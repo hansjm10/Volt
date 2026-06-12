@@ -234,6 +234,7 @@ export class LspClient {
 						hover: { dynamicRegistration: false, contentFormat: ["markdown", "plaintext"] },
 						documentSymbol: { dynamicRegistration: false, hierarchicalDocumentSymbolSupport: true },
 						rename: { dynamicRegistration: false, prepareSupport: false },
+						callHierarchy: { dynamicRegistration: false },
 						codeAction: {
 							dynamicRegistration: false,
 							codeActionLiteralSupport: {
@@ -396,6 +397,11 @@ export class LspClient {
 	/** Number of documents currently open on the server. */
 	get openDocumentCount(): number {
 		return this.documents.size;
+	}
+
+	/** Absolute paths of all documents currently open on the server. */
+	getOpenDocumentPaths(): string[] {
+		return [...this.documents.values()].map((document) => document.absolutePath);
 	}
 
 	/** Last published diagnostics for a document, if any. */

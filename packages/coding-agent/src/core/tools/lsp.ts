@@ -17,7 +17,17 @@ import { resolveToCwd } from "./path-utils.ts";
 import { renderToolPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 
-export const LSP_ACTIONS = ["definition", "references", "hover", "symbols", "diagnostics", "rename", "fix"] as const;
+export const LSP_ACTIONS = [
+	"definition",
+	"references",
+	"callers",
+	"callees",
+	"hover",
+	"symbols",
+	"diagnostics",
+	"rename",
+	"fix",
+] as const;
 export type LspAction = (typeof LSP_ACTIONS)[number];
 
 /**
@@ -33,6 +43,13 @@ export interface LspNavigationProvider {
 	hover(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string>;
 	documentSymbols(absolutePath: string, signal?: AbortSignal): Promise<string>;
 	workspaceSymbols(absolutePath: string, query: string, signal?: AbortSignal): Promise<string>;
+	callHierarchy(
+		absolutePath: string,
+		symbol: string,
+		direction: "incoming" | "outgoing",
+		line?: number,
+		signal?: AbortSignal,
+	): Promise<string>;
 	fileDiagnostics(absolutePath: string, signal?: AbortSignal): Promise<string>;
 	rename(absolutePath: string, symbol: string, newName: string, line?: number, signal?: AbortSignal): Promise<string>;
 	codeFix(
@@ -45,13 +62,13 @@ export interface LspNavigationProvider {
 const lspSchema = Type.Object({
 	action: StringEnum(LSP_ACTIONS, {
 		description:
-			"definition: where a symbol is defined. references: all usages of a symbol. hover: type/docs for a symbol. symbols: outline of a file, or project-wide symbol search when symbol is provided. diagnostics: current errors in a file. rename: rename a symbol across the project. fix: apply a quick fix (e.g. add a missing import).",
+			"definition: where a symbol is defined. references: all usages of a symbol. callers: functions that call a symbol. callees: functions a symbol calls. hover: type/docs for a symbol. symbols: outline of a file, or project-wide symbol search when symbol is provided. diagnostics: current errors in a file. rename: rename a symbol across the project. fix: apply a quick fix (e.g. add a missing import).",
 	}),
 	path: Type.String({ description: "Path to the file to query (relative or absolute)" }),
 	symbol: Type.Optional(
 		Type.String({
 			description:
-				"Symbol name to look up. Required for definition, references, hover, and rename; recommended for fix. For symbols, turns the file outline into a project-wide symbol search using this as the query.",
+				"Symbol name to look up. Required for definition, references, callers, callees, hover, and rename; recommended for fix. For symbols, turns the file outline into a project-wide symbol search using this as the query.",
 		}),
 	),
 	line: Type.Optional(
@@ -115,7 +132,7 @@ export function createLspToolDefinition(
 		name: "lsp",
 		label: "lsp",
 		description:
-			"Query language servers for code intelligence and refactoring. Actions: definition (where a symbol is defined), references (all usages of a symbol), hover (type signature and docs), symbols (file outline, or project-wide symbol search when symbol is provided), diagnostics (current errors in a file), rename (rename a symbol across the project; requires symbol and newName), fix (apply a quick fix for diagnostics at a symbol or line; pass title to choose among multiple). definition/references/hover/rename require a symbol name; pass line when the symbol occurs more than once.",
+			"Query language servers for code intelligence and refactoring. Actions: definition (where a symbol is defined), references (all usages of a symbol), callers (functions calling a symbol), callees (functions a symbol calls), hover (type signature and docs), symbols (file outline, or project-wide symbol search when symbol is provided), diagnostics (current errors in a file), rename (rename a symbol across the project; requires symbol and newName), fix (apply a quick fix for diagnostics at a symbol or line; pass title to choose among multiple). definition/references/callers/callees/hover/rename require a symbol name; pass line when the symbol occurs more than once.",
 		promptSnippet:
 			"Code intelligence via language servers: definition, references, hover, symbols, diagnostics, rename, quick fixes",
 		promptGuidelines: [
@@ -131,6 +148,8 @@ export function createLspToolDefinition(
 			const needsSymbol =
 				input.action === "definition" ||
 				input.action === "references" ||
+				input.action === "callers" ||
+				input.action === "callees" ||
 				input.action === "hover" ||
 				input.action === "rename";
 			if (needsSymbol && !input.symbol) {
@@ -147,6 +166,12 @@ export function createLspToolDefinition(
 					break;
 				case "references":
 					text = await provider.references(absolutePath, input.symbol!, input.line, signal);
+					break;
+				case "callers":
+					text = await provider.callHierarchy(absolutePath, input.symbol!, "incoming", input.line, signal);
+					break;
+				case "callees":
+					text = await provider.callHierarchy(absolutePath, input.symbol!, "outgoing", input.line, signal);
 					break;
 				case "hover":
 					text = await provider.hover(absolutePath, input.symbol!, input.line, signal);

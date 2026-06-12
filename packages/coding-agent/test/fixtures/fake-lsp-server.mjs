@@ -130,6 +130,7 @@ function handle(message) {
 					hoverProvider: true,
 					documentSymbolProvider: true,
 					renameProvider: true,
+					callHierarchyProvider: true,
 					codeActionProvider: true,
 					executeCommandProvider: { commands: ["fake.fix"] },
 					...(pullMode ? { diagnosticProvider: { interFileDependencies: false, workspaceDiagnostics: false } } : {}),
@@ -267,6 +268,70 @@ function handle(message) {
 							selectionRange: { start: { line: 1, character: 2 }, end: { line: 1, character: 12 } },
 						},
 					],
+				},
+			],
+		});
+		return;
+	}
+	if (method === "textDocument/prepareCallHierarchy") {
+		const text = documents.get(params.textDocument.uri) ?? "";
+		const lines = text.split("\n");
+		const word = wordAt(lines[params.position.line] ?? "", params.position.character);
+		if (!word) {
+			send({ jsonrpc: "2.0", id, result: null });
+			return;
+		}
+		send({
+			jsonrpc: "2.0",
+			id,
+			result: [
+				{
+					name: word,
+					kind: 12,
+					uri: params.textDocument.uri,
+					range: { start: { line: params.position.line, character: 0 }, end: { line: params.position.line, character: 10 } },
+					selectionRange: {
+						start: { line: params.position.line, character: params.position.character },
+						end: { line: params.position.line, character: params.position.character + word.length },
+					},
+				},
+			],
+		});
+		return;
+	}
+	if (method === "callHierarchy/incomingCalls") {
+		send({
+			jsonrpc: "2.0",
+			id,
+			result: [
+				{
+					from: {
+						name: "callerOne",
+						kind: 12,
+						uri: params.item.uri,
+						range: { start: { line: 0, character: 0 }, end: { line: 0, character: 9 } },
+						selectionRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 9 } },
+					},
+					fromRanges: [{ start: { line: 0, character: 0 }, end: { line: 0, character: 9 } }],
+				},
+			],
+		});
+		return;
+	}
+	if (method === "callHierarchy/outgoingCalls") {
+		send({
+			jsonrpc: "2.0",
+			id,
+			result: [
+				{
+					to: {
+						name: "calleeOne",
+						kind: 6,
+						uri: params.item.uri,
+						range: { start: { line: 1, character: 0 }, end: { line: 1, character: 9 } },
+						selectionRange: { start: { line: 1, character: 2 }, end: { line: 1, character: 11 } },
+					},
+					fromRanges: [{ start: { line: 1, character: 0 }, end: { line: 1, character: 9 } }],
 				},
 			],
 		});

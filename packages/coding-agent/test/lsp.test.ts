@@ -246,6 +246,47 @@ describe("LspManager", () => {
 		expect(result).toContain("error: found ERROR on line 1");
 	});
 
+	it("reports other open files that newly fail after a change", async () => {
+		const manager = setup();
+		const fileA = join(tempDir, "a.foo");
+		const fileB = join(tempDir, "b.foo");
+		const contentA = "watch CROSS here\n";
+		writeFileSync(fileA, contentA);
+		writeFileSync(fileB, "fine\n");
+		expect(await manager.getDiagnostics(fileA, contentA)).toBeUndefined();
+		expect(await manager.getDiagnostics(fileB, "fine\n")).toBeUndefined();
+
+		// Editing B introduces an error in B and breaks A via the cross-file rule.
+		const brokenB = "now has ERROR\n";
+		writeFileSync(fileB, brokenB);
+		const result = await manager.getDiagnostics(fileB, brokenB);
+		expect(result).toContain("b.foo(1,9): error: found ERROR on line 1");
+		expect(result).toContain("Newly failing in other open files:");
+		expect(result).toContain("a.foo(1,1): error: cross-file ERROR detected");
+
+		// Already-failing files are not reported again on the next edit.
+		const stillBrokenB = "still has ERROR\n";
+		writeFileSync(fileB, stillBrokenB);
+		const second = await manager.getDiagnostics(fileB, stillBrokenB);
+		expect(second).toContain("error: found ERROR on line 1");
+		expect(second).not.toContain("Newly failing");
+	});
+
+	it("reports incoming and outgoing calls", async () => {
+		const manager = setup();
+		const filePath = join(tempDir, "test.foo");
+		writeFileSync(filePath, "function target() {}\n");
+		const incoming = await manager.callHierarchy(filePath, "target", "incoming");
+		expect(incoming).toContain('Callers of "target":');
+		expect(incoming).toContain("callerOne (function) test.foo:1");
+
+		const outgoing = await manager.callHierarchy(filePath, "target", "outgoing");
+		expect(outgoing).toContain('Calls made by "target":');
+		expect(outgoing).toContain("calleeOne (method) test.foo:2");
+
+		expect(await manager.callHierarchy(filePath, "missing", "incoming")).toContain('Symbol "missing" not found');
+	});
+
 	it("renames a symbol across open files", async () => {
 		const manager = setup();
 		const fileA = join(tempDir, "a.foo");
@@ -613,6 +654,10 @@ describe("tool diagnostics integration", () => {
 				calls.push(`workspaceSymbols ${path} ${query}`);
 				return "workspace-symbols-result";
 			},
+			callHierarchy: async (path, symbol, direction) => {
+				calls.push(`callHierarchy ${path} ${symbol} ${direction}`);
+				return "calls-result";
+			},
 			fileDiagnostics: async () => "diag-result",
 			rename: async (path, symbol, newName) => {
 				calls.push(`rename ${path} ${symbol} ${newName}`);
@@ -652,6 +697,26 @@ describe("tool diagnostics integration", () => {
 		await expect(
 			tool.execute("t3", { action: "references", path: "a.ts" }, undefined, undefined, {} as never),
 		).rejects.toThrow("lsp references requires a symbol name");
+
+		const callers = await tool.execute(
+			"t3b",
+			{ action: "callers", path: "a.ts", symbol: "foo" },
+			undefined,
+			undefined,
+			{} as never,
+		);
+		expect(callers.content[0]).toEqual({ type: "text", text: "calls-result" });
+		expect(calls).toContain(`callHierarchy ${join(tempDir, "a.ts")} foo incoming`);
+
+		const callees = await tool.execute(
+			"t3c",
+			{ action: "callees", path: "a.ts", symbol: "foo" },
+			undefined,
+			undefined,
+			{} as never,
+		);
+		expect(callees.content[0]).toEqual({ type: "text", text: "calls-result" });
+		expect(calls).toContain(`callHierarchy ${join(tempDir, "a.ts")} foo outgoing`);
 
 		const renamed = await tool.execute(
 			"t4",

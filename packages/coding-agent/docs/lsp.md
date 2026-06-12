@@ -28,7 +28,7 @@ Or persistently in `~/.volt/agent/settings.json` (or per project in `.volt/setti
 - The project root is found by walking up from the edited file looking for the server's `rootMarkers` (falling back to the working directory). Markers are priority-ordered: for TypeScript, a `tsconfig.json` anywhere up the tree wins over a closer `package.json`, so monorepo subpackages resolve to the directory carrying the language configuration.
 - After each successful `edit`/`write`, volt syncs the new file content to the server and collects diagnostics, using pull diagnostics (`textDocument/diagnostic`) when the server supports them, otherwise waiting up to `settleMs` for the server to publish. The first collection on a freshly started server waits up to `firstSettleMs` instead, because servers like tsserver publish nothing until the project has loaded.
 - Before every diagnostics collection or navigation query, volt re-syncs any previously opened file whose on-disk content changed outside the `edit`/`write` tools (e.g. via `bash`: `git checkout`, codegen). Deleted files are closed on the server, and servers are notified via `workspace/didChangeWatchedFiles`.
-- Diagnostics at or above the configured `severity` are appended to the tool result and shown in the TUI.
+- Diagnostics at or above the configured `severity` are appended to the tool result and shown in the TUI. Other open files that go from clean to failing as a result of the change are reported in a `Newly failing in other open files` section (capped at 5 files; best-effort, depends on the server republishing within the settle window).
 - One client runs per (server, project root) pair. Servers shut down when the session ends or reloads, and after `idleShutdownMs` without use (they respawn lazily on the next operation).
 - `/lsp` shows the status of running servers (root, open documents, idle time); `/lsp restart` stops them all so they respawn fresh on next use.
 - A server that fails to start (for example, not installed) is reported once in the tool result and then silenced; after three failed starts it is disabled for the session.
@@ -43,6 +43,8 @@ When LSP is enabled, the `lsp` tool is active by default (it still respects `--t
 |--------|------------|-------------|
 | `definition` | `path`, `symbol`, `line?` | Where a symbol is defined, with a source snippet |
 | `references` | `path`, `symbol`, `line?` | All usages of a symbol across the project (capped at 50) |
+| `callers` | `path`, `symbol`, `line?` | Functions that call the symbol (call hierarchy, one level) |
+| `callees` | `path`, `symbol`, `line?` | Functions the symbol calls (call hierarchy, one level) |
 | `hover` | `path`, `symbol`, `line?` | Type signature and documentation for a symbol |
 | `symbols` | `path`, `symbol?` | Hierarchical symbol outline of a file; with `symbol`, a project-wide symbol search (the `path` routes the query to the right server) |
 | `diagnostics` | `path` | Current diagnostics for a file, on demand |

@@ -39,6 +39,7 @@ interface ServerFailureState {
 const MAX_START_ATTEMPTS = 3;
 const MAX_REFERENCES = 50;
 const MAX_SYMBOL_LINES = 200;
+const MAX_CROSS_FILE_REPORTS = 5;
 
 function uriToPath(uri: string): string {
 	try {
@@ -98,6 +99,14 @@ interface LspDocumentSymbol {
 
 interface LspHoverResult {
 	contents: unknown;
+}
+
+interface CallHierarchyItem {
+	name: string;
+	kind: number;
+	uri: string;
+	range: LspRange;
+	selectionRange?: LspRange;
 }
 
 interface LspCommand {
@@ -304,6 +313,10 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	/**
 	 * Collect diagnostics for a file that was just written.
 	 *
+	 * Also reports other open files that went from clean to failing as a result
+	 * of this change (best-effort: depends on the server republishing for open
+	 * documents within the settle window).
+	 *
 	 * Returns formatted diagnostics text, or undefined when no matching server
 	 * is configured, the server is unavailable, or there is nothing to report.
 	 */
@@ -321,6 +334,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		}
 
 		const client = this.getClient(server, absolutePath);
+		const cleanBefore = this.collectCleanOpenDocuments(client, absolutePath);
 		let diagnostics: LspDiagnostic[];
 		try {
 			diagnostics = await client.getDiagnostics(
@@ -337,7 +351,54 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			return undefined;
 		}
 		this.startFailures.delete(server.name);
-		return this.formatDiagnostics(absolutePath, diagnostics);
+
+		const ownDiagnostics = this.formatDiagnostics(absolutePath, diagnostics);
+		const crossFile = this.formatNewlyFailing(client, absolutePath, cleanBefore);
+		if (ownDiagnostics && crossFile) {
+			return `${ownDiagnostics}\n${crossFile}`;
+		}
+		return ownDiagnostics ?? crossFile;
+	}
+
+	/** Paths of other open documents that currently have no reportable diagnostics. */
+	private collectCleanOpenDocuments(client: LspClient, excludePath: string): Set<string> {
+		const clean = new Set<string>();
+		for (const path of client.getOpenDocumentPaths()) {
+			if (path === excludePath) {
+				continue;
+			}
+			const reportable = client
+				.getPublishedDiagnostics(path)
+				.filter((diagnostic) => (diagnostic.severity ?? 1) <= this.config.maxSeverity);
+			if (reportable.length === 0) {
+				clean.add(path);
+			}
+		}
+		return clean;
+	}
+
+	/** Report open documents that went from clean to failing since the snapshot. */
+	private formatNewlyFailing(client: LspClient, excludePath: string, cleanBefore: Set<string>): string | undefined {
+		const sections: string[] = [];
+		for (const path of client.getOpenDocumentPaths()) {
+			if (path === excludePath || !cleanBefore.has(path)) {
+				continue;
+			}
+			const formatted = this.formatDiagnostics(path, client.getPublishedDiagnostics(path));
+			if (formatted) {
+				sections.push(formatted);
+			}
+		}
+		if (sections.length === 0) {
+			return undefined;
+		}
+		const shown = sections.slice(0, MAX_CROSS_FILE_REPORTS);
+		if (sections.length > shown.length) {
+			shown.push(
+				`... and ${sections.length - shown.length} more file${sections.length - shown.length === 1 ? "" : "s"}`,
+			);
+		}
+		return `Newly failing in other open files:\n${shown.join("\n")}`;
 	}
 
 	dispose(): void {
@@ -403,6 +464,60 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			if (lines.length > MAX_SYMBOL_LINES) {
 				const extra = lines.length - MAX_SYMBOL_LINES;
 				return [...lines.slice(0, MAX_SYMBOL_LINES), `... and ${extra} more`].join("\n");
+			}
+			return lines.join("\n");
+		} catch (error) {
+			return this.describeRequestError(absolutePath, error);
+		}
+	}
+
+	async callHierarchy(
+		absolutePath: string,
+		symbol: string,
+		direction: "incoming" | "outgoing",
+		line?: number,
+		_signal?: AbortSignal,
+	): Promise<string> {
+		const session = await this.openSession(absolutePath);
+		if ("error" in session) {
+			return session.error;
+		}
+		const position = findSymbolPosition(session.content, symbol, line);
+		if (!position) {
+			return `Symbol "${symbol}" not found in ${this.displayPath(absolutePath)}.`;
+		}
+		try {
+			const items = (await session.client.sendRequest("textDocument/prepareCallHierarchy", {
+				textDocument: { uri: session.uri },
+				position,
+			})) as CallHierarchyItem[] | null;
+			if (!items || items.length === 0) {
+				return `No call hierarchy available for "${symbol}" (it may not be a callable symbol).`;
+			}
+			const item = items[0];
+			const label = direction === "incoming" ? "callers of" : "calls made by";
+			const method = direction === "incoming" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls";
+			const calls = (await session.client.sendRequest(method, { item })) as Array<{
+				from?: CallHierarchyItem;
+				to?: CallHierarchyItem;
+			}> | null;
+			if (!calls || calls.length === 0) {
+				return `No ${label} "${item.name}" found.`;
+			}
+			const shown = calls.slice(0, MAX_REFERENCES);
+			const lines: string[] = [`${direction === "incoming" ? "Callers of" : "Calls made by"} "${item.name}":`];
+			for (const call of shown) {
+				const target = direction === "incoming" ? call.from : call.to;
+				if (!target) {
+					continue;
+				}
+				const kind = SYMBOL_KIND_NAMES[target.kind] ?? "symbol";
+				const path = this.displayPath(uriToPath(target.uri));
+				const targetLine = (target.selectionRange ?? target.range).start.line + 1;
+				lines.push(`${target.name} (${kind}) ${path}:${targetLine}`);
+			}
+			if (calls.length > shown.length) {
+				lines.push(`... and ${calls.length - shown.length} more`);
 			}
 			return lines.join("\n");
 		} catch (error) {

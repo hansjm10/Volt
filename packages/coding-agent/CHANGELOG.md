@@ -11,6 +11,8 @@
 - Added a `/lsp` command showing language server status (root, open documents, idle time) with `/lsp restart` to stop servers, and automatic shutdown of servers idle for `lsp.idleShutdownMs` (default 10 minutes; servers respawn lazily).
 - Added per-server `lsp.servers.<name>.settings`: sent via `workspace/didChangeConfiguration` after startup and used to answer `workspace/configuration` section requests (e.g. pyright analysis options).
 - Added project-wide symbol search: `lsp symbols` with a `symbol` query searches the workspace via `workspace/symbol`, routed by the given file's server.
+- Edit/write diagnostics now report other open files that went from clean to failing as a result of the change (capped at 5 files).
+- Added `callers` and `callees` actions to the `lsp` tool (call hierarchy via `textDocument/prepareCallHierarchy`).
 
 ### Changed
 
