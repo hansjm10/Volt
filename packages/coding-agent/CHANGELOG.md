@@ -22,6 +22,7 @@
 ### Fixed
 
 - Fixed LSP diagnostics waits accepting publishes computed against an older document version, which could surface stale results after rapid consecutive edits.
+- Fixed LSP edit diagnostics reporting stale cross-file errors against pre-edit content: unversioned publishes that race a content change now trigger a re-wait for a fresher publish (capped at a short grace window for servers that never send versions, so single-publish servers do not stall every edit until the settle deadline), unversioned publishes pointing past the end of the synced content are dropped (also keeping them out of the "newly failing in other open files" sweep), and failed diagnostic pulls are retried once before falling back to published diagnostics ([#1](https://github.com/hansjm10/Volt/issues/1)).
 - Fixed missing-server install hints on Windows: shell spawning masked missing binaries as exit code 1, so a PATH/PATHEXT pre-check now produces the proper ENOENT failure.
 - LSP server start failures caused by a missing binary now include an install hint for the built-in servers (e.g. `npm install -g typescript-language-server typescript`), matched on the command's binary name so custom commands are unaffected.
 - Fixed the `lsp diagnostics` action bypassing the server start-failure breaker: a server that failed to start was respawned on every call instead of being disabled after three attempts.
