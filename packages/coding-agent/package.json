@@ -65,14 +65,12 @@
 	},
 	"devDependencies": {
 		"@types/cross-spawn": "6.0.6",
-		"@types/diff": "7.0.2",
 		"@types/hosted-git-info": "3.0.5",
-		"@types/ms": "2.1.0",
 		"@types/node": "24.12.4",
 		"@types/proper-lockfile": "4.1.4",
 		"shx": "0.4.0",
 		"typescript": "5.9.3",
-		"vitest": "3.2.4"
+		"vitest": "3.2.6"
 	},
 	"keywords": [
 		"coding-agent",
