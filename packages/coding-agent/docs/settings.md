@@ -215,6 +215,7 @@ See [LSP Diagnostics](lsp.md) for the full reference, including built-in server 
 | `lsp.settleMs` | number | `1500` | How long to wait for published diagnostics after a change |
 | `lsp.firstSettleMs` | number | `10000` | Wait window for the first diagnostics from a freshly started server |
 | `lsp.idleShutdownMs` | number | `600000` | Shut down servers idle for this long; `0` disables |
+| `lsp.traceFile` | string | | Append LSP protocol traffic and server stderr to this file |
 | `lsp.maxDiagnostics` | number | `20` | Maximum diagnostics reported per tool call |
 | `lsp.severity` | string | `"error"` | Minimum severity to report: `error`, `warning`, `information`, or `hint` |
 

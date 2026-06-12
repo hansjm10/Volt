@@ -31,6 +31,7 @@ Or persistently in `~/.volt/agent/settings.json` (or per project in `.volt/setti
 - Diagnostics at or above the configured `severity` are appended to the tool result and shown in the TUI. Other open files that go from clean to failing as a result of the change are reported in a `Newly failing in other open files` section (capped at 5 files; best-effort, depends on the server republishing within the settle window).
 - One client runs per (server, project root) pair. Servers shut down when the session ends or reloads, and after `idleShutdownMs` without use (they respawn lazily on the next operation).
 - `/lsp` shows the status of running servers (root, open documents, idle time); `/lsp restart` stops them all so they respawn fresh on next use.
+- `/lsp trace [path]` enables protocol tracing at runtime (`/lsp trace off` disables): JSON-RPC traffic in both directions, server stderr, and lifecycle events are appended to the trace file with timestamps. Use this to debug a misbehaving server. Persistent tracing: set `lsp.traceFile`.
 - A server that fails to start (for example, not installed) is reported once in the tool result and then silenced; after three failed starts it is disabled for the session.
 
 Diagnostics are best-effort: server failures or timeouts never fail the edit itself.
@@ -106,6 +107,7 @@ All settings live under `lsp` in `settings.json`:
 | `settleMs` | number | `1500` | How long to wait for published diagnostics after a change (servers without pull diagnostics) |
 | `firstSettleMs` | number | `10000` | Wait window for the first diagnostics from a freshly started server (project load time) |
 | `idleShutdownMs` | number | `600000` | Shut down servers idle for this long (10 minutes); `0` disables idle shutdown |
+| `traceFile` | string | | Append protocol traffic, server stderr, and lifecycle events to this file (also `/lsp trace` at runtime) |
 | `maxDiagnostics` | number | `20` | Maximum diagnostics per tool call; the rest are summarized as `... and N more` |
 | `severity` | string | `"error"` | Minimum severity to report: `error`, `warning`, `information`, or `hint` |
 | `servers.<name>` | object | | Server definition, merged over the built-in default with the same name |

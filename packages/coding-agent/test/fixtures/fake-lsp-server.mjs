@@ -20,10 +20,14 @@
 
 const pullMode = process.argv.includes("--pull");
 const configMode = process.argv.includes("--config");
+const staleMode = process.argv.includes("--stale");
 const delayIndex = process.argv.indexOf("--delay");
 const publishDelayMs = delayIndex !== -1 ? Number.parseInt(process.argv[delayIndex + 1], 10) : 50;
 const documents = new Map();
+const versions = new Map();
 const state = { opens: [], changes: [], closes: [], watched: [], configChanges: [], configResponses: undefined };
+
+process.stderr.write("fake-lsp-server ready\n");
 let buffer = Buffer.alloc(0);
 let nextServerRequestId = 1000;
 const pendingServerRequests = new Map();
@@ -195,13 +199,35 @@ function handle(message) {
 	}
 	if (method === "textDocument/didOpen") {
 		documents.set(params.textDocument.uri, params.textDocument.text);
+		versions.set(params.textDocument.uri, params.textDocument.version);
 		state.opens.push(params.textDocument.uri);
 		publishLater();
 		return;
 	}
 	if (method === "textDocument/didChange") {
 		documents.set(params.textDocument.uri, params.contentChanges[0].text);
+		versions.set(params.textDocument.uri, params.textDocument.version);
 		state.changes.push({ uri: params.textDocument.uri, version: params.textDocument.version });
+		if (staleMode) {
+			// Immediately publish a bogus result computed against the previous
+			// version, like a server racing syntactic/semantic passes.
+			send({
+				jsonrpc: "2.0",
+				method: "textDocument/publishDiagnostics",
+				params: {
+					uri: params.textDocument.uri,
+					version: params.textDocument.version - 1,
+					diagnostics: [
+						{
+							range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+							severity: 1,
+							source: "fake",
+							message: "stale result from previous version",
+						},
+					],
+				},
+			});
+		}
 		publishLater();
 		return;
 	}
@@ -466,7 +492,7 @@ function publishLater() {
 			send({
 				jsonrpc: "2.0",
 				method: "textDocument/publishDiagnostics",
-				params: { uri, diagnostics: scan(text, uri) },
+				params: { uri, version: versions.get(uri), diagnostics: scan(text, uri) },
 			});
 		}
 	}, publishDelayMs);

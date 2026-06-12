@@ -8,10 +8,12 @@
  */
 
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { basename, extname } from "node:path";
+import { basename, extname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { languageIdForExtension } from "./config.ts";
+import type { LspTracer } from "./trace.ts";
 
 export interface LspPosition {
 	line: number;
@@ -48,6 +50,8 @@ export interface LspClientOptions {
 	 * command-based code actions). Returns whether the edit was applied.
 	 */
 	onApplyEdit?: (edit: unknown) => Promise<boolean>;
+	/** Protocol tracer. Can also be set later via setTracer(). */
+	tracer?: LspTracer;
 }
 
 interface PendingRequest {
@@ -95,6 +99,23 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 
 function quoteWindowsArg(arg: string): string {
 	return /\s/.test(arg) ? `"${arg}"` : arg;
+}
+
+/**
+ * Whether a command binary is resolvable on Windows. Spawning through a shell
+ * masks missing binaries as exit code 1, so we pre-check PATH/PATHEXT to
+ * produce a proper ENOENT-style failure (which also carries install hints).
+ */
+function windowsCommandExists(binary: string): boolean {
+	if (!binary) {
+		return false;
+	}
+	const extensions = ["", ...(process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)];
+	if (binary.includes("/") || binary.includes("\\")) {
+		return extensions.some((ext) => existsSync(binary + ext));
+	}
+	const pathDirs = (process.env.PATH ?? "").split(";").filter(Boolean);
+	return pathDirs.some((dir) => extensions.some((ext) => existsSync(join(dir, binary + ext))));
 }
 
 function spawnServer(command: string[], cwd: string): ChildProcess {
@@ -167,10 +188,17 @@ export class LspClient {
 	private publishSeq = 0;
 	private publishWaiters: PublishWaiter[] = [];
 	private everPublished = false;
+	private tracer: LspTracer | undefined;
 
 	constructor(options: LspClientOptions) {
 		this.options = options;
 		this.rootUri = pathToFileURL(options.rootDir).toString();
+		this.tracer = options.tracer;
+	}
+
+	/** Enable or disable protocol tracing for this client. */
+	setTracer(tracer: LspTracer | undefined): void {
+		this.tracer = tracer;
 	}
 
 	get isAlive(): boolean {
@@ -186,6 +214,19 @@ export class LspClient {
 	}
 
 	private async doStart(): Promise<void> {
+		if (process.platform === "win32" && !windowsCommandExists(this.options.command[0] ?? "")) {
+			const error = new Error(
+				`Failed to start LSP server "${this.options.serverName}": spawn ${this.options.command[0]} ENOENT`,
+			);
+			this.tracer?.log(this.options.serverName, "info", error.message);
+			this.handleExit(error);
+			throw this.exitError ?? error;
+		}
+		this.tracer?.log(
+			this.options.serverName,
+			"info",
+			`spawning: ${this.options.command.join(" ")} (root: ${this.options.rootDir})`,
+		);
 		const child = spawnServer(this.options.command, this.options.rootDir);
 		this.child = child;
 
@@ -210,9 +251,12 @@ export class LspClient {
 
 		child.stdout?.on("data", (chunk: Buffer) => this.onData(chunk));
 		// Drain stderr so the server cannot block on a full pipe.
-		child.stderr?.on("data", () => {});
+		child.stderr?.on("data", (chunk: Buffer) => {
+			this.tracer?.log(this.options.serverName, "stderr", chunk.toString("utf-8"));
+		});
 		child.stdin?.on("error", () => {});
 		child.on("exit", (code) => {
+			this.tracer?.log(this.options.serverName, "info", `process exited (code ${code ?? "unknown"})`);
 			if (this.alive) {
 				this.handleExit(new Error(`LSP server "${this.options.serverName}" exited (code ${code ?? "unknown"})`));
 			}
@@ -562,6 +606,7 @@ export class LspClient {
 
 	private sendMessage(message: JsonRpcMessage): void {
 		const body = JSON.stringify(message);
+		this.tracer?.log(this.options.serverName, "send", body);
 		const length = Buffer.byteLength(body, "utf-8");
 		this.child?.stdin?.write(`Content-Length: ${length}\r\n\r\n${body}`);
 	}
@@ -587,6 +632,7 @@ export class LspClient {
 			}
 			const body = this.readBuffer.subarray(messageStart, messageStart + contentLength).toString("utf-8");
 			this.readBuffer = this.readBuffer.subarray(messageStart + contentLength);
+			this.tracer?.log(this.options.serverName, "recv", body);
 			try {
 				this.onMessage(JSON.parse(body) as JsonRpcMessage);
 			} catch {
@@ -614,10 +660,16 @@ export class LspClient {
 			return;
 		}
 		if (message.method === "textDocument/publishDiagnostics") {
-			const params = message.params as { uri?: string; diagnostics?: LspDiagnostic[] } | undefined;
+			const params = message.params as { uri?: string; version?: number; diagnostics?: LspDiagnostic[] } | undefined;
 			if (params?.uri) {
 				const key = normalizeUri(params.uri);
 				this.everPublished = true;
+				// Ignore publishes computed against an older synced version: they
+				// would satisfy the settle wait with stale diagnostics.
+				const document = this.documents.get(key);
+				if (params.version !== undefined && document !== undefined && params.version < document.version) {
+					return;
+				}
 				this.publishSeq++;
 				this.published.set(key, {
 					diagnostics: Array.isArray(params.diagnostics) ? params.diagnostics : [],

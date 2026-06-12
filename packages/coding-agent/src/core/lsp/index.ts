@@ -9,6 +9,7 @@ export {
 	resolveLspConfig,
 } from "./config.ts";
 export { LspManager, type LspManagerOptions, type LspServerStatus } from "./manager.ts";
+export { type LspTraceDirection, LspTracer } from "./trace.ts";
 export {
 	applyTextEdits,
 	type LspTextEdit,

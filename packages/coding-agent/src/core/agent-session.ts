@@ -360,11 +360,17 @@ export class AgentSession {
 	}
 
 	/** LSP status for the /lsp command. */
-	getLspStatus(): { enabled: boolean; servers: LspServerStatus[] } {
+	getLspStatus(): { enabled: boolean; servers: LspServerStatus[]; traceFile?: string } {
 		return {
 			enabled: this._lspManager !== undefined,
 			servers: this._lspManager?.getStatus() ?? [],
+			traceFile: this._lspManager?.getTraceFile(),
 		};
+	}
+
+	/** Enable or disable LSP protocol tracing at runtime. */
+	setLspTraceFile(filePath: string | undefined): void {
+		this._lspManager?.setTraceFile(filePath);
 	}
 
 	/** Stop all running language servers; they respawn lazily on next use. Returns the number stopped. */

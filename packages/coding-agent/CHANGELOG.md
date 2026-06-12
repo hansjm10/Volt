@@ -16,7 +16,14 @@
 - Added `implementations` and `type-definition` actions to the `lsp` tool.
 - Added a `kind` parameter to `lsp fix` for kind-filtered code actions such as `source.organizeImports` and `source.fixAll`.
 - Added built-in LSP server defaults for clangd (C/C++), zls (Zig), lua-language-server, and bash-language-server.
+- Added LSP protocol tracing: `lsp.traceFile` setting and `/lsp trace [path|off]` runtime toggle append JSON-RPC traffic, server stderr, and lifecycle events to a log file.
+
+### Fixed
+
+- Fixed LSP diagnostics waits accepting publishes computed against an older document version, which could surface stale results after rapid consecutive edits.
+- Fixed missing-server install hints on Windows: shell spawning masked missing binaries as exit code 1, so a PATH/PATHEXT pre-check now produces the proper ENOENT failure.
 - LSP server start failures caused by a missing binary now include an install hint for the built-in servers (e.g. `npm install -g typescript-language-server typescript`), matched on the command's binary name so custom commands are unaffected.
+- Reworked the startup ASCII wordmark to an outline letterform so it no longer appears split across a horizontal seam on macOS terminals that add inter-line spacing (the previous solid half-block art was bisected by the line gap).
 
 ### Changed
 
@@ -27,10 +34,6 @@
 - Renamed the `/new` slash command to `/clear`. The `app.session.new` keybinding action id is unchanged.
 - Restyled the built-in `dark` and `light` themes around an electric purple accent palette.
 - Replaced the plain-text startup logo with an ASCII wordmark; renamed forks (via `voltConfig.name`) still get the plain-text logo.
-
-### Fixed
-
-- Reworked the startup ASCII wordmark to an outline letterform so it no longer appears split across a horizontal seam on macOS terminals that add inter-line spacing (the previous solid half-block art was bisected by the line gap).
 
 ## [0.79.1] - 2026-06-09
 

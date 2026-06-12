@@ -165,6 +165,8 @@ export {
 	type LspServerStatus,
 	type LspSettings,
 	type LspSeverity,
+	type LspTraceDirection,
+	LspTracer,
 	languageIdForExtension,
 	type ResolvedLspConfig,
 	type ResolvedLspServerConfig,

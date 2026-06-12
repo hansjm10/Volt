@@ -20,6 +20,7 @@ import {
 	type ResolvedLspServerConfig,
 	SEVERITY_NAMES,
 } from "./config.ts";
+import { LspTracer } from "./trace.ts";
 import { applyTextEdits, type LspWorkspaceEdit, normalizeWorkspaceEdit } from "./workspace-edit.ts";
 
 export interface LspManagerOptions {
@@ -262,10 +263,14 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	private serverApplyEditSummaries: string[] = [];
 	private lastUsedAt = new Map<string, number>();
 	private idleTimer: NodeJS.Timeout | undefined;
+	private tracer: LspTracer | undefined;
 
 	constructor(options: LspManagerOptions) {
 		this.cwd = options.cwd;
 		this.config = options.config;
+		if (this.config.traceFile) {
+			this.tracer = new LspTracer(this.config.traceFile);
+		}
 		if (this.config.idleShutdownMs > 0) {
 			const checkIntervalMs = Math.max(250, Math.min(this.config.idleShutdownMs / 2, 60000));
 			this.idleTimer = setInterval(() => this.shutdownIdleClients(), checkIntervalMs);
@@ -286,6 +291,20 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 				idleMs: now - (this.lastUsedAt.get(key) ?? now),
 			};
 		});
+	}
+
+	/** Path of the active trace file, if tracing is enabled. */
+	getTraceFile(): string | undefined {
+		return this.tracer?.filePath;
+	}
+
+	/** Enable or disable protocol tracing for current and future servers. */
+	setTraceFile(filePath: string | undefined): void {
+		this.tracer?.dispose();
+		this.tracer = filePath ? new LspTracer(filePath) : undefined;
+		for (const client of this.clients.values()) {
+			client.setTracer(this.tracer);
+		}
 	}
 
 	/** Dispose all running servers. They respawn lazily on next use. Returns the number stopped. */
@@ -417,6 +436,8 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		}
 		this.clients.clear();
 		this.lastUsedAt.clear();
+		this.tracer?.dispose();
+		this.tracer = undefined;
 	}
 
 	// =========================================================================
@@ -977,6 +998,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			rootDir: root,
 			initializationOptions: server.initializationOptions,
 			settings: server.settings,
+			tracer: this.tracer,
 			onApplyEdit: async (edit) => {
 				const { summary } = await this.applyWorkspaceEdit(clientRef, edit as LspWorkspaceEdit);
 				this.serverApplyEditSummaries.push(summary);

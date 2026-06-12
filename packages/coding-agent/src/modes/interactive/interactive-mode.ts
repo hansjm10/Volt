@@ -89,7 +89,7 @@ import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelo
 import { copyToClipboard } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
 import { parseGitUrl } from "../../utils/git.ts";
-import { getCwdRelativePath } from "../../utils/paths.ts";
+import { getCwdRelativePath, resolvePath } from "../../utils/paths.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import { checkForNewVoltVersion, type LatestVoltRelease } from "../../utils/version-check.ts";
@@ -5401,6 +5401,25 @@ export class InteractiveMode {
 			info = status.enabled
 				? `Stopped ${count} language server${count === 1 ? "" : "s"}. Servers respawn on next use.`
 				: "LSP is disabled. Run with --lsp or set lsp.enabled in settings.";
+		} else if (args === "trace" || args?.startsWith("trace ")) {
+			if (!status.enabled) {
+				info = "LSP is disabled. Run with --lsp or set lsp.enabled in settings.";
+			} else {
+				const traceArg = args === "trace" ? undefined : args.slice(6).trim();
+				if (traceArg === "off") {
+					this.session.setLspTraceFile(undefined);
+					info = "LSP tracing disabled.";
+				} else {
+					const tracePath = resolvePath(
+						traceArg && traceArg.length > 0
+							? traceArg
+							: path.join(os.tmpdir(), `volt-lsp-trace-${process.pid}.log`),
+						this.session.sessionManager.getCwd(),
+					);
+					this.session.setLspTraceFile(tracePath);
+					info = `LSP tracing enabled: ${tracePath}\nUse /lsp trace off to disable.`;
+				}
+			}
 		} else if (!status.enabled) {
 			info = "LSP is disabled. Run with --lsp or set lsp.enabled in settings.";
 		} else if (status.servers.length === 0) {
@@ -5413,7 +5432,10 @@ export class InteractiveMode {
 				info += `${theme.fg("dim", "Open documents:")} ${server.openDocuments}\n`;
 				info += `${theme.fg("dim", "Idle:")} ${formatIdle(server.idleMs)}\n`;
 			}
-			info += `\n${theme.fg("dim", "Use /lsp restart to restart servers.")}`;
+			if (status.traceFile) {
+				info += `\n${theme.fg("dim", "Trace:")} ${status.traceFile}\n`;
+			}
+			info += `\n${theme.fg("dim", "Use /lsp restart to restart servers, /lsp trace [path|off] to toggle tracing.")}`;
 		}
 
 		this.chatContainer.addChild(new Spacer(1));

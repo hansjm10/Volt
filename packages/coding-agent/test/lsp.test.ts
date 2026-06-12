@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { LspClient } from "../src/core/lsp/client.ts";
 import { installHintForCommand, resolveLspConfig } from "../src/core/lsp/config.ts";
 import { LspManager } from "../src/core/lsp/manager.ts";
+import { LspTracer } from "../src/core/lsp/trace.ts";
 import { applyTextEdits, normalizeWorkspaceEdit } from "../src/core/lsp/workspace-edit.ts";
 import type { ToolDiagnosticsProvider } from "../src/core/tools/diagnostics-provider.ts";
 import { createEditToolDefinition } from "../src/core/tools/edit.ts";
@@ -34,6 +35,8 @@ function fakeServerConfig(options?: {
 	firstSettleMs?: number;
 	publishDelayMs?: number;
 	idleShutdownMs?: number;
+	stale?: boolean;
+	traceFile?: string;
 }) {
 	return resolveLspConfig({
 		enabled: true,
@@ -42,6 +45,7 @@ function fakeServerConfig(options?: {
 		maxDiagnostics: options?.maxDiagnostics,
 		severity: options?.severity,
 		idleShutdownMs: options?.idleShutdownMs ?? 0,
+		traceFile: options?.traceFile,
 		servers: {
 			// Disable built-in defaults so the test never spawns real servers.
 			typescript: { enabled: false },
@@ -53,6 +57,7 @@ function fakeServerConfig(options?: {
 					process.execPath,
 					FAKE_SERVER,
 					...(options?.pull ? ["--pull"] : []),
+					...(options?.stale ? ["--stale"] : []),
 					...(options?.publishDelayMs !== undefined ? ["--delay", String(options.publishDelayMs)] : []),
 				],
 				fileExtensions: [".foo"],
@@ -402,6 +407,84 @@ describe("LspManager", () => {
 		expect(await manager.workspaceSymbols(fileA, "nomatch")).toContain('No workspace symbols matching "nomatch"');
 	});
 
+	it("ignores diagnostics published for an older document version", async () => {
+		const manager = setup({ stale: true });
+		const filePath = join(tempDir, "test.foo");
+		writeFileSync(filePath, "clean\n");
+		expect(await manager.getDiagnostics(filePath, "clean\n")).toBeUndefined();
+
+		// The stale-mode server immediately publishes a bogus result tagged with
+		// the previous version before the real one arrives.
+		const result = await manager.getDiagnostics(filePath, "still clean\n");
+		expect(result).toBeUndefined();
+	});
+
+	it("writes protocol traffic to the trace file", async () => {
+		const traceFile = join(tmpdir(), `volt-lsp-trace-test-${Date.now()}.log`);
+		const manager = setup({ traceFile });
+		try {
+			expect(manager.getTraceFile()).toBe(traceFile);
+			const filePath = join(tempDir, "test.foo");
+			writeFileSync(filePath, "ok\n");
+			await manager.documentSymbols(filePath);
+
+			let content = "";
+			for (let attempt = 0; attempt < 20; attempt++) {
+				content = readFileSync(traceFile, "utf-8");
+				if (content.includes("documentSymbol")) break;
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+			expect(content).toContain("info: spawning:");
+			expect(content).toContain('send: {"jsonrpc":"2.0","id":1,"method":"initialize"');
+			expect(content).toContain("recv: ");
+			expect(content).toContain("stderr: fake-lsp-server ready");
+			expect(content).toContain("textDocument/documentSymbol");
+		} finally {
+			try {
+				rmSync(traceFile, { force: true });
+			} catch {
+				// A briefly-held handle may block deletion on Windows.
+			}
+		}
+	});
+
+	it("enables and disables tracing at runtime for existing servers", async () => {
+		const traceFile = join(tmpdir(), `volt-lsp-trace-test-${Date.now()}.log`);
+		const manager = setup();
+		try {
+			expect(manager.getTraceFile()).toBeUndefined();
+			const filePath = join(tempDir, "test.foo");
+			writeFileSync(filePath, "ok\n");
+			await manager.documentSymbols(filePath);
+
+			manager.setTraceFile(traceFile);
+			expect(manager.getTraceFile()).toBe(traceFile);
+			await manager.hover(filePath, "ok");
+
+			let content = "";
+			for (let attempt = 0; attempt < 20; attempt++) {
+				try {
+					content = readFileSync(traceFile, "utf-8");
+					if (content.includes("hover")) break;
+				} catch {
+					// File may not exist yet.
+				}
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+			expect(content).toContain("textDocument/hover");
+			expect(content).not.toContain('"method":"initialize"');
+
+			manager.setTraceFile(undefined);
+			expect(manager.getTraceFile()).toBeUndefined();
+		} finally {
+			try {
+				rmSync(traceFile, { force: true });
+			} catch {
+				// A briefly-held handle may block deletion on Windows.
+			}
+		}
+	});
+
 	it("reports server status and restarts servers", async () => {
 		const manager = setup();
 		expect(manager.getStatus()).toEqual([]);
@@ -490,6 +573,28 @@ describe("LspManager", () => {
 		expect(first).toContain("lsp(missing):");
 		expect(first).toContain("ENOENT");
 		expect(first).toContain("Install with: go install golang.org/x/tools/gopls@latest");
+	});
+});
+
+describe("LspTracer", () => {
+	it("truncates oversized entries", async () => {
+		const traceFile = join(tmpdir(), `volt-lsp-tracer-test-${Date.now()}.log`);
+		try {
+			const tracer = new LspTracer(traceFile);
+			tracer.log("test", "send", "x".repeat(5000));
+			await tracer.flush();
+			const content = readFileSync(traceFile, "utf-8");
+			expect(content).toContain("(1000 more chars)");
+			expect(content).toContain("[test] send: ");
+			tracer.dispose();
+			await tracer.flush();
+		} finally {
+			try {
+				rmSync(traceFile, { force: true });
+			} catch {
+				// A briefly-held handle may block deletion on Windows.
+			}
+		}
 	});
 });
 
