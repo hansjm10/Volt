@@ -458,9 +458,11 @@ export class Editor implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
-		const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
+		// Reserve 2 columns for the left/right box borders
+		const innerWidth = Math.max(1, width - 2);
+		const maxPadding = Math.max(0, Math.floor((innerWidth - 1) / 2));
 		const paddingX = Math.min(this.paddingX, maxPadding);
-		const contentWidth = Math.max(1, width - paddingX * 2);
+		const contentWidth = Math.max(1, innerWidth - paddingX * 2);
 
 		// Layout width: with padding the cursor can overflow into it,
 		// without padding we reserve 1 column for the cursor.
@@ -469,7 +471,7 @@ export class Editor implements Component, Focusable {
 		// Store for cursor navigation (must match wrapping width)
 		this.lastWidth = layoutWidth;
 
-		const horizontal = this.borderColor("─");
+		const vertical = this.borderColor("│");
 
 		// Layout the text
 		const layoutLines = this.layoutText(layoutWidth);
@@ -503,14 +505,14 @@ export class Editor implements Component, Focusable {
 		// Render top border (with scroll indicator if scrolled down)
 		if (this.scrollOffset > 0) {
 			const indicator = `─── ↑ ${this.scrollOffset} more `;
-			const remaining = width - visibleWidth(indicator);
+			const remaining = innerWidth - visibleWidth(indicator);
 			if (remaining >= 0) {
-				result.push(this.borderColor(indicator + "─".repeat(remaining)));
+				result.push(this.borderColor("╭" + indicator + "─".repeat(remaining) + "╮"));
 			} else {
-				result.push(this.borderColor(truncateToWidth(indicator, width)));
+				result.push(this.borderColor(truncateToWidth("╭" + indicator, width)));
 			}
 		} else {
-			result.push(horizontal.repeat(width));
+			result.push(this.borderColor("╭" + "─".repeat(innerWidth) + "╮"));
 		}
 
 		// Render each visible layout line
@@ -557,18 +559,22 @@ export class Editor implements Component, Focusable {
 			const padding = " ".repeat(Math.max(0, contentWidth - lineVisibleWidth));
 			const lineRightPadding = cursorInPadding ? rightPadding.slice(1) : rightPadding;
 
-			// Render the line (no side borders, just horizontal lines above and below)
-			result.push(`${leftPadding}${displayText}${padding}${lineRightPadding}`);
+			// Render the line with side borders
+			result.push(`${vertical}${leftPadding}${displayText}${padding}${lineRightPadding}${vertical}`);
 		}
 
 		// Render bottom border (with scroll indicator if more content below)
 		const linesBelow = layoutLines.length - (this.scrollOffset + visibleLines.length);
 		if (linesBelow > 0) {
 			const indicator = `─── ↓ ${linesBelow} more `;
-			const remaining = width - visibleWidth(indicator);
-			result.push(this.borderColor(indicator + "─".repeat(Math.max(0, remaining))));
+			const remaining = innerWidth - visibleWidth(indicator);
+			if (remaining >= 0) {
+				result.push(this.borderColor("╰" + indicator + "─".repeat(remaining) + "╯"));
+			} else {
+				result.push(this.borderColor(truncateToWidth("╰" + indicator, width)));
+			}
 		} else {
-			result.push(horizontal.repeat(width));
+			result.push(this.borderColor("╰" + "─".repeat(innerWidth) + "╯"));
 		}
 
 		// Add autocomplete list if active
@@ -577,7 +583,8 @@ export class Editor implements Component, Focusable {
 			for (const line of autocompleteResult) {
 				const lineWidth = visibleWidth(line);
 				const linePadding = " ".repeat(Math.max(0, contentWidth - lineWidth));
-				result.push(`${leftPadding}${line}${linePadding}${rightPadding}`);
+				// Indent by 1 to align with the box interior
+				result.push(` ${leftPadding}${line}${linePadding}${rightPadding} `);
 			}
 		}
 

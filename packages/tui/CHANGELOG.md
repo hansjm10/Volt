@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Changed the editor input to render as a full rounded box with side borders instead of only horizontal rules above and below the content.
+
 ### Fixed
 
 - Fixed WezTerm inline Kitty image rendering so reserved row clears do not erase all but the top strip of tool image previews ([#5618](https://github.com/earendil-works/pi/issues/5618)).
