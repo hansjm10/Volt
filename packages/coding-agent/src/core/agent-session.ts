@@ -2412,6 +2412,7 @@ export class AgentSession {
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 					edit: { diagnosticsProvider: this._lspManager },
 					write: { diagnosticsProvider: this._lspManager },
+					lsp: { provider: this._lspManager },
 				});
 
 		this._baseToolDefinitions = new Map(
@@ -2440,7 +2441,7 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write"];
+			: ["read", "bash", "edit", "write", ...(this._lspManager ? ["lsp"] : [])];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,

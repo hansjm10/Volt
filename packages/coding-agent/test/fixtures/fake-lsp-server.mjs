@@ -7,6 +7,8 @@
 //   per line containing "ERROR" (severity 1) or "WARN" (severity 2), after a
 //   short delay to exercise the publish wait path.
 // - In pull mode, answers textDocument/diagnostic from the same scan.
+// - Answers definition/references/hover/documentSymbol with fixed shapes so
+//   navigation formatting can be tested.
 // - Exits on the exit notification.
 
 const pullMode = process.argv.includes("--pull");
@@ -54,6 +56,10 @@ function handle(message) {
 			result: {
 				capabilities: {
 					textDocumentSync: 1,
+					definitionProvider: true,
+					referencesProvider: true,
+					hoverProvider: true,
+					documentSymbolProvider: true,
 					...(pullMode ? { diagnosticProvider: { interFileDependencies: false, workspaceDiagnostics: false } } : {}),
 				},
 			},
@@ -75,6 +81,63 @@ function handle(message) {
 	if (method === "textDocument/didChange") {
 		documents.set(params.textDocument.uri, params.contentChanges[0].text);
 		publishLater(params.textDocument.uri);
+		return;
+	}
+	if (method === "textDocument/definition") {
+		// LocationLink form to exercise link normalization.
+		send({
+			jsonrpc: "2.0",
+			id,
+			result: [
+				{
+					targetUri: params.textDocument.uri,
+					targetRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 10 } },
+					targetSelectionRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+				},
+			],
+		});
+		return;
+	}
+	if (method === "textDocument/references") {
+		send({
+			jsonrpc: "2.0",
+			id,
+			result: [
+				{ uri: params.textDocument.uri, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } } },
+				{ uri: params.textDocument.uri, range: { start: { line: 1, character: 2 }, end: { line: 1, character: 7 } } },
+			],
+		});
+		return;
+	}
+	if (method === "textDocument/hover") {
+		send({
+			jsonrpc: "2.0",
+			id,
+			result: { contents: { kind: "markdown", value: "fake hover text" } },
+		});
+		return;
+	}
+	if (method === "textDocument/documentSymbol") {
+		send({
+			jsonrpc: "2.0",
+			id,
+			result: [
+				{
+					name: "FakeClass",
+					kind: 5,
+					range: { start: { line: 0, character: 0 }, end: { line: 5, character: 0 } },
+					selectionRange: { start: { line: 0, character: 6 }, end: { line: 0, character: 15 } },
+					children: [
+						{
+							name: "fakeMethod",
+							kind: 6,
+							range: { start: { line: 1, character: 0 }, end: { line: 2, character: 0 } },
+							selectionRange: { start: { line: 1, character: 2 }, end: { line: 1, character: 12 } },
+						},
+					],
+				},
+			],
+		});
 		return;
 	}
 	if (method === "textDocument/diagnostic") {

@@ -6,6 +6,7 @@ import { resolveLspConfig } from "../src/core/lsp/config.ts";
 import { LspManager } from "../src/core/lsp/manager.ts";
 import type { ToolDiagnosticsProvider } from "../src/core/tools/diagnostics-provider.ts";
 import { createEditToolDefinition } from "../src/core/tools/edit.ts";
+import { createLspToolDefinition, type LspNavigationProvider } from "../src/core/tools/lsp.ts";
 import { createWriteToolDefinition } from "../src/core/tools/write.ts";
 
 const FAKE_SERVER = join(__dirname, "fixtures", "fake-lsp-server.mjs");
@@ -163,6 +164,40 @@ describe("LspManager", () => {
 		expect(third).toBeUndefined();
 	});
 
+	it("answers navigation queries via the fake server", async () => {
+		const manager = setup();
+		const filePath = join(tempDir, "test.foo");
+		const content = "class FakeClass\n  fakeMethod here\n";
+		writeFileSync(filePath, content);
+
+		const definition = await manager.definition(filePath, "FakeClass");
+		expect(definition).toContain("test.foo:1:1");
+		expect(definition).toContain("class FakeClass");
+
+		const references = await manager.references(filePath, "fakeMethod", 2);
+		const referenceLines = references.split("\n");
+		expect(referenceLines).toHaveLength(2);
+		expect(referenceLines[0]).toContain("test.foo:1:1");
+		expect(referenceLines[1]).toContain("test.foo:2:3");
+
+		const hover = await manager.hover(filePath, "fakeMethod");
+		expect(hover).toBe("fake hover text");
+
+		const symbols = await manager.documentSymbols(filePath);
+		expect(symbols).toBe("FakeClass (class):1\n  fakeMethod (method):2");
+
+		const diagnostics = await manager.fileDiagnostics(filePath);
+		expect(diagnostics).toContain("No diagnostics in");
+	});
+
+	it("reports symbol-not-found and no-server errors as text", async () => {
+		const manager = setup();
+		const filePath = join(tempDir, "test.foo");
+		writeFileSync(filePath, "nothing here\n");
+		expect(await manager.definition(filePath, "missingSymbol")).toContain('Symbol "missingSymbol" not found');
+		expect(await manager.hover(join(tempDir, "test.bar"), "x")).toContain("No language server configured for .bar");
+	});
+
 	it("reports a failed server start once, then stays silent", async () => {
 		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
 		manager = new LspManager({
@@ -240,6 +275,48 @@ describe("tool diagnostics integration", () => {
 		const texts = result.content.filter((c) => c.type === "text").map((c) => ("text" in c ? c.text : ""));
 		expect(texts.some((t) => t?.includes("Diagnostics:\nstub.ts(1,1): error: stub diagnostic"))).toBe(true);
 		expect(result.details?.diagnostics).toBe("stub.ts(1,1): error: stub diagnostic");
+	});
+
+	it("lsp tool routes actions to the provider and validates input", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-tool-test-"));
+		const calls: string[] = [];
+		const navProvider: LspNavigationProvider = {
+			definition: async (path, symbol, line) => {
+				calls.push(`definition ${path} ${symbol} ${line}`);
+				return "def-result";
+			},
+			references: async () => "ref-result",
+			hover: async () => "hover-result",
+			documentSymbols: async () => "symbols-result",
+			fileDiagnostics: async () => "diag-result",
+		};
+		const tool = createLspToolDefinition(tempDir, { provider: navProvider });
+
+		const result = await tool.execute(
+			"t1",
+			{ action: "definition", path: "a.ts", symbol: "foo", line: 12 },
+			undefined,
+			undefined,
+			{} as never,
+		);
+		expect(result.content[0]).toEqual({ type: "text", text: "def-result" });
+		expect(result.details).toEqual({ action: "definition" });
+		expect(calls[0]).toBe(`definition ${join(tempDir, "a.ts")} foo 12`);
+
+		const symbols = await tool.execute("t2", { action: "symbols", path: "a.ts" }, undefined, undefined, {} as never);
+		expect(symbols.content[0]).toEqual({ type: "text", text: "symbols-result" });
+
+		await expect(
+			tool.execute("t3", { action: "references", path: "a.ts" }, undefined, undefined, {} as never),
+		).rejects.toThrow("lsp references requires a symbol name");
+	});
+
+	it("lsp tool reports when LSP is disabled", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-tool-test-"));
+		const tool = createLspToolDefinition(tempDir);
+		await expect(
+			tool.execute("t1", { action: "symbols", path: "a.ts" }, undefined, undefined, {} as never),
+		).rejects.toThrow("LSP is not enabled");
 	});
 
 	it("diagnostics provider failures do not fail the write", async () => {

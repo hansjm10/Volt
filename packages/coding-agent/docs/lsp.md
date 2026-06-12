@@ -1,6 +1,8 @@
-# LSP Diagnostics
+# LSP Diagnostics & Navigation
 
 Volt can run language servers and feed diagnostics back to the model after every `edit` and `write`. When enabled, the tool result includes a `Diagnostics:` block with errors reported by the matching language server, so the model sees type and compile errors immediately instead of discovering them at build time.
+
+When LSP is enabled, the model also gets an `lsp` tool for code navigation: go-to-definition, find-references, hover, file symbol outlines, and on-demand diagnostics.
 
 ## Enabling
 
@@ -23,13 +25,27 @@ Or persistently in `~/.volt/agent/settings.json` (or per project in `.volt/setti
 ## How It Works
 
 - Servers are spawned lazily: the first `edit`/`write` to a file with a matching extension starts the server for that file's project root.
-- The project root is found by walking up from the edited file looking for the server's `rootMarkers` (falling back to the working directory).
+- The project root is found by walking up from the edited file looking for the server's `rootMarkers` (falling back to the working directory). Markers are priority-ordered: for TypeScript, a `tsconfig.json` anywhere up the tree wins over a closer `package.json`, so monorepo subpackages resolve to the directory carrying the language configuration.
 - After each successful `edit`/`write`, volt syncs the new file content to the server and collects diagnostics, using pull diagnostics (`textDocument/diagnostic`) when the server supports them, otherwise waiting up to `settleMs` for the server to publish.
 - Diagnostics at or above the configured `severity` are appended to the tool result and shown in the TUI.
 - One client runs per (server, project root) pair. Servers shut down when the session ends or reloads.
 - A server that fails to start (for example, not installed) is reported once in the tool result and then silenced; after three failed starts it is disabled for the session.
 
 Diagnostics are best-effort: server failures or timeouts never fail the edit itself.
+
+## The lsp Tool
+
+When LSP is enabled, the `lsp` tool is active by default (it still respects `--tools` and `--exclude-tools`). Actions:
+
+| Action | Parameters | Description |
+|--------|------------|-------------|
+| `definition` | `path`, `symbol`, `line?` | Where a symbol is defined, with a source snippet |
+| `references` | `path`, `symbol`, `line?` | All usages of a symbol across the project (capped at 50) |
+| `hover` | `path`, `symbol`, `line?` | Type signature and documentation for a symbol |
+| `symbols` | `path` | Hierarchical symbol outline of a file |
+| `diagnostics` | `path` | Current diagnostics for a file, on demand |
+
+The symbol is located by name: volt finds its position in the file (preferring a word-boundary match on the hinted `line`) and issues the positional LSP request. Errors such as a missing server or symbol are returned as text so the model can react.
 
 ## Built-in Servers
 

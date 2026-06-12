@@ -187,6 +187,10 @@ export class LspClient {
 						synchronization: { dynamicRegistration: false, didSave: false },
 						publishDiagnostics: { versionSupport: true, relatedInformation: false },
 						diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
+						definition: { dynamicRegistration: false, linkSupport: true },
+						references: { dynamicRegistration: false },
+						hover: { dynamicRegistration: false, contentFormat: ["markdown", "plaintext"] },
+						documentSymbol: { dynamicRegistration: false, hierarchicalDocumentSymbolSupport: true },
 					},
 					workspace: { configuration: true, workspaceFolders: true },
 					window: { workDoneProgress: false },
@@ -233,6 +237,20 @@ export class LspClient {
 
 		await this.waitForPublish(key, sinceSeq, settleMs, signal);
 		return this.published.get(key)?.diagnostics ?? [];
+	}
+
+	/** Sync a document to the server and return its URI. Starts the server if needed. */
+	async openDocument(absolutePath: string, content: string): Promise<string> {
+		await this.start();
+		const uri = pathToFileURL(absolutePath).toString();
+		this.syncDocument(uri, absolutePath, content);
+		return uri;
+	}
+
+	/** Send an arbitrary LSP request. Starts the server if needed. */
+	async sendRequest(method: string, params: unknown): Promise<unknown> {
+		await this.start();
+		return this.request(method, params);
 	}
 
 	dispose(): void {

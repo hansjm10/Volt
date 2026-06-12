@@ -392,5 +392,6 @@ ${chalk.bold("Built-in Tool Names:")}
   grep   - Search file contents (read-only, off by default)
   find   - Find files by glob pattern (read-only, off by default)
   ls     - List directory contents (read-only, off by default)
+  lsp    - Language server navigation and diagnostics (on when --lsp or lsp.enabled is set)
 `);
 }
