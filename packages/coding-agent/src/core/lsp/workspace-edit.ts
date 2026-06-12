@@ -100,11 +100,13 @@ export function applyTextEdits(content: string, edits: LspTextEdit[]): string {
 		end: positionToOffset(lineOffsets, content.length, edit.range.end),
 		newText: edit.newText,
 	}));
-	// Apply bottom-up so earlier offsets stay valid.
-	resolved.sort((a, b) => b.start - a.start || b.end - a.end);
+	// Stable-sort ascending, then apply in reverse: earlier offsets stay valid
+	// and same-position inserts keep their array order (per the LSP spec).
+	resolved.sort((a, b) => a.start - b.start || a.end - b.end);
 
 	let result = content;
-	for (const edit of resolved) {
+	for (let index = resolved.length - 1; index >= 0; index--) {
+		const edit = resolved[index];
 		result = result.slice(0, edit.start) + edit.newText + result.slice(Math.max(edit.start, edit.end));
 	}
 	return result;

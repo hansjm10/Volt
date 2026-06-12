@@ -21,6 +21,8 @@
 const pullMode = process.argv.includes("--pull");
 const configMode = process.argv.includes("--config");
 const staleMode = process.argv.includes("--stale");
+const hangMode = process.argv.includes("--hang");
+const initErrorMode = process.argv.includes("--init-error");
 const delayIndex = process.argv.indexOf("--delay");
 const publishDelayMs = delayIndex !== -1 ? Number.parseInt(process.argv[delayIndex + 1], 10) : 50;
 const documents = new Map();
@@ -123,6 +125,12 @@ function handle(message) {
 		return;
 	}
 	if (method === "initialize") {
+		if (initErrorMode) {
+			// Respond with a JSON-RPC error but keep the process running, like a
+			// server that fails its handshake without exiting.
+			send({ jsonrpc: "2.0", id, error: { code: -32603, message: "initialize failed (test mode)" } });
+			return;
+		}
 		send({
 			jsonrpc: "2.0",
 			id,
@@ -291,6 +299,10 @@ function handle(message) {
 		return;
 	}
 	if (method === "textDocument/hover") {
+		if (hangMode) {
+			// Never respond, like a stuck server.
+			return;
+		}
 		send({
 			jsonrpc: "2.0",
 			id,

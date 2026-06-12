@@ -174,6 +174,7 @@ export class LspClient {
 	private rootUri: string;
 	private child: ChildProcess | undefined;
 	private startPromise: Promise<void> | undefined;
+	private startFailure = false;
 	private alive = false;
 	private disposed = false;
 	private exitError: Error | undefined;
@@ -205,10 +206,18 @@ export class LspClient {
 		return this.alive && !this.disposed;
 	}
 
+	/** Whether the spawn/initialize handshake failed. Such a client never recovers. */
+	get startFailed(): boolean {
+		return this.startFailure;
+	}
+
 	/** Spawn the server process and run the initialize handshake. Memoized. */
 	start(): Promise<void> {
 		if (!this.startPromise) {
 			this.startPromise = this.doStart();
+			this.startPromise.catch(() => {
+				this.startFailure = true;
+			});
 		}
 		return this.startPromise;
 	}
@@ -340,7 +349,7 @@ export class LspClient {
 
 		if (this.supportsPullDiagnostics) {
 			try {
-				const result = (await this.request("textDocument/diagnostic", { textDocument: { uri } })) as
+				const result = (await this.request("textDocument/diagnostic", { textDocument: { uri } }, signal)) as
 					| { kind?: string; items?: LspDiagnostic[] }
 					| undefined;
 				if (result?.kind === "full" && Array.isArray(result.items)) {
@@ -430,9 +439,9 @@ export class LspClient {
 	}
 
 	/** Send an arbitrary LSP request. Starts the server if needed. */
-	async sendRequest(method: string, params: unknown): Promise<unknown> {
+	async sendRequest(method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
 		await this.start();
-		return this.request(method, params);
+		return this.request(method, params, signal);
 	}
 
 	/** Whether the document is currently open (synced) on the server. */
@@ -580,19 +589,37 @@ export class LspClient {
 	// JSON-RPC transport
 	// =========================================================================
 
-	private request(method: string, params: unknown): Promise<unknown> {
+	private request(method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
 		if (!this.alive) {
 			return Promise.reject(this.exitError ?? new Error(`LSP server "${this.options.serverName}" is not running`));
+		}
+		if (signal?.aborted) {
+			return Promise.reject(new Error(`LSP request "${method}" was aborted`));
 		}
 		const id = this.nextRequestId++;
 		const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 		return new Promise((resolve, reject) => {
+			// Wrap both settle paths so the timer and abort listener are always
+			// cleaned up, no matter who settles the request (response, exit,
+			// timeout, or abort).
+			const settle = <T>(fn: (value: T) => void): ((value: T) => void) => {
+				return (value: T): void => {
+					clearTimeout(timer);
+					signal?.removeEventListener("abort", onAbort);
+					fn(value);
+				};
+			};
+			const onAbort = (): void => {
+				this.pendingRequests.delete(id);
+				settle(reject)(new Error(`LSP request "${method}" was aborted`));
+			};
 			const timer = setTimeout(() => {
 				this.pendingRequests.delete(id);
-				reject(new Error(`LSP request "${method}" timed out after ${timeoutMs}ms`));
+				settle(reject)(new Error(`LSP request "${method}" timed out after ${timeoutMs}ms`));
 			}, timeoutMs);
 			timer.unref();
-			this.pendingRequests.set(id, { resolve, reject, timer });
+			signal?.addEventListener("abort", onAbort, { once: true });
+			this.pendingRequests.set(id, { resolve: settle(resolve), reject: settle(reject), timer });
 			this.sendMessage({ jsonrpc: "2.0", id, method, params });
 		});
 	}

@@ -23,6 +23,10 @@
 - Fixed LSP diagnostics waits accepting publishes computed against an older document version, which could surface stale results after rapid consecutive edits.
 - Fixed missing-server install hints on Windows: shell spawning masked missing binaries as exit code 1, so a PATH/PATHEXT pre-check now produces the proper ENOENT failure.
 - LSP server start failures caused by a missing binary now include an install hint for the built-in servers (e.g. `npm install -g typescript-language-server typescript`), matched on the command's binary name so custom commands are unaffected.
+- Fixed the `lsp diagnostics` action bypassing the server start-failure breaker: a server that failed to start was respawned on every call instead of being disabled after three attempts.
+- LSP navigation and refactoring requests now honor tool-call abort signals instead of waiting out the 30s request timeout on a stuck server.
+- Fixed a failed LSP initialize handshake leaving a zombie client (and its server process) registered; failed clients are now disposed and removed so retries spawn fresh, and request errors on a healthy server no longer count toward the start-failure breaker.
+- Fixed LSP WorkspaceEdit application reversing the order of same-position insert edits.
 - Reworked the startup ASCII wordmark to an outline letterform so it no longer appears split across a horizontal seam on macOS terminals that add inter-line spacing (the previous solid half-block art was bisected by the line gap).
 
 ### Changed

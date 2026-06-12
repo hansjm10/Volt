@@ -444,23 +444,23 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	// Navigation (LspNavigationProvider)
 	// =========================================================================
 
-	async definition(absolutePath: string, symbol: string, line?: number, _signal?: AbortSignal): Promise<string> {
-		return this.locationQuery("textDocument/definition", "definition", absolutePath, symbol, line);
+	async definition(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string> {
+		return this.locationQuery("textDocument/definition", "definition", absolutePath, symbol, line, signal);
 	}
 
-	async references(absolutePath: string, symbol: string, line?: number, _signal?: AbortSignal): Promise<string> {
-		return this.locationQuery("textDocument/references", "references", absolutePath, symbol, line);
+	async references(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string> {
+		return this.locationQuery("textDocument/references", "references", absolutePath, symbol, line, signal);
 	}
 
-	async implementations(absolutePath: string, symbol: string, line?: number, _signal?: AbortSignal): Promise<string> {
-		return this.locationQuery("textDocument/implementation", "implementations", absolutePath, symbol, line);
+	async implementations(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string> {
+		return this.locationQuery("textDocument/implementation", "implementations", absolutePath, symbol, line, signal);
 	}
 
-	async typeDefinition(absolutePath: string, symbol: string, line?: number, _signal?: AbortSignal): Promise<string> {
-		return this.locationQuery("textDocument/typeDefinition", "type definition", absolutePath, symbol, line);
+	async typeDefinition(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string> {
+		return this.locationQuery("textDocument/typeDefinition", "type definition", absolutePath, symbol, line, signal);
 	}
 
-	async hover(absolutePath: string, symbol: string, line?: number, _signal?: AbortSignal): Promise<string> {
+	async hover(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string> {
 		const session = await this.openSession(absolutePath);
 		if ("error" in session) {
 			return session.error;
@@ -470,10 +470,11 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			return `Symbol "${symbol}" not found in ${this.displayPath(absolutePath)}.`;
 		}
 		try {
-			const result = (await session.client.sendRequest("textDocument/hover", {
-				textDocument: { uri: session.uri },
-				position,
-			})) as LspHoverResult | null;
+			const result = (await session.client.sendRequest(
+				"textDocument/hover",
+				{ textDocument: { uri: session.uri }, position },
+				signal,
+			)) as LspHoverResult | null;
 			const text = result ? hoverContentsToText(result.contents).trim() : "";
 			return text.length > 0 ? text : `No hover information for "${symbol}".`;
 		} catch (error) {
@@ -481,15 +482,17 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		}
 	}
 
-	async documentSymbols(absolutePath: string, _signal?: AbortSignal): Promise<string> {
+	async documentSymbols(absolutePath: string, signal?: AbortSignal): Promise<string> {
 		const session = await this.openSession(absolutePath);
 		if ("error" in session) {
 			return session.error;
 		}
 		try {
-			const result = (await session.client.sendRequest("textDocument/documentSymbol", {
-				textDocument: { uri: session.uri },
-			})) as LspDocumentSymbol[] | null;
+			const result = (await session.client.sendRequest(
+				"textDocument/documentSymbol",
+				{ textDocument: { uri: session.uri } },
+				signal,
+			)) as LspDocumentSymbol[] | null;
 			if (!result || result.length === 0) {
 				return `No symbols found in ${this.displayPath(absolutePath)}.`;
 			}
@@ -510,7 +513,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		symbol: string,
 		direction: "incoming" | "outgoing",
 		line?: number,
-		_signal?: AbortSignal,
+		signal?: AbortSignal,
 	): Promise<string> {
 		const session = await this.openSession(absolutePath);
 		if ("error" in session) {
@@ -521,17 +524,18 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			return `Symbol "${symbol}" not found in ${this.displayPath(absolutePath)}.`;
 		}
 		try {
-			const items = (await session.client.sendRequest("textDocument/prepareCallHierarchy", {
-				textDocument: { uri: session.uri },
-				position,
-			})) as CallHierarchyItem[] | null;
+			const items = (await session.client.sendRequest(
+				"textDocument/prepareCallHierarchy",
+				{ textDocument: { uri: session.uri }, position },
+				signal,
+			)) as CallHierarchyItem[] | null;
 			if (!items || items.length === 0) {
 				return `No call hierarchy available for "${symbol}" (it may not be a callable symbol).`;
 			}
 			const item = items[0];
 			const label = direction === "incoming" ? "callers of" : "calls made by";
 			const method = direction === "incoming" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls";
-			const calls = (await session.client.sendRequest(method, { item })) as Array<{
+			const calls = (await session.client.sendRequest(method, { item }, signal)) as Array<{
 				from?: CallHierarchyItem;
 				to?: CallHierarchyItem;
 			}> | null;
@@ -559,13 +563,13 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		}
 	}
 
-	async workspaceSymbols(absolutePath: string, query: string, _signal?: AbortSignal): Promise<string> {
+	async workspaceSymbols(absolutePath: string, query: string, signal?: AbortSignal): Promise<string> {
 		const session = await this.openSession(absolutePath);
 		if ("error" in session) {
 			return session.error;
 		}
 		try {
-			const result = (await session.client.sendRequest("workspace/symbol", { query })) as Array<{
+			const result = (await session.client.sendRequest("workspace/symbol", { query }, signal)) as Array<{
 				name: string;
 				kind: number;
 				containerName?: string;
@@ -596,21 +600,16 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	}
 
 	async fileDiagnostics(absolutePath: string, signal?: AbortSignal): Promise<string> {
-		const server = this.findServer(absolutePath);
-		if (!server) {
-			return this.noServerMessage(absolutePath);
+		// openSession applies the start-failure breaker and failure accounting,
+		// so a broken server is not respawned on every diagnostics request.
+		const session = await this.openSession(absolutePath);
+		if ("error" in session) {
+			return session.error;
 		}
-		let content: string;
 		try {
-			content = await readFile(absolutePath, "utf-8");
-		} catch (error) {
-			return `Could not read ${this.displayPath(absolutePath)}: ${error instanceof Error ? error.message : String(error)}`;
-		}
-		const client = this.getClient(server, absolutePath);
-		try {
-			const diagnostics = await client.getDiagnostics(
+			const diagnostics = await session.client.getDiagnostics(
 				absolutePath,
-				content,
+				session.content,
 				this.config.settleMs,
 				this.config.firstSettleMs,
 				signal,
@@ -629,6 +628,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		absolutePath: string,
 		symbol: string,
 		line?: number,
+		signal?: AbortSignal,
 	): Promise<string> {
 		const session = await this.openSession(absolutePath);
 		if ("error" in session) {
@@ -639,11 +639,15 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			return `Symbol "${symbol}" not found in ${this.displayPath(absolutePath)}.`;
 		}
 		try {
-			const result = await session.client.sendRequest(method, {
-				textDocument: { uri: session.uri },
-				position,
-				...(method === "textDocument/references" ? { context: { includeDeclaration: true } } : {}),
-			});
+			const result = await session.client.sendRequest(
+				method,
+				{
+					textDocument: { uri: session.uri },
+					position,
+					...(method === "textDocument/references" ? { context: { includeDeclaration: true } } : {}),
+				},
+				signal,
+			);
 			const locations = normalizeLocations(result);
 			if (locations.length === 0) {
 				return `No ${label} found for "${symbol}".`;
@@ -696,7 +700,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		symbol: string,
 		newName: string,
 		line?: number,
-		_signal?: AbortSignal,
+		signal?: AbortSignal,
 	): Promise<string> {
 		const session = await this.openSession(absolutePath);
 		if ("error" in session) {
@@ -707,11 +711,11 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			return `Symbol "${symbol}" not found in ${this.displayPath(absolutePath)}.`;
 		}
 		try {
-			const result = (await session.client.sendRequest("textDocument/rename", {
-				textDocument: { uri: session.uri },
-				position,
-				newName,
-			})) as LspWorkspaceEdit | null;
+			const result = (await session.client.sendRequest(
+				"textDocument/rename",
+				{ textDocument: { uri: session.uri }, position, newName },
+				signal,
+			)) as LspWorkspaceEdit | null;
 			if (!result || normalizeWorkspaceEdit(result).length === 0) {
 				return `Rename of "${symbol}" is not available at this position.`;
 			}
@@ -725,7 +729,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	async codeFix(
 		absolutePath: string,
 		options: { symbol?: string; line?: number; title?: string; kind?: string },
-		_signal?: AbortSignal,
+		signal?: AbortSignal,
 	): Promise<string> {
 		const session = await this.openSession(absolutePath);
 		if ("error" in session) {
@@ -768,7 +772,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 					session.content,
 					this.config.settleMs,
 					this.config.firstSettleMs,
-					_signal,
+					signal,
 				);
 			} catch {
 				// Code actions may still be available without diagnostics context.
@@ -776,11 +780,15 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		}
 		const diagnostics = published.filter((diagnostic) => rangesOverlap(diagnostic.range, range));
 		try {
-			const result = await session.client.sendRequest("textDocument/codeAction", {
-				textDocument: { uri: session.uri },
-				range,
-				context: { diagnostics, ...(options.kind ? { only: [options.kind] } : {}) },
-			});
+			const result = await session.client.sendRequest(
+				"textDocument/codeAction",
+				{
+					textDocument: { uri: session.uri },
+					range,
+					context: { diagnostics, ...(options.kind ? { only: [options.kind] } : {}) },
+				},
+				signal,
+			);
 			const actions = normalizeCodeActions(result);
 			if (actions.length === 0) {
 				return "No code actions available at this position.";
@@ -801,18 +809,22 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			} else {
 				return `Multiple code actions available; rerun with a title to apply one:\n${actions.map(describe).join("\n")}`;
 			}
-			return await this.applyCodeAction(session.client, chosen);
+			return await this.applyCodeAction(session.client, chosen, signal);
 		} catch (error) {
 			return this.describeRequestError(absolutePath, error);
 		}
 	}
 
-	private async applyCodeAction(client: LspClient, action: NormalizedCodeAction): Promise<string> {
+	private async applyCodeAction(
+		client: LspClient,
+		action: NormalizedCodeAction,
+		signal?: AbortSignal,
+	): Promise<string> {
 		let edit = action.edit;
 		if (!edit) {
 			// Servers may defer the edit to codeAction/resolve.
 			try {
-				const resolved = (await client.sendRequest("codeAction/resolve", action.raw)) as {
+				const resolved = (await client.sendRequest("codeAction/resolve", action.raw, signal)) as {
 					edit?: LspWorkspaceEdit;
 				} | null;
 				edit = resolved?.edit;
@@ -827,10 +839,11 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		if (action.command) {
 			// Command-based actions apply their edits via workspace/applyEdit.
 			this.serverApplyEditSummaries = [];
-			await client.sendRequest("workspace/executeCommand", {
-				command: action.command.command,
-				arguments: action.command.arguments ?? [],
-			});
+			await client.sendRequest(
+				"workspace/executeCommand",
+				{ command: action.command.command, arguments: action.command.arguments ?? [] },
+				signal,
+			);
 			const summaries = this.serverApplyEditSummaries;
 			this.serverApplyEditSummaries = [];
 			if (summaries.length > 0) {
@@ -1011,15 +1024,22 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	}
 
 	private handleClientError(server: ResolvedLspServerConfig, client: LspClient, error: unknown): string | undefined {
-		if (!client.isAlive) {
-			for (const [key, value] of this.clients) {
-				if (value === client) {
-					this.clients.delete(key);
-					this.lastUsedAt.delete(key);
-				}
-			}
-			client.dispose();
+		const message = error instanceof Error ? error.message : String(error);
+		if (client.isAlive && !client.startFailed) {
+			// Request-level failure on a started, healthy server: report it without
+			// counting toward the start-failure breaker.
+			return `lsp(${server.name}): ${message}`;
 		}
+		// Remove and dispose the failed client (this also kills a process stuck
+		// in the handshake) so the next call attempts a genuinely fresh start
+		// instead of replaying the memoized failure.
+		for (const [key, value] of this.clients) {
+			if (value === client) {
+				this.clients.delete(key);
+				this.lastUsedAt.delete(key);
+			}
+		}
+		client.dispose();
 		const failure = this.startFailures.get(server.name) ?? { count: 0, reported: false };
 		failure.count++;
 		this.startFailures.set(server.name, failure);
@@ -1027,7 +1047,6 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			return undefined;
 		}
 		failure.reported = true;
-		const message = error instanceof Error ? error.message : String(error);
 		const hint = message.includes("ENOENT") ? installHintForCommand(server.command) : undefined;
 		return `lsp(${server.name}): ${message}${hint ? `. ${hint}` : ""} (further failures for this server will be silent)`;
 	}

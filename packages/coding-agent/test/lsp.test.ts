@@ -36,6 +36,8 @@ function fakeServerConfig(options?: {
 	publishDelayMs?: number;
 	idleShutdownMs?: number;
 	stale?: boolean;
+	hang?: boolean;
+	initError?: boolean;
 	traceFile?: string;
 }) {
 	return resolveLspConfig({
@@ -58,6 +60,8 @@ function fakeServerConfig(options?: {
 					FAKE_SERVER,
 					...(options?.pull ? ["--pull"] : []),
 					...(options?.stale ? ["--stale"] : []),
+					...(options?.hang ? ["--hang"] : []),
+					...(options?.initError ? ["--init-error"] : []),
 					...(options?.publishDelayMs !== undefined ? ["--delay", String(options.publishDelayMs)] : []),
 				],
 				fileExtensions: [".foo"],
@@ -548,6 +552,59 @@ describe("LspManager", () => {
 		expect(second).toBeUndefined();
 	});
 
+	it("applies the start-failure breaker to fileDiagnostics", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
+		manager = new LspManager({
+			cwd: tempDir,
+			config: resolveLspConfig({
+				enabled: true,
+				servers: {
+					typescript: { enabled: false },
+					python: { enabled: false },
+					go: { enabled: false },
+					rust: { enabled: false },
+					missing: { command: ["volt-test-nonexistent-lsp-server"], fileExtensions: [".foo"] },
+				},
+			}),
+		});
+		const filePath = join(tempDir, "test.foo");
+		writeFileSync(filePath, "x\n");
+		for (let attempt = 0; attempt < 3; attempt++) {
+			expect(await manager.fileDiagnostics(filePath)).toContain("lsp(missing)");
+		}
+		// After three failed starts the breaker must stop spawn attempts.
+		const fourth = await manager.fileDiagnostics(filePath);
+		expect(fourth).toContain("server unavailable after 3");
+		// Failed clients must not linger in the status list.
+		expect(manager.getStatus()).toEqual([]);
+	});
+
+	it("aborts a hanging navigation request when the signal fires", async () => {
+		const manager = setup({ hang: true });
+		const filePath = join(tempDir, "test.foo");
+		writeFileSync(filePath, "symbol here\n");
+		const controller = new AbortController();
+		const abortTimer = setTimeout(() => controller.abort(), 250);
+		const startedAt = Date.now();
+		const result = await manager.hover(filePath, "symbol", undefined, controller.signal);
+		clearTimeout(abortTimer);
+		expect(Date.now() - startedAt).toBeLessThan(5000);
+		expect(result).toContain("aborted");
+	}, 10000);
+
+	it("removes the client when the initialize handshake fails", async () => {
+		const manager = setup({ initError: true });
+		const filePath = join(tempDir, "test.foo");
+		const content = "has ERROR\n";
+		writeFileSync(filePath, content);
+		const first = await manager.getDiagnostics(filePath, content);
+		expect(first).toContain("lsp(fake)");
+		expect(first).toContain("initialize failed");
+		// The failed client must not linger as a zombie in the status list (its
+		// process would also keep running).
+		expect(manager.getStatus()).toEqual([]);
+	});
+
 	it("includes an install hint when a built-in server binary is missing", async () => {
 		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
 		manager = new LspManager({
@@ -607,6 +664,15 @@ describe("workspace edits", () => {
 			{ range: { start: { line: 2, character: 0 }, end: { line: 2, character: 0 } }, newText: "inserted " },
 		]);
 		expect(result).toBe("ONE two\nthree FOUR\ninserted five\n");
+	});
+
+	it("applies same-position inserts in array order", () => {
+		const position = { line: 0, character: 1 };
+		const result = applyTextEdits("ab", [
+			{ range: { start: position, end: position }, newText: "X" },
+			{ range: { start: position, end: position }, newText: "Y" },
+		]);
+		expect(result).toBe("aXYb");
 	});
 
 	it("applies multi-line range replacements and clamps out-of-range positions", () => {
