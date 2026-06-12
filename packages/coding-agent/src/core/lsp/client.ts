@@ -394,13 +394,19 @@ export class LspClient {
 		// An unversioned publish that arrives after our didChange can still have
 		// been computed against the pre-change content (the version field is
 		// optional in LSP, and cross-file invalidation from an earlier edit can
-		// race the sync). When this document's content just changed, re-wait once
-		// for a fresher publish before trusting an unversioned one. For servers
-		// that tag publishes with versions, an unversioned one is anomalous and
-		// the versioned republish will resolve the wait promptly, so use the full
-		// remaining deadline; for servers that never send versions, cap the
-		// re-wait so every edit does not stall for the whole settle window.
-		if (changed && entry !== undefined && entry.seq > sinceSeq && entry.version === undefined) {
+		// race the sync). When this document's content just changed — or its
+		// dependencies were refreshed, which can equally change its diagnostics —
+		// re-wait once for a fresher publish before trusting an unversioned one.
+		// For servers that tag publishes with versions, an unversioned one is
+		// anomalous and the versioned republish will resolve the wait promptly, so
+		// use the full remaining deadline; for servers that never send versions,
+		// cap the re-wait so every edit does not stall for the whole settle window.
+		if (
+			(changed || refreshed.length > 0) &&
+			entry !== undefined &&
+			entry.seq > sinceSeq &&
+			entry.version === undefined
+		) {
 			const remainingMs = this.everPublishedVersioned
 				? deadline - Date.now()
 				: Math.min(deadline - Date.now(), UNVERSIONED_REPUBLISH_GRACE_MS);
@@ -743,9 +749,12 @@ export class LspClient {
 				// those whose positions point past the end of the synced content:
 				// they describe an older snapshot and would otherwise satisfy the
 				// settle wait (and the cross-file sweep) with stale diagnostics.
+				// Tolerate line === lineCount: the spec tells clients to clamp
+				// out-of-range positions, and linters legitimately emit end-of-file
+				// diagnostics one past the last line (e.g. missing trailing newline).
 				if (params.version === undefined && document !== undefined && diagnostics.length > 0) {
 					const lineCount = document.content.split("\n").length;
-					if (diagnostics.some((diagnostic) => (diagnostic.range?.start?.line ?? 0) >= lineCount)) {
+					if (diagnostics.some((diagnostic) => (diagnostic.range?.start?.line ?? 0) > lineCount)) {
 						this.tracer?.log(
 							this.options.serverName,
 							"info",

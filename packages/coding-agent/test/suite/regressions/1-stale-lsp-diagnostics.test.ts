@@ -80,6 +80,42 @@ describe("stale cross-file LSP diagnostics (issue #1)", () => {
 		expect(result).toBeUndefined();
 	});
 
+	it("re-waits past an unversioned publish when only dependencies were refreshed", async () => {
+		// Editing A on disk (outside the edit/write tools) triggers a dependency
+		// refresh during B's collection. The server immediately publishes a bogus
+		// unversioned in-range result for B computed against the pre-refresh
+		// state; the genuine versioned publish follows. B's own content is
+		// unchanged, so only the dependency-refresh re-wait can avoid reporting
+		// the bogus one.
+		const manager = setup({ serverArgs: ["--stale-dep"] });
+		const fileA = join(tempDir, "a.foo");
+		const fileB = join(tempDir, "b.foo");
+		writeFileSync(fileA, "alpha\n");
+		writeFileSync(fileB, "beta\n");
+		expect(await manager.getDiagnostics(fileA, "alpha\n")).toBeUndefined();
+		expect(await manager.getDiagnostics(fileB, "beta\n")).toBeUndefined();
+
+		writeFileSync(fileA, "alpha two\n");
+		const result = await manager.getDiagnostics(fileB, "beta\n");
+		expect(result).toBeUndefined();
+	});
+
+	it("keeps unversioned end-of-file diagnostics one past the last line", async () => {
+		// Linters legitimately report end-of-file rules (e.g. missing trailing
+		// newline) at line === lineCount; the spec tells clients to clamp such
+		// positions, not discard them. The arrival-time staleness check must not
+		// suppress these publishes.
+		const manager = setup({
+			serverArgs: ["--eof-unversioned"],
+			settleMs: 1000,
+			firstSettleMs: 3000,
+		});
+		const filePath = join(tempDir, "test.foo");
+		writeFileSync(filePath, "clean");
+		const result = await manager.getDiagnostics(filePath, "clean");
+		expect(result).toContain("missing trailing newline");
+	});
+
 	it("drops unversioned publishes whose positions point past the synced content", async () => {
 		// The bogus unversioned publish points at line 10000 of a two-line
 		// document — it can only describe an older snapshot. The genuine

@@ -25,7 +25,9 @@ const staleMode = process.argv.includes("--stale");
 const staleUnversionedMode = process.argv.includes("--stale-unversioned");
 const staleOobMode = process.argv.includes("--stale-oob");
 const staleCrossMode = process.argv.includes("--stale-cross");
+const staleDepMode = process.argv.includes("--stale-dep");
 const noVersionMode = process.argv.includes("--no-version");
+const eofUnversionedMode = process.argv.includes("--eof-unversioned");
 const hangMode = process.argv.includes("--hang");
 const initErrorMode = process.argv.includes("--init-error");
 const delayIndex = process.argv.indexOf("--delay");
@@ -276,6 +278,31 @@ function handle(message) {
 			}, 10);
 			publishLater(changedUri);
 			return;
+		}
+		if (staleDepMode) {
+			// Immediately publish a bogus unversioned in-range result for every
+			// *other* open document, like a server recomputing dependents against
+			// an older snapshot. The genuine versioned republish follows after the
+			// publish delay.
+			const changedUri = params.textDocument.uri;
+			for (const uri of documents.keys()) {
+				if (uri === changedUri) continue;
+				send({
+					jsonrpc: "2.0",
+					method: "textDocument/publishDiagnostics",
+					params: {
+						uri,
+						diagnostics: [
+							{
+								range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+								severity: 1,
+								source: "fake",
+								message: "stale dependency result",
+							},
+						],
+					},
+				});
+			}
 		}
 		publishLater();
 		return;
@@ -550,10 +577,26 @@ function publishLater(onlyUri) {
 	setTimeout(() => {
 		for (const [uri, text] of documents) {
 			if (onlyUri !== undefined && uri !== onlyUri) continue;
+			const diagnostics = scan(text, uri);
+			if (eofUnversionedMode && !text.endsWith("\n")) {
+				// End-of-file rule one past the last line, like real linters report
+				// a missing trailing newline. Published without a version field.
+				const eofLine = text.split("\n").length;
+				diagnostics.push({
+					range: { start: { line: eofLine, character: 0 }, end: { line: eofLine, character: 0 } },
+					severity: 1,
+					source: "fake",
+					message: "missing trailing newline at end of file",
+				});
+			}
 			send({
 				jsonrpc: "2.0",
 				method: "textDocument/publishDiagnostics",
-				params: { uri, ...(noVersionMode ? {} : { version: versions.get(uri) }), diagnostics: scan(text, uri) },
+				params: {
+					uri,
+					...(noVersionMode || eofUnversionedMode ? {} : { version: versions.get(uri) }),
+					diagnostics,
+				},
 			});
 		}
 	}, publishDelayMs);
