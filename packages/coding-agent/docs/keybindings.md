@@ -93,7 +93,7 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
-| `app.session.new` | *(none)* | Start a new session (`/new`) |
+| `app.session.new` | *(none)* | Start a new session (`/clear`) |
 | `app.session.tree` | *(none)* | Open session tree navigator (`/tree`) |
 | `app.session.fork` | *(none)* | Fork current session (`/fork`) |
 | `app.session.resume` | *(none)* | Open session resume picker (`/resume`) |

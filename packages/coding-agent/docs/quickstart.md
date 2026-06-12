@@ -140,7 +140,7 @@ volt --name "my task"    # Set session display name at startup
 volt --session <path|id> # Open a specific session
 ```
 
-Inside volt, use `/resume`, `/new`, `/tree`, `/fork`, and `/clone` to manage sessions.
+Inside volt, use `/resume`, `/clear`, `/tree`, `/fork`, and `/clone` to manage sessions.
 
 ### Non-interactive mode
 

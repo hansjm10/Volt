@@ -304,7 +304,7 @@ user sends prompt ────────────────────�
                                                            │
 user sends another prompt ◄────────────────────────────────┘
 
-/new (new session) or /resume (switch session)
+/clear (new session) or /resume (switch session)
   ├─► session_before_switch (can cancel)
   ├─► session_shutdown
   ├─► session_start { reason: "new" | "resume", previousSessionFile? }
@@ -391,7 +391,7 @@ volt.on("session_start", async (event, ctx) => {
 
 #### session_before_switch
 
-Fired before starting a new session (`/new`) or switching sessions (`/resume`).
+Fired before starting a new session (`/clear`) or switching sessions (`/resume`).
 
 ```typescript
 volt.on("session_before_switch", async (event, ctx) => {

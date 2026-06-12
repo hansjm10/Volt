@@ -715,7 +715,7 @@ const { session: opened } = await createAgentSession({
 const currentProjectSessions = await SessionManager.list(process.cwd());
 const allSessions = await SessionManager.listAll(process.cwd());
 
-// Session replacement API for /new, /resume, /fork, /clone, and import flows.
+// Session replacement API for /clear, /resume, /fork, /clone, and import flows.
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
   const services = await createAgentSessionServices({ cwd });
   return {

@@ -33,7 +33,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "trust", description: "Save project trust decision for future sessions" },
 	{ name: "login", description: "Configure provider authentication" },
 	{ name: "logout", description: "Remove provider authentication" },
-	{ name: "new", description: "Start a new session" },
+	{ name: "clear", description: "Start a new session" },
 	{ name: "compact", description: "Manually compact the session context" },
 	{ name: "resume", description: "Resume a different session" },
 	{ name: "reload", description: "Reload keybindings, extensions, skills, prompts, and themes" },
