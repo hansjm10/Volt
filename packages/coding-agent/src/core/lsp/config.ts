@@ -93,6 +93,26 @@ const DEFAULT_LSP_SERVERS: Record<
 		fileExtensions: [".rs"],
 		rootMarkers: ["Cargo.toml"],
 	},
+	cpp: {
+		command: ["clangd"],
+		fileExtensions: [".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh"],
+		rootMarkers: ["compile_commands.json", "compile_flags.txt", ".clangd"],
+	},
+	zig: {
+		command: ["zls"],
+		fileExtensions: [".zig"],
+		rootMarkers: ["build.zig"],
+	},
+	lua: {
+		command: ["lua-language-server"],
+		fileExtensions: [".lua"],
+		rootMarkers: [".luarc.json", ".luarc.jsonc"],
+	},
+	bash: {
+		command: ["bash-language-server", "start"],
+		fileExtensions: [".sh", ".bash"],
+		rootMarkers: [],
+	},
 };
 
 const SEVERITY_TO_NUMBER: Record<LspSeverity, number> = {
@@ -167,6 +187,7 @@ const LANGUAGE_IDS: Record<string, string> = {
 	".cc": "cpp",
 	".cxx": "cpp",
 	".hpp": "cpp",
+	".hh": "cpp",
 	".java": "java",
 	".rb": "ruby",
 	".php": "php",

@@ -20,6 +20,8 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 export const LSP_ACTIONS = [
 	"definition",
 	"references",
+	"implementations",
+	"type-definition",
 	"callers",
 	"callees",
 	"hover",
@@ -40,6 +42,8 @@ export type LspAction = (typeof LSP_ACTIONS)[number];
 export interface LspNavigationProvider {
 	definition(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string>;
 	references(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string>;
+	implementations(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string>;
+	typeDefinition(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string>;
 	hover(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string>;
 	documentSymbols(absolutePath: string, signal?: AbortSignal): Promise<string>;
 	workspaceSymbols(absolutePath: string, query: string, signal?: AbortSignal): Promise<string>;
@@ -54,7 +58,7 @@ export interface LspNavigationProvider {
 	rename(absolutePath: string, symbol: string, newName: string, line?: number, signal?: AbortSignal): Promise<string>;
 	codeFix(
 		absolutePath: string,
-		options: { symbol?: string; line?: number; title?: string },
+		options: { symbol?: string; line?: number; title?: string; kind?: string },
 		signal?: AbortSignal,
 	): Promise<string>;
 }
@@ -62,7 +66,7 @@ export interface LspNavigationProvider {
 const lspSchema = Type.Object({
 	action: StringEnum(LSP_ACTIONS, {
 		description:
-			"definition: where a symbol is defined. references: all usages of a symbol. callers: functions that call a symbol. callees: functions a symbol calls. hover: type/docs for a symbol. symbols: outline of a file, or project-wide symbol search when symbol is provided. diagnostics: current errors in a file. rename: rename a symbol across the project. fix: apply a quick fix (e.g. add a missing import).",
+			"definition: where a symbol is defined. references: all usages of a symbol. implementations: implementations of an interface/abstract symbol. type-definition: where a symbol's type is defined. callers: functions that call a symbol. callees: functions a symbol calls. hover: type/docs for a symbol. symbols: outline of a file, or project-wide symbol search when symbol is provided. diagnostics: current errors in a file. rename: rename a symbol across the project. fix: apply a quick fix (e.g. add a missing import) or a kind like source.organizeImports.",
 	}),
 	path: Type.String({ description: "Path to the file to query (relative or absolute)" }),
 	symbol: Type.Optional(
@@ -85,6 +89,12 @@ const lspSchema = Type.Object({
 	title: Type.Optional(
 		Type.String({
 			description: "Code action title to apply when fix reports multiple available actions.",
+		}),
+	),
+	kind: Type.Optional(
+		Type.String({
+			description:
+				'Code action kind filter for fix, e.g. "source.organizeImports" to organize imports or "source.fixAll" to apply all safe fixes (requested over the whole file when no symbol/line is given).',
 		}),
 	),
 });
@@ -132,7 +142,7 @@ export function createLspToolDefinition(
 		name: "lsp",
 		label: "lsp",
 		description:
-			"Query language servers for code intelligence and refactoring. Actions: definition (where a symbol is defined), references (all usages of a symbol), callers (functions calling a symbol), callees (functions a symbol calls), hover (type signature and docs), symbols (file outline, or project-wide symbol search when symbol is provided), diagnostics (current errors in a file), rename (rename a symbol across the project; requires symbol and newName), fix (apply a quick fix for diagnostics at a symbol or line; pass title to choose among multiple). definition/references/callers/callees/hover/rename require a symbol name; pass line when the symbol occurs more than once.",
+			"Query language servers for code intelligence and refactoring. Actions: definition (where a symbol is defined), references (all usages of a symbol), implementations (implementations of an interface/abstract symbol), type-definition (where a symbol's type is defined), callers (functions calling a symbol), callees (functions a symbol calls), hover (type signature and docs), symbols (file outline, or project-wide symbol search when symbol is provided), diagnostics (current errors in a file), rename (rename a symbol across the project; requires symbol and newName), fix (apply a quick fix for diagnostics at a symbol or line; pass title to choose among multiple, or kind such as source.organizeImports). definition/references/implementations/type-definition/callers/callees/hover/rename require a symbol name; pass line when the symbol occurs more than once.",
 		promptSnippet:
 			"Code intelligence via language servers: definition, references, hover, symbols, diagnostics, rename, quick fixes",
 		promptGuidelines: [
@@ -148,6 +158,8 @@ export function createLspToolDefinition(
 			const needsSymbol =
 				input.action === "definition" ||
 				input.action === "references" ||
+				input.action === "implementations" ||
+				input.action === "type-definition" ||
 				input.action === "callers" ||
 				input.action === "callees" ||
 				input.action === "hover" ||
@@ -166,6 +178,12 @@ export function createLspToolDefinition(
 					break;
 				case "references":
 					text = await provider.references(absolutePath, input.symbol!, input.line, signal);
+					break;
+				case "implementations":
+					text = await provider.implementations(absolutePath, input.symbol!, input.line, signal);
+					break;
+				case "type-definition":
+					text = await provider.typeDefinition(absolutePath, input.symbol!, input.line, signal);
 					break;
 				case "callers":
 					text = await provider.callHierarchy(absolutePath, input.symbol!, "incoming", input.line, signal);
@@ -190,7 +208,7 @@ export function createLspToolDefinition(
 				case "fix":
 					text = await provider.codeFix(
 						absolutePath,
-						{ symbol: input.symbol, line: input.line, title: input.title },
+						{ symbol: input.symbol, line: input.line, title: input.title, kind: input.kind },
 						signal,
 					);
 					break;

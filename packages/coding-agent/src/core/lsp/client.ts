@@ -230,6 +230,8 @@ export class LspClient {
 						publishDiagnostics: { versionSupport: true, relatedInformation: false },
 						diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
 						definition: { dynamicRegistration: false, linkSupport: true },
+						implementation: { dynamicRegistration: false, linkSupport: true },
+						typeDefinition: { dynamicRegistration: false, linkSupport: true },
 						references: { dynamicRegistration: false },
 						hover: { dynamicRegistration: false, contentFormat: ["markdown", "plaintext"] },
 						documentSymbol: { dynamicRegistration: false, hierarchicalDocumentSymbolSupport: true },

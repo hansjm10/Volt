@@ -43,13 +43,15 @@ When LSP is enabled, the `lsp` tool is active by default (it still respects `--t
 |--------|------------|-------------|
 | `definition` | `path`, `symbol`, `line?` | Where a symbol is defined, with a source snippet |
 | `references` | `path`, `symbol`, `line?` | All usages of a symbol across the project (capped at 50) |
+| `implementations` | `path`, `symbol`, `line?` | Implementations of an interface or abstract symbol |
+| `type-definition` | `path`, `symbol`, `line?` | Where a symbol's type is defined |
 | `callers` | `path`, `symbol`, `line?` | Functions that call the symbol (call hierarchy, one level) |
 | `callees` | `path`, `symbol`, `line?` | Functions the symbol calls (call hierarchy, one level) |
 | `hover` | `path`, `symbol`, `line?` | Type signature and documentation for a symbol |
 | `symbols` | `path`, `symbol?` | Hierarchical symbol outline of a file; with `symbol`, a project-wide symbol search (the `path` routes the query to the right server) |
 | `diagnostics` | `path` | Current diagnostics for a file, on demand |
 | `rename` | `path`, `symbol`, `newName`, `line?` | Rename a symbol across the project (applies the server's WorkspaceEdit to disk) |
-| `fix` | `path`, `symbol?` or `line?`, `title?` | Apply a quick fix (e.g. add a missing import). A single available action applies automatically; multiple actions are listed and chosen via `title` |
+| `fix` | `path`, `symbol?` or `line?`, `title?`, `kind?` | Apply a quick fix (e.g. add a missing import). A single available action applies automatically; multiple actions are listed and chosen via `title`. `kind` filters by code-action kind, e.g. `source.organizeImports` or `source.fixAll` over the whole file |
 
 The symbol is located by name: volt finds its position in the file (preferring a word-boundary match on the hinted `line`) and issues the positional LSP request. Errors such as a missing server or symbol are returned as text so the model can react.
 
@@ -65,6 +67,10 @@ The matching server must be installed and on your `PATH`. Built-in defaults:
 | `python` | `pyright-langserver --stdio` | `.py` `.pyi` | `pyrightconfig.json`, `pyproject.toml`, `setup.py`, `requirements.txt` |
 | `go` | `gopls` | `.go` | `go.mod`, `go.work` |
 | `rust` | `rust-analyzer` | `.rs` | `Cargo.toml` |
+| `cpp` | `clangd` | `.c` `.h` `.cpp` `.cc` `.cxx` `.hpp` `.hh` | `compile_commands.json`, `compile_flags.txt`, `.clangd` |
+| `zig` | `zls` | `.zig` | `build.zig` |
+| `lua` | `lua-language-server` | `.lua` | `.luarc.json`, `.luarc.jsonc` |
+| `bash` | `bash-language-server start` | `.sh` `.bash` | (working directory) |
 
 ## Configuration
 

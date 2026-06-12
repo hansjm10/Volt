@@ -66,7 +66,10 @@ describe("resolveLspConfig", () => {
 	it("is disabled by default and includes built-in servers", () => {
 		const config = resolveLspConfig(undefined);
 		expect(config.enabled).toBe(false);
-		expect(config.servers.map((s) => s.name)).toContain("typescript");
+		const names = config.servers.map((s) => s.name);
+		for (const name of ["typescript", "python", "go", "rust", "cpp", "zig", "lua", "bash"]) {
+			expect(names).toContain(name);
+		}
 		expect(config.maxSeverity).toBe(1);
 		expect(config.settleMs).toBe(1500);
 		expect(config.firstSettleMs).toBe(10000);
@@ -270,6 +273,31 @@ describe("LspManager", () => {
 		const second = await manager.getDiagnostics(fileB, stillBrokenB);
 		expect(second).toContain("error: found ERROR on line 1");
 		expect(second).not.toContain("Newly failing");
+	});
+
+	it("reports implementations and type definitions", async () => {
+		const manager = setup();
+		const filePath = join(tempDir, "test.foo");
+		writeFileSync(filePath, "interface Target\nclass Impl\n");
+		const implementations = await manager.implementations(filePath, "Target");
+		expect(implementations).toContain("test.foo:2:1");
+		expect(implementations).toContain("class Impl");
+
+		const typeDefinition = await manager.typeDefinition(filePath, "Impl", 2);
+		expect(typeDefinition).toContain("test.foo:1:1");
+		expect(typeDefinition).toContain("interface Target");
+	});
+
+	it("applies kind-filtered code actions like organize imports", async () => {
+		const manager = setup();
+		const filePath = join(tempDir, "test.foo");
+		writeFileSync(filePath, "UNSORTED imports here\n");
+		const result = await manager.codeFix(filePath, { kind: "source.organizeImports" });
+		expect(result).toContain('Applied "Organize imports"');
+		expect(readFileSync(filePath, "utf-8")).toBe("SORTED imports here\n");
+
+		const clean = await manager.codeFix(filePath, { kind: "source.organizeImports" });
+		expect(clean).toContain("No code actions available");
 	});
 
 	it("reports incoming and outgoing calls", async () => {
@@ -658,6 +686,14 @@ describe("tool diagnostics integration", () => {
 				calls.push(`callHierarchy ${path} ${symbol} ${direction}`);
 				return "calls-result";
 			},
+			implementations: async (path, symbol) => {
+				calls.push(`implementations ${path} ${symbol}`);
+				return "impl-result";
+			},
+			typeDefinition: async (path, symbol) => {
+				calls.push(`typeDefinition ${path} ${symbol}`);
+				return "typedef-result";
+			},
 			fileDiagnostics: async () => "diag-result",
 			rename: async (path, symbol, newName) => {
 				calls.push(`rename ${path} ${symbol} ${newName}`);
@@ -737,6 +773,26 @@ describe("tool diagnostics integration", () => {
 		);
 		expect(fixed.content[0]).toEqual({ type: "text", text: "fix-result" });
 		expect(calls).toContain(`fix ${join(tempDir, "a.ts")} 3 Add import`);
+
+		const impls = await tool.execute(
+			"t5b",
+			{ action: "implementations", path: "a.ts", symbol: "Iface" },
+			undefined,
+			undefined,
+			{} as never,
+		);
+		expect(impls.content[0]).toEqual({ type: "text", text: "impl-result" });
+		expect(calls).toContain(`implementations ${join(tempDir, "a.ts")} Iface`);
+
+		const typedef = await tool.execute(
+			"t5c",
+			{ action: "type-definition", path: "a.ts", symbol: "value" },
+			undefined,
+			undefined,
+			{} as never,
+		);
+		expect(typedef.content[0]).toEqual({ type: "text", text: "typedef-result" });
+		expect(calls).toContain(`typeDefinition ${join(tempDir, "a.ts")} value`);
 
 		await expect(
 			tool.execute("t6", { action: "rename", path: "a.ts", symbol: "foo" }, undefined, undefined, {} as never),

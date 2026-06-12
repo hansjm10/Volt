@@ -13,6 +13,9 @@
 - Added project-wide symbol search: `lsp symbols` with a `symbol` query searches the workspace via `workspace/symbol`, routed by the given file's server.
 - Edit/write diagnostics now report other open files that went from clean to failing as a result of the change (capped at 5 files).
 - Added `callers` and `callees` actions to the `lsp` tool (call hierarchy via `textDocument/prepareCallHierarchy`).
+- Added `implementations` and `type-definition` actions to the `lsp` tool.
+- Added a `kind` parameter to `lsp fix` for kind-filtered code actions such as `source.organizeImports` and `source.fixAll`.
+- Added built-in LSP server defaults for clangd (C/C++), zls (Zig), lua-language-server, and bash-language-server.
 
 ### Changed
 

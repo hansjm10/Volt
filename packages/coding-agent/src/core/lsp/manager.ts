@@ -426,6 +426,14 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		return this.locationQuery("textDocument/references", "references", absolutePath, symbol, line);
 	}
 
+	async implementations(absolutePath: string, symbol: string, line?: number, _signal?: AbortSignal): Promise<string> {
+		return this.locationQuery("textDocument/implementation", "implementations", absolutePath, symbol, line);
+	}
+
+	async typeDefinition(absolutePath: string, symbol: string, line?: number, _signal?: AbortSignal): Promise<string> {
+		return this.locationQuery("textDocument/typeDefinition", "type definition", absolutePath, symbol, line);
+	}
+
 	async hover(absolutePath: string, symbol: string, line?: number, _signal?: AbortSignal): Promise<string> {
 		const session = await this.openSession(absolutePath);
 		if ("error" in session) {
@@ -690,7 +698,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 
 	async codeFix(
 		absolutePath: string,
-		options: { symbol?: string; line?: number; title?: string },
+		options: { symbol?: string; line?: number; title?: string; kind?: string },
 		_signal?: AbortSignal,
 	): Promise<string> {
 		const session = await this.openSession(absolutePath);
@@ -745,7 +753,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			const result = await session.client.sendRequest("textDocument/codeAction", {
 				textDocument: { uri: session.uri },
 				range,
-				context: { diagnostics },
+				context: { diagnostics, ...(options.kind ? { only: [options.kind] } : {}) },
 			});
 			const actions = normalizeCodeActions(result);
 			if (actions.length === 0) {

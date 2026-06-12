@@ -126,6 +126,8 @@ function handle(message) {
 				capabilities: {
 					textDocumentSync: 1,
 					definitionProvider: true,
+					implementationProvider: true,
+					typeDefinitionProvider: true,
 					referencesProvider: true,
 					hoverProvider: true,
 					documentSymbolProvider: true,
@@ -228,6 +230,26 @@ function handle(message) {
 					targetSelectionRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
 				},
 			],
+		});
+		return;
+	}
+	if (method === "textDocument/implementation") {
+		// Location[] form.
+		send({
+			jsonrpc: "2.0",
+			id,
+			result: [
+				{ uri: params.textDocument.uri, range: { start: { line: 1, character: 0 }, end: { line: 1, character: 5 } } },
+			],
+		});
+		return;
+	}
+	if (method === "textDocument/typeDefinition") {
+		// Bare single-Location form to exercise normalization.
+		send({
+			jsonrpc: "2.0",
+			id,
+			result: { uri: params.textDocument.uri, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } } },
 		});
 		return;
 	}
@@ -370,6 +392,20 @@ function handle(message) {
 	if (method === "textDocument/codeAction") {
 		const uri = params.textDocument.uri;
 		const text = documents.get(uri) ?? "";
+		const only = params.context?.only;
+		if (Array.isArray(only) && only.includes("source.organizeImports")) {
+			const actions = text.includes("UNSORTED")
+				? [
+						{
+							title: "Organize imports",
+							kind: "source.organizeImports",
+							edit: buildReplaceEdit(uri, text, "UNSORTED", "SORTED"),
+						},
+					]
+				: [];
+			send({ jsonrpc: "2.0", id, result: actions });
+			return;
+		}
 		const actions = [];
 		if (text.includes("ERROR")) {
 			actions.push({
