@@ -54,4 +54,23 @@ if [[ "$NO_ENV" == "true" ]]; then
   echo "Running without API keys..."
 fi
 
-"$SCRIPT_DIR/node_modules/.bin/tsx" --tsconfig "$SCRIPT_DIR/tsconfig.json" "$SCRIPT_DIR/packages/coding-agent/src/cli.ts" ${ARGS[@]+"${ARGS[@]}"}
+NODE_BIN="node"
+if ! command -v "$NODE_BIN" >/dev/null 2>&1; then
+  if command -v node.exe >/dev/null 2>&1; then
+    NODE_BIN="node.exe"
+  else
+    echo "node not found. Install Node.js and ensure it is available on PATH." >&2
+    exit 1
+  fi
+fi
+
+RUNNER_PATH="$SCRIPT_DIR/scripts/run-coding-agent-source.mjs"
+if [[ "$NODE_BIN" == "node.exe" ]]; then
+  if command -v wslpath >/dev/null 2>&1; then
+    RUNNER_PATH="$(wslpath -w "$RUNNER_PATH")"
+  elif command -v cygpath >/dev/null 2>&1; then
+    RUNNER_PATH="$(cygpath -w "$RUNNER_PATH")"
+  fi
+fi
+
+"$NODE_BIN" "$RUNNER_PATH" ${ARGS[@]+"${ARGS[@]}"}
