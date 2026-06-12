@@ -213,6 +213,24 @@ describe("LspManager", () => {
 		expect(await manager.hover(join(tempDir, "test.bar"), "x")).toContain("No language server configured for .bar");
 	});
 
+	it("re-waits for diagnostics when a dependency changed on disk", async () => {
+		// Regression: the unchanged-content shortcut must not return a stale
+		// publish when other open documents were just refreshed from disk.
+		const manager = setup();
+		const fileA = join(tempDir, "a.foo");
+		const fileB = join(tempDir, "b.foo");
+		const contentA = "watch CROSS here\n";
+		writeFileSync(fileA, contentA);
+		writeFileSync(fileB, "fine\n");
+		expect(await manager.getDiagnostics(fileA, contentA)).toBeUndefined();
+		expect(await manager.getDiagnostics(fileB, "fine\n")).toBeUndefined();
+
+		// Break the dependency outside the edit/write tools.
+		writeFileSync(fileB, "now has ERROR\n");
+		const result = await manager.getDiagnostics(fileA, contentA);
+		expect(result).toContain("cross-file ERROR detected");
+	});
+
 	it("waits longer for the first diagnostics from a fresh server", async () => {
 		// The publish delay exceeds settleMs but not firstSettleMs, so only the
 		// extended first-collection window catches the cold-start publish.

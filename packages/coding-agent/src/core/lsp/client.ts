@@ -228,10 +228,12 @@ export class LspClient {
 	/**
 	 * Sync a document and collect its diagnostics.
 	 *
-	 * Uses pull diagnostics when the server supports them; otherwise waits for
-	 * the server to publish diagnostics for the document. The first collection
-	 * on a fresh server waits up to firstSettleMs (servers like tsserver publish
-	 * nothing until the project has loaded); afterwards settleMs applies.
+	 * Refreshes other open documents from disk first, so dependency changes made
+	 * outside the tools are reflected. Uses pull diagnostics when the server
+	 * supports them; otherwise waits for the server to publish diagnostics for
+	 * the document. The first collection on a fresh server waits up to
+	 * firstSettleMs (servers like tsserver publish nothing until the project has
+	 * loaded); afterwards settleMs applies.
 	 */
 	async getDiagnostics(
 		absolutePath: string,
@@ -242,6 +244,7 @@ export class LspClient {
 	): Promise<LspDiagnostic[]> {
 		await this.start();
 		const sinceSeq = this.publishSeq;
+		const refreshed = await this.refreshStaleDocuments(absolutePath);
 		const { uri, changed } = await this.syncContent(absolutePath, content);
 		const key = normalizeUri(uri);
 
@@ -259,9 +262,11 @@ export class LspClient {
 			}
 		}
 
-		// Unchanged content will not trigger a republish; reuse the last publish.
+		// Reuse the last publish only when nothing changed at all: unchanged
+		// content cannot republish, but refreshed dependencies can change this
+		// document's diagnostics, so any refresh forces a fresh wait.
 		const existing = this.published.get(key);
-		if (!changed && existing) {
+		if (!changed && refreshed.length === 0 && existing) {
 			return existing.diagnostics;
 		}
 

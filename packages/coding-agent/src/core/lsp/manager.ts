@@ -202,7 +202,6 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		const client = this.getClient(server, absolutePath);
 		let diagnostics: LspDiagnostic[];
 		try {
-			await this.refreshStale(client, absolutePath);
 			diagnostics = await client.getDiagnostics(
 				absolutePath,
 				content,
@@ -298,7 +297,6 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		}
 		const client = this.getClient(server, absolutePath);
 		try {
-			await this.refreshStale(client, absolutePath);
 			const diagnostics = await client.getDiagnostics(
 				absolutePath,
 				content,

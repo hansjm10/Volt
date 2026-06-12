@@ -3,9 +3,12 @@
 // Behavior:
 // - Responds to initialize with full-text sync (and a diagnostic provider when
 //   started with --pull).
-// - On didOpen/didChange, scans the document text and publishes one diagnostic
-//   per line containing "ERROR" (severity 1) or "WARN" (severity 2), after a
-//   short delay to exercise the publish wait path.
+// - On didOpen/didChange, scans document text and publishes one diagnostic per
+//   line containing "ERROR" (severity 1) or "WARN" (severity 2), after a short
+//   delay to exercise the publish wait path. Like real servers, it republishes
+//   for all open documents on every change.
+// - Cross-file rule: a document containing "CROSS" gets an error when any
+//   other open document contains "ERROR", mimicking dependency breakage.
 // - In pull mode, answers textDocument/diagnostic from the same scan.
 // - Answers definition/references/hover/documentSymbol with fixed shapes so
 //   navigation formatting can be tested.
@@ -27,8 +30,21 @@ function send(message) {
 	process.stdout.write(`Content-Length: ${Buffer.byteLength(body, "utf-8")}\r\n\r\n${body}`);
 }
 
-function scan(text) {
+function scan(text, uri) {
 	const diagnostics = [];
+	if (text.includes("CROSS")) {
+		for (const [otherUri, otherText] of documents) {
+			if (otherUri !== uri && otherText.includes("ERROR")) {
+				diagnostics.push({
+					range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+					severity: 1,
+					source: "fake",
+					message: "cross-file ERROR detected",
+				});
+				break;
+			}
+		}
+	}
 	const lines = text.split("\n");
 	for (let i = 0; i < lines.length; i++) {
 		const errorIndex = lines[i].indexOf("ERROR");
@@ -83,13 +99,13 @@ function handle(message) {
 	if (method === "textDocument/didOpen") {
 		documents.set(params.textDocument.uri, params.textDocument.text);
 		state.opens.push(params.textDocument.uri);
-		publishLater(params.textDocument.uri);
+		publishLater();
 		return;
 	}
 	if (method === "textDocument/didChange") {
 		documents.set(params.textDocument.uri, params.contentChanges[0].text);
 		state.changes.push({ uri: params.textDocument.uri, version: params.textDocument.version });
-		publishLater(params.textDocument.uri);
+		publishLater();
 		return;
 	}
 	if (method === "textDocument/didClose") {
@@ -166,7 +182,10 @@ function handle(message) {
 		send({
 			jsonrpc: "2.0",
 			id,
-			result: { kind: "full", items: scan(documents.get(params.textDocument.uri) ?? "") },
+			result: {
+				kind: "full",
+				items: scan(documents.get(params.textDocument.uri) ?? "", params.textDocument.uri),
+			},
 		});
 		return;
 	}
@@ -175,14 +194,16 @@ function handle(message) {
 	}
 }
 
-function publishLater(uri) {
+function publishLater() {
 	if (pullMode) return;
 	setTimeout(() => {
-		send({
-			jsonrpc: "2.0",
-			method: "textDocument/publishDiagnostics",
-			params: { uri, diagnostics: scan(documents.get(uri) ?? "") },
-		});
+		for (const [uri, text] of documents) {
+			send({
+				jsonrpc: "2.0",
+				method: "textDocument/publishDiagnostics",
+				params: { uri, diagnostics: scan(text, uri) },
+			});
+		}
 	}, publishDelayMs);
 }
 
