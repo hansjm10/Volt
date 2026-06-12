@@ -410,6 +410,42 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		}
 	}
 
+	async workspaceSymbols(absolutePath: string, query: string, _signal?: AbortSignal): Promise<string> {
+		const session = await this.openSession(absolutePath);
+		if ("error" in session) {
+			return session.error;
+		}
+		try {
+			const result = (await session.client.sendRequest("workspace/symbol", { query })) as Array<{
+				name: string;
+				kind: number;
+				containerName?: string;
+				location?: { uri: string; range?: LspRange };
+			}> | null;
+			if (!result || result.length === 0) {
+				return `No workspace symbols matching "${query}".`;
+			}
+			const shown = result.slice(0, MAX_REFERENCES);
+			const lines = shown.map((symbol) => {
+				const kind = SYMBOL_KIND_NAMES[symbol.kind] ?? "symbol";
+				const container = symbol.containerName ? ` in ${symbol.containerName}` : "";
+				let location = "";
+				if (symbol.location?.uri) {
+					const path = this.displayPath(uriToPath(symbol.location.uri));
+					const line = symbol.location.range ? `:${symbol.location.range.start.line + 1}` : "";
+					location = ` ${path}${line}`;
+				}
+				return `${symbol.name} (${kind})${container}${location}`;
+			});
+			if (result.length > shown.length) {
+				lines.push(`... and ${result.length - shown.length} more`);
+			}
+			return lines.join("\n");
+		} catch (error) {
+			return this.describeRequestError(absolutePath, error);
+		}
+	}
+
 	async fileDiagnostics(absolutePath: string, signal?: AbortSignal): Promise<string> {
 		const server = this.findServer(absolutePath);
 		if (!server) {
@@ -812,6 +848,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			command: server.command,
 			rootDir: root,
 			initializationOptions: server.initializationOptions,
+			settings: server.settings,
 			onApplyEdit: async (edit) => {
 				const { summary } = await this.applyWorkspaceEdit(clientRef, edit as LspWorkspaceEdit);
 				this.serverApplyEditSummaries.push(summary);

@@ -18,6 +18,12 @@ export interface LspServerSettings {
 	rootMarkers?: string[];
 	/** LSP initializationOptions passed during the initialize handshake */
 	initializationOptions?: unknown;
+	/**
+	 * Server configuration, sent via workspace/didChangeConfiguration after
+	 * startup and used to answer workspace/configuration requests (section
+	 * lookups use dot-separated paths into this object).
+	 */
+	settings?: unknown;
 	/** Set false to disable a built-in or configured server */
 	enabled?: boolean;
 }
@@ -49,6 +55,7 @@ export interface ResolvedLspServerConfig {
 	fileExtensions: string[];
 	rootMarkers: string[];
 	initializationOptions?: unknown;
+	settings?: unknown;
 }
 
 export interface ResolvedLspConfig {
@@ -127,6 +134,7 @@ export function resolveLspConfig(settings: LspSettings | undefined): ResolvedLsp
 			fileExtensions: fileExtensions.map(normalizeExtension),
 			rootMarkers: [...(overrides?.rootMarkers ?? defaults?.rootMarkers ?? [])],
 			initializationOptions: overrides?.initializationOptions,
+			settings: overrides?.settings,
 		});
 	}
 	return {

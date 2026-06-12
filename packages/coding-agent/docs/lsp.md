@@ -44,7 +44,7 @@ When LSP is enabled, the `lsp` tool is active by default (it still respects `--t
 | `definition` | `path`, `symbol`, `line?` | Where a symbol is defined, with a source snippet |
 | `references` | `path`, `symbol`, `line?` | All usages of a symbol across the project (capped at 50) |
 | `hover` | `path`, `symbol`, `line?` | Type signature and documentation for a symbol |
-| `symbols` | `path` | Hierarchical symbol outline of a file |
+| `symbols` | `path`, `symbol?` | Hierarchical symbol outline of a file; with `symbol`, a project-wide symbol search (the `path` routes the query to the right server) |
 | `diagnostics` | `path` | Current diagnostics for a file, on demand |
 | `rename` | `path`, `symbol`, `newName`, `line?` | Rename a symbol across the project (applies the server's WorkspaceEdit to disk) |
 | `fix` | `path`, `symbol?` or `line?`, `title?` | Apply a quick fix (e.g. add a missing import). A single available action applies automatically; multiple actions are listed and chosen via `title` |
@@ -110,7 +110,24 @@ Per-server fields:
 | `fileExtensions` | string[] | File extensions routed to this server |
 | `rootMarkers` | string[] | Files/directories marking the project root, searched upward from the edited file |
 | `initializationOptions` | any | Passed to the server in the `initialize` request |
+| `settings` | object | Server configuration: sent via `workspace/didChangeConfiguration` after startup and used to answer `workspace/configuration` section requests (dot-separated section paths look up into this object) |
 | `enabled` | boolean | Set `false` to disable a built-in server |
+
+Example: tuning pyright through `settings`:
+
+```json
+{
+  "lsp": {
+    "servers": {
+      "python": {
+        "settings": {
+          "python": { "analysis": { "typeCheckingMode": "strict" } }
+        }
+      }
+    }
+  }
+}
+```
 
 User entries merge field-wise over built-in defaults: overriding only `command` for `typescript` keeps the default extensions and root markers.
 

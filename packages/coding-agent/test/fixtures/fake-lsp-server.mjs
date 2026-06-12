@@ -19,10 +19,11 @@
 // - Exits on the exit notification.
 
 const pullMode = process.argv.includes("--pull");
+const configMode = process.argv.includes("--config");
 const delayIndex = process.argv.indexOf("--delay");
 const publishDelayMs = delayIndex !== -1 ? Number.parseInt(process.argv[delayIndex + 1], 10) : 50;
 const documents = new Map();
-const state = { opens: [], changes: [], closes: [], watched: [] };
+const state = { opens: [], changes: [], closes: [], watched: [], configChanges: [], configResponses: undefined };
 let buffer = Buffer.alloc(0);
 let nextServerRequestId = 1000;
 const pendingServerRequests = new Map();
@@ -139,6 +140,51 @@ function handle(message) {
 	}
 	if (method === "shutdown") {
 		send({ jsonrpc: "2.0", id, result: null });
+		return;
+	}
+	if (method === "initialized") {
+		if (configMode) {
+			serverRequest(
+				"workspace/configuration",
+				{ items: [{ section: "foo.bar" }, { section: "missing.path" }, {}] },
+				(response) => {
+					state.configResponses = response.result;
+				},
+			);
+		}
+		return;
+	}
+	if (method === "workspace/didChangeConfiguration") {
+		state.configChanges.push(params.settings);
+		return;
+	}
+	if (method === "workspace/symbol") {
+		const query = params.query ?? "";
+		const symbols = [];
+		if (query) {
+			for (const [uri, text] of documents) {
+				const lines = text.split("\n");
+				for (let i = 0; i < lines.length; i++) {
+					const index = lines[i].indexOf(query);
+					if (index !== -1) {
+						symbols.push({
+							name: query,
+							kind: 13,
+							containerName: "fakeContainer",
+							location: {
+								uri,
+								range: {
+									start: { line: i, character: index },
+									end: { line: i, character: index + query.length },
+								},
+							},
+						});
+						break;
+					}
+				}
+			}
+		}
+		send({ jsonrpc: "2.0", id, result: symbols });
 		return;
 	}
 	if (method === "exit") {

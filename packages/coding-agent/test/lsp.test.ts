@@ -79,7 +79,7 @@ describe("resolveLspConfig", () => {
 			servers: {
 				typescript: { command: ["my-ts-server", "--stdio"] },
 				rust: { enabled: false },
-				custom: { command: ["custom-ls"], fileExtensions: ["zig"] },
+				custom: { command: ["custom-ls"], fileExtensions: ["zig"], settings: { custom: { level: 3 } } },
 			},
 		});
 		expect(config.enabled).toBe(true);
@@ -89,6 +89,7 @@ describe("resolveLspConfig", () => {
 		expect(typescript?.fileExtensions).toContain(".ts");
 		expect(config.servers.find((s) => s.name === "rust")).toBeUndefined();
 		expect(config.servers.find((s) => s.name === "custom")?.fileExtensions).toEqual([".zig"]);
+		expect(config.servers.find((s) => s.name === "custom")?.settings).toEqual({ custom: { level: 3 } });
 	});
 
 	it("skips user servers without a command or file extensions", () => {
@@ -299,6 +300,25 @@ describe("LspManager", () => {
 		expect(readFileSync(filePath, "utf-8")).toBe("needs FIXED here\n");
 	});
 
+	it("searches workspace symbols when a query is provided", async () => {
+		const manager = setup();
+		const fileA = join(tempDir, "a.foo");
+		const fileB = join(tempDir, "b.foo");
+		writeFileSync(fileA, "has findme here\n");
+		writeFileSync(fileB, "\nalso findme there\n");
+		// Open both documents so the fake server can search them.
+		await manager.documentSymbols(fileA);
+		await manager.documentSymbols(fileB);
+
+		const result = await manager.workspaceSymbols(fileA, "findme");
+		const lines = result.split("\n");
+		expect(lines).toHaveLength(2);
+		expect(lines[0]).toBe("findme (variable) in fakeContainer a.foo:1");
+		expect(lines[1]).toBe("findme (variable) in fakeContainer b.foo:2");
+
+		expect(await manager.workspaceSymbols(fileA, "nomatch")).toContain('No workspace symbols matching "nomatch"');
+	});
+
 	it("reports server status and restarts servers", async () => {
 		const manager = setup();
 		expect(manager.getStatus()).toEqual([]);
@@ -445,7 +465,26 @@ describe("LspClient disk sync", () => {
 		changes: Array<{ uri: string; version: number }>;
 		closes: string[];
 		watched: Array<{ uri: string; type: number }>;
+		configChanges: unknown[];
+		configResponses?: unknown[];
 	}
+
+	it("sends configuration and answers workspace/configuration section requests", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-client-test-"));
+		const settings = { foo: { bar: 42 }, top: "x" };
+		client = new LspClient({
+			serverName: "fake",
+			command: [process.execPath, FAKE_SERVER, "--config"],
+			rootDir: tempDir,
+			settings,
+		});
+		await client.start();
+		// Give the server's post-initialized configuration round-trip time to land.
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		const state = (await client.sendRequest("fake/state", {})) as FakeState;
+		expect(state.configChanges).toEqual([settings]);
+		expect(state.configResponses).toEqual([42, null, settings]);
+	});
 
 	it("re-syncs documents that changed on disk and notifies watched files", async () => {
 		const client = setupClient();
@@ -570,6 +609,10 @@ describe("tool diagnostics integration", () => {
 			references: async () => "ref-result",
 			hover: async () => "hover-result",
 			documentSymbols: async () => "symbols-result",
+			workspaceSymbols: async (path, query) => {
+				calls.push(`workspaceSymbols ${path} ${query}`);
+				return "workspace-symbols-result";
+			},
 			fileDiagnostics: async () => "diag-result",
 			rename: async (path, symbol, newName) => {
 				calls.push(`rename ${path} ${symbol} ${newName}`);
@@ -595,6 +638,16 @@ describe("tool diagnostics integration", () => {
 
 		const symbols = await tool.execute("t2", { action: "symbols", path: "a.ts" }, undefined, undefined, {} as never);
 		expect(symbols.content[0]).toEqual({ type: "text", text: "symbols-result" });
+
+		const workspaceSearch = await tool.execute(
+			"t2b",
+			{ action: "symbols", path: "a.ts", symbol: "findme" },
+			undefined,
+			undefined,
+			{} as never,
+		);
+		expect(workspaceSearch.content[0]).toEqual({ type: "text", text: "workspace-symbols-result" });
+		expect(calls).toContain(`workspaceSymbols ${join(tempDir, "a.ts")} findme`);
 
 		await expect(
 			tool.execute("t3", { action: "references", path: "a.ts" }, undefined, undefined, {} as never),

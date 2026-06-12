@@ -36,6 +36,11 @@ export interface LspClientOptions {
 	command: string[];
 	rootDir: string;
 	initializationOptions?: unknown;
+	/**
+	 * Server configuration. Sent via workspace/didChangeConfiguration after the
+	 * handshake and used to answer workspace/configuration section requests.
+	 */
+	settings?: unknown;
 	/** Timeout for individual LSP requests (including initialize). Default: 30000 */
 	requestTimeoutMs?: number;
 	/**
@@ -115,6 +120,21 @@ function killProcessTree(child: ChildProcess): void {
 	} catch {
 		// Process is already gone.
 	}
+}
+
+/** Look up a dot-separated configuration section (e.g. "python.analysis") in a settings object. */
+function lookupConfigSection(settings: unknown, section: unknown): unknown {
+	if (typeof section !== "string" || section.length === 0) {
+		return settings ?? null;
+	}
+	let current: unknown = settings;
+	for (const part of section.split(".")) {
+		if (current === null || typeof current !== "object") {
+			return null;
+		}
+		current = (current as Record<string, unknown>)[part];
+	}
+	return current ?? null;
 }
 
 /** Normalize a file URI for map keys (Windows URIs vary in drive-letter casing and escaping). */
@@ -226,6 +246,8 @@ export class LspClient {
 						configuration: true,
 						workspaceFolders: true,
 						didChangeWatchedFiles: { dynamicRegistration: false },
+						didChangeConfiguration: { dynamicRegistration: false },
+						symbol: { dynamicRegistration: false },
 						applyEdit: true,
 						workspaceEdit: {
 							documentChanges: true,
@@ -241,6 +263,9 @@ export class LspClient {
 
 		this.supportsPullDiagnostics = Boolean(initializeResult?.capabilities?.diagnosticProvider);
 		this.notify("initialized", {});
+		if (this.options.settings !== undefined) {
+			this.notify("workspace/didChangeConfiguration", { settings: this.options.settings });
+		}
 	}
 
 	/**
@@ -618,8 +643,10 @@ export class LspClient {
 		// round-trips (configuration, capability registration) do not stall.
 		let result: unknown = null;
 		if (method === "workspace/configuration") {
-			const items = (params as { items?: unknown[] } | undefined)?.items;
-			result = Array.isArray(items) ? items.map(() => null) : [];
+			const items = (params as { items?: Array<{ section?: unknown }> } | undefined)?.items;
+			result = Array.isArray(items)
+				? items.map((item) => lookupConfigSection(this.options.settings, item?.section))
+				: [];
 		} else if (method === "workspace/workspaceFolders") {
 			result = [{ uri: this.rootUri, name: basename(this.options.rootDir) }];
 		}

@@ -9,6 +9,8 @@
 - Added an `lsp` navigation tool (active by default when LSP is enabled) with definition, references, hover, symbols, and on-demand diagnostics actions.
 - Added `rename` and `fix` actions to the `lsp` tool: project-wide symbol rename and quick-fix application (e.g. auto-import) via LSP WorkspaceEdits, including command-based code actions applied through `workspace/applyEdit`.
 - Added a `/lsp` command showing language server status (root, open documents, idle time) with `/lsp restart` to stop servers, and automatic shutdown of servers idle for `lsp.idleShutdownMs` (default 10 minutes; servers respawn lazily).
+- Added per-server `lsp.servers.<name>.settings`: sent via `workspace/didChangeConfiguration` after startup and used to answer `workspace/configuration` section requests (e.g. pyright analysis options).
+- Added project-wide symbol search: `lsp symbols` with a `symbol` query searches the workspace via `workspace/symbol`, routed by the given file's server.
 
 ### Changed
 

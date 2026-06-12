@@ -32,6 +32,7 @@ export interface LspNavigationProvider {
 	references(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string>;
 	hover(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string>;
 	documentSymbols(absolutePath: string, signal?: AbortSignal): Promise<string>;
+	workspaceSymbols(absolutePath: string, query: string, signal?: AbortSignal): Promise<string>;
 	fileDiagnostics(absolutePath: string, signal?: AbortSignal): Promise<string>;
 	rename(absolutePath: string, symbol: string, newName: string, line?: number, signal?: AbortSignal): Promise<string>;
 	codeFix(
@@ -44,13 +45,13 @@ export interface LspNavigationProvider {
 const lspSchema = Type.Object({
 	action: StringEnum(LSP_ACTIONS, {
 		description:
-			"definition: where a symbol is defined. references: all usages of a symbol. hover: type/docs for a symbol. symbols: outline of a file. diagnostics: current errors in a file. rename: rename a symbol across the project. fix: apply a quick fix (e.g. add a missing import).",
+			"definition: where a symbol is defined. references: all usages of a symbol. hover: type/docs for a symbol. symbols: outline of a file, or project-wide symbol search when symbol is provided. diagnostics: current errors in a file. rename: rename a symbol across the project. fix: apply a quick fix (e.g. add a missing import).",
 	}),
 	path: Type.String({ description: "Path to the file to query (relative or absolute)" }),
 	symbol: Type.Optional(
 		Type.String({
 			description:
-				"Symbol name to look up. Required for definition, references, hover, and rename; recommended for fix.",
+				"Symbol name to look up. Required for definition, references, hover, and rename; recommended for fix. For symbols, turns the file outline into a project-wide symbol search using this as the query.",
 		}),
 	),
 	line: Type.Optional(
@@ -114,7 +115,7 @@ export function createLspToolDefinition(
 		name: "lsp",
 		label: "lsp",
 		description:
-			"Query language servers for code intelligence and refactoring. Actions: definition (where a symbol is defined), references (all usages of a symbol), hover (type signature and docs), symbols (file outline), diagnostics (current errors in a file), rename (rename a symbol across the project; requires symbol and newName), fix (apply a quick fix for diagnostics at a symbol or line; pass title to choose among multiple). definition/references/hover/rename require a symbol name; pass line when the symbol occurs more than once.",
+			"Query language servers for code intelligence and refactoring. Actions: definition (where a symbol is defined), references (all usages of a symbol), hover (type signature and docs), symbols (file outline, or project-wide symbol search when symbol is provided), diagnostics (current errors in a file), rename (rename a symbol across the project; requires symbol and newName), fix (apply a quick fix for diagnostics at a symbol or line; pass title to choose among multiple). definition/references/hover/rename require a symbol name; pass line when the symbol occurs more than once.",
 		promptSnippet:
 			"Code intelligence via language servers: definition, references, hover, symbols, diagnostics, rename, quick fixes",
 		promptGuidelines: [
@@ -151,7 +152,9 @@ export function createLspToolDefinition(
 					text = await provider.hover(absolutePath, input.symbol!, input.line, signal);
 					break;
 				case "symbols":
-					text = await provider.documentSymbols(absolutePath, signal);
+					text = input.symbol
+						? await provider.workspaceSymbols(absolutePath, input.symbol, signal)
+						: await provider.documentSymbols(absolutePath, signal);
 					break;
 				case "diagnostics":
 					text = await provider.fileDiagnostics(absolutePath, signal);
