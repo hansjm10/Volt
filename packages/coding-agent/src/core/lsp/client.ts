@@ -108,6 +108,19 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
  */
 const UNVERSIONED_REPUBLISH_GRACE_MS = 250;
 
+/**
+ * A JSON-RPC error response: the server actively rejected the request (as
+ * opposed to a timeout, abort, or server exit on our side).
+ */
+class LspResponseError extends Error {
+	readonly code: number;
+
+	constructor(code: number, message: string) {
+		super(`LSP error ${code}: ${message}`);
+		this.code = code;
+	}
+}
+
 function quoteWindowsArg(arg: string): string {
 	return /\s/.test(arg) ? `"${arg}"` : arg;
 }
@@ -373,8 +386,14 @@ export class LspClient {
 						return result.items;
 					}
 					break;
-				} catch {
-					// Retry once, then fall back to published diagnostics below.
+				} catch (error) {
+					// Retry once on an explicit server rejection (e.g. ContentModified
+					// while recomputing): those come back fast, so a retry is cheap.
+					// Timeouts, aborts, and server exits would only double the worst-case
+					// latency, so fall back to published diagnostics immediately.
+					if (!(error instanceof LspResponseError)) {
+						break;
+					}
 				}
 			}
 		}
@@ -723,7 +742,7 @@ export class LspClient {
 				this.pendingRequests.delete(Number(message.id));
 				clearTimeout(pending.timer);
 				if (message.error) {
-					pending.reject(new Error(`LSP error ${message.error.code}: ${message.error.message}`));
+					pending.reject(new LspResponseError(message.error.code, message.error.message));
 				} else {
 					pending.resolve(message.result);
 				}
