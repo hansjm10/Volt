@@ -22,7 +22,7 @@ import {
 } from "./install-plan.ts";
 import { renderCatalogSearch, renderStoreInstallPlan, renderStoreShow } from "./render.ts";
 import { resolveStoreSource } from "./resolver.ts";
-import { chooseStoreRemoveTarget, chooseStoreUpdateTarget } from "./targets.ts";
+import { chooseStoreRemoveTarget, chooseStoreUpdateTarget, storeTargetMatchesUpdateSource } from "./targets.ts";
 
 type StoreCommand = "search" | "show" | "install" | "remove" | "update";
 
@@ -567,7 +567,7 @@ async function runUpdate(
 		return true;
 	}
 
-	if (target.source === resolved.source || target.actionSource === resolved.source) {
+	if (storeTargetMatchesUpdateSource(target, resolved.source)) {
 		if (!(await confirmMutation({ yes: options.yes, action: "update" }))) {
 			return true;
 		}

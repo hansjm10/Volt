@@ -1,9 +1,10 @@
 import type { ChildProcessByStdio } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, type Stats, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import { globSync } from "glob";
+import { minimatch } from "minimatch";
 import { spawnProcess } from "../utils/child-process.ts";
 import { parseGitUrl } from "../utils/git.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -253,6 +254,95 @@ function isOverridePattern(entry: string): boolean {
 	return entry.startsWith("!") || entry.startsWith("+") || entry.startsWith("-");
 }
 
+function matchesAnyPattern(filePath: string, patterns: string[], baseDir: string): boolean {
+	const rel = toPosixPath(relative(baseDir, filePath));
+	const name = basename(filePath);
+	const filePathPosix = toPosixPath(filePath);
+	const isSkillFile = name === "SKILL.md";
+	const parentDir = isSkillFile ? dirname(filePath) : undefined;
+	const parentRel = isSkillFile ? toPosixPath(relative(baseDir, parentDir!)) : undefined;
+	const parentName = isSkillFile ? basename(parentDir!) : undefined;
+	const parentDirPosix = isSkillFile ? toPosixPath(parentDir!) : undefined;
+
+	return patterns.some((pattern) => {
+		const normalizedPattern = toPosixPath(pattern);
+		if (
+			minimatch(rel, normalizedPattern) ||
+			minimatch(name, normalizedPattern) ||
+			minimatch(filePathPosix, normalizedPattern)
+		) {
+			return true;
+		}
+		if (!isSkillFile) return false;
+		return (
+			minimatch(parentRel!, normalizedPattern) ||
+			minimatch(parentName!, normalizedPattern) ||
+			minimatch(parentDirPosix!, normalizedPattern)
+		);
+	});
+}
+
+function normalizeExactPattern(pattern: string): string {
+	const normalized = pattern.startsWith("./") || pattern.startsWith(".\\") ? pattern.slice(2) : pattern;
+	return toPosixPath(normalized);
+}
+
+function matchesAnyExactPattern(filePath: string, patterns: string[], baseDir: string): boolean {
+	if (patterns.length === 0) return false;
+	const rel = toPosixPath(relative(baseDir, filePath));
+	const name = basename(filePath);
+	const filePathPosix = toPosixPath(filePath);
+	const isSkillFile = name === "SKILL.md";
+	const parentDir = isSkillFile ? dirname(filePath) : undefined;
+	const parentRel = isSkillFile ? toPosixPath(relative(baseDir, parentDir!)) : undefined;
+	const parentDirPosix = isSkillFile ? toPosixPath(parentDir!) : undefined;
+
+	return patterns.some((pattern) => {
+		const normalized = normalizeExactPattern(pattern);
+		if (normalized === rel || normalized === filePathPosix) {
+			return true;
+		}
+		if (!isSkillFile) return false;
+		return normalized === parentRel || normalized === parentDirPosix;
+	});
+}
+
+function applyManifestPatterns(allFiles: string[], entries: string[], baseDir: string): Set<string> {
+	const includes: string[] = [];
+	const excludes: string[] = [];
+	const forceIncludes: string[] = [];
+	const forceExcludes: string[] = [];
+
+	for (const entry of entries) {
+		if (entry.startsWith("+")) {
+			forceIncludes.push(entry.slice(1));
+		} else if (entry.startsWith("-")) {
+			forceExcludes.push(entry.slice(1));
+		} else if (entry.startsWith("!")) {
+			excludes.push(entry.slice(1));
+		} else {
+			includes.push(entry);
+		}
+	}
+
+	let result =
+		includes.length === 0 ? [...allFiles] : allFiles.filter((file) => matchesAnyPattern(file, includes, baseDir));
+	if (excludes.length > 0) {
+		result = result.filter((file) => !matchesAnyPattern(file, excludes, baseDir));
+	}
+	if (forceIncludes.length > 0) {
+		for (const file of allFiles) {
+			if (!result.includes(file) && matchesAnyExactPattern(file, forceIncludes, baseDir)) {
+				result.push(file);
+			}
+		}
+	}
+	if (forceExcludes.length > 0) {
+		result = result.filter((file) => !matchesAnyExactPattern(file, forceExcludes, baseDir));
+	}
+	return new Set(result);
+}
+
 function collectManifestFiles(root: string, entries: string[], resourceType: StoreResourceType): string[] {
 	const sourceEntries = entries.filter((entry) => !isOverridePattern(entry));
 	const resolved = sourceEntries.flatMap((entry) => {
@@ -266,7 +356,9 @@ function collectManifestFiles(root: string, entries: string[], resourceType: Sto
 			nodir: false,
 		}).map((match) => resolve(match));
 	});
-	return collectFilesFromPaths(resolved, resourceType);
+	const files = collectFilesFromPaths(resolved, resourceType);
+	const enabled = applyManifestPatterns(files, entries, root);
+	return files.filter((file) => enabled.has(file));
 }
 
 function discoverResources(root: string, voltManifest?: StoreVoltManifest): Record<StoreResourceType, string[]> {

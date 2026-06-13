@@ -107,7 +107,12 @@ import { inspectStorePackage } from "../../store/inspector.ts";
 import { buildStoreInstallPlan, type StoreInstallScope } from "../../store/install-plan.ts";
 import { renderCatalogSearch, renderStoreInstallPlan, renderStoreShow } from "../../store/render.ts";
 import { resolveStoreSource } from "../../store/resolver.ts";
-import { chooseStoreRemoveTarget, chooseStoreUpdateTarget, type StoreScopeTarget } from "../../store/targets.ts";
+import {
+	chooseStoreRemoveTarget,
+	chooseStoreUpdateTarget,
+	type StoreScopeTarget,
+	storeTargetMatchesUpdateSource,
+} from "../../store/targets.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
@@ -4439,7 +4444,11 @@ export class InteractiveMode {
 				this.showWarning(`No matching package found for ${input}`);
 				return;
 			}
-			await this.removeInstalledStorePackage(packageManager, selection.target, resolved.source);
+			await this.removeInstalledStorePackage(
+				packageManager,
+				selection.target,
+				selection.target.actionSource ?? selection.target.source,
+			);
 		} catch (error: unknown) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -4494,13 +4503,13 @@ export class InteractiveMode {
 				this.showWarning(`No matching installed package found for catalog ID ${input}`);
 				return;
 			}
-			if (selection.target.source === resolved.source) {
+			if (storeTargetMatchesUpdateSource(selection.target, resolved.source)) {
 				const confirmed = await this.showExtensionConfirm("Store update", `Update ${selection.target.source}?`);
 				if (!confirmed) {
 					this.showStatus("Store update cancelled");
 					return;
 				}
-				await packageManager.update(selection.target.source, {
+				await packageManager.update(selection.target.actionSource ?? selection.target.source, {
 					local: selection.target.scope === "project",
 					scripts: "never",
 				});

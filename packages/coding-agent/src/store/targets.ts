@@ -1,4 +1,5 @@
 import type { ConfiguredPackage } from "../core/package-manager.ts";
+import { parseGitUrl } from "../utils/git.ts";
 import type { StoreInstallScope } from "./install-plan.ts";
 
 export interface StoreScopeTarget {
@@ -68,4 +69,26 @@ export function chooseStoreUpdateTarget(
 		return { conflict: "both-scopes" };
 	}
 	return { target: matches[0] };
+}
+
+function gitTrackingTargetMatchesSource(targetSource: string, source: string): boolean {
+	const targetGit = parseGitUrl(targetSource);
+	const sourceGit = parseGitUrl(source);
+	return Boolean(
+		targetGit &&
+			sourceGit &&
+			!targetGit.ref &&
+			targetGit.host === sourceGit.host &&
+			targetGit.path === sourceGit.path,
+	);
+}
+
+export function storeTargetMatchesUpdateSource(target: StoreScopeTarget, source: string): boolean {
+	if (target.source === source || target.actionSource === source) {
+		return true;
+	}
+	return (
+		gitTrackingTargetMatchesSource(target.source, source) ||
+		(target.actionSource !== undefined && gitTrackingTargetMatchesSource(target.actionSource, source))
+	);
 }

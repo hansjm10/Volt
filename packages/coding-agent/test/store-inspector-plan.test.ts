@@ -64,6 +64,28 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "loaded");
 		expect(existsSync(sentinelPath)).toBe(false);
 	});
 
+	it("applies manifest override patterns when discovering resources", async () => {
+		writeFileSync(join(packageDir, "extensions", "dev.ts"), "export default function dev() {}\n");
+		writeFileSync(
+			join(packageDir, "package.json"),
+			JSON.stringify(
+				{
+					name: "volt-example",
+					version: "1.2.3",
+					volt: { extensions: ["extensions/*.ts", "!extensions/dev.ts"] },
+				},
+				null,
+				2,
+			),
+		);
+
+		const inspection = await inspectStorePackage({ source: packageDir, cwd: tempDir });
+
+		expect(inspection.voltManifest?.extensions).toEqual(["extensions/*.ts", "!extensions/dev.ts"]);
+		expect(inspection.discoveredResources.extensions).toContain("extensions/example.ts");
+		expect(inspection.discoveredResources.extensions).not.toContain("extensions/dev.ts");
+	});
+
 	it("discovers conventional resource directories when no volt manifest exists", async () => {
 		writeFileSync(
 			join(packageDir, "package.json"),
