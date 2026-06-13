@@ -4439,7 +4439,7 @@ export class InteractiveMode {
 				this.showWarning(`No matching package found for ${input}`);
 				return;
 			}
-			await this.removeInstalledStorePackage(packageManager, selection.target);
+			await this.removeInstalledStorePackage(packageManager, selection.target, resolved.source);
 		} catch (error: unknown) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -4626,6 +4626,7 @@ export class InteractiveMode {
 	private async removeInstalledStorePackage(
 		packageManager: DefaultPackageManager,
 		target: StoreScopeTarget,
+		removeSource = target.source,
 	): Promise<void> {
 		if (target.scope === "project" && !this.settingsManager.isProjectTrusted()) {
 			this.showWarning("Project is not trusted. Use /trust, then restart volt before removing project packages.");
@@ -4640,11 +4641,11 @@ export class InteractiveMode {
 			return;
 		}
 		try {
-			const removed = await packageManager.removeAndPersist(target.source, {
+			const removed = await packageManager.removeAndPersist(removeSource, {
 				local: target.scope === "project",
 			});
 			await this.settingsManager.flush();
-			if (this.reportStoreSettingsErrors(packageManager, target.source, target.scope)) {
+			if (this.reportStoreSettingsErrors(packageManager, removeSource, target.scope)) {
 				return;
 			}
 			if (!removed) {

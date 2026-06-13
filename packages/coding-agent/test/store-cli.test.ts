@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ENV_AGENT_DIR } from "../src/config.ts";
+import { CONFIG_DIR_NAME, ENV_AGENT_DIR } from "../src/config.ts";
 import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { main } from "../src/main.ts";
 
@@ -124,6 +124,67 @@ describe("store CLI", () => {
 			await expect(main(["store", "remove", "rtk", "--yes"])).resolves.toBeUndefined();
 
 			const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")) as { packages?: string[] };
+			expect(settings.packages ?? []).toHaveLength(0);
+			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
+			expect(stdout).toContain("Removed");
+			expect(errorSpy).not.toHaveBeenCalled();
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("removes a project-local catalog package stored relative to the project settings directory", async () => {
+		const projectPackageDir = join(projectDir, "pkg");
+		mkdirSync(join(projectPackageDir, "extensions"), { recursive: true });
+		writeFileSync(
+			join(projectPackageDir, "package.json"),
+			JSON.stringify(
+				{
+					name: "project-local-rtk",
+					version: "0.1.0",
+					description: "Project-local RTK extension",
+					volt: { extensions: ["extensions/rtk.ts"] },
+				},
+				null,
+				2,
+			),
+		);
+		writeFileSync(join(projectPackageDir, "extensions", "rtk.ts"), "export default function rtk() {}\n");
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				Response.json({
+					schemaVersion: 1,
+					packages: [
+						{
+							id: "project-local-rtk",
+							name: "Project Local RTK",
+							description: "Project-local token optimized shell output",
+							source: projectPackageDir,
+							verified: true,
+							resources: ["extensions"],
+						},
+					],
+				}),
+			),
+		);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await main(["store", "install", "project-local-rtk", "--local", "--approve", "--yes"]);
+
+			const settingsPath = join(projectDir, CONFIG_DIR_NAME, "settings.json");
+			const installedSettings = JSON.parse(readFileSync(settingsPath, "utf-8")) as { packages?: string[] };
+			expect(installedSettings.packages).toEqual(["../pkg"]);
+
+			await expect(
+				main(["store", "remove", "project-local-rtk", "--local", "--approve", "--yes"]),
+			).resolves.toBeUndefined();
+
+			const settings = JSON.parse(readFileSync(settingsPath, "utf-8")) as { packages?: string[] };
 			expect(settings.packages ?? []).toHaveLength(0);
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stdout).toContain("Removed");

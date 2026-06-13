@@ -483,7 +483,7 @@ async function runRemove(
 	if (!(await confirmMutation({ yes: options.yes, action: "remove" }))) {
 		return true;
 	}
-	const removed = await packageManager.removeAndPersist(target.source, { local: target.scope === "project" });
+	const removed = await packageManager.removeAndPersist(resolved.source, { local: target.scope === "project" });
 	await settingsManager.flush();
 	const settingsErrors = settingsManager.drainErrors();
 	if (settingsErrors.length > 0) {
