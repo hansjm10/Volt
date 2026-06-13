@@ -1166,12 +1166,20 @@ export class DefaultPackageManager implements PackageManager {
 
 		const tasks: Promise<void>[] = [];
 		for (const scope of ["user", "project"] as const) {
-			for (const scripts of ["allow", "never"] as const) {
-				const npmUpdates = npmUpdateGroups[scope][scripts];
-				if (npmUpdates.length > 0) {
-					tasks.push(this.updateNpmBatch(npmUpdates, scope, scripts));
-				}
+			const scopeUpdates = npmUpdateGroups[scope];
+			if (scopeUpdates.allow.length === 0 && scopeUpdates.never.length === 0) {
+				continue;
 			}
+			tasks.push(
+				(async () => {
+					for (const scripts of ["allow", "never"] as const) {
+						const npmUpdates = scopeUpdates[scripts];
+						if (npmUpdates.length > 0) {
+							await this.updateNpmBatch(npmUpdates, scope, scripts);
+						}
+					}
+				})(),
+			);
 		}
 		if (gitCandidates.length > 0) {
 			const gitTasks = gitCandidates.map(

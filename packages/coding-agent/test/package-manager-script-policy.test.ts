@@ -149,6 +149,33 @@ describe("DefaultPackageManager script policy", () => {
 		expect(neverCall?.[1]).toContain("--ignore-scripts");
 	});
 
+	it("serializes npm update batches with mixed script policies in the same scope", async () => {
+		settingsManager.setPackages(["npm:@scope/allow", { source: "npm:@scope/never", scripts: "never" }]);
+		let activeNpmInstalls = 0;
+		let overlapped = false;
+		const runCommandSpy = vi
+			.spyOn(packageManager as unknown as PackageManagerInternals, "runCommand")
+			.mockImplementation(async (command, args) => {
+				if (command !== "npm" || args[0] !== "install") {
+					return;
+				}
+				if (activeNpmInstalls > 0) {
+					overlapped = true;
+				}
+				activeNpmInstalls += 1;
+				await Promise.resolve();
+				activeNpmInstalls -= 1;
+			});
+
+		await packageManager.update();
+
+		const npmInstallCalls = runCommandSpy.mock.calls.filter(
+			([command, args]) => command === "npm" && args[0] === "install",
+		);
+		expect(npmInstallCalls).toHaveLength(2);
+		expect(overlapped).toBe(false);
+	});
+
 	it("passes --ignore-scripts for git update dependency installs when scripts are disabled", async () => {
 		settingsManager.setPackages(["git:github.com/user/repo"]);
 		const targetDir = join(agentDir, "git", "github.com", "user", "repo");
