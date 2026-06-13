@@ -453,12 +453,16 @@ export async function createCommandSettingsManager(options: {
 	agentDir: string;
 	projectTrustOverride?: boolean;
 	extensionFactories?: ExtensionFactory[];
+	loadProjectTrustExtensions?: boolean;
 }): Promise<CommandSettingsResult> {
 	const settingsManager = SettingsManager.create(options.cwd, options.agentDir, { projectTrusted: false });
 	const projectTrustWarnings: string[] = [];
 	const appMode = getCommandAppMode();
+	const shouldLoadProjectTrustExtensions = options.loadProjectTrustExtensions ?? true;
 	const extensionsResult =
-		options.projectTrustOverride === undefined && hasProjectTrustInputs(options.cwd)
+		shouldLoadProjectTrustExtensions &&
+		options.projectTrustOverride === undefined &&
+		hasProjectTrustInputs(options.cwd)
 			? await new DefaultResourceLoader({
 					cwd: options.cwd,
 					agentDir: options.agentDir,

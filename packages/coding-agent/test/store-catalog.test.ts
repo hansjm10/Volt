@@ -102,4 +102,37 @@ describe("store catalog", () => {
 		expect(result.source).toBe("cache");
 		expect(result.warnings[0]).toBe("Offline mode enabled; using cached store catalog.");
 	});
+
+	it("falls back to the cached catalog when the remote fetch times out", async () => {
+		await loadDefaultStoreCatalog({
+			agentDir: tempDir,
+			fetcher: vi.fn(async () =>
+				Response.json({
+					schemaVersion: 1,
+					packages: [
+						{
+							id: "cached",
+							name: "Cached",
+							description: "Cached package",
+							source: "npm:@scope/cached@1.0.0",
+						},
+					],
+				}),
+			),
+		});
+		const fetcher = vi.fn(() => new Promise<never>(() => {}));
+		const options = { agentDir: tempDir, fetcher, timeoutMs: 5 };
+
+		const result = await Promise.race([
+			loadDefaultStoreCatalog(options),
+			new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 50)),
+		]);
+
+		expect(result).not.toBe("hung");
+		if (result === "hung") return;
+		expect(result.source).toBe("cache");
+		expect(result.catalog.packages.map((pkg) => pkg.id)).toEqual(["cached"]);
+		expect(result.warnings[0]).toContain("Failed to load remote store catalog");
+		expect(result.warnings[0]).toContain("using cached catalog");
+	});
 });

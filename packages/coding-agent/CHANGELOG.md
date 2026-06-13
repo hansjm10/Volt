@@ -24,6 +24,7 @@
 
 - Fixed store removal for project-local packages whose saved paths are relative to the project settings directory.
 - Fixed store updates to keep lifecycle scripts disabled, preserve git clone URLs when pinning sources, and honor configured `npmCommand` during store package inspection.
+- Fixed store commands to avoid resolving configured packages before their confirmation gates and to fall back to cached catalog data when remote catalog fetches time out.
 - Fixed LSP diagnostics waits accepting publishes computed against an older document version, which could surface stale results after rapid consecutive edits.
 - Fixed LSP edit diagnostics reporting stale cross-file errors against pre-edit content: unversioned publishes that race a content change now trigger a re-wait for a fresher publish (capped at a short grace window for servers that never send versions, so single-publish servers do not stall every edit until the settle deadline), unversioned publishes pointing past the end of the synced content are dropped (also keeping them out of the "newly failing in other open files" sweep), and failed diagnostic pulls are retried once before falling back to published diagnostics ([#1](https://github.com/hansjm10/Volt/issues/1)).
 - Fixed missing-server install hints on Windows: shell spawning masked missing binaries as exit code 1, so a PATH/PATHEXT pre-check now produces the proper ENOENT failure.

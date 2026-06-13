@@ -283,19 +283,62 @@ describe("store CLI", () => {
 		}
 	});
 
-	it("refuses non-interactive installs without --yes before writing settings", async () => {
+	it("searches without resolving configured packages during project trust bootstrap", async () => {
+		mkdirSync(join(projectDir, CONFIG_DIR_NAME), { recursive: true });
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify({ packages: ["npm:@scope/missing@1.0.0"] }, null, 2),
+		);
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const resolveSpy = vi.spyOn(DefaultPackageManager.prototype, "resolve").mockResolvedValue({
+			extensions: [],
+			skills: [],
+			prompts: [],
+			themes: [],
+		});
+
+		try {
+			await expect(main(["store", "search", "RTK"])).resolves.toBeUndefined();
+
+			expect(resolveSpy).not.toHaveBeenCalled();
+			expect(process.exitCode).toBeUndefined();
+			expect(errorSpy).not.toHaveBeenCalled();
+		} finally {
+			resolveSpy.mockRestore();
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("refuses non-interactive installs without --yes before resolving configured packages", async () => {
+		mkdirSync(join(projectDir, CONFIG_DIR_NAME), { recursive: true });
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify({ packages: ["npm:@scope/missing@1.0.0"] }, null, 2),
+		);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const resolveSpy = vi.spyOn(DefaultPackageManager.prototype, "resolve").mockResolvedValue({
+			extensions: [],
+			skills: [],
+			prompts: [],
+			themes: [],
+		});
 
 		try {
 			await expect(main(["store", "install", "rtk"])).resolves.toBeUndefined();
 
+			expect(resolveSpy).not.toHaveBeenCalled();
 			expect(errorSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain(
 				"Non-interactive install requires --yes.",
 			);
 			expect(process.exitCode).toBe(1);
-			expect(() => readFileSync(join(agentDir, "settings.json"), "utf-8")).toThrow();
+			expect(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"))).toEqual({
+				packages: ["npm:@scope/missing@1.0.0"],
+			});
 		} finally {
+			resolveSpy.mockRestore();
 			logSpy.mockRestore();
 			errorSpy.mockRestore();
 		}

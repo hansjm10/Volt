@@ -650,33 +650,62 @@ export async function handleStoreCommand(
 
 	const cwd = process.cwd();
 	const agentDir = getAgentDir();
-	const writesProjectPackageConfig =
-		options.local && (options.command === "install" || options.command === "remove" || options.command === "update");
-	const { settingsManager, projectTrustWarnings } = await createCommandSettingsManager({
-		cwd,
-		agentDir,
-		projectTrustOverride: options.projectTrustOverride,
-		extensionFactories: runtimeOptions.extensionFactories,
-	});
-	reportProjectTrustWarnings(projectTrustWarnings);
-	if (!settingsManager.isProjectTrusted() && writesProjectPackageConfig) {
-		console.error(chalk.red("Project is not trusted. Use --approve to modify local package config."));
-		process.exitCode = 1;
-		return true;
-	}
-	reportSettingsErrors(settingsManager, "store command");
-
-	const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
-	packageManager.setProgressCallback((event) => {
-		if (event.type === "start") {
-			process.stdout.write(chalk.dim(`${event.message}\n`));
-		}
-	});
 
 	try {
+		if (options.command === "search") {
+			return await runSearch(options, agentDir);
+		}
+		if (options.command === "show" && !options.input) {
+			console.error(chalk.red("Missing store show source."));
+			console.error(chalk.dim(`Usage: ${getStoreCommandUsage("show")}`));
+			process.exitCode = 1;
+			return true;
+		}
+		if (options.command === "install" && !options.input) {
+			console.error(chalk.red("Missing store install source."));
+			console.error(chalk.dim(`Usage: ${getStoreCommandUsage("install")}`));
+			process.exitCode = 1;
+			return true;
+		}
+		if (options.command === "remove" && !options.input) {
+			console.error(chalk.red("Missing store remove source."));
+			console.error(chalk.dim(`Usage: ${getStoreCommandUsage("remove")}`));
+			process.exitCode = 1;
+			return true;
+		}
+		if (
+			(options.command === "install" || options.command === "remove" || options.command === "update") &&
+			!preflightNonInteractiveMutation({ yes: options.yes, action: options.command })
+		) {
+			return true;
+		}
+
+		const writesProjectPackageConfig =
+			options.local &&
+			(options.command === "install" || options.command === "remove" || options.command === "update");
+		const { settingsManager, projectTrustWarnings } = await createCommandSettingsManager({
+			cwd,
+			agentDir,
+			projectTrustOverride: options.projectTrustOverride,
+			extensionFactories: runtimeOptions.extensionFactories,
+			loadProjectTrustExtensions: false,
+		});
+		reportProjectTrustWarnings(projectTrustWarnings);
+		if (!settingsManager.isProjectTrusted() && writesProjectPackageConfig) {
+			console.error(chalk.red("Project is not trusted. Use --approve to modify local package config."));
+			process.exitCode = 1;
+			return true;
+		}
+		reportSettingsErrors(settingsManager, "store command");
+
+		const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+		packageManager.setProgressCallback((event) => {
+			if (event.type === "start") {
+				process.stdout.write(chalk.dim(`${event.message}\n`));
+			}
+		});
+
 		switch (options.command) {
-			case "search":
-				return await runSearch(options, agentDir);
 			case "show":
 				return await runShow(options, cwd, agentDir, settingsManager);
 			case "install":

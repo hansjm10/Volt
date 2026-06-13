@@ -3,6 +3,8 @@ import { join } from "node:path";
 
 export const DEFAULT_STORE_CATALOG_URL = "https://earendil-works.github.io/volt/store/catalog.json";
 
+const DEFAULT_STORE_CATALOG_FETCH_TIMEOUT_MS = 10000;
+
 export type StoreResourceType = "extensions" | "skills" | "prompts" | "themes";
 
 export interface StoreCatalog {
@@ -43,13 +45,21 @@ interface StoreCatalogFetchResponse {
 	text(): Promise<string>;
 }
 
-export type StoreCatalogFetcher = (url: string) => Promise<StoreCatalogFetchResponse>;
+interface StoreCatalogFetchOptions {
+	signal?: AbortSignal;
+}
+
+export type StoreCatalogFetcher = (
+	url: string,
+	options?: StoreCatalogFetchOptions,
+) => Promise<StoreCatalogFetchResponse>;
 
 export interface LoadDefaultStoreCatalogOptions {
 	agentDir: string;
 	url?: string;
 	offline?: boolean;
 	fetcher?: StoreCatalogFetcher;
+	timeoutMs?: number;
 }
 
 const RESOURCE_TYPES = new Set<StoreResourceType>(["extensions", "skills", "prompts", "themes"]);
@@ -266,6 +276,36 @@ function writeCachedCatalog(agentDir: string, raw: string): void {
 	writeFileSync(cachePath, raw, "utf-8");
 }
 
+async function withCatalogFetchTimeout<T>(
+	timeoutMs: number,
+	operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+	const controller = new AbortController();
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	let timedOut = false;
+	const timeoutMessage = `Store catalog fetch timed out after ${timeoutMs}ms`;
+
+	try {
+		return await new Promise<T>((resolve, reject) => {
+			timeout = setTimeout(() => {
+				timedOut = true;
+				controller.abort();
+				reject(new Error(timeoutMessage));
+			}, timeoutMs);
+			operation(controller.signal).then(resolve, reject);
+		});
+	} catch (error: unknown) {
+		if (timedOut) {
+			throw new Error(timeoutMessage);
+		}
+		throw error;
+	} finally {
+		if (timeout) {
+			clearTimeout(timeout);
+		}
+	}
+}
+
 export async function loadDefaultStoreCatalog(
 	options: LoadDefaultStoreCatalogOptions,
 ): Promise<LoadStoreCatalogResult> {
@@ -295,14 +335,20 @@ export async function loadDefaultStoreCatalog(
 	}
 
 	const url = getDefaultCatalogUrl(options.url);
-	const fetcher = options.fetcher ?? globalThis.fetch;
+	const fetcher: StoreCatalogFetcher = options.fetcher ?? ((input, init) => globalThis.fetch(input, init));
+	const timeoutMs = Math.max(1, Math.trunc(options.timeoutMs ?? DEFAULT_STORE_CATALOG_FETCH_TIMEOUT_MS));
 	try {
-		const response = await fetcher(url);
-		if (!response.ok) {
-			throw new Error(`HTTP ${response.status}`);
-		}
-		const raw = await response.text();
-		const result = parseStoreCatalogJson(raw, "remote store catalog");
+		const { raw, result } = await withCatalogFetchTimeout(timeoutMs, async (signal) => {
+			const response = await fetcher(url, { signal });
+			if (!response.ok) {
+				throw new Error(`HTTP ${response.status}`);
+			}
+			const rawCatalog = await response.text();
+			return {
+				raw: rawCatalog,
+				result: parseStoreCatalogJson(rawCatalog, "remote store catalog"),
+			};
+		});
 		writeCachedCatalog(options.agentDir, raw);
 		return {
 			catalog: result.catalog,
