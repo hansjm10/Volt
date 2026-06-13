@@ -204,6 +204,9 @@ function statIfExists(path: string): Stats | undefined {
 }
 
 function collectResourceFiles(dir: string, resourceType: StoreResourceType, root = dir): string[] {
+	if (resourceType === "extensions") {
+		return collectConventionalExtensionFiles(dir);
+	}
 	if (!existsSync(dir)) {
 		return [];
 	}
@@ -226,6 +229,65 @@ function collectResourceFiles(dir: string, resourceType: StoreResourceType, root
 	}
 	if (resourceType === "skills" && existsSync(join(dir, "SKILL.md")) && dir !== root) {
 		return [join(dir, "SKILL.md")];
+	}
+	return files;
+}
+
+function readVoltManifestFile(packageJsonPath: string): StoreVoltManifest | undefined {
+	try {
+		return readPackageJsonFile(packageJsonPath).voltManifest;
+	} catch {
+		return undefined;
+	}
+}
+
+function resolveConventionalExtensionEntries(dir: string): string[] | undefined {
+	const packageJsonPath = join(dir, "package.json");
+	if (existsSync(packageJsonPath)) {
+		const manifest = readVoltManifestFile(packageJsonPath);
+		if (manifest?.extensions?.length) {
+			const entries = manifest.extensions.map((entry) => resolve(dir, entry)).filter((entry) => existsSync(entry));
+			if (entries.length > 0) {
+				return entries;
+			}
+		}
+	}
+
+	const indexTs = join(dir, "index.ts");
+	const indexJs = join(dir, "index.js");
+	if (existsSync(indexTs)) {
+		return [indexTs];
+	}
+	if (existsSync(indexJs)) {
+		return [indexJs];
+	}
+	return undefined;
+}
+
+function collectConventionalExtensionFiles(dir: string): string[] {
+	if (!existsSync(dir)) {
+		return [];
+	}
+
+	const rootEntries = resolveConventionalExtensionEntries(dir);
+	if (rootEntries) {
+		return rootEntries;
+	}
+
+	const files: string[] = [];
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		if (entry.name.startsWith(".") || entry.name === "node_modules") {
+			continue;
+		}
+		const fullPath = join(dir, entry.name);
+		if (entry.isDirectory()) {
+			const resolvedEntries = resolveConventionalExtensionEntries(fullPath);
+			if (resolvedEntries) {
+				files.push(...resolvedEntries);
+			}
+		} else if (entry.isFile() && FILE_PATTERNS.extensions.test(entry.name)) {
+			files.push(fullPath);
+		}
 	}
 	return files;
 }

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -91,6 +91,30 @@ describe("store catalog", () => {
 			schemaVersion: 1,
 			packages: [],
 		});
+	});
+
+	it("keeps the remote catalog when cache persistence fails", async () => {
+		const agentDir = join(tempDir, "agent-file");
+		writeFileSync(agentDir, "not a directory");
+		const fetcher = vi.fn(async () =>
+			Response.json({
+				schemaVersion: 1,
+				packages: [
+					{
+						id: "remote",
+						name: "Remote",
+						description: "Fresh remote package",
+						source: "npm:@scope/remote@1.0.0",
+					},
+				],
+			}),
+		);
+
+		const result = await loadDefaultStoreCatalog({ agentDir, fetcher });
+
+		expect(result.source).toBe("remote");
+		expect(result.catalog.packages.map((pkg) => pkg.id)).toEqual(["remote"]);
+		expect(result.warnings).toEqual([expect.stringContaining("Failed to cache remote store catalog")]);
 	});
 
 	it("uses the cached catalog in offline mode", async () => {

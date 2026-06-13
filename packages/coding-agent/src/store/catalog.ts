@@ -349,11 +349,17 @@ export async function loadDefaultStoreCatalog(
 				result: parseStoreCatalogJson(rawCatalog, "remote store catalog"),
 			};
 		});
-		writeCachedCatalog(options.agentDir, raw);
+		const warnings = [...result.warnings];
+		try {
+			writeCachedCatalog(options.agentDir, raw);
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : String(error);
+			warnings.push(`Failed to cache remote store catalog: ${message}`);
+		}
 		return {
 			catalog: result.catalog,
 			source: "remote",
-			warnings: result.warnings,
+			warnings,
 		};
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);

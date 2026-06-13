@@ -87,6 +87,19 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "loaded");
 	});
 
 	it("discovers conventional resource directories when no volt manifest exists", async () => {
+		mkdirSync(join(packageDir, "extensions", "nested"), { recursive: true });
+		mkdirSync(join(packageDir, "extensions", "with-index"), { recursive: true });
+		mkdirSync(join(packageDir, "extensions", "with-manifest", "src"), { recursive: true });
+		writeFileSync(join(packageDir, "extensions", "nested", "hidden.ts"), "export default function hidden() {}\n");
+		writeFileSync(join(packageDir, "extensions", "with-index", "index.ts"), "export default function indexed() {}\n");
+		writeFileSync(
+			join(packageDir, "extensions", "with-manifest", "package.json"),
+			JSON.stringify({ volt: { extensions: ["./src/main.ts"] } }, null, 2),
+		);
+		writeFileSync(
+			join(packageDir, "extensions", "with-manifest", "src", "main.ts"),
+			"export default function manifested() {}\n",
+		);
 		writeFileSync(
 			join(packageDir, "package.json"),
 			JSON.stringify({ name: "volt-example", version: "1.2.3" }, null, 2),
@@ -94,7 +107,11 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "loaded");
 
 		const inspection = await inspectStorePackage({ source: packageDir, cwd: tempDir });
 
-		expect(inspection.discoveredResources.extensions).toEqual(["extensions/example.ts"]);
+		expect([...inspection.discoveredResources.extensions].sort()).toEqual([
+			"extensions/example.ts",
+			"extensions/with-index/index.ts",
+			"extensions/with-manifest/src/main.ts",
+		]);
 		expect(inspection.discoveredResources.skills).toEqual(["skills/helper/SKILL.md"]);
 	});
 
