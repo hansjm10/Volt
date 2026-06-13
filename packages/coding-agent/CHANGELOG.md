@@ -18,6 +18,7 @@
 - Added built-in LSP server defaults for clangd (C/C++), zls (Zig), lua-language-server, and bash-language-server.
 - Added LSP protocol tracing: `lsp.traceFile` setting and `/lsp trace [path|off]` runtime toggle append JSON-RPC traffic, server stderr, and lifecycle events to a log file.
 - Added a built-in `/review` command that reviews uncommitted changes, branch diffs vs a base, GitHub PRs, or single commits in an isolated in-process review session with full tool access, then starts a fresh session seeded only with the numbered findings so follow-ups like "fix 1 and 3" run with clean context. Configure the reviewer model with the `reviewModel` setting or the "Review model" entry in `/settings`.
+- Added an RTK extension example that rewrites bash tool calls through `rtk rewrite` for token-optimized command output.
 
 ### Fixed
 

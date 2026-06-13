@@ -99,6 +99,7 @@ cp permission-gate.ts ~/.volt/agent/extensions/
 
 | Extension | Description |
 |-----------|-------------|
+| `rtk.ts` | Rewrites bash commands through RTK for token-optimized command output |
 | `mac-system-theme.ts` | Syncs volt theme with macOS dark/light mode |
 
 ### Resources

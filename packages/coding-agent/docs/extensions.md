@@ -24,6 +24,7 @@ Extensions are TypeScript modules that extend volt's behavior. They can subscrib
 - Interactive tools (questions, wizards, custom dialogs)
 - Stateful tools (todo lists, connection pools)
 - External integrations (file watchers, webhooks, CI triggers)
+- Command-output compression (see `rtk.ts` example)
 - Games while you wait (see `snake.ts` example)
 
 See [examples/extensions/](../examples/extensions/) for working implementations.
@@ -2606,6 +2607,7 @@ All examples in [examples/extensions/](../examples/extensions/).
 | `system-prompt-header.ts` | Display system prompt info | `on("agent_start")`, `getSystemPrompt` |
 | `claude-rules.ts` | Load rules from files | `on("session_start")`, `on("before_agent_start")` |
 | `prompt-customizer.ts` | Add context-aware tool guidance using `systemPromptOptions` | `on("before_agent_start")`, `BuildSystemPromptOptions` |
+| `rtk.ts` | Rewrite bash commands through RTK for token-optimized command output | `on("tool_call")`, `exec` |
 | `file-trigger.ts` | File watcher triggers messages | `sendMessage` |
 | **Compaction & Sessions** |||
 | `custom-compaction.ts` | Custom compaction summary | `on("session_before_compact")` |
