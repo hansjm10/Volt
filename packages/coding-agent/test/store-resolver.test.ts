@@ -45,6 +45,36 @@ describe("store resolver", () => {
 		expect(unpinned.warnings).toContain("npm package @scope/pkg is not pinned to an exact version.");
 	});
 
+	it("does not mark ranged npm catalog sources as tracking", async () => {
+		const rangedCatalog: StoreCatalog = {
+			schemaVersion: 1,
+			packages: [
+				...catalog.packages,
+				{
+					id: "ranged-theme",
+					name: "Ranged Theme",
+					description: "Theme package",
+					source: "npm:@scope/ranged-theme@^1.0.0",
+				},
+				{
+					id: "latest-theme",
+					name: "Latest Theme",
+					description: "Theme package",
+					source: "npm:@scope/latest-theme@latest",
+				},
+			],
+		};
+		const ranged = await resolveStoreSource({ input: "ranged-theme", catalog: rangedCatalog });
+		const latest = await resolveStoreSource({ input: "latest-theme", catalog: rangedCatalog });
+
+		expect(ranged.pinned).toBe(true);
+		expect(ranged.tracking).toBe(false);
+		expect(ranged.warnings).toContain('npm package @scope/ranged-theme uses non-exact version spec "^1.0.0".');
+		expect(latest.pinned).toBe(true);
+		expect(latest.tracking).toBe(false);
+		expect(latest.warnings).toContain('npm package @scope/latest-theme uses non-exact version spec "latest".');
+	});
+
 	it("pins ref-less git sources to remote HEAD by default", async () => {
 		const resolved = await resolveStoreSource({
 			input: "https://github.com/user/repo",

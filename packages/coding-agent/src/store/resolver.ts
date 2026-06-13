@@ -191,13 +191,14 @@ export async function resolveStoreSource(options: ResolveStoreSourceOptions): Pr
 		} else if (!npmInfo.exactVersion) {
 			warnings.push(`npm package ${npmInfo.name} uses non-exact version spec "${npmInfo.version}".`);
 		}
+		const hasVersion = npmInfo.version !== undefined;
 		return {
 			input,
 			source: baseSource,
 			kind: catalogPackage ? "catalog" : "npm",
 			...(catalogPackage ? { catalogPackage } : {}),
-			pinned: npmInfo.exactVersion,
-			tracking: !npmInfo.exactVersion,
+			pinned: hasVersion,
+			tracking: !hasVersion,
 			warnings,
 		};
 	}
