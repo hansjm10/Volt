@@ -4,6 +4,7 @@ import type { Readable } from "node:stream";
 import { spawnProcess } from "../utils/child-process.ts";
 import type { GitSource } from "../utils/git.ts";
 import { parseGitUrl } from "../utils/git.ts";
+import { type ParsedNpmSpec, parseNpmSpec } from "../utils/npm-spec.ts";
 import { isLocalPath } from "../utils/paths.ts";
 import {
 	findCatalogPackage,
@@ -35,32 +36,9 @@ export interface ResolveStoreSourceOptions {
 	gitLsRemote?: StoreGitLsRemote;
 }
 
-interface NpmSpecInfo {
-	spec: string;
-	name: string;
-	version?: string;
-	exactVersion: boolean;
-}
-
 const GIT_REMOTE_TIMEOUT_MS = 10000;
 
-function isExactNpmVersion(version: string): boolean {
-	return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version);
-}
-
-function parseNpmSpec(spec: string): NpmSpecInfo {
-	const match = spec.match(/^(@?[^@]+(?:\/[^@]+)?)(?:@(.+))?$/);
-	const name = match?.[1] ?? spec;
-	const version = match?.[2];
-	return {
-		spec,
-		name,
-		version,
-		exactVersion: version ? isExactNpmVersion(version) : false,
-	};
-}
-
-function parseNpmSource(source: string): NpmSpecInfo | undefined {
+function parseNpmSource(source: string): ParsedNpmSpec | undefined {
 	if (!source.startsWith("npm:")) {
 		return undefined;
 	}

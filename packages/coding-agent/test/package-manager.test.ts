@@ -34,6 +34,7 @@ interface PackageManagerInternals {
 		options?: { cwd?: string; timeoutMs?: number; env?: Record<string, string> },
 	): Promise<string>;
 	getLocalGitUpdateTarget(installedPath: string): Promise<{ ref: string; head: string; fetchArgs: string[] }>;
+	getNpmResolvedVersion(spec: string): Promise<string>;
 	parseSource(
 		source: string,
 	):
@@ -2064,7 +2065,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 
 			expect(runCommandCaptureSpy).toHaveBeenCalledWith(
 				"npm",
-				["view", "example", "version", "--json"],
+				["view", "example@latest", "version", "--json"],
 				expect.objectContaining({ cwd: tempDir, timeoutMs: expect.any(Number) }),
 			);
 			expect(runCommandSpy).toHaveBeenCalledWith(
@@ -2087,7 +2088,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 
 			expect(runCommandCaptureSpy).toHaveBeenCalledWith(
 				"npm",
-				["view", "example", "version", "--json"],
+				["view", "example@latest", "version", "--json"],
 				expect.objectContaining({ cwd: tempDir, timeoutMs: expect.any(Number) }),
 			);
 			expect(runCommandSpy).not.toHaveBeenCalled();
@@ -2180,13 +2181,13 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 						throw new Error(`Unexpected runCommandCapture args: ${args.join(" ")}`);
 					}
 					switch (args[1]) {
-						case "user-old":
-						case "project-old":
+						case "user-old@latest":
+						case "project-old@latest":
 							return '"2.0.0"';
-						case "user-current":
-						case "project-current":
+						case "user-current@latest":
+						case "project-current@latest":
 							return '"1.0.0"';
-						case "user-unknown":
+						case "user-unknown@latest":
 							throw new Error("registry unavailable");
 						default:
 							throw new Error(`Unexpected package lookup: ${args[1]}`);
@@ -2371,15 +2372,16 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			expect(gitUpdateSpy).not.toHaveBeenCalled();
 		});
 
-		it("should use npm view to fetch latest version", async () => {
-			const runCommandCaptureSpy = vi.spyOn(packageManager as any, "runCommandCapture").mockResolvedValue('"1.2.3"');
+		it("should use npm view to resolve package versions", async () => {
+			const managerWithInternals = packageManager as unknown as PackageManagerInternals;
+			const runCommandCaptureSpy = vi.spyOn(managerWithInternals, "runCommandCapture").mockResolvedValue('"1.2.3"');
 
-			const latest = await (packageManager as any).getLatestNpmVersion("example");
+			const latest = await managerWithInternals.getNpmResolvedVersion("example@latest");
 			expect(latest).toBe("1.2.3");
 			expect(runCommandCaptureSpy).toHaveBeenCalledTimes(1);
 			expect(runCommandCaptureSpy).toHaveBeenCalledWith(
 				"npm",
-				["view", "example", "version", "--json"],
+				["view", "example@latest", "version", "--json"],
 				expect.objectContaining({ cwd: tempDir, timeoutMs: expect.any(Number) }),
 			);
 		});
@@ -2394,13 +2396,14 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 				settingsManager,
 			});
 
-			const runCommandCaptureSpy = vi.spyOn(packageManager as any, "runCommandCapture").mockResolvedValue('"1.2.3"');
+			const managerWithInternals = packageManager as unknown as PackageManagerInternals;
+			const runCommandCaptureSpy = vi.spyOn(managerWithInternals, "runCommandCapture").mockResolvedValue('"1.2.3"');
 
-			const latest = await (packageManager as any).getLatestNpmVersion("@scope/pkg");
+			const latest = await managerWithInternals.getNpmResolvedVersion("@scope/pkg@latest");
 			expect(latest).toBe("1.2.3");
 			expect(runCommandCaptureSpy).toHaveBeenCalledWith(
 				"mise",
-				["exec", "node@20", "--", "npm", "view", "@scope/pkg", "version", "--json"],
+				["exec", "node@20", "--", "npm", "view", "@scope/pkg@latest", "version", "--json"],
 				expect.objectContaining({ cwd: tempDir }),
 			);
 		});

@@ -30,6 +30,7 @@ import { minimatch } from "minimatch";
 import { CONFIG_DIR_NAME } from "../config.ts";
 import { spawnProcess, spawnProcessSync } from "../utils/child-process.ts";
 import { type GitSource, parseGitUrl } from "../utils/git.ts";
+import { getNpmUpdateSpec, parseNpmSpec } from "../utils/npm-spec.ts";
 import { canonicalizePath, isLocalPath, markPathIgnoredByCloudSync, resolvePath } from "../utils/paths.ts";
 import { isStdoutTakenOver } from "./output-guard.ts";
 import type { PackageSource, SettingsManager } from "./settings-manager.ts";
@@ -42,10 +43,6 @@ function isOfflineModeEnabled(): boolean {
 	const value = process.env.VOLT_OFFLINE;
 	if (!value) return false;
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
-}
-
-function isExactNpmVersion(version: string): boolean {
-	return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version);
 }
 
 export interface PathMetadata {
@@ -137,6 +134,7 @@ type NpmSource = {
 	type: "npm";
 	spec: string;
 	name: string;
+	version?: string;
 	pinned: boolean;
 };
 
@@ -1206,8 +1204,8 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		try {
-			const latestVersion = await this.getLatestNpmVersion(source.name);
-			return latestVersion !== installedVersion;
+			const targetVersion = await this.getNpmResolvedVersion(getNpmUpdateSpec(source));
+			return targetVersion !== installedVersion;
 		} catch {
 			// Preserve existing update behavior when version lookup fails.
 			return true;
@@ -1225,7 +1223,7 @@ export class DefaultPackageManager implements PackageManager {
 
 		const sourceLabel = sources.length === 1 ? sources[0].source : `${scope} npm packages`;
 		const message = sources.length === 1 ? `Updating ${sources[0].source}...` : `Updating ${scope} npm packages...`;
-		const specs = sources.map((entry) => `${entry.parsed.name}@latest`);
+		const specs = sources.map((entry) => getNpmUpdateSpec(entry.parsed));
 
 		await this.withProgress("update", sourceLabel, message, async () => {
 			await this.installNpmBatch(specs, scope, scripts);
@@ -1527,12 +1525,13 @@ export class DefaultPackageManager implements PackageManager {
 	private parseSource(source: string): ParsedSource {
 		if (source.startsWith("npm:")) {
 			const spec = source.slice("npm:".length).trim();
-			const { name, exactVersion } = this.parseNpmSpec(spec);
+			const npmSpec = parseNpmSpec(spec);
 			return {
 				type: "npm",
 				spec,
-				name,
-				pinned: exactVersion,
+				name: npmSpec.name,
+				...(npmSpec.version !== undefined ? { version: npmSpec.version } : {}),
+				pinned: npmSpec.exactVersion,
 			};
 		}
 
@@ -1555,12 +1554,11 @@ export class DefaultPackageManager implements PackageManager {
 			return false;
 		}
 
-		const { version: pinnedVersion, exactVersion } = this.parseNpmSpec(source.spec);
-		if (!pinnedVersion || !exactVersion) {
+		if (!source.version || !source.pinned) {
 			return true;
 		}
 
-		return installedVersion === pinnedVersion;
+		return installedVersion === source.version;
 	}
 
 	private async npmHasAvailableUpdate(source: NpmSource, installedPath: string): Promise<boolean> {
@@ -1574,8 +1572,8 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		try {
-			const latestVersion = await this.getLatestNpmVersion(source.name);
-			return latestVersion !== installedVersion;
+			const targetVersion = await this.getNpmResolvedVersion(getNpmUpdateSpec(source));
+			return targetVersion !== installedVersion;
 		} catch {
 			return false;
 		}
@@ -1593,16 +1591,27 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private async getLatestNpmVersion(packageName: string): Promise<string> {
+	private async getNpmResolvedVersion(spec: string): Promise<string> {
 		const npmCommand = this.getNpmCommand();
 		const stdout = await this.runCommandCapture(
 			npmCommand.command,
-			[...npmCommand.args, "view", packageName, "version", "--json"],
+			[...npmCommand.args, "view", spec, "version", "--json"],
 			{ cwd: this.cwd, timeoutMs: NETWORK_TIMEOUT_MS },
 		);
 		const raw = stdout.trim();
 		if (!raw) throw new Error("Empty response from npm view");
-		return JSON.parse(raw);
+		const parsed = JSON.parse(raw) as unknown;
+		if (typeof parsed === "string") {
+			return parsed;
+		}
+		if (Array.isArray(parsed)) {
+			const versions = parsed.filter((entry): entry is string => typeof entry === "string");
+			const version = versions[versions.length - 1];
+			if (version) {
+				return version;
+			}
+		}
+		throw new Error(`Unexpected npm view version response for ${spec}`);
 	}
 
 	private async gitHasAvailableUpdate(installedPath: string): Promise<boolean> {
@@ -1804,16 +1813,6 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		return Array.from(seen.values());
-	}
-
-	private parseNpmSpec(spec: string): { name: string; version?: string; exactVersion: boolean } {
-		const match = spec.match(/^(@?[^@]+(?:\/[^@]+)?)(?:@(.+))?$/);
-		if (!match) {
-			return { name: spec, exactVersion: false };
-		}
-		const name = match[1] ?? spec;
-		const version = match[2];
-		return { name, version, exactVersion: version ? isExactNpmVersion(version) : false };
 	}
 
 	private assertProjectTrustedForScope(scope: SourceScope): void {

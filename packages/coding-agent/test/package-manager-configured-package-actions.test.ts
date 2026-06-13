@@ -8,6 +8,11 @@ import { SettingsManager } from "../src/core/settings-manager.ts";
 
 interface PackageManagerInternals {
 	runCommand(command: string, args: string[], options?: { cwd?: string }): Promise<void>;
+	runCommandCapture(
+		command: string,
+		args: string[],
+		options?: { cwd?: string; timeoutMs?: number; env?: Record<string, string> },
+	): Promise<string>;
 }
 
 describe("configured package actions", () => {
@@ -59,6 +64,57 @@ describe("configured package actions", () => {
 
 		await packageManager.resolve();
 
+		const npmInstallCalls = runCommandSpy.mock.calls.filter(
+			([command, args]) => command === "npm" && args[0] === "install",
+		);
+		expect(npmInstallCalls).toHaveLength(0);
+	});
+
+	it("preserves tracking npm specs when updating packages", async () => {
+		settingsManager.setPackages([
+			"npm:@scope/latest",
+			"npm:@scope/beta@beta",
+			"npm:@scope/ranged@^1.0.0",
+			"npm:@scope/exact@1.2.3",
+		]);
+		const runCommandSpy = vi
+			.spyOn(packageManager as unknown as PackageManagerInternals, "runCommand")
+			.mockResolvedValue(undefined);
+
+		await packageManager.update();
+
+		const npmInstallCalls = runCommandSpy.mock.calls.filter(
+			([command, args]) => command === "npm" && args[0] === "install",
+		);
+		expect(npmInstallCalls).toHaveLength(1);
+		expect(npmInstallCalls[0]?.[1]).toEqual(
+			expect.arrayContaining(["@scope/latest@latest", "@scope/beta@beta", "@scope/ranged@^1.0.0"]),
+		);
+		expect(npmInstallCalls[0]?.[1]).not.toContain("@scope/exact@1.2.3");
+	});
+
+	it("checks npm updates against the configured tracking spec", async () => {
+		const packageDir = join(agentDir, "npm", "node_modules", "@scope", "ranged");
+		mkdirSync(packageDir, { recursive: true });
+		writeFileSync(
+			join(packageDir, "package.json"),
+			JSON.stringify({ name: "@scope/ranged", version: "1.9.0" }, null, 2),
+		);
+		settingsManager.setPackages(["npm:@scope/ranged@^1.0.0"]);
+		const runCommandSpy = vi
+			.spyOn(packageManager as unknown as PackageManagerInternals, "runCommand")
+			.mockResolvedValue(undefined);
+		const runCommandCaptureSpy = vi
+			.spyOn(packageManager as unknown as PackageManagerInternals, "runCommandCapture")
+			.mockResolvedValue(JSON.stringify(["1.8.0", "1.9.0"]));
+
+		await packageManager.update();
+
+		expect(runCommandCaptureSpy).toHaveBeenCalledWith(
+			"npm",
+			["view", "@scope/ranged@^1.0.0", "version", "--json"],
+			expect.objectContaining({ cwd: tempDir }),
+		);
 		const npmInstallCalls = runCommandSpy.mock.calls.filter(
 			([command, args]) => command === "npm" && args[0] === "install",
 		);
