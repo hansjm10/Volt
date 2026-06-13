@@ -148,6 +148,7 @@ type InstalledSourceScope = Exclude<SourceScope, "temporary">;
 interface ConfiguredUpdateSource {
 	source: string;
 	scope: InstalledSourceScope;
+	scripts: PackageInstallScriptPolicy;
 }
 
 interface NpmUpdateTarget extends ConfiguredUpdateSource {
@@ -1086,7 +1087,6 @@ export class DefaultPackageManager implements PackageManager {
 		const identity = source ? this.getPackageIdentity(source) : undefined;
 		const scopeFilter: InstalledSourceScope | undefined =
 			options?.local === undefined ? undefined : options.local ? "project" : "user";
-		const scripts = options?.scripts ?? "allow";
 		let matched = false;
 		const updateSources: ConfiguredUpdateSource[] = [];
 
@@ -1095,7 +1095,11 @@ export class DefaultPackageManager implements PackageManager {
 				const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 				if (identity && this.getPackageIdentity(sourceStr, "user") !== identity) continue;
 				matched = true;
-				updateSources.push({ source: sourceStr, scope: "user" });
+				updateSources.push({
+					source: sourceStr,
+					scope: "user",
+					scripts: options?.scripts ?? this.getPackageInstallScriptPolicy(pkg),
+				});
 			}
 		}
 		if (scopeFilter !== "user") {
@@ -1103,7 +1107,11 @@ export class DefaultPackageManager implements PackageManager {
 				const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 				if (identity && this.getPackageIdentity(sourceStr, "project") !== identity) continue;
 				matched = true;
-				updateSources.push({ source: sourceStr, scope: "project" });
+				updateSources.push({
+					source: sourceStr,
+					scope: "project",
+					scripts: options?.scripts ?? this.getPackageInstallScriptPolicy(pkg),
+				});
 			}
 		}
 
@@ -1116,13 +1124,10 @@ export class DefaultPackageManager implements PackageManager {
 			);
 		}
 
-		await this.updateConfiguredSources(updateSources, scripts);
+		await this.updateConfiguredSources(updateSources);
 	}
 
-	private async updateConfiguredSources(
-		sources: ConfiguredUpdateSource[],
-		scripts: PackageInstallScriptPolicy,
-	): Promise<void> {
+	private async updateConfiguredSources(sources: ConfiguredUpdateSource[]): Promise<void> {
 		if (isOfflineModeEnabled() || sources.length === 0) {
 			return;
 		}
@@ -1148,31 +1153,31 @@ export class DefaultPackageManager implements PackageManager {
 			shouldUpdate: await this.shouldUpdateNpmSource(entry.parsed, entry.scope),
 		}));
 		const npmCheckResults = await this.runWithConcurrency(npmCheckTasks, UPDATE_CHECK_CONCURRENCY);
-		const userNpmUpdates: NpmUpdateTarget[] = [];
-		const projectNpmUpdates: NpmUpdateTarget[] = [];
+		const npmUpdateGroups: Record<InstalledSourceScope, Record<PackageInstallScriptPolicy, NpmUpdateTarget[]>> = {
+			user: { allow: [], never: [] },
+			project: { allow: [], never: [] },
+		};
 		for (const result of npmCheckResults) {
 			if (!result.shouldUpdate) {
 				continue;
 			}
-			if (result.entry.scope === "user") {
-				userNpmUpdates.push(result.entry);
-			} else {
-				projectNpmUpdates.push(result.entry);
-			}
+			npmUpdateGroups[result.entry.scope][result.entry.scripts].push(result.entry);
 		}
 
 		const tasks: Promise<void>[] = [];
-		if (userNpmUpdates.length > 0) {
-			tasks.push(this.updateNpmBatch(userNpmUpdates, "user", scripts));
-		}
-		if (projectNpmUpdates.length > 0) {
-			tasks.push(this.updateNpmBatch(projectNpmUpdates, "project", scripts));
+		for (const scope of ["user", "project"] as const) {
+			for (const scripts of ["allow", "never"] as const) {
+				const npmUpdates = npmUpdateGroups[scope][scripts];
+				if (npmUpdates.length > 0) {
+					tasks.push(this.updateNpmBatch(npmUpdates, scope, scripts));
+				}
+			}
 		}
 		if (gitCandidates.length > 0) {
 			const gitTasks = gitCandidates.map(
 				(entry) => async () =>
 					this.withProgress("update", entry.source, `Updating ${entry.source}...`, async () => {
-						await this.updateGit(entry.parsed, entry.scope, scripts);
+						await this.updateGit(entry.parsed, entry.scope, entry.scripts);
 					}),
 			);
 			tasks.push(this.runWithConcurrency(gitTasks, GIT_UPDATE_CONCURRENCY).then(() => {}));

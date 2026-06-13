@@ -130,6 +130,25 @@ describe("DefaultPackageManager script policy", () => {
 		);
 	});
 
+	it("uses persisted scripts policy for npm updates when no override is provided", async () => {
+		settingsManager.setPackages(["npm:@scope/allow", { source: "npm:@scope/never", scripts: "never" }]);
+		const runCommandSpy = vi
+			.spyOn(packageManager as unknown as PackageManagerInternals, "runCommand")
+			.mockResolvedValue(undefined);
+
+		await packageManager.update();
+
+		const npmInstallCalls = runCommandSpy.mock.calls.filter(
+			([command, args]) => command === "npm" && args[0] === "install",
+		);
+		const allowCall = npmInstallCalls.find(([, args]) => args.includes("@scope/allow@latest"));
+		const neverCall = npmInstallCalls.find(([, args]) => args.includes("@scope/never@latest"));
+		expect(allowCall).toBeDefined();
+		expect(neverCall).toBeDefined();
+		expect(allowCall?.[1]).not.toContain("--ignore-scripts");
+		expect(neverCall?.[1]).toContain("--ignore-scripts");
+	});
+
 	it("passes --ignore-scripts for git update dependency installs when scripts are disabled", async () => {
 		settingsManager.setPackages(["git:github.com/user/repo"]);
 		const targetDir = join(agentDir, "git", "github.com", "user", "repo");
@@ -143,6 +162,25 @@ describe("DefaultPackageManager script policy", () => {
 			});
 
 		await packageManager.update(undefined, { scripts: "never" });
+
+		expect(runCommandSpy).toHaveBeenCalledWith("npm", ["install", "--omit=dev", "--ignore-scripts"], {
+			cwd: targetDir,
+		});
+	});
+
+	it("uses persisted disabled scripts policy for git updates when no override is provided", async () => {
+		settingsManager.setPackages([{ source: "git:github.com/user/repo", scripts: "never" }]);
+		const targetDir = join(agentDir, "git", "github.com", "user", "repo");
+		const runCommandSpy = vi
+			.spyOn(packageManager as unknown as PackageManagerInternals, "runCommand")
+			.mockImplementation(async (command, args) => {
+				if (command === "git" && args[0] === "clone") {
+					mkdirSync(targetDir, { recursive: true });
+					writeFileSync(join(targetDir, "package.json"), JSON.stringify({ name: "repo", version: "1.0.0" }));
+				}
+			});
+
+		await packageManager.update();
 
 		expect(runCommandSpy).toHaveBeenCalledWith("npm", ["install", "--omit=dev", "--ignore-scripts"], {
 			cwd: targetDir,
