@@ -44,6 +44,10 @@ function isOfflineModeEnabled(): boolean {
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
 
+function isExactNpmVersion(version: string): boolean {
+	return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version);
+}
+
 export interface PathMetadata {
 	source: string;
 	scope: SourceScope;
@@ -1523,12 +1527,12 @@ export class DefaultPackageManager implements PackageManager {
 	private parseSource(source: string): ParsedSource {
 		if (source.startsWith("npm:")) {
 			const spec = source.slice("npm:".length).trim();
-			const { name, version } = this.parseNpmSpec(spec);
+			const { name, exactVersion } = this.parseNpmSpec(spec);
 			return {
 				type: "npm",
 				spec,
 				name,
-				pinned: Boolean(version),
+				pinned: exactVersion,
 			};
 		}
 
@@ -1551,8 +1555,8 @@ export class DefaultPackageManager implements PackageManager {
 			return false;
 		}
 
-		const { version: pinnedVersion } = this.parseNpmSpec(source.spec);
-		if (!pinnedVersion) {
+		const { version: pinnedVersion, exactVersion } = this.parseNpmSpec(source.spec);
+		if (!pinnedVersion || !exactVersion) {
 			return true;
 		}
 
@@ -1802,14 +1806,14 @@ export class DefaultPackageManager implements PackageManager {
 		return Array.from(seen.values());
 	}
 
-	private parseNpmSpec(spec: string): { name: string; version?: string } {
+	private parseNpmSpec(spec: string): { name: string; version?: string; exactVersion: boolean } {
 		const match = spec.match(/^(@?[^@]+(?:\/[^@]+)?)(?:@(.+))?$/);
 		if (!match) {
-			return { name: spec };
+			return { name: spec, exactVersion: false };
 		}
 		const name = match[1] ?? spec;
 		const version = match[2];
-		return { name, version };
+		return { name, version, exactVersion: version ? isExactNpmVersion(version) : false };
 	}
 
 	private assertProjectTrustedForScope(scope: SourceScope): void {

@@ -44,6 +44,10 @@ interface NpmSpecInfo {
 
 const GIT_REMOTE_TIMEOUT_MS = 10000;
 
+function isExactNpmVersion(version: string): boolean {
+	return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version);
+}
+
 function parseNpmSpec(spec: string): NpmSpecInfo {
 	const match = spec.match(/^(@?[^@]+(?:\/[^@]+)?)(?:@(.+))?$/);
 	const name = match?.[1] ?? spec;
@@ -52,7 +56,7 @@ function parseNpmSpec(spec: string): NpmSpecInfo {
 		spec,
 		name,
 		version,
-		exactVersion: version ? /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version) : false,
+		exactVersion: version ? isExactNpmVersion(version) : false,
 	};
 }
 
@@ -191,14 +195,14 @@ export async function resolveStoreSource(options: ResolveStoreSourceOptions): Pr
 		} else if (!npmInfo.exactVersion) {
 			warnings.push(`npm package ${npmInfo.name} uses non-exact version spec "${npmInfo.version}".`);
 		}
-		const hasVersion = npmInfo.version !== undefined;
+		const pinned = npmInfo.exactVersion;
 		return {
 			input,
 			source: baseSource,
 			kind: catalogPackage ? "catalog" : "npm",
 			...(catalogPackage ? { catalogPackage } : {}),
-			pinned: hasVersion,
-			tracking: !hasVersion,
+			pinned,
+			tracking: !pinned,
 			warnings,
 		};
 	}

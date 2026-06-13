@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -43,6 +43,26 @@ describe("configured package actions", () => {
 		await expect(packageManager.update(configured.actionSource, { scripts: "never" })).resolves.toBeUndefined();
 		await expect(packageManager.removeAndPersist(configured.actionSource, { local: true })).resolves.toBe(true);
 		expect(settingsManager.getProjectSettings().packages).toEqual([]);
+	});
+
+	it("does not reinstall installed npm packages for non-exact version specs", async () => {
+		const packageDir = join(agentDir, "npm", "node_modules", "@scope", "theme");
+		mkdirSync(packageDir, { recursive: true });
+		writeFileSync(
+			join(packageDir, "package.json"),
+			JSON.stringify({ name: "@scope/theme", version: "1.2.3" }, null, 2),
+		);
+		settingsManager.setPackages(["npm:@scope/theme@^1.0.0"]);
+		const runCommandSpy = vi
+			.spyOn(packageManager as unknown as PackageManagerInternals, "runCommand")
+			.mockResolvedValue(undefined);
+
+		await packageManager.resolve();
+
+		const npmInstallCalls = runCommandSpy.mock.calls.filter(
+			([command, args]) => command === "npm" && args[0] === "install",
+		);
+		expect(npmInstallCalls).toHaveLength(0);
 	});
 
 	it("updates only the selected scope when configured packages share an identity", async () => {

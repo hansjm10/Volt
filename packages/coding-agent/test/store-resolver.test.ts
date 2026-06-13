@@ -45,7 +45,7 @@ describe("store resolver", () => {
 		expect(unpinned.warnings).toContain("npm package @scope/pkg is not pinned to an exact version.");
 	});
 
-	it("does not mark ranged npm catalog sources as tracking", async () => {
+	it("marks non-exact npm catalog sources as tracking", async () => {
 		const rangedCatalog: StoreCatalog = {
 			schemaVersion: 1,
 			packages: [
@@ -67,11 +67,11 @@ describe("store resolver", () => {
 		const ranged = await resolveStoreSource({ input: "ranged-theme", catalog: rangedCatalog });
 		const latest = await resolveStoreSource({ input: "latest-theme", catalog: rangedCatalog });
 
-		expect(ranged.pinned).toBe(true);
-		expect(ranged.tracking).toBe(false);
+		expect(ranged.pinned).toBe(false);
+		expect(ranged.tracking).toBe(true);
 		expect(ranged.warnings).toContain('npm package @scope/ranged-theme uses non-exact version spec "^1.0.0".');
-		expect(latest.pinned).toBe(true);
-		expect(latest.tracking).toBe(false);
+		expect(latest.pinned).toBe(false);
+		expect(latest.tracking).toBe(true);
 		expect(latest.warnings).toContain('npm package @scope/latest-theme uses non-exact version spec "latest".');
 	});
 
