@@ -23,6 +23,19 @@ function callHandleCtrlZ(context: HandleCtrlZThis): void {
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown;
 
+function replaceProcessPlatform(value: NodeJS.Platform): () => void {
+	const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+	Object.defineProperty(process, "platform", {
+		configurable: true,
+		value,
+	});
+	return () => {
+		if (platformDescriptor) {
+			Object.defineProperty(process, "platform", platformDescriptor);
+		}
+	};
+}
+
 describe("InteractiveMode.handleCtrlZ", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -36,11 +49,7 @@ describe("InteractiveMode.handleCtrlZ", () => {
 		};
 		const showStatus = vi.fn();
 		const context: HandleCtrlZThis & { showStatus: (message: string) => void } = { ui, showStatus };
-		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
-		Object.defineProperty(process, "platform", {
-			configurable: true,
-			value: "win32",
-		});
+		const restorePlatform = replaceProcessPlatform("win32");
 		const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
 		const processOnSpy = vi.spyOn(process, "on");
 		const processOnceSpy = vi.spyOn(process, "once");
@@ -49,9 +58,7 @@ describe("InteractiveMode.handleCtrlZ", () => {
 		try {
 			callHandleCtrlZ(context);
 		} finally {
-			if (platformDescriptor) {
-				Object.defineProperty(process, "platform", platformDescriptor);
-			}
+			restorePlatform();
 		}
 
 		expect(showStatus).toHaveBeenCalledWith("Suspend to background is not supported on Windows");
@@ -93,8 +100,13 @@ describe("InteractiveMode.handleCtrlZ", () => {
 			.spyOn(process, "removeListener")
 			.mockImplementation(((_event: string, _listener: () => void) => process) as typeof process.removeListener);
 		const processKillSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+		const restorePlatform = replaceProcessPlatform("linux");
 
-		callHandleCtrlZ(context);
+		try {
+			callHandleCtrlZ(context);
+		} finally {
+			restorePlatform();
+		}
 
 		expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 2 ** 30);
 		expect(processOnSpy).toHaveBeenCalledWith("SIGINT", expect.any(Function));
@@ -137,8 +149,13 @@ describe("InteractiveMode.handleCtrlZ", () => {
 		vi.spyOn(process, "kill").mockImplementation(() => {
 			throw suspendError;
 		});
+		const restorePlatform = replaceProcessPlatform("linux");
 
-		expect(() => callHandleCtrlZ(context)).toThrow(suspendError);
+		try {
+			expect(() => callHandleCtrlZ(context)).toThrow(suspendError);
+		} finally {
+			restorePlatform();
+		}
 		expect(ui.stop).toHaveBeenCalledTimes(1);
 		expect(setIntervalSpy).toHaveBeenCalledTimes(1);
 		expect(clearIntervalSpy).toHaveBeenCalledWith(keepAliveHandle);

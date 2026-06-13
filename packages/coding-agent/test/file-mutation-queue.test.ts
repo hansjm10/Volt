@@ -1,10 +1,11 @@
-import { access, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEditTool } from "../src/core/tools/edit.ts";
 import { withFileMutationQueue } from "../src/core/tools/file-mutation-queue.ts";
 import { createWriteTool } from "../src/core/tools/write.ts";
+import { tryCreateFileSymlink } from "./symlink-utils.ts";
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -79,7 +80,8 @@ describe("withFileMutationQueue", () => {
 		const targetPath = join(dir, "target.txt");
 		const symlinkPath = join(dir, "alias.txt");
 		await writeFile(targetPath, "hello\n", "utf8");
-		await symlink(targetPath, symlinkPath);
+		const hasFileSymlink = await tryCreateFileSymlink(targetPath, symlinkPath);
+		if (!hasFileSymlink) return;
 
 		const order: string[] = [];
 		await Promise.all([

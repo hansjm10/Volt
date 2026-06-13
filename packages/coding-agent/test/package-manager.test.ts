@@ -1,11 +1,12 @@
 import { EventEmitter } from "node:events";
-import { mkdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager, type ProgressEvent, type ResolvedResource } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createDirectorySymlinkSync } from "./symlink-utils.ts";
 
 function normalizeForMatch(value: string): string {
 	return value.replace(/\\/g, "/");
@@ -212,14 +213,14 @@ Content`,
 
 				mkdirSync(join(agentDir), { recursive: true });
 				mkdirSync(join(tempDir, ".volt"), { recursive: true });
-				symlinkSync(sharedExtensionsDir, join(agentDir, "extensions"), "dir");
-				symlinkSync(sharedSkillsDir, join(agentDir, "skills"), "dir");
-				symlinkSync(sharedPromptsDir, join(agentDir, "prompts"), "dir");
-				symlinkSync(sharedThemesDir, join(agentDir, "themes"), "dir");
-				symlinkSync(sharedExtensionsDir, join(tempDir, ".volt", "extensions"), "dir");
-				symlinkSync(sharedSkillsDir, join(tempDir, ".volt", "skills"), "dir");
-				symlinkSync(sharedPromptsDir, join(tempDir, ".volt", "prompts"), "dir");
-				symlinkSync(sharedThemesDir, join(tempDir, ".volt", "themes"), "dir");
+				createDirectorySymlinkSync(sharedExtensionsDir, join(agentDir, "extensions"));
+				createDirectorySymlinkSync(sharedSkillsDir, join(agentDir, "skills"));
+				createDirectorySymlinkSync(sharedPromptsDir, join(agentDir, "prompts"));
+				createDirectorySymlinkSync(sharedThemesDir, join(agentDir, "themes"));
+				createDirectorySymlinkSync(sharedExtensionsDir, join(tempDir, ".volt", "extensions"));
+				createDirectorySymlinkSync(sharedSkillsDir, join(tempDir, ".volt", "skills"));
+				createDirectorySymlinkSync(sharedPromptsDir, join(tempDir, ".volt", "prompts"));
+				createDirectorySymlinkSync(sharedThemesDir, join(tempDir, ".volt", "themes"));
 
 				const result = await packageManager.resolve();
 
@@ -504,9 +505,7 @@ Content`,
 				const agentSkillsDir = join(agentDir, "skills");
 				const agentsSkillsDir = join(tempDir, ".agents", "skills");
 				mkdirSync(agentsSkillsDir, { recursive: true });
-				// Use junction on Windows to avoid EPERM when symlink privileges are unavailable.
-				const directoryLinkType = process.platform === "win32" ? "junction" : "dir";
-				symlinkSync(agentsSkillsDir, agentSkillsDir, directoryLinkType);
+				createDirectorySymlinkSync(agentsSkillsDir, agentSkillsDir);
 
 				const skillPath = join(agentsSkillsDir, "foo", "SKILL.md");
 				mkdirSync(join(agentsSkillsDir, "foo"), { recursive: true });

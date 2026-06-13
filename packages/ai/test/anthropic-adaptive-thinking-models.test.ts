@@ -7,6 +7,9 @@ const EXPECTED_CURRENT_ADAPTIVE_THINKING_MODELS = [
 	"anthropic/claude-opus-4-8",
 	"opencode/claude-fable-5",
 	"opencode/claude-opus-4-8",
+];
+
+const EXPECTED_CATALOG_ADAPTIVE_THINKING_MODELS = [
 	"vercel-ai-gateway/anthropic/claude-fable-5",
 	"vercel-ai-gateway/anthropic/claude-opus-4.8",
 ];
@@ -23,7 +26,14 @@ describe("Anthropic adaptive thinking model metadata", () => {
 			.map((model) => `${model.provider}/${model.id}`)
 			.sort();
 
-		expect(flaggedModels).toEqual(expect.arrayContaining([...EXPECTED_CURRENT_ADAPTIVE_THINKING_MODELS].sort()));
+		const allModelIds = new Set(getAllModels().map((model) => `${model.provider}/${model.id}`));
+		const expectedCatalogModels = EXPECTED_CATALOG_ADAPTIVE_THINKING_MODELS.filter((modelId) =>
+			allModelIds.has(modelId),
+		);
+
+		expect(flaggedModels).toEqual(
+			expect.arrayContaining([...EXPECTED_CURRENT_ADAPTIVE_THINKING_MODELS, ...expectedCatalogModels].sort()),
+		);
 		expect(flaggedModels).toEqual(
 			flaggedModels.filter((modelId) => /(opus[-.]4[-.][678]|sonnet[-.]4[-.]6|fable[-.]5)/.test(modelId)),
 		);

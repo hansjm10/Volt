@@ -1,9 +1,8 @@
-import { symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import { loadSkills, loadSourcedSkills } from "../../src/harness/skills.ts";
-import { createTempDir } from "./session-test-utils.ts";
+import { createTempDir, directorySymlinkType, tryCreateSymlink } from "./session-test-utils.ts";
 
 describe("loadSkills", () => {
 	it("loads SKILL.md files through the execution environment", async () => {
@@ -43,7 +42,7 @@ Use this skill.
 			"actual/example/SKILL.md",
 			"---\nname: example\ndescription: Example skill\n---\nUse this skill.",
 		);
-		await symlink(join(root, "actual"), join(root, "skills-link"));
+		await tryCreateSymlink(join(root, "actual"), join(root, "skills-link"), directorySymlinkType());
 
 		const { skills } = await loadSkills(env, "skills-link");
 

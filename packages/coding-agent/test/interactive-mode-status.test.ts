@@ -626,7 +626,7 @@ describe("InteractiveMode.showLoadedResources", () => {
 
 		expect(normalizeRenderedOutput(fakeThis.chatContainer)).toMatchInlineSnapshot(`
 "[Extensions]
-  @scope/volt-scoped, answer.ts, cli-extension.ts, HazAT/volt-interactive-subagents, HazAT/volt-interactive-subagents:subagents, local-index, volt-markdown-preview, user-index"`);
+  @scope/volt-scoped, answer.ts, cli-extension.ts, HazAT/volt-interactive-subagents, HazAT/volt-interactive-subagents:subagents, local-index, user-index, volt-markdown-preview"`);
 	});
 
 	test("adds more parent folders until local extension labels are unique", () => {

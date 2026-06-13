@@ -214,7 +214,8 @@ export function createGrepToolDefinition(
 
 						const args: string[] = ["--json", "--line-number", "--color=never", "--hidden"];
 						if (ignoreCase) args.push("--ignore-case");
-						if (literal) args.push("--fixed-strings");
+						const useFixedStrings = literal || pattern.startsWith("-");
+						if (useFixedStrings) args.push("--fixed-strings");
 						if (glob) args.push("--glob", glob);
 						args.push("--", pattern, searchPath);
 

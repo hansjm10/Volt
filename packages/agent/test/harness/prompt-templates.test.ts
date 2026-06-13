@@ -1,4 +1,3 @@
-import { symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
@@ -7,7 +6,7 @@ import {
 	loadPromptTemplates,
 	loadSourcedPromptTemplates,
 } from "../../src/harness/prompt-templates.ts";
-import { createTempDir } from "./session-test-utils.ts";
+import { createTempDir, tryCreateSymlink } from "./session-test-utils.ts";
 
 describe("loadPromptTemplates", () => {
 	it("loads markdown templates non-recursively from one or more dirs", async () => {
@@ -69,7 +68,8 @@ describe("loadPromptTemplates", () => {
 		const root = createTempDir();
 		const env = new NodeExecutionEnv({ cwd: root });
 		await env.writeFile("target.md", "---\ndescription: Target\n---\nTarget body");
-		await symlink(join(root, "target.md"), join(root, "link.md"));
+		const hasFileSymlink = await tryCreateSymlink(join(root, "target.md"), join(root, "link.md"), "file");
+		if (!hasFileSymlink) return;
 
 		const { promptTemplates } = await loadPromptTemplates(env, ["target.md", "link.md"]);
 

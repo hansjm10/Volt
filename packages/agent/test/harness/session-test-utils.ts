@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/volt-agent-core";
@@ -32,7 +33,27 @@ export function createAssistantMessage(text: string): AgentMessage {
 	};
 }
 
+type SymlinkType = "dir" | "file" | "junction";
+
 const tempDirs: string[] = [];
+
+function isSymlinkPermissionError(error: unknown): boolean {
+	return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "EPERM";
+}
+
+export async function tryCreateSymlink(target: string, path: string, type?: SymlinkType): Promise<boolean> {
+	try {
+		await symlink(target, path, type);
+		return true;
+	} catch (error) {
+		if (isSymlinkPermissionError(error)) return false;
+		throw error;
+	}
+}
+
+export function directorySymlinkType(): SymlinkType {
+	return process.platform === "win32" ? "junction" : "dir";
+}
 
 export function createTempDir(): string {
 	const dir = join(tmpdir(), `volt-agent-session-${Date.now()}-${Math.random().toString(36).slice(2)}`);

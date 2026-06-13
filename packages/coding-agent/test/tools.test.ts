@@ -391,12 +391,13 @@ describe("Coding Agent Tools", () => {
 			writeFileSync(testFile, "hello\n");
 			chmodSync(testFile, 0o444);
 
+			const expectedCode = process.platform === "win32" ? "EPERM" : "EACCES";
 			await expect(
 				editTool.execute("test-call-14", {
 					path: testFile,
 					edits: [{ oldText: "hello", newText: "world" }],
 				}),
-			).rejects.toThrow(`Could not edit file: ${testFile}. Error code: EACCES.`);
+			).rejects.toThrow(`Could not edit file: ${testFile}. Error code: ${expectedCode}.`);
 		});
 
 		it("should include the original error message for unknown edit access errors", async () => {
@@ -426,6 +427,8 @@ describe("Coding Agent Tools", () => {
 		});
 
 		it("should include EACCES in diff preview for unreadable files", async () => {
+			if (process.platform === "win32") return;
+
 			const unreadableFile = join(testDir, "unreadable-preview.txt");
 			writeFileSync(unreadableFile, "hello\n");
 			chmodSync(unreadableFile, 0o222);

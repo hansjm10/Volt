@@ -57,6 +57,17 @@ const VIRTUAL_MODULES: Record<string, unknown> = {
 
 const require = createRequire(import.meta.url);
 
+type ImportMetaWithResolve = ImportMeta & { resolve?: (specifier: string) => string };
+
+function resolveImportSpecifier(specifier: string): string {
+	const resolveSpecifier = (import.meta as ImportMetaWithResolve).resolve;
+	if (typeof resolveSpecifier === "function") {
+		const resolved = resolveSpecifier(specifier);
+		return resolved.startsWith("file:") ? fileURLToPath(resolved) : resolved;
+	}
+	return require.resolve(specifier);
+}
+
 /**
  * Get aliases for jiti (used in Node.js/development mode).
  * In Bun binary mode, virtualModules is used instead.
@@ -67,26 +78,45 @@ function getAliases(): Record<string, string> {
 	if (_aliases) return _aliases;
 
 	const __dirname = path.dirname(fileURLToPath(import.meta.url));
-	const packageIndex = path.resolve(__dirname, "../..", "index.js");
+	const sourcePackageIndex = path.resolve(__dirname, "../..", "index.ts");
+	const packageIndex = fs.existsSync(sourcePackageIndex)
+		? sourcePackageIndex
+		: path.resolve(__dirname, "../..", "index.js");
 
 	const typeboxEntry = require.resolve("typebox");
 	const typeboxCompileEntry = require.resolve("typebox/compile");
 	const typeboxValueEntry = require.resolve("typebox/value");
 
 	const packagesRoot = path.resolve(__dirname, "../../../../");
-	const resolveWorkspaceOrImport = (workspaceRelativePath: string, specifier: string): string => {
-		const workspacePath = path.join(packagesRoot, workspaceRelativePath);
-		if (fs.existsSync(workspacePath)) {
-			return workspacePath;
+	const resolveWorkspaceOrImport = (
+		distWorkspaceRelativePath: string,
+		sourceWorkspaceRelativePath: string,
+		specifier: string,
+	): string => {
+		const distWorkspacePath = path.join(packagesRoot, distWorkspaceRelativePath);
+		if (fs.existsSync(distWorkspacePath)) {
+			return distWorkspacePath;
 		}
-		return fileURLToPath(import.meta.resolve(specifier));
+		const sourceWorkspacePath = path.join(packagesRoot, sourceWorkspaceRelativePath);
+		if (fs.existsSync(sourceWorkspacePath)) {
+			return sourceWorkspacePath;
+		}
+		return resolveImportSpecifier(specifier);
 	};
 
 	const voltCodingAgentEntry = packageIndex;
-	const voltAgentCoreEntry = resolveWorkspaceOrImport("agent/dist/index.js", "@earendil-works/volt-agent-core");
-	const voltTuiEntry = resolveWorkspaceOrImport("tui/dist/index.js", "@earendil-works/volt-tui");
-	const voltAiEntry = resolveWorkspaceOrImport("ai/dist/index.js", "@earendil-works/volt-ai");
-	const voltAiOauthEntry = resolveWorkspaceOrImport("ai/dist/oauth.js", "@earendil-works/volt-ai/oauth");
+	const voltAgentCoreEntry = resolveWorkspaceOrImport(
+		"agent/dist/index.js",
+		"agent/src/index.ts",
+		"@earendil-works/volt-agent-core",
+	);
+	const voltTuiEntry = resolveWorkspaceOrImport("tui/dist/index.js", "tui/src/index.ts", "@earendil-works/volt-tui");
+	const voltAiEntry = resolveWorkspaceOrImport("ai/dist/index.js", "ai/src/index.ts", "@earendil-works/volt-ai");
+	const voltAiOauthEntry = resolveWorkspaceOrImport(
+		"ai/dist/oauth.js",
+		"ai/src/oauth.ts",
+		"@earendil-works/volt-ai/oauth",
+	);
 
 	_aliases = {
 		"@earendil-works/volt-coding-agent": voltCodingAgentEntry,

@@ -43,6 +43,11 @@ function fileKindFromStats(stats: {
 	return undefined;
 }
 
+function basenamePath(path: string): string {
+	const normalized = path.replace(/[\\/]+$/, "");
+	return normalized.split(/[\\/]/).pop() ?? path;
+}
+
 function fileInfoFromStats(
 	path: string,
 	stats: { isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean; size: number; mtimeMs: number },
@@ -50,7 +55,7 @@ function fileInfoFromStats(
 	const kind = fileKindFromStats(stats);
 	if (!kind) return err(new FileError("invalid", "Unsupported file type", path));
 	return ok({
-		name: path.replace(/\/+$/, "").split("/").pop() ?? path,
+		name: basenamePath(path),
 		path,
 		kind,
 		size: stats.size,

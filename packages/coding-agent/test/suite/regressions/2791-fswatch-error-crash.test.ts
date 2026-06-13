@@ -1,7 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 /**
@@ -18,6 +20,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
  * 4. If the watcher has no error handler -> crash (exit != 0) -> bug present
  * 5. If the watcher has an error handler -> clean exit (exit 0) -> bug fixed
  */
+const require = createRequire(import.meta.url);
+
 describe("issue #2791 fs.watch error event crashes process", () => {
 	let tempRoot: string;
 
@@ -39,7 +43,9 @@ describe("issue #2791 fs.watch error event crashes process", () => {
 	});
 
 	it("process should survive an error event on the theme FSWatcher", () => {
-		const themeModulePath = join(__dirname, "../../../src/modes/interactive/theme/theme.ts").replace(/\\/g, "/");
+		const themeModulePath = join(__dirname, "../../../src/modes/interactive/theme/theme.ts");
+		const tuiModulePath = join(__dirname, "../../../../tui/src/index.ts");
+		const jitiModuleUrl = pathToFileURL(require.resolve("jiti")).href;
 		const agentDir = join(tempRoot, "agent").replace(/\\/g, "/");
 
 		// Script that sets up the watcher and emits a synthetic error on it.
@@ -49,7 +55,14 @@ describe("issue #2791 fs.watch error event crashes process", () => {
 		writeFileSync(
 			scriptPath,
 			`
-import { setTheme, stopThemeWatcher } from "${themeModulePath}";
+import { createJiti } from ${JSON.stringify(jitiModuleUrl)};
+
+const jiti = createJiti(import.meta.url, {
+	alias: {
+		"@earendil-works/volt-tui": ${JSON.stringify(tuiModulePath)},
+	},
+});
+const { setTheme, stopThemeWatcher } = await jiti.import(${JSON.stringify(themeModulePath)});
 
 process.env.VOLT_CODING_AGENT_DIR = "${agentDir}";
 
