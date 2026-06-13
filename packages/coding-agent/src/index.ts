@@ -175,6 +175,8 @@ export {
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export type {
+	PackageInstallOptions,
+	PackageInstallScriptPolicy,
 	PackageManager,
 	PathMetadata,
 	ProgressCallback,
@@ -390,6 +392,55 @@ export {
 	Theme,
 	type ThemeColor,
 } from "./modes/interactive/theme/theme.ts";
+export {
+	DEFAULT_STORE_CATALOG_URL,
+	findCatalogPackage,
+	getStoreCatalogCachePath,
+	type LoadDefaultStoreCatalogOptions,
+	type LoadStoreCatalogResult,
+	loadDefaultStoreCatalog,
+	parseStoreCatalogJson,
+	type StoreCatalog,
+	type StoreCatalogFetcher,
+	type StoreCatalogPackage,
+	type StoreCatalogValidationResult,
+	type StoreResourceType,
+	searchCatalogPackages,
+	suggestCatalogPackageIds,
+	validateStoreCatalog,
+} from "./store/catalog.ts";
+export {
+	type InspectStorePackageOptions,
+	inspectPackageDirectory,
+	inspectStorePackage,
+	type StorePackageInspection,
+	type StoreVoltManifest,
+} from "./store/inspector.ts";
+export {
+	type BuildStoreInstallPlanOptions,
+	buildStoreInstallPlan,
+	getCompatibilityStatus,
+	type StoreCompatibilityStatus,
+	type StoreInstallPlan,
+	type StoreInstallScope,
+	type StoreInstallScriptPolicy,
+} from "./store/install-plan.ts";
+export {
+	type ResolveStoreSourceOptions,
+	resolveStoreSource,
+	type StoreGitLsRemote,
+	type StoreResolvedSource,
+	type StoreResolvedSourceKind,
+} from "./store/resolver.ts";
+export {
+	chooseStoreRemoveTarget,
+	chooseStoreUpdateTarget,
+	getMatchingStorePackageScopes,
+	type StoreScopeTarget,
+	type StoreTargetConflict,
+	type StoreTargetPackageManager,
+	type StoreTargetSelection,
+} from "./store/targets.ts";
 // Clipboard utilities
 export { copyToClipboard } from "./utils/clipboard.ts";
 export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.ts";

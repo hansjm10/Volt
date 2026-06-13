@@ -75,7 +75,7 @@ import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/htt
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.ts";
-import { DefaultPackageManager } from "../../core/package-manager.ts";
+import { type ConfiguredPackage, DefaultPackageManager } from "../../core/package-manager.ts";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-names.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import {
@@ -96,6 +96,18 @@ import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasProjectConfigDir, hasProjectTrustInputs, ProjectTrustStore } from "../../core/trust-manager.ts";
+import {
+	findCatalogPackage,
+	loadDefaultStoreCatalog,
+	type StoreCatalog,
+	type StoreCatalogPackage,
+	searchCatalogPackages,
+} from "../../store/catalog.ts";
+import { inspectStorePackage } from "../../store/inspector.ts";
+import { buildStoreInstallPlan, type StoreInstallScope } from "../../store/install-plan.ts";
+import { renderCatalogSearch, renderStoreInstallPlan, renderStoreShow } from "../../store/render.ts";
+import { resolveStoreSource } from "../../store/resolver.ts";
+import { chooseStoreRemoveTarget, chooseStoreUpdateTarget, type StoreScopeTarget } from "../../store/targets.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
@@ -2630,6 +2642,17 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
+			if (text === "/store" || text.startsWith("/store ")) {
+				const args = text === "/store" ? "" : text.slice(7).trim();
+				this.editor.setText("");
+				await this.handleStoreInteractiveCommand(args);
+				return;
+			}
+			if (text === "/extensions") {
+				this.editor.setText("");
+				await this.handleExtensionsInteractiveCommand();
+				return;
+			}
 			if (text === "/login") {
 				this.showOAuthSelector("login");
 				this.editor.setText("");
@@ -4151,6 +4174,503 @@ export class InteractiveMode {
 			);
 			return { component: selector, focus: selector.getSettingsList() };
 		});
+	}
+
+	private getStorePackageManager(): DefaultPackageManager {
+		const packageManager = new DefaultPackageManager({
+			cwd: this.sessionManager.getCwd(),
+			agentDir: this.runtimeHost.services.agentDir,
+			settingsManager: this.settingsManager,
+		});
+		packageManager.setProgressCallback((event) => {
+			if (event.type === "start" && event.message) {
+				this.showStatus(event.message);
+			}
+		});
+		return packageManager;
+	}
+
+	private async loadStoreCatalog(required: boolean): Promise<StoreCatalog | undefined> {
+		try {
+			const result = await loadDefaultStoreCatalog({ agentDir: this.runtimeHost.services.agentDir });
+			for (const warning of result.warnings) {
+				this.showWarning(warning);
+			}
+			return result.catalog;
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (required) {
+				this.showError(message);
+				return undefined;
+			}
+			this.showWarning(`${message}; continuing without catalog metadata.`);
+			return { schemaVersion: 1, packages: [] };
+		}
+	}
+
+	private showStoreText(text: string): void {
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(text, 1, 0));
+		this.ui.requestRender();
+	}
+
+	private formatStorePackageOption(pkg: StoreCatalogPackage, index: number): string {
+		const verified = pkg.verified ? " verified" : "";
+		return `${index + 1}. ${pkg.id} - ${pkg.name}${verified}`;
+	}
+
+	private getStorePackageTitle(input: string, catalog: StoreCatalog): string {
+		const pkg = findCatalogPackage(catalog, input);
+		return pkg ? `${pkg.id} - ${pkg.name}` : input;
+	}
+
+	private async handleStoreInteractiveCommand(args: string): Promise<void> {
+		const parts = args.split(/\s+/).filter((part) => part.length > 0);
+		const command = parts[0];
+		const input = parts.slice(1).join(" ");
+
+		if (!command) {
+			await this.showStoreCatalogBrowser();
+			return;
+		}
+		if (command === "search") {
+			await this.showStoreCatalogBrowser(input);
+			return;
+		}
+		if (command === "show") {
+			if (!input) {
+				this.showWarning("Usage: /store show <id|source>");
+				return;
+			}
+			await this.showStorePackageDetails(input);
+			return;
+		}
+		if (command === "install") {
+			if (!input) {
+				this.showWarning("Usage: /store install <id|source>");
+				return;
+			}
+			await this.showStoreInstallFlow(input);
+			return;
+		}
+		if (command === "remove") {
+			if (!input) {
+				this.showWarning("Usage: /store remove <id|source>");
+				return;
+			}
+			await this.showStoreRemoveFlow(input);
+			return;
+		}
+		if (command === "update") {
+			await this.showStoreUpdateFlow(input || undefined);
+			return;
+		}
+
+		await this.showStoreCatalogBrowser(args);
+	}
+
+	private async showStoreCatalogBrowser(initialQuery?: string): Promise<void> {
+		const catalog = await this.loadStoreCatalog(true);
+		if (!catalog) {
+			return;
+		}
+
+		let query = initialQuery;
+		if (query === undefined) {
+			const value = await this.showExtensionInput("Store search", "Search packages");
+			if (value === undefined) {
+				this.showStatus("Store search cancelled");
+				return;
+			}
+			query = value.trim();
+		}
+
+		const matches = searchCatalogPackages(catalog, query).slice(0, 50);
+		if (matches.length === 0) {
+			this.showStoreText(renderCatalogSearch(matches, query));
+			return;
+		}
+
+		const labels = new Map<string, StoreCatalogPackage>();
+		const options = matches.map((pkg, index) => {
+			const label = this.formatStorePackageOption(pkg, index);
+			labels.set(label, pkg);
+			return label;
+		});
+		options.push("Search again", "Cancel");
+
+		const selection = await this.showExtensionSelector("Store packages", options);
+		if (!selection || selection === "Cancel") {
+			return;
+		}
+		if (selection === "Search again") {
+			await this.showStoreCatalogBrowser();
+			return;
+		}
+
+		const pkg = labels.get(selection);
+		if (pkg) {
+			await this.showStorePackageActions(pkg.id, catalog);
+		}
+	}
+
+	private async showStorePackageActions(input: string, catalog: StoreCatalog): Promise<void> {
+		const title = this.getStorePackageTitle(input, catalog);
+		const action = await this.showExtensionSelector(`Store: ${title}`, [
+			"Show details",
+			"Install for user",
+			"Install for project",
+			"Remove",
+			"Update",
+			"Back",
+		]);
+		if (!action || action === "Back") {
+			return;
+		}
+		if (action === "Show details") {
+			await this.showStorePackageDetails(input, catalog);
+			await this.showStorePackageActions(input, catalog);
+			return;
+		}
+		if (action === "Install for user") {
+			await this.showStoreInstallFlow(input, "user", catalog);
+			return;
+		}
+		if (action === "Install for project") {
+			await this.showStoreInstallFlow(input, "project", catalog);
+			return;
+		}
+		if (action === "Remove") {
+			await this.showStoreRemoveFlow(input, undefined, catalog);
+			return;
+		}
+		if (action === "Update") {
+			await this.showStoreUpdateFlow(input, catalog);
+		}
+	}
+
+	private async showStorePackageDetails(input: string, catalog?: StoreCatalog): Promise<void> {
+		const storeCatalog = catalog ?? (await this.loadStoreCatalog(false));
+		if (!storeCatalog) {
+			return;
+		}
+		try {
+			this.showStatus(`Inspecting ${input}...`);
+			const resolved = await resolveStoreSource({ input, catalog: storeCatalog, pinGit: false });
+			const inspection = await inspectStorePackage({ source: resolved.source, cwd: this.sessionManager.getCwd() });
+			this.showStoreText(renderStoreShow(resolved, inspection));
+		} catch (error: unknown) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private async showStoreInstallFlow(
+		input: string,
+		scope: StoreInstallScope = "user",
+		catalog?: StoreCatalog,
+	): Promise<void> {
+		if (scope === "project" && !this.settingsManager.isProjectTrusted()) {
+			this.showWarning("Project is not trusted. Use /trust, then restart volt before installing project packages.");
+			return;
+		}
+
+		const storeCatalog = catalog ?? (await this.loadStoreCatalog(false));
+		if (!storeCatalog) {
+			return;
+		}
+		try {
+			this.showStatus(`Preparing store install for ${input}...`);
+			const resolved = await resolveStoreSource({ input, catalog: storeCatalog, pinGit: true });
+			const inspection = await inspectStorePackage({ source: resolved.source, cwd: this.sessionManager.getCwd() });
+			const plan = buildStoreInstallPlan({
+				resolved,
+				inspection,
+				scope,
+				scriptPolicy: "never",
+			});
+			this.showStoreText(renderStoreInstallPlan(plan));
+
+			const confirmed = await this.showExtensionConfirm(
+				"Store install",
+				`Install ${plan.source} to ${scope} scope? Package lifecycle scripts will be disabled.`,
+			);
+			if (!confirmed) {
+				this.showStatus("Store install cancelled");
+				return;
+			}
+
+			const packageManager = this.getStorePackageManager();
+			await packageManager.installAndPersist(plan.source, {
+				local: scope === "project",
+				scripts: "never",
+			});
+			await this.settingsManager.flush();
+			if (this.reportStoreSettingsErrors(packageManager, plan.source, scope)) {
+				return;
+			}
+			await this.offerStoreReload(`Installed ${plan.source}`);
+		} catch (error: unknown) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private async showStoreRemoveFlow(input: string, local?: boolean, catalog?: StoreCatalog): Promise<void> {
+		const storeCatalog = catalog ?? (await this.loadStoreCatalog(false));
+		if (!storeCatalog) {
+			return;
+		}
+		try {
+			const resolved = await resolveStoreSource({ input, catalog: storeCatalog, pinGit: false });
+			const packageManager = this.getStorePackageManager();
+			const selection = chooseStoreRemoveTarget(packageManager, resolved.source, local ?? false);
+			if (selection.conflict === "both-scopes") {
+				this.showWarning("Package is installed in both user and project scopes. Use /extensions to pick one.");
+				return;
+			}
+			if (!selection.target) {
+				this.showWarning(`No matching package found for ${input}`);
+				return;
+			}
+			await this.removeInstalledStorePackage(packageManager, selection.target);
+		} catch (error: unknown) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private async showStoreUpdateFlow(input?: string, catalog?: StoreCatalog): Promise<void> {
+		const packageManager = this.getStorePackageManager();
+		if (!input) {
+			const confirmed = await this.showExtensionConfirm("Store update", "Update all installed packages?");
+			if (!confirmed) {
+				this.showStatus("Store update cancelled");
+				return;
+			}
+			try {
+				await packageManager.update();
+				this.showStatus("Updated packages. Run /reload to load resource changes.");
+			} catch (error: unknown) {
+				this.showError(error instanceof Error ? error.message : String(error));
+			}
+			return;
+		}
+
+		const storeCatalog = catalog ?? (await this.loadStoreCatalog(false));
+		if (!storeCatalog) {
+			return;
+		}
+		const catalogPackage = findCatalogPackage(storeCatalog, input);
+		if (!catalogPackage) {
+			const confirmed = await this.showExtensionConfirm("Store update", `Update ${input}?`);
+			if (!confirmed) {
+				this.showStatus("Store update cancelled");
+				return;
+			}
+			try {
+				await packageManager.update(input);
+				this.showStatus(`Updated ${input}. Run /reload to load resource changes.`);
+			} catch (error: unknown) {
+				this.showError(error instanceof Error ? error.message : String(error));
+			}
+			return;
+		}
+
+		try {
+			this.showStatus(`Preparing store update for ${input}...`);
+			const resolved = await resolveStoreSource({ input, catalog: storeCatalog, pinGit: true });
+			const selection = chooseStoreUpdateTarget(packageManager, resolved.source);
+			if (selection.conflict === "both-scopes") {
+				this.showWarning("Package is installed in both user and project scopes. Use /extensions to pick one.");
+				return;
+			}
+			if (!selection.target) {
+				this.showWarning(`No matching installed package found for catalog ID ${input}`);
+				return;
+			}
+			if (selection.target.source === resolved.source) {
+				const confirmed = await this.showExtensionConfirm("Store update", `Update ${selection.target.source}?`);
+				if (!confirmed) {
+					this.showStatus("Store update cancelled");
+					return;
+				}
+				await packageManager.update(selection.target.source);
+				this.showStatus(`Updated ${selection.target.source}. Run /reload to load resource changes.`);
+				return;
+			}
+
+			const inspection = await inspectStorePackage({ source: resolved.source, cwd: this.sessionManager.getCwd() });
+			const plan = buildStoreInstallPlan({
+				resolved,
+				inspection,
+				scope: selection.target.scope,
+				scriptPolicy: "never",
+			});
+			this.showStoreText(renderStoreInstallPlan(plan));
+			const confirmed = await this.showExtensionConfirm(
+				"Store update",
+				`Update ${selection.target.source} to ${plan.source}? Package lifecycle scripts will be disabled.`,
+			);
+			if (!confirmed) {
+				this.showStatus("Store update cancelled");
+				return;
+			}
+			await packageManager.installAndPersist(plan.source, {
+				local: selection.target.scope === "project",
+				scripts: "never",
+			});
+			await this.settingsManager.flush();
+			if (this.reportStoreSettingsErrors(packageManager, plan.source, selection.target.scope)) {
+				return;
+			}
+			await this.offerStoreReload(`Updated ${selection.target.source} to ${plan.source}`);
+		} catch (error: unknown) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private async handleExtensionsInteractiveCommand(): Promise<void> {
+		const packageManager = this.getStorePackageManager();
+		const packages = packageManager.listConfiguredPackages();
+		if (packages.length === 0) {
+			this.showStatus("No packages installed");
+			return;
+		}
+
+		const labels = new Map<string, ConfiguredPackage>();
+		const options = packages.map((pkg, index) => {
+			const filtered = pkg.filtered ? " filtered" : "";
+			const label = `${index + 1}. ${pkg.scope} - ${pkg.source}${filtered}`;
+			labels.set(label, pkg);
+			return label;
+		});
+		options.push("Update all", "Cancel");
+
+		const selection = await this.showExtensionSelector("Installed packages", options);
+		if (!selection || selection === "Cancel") {
+			return;
+		}
+		if (selection === "Update all") {
+			await this.showStoreUpdateFlow();
+			return;
+		}
+
+		const pkg = labels.get(selection);
+		if (pkg) {
+			await this.showInstalledStorePackageActions(packageManager, pkg);
+		}
+	}
+
+	private async showInstalledStorePackageActions(
+		packageManager: DefaultPackageManager,
+		pkg: ConfiguredPackage,
+	): Promise<void> {
+		const action = await this.showExtensionSelector(`${pkg.scope}: ${pkg.source}`, [
+			"Show details",
+			"Update",
+			"Remove",
+			"Back",
+		]);
+		if (!action || action === "Back") {
+			return;
+		}
+		if (action === "Show details") {
+			this.showStoreText(
+				[
+					"Installed package",
+					`Source: ${pkg.source}`,
+					`Scope: ${pkg.scope}`,
+					`Filtered: ${pkg.filtered ? "yes" : "no"}`,
+					`Installed path: ${pkg.installedPath ?? "not installed"}`,
+				].join("\n"),
+			);
+			await this.showInstalledStorePackageActions(packageManager, pkg);
+			return;
+		}
+		if (action === "Update") {
+			await this.updateInstalledStorePackage(packageManager, pkg);
+			return;
+		}
+		if (action === "Remove") {
+			await this.removeInstalledStorePackage(packageManager, { source: pkg.source, scope: pkg.scope });
+		}
+	}
+
+	private async updateInstalledStorePackage(
+		packageManager: DefaultPackageManager,
+		pkg: ConfiguredPackage,
+	): Promise<void> {
+		const confirmed = await this.showExtensionConfirm("Store update", `Update ${pkg.source}?`);
+		if (!confirmed) {
+			this.showStatus("Store update cancelled");
+			return;
+		}
+		try {
+			await packageManager.update(pkg.source);
+			this.showStatus(`Updated ${pkg.source}. Run /reload to load resource changes.`);
+		} catch (error: unknown) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private async removeInstalledStorePackage(
+		packageManager: DefaultPackageManager,
+		target: StoreScopeTarget,
+	): Promise<void> {
+		if (target.scope === "project" && !this.settingsManager.isProjectTrusted()) {
+			this.showWarning("Project is not trusted. Use /trust, then restart volt before removing project packages.");
+			return;
+		}
+		const confirmed = await this.showExtensionConfirm(
+			"Store remove",
+			`Remove ${target.source} from ${target.scope} scope?`,
+		);
+		if (!confirmed) {
+			this.showStatus("Store remove cancelled");
+			return;
+		}
+		try {
+			const removed = await packageManager.removeAndPersist(target.source, {
+				local: target.scope === "project",
+			});
+			await this.settingsManager.flush();
+			if (this.reportStoreSettingsErrors(packageManager, target.source, target.scope)) {
+				return;
+			}
+			if (!removed) {
+				this.showWarning(`No matching package found for ${target.source}`);
+				return;
+			}
+			await this.offerStoreReload(`Removed ${target.source}`);
+		} catch (error: unknown) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private reportStoreSettingsErrors(
+		packageManager: DefaultPackageManager,
+		source: string,
+		scope: StoreInstallScope,
+	): boolean {
+		const settingsErrors = this.settingsManager.drainErrors();
+		if (settingsErrors.length === 0) {
+			return false;
+		}
+		const installedPath = packageManager.getInstalledPath(source, scope);
+		for (const { scope: errorScope, error } of settingsErrors) {
+			this.showWarning(`${errorScope} settings: ${error.message}`);
+		}
+		if (installedPath) {
+			this.showWarning(`Package was installed at ${installedPath}, but settings persistence failed.`);
+		}
+		return true;
+	}
+
+	private async offerStoreReload(message: string): Promise<void> {
+		const action = await this.showExtensionSelector(message, ["Reload now", "Later"]);
+		if (action === "Reload now") {
+			await this.handleReloadCommand();
+			return;
+		}
+		this.showStatus(`${message}. Run /reload to load resource changes.`);
 	}
 
 	private async handleModelCommand(searchTerm?: string): Promise<void> {

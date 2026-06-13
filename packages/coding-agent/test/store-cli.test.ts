@@ -1,0 +1,191 @@
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR } from "../src/config.ts";
+import { main } from "../src/main.ts";
+
+describe("store CLI", () => {
+	let tempDir: string;
+	let agentDir: string;
+	let projectDir: string;
+	let packageDir: string;
+	let originalCwd: string;
+	let originalAgentDir: string | undefined;
+	let originalExitCode: typeof process.exitCode;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `volt-store-cli-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		agentDir = join(tempDir, "agent");
+		projectDir = join(tempDir, "project");
+		packageDir = join(tempDir, "package");
+		mkdirSync(join(packageDir, "extensions"), { recursive: true });
+		mkdirSync(projectDir, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(
+			join(packageDir, "package.json"),
+			JSON.stringify(
+				{
+					name: "volt-rtk",
+					version: "0.1.0",
+					description: "RTK extension",
+					volt: { extensions: ["extensions/rtk.ts"] },
+				},
+				null,
+				2,
+			),
+		);
+		writeFileSync(join(packageDir, "extensions", "rtk.ts"), "export default function rtk() {}\n");
+		originalCwd = process.cwd();
+		originalAgentDir = process.env[ENV_AGENT_DIR];
+		originalExitCode = process.exitCode;
+		process.exitCode = undefined;
+		process.env[ENV_AGENT_DIR] = agentDir;
+		process.chdir(projectDir);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				Response.json({
+					schemaVersion: 1,
+					packages: [
+						{
+							id: "rtk",
+							name: "RTK Output Compression",
+							description: "Token optimized shell output",
+							source: packageDir,
+							verified: true,
+							resources: ["extensions"],
+						},
+					],
+				}),
+			),
+		);
+	});
+
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		process.chdir(originalCwd);
+		process.exitCode = originalExitCode;
+		if (originalAgentDir === undefined) {
+			delete process.env[ENV_AGENT_DIR];
+		} else {
+			process.env[ENV_AGENT_DIR] = originalAgentDir;
+		}
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("searches the catalog without starting normal app mode", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(main(["store", "search", "RTK"])).resolves.toBeUndefined();
+
+			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
+			expect(stdout).toContain("rtk - RTK Output Compression");
+			expect(stdout).toContain("Token optimized shell output");
+			expect(errorSpy).not.toHaveBeenCalled();
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("installs a catalog package with --yes and records it in user settings", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(main(["store", "install", "rtk", "--yes"])).resolves.toBeUndefined();
+
+			const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")) as { packages?: string[] };
+			expect(settings.packages).toHaveLength(1);
+			expect(settings.packages?.[0]).toContain("package");
+			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
+			expect(stdout).toContain("Store install plan");
+			expect(stdout).toContain("Script policy: never");
+			expect(stdout).toContain("Installed");
+			expect(errorSpy).not.toHaveBeenCalled();
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("removes an installed catalog package by catalog ID", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await main(["store", "install", "rtk", "--yes"]);
+			await expect(main(["store", "remove", "rtk", "--yes"])).resolves.toBeUndefined();
+
+			const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")) as { packages?: string[] };
+			expect(settings.packages ?? []).toHaveLength(0);
+			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
+			expect(stdout).toContain("Removed");
+			expect(errorSpy).not.toHaveBeenCalled();
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("updates all installed packages with --yes", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(main(["store", "update", "--yes"])).resolves.toBeUndefined();
+
+			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
+			expect(stdout).toContain("Updated packages");
+			expect(errorSpy).not.toHaveBeenCalled();
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("updates an installed catalog package without duplicating the settings entry", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await main(["store", "install", "rtk", "--yes"]);
+			await expect(main(["store", "update", "rtk", "--yes"])).resolves.toBeUndefined();
+
+			const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")) as { packages?: string[] };
+			expect(settings.packages).toHaveLength(1);
+			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
+			expect(stdout).toContain("Updated");
+			expect(errorSpy).not.toHaveBeenCalled();
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("refuses non-interactive installs without --yes before writing settings", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(main(["store", "install", "rtk"])).resolves.toBeUndefined();
+
+			expect(errorSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain(
+				"Non-interactive install requires --yes.",
+			);
+			expect(process.exitCode).toBe(1);
+			expect(() => readFileSync(join(agentDir, "settings.json"), "utf-8")).toThrow();
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+});

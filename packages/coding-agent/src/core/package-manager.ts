@@ -89,10 +89,17 @@ export interface ConfiguredPackage {
 	installedPath?: string;
 }
 
+export type PackageInstallScriptPolicy = "never" | "allow";
+
+export interface PackageInstallOptions {
+	local?: boolean;
+	scripts?: PackageInstallScriptPolicy;
+}
+
 export interface PackageManager {
 	resolve(onMissing?: (source: string) => Promise<MissingSourceAction>): Promise<ResolvedPaths>;
-	install(source: string, options?: { local?: boolean }): Promise<void>;
-	installAndPersist(source: string, options?: { local?: boolean }): Promise<void>;
+	install(source: string, options?: PackageInstallOptions): Promise<void>;
+	installAndPersist(source: string, options?: PackageInstallOptions): Promise<void>;
 	remove(source: string, options?: { local?: boolean }): Promise<void>;
 	removeAndPersist(source: string, options?: { local?: boolean }): Promise<boolean>;
 	update(source?: string): Promise<void>;
@@ -105,6 +112,7 @@ export interface PackageManager {
 	removeSourceFromSettings(source: string, options?: { local?: boolean }): boolean;
 	setProgressCallback(callback: ProgressCallback | undefined): void;
 	getInstalledPath(source: string, scope: "user" | "project"): string | undefined;
+	getPackageIdentity(source: string, scope?: "user" | "project"): string;
 }
 
 interface PackageManagerOptions {
@@ -960,17 +968,18 @@ export class DefaultPackageManager implements PackageManager {
 		return configuredPackages;
 	}
 
-	async install(source: string, options?: { local?: boolean }): Promise<void> {
+	async install(source: string, options?: PackageInstallOptions): Promise<void> {
 		const parsed = this.parseSource(source);
 		const scope: SourceScope = options?.local ? "project" : "user";
+		const scripts = options?.scripts ?? "allow";
 		this.assertProjectTrustedForScope(scope);
 		await this.withProgress("install", source, `Installing ${source}...`, async () => {
 			if (parsed.type === "npm") {
-				await this.installNpm(parsed, scope, false);
+				await this.installNpm(parsed, scope, false, scripts);
 				return;
 			}
 			if (parsed.type === "git") {
-				await this.installGit(parsed, scope);
+				await this.installGit(parsed, scope, scripts);
 				return;
 			}
 			if (parsed.type === "local") {
@@ -984,7 +993,7 @@ export class DefaultPackageManager implements PackageManager {
 		});
 	}
 
-	async installAndPersist(source: string, options?: { local?: boolean }): Promise<void> {
+	async installAndPersist(source: string, options?: PackageInstallOptions): Promise<void> {
 		await this.install(source, options);
 		this.addSourceToSettings(source, options);
 	}
@@ -1138,7 +1147,7 @@ export class DefaultPackageManager implements PackageManager {
 	private async installNpmBatch(specs: string[], scope: InstalledSourceScope): Promise<void> {
 		const installRoot = this.getNpmInstallRoot(scope, false);
 		this.ensureNpmProject(installRoot);
-		await this.runNpmCommand(this.getNpmInstallArgs(specs, installRoot));
+		await this.runNpmCommand(this.getNpmInstallArgs(specs, installRoot, "allow"));
 	}
 
 	async checkForAvailableUpdates(): Promise<PackageUpdate[]> {
@@ -1298,13 +1307,17 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private async installParsedSource(parsed: ParsedSource, scope: SourceScope): Promise<void> {
+	private async installParsedSource(
+		parsed: ParsedSource,
+		scope: SourceScope,
+		scripts: PackageInstallScriptPolicy = "allow",
+	): Promise<void> {
 		if (parsed.type === "npm") {
-			await this.installNpm(parsed, scope, scope === "temporary");
+			await this.installNpm(parsed, scope, scope === "temporary", scripts);
 			return;
 		}
 		if (parsed.type === "git") {
-			await this.installGit(parsed, scope);
+			await this.installGit(parsed, scope, scripts);
 			return;
 		}
 	}
@@ -1622,7 +1635,7 @@ export class DefaultPackageManager implements PackageManager {
 	 * For git packages, uses normalized host/path to ensure SSH and HTTPS URLs
 	 * for the same repository are treated as identical.
 	 */
-	private getPackageIdentity(source: string, scope?: SourceScope): string {
+	getPackageIdentity(source: string, scope?: "user" | "project"): string {
 		const parsed = this.parseSource(source);
 		if (parsed.type === "npm") {
 			return `npm:${parsed.name}`;
@@ -1649,7 +1662,10 @@ export class DefaultPackageManager implements PackageManager {
 
 		for (const entry of packages) {
 			const sourceStr = typeof entry.pkg === "string" ? entry.pkg : entry.pkg.source;
-			const identity = this.getPackageIdentity(sourceStr, entry.scope);
+			const identity =
+				entry.scope === "temporary"
+					? this.getPackageIdentity(sourceStr)
+					: this.getPackageIdentity(sourceStr, entry.scope);
 
 			const existing = seen.get(identity);
 			if (!existing) {
@@ -1706,12 +1722,13 @@ export class DefaultPackageManager implements PackageManager {
 		await this.runCommand(npmCommand.command, [...npmCommand.args, ...args], options);
 	}
 
-	private getGitDependencyInstallArgs(): string[] {
+	private getGitDependencyInstallArgs(scripts: PackageInstallScriptPolicy): string[] {
 		const configuredCommand = this.settingsManager.getNpmCommand();
+		const scriptArgs = scripts === "never" ? ["--ignore-scripts"] : [];
 		if (configuredCommand && configuredCommand.length > 0) {
-			return ["install"];
+			return ["install", ...scriptArgs];
 		}
-		return ["install", "--omit=dev"];
+		return ["install", "--omit=dev", ...scriptArgs];
 	}
 
 	private runNpmCommandSync(args: string[]): string {
@@ -1719,14 +1736,15 @@ export class DefaultPackageManager implements PackageManager {
 		return this.runCommandSync(npmCommand.command, [...npmCommand.args, ...args]);
 	}
 
-	private getNpmInstallArgs(specs: string[], installRoot: string): string[] {
+	private getNpmInstallArgs(specs: string[], installRoot: string, scripts: PackageInstallScriptPolicy): string[] {
 		const packageManagerName = this.getPackageManagerName();
+		const scriptArgs = scripts === "never" ? ["--ignore-scripts"] : [];
 		// Extension packages run inside volt and resolve volt APIs through loader aliases/virtual modules.
 		// Disable peer dependency resolution for managed installs (npm's --legacy-peer-deps, and
 		// equivalent bun/pnpm settings) so package managers do not install or solve host-provided
 		// @earendil-works/volt-* peers. Stale auto-installed volt peers can otherwise block updates.
 		if (packageManagerName === "bun") {
-			return ["install", ...specs, "--cwd", installRoot, "--omit=peer"];
+			return ["install", ...specs, "--cwd", installRoot, "--omit=peer", ...scriptArgs];
 		}
 		if (packageManagerName === "pnpm") {
 			return [
@@ -1734,18 +1752,24 @@ export class DefaultPackageManager implements PackageManager {
 				...specs,
 				"--prefix",
 				installRoot,
+				...scriptArgs,
 				"--config.auto-install-peers=false",
 				"--config.strict-peer-dependencies=false",
 				"--config.strict-dep-builds=false",
 			];
 		}
-		return ["install", ...specs, "--prefix", installRoot, "--legacy-peer-deps"];
+		return ["install", ...specs, "--prefix", installRoot, "--legacy-peer-deps", ...scriptArgs];
 	}
 
-	private async installNpm(source: NpmSource, scope: SourceScope, temporary: boolean): Promise<void> {
+	private async installNpm(
+		source: NpmSource,
+		scope: SourceScope,
+		temporary: boolean,
+		scripts: PackageInstallScriptPolicy,
+	): Promise<void> {
 		const installRoot = this.getNpmInstallRoot(scope, temporary);
 		this.ensureNpmProject(installRoot);
-		await this.runNpmCommand(this.getNpmInstallArgs([source.spec], installRoot));
+		await this.runNpmCommand(this.getNpmInstallArgs([source.spec], installRoot, scripts));
 	}
 
 	private async uninstallNpm(source: NpmSource, scope: SourceScope): Promise<void> {
@@ -1760,15 +1784,15 @@ export class DefaultPackageManager implements PackageManager {
 		await this.runNpmCommand(["uninstall", source.name, "--prefix", installRoot]);
 	}
 
-	private async installGit(source: GitSource, scope: SourceScope): Promise<void> {
+	private async installGit(source: GitSource, scope: SourceScope, scripts: PackageInstallScriptPolicy): Promise<void> {
 		const targetDir = this.getGitInstallPath(source, scope);
 		if (existsSync(targetDir)) {
 			if (source.ref) {
-				await this.ensureGitRef(targetDir, ["fetch", "origin", source.ref], "FETCH_HEAD");
+				await this.ensureGitRef(targetDir, ["fetch", "origin", source.ref], "FETCH_HEAD", scripts);
 				return;
 			}
 			const target = await this.getLocalGitUpdateTarget(targetDir);
-			await this.ensureGitRef(targetDir, target.fetchArgs, target.ref);
+			await this.ensureGitRef(targetDir, target.fetchArgs, target.ref, scripts);
 			return;
 		}
 		const gitRoot = this.getGitInstallRoot(scope);
@@ -1783,27 +1807,32 @@ export class DefaultPackageManager implements PackageManager {
 		}
 		const packageJsonPath = join(targetDir, "package.json");
 		if (existsSync(packageJsonPath)) {
-			await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
+			await this.runNpmCommand(this.getGitDependencyInstallArgs(scripts), { cwd: targetDir });
 		}
 	}
 
 	private async updateGit(source: GitSource, scope: SourceScope): Promise<void> {
 		const targetDir = this.getGitInstallPath(source, scope);
 		if (!existsSync(targetDir)) {
-			await this.installGit(source, scope);
+			await this.installGit(source, scope, "allow");
 			return;
 		}
 
 		if (source.ref) {
-			await this.ensureGitRef(targetDir, ["fetch", "origin", source.ref], "FETCH_HEAD");
+			await this.ensureGitRef(targetDir, ["fetch", "origin", source.ref], "FETCH_HEAD", "allow");
 			return;
 		}
 
 		const target = await this.getLocalGitUpdateTarget(targetDir);
-		await this.ensureGitRef(targetDir, target.fetchArgs, target.ref);
+		await this.ensureGitRef(targetDir, target.fetchArgs, target.ref, "allow");
 	}
 
-	private async ensureGitRef(targetDir: string, fetchArgs: string[], ref: string): Promise<void> {
+	private async ensureGitRef(
+		targetDir: string,
+		fetchArgs: string[],
+		ref: string,
+		scripts: PackageInstallScriptPolicy,
+	): Promise<void> {
 		// Fetch only the ref we will reset to, avoiding unrelated branch/tag noise.
 		await this.runCommand("git", fetchArgs, { cwd: targetDir });
 
@@ -1827,7 +1856,7 @@ export class DefaultPackageManager implements PackageManager {
 
 		const packageJsonPath = join(targetDir, "package.json");
 		if (existsSync(packageJsonPath)) {
-			await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
+			await this.runNpmCommand(this.getGitDependencyInstallArgs(scripts), { cwd: targetDir });
 		}
 	}
 

@@ -61,7 +61,7 @@ interface PackageCommandOptions {
 	conflictingOptions?: string;
 }
 
-function reportSettingsErrors(settingsManager: SettingsManager, context: string): void {
+export function reportSettingsErrors(settingsManager: SettingsManager, context: string): void {
 	const errors = settingsManager.drainErrors();
 	for (const { scope, error } of errors) {
 		console.error(chalk.yellow(`Warning (${context}, ${scope} settings): ${error.message}`));
@@ -417,7 +417,7 @@ function prepareWindowsNpmSelfUpdate(): void {
 	quarantineWindowsNativeDependencies(packageDir);
 }
 
-function parseProjectTrustOverride(args: readonly string[]): boolean | undefined {
+export function parseProjectTrustOverride(args: readonly string[]): boolean | undefined {
 	let trustOverride: boolean | undefined;
 	for (const arg of args) {
 		if (arg === "--approve" || arg === "-a") {
@@ -433,22 +433,22 @@ export interface PackageCommandRuntimeOptions {
 	extensionFactories?: ExtensionFactory[];
 }
 
-interface CommandSettingsResult {
+export interface CommandSettingsResult {
 	settingsManager: SettingsManager;
 	projectTrustWarnings: string[];
 }
 
-function getCommandAppMode(): AppMode {
+export function getCommandAppMode(): AppMode {
 	return process.stdin.isTTY && process.stdout.isTTY ? "interactive" : "print";
 }
 
-function reportProjectTrustWarnings(warnings: readonly string[]): void {
+export function reportProjectTrustWarnings(warnings: readonly string[]): void {
 	for (const warning of warnings) {
 		console.error(chalk.yellow(`Warning: ${warning}`));
 	}
 }
 
-async function createCommandSettingsManager(options: {
+export async function createCommandSettingsManager(options: {
 	cwd: string;
 	agentDir: string;
 	projectTrustOverride?: boolean;
