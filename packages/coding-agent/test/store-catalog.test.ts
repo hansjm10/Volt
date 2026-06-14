@@ -127,6 +127,36 @@ describe("store catalog", () => {
 		expect(result.warnings[0]).toBe("Offline mode enabled; using cached store catalog.");
 	});
 
+	it("does not fall back to a cached catalog from a different URL", async () => {
+		await loadDefaultStoreCatalog({
+			agentDir: tempDir,
+			url: "https://example.test/catalog-a.json",
+			fetcher: vi.fn(async () =>
+				Response.json({
+					schemaVersion: 1,
+					packages: [
+						{
+							id: "from-a",
+							name: "From A",
+							description: "Catalog A package",
+							source: "npm:@scope/from-a@1.0.0",
+						},
+					],
+				}),
+			),
+		});
+
+		await expect(
+			loadDefaultStoreCatalog({
+				agentDir: tempDir,
+				url: "https://example.test/catalog-b.json",
+				fetcher: vi.fn(async () => {
+					throw new Error("network down");
+				}),
+			}),
+		).rejects.toThrow("Failed to load store catalog: network down");
+	});
+
 	it("falls back to the cached catalog when the remote fetch times out", async () => {
 		await loadDefaultStoreCatalog({
 			agentDir: tempDir,

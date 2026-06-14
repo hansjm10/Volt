@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -242,8 +243,9 @@ export function parseStoreCatalogJson(raw: string, label = "store catalog"): Sto
 	return validateStoreCatalog(parsed);
 }
 
-export function getStoreCatalogCachePath(agentDir: string): string {
-	return join(agentDir, "store", "catalogs", "default.json");
+export function getStoreCatalogCachePath(agentDir: string, url = getDefaultCatalogUrl()): string {
+	const cacheKey = createHash("sha256").update(url).digest("hex");
+	return join(agentDir, "store", "catalogs", `${cacheKey}.json`);
 }
 
 function isOfflineModeEnabled(): boolean {
@@ -256,8 +258,8 @@ function getDefaultCatalogUrl(url?: string): string {
 	return url ?? process.env.VOLT_STORE_CATALOG_URL ?? DEFAULT_STORE_CATALOG_URL;
 }
 
-function readCachedCatalog(agentDir: string): LoadStoreCatalogResult | undefined {
-	const cachePath = getStoreCatalogCachePath(agentDir);
+function readCachedCatalog(agentDir: string, url: string): LoadStoreCatalogResult | undefined {
+	const cachePath = getStoreCatalogCachePath(agentDir, url);
 	if (!existsSync(cachePath)) {
 		return undefined;
 	}
@@ -270,8 +272,8 @@ function readCachedCatalog(agentDir: string): LoadStoreCatalogResult | undefined
 	};
 }
 
-function writeCachedCatalog(agentDir: string, raw: string): void {
-	const cachePath = getStoreCatalogCachePath(agentDir);
+function writeCachedCatalog(agentDir: string, url: string, raw: string): void {
+	const cachePath = getStoreCatalogCachePath(agentDir, url);
 	mkdirSync(join(agentDir, "store", "catalogs"), { recursive: true, mode: 0o700 });
 	writeFileSync(cachePath, raw, "utf-8");
 }
@@ -309,10 +311,11 @@ async function withCatalogFetchTimeout<T>(
 export async function loadDefaultStoreCatalog(
 	options: LoadDefaultStoreCatalogOptions,
 ): Promise<LoadStoreCatalogResult> {
+	const url = getDefaultCatalogUrl(options.url);
 	const offline = options.offline ?? isOfflineModeEnabled();
 	if (offline) {
 		try {
-			const cached = readCachedCatalog(options.agentDir);
+			const cached = readCachedCatalog(options.agentDir, url);
 			if (cached) {
 				return {
 					...cached,
@@ -334,7 +337,6 @@ export async function loadDefaultStoreCatalog(
 		};
 	}
 
-	const url = getDefaultCatalogUrl(options.url);
 	const fetcher: StoreCatalogFetcher = options.fetcher ?? ((input, init) => globalThis.fetch(input, init));
 	const timeoutMs = Math.max(1, Math.trunc(options.timeoutMs ?? DEFAULT_STORE_CATALOG_FETCH_TIMEOUT_MS));
 	try {
@@ -351,7 +353,7 @@ export async function loadDefaultStoreCatalog(
 		});
 		const warnings = [...result.warnings];
 		try {
-			writeCachedCatalog(options.agentDir, raw);
+			writeCachedCatalog(options.agentDir, url, raw);
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : String(error);
 			warnings.push(`Failed to cache remote store catalog: ${message}`);
@@ -363,7 +365,7 @@ export async function loadDefaultStoreCatalog(
 		};
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
-		const cached = readCachedCatalog(options.agentDir);
+		const cached = readCachedCatalog(options.agentDir, url);
 		if (cached) {
 			return {
 				...cached,
