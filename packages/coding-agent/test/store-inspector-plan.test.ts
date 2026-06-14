@@ -64,6 +64,27 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "loaded");
 		expect(existsSync(sentinelPath)).toBe(false);
 	});
 
+	it("reports explicit manifest extension files that runtime loading accepts", async () => {
+		mkdirSync(join(packageDir, "dist"), { recursive: true });
+		writeFileSync(join(packageDir, "dist", "index.mjs"), "export default function extension() {}\n");
+		writeFileSync(
+			join(packageDir, "package.json"),
+			JSON.stringify(
+				{
+					name: "volt-example",
+					version: "1.2.3",
+					volt: { extensions: ["dist/index.mjs"] },
+				},
+				null,
+				2,
+			),
+		);
+
+		const inspection = await inspectStorePackage({ source: packageDir, cwd: tempDir });
+
+		expect(inspection.discoveredResources.extensions).toEqual(["dist/index.mjs"]);
+	});
+
 	it("applies manifest override patterns when discovering resources", async () => {
 		writeFileSync(join(packageDir, "extensions", "dev.ts"), "export default function dev() {}\n");
 		writeFileSync(

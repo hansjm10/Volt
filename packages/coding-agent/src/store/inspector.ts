@@ -301,7 +301,7 @@ function collectFilesFromPaths(paths: string[], resourceType: StoreResourceType)
 		}
 		if (stats.isDirectory()) {
 			files.push(...collectResourceFiles(path, resourceType));
-		} else if (stats.isFile() && FILE_PATTERNS[resourceType].test(basename(path))) {
+		} else if (stats.isFile()) {
 			files.push(path);
 		}
 	}
