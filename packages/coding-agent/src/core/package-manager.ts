@@ -28,7 +28,7 @@ import { globSync } from "glob";
 import ignore from "ignore";
 import { minimatch } from "minimatch";
 import { CONFIG_DIR_NAME } from "../config.ts";
-import { spawnProcess, spawnProcessSync } from "../utils/child-process.ts";
+import { spawnProcess, spawnProcessSync, waitForChildProcess } from "../utils/child-process.ts";
 import { type GitSource, parseGitUrl } from "../utils/git.ts";
 import { getNpmUpdateSpec, parseNpmSpec } from "../utils/npm-spec.ts";
 import { canonicalizePath, isLocalPath, markPathIgnoredByCloudSync, resolvePath } from "../utils/paths.ts";
@@ -1085,9 +1085,9 @@ export class DefaultPackageManager implements PackageManager {
 	async update(source?: string, options?: PackageUpdateOptions): Promise<void> {
 		const globalSettings = this.settingsManager.getGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
-		const identity = source ? this.getPackageIdentity(source) : undefined;
 		const scopeFilter: InstalledSourceScope | undefined =
 			options?.local === undefined ? undefined : options.local ? "project" : "user";
+		const identity = source ? this.getPackageIdentity(source, scopeFilter) : undefined;
 		let matched = false;
 		const updateSources: ConfiguredUpdateSource[] = [];
 
@@ -2686,7 +2686,23 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async runCommand(command: string, args: string[], options?: { cwd?: string }): Promise<void> {
-		await this.runCommandCapture(command, args, options);
+		const child = this.spawnCaptureCommand(command, args, options);
+		let stdout = "";
+		let stderr = "";
+
+		child.stdout?.on("data", (data) => {
+			stdout += data.toString();
+		});
+		child.stderr?.on("data", (data) => {
+			stderr += data.toString();
+		});
+
+		const code = await waitForChildProcess(child);
+		if (code === 0) {
+			return;
+		}
+		const exitStatus = code === null ? `signal ${child.signalCode ?? "unknown"}` : `code ${code}`;
+		throw new Error(`${command} ${args.join(" ")} failed with ${exitStatus}: ${stderr || stdout}`);
 	}
 
 	private runCommandSync(command: string, args: string[]): string {

@@ -50,6 +50,38 @@ describe("configured package actions", () => {
 		expect(settingsManager.getProjectSettings().packages).toEqual([]);
 	});
 
+	it("updates settings-relative project-local package inputs in the selected scope", async () => {
+		const packageDir = join(tempDir, "pkg");
+		mkdirSync(packageDir, { recursive: true });
+		settingsManager.setProjectPackages(["../pkg"]);
+
+		await expect(packageManager.update("../pkg", { local: true, scripts: "never" })).resolves.toBeUndefined();
+	});
+
+	it("does not wait for background descendants that inherit output pipes", async () => {
+		const scriptPath = join(tempDir, "hold-stdio.cjs");
+		writeFileSync(
+			scriptPath,
+			[
+				'const { spawn } = require("node:child_process");',
+				'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 750);"], {',
+				'\tstdio: ["ignore", "inherit", "inherit"],',
+				"});",
+				"child.unref();",
+			].join("\n"),
+		);
+		const runCommandPromise = (packageManager as unknown as PackageManagerInternals)
+			.runCommand(process.execPath, [scriptPath])
+			.then(() => "resolved" as const);
+
+		const result = await Promise.race([
+			runCommandPromise,
+			new Promise<"timeout">((resolveTimeout) => setTimeout(() => resolveTimeout("timeout"), 500)),
+		]);
+
+		expect(result).toBe("resolved");
+	});
+
 	it("does not reinstall installed npm packages for non-exact version specs", async () => {
 		const packageDir = join(agentDir, "npm", "node_modules", "@scope", "theme");
 		mkdirSync(packageDir, { recursive: true });
