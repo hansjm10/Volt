@@ -22,7 +22,7 @@
 			"id": "terminal-bench-harbor",
 			"name": "Terminal-Bench Harbor",
 			"description": "Runs Volt on Terminal-Bench through Harbor.",
-			"source": "git:https://github.com/hansjm10/Volt@5255967c41c49693f6fa8f76cf1108744ace8d6f",
+			"source": "git:https://github.com/hansjm10/Volt@e8286c56167600e35a94f673c892f31905438e73",
 			"repo": "https://github.com/hansjm10/Volt/tree/store/terminal-bench-harbor",
 			"author": "Volt",
 			"license": "MIT",
