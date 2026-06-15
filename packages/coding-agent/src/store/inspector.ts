@@ -62,6 +62,10 @@ interface PackageJsonData {
 	scripts: Record<string, string>;
 }
 
+interface InspectionDiscoveryOptions {
+	localDirectoryFallbackExtension?: boolean;
+}
+
 const RESOURCE_TYPES: StoreResourceType[] = ["extensions", "skills", "prompts", "themes"];
 const EMPTY_RESOURCES: Record<StoreResourceType, string[]> = {
 	extensions: [],
@@ -494,28 +498,49 @@ function collectManifestFiles(root: string, entries: string[], resourceType: Sto
 	return files.filter((file) => enabled.has(file));
 }
 
-function discoverResources(root: string, voltManifest?: StoreVoltManifest): Record<StoreResourceType, string[]> {
+function toRelativeResourcePath(root: string, path: string): string {
+	return toPosixPath(relative(root, path)) || ".";
+}
+
+function discoverResources(
+	root: string,
+	voltManifest?: StoreVoltManifest,
+	options: InspectionDiscoveryOptions = {},
+): Record<StoreResourceType, string[]> {
 	const discovered = structuredClone(EMPTY_RESOURCES);
 	if (voltManifest) {
 		for (const resourceType of RESOURCE_TYPES) {
 			const entries = voltManifest[resourceType];
 			discovered[resourceType] = entries
-				? collectManifestFiles(root, entries, resourceType).map((path) => toPosixPath(relative(root, path)))
+				? collectManifestFiles(root, entries, resourceType).map((path) => toRelativeResourcePath(root, path))
 				: [];
 		}
 		return discovered;
 	}
 
+	let hasAnyResourcePath = false;
 	for (const resourceType of RESOURCE_TYPES) {
 		const dir = join(root, resourceType);
+		if (existsSync(dir)) {
+			hasAnyResourcePath = true;
+		}
 		discovered[resourceType] = isDirectory(dir)
-			? collectResourceFiles(dir, resourceType).map((path) => toPosixPath(relative(root, path)))
+			? collectResourceFiles(dir, resourceType).map((path) => toRelativeResourcePath(root, path))
 			: [];
+	}
+	if (options.localDirectoryFallbackExtension && !hasAnyResourcePath && isDirectory(root)) {
+		discovered.extensions = [toRelativeResourcePath(root, root)];
 	}
 	return discovered;
 }
 
-function buildInspection(source: string, pkg: PackageJsonData, root: string | undefined, warnings: string[]) {
+function buildInspection(
+	source: string,
+	pkg: PackageJsonData,
+	root: string | undefined,
+	warnings: string[],
+	discoveryOptions?: InspectionDiscoveryOptions,
+) {
 	const inspection: StorePackageInspection = {
 		source,
 		...(pkg.name !== undefined ? { packageName: pkg.name } : {}),
@@ -524,7 +549,9 @@ function buildInspection(source: string, pkg: PackageJsonData, root: string | un
 		...(pkg.license !== undefined ? { packageLicense: pkg.license } : {}),
 		...(pkg.repository !== undefined ? { packageRepository: pkg.repository } : {}),
 		...(pkg.voltManifest !== undefined ? { voltManifest: pkg.voltManifest } : {}),
-		discoveredResources: root ? discoverResources(root, pkg.voltManifest) : structuredClone(EMPTY_RESOURCES),
+		discoveredResources: root
+			? discoverResources(root, pkg.voltManifest, discoveryOptions)
+			: structuredClone(EMPTY_RESOURCES),
 		dependencies: pkg.dependencies,
 		peerDependencies: pkg.peerDependencies,
 		optionalDependencies: pkg.optionalDependencies,
@@ -629,23 +656,30 @@ export function inspectPackageDirectory(
 	source: string,
 	root: string,
 	initialWarnings: string[] = [],
+	discoveryOptions?: InspectionDiscoveryOptions,
 ): StorePackageInspection {
 	const packageJsonPath = join(root, "package.json");
 	if (!existsSync(packageJsonPath)) {
-		return buildInspection(source, readPackageJsonData({}), root, [
-			`No package.json found at ${root}.`,
-			...initialWarnings,
-		]);
+		return buildInspection(
+			source,
+			readPackageJsonData({}),
+			root,
+			[`No package.json found at ${root}.`, ...initialWarnings],
+			discoveryOptions,
+		);
 	}
 	try {
 		const pkg = readPackageJsonFile(packageJsonPath);
-		return buildInspection(source, pkg, root, initialWarnings);
+		return buildInspection(source, pkg, root, initialWarnings, discoveryOptions);
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
-		return buildInspection(source, readPackageJsonData({}), root, [
-			`Failed to read package metadata: ${message}`,
-			...initialWarnings,
-		]);
+		return buildInspection(
+			source,
+			readPackageJsonData({}),
+			root,
+			[`Failed to read package metadata: ${message}`, ...initialWarnings],
+			discoveryOptions,
+		);
 	}
 }
 
@@ -659,7 +693,10 @@ export async function inspectStorePackage(options: InspectStorePackageOptions): 
 	}
 
 	const root = resolvePath(options.source, options.cwd, { trim: true });
-	return inspectPackageDirectory(options.source, root, [
-		"Local package paths are not reproducible and are inspected directly from disk.",
-	]);
+	return inspectPackageDirectory(
+		options.source,
+		root,
+		["Local package paths are not reproducible and are inspected directly from disk."],
+		{ localDirectoryFallbackExtension: true },
+	);
 }

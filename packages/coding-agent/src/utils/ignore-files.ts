@@ -10,6 +10,11 @@ export function createIgnoreMatcher(): IgnoreMatcher {
 	return ignore();
 }
 
+function hasDirectorySeparator(pattern: string): boolean {
+	const withoutTrailingSlash = pattern.endsWith("/") ? pattern.slice(0, -1) : pattern;
+	return withoutTrailingSlash.includes("/");
+}
+
 function prefixIgnorePattern(line: string, prefix: string): string | null {
 	const trimmed = line.trim();
 	if (!trimmed) return null;
@@ -17,20 +22,25 @@ function prefixIgnorePattern(line: string, prefix: string): string | null {
 
 	let pattern = line;
 	let negated = false;
+	let escapedNegation = false;
 
 	if (pattern.startsWith("!")) {
 		negated = true;
 		pattern = pattern.slice(1);
 	} else if (pattern.startsWith("\\!")) {
+		escapedNegation = true;
 		pattern = pattern.slice(1);
 	}
 
-	if (pattern.startsWith("/")) {
+	const anchored = pattern.startsWith("/");
+	if (anchored) {
 		pattern = pattern.slice(1);
 	}
 
-	const prefixed = prefix ? `${prefix}${pattern}` : pattern;
-	return negated ? `!${prefixed}` : prefixed;
+	const descendantPrefix = prefix && !anchored && !hasDirectorySeparator(pattern) ? "**/" : "";
+	const prefixed = prefix ? `${prefix}${descendantPrefix}${pattern}` : pattern;
+	const escaped = escapedNegation && !prefix ? `\\${prefixed}` : prefixed;
+	return negated ? `!${escaped}` : escaped;
 }
 
 export function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {

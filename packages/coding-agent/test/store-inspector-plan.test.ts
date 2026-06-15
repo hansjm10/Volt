@@ -65,11 +65,12 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "loaded");
 			settingsManager: SettingsManager.inMemory(),
 		});
 		const resolved = await packageManager.resolveExtensionSources([root]);
+		const toRelativeResourcePath = (path: string) => relative(root, path).replace(/\\/g, "/") || ".";
 		return {
-			extensions: resolved.extensions.map((resource) => relative(root, resource.path).replace(/\\/g, "/")).sort(),
-			skills: resolved.skills.map((resource) => relative(root, resource.path).replace(/\\/g, "/")).sort(),
-			prompts: resolved.prompts.map((resource) => relative(root, resource.path).replace(/\\/g, "/")).sort(),
-			themes: resolved.themes.map((resource) => relative(root, resource.path).replace(/\\/g, "/")).sort(),
+			extensions: resolved.extensions.map((resource) => toRelativeResourcePath(resource.path)).sort(),
+			skills: resolved.skills.map((resource) => toRelativeResourcePath(resource.path)).sort(),
+			prompts: resolved.prompts.map((resource) => toRelativeResourcePath(resource.path)).sort(),
+			themes: resolved.themes.map((resource) => toRelativeResourcePath(resource.path)).sort(),
 		};
 	}
 
@@ -319,6 +320,34 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "loaded");
 		const runtimeResources = await resolveRuntimeResources(packageWithoutManifestDir);
 
 		expect(inspection.warnings).toContain(`No package.json found at ${packageWithoutManifestDir}.`);
+		expect(inspection.discoveredResources).toEqual(runtimeResources);
+	});
+
+	it("reports local directory fallback extensions to match runtime loading", async () => {
+		const fallbackPackageDir = join(tempDir, "fallback-extension");
+		mkdirSync(fallbackPackageDir, { recursive: true });
+		writeFileSync(join(fallbackPackageDir, "package.json"), JSON.stringify({ name: "fallback-extension" }, null, 2));
+		writeFileSync(join(fallbackPackageDir, "index.ts"), "export default function extension() {}\n");
+
+		const inspection = await inspectStorePackage({ source: fallbackPackageDir, cwd: tempDir });
+		const runtimeResources = await resolveRuntimeResources(fallbackPackageDir);
+
+		expect(runtimeResources.extensions).toEqual(["."]);
+		expect(inspection.discoveredResources).toEqual(runtimeResources);
+	});
+
+	it("honors nested slashless ignore patterns for descendant package resources", async () => {
+		const ignoredPackageDir = join(tempDir, "nested-ignore-descendants");
+		mkdirSync(join(ignoredPackageDir, "prompts", "sub", "deep"), { recursive: true });
+		writeFileSync(join(ignoredPackageDir, "package.json"), JSON.stringify({ name: "nested-ignore" }, null, 2));
+		writeFileSync(join(ignoredPackageDir, "prompts", "sub", ".gitignore"), "secret.md\n");
+		writeFileSync(join(ignoredPackageDir, "prompts", "sub", "visible.md"), "Visible prompt\n");
+		writeFileSync(join(ignoredPackageDir, "prompts", "sub", "deep", "secret.md"), "Ignored prompt\n");
+
+		const inspection = await inspectStorePackage({ source: ignoredPackageDir, cwd: tempDir });
+		const runtimeResources = await resolveRuntimeResources(ignoredPackageDir);
+
+		expect(runtimeResources.prompts).toEqual(["prompts/sub/visible.md"]);
 		expect(inspection.discoveredResources).toEqual(runtimeResources);
 	});
 
