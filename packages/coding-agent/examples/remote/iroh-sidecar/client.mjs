@@ -1,4 +1,7 @@
 import { Buffer } from "node:buffer";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
 import iroh from "@number0/iroh";
 import {
 	ALPN,
@@ -15,6 +18,7 @@ import {
 } from "./common.mjs";
 
 const { Endpoint, EndpointTicket, RelayMode, presetMinimal, presetN0 } = iroh;
+const DEFAULT_STATE_PATH = resolve(homedir(), ".volt", "agent", "remote", "iroh-sidecar-client.json");
 
 function printUsage() {
 	console.error(`Usage: npm run client -- <ticket> [options]
@@ -23,12 +27,31 @@ Options:
   --message <text>       Send one prompt and print streamed text deltas.
   --get-state            Send get_state instead of prompt.
   --client-label <label> Client label sent during pairing. Defaults to this process.
+  --state <path>         Client state path. Defaults to ~/.volt/agent/remote/iroh-sidecar-client.json.
   --timeout-ms <ms>      Exit if no completion arrives before timeout. Defaults to 30000.
   --verbose              Print non-text RPC events.
 `);
 }
 
-async function bindEndpoint(relayMode) {
+async function readState(path) {
+	try {
+		return JSON.parse(await readFile(path, "utf8"));
+	} catch (error) {
+		if (error && error.code === "ENOENT") {
+			return { clientSecretKey: undefined };
+		}
+		throw error;
+	}
+}
+
+async function writeState(path, state) {
+	await mkdir(dirname(path), { recursive: true });
+	const tempPath = `${path}.${process.pid}.tmp`;
+	await writeFile(tempPath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+	await rename(tempPath, path);
+}
+
+async function bindEndpoint(relayMode, state, statePath) {
 	const builder = Endpoint.builder();
 	if (relayMode === "default") {
 		presetN0(builder);
@@ -36,7 +59,14 @@ async function bindEndpoint(relayMode) {
 		presetMinimal(builder);
 		builder.relayMode(RelayMode.disabled());
 	}
+	if (state.clientSecretKey) {
+		builder.secretKey(state.clientSecretKey);
+	}
 	const endpoint = await builder.bind();
+	if (!state.clientSecretKey) {
+		state.clientSecretKey = endpoint.secretKey().toBytes();
+		await writeState(statePath, state);
+	}
 	if (relayMode === "default") {
 		await endpoint.online();
 	}
@@ -113,7 +143,9 @@ async function main() {
 		throw new Error(`Unsupported ticket ALPN: ${payload.alpn}`);
 	}
 
-	const endpoint = await bindEndpoint(payload.relayMode ?? "disabled");
+	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
+	const clientState = await readState(statePath);
+	const endpoint = await bindEndpoint(payload.relayMode ?? "disabled", clientState, statePath);
 	const endpointTicket = EndpointTicket.fromString(payload.irohTicket);
 	const connection = await endpoint.connect(endpointTicket.endpointAddr(), ALPN);
 	const stream = await connection.openBi();
@@ -126,6 +158,7 @@ async function main() {
 				workspace: payload.workspace,
 				secret: payload.secret,
 				clientLabel: getFlag(flags, "client-label", `node-${process.pid}`),
+				clientNodeId: endpoint.id().toString(),
 			}),
 		),
 	);

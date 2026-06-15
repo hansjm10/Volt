@@ -2,7 +2,7 @@
 
 This example tunnels Volt RPC JSONL over an Iroh QUIC bidirectional stream.
 
-The PoC keeps Iroh outside Volt core. `host.mjs` accepts an Iroh connection, validates a one-time pairing secret, spawns a child RPC process, and bridges bytes between Iroh and the child process. The child is `fake-rpc.mjs` by default so the network bridge can be tested without provider credentials.
+The PoC keeps Iroh outside Volt core. `host.mjs` accepts an Iroh connection, validates pairing, spawns a child RPC process, and bridges bytes between Iroh and the child process. The child is `fake-rpc.mjs` by default so the network bridge can be tested without provider credentials.
 
 ## Install
 
@@ -35,6 +35,39 @@ Expected output:
 ```text
 fake RPC response over Iroh: hello from another device
 ```
+
+The first successful connection persists the host key, client key, workspace, and paired client allowlist in state files:
+
+```text
+~/.volt/agent/remote/iroh-sidecar-host.json
+~/.volt/agent/remote/iroh-sidecar-client.json
+```
+
+Use `--state <path>` on host or client for isolated test state.
+
+## Pairing and revocation
+
+The host prints a pairing ticket by default. A client that connects with that ticket is added to the host allowlist for the selected workspace.
+
+List paired clients:
+
+```bash
+npm run host -- clients
+```
+
+Revoke a client:
+
+```bash
+npm run host -- revoke <client-node-id>
+```
+
+After a client is paired, the host can run without accepting new clients:
+
+```bash
+npm run host -- --no-pairing --once
+```
+
+In `--no-pairing` mode, the printed ticket contains no pairing secret. Only clients already stored in the host allowlist can connect.
 
 ## Test with real Volt RPC
 
@@ -73,8 +106,9 @@ The ticket records the relay mode and the client uses the same preset.
 
 This PoC is intentionally small and is not product-ready remote access.
 
-- Pairing tickets contain a one-time secret but are not persisted or revoked.
-- Any connected client can control the spawned RPC child for the selected workspace.
+- Pairing tickets contain a one-time secret for adding a client to the allowlist.
+- Paired clients are persisted until revoked.
+- Any paired client can control the spawned RPC child for its allowed workspace.
 - Real Volt RPC can read files, edit files, and run tools allowed by `--allow-tools`.
 - Keep the default read-only tool list while testing remotely.
 - Do not expose sensitive workspaces or run with `bash,edit,write` unless the client is trusted.
