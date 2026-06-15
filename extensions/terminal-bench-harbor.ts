@@ -5,13 +5,14 @@
  * volt_tbench_harbor/agent.py.
  */
 
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExecResult, ExtensionAPI, ExtensionCommandContext } from "@earendil-works/volt-coding-agent";
 
 const DATASET = "terminal-bench/terminal-bench-2-1";
 const AGENT_IMPORT_PATH = "volt_tbench_harbor.agent:VoltAgent";
-const DEFAULT_MODEL = "openai/gpt-4o";
+const DEFAULT_MODEL = "openai-codex/gpt-5.5";
 
 type CheckStatus = "ok" | "missing" | "error";
 
@@ -36,6 +37,25 @@ function quotePosix(value: string): string {
 
 function getJobsDir(): string {
 	return path.resolve(process.cwd(), "jobs", "terminal-bench-volt");
+}
+
+function getProjectVoltDir(): string | undefined {
+	const projectVoltDir = path.resolve(process.cwd(), ".volt");
+	return fs.existsSync(projectVoltDir) && fs.statSync(projectVoltDir).isDirectory() ? projectVoltDir : undefined;
+}
+
+function getInheritedAgentKwargs(): string[] {
+	const args = [
+		"force_auth_json=true",
+		"inherit_agent_dir=true",
+		"tools=",
+		"exclude_tools=",
+	];
+	const projectVoltDir = getProjectVoltDir();
+	if (projectVoltDir) {
+		args.push(`project_volt_dir=${projectVoltDir}`);
+	}
+	return args;
 }
 
 function splitArgs(args: string): string[] {
@@ -67,6 +87,7 @@ function getHarborArgs(model: string, extraArgs: string[] = []): string[] {
 		model,
 		"--jobs-dir",
 		getJobsDir(),
+		...getInheritedAgentKwargs().flatMap((arg) => ["--agent-kwarg", arg]),
 		...extraArgs,
 	];
 }
@@ -74,17 +95,19 @@ function getHarborArgs(model: string, extraArgs: string[] = []): string[] {
 function renderCommand(model: string): string {
 	const packageRoot = getPackageRoot();
 	const jobsDir = getJobsDir();
+	const inheritedKwargs = getInheritedAgentKwargs();
 	const posix = [
 		`cd ${quotePosix(packageRoot)} && \\`,
 		"harbor run \\",
 		`  -d ${DATASET} \\`,
 		`  --agent-import-path ${AGENT_IMPORT_PATH} \\`,
 		`  -m ${quotePosix(model)} \\`,
-		"  --agent-env OPENAI_API_KEY=$OPENAI_API_KEY \\",
+		...inheritedKwargs.map((arg) => `  --agent-kwarg ${quotePosix(arg)} \\`),
 		"  --agent-kwarg source_ref=main \\",
 		`  --jobs-dir ${quotePosix(jobsDir)} \\`,
 		"  -l 1 \\",
-		"  -n 1",
+		"  -n 1 \\",
+		"  --yes",
 	].join("\n");
 	const powershell = [
 		`Push-Location ${quotePowerShell(packageRoot)}`,
@@ -92,11 +115,12 @@ function renderCommand(model: string): string {
 		`  -d ${DATASET} \``,
 		`  --agent-import-path ${AGENT_IMPORT_PATH} \``,
 		`  -m ${quotePowerShell(model)} \``,
-		'  --agent-env "OPENAI_API_KEY=$env:OPENAI_API_KEY" `',
+		...inheritedKwargs.map((arg) => `  --agent-kwarg ${quotePowerShell(arg)} \``),
 		"  --agent-kwarg source_ref=main `",
 		`  --jobs-dir ${quotePowerShell(jobsDir)} \``,
 		"  -l 1 `",
-		"  -n 1",
+		"  -n 1 `",
+		"  --yes",
 		"Pop-Location",
 	].join("\n");
 	return [`PowerShell:\n${powershell}`, `sh:\n${posix}`].join("\n\n");
