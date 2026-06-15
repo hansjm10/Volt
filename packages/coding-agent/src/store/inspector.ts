@@ -63,7 +63,7 @@ interface PackageJsonData {
 }
 
 interface InspectionDiscoveryOptions {
-	localDirectoryFallbackExtension?: boolean;
+	localFallbackExtension?: boolean;
 }
 
 const RESOURCE_TYPES: StoreResourceType[] = ["extensions", "skills", "prompts", "themes"];
@@ -528,8 +528,11 @@ function discoverResources(
 			? collectResourceFiles(dir, resourceType).map((path) => toRelativeResourcePath(root, path))
 			: [];
 	}
-	if (options.localDirectoryFallbackExtension && !hasAnyResourcePath && isDirectory(root)) {
-		discovered.extensions = [toRelativeResourcePath(root, root)];
+	if (options.localFallbackExtension && !hasAnyResourcePath) {
+		const stats = statIfExists(root);
+		if (stats?.isDirectory() || stats?.isFile()) {
+			discovered.extensions = [toRelativeResourcePath(root, root)];
+		}
 	}
 	return discovered;
 }
@@ -697,6 +700,6 @@ export async function inspectStorePackage(options: InspectStorePackageOptions): 
 		options.source,
 		root,
 		["Local package paths are not reproducible and are inspected directly from disk."],
-		{ localDirectoryFallbackExtension: true },
+		{ localFallbackExtension: true },
 	);
 }

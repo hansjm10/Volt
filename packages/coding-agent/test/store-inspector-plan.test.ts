@@ -336,6 +336,29 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "loaded");
 		expect(inspection.discoveredResources).toEqual(runtimeResources);
 	});
 
+	it("reports local file sources as extensions to match runtime loading and install plans", async () => {
+		const localFile = join(tempDir, "local-extension.ts");
+		writeFileSync(localFile, "export default function extension() {}\n");
+
+		const inspection = await inspectStorePackage({ source: localFile, cwd: tempDir });
+		const runtimeResources = await resolveRuntimeResources(localFile);
+
+		expect(runtimeResources.extensions).toEqual(["."]);
+		expect(inspection.discoveredResources).toEqual(runtimeResources);
+
+		const resolved: StoreResolvedSource = {
+			input: localFile,
+			source: localFile,
+			kind: "local",
+			pinned: false,
+			tracking: false,
+			warnings: [],
+		};
+		const plan = buildStoreInstallPlan({ resolved, inspection, scope: "user", scriptPolicy: "never" });
+
+		expect(renderStoreInstallPlan(plan)).toContain("extensions: .");
+	});
+
 	it("honors nested slashless ignore patterns for descendant package resources", async () => {
 		const ignoredPackageDir = join(tempDir, "nested-ignore-descendants");
 		mkdirSync(join(ignoredPackageDir, "prompts", "sub", "deep"), { recursive: true });
