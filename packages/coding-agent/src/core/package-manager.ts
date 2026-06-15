@@ -811,7 +811,8 @@ export class DefaultPackageManager implements PackageManager {
 		const currentSettings =
 			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
 		const currentPackages = currentSettings.packages ?? [];
-		const nextPackages = currentPackages.filter((existing) => !this.packageSourcesMatch(existing, source, scope));
+		const matches = new Set(this.getPackageSourceMatchesForAction(currentPackages, source, scope));
+		const nextPackages = currentPackages.filter((existing) => !matches.has(existing));
 		const changed = nextPackages.length !== currentPackages.length;
 		if (!changed) {
 			return false;
@@ -1026,9 +1027,12 @@ export class DefaultPackageManager implements PackageManager {
 		const updateSources: ConfiguredUpdateSource[] = [];
 
 		if (scopeFilter !== "project") {
-			for (const pkg of globalSettings.packages ?? []) {
+			const globalPackages = globalSettings.packages ?? [];
+			const packages = source
+				? this.getPackageSourceMatchesForAction(globalPackages, source, "user")
+				: globalPackages;
+			for (const pkg of packages) {
 				const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
-				if (source && !this.packageSourcesMatch(pkg, source, "user")) continue;
 				matched = true;
 				updateSources.push({
 					source: sourceStr,
@@ -1038,9 +1042,12 @@ export class DefaultPackageManager implements PackageManager {
 			}
 		}
 		if (scopeFilter !== "user") {
-			for (const pkg of projectSettings.packages ?? []) {
+			const projectPackages = projectSettings.packages ?? [];
+			const packages = source
+				? this.getPackageSourceMatchesForAction(projectPackages, source, "project")
+				: projectPackages;
+			for (const pkg of packages) {
 				const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
-				if (source && !this.packageSourcesMatch(pkg, source, "project")) continue;
 				matched = true;
 				updateSources.push({
 					source: sourceStr,
@@ -1445,6 +1452,59 @@ export class DefaultPackageManager implements PackageManager {
 		const left = this.getSourceMatchKeyForSettings(this.getPackageSourceString(existing), scope);
 		const right = this.getSourceMatchKeysForInput(inputSource, scope);
 		return right.includes(left);
+	}
+
+	private getPackageSourceMatchesForAction(
+		packages: PackageSource[],
+		inputSource: string,
+		scope: SourceScope,
+	): PackageSource[] {
+		const matches: Array<{ pkg: PackageSource; rank: number }> = [];
+		for (const pkg of packages) {
+			const rank = this.getPackageSourceMatchRank(pkg, inputSource, scope);
+			if (rank !== undefined) {
+				matches.push({ pkg, rank });
+			}
+		}
+		const bestRank = Math.min(...matches.map((match) => match.rank));
+		return matches.filter((match) => match.rank === bestRank).map((match) => match.pkg);
+	}
+
+	private getPackageSourceMatchRank(
+		existing: PackageSource,
+		inputSource: string,
+		scope: SourceScope,
+	): number | undefined {
+		const existingSource = this.getPackageSourceString(existing);
+		const existingParsed = this.parseSource(existingSource);
+		const inputParsed = this.parseSource(inputSource);
+
+		if (existingParsed.type === "local" && inputParsed.type === "local") {
+			if (this.packageSourceTextMatches(existingSource, inputSource)) {
+				return 0;
+			}
+
+			const existingKey = this.getSourceMatchKeyForSettings(existingSource, scope);
+			const cwdRelativeInputKey = `local:${this.resolvePath(inputParsed.path)}`;
+			if (existingKey === cwdRelativeInputKey) {
+				return 1;
+			}
+
+			const settingsRelativeInputKey = `local:${this.resolvePathFromBase(
+				inputParsed.path,
+				this.getBaseDirForScope(scope),
+			)}`;
+			return existingKey === settingsRelativeInputKey ? 2 : undefined;
+		}
+
+		if (!this.packageSourcesMatch(existing, inputSource, scope)) {
+			return undefined;
+		}
+		return this.packageSourceTextMatches(existingSource, inputSource) ? 0 : 1;
+	}
+
+	private packageSourceTextMatches(left: string, right: string): boolean {
+		return left.trim() === right.trim();
 	}
 
 	private normalizePackageSourceForSettings(source: string, scope: SourceScope): string {

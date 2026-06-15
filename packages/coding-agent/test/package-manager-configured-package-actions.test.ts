@@ -6,6 +6,12 @@ import { CONFIG_DIR_NAME } from "../src/config.ts";
 import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 
+interface ConfiguredUpdateSourceForTest {
+	source: string;
+	scope: "user" | "project";
+	scripts: "never" | "allow";
+}
+
 interface PackageManagerInternals {
 	runCommand(command: string, args: string[], options?: { cwd?: string }): Promise<void>;
 	runCommandCapture(
@@ -13,6 +19,7 @@ interface PackageManagerInternals {
 		args: string[],
 		options?: { cwd?: string; timeoutMs?: number; env?: Record<string, string> },
 	): Promise<string>;
+	updateConfiguredSources(sources: ConfiguredUpdateSourceForTest[]): Promise<void>;
 }
 
 describe("configured package actions", () => {
@@ -77,6 +84,25 @@ describe("configured package actions", () => {
 		settingsManager.setProjectPackages(["../pkg"]);
 
 		await expect(packageManager.update("./pkg", { local: true, scripts: "never" })).resolves.toBeUndefined();
+	});
+
+	it("removes only the exact project-local package when one input matches two local paths", () => {
+		settingsManager.setProjectPackages(["foo", "../foo"]);
+
+		expect(packageManager.removeSourceFromSettings("foo", { local: true })).toBe(true);
+
+		expect(settingsManager.getProjectSettings().packages).toEqual(["../foo"]);
+	});
+
+	it("updates only the exact project-local package when one input matches two local paths", async () => {
+		settingsManager.setProjectPackages(["foo", "../foo"]);
+		const updateConfiguredSourcesSpy = vi
+			.spyOn(packageManager as unknown as PackageManagerInternals, "updateConfiguredSources")
+			.mockResolvedValue(undefined);
+
+		await packageManager.update("foo", { local: true, scripts: "never" });
+
+		expect(updateConfiguredSourcesSpy).toHaveBeenCalledWith([{ source: "foo", scope: "project", scripts: "never" }]);
 	});
 
 	it("does not wait for background descendants that inherit output pipes", async () => {
