@@ -145,7 +145,7 @@ function readVoltManifest(value: unknown): StoreVoltManifest | undefined {
 	if (themes !== undefined) manifest.themes = themes;
 	if (image !== undefined) manifest.image = image;
 	if (video !== undefined) manifest.video = video;
-	return Object.keys(manifest).length > 0 ? manifest : undefined;
+	return manifest;
 }
 
 function readPackageJsonData(value: unknown): PackageJsonData {

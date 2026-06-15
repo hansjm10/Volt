@@ -71,6 +71,14 @@ describe("configured package actions", () => {
 		await expect(packageManager.update("../pkg", { local: true, scripts: "never" })).resolves.toBeUndefined();
 	});
 
+	it("updates cwd-relative project-local package inputs in the selected scope", async () => {
+		const packageDir = join(tempDir, "pkg");
+		mkdirSync(packageDir, { recursive: true });
+		settingsManager.setProjectPackages(["../pkg"]);
+
+		await expect(packageManager.update("./pkg", { local: true, scripts: "never" })).resolves.toBeUndefined();
+	});
+
 	it("does not wait for background descendants that inherit output pipes", async () => {
 		const scriptPath = join(tempDir, "hold-stdio.cjs");
 		writeFileSync(

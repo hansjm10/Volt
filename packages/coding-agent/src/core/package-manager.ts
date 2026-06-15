@@ -1040,14 +1040,13 @@ export class DefaultPackageManager implements PackageManager {
 		const projectSettings = this.settingsManager.getProjectSettings();
 		const scopeFilter: InstalledSourceScope | undefined =
 			options?.local === undefined ? undefined : options.local ? "project" : "user";
-		const identity = source ? this.getPackageIdentity(source, scopeFilter) : undefined;
 		let matched = false;
 		const updateSources: ConfiguredUpdateSource[] = [];
 
 		if (scopeFilter !== "project") {
 			for (const pkg of globalSettings.packages ?? []) {
 				const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
-				if (identity && this.getPackageIdentity(sourceStr, "user") !== identity) continue;
+				if (source && !this.packageSourcesMatch(pkg, source, "user")) continue;
 				matched = true;
 				updateSources.push({
 					source: sourceStr,
@@ -1059,7 +1058,7 @@ export class DefaultPackageManager implements PackageManager {
 		if (scopeFilter !== "user") {
 			for (const pkg of projectSettings.packages ?? []) {
 				const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
-				if (identity && this.getPackageIdentity(sourceStr, "project") !== identity) continue;
+				if (source && !this.packageSourcesMatch(pkg, source, "project")) continue;
 				matched = true;
 				updateSources.push({
 					source: sourceStr,

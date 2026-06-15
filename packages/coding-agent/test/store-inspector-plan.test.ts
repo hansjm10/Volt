@@ -223,6 +223,26 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "loaded");
 		expect(inspection.discoveredResources.skills).toEqual(["skills/helper/SKILL.md"]);
 	});
 
+	it("preserves empty volt manifests during inspection to match runtime loading", async () => {
+		const emptyManifestPackageDir = join(tempDir, "empty-manifest");
+		mkdirSync(join(emptyManifestPackageDir, "extensions"), { recursive: true });
+		mkdirSync(join(emptyManifestPackageDir, "skills", "helper"), { recursive: true });
+		writeFileSync(
+			join(emptyManifestPackageDir, "package.json"),
+			JSON.stringify({ name: "empty-manifest", volt: {} }, null, 2),
+		);
+		writeFileSync(join(emptyManifestPackageDir, "extensions", "ext.ts"), "export default function extension() {}\n");
+		writeFileSync(join(emptyManifestPackageDir, "skills", "helper", "SKILL.md"), "---\nname: helper\n---\n");
+
+		const inspection = await inspectStorePackage({ source: emptyManifestPackageDir, cwd: tempDir });
+		const runtimeResources = await resolveRuntimeResources(emptyManifestPackageDir);
+
+		expect(inspection.voltManifest).toEqual({});
+		expect(inspection.discoveredResources).toEqual(runtimeResources);
+		expect(inspection.discoveredResources.extensions).toEqual([]);
+		expect(inspection.discoveredResources.skills).toEqual([]);
+	});
+
 	it("discovers conventional resources without package.json to match runtime loading", async () => {
 		const packageWithoutManifestDir = join(tempDir, "no-package-json");
 		mkdirSync(join(packageWithoutManifestDir, "extensions"), { recursive: true });
