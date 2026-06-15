@@ -57,23 +57,23 @@ function quotePosix(value: string): string {
 	return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function getJobsDir(): string {
-	return path.resolve(process.cwd(), "jobs", "terminal-bench-volt");
+function getJobsDir(projectRoot: string): string {
+	return path.resolve(projectRoot, "jobs", "terminal-bench-volt");
 }
 
-function getProjectVoltDir(): string | undefined {
-	const projectVoltDir = path.resolve(process.cwd(), ".volt");
+function getProjectVoltDir(projectRoot: string): string | undefined {
+	const projectVoltDir = path.resolve(projectRoot, ".volt");
 	return fs.existsSync(projectVoltDir) && fs.statSync(projectVoltDir).isDirectory() ? projectVoltDir : undefined;
 }
 
-function getInheritedAgentKwargs(): string[] {
+function getInheritedAgentKwargs(projectRoot: string): string[] {
 	const args = [
 		"force_auth_json=true",
 		"inherit_agent_dir=true",
 		"tools=",
 		"exclude_tools=",
 	];
-	const projectVoltDir = getProjectVoltDir();
+	const projectVoltDir = getProjectVoltDir(projectRoot);
 	if (projectVoltDir) {
 		args.push(`project_volt_dir=${projectVoltDir}`);
 	}
@@ -239,7 +239,7 @@ function summarizeExec(result: ExecResult): string {
 	return output ? `${prefix}\n${truncateOutput(output)}` : prefix;
 }
 
-function getHarborArgs(model: string, extraArgs: string[] = []): string[] {
+function getHarborArgs(projectRoot: string, model: string, extraArgs: string[] = []): string[] {
 	return [
 		"run",
 		"-d",
@@ -249,17 +249,17 @@ function getHarborArgs(model: string, extraArgs: string[] = []): string[] {
 		"-m",
 		model,
 		"--jobs-dir",
-		getJobsDir(),
-		...getInheritedAgentKwargs().flatMap((arg) => ["--agent-kwarg", arg]),
+		getJobsDir(projectRoot),
+		...getInheritedAgentKwargs(projectRoot).flatMap((arg) => ["--agent-kwarg", arg]),
 		"--yes",
 		...extraArgs,
 	];
 }
 
-function renderCommand(model: string, taskLimit: string, concurrentTrials: string): string {
+function renderCommand(projectRoot: string, model: string, taskLimit: string, concurrentTrials: string): string {
 	const packageRoot = getPackageRoot();
-	const jobsDir = getJobsDir();
-	const inheritedKwargs = getInheritedAgentKwargs();
+	const jobsDir = getJobsDir(projectRoot);
+	const inheritedKwargs = getInheritedAgentKwargs(projectRoot);
 	const posix = [
 		`cd ${quotePosix(packageRoot)} && \\`,
 		"harbor run \\",
@@ -349,7 +349,7 @@ export default function terminalBenchHarbor(volt: ExtensionAPI) {
 			if (action === "command") {
 				const config = await getRunConfig(rest, ctx);
 				if (config === undefined) return;
-				ctx.ui.notify(renderCommand(config.model, config.taskLimit, config.concurrentTrials), "info");
+				ctx.ui.notify(renderCommand(ctx.cwd, config.model, config.taskLimit, config.concurrentTrials), "info");
 				return;
 			}
 
@@ -359,7 +359,26 @@ export default function terminalBenchHarbor(volt: ExtensionAPI) {
 			}
 
 			if (action === "oracle") {
-				await runTbenchCommand(volt, ctx, ["run", "-d", DATASET, "-a", "oracle", "--jobs-dir", getJobsDir(), "-l", "1", "-n", "1", "--yes", ...rest], 3_600_000);
+				await runTbenchCommand(
+					volt,
+					ctx,
+					[
+						"run",
+						"-d",
+						DATASET,
+						"-a",
+						"oracle",
+						"--jobs-dir",
+						getJobsDir(ctx.cwd),
+						"-l",
+						"1",
+						"-n",
+						"1",
+						"--yes",
+						...rest,
+					],
+					3_600_000,
+				);
 				return;
 			}
 
@@ -369,7 +388,7 @@ export default function terminalBenchHarbor(volt: ExtensionAPI) {
 				await runTbenchCommand(
 					volt,
 					ctx,
-					getHarborArgs(config.model, [
+					getHarborArgs(ctx.cwd, config.model, [
 						"-l",
 						config.taskLimit,
 						"-n",

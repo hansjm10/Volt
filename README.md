@@ -65,6 +65,8 @@ Then use `/tbench` inside Volt:
 /tbench command openai-codex/gpt-5.5 -l 10 -n 2
 ```
 
+The TUI helper writes jobs under the current Volt workspace and passes that workspace's `.volt` directory when it exists.
+
 You can also run Harbor directly from this package root:
 
 ```bash
