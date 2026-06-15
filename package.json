@@ -1,6 +1,6 @@
 {
 	"name": "volt-terminal-bench-harbor",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "Run Volt on Terminal-Bench through Harbor.",
 	"type": "module",
 	"keywords": [

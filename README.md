@@ -53,9 +53,16 @@ Then use `/tbench` inside Volt:
 
 ```text
 /tbench doctor
-/tbench command openai-codex/gpt-5.5
+/tbench command
 /tbench oracle
-/tbench smoke openai-codex/gpt-5.5
+/tbench smoke
+```
+
+`/tbench command` and `/tbench smoke` prompt for a model from Volt's available model list, the Harbor task limit (`-l` / `--n-tasks`), and concurrent trials (`-n` / `--n-concurrent`). To skip prompts for scripting or repeat runs, pass the values explicitly:
+
+```text
+/tbench smoke openai-codex/gpt-5.5 -l 10 -n 2
+/tbench command openai-codex/gpt-5.5 -l 10 -n 2
 ```
 
 You can also run Harbor directly from this package root:

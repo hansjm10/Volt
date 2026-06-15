@@ -13,14 +13,36 @@ import type { ExecResult, ExtensionAPI, ExtensionCommandContext } from "@earendi
 const DATASET = "terminal-bench/terminal-bench-2-1";
 const AGENT_IMPORT_PATH = "volt_tbench_harbor.agent:VoltAgent";
 const DEFAULT_MODEL = "openai-codex/gpt-5.5";
+const DEFAULT_TASK_LIMIT = "1";
+const DEFAULT_CONCURRENT_TRIALS = "1";
 
 type CheckStatus = "ok" | "missing" | "error";
+type RunOptionName = "taskLimit" | "concurrentTrials";
 
 interface CheckResult {
 	name: string;
 	command: string;
 	status: CheckStatus;
 	detail: string;
+}
+
+interface ModelIdentity {
+	provider: string;
+	id: string;
+}
+
+interface ParsedRunArgs {
+	model: string | undefined;
+	taskLimit: string | undefined;
+	concurrentTrials: string | undefined;
+	extraArgs: string[];
+}
+
+interface RunConfig {
+	model: string;
+	taskLimit: string;
+	concurrentTrials: string;
+	extraArgs: string[];
 }
 
 function getPackageRoot(): string {
@@ -65,6 +87,147 @@ function splitArgs(args: string): string[] {
 		.filter((part) => part.length > 0);
 }
 
+function formatModelName(model: ModelIdentity): string {
+	return `${model.provider}/${model.id}`;
+}
+
+function unique(values: string[]): string[] {
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const value of values) {
+		if (seen.has(value)) continue;
+		seen.add(value);
+		result.push(value);
+	}
+	return result;
+}
+
+function getDefaultModel(ctx: ExtensionCommandContext): string {
+	return ctx.model ? formatModelName(ctx.model) : DEFAULT_MODEL;
+}
+
+function getModelOptions(ctx: ExtensionCommandContext): string[] {
+	const availableModels = ctx.modelRegistry
+		.getAvailable()
+		.map(formatModelName)
+		.sort((left, right) => left.localeCompare(right));
+	if (availableModels.length === 0) {
+		return unique([getDefaultModel(ctx), DEFAULT_MODEL]);
+	}
+	const preferredModels = unique([getDefaultModel(ctx), DEFAULT_MODEL]).filter((model) =>
+		availableModels.includes(model),
+	);
+	return unique([...preferredModels, ...availableModels]);
+}
+
+function getRunOptionName(arg: string): RunOptionName | undefined {
+	if (arg === "-l" || arg === "--n-tasks") return "taskLimit";
+	if (arg === "-n" || arg === "--n-concurrent") return "concurrentTrials";
+	return undefined;
+}
+
+function getAssignedRunOption(arg: string): { name: RunOptionName; value: string } | undefined {
+	for (const [prefix, name] of [
+		["-l=", "taskLimit"],
+		["--n-tasks=", "taskLimit"],
+		["-n=", "concurrentTrials"],
+		["--n-concurrent=", "concurrentTrials"],
+	] as const) {
+		if (arg.startsWith(prefix)) {
+			return { name, value: arg.slice(prefix.length) };
+		}
+	}
+	return undefined;
+}
+
+function parseRunArgs(args: string[]): ParsedRunArgs {
+	const [firstArg, ...restArgs] = args;
+	const model = firstArg && !firstArg.startsWith("-") ? firstArg : undefined;
+	const harborArgs = model ? restArgs : args;
+	const parsed: ParsedRunArgs = {
+		model,
+		taskLimit: undefined,
+		concurrentTrials: undefined,
+		extraArgs: [],
+	};
+
+	for (let index = 0; index < harborArgs.length; index++) {
+		const arg = harborArgs[index];
+		const assigned = getAssignedRunOption(arg);
+		if (assigned) {
+			parsed[assigned.name] = assigned.value;
+			continue;
+		}
+
+		const optionName = getRunOptionName(arg);
+		if (optionName) {
+			const value = harborArgs[index + 1];
+			if (value && !value.startsWith("-")) {
+				parsed[optionName] = value;
+				index++;
+			} else {
+				parsed.extraArgs.push(arg);
+			}
+			continue;
+		}
+
+		parsed.extraArgs.push(arg);
+	}
+
+	return parsed;
+}
+
+function validatePositiveInteger(value: string, label: string, ctx: ExtensionCommandContext): string | undefined {
+	const normalized = value.trim();
+	if (/^[1-9]\d*$/.test(normalized)) return normalized;
+	ctx.ui.notify(`${label} must be a positive integer.`, "warning");
+	return undefined;
+}
+
+async function promptPositiveInteger(
+	ctx: ExtensionCommandContext,
+	title: string,
+	defaultValue: string,
+	label: string,
+): Promise<string | undefined> {
+	const value = await ctx.ui.input(title, defaultValue);
+	if (value === undefined) return undefined;
+	return validatePositiveInteger(value.trim() || defaultValue, label, ctx);
+}
+
+async function promptRunConfig(ctx: ExtensionCommandContext): Promise<RunConfig | undefined> {
+	const model = await ctx.ui.select("Terminal-Bench model", getModelOptions(ctx));
+	if (model === undefined) return undefined;
+	const taskLimit = await promptPositiveInteger(ctx, "Terminal-Bench task limit (-l)", DEFAULT_TASK_LIMIT, "-l");
+	if (taskLimit === undefined) return undefined;
+	const concurrentTrials = await promptPositiveInteger(
+		ctx,
+		"Terminal-Bench concurrent trials (-n)",
+		DEFAULT_CONCURRENT_TRIALS,
+		"-n",
+	);
+	if (concurrentTrials === undefined) return undefined;
+	return { model, taskLimit, concurrentTrials, extraArgs: [] };
+}
+
+async function getRunConfig(args: string[], ctx: ExtensionCommandContext): Promise<RunConfig | undefined> {
+	if (args.length === 0 && ctx.hasUI) {
+		return promptRunConfig(ctx);
+	}
+
+	const parsed = parseRunArgs(args);
+	const model = (parsed.model ?? getDefaultModel(ctx)).trim();
+	if (!model) {
+		ctx.ui.notify("Model is required.", "warning");
+		return undefined;
+	}
+	const taskLimit = validatePositiveInteger(parsed.taskLimit ?? DEFAULT_TASK_LIMIT, "-l", ctx);
+	if (taskLimit === undefined) return undefined;
+	const concurrentTrials = validatePositiveInteger(parsed.concurrentTrials ?? DEFAULT_CONCURRENT_TRIALS, "-n", ctx);
+	if (concurrentTrials === undefined) return undefined;
+	return { model, taskLimit, concurrentTrials, extraArgs: parsed.extraArgs };
+}
+
 function truncateOutput(text: string, limit = 2400): string {
 	if (text.length <= limit) return text;
 	return `${text.slice(0, limit)}\n... truncated ...`;
@@ -93,7 +256,7 @@ function getHarborArgs(model: string, extraArgs: string[] = []): string[] {
 	];
 }
 
-function renderCommand(model: string): string {
+function renderCommand(model: string, taskLimit: string, concurrentTrials: string): string {
 	const packageRoot = getPackageRoot();
 	const jobsDir = getJobsDir();
 	const inheritedKwargs = getInheritedAgentKwargs();
@@ -106,8 +269,8 @@ function renderCommand(model: string): string {
 		...inheritedKwargs.map((arg) => `  --agent-kwarg ${quotePosix(arg)} \\`),
 		"  --agent-kwarg source_ref=main \\",
 		`  --jobs-dir ${quotePosix(jobsDir)} \\`,
-		"  -l 1 \\",
-		"  -n 1 \\",
+		`  -l ${quotePosix(taskLimit)} \\`,
+		`  -n ${quotePosix(concurrentTrials)} \\`,
 		"  --yes",
 	].join("\n");
 	const powershell = [
@@ -119,8 +282,8 @@ function renderCommand(model: string): string {
 		...inheritedKwargs.map((arg) => `  --agent-kwarg ${quotePowerShell(arg)} \``),
 		"  --agent-kwarg source_ref=main `",
 		`  --jobs-dir ${quotePowerShell(jobsDir)} \``,
-		"  -l 1 `",
-		"  -n 1 `",
+		`  -l ${quotePowerShell(taskLimit)} \``,
+		`  -n ${quotePowerShell(concurrentTrials)} \``,
 		"  --yes",
 		"Pop-Location",
 	].join("\n");
@@ -171,7 +334,7 @@ export default function terminalBenchHarbor(volt: ExtensionAPI) {
 	volt.registerCommand("tbench", {
 		description: "Terminal-Bench Harbor helpers for Volt",
 		handler: async (rawArgs, ctx) => {
-			const [action = "command", model = DEFAULT_MODEL, ...rest] = splitArgs(rawArgs);
+			const [action = "command", ...rest] = splitArgs(rawArgs);
 			if (action === "doctor") {
 				const checks = await Promise.all([
 					checkCommand(volt, "harbor", "harbor", ["--version"]),
@@ -184,7 +347,9 @@ export default function terminalBenchHarbor(volt: ExtensionAPI) {
 			}
 
 			if (action === "command") {
-				ctx.ui.notify(renderCommand(model), "info");
+				const config = await getRunConfig(rest, ctx);
+				if (config === undefined) return;
+				ctx.ui.notify(renderCommand(config.model, config.taskLimit, config.concurrentTrials), "info");
 				return;
 			}
 
@@ -199,11 +364,27 @@ export default function terminalBenchHarbor(volt: ExtensionAPI) {
 			}
 
 			if (action === "smoke") {
-				await runTbenchCommand(volt, ctx, getHarborArgs(model, ["-l", "1", "-n", "1", ...rest]), 3_600_000);
+				const config = await getRunConfig(rest, ctx);
+				if (config === undefined) return;
+				await runTbenchCommand(
+					volt,
+					ctx,
+					getHarborArgs(config.model, [
+						"-l",
+						config.taskLimit,
+						"-n",
+						config.concurrentTrials,
+						...config.extraArgs,
+					]),
+					3_600_000,
+				);
 				return;
 			}
 
-			ctx.ui.notify("Usage: /tbench doctor | command [model] | adapter | oracle [harbor args] | smoke [model] [harbor args]", "warning");
+			ctx.ui.notify(
+				"Usage: /tbench doctor | command [model] [-l tasks] [-n concurrent] | adapter | oracle [harbor args] | smoke [model] [-l tasks] [-n concurrent] [harbor args]",
+				"warning",
+			);
 		},
 	});
 }
