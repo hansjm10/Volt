@@ -35,6 +35,24 @@
 			"resources": [
 				"extensions"
 			]
+		},
+		{
+			"id": "azure-devops",
+			"name": "Azure DevOps",
+			"description": "Azure DevOps integration tools for Volt.",
+			"source": "git:https://github.com/hansjm10/Volt@7c6526b3866e4075fbe082b19a1c89ca5e6d2c87",
+			"repo": "https://github.com/hansjm10/Volt/tree/store/azure-devops",
+			"author": "Volt",
+			"license": "MIT",
+			"verified": true,
+			"categories": [
+				"azure-devops",
+				"developer-tools",
+				"integrations"
+			],
+			"resources": [
+				"extensions"
+			]
 		}
 	]
 }
