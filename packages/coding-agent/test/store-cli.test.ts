@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CONFIG_DIR_NAME, ENV_AGENT_DIR } from "../src/config.ts";
 import { DefaultPackageManager } from "../src/core/package-manager.ts";
@@ -182,7 +182,9 @@ describe("store CLI", () => {
 			const installedSettings = JSON.parse(readFileSync(settingsPath, "utf-8")) as {
 				packages?: Array<string | { source: string; scripts?: string }>;
 			};
-			expect(installedSettings.packages).toEqual([{ source: "../pkg", scripts: "never" }]);
+			expect(installedSettings.packages).toEqual([
+				{ source: relative(join(projectDir, CONFIG_DIR_NAME), projectPackageDir), scripts: "never" },
+			]);
 
 			await expect(
 				main(["store", "remove", "project-local-rtk", "--local", "--approve", "--yes"]),
@@ -227,7 +229,9 @@ describe("store CLI", () => {
 			const installedSettings = JSON.parse(readFileSync(settingsPath, "utf-8")) as {
 				packages?: Array<string | { source: string; scripts?: string }>;
 			};
-			expect(installedSettings.packages).toEqual([{ source: "../pkg", scripts: "never" }]);
+			expect(installedSettings.packages).toEqual([
+				{ source: relative(join(projectDir, CONFIG_DIR_NAME), projectPackageDir), scripts: "never" },
+			]);
 
 			await expect(main(["store", "remove", "../pkg", "--local", "--approve", "--yes"])).resolves.toBeUndefined();
 

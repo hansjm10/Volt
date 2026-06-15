@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -8,6 +8,7 @@ import { inspectStorePackage } from "../src/store/inspector.ts";
 import { buildStoreInstallPlan } from "../src/store/install-plan.ts";
 import { renderStoreInstallPlan } from "../src/store/render.ts";
 import type { StoreResolvedSource } from "../src/store/resolver.ts";
+import { createDirectorySymlinkSync, tryCreateFileSymlinkSync } from "./symlink-utils.ts";
 
 describe("store inspector and install plan", () => {
 	let tempDir: string;
@@ -231,17 +232,19 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "loaded");
 		writeFileSync(join(symlinkPackageDir, "package.json"), JSON.stringify({ name: "symlinked-resources" }, null, 2));
 		writeFileSync(join(targetDir, "real.ts"), "export default function real() {}\n");
 		writeFileSync(join(targetDir, "extension-dir", "index.ts"), "export default function indexed() {}\n");
-		symlinkSync(join(targetDir, "real.ts"), join(symlinkPackageDir, "extensions", "link.ts"));
-		symlinkSync(join(targetDir, "extension-dir"), join(symlinkPackageDir, "extensions", "linked-dir"), "dir");
+		const hasFileSymlink = tryCreateFileSymlinkSync(
+			join(targetDir, "real.ts"),
+			join(symlinkPackageDir, "extensions", "link.ts"),
+		);
+		createDirectorySymlinkSync(join(targetDir, "extension-dir"), join(symlinkPackageDir, "extensions", "linked-dir"));
 
 		const inspection = await inspectStorePackage({ source: symlinkPackageDir, cwd: tempDir });
 		const runtimeResources = await resolveRuntimeResources(symlinkPackageDir);
+		const expectedExtensions = ["extensions/linked-dir/index.ts"];
+		if (hasFileSymlink) expectedExtensions.unshift("extensions/link.ts");
 
 		expect(inspection.discoveredResources.extensions.sort()).toEqual(runtimeResources.extensions);
-		expect(inspection.discoveredResources.extensions.sort()).toEqual([
-			"extensions/link.ts",
-			"extensions/linked-dir/index.ts",
-		]);
+		expect(inspection.discoveredResources.extensions.sort()).toEqual(expectedExtensions);
 	});
 
 	it("discovers conventional resources after package metadata parse failures to match runtime loading", async () => {
