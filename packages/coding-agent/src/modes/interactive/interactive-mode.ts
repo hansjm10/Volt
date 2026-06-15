@@ -80,6 +80,7 @@ import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-nam
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import {
 	formatReviewForNewSession,
+	listLocalBranches,
 	listRecentCommits,
 	type ParsedReview,
 	parseReviewCommandArgs,
@@ -6363,28 +6364,28 @@ export class InteractiveMode {
 	}
 
 	private async promptForReviewTarget(): Promise<ReviewTarget | undefined> {
+		const branchLabel = "Against base branch";
 		const uncommittedLabel = "Uncommitted changes";
-		const branchLabel = "Branch changes (vs base)";
 		const prLabel = "GitHub pull request";
 		const commitLabel = "Specific commit";
 		const choice = await this.showExtensionSelector("Review what?", [
-			uncommittedLabel,
 			branchLabel,
+			uncommittedLabel,
 			prLabel,
 			commitLabel,
 		]);
 		if (choice === undefined) {
 			return undefined;
 		}
-		if (choice === uncommittedLabel) {
-			return { kind: "uncommitted" };
-		}
 		if (choice === branchLabel) {
-			const base = await this.showExtensionInput("Base branch (empty to auto-detect)", "main");
-			if (base === undefined) {
+			const base = await this.promptForReviewBaseBranch();
+			if (!base) {
 				return undefined;
 			}
-			return { kind: "branch", base: base.trim() || undefined };
+			return { kind: "branch", base };
+		}
+		if (choice === uncommittedLabel) {
+			return { kind: "uncommitted" };
 		}
 		if (choice === prLabel) {
 			const number = await this.showExtensionInput("PR number (empty for current branch's PR)", "123");
@@ -6395,6 +6396,20 @@ export class InteractiveMode {
 		}
 		// Commit: the SHA is picked from the recent-commit list in handleReviewCommand.
 		return { kind: "commit" };
+	}
+
+	/** Show a local-branch picker and return the selected base branch. */
+	private async promptForReviewBaseBranch(): Promise<string | undefined> {
+		const branches = await listLocalBranches(this.sessionManager.getCwd());
+		if ("error" in branches) {
+			this.showError(branches.error);
+			return undefined;
+		}
+		if (branches.length === 0) {
+			this.showError("No local branches to review against.");
+			return undefined;
+		}
+		return this.showExtensionSelector("Select base branch", branches);
 	}
 
 	/** Show a recent-commit picker and return the selected SHA. */

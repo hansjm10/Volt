@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	buildReviewPrompt,
 	formatReviewForNewSession,
+	listLocalBranches,
 	listRecentCommits,
 	MAX_REVIEW_DIFF_CHARS,
 	parseReviewCommandArgs,
@@ -88,6 +89,35 @@ describe("parseReviewOutput", () => {
 		expect(parsed?.overallExplanation).toBe("One real bug.");
 	});
 
+	it("parses findings and coverage from an XML payload", () => {
+		const text = [
+			"<response>",
+			"  <summary>Reviewed changed files and targeted tests.</summary>",
+			"  <payload><![CDATA[",
+			JSON.stringify({
+				findings: [{ title: "Missing guard", body: "The new branch accepts empty input.", priority: 1 }],
+				coverage: {
+					files_reviewed: ["src/review.ts"],
+					commands_run: ["npm run check"],
+					unchecked_areas: ["E2E tests not run"],
+				},
+				overall_correctness: "incorrect",
+				overall_explanation: "One bug remains.",
+			}),
+			"]]></payload>",
+			"</response>",
+		].join("\n");
+
+		const parsed = parseReviewOutput(text);
+		expect(parsed?.findings[0]?.title).toBe("Missing guard");
+		expect(parsed?.coverage).toEqual({
+			filesReviewed: ["src/review.ts"],
+			commandsRun: ["npm run check"],
+			uncheckedAreas: ["E2E tests not run"],
+		});
+		expect(parsed?.overallCorrectness).toBe("incorrect");
+	});
+
 	it("uses the last parseable json block", () => {
 		const text = [
 			"```json",
@@ -157,6 +187,11 @@ describe("formatReviewForNewSession", () => {
 					{ title: "First bug", body: "Body one", priority: 0, file: "a.ts", line: "1" },
 					{ title: "Second bug", body: "Body two" },
 				],
+				coverage: {
+					filesReviewed: ["a.ts"],
+					commandsRun: ["npm run check"],
+					uncheckedAreas: ["E2E tests not run"],
+				},
 				overallCorrectness: "incorrect",
 				overallExplanation: "Two bugs.",
 			},
@@ -164,6 +199,8 @@ describe("formatReviewForNewSession", () => {
 		);
 		expect(content).toContain("### 1. First bug [P0] (a.ts:1)");
 		expect(content).toContain("### 2. Second bug");
+		expect(content).toContain("Files reviewed: a.ts");
+		expect(content).toContain("Commands run: npm run check");
 		expect(content).toContain("git diff HEAD");
 		expect(content).toContain("refer to findings by number");
 	});
@@ -189,10 +226,11 @@ describe("buildReviewPrompt", () => {
 			extraContext: "Commits:\nabc fix things",
 		};
 		const prompt = buildReviewPrompt(resolved);
-		expect(prompt).toContain("branch changes vs main");
-		expect(prompt).toContain("git diff main...HEAD");
-		expect(prompt).toContain("<diff>\ndiff --git a/x b/x\n</diff>");
-		expect(prompt).toContain("Commits:");
+		expect(prompt).toContain("<review_request>");
+		expect(prompt).toContain("<description>branch changes vs main</description>");
+		expect(prompt).toContain("<diff_command>git diff main...HEAD</diff_command>");
+		expect(prompt).toContain("<diff><![CDATA[diff --git a/x b/x]]></diff>");
+		expect(prompt).toContain("<extra_context><![CDATA[Commits:\nabc fix things]]></extra_context>");
 	});
 
 	it("tells the reviewer to re-run the diff command when truncated", () => {
@@ -350,6 +388,20 @@ describe("resolveReviewTarget", () => {
 		const repo = createRepo();
 		const result = await resolveReviewTarget({ kind: "commit" }, repo);
 		expect(result).toEqual({ error: "Missing commit SHA." });
+	});
+
+	it("lists local branches with main and master first for the base picker", async () => {
+		const repo = createRepo();
+		git(repo, "checkout", "-b", "zeta");
+		git(repo, "checkout", "main");
+		git(repo, "checkout", "-b", "master");
+		git(repo, "checkout", "main");
+		git(repo, "checkout", "-b", "alpha");
+		const branches = await listLocalBranches(repo);
+		if ("error" in branches) {
+			throw new Error(branches.error);
+		}
+		expect(branches).toEqual(["main", "master", "alpha", "zeta"]);
 	});
 
 	it("lists recent commits for the picker", async () => {

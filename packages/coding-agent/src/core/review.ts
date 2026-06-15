@@ -298,6 +298,31 @@ export interface RecentCommit {
 	date: string;
 }
 
+function prioritizeBaseBranches(branches: string[]): string[] {
+	const priority = new Map([
+		["main", 0],
+		["master", 1],
+	]);
+	return [...branches].sort((a, b) => {
+		const aPriority = priority.get(a) ?? 2;
+		const bPriority = priority.get(b) ?? 2;
+		return aPriority === bPriority ? a.localeCompare(b) : aPriority - bPriority;
+	});
+}
+
+/** List local branches for the /review base-branch picker. */
+export async function listLocalBranches(cwd: string): Promise<string[] | { error: string }> {
+	const result = await runCommand("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd);
+	if (!result.ok) {
+		return { error: `git branch failed: ${result.stderr.trim()}` };
+	}
+	const branches = result.stdout
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean);
+	return prioritizeBaseBranches(branches);
+}
+
 /** List recent commits on HEAD for the /review commit picker. */
 export async function listRecentCommits(cwd: string, limit = 30): Promise<RecentCommit[] | { error: string }> {
 	const result = await runCommand("git", ["log", "-n", String(limit), "--pretty=format:%h%x09%cr%x09%s"], cwd);
@@ -319,29 +344,78 @@ export async function listRecentCommits(cwd: string, limit = 30): Promise<Recent
 // Review prompt
 // ============================================================================
 
-export const REVIEW_SYSTEM_PROMPT = `You are an expert code reviewer operating inside volt, a coding agent harness. You review a code change and report only findings that matter.
+export const REVIEW_SYSTEM_PROMPT = `<reviewer_prompt>
+  <role>
+    You are an expert code reviewer operating inside volt, a coding agent harness.
+    You review a code change comprehensively and report every substantiated finding that matters.
+  </role>
 
-You have full tool access (read, bash, edit, write) in the repository being reviewed. Use it:
-- Read the full files around changed hunks; never judge a hunk in isolation.
-- Trace callers and related code when a change could break an invariant elsewhere.
-- If you suspect a behavioral bug, verify it when feasible: run the relevant tests, or write a small scratch test/script to confirm. Delete any scratch files you create and revert any temporary edits before finishing, leaving the working tree as you found it.
+  <goal>
+    Complete the whole review, not a first-hit bug hunt. Do not stop after finding one or two issues.
+    Continue until you have reviewed the full diff and the relevant surrounding code.
+  </goal>
 
-What to flag:
-- Bugs and logic errors that affect behavior.
-- Security issues, data loss, race conditions, broken error handling.
-- Changes that contradict explicit project conventions (see project context).
-- Regressions: removed checks, broken invariants, missed call sites.
+  <tool_use>
+    <instruction>Build a map of the changed files, changed symbols, and intended behavior before judging individual hunks.</instruction>
+    <instruction>Read the full files around changed hunks, or enough of each file to understand its invariants; never judge a hunk in isolation.</instruction>
+    <instruction>Trace callers, callees, tests, configuration, and related code when a change could break an invariant elsewhere.</instruction>
+    <instruction>If the inline diff is truncated, run the provided diff command and review the full diff before finalizing.</instruction>
+    <instruction>If you suspect a behavioral bug, verify it when feasible: run the relevant tests, or write a small scratch test/script to confirm.</instruction>
+    <instruction>Delete any scratch files you create and revert any temporary edits before finishing, leaving the working tree as you found it.</instruction>
+  </tool_use>
 
-What NOT to flag:
-- Style nits, formatting, or naming preferences.
-- Speculative concerns you could not substantiate from the code.
-- Pre-existing issues in code the change does not touch, unless the change makes them worse.
+  <review_workflow>
+    <step id="1" name="scope">Identify all changed files, changed entry points, and the intended behavior.</step>
+    <step id="2" name="context">Read surrounding code and project instructions relevant to each change.</step>
+    <step id="3" name="trace">Follow call sites, data flow, configuration, and tests for changes that affect contracts or invariants.</step>
+    <step id="4" name="verify">Run targeted commands or scratch checks for suspected behavioral bugs when feasible.</step>
+    <step id="5" name="coverage">Apply the checklist below across the whole diff before finalizing.</step>
+    <step id="6" name="report">Report all independent substantiated findings in the required payload.</step>
+  </review_workflow>
 
-Each finding needs a confidence assessment grounded in code you actually read or executed. Prefer a few high-signal findings over an exhaustive list.
+  <coverage_checklist>
+    <item>Runtime correctness, logic errors, regressions, and broken invariants.</item>
+    <item>Missed call sites, API/contract compatibility, migrations, and configuration changes.</item>
+    <item>Edge cases: empty input, partial failure, cancellation/abort, retries, large inputs, platform differences, and boundary values.</item>
+    <item>Error handling, cleanup, data loss, concurrency, async ordering, and race conditions.</item>
+    <item>Security and privacy issues: trust boundaries, injection, path traversal, credential exposure, unsafe file/network operations.</item>
+    <item>Tests: missing or weakened coverage for changed behavior, and whether existing tests still exercise the intended behavior.</item>
+    <item>Project-specific conventions and instructions from project context.</item>
+  </coverage_checklist>
 
-Output format: end your FINAL message with a single fenced json block, after a short prose summary of what you reviewed and how you verified it:
+  <finding_rules>
+    <flag>Bugs and logic errors that affect behavior.</flag>
+    <flag>Security issues, data loss, race conditions, broken error handling.</flag>
+    <flag>Changes that contradict explicit project conventions from project context.</flag>
+    <flag>Regressions: removed checks, broken invariants, missed call sites.</flag>
+    <flag>All independent, substantiated priority 0, 1, or 2 findings. Include priority 3 only when it meaningfully helps the author.</flag>
+    <do_not_flag>Style nits, formatting, or naming preferences.</do_not_flag>
+    <do_not_flag>Speculative concerns you could not substantiate from the code.</do_not_flag>
+    <do_not_flag>Pre-existing issues in code the change does not touch, unless the change makes them worse.</do_not_flag>
+    <grouping>If multiple hunks share one root cause, group them into one finding; otherwise do not omit independent issues.</grouping>
+    <empty_findings>Use an empty findings array only after completing the workflow and checklist.</empty_findings>
+  </finding_rules>
 
-\`\`\`json
+  <priority_scale>
+    <priority value="0">Must fix before landing.</priority>
+    <priority value="1">Should fix.</priority>
+    <priority value="2">Worth fixing.</priority>
+    <priority value="3">Optional.</priority>
+  </priority_scale>
+
+  <output_contract>
+    <format>End your final message with one XML response envelope. Do not put anything after the closing response tag.</format>
+    <summary>Before the payload, include a short summary of what you reviewed, what you verified, and any important areas you could not verify.</summary>
+    <payload_rules>
+      <rule>The payload content must be valid JSON. Do not wrap it in markdown fences.</rule>
+      <rule>overall_correctness must be "correct" or "incorrect".</rule>
+      <rule>Confidence is a number from 0.0 to 1.0 and must be grounded in code you read or executed.</rule>
+      <rule>Use empty arrays in coverage when nothing applies.</rule>
+    </payload_rules>
+    <response_shape>
+<response>
+  <summary>Short prose summary.</summary>
+  <payload>
 {
   "findings": [
     {
@@ -353,31 +427,51 @@ Output format: end your FINAL message with a single fenced json block, after a s
       "line": "120-134"
     }
   ],
-  "overall_correctness": "correct" | "incorrect",
+  "coverage": {
+    "files_reviewed": ["relative/path/to/file.ts"],
+    "commands_run": ["npm run check"],
+    "unchecked_areas": ["Integration tests not run: reason"]
+  },
+  "overall_correctness": "correct",
   "overall_explanation": "One or two sentences on whether the change is safe to land."
 }
-\`\`\`
+  </payload>
+</response>
+    </response_shape>
+  </output_contract>
+</reviewer_prompt>`;
 
-Priorities: 0 = must fix before landing, 1 = should fix, 2 = worth fixing, 3 = optional. Confidence is 0.0-1.0. Use an empty findings array when the change looks good. Do not put anything after the json block.`;
+function escapeXml(value: string): string {
+	return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function wrapXmlCdata(value: string): string {
+	return `<![CDATA[${value.replace(/\]\]>/g, "]]]]><![CDATA[>")}]]>`;
+}
 
 /** Build the user prompt for the review session. */
 export function buildReviewPrompt(resolved: ResolvedReview): string {
-	const parts: string[] = [`Review the following change: ${resolved.description}.`];
+	const diffNote = resolved.truncated
+		? `The diff is too large to include inline. Run \`${resolved.diffCommand}\` yourself to read the full diff. A truncated preview is included in the diff node.`
+		: `Reproduce this diff with \`${resolved.diffCommand}\`.`;
+	const parts: string[] = [
+		"<review_request>",
+		"  <target>",
+		`    <description>${escapeXml(resolved.description)}</description>`,
+		`    <diff_command>${escapeXml(resolved.diffCommand)}</diff_command>`,
+		`    <diff_truncated>${resolved.truncated ? "true" : "false"}</diff_truncated>`,
+		"  </target>",
+	];
 	if (resolved.extraContext) {
-		parts.push(resolved.extraContext);
+		parts.push(`  <extra_context>${wrapXmlCdata(resolved.extraContext)}</extra_context>`);
 	}
-	if (resolved.truncated) {
-		parts.push(
-			`The diff is too large to include inline. Run \`${resolved.diffCommand}\` yourself to read the full diff. A truncated preview follows:`,
-		);
-	} else {
-		parts.push(`Reproduce this diff with \`${resolved.diffCommand}\`.`);
-	}
-	parts.push(`<diff>\n${resolved.diff}\n</diff>`);
 	parts.push(
-		"Investigate the surrounding code before judging any hunk. Verify suspected bugs when feasible. Then produce your findings in the required json format.",
+		`  <diff_note>${escapeXml(diffNote)}</diff_note>`,
+		`  <diff>${wrapXmlCdata(resolved.diff)}</diff>`,
+		"  <task>Investigate the surrounding code before judging any hunk. Complete the review workflow across the whole diff before finalizing; do not stop after the first finding. Verify suspected bugs when feasible. Then produce your findings in the required XML response envelope with a JSON payload.</task>",
+		"</review_request>",
 	);
-	return parts.join("\n\n");
+	return parts.join("\n");
 }
 
 // ============================================================================
@@ -395,8 +489,15 @@ export interface ReviewFinding {
 	line?: string;
 }
 
+export interface ReviewCoverage {
+	filesReviewed: string[];
+	commandsRun: string[];
+	uncheckedAreas: string[];
+}
+
 export interface ParsedReview {
 	findings: ReviewFinding[];
+	coverage?: ReviewCoverage;
 	overallCorrectness?: string;
 	overallExplanation?: string;
 }
@@ -426,18 +527,88 @@ function coerceFinding(raw: unknown): ReviewFinding | undefined {
 	};
 }
 
+function coerceStringArray(raw: unknown): string[] {
+	if (!Array.isArray(raw)) {
+		return [];
+	}
+	return raw
+		.filter((value): value is string => typeof value === "string")
+		.map((value) => value.trim())
+		.filter(Boolean);
+}
+
+function coerceCoverage(raw: unknown): ReviewCoverage | undefined {
+	if (typeof raw !== "object" || raw === null) {
+		return undefined;
+	}
+	const record = raw as Record<string, unknown>;
+	const coverage = {
+		filesReviewed: coerceStringArray(record.files_reviewed),
+		commandsRun: coerceStringArray(record.commands_run),
+		uncheckedAreas: coerceStringArray(record.unchecked_areas),
+	};
+	if (
+		coverage.filesReviewed.length === 0 &&
+		coverage.commandsRun.length === 0 &&
+		coverage.uncheckedAreas.length === 0
+	) {
+		return undefined;
+	}
+	return coverage;
+}
+
+interface JsonCandidate {
+	index: number;
+	text: string;
+}
+
+function decodeXmlEntities(value: string): string {
+	return value
+		.replace(/&quot;/g, '"')
+		.replace(/&apos;/g, "'")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&amp;/g, "&");
+}
+
+function decodeXmlPayloadText(value: string): string {
+	const decodedCdata = value.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1");
+	return (decodedCdata === value ? decodeXmlEntities(value) : decodedCdata).trim();
+}
+
+function stripJsonMarkdownFence(value: string): string {
+	const trimmed = value.trim();
+	const match = /^```(?:json)?[ \t]*(?:\r?\n)?([\s\S]*?)\r?\n?```$/i.exec(trimmed);
+	return match?.[1]?.trim() ?? trimmed;
+}
+
+function collectXmlPayloadCandidates(text: string): JsonCandidate[] {
+	const candidates: JsonCandidate[] = [];
+	const payloadRegex = /<payload\b[^>]*>([\s\S]*?)<\/payload>/gi;
+	let match = payloadRegex.exec(text);
+	while (match !== null) {
+		candidates.push({ index: match.index, text: decodeXmlPayloadText(match[1] ?? "") });
+		match = payloadRegex.exec(text);
+	}
+	return candidates;
+}
+
 /**
- * Parse the reviewer's final message. Looks for the last fenced json block
- * containing a findings array. Returns undefined when no parseable block exists.
+ * Parse the reviewer's final message. Looks for the last XML payload, fenced json block,
+ * or bare JSON object containing a findings array. Returns undefined when no parseable block exists.
  */
 export function parseReviewOutput(text: string): ParsedReview | undefined {
+	// Extract XML payloads first so the preferred response envelope can contain prose safely.
+	const candidates = collectXmlPayloadCandidates(text);
+
 	// Extract fenced blocks line by line. Any info string opens a block (so a
 	// ```ts block in prose doesn't pair fences off-by-one), but only json or
 	// untagged blocks become candidates. A closer must be a bare ``` line, so
 	// fences embedded inside JSON strings don't terminate the block early.
-	const candidates: string[] = [];
 	let blockLines: string[] | undefined;
 	let blockIsCandidate = false;
+	let blockStartIndex = 0;
+	let lineStartIndex = 0;
 	for (const line of text.split("\n")) {
 		const trimmed = line.trim();
 		if (blockLines === undefined) {
@@ -445,25 +616,27 @@ export function parseReviewOutput(text: string): ParsedReview | undefined {
 				const infoString = trimmed.slice(3).trim();
 				blockLines = [];
 				blockIsCandidate = infoString === "" || infoString === "json";
+				blockStartIndex = lineStartIndex;
 			}
 		} else if (trimmed === "```") {
 			if (blockIsCandidate) {
-				candidates.push(blockLines.join("\n"));
+				candidates.push({ index: blockStartIndex, text: blockLines.join("\n") });
 			}
 			blockLines = undefined;
 		} else {
 			blockLines.push(line);
 		}
+		lineStartIndex += line.length + 1;
 	}
 	// An unterminated trailing block is still worth trying.
 	if (blockLines !== undefined && blockIsCandidate) {
-		candidates.push(blockLines.join("\n"));
+		candidates.push({ index: blockStartIndex, text: blockLines.join("\n") });
 	}
 	// Also try the whole text in case the model emitted bare JSON.
-	candidates.push(text);
+	candidates.push({ index: 0, text });
 
-	for (let i = candidates.length - 1; i >= 0; i--) {
-		const candidate = candidates[i].trim();
+	for (const candidateEntry of candidates.sort((a, b) => b.index - a.index)) {
+		const candidate = stripJsonMarkdownFence(candidateEntry.text);
 		if (!candidate.startsWith("{")) {
 			continue;
 		}
@@ -485,6 +658,7 @@ export function parseReviewOutput(text: string): ParsedReview | undefined {
 			.filter((finding): finding is ReviewFinding => finding !== undefined);
 		return {
 			findings,
+			coverage: coerceCoverage(record.coverage),
 			overallCorrectness: typeof record.overall_correctness === "string" ? record.overall_correctness : undefined,
 			overallExplanation: typeof record.overall_explanation === "string" ? record.overall_explanation : undefined,
 		};
@@ -516,6 +690,21 @@ export function formatReviewForNewSession(
 		if (parsed.overallCorrectness || parsed.overallExplanation) {
 			const verdict = [parsed.overallCorrectness, parsed.overallExplanation].filter(Boolean).join(" — ");
 			lines.push(`Overall: ${verdict}`, "");
+		}
+		if (parsed.coverage) {
+			const coverageLines: string[] = [];
+			if (parsed.coverage.filesReviewed.length > 0) {
+				coverageLines.push(`Files reviewed: ${parsed.coverage.filesReviewed.join(", ")}`);
+			}
+			if (parsed.coverage.commandsRun.length > 0) {
+				coverageLines.push(`Commands run: ${parsed.coverage.commandsRun.join("; ")}`);
+			}
+			if (parsed.coverage.uncheckedAreas.length > 0) {
+				coverageLines.push(`Unchecked areas: ${parsed.coverage.uncheckedAreas.join("; ")}`);
+			}
+			if (coverageLines.length > 0) {
+				lines.push("Coverage:", ...coverageLines.map((line) => `- ${line}`), "");
+			}
 		}
 		if (parsed.findings.length === 0) {
 			lines.push("The review found no issues worth flagging.");

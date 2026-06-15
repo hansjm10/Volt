@@ -41,6 +41,8 @@
 
 - Changed store install/update confirmations and summaries to show package names and concise source labels instead of full git source strings.
 - Changed the interactive `/store` browser to list available packages immediately, with search available from the package list.
+- Updated the `/review` selector to offer base-branch review first and show local branches with `main`/`master` prioritized.
+- Updated `/review` to use XML-structured review prompts, require whole-diff coverage reporting, and parse XML-wrapped JSON review payloads.
 - `SettingsManager.applyOverrides()` overrides now persist across `reload()` and internal settings re-merges instead of being silently dropped.
 - LSP project-root markers are now priority-ordered (a `tsconfig.json` anywhere up the tree beats a closer `package.json`), and diagnostics for files outside the working directory display absolute paths.
 - LSP cold starts now wait up to `lsp.firstSettleMs` (default 10s) for the first diagnostics from a fresh server, so the first edit no longer misses errors while the project loads.
