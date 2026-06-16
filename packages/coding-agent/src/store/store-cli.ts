@@ -52,6 +52,7 @@ interface StoreCommandOptions {
 
 export interface StoreCommandRuntimeOptions {
 	extensionFactories?: ExtensionFactory[];
+	profile?: string;
 }
 
 function getStoreCommandUsage(command?: StoreCommand): string {
@@ -703,6 +704,7 @@ export async function handleStoreCommand(
 			projectTrustOverride: options.projectTrustOverride,
 			extensionFactories: runtimeOptions.extensionFactories,
 			loadProjectTrustExtensions: false,
+			profile: runtimeOptions.profile,
 		});
 		reportProjectTrustWarnings(projectTrustWarnings);
 		if (!settingsManager.isProjectTrusted() && writesProjectPackageConfig) {

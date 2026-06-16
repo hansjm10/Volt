@@ -926,8 +926,8 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	listConfiguredPackages(): ConfiguredPackage[] {
-		const globalSettings = this.settingsManager.getGlobalSettings();
-		const projectSettings = this.settingsManager.getProjectSettings();
+		const globalSettings = this.settingsManager.getGlobalEffectiveSettings();
+		const projectSettings = this.settingsManager.getProjectEffectiveSettings();
 		const configuredPackages: ConfiguredPackage[] = [];
 
 		for (const pkg of globalSettings.packages ?? []) {

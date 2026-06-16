@@ -3,8 +3,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR, PACKAGE_NAME, VERSION } from "../src/config.ts";
+import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { ProjectTrustStore } from "../src/core/trust-manager.ts";
 import { main } from "../src/main.ts";
+
+interface ConfiguredUpdateSourceForTest {
+	source: string;
+	scope: "user" | "project";
+	scripts: "never" | "allow";
+}
+
+interface PackageManagerInternals {
+	updateConfiguredSources(sources: ConfiguredUpdateSourceForTest[]): Promise<void>;
+}
 
 describe("package commands", () => {
 	let tempDir: string;
@@ -15,6 +26,7 @@ describe("package commands", () => {
 	let originalAgentDir: string | undefined;
 	let originalVoltPackageDir: string | undefined;
 	let originalLatestVersionUrl: string | undefined;
+	let originalVoltProfile: string | undefined;
 	let originalExitCode: typeof process.exitCode;
 	let originalExecPath: string;
 
@@ -36,6 +48,7 @@ describe("package commands", () => {
 		originalAgentDir = process.env[ENV_AGENT_DIR];
 		originalVoltPackageDir = process.env.VOLT_PACKAGE_DIR;
 		originalLatestVersionUrl = process.env.VOLT_LATEST_VERSION_URL;
+		originalVoltProfile = process.env.VOLT_PROFILE;
 		originalExitCode = process.exitCode;
 		originalExecPath = process.execPath;
 		process.exitCode = undefined;
@@ -61,6 +74,11 @@ describe("package commands", () => {
 			delete process.env.VOLT_LATEST_VERSION_URL;
 		} else {
 			process.env.VOLT_LATEST_VERSION_URL = originalLatestVersionUrl;
+		}
+		if (originalVoltProfile === undefined) {
+			delete process.env.VOLT_PROFILE;
+		} else {
+			process.env.VOLT_PROFILE = originalVoltProfile;
 		}
 		Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
 		rmSync(tempDir, { recursive: true, force: true });
@@ -180,6 +198,72 @@ describe("package commands", () => {
 			expect(process.exitCode).toBeUndefined();
 		} finally {
 			logSpy.mockRestore();
+		}
+	});
+
+	it("lists active profile packages", async () => {
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify({
+				packages: ["npm:@base/pkg"],
+				profiles: { work: { packages: ["npm:@profile/pkg"] } },
+			}),
+		);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		try {
+			await expect(main(["list", "--profile", "work"])).resolves.toBeUndefined();
+
+			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
+			expect(stdout).toContain("npm:@profile/pkg");
+			expect(stdout).not.toContain("npm:@base/pkg");
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it.each([
+		{ name: "VOLT_PROFILE", args: ["update", "--extensions"], envProfile: "work" },
+		{ name: "trailing --profile", args: ["update", "--extensions", "--profile", "work"] },
+		{ name: "leading --profile", args: ["--profile", "work", "update", "--extensions"] },
+	])("applies $name to package command settings", async ({ args, envProfile }) => {
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify(
+				{
+					packages: ["npm:@base/pkg"],
+					profiles: {
+						work: {
+							packages: ["npm:@profile/pkg"],
+						},
+					},
+				},
+				null,
+				2,
+			),
+		);
+		if (envProfile !== undefined) {
+			process.env.VOLT_PROFILE = envProfile;
+		}
+		const updateConfiguredSourcesSpy = vi
+			.spyOn(DefaultPackageManager.prototype as unknown as PackageManagerInternals, "updateConfiguredSources")
+			.mockResolvedValue(undefined);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(main(args)).resolves.toBeUndefined();
+
+			expect(updateConfiguredSourcesSpy).toHaveBeenCalledWith([
+				{ source: "npm:@profile/pkg", scope: "user", scripts: "allow" },
+			]);
+			expect(errorSpy).not.toHaveBeenCalled();
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			updateConfiguredSourcesSpy.mockRestore();
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
 		}
 	});
 

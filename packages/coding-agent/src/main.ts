@@ -102,6 +102,23 @@ function resolveRequestedProfile(parsed: Args): string | undefined {
 	return trimmed ? trimmed : undefined;
 }
 
+function stripCommandProfileArgs(args: readonly string[]): { args: string[]; profile?: string } {
+	const commandArgs: string[] = [];
+	let profile: string | undefined;
+
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--profile" && index + 1 < args.length) {
+			profile = args[index + 1];
+			index++;
+			continue;
+		}
+		commandArgs.push(arg);
+	}
+
+	return { args: commandArgs, profile };
+}
+
 function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
 	if (parsed.mode === "rpc") {
 		return "rpc";
@@ -473,15 +490,21 @@ export async function main(args: string[], options?: MainOptions) {
 		cleanupWindowsSelfUpdateQuarantine(getPackageDir());
 	}
 
-	if (await handleStoreCommand(args, { extensionFactories: options?.extensionFactories })) {
+	const commandProfileArgs = stripCommandProfileArgs(args);
+	const commandRuntimeOptions = {
+		extensionFactories: options?.extensionFactories,
+		profile: commandProfileArgs.profile,
+	};
+
+	if (await handleStoreCommand(commandProfileArgs.args, commandRuntimeOptions)) {
 		return;
 	}
 
-	if (await handlePackageCommand(args, { extensionFactories: options?.extensionFactories })) {
+	if (await handlePackageCommand(commandProfileArgs.args, commandRuntimeOptions)) {
 		return;
 	}
 
-	if (await handleConfigCommand(args, { extensionFactories: options?.extensionFactories })) {
+	if (await handleConfigCommand(commandProfileArgs.args, commandRuntimeOptions)) {
 		return;
 	}
 

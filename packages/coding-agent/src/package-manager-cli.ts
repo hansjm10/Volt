@@ -431,6 +431,7 @@ export function parseProjectTrustOverride(args: readonly string[]): boolean | un
 
 export interface PackageCommandRuntimeOptions {
 	extensionFactories?: ExtensionFactory[];
+	profile?: string;
 }
 
 export interface CommandSettingsResult {
@@ -448,14 +449,27 @@ export function reportProjectTrustWarnings(warnings: readonly string[]): void {
 	}
 }
 
+function normalizeCommandProfile(profile: string | undefined): string | undefined {
+	const trimmed = profile?.trim();
+	return trimmed ? trimmed : undefined;
+}
+
+function resolveCommandProfile(profile: string | undefined): string | undefined {
+	return normalizeCommandProfile(profile ?? process.env.VOLT_PROFILE);
+}
+
 export async function createCommandSettingsManager(options: {
 	cwd: string;
 	agentDir: string;
 	projectTrustOverride?: boolean;
 	extensionFactories?: ExtensionFactory[];
 	loadProjectTrustExtensions?: boolean;
+	profile?: string;
 }): Promise<CommandSettingsResult> {
-	const settingsManager = SettingsManager.create(options.cwd, options.agentDir, { projectTrusted: false });
+	const settingsManager = SettingsManager.create(options.cwd, options.agentDir, {
+		projectTrusted: false,
+		profile: resolveCommandProfile(options.profile),
+	});
 	const projectTrustWarnings: string[] = [];
 	const appMode = getCommandAppMode();
 	const shouldLoadProjectTrustExtensions = options.loadProjectTrustExtensions ?? true;
@@ -507,6 +521,7 @@ export async function handleConfigCommand(
 		agentDir,
 		projectTrustOverride: parseProjectTrustOverride(args),
 		extensionFactories: runtimeOptions.extensionFactories,
+		profile: runtimeOptions.profile,
 	});
 	reportProjectTrustWarnings(projectTrustWarnings);
 	reportSettingsErrors(settingsManager, "config command");
@@ -581,6 +596,7 @@ export async function handlePackageCommand(
 		agentDir,
 		projectTrustOverride: options.projectTrustOverride,
 		extensionFactories: runtimeOptions.extensionFactories,
+		profile: runtimeOptions.profile,
 	});
 	reportProjectTrustWarnings(projectTrustWarnings);
 	if (!settingsManager.isProjectTrusted() && writesProjectPackageConfig) {
