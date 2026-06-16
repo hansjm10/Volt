@@ -6,13 +6,41 @@ The PoC keeps Iroh outside Volt core. `host.mjs` accepts an Iroh connection, val
 
 ## Install
 
-From this directory:
+From the repository root:
+
+```bash
+npm run iroh:poc:install
+```
+
+Or from this directory:
 
 ```bash
 npm install --ignore-scripts
 ```
 
 `@number0/iroh` is a native package with optional prebuilt platform packages. Keeping it in this example package avoids adding Iroh to Volt's default install path.
+
+## Root scripts
+
+From the repository root:
+
+```bash
+npm run iroh:poc:smoke                  # local fake-RPC smoke test
+npm run iroh:poc:host                   # fake-RPC host
+npm run iroh:poc:host:volt              # source Volt RPC host for this checkout
+npm run iroh:poc:client -- "<ticket>"    # client
+npm run iroh:poc:clients                # list paired clients
+npm run iroh:poc:revoke -- <node-id>    # revoke a paired client
+```
+
+Pass extra host/client flags after `--`, for example:
+
+```bash
+npm run iroh:poc:host:volt -- --relay default --no-pairing
+npm run iroh:poc:client -- "<ticket>" --message "List top-level files."
+```
+
+Use `npm run --silent ...` if you want stdout to contain only the ticket or client output.
 
 ## Local fake-RPC smoke test
 
@@ -71,10 +99,16 @@ In `--no-pairing` mode, the printed ticket contains no pairing secret. Only clie
 
 ## Test with real Volt RPC
 
-Terminal 1, when testing from a source checkout:
+Terminal 1, when testing this source checkout from the repository root:
 
 ```bash
-npm run host -- --use-volt --volt-bin /path/to/volt/volt-test.sh --workspace volt=/path/to/volt --allow-tools read,grep,find,ls
+npm run iroh:poc:host:volt -- --allow-tools read,grep,find,ls
+```
+
+Terminal 1, when testing another source checkout from this directory:
+
+```bash
+npm run host -- --source-volt /path/to/volt --workspace volt=/path/to/volt --allow-tools read,grep,find,ls
 ```
 
 Terminal 1, when `volt` is globally installed on the host `PATH`:

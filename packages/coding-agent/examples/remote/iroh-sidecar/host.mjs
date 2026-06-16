@@ -35,6 +35,7 @@ Serve options:
   --relay <disabled|default> Iroh relay preset. Defaults to disabled for local tests.
   --state <path>             Host state path. Defaults to ~/.volt/agent/remote/iroh-sidecar-host.json.
   --use-volt                 Spawn volt --mode rpc instead of the fake RPC child.
+  --source-volt <repo-root>  Spawn Volt from a source checkout. Implies --use-volt.
   --volt-bin <path>          Volt executable for --use-volt. Defaults to volt.
   --allow-tools <list>       Tool allowlist passed to Volt. Defaults to read,grep,find,ls.
   --no-pairing               Reject unpaired clients and print a paired-client ticket.
@@ -180,8 +181,23 @@ function sourceCheckoutVoltBinHint(workspace) {
 	return `If testing a source checkout, pass --volt-bin ${resolve(workspace.path, "volt-test.sh")}.`;
 }
 
+async function resolveSourceVoltRunner(sourceVolt) {
+	const runnerPath = resolve(sourceVolt, "scripts", "run-coding-agent-source.mjs");
+	try {
+		const runnerStat = await stat(runnerPath);
+		if (runnerStat.isFile()) return runnerPath;
+	} catch (error) {
+		if (error && error.code !== "ENOENT") throw error;
+	}
+	throw new Error(`Volt source runner is not available: ${runnerPath}`);
+}
+
 async function preflightRpcChild(options, workspace) {
 	await assertWorkspaceDirectory(workspace);
+	if (options.sourceVolt) {
+		options.resolvedSourceVoltRunner = await resolveSourceVoltRunner(options.sourceVolt);
+		return;
+	}
 	if (!options.useVolt) return;
 
 	const voltBin = getPlatformVoltBin(options.voltBin);
@@ -218,6 +234,20 @@ async function bindEndpoint(relayMode, state, statePath) {
 }
 
 function spawnRpcChild(options, workspace, allowTools) {
+	if (options.sourceVolt) {
+		const runnerPath = options.resolvedSourceVoltRunner ?? resolve(options.sourceVolt, "scripts", "run-coding-agent-source.mjs");
+		const args = [runnerPath, "--mode", "rpc"];
+		if (allowTools) args.push("--tools", allowTools);
+		return {
+			command: process.execPath,
+			args,
+			child: spawn(process.execPath, args, {
+				cwd: workspace.path,
+				stdio: ["pipe", "pipe", "pipe"],
+			}),
+		};
+	}
+
 	if (!options.useVolt) {
 		const fakeRpcPath = fileURLToPath(new URL("./fake-rpc.mjs", import.meta.url));
 		return {
@@ -442,13 +472,15 @@ async function serve(flags) {
 	}
 
 	const pairingEnabled = !hasFlag(flags, "no-pairing");
+	const sourceVolt = getFlag(flags, "source-volt");
 	const options = {
 		allowTools,
 		relayMode,
 		pairingSecret: pairingEnabled ? randomBytes(24).toString("base64url") : undefined,
 		once: hasFlag(flags, "once"),
+		sourceVolt: sourceVolt ? resolve(sourceVolt) : undefined,
 		statePath,
-		useVolt: hasFlag(flags, "use-volt"),
+		useVolt: Boolean(sourceVolt) || hasFlag(flags, "use-volt"),
 		voltBin: getFlag(flags, "volt-bin", "volt"),
 		workspace,
 	};
@@ -462,7 +494,7 @@ async function serve(flags) {
 	console.error(`state: ${statePath}`);
 	console.error(`workspace: ${workspace.name} -> ${workspace.path}`);
 	console.error(
-		`child: ${options.useVolt ? `${options.resolvedVoltBin ?? getPlatformVoltBin(options.voltBin)} --mode rpc` : "fake-rpc"}`,
+		`child: ${options.sourceVolt ? `${process.execPath} ${options.resolvedSourceVoltRunner} --mode rpc` : options.useVolt ? `${options.resolvedVoltBin ?? getPlatformVoltBin(options.voltBin)} --mode rpc` : "fake-rpc"}`,
 	);
 	console.error(`pairing: ${pairingEnabled ? "enabled" : "disabled"}`);
 	console.error(pairingEnabled ? "pairing ticket:" : "paired-client ticket:");
