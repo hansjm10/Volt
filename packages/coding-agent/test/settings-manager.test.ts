@@ -343,6 +343,35 @@ describe("SettingsManager", () => {
 			expect(savedSettings.profiles.work.enabledModels).toEqual(["updated-profile-model"]);
 		});
 
+		it("should persist active profile clears for inherited optional settings", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					defaultProfile: "work",
+					enabledModels: ["base-model"],
+					reviewModel: "base-review-model",
+					profiles: {
+						work: {},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getEnabledModels()).toEqual(["base-model"]);
+			expect(manager.getReviewModel()).toBe("base-review-model");
+
+			manager.setEnabledModels(undefined);
+			manager.setReviewModel(undefined);
+			await manager.flush();
+
+			expect(manager.getEnabledModels()).toBeUndefined();
+			expect(manager.getReviewModel()).toBeUndefined();
+			const reloadedManager = SettingsManager.create(projectDir, agentDir);
+			expect(reloadedManager.getEnabledModels()).toBeUndefined();
+			expect(reloadedManager.getReviewModel()).toBeUndefined();
+		});
+
 		it("should preserve externally added nested fields when updating an active profile setting", async () => {
 			const settingsPath = join(agentDir, "settings.json");
 			writeFileSync(

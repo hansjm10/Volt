@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Agent } from "@earendil-works/volt-agent-core";
 import { registerFauxProvider } from "@earendil-works/volt-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import { AgentSession } from "../src/core/agent-session.ts";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -10,8 +12,10 @@ import {
 	createAgentSessionServices,
 } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { type Settings, SettingsManager } from "../src/core/settings-manager.ts";
+import { createTestResourceLoader } from "./utilities.ts";
 
 function getRuntimeProfile(options: Parameters<CreateAgentSessionRuntimeFactory>[0]): string | undefined {
 	if (!("profile" in options)) {
@@ -118,5 +122,60 @@ describe("AgentSessionRuntime profile propagation", () => {
 		expect(runtimeProfileDuringReplacement).toBe("switched");
 		expect(runtime.services.settingsManager.getActiveProfile()).toBe("switched");
 		expect(runtime.services.settingsManager.getTheme()).toBe("switched-theme");
+	});
+
+	it("refreshes snapshotted agent settings after a profile reload", async () => {
+		const faux = registerFauxProvider({
+			models: [{ id: "profile-runtime-model", reasoning: true }],
+		});
+		const settingsManager = SettingsManager.inMemory({
+			defaultProfile: "base",
+			transport: "sse",
+			thinkingBudgets: { low: 1000, high: 4000 },
+			retry: { provider: { maxRetryDelayMs: 1000 } },
+			profiles: {
+				base: {},
+				switched: {
+					transport: "websocket",
+					thinkingBudgets: { low: 2000, high: 8000 },
+					retry: { provider: { maxRetryDelayMs: 250 } },
+				},
+			},
+		} satisfies Partial<Settings>);
+		const agent = new Agent({
+			initialState: {
+				model: faux.getModel(),
+				systemPrompt: "You are a helpful assistant.",
+				tools: [],
+				thinkingLevel: "low",
+			},
+			transport: settingsManager.getTransport(),
+			thinkingBudgets: settingsManager.getThinkingBudgets(),
+			maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settingsManager,
+			cwd: process.cwd(),
+			modelRegistry: ModelRegistry.inMemory(AuthStorage.inMemory()),
+			resourceLoader: createTestResourceLoader(),
+		});
+
+		cleanups.push(() => {
+			session.dispose();
+			faux.unregister();
+		});
+
+		expect(agent.transport).toBe("sse");
+		expect(agent.thinkingBudgets).toEqual({ low: 1000, high: 4000 });
+		expect(agent.maxRetryDelayMs).toBe(1000);
+
+		settingsManager.setActiveProfile("switched");
+		await session.reload();
+
+		expect(agent.transport).toBe("websocket");
+		expect(agent.thinkingBudgets).toEqual({ low: 2000, high: 8000 });
+		expect(agent.maxRetryDelayMs).toBe(250);
 	});
 });

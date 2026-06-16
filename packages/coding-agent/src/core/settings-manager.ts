@@ -157,6 +157,10 @@ function deepMergeRecord(base: Record<string, unknown>, overrides: Record<string
 		if (overrideValue === undefined) {
 			continue;
 		}
+		if (overrideValue === null) {
+			delete result[key];
+			continue;
+		}
 
 		const baseValue = base[key];
 		if (isSettingsRecord(baseValue) && isSettingsRecord(overrideValue)) {
@@ -190,6 +194,17 @@ function defineOwnEnumerableProperty(target: Record<string, unknown>, key: strin
 		configurable: true,
 		writable: true,
 	});
+}
+
+function normalizeProfileClears(profile: Record<string, unknown>): void {
+	for (const key of Object.keys(profile)) {
+		const value = profile[key];
+		if (value === undefined) {
+			profile[key] = null;
+		} else if (isSettingsRecord(value)) {
+			normalizeProfileClears(value);
+		}
+	}
 }
 
 function getOwnProfileSettings(settings: Settings, profileName: string): ProfileSettings | undefined {
@@ -998,6 +1013,7 @@ export class SettingsManager {
 		settings.profiles = cloneProfiles(settings.profiles);
 		const profileSettings = structuredClone(getOwnProfileSettings(settings, profileName) ?? {}) as Settings;
 		update(profileSettings);
+		normalizeProfileClears(profileSettings as Record<string, unknown>);
 		defineOwnEnumerableProperty(settings.profiles, profileName, profileSettings);
 	}
 
