@@ -91,8 +91,10 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--model" && i + 1 < args.length) {
 			result.model = args[++i];
 		} else if (arg === "--profile") {
-			if (i + 1 < args.length) {
-				result.profile = args[++i];
+			const value = args[i + 1];
+			if (value !== undefined && !value.startsWith("-")) {
+				result.profile = value;
+				i++;
 			} else {
 				result.diagnostics.push({ type: "error", message: "--profile requires a value" });
 			}

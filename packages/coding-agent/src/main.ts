@@ -102,14 +102,18 @@ function resolveRequestedProfile(parsed: Args): string | undefined {
 	return trimmed ? trimmed : undefined;
 }
 
-function stripCommandProfileArgs(args: readonly string[]): { args: string[]; profile?: string } {
+function stripCommandProfileArgs(args: readonly string[]): { args: string[]; profile?: string; error?: string } {
 	const commandArgs: string[] = [];
 	let profile: string | undefined;
 
 	for (let index = 0; index < args.length; index++) {
 		const arg = args[index];
-		if (arg === "--profile" && index + 1 < args.length) {
-			profile = args[index + 1];
+		if (arg === "--profile") {
+			const value = args[index + 1];
+			if (value === undefined || value.startsWith("-")) {
+				return { args: [...args], error: "--profile requires a value" };
+			}
+			profile = value;
 			index++;
 			continue;
 		}
@@ -491,6 +495,11 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	const commandProfileArgs = stripCommandProfileArgs(args);
+	if (commandProfileArgs.error) {
+		console.error(chalk.red(`Error: ${commandProfileArgs.error}`));
+		process.exitCode = 1;
+		return;
+	}
 	const commandRuntimeOptions = {
 		extensionFactories: options?.extensionFactories,
 		profile: commandProfileArgs.profile,

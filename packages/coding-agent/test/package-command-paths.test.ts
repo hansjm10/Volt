@@ -257,6 +257,30 @@ describe("package commands", () => {
 		}
 	});
 
+	it("rejects missing package command --profile values before another option", async () => {
+		process.env.VOLT_LATEST_VERSION_URL = "https://updates.example/latest-version";
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => Response.json({ version: VERSION })),
+		);
+		const updateSpy = vi.spyOn(DefaultPackageManager.prototype, "update").mockResolvedValue(undefined);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(main(["update", "--profile", "--extensions"])).resolves.toBeUndefined();
+
+			expect(updateSpy).not.toHaveBeenCalled();
+			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
+			expect(stderr).toContain("--profile requires a value");
+			expect(process.exitCode).toBe(1);
+		} finally {
+			updateSpy.mockRestore();
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
 	it.each([
 		{ name: "VOLT_PROFILE", args: ["update", "--extensions"], envProfile: "work" },
 		{ name: "trailing --profile", args: ["update", "--extensions", "--profile", "work"] },

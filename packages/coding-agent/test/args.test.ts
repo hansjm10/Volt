@@ -105,6 +105,13 @@ describe("parseArgs", () => {
 			expect(result.diagnostics).toEqual([{ type: "error", message: "--profile requires a value" }]);
 		});
 
+		test("reports missing --profile value before another flag", () => {
+			const result = parseArgs(["--profile", "--help"]);
+			expect(result.profile).toBeUndefined();
+			expect(result.help).toBe(true);
+			expect(result.diagnostics).toEqual([{ type: "error", message: "--profile requires a value" }]);
+		});
+
 		test("parses --api-key", () => {
 			const result = parseArgs(["--api-key", "sk-test-key"]);
 			expect(result.apiKey).toBe("sk-test-key");
