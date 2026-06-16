@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME } from "../config.ts";
@@ -177,8 +178,12 @@ export function hasProjectTrustInputs(cwd: string): boolean {
 		return true;
 	}
 
+	const homeDir = process.env.HOME || homedir();
+	const userAgentsSkillsDir = canonicalizePath(resolvePath(join(homeDir, ".agents", "skills")));
+
 	while (true) {
-		if (existsSync(join(currentDir, ".agents", "skills"))) {
+		const agentsSkillsDir = canonicalizePath(resolvePath(join(currentDir, ".agents", "skills")));
+		if (agentsSkillsDir !== userAgentsSkillsDir && existsSync(agentsSkillsDir)) {
 			return true;
 		}
 
