@@ -7,13 +7,14 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage } from "@earendil-works/volt-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/volt-agent-core";
 import {
 	type AssistantMessage,
 	getProviders,
 	type ImageContent,
 	type Message,
 	type Model,
+	modelsAreEqual,
 	type OAuthProviderId,
 	type OAuthSelectPrompt,
 } from "@earendil-works/volt-ai";
@@ -4839,6 +4840,73 @@ export class InteractiveMode {
 		}
 	}
 
+	private applyProfileDefaultThinkingLevel(thinkingLevelOverride?: ThinkingLevel): boolean {
+		const defaultThinkingLevel = thinkingLevelOverride ?? this.settingsManager.getDefaultThinkingLevel();
+		if (defaultThinkingLevel === undefined) {
+			return false;
+		}
+
+		const previousThinkingLevel = this.session.thinkingLevel;
+		this.session.setThinkingLevel(defaultThinkingLevel, { persistDefault: false });
+		return this.session.thinkingLevel !== previousThinkingLevel;
+	}
+
+	private async applyProfileDefaultModel(): Promise<void> {
+		const defaultProvider = this.settingsManager.getDefaultProvider();
+		const defaultModel = this.settingsManager.getDefaultModel();
+		if (!defaultProvider && !defaultModel) {
+			if (this.applyProfileDefaultThinkingLevel()) {
+				this.footer.invalidate();
+				this.updateEditorBorderColor();
+			}
+			return;
+		}
+		if (!defaultProvider || !defaultModel) {
+			this.showWarning("Could not apply profile default model: defaultProvider/defaultModel is incomplete");
+			return;
+		}
+
+		const model = this.session.modelRegistry.find(defaultProvider, defaultModel);
+		if (!model) {
+			this.showWarning(`Could not apply profile default model ${defaultProvider}/${defaultModel}: model not found`);
+			return;
+		}
+
+		const scopedModels = this.session.scopedModels;
+		const scopedDefaultModel =
+			scopedModels.length > 0 ? scopedModels.find((scoped) => modelsAreEqual(scoped.model, model)) : undefined;
+		const selectedScopedModel = scopedModels.length > 0 ? (scopedDefaultModel ?? scopedModels[0]) : undefined;
+		const selectedModel = selectedScopedModel?.model ?? model;
+		const selectedThinkingLevel = selectedScopedModel?.thinkingLevel;
+
+		if (modelsAreEqual(this.session.model, selectedModel)) {
+			if (this.applyProfileDefaultThinkingLevel(selectedThinkingLevel)) {
+				this.footer.invalidate();
+				this.updateEditorBorderColor();
+			}
+			return;
+		}
+		if (!this.session.modelRegistry.hasConfiguredAuth(selectedModel)) {
+			this.showWarning(
+				`Could not apply profile model ${selectedModel.provider}/${selectedModel.id}: credentials are not configured`,
+			);
+			return;
+		}
+
+		try {
+			await this.session.setModel(selectedModel, { persistDefault: false });
+			this.applyProfileDefaultThinkingLevel(selectedThinkingLevel);
+			this.footer.invalidate();
+			this.updateEditorBorderColor();
+			void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel);
+			this.checkDaxnutsEasterEgg(selectedModel);
+		} catch (error: unknown) {
+			this.showWarning(
+				`Could not apply profile model ${selectedModel.provider}/${selectedModel.id}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
 	private async switchProfile(
 		profileName: string,
 		options?: { created?: boolean; forceReload?: boolean },
@@ -4873,6 +4941,7 @@ export class InteractiveMode {
 				`Could not apply profile model scope: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
+		await this.applyProfileDefaultModel();
 	}
 
 	private async applyScopedModelsFromSettings(): Promise<void> {

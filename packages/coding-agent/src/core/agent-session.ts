@@ -244,6 +244,10 @@ interface ToolDefinitionEntry {
 	sourceInfo: SourceInfo;
 }
 
+interface DefaultPersistenceOptions {
+	persistDefault?: boolean;
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -1461,22 +1465,25 @@ export class AgentSession {
 
 	/**
 	 * Set model directly.
-	 * Validates that auth is configured, saves to session and settings.
+	 * Validates that auth is configured, saves to session, and persists as the default unless disabled.
 	 * @throws Error if no auth is configured for the model
 	 */
-	async setModel(model: Model<any>): Promise<void> {
+	async setModel(model: Model<any>, options?: DefaultPersistenceOptions): Promise<void> {
 		if (!this._modelRegistry.hasConfiguredAuth(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
 		const previousModel = this.model;
+		const persistDefault = options?.persistDefault !== false;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = model;
 		this.sessionManager.appendModelChange(model.provider, model.id);
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		if (persistDefault) {
+			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		}
 
 		// Re-clamp thinking level for new model's capabilities
-		this.setThinkingLevel(thinkingLevel);
+		this.setThinkingLevel(thinkingLevel, { persistDefault });
 
 		await this._emitModelSelect(model, previousModel, "set");
 	}
@@ -1555,21 +1562,22 @@ export class AgentSession {
 	/**
 	 * Set thinking level.
 	 * Clamps to model capabilities based on available thinking levels.
-	 * Saves to session and settings only if the level actually changes.
+	 * Saves to session and settings only if the level actually changes. Settings persistence can be disabled.
 	 */
-	setThinkingLevel(level: ThinkingLevel): void {
+	setThinkingLevel(level: ThinkingLevel, options?: DefaultPersistenceOptions): void {
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
 		// Only persist if actually changing
 		const previousLevel = this.agent.state.thinkingLevel;
 		const isChanging = effectiveLevel !== previousLevel;
+		const persistDefault = options?.persistDefault !== false;
 
 		this.agent.state.thinkingLevel = effectiveLevel;
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (this.supportsThinking() || effectiveLevel !== "off") {
+			if (persistDefault && (this.supportsThinking() || effectiveLevel !== "off")) {
 				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
 			}
 			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
