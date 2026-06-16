@@ -30,7 +30,8 @@ From the repository root:
 npm run iroh:poc:smoke                  # local fake-RPC smoke test
 npm run iroh:poc:host                   # fake-RPC host
 npm run iroh:poc:host:volt              # source Volt RPC host for this checkout
-npm run iroh:poc:client -- "<ticket>"    # client
+npm run iroh:poc:client -- "<ticket>"    # one-shot client
+npm run iroh:poc:client -- "<ticket>" --interactive  # persistent prompt loop
 npm run iroh:poc:clients                # list paired clients
 npm run iroh:poc:revoke -- <node-id>    # revoke a paired client
 ```
@@ -60,7 +61,13 @@ Terminal 2:
 npm run client -- "<ticket>" --message "hello from another device"
 ```
 
-Expected output:
+Or keep the connection open:
+
+```bash
+npm run client -- "<ticket>" --interactive
+```
+
+Expected output for the one-shot command:
 
 ```text
 fake RPC response over Iroh: hello from another device
@@ -119,12 +126,25 @@ Terminal 1, when `volt` is globally installed on the host `PATH`:
 npm run host -- --use-volt --workspace volt=/path/to/repo --allow-tools read,grep,find,ls
 ```
 
-Terminal 2:
+Terminal 2, one-shot commands:
 
 ```bash
 npm run client -- "<ticket>" --get-state
 npm run client -- "<ticket>" --message "List the top-level files."
 ```
+
+Terminal 2, persistent prompt loop:
+
+```bash
+npm run client -- "<ticket>" --interactive
+```
+
+Interactive commands:
+
+- `/state` prints current RPC session state.
+- `/abort` sends an abort command.
+- `/quit` or `/exit` exits the client.
+- Ctrl+C aborts a running prompt; Ctrl+C while idle exits.
 
 Add `--relay default` to the host command when testing across networks; the ticket carries the relay mode to the client. On Windows, a global install normally resolves through `volt.cmd` automatically when `--volt-bin` is omitted.
 
