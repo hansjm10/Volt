@@ -735,7 +735,9 @@ export class DefaultPackageManager implements PackageManager {
 	addSourceToSettings(source: string, options?: PackageInstallOptions): boolean {
 		const scope: InstalledSourceScope = options?.local ? "project" : "user";
 		const currentSettings =
-			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
+			scope === "project"
+				? this.settingsManager.getProjectEffectiveSettings()
+				: this.settingsManager.getGlobalEffectiveSettings();
 		const currentPackages = currentSettings.packages ?? [];
 		const normalizedSource = this.normalizePackageSourceForSettings(source, scope);
 		const matchIndex = currentPackages.findIndex((existing) => this.packageSourcesMatch(existing, source, scope));
@@ -809,7 +811,9 @@ export class DefaultPackageManager implements PackageManager {
 	removeSourceFromSettings(source: string, options?: { local?: boolean }): boolean {
 		const scope: InstalledSourceScope = options?.local ? "project" : "user";
 		const currentSettings =
-			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
+			scope === "project"
+				? this.settingsManager.getProjectEffectiveSettings()
+				: this.settingsManager.getGlobalEffectiveSettings();
 		const currentPackages = currentSettings.packages ?? [];
 		const matches = new Set(this.getPackageSourceMatchesForAction(currentPackages, source, scope));
 		const nextPackages = currentPackages.filter((existing) => !matches.has(existing));

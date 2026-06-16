@@ -748,11 +748,34 @@ export class SettingsManager {
 		});
 	}
 
+	private updateProfileSettings(settings: Settings, profileName: string, update: (settings: Settings) => void): void {
+		settings.profiles = { ...(settings.profiles ?? {}) };
+		const profileSettings = structuredClone(settings.profiles[profileName] ?? {}) as Settings;
+		update(profileSettings);
+		settings.profiles[profileName] = profileSettings as ProfileSettings;
+	}
+
+	private updateGlobalSettings(field: keyof Settings, update: (settings: Settings) => void): void {
+		if (this.activeProfile) {
+			this.updateProfileSettings(this.globalSettings, this.activeProfile, update);
+			this.markModified("profiles", this.activeProfile);
+		} else {
+			update(this.globalSettings);
+			this.markModified(field);
+		}
+		this.save();
+	}
+
 	private updateProjectSettings(field: keyof Settings, update: (settings: Settings) => void): void {
 		this.assertProjectTrustedForWrite();
 		const projectSettings = structuredClone(this.projectSettings);
-		update(projectSettings);
-		this.markProjectModified(field);
+		if (this.activeProfile) {
+			this.updateProfileSettings(projectSettings, this.activeProfile, update);
+			this.markProjectModified("profiles", this.activeProfile);
+		} else {
+			update(projectSettings);
+			this.markProjectModified(field);
+		}
 		this.saveProjectSettings(projectSettings);
 	}
 
@@ -1050,9 +1073,9 @@ export class SettingsManager {
 	}
 
 	setPackages(packages: PackageSource[]): void {
-		this.globalSettings.packages = packages;
-		this.markModified("packages");
-		this.save();
+		this.updateGlobalSettings("packages", (settings) => {
+			settings.packages = packages;
+		});
 	}
 
 	setProjectPackages(packages: PackageSource[]): void {
@@ -1066,9 +1089,9 @@ export class SettingsManager {
 	}
 
 	setExtensionPaths(paths: string[]): void {
-		this.globalSettings.extensions = paths;
-		this.markModified("extensions");
-		this.save();
+		this.updateGlobalSettings("extensions", (settings) => {
+			settings.extensions = paths;
+		});
 	}
 
 	setProjectExtensionPaths(paths: string[]): void {
@@ -1082,9 +1105,9 @@ export class SettingsManager {
 	}
 
 	setSkillPaths(paths: string[]): void {
-		this.globalSettings.skills = paths;
-		this.markModified("skills");
-		this.save();
+		this.updateGlobalSettings("skills", (settings) => {
+			settings.skills = paths;
+		});
 	}
 
 	setProjectSkillPaths(paths: string[]): void {
@@ -1098,9 +1121,9 @@ export class SettingsManager {
 	}
 
 	setPromptTemplatePaths(paths: string[]): void {
-		this.globalSettings.prompts = paths;
-		this.markModified("prompts");
-		this.save();
+		this.updateGlobalSettings("prompts", (settings) => {
+			settings.prompts = paths;
+		});
 	}
 
 	setProjectPromptTemplatePaths(paths: string[]): void {
@@ -1114,9 +1137,9 @@ export class SettingsManager {
 	}
 
 	setThemePaths(paths: string[]): void {
-		this.globalSettings.themes = paths;
-		this.markModified("themes");
-		this.save();
+		this.updateGlobalSettings("themes", (settings) => {
+			settings.themes = paths;
+		});
 	}
 
 	setProjectThemePaths(paths: string[]): void {

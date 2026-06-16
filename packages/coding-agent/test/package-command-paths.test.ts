@@ -223,6 +223,40 @@ describe("package commands", () => {
 		}
 	});
 
+	it("removes packages from the active global profile", async () => {
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify(
+				{
+					profiles: {
+						work: { packages: [packageDir] },
+					},
+				},
+				null,
+				2,
+			),
+		);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(main(["remove", packageDir, "--profile", "work"])).resolves.toBeUndefined();
+
+			const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")) as {
+				packages?: string[];
+				profiles?: Record<string, { packages?: string[] }>;
+			};
+			expect(settings.packages).toBeUndefined();
+			expect(settings.profiles?.work?.packages).toEqual([]);
+			expect(logSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain(`Removed ${packageDir}`);
+			expect(errorSpy).not.toHaveBeenCalled();
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
 	it.each([
 		{ name: "VOLT_PROFILE", args: ["update", "--extensions"], envProfile: "work" },
 		{ name: "trailing --profile", args: ["update", "--extensions", "--profile", "work"] },
@@ -432,6 +466,60 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 			expect(recordedArgs).toContain(globalPrefix);
 			expect(recordedArgs).toContain(PACKAGE_NAME);
 			expect(recordedArgs).not.toContain(projectPrefix);
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("uses profile npmCommand for forced self updates", async () => {
+		const selfUpdatePrefix = join(tempDir, "self-update-prefix");
+		const selfPackageDir = join(selfUpdatePrefix, "lib", "node_modules", "@mariozechner", "volt-coding-agent");
+		const fakeGlobalNpmPath = join(tempDir, "fake-global-npm.cjs");
+		const fakeProfileNpmPath = join(tempDir, "fake-profile-npm.cjs");
+		const recordPath = join(tempDir, "profile-self-update.json");
+		mkdirSync(selfPackageDir, { recursive: true });
+		const fakeNpmScript = (label: string) =>
+			`const fs=require("node:fs"),path=require("node:path"),args=process.argv.slice(2),prefix=args[args.indexOf("--prefix")+1];
+if(args.includes("root")) console.log(path.join(prefix,"lib","node_modules"));
+else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify({label:${JSON.stringify(label)},args}));
+`;
+		writeFileSync(fakeGlobalNpmPath, fakeNpmScript("global"));
+		writeFileSync(fakeProfileNpmPath, fakeNpmScript("profile"));
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify(
+				{
+					npmCommand: [originalExecPath, fakeGlobalNpmPath, "--prefix", selfUpdatePrefix],
+					profiles: {
+						work: { npmCommand: [originalExecPath, fakeProfileNpmPath, "--prefix", selfUpdatePrefix] },
+					},
+				},
+				null,
+				2,
+			),
+		);
+		process.env.VOLT_PACKAGE_DIR = selfPackageDir;
+		process.env.VOLT_LATEST_VERSION_URL = "https://updates.example/latest-version";
+		Object.defineProperty(process, "execPath", {
+			value: join(selfPackageDir, "dist", "cli.js"),
+			configurable: true,
+		});
+		const fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(main(["update", "--self", "--force", "--profile", "work"])).resolves.toBeUndefined();
+
+			expect(process.exitCode).toBeUndefined();
+			expect(errorSpy).not.toHaveBeenCalled();
+			expect(fetchMock).not.toHaveBeenCalled();
+			const recorded = JSON.parse(readFileSync(recordPath, "utf-8")) as { label?: string; args?: string[] };
+			expect(recorded.label).toBe("profile");
+			expect(recorded.args).toContain(PACKAGE_NAME);
 		} finally {
 			logSpy.mockRestore();
 			errorSpy.mockRestore();
