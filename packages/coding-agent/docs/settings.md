@@ -23,7 +23,7 @@ Use `/trust` in interactive mode to save a project trust decision for future ses
 
 ## Profiles
 
-Profiles are named settings overlays for switching workflows. Select one at startup with `--profile <name>`, set `VOLT_PROFILE`, or set `defaultProfile` in settings. In interactive mode, use `/profile` to show the active profile, switch to another profile, or create an empty global profile and switch to it. Profiles can override normal settings such as packages, extensions, skills, prompts, themes, model defaults, model cycling, thinking level, and UI preferences.
+Profiles are named settings overlays for switching workflows. Select one at startup with `--profile <name>`, set `VOLT_PROFILE`, or set `defaultProfile` in settings. In interactive mode, use `/profile` to show the active profile, switch to another profile, or create an empty global profile and switch to it. When interactive mode exits, Volt remembers the active profile by saving it as `defaultProfile`. Profiles can override normal settings such as packages, extensions, skills, prompts, themes, model defaults, model cycling, thinking level, and UI preferences.
 
 Global and project profiles follow the normal settings precedence and trust model: global settings load first, the selected global profile overlays them, trusted project settings overlay that, and the selected trusted project profile overlays last. Without project trust, project profiles are ignored. Switching profiles with `/profile` reloads the current session's settings-backed resources so profile resource changes apply without restarting.
 
@@ -53,7 +53,7 @@ Profiles do not isolate auth or sessions yet. `sessionDir` and reserved profile 
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `defaultProfile` | string | - | Profile to apply when `--profile` and `VOLT_PROFILE` are not set |
+| `defaultProfile` | string | - | Profile to apply when `--profile` and `VOLT_PROFILE` are not set; updated to the active profile when interactive mode exits |
 | `profiles` | object | `{}` | Named settings overlays keyed by profile name |
 
 ### Model & Thinking

@@ -3442,6 +3442,11 @@ export class InteractiveMode {
 		this.isShuttingDown = true;
 		this.unregisterSignalHandlers();
 
+		const rememberActiveProfile = async () => {
+			this.settingsManager.rememberActiveProfile();
+			await this.settingsManager.flush();
+		};
+
 		if (options?.fromSignal) {
 			// Signal-triggered shutdown (SIGTERM/SIGHUP). Emit extension cleanup
 			// (session_shutdown) BEFORE touching the terminal. Extension teardown
@@ -3451,6 +3456,7 @@ export class InteractiveMode {
 			// which the stdout/stderr error handler turns into emergencyTerminalExit;
 			// the render loop is already idle, so this cannot hot-spin (see #4144).
 			await this.runtimeHost.dispose();
+			await rememberActiveProfile();
 			await this.ui.terminal.drainInput(1000);
 			this.stop();
 			process.exit(0);
@@ -3465,6 +3471,7 @@ export class InteractiveMode {
 
 		this.stop();
 		await this.runtimeHost.dispose();
+		await rememberActiveProfile();
 
 		const resumeCommand = formatResumeCommand(this.sessionManager);
 		if (resumeCommand) {

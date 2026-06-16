@@ -23,6 +23,7 @@
 
 ### Fixed
 
+- Fixed interactive mode to remember the last active settings profile on quit.
 - Fixed store package installs leaking verbose git and npm subprocess output into the interactive screen.
 - Fixed the default store catalog URL to point at the deployed GitHub Pages catalog.
 - Fixed store removal for project-local packages whose saved paths are relative to the project settings directory.

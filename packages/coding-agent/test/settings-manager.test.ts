@@ -269,6 +269,57 @@ describe("SettingsManager", () => {
 			expect(manager.getTheme()).toBe("light");
 		});
 
+		it("should remember the active profile as the global defaultProfile", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					defaultProfile: "work",
+					profiles: {
+						dev: { theme: "dark" },
+						work: { theme: "light" },
+					},
+					shellPath: "/bin/zsh",
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setActiveProfile("dev");
+			manager.rememberActiveProfile();
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.defaultProfile).toBe("dev");
+			expect(savedSettings.profiles).toEqual({ dev: { theme: "dark" }, work: { theme: "light" } });
+			expect(savedSettings.shellPath).toBe("/bin/zsh");
+
+			const reloadedManager = SettingsManager.create(projectDir, agentDir);
+			expect(reloadedManager.getActiveProfile()).toBe("dev");
+			expect(reloadedManager.getTheme()).toBe("dark");
+		});
+
+		it("should not create settings when there is no active profile to remember", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			manager.rememberActiveProfile();
+			await manager.flush();
+
+			expect(existsSync(settingsPath)).toBe(false);
+		});
+
+		it("should not remember an undefined selected profile", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ profiles: { work: { theme: "light" } } }));
+			const manager = SettingsManager.create(projectDir, agentDir, { profile: "missing" });
+
+			manager.rememberActiveProfile();
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.defaultProfile).toBeUndefined();
+		});
+
 		it("should persist active profile setting updates into the profile overlay", async () => {
 			const settingsPath = join(agentDir, "settings.json");
 			writeFileSync(

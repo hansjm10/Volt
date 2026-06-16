@@ -649,6 +649,18 @@ export class SettingsManager {
 		this.mergeEffectiveSettings();
 	}
 
+	rememberActiveProfile(): void {
+		if (!this.activeProfile || !this.hasProfile(this.activeProfile)) {
+			return;
+		}
+		if (normalizeProfileName(this.globalSettings.defaultProfile) === this.activeProfile) {
+			return;
+		}
+		this.globalSettings.defaultProfile = this.activeProfile;
+		this.markModified("defaultProfile");
+		this.save();
+	}
+
 	isProjectTrusted(): boolean {
 		return this.projectTrusted;
 	}
