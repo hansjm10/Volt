@@ -185,6 +185,41 @@ function normalizeProfileName(profile: string | undefined): string | undefined {
 	return trimmed ? trimmed : undefined;
 }
 
+function isSettingsRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function defineOwnEnumerableProperty(target: Record<string, unknown>, key: string, value: unknown): void {
+	Object.defineProperty(target, key, {
+		value,
+		enumerable: true,
+		configurable: true,
+		writable: true,
+	});
+}
+
+function getOwnProfileSettings(settings: Settings, profileName: string): ProfileSettings | undefined {
+	const profiles = settings.profiles;
+	if (!isSettingsRecord(profiles) || !Object.hasOwn(profiles, profileName)) {
+		return undefined;
+	}
+
+	const profile = profiles[profileName];
+	return isSettingsRecord(profile) ? (profile as ProfileSettings) : undefined;
+}
+
+function cloneProfiles(profiles: Settings["profiles"]): Record<string, ProfileSettings> {
+	const cloned: Record<string, ProfileSettings> = {};
+	if (!isSettingsRecord(profiles)) {
+		return cloned;
+	}
+
+	for (const [profileName, profile] of Object.entries(profiles)) {
+		defineOwnEnumerableProperty(cloned, profileName, profile);
+	}
+	return cloned;
+}
+
 function sanitizeProfileSettings(profile: ProfileSettings | undefined): Settings {
 	if (!profile) {
 		return {};
@@ -329,8 +364,10 @@ export class SettingsManager {
 	private projectTrusted: boolean;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
+	private modifiedProfileFields = new Map<string, Set<keyof Settings>>(); // Track global profile field modifications
 	private modifiedProjectFields = new Set<keyof Settings>(); // Track project fields modified during session
 	private modifiedProjectNestedFields = new Map<keyof Settings, Set<string>>(); // Track project nested field modifications
+	private modifiedProjectProfileFields = new Map<string, Set<keyof Settings>>(); // Track project profile field modifications
 	private globalSettingsLoadError: Error | null = null; // Track if global settings file had parse errors
 	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
 	private writeQueue: Promise<void> = Promise.resolve();
@@ -362,14 +399,17 @@ export class SettingsManager {
 		if (!profileName) {
 			return settings;
 		}
-		return deepMergeSettings(settings, sanitizeProfileSettings(settings.profiles?.[profileName]));
+		return deepMergeSettings(settings, sanitizeProfileSettings(getOwnProfileSettings(settings, profileName)));
 	}
 
 	private reportMissingProfile(profileName: string): void {
 		if (!this.projectTrusted || this.reportedMissingProfiles.has(profileName)) {
 			return;
 		}
-		if (this.globalSettings.profiles?.[profileName] || this.projectSettings.profiles?.[profileName]) {
+		if (
+			getOwnProfileSettings(this.globalSettings, profileName) ||
+			getOwnProfileSettings(this.projectSettings, profileName)
+		) {
 			return;
 		}
 		this.reportedMissingProfiles.add(profileName);
@@ -567,6 +607,7 @@ export class SettingsManager {
 		this.projectTrusted = trusted;
 		this.modifiedProjectFields.clear();
 		this.modifiedProjectNestedFields.clear();
+		this.modifiedProjectProfileFields.clear();
 
 		if (!trusted) {
 			this.projectSettings = {};
@@ -597,8 +638,10 @@ export class SettingsManager {
 
 		this.modifiedFields.clear();
 		this.modifiedNestedFields.clear();
+		this.modifiedProfileFields.clear();
 		this.modifiedProjectFields.clear();
 		this.modifiedProjectNestedFields.clear();
+		this.modifiedProjectProfileFields.clear();
 
 		const projectLoad = SettingsManager.tryLoadFromStorage(this.storage, "project", this.projectTrusted);
 		if (!projectLoad.error) {
@@ -640,6 +683,22 @@ export class SettingsManager {
 		}
 	}
 
+	private markProfileModified(profileName: string, field: keyof Settings): void {
+		this.modifiedFields.add("profiles");
+		if (!this.modifiedProfileFields.has(profileName)) {
+			this.modifiedProfileFields.set(profileName, new Set());
+		}
+		this.modifiedProfileFields.get(profileName)!.add(field);
+	}
+
+	private markProjectProfileModified(profileName: string, field: keyof Settings): void {
+		this.modifiedProjectFields.add("profiles");
+		if (!this.modifiedProjectProfileFields.has(profileName)) {
+			this.modifiedProjectProfileFields.set(profileName, new Set());
+		}
+		this.modifiedProjectProfileFields.get(profileName)!.add(field);
+	}
+
 	private assertProjectTrustedForWrite(): void {
 		if (!this.projectTrusted) {
 			throw new Error("Project is not trusted; refusing to write project settings");
@@ -655,11 +714,13 @@ export class SettingsManager {
 		if (scope === "global") {
 			this.modifiedFields.clear();
 			this.modifiedNestedFields.clear();
+			this.modifiedProfileFields.clear();
 			return;
 		}
 
 		this.modifiedProjectFields.clear();
 		this.modifiedProjectNestedFields.clear();
+		this.modifiedProjectProfileFields.clear();
 	}
 
 	private enqueueWrite(scope: SettingsScope, task: () => void): void {
@@ -684,11 +745,20 @@ export class SettingsManager {
 		return snapshot;
 	}
 
+	private cloneModifiedProfileFields(source: Map<string, Set<keyof Settings>>): Map<string, Set<keyof Settings>> {
+		const snapshot = new Map<string, Set<keyof Settings>>();
+		for (const [profileName, fields] of source.entries()) {
+			snapshot.set(profileName, new Set(fields));
+		}
+		return snapshot;
+	}
+
 	private persistScopedSettings(
 		scope: SettingsScope,
 		snapshotSettings: Settings,
 		modifiedFields: Set<keyof Settings>,
 		modifiedNestedFields: Map<keyof Settings, Set<string>>,
+		modifiedProfileFields: Map<string, Set<keyof Settings>>,
 	): void {
 		this.storage.withLock(scope, (current) => {
 			const currentFileSettings = current
@@ -697,13 +767,42 @@ export class SettingsManager {
 			const mergedSettings: Settings = { ...currentFileSettings };
 			for (const field of modifiedFields) {
 				const value = snapshotSettings[field];
-				if (modifiedNestedFields.has(field) && typeof value === "object" && value !== null) {
+				if (field === "profiles" && modifiedProfileFields.size > 0) {
+					const currentProfiles = isSettingsRecord(currentFileSettings.profiles)
+						? currentFileSettings.profiles
+						: {};
+					const snapshotProfiles = isSettingsRecord(snapshotSettings.profiles) ? snapshotSettings.profiles : {};
+					const mergedProfiles: Record<string, unknown> = {};
+					for (const [profileName, profile] of Object.entries(currentProfiles)) {
+						defineOwnEnumerableProperty(mergedProfiles, profileName, profile);
+					}
+
+					for (const [profileName, profileFields] of modifiedProfileFields.entries()) {
+						const currentProfile: Record<string, unknown> =
+							Object.hasOwn(currentProfiles, profileName) && isSettingsRecord(currentProfiles[profileName])
+								? currentProfiles[profileName]
+								: {};
+						const snapshotProfile: Record<string, unknown> =
+							Object.hasOwn(snapshotProfiles, profileName) && isSettingsRecord(snapshotProfiles[profileName])
+								? snapshotProfiles[profileName]
+								: {};
+						const mergedProfile: Record<string, unknown> = {};
+						for (const [profileField, profileValue] of Object.entries(currentProfile)) {
+							defineOwnEnumerableProperty(mergedProfile, profileField, profileValue);
+						}
+						for (const profileField of profileFields) {
+							defineOwnEnumerableProperty(mergedProfile, profileField, snapshotProfile[profileField]);
+						}
+						defineOwnEnumerableProperty(mergedProfiles, profileName, mergedProfile);
+					}
+
+					mergedSettings.profiles = mergedProfiles as Record<string, ProfileSettings>;
+				} else if (modifiedNestedFields.has(field) && isSettingsRecord(value)) {
 					const nestedModified = modifiedNestedFields.get(field)!;
-					const baseNested = (currentFileSettings[field] as Record<string, unknown>) ?? {};
-					const inMemoryNested = value as Record<string, unknown>;
-					const mergedNested = { ...baseNested };
+					const baseNested = isSettingsRecord(currentFileSettings[field]) ? currentFileSettings[field] : {};
+					const mergedNested: Record<string, unknown> = { ...baseNested };
 					for (const nestedKey of nestedModified) {
-						mergedNested[nestedKey] = inMemoryNested[nestedKey];
+						mergedNested[nestedKey] = value[nestedKey];
 					}
 					(mergedSettings as Record<string, unknown>)[field] = mergedNested;
 				} else {
@@ -725,9 +824,16 @@ export class SettingsManager {
 		const snapshotGlobalSettings = structuredClone(this.globalSettings);
 		const modifiedFields = new Set(this.modifiedFields);
 		const modifiedNestedFields = this.cloneModifiedNestedFields(this.modifiedNestedFields);
+		const modifiedProfileFields = this.cloneModifiedProfileFields(this.modifiedProfileFields);
 
 		this.enqueueWrite("global", () => {
-			this.persistScopedSettings("global", snapshotGlobalSettings, modifiedFields, modifiedNestedFields);
+			this.persistScopedSettings(
+				"global",
+				snapshotGlobalSettings,
+				modifiedFields,
+				modifiedNestedFields,
+				modifiedProfileFields,
+			);
 		});
 	}
 
@@ -743,22 +849,29 @@ export class SettingsManager {
 		const snapshotProjectSettings = structuredClone(this.projectSettings);
 		const modifiedFields = new Set(this.modifiedProjectFields);
 		const modifiedNestedFields = this.cloneModifiedNestedFields(this.modifiedProjectNestedFields);
+		const modifiedProfileFields = this.cloneModifiedProfileFields(this.modifiedProjectProfileFields);
 		this.enqueueWrite("project", () => {
-			this.persistScopedSettings("project", snapshotProjectSettings, modifiedFields, modifiedNestedFields);
+			this.persistScopedSettings(
+				"project",
+				snapshotProjectSettings,
+				modifiedFields,
+				modifiedNestedFields,
+				modifiedProfileFields,
+			);
 		});
 	}
 
 	private updateProfileSettings(settings: Settings, profileName: string, update: (settings: Settings) => void): void {
-		settings.profiles = { ...(settings.profiles ?? {}) };
-		const profileSettings = structuredClone(settings.profiles[profileName] ?? {}) as Settings;
+		settings.profiles = cloneProfiles(settings.profiles);
+		const profileSettings = structuredClone(getOwnProfileSettings(settings, profileName) ?? {}) as Settings;
 		update(profileSettings);
-		settings.profiles[profileName] = profileSettings as ProfileSettings;
+		defineOwnEnumerableProperty(settings.profiles, profileName, profileSettings);
 	}
 
 	private updateGlobalSettings(field: keyof Settings, update: (settings: Settings) => void): void {
 		if (this.activeProfile) {
 			this.updateProfileSettings(this.globalSettings, this.activeProfile, update);
-			this.markModified("profiles", this.activeProfile);
+			this.markProfileModified(this.activeProfile, field);
 		} else {
 			update(this.globalSettings);
 			this.markModified(field);
@@ -771,7 +884,7 @@ export class SettingsManager {
 		const projectSettings = structuredClone(this.projectSettings);
 		if (this.activeProfile) {
 			this.updateProfileSettings(projectSettings, this.activeProfile, update);
-			this.markProjectModified("profiles", this.activeProfile);
+			this.markProjectProfileModified(this.activeProfile, field);
 		} else {
 			update(projectSettings);
 			this.markProjectModified(field);

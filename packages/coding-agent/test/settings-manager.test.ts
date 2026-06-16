@@ -109,6 +109,61 @@ describe("SettingsManager", () => {
 			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
 			expect(savedSettings.defaultThinkingLevel).toBe("high");
 		});
+
+		it("should preserve externally added fields in an active profile", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					defaultProfile: "work",
+					profiles: {
+						work: {
+							packages: ["npm:before"],
+						},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			const currentSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			currentSettings.profiles.work.defaultModel = "claude-sonnet";
+			writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2));
+
+			manager.setPackages(["npm:after"]);
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.profiles.work.defaultModel).toBe("claude-sonnet");
+			expect(savedSettings.profiles.work.packages).toEqual(["npm:after"]);
+		});
+
+		it("should preserve externally added fields in an active project profile", async () => {
+			const settingsPath = join(projectDir, ".volt", "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					profiles: {
+						work: {
+							packages: ["npm:before"],
+						},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir, { profile: "work" });
+
+			const currentSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			currentSettings.profiles.work.defaultModel = "claude-sonnet";
+			writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2));
+
+			manager.setProjectPackages(["npm:after"]);
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.profiles.work.defaultModel).toBe("claude-sonnet");
+			expect(savedSettings.profiles.work.packages).toEqual(["npm:after"]);
+		});
 	});
 
 	describe("packages migration", () => {
@@ -270,6 +325,26 @@ describe("SettingsManager", () => {
 			const manager = SettingsManager.create(projectDir, agentDir, { profile: "work" });
 
 			expect(manager.getSessionDir()).toBe("/base/sessions");
+		});
+
+		it("should not use inherited object properties as selected profiles", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					defaultProfile: "toString",
+					profiles: {},
+					theme: "dark",
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const errors = manager.drainErrors();
+
+			expect(manager.getActiveProfile()).toBe("toString");
+			expect(manager.getTheme()).toBe("dark");
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.scope).toBe("global");
+			expect(errors[0]?.error.message).toBe('Profile "toString" was selected but is not defined');
 		});
 	});
 
