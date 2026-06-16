@@ -149,35 +149,29 @@ export interface Settings {
 	lsp?: LspSettings; // LSP diagnostics after edit/write (see docs/lsp.md)
 }
 
-/** Deep merge settings: project/overrides take precedence, nested objects merge recursively */
-function deepMergeSettings(base: Settings, overrides: Settings): Settings {
-	const result: Settings = { ...base };
+/** Deep merge records: overrides take precedence, nested objects merge recursively, arrays replace. */
+function deepMergeRecord(base: Record<string, unknown>, overrides: Record<string, unknown>): Record<string, unknown> {
+	const result: Record<string, unknown> = { ...base };
 
-	for (const key of Object.keys(overrides) as (keyof Settings)[]) {
-		const overrideValue = overrides[key];
-		const baseValue = base[key];
-
+	for (const [key, overrideValue] of Object.entries(overrides)) {
 		if (overrideValue === undefined) {
 			continue;
 		}
 
-		// For nested objects, merge recursively
-		if (
-			typeof overrideValue === "object" &&
-			overrideValue !== null &&
-			!Array.isArray(overrideValue) &&
-			typeof baseValue === "object" &&
-			baseValue !== null &&
-			!Array.isArray(baseValue)
-		) {
-			(result as Record<string, unknown>)[key] = { ...baseValue, ...overrideValue };
+		const baseValue = base[key];
+		if (isSettingsRecord(baseValue) && isSettingsRecord(overrideValue)) {
+			result[key] = deepMergeRecord(baseValue, overrideValue);
 		} else {
-			// For primitives and arrays, override value wins
-			(result as Record<string, unknown>)[key] = overrideValue;
+			result[key] = overrideValue;
 		}
 	}
 
 	return result;
+}
+
+/** Deep merge settings: project/overrides take precedence, nested objects merge recursively. */
+function deepMergeSettings(base: Settings, overrides: Settings): Settings {
+	return deepMergeRecord(base as Record<string, unknown>, overrides as Record<string, unknown>) as Settings;
 }
 
 function normalizeProfileName(profile: string | undefined): string | undefined {

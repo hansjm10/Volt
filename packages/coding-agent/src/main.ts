@@ -824,6 +824,7 @@ export async function main(args: string[], options?: MainOptions) {
 		const interactiveMode = new InteractiveMode(runtime, {
 			migratedProviders,
 			modelFallbackMessage,
+			modelScopePatterns: parsed.models,
 			autoTrustOnReloadCwd,
 			initialMessage,
 			initialImages,

@@ -285,6 +285,8 @@ export interface InteractiveModeOptions {
 	migratedProviders?: string[];
 	/** Warning message if session model couldn't be restored */
 	modelFallbackMessage?: string;
+	/** Explicit model scope patterns from CLI, preserved across profile switches. */
+	modelScopePatterns?: string[];
 	/** Cwd to trust after reload if it gained a .volt directory during this implicitly trusted session. */
 	autoTrustOnReloadCwd?: string;
 	/** Initial message to send on startup (can include @file content) */
@@ -4867,7 +4869,7 @@ export class InteractiveMode {
 	}
 
 	private async applyScopedModelsFromSettings(): Promise<void> {
-		const patterns = this.settingsManager.getEnabledModels();
+		const patterns = this.options.modelScopePatterns ?? this.settingsManager.getEnabledModels();
 		if (patterns && patterns.length > 0) {
 			const scopedModels = await resolveModelScope(patterns, this.session.modelRegistry);
 			this.session.setScopedModels(

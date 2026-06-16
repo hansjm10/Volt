@@ -318,6 +318,38 @@ describe("SettingsManager", () => {
 			expect(savedSettings.terminal).toBeUndefined();
 		});
 
+		it("should recursively merge partial nested profile overlays", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					retry: {
+						provider: {
+							timeoutMs: 1000,
+							maxRetries: 2,
+							maxRetryDelayMs: 3000,
+						},
+					},
+					profiles: {
+						work: {
+							retry: {
+								provider: {
+									timeoutMs: 5000,
+								},
+							},
+						},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir, { profile: "work" });
+
+			expect(manager.getProviderRetrySettings()).toEqual({
+				timeoutMs: 5000,
+				maxRetries: 2,
+				maxRetryDelayMs: 3000,
+			});
+		});
+
 		it("should let explicit profile override defaultProfile", () => {
 			writeFileSync(
 				join(agentDir, "settings.json"),
