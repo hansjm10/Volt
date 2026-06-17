@@ -24,6 +24,8 @@ import {
 const { Endpoint, EndpointTicket, RelayMode, presetMinimal, presetN0 } = iroh;
 const DEFAULT_ALLOW_TOOLS = "read,grep,find,ls";
 const DEFAULT_STATE_PATH = resolve(homedir(), ".volt", "agent", "remote", "iroh-sidecar-host.json");
+const HANDSHAKE_MAX_LINE_BYTES = 16 * 1024;
+const HANDSHAKE_TIMEOUT_MS = 15_000;
 const PAIRING_TICKET_TTL_MS = 10 * 60 * 1000;
 
 function printUsage() {
@@ -340,6 +342,20 @@ async function waitForConnectionClose(connection) {
 	]);
 }
 
+async function withTimeout(promise, timeoutMs, message) {
+	let timeoutId;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise((_, reject) => {
+				timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+			}),
+		]);
+	} finally {
+		clearTimeout(timeoutId);
+	}
+}
+
 function isExpectedDoneClose(error) {
 	const message = error instanceof Error ? error.message : String(error);
 	return (
@@ -364,11 +380,6 @@ async function authorizeClient({ hello, options, remoteId, state }) {
 	state.workspaces = latestState.workspaces ?? [];
 	state.clients = latestState.clients ?? [];
 
-	const workspace = state.workspaces.find((entry) => entry.name === hello.workspace);
-	if (!workspace) {
-		return { error: `workspace not allowed: ${hello.workspace}` };
-	}
-
 	const now = Date.now();
 	const existingClient = findClient(state, remoteId);
 	const hasPairingSecret = Boolean(options.pairingSecret && hello.secret === options.pairingSecret);
@@ -379,6 +390,17 @@ async function authorizeClient({ hello, options, remoteId, state }) {
 		options.pairingExpiresAt = undefined;
 		return { error: "pairing ticket has expired" };
 	}
+
+	const requestedWorkspace = typeof hello.workspace === "string" ? hello.workspace : undefined;
+	if (requestedWorkspace !== options.workspace.name) {
+		return { error: `workspace not allowed: ${requestedWorkspace ?? "<missing>"}` };
+	}
+
+	const workspace = state.workspaces.find((entry) => entry.name === requestedWorkspace);
+	if (!workspace) {
+		return { error: `workspace not allowed: ${requestedWorkspace}` };
+	}
+
 	if (!existingClient && !hasPairingSecret) {
 		return { error: "client is not paired" };
 	}
@@ -421,8 +443,12 @@ async function handleConnection(incoming, options, state) {
 
 	let child;
 	try {
-		const stream = await connection.acceptBi();
-		const handshake = await readLineFromIroh(stream.recv);
+		const stream = await withTimeout(connection.acceptBi(), HANDSHAKE_TIMEOUT_MS, "handshake timed out");
+		const handshake = await withTimeout(
+			readLineFromIroh(stream.recv, Buffer.alloc(0), { maxLineBytes: HANDSHAKE_MAX_LINE_BYTES }),
+			HANDSHAKE_TIMEOUT_MS,
+			"handshake timed out",
+		);
 		if (handshake.line === undefined) {
 			await sendHandshakeError(stream, "missing handshake");
 			return;

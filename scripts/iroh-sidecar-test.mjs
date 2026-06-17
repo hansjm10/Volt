@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ALPN_TEXT, encodeTicketPayload } from "../packages/coding-agent/examples/remote/iroh-sidecar/common.mjs";
+import { ALPN_TEXT, decodeTicketPayload, encodeTicketPayload } from "../packages/coding-agent/examples/remote/iroh-sidecar/common.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -267,6 +267,42 @@ async function pairingAndRevocationScenario() {
 	});
 }
 
+async function pairingTicketWorkspaceBindingScenario() {
+	await withStateDir("workspace-binding", async ({ clientStatePath, hostStatePath, stateDir }) => {
+		await writeFile(
+			hostStatePath,
+			`${JSON.stringify(
+				{
+					workspaces: [{ name: "private", path: stateDir, allowedTools: "bash" }],
+					clients: [],
+				},
+				null,
+				2,
+			)}\n`,
+		);
+
+		const host = startHost(["--state", hostStatePath, "--workspace", `safe=${stateDir}`, "--once"]);
+		try {
+			const ticket = await waitForFirstStdoutLine(host.child, host.output, "workspace-bound ticket host");
+			const tamperedPayload = decodeTicketPayload(ticket);
+			tamperedPayload.workspace = "private";
+			const tamperedTicket = encodeTicketPayload(tamperedPayload);
+			const clientOutput = await runClient(tamperedTicket, clientStatePath, ["--message", "private"], {
+				expectSuccess: false,
+				label: "workspace-bound ticket client",
+			});
+			await waitForExit(host.child, "workspace-bound ticket host", host.output);
+			assert(clientOutput.exit.code !== 0, "Workspace-bound ticket client unexpectedly succeeded");
+			assert(
+				clientOutput.stderr.includes("workspace not allowed: private"),
+				`Expected workspace-bound ticket rejection, got:\n${clientOutput.stderr}`,
+			);
+		} finally {
+			await stopProcess(host.child);
+		}
+	});
+}
+
 async function expiredTicketScenario() {
 	await withStateDir("expired", async ({ clientStatePath }) => {
 		const ticket = encodeTicketPayload({
@@ -305,6 +341,7 @@ const scenarios = [
 	["prompt round trip", promptRoundTripScenario],
 	["get_state", getStateScenario],
 	["pairing and revocation", pairingAndRevocationScenario],
+	["pairing ticket workspace binding", pairingTicketWorkspaceBindingScenario],
 	["expired ticket", expiredTicketScenario],
 	["missing workspace preflight", missingWorkspaceScenario],
 ];

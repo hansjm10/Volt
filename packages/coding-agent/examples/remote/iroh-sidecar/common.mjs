@@ -114,7 +114,9 @@ export async function writeIrohStream(send, chunk) {
 	await send.writeAll(Array.from(Buffer.from(chunk)));
 }
 
-export async function readLineFromIroh(recv, initial = Buffer.alloc(0)) {
+export async function readLineFromIroh(recv, initial = Buffer.alloc(0), options = {}) {
+	const maxLineBytes = options.maxLineBytes;
+	const readLimit = Math.min(DEFAULT_READ_LIMIT, maxLineBytes === undefined ? DEFAULT_READ_LIMIT : maxLineBytes + 1);
 	let buffer = Buffer.from(initial);
 
 	while (true) {
@@ -124,13 +126,20 @@ export async function readLineFromIroh(recv, initial = Buffer.alloc(0)) {
 			if (lineBuffer.length > 0 && lineBuffer[lineBuffer.length - 1] === 13) {
 				lineBuffer = lineBuffer.subarray(0, lineBuffer.length - 1);
 			}
+			if (maxLineBytes !== undefined && lineBuffer.length > maxLineBytes) {
+				throw new Error(`Line exceeds maximum size of ${maxLineBytes} bytes`);
+			}
 			return {
 				line: lineBuffer.toString("utf8"),
 				rest: buffer.subarray(newlineIndex + 1),
 			};
 		}
 
-		const chunk = await recv.read(DEFAULT_READ_LIMIT);
+		if (maxLineBytes !== undefined && buffer.length > maxLineBytes) {
+			throw new Error(`Line exceeds maximum size of ${maxLineBytes} bytes`);
+		}
+
+		const chunk = await recv.read(readLimit);
 		if (!chunk || chunk.length === 0) {
 			return { line: undefined, rest: buffer };
 		}
