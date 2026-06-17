@@ -53,6 +53,24 @@
 			"resources": [
 				"extensions"
 			]
+		},
+		{
+			"id": "review-loop",
+			"name": "Review Loop",
+			"description": "Runs isolated review/fix loops for a branch until findings are resolved.",
+			"source": "git:https://github.com/hansjm10/Volt@3eaa9ab870ef665c4633a448b6c12a0aaee41c28",
+			"repo": "https://github.com/hansjm10/Volt/tree/store/review-loop",
+			"author": "Volt",
+			"license": "MIT",
+			"verified": true,
+			"categories": [
+				"code-review",
+				"automation",
+				"developer-tools"
+			],
+			"resources": [
+				"extensions"
+			]
 		}
 	]
 }
