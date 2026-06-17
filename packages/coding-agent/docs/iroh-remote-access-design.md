@@ -38,7 +38,7 @@ Iroh v1 provides key-based dialing, encrypted QUIC connections, NAT traversal, l
 
 ## Current State
 
-RPC mode is bound to process stdin/stdout today:
+RPC mode defaults to process stdin/stdout:
 
 ```text
 client process
@@ -47,7 +47,7 @@ volt --mode rpc
   -> JSONL stdout
 ```
 
-This is enough for a sidecar bridge. Longer term, the RPC implementation can be refactored to accept an abstract duplex transport, but that is not required for the first proof of concept.
+The RPC implementation now accepts a core transport abstraction, so stdin/stdout is one adapter. This is still enough for a sidecar bridge while leaving room for in-process, remote, or native transports.
 
 ## Proposed Architecture
 
@@ -227,7 +227,7 @@ volt remote revoke <node-id>
 
 ### Phase 2: RPC transport extraction
 
-Refactor RPC internals so stdin/stdout is one adapter:
+Build on the core RPC transport abstraction so stdin/stdout remains one adapter:
 
 ```typescript
 interface RpcTransport {

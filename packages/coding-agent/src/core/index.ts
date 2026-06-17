@@ -75,4 +75,23 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export {
+	attachJsonlLineReader,
+	createJsonlRpcTransport,
+	createJsonlStreamRpcTransport,
+	type JsonlRpcTransportOptions,
+	type JsonlStreamRpcTransportOptions,
+	type RpcCloseHandler,
+	type RpcCommand,
+	type RpcCommandType,
+	type RpcExtensionUIRequest,
+	type RpcExtensionUIResponse,
+	type RpcLineHandler,
+	type RpcModel,
+	type RpcResponse,
+	type RpcSessionState,
+	type RpcSlashCommand,
+	type RpcTransport,
+	serializeJsonLine,
+} from "./rpc/index.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";

@@ -22,6 +22,7 @@
 - Added `/profile` for interactive profile inspection, switching, and creating empty global profiles.
 - Added `terminal.turnDoneAlert` and a `/settings` toggle to ring the terminal bell when Volt finishes a response.
 - Added an automated fake-RPC scenario runner for the Iroh sidecar PoC covering local prompt streaming, state retrieval, pairing, revocation, expired tickets, and workspace preflight failures.
+- Added a core RPC transport abstraction so RPC mode can run over adapters other than process stdin/stdout.
 
 ### Fixed
 

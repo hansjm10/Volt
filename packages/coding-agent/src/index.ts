@@ -187,6 +187,17 @@ export type {
 export { DefaultPackageManager } from "./core/package-manager.ts";
 export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.ts";
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
+export {
+	attachJsonlLineReader,
+	createJsonlRpcTransport,
+	createJsonlStreamRpcTransport,
+	type JsonlRpcTransportOptions,
+	type JsonlStreamRpcTransportOptions,
+	type RpcCloseHandler,
+	type RpcLineHandler,
+	type RpcTransport,
+	serializeJsonLine,
+} from "./core/rpc/index.ts";
 // SDK for programmatic usage
 export {
 	AgentSessionRuntime,
@@ -339,6 +350,7 @@ export {
 	type RpcEventListener,
 	type RpcExtensionUIRequest,
 	type RpcExtensionUIResponse,
+	type RpcModeOptions,
 	type RpcResponse,
 	type RpcSessionState,
 	runPrintMode,

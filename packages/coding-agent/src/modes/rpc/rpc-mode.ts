@@ -25,6 +25,7 @@ import {
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
 } from "../../core/output-guard.ts";
+import type { RpcTransport } from "../../core/rpc/transport.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
@@ -46,18 +47,78 @@ export type {
 	RpcSessionState,
 } from "./rpc-types.ts";
 
+export interface RpcModeOptions {
+	transport?: RpcTransport;
+}
+
+function createStdioRpcTransport(): RpcTransport {
+	return {
+		write(value) {
+			writeRawStdout(serializeJsonLine(value));
+		},
+		onLine(handler) {
+			return attachJsonlLineReader(process.stdin, handler);
+		},
+		onClose(handler) {
+			process.stdin.on("end", handler);
+			return () => {
+				process.stdin.off("end", handler);
+			};
+		},
+		waitForBackpressure: waitForRawStdoutBackpressure,
+		flush: flushRawStdout,
+		close() {
+			process.stdin.pause();
+		},
+	};
+}
+
 /**
  * Run in RPC mode.
- * Listens for JSON commands on stdin, outputs events and responses on stdout.
+ * Listens for JSON commands from the transport, outputs events and responses to it.
  */
-export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<never> {
-	takeOverStdout();
+export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcModeOptions = {}): Promise<never> {
+	if (!options.transport) {
+		takeOverStdout();
+	}
+	const transport = options.transport ?? createStdioRpcTransport();
+	const pendingWrites = new Set<Promise<void>>();
+	let hasPendingWriteError = false;
+	let pendingWriteError: unknown;
+	const trackTransportWrite = (result: void | Promise<void>): void => {
+		if (!result) {
+			return;
+		}
+		const tracked = Promise.resolve(result)
+			.catch((error: unknown) => {
+				if (!hasPendingWriteError) {
+					hasPendingWriteError = true;
+					pendingWriteError = error;
+				}
+			})
+			.finally(() => {
+				pendingWrites.delete(tracked);
+			});
+		pendingWrites.add(tracked);
+	};
+	const waitForTransportBackpressure = async (): Promise<void> => {
+		while (pendingWrites.size > 0) {
+			await Promise.all(pendingWrites);
+		}
+		if (hasPendingWriteError) {
+			const error = pendingWriteError;
+			hasPendingWriteError = false;
+			pendingWriteError = undefined;
+			throw error instanceof Error ? error : new Error(String(error));
+		}
+		await transport.waitForBackpressure?.();
+	};
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
 
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		writeRawStdout(serializeJsonLine(obj));
+		trackTransportWrite(transport.write(obj));
 	};
 
 	const success = <T extends RpcCommand["type"]>(
@@ -78,7 +139,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	// Pending extension UI requests waiting for response
 	const pendingExtensionRequests = new Map<
 		string,
-		{ resolve: (value: any) => void; reject: (error: Error) => void }
+		{ resolve: (response: RpcExtensionUIResponse) => void; reject: (error: Error) => void }
 	>();
 
 	// Shutdown request flag
@@ -355,7 +416,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			output(event);
 		});
 		unsubscribeBackpressure = session.agent.subscribe(async () => {
-			await waitForRawStdoutBackpressure();
+			await waitForTransportBackpressure();
 		});
 	};
 
@@ -677,6 +738,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	 * Called after handling each command when waiting for the next command.
 	 */
 	let detachInput = () => {};
+	let detachClose = () => {};
 
 	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
 		if (shuttingDown) {
@@ -690,10 +752,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		unsubscribeBackpressure?.();
 		await runtimeHost.dispose();
 		detachInput();
-		process.stdin.pause();
+		detachClose();
 		if (signal !== "SIGTERM") {
-			await flushRawStdout();
+			await waitForTransportBackpressure();
+			await transport.flush?.();
 		}
+		await transport.close();
 		process.exit(exitCode);
 	}
 
@@ -714,7 +778,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					`Failed to parse command: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
 				),
 			);
-			await waitForRawStdoutBackpressure();
+			await waitForTransportBackpressure();
 			return;
 		}
 
@@ -739,7 +803,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			const response = await handleCommand(command);
 			if (response) {
 				output(response);
-				await waitForRawStdoutBackpressure();
+				await waitForTransportBackpressure();
 			}
 			await checkShutdownRequested();
 		} catch (commandError: unknown) {
@@ -750,24 +814,17 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					commandError instanceof Error ? commandError.message : String(commandError),
 				),
 			);
-			await waitForRawStdoutBackpressure();
+			await waitForTransportBackpressure();
 		}
 	};
 
-	const onInputEnd = () => {
-		void shutdown();
-	};
-	process.stdin.on("end", onInputEnd);
-
-	detachInput = (() => {
-		const detachJsonl = attachJsonlLineReader(process.stdin, (line) => {
-			void handleInputLine(line);
-		});
-		return () => {
-			detachJsonl();
-			process.stdin.off("end", onInputEnd);
-		};
-	})();
+	detachInput = transport.onLine((line) => {
+		void handleInputLine(line);
+	});
+	detachClose =
+		transport.onClose?.(() => {
+			void shutdown();
+		}) ?? (() => {});
 
 	// Keep process alive forever
 	return new Promise(() => {});
