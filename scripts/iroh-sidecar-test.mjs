@@ -4,7 +4,19 @@ import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ALPN_TEXT, decodeTicketPayload, encodeTicketPayload } from "../packages/coding-agent/examples/remote/iroh-sidecar/common.mjs";
+import iroh from "../packages/coding-agent/examples/remote/iroh-sidecar/node_modules/@number0/iroh/index.js";
+import {
+	ALPN,
+	ALPN_TEXT,
+	decodeTicketPayload,
+	encodeTicketPayload,
+	readJsonlFromIroh,
+	readLineFromIroh,
+	serializeJsonLine,
+	toBytes,
+} from "../packages/coding-agent/examples/remote/iroh-sidecar/common.mjs";
+
+const { Endpoint, EndpointTicket, RelayMode, presetMinimal, presetN0 } = iroh;
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -137,6 +149,72 @@ async function runClient(ticket, clientStatePath, args, options = {}) {
 	return { ...client.output, exit };
 }
 
+async function bindRawClientEndpoint(relayMode) {
+	const builder = Endpoint.builder();
+	if (relayMode === "default") {
+		presetN0(builder);
+	} else {
+		presetMinimal(builder);
+		builder.relayMode(RelayMode.disabled());
+	}
+	const endpoint = await builder.bind();
+	if (relayMode === "default") await endpoint.online();
+	return endpoint;
+}
+
+async function runRawRpcClient(ticket, command, options = {}) {
+	const payload = decodeTicketPayload(ticket);
+	const endpoint = await bindRawClientEndpoint(payload.relayMode ?? "disabled");
+	let connection;
+	try {
+		const endpointTicket = EndpointTicket.fromString(payload.irohTicket);
+		connection = await endpoint.connect(endpointTicket.endpointAddr(), ALPN);
+		const stream = await connection.openBi();
+		await stream.send.writeAll(
+			toBytes(
+				serializeJsonLine({
+					type: "volt_iroh_hello",
+					protocol: ALPN_TEXT,
+					workspace: payload.workspace,
+					secret: payload.secret,
+					clientLabel: options.clientLabel ?? `raw-node-${process.pid}`,
+					clientNodeId: endpoint.id().toString(),
+				}),
+			),
+		);
+
+		const handshake = await readLineFromIroh(stream.recv);
+		if (handshake.line === undefined) throw new Error("Host closed before raw RPC handshake response");
+		const handshakeResponse = JSON.parse(handshake.line);
+		if (handshakeResponse.type !== "volt_iroh_handshake" || !handshakeResponse.success) {
+			throw new Error(handshakeResponse.error ?? "Raw RPC handshake rejected");
+		}
+
+		await stream.send.writeAll(toBytes(serializeJsonLine(command)));
+		if (options.finishSend) await stream.send.finish();
+
+		const lines = [];
+		let timeoutId;
+		try {
+			await Promise.race([
+				readJsonlFromIroh(stream.recv, (line) => lines.push(line), handshake.rest),
+				new Promise((_, reject) => {
+					timeoutId = setTimeout(
+						() => reject(new Error(`raw RPC client timed out after ${PROCESS_TIMEOUT_MS}ms`)),
+						PROCESS_TIMEOUT_MS,
+					);
+				}),
+			]);
+		} finally {
+			clearTimeout(timeoutId);
+		}
+		return lines;
+	} finally {
+		if (connection) connection.close(0n, Array.from(Buffer.from("done", "utf8")));
+		await endpoint.close();
+	}
+}
+
 async function withStateDir(name, callback) {
 	const stateDir = await mkdtemp(join(tmpdir(), `volt-iroh-sidecar-${name}-`));
 	try {
@@ -193,6 +271,54 @@ async function promptRoundTripScenario() {
 			clientOutput.stdout.includes(expected),
 			`Expected client output to contain ${JSON.stringify(expected)}, got:\n${clientOutput.stdout}`,
 		);
+	});
+}
+
+async function rawHalfClosePromptScenario() {
+	await withStateDir("raw-half-close", async ({ hostStatePath }) => {
+		const message = "half-close prompt";
+		const host = startHost(["--state", hostStatePath, "--once"]);
+		try {
+			const ticket = await waitForFirstStdoutLine(host.child, host.output, "raw half-close host");
+			const lines = await runRawRpcClient(
+				ticket,
+				{ id: "prompt-half-close", type: "prompt", message },
+				{ finishSend: true },
+			);
+			await waitForExit(host.child, "raw half-close host", host.output);
+			const expected = `fake RPC response over Iroh: ${message}`;
+			assert(
+				lines.join("\n").includes(expected),
+				`Expected raw half-close response to contain ${JSON.stringify(expected)}, got:\n${lines.join("\n")}`,
+			);
+		} finally {
+			await stopProcess(host.child);
+		}
+	});
+}
+
+async function rawCommandFilterScenario() {
+	await withStateDir("raw-filter", async ({ hostStatePath }) => {
+		const host = startHost(["--state", hostStatePath, "--once"]);
+		try {
+			const ticket = await waitForFirstStdoutLine(host.child, host.output, "raw command filter host");
+			const lines = await runRawRpcClient(
+				ticket,
+				{ id: "bash-1", type: "bash", command: "echo blocked" },
+				{ finishSend: true },
+			);
+			await waitForExit(host.child, "raw command filter host", host.output);
+			const responses = lines.map((line) => JSON.parse(line));
+			const response = responses.find((event) => event.id === "bash-1");
+			assert(response, `Expected host-side bash denial response, got:\n${lines.join("\n")}`);
+			assert(response.success === false, `Expected bash denial to fail, got:\n${JSON.stringify(response)}`);
+			assert(
+				response.error === "RPC command not allowed over remote sidecar: bash",
+				`Expected host-side bash denial, got:\n${JSON.stringify(response)}`,
+			);
+		} finally {
+			await stopProcess(host.child);
+		}
 	});
 }
 
@@ -339,6 +465,8 @@ async function missingWorkspaceScenario() {
 
 const scenarios = [
 	["prompt round trip", promptRoundTripScenario],
+	["raw half-close prompt", rawHalfClosePromptScenario],
+	["raw command filter", rawCommandFilterScenario],
 	["get_state", getStateScenario],
 	["pairing and revocation", pairingAndRevocationScenario],
 	["pairing ticket workspace binding", pairingTicketWorkspaceBindingScenario],

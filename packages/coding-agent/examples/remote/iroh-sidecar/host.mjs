@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import { access, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -14,11 +15,10 @@ import {
 	getFlag,
 	hasFlag,
 	parseFlags,
-	pipeIrohRecvToNodeWritable,
-	pipeNodeReadableToIrohSend,
 	readLineFromIroh,
 	serializeJsonLine,
 	toBytes,
+	writeNodeStream,
 } from "./common.mjs";
 
 const { Endpoint, EndpointTicket, RelayMode, presetMinimal, presetN0 } = iroh;
@@ -27,6 +27,14 @@ const DEFAULT_STATE_PATH = resolve(homedir(), ".volt", "agent", "remote", "iroh-
 const HANDSHAKE_MAX_LINE_BYTES = 16 * 1024;
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 const PAIRING_TICKET_TTL_MS = 10 * 60 * 1000;
+const REMOTE_RPC_PASSTHROUGH_TYPES = new Set([
+	"prompt",
+	"steer",
+	"follow_up",
+	"abort",
+	"get_state",
+	"extension_ui_response",
+]);
 
 function printUsage() {
 	console.error(`Usage: npm run host -- [serve] [options]
@@ -365,6 +373,109 @@ function isExpectedDoneClose(error) {
 	);
 }
 
+function createIrohSendQueue(send) {
+	let pendingWrite = Promise.resolve();
+	return {
+		write(chunk) {
+			if (chunk.length === 0) return pendingWrite;
+			const bytes = typeof chunk === "string" ? toBytes(chunk) : Array.from(Buffer.from(chunk));
+			pendingWrite = pendingWrite.then(() => send.writeAll(bytes));
+			return pendingWrite;
+		},
+		async finish() {
+			await pendingWrite;
+			await send.finish();
+		},
+	};
+}
+
+function createRpcErrorResponse(id, command, error) {
+	return serializeJsonLine({ id, type: "response", command, success: false, error });
+}
+
+function getRemoteRpcFilterResult(line) {
+	let parsed;
+	try {
+		parsed = JSON.parse(line);
+	} catch (error) {
+		return {
+			allowed: false,
+			response: createRpcErrorResponse(
+				undefined,
+				"parse",
+				`Failed to parse command: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		};
+	}
+
+	if (typeof parsed !== "object" || parsed === null || typeof parsed.type !== "string") {
+		return {
+			allowed: false,
+			response: createRpcErrorResponse(undefined, "unknown", "RPC command must be a JSON object with a string type"),
+		};
+	}
+
+	if (REMOTE_RPC_PASSTHROUGH_TYPES.has(parsed.type)) {
+		return { allowed: true };
+	}
+
+	return {
+		allowed: false,
+		response: createRpcErrorResponse(
+			typeof parsed.id === "string" ? parsed.id : undefined,
+			parsed.type,
+			`RPC command not allowed over remote sidecar: ${parsed.type}`,
+		),
+	};
+}
+
+async function writeRemoteRpcLineToChild(line, writable, writeToClient) {
+	const filterResult = getRemoteRpcFilterResult(line);
+	if (!filterResult.allowed) {
+		await writeToClient(filterResult.response);
+		return;
+	}
+	await writeNodeStream(writable, Buffer.from(`${line}\n`, "utf8"));
+}
+
+async function pipeFilteredIrohRpcToNodeWritable(recv, writable, initial, writeToClient) {
+	let buffer = Buffer.from(initial);
+
+	while (true) {
+		const result = await readLineFromIroh(recv, buffer);
+		if (result.line === undefined) {
+			if (result.rest.length > 0) {
+				await writeRemoteRpcLineToChild(result.rest.toString("utf8"), writable, writeToClient);
+			}
+			if (!writable.destroyed && !writable.writableEnded) writable.end();
+			return;
+		}
+
+		await writeRemoteRpcLineToChild(result.line, writable, writeToClient);
+		buffer = result.rest;
+	}
+}
+
+async function pipeNodeJsonlReadableToIrohSend(readable, sendQueue) {
+	const decoder = new StringDecoder("utf8");
+	let buffer = "";
+
+	for await (const chunk of readable) {
+		buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
+		while (true) {
+			const newlineIndex = buffer.indexOf("\n");
+			if (newlineIndex === -1) break;
+			const line = buffer.slice(0, newlineIndex + 1);
+			buffer = buffer.slice(newlineIndex + 1);
+			await sendQueue.write(line);
+		}
+	}
+
+	buffer += decoder.end();
+	if (buffer.length > 0) await sendQueue.write(buffer);
+	await sendQueue.finish();
+}
+
 function findClient(state, nodeId) {
 	return state.clients.find((client) => client.nodeId === nodeId);
 }
@@ -493,23 +604,27 @@ async function handleConnection(incoming, options, state) {
 			),
 		);
 
-		const clientToChild = pipeIrohRecvToNodeWritable(stream.recv, child.stdin, handshake.rest).catch((error) => {
+		const sendQueue = createIrohSendQueue(stream.send);
+		const clientToChild = pipeFilteredIrohRpcToNodeWritable(
+			stream.recv,
+			child.stdin,
+			handshake.rest,
+			(chunk) => sendQueue.write(chunk),
+		).catch((error) => {
 			if (!child.killed) child.kill();
 			throw error;
 		});
-		const childToClient = pipeNodeReadableToIrohSend(child.stdout, stream.send);
-		const childExit = new Promise((resolveChildExit) => {
-			child.once("exit", (code, signal) => resolveChildExit({ code, signal }));
-		});
+		const childToClient = pipeNodeJsonlReadableToIrohSend(child.stdout, sendQueue);
 		const childError = new Promise((_, rejectChildError) => {
 			child.once("error", (error) => {
 				rejectChildError(new Error(`RPC child error (${childCommand}): ${error.message}`));
 			});
 		});
+		const clientToChildFailure = clientToChild.then(() => new Promise(() => {}));
 
-		await Promise.race([clientToChild, childToClient, childExit, childError]);
+		await Promise.race([childToClient, childError, clientToChildFailure]);
 	} finally {
-		if (child && !child.killed) child.kill();
+		if (child && child.exitCode === null && !child.killed) child.kill();
 		connection.close(0n, Array.from(Buffer.from("done", "utf8")));
 		await waitForConnectionClose(connection);
 		console.error(`client disconnected: ${remoteId}`);
