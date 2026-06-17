@@ -308,9 +308,19 @@ function attachChildLogging(child) {
 	});
 }
 
-async function sendHandshakeError(send, message) {
-	await send.writeAll(toBytes(serializeJsonLine({ type: "volt_iroh_handshake", success: false, error: message })));
-	await send.finish();
+async function sendHandshakeError(stream, message) {
+	await stream.send.writeAll(toBytes(serializeJsonLine({ type: "volt_iroh_handshake", success: false, error: message })));
+	await stream.send.finish();
+	await stream.recv.stop(0n).catch(() => {});
+}
+
+async function waitForConnectionClose(connection) {
+	await Promise.race([
+		connection.closed().catch(() => {}),
+		new Promise((resolveDelay) => {
+			setTimeout(resolveDelay, 500);
+		}),
+	]);
 }
 
 function isExpectedDoneClose(error) {
@@ -383,23 +393,23 @@ async function handleConnection(incoming, options, state) {
 		const stream = await connection.acceptBi();
 		const handshake = await readLineFromIroh(stream.recv);
 		if (handshake.line === undefined) {
-			await sendHandshakeError(stream.send, "missing handshake");
+			await sendHandshakeError(stream, "missing handshake");
 			return;
 		}
 
 		const hello = JSON.parse(handshake.line);
 		if (hello.type !== "volt_iroh_hello") {
-			await sendHandshakeError(stream.send, "unexpected handshake type");
+			await sendHandshakeError(stream, "unexpected handshake type");
 			return;
 		}
 		if (hello.protocol !== ALPN_TEXT) {
-			await sendHandshakeError(stream.send, `unsupported protocol: ${hello.protocol}`);
+			await sendHandshakeError(stream, `unsupported protocol: ${hello.protocol}`);
 			return;
 		}
 
 		const authorization = await authorizeClient({ hello, options, remoteId, state });
 		if (authorization.error) {
-			await sendHandshakeError(stream.send, authorization.error);
+			await sendHandshakeError(stream, authorization.error);
 			return;
 		}
 
@@ -410,7 +420,7 @@ async function handleConnection(incoming, options, state) {
 		try {
 			await waitForChildSpawn(child, childCommand, authorization.workspace);
 		} catch (error) {
-			await sendHandshakeError(stream.send, error instanceof Error ? error.message : String(error));
+			await sendHandshakeError(stream, error instanceof Error ? error.message : String(error));
 			return;
 		}
 
@@ -444,6 +454,7 @@ async function handleConnection(incoming, options, state) {
 	} finally {
 		if (child && !child.killed) child.kill();
 		connection.close(0n, Array.from(Buffer.from("done", "utf8")));
+		await waitForConnectionClose(connection);
 		console.error(`client disconnected: ${remoteId}`);
 	}
 }

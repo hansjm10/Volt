@@ -28,6 +28,7 @@ From the repository root:
 
 ```bash
 npm run iroh:poc:smoke                  # local fake-RPC smoke test
+npm run iroh:poc:test                   # local fake-RPC scenario tests
 npm run iroh:poc:host                   # fake-RPC host
 npm run iroh:poc:host:volt              # source Volt RPC host for this checkout
 npm run iroh:poc:client -- "<ticket>"    # one-shot client
@@ -44,6 +45,16 @@ npm run iroh:poc:client -- "<ticket>" --message "List top-level files."
 ```
 
 Use `npm run --silent ...` if you want stdout to contain only the ticket or client output.
+
+## Local fake-RPC scenario tests
+
+Run the automated local scenario suite when changing the sidecar bridge:
+
+```bash
+npm run iroh:poc:test
+```
+
+The suite starts local host/client processes with isolated temporary state and covers fake-RPC prompt streaming, `get_state`, pairing persistence, `--no-pairing` rejection, revocation, expired tickets, and workspace preflight failures.
 
 ## Local fake-RPC smoke test
 

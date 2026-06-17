@@ -19,6 +19,7 @@
 		"check:shrinkwrap": "node scripts/generate-coding-agent-shrinkwrap.mjs --check",
 		"check:ts-imports": "node scripts/check-ts-relative-imports.mjs",
 		"iroh:poc:install": "npm --prefix packages/coding-agent/examples/remote/iroh-sidecar install --ignore-scripts",
+		"iroh:poc:test": "node scripts/iroh-sidecar-test.mjs",
 		"iroh:poc:host": "node scripts/iroh-sidecar-run.mjs host",
 		"iroh:poc:host:volt": "node scripts/iroh-sidecar-run.mjs host --source-volt . --workspace volt=.",
 		"iroh:poc:client": "node scripts/iroh-sidecar-run.mjs client",
