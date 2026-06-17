@@ -49,6 +49,8 @@ export type {
 
 export interface RpcModeOptions {
 	transport?: RpcTransport;
+	/** Defaults to true for stdio RPC mode and false for caller-provided transports. */
+	exitProcess?: boolean;
 }
 
 function createStdioRpcTransport(): RpcTransport {
@@ -77,10 +79,11 @@ function createStdioRpcTransport(): RpcTransport {
  * Run in RPC mode.
  * Listens for JSON commands from the transport, outputs events and responses to it.
  */
-export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcModeOptions = {}): Promise<never> {
+export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcModeOptions = {}): Promise<void> {
 	if (!options.transport) {
 		takeOverStdout();
 	}
+	const shouldExitProcess = options.exitProcess ?? !options.transport;
 	const transport = options.transport ?? createStdioRpcTransport();
 	const pendingWrites = new Set<Promise<void>>();
 	let hasPendingWriteError = false;
@@ -420,6 +423,16 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		});
 	};
 
+	let detachInput = () => {};
+	let detachClose = () => {};
+	let resolveModeClosed: (() => void) | undefined;
+	let rejectModeClosed: ((error: unknown) => void) | undefined;
+	const modeClosed = new Promise<void>((resolve, reject) => {
+		resolveModeClosed = resolve;
+		rejectModeClosed = reject;
+	});
+	let shutdownPromise: Promise<void> | undefined;
+
 	const registerSignalHandlers = (): void => {
 		const signals: NodeJS.Signals[] = ["SIGTERM"];
 		if (process.platform !== "win32") {
@@ -437,7 +450,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	};
 
 	await rebindSession();
-	registerSignalHandlers();
+	if (shouldExitProcess) {
+		registerSignalHandlers();
+	}
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
@@ -737,28 +752,39 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	 * Check if shutdown was requested and perform shutdown if so.
 	 * Called after handling each command when waiting for the next command.
 	 */
-	let detachInput = () => {};
-	let detachClose = () => {};
-
-	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
+	function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<void> {
 		if (shuttingDown) {
-			process.exit(exitCode);
+			if (shouldExitProcess) {
+				process.exit(exitCode);
+			}
+			return shutdownPromise ?? modeClosed;
 		}
 		shuttingDown = true;
-		for (const cleanup of signalCleanupHandlers) {
-			cleanup();
-		}
-		unsubscribe?.();
-		unsubscribeBackpressure?.();
-		await runtimeHost.dispose();
-		detachInput();
-		detachClose();
-		if (signal !== "SIGTERM") {
-			await waitForTransportBackpressure();
-			await transport.flush?.();
-		}
-		await transport.close();
-		process.exit(exitCode);
+		shutdownPromise = (async () => {
+			try {
+				for (const cleanup of signalCleanupHandlers) {
+					cleanup();
+				}
+				unsubscribe?.();
+				unsubscribeBackpressure?.();
+				await runtimeHost.dispose();
+				detachInput();
+				detachClose();
+				if (signal !== "SIGTERM") {
+					await waitForTransportBackpressure();
+					await transport.flush?.();
+				}
+				await transport.close();
+				if (shouldExitProcess) {
+					process.exit(exitCode);
+				}
+				resolveModeClosed?.();
+			} catch (shutdownError: unknown) {
+				rejectModeClosed?.(shutdownError);
+				throw shutdownError;
+			}
+		})();
+		return shutdownPromise;
 	}
 
 	async function checkShutdownRequested(): Promise<void> {
@@ -823,9 +849,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	});
 	detachClose =
 		transport.onClose?.(() => {
-			void shutdown();
+			void shutdown().catch(() => {});
 		}) ?? (() => {});
 
-	// Keep process alive forever
-	return new Promise(() => {});
+	// Keep RPC mode active until shutdown completes.
+	return modeClosed;
 }
