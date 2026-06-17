@@ -109,6 +109,61 @@ describe("SettingsManager", () => {
 			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
 			expect(savedSettings.defaultThinkingLevel).toBe("high");
 		});
+
+		it("should preserve externally added fields in an active profile", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					defaultProfile: "work",
+					profiles: {
+						work: {
+							packages: ["npm:before"],
+						},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			const currentSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			currentSettings.profiles.work.defaultModel = "claude-sonnet";
+			writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2));
+
+			manager.setPackages(["npm:after"]);
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.profiles.work.defaultModel).toBe("claude-sonnet");
+			expect(savedSettings.profiles.work.packages).toEqual(["npm:after"]);
+		});
+
+		it("should preserve externally added fields in an active project profile", async () => {
+			const settingsPath = join(projectDir, ".volt", "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					profiles: {
+						work: {
+							packages: ["npm:before"],
+						},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir, { profile: "work" });
+
+			const currentSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			currentSettings.profiles.work.defaultModel = "claude-sonnet";
+			writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2));
+
+			manager.setProjectPackages(["npm:after"]);
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.profiles.work.defaultModel).toBe("claude-sonnet");
+			expect(savedSettings.profiles.work.packages).toEqual(["npm:after"]);
+		});
 	});
 
 	describe("packages migration", () => {
@@ -153,6 +208,426 @@ describe("SettingsManager", () => {
 				extensions: ["extensions/oracle.ts"],
 				skills: [],
 			});
+		});
+	});
+
+	describe("profiles", () => {
+		it("should apply selected global and project profile overlays", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					theme: "dark",
+					defaultModel: "base-model",
+					profiles: {
+						development: {
+							theme: "light",
+							defaultModel: "global-profile-model",
+							packages: ["npm:global-profile"],
+						},
+					},
+				}),
+			);
+			writeFileSync(
+				join(projectDir, ".volt", "settings.json"),
+				JSON.stringify({
+					defaultModel: "project-base-model",
+					profiles: {
+						development: {
+							defaultThinkingLevel: "high",
+							packages: ["npm:project-profile"],
+						},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir, { profile: "development" });
+
+			expect(manager.getActiveProfile()).toBe("development");
+			expect(manager.getTheme()).toBe("light");
+			expect(manager.getDefaultModel()).toBe("project-base-model");
+			expect(manager.getDefaultThinkingLevel()).toBe("high");
+			expect(manager.getPackages()).toEqual(["npm:project-profile"]);
+			expect(manager.getGlobalEffectiveSettings().packages).toEqual(["npm:global-profile"]);
+			expect(manager.getProjectEffectiveSettings().packages).toEqual(["npm:project-profile"]);
+		});
+
+		it("should use defaultProfile when no explicit profile is selected", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					defaultProfile: "work",
+					profiles: {
+						work: { theme: "light" },
+					},
+					theme: "dark",
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getActiveProfile()).toBe("work");
+			expect(manager.getTheme()).toBe("light");
+		});
+
+		it("should remember the active profile as the global defaultProfile", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					defaultProfile: "work",
+					profiles: {
+						dev: { theme: "dark" },
+						work: { theme: "light" },
+					},
+					shellPath: "/bin/zsh",
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setActiveProfile("dev");
+			manager.rememberActiveProfile();
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.defaultProfile).toBe("dev");
+			expect(savedSettings.profiles).toEqual({ dev: { theme: "dark" }, work: { theme: "light" } });
+			expect(savedSettings.shellPath).toBe("/bin/zsh");
+
+			const reloadedManager = SettingsManager.create(projectDir, agentDir);
+			expect(reloadedManager.getActiveProfile()).toBe("dev");
+			expect(reloadedManager.getTheme()).toBe("dark");
+		});
+
+		it("should not create settings when there is no active profile to remember", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			manager.rememberActiveProfile();
+			await manager.flush();
+
+			expect(existsSync(settingsPath)).toBe(false);
+		});
+
+		it("should not remember an undefined selected profile", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ profiles: { work: { theme: "light" } } }));
+			const manager = SettingsManager.create(projectDir, agentDir, { profile: "missing" });
+
+			manager.rememberActiveProfile();
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.defaultProfile).toBeUndefined();
+		});
+
+		it("should not remember a project-only profile as the global default", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				join(projectDir, ".volt", "settings.json"),
+				JSON.stringify({
+					defaultProfile: "project-only",
+					profiles: {
+						"project-only": { theme: "project-theme" },
+					},
+				}),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getActiveProfile()).toBe("project-only");
+			expect(manager.getTheme()).toBe("project-theme");
+
+			manager.rememberActiveProfile();
+			await manager.flush();
+
+			expect(existsSync(settingsPath)).toBe(false);
+		});
+
+		it("should persist active profile setting updates into the profile overlay", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					defaultProfile: "work",
+					enabledModels: ["base-model"],
+					profiles: {
+						work: { enabledModels: ["profile-model"] },
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setEnabledModels(["updated-profile-model"]);
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(manager.getEnabledModels()).toEqual(["updated-profile-model"]);
+			expect(savedSettings.enabledModels).toEqual(["base-model"]);
+			expect(savedSettings.profiles.work.enabledModels).toEqual(["updated-profile-model"]);
+		});
+
+		it("should persist active profile clears for inherited optional settings", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					defaultProfile: "work",
+					enabledModels: ["base-model"],
+					reviewModel: "base-review-model",
+					profiles: {
+						work: {},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getEnabledModels()).toEqual(["base-model"]);
+			expect(manager.getReviewModel()).toBe("base-review-model");
+
+			manager.setEnabledModels(undefined);
+			manager.setReviewModel(undefined);
+			await manager.flush();
+
+			expect(manager.getEnabledModels()).toBeUndefined();
+			expect(manager.getReviewModel()).toBeUndefined();
+			const reloadedManager = SettingsManager.create(projectDir, agentDir);
+			expect(reloadedManager.getEnabledModels()).toBeUndefined();
+			expect(reloadedManager.getReviewModel()).toBeUndefined();
+		});
+
+		it("should let project profile clears override inherited global settings", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					reviewModel: "global-review-model",
+					enabledModels: ["global-model"],
+				}),
+			);
+			writeFileSync(
+				join(projectDir, ".volt", "settings.json"),
+				JSON.stringify({
+					profiles: {
+						work: {
+							reviewModel: null,
+							enabledModels: null,
+						},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir, { profile: "work" });
+
+			expect(manager.getGlobalEffectiveSettings().reviewModel).toBe("global-review-model");
+			expect(manager.getGlobalEffectiveSettings().enabledModels).toEqual(["global-model"]);
+			expect(manager.getProjectEffectiveSettings().reviewModel).toBeUndefined();
+			expect(manager.getProjectEffectiveSettings().enabledModels).toBeUndefined();
+			expect(manager.getReviewModel()).toBeUndefined();
+			expect(manager.getEnabledModels()).toBeUndefined();
+		});
+
+		it("should preserve externally added nested fields when updating an active profile setting", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					defaultProfile: "work",
+					profiles: {
+						work: { terminal: { showImages: true } },
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const currentSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			currentSettings.profiles.work.terminal.imageWidthCells = 100;
+			writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2));
+
+			manager.setShowImages(false);
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(manager.getShowImages()).toBe(false);
+			expect(savedSettings.profiles.work.terminal).toEqual({ showImages: false, imageWidthCells: 100 });
+			expect(savedSettings.terminal).toBeUndefined();
+		});
+
+		it("should recursively merge partial nested profile overlays", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					retry: {
+						provider: {
+							timeoutMs: 1000,
+							maxRetries: 2,
+							maxRetryDelayMs: 3000,
+						},
+					},
+					profiles: {
+						work: {
+							retry: {
+								provider: {
+									timeoutMs: 5000,
+								},
+							},
+						},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir, { profile: "work" });
+
+			expect(manager.getProviderRetrySettings()).toEqual({
+				timeoutMs: 5000,
+				maxRetries: 2,
+				maxRetryDelayMs: 3000,
+			});
+		});
+
+		it("should let explicit profile override defaultProfile", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					defaultProfile: "work",
+					profiles: {
+						development: { theme: "dark" },
+						work: { theme: "light" },
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir, { profile: "development" });
+
+			expect(manager.getActiveProfile()).toBe("development");
+			expect(manager.getTheme()).toBe("dark");
+		});
+
+		it("should list global and trusted project profiles", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					profiles: {
+						global: { theme: "dark" },
+						shared: { defaultModel: "global-model" },
+					},
+				}),
+			);
+			writeFileSync(
+				join(projectDir, ".volt", "settings.json"),
+				JSON.stringify({
+					profiles: {
+						project: { theme: "light" },
+						shared: { defaultModel: "project-model" },
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getProfileNames()).toEqual(["global", "project", "shared"]);
+			expect(manager.hasProfile("project")).toBe(true);
+		});
+
+		it("should not list project profiles when project is not trusted", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ profiles: { global: { theme: "dark" } } }));
+			writeFileSync(
+				join(projectDir, ".volt", "settings.json"),
+				JSON.stringify({ profiles: { project: { theme: "light" } } }),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir, { projectTrusted: false });
+
+			expect(manager.getProfileNames()).toEqual(["global"]);
+			expect(manager.hasProfile("project")).toBe(false);
+		});
+
+		it("should create empty global profiles without removing existing fields", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					profiles: {
+						work: { theme: "dark" },
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const profileName = manager.ensureGlobalProfile(" new-work ");
+			await manager.flush();
+
+			expect(profileName).toBe("new-work");
+			expect(manager.getProfileNames()).toEqual(["new-work", "work"]);
+			expect(JSON.parse(readFileSync(settingsPath, "utf-8"))).toEqual({
+				profiles: {
+					work: { theme: "dark" },
+					"new-work": {},
+				},
+			});
+		});
+
+		it("should reject empty profile names", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(() => manager.ensureGlobalProfile("   ")).toThrow("Profile name cannot be empty");
+		});
+
+		it("should skip project profile overlays when project is not trusted", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					profiles: {
+						work: { theme: "global-profile" },
+					},
+				}),
+			);
+			writeFileSync(
+				join(projectDir, ".volt", "settings.json"),
+				JSON.stringify({
+					profiles: {
+						work: { theme: "project-profile" },
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir, { projectTrusted: false, profile: "work" });
+
+			expect(manager.getTheme()).toBe("global-profile");
+			expect(manager.getProjectEffectiveSettings()).toEqual({});
+		});
+
+		it("should ignore profile sessionDir until profile storage isolation is implemented", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					sessionDir: "/base/sessions",
+					profiles: {
+						work: { sessionDir: "/profile/sessions" },
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir, { profile: "work" });
+
+			expect(manager.getSessionDir()).toBe("/base/sessions");
+		});
+
+		it("should not use inherited object properties as selected profiles", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					defaultProfile: "toString",
+					profiles: {},
+					theme: "dark",
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const errors = manager.drainErrors();
+
+			expect(manager.getActiveProfile()).toBe("toString");
+			expect(manager.getTheme()).toBe("dark");
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.scope).toBe("global");
+			expect(errors[0]?.error.message).toBe('Profile "toString" was selected but is not defined');
 		});
 	});
 
@@ -393,6 +868,26 @@ describe("SettingsManager", () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ sessionDir: "~/sessions" }));
 			const manager = SettingsManager.create(projectDir, agentDir);
 			expect(manager.getSessionDir()).toBe(join(homedir(), "sessions"));
+		});
+	});
+
+	describe("turnDoneAlert", () => {
+		it("should default to off", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getTurnDoneAlert()).toBe("off");
+		});
+
+		it("should persist the terminal bell setting without dropping sibling terminal settings", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ terminal: { showImages: false } }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setTurnDoneAlert("bell");
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.terminal).toEqual({ showImages: false, turnDoneAlert: "bell" });
+			expect(manager.getTurnDoneAlert()).toBe("bell");
 		});
 	});
 });

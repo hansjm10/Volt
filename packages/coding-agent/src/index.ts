@@ -243,6 +243,8 @@ export {
 	type DefaultProjectTrust,
 	type ImageSettings,
 	type PackageSource,
+	type ProfileSettings,
+	type ProfileStorageSettings,
 	type RetrySettings,
 	SettingsManager,
 	type SettingsManagerCreateOptions,
@@ -317,7 +319,7 @@ export {
 	withFileMutationQueue,
 } from "./core/tools/index.ts";
 export {
-	hasProjectTrustInputs,
+	hasTrustRequiringProjectResources,
 	type ProjectTrustDecision,
 	ProjectTrustStore,
 	type ProjectTrustStoreEntry,

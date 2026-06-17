@@ -12,7 +12,7 @@ import {
 	Text,
 } from "@earendil-works/volt-tui";
 import { formatHttpIdleTimeoutMs, HTTP_IDLE_TIMEOUT_CHOICES } from "../../../core/http-dispatcher.ts";
-import type { DefaultProjectTrust, WarningSettings } from "../../../core/settings-manager.ts";
+import type { DefaultProjectTrust, TurnDoneAlert, WarningSettings } from "../../../core/settings-manager.ts";
 import { getSelectListTheme, getSettingsListTheme, theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyDisplayText } from "./keybinding-hints.ts";
@@ -73,6 +73,7 @@ export interface SettingsConfig {
 	defaultProjectTrust: DefaultProjectTrust;
 	clearOnShrink: boolean;
 	showTerminalProgress: boolean;
+	turnDoneAlert?: TurnDoneAlert;
 	warnings: WarningSettings;
 }
 
@@ -103,6 +104,7 @@ export interface SettingsCallbacks {
 	onDefaultProjectTrustChange: (defaultProjectTrust: DefaultProjectTrust) => void;
 	onClearOnShrinkChange: (enabled: boolean) => void;
 	onShowTerminalProgressChange: (enabled: boolean) => void;
+	onTurnDoneAlertChange?: (mode: TurnDoneAlert) => void;
 	onWarningsChange: (warnings: WarningSettings) => void;
 	onCancel: () => void;
 }
@@ -510,6 +512,18 @@ export class SettingsSelectorComponent extends Container {
 			values: ["true", "false"],
 		});
 
+		// Turn done alert (insert after terminal-progress)
+		if (callbacks.onTurnDoneAlertChange) {
+			const terminalProgressIndex = items.findIndex((item) => item.id === "terminal-progress");
+			items.splice(terminalProgressIndex + 1, 0, {
+				id: "turn-done-alert",
+				label: "Turn done alert",
+				description: "Ring the terminal bell when Volt finishes a response",
+				currentValue: config.turnDoneAlert ?? "off",
+				values: ["off", "bell"],
+			});
+		}
+
 		// Add borders
 		this.addChild(new DynamicBorder());
 
@@ -594,6 +608,9 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "terminal-progress":
 						callbacks.onShowTerminalProgressChange(newValue === "true");
+						break;
+					case "turn-done-alert":
+						callbacks.onTurnDoneAlertChange?.(newValue as TurnDoneAlert);
 						break;
 				}
 			},

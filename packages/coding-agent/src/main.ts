@@ -26,7 +26,7 @@ import { formatNoModelsAvailableMessage } from "./core/auth-guidance.ts";
 import { AuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { ExtensionFactory } from "./core/extensions/types.ts";
-import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
+import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
 import type { ModelRegistry } from "./core/model-registry.ts";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
@@ -41,7 +41,7 @@ import {
 import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
-import { hasProjectTrustInputs, ProjectTrustStore } from "./core/trust-manager.ts";
+import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
@@ -94,6 +94,33 @@ function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]
 function isTruthyEnvFlag(value: string | undefined): boolean {
 	if (!value) return false;
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
+}
+
+function resolveRequestedProfile(parsed: Args): string | undefined {
+	const profile = parsed.profile ?? process.env.VOLT_PROFILE;
+	const trimmed = profile?.trim();
+	return trimmed ? trimmed : undefined;
+}
+
+function stripCommandProfileArgs(args: readonly string[]): { args: string[]; profile?: string; error?: string } {
+	const commandArgs: string[] = [];
+	let profile: string | undefined;
+
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--profile") {
+			const value = args[index + 1];
+			if (value === undefined || value.startsWith("-")) {
+				return { args: [...args], error: "--profile requires a value" };
+			}
+			profile = value;
+			index++;
+			continue;
+		}
+		commandArgs.push(arg);
+	}
+
+	return { args: commandArgs, profile };
 }
 
 function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
@@ -467,19 +494,49 @@ export async function main(args: string[], options?: MainOptions) {
 		cleanupWindowsSelfUpdateQuarantine(getPackageDir());
 	}
 
-	if (await handleStoreCommand(args, { extensionFactories: options?.extensionFactories })) {
+	const commandProfileArgs = stripCommandProfileArgs(args);
+	if (commandProfileArgs.error) {
+		console.error(chalk.red(`Error: ${commandProfileArgs.error}`));
+		process.exitCode = 1;
+		return;
+	}
+	const commandRuntimeOptions = {
+		extensionFactories: options?.extensionFactories,
+		profile: commandProfileArgs.profile,
+	};
+
+	const cwd = process.cwd();
+	const agentDir = getAgentDir();
+	const bootstrapSettingsManager = SettingsManager.create(cwd, agentDir, {
+		projectTrusted: false,
+		profile: commandProfileArgs.profile,
+	});
+	applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy);
+	configureHttpDispatcher();
+
+	if (await handleStoreCommand(commandProfileArgs.args, commandRuntimeOptions)) {
 		return;
 	}
 
-	if (await handlePackageCommand(args, { extensionFactories: options?.extensionFactories })) {
+	if (await handlePackageCommand(commandProfileArgs.args, commandRuntimeOptions)) {
+		const exitCode = process.exitCode ?? 0;
+		if (process.platform === "win32" && exitCode === 0 && commandProfileArgs.args[0] === "update") {
+			// We normally prefer process.exit(0) for package commands so bad extensions cannot keep
+			// one-shot commands alive. On Windows, Node can assert after fetch() if process.exit(0)
+			// runs during teardown; let successful `volt update` drain naturally instead.
+			// https://github.com/nodejs/node/issues/56645
+			return;
+		}
+		process.exit(exitCode);
 		return;
 	}
 
-	if (await handleConfigCommand(args, { extensionFactories: options?.extensionFactories })) {
+	if (await handleConfigCommand(commandProfileArgs.args, commandRuntimeOptions)) {
 		return;
 	}
 
 	const parsed = parseArgs(args);
+	const requestedProfile = resolveRequestedProfile(parsed);
 	if (parsed.diagnostics.length > 0) {
 		for (const d of parsed.diagnostics) {
 			const color = d.type === "error" ? chalk.red : chalk.yellow;
@@ -525,12 +582,10 @@ export async function main(args: string[], options?: MainOptions) {
 	validateSessionIdFlags(parsed);
 
 	// Run migrations (pass cwd for project-local migrations)
-	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(process.cwd());
+	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
 	time("runMigrations");
 
-	const cwd = process.cwd();
-	const agentDir = getAgentDir();
-	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
+	const startupSettingsManager = SettingsManager.create(cwd, agentDir, { profile: requestedProfile });
 	reportDiagnostics(collectSettingsDiagnostics(startupSettingsManager, "startup session lookup"));
 
 	// Experimental first-time setup: theme choice and analytics opt-in.
@@ -577,7 +632,9 @@ export async function main(args: string[], options?: MainOptions) {
 	const trustStore = new ProjectTrustStore(agentDir);
 	const sessionCwd = sessionManager.getCwd();
 	const autoTrustOnReloadCwd =
-		parsed.projectTrustOverride === undefined && !hasProjectTrustInputs(sessionCwd) ? sessionCwd : undefined;
+		parsed.projectTrustOverride === undefined && !hasTrustRequiringProjectResources(sessionCwd)
+			? sessionCwd
+			: undefined;
 	const trustPromptMode: AppMode = parsed.help || parsed.listModels !== undefined ? "print" : appMode;
 	const projectTrustByCwd = new Map<string, boolean>();
 
@@ -586,23 +643,24 @@ export async function main(args: string[], options?: MainOptions) {
 	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
 	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
 	const authStorage = AuthStorage.create();
-	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
-		cwd,
-		agentDir,
-		sessionManager,
-		sessionStartEvent,
-		projectTrustContext,
-	}) => {
+	const createRuntime: CreateAgentSessionRuntimeFactory = async (runtimeOptions) => {
+		const { cwd, agentDir, sessionManager, sessionStartEvent, projectTrustContext } = runtimeOptions;
+		const runtimeProfile = Object.hasOwn(runtimeOptions, "profile") ? runtimeOptions.profile : requestedProfile;
 		const isInitialRuntime = sessionStartEvent === undefined;
 		const projectTrustDiagnostics: AgentSessionRuntimeDiagnostic[] = [];
 		const cachedProjectTrust = projectTrustByCwd.get(cwd);
-		const hasTrustInputs = hasProjectTrustInputs(cwd);
+		const hasTrustRequiringResources = hasTrustRequiringProjectResources(cwd);
 		const shouldResolveProjectTrust =
-			parsed.projectTrustOverride === undefined && cachedProjectTrust === undefined && hasTrustInputs;
+			parsed.projectTrustOverride === undefined && cachedProjectTrust === undefined && hasTrustRequiringResources;
 		const projectTrusted = shouldResolveProjectTrust
 			? false
-			: (cachedProjectTrust ?? parsed.projectTrustOverride ?? (!hasTrustInputs || trustStore.get(cwd) === true));
-		const runtimeSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
+			: (cachedProjectTrust ??
+				parsed.projectTrustOverride ??
+				(!hasTrustRequiringResources || trustStore.get(cwd) === true));
+		const runtimeSettingsManager = SettingsManager.create(cwd, agentDir, {
+			projectTrusted,
+			profile: runtimeProfile,
+		});
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
@@ -721,6 +779,7 @@ export async function main(args: string[], options?: MainOptions) {
 	time("createAgentSessionRuntime");
 	const { services, session, modelFallbackMessage } = runtime;
 	const { settingsManager, modelRegistry, resourceLoader } = services;
+	applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
 	configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
 
 	if (parsed.help) {
@@ -786,6 +845,7 @@ export async function main(args: string[], options?: MainOptions) {
 		const interactiveMode = new InteractiveMode(runtime, {
 			migratedProviders,
 			modelFallbackMessage,
+			modelScopePatterns: parsed.models,
 			autoTrustOnReloadCwd,
 			initialMessage,
 			initialImages,

@@ -13,6 +13,12 @@ interface InspectCall {
 	npmCommand?: string[];
 }
 
+interface StoreCliTestSettings {
+	npmCommand?: string[];
+	packages?: string[];
+	profiles?: Record<string, { npmCommand?: string[] }>;
+}
+
 const inspectorMock = vi.hoisted(() => ({
 	calls: [] as InspectCall[],
 	inspectStorePackage: vi.fn(async (options: InspectCall): Promise<StorePackageInspection> => {
@@ -98,7 +104,7 @@ describe("store CLI npm command inspection", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	function writeSettings(settings: { npmCommand: string[]; packages?: string[] }): void {
+	function writeSettings(settings: StoreCliTestSettings): void {
 		writeFileSync(join(agentDir, "settings.json"), JSON.stringify(settings, null, 2));
 	}
 
@@ -132,6 +138,27 @@ describe("store CLI npm command inspection", () => {
 		expect(errorSpy).not.toHaveBeenCalled();
 		expect(process.exitCode).toBeUndefined();
 		installSpy.mockRestore();
+		logSpy.mockRestore();
+		errorSpy.mockRestore();
+	});
+
+	it("uses profile npmCommand for store show inspection", async () => {
+		const profileNpmCommand = ["profile-npm", "--registry", "https://profile.example.test"];
+		writeSettings({
+			npmCommand,
+			profiles: {
+				work: { npmCommand: profileNpmCommand },
+			},
+		});
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		await main(["store", "show", "theme", "--profile", "work"]);
+
+		const call = inspectorMock.calls[inspectorMock.calls.length - 1];
+		expect(call?.npmCommand).toEqual(profileNpmCommand);
+		expect(errorSpy).not.toHaveBeenCalled();
+		expect(process.exitCode).toBeUndefined();
 		logSpy.mockRestore();
 		errorSpy.mockRestore();
 	});

@@ -10,9 +10,9 @@ There are two general options. You can either
 
 | Pattern | What is isolated | Best for | Notes |
 | --- | --- | --- | --- |
-| OpenShell | Whole `volt` process in a policy-controlled sandbox | Local or remote managed sandbox | Requires an OpenShell gateway |
 | Gondolin extension | Built-in tools and `!` commands | Local micro-VM isolation while keeping auth on host | See [`examples/extensions/gondolin/`](../examples/extensions/gondolin/). |
 | Plain Docker | Whole `volt` process in a local container | Simple local isolation | Provider API keys enter the container. |
+| OpenShell | Whole `volt` process in a policy-controlled sandbox | Local or remote managed sandbox | Requires an OpenShell gateway |
 
 Extensions run wherever the `volt` process runs. If you run host `volt` with a tool-routing extension, other custom extension tools still run on the host unless they also delegate their operations.
 

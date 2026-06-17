@@ -30,7 +30,6 @@ import {
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	modelsAreEqual,
-	resetApiProviders,
 	streamSimple,
 } from "@earendil-works/volt-ai";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
@@ -244,6 +243,10 @@ interface ToolDefinitionEntry {
 	sourceInfo: SourceInfo;
 }
 
+interface DefaultPersistenceOptions {
+	persistDefault?: boolean;
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -381,6 +384,7 @@ export class AgentSession {
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
 		apiKey: string;
 		headers?: Record<string, string>;
+		env?: Record<string, string>;
 	}> {
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!result.ok) {
@@ -390,7 +394,7 @@ export class AgentSession {
 			throw new Error(result.error);
 		}
 		if (result.apiKey) {
-			return { apiKey: result.apiKey, headers: result.headers };
+			return { apiKey: result.apiKey, headers: result.headers, env: result.env };
 		}
 
 		const isOAuth = this._modelRegistry.isUsingOAuth(model);
@@ -407,13 +411,14 @@ export class AgentSession {
 	private async _getCompactionRequestAuth(model: Model<any>): Promise<{
 		apiKey?: string;
 		headers?: Record<string, string>;
+		env?: Record<string, string>;
 	}> {
 		if (this.agent.streamFn === streamSimple) {
 			return this._getRequiredRequestAuth(model);
 		}
 
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
-		return result.ok ? { apiKey: result.apiKey, headers: result.headers } : {};
+		return result.ok ? { apiKey: result.apiKey, headers: result.headers, env: result.env } : {};
 	}
 
 	/**
@@ -1461,22 +1466,25 @@ export class AgentSession {
 
 	/**
 	 * Set model directly.
-	 * Validates that auth is configured, saves to session and settings.
+	 * Validates that auth is configured, saves to session, and persists as the default unless disabled.
 	 * @throws Error if no auth is configured for the model
 	 */
-	async setModel(model: Model<any>): Promise<void> {
+	async setModel(model: Model<any>, options?: DefaultPersistenceOptions): Promise<void> {
 		if (!this._modelRegistry.hasConfiguredAuth(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
 		const previousModel = this.model;
+		const persistDefault = options?.persistDefault !== false;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = model;
 		this.sessionManager.appendModelChange(model.provider, model.id);
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		if (persistDefault) {
+			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		}
 
 		// Re-clamp thinking level for new model's capabilities
-		this.setThinkingLevel(thinkingLevel);
+		this.setThinkingLevel(thinkingLevel, { persistDefault });
 
 		await this._emitModelSelect(model, previousModel, "set");
 	}
@@ -1555,21 +1563,22 @@ export class AgentSession {
 	/**
 	 * Set thinking level.
 	 * Clamps to model capabilities based on available thinking levels.
-	 * Saves to session and settings only if the level actually changes.
+	 * Saves to session and settings only if the level actually changes. Settings persistence can be disabled.
 	 */
-	setThinkingLevel(level: ThinkingLevel): void {
+	setThinkingLevel(level: ThinkingLevel, options?: DefaultPersistenceOptions): void {
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
 		// Only persist if actually changing
 		const previousLevel = this.agent.state.thinkingLevel;
 		const isChanging = effectiveLevel !== previousLevel;
+		const persistDefault = options?.persistDefault !== false;
 
 		this.agent.state.thinkingLevel = effectiveLevel;
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (this.supportsThinking() || effectiveLevel !== "off") {
+			if (persistDefault && (this.supportsThinking() || effectiveLevel !== "off")) {
 				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
 			}
 			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
@@ -1636,6 +1645,13 @@ export class AgentSession {
 		this.agent.followUpMode = this.settingsManager.getFollowUpMode();
 	}
 
+	private syncAgentRuntimeSettingsFromSettings(): void {
+		this.syncQueueModesFromSettings();
+		this.agent.transport = this.settingsManager.getTransport();
+		this.agent.thinkingBudgets = this.settingsManager.getThinkingBudgets();
+		this.agent.maxRetryDelayMs = this.settingsManager.getProviderRetrySettings().maxRetryDelayMs;
+	}
+
 	/**
 	 * Set steering message mode.
 	 * Saves to settings.
@@ -1674,7 +1690,7 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { apiKey, headers } = await this._getCompactionRequestAuth(this.model);
+			const { apiKey, headers, env } = await this._getCompactionRequestAuth(this.model);
 
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
@@ -1733,6 +1749,7 @@ export class AgentSession {
 					this._compactionAbortController.signal,
 					this.thinkingLevel,
 					this.agent.streamFn,
+					env,
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -1923,6 +1940,7 @@ export class AgentSession {
 
 			let apiKey: string | undefined;
 			let headers: Record<string, string> | undefined;
+			let env: Record<string, string> | undefined;
 			if (this.agent.streamFn === streamSimple) {
 				const authResult = await this._modelRegistry.getApiKeyAndHeaders(this.model);
 				if (!authResult.ok || !authResult.apiKey) {
@@ -1937,8 +1955,9 @@ export class AgentSession {
 				}
 				apiKey = authResult.apiKey;
 				headers = authResult.headers;
+				env = authResult.env;
 			} else {
-				({ apiKey, headers } = await this._getCompactionRequestAuth(this.model));
+				({ apiKey, headers, env } = await this._getCompactionRequestAuth(this.model));
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
@@ -2006,6 +2025,7 @@ export class AgentSession {
 					this._autoCompactionAbortController.signal,
 					this.thinkingLevel,
 					this.agent.streamFn,
+					env,
 				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
@@ -2188,11 +2208,26 @@ export class AgentSession {
 		}
 
 		const refreshedModel = this._modelRegistry.find(currentModel.provider, currentModel.id);
-		if (!refreshedModel || refreshedModel === currentModel) {
+		if (refreshedModel) {
+			if (refreshedModel !== currentModel) {
+				this.agent.state.model = refreshedModel;
+			}
 			return;
 		}
 
-		this.agent.state.model = refreshedModel;
+		const scopedFallback = this._scopedModels
+			.map((scoped) => this._modelRegistry.find(scoped.model.provider, scoped.model.id))
+			.find((model) => model !== undefined && this._modelRegistry.hasConfiguredAuth(model));
+		const fallbackModel = scopedFallback ?? this._modelRegistry.getAvailable()[0];
+		if (!fallbackModel) {
+			(this.agent.state as unknown as { model: Model<any> | undefined }).model = undefined;
+			return;
+		}
+
+		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+		this.agent.state.model = fallbackModel;
+		this.sessionManager.appendModelChange(fallbackModel.provider, fallbackModel.id);
+		this.setThinkingLevel(thinkingLevel, { persistDefault: false });
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
@@ -2472,14 +2507,15 @@ export class AgentSession {
 		const previousFlagValues = this._extensionRunner.getFlagValues();
 		await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
 		await this.settingsManager.reload();
-		this.syncQueueModesFromSettings();
-		resetApiProviders();
+		this.syncAgentRuntimeSettingsFromSettings();
+		this._modelRegistry.clearRegisteredProviders();
 		await this._resourceLoader.reload();
 		this._buildRuntime({
 			activeToolNames: this.getActiveToolNames(),
 			flagValues: previousFlagValues,
 			includeAllExtensionTools: true,
 		});
+		this._refreshCurrentModelFromRegistry();
 
 		const hasBindings =
 			this._extensionUIContext ||
@@ -2820,12 +2856,13 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const model = this.model!;
-				const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+				const { apiKey, headers, env } = await this._getRequiredRequestAuth(model);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					model,
 					apiKey,
 					headers,
+					env,
 					signal: this._branchSummaryAbortController.signal,
 					customInstructions,
 					replaceInstructions,

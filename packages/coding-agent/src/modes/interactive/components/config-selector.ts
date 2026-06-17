@@ -457,7 +457,9 @@ class ResourceList implements Component, Focusable {
 	private toggleTopLevelResource(item: ResourceItem, enabled: boolean): void {
 		const scope = item.metadata.scope as "user" | "project";
 		const settings =
-			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
+			scope === "project"
+				? this.settingsManager.getProjectEffectiveSettings()
+				: this.settingsManager.getGlobalEffectiveSettings();
 
 		const arrayKey = item.resourceType as "extensions" | "skills" | "prompts" | "themes";
 		const current = (settings[arrayKey] ?? []) as string[];
@@ -505,7 +507,9 @@ class ResourceList implements Component, Focusable {
 	private togglePackageResource(item: ResourceItem, enabled: boolean): void {
 		const scope = item.metadata.scope as "user" | "project";
 		const settings =
-			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
+			scope === "project"
+				? this.settingsManager.getProjectEffectiveSettings()
+				: this.settingsManager.getGlobalEffectiveSettings();
 
 		const packages = [...(settings.packages ?? [])] as PackageSource[];
 		const pkgIndex = packages.findIndex((pkg) => {

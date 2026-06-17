@@ -18,7 +18,7 @@ import { DefaultPackageManager } from "./core/package-manager.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
 import { DefaultResourceLoader } from "./core/resource-loader.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
-import { hasProjectTrustInputs, ProjectTrustStore } from "./core/trust-manager.ts";
+import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import { spawnProcess } from "./utils/child-process.ts";
 import { getLatestVoltRelease, isNewerPackageVersion } from "./utils/version-check.ts";
 import {
@@ -431,6 +431,7 @@ export function parseProjectTrustOverride(args: readonly string[]): boolean | un
 
 export interface PackageCommandRuntimeOptions {
 	extensionFactories?: ExtensionFactory[];
+	profile?: string;
 }
 
 export interface CommandSettingsResult {
@@ -448,21 +449,42 @@ export function reportProjectTrustWarnings(warnings: readonly string[]): void {
 	}
 }
 
+function normalizeCommandProfile(profile: string | undefined): string | undefined {
+	const trimmed = profile?.trim();
+	return trimmed ? trimmed : undefined;
+}
+
+function resolveCommandProfile(profile: string | undefined): string | undefined {
+	return normalizeCommandProfile(profile ?? process.env.VOLT_PROFILE);
+}
+
 export async function createCommandSettingsManager(options: {
 	cwd: string;
 	agentDir: string;
 	projectTrustOverride?: boolean;
+	useSavedProjectTrustOnly?: boolean;
 	extensionFactories?: ExtensionFactory[];
 	loadProjectTrustExtensions?: boolean;
+	profile?: string;
 }): Promise<CommandSettingsResult> {
-	const settingsManager = SettingsManager.create(options.cwd, options.agentDir, { projectTrusted: false });
+	const settingsManager = SettingsManager.create(options.cwd, options.agentDir, {
+		projectTrusted: false,
+		profile: resolveCommandProfile(options.profile),
+	});
 	const projectTrustWarnings: string[] = [];
+	const trustStore = new ProjectTrustStore(options.agentDir);
+	if (options.useSavedProjectTrustOnly) {
+		const savedProjectTrusted = trustStore.get(options.cwd) === true;
+		settingsManager.setProjectTrusted(options.projectTrustOverride ?? savedProjectTrusted);
+		return { settingsManager, projectTrustWarnings };
+	}
+
 	const appMode = getCommandAppMode();
 	const shouldLoadProjectTrustExtensions = options.loadProjectTrustExtensions ?? true;
 	const extensionsResult =
 		shouldLoadProjectTrustExtensions &&
 		options.projectTrustOverride === undefined &&
-		hasProjectTrustInputs(options.cwd)
+		hasTrustRequiringProjectResources(options.cwd)
 			? await new DefaultResourceLoader({
 					cwd: options.cwd,
 					agentDir: options.agentDir,
@@ -476,7 +498,7 @@ export async function createCommandSettingsManager(options: {
 
 	const projectTrusted = await resolveProjectTrusted({
 		cwd: options.cwd,
-		trustStore: new ProjectTrustStore(options.agentDir),
+		trustStore,
 		trustOverride: options.projectTrustOverride,
 		defaultProjectTrust: settingsManager.getDefaultProjectTrust(),
 		extensionsResult,
@@ -507,6 +529,7 @@ export async function handleConfigCommand(
 		agentDir,
 		projectTrustOverride: parseProjectTrustOverride(args),
 		extensionFactories: runtimeOptions.extensionFactories,
+		profile: runtimeOptions.profile,
 	});
 	reportProjectTrustWarnings(projectTrustWarnings);
 	reportSettingsErrors(settingsManager, "config command");
@@ -580,7 +603,9 @@ export async function handlePackageCommand(
 		cwd,
 		agentDir,
 		projectTrustOverride: options.projectTrustOverride,
+		useSavedProjectTrustOnly: options.command === "update",
 		extensionFactories: runtimeOptions.extensionFactories,
+		profile: runtimeOptions.profile,
 	});
 	reportProjectTrustWarnings(projectTrustWarnings);
 	if (!settingsManager.isProjectTrusted() && writesProjectPackageConfig) {
@@ -589,7 +614,7 @@ export async function handlePackageCommand(
 		return true;
 	}
 	reportSettingsErrors(settingsManager, "package command");
-	const selfUpdateNpmCommand = settingsManager.getGlobalSettings().npmCommand;
+	const selfUpdateNpmCommand = settingsManager.getGlobalEffectiveSettings().npmCommand;
 
 	const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
 

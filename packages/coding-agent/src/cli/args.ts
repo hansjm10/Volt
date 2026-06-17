@@ -12,6 +12,7 @@ export type Mode = "text" | "json" | "rpc";
 export interface Args {
 	provider?: string;
 	model?: string;
+	profile?: string;
 	apiKey?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
@@ -89,6 +90,14 @@ export function parseArgs(args: string[]): Args {
 			result.provider = args[++i];
 		} else if (arg === "--model" && i + 1 < args.length) {
 			result.model = args[++i];
+		} else if (arg === "--profile") {
+			const value = args[i + 1];
+			if (value !== undefined && !value.startsWith("-")) {
+				result.profile = value;
+				i++;
+			} else {
+				result.diagnostics.push({ type: "error", message: "--profile requires a value" });
+			}
 		} else if (arg === "--api-key" && i + 1 < args.length) {
 			result.apiKey = args[++i];
 		} else if (arg === "--system-prompt" && i + 1 < args.length) {
@@ -240,6 +249,7 @@ ${chalk.bold("Commands:")}
 ${chalk.bold("Options:")}
   --provider <name>              Provider name (default: google)
   --model <pattern>              Model pattern or ID (supports "provider/id" and optional ":<thinking>")
+  --profile <name>               Apply a named settings profile (or set VOLT_PROFILE)
   --api-key <key>                API key (defaults to env vars)
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
@@ -378,6 +388,7 @@ ${chalk.bold("Environment Variables:")}
   ${ENV_AGENT_DIR.padEnd(32)} - Config directory (default: ~/${CONFIG_DIR_NAME}/agent)
   ${ENV_SESSION_DIR.padEnd(32)} - Session storage directory (overridden by --session-dir)
   VOLT_PACKAGE_DIR                   - Override package directory (for Nix/Guix store paths)
+  VOLT_PROFILE                       - Apply a named settings profile
   VOLT_OFFLINE                       - Disable startup network operations when set to 1/true/yes
   VOLT_TELEMETRY                     - Override install telemetry when set to 1/true/yes or 0/false/no
   VOLT_LATEST_VERSION_URL            - Enable hosted version checks against this JSON endpoint

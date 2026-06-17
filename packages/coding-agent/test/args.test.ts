@@ -95,6 +95,23 @@ describe("parseArgs", () => {
 			expect(result.model).toBe("gpt-4o");
 		});
 
+		test("parses --profile", () => {
+			const result = parseArgs(["--profile", "development"]);
+			expect(result.profile).toBe("development");
+		});
+
+		test("reports missing --profile value", () => {
+			const result = parseArgs(["--profile"]);
+			expect(result.diagnostics).toEqual([{ type: "error", message: "--profile requires a value" }]);
+		});
+
+		test("reports missing --profile value before another flag", () => {
+			const result = parseArgs(["--profile", "--help"]);
+			expect(result.profile).toBeUndefined();
+			expect(result.help).toBe(true);
+			expect(result.diagnostics).toEqual([{ type: "error", message: "--profile requires a value" }]);
+		});
+
 		test("parses --api-key", () => {
 			const result = parseArgs(["--api-key", "sk-test-key"]);
 			expect(result.apiKey).toBe("sk-test-key");

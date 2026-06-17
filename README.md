@@ -19,9 +19,9 @@ Volt does not include a built-in permission system for restricting filesystem, p
 
 If you need stronger boundaries, containerize or sandbox Volt. See [packages/coding-agent/docs/containerization.md](packages/coding-agent/docs/containerization.md) for three patterns:
 
-- **OpenShell**: run the whole `volt` process in a policy-controlled sandbox.
 - **Gondolin extension**: keep `volt` and provider auth on the host while routing built-in tools and `!` commands into a local Linux micro-VM.
 - **Plain Docker**: run the whole `volt` process in a local container for simple isolation.
+- **OpenShell**: run the whole `volt` process in a policy-controlled sandbox.
 
 ## Development
 

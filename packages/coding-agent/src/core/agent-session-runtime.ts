@@ -38,6 +38,7 @@ export type CreateAgentSessionRuntimeFactory = (options: {
 	sessionManager: SessionManager;
 	sessionStartEvent?: SessionStartEvent;
 	projectTrustContext?: ProjectTrustContext;
+	profile?: string;
 }) => Promise<CreateAgentSessionRuntimeResult>;
 
 /**
@@ -130,6 +131,10 @@ export class AgentSessionRuntime {
 		this.beforeSessionInvalidate = beforeSessionInvalidate;
 	}
 
+	private getReplacementProfile(): string | undefined {
+		return this.services.settingsManager.getRequestedProfile();
+	}
+
 	private async emitBeforeSwitch(
 		reason: "new" | "resume",
 		targetSessionFile?: string,
@@ -214,6 +219,7 @@ export class AgentSessionRuntime {
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
 				projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
+				profile: this.getReplacementProfile(),
 			}),
 		);
 		await this.finishSessionReplacement(options?.withSession);
@@ -246,6 +252,7 @@ export class AgentSessionRuntime {
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
+				profile: this.getReplacementProfile(),
 			}),
 		);
 		if (options?.setup) {
@@ -300,6 +307,7 @@ export class AgentSessionRuntime {
 						agentDir: this.services.agentDir,
 						sessionManager,
 						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+						profile: this.getReplacementProfile(),
 					}),
 				);
 				await this.finishSessionReplacement(options?.withSession);
@@ -318,6 +326,7 @@ export class AgentSessionRuntime {
 					agentDir: this.services.agentDir,
 					sessionManager,
 					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+					profile: this.getReplacementProfile(),
 				}),
 			);
 			await this.finishSessionReplacement(options?.withSession);
@@ -337,6 +346,7 @@ export class AgentSessionRuntime {
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+				profile: this.getReplacementProfile(),
 			}),
 		);
 		await this.finishSessionReplacement(options?.withSession);
@@ -381,6 +391,7 @@ export class AgentSessionRuntime {
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+				profile: this.getReplacementProfile(),
 			}),
 		);
 		await this.finishSessionReplacement();
@@ -410,6 +421,7 @@ export async function createAgentSessionRuntime(
 		agentDir: string;
 		sessionManager: SessionManager;
 		sessionStartEvent?: SessionStartEvent;
+		profile?: string;
 	},
 ): Promise<AgentSessionRuntime> {
 	assertSessionCwdExists(options.sessionManager, options.cwd);

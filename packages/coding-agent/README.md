@@ -144,6 +144,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 |---------|-------------|
 | `/login`, `/logout` | OAuth authentication |
 | `/model` | Switch models |
+| `/profile` | Show, switch, or create the active settings profile |
 | `/scoped-models` | Enable/disable models for Ctrl+P cycling |
 | `/settings` | Thinking level, theme, message delivery, transport |
 | `/resume` | Pick from previous sessions |
@@ -252,19 +253,21 @@ Use `/settings` to modify common options, or edit JSON files directly:
 | `~/.volt/agent/settings.json` | Global (all projects) |
 | `.volt/settings.json` | Project (overrides global) |
 
+Settings can define named profiles for switching workflows. Select one with `volt --profile development`, `VOLT_PROFILE=work`, or `defaultProfile` in settings, or use `/profile` during an interactive session to show, switch, or create profiles. Profiles overlay normal settings and resources, but do not isolate auth or sessions yet.
+
 See [docs/settings.md](docs/settings.md) for all options.
 
 ### Project Trust
 
-On interactive startup, volt asks before trusting a project folder that contains project-local extensions or settings and has no saved decision for the folder or a parent folder in `~/.volt/agent/trust.json`. Trusting a project allows volt to load `.volt/settings.json` and `.volt` resources, install missing project packages, and execute project extensions.
+On interactive startup, volt asks before trusting a project folder that contains project-local settings, resources, or project `.agents/skills` and has no saved decision for the folder or a parent folder in `~/.volt/agent/trust.json`. Trusting a project allows volt to load `.volt/settings.json` and `.volt` resources, install missing project packages, and execute project extensions.
 
 Before the trust decision, volt loads only context files, user/global extensions, and CLI `-e` extensions so they can handle the `project_trust` event. Project-local extensions, project package-managed extensions, and project settings are loaded only after the project is trusted. This split also applies when switching to a session from a different cwd whose trust has not been resolved in the current process.
 
-Non-interactive modes (`-p`, `--mode json`, and `--mode rpc`) do not show a trust prompt. Without an applicable saved trust decision, they use `defaultProjectTrust` from global settings: `ask` (default) and `never` ignore trust-gated project inputs, while `always` trusts them. Pass `--approve`/`-a` or `--no-approve`/`-na` to override project trust for one run.
+Non-interactive modes (`-p`, `--mode json`, and `--mode rpc`) do not show a trust prompt. Without an applicable saved trust decision, they use `defaultProjectTrust` from global settings: `ask` (default) and `never` ignore those project resources, while `always` trusts them. Pass `--approve`/`-a` or `--no-approve`/`-na` to override project trust for one run.
 
 If no extension or saved decision applies, `defaultProjectTrust` controls the fallback behavior. Set it to `"ask"`, `"always"`, or `"never"` in `~/.volt/agent/settings.json`, or change it with `/settings`.
 
-`volt config` and package commands use the same project trust flow. Pass `--approve` to trust project-local settings for one command or `--no-approve` to ignore them.
+`volt config` and package commands use the same project trust flow, except `volt update` never prompts. Pass `--approve` to trust project-local settings for one command or `--no-approve` to ignore them.
 
 Use `/trust` in interactive mode to save a project trust decision for future sessions, including trust for the immediate parent folder. It writes `~/.volt/agent/trust.json` only; the current session is not reloaded, so restart volt for changes to take effect.
 
@@ -492,7 +495,7 @@ volt list                      # List installed packages
 volt config                    # Enable/disable package resources
 ```
 
-`volt config` and project package commands accept `--approve`/`--no-approve` to trust or ignore project-local settings for one command.
+`volt config` and project package commands accept `--approve`/`--no-approve` to trust or ignore project-local settings for one command. `volt update` never prompts for project trust.
 
 ### Modes
 
@@ -516,6 +519,7 @@ cat README.md | volt -p "Summarize this text"
 |--------|-------------|
 | `--provider <name>` | Provider (anthropic, openai, google, etc.) |
 | `--model <pattern>` | Model pattern or ID (supports `provider/id` and optional `:<thinking>`) |
+| `--profile <name>` | Apply a named settings profile (or set `VOLT_PROFILE`) |
 | `--api-key <key>` | API key (overrides env vars) |
 | `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh` |
 | `--models <patterns>` | Comma-separated patterns for Ctrl+P cycling |
@@ -626,6 +630,7 @@ volt --thinking high "Solve this complex problem"
 | `VOLT_CODING_AGENT_DIR` | Override config directory (default: `~/.volt/agent`) |
 | `VOLT_CODING_AGENT_SESSION_DIR` | Override session storage directory (overridden by `--session-dir`) |
 | `VOLT_PACKAGE_DIR` | Override package directory (useful for Nix/Guix where store paths tokenize poorly) |
+| `VOLT_PROFILE` | Apply a named settings profile |
 | `VOLT_OFFLINE` | Disable startup network operations, including update checks, package update checks, and install/update telemetry |
 | `VOLT_SKIP_VERSION_CHECK` | Skip the Volt version update check at startup |
 | `VOLT_LATEST_VERSION_URL` | Enable hosted version checks against this JSON endpoint |

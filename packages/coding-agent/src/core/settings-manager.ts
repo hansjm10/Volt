@@ -32,11 +32,14 @@ export interface RetrySettings {
 	provider?: ProviderRetrySettings;
 }
 
+export type TurnDoneAlert = "off" | "bell";
+
 export interface TerminalSettings {
 	showImages?: boolean; // default: true (only relevant if terminal supports images)
 	imageWidthCells?: number; // default: 60 (preferred inline image width in terminal cells)
 	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
 	showTerminalProgress?: boolean; // default: false (OSC 9;4 terminal progress indicators)
+	turnDoneAlert?: TurnDoneAlert; // default: "off" (terminal alert when a turn finishes)
 }
 
 export interface ImageSettings {
@@ -63,6 +66,28 @@ export type DefaultProjectTrust = "ask" | "always" | "never";
 
 export type TransportSetting = Transport;
 
+export interface ProfileStorageSettings {
+	/** Reserved for future per-profile auth isolation. Ignored by the MVP. */
+	authDir?: string;
+	/** Reserved for future per-profile session isolation. Ignored by the MVP. */
+	sessionDir?: string;
+}
+
+export type ProfileSettings = Omit<
+	Settings,
+	| "lastChangelogVersion"
+	| "defaultProfile"
+	| "profiles"
+	| "defaultProjectTrust"
+	| "enableInstallTelemetry"
+	| "enableAnalytics"
+	| "trackingId"
+	| "sessionDir"
+> & {
+	/** Reserved for future per-profile storage isolation. Ignored by the MVP. */
+	storage?: ProfileStorageSettings;
+};
+
 /**
  * Package source for npm/git packages.
  * - String form: load all resources from the package
@@ -81,6 +106,8 @@ export type PackageSource =
 
 export interface Settings {
 	lastChangelogVersion?: string;
+	defaultProfile?: string;
+	profiles?: Record<string, ProfileSettings>;
 	defaultProvider?: string;
 	defaultModel?: string;
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -120,40 +147,108 @@ export interface Settings {
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
+	httpProxy?: string; // Proxy URL applied as HTTP_PROXY and HTTPS_PROXY for Pi-managed HTTP clients
 	httpIdleTimeoutMs?: number; // HTTP header/body idle timeout in milliseconds; 0 disables it
 	websocketConnectTimeoutMs?: number; // WebSocket connect/open handshake timeout in milliseconds; 0 disables it
 	lsp?: LspSettings; // LSP diagnostics after edit/write (see docs/lsp.md)
 }
 
-/** Deep merge settings: project/overrides take precedence, nested objects merge recursively */
-function deepMergeSettings(base: Settings, overrides: Settings): Settings {
-	const result: Settings = { ...base };
+/** Deep merge records: overrides take precedence, nested objects merge recursively, arrays replace. */
+function deepMergeRecord(base: Record<string, unknown>, overrides: Record<string, unknown>): Record<string, unknown> {
+	const result: Record<string, unknown> = { ...base };
 
-	for (const key of Object.keys(overrides) as (keyof Settings)[]) {
-		const overrideValue = overrides[key];
-		const baseValue = base[key];
-
+	for (const [key, overrideValue] of Object.entries(overrides)) {
 		if (overrideValue === undefined) {
 			continue;
 		}
+		if (overrideValue === null) {
+			delete result[key];
+			continue;
+		}
 
-		// For nested objects, merge recursively
-		if (
-			typeof overrideValue === "object" &&
-			overrideValue !== null &&
-			!Array.isArray(overrideValue) &&
-			typeof baseValue === "object" &&
-			baseValue !== null &&
-			!Array.isArray(baseValue)
-		) {
-			(result as Record<string, unknown>)[key] = { ...baseValue, ...overrideValue };
+		const baseValue = base[key];
+		if (isSettingsRecord(baseValue) && isSettingsRecord(overrideValue)) {
+			result[key] = deepMergeRecord(baseValue, overrideValue);
 		} else {
-			// For primitives and arrays, override value wins
-			(result as Record<string, unknown>)[key] = overrideValue;
+			result[key] = overrideValue;
 		}
 	}
 
 	return result;
+}
+
+/** Deep merge settings: project/overrides take precedence, nested objects merge recursively. */
+function deepMergeSettings(base: Settings, overrides: Settings): Settings {
+	return deepMergeRecord(base as Record<string, unknown>, overrides as Record<string, unknown>) as Settings;
+}
+
+function normalizeProfileName(profile: string | undefined): string | undefined {
+	const trimmed = profile?.trim();
+	return trimmed ? trimmed : undefined;
+}
+
+function isSettingsRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function defineOwnEnumerableProperty(target: Record<string, unknown>, key: string, value: unknown): void {
+	Object.defineProperty(target, key, {
+		value,
+		enumerable: true,
+		configurable: true,
+		writable: true,
+	});
+}
+
+function normalizeProfileClears(profile: Record<string, unknown>): void {
+	for (const key of Object.keys(profile)) {
+		const value = profile[key];
+		if (value === undefined) {
+			profile[key] = null;
+		} else if (isSettingsRecord(value)) {
+			normalizeProfileClears(value);
+		}
+	}
+}
+
+function getOwnProfileSettings(settings: Settings, profileName: string): ProfileSettings | undefined {
+	const profiles = settings.profiles;
+	if (!isSettingsRecord(profiles) || !Object.hasOwn(profiles, profileName)) {
+		return undefined;
+	}
+
+	const profile = profiles[profileName];
+	return isSettingsRecord(profile) ? (profile as ProfileSettings) : undefined;
+}
+
+function cloneProfiles(profiles: Settings["profiles"]): Record<string, ProfileSettings> {
+	const cloned: Record<string, ProfileSettings> = {};
+	if (!isSettingsRecord(profiles)) {
+		return cloned;
+	}
+
+	for (const [profileName, profile] of Object.entries(profiles)) {
+		defineOwnEnumerableProperty(cloned, profileName, profile);
+	}
+	return cloned;
+}
+
+function sanitizeProfileSettings(profile: ProfileSettings | undefined): Settings {
+	if (!profile) {
+		return {};
+	}
+
+	const sanitized = structuredClone(profile) as Record<string, unknown>;
+	delete sanitized.lastChangelogVersion;
+	delete sanitized.defaultProfile;
+	delete sanitized.profiles;
+	delete sanitized.defaultProjectTrust;
+	delete sanitized.enableInstallTelemetry;
+	delete sanitized.enableAnalytics;
+	delete sanitized.trackingId;
+	delete sanitized.sessionDir;
+	delete sanitized.storage;
+	return sanitized as Settings;
 }
 
 function parseTimeoutSetting(value: unknown, settingName: string): number | undefined {
@@ -171,6 +266,7 @@ export type SettingsScope = "global" | "project";
 
 export interface SettingsManagerCreateOptions {
 	projectTrusted?: boolean;
+	profile?: string;
 }
 
 export interface SettingsStorage {
@@ -181,6 +277,13 @@ export interface SettingsError {
 	scope: SettingsScope;
 	error: Error;
 }
+
+interface ModifiedSetting {
+	field: keyof Settings;
+	nestedKey?: string;
+}
+
+type ModifiedProfileNestedFields = Map<string, Map<keyof Settings, Set<string>>>;
 
 export class FileSettingsStorage implements SettingsStorage {
 	private globalSettingsPath: string;
@@ -272,12 +375,21 @@ export class SettingsManager {
 	private storage: SettingsStorage;
 	private globalSettings: Settings;
 	private projectSettings: Settings;
-	private settings: Settings;
+	private globalEffectiveSettings: Settings = {};
+	private projectEffectiveSettings: Settings = {};
+	private settings: Settings = {};
+	private requestedProfile: string | undefined;
+	private activeProfile: string | undefined;
+	private reportedMissingProfiles = new Set<string>();
 	private projectTrusted: boolean;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
+	private modifiedProfileFields = new Map<string, Set<keyof Settings>>(); // Track global profile field modifications
+	private modifiedProfileNestedFields: ModifiedProfileNestedFields = new Map(); // Track global profile nested field modifications
 	private modifiedProjectFields = new Set<keyof Settings>(); // Track project fields modified during session
 	private modifiedProjectNestedFields = new Map<keyof Settings, Set<string>>(); // Track project nested field modifications
+	private modifiedProjectProfileFields = new Map<string, Set<keyof Settings>>(); // Track project profile field modifications
+	private modifiedProjectProfileNestedFields: ModifiedProfileNestedFields = new Map(); // Track project profile nested field modifications
 	private globalSettingsLoadError: Error | null = null; // Track if global settings file had parse errors
 	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
 	private writeQueue: Promise<void> = Promise.resolve();
@@ -292,24 +404,66 @@ export class SettingsManager {
 		projectLoadError: Error | null = null,
 		initialErrors: SettingsError[] = [],
 		projectTrusted = true,
+		profile?: string,
 	) {
 		this.storage = storage;
 		this.globalSettings = initialGlobal;
 		this.projectSettings = initialProject;
 		this.projectTrusted = projectTrusted;
+		this.requestedProfile = normalizeProfileName(profile);
 		this.globalSettingsLoadError = globalLoadError;
 		this.projectSettingsLoadError = projectLoadError;
 		this.errors = [...initialErrors];
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.mergeEffectiveSettings();
 	}
 
-	/** Re-merge effective settings from global, project, and session overrides */
+	private getProfileOverlay(settings: Settings, profileName: string | undefined): Settings {
+		if (!profileName) {
+			return {};
+		}
+		return sanitizeProfileSettings(getOwnProfileSettings(settings, profileName));
+	}
+
+	private applyProfile(settings: Settings, profileName: string | undefined): Settings {
+		return deepMergeSettings(settings, this.getProfileOverlay(settings, profileName));
+	}
+
+	private reportMissingProfile(profileName: string): void {
+		if (!this.projectTrusted || this.reportedMissingProfiles.has(profileName)) {
+			return;
+		}
+		if (
+			getOwnProfileSettings(this.globalSettings, profileName) ||
+			getOwnProfileSettings(this.projectSettings, profileName)
+		) {
+			return;
+		}
+		this.reportedMissingProfiles.add(profileName);
+		this.recordError("global", new Error(`Profile "${profileName}" was selected but is not defined`));
+	}
+
+	/** Re-merge effective settings from global, project, profile overlays, and session overrides */
 	private mergeEffectiveSettings(): void {
-		let merged = deepMergeSettings(this.globalSettings, this.projectSettings);
+		const baseSettings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		const profileName = this.requestedProfile ?? normalizeProfileName(baseSettings.defaultProfile);
+		this.activeProfile = profileName;
+		this.globalEffectiveSettings = this.applyProfile(this.globalSettings, profileName);
+		const projectProfileOverlay = this.projectTrusted
+			? this.getProfileOverlay(this.projectSettings, profileName)
+			: {};
+		this.projectEffectiveSettings = this.projectTrusted
+			? deepMergeSettings(this.projectSettings, projectProfileOverlay)
+			: {};
+
+		let merged = deepMergeSettings(this.globalEffectiveSettings, this.projectTrusted ? this.projectSettings : {});
+		merged = deepMergeSettings(merged, projectProfileOverlay);
 		if (Object.keys(this.sessionOverrides).length > 0) {
 			merged = deepMergeSettings(merged, this.sessionOverrides);
 		}
 		this.settings = merged;
+		if (profileName) {
+			this.reportMissingProfile(profileName);
+		}
 	}
 
 	/** Create a SettingsManager that loads from files */
@@ -343,15 +497,16 @@ export class SettingsManager {
 			projectLoad.error,
 			initialErrors,
 			projectTrusted,
+			options.profile,
 		);
 	}
 
 	/** Create an in-memory SettingsManager (no file I/O) */
-	static inMemory(settings: Partial<Settings> = {}): SettingsManager {
+	static inMemory(settings: Partial<Settings> = {}, options: SettingsManagerCreateOptions = {}): SettingsManager {
 		const storage = new InMemorySettingsStorage();
 		const initialSettings = SettingsManager.migrateSettings(structuredClone(settings) as Record<string, unknown>);
 		storage.withLock("global", () => JSON.stringify(initialSettings, null, 2));
-		return SettingsManager.fromStorage(storage);
+		return SettingsManager.fromStorage(storage, options);
 	}
 
 	private static loadFromStorage(storage: SettingsStorage, scope: SettingsScope, projectTrusted = true): Settings {
@@ -454,6 +609,87 @@ export class SettingsManager {
 		return structuredClone(this.projectSettings);
 	}
 
+	getGlobalEffectiveSettings(): Settings {
+		return structuredClone(this.globalEffectiveSettings);
+	}
+
+	getProjectEffectiveSettings(): Settings {
+		return structuredClone(this.projectEffectiveSettings);
+	}
+
+	getActiveProfile(): string | undefined {
+		return this.activeProfile;
+	}
+
+	getRequestedProfile(): string | undefined {
+		return this.requestedProfile;
+	}
+
+	getProfileNames(): string[] {
+		const names = new Set<string>();
+		const addProfileNames = (profiles: Settings["profiles"]) => {
+			if (!isSettingsRecord(profiles)) {
+				return;
+			}
+			for (const [profileName, profile] of Object.entries(profiles)) {
+				if (isSettingsRecord(profile)) {
+					names.add(profileName);
+				}
+			}
+		};
+
+		addProfileNames(this.globalSettings.profiles);
+		if (this.projectTrusted) {
+			addProfileNames(this.projectSettings.profiles);
+		}
+		return [...names].sort((a, b) => a.localeCompare(b));
+	}
+
+	hasProfile(profile: string): boolean {
+		const profileName = normalizeProfileName(profile);
+		if (!profileName) {
+			return false;
+		}
+		return (
+			getOwnProfileSettings(this.globalSettings, profileName) !== undefined ||
+			(this.projectTrusted && getOwnProfileSettings(this.projectSettings, profileName) !== undefined)
+		);
+	}
+
+	ensureGlobalProfile(profile: string): string {
+		const profileName = normalizeProfileName(profile);
+		if (!profileName) {
+			throw new Error("Profile name cannot be empty");
+		}
+		if (getOwnProfileSettings(this.globalSettings, profileName)) {
+			return profileName;
+		}
+
+		this.globalSettings.profiles = cloneProfiles(this.globalSettings.profiles);
+		defineOwnEnumerableProperty(this.globalSettings.profiles, profileName, {});
+		this.markProfileModified(profileName);
+		this.save();
+		return profileName;
+	}
+
+	setActiveProfile(profile: string | undefined): void {
+		this.requestedProfile = normalizeProfileName(profile);
+		this.reportedMissingProfiles.clear();
+		this.mergeEffectiveSettings();
+	}
+
+	rememberActiveProfile(): void {
+		if (!this.activeProfile || getOwnProfileSettings(this.globalSettings, this.activeProfile) === undefined) {
+			return;
+		}
+		if (normalizeProfileName(this.globalSettings.defaultProfile) === this.activeProfile) {
+			return;
+		}
+		this.globalSettings.defaultProfile = this.activeProfile;
+		this.markModified("defaultProfile");
+		this.save();
+	}
+
 	isProjectTrusted(): boolean {
 		return this.projectTrusted;
 	}
@@ -466,6 +702,8 @@ export class SettingsManager {
 		this.projectTrusted = trusted;
 		this.modifiedProjectFields.clear();
 		this.modifiedProjectNestedFields.clear();
+		this.modifiedProjectProfileFields.clear();
+		this.modifiedProjectProfileNestedFields.clear();
 
 		if (!trusted) {
 			this.projectSettings = {};
@@ -496,8 +734,12 @@ export class SettingsManager {
 
 		this.modifiedFields.clear();
 		this.modifiedNestedFields.clear();
+		this.modifiedProfileFields.clear();
+		this.modifiedProfileNestedFields.clear();
 		this.modifiedProjectFields.clear();
 		this.modifiedProjectNestedFields.clear();
+		this.modifiedProjectProfileFields.clear();
+		this.modifiedProjectProfileNestedFields.clear();
 
 		const projectLoad = SettingsManager.tryLoadFromStorage(this.storage, "project", this.projectTrusted);
 		if (!projectLoad.error) {
@@ -539,6 +781,47 @@ export class SettingsManager {
 		}
 	}
 
+	private trackProfileNestedField(
+		modifiedNestedFields: ModifiedProfileNestedFields,
+		profileName: string,
+		field: keyof Settings,
+		nestedKey: string,
+	): void {
+		let profileNestedFields = modifiedNestedFields.get(profileName);
+		if (!profileNestedFields) {
+			profileNestedFields = new Map();
+			modifiedNestedFields.set(profileName, profileNestedFields);
+		}
+		if (!profileNestedFields.has(field)) {
+			profileNestedFields.set(field, new Set());
+		}
+		profileNestedFields.get(field)!.add(nestedKey);
+	}
+
+	private markProfileModified(profileName: string, field?: keyof Settings, nestedKey?: string): void {
+		this.modifiedFields.add("profiles");
+		if (!this.modifiedProfileFields.has(profileName)) {
+			this.modifiedProfileFields.set(profileName, new Set());
+		}
+		if (field !== undefined) {
+			this.modifiedProfileFields.get(profileName)!.add(field);
+			if (nestedKey) {
+				this.trackProfileNestedField(this.modifiedProfileNestedFields, profileName, field, nestedKey);
+			}
+		}
+	}
+
+	private markProjectProfileModified(profileName: string, field: keyof Settings, nestedKey?: string): void {
+		this.modifiedProjectFields.add("profiles");
+		if (!this.modifiedProjectProfileFields.has(profileName)) {
+			this.modifiedProjectProfileFields.set(profileName, new Set());
+		}
+		this.modifiedProjectProfileFields.get(profileName)!.add(field);
+		if (nestedKey) {
+			this.trackProfileNestedField(this.modifiedProjectProfileNestedFields, profileName, field, nestedKey);
+		}
+	}
+
 	private assertProjectTrustedForWrite(): void {
 		if (!this.projectTrusted) {
 			throw new Error("Project is not trusted; refusing to write project settings");
@@ -554,11 +837,15 @@ export class SettingsManager {
 		if (scope === "global") {
 			this.modifiedFields.clear();
 			this.modifiedNestedFields.clear();
+			this.modifiedProfileFields.clear();
+			this.modifiedProfileNestedFields.clear();
 			return;
 		}
 
 		this.modifiedProjectFields.clear();
 		this.modifiedProjectNestedFields.clear();
+		this.modifiedProjectProfileFields.clear();
+		this.modifiedProjectProfileNestedFields.clear();
 	}
 
 	private enqueueWrite(scope: SettingsScope, task: () => void): void {
@@ -583,11 +870,33 @@ export class SettingsManager {
 		return snapshot;
 	}
 
+	private cloneModifiedProfileFields(source: Map<string, Set<keyof Settings>>): Map<string, Set<keyof Settings>> {
+		const snapshot = new Map<string, Set<keyof Settings>>();
+		for (const [profileName, fields] of source.entries()) {
+			snapshot.set(profileName, new Set(fields));
+		}
+		return snapshot;
+	}
+
+	private cloneModifiedProfileNestedFields(source: ModifiedProfileNestedFields): ModifiedProfileNestedFields {
+		const snapshot: ModifiedProfileNestedFields = new Map();
+		for (const [profileName, profileNestedFields] of source.entries()) {
+			const clonedNestedFields = new Map<keyof Settings, Set<string>>();
+			for (const [field, nestedFields] of profileNestedFields.entries()) {
+				clonedNestedFields.set(field, new Set(nestedFields));
+			}
+			snapshot.set(profileName, clonedNestedFields);
+		}
+		return snapshot;
+	}
+
 	private persistScopedSettings(
 		scope: SettingsScope,
 		snapshotSettings: Settings,
 		modifiedFields: Set<keyof Settings>,
 		modifiedNestedFields: Map<keyof Settings, Set<string>>,
+		modifiedProfileFields: Map<string, Set<keyof Settings>>,
+		modifiedProfileNestedFields: ModifiedProfileNestedFields,
 	): void {
 		this.storage.withLock(scope, (current) => {
 			const currentFileSettings = current
@@ -596,13 +905,60 @@ export class SettingsManager {
 			const mergedSettings: Settings = { ...currentFileSettings };
 			for (const field of modifiedFields) {
 				const value = snapshotSettings[field];
-				if (modifiedNestedFields.has(field) && typeof value === "object" && value !== null) {
+				if (field === "profiles" && modifiedProfileFields.size > 0) {
+					const currentProfiles = isSettingsRecord(currentFileSettings.profiles)
+						? currentFileSettings.profiles
+						: {};
+					const snapshotProfiles = isSettingsRecord(snapshotSettings.profiles) ? snapshotSettings.profiles : {};
+					const mergedProfiles: Record<string, unknown> = {};
+					for (const [profileName, profile] of Object.entries(currentProfiles)) {
+						defineOwnEnumerableProperty(mergedProfiles, profileName, profile);
+					}
+
+					for (const [profileName, profileFields] of modifiedProfileFields.entries()) {
+						const currentProfile: Record<string, unknown> =
+							Object.hasOwn(currentProfiles, profileName) && isSettingsRecord(currentProfiles[profileName])
+								? currentProfiles[profileName]
+								: {};
+						const snapshotProfile: Record<string, unknown> =
+							Object.hasOwn(snapshotProfiles, profileName) && isSettingsRecord(snapshotProfiles[profileName])
+								? snapshotProfiles[profileName]
+								: {};
+						if (profileFields.size === 0) {
+							defineOwnEnumerableProperty(mergedProfiles, profileName, snapshotProfile);
+							continue;
+						}
+						const mergedProfile: Record<string, unknown> = {};
+						const profileNestedFields = modifiedProfileNestedFields.get(profileName);
+						for (const [profileField, profileValue] of Object.entries(currentProfile)) {
+							defineOwnEnumerableProperty(mergedProfile, profileField, profileValue);
+						}
+						for (const profileField of profileFields) {
+							const nestedModified = profileNestedFields?.get(profileField);
+							const snapshotValue = snapshotProfile[profileField];
+							if (nestedModified && isSettingsRecord(snapshotValue)) {
+								const baseNested = isSettingsRecord(currentProfile[profileField])
+									? currentProfile[profileField]
+									: {};
+								const mergedNested: Record<string, unknown> = { ...baseNested };
+								for (const nestedKey of nestedModified) {
+									mergedNested[nestedKey] = snapshotValue[nestedKey];
+								}
+								defineOwnEnumerableProperty(mergedProfile, profileField, mergedNested);
+							} else {
+								defineOwnEnumerableProperty(mergedProfile, profileField, snapshotValue);
+							}
+						}
+						defineOwnEnumerableProperty(mergedProfiles, profileName, mergedProfile);
+					}
+
+					mergedSettings.profiles = mergedProfiles as Record<string, ProfileSettings>;
+				} else if (modifiedNestedFields.has(field) && isSettingsRecord(value)) {
 					const nestedModified = modifiedNestedFields.get(field)!;
-					const baseNested = (currentFileSettings[field] as Record<string, unknown>) ?? {};
-					const inMemoryNested = value as Record<string, unknown>;
-					const mergedNested = { ...baseNested };
+					const baseNested = isSettingsRecord(currentFileSettings[field]) ? currentFileSettings[field] : {};
+					const mergedNested: Record<string, unknown> = { ...baseNested };
 					for (const nestedKey of nestedModified) {
-						mergedNested[nestedKey] = inMemoryNested[nestedKey];
+						mergedNested[nestedKey] = value[nestedKey];
 					}
 					(mergedSettings as Record<string, unknown>)[field] = mergedNested;
 				} else {
@@ -624,9 +980,18 @@ export class SettingsManager {
 		const snapshotGlobalSettings = structuredClone(this.globalSettings);
 		const modifiedFields = new Set(this.modifiedFields);
 		const modifiedNestedFields = this.cloneModifiedNestedFields(this.modifiedNestedFields);
+		const modifiedProfileFields = this.cloneModifiedProfileFields(this.modifiedProfileFields);
+		const modifiedProfileNestedFields = this.cloneModifiedProfileNestedFields(this.modifiedProfileNestedFields);
 
 		this.enqueueWrite("global", () => {
-			this.persistScopedSettings("global", snapshotGlobalSettings, modifiedFields, modifiedNestedFields);
+			this.persistScopedSettings(
+				"global",
+				snapshotGlobalSettings,
+				modifiedFields,
+				modifiedNestedFields,
+				modifiedProfileFields,
+				modifiedProfileNestedFields,
+			);
 		});
 	}
 
@@ -642,16 +1007,74 @@ export class SettingsManager {
 		const snapshotProjectSettings = structuredClone(this.projectSettings);
 		const modifiedFields = new Set(this.modifiedProjectFields);
 		const modifiedNestedFields = this.cloneModifiedNestedFields(this.modifiedProjectNestedFields);
+		const modifiedProfileFields = this.cloneModifiedProfileFields(this.modifiedProjectProfileFields);
+		const modifiedProfileNestedFields = this.cloneModifiedProfileNestedFields(
+			this.modifiedProjectProfileNestedFields,
+		);
 		this.enqueueWrite("project", () => {
-			this.persistScopedSettings("project", snapshotProjectSettings, modifiedFields, modifiedNestedFields);
+			this.persistScopedSettings(
+				"project",
+				snapshotProjectSettings,
+				modifiedFields,
+				modifiedNestedFields,
+				modifiedProfileFields,
+				modifiedProfileNestedFields,
+			);
 		});
 	}
 
-	private updateProjectSettings(field: keyof Settings, update: (settings: Settings) => void): void {
+	private updateProfileSettings(settings: Settings, profileName: string, update: (settings: Settings) => void): void {
+		settings.profiles = cloneProfiles(settings.profiles);
+		const profileSettings = structuredClone(getOwnProfileSettings(settings, profileName) ?? {}) as Settings;
+		update(profileSettings);
+		normalizeProfileClears(profileSettings as Record<string, unknown>);
+		defineOwnEnumerableProperty(settings.profiles, profileName, profileSettings);
+	}
+
+	private updateGlobalSettings(field: keyof Settings, update: (settings: Settings) => void, nestedKey?: string): void {
+		this.updateGlobalSettingsFields([{ field, nestedKey }], update);
+	}
+
+	private updateGlobalSettingsFields(modifiedSettings: ModifiedSetting[], update: (settings: Settings) => void): void {
+		if (this.activeProfile) {
+			this.updateProfileSettings(this.globalSettings, this.activeProfile, update);
+			for (const modifiedSetting of modifiedSettings) {
+				this.markProfileModified(this.activeProfile, modifiedSetting.field, modifiedSetting.nestedKey);
+			}
+		} else {
+			update(this.globalSettings);
+			for (const modifiedSetting of modifiedSettings) {
+				this.markModified(modifiedSetting.field, modifiedSetting.nestedKey);
+			}
+		}
+		this.save();
+	}
+
+	private updateProjectSettings(
+		field: keyof Settings,
+		update: (settings: Settings) => void,
+		nestedKey?: string,
+	): void {
+		this.updateProjectSettingsFields([{ field, nestedKey }], update);
+	}
+
+	private updateProjectSettingsFields(
+		modifiedSettings: ModifiedSetting[],
+		update: (settings: Settings) => void,
+	): void {
 		this.assertProjectTrustedForWrite();
 		const projectSettings = structuredClone(this.projectSettings);
-		update(projectSettings);
-		this.markProjectModified(field);
+		if (this.activeProfile) {
+			this.updateProfileSettings(projectSettings, this.activeProfile, update);
+			for (const modifiedSetting of modifiedSettings) {
+				this.markProjectProfileModified(this.activeProfile, modifiedSetting.field, modifiedSetting.nestedKey);
+			}
+		} else {
+			update(projectSettings);
+			for (const modifiedSetting of modifiedSettings) {
+				this.markProjectModified(modifiedSetting.field, modifiedSetting.nestedKey);
+			}
+		}
 		this.saveProjectSettings(projectSettings);
 	}
 
@@ -689,23 +1112,22 @@ export class SettingsManager {
 	}
 
 	setDefaultProvider(provider: string): void {
-		this.globalSettings.defaultProvider = provider;
-		this.markModified("defaultProvider");
-		this.save();
+		this.updateGlobalSettings("defaultProvider", (settings) => {
+			settings.defaultProvider = provider;
+		});
 	}
 
 	setDefaultModel(modelId: string): void {
-		this.globalSettings.defaultModel = modelId;
-		this.markModified("defaultModel");
-		this.save();
+		this.updateGlobalSettings("defaultModel", (settings) => {
+			settings.defaultModel = modelId;
+		});
 	}
 
 	setDefaultModelAndProvider(provider: string, modelId: string): void {
-		this.globalSettings.defaultProvider = provider;
-		this.globalSettings.defaultModel = modelId;
-		this.markModified("defaultProvider");
-		this.markModified("defaultModel");
-		this.save();
+		this.updateGlobalSettingsFields([{ field: "defaultProvider" }, { field: "defaultModel" }], (settings) => {
+			settings.defaultProvider = provider;
+			settings.defaultModel = modelId;
+		});
 	}
 
 	getSteeringMode(): "all" | "one-at-a-time" {
@@ -713,9 +1135,9 @@ export class SettingsManager {
 	}
 
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
-		this.globalSettings.steeringMode = mode;
-		this.markModified("steeringMode");
-		this.save();
+		this.updateGlobalSettings("steeringMode", (settings) => {
+			settings.steeringMode = mode;
+		});
 	}
 
 	getFollowUpMode(): "all" | "one-at-a-time" {
@@ -723,9 +1145,9 @@ export class SettingsManager {
 	}
 
 	setFollowUpMode(mode: "all" | "one-at-a-time"): void {
-		this.globalSettings.followUpMode = mode;
-		this.markModified("followUpMode");
-		this.save();
+		this.updateGlobalSettings("followUpMode", (settings) => {
+			settings.followUpMode = mode;
+		});
 	}
 
 	getTheme(): string | undefined {
@@ -733,9 +1155,9 @@ export class SettingsManager {
 	}
 
 	setTheme(theme: string): void {
-		this.globalSettings.theme = theme;
-		this.markModified("theme");
-		this.save();
+		this.updateGlobalSettings("theme", (settings) => {
+			settings.theme = theme;
+		});
 	}
 
 	getDefaultThinkingLevel(): "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined {
@@ -743,9 +1165,9 @@ export class SettingsManager {
 	}
 
 	setDefaultThinkingLevel(level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh"): void {
-		this.globalSettings.defaultThinkingLevel = level;
-		this.markModified("defaultThinkingLevel");
-		this.save();
+		this.updateGlobalSettings("defaultThinkingLevel", (settings) => {
+			settings.defaultThinkingLevel = level;
+		});
 	}
 
 	getTransport(): TransportSetting {
@@ -753,9 +1175,9 @@ export class SettingsManager {
 	}
 
 	setTransport(transport: TransportSetting): void {
-		this.globalSettings.transport = transport;
-		this.markModified("transport");
-		this.save();
+		this.updateGlobalSettings("transport", (settings) => {
+			settings.transport = transport;
+		});
 	}
 
 	getCompactionEnabled(): boolean {
@@ -763,12 +1185,16 @@ export class SettingsManager {
 	}
 
 	setCompactionEnabled(enabled: boolean): void {
-		if (!this.globalSettings.compaction) {
-			this.globalSettings.compaction = {};
-		}
-		this.globalSettings.compaction.enabled = enabled;
-		this.markModified("compaction", "enabled");
-		this.save();
+		this.updateGlobalSettings(
+			"compaction",
+			(settings) => {
+				if (!settings.compaction) {
+					settings.compaction = {};
+				}
+				settings.compaction.enabled = enabled;
+			},
+			"enabled",
+		);
 	}
 
 	getCompactionReserveTokens(): number {
@@ -803,12 +1229,16 @@ export class SettingsManager {
 	}
 
 	setRetryEnabled(enabled: boolean): void {
-		if (!this.globalSettings.retry) {
-			this.globalSettings.retry = {};
-		}
-		this.globalSettings.retry.enabled = enabled;
-		this.markModified("retry", "enabled");
-		this.save();
+		this.updateGlobalSettings(
+			"retry",
+			(settings) => {
+				if (!settings.retry) {
+					settings.retry = {};
+				}
+				settings.retry.enabled = enabled;
+			},
+			"enabled",
+		);
 	}
 
 	getRetrySettings(): { enabled: boolean; maxRetries: number; baseDelayMs: number } {
@@ -827,9 +1257,9 @@ export class SettingsManager {
 		if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
 			throw new Error(`Invalid httpIdleTimeoutMs setting: ${String(timeoutMs)}`);
 		}
-		this.globalSettings.httpIdleTimeoutMs = Math.floor(timeoutMs);
-		this.markModified("httpIdleTimeoutMs");
-		this.save();
+		this.updateGlobalSettings("httpIdleTimeoutMs", (settings) => {
+			settings.httpIdleTimeoutMs = Math.floor(timeoutMs);
+		});
 	}
 
 	getProviderRetrySettings(): { timeoutMs?: number; maxRetries?: number; maxRetryDelayMs: number } {
@@ -849,9 +1279,9 @@ export class SettingsManager {
 	}
 
 	setHideThinkingBlock(hide: boolean): void {
-		this.globalSettings.hideThinkingBlock = hide;
-		this.markModified("hideThinkingBlock");
-		this.save();
+		this.updateGlobalSettings("hideThinkingBlock", (settings) => {
+			settings.hideThinkingBlock = hide;
+		});
 	}
 
 	getShellPath(): string | undefined {
@@ -859,9 +1289,9 @@ export class SettingsManager {
 	}
 
 	setShellPath(path: string | undefined): void {
-		this.globalSettings.shellPath = path;
-		this.markModified("shellPath");
-		this.save();
+		this.updateGlobalSettings("shellPath", (settings) => {
+			settings.shellPath = path;
+		});
 	}
 
 	getQuietStartup(): boolean {
@@ -869,9 +1299,9 @@ export class SettingsManager {
 	}
 
 	setQuietStartup(quiet: boolean): void {
-		this.globalSettings.quietStartup = quiet;
-		this.markModified("quietStartup");
-		this.save();
+		this.updateGlobalSettings("quietStartup", (settings) => {
+			settings.quietStartup = quiet;
+		});
 	}
 
 	getDefaultProjectTrust(): DefaultProjectTrust {
@@ -890,9 +1320,9 @@ export class SettingsManager {
 	}
 
 	setShellCommandPrefix(prefix: string | undefined): void {
-		this.globalSettings.shellCommandPrefix = prefix;
-		this.markModified("shellCommandPrefix");
-		this.save();
+		this.updateGlobalSettings("shellCommandPrefix", (settings) => {
+			settings.shellCommandPrefix = prefix;
+		});
 	}
 
 	getNpmCommand(): string[] | undefined {
@@ -900,9 +1330,9 @@ export class SettingsManager {
 	}
 
 	setNpmCommand(command: string[] | undefined): void {
-		this.globalSettings.npmCommand = command ? [...command] : undefined;
-		this.markModified("npmCommand");
-		this.save();
+		this.updateGlobalSettings("npmCommand", (settings) => {
+			settings.npmCommand = command ? [...command] : undefined;
+		});
 	}
 
 	getCollapseChangelog(): boolean {
@@ -910,9 +1340,9 @@ export class SettingsManager {
 	}
 
 	setCollapseChangelog(collapse: boolean): void {
-		this.globalSettings.collapseChangelog = collapse;
-		this.markModified("collapseChangelog");
-		this.save();
+		this.updateGlobalSettings("collapseChangelog", (settings) => {
+			settings.collapseChangelog = collapse;
+		});
 	}
 
 	getEnableInstallTelemetry(): boolean {
@@ -949,9 +1379,9 @@ export class SettingsManager {
 	}
 
 	setPackages(packages: PackageSource[]): void {
-		this.globalSettings.packages = packages;
-		this.markModified("packages");
-		this.save();
+		this.updateGlobalSettings("packages", (settings) => {
+			settings.packages = packages;
+		});
 	}
 
 	setProjectPackages(packages: PackageSource[]): void {
@@ -965,9 +1395,9 @@ export class SettingsManager {
 	}
 
 	setExtensionPaths(paths: string[]): void {
-		this.globalSettings.extensions = paths;
-		this.markModified("extensions");
-		this.save();
+		this.updateGlobalSettings("extensions", (settings) => {
+			settings.extensions = paths;
+		});
 	}
 
 	setProjectExtensionPaths(paths: string[]): void {
@@ -981,9 +1411,9 @@ export class SettingsManager {
 	}
 
 	setSkillPaths(paths: string[]): void {
-		this.globalSettings.skills = paths;
-		this.markModified("skills");
-		this.save();
+		this.updateGlobalSettings("skills", (settings) => {
+			settings.skills = paths;
+		});
 	}
 
 	setProjectSkillPaths(paths: string[]): void {
@@ -997,9 +1427,9 @@ export class SettingsManager {
 	}
 
 	setPromptTemplatePaths(paths: string[]): void {
-		this.globalSettings.prompts = paths;
-		this.markModified("prompts");
-		this.save();
+		this.updateGlobalSettings("prompts", (settings) => {
+			settings.prompts = paths;
+		});
 	}
 
 	setProjectPromptTemplatePaths(paths: string[]): void {
@@ -1013,9 +1443,9 @@ export class SettingsManager {
 	}
 
 	setThemePaths(paths: string[]): void {
-		this.globalSettings.themes = paths;
-		this.markModified("themes");
-		this.save();
+		this.updateGlobalSettings("themes", (settings) => {
+			settings.themes = paths;
+		});
 	}
 
 	setProjectThemePaths(paths: string[]): void {
@@ -1029,9 +1459,9 @@ export class SettingsManager {
 	}
 
 	setEnableSkillCommands(enabled: boolean): void {
-		this.globalSettings.enableSkillCommands = enabled;
-		this.markModified("enableSkillCommands");
-		this.save();
+		this.updateGlobalSettings("enableSkillCommands", (settings) => {
+			settings.enableSkillCommands = enabled;
+		});
 	}
 
 	getThinkingBudgets(): ThinkingBudgetsSettings | undefined {
@@ -1043,12 +1473,16 @@ export class SettingsManager {
 	}
 
 	setShowImages(show: boolean): void {
-		if (!this.globalSettings.terminal) {
-			this.globalSettings.terminal = {};
-		}
-		this.globalSettings.terminal.showImages = show;
-		this.markModified("terminal", "showImages");
-		this.save();
+		this.updateGlobalSettings(
+			"terminal",
+			(settings) => {
+				if (!settings.terminal) {
+					settings.terminal = {};
+				}
+				settings.terminal.showImages = show;
+			},
+			"showImages",
+		);
 	}
 
 	getImageWidthCells(): number {
@@ -1060,12 +1494,16 @@ export class SettingsManager {
 	}
 
 	setImageWidthCells(width: number): void {
-		if (!this.globalSettings.terminal) {
-			this.globalSettings.terminal = {};
-		}
-		this.globalSettings.terminal.imageWidthCells = Math.max(1, Math.floor(width));
-		this.markModified("terminal", "imageWidthCells");
-		this.save();
+		this.updateGlobalSettings(
+			"terminal",
+			(settings) => {
+				if (!settings.terminal) {
+					settings.terminal = {};
+				}
+				settings.terminal.imageWidthCells = Math.max(1, Math.floor(width));
+			},
+			"imageWidthCells",
+		);
 	}
 
 	getClearOnShrink(): boolean {
@@ -1077,12 +1515,16 @@ export class SettingsManager {
 	}
 
 	setClearOnShrink(enabled: boolean): void {
-		if (!this.globalSettings.terminal) {
-			this.globalSettings.terminal = {};
-		}
-		this.globalSettings.terminal.clearOnShrink = enabled;
-		this.markModified("terminal", "clearOnShrink");
-		this.save();
+		this.updateGlobalSettings(
+			"terminal",
+			(settings) => {
+				if (!settings.terminal) {
+					settings.terminal = {};
+				}
+				settings.terminal.clearOnShrink = enabled;
+			},
+			"clearOnShrink",
+		);
 	}
 
 	getShowTerminalProgress(): boolean {
@@ -1090,12 +1532,33 @@ export class SettingsManager {
 	}
 
 	setShowTerminalProgress(enabled: boolean): void {
-		if (!this.globalSettings.terminal) {
-			this.globalSettings.terminal = {};
-		}
-		this.globalSettings.terminal.showTerminalProgress = enabled;
-		this.markModified("terminal", "showTerminalProgress");
-		this.save();
+		this.updateGlobalSettings(
+			"terminal",
+			(settings) => {
+				if (!settings.terminal) {
+					settings.terminal = {};
+				}
+				settings.terminal.showTerminalProgress = enabled;
+			},
+			"showTerminalProgress",
+		);
+	}
+
+	getTurnDoneAlert(): TurnDoneAlert {
+		return this.settings.terminal?.turnDoneAlert === "bell" ? "bell" : "off";
+	}
+
+	setTurnDoneAlert(mode: TurnDoneAlert): void {
+		this.updateGlobalSettings(
+			"terminal",
+			(settings) => {
+				if (!settings.terminal) {
+					settings.terminal = {};
+				}
+				settings.terminal.turnDoneAlert = mode;
+			},
+			"turnDoneAlert",
+		);
 	}
 
 	getImageAutoResize(): boolean {
@@ -1103,12 +1566,16 @@ export class SettingsManager {
 	}
 
 	setImageAutoResize(enabled: boolean): void {
-		if (!this.globalSettings.images) {
-			this.globalSettings.images = {};
-		}
-		this.globalSettings.images.autoResize = enabled;
-		this.markModified("images", "autoResize");
-		this.save();
+		this.updateGlobalSettings(
+			"images",
+			(settings) => {
+				if (!settings.images) {
+					settings.images = {};
+				}
+				settings.images.autoResize = enabled;
+			},
+			"autoResize",
+		);
 	}
 
 	getBlockImages(): boolean {
@@ -1116,12 +1583,16 @@ export class SettingsManager {
 	}
 
 	setBlockImages(blocked: boolean): void {
-		if (!this.globalSettings.images) {
-			this.globalSettings.images = {};
-		}
-		this.globalSettings.images.blockImages = blocked;
-		this.markModified("images", "blockImages");
-		this.save();
+		this.updateGlobalSettings(
+			"images",
+			(settings) => {
+				if (!settings.images) {
+					settings.images = {};
+				}
+				settings.images.blockImages = blocked;
+			},
+			"blockImages",
+		);
 	}
 
 	getEnabledModels(): string[] | undefined {
@@ -1133,15 +1604,15 @@ export class SettingsManager {
 	}
 
 	setReviewModel(modelReference: string | undefined): void {
-		this.globalSettings.reviewModel = modelReference;
-		this.markModified("reviewModel");
-		this.save();
+		this.updateGlobalSettings("reviewModel", (settings) => {
+			settings.reviewModel = modelReference;
+		});
 	}
 
 	setEnabledModels(patterns: string[] | undefined): void {
-		this.globalSettings.enabledModels = patterns;
-		this.markModified("enabledModels");
-		this.save();
+		this.updateGlobalSettings("enabledModels", (settings) => {
+			settings.enabledModels = patterns;
+		});
 	}
 
 	getDoubleEscapeAction(): "fork" | "tree" | "none" {
@@ -1149,9 +1620,9 @@ export class SettingsManager {
 	}
 
 	setDoubleEscapeAction(action: "fork" | "tree" | "none"): void {
-		this.globalSettings.doubleEscapeAction = action;
-		this.markModified("doubleEscapeAction");
-		this.save();
+		this.updateGlobalSettings("doubleEscapeAction", (settings) => {
+			settings.doubleEscapeAction = action;
+		});
 	}
 
 	getTreeFilterMode(): "default" | "no-tools" | "user-only" | "labeled-only" | "all" {
@@ -1161,9 +1632,9 @@ export class SettingsManager {
 	}
 
 	setTreeFilterMode(mode: "default" | "no-tools" | "user-only" | "labeled-only" | "all"): void {
-		this.globalSettings.treeFilterMode = mode;
-		this.markModified("treeFilterMode");
-		this.save();
+		this.updateGlobalSettings("treeFilterMode", (settings) => {
+			settings.treeFilterMode = mode;
+		});
 	}
 
 	getShowHardwareCursor(): boolean {
@@ -1171,9 +1642,9 @@ export class SettingsManager {
 	}
 
 	setShowHardwareCursor(enabled: boolean): void {
-		this.globalSettings.showHardwareCursor = enabled;
-		this.markModified("showHardwareCursor");
-		this.save();
+		this.updateGlobalSettings("showHardwareCursor", (settings) => {
+			settings.showHardwareCursor = enabled;
+		});
 	}
 
 	getEditorPaddingX(): number {
@@ -1181,9 +1652,9 @@ export class SettingsManager {
 	}
 
 	setEditorPaddingX(padding: number): void {
-		this.globalSettings.editorPaddingX = Math.max(0, Math.min(3, Math.floor(padding)));
-		this.markModified("editorPaddingX");
-		this.save();
+		this.updateGlobalSettings("editorPaddingX", (settings) => {
+			settings.editorPaddingX = Math.max(0, Math.min(3, Math.floor(padding)));
+		});
 	}
 
 	getAutocompleteMaxVisible(): number {
@@ -1191,9 +1662,9 @@ export class SettingsManager {
 	}
 
 	setAutocompleteMaxVisible(maxVisible: number): void {
-		this.globalSettings.autocompleteMaxVisible = Math.max(3, Math.min(20, Math.floor(maxVisible)));
-		this.markModified("autocompleteMaxVisible");
-		this.save();
+		this.updateGlobalSettings("autocompleteMaxVisible", (settings) => {
+			settings.autocompleteMaxVisible = Math.max(3, Math.min(20, Math.floor(maxVisible)));
+		});
 	}
 
 	getCodeBlockIndent(): string {
@@ -1209,8 +1680,8 @@ export class SettingsManager {
 	}
 
 	setWarnings(warnings: WarningSettings): void {
-		this.globalSettings.warnings = { ...warnings };
-		this.markModified("warnings");
-		this.save();
+		this.updateGlobalSettings("warnings", (settings) => {
+			settings.warnings = { ...warnings };
+		});
 	}
 }

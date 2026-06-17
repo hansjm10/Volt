@@ -7,13 +7,14 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage } from "@earendil-works/volt-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/volt-agent-core";
 import {
 	type AssistantMessage,
 	getProviders,
 	type ImageContent,
 	type Message,
 	type Model,
+	modelsAreEqual,
 	type OAuthProviderId,
 	type OAuthSelectPrompt,
 } from "@earendil-works/volt-ai";
@@ -96,7 +97,7 @@ import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
-import { hasProjectConfigDir, hasProjectTrustInputs, ProjectTrustStore } from "../../core/trust-manager.ts";
+import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import {
 	findCatalogPackage,
 	loadDefaultStoreCatalog,
@@ -161,6 +162,7 @@ import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
 import {
+	detectTerminalBackgroundTheme,
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
 	getEditorTheme,
@@ -224,6 +226,7 @@ function isDeadTerminalError(error: unknown): boolean {
 
 const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING =
 	"Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage.";
+const TURN_DONE_ALERT_BUSY_RETRY_MS = 250;
 
 function isAnthropicSubscriptionAuthKey(apiKey: string | undefined): boolean {
 	return typeof apiKey === "string" && apiKey.startsWith("sk-ant-oat");
@@ -285,6 +288,8 @@ export interface InteractiveModeOptions {
 	migratedProviders?: string[];
 	/** Warning message if session model couldn't be restored */
 	modelFallbackMessage?: string;
+	/** Explicit model scope patterns from CLI, preserved across profile switches. */
+	modelScopePatterns?: string[];
 	/** Cwd to trust after reload if it gained a .volt directory during this implicitly trusted session. */
 	autoTrustOnReloadCwd?: string;
 	/** Initial message to send on startup (can include @file content) */
@@ -379,6 +384,7 @@ export class InteractiveMode {
 
 	// Shutdown state
 	private shutdownRequested = false;
+	private turnDoneAlertTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 
 	// Extension UI state
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
@@ -463,6 +469,25 @@ export class InteractiveMode {
 		initTheme(this.settingsManager.getTheme(), true);
 	}
 
+	private async detectThemeIfUnset(): Promise<void> {
+		if (this.settingsManager.getTheme()) {
+			return;
+		}
+
+		const detection = await detectTerminalBackgroundTheme({ ui: this.ui, timeoutMs: 100 });
+		const result = setTheme(detection.theme, true);
+		if (!result.success) {
+			return;
+		}
+
+		if (detection.confidence === "high") {
+			this.settingsManager.setTheme(detection.theme);
+			await this.settingsManager.flush();
+		}
+		this.updateEditorBorderColor();
+		this.ui.requestRender();
+	}
+
 	private getAutocompleteSourceTag(sourceInfo?: SourceInfo): string | undefined {
 		if (!sourceInfo) {
 			return undefined;
@@ -545,6 +570,24 @@ export class InteractiveMode {
 					value: item.label,
 					label: item.id,
 					description: item.provider,
+				}));
+			};
+		}
+
+		const profileCommand = slashCommands.find((command) => command.name === "profile");
+		if (profileCommand) {
+			profileCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
+				const currentProfile = this.settingsManager.getActiveProfile();
+				const items = this.settingsManager.getProfileNames().map((name) => ({
+					name,
+					isCurrent: name === currentProfile,
+				}));
+				const filtered = fuzzyFilter(items, prefix, (item) => item.name);
+				if (filtered.length === 0) return null;
+				return filtered.map((item) => ({
+					value: item.name,
+					label: item.name,
+					description: item.isCurrent ? "current profile" : "profile",
 				}));
 			};
 		}
@@ -675,8 +718,27 @@ export class InteractiveMode {
 			console.log(theme.fg("dim", `Model scope: ${modelList}${cycleHint}`));
 		}
 
-		// Add header container as first child
+		// Add header container as first child. Populate it after detectThemeIfUnset.
 		this.ui.addChild(this.headerContainer);
+
+		this.ui.addChild(this.chatContainer);
+		this.ui.addChild(this.pendingMessagesContainer);
+		this.ui.addChild(this.statusContainer);
+		this.renderWidgets(); // Initialize with default spacer
+		this.ui.addChild(this.widgetContainerAbove);
+		this.ui.addChild(this.editorContainer);
+		this.ui.addChild(this.widgetContainerBelow);
+		this.ui.addChild(this.footer);
+		this.ui.setFocus(this.editor);
+
+		this.setupKeyHandlers();
+		this.setupEditorSubmitHandler();
+
+		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
+		this.ui.start();
+		this.isInitialized = true;
+
+		await this.detectThemeIfUnset();
 
 		// Add header with keybindings from config (unless silenced)
 		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
@@ -738,23 +800,7 @@ export class InteractiveMode {
 			this.builtInHeader = new Text("", 0, 0);
 			this.headerContainer.addChild(this.builtInHeader);
 		}
-
-		this.ui.addChild(this.chatContainer);
-		this.ui.addChild(this.pendingMessagesContainer);
-		this.ui.addChild(this.statusContainer);
-		this.renderWidgets(); // Initialize with default spacer
-		this.ui.addChild(this.widgetContainerAbove);
-		this.ui.addChild(this.editorContainer);
-		this.ui.addChild(this.widgetContainerBelow);
-		this.ui.addChild(this.footer);
-		this.ui.setFocus(this.editor);
-
-		this.setupKeyHandlers();
-		this.setupEditorSubmitHandler();
-
-		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
-		this.ui.start();
-		this.isInitialized = true;
+		this.ui.requestRender();
 
 		// Initialize extensions first so resources are shown before messages
 		await this.rebindCurrentSession();
@@ -1818,6 +1864,48 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private clearTurnDoneAlertTimer(): void {
+		if (!this.turnDoneAlertTimer) return;
+		clearTimeout(this.turnDoneAlertTimer);
+		this.turnDoneAlertTimer = undefined;
+	}
+
+	private scheduleTurnDoneAlert(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
+		this.clearTurnDoneAlertTimer();
+		if (this.settingsManager.getTurnDoneAlert() === "off" || event.willRetry || this.shutdownRequested) {
+			return;
+		}
+
+		let stopReason: AssistantMessage["stopReason"] | undefined;
+		for (let i = event.messages.length - 1; i >= 0; i--) {
+			const message = event.messages[i];
+			if (message?.role === "assistant") {
+				stopReason = (message as AssistantMessage).stopReason;
+				break;
+			}
+		}
+		if (stopReason === "aborted") {
+			return;
+		}
+
+		this.scheduleTurnDoneAlertTimer(0);
+	}
+
+	private scheduleTurnDoneAlertTimer(delayMs: number): void {
+		this.turnDoneAlertTimer = setTimeout(() => {
+			this.turnDoneAlertTimer = undefined;
+			if (this.settingsManager.getTurnDoneAlert() === "off" || this.shutdownRequested || this.isShuttingDown) {
+				return;
+			}
+			if (this.session.isStreaming || this.session.isCompacting || this.session.isRetrying) {
+				this.scheduleTurnDoneAlertTimer(TURN_DONE_ALERT_BUSY_RETRY_MS);
+				return;
+			}
+
+			this.ui.terminal.alert();
+		}, delayMs);
+	}
+
 	private setHiddenThinkingLabel(label?: string): void {
 		this.hiddenThinkingLabel = label ?? this.defaultHiddenThinkingLabel;
 		for (const child of this.chatContainer.children) {
@@ -1899,6 +1987,7 @@ export class InteractiveMode {
 			this.hideExtensionEditor();
 		}
 		this.ui.hideOverlay();
+		this.clearTurnDoneAlertTimer();
 		this.clearExtensionTerminalInputListeners();
 		this.setExtensionFooter(undefined);
 		this.setExtensionHeader(undefined);
@@ -2579,6 +2668,12 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
+			if (text === "/profile" || text.startsWith("/profile ")) {
+				const profileName = text.startsWith("/profile ") ? text.slice(9).trim() : undefined;
+				this.editor.setText("");
+				await this.handleProfileCommand(profileName);
+				return;
+			}
 			if (text === "/scoped-models") {
 				this.editor.setText("");
 				await this.showModelsSelector();
@@ -2991,6 +3086,7 @@ export class InteractiveMode {
 				this.pendingTools.clear();
 
 				await this.checkShutdownRequested();
+				this.scheduleTurnDoneAlert(event);
 
 				this.ui.requestRender();
 				break;
@@ -3346,7 +3442,7 @@ export class InteractiveMode {
 	}
 
 	private renderProjectTrustWarningIfNeeded(): void {
-		if (this.settingsManager.isProjectTrusted() || !hasProjectTrustInputs(this.sessionManager.getCwd())) {
+		if (this.settingsManager.isProjectTrusted() || !hasTrustRequiringProjectResources(this.sessionManager.getCwd())) {
 			return;
 		}
 
@@ -3414,7 +3510,14 @@ export class InteractiveMode {
 	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
 		if (this.isShuttingDown) return;
 		this.isShuttingDown = true;
-		this.unregisterSignalHandlers();
+		// Keep signal handlers registered until terminal cleanup has completed.
+		// `signal-exit` checks the listener list during the same SIGTERM/SIGHUP
+		// dispatch and re-sends the signal if only its own listeners remain.
+
+		const rememberActiveProfile = async () => {
+			this.settingsManager.rememberActiveProfile();
+			await this.settingsManager.flush();
+		};
 
 		if (options?.fromSignal) {
 			// Signal-triggered shutdown (SIGTERM/SIGHUP). Emit extension cleanup
@@ -3425,6 +3528,7 @@ export class InteractiveMode {
 			// which the stdout/stderr error handler turns into emergencyTerminalExit;
 			// the render loop is already idle, so this cannot hot-spin (see #4144).
 			await this.runtimeHost.dispose();
+			await rememberActiveProfile();
 			await this.ui.terminal.drainInput(1000);
 			this.stop();
 			process.exit(0);
@@ -3439,6 +3543,7 @@ export class InteractiveMode {
 
 		this.stop();
 		await this.runtimeHost.dispose();
+		await rememberActiveProfile();
 
 		const resumeCommand = formatResumeCommand(this.sessionManager);
 		if (resumeCommand) {
@@ -4050,6 +4155,7 @@ export class InteractiveMode {
 					quietStartup: this.settingsManager.getQuietStartup(),
 					clearOnShrink: this.settingsManager.getClearOnShrink(),
 					showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
+					turnDoneAlert: this.settingsManager.getTurnDoneAlert(),
 					warnings: this.settingsManager.getWarnings(),
 				},
 				{
@@ -4175,6 +4281,9 @@ export class InteractiveMode {
 					},
 					onShowTerminalProgressChange: (enabled) => {
 						this.settingsManager.setShowTerminalProgress(enabled);
+					},
+					onTurnDoneAlertChange: (mode) => {
+						this.settingsManager.setTurnDoneAlert(mode);
 					},
 					onWarningsChange: (warnings) => {
 						this.settingsManager.setWarnings(warnings);
@@ -4718,6 +4827,241 @@ export class InteractiveMode {
 		this.showStatus(`${message}. Run /reload to load resource changes.`);
 	}
 
+	private async handleProfileCommand(profileName?: string): Promise<void> {
+		if (this.session.isStreaming) {
+			this.showWarning("Wait for the current response to finish before switching profiles.");
+			return;
+		}
+		if (this.session.isCompacting) {
+			this.showWarning("Wait for compaction to finish before switching profiles.");
+			return;
+		}
+
+		if (profileName) {
+			if (!this.settingsManager.hasProfile(profileName)) {
+				this.showWarning(`Profile "${profileName}" is not defined. Run /profile to create it.`);
+				return;
+			}
+			await this.switchProfile(profileName);
+			return;
+		}
+
+		await this.showProfileSelector();
+	}
+
+	private async showProfileSelector(): Promise<void> {
+		const currentProfile = this.settingsManager.getActiveProfile();
+		const profileNames = this.settingsManager.getProfileNames();
+		const profileByLabel = new Map<string, string>();
+		const options: string[] = [];
+
+		for (const [index, profileName] of profileNames.entries()) {
+			const currentSuffix = profileName === currentProfile ? " (current)" : "";
+			const label = `${index + 1}. ${profileName}${currentSuffix}`;
+			profileByLabel.set(label, profileName);
+			options.push(label);
+		}
+
+		const createCurrentLabel =
+			currentProfile && !profileNames.includes(currentProfile) ? `Create "${currentProfile}"` : undefined;
+		if (createCurrentLabel) {
+			options.push(createCurrentLabel);
+		}
+		options.push("Create new profile", "Cancel");
+
+		const currentLabel = currentProfile ?? "none";
+		const selection = await this.showExtensionSelector(`Current profile: ${currentLabel}`, options);
+		if (!selection || selection === "Cancel") {
+			return;
+		}
+
+		const selectedProfile = profileByLabel.get(selection);
+		if (selectedProfile) {
+			await this.switchProfile(selectedProfile);
+			return;
+		}
+
+		if (selection === createCurrentLabel && currentProfile) {
+			await this.createAndSwitchProfile(currentProfile, { forceReload: true });
+			return;
+		}
+
+		const createdProfile = await this.showExtensionInput("Create profile", "Profile name");
+		if (createdProfile === undefined) {
+			this.showStatus("Profile creation cancelled");
+			return;
+		}
+		await this.createAndSwitchProfile(createdProfile);
+	}
+
+	private async createAndSwitchProfile(profileName: string, options?: { forceReload?: boolean }): Promise<void> {
+		const normalizedProfile = profileName.trim();
+		if (!normalizedProfile) {
+			this.showWarning("Profile name cannot be empty");
+			return;
+		}
+
+		try {
+			const profileExists = this.settingsManager.hasProfile(normalizedProfile);
+			const createdProfile = profileExists
+				? normalizedProfile
+				: this.settingsManager.ensureGlobalProfile(normalizedProfile);
+			if (!profileExists) {
+				await this.settingsManager.flush();
+			}
+			await this.switchProfile(createdProfile, { created: !profileExists, forceReload: options?.forceReload });
+		} catch (error: unknown) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private applyProfileDefaultThinkingLevel(thinkingLevelOverride?: ThinkingLevel): boolean {
+		const defaultThinkingLevel = thinkingLevelOverride ?? this.settingsManager.getDefaultThinkingLevel();
+		if (defaultThinkingLevel === undefined) {
+			return false;
+		}
+
+		const previousThinkingLevel = this.session.thinkingLevel;
+		this.session.setThinkingLevel(defaultThinkingLevel, { persistDefault: false });
+		return this.session.thinkingLevel !== previousThinkingLevel;
+	}
+
+	private async applyProfileDefaultModel(): Promise<void> {
+		const defaultProvider = this.settingsManager.getDefaultProvider();
+		const defaultModel = this.settingsManager.getDefaultModel();
+		if (!defaultProvider && !defaultModel) {
+			const scopedModels = this.session.scopedModels;
+			const selectedScopedModel = this.session.model
+				? (scopedModels.find((scoped) => modelsAreEqual(scoped.model, this.session.model)) ?? scopedModels[0])
+				: scopedModels[0];
+			if (selectedScopedModel && !modelsAreEqual(this.session.model, selectedScopedModel.model)) {
+				if (!this.session.modelRegistry.hasConfiguredAuth(selectedScopedModel.model)) {
+					this.showWarning(
+						`Could not apply profile model ${selectedScopedModel.model.provider}/${selectedScopedModel.model.id}: credentials are not configured`,
+					);
+					return;
+				}
+				try {
+					await this.session.setModel(selectedScopedModel.model, { persistDefault: false });
+					this.applyProfileDefaultThinkingLevel(selectedScopedModel.thinkingLevel);
+					this.footer.invalidate();
+					this.updateEditorBorderColor();
+					void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedScopedModel.model);
+					this.checkDaxnutsEasterEgg(selectedScopedModel.model);
+				} catch (error: unknown) {
+					this.showWarning(
+						`Could not apply profile model ${selectedScopedModel.model.provider}/${selectedScopedModel.model.id}: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+				return;
+			}
+			if (this.applyProfileDefaultThinkingLevel(selectedScopedModel?.thinkingLevel)) {
+				this.footer.invalidate();
+				this.updateEditorBorderColor();
+			}
+			return;
+		}
+		if (!defaultProvider || !defaultModel) {
+			this.showWarning("Could not apply profile default model: defaultProvider/defaultModel is incomplete");
+			return;
+		}
+
+		const model = this.session.modelRegistry.find(defaultProvider, defaultModel);
+		if (!model) {
+			this.showWarning(`Could not apply profile default model ${defaultProvider}/${defaultModel}: model not found`);
+			return;
+		}
+
+		const scopedModels = this.session.scopedModels;
+		const scopedDefaultModel =
+			scopedModels.length > 0 ? scopedModels.find((scoped) => modelsAreEqual(scoped.model, model)) : undefined;
+		const selectedScopedModel = scopedModels.length > 0 ? (scopedDefaultModel ?? scopedModels[0]) : undefined;
+		const selectedModel = selectedScopedModel?.model ?? model;
+		const selectedThinkingLevel = selectedScopedModel?.thinkingLevel;
+
+		if (modelsAreEqual(this.session.model, selectedModel)) {
+			if (this.applyProfileDefaultThinkingLevel(selectedThinkingLevel)) {
+				this.footer.invalidate();
+				this.updateEditorBorderColor();
+			}
+			return;
+		}
+		if (!this.session.modelRegistry.hasConfiguredAuth(selectedModel)) {
+			this.showWarning(
+				`Could not apply profile model ${selectedModel.provider}/${selectedModel.id}: credentials are not configured`,
+			);
+			return;
+		}
+
+		try {
+			await this.session.setModel(selectedModel, { persistDefault: false });
+			this.applyProfileDefaultThinkingLevel(selectedThinkingLevel);
+			this.footer.invalidate();
+			this.updateEditorBorderColor();
+			void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel);
+			this.checkDaxnutsEasterEgg(selectedModel);
+		} catch (error: unknown) {
+			this.showWarning(
+				`Could not apply profile model ${selectedModel.provider}/${selectedModel.id}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	private async switchProfile(
+		profileName: string,
+		options?: { created?: boolean; forceReload?: boolean },
+	): Promise<void> {
+		const normalizedProfile = profileName.trim();
+		if (!normalizedProfile) {
+			this.showWarning("Profile name cannot be empty");
+			return;
+		}
+		if (!options?.forceReload && this.settingsManager.getActiveProfile() === normalizedProfile) {
+			this.showStatus(`Current profile: ${normalizedProfile}`);
+			return;
+		}
+
+		this.settingsManager.setActiveProfile(normalizedProfile);
+		const reloaded = await this.reloadRuntimeResources({
+			action: "switching profiles",
+			progressMessage: `Switching profile to ${normalizedProfile}...`,
+			successMessage: (savedImplicitProjectTrust) => {
+				const createdPrefix = options?.created ? `Created profile ${normalizedProfile}. ` : "";
+				const trustSuffix = savedImplicitProjectTrust ? "; saved project trust" : "";
+				return `${createdPrefix}Profile: ${normalizedProfile}. Reloaded keybindings, extensions, skills, prompts, themes${trustSuffix}`;
+			},
+		});
+		if (!reloaded) {
+			return;
+		}
+		try {
+			await this.applyScopedModelsFromSettings();
+		} catch (error: unknown) {
+			this.showWarning(
+				`Could not apply profile model scope: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		await this.applyProfileDefaultModel();
+	}
+
+	private async applyScopedModelsFromSettings(): Promise<void> {
+		const patterns = this.options.modelScopePatterns ?? this.settingsManager.getEnabledModels();
+		if (patterns && patterns.length > 0) {
+			const scopedModels = await resolveModelScope(patterns, this.session.modelRegistry);
+			this.session.setScopedModels(
+				scopedModels.map((scopedModel) => ({
+					model: scopedModel.model,
+					thinkingLevel: scopedModel.thinkingLevel,
+				})),
+			);
+		} else {
+			this.session.setScopedModels([]);
+		}
+		await this.updateAvailableProviderCount();
+		this.footer.invalidate();
+		this.updateEditorBorderColor();
+	}
+
 	private async handleModelCommand(searchTerm?: string): Promise<void> {
 		if (!searchTerm) {
 			this.showModelSelector();
@@ -4804,7 +5148,7 @@ export class InteractiveMode {
 		if (this.autoTrustOnReloadCwd !== cwd) {
 			return false;
 		}
-		if (!this.settingsManager.isProjectTrusted() || !hasProjectConfigDir(cwd)) {
+		if (!this.settingsManager.isProjectTrusted() || !hasTrustRequiringProjectResources(cwd)) {
 			return false;
 		}
 
@@ -5641,14 +5985,19 @@ export class InteractiveMode {
 	// Command handlers
 	// =========================================================================
 
-	private async handleReloadCommand(): Promise<void> {
+	private async reloadRuntimeResources(options?: {
+		action?: string;
+		progressMessage?: string;
+		successMessage?: (savedImplicitProjectTrust: boolean) => string;
+	}): Promise<boolean> {
+		const action = options?.action ?? "reloading";
 		if (this.session.isStreaming) {
-			this.showWarning("Wait for the current response to finish before reloading.");
-			return;
+			this.showWarning(`Wait for the current response to finish before ${action}.`);
+			return false;
 		}
 		if (this.session.isCompacting) {
-			this.showWarning("Wait for compaction to finish before reloading.");
-			return;
+			this.showWarning(`Wait for compaction to finish before ${action}.`);
+			return false;
 		}
 
 		this.resetExtensionUI();
@@ -5658,7 +6007,14 @@ export class InteractiveMode {
 		reloadBox.addChild(new DynamicBorder(borderColor));
 		reloadBox.addChild(new Spacer(1));
 		reloadBox.addChild(
-			new Text(theme.fg("muted", "Reloading keybindings, extensions, skills, prompts, themes..."), 1, 0),
+			new Text(
+				theme.fg(
+					"muted",
+					options?.progressMessage ?? "Reloading keybindings, extensions, skills, prompts, themes...",
+				),
+				1,
+				0,
+			),
 		);
 		reloadBox.addChild(new Spacer(1));
 		reloadBox.addChild(new DynamicBorder(borderColor));
@@ -5680,6 +6036,7 @@ export class InteractiveMode {
 		try {
 			await this.session.reload();
 			configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
+			this.session.agent.transport = this.settingsManager.getTransport();
 			this.keybindings.reload();
 			const activeHeader = this.customHeader ?? this.builtInHeader;
 			if (isExpandable(activeHeader)) {
@@ -5687,6 +6044,7 @@ export class InteractiveMode {
 			}
 			setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
 			this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
+			this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
 			const themeName = this.settingsManager.getTheme();
 			const themeResult = themeName ? setTheme(themeName, true) : { success: true };
 			if (!themeResult.success) {
@@ -5717,14 +6075,21 @@ export class InteractiveMode {
 				this.showError(`models.json error: ${modelsJsonError}`);
 			}
 			this.showStatus(
-				savedImplicitProjectTrust
-					? "Reloaded keybindings, extensions, skills, prompts, themes; saved project trust"
-					: "Reloaded keybindings, extensions, skills, prompts, themes",
+				options?.successMessage?.(savedImplicitProjectTrust) ??
+					(savedImplicitProjectTrust
+						? "Reloaded keybindings, extensions, skills, prompts, themes; saved project trust"
+						: "Reloaded keybindings, extensions, skills, prompts, themes"),
 			);
+			return true;
 		} catch (error) {
 			dismissReloadBox(previousEditor as Component);
 			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`);
+			return false;
 		}
+	}
+
+	private async handleReloadCommand(): Promise<void> {
+		await this.reloadRuntimeResources();
 	}
 
 	private async handleExportCommand(text: string): Promise<void> {
@@ -6625,7 +6990,7 @@ export class InteractiveMode {
 	}
 
 	stop(): void {
-		this.unregisterSignalHandlers();
+		this.clearTurnDoneAlertTimer();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
 		}
@@ -6643,5 +7008,6 @@ export class InteractiveMode {
 			this.ui.stop();
 			this.isInitialized = false;
 		}
+		this.unregisterSignalHandlers();
 	}
 }
