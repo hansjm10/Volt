@@ -179,6 +179,48 @@ describe("InteractiveMode.scheduleTurnDoneAlert", () => {
 		}
 	});
 
+	test("clears queued alerts when a later agent_end suppresses the alert", () => {
+		vi.useFakeTimers();
+		try {
+			const fakeThis = createFakeThis({ compacting: true });
+
+			(InteractiveMode as any).prototype.scheduleTurnDoneAlert.call(fakeThis, {
+				type: "agent_end",
+				willRetry: false,
+				messages: [{ role: "assistant", stopReason: "stop" }],
+			});
+			vi.advanceTimersByTime(0);
+			expect(fakeThis.ui.terminal.alert).not.toHaveBeenCalled();
+
+			(InteractiveMode as any).prototype.scheduleTurnDoneAlert.call(fakeThis, {
+				type: "agent_end",
+				willRetry: false,
+				messages: [{ role: "assistant", stopReason: "aborted" }],
+			});
+			fakeThis.session.isCompacting = false;
+			vi.advanceTimersByTime(250);
+			expect(fakeThis.ui.terminal.alert).not.toHaveBeenCalled();
+
+			fakeThis.session.isCompacting = true;
+			(InteractiveMode as any).prototype.scheduleTurnDoneAlert.call(fakeThis, {
+				type: "agent_end",
+				willRetry: false,
+				messages: [{ role: "assistant", stopReason: "stop" }],
+			});
+			vi.advanceTimersByTime(0);
+			(InteractiveMode as any).prototype.scheduleTurnDoneAlert.call(fakeThis, {
+				type: "agent_end",
+				willRetry: true,
+				messages: [{ role: "assistant", stopReason: "error" }],
+			});
+			fakeThis.session.isCompacting = false;
+			vi.advanceTimersByTime(250);
+			expect(fakeThis.ui.terminal.alert).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	test("skips retrying and aborted turns", () => {
 		vi.useFakeTimers();
 		try {

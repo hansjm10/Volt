@@ -1848,6 +1848,7 @@ export class InteractiveMode {
 	}
 
 	private scheduleTurnDoneAlert(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
+		this.clearTurnDoneAlertTimer();
 		if (this.settingsManager.getTurnDoneAlert() === "off" || event.willRetry || this.shutdownRequested) {
 			return;
 		}
@@ -1864,7 +1865,6 @@ export class InteractiveMode {
 			return;
 		}
 
-		this.clearTurnDoneAlertTimer();
 		this.scheduleTurnDoneAlertTimer(0);
 	}
 
