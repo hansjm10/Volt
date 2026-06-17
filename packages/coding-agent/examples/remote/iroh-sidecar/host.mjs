@@ -24,6 +24,7 @@ import {
 const { Endpoint, EndpointTicket, RelayMode, presetMinimal, presetN0 } = iroh;
 const DEFAULT_ALLOW_TOOLS = "read,grep,find,ls";
 const DEFAULT_STATE_PATH = resolve(homedir(), ".volt", "agent", "remote", "iroh-sidecar-host.json");
+const PAIRING_TICKET_TTL_MS = 10 * 60 * 1000;
 
 function printUsage() {
 	console.error(`Usage: npm run host -- [serve] [options]
@@ -103,7 +104,9 @@ function selectWorkspace(state, requestedWorkspace, allowTools) {
 		return upsertWorkspace(state, parseWorkspace(requestedWorkspace), allowTools);
 	}
 	if (state.workspaces.length > 0) {
-		return state.workspaces[0];
+		const workspace = state.workspaces[0];
+		workspace.allowedTools = allowTools;
+		return workspace;
 	}
 	return upsertWorkspace(state, parseWorkspace(undefined), allowTools);
 }
@@ -233,6 +236,19 @@ async function bindEndpoint(relayMode, state, statePath) {
 	return endpoint;
 }
 
+function isWindowsCommandShim(command) {
+	if (process.platform !== "win32") return false;
+	const lowerCommand = command.toLowerCase();
+	return lowerCommand.endsWith(".cmd") || lowerCommand.endsWith(".bat");
+}
+
+function spawnProcess(command, args, options) {
+	if (!isWindowsCommandShim(command)) {
+		return spawn(command, args, options);
+	}
+	return spawn(process.env.ComSpec ?? process.env.COMSPEC ?? "cmd.exe", ["/d", "/s", "/c", command, ...args], options);
+}
+
 function spawnRpcChild(options, workspace, allowTools) {
 	if (options.sourceVolt) {
 		const runnerPath = options.resolvedSourceVoltRunner ?? resolve(options.sourceVolt, "scripts", "run-coding-agent-source.mjs");
@@ -241,7 +257,7 @@ function spawnRpcChild(options, workspace, allowTools) {
 		return {
 			command: process.execPath,
 			args,
-			child: spawn(process.execPath, args, {
+			child: spawnProcess(process.execPath, args, {
 				cwd: workspace.path,
 				stdio: ["pipe", "pipe", "pipe"],
 			}),
@@ -250,10 +266,11 @@ function spawnRpcChild(options, workspace, allowTools) {
 
 	if (!options.useVolt) {
 		const fakeRpcPath = fileURLToPath(new URL("./fake-rpc.mjs", import.meta.url));
+		const args = [fakeRpcPath];
 		return {
 			command: process.execPath,
-			args: [fakeRpcPath],
-			child: spawn(process.execPath, [fakeRpcPath], {
+			args,
+			child: spawnProcess(process.execPath, args, {
 				cwd: workspace.path,
 				stdio: ["pipe", "pipe", "pipe"],
 			}),
@@ -266,7 +283,7 @@ function spawnRpcChild(options, workspace, allowTools) {
 	return {
 		command: voltBin,
 		args,
-		child: spawn(voltBin, args, {
+		child: spawnProcess(voltBin, args, {
 			cwd: workspace.path,
 			stdio: ["pipe", "pipe", "pipe"],
 		}),
@@ -342,19 +359,31 @@ function getClientWorkspace(client, workspaceName) {
 }
 
 async function authorizeClient({ hello, options, remoteId, state }) {
+	const latestState = await readState(options.statePath);
+	state.hostSecretKey = latestState.hostSecretKey;
+	state.workspaces = latestState.workspaces ?? [];
+	state.clients = latestState.clients ?? [];
+
 	const workspace = state.workspaces.find((entry) => entry.name === hello.workspace);
 	if (!workspace) {
 		return { error: `workspace not allowed: ${hello.workspace}` };
 	}
 
+	const now = Date.now();
 	const existingClient = findClient(state, remoteId);
-	const validPairingSecret = Boolean(options.pairingSecret && hello.secret === options.pairingSecret);
-	if (!existingClient && !validPairingSecret) {
+	const hasPairingSecret = Boolean(options.pairingSecret && hello.secret === options.pairingSecret);
+	const pairingSecretExpired =
+		hasPairingSecret && options.pairingExpiresAt !== undefined && now > options.pairingExpiresAt;
+	if (!existingClient && pairingSecretExpired) {
+		options.pairingSecret = undefined;
+		options.pairingExpiresAt = undefined;
+		return { error: "pairing ticket has expired" };
+	}
+	if (!existingClient && !hasPairingSecret) {
 		return { error: "client is not paired" };
 	}
 
 	if (!existingClient) {
-		const now = Date.now();
 		const client = {
 			nodeId: remoteId,
 			label: hello.clientLabel || remoteId.slice(0, 12),
@@ -365,6 +394,8 @@ async function authorizeClient({ hello, options, remoteId, state }) {
 		};
 		state.clients.push(client);
 		await writeState(options.statePath, state);
+		options.pairingSecret = undefined;
+		options.pairingExpiresAt = undefined;
 		console.error(`paired client: ${client.label} (${remoteId})`);
 		return { client, workspace, allowTools: client.allowedTools };
 	}
@@ -372,7 +403,7 @@ async function authorizeClient({ hello, options, remoteId, state }) {
 	if (!getClientWorkspace(existingClient, workspace.name)) {
 		return { error: `client is not allowed to use workspace: ${workspace.name}` };
 	}
-	existingClient.lastSeenAt = Date.now();
+	existingClient.lastSeenAt = now;
 	if (hello.clientLabel) existingClient.label = hello.clientLabel;
 	await writeState(options.statePath, state);
 	return {
@@ -462,7 +493,7 @@ async function handleConnection(incoming, options, state) {
 function createTicketPayload(endpoint, options, includePairingSecret) {
 	return {
 		alpn: ALPN_TEXT,
-		expiresAt: Date.now() + 10 * 60 * 1000,
+		expiresAt: options.ticketExpiresAt,
 		irohTicket: EndpointTicket.fromAddr(endpoint.addr()).toString(),
 		nodeId: endpoint.id().toString(),
 		relayMode: options.relayMode,
@@ -484,10 +515,13 @@ async function serve(flags) {
 
 	const pairingEnabled = !hasFlag(flags, "no-pairing");
 	const sourceVolt = getFlag(flags, "source-volt");
+	const ticketExpiresAt = Date.now() + PAIRING_TICKET_TTL_MS;
 	const options = {
 		allowTools,
 		relayMode,
 		pairingSecret: pairingEnabled ? randomBytes(24).toString("base64url") : undefined,
+		pairingExpiresAt: pairingEnabled ? ticketExpiresAt : undefined,
+		ticketExpiresAt,
 		once: hasFlag(flags, "once"),
 		sourceVolt: sourceVolt ? resolve(sourceVolt) : undefined,
 		statePath,
