@@ -593,8 +593,10 @@ async function authorizeClient({ hello, options, remoteId, state }) {
 	state.hostSecretKey = latestState.hostSecretKey;
 	state.workspaces = latestState.workspaces ?? [];
 	state.clients = latestState.clients ?? [];
+	upsertWorkspace(state, options.workspace, options.allowTools);
 
 	const now = Date.now();
+	const workspace = options.workspace;
 	const existingClient = findClient(state, remoteId);
 	const hasPairingSecret = Boolean(options.pairingSecret && hello.secret === options.pairingSecret);
 	const pairingSecretExpired =
@@ -606,13 +608,8 @@ async function authorizeClient({ hello, options, remoteId, state }) {
 	}
 
 	const requestedWorkspace = typeof hello.workspace === "string" ? hello.workspace : undefined;
-	if (requestedWorkspace !== options.workspace.name) {
+	if (requestedWorkspace !== workspace.name) {
 		return { error: `workspace not allowed: ${requestedWorkspace ?? "<missing>"}` };
-	}
-
-	const workspace = state.workspaces.find((entry) => entry.name === requestedWorkspace);
-	if (!workspace) {
-		return { error: `workspace not allowed: ${requestedWorkspace}` };
 	}
 
 	if (!existingClient && !hasPairingSecret) {
@@ -743,7 +740,7 @@ async function handleConnection(incoming, options, state) {
 function createTicketPayload(endpoint, options, includePairingSecret) {
 	return {
 		alpn: ALPN_TEXT,
-		expiresAt: options.ticketExpiresAt,
+		expiresAt: includePairingSecret ? options.ticketExpiresAt : undefined,
 		irohTicket: EndpointTicket.fromAddr(endpoint.addr()).toString(),
 		nodeId: endpoint.id().toString(),
 		relayMode: options.relayMode,
@@ -765,7 +762,7 @@ async function serve(flags) {
 
 	const pairingEnabled = !hasFlag(flags, "no-pairing");
 	const sourceVolt = getFlag(flags, "source-volt");
-	const ticketExpiresAt = Date.now() + PAIRING_TICKET_TTL_MS;
+	const ticketExpiresAt = pairingEnabled ? Date.now() + PAIRING_TICKET_TTL_MS : undefined;
 	const options = {
 		allowTools,
 		relayMode,

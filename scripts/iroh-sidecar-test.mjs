@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import iroh from "../packages/coding-agent/examples/remote/iroh-sidecar/node_modules/@number0/iroh/index.js";
 import {
 	ALPN,
 	ALPN_TEXT,
@@ -16,16 +16,23 @@ import {
 	toBytes,
 } from "../packages/coding-agent/examples/remote/iroh-sidecar/common.mjs";
 
-const { Endpoint, EndpointTicket, RelayMode, presetMinimal, presetN0 } = iroh;
+const requireModule = createRequire(import.meta.url);
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
 const sidecarDir = join(repoRoot, "packages", "coding-agent", "examples", "remote", "iroh-sidecar");
 const hostScript = join(sidecarDir, "host.mjs");
 const clientScript = join(sidecarDir, "client.mjs");
+const irohModule = join(sidecarDir, "node_modules", "@number0", "iroh", "index.js");
 const irohPackageJson = join(sidecarDir, "node_modules", "@number0", "iroh", "package.json");
 const PROCESS_TIMEOUT_MS = 15_000;
 const TICKET_TIMEOUT_MS = 10_000;
+
+let Endpoint;
+let EndpointTicket;
+let RelayMode;
+let presetMinimal;
+let presetN0;
 
 async function assertInstalled() {
 	try {
@@ -33,6 +40,10 @@ async function assertInstalled() {
 	} catch {
 		throw new Error("Iroh sidecar dependencies are not installed. Run: npm run iroh:poc:install");
 	}
+}
+
+function loadIroh() {
+	({ Endpoint, EndpointTicket, RelayMode, presetMinimal, presetN0 } = requireModule(irohModule));
 }
 
 function assert(condition, message) {
@@ -238,7 +249,7 @@ async function createFakeSourceVolt(stateDir) {
 		`import { appendFile } from "node:fs/promises";
 
 const logPath = ${JSON.stringify(logPath)};
-await appendFile(logPath, JSON.stringify({ argv: process.argv.slice(2) }) + "\\n");
+await appendFile(logPath, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }) + "\\n");
 
 function write(value) {
 	process.stdout.write(JSON.stringify(value) + "\\n");
@@ -519,6 +530,11 @@ async function pairingAndRevocationScenario() {
 			noPairingSuccess.clientOutput.stdout.includes("fake RPC response over Iroh: paired"),
 			`Expected paired client to connect without a pairing secret, got:\n${noPairingSuccess.clientOutput.stdout}`,
 		);
+		const noPairingPayload = decodeTicketPayload(noPairingSuccess.ticket);
+		assert(
+			noPairingPayload.expiresAt === undefined,
+			`Expected paired-client ticket to omit expiresAt, got:\n${JSON.stringify(noPairingPayload)}`,
+		);
 
 		const unpairedClientStatePath = join(stateDir, "unpaired-client.json");
 		const unpairedFailure = await expectHostClientFailure({
@@ -618,6 +634,62 @@ async function pairingTicketWorkspaceBindingScenario() {
 	});
 }
 
+async function runningWorkspaceAuthorizationScenario() {
+	await withStateDir("running-workspace", async ({ clientStatePath, hostStatePath, stateDir }) => {
+		const { logPath, sourceDir } = await createFakeSourceVolt(stateDir);
+		const runningWorkspace = join(stateDir, "running");
+		const savedWorkspace = join(stateDir, "saved");
+		await mkdir(runningWorkspace, { recursive: true });
+		await mkdir(savedWorkspace, { recursive: true });
+
+		const host = startHost([
+			"--state",
+			hostStatePath,
+			"--workspace",
+			`safe=${runningWorkspace}`,
+			"--source-volt",
+			sourceDir,
+			"--once",
+		]);
+		try {
+			const ticket = await waitForFirstStdoutLine(host.child, host.output, "running workspace host");
+			await writeFile(
+				hostStatePath,
+				`${JSON.stringify(
+					{
+						workspaces: [{ name: "safe", path: savedWorkspace, allowedTools: "bash" }],
+						clients: [],
+					},
+					null,
+					2,
+				)}\n`,
+			);
+
+			const clientOutput = await runClient(ticket, clientStatePath, ["--message", "running workspace", "--timeout-ms", "10000"], {
+				label: "running workspace client",
+			});
+			await waitForExit(host.child, "running workspace host", host.output);
+			assert(
+				clientOutput.stdout.includes("fake source Volt response: running workspace"),
+				`Expected running workspace client response, got:\n${clientOutput.stdout}`,
+			);
+
+			const entries = (await readFile(logPath, "utf8"))
+				.trim()
+				.split("\n")
+				.filter((line) => line.length > 0)
+				.map((line) => JSON.parse(line));
+			assert(entries.length === 1, `Expected one fake source Volt invocation, got:\n${JSON.stringify(entries)}`);
+			assert(
+				entries[0].cwd === runningWorkspace,
+				`Expected RPC child to run in ${runningWorkspace}, got:\n${JSON.stringify(entries[0])}`,
+			);
+		} finally {
+			await stopProcess(host.child);
+		}
+	});
+}
+
 async function expiredTicketScenario() {
 	await withStateDir("expired", async ({ clientStatePath }) => {
 		const ticket = encodeTicketPayload({
@@ -661,12 +733,14 @@ const scenarios = [
 	["pairing and revocation", pairingAndRevocationScenario],
 	["paired client current tools", pairedClientCurrentToolsScenario],
 	["pairing ticket workspace binding", pairingTicketWorkspaceBindingScenario],
+	["running workspace authorization", runningWorkspaceAuthorizationScenario],
 	["expired ticket", expiredTicketScenario],
 	["missing workspace preflight", missingWorkspaceScenario],
 ];
 
 async function main() {
 	await assertInstalled();
+	loadIroh();
 	for (const [name, runScenario] of scenarios) {
 		process.stdout.write(`Running ${name}... `);
 		await runScenario();
