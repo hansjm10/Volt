@@ -249,4 +249,73 @@ describe("AgentSessionRuntime profile propagation", () => {
 
 		expect(modelRegistry.find(providerName, providerModelId)).toBeUndefined();
 	});
+
+	it("switches away from the current extension provider model when it disappears after reload", async () => {
+		const providerName = "removed-extension-provider";
+		const providerModelId = "removed-extension-model";
+		let currentExtensionsResult = await createTestExtensionsResult([
+			(volt) => {
+				volt.registerProvider(providerName, {
+					baseUrl: "http://localhost:0/removed-extension",
+					apiKey: "removed-extension-key",
+					api: "removed-extension-api",
+					models: [
+						{
+							id: providerModelId,
+							name: "Removed extension model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 16384,
+						},
+					],
+				});
+			},
+		]);
+		const resourceLoader = createTestResourceLoader({ extensionsResult: currentExtensionsResult });
+		resourceLoader.getExtensions = () => currentExtensionsResult;
+		resourceLoader.reload = async () => {
+			currentExtensionsResult = await createTestExtensionsResult([]);
+		};
+		const settingsManager = SettingsManager.inMemory();
+		const authStorage = AuthStorage.inMemory();
+		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const fallbackModel = modelRegistry.getAll()[0];
+		if (!fallbackModel) {
+			throw new Error("No fallback model was registered");
+		}
+		authStorage.setRuntimeApiKey(fallbackModel.provider, "fallback-key");
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: fallbackModel,
+					systemPrompt: "You are a helpful assistant.",
+					tools: [],
+					thinkingLevel: "off",
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settingsManager,
+			cwd: process.cwd(),
+			modelRegistry,
+			resourceLoader,
+		});
+
+		cleanups.push(() => {
+			modelRegistry.unregisterProvider(providerName);
+			session.dispose();
+		});
+
+		const extensionModel = modelRegistry.find(providerName, providerModelId);
+		expect(extensionModel).toBeDefined();
+		await session.setModel(extensionModel!, { persistDefault: false });
+		expect(session.model?.provider).toBe(providerName);
+
+		await session.reload();
+
+		expect(modelRegistry.find(providerName, providerModelId)).toBeUndefined();
+		expect(session.model?.provider).toBe(fallbackModel.provider);
+		expect(session.model?.id).toBe(fallbackModel.id);
+	});
 });

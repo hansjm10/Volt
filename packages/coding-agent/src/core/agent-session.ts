@@ -2202,11 +2202,26 @@ export class AgentSession {
 		}
 
 		const refreshedModel = this._modelRegistry.find(currentModel.provider, currentModel.id);
-		if (!refreshedModel || refreshedModel === currentModel) {
+		if (refreshedModel) {
+			if (refreshedModel !== currentModel) {
+				this.agent.state.model = refreshedModel;
+			}
 			return;
 		}
 
-		this.agent.state.model = refreshedModel;
+		const scopedFallback = this._scopedModels
+			.map((scoped) => this._modelRegistry.find(scoped.model.provider, scoped.model.id))
+			.find((model) => model !== undefined && this._modelRegistry.hasConfiguredAuth(model));
+		const fallbackModel = scopedFallback ?? this._modelRegistry.getAvailable()[0];
+		if (!fallbackModel) {
+			(this.agent.state as unknown as { model: Model<any> | undefined }).model = undefined;
+			return;
+		}
+
+		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+		this.agent.state.model = fallbackModel;
+		this.sessionManager.appendModelChange(fallbackModel.provider, fallbackModel.id);
+		this.setThinkingLevel(thinkingLevel, { persistDefault: false });
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
@@ -2494,6 +2509,7 @@ export class AgentSession {
 			flagValues: previousFlagValues,
 			includeAllExtensionTools: true,
 		});
+		this._refreshCurrentModelFromRegistry();
 
 		const hasBindings =
 			this._extensionUIContext ||

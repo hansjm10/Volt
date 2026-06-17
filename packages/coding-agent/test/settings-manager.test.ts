@@ -320,6 +320,28 @@ describe("SettingsManager", () => {
 			expect(savedSettings.defaultProfile).toBeUndefined();
 		});
 
+		it("should not remember a project-only profile as the global default", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				join(projectDir, ".volt", "settings.json"),
+				JSON.stringify({
+					defaultProfile: "project-only",
+					profiles: {
+						"project-only": { theme: "project-theme" },
+					},
+				}),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getActiveProfile()).toBe("project-only");
+			expect(manager.getTheme()).toBe("project-theme");
+
+			manager.rememberActiveProfile();
+			await manager.flush();
+
+			expect(existsSync(settingsPath)).toBe(false);
+		});
+
 		it("should persist active profile setting updates into the profile overlay", async () => {
 			const settingsPath = join(agentDir, "settings.json");
 			writeFileSync(

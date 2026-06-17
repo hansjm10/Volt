@@ -675,7 +675,7 @@ export class SettingsManager {
 	}
 
 	rememberActiveProfile(): void {
-		if (!this.activeProfile || !this.hasProfile(this.activeProfile)) {
+		if (!this.activeProfile || getOwnProfileSettings(this.globalSettings, this.activeProfile) === undefined) {
 			return;
 		}
 		if (normalizeProfileName(this.globalSettings.defaultProfile) === this.activeProfile) {

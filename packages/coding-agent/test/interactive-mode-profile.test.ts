@@ -272,6 +272,78 @@ describe("InteractiveMode profile selector", () => {
 		}
 	});
 
+	it("falls back to the first scoped model when a switched profile has no default model", async () => {
+		const faux = registerFauxProvider({
+			models: [
+				{ id: "enabled-profile-model", reasoning: false },
+				{ id: "previous-model", reasoning: false },
+			],
+		});
+		try {
+			const enabledProfileModel = faux.getModel("enabled-profile-model");
+			const previousModel = faux.getModel("previous-model");
+			if (!enabledProfileModel || !previousModel) {
+				throw new Error("Faux models were not registered");
+			}
+
+			let activeProfile = "previous";
+			const scopedModels: ScopedModelUpdate[] = [];
+			const session = {
+				model: previousModel,
+				thinkingLevel: "off" as ThinkingLevel,
+				get scopedModels() {
+					return scopedModels;
+				},
+				modelRegistry: {
+					find: (provider: string, modelId: string) =>
+						[enabledProfileModel, previousModel].find(
+							(model) => model.provider === provider && model.id === modelId,
+						),
+					getAvailable: () => [enabledProfileModel, previousModel],
+					hasConfiguredAuth: () => true,
+				},
+				setModel: vi.fn(async (model: Model<string>, _options?: SetModelOptions) => {
+					session.model = model;
+				}),
+				setThinkingLevel: vi.fn(),
+			};
+			const context = Object.create(InteractiveMode.prototype) as SwitchProfileContext;
+			Object.defineProperties(context, {
+				settingsManager: {
+					value: {
+						getActiveProfile: () => activeProfile,
+						setActiveProfile: (profileName: string) => {
+							activeProfile = profileName;
+						},
+						getDefaultProvider: () => undefined,
+						getDefaultModel: () => undefined,
+						getDefaultThinkingLevel: () => undefined,
+						getEnabledModels: () => [enabledProfileModel.id],
+						getWarnings: () => ({}),
+					},
+				},
+				reloadRuntimeResources: { value: vi.fn(async (_options: ReloadRuntimeResourcesOptions) => true) },
+				applyScopedModelsFromSettings: {
+					value: vi.fn(async () => {
+						scopedModels.splice(0, scopedModels.length, { model: enabledProfileModel });
+					}),
+				},
+				session: { value: session },
+				footer: { value: { invalidate: vi.fn() } },
+				updateEditorBorderColor: { value: vi.fn() },
+				showStatus: { value: vi.fn() },
+				showWarning: { value: vi.fn() },
+			});
+
+			await interactiveModePrototype.switchProfile.call(context, "enabled-only");
+
+			expect(session.setModel).toHaveBeenCalledWith(enabledProfileModel, { persistDefault: false });
+			expect(session.model).toBe(enabledProfileModel);
+		} finally {
+			faux.unregister();
+		}
+	});
+
 	it("does not persist inherited defaults while applying a switched profile model", async () => {
 		const provider = "profile-defaults-test";
 		const authStorage = AuthStorage.inMemory();

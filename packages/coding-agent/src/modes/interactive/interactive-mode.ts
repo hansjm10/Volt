@@ -4855,7 +4855,32 @@ export class InteractiveMode {
 		const defaultProvider = this.settingsManager.getDefaultProvider();
 		const defaultModel = this.settingsManager.getDefaultModel();
 		if (!defaultProvider && !defaultModel) {
-			if (this.applyProfileDefaultThinkingLevel()) {
+			const scopedModels = this.session.scopedModels;
+			const selectedScopedModel = this.session.model
+				? (scopedModels.find((scoped) => modelsAreEqual(scoped.model, this.session.model)) ?? scopedModels[0])
+				: scopedModels[0];
+			if (selectedScopedModel && !modelsAreEqual(this.session.model, selectedScopedModel.model)) {
+				if (!this.session.modelRegistry.hasConfiguredAuth(selectedScopedModel.model)) {
+					this.showWarning(
+						`Could not apply profile model ${selectedScopedModel.model.provider}/${selectedScopedModel.model.id}: credentials are not configured`,
+					);
+					return;
+				}
+				try {
+					await this.session.setModel(selectedScopedModel.model, { persistDefault: false });
+					this.applyProfileDefaultThinkingLevel(selectedScopedModel.thinkingLevel);
+					this.footer.invalidate();
+					this.updateEditorBorderColor();
+					void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedScopedModel.model);
+					this.checkDaxnutsEasterEgg(selectedScopedModel.model);
+				} catch (error: unknown) {
+					this.showWarning(
+						`Could not apply profile model ${selectedScopedModel.model.provider}/${selectedScopedModel.model.id}: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+				return;
+			}
+			if (this.applyProfileDefaultThinkingLevel(selectedScopedModel?.thinkingLevel)) {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 			}
