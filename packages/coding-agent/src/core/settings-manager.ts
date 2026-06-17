@@ -413,11 +413,15 @@ export class SettingsManager {
 		this.mergeEffectiveSettings();
 	}
 
-	private applyProfile(settings: Settings, profileName: string | undefined): Settings {
+	private getProfileOverlay(settings: Settings, profileName: string | undefined): Settings {
 		if (!profileName) {
-			return settings;
+			return {};
 		}
-		return deepMergeSettings(settings, sanitizeProfileSettings(getOwnProfileSettings(settings, profileName)));
+		return sanitizeProfileSettings(getOwnProfileSettings(settings, profileName));
+	}
+
+	private applyProfile(settings: Settings, profileName: string | undefined): Settings {
+		return deepMergeSettings(settings, this.getProfileOverlay(settings, profileName));
 	}
 
 	private reportMissingProfile(profileName: string): void {
@@ -440,9 +444,15 @@ export class SettingsManager {
 		const profileName = this.requestedProfile ?? normalizeProfileName(baseSettings.defaultProfile);
 		this.activeProfile = profileName;
 		this.globalEffectiveSettings = this.applyProfile(this.globalSettings, profileName);
-		this.projectEffectiveSettings = this.projectTrusted ? this.applyProfile(this.projectSettings, profileName) : {};
+		const projectProfileOverlay = this.projectTrusted
+			? this.getProfileOverlay(this.projectSettings, profileName)
+			: {};
+		this.projectEffectiveSettings = this.projectTrusted
+			? deepMergeSettings(this.projectSettings, projectProfileOverlay)
+			: {};
 
-		let merged = deepMergeSettings(this.globalEffectiveSettings, this.projectEffectiveSettings);
+		let merged = deepMergeSettings(this.globalEffectiveSettings, this.projectTrusted ? this.projectSettings : {});
+		merged = deepMergeSettings(merged, projectProfileOverlay);
 		if (Object.keys(this.sessionOverrides).length > 0) {
 			merged = deepMergeSettings(merged, this.sessionOverrides);
 		}

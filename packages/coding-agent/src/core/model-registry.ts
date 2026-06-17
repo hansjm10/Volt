@@ -891,6 +891,14 @@ export class ModelRegistry {
 	}
 
 	/**
+	 * Clear all providers registered by extensions and reload disk-backed models.
+	 */
+	clearRegisteredProviders(): void {
+		this.registeredProviders.clear();
+		this.refresh();
+	}
+
+	/**
 	 * Upsert a provider config into registeredProviders.
 	 * If the provider is already registered, defined values in the incoming config
 	 * override existing ones; undefined values are preserved from the stored config.

@@ -14,7 +14,7 @@ import { getNpmUpdateSpec, parseNpmSpec } from "../utils/npm-spec.ts";
 import { canonicalizePath, isLocalPath, markPathIgnoredByCloudSync, resolvePath } from "../utils/paths.ts";
 import { getSubprocessEnv } from "../utils/process-env.ts";
 import { isStdoutTakenOver } from "./output-guard.ts";
-import type { PackageSource, SettingsManager } from "./settings-manager.ts";
+import type { PackageSource, ProfileSettings, Settings, SettingsManager } from "./settings-manager.ts";
 
 const NETWORK_TIMEOUT_MS = 10000;
 const UPDATE_CHECK_CONCURRENCY = 4;
@@ -196,6 +196,10 @@ const FILE_PATTERNS: Record<ResourceType, RegExp> = {
 
 function toPosixPath(p: string): string {
 	return p.split(sep).join("/");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function getHomeDir(): string {
@@ -810,14 +814,7 @@ export class DefaultPackageManager implements PackageManager {
 
 	removeSourceFromSettings(source: string, options?: { local?: boolean }): boolean {
 		const scope: InstalledSourceScope = options?.local ? "project" : "user";
-		const currentSettings =
-			scope === "project"
-				? this.settingsManager.getProjectEffectiveSettings()
-				: this.settingsManager.getGlobalEffectiveSettings();
-		const currentPackages = currentSettings.packages ?? [];
-		const matches = new Set(this.getPackageSourceMatchesForAction(currentPackages, source, scope));
-		const nextPackages = currentPackages.filter((existing) => !matches.has(existing));
-		const changed = nextPackages.length !== currentPackages.length;
+		const { nextPackages, changed } = this.getPackageRemovalChange(source, scope);
 		if (!changed) {
 			return false;
 		}
@@ -967,6 +964,76 @@ export class DefaultPackageManager implements PackageManager {
 		return this.resolvePathFromBase(parsed.path, this.getBaseDirForScope(scope));
 	}
 
+	private getPackageRemovalChange(
+		source: string,
+		scope: InstalledSourceScope,
+	): { nextPackages: PackageSource[]; changed: boolean } {
+		const currentSettings =
+			scope === "project"
+				? this.settingsManager.getProjectEffectiveSettings()
+				: this.settingsManager.getGlobalEffectiveSettings();
+		const currentPackages = currentSettings.packages ?? [];
+		const matches = new Set(this.getPackageSourceMatchesForAction(currentPackages, source, scope));
+		const nextPackages = currentPackages.filter((existing) => !matches.has(existing));
+		return { nextPackages, changed: nextPackages.length !== currentPackages.length };
+	}
+
+	private isPackageReferencedAfterRemoval(
+		source: string,
+		scope: InstalledSourceScope,
+		nextPackages: PackageSource[],
+		changed: boolean,
+	): boolean {
+		const settings =
+			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
+		if (!changed) {
+			return this.isPackageReferencedInSettings(source, scope, settings);
+		}
+		return this.isPackageReferencedInSettings(
+			source,
+			scope,
+			this.applyPackageRemovalToRawSettings(settings, nextPackages),
+		);
+	}
+
+	private applyPackageRemovalToRawSettings(settings: Settings, nextPackages: PackageSource[]): Settings {
+		const activeProfile = this.settingsManager.getActiveProfile();
+		const nextSettings = structuredClone(settings);
+		if (!activeProfile) {
+			nextSettings.packages = nextPackages;
+			return nextSettings;
+		}
+
+		const currentProfiles = isRecord(nextSettings.profiles) ? nextSettings.profiles : {};
+		const profiles: Record<string, ProfileSettings> = {};
+		for (const [profileName, profileSettings] of Object.entries(currentProfiles)) {
+			if (isRecord(profileSettings)) {
+				profiles[profileName] = profileSettings as ProfileSettings;
+			}
+		}
+		const currentProfile = isRecord(profiles[activeProfile]) ? profiles[activeProfile] : {};
+		profiles[activeProfile] = { ...currentProfile, packages: nextPackages };
+		nextSettings.profiles = profiles;
+		return nextSettings;
+	}
+
+	private isPackageReferencedInSettings(source: string, scope: InstalledSourceScope, settings: Settings): boolean {
+		const packageLists: PackageSource[][] = [];
+		if (Array.isArray(settings.packages)) {
+			packageLists.push(settings.packages);
+		}
+
+		if (isRecord(settings.profiles)) {
+			for (const profileSettings of Object.values(settings.profiles)) {
+				if (isRecord(profileSettings) && Array.isArray(profileSettings.packages)) {
+					packageLists.push(profileSettings.packages);
+				}
+			}
+		}
+
+		return packageLists.some((packages) => this.getPackageSourceMatchesForAction(packages, source, scope).length > 0);
+	}
+
 	async install(source: string, options?: PackageInstallOptions): Promise<void> {
 		const parsed = this.parseSource(source);
 		const scope: SourceScope = options?.local ? "project" : "user";
@@ -1018,7 +1085,12 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	async removeAndPersist(source: string, options?: { local?: boolean }): Promise<boolean> {
-		await this.remove(source, options);
+		const scope: InstalledSourceScope = options?.local ? "project" : "user";
+		const { nextPackages, changed } = this.getPackageRemovalChange(source, scope);
+		const shouldRemoveInstalledPackage = !this.isPackageReferencedAfterRemoval(source, scope, nextPackages, changed);
+		if (shouldRemoveInstalledPackage) {
+			await this.remove(source, options);
+		}
 		return this.removeSourceFromSettings(source, options);
 	}
 

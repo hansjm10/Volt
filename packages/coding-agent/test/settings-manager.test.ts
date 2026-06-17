@@ -372,6 +372,36 @@ describe("SettingsManager", () => {
 			expect(reloadedManager.getReviewModel()).toBeUndefined();
 		});
 
+		it("should let project profile clears override inherited global settings", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					reviewModel: "global-review-model",
+					enabledModels: ["global-model"],
+				}),
+			);
+			writeFileSync(
+				join(projectDir, ".volt", "settings.json"),
+				JSON.stringify({
+					profiles: {
+						work: {
+							reviewModel: null,
+							enabledModels: null,
+						},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir, { profile: "work" });
+
+			expect(manager.getGlobalEffectiveSettings().reviewModel).toBe("global-review-model");
+			expect(manager.getGlobalEffectiveSettings().enabledModels).toEqual(["global-model"]);
+			expect(manager.getProjectEffectiveSettings().reviewModel).toBeUndefined();
+			expect(manager.getProjectEffectiveSettings().enabledModels).toBeUndefined();
+			expect(manager.getReviewModel()).toBeUndefined();
+			expect(manager.getEnabledModels()).toBeUndefined();
+		});
+
 		it("should preserve externally added nested fields when updating an active profile setting", async () => {
 			const settingsPath = join(agentDir, "settings.json");
 			writeFileSync(

@@ -17,6 +17,18 @@ interface PackageManagerInternals {
 	updateConfiguredSources(sources: ConfiguredUpdateSourceForTest[]): Promise<void>;
 }
 
+interface NpmSourceForTest {
+	type: "npm";
+	spec: string;
+	name: string;
+	version?: string;
+	pinned: boolean;
+}
+
+interface PackageManagerRemoveInternals {
+	uninstallNpm(source: NpmSourceForTest, scope: "user" | "project" | "temporary"): Promise<void>;
+}
+
 describe("package commands", () => {
 	let tempDir: string;
 	let agentDir: string;
@@ -252,6 +264,46 @@ describe("package commands", () => {
 			expect(errorSpy).not.toHaveBeenCalled();
 			expect(process.exitCode).toBeUndefined();
 		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("does not uninstall an inherited global package removed only by an active profile", async () => {
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify(
+				{
+					packages: ["npm:@base/pkg"],
+					profiles: {
+						work: {},
+					},
+				},
+				null,
+				2,
+			),
+		);
+		const uninstallSpy = vi
+			.spyOn(DefaultPackageManager.prototype as unknown as PackageManagerRemoveInternals, "uninstallNpm")
+			.mockResolvedValue(undefined);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(main(["remove", "npm:@base/pkg", "--profile", "work"])).resolves.toBeUndefined();
+
+			const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")) as {
+				packages?: string[];
+				profiles?: Record<string, { packages?: string[] }>;
+			};
+			expect(settings.packages).toEqual(["npm:@base/pkg"]);
+			expect(settings.profiles?.work?.packages).toEqual([]);
+			expect(uninstallSpy).not.toHaveBeenCalled();
+			expect(logSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain("Removed npm:@base/pkg");
+			expect(errorSpy).not.toHaveBeenCalled();
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			uninstallSpy.mockRestore();
 			logSpy.mockRestore();
 			errorSpy.mockRestore();
 		}

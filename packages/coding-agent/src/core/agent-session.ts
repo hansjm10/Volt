@@ -30,7 +30,6 @@ import {
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	modelsAreEqual,
-	resetApiProviders,
 	streamSimple,
 } from "@earendil-works/volt-ai";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
@@ -2488,7 +2487,7 @@ export class AgentSession {
 		await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
 		await this.settingsManager.reload();
 		this.syncAgentRuntimeSettingsFromSettings();
-		resetApiProviders();
+		this._modelRegistry.clearRegisteredProviders();
 		await this._resourceLoader.reload();
 		this._buildRuntime({
 			activeToolNames: this.getActiveToolNames(),

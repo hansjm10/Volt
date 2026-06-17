@@ -15,7 +15,7 @@ import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { type Settings, SettingsManager } from "../src/core/settings-manager.ts";
-import { createTestResourceLoader } from "./utilities.ts";
+import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
 function getRuntimeProfile(options: Parameters<CreateAgentSessionRuntimeFactory>[0]): string | undefined {
 	if (!("profile" in options)) {
@@ -177,5 +177,76 @@ describe("AgentSessionRuntime profile propagation", () => {
 		expect(agent.transport).toBe("websocket");
 		expect(agent.thinkingBudgets).toEqual({ low: 2000, high: 8000 });
 		expect(agent.maxRetryDelayMs).toBe(250);
+	});
+
+	it("drops providers registered by extensions that disappear after a profile reload", async () => {
+		const faux = registerFauxProvider({
+			models: [{ id: "profile-provider-host-model", reasoning: false }],
+		});
+		const providerName = "profile-extension-provider";
+		const providerModelId = "profile-only-model";
+		let currentExtensionsResult = await createTestExtensionsResult([
+			(volt) => {
+				volt.registerProvider(providerName, {
+					baseUrl: "http://localhost:0/profile-extension",
+					apiKey: "profile-extension-key",
+					api: "profile-extension-api",
+					models: [
+						{
+							id: providerModelId,
+							name: "Profile-only model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 16384,
+						},
+					],
+				});
+			},
+		]);
+		const resourceLoader = createTestResourceLoader({ extensionsResult: currentExtensionsResult });
+		resourceLoader.getExtensions = () => currentExtensionsResult;
+		resourceLoader.reload = async () => {
+			currentExtensionsResult = await createTestExtensionsResult([]);
+		};
+		const settingsManager = SettingsManager.inMemory(
+			{
+				profiles: {
+					withProvider: {},
+					withoutProvider: {},
+				},
+			},
+			{ profile: "withProvider" },
+		);
+		const modelRegistry = ModelRegistry.inMemory(AuthStorage.inMemory());
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: faux.getModel(),
+					systemPrompt: "You are a helpful assistant.",
+					tools: [],
+					thinkingLevel: "off",
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settingsManager,
+			cwd: process.cwd(),
+			modelRegistry,
+			resourceLoader,
+		});
+
+		cleanups.push(() => {
+			modelRegistry.unregisterProvider(providerName);
+			session.dispose();
+			faux.unregister();
+		});
+
+		expect(modelRegistry.find(providerName, providerModelId)).toBeDefined();
+
+		settingsManager.setActiveProfile("withoutProvider");
+		await session.reload();
+
+		expect(modelRegistry.find(providerName, providerModelId)).toBeUndefined();
 	});
 });
