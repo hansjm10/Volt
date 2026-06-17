@@ -870,4 +870,24 @@ describe("SettingsManager", () => {
 			expect(manager.getSessionDir()).toBe(join(homedir(), "sessions"));
 		});
 	});
+
+	describe("turnDoneAlert", () => {
+		it("should default to off", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getTurnDoneAlert()).toBe("off");
+		});
+
+		it("should persist the terminal bell setting without dropping sibling terminal settings", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ terminal: { showImages: false } }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setTurnDoneAlert("bell");
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.terminal).toEqual({ showImages: false, turnDoneAlert: "bell" });
+			expect(manager.getTurnDoneAlert()).toBe("bell");
+		});
+	});
 });

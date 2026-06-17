@@ -189,6 +189,8 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explic
 | `terminal.showImages` | boolean | `true` | Show images in terminal (if supported) |
 | `terminal.imageWidthCells` | number | `60` | Preferred inline image width in terminal cells |
 | `terminal.clearOnShrink` | boolean | `false` | Clear empty rows when content shrinks (can cause flicker) |
+| `terminal.showTerminalProgress` | boolean | `false` | Show OSC 9;4 indeterminate progress in supporting terminal tab bars |
+| `terminal.turnDoneAlert` | string | `"off"` | Alert when Volt finishes a response: `"off"` or `"bell"`. `"bell"` writes the terminal BEL sequence, which most terminals and tmux handle as an audible/visual alert according to terminal settings |
 | `images.autoResize` | boolean | `true` | Resize images to 2000x2000 max |
 | `images.blockImages` | boolean | `false` | Block all images from being sent to LLM |
 

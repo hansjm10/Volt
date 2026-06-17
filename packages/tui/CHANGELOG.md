@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Added required `Terminal.alert()` bell hook; custom `Terminal` implementations must implement it.
+
 ### Changed
 
 - Changed the editor input to render as a full rounded box with side borders instead of only horizontal rules above and below the content.

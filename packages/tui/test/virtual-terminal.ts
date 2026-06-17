@@ -102,6 +102,10 @@ export class VirtualTerminal implements Terminal {
 
 	setProgress(_active: boolean): void {}
 
+	alert(): void {
+		this.xterm.write("\x07");
+	}
+
 	// Test-specific methods not in Terminal interface
 
 	/**

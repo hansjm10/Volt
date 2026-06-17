@@ -116,6 +116,137 @@ describe("InteractiveMode.showStatus", () => {
 	});
 });
 
+describe("InteractiveMode.scheduleTurnDoneAlert", () => {
+	function createFakeThis(options?: {
+		alertMode?: "off" | "bell";
+		streaming?: boolean;
+		compacting?: boolean;
+		retrying?: boolean;
+	}) {
+		return {
+			settingsManager: { getTurnDoneAlert: vi.fn(() => options?.alertMode ?? "bell") },
+			session: {
+				isStreaming: options?.streaming ?? false,
+				isCompacting: options?.compacting ?? false,
+				isRetrying: options?.retrying ?? false,
+			},
+			ui: { terminal: { alert: vi.fn() } },
+			shutdownRequested: false,
+			isShuttingDown: false,
+			turnDoneAlertTimer: undefined,
+			clearTurnDoneAlertTimer: (InteractiveMode as any).prototype.clearTurnDoneAlertTimer,
+			scheduleTurnDoneAlertTimer: (InteractiveMode as any).prototype.scheduleTurnDoneAlertTimer,
+		};
+	}
+
+	test("rings the terminal bell after agent_end when enabled and idle", () => {
+		vi.useFakeTimers();
+		try {
+			const fakeThis = createFakeThis();
+
+			(InteractiveMode as any).prototype.scheduleTurnDoneAlert.call(fakeThis, {
+				type: "agent_end",
+				willRetry: false,
+				messages: [{ role: "assistant", stopReason: "stop" }],
+			});
+
+			expect(fakeThis.ui.terminal.alert).not.toHaveBeenCalled();
+			vi.runOnlyPendingTimers();
+			expect(fakeThis.ui.terminal.alert).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("waits until post-run compaction is idle", () => {
+		vi.useFakeTimers();
+		try {
+			const fakeThis = createFakeThis({ compacting: true });
+
+			(InteractiveMode as any).prototype.scheduleTurnDoneAlert.call(fakeThis, {
+				type: "agent_end",
+				willRetry: false,
+				messages: [{ role: "assistant", stopReason: "stop" }],
+			});
+
+			vi.advanceTimersByTime(0);
+			expect(fakeThis.ui.terminal.alert).not.toHaveBeenCalled();
+			fakeThis.session.isCompacting = false;
+			vi.advanceTimersByTime(250);
+			expect(fakeThis.ui.terminal.alert).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("clears queued alerts when a later agent_end suppresses the alert", () => {
+		vi.useFakeTimers();
+		try {
+			const fakeThis = createFakeThis({ compacting: true });
+
+			(InteractiveMode as any).prototype.scheduleTurnDoneAlert.call(fakeThis, {
+				type: "agent_end",
+				willRetry: false,
+				messages: [{ role: "assistant", stopReason: "stop" }],
+			});
+			vi.advanceTimersByTime(0);
+			expect(fakeThis.ui.terminal.alert).not.toHaveBeenCalled();
+
+			(InteractiveMode as any).prototype.scheduleTurnDoneAlert.call(fakeThis, {
+				type: "agent_end",
+				willRetry: false,
+				messages: [{ role: "assistant", stopReason: "aborted" }],
+			});
+			fakeThis.session.isCompacting = false;
+			vi.advanceTimersByTime(250);
+			expect(fakeThis.ui.terminal.alert).not.toHaveBeenCalled();
+
+			fakeThis.session.isCompacting = true;
+			(InteractiveMode as any).prototype.scheduleTurnDoneAlert.call(fakeThis, {
+				type: "agent_end",
+				willRetry: false,
+				messages: [{ role: "assistant", stopReason: "stop" }],
+			});
+			vi.advanceTimersByTime(0);
+			(InteractiveMode as any).prototype.scheduleTurnDoneAlert.call(fakeThis, {
+				type: "agent_end",
+				willRetry: true,
+				messages: [{ role: "assistant", stopReason: "error" }],
+			});
+			fakeThis.session.isCompacting = false;
+			vi.advanceTimersByTime(250);
+			expect(fakeThis.ui.terminal.alert).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("skips retrying and aborted turns", () => {
+		vi.useFakeTimers();
+		try {
+			const retryingThis = createFakeThis();
+			(InteractiveMode as any).prototype.scheduleTurnDoneAlert.call(retryingThis, {
+				type: "agent_end",
+				willRetry: true,
+				messages: [{ role: "assistant", stopReason: "error" }],
+			});
+
+			const abortedThis = createFakeThis();
+			(InteractiveMode as any).prototype.scheduleTurnDoneAlert.call(abortedThis, {
+				type: "agent_end",
+				willRetry: false,
+				messages: [{ role: "assistant", stopReason: "aborted" }],
+			});
+
+			vi.runOnlyPendingTimers();
+			expect(retryingThis.ui.terminal.alert).not.toHaveBeenCalled();
+			expect(abortedThis.ui.terminal.alert).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
+
 describe("InteractiveMode.setToolsExpanded", () => {
 	test("applies expansion state to the active header and chat entries", () => {
 		const header = { setExpanded: vi.fn() };

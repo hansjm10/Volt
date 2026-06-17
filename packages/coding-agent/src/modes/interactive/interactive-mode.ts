@@ -225,6 +225,7 @@ function isDeadTerminalError(error: unknown): boolean {
 
 const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING =
 	"Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage.";
+const TURN_DONE_ALERT_BUSY_RETRY_MS = 250;
 
 function isAnthropicSubscriptionAuthKey(apiKey: string | undefined): boolean {
 	return typeof apiKey === "string" && apiKey.startsWith("sk-ant-oat");
@@ -382,6 +383,7 @@ export class InteractiveMode {
 
 	// Shutdown state
 	private shutdownRequested = false;
+	private turnDoneAlertTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 
 	// Extension UI state
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
@@ -1839,6 +1841,48 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private clearTurnDoneAlertTimer(): void {
+		if (!this.turnDoneAlertTimer) return;
+		clearTimeout(this.turnDoneAlertTimer);
+		this.turnDoneAlertTimer = undefined;
+	}
+
+	private scheduleTurnDoneAlert(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
+		this.clearTurnDoneAlertTimer();
+		if (this.settingsManager.getTurnDoneAlert() === "off" || event.willRetry || this.shutdownRequested) {
+			return;
+		}
+
+		let stopReason: AssistantMessage["stopReason"] | undefined;
+		for (let i = event.messages.length - 1; i >= 0; i--) {
+			const message = event.messages[i];
+			if (message?.role === "assistant") {
+				stopReason = (message as AssistantMessage).stopReason;
+				break;
+			}
+		}
+		if (stopReason === "aborted") {
+			return;
+		}
+
+		this.scheduleTurnDoneAlertTimer(0);
+	}
+
+	private scheduleTurnDoneAlertTimer(delayMs: number): void {
+		this.turnDoneAlertTimer = setTimeout(() => {
+			this.turnDoneAlertTimer = undefined;
+			if (this.settingsManager.getTurnDoneAlert() === "off" || this.shutdownRequested || this.isShuttingDown) {
+				return;
+			}
+			if (this.session.isStreaming || this.session.isCompacting || this.session.isRetrying) {
+				this.scheduleTurnDoneAlertTimer(TURN_DONE_ALERT_BUSY_RETRY_MS);
+				return;
+			}
+
+			this.ui.terminal.alert();
+		}, delayMs);
+	}
+
 	private setHiddenThinkingLabel(label?: string): void {
 		this.hiddenThinkingLabel = label ?? this.defaultHiddenThinkingLabel;
 		for (const child of this.chatContainer.children) {
@@ -1920,6 +1964,7 @@ export class InteractiveMode {
 			this.hideExtensionEditor();
 		}
 		this.ui.hideOverlay();
+		this.clearTurnDoneAlertTimer();
 		this.clearExtensionTerminalInputListeners();
 		this.setExtensionFooter(undefined);
 		this.setExtensionHeader(undefined);
@@ -3018,6 +3063,7 @@ export class InteractiveMode {
 				this.pendingTools.clear();
 
 				await this.checkShutdownRequested();
+				this.scheduleTurnDoneAlert(event);
 
 				this.ui.requestRender();
 				break;
@@ -4084,6 +4130,7 @@ export class InteractiveMode {
 					quietStartup: this.settingsManager.getQuietStartup(),
 					clearOnShrink: this.settingsManager.getClearOnShrink(),
 					showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
+					turnDoneAlert: this.settingsManager.getTurnDoneAlert(),
 					warnings: this.settingsManager.getWarnings(),
 				},
 				{
@@ -4209,6 +4256,9 @@ export class InteractiveMode {
 					},
 					onShowTerminalProgressChange: (enabled) => {
 						this.settingsManager.setShowTerminalProgress(enabled);
+					},
+					onTurnDoneAlertChange: (mode) => {
+						this.settingsManager.setTurnDoneAlert(mode);
 					},
 					onWarningsChange: (warnings) => {
 						this.settingsManager.setWarnings(warnings);
@@ -6916,6 +6966,7 @@ export class InteractiveMode {
 
 	stop(): void {
 		this.unregisterSignalHandlers();
+		this.clearTurnDoneAlertTimer();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
 		}

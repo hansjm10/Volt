@@ -11,6 +11,7 @@ const cjsRequire = createRequire(import.meta.url);
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
+const TERMINAL_ALERT_SEQUENCE = "\x07";
 const APPLE_TERMINAL_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
 const DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7;
 const KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT_MS = 150;
@@ -91,6 +92,9 @@ export interface Terminal {
 
 	// Progress indicator (OSC 9;4)
 	setProgress(active: boolean): void;
+
+	// Terminal alert/bell
+	alert(): void;
 }
 
 /**
@@ -520,6 +524,12 @@ export class ProcessTerminal implements Terminal {
 			// OSC 9;4;0 - clear progress
 			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
+	}
+
+	alert(): void {
+		// BEL is the most portable terminal alert: local terminals, Windows Terminal,
+		// Apple Terminal, Linux terminal emulators, and tmux all handle or forward it.
+		process.stdout.write(TERMINAL_ALERT_SEQUENCE);
 	}
 
 	private clearProgressInterval(): boolean {
