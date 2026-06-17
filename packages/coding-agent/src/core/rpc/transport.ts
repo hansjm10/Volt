@@ -38,7 +38,7 @@ export interface JsonlRpcTransportOptions {
 export function createJsonlRpcTransport(options: JsonlRpcTransportOptions): RpcTransport {
 	return {
 		write(value) {
-			options.writeLine(serializeJsonLine(value));
+			return options.writeLine(serializeJsonLine(value));
 		},
 		onLine(handler) {
 			return attachJsonlLineReader(options.input, handler);

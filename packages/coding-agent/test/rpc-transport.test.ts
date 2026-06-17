@@ -50,6 +50,16 @@ describe("RPC transports", () => {
 		]);
 	});
 
+	test("returns async JSONL line write results", () => {
+		const writePromise = Promise.resolve();
+		const transport = createJsonlRpcTransport({
+			input: new PassThrough(),
+			writeLine: () => writePromise,
+		});
+
+		expect(transport.write({ ok: true })).toBe(writePromise);
+	});
+
 	test("adapts normal Node readable and writable streams", async () => {
 		const input = new PassThrough();
 		const output = new PassThrough();
