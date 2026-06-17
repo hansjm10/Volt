@@ -1,32 +1,23 @@
 {
-	"name": "volt-azure-devops",
+	"name": "volt-review-loop",
 	"version": "0.1.0",
-	"description": "Azure DevOps integration tools for Volt.",
+	"description": "Run isolated review/fix loops for a branch until findings are resolved.",
 	"type": "module",
-	"keywords": ["volt-package", "volt-extension", "volt", "azure-devops", "ado"],
+	"keywords": [
+		"volt-package",
+		"volt-extension",
+		"volt",
+		"review",
+		"code-review"
+	],
 	"license": "MIT",
-	"files": ["README.md", "extensions"],
+	"files": [
+		"README.md",
+		"extensions"
+	],
 	"volt": {
-		"extensions": ["extensions/azure-devops.ts"]
-	},
-	"dependencies": {
-		"@azure/identity": "4.13.1",
-		"azure-devops-node-api": "15.1.2"
-	},
-	"peerDependencies": {
-		"@earendil-works/volt-ai": "*",
-		"@earendil-works/volt-coding-agent": "*",
-		"typebox": "*"
-	},
-	"peerDependenciesMeta": {
-		"@earendil-works/volt-ai": {
-			"optional": true
-		},
-		"@earendil-works/volt-coding-agent": {
-			"optional": true
-		},
-		"typebox": {
-			"optional": true
-		}
+		"extensions": [
+			"extensions/review-loop.ts"
+		]
 	}
 }
