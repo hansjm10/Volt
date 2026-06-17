@@ -1,6 +1,6 @@
 {
 	"name": "@earendil-works/volt-ai",
-	"version": "0.79.1",
+	"version": "0.79.6",
 	"description": "Unified LLM API with automatic model discovery and provider configuration",
 	"type": "module",
 	"main": "./dist/index.js",
@@ -95,6 +95,7 @@
 		"node": ">=22.19.0"
 	},
 	"devDependencies": {
+		"canvas": "3.2.3",
 		"@types/node": "24.12.4",
 		"vitest": "3.2.6"
 	}

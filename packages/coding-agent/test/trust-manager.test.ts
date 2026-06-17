@@ -2,12 +2,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-	getProjectTrustPath,
-	hasProjectConfigDir,
-	hasProjectTrustInputs,
-	ProjectTrustStore,
-} from "../src/core/trust-manager.ts";
+import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../src/core/trust-manager.ts";
 
 describe("ProjectTrustStore", () => {
 	let tempDir: string;
@@ -33,10 +28,10 @@ describe("ProjectTrustStore", () => {
 		expect(store.getEntry(cwd)).toBeNull();
 		store.set(cwd, true);
 		expect(store.get(cwd)).toBe(true);
-		expect(store.getEntry(cwd)).toEqual({ path: getProjectTrustPath(cwd), decision: true });
+		expect(store.getEntry(cwd)).toEqual({ path: cwd, decision: true });
 		store.set(cwd, false);
 		expect(store.get(cwd)).toBe(false);
-		expect(store.getEntry(cwd)).toEqual({ path: getProjectTrustPath(cwd), decision: false });
+		expect(store.getEntry(cwd)).toEqual({ path: cwd, decision: false });
 		store.set(cwd, null);
 		expect(store.get(cwd)).toBeNull();
 		expect(store.getEntry(cwd)).toBeNull();
@@ -51,13 +46,13 @@ describe("ProjectTrustStore", () => {
 
 		store.set(parentDir, true);
 		expect(store.get(childDir)).toBe(true);
-		expect(store.getEntry(childDir)).toEqual({ path: getProjectTrustPath(parentDir), decision: true });
+		expect(store.getEntry(childDir)).toEqual({ path: parentDir, decision: true });
 		expect(store.get(grandchildDir)).toBe(true);
-		expect(store.getEntry(grandchildDir)).toEqual({ path: getProjectTrustPath(parentDir), decision: true });
+		expect(store.getEntry(grandchildDir)).toEqual({ path: parentDir, decision: true });
 
 		store.set(childDir, false);
 		expect(store.get(grandchildDir)).toBe(false);
-		expect(store.getEntry(grandchildDir)).toEqual({ path: getProjectTrustPath(childDir), decision: false });
+		expect(store.getEntry(grandchildDir)).toEqual({ path: childDir, decision: false });
 	});
 
 	it("can clear a child override to inherit parent trust", () => {
@@ -68,14 +63,14 @@ describe("ProjectTrustStore", () => {
 
 		store.set(parentDir, true);
 		store.set(childDir, false);
-		expect(store.getEntry(childDir)).toEqual({ path: getProjectTrustPath(childDir), decision: false });
+		expect(store.getEntry(childDir)).toEqual({ path: childDir, decision: false });
 
 		store.setMany([
 			{ path: parentDir, decision: true },
 			{ path: childDir, decision: null },
 		]);
 		expect(store.get(childDir)).toBe(true);
-		expect(store.getEntry(childDir)).toEqual({ path: getProjectTrustPath(parentDir), decision: true });
+		expect(store.getEntry(childDir)).toEqual({ path: parentDir, decision: true });
 	});
 
 	it("fails loudly without overwriting malformed trust stores", () => {
@@ -88,24 +83,40 @@ describe("ProjectTrustStore", () => {
 		expect(readFileSync(trustPath, "utf-8")).toBe("{not json");
 	});
 
-	it("detects project trust inputs", () => {
-		expect(hasProjectConfigDir(cwd)).toBe(false);
-		expect(hasProjectTrustInputs(cwd)).toBe(false);
+	it("detects trust-requiring project resources", () => {
+		const originalHome = process.env.HOME;
+		process.env.HOME = tempDir;
+		try {
+			mkdirSync(join(tempDir, ".volt", "agent"), { recursive: true });
+			mkdirSync(join(tempDir, ".agents", "skills"), { recursive: true });
+			expect(hasTrustRequiringProjectResources(tempDir)).toBe(false);
+			expect(hasTrustRequiringProjectResources(cwd)).toBe(false);
 
-		mkdirSync(join(cwd, ".volt"), { recursive: true });
-		expect(hasProjectConfigDir(cwd)).toBe(true);
-		expect(hasProjectTrustInputs(cwd)).toBe(true);
-		rmSync(join(cwd, ".volt"), { recursive: true, force: true });
+			writeFileSync(join(tempDir, ".volt", "settings.json"), "{}");
+			expect(hasTrustRequiringProjectResources(tempDir)).toBe(true);
+			rmSync(join(tempDir, ".volt", "settings.json"), { force: true });
 
-		writeFileSync(join(cwd, "AGENTS.md"), "Project instructions");
-		expect(hasProjectTrustInputs(cwd)).toBe(false);
-		rmSync(join(cwd, "AGENTS.md"), { force: true });
+			mkdirSync(join(cwd, ".volt"), { recursive: true });
+			writeFileSync(join(cwd, ".volt", "settings.json"), "{}");
+			expect(hasTrustRequiringProjectResources(cwd)).toBe(true);
+			rmSync(join(cwd, ".volt"), { recursive: true, force: true });
 
-		writeFileSync(join(cwd, "CLAUDE.md"), "Legacy project instructions");
-		expect(hasProjectTrustInputs(cwd)).toBe(false);
-		rmSync(join(cwd, "CLAUDE.md"), { force: true });
+			writeFileSync(join(cwd, "AGENTS.md"), "Project instructions");
+			expect(hasTrustRequiringProjectResources(cwd)).toBe(false);
+			rmSync(join(cwd, "AGENTS.md"), { force: true });
 
-		mkdirSync(join(cwd, ".agents", "skills"), { recursive: true });
-		expect(hasProjectTrustInputs(cwd)).toBe(true);
+			writeFileSync(join(cwd, "CLAUDE.md"), "Legacy project instructions");
+			expect(hasTrustRequiringProjectResources(cwd)).toBe(false);
+			rmSync(join(cwd, "CLAUDE.md"), { force: true });
+
+			mkdirSync(join(cwd, ".agents", "skills"), { recursive: true });
+			expect(hasTrustRequiringProjectResources(cwd)).toBe(true);
+		} finally {
+			if (originalHome === undefined) {
+				delete process.env.HOME;
+			} else {
+				process.env.HOME = originalHome;
+			}
+		}
 	});
 });

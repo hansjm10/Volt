@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +6,7 @@ import { ENV_AGENT_DIR, PACKAGE_NAME, VERSION } from "../src/config.ts";
 import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { ProjectTrustStore } from "../src/core/trust-manager.ts";
 import { main } from "../src/main.ts";
+import { handlePackageCommand } from "../src/package-manager-cli.ts";
 
 interface ConfiguredUpdateSourceForTest {
 	source: string;
@@ -47,6 +48,10 @@ describe("package commands", () => {
 		return `${major}.${minor}.${Number.parseInt(patch, 10) + 1}`;
 	}
 
+	async function runPackageCommandDirectly(args: string[]): Promise<void> {
+		expect(await handlePackageCommand(args)).toBe(true);
+	}
+
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `volt-package-commands-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		agentDir = join(tempDir, "agent");
@@ -64,12 +69,21 @@ describe("package commands", () => {
 		originalExitCode = process.exitCode;
 		originalExecPath = process.execPath;
 		process.exitCode = undefined;
+		vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+			if (code === undefined || code === null || Number(code) === 0) {
+				process.exitCode = undefined;
+			} else {
+				process.exitCode = code;
+			}
+			return undefined as never;
+		}) as typeof process.exit);
 		process.env[ENV_AGENT_DIR] = agentDir;
 		process.chdir(projectDir);
 	});
 
 	afterEach(() => {
 		vi.unstubAllGlobals();
+		vi.restoreAllMocks();
 		process.chdir(originalCwd);
 		process.exitCode = originalExitCode;
 		if (originalAgentDir === undefined) {
@@ -403,6 +417,69 @@ describe("package commands", () => {
 		}
 	});
 
+	it("does not prompt or ask extensions for project trust during update", async () => {
+		mkdirSync(join(projectDir, ".volt"), { recursive: true });
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultProjectTrust: "always" }));
+		const fakeNpmPath = join(tempDir, "fake-project-npm.cjs");
+		const recordPath = join(tempDir, "project-update.json");
+		writeFileSync(
+			fakeNpmPath,
+			`const fs=require("node:fs");fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(process.argv.slice(2)));`,
+		);
+		writeFileSync(
+			join(projectDir, ".volt", "settings.json"),
+			JSON.stringify({ packages: ["npm:fake-package"], npmCommand: [originalExecPath, fakeNpmPath] }),
+		);
+		let projectTrustCalled = false;
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		try {
+			await expect(
+				main(["update", "--extensions"], {
+					extensionFactories: [
+						(volt) => {
+							volt.on("project_trust", () => {
+								projectTrustCalled = true;
+								return { trusted: "yes" };
+							});
+						},
+					],
+				}),
+			).resolves.toBeUndefined();
+
+			expect(projectTrustCalled).toBe(false);
+			expect(existsSync(recordPath)).toBe(false);
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("uses saved project trust during update", async () => {
+		mkdirSync(join(projectDir, ".volt"), { recursive: true });
+		const fakeNpmPath = join(tempDir, "fake-trusted-project-npm.cjs");
+		const recordPath = join(tempDir, "trusted-project-update.json");
+		writeFileSync(
+			fakeNpmPath,
+			`const fs=require("node:fs");fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(process.argv.slice(2)));`,
+		);
+		writeFileSync(
+			join(projectDir, ".volt", "settings.json"),
+			JSON.stringify({ packages: ["npm:fake-package"], npmCommand: [originalExecPath, fakeNpmPath] }),
+		);
+		new ProjectTrustStore(agentDir).set(projectDir, true);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		try {
+			await expect(main(["update", "--extensions"])).resolves.toBeUndefined();
+
+			expect(existsSync(recordPath)).toBe(true);
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
 	it("lets trust.json override default project trust", async () => {
 		mkdirSync(join(projectDir, ".volt"), { recursive: true });
 		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultProjectTrust: "always" }));
@@ -424,6 +501,7 @@ describe("package commands", () => {
 
 	it("blocks local package changes when project is untrusted", async () => {
 		mkdirSync(join(projectDir, ".volt"), { recursive: true });
+		writeFileSync(join(projectDir, ".volt", "settings.json"), "{}");
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
@@ -533,7 +611,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["update", "--self", "--force"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["update", "--self", "--force"])).resolves.toBeUndefined();
 
 			expect(process.exitCode).toBeUndefined();
 			expect(errorSpy).not.toHaveBeenCalled();
@@ -632,7 +710,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["update", "--self"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["update", "--self"])).resolves.toBeUndefined();
 
 			expect(process.exitCode).toBeUndefined();
 			expect(errorSpy).not.toHaveBeenCalled();
@@ -682,7 +760,7 @@ else {
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["update", "--self"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["update", "--self"])).resolves.toBeUndefined();
 
 			expect(process.exitCode).toBeUndefined();
 			expect(errorSpy).not.toHaveBeenCalled();
@@ -736,7 +814,7 @@ if(args.includes("install")) process.exit(23);
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["update", "--self"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["update", "--self"])).resolves.toBeUndefined();
 
 			expect(process.exitCode).toBe(1);
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");

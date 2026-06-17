@@ -34,7 +34,7 @@ interface PackageManagerInternals {
 		options?: { cwd?: string; timeoutMs?: number; env?: Record<string, string> },
 	): Promise<string>;
 	getLocalGitUpdateTarget(installedPath: string): Promise<{ ref: string; head: string; fetchArgs: string[] }>;
-	getNpmResolvedVersion(spec: string): Promise<string>;
+	getLatestNpmVersion(packageSpec: string, range?: string): Promise<string>;
 	parseSource(
 		source: string,
 	):
@@ -1129,8 +1129,17 @@ Content`,
 		});
 
 		it("should parse package source types from docs examples", () => {
-			expect((packageManager as any).parseSource("npm:@scope/pkg@1.2.3").type).toBe("npm");
-			expect((packageManager as any).parseSource("npm:pkg").type).toBe("npm");
+			const parseNpm = (source: string) => {
+				const parsed = (packageManager as any).parseSource(source);
+				if (parsed.type !== "npm") {
+					throw new Error(`Expected npm source: ${source}`);
+				}
+				return parsed;
+			};
+
+			expect(parseNpm("npm:@scope/pkg@1.2.3").pinned).toBe(true);
+			expect(parseNpm("npm:@scope/pkg@^1.2.3").pinned).toBe(false);
+			expect(parseNpm("npm:pkg").pinned).toBe(false);
 
 			expect((packageManager as any).parseSource("git:github.com/user/repo@v1").type).toBe("git");
 			expect((packageManager as any).parseSource("https://github.com/user/repo@v1").type).toBe("git");
@@ -2076,20 +2085,47 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			);
 		});
 
-		it("should skip project npm update when installed version matches latest", async () => {
+		it("should update npm range packages using the configured spec", async () => {
 			const installedPath = join(tempDir, ".volt", "npm", "node_modules", "example");
 			mkdirSync(installedPath, { recursive: true });
-			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.2.3" }));
-			settingsManager.setProjectPackages(["npm:example"]);
+			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
+			settingsManager.setProjectPackages(["npm:example@^1.0.0"]);
 
-			const runCommandCaptureSpy = vi.spyOn(packageManager as any, "runCommandCapture").mockResolvedValue('"1.2.3"');
+			const runCommandCaptureSpy = vi
+				.spyOn(packageManager as any, "runCommandCapture")
+				.mockResolvedValue('["1.0.0","1.2.0"]');
 			const runCommandSpy = vi.spyOn(packageManager as any, "runCommand").mockResolvedValue(undefined);
 
 			await packageManager.update("npm:example");
 
 			expect(runCommandCaptureSpy).toHaveBeenCalledWith(
 				"npm",
-				["view", "example@latest", "version", "--json"],
+				["view", "example@^1.0.0", "version", "--json"],
+				expect.objectContaining({ cwd: tempDir, timeoutMs: expect.any(Number) }),
+			);
+			expect(runCommandSpy).toHaveBeenCalledWith(
+				"npm",
+				["install", "example@^1.0.0", "--prefix", join(tempDir, ".volt", "npm"), "--legacy-peer-deps"],
+				undefined,
+			);
+		});
+
+		it("should skip project npm update when installed version matches latest", async () => {
+			const installedPath = join(tempDir, ".volt", "npm", "node_modules", "example");
+			mkdirSync(installedPath, { recursive: true });
+			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.3.1" }));
+			settingsManager.setProjectPackages(["npm:example@^1.0.0"]);
+
+			const runCommandCaptureSpy = vi
+				.spyOn(packageManager as any, "runCommandCapture")
+				.mockResolvedValue('["1.0.0","1.3.1","1.0.2"]');
+			const runCommandSpy = vi.spyOn(packageManager as any, "runCommand").mockResolvedValue(undefined);
+
+			await packageManager.update("npm:example");
+
+			expect(runCommandCaptureSpy).toHaveBeenCalledWith(
+				"npm",
+				["view", "example@^1.0.0", "version", "--json"],
 				expect.objectContaining({ cwd: tempDir, timeoutMs: expect.any(Number) }),
 			);
 			expect(runCommandSpy).not.toHaveBeenCalled();
@@ -2303,7 +2339,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			mkdirSync(join(installedPath, "extensions"), { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
 			writeFileSync(join(installedPath, "extensions", "index.ts"), "export default function() {};");
-			settingsManager.setProjectPackages(["npm:example"]);
+			settingsManager.setProjectPackages(["npm:example@^1.0.0"]);
 
 			const runCommandCaptureSpy = vi.spyOn(packageManager as any, "runCommandCapture");
 
@@ -2377,7 +2413,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			const managerWithInternals = packageManager as unknown as PackageManagerInternals;
 			const runCommandCaptureSpy = vi.spyOn(managerWithInternals, "runCommandCapture").mockResolvedValue('"1.2.3"');
 
-			const latest = await managerWithInternals.getNpmResolvedVersion("example@latest");
+			const latest = await managerWithInternals.getLatestNpmVersion("example@latest");
 			expect(latest).toBe("1.2.3");
 			expect(runCommandCaptureSpy).toHaveBeenCalledTimes(1);
 			expect(runCommandCaptureSpy).toHaveBeenCalledWith(
@@ -2400,7 +2436,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			const managerWithInternals = packageManager as unknown as PackageManagerInternals;
 			const runCommandCaptureSpy = vi.spyOn(managerWithInternals, "runCommandCapture").mockResolvedValue('"1.2.3"');
 
-			const latest = await managerWithInternals.getNpmResolvedVersion("@scope/pkg@latest");
+			const latest = await managerWithInternals.getLatestNpmVersion("@scope/pkg@latest");
 			expect(latest).toBe("1.2.3");
 			expect(runCommandCaptureSpy).toHaveBeenCalledWith(
 				"mise",

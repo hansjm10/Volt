@@ -9,6 +9,7 @@ const EXPECTED_CURRENT_ADAPTIVE_THINKING_MODELS = [
 ];
 
 const EXPECTED_CATALOG_ADAPTIVE_THINKING_MODELS = [
+	"cloudflare-ai-gateway/claude-fable-5",
 	"vercel-ai-gateway/anthropic/claude-fable-5",
 	"vercel-ai-gateway/anthropic/claude-opus-4.8",
 ];

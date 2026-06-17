@@ -319,7 +319,7 @@ export {
 	withFileMutationQueue,
 } from "./core/tools/index.ts";
 export {
-	hasProjectTrustInputs,
+	hasTrustRequiringProjectResources,
 	type ProjectTrustDecision,
 	ProjectTrustStore,
 	type ProjectTrustStoreEntry,

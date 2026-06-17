@@ -6,6 +6,7 @@
 //
 // Intentionally left alone:
 // - CHANGELOG.md files (upstream issue/PR links must keep pointing at pi-mono)
+// - .volt merge guidance (must describe the upstream Pi package names)
 // - package-lock.json / npm-shrinkwrap.json (regenerated, not hand-edited)
 // - github.com/earendil-works/pi-mono URLs (don't match the scoped-package pattern)
 //
@@ -22,6 +23,7 @@ const pattern = /@earendil-works\/pi-/g;
 const extensions = [".ts", ".tsx", ".js", ".mjs", ".cjs", ".json", ".md"];
 const skip = (file) =>
 	file.endsWith("CHANGELOG.md") ||
+	file === ".volt/skills/merge-upstream.md" ||
 	file.endsWith("package-lock.json") ||
 	file.endsWith("npm-shrinkwrap.json") ||
 	file === "scripts/rename-upstream.mjs";
