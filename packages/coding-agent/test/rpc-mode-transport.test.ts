@@ -29,6 +29,38 @@ afterEach(() => {
 });
 
 describe("RPC mode caller-provided transports", () => {
+	test("rejects and closes when a command response write rejects", async () => {
+		let lineHandler: ((line: string) => void) | undefined;
+		const detachInput = vi.fn();
+		const detachClose = vi.fn();
+		const writeError = new Error("write failed");
+		const transportClose = vi.fn(async () => {});
+		const transport: RpcTransport = {
+			write: vi.fn(() => Promise.reject(writeError)),
+			onLine: vi.fn((handler) => {
+				lineHandler = handler;
+				return detachInput;
+			}),
+			onClose: vi.fn(() => detachClose),
+			waitForBackpressure: vi.fn(async () => {}),
+			flush: vi.fn(async () => {}),
+			close: transportClose,
+		};
+		const { runtimeHost, dispose } = createRuntimeHost();
+
+		const modePromise = runRpcMode(runtimeHost, { transport });
+		await vi.waitFor(() => expect(lineHandler).toBeDefined());
+
+		lineHandler?.(JSON.stringify({ id: "write-failure", type: "unknown_command" }));
+
+		await expect(modePromise).rejects.toBe(writeError);
+		expect(transport.write).toHaveBeenCalledOnce();
+		expect(dispose).toHaveBeenCalledOnce();
+		expect(detachInput).toHaveBeenCalledOnce();
+		expect(detachClose).toHaveBeenCalledOnce();
+		expect(transportClose).toHaveBeenCalledOnce();
+	});
+
 	test("close without exiting the embedding process", async () => {
 		let closeHandler: RpcCloseHandler | undefined;
 		const detachInput = vi.fn();

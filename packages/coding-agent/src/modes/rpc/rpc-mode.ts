@@ -90,6 +90,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	const pendingWrites = new Set<Promise<void>>();
 	let hasPendingWriteError = false;
 	let pendingWriteError: unknown;
+	const toError = (value: unknown): Error => (value instanceof Error ? value : new Error(String(value)));
 	const trackTransportWrite = (result: void | Promise<void>): void => {
 		if (!result) {
 			return;
@@ -114,7 +115,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			const error = pendingWriteError;
 			hasPendingWriteError = false;
 			pendingWriteError = undefined;
-			throw error instanceof Error ? error : new Error(String(error));
+			throw toError(error);
 		}
 		await transport.waitForBackpressure?.();
 	};
@@ -754,7 +755,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	 * Check if shutdown was requested and perform shutdown if so.
 	 * Called after handling each command when waiting for the next command.
 	 */
-	function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<void> {
+	function shutdown(exitCode = 0, signal?: NodeJS.Signals, failure?: { error: unknown }): Promise<void> {
 		if (shuttingDown) {
 			if (shouldExitProcess) {
 				process.exit(exitCode);
@@ -764,8 +765,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		shuttingDown = true;
 		shutdownPromise = (async () => {
 			try {
-				let hasShutdownError = false;
-				let shutdownError: unknown;
+				let hasShutdownError = failure !== undefined;
+				let shutdownError: unknown = failure?.error;
 				try {
 					for (const cleanup of signalCleanupHandlers) {
 						cleanup();
@@ -775,13 +776,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 					await runtimeHost.dispose();
 					detachInput();
 					detachClose();
-					if (signal !== "SIGTERM") {
+					if (signal !== "SIGTERM" && !hasShutdownError) {
 						await waitForTransportBackpressure();
 						await transport.flush?.();
 					}
 				} catch (error: unknown) {
-					hasShutdownError = true;
-					shutdownError = error;
+					if (!hasShutdownError) {
+						hasShutdownError = true;
+						shutdownError = error;
+					}
 				} finally {
 					try {
 						await transport.close();
@@ -848,27 +851,26 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		}
 
 		const command = parsed as RpcCommand;
+		let response: RpcResponse | undefined;
 		try {
-			const response = await handleCommand(command);
-			if (response) {
-				output(response);
-				await waitForTransportBackpressure();
-			}
-			await checkShutdownRequested();
+			response = await handleCommand(command);
 		} catch (commandError: unknown) {
-			output(
-				error(
-					command.id,
-					command.type,
-					commandError instanceof Error ? commandError.message : String(commandError),
-				),
-			);
+			output(error(command.id, command.type, toError(commandError).message));
+			await waitForTransportBackpressure();
+			await checkShutdownRequested();
+			return;
+		}
+		if (response) {
+			output(response);
 			await waitForTransportBackpressure();
 		}
+		await checkShutdownRequested();
 	};
 
 	detachInput = transport.onLine((line) => {
-		void handleInputLine(line);
+		void handleInputLine(line).catch((inputError: unknown) => {
+			void shutdown(1, undefined, { error: toError(inputError) }).catch(() => {});
+		});
 	});
 	detachClose =
 		transport.onClose?.(() => {
