@@ -437,6 +437,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	});
 
 	const rebindSession = async (): Promise<void> => {
+		if (shuttingDown) return;
 		session = runtimeHost.session;
 		await session.bindExtensions({
 			uiContext: createExtensionUIContext(),
@@ -471,6 +472,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
 			},
 		});
+		if (shuttingDown) return;
 
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
@@ -1013,7 +1015,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	if (shouldExitProcess) {
 		registerSignalHandlers();
 	}
-	options.onReady?.();
+	try {
+		options.onReady?.();
+	} catch (readyError: unknown) {
+		void modeClosed.catch(() => {});
+		await shutdown(1, undefined, { error: readyError });
+		throw readyError;
+	}
 
 	// Keep RPC mode active until shutdown completes.
 	return modeClosed;
