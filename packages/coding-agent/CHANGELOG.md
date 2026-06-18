@@ -24,6 +24,7 @@
 - Added an automated fake-RPC scenario runner for the Iroh sidecar PoC covering local prompt streaming, state retrieval, pairing, revocation, expired tickets, and workspace preflight failures.
 - Added a core RPC transport abstraction so RPC mode can run over adapters other than process stdin/stdout.
 - Added an in-process Iroh RPC transport adapter for running Volt RPC directly over Iroh bidirectional streams.
+- Added typed core Iroh remote helpers for tickets, handshakes, host state, client authorization, workspaces, remote RPC command filtering, and an in-process Iroh remote RPC mode wrapper.
 
 ### Fixed
 
