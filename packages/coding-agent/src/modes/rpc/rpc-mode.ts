@@ -511,17 +511,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		}
 	};
 
-	try {
-		await rebindSession();
-	} catch (startupError: unknown) {
-		try {
-			await cleanupStartupFailure();
-		} catch {}
-		throw startupError;
-	}
-	if (shouldExitProcess) {
-		registerSignalHandlers();
-	}
+	let startupComplete = false;
+	const queuedStartupCommandLines: string[] = [];
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
@@ -900,7 +891,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			return;
 		}
 
-		// Handle extension UI responses
+		// Handle extension UI responses during startup as well as normal operation.
 		if (
 			typeof parsed === "object" &&
 			parsed !== null &&
@@ -913,6 +904,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				pendingExtensionRequests.delete(response.id);
 				pending.resolve(response);
 			}
+			return;
+		}
+
+		if (!startupComplete) {
+			queuedStartupCommandLines.push(line);
 			return;
 		}
 
@@ -933,11 +929,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		await checkShutdownRequested();
 	};
 
-	detachInput = transport.onLine((line) => {
+	const processInputLine = (line: string): void => {
 		void handleInputLine(line).catch((inputError: unknown) => {
 			void shutdown(1, undefined, { error: toError(inputError) }).catch(() => {});
 		});
-	});
+	};
+
+	detachInput = transport.onLine(processInputLine);
 	detachClose =
 		transport.onClose?.((transportError) => {
 			if (transportError) {
@@ -946,6 +944,22 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			}
 			void shutdown().catch(() => {});
 		}) ?? (() => {});
+
+	try {
+		await rebindSession();
+	} catch (startupError: unknown) {
+		try {
+			await cleanupStartupFailure();
+		} catch {}
+		throw startupError;
+	}
+	startupComplete = true;
+	for (const line of queuedStartupCommandLines.splice(0)) {
+		processInputLine(line);
+	}
+	if (shouldExitProcess) {
+		registerSignalHandlers();
+	}
 	options.onReady?.();
 
 	// Keep RPC mode active until shutdown completes.

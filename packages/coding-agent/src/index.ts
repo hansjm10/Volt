@@ -402,6 +402,7 @@ export { type MainOptions, main } from "./main.ts";
 export {
 	createInProcessRpcClient,
 	InProcessRpcClient,
+	type InProcessRpcClientEventListener,
 	type InProcessRpcClientOptions,
 	InteractiveMode,
 	type InteractiveModeOptions,

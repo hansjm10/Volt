@@ -1,11 +1,16 @@
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import { createLoopbackRpcTransportPair } from "../../core/rpc/index.ts";
+import type { RpcClientEvent } from "./rpc-client-base.ts";
 import { runRpcMode } from "./rpc-mode.ts";
 import { RpcTransportClient } from "./rpc-transport-client.ts";
+
+export type InProcessRpcClientEventListener = (event: RpcClientEvent, client: InProcessRpcClient) => void;
 
 export interface InProcessRpcClientOptions {
 	/** Milliseconds to wait for a command response. Defaults to 30 seconds. */
 	requestTimeoutMs?: number;
+	/** Initial event listener registered before startup completes. */
+	onEvent?: InProcessRpcClientEventListener;
 }
 
 interface InProcessRpcClientConstructorOptions extends InProcessRpcClientOptions {
@@ -25,6 +30,13 @@ export class InProcessRpcClient extends RpcTransportClient {
 	constructor(options: InProcessRpcClientConstructorOptions) {
 		const pair = createLoopbackRpcTransportPair();
 		super({ transport: pair.client, requestTimeoutMs: options.requestTimeoutMs });
+
+		const initialEventListener = options.onEvent;
+		if (initialEventListener) {
+			this.onEvent((event) => {
+				initialEventListener(event, this);
+			});
+		}
 
 		let readySettled = false;
 		let resolveReady: () => void = () => {};

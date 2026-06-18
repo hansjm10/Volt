@@ -7,6 +7,7 @@ export { type PrintModeOptions, runPrintMode } from "./print-mode.ts";
 export {
 	createInProcessRpcClient,
 	InProcessRpcClient,
+	type InProcessRpcClientEventListener,
 	type InProcessRpcClientOptions,
 } from "./rpc/in-process-rpc-client.ts";
 export { type IrohRemoteRpcModeOptions, runIrohRemoteRpcMode } from "./rpc/iroh-remote-rpc-mode.ts";

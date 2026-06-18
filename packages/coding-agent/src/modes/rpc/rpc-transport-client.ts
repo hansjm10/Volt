@@ -31,14 +31,23 @@ export class RpcTransportClient extends RpcClientBase {
 		}
 
 		this.clearFailureError();
-		this.detachInput = this.transport.onLine((line) => {
-			this.handleLine(line);
-		});
-		this.detachClose =
-			this.transport.onClose?.((error) => {
-				this.handleTransportClose(error);
-			}) ?? (() => {});
 		this.started = true;
+		try {
+			this.detachInput = this.transport.onLine((line) => {
+				this.handleLine(line);
+			});
+			this.detachClose =
+				this.transport.onClose?.((error) => {
+					this.handleTransportClose(error);
+				}) ?? (() => {});
+		} catch (error: unknown) {
+			this.started = false;
+			this.detachInput?.();
+			this.detachInput = undefined;
+			this.detachClose?.();
+			this.detachClose = undefined;
+			throw error;
+		}
 	}
 
 	async stop(): Promise<void> {

@@ -126,6 +126,43 @@ describe("createInProcessRpcClient", () => {
 		}
 	});
 
+	test("handles extension UI requests emitted while binding startup extensions", async () => {
+		const responsePromises: Promise<void>[] = [];
+		const dispose = vi.fn(async () => {});
+		const runtimeHost = createRuntimeHost(dispose, async (bindings) => {
+			const uiContext = bindings.uiContext;
+			if (!uiContext) {
+				throw new Error("UI context was not bound");
+			}
+			const confirmed = await uiContext.confirm("Startup", "Continue?", { timeout: 250 });
+			if (!confirmed) {
+				throw new Error("startup UI was not confirmed");
+			}
+		});
+
+		const client = await createInProcessRpcClient(runtimeHost, {
+			onEvent(event, pendingClient) {
+				if (event.type === "extension_ui_request" && event.method === "confirm") {
+					const responsePromise = pendingClient.sendExtensionUIResponse({
+						type: "extension_ui_response",
+						id: event.id,
+						confirmed: true,
+					});
+					responsePromises.push(responsePromise);
+					void responsePromise.catch(() => {});
+				}
+			},
+		});
+
+		try {
+			await expect(Promise.all(responsePromises)).resolves.toEqual([undefined]);
+			await expect(client.getState()).resolves.toMatchObject({ sessionId: "in-process-session" });
+		} finally {
+			await client.stop();
+		}
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
 	test("rejects with the startup error when RPC mode cannot bind extensions", async () => {
 		const bindError = new Error("bind failed");
 		const dispose = vi.fn(async () => {});
