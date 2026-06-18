@@ -1,23 +1,57 @@
 {
-	"name": "volt-review-loop",
-	"version": "0.1.0",
-	"description": "Run isolated review/fix loops for a branch until findings are resolved.",
+	"name": "volt-build-ios-apps",
+	"version": "0.1.2",
+	"description": "Build, profile, debug, and refine iOS apps with SwiftUI and Xcode workflows.",
 	"type": "module",
 	"keywords": [
 		"volt-package",
+		"volt-skill",
+		"ios",
+		"swift",
+		"swiftui",
+		"xcode",
+		"xcodebuildmcp",
+		"mcp",
 		"volt-extension",
-		"volt",
-		"review",
-		"code-review"
+		"app-intents",
+		"performance",
+		"debugging"
 	],
 	"license": "MIT",
 	"files": [
 		"README.md",
-		"extensions"
+		".codex-plugin",
+		".mcp.json",
+		"agents",
+		"assets",
+		"extensions",
+		"skills"
 	],
 	"volt": {
 		"extensions": [
-			"extensions/review-loop.ts"
+			"extensions/xcodebuildmcp.ts"
+		],
+		"skills": [
+			"skills"
 		]
+	},
+	"dependencies": {
+		"xcodebuildmcp": "2.6.2"
+	},
+	"peerDependencies": {
+		"@earendil-works/volt-ai": "*",
+		"@earendil-works/volt-coding-agent": "*",
+		"typebox": "*"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/volt-ai": {
+			"optional": true
+		},
+		"@earendil-works/volt-coding-agent": {
+			"optional": true
+		},
+		"typebox": {
+			"optional": true
+		}
 	}
 }

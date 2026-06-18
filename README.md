@@ -1,35 +1,51 @@
-# Review Loop Volt extension
+# Build iOS Apps Volt Package
 
-Run iterative review/fix cycles in isolated context windows.
+Build, profile, debug, and refine iOS apps with SwiftUI and Xcode workflows.
+
+This package vendors OpenAI's `build-ios-apps` plugin payload from `openai/plugins` commit `015c0dff7475b7ee3cddc6cb06789ef302cfa4d6` and exposes its skills through Volt's package manifest.
+
+Volt also loads `extensions/xcodebuildmcp.ts`, which starts pinned `xcodebuildmcp@2.6.2` as a stdio MCP subprocess, discovers its `tools/list` response, and registers each XcodeBuildMCP tool as a native Volt tool. The preserved upstream `.mcp.json` is included for parity with the original plugin payload; Volt does not need it for the native tool path.
 
 ## Install
 
 From the Volt store:
 
 ```text
-/store install review-loop
+/store install build-ios-apps
 ```
 
 Or install the package source directly:
 
 ```bash
-volt install git:https://github.com/hansjm10/Volt@store/review-loop
+volt install git:https://github.com/hansjm10/Volt@store/build-ios-apps
 ```
 
-## Usage
+## Skills
 
-```text
-/review-loop        # up to 5 loops, review current branch vs detected base
-/review-loop 5      # explicit loop limit
-/review-loop main   # review current branch vs main
-/review-loop 3 main # up to 3 loops vs main
-```
+- `ios-debugger-agent`
+- `ios-simulator-browser`
+- `ios-ettrace-performance`
+- `ios-memgraph-leaks`
+- `ios-app-intents`
+- `swiftui-liquid-glass`
+- `swiftui-performance-audit`
+- `swiftui-ui-patterns`
+- `swiftui-view-refactor`
 
-The extension refuses to start unless the git working tree is clean. Each loop:
+## Requirements
 
-1. Reviews the cumulative branch diff (`base...HEAD`) in a separate Volt process.
-2. Fixes all findings in a fresh separate Volt process.
-3. Commits the fix work with a documented `review/work: iteration N` commit.
-4. Reviews the cumulative branch diff again, including previous loop commits.
+- macOS with Xcode and iOS Simulator.
+- `xcodebuild`, `xcrun`, and relevant simulator runtimes installed.
+- Node.js available for the bundled native extension and helper scripts.
+- Optional workflow tools such as `serve-sim`, ETTrace, Instruments, and `leaks`, depending on the selected skill.
+- Optional: set `VOLT_XCODEBUILDMCP_WORKFLOWS` to override the extension default of `simulator,ui-automation,debugging`.
 
-The loop stops when a review reports no findings, a phase fails, no fix changes are produced, or the loop limit is reached.
+## Package Structure
+
+- `package.json`: Volt package manifest that enables the skills and native XcodeBuildMCP extension.
+- `extensions/`: Volt extension that forwards XcodeBuildMCP tools as native Volt tools.
+- `.codex-plugin/plugin.json`: upstream Codex plugin manifest, preserved for parity with the original package.
+- `.mcp.json`: upstream XcodeBuildMCP configuration, preserved with the plugin payload.
+- `agents/`: upstream plugin-level agent metadata.
+- `assets/`: upstream icon assets.
+- `skills/`: upstream skill payload and helper scripts.
