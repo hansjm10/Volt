@@ -1,3 +1,12 @@
+export {
+	createIrohRpcTransport,
+	DEFAULT_IROH_READ_LIMIT,
+	type IrohBiStreamLike,
+	type IrohBytes,
+	type IrohRecvStreamLike,
+	type IrohRpcTransportOptions,
+	type IrohSendStreamLike,
+} from "./iroh-transport.ts";
 export { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 export {
 	createJsonlRpcTransport,

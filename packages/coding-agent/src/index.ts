@@ -189,8 +189,15 @@ export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./co
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
 export {
 	attachJsonlLineReader,
+	createIrohRpcTransport,
 	createJsonlRpcTransport,
 	createJsonlStreamRpcTransport,
+	DEFAULT_IROH_READ_LIMIT,
+	type IrohBiStreamLike,
+	type IrohBytes,
+	type IrohRecvStreamLike,
+	type IrohRpcTransportOptions,
+	type IrohSendStreamLike,
 	type JsonlRpcTransportOptions,
 	type JsonlStreamRpcTransportOptions,
 	type RpcCloseHandler,
