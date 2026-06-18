@@ -275,6 +275,8 @@ export class AgentSession {
 	private _followUpMessages: string[] = [];
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
+	/** Tracks session-level prompt work, including post-agent continuations. */
+	private _activePromptRuns = new Set<Promise<void>>();
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
@@ -964,13 +966,37 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
-		try {
-			await this.agent.prompt(messages);
-			while (await this._handlePostAgentRun()) {
-				await this.agent.continue();
+		const run = (async () => {
+			try {
+				await this.agent.prompt(messages);
+				while (await this._handlePostAgentRun()) {
+					await this.agent.continue();
+				}
+			} finally {
+				this._flushPendingBashMessages();
 			}
+		})();
+		this._activePromptRuns.add(run);
+		try {
+			await run;
 		} finally {
-			this._flushPendingBashMessages();
+			this._activePromptRuns.delete(run);
+		}
+	}
+
+	/** Wait for the agent and any session-level prompt continuations to settle. */
+	async waitForIdle(): Promise<void> {
+		while (true) {
+			const promptRuns = [...this._activePromptRuns];
+			if (promptRuns.length > 0) {
+				await Promise.allSettled(promptRuns);
+				continue;
+			}
+
+			await this.agent.waitForIdle();
+			if (this._activePromptRuns.size === 0) {
+				return;
+			}
 		}
 	}
 

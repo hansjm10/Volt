@@ -75,6 +75,7 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export * from "./remote/iroh/index.ts";
 export {
 	attachJsonlLineReader,
 	createIrohRpcTransport,
