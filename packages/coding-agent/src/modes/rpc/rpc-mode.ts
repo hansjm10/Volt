@@ -490,7 +490,35 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		}
 	};
 
-	await rebindSession();
+	const cleanupStartupFailure = async (): Promise<void> => {
+		try {
+			for (const cleanup of signalCleanupHandlers) {
+				cleanup();
+			}
+			unsubscribe?.();
+			unsubscribeBackpressure?.();
+			await runtimeHost.dispose();
+			detachInput();
+			detachClose();
+		} finally {
+			try {
+				await transport.close();
+			} finally {
+				if (shouldRestoreStdout) {
+					restoreStdout();
+				}
+			}
+		}
+	};
+
+	try {
+		await rebindSession();
+	} catch (startupError: unknown) {
+		try {
+			await cleanupStartupFailure();
+		} catch {}
+		throw startupError;
+	}
 	if (shouldExitProcess) {
 		registerSignalHandlers();
 	}

@@ -87,14 +87,13 @@ describe("createInProcessRpcClient", () => {
 
 	test("rejects with the startup error when RPC mode cannot bind extensions", async () => {
 		const bindError = new Error("bind failed");
-		const runtimeHost = createRuntimeHost(
-			vi.fn(async () => {}),
-			async () => {
-				throw bindError;
-			},
-		);
+		const dispose = vi.fn(async () => {});
+		const runtimeHost = createRuntimeHost(dispose, async () => {
+			throw bindError;
+		});
 
 		await expect(createInProcessRpcClient(runtimeHost)).rejects.toBe(bindError);
+		expect(dispose).toHaveBeenCalledOnce();
 	});
 });
 
