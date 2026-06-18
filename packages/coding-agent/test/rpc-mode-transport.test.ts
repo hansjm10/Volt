@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+import type { ExtensionUIContext } from "../src/core/extensions/index.ts";
 import { isStdoutTakenOver, restoreStdout } from "../src/core/output-guard.ts";
 import type { RpcCloseHandler, RpcTransport } from "../src/core/rpc/transport.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
@@ -208,6 +209,53 @@ describe("RPC mode caller-provided transports", () => {
 		await expect(modePromise).rejects.toThrow("RPC transport closed during startup");
 		expect(subscribe).not.toHaveBeenCalled();
 		expect(agentSubscribe).not.toHaveBeenCalled();
+		expect(detachInput).toHaveBeenCalledOnce();
+		expect(detachClose).toHaveBeenCalledOnce();
+		expect(transportClose).toHaveBeenCalledOnce();
+	});
+
+	test("startup cleanup treats extension shutdown UI requests as cancelled", async () => {
+		let uiContext: ExtensionUIContext | undefined;
+		const detachInput = vi.fn();
+		const detachClose = vi.fn();
+		const startupError = new Error("bind failed");
+		const transportClose = vi.fn(async () => {});
+		const transport: RpcTransport = {
+			write: vi.fn(),
+			onLine: vi.fn(() => detachInput),
+			onClose: vi.fn(() => detachClose),
+			waitForBackpressure: vi.fn(async () => {}),
+			flush: vi.fn(async () => {}),
+			close: transportClose,
+		};
+		const dispose = vi.fn(async () => {
+			if (!uiContext) {
+				throw new Error("missing extension UI context");
+			}
+			const confirmed = await uiContext.confirm("Shutdown", "Continue?");
+			expect(confirmed).toBe(false);
+		});
+		const runtimeHost = {
+			session: {
+				bindExtensions: vi.fn(async (options: { uiContext: ExtensionUIContext }) => {
+					uiContext = options.uiContext;
+					throw startupError;
+				}),
+				subscribe: vi.fn(() => () => {}),
+				agent: {
+					subscribe: vi.fn(() => () => {}),
+				},
+			},
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose,
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+
+		await expect(runRpcMode(runtimeHost, { transport })).rejects.toBe(startupError);
+		expect(dispose).toHaveBeenCalledOnce();
+		expect(transport.write).not.toHaveBeenCalled();
 		expect(detachInput).toHaveBeenCalledOnce();
 		expect(detachClose).toHaveBeenCalledOnce();
 		expect(transportClose).toHaveBeenCalledOnce();

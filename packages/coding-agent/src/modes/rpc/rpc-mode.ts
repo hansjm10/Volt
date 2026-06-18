@@ -515,6 +515,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	};
 
 	const cleanupStartupFailure = async (): Promise<void> => {
+		shuttingDown = true;
 		try {
 			cancelPendingExtensionRequests();
 			for (const cleanup of signalCleanupHandlers) {
