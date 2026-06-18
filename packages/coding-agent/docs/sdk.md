@@ -1038,7 +1038,7 @@ await runPrintMode(runtime, {
 
 ### runRpcMode
 
-JSON-RPC mode for subprocess integration:
+JSON-RPC mode for subprocess or custom transport integration:
 
 ```typescript
 import {
@@ -1067,6 +1067,40 @@ const runtime = await createAgentSessionRuntime(createRuntime, {
 
 await runRpcMode(runtime);
 ```
+
+For same-process RPC clients, use the in-memory transport adapter:
+
+```typescript
+import {
+  createInProcessRpcClient,
+  type CreateAgentSessionRuntimeFactory,
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
+  getAgentDir,
+  SessionManager,
+} from "@earendil-works/volt-coding-agent";
+
+const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
+  const services = await createAgentSessionServices({ cwd });
+  return {
+    ...(await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent })),
+    services,
+    diagnostics: services.diagnostics,
+  };
+};
+const runtime = await createAgentSessionRuntime(createRuntime, {
+  cwd: process.cwd(),
+  agentDir: getAgentDir(),
+  sessionManager: SessionManager.create(process.cwd()),
+});
+
+const client = await createInProcessRpcClient(runtime);
+const state = await client.getState();
+await client.stop(); // also disposes the runtime through RPC mode shutdown
+```
+
+For custom transports, pass any `RpcTransport` to `RpcTransportClient`. This is the client-side adapter used by non-stdio transports such as Iroh streams.
 
 See [RPC documentation](rpc.md) for the JSON protocol.
 
@@ -1100,6 +1134,13 @@ The main entry point exports:
 createAgentSession
 createAgentSessionRuntime
 AgentSessionRuntime
+
+// RPC clients and transports
+RpcClient
+RpcTransportClient
+InProcessRpcClient
+createInProcessRpcClient
+createLoopbackRpcTransportPair
 
 // Auth and Models
 AuthStorage

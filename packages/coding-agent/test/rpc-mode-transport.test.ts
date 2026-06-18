@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+import type { ExtensionUIContext } from "../src/core/extensions/index.ts";
 import { isStdoutTakenOver, restoreStdout } from "../src/core/output-guard.ts";
 import type { RpcCloseHandler, RpcTransport } from "../src/core/rpc/transport.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
@@ -154,6 +155,159 @@ describe("RPC mode caller-provided transports", () => {
 		expect(transportClose).toHaveBeenCalledOnce();
 	});
 
+	test("does not subscribe after startup close interrupts extension binding", async () => {
+		let closeHandler: RpcCloseHandler | undefined;
+		let resolveBindExtensions: (() => void) | undefined;
+		const detachInput = vi.fn();
+		const detachClose = vi.fn();
+		const transportClose = vi.fn(async () => {});
+		const transport: RpcTransport = {
+			write: vi.fn(),
+			onLine: vi.fn(() => detachInput),
+			onClose: vi.fn((handler) => {
+				closeHandler = handler;
+				return detachClose;
+			}),
+			waitForBackpressure: vi.fn(async () => {}),
+			flush: vi.fn(async () => {}),
+			close: transportClose,
+		};
+		const subscribe = vi.fn(() => () => {});
+		const agentSubscribe = vi.fn(() => () => {});
+		const dispose = vi.fn(async () => {});
+		const runtimeHost = {
+			session: {
+				bindExtensions: vi.fn(
+					() =>
+						new Promise<void>((resolve) => {
+							resolveBindExtensions = resolve;
+						}),
+				),
+				subscribe,
+				agent: {
+					subscribe: agentSubscribe,
+				},
+			},
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose,
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+
+		const modePromise = runRpcMode(runtimeHost, { transport });
+		await vi.waitFor(() => {
+			expect(closeHandler).toBeDefined();
+			expect(runtimeHost.session.bindExtensions).toHaveBeenCalledOnce();
+		});
+
+		closeHandler?.();
+		await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce());
+		expect(resolveBindExtensions).toBeDefined();
+		resolveBindExtensions?.();
+
+		await expect(modePromise).rejects.toThrow("RPC transport closed during startup");
+		expect(subscribe).not.toHaveBeenCalled();
+		expect(agentSubscribe).not.toHaveBeenCalled();
+		expect(detachInput).toHaveBeenCalledOnce();
+		expect(detachClose).toHaveBeenCalledOnce();
+		expect(transportClose).toHaveBeenCalledOnce();
+	});
+
+	test("startup cleanup treats extension shutdown UI requests as cancelled", async () => {
+		let uiContext: ExtensionUIContext | undefined;
+		const detachInput = vi.fn();
+		const detachClose = vi.fn();
+		const startupError = new Error("bind failed");
+		const transportClose = vi.fn(async () => {});
+		const transport: RpcTransport = {
+			write: vi.fn(),
+			onLine: vi.fn(() => detachInput),
+			onClose: vi.fn(() => detachClose),
+			waitForBackpressure: vi.fn(async () => {}),
+			flush: vi.fn(async () => {}),
+			close: transportClose,
+		};
+		const dispose = vi.fn(async () => {
+			if (!uiContext) {
+				throw new Error("missing extension UI context");
+			}
+			const confirmed = await uiContext.confirm("Shutdown", "Continue?");
+			expect(confirmed).toBe(false);
+		});
+		const runtimeHost = {
+			session: {
+				bindExtensions: vi.fn(async (options: { uiContext: ExtensionUIContext }) => {
+					uiContext = options.uiContext;
+					throw startupError;
+				}),
+				subscribe: vi.fn(() => () => {}),
+				agent: {
+					subscribe: vi.fn(() => () => {}),
+				},
+			},
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose,
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+
+		await expect(runRpcMode(runtimeHost, { transport })).rejects.toBe(startupError);
+		expect(dispose).toHaveBeenCalledOnce();
+		expect(transport.write).not.toHaveBeenCalled();
+		expect(detachInput).toHaveBeenCalledOnce();
+		expect(detachClose).toHaveBeenCalledOnce();
+		expect(transportClose).toHaveBeenCalledOnce();
+	});
+
+	test("cleans up when onReady throws", async () => {
+		const detachInput = vi.fn();
+		const detachClose = vi.fn();
+		const detachSession = vi.fn();
+		const detachBackpressure = vi.fn();
+		const readyError = new Error("ready failed");
+		const transportClose = vi.fn(async () => {});
+		const transport: RpcTransport = {
+			write: vi.fn(),
+			onLine: vi.fn(() => detachInput),
+			onClose: vi.fn(() => detachClose),
+			waitForBackpressure: vi.fn(async () => {}),
+			flush: vi.fn(async () => {}),
+			close: transportClose,
+		};
+		const dispose = vi.fn(async () => {});
+		const runtimeHost = {
+			session: {
+				bindExtensions: vi.fn(async () => {}),
+				subscribe: vi.fn(() => detachSession),
+				agent: {
+					subscribe: vi.fn(() => detachBackpressure),
+				},
+			},
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose,
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+
+		const modePromise = runRpcMode(runtimeHost, {
+			transport,
+			onReady: () => {
+				throw readyError;
+			},
+		});
+
+		await expect(modePromise).rejects.toBe(readyError);
+		expect(dispose).toHaveBeenCalledOnce();
+		expect(detachInput).toHaveBeenCalledOnce();
+		expect(detachClose).toHaveBeenCalledOnce();
+		expect(detachSession).toHaveBeenCalledOnce();
+		expect(detachBackpressure).toHaveBeenCalledOnce();
+		expect(transportClose).toHaveBeenCalledOnce();
+	});
+
 	test("close without exiting the embedding process", async () => {
 		let closeHandler: RpcCloseHandler | undefined;
 		const detachInput = vi.fn();
@@ -176,8 +330,18 @@ describe("RPC mode caller-provided transports", () => {
 		}) as typeof process.exit);
 
 		try {
-			const modePromise = runRpcMode(runtimeHost, { transport });
-			await vi.waitFor(() => expect(closeHandler).toBeDefined());
+			let resolveReady: () => void = () => {};
+			const ready = new Promise<void>((resolve) => {
+				resolveReady = resolve;
+			});
+			const modePromise = runRpcMode(runtimeHost, {
+				transport,
+				onReady: () => {
+					resolveReady();
+				},
+			});
+			await ready;
+			expect(closeHandler).toBeDefined();
 
 			closeHandler?.();
 
@@ -242,9 +406,19 @@ describe("RPC mode caller-provided transports", () => {
 			close: transportClose,
 		};
 		const { runtimeHost } = createRuntimeHost();
+		let resolveReady: () => void = () => {};
+		const ready = new Promise<void>((resolve) => {
+			resolveReady = resolve;
+		});
 
-		const modePromise = runRpcMode(runtimeHost, { transport });
-		await vi.waitFor(() => expect(closeHandler).toBeDefined());
+		const modePromise = runRpcMode(runtimeHost, {
+			transport,
+			onReady: () => {
+				resolveReady();
+			},
+		});
+		await ready;
+		expect(closeHandler).toBeDefined();
 
 		closeHandler?.();
 
@@ -258,11 +432,19 @@ describe("RPC mode stdio transport", () => {
 	test("restores stdout when non-exiting stdio mode closes", async () => {
 		const initialEndListenerCount = process.stdin.listenerCount("end");
 		const { runtimeHost } = createRuntimeHost();
-
-		const modePromise = runRpcMode(runtimeHost, { exitProcess: false });
-		await vi.waitFor(() => {
-			expect(process.stdin.listenerCount("end")).toBeGreaterThan(initialEndListenerCount);
+		let resolveReady: () => void = () => {};
+		const ready = new Promise<void>((resolve) => {
+			resolveReady = resolve;
 		});
+
+		const modePromise = runRpcMode(runtimeHost, {
+			exitProcess: false,
+			onReady: () => {
+				resolveReady();
+			},
+		});
+		await ready;
+		expect(process.stdin.listenerCount("end")).toBeGreaterThan(initialEndListenerCount);
 		expect(isStdoutTakenOver()).toBe(true);
 
 		process.stdin.emit("end");

@@ -26,6 +26,7 @@
 - Added a core RPC transport abstraction so RPC mode can run over adapters other than process stdin/stdout.
 - Added an in-process Iroh RPC transport adapter for running Volt RPC directly over Iroh bidirectional streams.
 - Added typed core Iroh remote helpers for tickets, handshakes, host state, client authorization, workspaces, remote RPC command filtering, and an in-process Iroh remote RPC mode wrapper.
+- Added transport-backed RPC clients, including an in-memory loopback transport and in-process client helper for running Volt RPC without spawning a subprocess.
 
 ### Fixed
 

@@ -2,7 +2,7 @@
 
 RPC mode enables headless operation of the coding agent via a JSON protocol over stdin/stdout. This is useful for embedding the agent in other applications, IDEs, or custom UIs.
 
-**Note for Node.js/TypeScript users**: If you're building a Node.js application, consider using `AgentSession` directly from `@earendil-works/volt-coding-agent` instead of spawning a subprocess. See [`src/core/agent-session.ts`](../src/core/agent-session.ts) for the API. For a subprocess-based TypeScript client, see [`src/modes/rpc/rpc-client.ts`](../src/modes/rpc/rpc-client.ts).
+**Note for Node.js/TypeScript users**: If you're building a Node.js application, consider using `AgentSession` directly from `@earendil-works/volt-coding-agent` instead of spawning a subprocess. See [`src/core/agent-session.ts`](../src/core/agent-session.ts) for the API. For typed RPC clients, use [`RpcClient`](../src/modes/rpc/rpc-client.ts) for subprocess stdio, [`RpcTransportClient`](../src/modes/rpc/rpc-transport-client.ts) for caller-provided transports, or [`createInProcessRpcClient`](../src/modes/rpc/in-process-rpc-client.ts) to run RPC mode in the same process.
 
 ## Starting RPC Mode
 
@@ -1206,6 +1206,8 @@ Source files:
 - [`src/core/messages.ts`](../src/core/messages.ts) - `BashExecutionMessage`
 - [`src/core/rpc/types.ts`](../src/core/rpc/types.ts) - RPC command/response types, extension UI request/response types
 - [`src/core/rpc/transport.ts`](../src/core/rpc/transport.ts) - RPC transport abstraction and JSONL stream adapters
+- [`src/core/rpc/loopback-transport.ts`](../src/core/rpc/loopback-transport.ts) - in-memory transport pair for in-process clients
+- [`src/modes/rpc/rpc-transport-client.ts`](../src/modes/rpc/rpc-transport-client.ts) - typed RPC client for caller-provided transports
 
 ### Model
 
@@ -1352,7 +1354,7 @@ for event in read_events():
 
 ## Example: Interactive Client (Node.js)
 
-See [`test/rpc-example.ts`](../test/rpc-example.ts) for a complete interactive example, or [`src/modes/rpc/rpc-client.ts`](../src/modes/rpc/rpc-client.ts) for a typed client implementation.
+See [`test/rpc-example.ts`](../test/rpc-example.ts) for a complete interactive example, [`src/modes/rpc/rpc-client.ts`](../src/modes/rpc/rpc-client.ts) for the subprocess typed client, or [`src/modes/rpc/rpc-transport-client.ts`](../src/modes/rpc/rpc-transport-client.ts) for the transport-backed typed client.
 
 For a complete example of handling the extension UI protocol, see [`examples/rpc-extension-ui.ts`](../examples/rpc-extension-ui.ts) which pairs with the [`examples/extensions/rpc-demo.ts`](../examples/extensions/rpc-demo.ts) extension.
 

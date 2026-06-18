@@ -8,6 +8,7 @@ export {
 	type IrohSendStreamLike,
 } from "./iroh-transport.ts";
 export { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
+export { createLoopbackRpcTransportPair, type LoopbackRpcTransportPair } from "./loopback-transport.ts";
 export {
 	createJsonlRpcTransport,
 	createJsonlStreamRpcTransport,
