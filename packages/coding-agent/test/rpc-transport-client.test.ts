@@ -3,6 +3,7 @@ import type { ExtensionBindings } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { createLoopbackRpcTransportPair, type RpcExtensionUIRequest } from "../src/core/rpc/index.ts";
 import { createInProcessRpcClient } from "../src/modes/rpc/in-process-rpc-client.ts";
+import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
 import { RpcTransportClient } from "../src/modes/rpc/rpc-transport-client.ts";
 
 describe("loopback RPC transport", () => {
@@ -66,6 +67,36 @@ describe("RpcTransportClient", () => {
 		pair.server.close();
 
 		await expect(statePromise).rejects.toThrow("RPC transport closed");
+	});
+});
+
+describe("runRpcMode", () => {
+	test("aborts startup extension UI waits when the transport closes", async () => {
+		const pair = createLoopbackRpcTransportPair();
+		const dispose = vi.fn(async () => {});
+		const startupRequest = new Promise<Extract<RpcExtensionUIRequest, { method: "confirm" }>>((resolve) => {
+			pair.client.onLine((line) => {
+				const event = JSON.parse(line) as RpcExtensionUIRequest;
+				if (event.type === "extension_ui_request" && event.method === "confirm") {
+					resolve(event);
+				}
+			});
+		});
+		const runtimeHost = createRuntimeHost(dispose, async (bindings) => {
+			const uiContext = bindings.uiContext;
+			if (!uiContext) {
+				throw new Error("UI context was not bound");
+			}
+			await uiContext.confirm("Startup", "Continue?");
+		});
+		const modePromise = runRpcMode(runtimeHost, { transport: pair.server, exitProcess: false });
+		void modePromise.catch(() => {});
+
+		await startupRequest;
+		pair.client.close();
+
+		await expect(modePromise).rejects.toThrow("RPC transport closed during startup");
+		expect(dispose).toHaveBeenCalledOnce();
 	});
 });
 

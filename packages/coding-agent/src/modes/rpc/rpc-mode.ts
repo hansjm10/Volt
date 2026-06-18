@@ -184,8 +184,16 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	// Pending extension UI requests waiting for response
 	const pendingExtensionRequests = new Map<
 		string,
-		{ resolve: (response: RpcExtensionUIResponse) => void; reject: (error: Error) => void }
+		{ resolve: (response: RpcExtensionUIResponse) => void; cancel: () => void }
 	>();
+
+	const cancelPendingExtensionRequests = (): void => {
+		const requests = Array.from(pendingExtensionRequests.values());
+		pendingExtensionRequests.clear();
+		for (const request of requests) {
+			request.cancel();
+		}
+	};
 
 	/** Helper for dialog methods with signal/timeout support */
 	function createDialogPromise<T>(
@@ -194,10 +202,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		request: Record<string, unknown>,
 		parseResponse: (response: RpcExtensionUIResponse) => T,
 	): Promise<T> {
-		if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
+		if (opts?.signal?.aborted || shuttingDown) return Promise.resolve(defaultValue);
 
 		const id = crypto.randomUUID();
-		return new Promise((resolve, reject) => {
+		return new Promise((resolve) => {
 			let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
 			const cleanup = () => {
@@ -224,7 +232,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 					cleanup();
 					resolve(parseResponse(response));
 				},
-				reject,
+				cancel: () => {
+					cleanup();
+					resolve(defaultValue);
+				},
 			});
 			output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 		});
@@ -352,10 +363,18 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		},
 
 		async editor(title: string, prefill?: string): Promise<string | undefined> {
+			if (shuttingDown) {
+				return undefined;
+			}
+
 			const id = crypto.randomUUID();
-			return new Promise((resolve, reject) => {
+			return new Promise((resolve) => {
+				const cleanup = () => {
+					pendingExtensionRequests.delete(id);
+				};
 				pendingExtensionRequests.set(id, {
 					resolve: (response: RpcExtensionUIResponse) => {
+						cleanup();
 						if ("cancelled" in response && response.cancelled) {
 							resolve(undefined);
 						} else if ("value" in response) {
@@ -364,7 +383,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 							resolve(undefined);
 						}
 					},
-					reject,
+					cancel: () => {
+						cleanup();
+						resolve(undefined);
+					},
 				});
 				output({ type: "extension_ui_request", id, method: "editor", title, prefill } as RpcExtensionUIRequest);
 			});
@@ -492,6 +514,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 
 	const cleanupStartupFailure = async (): Promise<void> => {
 		try {
+			cancelPendingExtensionRequests();
 			for (const cleanup of signalCleanupHandlers) {
 				cleanup();
 			}
@@ -512,6 +535,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	};
 
 	let startupComplete = false;
+	let startupAbortError: Error | undefined;
 	const queuedStartupCommandLines: string[] = [];
 
 	// Handle a single command
@@ -813,6 +837,19 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	 * Called after handling each command when waiting for the next command.
 	 */
 	function shutdown(exitCode = 0, signal?: NodeJS.Signals, failure?: { error: unknown }): Promise<void> {
+		if (!startupComplete) {
+			void modeClosed.catch(() => {});
+			if (!startupAbortError) {
+				if (failure) {
+					startupAbortError = toError(failure.error);
+				} else if (signal) {
+					startupAbortError = new Error(`RPC mode shut down during startup by ${signal}`);
+				} else {
+					startupAbortError = new Error("RPC mode shut down during startup");
+				}
+			}
+		}
+		cancelPendingExtensionRequests();
 		if (shuttingDown) {
 			if (shouldExitProcess) {
 				process.exit(exitCode);
@@ -942,16 +979,32 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				void shutdown(1, undefined, { error: transportError }).catch(() => {});
 				return;
 			}
+			if (!startupComplete) {
+				void shutdown(0, undefined, { error: new Error("RPC transport closed during startup") }).catch(() => {});
+				return;
+			}
 			void shutdown().catch(() => {});
 		}) ?? (() => {});
 
 	try {
 		await rebindSession();
 	} catch (startupError: unknown) {
+		if (shuttingDown) {
+			try {
+				await shutdownPromise;
+			} catch {}
+			throw startupAbortError ?? startupError;
+		}
 		try {
 			await cleanupStartupFailure();
 		} catch {}
 		throw startupError;
+	}
+	if (shuttingDown) {
+		try {
+			await shutdownPromise;
+		} catch {}
+		throw startupAbortError ?? new Error("RPC mode shut down during startup");
 	}
 	startupComplete = true;
 	for (const line of queuedStartupCommandLines.splice(0)) {
