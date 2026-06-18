@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { IrohRemoteHello } from "./handshake.ts";
 import type { IrohRemoteClient, IrohRemoteHostState, IrohRemoteWorkspace } from "./state.ts";
 import { upsertIrohRemoteWorkspace } from "./workspace.ts";
@@ -38,7 +39,15 @@ export function authorizeIrohRemoteClient(
 	const workspace = upsertIrohRemoteWorkspace(state, options.workspace, options.allowTools);
 	const now = options.now ?? Date.now();
 	const existingClient = findIrohRemoteClient(state, remoteNodeId);
-	const hasPairingSecret = Boolean(options.pairingSecret && hello.secret === options.pairingSecret);
+	const matchingPairingSecret =
+		options.pairingSecret !== undefined && hello.secret === options.pairingSecret ? options.pairingSecret : undefined;
+	const hasPairingSecret = matchingPairingSecret !== undefined;
+	const pairingSecretHash =
+		matchingPairingSecret !== undefined ? hashIrohRemotePairingSecret(matchingPairingSecret) : undefined;
+	if (!state.consumedPairingSecretHashes) {
+		state.consumedPairingSecretHashes = [];
+	}
+	const consumedPairingSecretHashes = state.consumedPairingSecretHashes;
 	const pairingSecretExpired =
 		hasPairingSecret && options.pairingExpiresAt !== undefined && now > options.pairingExpiresAt;
 
@@ -50,11 +59,18 @@ export function authorizeIrohRemoteClient(
 		return { ok: false, error: `workspace not allowed: ${hello.workspace}`, pairingSecretExpired: false };
 	}
 
+	if (!existingClient && pairingSecretHash && consumedPairingSecretHashes.includes(pairingSecretHash)) {
+		return { ok: false, error: "pairing ticket has already been used", pairingSecretExpired: false };
+	}
+
 	if (!existingClient && !hasPairingSecret) {
 		return { ok: false, error: "client is not paired", pairingSecretExpired: false };
 	}
 
 	if (!existingClient) {
+		if (!pairingSecretHash) {
+			return { ok: false, error: "client is not paired", pairingSecretExpired: false };
+		}
 		const client: IrohRemoteClient = {
 			nodeId: remoteNodeId,
 			label: hello.clientLabel || remoteNodeId.slice(0, 12),
@@ -63,6 +79,7 @@ export function authorizeIrohRemoteClient(
 			pairedAt: now,
 			lastSeenAt: now,
 		};
+		consumedPairingSecretHashes.push(pairingSecretHash);
 		state.clients.push(client);
 		return {
 			ok: true,
@@ -103,4 +120,8 @@ export function findIrohRemoteClient(state: IrohRemoteHostState, nodeId: string)
 
 export function isIrohRemoteClientAllowedForWorkspace(client: IrohRemoteClient, workspaceName: string): boolean {
 	return client.allowedWorkspaces.length === 0 || client.allowedWorkspaces.includes(workspaceName);
+}
+
+function hashIrohRemotePairingSecret(secret: string): string {
+	return `sha256:${createHash("sha256").update(secret, "utf8").digest("base64url")}`;
 }

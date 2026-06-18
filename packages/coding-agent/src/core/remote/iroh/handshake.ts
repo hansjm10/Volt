@@ -37,6 +37,18 @@ export function parseIrohRemoteHelloLine(line: string): IrohRemoteHello {
 	return parseIrohRemoteHello(parsed);
 }
 
+export function parseIrohRemoteHandshakeResponseLine(line: string): IrohRemoteHandshakeResponse {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(line);
+	} catch (error: unknown) {
+		throw new Error(
+			`Failed to parse Iroh remote handshake response: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	return parseIrohRemoteHandshakeResponse(parsed);
+}
+
 export function parseIrohRemoteHello(value: unknown): IrohRemoteHello {
 	const hello = expectRecord(value, "Iroh remote handshake");
 	if (hello.type !== IROH_REMOTE_HELLO_TYPE) {
@@ -54,6 +66,30 @@ export function parseIrohRemoteHello(value: unknown): IrohRemoteHello {
 		clientLabel: expectOptionalString(hello.clientLabel, "handshake clientLabel"),
 		clientNodeId: expectOptionalString(hello.clientNodeId, "handshake clientNodeId"),
 	};
+}
+
+export function parseIrohRemoteHandshakeResponse(value: unknown): IrohRemoteHandshakeResponse {
+	const response = expectRecord(value, "Iroh remote handshake response");
+	if (response.type !== IROH_REMOTE_HANDSHAKE_TYPE) {
+		throw new Error("unexpected handshake response type");
+	}
+	if (response.success === true) {
+		return {
+			type: IROH_REMOTE_HANDSHAKE_TYPE,
+			success: true,
+			workspace: expectString(response.workspace, "handshake response workspace"),
+			clientNodeId: expectString(response.clientNodeId, "handshake response clientNodeId"),
+			child: expectOptionalString(response.child, "handshake response child"),
+		};
+	}
+	if (response.success === false) {
+		return {
+			type: IROH_REMOTE_HANDSHAKE_TYPE,
+			success: false,
+			error: expectString(response.error, "handshake response error"),
+		};
+	}
+	throw new Error("handshake response success must be a boolean");
 }
 
 export function createIrohRemoteHandshakeSuccess(options: {

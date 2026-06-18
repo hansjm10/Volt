@@ -1,4 +1,11 @@
 export {
+	type IrohRemoteAuditEvent,
+	type IrohRemoteAuditEventInput,
+	IrohRemoteAuditLogger,
+	type IrohRemoteAuditLoggerOptions,
+	type IrohRemoteAuditSink,
+} from "./audit.ts";
+export {
 	type AuthorizeIrohRemoteClientOptions,
 	authorizeIrohRemoteClient,
 	findIrohRemoteClient,
@@ -8,15 +15,39 @@ export {
 	isIrohRemoteClientAllowedForWorkspace,
 } from "./authorization.ts";
 export {
+	DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS,
+	IrohRemoteClientEngine,
+	type IrohRemoteClientEngineOptions,
+	type IrohRemoteClientHandshakeResponseResult,
+	type IrohRemoteClientTicketHello,
+	IrohRemoteHostEngine,
+	type IrohRemoteHostEngineOptions,
+	type IrohRemoteHostHandshakeResult,
+	type IrohRemoteHostPairOptions,
+	type IrohRemoteHostReadHandshakeOptions,
+	type IrohRemotePairingTicket,
+} from "./engine.ts";
+export {
 	createIrohRemoteHandshakeFailure,
 	createIrohRemoteHandshakeSuccess,
 	type IrohRemoteHandshakeFailure,
 	type IrohRemoteHandshakeResponse,
 	type IrohRemoteHandshakeSuccess,
 	type IrohRemoteHello,
+	parseIrohRemoteHandshakeResponse,
+	parseIrohRemoteHandshakeResponseLine,
 	parseIrohRemoteHello,
 	parseIrohRemoteHelloLine,
 } from "./handshake.ts";
+export {
+	DEFAULT_IROH_REMOTE_HANDSHAKE_MAX_LINE_BYTES,
+	DEFAULT_IROH_REMOTE_HANDSHAKE_TIMEOUT_MS,
+	type IrohRemoteHandshakeLineReadOptions,
+	type IrohRemoteHandshakeLineReadResult,
+	readIrohRemoteHandshakeLine,
+	writeIrohRemoteHandshakeResponse,
+	writeIrohRemoteHello,
+} from "./handshake-reader.ts";
 export {
 	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 	IROH_REMOTE_ALPN,
@@ -51,6 +82,11 @@ export {
 	readIrohRemoteHostState,
 	writeIrohRemoteHostState,
 } from "./state.ts";
+export {
+	type IrohRemoteClientRevocationResult,
+	IrohRemoteHostStateManager,
+	type IrohRemoteHostStateManagerOptions,
+} from "./state-manager.ts";
 export {
 	assertIrohRemoteTicketNotExpired,
 	decodeIrohRemoteTicketPayload,

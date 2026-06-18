@@ -19,12 +19,13 @@ export interface IrohRemoteClient {
 
 export interface IrohRemoteHostState {
 	hostSecretKey?: number[];
+	consumedPairingSecretHashes: string[];
 	workspaces: IrohRemoteWorkspace[];
 	clients: IrohRemoteClient[];
 }
 
 export function createEmptyIrohRemoteHostState(): IrohRemoteHostState {
-	return { hostSecretKey: undefined, workspaces: [], clients: [] };
+	return { hostSecretKey: undefined, consumedPairingSecretHashes: [], workspaces: [], clients: [] };
 }
 
 export async function readIrohRemoteHostState(path: string): Promise<IrohRemoteHostState> {
@@ -51,6 +52,11 @@ export function parseIrohRemoteHostState(value: unknown): IrohRemoteHostState {
 	const state = expectRecord(value, "Iroh remote host state");
 	return {
 		hostSecretKey: parseOptionalByteArray(state.hostSecretKey, "hostSecretKey"),
+		consumedPairingSecretHashes: parseOptionalStringArray(
+			state.consumedPairingSecretHashes,
+			"consumedPairingSecretHashes",
+			"consumed pairing secret hash",
+		),
 		workspaces: parseArray(state.workspaces, "workspaces", parseIrohRemoteWorkspace),
 		clients: parseArray(state.clients, "clients", parseIrohRemoteClient),
 	};
@@ -96,6 +102,13 @@ function parseOptionalByteArray(value: unknown, label: string): number[] | undef
 		}
 		return entry;
 	});
+}
+
+function parseOptionalStringArray(value: unknown, label: string, entryLabel: string): string[] {
+	if (value === undefined) {
+		return [];
+	}
+	return parseArray(value, label, (entry) => expectString(entry, entryLabel));
 }
 
 function expectRecord(value: unknown, label: string): Record<string, unknown> {

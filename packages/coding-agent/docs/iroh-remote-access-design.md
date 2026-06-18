@@ -2,11 +2,11 @@
 
 ## Status
 
-Design proposal and proof-of-concept plan. No Volt core behavior is changed by this document.
+Phase 2 is mostly complete in Volt core: RPC mode has a transport abstraction, Iroh streams have a structurally typed RPC adapter, remote command filtering is available, and the Iroh remote helpers now cover tickets, handshakes, host state, authorization, workspace selection, audit logging, and host/client engine orchestration. Phase 3 productization is next.
 
 ## Summary
 
-Add an optional native sidecar that exposes Volt's existing RPC protocol over [Iroh](https://www.iroh.computer/blog/v1). The first proof of concept should keep Iroh out of Volt core: a separate `volt-iroh-host` process accepts Iroh connections, spawns `volt --mode rpc`, and bridges JSONL between the Iroh stream and the child process stdio.
+Add optional remote access that exposes Volt's existing RPC protocol over [Iroh](https://www.iroh.computer/blog/v1). The current proof of concept keeps the native Iroh dependency out of Volt's default install path by using a sidecar example, while Volt core provides the typed transport, handshake, state, authorization, audit, and engine helpers needed for an integrated remote mode.
 
 This turns Volt into a remotely reachable local coding agent without requiring users to open ports, configure reverse proxies, or move provider credentials to a mobile client. A future iOS app can use Iroh Swift support to connect to the user's host machine and render a native UI from RPC events.
 
@@ -25,7 +25,7 @@ Iroh v1 provides key-based dialing, encrypted QUIC connections, NAT traversal, l
 - Enable remote access to a local Volt session from another device without port forwarding.
 - Keep model credentials, repository files, and tool execution on the host machine.
 - Reuse Volt RPC as the application protocol instead of inventing a new agent protocol.
-- Keep the initial proof of concept optional and isolated from core packages.
+- Keep the native Iroh dependency optional while sharing remote protocol logic through core helpers.
 - Define a security model before exposing shell/file tools remotely.
 
 ## Non-goals
@@ -33,7 +33,7 @@ Iroh v1 provides key-based dialing, encrypted QUIC connections, NAT traversal, l
 - No TUI tunneling.
 - No mobile app implementation in the first proof of concept.
 - No built-in sandbox. Remote Volt has the same local-agent risks described in [Security](security.md).
-- No Iroh dependency in `@earendil-works/volt-coding-agent` during the first proof of concept.
+- No required Iroh dependency in `@earendil-works/volt-coding-agent` until the optional native dependency strategy is chosen.
 - No multi-user collaboration semantics in the first proof of concept.
 
 ## Current State
@@ -61,7 +61,7 @@ flowchart LR
     Rpc --> Auth[Host Volt auth]
 ```
 
-The sidecar owns network connectivity, pairing, client authorization, workspace selection, and child process lifecycle. The child `volt --mode rpc` process remains responsible for agent state, tools, model calls, sessions, extensions, and RPC semantics.
+The sidecar still owns native Iroh endpoint lifecycle and child process lifecycle for the proof of concept. Volt core owns shared remote protocol behavior: pairing tickets, handshake parsing, bounded handshake reads, host state management, client authorization, audit events, workspace selection, remote command filtering, and in-process RPC transport adapters.
 
 ## Minimal Sidecar Proof of Concept
 
@@ -73,15 +73,15 @@ volt-iroh-host serve --workspace volt=C:\Users\Jordan\source\repos\Volt
 
 The host process:
 
-1. Creates or loads a persistent Iroh endpoint key from `~/.volt/agent/remote/iroh-host.key`.
+1. Creates or loads a persistent Iroh endpoint key. The current sidecar stores this as `hostSecretKey` in `~/.volt/agent/remote/iroh-sidecar-host.json`.
 2. Validates the selected workspace path and child RPC executable before printing a ticket.
-3. Starts an Iroh endpoint using the default relay/discovery configuration.
-4. Prints a pairing ticket as text and QR payload.
-5. Waits for one client connection.
+3. Starts an Iroh endpoint. The current sidecar defaults to disabled relay for local tests; `--relay default` opts into Iroh's default relay/discovery preset.
+4. Prints a pairing ticket as text.
+5. Accepts client connections until stopped, or exits after the first disconnect when `--once` is set.
 6. Validates the pairing secret.
-7. Spawns `volt --mode rpc --session-dir <host-session-dir>` in the selected workspace.
+7. Spawns the configured RPC child in the selected workspace; with `--use-volt`, this is `volt --mode rpc`.
 8. Pipes Iroh stream bytes to child stdin and child stdout bytes back to the Iroh stream.
-9. Logs child stderr and sidecar diagnostics to `~/.volt/agent/remote/iroh-host.log`.
+9. Writes sidecar diagnostics and prefixed child stderr to stderr.
 
 ### Client command
 
@@ -121,7 +121,7 @@ The host must treat the ticket secret as one-time. After successful pairing, per
 
 ### Stream protocol
 
-After the handshake succeeds, the stream carries the same LF-delimited JSONL described in [RPC mode](rpc.md). The sidecar should not parse normal RPC commands for the proof of concept except to support connection-level shutdown and logging. It should preserve strict LF framing and not use generic line readers that split on Unicode separators.
+After the handshake succeeds, the stream carries the same LF-delimited JSONL described in [RPC mode](rpc.md). The current sidecar parses command envelopes only to enforce the remote command filter, track connection-level shutdown, and preserve response completion behavior. It should preserve strict LF framing and not use generic line readers that split on Unicode separators.
 
 ### Process model
 
@@ -187,6 +187,8 @@ Suggested shape:
 }
 ```
 
+The current sidecar state file also persists `hostSecretKey` and consumed pairing secret hashes. A productized command can split secret host state from user-editable configuration later.
+
 ## CLI UX
 
 Initial external commands:
@@ -225,7 +227,9 @@ volt remote revoke <node-id>
 - Keep native dependencies out of the default install path.
 - Document setup, pairing, and security warnings.
 
-### Phase 2: RPC transport extraction
+### Phase 2: RPC transport and remote core extraction
+
+Status: mostly complete.
 
 Build on the core RPC transport abstraction so stdin/stdout remains one adapter:
 
@@ -243,6 +247,8 @@ Then add adapters:
 - in-process adapter for SDK consumers.
 - Iroh adapter if native dependency strategy is acceptable.
 
+Current Volt core also includes typed Iroh remote helpers for ticket encoding/decoding, bounded handshakes, host state, authorization, audit logging, workspace management, pair/list/revoke operations, command filtering, and host/client engine orchestration. The sidecar example remains the native dependency integration point while those core APIs harden.
+
 ### Phase 3: Productized remote mode
 
 - Add `volt remote ...` commands.
@@ -257,7 +263,7 @@ Proof-of-concept validation:
 
 - Pair a client and host on the same LAN.
 - Pair a client and host across different networks using relay fallback.
-- Send `get_state`, `get_available_models`, `prompt`, `abort`, and `get_messages` RPC commands.
+- Send allowed remote RPC commands such as `get_state`, `prompt`, `abort`, `steer`, `follow_up`, and `extension_ui_response`.
 - Verify assistant streaming events arrive in order.
 - Verify extension UI requests can round-trip through the client.
 - Verify child process exits when the Iroh stream closes.

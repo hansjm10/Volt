@@ -10,6 +10,7 @@
     "fake-rpc": "node fake-rpc.mjs"
   },
   "dependencies": {
-    "@number0/iroh": "1.0.0"
+    "@number0/iroh": "1.0.0",
+    "proper-lockfile": "4.1.2"
   }
 }

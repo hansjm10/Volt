@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -220,6 +220,25 @@ async function runRawRpcClient(ticket, command, options = {}) {
 			clearTimeout(timeoutId);
 		}
 		return lines;
+	} finally {
+		if (connection) connection.close(0n, Array.from(Buffer.from("done", "utf8")));
+		await endpoint.close();
+	}
+}
+
+async function runRawHandshakeLine(ticket, line) {
+	const payload = decodeTicketPayload(ticket);
+	const endpoint = await bindRawClientEndpoint(payload.relayMode ?? "disabled");
+	let connection;
+	try {
+		const endpointTicket = EndpointTicket.fromString(payload.irohTicket);
+		connection = await endpoint.connect(endpointTicket.endpointAddr(), ALPN);
+		const stream = await connection.openBi();
+		await stream.send.writeAll(toBytes(`${line}\n`));
+
+		const handshake = await readLineFromIroh(stream.recv);
+		if (handshake.line === undefined) throw new Error("Host closed before raw handshake response");
+		return JSON.parse(handshake.line);
 	} finally {
 		if (connection) connection.close(0n, Array.from(Buffer.from("done", "utf8")));
 		await endpoint.close();
@@ -488,6 +507,42 @@ async function rawCommandFilterScenario() {
 	});
 }
 
+async function malformedHandshakeScenario() {
+	await withStateDir("malformed-handshake", async ({ hostStatePath }) => {
+		const cases = [
+			{ line: "{", error: "Failed to parse Iroh remote handshake" },
+			{ line: "null", error: "Iroh remote handshake must be an object" },
+			{ line: "x".repeat(16 * 1024 + 1), error: "Line exceeds maximum size of 16384 bytes" },
+			{
+				line: JSON.stringify({
+					type: "volt_iroh_hello",
+					protocol: ALPN_TEXT,
+					workspace: "Volt",
+					secret: "secret",
+					clientLabel: {},
+				}),
+				error: "handshake clientLabel must be a non-empty string",
+			},
+		];
+		for (const testCase of cases) {
+			const host = startHost(["--state", hostStatePath, "--once"]);
+			try {
+				const ticket = await waitForFirstStdoutLine(host.child, host.output, "malformed handshake host");
+				const response = await runRawHandshakeLine(ticket, testCase.line);
+				await waitForExit(host.child, "malformed handshake host", host.output);
+				assert(response.type === "volt_iroh_handshake", `Expected handshake response, got:\n${JSON.stringify(response)}`);
+				assert(response.success === false, `Expected handshake failure, got:\n${JSON.stringify(response)}`);
+				assert(
+					response.error.includes(testCase.error),
+					`Expected ${JSON.stringify(testCase.error)}, got:\n${JSON.stringify(response)}`,
+				);
+			} finally {
+				await stopProcess(host.child);
+			}
+		}
+	});
+}
+
 async function getStateScenario() {
 	await withStateDir("state", async ({ clientStatePath, hostStatePath }) => {
 		const { clientOutput } = await runHostClientOnce({
@@ -641,6 +696,7 @@ async function runningWorkspaceAuthorizationScenario() {
 		const savedWorkspace = join(stateDir, "saved");
 		await mkdir(runningWorkspace, { recursive: true });
 		await mkdir(savedWorkspace, { recursive: true });
+		const canonicalRunningWorkspace = await realpath(runningWorkspace);
 
 		const host = startHost([
 			"--state",
@@ -681,8 +737,8 @@ async function runningWorkspaceAuthorizationScenario() {
 				.map((line) => JSON.parse(line));
 			assert(entries.length === 1, `Expected one fake source Volt invocation, got:\n${JSON.stringify(entries)}`);
 			assert(
-				entries[0].cwd === runningWorkspace,
-				`Expected RPC child to run in ${runningWorkspace}, got:\n${JSON.stringify(entries[0])}`,
+				entries[0].cwd === canonicalRunningWorkspace,
+				`Expected RPC child to run in ${canonicalRunningWorkspace}, got:\n${JSON.stringify(entries[0])}`,
 			);
 		} finally {
 			await stopProcess(host.child);
@@ -729,6 +785,7 @@ const scenarios = [
 	["raw half-close prompt", rawHalfClosePromptScenario],
 	["source Volt half-close prompt", halfClosedSourceVoltPromptScenario],
 	["raw command filter", rawCommandFilterScenario],
+	["malformed handshake", malformedHandshakeScenario],
 	["get_state", getStateScenario],
 	["pairing and revocation", pairingAndRevocationScenario],
 	["paired client current tools", pairedClientCurrentToolsScenario],

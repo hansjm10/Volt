@@ -1,13 +1,14 @@
 import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
-import { access, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import iroh from "@number0/iroh";
+import lockfile from "proper-lockfile";
 import {
 	ALPN,
 	ALPN_TEXT,
@@ -81,10 +82,16 @@ function parseWorkspace(value) {
 
 async function readState(path) {
 	try {
-		return JSON.parse(await readFile(path, "utf8"));
+		const state = JSON.parse(await readFile(path, "utf8"));
+		return {
+			hostSecretKey: state.hostSecretKey,
+			consumedPairingSecretHashes: state.consumedPairingSecretHashes ?? [],
+			workspaces: state.workspaces ?? [],
+			clients: state.clients ?? [],
+		};
 	} catch (error) {
 		if (error && error.code === "ENOENT") {
-			return { hostSecretKey: undefined, workspaces: [], clients: [] };
+			return { hostSecretKey: undefined, consumedPairingSecretHashes: [], workspaces: [], clients: [] };
 		}
 		throw error;
 	}
@@ -95,6 +102,57 @@ async function writeState(path, state) {
 	const tempPath = `${path}.${process.pid}.tmp`;
 	await writeFile(tempPath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
 	await rename(tempPath, path);
+}
+
+async function withStateFileLock(statePath, operation) {
+	await mkdir(dirname(statePath), { recursive: true });
+	let release;
+	let lockCompromised = false;
+	let lockCompromisedError;
+	const throwIfCompromised = () => {
+		if (lockCompromised) {
+			throw lockCompromisedError ?? new Error("Iroh sidecar host state lock was compromised");
+		}
+	};
+
+	try {
+		release = await lockfile.lock(statePath, {
+			lockfilePath: `${statePath}.lock`,
+			realpath: false,
+			retries: {
+				retries: 10,
+				factor: 2,
+				minTimeout: 100,
+				maxTimeout: 10000,
+				randomize: true,
+			},
+			stale: 30000,
+			onCompromised: (error) => {
+				lockCompromised = true;
+				lockCompromisedError = error;
+			},
+		});
+
+		throwIfCompromised();
+		const result = await operation();
+		throwIfCompromised();
+		return result;
+	} finally {
+		if (release) {
+			try {
+				await release();
+			} catch {
+				// Ignore unlock errors after a compromised lock.
+			}
+		}
+	}
+}
+
+function syncState(target, source) {
+	target.hostSecretKey = source.hostSecretKey;
+	target.consumedPairingSecretHashes = source.consumedPairingSecretHashes ?? [];
+	target.workspaces = source.workspaces ?? [];
+	target.clients = source.clients ?? [];
 }
 
 function upsertWorkspace(state, workspace, allowTools) {
@@ -137,6 +195,7 @@ async function assertWorkspaceDirectory(workspace) {
 	if (!workspaceStat.isDirectory()) {
 		throw new Error(`Workspace path is not a directory: ${workspace.path}`);
 	}
+	workspace.path = await realpath(workspace.path);
 }
 
 function getPlatformVoltBin(voltBin) {
@@ -227,22 +286,26 @@ async function preflightRpcChild(options, workspace) {
 }
 
 async function bindEndpoint(relayMode, state, statePath) {
-	const builder = Endpoint.builder();
-	if (relayMode === "default") {
-		presetN0(builder);
-	} else {
-		presetMinimal(builder);
-		builder.relayMode(RelayMode.disabled());
-	}
-	if (state.hostSecretKey) {
-		builder.secretKey(state.hostSecretKey);
-	}
-	builder.alpns([ALPN]);
-	const endpoint = await builder.bind();
-	if (!state.hostSecretKey) {
-		state.hostSecretKey = endpoint.secretKey().toBytes();
-		await writeState(statePath, state);
-	}
+	const endpoint = await withStateFileLock(statePath, async () => {
+		syncState(state, await readState(statePath));
+		const builder = Endpoint.builder();
+		if (relayMode === "default") {
+			presetN0(builder);
+		} else {
+			presetMinimal(builder);
+			builder.relayMode(RelayMode.disabled());
+		}
+		if (state.hostSecretKey) {
+			builder.secretKey(state.hostSecretKey);
+		}
+		builder.alpns([ALPN]);
+		const boundEndpoint = await builder.bind();
+		if (!state.hostSecretKey) {
+			state.hostSecretKey = boundEndpoint.secretKey().toBytes();
+			await writeState(statePath, state);
+		}
+		return boundEndpoint;
+	});
 	if (relayMode === "default") {
 		await endpoint.online();
 	}
@@ -666,64 +729,121 @@ function getClientWorkspace(client, workspaceName) {
 	return allowedWorkspaces.length === 0 || allowedWorkspaces.includes(workspaceName);
 }
 
-async function authorizeClient({ hello, options, remoteId, state }) {
-	const latestState = await readState(options.statePath);
-	state.hostSecretKey = latestState.hostSecretKey;
-	state.workspaces = latestState.workspaces ?? [];
-	state.clients = latestState.clients ?? [];
-	upsertWorkspace(state, options.workspace, options.allowTools);
+function hashPairingSecret(secret) {
+	return `sha256:${createHash("sha256").update(secret, "utf8").digest("base64url")}`;
+}
 
-	const now = Date.now();
-	const workspace = options.workspace;
-	const existingClient = findClient(state, remoteId);
-	const hasPairingSecret = Boolean(options.pairingSecret && hello.secret === options.pairingSecret);
-	const pairingSecretExpired =
-		hasPairingSecret && options.pairingExpiresAt !== undefined && now > options.pairingExpiresAt;
-	if (!existingClient && pairingSecretExpired) {
-		options.pairingSecret = undefined;
-		options.pairingExpiresAt = undefined;
-		return { error: "pairing ticket has expired" };
+function expectString(value, label) {
+	if (typeof value !== "string" || value.length === 0) {
+		throw new Error(`${label} must be a non-empty string`);
 	}
+	return value;
+}
 
-	const requestedWorkspace = typeof hello.workspace === "string" ? hello.workspace : undefined;
-	if (requestedWorkspace !== workspace.name) {
-		return { error: `workspace not allowed: ${requestedWorkspace ?? "<missing>"}` };
+function expectOptionalString(value, label) {
+	if (value === undefined) {
+		return undefined;
 	}
+	return expectString(value, label);
+}
 
-	if (!existingClient && !hasPairingSecret) {
-		return { error: "client is not paired" };
+function parseHandshakeHello(line) {
+	let hello;
+	try {
+		hello = JSON.parse(line);
+	} catch (error) {
+		throw new Error(`Failed to parse Iroh remote handshake: ${error instanceof Error ? error.message : String(error)}`);
 	}
-
-	const currentAllowTools = options.allowTools;
-	if (!existingClient) {
-		const client = {
-			nodeId: remoteId,
-			label: hello.clientLabel || remoteId.slice(0, 12),
-			allowedWorkspaces: [workspace.name],
-			allowedTools: currentAllowTools,
-			pairedAt: now,
-			lastSeenAt: now,
-		};
-		state.clients.push(client);
-		await writeState(options.statePath, state);
-		options.pairingSecret = undefined;
-		options.pairingExpiresAt = undefined;
-		console.error(`paired client: ${client.label} (${remoteId})`);
-		return { client, workspace, allowTools: currentAllowTools };
+	if (typeof hello !== "object" || hello === null || Array.isArray(hello)) {
+		throw new Error("Iroh remote handshake must be an object");
 	}
-
-	if (!getClientWorkspace(existingClient, workspace.name)) {
-		return { error: `client is not allowed to use workspace: ${workspace.name}` };
+	if (hello.type !== "volt_iroh_hello") {
+		throw new Error("unexpected handshake type");
 	}
-	existingClient.lastSeenAt = now;
-	existingClient.allowedTools = currentAllowTools;
-	if (hello.clientLabel) existingClient.label = hello.clientLabel;
-	await writeState(options.statePath, state);
+	if (hello.protocol !== ALPN_TEXT) {
+		throw new Error(`unsupported protocol: ${typeof hello.protocol === "string" ? hello.protocol : "<missing>"}`);
+	}
 	return {
-		client: existingClient,
-		workspace,
-		allowTools: currentAllowTools,
+		type: "volt_iroh_hello",
+		protocol: ALPN_TEXT,
+		workspace: expectString(hello.workspace, "handshake workspace"),
+		secret: expectOptionalString(hello.secret, "handshake secret"),
+		clientLabel: expectOptionalString(hello.clientLabel, "handshake clientLabel"),
+		clientNodeId: expectOptionalString(hello.clientNodeId, "handshake clientNodeId"),
 	};
+}
+
+async function authorizeClient({ hello, options, remoteId, state }) {
+	return await withStateFileLock(options.statePath, async () => {
+		syncState(state, await readState(options.statePath));
+		upsertWorkspace(state, options.workspace, options.allowTools);
+
+		const now = Date.now();
+		const workspace = options.workspace;
+		const existingClient = findClient(state, remoteId);
+		const matchingPairingSecret =
+			options.pairingSecret !== undefined && hello.secret === options.pairingSecret
+				? options.pairingSecret
+				: undefined;
+		const hasPairingSecret = matchingPairingSecret !== undefined;
+		const pairingSecretHash =
+			matchingPairingSecret !== undefined ? hashPairingSecret(matchingPairingSecret) : undefined;
+		const pairingSecretExpired =
+			hasPairingSecret && options.pairingExpiresAt !== undefined && now > options.pairingExpiresAt;
+		if (!existingClient && pairingSecretExpired) {
+			options.pairingSecret = undefined;
+			options.pairingExpiresAt = undefined;
+			return { error: "pairing ticket has expired" };
+		}
+
+		const requestedWorkspace = typeof hello.workspace === "string" ? hello.workspace : undefined;
+		if (requestedWorkspace !== workspace.name) {
+			return { error: `workspace not allowed: ${requestedWorkspace ?? "<missing>"}` };
+		}
+
+		if (!existingClient && pairingSecretHash && state.consumedPairingSecretHashes.includes(pairingSecretHash)) {
+			return { error: "pairing ticket has already been used" };
+		}
+
+		if (!existingClient && !hasPairingSecret) {
+			return { error: "client is not paired" };
+		}
+
+		const currentAllowTools = options.allowTools;
+		if (!existingClient) {
+			if (!pairingSecretHash) {
+				return { error: "client is not paired" };
+			}
+			const client = {
+				nodeId: remoteId,
+				label: hello.clientLabel || remoteId.slice(0, 12),
+				allowedWorkspaces: [workspace.name],
+				allowedTools: currentAllowTools,
+				pairedAt: now,
+				lastSeenAt: now,
+			};
+			state.consumedPairingSecretHashes.push(pairingSecretHash);
+			state.clients.push(client);
+			await writeState(options.statePath, state);
+			options.pairingSecret = undefined;
+			options.pairingExpiresAt = undefined;
+			console.error(`paired client: ${client.label} (${remoteId})`);
+			return { client, workspace, allowTools: currentAllowTools };
+		}
+
+		if (!getClientWorkspace(existingClient, workspace.name)) {
+			return { error: `client is not allowed to use workspace: ${workspace.name}` };
+		}
+		existingClient.lastSeenAt = now;
+		existingClient.allowedTools = currentAllowTools;
+		if (hello.clientLabel) existingClient.label = hello.clientLabel;
+		await writeState(options.statePath, state);
+		return {
+			client: existingClient,
+			workspace,
+			allowTools: currentAllowTools,
+		};
+	});
 }
 
 async function handleConnection(incoming, options, state) {
@@ -735,23 +855,27 @@ async function handleConnection(incoming, options, state) {
 	let child;
 	try {
 		const stream = await withTimeout(connection.acceptBi(), HANDSHAKE_TIMEOUT_MS, "handshake timed out");
-		const handshake = await withTimeout(
-			readLineFromIroh(stream.recv, Buffer.alloc(0), { maxLineBytes: HANDSHAKE_MAX_LINE_BYTES }),
-			HANDSHAKE_TIMEOUT_MS,
-			"handshake timed out",
-		);
+		let handshake;
+		try {
+			handshake = await withTimeout(
+				readLineFromIroh(stream.recv, Buffer.alloc(0), { maxLineBytes: HANDSHAKE_MAX_LINE_BYTES }),
+				HANDSHAKE_TIMEOUT_MS,
+				"handshake timed out",
+			);
+		} catch (error) {
+			await sendHandshakeError(stream, error instanceof Error ? error.message : String(error));
+			return;
+		}
 		if (handshake.line === undefined) {
 			await sendHandshakeError(stream, "missing handshake");
 			return;
 		}
 
-		const hello = JSON.parse(handshake.line);
-		if (hello.type !== "volt_iroh_hello") {
-			await sendHandshakeError(stream, "unexpected handshake type");
-			return;
-		}
-		if (hello.protocol !== ALPN_TEXT) {
-			await sendHandshakeError(stream, `unsupported protocol: ${hello.protocol}`);
+		let hello;
+		try {
+			hello = parseHandshakeHello(handshake.line);
+		} catch (error) {
+			await sendHandshakeError(stream, error instanceof Error ? error.message : String(error));
 			return;
 		}
 
@@ -829,7 +953,7 @@ function createTicketPayload(endpoint, options, includePairingSecret) {
 
 async function serve(flags) {
 	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
-	const state = await readState(statePath);
+	const state = await withStateFileLock(statePath, () => readState(statePath));
 	const allowTools = getFlag(flags, "allow-tools", DEFAULT_ALLOW_TOOLS);
 	const workspace = selectWorkspace(state, getFlag(flags, "workspace"), allowTools);
 
@@ -855,7 +979,11 @@ async function serve(flags) {
 		workspace,
 	};
 	await preflightRpcChild(options, workspace);
-	await writeState(statePath, state);
+	await withStateFileLock(statePath, async () => {
+		syncState(state, await readState(statePath));
+		Object.assign(workspace, upsertWorkspace(state, workspace, allowTools));
+		await writeState(statePath, state);
+	});
 
 	const endpoint = await bindEndpoint(relayMode, state, statePath);
 	const ticket = encodeTicketPayload(createTicketPayload(endpoint, options, pairingEnabled));
@@ -886,18 +1014,24 @@ async function serve(flags) {
 
 async function listClients(flags) {
 	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
-	const state = await readState(statePath);
+	const state = await withStateFileLock(statePath, () => readState(statePath));
 	console.log(JSON.stringify(state.clients, null, 2));
 }
 
 async function revokeClient(flags, nodeId) {
 	if (!nodeId) throw new Error("Missing node id to revoke");
 	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
-	const state = await readState(statePath);
-	const before = state.clients.length;
-	state.clients = state.clients.filter((client) => client.nodeId !== nodeId);
-	await writeState(statePath, state);
-	if (state.clients.length === before) {
+	const revoked = await withStateFileLock(statePath, async () => {
+		const state = await readState(statePath);
+		const before = state.clients.length;
+		state.clients = state.clients.filter((client) => client.nodeId !== nodeId);
+		if (state.clients.length === before) {
+			return false;
+		}
+		await writeState(statePath, state);
+		return true;
+	});
+	if (!revoked) {
 		console.error(`No client found for ${nodeId}`);
 		return;
 	}
