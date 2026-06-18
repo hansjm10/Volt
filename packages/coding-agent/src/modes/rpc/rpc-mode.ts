@@ -87,20 +87,45 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	const shouldExitProcess = options.exitProcess ?? !options.transport;
 	const shouldRestoreStdout = !options.transport && !shouldExitProcess;
 	const transport = options.transport ?? createStdioRpcTransport();
+	// Shutdown request flag
+	let shutdownRequested = false;
+	let shuttingDown = false;
+	const signalCleanupHandlers: Array<() => void> = [];
 	const pendingWrites = new Set<Promise<void>>();
 	let hasPendingWriteError = false;
 	let pendingWriteError: unknown;
+	let transportFailureShutdownScheduled = false;
 	const toError = (value: unknown): Error => (value instanceof Error ? value : new Error(String(value)));
+	const recordPendingWriteError = (error: unknown): Error => {
+		const writeError = toError(error);
+		if (!hasPendingWriteError) {
+			hasPendingWriteError = true;
+			pendingWriteError = writeError;
+		}
+		return writeError;
+	};
+	const requestTransportFailureShutdown = (error: unknown): void => {
+		const writeError = recordPendingWriteError(error);
+		if (shuttingDown || transportFailureShutdownScheduled) {
+			return;
+		}
+		transportFailureShutdownScheduled = true;
+		// Defer so in-flight backpressure waits can report the same failure first.
+		setImmediate(() => {
+			transportFailureShutdownScheduled = false;
+			if (shuttingDown) {
+				return;
+			}
+			void shutdown(1, undefined, { error: writeError }).catch(() => {});
+		});
+	};
 	const trackTransportWrite = (result: void | Promise<void>): void => {
 		if (!result) {
 			return;
 		}
 		const tracked = Promise.resolve(result)
 			.catch((error: unknown) => {
-				if (!hasPendingWriteError) {
-					hasPendingWriteError = true;
-					pendingWriteError = error;
-				}
+				requestTransportFailureShutdown(error);
 			})
 			.finally(() => {
 				pendingWrites.delete(tracked);
@@ -124,7 +149,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	let unsubscribeBackpressure: (() => void) | undefined;
 
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		trackTransportWrite(transport.write(obj));
+		try {
+			trackTransportWrite(transport.write(obj));
+		} catch (writeError: unknown) {
+			requestTransportFailureShutdown(writeError);
+		}
 	};
 
 	const success = <T extends RpcCommand["type"]>(
@@ -147,11 +176,6 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		string,
 		{ resolve: (response: RpcExtensionUIResponse) => void; reject: (error: Error) => void }
 	>();
-
-	// Shutdown request flag
-	let shutdownRequested = false;
-	let shuttingDown = false;
-	const signalCleanupHandlers: Array<() => void> = [];
 
 	/** Helper for dialog methods with signal/timeout support */
 	function createDialogPromise<T>(
@@ -422,7 +446,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			output(event);
 		});
 		unsubscribeBackpressure = session.agent.subscribe(async () => {
-			await waitForTransportBackpressure();
+			try {
+				await waitForTransportBackpressure();
+			} catch (transportError: unknown) {
+				requestTransportFailureShutdown(transportError);
+			}
 		});
 	};
 

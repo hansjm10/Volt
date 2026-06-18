@@ -61,6 +61,99 @@ describe("RPC mode caller-provided transports", () => {
 		expect(transportClose).toHaveBeenCalledOnce();
 	});
 
+	test("rejects and closes when a fire-and-forget prompt response write rejects", async () => {
+		let lineHandler: ((line: string) => void) | undefined;
+		const detachInput = vi.fn();
+		const detachClose = vi.fn();
+		const writeError = new Error("write failed");
+		const transportClose = vi.fn(async () => {});
+		const transport: RpcTransport = {
+			write: vi.fn(() => Promise.reject(writeError)),
+			onLine: vi.fn((handler) => {
+				lineHandler = handler;
+				return detachInput;
+			}),
+			onClose: vi.fn(() => detachClose),
+			waitForBackpressure: vi.fn(async () => {}),
+			flush: vi.fn(async () => {}),
+			close: transportClose,
+		};
+		const { runtimeHost, dispose } = createRuntimeHost();
+		Object.assign(runtimeHost.session, {
+			prompt: vi.fn((_message: string, options: { preflightResult?: (didSucceed: boolean) => void }) => {
+				options.preflightResult?.(true);
+				return Promise.resolve();
+			}),
+		});
+
+		const modePromise = runRpcMode(runtimeHost, { transport });
+		await vi.waitFor(() => expect(lineHandler).toBeDefined());
+
+		lineHandler?.(JSON.stringify({ id: "prompt-write-failure", type: "prompt", message: "hello" }));
+
+		await expect(modePromise).rejects.toBe(writeError);
+		expect(transport.write).toHaveBeenCalledOnce();
+		expect(dispose).toHaveBeenCalledOnce();
+		expect(detachInput).toHaveBeenCalledOnce();
+		expect(detachClose).toHaveBeenCalledOnce();
+		expect(transportClose).toHaveBeenCalledOnce();
+	});
+
+	test("agent backpressure subscriber handles write failures by shutting down", async () => {
+		let sessionEventHandler: ((event: object) => void) | undefined;
+		let backpressureHandler: (() => Promise<void> | void) | undefined;
+		const detachInput = vi.fn();
+		const detachClose = vi.fn();
+		const detachSession = vi.fn();
+		const detachBackpressure = vi.fn();
+		const writeError = new Error("write failed");
+		const transportClose = vi.fn(async () => {});
+		const transport: RpcTransport = {
+			write: vi.fn(() => Promise.reject(writeError)),
+			onLine: vi.fn(() => detachInput),
+			onClose: vi.fn(() => detachClose),
+			waitForBackpressure: vi.fn(async () => {}),
+			flush: vi.fn(async () => {}),
+			close: transportClose,
+		};
+		const dispose = vi.fn(async () => {});
+		const runtimeHost = {
+			session: {
+				bindExtensions: vi.fn(async () => {}),
+				subscribe: vi.fn((handler: (event: object) => void) => {
+					sessionEventHandler = handler;
+					return detachSession;
+				}),
+				agent: {
+					subscribe: vi.fn((handler: () => Promise<void> | void) => {
+						backpressureHandler = handler;
+						return detachBackpressure;
+					}),
+				},
+			},
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose,
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+
+		const modePromise = runRpcMode(runtimeHost, { transport });
+		await vi.waitFor(() => expect(sessionEventHandler).toBeDefined());
+		await vi.waitFor(() => expect(backpressureHandler).toBeDefined());
+
+		sessionEventHandler?.({ type: "agent_event" });
+
+		await expect(Promise.resolve(backpressureHandler?.())).resolves.toBeUndefined();
+		await expect(modePromise).rejects.toBe(writeError);
+		expect(dispose).toHaveBeenCalledOnce();
+		expect(detachInput).toHaveBeenCalledOnce();
+		expect(detachClose).toHaveBeenCalledOnce();
+		expect(detachSession).toHaveBeenCalledOnce();
+		expect(detachBackpressure).toHaveBeenCalledOnce();
+		expect(transportClose).toHaveBeenCalledOnce();
+	});
+
 	test("close without exiting the embedding process", async () => {
 		let closeHandler: RpcCloseHandler | undefined;
 		const detachInput = vi.fn();
