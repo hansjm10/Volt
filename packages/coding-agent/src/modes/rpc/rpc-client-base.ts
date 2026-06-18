@@ -319,7 +319,7 @@ export abstract class RpcClientBase {
 
 			unsubscribe = this.onEvent((event) => {
 				events.push(event);
-				if (event.type === "agent_end" && promptAccepted) {
+				if (event.type === "agent_end") {
 					agentEnded = true;
 					resolveIfComplete();
 				}
