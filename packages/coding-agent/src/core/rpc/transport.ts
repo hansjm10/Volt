@@ -3,7 +3,7 @@ import type { Readable, Writable } from "node:stream";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 
 export type RpcLineHandler = (line: string) => void;
-export type RpcCloseHandler = () => void;
+export type RpcCloseHandler = (error?: Error) => void;
 
 /** Transport used by Volt RPC protocol handlers. */
 export interface RpcTransport {
@@ -82,13 +82,23 @@ export function createJsonlStreamRpcTransport(options: JsonlStreamRpcTransportOp
 		throw writeError;
 	};
 
-	const onOutputError = (error: Error): void => {
-		const writeError = recordWriteError(error);
+	const rejectPendingWrites = (error: Error): void => {
 		for (const reject of pendingWriteRejects) {
-			reject(writeError);
+			reject(error);
 		}
 	};
+
+	const onOutputError = (error: Error): void => {
+		rejectPendingWrites(recordWriteError(error));
+	};
+	const onOutputClose = (): void => {
+		if (pendingWrites.size === 0) {
+			return;
+		}
+		rejectPendingWrites(recordWriteError(new Error("RPC output stream closed before pending writes completed")));
+	};
 	options.output.on("error", onOutputError);
+	options.output.on("close", onOutputClose);
 
 	const trackPendingWrite = (writeComplete: Promise<void>, rejectWrite: (error: Error) => void): Promise<void> => {
 		pendingWrites.add(writeComplete);
@@ -160,6 +170,7 @@ export function createJsonlStreamRpcTransport(options: JsonlStreamRpcTransportOp
 				}
 			} finally {
 				options.output.off("error", onOutputError);
+				options.output.off("close", onOutputClose);
 			}
 		},
 	});
@@ -168,19 +179,30 @@ export function createJsonlStreamRpcTransport(options: JsonlStreamRpcTransportOp
 function attachReadableCloseHandler(input: Readable, handler: RpcCloseHandler): () => void {
 	let closed = false;
 
-	const onClose = () => {
+	const onClose = (error?: Error) => {
 		if (closed) {
 			return;
 		}
 		closed = true;
-		handler();
+		handler(error);
+	};
+	const onEnd = () => {
+		onClose();
+	};
+	const onStreamClose = () => {
+		onClose();
+	};
+	const onError = (error: Error) => {
+		onClose(error);
 	};
 
-	input.once("end", onClose);
-	input.once("close", onClose);
+	input.once("end", onEnd);
+	input.once("close", onStreamClose);
+	input.once("error", onError);
 
 	return () => {
-		input.off("end", onClose);
-		input.off("close", onClose);
+		input.off("end", onEnd);
+		input.off("close", onStreamClose);
+		input.off("error", onError);
 	};
 }

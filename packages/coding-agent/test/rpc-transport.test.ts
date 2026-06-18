@@ -129,6 +129,54 @@ describe("RPC transports", () => {
 		await flushExpectation;
 	});
 
+	test("rejects pending writes when output closes before write callbacks", async () => {
+		let receivedWrite = false;
+		const output = new Writable({
+			write(_chunk, _encoding, _callback) {
+				receivedWrite = true;
+			},
+		});
+		const transport = createJsonlStreamRpcTransport({ input: new PassThrough(), output });
+
+		const writeResult = transport.write({ ok: true });
+		const flushPromise = transport.flush?.();
+		if (!writeResult || !flushPromise) {
+			throw new Error("Expected stream transport writes and flushes to return promises");
+		}
+		const writeExpectation = expect(writeResult).rejects.toThrow(
+			"RPC output stream closed before pending writes completed",
+		);
+		const flushExpectation = expect(flushPromise).rejects.toThrow(
+			"RPC output stream closed before pending writes completed",
+		);
+
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(receivedWrite).toBe(true);
+		output.destroy();
+
+		await writeExpectation;
+		await flushExpectation;
+	});
+
+	test("reports input stream errors as close failures", async () => {
+		const input = new PassThrough();
+		const inputError = new Error("input failed");
+		const transport = createJsonlRpcTransport({
+			input,
+			writeLine: () => {},
+		});
+		transport.onLine(() => {});
+		const closed = new Promise<Error | undefined>((resolve) => {
+			transport.onClose?.((error) => {
+				resolve(error);
+			});
+		});
+
+		input.destroy(inputError);
+
+		await expect(closed).resolves.toBe(inputError);
+	});
+
 	test("can end an owned output stream on close", async () => {
 		const input = new PassThrough();
 		const output = new PassThrough();

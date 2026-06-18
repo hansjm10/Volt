@@ -63,9 +63,17 @@ function createStdioRpcTransport(): RpcTransport {
 			return attachJsonlLineReader(process.stdin, handler);
 		},
 		onClose(handler) {
-			process.stdin.on("end", handler);
+			const onEnd = () => {
+				handler();
+			};
+			const onError = (error: Error) => {
+				handler(error);
+			};
+			process.stdin.on("end", onEnd);
+			process.stdin.on("error", onError);
 			return () => {
-				process.stdin.off("end", handler);
+				process.stdin.off("end", onEnd);
+				process.stdin.off("error", onError);
 			};
 		},
 		waitForBackpressure: waitForRawStdoutBackpressure,
@@ -901,7 +909,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		});
 	});
 	detachClose =
-		transport.onClose?.(() => {
+		transport.onClose?.((transportError) => {
+			if (transportError) {
+				void shutdown(1, undefined, { error: transportError }).catch(() => {});
+				return;
+			}
 			void shutdown().catch(() => {});
 		}) ?? (() => {});
 

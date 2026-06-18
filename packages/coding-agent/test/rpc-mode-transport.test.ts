@@ -192,6 +192,37 @@ describe("RPC mode caller-provided transports", () => {
 		}
 	});
 
+	test("rejects and closes when the input transport closes with an error", async () => {
+		let closeHandler: RpcCloseHandler | undefined;
+		const detachInput = vi.fn();
+		const detachClose = vi.fn();
+		const inputError = new Error("input failed");
+		const transportClose = vi.fn(async () => {});
+		const transport: RpcTransport = {
+			write: vi.fn(),
+			onLine: vi.fn(() => detachInput),
+			onClose: vi.fn((handler) => {
+				closeHandler = handler;
+				return detachClose;
+			}),
+			waitForBackpressure: vi.fn(async () => {}),
+			flush: vi.fn(async () => {}),
+			close: transportClose,
+		};
+		const { runtimeHost, dispose } = createRuntimeHost();
+
+		const modePromise = runRpcMode(runtimeHost, { transport });
+		await vi.waitFor(() => expect(closeHandler).toBeDefined());
+
+		closeHandler?.(inputError);
+
+		await expect(modePromise).rejects.toBe(inputError);
+		expect(dispose).toHaveBeenCalledOnce();
+		expect(detachInput).toHaveBeenCalledOnce();
+		expect(detachClose).toHaveBeenCalledOnce();
+		expect(transportClose).toHaveBeenCalledOnce();
+	});
+
 	test("closes the transport when shutdown flushing fails", async () => {
 		let closeHandler: RpcCloseHandler | undefined;
 		const flushError = new Error("flush failed");
