@@ -34,7 +34,7 @@ export function createIrohRemoteFilteredRpcTransport(options: IrohRemoteFiltered
 		}
 		const pending = Promise.resolve(result)
 			.catch((error: unknown) => {
-				throw recordRejectionError(error);
+				recordRejectionError(error);
 			})
 			.finally(() => {
 				pendingRejections.delete(pending);
@@ -84,8 +84,25 @@ export function createIrohRemoteFilteredRpcTransport(options: IrohRemoteFiltered
 			await waitForRejectionWrites();
 			await options.transport.flush?.();
 		},
-		close() {
-			return options.transport.close();
+		async close() {
+			let rejectionError: unknown;
+			try {
+				await waitForRejectionWrites();
+			} catch (error: unknown) {
+				rejectionError = error;
+			}
+
+			try {
+				await options.transport.close();
+			} catch (closeError: unknown) {
+				if (!rejectionError) {
+					throw closeError;
+				}
+			}
+
+			if (rejectionError) {
+				throw rejectionError;
+			}
 		},
 	};
 }

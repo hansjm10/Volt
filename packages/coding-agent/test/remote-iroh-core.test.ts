@@ -28,17 +28,20 @@ import {
 	writeIrohRemoteHostState,
 } from "../src/core/remote/iroh/index.ts";
 import type { RpcCloseHandler, RpcLineHandler, RpcTransport } from "../src/core/rpc/index.ts";
+import { createIrohRemoteCloseDeferringRpcTransport } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
 
 class ManualRpcTransport implements RpcTransport {
 	readonly writes: object[] = [];
+	readonly writeResults: Array<void | Promise<void>> = [];
 	readonly lineHandlers = new Set<RpcLineHandler>();
 	readonly closeHandlers = new Set<RpcCloseHandler>();
 	closeCalls = 0;
 	flushCalls = 0;
 	waitForBackpressureCalls = 0;
 
-	write(value: object): void {
+	write(value: object): void | Promise<void> {
 		this.writes.push(value);
+		return this.writeResults.shift();
 	}
 
 	onLine(handler: RpcLineHandler): () => void {
@@ -72,6 +75,32 @@ class ManualRpcTransport implements RpcTransport {
 			handler(line);
 		}
 	}
+
+	emitClose(error?: Error): void {
+		for (const handler of this.closeHandlers) {
+			handler(error);
+		}
+	}
+}
+
+interface DeferredVoid {
+	promise: Promise<void>;
+	resolve(): void;
+	reject(error: Error): void;
+}
+
+function createDeferredVoid(): DeferredVoid {
+	let resolve: () => void = () => {};
+	let reject: (error: Error) => void = () => {};
+	const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
+}
+
+function nextTick(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
 }
 
 function makeHello(workspace: string, secret?: string, clientLabel = "phone"): IrohRemoteHello {
@@ -301,6 +330,75 @@ describe("Iroh remote core helpers", () => {
 		expect(inner.waitForBackpressureCalls).toBe(1);
 		expect(inner.flushCalls).toBe(1);
 		expect(inner.closeCalls).toBe(1);
+	});
+
+	test("surfaces asynchronous filter rejection write failures from close", async () => {
+		const inner = new ManualRpcTransport();
+		const transport = createIrohRemoteFilteredRpcTransport({ transport: inner });
+		const write = createDeferredVoid();
+		const writeError = new Error("rejection write failed");
+		inner.writeResults.push(write.promise);
+		transport.onLine(() => {
+			throw new Error("rejected commands must not be forwarded");
+		});
+
+		inner.emitLine(JSON.stringify({ id: "bash-1", type: "bash", command: "pwd" }));
+		write.reject(writeError);
+		await nextTick();
+
+		await expect(transport.close()).rejects.toBe(writeError);
+		expect(inner.closeCalls).toBe(1);
+	});
+
+	test("defers clean remote close until one-shot command responses are written", async () => {
+		const inner = new ManualRpcTransport();
+		const transport = createIrohRemoteCloseDeferringRpcTransport({
+			transport: inner,
+			waitForPromptCompletion: () => Promise.resolve(),
+		});
+		let closed = false;
+		transport.onLine(() => {});
+		transport.onClose?.(() => {
+			closed = true;
+		});
+
+		inner.emitLine(JSON.stringify({ id: "state-1", type: "get_state" }));
+		inner.emitClose();
+		await nextTick();
+		expect(closed).toBe(false);
+
+		transport.write({ id: "state-1", type: "response", command: "get_state", success: true });
+		await nextTick();
+
+		expect(closed).toBe(true);
+	});
+
+	test("defers clean remote close until prompt completion after preflight success", async () => {
+		const inner = new ManualRpcTransport();
+		const promptCompletion = createDeferredVoid();
+		const transport = createIrohRemoteCloseDeferringRpcTransport({
+			transport: inner,
+			waitForPromptCompletion: () => promptCompletion.promise,
+		});
+		let closed = false;
+		transport.onLine(() => {});
+		transport.onClose?.(() => {
+			closed = true;
+		});
+
+		inner.emitLine(JSON.stringify({ id: "prompt-1", type: "prompt", message: "hi" }));
+		inner.emitClose();
+		await nextTick();
+		expect(closed).toBe(false);
+
+		transport.write({ id: "prompt-1", type: "response", command: "prompt", success: true });
+		await nextTick();
+		expect(closed).toBe(false);
+
+		promptCompletion.resolve();
+		await nextTick();
+
+		expect(closed).toBe(true);
 	});
 
 	test("filters remote RPC commands before forwarding to Volt RPC", () => {
