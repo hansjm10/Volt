@@ -3,6 +3,7 @@ import type { ExtensionBindings } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { createLoopbackRpcTransportPair, type RpcExtensionUIRequest } from "../src/core/rpc/index.ts";
 import { createInProcessRpcClient } from "../src/modes/rpc/in-process-rpc-client.ts";
+import { createIrohRemoteCloseDeferringRpcTransport } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
 import { RpcTransportClient } from "../src/modes/rpc/rpc-transport-client.ts";
 
@@ -58,6 +59,50 @@ describe("RpcTransportClient", () => {
 		await client.stop();
 	});
 
+	test("rejects unsuccessful responses for void commands", async () => {
+		const pair = createLoopbackRpcTransportPair();
+		const client = new RpcTransportClient({ transport: pair.client });
+		pair.server.onLine((line) => {
+			const command = parseCommandLine(line);
+			pair.server.write({
+				id: command.id,
+				type: "response",
+				command: command.type,
+				success: false,
+				error: "Session name cannot be empty",
+			});
+		});
+
+		await client.start();
+		try {
+			await expect(client.setSessionName("")).rejects.toThrow("Session name cannot be empty");
+		} finally {
+			await client.stop();
+		}
+	});
+
+	test("promptAndWait rejects unsuccessful prompt responses", async () => {
+		const pair = createLoopbackRpcTransportPair();
+		const client = new RpcTransportClient({ transport: pair.client });
+		pair.server.onLine((line) => {
+			const command = parseCommandLine(line);
+			pair.server.write({
+				id: command.id,
+				type: "response",
+				command: command.type,
+				success: false,
+				error: "prompt preflight failed",
+			});
+		});
+
+		await client.start();
+		try {
+			await expect(client.promptAndWait("hi", undefined, 50)).rejects.toThrow("prompt preflight failed");
+		} finally {
+			await client.stop();
+		}
+	});
+
 	test("rejects in-flight requests when the transport closes", async () => {
 		const pair = createLoopbackRpcTransportPair();
 		const client = new RpcTransportClient({ transport: pair.client });
@@ -93,6 +138,39 @@ describe("runRpcMode", () => {
 		void modePromise.catch(() => {});
 
 		await startupRequest;
+		pair.client.close();
+
+		await expect(modePromise).rejects.toThrow("RPC transport closed during startup");
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	test("does not defer startup closes behind queued Iroh commands", async () => {
+		const pair = createLoopbackRpcTransportPair();
+		const dispose = vi.fn(async () => {});
+		const startupRequest = new Promise<Extract<RpcExtensionUIRequest, { method: "confirm" }>>((resolve) => {
+			pair.client.onLine((line) => {
+				const event = JSON.parse(line) as RpcExtensionUIRequest;
+				if (event.type === "extension_ui_request" && event.method === "confirm") {
+					resolve(event);
+				}
+			});
+		});
+		const runtimeHost = createRuntimeHost(dispose, async (bindings) => {
+			const uiContext = bindings.uiContext;
+			if (!uiContext) {
+				throw new Error("UI context was not bound");
+			}
+			await uiContext.confirm("Startup", "Continue?");
+		});
+		const transport = createIrohRemoteCloseDeferringRpcTransport({
+			transport: pair.server,
+			waitForPromptCompletion: () => Promise.resolve(),
+		});
+		const modePromise = runRpcMode(runtimeHost, { transport, exitProcess: false });
+		void modePromise.catch(() => {});
+
+		await startupRequest;
+		pair.client.write({ id: "queued-state", type: "get_state" });
 		pair.client.close();
 
 		await expect(modePromise).rejects.toThrow("RPC transport closed during startup");

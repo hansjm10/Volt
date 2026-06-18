@@ -56,6 +56,10 @@ export interface RpcModeOptions {
 	onReady?: () => void;
 }
 
+type RpcModeStartupAwareTransport = RpcTransport & {
+	setRpcModeStartupComplete?(startupComplete: boolean): void;
+};
+
 function createStdioRpcTransport(): RpcTransport {
 	return {
 		write(value) {
@@ -97,6 +101,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	const shouldExitProcess = options.exitProcess ?? !options.transport;
 	const shouldRestoreStdout = !options.transport && !shouldExitProcess;
 	const transport = options.transport ?? createStdioRpcTransport();
+	const startupAwareTransport = transport as RpcModeStartupAwareTransport;
+	startupAwareTransport.setRpcModeStartupComplete?.(false);
 	// Shutdown request flag
 	let shutdownRequested = false;
 	let shuttingDown = false;
@@ -1010,6 +1016,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		throw startupAbortError ?? new Error("RPC mode shut down during startup");
 	}
 	startupComplete = true;
+	startupAwareTransport.setRpcModeStartupComplete?.(true);
 	for (const line of queuedStartupCommandLines.splice(0)) {
 		processInputLine(line);
 	}

@@ -278,9 +278,30 @@ export abstract class RpcClientBase {
 
 	/** Send prompt and wait for completion, returning all events. */
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60_000): Promise<RpcClientEvent[]> {
-		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
-		return eventsPromise;
+		return new Promise((resolve, reject) => {
+			const events: RpcClientEvent[] = [];
+			const timer = setTimeout(() => {
+				unsubscribe();
+				reject(new Error(this.formatError("Timeout collecting events")));
+			}, timeout);
+
+			const rejectAndCleanup = (error: unknown): void => {
+				clearTimeout(timer);
+				unsubscribe();
+				reject(toError(error));
+			};
+
+			const unsubscribe = this.onEvent((event) => {
+				events.push(event);
+				if (event.type === "agent_end") {
+					clearTimeout(timer);
+					unsubscribe();
+					resolve(events);
+				}
+			});
+
+			void this.prompt(message, images).catch(rejectAndCleanup);
+		});
 	}
 
 	protected handleLine(line: string): void {
@@ -351,6 +372,10 @@ export abstract class RpcClientBase {
 			this.pendingRequests.set(id, {
 				resolve: (response) => {
 					clearTimeout(timeout);
+					if (!response.success) {
+						reject(new Error(response.error));
+						return;
+					}
 					resolve(response);
 				},
 				reject: rejectRequest,

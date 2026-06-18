@@ -17,6 +17,10 @@ interface IrohRemoteCloseDeferringRpcTransportOptions {
 	waitForPromptCompletion(): Promise<void>;
 }
 
+interface IrohRemoteCloseDeferringRpcTransport extends RpcTransport {
+	setRpcModeStartupComplete(startupComplete: boolean): void;
+}
+
 /** Run Volt RPC in-process over an authorized Iroh bidirectional stream. */
 export function runIrohRemoteRpcMode(
 	runtimeHost: AgentSessionRuntime,
@@ -35,6 +39,7 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 	options: IrohRemoteCloseDeferringRpcTransportOptions,
 ): RpcTransport {
 	const pendingCommands = new Set<PendingIrohRemoteCommand>();
+	let rpcModeStartupComplete = true;
 
 	const createPendingCommand = (command: string, id: string | undefined): PendingIrohRemoteCommand => {
 		let finished = false;
@@ -121,7 +126,10 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 		pending.finish();
 	};
 
-	return {
+	const transport: IrohRemoteCloseDeferringRpcTransport = {
+		setRpcModeStartupComplete(startupComplete) {
+			rpcModeStartupComplete = startupComplete;
+		},
 		write(value) {
 			const result = options.transport.write(value);
 			trackOutboundResponse(value);
@@ -149,6 +157,10 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 						handler(error);
 						return;
 					}
+					if (!rpcModeStartupComplete) {
+						handler();
+						return;
+					}
 					void waitForPendingCommands().then(() => {
 						if (active) {
 							handler();
@@ -170,4 +182,5 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 			return options.transport.close();
 		},
 	};
+	return transport;
 }
