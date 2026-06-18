@@ -144,6 +144,8 @@ To share extensions via npm or git as volt packages, see [packages.md](packages.
 | `@earendil-works/volt-ai` | AI utilities (`StringEnum` for Google-compatible enums) |
 | `@earendil-works/volt-tui` | TUI components for custom rendering |
 
+Pi extension packages also work: Volt maps Pi core imports (`@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, plus the legacy `@mariozechner/pi-*` names) to the corresponding Volt APIs when loading extensions.
+
 npm dependencies work too. Add a `package.json` next to your extension (or in a parent directory), run `npm install`, and imports from `node_modules/` are resolved automatically.
 
 For distributed volt packages installed with `volt install` (npm or git), runtime deps must be in `dependencies`. Package installation uses production installs (`npm install --omit=dev`) by default, so `devDependencies` are not available at runtime; when `npmCommand` is configured, git packages use plain `install` for compatibility with wrappers.

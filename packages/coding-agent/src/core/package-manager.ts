@@ -487,8 +487,8 @@ function collectAutoThemeEntries(dir: string): string[] {
 function readVoltManifestFile(packageJsonPath: string): VoltManifest | null {
 	try {
 		const content = readFileSync(packageJsonPath, "utf-8");
-		const pkg = JSON.parse(content) as { volt?: VoltManifest };
-		return pkg.volt ?? null;
+		const pkg = JSON.parse(content) as { volt?: unknown; pi?: unknown };
+		return (pkg.volt ?? pkg.pi ?? null) as VoltManifest | null;
 	} catch {
 		return null;
 	}
@@ -528,7 +528,7 @@ function collectAutoExtensionEntries(dir: string): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
-	// First check if this directory itself has explicit extension entries (package.json or index)
+	// First check if this directory itself has explicit extension entries (package.json volt/pi manifest or index)
 	const rootEntries = resolveExtensionEntries(dir);
 	if (rootEntries) {
 		return rootEntries;
@@ -2380,8 +2380,8 @@ export class DefaultPackageManager implements PackageManager {
 
 		try {
 			const content = readFileSync(packageJsonPath, "utf-8");
-			const pkg = JSON.parse(content) as { volt?: VoltManifest };
-			return pkg.volt ?? null;
+			const pkg = JSON.parse(content) as { volt?: unknown; pi?: unknown };
+			return (pkg.volt ?? pkg.pi ?? null) as VoltManifest | null;
 		} catch {
 			return null;
 		}

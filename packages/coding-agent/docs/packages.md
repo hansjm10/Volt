@@ -4,6 +4,8 @@
 
 Volt packages bundle extensions, skills, prompt templates, and themes so you can share them through npm or git. A package can declare resources in `package.json` under the `volt` key, or use conventional directories.
 
+Volt can also install existing Pi extension packages. When a package has a `pi` manifest but no `volt` manifest, Volt reads the `pi` resources and maps Pi core imports to the Volt APIs at load time.
+
 ## Table of Contents
 
 - [Install and Manage](#install-and-manage)
@@ -155,7 +157,7 @@ If both are set, video takes precedence.
 
 ### Convention Directories
 
-If no `volt` manifest is present, volt auto-discovers resources from these directories:
+If no `volt` or compatible `pi` manifest is present, volt auto-discovers resources from these directories:
 
 - `extensions/` loads `.ts` and `.js` files
 - `skills/` recursively finds `SKILL.md` folders and loads top-level `.md` files as skills
@@ -167,6 +169,8 @@ If no `volt` manifest is present, volt auto-discovers resources from these direc
 Third party runtime dependencies belong in `dependencies` in `package.json`. Dependencies that do not register extensions, skills, prompt templates, or themes also belong in `dependencies`. When volt installs a package from npm or git, it runs `npm install`, so those dependencies are installed automatically.
 
 Volt bundles core packages for extensions and skills. If you import any of these, list them in `peerDependencies` with a `"*"` range and do not bundle them: `@earendil-works/volt-ai`, `@earendil-works/volt-agent-core`, `@earendil-works/volt-coding-agent`, `@earendil-works/volt-tui`, `typebox`.
+
+For Pi compatibility, Volt aliases `@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and the legacy `@mariozechner/pi-*` package names to the corresponding Volt modules when loading extensions.
 
 Other volt packages must be bundled in your tarball. Add them to `dependencies` and `bundledDependencies`, then reference their resources through `node_modules/` paths. Volt loads packages with separate module roots, so separate installs do not collide or share modules.
 
