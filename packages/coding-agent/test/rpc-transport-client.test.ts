@@ -103,6 +103,29 @@ describe("RpcTransportClient", () => {
 		}
 	});
 
+	test("promptAndWait waits for prompt response before resolving on agent_end", async () => {
+		const pair = createLoopbackRpcTransportPair();
+		const client = new RpcTransportClient({ transport: pair.client });
+		pair.server.onLine((line) => {
+			const command = parseCommandLine(line);
+			pair.server.write({ type: "agent_end" });
+			pair.server.write({
+				id: command.id,
+				type: "response",
+				command: command.type,
+				success: false,
+				error: "prompt preflight failed",
+			});
+		});
+
+		await client.start();
+		try {
+			await expect(client.promptAndWait("hi", undefined, 50)).rejects.toThrow("prompt preflight failed");
+		} finally {
+			await client.stop();
+		}
+	});
+
 	test("rejects in-flight requests when the transport closes", async () => {
 		const pair = createLoopbackRpcTransportPair();
 		const client = new RpcTransportClient({ transport: pair.client });

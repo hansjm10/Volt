@@ -280,27 +280,55 @@ export abstract class RpcClientBase {
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60_000): Promise<RpcClientEvent[]> {
 		return new Promise((resolve, reject) => {
 			const events: RpcClientEvent[] = [];
+			let agentEnded = false;
+			let promptAccepted = false;
+			let settled = false;
+			let unsubscribe = (): void => {};
+
 			const timer = setTimeout(() => {
+				if (settled) {
+					return;
+				}
+				settled = true;
 				unsubscribe();
 				reject(new Error(this.formatError("Timeout collecting events")));
 			}, timeout);
 
-			const rejectAndCleanup = (error: unknown): void => {
+			const cleanup = (): void => {
 				clearTimeout(timer);
 				unsubscribe();
+			};
+
+			const rejectAndCleanup = (error: unknown): void => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
 				reject(toError(error));
 			};
 
-			const unsubscribe = this.onEvent((event) => {
+			const resolveIfComplete = (): void => {
+				if (settled || !agentEnded || !promptAccepted) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				resolve(events);
+			};
+
+			unsubscribe = this.onEvent((event) => {
 				events.push(event);
 				if (event.type === "agent_end") {
-					clearTimeout(timer);
-					unsubscribe();
-					resolve(events);
+					agentEnded = true;
+					resolveIfComplete();
 				}
 			});
 
-			void this.prompt(message, images).catch(rejectAndCleanup);
+			void this.prompt(message, images).then(() => {
+				promptAccepted = true;
+				resolveIfComplete();
+			}, rejectAndCleanup);
 		});
 	}
 
