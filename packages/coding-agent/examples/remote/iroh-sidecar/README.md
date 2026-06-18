@@ -2,7 +2,7 @@
 
 This example tunnels Volt RPC JSONL over an Iroh QUIC bidirectional stream.
 
-The PoC keeps Iroh outside Volt core. `host.mjs` accepts an Iroh connection, validates pairing, spawns a child RPC process, and bridges bytes between Iroh and the child process. The child is `fake-rpc.mjs` by default so the network bridge can be tested without provider credentials.
+The PoC keeps the native Iroh dependency outside Volt core while importing Volt's shared Iroh protocol helpers for tickets, state, authorization, handshakes, and command filtering. `host.mjs` accepts an Iroh connection, validates pairing, and either bridges to a child RPC process or runs the source checkout's Volt runtime in-process with `--integrated-volt`. The default child is `fake-rpc.mjs` so the network bridge can be tested without provider credentials.
 
 ## Install
 
@@ -30,7 +30,7 @@ From the repository root:
 npm run iroh:poc:smoke                  # local fake-RPC smoke test
 npm run iroh:poc:test                   # local fake-RPC scenario tests
 npm run iroh:poc:host                   # fake-RPC host
-npm run iroh:poc:host:volt              # source Volt RPC host for this checkout
+npm run iroh:poc:host:volt              # integrated source Volt host for this checkout
 npm run iroh:poc:client -- "<ticket>"    # one-shot client
 npm run iroh:poc:client -- "<ticket>" --interactive  # persistent prompt loop
 npm run iroh:poc:clients                # list paired clients
@@ -125,7 +125,13 @@ Terminal 1, when testing this source checkout from the repository root:
 npm run iroh:poc:host:volt -- --allow-tools read,grep,find,ls
 ```
 
-Terminal 1, when testing another source checkout from this directory:
+The same integrated path is also available through the source CLI:
+
+```bash
+node scripts/run-coding-agent-source.mjs remote host --workspace volt=. --allow-tools read,grep,find,ls
+```
+
+Terminal 1, when testing another source checkout as a spawned RPC child from this directory:
 
 ```bash
 npm run host -- --source-volt /path/to/volt --workspace volt=/path/to/volt --allow-tools read,grep,find,ls

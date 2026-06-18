@@ -79,6 +79,7 @@ export type IrohRemoteHostHandshakeResult =
 
 export interface IrohRemoteHostReadHandshakeOptions extends IrohRemoteHandshakeLineReadOptions {
 	child?: string;
+	writeSuccessResponse?: boolean;
 }
 
 export interface IrohRemoteClientEngineOptions {
@@ -234,7 +235,7 @@ export class IrohRemoteHostEngine {
 				});
 			}
 
-			return await this.writeHandshakeResult(stream, {
+			const successResult: IrohRemoteHostHandshakeResult = {
 				ok: true,
 				authorization,
 				hello,
@@ -245,7 +246,11 @@ export class IrohRemoteHostEngine {
 					workspace: authorization.workspace.name,
 				}),
 				responseWritten: false,
-			});
+			};
+			if (options.writeSuccessResponse === false) {
+				return successResult;
+			}
+			return await this.writeHandshakeResult(stream, successResult);
 		} catch (error: unknown) {
 			return await this.writeHandshakeResult(
 				stream,

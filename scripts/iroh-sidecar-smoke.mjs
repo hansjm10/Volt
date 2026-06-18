@@ -11,6 +11,7 @@ const sidecarDir = join(repoRoot, "packages", "coding-agent", "examples", "remot
 const hostScript = join(sidecarDir, "host.mjs");
 const clientScript = join(sidecarDir, "client.mjs");
 const irohPackageJson = join(sidecarDir, "node_modules", "@number0", "iroh", "package.json");
+const SOURCE_IMPORT_CONDITION_ARGS = ["--conditions", "volt-source"];
 
 async function assertInstalled() {
 	try {
@@ -70,10 +71,24 @@ async function waitForFirstStdoutLine(child, output, label) {
 }
 
 async function runClient(ticket, clientStatePath) {
-	const client = spawn(process.execPath, [clientScript, ticket, "--state", clientStatePath, "--message", "smoke", "--timeout-ms", "10000"], {
-		cwd: repoRoot,
-		stdio: ["ignore", "pipe", "pipe"],
-	});
+	const client = spawn(
+		process.execPath,
+		[
+			...SOURCE_IMPORT_CONDITION_ARGS,
+			clientScript,
+			ticket,
+			"--state",
+			clientStatePath,
+			"--message",
+			"smoke",
+			"--timeout-ms",
+			"10000",
+		],
+		{
+			cwd: repoRoot,
+			stdio: ["ignore", "pipe", "pipe"],
+		},
+	);
 	const output = collectProcess(client);
 	await waitForExit(client, "client").catch((error) => {
 		throw new Error(`${error.message}\n${output.stderr}`);
@@ -88,7 +103,7 @@ async function main() {
 	const clientStatePath = join(stateDir, "client.json");
 	let host;
 	try {
-		host = spawn(process.execPath, [hostScript, "--state", hostStatePath, "--once"], {
+		host = spawn(process.execPath, [...SOURCE_IMPORT_CONDITION_ARGS, hostScript, "--state", hostStatePath, "--once"], {
 			cwd: repoRoot,
 			stdio: ["ignore", "pipe", "pipe"],
 		});

@@ -2,7 +2,7 @@
 
 ## Status
 
-Phase 2 is mostly complete in Volt core: RPC mode has a transport abstraction, Iroh streams have a structurally typed RPC adapter, remote command filtering is available, and the Iroh remote helpers now cover tickets, handshakes, host state, authorization, workspace selection, audit logging, and host/client engine orchestration. Phase 3 productization is next.
+Phase 2 is mostly complete in Volt core: RPC mode has a transport abstraction, Iroh streams have a structurally typed RPC adapter, remote command filtering is available, and the Iroh remote helpers now cover tickets, handshakes, host state, authorization, workspace selection, audit logging, and host/client engine orchestration. A first `volt remote host` path now delegates to the temporary native sidecar adapter and runs the source checkout's Volt runtime in-process over `runIrohRemoteRpcMode()`.
 
 ## Summary
 
@@ -61,7 +61,7 @@ flowchart LR
     Rpc --> Auth[Host Volt auth]
 ```
 
-The sidecar still owns native Iroh endpoint lifecycle and child process lifecycle for the proof of concept. Volt core owns shared remote protocol behavior: pairing tickets, handshake parsing, bounded handshake reads, host state management, client authorization, audit events, workspace selection, remote command filtering, and in-process RPC transport adapters.
+The sidecar still owns native Iroh endpoint lifecycle for the proof of concept. Volt core owns shared remote protocol behavior: pairing tickets, handshake parsing, bounded handshake reads, host state management, client authorization, audit events, workspace selection, remote command filtering, and in-process RPC transport adapters. The sidecar can still spawn child RPC processes for fake-RPC and compatibility tests, but the integrated source-host path calls `runIrohRemoteRpcMode()` directly.
 
 ## Minimal Sidecar Proof of Concept
 
@@ -201,10 +201,15 @@ volt-iroh-host clients revoke <node-id>
 volt-iroh-client connect <ticket>
 ```
 
-Future integrated Volt commands:
+Initial integrated Volt command:
 
 ```bash
 volt remote host --workspace volt=/path/to/repo
+```
+
+Future integrated Volt commands:
+
+```bash
 volt remote pair --workspace volt
 volt remote clients
 volt remote revoke <node-id>

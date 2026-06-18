@@ -5,8 +5,8 @@
   "type": "module",
   "description": "Proof of concept for tunneling Volt RPC over Iroh",
   "scripts": {
-    "host": "node host.mjs",
-    "client": "node client.mjs",
+    "host": "node source-aware-run.mjs host.mjs",
+    "client": "node source-aware-run.mjs client.mjs",
     "fake-rpc": "node fake-rpc.mjs"
   },
   "dependencies": {

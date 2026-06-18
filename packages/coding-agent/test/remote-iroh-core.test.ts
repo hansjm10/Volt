@@ -637,6 +637,46 @@ describe("Iroh remote core helpers", () => {
 		expect(await hostEngine.listClients()).toEqual([expect.objectContaining({ nodeId: "client-node" })]);
 	});
 
+	test("host engine can defer writing successful handshakes", async () => {
+		const stateManager = new IrohRemoteHostStateManager({ initialState: createEmptyIrohRemoteHostState() });
+		const workspace: IrohRemoteWorkspace = { name: "volt", path: "/workspace" };
+		const hostEngine = new IrohRemoteHostEngine({
+			now: () => 100,
+			stateManager,
+			workspace,
+		});
+		await hostEngine.pair({
+			irohTicket: "iroh-endpoint-ticket",
+			secret: "secret",
+		});
+		const recv = new ManualIrohRecvStream();
+		const send = new ManualIrohSendStream();
+		recv.push(
+			Buffer.from(
+				`${JSON.stringify({
+					type: "volt_iroh_hello",
+					protocol: IROH_REMOTE_ALPN,
+					workspace: "volt",
+					secret: "secret",
+				})}\n{"id":"state-1","type":"get_state"}\n`,
+			),
+		);
+
+		const handshake = await hostEngine.readHandshake({ recv, send }, "client-node", {
+			child: "volt",
+			writeSuccessResponse: false,
+		});
+
+		if (!handshake.ok) {
+			throw new Error(handshake.error);
+		}
+		expect(handshake.response.success).toBe(true);
+		expect(handshake.responseWritten).toBe(false);
+		expect(handshake.initialInput).toEqual(Buffer.from('{"id":"state-1","type":"get_state"}\n'));
+		expect(send.writtenText()).toBe("");
+		expect(await hostEngine.listClients()).toEqual([expect.objectContaining({ nodeId: "client-node" })]);
+	});
+
 	test("host engine send failures do not turn committed authorization into handshake failure", async () => {
 		const stateManager = new IrohRemoteHostStateManager({ initialState: createEmptyIrohRemoteHostState() });
 		const workspace: IrohRemoteWorkspace = { name: "volt", path: "/workspace" };

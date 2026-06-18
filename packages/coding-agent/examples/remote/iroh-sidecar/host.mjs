@@ -1,41 +1,43 @@
 import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
-import { access, mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import iroh from "@number0/iroh";
 import lockfile from "proper-lockfile";
 import {
+	createIrohRemoteHandshakeFailure,
+	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+	DEFAULT_IROH_REMOTE_HANDSHAKE_MAX_LINE_BYTES,
+	DEFAULT_IROH_REMOTE_HANDSHAKE_TIMEOUT_MS,
+	DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS,
+	encodeIrohRemoteTicketPayload,
+	getIrohRemoteRpcFilterResult,
+	IROH_REMOTE_ALPN,
+	IrohRemoteHostEngine,
+	IrohRemoteHostStateManager,
+	readIrohRemoteHostState,
+	selectIrohRemoteWorkspace,
+	serializeIrohRemoteRpcFilterRejection,
+	writeIrohRemoteHandshakeResponse,
+	writeIrohRemoteHostState,
+	createIrohRemoteAgentRuntime,
+	runIrohRemoteRpcMode,
+} from "@earendil-works/volt-coding-agent";
+import {
 	ALPN,
-	ALPN_TEXT,
-	encodeTicketPayload,
 	getFlag,
 	hasFlag,
 	parseFlags,
 	readLineFromIroh,
-	serializeJsonLine,
-	toBytes,
 	writeNodeStream,
 } from "./common.mjs";
 
 const { Endpoint, EndpointTicket, RelayMode, presetMinimal, presetN0 } = iroh;
-const DEFAULT_ALLOW_TOOLS = "read,grep,find,ls";
 const DEFAULT_STATE_PATH = resolve(homedir(), ".volt", "agent", "remote", "iroh-sidecar-host.json");
-const HANDSHAKE_MAX_LINE_BYTES = 16 * 1024;
-const HANDSHAKE_TIMEOUT_MS = 15_000;
-const PAIRING_TICKET_TTL_MS = 10 * 60 * 1000;
-const REMOTE_RPC_PASSTHROUGH_TYPES = new Set([
-	"prompt",
-	"steer",
-	"follow_up",
-	"abort",
-	"get_state",
-	"extension_ui_response",
-]);
 const PROMPT_COMPLETION_RPC_TYPES = new Set(["prompt", "steer", "follow_up"]);
 const RESPONSE_COMPLETION_RPC_TYPES = new Set(["abort", "get_state"]);
 const PROMPT_COMPLETION_SETTLE_MS = 100;
@@ -51,8 +53,12 @@ Serve options:
   --state <path>             Host state path. Defaults to ~/.volt/agent/remote/iroh-sidecar-host.json.
   --use-volt                 Spawn volt --mode rpc instead of the fake RPC child.
   --source-volt <repo-root>  Spawn Volt from a source checkout. Implies --use-volt.
+  --integrated-volt          Run this source checkout's Volt runtime in-process over Iroh.
   --volt-bin <path>          Volt executable for --use-volt. Defaults to volt.
   --allow-tools <list>       Tool allowlist passed to Volt. Defaults to read,grep,find,ls.
+  --profile <name>           Volt settings profile for integrated Volt runtime.
+  --agent-dir <path>         Volt agent config directory for integrated Volt runtime.
+  --approve                  Trust project-local Volt settings/resources for integrated Volt runtime.
   --no-pairing               Reject unpaired clients and print a paired-client ticket.
   --once                     Exit after the first client disconnects.
 
@@ -60,48 +66,6 @@ Client management:
   clients                    Print paired clients from state.
   revoke <node-id>           Remove a paired client from state.
 `);
-}
-
-function parseWorkspace(value) {
-	if (!value) {
-		const cwd = process.cwd();
-		return { name: basename(cwd) || "workspace", path: cwd };
-	}
-
-	const separatorIndex = value.indexOf("=");
-	if (separatorIndex === -1) {
-		const path = resolve(value);
-		return { name: basename(path) || "workspace", path };
-	}
-
-	const name = value.slice(0, separatorIndex).trim();
-	const path = resolve(value.slice(separatorIndex + 1));
-	if (!name) throw new Error("Workspace name cannot be empty");
-	return { name, path };
-}
-
-async function readState(path) {
-	try {
-		const state = JSON.parse(await readFile(path, "utf8"));
-		return {
-			hostSecretKey: state.hostSecretKey,
-			consumedPairingSecretHashes: state.consumedPairingSecretHashes ?? [],
-			workspaces: state.workspaces ?? [],
-			clients: state.clients ?? [],
-		};
-	} catch (error) {
-		if (error && error.code === "ENOENT") {
-			return { hostSecretKey: undefined, consumedPairingSecretHashes: [], workspaces: [], clients: [] };
-		}
-		throw error;
-	}
-}
-
-async function writeState(path, state) {
-	await mkdir(dirname(path), { recursive: true });
-	const tempPath = `${path}.${process.pid}.tmp`;
-	await writeFile(tempPath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-	await rename(tempPath, path);
 }
 
 async function withStateFileLock(statePath, operation) {
@@ -153,33 +117,6 @@ function syncState(target, source) {
 	target.consumedPairingSecretHashes = source.consumedPairingSecretHashes ?? [];
 	target.workspaces = source.workspaces ?? [];
 	target.clients = source.clients ?? [];
-}
-
-function upsertWorkspace(state, workspace, allowTools) {
-	const existing = state.workspaces.find((entry) => entry.name === workspace.name);
-	const savedWorkspace = {
-		name: workspace.name,
-		path: workspace.path,
-		allowedTools: allowTools,
-	};
-	if (existing) {
-		Object.assign(existing, savedWorkspace);
-		return existing;
-	}
-	state.workspaces.push(savedWorkspace);
-	return savedWorkspace;
-}
-
-function selectWorkspace(state, requestedWorkspace, allowTools) {
-	if (requestedWorkspace) {
-		return upsertWorkspace(state, parseWorkspace(requestedWorkspace), allowTools);
-	}
-	if (state.workspaces.length > 0) {
-		const workspace = state.workspaces[0];
-		workspace.allowedTools = allowTools;
-		return workspace;
-	}
-	return upsertWorkspace(state, parseWorkspace(undefined), allowTools);
 }
 
 async function assertWorkspaceDirectory(workspace) {
@@ -269,6 +206,9 @@ async function resolveSourceVoltRunner(sourceVolt) {
 
 async function preflightRpcChild(options, workspace) {
 	await assertWorkspaceDirectory(workspace);
+	if (options.integratedVolt) {
+		return;
+	}
 	if (options.sourceVolt) {
 		options.resolvedSourceVoltRunner = await resolveSourceVoltRunner(options.sourceVolt);
 		return;
@@ -287,7 +227,7 @@ async function preflightRpcChild(options, workspace) {
 
 async function bindEndpoint(relayMode, state, statePath) {
 	const endpoint = await withStateFileLock(statePath, async () => {
-		syncState(state, await readState(statePath));
+		syncState(state, await readIrohRemoteHostState(statePath));
 		const builder = Endpoint.builder();
 		if (relayMode === "default") {
 			presetN0(builder);
@@ -302,7 +242,7 @@ async function bindEndpoint(relayMode, state, statePath) {
 		const boundEndpoint = await builder.bind();
 		if (!state.hostSecretKey) {
 			state.hostSecretKey = boundEndpoint.secretKey().toBytes();
-			await writeState(statePath, state);
+			await writeIrohRemoteHostState(statePath, state);
 		}
 		return boundEndpoint;
 	});
@@ -402,9 +342,9 @@ function attachChildLogging(child) {
 }
 
 async function sendHandshakeError(stream, message) {
-	await stream.send.writeAll(toBytes(serializeJsonLine({ type: "volt_iroh_handshake", success: false, error: message })));
-	await stream.send.finish();
-	await stream.recv.stop(0n).catch(() => {});
+	await writeIrohRemoteHandshakeResponse(stream.send, createIrohRemoteHandshakeFailure(message));
+	await stream.send.finish?.();
+	await Promise.resolve(stream.recv.stop?.(0n)).catch(() => {});
 }
 
 async function waitForConnectionClose(connection) {
@@ -445,7 +385,7 @@ function createIrohSendQueue(send) {
 	return {
 		write(chunk) {
 			if (chunk.length === 0 || finishPromise) return pendingWrite;
-			const bytes = typeof chunk === "string" ? toBytes(chunk) : Array.from(Buffer.from(chunk));
+			const bytes = Array.from(Buffer.from(chunk));
 			pendingWrite = pendingWrite.then(() => send.writeAll(bytes));
 			return pendingWrite;
 		},
@@ -623,50 +563,10 @@ function createRemoteRpcCompletionTracker(sendQueue) {
 	};
 }
 
-function createRpcErrorResponse(id, command, error) {
-	return serializeJsonLine({ id, type: "response", command, success: false, error });
-}
-
-function getRemoteRpcFilterResult(line) {
-	let parsed;
-	try {
-		parsed = JSON.parse(line);
-	} catch (error) {
-		return {
-			allowed: false,
-			response: createRpcErrorResponse(
-				undefined,
-				"parse",
-				`Failed to parse command: ${error instanceof Error ? error.message : String(error)}`,
-			),
-		};
-	}
-
-	if (typeof parsed !== "object" || parsed === null || typeof parsed.type !== "string") {
-		return {
-			allowed: false,
-			response: createRpcErrorResponse(undefined, "unknown", "RPC command must be a JSON object with a string type"),
-		};
-	}
-
-	if (REMOTE_RPC_PASSTHROUGH_TYPES.has(parsed.type)) {
-		return { allowed: true, command: parsed };
-	}
-
-	return {
-		allowed: false,
-		response: createRpcErrorResponse(
-			typeof parsed.id === "string" ? parsed.id : undefined,
-			parsed.type,
-			`RPC command not allowed over remote sidecar: ${parsed.type}`,
-		),
-	};
-}
-
 async function writeRemoteRpcLineToChild(line, writable, writeToClient, rpcCompletionTracker) {
-	const filterResult = getRemoteRpcFilterResult(line);
+	const filterResult = getIrohRemoteRpcFilterResult(line);
 	if (!filterResult.allowed) {
-		await writeToClient(filterResult.response);
+		await writeToClient(serializeIrohRemoteRpcFilterRejection(filterResult.response));
 		return;
 	}
 	rpcCompletionTracker.registerForwardedCommand(filterResult.command);
@@ -720,133 +620,69 @@ async function pipeNodeJsonlReadableToIrohSend(readable, sendQueue, onLine) {
 	await sendQueue.finish();
 }
 
-function findClient(state, nodeId) {
-	return state.clients.find((client) => client.nodeId === nodeId);
-}
-
-function getClientWorkspace(client, workspaceName) {
-	const allowedWorkspaces = client.allowedWorkspaces ?? [];
-	return allowedWorkspaces.length === 0 || allowedWorkspaces.includes(workspaceName);
-}
-
-function hashPairingSecret(secret) {
-	return `sha256:${createHash("sha256").update(secret, "utf8").digest("base64url")}`;
-}
-
-function expectString(value, label) {
-	if (typeof value !== "string" || value.length === 0) {
-		throw new Error(`${label} must be a non-empty string`);
-	}
-	return value;
-}
-
-function expectOptionalString(value, label) {
-	if (value === undefined) {
-		return undefined;
-	}
-	return expectString(value, label);
-}
-
-function parseHandshakeHello(line) {
-	let hello;
+async function runSpawnedRpcConnection(stream, handshake, authorization, options) {
+	const spawnedChild = spawnRpcChild(options, authorization.workspace, authorization.allowTools);
+	const child = spawnedChild.child;
+	const childCommand = formatCommand(spawnedChild.command, spawnedChild.args);
+	attachChildLogging(child);
 	try {
-		hello = JSON.parse(line);
+		await waitForChildSpawn(child, childCommand, authorization.workspace);
 	} catch (error) {
-		throw new Error(`Failed to parse Iroh remote handshake: ${error instanceof Error ? error.message : String(error)}`);
+		await sendHandshakeError(stream, error instanceof Error ? error.message : String(error));
+		return child;
 	}
-	if (typeof hello !== "object" || hello === null || Array.isArray(hello)) {
-		throw new Error("Iroh remote handshake must be an object");
-	}
-	if (hello.type !== "volt_iroh_hello") {
-		throw new Error("unexpected handshake type");
-	}
-	if (hello.protocol !== ALPN_TEXT) {
-		throw new Error(`unsupported protocol: ${typeof hello.protocol === "string" ? hello.protocol : "<missing>"}`);
-	}
-	return {
-		type: "volt_iroh_hello",
-		protocol: ALPN_TEXT,
-		workspace: expectString(hello.workspace, "handshake workspace"),
-		secret: expectOptionalString(hello.secret, "handshake secret"),
-		clientLabel: expectOptionalString(hello.clientLabel, "handshake clientLabel"),
-		clientNodeId: expectOptionalString(hello.clientNodeId, "handshake clientNodeId"),
-	};
+
+	await writeIrohRemoteHandshakeResponse(stream.send, handshake.response);
+
+	const sendQueue = createIrohSendQueue(stream.send);
+	const rpcCompletionTracker = createRemoteRpcCompletionTracker(sendQueue);
+	const clientToChild = pipeFilteredIrohRpcToNodeWritable(
+		stream.recv,
+		child.stdin,
+		handshake.initialInput,
+		(chunk) => sendQueue.write(chunk),
+		rpcCompletionTracker,
+	).catch((error) => {
+		if (!child.killed) child.kill();
+		throw error;
+	});
+	const childToClient = pipeNodeJsonlReadableToIrohSend(child.stdout, sendQueue, (line) => {
+		rpcCompletionTracker.markChildOutputLine(line);
+	});
+	const childError = new Promise((_, rejectChildError) => {
+		child.once("error", (error) => {
+			rejectChildError(new Error(`RPC child error (${childCommand}): ${error.message}`));
+		});
+	});
+	const clientToChildFailure = clientToChild.then(() => new Promise(() => {}));
+
+	await Promise.race([childToClient, childError, clientToChildFailure, rpcCompletionTracker.completion]);
+	return child;
 }
 
-async function authorizeClient({ hello, options, remoteId, state }) {
-	return await withStateFileLock(options.statePath, async () => {
-		syncState(state, await readState(options.statePath));
-		upsertWorkspace(state, options.workspace, options.allowTools);
+async function runIntegratedVoltConnection(stream, handshake, authorization, options) {
+	let runtime;
+	try {
+		runtime = await createIrohRemoteAgentRuntime({
+			agentDir: options.agentDir,
+			allowTools: authorization.allowTools,
+			cwd: authorization.workspace.path,
+			profile: options.profile,
+			projectTrusted: options.projectTrusted,
+		});
+	} catch (error) {
+		await sendHandshakeError(stream, error instanceof Error ? error.message : String(error));
+		return;
+	}
 
-		const now = Date.now();
-		const workspace = options.workspace;
-		const existingClient = findClient(state, remoteId);
-		const matchingPairingSecret =
-			options.pairingSecret !== undefined && hello.secret === options.pairingSecret
-				? options.pairingSecret
-				: undefined;
-		const hasPairingSecret = matchingPairingSecret !== undefined;
-		const pairingSecretHash =
-			matchingPairingSecret !== undefined ? hashPairingSecret(matchingPairingSecret) : undefined;
-		const pairingSecretExpired =
-			hasPairingSecret && options.pairingExpiresAt !== undefined && now > options.pairingExpiresAt;
-		if (!existingClient && pairingSecretExpired) {
-			options.pairingSecret = undefined;
-			options.pairingExpiresAt = undefined;
-			return { error: "pairing ticket has expired" };
-		}
-
-		const requestedWorkspace = typeof hello.workspace === "string" ? hello.workspace : undefined;
-		if (requestedWorkspace !== workspace.name) {
-			return { error: `workspace not allowed: ${requestedWorkspace ?? "<missing>"}` };
-		}
-
-		if (!existingClient && pairingSecretHash && state.consumedPairingSecretHashes.includes(pairingSecretHash)) {
-			return { error: "pairing ticket has already been used" };
-		}
-
-		if (!existingClient && !hasPairingSecret) {
-			return { error: "client is not paired" };
-		}
-
-		const currentAllowTools = options.allowTools;
-		if (!existingClient) {
-			if (!pairingSecretHash) {
-				return { error: "client is not paired" };
-			}
-			const client = {
-				nodeId: remoteId,
-				label: hello.clientLabel || remoteId.slice(0, 12),
-				allowedWorkspaces: [workspace.name],
-				allowedTools: currentAllowTools,
-				pairedAt: now,
-				lastSeenAt: now,
-			};
-			state.consumedPairingSecretHashes.push(pairingSecretHash);
-			state.clients.push(client);
-			await writeState(options.statePath, state);
-			options.pairingSecret = undefined;
-			options.pairingExpiresAt = undefined;
-			console.error(`paired client: ${client.label} (${remoteId})`);
-			return { client, workspace, allowTools: currentAllowTools };
-		}
-
-		if (!getClientWorkspace(existingClient, workspace.name)) {
-			return { error: `client is not allowed to use workspace: ${workspace.name}` };
-		}
-		existingClient.lastSeenAt = now;
-		existingClient.allowedTools = currentAllowTools;
-		if (hello.clientLabel) existingClient.label = hello.clientLabel;
-		await writeState(options.statePath, state);
-		return {
-			client: existingClient,
-			workspace,
-			allowTools: currentAllowTools,
-		};
+	await writeIrohRemoteHandshakeResponse(stream.send, handshake.response);
+	await runIrohRemoteRpcMode(runtime, {
+		stream,
+		initialInput: handshake.initialInput,
 	});
 }
 
-async function handleConnection(incoming, options, state) {
+async function handleConnection(incoming, options) {
 	const accepting = await incoming.accept();
 	const connection = await accepting.connect();
 	const remoteId = connection.remoteId().toString();
@@ -854,83 +690,32 @@ async function handleConnection(incoming, options, state) {
 
 	let child;
 	try {
-		const stream = await withTimeout(connection.acceptBi(), HANDSHAKE_TIMEOUT_MS, "handshake timed out");
-		let handshake;
-		try {
-			handshake = await withTimeout(
-				readLineFromIroh(stream.recv, Buffer.alloc(0), { maxLineBytes: HANDSHAKE_MAX_LINE_BYTES }),
-				HANDSHAKE_TIMEOUT_MS,
-				"handshake timed out",
-			);
-		} catch (error) {
-			await sendHandshakeError(stream, error instanceof Error ? error.message : String(error));
-			return;
-		}
-		if (handshake.line === undefined) {
-			await sendHandshakeError(stream, "missing handshake");
-			return;
-		}
-
-		let hello;
-		try {
-			hello = parseHandshakeHello(handshake.line);
-		} catch (error) {
-			await sendHandshakeError(stream, error instanceof Error ? error.message : String(error));
-			return;
-		}
-
-		const authorization = await authorizeClient({ hello, options, remoteId, state });
-		if (authorization.error) {
-			await sendHandshakeError(stream, authorization.error);
-			return;
-		}
-
-		const spawnedChild = spawnRpcChild(options, authorization.workspace, authorization.allowTools);
-		child = spawnedChild.child;
-		const childCommand = formatCommand(spawnedChild.command, spawnedChild.args);
-		attachChildLogging(child);
-		try {
-			await waitForChildSpawn(child, childCommand, authorization.workspace);
-		} catch (error) {
-			await sendHandshakeError(stream, error instanceof Error ? error.message : String(error));
-			return;
-		}
-
-		await stream.send.writeAll(
-			toBytes(
-				serializeJsonLine({
-					type: "volt_iroh_handshake",
-					success: true,
-					workspace: authorization.workspace.name,
-					clientNodeId: remoteId,
-					child: options.useVolt ? "volt" : "fake-rpc",
-				}),
-			),
+		const stream = await withTimeout(
+			connection.acceptBi(),
+			DEFAULT_IROH_REMOTE_HANDSHAKE_TIMEOUT_MS,
+			"handshake timed out",
 		);
+		const handshake = await options.hostEngine.readHandshake(stream, remoteId, {
+			child: options.integratedVolt || options.useVolt ? "volt" : "fake-rpc",
+			maxLineBytes: DEFAULT_IROH_REMOTE_HANDSHAKE_MAX_LINE_BYTES,
+			timeoutMs: DEFAULT_IROH_REMOTE_HANDSHAKE_TIMEOUT_MS,
+			writeSuccessResponse: false,
+		});
+		if (!handshake.ok) {
+			await stream.send.finish?.();
+			await Promise.resolve(stream.recv.stop?.(0n)).catch(() => {});
+			return;
+		}
 
-		const sendQueue = createIrohSendQueue(stream.send);
-		const rpcCompletionTracker = createRemoteRpcCompletionTracker(sendQueue);
-		const clientToChild = pipeFilteredIrohRpcToNodeWritable(
-			stream.recv,
-			child.stdin,
-			handshake.rest,
-			(chunk) => sendQueue.write(chunk),
-			rpcCompletionTracker,
-		).catch((error) => {
-			if (!child.killed) child.kill();
-			throw error;
-		});
-		const childToClient = pipeNodeJsonlReadableToIrohSend(child.stdout, sendQueue, (line) => {
-			rpcCompletionTracker.markChildOutputLine(line);
-		});
-		const childError = new Promise((_, rejectChildError) => {
-			child.once("error", (error) => {
-				rejectChildError(new Error(`RPC child error (${childCommand}): ${error.message}`));
-			});
-		});
-		const clientToChildFailure = clientToChild.then(() => new Promise(() => {}));
+		if (handshake.authorization.paired) {
+			console.error(`paired client: ${handshake.authorization.client.label} (${remoteId})`);
+		}
 
-		await Promise.race([childToClient, childError, clientToChildFailure, rpcCompletionTracker.completion]);
+		if (options.integratedVolt) {
+			await runIntegratedVoltConnection(stream, handshake, handshake.authorization, options);
+			return;
+		}
+		child = await runSpawnedRpcConnection(stream, handshake, handshake.authorization, options);
 	} finally {
 		if (child && child.exitCode === null && !child.killed) child.kill();
 		connection.close(0n, Array.from(Buffer.from("done", "utf8")));
@@ -941,7 +726,7 @@ async function handleConnection(incoming, options, state) {
 
 function createTicketPayload(endpoint, options, includePairingSecret) {
 	return {
-		alpn: ALPN_TEXT,
+		alpn: IROH_REMOTE_ALPN,
 		expiresAt: includePairingSecret ? options.ticketExpiresAt : undefined,
 		irohTicket: EndpointTicket.fromAddr(endpoint.addr()).toString(),
 		nodeId: endpoint.id().toString(),
@@ -953,9 +738,10 @@ function createTicketPayload(endpoint, options, includePairingSecret) {
 
 async function serve(flags) {
 	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
-	const state = await withStateFileLock(statePath, () => readState(statePath));
-	const allowTools = getFlag(flags, "allow-tools", DEFAULT_ALLOW_TOOLS);
-	const workspace = selectWorkspace(state, getFlag(flags, "workspace"), allowTools);
+	const stateManager = new IrohRemoteHostStateManager({ statePath });
+	const state = await stateManager.load();
+	const allowTools = getFlag(flags, "allow-tools", DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+	const workspace = selectIrohRemoteWorkspace(state, getFlag(flags, "workspace"), allowTools, process.cwd());
 
 	const relayMode = getFlag(flags, "relay", "disabled");
 	if (relayMode !== "disabled" && relayMode !== "default") {
@@ -964,12 +750,15 @@ async function serve(flags) {
 
 	const pairingEnabled = !hasFlag(flags, "no-pairing");
 	const sourceVolt = getFlag(flags, "source-volt");
-	const ticketExpiresAt = pairingEnabled ? Date.now() + PAIRING_TICKET_TTL_MS : undefined;
+	const ticketExpiresAt = pairingEnabled ? Date.now() + DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS : undefined;
 	const options = {
+		agentDir: getFlag(flags, "agent-dir"),
 		allowTools,
+		hostEngine: undefined,
+		integratedVolt: hasFlag(flags, "integrated-volt"),
+		profile: getFlag(flags, "profile"),
 		relayMode,
-		pairingSecret: pairingEnabled ? randomBytes(24).toString("base64url") : undefined,
-		pairingExpiresAt: pairingEnabled ? ticketExpiresAt : undefined,
+		projectTrusted: hasFlag(flags, "approve"),
 		ticketExpiresAt,
 		once: hasFlag(flags, "once"),
 		sourceVolt: sourceVolt ? resolve(sourceVolt) : undefined,
@@ -979,20 +768,32 @@ async function serve(flags) {
 		workspace,
 	};
 	await preflightRpcChild(options, workspace);
-	await withStateFileLock(statePath, async () => {
-		syncState(state, await readState(statePath));
-		Object.assign(workspace, upsertWorkspace(state, workspace, allowTools));
-		await writeState(statePath, state);
-	});
+	Object.assign(workspace, await stateManager.upsertWorkspace(workspace, allowTools));
 
 	const endpoint = await bindEndpoint(relayMode, state, statePath);
-	const ticket = encodeTicketPayload(createTicketPayload(endpoint, options, pairingEnabled));
+	const hostEngine = new IrohRemoteHostEngine({
+		allowTools,
+		stateManager,
+		workspace,
+	});
+	options.hostEngine = hostEngine;
+	const endpointTicket = EndpointTicket.fromAddr(endpoint.addr()).toString();
+	const ticket = pairingEnabled
+		? (
+				await hostEngine.pair({
+					expiresAt: ticketExpiresAt,
+					irohTicket: endpointTicket,
+					nodeId: endpoint.id().toString(),
+					relayMode,
+				})
+			).ticket
+		: encodeIrohRemoteTicketPayload(createTicketPayload(endpoint, options, false));
 
 	console.error(`host id: ${endpoint.id().toString()}`);
 	console.error(`state: ${statePath}`);
 	console.error(`workspace: ${workspace.name} -> ${workspace.path}`);
 	console.error(
-		`child: ${options.sourceVolt ? `${process.execPath} ${options.resolvedSourceVoltRunner} --mode rpc` : options.useVolt ? `${options.resolvedVoltBin ?? getPlatformVoltBin(options.voltBin)} --mode rpc` : "fake-rpc"}`,
+		`child: ${options.integratedVolt ? "in-process volt remote host" : options.sourceVolt ? `${process.execPath} ${options.resolvedSourceVoltRunner} --mode rpc` : options.useVolt ? `${options.resolvedVoltBin ?? getPlatformVoltBin(options.voltBin)} --mode rpc` : "fake-rpc"}`,
 	);
 	console.error(`pairing: ${pairingEnabled ? "enabled" : "disabled"}`);
 	console.error(pairingEnabled ? "pairing ticket:" : "paired-client ticket:");
@@ -1001,7 +802,7 @@ async function serve(flags) {
 	while (true) {
 		const incoming = await endpoint.acceptNext();
 		if (!incoming) break;
-		await handleConnection(incoming, options, state).catch((error) => {
+		await handleConnection(incoming, options).catch((error) => {
 			if (!isExpectedDoneClose(error)) {
 				console.error(error instanceof Error ? error.stack : String(error));
 			}
@@ -1014,24 +815,16 @@ async function serve(flags) {
 
 async function listClients(flags) {
 	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
-	const state = await withStateFileLock(statePath, () => readState(statePath));
-	console.log(JSON.stringify(state.clients, null, 2));
+	const stateManager = new IrohRemoteHostStateManager({ statePath });
+	console.log(JSON.stringify(await stateManager.listClients(), null, 2));
 }
 
 async function revokeClient(flags, nodeId) {
 	if (!nodeId) throw new Error("Missing node id to revoke");
 	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
-	const revoked = await withStateFileLock(statePath, async () => {
-		const state = await readState(statePath);
-		const before = state.clients.length;
-		state.clients = state.clients.filter((client) => client.nodeId !== nodeId);
-		if (state.clients.length === before) {
-			return false;
-		}
-		await writeState(statePath, state);
-		return true;
-	});
-	if (!revoked) {
+	const stateManager = new IrohRemoteHostStateManager({ statePath });
+	const result = await stateManager.revokeClient(nodeId);
+	if (!result.revoked) {
 		console.error(`No client found for ${nodeId}`);
 		return;
 	}

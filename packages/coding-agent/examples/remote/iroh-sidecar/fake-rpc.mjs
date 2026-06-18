@@ -1,7 +1,26 @@
-import { attachNodeJsonlReader, serializeJsonLine } from "./common.mjs";
+function attachJsonlReader(readable, onLine) {
+	let buffer = "";
+	readable.setEncoding("utf8");
+	readable.on("data", (chunk) => {
+		buffer += chunk;
+		while (true) {
+			const newlineIndex = buffer.indexOf("\n");
+			if (newlineIndex === -1) break;
+			let line = buffer.slice(0, newlineIndex);
+			buffer = buffer.slice(newlineIndex + 1);
+			if (line.endsWith("\r")) line = line.slice(0, -1);
+			onLine(line);
+		}
+	});
+	readable.on("end", () => {
+		if (buffer.length === 0) return;
+		const line = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
+		onLine(line);
+	});
+}
 
 function write(value) {
-	process.stdout.write(serializeJsonLine(value));
+	process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
 function usage() {
@@ -119,6 +138,6 @@ async function handleLine(line) {
 	});
 }
 
-attachNodeJsonlReader(process.stdin, (line) => {
+attachJsonlReader(process.stdin, (line) => {
 	void handleLine(line);
 });

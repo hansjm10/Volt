@@ -5,6 +5,9 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { spawn } from "node:child_process";
+import { access } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/volt-ai";
 import chalk from "chalk";
@@ -15,7 +18,7 @@ import { listModels } from "./cli/list-models.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
 import { selectSession } from "./cli/session-picker.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
-import { ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, VERSION } from "./config.ts";
+import { ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, isBunBinary, VERSION } from "./config.ts";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
 import {
 	type AgentSessionRuntimeDiagnostic,
@@ -71,6 +74,103 @@ async function readPipedStdin(): Promise<string | undefined> {
 		});
 		process.stdin.resume();
 	});
+}
+
+function printRemoteCommandHelp(): void {
+	console.error(`Usage:
+  volt remote host [options]
+
+Options are forwarded to the temporary Iroh sidecar host. Common options:
+  --workspace <name=path>       Workspace exposed to the client
+  --relay <disabled|default>    Iroh relay preset
+  --state <path>                Host state path
+  --allow-tools <list>          Remote tool allowlist
+  --profile <name>              Volt settings profile
+  --agent-dir <path>            Volt agent config directory
+  --approve                     Trust project-local Volt settings/resources
+  --no-pairing                  Reject unpaired clients
+  --once                        Exit after first client disconnects
+`);
+}
+
+async function pathExists(path: string): Promise<boolean> {
+	try {
+		await access(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function handleRemoteCommand(args: string[], options: { profile?: string } = {}): Promise<boolean> {
+	if (args[0] !== "remote") {
+		return false;
+	}
+
+	const command = args[1];
+	if (command === undefined || command === "--help" || command === "-h") {
+		printRemoteCommandHelp();
+		return true;
+	}
+	if (command !== "host") {
+		console.error(chalk.red(`Error: Unknown remote command: ${command}`));
+		printRemoteCommandHelp();
+		process.exitCode = 1;
+		return true;
+	}
+	const hostArgs = args.slice(2);
+	if (hostArgs.includes("--help") || hostArgs.includes("-h")) {
+		printRemoteCommandHelp();
+		return true;
+	}
+	if (isBunBinary) {
+		console.error(chalk.red("Error: volt remote host is not available from the Bun binary release yet."));
+		console.error("Use a Node.js npm install or a source checkout for the temporary Iroh sidecar adapter.");
+		process.exitCode = 1;
+		return true;
+	}
+
+	const packageDir = getPackageDir();
+	const hostScript = join(packageDir, "examples", "remote", "iroh-sidecar", "host.mjs");
+	const sourceModesIndex = join(packageDir, "src", "modes", "index.ts");
+	const irohPackageJson = join(dirname(hostScript), "node_modules", "@number0", "iroh", "package.json");
+	try {
+		await access(hostScript);
+		await access(irohPackageJson);
+	} catch {
+		console.error(chalk.red("Error: Iroh sidecar dependencies are not installed."));
+		console.error("Install the temporary native adapter dependencies:");
+		console.error(`  npm --prefix ${dirname(hostScript)} install --ignore-scripts`);
+		process.exitCode = 1;
+		return true;
+	}
+
+	const nodeArgs = (await pathExists(sourceModesIndex)) ? ["--conditions", "volt-source"] : [];
+	const profileArgs = options.profile ? ["--profile", options.profile] : [];
+	await new Promise<void>((resolve) => {
+		const child = spawn(
+			process.execPath,
+			[...nodeArgs, hostScript, "--integrated-volt", ...hostArgs, ...profileArgs],
+			{
+				cwd: process.cwd(),
+				stdio: "inherit",
+			},
+		);
+		child.once("error", (error) => {
+			console.error(chalk.red(error instanceof Error ? error.message : String(error)));
+			process.exitCode = 1;
+			resolve();
+		});
+		child.once("exit", (code, signal) => {
+			if (signal) {
+				process.kill(process.pid, signal);
+				return;
+			}
+			process.exitCode = code ?? 0;
+			resolve();
+		});
+	});
+	return true;
 }
 
 function collectSettingsDiagnostics(
@@ -502,8 +602,15 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	const commandRuntimeOptions = {
 		extensionFactories: options?.extensionFactories,
-		profile: commandProfileArgs.profile,
+		profile:
+			commandProfileArgs.profile !== undefined
+				? commandProfileArgs.profile.trim() || undefined
+				: process.env.VOLT_PROFILE?.trim() || undefined,
 	};
+
+	if (await handleRemoteCommand(commandProfileArgs.args, { profile: commandRuntimeOptions.profile })) {
+		return;
+	}
 
 	const cwd = process.cwd();
 	const agentDir = getAgentDir();

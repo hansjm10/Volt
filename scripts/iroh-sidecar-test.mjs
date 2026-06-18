@@ -13,6 +13,7 @@ import {
 	readJsonlFromIroh,
 	readLineFromIroh,
 	serializeJsonLine,
+	TICKET_PREFIX,
 	toBytes,
 } from "../packages/coding-agent/examples/remote/iroh-sidecar/common.mjs";
 
@@ -20,6 +21,7 @@ const requireModule = createRequire(import.meta.url);
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
+const sourceCliScript = join(repoRoot, "scripts", "run-coding-agent-source.mjs");
 const sidecarDir = join(repoRoot, "packages", "coding-agent", "examples", "remote", "iroh-sidecar");
 const hostScript = join(sidecarDir, "host.mjs");
 const clientScript = join(sidecarDir, "client.mjs");
@@ -27,6 +29,7 @@ const irohModule = join(sidecarDir, "node_modules", "@number0", "iroh", "index.j
 const irohPackageJson = join(sidecarDir, "node_modules", "@number0", "iroh", "package.json");
 const PROCESS_TIMEOUT_MS = 15_000;
 const TICKET_TIMEOUT_MS = 10_000;
+const SOURCE_IMPORT_CONDITION_ARGS = ["--conditions", "volt-source"];
 
 let Endpoint;
 let EndpointTicket;
@@ -76,8 +79,17 @@ function formatExit(code, signal) {
 }
 
 function spawnScript(script, args) {
-	const child = spawn(process.execPath, [script, ...args], {
+	const child = spawn(process.execPath, [...SOURCE_IMPORT_CONDITION_ARGS, script, ...args], {
 		cwd: repoRoot,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	return { child, output: collectProcess(child) };
+}
+
+function spawnSourceCli(args, env = {}) {
+	const child = spawn(process.execPath, [sourceCliScript, ...args], {
+		cwd: repoRoot,
+		env: { ...process.env, ...env },
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	return { child, output: collectProcess(child) };
@@ -143,6 +155,10 @@ async function stopProcess(child) {
 
 function startHost(args) {
 	return spawnScript(hostScript, args);
+}
+
+function startSourceCliRemoteHost(args, env = {}) {
+	return spawnSourceCli(["remote", "host", ...args], env);
 }
 
 async function runHostCommand(args) {
@@ -389,6 +405,45 @@ setInterval(() => {}, 1000);
 	return { logPath, sourceDir };
 }
 
+async function createIntegratedVoltAgentDir(stateDir) {
+	const agentDir = join(stateDir, "agent");
+	await mkdir(agentDir, { recursive: true });
+	await writeFile(
+		join(agentDir, "models.json"),
+		`${JSON.stringify(
+			{
+				providers: {
+					"iroh-integrated-test": {
+						api: "openai-completions",
+						apiKey: "test-key",
+						baseUrl: "http://127.0.0.1:9/v1",
+						models: [
+							{
+								id: "fake-integrated",
+								name: "Fake Integrated Volt",
+							},
+						],
+					},
+				},
+			},
+			null,
+			2,
+		)}\n`,
+	);
+	await writeFile(
+		join(agentDir, "settings.json"),
+		`${JSON.stringify(
+			{
+				defaultProvider: "iroh-integrated-test",
+				defaultModel: "fake-integrated",
+			},
+			null,
+			2,
+		)}\n`,
+	);
+	return agentDir;
+}
+
 async function runHostClientOnce({ clientArgs, clientStatePath, hostArgs, hostStatePath, label }) {
 	const host = startHost(["--state", hostStatePath, "--once", ...hostArgs]);
 	try {
@@ -507,12 +562,167 @@ async function rawCommandFilterScenario() {
 	});
 }
 
+async function integratedVoltGetStateScenario() {
+	await withStateDir("integrated-volt", async ({ hostStatePath, stateDir }) => {
+		const agentDir = await createIntegratedVoltAgentDir(stateDir);
+		const workspacePath = join(stateDir, "workspace");
+		await mkdir(workspacePath, { recursive: true });
+		const host = startHost([
+			"--state",
+			hostStatePath,
+			"--agent-dir",
+			agentDir,
+			"--workspace",
+			`integrated=${workspacePath}`,
+			"--integrated-volt",
+			"--once",
+		]);
+		try {
+			const ticket = await waitForFirstStdoutLine(host.child, host.output, "integrated Volt host");
+			const lines = await runRawRpcClient(
+				ticket,
+				{ id: "state-integrated", type: "get_state" },
+				{ finishSend: true },
+			);
+			await waitForExit(host.child, "integrated Volt host", host.output);
+			const responses = lines.map((line) => JSON.parse(line));
+			const response = responses.find((event) => event.id === "state-integrated");
+			assert(response, `Expected integrated get_state response, got:\n${lines.join("\n")}`);
+			assert(response.success === true, `Expected integrated get_state success, got:\n${JSON.stringify(response)}`);
+			assert(
+				response.data?.model?.provider === "iroh-integrated-test" &&
+					response.data?.model?.id === "fake-integrated",
+				`Expected integrated fake model state, got:\n${JSON.stringify(response)}`,
+			);
+		} finally {
+			await stopProcess(host.child);
+		}
+	});
+}
+
+async function integratedVoltProfileScenario() {
+	await withStateDir("integrated-profile", async ({ hostStatePath, stateDir }) => {
+		const agentDir = await createIntegratedVoltAgentDir(stateDir);
+		const workspacePath = join(stateDir, "workspace");
+		await mkdir(workspacePath, { recursive: true });
+		await writeFile(
+			join(agentDir, "settings.json"),
+			`${JSON.stringify(
+				{
+					defaultProvider: "missing-provider",
+					defaultModel: "missing-model",
+					profiles: {
+						remote: {
+							defaultProvider: "iroh-integrated-test",
+							defaultModel: "fake-integrated",
+						},
+					},
+				},
+				null,
+				2,
+			)}\n`,
+		);
+		const host = startHost([
+			"--state",
+			hostStatePath,
+			"--agent-dir",
+			agentDir,
+			"--profile",
+			"remote",
+			"--workspace",
+			`profile=${workspacePath}`,
+			"--integrated-volt",
+			"--once",
+		]);
+		try {
+			const ticket = await waitForFirstStdoutLine(host.child, host.output, "integrated profile host");
+			const lines = await runRawRpcClient(
+				ticket,
+				{ id: "state-profile", type: "get_state" },
+				{ finishSend: true },
+			);
+			await waitForExit(host.child, "integrated profile host", host.output);
+			const responses = lines.map((line) => JSON.parse(line));
+			const response = responses.find((event) => event.id === "state-profile");
+			assert(response, `Expected integrated profile get_state response, got:\n${lines.join("\n")}`);
+			assert(response.success === true, `Expected integrated profile success, got:\n${JSON.stringify(response)}`);
+			assert(
+				response.data?.model?.provider === "iroh-integrated-test" &&
+					response.data?.model?.id === "fake-integrated",
+				`Expected profile-selected fake model state, got:\n${JSON.stringify(response)}`,
+			);
+		} finally {
+			await stopProcess(host.child);
+		}
+	});
+}
+
+async function integratedVoltEnvProfileScenario() {
+	await withStateDir("integrated-env-profile", async ({ hostStatePath, stateDir }) => {
+		const agentDir = await createIntegratedVoltAgentDir(stateDir);
+		const workspacePath = join(stateDir, "workspace");
+		await mkdir(workspacePath, { recursive: true });
+		await mkdir(join(agentDir, "commands"), { recursive: true });
+		await writeFile(join(agentDir, "commands", "agent.md"), "agent prompt\n");
+		await mkdir(join(workspacePath, ".volt", "commands"), { recursive: true });
+		await writeFile(join(workspacePath, ".volt", "commands", "project.md"), "project prompt\n");
+		await writeFile(
+			join(agentDir, "settings.json"),
+			`${JSON.stringify(
+				{
+					defaultProvider: "missing-provider",
+					defaultModel: "missing-model",
+					profiles: {
+						remote: {
+							defaultProvider: "iroh-integrated-test",
+							defaultModel: "fake-integrated",
+						},
+					},
+				},
+				null,
+				2,
+			)}\n`,
+		);
+		const host = startSourceCliRemoteHost(
+			[
+				"--state",
+				hostStatePath,
+				"--agent-dir",
+				agentDir,
+				"--workspace",
+				`env-profile=${workspacePath}`,
+				"--once",
+			],
+			{ VOLT_PROFILE: "remote" },
+		);
+		try {
+			const ticket = await waitForFirstStdoutLine(host.child, host.output, "integrated env profile host");
+			assert(ticket.startsWith(TICKET_PREFIX), `Expected first stdout line to be a ticket, got:\n${host.output.stdout}`);
+			const lines = await runRawRpcClient(ticket, { id: "state-env-profile", type: "get_state" }, { finishSend: true });
+			await waitForExit(host.child, "integrated env profile host", host.output);
+			await access(join(agentDir, "prompts", "agent.md"));
+			await access(join(workspacePath, ".volt", "prompts", "project.md"));
+			const responses = lines.map((line) => JSON.parse(line));
+			const response = responses.find((event) => event.id === "state-env-profile");
+			assert(response, `Expected integrated env profile get_state response, got:\n${lines.join("\n")}`);
+			assert(response.success === true, `Expected integrated env profile success, got:\n${JSON.stringify(response)}`);
+			assert(
+				response.data?.model?.provider === "iroh-integrated-test" &&
+					response.data?.model?.id === "fake-integrated",
+				`Expected env profile-selected fake model state, got:\n${JSON.stringify(response)}`,
+			);
+		} finally {
+			await stopProcess(host.child);
+		}
+	});
+}
+
 async function malformedHandshakeScenario() {
 	await withStateDir("malformed-handshake", async ({ hostStatePath }) => {
 		const cases = [
 			{ line: "{", error: "Failed to parse Iroh remote handshake" },
 			{ line: "null", error: "Iroh remote handshake must be an object" },
-			{ line: "x".repeat(16 * 1024 + 1), error: "Line exceeds maximum size of 16384 bytes" },
+			{ line: "x".repeat(16 * 1024 + 1), error: "Iroh remote handshake line exceeds maximum size of 16384 bytes" },
 			{
 				line: JSON.stringify({
 					type: "volt_iroh_hello",
@@ -785,6 +995,9 @@ const scenarios = [
 	["raw half-close prompt", rawHalfClosePromptScenario],
 	["source Volt half-close prompt", halfClosedSourceVoltPromptScenario],
 	["raw command filter", rawCommandFilterScenario],
+	["integrated Volt get_state", integratedVoltGetStateScenario],
+	["integrated Volt profile", integratedVoltProfileScenario],
+	["integrated Volt env profile", integratedVoltEnvProfileScenario],
 	["malformed handshake", malformedHandshakeScenario],
 	["get_state", getStateScenario],
 	["pairing and revocation", pairingAndRevocationScenario],

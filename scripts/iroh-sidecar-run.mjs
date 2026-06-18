@@ -8,6 +8,7 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
 const sidecarDir = join(repoRoot, "packages", "coding-agent", "examples", "remote", "iroh-sidecar");
 const irohPackageJson = join(sidecarDir, "node_modules", "@number0", "iroh", "package.json");
+const SOURCE_IMPORT_CONDITION_ARGS = ["--conditions", "volt-source"];
 
 async function assertInstalled() {
 	try {
@@ -35,7 +36,7 @@ async function main() {
 
 	await assertInstalled();
 	const entrypoint = resolveEntrypoint(command);
-	const child = spawn(process.execPath, [entrypoint, ...args], {
+	const child = spawn(process.execPath, [...SOURCE_IMPORT_CONDITION_ARGS, entrypoint, ...args], {
 		cwd: repoRoot,
 		stdio: "inherit",
 	});

@@ -10,6 +10,10 @@ export {
 	type InProcessRpcClientEventListener,
 	type InProcessRpcClientOptions,
 } from "./rpc/in-process-rpc-client.ts";
+export {
+	createIrohRemoteAgentRuntime,
+	type IrohRemoteAgentRuntimeOptions,
+} from "./rpc/iroh-remote-agent-runtime.ts";
 export { type IrohRemoteRpcModeOptions, runIrohRemoteRpcMode } from "./rpc/iroh-remote-rpc-mode.ts";
 export {
 	type ModelInfo,

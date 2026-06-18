@@ -1,10 +1,16 @@
 import { Buffer } from "node:buffer";
 import { StringDecoder } from "node:string_decoder";
 import { once } from "node:events";
+import {
+	decodeIrohRemoteTicketPayload,
+	encodeIrohRemoteTicketPayload,
+	IROH_REMOTE_ALPN,
+	IROH_REMOTE_TICKET_PREFIX,
+} from "@earendil-works/volt-coding-agent";
 
-export const ALPN_TEXT = "volt-rpc/0";
+export const ALPN_TEXT = IROH_REMOTE_ALPN;
 export const ALPN = Array.from(Buffer.from(ALPN_TEXT, "utf8"));
-export const TICKET_PREFIX = "volt+iroh://v1/";
+export const TICKET_PREFIX = IROH_REMOTE_TICKET_PREFIX;
 export const DEFAULT_READ_LIMIT = 64 * 1024;
 
 export function toBytes(text) {
@@ -20,15 +26,11 @@ export function serializeJsonLine(value) {
 }
 
 export function encodeTicketPayload(payload) {
-	return `${TICKET_PREFIX}${Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")}`;
+	return encodeIrohRemoteTicketPayload(payload);
 }
 
 export function decodeTicketPayload(ticket) {
-	if (!ticket.startsWith(TICKET_PREFIX)) {
-		throw new Error(`Expected ticket prefix ${TICKET_PREFIX}`);
-	}
-	const encoded = ticket.slice(TICKET_PREFIX.length);
-	return JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+	return decodeIrohRemoteTicketPayload(ticket);
 }
 
 export function parseFlags(argv) {

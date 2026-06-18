@@ -429,11 +429,13 @@ export { type MainOptions, main } from "./main.ts";
 // Run modes for programmatic SDK usage
 export {
 	createInProcessRpcClient,
+	createIrohRemoteAgentRuntime,
 	InProcessRpcClient,
 	type InProcessRpcClientEventListener,
 	type InProcessRpcClientOptions,
 	InteractiveMode,
 	type InteractiveModeOptions,
+	type IrohRemoteAgentRuntimeOptions,
 	type IrohRemoteRpcModeOptions,
 	type ModelInfo,
 	type PrintModeOptions,
