@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "../src/core/remote/iroh/index.ts";
 import { createIrohRemoteAgentRuntime } from "../src/modes/rpc/iroh-remote-agent-runtime.ts";
 
 const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY"] as const;
@@ -88,6 +89,7 @@ describe("createIrohRemoteAgentRuntime", () => {
 			expect(existsSync(join(agentDir, "prompts", "remote.md"))).toBe(true);
 			expect(existsSync(join(agentDir, "commands"))).toBe(false);
 			expect(readdirSync(join(agentDir, "sessions"))).toHaveLength(1);
+			expect(runtime.session.getActiveToolNames()).toEqual(DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(","));
 		} finally {
 			errorSpy.mockRestore();
 			await runtime?.dispose();

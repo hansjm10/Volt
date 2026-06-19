@@ -274,6 +274,21 @@ async function withStateDir(name, callback) {
 	}
 }
 
+function getDefaultAuditPath(hostStatePath) {
+	return hostStatePath.endsWith(".json")
+		? `${hostStatePath.slice(0, -".json".length)}.audit.jsonl`
+		: `${hostStatePath}.audit.jsonl`;
+}
+
+async function readAuditEvents(auditPath) {
+	const text = await readFile(auditPath, "utf8");
+	return text
+		.trim()
+		.split("\n")
+		.filter((line) => line.length > 0)
+		.map((line) => JSON.parse(line));
+}
+
 async function createFakeSourceVolt(stateDir) {
 	const sourceDir = join(stateDir, "fake-source-volt");
 	const scriptsDir = join(sourceDir, "scripts");
@@ -829,6 +844,100 @@ async function pairingAndRevocationScenario() {
 	});
 }
 
+async function auditLogScenario() {
+	await withStateDir("audit", async ({ clientStatePath, hostStatePath, stateDir }) => {
+		await runHostClientOnce({
+			clientArgs: ["--message", "audit", "--timeout-ms", "10000"],
+			clientStatePath,
+			hostArgs: [],
+			hostStatePath,
+			label: "audit initial pairing",
+		});
+
+		const pairedOutput = await runHostCommand(["clients", "--state", hostStatePath]);
+		const pairedClients = JSON.parse(pairedOutput.stdout);
+		assert(
+			pairedClients.length === 1,
+			`Expected one paired client before audit revocation, got:\n${pairedOutput.stdout}`,
+		);
+
+		const unpairedClientStatePath = join(stateDir, "unpaired-client.json");
+		await expectHostClientFailure({
+			clientArgs: ["--message", "unpaired audit", "--timeout-ms", "10000"],
+			clientStatePath: unpairedClientStatePath,
+			hostArgs: ["--no-pairing"],
+			hostStatePath,
+			label: "audit unpaired rejection",
+		});
+
+		await runHostCommand(["revoke", pairedClients[0].nodeId, "--state", hostStatePath]);
+
+		const agentDir = join(stateDir, "agent-with-invalid-settings");
+		const workspacePath = join(stateDir, "runtime-workspace");
+		await mkdir(agentDir, { recursive: true });
+		await mkdir(workspacePath, { recursive: true });
+		await writeFile(
+			join(agentDir, "settings.json"),
+			`${JSON.stringify(
+				{
+					httpIdleTimeoutMs: -1,
+				},
+				null,
+				2,
+			)}\n`,
+		);
+		const host = startHost([
+			"--state",
+			hostStatePath,
+			"--agent-dir",
+			agentDir,
+			"--workspace",
+			`runtime=${workspacePath}`,
+			"--integrated-volt",
+			"--once",
+		]);
+		try {
+			const ticket = await waitForFirstStdoutLine(host.child, host.output, "audit runtime failure host");
+			let runtimeError;
+			try {
+				await runRawRpcClient(ticket, { id: "state-runtime-failure", type: "get_state" }, { finishSend: true });
+			} catch (error) {
+				runtimeError = error;
+			}
+			assert(runtimeError, "Expected integrated runtime failure client to fail");
+			await waitForExit(host.child, "audit runtime failure host", host.output);
+		} finally {
+			await stopProcess(host.child);
+		}
+
+		const auditEvents = await readAuditEvents(getDefaultAuditPath(hostStatePath));
+		const eventTypes = auditEvents.map((event) => event.type);
+		for (const eventType of [
+			"pairing_ticket_created",
+			"client_connected",
+			"client_authorized",
+			"client_rejected",
+			"client_revoked",
+			"client_disconnected",
+			"runtime_failure",
+		]) {
+			assert(eventTypes.includes(eventType), `Expected audit event ${eventType}, got:\n${JSON.stringify(auditEvents)}`);
+		}
+		assert(
+			auditEvents.every((event) => typeof event.timestamp === "number"),
+			`Expected every audit event to include a timestamp, got:\n${JSON.stringify(auditEvents)}`,
+		);
+		assert(
+			auditEvents.some((event) => event.type === "runtime_failure" && event.success === false && event.error),
+			`Expected failed runtime audit event with an error, got:\n${JSON.stringify(auditEvents)}`,
+		);
+		assert(
+			auditEvents.some((event) => event.type === "client_rejected" && event.success === false),
+			`Expected rejected client audit event, got:\n${JSON.stringify(auditEvents)}`,
+		);
+	});
+}
+
 async function pairedClientCurrentToolsScenario() {
 	await withStateDir("paired-tools", async ({ clientStatePath, hostStatePath, stateDir }) => {
 		const { logPath, sourceDir } = await createFakeSourceVolt(stateDir);
@@ -1001,6 +1110,7 @@ const scenarios = [
 	["malformed handshake", malformedHandshakeScenario],
 	["get_state", getStateScenario],
 	["pairing and revocation", pairingAndRevocationScenario],
+	["audit log", auditLogScenario],
 	["paired client current tools", pairedClientCurrentToolsScenario],
 	["pairing ticket workspace binding", pairingTicketWorkspaceBindingScenario],
 	["running workspace authorization", runningWorkspaceAuthorizationScenario],

@@ -5,16 +5,17 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import iroh from "@number0/iroh";
 import {
+	assertIrohRemoteTicketNotExpired,
+	decodeIrohRemoteTicketPayload,
+	IrohRemoteClientEngine,
+	serializeJsonLine,
+} from "@earendil-works/volt-coding-agent";
+import {
 	ALPN,
-	ALPN_TEXT,
-	decodeTicketPayload,
 	getFlag,
 	hasFlag,
 	parseFlags,
 	readJsonlFromIroh,
-	readLineFromIroh,
-	serializeJsonLine,
-	toBytes,
 	writeIrohStream,
 } from "./common.mjs";
 
@@ -479,13 +480,8 @@ async function main() {
 		return;
 	}
 
-	const payload = decodeTicketPayload(positionals[0]);
-	if (payload.expiresAt && Date.now() > payload.expiresAt) {
-		throw new Error("Pairing ticket has expired");
-	}
-	if (payload.alpn !== ALPN_TEXT) {
-		throw new Error(`Unsupported ticket ALPN: ${payload.alpn}`);
-	}
+	const payload = decodeIrohRemoteTicketPayload(positionals[0]);
+	assertIrohRemoteTicketNotExpired(payload);
 
 	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
 	const clientState = await readState(statePath);
@@ -493,33 +489,21 @@ async function main() {
 	const endpointTicket = EndpointTicket.fromString(payload.irohTicket);
 	const connection = await endpoint.connect(endpointTicket.endpointAddr(), ALPN);
 	const stream = await connection.openBi();
+	const clientEngine = new IrohRemoteClientEngine({
+		clientLabel: getFlag(flags, "client-label", `node-${process.pid}`),
+		clientNodeId: endpoint.id().toString(),
+	});
 
-	await stream.send.writeAll(
-		toBytes(
-			serializeJsonLine({
-				type: "volt_iroh_hello",
-				protocol: ALPN_TEXT,
-				workspace: payload.workspace,
-				secret: payload.secret,
-				clientLabel: getFlag(flags, "client-label", `node-${process.pid}`),
-				clientNodeId: endpoint.id().toString(),
-			}),
-		),
-	);
-
-	const handshake = await readLineFromIroh(stream.recv);
-	if (handshake.line === undefined) {
-		throw new Error("Host closed before handshake response");
-	}
-	const handshakeResponse = JSON.parse(handshake.line);
-	if (handshakeResponse.type !== "volt_iroh_handshake" || !handshakeResponse.success) {
-		throw new Error(handshakeResponse.error ?? "Handshake rejected");
+	await clientEngine.writeHello(stream, payload);
+	const handshake = await clientEngine.readHandshakeResponse(stream.recv);
+	if (!handshake.response.success) {
+		throw new Error(handshake.response.error);
 	}
 
 	if (hasFlag(flags, "interactive")) {
-		await runInteractive(stream, flags, handshake.rest);
+		await runInteractive(stream, flags, handshake.initialInput);
 	} else {
-		await runOneShot(stream, flags, handshake.rest);
+		await runOneShot(stream, flags, handshake.initialInput);
 	}
 
 	connection.close(0n, Array.from(Buffer.from("done", "utf8")));
