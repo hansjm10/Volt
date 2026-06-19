@@ -7,7 +7,7 @@
 
 import { spawn } from "node:child_process";
 import { access } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/volt-ai";
 import chalk from "chalk";
@@ -83,10 +83,14 @@ function printRemoteCommandHelp(): void {
   volt remote clients [options]
   volt remote revoke <node-id> [options]
 
-Host options are forwarded to the temporary Iroh sidecar host. Common options:
+Host options are forwarded to the integrated Iroh remote host. Common options:
   --workspace <name=path>       Workspace exposed to the client
   --relay <disabled|default>    Iroh relay preset
   --state <path>                Host state path
+  --audit <path>                Host audit JSONL path
+  --use-volt                    Spawn volt --mode rpc instead of the integrated runtime
+  --source-volt <repo-root>     Spawn Volt from a source checkout. Implies --use-volt
+  --volt-bin <path>             Volt executable for --use-volt
   --allow-tools <list>          Remote tool allowlist
   --profile <name>              Volt settings profile
   --agent-dir <path>            Volt agent config directory
@@ -109,7 +113,7 @@ interface RemoteManagementArgs {
 }
 
 function getDefaultIrohRemoteStatePath(): string {
-	return join(getAgentDir(), "remote", "iroh-sidecar-host.json");
+	return join(getAgentDir(), "remote", "iroh-host.json");
 }
 
 function getDefaultIrohRemoteAuditPath(statePath: string): string {
@@ -127,6 +131,17 @@ function addDefaultRemoteHostStateArgs(args: readonly string[]): string[] {
 		return [...args];
 	}
 	return ["--state", getDefaultIrohRemoteStatePath(), ...args];
+}
+
+function addDefaultRemoteHostRuntimeArgs(args: readonly string[]): string[] {
+	if (
+		argsIncludeOption(args, "--integrated-volt") ||
+		argsIncludeOption(args, "--source-volt") ||
+		argsIncludeOption(args, "--use-volt")
+	) {
+		return [...args];
+	}
+	return ["--integrated-volt", ...args];
 }
 
 function parseRemoteManagementArgs(args: readonly string[]): RemoteManagementArgs {
@@ -246,6 +261,20 @@ async function pathExists(path: string): Promise<boolean> {
 	}
 }
 
+async function resolveRemoteHostScript(packageDir: string): Promise<string | undefined> {
+	const sourceHostScript = join(packageDir, "src", "remote", "iroh-host.mjs");
+	if (await pathExists(sourceHostScript)) {
+		return sourceHostScript;
+	}
+
+	const distHostScript = join(packageDir, "dist", "remote", "iroh-host.mjs");
+	if (await pathExists(distHostScript)) {
+		return distHostScript;
+	}
+
+	return undefined;
+}
+
 async function handleRemoteCommand(args: string[], options: { profile?: string } = {}): Promise<boolean> {
 	if (args[0] !== "remote") {
 		return false;
@@ -277,37 +306,31 @@ async function handleRemoteCommand(args: string[], options: { profile?: string }
 	}
 	if (isBunBinary) {
 		console.error(chalk.red("Error: volt remote host is not available from the Bun binary release yet."));
-		console.error("Use a Node.js npm install or a source checkout for the temporary Iroh sidecar adapter.");
+		console.error("Use a Node.js npm install or a source checkout with optional @number0/iroh dependencies.");
 		process.exitCode = 1;
 		return true;
 	}
 
 	const packageDir = getPackageDir();
-	const hostScript = join(packageDir, "examples", "remote", "iroh-sidecar", "host.mjs");
+	const hostScript = await resolveRemoteHostScript(packageDir);
 	const sourceModesIndex = join(packageDir, "src", "modes", "index.ts");
-	const irohPackageJson = join(dirname(hostScript), "node_modules", "@number0", "iroh", "package.json");
-	try {
-		await access(hostScript);
-		await access(irohPackageJson);
-	} catch {
-		console.error(chalk.red("Error: Iroh sidecar dependencies are not installed."));
-		console.error("Install the temporary native adapter dependencies:");
-		console.error(`  npm --prefix ${dirname(hostScript)} install --ignore-scripts`);
+	if (!hostScript) {
+		console.error(chalk.red("Error: Iroh remote host entrypoint is not available in this installation."));
+		console.error(
+			"Reinstall @earendil-works/volt-coding-agent or use a source checkout that includes src/remote/iroh-host.mjs.",
+		);
 		process.exitCode = 1;
 		return true;
 	}
 
 	const nodeArgs = (await pathExists(sourceModesIndex)) ? ["--conditions", "volt-source"] : [];
 	const profileArgs = options.profile ? ["--profile", options.profile] : [];
+	const resolvedHostArgs = addDefaultRemoteHostRuntimeArgs(hostArgs);
 	await new Promise<void>((resolve) => {
-		const child = spawn(
-			process.execPath,
-			[...nodeArgs, hostScript, "--integrated-volt", ...hostArgs, ...profileArgs],
-			{
-				cwd: process.cwd(),
-				stdio: "inherit",
-			},
-		);
+		const child = spawn(process.execPath, [...nodeArgs, hostScript, ...resolvedHostArgs, ...profileArgs], {
+			cwd: process.cwd(),
+			stdio: "inherit",
+		});
 		child.once("error", (error) => {
 			console.error(chalk.red(error instanceof Error ? error.message : String(error)));
 			process.exitCode = 1;

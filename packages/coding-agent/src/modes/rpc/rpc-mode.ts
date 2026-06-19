@@ -187,6 +187,17 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		return { id, type: "response", command, success: false, error: message };
 	};
 
+	const getErrorResponseTarget = (value: unknown): { id: string | undefined; command: string } => {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) {
+			return { id: undefined, command: "unknown" };
+		}
+		const command = value as Record<string, unknown>;
+		return {
+			id: typeof command.id === "string" ? command.id : undefined,
+			command: typeof command.type === "string" ? command.type : "unknown",
+		};
+	};
+
 	// Pending extension UI requests waiting for response
 	const pendingExtensionRequests = new Map<
 		string,
@@ -549,7 +560,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
-		const id = command.id;
+		const id = typeof command.id === "string" ? command.id : undefined;
 
 		switch (command.type) {
 			// =================================================================
@@ -835,8 +846,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			}
 
 			default: {
-				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
+				const target = getErrorResponseTarget(command);
+				return error(target.id, target.command, `Unknown command: ${target.command}`);
 			}
 		}
 	};
@@ -953,6 +964,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			return;
 		}
 
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			const target = getErrorResponseTarget(parsed);
+			output(error(target.id, target.command, `Unknown command: ${target.command}`));
+			await waitForTransportBackpressure();
+			return;
+		}
+
 		if (!startupComplete) {
 			queuedStartupCommandLines.push(line);
 			return;
@@ -963,7 +981,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		try {
 			response = await handleCommand(command);
 		} catch (commandError: unknown) {
-			output(error(command.id, command.type, toError(commandError).message));
+			const target = getErrorResponseTarget(command);
+			output(error(target.id, target.command, toError(commandError).message));
 			await waitForTransportBackpressure();
 			await checkShutdownRequested();
 			return;

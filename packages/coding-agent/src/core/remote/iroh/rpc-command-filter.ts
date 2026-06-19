@@ -51,11 +51,12 @@ export function getIrohRemoteRpcFilterResult(line: string): IrohRemoteRpcFilterR
 		};
 	}
 	const command = parsed as Record<string, unknown>;
+	const responseId = typeof command.id === "string" ? command.id : undefined;
 	if (typeof command.type !== "string") {
 		return {
 			allowed: false,
 			response: createIrohRemoteRpcErrorResponse(
-				undefined,
+				responseId,
 				"unknown",
 				"RPC command must be a JSON object with a string type",
 			),
@@ -69,9 +70,9 @@ export function getIrohRemoteRpcFilterResult(line: string): IrohRemoteRpcFilterR
 	return {
 		allowed: false,
 		response: createIrohRemoteRpcErrorResponse(
-			typeof command.id === "string" ? command.id : undefined,
+			responseId,
 			command.type,
-			`RPC command not allowed over remote sidecar: ${command.type}`,
+			`RPC command not allowed over remote host: ${command.type}`,
 		),
 	};
 }

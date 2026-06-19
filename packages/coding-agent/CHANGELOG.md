@@ -22,13 +22,14 @@
 - Added settings profiles, selectable with `--profile`, `VOLT_PROFILE`, or `defaultProfile`, for workflow-specific settings and resource overlays.
 - Added `/profile` for interactive profile inspection, switching, and creating empty global profiles.
 - Added `terminal.turnDoneAlert` and a `/settings` toggle to ring the terminal bell when Volt finishes a response.
-- Added an automated fake-RPC scenario runner for the Iroh sidecar PoC covering local prompt streaming, state retrieval, pairing, revocation, expired tickets, and workspace preflight failures.
+- Added an automated fake-RPC scenario runner for the Iroh remote host demo covering local prompt streaming, state retrieval, pairing, revocation, expired tickets, and workspace preflight failures.
 - Added a core RPC transport abstraction so RPC mode can run over adapters other than process stdin/stdout.
 - Added an in-process Iroh RPC transport adapter for running Volt RPC directly over Iroh bidirectional streams.
 - Added typed core Iroh remote helpers for tickets, handshakes, host state, client authorization, workspaces, remote RPC command filtering, and an in-process Iroh remote RPC mode wrapper.
 - Added typed Iroh remote host/client engines with bounded handshake reads, host state management, audit logging, and pair/list/revoke operations.
-- Added default JSONL audit logging to the Iroh sidecar host for pairing, authorization, rejection, revocation, connection lifecycle, and integrated runtime startup failures.
+- Added default JSONL audit logging to the Iroh remote host for pairing, authorization, rejection, revocation, connection lifecycle, and integrated runtime startup failures.
 - Added `volt remote clients` and `volt remote revoke <node-id>` for managing paired Iroh remote clients from the main CLI.
+- Added a self-contained `volt remote host` product entrypoint backed by optional `@number0/iroh`, keeping native Iroh loading isolated from the main CLI.
 - Added transport-backed RPC clients, including an in-memory loopback transport and in-process client helper for running Volt RPC without spawning a subprocess.
 
 ### Fixed
@@ -50,8 +51,8 @@
 - Fixed LSP WorkspaceEdit application reversing the order of same-position insert edits.
 - Reworked the startup ASCII wordmark to an outline letterform so it no longer appears split across a horizontal seam on macOS terminals that add inter-line spacing (the previous solid half-block art was bisected by the line gap).
 - Fixed the tree navigator to horizontally pan deep entries so the selected item remains readable ([#5830](https://github.com/earendil-works/pi/issues/5830)).
-- Fixed the Iroh sidecar scenario harness and host preflight to canonicalize workspace paths before comparing or spawning RPC children.
-- Fixed the Iroh sidecar client to use core remote ticket and handshake helpers, and made direct Iroh remote runtime creation default to the read-only tool allowlist.
+- Fixed the Iroh remote host scenario harness and host preflight to canonicalize workspace paths before comparing or spawning RPC children.
+- Fixed the Iroh remote client to use core remote ticket and handshake helpers, and made direct Iroh remote runtime creation default to the read-only tool allowlist.
 - Fixed Iroh remote RPC outbound messages to normalize workspace paths and redact host-only session, export, and bash temp paths before sending data to remote clients.
 
 ### Changed

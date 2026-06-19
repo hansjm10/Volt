@@ -507,6 +507,20 @@ volt config                    # Enable/disable package resources
 | `--mode rpc` | RPC mode for process integration (see [docs/rpc.md](docs/rpc.md)) |
 | `--export <in> [out]` | Export session to HTML |
 
+### Remote Host
+
+```bash
+volt remote host --workspace volt=/path/to/repo
+volt remote clients
+volt remote revoke <node-id>
+```
+
+`volt remote host` exposes Volt RPC over Iroh using the optional `@number0/iroh` native adapter. The default remote tool allowlist is read-only (`read,grep,find,ls`); pass `--allow-tools` to change it.
+
+The remote host requires a Node.js package install or source checkout on a platform supported by `@number0/iroh`. Bun binary builds currently reject this command because the optional native Iroh adapter is not bundled.
+
+### Print Mode Stdin
+
 In print mode, volt also reads piped stdin and merges it into the initial prompt:
 
 ```bash

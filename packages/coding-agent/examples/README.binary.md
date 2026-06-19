@@ -18,8 +18,9 @@ Example extensions demonstrating:
 - External integrations (SSH, file watchers, system theme sync)
 - Custom providers (Anthropic with custom streaming, GitLab Duo)
 
-### [remote/iroh-sidecar/](remote/iroh-sidecar/)
-Demo clients and fake-RPC fixtures for tunneling Volt RPC JSONL over the product `volt remote host` Iroh adapter.
+## Not Included
+
+The Iroh remote demo clients are available in Node.js package installs and source checkouts, but are not included in Bun binary archives because they require the optional native `@number0/iroh` adapter.
 
 ## Documentation
 

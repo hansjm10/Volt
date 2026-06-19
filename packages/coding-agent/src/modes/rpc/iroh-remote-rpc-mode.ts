@@ -1,9 +1,15 @@
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import {
+	createIrohRemoteFilteredRpcTransport,
 	createIrohRemoteOutboundFilteredRpcTransport,
-	createIrohRemoteRpcTransport,
 } from "../../core/remote/iroh/index.ts";
-import type { IrohRpcTransportOptions, RpcCloseHandler, RpcLineHandler, RpcTransport } from "../../core/rpc/index.ts";
+import {
+	createIrohRpcTransport,
+	type IrohRpcTransportOptions,
+	type RpcCloseHandler,
+	type RpcLineHandler,
+	type RpcTransport,
+} from "../../core/rpc/index.ts";
 import { runRpcMode } from "./rpc-mode.ts";
 
 export interface IrohRemoteRpcModeOptions extends IrohRpcTransportOptions {
@@ -15,6 +21,7 @@ interface PendingIrohRemoteCommand {
 	command: string;
 	id: string | undefined;
 	done: Promise<void>;
+	responseMatched: boolean;
 	finish(): void;
 }
 
@@ -33,13 +40,15 @@ export function runIrohRemoteRpcMode(
 	options: IrohRemoteRpcModeOptions,
 ): Promise<void> {
 	return runRpcMode(runtimeHost, {
-		transport: createIrohRemoteCloseDeferringRpcTransport({
-			transport: createIrohRemoteOutboundFilteredRpcTransport({
-				remoteWorkspacePath: options.remoteWorkspacePath,
-				transport: createIrohRemoteRpcTransport(options),
-				workspacePath: options.workspacePath,
+		transport: createIrohRemoteFilteredRpcTransport({
+			transport: createIrohRemoteCloseDeferringRpcTransport({
+				transport: createIrohRemoteOutboundFilteredRpcTransport({
+					remoteWorkspacePath: options.remoteWorkspacePath,
+					transport: createIrohRpcTransport(options),
+					workspacePath: options.workspacePath,
+				}),
+				waitForPromptCompletion: () => runtimeHost.session.waitForIdle(),
 			}),
-			waitForPromptCompletion: () => runtimeHost.session.waitForIdle(),
 		}),
 		exitProcess: false,
 	});
@@ -50,6 +59,9 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 ): RpcTransport {
 	const pendingCommands = new Set<PendingIrohRemoteCommand>();
 	let rpcModeStartupComplete = true;
+	let startupCompletedPendingCommand = false;
+	let startupCleanClosePending = false;
+	const startupCleanCloseHandlers = new Set<() => void>();
 
 	const createPendingCommand = (command: string, id: string | undefined): PendingIrohRemoteCommand => {
 		let finished = false;
@@ -60,12 +72,16 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 			done: new Promise<void>((resolve) => {
 				resolveDone = resolve;
 			}),
+			responseMatched: false,
 			finish() {
 				if (finished) {
 					return;
 				}
 				finished = true;
 				pendingCommands.delete(pending);
+				if (!rpcModeStartupComplete) {
+					startupCompletedPendingCommand = true;
+				}
 				resolveDone();
 			},
 		};
@@ -81,25 +97,28 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 
 	const findPendingCommand = (command: string, id: string | undefined): PendingIrohRemoteCommand | undefined => {
 		for (const pending of pendingCommands) {
-			if (pending.command === command && pending.id === id) {
+			if (!pending.responseMatched && pending.command === command && pending.id === id) {
 				return pending;
 			}
 		}
 		return undefined;
 	};
 
-	const trackInboundCommand = (line: string): PendingIrohRemoteCommand | undefined => {
+	const trackInboundLine = (line: string): PendingIrohRemoteCommand | undefined => {
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(line);
 		} catch {
-			return undefined;
+			return createPendingCommand("parse", undefined);
 		}
 		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-			return undefined;
+			return createPendingCommand("unknown", undefined);
 		}
 		const command = parsed as Record<string, unknown>;
-		if (typeof command.type !== "string" || command.type === "extension_ui_response") {
+		if (typeof command.type !== "string") {
+			return createPendingCommand("unknown", typeof command.id === "string" ? command.id : undefined);
+		}
+		if (command.type === "extension_ui_response") {
 			return undefined;
 		}
 		return createPendingCommand(command.type, typeof command.id === "string" ? command.id : undefined);
@@ -126,6 +145,7 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 		if (!pending) {
 			return;
 		}
+		pending.responseMatched = true;
 		if (
 			response.success === true &&
 			(pending.command === "prompt" || pending.command === "steer" || pending.command === "follow_up")
@@ -136,18 +156,47 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 		pending.finish();
 	};
 
+	const finishPendingResponseAfterWriteFailure = (value: object): void => {
+		const response = value as Record<string, unknown>;
+		if (response.type !== "response" || typeof response.command !== "string") {
+			return;
+		}
+		const pending = findPendingCommand(response.command, typeof response.id === "string" ? response.id : undefined);
+		if (pending) {
+			pending.responseMatched = true;
+			pending.finish();
+		}
+	};
+
 	const transport: IrohRemoteCloseDeferringRpcTransport = {
 		setRpcModeStartupComplete(startupComplete) {
 			rpcModeStartupComplete = startupComplete;
+			if (!rpcModeStartupComplete || !startupCleanClosePending) {
+				if (rpcModeStartupComplete) {
+					startupCompletedPendingCommand = false;
+				}
+				return;
+			}
+			startupCleanClosePending = false;
+			startupCompletedPendingCommand = false;
+			for (const handler of startupCleanCloseHandlers) {
+				handler();
+			}
 		},
 		write(value) {
-			const result = options.transport.write(value);
+			let result: void | Promise<void>;
+			try {
+				result = options.transport.write(value);
+			} catch (error: unknown) {
+				finishPendingResponseAfterWriteFailure(value);
+				throw error;
+			}
 			trackOutboundResponse(value);
 			return result;
 		},
 		onLine(handler: RpcLineHandler): () => void {
 			return options.transport.onLine((line) => {
-				const pending = trackInboundCommand(line);
+				const pending = trackInboundLine(line);
 				try {
 					handler(line);
 				} catch (error: unknown) {
@@ -158,6 +207,14 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 		},
 		onClose(handler: RpcCloseHandler): () => void {
 			let active = true;
+			const handleCleanClose = () => {
+				void waitForPendingCommands().then(() => {
+					if (active) {
+						handler();
+					}
+				});
+			};
+			startupCleanCloseHandlers.add(handleCleanClose);
 			const detach =
 				options.transport.onClose?.((error) => {
 					if (!active) {
@@ -167,18 +224,15 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 						handler(error);
 						return;
 					}
-					if (!rpcModeStartupComplete) {
-						handler();
+					if (!rpcModeStartupComplete && (pendingCommands.size > 0 || startupCompletedPendingCommand)) {
+						startupCleanClosePending = true;
 						return;
 					}
-					void waitForPendingCommands().then(() => {
-						if (active) {
-							handler();
-						}
-					});
+					handleCleanClose();
 				}) ?? (() => {});
 			return () => {
 				active = false;
+				startupCleanCloseHandlers.delete(handleCleanClose);
 				detach();
 			};
 		},

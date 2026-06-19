@@ -23,10 +23,8 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
 const sourceCliScript = join(repoRoot, "scripts", "run-coding-agent-source.mjs");
 const sidecarDir = join(repoRoot, "packages", "coding-agent", "examples", "remote", "iroh-sidecar");
-const hostScript = join(sidecarDir, "host.mjs");
+const hostScript = join(repoRoot, "packages", "coding-agent", "src", "remote", "iroh-host.mjs");
 const clientScript = join(sidecarDir, "client.mjs");
-const irohModule = join(sidecarDir, "node_modules", "@number0", "iroh", "index.js");
-const irohPackageJson = join(sidecarDir, "node_modules", "@number0", "iroh", "package.json");
 const PROCESS_TIMEOUT_MS = 15_000;
 const TICKET_TIMEOUT_MS = 10_000;
 const SOURCE_IMPORT_CONDITION_ARGS = ["--conditions", "volt-source"];
@@ -39,14 +37,15 @@ let presetN0;
 
 async function assertInstalled() {
 	try {
-		await access(irohPackageJson);
+		requireModule.resolve("@number0/iroh/package.json");
 	} catch {
-		throw new Error("Iroh sidecar dependencies are not installed. Run: npm run iroh:poc:install");
+		throw new Error("The optional @number0/iroh dependency is not installed. Run: npm run iroh:poc:install");
 	}
+	await access(hostScript);
 }
 
 function loadIroh() {
-	({ Endpoint, EndpointTicket, RelayMode, presetMinimal, presetN0 } = requireModule(irohModule));
+	({ Endpoint, EndpointTicket, RelayMode, presetMinimal, presetN0 } = requireModule("@number0/iroh/index.js"));
 }
 
 function assert(condition, message) {
@@ -326,6 +325,27 @@ function messageFor(text) {
 }
 
 function writePromptResponse(command) {
+	if (command.message === "handled without agent end") {
+		write({ id: command.id, type: "response", command: "prompt", success: true });
+		return;
+	}
+	if (command.message === "retry cancelled without agent end") {
+		write({ id: command.id, type: "response", command: "prompt", success: true });
+		write({
+			type: "auto_retry_start",
+			attempt: 1,
+			maxAttempts: 1,
+			delayMs: 1000,
+			errorMessage: "retryable",
+		});
+		write({
+			type: "auto_retry_end",
+			success: false,
+			attempt: 1,
+			finalError: "Retry cancelled",
+		});
+		return;
+	}
 	const responseText = "fake source Volt response: " + command.message;
 	const message = messageFor(responseText);
 	write({ id: command.id, type: "response", command: "prompt", success: true });
@@ -366,6 +386,15 @@ function writeStateResponse(command) {
 	});
 }
 
+function writeQueuedInputResponse(command) {
+	write({ id: command.id, type: "response", command: command.type, success: true });
+	write({
+		type: "queue_update",
+		steering: command.type === "steer" ? [command.message] : [],
+		followUp: command.type === "follow_up" ? [command.message] : [],
+	});
+}
+
 function handleLine(line) {
 	if (line.trim().length === 0) return;
 	let command;
@@ -386,6 +415,10 @@ function handleLine(line) {
 	}
 	if (command.type === "get_state") {
 		writeStateResponse(command);
+		return;
+	}
+	if (command.type === "steer" || command.type === "follow_up") {
+		writeQueuedInputResponse(command);
 		return;
 	}
 	write({
@@ -552,24 +585,142 @@ async function halfClosedSourceVoltPromptScenario() {
 	});
 }
 
+async function halfClosedSourceVoltHandledPromptScenario() {
+	await withStateDir("source-handled-half-close", async ({ hostStatePath, stateDir }) => {
+		const { sourceDir } = await createFakeSourceVolt(stateDir);
+		const host = startHost(["--state", hostStatePath, "--source-volt", sourceDir, "--once"]);
+		try {
+			const ticket = await waitForFirstStdoutLine(host.child, host.output, "source handled half-close host");
+			const lines = await runRawRpcClient(
+				ticket,
+				{ id: "prompt-source-handled-half-close", type: "prompt", message: "handled without agent end" },
+				{ finishSend: true },
+			);
+			await waitForExit(host.child, "source handled half-close host", host.output);
+			const responses = lines.map((line) => JSON.parse(line));
+			const response = responses.find((event) => event.id === "prompt-source-handled-half-close");
+			assert(response, `Expected handled prompt response, got:\n${lines.join("\n")}`);
+			assert(response.success === true, `Expected handled prompt success, got:\n${JSON.stringify(response)}`);
+		} finally {
+			await stopProcess(host.child);
+		}
+	});
+}
+
+async function halfClosedSourceVoltRetryCancelledScenario() {
+	await withStateDir("source-retry-cancelled-half-close", async ({ hostStatePath, stateDir }) => {
+		const { sourceDir } = await createFakeSourceVolt(stateDir);
+		const host = startHost(["--state", hostStatePath, "--source-volt", sourceDir, "--once"]);
+		try {
+			const ticket = await waitForFirstStdoutLine(host.child, host.output, "source retry cancelled half-close host");
+			const lines = await runRawRpcClient(
+				ticket,
+				{ id: "prompt-source-retry-cancelled", type: "prompt", message: "retry cancelled without agent end" },
+				{ finishSend: true },
+			);
+			await waitForExit(host.child, "source retry cancelled half-close host", host.output);
+			const responses = lines.map((line) => JSON.parse(line));
+			const response = responses.find((event) => event.id === "prompt-source-retry-cancelled");
+			assert(response, `Expected retry-cancelled prompt response, got:\n${lines.join("\n")}`);
+			assert(response.success === true, `Expected retry-cancelled prompt success, got:\n${JSON.stringify(response)}`);
+			assert(
+				responses.some((event) => event.type === "auto_retry_end" && event.success === false),
+				`Expected retry cancellation event, got:\n${lines.join("\n")}`,
+			);
+		} finally {
+			await stopProcess(host.child);
+		}
+	});
+}
+
+async function halfClosedSourceVoltQueuedSteerScenario() {
+	await withStateDir("source-queued-steer-half-close", async ({ hostStatePath, stateDir }) => {
+		const { sourceDir } = await createFakeSourceVolt(stateDir);
+		const host = startHost(["--state", hostStatePath, "--source-volt", sourceDir, "--once"]);
+		try {
+			const ticket = await waitForFirstStdoutLine(host.child, host.output, "source queued steer half-close host");
+			const lines = await runRawRpcClient(
+				ticket,
+				{ id: "steer-source-queued", type: "steer", message: "queued steer without agent start" },
+				{ finishSend: true },
+			);
+			await waitForExit(host.child, "source queued steer half-close host", host.output);
+			const responses = lines.map((line) => JSON.parse(line));
+			const response = responses.find((event) => event.id === "steer-source-queued");
+			assert(response, `Expected queued steer response, got:\n${lines.join("\n")}`);
+			assert(response.success === true, `Expected queued steer success, got:\n${JSON.stringify(response)}`);
+			assert(
+				responses.some(
+					(event) =>
+						event.type === "queue_update" &&
+						Array.isArray(event.steering) &&
+						event.steering.includes("queued steer without agent start"),
+				),
+				`Expected queued steer update, got:\n${lines.join("\n")}`,
+			);
+		} finally {
+			await stopProcess(host.child);
+		}
+	});
+}
+
 async function rawCommandFilterScenario() {
-	await withStateDir("raw-filter", async ({ hostStatePath }) => {
+	await withStateDir("raw-filter", async ({ hostStatePath, stateDir }) => {
 		const host = startHost(["--state", hostStatePath, "--once"]);
 		try {
 			const ticket = await waitForFirstStdoutLine(host.child, host.output, "raw command filter host");
+			const privateCommandPath = join(stateDir, "private-command");
 			const lines = await runRawRpcClient(
 				ticket,
-				{ id: "bash-1", type: "bash", command: "echo blocked" },
+				{ id: "path-filter", type: privateCommandPath },
 				{ finishSend: true },
 			);
 			await waitForExit(host.child, "raw command filter host", host.output);
 			const responses = lines.map((line) => JSON.parse(line));
-			const response = responses.find((event) => event.id === "bash-1");
-			assert(response, `Expected host-side bash denial response, got:\n${lines.join("\n")}`);
-			assert(response.success === false, `Expected bash denial to fail, got:\n${JSON.stringify(response)}`);
+			const response = responses.find((event) => event.id === "path-filter");
+			assert(response, `Expected host-side path denial response, got:\n${lines.join("\n")}`);
+			assert(response.success === false, `Expected path denial to fail, got:\n${JSON.stringify(response)}`);
+			assert(response.command === "[redacted host path]", `Expected redacted command, got:\n${JSON.stringify(response)}`);
 			assert(
-				response.error === "RPC command not allowed over remote sidecar: bash",
-				`Expected host-side bash denial, got:\n${JSON.stringify(response)}`,
+				response.error === "RPC command not allowed over remote host: [redacted host path]",
+				`Expected redacted host-side denial, got:\n${JSON.stringify(response)}`,
+			);
+		} finally {
+			await stopProcess(host.child);
+		}
+	});
+}
+
+async function integratedRawCommandFilterScenario() {
+	await withStateDir("integrated-filter", async ({ hostStatePath, stateDir }) => {
+		const agentDir = await createIntegratedVoltAgentDir(stateDir);
+		const workspacePath = join(stateDir, "workspace");
+		await mkdir(workspacePath, { recursive: true });
+		const host = startHost([
+			"--state",
+			hostStatePath,
+			"--agent-dir",
+			agentDir,
+			"--workspace",
+			`integrated-filter=${workspacePath}`,
+			"--integrated-volt",
+			"--once",
+		]);
+		try {
+			const ticket = await waitForFirstStdoutLine(host.child, host.output, "integrated raw command filter host");
+			const lines = await runRawRpcClient(
+				ticket,
+				{ id: "bash-integrated-1", type: "bash", command: "echo blocked" },
+				{ finishSend: true },
+			);
+			await waitForExit(host.child, "integrated raw command filter host", host.output);
+			const responses = lines.map((line) => JSON.parse(line));
+			const response = responses.find((event) => event.id === "bash-integrated-1");
+			assert(response, `Expected integrated host-side bash denial response, got:\n${lines.join("\n")}`);
+			assert(response.success === false, `Expected integrated bash denial to fail, got:\n${JSON.stringify(response)}`);
+			assert(
+				response.error === "RPC command not allowed over remote host: bash",
+				`Expected integrated host-side bash denial, got:\n${JSON.stringify(response)}`,
 			);
 		} finally {
 			await stopProcess(host.child);
@@ -609,6 +760,14 @@ async function integratedVoltGetStateScenario() {
 					response.data?.model?.id === "fake-integrated",
 				`Expected integrated fake model state, got:\n${JSON.stringify(response)}`,
 			);
+
+			const auditEvents = await readAuditEvents(getDefaultAuditPath(hostStatePath));
+			for (const eventType of ["runtime_started", "runtime_stopped"]) {
+				assert(
+					auditEvents.some((event) => event.type === eventType && event.success === true),
+					`Expected successful audit event ${eventType}, got:\n${JSON.stringify(auditEvents)}`,
+				);
+			}
 		} finally {
 			await stopProcess(host.child);
 		}
@@ -918,6 +1077,8 @@ async function auditLogScenario() {
 			"client_authorized",
 			"client_rejected",
 			"client_revoked",
+			"child_started",
+			"child_stopped",
 			"client_disconnected",
 			"runtime_failure",
 		]) {
@@ -934,6 +1095,14 @@ async function auditLogScenario() {
 		assert(
 			auditEvents.some((event) => event.type === "client_rejected" && event.success === false),
 			`Expected rejected client audit event, got:\n${JSON.stringify(auditEvents)}`,
+		);
+		assert(
+			auditEvents.some((event) => event.type === "child_started" && event.success === true),
+			`Expected successful child start audit event, got:\n${JSON.stringify(auditEvents)}`,
+		);
+		assert(
+			auditEvents.some((event) => event.type === "child_stopped" && event.success === true),
+			`Expected successful child stop audit event, got:\n${JSON.stringify(auditEvents)}`,
 		);
 	});
 }
@@ -1103,7 +1272,11 @@ const scenarios = [
 	["prompt round trip", promptRoundTripScenario],
 	["raw half-close prompt", rawHalfClosePromptScenario],
 	["source Volt half-close prompt", halfClosedSourceVoltPromptScenario],
+	["source Volt handled half-close prompt", halfClosedSourceVoltHandledPromptScenario],
+	["source Volt retry-cancelled half-close prompt", halfClosedSourceVoltRetryCancelledScenario],
+	["source Volt queued steer half-close", halfClosedSourceVoltQueuedSteerScenario],
 	["raw command filter", rawCommandFilterScenario],
+	["integrated raw command filter", integratedRawCommandFilterScenario],
 	["integrated Volt get_state", integratedVoltGetStateScenario],
 	["integrated Volt profile", integratedVoltProfileScenario],
 	["integrated Volt env profile", integratedVoltEnvProfileScenario],
@@ -1126,7 +1299,7 @@ async function main() {
 		await runScenario();
 		process.stdout.write("passed\n");
 	}
-	console.log("Iroh sidecar scenario tests passed.");
+	console.log("Iroh remote host scenario tests passed.");
 }
 
 main().catch((error) => {

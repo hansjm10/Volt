@@ -11,6 +11,10 @@ export interface IrohRemoteFilteredRpcTransportOptions {
 	transport: RpcTransport;
 }
 
+interface StartupAwareRpcTransport extends RpcTransport {
+	setRpcModeStartupComplete?(startupComplete: boolean): void;
+}
+
 /**
  * Wrap an RPC transport with the remote Iroh command policy.
  *
@@ -18,9 +22,12 @@ export interface IrohRemoteFilteredRpcTransportOptions {
  * Disallowed or malformed commands are rejected on the same transport without
  * reaching Volt RPC handlers.
  */
-export function createIrohRemoteFilteredRpcTransport(options: IrohRemoteFilteredRpcTransportOptions): RpcTransport {
+export function createIrohRemoteFilteredRpcTransport(
+	options: IrohRemoteFilteredRpcTransportOptions,
+): RpcTransport & { setRpcModeStartupComplete?(startupComplete: boolean): void } {
 	const pendingRejections = new Set<Promise<void>>();
 	let pendingRejectionError: Error | undefined;
+	const startupAwareTransport = options.transport as StartupAwareRpcTransport;
 
 	const recordRejectionError = (error: unknown): Error => {
 		const rejectionError = error instanceof Error ? error : new Error(String(error));
@@ -55,6 +62,9 @@ export function createIrohRemoteFilteredRpcTransport(options: IrohRemoteFiltered
 	};
 
 	return {
+		setRpcModeStartupComplete(startupComplete: boolean) {
+			startupAwareTransport.setRpcModeStartupComplete?.(startupComplete);
+		},
 		write(value) {
 			return options.transport.write(value);
 		},

@@ -18,7 +18,7 @@
 		"check:pinned-deps": "node scripts/check-pinned-deps.mjs",
 		"check:shrinkwrap": "node scripts/generate-coding-agent-shrinkwrap.mjs --check",
 		"check:ts-imports": "node scripts/check-ts-relative-imports.mjs",
-		"iroh:poc:install": "npm --prefix packages/coding-agent/examples/remote/iroh-sidecar install --ignore-scripts",
+		"iroh:poc:install": "npm install --ignore-scripts",
 		"iroh:poc:test": "node --conditions volt-source scripts/iroh-sidecar-test.mjs",
 		"iroh:poc:host": "node --conditions volt-source scripts/iroh-sidecar-run.mjs host",
 		"iroh:poc:host:volt": "node --conditions volt-source scripts/iroh-sidecar-run.mjs host --integrated-volt --workspace volt=.",

@@ -165,6 +165,7 @@ function shouldPreserveOpaqueStringEntry(
 		return false;
 	}
 	return (
+		key === "id" ||
 		(key === "data" && isImageContentRecord(record)) ||
 		(key === "textSignature" && isTypedContentRecord(record, "text")) ||
 		(key === "thinkingSignature" && isTypedContentRecord(record, "thinking")) ||
