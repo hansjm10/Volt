@@ -1,8 +1,8 @@
-# Iroh remote demo clients
+# Iroh remote demo fixtures
 
 This example tunnels Volt RPC JSONL over an Iroh QUIC bidirectional stream.
 
-The product host lives in Volt itself: `volt remote host` launches `packages/coding-agent/src/remote/iroh-host.mjs` from source checkouts, or the copied `dist/remote/iroh-host.mjs` from package installs. This directory keeps demo clients, fake-RPC fixtures, and compatibility wrappers for local remote-host testing.
+The product workflow lives in Volt itself: `volt remote host` launches `packages/coding-agent/src/remote/iroh-host.mjs` from source checkouts, or the copied `dist/remote/iroh-host.mjs` from package installs, and `volt remote client <ticket>` connects to the printed ticket. This directory keeps the legacy demo client, fake-RPC fixtures, and compatibility wrappers for local remote-host testing.
 
 ## Install
 
@@ -12,13 +12,13 @@ From the repository root:
 npm run iroh:poc:install
 ```
 
-For direct demo-client commands from this directory after the repository root or containing package has already been installed:
+For direct legacy demo-client commands from this directory after the repository root or containing package has already been installed:
 
 ```bash
 npm install --ignore-scripts
 ```
 
-`@number0/iroh` is now an optional dependency of `@earendil-works/volt-coding-agent`. Host commands use the product package install, so run root install before `volt remote host` or `npm run iroh:poc:host`. If `volt remote host` reports that the optional native adapter is unavailable, reinstall with optional dependencies enabled for the current platform. The example package can still install the dependency locally for direct client demos.
+`@number0/iroh` is now an optional dependency of `@earendil-works/volt-coding-agent`. Product commands use the package install, so run root install before `volt remote host`, `volt remote client`, or the root `iroh:poc:*` scripts. If a remote command reports that the optional native adapter is unavailable, reinstall with optional dependencies enabled for the current platform. The example package can still install the dependency locally for direct legacy client demos.
 
 ## Root scripts
 
@@ -29,7 +29,7 @@ npm run iroh:poc:smoke                  # local fake-RPC smoke test
 npm run iroh:poc:test                   # local fake-RPC scenario tests
 npm run iroh:poc:host                   # product host with the fake-RPC child
 npm run iroh:poc:host:volt              # integrated source Volt host for this checkout
-npm run iroh:poc:client -- "<ticket>"    # one-shot client
+npm run iroh:poc:client -- "<ticket>" --message "hello"  # product one-shot client
 npm run iroh:poc:client -- "<ticket>" --interactive  # persistent prompt loop
 npm run iroh:poc:clients                # list paired clients
 npm run iroh:poc:revoke -- <node-id>    # revoke a paired client
@@ -86,7 +86,7 @@ The first successful connection persists the host key, client key, workspace, an
 
 ```text
 ~/.volt/agent/remote/iroh-host.json
-~/.volt/agent/remote/iroh-sidecar-client.json
+~/.volt/agent/remote/iroh-client.json
 ```
 
 Use `--state <path>` on host or client for isolated test state.

@@ -84,4 +84,26 @@ describe("remote CLI", () => {
 		});
 		expect(process.exitCode).toBeUndefined();
 	});
+
+	it("prints remote client help without loading native Iroh", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		await expect(main(["remote", "client", "--help"])).resolves.toBeUndefined();
+
+		expect(errorSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain(
+			"Usage: volt remote client <ticket>",
+		);
+		expect(process.exitCode).toBeUndefined();
+	});
+
+	it("rejects remote client commands with missing tickets before loading native Iroh", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		await expect(main(["remote", "client", "--message", "hello"])).resolves.toBeUndefined();
+
+		expect(errorSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain(
+			"Error: Missing remote client ticket",
+		);
+		expect(process.exitCode).toBe(1);
+	});
 });

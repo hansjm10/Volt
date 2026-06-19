@@ -19,7 +19,7 @@ Example extensions demonstrating:
 - Custom providers (Anthropic with custom streaming, GitLab Duo)
 
 ### [remote/iroh-sidecar/](remote/iroh-sidecar/)
-Demo clients and fake-RPC fixtures for tunneling Volt RPC JSONL over the product `volt remote host` Iroh adapter.
+Legacy demo clients and fake-RPC fixtures for tunneling Volt RPC JSONL over the product `volt remote host` and `volt remote client` Iroh adapter.
 
 ## Documentation
 

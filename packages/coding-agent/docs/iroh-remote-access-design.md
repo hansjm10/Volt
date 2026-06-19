@@ -2,7 +2,7 @@
 
 ## Status
 
-Phase 2 is mostly complete in Volt core: RPC mode has a transport abstraction, Iroh streams have a structurally typed RPC adapter, remote command filtering is available, and the Iroh remote helpers now cover tickets, handshakes, host state, authorization, workspace selection, audit logging, and host/client engine orchestration. `volt remote host` now launches a product host entrypoint in the coding-agent package and runs Volt's runtime in-process over `runIrohRemoteRpcMode()`.
+Phase 2 is mostly complete in Volt core: RPC mode has a transport abstraction, Iroh streams have a structurally typed RPC adapter, remote command filtering is available, and the Iroh remote helpers now cover tickets, handshakes, host state, authorization, workspace selection, audit logging, and host/client engine orchestration. `volt remote host` now launches a product host entrypoint in the coding-agent package and runs Volt's runtime in-process over `runIrohRemoteRpcMode()`. `volt remote client <ticket>` is the primary manual client workflow and uses `RpcTransportClient` over the Iroh RPC adapter.
 
 ## Summary
 
@@ -82,10 +82,10 @@ The host process:
 8. Pipes Iroh stream bytes to the selected RPC runtime.
 9. Writes host diagnostics and prefixed child stderr, when a child process is used, to stderr.
 
-### Example client command
+### Client command
 
 ```bash
-npm run iroh:poc:client -- "<pairing-ticket>"
+volt remote client "<pairing-ticket>"
 ```
 
 The client process:
@@ -94,7 +94,7 @@ The client process:
 2. Dials the host ticket.
 3. Sends a JSON handshake containing the pairing secret, requested workspace name, client label, and protocol version.
 4. Sends normal Volt RPC JSONL commands after the host accepts.
-5. Renders RPC events in a minimal terminal UI or prints text deltas for the proof of concept.
+5. Renders RPC events in a minimal terminal prompt loop, prints text deltas for `--message`, or prints state for `--get-state`.
 
 ### Pairing ticket shape
 
@@ -196,15 +196,16 @@ Initial external commands:
 
 ```bash
 volt remote host --workspace volt=/path/to/repo
+volt remote client "<ticket>"
 volt remote clients
 volt remote revoke <node-id>
-npm run iroh:poc:client -- "<ticket>"
 ```
 
 Initial integrated Volt command:
 
 ```bash
 volt remote host --workspace volt=/path/to/repo
+volt remote client "<ticket>"
 ```
 
 Future integrated Volt commands:

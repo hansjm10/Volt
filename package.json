@@ -24,7 +24,7 @@
 		"iroh:poc:test": "node --conditions volt-source scripts/iroh-sidecar-test.mjs",
 		"iroh:poc:host": "node --conditions volt-source scripts/iroh-sidecar-run.mjs host",
 		"iroh:poc:host:volt": "node --conditions volt-source scripts/iroh-sidecar-run.mjs host --integrated-volt --workspace volt=.",
-		"iroh:poc:client": "node --conditions volt-source scripts/iroh-sidecar-run.mjs client",
+		"iroh:poc:client": "node scripts/run-coding-agent-source.mjs remote client",
 		"iroh:poc:clients": "node --conditions volt-source scripts/iroh-sidecar-run.mjs host clients",
 		"iroh:poc:revoke": "node --conditions volt-source scripts/iroh-sidecar-run.mjs host revoke",
 		"iroh:poc:smoke": "node --conditions volt-source scripts/iroh-sidecar-smoke.mjs",
