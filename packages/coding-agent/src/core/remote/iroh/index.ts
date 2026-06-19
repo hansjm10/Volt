@@ -49,6 +49,19 @@ export {
 	writeIrohRemoteHello,
 } from "./handshake-reader.ts";
 export {
+	createIrohRemoteOutboundFilteredRpcTransport,
+	IROH_REMOTE_REDACTED_BASH_OUTPUT_PATH,
+	IROH_REMOTE_REDACTED_EXPORT_PATH,
+	IROH_REMOTE_REDACTED_HOST_PATH,
+	IROH_REMOTE_REDACTED_SESSION_FILE,
+	type IrohRemoteOutboundFilterOptions,
+	type IrohRemoteOutboundJsonlReadablePipeOptions,
+	type IrohRemoteOutboundSanitizerOptions,
+	pipeIrohRemoteOutboundJsonlReadable,
+	sanitizeIrohRemoteOutbound,
+	sanitizeIrohRemoteOutboundJsonLine,
+} from "./outbound-filter.ts";
+export {
 	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_HANDSHAKE_TYPE,

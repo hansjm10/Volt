@@ -1,7 +1,6 @@
 import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { StringDecoder } from "node:string_decoder";
 import { access, mkdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -20,6 +19,7 @@ import {
 	IrohRemoteAuditLogger,
 	IrohRemoteHostEngine,
 	IrohRemoteHostStateManager,
+	pipeIrohRemoteOutboundJsonlReadable,
 	readIrohRemoteHostState,
 	selectIrohRemoteWorkspace,
 	serializeIrohRemoteRpcFilterRejection,
@@ -617,30 +617,6 @@ async function pipeFilteredIrohRpcToNodeWritable(recv, writable, initial, writeT
 	}
 }
 
-async function pipeNodeJsonlReadableToIrohSend(readable, sendQueue, onLine) {
-	const decoder = new StringDecoder("utf8");
-	let buffer = "";
-
-	for await (const chunk of readable) {
-		buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
-		while (true) {
-			const newlineIndex = buffer.indexOf("\n");
-			if (newlineIndex === -1) break;
-			const line = buffer.slice(0, newlineIndex + 1);
-			buffer = buffer.slice(newlineIndex + 1);
-			await sendQueue.write(line);
-			onLine(line);
-		}
-	}
-
-	buffer += decoder.end();
-	if (buffer.length > 0) {
-		await sendQueue.write(buffer);
-		onLine(buffer);
-	}
-	await sendQueue.finish();
-}
-
 async function runSpawnedRpcConnection(stream, handshake, authorization, options) {
 	const spawnedChild = spawnRpcChild(options, authorization.workspace, authorization.allowTools);
 	const child = spawnedChild.child;
@@ -667,9 +643,13 @@ async function runSpawnedRpcConnection(stream, handshake, authorization, options
 		if (!child.killed) child.kill();
 		throw error;
 	});
-	const childToClient = pipeNodeJsonlReadableToIrohSend(child.stdout, sendQueue, (line) => {
-		rpcCompletionTracker.markChildOutputLine(line);
-	});
+	const childToClient = pipeIrohRemoteOutboundJsonlReadable(child.stdout, {
+		workspacePath: authorization.workspace.path,
+		writeLine: (line) => sendQueue.write(line),
+		onLine: (line) => {
+			rpcCompletionTracker.markChildOutputLine(line);
+		},
+	}).then(() => sendQueue.finish());
 	const childError = new Promise((_, rejectChildError) => {
 		child.once("error", (error) => {
 			rejectChildError(new Error(`RPC child error (${childCommand}): ${error.message}`));
@@ -709,6 +689,7 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, opt
 	await runIrohRemoteRpcMode(runtime, {
 		stream,
 		initialInput: handshake.initialInput,
+		workspacePath: authorization.workspace.path,
 	});
 }
 

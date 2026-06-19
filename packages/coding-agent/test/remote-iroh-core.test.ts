@@ -9,11 +9,16 @@ import {
 	createIrohRemoteFilteredRpcTransport,
 	createIrohRemoteHandshakeFailure,
 	createIrohRemoteHandshakeSuccess,
+	createIrohRemoteOutboundFilteredRpcTransport,
 	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 	decodeIrohRemoteTicketPayload,
 	encodeIrohRemoteTicketPayload,
 	getIrohRemoteRpcFilterResult,
 	IROH_REMOTE_ALPN,
+	IROH_REMOTE_REDACTED_BASH_OUTPUT_PATH,
+	IROH_REMOTE_REDACTED_EXPORT_PATH,
+	IROH_REMOTE_REDACTED_HOST_PATH,
+	IROH_REMOTE_REDACTED_SESSION_FILE,
 	type IrohRemoteAuditEvent,
 	IrohRemoteAuditLogger,
 	IrohRemoteClientEngine,
@@ -29,8 +34,11 @@ import {
 	parseIrohRemoteHostState,
 	parseIrohRemoteTicketPayload,
 	parseIrohRemoteWorkspaceSpec,
+	pipeIrohRemoteOutboundJsonlReadable,
 	readIrohRemoteHandshakeLine,
 	readIrohRemoteHostState,
+	sanitizeIrohRemoteOutbound,
+	sanitizeIrohRemoteOutboundJsonLine,
 	selectIrohRemoteWorkspace,
 	serializeIrohRemoteRpcFilterRejection,
 	writeIrohRemoteHandshakeResponse,
@@ -1086,6 +1094,499 @@ describe("Iroh remote core helpers", () => {
 		expect(inner.waitForBackpressureCalls).toBe(1);
 		expect(inner.flushCalls).toBe(1);
 		expect(inner.closeCalls).toBe(1);
+	});
+
+	test("sanitizes remote outbound host paths", () => {
+		const workspacePath = "/Users/jordan/project";
+		const sessionFile = "/Users/jordan/.volt/agent/sessions/project/session.jsonl";
+		const exportPath = "/Users/jordan/.volt/agent/exports/Volt-session-session.html";
+		const bashOutputPath = join(tmpdir(), "volt-bash-deadbeef.log");
+
+		const sanitized = sanitizeIrohRemoteOutbound(
+			{
+				type: "response",
+				command: "get_state",
+				success: true,
+				data: {
+					sessionFile,
+					sessionPath: sessionFile,
+					sourceInfo: { path: `${workspacePath}/src/index.ts` },
+					remotePathList: { path: "/workspace/bin:/Users/jordan/.volt/auth.json" },
+					tildeSessionPath: "~/.volt/agent/sessions/proj/session.jsonl",
+					tildeUserSessionPath: "~jordan/.volt/agent/sessions/proj/session.jsonl",
+					outsidePath: "/Users/jordan/.volt/agent/auth.json",
+					outputPath: `${workspacePath}/bin:/Users/jordan/.volt/auth.json`,
+					networkPath: "\\\\server\\share\\auth.json",
+					message: `Workspace ${workspacePath}/src/index.ts, sibling ${workspacePath}-private/file.ts, outside /Users/jordan/.volt/agent/auth.json, pipe |/Users/jordan/.volt/agent/auth.json|, pathList PATH=${workspacePath}/bin:/Users/jordan/.volt/auth.json;/Users/jordan/.volt/other.json,/Users/jordan/.volt/third.json, remoteList /workspace/bin:/Users/jordan/.volt/remote.json, label path:/Users/jordan/.volt/agent/auth.json, numeric 1:/Users/jordan/.volt/agent/auth.json, windows path:C:\\Users\\jordan\\.volt\\agent\\auth.json, unc \\\\server\\share\\auth.json, tilde ~/.volt/auth.json, tildeExport ~/Volt-session-abc.html, file file://localhost/Users/jordan/.volt/agent/auth.json, fileRoot file:///Users/jordan/.volt/agent/auth.json, fileCase FILE:///Users/jordan/.volt/agent/auth.json, url https://example.com/Users/jordan/file, workspaceUrl https://example.com/Users/jordan/project/src/index.ts, relative src/index.ts, full output: ${bashOutputPath}, export: ${exportPath}, session: ${sessionFile}`,
+					keyedPaths: {
+						"/Users/jordan/.volt/agent/auth.json": "key value",
+						"|/Users/jordan/.volt/agent/leading.json": "leading pipe key value",
+						"|/Users/jordan/.volt/agent/auth.json|": "pipe key value",
+						"/Users/jordan/project/src/index.ts": "workspace key value",
+						"/Users/jordan/secrets.json": "second redacted key value",
+					},
+					keyedSpacedPath: { "/Users/jordan/Secret Key": "spaced key value" },
+					keyedPathSuffix: { "/Users/jordan/privatePath": "suffix key value" },
+					ordinaryKeys: { constructor: 1, toString: 2 },
+					details: {
+						fullOutputPath: bashOutputPath,
+						note: `Full output: ${bashOutputPath}`,
+					},
+				},
+			},
+			{ workspacePath },
+		) as {
+			data: {
+				details: Record<string, unknown>;
+				keyedSpacedPath: Record<string, string>;
+				message: string;
+				networkPath: string;
+				ordinaryKeys: Record<string, number>;
+				outsidePath: string;
+				outputPath: string;
+				keyedPathSuffix: Record<string, string>;
+				keyedPaths: Record<string, string>;
+				remotePathList: { path: string };
+				sessionFile?: string;
+				sessionPath: string;
+				sourceInfo: { path: string };
+				tildeSessionPath: string;
+				tildeUserSessionPath: string;
+			};
+		};
+
+		expect(sanitized.data.sessionFile).toBeUndefined();
+		expect(sanitized.data.sessionPath).toBe(IROH_REMOTE_REDACTED_HOST_PATH);
+		expect(sanitized.data.tildeSessionPath).toBe(IROH_REMOTE_REDACTED_SESSION_FILE);
+		expect(sanitized.data.tildeUserSessionPath).toBe(IROH_REMOTE_REDACTED_SESSION_FILE);
+		expect(sanitized.data.sourceInfo.path).toBe("/workspace/src/index.ts");
+		expect(sanitized.data.outsidePath).toBe(IROH_REMOTE_REDACTED_HOST_PATH);
+		expect(sanitized.data.outputPath).toBe(`/workspace/bin:${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		expect(sanitized.data.remotePathList.path).toBe(`/workspace/bin:${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		expect(sanitized.data.networkPath).toBe(IROH_REMOTE_REDACTED_HOST_PATH);
+		expect(sanitized.data.details.fullOutputPath).toBeUndefined();
+		expect(sanitized.data.details.note).toBe(`Full output: ${IROH_REMOTE_REDACTED_BASH_OUTPUT_PATH}`);
+		expect(sanitized.data.message).toBe(
+			`Workspace /workspace/src/index.ts, sibling ${IROH_REMOTE_REDACTED_HOST_PATH}, outside ${IROH_REMOTE_REDACTED_HOST_PATH}, pipe |${IROH_REMOTE_REDACTED_HOST_PATH}|, pathList PATH=/workspace/bin:${IROH_REMOTE_REDACTED_HOST_PATH};${IROH_REMOTE_REDACTED_HOST_PATH},${IROH_REMOTE_REDACTED_HOST_PATH}, remoteList /workspace/bin:${IROH_REMOTE_REDACTED_HOST_PATH}, label path:${IROH_REMOTE_REDACTED_HOST_PATH}, numeric 1:${IROH_REMOTE_REDACTED_HOST_PATH}, windows path:${IROH_REMOTE_REDACTED_HOST_PATH}, unc ${IROH_REMOTE_REDACTED_HOST_PATH}, tilde ${IROH_REMOTE_REDACTED_HOST_PATH}, tildeExport ${IROH_REMOTE_REDACTED_EXPORT_PATH}, file ${IROH_REMOTE_REDACTED_HOST_PATH}, fileRoot ${IROH_REMOTE_REDACTED_HOST_PATH}, fileCase ${IROH_REMOTE_REDACTED_HOST_PATH}, url https://example.com/Users/jordan/file, workspaceUrl https://example.com/Users/jordan/project/src/index.ts, relative src/index.ts, full output: ${IROH_REMOTE_REDACTED_BASH_OUTPUT_PATH}, export: ${IROH_REMOTE_REDACTED_EXPORT_PATH}, session: ${IROH_REMOTE_REDACTED_SESSION_FILE}`,
+		);
+		expect(sanitized.data.keyedPaths).toEqual({
+			[IROH_REMOTE_REDACTED_HOST_PATH]: "key value",
+			[`|${IROH_REMOTE_REDACTED_HOST_PATH}`]: "leading pipe key value",
+			[`|${IROH_REMOTE_REDACTED_HOST_PATH}|`]: "pipe key value",
+			"/workspace/src/index.ts": "workspace key value",
+			[`${IROH_REMOTE_REDACTED_HOST_PATH} (2)`]: "second redacted key value",
+		});
+		expect(sanitized.data.keyedPathSuffix).toEqual({
+			[IROH_REMOTE_REDACTED_HOST_PATH]: "suffix key value",
+		});
+		expect(sanitized.data.keyedSpacedPath).toEqual({
+			[IROH_REMOTE_REDACTED_HOST_PATH]: "spaced key value",
+		});
+		expect(sanitized.data.ordinaryKeys).toEqual({ constructor: 1, toString: 2 });
+
+		const spacedWorkspacePath = "/Users/Jordan Hans/project";
+		const spacedSanitized = sanitizeIrohRemoteOutbound(
+			{
+				message: `Opened ${spacedWorkspacePath}/src/index.ts and outside /Users/Jordan Hans/.volt/auth.json`,
+			},
+			{ workspacePath: spacedWorkspacePath },
+		) as { message: string };
+		expect(spacedSanitized.message).toBe(
+			`Opened /workspace/src/index.ts and outside ${IROH_REMOTE_REDACTED_HOST_PATH}`,
+		);
+		const terminalSpacedSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "Owner path /Users/Jordan Hans" },
+			{ workspacePath: spacedWorkspacePath },
+		) as { message: string };
+		expect(terminalSpacedSanitized.message).toBe(`Owner path ${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		const terminalSecretKeySanitized = sanitizeIrohRemoteOutbound(
+			{ message: "Secret path /Users/jordan/Secret Key" },
+			{ workspacePath },
+		) as { message: string };
+		expect(terminalSecretKeySanitized.message).toBe(`Secret path ${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		const spacedProjectSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "Project path /Users/jordan/My Project" },
+			{ workspacePath },
+		) as { message: string };
+		expect(spacedProjectSanitized.message).toBe(`Project path ${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		const lowercaseSpacedProjectSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "Project path /Users/jordan/my project" },
+			{ workspacePath },
+		) as { message: string };
+		expect(lowercaseSpacedProjectSanitized.message).toBe(`Project path ${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		const multiWordPathSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "Project path /Users/jordan/my project data/file.txt" },
+			{ workspacePath },
+		) as { message: string };
+		expect(multiWordPathSanitized.message).toBe(`Project path ${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		const terminalMultiWordPathSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "Project path /Users/jordan/my project data" },
+			{ workspacePath },
+		) as { message: string };
+		expect(terminalMultiWordPathSanitized.message).toBe(`Project path ${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		const apostrophePathSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "Project path /Users/jordan/John's Project/auth.json" },
+			{ workspacePath },
+		) as { message: string };
+		expect(apostrophePathSanitized.message).toBe(`Project path ${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		const spacedApostrophePathSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "Project path /Users/jordan/O' Brien/auth.json" },
+			{ workspacePath },
+		) as { message: string };
+		expect(spacedApostrophePathSanitized.message).toBe(`Project path ${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		const terminalSpacedApostrophePathSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "Project path /Users/jordan/O' Brien" },
+			{ workspacePath },
+		) as { message: string };
+		expect(terminalSpacedApostrophePathSanitized.message).toBe(`Project path ${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		const configSpacedPathSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "Config path /Users/jordan/.config/app data" },
+			{ workspacePath },
+		) as { message: string };
+		expect(configSpacedPathSanitized.message).toBe(`Config path ${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		const spacedThenProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "Owner path /Users/Jordan Hans missing" },
+			{ workspacePath: spacedWorkspacePath },
+		) as { message: string };
+		expect(spacedThenProseSanitized.message).toBe(`Owner path ${IROH_REMOTE_REDACTED_HOST_PATH} missing`);
+
+		const adjacentPathSanitized = sanitizeIrohRemoteOutbound(
+			{ message: `${workspacePath}/src /Users/jordan/.volt/auth.json` },
+			{ workspacePath },
+		) as { message: string };
+		expect(adjacentPathSanitized.message).toBe(`/workspace/src ${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		const adjacentColonPathSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "/Users/jordan/.volt/auth.json 1:/Users/jordan/.volt/other.json" },
+			{ workspacePath },
+		) as { message: string };
+		expect(adjacentColonPathSanitized.message).toBe(
+			`${IROH_REMOTE_REDACTED_HOST_PATH} 1:${IROH_REMOTE_REDACTED_HOST_PATH}`,
+		);
+
+		const suffixSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/.volt/auth.json suffix" },
+			{ workspacePath },
+		) as { message: string };
+		expect(suffixSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} suffix`);
+		const directoryThenProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/project suffix" },
+			{ workspacePath },
+		) as { message: string };
+		expect(directoryThenProseSanitized.message).toBe("prefix /workspace suffix");
+		const workspaceThenUppercaseProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/project Missing" },
+			{ workspacePath },
+		) as { message: string };
+		expect(workspaceThenUppercaseProseSanitized.message).toBe("prefix /workspace Missing");
+		const parenthesizedSuffixSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "(/Users/jordan/.volt/auth.json missing)" },
+			{ workspacePath },
+		) as { message: string };
+		expect(parenthesizedSuffixSanitized.message).toBe(`(${IROH_REMOTE_REDACTED_HOST_PATH} missing)`);
+		const slashProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "/Users/jordan/.volt/auth.json and/or missing" },
+			{ workspacePath },
+		) as { message: string };
+		expect(slashProseSanitized.message).toBe(`${IROH_REMOTE_REDACTED_HOST_PATH} and/or missing`);
+		const privateSlashProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/private and/missing" },
+			{ workspacePath },
+		) as { message: string };
+		expect(privateSlashProseSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} and/missing`);
+		const privateUppercaseProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/private Missing" },
+			{ workspacePath },
+		) as { message: string };
+		expect(privateUppercaseProseSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} Missing`);
+		const privateFailedProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/private failed" },
+			{ workspacePath },
+		) as { message: string };
+		expect(privateFailedProseSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} failed`);
+		const privateNotFoundProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/private not found" },
+			{ workspacePath },
+		) as { message: string };
+		expect(privateNotFoundProseSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} not found`);
+		const privateExistsProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/private exists" },
+			{ workspacePath },
+		) as { message: string };
+		expect(privateExistsProseSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} exists`);
+		const multiWordPathThenProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/my project data missing" },
+			{ workspacePath },
+		) as { message: string };
+		expect(multiWordPathThenProseSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} missing`);
+		const privateDataThenProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/private data missing" },
+			{ workspacePath },
+		) as { message: string };
+		expect(privateDataThenProseSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} missing`);
+		const privateKeySanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/private key" },
+			{ workspacePath },
+		) as { message: string };
+		expect(privateKeySanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} key`);
+		const backtickedPrivateKeySanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix `/Users/jordan/private key`" },
+			{ workspacePath },
+		) as { message: string };
+		expect(backtickedPrivateKeySanitized.message).toBe(`prefix \`${IROH_REMOTE_REDACTED_HOST_PATH}\``);
+		const clientFilesSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/client files" },
+			{ workspacePath },
+		) as { message: string };
+		expect(clientFilesSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} files`);
+		const privateCrashedProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/private crashed badly" },
+			{ workspacePath },
+		) as { message: string };
+		expect(privateCrashedProseSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} crashed badly`);
+		const fooUnavailableSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/foo unavailable" },
+			{ workspacePath },
+		) as { message: string };
+		expect(fooUnavailableSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} unavailable`);
+		const tildeUserSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix ~jordan/.volt/auth.json" },
+			{ workspacePath },
+		) as { message: string };
+		expect(tildeUserSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH}`);
+		const configSpacedProseSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "prefix /Users/jordan/.config/app data missing" },
+			{ workspacePath },
+		) as { message: string };
+		expect(configSpacedProseSanitized.message).toBe(`prefix ${IROH_REMOTE_REDACTED_HOST_PATH} missing`);
+		const singleQuotedSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "path '/Users/jordan/.volt/auth.json' done" },
+			{ workspacePath },
+		) as { message: string };
+		expect(singleQuotedSanitized.message).toBe(`path '${IROH_REMOTE_REDACTED_HOST_PATH}' done`);
+		const backtickedSanitized = sanitizeIrohRemoteOutbound(
+			{ message: "path `/Users/jordan/.volt/auth.json` done" },
+			{ workspacePath },
+		) as { message: string };
+		expect(backtickedSanitized.message).toBe(`path \`${IROH_REMOTE_REDACTED_HOST_PATH}\` done`);
+
+		const keyEdgeSanitized = sanitizeIrohRemoteOutbound(
+			{
+				"/Users/jordan/private key": "key",
+				__proto__: { leaked: true },
+			},
+			{ workspacePath },
+		) as Record<string, unknown>;
+		expect(keyEdgeSanitized).toEqual({
+			[IROH_REMOTE_REDACTED_HOST_PATH]: "key",
+			__proto__: { leaked: true },
+		});
+		expect(Object.getPrototypeOf(keyEdgeSanitized)).toBeNull();
+
+		const ordinaryDataSanitized = sanitizeIrohRemoteOutbound(
+			{ type: "response", data: "/Users/jordan/.volt/auth.json" },
+			{ workspacePath },
+		) as { data: string };
+		expect(ordinaryDataSanitized.data).toBe(IROH_REMOTE_REDACTED_HOST_PATH);
+
+		const opaqueContentSanitized = sanitizeIrohRemoteOutbound(
+			{
+				content: [
+					{
+						type: "text",
+						text: "Read /Users/jordan/.volt/auth.json",
+						textSignature: "/opaque/text-signature",
+					},
+					{
+						type: "thinking",
+						thinking: "Saw /Users/jordan/.volt/auth.json",
+						thinkingSignature: "/opaque/thinking-signature",
+					},
+					{
+						type: "toolCall",
+						id: "tool-call-1",
+						name: "read",
+						arguments: { path: "/Users/jordan/.volt/auth.json" },
+						thoughtSignature: "/opaque/thought-signature",
+					},
+				],
+			},
+			{ workspacePath },
+		) as {
+			content: [
+				{ text: string; textSignature: string },
+				{ thinking: string; thinkingSignature: string },
+				{ arguments: { path: string }; thoughtSignature: string },
+			];
+		};
+		expect(opaqueContentSanitized.content).toEqual([
+			{
+				type: "text",
+				text: `Read ${IROH_REMOTE_REDACTED_HOST_PATH}`,
+				textSignature: "/opaque/text-signature",
+			},
+			{
+				type: "thinking",
+				thinking: `Saw ${IROH_REMOTE_REDACTED_HOST_PATH}`,
+				thinkingSignature: "/opaque/thinking-signature",
+			},
+			{
+				type: "toolCall",
+				id: "tool-call-1",
+				name: "read",
+				arguments: { path: IROH_REMOTE_REDACTED_HOST_PATH },
+				thoughtSignature: "/opaque/thought-signature",
+			},
+		]);
+
+		const remoteWorkspaceSanitized = sanitizeIrohRemoteOutbound({ cwd: "/workspace/src" }, { workspacePath }) as {
+			cwd: string;
+		};
+		expect(remoteWorkspaceSanitized.cwd).toBe("/workspace/src");
+	});
+
+	test("sanitizes remote outbound JSONL lines for sidecar spawned children", () => {
+		const line = `${JSON.stringify({
+			type: "response",
+			command: "get_messages",
+			success: true,
+			data: {
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "text",
+								text: "Read /Users/jordan/project/src/index.ts and /Users/jordan/.volt/auth.json",
+							},
+							{
+								type: "image",
+								data: "/9j/4AAQSkZJRgABAQAAAQABAAD=",
+								mimeType: "image/jpeg",
+							},
+						],
+					},
+				],
+			},
+		})}\n`;
+
+		expect(sanitizeIrohRemoteOutboundJsonLine(line, { workspacePath: "/Users/jordan/project" })).toBe(
+			`${JSON.stringify({
+				type: "response",
+				command: "get_messages",
+				success: true,
+				data: {
+					messages: [
+						{
+							role: "assistant",
+							content: [
+								{ type: "text", text: `Read /workspace/src/index.ts and ${IROH_REMOTE_REDACTED_HOST_PATH}` },
+								{
+									type: "image",
+									data: "/9j/4AAQSkZJRgABAQAAAQABAAD=",
+									mimeType: "image/jpeg",
+								},
+							],
+						},
+					],
+				},
+			})}\n`,
+		);
+		expect(sanitizeIrohRemoteOutboundJsonLine("not json\n", { workspacePath: "/Users/jordan/project" })).toBe(
+			"not json\n",
+		);
+		expect(
+			sanitizeIrohRemoteOutboundJsonLine(
+				"not json path:/Users/jordan/.volt/agent/auth.json pipe |/Users/jordan/.volt/agent/auth.json| file:file://localhost/Users/jordan/.volt/agent/auth.json url:https://example.com/Users/jordan/file\n",
+				{
+					workspacePath: "/Users/jordan/project",
+				},
+			),
+		).toBe(
+			`not json path:${IROH_REMOTE_REDACTED_HOST_PATH} pipe |${IROH_REMOTE_REDACTED_HOST_PATH}| file:${IROH_REMOTE_REDACTED_HOST_PATH} url:https://example.com/Users/jordan/file\n`,
+		);
+		expect(
+			sanitizeIrohRemoteOutboundJsonLine("not json 1:/Users/jordan/.volt/agent/auth.json\n", {
+				workspacePath: "/Users/jordan/project",
+			}),
+		).toBe(`not json 1:${IROH_REMOTE_REDACTED_HOST_PATH}\n`);
+		expect(
+			sanitizeIrohRemoteOutboundJsonLine('not json {\\"message\\":\\"\\\\\\\\server\\\\share\\\\auth.json\\"}\n', {
+				workspacePath: "/Users/jordan/project",
+			}),
+		).toBe(`not json {\\"message\\":\\"${IROH_REMOTE_REDACTED_HOST_PATH}\\"}\n`);
+	});
+
+	test("pipes remote outbound JSONL chunks through the shared sanitizer", async () => {
+		const workspacePath = "/Users/jordan/project";
+		const eventLine = `${JSON.stringify({
+			type: "response",
+			command: "get_state",
+			success: true,
+			data: {
+				cwd: `${workspacePath}/src`,
+				message: `using /Users/jordan/.volt/agent/sessions/project/session.jsonl`,
+			},
+		})}\n`;
+		const partialLine = "child failed at /Users/jordan/.volt/agent/auth.json";
+		const writes: string[] = [];
+		const observedLines: string[] = [];
+
+		async function* readable(): AsyncIterable<string | Uint8Array> {
+			yield Buffer.from(eventLine.slice(0, 19), "utf8");
+			yield Buffer.from(eventLine.slice(19), "utf8");
+			yield partialLine;
+		}
+
+		await pipeIrohRemoteOutboundJsonlReadable(readable(), {
+			workspacePath,
+			writeLine(line) {
+				writes.push(line);
+			},
+			onLine(line) {
+				observedLines.push(line);
+			},
+		});
+
+		expect(writes).toEqual([
+			`${JSON.stringify({
+				type: "response",
+				command: "get_state",
+				success: true,
+				data: {
+					cwd: "/workspace/src",
+					message: `using ${IROH_REMOTE_REDACTED_SESSION_FILE}`,
+				},
+			})}\n`,
+			`child failed at ${IROH_REMOTE_REDACTED_HOST_PATH}`,
+		]);
+		expect(observedLines).toEqual(writes);
+	});
+
+	test("wraps RPC transports with the remote outbound filter", () => {
+		const inner = new ManualRpcTransport();
+		const transport = createIrohRemoteOutboundFilteredRpcTransport({
+			transport: inner,
+			workspacePath: "/Users/jordan/project",
+		});
+
+		transport.write({
+			type: "response",
+			command: "get_session_stats",
+			success: true,
+			data: {
+				sessionFile: "/Users/jordan/.volt/agent/sessions/project/session.jsonl",
+				cwd: "/Users/jordan/project",
+			},
+		});
+
+		expect(inner.writes).toEqual([
+			{
+				type: "response",
+				command: "get_session_stats",
+				success: true,
+				data: { cwd: "/workspace" },
+			},
+		]);
 	});
 
 	test("surfaces asynchronous filter rejection write failures from close", async () => {

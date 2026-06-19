@@ -1,9 +1,15 @@
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
-import { createIrohRemoteRpcTransport } from "../../core/remote/iroh/index.ts";
+import {
+	createIrohRemoteOutboundFilteredRpcTransport,
+	createIrohRemoteRpcTransport,
+} from "../../core/remote/iroh/index.ts";
 import type { IrohRpcTransportOptions, RpcCloseHandler, RpcLineHandler, RpcTransport } from "../../core/rpc/index.ts";
 import { runRpcMode } from "./rpc-mode.ts";
 
-export interface IrohRemoteRpcModeOptions extends IrohRpcTransportOptions {}
+export interface IrohRemoteRpcModeOptions extends IrohRpcTransportOptions {
+	remoteWorkspacePath?: string;
+	workspacePath: string;
+}
 
 interface PendingIrohRemoteCommand {
 	command: string;
@@ -28,7 +34,11 @@ export function runIrohRemoteRpcMode(
 ): Promise<void> {
 	return runRpcMode(runtimeHost, {
 		transport: createIrohRemoteCloseDeferringRpcTransport({
-			transport: createIrohRemoteRpcTransport(options),
+			transport: createIrohRemoteOutboundFilteredRpcTransport({
+				remoteWorkspacePath: options.remoteWorkspacePath,
+				transport: createIrohRemoteRpcTransport(options),
+				workspacePath: options.workspacePath,
+			}),
 			waitForPromptCompletion: () => runtimeHost.session.waitForIdle(),
 		}),
 		exitProcess: false,

@@ -34,6 +34,7 @@ import type { ModelRegistry } from "./core/model-registry.ts";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
+import { IrohRemoteAuditLogger, IrohRemoteHostStateManager } from "./core/remote/iroh/index.ts";
 import type { CreateAgentSessionOptions } from "./core/sdk.ts";
 import {
 	formatMissingSessionCwdPrompt,
@@ -79,8 +80,10 @@ async function readPipedStdin(): Promise<string | undefined> {
 function printRemoteCommandHelp(): void {
 	console.error(`Usage:
   volt remote host [options]
+  volt remote clients [options]
+  volt remote revoke <node-id> [options]
 
-Options are forwarded to the temporary Iroh sidecar host. Common options:
+Host options are forwarded to the temporary Iroh sidecar host. Common options:
   --workspace <name=path>       Workspace exposed to the client
   --relay <disabled|default>    Iroh relay preset
   --state <path>                Host state path
@@ -90,7 +93,148 @@ Options are forwarded to the temporary Iroh sidecar host. Common options:
   --approve                     Trust project-local Volt settings/resources
   --no-pairing                  Reject unpaired clients
   --once                        Exit after first client disconnects
+
+Client management options:
+  --state <path>                Host state path
+  --audit <path>                Audit JSONL path for revoke
 `);
+}
+
+interface RemoteManagementArgs {
+	auditPath?: string;
+	error?: string;
+	help: boolean;
+	positionals: string[];
+	statePath: string;
+}
+
+function getDefaultIrohRemoteStatePath(): string {
+	return join(getAgentDir(), "remote", "iroh-sidecar-host.json");
+}
+
+function getDefaultIrohRemoteAuditPath(statePath: string): string {
+	return statePath.endsWith(".json")
+		? `${statePath.slice(0, -".json".length)}.audit.jsonl`
+		: `${statePath}.audit.jsonl`;
+}
+
+function argsIncludeOption(args: readonly string[], option: string): boolean {
+	return args.some((arg) => arg === option || arg.startsWith(`${option}=`));
+}
+
+function addDefaultRemoteHostStateArgs(args: readonly string[]): string[] {
+	if (argsIncludeOption(args, "--state")) {
+		return [...args];
+	}
+	return ["--state", getDefaultIrohRemoteStatePath(), ...args];
+}
+
+function parseRemoteManagementArgs(args: readonly string[]): RemoteManagementArgs {
+	const positionals: string[] = [];
+	let auditPath: string | undefined;
+	let statePath = getDefaultIrohRemoteStatePath();
+
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--help" || arg === "-h") {
+			return { auditPath, help: true, positionals, statePath };
+		}
+
+		const eqIndex = arg.indexOf("=");
+		const flag = eqIndex === -1 ? arg : arg.slice(0, eqIndex);
+		const inlineValue = eqIndex === -1 ? undefined : arg.slice(eqIndex + 1);
+		if (flag === "--state" || flag === "--audit") {
+			const value = inlineValue ?? args[index + 1];
+			if (value === undefined || value.startsWith("-")) {
+				return { auditPath, error: `${flag} requires a value`, help: false, positionals, statePath };
+			}
+			if (inlineValue === undefined) {
+				index++;
+			}
+			if (flag === "--state") {
+				statePath = resolvePath(value);
+			} else {
+				auditPath = resolvePath(value);
+			}
+			continue;
+		}
+
+		if (arg.startsWith("-")) {
+			return { auditPath, error: `Unknown remote option: ${arg}`, help: false, positionals, statePath };
+		}
+		positionals.push(arg);
+	}
+
+	return { auditPath, help: false, positionals, statePath: resolvePath(statePath) };
+}
+
+async function handleRemoteClientsCommand(args: readonly string[]): Promise<void> {
+	const parsed = parseRemoteManagementArgs(args);
+	if (parsed.help) {
+		printRemoteCommandHelp();
+		return;
+	}
+	if (parsed.error) {
+		console.error(chalk.red(`Error: ${parsed.error}`));
+		process.exitCode = 1;
+		return;
+	}
+	if (parsed.positionals.length > 0) {
+		console.error(chalk.red(`Error: Unexpected remote clients argument: ${parsed.positionals[0]}`));
+		process.exitCode = 1;
+		return;
+	}
+
+	const stateManager = new IrohRemoteHostStateManager({ statePath: parsed.statePath });
+	console.log(JSON.stringify(await stateManager.listClients(), null, 2));
+}
+
+async function handleRemoteRevokeCommand(args: readonly string[]): Promise<void> {
+	const parsed = parseRemoteManagementArgs(args);
+	if (parsed.help) {
+		printRemoteCommandHelp();
+		return;
+	}
+	if (parsed.error) {
+		console.error(chalk.red(`Error: ${parsed.error}`));
+		process.exitCode = 1;
+		return;
+	}
+
+	const nodeId = parsed.positionals[0];
+	if (!nodeId) {
+		console.error(chalk.red("Error: Missing node id to revoke"));
+		process.exitCode = 1;
+		return;
+	}
+	if (parsed.positionals.length > 1) {
+		console.error(chalk.red(`Error: Unexpected remote revoke argument: ${parsed.positionals[1]}`));
+		process.exitCode = 1;
+		return;
+	}
+
+	const stateManager = new IrohRemoteHostStateManager({ statePath: parsed.statePath });
+	const result = await stateManager.revokeClient(nodeId);
+	const auditLogger = new IrohRemoteAuditLogger({
+		path: parsed.auditPath ?? getDefaultIrohRemoteAuditPath(parsed.statePath),
+	});
+	try {
+		await auditLogger.log({
+			type: "client_revoked",
+			clientNodeId: nodeId,
+			success: result.revoked,
+			error: result.revoked ? undefined : "client not found",
+		});
+	} catch {
+		// Audit logging is best-effort for local client management commands.
+	}
+
+	if (!result.revoked) {
+		console.error(chalk.red(`Error: No client found for ${nodeId}`));
+		process.exitCode = 1;
+		return;
+	}
+	console.error(`Revoked ${nodeId}`);
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -112,13 +256,21 @@ async function handleRemoteCommand(args: string[], options: { profile?: string }
 		printRemoteCommandHelp();
 		return true;
 	}
+	if (command === "clients") {
+		await handleRemoteClientsCommand(args.slice(2));
+		return true;
+	}
+	if (command === "revoke") {
+		await handleRemoteRevokeCommand(args.slice(2));
+		return true;
+	}
 	if (command !== "host") {
 		console.error(chalk.red(`Error: Unknown remote command: ${command}`));
 		printRemoteCommandHelp();
 		process.exitCode = 1;
 		return true;
 	}
-	const hostArgs = args.slice(2);
+	const hostArgs = addDefaultRemoteHostStateArgs(args.slice(2));
 	if (hostArgs.includes("--help") || hostArgs.includes("-h")) {
 		printRemoteCommandHelp();
 		return true;
