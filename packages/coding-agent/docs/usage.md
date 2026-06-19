@@ -173,6 +173,18 @@ These commands manage volt packages, not the volt CLI installation. To uninstall
 
 See [Volt Packages](packages.md) for package sources and security notes.
 
+### Remote Host
+
+```bash
+volt remote host --workspace volt=/path/to/repo
+volt remote clients
+volt remote revoke <node-id>
+```
+
+`volt remote host` exposes Volt RPC over Iroh using the optional `@number0/iroh` native adapter. The default remote tool allowlist is read-only (`read,grep,find,ls`); pass `--allow-tools` to change it.
+
+The remote host requires a Node.js package install or source checkout on a platform supported by `@number0/iroh`. Bun binary builds currently reject this command because the optional native Iroh adapter is not bundled.
+
 ### Modes
 
 | Flag | Description |

@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import iroh from "@number0/iroh";
+import iroh from "@number0/iroh/index.js";
 import {
 	assertIrohRemoteTicketNotExpired,
 	decodeIrohRemoteTicketPayload,

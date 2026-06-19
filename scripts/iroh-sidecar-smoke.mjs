@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { access, mkdtemp, rm } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,18 +8,19 @@ import { spawn } from "node:child_process";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
+const requireModule = createRequire(import.meta.url);
 const sidecarDir = join(repoRoot, "packages", "coding-agent", "examples", "remote", "iroh-sidecar");
-const hostScript = join(sidecarDir, "host.mjs");
+const hostScript = join(repoRoot, "packages", "coding-agent", "src", "remote", "iroh-host.mjs");
 const clientScript = join(sidecarDir, "client.mjs");
-const irohPackageJson = join(sidecarDir, "node_modules", "@number0", "iroh", "package.json");
 const SOURCE_IMPORT_CONDITION_ARGS = ["--conditions", "volt-source"];
 
 async function assertInstalled() {
 	try {
-		await access(irohPackageJson);
+		requireModule.resolve("@number0/iroh/package.json");
 	} catch {
-		throw new Error("Iroh sidecar dependencies are not installed. Run: npm run iroh:poc:install");
+		throw new Error("The optional @number0/iroh dependency is not installed. Run: npm run iroh:poc:install");
 	}
+	await access(hostScript);
 }
 
 function collectProcess(child) {
@@ -119,7 +121,7 @@ async function main() {
 			throw new Error(`Expected client output to contain ${JSON.stringify(expected)}, got:\n${clientOutput.stdout}`);
 		}
 		console.log(clientOutput.stdout.trim());
-		console.log("Iroh sidecar smoke test passed.");
+		console.log("Iroh remote host smoke test passed.");
 	} finally {
 		if (host && host.exitCode === null) host.kill();
 		await rm(stateDir, { force: true, recursive: true });

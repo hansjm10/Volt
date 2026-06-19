@@ -17,7 +17,7 @@ async function pathExists(path) {
 
 const [entrypoint, ...args] = process.argv.slice(2);
 if (!entrypoint) {
-	console.error("Missing sidecar entrypoint");
+	console.error("Missing remote example entrypoint");
 	process.exit(1);
 }
 

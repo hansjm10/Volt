@@ -56,7 +56,7 @@ For the full first-run flow, see [Quickstart](quickstart.md).
 
 - [SDK](sdk.md) - embed volt in Node.js applications.
 - [RPC mode](rpc.md) - integrate over stdin/stdout JSONL.
-- [Iroh remote access design](iroh-remote-access-design.md) - optional sidecar design for remote Volt access over Iroh.
+- [Iroh remote access design](iroh-remote-access-design.md) - optional remote host design for Volt access over Iroh.
 - [JSON event stream mode](json.md) - print mode with structured events.
 - [TUI components](tui.md) - build custom terminal UI for extensions.
 

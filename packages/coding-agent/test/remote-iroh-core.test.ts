@@ -63,9 +63,13 @@ class ManualRpcTransport implements RpcTransport {
 	closeCalls = 0;
 	flushCalls = 0;
 	waitForBackpressureCalls = 0;
+	writeError: Error | undefined;
 
 	write(value: object): void | Promise<void> {
 		this.writes.push(value);
+		if (this.writeError) {
+			throw this.writeError;
+		}
 		return this.writeResults.shift();
 	}
 
@@ -1087,13 +1091,44 @@ describe("Iroh remote core helpers", () => {
 				type: "response",
 				command: "bash",
 				success: false,
-				error: "RPC command not allowed over remote sidecar: bash",
+				error: "RPC command not allowed over remote host: bash",
 			},
 			expect.objectContaining({ type: "response", command: "parse", success: false }),
 		]);
 		expect(inner.waitForBackpressureCalls).toBe(1);
 		expect(inner.flushCalls).toBe(1);
 		expect(inner.closeCalls).toBe(1);
+	});
+
+	test("routes remote command filter rejections through outbound and close-deferring layers", async () => {
+		const inner = new ManualRpcTransport();
+		const transport = createIrohRemoteFilteredRpcTransport({
+			transport: createIrohRemoteCloseDeferringRpcTransport({
+				transport: createIrohRemoteOutboundFilteredRpcTransport({
+					transport: inner,
+					workspacePath: "/Users/jordan/project",
+				}),
+				waitForPromptCompletion: () => Promise.resolve(),
+			}),
+		});
+		const forwardedLines: string[] = [];
+		transport.onLine((line) => {
+			forwardedLines.push(line);
+		});
+
+		inner.emitLine(JSON.stringify({ id: "private-command", type: "/Users/jordan/private" }));
+		await transport.waitForBackpressure?.();
+
+		expect(forwardedLines).toEqual([]);
+		expect(inner.writes).toEqual([
+			expect.objectContaining({
+				id: "private-command",
+				type: "response",
+				command: IROH_REMOTE_REDACTED_HOST_PATH,
+				success: false,
+				error: `RPC command not allowed over remote host: ${IROH_REMOTE_REDACTED_HOST_PATH}`,
+			}),
+		]);
 	});
 
 	test("sanitizes remote outbound host paths", () => {
@@ -1104,6 +1139,7 @@ describe("Iroh remote core helpers", () => {
 
 		const sanitized = sanitizeIrohRemoteOutbound(
 			{
+				id: "/Users/jordan/private/request-id",
 				type: "response",
 				command: "get_state",
 				success: true,
@@ -1136,6 +1172,7 @@ describe("Iroh remote core helpers", () => {
 			},
 			{ workspacePath },
 		) as {
+			id: string;
 			data: {
 				details: Record<string, unknown>;
 				keyedSpacedPath: Record<string, string>;
@@ -1155,6 +1192,7 @@ describe("Iroh remote core helpers", () => {
 			};
 		};
 
+		expect(sanitized.id).toBe("/Users/jordan/private/request-id");
 		expect(sanitized.data.sessionFile).toBeUndefined();
 		expect(sanitized.data.sessionPath).toBe(IROH_REMOTE_REDACTED_HOST_PATH);
 		expect(sanitized.data.tildeSessionPath).toBe(IROH_REMOTE_REDACTED_SESSION_FILE);
@@ -1446,6 +1484,7 @@ describe("Iroh remote core helpers", () => {
 
 	test("sanitizes remote outbound JSONL lines for sidecar spawned children", () => {
 		const line = `${JSON.stringify({
+			id: "/Users/jordan/private/request-id",
 			type: "response",
 			command: "get_messages",
 			success: true,
@@ -1471,6 +1510,7 @@ describe("Iroh remote core helpers", () => {
 
 		expect(sanitizeIrohRemoteOutboundJsonLine(line, { workspacePath: "/Users/jordan/project" })).toBe(
 			`${JSON.stringify({
+				id: "/Users/jordan/private/request-id",
 				type: "response",
 				command: "get_messages",
 				success: true,
@@ -1630,6 +1670,56 @@ describe("Iroh remote core helpers", () => {
 		expect(closed).toBe(true);
 	});
 
+	test("defers clean remote close until unknown command error responses are written", async () => {
+		const inner = new ManualRpcTransport();
+		const transport = createIrohRemoteCloseDeferringRpcTransport({
+			transport: inner,
+			waitForPromptCompletion: () => Promise.resolve(),
+		});
+		let closed = false;
+		transport.onLine(() => {});
+		transport.onClose?.(() => {
+			closed = true;
+		});
+
+		inner.emitLine(JSON.stringify({ id: "unknown-1", type: "unknown_rpc" }));
+		inner.emitClose();
+		await nextTick();
+		expect(closed).toBe(false);
+
+		transport.write({ id: "unknown-1", type: "response", command: "unknown_rpc", success: false });
+		await nextTick();
+
+		expect(closed).toBe(true);
+	});
+
+	test("does not hang clean remote close after synchronous response write failures", async () => {
+		const inner = new ManualRpcTransport();
+		const writeError = new Error("send closed");
+		const transport = createIrohRemoteCloseDeferringRpcTransport({
+			transport: inner,
+			waitForPromptCompletion: () => Promise.resolve(),
+		});
+		let closed = false;
+		transport.onLine(() => {});
+		transport.onClose?.(() => {
+			closed = true;
+		});
+
+		inner.emitLine(JSON.stringify({ id: "state-1", type: "get_state" }));
+		inner.emitClose();
+		await nextTick();
+		expect(closed).toBe(false);
+
+		inner.writeError = writeError;
+		expect(() => transport.write({ id: "state-1", type: "response", command: "get_state", success: true })).toThrow(
+			writeError,
+		);
+		await nextTick();
+
+		expect(closed).toBe(true);
+	});
+
 	test("defers clean remote close until prompt completion after preflight success", async () => {
 		const inner = new ManualRpcTransport();
 		const promptCompletion = createDeferredVoid();
@@ -1689,6 +1779,48 @@ describe("Iroh remote core helpers", () => {
 		},
 	);
 
+	test("matches duplicate id-less prompt-like responses one pending command at a time", async () => {
+		const inner = new ManualRpcTransport();
+		const firstCompletion = createDeferredVoid();
+		const secondCompletion = createDeferredVoid();
+		const completions = [firstCompletion, secondCompletion];
+		const transport = createIrohRemoteCloseDeferringRpcTransport({
+			transport: inner,
+			waitForPromptCompletion: () => {
+				const completion = completions.shift();
+				if (!completion) {
+					throw new Error("unexpected prompt completion wait");
+				}
+				return completion.promise;
+			},
+		});
+		let closed = false;
+		transport.onLine(() => {});
+		transport.onClose?.(() => {
+			closed = true;
+		});
+
+		inner.emitLine(JSON.stringify({ type: "steer", message: "first" }));
+		inner.emitLine(JSON.stringify({ type: "steer", message: "second" }));
+		inner.emitClose();
+		await nextTick();
+		expect(closed).toBe(false);
+
+		transport.write({ type: "response", command: "steer", success: true });
+		transport.write({ type: "response", command: "steer", success: true });
+		await nextTick();
+		expect(closed).toBe(false);
+
+		firstCompletion.resolve();
+		await nextTick();
+		expect(closed).toBe(false);
+
+		secondCompletion.resolve();
+		await nextTick();
+
+		expect(closed).toBe(true);
+	});
+
 	test("filters remote RPC commands before forwarding to Volt RPC", () => {
 		const prompt = getIrohRemoteRpcFilterResult(JSON.stringify({ id: "prompt-1", type: "prompt", message: "hi" }));
 		if (!prompt.allowed) {
@@ -1705,7 +1837,7 @@ describe("Iroh remote core helpers", () => {
 			type: "response",
 			command: "bash",
 			success: false,
-			error: "RPC command not allowed over remote sidecar: bash",
+			error: "RPC command not allowed over remote host: bash",
 		});
 		expect(serializeIrohRemoteRpcFilterRejection(rejected.response)).toBe(`${JSON.stringify(rejected.response)}\n`);
 
@@ -1715,5 +1847,29 @@ describe("Iroh remote core helpers", () => {
 		}
 		expect(parseFailure.response.command).toBe("parse");
 		expect(parseFailure.response.error).toContain("Failed to parse command");
+
+		const missingType = getIrohRemoteRpcFilterResult(JSON.stringify({ id: "missing-type" }));
+		if (missingType.allowed) {
+			throw new Error("missing type should have been rejected");
+		}
+		expect(missingType.response).toEqual({
+			id: "missing-type",
+			type: "response",
+			command: "unknown",
+			success: false,
+			error: "RPC command must be a JSON object with a string type",
+		});
+
+		const numericType = getIrohRemoteRpcFilterResult(JSON.stringify({ id: "numeric-type", type: 1 }));
+		if (numericType.allowed) {
+			throw new Error("numeric type should have been rejected");
+		}
+		expect(numericType.response).toEqual({
+			id: "numeric-type",
+			type: "response",
+			command: "unknown",
+			success: false,
+			error: "RPC command must be a JSON object with a string type",
+		});
 	});
 });

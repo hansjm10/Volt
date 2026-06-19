@@ -155,7 +155,9 @@ for platform in "${PLATFORMS[@]}"; do
     cp -r dist/core/export-html "$OUTPUT_DIR/$platform/"
     cp -r docs "$OUTPUT_DIR/$platform/"
     cp -r examples "$OUTPUT_DIR/$platform/"
-    rm -rf "$OUTPUT_DIR/$platform/examples/remote/iroh-sidecar/node_modules"
+    cp examples/README.binary.md "$OUTPUT_DIR/$platform/examples/README.md"
+    rm -f "$OUTPUT_DIR/$platform/examples/README.binary.md"
+    rm -rf "$OUTPUT_DIR/$platform/examples/remote/iroh-sidecar"
 
     case "$platform" in
         darwin-arm64)

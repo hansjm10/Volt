@@ -8,7 +8,11 @@ const packages = [
 	{ directory: "packages/ai", name: "@earendil-works/volt-ai" },
 	{ directory: "packages/agent", name: "@earendil-works/volt-agent-core" },
 	{ directory: "packages/tui", name: "@earendil-works/volt-tui" },
-	{ directory: "packages/coding-agent", name: "@earendil-works/volt-coding-agent" },
+	{
+		directory: "packages/coding-agent",
+		name: "@earendil-works/volt-coding-agent",
+		requiredPackFiles: ["dist/remote/iroh-host.mjs", "dist/remote/iroh-native-adapter.cjs"],
+	},
 ];
 
 const dryRun = process.argv.includes("--dry-run");
@@ -49,9 +53,16 @@ function assertBuildOutputExists(directory) {
 	}
 }
 
-function validatePack(directory) {
+function validatePack(pkg) {
+	const directory = pkg.directory;
 	const result = run("npm", ["pack", "--dry-run", "--ignore-scripts", "--json"], { capture: true, cwd: directory });
 	const packed = JSON.parse(result.stdout)[0];
+	const packedPaths = new Set(packed.files.map((file) => file.path));
+	for (const requiredFile of pkg.requiredPackFiles ?? []) {
+		if (!packedPaths.has(requiredFile)) {
+			throw new Error(`${pkg.name} pack output is missing required file: ${requiredFile}. Run npm run build before publishing.`);
+		}
+	}
 	console.log(`  ${packed.filename}: ${packed.files.length} files, ${packed.size} bytes packed, ${packed.unpackedSize} bytes unpacked`);
 }
 
@@ -100,7 +111,7 @@ for (const pkg of packages) {
 		} else {
 			console.log(`${pkg.name}@${version} is not published; validating package contents before publish.`);
 		}
-		validatePack(pkg.directory);
+		validatePack(pkg);
 		console.log();
 		continue;
 	}
@@ -110,6 +121,7 @@ for (const pkg of packages) {
 		continue;
 	}
 
+	validatePack(pkg);
 	run("npm", ["publish", "--access", "public", "--provenance", "--ignore-scripts"], { cwd: pkg.directory });
 	console.log();
 }

@@ -244,7 +244,7 @@ ${chalk.bold("Commands:")}
   ${APP_NAME} update [source|self|volt]   Update volt and installed extensions
   ${APP_NAME} list                      List installed extensions from settings
   ${APP_NAME} config                    Open TUI to enable/disable package resources
-  ${APP_NAME} remote host [options]     Host Volt RPC over Iroh using the temporary sidecar adapter
+  ${APP_NAME} remote host [options]     Host Volt RPC over Iroh (Node package/source installs only)
   ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list
 
 ${chalk.bold("Options:")}

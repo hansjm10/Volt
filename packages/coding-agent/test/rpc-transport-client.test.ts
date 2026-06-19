@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import type { ExtensionBindings } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+import { createIrohRemoteFilteredRpcTransport } from "../src/core/remote/iroh/index.ts";
 import { createLoopbackRpcTransportPair, type RpcExtensionUIRequest } from "../src/core/rpc/index.ts";
 import { createInProcessRpcClient } from "../src/modes/rpc/in-process-rpc-client.ts";
 import { createIrohRemoteCloseDeferringRpcTransport } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
@@ -203,7 +204,113 @@ describe("runRpcMode", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
-	test("does not defer startup closes behind queued Iroh commands", async () => {
+	test("defers startup closes until queued Iroh commands drain", async () => {
+		const pair = createLoopbackRpcTransportPair();
+		const dispose = vi.fn(async () => {});
+		const responses: Array<Record<string, unknown>> = [];
+		let finishStartup = () => {};
+		const startupBlock = new Promise<void>((resolve) => {
+			finishStartup = resolve;
+		});
+		pair.client.onLine((line) => {
+			responses.push(JSON.parse(line) as Record<string, unknown>);
+		});
+		const runtimeHost = createRuntimeHost(dispose, async () => {
+			await startupBlock;
+		});
+		const transport = createIrohRemoteFilteredRpcTransport({
+			transport: createIrohRemoteCloseDeferringRpcTransport({
+				transport: pair.server,
+				waitForPromptCompletion: () => Promise.resolve(),
+			}),
+		});
+		const modePromise = runRpcMode(runtimeHost, { transport, exitProcess: false });
+		void modePromise.catch(() => {});
+		let modeSettled = false;
+		void modePromise.then(
+			() => {
+				modeSettled = true;
+			},
+			() => {
+				modeSettled = true;
+			},
+		);
+
+		await Promise.resolve();
+		pair.client.write({ id: "queued-state", type: "get_state" });
+		pair.client.close();
+		await Promise.resolve();
+
+		expect(modeSettled).toBe(false);
+		finishStartup();
+
+		await expect(modePromise).resolves.toBeUndefined();
+		expect(responses).toContainEqual(
+			expect.objectContaining({
+				id: "queued-state",
+				type: "response",
+				command: "get_state",
+				success: true,
+			}),
+		);
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	test("defers startup closes until filtered Iroh rejections drain", async () => {
+		const pair = createLoopbackRpcTransportPair();
+		const dispose = vi.fn(async () => {});
+		const responses: Array<Record<string, unknown>> = [];
+		let finishStartup = () => {};
+		const startupBlock = new Promise<void>((resolve) => {
+			finishStartup = resolve;
+		});
+		pair.client.onLine((line) => {
+			responses.push(JSON.parse(line) as Record<string, unknown>);
+		});
+		const runtimeHost = createRuntimeHost(dispose, async () => {
+			await startupBlock;
+		});
+		const transport = createIrohRemoteFilteredRpcTransport({
+			transport: createIrohRemoteCloseDeferringRpcTransport({
+				transport: pair.server,
+				waitForPromptCompletion: () => Promise.resolve(),
+			}),
+		});
+		const modePromise = runRpcMode(runtimeHost, { transport, exitProcess: false });
+		void modePromise.catch(() => {});
+		let modeSettled = false;
+		void modePromise.then(
+			() => {
+				modeSettled = true;
+			},
+			() => {
+				modeSettled = true;
+			},
+		);
+
+		await Promise.resolve();
+		pair.client.write({ id: "missing-type" });
+		pair.client.close();
+		await vi.waitFor(() => {
+			expect(responses).toContainEqual(
+				expect.objectContaining({
+					id: "missing-type",
+					type: "response",
+					command: "unknown",
+					success: false,
+				}),
+			);
+		});
+		await Promise.resolve();
+
+		expect(modeSettled).toBe(false);
+		finishStartup();
+
+		await expect(modePromise).resolves.toBeUndefined();
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	test("does not defer startup closes without queued Iroh commands", async () => {
 		const pair = createLoopbackRpcTransportPair();
 		const dispose = vi.fn(async () => {});
 		const startupRequest = new Promise<Extract<RpcExtensionUIRequest, { method: "confirm" }>>((resolve) => {
@@ -229,10 +336,93 @@ describe("runRpcMode", () => {
 		void modePromise.catch(() => {});
 
 		await startupRequest;
-		pair.client.write({ id: "queued-state", type: "get_state" });
 		pair.client.close();
 
 		await expect(modePromise).rejects.toThrow("RPC transport closed during startup");
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	test("sanitizes malformed unknown command responses", async () => {
+		const pair = createLoopbackRpcTransportPair();
+		const dispose = vi.fn(async () => {});
+		const responses: Array<Record<string, unknown>> = [];
+		pair.client.onLine((line) => {
+			responses.push(JSON.parse(line) as Record<string, unknown>);
+		});
+		const runtimeHost = createRuntimeHost(dispose);
+		const modePromise = runRpcMode(runtimeHost, { transport: pair.server, exitProcess: false });
+
+		pair.client.write({ id: 1, type: "get_state" });
+		await vi.waitFor(() => {
+			expect(responses).toContainEqual(
+				expect.objectContaining({
+					type: "response",
+					command: "get_state",
+					success: true,
+				}),
+			);
+		});
+
+		const stateResponse = responses.find((event) => event.command === "get_state");
+		expect(stateResponse).toBeDefined();
+		expect(stateResponse).not.toHaveProperty("id");
+
+		pair.client.write({ id: 1, type: "unknown_rpc" });
+		await vi.waitFor(() => {
+			expect(responses).toContainEqual(
+				expect.objectContaining({
+					type: "response",
+					command: "unknown_rpc",
+					success: false,
+					error: "Unknown command: unknown_rpc",
+				}),
+			);
+		});
+
+		const response = responses.find((event) => event.command === "unknown_rpc");
+		expect(response).toBeDefined();
+		expect(response).not.toHaveProperty("id");
+
+		pair.client.write({ id: "missing-type" });
+		await vi.waitFor(() => {
+			expect(responses).toContainEqual(
+				expect.objectContaining({
+					id: "missing-type",
+					type: "response",
+					command: "unknown",
+					success: false,
+					error: "Unknown command: unknown",
+				}),
+			);
+		});
+
+		pair.client.write({ id: "number-type", type: 1 });
+		await vi.waitFor(() => {
+			expect(responses).toContainEqual(
+				expect.objectContaining({
+					id: "number-type",
+					type: "response",
+					command: "unknown",
+					success: false,
+					error: "Unknown command: unknown",
+				}),
+			);
+		});
+
+		pair.client.write(null as unknown as object);
+		await vi.waitFor(() => {
+			expect(responses).toContainEqual(
+				expect.objectContaining({
+					type: "response",
+					command: "unknown",
+					success: false,
+					error: "Unknown command: unknown",
+				}),
+			);
+		});
+
+		pair.client.close();
+		await expect(modePromise).resolves.toBeUndefined();
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 });

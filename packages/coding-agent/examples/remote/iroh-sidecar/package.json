@@ -1,16 +1,14 @@
 {
-  "name": "volt-iroh-sidecar-poc",
+  "name": "volt-iroh-remote-demo",
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "Proof of concept for tunneling Volt RPC over Iroh",
+  "description": "Demo clients for tunneling Volt RPC over Iroh",
   "scripts": {
-    "host": "node source-aware-run.mjs host.mjs",
     "client": "node source-aware-run.mjs client.mjs",
     "fake-rpc": "node fake-rpc.mjs"
   },
   "dependencies": {
-    "@number0/iroh": "1.0.0",
-    "proper-lockfile": "4.1.2"
+    "@number0/iroh": "1.0.0"
   }
 }

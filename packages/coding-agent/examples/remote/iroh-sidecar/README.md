@@ -1,8 +1,8 @@
-# Iroh sidecar proof of concept
+# Iroh remote demo clients
 
 This example tunnels Volt RPC JSONL over an Iroh QUIC bidirectional stream.
 
-The PoC keeps the native Iroh dependency outside Volt core while importing Volt's shared Iroh protocol helpers for tickets, state, authorization, handshakes, and command filtering. `host.mjs` accepts an Iroh connection, validates pairing, and either bridges to a child RPC process or runs the source checkout's Volt runtime in-process with `--integrated-volt`. The default child is `fake-rpc.mjs` so the network bridge can be tested without provider credentials.
+The product host lives in Volt itself: `volt remote host` launches `packages/coding-agent/src/remote/iroh-host.mjs` from source checkouts, or the copied `dist/remote/iroh-host.mjs` from package installs. This directory keeps demo clients, fake-RPC fixtures, and compatibility wrappers for local remote-host testing.
 
 ## Install
 
@@ -12,15 +12,13 @@ From the repository root:
 npm run iroh:poc:install
 ```
 
-Or from this directory:
+For direct demo-client commands from this directory after the repository root or containing package has already been installed:
 
 ```bash
 npm install --ignore-scripts
 ```
 
-`@number0/iroh` is a native package with optional prebuilt platform packages. Keeping it in this example package avoids adding Iroh to Volt's default install path.
-
-If a root script says the Iroh sidecar dependencies are not installed, run `npm run iroh:poc:install` on that machine.
+`@number0/iroh` is now an optional dependency of `@earendil-works/volt-coding-agent`. Host commands use the product package install, so run root install before `volt remote host` or `npm run iroh:poc:host`. If `volt remote host` reports that the optional native adapter is unavailable, reinstall with optional dependencies enabled for the current platform. The example package can still install the dependency locally for direct client demos.
 
 ## Root scripts
 
@@ -29,7 +27,7 @@ From the repository root:
 ```bash
 npm run iroh:poc:smoke                  # local fake-RPC smoke test
 npm run iroh:poc:test                   # local fake-RPC scenario tests
-npm run iroh:poc:host                   # fake-RPC host
+npm run iroh:poc:host                   # product host with the fake-RPC child
 npm run iroh:poc:host:volt              # integrated source Volt host for this checkout
 npm run iroh:poc:client -- "<ticket>"    # one-shot client
 npm run iroh:poc:client -- "<ticket>" --interactive  # persistent prompt loop
@@ -48,7 +46,7 @@ Use `npm run --silent ...` if you want stdout to contain only the ticket or clie
 
 ## Local fake-RPC scenario tests
 
-Run the automated local scenario suite when changing the sidecar bridge:
+Run the automated local scenario suite when changing the remote host bridge:
 
 ```bash
 npm run iroh:poc:test
@@ -61,7 +59,7 @@ The suite starts local host/client processes with isolated temporary state and c
 Terminal 1:
 
 ```bash
-npm run host -- --once
+npm run iroh:poc:host -- --once
 ```
 
 Copy the printed `volt+iroh://v1/...` ticket.
@@ -69,13 +67,13 @@ Copy the printed `volt+iroh://v1/...` ticket.
 Terminal 2:
 
 ```bash
-npm run client -- "<ticket>" --message "hello from another device"
+npm run iroh:poc:client -- "<ticket>" --message "hello from another device"
 ```
 
 Or keep the connection open:
 
 ```bash
-npm run client -- "<ticket>" --interactive
+npm run iroh:poc:client -- "<ticket>" --interactive
 ```
 
 Expected output for the one-shot command:
@@ -87,7 +85,7 @@ fake RPC response over Iroh: hello from another device
 The first successful connection persists the host key, client key, workspace, and paired client allowlist in state files:
 
 ```text
-~/.volt/agent/remote/iroh-sidecar-host.json
+~/.volt/agent/remote/iroh-host.json
 ~/.volt/agent/remote/iroh-sidecar-client.json
 ```
 
@@ -100,19 +98,19 @@ The host prints a pairing ticket by default. A client that connects with that ti
 List paired clients:
 
 ```bash
-npm run host -- clients
+npm run iroh:poc:clients
 ```
 
 Revoke a client:
 
 ```bash
-npm run host -- revoke <client-node-id>
+npm run iroh:poc:revoke -- <client-node-id>
 ```
 
 After a client is paired, the host can run without accepting new clients:
 
 ```bash
-npm run host -- --no-pairing --once
+npm run iroh:poc:host -- --no-pairing --once
 ```
 
 In `--no-pairing` mode, the printed ticket contains no pairing secret. Only clients already stored in the host allowlist can connect.
@@ -134,26 +132,26 @@ node scripts/run-coding-agent-source.mjs remote host --workspace volt=. --allow-
 Terminal 1, when testing another source checkout as a spawned RPC child from this directory:
 
 ```bash
-npm run host -- --source-volt /path/to/volt --workspace volt=/path/to/volt --allow-tools read,grep,find,ls
+npm run iroh:poc:host -- --source-volt /path/to/volt --workspace volt=/path/to/volt --allow-tools read,grep,find,ls
 ```
 
 Terminal 1, when `volt` is globally installed on the host `PATH`:
 
 ```bash
-npm run host -- --use-volt --workspace volt=/path/to/repo --allow-tools read,grep,find,ls
+npm run iroh:poc:host -- --use-volt --workspace volt=/path/to/repo --allow-tools read,grep,find,ls
 ```
 
 Terminal 2, one-shot commands:
 
 ```bash
-npm run client -- "<ticket>" --get-state
-npm run client -- "<ticket>" --message "List the top-level files."
+npm run iroh:poc:client -- "<ticket>" --get-state
+npm run iroh:poc:client -- "<ticket>" --message "List the top-level files."
 ```
 
 Terminal 2, persistent prompt loop:
 
 ```bash
-npm run client -- "<ticket>" --interactive
+npm run iroh:poc:client -- "<ticket>" --interactive
 ```
 
 Interactive commands:
@@ -170,18 +168,18 @@ Add `--relay default` to the host command when testing across networks; the tick
 The default is `--relay disabled`, which is best for same-machine or same-LAN testing. To exercise Iroh's relay/discovery path:
 
 ```bash
-npm run host -- --relay default --once
+npm run iroh:poc:host -- --relay default --once
 ```
 
 The ticket records the relay mode and the client uses the same preset.
 
 ## Security notes
 
-This PoC is intentionally small and is not product-ready remote access.
+Remote host support is experimental and should be treated as remote access to the host machine.
 
 - Pairing tickets contain a one-time secret for adding a client to the allowlist.
 - Paired clients are persisted until revoked.
-- Any paired client can control the spawned RPC child for its allowed workspace.
+- Any paired client can control the integrated runtime or spawned RPC child for its allowed workspace.
 - Real Volt RPC can read files, edit files, and run tools allowed by `--allow-tools`.
 - Keep the default read-only tool list while testing remotely.
 - Do not expose sensitive workspaces or run with `bash,edit,write` unless the client is trusted.
