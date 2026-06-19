@@ -17,6 +17,7 @@ import {
 	encodeIrohRemoteTicketPayload,
 	getIrohRemoteRpcFilterResult,
 	IROH_REMOTE_ALPN,
+	IrohRemoteAuditLogger,
 	IrohRemoteHostEngine,
 	IrohRemoteHostStateManager,
 	readIrohRemoteHostState,
@@ -51,6 +52,7 @@ Serve options:
   --workspace <name=path>    Workspace exposed to the client. Defaults to saved workspace or cwd.
   --relay <disabled|default> Iroh relay preset. Defaults to disabled for local tests.
   --state <path>             Host state path. Defaults to ~/.volt/agent/remote/iroh-sidecar-host.json.
+  --audit <path>             Host audit JSONL path. Defaults to <state>.audit.jsonl.
   --use-volt                 Spawn volt --mode rpc instead of the fake RPC child.
   --source-volt <repo-root>  Spawn Volt from a source checkout. Implies --use-volt.
   --integrated-volt          Run this source checkout's Volt runtime in-process over Iroh.
@@ -117,6 +119,25 @@ function syncState(target, source) {
 	target.consumedPairingSecretHashes = source.consumedPairingSecretHashes ?? [];
 	target.workspaces = source.workspaces ?? [];
 	target.clients = source.clients ?? [];
+}
+
+function getDefaultAuditPath(statePath) {
+	return statePath.endsWith(".json")
+		? `${statePath.slice(0, -".json".length)}.audit.jsonl`
+		: `${statePath}.audit.jsonl`;
+}
+
+function createAuditLogger(flags, statePath) {
+	const auditPath = resolve(getFlag(flags, "audit", getDefaultAuditPath(statePath)));
+	return { auditLogger: new IrohRemoteAuditLogger({ path: auditPath }), auditPath };
+}
+
+async function logAudit(auditLogger, event) {
+	try {
+		await auditLogger.log(event);
+	} catch {
+		// Audit logging is best-effort and must not change remote runtime behavior.
+	}
 }
 
 async function assertWorkspaceDirectory(workspace) {
@@ -671,7 +692,16 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, opt
 			projectTrusted: options.projectTrusted,
 		});
 	} catch (error) {
-		await sendHandshakeError(stream, error instanceof Error ? error.message : String(error));
+		const message = error instanceof Error ? error.message : String(error);
+		await logAudit(options.auditLogger, {
+			type: "runtime_failure",
+			clientNodeId: authorization.client.nodeId,
+			workspace: authorization.workspace.name,
+			success: false,
+			error: message,
+			details: { runtime: "integrated-volt" },
+		});
+		await sendHandshakeError(stream, message);
 		return;
 	}
 
@@ -687,6 +717,12 @@ async function handleConnection(incoming, options) {
 	const connection = await accepting.connect();
 	const remoteId = connection.remoteId().toString();
 	console.error(`client connected: ${remoteId}`);
+	await logAudit(options.auditLogger, {
+		type: "client_connected",
+		clientNodeId: remoteId,
+		workspace: options.workspace.name,
+		success: true,
+	});
 
 	let child;
 	try {
@@ -721,6 +757,12 @@ async function handleConnection(incoming, options) {
 		connection.close(0n, Array.from(Buffer.from("done", "utf8")));
 		await waitForConnectionClose(connection);
 		console.error(`client disconnected: ${remoteId}`);
+		await logAudit(options.auditLogger, {
+			type: "client_disconnected",
+			clientNodeId: remoteId,
+			workspace: options.workspace.name,
+			success: true,
+		});
 	}
 }
 
@@ -738,6 +780,7 @@ function createTicketPayload(endpoint, options, includePairingSecret) {
 
 async function serve(flags) {
 	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
+	const { auditLogger, auditPath } = createAuditLogger(flags, statePath);
 	const stateManager = new IrohRemoteHostStateManager({ statePath });
 	const state = await stateManager.load();
 	const allowTools = getFlag(flags, "allow-tools", DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
@@ -754,6 +797,7 @@ async function serve(flags) {
 	const options = {
 		agentDir: getFlag(flags, "agent-dir"),
 		allowTools,
+		auditLogger,
 		hostEngine: undefined,
 		integratedVolt: hasFlag(flags, "integrated-volt"),
 		profile: getFlag(flags, "profile"),
@@ -773,6 +817,7 @@ async function serve(flags) {
 	const endpoint = await bindEndpoint(relayMode, state, statePath);
 	const hostEngine = new IrohRemoteHostEngine({
 		allowTools,
+		auditLogger,
 		stateManager,
 		workspace,
 	});
@@ -791,6 +836,7 @@ async function serve(flags) {
 
 	console.error(`host id: ${endpoint.id().toString()}`);
 	console.error(`state: ${statePath}`);
+	console.error(`audit: ${auditPath}`);
 	console.error(`workspace: ${workspace.name} -> ${workspace.path}`);
 	console.error(
 		`child: ${options.integratedVolt ? "in-process volt remote host" : options.sourceVolt ? `${process.execPath} ${options.resolvedSourceVoltRunner} --mode rpc` : options.useVolt ? `${options.resolvedVoltBin ?? getPlatformVoltBin(options.voltBin)} --mode rpc` : "fake-rpc"}`,
@@ -822,8 +868,15 @@ async function listClients(flags) {
 async function revokeClient(flags, nodeId) {
 	if (!nodeId) throw new Error("Missing node id to revoke");
 	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
+	const { auditLogger } = createAuditLogger(flags, statePath);
 	const stateManager = new IrohRemoteHostStateManager({ statePath });
 	const result = await stateManager.revokeClient(nodeId);
+	await logAudit(auditLogger, {
+		type: "client_revoked",
+		clientNodeId: nodeId,
+		success: result.revoked,
+		error: result.revoked ? undefined : "client not found",
+	});
 	if (!result.revoked) {
 		console.error(`No client found for ${nodeId}`);
 		return;

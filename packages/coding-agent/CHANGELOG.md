@@ -27,6 +27,7 @@
 - Added an in-process Iroh RPC transport adapter for running Volt RPC directly over Iroh bidirectional streams.
 - Added typed core Iroh remote helpers for tickets, handshakes, host state, client authorization, workspaces, remote RPC command filtering, and an in-process Iroh remote RPC mode wrapper.
 - Added typed Iroh remote host/client engines with bounded handshake reads, host state management, audit logging, and pair/list/revoke operations.
+- Added default JSONL audit logging to the Iroh sidecar host for pairing, authorization, rejection, revocation, connection lifecycle, and integrated runtime startup failures.
 - Added transport-backed RPC clients, including an in-memory loopback transport and in-process client helper for running Volt RPC without spawning a subprocess.
 
 ### Fixed
@@ -49,6 +50,7 @@
 - Reworked the startup ASCII wordmark to an outline letterform so it no longer appears split across a horizontal seam on macOS terminals that add inter-line spacing (the previous solid half-block art was bisected by the line gap).
 - Fixed the tree navigator to horizontally pan deep entries so the selected item remains readable ([#5830](https://github.com/earendil-works/pi/issues/5830)).
 - Fixed the Iroh sidecar scenario harness and host preflight to canonicalize workspace paths before comparing or spawning RPC children.
+- Fixed the Iroh sidecar client to use core remote ticket and handshake helpers, and made direct Iroh remote runtime creation default to the read-only tool allowlist.
 
 ### Changed
 

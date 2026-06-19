@@ -9,6 +9,7 @@ import { createAgentSessionFromServices, createAgentSessionServices } from "../.
 import { formatNoModelsAvailableMessage } from "../../core/auth-guidance.ts";
 import { AuthStorage } from "../../core/auth-storage.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "../../core/http-dispatcher.ts";
+import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "../../core/remote/iroh/index.ts";
 import { getDefaultSessionDir, SessionManager } from "../../core/session-manager.ts";
 import { SettingsManager } from "../../core/settings-manager.ts";
 import { runMigrations } from "../../migrations.ts";
@@ -81,12 +82,13 @@ export async function createIrohRemoteAgentRuntime(
 	return runtime;
 }
 
-function parseAllowTools(allowTools: string | undefined): string[] | undefined {
-	const tools = allowTools
+function parseAllowTools(allowTools: string | undefined): string[] {
+	const requestedAllowTools = allowTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS;
+	const tools = requestedAllowTools
 		?.split(",")
 		.map((tool) => tool.trim())
 		.filter((tool) => tool.length > 0);
-	return tools && tools.length > 0 ? tools : undefined;
+	return tools && tools.length > 0 ? tools : DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(",");
 }
 
 function runIrohRemoteStartupMigrations(cwd: string, agentDir: string): void {
