@@ -50,6 +50,7 @@ import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
+import { getIrohRemoteClientUsage, parseIrohRemoteClientArgs, runIrohRemoteClient } from "./remote/iroh-client.ts";
 import { handleStoreCommand } from "./store/store-cli.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
@@ -80,6 +81,7 @@ async function readPipedStdin(): Promise<string | undefined> {
 function printRemoteCommandHelp(): void {
 	console.error(`Usage:
   volt remote host [options]
+  volt remote client <ticket> [options]
   volt remote clients [options]
   volt remote revoke <node-id> [options]
 
@@ -97,6 +99,15 @@ Host options are forwarded to the integrated Iroh remote host. Common options:
   --approve                     Trust project-local Volt settings/resources
   --no-pairing                  Reject unpaired clients
   --once                        Exit after first client disconnects
+
+Client options:
+  --message <text>              Send one prompt and print streamed text deltas
+  --get-state                   Print the remote RPC session state as JSON
+  --interactive                 Read prompts from stdin until /quit or /exit
+  --client-label <label>        Client label sent during pairing
+  --state <path>                Client state path
+  --timeout-ms <ms>             Command timeout
+  --verbose                     Print non-text RPC events
 
 Client management options:
   --state <path>                Host state path
@@ -252,6 +263,48 @@ async function handleRemoteRevokeCommand(args: readonly string[]): Promise<void>
 	console.error(`Revoked ${nodeId}`);
 }
 
+async function handleRemoteClientCommand(args: readonly string[]): Promise<void> {
+	const parsed = parseIrohRemoteClientArgs(args, Boolean(process.stdin.isTTY));
+	if (parsed.help) {
+		console.error(getIrohRemoteClientUsage());
+		return;
+	}
+	if (parsed.error) {
+		console.error(chalk.red(`Error: ${parsed.error}`));
+		process.exitCode = 1;
+		return;
+	}
+	if (!parsed.ticket || !parsed.mode) {
+		console.error(chalk.red("Error: Missing remote client ticket"));
+		process.exitCode = 1;
+		return;
+	}
+	if (isBunBinary) {
+		console.error(chalk.red("Error: volt remote client is not available from the Bun binary release yet."));
+		console.error("Use a Node.js npm install or a source checkout with optional @number0/iroh dependencies.");
+		process.exitCode = 1;
+		return;
+	}
+
+	try {
+		const exitCode = await runIrohRemoteClient({
+			clientLabel: parsed.clientLabel,
+			message: parsed.message,
+			mode: parsed.mode,
+			statePath: parsed.statePath,
+			timeoutMs: parsed.timeoutMs,
+			ticket: parsed.ticket,
+			verbose: parsed.verbose,
+		});
+		if (exitCode !== 0) {
+			process.exitCode = exitCode;
+		}
+	} catch (error: unknown) {
+		console.error(chalk.red(error instanceof Error ? error.message : String(error)));
+		process.exitCode = 1;
+	}
+}
+
 async function pathExists(path: string): Promise<boolean> {
 	try {
 		await access(path);
@@ -287,6 +340,10 @@ async function handleRemoteCommand(args: string[], options: { profile?: string }
 	}
 	if (command === "clients") {
 		await handleRemoteClientsCommand(args.slice(2));
+		return true;
+	}
+	if (command === "client") {
+		await handleRemoteClientCommand(args.slice(2));
 		return true;
 	}
 	if (command === "revoke") {

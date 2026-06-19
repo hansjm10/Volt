@@ -511,13 +511,15 @@ volt config                    # Enable/disable package resources
 
 ```bash
 volt remote host --workspace volt=/path/to/repo
+volt remote client "<ticket>" --message "List top-level files."
+volt remote client "<ticket>"
 volt remote clients
 volt remote revoke <node-id>
 ```
 
-`volt remote host` exposes Volt RPC over Iroh using the optional `@number0/iroh` native adapter. The default remote tool allowlist is read-only (`read,grep,find,ls`); pass `--allow-tools` to change it.
+`volt remote host` exposes Volt RPC over Iroh using the optional `@number0/iroh` native adapter. `volt remote client <ticket>` connects to the printed pairing ticket, opens an interactive prompt loop on TTYs, or runs one-shot commands with `--message` and `--get-state`. The default remote tool allowlist is read-only (`read,grep,find,ls`); pass `--allow-tools` to change it.
 
-The remote host requires a Node.js package install or source checkout on a platform supported by `@number0/iroh`. Bun binary builds currently reject this command because the optional native Iroh adapter is not bundled.
+Remote host and client commands require a Node.js package install or source checkout on a platform supported by `@number0/iroh`. Bun binary builds currently reject these commands because the optional native Iroh adapter is not bundled.
 
 ### Print Mode Stdin
 

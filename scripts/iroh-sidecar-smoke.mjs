@@ -9,9 +9,8 @@ import { spawn } from "node:child_process";
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
 const requireModule = createRequire(import.meta.url);
-const sidecarDir = join(repoRoot, "packages", "coding-agent", "examples", "remote", "iroh-sidecar");
 const hostScript = join(repoRoot, "packages", "coding-agent", "src", "remote", "iroh-host.mjs");
-const clientScript = join(sidecarDir, "client.mjs");
+const clientScript = join(repoRoot, "scripts", "run-coding-agent-source.mjs");
 const SOURCE_IMPORT_CONDITION_ARGS = ["--conditions", "volt-source"];
 
 async function assertInstalled() {
@@ -78,6 +77,8 @@ async function runClient(ticket, clientStatePath) {
 		[
 			...SOURCE_IMPORT_CONDITION_ARGS,
 			clientScript,
+			"remote",
+			"client",
 			ticket,
 			"--state",
 			clientStatePath,

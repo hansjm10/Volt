@@ -29,6 +29,7 @@
 - Added typed Iroh remote host/client engines with bounded handshake reads, host state management, audit logging, and pair/list/revoke operations.
 - Added default JSONL audit logging to the Iroh remote host for pairing, authorization, rejection, revocation, connection lifecycle, and integrated runtime startup failures.
 - Added `volt remote clients` and `volt remote revoke <node-id>` for managing paired Iroh remote clients from the main CLI.
+- Added `volt remote client <ticket>` as the primary manual Iroh remote client, backed by the core client engine and `RpcTransportClient`.
 - Added a self-contained `volt remote host` product entrypoint backed by optional `@number0/iroh`, keeping native Iroh loading isolated from the main CLI.
 - Added transport-backed RPC clients, including an in-memory loopback transport and in-process client helper for running Volt RPC without spawning a subprocess.
 
