@@ -1,0 +1,8 @@
+{
+	"service_url": "http://127.0.0.1:8000",
+	"threshold": 0.5,
+	"always_keep_first_frags": false,
+	"chunk_overlap_tokens": 50,
+	"max_bytes": 2097152,
+	"timeout_ms": 60000
+}
