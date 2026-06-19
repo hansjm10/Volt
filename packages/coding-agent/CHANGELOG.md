@@ -32,6 +32,7 @@
 - Added `volt remote client <ticket>` as the primary manual Iroh remote client, backed by the core client engine and `RpcTransportClient`.
 - Added a self-contained `volt remote host` product entrypoint backed by optional `@number0/iroh`, keeping native Iroh loading isolated from the main CLI.
 - Added transport-backed RPC clients, including an in-memory loopback transport and in-process client helper for running Volt RPC without spawning a subprocess.
+- Added a `swe-pruner.ts` example extension that finds task-relevant excerpts in local files through a local SWE-Pruner service, persists its settings in global or project config, and includes npm scripts for starting and stopping the local service.
 
 ### Fixed
 
@@ -58,6 +59,7 @@
 
 ### Changed
 
+- Updated the SWE-Pruner example extension guidance to prefer semantic pruning after candidate-file discovery and clarify when to use search, LSP, or full reads instead.
 - Changed store install/update confirmations and summaries to show package names and concise source labels instead of full git source strings.
 - Changed the interactive `/store` browser to list available packages immediately, with search available from the package list.
 - Updated the `/review` selector to offer base-branch review first and show local branches with `main`/`master` prioritized.

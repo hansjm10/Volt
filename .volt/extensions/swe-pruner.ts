@@ -1,0 +1,1 @@
+../../packages/coding-agent/examples/extensions/swe-pruner.ts
