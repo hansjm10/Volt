@@ -41,6 +41,19 @@ describe("remote CLI", () => {
 		rmSync(tempDir, { force: true, recursive: true });
 	});
 
+	it("prints unsafe remote tool warning help", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		await expect(main(["remote", "host", "--help"])).resolves.toBeUndefined();
+
+		expect(logSpy).not.toHaveBeenCalled();
+		const helpText = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
+		expect(helpText).toContain("bash, edit, or write can modify host state and require confirmation");
+		expect(helpText).toContain("--yes");
+		expect(process.exitCode).toBeUndefined();
+	});
+
 	it("lists and revokes paired Iroh clients", async () => {
 		const statePath = join(tempDir, "host.json");
 		const auditPath = join(tempDir, "host.audit.jsonl");

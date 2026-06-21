@@ -1128,7 +1128,7 @@ async function pairedClientPersistedToolsScenario() {
 		await runHostClientOnce({
 			clientArgs: ["--message", "paired unsafe host defaults", "--timeout-ms", "10000"],
 			clientStatePath,
-			hostArgs: ["--source-volt", sourceDir, "--no-pairing", "--allow-tools", "bash"],
+			hostArgs: ["--source-volt", sourceDir, "--no-pairing", "--allow-tools", "bash", "--yes"],
 			hostStatePath,
 			label: "paired tools persisted allowlist",
 		});
@@ -1145,6 +1145,49 @@ async function pairedClientPersistedToolsScenario() {
 		assert(
 			secondArgs[toolsIndex + 1] === "read,grep,find,ls",
 			`Expected persisted read-only tool allowlist despite unsafe host defaults, got:\n${secondArgs.join(" ")}`,
+		);
+	});
+}
+
+async function unsafeToolGateScenario() {
+	await withStateDir("unsafe-tools", async ({ clientStatePath, hostStatePath }) => {
+		const rejectedHost = startHost(["--state", hostStatePath, "--allow-tools", "bash", "--once"]);
+		const rejectedExit = await waitForExit(rejectedHost.child, "unsafe tool rejection host", rejectedHost.output, {
+			expectSuccess: false,
+		});
+		assert(rejectedExit.code !== 0, "Unsafe tool rejection host unexpectedly succeeded");
+		assert(
+			rejectedHost.output.stderr.includes("Pass --yes to accept unsafe remote tool grants"),
+			`Expected --yes guidance for unsafe tool rejection, got:\n${rejectedHost.output.stderr}`,
+		);
+		assert(
+			rejectedHost.output.stdout.trim().length === 0,
+			`Unsafe rejected host printed a ticket:\n${rejectedHost.output.stdout}`,
+		);
+
+		const { clientOutput } = await runHostClientOnce({
+			clientArgs: ["--message", "unsafe accepted", "--timeout-ms", "10000"],
+			clientStatePath,
+			hostArgs: ["--allow-tools", "read,grep,find,ls,bash", "--yes"],
+			hostStatePath,
+			label: "unsafe accepted",
+		});
+		assert(
+			clientOutput.stdout.includes("fake RPC response over Iroh: unsafe accepted"),
+			`Expected unsafe accepted client response, got:\n${clientOutput.stdout}`,
+		);
+
+		const auditEvents = await readAuditEvents(getDefaultAuditPath(hostStatePath));
+		assert(
+			auditEvents.some(
+				(event) =>
+					event.type === "unsafe_tools_enabled" &&
+					event.success === true &&
+					event.details?.approval === "yes_flag" &&
+					Array.isArray(event.details?.unsafeTools) &&
+					event.details.unsafeTools.includes("bash"),
+			),
+			`Expected unsafe_tools_enabled audit event, got:\n${JSON.stringify(auditEvents)}`,
 		);
 	});
 }
@@ -1293,6 +1336,7 @@ const scenarios = [
 	["pairing and revocation", pairingAndRevocationScenario],
 	["audit log", auditLogScenario],
 	["paired client persisted tools", pairedClientPersistedToolsScenario],
+	["unsafe tool gates", unsafeToolGateScenario],
 	["pairing ticket workspace binding", pairingTicketWorkspaceBindingScenario],
 	["running workspace authorization", runningWorkspaceAuthorizationScenario],
 	["expired ticket", expiredTicketScenario],

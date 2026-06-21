@@ -182,6 +182,7 @@ Remote host support is experimental and should be treated as remote access to th
 - Any paired client can control the integrated runtime or spawned RPC child for its allowed workspace.
 - Real Volt RPC can read files, edit files, and run tools allowed by `--allow-tools`.
 - Keep the default read-only tool list while testing remotely.
+- `--allow-tools` grants that include `bash`, `edit`, or `write` can modify host files or run shell commands; TTY hosts ask for confirmation, and noninteractive hosts must pass `--yes`.
 - Do not expose sensitive workspaces or run with `bash,edit,write` unless the client is trusted.
 
 See [the design document](../../../docs/iroh-remote-access-design.md) for the intended product security model.

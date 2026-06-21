@@ -144,6 +144,8 @@ Before removing experimental language, the feature must have explicit safety gat
 - project trust is never auto-approved for remote sessions
 - audit events cover pairing, authorization, rejection, revocation, connection lifecycle, runtime startup/stopping, and unsafe tool grants
 
+Resolved 2026-06-21: Unsafe remote tool grants are detected through shared core helpers. `volt remote host` now requires TTY confirmation or `--yes` before granting `bash`, `edit`, or `write`; non-TTY startup fails without `--yes`; accepted unsafe grants write `unsafe_tools_enabled` audit events. CLI help, the sidecar README, unit tests, and scenario tests cover the gate.
+
 ### G5. Reconnect/resume semantics
 
 Define and implement minimum reconnection behavior suitable for mobile or flaky networks.
@@ -627,6 +629,8 @@ Requirements:
 - Audit event `unsafe_tools_enabled` is written when unsafe tools are accepted.
 - Existing clients do not get unsafe tools unless explicitly paired or updated with those tools.
 
+Resolved 2026-06-21: Host-startup pairing tickets with unsafe tool grants require confirmation or `--yes`, and accepted grants audit `unsafe_tools_enabled` with non-secret details. Future first-class `volt remote pair` work must reuse this gate when it adds standalone pair-ticket creation.
+
 ### Project trust
 
 Requirements:
@@ -914,7 +918,7 @@ Docs must cover:
 Do not remove experimental language until all of these are true:
 
 - [x] Per-client tools are persisted and enforced on reconnect. Resolved 2026-06-21.
-- [ ] Unsafe tool grants require confirmation or `--yes`.
+- [x] Unsafe tool grants require confirmation or `--yes`. Resolved 2026-06-21.
 - [ ] Pairing workflow is first-class or explicitly scoped to running host startup with clear docs.
 - [ ] Protocol v1 is documented.
 - [ ] Protocol compatibility tests exist.

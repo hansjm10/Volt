@@ -14,6 +14,7 @@ import {
 	decodeIrohRemoteTicketPayload,
 	encodeIrohRemoteTicketPayload,
 	getIrohRemoteRpcFilterResult,
+	getIrohRemoteUnsafeAllowedTools,
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_REDACTED_BASH_OUTPUT_PATH,
 	IROH_REMOTE_REDACTED_EXPORT_PATH,
@@ -370,6 +371,11 @@ describe("Iroh remote core helpers", () => {
 		} finally {
 			await rm(stateDir, { force: true, recursive: true });
 		}
+	});
+
+	test("detects unsafe remote tool grants", () => {
+		expect(getIrohRemoteUnsafeAllowedTools(DEFAULT_IROH_REMOTE_ALLOW_TOOLS)).toEqual([]);
+		expect(getIrohRemoteUnsafeAllowedTools("read,bash, edit,write,bash,custom")).toEqual(["bash", "edit", "write"]);
 	});
 
 	test("selects and upserts workspace definitions", async () => {

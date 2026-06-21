@@ -59,6 +59,7 @@
 
 ### Changed
 
+- Changed Iroh remote host startup to require TTY confirmation or `--yes` before granting unsafe remote tools (`bash`, `edit`, or `write`) and to audit accepted unsafe grants.
 - Updated the SWE-Pruner example extension guidance to prefer semantic pruning after candidate-file discovery and clarify when to use search, LSP, or full reads instead.
 - Changed store install/update confirmations and summaries to show package names and concise source labels instead of full git source strings.
 - Changed the interactive `/store` browser to list available packages immediately, with search available from the package list.

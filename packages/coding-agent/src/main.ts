@@ -91,12 +91,13 @@ Host options are forwarded to the integrated Iroh remote host. Common options:
   --use-volt                    Spawn volt --mode rpc instead of the integrated runtime
   --source-volt <repo-root>     Spawn Volt from a source checkout. Implies --use-volt
   --volt-bin <path>             Volt executable for --use-volt
-  --allow-tools <list>          Remote tool allowlist
+  --allow-tools <list>          Remote tool allowlist. bash, edit, or write can modify host state and require confirmation.
   --profile <name>              Volt settings profile
   --agent-dir <path>            Volt agent config directory
   --approve                     Trust project-local Volt settings/resources
   --no-pairing                  Reject unpaired clients
   --once                        Exit after first client disconnects
+  --yes                         Accept unsafe remote tool grants for noninteractive startup
 
 Client management options:
   --state <path>                Host state path

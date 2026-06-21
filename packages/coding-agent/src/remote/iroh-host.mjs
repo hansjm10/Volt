@@ -5,6 +5,7 @@ import { constants } from "node:fs";
 import { access, mkdir, realpath, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 import lockfile from "proper-lockfile";
 import {
 	createIrohRemoteHandshakeFailure,
@@ -14,6 +15,7 @@ import {
 	DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS,
 	encodeIrohRemoteTicketPayload,
 	getIrohRemoteRpcFilterResult,
+	getIrohRemoteUnsafeAllowedTools,
 	getAgentDir,
 	IROH_REMOTE_ALPN,
 	IrohRemoteAuditLogger,
@@ -45,7 +47,7 @@ const DEFAULT_STATE_PATH = join(getAgentDir(), "remote", "iroh-host.json");
 const PROMPT_COMPLETION_RPC_TYPES = new Set(["prompt", "steer", "follow_up"]);
 const RESPONSE_COMPLETION_RPC_TYPES = new Set(["abort", "get_state"]);
 const PROMPT_COMPLETION_SETTLE_MS = 100;
-const BOOLEAN_FLAGS = new Set(["approve", "help", "integrated-volt", "no-pairing", "once", "use-volt"]);
+const BOOLEAN_FLAGS = new Set(["approve", "help", "integrated-volt", "no-pairing", "once", "use-volt", "yes"]);
 const VALUE_FLAGS = new Set([
 	"agent-dir",
 	"allow-tools",
@@ -183,11 +185,13 @@ Serve options:
   --integrated-volt          Run Volt's runtime in-process over Iroh.
   --volt-bin <path>          Volt executable for --use-volt. Defaults to volt.
   --allow-tools <list>       Tool allowlist passed to Volt. Defaults to read,grep,find,ls.
+                              bash, edit, or write can modify host state and require confirmation.
   --profile <name>           Volt settings profile for integrated Volt runtime.
   --agent-dir <path>         Volt agent config directory for integrated Volt runtime.
   --approve                  Trust project-local Volt settings/resources for integrated Volt runtime.
   --no-pairing               Reject unpaired clients and print a paired-client ticket.
   --once                     Exit after the first client disconnects.
+  --yes                      Accept unsafe remote tool grants for noninteractive startup.
 
 Client management:
   clients                    Print paired clients from state.
@@ -263,6 +267,50 @@ async function logAudit(auditLogger, event) {
 	} catch {
 		// Audit logging is best-effort and must not change remote runtime behavior.
 	}
+}
+
+function formatUnsafeToolWarning(unsafeTools) {
+	const formattedTools = unsafeTools.join(", ");
+	return [
+		`Unsafe remote tools requested: ${formattedTools}.`,
+		"These tools can modify files or run shell commands on the host through a paired remote client.",
+	].join("\n");
+}
+
+async function confirmUnsafeRemoteToolGrant(options) {
+	const unsafeTools = getIrohRemoteUnsafeAllowedTools(options.allowTools);
+	if (unsafeTools.length === 0) return;
+
+	const warning = formatUnsafeToolWarning(unsafeTools);
+	let approval = "yes_flag";
+	if (!options.yes) {
+		if (!process.stdin.isTTY || !process.stderr.isTTY) {
+			throw new Error(`${warning}\nPass --yes to accept unsafe remote tool grants in noninteractive contexts.`);
+		}
+		const readline = createInterface({ input: process.stdin, output: process.stderr });
+		let answer;
+		try {
+			answer = await readline.question(`${warning}\nType yes to continue: `);
+		} finally {
+			readline.close();
+		}
+		if (answer.trim().toLowerCase() !== "yes") {
+			throw new Error("Unsafe remote tool grant was not accepted.");
+		}
+		approval = "tty_confirmation";
+	}
+
+	await logAudit(options.auditLogger, {
+		type: "unsafe_tools_enabled",
+		workspace: options.workspaceName,
+		success: true,
+		details: {
+			allowTools: options.allowTools,
+			approval,
+			context: options.context,
+			unsafeTools,
+		},
+	});
 }
 
 async function assertWorkspaceDirectory(workspace) {
@@ -1041,6 +1089,13 @@ async function serve(flags) {
 		voltBin: getFlag(flags, "volt-bin", "volt"),
 		workspace,
 	};
+	await confirmUnsafeRemoteToolGrant({
+		allowTools,
+		auditLogger,
+		context: pairingEnabled ? "host_startup_pairing" : "host_startup",
+		workspaceName: workspace.name,
+		yes: hasFlag(flags, "yes"),
+	});
 	await preflightRpcChild(options, workspace);
 	Object.assign(workspace, await stateManager.upsertWorkspace(workspace, allowTools));
 

@@ -63,10 +63,12 @@ export {
 } from "./outbound-filter.ts";
 export {
 	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+	getIrohRemoteUnsafeAllowedTools,
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_HANDSHAKE_TYPE,
 	IROH_REMOTE_HELLO_TYPE,
 	IROH_REMOTE_TICKET_PREFIX,
+	IROH_REMOTE_UNSAFE_TOOL_NAMES,
 	type IrohRemoteRelayMode,
 	isIrohRemoteRelayMode,
 } from "./protocol.ts";
