@@ -268,10 +268,10 @@ the rollup item is resolved, and the final turn's required verification passed.
 </group>
 
 <group n="2" title="First-class pairing workflow">
-  <item ref="B.1" status="open" prereq="A.1,A.3" type="decision">
+  <item ref="B.1" status="resolved" prereq="A.1,A.3" type="decision">
     <title>Resolve the Iroh endpoint-ticket model for `volt remote pair`: decide whether pairing can be generated offline, must be mediated by a running host control channel, or should be implemented as a short-lived pair endpoint</title>
     <acceptance>Decision is recorded with direct evidence from @number0/iroh API behavior or a small native smoke; design doc open decision #1 is updated; chosen approach includes user-visible behavior, failure modes, and security implications; no misleading offline pair command is shipped if the endpoint ticket cannot be valid offline.</acceptance>
-    <evidence/>
+    <evidence>Resolved 2026-06-21: decided `volt remote pair` must be mediated by a running host control channel; native smoke showed an ID-only persisted-secret ticket had zero direct addresses/no relay and connect failed with no address lookup, while a bound endpoint ticket had a direct address; design records user behavior, failure modes, and security implications; verification: git diff --check -- .volt/iroh-productization-design.md and pre-commit npm run check; commit 9d3aa735</evidence>
   </item>
 
   <item ref="B.2" status="open" prereq="B.1,A.2">
