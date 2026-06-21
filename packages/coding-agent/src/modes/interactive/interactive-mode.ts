@@ -70,6 +70,7 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
 	ProjectTrustContext,
+	ToolInfo,
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
@@ -152,6 +153,7 @@ import { LoginDialogComponent } from "./components/login-dialog.ts";
 import { renderLogo } from "./components/logo.ts";
 import { ModelSelectorComponent } from "./components/model-selector.ts";
 import { type AuthSelectorProvider, OAuthSelectorComponent } from "./components/oauth-selector.ts";
+import { type ReviewToolSelectorOption, ReviewToolsSelectorComponent } from "./components/review-tools-selector.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
 import { SessionSelectorComponent } from "./components/session-selector.ts";
 import { SettingsSelectorComponent } from "./components/settings-selector.ts";
@@ -595,7 +597,7 @@ export class InteractiveMode {
 		const reviewCommand = slashCommands.find((command) => command.name === "review");
 		if (reviewCommand) {
 			reviewCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
-				const options = ["uncommitted", "branch", "pr", "commit"];
+				const options = ["tools", "uncommitted", "branch", "pr", "commit"];
 				const normalized = prefix.trim().toLowerCase();
 				const filtered = options.filter((option) => option.startsWith(normalized));
 				if (filtered.length === 0) return null;
@@ -6796,6 +6798,95 @@ export class InteractiveMode {
 		return commits[labels.indexOf(choice)]?.sha;
 	}
 
+	private formatReviewToolSource(tool: ToolInfo): string {
+		const source = tool.sourceInfo.source.trim();
+		if (source === "builtin") {
+			return "builtin";
+		}
+		if (source === "sdk") {
+			return "custom";
+		}
+		const prefix =
+			tool.sourceInfo.scope === "user" ? "user" : tool.sourceInfo.scope === "project" ? "project" : "temporary";
+		return source ? `${prefix}:${source}` : prefix;
+	}
+
+	private getReviewToolsForRun(): string[] {
+		const availableToolNames = new Set(this.session.getAllTools().map((tool) => tool.name));
+		const configuredTools = this.settingsManager.getReviewTools();
+		const activeTools = this.session.getActiveToolNames().filter((name) => availableToolNames.has(name));
+		const selectedTools = (configuredTools ?? activeTools).filter((name) => availableToolNames.has(name));
+
+		if (selectedTools.length > 0) {
+			return [...new Set(selectedTools)];
+		}
+		if (configuredTools) {
+			this.showWarning("Configured review tools are unavailable; using current active tools.");
+		}
+		return [...new Set(activeTools)];
+	}
+
+	private async showReviewToolsSelector(options: ReviewToolSelectorOption[]): Promise<string[] | undefined> {
+		return new Promise((resolve) => {
+			const restoreEditor = () => {
+				this.editorContainer.clear();
+				this.editorContainer.addChild(this.editor);
+				this.ui.setFocus(this.editor);
+				this.ui.requestRender();
+			};
+
+			const selector = new ReviewToolsSelectorComponent(
+				options,
+				(toolNames) => {
+					restoreEditor();
+					resolve(toolNames);
+				},
+				() => {
+					restoreEditor();
+					resolve(undefined);
+				},
+			);
+
+			this.editorContainer.clear();
+			this.editorContainer.addChild(selector);
+			this.ui.setFocus(selector);
+			this.ui.requestRender();
+		});
+	}
+
+	private async configureReviewTools(): Promise<void> {
+		const tools = this.session.getAllTools();
+		if (tools.length === 0) {
+			this.showError("No tools are available to configure for review.");
+			return;
+		}
+
+		const activeTools = new Set(this.session.getActiveToolNames());
+		const configuredTools = this.settingsManager.getReviewTools();
+		const selectedTools = new Set(configuredTools ?? this.session.getActiveToolNames());
+		const options = tools.map((tool) => ({
+			name: tool.name,
+			description: tool.description,
+			source: this.formatReviewToolSource(tool),
+			active: activeTools.has(tool.name),
+			selected: selectedTools.has(tool.name),
+		}));
+
+		const selected = await this.showReviewToolsSelector(options);
+		if (selected === undefined) {
+			this.showStatus("Review tool selection cancelled");
+			return;
+		}
+		if (selected.length === 0) {
+			this.settingsManager.setReviewTools(undefined);
+			this.showStatus("Review tools reset to current active tools.");
+			return;
+		}
+
+		this.settingsManager.setReviewTools(selected);
+		this.showStatus(`Review tools saved: ${selected.join(", ")}`);
+	}
+
 	private async resolveReviewModel(): Promise<Model<any> | undefined> {
 		const reference = this.settingsManager.getReviewModel();
 		if (reference) {
@@ -6819,6 +6910,10 @@ export class InteractiveMode {
 		const parsedArgs = parseReviewCommandArgs(argsText);
 		if (parsedArgs.error) {
 			this.showError(parsedArgs.error);
+			return;
+		}
+		if (parsedArgs.configureTools) {
+			await this.configureReviewTools();
 			return;
 		}
 
@@ -6859,7 +6954,7 @@ export class InteractiveMode {
 			return;
 		}
 
-		const result = await this.runBlockingReview(resolution, model);
+		const result = await this.runBlockingReview(resolution, model, this.getReviewToolsForRun());
 		if (!result) {
 			return;
 		}
@@ -6871,6 +6966,7 @@ export class InteractiveMode {
 	private async runBlockingReview(
 		resolution: ResolvedReview,
 		model: Model<any>,
+		tools: string[],
 	): Promise<{ raw: string; parsed?: ParsedReview } | undefined> {
 		const baseMessage = `Reviewing ${resolution.description} with ${model.id}...`;
 		const loader = new BorderedLoader(this.ui, theme, baseMessage);
@@ -6902,6 +6998,8 @@ export class InteractiveMode {
 				modelRegistry: this.session.modelRegistry,
 				settingsManager: this.settingsManager,
 				resolved: resolution,
+				parentResourceLoader: this.session.resourceLoader,
+				tools,
 				signal: abortController.signal,
 				onProgress: (message) => {
 					loader.setMessage(`${baseMessage} ${message}`);

@@ -16,6 +16,7 @@ import type { ThinkingLevel } from "@earendil-works/volt-agent-core";
 import type { AssistantMessage, Model } from "@earendil-works/volt-ai";
 import type { AuthStorage } from "./auth-storage.ts";
 import { createExtensionRuntime } from "./extensions/loader.ts";
+import type { ToolDefinition } from "./extensions/types.ts";
 import type { ModelRegistry } from "./model-registry.ts";
 import { loadProjectContextFiles, type ResourceLoader } from "./resource-loader.ts";
 import { createAgentSession } from "./sdk.ts";
@@ -33,13 +34,17 @@ export type ReviewTarget =
 	| { kind: "commit"; sha?: string };
 
 export const REVIEW_USAGE =
-	"Usage: /review [uncommitted | branch [base] | pr [number] | commit [sha]] (no arguments opens a selector)";
+	"Usage: /review [tools | uncommitted | branch [base] | pr [number] | commit [sha]] (no arguments opens a selector)";
 
 /**
  * Parse the argument text after "/review".
  * Returns an empty object when no arguments were given (caller shows a selector).
  */
-export function parseReviewCommandArgs(argsText: string): { target?: ReviewTarget; error?: string } {
+export function parseReviewCommandArgs(argsText: string): {
+	target?: ReviewTarget;
+	configureTools?: boolean;
+	error?: string;
+} {
 	const tokens = argsText.trim().split(/\s+/).filter(Boolean);
 	if (tokens.length === 0) {
 		return {};
@@ -47,6 +52,11 @@ export function parseReviewCommandArgs(argsText: string): { target?: ReviewTarge
 
 	const keyword = tokens[0].toLowerCase();
 	switch (keyword) {
+		case "tools":
+			if (tokens.length > 1) {
+				return { error: `Unexpected arguments after "tools". ${REVIEW_USAGE}` };
+			}
+			return { configureTools: true };
 		case "uncommitted":
 		case "unstaged":
 		case "working":
@@ -740,7 +750,7 @@ export function formatReviewForNewSession(
 // Running the review
 // ============================================================================
 
-/** Minimal resource loader for the isolated review session: no extensions, skills, prompts, or themes. */
+/** Minimal resource loader for the isolated review session: no extensions by default, no skills, prompts, or themes. */
 export function createReviewResourceLoader(cwd: string, agentDir: string): ResourceLoader {
 	const extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
 	const agentsFiles = loadProjectContextFiles({ cwd, agentDir });
@@ -757,6 +767,23 @@ export function createReviewResourceLoader(cwd: string, agentDir: string): Resou
 	};
 }
 
+function collectParentExtensionTools(parentResourceLoader: ResourceLoader | undefined): ToolDefinition[] {
+	const parentExtensions = parentResourceLoader?.getExtensions();
+	if (!parentExtensions) {
+		return [];
+	}
+
+	const toolsByName = new Map<string, ToolDefinition>();
+	for (const extension of parentExtensions.extensions) {
+		for (const tool of extension.tools.values()) {
+			if (!toolsByName.has(tool.definition.name)) {
+				toolsByName.set(tool.definition.name, tool.definition);
+			}
+		}
+	}
+	return Array.from(toolsByName.values());
+}
+
 export interface RunReviewOptions {
 	cwd: string;
 	agentDir: string;
@@ -766,6 +793,10 @@ export interface RunReviewOptions {
 	modelRegistry: ModelRegistry;
 	settingsManager: SettingsManager;
 	resolved: ResolvedReview;
+	/** Parent session resource loader used to inherit configured extension tools. */
+	parentResourceLoader?: ResourceLoader;
+	/** Optional review tool allowlist. Omit to use normal review defaults. */
+	tools?: string[];
 	/** Aborts the review session when triggered. */
 	signal?: AbortSignal;
 	/** Called with short progress updates (tool activity) while the review runs. */
@@ -798,6 +829,7 @@ function summarizeToolArgs(args: unknown): string | undefined {
  * The session is in-memory (not persisted) and disposed when done.
  */
 export async function runReview(options: RunReviewOptions): Promise<ReviewRunResult> {
+	const inheritedTools = collectParentExtensionTools(options.parentResourceLoader);
 	const resourceLoader = createReviewResourceLoader(options.cwd, options.agentDir);
 	const { session } = await createAgentSession({
 		cwd: options.cwd,
@@ -809,6 +841,8 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 		thinkingLevel: options.thinkingLevel,
 		sessionManager: SessionManager.inMemory(options.cwd),
 		resourceLoader,
+		customTools: inheritedTools.length > 0 ? inheritedTools : undefined,
+		tools: options.tools,
 	});
 
 	// An abort during session creation fires before the listener below is

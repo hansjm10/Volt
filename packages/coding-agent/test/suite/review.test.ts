@@ -2,8 +2,10 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage } from "@earendil-works/volt-ai";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/volt-ai";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ExtensionFactory } from "../../src/core/extensions/index.ts";
 import {
 	buildReviewPrompt,
 	formatReviewForNewSession,
@@ -44,6 +46,11 @@ describe("parseReviewCommandArgs", () => {
 		expect(parseReviewCommandArgs("commit abc123").target).toEqual({ kind: "commit", sha: "abc123" });
 		// Without a SHA the caller shows the commit picker.
 		expect(parseReviewCommandArgs("commit").target).toEqual({ kind: "commit", sha: undefined });
+	});
+
+	it("parses review tool configuration", () => {
+		expect(parseReviewCommandArgs("tools")).toEqual({ configureTools: true });
+		expect(parseReviewCommandArgs("tools now").error).toMatch(/Unexpected arguments/);
 	});
 
 	it("errors on unknown targets", () => {
@@ -489,6 +496,56 @@ describe("runReview", () => {
 		expect(result.parsed?.findings[0]?.title).toBe("Bug in file.txt");
 		// The review runs in its own session: the harness session is untouched.
 		expect(harness.session.messages).toHaveLength(0);
+	});
+
+	it("can inherit extension tools from the parent session", async () => {
+		const toolRuns: Array<{ activeTools: string[]; query: string }> = [];
+		const extensionFactory: ExtensionFactory = (volt) => {
+			volt.registerTool({
+				name: "review_helper",
+				label: "Review Helper",
+				description: "Returns review context",
+				parameters: Type.Object({ query: Type.String() }),
+				async execute(_toolCallId, params) {
+					const activeTools = volt.getActiveTools();
+					toolRuns.push({ activeTools, query: params.query });
+					return { content: [{ type: "text", text: `context:${params.query}` }], details: {} };
+				},
+			});
+		};
+		const harness = await createHarness({ extensionFactories: [extensionFactory] });
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("review_helper", { query: "changed file" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage(JSON.stringify({ findings: [] })),
+		]);
+
+		const result = await runReview({
+			cwd: harness.tempDir,
+			agentDir: join(harness.tempDir, "agent"),
+			model: harness.getModel(),
+			authStorage: harness.authStorage,
+			modelRegistry: harness.session.modelRegistry,
+			settingsManager: harness.settingsManager,
+			resolved,
+			parentResourceLoader: harness.session.resourceLoader,
+			tools: ["review_helper"],
+		});
+
+		expect(result.errorMessage).toBeUndefined();
+		expect(result.parsed?.findings).toEqual([]);
+		expect(toolRuns.map((run) => run.query)).toEqual(["changed file"]);
+		expect(harness.session.messages).toHaveLength(0);
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("review_helper", { query: "parent session" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		await harness.session.prompt("parent");
+
+		expect(toolRuns.map((run) => run.query)).toEqual(["changed file", "parent session"]);
+		expect(toolRuns[1]?.activeTools).toContain("review_helper");
 	});
 
 	it("returns the raw report when the output is unstructured", async () => {

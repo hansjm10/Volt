@@ -45,6 +45,7 @@ export interface AppKeybindings {
 	"app.models.toggleProvider": true;
 	"app.models.reorderUp": true;
 	"app.models.reorderDown": true;
+	"app.reviewTools.toggle": true;
 	"app.tree.filter.default": true;
 	"app.tree.filter.noTools": true;
 	"app.tree.filter.userOnly": true;
@@ -171,6 +172,10 @@ export const KEYBINDINGS = {
 		defaultKeys: "alt+down",
 		description: "Move model down in order",
 	},
+	"app.reviewTools.toggle": {
+		defaultKeys: "space",
+		description: "Toggle review tool selection",
+	},
 	"app.tree.filter.default": {
 		defaultKeys: "ctrl+d",
 		description: "Tree filter: default view",
@@ -261,6 +266,7 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	renameSession: "app.session.rename",
 	deleteSession: "app.session.delete",
 	deleteSessionNoninvasive: "app.session.deleteNoninvasive",
+	reviewToolsToggle: "app.reviewTools.toggle",
 } as const satisfies Record<string, Keybinding>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {

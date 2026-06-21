@@ -138,6 +138,7 @@ export interface Settings {
 	images?: ImageSettings;
 	enabledModels?: string[]; // Model patterns for cycling (same format as --models CLI flag)
 	reviewModel?: string; // Model for /review, e.g. "anthropic/claude-opus-4-5" (falls back to the session model)
+	reviewTools?: string[]; // Tool names allowed in /review sessions (defaults to inherited parent active tools)
 	doubleEscapeAction?: "fork" | "tree" | "none"; // Action for double-escape with empty editor (default: "tree")
 	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default filter when opening /tree
 	thinkingBudgets?: ThinkingBudgetsSettings; // Custom token budgets for thinking levels
@@ -1606,6 +1607,22 @@ export class SettingsManager {
 	setReviewModel(modelReference: string | undefined): void {
 		this.updateGlobalSettings("reviewModel", (settings) => {
 			settings.reviewModel = modelReference;
+		});
+	}
+
+	getReviewTools(): string[] | undefined {
+		const tools = this.settings.reviewTools;
+		if (!Array.isArray(tools)) {
+			return undefined;
+		}
+		const normalized = tools.map((tool) => tool.trim()).filter(Boolean);
+		return normalized.length > 0 ? [...new Set(normalized)] : undefined;
+	}
+
+	setReviewTools(toolNames: string[] | undefined): void {
+		this.updateGlobalSettings("reviewTools", (settings) => {
+			const normalized = toolNames?.map((tool) => tool.trim()).filter(Boolean) ?? [];
+			settings.reviewTools = normalized.length > 0 ? [...new Set(normalized)] : undefined;
 		});
 	}
 
