@@ -294,10 +294,10 @@ the rollup item is resolved, and the final turn's required verification passed.
     <evidence>Resolved 2026-06-21: added deterministic JSON `volt remote status` output with state/audit paths, sorted workspaces, client count, client labels/node IDs, allowedWorkspaces, allowedTools, pairedAt, lastSeenAt, persisted-state-only warning, and secret/hash omission tests plus sidecar status scenario/docs; verification: lsp.diagnostics on changed TS/test files, cd packages/coding-agent &amp;&amp; node node_modules/vitest/dist/cli.js --run test/remote-cli.test.ts, node --check scripts/iroh-sidecar-test.mjs, npm run iroh:poc:test, npm run check, git diff --check; commit 431af3d7</evidence>
   </item>
 
-  <item ref="C.2" status="open" prereq="C.1" type="decision">
+  <item ref="C.2" status="resolved" prereq="C.1" type="decision">
     <title>Decide active revocation semantics: future-connections-only with explicit docs, or live host coordination that disconnects active revoked clients promptly</title>
     <acceptance>Decision is recorded in both ledgers with rationale; if active disconnect is deferred, docs state revocation affects future connections only; if active disconnect is chosen, implementation plan names the control mechanism and lifecycle guarantees; audit event requirements are updated.</acceptance>
-    <evidence/>
+    <evidence>Resolved 2026-06-21: chose live host coordination for preview active revocation, with persisted-state revocation as fallback; design names the running host control channel, active connection registry, one-second close guarantee, and `active_connection_revoked` audit requirements; direct @number0/iroh API evidence: Connection.close/closed plus stream stop/reset handles in node_modules/@number0/iroh/index.d.ts; verification: git diff --check -- .volt/iroh-productization-design.md and pre-commit npm run check; commit c36d9dd4</evidence>
   </item>
 
   <item ref="C.3" status="open" prereq="C.2">
