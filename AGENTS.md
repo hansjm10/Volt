@@ -32,7 +32,7 @@
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` named `<issue-number>-<short-slug>.test.ts`.
 - For ad-hoc scripts, `write` them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
-- Never commit unless the user asks.
+- You may commit your own completed work without asking when a commit is a useful checkpoint or natural outcome of the task. Do not commit unrelated work or unfinished changes unless the user asks.
 
 ## Dependency and Install Security
 
@@ -46,8 +46,11 @@
 
 Multiple volt sessions may be running in this cwd at the same time, each modifying different files. Git operations that touch unstaged, staged, or untracked files outside your own changes will stomp on other sessions' work. Follow these rules:
 
-Committing:
+Committing and pushing:
 
+- You may commit your own completed work without explicit user consent when a commit is a useful checkpoint or natural outcome of the task.
+- You may push without an extra confirmation when pushing is the expected next step for the requested workflow and the remote/branch are unambiguous.
+- Ask before committing or pushing if the scope, target branch, remote, ownership of changes, or safety implications are unclear.
 - Only commit files YOU changed in THIS session.
 - Stage explicit paths (`git add <path1> <path2>`); never `git add -A` / `git add .`.
 - Before committing, run `git status` and verify you are only staging your files.
