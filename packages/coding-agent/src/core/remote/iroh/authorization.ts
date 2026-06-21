@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { IrohRemoteHello } from "./handshake.ts";
+import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "./protocol.ts";
 import type { IrohRemoteClient, IrohRemoteHostState, IrohRemoteWorkspace } from "./state.ts";
 import { upsertIrohRemoteWorkspace } from "./workspace.ts";
 
@@ -99,14 +100,15 @@ export function authorizeIrohRemoteClient(
 		};
 	}
 
+	const persistedAllowedTools = existingClient.allowedTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS;
 	existingClient.lastSeenAt = now;
-	existingClient.allowedTools = options.allowTools;
+	existingClient.allowedTools = persistedAllowedTools;
 	if (hello.clientLabel) {
 		existingClient.label = hello.clientLabel;
 	}
 	return {
 		ok: true,
-		allowTools: options.allowTools,
+		allowTools: persistedAllowedTools,
 		client: existingClient,
 		paired: false,
 		pairingSecretConsumed: false,

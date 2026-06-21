@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "./protocol.ts";
 
 export interface IrohRemoteWorkspace {
 	name: string;
@@ -12,7 +13,7 @@ export interface IrohRemoteClient {
 	nodeId: string;
 	label: string;
 	allowedWorkspaces: string[];
-	allowedTools?: string;
+	allowedTools: string;
 	pairedAt: number;
 	lastSeenAt: number;
 }
@@ -79,7 +80,7 @@ export function parseIrohRemoteClient(value: unknown): IrohRemoteClient {
 		allowedWorkspaces: parseArray(client.allowedWorkspaces, "client allowedWorkspaces", (entry) =>
 			expectString(entry, "client allowed workspace"),
 		),
-		allowedTools: expectOptionalString(client.allowedTools, "client allowedTools"),
+		allowedTools: expectOptionalString(client.allowedTools, "client allowedTools") ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 		pairedAt: expectNumber(client.pairedAt, "client pairedAt"),
 		lastSeenAt: expectNumber(client.lastSeenAt, "client lastSeenAt"),
 	};

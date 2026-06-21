@@ -35,6 +35,7 @@
 
 ### Fixed
 
+- Fixed Iroh remote reconnect authorization to keep each paired client's persisted tool allowlist instead of inheriting broader host restart defaults.
 - Fixed interactive mode to remember the last active settings profile on quit.
 - Fixed store package installs leaking verbose git and npm subprocess output into the interactive screen.
 - Fixed the default store catalog URL to point at the deployed GitHub Pages catalog.

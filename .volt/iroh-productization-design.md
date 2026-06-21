@@ -117,6 +117,8 @@ Persist at least:
 
 A reconnecting client must use its persisted `allowedTools` and workspace permissions. It must not silently gain new tools because the current host process was started with a broader `--allow-tools` value.
 
+Resolved 2026-06-21: `IrohRemoteClient.allowedTools` is now parsed with a read-only legacy default, new pairings store the pair-time tool snapshot, and reconnect authorization returns the persisted client tool grant instead of the current host `--allow-tools` value. Unit and sidecar scenario tests cover read-only clients remaining read-only after restart with unsafe host defaults.
+
 ### G3. Stable protocol v1 contract
 
 Document and test the wire contract used by non-demo clients:
@@ -911,7 +913,7 @@ Docs must cover:
 
 Do not remove experimental language until all of these are true:
 
-- [ ] Per-client tools are persisted and enforced on reconnect.
+- [x] Per-client tools are persisted and enforced on reconnect. Resolved 2026-06-21.
 - [ ] Unsafe tool grants require confirmation or `--yes`.
 - [ ] Pairing workflow is first-class or explicitly scoped to running host startup with clear docs.
 - [ ] Protocol v1 is documented.

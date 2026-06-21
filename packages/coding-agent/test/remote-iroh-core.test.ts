@@ -346,6 +346,20 @@ describe("Iroh remote core helpers", () => {
 			await writeIrohRemoteHostState(statePath, state);
 
 			expect(await readIrohRemoteHostState(statePath)).toEqual(state);
+			expect(
+				parseIrohRemoteHostState({
+					...state,
+					clients: [
+						{
+							nodeId: "legacy-client",
+							label: "old phone",
+							allowedWorkspaces: ["volt"],
+							pairedAt: 10,
+							lastSeenAt: 20,
+						},
+					],
+				}).clients[0].allowedTools,
+			).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
 			expect((await readFile(statePath, "utf8")).endsWith("\n")).toBe(true);
 			expect((await stat(statePath)).isFile()).toBe(true);
 			await writeFile(statePath, JSON.stringify({ ...state, clients: [{ nodeId: "missing fields" }] }));
@@ -423,7 +437,7 @@ describe("Iroh remote core helpers", () => {
 		).toEqual({ ok: false, error: "pairing ticket has already been used", pairingSecretExpired: false });
 
 		const persisted = authorizeIrohRemoteClient(state, makeHello("volt", undefined, "renamed phone"), "client-node", {
-			allowTools: "read",
+			allowTools: "bash",
 			workspace,
 			now: 150,
 		});
@@ -431,9 +445,39 @@ describe("Iroh remote core helpers", () => {
 			throw new Error(persisted.error);
 		}
 		expect(persisted.paired).toBe(false);
+		expect(persisted.allowTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
 		expect(persisted.client.label).toBe("renamed phone");
-		expect(persisted.client.allowedTools).toBe("read");
+		expect(persisted.client.allowedTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
 		expect(persisted.client.lastSeenAt).toBe(150);
+
+		const legacyState = parseIrohRemoteHostState({
+			consumedPairingSecretHashes: [],
+			workspaces: [workspace],
+			clients: [
+				{
+					nodeId: "legacy-client",
+					label: "old phone",
+					allowedWorkspaces: ["volt"],
+					pairedAt: 10,
+					lastSeenAt: 20,
+				},
+			],
+		});
+		const legacyPersisted = authorizeIrohRemoteClient(
+			legacyState,
+			makeHello("volt", undefined, "old phone"),
+			"legacy-client",
+			{
+				allowTools: "bash",
+				workspace,
+				now: 175,
+			},
+		);
+		if (!legacyPersisted.ok) {
+			throw new Error(legacyPersisted.error);
+		}
+		expect(legacyPersisted.allowTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+		expect(legacyPersisted.client.allowedTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
 
 		const unpairedState = createEmptyIrohRemoteHostState();
 		expect(
@@ -553,6 +597,49 @@ describe("Iroh remote core helpers", () => {
 		]);
 	});
 
+	test("host engine uses pair-time tools for new clients and persisted tools for reconnects", async () => {
+		const stateManager = new IrohRemoteHostStateManager({ initialState: createEmptyIrohRemoteHostState() });
+		const workspace: IrohRemoteWorkspace = { name: "volt", path: "/workspace" };
+		const hostEngine = new IrohRemoteHostEngine({
+			allowTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+			now: () => 100,
+			stateManager,
+			workspace,
+		});
+		await hostEngine.pair({
+			irohTicket: "iroh-endpoint-ticket",
+			secret: "secret",
+		});
+		hostEngine.setAllowTools("bash");
+
+		const paired = await hostEngine.authorizeHello(makeHello("volt", "secret", "phone"), "client-node");
+		if (!paired.ok) {
+			throw new Error(paired.error);
+		}
+		expect(paired.paired).toBe(true);
+		expect(paired.allowTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+		expect(paired.client.allowedTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+
+		const restartedHostEngine = new IrohRemoteHostEngine({
+			allowTools: "bash",
+			now: () => 200,
+			stateManager,
+			workspace,
+		});
+		const reconnected = await restartedHostEngine.authorizeHello(
+			makeHello("volt", undefined, "renamed phone"),
+			"client-node",
+		);
+		if (!reconnected.ok) {
+			throw new Error(reconnected.error);
+		}
+		expect(reconnected.paired).toBe(false);
+		expect(reconnected.allowTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+		expect(reconnected.client.label).toBe("renamed phone");
+		expect(reconnected.client.allowedTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+		expect(reconnected.client.lastSeenAt).toBe(200);
+	});
+
 	test("host state manager returns defensive copies", async () => {
 		const workspace: IrohRemoteWorkspace = { name: "volt", path: "/workspace" };
 		const initialState: IrohRemoteHostState = {
@@ -572,6 +659,7 @@ describe("Iroh remote core helpers", () => {
 			nodeId: "leaked-client",
 			label: "leaked",
 			allowedWorkspaces: [],
+			allowedTools: "read",
 			pairedAt: 1,
 			lastSeenAt: 1,
 		});

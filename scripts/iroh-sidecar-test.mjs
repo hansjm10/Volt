@@ -1107,22 +1107,30 @@ async function auditLogScenario() {
 	});
 }
 
-async function pairedClientCurrentToolsScenario() {
+async function pairedClientPersistedToolsScenario() {
 	await withStateDir("paired-tools", async ({ clientStatePath, hostStatePath, stateDir }) => {
 		const { logPath, sourceDir } = await createFakeSourceVolt(stateDir);
 		await runHostClientOnce({
-			clientArgs: ["--message", "pair with bash", "--timeout-ms", "10000"],
+			clientArgs: ["--message", "pair read-only", "--timeout-ms", "10000"],
 			clientStatePath,
-			hostArgs: ["--source-volt", sourceDir, "--allow-tools", "bash"],
+			hostArgs: ["--source-volt", sourceDir],
 			hostStatePath,
 			label: "paired tools initial",
 		});
+
+		const pairedState = JSON.parse(await readFile(hostStatePath, "utf8"));
+		const pairedClient = pairedState.clients?.[0];
+		assert(
+			pairedClient?.allowedTools === "read,grep,find,ls",
+			`Expected paired client to persist read-only tools, got:\n${JSON.stringify(pairedState)}`,
+		);
+
 		await runHostClientOnce({
-			clientArgs: ["--message", "paired default tools", "--timeout-ms", "10000"],
+			clientArgs: ["--message", "paired unsafe host defaults", "--timeout-ms", "10000"],
 			clientStatePath,
-			hostArgs: ["--source-volt", sourceDir, "--no-pairing"],
+			hostArgs: ["--source-volt", sourceDir, "--no-pairing", "--allow-tools", "bash"],
 			hostStatePath,
-			label: "paired tools current allowlist",
+			label: "paired tools persisted allowlist",
 		});
 
 		const entries = (await readFile(logPath, "utf8"))
@@ -1136,7 +1144,7 @@ async function pairedClientCurrentToolsScenario() {
 		assert(toolsIndex !== -1, `Expected second invocation to include --tools, got:\n${secondArgs.join(" ")}`);
 		assert(
 			secondArgs[toolsIndex + 1] === "read,grep,find,ls",
-			`Expected current default tool allowlist, got:\n${secondArgs.join(" ")}`,
+			`Expected persisted read-only tool allowlist despite unsafe host defaults, got:\n${secondArgs.join(" ")}`,
 		);
 	});
 }
@@ -1284,7 +1292,7 @@ const scenarios = [
 	["get_state", getStateScenario],
 	["pairing and revocation", pairingAndRevocationScenario],
 	["audit log", auditLogScenario],
-	["paired client current tools", pairedClientCurrentToolsScenario],
+	["paired client persisted tools", pairedClientPersistedToolsScenario],
 	["pairing ticket workspace binding", pairingTicketWorkspaceBindingScenario],
 	["running workspace authorization", runningWorkspaceAuthorizationScenario],
 	["expired ticket", expiredTicketScenario],

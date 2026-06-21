@@ -106,6 +106,7 @@ export class IrohRemoteHostEngine {
 	private readonly workspace: IrohRemoteWorkspace;
 	private authorizationQueue: Promise<void> = Promise.resolve();
 	private allowTools: string;
+	private pairingAllowTools: string | undefined;
 	private pairingExpiresAt: number | undefined;
 	private pairingSecret: string | undefined;
 
@@ -129,6 +130,7 @@ export class IrohRemoteHostEngine {
 			const secret = options.secret ?? randomBytes(24).toString("base64url");
 			const expiresAt =
 				options.expiresAt ?? this.now() + (options.ttlMs ?? DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS);
+			this.pairingAllowTools = this.allowTools;
 			this.pairingSecret = secret;
 			this.pairingExpiresAt = expiresAt;
 
@@ -180,8 +182,12 @@ export class IrohRemoteHostEngine {
 		hello: IrohRemoteHello,
 		remoteNodeId: string,
 	): Promise<IrohRemoteClientAuthorizationResult> {
+		const allowTools =
+			this.pairingSecret !== undefined && hello.secret === this.pairingSecret
+				? (this.pairingAllowTools ?? this.allowTools)
+				: this.allowTools;
 		const result = await this.stateManager.authorizeClient(hello, remoteNodeId, {
-			allowTools: this.allowTools,
+			allowTools,
 			now: this.now(),
 			pairingExpiresAt: this.pairingExpiresAt,
 			pairingSecret: this.pairingSecret,
@@ -264,6 +270,7 @@ export class IrohRemoteHostEngine {
 	}
 
 	private clearPairingSecret(): void {
+		this.pairingAllowTools = undefined;
 		this.pairingSecret = undefined;
 		this.pairingExpiresAt = undefined;
 	}
