@@ -413,6 +413,8 @@ Required changes:
 
 Preferred preview acceptance: active connections are closed within one second of revocation when host and management command coordinate through a control socket or shared revocation watcher.
 
+Resolved 2026-06-21: Preview revocation will use live host coordination when available. `volt remote revoke <node-id>` must always remove the client from persisted state first so future authorization fails; it must also send a local control-channel revoke request to any running host for the same state path. The running host will keep an active connection registry keyed by authoritative Iroh remote node ID and workspace, close matching native `Connection` handles, let the existing connection cleanup stop the RPC child/runtime, and audit `active_connection_revoked`. Direct `@number0/iroh` API evidence: `Connection.close(errorCode, reason)` and `Connection.closed()` are available for active QUIC connections, with `RecvStream.stop()` and `SendStream.reset()` available if stream-level cleanup is needed. Lifecycle guarantee for C.3: if a live host acknowledges a matching active client, the connection is closed within one second with reason `revoked`; if no host is reachable, the command still succeeds for persisted revocation and reports that active live revocation was not available.
+
 ### `volt remote status`
 
 New command.
@@ -694,6 +696,8 @@ Each event should include where relevant:
 
 Never log raw pairing secrets, provider API keys, full auth paths, or raw prompt content.
 
+Resolved 2026-06-21: Active revocation must audit `active_connection_revoked` when a running host receives a revoke request for an active client. The event should include client node ID, workspace, success, non-secret details such as control-channel source and close reason, and an error if no matching active connection was found on that host.
+
 ## Implementation Plan
 
 ### Phase 1: Policy persistence and safety gates
@@ -765,12 +769,14 @@ Tasks:
 3. Define revocation behavior for active connections.
 4. If implementing active disconnect, add a live host connection registry and management communication path.
 
+Resolved 2026-06-21: Active disconnect is selected for preview and will extend the existing running-host control channel with revoke requests plus a host-side active connection registry.
+
 Acceptance criteria:
 
 - `volt remote status --state <path>` shows persisted workspaces and clients. Resolved 2026-06-21.
 - `volt remote clients --state <path>` includes allowed tools and workspace permissions.
 - `volt remote revoke <node-id>` prevents reconnect.
-- If active disconnect is implemented, active revoked clients are disconnected promptly and an audit event is written.
+- If active disconnect is implemented, active revoked clients are disconnected promptly and an audit event is written. Resolved 2026-06-21 decision: implement this path in C.3.
 - If active disconnect is deferred, docs explicitly state revocation applies to future connections only.
 
 ### Phase 4: Protocol documentation and compatibility tests
@@ -952,7 +958,7 @@ These must be resolved during implementation:
 2. Should duplicate connections from the same client node ID be rejected or should the newer connection replace the older one?
 3. Should `get_messages`, `get_commands`, or `get_available_models` be allowed over remote RPC in preview?
 4. Should client policy updates be supported by a command, or should users revoke and re-pair?
-5. Should active revocation require a host control socket in preview, or is future-connection revocation acceptable with clear docs?
+5. Resolved 2026-06-21: Active revocation should use the running host control channel in preview; persisted-state revocation remains the fallback when no live host is reachable.
 6. Should the host store relay mode in state for status/pair defaults?
 7. Is supported preview explicitly Node-only, or should a native sidecar be planned before removing experimental language?
 
