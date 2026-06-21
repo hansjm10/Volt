@@ -115,11 +115,19 @@ export function authorizeIrohRemoteClient(
 				pairingSecretExpired: false,
 			};
 		}
+		if (matchingPendingPairingTicket && matchingPendingPairingTicket.workspace !== workspace.name) {
+			return {
+				ok: false,
+				error: `pairing ticket is not valid for workspace: ${workspace.name}`,
+				...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
+				pairingSecretExpired: false,
+			};
+		}
 		const allowedTools = matchingPendingPairingTicket?.allowedTools ?? options.allowTools;
 		const allowedWorkspace = matchingPendingPairingTicket?.workspace ?? workspace.name;
 		const client: IrohRemoteClient = {
 			nodeId: remoteNodeId,
-			label: hello.clientLabel || remoteNodeId.slice(0, 12),
+			label: hello.clientLabel || matchingPendingPairingTicket?.labelHint || remoteNodeId.slice(0, 12),
 			allowedWorkspaces: [allowedWorkspace],
 			allowedTools,
 			pairedAt: now,

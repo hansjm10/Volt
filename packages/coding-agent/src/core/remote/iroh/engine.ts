@@ -46,8 +46,10 @@ export interface IrohRemoteHostEngineOptions {
 }
 
 export interface IrohRemoteHostPairOptions {
+	allowTools?: string;
 	expiresAt?: number;
 	irohTicket: string;
+	labelHint?: string;
 	nodeId?: string;
 	relayMode?: IrohRemoteRelayMode;
 	secret?: string;
@@ -135,15 +137,17 @@ export class IrohRemoteHostEngine {
 			const createdAt = this.now();
 			const expiresAt =
 				options.expiresAt ?? createdAt + (options.ttlMs ?? DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS);
-			this.pairingAllowTools = this.allowTools;
+			const allowTools = options.allowTools ?? this.allowTools;
+			this.pairingAllowTools = allowTools;
 			this.pairingSecret = secret;
 			this.pairingExpiresAt = expiresAt;
 			const pendingPairingTicket = await this.stateManager.addPendingPairingTicket({
 				secretHash: hashIrohRemotePairingSecret(secret),
 				workspace,
-				allowedTools: this.allowTools,
+				allowedTools: allowTools,
 				expiresAt,
 				createdAt,
+				...(options.labelHint === undefined ? {} : { labelHint: options.labelHint }),
 			});
 
 			const payload: IrohRemoteTicketPayload = {
@@ -163,6 +167,7 @@ export class IrohRemoteHostEngine {
 					allowedTools: pendingPairingTicket.allowedTools,
 					createdAt: pendingPairingTicket.createdAt,
 					expiresAt: pendingPairingTicket.expiresAt,
+					labelHint: pendingPairingTicket.labelHint,
 					nodeId: options.nodeId,
 					relayMode: options.relayMode,
 				},
@@ -355,6 +360,7 @@ export class IrohRemoteHostEngine {
 						allowedTools: result.consumedPairingTicket.allowedTools,
 						createdAt: result.consumedPairingTicket.createdAt,
 						expiresAt: result.consumedPairingTicket.expiresAt,
+						labelHint: result.consumedPairingTicket.labelHint,
 					}
 				: undefined,
 		});

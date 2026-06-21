@@ -223,6 +223,18 @@ function makeHello(workspace: string, secret?: string, clientLabel = "phone"): I
 	);
 }
 
+function makeHelloWithoutLabel(workspace: string, secret?: string): IrohRemoteHello {
+	return parseIrohRemoteHelloLine(
+		JSON.stringify({
+			type: "volt_iroh_hello",
+			protocol: IROH_REMOTE_ALPN,
+			workspace,
+			secret,
+			clientNodeId: "client-claimed-id",
+		}),
+	);
+}
+
 describe("Iroh remote core helpers", () => {
 	test("encodes, decodes, validates, and expires remote tickets", () => {
 		const payload: IrohRemoteTicketPayload = {
@@ -351,6 +363,7 @@ describe("Iroh remote core helpers", () => {
 						allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 						createdAt: 30,
 						expiresAt: 40,
+						labelHint: "tablet",
 					},
 				],
 			};
@@ -660,6 +673,83 @@ describe("Iroh remote core helpers", () => {
 		expect(reconnected.client.label).toBe("renamed phone");
 		expect(reconnected.client.allowedTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
 		expect(reconnected.client.lastSeenAt).toBe(200);
+	});
+
+	test("host engine stores pair-time policy, relay hints, TTLs, and label hints", async () => {
+		const stateManager = new IrohRemoteHostStateManager({ initialState: createEmptyIrohRemoteHostState() });
+		const workspace: IrohRemoteWorkspace = { name: "volt", path: "/workspace" };
+		const hostEngine = new IrohRemoteHostEngine({
+			allowTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+			now: () => 100,
+			stateManager,
+			workspace,
+		});
+		const pairing = await hostEngine.pair({
+			allowTools: "read,bash",
+			irohTicket: "iroh-endpoint-ticket",
+			labelHint: "tablet",
+			nodeId: "host-node",
+			relayMode: "default",
+			secret: "secret",
+			ttlMs: 25,
+		});
+
+		expect(pairing.payload).toMatchObject({
+			expiresAt: 125,
+			relayMode: "default",
+			workspace: "volt",
+		});
+		expect(await stateManager.getState()).toMatchObject({
+			pendingPairingTickets: [
+				{
+					secretHash: hashIrohRemotePairingSecret("secret"),
+					workspace: "volt",
+					allowedTools: "read,bash",
+					createdAt: 100,
+					expiresAt: 125,
+					labelHint: "tablet",
+				},
+			],
+		});
+
+		const paired = await hostEngine.authorizeHello(makeHelloWithoutLabel("volt", "secret"), "client-node");
+		if (!paired.ok) {
+			throw new Error(paired.error);
+		}
+		expect(paired.allowTools).toBe("read,bash");
+		expect(paired.client).toMatchObject({
+			label: "tablet",
+			allowedTools: "read,bash",
+			allowedWorkspaces: ["volt"],
+		});
+		expect((await stateManager.getState()).pendingPairingTickets).toEqual([]);
+		await expect(hostEngine.authorizeHello(makeHello("volt", "secret"), "other-client")).resolves.toEqual({
+			ok: false,
+			error: "pairing ticket has already been used",
+			pairingSecretExpired: false,
+		});
+	});
+
+	test("host engine rejects pending pairing tickets bound to another workspace", async () => {
+		const stateManager = new IrohRemoteHostStateManager({ initialState: createEmptyIrohRemoteHostState() });
+		await stateManager.addPendingPairingTicket({
+			secretHash: hashIrohRemotePairingSecret("secret"),
+			workspace: "private",
+			allowedTools: "read",
+			createdAt: 100,
+			expiresAt: 200,
+		});
+		const hostEngine = new IrohRemoteHostEngine({
+			now: () => 125,
+			stateManager,
+			workspace: { name: "safe", path: "/workspace" },
+		});
+
+		await expect(hostEngine.authorizeHello(makeHello("safe", "secret"), "client-node")).resolves.toEqual({
+			ok: false,
+			error: "pairing ticket is not valid for workspace: safe",
+			pairingSecretExpired: false,
+		});
 	});
 
 	test("host engine persists pending pairing hashes, rejects expired pending tickets, and audits lifecycle", async () => {

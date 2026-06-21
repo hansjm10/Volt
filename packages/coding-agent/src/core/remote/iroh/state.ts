@@ -24,6 +24,7 @@ export interface IrohRemotePendingPairingTicket {
 	allowedTools: string;
 	expiresAt: number;
 	createdAt: number;
+	labelHint?: string;
 }
 
 export interface IrohRemoteHostState {
@@ -108,12 +109,14 @@ export function parseIrohRemoteClient(value: unknown): IrohRemoteClient {
 
 export function parseIrohRemotePendingPairingTicket(value: unknown): IrohRemotePendingPairingTicket {
 	const ticket = expectRecord(value, "Iroh remote pending pairing ticket");
+	const labelHint = expectOptionalString(ticket.labelHint, "pending pairing ticket labelHint");
 	return {
 		secretHash: expectString(ticket.secretHash, "pending pairing ticket secretHash"),
 		workspace: expectString(ticket.workspace, "pending pairing ticket workspace"),
 		allowedTools: expectString(ticket.allowedTools, "pending pairing ticket allowedTools"),
 		expiresAt: expectNumber(ticket.expiresAt, "pending pairing ticket expiresAt"),
 		createdAt: expectNumber(ticket.createdAt, "pending pairing ticket createdAt"),
+		...(labelHint === undefined ? {} : { labelHint }),
 	};
 }
 
