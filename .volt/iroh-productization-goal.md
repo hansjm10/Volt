@@ -288,10 +288,10 @@ the rollup item is resolved, and the final turn's required verification passed.
 </group>
 
 <group n="3" title="Client management and host status">
-  <item ref="C.1" status="open" prereq="A.1">
+  <item ref="C.1" status="resolved" prereq="A.1">
     <title>Add `volt remote status` for persisted host state, showing state/audit paths, workspaces, paired clients, per-client tools, last seen timestamps, and a clear persisted-state-only warning when no live host state is available</title>
     <acceptance>Status never prints secrets or secret hashes; output is deterministic and testable; includes workspace names/paths, client labels/node IDs, allowedWorkspaces, allowedTools, pairedAt, lastSeenAt; if live host discovery is absent, output explicitly says persisted state only; docs mention status.</acceptance>
-    <evidence/>
+    <evidence>Resolved 2026-06-21: added deterministic JSON `volt remote status` output with state/audit paths, sorted workspaces, client count, client labels/node IDs, allowedWorkspaces, allowedTools, pairedAt, lastSeenAt, persisted-state-only warning, and secret/hash omission tests plus sidecar status scenario/docs; verification: lsp.diagnostics on changed TS/test files, cd packages/coding-agent &amp;&amp; node node_modules/vitest/dist/cli.js --run test/remote-cli.test.ts, node --check scripts/iroh-sidecar-test.mjs, npm run iroh:poc:test, npm run check, git diff --check; commit 431af3d7</evidence>
   </item>
 
   <item ref="C.2" status="open" prereq="C.1" type="decision">
