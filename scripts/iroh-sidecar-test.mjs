@@ -1073,6 +1073,7 @@ async function auditLogScenario() {
 		const eventTypes = auditEvents.map((event) => event.type);
 		for (const eventType of [
 			"pairing_ticket_created",
+			"pairing_ticket_consumed",
 			"client_connected",
 			"client_authorized",
 			"client_rejected",

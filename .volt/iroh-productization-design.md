@@ -649,6 +649,8 @@ Requirements:
 - Expired secrets are rejected.
 - Expired pending tickets should be pruned opportunistically.
 
+Resolved 2026-06-21: Pairing creation now persists only `sha256:` pending-ticket hashes plus non-secret metadata (`workspace`, `allowedTools`, `createdAt`, `expiresAt`). Authorization hashes presented secrets, rejects consumed hashes even after host restart, rejects and prunes expired pending tickets, removes pending entries on consumption, and audits `pairing_ticket_created`, `pairing_ticket_consumed`, and `pairing_ticket_expired` without raw secrets.
+
 ### Audit events
 
 Minimum event types:

@@ -2,7 +2,11 @@ import { Buffer } from "node:buffer";
 import { randomBytes } from "node:crypto";
 import type { IrohBiStreamLike, IrohBytes, IrohRecvStreamLike } from "../../rpc/index.ts";
 import { type IrohRemoteAuditEventInput, IrohRemoteAuditLogger } from "./audit.ts";
-import type { IrohRemoteClientAuthorizationResult, IrohRemoteClientAuthorizationSuccess } from "./authorization.ts";
+import {
+	hashIrohRemotePairingSecret,
+	type IrohRemoteClientAuthorizationResult,
+	type IrohRemoteClientAuthorizationSuccess,
+} from "./authorization.ts";
 import {
 	createIrohRemoteHandshakeFailure,
 	createIrohRemoteHandshakeSuccess,
@@ -128,11 +132,19 @@ export class IrohRemoteHostEngine {
 			}
 
 			const secret = options.secret ?? randomBytes(24).toString("base64url");
+			const createdAt = this.now();
 			const expiresAt =
-				options.expiresAt ?? this.now() + (options.ttlMs ?? DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS);
+				options.expiresAt ?? createdAt + (options.ttlMs ?? DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS);
 			this.pairingAllowTools = this.allowTools;
 			this.pairingSecret = secret;
 			this.pairingExpiresAt = expiresAt;
+			const pendingPairingTicket = await this.stateManager.addPendingPairingTicket({
+				secretHash: hashIrohRemotePairingSecret(secret),
+				workspace,
+				allowedTools: this.allowTools,
+				expiresAt,
+				createdAt,
+			});
 
 			const payload: IrohRemoteTicketPayload = {
 				alpn: IROH_REMOTE_ALPN,
@@ -148,7 +160,9 @@ export class IrohRemoteHostEngine {
 				type: "pairing_ticket_created",
 				workspace: payload.workspace,
 				details: {
-					expiresAt,
+					allowedTools: pendingPairingTicket.allowedTools,
+					createdAt: pendingPairingTicket.createdAt,
+					expiresAt: pendingPairingTicket.expiresAt,
 					nodeId: options.nodeId,
 					relayMode: options.relayMode,
 				},
@@ -200,6 +214,7 @@ export class IrohRemoteHostEngine {
 			this.clearPairingSecret();
 		}
 
+		await this.logPairingTicketLifecycle(result, remoteNodeId);
 		await this.logAuthorization(hello, remoteNodeId, result);
 		return result;
 	}
@@ -309,6 +324,40 @@ export class IrohRemoteHostEngine {
 				responseWriteError: error instanceof Error ? error.message : String(error),
 			};
 		}
+	}
+
+	private async logPairingTicketLifecycle(
+		result: IrohRemoteClientAuthorizationResult,
+		remoteNodeId: string,
+	): Promise<void> {
+		for (const ticket of result.expiredPairingTickets ?? []) {
+			await this.log({
+				type: "pairing_ticket_expired",
+				workspace: ticket.workspace,
+				success: false,
+				details: {
+					allowedTools: ticket.allowedTools,
+					createdAt: ticket.createdAt,
+					expiresAt: ticket.expiresAt,
+				},
+			});
+		}
+		if (!result.ok || !result.pairingSecretConsumed) {
+			return;
+		}
+		await this.log({
+			type: "pairing_ticket_consumed",
+			clientNodeId: remoteNodeId,
+			workspace: result.workspace.name,
+			success: true,
+			details: result.consumedPairingTicket
+				? {
+						allowedTools: result.consumedPairingTicket.allowedTools,
+						createdAt: result.consumedPairingTicket.createdAt,
+						expiresAt: result.consumedPairingTicket.expiresAt,
+					}
+				: undefined,
+		});
 	}
 
 	private async logAuthorization(

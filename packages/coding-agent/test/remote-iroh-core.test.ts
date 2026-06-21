@@ -15,6 +15,7 @@ import {
 	encodeIrohRemoteTicketPayload,
 	getIrohRemoteRpcFilterResult,
 	getIrohRemoteUnsafeAllowedTools,
+	hashIrohRemotePairingSecret,
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_REDACTED_BASH_OUTPUT_PATH,
 	IROH_REMOTE_REDACTED_EXPORT_PATH,
@@ -343,24 +344,34 @@ describe("Iroh remote core helpers", () => {
 						lastSeenAt: 20,
 					},
 				],
+				pendingPairingTickets: [
+					{
+						secretHash: "sha256:pending",
+						workspace: "volt",
+						allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+						createdAt: 30,
+						expiresAt: 40,
+					},
+				],
 			};
 			await writeIrohRemoteHostState(statePath, state);
 
 			expect(await readIrohRemoteHostState(statePath)).toEqual(state);
-			expect(
-				parseIrohRemoteHostState({
-					...state,
-					clients: [
-						{
-							nodeId: "legacy-client",
-							label: "old phone",
-							allowedWorkspaces: ["volt"],
-							pairedAt: 10,
-							lastSeenAt: 20,
-						},
-					],
-				}).clients[0].allowedTools,
-			).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+			const parsedLegacyState = parseIrohRemoteHostState({
+				...state,
+				clients: [
+					{
+						nodeId: "legacy-client",
+						label: "old phone",
+						allowedWorkspaces: ["volt"],
+						pairedAt: 10,
+						lastSeenAt: 20,
+					},
+				],
+				pendingPairingTickets: undefined,
+			});
+			expect(parsedLegacyState.clients[0].allowedTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+			expect(parsedLegacyState.pendingPairingTickets).toEqual([]);
 			expect((await readFile(statePath, "utf8")).endsWith("\n")).toBe(true);
 			expect((await stat(statePath)).isFile()).toBe(true);
 			await writeFile(statePath, JSON.stringify({ ...state, clients: [{ nodeId: "missing fields" }] }));
@@ -585,7 +596,11 @@ describe("Iroh remote core helpers", () => {
 		expect(await hostEngine.listClients()).toEqual([expect.objectContaining({ allowedWorkspaces: ["volt"] })]);
 
 		const rejected = await hostEngine.authorizeHello(makeHello("volt", "secret", "second phone"), "second-client");
-		expect(rejected).toEqual({ ok: false, error: "client is not paired", pairingSecretExpired: false });
+		expect(rejected).toEqual({
+			ok: false,
+			error: "pairing ticket has already been used",
+			pairingSecretExpired: false,
+		});
 
 		await expect(hostEngine.revokeClient("client-node")).resolves.toEqual({
 			revoked: true,
@@ -594,6 +609,7 @@ describe("Iroh remote core helpers", () => {
 		await expect(hostEngine.listClients()).resolves.toEqual([]);
 		expect(sink.events.map((event) => event.type)).toEqual([
 			"pairing_ticket_created",
+			"pairing_ticket_consumed",
 			"client_authorized",
 			"clients_listed",
 			"clients_listed",
@@ -646,6 +662,75 @@ describe("Iroh remote core helpers", () => {
 		expect(reconnected.client.lastSeenAt).toBe(200);
 	});
 
+	test("host engine persists pending pairing hashes, rejects expired pending tickets, and audits lifecycle", async () => {
+		const sink = new InMemoryAuditSink();
+		const auditLogger = new IrohRemoteAuditLogger({ now: () => 700, sink });
+		const stateManager = new IrohRemoteHostStateManager({ initialState: createEmptyIrohRemoteHostState() });
+		const workspace: IrohRemoteWorkspace = { name: "volt", path: "/workspace" };
+		const hostEngine = new IrohRemoteHostEngine({
+			auditLogger,
+			now: () => 100,
+			stateManager,
+			workspace,
+		});
+		const secret = "raw-pairing-secret";
+		await hostEngine.pair({
+			irohTicket: "iroh-endpoint-ticket",
+			secret,
+			ttlMs: 50,
+		});
+
+		const pendingState = await stateManager.getState();
+		expect(JSON.stringify(pendingState)).not.toContain(secret);
+		expect(pendingState.pendingPairingTickets).toEqual([
+			{
+				secretHash: hashIrohRemotePairingSecret(secret),
+				workspace: "volt",
+				allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+				createdAt: 100,
+				expiresAt: 150,
+			},
+		]);
+
+		const restartedHostEngine = new IrohRemoteHostEngine({
+			auditLogger,
+			now: () => 200,
+			stateManager,
+			workspace,
+		});
+		const expired = await restartedHostEngine.authorizeHello(makeHello("volt", secret, "late phone"), "late-client");
+		expect(expired).toEqual({
+			ok: false,
+			error: "pairing ticket has expired",
+			expiredPairingTickets: [
+				{
+					secretHash: hashIrohRemotePairingSecret(secret),
+					workspace: "volt",
+					allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+					createdAt: 100,
+					expiresAt: 150,
+				},
+			],
+			pairingSecretExpired: true,
+		});
+		expect((await stateManager.getState()).pendingPairingTickets).toEqual([]);
+		expect(sink.events.map((event) => event.type)).toEqual([
+			"pairing_ticket_created",
+			"pairing_ticket_expired",
+			"client_rejected",
+		]);
+		expect(sink.events).toEqual([
+			expect.objectContaining({ type: "pairing_ticket_created", workspace: "volt" }),
+			expect.objectContaining({
+				type: "pairing_ticket_expired",
+				workspace: "volt",
+				success: false,
+				details: expect.objectContaining({ createdAt: 100, expiresAt: 150 }),
+			}),
+			expect.objectContaining({ type: "client_rejected", error: "pairing ticket has expired" }),
+		]);
+	});
+
 	test("host state manager returns defensive copies", async () => {
 		const workspace: IrohRemoteWorkspace = { name: "volt", path: "/workspace" };
 		const initialState: IrohRemoteHostState = {
@@ -653,14 +738,37 @@ describe("Iroh remote core helpers", () => {
 			consumedPairingSecretHashes: [],
 			workspaces: [{ ...workspace }],
 			clients: [],
+			pendingPairingTickets: [
+				{
+					secretHash: "sha256:pending",
+					workspace: "volt",
+					allowedTools: "read",
+					createdAt: 1,
+					expiresAt: 200,
+				},
+			],
 		};
 		const stateManager = new IrohRemoteHostStateManager({ initialState });
 		initialState.workspaces[0].path = "/mutated-before-load";
 		initialState.hostSecretKey?.push(4);
+		initialState.pendingPairingTickets?.push({
+			secretHash: "sha256:leaked",
+			workspace: "leaked",
+			allowedTools: "bash",
+			createdAt: 1,
+			expiresAt: 200,
+		});
 
 		const loaded = await stateManager.load();
 		loaded.hostSecretKey?.push(5);
 		loaded.workspaces[0].path = "/mutated-loaded";
+		loaded.pendingPairingTickets?.push({
+			secretHash: "sha256:loaded-leak",
+			workspace: "loaded-leak",
+			allowedTools: "bash",
+			createdAt: 1,
+			expiresAt: 200,
+		});
 		loaded.clients.push({
 			nodeId: "leaked-client",
 			label: "leaked",
@@ -674,6 +782,15 @@ describe("Iroh remote core helpers", () => {
 			consumedPairingSecretHashes: [],
 			workspaces: [{ name: "volt", path: "/workspace" }],
 			clients: [],
+			pendingPairingTickets: [
+				{
+					secretHash: "sha256:pending",
+					workspace: "volt",
+					allowedTools: "read",
+					createdAt: 1,
+					expiresAt: 200,
+				},
+			],
 		});
 
 		const authorized = await stateManager.authorizeClient(makeHello("volt", "secret"), "client-node", {
@@ -874,7 +991,7 @@ describe("Iroh remote core helpers", () => {
 		]);
 
 		expect(first.ok).toBe(true);
-		expect(second).toEqual({ ok: false, error: "client is not paired", pairingSecretExpired: false });
+		expect(second).toEqual({ ok: false, error: "pairing ticket has already been used", pairingSecretExpired: false });
 		expect(await hostEngine.listClients()).toEqual([expect.objectContaining({ nodeId: "first-client" })]);
 	});
 
@@ -898,7 +1015,6 @@ describe("Iroh remote core helpers", () => {
 
 			const secondEngine = new IrohRemoteHostEngine({
 				now: () => 125,
-				pairingSecret: "secret",
 				stateManager: new IrohRemoteHostStateManager({ statePath }),
 				workspace,
 			});

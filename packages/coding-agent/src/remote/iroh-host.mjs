@@ -248,6 +248,7 @@ function syncState(target, source) {
 	target.consumedPairingSecretHashes = source.consumedPairingSecretHashes ?? [];
 	target.workspaces = source.workspaces ?? [];
 	target.clients = source.clients ?? [];
+	target.pendingPairingTickets = source.pendingPairingTickets ?? [];
 }
 
 function getDefaultAuditPath(statePath) {

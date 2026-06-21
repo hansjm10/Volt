@@ -11,6 +11,7 @@ import {
 	createEmptyIrohRemoteHostState,
 	type IrohRemoteClient,
 	type IrohRemoteHostState,
+	type IrohRemotePendingPairingTicket,
 	type IrohRemoteWorkspace,
 	readIrohRemoteHostState,
 	writeIrohRemoteHostState,
@@ -66,6 +67,18 @@ export class IrohRemoteHostStateManager {
 			const savedWorkspace = upsertIrohRemoteWorkspace(state, workspace, allowTools);
 			await this.saveUnlocked(state);
 			return cloneWorkspace(savedWorkspace);
+		});
+	}
+
+	async addPendingPairingTicket(ticket: IrohRemotePendingPairingTicket): Promise<IrohRemotePendingPairingTicket> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			state.pendingPairingTickets = [
+				...(state.pendingPairingTickets ?? []).filter((entry) => entry.secretHash !== ticket.secretHash),
+				clonePendingPairingTicket(ticket),
+			];
+			await this.saveUnlocked(state);
+			return clonePendingPairingTicket(ticket);
 		});
 	}
 
@@ -183,11 +196,22 @@ export class IrohRemoteHostStateManager {
 
 function cloneAuthorizationResult(result: IrohRemoteClientAuthorizationResult): IrohRemoteClientAuthorizationResult {
 	if (!result.ok) {
-		return { ...result };
+		return {
+			...result,
+			...(result.expiredPairingTickets
+				? { expiredPairingTickets: result.expiredPairingTickets.map((ticket) => clonePendingPairingTicket(ticket)) }
+				: {}),
+		};
 	}
 	return {
 		...result,
 		client: cloneClient(result.client),
+		...(result.consumedPairingTicket
+			? { consumedPairingTicket: clonePendingPairingTicket(result.consumedPairingTicket) }
+			: {}),
+		...(result.expiredPairingTickets
+			? { expiredPairingTickets: result.expiredPairingTickets.map((ticket) => clonePendingPairingTicket(ticket)) }
+			: {}),
 		workspace: cloneWorkspace(result.workspace),
 	};
 }
@@ -205,7 +229,12 @@ function cloneHostState(state: IrohRemoteHostState): IrohRemoteHostState {
 		consumedPairingSecretHashes: [...(state.consumedPairingSecretHashes ?? [])],
 		workspaces: state.workspaces.map((workspace) => cloneWorkspace(workspace)),
 		clients: state.clients.map((client) => cloneClient(client)),
+		pendingPairingTickets: (state.pendingPairingTickets ?? []).map((ticket) => clonePendingPairingTicket(ticket)),
 	};
+}
+
+function clonePendingPairingTicket(ticket: IrohRemotePendingPairingTicket): IrohRemotePendingPairingTicket {
+	return { ...ticket };
 }
 
 function cloneWorkspace(workspace: IrohRemoteWorkspace): IrohRemoteWorkspace {

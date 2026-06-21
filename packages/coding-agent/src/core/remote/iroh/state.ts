@@ -18,15 +18,30 @@ export interface IrohRemoteClient {
 	lastSeenAt: number;
 }
 
+export interface IrohRemotePendingPairingTicket {
+	secretHash: string;
+	workspace: string;
+	allowedTools: string;
+	expiresAt: number;
+	createdAt: number;
+}
+
 export interface IrohRemoteHostState {
 	hostSecretKey?: number[];
 	consumedPairingSecretHashes: string[];
 	workspaces: IrohRemoteWorkspace[];
 	clients: IrohRemoteClient[];
+	pendingPairingTickets?: IrohRemotePendingPairingTicket[];
 }
 
 export function createEmptyIrohRemoteHostState(): IrohRemoteHostState {
-	return { hostSecretKey: undefined, consumedPairingSecretHashes: [], workspaces: [], clients: [] };
+	return {
+		hostSecretKey: undefined,
+		consumedPairingSecretHashes: [],
+		workspaces: [],
+		clients: [],
+		pendingPairingTickets: [],
+	};
 }
 
 export async function readIrohRemoteHostState(path: string): Promise<IrohRemoteHostState> {
@@ -60,6 +75,11 @@ export function parseIrohRemoteHostState(value: unknown): IrohRemoteHostState {
 		),
 		workspaces: parseArray(state.workspaces, "workspaces", parseIrohRemoteWorkspace),
 		clients: parseArray(state.clients, "clients", parseIrohRemoteClient),
+		pendingPairingTickets: parseOptionalArray(
+			state.pendingPairingTickets,
+			"pendingPairingTickets",
+			parseIrohRemotePendingPairingTicket,
+		),
 	};
 }
 
@@ -86,11 +106,29 @@ export function parseIrohRemoteClient(value: unknown): IrohRemoteClient {
 	};
 }
 
+export function parseIrohRemotePendingPairingTicket(value: unknown): IrohRemotePendingPairingTicket {
+	const ticket = expectRecord(value, "Iroh remote pending pairing ticket");
+	return {
+		secretHash: expectString(ticket.secretHash, "pending pairing ticket secretHash"),
+		workspace: expectString(ticket.workspace, "pending pairing ticket workspace"),
+		allowedTools: expectString(ticket.allowedTools, "pending pairing ticket allowedTools"),
+		expiresAt: expectNumber(ticket.expiresAt, "pending pairing ticket expiresAt"),
+		createdAt: expectNumber(ticket.createdAt, "pending pairing ticket createdAt"),
+	};
+}
+
 function parseArray<T>(value: unknown, label: string, parseEntry: (value: unknown) => T): T[] {
 	if (!Array.isArray(value)) {
 		throw new Error(`${label} must be an array`);
 	}
 	return value.map((entry) => parseEntry(entry));
+}
+
+function parseOptionalArray<T>(value: unknown, label: string, parseEntry: (value: unknown) => T): T[] {
+	if (value === undefined) {
+		return [];
+	}
+	return parseArray(value, label, parseEntry);
 }
 
 function parseOptionalByteArray(value: unknown, label: string): number[] | undefined {
