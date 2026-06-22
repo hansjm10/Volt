@@ -340,10 +340,10 @@ blocked.
     <evidence>2026-06-22: iOS startup now prioritizes explicit launch tickets, otherwise saved-host reconnect, otherwise unpaired state; saved reconnect sends secret-free tickets, verifies handshake hostNodeId, maps stable outcomes into savedHostIssue/offline state, and preserves saved records for retryable/revoked/workspace failures; verification: cd ../volt-app/Packages/VoltClient &amp;&amp; swift test, app package diff/app design whitespace checks, and root doc diff check passed; app commit 7448f53.</evidence>
   </item>
 
-  <item ref="C.3" status="open" prereq="C.1,A.2">
+  <item ref="C.3" status="resolved" prereq="C.1,A.2">
     <title>Align Forget Host and endpoint identity behavior with one-host v1 and future multi-host support</title>
     <acceptance>Forget Host deletes the selected saved host record; one-host v1 clears endpoint identity only according to A.2; future multi-host behavior is not blocked by current storage; tests cover Forget Host, endpoint identity retention/clearing, and re-pair behavior after forget.</acceptance>
-    <evidence/>
+    <evidence>2026-06-22: iOS Forget Host now uses an explicit endpoint identity reset path, clears saved-host issue state with the selected saved record, preserves endpoint identity for client_unknown/client_revoked outcomes until intentional forget, and an Iroh transport regression proves reset rotates the client node ID for later re-pair; verification: cd ../volt-app/Packages/VoltClient &amp;&amp; swift test, app package diff/app design whitespace checks, and root doc diff check passed; app commit b9ed40e.</evidence>
   </item>
 
   <item ref="C.4" status="open" prereq="C.2,C.3">

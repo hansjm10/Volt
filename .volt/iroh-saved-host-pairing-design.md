@@ -334,6 +334,8 @@ The app should not rotate or clear its endpoint identity automatically when it r
 
 If the app has cleared its endpoint identity, the host cannot cryptographically connect the new node ID to the revoked tombstone. That device is treated as a new phone and still requires a fresh desktop-generated pairing QR. The product should not describe endpoint rotation as a way to bypass revocation.
 
+Implemented 2026-06-22: the iOS one-host v1 Forget Host path disconnects, clears the selected saved host record, clears saved-host issue state, and clears the persisted Iroh endpoint identity. `client_revoked` and `client_unknown` reconnect outcomes keep the saved host and endpoint identity until the user intentionally forgets the host. App tests cover endpoint identity retention and reset, and an Iroh transport test proves endpoint reset rotates the client node ID for later re-pair.
+
 ## UX Requirements
 
 Desktop host:
