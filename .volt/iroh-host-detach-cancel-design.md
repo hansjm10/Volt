@@ -176,6 +176,8 @@ If the runtime is disposed while active, that is cancellation/stop behavior and 
 
 Resolved 2026-06-22: Integrated runtime disposal moved to host-owned registry shutdown for this phase. Host shutdown disposes retained runtimes and audits `remote_runtime_stopped` while preserving the legacy `runtime_started`/`runtime_stopped` events for existing diagnostics.
 
+Resolved 2026-06-22: Detached integrated runtimes now use an explicit retention policy. Active detached runtimes wait for the session to become idle and are not disposed by TTL while work is running; idle detached runtimes are retained for 30 minutes by default, configurable with `--detached-runtime-ttl-ms`, then audit `remote_runtime_retention_expired` and dispose with reason `detached_runtime_ttl_expired`.
+
 ### Explicit Cancel Path
 
 Keep explicit cancel narrow:
@@ -272,6 +274,7 @@ Record exact device, iOS version, macOS version, relay mode, and network.
 1. Detached runtime retention:
    - Proposed default: continue active prompts to completion, then retain idle runtime for a short TTL such as 10 to 30 minutes.
    - Need product decision on whether active detached prompts can run indefinitely.
+   - Resolved 2026-06-22: active detached prompts continue until idle; idle detached runtimes retain for 30 minutes by default and can be configured per host with `--detached-runtime-ttl-ms`.
 
 2. App disconnect button:
    - Proposed default: app-level disconnect is detach only.

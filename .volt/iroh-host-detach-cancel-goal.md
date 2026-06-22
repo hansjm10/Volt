@@ -265,10 +265,10 @@ the rollup item is resolved, and the final turn's required verification passed.
     <evidence>Resolved 2026-06-22: added an active remote prompt regression through the Iroh remote filter and close-deferring transport proving `abort` calls `session.abort()`, waits for abort settlement before responding, leaves detach-only paths distinct, and persists observable transcript output; verification: `cd packages/coding-agent &amp;&amp; node node_modules/vitest/dist/cli.js --run test/remote-iroh-lifecycle-contract.test.ts`, `npm run check`, `npm run iroh:poc:test`; commit be521aa0</evidence>
   </item>
 
-  <item ref="B.3" status="open" prereq="B.1">
+  <item ref="B.3" status="resolved" prereq="B.1">
     <title>Add detached runtime retention and cleanup policy</title>
     <acceptance>Detached runtimes are retained long enough for reconnect and cleaned up by a documented TTL/resource policy; active prompts either continue to completion or stop only by explicit policy; idle detached runtimes are disposed without leaking resources; tests cover TTL cleanup and no premature cleanup during active work.</acceptance>
-    <evidence/>
+    <evidence>Resolved 2026-06-22: added a detached integrated runtime retention scheduler, default 30-minute idle TTL configurable via `--detached-runtime-ttl-ms`, host audit/disposal on TTL expiry, unit coverage for idle expiry/no active-run expiry/cancel-on-reattach, and a native integrated TTL cleanup scenario; verification: `node --check packages/coding-agent/src/remote/iroh-host.mjs`, `node --check scripts/iroh-sidecar-test.mjs`, `cd packages/coding-agent &amp;&amp; node node_modules/vitest/dist/cli.js --run test/integrated-runtime-retention.test.ts`, `npm run check`, `npm run iroh:poc:test`; commit 411958d1</evidence>
   </item>
 </group>
 
