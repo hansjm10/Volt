@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -260,14 +260,22 @@ async function runRawHandshakeLine(ticket, line) {
 	}
 }
 
-async function openRawAuthorizedClient(ticket, options = {}) {
+async function openRawAuthorizedClientOnEndpoint(endpoint, ticket, options = {}) {
 	const payload = decodeTicketPayload(ticket);
-	const endpoint = await bindRawClientEndpoint(payload.relayMode ?? "disabled");
 	let connection;
 	try {
 		const endpointTicket = EndpointTicket.fromString(payload.irohTicket);
-		connection = await endpoint.connect(endpointTicket.endpointAddr(), ALPN);
-		const stream = await connection.openBi();
+		try {
+			connection = await endpoint.connect(endpointTicket.endpointAddr(), ALPN);
+		} catch (error) {
+			throw new Error(`Raw RPC connect failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		let stream;
+		try {
+			stream = await connection.openBi();
+		} catch (error) {
+			throw new Error(`Raw RPC stream open failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
 		await stream.send.writeAll(
 			toBytes(
 				serializeJsonLine({
@@ -284,21 +292,103 @@ async function openRawAuthorizedClient(ticket, options = {}) {
 		const handshake = await readLineFromIroh(stream.recv);
 		if (handshake.line === undefined) throw new Error("Host closed before raw RPC handshake response");
 		const handshakeResponse = JSON.parse(handshake.line);
-		if (handshakeResponse.type !== "volt_iroh_handshake" || !handshakeResponse.success) {
+		if (handshakeResponse.type !== "volt_iroh_handshake") {
+			throw new Error(`Unexpected raw RPC handshake response: ${JSON.stringify(handshakeResponse)}`);
+		}
+		if (handshakeResponse.success !== true && options.expectSuccess !== false) {
 			throw new Error(handshakeResponse.error ?? "Raw RPC handshake rejected");
 		}
-		return { connection, endpoint, nodeId: endpoint.id().toString(), stream };
+		return {
+			connection,
+			handshakeResponse,
+			nodeId: endpoint.id().toString(),
+			rest: handshake.rest,
+			stream,
+		};
 	} catch (error) {
 		if (connection) connection.close(0n, Array.from(Buffer.from("done", "utf8")));
+		throw error;
+	}
+}
+
+async function openRawAuthorizedStreamOnConnection(rawClient, ticket, options = {}) {
+	const payload = decodeTicketPayload(ticket);
+	const stream = await rawClient.connection.openBi();
+	await stream.send.writeAll(
+		toBytes(
+			serializeJsonLine({
+				type: "volt_iroh_hello",
+				protocol: ALPN_TEXT,
+				workspace: payload.workspace,
+				secret: payload.secret,
+				clientLabel: options.clientLabel ?? `raw-node-${process.pid}`,
+				clientNodeId: rawClient.nodeId,
+			}),
+		),
+	);
+	const handshake = await readLineFromIroh(stream.recv);
+	if (handshake.line === undefined) throw new Error("Host closed before raw RPC handshake response");
+	const handshakeResponse = JSON.parse(handshake.line);
+	if (handshakeResponse.type !== "volt_iroh_handshake") {
+		throw new Error(`Unexpected raw RPC handshake response: ${JSON.stringify(handshakeResponse)}`);
+	}
+	if (handshakeResponse.success !== true && options.expectSuccess !== false) {
+		throw new Error(handshakeResponse.error ?? "Raw RPC handshake rejected");
+	}
+	return { handshakeResponse, rest: handshake.rest, stream };
+}
+
+async function openRawAuthorizedClient(ticket, options = {}) {
+	const payload = decodeTicketPayload(ticket);
+	const endpoint = await bindRawClientEndpoint(payload.relayMode ?? "disabled");
+	try {
+		const rawClient = await openRawAuthorizedClientOnEndpoint(endpoint, ticket, options);
+		return { ...rawClient, endpoint, ownsEndpoint: true };
+	} catch (error) {
 		await endpoint.close();
 		throw error;
 	}
 }
 
+function closeRawConnection(connection) {
+	if (!connection) return;
+	connection.close(0n, Array.from(Buffer.from("done", "utf8")));
+}
+
 async function closeRawAuthorizedClient(rawClient) {
 	if (!rawClient) return;
-	rawClient.connection.close(0n, Array.from(Buffer.from("done", "utf8")));
-	await rawClient.endpoint.close();
+	closeRawConnection(rawClient.connection);
+	if (rawClient.ownsEndpoint !== false) {
+		await rawClient.endpoint.close();
+	}
+}
+
+async function readRawRpcResponse(rawClient, command, label, timeoutMs = PROCESS_TIMEOUT_MS) {
+	await rawClient.stream.send.writeAll(toBytes(serializeJsonLine(command)));
+	const lines = [];
+	let timeoutId;
+	try {
+		while (true) {
+			const lineRead = await Promise.race([
+				readLineFromIroh(rawClient.stream.recv, rawClient.rest),
+				new Promise((_, reject) => {
+					timeoutId = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+				}),
+			]);
+			clearTimeout(timeoutId);
+			rawClient.rest = lineRead.rest;
+			if (lineRead.line === undefined) {
+				throw new Error(`${label} closed before response ${command.id ?? command.type}`);
+			}
+			lines.push(lineRead.line);
+			const event = JSON.parse(lineRead.line);
+			if (event.type === "response" && event.id === command.id) {
+				return { event, lines };
+			}
+		}
+	} finally {
+		clearTimeout(timeoutId);
+	}
 }
 
 async function waitForRawConnectionClosed(connection, label, timeoutMs = 2000) {
@@ -341,6 +431,54 @@ async function readAuditEvents(auditPath) {
 		.split("\n")
 		.filter((line) => line.length > 0)
 		.map((line) => JSON.parse(line));
+}
+
+async function findSessionFileById(directory, sessionId) {
+	let entries;
+	try {
+		entries = await readdir(directory, { withFileTypes: true });
+	} catch (error) {
+		if (error?.code === "ENOENT") return undefined;
+		throw error;
+	}
+	for (const entry of entries) {
+		const entryPath = join(directory, entry.name);
+		if (entry.isDirectory()) {
+			const nested = await findSessionFileById(entryPath, sessionId);
+			if (nested) return nested;
+			continue;
+		}
+		if (entry.isFile() && entry.name.endsWith(`_${sessionId}.jsonl`)) {
+			return entryPath;
+		}
+	}
+	return undefined;
+}
+
+async function getOnlySessionDirectory(agentDir, label) {
+	const sessionsRoot = join(agentDir, "sessions");
+	const entries = await readdir(sessionsRoot, { withFileTypes: true });
+	const directories = entries.filter((entry) => entry.isDirectory()).map((entry) => join(sessionsRoot, entry.name));
+	assert(directories.length === 1, `${label}: expected one session directory`);
+	return directories[0];
+}
+
+async function ensureSessionFileForId(agentDir, workspacePath, sessionId, label) {
+	const existing = await findSessionFileById(join(agentDir, "sessions"), sessionId);
+	if (existing) return existing;
+	const sessionDir = await getOnlySessionDirectory(agentDir, label);
+	const sessionFile = join(sessionDir, `2026-06-21T00-00-00-000Z_${sessionId}.jsonl`);
+	await writeFile(
+		sessionFile,
+		`${JSON.stringify({
+			type: "session",
+			version: 3,
+			id: sessionId,
+			timestamp: "2026-06-21T00:00:00.000Z",
+			cwd: workspacePath,
+		})}\n`,
+	);
+	return sessionFile;
 }
 
 async function createFakeSourceVolt(stateDir) {
@@ -825,6 +963,208 @@ async function integratedVoltGetStateScenario() {
 			}
 		} finally {
 			await stopProcess(host.child);
+		}
+	});
+}
+
+async function integratedVoltReconnectSessionScenario() {
+	await withStateDir("integrated-reconnect", async ({ clientStatePath, hostStatePath, stateDir }) => {
+		const agentDir = await createIntegratedVoltAgentDir(stateDir);
+		const workspacePath = join(stateDir, "workspace");
+		await mkdir(workspacePath, { recursive: true });
+		const canonicalWorkspacePath = await realpath(workspacePath);
+		const workspaceArg = `reconnect=${workspacePath}`;
+
+		const initial = await runHostClientOnce({
+			clientArgs: ["--get-state", "--timeout-ms", "10000"],
+			clientStatePath,
+			hostArgs: ["--agent-dir", agentDir, "--workspace", workspaceArg, "--integrated-volt"],
+			hostStatePath,
+			label: "integrated reconnect initial",
+		});
+		const initialState = JSON.parse(initial.clientOutput.stdout);
+		const initialSessionId = initialState.sessionId;
+		assert(initialSessionId, "Reconnect initial get_state did not include a session id");
+		const initialSessionFile = await ensureSessionFileForId(
+			agentDir,
+			canonicalWorkspacePath,
+			initialSessionId,
+			"integrated reconnect initial",
+		);
+
+		const hostStateAfterInitial = JSON.parse(await readFile(hostStatePath, "utf8"));
+		assert(
+			hostStateAfterInitial.clients?.[0]?.lastSessionIdByWorkspace?.reconnect === initialSessionId,
+			"Initial reconnect state did not record the remote session id",
+		);
+
+		const resumed = await runHostClientOnce({
+			clientArgs: ["--get-state", "--timeout-ms", "10000"],
+			clientStatePath,
+			hostArgs: ["--agent-dir", agentDir, "--workspace", workspaceArg, "--integrated-volt", "--no-pairing"],
+			hostStatePath,
+			label: "integrated reconnect resumed",
+		});
+		const resumedState = JSON.parse(resumed.clientOutput.stdout);
+		assert(
+			resumedState.sessionId === initialSessionId,
+			`Expected reconnect to resume ${initialSessionId}, got ${resumedState.sessionId}`,
+		);
+
+		await rm(initialSessionFile, { force: true });
+		const missingFallback = await runHostClientOnce({
+			clientArgs: ["--get-state", "--timeout-ms", "10000"],
+			clientStatePath,
+			hostArgs: ["--agent-dir", agentDir, "--workspace", workspaceArg, "--integrated-volt", "--no-pairing"],
+			hostStatePath,
+			label: "integrated reconnect missing session",
+		});
+		const missingState = JSON.parse(missingFallback.clientOutput.stdout);
+		assert(
+			missingState.sessionId && missingState.sessionId !== initialSessionId,
+			"Expected missing-session reconnect to create a replacement session id",
+		);
+
+		const finalHostState = JSON.parse(await readFile(hostStatePath, "utf8"));
+		assert(
+			finalHostState.clients?.[0]?.lastSessionIdByWorkspace?.reconnect === missingState.sessionId,
+			"Missing-session reconnect did not record the replacement session id",
+		);
+		const auditEvents = await readAuditEvents(getDefaultAuditPath(hostStatePath));
+		assert(
+			auditEvents.some((event) => event.type === "session_resumed" && event.details?.sessionId === initialSessionId),
+			"Expected session_resumed audit event for reconnect",
+		);
+		assert(
+			auditEvents.some(
+				(event) =>
+					event.type === "session_missing_on_resume" &&
+					event.success === false &&
+					event.details?.requestedSessionId === initialSessionId,
+			),
+			"Expected session_missing_on_resume audit event for deleted session",
+		);
+		assert(
+			auditEvents.some(
+				(event) =>
+					event.type === "session_created" &&
+					event.details?.reason === "missing_on_resume" &&
+					event.details?.sessionId === missingState.sessionId,
+			),
+			"Expected session_created audit event for missing-session replacement",
+		);
+	});
+}
+
+async function duplicateActiveConnectionScenario() {
+	await withStateDir("duplicate-active", async ({ hostStatePath, stateDir }) => {
+		const agentDir = await createIntegratedVoltAgentDir(stateDir);
+		const workspacePath = join(stateDir, "workspace");
+		await mkdir(workspacePath, { recursive: true });
+		const workspaceArg = `duplicate=${workspacePath}`;
+		const endpoint = await bindRawClientEndpoint("disabled");
+		let firstClient;
+		let duplicateStream;
+		try {
+			const host = startHost([
+				"--state",
+				hostStatePath,
+				"--agent-dir",
+				agentDir,
+				"--workspace",
+				workspaceArg,
+				"--integrated-volt",
+				"--once",
+			]);
+			try {
+				const ticket = await waitForFirstStdoutLine(host.child, host.output, "duplicate active host");
+				firstClient = await openRawAuthorizedClientOnEndpoint(endpoint, ticket, {
+					clientLabel: "duplicate active client",
+				});
+				const firstState = await readRawRpcResponse(
+					firstClient,
+					{ id: "state-duplicate-first", type: "get_state" },
+					"duplicate active first get_state",
+				);
+				assert(firstState.event.success === true, "Expected first duplicate-active client get_state to succeed");
+
+				duplicateStream = await openRawAuthorizedStreamOnConnection(firstClient, ticket, {
+					clientLabel: "duplicate active client",
+					expectSuccess: false,
+				});
+				assert(
+					duplicateStream.handshakeResponse.success === false &&
+						duplicateStream.handshakeResponse.error === "client already connected",
+					`Expected duplicate handshake rejection, got ${JSON.stringify(duplicateStream.handshakeResponse)}`,
+				);
+				await Promise.resolve(duplicateStream.stream.send.finish?.()).catch(() => {});
+				duplicateStream = undefined;
+
+				const stillUsable = await readRawRpcResponse(
+					firstClient,
+					{ id: "state-duplicate-still-usable", type: "get_state" },
+					"duplicate active first client after rejection",
+				);
+				assert(stillUsable.event.success === true, "Expected first duplicate-active client to remain usable");
+				closeRawConnection(firstClient.connection);
+				firstClient = undefined;
+				await waitForExit(host.child, "duplicate active host", host.output);
+			} finally {
+				await Promise.resolve(duplicateStream?.stream?.send?.finish?.()).catch(() => {});
+				closeRawConnection(firstClient?.connection);
+				await stopProcess(host.child);
+			}
+
+			const reconnectHost = startHost([
+				"--state",
+				hostStatePath,
+				"--agent-dir",
+				agentDir,
+				"--workspace",
+				workspaceArg,
+				"--integrated-volt",
+				"--no-pairing",
+				"--once",
+			]);
+			try {
+				const reconnectTicket = await waitForFirstStdoutLine(
+					reconnectHost.child,
+					reconnectHost.output,
+					"duplicate active reconnect host",
+				);
+				firstClient = await openRawAuthorizedClientOnEndpoint(endpoint, reconnectTicket, {
+					clientLabel: "duplicate active client",
+				});
+				const reconnectState = await readRawRpcResponse(
+					firstClient,
+					{ id: "state-duplicate-reconnect", type: "get_state" },
+					"duplicate active reconnect get_state",
+				);
+				assert(reconnectState.event.success === true, "Expected reconnect after duplicate-active close to succeed");
+				closeRawConnection(firstClient.connection);
+				firstClient = undefined;
+				await waitForExit(reconnectHost.child, "duplicate active reconnect host", reconnectHost.output);
+			} finally {
+				closeRawConnection(firstClient?.connection);
+				await stopProcess(reconnectHost.child);
+			}
+
+			const auditEvents = await readAuditEvents(getDefaultAuditPath(hostStatePath));
+			assert(
+				auditEvents.some(
+					(event) =>
+						event.type === "duplicate_connection_rejected" &&
+						event.clientNodeId === endpoint.id().toString() &&
+						event.workspace === "duplicate" &&
+						event.success === false &&
+						event.error === "client already connected",
+				),
+				"Expected duplicate_connection_rejected audit event",
+			);
+		} finally {
+			await Promise.resolve(duplicateStream?.stream?.send?.finish?.()).catch(() => {});
+			closeRawConnection(firstClient?.connection);
+			await endpoint.close();
 		}
 	});
 }
@@ -1520,6 +1860,8 @@ const scenarios = [
 	["raw command filter", rawCommandFilterScenario],
 	["integrated raw command filter", integratedRawCommandFilterScenario],
 	["integrated Volt get_state", integratedVoltGetStateScenario],
+	["integrated Volt reconnect session", integratedVoltReconnectSessionScenario],
+	["duplicate active connection", duplicateActiveConnectionScenario],
 	["integrated Volt profile", integratedVoltProfileScenario],
 	["integrated Volt env profile", integratedVoltEnvProfileScenario],
 	["malformed handshake", malformedHandshakeScenario],

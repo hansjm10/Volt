@@ -1095,6 +1095,49 @@ async function rejectDuplicateActiveConnection(stream, authorization, options) {
 	await Promise.resolve(stream.recv.stop?.(0n)).catch(() => {});
 }
 
+function getHandshakeChildLabel(options) {
+	return options.integratedVolt || options.useVolt ? "volt" : "fake-rpc";
+}
+
+function startDuplicateStreamRejectionLoop(connection, remoteId, options) {
+	let stopped = false;
+	const loop = async () => {
+		while (!stopped) {
+			let stream;
+			try {
+				stream = await connection.acceptBi();
+			} catch {
+				return;
+			}
+			if (stopped) {
+				await Promise.resolve(stream.recv.stop?.(0n)).catch(() => {});
+				await Promise.resolve(stream.send.finish?.()).catch(() => {});
+				return;
+			}
+			void rejectDuplicateStream(stream, remoteId, options);
+		}
+	};
+	void loop().catch(() => {});
+	return () => {
+		stopped = true;
+	};
+}
+
+async function rejectDuplicateStream(stream, remoteId, options) {
+	const handshake = await options.hostEngine.readHandshake(stream, remoteId, {
+		child: getHandshakeChildLabel(options),
+		maxLineBytes: DEFAULT_IROH_REMOTE_HANDSHAKE_MAX_LINE_BYTES,
+		timeoutMs: DEFAULT_IROH_REMOTE_HANDSHAKE_TIMEOUT_MS,
+		writeSuccessResponse: false,
+	});
+	if (!handshake.ok) {
+		await stream.send.finish?.();
+		await Promise.resolve(stream.recv.stop?.(0n)).catch(() => {});
+		return;
+	}
+	await rejectDuplicateActiveConnection(stream, handshake.authorization, options);
+}
+
 async function closeActiveConnectionsForClient(options, nodeId) {
 	const entries = Array.from(options.activeConnections.get(nodeId) ?? []);
 	if (entries.length === 0) {
@@ -1142,6 +1185,7 @@ async function handleConnection(incoming, options) {
 
 	let child;
 	let removeActiveConnection;
+	let stopDuplicateStreamRejectionLoop;
 	try {
 		const stream = await withTimeout(
 			connection.acceptBi(),
@@ -1149,7 +1193,7 @@ async function handleConnection(incoming, options) {
 			"handshake timed out",
 		);
 		const handshake = await options.hostEngine.readHandshake(stream, remoteId, {
-			child: options.integratedVolt || options.useVolt ? "volt" : "fake-rpc",
+			child: getHandshakeChildLabel(options),
 			maxLineBytes: DEFAULT_IROH_REMOTE_HANDSHAKE_MAX_LINE_BYTES,
 			timeoutMs: DEFAULT_IROH_REMOTE_HANDSHAKE_TIMEOUT_MS,
 			writeSuccessResponse: false,
@@ -1168,6 +1212,7 @@ async function handleConnection(incoming, options) {
 			return;
 		}
 		removeActiveConnection = registerActiveConnection(options, handshake.authorization, connection);
+		stopDuplicateStreamRejectionLoop = startDuplicateStreamRejectionLoop(connection, remoteId, options);
 
 		if (options.integratedVolt) {
 			await runIntegratedVoltConnection(stream, handshake, handshake.authorization, options);
@@ -1175,6 +1220,7 @@ async function handleConnection(incoming, options) {
 		}
 		child = await runSpawnedRpcConnection(stream, handshake, handshake.authorization, options);
 	} finally {
+		stopDuplicateStreamRejectionLoop?.();
 		removeActiveConnection?.();
 		if (child && child.exitCode === null && !child.killed) child.kill();
 		connection.close(0n, Array.from(Buffer.from("done", "utf8")));

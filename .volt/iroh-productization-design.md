@@ -817,8 +817,8 @@ Acceptance criteria:
 
 - Client reconnect resumes previous session for the same client/workspace. E.2 implemented and unit-tested 2026-06-21; E.3 must prove it through `npm run iroh:poc:test`.
 - Missing session file creates a new session and logs an audit event. E.2 implemented and unit-tested 2026-06-21; E.3 must prove it through `npm run iroh:poc:test`.
-- Duplicate active connection behavior is deterministic and tested. E.3 must hold one same-client/workspace connection open, assert a second connection receives handshake failure `client already connected`, assert `duplicate_connection_rejected` is audited, assert the first connection remains usable, then assert reconnect succeeds after the first connection closes.
-- `get_state` after reconnect returns the resumed session ID. E.2 runtime selection is implemented; E.3 must assert the client-observable RPC state.
+- Duplicate active connection behavior is deterministic and tested. Resolved 2026-06-21: `npm run iroh:poc:test` now holds one same-client/workspace stream open, opens a duplicate stream on the same authoritative Iroh connection, asserts handshake failure `client already connected`, asserts `duplicate_connection_rejected` is audited, asserts the first stream remains usable, then asserts reconnect succeeds after the first stream closes.
+- `get_state` after reconnect returns the resumed session ID. Resolved 2026-06-21: `npm run iroh:poc:test` now pairs an integrated remote client, records the first `get_state` session ID, creates the corresponding persisted session file, reconnects with the same client state, and asserts the next `get_state` returns the same session ID. It then deletes the session file, reconnects again, asserts a new session ID, and verifies `session_resumed`, `session_missing_on_resume`, and replacement `session_created` audit events.
 
 ### Phase 6: Cross-network validation and docs polish
 
@@ -869,7 +869,7 @@ Update `scripts/iroh-sidecar-test.mjs` to cover:
 
 - pair command flow, if implemented
 - reconnect with persisted tools
-- reconnect session resume
+- reconnect session resume. Resolved 2026-06-21.
 - read-only client remains read-only after host restart with unsafe tools
 - unsafe pair ticket requires `--yes`
 - status output
@@ -949,10 +949,10 @@ Do not remove experimental language until all of these are true:
 - [x] Pairing workflow is first-class and scoped to a running host control channel. Resolved 2026-06-21.
 - [x] Protocol v1 is documented. Resolved 2026-06-21.
 - [x] Protocol compatibility tests exist. Resolved 2026-06-21.
-- [ ] Reconnect/resume behavior is implemented and documented.
+- [x] Reconnect/resume behavior is implemented and documented. Resolved 2026-06-21.
 - [x] Revocation behavior is implemented and documented, including active connection semantics. Resolved 2026-06-21.
 - [x] `volt remote status` persisted-state inspection exists. Resolved 2026-06-21.
-- [ ] Scenario tests cover pair, reconnect, policy, revocation, expiry, and command filtering.
+- [x] Scenario tests cover pair, reconnect, policy, revocation, expiry, and command filtering. Resolved 2026-06-21.
 - [ ] Cross-network `--relay default` dogfood succeeds.
 - [ ] README and usage docs include security warnings and unsupported environments.
 - [ ] `npm run check` passes after code changes.
