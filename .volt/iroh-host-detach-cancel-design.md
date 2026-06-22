@@ -273,6 +273,8 @@ Run on iPhone 16 Pro or newer equivalent:
 
 Record exact device, iOS version, macOS version, relay mode, and network.
 
+Blocked 2026-06-22: Automated D.2 validation passed, but the manual physical-device iOS smoke was not run. `xcrun xctrace list devices` showed only the Mac online; two physical iPhones were listed offline (`Corin's Iphone` on iOS 26.2.1 and `Jordan's iPhone` on iOS 26.6). Simulators were available, including a booted iPhone 17 Pro Simulator on iOS 27.0, but simulator evidence does not prove real-device background suspension/foreground reconnect behavior. To unblock D.2, run the steps above on an online iPhone 16 Pro or newer equivalent and record device, iOS version, macOS version, relay mode, network, commands, and results.
+
 ## Open Decisions
 
 1. Detached runtime retention:

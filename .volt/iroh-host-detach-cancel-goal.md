@@ -293,10 +293,11 @@ the rollup item is resolved, and the final turn's required verification passed.
     <evidence>Resolved 2026-06-22: updated `packages/coding-agent/docs/rpc.md`, `packages/coding-agent/docs/iroh-remote-protocol.md`, `packages/coding-agent/docs/iroh-remote-access-design.md`, `packages/coding-agent/docs/usage.md`, and `packages/coding-agent/docs/security.md` to document transport close as detach, `abort` as cancel, integrated runtime active-work detach/reconnect plus idle retention, host-exit durability limits, and spawned child connection-scoped limits. Evidence commit: `694aa7d8`; verification: `git diff --check -- packages/coding-agent/docs/rpc.md packages/coding-agent/docs/iroh-remote-protocol.md packages/coding-agent/docs/iroh-remote-access-design.md packages/coding-agent/docs/usage.md packages/coding-agent/docs/security.md`, pre-commit `npm run check`.</evidence>
   </item>
 
-  <item ref="D.2" status="open" prereq="D.1,C.2">
+  <item ref="D.2" status="blocked" prereq="D.1,C.2">
     <title>Run final automated and manual validation</title>
     <acceptance>Final evidence lists exact targeted Vitest files, `npm run iroh:poc:test`, `npm run check`, doc diff checks, and manual iOS detach/cancel smoke results with device, iOS version, macOS version, relay mode, and network. Any unsupported case is documented without overclaiming.</acceptance>
-    <evidence/>
+    <evidence>Partial validation 2026-06-22: `cd packages/coding-agent &amp;&amp; node node_modules/vitest/dist/cli.js --run test/remote-iroh-lifecycle-contract.test.ts test/remote-iroh-core.test.ts test/integrated-runtime-retention.test.ts test/rpc-mode-transport.test.ts` passed 70 tests; `npm run iroh:poc:test` passed; `npm run check` passed; `git diff --check -- packages/coding-agent/docs/rpc.md packages/coding-agent/docs/iroh-remote-protocol.md packages/coding-agent/docs/iroh-remote-access-design.md packages/coding-agent/docs/usage.md packages/coding-agent/docs/security.md .volt/iroh-host-detach-cancel-design.md .volt/iroh-host-detach-cancel-goal.md` passed.</evidence>
+    <blocker>Manual physical-device iOS detach/cancel smoke is still required. `xcrun xctrace list devices` showed only the Mac online, with physical iPhones listed offline (`Corin's Iphone` on iOS 26.2.1 and `Jordan's iPhone` on iOS 26.6). Simulators are available but do not prove real-device background suspension/foreground reconnect behavior. Need an online iPhone 16 Pro or newer equivalent, then record device, iOS version, macOS version, relay mode, network, commands, and detach/reconnect plus explicit `abort` results.</blocker>
   </item>
 
   <item ref="D.3" status="open" prereq="D.2" type="rollup">
