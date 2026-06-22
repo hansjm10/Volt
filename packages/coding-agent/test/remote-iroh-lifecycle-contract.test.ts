@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import {
+	createIrohRemoteFilteredRpcTransport,
 	getIrohRemoteRpcFilterResult,
 	IROH_REMOTE_RPC_CANCELLATION_TYPES,
 	IROH_REMOTE_RPC_PASSTHROUGH_TYPES,
@@ -63,10 +64,29 @@ function createDeferred(): { promise: Promise<void>; resolve: () => void; reject
 	return { promise, resolve, reject };
 }
 
-function createPromptRuntime(sessionManager: SessionManager, completionText: string) {
+interface PromptRuntimeAbortControls {
+	completePrompt(): void;
+	promptCompleted: Promise<void>;
+}
+
+interface PromptRuntimeOptions {
+	abort?: (controls: PromptRuntimeAbortControls) => Promise<void>;
+	stopReason?: "stop" | "aborted";
+}
+
+function createPromptRuntime(
+	sessionManager: SessionManager,
+	completionText: string,
+	options: PromptRuntimeOptions = {},
+) {
 	const promptRelease = createDeferred();
 	const promptCompleted = createDeferred();
-	const abort = vi.fn(async () => {});
+	const abort = vi.fn(async () => {
+		await options.abort?.({
+			completePrompt: promptRelease.resolve,
+			promptCompleted: promptCompleted.promise,
+		});
+	});
 	const dispose = vi.fn(async () => {
 		await abort();
 	});
@@ -86,8 +106,11 @@ function createPromptRuntime(sessionManager: SessionManager, completionText: str
 			sessionId: sessionManager.getSessionId(),
 			sessionManager,
 			prompt: vi.fn(
-				async (_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }): Promise<void> => {
-					options?.preflightResult?.(true);
+				async (
+					_message: string,
+					promptOptions?: { preflightResult?: (didSucceed: boolean) => void },
+				): Promise<void> => {
+					promptOptions?.preflightResult?.(true);
 					await promptRelease.promise;
 					sessionManager.appendMessage({
 						role: "assistant",
@@ -103,7 +126,7 @@ function createPromptRuntime(sessionManager: SessionManager, completionText: str
 							totalTokens: 0,
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						},
-						stopReason: "stop",
+						stopReason: options.stopReason ?? "stop",
 						timestamp: Date.now(),
 					});
 					promptCompleted.resolve();
@@ -282,5 +305,72 @@ describe("Iroh remote lifecycle command contract", () => {
 		expect(projectSessionTranscript(sessionManager, { limit: 10 }).items).toContainEqual(
 			expect.objectContaining({ role: "assistant", text: "write failure detached completion" }),
 		);
+	});
+
+	test("explicit remote abort cancels an active prompt and waits for abort settlement", async () => {
+		const inner = new ManualRpcTransport();
+		const sessionManager = SessionManager.inMemory("/workspace");
+		const abortCanFinish = createDeferred();
+		const runtime = createPromptRuntime(sessionManager, "explicit abort completed", {
+			stopReason: "aborted",
+			async abort({ completePrompt, promptCompleted }) {
+				completePrompt();
+				await promptCompleted;
+				await abortCanFinish.promise;
+			},
+		});
+		const transport = createIrohRemoteFilteredRpcTransport({
+			transport: createIrohRemoteCloseDeferringRpcTransport({
+				transport: inner,
+				waitForPromptCompletion: () => runtime.promptCompleted,
+			}),
+		});
+		let resolveReady = () => {};
+		const ready = new Promise<void>((resolve) => {
+			resolveReady = resolve;
+		});
+		const modePromise = runRpcMode(runtime.runtimeHost, {
+			disposeRuntimeOnClose: false,
+			onReady: resolveReady,
+			transport,
+		});
+		await ready;
+
+		inner.emitLine(JSON.stringify({ id: "prompt-1", type: "prompt", message: "keep running" }));
+		await vi.waitFor(() =>
+			expect(inner.writes).toContainEqual({
+				id: "prompt-1",
+				type: "response",
+				command: "prompt",
+				success: true,
+			}),
+		);
+
+		inner.emitLine(JSON.stringify({ id: "abort-1", type: "abort" }));
+		await vi.waitFor(() => expect(runtime.abort).toHaveBeenCalledOnce());
+		await Promise.resolve();
+		expect(inner.writes).not.toContainEqual({
+			id: "abort-1",
+			type: "response",
+			command: "abort",
+			success: true,
+		});
+
+		abortCanFinish.resolve();
+		await vi.waitFor(() =>
+			expect(inner.writes).toContainEqual({
+				id: "abort-1",
+				type: "response",
+				command: "abort",
+				success: true,
+			}),
+		);
+		expect(projectSessionTranscript(sessionManager, { limit: 10 }).items).toContainEqual(
+			expect.objectContaining({ role: "assistant", text: "explicit abort completed" }),
+		);
+
+		inner.emitClose();
+		await expect(modePromise).resolves.toBeUndefined();
+		expect(runtime.dispose).not.toHaveBeenCalled();
 	});
 });
