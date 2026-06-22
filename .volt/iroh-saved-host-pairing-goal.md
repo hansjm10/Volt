@@ -296,10 +296,10 @@ blocked.
     <evidence>2026-06-22: Host core now records consumed/expired pairing-secret tombstones with 30-day retention, commits consumed tombstones with new-client authorization, rejects consumed/expired replays while retained, preserves same-node recovery with the original QR data, and tests failed-attempt non-consumption, concurrency, expiry retention/pruning, and restart persistence; verification: targeted Vitest files, npm run iroh:poc:test, git diff --check, and commit-hook npm run check passed; Volt commit e407b04b.</evidence>
   </item>
 
-  <item ref="B.2" status="open" prereq="A.2,A.6">
+  <item ref="B.2" status="resolved" prereq="A.2,A.6">
     <title>Implement revocation and re-pair semantics</title>
     <acceptance>Revoked clients cannot silently reconnect; re-pair behavior follows A.2; host state and CLI/status output expose enough information for desktop approval or continued rejection; tests cover revoked reconnect, revoked re-pair, approved re-pair if supported, and audit events.</acceptance>
-    <evidence/>
+    <evidence>2026-06-22: Host state now persists revoked-client tombstones with explicit re-pair approval timestamps, revoked nodes reject reconnects and generic QR use until approval plus an active pairing secret, successful same-node re-pair clears the tombstone, and CLI/status exposes revoked devices plus approve-repair audit events; verification: targeted Vitest files, npm run iroh:poc:test, git diff --check, npm run check, and commit-hook npm run check passed; Volt commit d26756b0.</evidence>
   </item>
 
   <item ref="B.3" status="open" prereq="A.1,A.4">
