@@ -328,10 +328,10 @@ the rollup item is resolved, and the final turn's required verification passed.
 </group>
 
 <group n="5" title="Reconnect and resume">
-  <item ref="E.1" status="open" prereq="A.1,D.1" type="decision">
+  <item ref="E.1" status="resolved" prereq="A.1,D.1" type="decision">
     <title>Decide duplicate active connection behavior for the same client node/workspace: reject the second connection or replace the old connection</title>
     <acceptance>Decision is recorded with mobile UX and safety rationale; handshake failure or replacement behavior is specified; audit events are named; scenario test plan is updated.</acceptance>
-    <evidence/>
+    <evidence>Resolved 2026-06-21: chose to reject a second active connection for the same authoritative client node ID and workspace with handshake failure `client already connected`, keep the existing runtime alive, audit `duplicate_connection_rejected`, and cover the behavior in E.3 reconnect scenarios; verification: git diff --check -- .volt/iroh-productization-design.md packages/coding-agent/CHANGELOG.md packages/coding-agent/docs/iroh-remote-protocol.md, npm run check, and pre-commit npm run check; commit 91781b6e</evidence>
   </item>
 
   <item ref="E.2" status="open" prereq="E.1">
