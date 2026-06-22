@@ -293,7 +293,7 @@ blocked.
   <item ref="B.1" status="resolved" prereq="A.3,A.6">
     <title>Make one-time pairing transaction semantics precise and tested</title>
     <acceptance>Host authorization consumes a pairing secret only at the decided successful transaction boundary; failed attempts do not consume it; concurrent attempts allow at most one success; recovery behavior for host-recorded/app-not-saved cases follows A.3; core tests cover success, failed attempt, concurrent attempt, reuse, expiry, and restart persistence.</acceptance>
-    <evidence>2026-06-22: Host core now records consumed/expired pairing-secret tombstones with 30-day retention, commits consumed tombstones with new-client authorization, rejects consumed/expired replays while retained, preserves same-node recovery with the original QR data, and tests failed-attempt non-consumption, concurrency, expiry retention/pruning, and restart persistence; verification: pending final checks; Volt commit pending.</evidence>
+    <evidence>2026-06-22: Host core now records consumed/expired pairing-secret tombstones with 30-day retention, commits consumed tombstones with new-client authorization, rejects consumed/expired replays while retained, preserves same-node recovery with the original QR data, and tests failed-attempt non-consumption, concurrency, expiry retention/pruning, and restart persistence; verification: targeted Vitest files, npm run iroh:poc:test, git diff --check, and commit-hook npm run check passed; Volt commit e407b04b.</evidence>
   </item>
 
   <item ref="B.2" status="open" prereq="A.2,A.6">
