@@ -279,10 +279,10 @@ the rollup item is resolved, and the final turn's required verification passed.
     <evidence>Resolved 2026-06-22: added a native integrated-host scenario with a local OpenAI-compatible streaming provider proving same-node active detach reconnect keeps the session ID, `get_state` shows the active runtime, `get_transcript` recovers detached user/assistant output after completion, a different node cannot reuse the consumed ticket, revoked reconnect is rejected, and duplicate active behavior remains covered by the existing native duplicate scenario; verification: `node --check scripts/iroh-sidecar-test.mjs`, `npm run iroh:poc:test`, `npm run check`; commit 1b4c72fa</evidence>
   </item>
 
-  <item ref="C.2" status="open" prereq="C.1">
+  <item ref="C.2" status="resolved" prereq="C.1">
     <title>Expose enough state for remote UI to represent active detached work</title>
     <acceptance>`get_state` continues to be safe over Iroh and exposes sufficient active/idle information for iOS to render reconnecting active work. If new run metadata is added, it is documented, typed, redacted where needed, and covered by tests; if existing `isStreaming` is sufficient, record that decision in both ledgers.</acceptance>
-    <evidence/>
+    <evidence>Resolved 2026-06-22: recorded the decision to keep existing `get_state.isStreaming` as the active-work signal for iOS and defer richer run metadata; current evidence includes the native C.1 active-reconnect scenario proving `isStreaming === true` on reconnect plus Iroh outbound sanitizer coverage for safe `get_state` responses; verification: `cd packages/coding-agent &amp;&amp; node node_modules/vitest/dist/cli.js --run test/remote-iroh-core.test.ts`, `git diff --check -- .volt/iroh-host-detach-cancel-design.md .volt/iroh-host-detach-cancel-goal.md`</evidence>
   </item>
 </group>
 

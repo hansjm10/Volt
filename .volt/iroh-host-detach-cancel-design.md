@@ -127,6 +127,8 @@ The host must persist transcript entries independently of subscriber presence so
 
 Resolved 2026-06-22: Native integrated-host coverage now exercises active detach and reconnect against a local OpenAI-compatible streaming provider. The same authorized Iroh node reconnects while the detached prompt is still active, sees the same session ID via `get_state`, receives prompt completion, and recovers both the detached user prompt and assistant output through `get_transcript`. The same scenario also proves a different node cannot reuse the consumed pairing ticket and a revoked node cannot reconnect.
 
+Resolved 2026-06-22: No additional `get_state.run` metadata is required for this phase. The existing safe `get_state.isStreaming` boolean is the remote UI signal for active work after reconnect, and `get_transcript` remains the recovery surface for output generated while detached. The native active-detach reconnect scenario verifies `isStreaming === true` on active reconnect, and the Iroh outbound sanitizer continues to omit/redact host-local state fields such as `sessionFile`.
+
 ## Proposed Architecture
 
 ### Host Runtime Registry
@@ -289,6 +291,7 @@ Record exact device, iOS version, macOS version, relay mode, and network.
 4. State shape:
    - Proposed first implementation: keep `get_state.isStreaming` and add minimal remote run metadata only if needed by iOS.
    - Alternative: add explicit run IDs and event cursors now.
+   - Resolved 2026-06-22: keep `get_state.isStreaming` as the active-work signal for iOS in this phase; defer richer run metadata and event cursors until a concrete UI need appears.
 
 5. Revocation while active:
    - Proposed default: revoke closes active streams and prevents reconnect. Whether it also cancels a detached active run should be a host policy decision.
