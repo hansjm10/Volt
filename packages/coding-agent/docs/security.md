@@ -65,6 +65,8 @@ Supported preview safety model:
 - Pairing through `volt remote pair` requires a running host control channel; offline ticket generation from persisted state is not supported.
 - Paired clients are persisted until revoked with `volt remote revoke <node-id>`.
 - Revocation removes future access from persisted state and asks a live host to close matching active connections when one is reachable.
+- In the default integrated runtime, Iroh stream close is detach, not cancellation. Active work can continue on the host until it finishes or an authorized client sends `abort`.
+- Detached integrated runtimes can be reattached only by the same authoritative Iroh client node ID and workspace, and idle detached runtimes expire by the host retention policy.
 - `volt remote status` reports persisted workspaces, clients, tool grants, state path, and audit path without printing secrets or secret hashes.
 - Default paths are `~/.volt/agent/remote/iroh-host.json` for state and `~/.volt/agent/remote/iroh-host.audit.jsonl` for audit JSONL.
 
@@ -73,6 +75,8 @@ Unsafe remote tools require explicit host approval. Granting `bash`, `edit`, or 
 Remote sessions do not auto-approve project trust. Project-local settings, extensions, skills, prompt templates, themes, system prompts, and package-managed resources follow the same project trust rules as local Volt. Use `--approve` only when the host user trusts those resources for the exposed workspace.
 
 Remote host support requires a Node.js npm package install or source checkout with optional `@number0/iroh` available for the platform. Bun binary builds reject `volt remote host` because the native Iroh adapter is not bundled. If startup reports that the optional native adapter is unavailable, reinstall with optional dependencies enabled for the current platform.
+
+Host process exit, host crash, or explicit host shutdown stops in-memory work; remote access does not provide durable job recovery beyond persisted session state. Spawned child compatibility modes through `--use-volt` or `--source-volt` are connection-scoped and can stop the child on disconnect.
 
 Use `--relay default` when validating access across networks. The default `--relay disabled` is intended for same-machine and same-LAN testing.
 

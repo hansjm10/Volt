@@ -2,7 +2,7 @@
 
 ## Status
 
-The Iroh remote host is a supported preview for Node.js npm installs and source checkouts with optional `@number0/iroh` available for the platform. RPC mode has a transport abstraction, Iroh streams have a structurally typed RPC adapter, remote command filtering is available, and the Iroh remote helpers cover tickets, handshakes, host state, authorization, workspace selection, audit logging, redaction, reconnect/session selection, revocation, and host/client engine orchestration. `volt remote host` launches a product host entrypoint in the coding-agent package and runs Volt's runtime in-process over `runIrohRemoteRpcMode()`. The preview wire contract is documented in [Iroh Remote Protocol v1](iroh-remote-protocol.md). Unsupported areas remain explicit: Bun binary builds reject remote host startup, `volt remote status` is persisted-state-only, cross-network relay should be validated with `--relay default` in the target environment, and mobile UI/product work is outside this host preview.
+The Iroh remote host is a supported preview for Node.js npm installs and source checkouts with optional `@number0/iroh` available for the platform. RPC mode has a transport abstraction, Iroh streams have a structurally typed RPC adapter, remote command filtering is available, and the Iroh remote helpers cover tickets, handshakes, host state, authorization, workspace selection, audit logging, redaction, reconnect/session selection, revocation, and host/client engine orchestration. `volt remote host` launches a product host entrypoint in the coding-agent package and runs Volt's runtime in-process over `runIrohRemoteRpcMode()`. Integrated hosts treat stream close as client detach, keep active work running on the host, and reserve explicit cancellation for the `abort` RPC command. The preview wire contract is documented in [Iroh Remote Protocol v1](iroh-remote-protocol.md). Unsupported areas remain explicit: Bun binary builds reject remote host startup, spawned child compatibility mode remains connection-scoped, host process exit is not durable recovery, `volt remote status` is persisted-state-only, cross-network relay should be validated with `--relay default` in the target environment, and mobile UI/product work is outside this host preview.
 
 ## Summary
 
@@ -128,12 +128,14 @@ The supported preview stream handshake, strict LF framing, command allowlist, au
 
 Preview process model:
 
-- One Iroh connection maps to one in-process Volt RPC runtime by default.
-- One workspace per runtime.
-- The runtime is disposed when the Iroh connection closes.
-- Compatibility and fake-RPC modes can still spawn a child process, and the host terminates that child on disconnect after a short grace period.
-- Reconnecting paired clients resume the last recorded session for that workspace when the session file still exists. If it is missing, the host creates and audits a replacement session.
+- Default `volt remote host` adds `--integrated-volt` and uses an in-process Volt runtime.
+- Integrated runtime entries are keyed by authoritative client node ID and workspace name.
+- An authorized Iroh stream is a subscriber/control channel for that runtime; closing the stream detaches the subscriber and does not synthesize `abort`.
+- Active detached integrated runtimes keep running on the host. Idle detached integrated runtimes are retained for 30 minutes by default, configurable with `--detached-runtime-ttl-ms`, then stopped by the retention policy.
+- Reconnecting paired clients with the same authoritative client node ID and workspace attach to the existing detached integrated runtime when it still exists. If no detached runtime exists, the host resumes the last recorded session for that workspace when the session file still exists; if it is missing, the host creates and audits a replacement session.
 - A second active stream for the same authoritative client node ID and workspace is rejected with handshake error `client already connected`; the existing runtime remains active.
+- Compatibility and fake-RPC modes can still spawn a child process through `--use-volt`, `--source-volt`, or internal test paths. Those modes remain connection-scoped: the host terminates the child on disconnect after a short grace period, so active work is not preserved across detach unless a persistent child registry is implemented.
+- Host process exit, crash, or explicit shutdown stops in-memory work because there is no durable job recovery layer.
 
 ## Security Model
 
@@ -273,7 +275,8 @@ Preview validation:
 - Send allowed remote RPC commands such as `get_state`, `list_sessions`, `switch_session_by_id`, `prompt`, `abort`, `steer`, `follow_up`, `new_session`, and `extension_ui_response`.
 - Verify assistant streaming events arrive in order.
 - Verify extension UI requests can round-trip through the client.
-- Verify child process exits when the Iroh stream closes.
+- Verify integrated runtime detach keeps active work running and reconnect recovers `get_state` plus `get_transcript`.
+- Verify spawned child process mode exits when the Iroh stream closes.
 - Verify unpaired clients are rejected.
 - Verify a missing workspace path or Volt executable fails before printing a pairing ticket.
 - Verify a client cannot request a workspace outside the host allowlist.
@@ -291,7 +294,7 @@ Automated tests for a monorepo version:
 | --- | --- |
 | Remote access exposes local shell and filesystem | Opt-in host command, unsafe-tool confirmation, workspace allowlist, client revocation, clear warnings |
 | Native dependency increases install complexity | Keep `@number0/iroh` optional, keep native loading isolated from the main CLI, document native install troubleshooting, and reject Bun binary remote host startup with an actionable Node/source guidance message |
-| Mobile networks disconnect often | Preview reconnect resumes the last recorded session when present and creates/audits a replacement when missing |
+| Mobile networks disconnect often | Integrated hosts treat stream close as detach, retain active host work, allow same-client/workspace reconnect, and recover persisted output through `get_transcript` |
 | RPC responses expose host paths | Remote-safe outbound filtering normalizes workspace paths and redacts host-only session, export, bash-output, and arbitrary absolute paths |
 | Relay fallback may add latency or cost | Prefer direct connections, expose connection diagnostics, allow custom relay config later |
 | Project extensions can run arbitrary code | Preserve project trust behavior and do not auto-approve remote workspaces |
@@ -309,6 +312,9 @@ Resolved preview decisions:
 - Remote clients use the default tool grant (`read,bash,edit,write,grep,find,ls`) unless configured otherwise, and keep their pair-time tool grant on reconnect.
 - Remote outbound state/events normalize workspace paths to `/workspace` and redact host-only session, export, bash-output, and arbitrary absolute host paths.
 - Pairing is workspace-bound by saved workspace name; clients cannot request arbitrary host paths.
+- Transport close is detach, not cancel; remote cancellation is the `abort` RPC command.
+- Spawned child compatibility mode remains connection-scoped, while integrated runtime mode is the supported active-work detach path.
+- Host process exit is not durable recovery; only persisted session state can be recovered after restarting the host.
 
 ## References
 

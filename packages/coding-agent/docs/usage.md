@@ -204,7 +204,7 @@ volt remote host --workspace volt=/path/to/repo --no-pairing
 
 Options to know:
 
-- Host: `--workspace <name=path>`, `--relay <disabled|default>`, `--state <path>`, `--audit <path>`, `--allow-tools <list>`, `--profile <name>`, `--agent-dir <path>`, `--approve`, `--no-pairing`, `--once`, `--yes`.
+- Host: `--workspace <name=path>`, `--relay <disabled|default>`, `--state <path>`, `--audit <path>`, `--allow-tools <list>`, `--profile <name>`, `--agent-dir <path>`, `--detached-runtime-ttl-ms <ms>`, `--approve`, `--no-pairing`, `--once`, `--yes`.
 - Pair: `--workspace <name>`, `--allow-tools <list>`, `--label <label>`, `--ttl <duration>`, `--state <path>`, `--relay <disabled|default>`, `--yes`.
 - Management: `--state <path>` and `--audit <path>` for `status`, `clients`, and `revoke`.
 
@@ -215,6 +215,10 @@ Security and support boundary:
 - Pairing tickets are short-lived and one-time. `volt remote host` shows the startup ticket as a terminal QR code by default when stderr is a TTY. `volt remote pair` is mediated by a running host control channel; offline pairing from persisted state is not supported.
 - Remote clients select saved workspace names only. They cannot request arbitrary host paths.
 - Remote sessions do not bypass project trust. Pass `--approve` only when the host user trusts project-local settings/resources for that workspace.
+- In the default integrated runtime, app backgrounding, network loss, or stream close detaches the client and does not send `abort`. Active work continues on the host; the same paired client/workspace can reconnect and refresh with `get_state` and `get_transcript`.
+- Remote stop/cancel controls must send the `abort` RPC command. Closing the stream without `abort` is disconnect only.
+- Idle detached integrated runtimes are retained for 30 minutes by default; change this with `--detached-runtime-ttl-ms <ms>`. Host exit, crash, explicit shutdown, or `--once` is not durable recovery for active work.
+- `--use-volt` and `--source-volt` spawned child compatibility modes remain connection-scoped. A disconnect can stop the spawned RPC child and any active in-memory work.
 - Default paths are `~/.volt/agent/remote/iroh-host.json` for state and `~/.volt/agent/remote/iroh-host.audit.jsonl` for audit JSONL.
 - `--relay disabled` is the same-machine/LAN default. Use `--relay default` when validating cross-network relay/discovery.
 - `volt remote host` requires a Node.js npm install or source checkout with optional `@number0/iroh` available for the platform. Bun binary builds reject it because the native Iroh adapter is not bundled.

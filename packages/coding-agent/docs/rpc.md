@@ -42,6 +42,8 @@ Transport lifetime is separate from cancellation semantics. A clean input close,
 
 Clients that intend to stop active agent work must send the `abort` command and wait for its response. Plain subprocess RPC mode still treats transport close as mode/process shutdown, and remote transports may use close as detach/reconnect; neither path changes the RPC cancellation command.
 
+RPC mode is not durable job recovery. If the Volt process or embedding host process exits or crashes, in-memory work stops; clients can only reopen persisted session state that was written before exit.
+
 ## Commands
 
 ### Prompting

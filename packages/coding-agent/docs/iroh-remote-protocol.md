@@ -114,6 +114,10 @@ The successful response uses the normal RPC response shape:
 
 `abort` is the only direct remote cancellation command in v1. Command names such as `cancel`, `cancel_run`, `detach`, and `disconnect` are not forwarded by the remote command allowlist. App-level disconnect without stop should close the stream only; clients reconnect by opening a new authorized stream, then calling `get_state` and `get_transcript`.
 
+The default integrated `volt remote host` runtime treats an authorized stream as a subscriber to host-owned session state. When the only subscriber detaches during active work, the prompt continues on the host. The same authoritative Iroh node ID and workspace can reconnect to the detached runtime; `get_state.isStreaming` reports whether work is still active, and `get_transcript` recovers persisted output. Idle detached integrated runtimes are retained for 30 minutes by default, configurable with `--detached-runtime-ttl-ms`.
+
+Compatibility modes that spawn `volt --mode rpc` through `--use-volt` or `--source-volt` remain connection-scoped. A disconnect can terminate the spawned child and any in-memory active work unless a future persistent child registry is added. Mobile clients that depend on detach/reconnect during active work should use the integrated host path.
+
 Host process exit, host crash, or explicit host shutdown are separate from client detach and can stop in-memory work because the runtime is gone. A reconnect after host exit requires a new host process and can recover only persisted session state.
 
 ## JSONL framing
