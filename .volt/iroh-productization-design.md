@@ -278,6 +278,7 @@ interface IrohRemoteClient {
   pairedAt: number;
   lastSeenAt: number;
   lastWorkspace?: string;
+  lastSessionIdByWorkspace?: Record<string, string>;
   revokedAt?: number;
 }
 
@@ -608,10 +609,12 @@ interface IrohRemoteClient {
 - Do not attempt to replay live stream deltas in v1.
 - Client recovery path is `get_state` plus future commands.
 
+Resolved 2026-06-21: E.2 persists `IrohRemoteClient.lastSessionIdByWorkspace`, deep-clones/parses it for old-state compatibility, records the integrated runtime session ID after successful runtime creation, and opens a requested prior session when its file still exists. If the recorded session ID cannot be found in the workspace session directory, the runtime creates a replacement session, records that new ID, audits `session_missing_on_resume` followed by `session_created`, and lets the client recover with `get_state`. Initial remote sessions audit `session_created`; successful resumes audit `session_resumed`. Unit tests cover state parsing/cloning/updates and runtime session selection for found and missing resume IDs.
+
 Acceptance criteria:
 
-- Reconnecting a paired client within the same workspace continues in the same session when the session file still exists.
-- If the session file is deleted, reconnect creates a new session and logs an audit event.
+- Reconnecting a paired client within the same workspace continues in the same session when the session file still exists. E.2 implemented and unit-tested 2026-06-21; E.3 adds end-to-end scenario coverage.
+- If the session file is deleted, reconnect creates a new session and logs an audit event. E.2 implemented and unit-tested 2026-06-21; E.3 adds end-to-end scenario coverage.
 - If another active connection for the same client/workspace exists, define behavior:
   - preferred: reject the second connection with `client already connected`; or
   - alternative: close the old connection and accept the new one.
@@ -812,10 +815,10 @@ Tasks:
 
 Acceptance criteria:
 
-- Client reconnect resumes previous session for the same client/workspace.
-- Missing session file creates a new session and logs an audit event.
+- Client reconnect resumes previous session for the same client/workspace. E.2 implemented and unit-tested 2026-06-21; E.3 must prove it through `npm run iroh:poc:test`.
+- Missing session file creates a new session and logs an audit event. E.2 implemented and unit-tested 2026-06-21; E.3 must prove it through `npm run iroh:poc:test`.
 - Duplicate active connection behavior is deterministic and tested. E.3 must hold one same-client/workspace connection open, assert a second connection receives handshake failure `client already connected`, assert `duplicate_connection_rejected` is audited, assert the first connection remains usable, then assert reconnect succeeds after the first connection closes.
-- `get_state` after reconnect returns the resumed session ID.
+- `get_state` after reconnect returns the resumed session ID. E.2 runtime selection is implemented; E.3 must assert the client-observable RPC state.
 
 ### Phase 6: Cross-network validation and docs polish
 

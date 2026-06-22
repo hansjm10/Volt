@@ -524,6 +524,7 @@ describe("Iroh remote core helpers", () => {
 						allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 						pairedAt: 10,
 						lastSeenAt: 20,
+						lastSessionIdByWorkspace: { volt: "session-one" },
 					},
 				],
 				pendingPairingTickets: [
@@ -554,6 +555,7 @@ describe("Iroh remote core helpers", () => {
 				pendingPairingTickets: undefined,
 			});
 			expect(parsedLegacyState.clients[0].allowedTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+			expect(parsedLegacyState.clients[0].lastSessionIdByWorkspace).toBeUndefined();
 			expect(parsedLegacyState.pendingPairingTickets).toEqual([]);
 			expect((await readFile(statePath, "utf8")).endsWith("\n")).toBe(true);
 			expect((await stat(statePath)).isFile()).toBe(true);
@@ -561,6 +563,12 @@ describe("Iroh remote core helpers", () => {
 			expect(() => parseIrohRemoteHostState({ ...state, hostSecretKey: [999] })).toThrow(
 				"hostSecretKey must contain byte values",
 			);
+			expect(() =>
+				parseIrohRemoteHostState({
+					...state,
+					clients: [{ ...state.clients[0], lastSessionIdByWorkspace: { volt: "" } }],
+				}),
+			).toThrow("client last session id must be a non-empty string");
 			await expect(readIrohRemoteHostState(statePath)).rejects.toThrow("client label must be a non-empty string");
 		} finally {
 			await rm(stateDir, { force: true, recursive: true });
@@ -778,6 +786,18 @@ describe("Iroh remote core helpers", () => {
 		clients[0].allowedWorkspaces.push("mutated");
 		expect(await hostEngine.listClients()).toEqual([expect.objectContaining({ allowedWorkspaces: ["volt"] })]);
 
+		await expect(hostEngine.setClientLastSessionId("client-node", "volt", "session-one")).resolves.toEqual(
+			expect.objectContaining({
+				nodeId: "client-node",
+				lastSessionIdByWorkspace: { volt: "session-one" },
+			}),
+		);
+		const clientWithSession = (await hostEngine.listClients())[0];
+		clientWithSession.lastSessionIdByWorkspace!.volt = "mutated";
+		expect(await hostEngine.listClients()).toEqual([
+			expect.objectContaining({ lastSessionIdByWorkspace: { volt: "session-one" } }),
+		]);
+
 		const rejected = await hostEngine.authorizeHello(makeHello("volt", "secret", "second phone"), "second-client");
 		expect(rejected).toEqual({
 			ok: false,
@@ -794,6 +814,8 @@ describe("Iroh remote core helpers", () => {
 			"pairing_ticket_created",
 			"pairing_ticket_consumed",
 			"client_authorized",
+			"clients_listed",
+			"clients_listed",
 			"clients_listed",
 			"clients_listed",
 			"client_rejected",
@@ -997,7 +1019,17 @@ describe("Iroh remote core helpers", () => {
 			hostSecretKey: [1, 2, 3],
 			consumedPairingSecretHashes: [],
 			workspaces: [{ ...workspace }],
-			clients: [],
+			clients: [
+				{
+					nodeId: "client-node",
+					label: "phone",
+					allowedWorkspaces: ["volt"],
+					allowedTools: "read",
+					pairedAt: 1,
+					lastSeenAt: 1,
+					lastSessionIdByWorkspace: { volt: "session-one" },
+				},
+			],
 			pendingPairingTickets: [
 				{
 					secretHash: "sha256:pending",
@@ -1010,6 +1042,7 @@ describe("Iroh remote core helpers", () => {
 		};
 		const stateManager = new IrohRemoteHostStateManager({ initialState });
 		initialState.workspaces[0].path = "/mutated-before-load";
+		initialState.clients[0].lastSessionIdByWorkspace!.volt = "mutated-before-load";
 		initialState.hostSecretKey?.push(4);
 		initialState.pendingPairingTickets?.push({
 			secretHash: "sha256:leaked",
@@ -1029,6 +1062,7 @@ describe("Iroh remote core helpers", () => {
 			createdAt: 1,
 			expiresAt: 200,
 		});
+		loaded.clients[0].lastSessionIdByWorkspace!.volt = "mutated-session";
 		loaded.clients.push({
 			nodeId: "leaked-client",
 			label: "leaked",
@@ -1041,7 +1075,17 @@ describe("Iroh remote core helpers", () => {
 			hostSecretKey: [1, 2, 3],
 			consumedPairingSecretHashes: [],
 			workspaces: [{ name: "volt", path: "/workspace" }],
-			clients: [],
+			clients: [
+				{
+					nodeId: "client-node",
+					label: "phone",
+					allowedWorkspaces: ["volt"],
+					allowedTools: "read",
+					pairedAt: 1,
+					lastSeenAt: 1,
+					lastSessionIdByWorkspace: { volt: "session-one" },
+				},
+			],
 			pendingPairingTickets: [
 				{
 					secretHash: "sha256:pending",

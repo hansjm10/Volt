@@ -36,7 +36,7 @@ import {
 	serializeIrohRemoteRpcFilterRejection,
 	writeIrohRemoteHandshakeResponse,
 	writeIrohRemoteHostState,
-	createIrohRemoteAgentRuntime,
+	createIrohRemoteAgentRuntimeWithSessionSelection,
 	runIrohRemoteRpcMode,
 } from "@earendil-works/volt-coding-agent";
 import nativeAdapter from "./iroh-native-adapter.cjs";
@@ -933,14 +933,26 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, opt
 	let runtime;
 	let runtimeOwnedByRpcMode = false;
 	try {
-		runtime = await createIrohRemoteAgentRuntime({
+		const previousSessionId = authorization.client.lastSessionIdByWorkspace?.[authorization.workspace.name];
+		const runtimeResult = await createIrohRemoteAgentRuntimeWithSessionSelection({
 			agentDir: options.agentDir,
 			allowTools: authorization.allowTools,
 			cwd: authorization.workspace.path,
 			profile: options.profile,
 			projectTrusted: options.projectTrusted,
+			resumeSessionId: previousSessionId,
 		});
+		runtime = runtimeResult.runtime;
+		await options.hostEngine.setClientLastSessionId(
+			authorization.client.nodeId,
+			authorization.workspace.name,
+			runtime.session.sessionId,
+		);
+		await logRemoteSessionSelection(runtimeResult.sessionSelection, authorization, options);
 	} catch (error) {
+		if (runtime) {
+			await runtime.dispose().catch(() => {});
+		}
 		const message = error instanceof Error ? error.message : String(error);
 		await logAudit(options.auditLogger, {
 			type: "runtime_failure",
@@ -959,7 +971,7 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, opt
 		clientNodeId: authorization.client.nodeId,
 		workspace: authorization.workspace.name,
 		success: true,
-		details: { runtime: "integrated-volt" },
+		details: { runtime: "integrated-volt", sessionId: runtime.session.sessionId },
 	});
 
 	let runtimeStopSuccess = true;
@@ -1000,6 +1012,44 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, opt
 	}
 }
 
+async function logRemoteSessionSelection(selection, authorization, options) {
+	const common = {
+		clientNodeId: authorization.client.nodeId,
+		workspace: authorization.workspace.name,
+	};
+	if (selection.kind === "resumed") {
+		await logAudit(options.auditLogger, {
+			...common,
+			type: "session_resumed",
+			success: true,
+			details: { requestedSessionId: selection.requestedSessionId, sessionId: selection.sessionId },
+		});
+		return;
+	}
+	if (selection.kind === "created_after_missing") {
+		await logAudit(options.auditLogger, {
+			...common,
+			type: "session_missing_on_resume",
+			success: false,
+			error: "session not found",
+			details: { requestedSessionId: selection.requestedSessionId },
+		});
+		await logAudit(options.auditLogger, {
+			...common,
+			type: "session_created",
+			success: true,
+			details: { reason: "missing_on_resume", sessionId: selection.sessionId },
+		});
+		return;
+	}
+	await logAudit(options.auditLogger, {
+		...common,
+		type: "session_created",
+		success: true,
+		details: { reason: "new_client_connection", sessionId: selection.sessionId },
+	});
+}
+
 function registerActiveConnection(options, authorization, connection) {
 	const entry = {
 		clientNodeId: authorization.client.nodeId,
@@ -1018,6 +1068,31 @@ function registerActiveConnection(options, authorization, connection) {
 			options.activeConnections.delete(entry.clientNodeId);
 		}
 	};
+}
+
+function hasActiveConnectionForAuthorization(options, authorization) {
+	const entries = options.activeConnections.get(authorization.client.nodeId) ?? [];
+	for (const entry of entries) {
+		if (entry.workspace === authorization.workspace.name) {
+			return true;
+		}
+	}
+	return false;
+}
+
+async function rejectDuplicateActiveConnection(stream, authorization, options) {
+	const error = "client already connected";
+	await logAudit(options.auditLogger, {
+		type: "duplicate_connection_rejected",
+		clientNodeId: authorization.client.nodeId,
+		workspace: authorization.workspace.name,
+		success: false,
+		error,
+		details: { source: "active_connection_registry" },
+	});
+	await writeIrohRemoteHandshakeResponse(stream.send, createIrohRemoteHandshakeFailure(error));
+	await stream.send.finish?.();
+	await Promise.resolve(stream.recv.stop?.(0n)).catch(() => {});
 }
 
 async function closeActiveConnectionsForClient(options, nodeId) {
@@ -1087,6 +1162,10 @@ async function handleConnection(incoming, options) {
 
 		if (handshake.authorization.paired) {
 			console.error(`paired client: ${handshake.authorization.client.label} (${remoteId})`);
+		}
+		if (hasActiveConnectionForAuthorization(options, handshake.authorization)) {
+			await rejectDuplicateActiveConnection(stream, handshake.authorization, options);
+			return;
 		}
 		removeActiveConnection = registerActiveConnection(options, handshake.authorization, connection);
 

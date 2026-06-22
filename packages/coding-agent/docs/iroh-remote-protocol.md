@@ -88,6 +88,10 @@ On success, `clientNodeId` is authoritative and comes from the host's accepted I
 
 A paired client may have only one active connection per workspace in v1 preview. If the same authoritative client node ID connects to the same workspace while a previous connection is still active, the host rejects the new stream with a normal handshake failure response whose `error` is `client already connected`; the existing connection remains active.
 
+## Reconnect and session selection
+
+A reconnecting paired client with the same authoritative Iroh node ID resumes the last recorded Volt session for that workspace when the session file still exists. If the recorded session is missing, the host creates a new session, records it for future reconnects, and reports the active `sessionId` through `get_state`. V1 does not replay live stream deltas; clients recover by reconnecting, calling `get_state`, and continuing from the persisted session state.
+
 ## JSONL framing
 
 All post-handshake traffic is Volt RPC JSONL:

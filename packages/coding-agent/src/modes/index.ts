@@ -12,7 +12,10 @@ export {
 } from "./rpc/in-process-rpc-client.ts";
 export {
 	createIrohRemoteAgentRuntime,
+	createIrohRemoteAgentRuntimeWithSessionSelection,
 	type IrohRemoteAgentRuntimeOptions,
+	type IrohRemoteAgentRuntimeResult,
+	type IrohRemoteAgentRuntimeSessionSelection,
 } from "./rpc/iroh-remote-agent-runtime.ts";
 export { type IrohRemoteRpcModeOptions, runIrohRemoteRpcMode } from "./rpc/iroh-remote-rpc-mode.ts";
 export {

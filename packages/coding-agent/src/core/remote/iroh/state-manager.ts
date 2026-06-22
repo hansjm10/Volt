@@ -102,6 +102,26 @@ export class IrohRemoteHostStateManager {
 		});
 	}
 
+	async setClientLastSessionId(
+		nodeId: string,
+		workspace: string,
+		sessionId: string,
+	): Promise<IrohRemoteClient | undefined> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const client = state.clients.find((entry) => entry.nodeId === nodeId);
+			if (!client) {
+				return undefined;
+			}
+			client.lastSessionIdByWorkspace = {
+				...(client.lastSessionIdByWorkspace ?? {}),
+				[workspace]: sessionId,
+			};
+			await this.saveUnlocked(state);
+			return cloneClient(client);
+		});
+	}
+
 	async revokeClient(nodeId: string): Promise<IrohRemoteClientRevocationResult> {
 		return this.runExclusive(async () => {
 			const state = await this.loadUnlocked();
@@ -220,6 +240,7 @@ function cloneClient(client: IrohRemoteClient): IrohRemoteClient {
 	return {
 		...client,
 		allowedWorkspaces: [...client.allowedWorkspaces],
+		...(client.lastSessionIdByWorkspace ? { lastSessionIdByWorkspace: { ...client.lastSessionIdByWorkspace } } : {}),
 	};
 }
 

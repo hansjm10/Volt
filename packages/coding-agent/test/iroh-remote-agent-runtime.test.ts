@@ -4,7 +4,11 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "../src/core/remote/iroh/index.ts";
-import { createIrohRemoteAgentRuntime } from "../src/modes/rpc/iroh-remote-agent-runtime.ts";
+import { CURRENT_SESSION_VERSION } from "../src/core/session-manager.ts";
+import {
+	createIrohRemoteAgentRuntime,
+	createIrohRemoteAgentRuntimeWithSessionSelection,
+} from "../src/modes/rpc/iroh-remote-agent-runtime.ts";
 
 const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY"] as const;
 
@@ -90,6 +94,77 @@ describe("createIrohRemoteAgentRuntime", () => {
 			expect(existsSync(join(agentDir, "commands"))).toBe(false);
 			expect(readdirSync(join(agentDir, "sessions"))).toHaveLength(1);
 			expect(runtime.session.getActiveToolNames()).toEqual(DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(","));
+		} finally {
+			errorSpy.mockRestore();
+			await runtime?.dispose();
+		}
+	});
+
+	it("resumes a requested remote session when its file still exists", async () => {
+		writeRuntimeConfig({});
+		const sessionDir = join(agentDir, "sessions", "remote-workspace");
+		mkdirSync(sessionDir, { recursive: true });
+		const sessionFile = join(sessionDir, "2026-06-21T00-00-00-000Z_remote-session.jsonl");
+		writeFileSync(
+			sessionFile,
+			`${JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "remote-session",
+				timestamp: "2026-06-21T00:00:00.000Z",
+				cwd,
+			})}\n`,
+		);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		let runtime: Awaited<ReturnType<typeof createIrohRemoteAgentRuntime>> | undefined;
+		try {
+			const result = await createIrohRemoteAgentRuntimeWithSessionSelection({
+				agentDir,
+				cwd,
+				resumeSessionId: "remote-session",
+				sessionDir,
+			});
+			runtime = result.runtime;
+
+			expect(result.sessionSelection).toEqual({
+				kind: "resumed",
+				requestedSessionId: "remote-session",
+				sessionFile,
+				sessionId: "remote-session",
+			});
+			expect(runtime.session.sessionId).toBe("remote-session");
+			expect(runtime.session.sessionFile).toBe(sessionFile);
+		} finally {
+			errorSpy.mockRestore();
+			await runtime?.dispose();
+		}
+	});
+
+	it("creates a new remote session when the requested resume session is missing", async () => {
+		writeRuntimeConfig({});
+		const sessionDir = join(agentDir, "sessions", "remote-workspace");
+		mkdirSync(sessionDir, { recursive: true });
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		let runtime: Awaited<ReturnType<typeof createIrohRemoteAgentRuntime>> | undefined;
+		try {
+			const result = await createIrohRemoteAgentRuntimeWithSessionSelection({
+				agentDir,
+				cwd,
+				resumeSessionId: "missing-session",
+				sessionDir,
+			});
+			runtime = result.runtime;
+
+			expect(result.sessionSelection.kind).toBe("created_after_missing");
+			if (result.sessionSelection.kind !== "created_after_missing") {
+				throw new Error("expected missing-session fallback");
+			}
+			expect(result.sessionSelection.requestedSessionId).toBe("missing-session");
+			expect(result.sessionSelection.sessionId).toBe(runtime.session.sessionId);
+			expect(result.sessionSelection.sessionId).not.toBe("missing-session");
+			expect(result.sessionSelection.sessionFile).toBe(runtime.session.sessionFile);
 		} finally {
 			errorSpy.mockRestore();
 			await runtime?.dispose();

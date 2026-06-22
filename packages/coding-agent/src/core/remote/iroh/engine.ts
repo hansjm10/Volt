@@ -193,6 +193,14 @@ export class IrohRemoteHostEngine {
 		return result;
 	}
 
+	async setClientLastSessionId(
+		nodeId: string,
+		workspace: string,
+		sessionId: string,
+	): Promise<IrohRemoteClient | undefined> {
+		return this.stateManager.setClientLastSessionId(nodeId, workspace, sessionId);
+	}
+
 	async authorizeHello(hello: IrohRemoteHello, remoteNodeId: string): Promise<IrohRemoteClientAuthorizationResult> {
 		return this.runAuthorizationExclusive(() => this.authorizeHelloUnlocked(hello, remoteNodeId));
 	}

@@ -16,6 +16,7 @@ export interface IrohRemoteClient {
 	allowedTools: string;
 	pairedAt: number;
 	lastSeenAt: number;
+	lastSessionIdByWorkspace?: Record<string, string>;
 }
 
 export interface IrohRemotePendingPairingTicket {
@@ -104,6 +105,12 @@ export function parseIrohRemoteClient(value: unknown): IrohRemoteClient {
 		allowedTools: expectOptionalString(client.allowedTools, "client allowedTools") ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 		pairedAt: expectNumber(client.pairedAt, "client pairedAt"),
 		lastSeenAt: expectNumber(client.lastSeenAt, "client lastSeenAt"),
+		...parseOptionalStringRecordProperty(
+			client.lastSessionIdByWorkspace,
+			"client lastSessionIdByWorkspace",
+			"client last session workspace",
+			"client last session id",
+		),
 	};
 }
 
@@ -151,6 +158,26 @@ function parseOptionalStringArray(value: unknown, label: string, entryLabel: str
 		return [];
 	}
 	return parseArray(value, label, (entry) => expectString(entry, entryLabel));
+}
+
+function parseOptionalStringRecordProperty(
+	value: unknown,
+	label: string,
+	keyLabel: string,
+	valueLabel: string,
+): { lastSessionIdByWorkspace?: Record<string, string> } {
+	if (value === undefined) {
+		return {};
+	}
+	const record = expectRecord(value, label);
+	const parsed: Record<string, string> = {};
+	for (const [key, entry] of Object.entries(record)) {
+		if (key.length === 0) {
+			throw new Error(`${keyLabel} must be a non-empty string`);
+		}
+		parsed[key] = expectString(entry, valueLabel);
+	}
+	return { lastSessionIdByWorkspace: parsed };
 }
 
 function expectRecord(value: unknown, label: string): Record<string, unknown> {

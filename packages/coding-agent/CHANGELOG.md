@@ -32,6 +32,7 @@
 - Added `volt remote pair` to request first-class pairing tickets from a running Iroh remote host control channel.
 - Added `volt remote status` for deterministic persisted Iroh remote host state inspection without printing secrets or secret hashes.
 - Added Iroh remote protocol v1 documentation and compatibility vectors for tickets, handshakes, LF JSONL framing, command filtering, and outbound redaction.
+- Added Iroh remote per-client session tracking so integrated remote reconnects resume the client's previous workspace session when its session file still exists and create/audit a replacement when it is missing.
 - Added a self-contained `volt remote host` product entrypoint backed by optional `@number0/iroh`, keeping native Iroh loading isolated from the main CLI.
 - Added transport-backed RPC clients, including an in-memory loopback transport and in-process client helper for running Volt RPC without spawning a subprocess.
 - Added a `swe-pruner.ts` example extension that finds task-relevant excerpts in local files through a local SWE-Pruner service, persists its settings in global or project config, and includes npm scripts for starting and stopping the local service.
@@ -66,6 +67,7 @@
 - Changed Iroh remote host startup to require TTY confirmation or `--yes` before granting unsafe remote tools (`bash`, `edit`, or `write`) and to audit accepted unsafe grants.
 - Changed Iroh remote pairing ticket state to persist only secret hashes and non-secret metadata, prune expired pending tickets, audit ticket consumption and expiry, and apply pair-time tools/label hints through the host lifecycle.
 - Changed Iroh remote revocation to coordinate with a running host control channel, close matching active connections, and audit `active_connection_revoked` while keeping persisted-state revocation as a no-host fallback.
+- Changed Iroh remote host active connection handling to reject duplicate same-client/workspace connections with a `client already connected` handshake failure and `duplicate_connection_rejected` audit event.
 - Clarified that Iroh remote protocol v1 keeps the direct RPC command allowlist narrow and continues rejecting transcript, command-list, last-assistant-text, and model-list RPC commands in preview.
 - Documented the Iroh remote v1 preview duplicate-connection policy: reject a second active connection for the same client/workspace instead of replacing the existing runtime.
 - Updated the SWE-Pruner example extension guidance to prefer semantic pruning after candidate-file discovery and clarify when to use search, LSP, or full reads instead.
