@@ -507,17 +507,45 @@ volt config                    # Enable/disable package resources
 | `--mode rpc` | RPC mode for process integration (see [docs/rpc.md](docs/rpc.md)) |
 | `--export <in> [out]` | Export session to HTML |
 
-### Remote Host
+### Remote Access over Iroh (Preview)
+
+`volt remote host` exposes a local Volt runtime over Iroh. Remote access is opt-in: nothing listens until you start the host. The host keeps provider credentials, files, tools, settings, sessions, state, and audit logs on the host machine.
+
+Copy-pastable happy path:
 
 ```bash
-volt remote host --workspace volt=/path/to/repo
-volt remote clients
-volt remote revoke <node-id>
+# Terminal 1: start a host for one named workspace.
+volt remote host --workspace volt=/path/to/repo --allow-tools read,grep,find,ls
+
+# Terminal 2: create a pairing ticket from the running host.
+volt remote pair --workspace volt
+
+# From a source checkout demo client, connect with the printed ticket.
+npm run iroh:poc:client -- "<ticket>" --get-state
+npm run iroh:poc:client -- "<ticket>" --message "List the top-level files."
 ```
 
-`volt remote host` exposes Volt RPC over Iroh using the optional `@number0/iroh` native adapter. The default remote tool allowlist is read-only (`read,grep,find,ls`); pass `--allow-tools` to change it.
+Management commands:
 
-The remote host requires a Node.js package install or source checkout on a platform supported by `@number0/iroh`. Bun binary builds currently reject this command because the optional native Iroh adapter is not bundled.
+```bash
+volt remote status                         # persisted state, workspaces, clients, tools, state/audit paths
+volt remote clients                        # paired client JSON
+volt remote revoke <node-id>               # revoke future access and close active connections when the host is live
+volt remote host --workspace volt=/path/to/repo --no-pairing
+```
+
+Security defaults and limitations:
+
+- Default remote tools are read-only: `read,grep,find,ls`.
+- Granting `bash`, `edit`, or `write` can modify the host or run shell commands. TTY host/pair commands ask for confirmation; noninteractive unsafe grants require `--yes`.
+- Pairing tickets are short-lived, one-time credentials. `volt remote pair` requires a running host control channel; it does not generate offline tickets from persisted state.
+- Remote workspaces are selected by saved name, not arbitrary client-provided paths.
+- Remote sessions do not auto-approve project trust. Use `--approve` only when the host user trusts the workspace resources.
+- Default paths are `~/.volt/agent/remote/iroh-host.json` for state and `~/.volt/agent/remote/iroh-host.audit.jsonl` for audit JSONL.
+- Use `--relay default` on the host when validating cross-network relay/discovery; same-machine and same-LAN testing can keep the default `--relay disabled`.
+- Remote host support requires a Node.js npm package install or source checkout with optional `@number0/iroh` available for the platform. Bun binary builds reject `volt remote host` because the native Iroh adapter is not bundled.
+
+See [Iroh remote protocol v1](docs/iroh-remote-protocol.md), [Iroh remote access design](docs/iroh-remote-access-design.md), and [Security](docs/security.md#remote-access-over-iroh-preview).
 
 ### Print Mode Stdin
 

@@ -35,7 +35,7 @@ For the full first-run flow, see [Quickstart](quickstart.md).
 - [Quickstart](quickstart.md) - install, authenticate, and run a first session.
 - [Using Volt](usage.md) - interactive mode, slash commands, context files, and CLI reference.
 - [Providers](providers.md) - subscription and API-key setup for built-in providers.
-- [Security](security.md) - project trust, sandbox boundaries, and vulnerability reporting.
+- [Security](security.md) - project trust, sandbox boundaries, remote access warnings, and vulnerability reporting.
 - [Containerization](containerization.md) - sandbox volt with OpenShell, Gondolin, or Docker.
 - [Settings](settings.md) - global and project settings.
 - [Keybindings](keybindings.md) - default shortcuts and custom keybindings.
@@ -56,8 +56,9 @@ For the full first-run flow, see [Quickstart](quickstart.md).
 
 - [SDK](sdk.md) - embed volt in Node.js applications.
 - [RPC mode](rpc.md) - integrate over stdin/stdout JSONL.
-- [Iroh remote protocol](iroh-remote-protocol.md) - v1 ticket, handshake, JSONL, command, and redaction contract.
-- [Iroh remote access design](iroh-remote-access-design.md) - optional remote host design for Volt access over Iroh.
+- [Iroh remote access](usage.md#remote-access-over-iroh-preview) - supported preview host, pair, status, clients, revoke, relay, and safety workflow.
+- [Iroh remote protocol](iroh-remote-protocol.md) - v1 ticket, handshake, JSONL, command, and redaction contract for client authors.
+- [Iroh remote access design](iroh-remote-access-design.md) - architecture, support boundary, and limitations for Volt access over Iroh.
 - [JSON event stream mode](json.md) - print mode with structured events.
 - [TUI components](tui.md) - build custom terminal UI for extensions.
 

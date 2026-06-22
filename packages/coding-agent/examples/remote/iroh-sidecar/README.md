@@ -2,7 +2,7 @@
 
 This example tunnels Volt RPC JSONL over an Iroh QUIC bidirectional stream.
 
-The product host lives in Volt itself: `volt remote host` launches `packages/coding-agent/src/remote/iroh-host.mjs` from source checkouts, or the copied `dist/remote/iroh-host.mjs` from package installs. This directory keeps demo clients, fake-RPC fixtures, and compatibility wrappers for local remote-host testing.
+The supported preview host lives in Volt itself: `volt remote host` launches `packages/coding-agent/src/remote/iroh-host.mjs` from source checkouts, or the copied `dist/remote/iroh-host.mjs` from package installs. This directory keeps demo clients, fake-RPC fixtures, and compatibility wrappers for local remote-host testing.
 
 ## Install
 
@@ -18,7 +18,7 @@ For direct demo-client commands from this directory after the repository root or
 npm install --ignore-scripts
 ```
 
-`@number0/iroh` is now an optional dependency of `@earendil-works/volt-coding-agent`. Host commands use the product package install, so run root install before `volt remote host` or `npm run iroh:poc:host`. If `volt remote host` reports that the optional native adapter is unavailable, reinstall with optional dependencies enabled for the current platform. The example package can still install the dependency locally for direct client demos.
+`@number0/iroh` is an optional dependency of `@earendil-works/volt-coding-agent`. Host commands use the product package install, so run root install before `volt remote host` or `npm run iroh:poc:host`. If `volt remote host` reports that the optional native adapter is unavailable, reinstall with optional dependencies enabled for the current platform. The example package can still install the dependency locally for direct client demos. Bun binary builds reject `volt remote host` because the optional native Iroh adapter is not bundled; use a Node.js npm install or source checkout.
 
 ## Root scripts
 
@@ -31,9 +31,11 @@ npm run iroh:poc:host                   # product host with the fake-RPC child
 npm run iroh:poc:host:volt              # integrated source Volt host for this checkout
 npm run iroh:poc:client -- "<ticket>"    # one-shot client
 npm run iroh:poc:client -- "<ticket>" --interactive  # persistent prompt loop
-npm run iroh:poc:clients                # list paired clients
+npm run iroh:poc:clients                # list paired clients through the example wrapper
+volt remote clients                     # list paired clients through the product CLI
 volt remote status                      # inspect persisted host state
-npm run iroh:poc:revoke -- <node-id>    # revoke a paired client
+npm run iroh:poc:revoke -- <node-id>    # revoke a paired client through the wrapper
+volt remote revoke <node-id>            # revoke a paired client through the product CLI
 ```
 
 Pass extra host/client flags after `--`, for example:
@@ -53,7 +55,7 @@ Run the automated local scenario suite when changing the remote host bridge:
 npm run iroh:poc:test
 ```
 
-The suite starts local host/client processes with isolated temporary state and covers fake-RPC prompt streaming, `get_state`, first-class `volt remote pair`, `volt remote status`, pairing persistence, `--no-pairing` rejection, revocation, expired tickets, and workspace preflight failures.
+The suite starts local host/client processes with isolated temporary state and covers fake-RPC prompt streaming, remote command filtering, `get_state`, first-class `volt remote pair`, `volt remote status`, pairing persistence, reconnect session resume, missing-session fallback, duplicate active connection rejection, `--no-pairing` rejection, active revocation, unsafe tool gates, expired tickets, and workspace preflight failures.
 
 ## Local fake-RPC smoke test
 
@@ -99,8 +101,14 @@ The host prints a pairing ticket by default. A client that connects with that ti
 A running host also accepts local management requests from `volt remote pair`, which prints only the generated ticket on stdout:
 
 ```bash
-volt remote host --workspace volt=/path/to/repo --no-pairing
+# Terminal 1
+volt remote host --workspace volt=/path/to/repo --allow-tools read,grep,find,ls
+
+# Terminal 2
 volt remote pair --workspace volt
+npm run iroh:poc:client -- "<ticket>" --get-state
+
+# Unsafe grants require confirmation, or --yes for noninteractive use.
 volt remote pair --workspace volt --allow-tools read,grep,find,ls,bash --yes
 ```
 
@@ -127,7 +135,7 @@ Revoke a client:
 npm run iroh:poc:revoke -- <client-node-id>
 ```
 
-Revocation removes the client from persisted state so future connections fail. If a host is currently running for the same state file, the revoke command also asks that host to close matching active connections and audits `active_connection_revoked`; if no live host is reachable, persisted revocation still succeeds and the command prints an active-live-unavailable diagnostic.
+Revocation removes the client from persisted state so future connections fail. If a host is currently running for the same state file, the revoke command also asks that host to close matching active connections and audits `active_connection_revoked`; if no live host is reachable, persisted revocation still succeeds and the command prints an active-live-unavailable diagnostic. To change an existing client's tool grant in preview, revoke that client and pair it again with the desired `--allow-tools`.
 
 After a client is paired, the host can run without accepting new clients:
 
@@ -150,6 +158,8 @@ The same integrated path is also available through the source CLI:
 ```bash
 node scripts/run-coding-agent-source.mjs remote host --workspace volt=. --allow-tools read,grep,find,ls
 ```
+
+Remote sessions follow normal project trust behavior. Add `--approve` only when the host user trusts project-local settings/resources for the exposed workspace.
 
 Terminal 1, when testing another source checkout as a spawned RPC child from this directory:
 
@@ -193,18 +203,22 @@ The default is `--relay disabled`, which is best for same-machine or same-LAN te
 npm run iroh:poc:host -- --relay default --once
 ```
 
-The ticket records the relay mode and the client uses the same preset.
+The ticket records the relay mode and the client uses the same preset. Use `--relay default` for real cross-network validation; same-machine tests do not prove relay reachability.
 
 ## Security notes
 
-Remote host support is experimental and should be treated as remote access to the host machine.
+Remote host support is a preview feature and should be treated as remote access to the host machine.
 
-- Pairing tickets contain a one-time secret for adding a client to the allowlist.
+- Remote access is opt-in; nothing listens until the host command starts.
+- Pairing tickets contain a short-lived one-time secret for adding a client to the allowlist. Persisted state stores hashes and non-secret metadata, not raw secrets.
 - Paired clients are persisted until revoked.
 - Any paired client can control the integrated runtime or spawned RPC child for its allowed workspace.
-- Real Volt RPC can read files, edit files, and run tools allowed by `--allow-tools`.
-- Keep the default read-only tool list while testing remotely.
+- Real Volt RPC can use only tools allowed by the client's persisted `allowedTools` grant.
+- Keep the default read-only tool list (`read,grep,find,ls`) unless the client and workspace are trusted.
 - `--allow-tools` grants that include `bash`, `edit`, or `write` can modify host files or run shell commands; TTY host and pair commands ask for confirmation, and noninteractive commands must pass `--yes`.
+- Workspaces are selected by saved name, not arbitrary client-provided paths.
+- Remote sessions do not auto-approve project trust. Use `--approve` only when the host user trusts project-local resources.
+- Default state and audit paths are `~/.volt/agent/remote/iroh-host.json` and `~/.volt/agent/remote/iroh-host.audit.jsonl`.
 - Do not expose sensitive workspaces or run with `bash,edit,write` unless the client is trusted.
 
-See [the design document](../../../docs/iroh-remote-access-design.md) for the intended product security model.
+See [Using Volt](../../../docs/usage.md#remote-access-over-iroh-preview), [Security](../../../docs/security.md#remote-access-over-iroh-preview), and [the design document](../../../docs/iroh-remote-access-design.md) for the product security model.

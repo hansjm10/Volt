@@ -52,6 +52,32 @@ Common patterns are documented in [Containerization](containerization.md):
 
 If you bind-mount a host workspace read/write, writes from inside the container or VM can still modify host files. Use read-only mounts or copy files into and out of the sandbox when you need stronger protection from unintended writes.
 
+## Remote Access over Iroh (Preview)
+
+`volt remote host` is opt-in remote access to a local Volt runtime. Treat a paired remote client as a user who can operate Volt inside the exposed workspace with the tools granted by the host.
+
+Supported preview safety model:
+
+- Nothing listens until the host user runs `volt remote host`.
+- Workspaces are exposed by saved names such as `volt=/path/to/repo`; clients cannot request arbitrary host paths.
+- The default remote tool allowlist is read-only: `read,grep,find,ls`.
+- Pairing tickets are short-lived, one-time credentials. Persisted state stores secret hashes and non-secret metadata, not raw pairing secrets.
+- Pairing through `volt remote pair` requires a running host control channel; offline ticket generation from persisted state is not supported.
+- Paired clients are persisted until revoked with `volt remote revoke <node-id>`.
+- Revocation removes future access from persisted state and asks a live host to close matching active connections when one is reachable.
+- `volt remote status` reports persisted workspaces, clients, tool grants, state path, and audit path without printing secrets or secret hashes.
+- Default paths are `~/.volt/agent/remote/iroh-host.json` for state and `~/.volt/agent/remote/iroh-host.audit.jsonl` for audit JSONL.
+
+Unsafe remote tools require explicit host approval. Granting `bash`, `edit`, or `write` lets the remote session modify files or run shell commands on the host. TTY host/pair commands ask for confirmation; noninteractive unsafe grants require `--yes`. Do not grant unsafe tools unless the client device and network path are trusted.
+
+Remote sessions do not auto-approve project trust. Project-local settings, extensions, skills, prompt templates, themes, system prompts, and package-managed resources follow the same project trust rules as local Volt. Use `--approve` only when the host user trusts those resources for the exposed workspace.
+
+Remote host support requires a Node.js npm package install or source checkout with optional `@number0/iroh` available for the platform. Bun binary builds reject `volt remote host` because the native Iroh adapter is not bundled. If startup reports that the optional native adapter is unavailable, reinstall with optional dependencies enabled for the current platform.
+
+Use `--relay default` when validating access across networks. The default `--relay disabled` is intended for same-machine and same-LAN testing.
+
+See [Using Volt](usage.md#remote-access-over-iroh-preview) for copy-pastable commands and [Iroh remote protocol v1](iroh-remote-protocol.md) for the external client contract.
+
 ## Reporting Security Issues
 
 To report a security issue, follow the repository [Security Policy](../../../SECURITY.md). Do not open a public issue for security-sensitive reports.

@@ -4,6 +4,8 @@ Iroh remote access tunnels Volt RPC JSONL over an Iroh QUIC bidirectional stream
 
 This protocol is preview-stable for external client authors. Clients must reject unsupported required values, ignore unknown fields unless this document says otherwise, and treat secrets as one-time credentials.
 
+For user-facing setup, run `volt remote host` on a trusted host workspace, create tickets with `volt remote pair`, inspect `volt remote status`, and revoke clients with `volt remote revoke <node-id>`. The host-side management workflow, state/audit paths, unsafe tool warnings, relay mode, and Node-only/Bun-binary limitation are documented in [Using Volt](usage.md#remote-access-over-iroh-preview) and [Security](security.md#remote-access-over-iroh-preview). This document defines the wire contract only.
+
 ## Version and ALPN
 
 - Ticket prefix: `volt+iroh://v1/`

@@ -69,6 +69,7 @@
 - Changed Iroh remote revocation to coordinate with a running host control channel, close matching active connections, and audit `active_connection_revoked` while keeping persisted-state revocation as a no-host fallback.
 - Changed Iroh remote host active connection handling to reject duplicate same-client/workspace connections with a `client already connected` handshake failure and `duplicate_connection_rejected` audit event.
 - Clarified that Iroh remote protocol v1 keeps the direct RPC command allowlist narrow and continues rejecting transcript, command-list, last-assistant-text, and model-list RPC commands in preview.
+- Documented the Iroh remote supported-preview user workflow, security model, relay guidance, state/audit paths, and Node-only host support boundary across README, usage, security, protocol, design, and sidecar docs.
 - Documented the Iroh remote v1 preview duplicate-connection policy: reject a second active connection for the same client/workspace instead of replacing the existing runtime.
 - Updated the SWE-Pruner example extension guidance to prefer semantic pruning after candidate-file discovery and clarify when to use search, LSP, or full reads instead.
 - Changed store install/update confirmations and summaries to show package names and concise source labels instead of full git source strings.

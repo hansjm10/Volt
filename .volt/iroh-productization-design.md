@@ -800,7 +800,7 @@ Resolved 2026-06-21: `packages/coding-agent/docs/iroh-remote-protocol.md` includ
 
 - Protocol doc includes ticket, hello, response, JSONL framing, command allowlist, and redaction guarantees. Resolved 2026-06-21.
 - Tests fail if the v1 protocol shape changes unintentionally. Resolved 2026-06-21.
-- README/usage docs point users to the protocol/security docs.
+- README/usage docs point users to the protocol/security docs. Resolved 2026-06-21: F.1 added README/usage remote access sections that link protocol, design, and security docs.
 
 ### Phase 5: Reconnect/resume
 
@@ -825,16 +825,16 @@ Acceptance criteria:
 Tasks:
 
 1. Run and document `--relay default` validation across two networks.
-2. Add troubleshooting docs for native adapter install failures.
-3. Update README and `docs/usage.md` to remove or narrow experimental language only after all acceptance criteria pass.
-4. Document Bun binary limitation.
-5. Document security model prominently.
+2. Add troubleshooting docs for native adapter install failures. Resolved 2026-06-21: F.1 documents optional `@number0/iroh` reinstall guidance and the host startup missing-adapter failure surface.
+3. Update README and `docs/usage.md` to remove or narrow experimental language only after all acceptance criteria pass. Resolved 2026-06-21: F.1 documents Iroh remote as preview with explicit unsupported boundaries instead of generic experimental language.
+4. Document Bun binary limitation. Resolved 2026-06-21: F.1 documents Node.js npm/source support and Bun binary remote-host rejection.
+5. Document security model prominently. Resolved 2026-06-21: F.1 adds prominent README/usage/security/sidecar warnings for opt-in hosting, read-only defaults, unsafe tools, project trust, revocation, state/audit paths, and workspace boundaries.
 
 Acceptance criteria:
 
 - A real host/client test over relay succeeds.
-- Docs include install, pair, connect, list, revoke, status, relay, and security sections.
-- Unsupported environments produce actionable errors.
+- Docs include install, pair, connect, list, revoke, status, relay, and security sections. Resolved 2026-06-21: README, usage, docs index, security, Iroh design, protocol, sidecar README, and changelog now cover these surfaces.
+- Unsupported environments produce actionable errors. Resolved 2026-06-21: docs describe optional native adapter reinstall guidance and the Node-only/Bun-binary limitation; final environment validation remains tracked by F.2.
 
 ## Required Tests
 
@@ -954,8 +954,8 @@ Do not remove experimental language until all of these are true:
 - [x] `volt remote status` persisted-state inspection exists. Resolved 2026-06-21.
 - [x] Scenario tests cover pair, reconnect, policy, revocation, expiry, and command filtering. Resolved 2026-06-21.
 - [ ] Cross-network `--relay default` dogfood succeeds.
-- [ ] README and usage docs include security warnings and unsupported environments.
-- [ ] `npm run check` passes after code changes.
+- [x] README and usage docs include security warnings and unsupported environments. Resolved 2026-06-21.
+- [x] `npm run check` passes after docs/code changes. Resolved 2026-06-21.
 
 ## Open Decisions
 
@@ -964,10 +964,10 @@ These must be resolved during implementation:
 1. Resolved 2026-06-21: A dialable Iroh endpoint ticket cannot be generated offline from persisted host state alone; `volt remote pair` will be mediated by a running host control channel that has access to the live endpoint address.
 2. Resolved 2026-06-21: Reject the second active connection for the same authoritative client node ID and workspace with handshake failure `client already connected`; do not replace the old connection in v1 preview. This preserves a single active runtime/session writer, avoids killing in-flight model/tool work without explicit user intent, and gives mobile clients an actionable retry condition. Audit rejected duplicates as `duplicate_connection_rejected`.
 3. Resolved 2026-06-21: Do not allow `get_messages`, `get_commands`, `get_last_assistant_text`, or `get_available_models` over remote RPC in v1 preview. Keep the direct command surface limited to prompt/steer/follow_up/abort/get_state/extension_ui_response; the candidate read-only commands expose transcript, installed-resource, prior-output, or model/provider metadata that is not required for minimal reconnect and should be revisited only with a dedicated remote UI/transcript policy.
-4. Should client policy updates be supported by a command, or should users revoke and re-pair?
+4. Resolved 2026-06-21: supported preview does not include an in-place client policy update command. Users should revoke and re-pair a client to change its `allowedTools` or label/workspace policy; this avoids silent policy broadening and keeps each grant auditable through pairing and revocation events.
 5. Resolved 2026-06-21: Active revocation should use the running host control channel in preview; persisted-state revocation remains the fallback when no live host is reachable.
-6. Should the host store relay mode in state for status/pair defaults?
-7. Is supported preview explicitly Node-only, or should a native sidecar be planned before removing experimental language?
+6. Resolved 2026-06-21: the preview host does not store relay mode in persisted state for status defaults. The running host owns the live relay mode, tickets include a relay hint, `volt remote pair --relay <disabled|default>` can assert an expected live host mode, and `volt remote status` remains a persisted-state-only view that does not imply live relay status.
+7. Resolved 2026-06-21: supported preview is explicitly Node.js npm install/source-checkout only. Bun binary remote-host support remains unsupported until a bundling or native sidecar strategy is implemented; docs and the CLI error point users to Node/source installs with optional `@number0/iroh`.
 
 ## Recommended First PR
 
