@@ -39,7 +39,9 @@ import {
 	writeIrohRemoteHandshakeResponse,
 	writeIrohRemoteHostState,
 	createIrohRemoteAgentRuntimeWithSessionSelection,
+	parseIntegratedDetachedRuntimeTtlMs,
 	runIrohRemoteRpcMode,
+	scheduleDetachedRuntimeRetention,
 } from "@earendil-works/volt-coding-agent";
 import nativeAdapter from "./iroh-native-adapter.cjs";
 
@@ -71,6 +73,7 @@ const VALUE_FLAGS = new Set([
 	"agent-dir",
 	"allow-tools",
 	"audit",
+	"detached-runtime-ttl-ms",
 	"profile",
 	"relay",
 	"source-volt",
@@ -206,6 +209,8 @@ Serve options:
                               bash, edit, or write can modify host state and require confirmation.
   --profile <name>           Volt settings profile for integrated Volt runtime.
   --agent-dir <path>         Volt agent config directory for integrated Volt runtime.
+  --detached-runtime-ttl-ms <ms>
+                              Retain idle detached integrated runtimes for this many milliseconds. Defaults to 30 minutes.
   --approve                  Trust project-local Volt settings/resources for integrated Volt runtime.
   --no-pairing               Reject unpaired clients and print a paired-client ticket.
   --once                     Exit after the first client disconnects.
@@ -1142,6 +1147,7 @@ async function createIntegratedRuntimeEntry(authorization, options) {
 			recordedSessionId: runtime.session.sessionId,
 			subscribers: new Set(),
 			detachedAt: undefined,
+			detachedRuntimeRetention: undefined,
 		};
 		options.integratedRuntimes.set(entry.key, entry);
 		await options.hostEngine.setClientLastSessionId(
@@ -1180,6 +1186,7 @@ let integratedRuntimeSubscriberSequence = 0;
 
 async function attachIntegratedRuntimeSubscriber(entry, options) {
 	const wasDetached = entry.subscribers.size === 0 && entry.detachedAt !== undefined;
+	cancelIntegratedRuntimeRetention(entry);
 	const subscriber = {
 		id: `subscriber-${++integratedRuntimeSubscriberSequence}`,
 		attachedAt: Date.now(),
@@ -1219,12 +1226,14 @@ async function detachIntegratedRuntimeSubscriber(entry, subscriber, options, rea
 		detachedAt: entry.detachedAt,
 		reason,
 	});
+	scheduleIntegratedRuntimeRetention(entry, options, reason);
 }
 
 async function stopIntegratedRuntimeEntry(entry, options, reason) {
 	if (!options.integratedRuntimes.has(entry.key)) {
 		return;
 	}
+	cancelIntegratedRuntimeRetention(entry);
 	options.integratedRuntimes.delete(entry.key);
 	const wasActive = entry.runtime.session.isStreaming;
 	let stopSuccess = true;
@@ -1251,6 +1260,59 @@ async function stopIntegratedRuntimeEntry(entry, options, reason) {
 		stopSuccess,
 		stopError,
 	);
+}
+
+function cancelIntegratedRuntimeRetention(entry) {
+	if (!entry.detachedRuntimeRetention) {
+		return;
+	}
+	entry.detachedRuntimeRetention.cancel();
+	entry.detachedRuntimeRetention = undefined;
+}
+
+function isIntegratedRuntimeDetached(entry, options) {
+	return (
+		options.integratedRuntimes.get(entry.key) === entry &&
+		entry.subscribers.size === 0 &&
+		entry.detachedAt !== undefined
+	);
+}
+
+function scheduleIntegratedRuntimeRetention(entry, options, detachReason) {
+	cancelIntegratedRuntimeRetention(entry);
+	entry.detachedRuntimeRetention = scheduleDetachedRuntimeRetention({
+		ttlMs: options.detachedRuntimeTtlMs,
+		isDetached: () => isIntegratedRuntimeDetached(entry, options),
+		isActive: () => entry.runtime.session.isStreaming,
+		waitForIdle: () => entry.runtime.session.waitForIdle(),
+		onExpire: async () => {
+			if (!isIntegratedRuntimeDetached(entry, options) || entry.runtime.session.isStreaming) {
+				return;
+			}
+			await logIntegratedRuntimeAudit(options, entry, "remote_runtime_retention_expired", {
+				detachedAt: entry.detachedAt,
+				detachReason,
+				reason: "detached_runtime_ttl_expired",
+				ttlMs: options.detachedRuntimeTtlMs,
+			});
+			await stopIntegratedRuntimeEntry(entry, options, "detached_runtime_ttl_expired");
+		},
+		onError: (error) => {
+			void logIntegratedRuntimeAudit(
+				options,
+				entry,
+				"remote_runtime_retention_expired",
+				{
+					detachedAt: entry.detachedAt,
+					detachReason,
+					reason: "detached_runtime_ttl_error",
+					ttlMs: options.detachedRuntimeTtlMs,
+				},
+				false,
+				error instanceof Error ? error.message : String(error),
+			);
+		},
+	});
 }
 
 async function stopIntegratedRuntimes(options, reason) {
@@ -1698,6 +1760,7 @@ async function serve(flags) {
 		agentDir: getFlag(flags, "agent-dir"),
 		allowTools,
 		auditLogger,
+		detachedRuntimeTtlMs: parseIntegratedDetachedRuntimeTtlMs(getFlag(flags, "detached-runtime-ttl-ms")),
 		hostEngine: undefined,
 		integratedVolt: hasFlag(flags, "integrated-volt"),
 		integratedRuntimes: new Map(),

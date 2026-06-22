@@ -1326,6 +1326,88 @@ async function integratedVoltDetachReattachRuntimeScenario() {
 	});
 }
 
+async function integratedVoltDetachedRuntimeTtlScenario() {
+	await withStateDir("integrated-detached-ttl", async ({ hostStatePath, stateDir }) => {
+		const agentDir = await createIntegratedVoltAgentDir(stateDir);
+		const workspacePath = join(stateDir, "workspace");
+		await mkdir(workspacePath, { recursive: true });
+		const workspaceArg = `ttl=${workspacePath}`;
+		const auditPath = getDefaultAuditPath(hostStatePath);
+		const endpoint = await bindRawClientEndpoint("disabled");
+		let rawClient;
+		const host = startHost([
+			"--state",
+			hostStatePath,
+			"--agent-dir",
+			agentDir,
+			"--workspace",
+			workspaceArg,
+			"--integrated-volt",
+			"--no-pairing",
+			"--detached-runtime-ttl-ms",
+			"100",
+		]);
+		try {
+			await waitForFirstStdoutLine(host.child, host.output, "integrated detached ttl host");
+			const pairCommand = spawnSourceCli([
+				"remote",
+				"pair",
+				"--state",
+				hostStatePath,
+				"--workspace",
+				"ttl",
+				"--allow-tools",
+				DEFAULT_TEST_ALLOW_TOOLS,
+				"--label",
+				"ttl client",
+			]);
+			await waitForExit(pairCommand.child, "integrated detached ttl pair command", pairCommand.output);
+			const ticket = pairCommand.output.stdout.trim();
+			assert(ticket.startsWith(TICKET_PREFIX), `Expected detached ttl pair command ticket, got:\n${pairCommand.output.stdout}`);
+
+			rawClient = await openRawAuthorizedClientOnEndpoint(endpoint, ticket, {
+				clientLabel: "ttl client",
+			});
+			const state = await readRawRpcResponse(
+				rawClient,
+				{ id: "state-detached-ttl", type: "get_state" },
+				"integrated detached ttl get_state",
+			);
+			assert(state.event.success === true, `Expected detached ttl get_state success, got:\n${state.lines.join("\n")}`);
+			const sessionId = state.event.data?.sessionId;
+			assert(sessionId, `Expected detached ttl session id, got:\n${JSON.stringify(state.event)}`);
+
+			closeRawConnection(rawClient.connection);
+			rawClient = undefined;
+			await waitForAuditEvent(
+				auditPath,
+				(event) => event.type === "remote_runtime_detached" && event.details?.sessionId === sessionId,
+				"integrated detached ttl runtime detached",
+			);
+			await waitForAuditEvent(
+				auditPath,
+				(event) =>
+					event.type === "remote_runtime_retention_expired" &&
+					event.details?.sessionId === sessionId &&
+					event.details?.ttlMs === 100,
+				"integrated detached ttl retention expired",
+			);
+			await waitForAuditEvent(
+				auditPath,
+				(event) =>
+					event.type === "remote_runtime_stopped" &&
+					event.details?.sessionId === sessionId &&
+					event.details?.reason === "detached_runtime_ttl_expired",
+				"integrated detached ttl runtime stopped",
+			);
+		} finally {
+			closeRawConnection(rawClient?.connection);
+			await endpoint.close();
+			await stopProcess(host.child);
+		}
+	});
+}
+
 async function duplicateActiveConnectionScenario() {
 	await withStateDir("duplicate-active", async ({ hostStatePath, stateDir }) => {
 		const agentDir = await createIntegratedVoltAgentDir(stateDir);
@@ -2139,6 +2221,7 @@ const scenarios = [
 	["integrated Volt get_state", integratedVoltGetStateScenario],
 	["integrated Volt reconnect session", integratedVoltReconnectSessionScenario],
 	["integrated Volt detach reattach runtime", integratedVoltDetachReattachRuntimeScenario],
+	["integrated Volt detached runtime TTL", integratedVoltDetachedRuntimeTtlScenario],
 	["duplicate active connection", duplicateActiveConnectionScenario],
 	["integrated Volt profile", integratedVoltProfileScenario],
 	["integrated Volt env profile", integratedVoltEnvProfileScenario],

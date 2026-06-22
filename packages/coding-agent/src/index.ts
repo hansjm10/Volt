@@ -558,6 +558,13 @@ export {
 	type ThemeColor,
 } from "./modes/interactive/theme/theme.ts";
 export {
+	DEFAULT_INTEGRATED_DETACHED_RUNTIME_TTL_MS,
+	type DetachedRuntimeRetentionHandle,
+	type DetachedRuntimeRetentionOptions,
+	parseIntegratedDetachedRuntimeTtlMs,
+	scheduleDetachedRuntimeRetention,
+} from "./remote/integrated-runtime-retention.ts";
+export {
 	DEFAULT_STORE_CATALOG_URL,
 	findCatalogPackage,
 	getStoreCatalogCachePath,
