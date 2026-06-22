@@ -302,10 +302,10 @@ blocked.
     <evidence>2026-06-22: Host state now persists revoked-client tombstones with explicit re-pair approval timestamps, revoked nodes reject reconnects and generic QR use until approval plus an active pairing secret, successful same-node re-pair clears the tombstone, and CLI/status exposes revoked devices plus approve-repair audit events; verification: targeted Vitest files, npm run iroh:poc:test, git diff --check, npm run check, and commit-hook npm run check passed; Volt commit d26756b0.</evidence>
   </item>
 
-  <item ref="B.3" status="open" prereq="A.1,A.4">
+  <item ref="B.3" status="resolved" prereq="A.1,A.4">
     <title>Add stable saved-host protocol support and host identity verification</title>
     <acceptance>Ticket/handshake/protocol support exposes enough non-secret data for SavedHostRecord v1; reconnect handshakes without pairing secrets verify the reached host identity; stale discovery refresh or failure behavior follows A.1/A.4; tests cover host restart with same state, host identity mismatch, stale discovery if reproducible, and malformed saved-host data.</acceptance>
-    <evidence/>
+    <evidence>2026-06-22: Volt protocol now exposes sanitized non-secret reconnect tickets, includes hostNodeId in handshakes when the host identity is known, and verifies saved-host identity in ticket, connection, and handshake paths; core tests cover host restart with same state, host identity mismatch, and malformed saved reconnect fields. Verification: targeted Vitest file, npm run iroh:poc:test, git diff --check, npm run check, and commit-hook npm run check passed; Volt commit 95da73e0.</evidence>
   </item>
 
   <item ref="B.4" status="open" prereq="A.1,A.6">
