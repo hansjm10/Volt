@@ -86,6 +86,8 @@ Failure:
 
 On success, `clientNodeId` is authoritative and comes from the host's accepted Iroh connection. `child` is an implementation label for the host-side child process and may be omitted. Unknown handshake response fields are ignored.
 
+A paired client may have only one active connection per workspace in v1 preview. If the same authoritative client node ID connects to the same workspace while a previous connection is still active, the host rejects the new stream with a normal handshake failure response whose `error` is `client already connected`; the existing connection remains active.
+
 ## JSONL framing
 
 All post-handshake traffic is Volt RPC JSONL:

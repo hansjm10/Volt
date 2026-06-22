@@ -617,6 +617,10 @@ Acceptance criteria:
   - alternative: close the old connection and accept the new one.
 - The chosen behavior must be documented and tested.
 
+Resolved 2026-06-21: Preview duplicate active connection behavior is to reject the second active connection for the same authoritative client node ID and workspace. Rationale: one active runtime/session writer per client/workspace avoids concurrent prompt/tool execution, duplicate session mutations, and ambiguous `lastSessionIdByWorkspace` updates. Replacing the old connection would improve aggressive mobile takeover behavior, but it could also terminate in-flight model/tool work without explicit user intent. Mobile clients should retry after the old transport closes; if the host still sees the previous connection as active, the second handshake receives an actionable failure.
+
+Implementation contract for E.2/E.3: after the hello is parsed and the client is authorized, but before the host writes a success handshake or starts a runtime, check a registry keyed by authoritative client node ID plus workspace. If an entry already exists, write a normal handshake failure response with error `client already connected`, close only the new stream/connection, and leave the existing connection/runtime running. Audit `duplicate_connection_rejected` with `clientNodeId`, `workspace`, `success:false`, `error:"client already connected"`, and non-secret details such as `source:"active_connection_registry"`. Existing connection lifecycle events may still record the attempted connection/disconnection.
+
 ## Security Requirements
 
 ### Tool grants
@@ -677,6 +681,7 @@ runtime_stopped
 unsafe_tools_enabled
 remote_command_rejected
 active_connection_revoked
+duplicate_connection_rejected
 session_resumed
 session_created
 session_missing_on_resume
@@ -802,14 +807,14 @@ Tasks:
 2. Update `createIrohRemoteAgentRuntime()` to accept a session selection/resume option.
 3. Record session ID after runtime creation.
 4. Open previous session on reconnect when possible.
-5. Define duplicate active connection behavior.
+5. Define duplicate active connection behavior. Resolved 2026-06-21: reject the second same-client/workspace active connection with handshake failure `client already connected`, keep the existing runtime alive, and audit `duplicate_connection_rejected`.
 6. Add scenario tests.
 
 Acceptance criteria:
 
 - Client reconnect resumes previous session for the same client/workspace.
 - Missing session file creates a new session and logs an audit event.
-- Duplicate active connection behavior is deterministic and tested.
+- Duplicate active connection behavior is deterministic and tested. E.3 must hold one same-client/workspace connection open, assert a second connection receives handshake failure `client already connected`, assert `duplicate_connection_rejected` is audited, assert the first connection remains usable, then assert reconnect succeeds after the first connection closes.
 - `get_state` after reconnect returns the resumed session ID.
 
 ### Phase 6: Cross-network validation and docs polish
@@ -954,7 +959,7 @@ Do not remove experimental language until all of these are true:
 These must be resolved during implementation:
 
 1. Resolved 2026-06-21: A dialable Iroh endpoint ticket cannot be generated offline from persisted host state alone; `volt remote pair` will be mediated by a running host control channel that has access to the live endpoint address.
-2. Should duplicate connections from the same client node ID be rejected or should the newer connection replace the older one?
+2. Resolved 2026-06-21: Reject the second active connection for the same authoritative client node ID and workspace with handshake failure `client already connected`; do not replace the old connection in v1 preview. This preserves a single active runtime/session writer, avoids killing in-flight model/tool work without explicit user intent, and gives mobile clients an actionable retry condition. Audit rejected duplicates as `duplicate_connection_rejected`.
 3. Resolved 2026-06-21: Do not allow `get_messages`, `get_commands`, `get_last_assistant_text`, or `get_available_models` over remote RPC in v1 preview. Keep the direct command surface limited to prompt/steer/follow_up/abort/get_state/extension_ui_response; the candidate read-only commands expose transcript, installed-resource, prior-output, or model/provider metadata that is not required for minimal reconnect and should be revisited only with a dedicated remote UI/transcript policy.
 4. Should client policy updates be supported by a command, or should users revoke and re-pair?
 5. Resolved 2026-06-21: Active revocation should use the running host control channel in preview; persisted-state revocation remains the fallback when no live host is reachable.
