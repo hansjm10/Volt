@@ -176,6 +176,8 @@ The one-time pairing `secret` must never be stored in `SavedHostRecord`. If a re
 
 For v1, the current sanitized endpoint ticket is sufficient as the discovery field when it is stored with an explicit required `hostNodeId` and verified before use. A separate discovery blob is not required for v1. The sanitized ticket alone is not the identity contract; it is only an implementation detail for dialing.
 
+Implemented 2026-06-22: the iOS app model now persists `SavedHostRecord` v1 instead of treating a sanitized reconnect ticket as the saved record. The record requires `hostNodeId`, normalized `relayMode`, `primaryWorkspace`, `workspaceNames`, `endpointTicket`, `savedAt`, and no pairing secret; it can synthesize a secret-free reconnect ticket for the current Iroh transport and migrate valid legacy saved-ticket Keychain data into the new saved-host account.
+
 Identity verification should happen in two places:
 
 1. Before dialing, if the client can derive a node ID from `endpointTicket`, it must match `hostNodeId`.

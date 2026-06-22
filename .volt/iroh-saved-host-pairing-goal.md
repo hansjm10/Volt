@@ -328,10 +328,10 @@ blocked.
 </group>
 
 <group n="3" title="iOS app implementation">
-  <item ref="C.1" status="open" prereq="A.4,B.3">
+  <item ref="C.1" status="resolved" prereq="A.4,B.3">
     <title>Replace saved reconnect-ticket semantics with SavedHostRecord in the app model</title>
     <acceptance>iOS stores a SavedHostRecord with the fields decided in A.4, no pairing secret, and one-host-v1/multi-host-ready shape; existing Keychain loading/migration behavior is explicit; tests cover saving, loading, sanitization, malformed record handling, and future-compatible host-node-ID keying where practical.</acceptance>
-    <evidence/>
+    <evidence>2026-06-22: iOS now stores SavedHostRecord v1 keyed by hostNodeId, migrates valid legacy saved-ticket Keychain data, strips secret/expiry from reconnect envelopes, and tests saving/loading, sanitization, malformed records, and host-node-ID keying; verification: cd ../volt-app/Packages/VoltClient &amp;&amp; swift test, XcodeBuildMCP test_sim on Volt scheme with iPhone 17 Pro iOS 27.0, root/app doc whitespace checks passed; app commit 295f143.</evidence>
   </item>
 
   <item ref="C.2" status="open" prereq="C.1,B.4">
