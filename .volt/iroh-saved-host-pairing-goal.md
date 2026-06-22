@@ -285,7 +285,7 @@ blocked.
   <item ref="A.6" status="resolved" prereq="A.2,A.3" type="decision">
     <title>Define pairing metadata retention and precise auth outcome detection</title>
     <acceptance>Specs define cleanup for pending pairing tickets and consumed pairing-secret hashes, including whether consumed hashes are retained forever or pruned by TTL. Specs also define how hosts distinguish client_unknown, client_revoked, host_identity_mismatch, workspace_unavailable, and workspace_forbidden in protocol terms.</acceptance>
-    <evidence>2026-06-22: Root/app specs now define active pending tickets, consumed/expired pairing-secret tombstones pruned after 30-day retention, and stable protocol outcomes for client_unknown, client_revoked, workspace_unavailable, workspace_forbidden, pairing_secret_expired, and pairing_secret_consumed; verification: pending doc checks and commit-hook npm run check; Volt commit pending.</evidence>
+    <evidence>2026-06-22: Root/app specs now define active pending tickets, consumed/expired pairing-secret tombstones pruned after 30-day retention, and stable protocol outcomes for client_unknown, client_revoked, workspace_unavailable, workspace_forbidden, pairing_secret_expired, and pairing_secret_consumed; verification: Volt/app doc whitespace checks and commit-hook npm run check passed; Volt commit 4c1cf4d5.</evidence>
   </item>
 </group>
 
