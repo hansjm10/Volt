@@ -314,10 +314,10 @@ blocked.
     <evidence>2026-06-22: Volt protocol now defines stable reconnect outcomes, emits host auth outcomes on failed handshakes, exposes outcome-bearing client-local errors for host identity mismatch and invalid saved-host ticket data, and updates PoC client/tests to assert outcome fields instead of only human strings. Verification: targeted Vitest file, npm run iroh:poc:test, git diff --check, npm run check, and commit-hook npm run check passed; Volt commit 2b5336f1.</evidence>
   </item>
 
-  <item ref="B.5" status="open" prereq="A.5">
+  <item ref="B.5" status="resolved" prereq="A.5">
     <title>Apply the decided relay default policy to host pairing flows</title>
     <acceptance>Host CLI/desktop/service behavior follows A.5; mobile-facing tickets include `relayMode: "default"` unless explicitly opted out; local/LAN-only mode remains available as an explicit advanced option; tests and docs cover default and opt-out behavior.</acceptance>
-    <evidence/>
+    <evidence>2026-06-22: Host CLI now supports `volt remote host --mobile`, defaults mobile startup/control-channel tickets to `relayMode: "default"`, preserves bare-host `disabled` and explicit `--relay disabled` opt-out, and documents/tests the policy; verification: targeted remote-cli Vitest file, npm run iroh:poc:test, same-machine --relay default host/client smoke passed, two-network relay environment unavailable in this session, git diff --check, npm run check, and commit-hook npm run check passed; Volt commit 6cb030d9.</evidence>
   </item>
 
   <item ref="B.6" status="open" prereq="B.1,B.3,B.5">
