@@ -21,6 +21,7 @@ import {
 	IROH_REMOTE_REDACTED_EXPORT_PATH,
 	IROH_REMOTE_REDACTED_HOST_PATH,
 	IROH_REMOTE_REDACTED_SESSION_FILE,
+	IROH_REMOTE_RPC_PASSTHROUGH_TYPES,
 	type IrohRemoteAuditEvent,
 	IrohRemoteAuditLogger,
 	IrohRemoteClientEngine,
@@ -302,6 +303,158 @@ describe("Iroh remote core helpers", () => {
 		expect(() => parseIrohRemoteHandshakeResponseLine(JSON.stringify({ type: "volt_iroh_handshake" }))).toThrow(
 			"handshake response success must be a boolean",
 		);
+	});
+
+	test("pins protocol v1 ticket and handshake compatibility vectors", () => {
+		const payload: IrohRemoteTicketPayload = {
+			alpn: IROH_REMOTE_ALPN,
+			expiresAt: 1790000000000,
+			irohTicket: "iroh-endpoint-ticket",
+			nodeId: "host-node-id",
+			relayMode: "disabled",
+			secret: "one-time-secret",
+			workspace: "volt",
+		};
+		const ticket =
+			"volt+iroh://v1/eyJhbHBuIjoidm9sdC1ycGMvMCIsImV4cGlyZXNBdCI6MTc5MDAwMDAwMDAwMCwiaXJvaFRpY2tldCI6Imlyb2gtZW5kcG9pbnQtdGlja2V0Iiwibm9kZUlkIjoiaG9zdC1ub2RlLWlkIiwicmVsYXlNb2RlIjoiZGlzYWJsZWQiLCJzZWNyZXQiOiJvbmUtdGltZS1zZWNyZXQiLCJ3b3Jrc3BhY2UiOiJ2b2x0In0";
+
+		expect(encodeIrohRemoteTicketPayload(payload)).toBe(ticket);
+		expect(decodeIrohRemoteTicketPayload(ticket)).toEqual(payload);
+		expect(parseIrohRemoteTicketPayload({ ...payload, unknownFutureField: "ignored" })).toEqual(payload);
+
+		const helloLine =
+			'{"type":"volt_iroh_hello","protocol":"volt-rpc/0","workspace":"volt","secret":"one-time-secret","clientLabel":"Jordan iPhone","clientNodeId":"client-claimed-node-id"}';
+		expect(parseIrohRemoteHelloLine(helloLine)).toEqual({
+			type: "volt_iroh_hello",
+			protocol: IROH_REMOTE_ALPN,
+			workspace: "volt",
+			secret: "one-time-secret",
+			clientLabel: "Jordan iPhone",
+			clientNodeId: "client-claimed-node-id",
+		});
+		expect(parseIrohRemoteHelloLine(`${helloLine.slice(0, -1)},"unknownFutureField":"ignored"}`)).toEqual({
+			type: "volt_iroh_hello",
+			protocol: IROH_REMOTE_ALPN,
+			workspace: "volt",
+			secret: "one-time-secret",
+			clientLabel: "Jordan iPhone",
+			clientNodeId: "client-claimed-node-id",
+		});
+
+		const success = createIrohRemoteHandshakeSuccess({
+			workspace: "volt",
+			clientNodeId: "authoritative-client-node-id",
+			child: "volt",
+		});
+		const successLine =
+			'{"type":"volt_iroh_handshake","success":true,"workspace":"volt","clientNodeId":"authoritative-client-node-id","child":"volt"}';
+		expect(JSON.stringify(success)).toBe(successLine);
+		expect(parseIrohRemoteHandshakeResponseLine(successLine)).toEqual(success);
+		expect(
+			parseIrohRemoteHandshakeResponseLine(`${successLine.slice(0, -1)},"unknownFutureField":"ignored"}`),
+		).toEqual(success);
+
+		const failure = createIrohRemoteHandshakeFailure("client is not paired");
+		const failureLine = '{"type":"volt_iroh_handshake","success":false,"error":"client is not paired"}';
+		expect(JSON.stringify(failure)).toBe(failureLine);
+		expect(parseIrohRemoteHandshakeResponseLine(failureLine)).toEqual(failure);
+	});
+
+	test("pins protocol v1 LF framing and initial RPC input preservation", async () => {
+		const unicodeLineSeparators = String.fromCharCode(0x2028, 0x2029);
+		const line = JSON.stringify({
+			type: "volt_iroh_hello",
+			protocol: IROH_REMOTE_ALPN,
+			workspace: "volt",
+			secret: "one-time-secret",
+			clientLabel: `line separator client with unicode separators ${unicodeLineSeparators}`,
+		});
+		const initialRpcInput = '{"id":"prompt-1","type":"prompt","message":"kept after hello"}\n';
+		const recv = new ManualIrohRecvStream();
+		recv.push(Buffer.from(`${line}\n${initialRpcInput}`));
+
+		await expect(
+			readIrohRemoteHandshakeLine(recv, { maxLineBytes: 512, readLimit: 1024, timeoutMs: 1000 }),
+		).resolves.toEqual({
+			line,
+			rest: Buffer.from(initialRpcInput),
+		});
+	});
+
+	test("pins protocol v1 remote command and redaction compatibility vectors", () => {
+		expect(Array.from(IROH_REMOTE_RPC_PASSTHROUGH_TYPES)).toEqual([
+			"prompt",
+			"steer",
+			"follow_up",
+			"abort",
+			"get_state",
+			"extension_ui_response",
+		]);
+		for (const type of IROH_REMOTE_RPC_PASSTHROUGH_TYPES) {
+			const result = getIrohRemoteRpcFilterResult(JSON.stringify({ id: `${type}-1`, type }));
+			expect(result).toEqual({ allowed: true, command: { id: `${type}-1`, type } });
+		}
+		expect(getIrohRemoteRpcFilterResult(JSON.stringify({ id: "bash-1", type: "bash" }))).toEqual({
+			allowed: false,
+			response: {
+				id: "bash-1",
+				type: "response",
+				command: "bash",
+				success: false,
+				error: "RPC command not allowed over remote host: bash",
+			},
+		});
+
+		const workspacePath = "/Users/jordan/project";
+		expect(
+			sanitizeIrohRemoteOutbound(
+				{
+					type: "response",
+					command: "get_state",
+					success: true,
+					data: {
+						cwd: `${workspacePath}/src`,
+						sessionFile: "/Users/jordan/.volt/agent/sessions/project/session.jsonl",
+						exportPath: "/Users/jordan/.volt/agent/exports/Volt-session-session.html",
+						message: `inside ${workspacePath}/src/index.ts outside /Users/jordan/.volt/auth.json`,
+						content: [
+							{
+								type: "image",
+								data: "/9j/4AAQSkZJRgABAQAAAQABAAD=",
+								mimeType: "image/jpeg",
+							},
+							{
+								type: "text",
+								text: "Read /Users/jordan/.volt/auth.json",
+								textSignature: "/opaque/text-signature",
+							},
+						],
+					},
+				},
+				{ workspacePath },
+			),
+		).toEqual({
+			type: "response",
+			command: "get_state",
+			success: true,
+			data: {
+				cwd: "/workspace/src",
+				exportPath: IROH_REMOTE_REDACTED_HOST_PATH,
+				message: `inside /workspace/src/index.ts outside ${IROH_REMOTE_REDACTED_HOST_PATH}`,
+				content: [
+					{
+						type: "image",
+						data: "/9j/4AAQSkZJRgABAQAAAQABAAD=",
+						mimeType: "image/jpeg",
+					},
+					{
+						type: "text",
+						text: `Read ${IROH_REMOTE_REDACTED_HOST_PATH}`,
+						textSignature: "/opaque/text-signature",
+					},
+				],
+			},
+		});
 	});
 
 	test("reads bounded Iroh remote handshake lines and preserves RPC bytes", async () => {

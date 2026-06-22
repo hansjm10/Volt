@@ -31,6 +31,7 @@
 - Added `volt remote clients` and `volt remote revoke <node-id>` for managing paired Iroh remote clients from the main CLI.
 - Added `volt remote pair` to request first-class pairing tickets from a running Iroh remote host control channel.
 - Added `volt remote status` for deterministic persisted Iroh remote host state inspection without printing secrets or secret hashes.
+- Added Iroh remote protocol v1 documentation and compatibility vectors for tickets, handshakes, LF JSONL framing, command filtering, and outbound redaction.
 - Added a self-contained `volt remote host` product entrypoint backed by optional `@number0/iroh`, keeping native Iroh loading isolated from the main CLI.
 - Added transport-backed RPC clients, including an in-memory loopback transport and in-process client helper for running Volt RPC without spawning a subprocess.
 - Added a `swe-pruner.ts` example extension that finds task-relevant excerpts in local files through a local SWE-Pruner service, persists its settings in global or project config, and includes npm scripts for starting and stopping the local service.

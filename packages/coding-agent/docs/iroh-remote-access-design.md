@@ -2,7 +2,7 @@
 
 ## Status
 
-Phase 2 is mostly complete in Volt core: RPC mode has a transport abstraction, Iroh streams have a structurally typed RPC adapter, remote command filtering is available, and the Iroh remote helpers now cover tickets, handshakes, host state, authorization, workspace selection, audit logging, and host/client engine orchestration. `volt remote host` now launches a product host entrypoint in the coding-agent package and runs Volt's runtime in-process over `runIrohRemoteRpcMode()`.
+Phase 2 is mostly complete in Volt core: RPC mode has a transport abstraction, Iroh streams have a structurally typed RPC adapter, remote command filtering is available, and the Iroh remote helpers now cover tickets, handshakes, host state, authorization, workspace selection, audit logging, and host/client engine orchestration. `volt remote host` now launches a product host entrypoint in the coding-agent package and runs Volt's runtime in-process over `runIrohRemoteRpcMode()`. The preview wire contract is documented in [Iroh Remote Protocol v1](iroh-remote-protocol.md).
 
 ## Summary
 
@@ -98,7 +98,7 @@ The client process:
 
 ### Pairing ticket shape
 
-Use an opaque URL-safe payload so the format can change:
+The supported preview ticket format and compatibility rules are specified in [Iroh Remote Protocol v1](iroh-remote-protocol.md). Use an opaque URL-safe payload so the format can change:
 
 ```text
 volt+iroh://v1/<base64url-json>
@@ -122,7 +122,7 @@ The host must treat the ticket secret as one-time. After successful pairing, per
 
 ### Stream protocol
 
-After the handshake succeeds, the stream carries the same LF-delimited JSONL described in [RPC mode](rpc.md). The current host parses command envelopes only to enforce the remote command filter, track connection-level shutdown, and preserve response completion behavior. It should preserve strict LF framing and not use generic line readers that split on Unicode separators.
+The supported preview stream handshake, strict LF framing, command allowlist, authoritative identity rules, and outbound redaction guarantees are specified in [Iroh Remote Protocol v1](iroh-remote-protocol.md). After the handshake succeeds, the stream carries the same LF-delimited JSONL described in [RPC mode](rpc.md). The current host parses command envelopes only to enforce the remote command filter, track connection-level shutdown, and preserve response completion behavior. It should preserve strict LF framing and not use generic line readers that split on Unicode separators.
 
 ### Process model
 

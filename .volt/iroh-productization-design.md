@@ -132,6 +132,8 @@ Document and test the wire contract used by non-demo clients:
 - outbound event redaction guarantees
 - protocol version and compatibility rules
 
+Resolved 2026-06-21: Added `packages/coding-agent/docs/iroh-remote-protocol.md`, linked it from the docs index and Iroh remote access design, and added protocol compatibility vectors for v1 ticket encoding/decoding, unknown-field tolerance, hello/handshake response shapes, strict LF framing with initial RPC input preservation, the remote RPC allowlist/rejection behavior, and representative outbound redaction guarantees.
+
 ### G4. Security hardening
 
 Before removing experimental language, the feature must have explicit safety gates:
@@ -442,7 +444,7 @@ Optional live status if a host control socket exists:
 
 ## Protocol v1 Contract
 
-Document this in `packages/coding-agent/docs/iroh-remote-protocol.md` or fold into the existing design doc once implemented.
+Resolved 2026-06-21: The supported preview wire contract is documented in `packages/coding-agent/docs/iroh-remote-protocol.md`; this section remains the design source for unresolved follow-up protocol decisions.
 
 ### Ticket
 
@@ -579,7 +581,7 @@ Guarantees:
 - Absolute host paths outside the workspace are redacted.
 - Image data and opaque signatures are preserved.
 
-Before graduation, add compatibility tests that assert these guarantees for representative RPC events.
+Resolved 2026-06-21: Protocol compatibility tests now assert representative outbound RPC event redaction, including workspace normalization, host path redaction, session-file omission, structured export-path redaction, opaque image payload preservation, and signature preservation. D.3 keeps broader redaction hardening open for additional event shapes and path variants.
 
 ## Reconnect and Session Resume Design
 
@@ -793,8 +795,10 @@ Tasks:
 
 Acceptance criteria:
 
-- Protocol doc includes ticket, hello, response, JSONL framing, command allowlist, and redaction guarantees.
-- Tests fail if the v1 protocol shape changes unintentionally.
+Resolved 2026-06-21: `packages/coding-agent/docs/iroh-remote-protocol.md` includes ticket, hello, response, JSONL framing, command allowlist, authoritative-field/unknown-field compatibility rules, and redaction guarantees; it is linked from `docs/index.md` and the Iroh remote access design doc. `remote-iroh-core.test.ts` now pins ticket/handshake shapes, strict LF framing with initial RPC input preservation, the current command allowlist/rejection surface, and representative redaction guarantees. Broader README/usage/security doc polish remains tracked by F.1.
+
+- Protocol doc includes ticket, hello, response, JSONL framing, command allowlist, and redaction guarantees. Resolved 2026-06-21.
+- Tests fail if the v1 protocol shape changes unintentionally. Resolved 2026-06-21.
 - README/usage docs point users to the protocol/security docs.
 
 ### Phase 5: Reconnect/resume
@@ -942,8 +946,8 @@ Do not remove experimental language until all of these are true:
 - [x] Per-client tools are persisted and enforced on reconnect. Resolved 2026-06-21.
 - [x] Unsafe tool grants require confirmation or `--yes`. Resolved 2026-06-21.
 - [x] Pairing workflow is first-class and scoped to a running host control channel. Resolved 2026-06-21.
-- [ ] Protocol v1 is documented.
-- [ ] Protocol compatibility tests exist.
+- [x] Protocol v1 is documented. Resolved 2026-06-21.
+- [x] Protocol compatibility tests exist. Resolved 2026-06-21.
 - [ ] Reconnect/resume behavior is implemented and documented.
 - [x] Revocation behavior is implemented and documented, including active connection semantics. Resolved 2026-06-21.
 - [x] `volt remote status` persisted-state inspection exists. Resolved 2026-06-21.
