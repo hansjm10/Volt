@@ -125,6 +125,8 @@ On connect or reconnect, remote clients should:
 
 The host must persist transcript entries independently of subscriber presence so that detached work can be recovered through `get_transcript`.
 
+Resolved 2026-06-22: Native integrated-host coverage now exercises active detach and reconnect against a local OpenAI-compatible streaming provider. The same authorized Iroh node reconnects while the detached prompt is still active, sees the same session ID via `get_state`, receives prompt completion, and recovers both the detached user prompt and assistant output through `get_transcript`. The same scenario also proves a different node cannot reuse the consumed pairing ticket and a revoked node cannot reconnect.
+
 ## Proposed Architecture
 
 ### Host Runtime Registry

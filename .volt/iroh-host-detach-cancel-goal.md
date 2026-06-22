@@ -273,10 +273,10 @@ the rollup item is resolved, and the final turn's required verification passed.
 </group>
 
 <group n="3" title="Reconnect and protocol recovery">
-  <item ref="C.1" status="open" prereq="B.1">
+  <item ref="C.1" status="resolved" prereq="B.1">
     <title>Reconnect same authorized client to detached active runtime</title>
     <acceptance>A reconnecting client with the same authoritative Iroh node ID and workspace attaches to the detached runtime, sees the same session ID, and can call `get_state` plus `get_transcript` to recover output generated while detached; different or revoked clients cannot attach; duplicate active connection behavior remains deterministic and tested.</acceptance>
-    <evidence/>
+    <evidence>Resolved 2026-06-22: added a native integrated-host scenario with a local OpenAI-compatible streaming provider proving same-node active detach reconnect keeps the session ID, `get_state` shows the active runtime, `get_transcript` recovers detached user/assistant output after completion, a different node cannot reuse the consumed ticket, revoked reconnect is rejected, and duplicate active behavior remains covered by the existing native duplicate scenario; verification: `node --check scripts/iroh-sidecar-test.mjs`, `npm run iroh:poc:test`, `npm run check`; commit 1b4c72fa</evidence>
   </item>
 
   <item ref="C.2" status="open" prereq="C.1">
