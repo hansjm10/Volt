@@ -154,6 +154,35 @@ The saved host record should not contain the one-time pairing secret. The produc
 
 The iOS v1 app may support exactly one saved desktop host, but the storage shape should be able to evolve into multiple saved hosts later. App-specific storage, launch, offline-state, and Forget Host behavior is defined in `/Users/jordan.hans/Projects/volt-app/.volt/designs/iroh-saved-host-app-design.md`.
 
+### SavedHostRecord v1
+
+Resolved 2026-06-22: `hostNodeId` is the authoritative saved-host identity. Endpoint tickets and discovery fields are dial hints that can be refreshed only after the client verifies it reached that same host node ID.
+
+Client persistence should use a concrete v1 record with these fields:
+
+- `schemaVersion: 1`
+- `hostNodeId`: required stable desktop host node ID; this is the key for future multi-host storage and the value used for identity checks
+- `hostDisplayName`: optional user-facing label, such as a desktop host name
+- `relayMode`: required normalized relay mode, currently `"disabled"` or `"default"`
+- `primaryWorkspace`: required workspace name used for the first reconnect
+- `workspaceNames`: non-empty list of saved or granted workspace names known to the client
+- `endpointTicket`: required sanitized Iroh endpoint ticket or equivalent Iroh discovery address for dialing the host
+- `sanitizedReconnectTicket`: optional v1 compatibility envelope containing the current `volt+iroh://v1` ticket with `secret` removed; if present, it must decode to the same `hostNodeId`, `relayMode`, `primaryWorkspace`, and `endpointTicket`
+- `savedAt`: required timestamp
+- `lastConnectedAt`: optional timestamp updated after a verified reconnect
+- `discoveryRefreshedAt`: optional timestamp updated when non-secret endpoint/discovery data is replaced
+
+The one-time pairing `secret` must never be stored in `SavedHostRecord`. If a record has a secret, lacks `hostNodeId`, lacks a supported `relayMode`, lacks `primaryWorkspace`, or lacks usable `endpointTicket`/discovery data, treat it as `saved_host_invalid`.
+
+For v1, the current sanitized endpoint ticket is sufficient as the discovery field when it is stored with an explicit required `hostNodeId` and verified before use. A separate discovery blob is not required for v1. The sanitized ticket alone is not the identity contract; it is only an implementation detail for dialing.
+
+Identity verification should happen in two places:
+
+1. Before dialing, if the client can derive a node ID from `endpointTicket`, it must match `hostNodeId`.
+2. After dialing, the protocol must let the client verify the reached host node ID, either from the Iroh connection identity or an authenticated handshake field added by the saved-host protocol. If the reached host identity differs from `hostNodeId`, return `host_identity_mismatch` and do not overwrite saved identity or discovery data.
+
+Discovery refresh is allowed only after identity verification succeeds. The client may update `endpointTicket`, `sanitizedReconnectTicket`, `relayMode`, `workspaceNames`, `hostDisplayName`, `lastConnectedAt`, and `discoveryRefreshedAt` from host-provided non-secret data. It must not update `hostNodeId` from refreshed discovery. If the saved endpoint ticket is stale and no refresh path can reach the saved node ID, keep the record and report `host_unreachable`.
+
 ## QR Code Rules
 
 Pairing QR codes should be:
@@ -353,6 +382,9 @@ Host/core tests:
 - Existing paired client reconnects without `secret`.
 - New unpaired client without `secret` is rejected.
 - Consumed pairing secret cannot pair a second client.
+- Saved-host reconnect verifies reached host node ID against `SavedHostRecord.hostNodeId`.
+- Verified reconnect refreshes non-secret discovery fields without changing `hostNodeId`.
+- Malformed saved-host records missing required v1 fields map to `saved_host_invalid`.
 - Retry from the same phone node ID after host commit can recover even if the app has not saved `SavedHostRecord` yet.
 - Host response-write failure after client commit keeps the client paired and the secret consumed.
 - Failed pairing attempt does not consume the pairing secret.
@@ -410,7 +442,7 @@ Saved reconnect should use a stable saved-host record.
 
 `SavedHostRecord` is the product model. It should contain the stable host node ID, relay mode, workspace grant reference or workspace names, endpoint discovery data, saved timestamp, optional last connected timestamp, and no pairing secret.
 
-The current sanitized endpoint ticket can be one internal field in the v1 record if it proves reliable across host restarts with the same host key, state path, and relay mode. The product contract should still be "saved host identity and discovery," not "reuse the original QR." If endpoint-ticket reuse is brittle, replace that internal field with stronger discovery data without changing the user-facing flow.
+Resolved 2026-06-22: the current sanitized endpoint ticket is sufficient as the v1 discovery field when the record also has a required `hostNodeId` and reconnect verifies the reached host identity. The product contract is still "saved host identity and discovery," not "reuse the original QR." If future Iroh behavior needs stronger discovery data, migrate the refreshable `endpointTicket` field without changing the user-facing saved-host flow.
 
 ### Should one desktop host support multiple named workspaces under a single saved phone relationship?
 
@@ -443,3 +475,7 @@ Resolved 2026-06-22: not silently. The host must keep a revocation tombstone for
 ### When is a one-time QR consumed, and how does app-save failure recover?
 
 Resolved 2026-06-22: the QR is consumed when the host durably commits the new phone node ID, removes the pending ticket, and persists the consumed secret hash. The app saving `SavedHostRecord` is required for normal future reconnect, but it is not part of the host's commit boundary. If the app crashes or Keychain save fails after the host records the phone, the same phone endpoint identity can retry with the original QR data and the host must treat it as an existing-client recovery path, not as a second use of the consumed secret. A different node ID cannot reuse the consumed secret.
+
+### What are the concrete SavedHostRecord v1 fields and identity rules?
+
+Resolved 2026-06-22: clients persist `schemaVersion`, required `hostNodeId`, optional `hostDisplayName`, normalized `relayMode`, `primaryWorkspace`, `workspaceNames`, required `endpointTicket`, optional `sanitizedReconnectTicket`, `savedAt`, optional `lastConnectedAt`, and optional `discoveryRefreshedAt`. `hostNodeId` is authoritative. Endpoint tickets and sanitized reconnect tickets are refreshable dial hints. The current sanitized endpoint ticket is sufficient for v1 discovery when paired with explicit `hostNodeId` verification; no separate discovery blob is required for v1.

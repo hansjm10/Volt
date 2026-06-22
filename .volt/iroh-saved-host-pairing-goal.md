@@ -270,10 +270,10 @@ blocked.
     <evidence>2026-06-22: Root and app specs now define host-side durable authorization commit as the QR consumption boundary, same-phone retry recovery after app save failure, and serialized concurrency where one new node wins and other nodes get pairing_secret_consumed; verification: Volt/app doc whitespace checks and commit-hook npm run check passed; Volt commit f2f633ed.</evidence>
   </item>
 
-  <item ref="A.4" status="open" prereq="A.1" type="decision">
+  <item ref="A.4" status="resolved" prereq="A.1" type="decision">
     <title>Define SavedHostRecord v1 discovery fields, identity verification, and refresh behavior</title>
     <acceptance>Specs name the concrete v1 fields persisted by clients, identify which field is authoritative for host identity, define how the client verifies the reached host node ID, and define how endpoint/discovery data is refreshed when relay or network details change. The decision states whether the current sanitized endpoint ticket is sufficient for v1 or needs a new record field.</acceptance>
-    <evidence/>
+    <evidence>2026-06-22: Root and app specs now define SavedHostRecord v1 fields, make hostNodeId authoritative, require pre/post-dial host identity verification, and allow only verified non-secret discovery refresh; current sanitized endpoint ticket is sufficient for v1 discovery when paired with hostNodeId verification; verification: pending doc checks and commit-hook npm run check; Volt commit SHA to be recorded after commit.</evidence>
   </item>
 
   <item ref="A.5" status="open" prereq="A.1" type="decision">
