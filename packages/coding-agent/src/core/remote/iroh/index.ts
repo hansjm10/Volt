@@ -108,6 +108,7 @@ export {
 export {
 	createIrohRemoteRpcErrorResponse,
 	getIrohRemoteRpcFilterResult,
+	IROH_REMOTE_RPC_CANCELLATION_TYPES,
 	IROH_REMOTE_RPC_PASSTHROUGH_TYPES,
 	type IrohRemoteRpcCommand,
 	type IrohRemoteRpcErrorResponse,

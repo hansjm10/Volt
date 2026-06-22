@@ -1,10 +1,12 @@
 import { serializeJsonLine } from "../../rpc/jsonl.ts";
 
+export const IROH_REMOTE_RPC_CANCELLATION_TYPES = new Set(["abort"]);
+
 export const IROH_REMOTE_RPC_PASSTHROUGH_TYPES = new Set([
 	"prompt",
 	"steer",
 	"follow_up",
-	"abort",
+	...IROH_REMOTE_RPC_CANCELLATION_TYPES,
 	"new_session",
 	"get_state",
 	"get_transcript",

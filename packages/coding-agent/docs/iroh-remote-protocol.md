@@ -96,6 +96,26 @@ A reconnecting paired client with the same authoritative Iroh node ID resumes th
 
 Remote UI clients should request `get_state` followed by `get_transcript` after connect/reconnect, and after a successful `switch_session_by_id` should show a loading transcript state while refreshing state and transcript for the selected session. After `new_session`, clients should keep a fresh empty transcript and refresh state without requesting older transcript from the previous session. For older history, clients use `get_transcript` pagination (`hasMore` and `nextBeforeEntryId`) and request pages with `beforeEntryId`.
 
+## Lifecycle: detach versus cancel
+
+An Iroh stream close, stream EOF, QUIC connection close, input half-close, or remote write failure is a detach signal. It has no RPC payload and the host must not translate it into an `abort` command. Mobile clients do not need to send a best-effort detach command before background suspension or process loss.
+
+User-visible stop/cancel controls must send the allowed `abort` RPC command:
+
+```json
+{"id":"cancel-1","type":"abort"}
+```
+
+The successful response uses the normal RPC response shape:
+
+```json
+{"id":"cancel-1","type":"response","command":"abort","success":true}
+```
+
+`abort` is the only direct remote cancellation command in v1. Command names such as `cancel`, `cancel_run`, `detach`, and `disconnect` are not forwarded by the remote command allowlist. App-level disconnect without stop should close the stream only; clients reconnect by opening a new authorized stream, then calling `get_state` and `get_transcript`.
+
+Host process exit, host crash, or explicit host shutdown are separate from client detach and can stop in-memory work because the runtime is gone. A reconnect after host exit requires a new host process and can recover only persisted session state.
+
 ## JSONL framing
 
 All post-handshake traffic is Volt RPC JSONL:
@@ -120,7 +140,7 @@ The host forwards only these inbound RPC command `type` values from remote clien
 - `switch_session_by_id`
 - `extension_ui_response`
 
-All other command types receive a JSONL `response` with `success:false` and are not forwarded to the local Volt RPC process.
+All other command types receive a JSONL `response` with `success:false` and are not forwarded to the local Volt RPC process. Within this allowlist, only `abort` is a direct cancellation command.
 
 The preview RPC surface intentionally stays narrow. It excludes local tools such as `bash`, `edit`, and `write`; those tools can only be used through the normal model/tool flow and host-side permission policy. It also excludes read-only local RPC commands such as `get_messages`, `get_commands`, `get_last_assistant_text`, and `get_available_models` for v1 preview:
 

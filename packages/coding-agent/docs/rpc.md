@@ -36,6 +36,12 @@ This matters for clients:
 
 In particular, Node `readline` is not protocol-compliant for RPC mode because it also splits on `U+2028` and `U+2029`, which are valid inside JSON strings.
 
+### Lifecycle and Cancellation
+
+Transport lifetime is separate from cancellation semantics. A clean input close, socket close, stream EOF, or write failure is a transport event, not an RPC command, and must not be interpreted as an implicit `abort`.
+
+Clients that intend to stop active agent work must send the `abort` command and wait for its response. Plain subprocess RPC mode still treats transport close as mode/process shutdown, and remote transports may use close as detach/reconnect; neither path changes the RPC cancellation command.
+
 ## Commands
 
 ### Prompting
@@ -133,6 +139,8 @@ Response:
 ```json
 {"type": "response", "command": "abort", "success": true}
 ```
+
+`abort` is the semantic cancellation command. Closing the RPC transport without sending `abort` requests transport shutdown or remote detach according to the transport, but it does not ask Volt to cancel the active run.
 
 #### new_session
 

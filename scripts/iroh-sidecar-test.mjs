@@ -28,6 +28,7 @@ const clientScript = join(sidecarDir, "client.mjs");
 const PROCESS_TIMEOUT_MS = 15_000;
 const TICKET_TIMEOUT_MS = 10_000;
 const SOURCE_IMPORT_CONDITION_ARGS = ["--conditions", "volt-source"];
+const DEFAULT_TEST_ALLOW_TOOLS = "read,grep,find,ls";
 
 let Endpoint;
 let EndpointTicket;
@@ -152,12 +153,20 @@ async function stopProcess(child) {
 	});
 }
 
+function hasFlagArg(args, name) {
+	return args.some((arg) => arg === `--${name}` || arg.startsWith(`--${name}=`));
+}
+
+function withDefaultTestAllowTools(args) {
+	return hasFlagArg(args, "allow-tools") ? args : ["--allow-tools", DEFAULT_TEST_ALLOW_TOOLS, ...args];
+}
+
 function startHost(args) {
-	return spawnScript(hostScript, args);
+	return spawnScript(hostScript, withDefaultTestAllowTools(args));
 }
 
 function startSourceCliRemoteHost(args, env = {}) {
-	return spawnSourceCli(["remote", "host", ...args], env);
+	return spawnSourceCli(["remote", "host", ...withDefaultTestAllowTools(args)], env);
 }
 
 async function runHostCommand(args) {
