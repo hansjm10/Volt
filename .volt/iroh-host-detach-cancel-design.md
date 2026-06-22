@@ -160,6 +160,8 @@ Write failures should be treated as subscriber loss. They should not shut down t
 
 Resolved 2026-06-22: `runRpcMode()` now has an opt-in `disposeRuntimeOnClose: false` path used by integrated Iroh subscribers, so stream shutdown closes the subscriber transport while leaving the host runtime alive. The host audits `remote_subscriber_attached`, `remote_subscriber_detached`, `remote_runtime_detached`, and `remote_runtime_reattached`.
 
+Resolved 2026-06-22: Accepted integrated prompt behavior is pinned by remote lifecycle regression tests that run the real RPC mode over the Iroh close-deferring transport. Clean stream close waits for the accepted prompt to finish without disposing the runtime, remote write failure detaches the subscriber without calling runtime dispose/abort, and transcript entries produced after detach remain recoverable through the transcript projection.
+
 ### Runtime Disposal
 
 Dispose the runtime only when one of these is true:

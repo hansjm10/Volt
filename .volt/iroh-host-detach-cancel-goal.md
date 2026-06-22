@@ -253,10 +253,10 @@ the rollup item is resolved, and the final turn's required verification passed.
 </group>
 
 <group n="2" title="Run preservation and cancellation">
-  <item ref="B.1" status="open" prereq="A.2">
+  <item ref="B.1" status="resolved" prereq="A.2">
     <title>Keep active integrated prompts running after client disconnect</title>
     <acceptance>An accepted prompt continues when the Iroh stream closes or the remote write side fails; `AgentSessionRuntime.dispose()` is not called solely because the subscriber detached; transcript entries produced while detached remain persisted; tests prove the old failure mode would have cancelled/disposed and the new behavior does not.</acceptance>
-    <evidence/>
+    <evidence>Resolved 2026-06-22: added remote lifecycle regressions using real RPC mode and the Iroh close-deferring transport to prove accepted prompts survive clean close and write failure without runtime dispose/abort, and detached transcript entries remain recoverable; verification: `cd packages/coding-agent &amp;&amp; node node_modules/vitest/dist/cli.js --run test/remote-iroh-lifecycle-contract.test.ts`, `npm run check`, `npm run iroh:poc:test`; commit 7761c3dd</evidence>
   </item>
 
   <item ref="B.2" status="open" prereq="B.1">
