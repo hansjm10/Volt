@@ -404,6 +404,23 @@ describe("Iroh remote core helpers", () => {
 				error: "RPC command not allowed over remote host: bash",
 			},
 		});
+		for (const command of [
+			"get_messages",
+			"get_commands",
+			"get_last_assistant_text",
+			"get_available_models",
+		] as const) {
+			expect(getIrohRemoteRpcFilterResult(JSON.stringify({ id: `${command}-1`, type: command }))).toEqual({
+				allowed: false,
+				response: {
+					id: `${command}-1`,
+					type: "response",
+					command,
+					success: false,
+					error: `RPC command not allowed over remote host: ${command}`,
+				},
+			});
+		}
 
 		const workspacePath = "/Users/jordan/project";
 		expect(

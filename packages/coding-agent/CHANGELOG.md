@@ -65,6 +65,7 @@
 - Changed Iroh remote host startup to require TTY confirmation or `--yes` before granting unsafe remote tools (`bash`, `edit`, or `write`) and to audit accepted unsafe grants.
 - Changed Iroh remote pairing ticket state to persist only secret hashes and non-secret metadata, prune expired pending tickets, audit ticket consumption and expiry, and apply pair-time tools/label hints through the host lifecycle.
 - Changed Iroh remote revocation to coordinate with a running host control channel, close matching active connections, and audit `active_connection_revoked` while keeping persisted-state revocation as a no-host fallback.
+- Clarified that Iroh remote protocol v1 keeps the direct RPC command allowlist narrow and continues rejecting transcript, command-list, last-assistant-text, and model-list RPC commands in preview.
 - Updated the SWE-Pruner example extension guidance to prefer semantic pruning after candidate-file discovery and clarify when to use search, LSP, or full reads instead.
 - Changed store install/update confirmations and summaries to show package names and concise source labels instead of full git source strings.
 - Changed the interactive `/store` browser to list available packages immediately, with search available from the package list.

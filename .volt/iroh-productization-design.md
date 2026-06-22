@@ -542,25 +542,16 @@ get_state
 extension_ui_response
 ```
 
-Before graduation, decide whether to include additional read-only commands such as:
+Resolved 2026-06-21: Keep the preview remote RPC allowlist narrow and do not add `get_messages`, `get_commands`, `get_last_assistant_text`, or `get_available_models` for v1 preview. Rationale by candidate:
 
-```text
-get_messages
-get_commands
-get_last_assistant_text
-get_available_models
-```
+- `get_messages` can return the full transcript, including prompts, tool output, file excerpts, and extension content beyond the minimal state needed for reconnect.
+- `get_commands` exposes installed extension, prompt-template, and skill metadata; slash-command use should go through `prompt` until the remote UI command surface is reviewed separately.
+- `get_last_assistant_text` duplicates streamed assistant output and would expose prior-session text without a settled transcript-access policy.
+- `get_available_models` exposes provider/model availability while remote model selection remains unsupported.
 
-If added, update:
-
-- `IROH_REMOTE_RPC_PASSTHROUGH_TYPES`
-- protocol docs
-- command filter tests
-- scenario tests
+The protocol doc now explains that tool access and RPC command access are separate surfaces: `allowedTools` controls host-side model tool use, while `IROH_REMOTE_RPC_PASSTHROUGH_TYPES` controls direct remote JSONL commands. The compatibility tests pin these candidate commands as rejected.
 
 Do not allow direct `bash`, `edit`, `write`, session switching, model changes, package installation, or settings mutation over remote access unless explicitly reviewed.
-
-Note: tool access is governed by the agent prompt/tool allowlist, but RPC command access is a separate surface. Keep the remote RPC command allowlist narrow.
 
 ### Outbound redaction contract
 
@@ -962,7 +953,7 @@ These must be resolved during implementation:
 
 1. Resolved 2026-06-21: A dialable Iroh endpoint ticket cannot be generated offline from persisted host state alone; `volt remote pair` will be mediated by a running host control channel that has access to the live endpoint address.
 2. Should duplicate connections from the same client node ID be rejected or should the newer connection replace the older one?
-3. Should `get_messages`, `get_commands`, or `get_available_models` be allowed over remote RPC in preview?
+3. Resolved 2026-06-21: Do not allow `get_messages`, `get_commands`, `get_last_assistant_text`, or `get_available_models` over remote RPC in v1 preview. Keep the direct command surface limited to prompt/steer/follow_up/abort/get_state/extension_ui_response; the candidate read-only commands expose transcript, installed-resource, prior-output, or model/provider metadata that is not required for minimal reconnect and should be revisited only with a dedicated remote UI/transcript policy.
 4. Should client policy updates be supported by a command, or should users revoke and re-pair?
 5. Resolved 2026-06-21: Active revocation should use the running host control channel in preview; persisted-state revocation remains the fallback when no live host is reachable.
 6. Should the host store relay mode in state for status/pair defaults?

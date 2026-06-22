@@ -106,7 +106,16 @@ The host forwards only these inbound RPC command `type` values from remote clien
 - `get_state`
 - `extension_ui_response`
 
-All other command types receive a JSONL `response` with `success:false` and are not forwarded to the local Volt RPC process. This intentionally excludes local tools such as `bash`, `edit`, and `write`; those tools can only be used through the normal model/tool flow and host-side permission policy.
+All other command types receive a JSONL `response` with `success:false` and are not forwarded to the local Volt RPC process.
+
+The preview RPC surface intentionally stays narrow. It excludes local tools such as `bash`, `edit`, and `write`; those tools can only be used through the normal model/tool flow and host-side permission policy. It also excludes read-only local RPC commands such as `get_messages`, `get_commands`, `get_last_assistant_text`, and `get_available_models` for v1 preview:
+
+- `get_messages` can return the full transcript, including prompts, tool output, file excerpts, and extension content beyond the minimal state needed for reconnect.
+- `get_commands` exposes installed extension, prompt-template, and skill metadata; slash-command use should go through `prompt` until the remote UI command surface is reviewed separately.
+- `get_last_assistant_text` duplicates streamed assistant output and would expose prior-session text without a settled transcript-access policy.
+- `get_available_models` exposes provider/model availability while remote model selection remains unsupported.
+
+Tool access and RPC command access are separate surfaces. `allowedTools` controls which tools the host-side model may invoke; this allowlist controls which JSONL commands a remote client may send directly.
 
 ## Outbound redaction guarantees
 
