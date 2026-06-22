@@ -90,6 +90,8 @@ On app launch, if no explicit launch ticket is supplied, the app should:
 
 This is the normal path after first pairing.
 
+Implemented 2026-06-22: the iOS app startup path now uses an explicit launch ticket first, otherwise a saved host, otherwise the unpaired state. Saved-host reconnect synthesizes a secret-free reconnect ticket from `SavedHostRecord`, verifies the handshake `hostNodeId`, keeps the saved host for offline/retry states, and maps stable reconnect outcomes into app state without parsing human-readable error text.
+
 ### Host Restart
 
 When the host service restarts, it should:
@@ -401,6 +403,8 @@ Handshake failure responses should include at least:
 ```
 
 Handshake success responses should include the authoritative `hostNodeId` and `clientNodeId` so saved-host clients can verify identity and update non-secret discovery data after success. Outcome precedence on the host should be: revoked node, existing paired client authorization, recognized active pending secret, retained consumed/expired secret tombstone, then unknown client. Workspace checks apply before success: missing workspace is `workspace_unavailable`; known but unauthorized workspace is `workspace_forbidden`.
+
+Implemented 2026-06-22: the iOS transport now decodes handshake `outcome` and `hostNodeId`, rejects saved-host identity mismatches before applying host outcomes, and surfaces outcome-bearing transport errors. `VoltSession` maps those errors to `host_unreachable`, `host_identity_mismatch`, `saved_host_invalid`, `client_unknown`, `client_revoked`, workspace failures, and pairing-secret failures while preserving saved-host records according to the recovery boundaries above.
 
 ## Implementation Plan
 

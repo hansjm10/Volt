@@ -334,10 +334,10 @@ blocked.
     <evidence>2026-06-22: iOS now stores SavedHostRecord v1 keyed by hostNodeId, migrates valid legacy saved-ticket Keychain data, strips secret/expiry from reconnect envelopes, and tests saving/loading, sanitization, malformed records, and host-node-ID keying; verification: cd ../volt-app/Packages/VoltClient &amp;&amp; swift test, XcodeBuildMCP test_sim on Volt scheme with iPhone 17 Pro iOS 27.0, root/app doc whitespace checks passed; app commit 295f143.</evidence>
   </item>
 
-  <item ref="C.2" status="open" prereq="C.1,B.4">
+  <item ref="C.2" status="resolved" prereq="C.1,B.4">
     <title>Implement saved-host startup, reconnect, and offline/error UX</title>
     <acceptance>App launch uses explicit launch ticket first, otherwise saved host, otherwise unpaired state; saved-host reconnect sends no pairing secret; host_unreachable keeps the saved host and shows offline/retry; stale/invalid/mismatch/revoked outcomes follow A.1/A.2/B.4; tests cover startup priority and outcome mapping.</acceptance>
-    <evidence/>
+    <evidence>2026-06-22: iOS startup now prioritizes explicit launch tickets, otherwise saved-host reconnect, otherwise unpaired state; saved reconnect sends secret-free tickets, verifies handshake hostNodeId, maps stable outcomes into savedHostIssue/offline state, and preserves saved records for retryable/revoked/workspace failures; verification: cd ../volt-app/Packages/VoltClient &amp;&amp; swift test, app package diff/app design whitespace checks, and root doc diff check passed; app commit 7448f53.</evidence>
   </item>
 
   <item ref="C.3" status="open" prereq="C.1,A.2">
