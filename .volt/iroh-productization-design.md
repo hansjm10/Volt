@@ -832,7 +832,7 @@ Tasks:
 
 Acceptance criteria:
 
-- A real host/client test over relay succeeds. Blocked 2026-06-21: no two-network/cross-network relay environment is available in this agent session. Local same-machine `--relay default` integrated `get_state` smoke passed, but that does not prove cross-network relay reachability. Needed to unblock: a host and client on separate networks, or operator-provided access to an equivalent two-network environment, to run `npm run iroh:poc:host:volt -- --relay default --allow-tools read,grep,find,ls` and `npm run iroh:poc:client -- "<ticket>" --get-state` without committing the raw ticket.
+- A real host/client test over relay succeeds. Resolved 2026-06-21: operator-provided cross-network `--relay default` smoke succeeded with host on macOS over a phone hotspot and client on WSL over home ethernet. Commands were `npm run iroh:poc:host:volt -- --relay default --allow-tools read,grep,find,ls` and `npm run iroh:poc:client -- "<redacted ticket>" --get-state`; client returned `get_state` JSON with a session ID, and host logs showed client connected, paired, and disconnected. Raw ticket and private local paths are not recorded.
 - Docs include install, pair, connect, list, revoke, status, relay, and security sections. Resolved 2026-06-21: README, usage, docs index, security, Iroh design, protocol, sidecar README, and changelog now cover these surfaces.
 - Unsupported environments produce actionable errors. Resolved 2026-06-21: docs describe optional native adapter reinstall guidance and the Node-only/Bun-binary limitation; F.2 verified missing optional native adapter startup output includes reinstall guidance and no ticket.
 
@@ -953,7 +953,7 @@ Do not remove experimental language until all of these are true:
 - [x] Revocation behavior is implemented and documented, including active connection semantics. Resolved 2026-06-21.
 - [x] `volt remote status` persisted-state inspection exists. Resolved 2026-06-21.
 - [x] Scenario tests cover pair, reconnect, policy, revocation, expiry, and command filtering. Resolved 2026-06-21.
-- [ ] Cross-network `--relay default` dogfood succeeds. Blocked 2026-06-21: requires a real two-network relay environment; same-machine `--relay default` smoke passed but is not sufficient.
+- [x] Cross-network `--relay default` dogfood succeeds. Resolved 2026-06-21.
 - [x] README and usage docs include security warnings and unsupported environments. Resolved 2026-06-21.
 - [x] `npm run check` passes after docs/code changes. Resolved 2026-06-21.
 
