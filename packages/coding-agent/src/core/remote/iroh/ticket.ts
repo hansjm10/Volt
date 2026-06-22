@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import {
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_TICKET_PREFIX,
+	IrohRemoteOutcomeError,
 	type IrohRemoteRelayMode,
 	isIrohRemoteRelayMode,
 } from "./protocol.ts";
@@ -78,10 +79,10 @@ export function createIrohRemoteSanitizedReconnectTicketPayload(
 	payload: IrohRemoteTicketPayload,
 ): IrohRemoteSanitizedReconnectTicketPayload {
 	if (payload.nodeId === undefined) {
-		throw new Error("saved_host_invalid: ticket nodeId is required for saved-host reconnect");
+		throw new IrohRemoteOutcomeError("saved_host_invalid", "ticket nodeId is required for saved-host reconnect");
 	}
 	if (payload.relayMode === undefined) {
-		throw new Error("saved_host_invalid: ticket relayMode is required for saved-host reconnect");
+		throw new IrohRemoteOutcomeError("saved_host_invalid", "ticket relayMode is required for saved-host reconnect");
 	}
 	return {
 		alpn: payload.alpn,
@@ -103,10 +104,16 @@ export function assertIrohRemoteTicketPayloadHostIdentity(
 	expectedHostNodeId: string,
 ): void {
 	if (payload.nodeId === undefined) {
-		throw new Error("saved_host_invalid: ticket nodeId is required for host identity verification");
+		throw new IrohRemoteOutcomeError(
+			"saved_host_invalid",
+			"ticket nodeId is required for host identity verification",
+		);
 	}
 	if (payload.nodeId !== expectedHostNodeId) {
-		throw new Error(`host_identity_mismatch: expected ${expectedHostNodeId}, got ${payload.nodeId}`);
+		throw new IrohRemoteOutcomeError(
+			"host_identity_mismatch",
+			`expected ${expectedHostNodeId}, got ${payload.nodeId}`,
+		);
 	}
 }
 

@@ -126,6 +126,8 @@ Saved-host reconnect records keep only non-secret discovery and identity data fr
 
 The supported preview stream handshake, strict LF framing, command allowlist, authoritative host/client identity rules, and outbound redaction guarantees are specified in [Iroh Remote Protocol v1](iroh-remote-protocol.md). After the handshake succeeds, the stream carries the same LF-delimited JSONL described in [RPC mode](rpc.md). The current host parses command envelopes only to enforce the remote command filter, track connection-level shutdown, and preserve response completion behavior. It should preserve strict LF framing and not use generic line readers that split on Unicode separators.
 
+Failed authorization handshakes carry a stable machine-readable `outcome` next to the diagnostic `error` text. Clients should drive reconnect UX from `outcome` and use `error` for logs or secondary detail.
+
 ### Process model
 
 Preview process model:

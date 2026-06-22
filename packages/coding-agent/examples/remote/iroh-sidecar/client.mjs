@@ -509,7 +509,8 @@ async function main() {
 	await clientEngine.writeHello(stream, payload);
 	const handshake = await clientEngine.readHandshakeResponse(stream.recv, { expectedHostNodeId: payload.nodeId });
 	if (!handshake.response.success) {
-		throw new Error(handshake.response.error);
+		const outcomePrefix = handshake.response.outcome ? `${handshake.response.outcome}: ` : "";
+		throw new Error(`${outcomePrefix}${handshake.response.error}`);
 	}
 
 	if (hasFlag(flags, "interactive")) {

@@ -85,10 +85,23 @@ Success:
 Failure:
 
 ```json
-{"type":"volt_iroh_handshake","success":false,"hostNodeId":"<authoritative-host-node-id>","error":"client is not paired"}
+{"type":"volt_iroh_handshake","success":false,"outcome":"client_unknown","hostNodeId":"<authoritative-host-node-id>","error":"client is not paired"}
 ```
 
-On success, `hostNodeId` is the host's authoritative Iroh node ID and `clientNodeId` is the client's authoritative Iroh node ID observed by the host on the accepted connection. `child` is an implementation label for the host-side child process and may be omitted. Failure responses include `hostNodeId` when the host identity is known. Unknown handshake response fields are ignored.
+On success, `hostNodeId` is the host's authoritative Iroh node ID and `clientNodeId` is the client's authoritative Iroh node ID observed by the host on the accepted connection. `child` is an implementation label for the host-side child process and may be omitted. Failure responses include `hostNodeId` when the host identity is known. The optional failure `outcome` is the machine-readable reason; `error` is diagnostic text and should not drive app state. Unknown handshake response fields are ignored.
+
+Host handshake failure outcomes:
+
+| Outcome | Meaning |
+| --- | --- |
+| `pairing_secret_expired` | The supplied pairing secret matches an expired pending ticket or retained expired tombstone. |
+| `pairing_secret_consumed` | The supplied pairing secret matches a retained consumed tombstone and this client is not the paired recovery node. |
+| `client_unknown` | The host does not know this client node ID and no active, expired, or consumed pairing secret applies. |
+| `client_revoked` | The client node ID has a retained revocation tombstone and has not completed an approved re-pair. |
+| `workspace_unavailable` | The requested workspace is not currently served by this host. |
+| `workspace_forbidden` | The requested workspace exists, but this client or pairing ticket is not allowed to use it. |
+
+Client-local reconnect outcomes are not sent by the host: `host_unreachable` means no usable transport/handshake could be opened, `host_identity_mismatch` means the reached Iroh node or handshake `hostNodeId` differs from the saved host identity, and `saved_host_invalid` means the local saved record is malformed or missing required v1 fields.
 
 A paired client may have only one active connection per workspace in v1 preview. If the same authoritative client node ID connects to the same workspace while a previous connection is still active, the host rejects the new stream with a normal handshake failure response whose `error` is `client already connected`; the existing connection remains active.
 

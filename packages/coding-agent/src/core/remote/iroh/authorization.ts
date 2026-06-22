@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { IrohRemoteHello } from "./handshake.ts";
-import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "./protocol.ts";
+import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS, type IrohRemoteHostHandshakeFailureOutcome } from "./protocol.ts";
 import type {
 	IrohRemoteClient,
 	IrohRemoteHostState,
@@ -36,6 +36,7 @@ export interface IrohRemoteClientAuthorizationFailure {
 	ok: false;
 	error: string;
 	expiredPairingTickets?: IrohRemotePendingPairingTicket[];
+	outcome: IrohRemoteHostHandshakeFailureOutcome;
 	pairingSecretExpired: boolean;
 }
 
@@ -97,6 +98,7 @@ export function authorizeIrohRemoteClient(
 			ok: false,
 			error: "client is revoked",
 			...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
+			outcome: "client_revoked",
 			pairingSecretExpired: false,
 		};
 	}
@@ -116,6 +118,7 @@ export function authorizeIrohRemoteClient(
 			ok: false,
 			error: "pairing ticket has expired",
 			...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
+			outcome: "pairing_secret_expired",
 			pairingSecretExpired: true,
 		};
 	}
@@ -125,6 +128,7 @@ export function authorizeIrohRemoteClient(
 			ok: false,
 			error: `workspace not allowed: ${hello.workspace}`,
 			...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
+			outcome: "workspace_unavailable",
 			pairingSecretExpired: false,
 		};
 	}
@@ -134,6 +138,7 @@ export function authorizeIrohRemoteClient(
 			ok: false,
 			error: "pairing ticket has already been used",
 			...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
+			outcome: "pairing_secret_consumed",
 			pairingSecretExpired: false,
 		};
 	}
@@ -143,6 +148,7 @@ export function authorizeIrohRemoteClient(
 			ok: false,
 			error: "client is not paired",
 			...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
+			outcome: "client_unknown",
 			pairingSecretExpired: false,
 		};
 	}
@@ -153,6 +159,7 @@ export function authorizeIrohRemoteClient(
 				ok: false,
 				error: "client is not paired",
 				...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
+				outcome: "client_unknown",
 				pairingSecretExpired: false,
 			};
 		}
@@ -161,6 +168,7 @@ export function authorizeIrohRemoteClient(
 				ok: false,
 				error: `pairing ticket is not valid for workspace: ${workspace.name}`,
 				...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
+				outcome: "workspace_forbidden",
 				pairingSecretExpired: false,
 			};
 		}
@@ -217,6 +225,7 @@ export function authorizeIrohRemoteClient(
 			ok: false,
 			error: `client is not allowed to use workspace: ${workspace.name}`,
 			...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
+			outcome: "workspace_forbidden",
 			pairingSecretExpired: false,
 		};
 	}

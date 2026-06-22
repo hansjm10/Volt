@@ -287,7 +287,10 @@ export class IrohRemoteHostEngine {
 					ok: false,
 					error: authorization.error,
 					initialInput,
-					response: createIrohRemoteHandshakeFailure(authorization.error, { hostNodeId: this.hostNodeId }),
+					response: createIrohRemoteHandshakeFailure(authorization.error, {
+						hostNodeId: this.hostNodeId,
+						outcome: authorization.outcome,
+					}),
 					responseWritten: false,
 				});
 			}
@@ -409,7 +412,9 @@ export class IrohRemoteHostEngine {
 			workspace: hello.workspace,
 			success: result.ok,
 			error: result.ok ? undefined : result.error,
-			details: result.ok ? { paired: result.paired } : { pairingSecretExpired: result.pairingSecretExpired },
+			details: result.ok
+				? { paired: result.paired }
+				: { outcome: result.outcome, pairingSecretExpired: result.pairingSecretExpired },
 		});
 	}
 
@@ -484,6 +489,7 @@ export class IrohRemoteClientEngine {
 			workspace: response.success ? response.workspace : undefined,
 			success: response.success,
 			error: response.success ? undefined : response.error,
+			details: response.success ? undefined : { outcome: response.outcome },
 		});
 		return { initialInput: handshake.rest, response };
 	}

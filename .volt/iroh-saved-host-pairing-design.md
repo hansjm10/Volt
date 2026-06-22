@@ -361,6 +361,8 @@ Resolved 2026-06-22: reconnect UX must classify failures by saved-host recovery 
 
 Resolved 2026-06-22: host handshake failures should carry a stable machine-readable `outcome` field. The human `error` field remains diagnostic text and must not be the app's authority for user-facing state.
 
+Resolved 2026-06-22: Volt protocol now defines the shared outcome set and exposes host auth outcomes in failed handshake responses. Client-local saved-host validation errors use outcome-bearing errors for `host_identity_mismatch` and `saved_host_invalid`; `host_unreachable` remains a client transport outcome outside host handshakes.
+
 Suggested outcomes:
 
 - `host_unreachable`: app could not reach the host. Keep the saved host and show offline/retry.

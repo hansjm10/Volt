@@ -1578,6 +1578,7 @@ async function integratedVoltActiveDetachReconnectTranscriptScenario() {
 			});
 			assert(
 				differentClient.handshakeResponse.success === false &&
+					differentClient.handshakeResponse.outcome === "pairing_secret_consumed" &&
 					differentClient.handshakeResponse.error === "pairing ticket has already been used",
 				`Expected different node to be rejected, got:\n${JSON.stringify(differentClient.handshakeResponse)}`,
 			);
@@ -1644,6 +1645,7 @@ async function integratedVoltActiveDetachReconnectTranscriptScenario() {
 			});
 			assert(
 				revokedClient.handshakeResponse.success === false &&
+					revokedClient.handshakeResponse.outcome === "client_revoked" &&
 					revokedClient.handshakeResponse.error === "client is revoked",
 				`Expected revoked node to be rejected, got:\n${JSON.stringify(revokedClient.handshakeResponse)}`,
 			);
@@ -2130,7 +2132,7 @@ async function pairingAndRevocationScenario() {
 			label: "unpaired no-pairing",
 		});
 		assert(
-			unpairedFailure.clientOutput.stderr.includes("client is not paired"),
+			unpairedFailure.clientOutput.stderr.includes("client_unknown: client is not paired"),
 			`Expected unpaired client rejection, got:\n${unpairedFailure.clientOutput.stderr}`,
 		);
 
@@ -2143,7 +2145,7 @@ async function pairingAndRevocationScenario() {
 			label: "revoked client",
 		});
 		assert(
-			revokedFailure.clientOutput.stderr.includes("client is revoked"),
+			revokedFailure.clientOutput.stderr.includes("client_revoked: client is revoked"),
 			`Expected revoked client rejection, got:\n${revokedFailure.clientOutput.stderr}`,
 		);
 	});
@@ -2366,7 +2368,7 @@ async function pairingTicketWorkspaceBindingScenario() {
 			await waitForExit(host.child, "workspace-bound ticket host", host.output);
 			assert(clientOutput.exit.code !== 0, "Workspace-bound ticket client unexpectedly succeeded");
 			assert(
-				clientOutput.stderr.includes("workspace not allowed: private"),
+				clientOutput.stderr.includes("workspace_unavailable: workspace not allowed: private"),
 				`Expected workspace-bound ticket rejection, got:\n${clientOutput.stderr}`,
 			);
 		} finally {

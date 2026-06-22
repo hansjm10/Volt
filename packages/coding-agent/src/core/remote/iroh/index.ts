@@ -97,9 +97,16 @@ export {
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_HANDSHAKE_TYPE,
 	IROH_REMOTE_HELLO_TYPE,
+	IROH_REMOTE_HOST_HANDSHAKE_FAILURE_OUTCOMES,
+	IROH_REMOTE_OUTCOMES,
 	IROH_REMOTE_TICKET_PREFIX,
 	IROH_REMOTE_UNSAFE_TOOL_NAMES,
+	type IrohRemoteHostHandshakeFailureOutcome,
+	type IrohRemoteOutcome,
+	IrohRemoteOutcomeError,
 	type IrohRemoteRelayMode,
+	isIrohRemoteHostHandshakeFailureOutcome,
+	isIrohRemoteOutcome,
 	isIrohRemoteRelayMode,
 } from "./protocol.ts";
 export {
