@@ -309,3 +309,4 @@ Record exact device, iOS version, macOS version, relay mode, and network.
 ## Implementation Notes
 
 - Resolved items should be recorded here as `Resolved YYYY-MM-DD:` entries.
+- Resolved 2026-06-22: User-facing and protocol docs now document the D.1 lifecycle contract: transport close is detach, `abort` is cancellation, integrated host runtimes support active-work detach/reconnect with idle retention, host process exit is not durable recovery, and spawned child compatibility modes remain connection-scoped. Evidence commit: `694aa7d8`; verification: `git diff --check -- packages/coding-agent/docs/rpc.md packages/coding-agent/docs/iroh-remote-protocol.md packages/coding-agent/docs/iroh-remote-access-design.md packages/coding-agent/docs/usage.md packages/coding-agent/docs/security.md`, pre-commit `npm run check`.

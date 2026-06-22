@@ -287,10 +287,10 @@ the rollup item is resolved, and the final turn's required verification passed.
 </group>
 
 <group n="4" title="Docs and validation">
-  <item ref="D.1" status="open" prereq="B.2,C.1">
+  <item ref="D.1" status="resolved" prereq="B.2,C.1">
     <title>Update user-facing and protocol docs for detach/cancel semantics and limitations</title>
     <acceptance>`packages/coding-agent/docs/rpc.md`, `packages/coding-agent/docs/iroh-remote-protocol.md`, and relevant remote access docs explain that transport close means detach, `abort` means cancel, host process exit is not durable recovery, and spawned child mode limitations are documented if still connection-scoped.</acceptance>
-    <evidence/>
+    <evidence>Resolved 2026-06-22: updated `packages/coding-agent/docs/rpc.md`, `packages/coding-agent/docs/iroh-remote-protocol.md`, `packages/coding-agent/docs/iroh-remote-access-design.md`, `packages/coding-agent/docs/usage.md`, and `packages/coding-agent/docs/security.md` to document transport close as detach, `abort` as cancel, integrated runtime active-work detach/reconnect plus idle retention, host-exit durability limits, and spawned child connection-scoped limits. Evidence commit: `694aa7d8`; verification: `git diff --check -- packages/coding-agent/docs/rpc.md packages/coding-agent/docs/iroh-remote-protocol.md packages/coding-agent/docs/iroh-remote-access-design.md packages/coding-agent/docs/usage.md packages/coding-agent/docs/security.md`, pre-commit `npm run check`.</evidence>
   </item>
 
   <item ref="D.2" status="open" prereq="D.1,C.2">
