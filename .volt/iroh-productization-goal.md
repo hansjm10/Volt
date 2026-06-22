@@ -340,10 +340,10 @@ the rollup item is resolved, and the final turn's required verification passed.
     <evidence>Resolved 2026-06-21: added `lastSessionIdByWorkspace` state parsing/cloning/persistence, integrated remote runtime session selection and audit events for session_created/session_resumed/session_missing_on_resume, state updates after runtime creation, and duplicate same-client/workspace handshake rejection from E.1; verification: lsp.diagnostics on changed TS/test files, node --check packages/coding-agent/src/remote/iroh-host.mjs, cd packages/coding-agent &amp;&amp; node node_modules/vitest/dist/cli.js --run test/remote-iroh-core.test.ts test/iroh-remote-agent-runtime.test.ts, npm run iroh:poc:test, npm run check, git diff --check; commit db2201e7</evidence>
   </item>
 
-  <item ref="E.3" status="open" prereq="E.2">
+  <item ref="E.3" status="resolved" prereq="E.2">
     <title>Add reconnect scenario coverage for same-client resume, missing-session fallback, and duplicate active connection behavior from E.1</title>
     <acceptance>`npm run iroh:poc:test` covers reconnecting with the same client state, verifies same session ID after reconnect, verifies new session after deleting the saved session, and verifies duplicate connection behavior; failures produce actionable diagnostics without PHI or raw secrets.</acceptance>
-    <evidence/>
+    <evidence>Resolved 2026-06-21: extended `npm run iroh:poc:test` with integrated reconnect scenarios for same-client session resume, missing-session fallback, audit checks, and duplicate same-client/workspace stream rejection while preserving the first stream and proving reconnect succeeds after close; verification: node --check packages/coding-agent/src/remote/iroh-host.mjs scripts/iroh-sidecar-test.mjs, npm run iroh:poc:test, npm run check, git diff --check; commit e274d961</evidence>
   </item>
 </group>
 
