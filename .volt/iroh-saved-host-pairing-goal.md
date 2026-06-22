@@ -279,7 +279,7 @@ blocked.
   <item ref="A.5" status="resolved" prereq="A.1" type="decision">
     <title>Define the exact scope of the mobile `--relay default` product default</title>
     <acceptance>Specs state whether the global CLI default changes, only desktop/mobile pairing flows default to relay, or `volt remote host` gains a mobile/profile option. Docs and tests expected from later items are updated to match the decision.</acceptance>
-    <evidence>2026-06-22: Root and app specs now keep bare volt remote host defaulting to relay disabled, make desktop Pair Phone/service and a dedicated CLI mobile mode default to relay default, preserve explicit --relay disabled LAN-only opt-out, and treat volt remote pair --relay as a running-host expectation check; verification: pending doc checks and commit-hook npm run check; Volt commit SHA to be recorded after commit.</evidence>
+    <evidence>2026-06-22: Root and app specs now keep bare volt remote host defaulting to relay disabled, make desktop Pair Phone/service and a dedicated CLI mobile mode default to relay default, preserve explicit --relay disabled LAN-only opt-out, and treat volt remote pair --relay as a running-host expectation check; verification: Volt/app doc whitespace checks and commit-hook npm run check passed; Volt commit dab5c3c5.</evidence>
   </item>
 
   <item ref="A.6" status="open" prereq="A.2,A.3" type="decision">
