@@ -259,6 +259,8 @@ The relay default scope is:
 
 Mobile-facing tickets should include `relayMode: "default"` so the iOS app binds with compatible Iroh options. LAN-only tickets should include `relayMode: "disabled"` and be treated as an explicit advanced/local configuration.
 
+Implemented 2026-06-22: `volt remote host --mobile` defaults the running host and emitted startup/control-channel tickets to `relayMode: "default"`. Bare `volt remote host` continues to default tickets to `relayMode: "disabled"`, and explicit `--relay disabled` overrides `--mobile` for LAN-only setup.
+
 ## Local Development Guidance
 
 When testing the desired flow:

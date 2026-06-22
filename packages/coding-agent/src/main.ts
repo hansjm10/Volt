@@ -103,6 +103,7 @@ function printRemoteCommandHelp(): void {
 
 Host options are forwarded to the integrated Iroh remote host. Common options:
   --workspace <name=path>       Workspace exposed to the client
+  --mobile                      Mobile-facing host mode. Defaults relay to default unless --relay is supplied
   --relay <disabled|default>    Iroh relay preset
   --state <path>                Host state path
   --audit <path>                Host audit JSONL path

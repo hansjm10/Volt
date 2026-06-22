@@ -833,6 +833,16 @@ async function runHostClientOnce({ clientArgs, clientStatePath, hostArgs, hostSt
 	}
 }
 
+async function readStartupTicketPayload({ hostArgs, hostStatePath, label }) {
+	const host = startHost(["--state", hostStatePath, ...hostArgs]);
+	try {
+		const ticket = await waitForFirstStdoutLine(host.child, host.output, `${label} host`);
+		return decodeTicketPayload(ticket);
+	} finally {
+		await stopProcess(host.child);
+	}
+}
+
 async function expectHostClientFailure({ clientArgs, clientStatePath, hostArgs, hostStatePath, label }) {
 	const host = startHost(["--state", hostStatePath, "--once", ...hostArgs]);
 	try {
@@ -1948,6 +1958,82 @@ async function getStateScenario() {
 	});
 }
 
+async function relayDefaultPolicyScenario() {
+	await withStateDir("relay-policy", async ({ stateDir }) => {
+		const barePayload = await readStartupTicketPayload({
+			hostArgs: ["--once"],
+			hostStatePath: join(stateDir, "bare-host.json"),
+			label: "bare relay policy",
+		});
+		assert(
+			barePayload.relayMode === "disabled",
+			`Expected bare host ticket relay disabled, got:\n${JSON.stringify(barePayload)}`,
+		);
+
+		const mobilePayload = await readStartupTicketPayload({
+			hostArgs: ["--mobile", "--once"],
+			hostStatePath: join(stateDir, "mobile-host.json"),
+			label: "mobile relay policy",
+		});
+		assert(
+			mobilePayload.relayMode === "default",
+			`Expected mobile host ticket relay default, got:\n${JSON.stringify(mobilePayload)}`,
+		);
+
+		const optOutPayload = await readStartupTicketPayload({
+			hostArgs: ["--mobile", "--relay", "disabled", "--once"],
+			hostStatePath: join(stateDir, "mobile-opt-out-host.json"),
+			label: "mobile relay opt-out policy",
+		});
+		assert(
+			optOutPayload.relayMode === "disabled",
+			`Expected mobile opt-out ticket relay disabled, got:\n${JSON.stringify(optOutPayload)}`,
+		);
+
+		const workspacePath = join(stateDir, "workspace");
+		await mkdir(workspacePath, { recursive: true });
+		const pairStatePath = join(stateDir, "mobile-pair-host.json");
+		const host = startHost([
+			"--state",
+			pairStatePath,
+			"--mobile",
+			"--no-pairing",
+			"--workspace",
+			`mobile=${workspacePath}`,
+		]);
+		try {
+			const startupTicket = await waitForFirstStdoutLine(host.child, host.output, "mobile pair relay policy host");
+			const startupPayload = decodeTicketPayload(startupTicket);
+			assert(
+				startupPayload.relayMode === "default",
+				`Expected mobile paired-client ticket relay default, got:\n${JSON.stringify(startupPayload)}`,
+			);
+			const pairCommand = spawnSourceCli([
+				"remote",
+				"pair",
+				"--state",
+				pairStatePath,
+				"--workspace",
+				"mobile",
+				"--allow-tools",
+				DEFAULT_TEST_ALLOW_TOOLS,
+				"--label",
+				"mobile client",
+			]);
+			await waitForExit(pairCommand.child, "mobile relay policy pair command", pairCommand.output);
+			const pairTicket = pairCommand.output.stdout.trim();
+			assert(pairTicket.startsWith(TICKET_PREFIX), `Expected pair command ticket, got:\n${pairCommand.output.stdout}`);
+			const pairPayload = decodeTicketPayload(pairTicket);
+			assert(
+				pairPayload.relayMode === "default",
+				`Expected mobile pair command ticket relay default, got:\n${JSON.stringify(pairPayload)}`,
+			);
+		} finally {
+			await stopProcess(host.child);
+		}
+	});
+}
+
 async function statusCommandScenario() {
 	await withStateDir("status", async ({ clientStatePath, hostStatePath }) => {
 		await runHostClientOnce({
@@ -2488,6 +2574,7 @@ const scenarios = [
 	["integrated Volt env profile", integratedVoltEnvProfileScenario],
 	["malformed handshake", malformedHandshakeScenario],
 	["get_state", getStateScenario],
+	["relay default policy", relayDefaultPolicyScenario],
 	["status command", statusCommandScenario],
 	["pair command", pairCommandScenario],
 	["active revocation", activeRevocationScenario],

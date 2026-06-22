@@ -92,6 +92,7 @@ describe("remote CLI", () => {
 		expect(helpText).toContain("volt remote status [options]");
 		expect(helpText).toContain("volt remote approve-repair <node-id> [options]");
 		expect(helpText).toContain("bash, edit, or write can modify host state and require confirmation");
+		expect(helpText).toContain("--mobile");
 		expect(helpText).toContain("--yes");
 		expect(process.exitCode).toBeUndefined();
 	});

@@ -74,7 +74,7 @@ The host process:
 
 1. Creates or loads a persistent Iroh endpoint key. The current host stores this as `hostSecretKey` in `~/.volt/agent/remote/iroh-host.json`.
 2. Validates the selected workspace path, plus any requested child RPC executable before printing a ticket.
-3. Starts an Iroh endpoint. The current host defaults to disabled relay for local tests; `--relay default` opts into Iroh's default relay/discovery preset.
+3. Starts an Iroh endpoint. The current bare host defaults to disabled relay for local tests; `--mobile` defaults to Iroh's default relay/discovery preset for mobile-facing setup; `--relay disabled` remains the explicit LAN-only opt-out.
 4. Prints a pairing ticket QR code when stderr is a TTY, plus the text ticket for copy/paste and scripting.
 5. Accepts client connections until stopped, or exits after the first disconnect when `--once` is set.
 6. Validates the pairing secret.
@@ -201,6 +201,8 @@ Suggested shape:
 
 The host state file also persists `hostSecretKey`, consumed pairing secret hashes, pending pairing ticket hashes plus non-secret metadata, and per-client last session IDs. It does not persist raw pairing secrets. `volt remote status` prints a secret-free persisted-state view. Preview does not store relay mode in the persisted state; the running host owns the live relay mode, tickets include a relay hint, and `volt remote pair --relay <disabled|default>` can be used as an expected-live-mode check when needed.
 
+Bare `volt remote host` keeps relay mode disabled for same-machine and same-LAN preview workflows. Mobile-facing host startup uses `volt remote host --mobile`, which emits tickets with `relayMode: "default"` unless `--relay disabled` is supplied as an explicit LAN-only opt-out.
+
 ## CLI UX
 
 Supported preview commands:
@@ -208,6 +210,9 @@ Supported preview commands:
 ```bash
 # Start a host for one saved workspace.
 volt remote host --workspace volt=/path/to/repo --yes
+
+# Start a mobile-facing host that defaults tickets to relay/discovery mode.
+volt remote host --mobile --workspace volt=/path/to/repo --yes
 
 # Ask the running host for a short-lived one-time pairing ticket.
 volt remote pair --workspace volt

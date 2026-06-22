@@ -68,7 +68,7 @@ const RESPONSE_COMPLETION_RPC_TYPES = new Set([
 	"switch_session_by_id",
 ]);
 const PROMPT_COMPLETION_SETTLE_MS = 100;
-const BOOLEAN_FLAGS = new Set(["approve", "help", "integrated-volt", "no-pairing", "once", "use-volt", "yes"]);
+const BOOLEAN_FLAGS = new Set(["approve", "help", "integrated-volt", "mobile", "no-pairing", "once", "use-volt", "yes"]);
 const VALUE_FLAGS = new Set([
 	"agent-dir",
 	"allow-tools",
@@ -199,7 +199,8 @@ function printUsage() {
 
 Serve options:
   --workspace <name=path>    Workspace exposed to the client. Defaults to saved workspace or cwd.
-  --relay <disabled|default> Iroh relay preset. Defaults to disabled for local tests.
+  --mobile                   Mobile-facing host mode. Defaults relay to default unless --relay is supplied.
+  --relay <disabled|default> Iroh relay preset. Defaults to disabled, or default with --mobile.
   --state <path>             Host state path. Defaults to ~/.volt/agent/remote/iroh-host.json.
   --audit <path>             Host audit JSONL path. Defaults to <state>.audit.jsonl.
   --use-volt                 Spawn volt --mode rpc instead of the fake RPC child.
@@ -1747,6 +1748,14 @@ function printTicket(ticket, label) {
 	console.log(ticket);
 }
 
+function getRelayMode(flags) {
+	const relayMode = getFlag(flags, "relay", hasFlag(flags, "mobile") ? "default" : "disabled");
+	if (relayMode !== "disabled" && relayMode !== "default") {
+		throw new Error("--relay must be disabled or default");
+	}
+	return relayMode;
+}
+
 async function serve(flags) {
 	ensureIrohAvailable();
 	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
@@ -1756,11 +1765,7 @@ async function serve(flags) {
 	const allowTools = getFlag(flags, "allow-tools", DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
 	const workspace = selectIrohRemoteWorkspace(state, getFlag(flags, "workspace"), allowTools, process.cwd());
 
-	const relayMode = getFlag(flags, "relay", "disabled");
-	if (relayMode !== "disabled" && relayMode !== "default") {
-		throw new Error("--relay must be disabled or default");
-	}
-
+	const relayMode = getRelayMode(flags);
 	const pairingEnabled = !hasFlag(flags, "no-pairing");
 	const sourceVolt = getFlag(flags, "source-volt");
 	const ticketExpiresAt = pairingEnabled ? Date.now() + DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS : undefined;

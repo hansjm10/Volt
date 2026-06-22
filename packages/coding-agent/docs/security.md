@@ -78,7 +78,7 @@ Remote host support requires a Node.js npm package install or source checkout wi
 
 Host process exit, host crash, or explicit host shutdown stops in-memory work; remote access does not provide durable job recovery beyond persisted session state. Spawned child compatibility modes through `--use-volt` or `--source-volt` are connection-scoped and can stop the child on disconnect.
 
-Use `--relay default` when validating access across networks. The default `--relay disabled` is intended for same-machine and same-LAN testing.
+Bare `volt remote host` uses `--relay disabled` for same-machine and same-LAN preview workflows. Use `volt remote host --mobile` for mobile-facing setup; it defaults tickets to relay/discovery mode `"default"` unless the host user explicitly opts out with `--relay disabled` for LAN-only use. Use `--relay default` when validating access across networks.
 
 See [Using Volt](usage.md#remote-access-over-iroh-preview) for copy-pastable commands and [Iroh remote protocol v1](iroh-remote-protocol.md) for the external client contract.
 
