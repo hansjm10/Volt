@@ -185,6 +185,8 @@ Keep explicit cancel narrow:
 - If multiple subscribers exist, all subscribers see the resulting events.
 - No transport close path should call `abort`.
 
+Resolved 2026-06-22: The explicit remote `abort` path remains the only cancellation command and is covered during an active remote prompt. The regression test runs the real RPC mode through the Iroh remote filter and close-deferring transport, proves `session.abort()` is called, proves the `abort` response is withheld until abort settlement, and checks the cancelled prompt's transcript output remains observable.
+
 ### Duplicate Connections
 
 The current protocol rejects a second active connection for the same client/workspace. Detach-aware behavior should revisit this:

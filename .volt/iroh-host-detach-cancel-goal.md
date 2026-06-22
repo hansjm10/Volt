@@ -259,10 +259,10 @@ the rollup item is resolved, and the final turn's required verification passed.
     <evidence>Resolved 2026-06-22: added remote lifecycle regressions using real RPC mode and the Iroh close-deferring transport to prove accepted prompts survive clean close and write failure without runtime dispose/abort, and detached transcript entries remain recoverable; verification: `cd packages/coding-agent &amp;&amp; node node_modules/vitest/dist/cli.js --run test/remote-iroh-lifecycle-contract.test.ts`, `npm run check`, `npm run iroh:poc:test`; commit 7761c3dd</evidence>
   </item>
 
-  <item ref="B.2" status="open" prereq="B.1">
+  <item ref="B.2" status="resolved" prereq="B.1">
     <title>Preserve explicit remote cancellation behavior</title>
     <acceptance>Authorized inbound `abort` still calls `session.abort()` and waits for the agent to settle; cancellation is observable through state/events/transcript as currently supported; tests cover explicit abort during an active remote run and distinguish it from transport detach.</acceptance>
-    <evidence/>
+    <evidence>Resolved 2026-06-22: added an active remote prompt regression through the Iroh remote filter and close-deferring transport proving `abort` calls `session.abort()`, waits for abort settlement before responding, leaves detach-only paths distinct, and persists observable transcript output; verification: `cd packages/coding-agent &amp;&amp; node node_modules/vitest/dist/cli.js --run test/remote-iroh-lifecycle-contract.test.ts`, `npm run check`, `npm run iroh:poc:test`; commit be521aa0</evidence>
   </item>
 
   <item ref="B.3" status="open" prereq="B.1">
