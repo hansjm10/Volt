@@ -308,10 +308,10 @@ the rollup item is resolved, and the final turn's required verification passed.
 </group>
 
 <group n="4" title="Protocol contract and RPC surface">
-  <item ref="D.1" status="open" prereq="A.1,B.2">
+  <item ref="D.1" status="resolved" prereq="A.1,B.2">
     <title>Add an Iroh remote protocol v1 document and compatibility tests for ticket payloads, hello, handshake success/failure, strict LF JSONL framing, initialInput preservation, and outbound redaction guarantees</title>
     <acceptance>`packages/coding-agent/docs/iroh-remote-protocol.md` exists and is linked from docs index and Iroh design doc; test vectors pin ticket and handshake shapes; command/redaction tests fail on unintended v1 changes; docs tell client authors which fields are authoritative and which unknown fields must be ignored.</acceptance>
-    <evidence/>
+    <evidence>Resolved 2026-06-21: added Iroh remote protocol v1 docs linked from the docs index/design doc plus compatibility vectors for ticket/hello/handshake shapes, LF framing with initialInput preservation, command allowlist/rejections, and representative outbound redaction; verification: lsp.diagnostics on packages/coding-agent/test/remote-iroh-core.test.ts, cd packages/coding-agent &amp;&amp; node node_modules/vitest/dist/cli.js --run test/remote-iroh-core.test.ts, npm run check, git diff --check -- .volt/iroh-productization-design.md packages/coding-agent/CHANGELOG.md packages/coding-agent/docs/index.md packages/coding-agent/docs/iroh-remote-access-design.md packages/coding-agent/docs/iroh-remote-protocol.md packages/coding-agent/test/remote-iroh-core.test.ts; commit 0dcf9bc4</evidence>
   </item>
 
   <item ref="D.2" status="open" prereq="D.1" type="decision">
