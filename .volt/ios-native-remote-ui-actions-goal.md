@@ -416,7 +416,7 @@ and recorded without overclaiming.
   <item ref="F.1" status="resolved" prereq="B.5,C.4,D.2">
     <title>Update protocol, extension, skill, prompt-template, and iOS docs for native actions</title>
     <acceptance>`packages/coding-agent/docs/rpc.md`, `docs/iroh-remote-protocol.md`, `docs/extensions.md`, `docs/prompt-templates.md`, `docs/skills.md`, the paired design doc, and relevant iOS README/user-facing docs describe native UI actions, slash aliases, discovery, invocation, security limits, extension command projection, skills/templates, and unsupported/deferred surfaces. Changelog entries are added where appropriate.</acceptance>
-    <evidence>Resolved 2026-06-23: updated RPC, Iroh remote protocol, extension, prompt-template, skill, coding-agent changelog, paired design, and iOS README docs to describe native action discovery/invocation, primary versus palette surfaces, slash aliases, descriptor security limits, extension command projection, prompt/skill projection, iOS Actions behavior, and unsupported/deferred model/settings/profile/package surfaces. Verified with `git diff --check`; app commit 1c66868f, Volt commit pending.</evidence>
+    <evidence>Resolved 2026-06-23: updated RPC, Iroh remote protocol, extension, prompt-template, skill, coding-agent changelog, paired design, and iOS README docs to describe native action discovery/invocation, primary versus palette surfaces, slash aliases, descriptor security limits, extension command projection, prompt/skill projection, iOS Actions behavior, and unsupported/deferred model/settings/profile/package surfaces. Verified with `git diff --check`; app commit 1c66868f, Volt commit c581ccea.</evidence>
   </item>
 
   <item ref="F.2" status="open" prereq="E.2,F.1">
