@@ -364,6 +364,10 @@ Implemented 2026-06-22: the iOS Settings screen now shows saved-host status, sav
 
 Detailed iOS UX and state behavior lives in `/Users/jordan.hans/Projects/volt-app/.volt/designs/iroh-saved-host-app-design.md`.
 
+## Documentation Surface
+
+Resolved 2026-06-22: the public root docs now describe the saved-host pairing contract in the user-facing usage guide, security notes, and protocol reference. The docs identify Pair Phone as the explicit ticket creation path, define the QR as a short-lived one-time invitation, state that saved-host reconnect uses no pairing secret and no ordinary QR rescan, document `~/.volt/agent/remote/iroh-host.json`, record the mobile relay default and LAN-only opt-out, cover revocation plus `volt remote approve-repair`, list offline/auth outcome boundaries, and keep preview limitations explicit.
+
 ## Auth and Error Outcomes
 
 The app needs stable machine-readable outcomes, not only human-readable error strings. These outcomes should drive whether the app retries, keeps the saved host, asks the user to pair again, or asks the user to inspect the desktop host.

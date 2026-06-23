@@ -177,6 +177,8 @@ See [Volt Packages](packages.md) for package sources and security notes.
 
 `volt remote host` exposes a local Volt runtime over Iroh. The feature is opt-in and host-controlled: provider credentials, workspace files, tool execution, sessions, state, and audit logs remain on the host machine.
 
+Phone setup uses a Pair Phone flow. For mobile-facing setup, start the host with `volt remote host --mobile`, then run `volt remote pair` only when adding a phone. That QR/ticket is a short-lived, one-time invitation. After the first successful pairing, the host records the phone's authoritative Iroh node ID in the host state file and the app saves a secret-free saved-host record. Later reconnects use that saved host and do not need another QR scan as long as the host restarts with the same state path and host identity.
+
 Happy path:
 
 ```bash
@@ -198,6 +200,7 @@ Common management commands:
 volt remote status                         # persisted state, workspaces, clients, tools, state/audit paths
 volt remote clients                        # paired client JSON
 volt remote revoke <node-id>               # revoke future access; live hosts also close active connections
+volt remote approve-repair <node-id>       # allow a revoked phone identity to re-pair with a fresh ticket
 volt remote pair --workspace volt --label "Jordan iPhone"
 volt remote host --workspace volt=/path/to/repo --no-pairing
 
@@ -210,13 +213,16 @@ Options to know:
 
 - Host: `--workspace <name=path>`, `--mobile`, `--relay <disabled|default>`, `--state <path>`, `--audit <path>`, `--allow-tools <list>`, `--profile <name>`, `--agent-dir <path>`, `--detached-runtime-ttl-ms <ms>`, `--approve`, `--no-pairing`, `--once`, `--yes`.
 - Pair: `--workspace <name>`, `--allow-tools <list>`, `--label <label>`, `--ttl <duration>`, `--state <path>`, `--relay <disabled|default>`, `--yes`.
-- Management: `--state <path>` and `--audit <path>` for `status`, `clients`, and `revoke`.
+- Management: `--state <path>` and `--audit <path>` for `status`, `clients`, `revoke`, and `approve-repair`.
 
 Security and support boundary:
 
 - The default remote tool allowlist is `read,bash,edit,write,grep,find,ls`.
 - Granting `bash`, `edit`, or `write` can modify host files or run shell commands. TTY host/pair commands require confirmation; noninteractive unsafe grants, including the default grant, require `--yes`.
-- Pairing tickets are short-lived and one-time. Bare preview `volt remote host` shows a startup ticket as a terminal QR code by default when stderr is a TTY. `volt remote host --mobile` starts without an active startup pairing invite; use `volt remote pair` to create the QR/ticket when pairing a phone. `volt remote pair` is mediated by a running host control channel; offline pairing from persisted state is not supported.
+- Pairing tickets are short-lived and one-time. Bare preview `volt remote host` shows a startup ticket as a terminal QR code by default when stderr is a TTY. `volt remote host --mobile` starts without an active startup pairing invite; use `volt remote pair` to create the QR/ticket when pairing a phone. The QR is for first setup or explicit Pair Again, not ordinary reconnect. `volt remote pair` is mediated by a running host control channel; offline pairing from persisted state is not supported.
+- Saved-host reconnects omit the pairing secret and verify the host node ID. App restart, foreground reconnect after network loss, and host restart with the same `~/.volt/agent/remote/iroh-host.json` state path should use the saved-host path instead of asking for another QR.
+- Revoked clients cannot reconnect or silently re-pair. To trust the same phone identity again, run `volt remote approve-repair <node-id>` on the desktop host, then create a fresh pairing ticket.
+- Reconnect clients should distinguish `host_unreachable`, `host_identity_mismatch`, `saved_host_invalid`, `client_unknown`, `client_revoked`, `workspace_unavailable`, and `workspace_forbidden`. Ordinary offline hosts are retry states that keep the saved host; invalid, mismatched, unknown, or revoked relationships require Pair Again or Forget Host decisions.
 - Remote clients select saved workspace names only. They cannot request arbitrary host paths.
 - Remote sessions do not bypass project trust. Pass `--approve` only when the host user trusts project-local settings/resources for that workspace.
 - In the default integrated runtime, app backgrounding, network loss, or stream close detaches the client and does not send `abort`. Active work continues on the host; the same paired client/workspace can reconnect and refresh with `get_state` and `get_transcript`.
@@ -227,6 +233,7 @@ Security and support boundary:
 - Bare `volt remote host` uses `--relay disabled` for same-machine/LAN preview workflows. `volt remote host --mobile` is the mobile-facing host mode: it starts in relay/discovery mode `"default"` and skips startup pairing. Use `--relay disabled` only as an explicit LAN-only opt-out.
 - `volt remote pair` creates pairing tickets with the live host relay mode unless `--relay <disabled|default>` is supplied as an expectation check; it cannot change a running host's relay mode.
 - `volt remote host` requires a Node.js npm install or source checkout with optional `@number0/iroh` available for the platform. Bun binary builds reject it because the native Iroh adapter is not bundled.
+- Known preview limitations: spawned child compatibility modes are connection-scoped, host process exit is not durable active-work recovery, `volt remote status` is a persisted-state view, and cross-network relay should be validated with `--relay default` in the target environment.
 
 See [Iroh remote protocol v1](iroh-remote-protocol.md), [Iroh remote access design](iroh-remote-access-design.md), and [Security](security.md#remote-access-over-iroh-preview).
 
