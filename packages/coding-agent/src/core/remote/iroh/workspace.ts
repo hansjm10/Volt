@@ -25,10 +25,11 @@ export function upsertIrohRemoteWorkspace(
 	workspace: IrohRemoteWorkspace,
 	allowTools?: string,
 ): IrohRemoteWorkspace {
+	const savedAllowedTools = allowTools ?? workspace.allowedTools;
 	const savedWorkspace: IrohRemoteWorkspace = {
 		name: workspace.name,
 		path: workspace.path,
-		allowedTools: allowTools,
+		...(savedAllowedTools === undefined ? {} : { allowedTools: savedAllowedTools }),
 	};
 	const existing = state.workspaces.find((entry) => entry.name === workspace.name);
 	if (!existing) {
@@ -37,7 +38,9 @@ export function upsertIrohRemoteWorkspace(
 	}
 
 	existing.path = savedWorkspace.path;
-	existing.allowedTools = savedWorkspace.allowedTools;
+	if (savedAllowedTools !== undefined) {
+		existing.allowedTools = savedAllowedTools;
+	}
 	return existing;
 }
 

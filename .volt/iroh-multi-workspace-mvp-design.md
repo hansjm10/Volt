@@ -729,6 +729,13 @@ Tasks:
 8. Add tests for cwd, path, `name=path`, state path, invalid path, file path,
    realpath storage, and update existing name.
 
+Resolved 2026-06-23: `volt remote host --register-workspace` is a one-shot host
+mode that runs before native Iroh startup, validates directory paths, stores
+realpaths, supports cwd, positional path, positional `name=path`, and
+`--workspace` fallback specs, and writes either the default host state path or an
+explicit `--state` path. Re-registering a name updates its saved path while
+preserving existing `allowedTools` unless `--allow-tools` is supplied.
+
 ### Phase 2: Host multi-workspace authorization
 
 Files likely touched:

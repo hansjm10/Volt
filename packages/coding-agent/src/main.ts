@@ -95,6 +95,7 @@ async function readPipedStdin(): Promise<string | undefined> {
 function printRemoteCommandHelp(): void {
 	console.error(`Usage:
   volt remote host [options]
+  volt remote host --register-workspace [path|name=path] [options]
   volt remote pair [options]
   volt remote status [options]
   volt remote clients [options]
@@ -103,6 +104,7 @@ function printRemoteCommandHelp(): void {
 
 Host options are forwarded to the integrated Iroh remote host. Common options:
   --workspace <name=path>       Workspace exposed to the client
+  --register-workspace [spec]   Register cwd, path, or name=path in host state and exit
   --mobile                      Mobile-facing host mode. Defaults relay to default and skips startup pairing
   --relay <disabled|default>    Iroh relay preset
   --state <path>                Host state path

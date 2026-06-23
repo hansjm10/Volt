@@ -6,7 +6,7 @@ import { access, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { connect as connectNet, createServer } from "node:net";
 import { hostname, userInfo } from "node:os";
 import { fileURLToPath } from "node:url";
-import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import lockfile from "proper-lockfile";
 import {
@@ -29,6 +29,7 @@ import {
 	IrohRemoteAuditLogger,
 	IrohRemoteHostEngine,
 	IrohRemoteHostStateManager,
+	parseIrohRemoteWorkspaceSpec,
 	parseIrohRemoteControlRequest,
 	pipeIrohRemoteOutboundJsonlReadable,
 	readIrohRemoteHostState,
@@ -69,7 +70,17 @@ const RESPONSE_COMPLETION_RPC_TYPES = new Set([
 	"switch_session_by_id",
 ]);
 const PROMPT_COMPLETION_SETTLE_MS = 100;
-const BOOLEAN_FLAGS = new Set(["approve", "help", "integrated-volt", "mobile", "no-pairing", "once", "use-volt", "yes"]);
+const BOOLEAN_FLAGS = new Set([
+	"approve",
+	"help",
+	"integrated-volt",
+	"mobile",
+	"no-pairing",
+	"once",
+	"register-workspace",
+	"use-volt",
+	"yes",
+]);
 const VALUE_FLAGS = new Set([
 	"agent-dir",
 	"allow-tools",
@@ -194,12 +205,14 @@ function ensureIrohAvailable() {
 
 function printUsage() {
 	console.error(`Usage: volt remote host [serve] [options]
+       volt remote host --register-workspace [path|name=path] [options]
        volt remote clients [options]
        volt remote revoke <node-id> [options]
        volt remote approve-repair <node-id> [options]
 
 Serve options:
   --workspace <name=path>    Workspace exposed to the client. Defaults to saved workspace or cwd.
+  --register-workspace       Register cwd, path, or name=path in host state and exit.
   --mobile                   Mobile-facing host mode. Defaults relay to default and skips startup pairing.
   --relay <disabled|default> Iroh relay preset. Defaults to disabled, or default with --mobile.
   --state <path>             Host state path. Defaults to ~/.volt/agent/remote/iroh-host.json.
@@ -356,6 +369,38 @@ async function assertWorkspaceDirectory(workspace) {
 		throw new Error(`Workspace path is not a directory: ${workspace.path}`);
 	}
 	workspace.path = await realpath(workspace.path);
+}
+
+function getRegisterWorkspacePositionals(positionals) {
+	return positionals[0] === "serve" ? positionals.slice(1) : positionals;
+}
+
+function getRegisterWorkspaceSpec(flags, positionals) {
+	const registerPositionals = getRegisterWorkspacePositionals(positionals);
+	if (registerPositionals.length > 1) {
+		throw new Error(`Unexpected workspace registration argument: ${registerPositionals[1]}`);
+	}
+
+	const workspaceFlag = getFlag(flags, "workspace");
+	if (registerPositionals.length === 1 && workspaceFlag !== undefined) {
+		throw new Error("Workspace registration accepts either a positional workspace spec or --workspace, not both");
+	}
+	return registerPositionals[0] ?? workspaceFlag;
+}
+
+async function registerWorkspace(flags, positionals) {
+	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
+	const spec = getRegisterWorkspaceSpec(flags, positionals);
+	const workspace = parseIrohRemoteWorkspaceSpec(spec, process.cwd());
+	const useRealpathBasename = spec === undefined || !spec.includes("=");
+	await assertWorkspaceDirectory(workspace);
+	if (useRealpathBasename) {
+		workspace.name = basename(workspace.path) || "workspace";
+	}
+
+	const stateManager = new IrohRemoteHostStateManager({ statePath });
+	const savedWorkspace = await stateManager.upsertWorkspace(workspace, getFlag(flags, "allow-tools"));
+	console.error(`registered workspace: ${savedWorkspace.name} -> ${savedWorkspace.path}`);
 }
 
 function getPlatformVoltBin(voltBin) {
@@ -1985,6 +2030,11 @@ async function main() {
 	const { flags, positionals } = parseFlags(process.argv.slice(2));
 	if (hasFlag(flags, "help")) {
 		printUsage();
+		return;
+	}
+
+	if (hasFlag(flags, "register-workspace")) {
+		await registerWorkspace(flags, positionals);
 		return;
 	}
 

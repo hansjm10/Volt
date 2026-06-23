@@ -1,13 +1,15 @@
-import { mkdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 import {
 	getIrohRemoteControlPath,
 	IROH_REMOTE_PAIR_CONTROL_RESPONSE_TYPE,
 	IROH_REMOTE_REVOKE_CONTROL_RESPONSE_TYPE,
+	IrohRemoteHostStateManager,
+	parseIrohRemoteWorkspaceSpec,
 	readIrohRemoteHostState,
 	writeIrohRemoteHostState,
 } from "../src/core/remote/iroh/index.ts";
@@ -91,10 +93,169 @@ describe("remote CLI", () => {
 		expect(helpText).toContain("volt remote pair [options]");
 		expect(helpText).toContain("volt remote status [options]");
 		expect(helpText).toContain("volt remote approve-repair <node-id> [options]");
+		expect(helpText).toContain("--register-workspace");
 		expect(helpText).toContain("bash, edit, or write can modify host state and require confirmation");
 		expect(helpText).toContain("--mobile");
 		expect(helpText).toContain("--yes");
 		expect(process.exitCode).toBeUndefined();
+	});
+
+	it("parses workspace registration specs", () => {
+		expect(parseIrohRemoteWorkspaceSpec(undefined, projectDir)).toEqual({
+			name: "project",
+			path: projectDir,
+		});
+		expect(parseIrohRemoteWorkspaceSpec("src", projectDir)).toEqual({
+			name: "src",
+			path: join(projectDir, "src"),
+		});
+		expect(parseIrohRemoteWorkspaceSpec("volt=.", projectDir)).toEqual({
+			name: "volt",
+			path: resolve(projectDir, "."),
+		});
+		expect(() => parseIrohRemoteWorkspaceSpec("=.", projectDir)).toThrow("Workspace name cannot be empty");
+	});
+
+	it("preserves workspace tool defaults when upserting without explicit tools", async () => {
+		const statePath = join(tempDir, "host.json");
+		const firstPath = join(projectDir, "first");
+		const secondPath = join(projectDir, "second");
+		mkdirSync(firstPath, { recursive: true });
+		mkdirSync(secondPath, { recursive: true });
+		const stateManager = new IrohRemoteHostStateManager({ statePath });
+
+		await expect(stateManager.upsertWorkspace({ name: "project", path: firstPath }, "read")).resolves.toEqual({
+			name: "project",
+			path: firstPath,
+			allowedTools: "read",
+		});
+		await expect(stateManager.upsertWorkspace({ name: "project", path: secondPath })).resolves.toEqual({
+			name: "project",
+			path: secondPath,
+			allowedTools: "read",
+		});
+		await expect(stateManager.upsertWorkspace({ name: "project", path: firstPath }, "read,grep")).resolves.toEqual({
+			name: "project",
+			path: firstPath,
+			allowedTools: "read,grep",
+		});
+	});
+
+	it("registers the current directory with the default Iroh host state path", async () => {
+		const defaultStatePath = join(agentDir, "remote", "iroh-host.json");
+		const realProjectDir = realpathSync(projectDir);
+
+		await expect(main(["remote", "host", "--register-workspace"])).resolves.toBeUndefined();
+
+		const savedState = await readIrohRemoteHostState(defaultStatePath);
+		expect(savedState.workspaces).toEqual([
+			{
+				name: basename(realProjectDir),
+				path: realProjectDir,
+			},
+		]);
+		expect(process.exitCode).toBe(0);
+	});
+
+	it("registers explicit workspace specs with an explicit Iroh host state path", async () => {
+		const statePath = join(tempDir, "custom", "host.json");
+		const alphaPath = join(projectDir, "alpha");
+		const betaPath = join(projectDir, "beta");
+		mkdirSync(alphaPath, { recursive: true });
+		mkdirSync(betaPath, { recursive: true });
+
+		await expect(
+			main(["remote", "host", "--state", statePath, "--register-workspace", `alpha=${alphaPath}`]),
+		).resolves.toBeUndefined();
+		expect(process.exitCode).toBe(0);
+		process.exitCode = undefined;
+
+		await expect(
+			main(["remote", "host", "--state", statePath, "--register-workspace", betaPath]),
+		).resolves.toBeUndefined();
+
+		const savedState = await readIrohRemoteHostState(statePath);
+		expect(savedState.workspaces).toEqual([
+			{
+				name: "alpha",
+				path: realpathSync(alphaPath),
+			},
+			{
+				name: basename(realpathSync(betaPath)),
+				path: realpathSync(betaPath),
+			},
+		]);
+		expect(process.exitCode).toBe(0);
+	});
+
+	it("updates a registered workspace realpath while preserving saved tool defaults", async () => {
+		const statePath = join(tempDir, "host.json");
+		const firstPath = join(projectDir, "first");
+		const secondPath = join(projectDir, "second");
+		mkdirSync(firstPath, { recursive: true });
+		mkdirSync(secondPath, { recursive: true });
+		await writeIrohRemoteHostState(statePath, {
+			hostSecretKey: undefined,
+			workspaces: [{ name: "app", path: firstPath, allowedTools: "read" }],
+			clients: [],
+		});
+
+		await expect(
+			main(["remote", "host", "--state", statePath, "--register-workspace", `app=${secondPath}`]),
+		).resolves.toBeUndefined();
+
+		let savedState = await readIrohRemoteHostState(statePath);
+		expect(savedState.workspaces).toEqual([
+			{
+				name: "app",
+				path: realpathSync(secondPath),
+				allowedTools: "read",
+			},
+		]);
+		expect(process.exitCode).toBe(0);
+		process.exitCode = undefined;
+
+		await expect(
+			main([
+				"remote",
+				"host",
+				"--state",
+				statePath,
+				"--register-workspace",
+				`app=${firstPath}`,
+				"--allow-tools",
+				"read,grep",
+			]),
+		).resolves.toBeUndefined();
+
+		savedState = await readIrohRemoteHostState(statePath);
+		expect(savedState.workspaces).toEqual([
+			{
+				name: "app",
+				path: realpathSync(firstPath),
+				allowedTools: "read,grep",
+			},
+		]);
+		expect(process.exitCode).toBe(0);
+	});
+
+	it("rejects invalid workspace registration paths", async () => {
+		const statePath = join(tempDir, "host.json");
+		const filePath = join(projectDir, "file.txt");
+		writeFileSync(filePath, "not a directory");
+
+		await expect(
+			main(["remote", "host", "--state", statePath, "--register-workspace", join(projectDir, "missing")]),
+		).resolves.toBeUndefined();
+		expect(process.exitCode).toBe(1);
+		expect((await readIrohRemoteHostState(statePath)).workspaces).toEqual([]);
+		process.exitCode = undefined;
+
+		await expect(
+			main(["remote", "host", "--state", statePath, "--register-workspace", `file=${filePath}`]),
+		).resolves.toBeUndefined();
+		expect(process.exitCode).toBe(1);
+		expect((await readIrohRemoteHostState(statePath)).workspaces).toEqual([]);
 	});
 
 	it("creates a remote pairing ticket through a running host control channel", async () => {
