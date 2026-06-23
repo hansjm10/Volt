@@ -21,7 +21,7 @@ The current implementation is functional and has strong core plumbing:
   - workspace selection
   - audit logging
   - command filtering
-  - outbound host-path redaction
+  - outbound path normalization and dedicated path filtering
   - host/client engine orchestration
 - The host has basic safety defaults:
   - opt-in command
@@ -554,9 +554,9 @@ The protocol doc now explains that tool access and RPC command access are separa
 
 Do not allow direct `bash`, `edit`, `write`, session switching, model changes, package installation, or settings mutation over remote access unless explicitly reviewed.
 
-### Outbound redaction contract
+### Outbound path handling contract
 
-Remote clients must not receive full host-only paths unless those paths are inside the selected workspace and normalized to the remote workspace root.
+Remote clients receive generic host-only paths as-is, while paths inside the selected workspace are normalized to the remote workspace root.
 
 Current remote workspace root default:
 
@@ -570,12 +570,12 @@ Guarantees:
 - Host session files are redacted.
 - Host export paths are redacted.
 - Bash temp output paths are redacted.
-- Absolute host paths outside the workspace are redacted.
+- Absolute host paths outside the workspace are left unchanged.
 - Image data and opaque signatures are preserved.
 
-Resolved 2026-06-21: Protocol compatibility tests now assert representative outbound RPC event redaction, including workspace normalization, host path redaction, session-file omission, structured export-path redaction, opaque image payload preservation, and signature preservation.
+Resolved 2026-06-21: Protocol compatibility tests asserted representative outbound RPC event handling, including workspace normalization, session-file omission, structured export-path filtering, opaque image payload preservation, and signature preservation.
 
-Resolved 2026-06-21: D.3 hardened structured path-field redaction so recognized session files, export paths, and bash output paths use their dedicated placeholders even in strict path fields. Tests now cover representative `get_state`, `export_html`, `bash`, extension UI, assistant-content, and tool-call outbound events, plus the existing POSIX, Windows, UNC, tilde, file URL, spaced-path, opaque image, and signature cases. The protocol doc now lists the outbound redaction surfaces and placeholder guarantees.
+Updated 2026-06-22: The generic host-path placeholder was removed. The outbound layer now keeps arbitrary host paths intact while preserving workspace normalization and dedicated session/export/bash-output filtering. Tests cover representative `get_state`, `export_html`, `bash`, extension UI, assistant-content, and tool-call outbound events, plus POSIX, Windows, UNC, tilde, file URL, spaced-path, opaque image, and signature cases. The protocol doc lists the current outbound path-handling surfaces and placeholder guarantees.
 
 ## Reconnect and Session Resume Design
 

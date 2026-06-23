@@ -4,7 +4,6 @@ import type { RpcCloseHandler, RpcLineHandler, RpcTransport } from "../../rpc/in
 
 export const IROH_REMOTE_REDACTED_BASH_OUTPUT_PATH = "[redacted bash output path]";
 export const IROH_REMOTE_REDACTED_EXPORT_PATH = "[redacted export path]";
-export const IROH_REMOTE_REDACTED_HOST_PATH = "[redacted host path]";
 export const IROH_REMOTE_REDACTED_SESSION_FILE = "[redacted session file]";
 
 const OMIT_REMOTE_PATH_FIELDS = new Set(["fullOutputPath", "sessionFile"]);
@@ -226,7 +225,7 @@ function shouldTreatAsPathField(fieldName: string | undefined): boolean {
 
 function sanitizePathField(value: string, context: IrohRemoteOutboundSanitizerContext): string {
 	if (hasPathListSeparator(value)) {
-		return sanitizeRemoteText(value, context);
+		return redactPathOccurrences(value, context, "text");
 	}
 	const normalized = normalizeWorkspacePath(value, context);
 	if (normalized) {
@@ -248,13 +247,13 @@ function sanitizePathField(value: string, context: IrohRemoteOutboundSanitizerCo
 		return sanitizePathToken(value, context);
 	}
 	if (isAbsolute(value) || isWindowsAbsolutePath(value) || isWindowsUncPath(value) || isFileUrl(value)) {
-		return IROH_REMOTE_REDACTED_HOST_PATH;
+		return value;
 	}
 	return sanitizeRemoteText(value, context);
 }
 
 function sanitizeRemoteText(value: string, context: IrohRemoteOutboundSanitizerContext): string {
-	return redactPathOccurrences(value, context, "text");
+	return sanitizePathOccurrences(value, context, "text");
 }
 
 function sanitizeObjectKey(value: string, context: IrohRemoteOutboundSanitizerContext): string {
@@ -311,6 +310,14 @@ function redactPathOccurrences(
 	context: IrohRemoteOutboundSanitizerContext,
 	mode: PathContinuationMode,
 ): string {
+	return sanitizePathOccurrences(value, context, mode);
+}
+
+function sanitizePathOccurrences(
+	value: string,
+	context: IrohRemoteOutboundSanitizerContext,
+	mode: PathContinuationMode,
+): string {
 	let sanitized = "";
 	let index = 0;
 	while (index < value.length) {
@@ -363,7 +370,7 @@ function sanitizePathToken(value: string, context: IrohRemoteOutboundSanitizerCo
 		isWindowsUncPath(path) ||
 		isFileUrl(path)
 	) {
-		return `${IROH_REMOTE_REDACTED_HOST_PATH}${suffix}`;
+		return `${path}${suffix}`;
 	}
 	return `${normalizeWorkspacePathOccurrences(path, context)}${suffix}`;
 }

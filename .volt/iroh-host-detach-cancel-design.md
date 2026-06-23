@@ -218,7 +218,7 @@ Detach support must preserve the remote access boundary:
 - `get_transcript` remains the remote-safe transcript recovery surface.
 - Transcript fields remain bounded and redacted.
 - Session file paths remain hidden.
-- Host-local paths outside the workspace remain redacted.
+- Host-local paths outside the workspace remain visible; dedicated session/export/bash-output filtering still applies.
 - Detached runs must not accept commands from revoked clients.
 - Reconnect must authorize the same authoritative Iroh client node ID before attaching to any existing runtime.
 - If client permissions change or are revoked while detached, the next attach must enforce the new policy.

@@ -1207,10 +1207,10 @@ async function rawCommandFilterScenario() {
 			const response = responses.find((event) => event.id === "path-filter");
 			assert(response, `Expected host-side path denial response, got:\n${lines.join("\n")}`);
 			assert(response.success === false, `Expected path denial to fail, got:\n${JSON.stringify(response)}`);
-			assert(response.command === "[redacted host path]", `Expected redacted command, got:\n${JSON.stringify(response)}`);
+			assert(response.command === privateCommandPath, `Expected raw command path, got:\n${JSON.stringify(response)}`);
 			assert(
-				response.error === "RPC command not allowed over remote host: [redacted host path]",
-				`Expected redacted host-side denial, got:\n${JSON.stringify(response)}`,
+				response.error === `RPC command not allowed over remote host: ${privateCommandPath}`,
+				`Expected raw host-side denial, got:\n${JSON.stringify(response)}`,
 			);
 		} finally {
 			await stopProcess(host.child);

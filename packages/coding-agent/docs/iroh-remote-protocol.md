@@ -198,16 +198,16 @@ The path-based `switch_session` command remains blocked remotely; remote clients
 
 Tool access and RPC command access are separate surfaces. `allowedTools` controls which tools the host-side model may invoke; this allowlist controls which JSONL commands a remote client may send directly.
 
-## Outbound redaction guarantees
+## Outbound path handling
 
-Before host RPC output is sent to the remote stream, Volt sanitizes host-local paths while preserving remote-meaningful workspace paths:
+Before host RPC output is sent to the remote stream, Volt normalizes remote-meaningful workspace paths and keeps generic host paths intact:
 
 - Paths under the hosted workspace are rewritten under `/workspace`.
-- Host-local paths outside the workspace are replaced with `[redacted host path]`.
-- Export paths are redacted. Recognized export path occurrences and structured path fields use `[redacted export path]`; unrecognized host-local path fields use `[redacted host path]`.
+- Host-local paths outside the workspace are left unchanged; Volt no longer emits a generic placeholder for them.
+- Export paths are redacted when recognized with `[redacted export path]`.
 - Session files are omitted or replaced with `[redacted session file]`.
 - Bash output file paths are omitted or replaced with `[redacted bash output path]`.
-- Redaction applies to responses, extension UI requests, assistant content, tool-call arguments, and plain-text fallback lines.
-- Opaque model/provider data such as image base64 payloads and signature fields are preserved, while adjacent text and structured arguments are still sanitized.
+- Path handling applies to responses, extension UI requests, assistant content, tool-call arguments, and plain-text fallback lines.
+- Opaque model/provider data such as image base64 payloads and signature fields are preserved, while adjacent text and structured arguments are still processed as above.
 
-These placeholders are part of the v1 compatibility surface. Clients must display them as opaque strings and must not assume that a redacted path can be expanded locally.
+The remaining dedicated placeholders are part of the v1 compatibility surface. Clients must display them as opaque strings and must not assume that a redacted path can be expanded locally.

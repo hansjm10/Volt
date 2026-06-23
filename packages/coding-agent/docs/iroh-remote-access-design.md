@@ -305,7 +305,7 @@ Automated tests for a monorepo version:
 | Remote access exposes local shell and filesystem | Opt-in host command, unsafe-tool confirmation, workspace allowlist, client revocation, clear warnings |
 | Native dependency increases install complexity | Keep `@number0/iroh` optional, keep native loading isolated from the main CLI, document native install troubleshooting, and reject Bun binary remote host startup with an actionable Node/source guidance message |
 | Mobile networks disconnect often | Integrated hosts treat stream close as detach, retain active host work, allow same-client/workspace reconnect, and recover persisted output through `get_transcript` |
-| RPC responses expose host paths | Remote-safe outbound filtering normalizes workspace paths and redacts host-only session, export, bash-output, and arbitrary absolute paths |
+| RPC responses expose host paths | Remote-safe outbound filtering normalizes workspace paths and only uses dedicated redaction for host-only session, export, and bash-output paths |
 | Relay fallback may add latency or cost | Prefer direct connections, expose connection diagnostics, allow custom relay config later |
 | Project extensions can run arbitrary code | Preserve project trust behavior and do not auto-approve remote workspaces |
 
@@ -320,7 +320,7 @@ These are outside the host preview support boundary:
 Resolved preview decisions:
 
 - Remote clients use the default tool grant (`read,bash,edit,write,grep,find,ls`) unless configured otherwise, and keep their pair-time tool grant on reconnect.
-- Remote outbound state/events normalize workspace paths to `/workspace` and redact host-only session, export, bash-output, and arbitrary absolute host paths.
+- Remote outbound state/events normalize workspace paths to `/workspace`, keep generic host paths intact, and only use dedicated redaction for host-only session, export, and bash-output paths.
 - Pairing is workspace-bound by saved workspace name; clients cannot request arbitrary host paths.
 - Mobile-facing host startup skips startup pairing; Pair Phone is the explicit `volt remote pair` path.
 - Transport close is detach, not cancel; remote cancellation is the `abort` RPC command.

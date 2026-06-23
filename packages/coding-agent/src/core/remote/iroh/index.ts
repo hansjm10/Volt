@@ -81,7 +81,6 @@ export {
 	createIrohRemoteOutboundFilteredRpcTransport,
 	IROH_REMOTE_REDACTED_BASH_OUTPUT_PATH,
 	IROH_REMOTE_REDACTED_EXPORT_PATH,
-	IROH_REMOTE_REDACTED_HOST_PATH,
 	IROH_REMOTE_REDACTED_SESSION_FILE,
 	type IrohRemoteOutboundFilterOptions,
 	type IrohRemoteOutboundJsonlReadablePipeOptions,
