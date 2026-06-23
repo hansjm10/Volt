@@ -1176,6 +1176,21 @@ Concrete behavior:
 - `docs/rpc.md` documents the non-remote commands, descriptor shape, invocation response statuses, and security notes.
 - Iroh remote RPC remains allowlist-based and still rejects `get_ui_capabilities`, `get_ui_actions`, and `invoke_ui_action`; B.3 and B.5 own any future remote allowlist changes.
 
+## Resolved 2026-06-23: Dynamic Host Action Discovery
+
+B.2 implementation projects existing dynamic command sources into sanitized local RPC UI action descriptors.
+
+Concrete behavior:
+
+- `get_ui_actions` returns palette descriptors for extension commands, prompt templates, and skills for the default, `palette`, and `all` scopes. `primary` remains empty until host-curated built-in action cards exist.
+- Projected extension command ids use session-local opaque ids under `extension.command.*`; prompt templates use `prompt.template.*`; skills use `skill.*`.
+- Duplicate extension command invocation names are preserved in descriptor labels and slash aliases, matching the existing `getRegisteredCommands()` resolution.
+- Descriptors include bounded labels, descriptions, hints, safe source scope/origin fields, and generic source labels such as `Project`, `User`, `Temporary`, or `Package`.
+- Descriptors omit raw `sourceInfo`, extension source paths, prompt template file paths and bodies, skill file paths, skill base directories, and package install paths.
+- Display text projection redacts path-like strings before bounding so accidental path mentions in descriptions or hints do not leak through the action list.
+- Dynamic descriptors are marked `remoteSafe: true` as an action-level classification, but Iroh remote access remains blocked until B.3 adds the explicit allowlist and outbound descriptor policy.
+- `invoke_ui_action` remains unavailable until B.4 implements prompt-like action invocation and stale-id checks.
+
 ## Host Implementation Plan
 
 ### Phase A: Design and Inventory

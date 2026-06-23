@@ -1,8 +1,12 @@
 import { describe, expect, test, vi } from "vitest";
 import type { ExtensionBindings } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+import type { ResolvedCommand } from "../src/core/extensions/types.ts";
+import type { PromptTemplate } from "../src/core/prompt-templates.ts";
 import { createIrohRemoteFilteredRpcTransport, getIrohRemoteRpcFilterResult } from "../src/core/remote/iroh/index.ts";
 import { createLoopbackRpcTransportPair, type RpcExtensionUIRequest } from "../src/core/rpc/index.ts";
+import type { Skill } from "../src/core/skills.ts";
+import type { SourceInfo } from "../src/core/source-info.ts";
 import { createInProcessRpcClient } from "../src/modes/rpc/in-process-rpc-client.ts";
 import { createIrohRemoteCloseDeferringRpcTransport } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
@@ -486,6 +490,91 @@ describe("createInProcessRpcClient", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
+	test("projects sanitized native UI actions for extension commands, prompt templates, and skills", async () => {
+		const sensitiveRoot = "/Users/jordan/private-project";
+		const projectSourceInfo = createSourceInfo(`${sensitiveRoot}/.volt/agent/extensions/deploy.ts`, {
+			scope: "project",
+		});
+		const userSourceInfo = createSourceInfo(`${sensitiveRoot}/.volt/agent/prompts/fix-tests.md`, {
+			scope: "user",
+		});
+		const packageSourceInfo = createSourceInfo(`${sensitiveRoot}/.volt/agent/skills/debugger/SKILL.md`, {
+			origin: "package",
+		});
+		const commands: ResolvedCommand[] = [
+			createCommand("deploy", "deploy:1", `Deploy from ${sensitiveRoot}/one`, projectSourceInfo),
+			createCommand("deploy", "deploy:2", "Deploy the second target", projectSourceInfo),
+		];
+		const prompts: PromptTemplate[] = [
+			{
+				name: "fix-tests",
+				description: `Fix tests using ${sensitiveRoot}/logs/failure.log`,
+				argumentHint: "paste failing test output",
+				content: `Prompt body should not leak ${sensitiveRoot}/prompt-body`,
+				filePath: `${sensitiveRoot}/.volt/agent/prompts/fix-tests.md`,
+				sourceInfo: userSourceInfo,
+			},
+		];
+		const skills: Skill[] = [
+			{
+				name: "debugger",
+				description: `Debug issues without exposing ${sensitiveRoot}/skills/debugger/SKILL.md`,
+				filePath: `${sensitiveRoot}/.volt/agent/skills/debugger/SKILL.md`,
+				baseDir: `${sensitiveRoot}/.volt/agent/skills/debugger`,
+				sourceInfo: packageSourceInfo,
+				disableModelInvocation: false,
+			},
+		];
+		const dispose = vi.fn(async () => {});
+		const runtimeHost = createRuntimeHost(dispose, async () => {}, { commands, prompts, skills });
+		const client = await createInProcessRpcClient(runtimeHost);
+
+		try {
+			const actions = await client.getUiActions("all");
+
+			expect(actions).toHaveLength(4);
+			expect(actions.map((action) => action.id)).toEqual([
+				"extension.command.ec_1",
+				"extension.command.ec_2",
+				"prompt.template.pt_1",
+				"skill.sk_1",
+			]);
+			expect(actions.map((action) => action.slash?.name)).toEqual([
+				"deploy:1",
+				"deploy:2",
+				"fix-tests",
+				"skill:debugger",
+			]);
+			expect(actions.map((action) => action.source)).toEqual(["extension", "extension", "prompt", "skill"]);
+			expect(actions.map((action) => action.category)).toEqual(["extension", "extension", "prompt", "skill"]);
+			expect(actions.every((action) => action.remoteSafe)).toBe(true);
+			expect(actions.every((action) => action.enabled)).toBe(true);
+			expect(actions[0].sourceScope).toBe("project");
+			expect(actions[0].sourceOrigin).toBe("top-level");
+			expect(actions[0].sourceLabel).toBe("Project");
+			expect(actions[2].sourceLabel).toBe("User");
+			expect(actions[3].sourceLabel).toBe("Package");
+			expect(actions[0].args).toEqual([
+				expect.objectContaining({ name: "arguments", type: "string", completion: "commandArguments" }),
+			]);
+			expect(actions[2].args).toEqual([
+				expect.objectContaining({ name: "arguments", type: "string", hint: "paste failing test output" }),
+			]);
+			expect(await client.getUiActions("primary")).toEqual([]);
+
+			const serialized = JSON.stringify(actions);
+			expect(serialized).not.toContain(sensitiveRoot);
+			expect(serialized).not.toContain("prompt-body");
+			expect(serialized).not.toContain("filePath");
+			expect(serialized).not.toContain("baseDir");
+			expect(serialized).not.toContain("sourceInfo");
+			expect(serialized).toContain("[redacted path]");
+		} finally {
+			await client.stop();
+		}
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
 	test("sends extension UI responses from in-process clients", async () => {
 		let uiContext: ExtensionBindings["uiContext"];
 		const runtimeHost = createRuntimeHost(
@@ -590,6 +679,11 @@ function parseCommandLine(line: string): { id: string; type: string } {
 function createRuntimeHost(
 	dispose: () => Promise<void>,
 	bindExtensions: (bindings: ExtensionBindings) => Promise<void> = async () => {},
+	resources: {
+		commands?: ResolvedCommand[];
+		prompts?: PromptTemplate[];
+		skills?: Skill[];
+	} = {},
 ): AgentSessionRuntime {
 	return {
 		session: {
@@ -610,6 +704,13 @@ function createRuntimeHost(
 			autoCompactionEnabled: true,
 			messages: [],
 			pendingMessageCount: 0,
+			extensionRunner: {
+				getRegisteredCommands: vi.fn(() => resources.commands ?? []),
+			},
+			promptTemplates: resources.prompts ?? [],
+			resourceLoader: {
+				getSkills: vi.fn(() => ({ skills: resources.skills ?? [], diagnostics: [] })),
+			},
 		},
 		newSession: vi.fn(async () => ({ cancelled: true })),
 		switchSession: vi.fn(async () => ({ cancelled: true })),
@@ -617,4 +718,37 @@ function createRuntimeHost(
 		dispose,
 		setRebindSession: vi.fn(),
 	} as unknown as AgentSessionRuntime;
+}
+
+function createSourceInfo(
+	path: string,
+	options: {
+		scope?: SourceInfo["scope"];
+		origin?: SourceInfo["origin"];
+		source?: string;
+	} = {},
+): SourceInfo {
+	return {
+		path,
+		source: options.source ?? "local",
+		scope: options.scope ?? "project",
+		origin: options.origin ?? "top-level",
+		baseDir: path.slice(0, path.lastIndexOf("/")),
+	};
+}
+
+function createCommand(
+	name: string,
+	invocationName: string,
+	description: string,
+	sourceInfo: SourceInfo,
+): ResolvedCommand {
+	return {
+		name,
+		invocationName,
+		description,
+		sourceInfo,
+		getArgumentCompletions: vi.fn(() => []),
+		handler: vi.fn(async () => {}),
+	};
 }

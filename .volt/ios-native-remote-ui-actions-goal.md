@@ -303,10 +303,10 @@ and recorded without overclaiming.
     <evidence>Resolved 2026-06-23: added v1 UI action RPC command/response types, typed exports/client helpers, local capability and empty action-list dispatch, unavailable invocation error, non-remote RPC docs, and Iroh blocked-command coverage; verified with `node node_modules/vitest/dist/cli.js --run test/rpc-transport-client.test.ts` from `packages/coding-agent`, `npm run iroh:poc:test`, `npm run check`, and `git diff --check -- packages/coding-agent/docs/rpc.md .volt/ios-native-remote-ui-actions-design.md .volt/ios-native-remote-ui-actions-goal.md`; commit 07bd4d21c787b6e485b06b22cb6d85ea2bc097dd.</evidence>
   </item>
 
-  <item ref="B.2" status="open" prereq="B.1,A.1">
+  <item ref="B.2" status="resolved" prereq="B.1,A.1">
     <title>Implement host action discovery for extension commands, prompt templates, and skills</title>
     <acceptance>`get_ui_actions` returns sanitized descriptors for extension commands, prompt templates, and skills; descriptors omit host-local paths, prompt bodies, and skill content; duplicate extension command invocation names are preserved; source labels are bounded and remote-safe; tests cover extension command, template, skill, duplicates, and no sensitive fields.</acceptance>
-    <evidence></evidence>
+    <evidence>Resolved 2026-06-23: implemented sanitized `get_ui_actions` projection for extension commands, prompt templates, and skills with opaque ids, bounded safe source labels, duplicate invocation-name preservation, path-like text redaction, and sensitive-field omission tests; verified with `node node_modules/vitest/dist/cli.js --run test/rpc-transport-client.test.ts` from `packages/coding-agent`, `npm run check`, `npm run iroh:poc:test` after an initial timeout rerun, and `git diff --check -- packages/coding-agent/docs/rpc.md .volt/ios-native-remote-ui-actions-design.md .volt/ios-native-remote-ui-actions-goal.md`; commit pending.</evidence>
   </item>
 
   <item ref="B.3" status="open" prereq="B.2">

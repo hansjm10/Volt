@@ -271,7 +271,7 @@ Messages are `AgentMessage` objects (see [Message Types](#message-types)).
 
 Native UI action commands let typed clients discover host-owned actions for native cards, buttons, toggles, pickers, and command palettes. They are distinct from raw slash command strings: slash commands are presentation aliases, while action ids are the invocation contract.
 
-The current non-remote RPC implementation exposes the v1 protocol shape and an empty action list. It does not advertise invocation support yet, and `invoke_ui_action` returns a normal RPC error until action handlers are registered in later implementation phases. Iroh remote transports still reject these commands until a separate allowlist and descriptor-sanitization change is made.
+The current non-remote RPC implementation exposes the v1 protocol shape and sanitized palette descriptors for extension commands, prompt templates, and skills. It does not advertise invocation support yet, and `invoke_ui_action` returns a normal RPC error until action handlers are registered in later implementation phases. Iroh remote transports still reject these commands until a separate allowlist change is made.
 
 #### get_ui_capabilities
 
@@ -306,19 +306,40 @@ Get native UI action descriptors. `scope` is optional and may be `"primary"`, `"
 {"type": "get_ui_actions", "scope": "palette"}
 ```
 
-Initial response:
+Example response:
 ```json
 {
   "type": "response",
   "command": "get_ui_actions",
   "success": true,
   "data": {
-    "actions": []
+    "actions": [
+      {
+        "schemaVersion": 1,
+        "id": "extension.command.ec_1",
+        "label": "session-name",
+        "description": "Set or clear session name",
+        "source": "extension",
+        "sourceScope": "project",
+        "sourceOrigin": "top-level",
+        "sourceLabel": "Project",
+        "category": "extension",
+        "presentation": {"kind": "palette", "group": "Extensions"},
+        "args": [{"name": "arguments", "label": "Arguments", "type": "string", "required": false}],
+        "enabled": true,
+        "disabledReason": null,
+        "destructive": false,
+        "requiresConfirmation": false,
+        "streamingBehavior": "immediate",
+        "remoteSafe": true,
+        "slash": {"name": "session-name", "example": "/session-name"}
+      }
+    ]
   }
 }
 ```
 
-When actions are available, each descriptor uses this v1 shape:
+Each descriptor uses this v1 shape:
 
 ```json
 {
@@ -351,6 +372,8 @@ When actions are available, each descriptor uses this v1 shape:
 Required fields are `schemaVersion`, `id`, `label`, `source`, `category`, `enabled`, and `remoteSafe`. Clients should ignore unknown fields, skip invalid descriptors, render unknown categories as advanced or other actions, and treat unknown presentation kinds as palette rows.
 
 Descriptor fields are advisory snapshots. The host remains authoritative and may omit actions that are unavailable, unsafe, too large, or unsupported by the client. Dynamic action ids are session-local unless a future descriptor explicitly documents stronger stability.
+
+Projected extension command, prompt template, and skill actions use session-local opaque ids. Descriptors include bounded display strings, source kind, source scope/origin, and a safe source label such as `"Project"`, `"User"`, `"Temporary"`, or `"Package"`. They do not include extension source paths, prompt file paths or bodies, skill file paths, skill base directories, or raw `sourceInfo`.
 
 #### invoke_ui_action
 

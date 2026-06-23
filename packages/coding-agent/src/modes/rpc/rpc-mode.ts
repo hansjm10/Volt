@@ -28,6 +28,7 @@ import {
 } from "../../core/output-guard.ts";
 import { projectSessionTranscript } from "../../core/rpc/transcript.ts";
 import type { RpcTransport } from "../../core/rpc/transport.ts";
+import { getUiActionDescriptors } from "../../core/rpc/ui-actions.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
@@ -671,7 +672,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			}
 
 			case "get_ui_actions": {
-				return success(id, "get_ui_actions", { actions: [] });
+				return success(id, "get_ui_actions", { actions: getUiActionDescriptors(session, command.scope) });
 			}
 
 			case "invoke_ui_action": {
