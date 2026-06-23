@@ -1252,6 +1252,20 @@ Concrete behavior:
 - The demo mock transport advertises the v1 action protocol and returns a safe mock palette action so local demo sessions exercise the discovery path.
 - Lifecycle tests cover initial connect/reconnect request ordering, successful capability/list loading, invalid descriptor skipping, unsupported-command fallback, session-change refresh, action-change refresh, and unchanged transcript loading behavior.
 
+## Resolved 2026-06-23: iOS Command Palette
+
+C.3 implementation exposes discovered descriptors through a native SwiftUI command palette while leaving response lifecycle handling to C.4.
+
+Concrete behavior:
+
+- The chat composer plus button opens a native command palette sheet backed by `VoltSession.uiActions`.
+- The palette is searchable and groups visible actions by category and source. Rows show action label, host description, source/category/slash badges, and source-specific icon/accent treatment so extension, prompt, skill, package, and built-in actions are visually distinct.
+- Loading, unsupported-host, action-list error, empty-list, and no-search-match states render native empty/loading views without affecting the transcript.
+- Rows are disabled when disconnected, host-disabled, or requiring argument fields the palette does not support. Host-provided `disabledReason` text is shown for host-disabled actions and disabled rows do not invoke.
+- Actions with no arguments, or with only optional arguments outside the single-string case, invoke directly without sending args. Actions whose only argument is a string prompt for text in a second native sheet and send the descriptor argument name as a string value.
+- `VoltSession.invokeUIAction` checks connected/enabled state before sending `invoke_ui_action`, omits empty argument objects, and appends a system message only if transport send fails. C.4 remains responsible for handling invocation responses and streaming-state transitions.
+- Tests cover session invocation encoding/disabled-action refusal and source-level UI affordances for the command palette, argument sheet, search, grouping/source display, disabled reasons, invocation modes, and invocation calls.
+
 ## Host Implementation Plan
 
 ### Phase A: Design and Inventory
