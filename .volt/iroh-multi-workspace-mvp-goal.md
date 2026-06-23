@@ -277,10 +277,10 @@ workspace-selection smoke, or explicitly document why that evidence is blocked.
     <evidence>Resolved workstation grants as persisted `allowedWorkspaces: []`, new pairings as wildcard, legacy active-client normalization on next successful authorization, and revoked tombstones as blocked/non-normalized; verification: `git diff --check -- .volt/iroh-multi-workspace-mvp-design.md` plus commit hook `npm run check`; commit 5ab055f7.</evidence>
   </item>
 
-  <item ref="A.2" status="open" prereq="" type="decision">
+  <item ref="A.2" status="resolved" prereq="" type="decision">
     <title>Finalize registration visibility for running hosts and stale workspace paths</title>
     <acceptance>The SPEC states whether `--register-workspace` is visible to a running host without restart, how pair-control and handshakes read current state, and how stale or deleted registered paths fail. The outcome mapping for stale paths is explicit.</acceptance>
-    <evidence></evidence>
+    <evidence>Resolved running-host registration as visible without restart via state-manager reads on future pair-control requests and handshakes; selected stale paths fail with `workspace_unavailable` and pair-control creates no ticket; verification: `git diff --check -- .volt/iroh-multi-workspace-mvp-design.md` plus commit hook `npm run check`; commit 1e1a4de8.</evidence>
   </item>
 
   <item ref="A.3" status="open" prereq="" type="decision">
