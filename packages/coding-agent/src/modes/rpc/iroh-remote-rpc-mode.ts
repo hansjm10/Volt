@@ -44,6 +44,7 @@ export function runIrohRemoteRpcMode(
 	options: IrohRemoteRpcModeOptions,
 ): Promise<void> {
 	return runRpcMode(runtimeHost, {
+		allowUiActionInvocation: false,
 		disposeRuntimeOnClose: options.disposeRuntimeOnClose,
 		onSessionChanged: options.onSessionChanged,
 		transport: createIrohRemoteFilteredRpcTransport({

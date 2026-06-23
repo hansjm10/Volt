@@ -1174,7 +1174,7 @@ Concrete behavior:
 - `RpcClientBase` exposes typed `getUiCapabilities()`, `getUiActions(scope?)`, and `invokeUiAction(action, options?)` helpers.
 - Local `runRpcMode` returns protocol v1 capabilities with only `ui_actions.v1` advertised, returns an empty `actions` array for `get_ui_actions`, and rejects `invoke_ui_action` with a normal RPC error until handlers exist.
 - `docs/rpc.md` documents the non-remote commands, descriptor shape, invocation response statuses, and security notes.
-- Iroh remote RPC remains allowlist-based and still rejects `get_ui_capabilities`, `get_ui_actions`, and `invoke_ui_action`; B.3 and B.5 own any future remote allowlist changes.
+- At the B.1 foundation step, Iroh remote RPC remained allowlist-based and did not yet forward UI action commands; B.3 and B.5 own remote allowlist changes.
 
 ## Resolved 2026-06-23: Dynamic Host Action Discovery
 
@@ -1202,6 +1202,19 @@ Concrete behavior:
 - Raw legacy/local RPC commands remain blocked over Iroh, including `get_messages`, `get_commands`, path-based `switch_session`, unrestricted model listing/selection, local tool RPC such as `bash`, and host file export RPC.
 - Remote action descriptor responses pass through the existing Iroh outbound sanitizer after descriptor-level sanitization. Workspace paths in descriptor-like string or path fields normalize to the remote workspace path, while dedicated redaction/omission rules still apply to known sensitive path fields.
 - `docs/rpc.md` and `docs/iroh-remote-protocol.md` document the remote discovery surface and the continued invocation/legacy-command boundary.
+
+## Resolved 2026-06-23: Prompt-Like Local Action Invocation
+
+B.4 implementation adds local `invoke_ui_action` support for the dynamic actions discovered in B.2 while keeping Iroh remote invocation disabled until B.5.
+
+Concrete behavior:
+
+- Local RPC capabilities now advertise `ui_action_invocation.v1`; Iroh remote RPC passes `allowUiActionInvocation: false`, so remote capabilities continue to advertise discovery only.
+- `invoke_ui_action` resolves the current dynamic action catalog and invokes extension command, prompt template, and skill actions by descriptor id.
+- Invocation supports one optional raw string argument named `arguments`. Unknown argument names or non-string `arguments` values are rejected with normal RPC errors.
+- Extension command actions invoke their slash alias through `AgentSession.prompt()` and return `handled` after prompt preflight succeeds, so synchronous command handlers do not require `agent_end`.
+- Prompt template and skill actions invoke through the same host prompt path used by raw slash compatibility. Idle invocations return `accepted`; streaming invocations require `streamingBehavior: "steer"` or `"followUp"` and return `queued` with `queuedAs`.
+- Dynamic ids now include an opaque per-session catalog token. The token changes when the current extension/prompt/skill catalog changes or when a new session object owns the catalog, so stale ids reject instead of silently invoking a different action at the same index.
 
 ## Host Implementation Plan
 

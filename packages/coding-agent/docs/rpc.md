@@ -271,7 +271,7 @@ Messages are `AgentMessage` objects (see [Message Types](#message-types)).
 
 Native UI action commands let typed clients discover host-owned actions for native cards, buttons, toggles, pickers, and command palettes. They are distinct from raw slash command strings: slash commands are presentation aliases, while action ids are the invocation contract.
 
-The current RPC implementation exposes the v1 protocol shape and sanitized palette descriptors for extension commands, prompt templates, and skills. It does not advertise invocation support yet, and `invoke_ui_action` returns a normal RPC error until action handlers are registered in later implementation phases. Iroh remote transports allow only the read-only discovery commands, `get_ui_capabilities` and `get_ui_actions`; remote `invoke_ui_action` remains blocked until invocation-time authorization exists.
+The current local RPC implementation exposes the v1 protocol shape, sanitized palette descriptors, and prompt-like invocation for extension commands, prompt templates, and skills. Iroh remote transports allow only the read-only discovery commands, `get_ui_capabilities` and `get_ui_actions`; remote `invoke_ui_action` remains blocked until invocation-time authorization exists.
 
 #### get_ui_capabilities
 
@@ -289,14 +289,14 @@ Response:
   "success": true,
   "data": {
     "protocolVersion": 1,
-    "features": ["ui_actions.v1"],
+    "features": ["ui_actions.v1", "ui_action_invocation.v1"],
     "maxActions": 200,
     "maxDescriptorBytes": 65536
   }
 }
 ```
 
-`ui_actions.v1` means the host understands `get_ui_actions` descriptors. Clients must only rely on features present in this list. `ui_action_invocation.v1` and `ui_action_completions.v1` are reserved for later support.
+`ui_actions.v1` means the host understands `get_ui_actions` descriptors. `ui_action_invocation.v1` means the host accepts `invoke_ui_action` for currently advertised actions. Clients must only rely on features present in this list. Iroh remote discovery currently omits `ui_action_invocation.v1`, and `ui_action_completions.v1` is reserved for later support.
 
 #### get_ui_actions
 
@@ -316,7 +316,7 @@ Example response:
     "actions": [
       {
         "schemaVersion": 1,
-        "id": "extension.command.ec_1",
+        "id": "extension.command.ec_a1b2c3d4e5f6_1",
         "label": "session-name",
         "description": "Set or clear session name",
         "source": "extension",
@@ -385,17 +385,17 @@ Invoke a native UI action by descriptor id.
 
 `args` is an optional object matching the descriptor's argument metadata. `streamingBehavior` is optional and may be `"steer"` or `"followUp"` when the descriptor allows queued invocation while the agent is streaming.
 
-Current response before invocation support is implemented:
+Unknown, stale, disabled, unauthorized, or unavailable action ids fail with the normal RPC error shape:
 ```json
 {
   "type": "response",
   "command": "invoke_ui_action",
   "success": false,
-  "error": "UI action invocation is not available yet"
+  "error": "UI action not available: prompt.template.pt_a1b2c3d4e5f6_1"
 }
 ```
 
-When invocation is supported, successful response data reports the command disposition:
+Successful response data reports the command disposition:
 
 ```json
 {
@@ -417,6 +417,12 @@ Possible statuses:
 - `"cancelled"`: the action was cancelled before execution.
 
 Only `accepted` and `queued` may require waiting for later agent events. Clients must clear pending UI immediately for `completed`, `handled`, `cancelled`, and RPC errors.
+
+For projected dynamic actions, invocation uses the host's existing prompt semantics:
+
+- Extension command actions invoke their registered slash command and return `handled` when the command handler completes. They do not require an `agent_end` event.
+- Prompt template and skill actions send their slash alias through host prompt expansion. While idle they return `accepted`; while the agent is streaming they require `streamingBehavior: "steer"` or `"followUp"` and return `queued`.
+- Dynamic action ids are opaque and tied to the current action catalog. After a reload, session replacement, or catalog change, clients must refresh descriptors; stale ids are rejected instead of being remapped to another action.
 
 #### Native UI Action Security
 

@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
-import type { ExtensionBindings } from "../src/core/agent-session.ts";
+import type { ExtensionBindings, PromptOptions } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import type { ResolvedCommand } from "../src/core/extensions/types.ts";
 import type { PromptTemplate } from "../src/core/prompt-templates.ts";
@@ -541,7 +541,7 @@ describe("createInProcessRpcClient", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
-	test("exposes native UI action discovery without invocation support", async () => {
+	test("exposes native UI action discovery and local invocation capability", async () => {
 		const dispose = vi.fn(async () => {});
 		const runtimeHost = createRuntimeHost(dispose);
 		const client = await createInProcessRpcClient(runtimeHost);
@@ -549,17 +549,14 @@ describe("createInProcessRpcClient", () => {
 		try {
 			await expect(client.getUiCapabilities()).resolves.toEqual({
 				protocolVersion: 1,
-				features: ["ui_actions.v1"],
+				features: ["ui_actions.v1", "ui_action_invocation.v1"],
 				maxActions: 200,
 				maxDescriptorBytes: 65_536,
 			});
 			await expect(client.getUiActions("all")).resolves.toEqual([]);
-			await expect(
-				client.invokeUiAction("review.uncommitted", {
-					args: {},
-					streamingBehavior: "followUp",
-				}),
-			).rejects.toThrow("UI action invocation is not available yet");
+			await expect(client.invokeUiAction("review.uncommitted", { args: {} })).rejects.toThrow(
+				"UI action not available: review.uncommitted",
+			);
 		} finally {
 			await client.stop();
 		}
@@ -610,10 +607,10 @@ describe("createInProcessRpcClient", () => {
 
 			expect(actions).toHaveLength(4);
 			expect(actions.map((action) => action.id)).toEqual([
-				"extension.command.ec_1",
-				"extension.command.ec_2",
-				"prompt.template.pt_1",
-				"skill.sk_1",
+				expect.stringMatching(/^extension\.command\.ec_[a-f0-9]{12}_1$/),
+				expect.stringMatching(/^extension\.command\.ec_[a-f0-9]{12}_2$/),
+				expect.stringMatching(/^prompt\.template\.pt_[a-f0-9]{12}_1$/),
+				expect.stringMatching(/^skill\.sk_[a-f0-9]{12}_1$/),
 			]);
 			expect(actions.map((action) => action.slash?.name)).toEqual([
 				"deploy:1",
@@ -649,6 +646,180 @@ describe("createInProcessRpcClient", () => {
 			await client.stop();
 		}
 		expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	test("invokes discovered extension, prompt template, and skill actions through prompt semantics", async () => {
+		const sourceInfo = createSourceInfo("/Users/jordan/project/.volt/agent/extensions/deploy.ts");
+		const prompt = vi.fn(async (_message: string, options?: PromptOptions) => {
+			options?.preflightResult?.(true);
+		});
+		const resources = {
+			commands: [createCommand("deploy", "deploy", "Deploy", sourceInfo)],
+			prompts: [
+				{
+					name: "fix-tests",
+					description: "Fix failing tests",
+					argumentHint: "failure output",
+					content: "Fix $ARGUMENTS",
+					filePath: "/Users/jordan/project/.volt/agent/prompts/fix-tests.md",
+					sourceInfo,
+				},
+			],
+			skills: [
+				{
+					name: "debugger",
+					description: "Debug issues",
+					filePath: "/Users/jordan/project/.volt/agent/skills/debugger/SKILL.md",
+					baseDir: "/Users/jordan/project/.volt/agent/skills/debugger",
+					sourceInfo,
+					disableModelInvocation: false,
+				},
+			],
+			prompt,
+		};
+		const dispose = vi.fn(async () => {});
+		const runtimeHost = createRuntimeHost(dispose, async () => {}, resources);
+		const client = await createInProcessRpcClient(runtimeHost);
+
+		try {
+			const actions = await client.getUiActions("all");
+			const extensionAction = actions.find((action) => action.source === "extension");
+			const promptAction = actions.find((action) => action.source === "prompt");
+			const skillAction = actions.find((action) => action.source === "skill");
+			if (!extensionAction || !promptAction || !skillAction) {
+				throw new Error("expected extension, prompt, and skill actions");
+			}
+
+			await expect(client.invokeUiAction(extensionAction.id, { args: { arguments: "prod" } })).resolves.toEqual({
+				action: extensionAction.id,
+				status: "handled",
+			});
+			await expect(
+				client.invokeUiAction(promptAction.id, { args: { arguments: "copy failing output" } }),
+			).resolves.toEqual({
+				action: promptAction.id,
+				status: "accepted",
+			});
+			await expect(client.invokeUiAction(skillAction.id, { args: { arguments: "inspect crash" } })).resolves.toEqual(
+				{
+					action: skillAction.id,
+					status: "accepted",
+				},
+			);
+
+			expect(prompt).toHaveBeenCalledTimes(3);
+			expect(prompt.mock.calls.map(([message]) => message)).toEqual([
+				"/deploy prod",
+				"/fix-tests copy failing output",
+				"/skill:debugger inspect crash",
+			]);
+			expect(prompt.mock.calls.map(([, options]) => options?.source)).toEqual(["rpc", "rpc", "rpc"]);
+			expect(prompt.mock.calls.map(([, options]) => options?.streamingBehavior)).toEqual([
+				undefined,
+				undefined,
+				undefined,
+			]);
+		} finally {
+			await client.stop();
+		}
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	test("queues prompt-like action invocation while streaming", async () => {
+		const sourceInfo = createSourceInfo("/Users/jordan/project/.volt/agent/prompts/fix-tests.md");
+		const prompt = vi.fn(async (_message: string, options?: PromptOptions) => {
+			options?.preflightResult?.(true);
+		});
+		const runtimeHost = createRuntimeHost(
+			vi.fn(async () => {}),
+			async () => {},
+			{
+				isStreaming: true,
+				prompts: [
+					{
+						name: "fix-tests",
+						description: "Fix failing tests",
+						argumentHint: "failure output",
+						content: "Fix $ARGUMENTS",
+						filePath: "/Users/jordan/project/.volt/agent/prompts/fix-tests.md",
+						sourceInfo,
+					},
+				],
+				prompt,
+			},
+		);
+		const client = await createInProcessRpcClient(runtimeHost);
+
+		try {
+			const [action] = await client.getUiActions("all");
+			if (!action) {
+				throw new Error("expected prompt action");
+			}
+			await expect(client.invokeUiAction(action.id, { args: { arguments: "after current turn" } })).rejects.toThrow(
+				"UI action requires streamingBehavior ('steer' or 'followUp') while the agent is streaming",
+			);
+			await expect(
+				client.invokeUiAction(action.id, {
+					args: { arguments: "after current turn" },
+					streamingBehavior: "followUp",
+				}),
+			).resolves.toEqual({
+				action: action.id,
+				status: "queued",
+				queuedAs: "followUp",
+			});
+
+			expect(prompt).toHaveBeenCalledOnce();
+			expect(prompt).toHaveBeenCalledWith(
+				"/fix-tests after current turn",
+				expect.objectContaining({ source: "rpc", streamingBehavior: "followUp" }),
+			);
+		} finally {
+			await client.stop();
+		}
+	});
+
+	test("rejects stale UI action ids after the catalog changes", async () => {
+		const sourceInfo = createSourceInfo("/Users/jordan/project/.volt/agent/extensions/deploy.ts");
+		const prompt = vi.fn(async (_message: string, options?: PromptOptions) => {
+			options?.preflightResult?.(true);
+		});
+		const resources = {
+			commands: [createCommand("deploy", "deploy", "Deploy", sourceInfo)],
+			prompt,
+		};
+		const runtimeHost = createRuntimeHost(
+			vi.fn(async () => {}),
+			async () => {},
+			resources,
+		);
+		const client = await createInProcessRpcClient(runtimeHost);
+
+		try {
+			const [staleAction] = await client.getUiActions("all");
+			if (!staleAction) {
+				throw new Error("expected extension action");
+			}
+			resources.commands.splice(0, 1, createCommand("release", "release", "Release", sourceInfo));
+
+			await expect(client.invokeUiAction(staleAction.id, { args: { arguments: "prod" } })).rejects.toThrow(
+				`UI action not available: ${staleAction.id}`,
+			);
+
+			const [freshAction] = await client.getUiActions("all");
+			if (!freshAction) {
+				throw new Error("expected refreshed extension action");
+			}
+			expect(freshAction.id).not.toBe(staleAction.id);
+			await expect(client.invokeUiAction(freshAction.id, { args: { arguments: "prod" } })).resolves.toEqual({
+				action: freshAction.id,
+				status: "handled",
+			});
+			expect(prompt).toHaveBeenCalledOnce();
+			expect(prompt).toHaveBeenCalledWith("/release prod", expect.objectContaining({ source: "rpc" }));
+		} finally {
+			await client.stop();
+		}
 	});
 
 	test("sends extension UI responses from in-process clients", async () => {
@@ -757,6 +928,8 @@ function createRuntimeHost(
 	bindExtensions: (bindings: ExtensionBindings) => Promise<void> = async () => {},
 	resources: {
 		commands?: ResolvedCommand[];
+		isStreaming?: boolean;
+		prompt?: (message: string, options?: PromptOptions) => Promise<void>;
 		prompts?: PromptTemplate[];
 		skills?: Skill[];
 	} = {},
@@ -770,7 +943,7 @@ function createRuntimeHost(
 			},
 			model: undefined,
 			thinkingLevel: "off",
-			isStreaming: false,
+			isStreaming: resources.isStreaming ?? false,
 			isCompacting: false,
 			steeringMode: "one-at-a-time",
 			followUpMode: "one-at-a-time",
@@ -780,6 +953,11 @@ function createRuntimeHost(
 			autoCompactionEnabled: true,
 			messages: [],
 			pendingMessageCount: 0,
+			prompt:
+				resources.prompt ??
+				vi.fn(async (_message: string, options?: PromptOptions) => {
+					options?.preflightResult?.(true);
+				}),
 			extensionRunner: {
 				getRegisteredCommands: vi.fn(() => resources.commands ?? []),
 			},

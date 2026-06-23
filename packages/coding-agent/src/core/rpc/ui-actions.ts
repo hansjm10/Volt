@@ -1,9 +1,17 @@
+import { randomBytes } from "node:crypto";
 import type { ResolvedCommand } from "../extensions/types.ts";
 import type { PromptTemplate } from "../prompt-templates.ts";
 import type { ResourceLoader } from "../resource-loader.ts";
 import type { Skill } from "../skills.ts";
 import type { SourceInfo } from "../source-info.ts";
-import type { UiActionArgumentDescriptor, UiActionDescriptor, UiActionListScope } from "./types.ts";
+import type {
+	UiActionArgumentDescriptor,
+	UiActionDescriptor,
+	UiActionInvocationQueueBehavior,
+	UiActionInvocationResponse,
+	UiActionListScope,
+	UiActionStreamingBehavior,
+} from "./types.ts";
 
 const MAX_ACTIONS = 200;
 const MAX_LABEL_LENGTH = 80;
@@ -20,6 +28,25 @@ export interface UiActionDiscoverySession {
 	resourceLoader: Pick<ResourceLoader, "getSkills">;
 }
 
+export interface UiActionInvocationPlan {
+	promptText: string;
+	promptStreamingBehavior?: UiActionInvocationQueueBehavior;
+	response: UiActionInvocationResponse;
+}
+
+interface UiActionCatalogState {
+	fingerprint: string;
+	token: string;
+}
+
+interface UiActionCatalogEntry {
+	descriptor: UiActionDescriptor;
+	promptName: string;
+	source: "extension" | "prompt" | "skill";
+}
+
+const catalogStates = new WeakMap<UiActionDiscoverySession, UiActionCatalogState>();
+
 export function getUiActionDescriptors(
 	session: UiActionDiscoverySession,
 	scope?: UiActionListScope,
@@ -28,90 +55,264 @@ export function getUiActionDescriptors(
 		return [];
 	}
 
+	return getUiActionCatalog(session).map((entry) => entry.descriptor);
+}
+
+export function createUiActionInvocationPlan(
+	session: UiActionDiscoverySession & { isStreaming: boolean },
+	options: {
+		action: string;
+		args?: unknown;
+		streamingBehavior?: unknown;
+	},
+): UiActionInvocationPlan {
+	if (typeof options.action !== "string" || options.action.length === 0) {
+		throw new Error("UI action id must be a non-empty string");
+	}
+
+	const entry = getUiActionCatalog(session).find((candidate) => candidate.descriptor.id === options.action);
+	if (!entry) {
+		throw new Error(`UI action not available: ${options.action}`);
+	}
+	if (!entry.descriptor.enabled) {
+		throw new Error(entry.descriptor.disabledReason ?? `UI action is disabled: ${options.action}`);
+	}
+
+	const rawArguments = getRawArguments(options.args);
+	const promptText = createPromptText(entry.promptName, rawArguments);
+	if (entry.source === "extension") {
+		return {
+			promptText,
+			response: {
+				action: entry.descriptor.id,
+				status: "handled",
+			},
+		};
+	}
+
+	if (!session.isStreaming) {
+		return {
+			promptText,
+			response: {
+				action: entry.descriptor.id,
+				status: "accepted",
+			},
+		};
+	}
+
+	const streamingBehavior = getQueueBehavior(options.streamingBehavior, entry.descriptor.streamingBehavior);
+	return {
+		promptText,
+		promptStreamingBehavior: streamingBehavior,
+		response: {
+			action: entry.descriptor.id,
+			status: "queued",
+			queuedAs: streamingBehavior,
+		},
+	};
+}
+
+function getUiActionCatalog(session: UiActionDiscoverySession): UiActionCatalogEntry[] {
+	const token = getCatalogToken(session);
 	const extensionActions = session.extensionRunner
 		.getRegisteredCommands()
-		.map((command, index) => createExtensionCommandAction(command, index));
-	const promptActions = session.promptTemplates.map((template, index) => createPromptTemplateAction(template, index));
+		.map((command, index) => createExtensionCommandAction(command, index, token));
+	const promptActions = session.promptTemplates.map((template, index) =>
+		createPromptTemplateAction(template, index, token),
+	);
 	const skillActions = session.resourceLoader
 		.getSkills()
-		.skills.map((skill, index) => createSkillAction(skill, index));
+		.skills.map((skill, index) => createSkillAction(skill, index, token));
 
 	return [...extensionActions, ...promptActions, ...skillActions].slice(0, MAX_ACTIONS);
 }
 
-function createExtensionCommandAction(command: ResolvedCommand, index: number): UiActionDescriptor {
+function createExtensionCommandAction(command: ResolvedCommand, index: number, token: string): UiActionCatalogEntry {
 	const label = boundedDisplayString(command.invocationName, MAX_LABEL_LENGTH) ?? "Extension command";
 	return {
-		schemaVersion: 1,
-		id: `extension.command.${opaqueId("ec", index)}`,
-		label,
-		description: boundedDisplayString(command.description, MAX_DESCRIPTION_LENGTH),
+		promptName: command.invocationName,
 		source: "extension",
-		...safeSourceFields(command.sourceInfo),
-		category: "extension",
-		presentation: { kind: "palette", group: "Extensions" },
-		args: [rawArgumentsDescriptor(command.getArgumentCompletions ? "commandArguments" : undefined)],
-		enabled: true,
-		disabledReason: null,
-		destructive: false,
-		requiresConfirmation: false,
-		streamingBehavior: "immediate",
-		remoteSafe: true,
-		slash: {
-			name: command.invocationName,
-			example: `/${command.invocationName}`,
+		descriptor: {
+			schemaVersion: 1,
+			id: `extension.command.${opaqueId("ec", token, index)}`,
+			label,
+			description: boundedDisplayString(command.description, MAX_DESCRIPTION_LENGTH),
+			source: "extension",
+			...safeSourceFields(command.sourceInfo),
+			category: "extension",
+			presentation: { kind: "palette", group: "Extensions" },
+			args: [rawArgumentsDescriptor(command.getArgumentCompletions ? "commandArguments" : undefined)],
+			enabled: true,
+			disabledReason: null,
+			destructive: false,
+			requiresConfirmation: false,
+			streamingBehavior: "immediate",
+			remoteSafe: true,
+			slash: {
+				name: command.invocationName,
+				example: `/${command.invocationName}`,
+			},
 		},
 	};
 }
 
-function createPromptTemplateAction(template: PromptTemplate, index: number): UiActionDescriptor {
+function createPromptTemplateAction(template: PromptTemplate, index: number, token: string): UiActionCatalogEntry {
 	const label = boundedDisplayString(template.name, MAX_LABEL_LENGTH) ?? "Prompt template";
 	return {
-		schemaVersion: 1,
-		id: `prompt.template.${opaqueId("pt", index)}`,
-		label,
-		description: boundedDisplayString(template.description, MAX_DESCRIPTION_LENGTH),
+		promptName: template.name,
 		source: "prompt",
-		...safeSourceFields(template.sourceInfo),
-		category: "prompt",
-		presentation: { kind: "palette", group: "Prompts" },
-		args: [rawArgumentsDescriptor(undefined, template.argumentHint)],
-		enabled: true,
-		disabledReason: null,
-		destructive: false,
-		requiresConfirmation: false,
-		streamingBehavior: ["queueSteer", "queueFollowUp"],
-		remoteSafe: true,
-		slash: {
-			name: template.name,
-			example: `/${template.name}`,
+		descriptor: {
+			schemaVersion: 1,
+			id: `prompt.template.${opaqueId("pt", token, index)}`,
+			label,
+			description: boundedDisplayString(template.description, MAX_DESCRIPTION_LENGTH),
+			source: "prompt",
+			...safeSourceFields(template.sourceInfo),
+			category: "prompt",
+			presentation: { kind: "palette", group: "Prompts" },
+			args: [rawArgumentsDescriptor(undefined, template.argumentHint)],
+			enabled: true,
+			disabledReason: null,
+			destructive: false,
+			requiresConfirmation: false,
+			streamingBehavior: ["queueSteer", "queueFollowUp"],
+			remoteSafe: true,
+			slash: {
+				name: template.name,
+				example: `/${template.name}`,
+			},
 		},
 	};
 }
 
-function createSkillAction(skill: Skill, index: number): UiActionDescriptor {
+function createSkillAction(skill: Skill, index: number, token: string): UiActionCatalogEntry {
 	const label = boundedDisplayString(skill.name, MAX_LABEL_LENGTH) ?? "Skill";
 	return {
-		schemaVersion: 1,
-		id: `skill.${opaqueId("sk", index)}`,
-		label,
-		description: boundedDisplayString(skill.description, MAX_DESCRIPTION_LENGTH),
+		promptName: `skill:${skill.name}`,
 		source: "skill",
-		...safeSourceFields(skill.sourceInfo),
-		category: "skill",
-		presentation: { kind: "palette", group: "Skills" },
-		args: [rawArgumentsDescriptor()],
-		enabled: true,
-		disabledReason: null,
-		destructive: false,
-		requiresConfirmation: false,
-		streamingBehavior: ["queueSteer", "queueFollowUp"],
-		remoteSafe: true,
-		slash: {
-			name: `skill:${skill.name}`,
-			example: `/skill:${skill.name}`,
+		descriptor: {
+			schemaVersion: 1,
+			id: `skill.${opaqueId("sk", token, index)}`,
+			label,
+			description: boundedDisplayString(skill.description, MAX_DESCRIPTION_LENGTH),
+			source: "skill",
+			...safeSourceFields(skill.sourceInfo),
+			category: "skill",
+			presentation: { kind: "palette", group: "Skills" },
+			args: [rawArgumentsDescriptor()],
+			enabled: true,
+			disabledReason: null,
+			destructive: false,
+			requiresConfirmation: false,
+			streamingBehavior: ["queueSteer", "queueFollowUp"],
+			remoteSafe: true,
+			slash: {
+				name: `skill:${skill.name}`,
+				example: `/skill:${skill.name}`,
+			},
 		},
 	};
+}
+
+function getCatalogToken(session: UiActionDiscoverySession): string {
+	const fingerprint = getCatalogFingerprint(session);
+	const existing = catalogStates.get(session);
+	if (existing?.fingerprint === fingerprint) {
+		return existing.token;
+	}
+	const next = {
+		fingerprint,
+		token: randomBytes(6).toString("hex"),
+	};
+	catalogStates.set(session, next);
+	return next.token;
+}
+
+function getCatalogFingerprint(session: UiActionDiscoverySession): string {
+	return JSON.stringify({
+		commands: session.extensionRunner.getRegisteredCommands().map((command) => ({
+			description: command.description,
+			invocationName: command.invocationName,
+			name: command.name,
+			sourceInfo: sourceFingerprint(command.sourceInfo),
+		})),
+		prompts: session.promptTemplates.map((template) => ({
+			argumentHint: template.argumentHint,
+			content: template.content,
+			description: template.description,
+			filePath: template.filePath,
+			name: template.name,
+			sourceInfo: sourceFingerprint(template.sourceInfo),
+		})),
+		skills: session.resourceLoader.getSkills().skills.map((skill) => ({
+			baseDir: skill.baseDir,
+			description: skill.description,
+			disableModelInvocation: skill.disableModelInvocation,
+			filePath: skill.filePath,
+			name: skill.name,
+			sourceInfo: sourceFingerprint(skill.sourceInfo),
+		})),
+	});
+}
+
+function sourceFingerprint(sourceInfo: SourceInfo): Record<string, string | undefined> {
+	return {
+		baseDir: sourceInfo.baseDir,
+		origin: sourceInfo.origin,
+		path: sourceInfo.path,
+		scope: sourceInfo.scope,
+		source: sourceInfo.source,
+	};
+}
+
+function getRawArguments(args: unknown): string {
+	if (args === undefined) {
+		return "";
+	}
+	if (typeof args !== "object" || args === null || Array.isArray(args)) {
+		throw new Error("UI action args must be an object");
+	}
+	const record = args as Record<string, unknown>;
+	const unknownKeys = Object.keys(record).filter((key) => key !== "arguments");
+	if (unknownKeys.length > 0) {
+		throw new Error(`Unsupported UI action argument: ${unknownKeys[0]}`);
+	}
+	const value = record.arguments;
+	if (value === undefined || value === null) {
+		return "";
+	}
+	if (typeof value !== "string") {
+		throw new Error('UI action argument "arguments" must be a string');
+	}
+	return value;
+}
+
+function createPromptText(promptName: string, rawArguments: string): string {
+	return rawArguments.length > 0 ? `/${promptName} ${rawArguments}` : `/${promptName}`;
+}
+
+function getQueueBehavior(
+	requested: unknown,
+	allowed: UiActionDescriptor["streamingBehavior"],
+): UiActionInvocationQueueBehavior {
+	if (requested !== "steer" && requested !== "followUp") {
+		throw new Error("UI action requires streamingBehavior ('steer' or 'followUp') while the agent is streaming");
+	}
+	const requiredBehavior = requested === "steer" ? "queueSteer" : "queueFollowUp";
+	if (!streamingBehaviorIncludes(allowed, requiredBehavior)) {
+		throw new Error(`UI action cannot be queued as ${requested}`);
+	}
+	return requested;
+}
+
+function streamingBehaviorIncludes(
+	allowed: UiActionDescriptor["streamingBehavior"],
+	behavior: UiActionStreamingBehavior,
+): boolean {
+	if (Array.isArray(allowed)) {
+		return allowed.includes(behavior);
+	}
+	return allowed === behavior;
 }
 
 function rawArgumentsDescriptor(
@@ -154,8 +355,8 @@ function getSafeSourceLabel(sourceInfo: SourceInfo): string {
 	}
 }
 
-function opaqueId(prefix: string, index: number): string {
-	return `${prefix}_${(index + 1).toString(36)}`;
+function opaqueId(prefix: string, token: string, index: number): string {
+	return `${prefix}_${token}_${(index + 1).toString(36)}`;
 }
 
 function boundedDisplayString(value: string | undefined, maxLength: number): string | undefined {

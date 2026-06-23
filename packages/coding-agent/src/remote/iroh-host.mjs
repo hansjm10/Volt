@@ -728,16 +728,41 @@ function createRemoteHostMetadata(authorization, options) {
 }
 
 function decorateRemoteHostState(value, authorization, options) {
+	const decoratedValue = decorateRemoteUiActionCapabilities(value);
+	if (
+		typeof decoratedValue !== "object" ||
+		decoratedValue === null ||
+		Array.isArray(decoratedValue) ||
+		decoratedValue.type !== "response" ||
+		decoratedValue.command !== "get_state" ||
+		decoratedValue.success !== true ||
+		typeof decoratedValue.data !== "object" ||
+		decoratedValue.data === null ||
+		Array.isArray(decoratedValue.data)
+	) {
+		return decoratedValue;
+	}
+	return {
+		...decoratedValue,
+		data: {
+			...decoratedValue.data,
+			remoteHost: createRemoteHostMetadata(authorization, options),
+		},
+	};
+}
+
+function decorateRemoteUiActionCapabilities(value) {
 	if (
 		typeof value !== "object" ||
 		value === null ||
 		Array.isArray(value) ||
 		value.type !== "response" ||
-		value.command !== "get_state" ||
+		value.command !== "get_ui_capabilities" ||
 		value.success !== true ||
 		typeof value.data !== "object" ||
 		value.data === null ||
-		Array.isArray(value.data)
+		Array.isArray(value.data) ||
+		!Array.isArray(value.data.features)
 	) {
 		return value;
 	}
@@ -745,7 +770,7 @@ function decorateRemoteHostState(value, authorization, options) {
 		...value,
 		data: {
 			...value.data,
-			remoteHost: createRemoteHostMetadata(authorization, options),
+			features: value.data.features.filter((feature) => feature !== "ui_action_invocation.v1"),
 		},
 	};
 }

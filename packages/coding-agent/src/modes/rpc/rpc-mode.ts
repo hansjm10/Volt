@@ -28,7 +28,7 @@ import {
 } from "../../core/output-guard.ts";
 import { projectSessionTranscript } from "../../core/rpc/transcript.ts";
 import type { RpcTransport } from "../../core/rpc/transport.ts";
-import { getUiActionDescriptors } from "../../core/rpc/ui-actions.ts";
+import { createUiActionInvocationPlan, getUiActionDescriptors } from "../../core/rpc/ui-actions.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
@@ -72,12 +72,14 @@ export type {
 	UiActionStreamingBehavior,
 } from "./rpc-types.ts";
 
-const UI_ACTION_CAPABILITIES: UiActionCapabilities = {
-	protocolVersion: 1,
-	features: ["ui_actions.v1"],
-	maxActions: 200,
-	maxDescriptorBytes: 65_536,
-};
+function getUiActionCapabilities(invocationEnabled: boolean): UiActionCapabilities {
+	return {
+		protocolVersion: 1,
+		features: invocationEnabled ? ["ui_actions.v1", "ui_action_invocation.v1"] : ["ui_actions.v1"],
+		maxActions: 200,
+		maxDescriptorBytes: 65_536,
+	};
+}
 
 export interface RpcSessionChange {
 	sessionFile?: string;
@@ -94,6 +96,8 @@ export interface RpcModeOptions {
 	onSessionChanged?: (session: RpcSessionChange) => void | Promise<void>;
 	/** Called after initial startup has completed and the RPC transport is accepting commands. */
 	onReady?: () => void;
+	/** Defaults to true. Remote transports can disable this until their action allowlist is widened. */
+	allowUiActionInvocation?: boolean;
 }
 
 type RpcModeStartupAwareTransport = RpcTransport & {
@@ -140,6 +144,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	}
 	const shouldExitProcess = options.exitProcess ?? !options.transport;
 	const shouldDisposeRuntimeOnClose = options.disposeRuntimeOnClose ?? true;
+	const allowUiActionInvocation = options.allowUiActionInvocation ?? true;
 	const shouldRestoreStdout = !options.transport && !shouldExitProcess;
 	const transport = options.transport ?? createStdioRpcTransport();
 	const startupAwareTransport = transport as RpcModeStartupAwareTransport;
@@ -668,7 +673,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			// =================================================================
 
 			case "get_ui_capabilities": {
-				return success(id, "get_ui_capabilities", UI_ACTION_CAPABILITIES);
+				return success(id, "get_ui_capabilities", getUiActionCapabilities(allowUiActionInvocation));
 			}
 
 			case "get_ui_actions": {
@@ -676,7 +681,32 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			}
 
 			case "invoke_ui_action": {
-				return error(id, "invoke_ui_action", "UI action invocation is not available yet");
+				if (!allowUiActionInvocation) {
+					return error(id, "invoke_ui_action", "UI action invocation is not available over this RPC transport");
+				}
+				const invocation = createUiActionInvocationPlan(session, {
+					action: command.action,
+					args: command.args,
+					streamingBehavior: command.streamingBehavior,
+				});
+				let preflightSucceeded = false;
+				void session
+					.prompt(invocation.promptText, {
+						streamingBehavior: invocation.promptStreamingBehavior,
+						source: "rpc",
+						preflightResult: (didSucceed) => {
+							if (didSucceed) {
+								preflightSucceeded = true;
+								output(success(id, "invoke_ui_action", invocation.response));
+							}
+						},
+					})
+					.catch((e) => {
+						if (!preflightSucceeded) {
+							output(error(id, "invoke_ui_action", e.message));
+						}
+					});
+				return undefined;
 			}
 
 			// =================================================================
