@@ -280,7 +280,7 @@ and recorded without overclaiming.
   <item ref="A.3" status="resolved" prereq="A.1,A.2" type="decision">
     <title>Define invocation semantics for synchronous, prompt-like, queued, and state actions</title>
     <acceptance>The design document defines `invoke_ui_action` response semantics, including `accepted`, `completed`, `queued`, `handled`, and `cancelled` statuses; how prompt-like actions relate to `agent_end`; how synchronous actions clear pending UI without waiting for agent events; how invocation behaves while streaming; and how stale enabled state is rechecked by the host. Tests expected in later items are named.</acceptance>
-    <evidence>Resolved 2026-06-23: design documents `invoke_ui_action` response statuses, `agent_end` waiting rules, synchronous pending-state clearing, descriptor streaming policy, host-side stale enabled rechecks, and later host/Iroh/iOS test names; verified with `git diff --check -- .volt/ios-native-remote-ui-actions-design.md .volt/ios-native-remote-ui-actions-goal.md` and pre-commit `npm run check`; commit pending.</evidence>
+    <evidence>Resolved 2026-06-23: design documents `invoke_ui_action` response statuses, `agent_end` waiting rules, synchronous pending-state clearing, descriptor streaming policy, host-side stale enabled rechecks, and later host/Iroh/iOS test names; verified with `git diff --check -- .volt/ios-native-remote-ui-actions-design.md .volt/ios-native-remote-ui-actions-goal.md` and pre-commit `npm run check`; commit 13e7b9ea8277860ed71a88154d02c0710382574d.</evidence>
   </item>
 
   <item ref="A.4" status="open" prereq="A.1" type="decision">
