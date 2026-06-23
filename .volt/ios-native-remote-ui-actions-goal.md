@@ -367,10 +367,10 @@ and recorded without overclaiming.
     <evidence>Resolved 2026-06-23: migrated `session.new`, `run.cancel`, `context.compact`, and `session.rename` into the shared host action registry with descriptors, availability, argument validation, and slash aliases where applicable; routed TUI `/clear`, `/compact`, and `/name`, plus RPC `new_session`, `abort`, `compact`, `set_session_name`, and built-in `invoke_ui_action` through shared helpers; exposed exact remote-safe built-in actions `session.new` and `run.cancel` over Iroh while keeping `context.compact` and `session.rename` local-only; documented action ids and aliases. Verified with `node node_modules/vitest/dist/cli.js --run test/host-actions.test.ts test/rpc-transport-client.test.ts test/remote-iroh-core.test.ts` from `packages/coding-agent`, `npm run iroh:poc:test`, `npm run check`, `git diff --check`, and pre-commit `npm run check`; Volt commit 63fc27da3c226033816d2d789e71accdaa885696.</evidence>
   </item>
 
-  <item ref="D.3" status="open" prereq="D.1,A.5">
+  <item ref="D.3" status="resolved" prereq="D.1,A.5">
     <title>Refactor review workflows into shared native actions</title>
     <acceptance>Review actions decided in A.5 are registered with descriptors and handlers; TUI `/review ...` aliases continue to work; iOS-visible descriptors include card presentation metadata; host-side review behavior remains authoritative for git/gh inspection, model choice, tool setup, and session behavior; tests cover at least one review action through both TUI alias or core parser and RPC action invocation. If full review execution requires credentials or environment, blocked/partial evidence is recorded.</acceptance>
-    <evidence></evidence>
+    <evidence>Resolved 2026-06-23: registered `review.uncommitted` and `review.branch` as shared built-in card actions with remote-safe descriptors, TUI `/review` routing, RPC workflow invocation, remote confirmation/read-only-tool policy, and Iroh allowlist coverage while keeping PR/commit/tools local-only; verified with `node node_modules/vitest/dist/cli.js --run test/host-actions.test.ts test/rpc-transport-client.test.ts test/remote-iroh-core.test.ts test/suite/review.test.ts` from `packages/coding-agent`, `npm run iroh:poc:test`, `npm run check`, `git diff --check`, and pre-commit `npm run check`; Volt commit 0af1ef23e539a4f9fdf61a796233adb07c45a116.</evidence>
   </item>
 
   <item ref="D.4" status="open" prereq="D.1,A.4">
