@@ -283,10 +283,10 @@ workspace-selection smoke, or explicitly document why that evidence is blocked.
     <evidence>Resolved running-host registration as visible without restart via state-manager reads on future pair-control requests and handshakes; selected stale paths fail with `workspace_unavailable` and pair-control creates no ticket; verification: `git diff --check -- .volt/iroh-multi-workspace-mvp-design.md` plus commit hook `npm run check`; commit 1e1a4de8.</evidence>
   </item>
 
-  <item ref="A.3" status="open" prereq="" type="decision">
+  <item ref="A.3" status="resolved" prereq="" type="decision">
     <title>Finalize app workspace-selection UX for idle, connected, streaming, and offline states</title>
     <acceptance>The SPEC states whether picker changes auto-reconnect, when selection is disabled or confirmed, what happens while streaming, and how offline or workspace_unavailable states preserve selected workspace. The decision is concrete enough for app implementation.</acceptance>
-    <evidence></evidence>
+    <evidence>Resolved Settings picker as saved workspace names only, disabled while streaming/connecting, auto-reconnect for safe idle and workspace-specific failure states, offline selection as local persistence until Retry, and selected workspace preservation across failures; verification: `git diff --check -- .volt/iroh-multi-workspace-mvp-design.md` plus commit hook `npm run check`; commit b23a59f5.</evidence>
   </item>
 </group>
 
