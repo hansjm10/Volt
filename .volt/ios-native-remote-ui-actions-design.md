@@ -298,6 +298,7 @@ type UiActionCategory = "review" | "session" | "model" | "context" | "extension"
 type UiActionPresentationKind = "card" | "button" | "toggle" | "picker" | "palette" | "detail" | "hidden";
 type UiActionArgumentType = "string" | "boolean" | "enum" | "integer";
 type UiActionStateType = "boolean" | "string" | "enum" | "integer";
+type UiActionStreamingBehavior = "disabled" | "immediate" | "queueSteer" | "queueFollowUp";
 type UiActionScalar = string | number | boolean | null;
 
 interface UiActionDescriptor {
@@ -317,6 +318,7 @@ interface UiActionDescriptor {
   disabledReason?: string | null;
   destructive?: boolean;
   requiresConfirmation?: boolean;
+  streamingBehavior?: UiActionStreamingBehavior | UiActionStreamingBehavior[];
   remoteSafe: boolean;
   slash?: UiActionSlashAlias;
 }
@@ -365,6 +367,7 @@ Field rules:
 - `args` describes the data shape the app may collect. The first implementation may support only a single optional string argument, but descriptors should use this shape so later forms remain compatible.
 - `state` is a display snapshot for toggles, pickers, or selected values. Host state remains authoritative and must be refreshed after invocation, reconnect, or `ui_action_state_changed`.
 - `destructive` and `requiresConfirmation` default to `false` when omitted. The host may still require confirmation or reject an action at invocation time.
+- `streamingBehavior` describes what the host may do if the action is invoked while an agent turn is already streaming. Omitted means `disabled`. Multiple values mean the client may select between allowed queue modes when invoking.
 - `remoteSafe` describes whether the action may be shown to a remote client after filtering. It is not an authorization grant.
 - `slash` is an alias/presentation hint only. Clients must not treat slash text as the canonical action id.
 
@@ -383,6 +386,7 @@ Compatibility rules:
 - Clients must ignore unknown descriptor fields.
 - Clients should skip descriptors missing required fields or containing invalid required field types.
 - Clients must tolerate unknown `source`, `category`, `presentation.kind`, argument type, and state type values. Unknown categories render in an advanced/other group; unknown presentation kinds render as palette rows; unknown argument types make the action non-invokable from generated forms.
+- Clients must ignore unknown `streamingBehavior` values. If no known streaming behavior remains and the agent is streaming, the action should render disabled until actions refresh.
 - Hosts must reject unknown, stale, disabled, unauthorized, or not-remote-safe action ids at invocation time with the normal RPC error shape.
 - Descriptors are advisory snapshots. Hosts must re-check availability, streaming state, project trust, remote policy, and authorization when `invoke_ui_action` is received.
 - Hosts may omit actions that are unavailable, unsafe, too large, or unsupported by the requesting client capabilities.
@@ -582,7 +586,37 @@ As with prompt templates, the host expands the skill. The remote descriptor shou
 
 ## Invocation Response Semantics
 
-`invoke_ui_action` should behave like `prompt` in that the response reports acceptance or immediate failure, not necessarily final workflow completion.
+`invoke_ui_action` response data reports the command disposition, not necessarily final workflow completion. Prompt-like actions keep the existing `prompt` contract: the RPC response means the host accepted the request after preflight, and the normal agent event stream reports the turn lifecycle.
+
+Request shape:
+
+```ts
+interface InvokeUiActionCommand {
+  action: string;
+  args?: Record<string, unknown>;
+  streamingBehavior?: "steer" | "followUp";
+}
+```
+
+Response data shape:
+
+```ts
+type UiActionInvocationStatus =
+  | "accepted"
+  | "completed"
+  | "queued"
+  | "handled"
+  | "cancelled";
+
+interface UiActionInvocationResponse {
+  action: string;
+  status: UiActionInvocationStatus;
+  queuedAs?: "steer" | "followUp";
+  stateChanged?: boolean;
+  actionsChanged?: boolean;
+  message?: string;
+}
+```
 
 Example accepted response:
 
@@ -601,13 +635,26 @@ Example accepted response:
 
 Possible statuses:
 
-- `accepted`: action accepted and may produce async events.
-- `completed`: action finished synchronously.
-- `queued`: action was queued for later delivery.
-- `handled`: action was handled without starting an agent turn.
-- `cancelled`: user or extension cancelled before execution.
+- `accepted`: a prompt-like action was accepted while idle and will produce normal agent events. iOS should enter or keep streaming UI state and clear action pending state only when the turn reaches `agent_end`, fails, or the connection recovery path replaces the session state.
+- `queued`: a prompt-like action was accepted while another turn is streaming. `queuedAs` names whether the host queued it as a `steer` or `followUp`. iOS should clear the tap/send pending spinner on the response, keep the current streaming state, and rely on `queue_update` plus later agent events for queue visibility and completion.
+- `completed`: the action finished synchronously and no agent events are expected. iOS should clear pending UI immediately and apply any returned state or refresh hints.
+- `handled`: the host, an extension command, or an input hook handled the action without starting an agent turn. No `agent_end` is expected; iOS should clear pending UI immediately.
+- `cancelled`: the action was cancelled before execution by the user, host, or extension. No `agent_end` is expected; iOS should clear pending UI immediately.
 
-If an action starts an agent turn, normal agent events continue streaming. If an action only changes state, the app should rely on response data plus state/action change events.
+Only `accepted` and `queued` may require waiting for later agent events after the RPC response. `completed`, `handled`, and `cancelled` are terminal for the invocation response itself. Clients must not use a `promptAndWait`-style `agent_end` wait for terminal synchronous statuses because extension/input-hook handling can intentionally produce no agent turn.
+
+Synchronous state actions return `completed` with `stateChanged`, `actionsChanged`, or bounded response data when useful. If the response says actions changed, iOS should refresh `get_ui_actions`; if it says state changed, iOS should refresh `get_state` unless the response already contains the new state shape for the specific action.
+
+While the agent is streaming, the host rechecks the current action descriptor and handler policy before invocation:
+
+- `disabled`: reject with a normal RPC error.
+- `immediate`: execute now and return `completed`, `handled`, or `cancelled`.
+- `queueSteer`: enqueue as steering and return `queued` with `queuedAs: "steer"`.
+- `queueFollowUp`: enqueue as a follow-up and return `queued` with `queuedAs: "followUp"`.
+
+If a descriptor allows both queue modes, the optional `streamingBehavior` request field selects the mode. If a prompt-like action has no streaming policy and the agent is already streaming, the host rejects it instead of guessing.
+
+The host must never trust cached client availability. On every invocation it resolves the action id against the current registry, applies the Iroh/local allowlist, validates arguments, rechecks `enabled`, `remoteSafe`, trust, session state, and streaming policy, then executes the current handler. Unknown, stale, disabled, local-only, or disallowed actions fail with the normal RPC error shape even if an older descriptor advertised them as enabled.
 
 Errors should use normal RPC error shape:
 
@@ -620,6 +667,13 @@ Errors should use normal RPC error shape:
   "error": "Action not available while the agent is streaming"
 }
 ```
+
+Expected later tests:
+
+- `B.1` RPC shape tests cover parsing `invoke_ui_action` request fields and serializing all five status values.
+- `B.4` host tests cover idle prompt-like `accepted`, streaming `queued` steer/follow-up, immediate `handled`, synchronous `completed`, `cancelled`, stale id rejection, disabled action rejection, and invocation-time enabled rechecks.
+- `B.5` Iroh tests cover remote allowlist rejection and confirm synchronous responses do not wait for `agent_end` before remote command completion.
+- `C.4` iOS tests cover `accepted` waiting for `agent_end`, `queued` preserving current streaming/queue UI, terminal synchronous statuses clearing pending UI immediately, and RPC errors clearing pending UI with a system-visible error.
 
 ## Slash Commands as Presentation
 
@@ -939,8 +993,9 @@ The prompt editor can support slash autocomplete by querying action descriptors:
 3. If `requiresConfirmation` is true, app confirms or lets host send a confirmation UI request.
 4. App sends `invoke_ui_action`.
 5. App shows optimistic pending state for that action.
-6. Host response confirms accepted/completed/rejected.
-7. Transcript and state update from normal events.
+6. Host response returns `accepted`, `queued`, `completed`, `handled`, or `cancelled`, or a normal RPC error.
+7. `completed`, `handled`, `cancelled`, and errors clear pending state immediately.
+8. `accepted` waits for normal agent events through `agent_end`; `queued` clears tap pending state but leaves queue/streaming UI driven by `queue_update` and later agent events.
 
 ### Stale Data Handling
 
@@ -1161,6 +1216,7 @@ The design should not require a flag day.
 4. **Action result detail**
    - Keep invocation response small and rely on transcript/state events, or return richer action-specific results.
    - Proposed first implementation: small generic response plus normal events.
+   - Resolved 2026-06-23: v1 uses the generic `UiActionInvocationResponse` with status, optional queue mode, and bounded state/action refresh hints. Rich action-specific result payloads are deferred.
 
 5. **Built-in review exposure over Iroh**
    - Review can run git/gh commands and may inspect workspace data.
@@ -1177,6 +1233,7 @@ The design should not require a flag day.
 8. **Action availability while streaming**
    - Some actions can execute immediately, some can queue, some must be disabled.
    - Need per-action `streamingBehavior`: `disabled`, `immediate`, `queueSteer`, `queueFollowUp`, or `custom`.
+   - Resolved 2026-06-23: v1 supports `disabled`, `immediate`, `queueSteer`, and `queueFollowUp`. `custom` remains deferred; host handlers must recheck the live descriptor and reject unsupported streaming invocations.
 
 ## Acceptance Criteria
 

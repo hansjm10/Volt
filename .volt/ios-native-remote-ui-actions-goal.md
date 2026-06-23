@@ -277,10 +277,10 @@ and recorded without overclaiming.
     <evidence>Resolved 2026-06-23: design documents the v1 `UiActionDescriptor` schema, stable built-in ids, session-local opaque dynamic ids, and compatibility/security rules; verified with `git diff --check -- .volt/ios-native-remote-ui-actions-design.md .volt/ios-native-remote-ui-actions-goal.md` and pre-commit `npm run check`; commit e7c8cd0d681c1c4b5a02b5160da2b6a017d29087.</evidence>
   </item>
 
-  <item ref="A.3" status="open" prereq="A.1,A.2" type="decision">
+  <item ref="A.3" status="resolved" prereq="A.1,A.2" type="decision">
     <title>Define invocation semantics for synchronous, prompt-like, queued, and state actions</title>
     <acceptance>The design document defines `invoke_ui_action` response semantics, including `accepted`, `completed`, `queued`, `handled`, and `cancelled` statuses; how prompt-like actions relate to `agent_end`; how synchronous actions clear pending UI without waiting for agent events; how invocation behaves while streaming; and how stale enabled state is rechecked by the host. Tests expected in later items are named.</acceptance>
-    <evidence></evidence>
+    <evidence>Resolved 2026-06-23: design documents `invoke_ui_action` response statuses, `agent_end` waiting rules, synchronous pending-state clearing, descriptor streaming policy, host-side stale enabled rechecks, and later host/Iroh/iOS test names; verified with `git diff --check -- .volt/ios-native-remote-ui-actions-design.md .volt/ios-native-remote-ui-actions-goal.md` and pre-commit `npm run check`; commit pending.</evidence>
   </item>
 
   <item ref="A.4" status="open" prereq="A.1" type="decision">
