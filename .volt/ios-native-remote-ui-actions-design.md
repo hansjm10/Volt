@@ -1450,6 +1450,44 @@ Concrete behavior documented:
 - `packages/coding-agent/docs/prompt-templates.md` and `packages/coding-agent/docs/skills.md` document their native palette projections, opaque action ids, host-owned expansion paths, and omitted bodies/paths.
 - `../volt-app/README.md` documents the iOS command palette, Actions tab, supported Review/Fast/extension action presentation, invocation lifecycle, sanitized metadata boundary, and deferred native action surfaces.
 
+## Resolved 2026-06-23: Final Cross-Surface Validation
+
+F.2 final validation covered the host registry/RPC/Iroh path, iOS client models/session behavior, simulator UI, documentation hygiene, and deferred-scope boundaries.
+
+Automated evidence:
+
+- Targeted host tests passed with `node node_modules/vitest/dist/cli.js --run test/host-actions.test.ts test/rpc-transport-client.test.ts test/remote-iroh-core.test.ts test/suite/review.test.ts test/suite/agent-session-model-extension.test.ts` from `packages/coding-agent`: 5 files, 143 tests.
+- Iroh scenario coverage passed with `npm run iroh:poc:test`, including reconnect/session, pairing/revocation, multi-workspace, authorization, ticket, and persisted-tool scenarios.
+- Monorepo check passed with `npm run check`.
+- Swift package validation passed with `swift test` from `../volt-app/Packages/VoltClient`: 23 XCTest tests plus 103 Swift Testing tests.
+- iOS simulator validation passed with XcodeBuildMCP `test_sim` on `iPhone 17 Pro` and `xcodebuild -scheme Volt -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=27.0' test` from `../volt-app`: 109 simulator tests.
+
+Manual iOS smoke evidence:
+
+- Environment: iPhone 17 Pro simulator on iOS 27.0, macOS 27.0 build 26A5353q, app commit `1c66868fd1b9`, Volt host commit `1ca030096e06`.
+- Transport: Demo transport connected as `mock / local-demo`; real Iroh host behavior was covered by the Iroh scenario suite rather than a live manual pairing in this smoke.
+- Connected to Demo from Settings and verified no pairing ticket or secret was visible. Saved-host metadata was bounded to a short host id, workspace name, and relay mode.
+- Loaded the native Actions tab and verified Review, Model, and Extensions groups, including disabled reasons and safe extension badges only (`Extension`, `Package`, `Demo`, `/disabled`, `/mock`).
+- Invoked the prompt-like `Review changes` action and verified Chat transcript output `Mock review started. No issues found.` Screenshot: `/tmp/volt-f2-review-output.png`.
+- Invoked the synchronous `Fast mode` toggle and verified state refreshed from `Normal reasoning` to `Fast: low` while the model label stayed `mock / local-demo`. Screenshot: `/tmp/volt-f2-fast-mode.png`.
+- Started a new conversation and then switched to `Previous mock chat`; after the session switch, the Actions list refreshed and still showed the expected Review, Fast mode, and extension descriptors. Screenshots: `/tmp/volt-f2-new-conversation.png`, `/tmp/volt-f2-session-switch.png`, `/tmp/volt-f2-actions-after-switch.png`.
+- No manual screenshot exposed raw source paths, prompt or skill bodies, full pairing tickets, reconnect secrets, raw model catalogs, git diffs, or tool metadata.
+
+Unsupported or deferred surfaces are not counted as implemented: first-class `volt.registerAction()` cards, real-device smoke, live manual Iroh pairing, remote model selection, global/default Fast mode settings, per-chat model overrides, package/profile settings, and richer action-specific result payloads remain future work or separately documented decisions.
+
+## Resolved 2026-06-23: Rollup for iOS Preview Use
+
+F.3 rollup status: native remote UI actions are ready for iOS preview use within the v1 scope.
+
+The completed v1 scope includes host-owned action discovery, descriptor sanitization, shared built-in action registry, prompt-like and synchronous invocation semantics, Iroh allowlist/sanitizer coverage, iOS command palette, native Actions tab, descriptor-driven forms/toggles, projected extension command groups, documentation, changelog coverage, and final validation evidence.
+
+Explicit limitations remain intentional future work rather than open implementation decisions:
+
+- `volt.registerAction()` is deferred; projected extension commands keep the compatibility path.
+- `thinking.fast_mode` is session-local and non-persistent in v1. The future shared preference descriptor abstraction covers global defaults, native General settings, per-chat overrides, inherited effective values, reset-to-default behavior, and model selection policy.
+- Direct remote model listing/selection stays blocked until a remote-safe model option policy, session preference storage, and sanitizer/allowlist tests exist.
+- Raw slash prompt compatibility remains supported for extension commands, skills, and prompt templates while native descriptors are used opportunistically.
+
 ## Host Implementation Plan
 
 ### Phase A: Design and Inventory
@@ -1635,6 +1673,7 @@ The design should not require a flag day.
 6. **Extension-provided card trust**
    - Project-local extension actions should only appear after project trust.
    - Need UI labeling so users can distinguish built-in and extension/package actions.
+   - Resolved 2026-06-23: v1 does not add first-class extension-provided native card registration. Projected extension commands continue through the existing extension loading and trust path, and native iOS renders only sanitized source/scope/package labels. The future `registerAction()` design must define stable trust and descriptor fields before exposing extension-owned cards.
 
 7. **Argument schema format**
    - Reuse TypeBox/JSON Schema subset or define a small custom schema.
