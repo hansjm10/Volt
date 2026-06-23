@@ -1,4 +1,5 @@
 import { APP_NAME } from "../config.ts";
+import { getBuiltinHostActionSlashCommand, SESSION_NEW_SLASH_ALIAS } from "./host-actions.ts";
 import type { SourceInfo } from "./source-info.ts";
 
 export type SlashCommandSource = "extension" | "prompt" | "skill";
@@ -14,6 +15,11 @@ export interface BuiltinSlashCommand {
 	name: string;
 	description: string;
 }
+
+const SESSION_NEW_SLASH_COMMAND = getBuiltinHostActionSlashCommand(SESSION_NEW_SLASH_ALIAS) ?? {
+	name: SESSION_NEW_SLASH_ALIAS,
+	description: "Start a new session",
+};
 
 export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "settings", description: "Open settings menu" },
@@ -37,7 +43,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "extensions", description: "Manage installed extension packages" },
 	{ name: "login", description: "Configure provider authentication" },
 	{ name: "logout", description: "Remove provider authentication" },
-	{ name: "clear", description: "Start a new session" },
+	SESSION_NEW_SLASH_COMMAND,
 	{ name: "compact", description: "Manually compact the session context" },
 	{
 		name: "review",

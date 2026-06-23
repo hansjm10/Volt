@@ -73,6 +73,7 @@ import type {
 	ToolInfo,
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
+import { BUILTIN_HOST_ACTION_REGISTRY, SESSION_NEW_SLASH_ALIAS } from "../../core/host-actions.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
@@ -6573,8 +6574,11 @@ export class InteractiveMode {
 		}
 		this.statusContainer.clear();
 		try {
-			const result = await this.runtimeHost.newSession();
-			if (result.cancelled) {
+			const response = await BUILTIN_HOST_ACTION_REGISTRY.invokeBySlashAlias(SESSION_NEW_SLASH_ALIAS, {
+				session: this.session,
+				newSession: (newSessionOptions) => this.runtimeHost.newSession(newSessionOptions),
+			});
+			if (response.status === "cancelled") {
 				return;
 			}
 			this.renderCurrentSessionState();

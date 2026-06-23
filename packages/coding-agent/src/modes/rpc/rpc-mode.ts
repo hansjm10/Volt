@@ -20,6 +20,11 @@ import type {
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
 import {
+	BUILTIN_HOST_ACTION_REGISTRY,
+	type HostActionInvocationContext,
+	runSessionNewHostAction,
+} from "../../core/host-actions.ts";
+import {
 	flushRawStdout,
 	restoreStdout,
 	takeOverStdout,
@@ -559,6 +564,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		});
 	};
 
+	const createHostActionContext = (): HostActionInvocationContext => ({
+		session,
+		newSession: (newSessionOptions) => runtimeHost.newSession(newSessionOptions),
+		afterSessionSwitch: rebindSession,
+	});
+
 	let detachInput = () => {};
 	let detachClose = () => {};
 	let resolveModeClosed: (() => void) | undefined;
@@ -664,10 +675,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 
 			case "new_session": {
 				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
-				const result = await runtimeHost.newSession(options);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
+				const result = await runSessionNewHostAction(createHostActionContext(), options);
 				return success(id, "new_session", result);
 			}
 
@@ -688,6 +696,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			case "invoke_ui_action": {
 				if (!allowUiActionInvocation) {
 					return error(id, "invoke_ui_action", "UI action invocation is not available over this RPC transport");
+				}
+				if (BUILTIN_HOST_ACTION_REGISTRY.get(command.action)) {
+					const response = await BUILTIN_HOST_ACTION_REGISTRY.invoke(
+						command.action,
+						createHostActionContext(),
+						command.args,
+						{ requireRemoteSafe: requireRemoteSafeUiActions },
+					);
+					return success(id, "invoke_ui_action", response);
 				}
 				const invocation = createUiActionInvocationPlan(session, {
 					action: command.action,

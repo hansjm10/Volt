@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { ResolvedCommand } from "../extensions/types.ts";
+import { BUILTIN_HOST_ACTION_REGISTRY } from "../host-actions.ts";
 import type { PromptTemplate } from "../prompt-templates.ts";
 import type { ResourceLoader } from "../resource-loader.ts";
 import type { Skill } from "../skills.ts";
@@ -24,6 +25,8 @@ export interface UiActionDiscoverySession {
 	extensionRunner: {
 		getRegisteredCommands(): ResolvedCommand[];
 	};
+	isCompacting?: boolean;
+	isStreaming?: boolean;
 	promptTemplates: ReadonlyArray<PromptTemplate>;
 	resourceLoader: Pick<ResourceLoader, "getSkills">;
 }
@@ -60,9 +63,17 @@ export function getUiActionDescriptors(
 		return [];
 	}
 
-	return getUiActionCatalog(session)
-		.filter((entry) => !options.remoteSafeOnly || entry.descriptor.remoteSafe)
-		.map((entry) => entry.descriptor);
+	const descriptors = [
+		...BUILTIN_HOST_ACTION_REGISTRY.getDescriptors({
+			session: {
+				isCompacting: session.isCompacting ?? false,
+				isStreaming: session.isStreaming ?? false,
+			},
+		}),
+		...getUiActionCatalog(session).map((entry) => entry.descriptor),
+	];
+
+	return descriptors.filter((descriptor) => !options.remoteSafeOnly || descriptor.remoteSafe).slice(0, MAX_ACTIONS);
 }
 
 export function createUiActionInvocationPlan(

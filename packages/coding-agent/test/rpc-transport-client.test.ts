@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import type { ExtensionBindings, PromptOptions } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import type { ResolvedCommand } from "../src/core/extensions/types.ts";
+import { SESSION_NEW_ACTION_ID, SESSION_NEW_SLASH_ALIAS } from "../src/core/host-actions.ts";
 import type { PromptTemplate } from "../src/core/prompt-templates.ts";
 import {
 	createIrohRemoteFilteredRpcTransport,
@@ -692,7 +693,8 @@ describe("createInProcessRpcClient", () => {
 
 	test("exposes native UI action discovery and local invocation capability", async () => {
 		const dispose = vi.fn(async () => {});
-		const runtimeHost = createRuntimeHost(dispose);
+		const newSession = vi.fn(async () => ({ cancelled: false }));
+		const runtimeHost = createRuntimeHost(dispose, async () => {}, { newSession });
 		const client = await createInProcessRpcClient(runtimeHost);
 
 		try {
@@ -702,7 +704,23 @@ describe("createInProcessRpcClient", () => {
 				maxActions: 200,
 				maxDescriptorBytes: 65_536,
 			});
-			await expect(client.getUiActions("all")).resolves.toEqual([]);
+			await expect(client.getUiActions("all")).resolves.toEqual([
+				expect.objectContaining({
+					id: SESSION_NEW_ACTION_ID,
+					label: "New session",
+					source: "builtin",
+					category: "session",
+					remoteSafe: false,
+					slash: { name: SESSION_NEW_SLASH_ALIAS, example: "/clear" },
+				}),
+			]);
+			await expect(client.invokeUiAction(SESSION_NEW_ACTION_ID, { args: {} })).resolves.toEqual({
+				action: SESSION_NEW_ACTION_ID,
+				status: "completed",
+				stateChanged: true,
+				actionsChanged: true,
+			});
+			expect(newSession).toHaveBeenCalledWith(undefined);
 			await expect(client.invokeUiAction("review.uncommitted", { args: {} })).rejects.toThrow(
 				"UI action not available: review.uncommitted",
 			);
@@ -753,33 +771,42 @@ describe("createInProcessRpcClient", () => {
 
 		try {
 			const actions = await client.getUiActions("all");
+			const builtinAction = actions.find((action) => action.source === "builtin");
+			const dynamicActions = actions.filter((action) => action.source !== "builtin");
 
-			expect(actions).toHaveLength(4);
-			expect(actions.map((action) => action.id)).toEqual([
+			expect(builtinAction).toEqual(
+				expect.objectContaining({
+					id: SESSION_NEW_ACTION_ID,
+					label: "New session",
+					remoteSafe: false,
+				}),
+			);
+			expect(dynamicActions).toHaveLength(4);
+			expect(dynamicActions.map((action) => action.id)).toEqual([
 				expect.stringMatching(/^extension\.command\.ec_[a-f0-9]{12}_1$/),
 				expect.stringMatching(/^extension\.command\.ec_[a-f0-9]{12}_2$/),
 				expect.stringMatching(/^prompt\.template\.pt_[a-f0-9]{12}_1$/),
 				expect.stringMatching(/^skill\.sk_[a-f0-9]{12}_1$/),
 			]);
-			expect(actions.map((action) => action.slash?.name)).toEqual([
+			expect(dynamicActions.map((action) => action.slash?.name)).toEqual([
 				"deploy:1",
 				"deploy:2",
 				"fix-tests",
 				"skill:debugger",
 			]);
-			expect(actions.map((action) => action.source)).toEqual(["extension", "extension", "prompt", "skill"]);
-			expect(actions.map((action) => action.category)).toEqual(["extension", "extension", "prompt", "skill"]);
-			expect(actions.every((action) => action.remoteSafe)).toBe(true);
+			expect(dynamicActions.map((action) => action.source)).toEqual(["extension", "extension", "prompt", "skill"]);
+			expect(dynamicActions.map((action) => action.category)).toEqual(["extension", "extension", "prompt", "skill"]);
+			expect(dynamicActions.every((action) => action.remoteSafe)).toBe(true);
 			expect(actions.every((action) => action.enabled)).toBe(true);
-			expect(actions[0].sourceScope).toBe("project");
-			expect(actions[0].sourceOrigin).toBe("top-level");
-			expect(actions[0].sourceLabel).toBe("Project");
-			expect(actions[2].sourceLabel).toBe("User");
-			expect(actions[3].sourceLabel).toBe("Package");
-			expect(actions[0].args).toEqual([
+			expect(dynamicActions[0].sourceScope).toBe("project");
+			expect(dynamicActions[0].sourceOrigin).toBe("top-level");
+			expect(dynamicActions[0].sourceLabel).toBe("Project");
+			expect(dynamicActions[2].sourceLabel).toBe("User");
+			expect(dynamicActions[3].sourceLabel).toBe("Package");
+			expect(dynamicActions[0].args).toEqual([
 				expect.objectContaining({ name: "arguments", type: "string", completion: "commandArguments" }),
 			]);
-			expect(actions[2].args).toEqual([
+			expect(dynamicActions[2].args).toEqual([
 				expect.objectContaining({ name: "arguments", type: "string", hint: "paste failing test output" }),
 			]);
 			expect(await client.getUiActions("primary")).toEqual([]);
@@ -900,7 +927,8 @@ describe("createInProcessRpcClient", () => {
 		const client = await createInProcessRpcClient(runtimeHost);
 
 		try {
-			const [action] = await client.getUiActions("all");
+			const actions = await client.getUiActions("all");
+			const action = actions.find((candidate) => candidate.source === "prompt");
 			if (!action) {
 				throw new Error("expected prompt action");
 			}
@@ -945,7 +973,8 @@ describe("createInProcessRpcClient", () => {
 		const client = await createInProcessRpcClient(runtimeHost);
 
 		try {
-			const [staleAction] = await client.getUiActions("all");
+			const actions = await client.getUiActions("all");
+			const staleAction = actions.find((candidate) => candidate.source === "extension");
 			if (!staleAction) {
 				throw new Error("expected extension action");
 			}
@@ -955,7 +984,8 @@ describe("createInProcessRpcClient", () => {
 				`UI action not available: ${staleAction.id}`,
 			);
 
-			const [freshAction] = await client.getUiActions("all");
+			const freshActions = await client.getUiActions("all");
+			const freshAction = freshActions.find((candidate) => candidate.source === "extension");
 			if (!freshAction) {
 				throw new Error("expected refreshed extension action");
 			}
@@ -1078,6 +1108,7 @@ function createRuntimeHost(
 	resources: {
 		commands?: ResolvedCommand[];
 		isStreaming?: boolean;
+		newSession?: (options?: { parentSession?: string }) => Promise<{ cancelled: boolean }>;
 		prompt?: (message: string, options?: PromptOptions) => Promise<void>;
 		prompts?: PromptTemplate[];
 		skills?: Skill[];
@@ -1115,7 +1146,7 @@ function createRuntimeHost(
 				getSkills: vi.fn(() => ({ skills: resources.skills ?? [], diagnostics: [] })),
 			},
 		},
-		newSession: vi.fn(async () => ({ cancelled: true })),
+		newSession: resources.newSession ?? vi.fn(async () => ({ cancelled: true })),
 		switchSession: vi.fn(async () => ({ cancelled: true })),
 		fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 		dispose,
