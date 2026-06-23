@@ -291,10 +291,10 @@ workspace-selection smoke, or explicitly document why that evidence is blocked.
 </group>
 
 <group n="2" title="Host and protocol implementation">
-  <item ref="B.1" status="open" prereq="A.1,A.2">
+  <item ref="B.1" status="resolved" prereq="A.1,A.2">
     <title>Implement workspace registration CLI and state upsert</title>
     <acceptance>`volt remote host --register-workspace`, explicit path, and `name=path` registration work with default and explicit state paths; invalid paths are rejected; re-registering a name updates the saved realpath; tests cover parser and state behavior.</acceptance>
-    <evidence></evidence>
+    <evidence>2026-06-23: Added one-shot workspace registration before native Iroh startup, realpath validation/storage, default and explicit state support, path/name parser coverage, invalid path rejection, and preserve-on-reregister allowedTools behavior; verification: targeted Vitest `test/remote-cli.test.ts` and `test/remote-iroh-core.test.ts`, `npm run iroh:poc:test`, `git diff --check -- .volt/iroh-multi-workspace-mvp-design.md`, `npm run check`, and commit-hook `npm run check` passed; Volt commit 72b6525a.</evidence>
   </item>
 
   <item ref="B.2" status="open" prereq="A.1,A.2,B.1">
