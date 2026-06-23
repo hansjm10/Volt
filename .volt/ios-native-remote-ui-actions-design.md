@@ -1343,6 +1343,19 @@ Concrete behavior:
 - iOS command palette rows open a native argument form when every descriptor argument is supported. The form renders text fields for string and integer values, multiline text fields for multiline strings, toggles for booleans, and menu pickers for enums; unsupported argument types keep the row disabled.
 - iOS form state initializes from descriptor defaults where usable, validates required and integer fields before enabling Run, and sends typed JSON values through `invoke_ui_action`.
 
+## Resolved 2026-06-23: iOS Actions Page
+
+E.2 implementation adds a dedicated native iOS Actions tab that renders host-curated primary action descriptors instead of hardcoded slash commands.
+
+Concrete behavior:
+
+- `ActionsView` filters descriptors with primary presentation kinds (`card`, `button`, and `toggle`) and groups them by host-provided presentation group, with stable ordering for Review, Model, Session, Context, Extensions, Skills, and Advanced.
+- Review cards and the `thinking.fast_mode` Model toggle appear when the connected host exposes them. The page also renders disabled cards with the host-provided disabled reason, such as an unavailable Review branch card.
+- Card and button invocations call `VoltSession.invokeUIAction`; toggle invocations send a typed boolean `enabled` argument through the same RPC path and optimistically display state until the host response/action refresh arrives.
+- The app shell now handles host `confirm` extension UI requests with a native alert and replies using `extension_ui_response.confirmed`, so remote Review actions can ask for confirmation without being auto-cancelled.
+- The demo transport exposes primary Review and Fast mode descriptors for simulator smoke coverage. Demo Review starts a mock accepted agent run; Demo Fast mode completes synchronously and refreshes action state.
+- Manual simulator smoke on iPhone 17 Pro iOS 27.0 used Demo transport, opened the Actions tab, verified Review and Model groups, verified disabled Review branch reason, toggled Fast mode to `Fast: low`, invoked Review changes, and verified the Chat transcript received `Mock review started. No issues found.` Screenshots were saved at `/tmp/volt-actions-smoke-actions.png` and `/tmp/volt-actions-smoke-chat.png`.
+
 ## Host Implementation Plan
 
 ### Phase A: Design and Inventory
