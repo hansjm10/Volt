@@ -355,10 +355,10 @@ and recorded without overclaiming.
 </group>
 
 <group n="4" title="Shared built-in action registry">
-  <item ref="D.1" status="open" prereq="B.1,A.2,A.3">
+  <item ref="D.1" status="resolved" prereq="B.1,A.2,A.3">
     <title>Create a shared host action registry scaffold for built-in actions</title>
     <acceptance>A shared core action registry can register built-in actions with descriptors, availability checks, argument metadata, slash aliases, and handlers. TUI and RPC can both resolve actions through this registry without duplicating core business logic. Initial scaffold includes tests and does not change user-visible TUI behavior beyond internal routing for a minimal safe action.</acceptance>
-    <evidence></evidence>
+    <evidence>Resolved 2026-06-23: added `HostActionRegistry` in coding-agent core with built-in action registration, descriptor projection, availability checks, argument validation, slash alias lookup, and handler invocation; registered the local-only `session.new` action with `/clear`; routed TUI `/clear`, RPC `new_session`, and built-in `invoke_ui_action` through the shared new-session handler while keeping dynamic extension/prompt/skill prompt semantics unchanged; exposed built-in descriptors through `get_ui_actions` without widening remote-safe action invocation. Added registry and RPC integration coverage; verified with `node node_modules/vitest/dist/cli.js --run test/host-actions.test.ts test/rpc-transport-client.test.ts` from `packages/coding-agent`, `npm run check`, and pre-commit `npm run check`; Volt commit 08006b211c698b82a9a4f21b67953e09957df9d8.</evidence>
   </item>
 
   <item ref="D.2" status="open" prereq="D.1">
