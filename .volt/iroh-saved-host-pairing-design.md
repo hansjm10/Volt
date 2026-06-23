@@ -491,6 +491,33 @@ Manual smoke test:
 8. Revoke phone on host.
 9. Confirm app can no longer reconnect until re-paired.
 
+## Final Validation
+
+Resolved 2026-06-22: final D.2 validation passed for the root host/protocol path and the iOS app path.
+
+Automated validation:
+
+- Targeted host/protocol Vitest command: `cd packages/coding-agent && node node_modules/vitest/dist/cli.js --run test/remote-iroh-core.test.ts test/remote-cli.test.ts`; result: 2 files, 63 tests passed. The documented `../../node_modules/vitest/dist/cli.js` path was absent in this checkout, so the same two files were run with the installed package-local Vitest CLI.
+- Native Iroh scenario suite: `npm run iroh:poc:test`; result: all scenarios passed, including relay default policy, pair command, active revocation, pairing and revocation, audit log, workspace binding, and missing workspace preflight.
+- Root broad check: `npm run check`; result: passed.
+- App package tests: `cd ../volt-app/Packages/VoltClient && swift test`; result: passed, including 18 XCTest tests and 68 Swift Testing tests covering saved-host record, startup/reconnect, offline/error mapping, revocation, endpoint identity, QR URL input, and saved-host UI affordance configuration.
+- iOS simulator test: XcodeBuildMCP `test_sim` with project `/Users/jordan.hans/Projects/volt-app/Volt.xcodeproj`, scheme `Volt`, simulator `iPhone 17 Pro` ID `66257DFE-85C0-4010-9C47-2F7D24225BE6`; result: 76 passed, 0 failed.
+- Documentation checks: root `git diff --check` over the saved-host goal/spec/docs paths, app README `git diff --check`, and app design trailing-whitespace check all passed.
+
+Manual smoke validation:
+
+- Native sidecar saved-host smoke used relay mode `"default"` and temp host state `/var/folders/ss/bb1j8z8s7qzch6d0h2fhs2br0000gn/T/volt-d2-saved-host-smoke-lzzqBO/native-host.json`. It started a mobile host, created the Pair Phone ticket with `volt remote pair`, paired once, removed `secret` and `expiresAt` from the reconnect ticket, restarted the host with the same state path, reconnected the same client node without a pairing secret or QR rescan, revoked that node, and verified later reconnect failed with `client_revoked`.
+- iOS simulator saved-host smoke used relay mode `"default"`, temp host state `/var/folders/ss/bb1j8z8s7qzch6d0h2fhs2br0000gn/T/volt-d2-saved-host-smoke-lzzqBO/ios-host.json`, simulator `iPhone 17 Pro` ID `66257DFE-85C0-4010-9C47-2F7D24225BE6`, and bundle `com.earendilworks.volt`. It launched the installed app with `--volt-iroh-ticket`, observed the host pair the app's client node, terminated the app, restarted the host with the same state path, relaunched the app without `--volt-iroh-ticket`, observed host audit authorization for the same client node from saved-host reconnect, revoked that node, relaunched without the launch ticket again, and observed a `client_revoked` host rejection.
+
+Unsupported or not claimed:
+
+- Same-machine relay mode `"default"` was validated. A two-network or Wi-Fi/cellular relay environment was not available in this session, so no cross-network relay claim is made.
+- Real-device background smoke was not run. The final evidence includes simulator launch/relaunch smoke plus package lifecycle tests for background reconnect behavior; real-device background coverage remains a release evidence gap outside this preview validation.
+
+## Rollup Status
+
+Resolved 2026-06-22: all product decisions, host/protocol implementation items, iOS app implementation items, docs, and final validation items are resolved. No open saved-host pairing implementation decisions remain. Deferred future work is limited to explicitly documented preview boundaries: multi-host app storage, event-cursor stream resume, dedicated relay diagnostics, cross-network relay validation in a target environment, and real-device background smoke coverage.
+
 ## Acceptance Criteria
 
 - A user can pair the iOS app to a desktop host by scanning one QR code.
