@@ -315,10 +315,10 @@ and recorded without overclaiming.
     <evidence>Resolved 2026-06-23: allowed only `get_ui_capabilities` and `get_ui_actions` through the Iroh remote RPC filter, kept `invoke_ui_action` and legacy/local commands blocked, added descriptor outbound-redaction coverage, and documented the remote discovery-only surface; verified with `node node_modules/vitest/dist/cli.js --run test/rpc-transport-client.test.ts` from `packages/coding-agent`, `npm run iroh:poc:test`, `npm run check`, pre-commit `npm run check`, and `git diff --check -- packages/coding-agent/docs/rpc.md packages/coding-agent/docs/iroh-remote-protocol.md .volt/ios-native-remote-ui-actions-design.md`; commit b6fb63e22dfc1638f619d732b9d71f965b38ce05.</evidence>
   </item>
 
-  <item ref="B.4" status="open" prereq="B.2,A.3">
+  <item ref="B.4" status="resolved" prereq="B.2,A.3">
     <title>Implement `invoke_ui_action` for prompt-like discovered actions</title>
     <acceptance>Extension command actions, prompt template actions, and skill actions can be invoked by action id; the host performs command dispatch and template/skill expansion; invocation supports a single raw arguments string at minimum; prompt-like actions use existing `AgentSession.prompt()` semantics and return the correct acceptance status; synchronous extension commands that do not start an agent run still complete without requiring `agent_end`; tests cover success, unknown id, stale id after reload/session replacement, and invocation while streaming.</acceptance>
-    <evidence></evidence>
+    <evidence>Resolved 2026-06-23: implemented local `invoke_ui_action` for discovered extension command, prompt template, and skill actions using `AgentSession.prompt()` semantics with raw `arguments` support, handled/accepted/queued responses, streaming queue behavior, stale catalog-id rejection, and Iroh remote invocation capability suppression; verified with `node node_modules/vitest/dist/cli.js --run test/rpc-transport-client.test.ts` from `packages/coding-agent`, `npm run iroh:poc:test`, `npm run check`, pre-commit `npm run check`, and `git diff --check -- packages/coding-agent/docs/rpc.md packages/coding-agent/docs/iroh-remote-protocol.md .volt/ios-native-remote-ui-actions-design.md`; commit 9a7dd0671f80189908b4c24848674adc2c269d14.</evidence>
   </item>
 
   <item ref="B.5" status="open" prereq="B.4,B.3">
