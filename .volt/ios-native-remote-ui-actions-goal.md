@@ -329,10 +329,10 @@ and recorded without overclaiming.
 </group>
 
 <group n="3" title="iOS discovery, palette, and invocation">
-  <item ref="C.1" status="open" prereq="B.1,B.2">
+  <item ref="C.1" status="resolved" prereq="B.1,B.2">
     <title>Add iOS RPC commands and models for UI action descriptors</title>
     <acceptance>`VoltRPCCommand` can encode `get_ui_capabilities`, `get_ui_actions`, and `invoke_ui_action`; Swift models parse action descriptors, presentation hints, argument metadata, state, enabled/disabledReason, source, and slash alias while skipping invalid entries safely; tests cover encoding and descriptor parsing with unknown fields.</acceptance>
-    <evidence></evidence>
+    <evidence>Resolved 2026-06-23: added VoltClient command encoders for `get_ui_capabilities`, `get_ui_actions`, and `invoke_ui_action`; added Swift UI action descriptor, capability, list, and invocation response models with lenient optional-field decoding, unknown string passthrough, string-or-array streaming behavior parsing, and invalid descriptor/argument/option skipping; covered command encoding and descriptor parsing with unknown fields in `VoltUIActionRPCTests`; verified with `swift test --filter VoltUIActionRPCTests`, `swift test` from `../volt-app/Packages/VoltClient`, and `git diff --check -- Packages/VoltClient/Sources/VoltClient/RPC/VoltRPC.swift Packages/VoltClient/Sources/VoltClient/RPC/VoltUIActions.swift Packages/VoltClient/Tests/VoltClientTests/VoltUIActionRPCTests.swift`; app commit b58f698bce46decc8fe4c2928ecdeed2738be1fd.</evidence>
   </item>
 
   <item ref="C.2" status="open" prereq="C.1,B.3">

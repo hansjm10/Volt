@@ -1228,6 +1228,17 @@ Concrete behavior:
 - Remote invocation still uses the host `AgentSession.prompt()` expansion path from B.4, so extension commands return terminal `handled`, prompt templates and skills return `accepted` while idle, and queued prompt-like actions return `queued`.
 - Iroh close/defer tracking treats terminal `invoke_ui_action` statuses such as `handled`, `completed`, and `cancelled` as complete after the response write, while `accepted` and `queued` continue to wait for the normal prompt lifecycle where the transport path requires that wait.
 
+## Resolved 2026-06-23: iOS RPC Action Models
+
+C.1 implementation adds the typed iOS client protocol surface needed before session loading and UI work.
+
+Concrete behavior:
+
+- `VoltRPCCommand` now encodes `get_ui_capabilities`, `get_ui_actions` with optional `scope`, and `invoke_ui_action` with action id, optional argument object, and optional queue behavior.
+- `VoltClient` exposes Swift models for capabilities, action list responses, descriptors, presentation hints, argument metadata, option metadata, action state, streaming behavior, slash aliases, and invocation responses.
+- Descriptor parsing keeps required v1 fields strict, passes unknown source/category/presentation/argument/state/streaming string values through for forward compatibility, ignores unknown fields, and skips invalid descriptors, argument entries, or option entries without failing the whole action list.
+- Tests cover command JSONL encoding and descriptor parsing with unknown fields, invalid entries, presentation/source metadata, enabled and disabled reason state, argument metadata, state snapshots, streaming behavior, and slash aliases.
+
 ## Host Implementation Plan
 
 ### Phase A: Design and Inventory
