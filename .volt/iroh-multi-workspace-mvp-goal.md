@@ -271,10 +271,10 @@ workspace-selection smoke, or explicitly document why that evidence is blocked.
 <work_queue>
 
 <group n="1" title="Resolve MVP decisions">
-  <item ref="A.1" status="open" prereq="" type="decision">
+  <item ref="A.1" status="resolved" prereq="" type="decision">
     <title>Finalize workstation-scoped authorization and existing-client migration</title>
     <acceptance>The SPEC states the exact persisted representation for workstation-scoped clients, how new pairings are stored, how existing active clients are treated, whether and when legacy clients are normalized to `allowedWorkspaces: []`, and why revoked clients remain blocked. Tests or fixtures are identified for the chosen behavior.</acceptance>
-    <evidence></evidence>
+    <evidence>Resolved workstation grants as persisted `allowedWorkspaces: []`, new pairings as wildcard, legacy active-client normalization on next successful authorization, and revoked tombstones as blocked/non-normalized; verification: `git diff --check -- .volt/iroh-multi-workspace-mvp-design.md` plus commit hook `npm run check`; commit 5ab055f7.</evidence>
   </item>
 
   <item ref="A.2" status="open" prereq="" type="decision">
