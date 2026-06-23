@@ -315,10 +315,10 @@ workspace-selection smoke, or explicitly document why that evidence is blocked.
     <evidence>2026-06-23: Added authorization-time registered `workspaceNames` snapshots to host metadata, kept `remoteHost.workspace` and `/workspace` cwd scoped to the selected workspace, and covered multi-workspace get_state metadata without host path leakage; verification: LSP tools unavailable in this session, so fallback TypeScript validation used targeted Vitest `test/remote-iroh-core.test.ts`, `npm run iroh:poc:test`, `git diff --check -- .volt/iroh-multi-workspace-mvp-design.md`, and `npm run check` in a B.4-only clean worktree; Volt commit 1a248341.</evidence>
   </item>
 
-  <item ref="B.5" status="open" prereq="B.1,B.2,B.3,B.4">
+  <item ref="B.5" status="resolved" prereq="B.1,B.2,B.3,B.4">
     <title>Add native scenario coverage for multi-workspace reconnect</title>
     <acceptance>The native Iroh scenario suite or an equivalent focused smoke proves register A, pair once, register B, reconnect/select B without QR or secret, switch back to A without QR, and revocation blocks both workspaces.</acceptance>
-    <evidence></evidence>
+    <evidence>2026-06-23: Added native `multi-workspace reconnect` scenario coverage that registers workspace A, pairs once via pair-control with relay `default`, registers workspace B, observes workspace names A/B, reconnects to B and back to A with secret-free workspace tickets, verifies selected workspace cwd, revokes the client, and verifies secret-free reconnects to both workspaces fail with `client_revoked`; verification: filtered `VOLT_IROH_SCENARIO='multi-workspace reconnect' npm run iroh:poc:test`, full `npm run iroh:poc:test`, `git diff --check -- .volt/iroh-multi-workspace-mvp-design.md scripts/iroh-sidecar-test.mjs`, and `npm run check` in a B.5-only clean worktree; Volt commit abfb191a.</evidence>
   </item>
 </group>
 
