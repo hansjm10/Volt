@@ -280,17 +280,27 @@ New workstation-scoped pairings should store:
 "allowedWorkspaces": []
 ```
 
-Existing clients:
+Resolved 2026-06-23: workstation-scoped authorization uses this existing
+wildcard persisted representation. No new host-state field or schema migration
+is required.
 
-- MVP may migrate active clients in the state file to `allowedWorkspaces: []` when the host first runs in multi-workspace mode, or it may do this when a client next successfully authorizes.
-- The product behavior should be clear: paired clients under this state file are workstation-scoped.
-- Revoked clients remain revoked and must not be silently restored.
+New successful pairings store the active client record with
+`allowedWorkspaces: []` regardless of the ticket's initial workspace. Pending
+pairing tickets and pairing-secret tombstones continue to store their workspace
+name for initial ticket validity, audit, and diagnostics only; they do not
+define the client's future workspace set.
 
-Preferred MVP path for speed:
+Existing active clients with non-empty `allowedWorkspaces` are treated as
+workstation-scoped when the requested workspace name is registered. On the next
+successful authorization after multi-workspace auth lands, the host normalizes
+that active client record to `allowedWorkspaces: []` during the same locked state
+mutation. Startup does not blanket-rewrite client records.
 
-- New pairings use `allowedWorkspaces: []`.
-- Existing active clients are treated as workstation-scoped by the authorization layer when workstation mode is enabled.
-- Optionally persist the normalized `[]` grant the next time that client is touched.
+Revoked clients are excluded from migration. `revokedClients[]` tombstones keep
+their prior grant metadata for status and audit, but the tombstone blocks the
+node ID before workspace grants are considered. A revoked node remains blocked
+for every workspace until explicit desktop re-pair approval and a successful
+fresh pairing create a new active client record.
 
 This avoids forcing existing paired phones to scan again.
 
@@ -307,11 +317,16 @@ Current behavior compares `hello.workspace` to one engine workspace. MVP behavio
 3. If none exists, reject with `workspace_unavailable`.
 4. If the client is revoked, reject with `client_revoked` before allowing reconnect.
 5. If the client is paired and workstation-scoped, authorize it for the selected workspace.
-6. If the client has a non-wildcard `allowedWorkspaces` list and it does not include the selected workspace, either:
-   - treat it as workstation-scoped under MVP migration rules, or
-   - reject with `workspace_forbidden` if preserving legacy restrictions is explicitly chosen.
+6. If the client is an active legacy record with a non-wildcard
+   `allowedWorkspaces` list, authorize it for the selected registered workspace
+   under the MVP migration rule and normalize the active record to `[]` on
+   success.
 
-For MVP speed and product simplicity, the preferred behavior is workstation-scoped authorization for all active paired clients in the state file.
+Resolved 2026-06-23: active paired clients in the state file are
+workstation-scoped for MVP. `workspace_forbidden` remains reserved for future
+per-client workspace subset grants or malformed legacy states that cannot be
+normalized safely; it is not the normal outcome for old one-workspace preview
+clients selecting a newly registered workspace.
 
 ### Pairing tickets
 
@@ -610,11 +625,14 @@ Suggested migration behavior:
 - Existing saved host records continue to load.
 - Existing records with one `workspaceNames` entry can be refreshed after `get_state` returns the full registered list.
 - Existing active clients should not be forced to scan a new QR.
-- Existing active clients may be treated as workstation-scoped under the new host behavior.
+- Existing active clients are treated as workstation-scoped under the new host behavior.
 - Revoked clients remain revoked.
 - Pending pairing tickets remain valid for their initial workspace only, but successful pairing creates workstation-scoped client authorization.
 
-If implementation chooses not to auto-upgrade existing active clients, this must be documented because it would require re-pairing or manual state adjustment for old clients. The preferred MVP is no re-pairing.
+Resolved 2026-06-23: existing active clients are not required to re-scan. The
+host authorizes them as workstation-scoped when they request a registered
+workspace and persists `allowedWorkspaces: []` on their next successful
+authorization. Revoked tombstones are not normalized or restored by migration.
 
 ## Implementation Plan
 
@@ -655,12 +673,16 @@ Tasks:
 2. Resolve `hello.workspace` dynamically.
 3. Return selected workspace in authorization success.
 4. Make new pairings workstation-scoped with `allowedWorkspaces: []`.
-5. Decide and implement existing-client upgrade behavior.
+5. Normalize legacy active clients to `allowedWorkspaces: []` on their next
+   successful authorization; do not normalize revoked tombstones.
 6. Preserve revocation and pairing-secret semantics.
 7. Add tests for:
    - pair in workspace A, reconnect workspace B
+   - new pairing persists `allowedWorkspaces: []`
+   - legacy active client with `allowedWorkspaces: ["volt"]` can reconnect to
+     another registered workspace and is persisted as `[]`
    - unregistered workspace rejected
-   - revoked client rejected for all workspaces
+   - revoked legacy client rejected for all workspaces and not normalized
    - consumed/expired pairing behavior unchanged
    - persisted `lastSessionIdByWorkspace` still keyed by selected workspace
 
@@ -754,6 +776,13 @@ Required:
 - Unregistered workspace returns `workspace_unavailable`.
 - Revoked client cannot use any registered workspace.
 - Pairing ticket for workspace A creates workstation-scoped client grant.
+- New pairing persists active client `allowedWorkspaces: []` while pending ticket
+  and tombstone fixtures retain the initial workspace for ticket validity and
+  diagnostics.
+- Legacy active client with `allowedWorkspaces: ["volt"]` can reconnect to a
+  second registered workspace and is persisted to `[]`.
+- Revoked legacy client with previous workspace grants stays blocked with
+  `client_revoked` and is not normalized or restored.
 - Same client `lastSessionIdByWorkspace` is independent for workspaces A and B.
 - Pair control can create ticket for any registered workspace.
 - Pair control rejects unknown workspace.
@@ -811,7 +840,10 @@ Minimum smoke:
 These should be resolved before implementation or explicitly accepted as MVP constraints:
 
 1. Should existing active clients be automatically persisted to `allowedWorkspaces: []`, or only treated as wildcard at runtime?
-   - Preferred MVP: persist `[]` when touched, no re-pair required.
+   - Resolved 2026-06-23: treat existing active clients as workstation-scoped at
+     authorization time and persist `[]` on the next successful authorization.
+     Startup does not blanket-rewrite state, and revoked tombstones are not
+     normalized.
 2. Should workspace registration while the host is running be immediately visible without restart?
    - Preferred MVP: yes, by reading state for control requests and handshakes.
 3. Should selecting a workspace in the app auto-reconnect immediately?
