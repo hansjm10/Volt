@@ -1702,13 +1702,24 @@ function getControlResponseType(request) {
 	return IROH_REMOTE_PAIR_CONTROL_RESPONSE_TYPE;
 }
 
-async function createPairControlSuccessResponse(request, endpoint, options) {
-	if (request.workspace !== options.workspace.name) {
-		return createControlErrorResponse(
-			IROH_REMOTE_PAIR_CONTROL_RESPONSE_TYPE,
-			`running host is serving workspace ${options.workspace.name}; cannot pair workspace ${request.workspace}`,
-		);
+async function resolvePairControlWorkspace(request, options) {
+	const state = await options.stateManager.getState();
+	const workspace = state.workspaces.find((entry) => entry.name === request.workspace);
+	if (!workspace) {
+		return { error: `workspace_unavailable: workspace not registered: ${request.workspace}` };
 	}
+	if (!(await isWorkspaceDirectoryAvailable(workspace))) {
+		return { error: `workspace_unavailable: workspace path is unavailable: ${request.workspace}` };
+	}
+	return { workspace };
+}
+
+async function createPairControlSuccessResponse(request, endpoint, options) {
+	const workspaceResult = await resolvePairControlWorkspace(request, options);
+	if (workspaceResult.error) {
+		return createControlErrorResponse(IROH_REMOTE_PAIR_CONTROL_RESPONSE_TYPE, workspaceResult.error);
+	}
+	const workspace = workspaceResult.workspace;
 	if (request.relayMode !== undefined && request.relayMode !== options.relayMode) {
 		return createControlErrorResponse(
 			IROH_REMOTE_PAIR_CONTROL_RESPONSE_TYPE,
@@ -1716,7 +1727,7 @@ async function createPairControlSuccessResponse(request, endpoint, options) {
 		);
 	}
 
-	const allowTools = request.allowTools ?? options.workspace.allowedTools ?? options.allowTools;
+	const allowTools = request.allowTools ?? workspace.allowedTools ?? options.allowTools;
 	const unsafeTools = getIrohRemoteUnsafeAllowedTools(allowTools);
 	if (unsafeTools.length > 0) {
 		if (!request.unsafeApproval) {
@@ -1727,7 +1738,7 @@ async function createPairControlSuccessResponse(request, endpoint, options) {
 		}
 		await logAudit(options.auditLogger, {
 			type: "unsafe_tools_enabled",
-			workspace: request.workspace,
+			workspace: workspace.name,
 			success: true,
 			details: {
 				allowTools,
@@ -1745,7 +1756,7 @@ async function createPairControlSuccessResponse(request, endpoint, options) {
 		nodeId: endpoint.id().toString(),
 		relayMode: options.relayMode,
 		ttlMs: request.ttlMs,
-		workspace: request.workspace,
+		workspace: workspace.name,
 	});
 	return {
 		type: IROH_REMOTE_PAIR_CONTROL_RESPONSE_TYPE,
@@ -1883,6 +1894,7 @@ async function serve(flags) {
 		ticketExpiresAt,
 		once: hasFlag(flags, "once"),
 		sourceVolt: sourceVolt ? resolve(sourceVolt) : undefined,
+		stateManager,
 		statePath,
 		useVolt: Boolean(sourceVolt) || hasFlag(flags, "use-volt"),
 		voltBin: getFlag(flags, "volt-bin", "volt"),

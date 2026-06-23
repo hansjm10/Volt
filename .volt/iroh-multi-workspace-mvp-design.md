@@ -796,6 +796,13 @@ Tasks:
 5. Keep relay expectation behavior unchanged.
 6. Add scenario coverage for registering a second workspace and pairing/selecting it without restarting the host.
 
+Resolved 2026-06-23: pair-control requests now resolve the requested workspace
+from the current registered workspace set, validate the selected path before
+ticket creation, return `workspace_unavailable` for missing or stale workspace
+names without creating tickets, preserve relay expectation errors, and issue
+pairing tickets for any registered workspace visible in the shared state file
+while the host is running.
+
 ### Phase 4: Host metadata
 
 Files likely touched:

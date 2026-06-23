@@ -144,23 +144,20 @@ export class IrohRemoteHostEngine {
 
 	async pair(options: IrohRemoteHostPairOptions): Promise<IrohRemotePairingTicket> {
 		return this.runAuthorizationExclusive(async () => {
-			const workspace = options.workspace ?? this.workspace.name;
-			if (workspace !== this.workspace.name) {
-				throw new Error(`pairing workspace does not match host workspace: ${workspace}`);
-			}
-			await this.ensurePrimaryWorkspaceRegistered();
+			const requestedWorkspace = options.workspace ?? this.workspace.name;
+			const workspace = await this.resolvePairWorkspace(requestedWorkspace, options.workspace === undefined);
 
 			const secret = options.secret ?? randomBytes(24).toString("base64url");
 			const createdAt = this.now();
 			const expiresAt =
 				options.expiresAt ?? createdAt + (options.ttlMs ?? DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS);
-			const allowTools = options.allowTools ?? this.allowTools;
+			const allowTools = options.allowTools ?? workspace.allowedTools ?? this.allowTools;
 			this.pairingAllowTools = allowTools;
 			this.pairingSecret = secret;
 			this.pairingExpiresAt = expiresAt;
 			const pendingPairingTicket = await this.stateManager.addPendingPairingTicket({
 				secretHash: hashIrohRemotePairingSecret(secret),
-				workspace,
+				workspace: workspace.name,
 				allowedTools: allowTools,
 				expiresAt,
 				createdAt,
@@ -174,7 +171,7 @@ export class IrohRemoteHostEngine {
 				nodeId: options.nodeId,
 				relayMode: options.relayMode,
 				secret,
-				workspace,
+				workspace: workspace.name,
 			};
 			const ticket = encodeIrohRemoteTicketPayload(payload);
 			await this.log({
@@ -240,6 +237,23 @@ export class IrohRemoteHostEngine {
 			return workspace;
 		}
 		return await this.stateManager.upsertWorkspace(this.workspace);
+	}
+
+	private async resolvePairWorkspace(
+		workspaceName: string,
+		registerPrimaryFallback: boolean,
+	): Promise<IrohRemoteWorkspace> {
+		const workspace =
+			registerPrimaryFallback && workspaceName === this.workspace.name
+				? await this.ensurePrimaryWorkspaceRegistered()
+				: findIrohRemoteWorkspace(await this.stateManager.getState(), workspaceName);
+		if (!workspace) {
+			throw new Error(`workspace_unavailable: workspace not registered: ${workspaceName}`);
+		}
+		if (this.validateWorkspace !== undefined && !(await this.validateWorkspace(workspace))) {
+			throw new Error(`workspace_unavailable: workspace path is unavailable: ${workspaceName}`);
+		}
+		return workspace;
 	}
 
 	private async authorizeHelloUnlocked(

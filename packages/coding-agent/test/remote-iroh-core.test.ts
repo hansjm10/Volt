@@ -2033,19 +2033,51 @@ describe("Iroh remote core helpers", () => {
 		expect(await hostEngine.listClients()).toEqual([expect.objectContaining({ nodeId: "client-node" })]);
 	});
 
-	test("host engine rejects pair-time workspace mismatches", async () => {
+	test("host engine pairs registered workspaces and rejects unavailable pair workspaces", async () => {
 		const stateManager = new IrohRemoteHostStateManager({ initialState: createEmptyIrohRemoteHostState() });
+		await stateManager.upsertWorkspace({ name: "safe", path: "/workspace" });
+		await stateManager.upsertWorkspace({ name: "private", path: "/private", allowedTools: "read" });
+		await stateManager.upsertWorkspace({ name: "stale", path: "/stale" });
 		const hostEngine = new IrohRemoteHostEngine({
+			now: () => 100,
 			stateManager,
+			validateWorkspace: (workspace) => workspace.name !== "stale",
 			workspace: { name: "safe", path: "/workspace" },
 		});
 
+		const pairing = await hostEngine.pair({
+			irohTicket: "iroh-endpoint-ticket",
+			secret: "private-secret",
+			ttlMs: 1000,
+			workspace: "private",
+		});
+		expect(pairing.payload.workspace).toBe("private");
+		expect(await stateManager.getState()).toMatchObject({
+			pendingPairingTickets: [
+				{
+					secretHash: hashIrohRemotePairingSecret("private-secret"),
+					workspace: "private",
+					allowedTools: "read",
+					createdAt: 100,
+					expiresAt: 1100,
+				},
+			],
+		});
 		await expect(
 			hostEngine.pair({
 				irohTicket: "iroh-endpoint-ticket",
-				workspace: "private",
+				secret: "missing-secret",
+				workspace: "missing",
 			}),
-		).rejects.toThrow("pairing workspace does not match host workspace: private");
+		).rejects.toThrow("workspace_unavailable: workspace not registered: missing");
+		await expect(
+			hostEngine.pair({
+				irohTicket: "iroh-endpoint-ticket",
+				secret: "stale-secret",
+				workspace: "stale",
+			}),
+		).rejects.toThrow("workspace_unavailable: workspace path is unavailable: stale");
+		expect((await stateManager.getState()).pendingPairingTickets).toHaveLength(1);
 	});
 
 	test("host engine snapshots workspace options at construction", async () => {

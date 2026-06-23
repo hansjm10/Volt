@@ -2218,7 +2218,10 @@ async function statusCommandScenario() {
 async function pairCommandScenario() {
 	await withStateDir("pair-command", async ({ clientStatePath, hostStatePath, stateDir }) => {
 		const workspacePath = join(stateDir, "workspace");
+		const registeredWorkspacePath = join(stateDir, "registered-workspace");
+		const staleWorkspacePath = join(stateDir, "stale-workspace");
 		await mkdir(workspacePath, { recursive: true });
+		await mkdir(registeredWorkspacePath, { recursive: true });
 		const host = startHost([
 			"--state",
 			hostStatePath,
@@ -2229,13 +2232,57 @@ async function pairCommandScenario() {
 		]);
 		try {
 			await waitForFirstStdoutLine(host.child, host.output, "pair command host");
+			const stateWithStaleWorkspace = JSON.parse(await readFile(hostStatePath, "utf8"));
+			stateWithStaleWorkspace.workspaces.push({
+				name: "stale",
+				path: staleWorkspacePath,
+				allowedTools: DEFAULT_TEST_ALLOW_TOOLS,
+			});
+			await writeFile(hostStatePath, `${JSON.stringify(stateWithStaleWorkspace, null, 2)}\n`);
+			const stalePairCommand = spawnSourceCli([
+				"remote",
+				"pair",
+				"--state",
+				hostStatePath,
+				"--workspace",
+				"stale",
+				"--allow-tools",
+				DEFAULT_TEST_ALLOW_TOOLS,
+			]);
+			const stalePairExit = await waitForExit(stalePairCommand.child, "remote stale pair command", stalePairCommand.output, {
+				expectSuccess: false,
+			});
+			assert(stalePairExit.code !== 0, "Stale workspace pair command unexpectedly succeeded");
+			assert(
+				stalePairCommand.output.stderr.includes("workspace_unavailable: workspace path is unavailable: stale"),
+				`Expected stale workspace_unavailable pair rejection, got:\n${stalePairCommand.output.stderr}`,
+			);
+			const stateAfterStalePair = JSON.parse(await readFile(hostStatePath, "utf8"));
+			assert(
+				!(stateAfterStalePair.pendingPairingTickets ?? []).some((ticket) => ticket.workspace === "stale"),
+				`Expected stale pair rejection to create no ticket, got:\n${JSON.stringify(stateAfterStalePair)}`,
+			);
+
+			const registerCommand = spawnSourceCli([
+				"remote",
+				"host",
+				"--state",
+				hostStatePath,
+				"--register-workspace",
+				`registered=${registeredWorkspacePath}`,
+			]);
+			await waitForExit(registerCommand.child, "remote register workspace command", registerCommand.output);
+			assert(
+				registerCommand.output.stderr.includes("registered workspace: registered ->"),
+				`Expected workspace registration confirmation, got:\n${registerCommand.output.stderr}`,
+			);
 			const pairCommand = spawnSourceCli([
 				"remote",
 				"pair",
 				"--state",
 				hostStatePath,
 				"--workspace",
-				"pair-command",
+				"registered",
 				"--allow-tools",
 				"read,grep,find,ls",
 				"--label",
@@ -2251,6 +2298,10 @@ async function pairCommandScenario() {
 			assert(
 				pairStdoutLines.length === 1 && pairStdoutLines[0].startsWith(TICKET_PREFIX),
 				`Expected pair command stdout to contain only a ticket, got:\nstdout:\n${pairCommand.output.stdout}\nstderr:\n${pairCommand.output.stderr}`,
+			);
+			assert(
+				decodeTicketPayload(pairStdoutLines[0]).workspace === "registered",
+				`Expected registered workspace ticket, got:\n${pairStdoutLines[0]}`,
 			);
 
 			const clientOutput = await runClient(
@@ -2269,6 +2320,10 @@ async function pairCommandScenario() {
 			assert(
 				hostState.clients?.[0]?.allowedTools === "read,grep,find,ls",
 				`Expected pair command client to persist requested tools, got:\n${JSON.stringify(hostState)}`,
+			);
+			assert(
+				hostState.clients?.[0]?.allowedWorkspaces?.length === 0,
+				`Expected pair command client to persist wildcard workspaces, got:\n${JSON.stringify(hostState)}`,
 			);
 		} finally {
 			await stopProcess(host.child);
