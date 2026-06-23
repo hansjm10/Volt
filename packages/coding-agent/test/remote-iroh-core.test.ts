@@ -811,6 +811,7 @@ describe("Iroh remote core helpers", () => {
 	test("authorizes pairing, persisted clients, workspace binding, and expiry", () => {
 		const workspace: IrohRemoteWorkspace = { name: "volt", path: "/workspace" };
 		const state = createEmptyIrohRemoteHostState();
+		state.workspaces.push(workspace, { name: "other-project", path: "/other-project" });
 		const paired = authorizeIrohRemoteClient(state, makeHello("volt", "secret"), "client-node", {
 			allowTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 			pairingExpiresAt: 200,
@@ -824,6 +825,7 @@ describe("Iroh remote core helpers", () => {
 		}
 		expect(paired.paired).toBe(true);
 		expect(paired.pairingSecretConsumed).toBe(true);
+		expect(paired.workspaceNames).toEqual(["volt", "other-project"]);
 		expect(paired.client).toMatchObject({
 			nodeId: "client-node",
 			label: "phone",
@@ -1889,6 +1891,7 @@ describe("Iroh remote core helpers", () => {
 			],
 		});
 
+		await stateManager.upsertWorkspace({ name: "other-project", path: "/other-project" });
 		const authorized = await stateManager.authorizeClient(makeHello("volt", "secret"), "client-node", {
 			allowTools: "read",
 			pairingSecret: "secret",
@@ -1898,12 +1901,15 @@ describe("Iroh remote core helpers", () => {
 		if (!authorized.ok) {
 			throw new Error(authorized.error);
 		}
+		expect(authorized.workspaceNames).toEqual(["volt", "other-project"]);
 		authorized.client.allowedWorkspaces.push("mutated");
 		authorized.workspace.path = "/mutated-workspace";
+		authorized.workspaceNames.push("mutated");
 
 		const state = await stateManager.getState();
 		expect(state.clients[0].allowedWorkspaces).toEqual([]);
 		expect(state.workspaces[0].path).toBe("/workspace");
+		expect(state.workspaces.map((entry) => entry.name)).toEqual(["volt", "other-project"]);
 	});
 
 	test("host state manager rejects ambiguous initial state and file path options", () => {

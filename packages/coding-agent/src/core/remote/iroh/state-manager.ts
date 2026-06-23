@@ -285,6 +285,7 @@ function cloneAuthorizationResult(result: IrohRemoteClientAuthorizationResult): 
 			? { expiredPairingTickets: result.expiredPairingTickets.map((ticket) => clonePendingPairingTicket(ticket)) }
 			: {}),
 		workspace: cloneWorkspace(result.workspace),
+		workspaceNames: [...result.workspaceNames],
 	};
 }
 

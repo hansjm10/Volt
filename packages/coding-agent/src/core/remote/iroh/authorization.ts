@@ -30,6 +30,7 @@ export interface IrohRemoteClientAuthorizationSuccess {
 	paired: boolean;
 	pairingSecretConsumed: boolean;
 	workspace: IrohRemoteWorkspace;
+	workspaceNames: string[];
 }
 
 export interface IrohRemoteClientAuthorizationFailure {
@@ -52,6 +53,7 @@ export function authorizeIrohRemoteClient(
 ): IrohRemoteClientAuthorizationResult {
 	const workspace = options.workspace;
 	const workspaceName = workspace?.name ?? hello.workspace;
+	const workspaceNames = state.workspaces.map((entry) => entry.name);
 	const now = options.now ?? Date.now();
 	const revokedClient = findIrohRemoteRevokedClient(state, remoteNodeId);
 	const existingClient = revokedClient ? undefined : findIrohRemoteClient(state, remoteNodeId);
@@ -218,6 +220,7 @@ export function authorizeIrohRemoteClient(
 			paired: true,
 			pairingSecretConsumed: true,
 			workspace,
+			workspaceNames,
 		};
 	}
 
@@ -236,6 +239,7 @@ export function authorizeIrohRemoteClient(
 		paired: false,
 		pairingSecretConsumed: false,
 		workspace,
+		workspaceNames,
 	};
 }
 

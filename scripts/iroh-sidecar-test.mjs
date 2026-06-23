@@ -1208,7 +1208,9 @@ async function integratedVoltGetStateScenario() {
 	await withStateDir("integrated-volt", async ({ hostStatePath, stateDir }) => {
 		const agentDir = await createIntegratedVoltAgentDir(stateDir);
 		const workspacePath = join(stateDir, "workspace");
+		const metadataWorkspacePath = join(stateDir, "metadata-workspace");
 		await mkdir(workspacePath, { recursive: true });
+		await mkdir(metadataWorkspacePath, { recursive: true });
 		const host = startHost([
 			"--state",
 			hostStatePath,
@@ -1221,6 +1223,15 @@ async function integratedVoltGetStateScenario() {
 		]);
 		try {
 			const ticket = await waitForFirstStdoutLine(host.child, host.output, "integrated Volt host");
+			const registerCommand = spawnSourceCli([
+				"remote",
+				"host",
+				"--state",
+				hostStatePath,
+				"--register-workspace",
+				`metadata-extra=${metadataWorkspacePath}`,
+			]);
+			await waitForExit(registerCommand.child, "remote metadata workspace register command", registerCommand.output);
 			const lines = await runRawRpcClient(
 				ticket,
 				{ id: "state-integrated", type: "get_state" },
@@ -1236,14 +1247,21 @@ async function integratedVoltGetStateScenario() {
 					response.data?.model?.id === "fake-integrated",
 				`Expected integrated fake model state, got:\n${JSON.stringify(response)}`,
 			);
+			const remoteHostMetadata = JSON.stringify(response.data?.remoteHost ?? null);
 			assert(
 				response.data?.remoteHost?.workspace === "integrated" &&
+					JSON.stringify(response.data?.remoteHost?.workspaceNames) ===
+						JSON.stringify(["integrated", "metadata-extra"]) &&
 					response.data?.remoteHost?.hostNodeId &&
 					response.data?.remoteHost?.relayMode === "disabled" &&
 					response.data?.remoteHost?.hostName &&
 					response.data?.remoteHost?.userName &&
 					response.data?.remoteHost?.cwd === "/workspace",
 				`Expected integrated remote host metadata, got:\n${JSON.stringify(response.data?.remoteHost)}`,
+			);
+			assert(
+				!remoteHostMetadata.includes(workspacePath) && !remoteHostMetadata.includes(metadataWorkspacePath),
+				`Expected remote host metadata to omit host paths, got:\n${remoteHostMetadata}`,
 			);
 
 			const auditEvents = await readAuditEvents(getDefaultAuditPath(hostStatePath));

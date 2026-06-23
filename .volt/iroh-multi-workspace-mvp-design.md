@@ -818,6 +818,12 @@ Tasks:
 3. Ensure sanitizer still redacts host paths.
 4. Add tests for metadata shape.
 
+Resolved 2026-06-23: `get_state.remoteHost` now includes `workspaceNames`
+from the authorization-time registered workspace snapshot, preserving persisted
+workspace order and exposing names only. `remoteHost.workspace` remains the
+selected workspace, `cwd` remains `/workspace`, and the outbound sanitizer still
+uses only the selected workspace path as the `/workspace` mapping root.
+
 ### Phase 5: App workspace picker and saved record refresh
 
 Files likely touched in `/Users/jordan.hans/Projects/volt-app`:

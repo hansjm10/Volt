@@ -718,6 +718,7 @@ function getCurrentUserName() {
 function createRemoteHostMetadata(authorization, options) {
 	return {
 		workspace: authorization.workspace.name,
+		workspaceNames: authorization.workspaceNames,
 		hostNodeId: options.hostNodeId,
 		relayMode: options.relayMode,
 		hostName: hostname(),
