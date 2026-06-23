@@ -373,10 +373,10 @@ and recorded without overclaiming.
     <evidence>Resolved 2026-06-23: registered `review.uncommitted` and `review.branch` as shared built-in card actions with remote-safe descriptors, TUI `/review` routing, RPC workflow invocation, remote confirmation/read-only-tool policy, and Iroh allowlist coverage while keeping PR/commit/tools local-only; verified with `node node_modules/vitest/dist/cli.js --run test/host-actions.test.ts test/rpc-transport-client.test.ts test/remote-iroh-core.test.ts test/suite/review.test.ts` from `packages/coding-agent`, `npm run iroh:poc:test`, `npm run check`, `git diff --check`, and pre-commit `npm run check`; Volt commit 0af1ef23e539a4f9fdf61a796233adb07c45a116.</evidence>
   </item>
 
-  <item ref="D.4" status="open" prereq="D.1,A.4">
+  <item ref="D.4" status="resolved" prereq="D.1,A.4">
     <title>Implement Fast mode or the decided first model-speed action</title>
     <acceptance>The host exposes the decided Fast mode or model-speed action with toggle/picker state; iOS does not hardcode provider-specific policy; invocation applies the host-owned policy and returns updated state; get_state/action state remains consistent after reconnect/session switch; tests cover supported and unsupported models or thinking levels. If Fast mode is deferred, implement the agreed substitute and record the remaining blocker.</acceptance>
-    <evidence></evidence>
+    <evidence>Resolved 2026-06-23: implemented remote-safe shared `thinking.fast_mode` as a session-local, non-persistent thinking toggle with supported/unsupported descriptor state, RPC/Iroh invocation, manual-change clearing, docs, and changelog; verified with `node node_modules/vitest/dist/cli.js --run test/host-actions.test.ts test/rpc-transport-client.test.ts test/remote-iroh-core.test.ts test/suite/agent-session-model-extension.test.ts` from `packages/coding-agent`, `npm run iroh:poc:test`, `npm run check`, pre-commit `npm run check`, and `git diff --check -- .volt/ios-native-remote-ui-actions-design.md packages/coding-agent/CHANGELOG.md packages/coding-agent/docs/rpc.md packages/coding-agent/docs/iroh-remote-protocol.md`; Volt commit 5566c505ac1832b0594e56c02f2e3a5bd07af092.</evidence>
   </item>
 </group>
 
