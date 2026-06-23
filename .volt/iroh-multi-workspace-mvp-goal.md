@@ -309,10 +309,10 @@ workspace-selection smoke, or explicitly document why that evidence is blocked.
     <evidence>2026-06-23: Updated host-engine pairing and pair-control to issue tickets for registered workspaces from current state, reject missing or stale selected workspaces with `workspace_unavailable` before ticket creation, preserve relay expectation checks, and verify successful pairing persists workstation-scoped client grants; verification: LSP tools unavailable in this session, so fallback TypeScript validation used targeted Vitest `test/remote-iroh-core.test.ts` and `test/remote-cli.test.ts`, `npm run iroh:poc:test`, `git diff --check -- .volt/iroh-multi-workspace-mvp-design.md`, and `npm run check` in a B.3-only clean worktree; Volt commit aa1deb37.</evidence>
   </item>
 
-  <item ref="B.4" status="open" prereq="B.2">
+  <item ref="B.4" status="resolved" prereq="B.2">
     <title>Expose registered workspace names in remote host metadata without paths</title>
     <acceptance>`get_state.remoteHost.workspaceNames` contains registered workspace names, `remoteHost.workspace` remains the selected workspace, no host paths are exposed, and outbound path redaction still treats only the selected workspace path as `/workspace`. Tests cover metadata and sanitizer boundaries.</acceptance>
-    <evidence></evidence>
+    <evidence>2026-06-23: Added authorization-time registered `workspaceNames` snapshots to host metadata, kept `remoteHost.workspace` and `/workspace` cwd scoped to the selected workspace, and covered multi-workspace get_state metadata without host path leakage; verification: LSP tools unavailable in this session, so fallback TypeScript validation used targeted Vitest `test/remote-iroh-core.test.ts`, `npm run iroh:poc:test`, `git diff --check -- .volt/iroh-multi-workspace-mvp-design.md`, and `npm run check` in a B.4-only clean worktree; Volt commit 1a248341.</evidence>
   </item>
 
   <item ref="B.5" status="open" prereq="B.1,B.2,B.3,B.4">
