@@ -22,7 +22,10 @@ import type {
 import {
 	BUILTIN_HOST_ACTION_REGISTRY,
 	type HostActionInvocationContext,
+	runCancelHostAction,
+	runContextCompactHostAction,
 	runSessionNewHostAction,
+	runSessionRenameHostAction,
 } from "../../core/host-actions.ts";
 import {
 	flushRawStdout,
@@ -566,8 +569,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 
 	const createHostActionContext = (): HostActionInvocationContext => ({
 		session,
+		abortRun: () => session.abort(),
+		compactContext: (customInstructions) => session.compact(customInstructions),
 		newSession: (newSessionOptions) => runtimeHost.newSession(newSessionOptions),
 		afterSessionSwitch: rebindSession,
+		renameSession: (name) => {
+			session.setSessionName(name);
+		},
 	});
 
 	let detachInput = () => {};
@@ -669,7 +677,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			}
 
 			case "abort": {
-				await session.abort();
+				await runCancelHostAction(createHostActionContext());
 				return success(id, "abort");
 			}
 
@@ -825,7 +833,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			// =================================================================
 
 			case "compact": {
-				const result = await session.compact(command.customInstructions);
+				const result = await runContextCompactHostAction(createHostActionContext(), command.customInstructions);
 				return success(id, "compact", result);
 			}
 
@@ -930,11 +938,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			}
 
 			case "set_session_name": {
-				const name = command.name.trim();
-				if (!name) {
-					return error(id, "set_session_name", "Session name cannot be empty");
-				}
-				session.setSessionName(name);
+				runSessionRenameHostAction(createHostActionContext(), command.name);
 				return success(id, "set_session_name");
 			}
 

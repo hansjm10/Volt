@@ -73,7 +73,13 @@ import type {
 	ToolInfo,
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
-import { BUILTIN_HOST_ACTION_REGISTRY, SESSION_NEW_SLASH_ALIAS } from "../../core/host-actions.ts";
+import {
+	BUILTIN_HOST_ACTION_REGISTRY,
+	CONTEXT_COMPACT_SLASH_ALIAS,
+	type HostActionInvocationContext,
+	SESSION_NEW_SLASH_ALIAS,
+	SESSION_RENAME_SLASH_ALIAS,
+} from "../../core/host-actions.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
@@ -2638,6 +2644,18 @@ export class InteractiveMode {
 		};
 	}
 
+	private createHostActionContext(): HostActionInvocationContext {
+		return {
+			session: this.session,
+			abortRun: () => this.session.abort(),
+			compactContext: (customInstructions) => this.session.compact(customInstructions),
+			newSession: (newSessionOptions) => this.runtimeHost.newSession(newSessionOptions),
+			renameSession: (name) => {
+				this.session.setSessionName(name);
+			},
+		};
+	}
+
 	private async handleClipboardImagePaste(): Promise<void> {
 		try {
 			const image = await readClipboardImage();
@@ -2709,7 +2727,7 @@ export class InteractiveMode {
 				return;
 			}
 			if (text === "/name" || text.startsWith("/name ")) {
-				this.handleNameCommand(text);
+				await this.handleNameCommand(text);
 				this.editor.setText("");
 				return;
 			}
@@ -6299,7 +6317,7 @@ export class InteractiveMode {
 		}
 	}
 
-	private handleNameCommand(text: string): void {
+	private async handleNameCommand(text: string): Promise<void> {
 		const name = text.replace(/^\/name\s*/, "").trim();
 		if (!name) {
 			const currentName = this.sessionManager.getSessionName();
@@ -6313,9 +6331,15 @@ export class InteractiveMode {
 			return;
 		}
 
-		this.session.setSessionName(name);
+		const response = await BUILTIN_HOST_ACTION_REGISTRY.invokeBySlashAlias(
+			SESSION_RENAME_SLASH_ALIAS,
+			this.createHostActionContext(),
+			{
+				name,
+			},
+		);
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("dim", `Session name set: ${name}`), 1, 0));
+		this.chatContainer.addChild(new Text(theme.fg("dim", response.message ?? `Session name set: ${name}`), 1, 0));
 		this.ui.requestRender();
 	}
 
@@ -6574,10 +6598,10 @@ export class InteractiveMode {
 		}
 		this.statusContainer.clear();
 		try {
-			const response = await BUILTIN_HOST_ACTION_REGISTRY.invokeBySlashAlias(SESSION_NEW_SLASH_ALIAS, {
-				session: this.session,
-				newSession: (newSessionOptions) => this.runtimeHost.newSession(newSessionOptions),
-			});
+			const response = await BUILTIN_HOST_ACTION_REGISTRY.invokeBySlashAlias(
+				SESSION_NEW_SLASH_ALIAS,
+				this.createHostActionContext(),
+			);
 			if (response.status === "cancelled") {
 				return;
 			}
@@ -7085,7 +7109,13 @@ export class InteractiveMode {
 		this.statusContainer.clear();
 
 		try {
-			await this.session.compact(customInstructions);
+			await BUILTIN_HOST_ACTION_REGISTRY.invokeBySlashAlias(
+				CONTEXT_COMPACT_SLASH_ALIAS,
+				this.createHostActionContext(),
+				{
+					customInstructions,
+				},
+			);
 		} catch {
 			// Ignore, will be emitted as an event
 		}

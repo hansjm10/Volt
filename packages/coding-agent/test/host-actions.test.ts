@@ -1,9 +1,14 @@
 import { describe, expect, test, vi } from "vitest";
 import {
+	CONTEXT_COMPACT_ACTION_ID,
+	CONTEXT_COMPACT_SLASH_ALIAS,
 	HostActionRegistry,
+	RUN_CANCEL_ACTION_ID,
 	registerBuiltinHostActions,
 	SESSION_NEW_ACTION_ID,
 	SESSION_NEW_SLASH_ALIAS,
+	SESSION_RENAME_ACTION_ID,
+	SESSION_RENAME_SLASH_ALIAS,
 } from "../src/core/host-actions.ts";
 
 describe("HostActionRegistry", () => {
@@ -27,7 +32,10 @@ describe("HostActionRegistry", () => {
 
 		const context = {
 			session: { isStreaming: false, isCompacting: false },
+			abortRun: vi.fn(async () => {}),
+			compactContext: vi.fn(async () => createCompactionResult()),
 			newSession: vi.fn(async () => ({ cancelled: true })),
+			renameSession: vi.fn(() => {}),
 		};
 
 		expect(registry.getDescriptors(context)).toEqual([
@@ -59,8 +67,11 @@ describe("HostActionRegistry", () => {
 		const registry = registerBuiltinHostActions(new HostActionRegistry());
 		const context = {
 			session: { isStreaming: false, isCompacting: false },
+			abortRun: vi.fn(async () => {}),
+			compactContext: vi.fn(async () => createCompactionResult()),
 			newSession,
 			afterSessionSwitch,
+			renameSession: vi.fn(() => {}),
 		};
 
 		expect(registry.getSlashCommand(SESSION_NEW_SLASH_ALIAS)).toEqual({
@@ -75,7 +86,7 @@ describe("HostActionRegistry", () => {
 				label: "New session",
 				source: "builtin",
 				category: "session",
-				remoteSafe: false,
+				remoteSafe: true,
 				slash: { name: SESSION_NEW_SLASH_ALIAS, example: "/clear" },
 			}),
 		);
@@ -88,4 +99,105 @@ describe("HostActionRegistry", () => {
 		expect(newSession).toHaveBeenCalledWith(undefined);
 		expect(afterSessionSwitch).toHaveBeenCalledOnce();
 	});
+
+	test("registers cancel, compact, and rename built-ins", async () => {
+		const abortRun = vi.fn(async () => {});
+		const compactContext = vi.fn(async () => createCompactionResult());
+		const renameSession = vi.fn(() => {});
+		const registry = registerBuiltinHostActions(new HostActionRegistry());
+		const context = {
+			session: { isStreaming: true, isCompacting: false },
+			abortRun,
+			compactContext,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			renameSession,
+		};
+
+		const descriptors = registry.getDescriptors(context);
+		expect(descriptors.map((descriptor) => descriptor.id)).toEqual([
+			SESSION_NEW_ACTION_ID,
+			RUN_CANCEL_ACTION_ID,
+			CONTEXT_COMPACT_ACTION_ID,
+			SESSION_RENAME_ACTION_ID,
+		]);
+		expect(descriptors.find((descriptor) => descriptor.id === RUN_CANCEL_ACTION_ID)).toEqual(
+			expect.objectContaining({
+				label: "Cancel run",
+				enabled: true,
+				remoteSafe: true,
+				streamingBehavior: "immediate",
+			}),
+		);
+		expect(descriptors.find((descriptor) => descriptor.id === CONTEXT_COMPACT_ACTION_ID)).toEqual(
+			expect.objectContaining({
+				label: "Compact context",
+				remoteSafe: false,
+				slash: { name: CONTEXT_COMPACT_SLASH_ALIAS, example: "/compact" },
+			}),
+		);
+		expect(descriptors.find((descriptor) => descriptor.id === SESSION_RENAME_ACTION_ID)).toEqual(
+			expect.objectContaining({
+				label: "Rename session",
+				remoteSafe: false,
+				slash: { name: SESSION_RENAME_SLASH_ALIAS, example: "/name <name>" },
+			}),
+		);
+
+		await expect(registry.invoke(RUN_CANCEL_ACTION_ID, context, {})).resolves.toEqual({
+			action: RUN_CANCEL_ACTION_ID,
+			status: "completed",
+			stateChanged: true,
+			actionsChanged: true,
+			message: "Run cancelled",
+		});
+		await expect(
+			registry.invokeBySlashAlias(CONTEXT_COMPACT_SLASH_ALIAS, context, {
+				customInstructions: "preserve todo list",
+			}),
+		).resolves.toEqual({
+			action: CONTEXT_COMPACT_ACTION_ID,
+			status: "completed",
+			stateChanged: true,
+			actionsChanged: true,
+			message: "Context compacted",
+		});
+		await expect(
+			registry.invokeBySlashAlias(SESSION_RENAME_SLASH_ALIAS, context, { name: "  D.2 work  " }),
+		).resolves.toEqual({
+			action: SESSION_RENAME_ACTION_ID,
+			status: "completed",
+			stateChanged: true,
+			message: "Session name set: D.2 work",
+		});
+		expect(abortRun).toHaveBeenCalledOnce();
+		expect(compactContext).toHaveBeenCalledWith("preserve todo list");
+		expect(renameSession).toHaveBeenCalledWith("D.2 work");
+	});
+
+	test("rechecks built-in availability and validates arguments at invocation time", async () => {
+		const registry = registerBuiltinHostActions(new HostActionRegistry());
+		const idleContext = {
+			session: { isStreaming: false, isCompacting: false },
+			abortRun: vi.fn(async () => {}),
+			compactContext: vi.fn(async () => createCompactionResult()),
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			renameSession: vi.fn(() => {}),
+		};
+
+		await expect(registry.invoke(RUN_CANCEL_ACTION_ID, idleContext, {})).rejects.toThrow("No active run to cancel");
+		await expect(
+			registry.invokeBySlashAlias(SESSION_RENAME_SLASH_ALIAS, idleContext, { name: "   " }),
+		).rejects.toThrow("Session name cannot be empty");
+		await expect(
+			registry.invokeBySlashAlias(CONTEXT_COMPACT_SLASH_ALIAS, idleContext, { unexpected: true }),
+		).rejects.toThrow("Unsupported UI action argument: unexpected");
+	});
 });
+
+function createCompactionResult() {
+	return {
+		summary: "summary",
+		firstKeptEntryId: "entry-1",
+		tokensBefore: 100,
+	};
+}

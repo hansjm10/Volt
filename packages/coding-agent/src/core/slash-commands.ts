@@ -1,5 +1,10 @@
 import { APP_NAME } from "../config.ts";
-import { getBuiltinHostActionSlashCommand, SESSION_NEW_SLASH_ALIAS } from "./host-actions.ts";
+import {
+	CONTEXT_COMPACT_SLASH_ALIAS,
+	getBuiltinHostActionSlashCommand,
+	SESSION_NEW_SLASH_ALIAS,
+	SESSION_RENAME_SLASH_ALIAS,
+} from "./host-actions.ts";
 import type { SourceInfo } from "./source-info.ts";
 
 export type SlashCommandSource = "extension" | "prompt" | "skill";
@@ -20,6 +25,14 @@ const SESSION_NEW_SLASH_COMMAND = getBuiltinHostActionSlashCommand(SESSION_NEW_S
 	name: SESSION_NEW_SLASH_ALIAS,
 	description: "Start a new session",
 };
+const SESSION_RENAME_SLASH_COMMAND = getBuiltinHostActionSlashCommand(SESSION_RENAME_SLASH_ALIAS) ?? {
+	name: SESSION_RENAME_SLASH_ALIAS,
+	description: "Set session display name",
+};
+const CONTEXT_COMPACT_SLASH_COMMAND = getBuiltinHostActionSlashCommand(CONTEXT_COMPACT_SLASH_ALIAS) ?? {
+	name: CONTEXT_COMPACT_SLASH_ALIAS,
+	description: "Manually compact the session context",
+};
 
 export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "settings", description: "Open settings menu" },
@@ -30,7 +43,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "import", description: "Import and resume a session from a JSONL file" },
 	{ name: "share", description: "Share session as a secret GitHub gist" },
 	{ name: "copy", description: "Copy last agent message to clipboard" },
-	{ name: "name", description: "Set session display name" },
+	SESSION_RENAME_SLASH_COMMAND,
 	{ name: "session", description: "Show session info and stats" },
 	{ name: "lsp", description: "Show LSP server status (/lsp restart, /lsp trace [path|off])" },
 	{ name: "changelog", description: "Show changelog entries" },
@@ -44,7 +57,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "login", description: "Configure provider authentication" },
 	{ name: "logout", description: "Remove provider authentication" },
 	SESSION_NEW_SLASH_COMMAND,
-	{ name: "compact", description: "Manually compact the session context" },
+	CONTEXT_COMPACT_SLASH_COMMAND,
 	{
 		name: "review",
 		description: "Review code (tools, uncommitted, branch, PR, commit); findings start a fresh session",

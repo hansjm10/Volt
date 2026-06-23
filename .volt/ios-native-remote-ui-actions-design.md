@@ -1280,6 +1280,23 @@ Concrete behavior:
 - The demo mock transport now returns `handled` for its advertised mock command, so demo command invocation exercises the terminal synchronous path.
 - Lifecycle tests cover direct invocation encoding, terminal handled/completed/cancelled statuses, prompt-like accepted streaming through `agent_end`, queued follow-up behavior while already streaming, and failure responses preserving the active stream.
 
+## Resolved 2026-06-23: Shared Built-In Action Registry
+
+D.1 and D.2 implementation introduce a shared host action registry for simple built-in actions and route selected TUI/RPC entry points through shared handlers.
+
+Concrete behavior:
+
+- `HostActionRegistry` owns built-in descriptor projection, availability checks, argument metadata and validation, slash alias lookup, remote-safety classification, and handler dispatch.
+- Registered simple built-ins are:
+  - `session.new`, slash alias `/clear`, remote-safe over Iroh, delegates to the same new-session runtime operation used by `new_session`.
+  - `run.cancel`, no slash alias, remote-safe over Iroh, delegates to the same abort operation used by `abort`.
+  - `context.compact`, slash alias `/compact`, local-only over Iroh, delegates to the same compaction operation used by local `compact` and accepts optional `customInstructions`.
+  - `session.rename`, slash alias `/name <name>`, local-only over Iroh, delegates to the same session naming operation used by local `set_session_name`.
+- TUI `/clear`, `/compact`, and `/name` resolve through the shared registry while preserving existing user-visible terminal behavior such as `/name` with no argument showing the current name or usage.
+- RPC direct commands `new_session`, `abort`, `compact`, and `set_session_name` use the same core helper functions as built-in `invoke_ui_action` handlers, while preserving their existing response shapes.
+- Iroh remote `invoke_ui_action` is still allowlist-based. It forwards exact built-in ids `session.new` and `run.cancel`, plus the previously reviewed projected dynamic prefixes. It rejects `context.compact`, `session.rename`, review/model ids, malformed ids, and unreviewed prefixes before forwarding.
+- `get_ui_actions` returns built-in descriptors alongside dynamic palette actions; remote descriptor lists include only actions whose live descriptors are marked `remoteSafe`.
+
 ## Host Implementation Plan
 
 ### Phase A: Design and Inventory

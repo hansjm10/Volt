@@ -3,6 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import {
+	CONTEXT_COMPACT_ACTION_ID,
+	RUN_CANCEL_ACTION_ID,
+	SESSION_NEW_ACTION_ID,
+	SESSION_RENAME_ACTION_ID,
+} from "../src/core/host-actions.ts";
+import {
 	assertIrohRemoteHandshakeHostIdentity,
 	assertIrohRemoteTicketNotExpired,
 	assertIrohRemoteTicketPayloadHostIdentity,
@@ -572,6 +578,31 @@ describe("Iroh remote core helpers", () => {
 			allowed: true,
 			command: dynamicInvocation,
 		});
+		for (const action of [SESSION_NEW_ACTION_ID, RUN_CANCEL_ACTION_ID]) {
+			const builtInInvocation = {
+				id: `${action}-1`,
+				type: "invoke_ui_action",
+				action,
+			};
+			expect(getIrohRemoteRpcFilterResult(JSON.stringify(builtInInvocation))).toEqual({
+				allowed: true,
+				command: builtInInvocation,
+			});
+		}
+		for (const action of [CONTEXT_COMPACT_ACTION_ID, SESSION_RENAME_ACTION_ID]) {
+			expect(
+				getIrohRemoteRpcFilterResult(JSON.stringify({ id: `${action}-1`, type: "invoke_ui_action", action })),
+			).toEqual({
+				allowed: false,
+				response: {
+					id: `${action}-1`,
+					type: "response",
+					command: "invoke_ui_action",
+					success: false,
+					error: `UI action not available over remote host: ${action}`,
+				},
+			});
+		}
 		expect(
 			getIrohRemoteRpcFilterResult(
 				JSON.stringify({ id: "invoke-local", type: "invoke_ui_action", action: "review.pr" }),

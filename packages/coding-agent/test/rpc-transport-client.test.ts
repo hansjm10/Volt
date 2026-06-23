@@ -2,7 +2,13 @@ import { describe, expect, test, vi } from "vitest";
 import type { ExtensionBindings, PromptOptions } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import type { ResolvedCommand } from "../src/core/extensions/types.ts";
-import { SESSION_NEW_ACTION_ID, SESSION_NEW_SLASH_ALIAS } from "../src/core/host-actions.ts";
+import {
+	CONTEXT_COMPACT_ACTION_ID,
+	RUN_CANCEL_ACTION_ID,
+	SESSION_NEW_ACTION_ID,
+	SESSION_NEW_SLASH_ALIAS,
+	SESSION_RENAME_ACTION_ID,
+} from "../src/core/host-actions.ts";
 import type { PromptTemplate } from "../src/core/prompt-templates.ts";
 import {
 	createIrohRemoteFilteredRpcTransport,
@@ -204,6 +210,31 @@ describe("Iroh remote RPC filter", () => {
 			allowed: true,
 			command: invocation,
 		});
+		for (const action of [SESSION_NEW_ACTION_ID, RUN_CANCEL_ACTION_ID]) {
+			const builtInInvocation = {
+				id: `${action}-1`,
+				type: "invoke_ui_action",
+				action,
+			};
+			expect(getIrohRemoteRpcFilterResult(JSON.stringify(builtInInvocation))).toEqual({
+				allowed: true,
+				command: builtInInvocation,
+			});
+		}
+		for (const action of [CONTEXT_COMPACT_ACTION_ID, SESSION_RENAME_ACTION_ID]) {
+			expect(
+				getIrohRemoteRpcFilterResult(JSON.stringify({ id: `${action}-1`, type: "invoke_ui_action", action })),
+			).toEqual({
+				allowed: false,
+				response: {
+					id: `${action}-1`,
+					type: "response",
+					command: "invoke_ui_action",
+					success: false,
+					error: `UI action not available over remote host: ${action}`,
+				},
+			});
+		}
 		expect(
 			getIrohRemoteRpcFilterResult(
 				JSON.stringify({ id: "local-action-1", type: "invoke_ui_action", action: "review.pr", args: {} }),
@@ -590,6 +621,8 @@ describe("runRpcMode", () => {
 		});
 		const runtimeHost = createRuntimeHost(dispose, async () => {}, {
 			commands: [createCommand("deploy", "deploy", "Deploy", sourceInfo)],
+			isStreaming: true,
+			newSession: vi.fn(async () => ({ cancelled: false })),
 			prompts: [
 				{
 					name: "fix-tests",
@@ -638,24 +671,57 @@ describe("runRpcMode", () => {
 			const extensionAction = actions.find((action) => action.source === "extension");
 			const promptAction = actions.find((action) => action.source === "prompt");
 			const skillAction = actions.find((action) => action.source === "skill");
+			const newSessionAction = actions.find((action) => action.id === SESSION_NEW_ACTION_ID);
+			const cancelAction = actions.find((action) => action.id === RUN_CANCEL_ACTION_ID);
+			expect(actions.find((action) => action.id === CONTEXT_COMPACT_ACTION_ID)).toBeUndefined();
+			expect(actions.find((action) => action.id === SESSION_RENAME_ACTION_ID)).toBeUndefined();
 			if (!extensionAction || !promptAction || !skillAction) {
 				throw new Error("expected remote extension, prompt, and skill actions");
 			}
+			if (!newSessionAction || !cancelAction) {
+				throw new Error("expected remote-safe built-in actions");
+			}
+			expect(newSessionAction.remoteSafe).toBe(true);
+			expect(cancelAction.remoteSafe).toBe(true);
 			await expect(client.invokeUiAction(extensionAction.id, { args: { arguments: "prod" } })).resolves.toEqual({
 				action: extensionAction.id,
 				status: "handled",
 			});
 			await expect(
-				client.invokeUiAction(promptAction.id, { args: { arguments: "copy failing output" } }),
+				client.invokeUiAction(promptAction.id, {
+					args: { arguments: "copy failing output" },
+					streamingBehavior: "followUp",
+				}),
 			).resolves.toEqual({
 				action: promptAction.id,
-				status: "accepted",
+				status: "queued",
+				queuedAs: "followUp",
 			});
-			await expect(client.invokeUiAction(skillAction.id, { args: { arguments: "inspect crash" } })).resolves.toEqual(
-				{
-					action: skillAction.id,
-					status: "accepted",
-				},
+			await expect(
+				client.invokeUiAction(skillAction.id, {
+					args: { arguments: "inspect crash" },
+					streamingBehavior: "followUp",
+				}),
+			).resolves.toEqual({
+				action: skillAction.id,
+				status: "queued",
+				queuedAs: "followUp",
+			});
+			await expect(client.invokeUiAction(SESSION_NEW_ACTION_ID, { args: {} })).resolves.toEqual({
+				action: SESSION_NEW_ACTION_ID,
+				status: "completed",
+				stateChanged: true,
+				actionsChanged: true,
+			});
+			await expect(client.invokeUiAction(RUN_CANCEL_ACTION_ID, { args: {} })).resolves.toEqual({
+				action: RUN_CANCEL_ACTION_ID,
+				status: "completed",
+				stateChanged: true,
+				actionsChanged: true,
+				message: "Run cancelled",
+			});
+			await expect(client.invokeUiAction(CONTEXT_COMPACT_ACTION_ID, { args: {} })).rejects.toThrow(
+				`UI action not available over remote host: ${CONTEXT_COMPACT_ACTION_ID}`,
 			);
 			await expect(client.invokeUiAction("review.pr", { args: {} })).rejects.toThrow(
 				"UI action not available over remote host: review.pr",
@@ -665,6 +731,11 @@ describe("runRpcMode", () => {
 				"/deploy prod",
 				"/fix-tests copy failing output",
 				"/skill:debugger inspect crash",
+			]);
+			expect(prompt.mock.calls.map(([, options]) => options?.streamingBehavior)).toEqual([
+				undefined,
+				"followUp",
+				"followUp",
 			]);
 		} finally {
 			await client.stop();
@@ -693,8 +764,17 @@ describe("createInProcessRpcClient", () => {
 
 	test("exposes native UI action discovery and local invocation capability", async () => {
 		const dispose = vi.fn(async () => {});
+		const abortRun = vi.fn(async () => {});
+		const compact = vi.fn(async () => createCompactionResult());
 		const newSession = vi.fn(async () => ({ cancelled: false }));
-		const runtimeHost = createRuntimeHost(dispose, async () => {}, { newSession });
+		const setSessionName = vi.fn();
+		const runtimeHost = createRuntimeHost(dispose, async () => {}, {
+			abort: abortRun,
+			compact,
+			isStreaming: true,
+			newSession,
+			setSessionName,
+		});
 		const client = await createInProcessRpcClient(runtimeHost);
 
 		try {
@@ -704,14 +784,36 @@ describe("createInProcessRpcClient", () => {
 				maxActions: 200,
 				maxDescriptorBytes: 65_536,
 			});
-			await expect(client.getUiActions("all")).resolves.toEqual([
+			const actions = await client.getUiActions("all");
+			expect(actions).toEqual([
 				expect.objectContaining({
 					id: SESSION_NEW_ACTION_ID,
 					label: "New session",
 					source: "builtin",
 					category: "session",
-					remoteSafe: false,
+					remoteSafe: true,
 					slash: { name: SESSION_NEW_SLASH_ALIAS, example: "/clear" },
+				}),
+				expect.objectContaining({
+					id: RUN_CANCEL_ACTION_ID,
+					label: "Cancel run",
+					source: "builtin",
+					enabled: true,
+					remoteSafe: true,
+				}),
+				expect.objectContaining({
+					id: CONTEXT_COMPACT_ACTION_ID,
+					label: "Compact context",
+					source: "builtin",
+					remoteSafe: false,
+					slash: { name: "compact", example: "/compact" },
+				}),
+				expect.objectContaining({
+					id: SESSION_RENAME_ACTION_ID,
+					label: "Rename session",
+					source: "builtin",
+					remoteSafe: false,
+					slash: { name: "name", example: "/name <name>" },
 				}),
 			]);
 			await expect(client.invokeUiAction(SESSION_NEW_ACTION_ID, { args: {} })).resolves.toEqual({
@@ -721,6 +823,31 @@ describe("createInProcessRpcClient", () => {
 				actionsChanged: true,
 			});
 			expect(newSession).toHaveBeenCalledWith(undefined);
+			await expect(client.invokeUiAction(RUN_CANCEL_ACTION_ID, { args: {} })).resolves.toEqual({
+				action: RUN_CANCEL_ACTION_ID,
+				status: "completed",
+				stateChanged: true,
+				actionsChanged: true,
+				message: "Run cancelled",
+			});
+			expect(abortRun).toHaveBeenCalledOnce();
+			await expect(
+				client.invokeUiAction(CONTEXT_COMPACT_ACTION_ID, { args: { customInstructions: "preserve decisions" } }),
+			).resolves.toEqual({
+				action: CONTEXT_COMPACT_ACTION_ID,
+				status: "completed",
+				stateChanged: true,
+				actionsChanged: true,
+				message: "Context compacted",
+			});
+			expect(compact).toHaveBeenCalledWith("preserve decisions");
+			await expect(client.invokeUiAction(SESSION_RENAME_ACTION_ID, { args: { name: "  D.2  " } })).resolves.toEqual({
+				action: SESSION_RENAME_ACTION_ID,
+				status: "completed",
+				stateChanged: true,
+				message: "Session name set: D.2",
+			});
+			expect(setSessionName).toHaveBeenCalledWith("D.2");
 			await expect(client.invokeUiAction("review.uncommitted", { args: {} })).rejects.toThrow(
 				"UI action not available: review.uncommitted",
 			);
@@ -771,16 +898,15 @@ describe("createInProcessRpcClient", () => {
 
 		try {
 			const actions = await client.getUiActions("all");
-			const builtinAction = actions.find((action) => action.source === "builtin");
+			const builtinActions = actions.filter((action) => action.source === "builtin");
 			const dynamicActions = actions.filter((action) => action.source !== "builtin");
 
-			expect(builtinAction).toEqual(
-				expect.objectContaining({
-					id: SESSION_NEW_ACTION_ID,
-					label: "New session",
-					remoteSafe: false,
-				}),
-			);
+			expect(builtinActions.map((action) => action.id)).toEqual([
+				SESSION_NEW_ACTION_ID,
+				RUN_CANCEL_ACTION_ID,
+				CONTEXT_COMPACT_ACTION_ID,
+				SESSION_RENAME_ACTION_ID,
+			]);
 			expect(dynamicActions).toHaveLength(4);
 			expect(dynamicActions.map((action) => action.id)).toEqual([
 				expect.stringMatching(/^extension\.command\.ec_[a-f0-9]{12}_1$/),
@@ -797,7 +923,7 @@ describe("createInProcessRpcClient", () => {
 			expect(dynamicActions.map((action) => action.source)).toEqual(["extension", "extension", "prompt", "skill"]);
 			expect(dynamicActions.map((action) => action.category)).toEqual(["extension", "extension", "prompt", "skill"]);
 			expect(dynamicActions.every((action) => action.remoteSafe)).toBe(true);
-			expect(actions.every((action) => action.enabled)).toBe(true);
+			expect(dynamicActions.every((action) => action.enabled)).toBe(true);
 			expect(dynamicActions[0].sourceScope).toBe("project");
 			expect(dynamicActions[0].sourceOrigin).toBe("top-level");
 			expect(dynamicActions[0].sourceLabel).toBe("Project");
@@ -1106,11 +1232,15 @@ function createRuntimeHost(
 	dispose: () => Promise<void>,
 	bindExtensions: (bindings: ExtensionBindings) => Promise<void> = async () => {},
 	resources: {
+		abort?: () => Promise<void>;
+		compact?: (customInstructions?: string) => Promise<ReturnType<typeof createCompactionResult>>;
 		commands?: ResolvedCommand[];
+		isCompacting?: boolean;
 		isStreaming?: boolean;
 		newSession?: (options?: { parentSession?: string }) => Promise<{ cancelled: boolean }>;
 		prompt?: (message: string, options?: PromptOptions) => Promise<void>;
 		prompts?: PromptTemplate[];
+		setSessionName?: (name: string) => void;
 		skills?: Skill[];
 	} = {},
 ): AgentSessionRuntime {
@@ -1124,7 +1254,7 @@ function createRuntimeHost(
 			model: undefined,
 			thinkingLevel: "off",
 			isStreaming: resources.isStreaming ?? false,
-			isCompacting: false,
+			isCompacting: resources.isCompacting ?? false,
 			steeringMode: "one-at-a-time",
 			followUpMode: "one-at-a-time",
 			sessionFile: undefined,
@@ -1145,6 +1275,9 @@ function createRuntimeHost(
 			resourceLoader: {
 				getSkills: vi.fn(() => ({ skills: resources.skills ?? [], diagnostics: [] })),
 			},
+			abort: resources.abort ?? vi.fn(async () => {}),
+			compact: resources.compact ?? vi.fn(async () => createCompactionResult()),
+			setSessionName: resources.setSessionName ?? vi.fn(() => {}),
 		},
 		newSession: resources.newSession ?? vi.fn(async () => ({ cancelled: true })),
 		switchSession: vi.fn(async () => ({ cancelled: true })),
@@ -1152,6 +1285,14 @@ function createRuntimeHost(
 		dispose,
 		setRebindSession: vi.fn(),
 	} as unknown as AgentSessionRuntime;
+}
+
+function createCompactionResult() {
+	return {
+		summary: "summary",
+		firstKeptEntryId: "entry-1",
+		tokensBefore: 100,
+	};
 }
 
 function createSourceInfo(

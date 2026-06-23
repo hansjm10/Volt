@@ -7,9 +7,11 @@ import type {
 } from "./rpc/types.ts";
 
 type RuntimeNewSession = AgentSessionRuntime["newSession"];
+type RuntimeSession = AgentSessionRuntime["session"];
 
 export type HostActionNewSessionOptions = Parameters<RuntimeNewSession>[0];
 export type HostActionNewSessionResult = Awaited<ReturnType<RuntimeNewSession>>;
+export type HostActionCompactResult = Awaited<ReturnType<RuntimeSession["compact"]>>;
 
 export interface HostActionSessionState {
 	isStreaming: boolean;
@@ -21,8 +23,11 @@ export interface HostActionDescriptorContext {
 }
 
 export interface HostActionInvocationContext extends HostActionDescriptorContext {
+	abortRun(): Promise<void>;
+	compactContext(customInstructions?: string): Promise<HostActionCompactResult>;
 	newSession(options?: HostActionNewSessionOptions): Promise<HostActionNewSessionResult>;
 	afterSessionSwitch?: () => Promise<void>;
+	renameSession(name: string): void;
 }
 
 export type HostActionAvailability =
@@ -60,8 +65,15 @@ export interface HostActionSlashCommand {
 	description: string;
 }
 
+export const CONTEXT_COMPACT_ACTION_ID = "context.compact";
+export const CONTEXT_COMPACT_SLASH_ALIAS = "compact";
+export const RUN_CANCEL_ACTION_ID = "run.cancel";
 export const SESSION_NEW_ACTION_ID = "session.new";
 export const SESSION_NEW_SLASH_ALIAS = "clear";
+export const SESSION_RENAME_ACTION_ID = "session.rename";
+export const SESSION_RENAME_SLASH_ALIAS = "name";
+
+const REMOTE_SAFE_BUILTIN_HOST_ACTION_IDS = new Set<string>([SESSION_NEW_ACTION_ID, RUN_CANCEL_ACTION_ID]);
 
 export class HostActionRegistry {
 	private readonly actionIds: string[] = [];
@@ -192,6 +204,26 @@ export async function runSessionNewHostAction(
 	return result;
 }
 
+export async function runCancelHostAction(context: HostActionInvocationContext): Promise<void> {
+	await context.abortRun();
+}
+
+export async function runContextCompactHostAction(
+	context: HostActionInvocationContext,
+	customInstructions?: string,
+): Promise<HostActionCompactResult> {
+	return context.compactContext(customInstructions);
+}
+
+export function runSessionRenameHostAction(context: HostActionInvocationContext, name: string): string {
+	const trimmedName = name.trim();
+	if (!trimmedName) {
+		throw new Error("Session name cannot be empty");
+	}
+	context.renameSession(trimmedName);
+	return trimmedName;
+}
+
 export function registerBuiltinHostActions(registry: HostActionRegistry): HostActionRegistry {
 	registry.register({
 		id: SESSION_NEW_ACTION_ID,
@@ -203,7 +235,7 @@ export function registerBuiltinHostActions(registry: HostActionRegistry): HostAc
 		destructive: false,
 		requiresConfirmation: false,
 		streamingBehavior: "disabled",
-		remoteSafe: false,
+		remoteSafe: true,
 		slashAliases: [
 			{
 				name: SESSION_NEW_SLASH_ALIAS,
@@ -212,6 +244,82 @@ export function registerBuiltinHostActions(registry: HostActionRegistry): HostAc
 		],
 		availability: () => ({ enabled: true }),
 		handler: invokeSessionNewAction,
+	});
+	registry.register({
+		id: RUN_CANCEL_ACTION_ID,
+		label: "Cancel run",
+		description: "Abort the current agent operation",
+		category: "session",
+		presentation: { kind: "button", group: "Session" },
+		args: [],
+		destructive: false,
+		requiresConfirmation: false,
+		streamingBehavior: "immediate",
+		remoteSafe: true,
+		availability: (context) =>
+			context.session.isStreaming
+				? { enabled: true }
+				: { enabled: false, disabledReason: "No active run to cancel" },
+		handler: invokeRunCancelAction,
+	});
+	registry.register({
+		id: CONTEXT_COMPACT_ACTION_ID,
+		label: "Compact context",
+		description: "Summarize the current session context",
+		category: "context",
+		presentation: { kind: "palette", group: "Context" },
+		args: [
+			{
+				name: "customInstructions",
+				label: "Custom instructions",
+				type: "string",
+				required: false,
+				multiline: true,
+			},
+		],
+		destructive: false,
+		requiresConfirmation: false,
+		streamingBehavior: "disabled",
+		remoteSafe: false,
+		slashAliases: [
+			{
+				name: CONTEXT_COMPACT_SLASH_ALIAS,
+				example: `/${CONTEXT_COMPACT_SLASH_ALIAS}`,
+			},
+		],
+		availability: (context) =>
+			context.session.isCompacting
+				? { enabled: false, disabledReason: "Compaction is already running" }
+				: { enabled: true },
+		handler: invokeContextCompactAction,
+	});
+	registry.register({
+		id: SESSION_RENAME_ACTION_ID,
+		label: "Rename session",
+		description: "Set the current session display name",
+		category: "session",
+		presentation: { kind: "palette", group: "Session" },
+		args: [
+			{
+				name: "name",
+				label: "Name",
+				type: "string",
+				required: true,
+				placeholder: "Session name",
+			},
+		],
+		destructive: false,
+		requiresConfirmation: false,
+		streamingBehavior: "immediate",
+		remoteSafe: false,
+		slashAliases: [
+			{
+				name: SESSION_RENAME_SLASH_ALIAS,
+				example: `/${SESSION_RENAME_SLASH_ALIAS} <name>`,
+			},
+		],
+		availability: () => ({ enabled: true }),
+		handler: invokeSessionRenameAction,
 	});
 	return registry;
 }
@@ -224,6 +332,10 @@ export const BUILTIN_HOST_ACTION_REGISTRY = createBuiltinHostActionRegistry();
 
 export function getBuiltinHostActionSlashCommand(alias: string): HostActionSlashCommand | undefined {
 	return BUILTIN_HOST_ACTION_REGISTRY.getSlashCommand(alias);
+}
+
+export function isRemoteSafeBuiltinHostActionId(actionId: string): boolean {
+	return REMOTE_SAFE_BUILTIN_HOST_ACTION_IDS.has(actionId);
 }
 
 async function invokeSessionNewAction(
@@ -241,6 +353,50 @@ async function invokeSessionNewAction(
 		response.actionsChanged = true;
 	}
 	return response;
+}
+
+async function invokeRunCancelAction(
+	context: HostActionInvocationContext,
+	args: unknown,
+): Promise<UiActionInvocationResponse> {
+	assertNoActionArgs(args);
+	await runCancelHostAction(context);
+	return {
+		action: RUN_CANCEL_ACTION_ID,
+		status: "completed",
+		stateChanged: true,
+		actionsChanged: true,
+		message: "Run cancelled",
+	};
+}
+
+async function invokeContextCompactAction(
+	context: HostActionInvocationContext,
+	args: unknown,
+): Promise<UiActionInvocationResponse> {
+	const customInstructions = getOptionalStringArg(args, "customInstructions");
+	await runContextCompactHostAction(context, customInstructions);
+	return {
+		action: CONTEXT_COMPACT_ACTION_ID,
+		status: "completed",
+		stateChanged: true,
+		actionsChanged: true,
+		message: "Context compacted",
+	};
+}
+
+async function invokeSessionRenameAction(
+	context: HostActionInvocationContext,
+	args: unknown,
+): Promise<UiActionInvocationResponse> {
+	const name = getRequiredStringArg(args, "name");
+	const trimmedName = runSessionRenameHostAction(context, name);
+	return {
+		action: SESSION_RENAME_ACTION_ID,
+		status: "completed",
+		stateChanged: true,
+		message: `Session name set: ${trimmedName}`,
+	};
 }
 
 function createDescriptor(action: HostActionDefinition, context: HostActionDescriptorContext): UiActionDescriptor {
@@ -284,4 +440,38 @@ function assertNoActionArgs(args: unknown): void {
 	if (unknownKeys.length > 0) {
 		throw new Error(`Unsupported UI action argument: ${unknownKeys[0]}`);
 	}
+}
+
+function getArgsRecord(args: unknown): Record<string, unknown> {
+	if (args === undefined) {
+		return {};
+	}
+	if (typeof args !== "object" || args === null || Array.isArray(args)) {
+		throw new Error("UI action args must be an object");
+	}
+	return args as Record<string, unknown>;
+}
+
+function getOptionalStringArg(args: unknown, name: string): string | undefined {
+	const record = getArgsRecord(args);
+	const unknownKeys = Object.keys(record).filter((key) => key !== name);
+	if (unknownKeys.length > 0) {
+		throw new Error(`Unsupported UI action argument: ${unknownKeys[0]}`);
+	}
+	const value = record[name];
+	if (value === undefined || value === null) {
+		return undefined;
+	}
+	if (typeof value !== "string") {
+		throw new Error(`UI action argument "${name}" must be a string`);
+	}
+	return value;
+}
+
+function getRequiredStringArg(args: unknown, name: string): string {
+	const value = getOptionalStringArg(args, name);
+	if (value === undefined) {
+		throw new Error(`Missing required UI action argument: ${name}`);
+	}
+	return value;
 }

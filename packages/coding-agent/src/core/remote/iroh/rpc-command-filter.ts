@@ -1,3 +1,4 @@
+import { isRemoteSafeBuiltinHostActionId } from "../../host-actions.ts";
 import { serializeJsonLine } from "../../rpc/jsonl.ts";
 
 export const IROH_REMOTE_RPC_CANCELLATION_TYPES = new Set(["abort"]);
@@ -113,7 +114,10 @@ export function getIrohRemoteRpcFilterResult(line: string): IrohRemoteRpcFilterR
 }
 
 function isIrohRemoteUiActionId(action: string): boolean {
-	return IROH_REMOTE_UI_ACTION_PREFIXES.some((prefix) => action.startsWith(prefix));
+	return (
+		isRemoteSafeBuiltinHostActionId(action) ||
+		IROH_REMOTE_UI_ACTION_PREFIXES.some((prefix) => action.startsWith(prefix))
+	);
 }
 
 export function serializeIrohRemoteRpcFilterRejection(response: IrohRemoteRpcErrorResponse): string {

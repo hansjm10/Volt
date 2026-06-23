@@ -271,7 +271,7 @@ Messages are `AgentMessage` objects (see [Message Types](#message-types)).
 
 Native UI action commands let typed clients discover host-owned actions for native cards, buttons, toggles, pickers, and command palettes. They are distinct from raw slash command strings: slash commands are presentation aliases, while action ids are the invocation contract.
 
-The current local RPC implementation exposes the v1 protocol shape, sanitized palette descriptors, and prompt-like invocation for extension commands, prompt templates, and skills. Iroh remote transports allow discovery plus `invoke_ui_action` for the currently advertised remote-safe projected extension command, prompt template, and skill actions. Local-only built-ins and unreviewed action ids remain blocked remotely.
+The current local RPC implementation exposes the v1 protocol shape, sanitized palette descriptors, shared built-in actions, and prompt-like invocation for extension commands, prompt templates, and skills. Iroh remote transports allow discovery plus `invoke_ui_action` for the currently advertised remote-safe built-in and projected extension command, prompt template, and skill actions. Local-only built-ins and unreviewed action ids remain blocked remotely.
 
 #### get_ui_capabilities
 
@@ -375,6 +375,15 @@ Descriptor fields are advisory snapshots. The host remains authoritative and may
 
 Projected extension command, prompt template, and skill actions use session-local opaque ids. Descriptors include bounded display strings, source kind, source scope/origin, and a safe source label such as `"Project"`, `"User"`, `"Temporary"`, or `"Package"`. They do not include extension source paths, prompt file paths or bodies, skill file paths, skill base directories, or raw `sourceInfo`.
 
+Built-in v1 actions currently include:
+
+| Action id | Slash alias | Remote over Iroh | Notes |
+| --- | --- | --- | --- |
+| `session.new` | `/clear` | yes | Starts a fresh session through the same host path as `new_session`. |
+| `run.cancel` | none | yes | Aborts the current agent operation through the same host path as `abort`; descriptors may be disabled when no run is active. |
+| `context.compact` | `/compact` | no | Runs host compaction through the same handler as the local `compact` RPC command. |
+| `session.rename` | `/name <name>` | no | Sets the current session display name through the same handler as `set_session_name`. |
+
 #### invoke_ui_action
 
 Invoke a native UI action by descriptor id.
@@ -423,7 +432,7 @@ For projected dynamic actions, invocation uses the host's existing prompt semant
 - Extension command actions invoke their registered slash command and return `handled` when the command handler completes. They do not require an `agent_end` event.
 - Prompt template and skill actions send their slash alias through host prompt expansion. While idle they return `accepted`; while the agent is streaming they require `streamingBehavior: "steer"` or `"followUp"` and return `queued`.
 - Dynamic action ids are opaque and tied to the current action catalog. After a reload, session replacement, or catalog change, clients must refresh descriptors; stale ids are rejected instead of being remapped to another action.
-- Over Iroh, v1 invocation is allowlist-based and forwards only projected dynamic ids under `extension.command.*`, `prompt.template.*`, and `skill.*`. Local-only built-ins such as deferred review/model actions are rejected with a normal RPC error.
+- Over Iroh, v1 invocation is allowlist-based and forwards only exact reviewed built-in ids (`session.new`, `run.cancel`) plus projected dynamic ids under `extension.command.*`, `prompt.template.*`, and `skill.*`. Local-only built-ins such as `context.compact`, `session.rename`, deferred review/model actions, and unreviewed prefixes are rejected with a normal RPC error.
 
 #### Native UI Action Security
 
