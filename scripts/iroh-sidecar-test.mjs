@@ -130,9 +130,9 @@ function waitForExit(child, label, output, options = {}) {
 	});
 }
 
-async function waitForFirstStdoutLine(child, output, label) {
+async function waitForFirstStdoutLine(child, output, label, timeoutMs = TICKET_TIMEOUT_MS) {
 	const startedAt = Date.now();
-	while (Date.now() - startedAt < TICKET_TIMEOUT_MS) {
+	while (Date.now() - startedAt < timeoutMs) {
 		const newlineIndex = output.stdout.indexOf("\n");
 		if (newlineIndex !== -1) {
 			return output.stdout.slice(0, newlineIndex).trim();
@@ -142,7 +142,7 @@ async function waitForFirstStdoutLine(child, output, label) {
 		}
 		await new Promise((resolveWait) => setTimeout(resolveWait, 50));
 	}
-	throw new Error(`${label} did not print a ticket within ${TICKET_TIMEOUT_MS}ms:\n${output.stderr}`);
+	throw new Error(`${label} did not print a ticket within ${timeoutMs}ms:\n${output.stderr}`);
 }
 
 async function waitForHostReady(child, output, label) {
@@ -893,6 +893,57 @@ async function expectHostClientFailure({ clientArgs, clientStatePath, hostArgs, 
 		await waitForExit(host.child, `${label} host`, host.output);
 		assert(clientOutput.exit.code !== 0, `${label} client unexpectedly succeeded`);
 		return { clientOutput, hostOutput: host.output, ticket };
+	} finally {
+		await stopProcess(host.child);
+	}
+}
+
+function createSecretFreeWorkspaceTicket(ticket, workspace) {
+	const payload = decodeTicketPayload(ticket);
+	delete payload.expiresAt;
+	delete payload.secret;
+	payload.workspace = workspace;
+	return encodeTicketPayload(payload);
+}
+
+async function runHostClientWithTicketOnce({
+	clientArgs,
+	clientTimeoutMs,
+	clientStatePath,
+	expectSuccess = true,
+	hostArgs,
+	hostExitTimeoutMs,
+	hostReadyTimeoutMs,
+	hostStatePath,
+	label,
+	refreshEndpointTicket = false,
+	ticket,
+	waitForHostExit = true,
+}) {
+	const host = startHost(["--state", hostStatePath, "--once", ...hostArgs]);
+	try {
+		const hostTicket = await waitForFirstStdoutLine(host.child, host.output, `${label} host`, hostReadyTimeoutMs);
+		let clientTicket = ticket;
+		if (refreshEndpointTicket) {
+			const hostPayload = decodeTicketPayload(hostTicket);
+			const clientPayload = decodeTicketPayload(ticket);
+			clientPayload.irohTicket = hostPayload.irohTicket;
+			clientPayload.nodeId = hostPayload.nodeId;
+			clientPayload.relayMode = hostPayload.relayMode;
+			clientTicket = encodeTicketPayload(clientPayload);
+		}
+		const clientOutput = await runClient(clientTicket, clientStatePath, clientArgs, {
+			expectSuccess,
+			label: `${label} client`,
+			timeoutMs: clientTimeoutMs,
+		});
+		if (waitForHostExit) {
+			await waitForExit(host.child, `${label} host`, host.output, { timeoutMs: hostExitTimeoutMs });
+		}
+		if (!expectSuccess) {
+			assert(clientOutput.exit.code !== 0, `${label} client unexpectedly succeeded`);
+		}
+		return { clientOutput, hostOutput: host.output };
 	} finally {
 		await stopProcess(host.child);
 	}
@@ -2446,6 +2497,228 @@ async function pairingAndRevocationScenario() {
 	});
 }
 
+async function multiWorkspaceReconnectScenario() {
+	await withStateDir("multi-workspace", async ({ clientStatePath, hostStatePath, stateDir }) => {
+		const { logPath, sourceDir } = await createFakeSourceVolt(stateDir);
+		const alphaWorkspacePath = join(stateDir, "alpha-workspace");
+		const betaWorkspacePath = join(stateDir, "beta-workspace");
+		await mkdir(alphaWorkspacePath, { recursive: true });
+		await mkdir(betaWorkspacePath, { recursive: true });
+		const canonicalAlphaWorkspacePath = await realpath(alphaWorkspacePath);
+		const canonicalBetaWorkspacePath = await realpath(betaWorkspacePath);
+
+		async function registerWorkspace(name, workspacePath) {
+			const registerCommand = spawnSourceCli([
+				"remote",
+				"host",
+				"--state",
+				hostStatePath,
+				"--register-workspace",
+				`${name}=${workspacePath}`,
+				"--allow-tools",
+				DEFAULT_TEST_ALLOW_TOOLS,
+			]);
+			await waitForExit(registerCommand.child, `register ${name} workspace`, registerCommand.output);
+			assert(
+				registerCommand.output.stderr.includes(`registered workspace: ${name} ->`),
+				`Expected ${name} registration confirmation, got:\n${registerCommand.output.stderr}`,
+			);
+		}
+
+		const hostArgs = ["--source-volt", sourceDir, "--relay", "default", "--no-pairing"];
+		const relayHostReadyTimeoutMs = 30_000;
+		const relayHostExitTimeoutMs = 30_000;
+		const relayClientTimeoutMs = 30_000;
+		await registerWorkspace("alpha", alphaWorkspacePath);
+
+		let pairTicket;
+		const pairHost = startHost(["--state", hostStatePath, "--once", ...hostArgs]);
+		try {
+			await waitForFirstStdoutLine(
+				pairHost.child,
+				pairHost.output,
+				"multi-workspace pair host",
+				relayHostReadyTimeoutMs,
+			);
+			const pairCommand = spawnSourceCli([
+				"remote",
+				"pair",
+				"--state",
+				hostStatePath,
+				"--workspace",
+				"alpha",
+				"--relay",
+				"default",
+				"--allow-tools",
+				DEFAULT_TEST_ALLOW_TOOLS,
+				"--label",
+				"multi-workspace client",
+			]);
+			await waitForExit(pairCommand.child, "multi-workspace pair command", pairCommand.output);
+			const pairStdoutLines = pairCommand.output.stdout
+				.trim()
+				.split("\n")
+				.filter((line) => line.length > 0);
+			assert(
+				pairStdoutLines.length === 1 && pairStdoutLines[0].startsWith(TICKET_PREFIX),
+				`Expected multi-workspace pair command to emit one ticket, got:\nstdout:\n${pairCommand.output.stdout}\nstderr:\n${pairCommand.output.stderr}`,
+			);
+			pairTicket = pairStdoutLines[0];
+			const pairPayload = decodeTicketPayload(pairTicket);
+			assert(pairPayload.workspace === "alpha", `Expected alpha pairing ticket, got:\n${JSON.stringify(pairPayload)}`);
+			assert(pairPayload.relayMode === "default", `Expected relay default ticket, got:\n${JSON.stringify(pairPayload)}`);
+			assert(pairPayload.secret, `Expected initial pairing ticket to include a secret, got:\n${JSON.stringify(pairPayload)}`);
+
+			const initialPairOutput = await runClient(
+				pairTicket,
+				clientStatePath,
+				["--message", "multi workspace pair", "--timeout-ms", "10000"],
+				{ label: "multi-workspace initial pair client", timeoutMs: relayClientTimeoutMs },
+			);
+			assert(
+				initialPairOutput.stdout.includes("fake source Volt response: multi workspace pair"),
+				`Expected initial pair response, got:\n${initialPairOutput.stdout}`,
+			);
+		} finally {
+			await stopProcess(pairHost.child);
+		}
+		assert(pairTicket, "Pair command did not produce a ticket");
+
+		await registerWorkspace("beta", betaWorkspacePath);
+
+		const alphaReconnectTicket = createSecretFreeWorkspaceTicket(pairTicket, "alpha");
+		const betaReconnectTicket = createSecretFreeWorkspaceTicket(pairTicket, "beta");
+		for (const [name, ticket] of [
+			["alpha", alphaReconnectTicket],
+			["beta", betaReconnectTicket],
+		]) {
+			const payload = decodeTicketPayload(ticket);
+			assert(payload.workspace === name, `Expected ${name} reconnect ticket, got:\n${JSON.stringify(payload)}`);
+			assert(payload.relayMode === "default", `Expected ${name} reconnect relay default, got:\n${JSON.stringify(payload)}`);
+			assert(payload.secret === undefined, `Expected ${name} reconnect ticket to omit secret, got:\n${JSON.stringify(payload)}`);
+			assert(
+				payload.expiresAt === undefined,
+				`Expected ${name} reconnect ticket to omit expiresAt, got:\n${JSON.stringify(payload)}`,
+			);
+		}
+
+		const refreshed = await runHostClientWithTicketOnce({
+			clientArgs: ["--get-state", "--timeout-ms", "10000"],
+			clientTimeoutMs: relayClientTimeoutMs,
+			clientStatePath,
+			hostArgs,
+			hostExitTimeoutMs: relayHostExitTimeoutMs,
+			hostReadyTimeoutMs: relayHostReadyTimeoutMs,
+			hostStatePath,
+			label: "multi-workspace metadata refresh",
+			refreshEndpointTicket: true,
+			ticket: alphaReconnectTicket,
+			waitForHostExit: false,
+		});
+		const refreshedState = JSON.parse(refreshed.clientOutput.stdout);
+		assert(
+			refreshedState.remoteHost?.workspace === "alpha" &&
+				JSON.stringify(refreshedState.remoteHost?.workspaceNames) === JSON.stringify(["alpha", "beta"]),
+			`Expected refreshed workspace names alpha,beta, got:\n${refreshed.clientOutput.stdout}`,
+		);
+
+		const betaOutput = await runHostClientWithTicketOnce({
+			clientArgs: ["--message", "multi workspace beta", "--timeout-ms", "10000"],
+			clientTimeoutMs: relayClientTimeoutMs,
+			clientStatePath,
+			hostArgs,
+			hostExitTimeoutMs: relayHostExitTimeoutMs,
+			hostReadyTimeoutMs: relayHostReadyTimeoutMs,
+			hostStatePath,
+			label: "multi-workspace beta reconnect",
+			refreshEndpointTicket: true,
+			ticket: betaReconnectTicket,
+			waitForHostExit: false,
+		});
+		assert(
+			betaOutput.clientOutput.stdout.includes("fake source Volt response: multi workspace beta"),
+			`Expected beta reconnect response, got:\n${betaOutput.clientOutput.stdout}`,
+		);
+
+		const alphaOutput = await runHostClientWithTicketOnce({
+			clientArgs: ["--message", "multi workspace alpha", "--timeout-ms", "10000"],
+			clientTimeoutMs: relayClientTimeoutMs,
+			clientStatePath,
+			hostArgs,
+			hostExitTimeoutMs: relayHostExitTimeoutMs,
+			hostReadyTimeoutMs: relayHostReadyTimeoutMs,
+			hostStatePath,
+			label: "multi-workspace alpha reconnect",
+			refreshEndpointTicket: true,
+			ticket: alphaReconnectTicket,
+			waitForHostExit: false,
+		});
+		assert(
+			alphaOutput.clientOutput.stdout.includes("fake source Volt response: multi workspace alpha"),
+			`Expected alpha reconnect response, got:\n${alphaOutput.clientOutput.stdout}`,
+		);
+
+		const entries = (await readFile(logPath, "utf8"))
+			.trim()
+			.split("\n")
+			.filter((line) => line.length > 0)
+			.map((line) => JSON.parse(line));
+		const expectedCwds = [
+			canonicalAlphaWorkspacePath,
+			canonicalAlphaWorkspacePath,
+			canonicalBetaWorkspacePath,
+			canonicalAlphaWorkspacePath,
+		];
+		assert(
+			JSON.stringify(entries.map((entry) => entry.cwd)) === JSON.stringify(expectedCwds),
+			`Expected child cwd sequence ${JSON.stringify(expectedCwds)}, got:\n${JSON.stringify(entries)}`,
+		);
+
+		const pairedOutput = await runHostCommand(["clients", "--state", hostStatePath]);
+		const pairedClients = JSON.parse(pairedOutput.stdout);
+		assert(pairedClients.length === 1, `Expected one multi-workspace client, got:\n${pairedOutput.stdout}`);
+		assert(
+			Array.isArray(pairedClients[0].allowedWorkspaces) && pairedClients[0].allowedWorkspaces.length === 0,
+			`Expected multi-workspace client to have wildcard workspace grant, got:\n${pairedOutput.stdout}`,
+		);
+		await runHostCommand(["revoke", pairedClients[0].nodeId, "--state", hostStatePath]);
+
+		for (const [name, ticket] of [
+			["beta", betaReconnectTicket],
+			["alpha", alphaReconnectTicket],
+		]) {
+			const revoked = await runHostClientWithTicketOnce({
+				clientArgs: ["--get-state", "--timeout-ms", "10000"],
+				clientTimeoutMs: relayClientTimeoutMs,
+				clientStatePath,
+				expectSuccess: false,
+				hostArgs,
+				hostExitTimeoutMs: relayHostExitTimeoutMs,
+				hostReadyTimeoutMs: relayHostReadyTimeoutMs,
+				hostStatePath,
+				label: `multi-workspace revoked ${name} reconnect`,
+				refreshEndpointTicket: true,
+				ticket,
+				waitForHostExit: false,
+			});
+			assert(
+				revoked.clientOutput.stderr.includes("client_revoked: client is revoked"),
+				`Expected revoked ${name} reconnect to fail with client_revoked, got:\n${revoked.clientOutput.stderr}`,
+			);
+		}
+
+		const finalEntries = (await readFile(logPath, "utf8"))
+			.trim()
+			.split("\n")
+			.filter((line) => line.length > 0)
+			.map((line) => JSON.parse(line));
+		assert(
+			finalEntries.length === expectedCwds.length,
+			`Expected revoked reconnects not to start child processes, got:\n${JSON.stringify(finalEntries)}`,
+		);
+	});
+}
+
 async function auditLogScenario() {
 	await withStateDir("audit", async ({ clientStatePath, hostStatePath, stateDir }) => {
 		await runHostClientOnce({
@@ -2790,6 +3063,7 @@ const scenarios = [
 	["pair command", pairCommandScenario],
 	["active revocation", activeRevocationScenario],
 	["pairing and revocation", pairingAndRevocationScenario],
+	["multi-workspace reconnect", multiWorkspaceReconnectScenario],
 	["audit log", auditLogScenario],
 	["paired client persisted tools", pairedClientPersistedToolsScenario],
 	["unsafe tool gates", unsafeToolGateScenario],

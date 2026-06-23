@@ -946,6 +946,15 @@ Minimum smoke:
 11. Revoke phone/client.
 12. Verify reconnect to both A and B fails with `client_revoked`.
 
+Resolved 2026-06-23: the native Iroh scenario suite includes a
+`multi-workspace reconnect` smoke using relay mode `default` and a persistent
+temp host state. It registers workspace A, pairs once with A through the
+pair-control command, registers workspace B, verifies `remoteHost.workspaceNames`
+contains A and B, reconnects to B and back to A with secret-free workspace
+tickets, verifies the source child cwd for each selected workspace, revokes the
+client, and verifies secret-free reconnects to both A and B fail with
+`client_revoked`.
+
 ## Acceptance Criteria
 
 - `volt remote host --register-workspace` registers the current directory in the default host state.
