@@ -360,6 +360,8 @@ iOS app:
   - saved host invalid
   - pairing ticket expired
 
+Implemented 2026-06-22: the iOS Settings screen now shows saved-host status, saved-host issue details, Retry for offline/workspace recovery, Pair Again for invalid/mismatched/unknown/revoked/expired/consumed pairing states, and Forget Host. Host offline uses Retry as the primary action and does not make QR scanning the ordinary offline recovery path. The chat connection header also shows saved-host issue detail and a warning state for Host offline.
+
 Detailed iOS UX and state behavior lives in `/Users/jordan.hans/Projects/volt-app/.volt/designs/iroh-saved-host-app-design.md`.
 
 ## Auth and Error Outcomes

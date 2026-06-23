@@ -346,10 +346,10 @@ blocked.
     <evidence>2026-06-22: iOS Forget Host now uses an explicit endpoint identity reset path, clears saved-host issue state with the selected saved record, preserves endpoint identity for client_unknown/client_revoked outcomes until intentional forget, and an Iroh transport regression proves reset rotates the client node ID for later re-pair; verification: cd ../volt-app/Packages/VoltClient &amp;&amp; swift test, app package diff/app design whitespace checks, and root doc diff check passed; app commit b9ed40e.</evidence>
   </item>
 
-  <item ref="C.4" status="open" prereq="C.2,C.3">
+  <item ref="C.4" status="resolved" prereq="C.2,C.3">
     <title>Add app UI affordances for saved host, offline, and Pair Again flows</title>
     <acceptance>Settings or connection UI shows saved host status, Host offline, Retry, Forget Host, Pair Again where appropriate, and does not make QR scanning the main path for ordinary offline states; simulator or Swift tests cover visible state decisions where possible.</acceptance>
-    <evidence/>
+    <evidence>2026-06-22: iOS Settings now shows saved-host status, issue detail, Retry, Forget Host, and Pair Again only for invalid/mismatched/unknown/revoked/expired/consumed states while Host offline uses Retry instead of QR scanning; Chat header shows saved-host issue detail and Host offline warning state; verification: cd ../volt-app/Packages/VoltClient &amp;&amp; swift test, XcodeBuildMCP test_sim on Volt scheme with iPhone 17 Pro iOS 27.0, app package diff/app design whitespace checks, and root doc diff check passed; app commit 79a7af7.</evidence>
   </item>
 </group>
 
