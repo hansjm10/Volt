@@ -181,18 +181,22 @@ The host forwards only these inbound RPC command `type` values from remote clien
 - `new_session`
 - `get_state`
 - `get_transcript`
+- `get_ui_capabilities`
+- `get_ui_actions`
 - `list_sessions`
 - `switch_session_by_id`
 - `extension_ui_response`
 
 All other command types receive a JSONL `response` with `success:false` and are not forwarded to the local Volt RPC process. Within this allowlist, only `abort` is a direct cancellation command.
 
-The preview RPC surface intentionally stays narrow. It excludes local tools such as `bash`, `edit`, and `write`; those tools can only be used through the normal model/tool flow and host-side permission policy. It also excludes read-only local RPC commands such as `get_messages`, `get_commands`, `get_last_assistant_text`, and `get_available_models` for v1 preview:
+`get_ui_capabilities` and `get_ui_actions` are read-only native UI action discovery commands. They expose the v1 action descriptor protocol and sanitized descriptor metadata for extension commands, prompt templates, and skills. Descriptor responses omit prompt bodies, skill content, raw `sourceInfo`, extension source paths, prompt and skill file paths, skill base directories, host session files, provider metadata, and secrets. They still pass through the outbound path handling layer below before being written to the remote stream. `invoke_ui_action` remains blocked remotely until action invocation has separate reauthorization and action-level remote-safety checks.
+
+The preview RPC surface intentionally stays narrow. It excludes local tools such as `bash`, `edit`, and `write`; those tools can only be used through the normal model/tool flow and host-side permission policy. It also excludes read-only local RPC commands such as `get_messages`, `get_commands`, `get_last_assistant_text`, and `get_available_models` for v1 preview.
 
 The path-based `switch_session` command remains blocked remotely; remote clients must use workspace-scoped `switch_session_by_id` instead. `get_transcript` is the remote-safe transcript read: it returns only the active session's projected user, assistant, tool-summary, and compaction-summary items, ordered oldest-to-newest, with default limit 100 and server cap 200. Host session file paths, raw `get_messages` payloads, thinking blocks, raw tool output, full file contents, provider payloads, and extension-private custom data are not returned. Transcript path and text fields still pass through the outbound redaction layer below.
 
 - `get_messages` can return the full raw transcript, including prompts, tool output, file excerpts, provider payloads, and extension content beyond the projected transcript needed for reconnect.
-- `get_commands` exposes installed extension, prompt-template, and skill metadata; slash-command use should go through `prompt` until the remote UI command surface is reviewed separately.
+- `get_commands` exposes installed extension, prompt-template, and skill metadata; remote clients must use the sanitized `get_ui_actions` discovery surface instead.
 - `get_last_assistant_text` duplicates streamed assistant output and is superseded remotely by the projected transcript surface.
 - `get_available_models` exposes provider/model availability while remote model selection remains unsupported.
 

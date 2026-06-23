@@ -271,7 +271,7 @@ Messages are `AgentMessage` objects (see [Message Types](#message-types)).
 
 Native UI action commands let typed clients discover host-owned actions for native cards, buttons, toggles, pickers, and command palettes. They are distinct from raw slash command strings: slash commands are presentation aliases, while action ids are the invocation contract.
 
-The current non-remote RPC implementation exposes the v1 protocol shape and sanitized palette descriptors for extension commands, prompt templates, and skills. It does not advertise invocation support yet, and `invoke_ui_action` returns a normal RPC error until action handlers are registered in later implementation phases. Iroh remote transports still reject these commands until a separate allowlist change is made.
+The current RPC implementation exposes the v1 protocol shape and sanitized palette descriptors for extension commands, prompt templates, and skills. It does not advertise invocation support yet, and `invoke_ui_action` returns a normal RPC error until action handlers are registered in later implementation phases. Iroh remote transports allow only the read-only discovery commands, `get_ui_capabilities` and `get_ui_actions`; remote `invoke_ui_action` remains blocked until invocation-time authorization exists.
 
 #### get_ui_capabilities
 
@@ -420,9 +420,9 @@ Only `accepted` and `queued` may require waiting for later agent events. Clients
 
 #### Native UI Action Security
 
-For non-remote RPC, descriptors still must not expose host-local paths, extension source paths, prompt template bodies, skill content, provider secrets, environment values, auth internals, raw model/provider metadata, raw transcript payloads, or host session file paths. Future remote exposure must be allowlist-based and must re-check action availability, authorization, project trust, streaming policy, and argument validity at invocation time.
+Descriptors must not expose host-local paths, extension source paths, prompt template bodies, skill content, provider secrets, environment values, auth internals, raw model/provider metadata, raw transcript payloads, or host session file paths. Iroh remote discovery responses pass through the remote outbound redaction layer in addition to descriptor-level sanitization. Future remote invocation must be allowlist-based and must re-check action availability, authorization, project trust, streaming policy, and argument validity at invocation time.
 
-`get_commands` remains the legacy local command-discovery surface for raw slash invocation and may include source metadata useful to local clients. Remote clients should use sanitized `get_ui_actions` only after the remote allowlist explicitly permits it.
+`get_commands` remains the legacy local command-discovery surface for raw slash invocation and may include source metadata useful to local clients. Remote clients must use sanitized `get_ui_actions`; raw `get_commands` remains blocked over Iroh.
 
 ### Model
 

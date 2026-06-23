@@ -10,6 +10,8 @@ export const IROH_REMOTE_RPC_PASSTHROUGH_TYPES = new Set([
 	"new_session",
 	"get_state",
 	"get_transcript",
+	"get_ui_capabilities",
+	"get_ui_actions",
 	"list_sessions",
 	"switch_session_by_id",
 	"extension_ui_response",

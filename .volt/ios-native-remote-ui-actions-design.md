@@ -1191,6 +1191,18 @@ Concrete behavior:
 - Dynamic descriptors are marked `remoteSafe: true` as an action-level classification, but Iroh remote access remains blocked until B.3 adds the explicit allowlist and outbound descriptor policy.
 - `invoke_ui_action` remains unavailable until B.4 implements prompt-like action invocation and stale-id checks.
 
+## Resolved 2026-06-23: Iroh Safe Action Discovery
+
+B.3 implementation allows read-only native action discovery over Iroh without widening unrelated remote RPC access.
+
+Concrete behavior:
+
+- The Iroh remote RPC command allowlist now forwards `get_ui_capabilities` and `get_ui_actions`.
+- `invoke_ui_action` remains blocked over Iroh until B.5 adds invocation-time reauthorization and action-level remote-safety checks.
+- Raw legacy/local RPC commands remain blocked over Iroh, including `get_messages`, `get_commands`, path-based `switch_session`, unrestricted model listing/selection, local tool RPC such as `bash`, and host file export RPC.
+- Remote action descriptor responses pass through the existing Iroh outbound sanitizer after descriptor-level sanitization. Workspace paths in descriptor-like string or path fields normalize to the remote workspace path, while dedicated redaction/omission rules still apply to known sensitive path fields.
+- `docs/rpc.md` and `docs/iroh-remote-protocol.md` document the remote discovery surface and the continued invocation/legacy-command boundary.
+
 ## Host Implementation Plan
 
 ### Phase A: Design and Inventory

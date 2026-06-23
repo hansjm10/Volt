@@ -3,7 +3,11 @@ import type { ExtensionBindings } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import type { ResolvedCommand } from "../src/core/extensions/types.ts";
 import type { PromptTemplate } from "../src/core/prompt-templates.ts";
-import { createIrohRemoteFilteredRpcTransport, getIrohRemoteRpcFilterResult } from "../src/core/remote/iroh/index.ts";
+import {
+	createIrohRemoteFilteredRpcTransport,
+	getIrohRemoteRpcFilterResult,
+	sanitizeIrohRemoteOutbound,
+} from "../src/core/remote/iroh/index.ts";
 import { createLoopbackRpcTransportPair, type RpcExtensionUIRequest } from "../src/core/rpc/index.ts";
 import type { Skill } from "../src/core/skills.ts";
 import type { SourceInfo } from "../src/core/source-info.ts";
@@ -180,8 +184,25 @@ describe("RpcTransportClient", () => {
 });
 
 describe("Iroh remote RPC filter", () => {
-	test("keeps native UI action commands blocked until explicitly allowlisted", () => {
-		for (const type of ["get_ui_capabilities", "get_ui_actions", "invoke_ui_action"]) {
+	test("allows native UI action discovery while keeping invocation and legacy local commands blocked", () => {
+		for (const type of ["get_ui_capabilities", "get_ui_actions"]) {
+			const command = { id: `${type}-1`, type };
+			expect(getIrohRemoteRpcFilterResult(JSON.stringify(command))).toEqual({
+				allowed: true,
+				command,
+			});
+		}
+
+		for (const type of [
+			"invoke_ui_action",
+			"get_messages",
+			"get_commands",
+			"switch_session",
+			"get_available_models",
+			"set_model",
+			"bash",
+			"export_html",
+		]) {
 			expect(getIrohRemoteRpcFilterResult(JSON.stringify({ id: `${type}-1`, type }))).toEqual({
 				allowed: false,
 				response: {
@@ -193,6 +214,61 @@ describe("Iroh remote RPC filter", () => {
 				},
 			});
 		}
+	});
+
+	test("sanitizes native UI action descriptor responses for remote output", () => {
+		const workspacePath = "/Users/jordan/private-project";
+		const sanitized = sanitizeIrohRemoteOutbound(
+			{
+				id: "actions-1",
+				type: "response",
+				command: "get_ui_actions",
+				success: true,
+				data: {
+					actions: [
+						{
+							schemaVersion: 1,
+							id: "extension.command.ec_1",
+							label: `Deploy from ${workspacePath}/services/api`,
+							description: `Run ${workspacePath}/.volt/agent/extensions/deploy.ts`,
+							source: "extension",
+							sourceScope: "project",
+							sourceOrigin: "top-level",
+							sourceLabel: `Project extension at ${workspacePath}/.volt/agent/extensions`,
+							category: "extension",
+							presentation: {
+								kind: "palette",
+								group: `${workspacePath}/groups/deploy`,
+							},
+							args: [
+								{
+									name: "arguments",
+									type: "string",
+									hint: `Use ${workspacePath}/deploy/config.json`,
+								},
+							],
+							enabled: true,
+							remoteSafe: true,
+							slash: {
+								name: "deploy",
+								example: `/deploy ${workspacePath}/targets/prod`,
+							},
+							filePath: `${workspacePath}/.volt/agent/extensions/deploy.ts`,
+							sourceInfo: {
+								path: `${workspacePath}/.volt/agent/extensions/deploy.ts`,
+								baseDir: `${workspacePath}/.volt/agent/extensions`,
+							},
+						},
+					],
+				},
+			},
+			{ workspacePath, remoteWorkspacePath: "/workspace" },
+		);
+
+		const serialized = JSON.stringify(sanitized);
+		expect(serialized).not.toContain(workspacePath);
+		expect(serialized).not.toContain("private-project");
+		expect(serialized).toContain("/workspace");
 	});
 });
 
