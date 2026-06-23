@@ -1,7 +1,7 @@
 # Iroh Multi-Workspace MVP Design
 
 Date: 2026-06-22
-Status: Proposed
+Status: Implemented for preview use
 
 ## Purpose
 
@@ -925,6 +925,21 @@ tool grants applying across all registered workspaces, revocation blocking every
 workspace for the phone, and the MVP limits around remote workspace management,
 per-workspace grants, and live cwd switching.
 
+Resolved 2026-06-23: D.2 final validation covered the targeted host/core Vitest
+files (`test/remote-cli.test.ts` and `test/remote-iroh-core.test.ts`), the
+filtered native `multi-workspace reconnect` smoke, the full native Iroh scenario
+suite, root `npm run check`, Swift package tests, the Volt scheme iOS simulator
+test, doc whitespace checks for this SPEC and ledger, and a manual iOS simulator
+workspace-selection smoke. The app smoke used relay mode `default`, temp state
+`/tmp/volt-d2-workspace-smoke-BDzjmf/host.json`, host command
+`node scripts/run-coding-agent-source.mjs remote host --state /tmp/volt-d2-workspace-smoke-BDzjmf/host.json --mobile --yes`,
+and iPhone 17 Pro simulator `66257DFE-85C0-4010-9C47-2F7D24225BE6` on iOS
+27.0. It paired once to workspace `volt`, observed registered names including
+`volt`, `other`, and `stale`, selected `other` from Settings without another QR
+and reached Connected with `remoteHost.workspace`/summary workspace `other`,
+then deleted the stale workspace directory, selected `stale`, and verified the
+saved-host state reported `Workspace unavailable` while retaining the saved host.
+
 ## Test Plan
 
 ### Host/core tests
@@ -1009,6 +1024,15 @@ tickets, verifies the source child cwd for each selected workspace, revokes the
 client, and verifies secret-free reconnects to both A and B fail with
 `client_revoked`.
 
+Resolved 2026-06-23: the iOS simulator workspace-selection smoke used iPhone 17
+Pro simulator `66257DFE-85C0-4010-9C47-2F7D24225BE6` on iOS 27.0 against a
+native host with relay mode `default` and temp state
+`/tmp/volt-d2-workspace-smoke-BDzjmf/host.json`. The app was launched with a
+pairing ticket for `volt`, Settings exposed a Workspace popup with `volt`,
+`other`, and `stale`, selecting `other` reconnected without another QR and
+showed Connected Host workspace `other`, and selecting deleted workspace `stale`
+reported `Workspace unavailable` with the saved host retained.
+
 ## Acceptance Criteria
 
 - `volt remote host --register-workspace` registers the current directory in the default host state.
@@ -1023,6 +1047,10 @@ client, and verifies secret-free reconnects to both A and B fail with
 - Unknown workspace names are rejected with `workspace_unavailable`.
 - Host metadata exposes workspace names but never host-local paths.
 - Tests cover registration, authorization, app selection, and security boundaries.
+
+Resolved 2026-06-23: all MVP implementation queue items are resolved, the final
+automated and manual validation evidence is recorded above, and the remaining
+limitations are the explicitly deferred future-work items below.
 
 ## Open Questions
 

@@ -349,16 +349,16 @@ workspace-selection smoke, or explicitly document why that evidence is blocked.
     <evidence>2026-06-23: Documented `--register-workspace`, registered-name-only app selection, workstation-scoped pairing, no-QR saved-host workspace changes, shared per-client tool grants, revocation across all workspaces, and MVP limitations in Volt usage/security/protocol/example docs plus the app README; verification: app `git diff --check -- README.md`, Volt `git diff --check -- packages/coding-agent/docs/usage.md packages/coding-agent/docs/security.md packages/coding-agent/docs/iroh-remote-protocol.md packages/coding-agent/examples/remote/iroh-sidecar/README.md .volt/iroh-multi-workspace-mvp-design.md .volt/iroh-multi-workspace-mvp-goal.md`, app commit 91e15c4, and Volt commit-hook `npm run check`.</evidence>
   </item>
 
-  <item ref="D.2" status="open" prereq="B.5,C.3,D.1">
+  <item ref="D.2" status="resolved" prereq="B.5,C.3,D.1">
     <title>Run final automated and manual multi-workspace validation</title>
     <acceptance>Final evidence lists exact targeted Vitest files, `npm run iroh:poc:test`, `npm run check`, Swift package tests, iOS simulator tests when app UI changed, doc checks, native multi-workspace smoke, and app workspace-selection smoke or a documented blocker. Unsupported cases are documented without overclaiming.</acceptance>
-    <evidence></evidence>
+    <evidence>2026-06-23: Final validation passed: targeted Vitest `cd packages/coding-agent && node node_modules/vitest/dist/cli.js --run test/remote-cli.test.ts test/remote-iroh-core.test.ts` (73 tests), filtered native smoke `VOLT_IROH_SCENARIO='multi-workspace reconnect' npm run iroh:poc:test`, full `npm run iroh:poc:test`, root `npm run check`, Swift package tests `cd ../volt-app/Packages/VoltClient && swift test`, XcodeBuildMCP `test_sim` on the Volt scheme with iPhone 17 Pro simulator `66257DFE-85C0-4010-9C47-2F7D24225BE6` iOS 27.0 (93 tests), docs check `git diff --check -- .volt/iroh-multi-workspace-mvp-design.md .volt/iroh-multi-workspace-mvp-goal.md`, native multi-workspace reconnect smoke, and app workspace-selection smoke using temp state `/tmp/volt-d2-workspace-smoke-BDzjmf/host.json`, relay `default`, host command `node scripts/run-coding-agent-source.mjs remote host --state /tmp/volt-d2-workspace-smoke-BDzjmf/host.json --mobile --yes`, Settings picker switch from `volt` to connected `other` without QR, and deleted `stale` workspace reporting `Workspace unavailable` while retaining the saved host.</evidence>
   </item>
 
-  <item ref="D.3" status="open" prereq="D.2" type="rollup">
+  <item ref="D.3" status="resolved" prereq="D.2" type="rollup">
     <title>Rollup: multi-workspace MVP is implemented, tested, documented, and ready for preview use</title>
     <acceptance>All prior items are resolved; the SPEC records final behavior and limitations; no open multi-workspace MVP implementation decisions remain except explicitly deferred future work; final automated and manual validation evidence is recorded.</acceptance>
-    <evidence></evidence>
+    <evidence>2026-06-23: Rollup resolved after D.2: all prior queue items are resolved, the SPEC status is implemented for preview use, final automated/native/app smoke validation evidence is recorded, and the only remaining scope is listed under Deferred Future Work.</evidence>
   </item>
 </group>
 
