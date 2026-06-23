@@ -58,6 +58,7 @@ const CONTROL_REQUEST_MAX_BYTES = 16 * 1024;
 const DEFAULT_READ_LIMIT = 64 * 1024;
 const DEFAULT_STATE_PATH = join(getAgentDir(), "remote", "iroh-host.json");
 const ACTIVE_REVOKE_CLOSE_REASON = "revoked";
+const ACTIVE_REPLACE_CLOSE_REASON = "replaced";
 const PROMPT_COMPLETION_RPC_TYPES = new Set(["prompt", "steer", "follow_up"]);
 const RESPONSE_COMPLETION_RPC_TYPES = new Set([
 	"abort",
@@ -629,7 +630,9 @@ function isExpectedApplicationClose(error) {
 	return (
 		message.includes("ConnectionLost(ApplicationClosed") &&
 		message.includes("error_code: 0") &&
-		(message.includes('reason: b"done"') || message.includes(`reason: b"${ACTIVE_REVOKE_CLOSE_REASON}"`))
+		(message.includes('reason: b"done"') ||
+			message.includes(`reason: b"${ACTIVE_REVOKE_CLOSE_REASON}"`) ||
+			message.includes(`reason: b"${ACTIVE_REPLACE_CLOSE_REASON}"`))
 	);
 }
 
@@ -1342,20 +1345,51 @@ function registerActiveConnection(options, authorization, connection) {
 	entries.add(entry);
 	return () => {
 		entries.delete(entry);
-		if (entries.size === 0) {
+		if (entries.size === 0 && options.activeConnections.get(entry.clientNodeId) === entries) {
 			options.activeConnections.delete(entry.clientNodeId);
 		}
 	};
 }
 
-function hasActiveConnectionForAuthorization(options, authorization) {
+function getActiveConnectionsForAuthorization(options, authorization) {
 	const entries = options.activeConnections.get(authorization.client.nodeId) ?? [];
+	const matchingEntries = [];
 	for (const entry of entries) {
 		if (entry.workspace === authorization.workspace.name) {
-			return true;
+			matchingEntries.push(entry);
 		}
 	}
-	return false;
+	return matchingEntries;
+}
+
+async function replaceActiveConnectionForAuthorization(options, authorization) {
+	const entries = options.activeConnections.get(authorization.client.nodeId);
+	const matchingEntries = getActiveConnectionsForAuthorization(options, authorization);
+	if (matchingEntries.length === 0) {
+		return { replaced: false, closedCount: 0 };
+	}
+
+	const closeReason = Array.from(Buffer.from(ACTIVE_REPLACE_CLOSE_REASON, "utf8"));
+	for (const entry of matchingEntries) {
+		entries.delete(entry);
+		entry.connection.close(0n, closeReason);
+	}
+	if (entries.size === 0 && options.activeConnections.get(authorization.client.nodeId) === entries) {
+		options.activeConnections.delete(authorization.client.nodeId);
+	}
+
+	await logAudit(options.auditLogger, {
+		type: "duplicate_connection_replaced",
+		clientNodeId: authorization.client.nodeId,
+		workspace: authorization.workspace.name,
+		success: true,
+		details: {
+			closeReason: ACTIVE_REPLACE_CLOSE_REASON,
+			closedCount: matchingEntries.length,
+			source: "active_connection_registry",
+		},
+	});
+	return { replaced: true, closedCount: matchingEntries.length };
 }
 
 async function rejectDuplicateActiveConnection(stream, authorization, options) {
@@ -1488,10 +1522,7 @@ async function handleConnection(incoming, options) {
 		if (handshake.authorization.paired) {
 			console.error(`paired client: ${handshake.authorization.client.label} (${remoteId})`);
 		}
-		if (hasActiveConnectionForAuthorization(options, handshake.authorization)) {
-			await rejectDuplicateActiveConnection(stream, handshake.authorization, options);
-			return;
-		}
+		await replaceActiveConnectionForAuthorization(options, handshake.authorization);
 		removeActiveConnection = registerActiveConnection(options, handshake.authorization, connection);
 		stopDuplicateStreamRejectionLoop = startDuplicateStreamRejectionLoop(connection, remoteId, options);
 
@@ -1857,22 +1888,30 @@ async function serve(flags) {
 		console.error("startup ticket: disabled; run `volt remote pair` to create a pairing ticket.");
 	}
 
+	const connectionTasks = new Set();
 	try {
 		while (true) {
 			const incoming = await endpoint.acceptNext();
 			if (!incoming) break;
-			await handleConnection(incoming, options).catch((error) => {
+			const task = handleConnection(incoming, options).catch((error) => {
 				if (!isExpectedApplicationClose(error)) {
 					console.error(error instanceof Error ? error.stack : String(error));
 				}
+			}).finally(() => {
+				connectionTasks.delete(task);
 			});
-			if (options.once) break;
+			connectionTasks.add(task);
+			if (options.once) {
+				await task;
+				break;
+			}
 		}
 	} finally {
 		await closePairControlServer(controlServer);
 		try {
 			await endpoint.close();
 		} finally {
+			await Promise.allSettled(connectionTasks);
 			await stopIntegratedRuntimes(options, "host_shutdown");
 		}
 	}

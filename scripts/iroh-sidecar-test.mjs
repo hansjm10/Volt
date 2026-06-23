@@ -199,13 +199,16 @@ async function runClient(ticket, clientStatePath, args, options = {}) {
 	return { ...client.output, exit };
 }
 
-async function bindRawClientEndpoint(relayMode) {
+async function bindRawClientEndpoint(relayMode, secretKey) {
 	const builder = Endpoint.builder();
 	if (relayMode === "default") {
 		presetN0(builder);
 	} else {
 		presetMinimal(builder);
 		builder.relayMode(RelayMode.disabled());
+	}
+	if (secretKey) {
+		builder.secretKey(secretKey);
 	}
 	const endpoint = await builder.bind();
 	if (relayMode === "default") await endpoint.online();
@@ -442,6 +445,22 @@ async function waitForRawConnectionClosed(connection, label, timeoutMs = 2000) {
 			connection.closed().catch(() => {}),
 			new Promise((_, reject) => {
 				timeoutId = setTimeout(() => reject(new Error(`${label} did not close within ${timeoutMs}ms`)), timeoutMs);
+			}),
+		]);
+	} finally {
+		clearTimeout(timeoutId);
+	}
+}
+
+async function withOperationTimeout(promise, label, timeoutMs = PROCESS_TIMEOUT_MS) {
+	const trackedPromise = Promise.resolve(promise);
+	trackedPromise.catch(() => {});
+	let timeoutId;
+	try {
+		return await Promise.race([
+			trackedPromise,
+			new Promise((_, reject) => {
+				timeoutId = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
 			}),
 		]);
 	} finally {
@@ -1698,7 +1717,9 @@ async function duplicateActiveConnectionScenario() {
 		await mkdir(workspacePath, { recursive: true });
 		const workspaceArg = `duplicate=${workspacePath}`;
 		const endpoint = await bindRawClientEndpoint("disabled");
+		let replacementEndpoint;
 		let firstClient;
+		let replacementClient;
 		let duplicateStream;
 		try {
 			const host = startHost([
@@ -1709,7 +1730,6 @@ async function duplicateActiveConnectionScenario() {
 				"--workspace",
 				workspaceArg,
 				"--integrated-volt",
-				"--once",
 			]);
 			try {
 				const ticket = await waitForFirstStdoutLine(host.child, host.output, "duplicate active host");
@@ -1741,12 +1761,36 @@ async function duplicateActiveConnectionScenario() {
 					"duplicate active first client after rejection",
 				);
 				assert(stillUsable.event.success === true, "Expected first duplicate-active client to remain usable");
-				closeRawConnection(firstClient.connection);
+
+				const reconnectPayload = decodeTicketPayload(ticket);
+				delete reconnectPayload.expiresAt;
+				delete reconnectPayload.secret;
+				const reconnectTicket = encodeTicketPayload(reconnectPayload);
+				replacementEndpoint = await bindRawClientEndpoint("disabled", endpoint.secretKey().toBytes());
+				replacementClient = await withOperationTimeout(
+					openRawAuthorizedClientOnEndpoint(replacementEndpoint, reconnectTicket, {
+						clientLabel: "duplicate active client",
+					}),
+					"duplicate active replacement connect",
+					2000,
+				);
+				const replacementState = await readRawRpcResponse(
+					replacementClient,
+					{ id: "state-duplicate-replacement", type: "get_state" },
+					"duplicate active replacement get_state",
+				);
+				assert(replacementState.event.success === true, "Expected replacement duplicate-active client to succeed");
+				await waitForRawConnectionClosed(firstClient.connection, "duplicate active replaced first");
 				firstClient = undefined;
-				await waitForExit(host.child, "duplicate active host", host.output);
+
+				closeRawConnection(replacementClient.connection);
+				replacementClient = undefined;
 			} finally {
 				await Promise.resolve(duplicateStream?.stream?.send?.finish?.()).catch(() => {});
+				closeRawConnection(replacementClient?.connection);
 				closeRawConnection(firstClient?.connection);
+				await replacementEndpoint?.close();
+				replacementEndpoint = undefined;
 				await stopProcess(host.child);
 			}
 
@@ -1796,8 +1840,22 @@ async function duplicateActiveConnectionScenario() {
 				),
 				"Expected duplicate_connection_rejected audit event",
 			);
+			assert(
+				auditEvents.some(
+					(event) =>
+						event.type === "duplicate_connection_replaced" &&
+						event.clientNodeId === endpoint.id().toString() &&
+						event.workspace === "duplicate" &&
+						event.success === true &&
+						event.details?.closeReason === "replaced" &&
+						event.details?.closedCount === 1,
+				),
+				"Expected duplicate_connection_replaced audit event",
+			);
 		} finally {
 			await Promise.resolve(duplicateStream?.stream?.send?.finish?.()).catch(() => {});
+			closeRawConnection(replacementClient?.connection);
+			await replacementEndpoint?.close();
 			closeRawConnection(firstClient?.connection);
 			await endpoint.close();
 		}
@@ -2669,7 +2727,12 @@ const scenarios = [
 async function main() {
 	await assertInstalled();
 	loadIroh();
-	for (const [name, runScenario] of scenarios) {
+	const scenarioFilter = process.env.VOLT_IROH_SCENARIO;
+	const selectedScenarios = scenarioFilter
+		? scenarios.filter(([name]) => name.includes(scenarioFilter))
+		: scenarios;
+	assert(selectedScenarios.length > 0, `No Iroh remote host scenario matches ${JSON.stringify(scenarioFilter)}`);
+	for (const [name, runScenario] of selectedScenarios) {
 		process.stdout.write(`Running ${name}... `);
 		await runScenario();
 		process.stdout.write("passed\n");
