@@ -1460,6 +1460,14 @@ volt.registerCommand("deploy", {
 
 Native action projection: extension commands are also exposed through the native UI action protocol as palette actions when the host supports `get_ui_actions`. They use an opaque session-local action id, keep `presentation.kind` as `"palette"`, and accept one optional string argument named `arguments`. If the command defines `getArgumentCompletions`, the projected action advertises `completion: "commandArguments"` and remote clients can request the same completions through the UI action completion RPC.
 
+Projection is a native presentation layer over the existing command handler:
+
+- Native clients invoke the projected action by id with `invoke_ui_action`; they should not synthesize `/<command>` when an action id is available.
+- The command still runs in the host and may return terminal `handled` without starting an agent turn.
+- `ctx.ui` dialog and notification requests continue through the existing RPC extension UI protocol. Terminal-only APIs such as `ctx.ui.custom()` remain unavailable or degraded in RPC mode.
+- Descriptors expose only safe labels and source scope/origin metadata. They do not expose extension source paths or raw `sourceInfo`.
+- Project-local extension commands appear only after the same project-trust/resource-loading path that exposes them locally.
+
 There is no first-class `volt.registerAction()` API in v1. Use `volt.registerCommand()` for user-invokable extension actions; native card/toggle metadata for extensions is deferred until stable extension-owned action ids, descriptor validation, project trust, and remote-safety rules are defined.
 
 ### volt.getCommands()

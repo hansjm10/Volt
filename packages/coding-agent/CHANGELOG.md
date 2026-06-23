@@ -78,6 +78,7 @@
 - Clarified that Iroh remote protocol v1 keeps the direct RPC command allowlist narrow, exposes only the projected `get_transcript` transcript surface, and continues rejecting raw messages, command-list, last-assistant-text, model-list, and path-based session-switch commands in preview.
 - Documented the Iroh remote supported-preview user workflow, security model, relay guidance, state/audit paths, and Node-only host support boundary across README, usage, security, protocol, design, and sidecar docs.
 - Documented the Iroh remote v1 preview duplicate-connection policy: reject a second active connection for the same client/workspace instead of replacing the existing runtime.
+- Documented the native UI action protocol across RPC, Iroh remote, extension command, prompt-template, skill, and iOS client docs.
 - Updated the SWE-Pruner example extension guidance to prefer semantic pruning after candidate-file discovery and clarify when to use search, LSP, or full reads instead.
 - Changed store install/update confirmations and summaries to show package names and concise source labels instead of full git source strings.
 - Changed the interactive `/store` browser to list available packages immediately, with search available from the package list.

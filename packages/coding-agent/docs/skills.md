@@ -89,6 +89,19 @@ Toggle skill commands via `/settings` in interactive mode or in `settings.json`:
 }
 ```
 
+### Native UI Actions
+
+When the host supports native UI actions, skills are also exposed as palette descriptors through `get_ui_actions`. Native clients can show those descriptors in a command palette and invoke the skill by action id with `invoke_ui_action`.
+
+The descriptor is a safe projection:
+
+- The action id is opaque and session-local, under `skill.*`.
+- The slash alias remains display/compatibility metadata; native clients should invoke the action id instead of constructing raw `/skill:name` text.
+- The skill body, skill file path, and skill base directory are not included in descriptors.
+- Invocation still runs through the host's skill expansion path. The host loads the skill content, appends any arguments as `User: <args>`, applies streaming policy, and rejects stale ids after reloads or session replacement.
+
+Over Iroh, skill actions are allowed only through the native action allowlist and sanitized descriptors. Raw `get_commands` remains blocked remotely because it may include local source metadata.
+
 ## Skill Structure
 
 A skill is a directory with a `SKILL.md` file. Everything else is freeform.

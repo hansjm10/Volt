@@ -1438,6 +1438,18 @@ Concrete behavior:
 - The demo transport now returns one enabled projected extension command and one disabled package-origin extension command, and handles the enabled mock command with a terminal `handled` response.
 - Manual simulator smoke on iPhone 17 Pro iOS 27.0 used Demo transport, opened the Actions tab, verified the Extensions group, disabled package-labeled command, enabled Demo command, and tapped the mock command without leaving a stuck pending state. Screenshots were saved at `/tmp/volt-e4-actions-extension.png` and `/tmp/volt-e4-actions-after-mock.png`.
 
+## Resolved 2026-06-23: Native Action Documentation Refresh
+
+F.1 documentation refresh records the user-facing and protocol contract for the completed native action surfaces.
+
+Concrete behavior documented:
+
+- `packages/coding-agent/docs/rpc.md` describes native action discovery, primary versus palette scopes, descriptor safety, slash aliases as presentation, built-in action ids, dynamic extension/prompt/skill projection, invocation statuses, and deferred/local-only surfaces.
+- `packages/coding-agent/docs/iroh-remote-protocol.md` describes the remote allowlist, sanitized descriptor metadata, extension UI behavior over RPC, exact forwarded action ids/prefixes, and deferred remote model/settings/package/profile surfaces.
+- `packages/coding-agent/docs/extensions.md` documents projected extension commands as palette actions, source-label safety, project-trust gating, existing extension UI request handling, and the v1 `registerAction()` defer.
+- `packages/coding-agent/docs/prompt-templates.md` and `packages/coding-agent/docs/skills.md` document their native palette projections, opaque action ids, host-owned expansion paths, and omitted bodies/paths.
+- `../volt-app/README.md` documents the iOS command palette, Actions tab, supported Review/Fast/extension action presentation, invocation lifecycle, sanitized metadata boundary, and deferred native action surfaces.
+
 ## Host Implementation Plan
 
 ### Phase A: Design and Inventory

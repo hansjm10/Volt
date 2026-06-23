@@ -273,6 +273,15 @@ Native UI action commands let typed clients discover host-owned actions for nati
 
 The current local RPC implementation exposes the v1 protocol shape, sanitized palette descriptors, shared built-in actions, review cards, Fast mode, and prompt-like invocation for extension commands, prompt templates, and skills. Iroh remote transports allow discovery plus `invoke_ui_action` for the currently advertised remote-safe built-in, review, Fast mode, projected extension command, prompt template, and skill actions. Local-only built-ins and unreviewed action ids remain blocked remotely.
 
+Native clients should treat this as an optional capability:
+
+1. Call `get_ui_capabilities`.
+2. If `ui_actions.v1` is present, call `get_ui_actions` and render descriptors that the client supports.
+3. If `ui_action_invocation.v1` is present, invoke by descriptor `id` with `invoke_ui_action`.
+4. Keep raw `prompt` slash-text submission as compatibility for clients or hosts that do not expose native actions.
+
+`scope: "primary"` is for curated cards, buttons, and toggles such as Review and Fast mode. `scope: "palette"` is for searchable commands such as extension commands, prompt templates, and skills. `scope: "all"` lets a client build both surfaces from one response.
+
 #### get_ui_capabilities
 
 Get supported native UI action protocol features.
@@ -387,6 +396,15 @@ Built-in v1 actions currently include:
 | `review.uncommitted` | `/review uncommitted` | yes | Reviews uncommitted changes against `HEAD`, requires confirmation remotely, uses host-owned git/model/session policy, and returns only bounded workflow status. |
 | `review.branch` | `/review branch [base]` | yes | Reviews `HEAD` against a base branch; optional `base` is validated by the host and omitted values use host auto-detection. |
 
+Slash aliases are display and compatibility metadata. Clients may show them in palettes or advanced detail views, but should not synthesize slash strings when an action id is available. The host may change slash syntax without changing a stable built-in action id.
+
+Unsupported or deferred native surfaces in v1:
+
+- Extension commands project as palette actions only. First-class extension cards/toggles are deferred until a future `volt.registerAction()` policy defines stable extension-owned ids, trust, descriptor validation, and remote safety.
+- Prompt templates and skills project as palette actions; descriptors omit prompt bodies, skill bodies, file paths, and base directories.
+- Direct model selection, profile switching, scoped-model editing, login/logout, package management, and local settings screens are not exposed over Iroh as native actions. Remote clients should use reviewed actions such as `thinking.fast_mode` and host-approved future preference descriptors instead of raw model/settings RPC.
+- Local-only built-ins such as `context.compact` and `session.rename` may appear in local RPC descriptors but are blocked over Iroh until separate remote policy exists.
+
 #### get_ui_action_completions
 
 Get completion options for one action argument. Clients should only call this when the descriptor argument includes a supported `completion` value. V1 currently supports extension command argument completions via `"completion": "commandArguments"`.
@@ -471,7 +489,7 @@ For projected dynamic actions, invocation uses the host's existing prompt semant
 
 Descriptors must not expose host-local paths, extension source paths, prompt template bodies, skill content, provider secrets, environment values, auth internals, raw model/provider metadata, raw transcript payloads, or host session file paths. Iroh remote discovery responses pass through the remote outbound redaction layer in addition to descriptor-level sanitization. Remote invocation is allowlist-based and re-checks action availability, remote safety, authorization, streaming policy, and argument validity at invocation time.
 
-`get_commands` remains the legacy local command-discovery surface for raw slash invocation and may include source metadata useful to local clients. Remote clients must use sanitized `get_ui_actions`; raw `get_commands` remains blocked over Iroh.
+`get_commands` remains the legacy local command-discovery surface for raw slash invocation and may include source metadata useful to local clients. Remote clients and native mobile clients should use sanitized `get_ui_actions`; raw `get_commands` remains blocked over Iroh.
 
 ### Model
 

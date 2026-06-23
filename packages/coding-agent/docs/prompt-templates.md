@@ -62,6 +62,19 @@ Type `/` followed by the template name in the editor. Autocomplete shows availab
 /component Button "click handler" # Multiple arguments
 ```
 
+### Native UI Actions
+
+When the host supports native UI actions, prompt templates are also exposed as palette descriptors through `get_ui_actions`. Native clients can render those descriptors in a command palette and invoke them by action id with `invoke_ui_action`.
+
+The descriptor is a safe projection:
+
+- The action id is opaque and session-local, under `prompt.template.*`.
+- The slash alias remains display/compatibility metadata; native clients should invoke the action id instead of constructing raw slash text.
+- Template bodies and template file paths are not included in descriptors.
+- Arguments are passed through the host template-expansion path, so the host remains responsible for parsing, expansion, streaming behavior, and stale-id rejection.
+
+Over Iroh, prompt-template actions are allowed only through the native action allowlist and existing prompt expansion path. Raw `get_commands` remains blocked remotely because it may include local source metadata.
+
 ## Arguments
 
 Templates support positional arguments, defaults, and simple slicing:
