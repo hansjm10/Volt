@@ -220,6 +220,9 @@ function getPublicRelayUrl(request) {
 	const scheme = typeof protocol === "string" && protocol.length > 0 ? protocol.split(",")[0].trim() : "https";
 	const baseUrl = new URL(request.originalUrl || request.url || "/", `${scheme}://${host}`);
 	const versionPathIndex = baseUrl.pathname.indexOf("/v1/");
+	if (versionPathIndex === 0 && host.endsWith(".cloudfunctions.net")) {
+		return `${scheme}://${host}/pushRelay`;
+	}
 	if (versionPathIndex === -1) {
 		return `${scheme}://${host}${baseUrl.pathname.replace(/\/+$/, "")}`;
 	}
