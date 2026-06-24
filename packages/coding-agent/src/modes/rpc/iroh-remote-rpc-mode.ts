@@ -6,6 +6,7 @@ import {
 	createIrohRemoteOutboundFilteredRpcTransport,
 	type IrohRemoteLiveActivityContentState,
 	type IrohRemoteLiveActivityToolGlyph,
+	type IrohRemoteLiveActivityUpdateIntent,
 	type IrohRemoteOutboundValueDecorator,
 	type IrohRemotePushNotificationDelivery,
 } from "../../core/remote/iroh/index.ts";
@@ -152,6 +153,7 @@ class IrohRemoteLiveActivityUpdater {
 	private readonly delivery: Required<Pick<IrohRemotePushNotificationDelivery, "deliverLiveActivityUpdate">>;
 	private readonly runtimeHost: AgentSessionRuntime;
 	private readonly toolIndexesByCallId = new Map<string, number>();
+	private deliveryQueue: Promise<void> = Promise.resolve();
 	private recentTools: IrohRemoteLiveActivityToolGlyph[] = [];
 	private sequence = 0;
 	private active = false;
@@ -170,9 +172,13 @@ class IrohRemoteLiveActivityUpdater {
 				this.active = true;
 				this.recentTools = [];
 				this.toolIndexesByCallId.clear();
+				await this.sendUpdate("running");
 				break;
 			case "tool_execution_start":
 				this.active = true;
+				if (this.recordTool(event.toolCallId, createLiveActivityToolGlyph(event.toolName, "started"))) {
+					await this.sendUpdate("running");
+				}
 				break;
 			case "tool_execution_end":
 				this.active = true;
@@ -189,7 +195,7 @@ class IrohRemoteLiveActivityUpdater {
 				if (!this.active || event.willRetry) {
 					return;
 				}
-				await this.sendUpdate("completed", "end");
+				await this.sendUpdate("completed");
 				this.active = false;
 				this.toolIndexesByCallId.clear();
 				break;
@@ -242,7 +248,7 @@ class IrohRemoteLiveActivityUpdater {
 			sessionID: completionState.sessionId,
 			updatedAtEpochSeconds: nowSeconds,
 		};
-		await this.delivery.deliverLiveActivityUpdate({
+		const update: IrohRemoteLiveActivityUpdateIntent = {
 			eventId: `live-activity:${completionState.sessionId}:${completionState.runId ?? "active"}:${++this.sequence}`,
 			kind: activityEvent === "end" ? "live_activity_end" : "live_activity_update",
 			activityEvent,
@@ -250,7 +256,13 @@ class IrohRemoteLiveActivityUpdater {
 			...(activityEvent === "end"
 				? { dismissalDateEpochSeconds: nowSeconds + 45 }
 				: { staleDateEpochSeconds: nowSeconds + 90 }),
-		});
+		};
+		const delivery = this.deliveryQueue.then(() => this.delivery.deliverLiveActivityUpdate(update));
+		this.deliveryQueue = delivery.then(
+			() => {},
+			() => {},
+		);
+		await delivery;
 	}
 }
 

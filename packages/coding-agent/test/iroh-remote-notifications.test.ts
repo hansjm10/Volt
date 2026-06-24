@@ -576,7 +576,7 @@ describe("Iroh remote notification requests", () => {
 		});
 	});
 
-	test("Live Activity updater only sends completed new tool names", async () => {
+	test("Live Activity updater sends running state and keeps completed activities updateable", async () => {
 		const session = createTestSession("session-one", "conversation-run");
 		const stateManager = createStateManagerWithClient([
 			createEnabledPushTarget({
@@ -614,9 +614,27 @@ describe("Iroh remote notification requests", () => {
 		}
 
 		liveActivityHandler({ type: "agent_start" });
+		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(1));
+		expect(relayClient.sendLiveActivityUpdate).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				activityEvent: "update",
+				contentState: expect.objectContaining({ status: "running", statusText: "Volt is thinking" }),
+				kind: "live_activity_update",
+			}),
+		);
+
 		liveActivityHandler({ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: {} });
-		await new Promise((resolve) => setImmediate(resolve));
-		expect(relayClient.sendLiveActivityUpdate).not.toHaveBeenCalled();
+		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(2));
+		expect(relayClient.sendLiveActivityUpdate).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				contentState: expect.objectContaining({
+					currentTool: expect.objectContaining({ name: "read", status: "started" }),
+					status: "running",
+					statusText: "Using read",
+				}),
+				kind: "live_activity_update",
+			}),
+		);
 
 		liveActivityHandler({
 			type: "tool_execution_end",
@@ -625,7 +643,7 @@ describe("Iroh remote notification requests", () => {
 			result: {},
 			isError: false,
 		});
-		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(1));
+		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(3));
 		liveActivityHandler({
 			type: "tool_execution_end",
 			toolCallId: "read-2",
@@ -634,7 +652,7 @@ describe("Iroh remote notification requests", () => {
 			isError: false,
 		});
 		await new Promise((resolve) => setImmediate(resolve));
-		expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(1);
+		expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(3);
 
 		liveActivityHandler({
 			type: "tool_execution_end",
@@ -643,11 +661,28 @@ describe("Iroh remote notification requests", () => {
 			result: {},
 			isError: false,
 		});
-		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(2));
+		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(4));
 		liveActivityHandler({ type: "agent_end", messages: [], willRetry: false });
-		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(3));
+		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(5));
 		expect(relayClient.sendLiveActivityUpdate).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				activityEvent: "update",
+				contentState: expect.objectContaining({ status: "completed", statusText: "Volt finished" }),
+				kind: "live_activity_update",
+			}),
+		);
+		expect(relayClient.sendLiveActivityUpdate).not.toHaveBeenCalledWith(
 			expect.objectContaining({ activityEvent: "end", kind: "live_activity_end" }),
+		);
+
+		liveActivityHandler({ type: "agent_start" });
+		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(6));
+		expect(relayClient.sendLiveActivityUpdate).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				activityEvent: "update",
+				contentState: expect.objectContaining({ status: "running", statusText: "Volt is thinking" }),
+				kind: "live_activity_update",
+			}),
 		);
 
 		recv.end();

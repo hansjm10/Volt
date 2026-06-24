@@ -47,6 +47,7 @@
 
 ### Fixed
 
+- Fixed Iroh remote Live Activity updates to report new turns as running and keep completed activities updateable for continued conversations.
 - Fixed Iroh remote host control socket setup to harden the shared control root directory before binding per-state sockets.
 - Fixed Iroh remote host startup to preserve saved workspace tool allowlists unless `--allow-tools` is explicitly passed.
 - Fixed Iroh remote RPC transports to reject oversized inbound JSONL lines instead of buffering them without bound.
