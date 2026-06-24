@@ -73,6 +73,7 @@
 - LSP navigation and refactoring requests now honor tool-call abort signals instead of waiting out the 30s request timeout on a stuck server.
 - Fixed a failed LSP initialize handshake leaving a zombie client (and its server process) registered; failed clients are now disposed and removed so retries spawn fresh, and request errors on a healthy server no longer count toward the start-failure breaker.
 - Fixed LSP WorkspaceEdit application reversing the order of same-position insert edits.
+- Fixed LSP WorkspaceEdit application to reject code actions that try to create, edit, rename, or delete files outside the language server root before making any changes.
 - Reworked the startup ASCII wordmark to an outline letterform so it no longer appears split across a horizontal seam on macOS terminals that add inter-line spacing (the previous solid half-block art was bisected by the line gap).
 - Fixed the tree navigator to horizontally pan deep entries so the selected item remains readable ([#5830](https://github.com/earendil-works/pi/issues/5830)).
 - Fixed the Iroh remote host scenario harness and host preflight to canonicalize workspace paths before comparing or spawning RPC children.

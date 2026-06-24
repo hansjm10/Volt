@@ -21,7 +21,12 @@ import {
 	SEVERITY_NAMES,
 } from "./config.ts";
 import { LspTracer } from "./trace.ts";
-import { applyTextEdits, type LspWorkspaceEdit, normalizeWorkspaceEdit } from "./workspace-edit.ts";
+import {
+	applyTextEdits,
+	type LspWorkspaceEdit,
+	type NormalizedWorkspaceOperation,
+	normalizeWorkspaceEdit,
+} from "./workspace-edit.ts";
 
 export interface LspManagerOptions {
 	cwd: string;
@@ -53,6 +58,14 @@ function uriToPath(uri: string): string {
 	} catch {
 		return uri;
 	}
+}
+
+function isPathInsideRoot(rootDir: string, absolutePath: string): boolean {
+	if (!isAbsolute(absolutePath)) {
+		return false;
+	}
+	const rel = relative(rootDir, absolutePath);
+	return rel === "" || (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel));
 }
 
 const SYMBOL_KIND_NAMES: Record<number, string> = {
@@ -863,6 +876,10 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		edit: LspWorkspaceEdit,
 	): Promise<{ summary: string; changedPaths: string[] }> {
 		const operations = normalizeWorkspaceEdit(edit);
+		for (const operation of operations) {
+			this.assertWorkspaceEditOperationInRoot(client, operation);
+		}
+
 		const lines: string[] = [];
 		const changedPaths: string[] = [];
 		for (const operation of operations) {
@@ -909,6 +926,23 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		}
 		client.notifyFilesChanged(unopenedPaths);
 		return { summary: lines.join("\n"), changedPaths };
+	}
+
+	private assertWorkspaceEditOperationInRoot(client: LspClient, operation: NormalizedWorkspaceOperation): void {
+		if (operation.kind === "rename") {
+			this.assertWorkspaceEditPathInRoot(client, uriToPath(operation.oldUri));
+			this.assertWorkspaceEditPathInRoot(client, uriToPath(operation.newUri));
+			return;
+		}
+		this.assertWorkspaceEditPathInRoot(client, uriToPath(operation.uri));
+	}
+
+	private assertWorkspaceEditPathInRoot(client: LspClient, absolutePath: string): void {
+		if (!isPathInsideRoot(client.rootDir, absolutePath)) {
+			throw new Error(
+				`Refusing to apply LSP workspace edit outside workspace root: ${this.displayPath(absolutePath)}`,
+			);
+		}
 	}
 
 	/** Re-sync open documents that changed on disk outside edit/write (best-effort). */

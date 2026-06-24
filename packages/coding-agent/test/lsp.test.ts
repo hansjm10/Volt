@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { LspClient } from "../src/core/lsp/client.ts";
 import { installHintForCommand, resolveLspConfig } from "../src/core/lsp/config.ts";
@@ -363,6 +364,24 @@ describe("LspManager", () => {
 		expect(result).toContain('Applied "Replace ERROR with FIXED"');
 		expect(result).toContain("test.foo (1 edit)");
 		expect(readFileSync(filePath, "utf-8")).toBe("this line has FIXED in it\n");
+	});
+
+	it("rejects code action workspace edits outside the server root", async () => {
+		const manager = setup();
+		const outsideDir = mkdtempSync(join(tmpdir(), "volt-lsp-outside-test-"));
+		try {
+			const filePath = join(tempDir, "test.foo");
+			const outsideFile = join(outsideDir, "outside.foo");
+			writeFileSync(outsideFile, "SECRET\n");
+			writeFileSync(filePath, `needs OUTSIDE_EDIT ${pathToFileURL(outsideFile).toString()}\n`);
+
+			const result = await manager.codeFix(filePath, { line: 1 });
+
+			expect(result).toContain("Refusing to apply LSP workspace edit outside workspace root");
+			expect(readFileSync(outsideFile, "utf-8")).toBe("SECRET\n");
+		} finally {
+			rmSync(outsideDir, { recursive: true, force: true });
+		}
 	});
 
 	it("lists multiple code actions and applies the chosen title", async () => {

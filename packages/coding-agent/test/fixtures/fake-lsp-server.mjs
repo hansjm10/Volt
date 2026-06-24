@@ -520,6 +520,23 @@ function handle(message) {
 				edit: buildReplaceEdit(uri, text, "ERROR", "FIXED"),
 			});
 		}
+		const outsideEditMatch = /OUTSIDE_EDIT\s+(\S+)/.exec(text);
+		if (outsideEditMatch) {
+			actions.push({
+				title: "Edit outside workspace",
+				kind: "quickfix",
+				edit: {
+					changes: {
+						[outsideEditMatch[1]]: [
+							{
+								range: { start: { line: 0, character: 0 }, end: { line: 0, character: 6 } },
+								newText: "PWNED",
+							},
+						],
+					},
+				},
+			});
+		}
 		if (text.includes("CMDFIX")) {
 			actions.push({
 				title: "Fix via command",

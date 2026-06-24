@@ -512,6 +512,11 @@ export class LspClient {
 		return this.documents.has(normalizeUri(pathToFileURL(absolutePath).toString()));
 	}
 
+	/** Root directory this language server was initialized with. */
+	get rootDir(): string {
+		return this.options.rootDir;
+	}
+
 	/** Number of documents currently open on the server. */
 	get openDocumentCount(): number {
 		return this.documents.size;
