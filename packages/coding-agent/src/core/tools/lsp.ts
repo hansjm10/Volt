@@ -3,8 +3,8 @@
  * diagnostics through the language servers configured in the lsp settings.
  *
  * The tool is registered as a built-in but only does useful work when an
- * LspNavigationProvider (the LspManager) is supplied, i.e. when LSP is
- * enabled via --lsp or lsp.enabled.
+ * LspNavigationProvider (the LspManager) is supplied, i.e. when LSP is not
+ * disabled in settings.
  */
 
 import type { AgentTool } from "@earendil-works/volt-agent-core";
@@ -152,7 +152,7 @@ export function createLspToolDefinition(
 		parameters: lspSchema,
 		async execute(_toolCallId, input: LspToolInput, signal?: AbortSignal, _onUpdate?, _ctx?) {
 			if (!provider) {
-				throw new Error("LSP is not enabled. Run volt with --lsp or set lsp.enabled in settings.");
+				throw new Error("LSP is disabled. Run volt with --lsp or set lsp.enabled=true in settings.");
 			}
 			const absolutePath = resolveToCwd(input.path, cwd);
 			const needsSymbol =

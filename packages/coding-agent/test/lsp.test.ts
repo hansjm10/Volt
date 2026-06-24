@@ -73,9 +73,9 @@ function fakeServerConfig(options?: {
 }
 
 describe("resolveLspConfig", () => {
-	it("is disabled by default and includes built-in servers", () => {
+	it("is enabled by default and includes built-in servers", () => {
 		const config = resolveLspConfig(undefined);
-		expect(config.enabled).toBe(false);
+		expect(config.enabled).toBe(true);
 		const names = config.servers.map((s) => s.name);
 		for (const name of ["typescript", "python", "go", "rust", "cpp", "zig", "lua", "bash"]) {
 			expect(names).toContain(name);
@@ -83,6 +83,11 @@ describe("resolveLspConfig", () => {
 		expect(config.maxSeverity).toBe(1);
 		expect(config.settleMs).toBe(1500);
 		expect(config.firstSettleMs).toBe(10000);
+	});
+
+	it("can be disabled explicitly", () => {
+		const config = resolveLspConfig({ enabled: false });
+		expect(config.enabled).toBe(false);
 	});
 
 	it("merges user overrides over built-in defaults by name", () => {
@@ -1037,7 +1042,7 @@ describe("tool diagnostics integration", () => {
 		const tool = createLspToolDefinition(tempDir);
 		await expect(
 			tool.execute("t1", { action: "symbols", path: "a.ts" }, undefined, undefined, {} as never),
-		).rejects.toThrow("LSP is not enabled");
+		).rejects.toThrow("LSP is disabled");
 	});
 
 	it("diagnostics provider failures do not fail the write", async () => {

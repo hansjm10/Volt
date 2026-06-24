@@ -31,7 +31,7 @@ export interface LspServerSettings {
 }
 
 export interface LspSettings {
-	/** Enable LSP diagnostics after edit/write. Default: false (also enabled per run via --lsp) */
+	/** Enable LSP diagnostics after edit/write. Default: true (set false to disable; --lsp forces enabled per run) */
 	enabled?: boolean;
 	/** Server definitions, merged over the built-in defaults by name */
 	servers?: Record<string, LspServerSettings>;
@@ -188,7 +188,7 @@ export function resolveLspConfig(settings: LspSettings | undefined): ResolvedLsp
 		});
 	}
 	return {
-		enabled: settings?.enabled ?? false,
+		enabled: settings?.enabled ?? true,
 		servers,
 		settleMs: settings?.settleMs ?? 1500,
 		firstSettleMs: settings?.firstSettleMs ?? 10000,

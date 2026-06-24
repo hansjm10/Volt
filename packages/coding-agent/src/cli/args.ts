@@ -284,7 +284,7 @@ ${chalk.bold("Options:")}
   --theme <path>                 Load a theme file or directory (can be used multiple times)
   --no-themes                    Disable theme discovery and loading
   --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
-  --lsp                          Enable LSP diagnostics after edit/write (see docs/lsp.md)
+  --lsp                          Force-enable LSP diagnostics for this run (see docs/lsp.md)
   --export <file>                Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
@@ -406,6 +406,6 @@ ${chalk.bold("Built-in Tool Names:")}
   grep   - Search file contents (read-only, off by default)
   find   - Find files by glob pattern (read-only, off by default)
   ls     - List directory contents (read-only, off by default)
-  lsp    - Language server navigation and diagnostics (on when --lsp or lsp.enabled is set)
+  lsp    - Language server navigation and diagnostics (on by default unless lsp.enabled=false)
 `);
 }

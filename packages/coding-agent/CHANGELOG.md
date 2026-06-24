@@ -6,8 +6,8 @@
 
 - Added Pi extension package compatibility: `volt install` now reads `pi` manifests when no `volt` manifest is present and aliases Pi core imports to Volt modules at extension load time.
 - Added an experimental first-time setup flow behind `PI_EXPERIMENTAL=1` that asks for a dark/light theme choice (preselecting the detected appearance) and opt-in analytics data sharing on first launch with the default agent directory; opting in stores a `trackingId` in `settings.json`.
-- Added native LSP diagnostics: a config-driven multi-server manager spawns language servers lazily and appends diagnostics to `edit`/`write` tool results. Enable with `--lsp` or the `lsp.enabled` setting; configure servers via `lsp.servers`. See [LSP Diagnostics](docs/lsp.md).
-- Added an `lsp` navigation tool (active by default when LSP is enabled) with definition, references, hover, symbols, and on-demand diagnostics actions.
+- Added native LSP diagnostics: a config-driven multi-server manager spawns language servers lazily and appends diagnostics to `edit`/`write` tool results. It is enabled by default; configure servers via `lsp.servers` or set `lsp.enabled` to `false` to disable. See [LSP Diagnostics](docs/lsp.md).
+- Added an `lsp` navigation tool (active by default unless LSP is disabled) with definition, references, hover, symbols, and on-demand diagnostics actions.
 - Added `rename` and `fix` actions to the `lsp` tool: project-wide symbol rename and quick-fix application (e.g. auto-import) via LSP WorkspaceEdits, including command-based code actions applied through `workspace/applyEdit`.
 - Added a `/lsp` command showing language server status (root, open documents, idle time) with `/lsp restart` to stop servers, and automatic shutdown of servers idle for `lsp.idleShutdownMs` (default 10 minutes; servers respawn lazily).
 - Added per-server `lsp.servers.<name>.settings`: sent via `workspace/didChangeConfiguration` after startup and used to answer `workspace/configuration` section requests (e.g. pyright analysis options).
@@ -102,6 +102,7 @@
 - LSP project-root markers are now priority-ordered (a `tsconfig.json` anywhere up the tree beats a closer `package.json`), and diagnostics for files outside the working directory display absolute paths.
 - LSP cold starts now wait up to `lsp.firstSettleMs` (default 10s) for the first diagnostics from a fresh server, so the first edit no longer misses errors while the project loads.
 - LSP clients now re-sync open documents that changed on disk outside the `edit`/`write` tools (e.g. `git checkout` via bash) before every diagnostics collection or navigation query, closing deleted files and notifying servers via `workspace/didChangeWatchedFiles`. When a dependency was refreshed, diagnostics collection waits for a fresh publish instead of reusing the last one, so cross-file breakage introduced via bash is reported.
+- Changed LSP diagnostics and the `lsp` tool to be enabled by default. Set `lsp.enabled` to `false` to opt out; `--lsp` force-enables it for a run.
 - Renamed the `/new` slash command to `/clear`. The `app.session.new` keybinding action id is unchanged.
 - Restyled the built-in `dark` and `light` themes around an electric purple accent palette.
 - Replaced the plain-text startup logo with an ASCII wordmark; renamed forks (via `voltConfig.name`) still get the plain-text logo.

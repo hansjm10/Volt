@@ -6407,10 +6407,10 @@ export class InteractiveMode {
 			const count = this.session.restartLspServers();
 			info = status.enabled
 				? `Stopped ${count} language server${count === 1 ? "" : "s"}. Servers respawn on next use.`
-				: "LSP is disabled. Run with --lsp or set lsp.enabled in settings.";
+				: "LSP is disabled. Run with --lsp or set lsp.enabled=true in settings.";
 		} else if (args === "trace" || args?.startsWith("trace ")) {
 			if (!status.enabled) {
-				info = "LSP is disabled. Run with --lsp or set lsp.enabled in settings.";
+				info = "LSP is disabled. Run with --lsp or set lsp.enabled=true in settings.";
 			} else {
 				const traceArg = args === "trace" ? undefined : args.slice(6).trim();
 				if (traceArg === "off") {
@@ -6428,7 +6428,7 @@ export class InteractiveMode {
 				}
 			}
 		} else if (!status.enabled) {
-			info = "LSP is disabled. Run with --lsp or set lsp.enabled in settings.";
+			info = "LSP is disabled. Run with --lsp or set lsp.enabled=true in settings.";
 		} else if (status.servers.length === 0) {
 			info = `${theme.bold("LSP Servers")}\n\nNo servers running. Servers spawn on first use of a matching file.`;
 		} else {

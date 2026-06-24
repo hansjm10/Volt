@@ -4,23 +4,19 @@ Volt can run language servers and feed diagnostics back to the model after every
 
 When LSP is enabled, the model also gets an `lsp` tool for code navigation and refactoring: go-to-definition, find-references, hover, file symbol outlines, on-demand diagnostics, project-wide rename, and quick fixes (e.g. auto-import).
 
-## Enabling
+## Default and Disabling
 
-Diagnostics are off by default. Enable them per run:
-
-```bash
-volt --lsp
-```
-
-Or persistently in `~/.volt/agent/settings.json` (or per project in `.volt/settings.json`):
+Diagnostics are on by default. To disable them, set `lsp.enabled` to `false` in `~/.volt/agent/settings.json` (or per project in `.volt/settings.json`):
 
 ```json
 {
   "lsp": {
-    "enabled": true
+    "enabled": false
   }
 }
 ```
+
+Use `volt --lsp` to force-enable LSP for a run when settings disable it.
 
 ## How It Works
 
@@ -80,7 +76,6 @@ All settings live under `lsp` in `settings.json`:
 ```json
 {
   "lsp": {
-    "enabled": true,
     "settleMs": 1500,
     "maxDiagnostics": 20,
     "severity": "error",
@@ -103,7 +98,7 @@ All settings live under `lsp` in `settings.json`:
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `enabled` | boolean | `false` | Master switch (also `--lsp` per run) |
+| `enabled` | boolean | `true` | Master switch; set `false` to disable (`--lsp` force-enables per run) |
 | `settleMs` | number | `1500` | How long to wait for published diagnostics after a change (servers without pull diagnostics) |
 | `firstSettleMs` | number | `10000` | Wait window for the first diagnostics from a freshly started server (project load time) |
 | `idleShutdownMs` | number | `600000` | Shut down servers idle for this long (10 minutes); `0` disables idle shutdown |

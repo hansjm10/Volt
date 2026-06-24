@@ -321,7 +321,7 @@ export class AgentSession {
 	private _modelRegistry: ModelRegistry;
 	private _fastModeRestoreThinkingLevel: ThinkingLevel | undefined;
 
-	// LSP diagnostics manager (created when lsp.enabled is set)
+	// LSP diagnostics manager (created unless lsp.enabled is false)
 	private _lspManager?: LspManager;
 
 	// Tool registry for extension getTools/setTools
