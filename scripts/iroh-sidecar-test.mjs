@@ -388,6 +388,16 @@ function closeRawConnection(connection) {
 	connection.close(0n, Array.from(Buffer.from("done", "utf8")));
 }
 
+async function closeRawStream(rawClient) {
+	if (!rawClient) return;
+	if (rawClient.stream?.send?.reset) {
+		await Promise.resolve(rawClient.stream.send.reset(0n)).catch(() => {});
+	} else {
+		await Promise.resolve(rawClient.stream?.send?.finish?.()).catch(() => {});
+	}
+	await Promise.resolve(rawClient.stream?.recv?.stop?.(0n)).catch(() => {});
+}
+
 async function closeRawAuthorizedClient(rawClient) {
 	if (!rawClient) return;
 	closeRawConnection(rawClient.connection);
@@ -2051,6 +2061,262 @@ async function integratedVoltMultiWorkspaceRuntimeIsolationScenario() {
 	});
 }
 
+async function nativeIrohMultiStreamLifecycleScenario() {
+	await withStateDir("native-multi-stream-lifecycle", async ({ hostStatePath, stateDir }) => {
+		const responseText = "native multi-stream completion";
+		const fakeOpenAI = await startFakeOpenAICompletionsServer(responseText);
+		const agentDir = await createIntegratedVoltAgentDir(stateDir, { baseUrl: fakeOpenAI.baseUrl });
+		const alphaWorkspacePath = join(stateDir, "alpha-workspace");
+		const betaWorkspacePath = join(stateDir, "beta-workspace");
+		await mkdir(alphaWorkspacePath, { recursive: true });
+		await mkdir(betaWorkspacePath, { recursive: true });
+		const auditPath = getDefaultAuditPath(hostStatePath);
+		const endpoint = await bindRawClientEndpoint("disabled");
+		let alphaClient;
+		let betaClient;
+		let reattachedAlphaClient;
+		let revokedClient;
+
+		async function registerWorkspace(name, workspacePath) {
+			const registerCommand = spawnSourceCli([
+				"remote",
+				"host",
+				"--state",
+				hostStatePath,
+				"--register-workspace",
+				`${name}=${workspacePath}`,
+				"--allow-tools",
+				DEFAULT_TEST_ALLOW_TOOLS,
+			]);
+			await waitForExit(registerCommand.child, `native multi-stream register ${name}`, registerCommand.output);
+			assert(
+				registerCommand.output.stderr.includes(`registered workspace: ${name} ->`),
+				`Expected ${name} registration confirmation`,
+			);
+		}
+
+		await registerWorkspace("alpha", alphaWorkspacePath);
+		await registerWorkspace("beta", betaWorkspacePath);
+
+		const host = startHost([
+			"--state",
+			hostStatePath,
+			"--agent-dir",
+			agentDir,
+			"--workspace",
+			`alpha=${alphaWorkspacePath}`,
+			"--integrated-volt",
+			"--no-pairing",
+		]);
+		try {
+			await waitForHostReady(host.child, host.output, "native multi-stream lifecycle host");
+			const pairCommand = spawnSourceCli([
+				"remote",
+				"pair",
+				"--state",
+				hostStatePath,
+				"--workspace",
+				"alpha",
+				"--allow-tools",
+				DEFAULT_TEST_ALLOW_TOOLS,
+				"--label",
+				"native multi-stream client",
+			]);
+			await waitForExit(pairCommand.child, "native multi-stream pair command", pairCommand.output);
+			const alphaTicket = pairCommand.output.stdout.trim();
+			assert(
+				alphaTicket.startsWith(TICKET_PREFIX),
+				"Expected native multi-stream pair command to emit a ticket",
+			);
+			const alphaReconnectTicket = createSecretFreeWorkspaceTicket(alphaTicket, "alpha");
+			const betaTicket = createSecretFreeWorkspaceTicket(alphaTicket, "beta");
+
+			alphaClient = await openRawAuthorizedClientOnEndpoint(endpoint, alphaTicket, {
+				clientLabel: "native multi-stream client",
+			});
+			assert(
+				alphaClient.handshakeResponse.features?.includes("multi_streams.v1"),
+				`Expected alpha handshake to advertise multi_streams.v1, got ${JSON.stringify(alphaClient.handshakeResponse)}`,
+			);
+			const betaStream = await openRawAuthorizedStreamOnConnection(alphaClient, betaTicket, {
+				clientLabel: "native multi-stream client",
+			});
+			assert(
+				betaStream.handshakeResponse.features?.includes("multi_streams.v1"),
+				`Expected beta handshake to advertise multi_streams.v1, got ${JSON.stringify(betaStream.handshakeResponse)}`,
+			);
+			betaClient = {
+				connection: alphaClient.connection,
+				handshakeResponse: betaStream.handshakeResponse,
+				nodeId: alphaClient.nodeId,
+				rest: betaStream.rest,
+				stream: betaStream.stream,
+			};
+
+			const alphaState = await readRawRpcResponse(
+				alphaClient,
+				{ id: "state-native-alpha-initial", type: "get_state" },
+				"native multi-stream alpha initial get_state",
+			);
+			const betaState = await readRawRpcResponse(
+				betaClient,
+				{ id: "state-native-beta-initial", type: "get_state" },
+				"native multi-stream beta initial get_state",
+			);
+			const alphaSessionId = alphaState.event.data?.sessionId;
+			const betaSessionId = betaState.event.data?.sessionId;
+			assert(
+				alphaState.event.success === true &&
+					alphaState.event.data?.remoteHost?.workspace === "alpha" &&
+					alphaSessionId,
+				`Expected alpha get_state success with workspace alpha, got ${JSON.stringify(alphaState.event)}`,
+			);
+			assert(
+				betaState.event.success === true && betaState.event.data?.remoteHost?.workspace === "beta" && betaSessionId,
+				`Expected beta get_state success with workspace beta, got ${JSON.stringify(betaState.event)}`,
+			);
+			assert(
+				alphaSessionId !== betaSessionId,
+				`Expected distinct alpha and beta sessions, got alpha=${alphaSessionId} beta=${betaSessionId}`,
+			);
+
+			const alphaPrompt = await readRawRpcResponse(
+				alphaClient,
+				{ id: "prompt-native-alpha", type: "prompt", message: "alpha keeps running after stream close" },
+				"native multi-stream alpha prompt",
+			);
+			const betaPrompt = await readRawRpcResponse(
+				betaClient,
+				{ id: "prompt-native-beta", type: "prompt", message: "beta abort is isolated" },
+				"native multi-stream beta prompt",
+			);
+			assert(alphaPrompt.event.success === true, "Expected alpha prompt to start");
+			assert(betaPrompt.event.success === true, "Expected beta prompt to start");
+			await waitForFakeOpenAIRequestCount(fakeOpenAI, 2, "native multi-stream concurrent prompts");
+
+			await closeRawStream(alphaClient);
+			await waitForAuditEvent(
+				auditPath,
+				(event) =>
+					event.type === "remote_runtime_detached" &&
+					event.workspace === "alpha" &&
+					event.details?.sessionId === alphaSessionId &&
+					event.details?.active === true,
+				"native multi-stream alpha active detach",
+			);
+
+			const betaAfterAlphaClose = await readRawRpcResponse(
+				betaClient,
+				{ id: "state-native-beta-after-alpha-close", type: "get_state" },
+				"native multi-stream beta get_state after alpha close",
+			);
+			assert(
+				betaAfterAlphaClose.event.data?.sessionId === betaSessionId &&
+					betaAfterAlphaClose.event.data?.isStreaming === true,
+				`Expected beta stream to remain active after alpha closed, got ${JSON.stringify(betaAfterAlphaClose.event)}`,
+			);
+
+			const betaAbort = await readRawRpcResponse(
+				betaClient,
+				{ id: "abort-native-beta", type: "abort" },
+				"native multi-stream beta abort",
+			);
+			assert(betaAbort.event.success === true, `Expected beta abort success, got ${JSON.stringify(betaAbort.event)}`);
+			const betaAfterAbort = await readRawRpcResponse(
+				betaClient,
+				{ id: "state-native-beta-after-abort", type: "get_state" },
+				"native multi-stream beta get_state after abort",
+			);
+			assert(
+				betaAfterAbort.event.data?.sessionId === betaSessionId &&
+					betaAfterAbort.event.data?.isStreaming === false,
+				`Expected beta to stop streaming after abort, got ${JSON.stringify(betaAfterAbort.event)}`,
+			);
+
+			const reattachedAlphaStream = await openRawAuthorizedStreamOnConnection(betaClient, alphaReconnectTicket, {
+				clientLabel: "native multi-stream client",
+			});
+			reattachedAlphaClient = {
+				connection: betaClient.connection,
+				handshakeResponse: reattachedAlphaStream.handshakeResponse,
+				nodeId: betaClient.nodeId,
+				rest: reattachedAlphaStream.rest,
+				stream: reattachedAlphaStream.stream,
+			};
+			const alphaReattachedState = await readRawRpcResponse(
+				reattachedAlphaClient,
+				{ id: "state-native-alpha-reattached", type: "get_state" },
+				"native multi-stream alpha reattached get_state",
+			);
+			assert(
+				alphaReattachedState.event.data?.sessionId === alphaSessionId &&
+					alphaReattachedState.event.data?.isStreaming === true,
+				`Expected alpha to keep streaming after beta abort, got ${JSON.stringify(alphaReattachedState.event)}`,
+			);
+
+			fakeOpenAI.releaseResponse();
+			let alphaAgentEnd;
+			for (let index = 0; !alphaAgentEnd && index < 20; index += 1) {
+				const { event } = await readRawRpcEvent(
+					reattachedAlphaClient,
+					"native multi-stream alpha completion after beta abort",
+				);
+				if (event.type === "agent_end") alphaAgentEnd = event;
+			}
+			assert(alphaAgentEnd, "Expected alpha prompt to finish after beta abort");
+			assert(
+				alphaAgentEnd.messages?.some((message) => message.role === "assistant" && message.stopReason === "stop"),
+				`Expected alpha prompt to stop normally, got ${JSON.stringify(alphaAgentEnd)}`,
+			);
+
+			const revokeCommand = spawnSourceCli(["remote", "revoke", betaClient.nodeId, "--state", hostStatePath]);
+			await waitForExit(revokeCommand.child, "native multi-stream revoke command", revokeCommand.output);
+			assert(
+				revokeCommand.output.stderr.includes(`Active connection revoked for ${betaClient.nodeId}`),
+				"Expected active revocation diagnostic for native multi-stream client",
+			);
+			await waitForRawConnectionClosed(betaClient.connection, "native multi-stream revoked connection");
+			await waitForAuditEvent(
+				auditPath,
+				(event) =>
+					event.type === "active_connection_revoked" &&
+					event.clientNodeId === betaClient.nodeId &&
+					event.workspace === "alpha" &&
+					event.success === true,
+				"native multi-stream alpha revocation",
+			);
+			await waitForAuditEvent(
+				auditPath,
+				(event) =>
+					event.type === "active_connection_revoked" &&
+					event.clientNodeId === betaClient.nodeId &&
+					event.workspace === "beta" &&
+					event.success === true,
+				"native multi-stream beta revocation",
+			);
+
+			revokedClient = await openRawAuthorizedClientOnEndpoint(endpoint, alphaReconnectTicket, {
+				clientLabel: "native multi-stream client",
+				expectSuccess: false,
+			});
+			assert(
+				revokedClient.handshakeResponse.success === false &&
+					revokedClient.handshakeResponse.outcome === "client_revoked",
+				`Expected revoked native multi-stream client to be rejected, got ${JSON.stringify(revokedClient.handshakeResponse)}`,
+			);
+		} finally {
+			await closeRawStream(alphaClient);
+			await closeRawStream(reattachedAlphaClient);
+			await closeRawStream(betaClient);
+			closeRawConnection(revokedClient?.connection);
+			closeRawConnection(betaClient?.connection ?? alphaClient?.connection ?? reattachedAlphaClient?.connection);
+			await endpoint.close();
+			await stopProcess(host.child);
+			await fakeOpenAI.close();
+		}
+	});
+}
+
 async function duplicateActiveConnectionScenario() {
 	await withStateDir("duplicate-active", async ({ hostStatePath, stateDir }) => {
 		const agentDir = await createIntegratedVoltAgentDir(stateDir);
@@ -3471,6 +3737,7 @@ const scenarios = [
 	["integrated Volt detached runtime TTL", integratedVoltDetachedRuntimeTtlScenario],
 	["integrated Volt active detach reconnect transcript", integratedVoltActiveDetachReconnectTranscriptScenario],
 	["integrated Volt multi-workspace runtime isolation", integratedVoltMultiWorkspaceRuntimeIsolationScenario],
+	["native Iroh multi-stream lifecycle", nativeIrohMultiStreamLifecycleScenario],
 	["duplicate active connection", duplicateActiveConnectionScenario],
 	["integrated Volt profile", integratedVoltProfileScenario],
 	["integrated Volt env profile", integratedVoltEnvProfileScenario],
