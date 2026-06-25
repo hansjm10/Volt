@@ -215,7 +215,9 @@ export {
 	parseIrohRemoteTicketPayload,
 } from "./ticket.ts";
 export {
+	getAvailableIrohRemoteWorkspaceNames,
 	getIrohRemoteWorkspaceAvailabilityStatus,
+	getIrohRemoteWorkspaceStatuses,
 	type IrohRemoteWorkspaceAvailabilityClassifier,
 	type IrohRemoteWorkspaceAvailabilityStatus,
 	type IrohRemoteWorkspaceStatus,
@@ -223,3 +225,12 @@ export {
 	selectIrohRemoteWorkspace,
 	upsertIrohRemoteWorkspace,
 } from "./workspace.ts";
+export {
+	type HandleIrohRemoteWorkspaceUnregisterRpcCommandOptions,
+	handleIrohRemoteWorkspaceUnregisterRpcCommand,
+	IROH_REMOTE_UNREGISTER_WORKSPACE_RPC_TYPE,
+	type IrohRemoteWorkspaceMetadataSnapshot,
+	type IrohRemoteWorkspaceUnregisterRpcData,
+	type IrohRemoteWorkspaceUnregisterRpcResponse,
+	type IrohRemoteWorkspaceUnregisterRpcResult,
+} from "./workspace-rpc.ts";

@@ -151,6 +151,17 @@ export function validateRpcCommandPayload(value: unknown): string | undefined {
 			);
 		case "register_push_target":
 			return validateRequiredField(value, "args", isRpcRegisterPushTargetArgs, "a push target registration object");
+		case "unregister_workspace":
+			return (
+				validateRequiredField(
+					value,
+					"name",
+					(entry): entry is string => typeof entry === "string" && entry.trim().length > 0,
+					"a non-empty workspace name",
+				) ??
+				validateOptionalField(value, "path", () => false, "omitted") ??
+				validateOptionalField(value, "workspacePath", () => false, "omitted")
+			);
 		case "get_transcript":
 			return (
 				validateOptionalField(value, "beforeEntryId", isString, "a string") ??

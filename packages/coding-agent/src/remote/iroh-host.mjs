@@ -12,6 +12,7 @@ import lockfile from "proper-lockfile";
 import {
 	createIrohRemoteHandshakeFailure,
 	createIrohRemoteHostMetadata,
+	createIrohRemoteRpcErrorResponse,
 	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 	DEFAULT_IROH_REMOTE_HANDSHAKE_MAX_LINE_BYTES,
 	DEFAULT_IROH_REMOTE_HANDSHAKE_TIMEOUT_MS,
@@ -24,6 +25,7 @@ import {
 	getIrohRemoteUnsafeAllowedTools,
 	getIrohRemoteVoltRpcToolArgs,
 	getIrohRemoteWorkspaceAvailabilityStatus,
+	handleIrohRemoteWorkspaceUnregisterRpcCommand,
 	hasTrustRequiringProjectResources,
 	IROH_REMOTE_PAIR_CONTROL_REQUEST_TYPE,
 	IROH_REMOTE_PAIR_CONTROL_RESPONSE_TYPE,
@@ -89,6 +91,7 @@ const RESPONSE_COMPLETION_RPC_TYPES = new Set([
 	"list_sessions",
 	"register_push_target",
 	"switch_session_by_id",
+	"unregister_workspace",
 ]);
 const UI_ACTION_PROMPT_COMPLETION_STATUSES = new Set(["accepted", "queued"]);
 const PROMPT_COMPLETION_SETTLE_MS = 100;
@@ -853,6 +856,42 @@ function createRemoteHostMetadata(authorization, options) {
 	});
 }
 
+function updateAuthorizationWorkspaceMetadata(authorization, metadata) {
+	authorization.workspaceNames = [...metadata.workspaceNames];
+	authorization.workspaces = metadata.workspaces.map((workspace) => ({ ...workspace }));
+}
+
+async function handleRemoteHostRpcCommand(command, authorization, options) {
+	let result;
+	try {
+		result = await handleIrohRemoteWorkspaceUnregisterRpcCommand(command, {
+			classifyWorkspaceAvailability: getIrohRemoteWorkspaceAvailabilityStatus,
+			stateManager: options.stateManager,
+		});
+	} catch (error) {
+		return createIrohRemoteRpcErrorResponse(
+			typeof command.id === "string" ? command.id : undefined,
+			typeof command.type === "string" ? command.type : "unknown",
+			error instanceof Error ? error.message : String(error),
+		);
+	}
+	if (!result.handled) {
+		return undefined;
+	}
+	if (result.metadata) {
+		updateAuthorizationWorkspaceMetadata(authorization, result.metadata);
+	}
+	await logAudit(options.auditLogger, {
+		type: "workspace_unregistered",
+		clientNodeId: authorization.client.nodeId,
+		workspace: typeof command.name === "string" ? command.name : undefined,
+		success: result.response.success === true,
+		error: result.response.success === true ? undefined : result.response.error,
+		details: { source: "remote_rpc" },
+	});
+	return result.response;
+}
+
 function decorateRemoteHostState(value, authorization, options) {
 	const decoratedValue = decorateRemoteUiActionResponse(value);
 	if (
@@ -1105,11 +1144,26 @@ function shouldWaitForRemoteRpcPromptCompletion(command, response) {
 	return UI_ACTION_PROMPT_COMPLETION_STATUSES.has(response.data?.status);
 }
 
-async function writeRemoteRpcLineToChild(line, writable, writeToClient, rpcCompletionTracker, sanitizerOptions) {
+async function writeRemoteRpcLineToChild(
+	line,
+	writable,
+	initialAuthorization,
+	options,
+	writeToClient,
+	rpcCompletionTracker,
+	sanitizerOptions,
+) {
 	const filterResult = getIrohRemoteRpcFilterResult(line);
 	if (!filterResult.allowed) {
 		await writeToClient(
 			sanitizeIrohRemoteOutboundJsonLine(serializeIrohRemoteRpcFilterRejection(filterResult.response), sanitizerOptions),
+		);
+		return;
+	}
+	const remoteHostResponse = await handleRemoteHostRpcCommand(filterResult.command, initialAuthorization, options);
+	if (remoteHostResponse) {
+		await writeToClient(
+			sanitizeIrohRemoteOutboundJsonLine(`${JSON.stringify(remoteHostResponse)}\n`, sanitizerOptions),
 		);
 		return;
 	}
@@ -1121,6 +1175,8 @@ async function pipeFilteredIrohRpcToNodeWritable(
 	recv,
 	writable,
 	initial,
+	initialAuthorization,
+	options,
 	writeToClient,
 	rpcCompletionTracker,
 	sanitizerOptions,
@@ -1134,6 +1190,8 @@ async function pipeFilteredIrohRpcToNodeWritable(
 				await writeRemoteRpcLineToChild(
 					result.rest.toString("utf8"),
 					writable,
+					initialAuthorization,
+					options,
 					writeToClient,
 					rpcCompletionTracker,
 					sanitizerOptions,
@@ -1143,7 +1201,15 @@ async function pipeFilteredIrohRpcToNodeWritable(
 			return;
 		}
 
-		await writeRemoteRpcLineToChild(result.line, writable, writeToClient, rpcCompletionTracker, sanitizerOptions);
+		await writeRemoteRpcLineToChild(
+			result.line,
+			writable,
+			initialAuthorization,
+			options,
+			writeToClient,
+			rpcCompletionTracker,
+			sanitizerOptions,
+		);
 		buffer = result.rest;
 	}
 }
@@ -1184,6 +1250,8 @@ async function runSpawnedRpcConnection(stream, handshake, authorization, options
 		stream.recv,
 		child.stdin,
 		handshake.initialInput,
+		authorization,
+		options,
 		(chunk) => sendQueue.write(chunk),
 		rpcCompletionTracker,
 		{ workspacePath: authorization.workspace.path },
@@ -1251,6 +1319,7 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, opt
 			registerPushTarget: pushDispatcher
 				? (args) => pushDispatcher.registerPushTarget(args)
 				: undefined,
+			remoteCommandHandler: (command) => handleRemoteHostRpcCommand(command, authorization, options),
 			stream,
 			initialInput: handshake.initialInput,
 			workspacePath: authorization.workspace.path,

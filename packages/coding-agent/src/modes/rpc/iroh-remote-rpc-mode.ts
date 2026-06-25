@@ -4,6 +4,7 @@ import { REVIEW_BRANCH_ACTION_ID, REVIEW_UNCOMMITTED_ACTION_ID } from "../../cor
 import {
 	createIrohRemoteFilteredRpcTransport,
 	createIrohRemoteOutboundFilteredRpcTransport,
+	createIrohRemoteRpcErrorResponse,
 	type IrohRemoteLiveActivityContentState,
 	type IrohRemoteLiveActivityToolGlyph,
 	type IrohRemoteLiveActivityUpdateIntent,
@@ -26,6 +27,7 @@ export interface IrohRemoteRpcModeOptions extends IrohRpcTransportOptions {
 	notificationDelivery?: IrohRemotePushNotificationDelivery;
 	onSessionChanged?: (session: RpcSessionChange) => void | Promise<void>;
 	registerPushTarget?: (args: unknown) => Promise<RpcRegisterPushTargetResponse>;
+	remoteCommandHandler?: (command: Record<string, unknown>) => object | Promise<object | undefined> | undefined;
 	remoteWorkspacePath?: string;
 	workspacePath: string;
 }
@@ -78,6 +80,11 @@ interface IrohRemoteCloseDeferringRpcTransport extends RpcTransport {
 	setRpcModeStartupComplete(startupComplete: boolean): void;
 }
 
+interface IrohRemoteHostCommandRpcTransportOptions {
+	handleCommand: (command: Record<string, unknown>) => object | Promise<object | undefined> | undefined;
+	transport: RpcTransport;
+}
+
 /** Run Volt RPC in-process over an authorized Iroh bidirectional stream. */
 export function runIrohRemoteRpcMode(
 	runtimeHost: AgentSessionRuntime,
@@ -118,6 +125,16 @@ export function runIrohRemoteRpcMode(
 		waitForPromptCompletion: () => runtimeHost.session.waitForIdle(),
 	});
 
+	const filteredTransport = createIrohRemoteFilteredRpcTransport({
+		transport: closeDeferringTransport,
+	});
+	const remoteHostCommandTransport = options.remoteCommandHandler
+		? createIrohRemoteHostCommandRpcTransport({
+				handleCommand: options.remoteCommandHandler,
+				transport: filteredTransport,
+			})
+		: filteredTransport;
+
 	return runRpcMode(runtimeHost, {
 		allowUiActionInvocation: true,
 		disposeRuntimeOnClose: options.disposeRuntimeOnClose,
@@ -126,9 +143,7 @@ export function runIrohRemoteRpcMode(
 			await options.onSessionChanged?.(session);
 		},
 		requireRemoteSafeUiActions: true,
-		transport: createIrohRemoteFilteredRpcTransport({
-			transport: closeDeferringTransport,
-		}),
+		transport: remoteHostCommandTransport,
 		exitProcess: false,
 		registerPushTarget: options.registerPushTarget,
 	}).finally(() => {
@@ -284,6 +299,105 @@ function sanitizeLiveActivityToolName(toolName: string | undefined): string {
 		return "tool";
 	}
 	return trimmed.slice(0, 32);
+}
+
+export function createIrohRemoteHostCommandRpcTransport(
+	options: IrohRemoteHostCommandRpcTransportOptions,
+): RpcTransport {
+	let pendingInboundCommand = Promise.resolve();
+
+	const waitForPendingInboundCommand = async (): Promise<void> => {
+		await pendingInboundCommand;
+	};
+
+	const writeHandlerError = async (line: string, error: unknown): Promise<void> => {
+		const target = getIrohRemoteRpcErrorTarget(line);
+		await options.transport.write(
+			createIrohRemoteRpcErrorResponse(
+				target.id,
+				target.command,
+				error instanceof Error ? error.message : String(error),
+			),
+		);
+	};
+
+	const handleLine = async (line: string, handler: RpcLineHandler): Promise<void> => {
+		const command = parseIrohRemoteHostCommandLine(line);
+		if (!command) {
+			handler(line);
+			return;
+		}
+		let response: object | undefined;
+		try {
+			response = await options.handleCommand(command);
+		} catch (error: unknown) {
+			await writeHandlerError(line, error);
+			return;
+		}
+		if (response === undefined) {
+			handler(line);
+			return;
+		}
+		await options.transport.write(response);
+	};
+
+	return {
+		write(value) {
+			return options.transport.write(value);
+		},
+		onLine(handler: RpcLineHandler): () => void {
+			return options.transport.onLine((line) => {
+				pendingInboundCommand = pendingInboundCommand.then(
+					() => handleLine(line, handler),
+					() => handleLine(line, handler),
+				);
+				void pendingInboundCommand.catch(() => {});
+			});
+		},
+		onClose(handler: RpcCloseHandler): () => void {
+			return options.transport.onClose?.(handler) ?? (() => {});
+		},
+		async waitForBackpressure() {
+			await waitForPendingInboundCommand();
+			await options.transport.waitForBackpressure?.();
+		},
+		async flush() {
+			await waitForPendingInboundCommand();
+			await options.transport.flush?.();
+		},
+		async close() {
+			await waitForPendingInboundCommand();
+			await options.transport.close();
+		},
+	};
+}
+
+function parseIrohRemoteHostCommandLine(line: string): Record<string, unknown> | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(line);
+	} catch {
+		return undefined;
+	}
+	if (!isRecord(parsed) || typeof parsed.type !== "string") {
+		return undefined;
+	}
+	return parsed;
+}
+
+function getIrohRemoteRpcErrorTarget(line: string): { id: string | undefined; command: string } {
+	try {
+		const parsed: unknown = JSON.parse(line);
+		if (!isRecord(parsed)) {
+			return { id: undefined, command: "unknown" };
+		}
+		return {
+			id: typeof parsed.id === "string" ? parsed.id : undefined,
+			command: typeof parsed.type === "string" ? parsed.type : "unknown",
+		};
+	} catch {
+		return { id: undefined, command: "parse" };
+	}
 }
 
 function liveActivityStatusText(

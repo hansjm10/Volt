@@ -37,6 +37,7 @@ import {
 	getIrohRemoteRpcFilterResult,
 	getIrohRemoteUnsafeAllowedTools,
 	getIrohRemoteWorkspaceAvailabilityStatus,
+	handleIrohRemoteWorkspaceUnregisterRpcCommand,
 	hashIrohRemotePairingSecret,
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_HOST_HANDSHAKE_FAILURE_OUTCOMES,
@@ -82,7 +83,10 @@ import type {
 	RpcLineHandler,
 	RpcTransport,
 } from "../src/core/rpc/index.ts";
-import { createIrohRemoteCloseDeferringRpcTransport } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
+import {
+	createIrohRemoteCloseDeferringRpcTransport,
+	createIrohRemoteHostCommandRpcTransport,
+} from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
 
 class ManualRpcTransport implements RpcTransport {
 	readonly writes: object[] = [];
@@ -672,6 +676,7 @@ describe("Iroh remote core helpers", () => {
 			"list_sessions",
 			"switch_session_by_id",
 			"register_push_target",
+			"unregister_workspace",
 			"extension_ui_response",
 		]);
 		for (const type of IROH_REMOTE_RPC_PASSTHROUGH_TYPES) {
@@ -2351,6 +2356,143 @@ describe("Iroh remote core helpers", () => {
 		expect(state.pendingPairingTickets).toEqual([expect.objectContaining({ workspace: "alpha" })]);
 	});
 
+	test("remote RPC unregister command removes workspace registration and returns fresh metadata only", async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "volt-iroh-unregister-rpc-"));
+		try {
+			const alphaPath = join(tempDir, "alpha");
+			const betaPath = join(tempDir, "beta");
+			const missingPath = join(tempDir, "missing");
+			await mkdir(alphaPath, { recursive: true });
+			await mkdir(betaPath, { recursive: true });
+			const stateManager = new IrohRemoteHostStateManager({
+				initialState: {
+					hostSecretKey: undefined,
+					workspaces: [
+						{ name: "alpha", path: alphaPath, allowedTools: "read" },
+						{ name: "beta", path: betaPath, allowedTools: "read,grep" },
+						{ name: "missing", path: missingPath, allowedTools: "read" },
+					],
+					clients: [
+						{
+							nodeId: "client-node",
+							label: "phone",
+							allowedWorkspaces: [],
+							allowedTools: "read",
+							pairedAt: 1,
+							lastSeenAt: 2,
+							lastSessionIdByWorkspace: { beta: "session-beta" },
+						},
+					],
+					revokedClients: [
+						{
+							nodeId: "revoked-node",
+							label: "revoked phone",
+							allowedWorkspaces: [],
+							allowedTools: "read",
+							pairedAt: 1,
+							lastSeenAt: 2,
+							revokedAt: 3,
+						},
+					],
+					pendingPairingTickets: [
+						{
+							secretHash: "sha256:pending",
+							workspace: "beta",
+							allowedTools: "read",
+							createdAt: 1,
+							expiresAt: 2,
+						},
+					],
+				},
+			});
+
+			const result = await handleIrohRemoteWorkspaceUnregisterRpcCommand(
+				{ id: "remove-beta", type: "unregister_workspace", name: "beta" },
+				{
+					classifyWorkspaceAvailability: getIrohRemoteWorkspaceAvailabilityStatus,
+					stateManager,
+				},
+			);
+
+			expect(result).toEqual({
+				handled: true,
+				metadata: {
+					workspaceNames: ["alpha"],
+					workspaces: [
+						{ name: "alpha", status: "available" },
+						{ name: "missing", status: "missing" },
+					],
+				},
+				response: {
+					id: "remove-beta",
+					type: "response",
+					command: "unregister_workspace",
+					success: true,
+					data: {
+						removedWorkspace: "beta",
+						workspaceNames: ["alpha"],
+						workspaces: [
+							{ name: "alpha", status: "available" },
+							{ name: "missing", status: "missing" },
+						],
+					},
+				},
+			});
+			expect(JSON.stringify(result)).not.toContain(betaPath);
+			const state = await stateManager.getState();
+			expect(state.workspaces.map((workspace) => workspace.name)).toEqual(["alpha", "missing"]);
+			expect(state.clients).toEqual([expect.objectContaining({ nodeId: "client-node" })]);
+			expect(state.revokedClients).toEqual([expect.objectContaining({ nodeId: "revoked-node" })]);
+			expect(state.pendingPairingTickets).toEqual([expect.objectContaining({ workspace: "beta" })]);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	});
+
+	test("remote RPC unregister command rejects unknown workspace without mutating state", async () => {
+		const stateManager = new IrohRemoteHostStateManager({
+			initialState: {
+				hostSecretKey: undefined,
+				workspaces: [{ name: "alpha", path: "/alpha" }],
+				clients: [],
+			},
+		});
+		const before = await stateManager.getState();
+
+		await expect(
+			handleIrohRemoteWorkspaceUnregisterRpcCommand(
+				{ id: "remove-missing", type: "unregister_workspace", name: "missing" },
+				{ stateManager },
+			),
+		).resolves.toEqual({
+			handled: true,
+			response: {
+				id: "remove-missing",
+				type: "response",
+				command: "unregister_workspace",
+				success: false,
+				error: "No registered Iroh remote workspace named missing",
+			},
+		});
+		expect(await stateManager.getState()).toEqual(before);
+		await expect(
+			handleIrohRemoteWorkspaceUnregisterRpcCommand(
+				{ id: "remove-path", type: "unregister_workspace", name: "alpha", path: "/alpha" },
+				{ stateManager },
+			),
+		).resolves.toEqual({
+			handled: true,
+			response: {
+				id: "remove-path",
+				type: "response",
+				command: "unregister_workspace",
+				success: false,
+				error: "Workspace unregister accepts a workspace name only, not a path",
+			},
+		});
+		expect(await stateManager.getState()).toEqual(before);
+	});
+
 	test("host state manager rejects ambiguous initial state and file path options", () => {
 		expect(
 			() =>
@@ -2991,6 +3133,71 @@ describe("Iroh remote core helpers", () => {
 		expect(inner.waitForBackpressureCalls).toBe(1);
 		expect(inner.flushCalls).toBe(1);
 		expect(inner.closeCalls).toBe(1);
+	});
+
+	test("intercepts allowed remote host commands before subsequent active-connection state requests", async () => {
+		const inner = new ManualRpcTransport();
+		const forwardedLines: string[] = [];
+		let activeWorkspaceNames = ["alpha", "beta"];
+		const filteredTransport = createIrohRemoteFilteredRpcTransport({
+			transport: createIrohRemoteCloseDeferringRpcTransport({
+				transport: inner,
+				waitForPromptCompletion: () => Promise.resolve(),
+			}),
+		});
+		const transport = createIrohRemoteHostCommandRpcTransport({
+			transport: filteredTransport,
+			handleCommand: async (command) => {
+				if (command.type !== "unregister_workspace") {
+					return undefined;
+				}
+				await Promise.resolve();
+				activeWorkspaceNames = ["alpha"];
+				return {
+					id: typeof command.id === "string" ? command.id : undefined,
+					type: "response",
+					command: "unregister_workspace",
+					success: true,
+					data: {
+						removedWorkspace: "beta",
+						workspaceNames: activeWorkspaceNames,
+						workspaces: [{ name: "alpha", status: "available" }],
+					},
+				};
+			},
+		});
+		transport.onLine((line) => {
+			if (JSON.parse(line).type === "get_state") {
+				expect(activeWorkspaceNames).toEqual(["alpha"]);
+			}
+			forwardedLines.push(line);
+		});
+
+		inner.emitLine(JSON.stringify({ id: "remove-beta", type: "unregister_workspace", name: "beta" }));
+		const getStateLine = JSON.stringify({ id: "state-after-remove", type: "get_state" });
+		inner.emitLine(getStateLine);
+		inner.emitLine(JSON.stringify({ id: "unsafe", type: "bash", command: "pwd" }));
+		await transport.flush?.();
+
+		expect(forwardedLines).toEqual([getStateLine]);
+		expect(inner.writes).toContainEqual({
+			id: "remove-beta",
+			type: "response",
+			command: "unregister_workspace",
+			success: true,
+			data: {
+				removedWorkspace: "beta",
+				workspaceNames: ["alpha"],
+				workspaces: [{ name: "alpha", status: "available" }],
+			},
+		});
+		expect(inner.writes).toContainEqual({
+			id: "unsafe",
+			type: "response",
+			command: "bash",
+			success: false,
+			error: "RPC command not allowed over remote host: bash",
+		});
 	});
 
 	test("routes remote command filter rejections through outbound and close-deferring layers", async () => {

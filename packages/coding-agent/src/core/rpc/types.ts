@@ -52,6 +52,9 @@ export type RpcCommand =
 	// Push notifications
 	| { id?: string; type: "register_push_target"; args: RpcRegisterPushTargetArgs }
 
+	// Remote host management
+	| { id?: string; type: "unregister_workspace"; name: string }
+
 	// State
 	| { id?: string; type: "get_state" }
 	| { id?: string; type: "get_transcript"; limit?: number; beforeEntryId?: string }
@@ -428,6 +431,19 @@ export type RpcResponse =
 			command: "register_push_target";
 			success: true;
 			data: RpcRegisterPushTargetResponse;
+	  }
+
+	// Remote host management
+	| {
+			id?: string;
+			type: "response";
+			command: "unregister_workspace";
+			success: true;
+			data: {
+				removedWorkspace: string;
+				workspaceNames: string[];
+				workspaces: Array<{ name: string; status: string }>;
+			};
 	  }
 
 	// State

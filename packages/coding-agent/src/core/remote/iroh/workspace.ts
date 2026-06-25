@@ -67,6 +67,36 @@ export function upsertIrohRemoteWorkspace(
 	return existing;
 }
 
+export async function getIrohRemoteWorkspaceStatuses(
+	state: IrohRemoteHostState,
+	classifier?: IrohRemoteWorkspaceAvailabilityClassifier,
+): Promise<IrohRemoteWorkspaceStatus[]> {
+	return await Promise.all(
+		state.workspaces.map(async (workspace) => ({
+			name: workspace.name,
+			status: await getIrohRemoteWorkspaceStatus(workspace, classifier),
+		})),
+	);
+}
+
+export function getAvailableIrohRemoteWorkspaceNames(workspaces: readonly IrohRemoteWorkspaceStatus[]): string[] {
+	return workspaces.filter((entry) => entry.status === "available").map((entry) => entry.name);
+}
+
+async function getIrohRemoteWorkspaceStatus(
+	workspace: IrohRemoteWorkspace,
+	classifier: IrohRemoteWorkspaceAvailabilityClassifier | undefined,
+): Promise<IrohRemoteWorkspaceAvailabilityStatus> {
+	if (classifier === undefined) {
+		return "available";
+	}
+	try {
+		return await classifier(workspace);
+	} catch {
+		return "unavailable";
+	}
+}
+
 export function findIrohRemoteWorkspace(
 	state: IrohRemoteHostState,
 	workspaceName: string,

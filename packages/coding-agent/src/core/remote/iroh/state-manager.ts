@@ -19,7 +19,13 @@ import {
 	readIrohRemoteHostState,
 	writeIrohRemoteHostState,
 } from "./state.ts";
-import { findIrohRemoteWorkspace, type IrohRemoteWorkspaceStatus, upsertIrohRemoteWorkspace } from "./workspace.ts";
+import {
+	findIrohRemoteWorkspace,
+	getIrohRemoteWorkspaceStatuses,
+	type IrohRemoteWorkspaceAvailabilityClassifier,
+	type IrohRemoteWorkspaceStatus,
+	upsertIrohRemoteWorkspace,
+} from "./workspace.ts";
 
 export interface IrohRemoteHostStateManagerOptions {
 	initialState?: IrohRemoteHostState;
@@ -89,6 +95,15 @@ export class IrohRemoteHostStateManager {
 			const [removedWorkspace] = state.workspaces.splice(index, 1);
 			await this.saveUnlocked(state);
 			return removedWorkspace ? cloneWorkspace(removedWorkspace) : undefined;
+		});
+	}
+
+	async listWorkspaceStatuses(
+		options: { classifyWorkspaceAvailability?: IrohRemoteWorkspaceAvailabilityClassifier } = {},
+	): Promise<IrohRemoteWorkspaceStatus[]> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			return await getIrohRemoteWorkspaceStatuses(state, options.classifyWorkspaceAvailability);
 		});
 	}
 
@@ -262,26 +277,7 @@ export class IrohRemoteHostStateManager {
 		state: IrohRemoteHostState,
 		options: AuthorizeIrohRemoteClientOptions,
 	): Promise<IrohRemoteWorkspaceStatus[]> {
-		return await Promise.all(
-			state.workspaces.map(async (workspace) => ({
-				name: workspace.name,
-				status: await this.getWorkspaceStatus(workspace, options),
-			})),
-		);
-	}
-
-	private async getWorkspaceStatus(
-		workspace: IrohRemoteWorkspace,
-		options: AuthorizeIrohRemoteClientOptions,
-	): Promise<IrohRemoteWorkspaceStatus["status"]> {
-		if (options.classifyWorkspaceAvailability === undefined) {
-			return "available";
-		}
-		try {
-			return await options.classifyWorkspaceAvailability(workspace);
-		} catch {
-			return "unavailable";
-		}
+		return await getIrohRemoteWorkspaceStatuses(state, options.classifyWorkspaceAvailability);
 	}
 
 	private runExclusive<T>(operation: () => T | Promise<T>): Promise<T> {
