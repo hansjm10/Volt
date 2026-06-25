@@ -233,7 +233,7 @@ function printUsage() {
        volt remote approve-repair <node-id> [options]
 
 Serve options:
-  --workspace <name=path>    Workspace exposed to the client. Defaults to saved workspace or cwd.
+  --workspace <name=path>    Workspace exposed to the client. Defaults to cwd.
   --register-workspace       Register cwd, path, or name=path in host state and exit.
   --mobile                   Mobile-facing host mode. Skips startup pairing; relay already defaults to default.
   --relay <disabled|default> Iroh relay preset. Defaults to default; use disabled for LAN-only testing.

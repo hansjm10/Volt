@@ -186,6 +186,7 @@ Happy path:
 ```bash
 # Terminal 1: register one named workspace, then start the mobile-facing host.
 volt remote host --register-workspace volt=/path/to/repo --allow-tools read,grep,find,ls
+cd /path/to/repo
 volt remote host --mobile --yes
 
 # Terminal 2: ask the running host for a short-lived one-time pairing ticket.
@@ -227,6 +228,7 @@ Security and support boundary:
 - The default remote tool grant enables the built-in tools `read,bash,edit,write,grep,find,ls` plus active tools registered by loaded extensions. Custom `--allow-tools` grants that differ from the default built-in list are strict; name extension tools explicitly when using one.
 - Granting `bash`, `edit`, or `write` can modify host files or run shell commands. Extension tools run code installed on the host and may do the same. TTY host startup asks for confirmation and offers `trust` to continue while trusting project-local workspace resources; noninteractive unsafe grants, including the default grant, require `--yes`.
 - `--register-workspace` is a local desktop action. It stores a workspace name and realpath in the selected host state file, without starting a remote API for clients to create, rename, delete, or path-map workspaces. In a TTY, registration also offers `trust` when the workspace has project-local Volt resources; `--register-workspace --approve` saves workspace trust noninteractively.
+- Bare `volt remote host` exposes the current working directory. If that directory is already registered, the saved workspace name and tool defaults are reused; otherwise the host registers it by basename.
 - If a host state file has multiple registered workspaces, `volt remote pair --workspace <name>` chooses the initial workspace for the ticket. It does not restrict that paired phone to only that workspace.
 - Pairing tickets are short-lived and one-time. Bare preview `volt remote host` shows a startup ticket as a terminal QR code by default when stderr is a TTY. `volt remote host --mobile` starts without an active startup pairing invite; use `volt remote pair` to create the QR/ticket when pairing a phone. The QR is for first setup or explicit Pair Again, not ordinary reconnect. `volt remote pair` is mediated by a running host control channel; offline pairing from persisted state is not supported.
 - Saved-host reconnects omit the pairing secret and verify the host node ID. App restart, foreground reconnect after network loss, and host restart with the same `~/.volt/agent/remote/iroh-host.json` state path should use the saved-host path instead of asking for another QR.

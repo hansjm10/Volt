@@ -60,12 +60,13 @@ export function selectIrohRemoteWorkspace(
 	if (workspaceSpec) {
 		return upsertIrohRemoteWorkspace(state, parseIrohRemoteWorkspaceSpec(workspaceSpec, cwd), allowTools);
 	}
-	if (state.workspaces.length > 0) {
-		const workspace = state.workspaces[0];
+	const cwdWorkspace = parseIrohRemoteWorkspaceSpec(undefined, cwd);
+	const workspace = state.workspaces.find((entry) => entry.path === cwdWorkspace.path);
+	if (workspace) {
 		if (allowTools !== undefined) {
 			workspace.allowedTools = allowTools;
 		}
 		return workspace;
 	}
-	return upsertIrohRemoteWorkspace(state, parseIrohRemoteWorkspaceSpec(undefined, cwd), allowTools);
+	return upsertIrohRemoteWorkspace(state, cwdWorkspace, allowTools);
 }

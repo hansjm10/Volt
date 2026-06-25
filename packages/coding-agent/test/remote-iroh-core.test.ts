@@ -1038,16 +1038,16 @@ describe("Iroh remote core helpers", () => {
 		}
 	});
 
-	test("preserves saved workspace tool defaults unless a host allowlist is explicit", () => {
+	test("defaults to cwd while preserving matching saved workspace tool defaults unless a host allowlist is explicit", () => {
 		const state = createEmptyIrohRemoteHostState();
 		state.workspaces.push({ name: "app", path: "/app", allowedTools: "read" });
 
 		expect(selectIrohRemoteWorkspace(state, undefined, undefined, "/cwd")).toEqual({
-			name: "app",
-			path: "/app",
-			allowedTools: "read",
+			name: "cwd",
+			path: "/cwd",
 		});
 		expect(state.workspaces[0].allowedTools).toBe("read");
+		expect(state.workspaces).toHaveLength(2);
 
 		expect(selectIrohRemoteWorkspace(state, "app=/new-app", undefined, "/cwd")).toEqual({
 			name: "app",
@@ -1057,11 +1057,18 @@ describe("Iroh remote core helpers", () => {
 		expect(state.workspaces[0].allowedTools).toBe("read");
 
 		expect(selectIrohRemoteWorkspace(state, undefined, "read,grep", "/cwd")).toEqual({
-			name: "app",
-			path: "/new-app",
+			name: "cwd",
+			path: "/cwd",
 			allowedTools: "read,grep",
 		});
-		expect(state.workspaces[0].allowedTools).toBe("read,grep");
+		expect(state.workspaces[0].allowedTools).toBe("read");
+		expect(state.workspaces[1].allowedTools).toBe("read,grep");
+		expect(selectIrohRemoteWorkspace(state, undefined, "read,ls", "/new-app")).toEqual({
+			name: "app",
+			path: "/new-app",
+			allowedTools: "read,ls",
+		});
+		expect(state.workspaces[0].allowedTools).toBe("read,ls");
 	});
 
 	test("resolves remote workspace trust per workspace", () => {
