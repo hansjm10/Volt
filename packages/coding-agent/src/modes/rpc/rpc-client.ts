@@ -98,12 +98,18 @@ export class RpcClient extends RpcClientBase {
 			this.handleLine(line);
 		});
 
-		await new Promise((resolve) => setTimeout(resolve, 100));
-
-		if (this.process && this.process.exitCode !== null) {
-			const error = this.createProcessExitError(this.process.exitCode, this.process.signalCode);
-			this.handleProcessFailure(error);
-			throw error;
+		try {
+			await this.getState();
+		} catch (error: unknown) {
+			const readinessError = this.createReadinessError(toError(error));
+			try {
+				await this.cleanupFailedStart(childProcess);
+			} catch (cleanupError: unknown) {
+				throw new Error(
+					`${readinessError.message}; additionally failed to clean up child process: ${toError(cleanupError).message}`,
+				);
+			}
+			throw readinessError;
 		}
 	}
 
@@ -117,19 +123,7 @@ export class RpcClient extends RpcClientBase {
 		this.stopReadingStdout?.();
 		this.stopReadingStdout = null;
 		this.rejectPendingRequests(new Error("RPC client stopped"));
-		childProcess.kill("SIGTERM");
-
-		await new Promise<void>((resolve) => {
-			const timeout = setTimeout(() => {
-				childProcess.kill("SIGKILL");
-				resolve();
-			}, 1000);
-
-			childProcess.on("exit", () => {
-				clearTimeout(timeout);
-				resolve();
-			});
-		});
+		await this.terminateChildProcess(childProcess);
 
 		if (this.process === childProcess) {
 			this.process = null;
@@ -148,7 +142,7 @@ export class RpcClient extends RpcClientBase {
 			throw new Error("Client not started");
 		}
 		super.assertCanSend();
-		if (childProcess.exitCode !== null) {
+		if (this.hasProcessExited(childProcess)) {
 			const error = this.createProcessExitError(childProcess.exitCode, childProcess.signalCode);
 			this.handleProcessFailure(error);
 			throw error;
@@ -176,8 +170,69 @@ export class RpcClient extends RpcClientBase {
 		return new Error(`Agent process exited (code=${code} signal=${signal}). ${this.getErrorContext()}`);
 	}
 
+	private createReadinessError(error: Error): Error {
+		const context = this.getErrorContext();
+		const contextSuffix = context && !error.message.includes(context) ? `. ${context}` : "";
+		return new Error(`RPC readiness probe failed: ${error.message}${contextSuffix}`);
+	}
+
+	private async cleanupFailedStart(childProcess: ChildProcess): Promise<void> {
+		if (this.process !== childProcess) {
+			return;
+		}
+
+		this.stopReadingStdout?.();
+		this.stopReadingStdout = null;
+		this.rejectPendingRequests(new Error("RPC client startup failed"));
+		this.process = null;
+		await this.terminateChildProcess(childProcess);
+	}
+
+	private async terminateChildProcess(childProcess: ChildProcess): Promise<void> {
+		if (childProcess.pid === undefined || this.hasProcessExited(childProcess)) {
+			return;
+		}
+
+		await new Promise<void>((resolve) => {
+			let settled = false;
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			const finish = (): void => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				if (timeout) {
+					clearTimeout(timeout);
+				}
+				childProcess.off("exit", finish);
+				resolve();
+			};
+			timeout = setTimeout(() => {
+				if (!this.hasProcessExited(childProcess)) {
+					childProcess.kill("SIGKILL");
+				}
+				finish();
+			}, 1000);
+			childProcess.once("exit", finish);
+
+			if (this.hasProcessExited(childProcess)) {
+				finish();
+				return;
+			}
+			childProcess.kill("SIGTERM");
+		});
+	}
+
+	private hasProcessExited(childProcess: ChildProcess): boolean {
+		return childProcess.exitCode !== null || childProcess.signalCode !== null;
+	}
+
 	private handleProcessFailure(error: Error): void {
 		this.setFailureError(error);
 		this.rejectPendingRequests(error);
 	}
+}
+
+function toError(value: unknown): Error {
+	return value instanceof Error ? value : new Error(String(value));
 }
