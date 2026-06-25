@@ -396,6 +396,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	let unsubscribeBackpressure: (() => void) | undefined;
 
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
+		if (shuttingDown || hasPendingWriteError) {
+			return;
+		}
 		try {
 			trackTransportWrite(transport.write(obj));
 		} catch (writeError: unknown) {
@@ -1351,53 +1354,41 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		await shutdown();
 	}
 
-	const handleInputLine = async (line: string) => {
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(line);
-		} catch (parseError: unknown) {
-			output(
-				error(
-					undefined,
-					"parse",
-					`Failed to parse command: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
-				),
-			);
-			await waitForTransportBackpressure();
+	let commandQueue: Promise<void> = Promise.resolve();
+
+	const handleControlMessage = (parsed: unknown): boolean => {
+		// Handle extension UI and host action responses during startup as well as normal operation.
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) || !("type" in parsed)) {
+			return false;
+		}
+		if (parsed.type === "extension_ui_response") {
+			const response = parsed as RpcExtensionUIResponse;
+			const pending = pendingExtensionRequests.get(response.id);
+			if (pending) {
+				pendingExtensionRequests.delete(response.id);
+				pending.resolve(response);
+			}
+			return true;
+		}
+		if (parsed.type === "host_action_response") {
+			const response = parsed as RpcHostActionResponse;
+			const decision = parseHostActionResponseDecision(response.decision);
+			if (decision) {
+				hostActionBridge.resolveResponse({ ...response, decision });
+			}
+			return true;
+		}
+		return false;
+	};
+
+	const handleQueuedParsedInput = async (parsed: unknown): Promise<void> => {
+		if (shuttingDown) {
 			return;
 		}
-
-		// Handle extension UI and host action responses during startup as well as normal operation.
-		if (typeof parsed === "object" && parsed !== null && "type" in parsed) {
-			if (parsed.type === "extension_ui_response") {
-				const response = parsed as RpcExtensionUIResponse;
-				const pending = pendingExtensionRequests.get(response.id);
-				if (pending) {
-					pendingExtensionRequests.delete(response.id);
-					pending.resolve(response);
-				}
-				return;
-			}
-			if (parsed.type === "host_action_response") {
-				const response = parsed as RpcHostActionResponse;
-				const decision = parseHostActionResponseDecision(response.decision);
-				if (!decision) {
-					return;
-				}
-				hostActionBridge.resolveResponse({ ...response, decision });
-				return;
-			}
-		}
-
 		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
 			const target = getErrorResponseTarget(parsed);
 			output(error(target.id, target.command, `Unknown command: ${target.command}`));
 			await waitForTransportBackpressure();
-			return;
-		}
-
-		if (!startupComplete) {
-			queuedStartupCommandLines.push(line);
 			return;
 		}
 
@@ -1412,17 +1403,56 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			await checkShutdownRequested();
 			return;
 		}
-		if (response) {
+		if (response && !shuttingDown) {
 			output(response);
 			await waitForTransportBackpressure();
 		}
 		await checkShutdownRequested();
 	};
 
+	const enqueueInputTask = (task: () => Promise<void>): void => {
+		const runTask = async (): Promise<void> => {
+			try {
+				await task();
+			} catch (inputError: unknown) {
+				await shutdown(1, undefined, { error: toError(inputError) }).catch(() => {});
+			}
+		};
+		commandQueue = commandQueue.then(runTask, runTask);
+		void commandQueue.catch(() => {});
+	};
+
 	const processInputLine = (line: string): void => {
-		void handleInputLine(line).catch((inputError: unknown) => {
-			void shutdown(1, undefined, { error: toError(inputError) }).catch(() => {});
-		});
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch (parseError: unknown) {
+			enqueueInputTask(async () => {
+				if (shuttingDown) {
+					return;
+				}
+				output(
+					error(
+						undefined,
+						"parse",
+						`Failed to parse command: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
+					),
+				);
+				await waitForTransportBackpressure();
+			});
+			return;
+		}
+
+		if (handleControlMessage(parsed)) {
+			return;
+		}
+
+		if (!startupComplete) {
+			queuedStartupCommandLines.push(line);
+			return;
+		}
+
+		enqueueInputTask(() => handleQueuedParsedInput(parsed));
 	};
 
 	detachInput = transport.onLine(processInputLine);

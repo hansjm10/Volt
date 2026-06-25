@@ -27,6 +27,77 @@ function createRuntimeHost(): { runtimeHost: AgentSessionRuntime; dispose: Retur
 	return { runtimeHost, dispose };
 }
 
+interface RpcModeHarness {
+	close(): void;
+	modePromise: Promise<void>;
+	send(message: object): void;
+	writes: object[];
+}
+
+function createStateSession(sessionId: string) {
+	return {
+		agent: {
+			subscribe: vi.fn(() => () => {}),
+		},
+		autoCompactionEnabled: true,
+		bindExtensions: vi.fn(async () => {}),
+		followUpMode: "one-at-a-time" as const,
+		isCompacting: false,
+		isStreaming: false,
+		messages: [],
+		model: undefined,
+		pendingMessageCount: 0,
+		sessionFile: `/sessions/${sessionId}.jsonl`,
+		sessionId,
+		steeringMode: "one-at-a-time" as const,
+		subscribe: vi.fn(() => () => {}),
+		thinkingLevel: "off" as const,
+	};
+}
+
+async function startRpcModeHarness(runtimeHost: AgentSessionRuntime): Promise<RpcModeHarness> {
+	let lineHandler: ((line: string) => void) | undefined;
+	let closeHandler: RpcCloseHandler | undefined;
+	const writes: object[] = [];
+	const transport: RpcTransport = {
+		write: vi.fn((value) => {
+			writes.push(value);
+		}),
+		onLine: vi.fn((handler) => {
+			lineHandler = handler;
+			return vi.fn();
+		}),
+		onClose: vi.fn((handler) => {
+			closeHandler = handler;
+			return vi.fn();
+		}),
+		waitForBackpressure: vi.fn(async () => {}),
+		flush: vi.fn(async () => {}),
+		close: vi.fn(async () => {}),
+	};
+	let resolveReady: () => void = () => {};
+	const ready = new Promise<void>((resolve) => {
+		resolveReady = resolve;
+	});
+	const modePromise = runRpcMode(runtimeHost, { onReady: resolveReady, transport });
+	await ready;
+	await vi.waitFor(() => expect(lineHandler).toBeDefined());
+
+	return {
+		close() {
+			closeHandler?.();
+		},
+		modePromise,
+		send(message: object) {
+			if (!lineHandler) {
+				throw new Error("RPC line handler was not registered");
+			}
+			lineHandler(JSON.stringify(message));
+		},
+		writes,
+	};
+}
+
 afterEach(() => {
 	restoreStdout();
 });
@@ -142,6 +213,106 @@ describe("RPC mode caller-provided transports", () => {
 
 		closeHandler?.();
 		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("serializes regular commands so state reads wait for pending session switches", async () => {
+		let resolveSwitch: ((result: { cancelled: boolean }) => void) | undefined;
+		let switchResolved = false;
+		let currentSession = createStateSession("initial-session");
+		const finishSwitch = () => {
+			if (switchResolved || !resolveSwitch) {
+				return;
+			}
+			switchResolved = true;
+			currentSession = createStateSession("selected-session");
+			resolveSwitch({ cancelled: false });
+		};
+		const runtimeHost = {
+			get session() {
+				return currentSession;
+			},
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			switchSessionById: vi.fn(
+				() =>
+					new Promise<{ cancelled: boolean }>((resolve) => {
+						resolveSwitch = resolve;
+					}),
+			),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const rpc = await startRpcModeHarness(runtimeHost);
+
+		try {
+			rpc.send({ id: "switch-1", type: "switch_session_by_id", sessionId: "selected-session" });
+			await vi.waitFor(() => expect(runtimeHost.switchSessionById).toHaveBeenCalledOnce());
+			rpc.send({ id: "state-1", type: "get_state" });
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(rpc.writes).not.toContainEqual(expect.objectContaining({ id: "state-1" }));
+
+			finishSwitch();
+			await vi.waitFor(() =>
+				expect(rpc.writes).toContainEqual(
+					expect.objectContaining({
+						id: "state-1",
+						data: expect.objectContaining({ sessionId: "selected-session" }),
+					}),
+				),
+			);
+		} finally {
+			finishSwitch();
+			rpc.close();
+			await rpc.modePromise.catch(() => {});
+		}
+	});
+
+	test("does not write delayed command responses after transport close", async () => {
+		let resolveNewSession: ((result: { cancelled: boolean }) => void) | undefined;
+		let newSessionResolved = false;
+		let currentSession = createStateSession("initial-session");
+		const finishNewSession = () => {
+			if (newSessionResolved || !resolveNewSession) {
+				return;
+			}
+			newSessionResolved = true;
+			currentSession = createStateSession("next-session");
+			resolveNewSession({ cancelled: false });
+		};
+		const runtimeHost = {
+			get session() {
+				return currentSession;
+			},
+			newSession: vi.fn(
+				() =>
+					new Promise<{ cancelled: boolean }>((resolve) => {
+						resolveNewSession = resolve;
+					}),
+			),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const rpc = await startRpcModeHarness(runtimeHost);
+
+		try {
+			rpc.send({ id: "new-1", type: "new_session" });
+			await vi.waitFor(() => expect(runtimeHost.newSession).toHaveBeenCalledOnce());
+
+			rpc.close();
+			await expect(rpc.modePromise).resolves.toBeUndefined();
+
+			finishNewSession();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+
+			expect(rpc.writes).not.toContainEqual(expect.objectContaining({ id: "new-1" }));
+		} finally {
+			finishNewSession();
+			rpc.close();
+			await rpc.modePromise.catch(() => {});
+		}
 	});
 
 	test("bridges host-initiated action requests over RPC", async () => {

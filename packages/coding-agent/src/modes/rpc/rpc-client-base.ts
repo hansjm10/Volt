@@ -13,8 +13,10 @@ import type {
 	RpcHostActionResponse,
 	RpcHostActionUpdate,
 	RpcResponse,
+	RpcSessionListItem,
 	RpcSessionState,
 	RpcSlashCommand,
+	RpcTranscriptResponse,
 	RpcWorkflowEvent,
 	RpcWorkflowToolEvent,
 	UiActionCapabilities,
@@ -131,6 +133,16 @@ export abstract class RpcClientBase {
 	/** Get current session state. */
 	async getState(): Promise<RpcSessionState> {
 		const response = await this.send({ type: "get_state" });
+		return this.getData(response);
+	}
+
+	/** Get a UI-ready projected transcript for the active session. */
+	async getTranscript(options: { limit?: number; beforeEntryId?: string } = {}): Promise<RpcTranscriptResponse> {
+		const response = await this.send({
+			type: "get_transcript",
+			limit: options.limit,
+			beforeEntryId: options.beforeEntryId,
+		});
 		return this.getData(response);
 	}
 
@@ -251,6 +263,12 @@ export abstract class RpcClientBase {
 		return this.getData(response);
 	}
 
+	/** List persisted sessions for the current workspace. */
+	async listSessions(): Promise<RpcSessionListItem[]> {
+		const response = await this.send({ type: "list_sessions" });
+		return this.getData<{ sessions: RpcSessionListItem[] }>(response).sessions;
+	}
+
 	/** Export session to HTML. */
 	async exportHtml(outputPath?: string): Promise<{ path: string }> {
 		const response = await this.send({ type: "export_html", outputPath });
@@ -260,6 +278,12 @@ export abstract class RpcClientBase {
 	/** Switch to a different session file. */
 	async switchSession(sessionPath: string): Promise<{ cancelled: boolean }> {
 		const response = await this.send({ type: "switch_session", sessionPath });
+		return this.getData(response);
+	}
+
+	/** Switch to a workspace session by stable session id. */
+	async switchSessionById(sessionId: string): Promise<{ cancelled: boolean }> {
+		const response = await this.send({ type: "switch_session_by_id", sessionId });
 		return this.getData(response);
 	}
 

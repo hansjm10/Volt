@@ -81,6 +81,79 @@ describe("RpcTransportClient", () => {
 		await client.stop();
 	});
 
+	test("exposes typed wrappers for documented session RPC commands", async () => {
+		const pair = createLoopbackRpcTransportPair();
+		const client = new RpcTransportClient({ transport: pair.client });
+		const commands: Array<Record<string, unknown>> = [];
+		const session = {
+			current: true,
+			createdAt: "2026-01-01T00:00:00.000Z",
+			firstMessage: "hello",
+			messageCount: 2,
+			modifiedAt: "2026-01-01T00:01:00.000Z",
+			sessionId: "session-1",
+			sessionName: "Initial",
+		};
+		const transcript = {
+			sessionId: "session-1",
+			items: [{ id: "entry-1", role: "user", text: "hello", timestamp: "2026-01-01T00:00:00.000Z" }],
+			hasMore: false,
+			nextBeforeEntryId: null,
+		};
+		pair.server.onLine((line) => {
+			const parsed = JSON.parse(line) as Record<string, unknown>;
+			if (typeof parsed.id !== "string" || typeof parsed.type !== "string") {
+				throw new Error("command must include id and type");
+			}
+			commands.push(parsed);
+			switch (parsed.type) {
+				case "list_sessions":
+					pair.server.write({
+						id: parsed.id,
+						type: "response",
+						command: parsed.type,
+						success: true,
+						data: { sessions: [session] },
+					});
+					break;
+				case "switch_session_by_id":
+					pair.server.write({
+						id: parsed.id,
+						type: "response",
+						command: parsed.type,
+						success: true,
+						data: { cancelled: false },
+					});
+					break;
+				case "get_transcript":
+					pair.server.write({
+						id: parsed.id,
+						type: "response",
+						command: parsed.type,
+						success: true,
+						data: transcript,
+					});
+					break;
+				default:
+					throw new Error(`unexpected command: ${parsed.type}`);
+			}
+		});
+
+		await client.start();
+		try {
+			await expect(client.listSessions()).resolves.toEqual([session]);
+			await expect(client.switchSessionById("session-2")).resolves.toEqual({ cancelled: false });
+			await expect(client.getTranscript({ limit: 10, beforeEntryId: "entry-2" })).resolves.toEqual(transcript);
+			expect(commands).toEqual([
+				expect.objectContaining({ type: "list_sessions" }),
+				expect.objectContaining({ type: "switch_session_by_id", sessionId: "session-2" }),
+				expect.objectContaining({ type: "get_transcript", limit: 10, beforeEntryId: "entry-2" }),
+			]);
+		} finally {
+			await client.stop();
+		}
+	});
+
 	test("rejects unsuccessful responses for void commands", async () => {
 		const pair = createLoopbackRpcTransportPair();
 		const client = new RpcTransportClient({ transport: pair.client });
