@@ -11,6 +11,7 @@ import { createInterface } from "node:readline/promises";
 import lockfile from "proper-lockfile";
 import {
 	createIrohRemoteHandshakeFailure,
+	createIrohRemoteHostMetadata,
 	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 	DEFAULT_IROH_REMOTE_HANDSHAKE_MAX_LINE_BYTES,
 	DEFAULT_IROH_REMOTE_HANDSHAKE_TIMEOUT_MS,
@@ -22,6 +23,7 @@ import {
 	getIrohRemoteRpcFilterResult,
 	getIrohRemoteUnsafeAllowedTools,
 	getIrohRemoteVoltRpcToolArgs,
+	getIrohRemoteWorkspaceAvailabilityStatus,
 	hasTrustRequiringProjectResources,
 	IROH_REMOTE_PAIR_CONTROL_REQUEST_TYPE,
 	IROH_REMOTE_PAIR_CONTROL_RESPONSE_TYPE,
@@ -112,6 +114,7 @@ const VALUE_FLAGS = new Set([
 	"relay",
 	"source-volt",
 	"state",
+	"unregister-workspace",
 	"volt-bin",
 	"workspace",
 ]);
@@ -228,6 +231,7 @@ function ensureIrohAvailable() {
 function printUsage() {
 	console.error(`Usage: volt remote host [serve] [options]
        volt remote host --register-workspace [path|name=path] [options]
+       volt remote host --unregister-workspace <name> [options]
        volt remote clients [options]
        volt remote revoke <node-id> [options]
        volt remote approve-repair <node-id> [options]
@@ -235,6 +239,8 @@ function printUsage() {
 Serve options:
   --workspace <name=path>    Workspace exposed to the client. Defaults to cwd.
   --register-workspace       Register cwd, path, or name=path in host state and exit.
+  --unregister-workspace <name>
+                              Remove a registered workspace from host state without deleting files.
   --mobile                   Mobile-facing host mode. Skips startup pairing; relay already defaults to default.
   --relay <disabled|default> Iroh relay preset. Defaults to default; use disabled for LAN-only testing.
   --state <path>             Host state path. Defaults to ~/.volt/agent/remote/iroh-host.json.
@@ -461,12 +467,7 @@ async function assertWorkspaceDirectory(workspace) {
 }
 
 async function isWorkspaceDirectoryAvailable(workspace) {
-	try {
-		const workspaceStat = await stat(workspace.path);
-		return workspaceStat.isDirectory();
-	} catch {
-		return false;
-	}
+	return (await getIrohRemoteWorkspaceAvailabilityStatus(workspace)) === "available";
 }
 
 function getRegisterWorkspacePositionals(positionals) {
@@ -514,6 +515,23 @@ async function registerWorkspace(flags, positionals) {
 	const stateManager = new IrohRemoteHostStateManager({ statePath });
 	const savedWorkspace = await stateManager.upsertWorkspace(workspace, getFlag(flags, "allow-tools"));
 	console.error(`registered workspace: ${savedWorkspace.name} -> ${savedWorkspace.path}`);
+}
+
+async function unregisterWorkspace(flags, positionals) {
+	if (positionals.length > 0) {
+		throw new Error(`Unexpected workspace unregister argument: ${positionals[0]}`);
+	}
+	const workspaceName = getFlag(flags, "unregister-workspace");
+	if (!workspaceName || workspaceName.trim().length === 0) {
+		throw new Error("--unregister-workspace requires a value");
+	}
+	const statePath = resolve(getFlag(flags, "state", DEFAULT_STATE_PATH));
+	const stateManager = new IrohRemoteHostStateManager({ statePath });
+	const removedWorkspace = await stateManager.unregisterWorkspace(workspaceName);
+	if (!removedWorkspace) {
+		throw new Error(`No registered Iroh remote workspace named ${workspaceName}`);
+	}
+	console.error(`unregistered workspace: ${workspaceName}`);
 }
 
 function getPlatformVoltBin(voltBin) {
@@ -825,15 +843,14 @@ function getCurrentUserName() {
 }
 
 function createRemoteHostMetadata(authorization, options) {
-	return {
-		workspace: authorization.workspace.name,
-		workspaceNames: authorization.workspaceNames,
+	return createIrohRemoteHostMetadata({
+		authorization,
 		hostNodeId: options.hostNodeId,
 		relayMode: options.relayMode,
 		hostName: hostname(),
 		userName: getCurrentUserName(),
 		cwd: "/workspace",
-	};
+	});
 }
 
 function decorateRemoteHostState(value, authorization, options) {
@@ -2118,6 +2135,7 @@ async function serve(flags) {
 	const hostEngine = new IrohRemoteHostEngine({
 		allowTools,
 		auditLogger,
+		classifyWorkspaceAvailability: getIrohRemoteWorkspaceAvailabilityStatus,
 		hostNodeId: options.hostNodeId,
 		stateManager,
 		validateWorkspace: isWorkspaceDirectoryAvailable,
@@ -2288,6 +2306,11 @@ async function main() {
 
 	if (hasFlag(flags, "register-workspace")) {
 		await registerWorkspace(flags, positionals);
+		return;
+	}
+
+	if (flags.has("unregister-workspace")) {
+		await unregisterWorkspace(flags, positionals);
 		return;
 	}
 

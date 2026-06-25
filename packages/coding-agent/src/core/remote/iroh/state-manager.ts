@@ -19,7 +19,7 @@ import {
 	readIrohRemoteHostState,
 	writeIrohRemoteHostState,
 } from "./state.ts";
-import { findIrohRemoteWorkspace, upsertIrohRemoteWorkspace } from "./workspace.ts";
+import { findIrohRemoteWorkspace, type IrohRemoteWorkspaceStatus, upsertIrohRemoteWorkspace } from "./workspace.ts";
 
 export interface IrohRemoteHostStateManagerOptions {
 	initialState?: IrohRemoteHostState;
@@ -79,6 +79,19 @@ export class IrohRemoteHostStateManager {
 		});
 	}
 
+	async unregisterWorkspace(name: string): Promise<IrohRemoteWorkspace | undefined> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const index = state.workspaces.findIndex((workspace) => workspace.name === name);
+			if (index === -1) {
+				return undefined;
+			}
+			const [removedWorkspace] = state.workspaces.splice(index, 1);
+			await this.saveUnlocked(state);
+			return removedWorkspace ? cloneWorkspace(removedWorkspace) : undefined;
+		});
+	}
+
 	async addPendingPairingTicket(ticket: IrohRemotePendingPairingTicket): Promise<IrohRemotePendingPairingTicket> {
 		return this.runExclusive(async () => {
 			const state = await this.loadUnlocked();
@@ -98,13 +111,17 @@ export class IrohRemoteHostStateManager {
 	): Promise<IrohRemoteClientAuthorizationResult> {
 		return this.runExclusive(async () => {
 			const state = await this.loadUnlocked();
+			const workspaceStatuses = await this.getWorkspaceStatuses(state, options);
 			const workspace = findIrohRemoteWorkspace(state, hello.workspace);
+			const workspaceStatus = workspaceStatuses.find((entry) => entry.name === hello.workspace)?.status;
 			const workspaceAvailable =
 				workspace !== undefined &&
+				workspaceStatus === "available" &&
 				(options.validateWorkspace === undefined || (await options.validateWorkspace(workspace)));
 			const result = authorizeIrohRemoteClient(state, hello, remoteNodeId, {
 				...options,
 				workspace: workspaceAvailable ? workspace : undefined,
+				workspaceStatuses,
 			});
 			await this.saveUnlocked(state);
 			return cloneAuthorizationResult(result);
@@ -241,6 +258,32 @@ export class IrohRemoteHostStateManager {
 		});
 	}
 
+	private async getWorkspaceStatuses(
+		state: IrohRemoteHostState,
+		options: AuthorizeIrohRemoteClientOptions,
+	): Promise<IrohRemoteWorkspaceStatus[]> {
+		return await Promise.all(
+			state.workspaces.map(async (workspace) => ({
+				name: workspace.name,
+				status: await this.getWorkspaceStatus(workspace, options),
+			})),
+		);
+	}
+
+	private async getWorkspaceStatus(
+		workspace: IrohRemoteWorkspace,
+		options: AuthorizeIrohRemoteClientOptions,
+	): Promise<IrohRemoteWorkspaceStatus["status"]> {
+		if (options.classifyWorkspaceAvailability === undefined) {
+			return "available";
+		}
+		try {
+			return await options.classifyWorkspaceAvailability(workspace);
+		} catch {
+			return "unavailable";
+		}
+	}
+
 	private runExclusive<T>(operation: () => T | Promise<T>): Promise<T> {
 		const run = this.operationQueue.then(
 			() => this.withStateFileLock(operation),
@@ -339,6 +382,7 @@ function cloneAuthorizationResult(result: IrohRemoteClientAuthorizationResult): 
 			: {}),
 		workspace: cloneWorkspace(result.workspace),
 		workspaceNames: [...result.workspaceNames],
+		workspaces: result.workspaces.map((workspace) => ({ ...workspace })),
 	};
 }
 

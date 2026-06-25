@@ -37,7 +37,7 @@ import {
 	encodeIrohRemoteTicketPayload,
 	type IrohRemoteTicketPayload,
 } from "./ticket.ts";
-import { findIrohRemoteWorkspace } from "./workspace.ts";
+import { findIrohRemoteWorkspace, type IrohRemoteWorkspaceAvailabilityClassifier } from "./workspace.ts";
 
 export const DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS = 10 * 60 * 1000;
 
@@ -49,6 +49,7 @@ export interface IrohRemoteHostEngineOptions {
 	pairingExpiresAt?: number;
 	pairingSecret?: string;
 	stateManager: IrohRemoteHostStateManager;
+	classifyWorkspaceAvailability?: IrohRemoteWorkspaceAvailabilityClassifier;
 	validateWorkspace?: (workspace: IrohRemoteWorkspace) => boolean | Promise<boolean>;
 	workspace: IrohRemoteWorkspace;
 }
@@ -119,6 +120,7 @@ export interface IrohRemoteClientReadHandshakeResponseOptions extends IrohRemote
 
 export class IrohRemoteHostEngine {
 	private readonly auditLogger: IrohRemoteAuditLogger;
+	private readonly classifyWorkspaceAvailability: IrohRemoteWorkspaceAvailabilityClassifier | undefined;
 	private readonly hostNodeId: string | undefined;
 	private readonly now: () => number;
 	private readonly stateManager: IrohRemoteHostStateManager;
@@ -133,6 +135,7 @@ export class IrohRemoteHostEngine {
 	constructor(options: IrohRemoteHostEngineOptions) {
 		this.allowTools = options.allowTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS;
 		this.auditLogger = options.auditLogger ?? new IrohRemoteAuditLogger();
+		this.classifyWorkspaceAvailability = options.classifyWorkspaceAvailability;
 		this.hostNodeId = options.hostNodeId;
 		this.now = options.now ?? Date.now;
 		this.pairingExpiresAt = options.pairingExpiresAt;
@@ -269,6 +272,7 @@ export class IrohRemoteHostEngine {
 				: this.allowTools;
 		const result = await this.stateManager.authorizeClient(hello, remoteNodeId, {
 			allowTools,
+			classifyWorkspaceAvailability: this.classifyWorkspaceAvailability,
 			now: this.now(),
 			pairingExpiresAt: this.pairingExpiresAt,
 			pairingSecret: this.pairingSecret,

@@ -1309,6 +1309,11 @@ async function integratedVoltGetStateScenario() {
 				response.data?.remoteHost?.workspace === "integrated" &&
 					JSON.stringify(response.data?.remoteHost?.workspaceNames) ===
 						JSON.stringify(["integrated", "metadata-extra"]) &&
+					JSON.stringify(response.data?.remoteHost?.workspaces) ===
+						JSON.stringify([
+							{ name: "integrated", status: "available" },
+							{ name: "metadata-extra", status: "available" },
+						]) &&
 					response.data?.remoteHost?.hostNodeId &&
 					response.data?.remoteHost?.relayMode === "disabled" &&
 					response.data?.remoteHost?.hostName &&
@@ -2625,7 +2630,12 @@ async function multiWorkspaceReconnectScenario() {
 		const refreshedState = JSON.parse(refreshed.clientOutput.stdout);
 		assert(
 			refreshedState.remoteHost?.workspace === "alpha" &&
-				JSON.stringify(refreshedState.remoteHost?.workspaceNames) === JSON.stringify(["alpha", "beta"]),
+				JSON.stringify(refreshedState.remoteHost?.workspaceNames) === JSON.stringify(["alpha", "beta"]) &&
+				JSON.stringify(refreshedState.remoteHost?.workspaces) ===
+					JSON.stringify([
+						{ name: "alpha", status: "available" },
+						{ name: "beta", status: "available" },
+					]),
 			`Expected refreshed workspace names alpha,beta, got:\n${refreshed.clientOutput.stdout}`,
 		);
 

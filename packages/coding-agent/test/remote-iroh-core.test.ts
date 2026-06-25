@@ -21,6 +21,7 @@ import {
 	createIrohRemoteFilteredRpcTransport,
 	createIrohRemoteHandshakeFailure,
 	createIrohRemoteHandshakeSuccess,
+	createIrohRemoteHostMetadata,
 	createIrohRemoteOutboundFilteredRpcTransport,
 	createIrohRemoteSanitizedReconnectTicket,
 	createIrohRemoteSanitizedReconnectTicketPayload,
@@ -35,6 +36,7 @@ import {
 	getIrohRemoteControlPath,
 	getIrohRemoteRpcFilterResult,
 	getIrohRemoteUnsafeAllowedTools,
+	getIrohRemoteWorkspaceAvailabilityStatus,
 	hashIrohRemotePairingSecret,
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_HOST_HANDSHAKE_FAILURE_OUTCOMES,
@@ -1132,6 +1134,10 @@ describe("Iroh remote core helpers", () => {
 		expect(paired.paired).toBe(true);
 		expect(paired.pairingSecretConsumed).toBe(true);
 		expect(paired.workspaceNames).toEqual(["volt", "other-project"]);
+		expect(paired.workspaces).toEqual([
+			{ name: "volt", status: "available" },
+			{ name: "other-project", status: "available" },
+		]);
 		expect(paired.client).toMatchObject({
 			nodeId: "client-node",
 			label: "phone",
@@ -2208,14 +2214,141 @@ describe("Iroh remote core helpers", () => {
 			throw new Error(authorized.error);
 		}
 		expect(authorized.workspaceNames).toEqual(["volt", "other-project"]);
+		expect(authorized.workspaces).toEqual([
+			{ name: "volt", status: "available" },
+			{ name: "other-project", status: "available" },
+		]);
 		authorized.client.allowedWorkspaces.push("mutated");
 		authorized.workspace.path = "/mutated-workspace";
 		authorized.workspaceNames.push("mutated");
+		authorized.workspaces.push({ name: "mutated", status: "available" });
 
 		const state = await stateManager.getState();
 		expect(state.clients[0].allowedWorkspaces).toEqual([]);
 		expect(state.workspaces[0].path).toBe("/workspace");
 		expect(state.workspaces.map((entry) => entry.name)).toEqual(["volt", "other-project"]);
+	});
+
+	test("classifies workspace availability without deleting missing registrations", async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "volt-iroh-workspace-status-"));
+		try {
+			const availablePath = join(tempDir, "available");
+			const unavailablePath = join(tempDir, "not-a-directory");
+			const missingPath = join(tempDir, "missing");
+			await mkdir(availablePath, { recursive: true });
+			await writeFile(unavailablePath, "not a directory");
+
+			await expect(
+				getIrohRemoteWorkspaceAvailabilityStatus({ name: "available", path: availablePath }),
+			).resolves.toBe("available");
+			await expect(getIrohRemoteWorkspaceAvailabilityStatus({ name: "missing", path: missingPath })).resolves.toBe(
+				"missing",
+			);
+			await expect(
+				getIrohRemoteWorkspaceAvailabilityStatus({ name: "unavailable", path: unavailablePath }),
+			).resolves.toBe("unavailable");
+
+			const stateManager = new IrohRemoteHostStateManager({
+				initialState: {
+					hostSecretKey: undefined,
+					workspaces: [
+						{ name: "available", path: availablePath },
+						{ name: "missing", path: missingPath },
+						{ name: "unavailable", path: unavailablePath },
+					],
+					clients: [],
+				},
+			});
+			const authorized = await stateManager.authorizeClient(makeHello("available", "secret"), "client-node", {
+				allowTools: "read",
+				classifyWorkspaceAvailability: getIrohRemoteWorkspaceAvailabilityStatus,
+				pairingSecret: "secret",
+				now: 100,
+			});
+			if (!authorized.ok) {
+				throw new Error(authorized.error);
+			}
+
+			expect(authorized.workspaceNames).toEqual(["available"]);
+			expect(authorized.workspaces).toEqual([
+				{ name: "available", status: "available" },
+				{ name: "missing", status: "missing" },
+				{ name: "unavailable", status: "unavailable" },
+			]);
+			const metadata = createIrohRemoteHostMetadata({
+				authorization: authorized,
+				hostNodeId: "host-node",
+				relayMode: "default",
+				hostName: "mac",
+				userName: "jordan",
+			});
+			expect(metadata.workspaceNames).toEqual(["available"]);
+			expect(metadata.workspaces).toEqual(authorized.workspaces);
+			expect(JSON.stringify(metadata)).not.toContain(availablePath);
+			expect(JSON.stringify(metadata)).not.toContain(missingPath);
+			expect(JSON.stringify(metadata)).not.toContain(unavailablePath);
+
+			const rejected = await stateManager.authorizeClient(makeHello("missing", "secret"), "client-node", {
+				allowTools: "read",
+				classifyWorkspaceAvailability: getIrohRemoteWorkspaceAvailabilityStatus,
+				pairingSecret: "secret",
+				now: 125,
+			});
+			expect(rejected).toMatchObject({
+				ok: false,
+				outcome: "workspace_unavailable",
+			});
+			expect((await stateManager.getState()).workspaces.map((workspace) => workspace.name)).toEqual([
+				"available",
+				"missing",
+				"unavailable",
+			]);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	});
+
+	test("host state manager unregisters workspaces by exact name only", async () => {
+		const stateManager = new IrohRemoteHostStateManager({
+			initialState: {
+				hostSecretKey: undefined,
+				workspaces: [
+					{ name: "alpha", path: "/alpha", allowedTools: "read" },
+					{ name: "alphabet", path: "/alphabet", allowedTools: "read,grep" },
+				],
+				clients: [
+					{
+						nodeId: "client-node",
+						label: "phone",
+						allowedWorkspaces: ["alpha"],
+						allowedTools: "read",
+						pairedAt: 1,
+						lastSeenAt: 2,
+					},
+				],
+				revokedClients: [],
+				pendingPairingTickets: [
+					{
+						secretHash: "sha256:pending",
+						workspace: "alpha",
+						allowedTools: "read",
+						createdAt: 1,
+						expiresAt: 2,
+					},
+				],
+			},
+		});
+
+		await expect(stateManager.unregisterWorkspace("alp")).resolves.toBeUndefined();
+		await expect(stateManager.unregisterWorkspace("alpha")).resolves.toEqual({
+			name: "alpha",
+			path: "/alpha",
+			allowedTools: "read",
+		});
+		const state = await stateManager.getState();
+		expect(state.workspaces).toEqual([{ name: "alphabet", path: "/alphabet", allowedTools: "read,grep" }]);
+		expect(state.clients).toEqual([expect.objectContaining({ nodeId: "client-node" })]);
+		expect(state.pendingPairingTickets).toEqual([expect.objectContaining({ workspace: "alpha" })]);
 	});
 
 	test("host state manager rejects ambiguous initial state and file path options", () => {

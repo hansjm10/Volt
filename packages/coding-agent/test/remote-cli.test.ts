@@ -94,6 +94,7 @@ describe("remote CLI", () => {
 		expect(helpText).toContain("volt remote status [options]");
 		expect(helpText).toContain("volt remote approve-repair <node-id> [options]");
 		expect(helpText).toContain("--register-workspace");
+		expect(helpText).toContain("--unregister-workspace");
 		expect(helpText).toContain("bash, edit, or write can modify host state and require confirmation");
 		expect(helpText).toContain("--mobile");
 		expect(helpText).toContain("--yes");
@@ -270,6 +271,90 @@ describe("remote CLI", () => {
 		).resolves.toBeUndefined();
 		expect(process.exitCode).toBe(1);
 		expect((await readIrohRemoteHostState(statePath)).workspaces).toEqual([]);
+	});
+
+	it("unregisters a workspace without deleting files or other host state", async () => {
+		const statePath = join(tempDir, "host.json");
+		const alphaPath = join(projectDir, "alpha");
+		const betaPath = join(projectDir, "beta");
+		mkdirSync(alphaPath, { recursive: true });
+		mkdirSync(betaPath, { recursive: true });
+		await writeIrohRemoteHostState(statePath, {
+			hostSecretKey: undefined,
+			workspaces: [
+				{ name: "alpha", path: alphaPath, allowedTools: "read" },
+				{ name: "beta", path: betaPath, allowedTools: "read,grep" },
+			],
+			clients: [
+				{
+					nodeId: "client-node",
+					label: "phone",
+					allowedWorkspaces: ["alpha", "beta"],
+					allowedTools: "read",
+					pairedAt: 10,
+					lastSeenAt: 20,
+				},
+			],
+			revokedClients: [
+				{
+					nodeId: "revoked-node",
+					label: "old phone",
+					allowedWorkspaces: ["alpha"],
+					allowedTools: "read",
+					pairedAt: 1,
+					lastSeenAt: 2,
+					revokedAt: 3,
+				},
+			],
+			pendingPairingTickets: [
+				{
+					secretHash: "sha256:pending",
+					workspace: "alpha",
+					allowedTools: "read",
+					createdAt: 30,
+					expiresAt: 40,
+				},
+			],
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		await expect(
+			main(["remote", "host", "--state", statePath, "--unregister-workspace", "alpha"]),
+		).resolves.toBeUndefined();
+
+		const savedState = await readIrohRemoteHostState(statePath);
+		expect(savedState.workspaces).toEqual([{ name: "beta", path: betaPath, allowedTools: "read,grep" }]);
+		expect(savedState.clients).toEqual([
+			expect.objectContaining({ nodeId: "client-node", allowedWorkspaces: ["alpha", "beta"] }),
+		]);
+		expect(savedState.revokedClients).toEqual([expect.objectContaining({ nodeId: "revoked-node" })]);
+		expect(savedState.pendingPairingTickets).toEqual([expect.objectContaining({ workspace: "alpha" })]);
+		expect(() => realpathSync(alphaPath)).not.toThrow();
+		expect(errorSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain(
+			"Unregistered workspace alpha",
+		);
+		expect(process.exitCode).toBeUndefined();
+	});
+
+	it("rejects unknown workspace unregister without mutating state", async () => {
+		const statePath = join(tempDir, "host.json");
+		await writeIrohRemoteHostState(statePath, {
+			hostSecretKey: undefined,
+			workspaces: [{ name: "alpha", path: projectDir, allowedTools: "read" }],
+			clients: [],
+		});
+		const before = await readIrohRemoteHostState(statePath);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		await expect(
+			main(["remote", "host", "--state", statePath, "--unregister-workspace", "missing"]),
+		).resolves.toBeUndefined();
+
+		expect(await readIrohRemoteHostState(statePath)).toEqual(before);
+		expect(errorSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain(
+			"Error: No registered Iroh remote workspace named missing",
+		);
+		expect(process.exitCode).toBe(1);
 	});
 
 	it("creates a remote pairing ticket through a running host control channel", async () => {
@@ -487,6 +572,8 @@ describe("remote CLI", () => {
 	it("prints persisted Iroh remote status without secrets", async () => {
 		const statePath = join(tempDir, "host.json");
 		const auditPath = join(tempDir, "custom.audit.jsonl");
+		mkdirSync(join(projectDir, "alpha"), { recursive: true });
+		writeFileSync(join(projectDir, "zeta"), "not a directory");
 		await writeIrohRemoteHostState(statePath, {
 			hostSecretKey: [1, 2, 3],
 			pairingSecretTombstones: [
@@ -566,8 +653,8 @@ describe("remote CLI", () => {
 				warning: "Persisted state only; live Iroh remote host status is not available from this command yet.",
 			},
 			workspaces: [
-				{ name: "alpha", path: join(projectDir, "alpha"), allowedTools: "read,grep" },
-				{ name: "zeta", path: join(projectDir, "zeta"), allowedTools: "read" },
+				{ name: "alpha", path: join(projectDir, "alpha"), allowedTools: "read,grep", status: "available" },
+				{ name: "zeta", path: join(projectDir, "zeta"), allowedTools: "read", status: "unavailable" },
 			],
 			clientCount: 1,
 			clients: [

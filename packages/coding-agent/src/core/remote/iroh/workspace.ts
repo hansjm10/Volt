@@ -1,5 +1,17 @@
+import { stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import type { IrohRemoteHostState, IrohRemoteWorkspace } from "./state.ts";
+
+export type IrohRemoteWorkspaceAvailabilityStatus = "available" | "missing" | "unavailable";
+
+export interface IrohRemoteWorkspaceStatus {
+	name: string;
+	status: IrohRemoteWorkspaceAvailabilityStatus;
+}
+
+export type IrohRemoteWorkspaceAvailabilityClassifier = (
+	workspace: IrohRemoteWorkspace,
+) => IrohRemoteWorkspaceAvailabilityStatus | Promise<IrohRemoteWorkspaceAvailabilityStatus>;
 
 export function parseIrohRemoteWorkspaceSpec(value?: string, cwd = process.cwd()): IrohRemoteWorkspace {
 	if (!value) {
@@ -18,6 +30,17 @@ export function parseIrohRemoteWorkspaceSpec(value?: string, cwd = process.cwd()
 		throw new Error("Workspace name cannot be empty");
 	}
 	return { name, path };
+}
+
+export async function getIrohRemoteWorkspaceAvailabilityStatus(
+	workspace: IrohRemoteWorkspace,
+): Promise<IrohRemoteWorkspaceAvailabilityStatus> {
+	try {
+		const workspaceStat = await stat(workspace.path);
+		return workspaceStat.isDirectory() ? "available" : "unavailable";
+	} catch (error) {
+		return error instanceof Error && "code" in error && error.code === "ENOENT" ? "missing" : "unavailable";
+	}
 }
 
 export function upsertIrohRemoteWorkspace(

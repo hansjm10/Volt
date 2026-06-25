@@ -9,15 +9,18 @@ import type {
 	IrohRemoteRevokedClient,
 	IrohRemoteWorkspace,
 } from "./state.ts";
+import type { IrohRemoteWorkspaceAvailabilityClassifier, IrohRemoteWorkspaceStatus } from "./workspace.ts";
 
 export const DEFAULT_IROH_REMOTE_PAIRING_SECRET_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface AuthorizeIrohRemoteClientOptions {
 	allowTools: string;
+	classifyWorkspaceAvailability?: IrohRemoteWorkspaceAvailabilityClassifier;
 	pairingExpiresAt?: number;
 	pairingSecret?: string;
 	validateWorkspace?: (workspace: IrohRemoteWorkspace) => boolean | Promise<boolean>;
 	workspace?: IrohRemoteWorkspace;
+	workspaceStatuses?: readonly IrohRemoteWorkspaceStatus[];
 	now?: number;
 }
 
@@ -31,6 +34,7 @@ export interface IrohRemoteClientAuthorizationSuccess {
 	pairingSecretConsumed: boolean;
 	workspace: IrohRemoteWorkspace;
 	workspaceNames: string[];
+	workspaces: IrohRemoteWorkspaceStatus[];
 }
 
 export interface IrohRemoteClientAuthorizationFailure {
@@ -53,7 +57,8 @@ export function authorizeIrohRemoteClient(
 ): IrohRemoteClientAuthorizationResult {
 	const workspace = options.workspace;
 	const workspaceName = workspace?.name ?? hello.workspace;
-	const workspaceNames = state.workspaces.map((entry) => entry.name);
+	const workspaces = getIrohRemoteWorkspaceStatuses(state, options.workspaceStatuses);
+	const workspaceNames = workspaces.filter((entry) => entry.status === "available").map((entry) => entry.name);
 	const now = options.now ?? Date.now();
 	const revokedClient = findIrohRemoteRevokedClient(state, remoteNodeId);
 	const existingClient = revokedClient ? undefined : findIrohRemoteClient(state, remoteNodeId);
@@ -221,6 +226,7 @@ export function authorizeIrohRemoteClient(
 			pairingSecretConsumed: true,
 			workspace,
 			workspaceNames,
+			workspaces,
 		};
 	}
 
@@ -240,7 +246,18 @@ export function authorizeIrohRemoteClient(
 		pairingSecretConsumed: false,
 		workspace,
 		workspaceNames,
+		workspaces,
 	};
+}
+
+function getIrohRemoteWorkspaceStatuses(
+	state: IrohRemoteHostState,
+	workspaceStatuses: readonly IrohRemoteWorkspaceStatus[] | undefined,
+): IrohRemoteWorkspaceStatus[] {
+	return state.workspaces.map((workspace) => ({
+		name: workspace.name,
+		status: workspaceStatuses?.find((entry) => entry.name === workspace.name)?.status ?? "available",
+	}));
 }
 
 export function findIrohRemoteClient(state: IrohRemoteHostState, nodeId: string): IrohRemoteClient | undefined {

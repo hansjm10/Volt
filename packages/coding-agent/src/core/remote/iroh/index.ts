@@ -87,6 +87,11 @@ export {
 	shouldReplaceIrohRemoteIntegratedRuntimeForAuthorization,
 } from "./host-policy.ts";
 export {
+	type CreateIrohRemoteHostMetadataOptions,
+	createIrohRemoteHostMetadata,
+	type IrohRemoteHostMetadata,
+} from "./metadata.ts";
+export {
 	createIrohRemoteOutboundFilteredRpcTransport,
 	IROH_REMOTE_REDACTED_BASH_OUTPUT_PATH,
 	IROH_REMOTE_REDACTED_EXPORT_PATH,
@@ -210,6 +215,10 @@ export {
 	parseIrohRemoteTicketPayload,
 } from "./ticket.ts";
 export {
+	getIrohRemoteWorkspaceAvailabilityStatus,
+	type IrohRemoteWorkspaceAvailabilityClassifier,
+	type IrohRemoteWorkspaceAvailabilityStatus,
+	type IrohRemoteWorkspaceStatus,
 	parseIrohRemoteWorkspaceSpec,
 	selectIrohRemoteWorkspace,
 	upsertIrohRemoteWorkspace,
