@@ -656,6 +656,17 @@ async function startFakeOpenAICompletionsServer(responseText) {
 	};
 }
 
+async function waitForFakeOpenAIRequestCount(fakeOpenAI, expectedCount, label, timeoutMs = PROCESS_TIMEOUT_MS) {
+	const startedAt = Date.now();
+	while (Date.now() - startedAt < timeoutMs) {
+		if (fakeOpenAI.requestCount >= expectedCount) {
+			return;
+		}
+		await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+	}
+	throw new Error(`${label} expected ${expectedCount} fake OpenAI request(s), got ${fakeOpenAI.requestCount}`);
+}
+
 async function createFakeSourceVolt(stateDir) {
 	const sourceDir = join(stateDir, "fake-source-volt");
 	const scriptsDir = join(sourceDir, "scripts");
@@ -1784,6 +1795,256 @@ async function integratedVoltActiveDetachReconnectTranscriptScenario() {
 			closeRawConnection(differentClient?.connection);
 			await endpoint.close();
 			await differentEndpoint.close();
+			await stopProcess(host.child);
+			await fakeOpenAI.close();
+		}
+	});
+}
+
+async function integratedVoltMultiWorkspaceRuntimeIsolationScenario() {
+	await withStateDir("integrated-multi-workspace-runtime", async ({ hostStatePath, stateDir }) => {
+		const responseText = "multi workspace completion";
+		const fakeOpenAI = await startFakeOpenAICompletionsServer(responseText);
+		const agentDir = await createIntegratedVoltAgentDir(stateDir, { baseUrl: fakeOpenAI.baseUrl });
+		const alphaWorkspacePath = join(stateDir, "alpha-workspace");
+		const betaWorkspacePath = join(stateDir, "beta-workspace");
+		await mkdir(alphaWorkspacePath, { recursive: true });
+		await mkdir(betaWorkspacePath, { recursive: true });
+		const endpoint = await bindRawClientEndpoint("disabled");
+		let rawClient;
+		let betaClient;
+
+		async function registerWorkspace(name, workspacePath) {
+			const registerCommand = spawnSourceCli([
+				"remote",
+				"host",
+				"--state",
+				hostStatePath,
+				"--register-workspace",
+				`${name}=${workspacePath}`,
+				"--allow-tools",
+				DEFAULT_TEST_ALLOW_TOOLS,
+			]);
+			await waitForExit(registerCommand.child, `register ${name} runtime workspace`, registerCommand.output);
+			assert(
+				registerCommand.output.stderr.includes(`registered workspace: ${name} ->`),
+				`Expected ${name} registration confirmation, got:\n${registerCommand.output.stderr}`,
+			);
+		}
+
+		await registerWorkspace("alpha", alphaWorkspacePath);
+		await registerWorkspace("beta", betaWorkspacePath);
+
+		const host = startHost([
+			"--state",
+			hostStatePath,
+			"--agent-dir",
+			agentDir,
+			"--workspace",
+			`alpha=${alphaWorkspacePath}`,
+			"--integrated-volt",
+			"--no-pairing",
+		]);
+		try {
+			await waitForHostReady(host.child, host.output, "integrated multi-workspace runtime host");
+			const pairCommand = spawnSourceCli([
+				"remote",
+				"pair",
+				"--state",
+				hostStatePath,
+				"--workspace",
+				"alpha",
+				"--allow-tools",
+				DEFAULT_TEST_ALLOW_TOOLS,
+				"--label",
+				"multi-workspace runtime client",
+			]);
+			await waitForExit(pairCommand.child, "integrated multi-workspace runtime pair command", pairCommand.output);
+			const alphaTicket = pairCommand.output.stdout.trim();
+			assert(
+				alphaTicket.startsWith(TICKET_PREFIX),
+				`Expected runtime isolation pair command ticket, got:\n${pairCommand.output.stdout}`,
+			);
+			const betaTicket = createSecretFreeWorkspaceTicket(alphaTicket, "beta");
+
+			rawClient = await openRawAuthorizedClientOnEndpoint(endpoint, alphaTicket, {
+				clientLabel: "multi-workspace runtime client",
+			});
+			const betaStream = await openRawAuthorizedStreamOnConnection(rawClient, betaTicket, {
+				clientLabel: "multi-workspace runtime client",
+			});
+			betaClient = {
+				connection: rawClient.connection,
+				handshakeResponse: betaStream.handshakeResponse,
+				nodeId: rawClient.nodeId,
+				rest: betaStream.rest,
+				stream: betaStream.stream,
+			};
+
+			const alphaState = await readRawRpcResponse(
+				rawClient,
+				{ id: "state-runtime-alpha-initial", type: "get_state" },
+				"integrated multi-workspace alpha initial get_state",
+			);
+			const betaState = await readRawRpcResponse(
+				betaClient,
+				{ id: "state-runtime-beta-initial", type: "get_state" },
+				"integrated multi-workspace beta initial get_state",
+			);
+			assert(alphaState.event.success === true, `Expected alpha get_state success, got:\n${alphaState.lines.join("\n")}`);
+			assert(betaState.event.success === true, `Expected beta get_state success, got:\n${betaState.lines.join("\n")}`);
+			const alphaSessionId = alphaState.event.data?.sessionId;
+			const betaInitialSessionId = betaState.event.data?.sessionId;
+			assert(alphaSessionId, `Expected alpha session id, got:\n${JSON.stringify(alphaState.event)}`);
+			assert(betaInitialSessionId, `Expected beta session id, got:\n${JSON.stringify(betaState.event)}`);
+			assert(
+				alphaSessionId !== betaInitialSessionId,
+				`Expected independent workspace sessions, got alpha=${alphaSessionId} beta=${betaInitialSessionId}`,
+			);
+
+			const betaNewSession = await readRawRpcResponse(
+				betaClient,
+				{ id: "new-session-runtime-beta", type: "new_session" },
+				"integrated multi-workspace beta new_session",
+			);
+			assert(
+				betaNewSession.event.success === true,
+				`Expected beta new_session success, got:\n${betaNewSession.lines.join("\n")}`,
+			);
+			const betaNewState = await readRawRpcResponse(
+				betaClient,
+				{ id: "state-runtime-beta-new", type: "get_state" },
+				"integrated multi-workspace beta get_state after new_session",
+			);
+			const betaNewSessionId = betaNewState.event.data?.sessionId;
+			assert(betaNewSessionId, `Expected beta new session id, got:\n${JSON.stringify(betaNewState.event)}`);
+			assert(
+				betaNewSessionId !== betaInitialSessionId,
+				`Expected beta new_session to change only beta session, got ${betaNewSessionId}`,
+			);
+			const alphaAfterBetaNew = await readRawRpcResponse(
+				rawClient,
+				{ id: "state-runtime-alpha-after-beta-new", type: "get_state" },
+				"integrated multi-workspace alpha get_state after beta new_session",
+			);
+			assert(
+				alphaAfterBetaNew.event.data?.sessionId === alphaSessionId,
+				`Expected alpha session to remain ${alphaSessionId}, got:\n${JSON.stringify(alphaAfterBetaNew.event)}`,
+			);
+
+			let hostState = JSON.parse(await readFile(hostStatePath, "utf8"));
+			assert(
+				hostState.clients?.[0]?.lastSessionIdByWorkspace?.alpha === alphaSessionId &&
+					hostState.clients?.[0]?.lastSessionIdByWorkspace?.beta === betaNewSessionId,
+				`Expected per-workspace last session IDs after beta new_session, got:\n${JSON.stringify(hostState.clients)}`,
+			);
+
+			const alphaList = await readRawRpcResponse(
+				rawClient,
+				{ id: "list-runtime-alpha", type: "list_sessions" },
+				"integrated multi-workspace alpha list_sessions",
+			);
+			const alphaSessions = alphaList.event.data?.sessions ?? [];
+			assert(
+				alphaSessions.some((session) => session.sessionId === alphaSessionId) &&
+					!alphaSessions.some((session) => session.sessionId === betaInitialSessionId || session.sessionId === betaNewSessionId),
+				`Expected alpha list_sessions to stay workspace-scoped, got:\n${JSON.stringify(alphaList.event)}`,
+			);
+			const betaList = await readRawRpcResponse(
+				betaClient,
+				{ id: "list-runtime-beta", type: "list_sessions" },
+				"integrated multi-workspace beta list_sessions",
+			);
+			const betaSessions = betaList.event.data?.sessions ?? [];
+			assert(
+				betaSessions.some((session) => session.sessionId === betaNewSessionId) &&
+					!betaSessions.some((session) => session.sessionId === alphaSessionId),
+				`Expected beta list_sessions to stay workspace-scoped, got:\n${JSON.stringify(betaList.event)}`,
+			);
+
+			const alphaSwitchToBeta = await readRawRpcResponse(
+				rawClient,
+				{ id: "switch-runtime-alpha-to-beta", type: "switch_session_by_id", sessionId: betaNewSessionId },
+				"integrated multi-workspace alpha switch_session_by_id beta",
+			);
+			assert(
+				alphaSwitchToBeta.event.success === false &&
+					alphaSwitchToBeta.event.error === `Session not found in current workspace: ${betaNewSessionId}`,
+				`Expected alpha to reject beta session switch, got:\n${JSON.stringify(alphaSwitchToBeta.event)}`,
+			);
+			const betaSwitchCurrent = await readRawRpcResponse(
+				betaClient,
+				{ id: "switch-runtime-beta-current", type: "switch_session_by_id", sessionId: betaNewSessionId },
+				"integrated multi-workspace beta switch_session_by_id current",
+			);
+			assert(
+				betaSwitchCurrent.event.success === true,
+				`Expected beta switch_session_by_id success, got:\n${JSON.stringify(betaSwitchCurrent.event)}`,
+			);
+			hostState = JSON.parse(await readFile(hostStatePath, "utf8"));
+			assert(
+				hostState.clients?.[0]?.lastSessionIdByWorkspace?.alpha === alphaSessionId &&
+					hostState.clients?.[0]?.lastSessionIdByWorkspace?.beta === betaNewSessionId,
+				`Expected beta session switch to preserve per-workspace last session IDs, got:\n${JSON.stringify(hostState.clients)}`,
+			);
+
+			const alphaPrompt = await readRawRpcResponse(
+				rawClient,
+				{ id: "prompt-runtime-alpha", type: "prompt", message: "alpha should abort" },
+				"integrated multi-workspace alpha prompt",
+			);
+			const betaPrompt = await readRawRpcResponse(
+				betaClient,
+				{ id: "prompt-runtime-beta", type: "prompt", message: "beta should finish" },
+				"integrated multi-workspace beta prompt",
+			);
+			assert(alphaPrompt.event.success === true, `Expected alpha prompt success, got:\n${alphaPrompt.lines.join("\n")}`);
+			assert(betaPrompt.event.success === true, `Expected beta prompt success, got:\n${betaPrompt.lines.join("\n")}`);
+			await waitForFakeOpenAIRequestCount(fakeOpenAI, 2, "integrated multi-workspace runtime prompts");
+
+			const alphaAbort = await readRawRpcResponse(
+				rawClient,
+				{ id: "abort-runtime-alpha", type: "abort" },
+				"integrated multi-workspace alpha abort",
+			);
+			assert(alphaAbort.event.success === true, `Expected alpha abort success, got:\n${alphaAbort.lines.join("\n")}`);
+			const betaStreaming = await readRawRpcResponse(
+				betaClient,
+				{ id: "state-runtime-beta-streaming", type: "get_state" },
+				"integrated multi-workspace beta get_state while alpha aborted",
+			);
+			assert(
+				betaStreaming.event.data?.sessionId === betaNewSessionId && betaStreaming.event.data?.isStreaming === true,
+				`Expected beta to keep streaming after alpha abort, got:\n${JSON.stringify(betaStreaming.event)}`,
+			);
+
+			fakeOpenAI.releaseResponse();
+			let betaAgentEnd;
+			for (let index = 0; !betaAgentEnd && index < 20; index += 1) {
+				const { event } = await readRawRpcEvent(betaClient, "integrated multi-workspace beta completion");
+				if (event.type === "agent_end") betaAgentEnd = event;
+			}
+			assert(betaAgentEnd, "Expected beta prompt to finish after alpha abort");
+			assert(
+				betaAgentEnd.messages?.some((message) => message.role === "assistant" && message.stopReason === "stop"),
+				`Expected beta prompt to stop normally, got:\n${JSON.stringify(betaAgentEnd)}`,
+			);
+
+			const betaTranscript = await readRawRpcResponse(
+				betaClient,
+				{ id: "transcript-runtime-beta", type: "get_transcript", limit: 20 },
+				"integrated multi-workspace beta transcript",
+			);
+			const betaItems = betaTranscript.event.data?.items ?? [];
+			assert(
+				betaItems.some((item) => item.role === "user" && item.text === "beta should finish") &&
+					betaItems.some((item) => item.role === "assistant" && item.text === responseText),
+				`Expected beta transcript to contain only beta completion, got:\n${JSON.stringify(betaTranscript.event)}`,
+			);
+		} finally {
+			await Promise.resolve(betaClient?.stream?.send?.finish?.()).catch(() => {});
+			closeRawConnection(rawClient?.connection);
+			await endpoint.close();
 			await stopProcess(host.child);
 			await fakeOpenAI.close();
 		}
@@ -3209,6 +3470,7 @@ const scenarios = [
 	["integrated Volt detach reattach runtime", integratedVoltDetachReattachRuntimeScenario],
 	["integrated Volt detached runtime TTL", integratedVoltDetachedRuntimeTtlScenario],
 	["integrated Volt active detach reconnect transcript", integratedVoltActiveDetachReconnectTranscriptScenario],
+	["integrated Volt multi-workspace runtime isolation", integratedVoltMultiWorkspaceRuntimeIsolationScenario],
 	["duplicate active connection", duplicateActiveConnectionScenario],
 	["integrated Volt profile", integratedVoltProfileScenario],
 	["integrated Volt env profile", integratedVoltEnvProfileScenario],
