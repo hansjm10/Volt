@@ -78,6 +78,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import type { HostInteraction } from "./host-interaction.ts";
 import { resolveLspConfig } from "./lsp/config.ts";
 import { LspManager, type LspServerStatus } from "./lsp/manager.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
@@ -172,6 +173,8 @@ export interface AgentSessionConfig {
 	initialActiveToolNames?: string[];
 	/** Optional allowlist of tool names. When provided, only these tool names are exposed. */
 	allowedToolNames?: string[];
+	/** Allow extension and SDK custom tools even when they are absent from allowedToolNames. */
+	allowUnlistedExtensionTools?: boolean;
 	/** Optional denylist of tool names. When provided, these tool names are not exposed. */
 	excludedToolNames?: string[];
 	/**
@@ -185,6 +188,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Optional host interaction bridge for blocking host-initiated actions. */
+	hostInteraction?: HostInteraction;
 }
 
 export interface ExtensionBindings {
@@ -306,6 +311,7 @@ export class AgentSession {
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
+	private _allowUnlistedExtensionTools: boolean;
 	private _excludedToolNames?: Set<string>;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
@@ -323,6 +329,7 @@ export class AgentSession {
 
 	// LSP diagnostics manager (created unless lsp.enabled is false)
 	private _lspManager?: LspManager;
+	private _hostInteraction?: HostInteraction;
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -346,9 +353,11 @@ export class AgentSession {
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
+		this._allowUnlistedExtensionTools = config.allowUnlistedExtensionTools ?? false;
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._hostInteraction = config.hostInteraction;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -364,6 +373,11 @@ export class AgentSession {
 	/** Model registry for API key resolution and model discovery */
 	get modelRegistry(): ModelRegistry {
 		return this._modelRegistry;
+	}
+
+	setHostInteraction(hostInteraction: HostInteraction | undefined): void {
+		this._hostInteraction = hostInteraction;
+		this._lspManager?.setHostInteraction(hostInteraction);
 	}
 
 	/** LSP status for the /lsp command. */
@@ -2395,9 +2409,13 @@ export class AgentSession {
 		const previousRegistryNames = new Set(this._toolRegistry.keys());
 		const previousActiveToolNames = this.getActiveToolNames();
 		const allowedToolNames = this._allowedToolNames;
+		const allowUnlistedExtensionTools = this._allowUnlistedExtensionTools;
 		const excludedToolNames = this._excludedToolNames;
-		const isAllowedTool = (name: string): boolean =>
-			(!allowedToolNames || allowedToolNames.has(name)) && !excludedToolNames?.has(name);
+		const isExcludedTool = (name: string): boolean => excludedToolNames?.has(name) === true;
+		const isAllowedListedTool = (name: string): boolean =>
+			(!allowedToolNames || allowedToolNames.has(name)) && !isExcludedTool(name);
+		const isAllowedExtensionTool = (name: string): boolean =>
+			!isExcludedTool(name) && (!allowedToolNames || allowUnlistedExtensionTools || allowedToolNames.has(name));
 
 		const registeredTools = this._extensionRunner.getAllRegisteredTools();
 		const allCustomTools = [
@@ -2406,10 +2424,10 @@ export class AgentSession {
 				definition,
 				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, { source: "sdk" }),
 			})),
-		].filter((tool) => isAllowedTool(tool.definition.name));
+		].filter((tool) => isAllowedExtensionTool(tool.definition.name));
 		const definitionRegistry = new Map<string, ToolDefinitionEntry>(
 			Array.from(this._baseToolDefinitions.entries())
-				.filter(([name]) => isAllowedTool(name))
+				.filter(([name]) => isAllowedListedTool(name))
 				.map(([name, definition]) => [
 					name,
 					{
@@ -2445,7 +2463,7 @@ export class AgentSession {
 		const wrappedExtensionTools = wrapRegisteredTools(allCustomTools, runner);
 		const wrappedBuiltInTools = wrapRegisteredTools(
 			Array.from(this._baseToolDefinitions.values())
-				.filter((definition) => isAllowedTool(definition.name))
+				.filter((definition) => isAllowedListedTool(definition.name))
 				.map((definition) => ({
 					definition,
 					sourceInfo: createSyntheticSourceInfo(`<builtin:${definition.name}>`, { source: "builtin" }),
@@ -2461,12 +2479,17 @@ export class AgentSession {
 
 		const nextActiveToolNames = (
 			options?.activeToolNames ? [...options.activeToolNames] : [...previousActiveToolNames]
-		).filter((name) => isAllowedTool(name));
+		).filter((name) => this._toolRegistry.has(name));
 
 		if (allowedToolNames) {
 			for (const toolName of this._toolRegistry.keys()) {
 				if (allowedToolNames.has(toolName)) {
 					nextActiveToolNames.push(toolName);
+				}
+			}
+			if (allowUnlistedExtensionTools) {
+				for (const tool of wrappedExtensionTools) {
+					nextActiveToolNames.push(tool.name);
 				}
 			}
 		} else if (options?.includeAllExtensionTools) {
@@ -2497,7 +2520,11 @@ export class AgentSession {
 		this._lspManager = undefined;
 		const lspConfig = resolveLspConfig(this.settingsManager.getLspSettings());
 		if (lspConfig.enabled) {
-			this._lspManager = new LspManager({ cwd: this._cwd, config: lspConfig });
+			this._lspManager = new LspManager({
+				cwd: this._cwd,
+				config: lspConfig,
+				hostInteraction: this._hostInteraction,
+			});
 		}
 
 		const baseToolDefinitions = this._baseToolsOverride

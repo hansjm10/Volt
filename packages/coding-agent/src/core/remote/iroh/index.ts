@@ -27,6 +27,7 @@ export {
 	IROH_REMOTE_REVOKE_CONTROL_RESPONSE_TYPE,
 	type IrohRemoteControlClientOptions,
 	type IrohRemoteControlRequest,
+	type IrohRemoteControlServerListenOptions,
 	type IrohRemotePairControlClientOptions,
 	type IrohRemotePairControlRequest,
 	type IrohRemotePairControlResponse,
@@ -34,6 +35,7 @@ export {
 	type IrohRemoteRevokeControlRequest,
 	type IrohRemoteRevokeControlResponse,
 	type IrohRemoteUnsafeApproval,
+	listenIrohRemoteControlServer,
 	parseIrohRemoteControlRequest,
 	parseIrohRemotePairControlRequest,
 	parseIrohRemotePairControlResponse,
@@ -100,6 +102,7 @@ export {
 export {
 	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 	getIrohRemoteUnsafeAllowedTools,
+	getIrohRemoteVoltRpcToolArgs,
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_HANDSHAKE_TYPE,
 	IROH_REMOTE_HELLO_TYPE,
@@ -114,6 +117,8 @@ export {
 	isIrohRemoteHostHandshakeFailureOutcome,
 	isIrohRemoteOutcome,
 	isIrohRemoteRelayMode,
+	parseIrohRemoteAllowTools,
+	usesDefaultIrohRemoteAllowTools,
 } from "./protocol.ts";
 export {
 	DEFAULT_IROH_REMOTE_PUSH_RELAY_RETRY_ATTEMPTS,

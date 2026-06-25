@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdir } from "node:fs/promises";
-import { connect } from "node:net";
+import { chmod, lstat, mkdir, rm } from "node:fs/promises";
+import { connect, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { type IrohRemoteRelayMode, isIrohRemoteRelayMode } from "./protocol.ts";
@@ -11,6 +11,8 @@ export const IROH_REMOTE_REVOKE_CONTROL_REQUEST_TYPE = "volt_iroh_revoke_request
 export const IROH_REMOTE_REVOKE_CONTROL_RESPONSE_TYPE = "volt_iroh_revoke_response";
 export const DEFAULT_IROH_REMOTE_CONTROL_TIMEOUT_MS = 5_000;
 
+const DEFAULT_IROH_REMOTE_CONTROL_ACTIVE_RETRY_ATTEMPTS = 10;
+const DEFAULT_IROH_REMOTE_CONTROL_ACTIVE_RETRY_DELAY_MS = 250;
 const IROH_REMOTE_CONTROL_ROOT_DIR = "volt-iroh-remote";
 
 export type IrohRemoteUnsafeApproval = "tty_confirmation" | "yes_flag";
@@ -64,6 +66,11 @@ export interface IrohRemoteControlClientOptions<Request extends IrohRemoteContro
 	timeoutMs?: number;
 }
 
+export interface IrohRemoteControlServerListenOptions {
+	activeRetryAttempts?: number;
+	activeRetryDelayMs?: number;
+}
+
 export type IrohRemotePairControlClientOptions = IrohRemoteControlClientOptions<IrohRemotePairControlRequest>;
 export type IrohRemoteRevokeControlClientOptions = IrohRemoteControlClientOptions<IrohRemoteRevokeControlRequest>;
 
@@ -85,6 +92,86 @@ export async function ensureIrohRemoteControlDirectory(controlPath: string): Pro
 		await ensureOwnerOnlyIrohRemoteControlDirectory(controlRootDir);
 	}
 	await ensureOwnerOnlyIrohRemoteControlDirectory(controlDir);
+}
+
+export async function listenIrohRemoteControlServer(
+	server: Server,
+	controlPath: string,
+	options: IrohRemoteControlServerListenOptions = {},
+): Promise<void> {
+	await ensureIrohRemoteControlDirectory(controlPath);
+	const activeRetryAttempts = options.activeRetryAttempts ?? DEFAULT_IROH_REMOTE_CONTROL_ACTIVE_RETRY_ATTEMPTS;
+	const activeRetryDelayMs = options.activeRetryDelayMs ?? DEFAULT_IROH_REMOTE_CONTROL_ACTIVE_RETRY_DELAY_MS;
+	for (let attempt = 0; ; attempt += 1) {
+		try {
+			await listenServer(server, controlPath);
+			return;
+		} catch (error) {
+			if (process.platform === "win32" || !(error instanceof Error) || !isNodeErrorCode(error, "EADDRINUSE")) {
+				throw error;
+			}
+			if (await canConnectToControlPath(controlPath)) {
+				if (attempt < activeRetryAttempts) {
+					await delay(activeRetryDelayMs);
+					continue;
+				}
+				throw new Error(`Iroh remote host control channel is already active for this state path: ${controlPath}`);
+			}
+			await rm(controlPath, { force: true });
+		}
+	}
+}
+
+function listenServer(server: Server, controlPath: string): Promise<void> {
+	return new Promise((resolveListen, rejectListen) => {
+		const cleanup = () => {
+			server.off("error", handleError);
+			server.off("listening", handleListening);
+		};
+		const handleError = (error: Error) => {
+			cleanup();
+			rejectListen(error);
+		};
+		const handleListening = () => {
+			cleanup();
+			resolveListen();
+		};
+		server.once("error", handleError);
+		server.once("listening", handleListening);
+		try {
+			server.listen(controlPath);
+		} catch (error) {
+			cleanup();
+			rejectListen(error instanceof Error ? error : new Error(String(error)));
+		}
+	});
+}
+
+function canConnectToControlPath(controlPath: string): Promise<boolean> {
+	return new Promise((resolveConnect) => {
+		const socket = connect(controlPath);
+		let settled = false;
+		const finish = (canConnect: boolean) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			socket.destroy();
+			resolveConnect(canConnect);
+		};
+		const timeout = setTimeout(() => finish(false), 250);
+		socket.once("connect", () => finish(true));
+		socket.once("error", () => finish(false));
+	});
+}
+
+function delay(ms: number): Promise<void> {
+	return new Promise((resolveDelay) => {
+		setTimeout(resolveDelay, ms);
+	});
+}
+
+function isNodeErrorCode(error: Error, code: string): boolean {
+	return "code" in error && error.code === code;
 }
 
 async function ensureOwnerOnlyIrohRemoteControlDirectory(path: string): Promise<void> {

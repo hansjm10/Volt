@@ -407,7 +407,7 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 		if (typeof command.type !== "string") {
 			return createPendingCommand("unknown", typeof command.id === "string" ? command.id : undefined);
 		}
-		if (command.type === "extension_ui_response") {
+		if (command.type === "extension_ui_response" || command.type === "host_action_response") {
 			return undefined;
 		}
 		return createPendingCommand(command.type, typeof command.id === "string" ? command.id : undefined);

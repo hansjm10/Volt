@@ -47,6 +47,37 @@ describe("createIrohRemoteAgentRuntime", () => {
 		}
 	});
 
+	function writeToolExtension(): void {
+		mkdirSync(join(agentDir, "extensions"), { recursive: true });
+		writeFileSync(
+			join(agentDir, "extensions", "remote-tool.ts"),
+			`import { Type } from "typebox";
+
+export default function (volt) {
+	volt.registerTool({
+		name: "remote_extension_tool",
+		label: "Remote Extension Tool",
+		description: "Remote extension test tool",
+		promptSnippet: "Run remote extension test behavior",
+		parameters: Type.Object({}),
+		execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+	});
+
+	volt.on("session_start", () => {
+		volt.registerTool({
+			name: "remote_dynamic_tool",
+			label: "Remote Dynamic Tool",
+			description: "Remote dynamic test tool",
+			promptSnippet: "Run remote dynamic test behavior",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+		});
+	});
+}
+`,
+		);
+	}
+
 	function writeRuntimeConfig(settings: Record<string, unknown>): void {
 		writeFileSync(
 			join(agentDir, "models.json"),
@@ -94,6 +125,56 @@ describe("createIrohRemoteAgentRuntime", () => {
 			expect(existsSync(join(agentDir, "commands"))).toBe(false);
 			expect(readdirSync(join(agentDir, "sessions"))).toHaveLength(1);
 			expect(runtime.session.getActiveToolNames()).toEqual(DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(","));
+		} finally {
+			errorSpy.mockRestore();
+			await runtime?.dispose();
+		}
+	});
+
+	it("keeps active user extension tools available with the default remote grant", async () => {
+		writeRuntimeConfig({});
+		writeToolExtension();
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		let runtime: Awaited<ReturnType<typeof createIrohRemoteAgentRuntime>> | undefined;
+		try {
+			runtime = await createIrohRemoteAgentRuntime({ agentDir, cwd });
+
+			expect(runtime.session.getAllTools().map((tool) => tool.name)).toContain("remote_extension_tool");
+			expect(runtime.session.getActiveToolNames()).toEqual(
+				expect.arrayContaining([...DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(","), "remote_extension_tool"]),
+			);
+
+			await runtime.session.bindExtensions({});
+
+			expect(runtime.session.getAllTools().map((tool) => tool.name)).toContain("remote_dynamic_tool");
+			expect(runtime.session.getActiveToolNames()).toEqual(expect.arrayContaining(["remote_dynamic_tool"]));
+			expect(runtime.session.systemPrompt).toContain("- remote_dynamic_tool: Run remote dynamic test behavior");
+		} finally {
+			errorSpy.mockRestore();
+			await runtime?.dispose();
+		}
+	});
+
+	it("keeps custom remote tool allowlists strict", async () => {
+		writeRuntimeConfig({});
+		writeToolExtension();
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		let runtime: Awaited<ReturnType<typeof createIrohRemoteAgentRuntime>> | undefined;
+		try {
+			runtime = await createIrohRemoteAgentRuntime({ agentDir, allowTools: "read", cwd });
+			await runtime.session.bindExtensions({});
+
+			expect(
+				runtime.session
+					.getAllTools()
+					.map((tool) => tool.name)
+					.sort(),
+			).toEqual(["read"]);
+			expect(runtime.session.getActiveToolNames()).toEqual(["read"]);
+			expect(runtime.session.systemPrompt).not.toContain("remote_extension_tool");
+			expect(runtime.session.systemPrompt).not.toContain("remote_dynamic_tool");
 		} finally {
 			errorSpy.mockRestore();
 			await runtime?.dispose();

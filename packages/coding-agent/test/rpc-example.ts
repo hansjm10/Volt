@@ -31,7 +31,7 @@ async function main() {
 			console.log(`\n[Tool: ${event.toolName}]`);
 		}
 
-		if (event.type === "tool_execution_end") {
+		if (event.type === "tool_execution_end" && "result" in event) {
 			console.log(`[Result: ${JSON.stringify(event.result).slice(0, 200)}...]\n`);
 		}
 	});

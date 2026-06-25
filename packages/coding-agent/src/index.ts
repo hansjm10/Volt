@@ -154,11 +154,27 @@ export {
 } from "./core/extensions/index.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
+export type {
+	HostActionDecision,
+	HostActionDecisionKind,
+	HostActionMetadata,
+	HostActionMetadataValue,
+	HostActionRequest,
+	HostActionStatus,
+	HostActionUpdate,
+	HostInteraction,
+} from "./core/host-interaction.ts";
 // LSP
 export {
+	installHintForCommand,
+	installRecipeForCommand,
 	LspClient,
 	type LspClientOptions,
 	type LspDiagnostic,
+	type LspInstallCommandOptions,
+	type LspInstallCommandResult,
+	type LspInstallRecipe,
+	type LspInstallRunner,
 	LspManager,
 	type LspManagerOptions,
 	type LspServerSettings,
@@ -171,6 +187,7 @@ export {
 	type ResolvedLspConfig,
 	type ResolvedLspServerConfig,
 	resolveLspConfig,
+	runDefaultLspInstallCommand,
 } from "./core/lsp/index.ts";
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
@@ -255,6 +272,7 @@ export {
 	type IrohRemoteClientTicketHello,
 	type IrohRemoteControlClientOptions,
 	type IrohRemoteControlRequest,
+	type IrohRemoteControlServerListenOptions,
 	type IrohRemoteFilteredRpcTransportOptions,
 	type IrohRemoteHandshakeFailure,
 	type IrohRemoteHandshakeLineReadOptions,
@@ -323,6 +341,7 @@ export {
 	isIrohRemoteHostHandshakeFailureOutcome,
 	isIrohRemoteOutcome,
 	isIrohRemoteRelayMode,
+	listenIrohRemoteControlServer,
 	parseIrohRemoteClient,
 	parseIrohRemoteControlRequest,
 	parseIrohRemoteHandshakeResponse,
@@ -542,6 +561,7 @@ export {
 	type ModelInfo,
 	type PrintModeOptions,
 	RpcClient,
+	type RpcClientCapabilityFeature,
 	type RpcClientEvent,
 	type RpcClientOptions,
 	type RpcCommand,
@@ -549,7 +569,11 @@ export {
 	type RpcExtensionErrorEvent,
 	type RpcExtensionUIRequest,
 	type RpcExtensionUIResponse,
+	type RpcHostActionRequest,
+	type RpcHostActionResponse,
+	type RpcHostActionUpdate,
 	type RpcModeOptions,
+	type RpcPendingHostActionsResponse,
 	type RpcPushPlatform,
 	type RpcPushProvider,
 	type RpcRegisterPushTargetArgs,
@@ -563,6 +587,10 @@ export {
 	type RpcTranscriptToolStatus,
 	RpcTransportClient,
 	type RpcTransportClientOptions,
+	type RpcWorkflowEvent,
+	type RpcWorkflowKind,
+	type RpcWorkflowStatus,
+	type RpcWorkflowToolEvent,
 	runIrohRemoteRpcMode,
 	runPrintMode,
 	runRpcMode,

@@ -75,6 +75,16 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export type {
+	HostActionDecision,
+	HostActionDecisionKind,
+	HostActionMetadata,
+	HostActionMetadataValue,
+	HostActionRequest,
+	HostActionStatus,
+	HostActionUpdate,
+	HostInteraction,
+} from "./host-interaction.ts";
 export * from "./remote/iroh/index.ts";
 export {
 	attachJsonlLineReader,
@@ -91,13 +101,18 @@ export {
 	type JsonlRpcTransportOptions,
 	type JsonlStreamRpcTransportOptions,
 	type LoopbackRpcTransportPair,
+	type RpcClientCapabilityFeature,
 	type RpcCloseHandler,
 	type RpcCommand,
 	type RpcCommandType,
 	type RpcExtensionUIRequest,
 	type RpcExtensionUIResponse,
+	type RpcHostActionRequest,
+	type RpcHostActionResponse,
+	type RpcHostActionUpdate,
 	type RpcLineHandler,
 	type RpcModel,
+	type RpcPendingHostActionsResponse,
 	type RpcResponse,
 	type RpcSessionState,
 	type RpcSlashCommand,

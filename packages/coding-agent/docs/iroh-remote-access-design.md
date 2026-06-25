@@ -162,7 +162,7 @@ Default tool grant:
 volt remote host --workspace volt=. --allow-tools read,bash,edit,write,grep,find,ls
 ```
 
-The default grant includes write and shell tools, so it requires explicit host approval. TTY host and pair commands prompt before accepting `bash`, `edit`, or `write`; noninteractive flows must pass `--yes`:
+The default grant includes write, shell, and active extension tools, and the write/shell tools require explicit host approval. TTY host and pair commands prompt before accepting `bash`, `edit`, or `write`; noninteractive flows must pass `--yes`:
 
 ```bash
 volt remote host --workspace volt=. --yes
@@ -319,7 +319,7 @@ These are outside the host preview support boundary:
 
 Resolved preview decisions:
 
-- Remote clients use the default tool grant (`read,bash,edit,write,grep,find,ls`) unless configured otherwise, and keep their pair-time tool grant on reconnect.
+- Remote clients use the default built-in tool grant (`read,bash,edit,write,grep,find,ls`) plus active extension tools unless configured otherwise, and keep their pair-time built-in tool grant on reconnect.
 - Remote outbound state/events normalize workspace paths to `/workspace`, keep generic host paths intact, and only use dedicated redaction for host-only session, export, and bash-output paths.
 - Pairing is workspace-bound by saved workspace name; clients cannot request arbitrary host paths.
 - Mobile-facing host startup skips startup pairing; Pair Phone is the explicit `volt remote pair` path.

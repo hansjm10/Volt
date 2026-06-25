@@ -4,20 +4,61 @@ import { restoreStdout } from "../src/core/output-guard.ts";
 import type { RpcCloseHandler, RpcTransport } from "../src/core/rpc/transport.ts";
 
 const reviewMocks = vi.hoisted(() => ({
-	runReviewWorkflow: vi.fn(async (options: { newSession: (options?: unknown) => Promise<{ cancelled: boolean }> }) => {
-		const newSessionResult = await options.newSession({});
-		return {
-			status: "completed" as const,
-			resolution: {
-				description: "uncommitted changes",
-				diffCommand: "git diff HEAD",
-				diff: "diff",
-				truncated: false,
-			},
-			findingsCount: 1,
-			sessionSwitchCancelled: newSessionResult.cancelled,
-		};
-	}),
+	runReviewWorkflow: vi.fn(
+		async (options: {
+			newSession: (options?: unknown) => Promise<{ cancelled: boolean }>;
+			onEvent?: (event: Record<string, unknown>) => void;
+		}) => {
+			options.onEvent?.({
+				type: "workflow_start",
+				workflowId: "review:test",
+				kind: "review",
+				action: "review.uncommitted",
+				title: "Review",
+				message: "Reviewing uncommitted changes.",
+				status: "running",
+			});
+			options.onEvent?.({
+				type: "tool_execution_start",
+				workflowId: "review:test",
+				workflowKind: "review",
+				workflowAction: "review.uncommitted",
+				toolCallId: "review:test:tool-1",
+				toolName: "read",
+				args: { path: "src/file.ts" },
+			});
+			options.onEvent?.({
+				type: "tool_execution_end",
+				workflowId: "review:test",
+				workflowKind: "review",
+				workflowAction: "review.uncommitted",
+				toolCallId: "review:test:tool-1",
+				toolName: "read",
+				isError: false,
+			});
+			const newSessionResult = await options.newSession({});
+			options.onEvent?.({
+				type: "workflow_end",
+				workflowId: "review:test",
+				kind: "review",
+				action: "review.uncommitted",
+				title: "Review",
+				message: "Review complete: 1 finding. Opening review session.",
+				status: "completed",
+			});
+			return {
+				status: "completed" as const,
+				resolution: {
+					description: "uncommitted changes",
+					diffCommand: "git diff HEAD",
+					diff: "diff",
+					truncated: false,
+				},
+				findingsCount: 1,
+				sessionSwitchCancelled: newSessionResult.cancelled,
+			};
+		},
+	),
 }));
 
 vi.mock("../src/core/review.ts", async (importOriginal) => {
@@ -126,6 +167,30 @@ describe("RPC mode review actions", () => {
 					status: "completed",
 					stateChanged: true,
 				}),
+			}),
+		);
+
+		expect(writes).toContainEqual(
+			expect.objectContaining({
+				type: "workflow_start",
+				workflowId: "review:test",
+				kind: "review",
+				message: "Reviewing uncommitted changes.",
+			}),
+		);
+		expect(writes).toContainEqual(
+			expect.objectContaining({
+				type: "tool_execution_start",
+				workflowId: "review:test",
+				toolName: "read",
+				args: { path: "src/file.ts" },
+			}),
+		);
+		expect(writes).toContainEqual(
+			expect.objectContaining({
+				type: "workflow_end",
+				workflowId: "review:test",
+				status: "completed",
 			}),
 		);
 

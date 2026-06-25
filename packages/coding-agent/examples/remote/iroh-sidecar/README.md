@@ -122,7 +122,7 @@ volt remote pair --workspace volt --allow-tools read,grep,find,ls,bash --yes
 
 If no host is running for the selected `--state` file, or if the workspace is missing or ambiguous, `volt remote pair` fails with diagnostics on stderr and no ticket on stdout.
 
-After a client is paired, reconnect tickets do not need a pairing secret. The same paired client can reconnect to another registered workspace name in the same host state file without scanning another QR. Registering a new workspace does not change the client's persisted tool grant; the existing `allowedTools` grant applies across all registered workspaces until the client is revoked and paired again with a different grant.
+After a client is paired, reconnect tickets do not need a pairing secret. The same paired client can reconnect to another registered workspace name in the same host state file without scanning another QR. Registering a new workspace does not change the client's persisted built-in tool grant; the existing `allowedTools` grant applies across all registered workspaces until the client is revoked and paired again with a different grant. When that grant is the default built-in list, active extension tools in the selected workspace are also exposed.
 
 List paired clients:
 
@@ -224,9 +224,9 @@ Remote host support is a preview feature and should be treated as remote access 
 - Paired clients are persisted until revoked.
 - Any paired client can control the integrated runtime or spawned RPC child for registered workspace names in the same host state file.
 - Pairing is workstation-scoped in this preview. A paired client can use registered workspace names added later without another QR scan, and revocation blocks that client from every registered workspace.
-- Real Volt RPC can use only tools allowed by the client's persisted `allowedTools` grant. That grant applies across all registered workspaces.
-- Keep the default read-only tool list (`read,grep,find,ls`) unless the client and workspace are trusted.
-- `--allow-tools` grants that include `bash`, `edit`, or `write` can modify host files or run shell commands; TTY host and pair commands ask for confirmation, and noninteractive commands must pass `--yes`.
+- Real Volt RPC can use only built-in tools allowed by the client's persisted `allowedTools` grant. That grant applies across all registered workspaces; when it is the default built-in list, active extension tools in the selected workspace are also exposed.
+- Use a custom read-only tool list (`read,grep,find,ls`) unless the client, workspace, and loaded extensions are trusted.
+- `--allow-tools` grants that include `bash`, `edit`, or `write` can modify host files or run shell commands; extension tools run code installed on the host and may do the same. TTY host and pair commands ask for confirmation on unsafe built-in grants, and noninteractive commands must pass `--yes`.
 - Workspaces are registered locally and selected by saved name, not arbitrary client-provided paths. Remote clients cannot register, edit, delete, or map workspace paths.
 - Remote sessions do not bypass project trust. Saved workspace trust is honored; otherwise choose `trust` in the host prompt or use `--approve` only when the host user trusts project-local resources.
 - Default state and audit paths are `~/.volt/agent/remote/iroh-host.json` and `~/.volt/agent/remote/iroh-host.audit.jsonl`.

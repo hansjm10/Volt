@@ -500,6 +500,7 @@ describe("runReview", () => {
 
 	it("can inherit extension tools from the parent session", async () => {
 		const toolRuns: Array<{ activeTools: string[]; query: string }> = [];
+		const workflowEvents: object[] = [];
 		const extensionFactory: ExtensionFactory = (volt) => {
 			volt.registerTool({
 				name: "review_helper",
@@ -531,11 +532,34 @@ describe("runReview", () => {
 			resolved,
 			parentResourceLoader: harness.session.resourceLoader,
 			tools: ["review_helper"],
+			workflowId: "review:test",
+			workflowAction: "review.uncommitted",
+			onEvent: (event) => workflowEvents.push(event),
 		});
 
 		expect(result.errorMessage).toBeUndefined();
 		expect(result.parsed?.findings).toEqual([]);
 		expect(toolRuns.map((run) => run.query)).toEqual(["changed file"]);
+		expect(workflowEvents).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "tool_execution_start",
+					workflowId: "review:test",
+					workflowKind: "review",
+					workflowAction: "review.uncommitted",
+					toolName: "review_helper",
+					args: { query: "changed file" },
+				}),
+				expect.objectContaining({
+					type: "tool_execution_end",
+					workflowId: "review:test",
+					workflowKind: "review",
+					workflowAction: "review.uncommitted",
+					toolName: "review_helper",
+					isError: false,
+				}),
+			]),
+		);
 		expect(harness.session.messages).toHaveLength(0);
 
 		harness.setResponses([

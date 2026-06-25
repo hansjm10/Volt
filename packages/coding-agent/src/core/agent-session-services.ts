@@ -5,6 +5,7 @@ import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AuthStorage } from "./auth-storage.ts";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
+import type { HostInteraction } from "./host-interaction.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import {
 	DefaultResourceLoader,
@@ -61,9 +62,11 @@ export interface CreateAgentSessionFromServicesOptions {
 	thinkingLevel?: ThinkingLevel;
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	tools?: string[];
+	allowUnlistedExtensionTools?: CreateAgentSessionOptions["allowUnlistedExtensionTools"];
 	excludeTools?: CreateAgentSessionOptions["excludeTools"];
 	noTools?: CreateAgentSessionOptions["noTools"];
 	customTools?: ToolDefinition[];
+	hostInteraction?: HostInteraction;
 }
 
 /**
@@ -201,9 +204,11 @@ export async function createAgentSessionFromServices(
 		thinkingLevel: options.thinkingLevel,
 		scopedModels: options.scopedModels,
 		tools: options.tools,
+		allowUnlistedExtensionTools: options.allowUnlistedExtensionTools,
 		excludeTools: options.excludeTools,
 		noTools: options.noTools,
 		customTools: options.customTools,
 		sessionStartEvent: options.sessionStartEvent,
+		hostInteraction: options.hostInteraction,
 	});
 }

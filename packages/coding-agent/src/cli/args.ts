@@ -30,6 +30,7 @@ export interface Args {
 	sessionDir?: string;
 	models?: string[];
 	tools?: string[];
+	allowUnlistedExtensionTools?: boolean;
 	excludeTools?: string[];
 	noTools?: boolean;
 	noBuiltinTools?: boolean;
@@ -132,6 +133,8 @@ export function parseArgs(args: string[]): Args {
 				.split(",")
 				.map((s) => s.trim())
 				.filter((name) => name.length > 0);
+		} else if (arg === "--allow-unlisted-extension-tools") {
+			result.allowUnlistedExtensionTools = true;
 		} else if ((arg === "--exclude-tools" || arg === "-xt") && i + 1 < args.length) {
 			result.excludeTools = args[++i]
 				.split(",")
@@ -272,6 +275,8 @@ ${chalk.bold("Options:")}
   --no-builtin-tools, -nbt       Disable built-in tools by default but keep extension/custom tools enabled
   --tools, -t <tools>            Comma-separated allowlist of tool names to enable
                                  Applies to built-in, extension, and custom tools
+  --allow-unlisted-extension-tools
+                                 Keep extension/custom tools enabled when absent from --tools
   --exclude-tools, -xt <tools>   Comma-separated denylist of tool names to disable
                                  Applies to built-in, extension, and custom tools
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh

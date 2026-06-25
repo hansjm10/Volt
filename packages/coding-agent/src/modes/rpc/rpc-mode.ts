@@ -12,6 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
+import type { AgentSession } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
@@ -27,6 +28,12 @@ import {
 	runSessionNewHostAction,
 	runSessionRenameHostAction,
 } from "../../core/host-actions.ts";
+import type {
+	HostActionDecision,
+	HostActionRequest,
+	HostActionUpdate,
+	HostInteraction,
+} from "../../core/host-interaction.ts";
 import {
 	flushRawStdout,
 	restoreStdout,
@@ -46,9 +53,14 @@ import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type {
+	RpcClientCapabilityFeature,
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcHostActionRequest,
+	RpcHostActionResponse,
+	RpcHostActionUpdate,
+	RpcPendingHostActionsResponse,
 	RpcRegisterPushTargetResponse,
 	RpcResponse,
 	RpcSessionListItem,
@@ -59,16 +71,25 @@ import type {
 
 // Re-export types for consumers
 export type {
+	RpcClientCapabilityFeature,
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcHostActionRequest,
+	RpcHostActionResponse,
+	RpcHostActionUpdate,
 	RpcLiveActivityRegistration,
+	RpcPendingHostActionsResponse,
 	RpcPushPlatform,
 	RpcPushProvider,
 	RpcRegisterPushTargetArgs,
 	RpcRegisterPushTargetResponse,
 	RpcResponse,
 	RpcSessionState,
+	RpcWorkflowEvent,
+	RpcWorkflowKind,
+	RpcWorkflowStatus,
+	RpcWorkflowToolEvent,
 	UiActionArgumentDescriptor,
 	UiActionArgumentType,
 	UiActionCapabilities,
@@ -101,6 +122,12 @@ function getUiActionCapabilities(invocationEnabled: boolean): UiActionCapabiliti
 		maxActions: 200,
 		maxDescriptorBytes: 65_536,
 	};
+}
+
+const HOST_ACTION_REQUESTS_CAPABILITY: RpcClientCapabilityFeature = "host_action_requests.v1";
+
+function parseHostActionResponseDecision(value: unknown): RpcHostActionResponse["decision"] | undefined {
+	return value === "approved" || value === "denied" || value === "dismissed" ? value : undefined;
 }
 
 export interface RpcSessionChange {
@@ -158,6 +185,136 @@ function createStdioRpcTransport(): RpcTransport {
 			process.stdin.pause();
 		},
 	};
+}
+
+interface RpcHostActionBridgeAttachment {
+	canSend(): boolean;
+	isShuttingDown(): boolean;
+	output(message: RpcHostActionRequest | RpcHostActionUpdate): void;
+}
+
+interface PendingRpcHostActionRequest {
+	request: RpcHostActionRequest;
+	resolve(decision: HostActionDecision): void;
+	settled: boolean;
+	signal?: AbortSignal;
+	timeoutId?: ReturnType<typeof setTimeout>;
+	onAbort(): void;
+}
+
+class RpcHostActionBridge {
+	readonly interaction: HostInteraction = {
+		requestAction: (request, options) => this.requestAction(request, options),
+		updateAction: (update) => this.updateAction(update),
+	};
+
+	private activeAttachment: (RpcHostActionBridgeAttachment & { id: number }) | undefined;
+	private nextAttachmentId = 0;
+	private readonly pendingRequests = new Map<string, PendingRpcHostActionRequest>();
+
+	attach(attachment: RpcHostActionBridgeAttachment): () => void {
+		const activeAttachment = { ...attachment, id: ++this.nextAttachmentId };
+		this.activeAttachment = activeAttachment;
+		return () => {
+			if (this.activeAttachment?.id === activeAttachment.id) {
+				this.activeAttachment = undefined;
+			}
+		};
+	}
+
+	getPendingRequests(): RpcHostActionRequest[] {
+		return Array.from(this.pendingRequests.values()).map((entry) => entry.request);
+	}
+
+	cancelAll(message = "RPC mode is shutting down"): void {
+		const requests = Array.from(this.pendingRequests.values());
+		for (const request of requests) {
+			this.settle(request, { decision: "dismissed", message });
+		}
+	}
+
+	resolveResponse(response: RpcHostActionResponse & { decision: HostActionDecision["decision"] }): void {
+		const pending = this.pendingRequests.get(response.id);
+		if (pending) {
+			this.settle(pending, { decision: response.decision, message: response.message });
+		}
+	}
+
+	private requestAction(
+		request: HostActionRequest,
+		requestOptions?: { signal?: AbortSignal },
+	): Promise<HostActionDecision> {
+		const activeAttachment = this.activeAttachment;
+		if (activeAttachment?.isShuttingDown()) {
+			return Promise.resolve({ decision: "dismissed" });
+		}
+		if (!activeAttachment?.canSend()) {
+			return Promise.resolve({ decision: "unavailable" });
+		}
+		if (requestOptions?.signal?.aborted) {
+			return Promise.resolve({ decision: "dismissed" });
+		}
+
+		return new Promise((resolve) => {
+			const existing = this.pendingRequests.get(request.id);
+			if (existing) {
+				this.settle(existing, { decision: "dismissed", message: "Host action replaced" });
+			}
+
+			const rpcRequest: RpcHostActionRequest = { type: "host_action_request", ...request };
+			let entry: PendingRpcHostActionRequest;
+			const onAbort = (): void => {
+				this.settle(entry, { decision: "dismissed", message: "Host action cancelled" });
+			};
+			entry = {
+				request: rpcRequest,
+				resolve,
+				settled: false,
+				signal: requestOptions?.signal,
+				onAbort,
+			};
+			requestOptions?.signal?.addEventListener("abort", onAbort, { once: true });
+			if (request.timeoutMs !== undefined) {
+				entry.timeoutId = setTimeout(() => {
+					this.settle(entry, { decision: "dismissed", message: "Host action timed out" });
+				}, request.timeoutMs);
+				entry.timeoutId.unref?.();
+			}
+			this.pendingRequests.set(request.id, entry);
+			activeAttachment.output(rpcRequest);
+		});
+	}
+
+	private updateAction(update: HostActionUpdate): void {
+		const activeAttachment = this.activeAttachment;
+		if (activeAttachment?.canSend()) {
+			activeAttachment.output({ type: "host_action_update", ...update });
+		}
+	}
+
+	private settle(entry: PendingRpcHostActionRequest, decision: HostActionDecision): void {
+		if (entry.settled) {
+			return;
+		}
+		entry.settled = true;
+		if (entry.timeoutId) {
+			clearTimeout(entry.timeoutId);
+		}
+		entry.signal?.removeEventListener("abort", entry.onAbort);
+		this.pendingRequests.delete(entry.request.id);
+		entry.resolve(decision);
+	}
+}
+
+const rpcHostActionBridges = new WeakMap<AgentSessionRuntime, RpcHostActionBridge>();
+
+function getRpcHostActionBridge(runtimeHost: AgentSessionRuntime): RpcHostActionBridge {
+	let bridge = rpcHostActionBridges.get(runtimeHost);
+	if (!bridge) {
+		bridge = new RpcHostActionBridge();
+		rpcHostActionBridges.set(runtimeHost, bridge);
+	}
+	return bridge;
 }
 
 /**
@@ -284,6 +441,25 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		for (const request of requests) {
 			request.cancel();
 		}
+	};
+
+	let clientCapabilities = new Set<RpcClientCapabilityFeature>();
+	const hostActionBridge = getRpcHostActionBridge(runtimeHost);
+	const detachHostActionBridge = hostActionBridge.attach({
+		canSend: () => !shuttingDown && clientCapabilities.has(HOST_ACTION_REQUESTS_CAPABILITY),
+		isShuttingDown: () => shuttingDown,
+		output: (message) => output(message),
+	});
+
+	const cancelPendingHostActionRequests = (message = "RPC mode is shutting down"): void => {
+		hostActionBridge.cancelAll(message);
+	};
+
+	const setSessionHostInteraction = (targetSession: AgentSession): void => {
+		const sessionWithHostInteraction = targetSession as {
+			setHostInteraction?: (hostInteraction: HostInteraction) => void;
+		};
+		sessionWithHostInteraction.setHostInteraction?.(hostActionBridge.interaction);
 	};
 
 	/** Helper for dialog methods with signal/timeout support */
@@ -530,6 +706,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	const rebindSession = async (): Promise<void> => {
 		if (shuttingDown) return;
 		session = runtimeHost.session;
+		setSessionHostInteraction(session);
 		await session.bindExtensions({
 			uiContext: createExtensionUIContext(),
 			mode: "rpc",
@@ -617,6 +794,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				requireProjectTrust: reviewOptions.remote,
 				requireConfirmation: reviewOptions.requireConfirmation,
 				confirm: ({ title, message }) => createExtensionUIContext().confirm(title, message),
+				onEvent: output,
 			}),
 	});
 
@@ -650,6 +828,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		shuttingDown = true;
 		try {
 			cancelPendingExtensionRequests();
+			detachHostActionBridge();
+			if (shouldDisposeRuntimeOnClose) {
+				cancelPendingHostActionRequests();
+			}
 			for (const cleanup of signalCleanupHandlers) {
 				cleanup();
 			}
@@ -727,6 +909,27 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
 				const result = await runSessionNewHostAction(createHostActionContext(), options);
 				return success(id, "new_session", result);
+			}
+
+			// =================================================================
+			// Client capabilities and host-initiated actions
+			// =================================================================
+
+			case "set_client_capabilities": {
+				clientCapabilities = new Set(
+					command.features.filter((feature): feature is RpcClientCapabilityFeature => typeof feature === "string"),
+				);
+				if (!clientCapabilities.has(HOST_ACTION_REQUESTS_CAPABILITY)) {
+					cancelPendingHostActionRequests("Host action capability disabled");
+				}
+				return success(id, "set_client_capabilities");
+			}
+
+			case "get_pending_host_actions": {
+				const data: RpcPendingHostActionsResponse = {
+					actions: hostActionBridge.getPendingRequests(),
+				};
+				return success(id, "get_pending_host_actions", data);
 			}
 
 			// =================================================================
@@ -1080,6 +1283,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			}
 		}
 		cancelPendingExtensionRequests();
+		detachHostActionBridge();
+		if (shouldDisposeRuntimeOnClose) {
+			cancelPendingHostActionRequests();
+		}
 		if (shuttingDown) {
 			if (shouldExitProcess) {
 				process.exit(exitCode);
@@ -1160,20 +1367,26 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			return;
 		}
 
-		// Handle extension UI responses during startup as well as normal operation.
-		if (
-			typeof parsed === "object" &&
-			parsed !== null &&
-			"type" in parsed &&
-			parsed.type === "extension_ui_response"
-		) {
-			const response = parsed as RpcExtensionUIResponse;
-			const pending = pendingExtensionRequests.get(response.id);
-			if (pending) {
-				pendingExtensionRequests.delete(response.id);
-				pending.resolve(response);
+		// Handle extension UI and host action responses during startup as well as normal operation.
+		if (typeof parsed === "object" && parsed !== null && "type" in parsed) {
+			if (parsed.type === "extension_ui_response") {
+				const response = parsed as RpcExtensionUIResponse;
+				const pending = pendingExtensionRequests.get(response.id);
+				if (pending) {
+					pendingExtensionRequests.delete(response.id);
+					pending.resolve(response);
+				}
+				return;
 			}
-			return;
+			if (parsed.type === "host_action_response") {
+				const response = parsed as RpcHostActionResponse;
+				const decision = parseHostActionResponseDecision(response.decision);
+				if (!decision) {
+					return;
+				}
+				hostActionBridge.resolveResponse({ ...response, decision });
+				return;
+			}
 		}
 
 		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {

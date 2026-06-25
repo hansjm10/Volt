@@ -61,14 +61,14 @@ Supported preview safety model:
 - Nothing listens until the host user runs `volt remote host`.
 - Workspaces are registered locally by the desktop user with saved names such as `volt=/path/to/repo` or `volt remote host --register-workspace volt=/path/to/repo`; clients cannot request arbitrary host paths.
 - Registering a workspace is not a remote API. Clients cannot create, rename, delete, or path-map host workspaces from the app.
-- The default remote tool allowlist includes the built-in coding tools: `read,bash,edit,write,grep,find,ls`.
+- The default remote tool grant includes the built-in coding tools `read,bash,edit,write,grep,find,ls` plus active tools registered by loaded extensions. Custom grants that differ from the default built-in list are strict; extension tools must be named explicitly there.
 - Pairing tickets are short-lived, one-time credentials. Persisted state stores secret hashes and non-secret metadata, not raw pairing secrets.
 - Pairing through `volt remote pair` requires a running host control channel; offline ticket generation from persisted state is not supported.
 - Mobile-facing `volt remote host --mobile` startup does not create an active pairing ticket. Add phones explicitly with `volt remote pair`.
 - Paired clients are persisted until revoked with `volt remote revoke <node-id>`.
 - After pairing, saved-host reconnect uses the persisted client node ID and a secret-free client saved-host record. Ordinary app reconnect, temporary network loss, or host restart with the same host state path should not require scanning another QR.
 - Pairing is workstation-scoped for the host state file. A paired phone can reconnect to any registered workspace name in that state file, including workspaces registered after pairing, without another QR scan. The app receives and selects names only, never host-local paths.
-- Registering another workspace does not grant more tools. The client's persisted `allowedTools` grant applies across every registered workspace until the client is revoked and paired again with a different grant.
+- Registering another workspace does not grant more built-in tools. The client's persisted `allowedTools` grant applies across every registered workspace until the client is revoked and paired again with a different grant; when that grant is the default built-in list, active extension tools in the selected workspace are also exposed.
 - Revocation removes future access from persisted state and asks a live host to close matching active connections when one is reachable. A revoked phone is blocked from every registered workspace in that state file.
 - A revoked phone node ID cannot reconnect or re-pair with only a generic new QR. The desktop host must approve that node with `volt remote approve-repair <node-id>`, then issue a fresh active pairing ticket.
 - In the default integrated runtime, Iroh stream close is detach, not cancellation. Active work can continue on the host until it finishes or an authorized client sends `abort`.
@@ -76,7 +76,7 @@ Supported preview safety model:
 - `volt remote status` and `volt remote clients` report persisted workspaces, clients, tool grants, state path, audit path, and redacted push target metadata without printing secrets or secret hashes.
 - Default paths are `~/.volt/agent/remote/iroh-host.json` for state and `~/.volt/agent/remote/iroh-host.audit.jsonl` for audit JSONL.
 
-Unsafe remote tools require explicit host approval. Granting `bash`, `edit`, or `write` lets the remote session modify files or run shell commands on the host. TTY host startup asks for confirmation and offers `trust` to continue while saving workspace trust; TTY pair commands ask for confirmation. Noninteractive unsafe grants, including the default grant, require `--yes`. Do not grant unsafe tools unless the client device and network path are trusted.
+Unsafe remote tools require explicit host approval. Granting `bash`, `edit`, or `write` lets the remote session modify files or run shell commands on the host. Extension tools run code installed on the host and may do the same; expose them only when those extensions, the client device, and the network path are trusted. TTY host startup asks for confirmation and offers `trust` to continue while saving workspace trust; TTY pair commands ask for confirmation. Noninteractive unsafe grants, including the default grant, require `--yes`.
 
 Remote sessions do not bypass project trust. Project-local settings, extensions, skills, prompt templates, themes, system prompts, and package-managed resources follow the same project trust rules as local Volt. A saved trust decision for the workspace is honored; otherwise the host runs those resources untrusted unless the host user chooses `trust` in the prompt or passes `--approve`. `volt remote host --register-workspace --approve` saves trust for the registered workspace.
 

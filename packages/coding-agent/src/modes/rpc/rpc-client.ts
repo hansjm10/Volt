@@ -1,9 +1,10 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import { RpcClientBase } from "./rpc-client-base.ts";
-import type { RpcCommand, RpcExtensionUIResponse } from "./rpc-types.ts";
+import type { RpcCommand, RpcExtensionUIResponse, RpcHostActionResponse } from "./rpc-types.ts";
 
 export type { ModelInfo, RpcClientEvent, RpcEventListener, RpcExtensionErrorEvent } from "./rpc-client-base.ts";
+export type { RpcWorkflowEvent, RpcWorkflowToolEvent } from "./rpc-types.ts";
 
 export interface RpcClientOptions {
 	/** Path to the CLI entry point (default: searches for dist/cli.js) */
@@ -159,7 +160,7 @@ export class RpcClient extends RpcClientBase {
 		}
 	}
 
-	protected writeMessage(message: RpcCommand | RpcExtensionUIResponse): void {
+	protected writeMessage(message: RpcCommand | RpcExtensionUIResponse | RpcHostActionResponse): void {
 		const stdin = this.process?.stdin;
 		if (!stdin) {
 			throw new Error("Client not started");

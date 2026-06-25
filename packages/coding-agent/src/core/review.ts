@@ -12,6 +12,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type { ThinkingLevel } from "@earendil-works/volt-agent-core";
 import type { AssistantMessage, Model } from "@earendil-works/volt-ai";
 import type { AgentSessionRuntime } from "./agent-session-runtime.ts";
@@ -805,6 +806,10 @@ export interface RunReviewOptions {
 	signal?: AbortSignal;
 	/** Called with short progress updates (tool activity) while the review runs. */
 	onProgress?: (message: string) => void;
+	/** Emits sanitized review tool lifecycle events while the review runs. */
+	onEvent?: (event: ReviewWorkflowToolEvent) => void;
+	workflowId?: string;
+	workflowAction?: string;
 }
 
 export interface ReviewRunResult {
@@ -835,9 +840,59 @@ interface ReviewCustomMessage<T> {
 	details: T;
 }
 
+export type ReviewWorkflowEvent =
+	| {
+			type: "workflow_start";
+			workflowId: string;
+			kind: "review";
+			action: string;
+			title: string;
+			message: string;
+			status: "running";
+	  }
+	| {
+			type: "workflow_update";
+			workflowId: string;
+			kind: "review";
+			action: string;
+			title: string;
+			message: string;
+			status: "running" | "finalizing";
+	  }
+	| {
+			type: "workflow_end";
+			workflowId: string;
+			kind: "review";
+			action: string;
+			title: string;
+			message: string;
+			status: "completed" | "cancelled" | "failed";
+	  };
+
+export type ReviewWorkflowToolEvent =
+	| {
+			type: "tool_execution_start";
+			workflowId: string;
+			workflowKind: "review";
+			workflowAction: string;
+			toolCallId: string;
+			toolName: string;
+			args?: Record<string, unknown>;
+	  }
+	| {
+			type: "tool_execution_end";
+			workflowId: string;
+			workflowKind: "review";
+			workflowAction: string;
+			toolCallId: string;
+			toolName: string;
+			isError: boolean;
+	  };
+
 export interface ReviewWorkflowHooks {
 	signal?: AbortSignal;
 	onProgress?: (message: string) => void;
+	onEvent?: (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent) => void;
 	cleanup?: () => void;
 }
 
@@ -858,6 +913,8 @@ export interface ReviewWorkflowOptions {
 		model: Model<any>,
 	) => Promise<ReviewWorkflowHooks> | ReviewWorkflowHooks;
 	onReviewModelWarning?: (message: string) => void;
+	/** Emits sanitized review workflow and tool-usage events for UI surfaces. */
+	onEvent?: (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent) => void;
 }
 
 export type ReviewWorkflowResult =
@@ -899,6 +956,30 @@ export function resolveReviewModel(options: {
 	return { model: options.currentModel };
 }
 
+function reviewActionIdForTarget(target: ReviewTarget): string {
+	switch (target.kind) {
+		case "uncommitted":
+			return "review.uncommitted";
+		case "branch":
+			return "review.branch";
+		case "pr":
+			return "review.pr";
+		case "commit":
+			return "review.commit";
+	}
+}
+
+function createReviewWorkflowId(): string {
+	return `review:${randomUUID()}`;
+}
+
+function emitReviewWorkflowEvent(
+	emit: ((event: ReviewWorkflowEvent | ReviewWorkflowToolEvent) => void) | undefined,
+	event: ReviewWorkflowEvent,
+): void {
+	emit?.(event);
+}
+
 export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise<ReviewWorkflowResult> {
 	assertReviewCanStart(options.session);
 	if (options.requireProjectTrust && !options.settingsManager.isProjectTrusted()) {
@@ -935,49 +1016,130 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 	}
 
 	assertReviewCanStart(options.session);
+	const workflowId = createReviewWorkflowId();
+	const workflowAction = reviewActionIdForTarget(options.target);
 	const hooks = await options.onBeforeReview?.(resolution, model);
-	let result: ReviewRunResult;
-	try {
-		result = await runReview({
-			cwd: options.cwd,
-			agentDir: options.agentDir,
-			model,
-			thinkingLevel: options.session.thinkingLevel,
-			authStorage: options.authStorage,
-			modelRegistry: options.session.modelRegistry,
-			settingsManager: options.settingsManager,
-			resolved: resolution,
-			parentResourceLoader: options.session.resourceLoader,
-			tools: options.tools ? [...options.tools] : undefined,
-			signal: hooks?.signal,
-			onProgress: hooks?.onProgress,
-		});
-	} finally {
-		hooks?.cleanup?.();
-	}
-
-	if (result.aborted || hooks?.signal?.aborted) {
-		return { status: "cancelled", resolution };
-	}
-	if (result.errorMessage) {
-		throw new Error(`Review failed: ${result.errorMessage}`);
-	}
-
-	const reviewMessage = createReviewSeedMessage(resolution, result);
-	const newSessionResult = await options.newSession({
-		withSession: async (ctx: ReplacedSessionContext) => {
-			await ctx.sendMessage(reviewMessage);
-		},
-	});
-	if (newSessionResult.cancelled) {
-		await options.session.sendCustomMessage(reviewMessage);
-	}
-	return {
-		status: "completed",
-		resolution,
-		findingsCount: result.parsed?.findings.length,
-		sessionSwitchCancelled: newSessionResult.cancelled,
+	const emitEvent = (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent): void => {
+		options.onEvent?.(event);
+		hooks?.onEvent?.(event);
 	};
+
+	emitReviewWorkflowEvent(emitEvent, {
+		type: "workflow_start",
+		workflowId,
+		kind: "review",
+		action: workflowAction,
+		title: "Review",
+		message: `Reviewing ${resolution.description}.`,
+		status: "running",
+	});
+
+	let terminalWorkflowEmitted = false;
+	const emitTerminalWorkflowEvent = (event: Extract<ReviewWorkflowEvent, { type: "workflow_end" }>): void => {
+		terminalWorkflowEmitted = true;
+		emitReviewWorkflowEvent(emitEvent, event);
+	};
+
+	try {
+		let result: ReviewRunResult;
+		try {
+			result = await runReview({
+				cwd: options.cwd,
+				agentDir: options.agentDir,
+				model,
+				thinkingLevel: options.session.thinkingLevel,
+				authStorage: options.authStorage,
+				modelRegistry: options.session.modelRegistry,
+				settingsManager: options.settingsManager,
+				resolved: resolution,
+				parentResourceLoader: options.session.resourceLoader,
+				tools: options.tools ? [...options.tools] : undefined,
+				signal: hooks?.signal,
+				onProgress: hooks?.onProgress,
+				onEvent: emitEvent,
+				workflowId,
+				workflowAction,
+			});
+		} finally {
+			hooks?.cleanup?.();
+		}
+
+		if (result.aborted || hooks?.signal?.aborted) {
+			emitTerminalWorkflowEvent({
+				type: "workflow_end",
+				workflowId,
+				kind: "review",
+				action: workflowAction,
+				title: "Review",
+				message: "Review cancelled.",
+				status: "cancelled",
+			});
+			return { status: "cancelled", resolution };
+		}
+		if (result.errorMessage) {
+			emitTerminalWorkflowEvent({
+				type: "workflow_end",
+				workflowId,
+				kind: "review",
+				action: workflowAction,
+				title: "Review",
+				message: `Review failed: ${result.errorMessage}`,
+				status: "failed",
+			});
+			throw new Error(`Review failed: ${result.errorMessage}`);
+		}
+
+		emitReviewWorkflowEvent(emitEvent, {
+			type: "workflow_update",
+			workflowId,
+			kind: "review",
+			action: workflowAction,
+			title: "Review",
+			message: "Finalizing findings.",
+			status: "finalizing",
+		});
+
+		const reviewMessage = createReviewSeedMessage(resolution, result);
+		const newSessionResult = await options.newSession({
+			withSession: async (ctx: ReplacedSessionContext) => {
+				await ctx.sendMessage(reviewMessage);
+			},
+		});
+		if (newSessionResult.cancelled) {
+			await options.session.sendCustomMessage(reviewMessage);
+		}
+		const completedResult = {
+			status: "completed" as const,
+			resolution,
+			findingsCount: result.parsed?.findings.length,
+			sessionSwitchCancelled: newSessionResult.cancelled,
+		};
+		emitTerminalWorkflowEvent({
+			type: "workflow_end",
+			workflowId,
+			kind: "review",
+			action: workflowAction,
+			title: "Review",
+			message: newSessionResult.cancelled
+				? `${formatReviewWorkflowSummary(completedResult)} Findings were added to the current session.`
+				: `${formatReviewWorkflowSummary(completedResult)} Opening review session.`,
+			status: "completed",
+		});
+		return completedResult;
+	} catch (error) {
+		if (!terminalWorkflowEmitted) {
+			emitTerminalWorkflowEvent({
+				type: "workflow_end",
+				workflowId,
+				kind: "review",
+				action: workflowAction,
+				title: "Review",
+				message: "Review failed.",
+				status: "failed",
+			});
+		}
+		throw error;
+	}
 }
 
 export function formatReviewWorkflowSummary(result: Extract<ReviewWorkflowResult, { status: "completed" }>): string {
@@ -1019,6 +1181,106 @@ function summarizeToolArgs(args: unknown): string | undefined {
 	return undefined;
 }
 
+const REVIEW_WORKFLOW_ARG_STRING_LIMIT = 240;
+
+function createReviewWorkflowToolCallId(workflowId: string | undefined, toolCallId: unknown): string {
+	const id = typeof toolCallId === "string" && toolCallId.trim() ? toolCallId.trim() : "unknown";
+	return workflowId ? `${workflowId}:${id}` : id;
+}
+
+function sanitizeReviewWorkflowToolArgs(
+	toolName: string | undefined,
+	args: unknown,
+): Record<string, unknown> | undefined {
+	if (typeof args !== "object" || args === null || Array.isArray(args)) {
+		return undefined;
+	}
+	const record = args as Record<string, unknown>;
+	const normalizedToolName = toolName?.trim().toLowerCase();
+	const keysByTool: Record<string, string[]> = {
+		read: ["path", "file_path", "offset", "limit"],
+		grep: ["pattern", "path", "glob", "ignoreCase", "literal", "context", "limit"],
+		find: ["pattern", "query", "path", "limit"],
+		ls: ["path", "limit"],
+		bash: ["command"],
+		lsp: ["action", "symbol", "line", "path"],
+	};
+	const allowedKeys = keysByTool[normalizedToolName ?? ""] ?? [
+		"action",
+		"command",
+		"file_path",
+		"glob",
+		"line",
+		"path",
+		"pattern",
+		"query",
+		"symbol",
+	];
+	const sanitized: Record<string, unknown> = {};
+	for (const key of allowedKeys) {
+		if (!Object.hasOwn(record, key)) {
+			continue;
+		}
+		const value = sanitizeReviewWorkflowArgValue(record[key]);
+		if (value !== undefined) {
+			sanitized[key] = value;
+		}
+	}
+	return Object.keys(sanitized).length > 0 ? sanitized : undefined;
+}
+
+function sanitizeReviewWorkflowArgValue(value: unknown): string | number | boolean | undefined {
+	if (typeof value === "string") {
+		const trimmed = value.replace(/\s+/g, " ").trim();
+		if (!trimmed) {
+			return undefined;
+		}
+		return trimmed.length <= REVIEW_WORKFLOW_ARG_STRING_LIMIT
+			? trimmed
+			: `${trimmed.slice(0, REVIEW_WORKFLOW_ARG_STRING_LIMIT - 1)}…`;
+	}
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return value;
+	}
+	if (typeof value === "boolean") {
+		return value;
+	}
+	return undefined;
+}
+
+function emitReviewWorkflowToolEvent(
+	emit: ((event: ReviewWorkflowToolEvent) => void) | undefined,
+	options: Pick<RunReviewOptions, "workflowId" | "workflowAction">,
+	event: { type: string; toolCallId?: string; toolName?: string; args?: unknown; isError?: boolean },
+): void {
+	if (!emit || !options.workflowId || !options.workflowAction || !event.toolName) {
+		return;
+	}
+	if (event.type === "tool_execution_start") {
+		emit({
+			type: "tool_execution_start",
+			workflowId: options.workflowId,
+			workflowKind: "review",
+			workflowAction: options.workflowAction,
+			toolCallId: createReviewWorkflowToolCallId(options.workflowId, event.toolCallId),
+			toolName: event.toolName,
+			args: sanitizeReviewWorkflowToolArgs(event.toolName, event.args),
+		});
+		return;
+	}
+	if (event.type === "tool_execution_end") {
+		emit({
+			type: "tool_execution_end",
+			workflowId: options.workflowId,
+			workflowKind: "review",
+			workflowAction: options.workflowAction,
+			toolCallId: createReviewWorkflowToolCallId(options.workflowId, event.toolCallId),
+			toolName: event.toolName,
+			isError: event.isError === true,
+		});
+	}
+}
+
 /**
  * Run a review in an isolated in-process agent session.
  * The session is in-memory (not persisted) and disposed when done.
@@ -1056,6 +1318,9 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 		if (event.type === "tool_execution_start") {
 			const summary = summarizeToolArgs(event.args);
 			options.onProgress?.(summary ? `${event.toolName}: ${summary}` : event.toolName);
+			emitReviewWorkflowToolEvent(options.onEvent, options, event);
+		} else if (event.type === "tool_execution_end") {
+			emitReviewWorkflowToolEvent(options.onEvent, options, event);
 		}
 	});
 

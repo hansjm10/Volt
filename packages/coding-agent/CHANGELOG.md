@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added host-initiated RPC action requests so clients can approve blocking host workflows; missing trusted LSP server binaries can now prompt for installation, run the host-owned install command, and retry diagnostics.
 - Added Pi extension package compatibility: `volt install` now reads `pi` manifests when no `volt` manifest is present and aliases Pi core imports to Volt modules at extension load time.
 - Added an experimental first-time setup flow behind `PI_EXPERIMENTAL=1` that asks for a dark/light theme choice (preselecting the detected appearance) and opt-in analytics data sharing on first launch with the default agent directory; opting in stores a `trackingId` in `settings.json`.
 - Added native LSP diagnostics: a config-driven multi-server manager spawns language servers lazily and appends diagnostics to `edit`/`write` tool results. It is enabled by default; configure servers via `lsp.servers` or set `lsp.enabled` to `false` to disable. See [LSP Diagnostics](docs/lsp.md).
@@ -47,9 +48,11 @@
 
 ### Fixed
 
+- Fixed Iroh remote host default tool grants to keep loaded extension tools available to the remote runtime.
 - Fixed fuzzy `edit` matches so they only replace the targeted range and no longer normalize unrelated file content.
 - Fixed Iroh remote Live Activity updates to report new turns as running and keep completed activities updateable for continued conversations.
 - Fixed Iroh remote host control socket setup to harden the shared control root directory before binding per-state sockets.
+- Fixed Iroh remote host startup to avoid leaking `listening` event listeners while retrying an already-active control socket.
 - Fixed Iroh remote host startup to preserve saved workspace tool allowlists unless `--allow-tools` is explicitly passed.
 - Fixed Iroh remote RPC transports to reject oversized inbound JSONL lines instead of buffering them without bound.
 - Fixed Iroh remote host control sockets to live under state-specific owner-only directories.

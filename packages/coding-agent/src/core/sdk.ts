@@ -8,6 +8,7 @@ import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { AuthStorage } from "./auth-storage.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
+import type { HostInteraction } from "./host-interaction.ts";
 import { resolveLspConfig } from "./lsp/config.ts";
 import { convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
@@ -67,6 +68,8 @@ export interface CreateAgentSessionOptions {
 	 * When provided, only the listed tool names are enabled.
 	 */
 	tools?: string[];
+	/** Allow extension and SDK custom tools even when they are absent from `tools`. */
+	allowUnlistedExtensionTools?: boolean;
 	/** Optional denylist of tool names to disable. Applies after `tools` when both are provided. */
 	excludeTools?: string[];
 	/** Custom tools to register (in addition to built-in tools). */
@@ -84,6 +87,8 @@ export interface CreateAgentSessionOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Optional host interaction bridge for blocking host-initiated actions. */
+	hostInteraction?: HostInteraction;
 }
 
 /** Result from createAgentSession */
@@ -394,9 +399,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		modelRegistry,
 		initialActiveToolNames,
 		allowedToolNames,
+		allowUnlistedExtensionTools: options.allowUnlistedExtensionTools,
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
+		hostInteraction: options.hostInteraction,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 

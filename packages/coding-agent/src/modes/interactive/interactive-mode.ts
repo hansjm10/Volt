@@ -82,6 +82,7 @@ import {
 	SESSION_NEW_SLASH_ALIAS,
 	SESSION_RENAME_SLASH_ALIAS,
 } from "../../core/host-actions.ts";
+import type { HostActionRequest, HostActionUpdate, HostInteraction } from "../../core/host-interaction.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
@@ -478,6 +479,7 @@ export class InteractiveMode {
 		// Register themes from resource loader and initialize
 		setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
 		initTheme(this.settingsManager.getTheme(), true);
+		this.session.setHostInteraction(this.createHostInteraction());
 	}
 
 	private async detectThemeIfUnset(): Promise<void> {
@@ -1735,6 +1737,7 @@ export class InteractiveMode {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.applyRuntimeSettings();
+		this.session.setHostInteraction(this.createHostInteraction());
 		await this.bindCurrentSessionExtensions();
 		this.subscribeToAgent();
 		await this.updateAvailableProviderCount();
@@ -2166,6 +2169,42 @@ export class InteractiveMode {
 				notify: ui.notify,
 			},
 		};
+	}
+
+	private createHostInteraction(): HostInteraction {
+		return {
+			requestAction: (request, options) => this.requestHostAction(request, options),
+			updateAction: (update) => this.updateHostAction(update),
+		};
+	}
+
+	private async requestHostAction(
+		request: HostActionRequest,
+		options?: { signal?: AbortSignal },
+	): Promise<{ decision: "approved" | "denied" | "dismissed" }> {
+		if (options?.signal?.aborted) {
+			return { decision: "dismissed" };
+		}
+		const details = [request.message, request.commandPreview ? `Command: ${request.commandPreview}` : undefined]
+			.filter((line): line is string => line !== undefined && line.length > 0)
+			.join("\n\n");
+		const confirmed = await this.showExtensionConfirm(request.title, details, {
+			signal: options?.signal,
+			timeout: request.timeoutMs,
+		});
+		return { decision: confirmed ? "approved" : "denied" };
+	}
+
+	private updateHostAction(update: HostActionUpdate): void {
+		if (update.status === "running") {
+			this.showStatus(update.message ?? "Running host action...");
+		} else if (update.status === "completed") {
+			this.showStatus(update.message ?? "Host action completed");
+		} else if (update.status === "failed") {
+			this.showWarning(update.message ?? "Host action failed");
+		} else if (update.status === "cancelled") {
+			this.showStatus(update.message ?? "Host action cancelled");
+		}
 	}
 
 	private createExtensionUIContext(): ExtensionUIContext {

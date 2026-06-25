@@ -1,4 +1,5 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -52,6 +53,7 @@ import {
 	IrohRemoteHostStateManager,
 	type IrohRemoteTicketPayload,
 	type IrohRemoteWorkspace,
+	listenIrohRemoteControlServer,
 	parseIrohRemoteHandshakeResponseLine,
 	parseIrohRemoteHelloLine,
 	parseIrohRemoteHostState,
@@ -233,6 +235,19 @@ function nextTick(): Promise<void> {
 	return new Promise((resolve) => setImmediate(resolve));
 }
 
+async function closeListeningServer(server: Server): Promise<void> {
+	if (!server.listening) return;
+	await new Promise<void>((resolveClose, rejectClose) => {
+		server.close((error) => {
+			if (error) {
+				rejectClose(error);
+				return;
+			}
+			resolveClose();
+		});
+	});
+}
+
 function makeHello(workspace: string, secret?: string, clientLabel = "phone"): IrohRemoteHello {
 	return parseIrohRemoteHelloLine(
 		JSON.stringify({
@@ -388,6 +403,38 @@ describe("Iroh remote core helpers", () => {
 				process.env.TMPDIR = previousTmpdir;
 			}
 			await rm(tmpRoot, { force: true, recursive: true });
+		}
+	});
+
+	test("cleans failed remote control listen listeners before retrying active sockets", async () => {
+		if (process.platform === "win32") {
+			return;
+		}
+
+		const controlDir = await mkdtemp(join(tmpdir(), "volt-iroh-core-control-listen-"));
+		const controlPath = join(controlDir, "control.sock");
+		const activeServer = createServer((socket) => {
+			socket.end();
+		});
+		const retryingServer = createServer();
+		try {
+			await new Promise<void>((resolveListen, rejectListen) => {
+				activeServer.once("error", rejectListen);
+				activeServer.listen(controlPath, resolveListen);
+			});
+
+			await expect(
+				listenIrohRemoteControlServer(retryingServer, controlPath, {
+					activeRetryAttempts: 12,
+					activeRetryDelayMs: 1,
+				}),
+			).rejects.toThrow("Iroh remote host control channel is already active");
+			expect(retryingServer.listenerCount("listening")).toBe(0);
+			expect(retryingServer.listenerCount("error")).toBe(0);
+		} finally {
+			await closeListeningServer(activeServer);
+			retryingServer.removeAllListeners();
+			await rm(controlDir, { force: true, recursive: true });
 		}
 	});
 
@@ -613,6 +660,9 @@ describe("Iroh remote core helpers", () => {
 			"follow_up",
 			"abort",
 			"new_session",
+			"set_client_capabilities",
+			"get_pending_host_actions",
+			"host_action_response",
 			"get_state",
 			"get_transcript",
 			"get_ui_capabilities",

@@ -537,8 +537,8 @@ volt remote host --workspace volt=/path/to/repo --no-pairing
 
 Security defaults and limitations:
 
-- Default remote tools are read-only: `read,grep,find,ls`.
-- Granting `bash`, `edit`, or `write` can modify the host or run shell commands. TTY host startup asks for confirmation and offers `trust` to continue while trusting workspace resources; noninteractive unsafe grants require `--yes`.
+- The default remote tool grant enables built-in `read,bash,edit,write,grep,find,ls` plus active tools registered by loaded extensions. Custom grants that differ from the default built-in list are strict; name extension tools explicitly when using one.
+- Granting `bash`, `edit`, or `write` can modify the host or run shell commands. Extension tools run code installed on the host and may do the same. TTY host startup asks for confirmation and offers `trust` to continue while trusting workspace resources; noninteractive unsafe grants require `--yes`.
 - Pairing tickets are short-lived, one-time credentials. `volt remote host` shows the startup ticket as a terminal QR code by default when stderr is a TTY. `volt remote pair` requires a running host control channel; it does not generate offline tickets from persisted state.
 - Remote workspaces are selected by saved name, not arbitrary client-provided paths.
 - Remote sessions do not bypass project trust. Saved workspace trust is honored; otherwise use the host prompt's `trust` option or `--approve` only when the host user trusts the workspace resources.

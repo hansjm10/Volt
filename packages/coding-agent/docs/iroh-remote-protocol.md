@@ -107,7 +107,7 @@ Client-local reconnect outcomes are not sent by the host: `host_unreachable` mea
 
 `client_revoked` remains authoritative for a revoked client node ID. A generic new pairing ticket does not let that same node silently return. The desktop host must first approve re-pair for the revoked node ID, then issue a fresh active pairing ticket; successful re-pair creates a new active client record and clears the revocation tombstone.
 
-A successful pairing stores the client as authorized for the workstation represented by the host state file. That paired client can use any registered workspace name in that state file, including workspaces registered later, without scanning another QR. Revocation blocks that client node ID from every registered workspace. The client's persisted `allowedTools` grant applies across all selected workspaces; registering a workspace does not add tools.
+A successful pairing stores the client as authorized for the workstation represented by the host state file. That paired client can use any registered workspace name in that state file, including workspaces registered later, without scanning another QR. Revocation blocks that client node ID from every registered workspace. The client's persisted `allowedTools` grant applies across all selected workspaces; registering a workspace does not add built-in tools. When the persisted grant is the default built-in list, the host also exposes active tools registered by loaded extensions in the selected workspace.
 
 A paired client may have only one active connection per workspace in v1 preview. If the same authoritative client node ID connects to the same workspace while a previous connection is still active, the host rejects the new stream with a normal handshake failure response whose `error` is `client already connected`; the existing connection remains active.
 
@@ -224,7 +224,7 @@ Remote clients should use `get_ui_actions` rather than `get_commands` to build n
 
 Projected extension command, prompt-template, and skill actions execute through the host's existing prompt/command expansion path. Extension UI requests raised during those commands continue to use the existing `extension_ui_request` / `extension_ui_response` protocol. RPC-degraded extension UI methods keep the behavior documented in [RPC mode](rpc.md#extension-ui-protocol); Iroh does not add terminal-only UI support.
 
-Remote review descriptors expose only bounded card metadata. Review invocation responses do not include raw diffs, GitHub metadata, configured review model values, auth state, or tool provenance. The remote review workflow uses the host-owned read-only review tool set (`read`, `grep`, `find`, `ls`) and creates a fresh session seeded with findings when the review completes.
+Remote review descriptors expose only bounded card metadata. Review invocation responses do not include raw diffs, GitHub metadata, configured review model values, auth state, or raw tool output. While review runs, the host may emit `workflow_start`, sanitized workflow-scoped `tool_execution_start`/`tool_execution_end`, `workflow_update`, and `workflow_end` events so clients can render a live progress timeline. These activity events include bounded tool names and arguments only; raw read contents, grep output, review prompts, and diffs remain hidden. The remote review workflow uses the host-owned read-only review tool set (`read`, `grep`, `find`, `ls`) and creates a fresh session seeded with findings when the review completes.
 
 Remote Fast mode descriptors expose only bounded toggle metadata and current boolean state. `thinking.fast_mode` invocation accepts a boolean `enabled` argument, changes only the current session's thinking level without persisting defaults or switching models, and returns updated action state. Direct model and thinking RPC commands, including `get_available_models`, `set_model`, `set_thinking_level`, and `cycle_thinking_level`, remain outside the remote allowlist.
 
@@ -240,7 +240,7 @@ The path-based `switch_session` command remains blocked remotely; remote clients
 - `get_available_models` exposes provider/model availability while remote model selection remains unsupported.
 - `set_model`, `set_thinking_level`, and `cycle_thinking_level` directly mutate local model/thinking state; remote clients must use reviewed native actions such as `thinking.fast_mode` instead.
 
-Tool access and RPC command access are separate surfaces. `allowedTools` controls which tools the host-side model may invoke; this allowlist controls which JSONL commands a remote client may send directly.
+Tool access and RPC command access are separate surfaces. `allowedTools` controls which listed built-in or extension tools the host-side model may invoke, with active extension tools also exposed for the default built-in grant; this allowlist controls which JSONL commands a remote client may send directly.
 
 ## Outbound path handling
 

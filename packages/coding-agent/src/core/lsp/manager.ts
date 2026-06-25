@@ -6,16 +6,19 @@
  * results. Server start failures are reported once and then suppressed.
  */
 
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { rename as fsRename, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, extname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { HostInteraction } from "../host-interaction.ts";
 import type { ToolDiagnosticsProvider } from "../tools/diagnostics-provider.ts";
 import { withFileMutationQueue } from "../tools/file-mutation-queue.ts";
 import type { LspNavigationProvider } from "../tools/lsp.ts";
 import { LspClient, type LspDiagnostic, type LspPosition, type LspRange } from "./client.ts";
 import {
-	installHintForCommand,
+	type LspInstallRecipe,
 	type ResolvedLspConfig,
 	type ResolvedLspServerConfig,
 	SEVERITY_NAMES,
@@ -31,7 +34,25 @@ import {
 export interface LspManagerOptions {
 	cwd: string;
 	config: ResolvedLspConfig;
+	hostInteraction?: HostInteraction;
+	installRunner?: LspInstallRunner;
 }
+
+export interface LspInstallCommandOptions {
+	cwd: string;
+	signal?: AbortSignal;
+	onChunk?: (chunk: string) => void;
+}
+
+export interface LspInstallCommandResult {
+	exitCode: number | null;
+	output: string;
+}
+
+export type LspInstallRunner = (
+	command: readonly string[],
+	options: LspInstallCommandOptions,
+) => Promise<LspInstallCommandResult>;
 
 export interface LspServerStatus {
 	name: string;
@@ -47,10 +68,19 @@ interface ServerFailureState {
 	reported: boolean;
 }
 
+type LspClientErrorResult = { retry: true } | { retry: false; message?: string };
+
+interface LspInstallAttemptResult {
+	retry: boolean;
+	message?: string;
+}
+
 const MAX_START_ATTEMPTS = 3;
 const MAX_REFERENCES = 50;
 const MAX_SYMBOL_LINES = 200;
 const MAX_CROSS_FILE_REPORTS = 5;
+const LSP_INSTALL_REQUEST_TIMEOUT_MS = 10 * 60_000;
+const MAX_INSTALL_OUTPUT_CHARS = 12000;
 
 function uriToPath(uri: string): string {
 	try {
@@ -156,6 +186,97 @@ function positionLeq(a: LspPosition, b: LspPosition): boolean {
 
 function rangesOverlap(a: LspRange, b: LspRange): boolean {
 	return positionLeq(a.start, b.end) && positionLeq(b.start, a.end);
+}
+
+function quoteWindowsArg(arg: string): string {
+	return /\s/.test(arg) ? `"${arg.replace(/"/g, '\\"')}"` : arg;
+}
+
+function appendBoundedOutput(current: string, chunk: string): string {
+	const next = current + chunk;
+	if (next.length <= MAX_INSTALL_OUTPUT_CHARS) {
+		return next;
+	}
+	return next.slice(next.length - MAX_INSTALL_OUTPUT_CHARS);
+}
+
+function commandToDisplay(command: readonly string[]): string {
+	return command.map((arg) => (/\s/.test(arg) ? JSON.stringify(arg) : arg)).join(" ");
+}
+
+export function runDefaultLspInstallCommand(
+	command: readonly string[],
+	options: LspInstallCommandOptions,
+): Promise<LspInstallCommandResult> {
+	if (command.length === 0) {
+		return Promise.reject(new Error("LSP install command cannot be empty"));
+	}
+	if (options.signal?.aborted) {
+		return Promise.reject(new Error("LSP server install aborted"));
+	}
+
+	return new Promise((resolve, reject) => {
+		let output = "";
+		let settled = false;
+		const child =
+			process.platform === "win32"
+				? spawn(command.map(quoteWindowsArg).join(" "), {
+						cwd: options.cwd,
+						shell: true,
+						stdio: ["ignore", "pipe", "pipe"],
+						windowsHide: true,
+					})
+				: spawn(command[0], command.slice(1), {
+						cwd: options.cwd,
+						stdio: ["ignore", "pipe", "pipe"],
+					});
+
+		const cleanup = (): void => {
+			options.signal?.removeEventListener("abort", onAbort);
+		};
+		const finish = (result: LspInstallCommandResult): void => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			cleanup();
+			resolve(result);
+		};
+		const fail = (error: Error): void => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			cleanup();
+			reject(error);
+		};
+		function onAbort(): void {
+			try {
+				child.kill();
+			} catch {
+				// Process already exited.
+			}
+			fail(new Error("LSP server install aborted"));
+		}
+
+		child.stdout?.on("data", (chunk: Buffer) => {
+			const text = chunk.toString("utf-8");
+			output = appendBoundedOutput(output, text);
+			options.onChunk?.(text);
+		});
+		child.stderr?.on("data", (chunk: Buffer) => {
+			const text = chunk.toString("utf-8");
+			output = appendBoundedOutput(output, text);
+			options.onChunk?.(text);
+		});
+		child.once("error", (error) => {
+			fail(new Error(`Failed to run LSP install command "${commandToDisplay(command)}": ${error.message}`));
+		});
+		child.once("close", (code) => {
+			finish({ exitCode: code, output });
+		});
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 /** Normalize codeAction results: bare Commands and CodeAction literals. */
@@ -271,6 +392,10 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	private config: ResolvedLspConfig;
 	private clients = new Map<string, LspClient>();
 	private startFailures = new Map<string, ServerFailureState>();
+	private hostInteraction: HostInteraction | undefined;
+	private installRunner: LspInstallRunner;
+	private installPromptsUsed = new Set<string>();
+	private installAttempts = new Map<string, Promise<LspInstallAttemptResult>>();
 	private disposed = false;
 	/** Summaries of WorkspaceEdits applied via server-initiated workspace/applyEdit */
 	private serverApplyEditSummaries: string[] = [];
@@ -281,6 +406,8 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	constructor(options: LspManagerOptions) {
 		this.cwd = options.cwd;
 		this.config = options.config;
+		this.hostInteraction = options.hostInteraction;
+		this.installRunner = options.installRunner ?? runDefaultLspInstallCommand;
 		if (this.config.traceFile) {
 			this.tracer = new LspTracer(this.config.traceFile);
 		}
@@ -289,6 +416,10 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			this.idleTimer = setInterval(() => this.shutdownIdleClients(), checkIntervalMs);
 			this.idleTimer.unref();
 		}
+	}
+
+	setHostInteraction(hostInteraction: HostInteraction | undefined): void {
+		this.hostInteraction = hostInteraction;
 	}
 
 	/** Status of all spawned language servers. */
@@ -329,6 +460,8 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		this.clients.clear();
 		this.lastUsedAt.clear();
 		this.startFailures.clear();
+		this.installPromptsUsed.clear();
+		this.installAttempts.clear();
 		return count;
 	}
 
@@ -365,36 +498,45 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		if (!server) {
 			return undefined;
 		}
-		const failure = this.startFailures.get(server.name);
-		if (failure && failure.count >= MAX_START_ATTEMPTS) {
-			return undefined;
+
+		while (!this.disposed) {
+			const failure = this.startFailures.get(server.name);
+			if (failure && failure.count >= MAX_START_ATTEMPTS) {
+				return undefined;
+			}
+
+			const client = this.getClient(server, absolutePath);
+			const cleanBefore = this.collectCleanOpenDocuments(client, absolutePath);
+			let diagnostics: LspDiagnostic[];
+			try {
+				diagnostics = await client.getDiagnostics(
+					absolutePath,
+					content,
+					this.config.settleMs,
+					this.config.firstSettleMs,
+					signal,
+				);
+			} catch (error) {
+				const result = await this.handleClientError(server, client, error, signal);
+				if (result.retry) {
+					continue;
+				}
+				return result.message;
+			}
+			if (this.disposed) {
+				return undefined;
+			}
+			this.startFailures.delete(server.name);
+
+			const ownDiagnostics = this.formatDiagnostics(absolutePath, diagnostics);
+			const crossFile = this.formatNewlyFailing(client, absolutePath, cleanBefore);
+			if (ownDiagnostics && crossFile) {
+				return `${ownDiagnostics}\n${crossFile}`;
+			}
+			return ownDiagnostics ?? crossFile;
 		}
 
-		const client = this.getClient(server, absolutePath);
-		const cleanBefore = this.collectCleanOpenDocuments(client, absolutePath);
-		let diagnostics: LspDiagnostic[];
-		try {
-			diagnostics = await client.getDiagnostics(
-				absolutePath,
-				content,
-				this.config.settleMs,
-				this.config.firstSettleMs,
-				signal,
-			);
-		} catch (error) {
-			return this.handleClientError(server, client, error);
-		}
-		if (this.disposed) {
-			return undefined;
-		}
-		this.startFailures.delete(server.name);
-
-		const ownDiagnostics = this.formatDiagnostics(absolutePath, diagnostics);
-		const crossFile = this.formatNewlyFailing(client, absolutePath, cleanBefore);
-		if (ownDiagnostics && crossFile) {
-			return `${ownDiagnostics}\n${crossFile}`;
-		}
-		return ownDiagnostics ?? crossFile;
+		return undefined;
 	}
 
 	/** Paths of other open documents that currently have no reportable diagnostics. */
@@ -449,6 +591,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		}
 		this.clients.clear();
 		this.lastUsedAt.clear();
+		this.installAttempts.clear();
 		this.tracer?.dispose();
 		this.tracer = undefined;
 	}
@@ -474,7 +617,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	}
 
 	async hover(absolutePath: string, symbol: string, line?: number, signal?: AbortSignal): Promise<string> {
-		const session = await this.openSession(absolutePath);
+		const session = await this.openSession(absolutePath, signal);
 		if ("error" in session) {
 			return session.error;
 		}
@@ -496,7 +639,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	}
 
 	async documentSymbols(absolutePath: string, signal?: AbortSignal): Promise<string> {
-		const session = await this.openSession(absolutePath);
+		const session = await this.openSession(absolutePath, signal);
 		if ("error" in session) {
 			return session.error;
 		}
@@ -528,7 +671,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		line?: number,
 		signal?: AbortSignal,
 	): Promise<string> {
-		const session = await this.openSession(absolutePath);
+		const session = await this.openSession(absolutePath, signal);
 		if ("error" in session) {
 			return session.error;
 		}
@@ -577,7 +720,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	}
 
 	async workspaceSymbols(absolutePath: string, query: string, signal?: AbortSignal): Promise<string> {
-		const session = await this.openSession(absolutePath);
+		const session = await this.openSession(absolutePath, signal);
 		if ("error" in session) {
 			return session.error;
 		}
@@ -615,7 +758,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	async fileDiagnostics(absolutePath: string, signal?: AbortSignal): Promise<string> {
 		// openSession applies the start-failure breaker and failure accounting,
 		// so a broken server is not respawned on every diagnostics request.
-		const session = await this.openSession(absolutePath);
+		const session = await this.openSession(absolutePath, signal);
 		if ("error" in session) {
 			return session.error;
 		}
@@ -643,7 +786,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		line?: number,
 		signal?: AbortSignal,
 	): Promise<string> {
-		const session = await this.openSession(absolutePath);
+		const session = await this.openSession(absolutePath, signal);
 		if ("error" in session) {
 			return session.error;
 		}
@@ -677,14 +820,10 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	}
 
 	/** Route a file to its server, read it from disk, and sync it. Returns an error message on failure. */
-	private async openSession(absolutePath: string): Promise<DocumentSession> {
+	private async openSession(absolutePath: string, signal?: AbortSignal): Promise<DocumentSession> {
 		const server = this.findServer(absolutePath);
 		if (!server) {
 			return { error: this.noServerMessage(absolutePath) };
-		}
-		const failure = this.startFailures.get(server.name);
-		if (failure && failure.count >= MAX_START_ATTEMPTS) {
-			return { error: `lsp(${server.name}): server unavailable after ${failure.count} failed starts.` };
 		}
 		let content: string;
 		try {
@@ -694,18 +833,31 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 				error: `Could not read ${this.displayPath(absolutePath)}: ${error instanceof Error ? error.message : String(error)}`,
 			};
 		}
-		const client = this.getClient(server, absolutePath);
-		try {
-			const uri = await client.openDocument(absolutePath, content);
-			await this.refreshStale(client, absolutePath);
-			this.startFailures.delete(server.name);
-			return { client, uri, content };
-		} catch (error) {
-			const reported = this.handleClientError(server, client, error);
-			return {
-				error: reported ?? `lsp(${server.name}): ${error instanceof Error ? error.message : String(error)}`,
-			};
+
+		while (!this.disposed) {
+			const failure = this.startFailures.get(server.name);
+			if (failure && failure.count >= MAX_START_ATTEMPTS) {
+				return { error: `lsp(${server.name}): server unavailable after ${failure.count} failed starts.` };
+			}
+			const client = this.getClient(server, absolutePath);
+			try {
+				const uri = await client.openDocument(absolutePath, content);
+				await this.refreshStale(client, absolutePath);
+				this.startFailures.delete(server.name);
+				return { client, uri, content };
+			} catch (error) {
+				const result = await this.handleClientError(server, client, error, signal);
+				if (result.retry) {
+					continue;
+				}
+				return {
+					error:
+						result.message ?? `lsp(${server.name}): ${error instanceof Error ? error.message : String(error)}`,
+				};
+			}
 		}
+
+		return { error: `lsp(${server.name}): LSP manager disposed.` };
 	}
 
 	async rename(
@@ -715,7 +867,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		line?: number,
 		signal?: AbortSignal,
 	): Promise<string> {
-		const session = await this.openSession(absolutePath);
+		const session = await this.openSession(absolutePath, signal);
 		if ("error" in session) {
 			return session.error;
 		}
@@ -744,7 +896,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		options: { symbol?: string; line?: number; title?: string; kind?: string },
 		signal?: AbortSignal,
 	): Promise<string> {
-		const session = await this.openSession(absolutePath);
+		const session = await this.openSession(absolutePath, signal);
 		if ("error" in session) {
 			return session.error;
 		}
@@ -1057,13 +1209,33 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		return client;
 	}
 
-	private handleClientError(server: ResolvedLspServerConfig, client: LspClient, error: unknown): string | undefined {
+	private async handleClientError(
+		server: ResolvedLspServerConfig,
+		client: LspClient,
+		error: unknown,
+		signal?: AbortSignal,
+	): Promise<LspClientErrorResult> {
 		const message = error instanceof Error ? error.message : String(error);
 		if (client.isAlive && !client.startFailed) {
 			// Request-level failure on a started, healthy server: report it without
 			// counting toward the start-failure breaker.
-			return `lsp(${server.name}): ${message}`;
+			return { retry: false, message: `lsp(${server.name}): ${message}` };
 		}
+
+		this.removeFailedClient(client);
+		const existingFailure = this.startFailures.get(server.name);
+		if (!this.disposed && !existingFailure?.reported && message.includes("ENOENT")) {
+			const installResult = await this.tryInstallMissingServer(server, signal);
+			if (installResult.retry) {
+				return { retry: true };
+			}
+			return { retry: false, message: this.recordStartFailure(server, message, installResult.message) };
+		}
+
+		return { retry: false, message: this.recordStartFailure(server, message) };
+	}
+
+	private removeFailedClient(client: LspClient): void {
 		// Remove and dispose the failed client (this also kills a process stuck
 		// in the handshake) so the next call attempts a genuinely fresh start
 		// instead of replaying the memoized failure.
@@ -1074,6 +1246,13 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			}
 		}
 		client.dispose();
+	}
+
+	private recordStartFailure(
+		server: ResolvedLspServerConfig,
+		message: string,
+		extraMessage?: string,
+	): string | undefined {
 		const failure = this.startFailures.get(server.name) ?? { count: 0, reported: false };
 		failure.count++;
 		this.startFailures.set(server.name, failure);
@@ -1081,8 +1260,131 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			return undefined;
 		}
 		failure.reported = true;
-		const hint = message.includes("ENOENT") ? installHintForCommand(server.command) : undefined;
-		return `lsp(${server.name}): ${message}${hint ? `. ${hint}` : ""} (further failures for this server will be silent)`;
+		const hint = message.includes("ENOENT") ? server.installHint : undefined;
+		const extra = extraMessage ? `. ${extraMessage}` : "";
+		return `lsp(${server.name}): ${message}${hint ? `. ${hint}` : ""}${extra} (further failures for this server will be silent)`;
+	}
+
+	private async tryInstallMissingServer(
+		server: ResolvedLspServerConfig,
+		signal?: AbortSignal,
+	): Promise<LspInstallAttemptResult> {
+		const recipe = server.installRecipe;
+		const interaction = this.hostInteraction;
+		const existing = this.installAttempts.get(server.name);
+		if (existing) {
+			return existing.catch((error: unknown) => this.createInstallAttemptFailure(error));
+		}
+		if (!recipe || !interaction || this.installPromptsUsed.has(server.name)) {
+			return { retry: false };
+		}
+
+		const attempt = this.runInstallPrompt(server, recipe, interaction, signal).finally(() => {
+			this.installAttempts.delete(server.name);
+		});
+		this.installAttempts.set(server.name, attempt);
+		return attempt.catch((error: unknown) => this.createInstallAttemptFailure(error));
+	}
+
+	private createInstallAttemptFailure(error: unknown): LspInstallAttemptResult {
+		return {
+			retry: false,
+			message: `LSP install prompt failed: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+
+	private async runInstallPrompt(
+		server: ResolvedLspServerConfig,
+		recipe: LspInstallRecipe,
+		interaction: HostInteraction,
+		signal?: AbortSignal,
+	): Promise<LspInstallAttemptResult> {
+		this.installPromptsUsed.add(server.name);
+		const requestId = `lsp-install-${randomUUID()}`;
+		const decision = await interaction.requestAction(
+			{
+				id: requestId,
+				action: "lsp.install_server",
+				title: `Install ${server.name} language server?`,
+				message: `Volt tried to use LSP for ${server.name}, but ${recipe.binary} is not installed. Install it now and retry diagnostics?`,
+				confirmLabel: "Install",
+				cancelLabel: "Skip",
+				commandPreview: recipe.displayCommand,
+				blocking: true,
+				destructive: false,
+				metadata: {
+					server: server.name,
+					binary: recipe.binary,
+				},
+				timeoutMs: LSP_INSTALL_REQUEST_TIMEOUT_MS,
+			},
+			{ signal },
+		);
+
+		if (decision.decision !== "approved") {
+			return { retry: false, message: decision.message };
+		}
+		if (signal?.aborted) {
+			return { retry: false, message: "LSP install cancelled." };
+		}
+
+		await this.emitHostActionUpdate({
+			id: requestId,
+			action: "lsp.install_server",
+			status: "running",
+			message: `Running ${recipe.displayCommand}`,
+		});
+		let result: LspInstallCommandResult;
+		try {
+			result = await this.installRunner(recipe.command, { cwd: this.cwd, signal });
+		} catch (error) {
+			const message = `LSP install failed: ${error instanceof Error ? error.message : String(error)}`;
+			await this.emitHostActionUpdate({
+				id: requestId,
+				action: "lsp.install_server",
+				status: signal?.aborted ? "cancelled" : "failed",
+				message,
+			});
+			return { retry: false, message };
+		}
+
+		if (result.exitCode !== 0) {
+			const message = this.formatInstallFailure(recipe, result);
+			await this.emitHostActionUpdate({
+				id: requestId,
+				action: "lsp.install_server",
+				status: "failed",
+				message,
+				exitCode: result.exitCode,
+			});
+			return { retry: false, message };
+		}
+
+		this.startFailures.delete(server.name);
+		await this.emitHostActionUpdate({
+			id: requestId,
+			action: "lsp.install_server",
+			status: "completed",
+			message: `${server.name} language server installed. Retrying diagnostics.`,
+			exitCode: result.exitCode,
+		});
+		return { retry: true };
+	}
+
+	private formatInstallFailure(recipe: LspInstallRecipe, result: LspInstallCommandResult): string {
+		const output = result.output.trim();
+		const summary = `LSP install command failed (${recipe.displayCommand}) with exit code ${result.exitCode ?? "unknown"}.`;
+		return output ? `${summary} Output:\n${output}` : summary;
+	}
+
+	private async emitHostActionUpdate(
+		update: Parameters<NonNullable<HostInteraction["updateAction"]>>[0],
+	): Promise<void> {
+		try {
+			await this.hostInteraction?.updateAction?.(update);
+		} catch {
+			// Host action updates are advisory; do not fail the underlying LSP operation.
+		}
 	}
 
 	private formatDiagnostics(absolutePath: string, diagnostics: LspDiagnostic[]): string | undefined {

@@ -1,10 +1,11 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import type { HostActionRequest, HostActionUpdate, HostInteraction } from "../src/core/host-interaction.ts";
 import { LspClient } from "../src/core/lsp/client.ts";
-import { installHintForCommand, resolveLspConfig } from "../src/core/lsp/config.ts";
+import { installHintForCommand, installRecipeForCommand, resolveLspConfig } from "../src/core/lsp/config.ts";
 import { LspManager } from "../src/core/lsp/manager.ts";
 import { LspTracer } from "../src/core/lsp/trace.ts";
 import { applyTextEdits, normalizeWorkspaceEdit } from "../src/core/lsp/workspace-edit.ts";
@@ -26,6 +27,20 @@ async function removeTempDir(dir: string): Promise<void> {
 		}
 	}
 	rmSync(dir, { recursive: true, force: true });
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function writeFakeServerExecutable(binDir: string, binary: string): void {
+	if (process.platform === "win32") {
+		writeFileSync(join(binDir, `${binary}.cmd`), `@"${process.execPath}" "${FAKE_SERVER}" %*\r\n`);
+		return;
+	}
+	const path = join(binDir, binary);
+	writeFileSync(path, `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(FAKE_SERVER)} "$@"\n`);
+	chmodSync(path, 0o755);
 }
 
 function fakeServerConfig(options?: {
@@ -105,6 +120,7 @@ describe("resolveLspConfig", () => {
 		const typescript = config.servers.find((s) => s.name === "typescript");
 		expect(typescript?.command).toEqual(["my-ts-server", "--stdio"]);
 		expect(typescript?.fileExtensions).toContain(".ts");
+		expect(typescript?.installRecipe).toBeUndefined();
 		expect(config.servers.find((s) => s.name === "rust")).toBeUndefined();
 		expect(config.servers.find((s) => s.name === "custom")?.fileExtensions).toEqual([".zig"]);
 		expect(config.servers.find((s) => s.name === "custom")?.settings).toEqual({ custom: { level: 3 } });
@@ -122,6 +138,21 @@ describe("installHintForCommand", () => {
 			"npm install -g typescript-language-server",
 		);
 		expect(installHintForCommand(["gopls"])).toContain("go install");
+	});
+
+	it("returns trusted recipes only for reviewed install commands", () => {
+		expect(installRecipeForCommand(["typescript-language-server", "--stdio"])?.command).toEqual([
+			"npm",
+			"install",
+			"-g",
+			"typescript-language-server",
+			"typescript",
+		]);
+		expect(installRecipeForCommand([join("/tmp", "gopls")])?.displayCommand).toBe(
+			"go install golang.org/x/tools/gopls@latest",
+		);
+		expect(installHintForCommand(["clangd"])).toContain("clangd.llvm.org");
+		expect(installRecipeForCommand(["clangd"])).toBeUndefined();
 	});
 
 	it("returns undefined for unknown binaries and empty commands", () => {
@@ -638,22 +669,175 @@ describe("LspManager", () => {
 				servers: {
 					typescript: { enabled: false },
 					python: { enabled: false },
-					go: { enabled: false },
-					rust: { enabled: false },
 					// Binary name carries the hint; a missing dir guarantees ENOENT
 					// even on machines that have gopls installed.
-					missing: {
+					go: {
 						command: [join(tempDir, "no-such-dir", "gopls")],
 						fileExtensions: [".foo"],
+						rootMarkers: [],
 					},
+					rust: { enabled: false },
 				},
 			}),
 		});
 		const filePath = join(tempDir, "test.foo");
 		const first = await manager.getDiagnostics(filePath, "ERROR\n");
-		expect(first).toContain("lsp(missing):");
+		expect(first).toContain("lsp(go):");
 		expect(first).toContain("ENOENT");
 		expect(first).toContain("Install with: go install golang.org/x/tools/gopls@latest");
+	});
+
+	it("does not prompt for custom servers that use a known built-in binary", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
+		const previousPath = process.env.PATH;
+		process.env.PATH = tempDir;
+		const requests: HostActionRequest[] = [];
+		const installCommands: string[][] = [];
+		try {
+			manager = new LspManager({
+				cwd: tempDir,
+				config: resolveLspConfig({
+					enabled: true,
+					servers: {
+						typescript: { enabled: false },
+						python: { enabled: false },
+						go: { enabled: false },
+						rust: { enabled: false },
+						custom: {
+							command: ["typescript-language-server", "--stdio"],
+							fileExtensions: [".foo"],
+							rootMarkers: [],
+						},
+					},
+				}),
+				hostInteraction: {
+					requestAction: async (request) => {
+						requests.push(request);
+						return { decision: "approved" };
+					},
+				},
+				installRunner: async (command) => {
+					installCommands.push([...command]);
+					return { exitCode: 0, output: "" };
+				},
+			});
+			const filePath = join(tempDir, "test.foo");
+			const first = await manager.getDiagnostics(filePath, "ERROR\n");
+
+			expect(first).toContain("lsp(custom):");
+			expect(first).toContain("Install with: npm install -g typescript-language-server typescript");
+			expect(requests).toEqual([]);
+			expect(installCommands).toEqual([]);
+		} finally {
+			if (previousPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = previousPath;
+			}
+		}
+	});
+
+	it("prompts, installs, and retries when post-mutation diagnostics finds a missing server", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
+		const binDir = join(tempDir, "bin");
+		mkdirSync(binDir);
+		const previousPath = process.env.PATH;
+		process.env.PATH = binDir;
+		const requests: HostActionRequest[] = [];
+		const updates: HostActionUpdate[] = [];
+		const installCommands: string[][] = [];
+		const hostInteraction: HostInteraction = {
+			requestAction: async (request) => {
+				requests.push(request);
+				return { decision: "approved" };
+			},
+			updateAction: (update) => {
+				updates.push(update);
+			},
+		};
+		try {
+			manager = new LspManager({
+				cwd: tempDir,
+				config: resolveLspConfig({
+					enabled: true,
+					servers: {
+						typescript: {
+							command: ["typescript-language-server", "--stdio"],
+							fileExtensions: [".foo"],
+							rootMarkers: [],
+						},
+					},
+				}),
+				hostInteraction,
+				installRunner: async (command) => {
+					installCommands.push([...command]);
+					writeFakeServerExecutable(binDir, "typescript-language-server");
+					return { exitCode: 0, output: "installed\n" };
+				},
+			});
+			const filePath = join(tempDir, "test.foo");
+			const content = "has ERROR\n";
+			writeFileSync(filePath, content);
+
+			const result = await manager.getDiagnostics(filePath, content);
+
+			expect(result).toContain("test.foo(1,5): error: found ERROR on line 1");
+			expect(requests).toHaveLength(1);
+			expect(requests[0]).toMatchObject({
+				action: "lsp.install_server",
+				commandPreview: "npm install -g typescript-language-server typescript",
+				metadata: { server: "typescript", binary: "typescript-language-server" },
+			});
+			expect(installCommands).toEqual([["npm", "install", "-g", "typescript-language-server", "typescript"]]);
+			expect(updates.map((update) => update.status)).toEqual(["running", "completed"]);
+		} finally {
+			if (previousPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = previousPath;
+			}
+		}
+	});
+
+	it("does not repeatedly prompt after the user declines a missing server install", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
+		const previousPath = process.env.PATH;
+		process.env.PATH = tempDir;
+		const requests: HostActionRequest[] = [];
+		try {
+			manager = new LspManager({
+				cwd: tempDir,
+				config: resolveLspConfig({
+					enabled: true,
+					servers: {
+						typescript: {
+							command: ["typescript-language-server", "--stdio"],
+							fileExtensions: [".foo"],
+							rootMarkers: [],
+						},
+					},
+				}),
+				hostInteraction: {
+					requestAction: async (request) => {
+						requests.push(request);
+						return { decision: "denied" };
+					},
+				},
+			});
+			const filePath = join(tempDir, "test.foo");
+			const first = await manager.getDiagnostics(filePath, "ERROR\n");
+			const second = await manager.getDiagnostics(filePath, "ERROR\n");
+
+			expect(first).toContain("Install with: npm install -g typescript-language-server typescript");
+			expect(second).toBeUndefined();
+			expect(requests).toHaveLength(1);
+		} finally {
+			if (previousPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = previousPath;
+			}
+		}
 	});
 });
 

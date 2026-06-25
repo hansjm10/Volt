@@ -10,6 +10,7 @@ import type { Api, ImageContent, Model } from "@earendil-works/volt-ai";
 import type { SessionStats } from "../agent-session.ts";
 import type { BashResult } from "../bash-executor.ts";
 import type { CompactionResult } from "../compaction/index.ts";
+import type { HostActionDecisionKind, HostActionRequest, HostActionUpdate } from "../host-interaction.ts";
 import type { SourceInfo } from "../source-info.ts";
 
 export type RpcModel = Model<Api>;
@@ -25,6 +26,10 @@ export type RpcCommand =
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "new_session"; parentSession?: string }
+
+	// Client capabilities and host-initiated actions
+	| { id?: string; type: "set_client_capabilities"; features: RpcClientCapabilityFeature[] }
+	| { id?: string; type: "get_pending_host_actions" }
 
 	// Native UI actions
 	| { id?: string; type: "get_ui_capabilities" }
@@ -121,6 +126,7 @@ export type UiActionCapabilityFeature =
 	| "ui_action_invocation.v1"
 	| "ui_action_completions.v1"
 	| (string & {});
+export type RpcClientCapabilityFeature = "host_action_requests.v1" | (string & {});
 
 export interface UiActionOptionDescriptor {
 	value: string;
@@ -206,6 +212,60 @@ export interface UiActionInvocationResponse {
 	stateChanged?: boolean;
 	actionsChanged?: boolean;
 	message?: string;
+}
+
+// ============================================================================
+// RPC Workflow Events
+// ============================================================================
+
+export type RpcWorkflowKind = "review" | (string & {});
+export type RpcWorkflowStatus = "running" | "finalizing" | "completed" | "cancelled" | "failed" | (string & {});
+
+export interface RpcWorkflowEvent {
+	type: "workflow_start" | "workflow_update" | "workflow_end";
+	workflowId: string;
+	kind: RpcWorkflowKind;
+	action?: string;
+	title?: string;
+	message?: string;
+	status?: RpcWorkflowStatus;
+}
+
+export type RpcWorkflowToolEvent =
+	| {
+			type: "tool_execution_start";
+			workflowId: string;
+			workflowKind: RpcWorkflowKind;
+			workflowAction: string;
+			toolCallId: string;
+			toolName: string;
+			args?: Record<string, unknown>;
+	  }
+	| {
+			type: "tool_execution_end";
+			workflowId: string;
+			workflowKind: RpcWorkflowKind;
+			workflowAction: string;
+			toolCallId: string;
+			toolName: string;
+			isError: boolean;
+	  };
+
+// ============================================================================
+// RPC Host Actions
+// ============================================================================
+
+export type RpcHostActionRequest = { type: "host_action_request" } & HostActionRequest;
+export type RpcHostActionUpdate = { type: "host_action_update" } & HostActionUpdate;
+export type RpcHostActionResponse = {
+	type: "host_action_response";
+	id: string;
+	decision: Exclude<HostActionDecisionKind, "unavailable">;
+	message?: string;
+};
+
+export interface RpcPendingHostActionsResponse {
+	actions: RpcHostActionRequest[];
 }
 
 // ============================================================================
@@ -332,6 +392,16 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "follow_up"; success: true }
 	| { id?: string; type: "response"; command: "abort"; success: true }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
+
+	// Client capabilities and host-initiated actions
+	| { id?: string; type: "response"; command: "set_client_capabilities"; success: true }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_pending_host_actions";
+			success: true;
+			data: RpcPendingHostActionsResponse;
+	  }
 
 	// Native UI actions
 	| { id?: string; type: "response"; command: "get_ui_capabilities"; success: true; data: UiActionCapabilities }

@@ -482,7 +482,7 @@ For projected dynamic actions, invocation uses the host's existing prompt semant
 - Prompt template and skill actions send their slash alias through host prompt expansion. While idle they return `accepted`; while the agent is streaming they require `streamingBehavior: "steer"` or `"followUp"` and return `queued`.
 - Dynamic action ids are opaque and tied to the current action catalog. After a reload, session replacement, or catalog change, clients must refresh descriptors; stale ids are rejected instead of being remapped to another action.
 - `thinking.fast_mode` uses a required boolean `enabled` argument. Enabling captures the current thinking level, applies the fastest supported lower thinking level among `off`, `minimal`, and `low`, and returns updated boolean state. Disabling restores the captured thinking level after host clamping. It never switches models, exposes model catalogs, changes scoped-model/profile settings, or persists model/thinking defaults. Manual thinking/model/profile/scoped-model changes clear the session-local restore marker.
-- Review actions run a host workflow: the host resolves git targets, applies review-model settings, runs an isolated review session with the approved tool policy, and creates a fresh session seeded with findings. Responses do not include raw diffs, review prompts, configured model names, auth state, or tool provenance. Remote review actions require confirmation and use the host-owned read-only tool set (`read`, `grep`, `find`, `ls`).
+- Review actions run a host workflow: the host resolves git targets, applies review-model settings, runs an isolated review session with the approved tool policy, and creates a fresh session seeded with findings. Responses do not include raw diffs, review prompts, configured model names, auth state, or raw tool output. While the workflow runs, hosts may emit sanitized `workflow_*` and `tool_execution_*` activity events so clients can show progress. Remote review actions require confirmation and use the host-owned read-only tool set (`read`, `grep`, `find`, `ls`).
 - Over Iroh, v1 invocation is allowlist-based and forwards only exact reviewed built-in ids (`session.new`, `run.cancel`, `thinking.fast_mode`, `review.uncommitted`, `review.branch`) plus projected dynamic ids under `extension.command.*`, `prompt.template.*`, and `skill.*`. Local-only built-ins such as `context.compact`, `session.rename`, deferred review/model actions, direct model/thinking RPC commands, and unreviewed prefixes are rejected with a normal RPC error.
 
 #### Native UI Action Security
@@ -490,6 +490,61 @@ For projected dynamic actions, invocation uses the host's existing prompt semant
 Descriptors must not expose host-local paths, extension source paths, prompt template bodies, skill content, provider secrets, environment values, auth internals, raw model/provider metadata, raw transcript payloads, or host session file paths. Iroh remote discovery responses pass through the remote outbound redaction layer in addition to descriptor-level sanitization. Remote invocation is allowlist-based and re-checks action availability, remote safety, authorization, streaming policy, and argument validity at invocation time.
 
 `get_commands` remains the legacy local command-discovery surface for raw slash invocation and may include source metadata useful to local clients. Remote clients and native mobile clients should use sanitized `get_ui_actions`; raw `get_commands` remains blocked over Iroh.
+
+### Host-Initiated Action Requests
+
+Host-initiated action requests let Volt pause a running workflow and ask an RPC client to approve a host-owned action. This is separate from native UI actions: native UI actions are client-initiated, while host action requests are emitted by Volt when it needs user/app approval to continue.
+
+Clients must opt in before Volt will block on host action requests:
+
+```json
+{"type": "set_client_capabilities", "features": ["host_action_requests.v1"]}
+```
+
+Response:
+
+```json
+{"type": "response", "command": "set_client_capabilities", "success": true}
+```
+
+When a host action is needed, Volt emits:
+
+```json
+{
+  "type": "host_action_request",
+  "id": "ha_123",
+  "action": "lsp.install_server",
+  "title": "Install typescript language server?",
+  "message": "Volt tried to use LSP for typescript, but typescript-language-server is not installed. Install it now and retry diagnostics?",
+  "confirmLabel": "Install",
+  "cancelLabel": "Skip",
+  "commandPreview": "npm install -g typescript-language-server typescript",
+  "blocking": true,
+  "destructive": false,
+  "metadata": {"server": "typescript", "binary": "typescript-language-server"}
+}
+```
+
+The client responds with one of `"approved"`, `"denied"`, or `"dismissed"`:
+
+```json
+{"type": "host_action_response", "id": "ha_123", "decision": "approved"}
+```
+
+Volt may emit progress updates for approved actions:
+
+```json
+{"type": "host_action_update", "id": "ha_123", "action": "lsp.install_server", "status": "running", "message": "Running npm install -g typescript-language-server typescript"}
+{"type": "host_action_update", "id": "ha_123", "action": "lsp.install_server", "status": "completed", "message": "typescript language server installed. Retrying diagnostics.", "exitCode": 0}
+```
+
+Use `get_pending_host_actions` to recover currently pending requests after reconnect:
+
+```json
+{"type": "get_pending_host_actions"}
+```
+
+Clients approve only the advertised host-owned action; they cannot alter the command. If the client does not advertise `host_action_requests.v1`, Volt falls back without blocking (for example, an LSP missing-server message with install instructions). Current LSP install requests are limited to trusted built-in install recipes; custom LSP commands and manual-install-only servers still produce instructions only.
 
 ### Model
 
@@ -1083,6 +1138,9 @@ Events are streamed to stdout as JSON lines during agent operation. Events do NO
 | `tool_execution_start` | Tool begins execution |
 | `tool_execution_update` | Tool execution progress (streaming output) |
 | `tool_execution_end` | Tool completes |
+| `workflow_start` | Host-owned workflow begins (for example, review) |
+| `workflow_update` | Host-owned workflow progress update |
+| `workflow_end` | Host-owned workflow completes, fails, or is cancelled |
 | `queue_update` | Pending steering/follow-up queue changed |
 | `compaction_start` | Compaction begins |
 | `compaction_end` | Compaction completes |
@@ -1220,6 +1278,25 @@ When complete:
 ```
 
 Use `toolCallId` to correlate events. The `partialResult` in `tool_execution_update` contains the accumulated output so far (not just the delta), allowing clients to simply replace their display on each update.
+
+Host-owned workflows can also emit sanitized tool lifecycle events with workflow metadata. For example, review actions emit tool names and bounded arguments, but omit raw file contents and raw tool output:
+
+```json
+{"type":"tool_execution_start","workflowId":"review:abc","workflowKind":"review","workflowAction":"review.uncommitted","toolCallId":"review:abc:call_1","toolName":"read","args":{"path":"src/file.ts"}}
+{"type":"tool_execution_end","workflowId":"review:abc","workflowKind":"review","workflowAction":"review.uncommitted","toolCallId":"review:abc:call_1","toolName":"read","isError":false}
+```
+
+### workflow_start / workflow_update / workflow_end
+
+Emitted for host-owned workflows that are not ordinary assistant chat turns, such as a review action. Clients can render these as a temporary live timeline until the action response and any resulting session refresh arrive.
+
+```json
+{"type":"workflow_start","workflowId":"review:abc","kind":"review","action":"review.uncommitted","title":"Review","message":"Reviewing uncommitted changes.","status":"running"}
+{"type":"workflow_update","workflowId":"review:abc","kind":"review","action":"review.uncommitted","title":"Review","message":"Finalizing findings.","status":"finalizing"}
+{"type":"workflow_end","workflowId":"review:abc","kind":"review","action":"review.uncommitted","title":"Review","message":"Review complete: 2 findings. Opening review session.","status":"completed"}
+```
+
+`status` is advisory. Known review statuses are `running`, `finalizing`, `completed`, `cancelled`, and `failed`. Unknown workflow kinds, statuses, and extra fields should be ignored or rendered generically.
 
 ### queue_update
 

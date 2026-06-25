@@ -60,6 +60,17 @@ export interface ResolvedLspServerConfig {
 	rootMarkers: string[];
 	initializationOptions?: unknown;
 	settings?: unknown;
+	/** Trusted automatic install recipe, present only for matching built-in server defaults. */
+	installRecipe?: LspInstallRecipe;
+	/** Manual install guidance for recognized server binaries. */
+	installHint?: string;
+}
+
+export interface LspInstallRecipe {
+	binary: string;
+	command: string[];
+	displayCommand: string;
+	installHint: string;
 }
 
 export interface ResolvedLspConfig {
@@ -121,28 +132,63 @@ const DEFAULT_LSP_SERVERS: Record<
 };
 
 /**
- * Install hints keyed by server binary (argv[0]). Used to make "server not
- * found" failures actionable. Keyed by binary rather than server name so
- * custom commands never get a hint for a binary they do not use.
+ * Trusted install recipes keyed by server binary (argv[0]). These are host-owned
+ * commands for built-in server binaries. Resolution attaches them only to
+ * matching built-in server entries, not arbitrary custom server definitions.
  */
-const INSTALL_HINTS: Record<string, string> = {
-	"typescript-language-server": "Install with: npm install -g typescript-language-server typescript",
-	"pyright-langserver": "Install with: npm install -g pyright",
-	gopls: "Install with: go install golang.org/x/tools/gopls@latest",
-	"rust-analyzer": "Install with: rustup component add rust-analyzer",
+const INSTALL_RECIPES: Record<string, Omit<LspInstallRecipe, "binary">> = {
+	"typescript-language-server": {
+		command: ["npm", "install", "-g", "typescript-language-server", "typescript"],
+		displayCommand: "npm install -g typescript-language-server typescript",
+		installHint: "Install with: npm install -g typescript-language-server typescript",
+	},
+	"pyright-langserver": {
+		command: ["npm", "install", "-g", "pyright"],
+		displayCommand: "npm install -g pyright",
+		installHint: "Install with: npm install -g pyright",
+	},
+	gopls: {
+		command: ["go", "install", "golang.org/x/tools/gopls@latest"],
+		displayCommand: "go install golang.org/x/tools/gopls@latest",
+		installHint: "Install with: go install golang.org/x/tools/gopls@latest",
+	},
+	"rust-analyzer": {
+		command: ["rustup", "component", "add", "rust-analyzer"],
+		displayCommand: "rustup component add rust-analyzer",
+		installHint: "Install with: rustup component add rust-analyzer",
+	},
+	"bash-language-server": {
+		command: ["npm", "install", "-g", "bash-language-server"],
+		displayCommand: "npm install -g bash-language-server",
+		installHint: "Install with: npm install -g bash-language-server",
+	},
+};
+
+const MANUAL_INSTALL_HINTS: Record<string, string> = {
 	clangd: "Install instructions: https://clangd.llvm.org/installation",
 	zls: "Install instructions: https://github.com/zigtools/zls",
 	"lua-language-server": "Install instructions: https://luals.github.io/#install",
-	"bash-language-server": "Install with: npm install -g bash-language-server",
 };
 
 /**
- * Install hint for a server launch command, or undefined for unknown
- * binaries. Matches on the binary basename so absolute-path commands
- * (e.g. /usr/local/bin/gopls) still get a hint.
+ * Trusted install recipe for a server launch command, or undefined for unknown
+ * or manual-install-only binaries. Matches on the binary basename so absolute
+ * path commands (e.g. /usr/local/bin/gopls) still get the reviewed recipe for
+ * that binary.
+ */
+export function installRecipeForCommand(command: string[]): LspInstallRecipe | undefined {
+	const binary = basename(command[0] ?? "");
+	const recipe = INSTALL_RECIPES[binary];
+	return recipe ? { binary, ...recipe } : undefined;
+}
+
+/**
+ * Install hint for a server launch command, or undefined for unknown binaries.
+ * Matches on the binary basename so absolute-path commands still get a hint.
  */
 export function installHintForCommand(command: string[]): string | undefined {
-	return INSTALL_HINTS[basename(command[0] ?? "")];
+	const binary = basename(command[0] ?? "");
+	return INSTALL_RECIPES[binary]?.installHint ?? MANUAL_INSTALL_HINTS[binary];
 }
 
 const SEVERITY_TO_NUMBER: Record<LspSeverity, number> = {
@@ -178,6 +224,11 @@ export function resolveLspConfig(settings: LspSettings | undefined): ResolvedLsp
 		if (!command || command.length === 0 || !fileExtensions || fileExtensions.length === 0) {
 			continue;
 		}
+		const commandBinary = basename(command[0] ?? "");
+		const builtInBinary = defaults ? basename(defaults.command[0] ?? "") : undefined;
+		const usesBuiltInBinary = builtInBinary !== undefined && commandBinary === builtInBinary;
+		const installRecipe = usesBuiltInBinary ? installRecipeForCommand(command) : undefined;
+		const installHint = installHintForCommand(command);
 		servers.push({
 			name,
 			command: [...command],
@@ -185,6 +236,8 @@ export function resolveLspConfig(settings: LspSettings | undefined): ResolvedLsp
 			rootMarkers: [...(overrides?.rootMarkers ?? defaults?.rootMarkers ?? [])],
 			initializationOptions: overrides?.initializationOptions,
 			settings: overrides?.settings,
+			...(installRecipe ? { installRecipe } : {}),
+			...(installHint ? { installHint } : {}),
 		});
 	}
 	return {

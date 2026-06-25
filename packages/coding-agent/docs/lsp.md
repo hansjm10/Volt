@@ -28,7 +28,7 @@ Use `volt --lsp` to force-enable LSP for a run when settings disable it.
 - One client runs per (server, project root) pair. Servers shut down when the session ends or reloads, and after `idleShutdownMs` without use (they respawn lazily on the next operation).
 - `/lsp` shows the status of running servers (root, open documents, idle time); `/lsp restart` stops them all so they respawn fresh on next use.
 - `/lsp trace [path]` enables protocol tracing at runtime (`/lsp trace off` disables): JSON-RPC traffic in both directions, server stderr, and lifecycle events are appended to the trace file with timestamps. Use this to debug a misbehaving server. Persistent tracing: set `lsp.traceFile`.
-- A server that fails to start (for example, not installed) is reported once in the tool result and then silenced; after three failed starts it is disabled for the session.
+- A server that fails to start because its binary is missing can trigger a host confirmation prompt for trusted built-in install recipes (including post-`edit`/`write` diagnostics). If approved, Volt runs the host-owned install command, clears the start failure, retries the server, and resumes diagnostics. If denied or unsupported, the missing-server message includes install instructions and is then silenced; after three failed starts the server is disabled for the session.
 
 Diagnostics are best-effort: server failures or timeouts never fail the edit itself.
 
@@ -56,7 +56,7 @@ The symbol is located by name: volt finds its position in the file (preferring a
 
 ## Built-in Servers
 
-The matching server must be installed and on your `PATH`. When a built-in server binary is missing, the one-time failure message includes the install command for it. Built-in defaults:
+The matching server must be installed and on your `PATH`. When a trusted built-in server binary is missing, interactive and capable RPC hosts can ask to install it automatically, then retry the LSP operation. Non-interactive hosts, clients that do not advertise host action support, custom commands, and manual-install-only servers fall back to a one-time install hint. Built-in defaults:
 
 | Name | Command | Extensions | Root markers | Install |
 |------|---------|------------|--------------|---------|

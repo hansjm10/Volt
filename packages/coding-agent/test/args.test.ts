@@ -372,6 +372,13 @@ describe("parseArgs", () => {
 			expect(result.tools).toEqual(["read", "bash"]);
 		});
 
+		test("parses --allow-unlisted-extension-tools flag", () => {
+			const result = parseArgs(["--tools", "read,bash", "--allow-unlisted-extension-tools"]);
+			expect(result.tools).toEqual(["read", "bash"]);
+			expect(result.allowUnlistedExtensionTools).toBe(true);
+			expect(result.unknownFlags.has("allow-unlisted-extension-tools")).toBe(false);
+		});
+
 		test("parses -t shorthand", () => {
 			const result = parseArgs(["-t", "read,bash"]);
 			expect(result.tools).toEqual(["read", "bash"]);

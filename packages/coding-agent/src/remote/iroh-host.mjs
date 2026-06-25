@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { constants, rmSync } from "node:fs";
 import { access, mkdir, realpath, rm, stat } from "node:fs/promises";
-import { connect as connectNet, createServer } from "node:net";
+import { createServer } from "node:net";
 import { hostname, userInfo } from "node:os";
 import { fileURLToPath } from "node:url";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
@@ -21,6 +21,7 @@ import {
 	getIrohRemoteControlPath,
 	getIrohRemoteRpcFilterResult,
 	getIrohRemoteUnsafeAllowedTools,
+	getIrohRemoteVoltRpcToolArgs,
 	hasTrustRequiringProjectResources,
 	IROH_REMOTE_PAIR_CONTROL_REQUEST_TYPE,
 	IROH_REMOTE_PAIR_CONTROL_RESPONSE_TYPE,
@@ -33,9 +34,9 @@ import {
 	IrohRemoteHostStateManager,
 	IrohRemoteInMemoryPushNotificationDeduper,
 	DEFAULT_IROH_REMOTE_PUSH_RELAY_URL,
-	ensureIrohRemoteControlDirectory,
 	IrohRemotePushNotificationDispatcher,
 	IrohRemotePushRelayHttpClient,
+	listenIrohRemoteControlServer,
 	parseIrohRemoteWorkspaceSpec,
 	parseIrohRemoteControlRequest,
 	ProjectTrustStore,
@@ -66,8 +67,6 @@ const HOST_ENTRYPOINT_DIR = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_DIR = resolve(HOST_ENTRYPOINT_DIR, "..", "..");
 const ALPN = Array.from(Buffer.from(IROH_REMOTE_ALPN, "utf8"));
 const CONTROL_REQUEST_MAX_BYTES = 16 * 1024;
-const CONTROL_ACTIVE_RETRY_ATTEMPTS = 10;
-const CONTROL_ACTIVE_RETRY_DELAY_MS = 250;
 const DEFAULT_READ_LIMIT = 64 * 1024;
 const DEFAULT_STATE_PATH = join(getAgentDir(), "remote", "iroh-host.json");
 const ACTIVE_REVOKE_CLOSE_REASON = "revoked";
@@ -77,6 +76,8 @@ const PROMPT_COMPLETION_RPC_TYPES = new Set(["prompt", "steer", "follow_up"]);
 const RESPONSE_COMPLETION_RPC_TYPES = new Set([
 	"abort",
 	"new_session",
+	"set_client_capabilities",
+	"get_pending_host_actions",
 	"get_state",
 	"get_transcript",
 	"get_ui_capabilities",
@@ -653,8 +654,7 @@ function spawnRpcChild(options, workspace, allowTools) {
 	if (options.sourceVolt) {
 		const runnerPath =
 			options.resolvedSourceVoltRunner ?? resolve(options.sourceVolt, "scripts", "run-coding-agent-source.mjs");
-		const args = [runnerPath, "--mode", "rpc"];
-		if (allowTools !== undefined) args.push("--tools", allowTools);
+		const args = [runnerPath, "--mode", "rpc", ...getIrohRemoteVoltRpcToolArgs(allowTools)];
 		if (getProjectTrustedForWorkspace(options, workspace)) args.push("--approve");
 		return {
 			command: process.execPath,
@@ -680,8 +680,7 @@ function spawnRpcChild(options, workspace, allowTools) {
 	}
 
 	const voltBin = options.resolvedVoltBin ?? getPlatformVoltBin(options.voltBin);
-	const args = ["--mode", "rpc"];
-	if (allowTools !== undefined) args.push("--tools", allowTools);
+	const args = ["--mode", "rpc", ...getIrohRemoteVoltRpcToolArgs(allowTools)];
 	if (getProjectTrustedForWorkspace(options, workspace)) args.push("--approve");
 	return {
 		command: voltBin,
@@ -787,12 +786,6 @@ async function withTimeout(promise, timeoutMs, message) {
 	} finally {
 		clearTimeout(timeoutId);
 	}
-}
-
-function delay(ms) {
-	return new Promise((resolveDelay) => {
-		setTimeout(resolveDelay, ms);
-	});
 }
 
 function isExpectedApplicationClose(error) {
@@ -1809,60 +1802,6 @@ async function handleConnection(incoming, options) {
 	}
 }
 
-function listenServer(server, controlPath) {
-	return new Promise((resolveListen, rejectListen) => {
-		const cleanup = () => {
-			server.off("error", handleError);
-		};
-		const handleError = (error) => {
-			cleanup();
-			rejectListen(error);
-		};
-		server.once("error", handleError);
-		server.listen(controlPath, () => {
-			cleanup();
-			resolveListen();
-		});
-	});
-}
-
-function canConnectToControlPath(controlPath) {
-	return new Promise((resolveConnect) => {
-		const socket = connectNet(controlPath);
-		let settled = false;
-		const finish = (canConnect) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			socket.destroy();
-			resolveConnect(canConnect);
-		};
-		const timeout = setTimeout(() => finish(false), 250);
-		socket.once("connect", () => finish(true));
-		socket.once("error", () => finish(false));
-	});
-}
-
-async function listenOnControlPath(server, controlPath) {
-	await ensureIrohRemoteControlDirectory(controlPath);
-	for (let attempt = 0; ; attempt += 1) {
-		try {
-			await listenServer(server, controlPath);
-			return;
-		} catch (error) {
-			if (process.platform === "win32" || error?.code !== "EADDRINUSE") throw error;
-			if (await canConnectToControlPath(controlPath)) {
-				if (attempt < CONTROL_ACTIVE_RETRY_ATTEMPTS) {
-					await delay(CONTROL_ACTIVE_RETRY_DELAY_MS);
-					continue;
-				}
-				throw new Error(`Iroh remote host control channel is already active for this state path: ${controlPath}`);
-			}
-			await rm(controlPath, { force: true });
-		}
-	}
-}
-
 function readLineFromControlSocket(socket) {
 	return new Promise((resolveLine, rejectLine) => {
 		let buffer = "";
@@ -2023,7 +1962,7 @@ async function startPairControlServer(endpoint, options) {
 			);
 		});
 	});
-	await listenOnControlPath(server, controlPath);
+	await listenIrohRemoteControlServer(server, controlPath);
 	return { controlPath, server };
 }
 

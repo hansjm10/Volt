@@ -327,6 +327,48 @@ describe("remote CLI", () => {
 		expect(process.exitCode).toBeUndefined();
 	});
 
+	it("prints a remote pairing QR when stderr is a TTY", async () => {
+		const statePath = join(tempDir, "host.json");
+		await writeIrohRemoteHostState(statePath, {
+			hostSecretKey: undefined,
+			workspaces: [{ name: "project", path: projectDir, allowedTools: "read" }],
+			clients: [],
+		});
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const stderrTtyDescriptor = Object.getOwnPropertyDescriptor(process.stderr, "isTTY");
+		Object.defineProperty(process.stderr, "isTTY", { configurable: true, value: true });
+
+		try {
+			await withMockPairControlServer(
+				statePath,
+				() => ({
+					type: IROH_REMOTE_PAIR_CONTROL_RESPONSE_TYPE,
+					success: true,
+					expiresAt: 125,
+					ticket: "volt+iroh://v1/mock-ticket",
+				}),
+				async () => {
+					await expect(
+						main(["remote", "pair", "--state", statePath, "--workspace", "project"]),
+					).resolves.toBeUndefined();
+				},
+			);
+		} finally {
+			if (stderrTtyDescriptor) {
+				Object.defineProperty(process.stderr, "isTTY", stderrTtyDescriptor);
+			} else {
+				Reflect.deleteProperty(process.stderr, "isTTY");
+			}
+		}
+
+		expect(logSpy.mock.calls.map(([message]) => String(message))).toEqual(["volt+iroh://v1/mock-ticket"]);
+		const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
+		expect(stderr).toContain("pairing ticket QR:");
+		expect(stderr).toContain("pairing ticket:");
+		expect(process.exitCode).toBeUndefined();
+	});
+
 	it("rejects ambiguous remote pair workspace selection before contacting a host", async () => {
 		const statePath = join(tempDir, "host.json");
 		await writeIrohRemoteHostState(statePath, {

@@ -5,12 +5,18 @@ import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { ExtensionError } from "../../core/extensions/index.ts";
 import type {
+	RpcClientCapabilityFeature,
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcHostActionRequest,
+	RpcHostActionResponse,
+	RpcHostActionUpdate,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
+	RpcWorkflowEvent,
+	RpcWorkflowToolEvent,
 	UiActionCapabilities,
 	UiActionDescriptor,
 	UiActionInvocationQueueBehavior,
@@ -43,7 +49,14 @@ export interface ModelInfo {
 }
 
 export type RpcExtensionErrorEvent = { type: "extension_error" } & ExtensionError;
-export type RpcClientEvent = AgentSessionEvent | RpcExtensionUIRequest | RpcExtensionErrorEvent;
+export type RpcClientEvent =
+	| AgentSessionEvent
+	| RpcWorkflowEvent
+	| RpcWorkflowToolEvent
+	| RpcExtensionUIRequest
+	| RpcHostActionRequest
+	| RpcHostActionUpdate
+	| RpcExtensionErrorEvent;
 export type RpcEventListener = (event: RpcClientEvent) => void;
 
 export abstract class RpcClientBase {
@@ -70,12 +83,23 @@ export abstract class RpcClientBase {
 
 	/** Respond to an extension UI request emitted through onEvent(). */
 	async sendExtensionUIResponse(response: RpcExtensionUIResponse): Promise<void> {
-		this.assertCanSend();
-		try {
-			await this.writeMessage(response);
-		} catch (error: unknown) {
-			throw toError(error);
-		}
+		await this.sendOneWay(response);
+	}
+
+	/** Respond to a host-initiated action request emitted through onEvent(). */
+	async sendHostActionResponse(response: RpcHostActionResponse): Promise<void> {
+		await this.sendOneWay(response);
+	}
+
+	/** Advertise client-supported optional protocol features. */
+	async setClientCapabilities(features: RpcClientCapabilityFeature[]): Promise<void> {
+		await this.send({ type: "set_client_capabilities", features });
+	}
+
+	/** Return host actions currently waiting for client response. */
+	async getPendingHostActions(): Promise<RpcHostActionRequest[]> {
+		const response = await this.send({ type: "get_pending_host_actions" });
+		return this.getData<{ actions: RpcHostActionRequest[] }>(response).actions;
 	}
 
 	/** Send a prompt to the agent. */
@@ -419,7 +443,18 @@ export abstract class RpcClientBase {
 		return undefined;
 	}
 
-	protected abstract writeMessage(message: RpcCommand | RpcExtensionUIResponse): void | Promise<void>;
+	protected abstract writeMessage(
+		message: RpcCommand | RpcExtensionUIResponse | RpcHostActionResponse,
+	): void | Promise<void>;
+
+	private async sendOneWay(message: RpcExtensionUIResponse | RpcHostActionResponse): Promise<void> {
+		this.assertCanSend();
+		try {
+			await this.writeMessage(message);
+		} catch (error: unknown) {
+			throw toError(error);
+		}
+	}
 
 	private async send(command: RpcCommandBody, onSuccessResponse?: () => void): Promise<RpcResponse> {
 		this.assertCanSend();

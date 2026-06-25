@@ -36,6 +36,7 @@ import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
 import {
 	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+	formatIrohRemoteTicketQrCode,
 	getIrohRemoteUnsafeAllowedTools,
 	IROH_REMOTE_PAIR_CONTROL_REQUEST_TYPE,
 	IROH_REMOTE_REVOKE_CONTROL_REQUEST_TYPE,
@@ -445,6 +446,19 @@ async function confirmUnsafeRemotePairToolGrant(
 	}
 }
 
+function printRemotePairingTicket(ticket: string): void {
+	if (process.stderr.isTTY) {
+		try {
+			console.error("pairing ticket QR:");
+			console.error(formatIrohRemoteTicketQrCode(ticket));
+		} catch (error) {
+			console.error(`Could not render pairing ticket QR: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		console.error("pairing ticket:");
+	}
+	console.log(ticket);
+}
+
 async function handleRemotePairCommand(args: readonly string[]): Promise<void> {
 	const parsed = parseRemotePairArgs(args);
 	if (parsed.help) {
@@ -499,7 +513,7 @@ async function handleRemotePairCommand(args: readonly string[]): Promise<void> {
 			process.exitCode = 1;
 			return;
 		}
-		console.log(response.ticket);
+		printRemotePairingTicket(response.ticket);
 	} catch (error) {
 		console.error(chalk.red(`Error: ${error instanceof Error ? error.message : String(error)}`));
 		process.exitCode = 1;
@@ -1259,6 +1273,9 @@ function buildSessionOptions(
 	if (parsed.tools) {
 		options.tools = [...parsed.tools];
 	}
+	if (parsed.allowUnlistedExtensionTools) {
+		options.allowUnlistedExtensionTools = true;
+	}
 	if (parsed.excludeTools) {
 		options.excludeTools = [...parsed.excludeTools];
 	}
@@ -1564,6 +1581,7 @@ export async function main(args: string[], options?: MainOptions) {
 			thinkingLevel: sessionOptions.thinkingLevel,
 			scopedModels: sessionOptions.scopedModels,
 			tools: sessionOptions.tools,
+			allowUnlistedExtensionTools: sessionOptions.allowUnlistedExtensionTools,
 			excludeTools: sessionOptions.excludeTools,
 			noTools: sessionOptions.noTools,
 			customTools: sessionOptions.customTools,

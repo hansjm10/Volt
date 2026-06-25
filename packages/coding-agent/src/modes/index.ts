@@ -36,10 +36,15 @@ export {
 export { type RpcModeOptions, type RpcSessionChange, runRpcMode } from "./rpc/rpc-mode.ts";
 export { RpcTransportClient, type RpcTransportClientOptions } from "./rpc/rpc-transport-client.ts";
 export type {
+	RpcClientCapabilityFeature,
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcHostActionRequest,
+	RpcHostActionResponse,
+	RpcHostActionUpdate,
 	RpcLiveActivityRegistration,
+	RpcPendingHostActionsResponse,
 	RpcPushPlatform,
 	RpcPushProvider,
 	RpcRegisterPushTargetArgs,
@@ -50,6 +55,10 @@ export type {
 	RpcTranscriptItem,
 	RpcTranscriptResponse,
 	RpcTranscriptToolStatus,
+	RpcWorkflowEvent,
+	RpcWorkflowKind,
+	RpcWorkflowStatus,
+	RpcWorkflowToolEvent,
 	UiActionArgumentDescriptor,
 	UiActionArgumentType,
 	UiActionCapabilities,
