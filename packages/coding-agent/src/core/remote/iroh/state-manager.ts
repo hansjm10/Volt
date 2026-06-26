@@ -11,9 +11,12 @@ import {
 	createEmptyIrohRemoteHostState,
 	type IrohRemoteClient,
 	type IrohRemoteHostState,
+	type IrohRemoteLiveActivityRegistration,
 	type IrohRemotePairingSecretTombstone,
 	type IrohRemotePendingPairingTicket,
 	type IrohRemotePushTarget,
+	type IrohRemotePushTargetPlatform,
+	type IrohRemotePushTokenEnvironment,
 	type IrohRemoteRevokedClient,
 	type IrohRemoteWorkspace,
 	readIrohRemoteHostState,
@@ -41,6 +44,18 @@ export interface IrohRemoteClientRevocationResult {
 export interface IrohRemoteClientRePairApprovalResult {
 	approved: boolean;
 	revokedClient?: IrohRemoteRevokedClient;
+}
+
+export interface IrohRemoteLiveActivityDeliveryChannelLookup {
+	tokenHash: string;
+	tokenEnvironment: IrohRemotePushTokenEnvironment;
+	platform: IrohRemotePushTargetPlatform;
+}
+
+export interface IrohRemoteLiveActivityRegistrationResult {
+	client?: IrohRemoteClient;
+	registration?: IrohRemoteLiveActivityRegistration;
+	replacedRegistration?: IrohRemoteLiveActivityRegistration;
 }
 
 export class IrohRemoteHostStateManager {
@@ -229,6 +244,124 @@ export class IrohRemoteHostStateManager {
 		});
 	}
 
+	async findClientLiveActivityDeliveryChannel(
+		nodeId: string,
+		lookup: IrohRemoteLiveActivityDeliveryChannelLookup,
+	): Promise<IrohRemotePushTarget | undefined> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const client = state.clients.find((entry) => entry.nodeId === nodeId);
+			const pushTarget = client?.pushTargets?.find(
+				(entry) =>
+					entry.enabled &&
+					entry.platform === lookup.platform &&
+					entry.liveActivity?.tokenHash === lookup.tokenHash &&
+					entry.liveActivity.tokenEnvironment === lookup.tokenEnvironment,
+			);
+			return pushTarget ? clonePushTarget(pushTarget) : undefined;
+		});
+	}
+
+	async registerClientLiveActivity(
+		nodeId: string,
+		registration: IrohRemoteLiveActivityRegistration,
+	): Promise<IrohRemoteLiveActivityRegistrationResult> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const client = state.clients.find((entry) => entry.nodeId === nodeId);
+			if (!client) {
+				return {};
+			}
+			let createdAt = registration.createdAt;
+			let replacedRegistration: IrohRemoteLiveActivityRegistration | undefined;
+			const retainedRegistrations: IrohRemoteLiveActivityRegistration[] = [];
+			for (const existingRegistration of client.liveActivities ?? []) {
+				if (existingRegistration.activityId === registration.activityId) {
+					createdAt = existingRegistration.createdAt;
+					replacedRegistration = existingRegistration;
+					continue;
+				}
+				retainedRegistrations.push(existingRegistration);
+			}
+			const savedRegistration = { ...registration, createdAt };
+			client.liveActivities = [...retainedRegistrations, savedRegistration];
+			await this.saveUnlocked(state);
+			return {
+				client: cloneClient(client),
+				registration: cloneLiveActivityRegistration(savedRegistration),
+				...(replacedRegistration
+					? { replacedRegistration: cloneLiveActivityRegistration(replacedRegistration) }
+					: {}),
+			};
+		});
+	}
+
+	async unregisterClientLiveActivity(
+		nodeId: string,
+		workspaceName: string,
+		sessionId: string,
+		activityId: string,
+	): Promise<boolean> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const client = state.clients.find((entry) => entry.nodeId === nodeId);
+			if (!client?.liveActivities) {
+				return false;
+			}
+			const beforeCount = client.liveActivities.length;
+			client.liveActivities = client.liveActivities.filter(
+				(entry) =>
+					entry.workspaceName !== workspaceName ||
+					entry.sessionId !== sessionId ||
+					entry.activityId !== activityId,
+			);
+			const removed = client.liveActivities.length !== beforeCount;
+			if (client.liveActivities.length === 0) {
+				delete client.liveActivities;
+			}
+			if (removed) {
+				await this.saveUnlocked(state);
+			}
+			return removed;
+		});
+	}
+
+	async removeClientLiveActivitiesForSession(
+		nodeId: string,
+		workspaceName: string,
+		sessionId: string,
+	): Promise<number> {
+		return this.removeClientLiveActivities(nodeId, (entry) => {
+			return entry.workspaceName === workspaceName && entry.sessionId === sessionId;
+		});
+	}
+
+	async removeClientLiveActivitiesForWorkspace(nodeId: string, workspaceName: string): Promise<number> {
+		return this.removeClientLiveActivities(nodeId, (entry) => entry.workspaceName === workspaceName);
+	}
+
+	async removeLiveActivitiesForWorkspace(workspaceName: string): Promise<number> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			let removedCount = 0;
+			for (const client of state.clients) {
+				if (!client.liveActivities) {
+					continue;
+				}
+				const beforeCount = client.liveActivities.length;
+				client.liveActivities = client.liveActivities.filter((entry) => entry.workspaceName !== workspaceName);
+				removedCount += beforeCount - client.liveActivities.length;
+				if (client.liveActivities.length === 0) {
+					delete client.liveActivities;
+				}
+			}
+			if (removedCount > 0) {
+				await this.saveUnlocked(state);
+			}
+			return removedCount;
+		});
+	}
+
 	async revokeClient(nodeId: string, now = Date.now()): Promise<IrohRemoteClientRevocationResult> {
 		return this.runExclusive(async () => {
 			const state = await this.loadUnlocked();
@@ -356,15 +489,40 @@ export class IrohRemoteHostStateManager {
 			await writeIrohRemoteHostState(this.statePath, stateToSave);
 		}
 	}
+
+	private async removeClientLiveActivities(
+		nodeId: string,
+		shouldRemove: (registration: IrohRemoteLiveActivityRegistration) => boolean,
+	): Promise<number> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const client = state.clients.find((entry) => entry.nodeId === nodeId);
+			if (!client?.liveActivities) {
+				return 0;
+			}
+			const beforeCount = client.liveActivities.length;
+			client.liveActivities = client.liveActivities.filter((entry) => !shouldRemove(entry));
+			const removedCount = beforeCount - client.liveActivities.length;
+			if (client.liveActivities.length === 0) {
+				delete client.liveActivities;
+			}
+			if (removedCount > 0) {
+				await this.saveUnlocked(state);
+			}
+			return removedCount;
+		});
+	}
 }
 
 function cloneAuthorizationResult(result: IrohRemoteClientAuthorizationResult): IrohRemoteClientAuthorizationResult {
 	if (!result.ok) {
 		return {
 			...result,
+			...(result.client ? { client: cloneClient(result.client) } : {}),
 			...(result.expiredPairingTickets
 				? { expiredPairingTickets: result.expiredPairingTickets.map((ticket) => clonePendingPairingTicket(ticket)) }
 				: {}),
+			...(result.workspace ? { workspace: cloneWorkspace(result.workspace) } : {}),
 		};
 	}
 	return {
@@ -388,6 +546,9 @@ function cloneClient(client: IrohRemoteClient): IrohRemoteClient {
 		allowedWorkspaces: [...client.allowedWorkspaces],
 		...(client.lastSessionIdByWorkspace ? { lastSessionIdByWorkspace: { ...client.lastSessionIdByWorkspace } } : {}),
 		...(client.pushTargets ? { pushTargets: client.pushTargets.map((target) => clonePushTarget(target)) } : {}),
+		...(client.liveActivities
+			? { liveActivities: client.liveActivities.map((registration) => cloneLiveActivityRegistration(registration)) }
+			: {}),
 	};
 }
 
@@ -417,6 +578,12 @@ function clonePushTarget(pushTarget: IrohRemotePushTarget): IrohRemotePushTarget
 		...pushTarget,
 		...(pushTarget.liveActivity ? { liveActivity: { ...pushTarget.liveActivity } } : {}),
 	};
+}
+
+function cloneLiveActivityRegistration(
+	registration: IrohRemoteLiveActivityRegistration,
+): IrohRemoteLiveActivityRegistration {
+	return { ...registration };
 }
 
 function cloneRevokedClient(client: IrohRemoteRevokedClient): IrohRemoteRevokedClient {

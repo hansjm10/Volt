@@ -21,6 +21,8 @@ export const IROH_REMOTE_RPC_PASSTHROUGH_TYPES = new Set([
 	"list_sessions",
 	"switch_session_by_id",
 	"register_push_target",
+	"register_live_activity",
+	"unregister_live_activity",
 	"unregister_workspace",
 	"extension_ui_response",
 ]);

@@ -68,7 +68,10 @@ function isRpcLiveActivityRegistration(value: unknown): boolean {
 		isRecord(value) &&
 		typeof value.activityId === "string" &&
 		typeof value.pushToken === "string" &&
-		(value.tokenHash === undefined || typeof value.tokenHash === "string")
+		(value.tokenHash === undefined || typeof value.tokenHash === "string") &&
+		(value.tokenEnvironment === undefined ||
+			value.tokenEnvironment === "development" ||
+			value.tokenEnvironment === "production")
 	);
 }
 

@@ -571,14 +571,24 @@ async function withOperationTimeout(promise, label, timeoutMs = PROCESS_TIMEOUT_
 
 async function withStateDir(name, callback) {
 	const stateDir = await mkdtemp(join(tmpdir(), `volt-iroh-sidecar-${name}-`));
+	let callbackError;
 	try {
 		return await callback({
 			clientStatePath: join(stateDir, "client.json"),
 			hostStatePath: join(stateDir, "host.json"),
 			stateDir,
 		});
+	} catch (error) {
+		callbackError = error;
+		throw error;
 	} finally {
-		await rm(stateDir, { force: true, recursive: true });
+		try {
+			await rm(stateDir, { force: true, recursive: true });
+		} catch (error) {
+			if (!callbackError) {
+				throw error;
+			}
+		}
 	}
 }
 
@@ -3421,6 +3431,265 @@ async function workspaceDiscoveryManagementScenario() {
 	});
 }
 
+async function integratedVoltLiveActivityHostScenario() {
+	await withStateDir("integrated-live-activity", async ({ hostStatePath, stateDir }) => {
+		const agentDir = await createIntegratedVoltAgentDir(stateDir);
+		const workspacePath = join(stateDir, "workspace");
+		await mkdir(workspacePath, { recursive: true });
+		const endpoint = await bindRawClientEndpoint("disabled");
+		const liveActivityTokenHash = "a".repeat(64);
+		const host = startHost([
+			"--state",
+			hostStatePath,
+			"--agent-dir",
+			agentDir,
+			"--workspace",
+			`remote=${workspacePath}`,
+			"--integrated-volt",
+		]);
+		let rawClient;
+		let managementClient;
+		try {
+			await waitForHostReady(host.child, host.output, "integrated live activity host");
+			const ticket = host.output.stdout.trim();
+			assert(ticket.startsWith(TICKET_PREFIX), `Expected live activity host ticket, got:\n${host.output.stdout}`);
+
+			rawClient = await openRawAuthorizedClientOnEndpoint(endpoint, ticket, {
+				clientLabel: "live activity client",
+				helloMode: "conversation",
+			});
+			rawClient.ownsEndpoint = false;
+			const stateResponse = await readRawRpcResponse(
+				rawClient,
+				{ id: "live-activity-state", type: "get_state" },
+				"live activity get_state",
+			);
+			const sessionId = stateResponse.event.data?.sessionId;
+			assert(sessionId, `Expected live activity session id, got:\n${JSON.stringify(stateResponse.event)}`);
+
+			const pushRegistration = await readRawRpcResponse(
+				rawClient,
+				{
+					id: "live-activity-push-target",
+					type: "register_push_target",
+					args: {
+						provider: "fcm",
+						platform: "ios",
+						pushTargetId: "relay-target-1",
+						pushTargetAuthToken: "secret-target-auth-token",
+						tokenHash: "push-target-hash",
+						liveActivity: {
+							activityId: "app-live-activity",
+							pushToken: "secret-live-activity-token",
+							tokenHash: liveActivityTokenHash,
+							tokenEnvironment: "production",
+						},
+						enabled: true,
+					},
+				},
+				"live activity push target registration",
+			);
+			assert(
+				pushRegistration.event.success === true,
+				`Expected push target registration success, got:\n${JSON.stringify(pushRegistration.event)}`,
+			);
+
+			const malformedToken = await readRawRpcResponse(
+				rawClient,
+				{
+					id: "live-activity-malformed-token",
+					type: "register_live_activity",
+					workspaceName: "remote",
+					sessionId,
+					activityId: "activity-1",
+					tokenHash: "A".repeat(64),
+					tokenEnvironment: "production",
+					platform: "ios",
+				},
+				"live activity malformed token",
+			);
+			assert(
+				malformedToken.event.success === false && malformedToken.event.error === "invalid_live_activity_token",
+				`Expected invalid_live_activity_token, got:\n${JSON.stringify(malformedToken.event)}`,
+			);
+
+			const unknownToken = await readRawRpcResponse(
+				rawClient,
+				{
+					id: "live-activity-unknown-token",
+					type: "register_live_activity",
+					workspaceName: "remote",
+					sessionId,
+					activityId: "activity-1",
+					tokenHash: "b".repeat(64),
+					tokenEnvironment: "production",
+					platform: "ios",
+				},
+				"live activity unknown token",
+			);
+			assert(
+				unknownToken.event.success === false && unknownToken.event.error === "unknown_live_activity_token",
+				`Expected unknown_live_activity_token, got:\n${JSON.stringify(unknownToken.event)}`,
+			);
+
+			const sessionMismatch = await readRawRpcResponse(
+				rawClient,
+				{
+					id: "live-activity-session-mismatch",
+					type: "register_live_activity",
+					workspaceName: "remote",
+					sessionId: "other-session",
+					activityId: "activity-1",
+					tokenHash: liveActivityTokenHash,
+					tokenEnvironment: "production",
+					platform: "ios",
+				},
+				"live activity session mismatch",
+			);
+			assert(
+				sessionMismatch.event.success === false && sessionMismatch.event.error === "session_mismatch",
+				`Expected session_mismatch, got:\n${JSON.stringify(sessionMismatch.event)}`,
+			);
+
+			const registration = await readRawRpcResponse(
+				rawClient,
+				{
+					id: "live-activity-register",
+					type: "register_live_activity",
+					workspaceName: "remote",
+					sessionId,
+					activityId: "activity-1",
+					tokenHash: liveActivityTokenHash,
+					tokenEnvironment: "production",
+					platform: "ios",
+				},
+				"live activity register",
+			);
+			assert(
+				registration.event.success === true &&
+					registration.event.data?.status === "registered" &&
+					registration.event.data?.activityId === "activity-1",
+				`Expected live activity registration success, got:\n${JSON.stringify(registration.event)}`,
+			);
+			let hostState = JSON.parse(await readFile(hostStatePath, "utf8"));
+			assert(
+				hostState.clients?.[0]?.liveActivities?.length === 1 &&
+					hostState.clients[0].liveActivities[0].sessionId === sessionId &&
+					hostState.clients[0].liveActivities[0].tokenHash === liveActivityTokenHash,
+				`Expected one live activity registration, got:\n${JSON.stringify(hostState.clients?.[0]?.liveActivities)}`,
+			);
+			assert(
+				!JSON.stringify(hostState.clients[0].liveActivities).includes("secret-live-activity-token"),
+				"Live activity registration stored a raw push token",
+			);
+
+			const idempotentUnregister = await readRawRpcResponse(
+				rawClient,
+				{
+					id: "live-activity-unregister-missing",
+					type: "unregister_live_activity",
+					workspaceName: "remote",
+					sessionId,
+					activityId: "missing-activity",
+				},
+				"live activity idempotent unregister",
+			);
+			assert(
+				idempotentUnregister.event.success === true &&
+					idempotentUnregister.event.data?.status === "unregistered",
+				`Expected idempotent unregister success, got:\n${JSON.stringify(idempotentUnregister.event)}`,
+			);
+			hostState = JSON.parse(await readFile(hostStatePath, "utf8"));
+			assert(
+				hostState.clients?.[0]?.liveActivities?.length === 1,
+				`Expected missing unregister to keep registration, got:\n${JSON.stringify(hostState.clients?.[0]?.liveActivities)}`,
+			);
+
+			const unregister = await readRawRpcResponse(
+				rawClient,
+				{
+					id: "live-activity-unregister",
+					type: "unregister_live_activity",
+					workspaceName: "remote",
+					sessionId,
+					activityId: "activity-1",
+				},
+				"live activity unregister",
+			);
+			assert(
+				unregister.event.success === true && unregister.event.data?.activityId === "activity-1",
+				`Expected unregister success, got:\n${JSON.stringify(unregister.event)}`,
+			);
+			hostState = JSON.parse(await readFile(hostStatePath, "utf8"));
+			assert(
+				hostState.clients?.[0]?.liveActivities === undefined,
+				`Expected unregister to drop registration, got:\n${JSON.stringify(hostState.clients?.[0]?.liveActivities)}`,
+			);
+
+			await readRawRpcResponse(
+				rawClient,
+				{
+					id: "live-activity-register-for-unregister",
+					type: "register_live_activity",
+					workspaceName: "remote",
+					sessionId,
+					activityId: "activity-1",
+					tokenHash: liveActivityTokenHash,
+					tokenEnvironment: "production",
+					platform: "ios",
+				},
+				"live activity register before workspace unregister",
+			);
+			managementClient = {
+				connection: rawClient.connection,
+				...(await openRawAuthorizedStreamOnConnection(rawClient, ticket, {
+					clientLabel: "live activity client",
+					helloMode: "workspaceManagement",
+				})),
+			};
+			const workspaceUnregister = await readRawRpcResponse(
+				managementClient,
+				{ id: "live-activity-workspace-unregister", type: "unregister_workspace", workspaceName: "remote" },
+				"live activity workspace unregister",
+			);
+			assert(
+				workspaceUnregister.event.success === true,
+				`Expected workspace unregister success, got:\n${JSON.stringify(workspaceUnregister.event)}`,
+			);
+			const terminal = await readRawRpcEvent(rawClient, "live activity workspace unregister terminal");
+			assert(
+				terminal.event.type === "remote_terminal" &&
+					terminal.event.reason === "workspace_unregistered" &&
+					terminal.event.workspace === "remote" &&
+					terminal.event.sessionId === sessionId,
+				`Expected workspace unregister terminal, got:\n${JSON.stringify(terminal.event)}`,
+			);
+			hostState = JSON.parse(await readFile(hostStatePath, "utf8"));
+			assert(
+				hostState.clients?.every((client) => client.liveActivities === undefined),
+				`Expected workspace unregister to drop live activities, got:\n${JSON.stringify(hostState.clients)}`,
+			);
+			const stopped = await waitForAuditEvent(
+				getDefaultAuditPath(hostStatePath),
+				(event) =>
+					event.type === "remote_runtime_stopped" &&
+					event.workspace === "remote" &&
+					event.details?.removedLiveActivityCount === 1,
+				"live activity cleanup audit",
+			);
+			assert(
+				stopped.details?.sessionId === sessionId,
+				`Expected cleanup audit to include session id, got:\n${JSON.stringify(stopped)}`,
+			);
+		} finally {
+			await closeRawStream(managementClient);
+			await closeRawAuthorizedClient(rawClient);
+			await endpoint.close();
+			await stopProcess(host.child);
+		}
+	});
+}
+
 async function integratedVoltProfileScenario() {
 	await withStateDir("integrated-profile", async ({ hostStatePath, stateDir }) => {
 		const agentDir = await createIntegratedVoltAgentDir(stateDir);
@@ -4703,6 +4972,7 @@ const scenarios = [
 	["duplicate active connection", duplicateActiveConnectionScenario],
 	["integrated Volt same-workspace conversation ownership", integratedVoltSameWorkspaceConversationOwnershipScenario],
 	["workspace discovery and management", workspaceDiscoveryManagementScenario],
+	["integrated Volt Live Activity host support", integratedVoltLiveActivityHostScenario],
 	["integrated Volt profile", integratedVoltProfileScenario],
 	["integrated Volt env profile", integratedVoltEnvProfileScenario],
 	["malformed handshake", malformedHandshakeScenario],

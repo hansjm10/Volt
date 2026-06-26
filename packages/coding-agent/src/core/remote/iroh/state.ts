@@ -11,11 +11,13 @@ export interface IrohRemoteWorkspace {
 
 export type IrohRemotePushTargetProvider = "fcm";
 export type IrohRemotePushTargetPlatform = "ios";
+export type IrohRemotePushTokenEnvironment = "development" | "production";
 
 export interface IrohRemoteLiveActivityTarget {
 	activityId: string;
 	pushToken: string;
 	tokenHash?: string;
+	tokenEnvironment?: IrohRemotePushTokenEnvironment;
 	updatedAt: number;
 }
 
@@ -32,6 +34,18 @@ export interface IrohRemotePushTarget {
 	updatedAt: number;
 }
 
+export interface IrohRemoteLiveActivityRegistration {
+	workspaceName: string;
+	sessionId: string;
+	activityId: string;
+	tokenHash: string;
+	tokenEnvironment: IrohRemotePushTokenEnvironment;
+	platform: IrohRemotePushTargetPlatform;
+	pushTargetId: string;
+	createdAt: number;
+	updatedAt: number;
+}
+
 export interface IrohRemoteClient {
 	nodeId: string;
 	label: string;
@@ -41,6 +55,7 @@ export interface IrohRemoteClient {
 	lastSeenAt: number;
 	lastSessionIdByWorkspace?: Record<string, string>;
 	pushTargets?: IrohRemotePushTarget[];
+	liveActivities?: IrohRemoteLiveActivityRegistration[];
 }
 
 export interface IrohRemoteRevokedClient {
@@ -150,7 +165,17 @@ function serializeIrohRemoteHostState(state: IrohRemoteHostState): IrohRemoteHos
 			...(client.lastSessionIdByWorkspace
 				? { lastSessionIdByWorkspace: { ...client.lastSessionIdByWorkspace } }
 				: {}),
-			...(client.pushTargets ? { pushTargets: client.pushTargets.map((target) => ({ ...target })) } : {}),
+			...(client.pushTargets
+				? {
+						pushTargets: client.pushTargets.map((target) => ({
+							...target,
+							...(target.liveActivity ? { liveActivity: { ...target.liveActivity } } : {}),
+						})),
+					}
+				: {}),
+			...(client.liveActivities
+				? { liveActivities: client.liveActivities.map((registration) => ({ ...registration })) }
+				: {}),
 		})),
 		revokedClients: (state.revokedClients ?? []).map((client) => ({
 			...client,
@@ -190,6 +215,7 @@ export function parseIrohRemoteClient(value: unknown): IrohRemoteClient {
 			"client last session id",
 		),
 		...parseOptionalPushTargetsProperty(client.pushTargets, "client pushTargets"),
+		...parseOptionalLiveActivityRegistrationsProperty(client.liveActivities, "client liveActivities"),
 	};
 }
 
@@ -221,7 +247,23 @@ function parseOptionalIrohRemoteLiveActivityTarget(
 		activityId: expectString(target.activityId, `${label} activityId`),
 		pushToken: expectString(target.pushToken, `${label} pushToken`),
 		tokenHash: expectOptionalString(target.tokenHash, `${label} tokenHash`),
+		tokenEnvironment: expectOptionalPushTokenEnvironment(target.tokenEnvironment, `${label} tokenEnvironment`),
 		updatedAt: expectNumber(target.updatedAt, `${label} updatedAt`),
+	};
+}
+
+export function parseIrohRemoteLiveActivityRegistration(value: unknown): IrohRemoteLiveActivityRegistration {
+	const registration = expectRecord(value, "live activity registration");
+	return {
+		workspaceName: expectString(registration.workspaceName, "live activity workspaceName"),
+		sessionId: expectString(registration.sessionId, "live activity sessionId"),
+		activityId: expectString(registration.activityId, "live activity activityId"),
+		tokenHash: expectString(registration.tokenHash, "live activity tokenHash"),
+		tokenEnvironment: expectPushTokenEnvironment(registration.tokenEnvironment, "live activity tokenEnvironment"),
+		platform: expectPushTargetPlatform(registration.platform, "live activity platform"),
+		pushTargetId: expectString(registration.pushTargetId, "live activity pushTargetId"),
+		createdAt: expectNumber(registration.createdAt, "live activity createdAt"),
+		updatedAt: expectNumber(registration.updatedAt, "live activity updatedAt"),
 	};
 }
 
@@ -343,6 +385,16 @@ function parseOptionalPushTargetsProperty(value: unknown, label: string): { push
 	return { pushTargets: parseArray(value, label, parseIrohRemotePushTarget) };
 }
 
+function parseOptionalLiveActivityRegistrationsProperty(
+	value: unknown,
+	label: string,
+): { liveActivities?: IrohRemoteLiveActivityRegistration[] } {
+	if (value === undefined) {
+		return {};
+	}
+	return { liveActivities: parseArray(value, label, parseIrohRemoteLiveActivityRegistration) };
+}
+
 function expectPairingSecretTombstoneOutcome(value: unknown): IrohRemotePairingSecretTombstoneOutcome {
 	if (value === "pairing_secret_consumed" || value === "pairing_secret_expired") {
 		return value;
@@ -362,6 +414,20 @@ function expectPushTargetPlatform(value: unknown, label: string): IrohRemotePush
 		return value;
 	}
 	throw new Error(`${label} must be ios`);
+}
+
+function expectPushTokenEnvironment(value: unknown, label: string): IrohRemotePushTokenEnvironment {
+	if (value === "development" || value === "production") {
+		return value;
+	}
+	throw new Error(`${label} must be development or production`);
+}
+
+function expectOptionalPushTokenEnvironment(value: unknown, label: string): IrohRemotePushTokenEnvironment | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+	return expectPushTokenEnvironment(value, label);
 }
 
 function expectRecord(value: unknown, label: string): Record<string, unknown> {

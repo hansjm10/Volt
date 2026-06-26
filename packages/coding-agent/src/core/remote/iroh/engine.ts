@@ -354,6 +354,7 @@ export class IrohRemoteHostEngine {
 					response: createIrohRemoteHandshakeFailure(authorization.error, {
 						hostNodeId: this.hostNodeId,
 						outcome: authorization.outcome,
+						workspace: authorization.workspace?.name,
 					}),
 					responseWritten: false,
 				});

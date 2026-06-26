@@ -51,6 +51,17 @@ export type RpcCommand =
 
 	// Push notifications
 	| { id?: string; type: "register_push_target"; args: RpcRegisterPushTargetArgs }
+	| {
+			id?: string;
+			type: "register_live_activity";
+			workspaceName: string;
+			sessionId: string;
+			activityId: string;
+			tokenHash: string;
+			tokenEnvironment: RpcPushTokenEnvironment;
+			platform: RpcPushPlatform;
+	  }
+	| { id?: string; type: "unregister_live_activity"; workspaceName: string; sessionId: string; activityId: string }
 
 	// Remote host management
 	| { id?: string; type: "unregister_workspace"; name: string }
@@ -277,11 +288,13 @@ export interface RpcPendingHostActionsResponse {
 
 export type RpcPushProvider = "fcm";
 export type RpcPushPlatform = "ios";
+export type RpcPushTokenEnvironment = "development" | "production";
 
 export interface RpcLiveActivityRegistration {
 	activityId: string;
 	pushToken: string;
 	tokenHash?: string;
+	tokenEnvironment?: RpcPushTokenEnvironment;
 }
 
 export interface RpcRegisterPushTargetArgs {
@@ -298,6 +311,16 @@ export interface RpcRegisterPushTargetArgs {
 export interface RpcRegisterPushTargetResponse {
 	status: "registered";
 	pushTargetId: string;
+}
+
+export interface RpcRegisterLiveActivityResponse {
+	status: "registered";
+	activityId: string;
+}
+
+export interface RpcUnregisterLiveActivityResponse {
+	status: "unregistered";
+	activityId: string;
 }
 
 // ============================================================================
@@ -431,6 +454,20 @@ export type RpcResponse =
 			command: "register_push_target";
 			success: true;
 			data: RpcRegisterPushTargetResponse;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "register_live_activity";
+			success: true;
+			data: RpcRegisterLiveActivityResponse;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "unregister_live_activity";
+			success: true;
+			data: RpcUnregisterLiveActivityResponse;
 	  }
 
 	// Remote host management

@@ -102,7 +102,11 @@ export function runIrohRemoteRpcMode(
 	let detachLiveActivityUpdates: (() => void) | undefined;
 	const attachLiveActivityUpdates = () => {
 		detachLiveActivityUpdates?.();
-		detachLiveActivityUpdates = attachIrohRemoteLiveActivityUpdates(runtimeHost, options.notificationDelivery);
+		detachLiveActivityUpdates = attachIrohRemoteLiveActivityUpdates(
+			runtimeHost,
+			options.notificationDelivery,
+			options.workspaceName,
+		);
 	};
 	const outboundTransport = createIrohRemoteOutboundFilteredRpcTransport({
 		decorate: options.decorateOutbound,
@@ -317,11 +321,12 @@ function normalizeIrohRemoteTranscriptTimestamp(timestamp: string): string {
 function attachIrohRemoteLiveActivityUpdates(
 	runtimeHost: AgentSessionRuntime,
 	delivery: IrohRemotePushNotificationDelivery | undefined,
+	workspaceName: string | undefined,
 ): () => void {
 	if (!delivery?.deliverLiveActivityUpdate) {
 		return () => {};
 	}
-	const updater = new IrohRemoteLiveActivityUpdater(runtimeHost, delivery);
+	const updater = new IrohRemoteLiveActivityUpdater(runtimeHost, delivery, workspaceName);
 	return runtimeHost.session.subscribe((event) => {
 		void updater.handle(event).catch(() => {});
 	});
@@ -330,18 +335,24 @@ function attachIrohRemoteLiveActivityUpdates(
 class IrohRemoteLiveActivityUpdater {
 	private readonly delivery: Required<Pick<IrohRemotePushNotificationDelivery, "deliverLiveActivityUpdate">>;
 	private readonly runtimeHost: AgentSessionRuntime;
+	private readonly workspaceName: string | undefined;
 	private readonly toolIndexesByCallId = new Map<string, number>();
 	private deliveryQueue: Promise<void> = Promise.resolve();
 	private recentTools: IrohRemoteLiveActivityToolGlyph[] = [];
 	private sequence = 0;
 	private active = false;
 
-	constructor(runtimeHost: AgentSessionRuntime, delivery: IrohRemotePushNotificationDelivery) {
+	constructor(
+		runtimeHost: AgentSessionRuntime,
+		delivery: IrohRemotePushNotificationDelivery,
+		workspaceName: string | undefined,
+	) {
 		if (!delivery.deliverLiveActivityUpdate) {
 			throw new Error("live activity delivery is unavailable");
 		}
 		this.runtimeHost = runtimeHost;
 		this.delivery = { deliverLiveActivityUpdate: delivery.deliverLiveActivityUpdate.bind(delivery) };
+		this.workspaceName = workspaceName;
 	}
 
 	async handle(event: AgentSessionEvent): Promise<void> {
@@ -424,6 +435,7 @@ class IrohRemoteLiveActivityUpdater {
 			...(currentTool === undefined ? {} : { currentTool }),
 			recentTools: this.recentTools.slice(-6),
 			sessionID: completionState.sessionId,
+			...(this.workspaceName === undefined ? {} : { workspaceName: this.workspaceName }),
 			updatedAtEpochSeconds: nowSeconds,
 		};
 		const update: IrohRemoteLiveActivityUpdateIntent = {

@@ -121,6 +121,8 @@ const RESPONSE_COMPLETION_RPC_TYPES = new Set([
 	"invoke_ui_action",
 	"list_sessions",
 	"register_push_target",
+	"register_live_activity",
+	"unregister_live_activity",
 	"switch_session_by_id",
 	"unregister_workspace",
 ]);
@@ -968,6 +970,7 @@ async function unregisterWorkspace(flags, positionals) {
 	if (!removedWorkspace) {
 		throw new Error(`No registered Iroh remote workspace named ${workspaceName}`);
 	}
+	await stateManager.removeLiveActivitiesForWorkspace(workspaceName);
 	console.error(`unregistered workspace: ${workspaceName}`);
 }
 
@@ -1870,6 +1873,12 @@ async function handleIntegratedConversationRpcCommand(command, authorization, op
 	if (INTEGRATED_CONVERSATION_UNSUPPORTED_RPC_TYPES.has(command.type)) {
 		return createIrohRemoteRpcErrorResponse(getRpcResponseId(command), command.type, "unsupported_remote_command");
 	}
+	if (command.type === "register_live_activity") {
+		return await createRemoteRegisterLiveActivityRpcResponse(command, authorization, options, runtime);
+	}
+	if (command.type === "unregister_live_activity") {
+		return await createRemoteUnregisterLiveActivityRpcResponse(command, authorization, options, runtime);
+	}
 	const identityError = getIntegratedConversationIdentityError(command, authorization, runtime);
 	if (identityError) {
 		return createIrohRemoteRpcErrorResponse(getRpcResponseId(command), command.type, identityError);
@@ -1878,6 +1887,169 @@ async function handleIntegratedConversationRpcCommand(command, authorization, op
 		return createRemoteGetTranscriptRpcResponse(command, authorization, runtime);
 	}
 	return await handleRemoteHostRpcCommand(command, authorization, options);
+}
+
+async function createRemoteRegisterLiveActivityRpcResponse(command, authorization, options, runtime) {
+	const id = getRpcResponseId(command);
+	const request = parseRemoteLiveActivityRegistrationCommand(command, authorization, runtime);
+	if (!request.ok) {
+		await logLiveActivityRegistrationAudit(options, authorization, command, false, request.error);
+		return createIrohRemoteRpcErrorResponse(id, "register_live_activity", request.error);
+	}
+	const deliveryChannel = await options.stateManager.findClientLiveActivityDeliveryChannel(
+		authorization.client.nodeId,
+		{
+			tokenHash: request.tokenHash,
+			tokenEnvironment: request.tokenEnvironment,
+			platform: request.platform,
+		},
+	);
+	if (!deliveryChannel?.liveActivity) {
+		await logLiveActivityRegistrationAudit(
+			options,
+			authorization,
+			command,
+			false,
+			"unknown_live_activity_token",
+			request,
+		);
+		return createIrohRemoteRpcErrorResponse(id, "register_live_activity", "unknown_live_activity_token");
+	}
+	const now = Date.now();
+	const result = await options.stateManager.registerClientLiveActivity(authorization.client.nodeId, {
+		workspaceName: request.workspaceName,
+		sessionId: request.sessionId,
+		activityId: request.activityId,
+		tokenHash: request.tokenHash,
+		tokenEnvironment: request.tokenEnvironment,
+		platform: request.platform,
+		pushTargetId: deliveryChannel.id,
+		createdAt: now,
+		updatedAt: now,
+	});
+	if (!result.registration) {
+		await logLiveActivityRegistrationAudit(options, authorization, command, false, "unknown_live_activity_token", request);
+		return createIrohRemoteRpcErrorResponse(id, "register_live_activity", "unknown_live_activity_token");
+	}
+	await logLiveActivityRegistrationAudit(options, authorization, command, true, undefined, request, {
+		pushTargetId: deliveryChannel.id,
+		replaced: result.replacedRegistration !== undefined,
+	});
+	return createRpcSuccessResponse(id, "register_live_activity", {
+		status: "registered",
+		activityId: request.activityId,
+	});
+}
+
+async function createRemoteUnregisterLiveActivityRpcResponse(command, authorization, options, runtime) {
+	const id = getRpcResponseId(command);
+	const request = parseRemoteLiveActivityUnregistrationCommand(command, authorization, runtime);
+	if (!request.ok) {
+		await logLiveActivityRegistrationAudit(options, authorization, command, false, request.error);
+		return createIrohRemoteRpcErrorResponse(id, "unregister_live_activity", request.error);
+	}
+	const removed = await options.stateManager.unregisterClientLiveActivity(
+		authorization.client.nodeId,
+		request.workspaceName,
+		request.sessionId,
+		request.activityId,
+	);
+	await logLiveActivityRegistrationAudit(options, authorization, command, true, undefined, request, { removed });
+	return createRpcSuccessResponse(id, "unregister_live_activity", {
+		status: "unregistered",
+		activityId: request.activityId,
+	});
+}
+
+function parseRemoteLiveActivityRegistrationCommand(command, authorization, runtime) {
+	const common = parseRemoteLiveActivityCommandScope(command, authorization, runtime);
+	if (!common.ok) {
+		return common;
+	}
+	if (typeof command.tokenHash !== "string") {
+		return { ok: false, error: "invalid_live_activity_token" };
+	}
+	if (!/^[0-9a-f]{64}$/.test(command.tokenHash)) {
+		return { ok: false, error: "invalid_live_activity_token" };
+	}
+	if (command.tokenEnvironment !== "development" && command.tokenEnvironment !== "production") {
+		return { ok: false, error: "invalid_live_activity_registration" };
+	}
+	if (command.platform !== "ios") {
+		return { ok: false, error: "invalid_live_activity_registration" };
+	}
+	return {
+		...common,
+		tokenHash: command.tokenHash,
+		tokenEnvironment: command.tokenEnvironment,
+		platform: command.platform,
+	};
+}
+
+function parseRemoteLiveActivityUnregistrationCommand(command, authorization, runtime) {
+	return parseRemoteLiveActivityCommandScope(command, authorization, runtime);
+}
+
+function parseRemoteLiveActivityCommandScope(command, authorization, runtime) {
+	if (
+		typeof command.workspaceName !== "string" ||
+		typeof command.sessionId !== "string" ||
+		typeof command.activityId !== "string"
+	) {
+		return { ok: false, error: "invalid_live_activity_registration" };
+	}
+	if (command.workspaceName !== authorization.workspace.name || command.sessionId !== runtime.session.sessionId) {
+		return { ok: false, error: "session_mismatch" };
+	}
+	if (!isValidLiveActivityId(command.activityId)) {
+		return { ok: false, error: "invalid_live_activity_registration" };
+	}
+	return {
+		ok: true,
+		workspaceName: command.workspaceName,
+		sessionId: command.sessionId,
+		activityId: command.activityId,
+	};
+}
+
+function isValidLiveActivityId(activityId) {
+	return (
+		activityId.length > 0 &&
+		Array.from(activityId).length <= 128 &&
+		Buffer.byteLength(activityId, "utf8") <= 512
+	);
+}
+
+async function logLiveActivityRegistrationAudit(
+	options,
+	authorization,
+	command,
+	success,
+	error,
+	request,
+	extraDetails = {},
+) {
+	const details = {
+		command: command.type,
+		...(request
+			? {
+					sessionId: request.sessionId,
+					activityId: request.activityId,
+					tokenHash: request.tokenHash,
+					tokenEnvironment: request.tokenEnvironment,
+					platform: request.platform,
+				}
+			: {}),
+		...extraDetails,
+	};
+	await logAudit(options.auditLogger, {
+		type: command.type === "unregister_live_activity" ? "live_activity_unregistered" : "live_activity_registered",
+		clientNodeId: authorization.client.nodeId,
+		workspace: request?.workspaceName ?? authorization.workspace.name,
+		success,
+		error,
+		details,
+	});
 }
 
 function getIntegratedConversationIdentityError(command, authorization, runtime) {
@@ -1996,6 +2168,21 @@ async function closeActiveStreamsForWorkspace(options, workspaceName, reason, ex
 	return entries.length;
 }
 
+async function closeActiveStreamsForClientWorkspace(options, nodeId, workspaceName, reason) {
+	const entries = options.activeStreams
+		.entriesForClientNodeId(nodeId)
+		.filter((entry) => entry.workspaceName === workspaceName);
+	if (entries.length === 0) {
+		return 0;
+	}
+	for (const entry of entries) {
+		options.activeStreams.unregister(entry);
+		await Promise.resolve(entry.close(reason)).catch(() => {});
+	}
+	await closeIdleConnectionsForEntries(options, entries, reason);
+	return entries.length;
+}
+
 async function stopIntegratedRuntimesForWorkspace(options, workspaceName, reason) {
 	let stoppedCount = 0;
 	for (const entry of Array.from(options.integratedRuntimes.values())) {
@@ -2006,6 +2193,40 @@ async function stopIntegratedRuntimesForWorkspace(options, workspaceName, reason
 		stoppedCount++;
 	}
 	return stoppedCount;
+}
+
+async function stopIntegratedRuntimesForClientWorkspace(options, nodeId, workspaceName, reason) {
+	let stoppedCount = 0;
+	for (const entry of Array.from(options.integratedRuntimes.values())) {
+		if (entry.clientNodeId !== nodeId || entry.workspaceName !== workspaceName) {
+			continue;
+		}
+		await stopIntegratedRuntimeEntry(entry, options, reason);
+		stoppedCount++;
+	}
+	return stoppedCount;
+}
+
+async function closeWorkspaceAuthorizationRemovedStreams(options, nodeId, workspaceName) {
+	const reason = "workspace_authorization_removed";
+	const closedStreamCount = await closeActiveStreamsForClientWorkspace(options, nodeId, workspaceName, reason);
+	const stoppedRuntimeCount = await stopIntegratedRuntimesForClientWorkspace(options, nodeId, workspaceName, reason);
+	const removedLiveActivityCount = await options.stateManager.removeClientLiveActivitiesForWorkspace(
+		nodeId,
+		workspaceName,
+	);
+	await logAudit(options.auditLogger, {
+		type: "workspace_authorization_removed",
+		clientNodeId: nodeId,
+		workspace: workspaceName,
+		success: closedStreamCount > 0 || stoppedRuntimeCount > 0 || removedLiveActivityCount > 0,
+		details: {
+			closedStreamCount,
+			removedLiveActivityCount,
+			source: "authorization_failure",
+			stoppedRuntimeCount,
+		},
+	});
 }
 
 async function handleWorkspaceManagementUnregisterCommand(command, authorization, activeStream, options) {
@@ -2033,6 +2254,7 @@ async function handleWorkspaceManagementUnregisterCommand(command, authorization
 		request.workspaceName,
 		WORKSPACE_UNREGISTERED_CLOSE_REASON,
 	);
+	const removedLiveActivityCount = await options.stateManager.removeLiveActivitiesForWorkspace(request.workspaceName);
 	await logAudit(options.auditLogger, {
 		type: "workspace_unregistered",
 		clientNodeId: authorization.client.nodeId,
@@ -2040,6 +2262,7 @@ async function handleWorkspaceManagementUnregisterCommand(command, authorization
 		success: true,
 		details: {
 			closedStreamCount,
+			removedLiveActivityCount,
 			source: "remote_workspace_management_stream",
 			stoppedRuntimeCount,
 		},
@@ -2496,6 +2719,11 @@ async function stopIntegratedRuntimeEntry(entry, options, reason) {
 	entry.subscribers.clear();
 	entry.detachedAt = undefined;
 	const wasActive = entry.runtime.session.isStreaming;
+	const removedLiveActivityCount = await options.stateManager.removeClientLiveActivitiesForSession(
+		entry.clientNodeId,
+		entry.workspaceName,
+		entry.sessionId,
+	);
 	let stopSuccess = true;
 	let stopError;
 	try {
@@ -2510,13 +2738,13 @@ async function stopIntegratedRuntimeEntry(entry, options, reason) {
 		workspace: entry.workspaceName,
 		success: stopSuccess,
 		error: stopError,
-		details: getIntegratedRuntimeDetails(entry, { active: wasActive, reason }),
+		details: getIntegratedRuntimeDetails(entry, { active: wasActive, reason, removedLiveActivityCount }),
 	});
 	await logIntegratedRuntimeAudit(
 		options,
 		entry,
 		"remote_runtime_stopped",
-		{ active: wasActive, reason },
+		{ active: wasActive, reason, removedLiveActivityCount },
 		stopSuccess,
 		stopError,
 	);
@@ -2891,6 +3119,12 @@ async function handleConnectionStream(
 		writeSuccessResponse: false,
 	});
 	if (!handshake.ok) {
+		if (
+			handshake.response?.outcome === "workspace_authorization_removed" &&
+			typeof handshake.response.workspace === "string"
+		) {
+			await closeWorkspaceAuthorizationRemovedStreams(options, remoteId, handshake.response.workspace);
+		}
 		await stream.send.finish?.();
 		await Promise.resolve(stream.recv.stop?.(0n)).catch(() => {});
 		return;

@@ -39,10 +39,12 @@ export interface IrohRemoteClientAuthorizationSuccess {
 
 export interface IrohRemoteClientAuthorizationFailure {
 	ok: false;
+	client?: IrohRemoteClient;
 	error: string;
 	expiredPairingTickets?: IrohRemotePendingPairingTicket[];
 	outcome: IrohRemoteHostHandshakeFailureOutcome;
 	pairingSecretExpired: boolean;
+	workspace?: IrohRemoteWorkspace;
 }
 
 export type IrohRemoteClientAuthorizationResult =
@@ -157,10 +159,12 @@ export function authorizeIrohRemoteClient(
 	if (existingClient && !isIrohRemoteClientAllowedForWorkspace(existingClient, workspace.name)) {
 		return {
 			ok: false,
+			client: existingClient,
 			error: `workspace authorization has been removed: ${workspace.name}`,
 			...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
 			outcome: "workspace_authorization_removed",
 			pairingSecretExpired: false,
+			workspace,
 		};
 	}
 
