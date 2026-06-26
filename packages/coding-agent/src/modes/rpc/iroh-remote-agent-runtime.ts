@@ -12,6 +12,7 @@ import { AuthStorage } from "../../core/auth-storage.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "../../core/http-dispatcher.ts";
 import {
 	IrohRemoteOutcomeError,
+	isIrohRemoteSessionId,
 	parseIrohRemoteAllowTools,
 	usesDefaultIrohRemoteAllowTools,
 } from "../../core/remote/iroh/index.ts";
@@ -156,6 +157,22 @@ async function createIrohRemoteSessionManager(
 			sessionManager,
 			selection: {
 				kind: "created",
+				sessionFile: sessionManager.getSessionFile(),
+				sessionId: sessionManager.getSessionId(),
+			},
+		};
+	}
+
+	if (!isIrohRemoteSessionId(resumeSessionId)) {
+		if (target.target === "session") {
+			throw new IrohRemoteOutcomeError("session_unavailable", "session not found in workspace");
+		}
+		const sessionManager = SessionManager.create(options.cwd, sessionDir);
+		return {
+			sessionManager,
+			selection: {
+				kind: "created_after_missing",
+				requestedSessionId: resumeSessionId,
 				sessionFile: sessionManager.getSessionFile(),
 				sessionId: sessionManager.getSessionId(),
 			},

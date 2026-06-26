@@ -55,8 +55,11 @@ export function authorizeIrohRemoteClient(
 	remoteNodeId: string,
 	options: AuthorizeIrohRemoteClientOptions,
 ): IrohRemoteClientAuthorizationResult {
-	const workspace = options.workspace;
-	const workspaceName = workspace?.name ?? hello.workspace;
+	const workspace = options.workspace?.name === hello.workspace ? options.workspace : undefined;
+	const registeredWorkspace =
+		state.workspaces.find((entry) => entry.name === hello.workspace) ??
+		(options.workspace?.name === hello.workspace ? options.workspace : undefined);
+	const workspaceName = registeredWorkspace?.name ?? options.workspace?.name ?? hello.workspace;
 	const workspaces = getIrohRemoteWorkspaceStatuses(state, options.workspaceStatuses);
 	const workspaceNames = workspaces.filter((entry) => entry.status === "available").map((entry) => entry.name);
 	const now = options.now ?? Date.now();
@@ -131,12 +134,32 @@ export function authorizeIrohRemoteClient(
 		};
 	}
 
-	if (!workspace || hello.workspace !== workspace.name) {
+	if (!registeredWorkspace) {
 		return {
 			ok: false,
-			error: `workspace not allowed: ${hello.workspace}`,
+			error: `workspace is not registered: ${hello.workspace}`,
+			...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
+			outcome: "workspace_unregistered",
+			pairingSecretExpired: false,
+		};
+	}
+
+	if (!workspace) {
+		return {
+			ok: false,
+			error: `workspace path is unavailable: ${hello.workspace}`,
 			...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
 			outcome: "workspace_unavailable",
+			pairingSecretExpired: false,
+		};
+	}
+
+	if (existingClient && !isIrohRemoteClientAllowedForWorkspace(existingClient, workspace.name)) {
+		return {
+			ok: false,
+			error: `workspace authorization has been removed: ${workspace.name}`,
+			...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
+			outcome: "workspace_authorization_removed",
 			pairingSecretExpired: false,
 		};
 	}
@@ -176,7 +199,7 @@ export function authorizeIrohRemoteClient(
 				ok: false,
 				error: `pairing ticket is not valid for workspace: ${workspace.name}`,
 				...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
-				outcome: "workspace_forbidden",
+				outcome: "workspace_authorization_removed",
 				pairingSecretExpired: false,
 			};
 		}
@@ -232,7 +255,6 @@ export function authorizeIrohRemoteClient(
 
 	const persistedAllowedTools = existingClient.allowedTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS;
 	existingClient.lastSeenAt = now;
-	existingClient.allowedWorkspaces = [];
 	existingClient.allowedTools = persistedAllowedTools;
 	if (hello.clientLabel) {
 		existingClient.label = hello.clientLabel;

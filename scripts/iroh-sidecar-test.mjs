@@ -3726,7 +3726,7 @@ async function pairingTicketWorkspaceBindingScenario() {
 			assert(clientOutput.exit.code !== 0, "Workspace-bound ticket client unexpectedly succeeded");
 			assert(
 				clientOutput.stderr.includes(
-					"workspace_forbidden: pairing ticket is not valid for workspace: private",
+					"workspace_authorization_removed: pairing ticket is not valid for workspace: private",
 				),
 				`Expected workspace-bound ticket rejection, got:\n${clientOutput.stderr}`,
 			);

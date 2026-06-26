@@ -252,6 +252,46 @@ export default function (volt) {
 		}
 	});
 
+	it("ignores malformed remembered remote session IDs before lookup", async () => {
+		writeRuntimeConfig({});
+		const sessionDir = join(agentDir, "sessions", "remote-workspace");
+		mkdirSync(sessionDir, { recursive: true });
+		writeFileSync(
+			join(sessionDir, "2026-06-21T00-00-00-000Z_BAD-SESSION.jsonl"),
+			`${JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "BAD-SESSION",
+				timestamp: "2026-06-21T00:00:00.000Z",
+				cwd,
+			})}\n`,
+		);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		let runtime: Awaited<ReturnType<typeof createIrohRemoteAgentRuntime>> | undefined;
+		try {
+			const result = await createIrohRemoteAgentRuntimeWithSessionSelection({
+				agentDir,
+				cwd,
+				resumeSessionId: "BAD-SESSION",
+				sessionDir,
+			});
+			runtime = result.runtime;
+
+			expect(result.sessionSelection.kind).toBe("created_after_missing");
+			if (result.sessionSelection.kind !== "created_after_missing") {
+				throw new Error("expected malformed remembered session fallback");
+			}
+			expect(result.sessionSelection.requestedSessionId).toBe("BAD-SESSION");
+			expect(result.sessionSelection.sessionId).toBe(runtime.session.sessionId);
+			expect(result.sessionSelection.sessionId).not.toBe("BAD-SESSION");
+			expect(runtime.session.sessionId).not.toBe("BAD-SESSION");
+		} finally {
+			errorSpy.mockRestore();
+			await runtime?.dispose();
+		}
+	});
+
 	it("rejects a strict missing remote session target", async () => {
 		writeRuntimeConfig({});
 		const sessionDir = join(agentDir, "sessions", "remote-workspace");

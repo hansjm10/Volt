@@ -71,6 +71,8 @@ export interface IrohRemoteHelloParseOptions {
 	allowLegacyWorkspaceMode?: boolean;
 }
 
+export const IROH_REMOTE_SESSION_ID_PATTERN = /^[a-z0-9_-]{1,128}$/;
+
 export interface IrohRemoteHandshakeSuccess {
 	type: typeof IROH_REMOTE_HANDSHAKE_TYPE;
 	success: true;
@@ -289,13 +291,28 @@ function expectOptionalString(value: unknown, label: string): string | undefined
 
 function expectWorkspaceName(value: unknown, label: string): string {
 	const workspace = expectStringForOutcome(value, label, "invalid_workspace");
-	if (hasAsciiControlCharacter(workspace)) {
-		throw new IrohRemoteHandshakeError("invalid_workspace", `${label} must not contain ASCII control characters`);
-	}
-	if (Array.from(workspace).length > 255 || Buffer.byteLength(workspace, "utf8") > 1024) {
-		throw new IrohRemoteHandshakeError("invalid_workspace", `${label} exceeds maximum length`);
+	const validationError = getIrohRemoteWorkspaceNameValidationError(workspace, label);
+	if (validationError) {
+		throw new IrohRemoteHandshakeError("invalid_workspace", validationError);
 	}
 	return workspace;
+}
+
+export function isIrohRemoteWorkspaceName(value: unknown): value is string {
+	return typeof value === "string" && getIrohRemoteWorkspaceNameValidationError(value, "workspace") === undefined;
+}
+
+function getIrohRemoteWorkspaceNameValidationError(value: string, label: string): string | undefined {
+	if (value.length === 0) {
+		return `${label} must be a non-empty string`;
+	}
+	if (hasAsciiControlCharacter(value)) {
+		return `${label} must not contain ASCII control characters`;
+	}
+	if (Array.from(value).length > 255 || Buffer.byteLength(value, "utf8") > 1024) {
+		return `${label} exceeds maximum length`;
+	}
+	return undefined;
 }
 
 function hasAsciiControlCharacter(value: string): boolean {
@@ -306,6 +323,10 @@ function hasAsciiControlCharacter(value: string): boolean {
 		}
 	}
 	return false;
+}
+
+export function isIrohRemoteSessionId(value: unknown): value is string {
+	return typeof value === "string" && IROH_REMOTE_SESSION_ID_PATTERN.test(value);
 }
 
 function parseIrohRemoteHelloMode(
@@ -418,7 +439,7 @@ function expectKnownResponseFields(
 
 function expectRemoteSessionId(value: unknown, label: string): string {
 	const sessionId = expectStringForOutcome(value, label, "invalid_conversation_target");
-	if (!/^[a-z0-9_-]{1,128}$/.test(sessionId)) {
+	if (!isIrohRemoteSessionId(sessionId)) {
 		throw new IrohRemoteHandshakeError(
 			"invalid_conversation_target",
 			`${label} must match lowercase remote session ID syntax`,
@@ -547,7 +568,7 @@ function assertConversationTargetSelection(conversation: IrohRemoteConversationH
 
 function expectRemoteSessionIdForResponse(value: unknown, label: string): string {
 	const sessionId = expectString(value, label);
-	if (!/^[a-z0-9_-]{1,128}$/.test(sessionId)) {
+	if (!isIrohRemoteSessionId(sessionId)) {
 		throw new Error(`${label} must match lowercase remote session ID syntax`);
 	}
 	return sessionId;
