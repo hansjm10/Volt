@@ -301,6 +301,7 @@ export {
 	type IrohRemoteHandshakeSuccess,
 	type IrohRemoteHello,
 	type IrohRemoteHelloMode,
+	type IrohRemoteHelloParseOptions,
 	IrohRemoteHostEngine,
 	type IrohRemoteHostEngineOptions,
 	type IrohRemoteHostFeature,

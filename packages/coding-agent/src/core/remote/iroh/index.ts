@@ -75,6 +75,7 @@ export {
 	type IrohRemoteHandshakeSuccess,
 	type IrohRemoteHello,
 	type IrohRemoteHelloMode,
+	type IrohRemoteHelloParseOptions,
 	type IrohRemoteWorkspaceDiscoveryTarget,
 	type IrohRemoteWorkspaceManagementTarget,
 	parseIrohRemoteHandshakeResponse,

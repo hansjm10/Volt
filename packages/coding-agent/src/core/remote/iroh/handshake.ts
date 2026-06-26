@@ -51,6 +51,9 @@ export type IrohRemoteHelloMode =
 	| {
 			mode: "workspaceManagement";
 			workspaceManagement: IrohRemoteWorkspaceManagementTarget;
+	  }
+	| {
+			mode: "legacyWorkspace";
 	  };
 
 interface IrohRemoteHelloBase {
@@ -63,6 +66,10 @@ interface IrohRemoteHelloBase {
 }
 
 export type IrohRemoteHello = IrohRemoteHelloBase & IrohRemoteHelloMode;
+
+export interface IrohRemoteHelloParseOptions {
+	allowLegacyWorkspaceMode?: boolean;
+}
 
 export interface IrohRemoteHandshakeSuccess {
 	type: typeof IROH_REMOTE_HANDSHAKE_TYPE;
@@ -98,7 +105,7 @@ export class IrohRemoteHandshakeError extends Error {
 	}
 }
 
-export function parseIrohRemoteHelloLine(line: string): IrohRemoteHello {
+export function parseIrohRemoteHelloLine(line: string, options: IrohRemoteHelloParseOptions = {}): IrohRemoteHello {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(line);
@@ -108,7 +115,7 @@ export function parseIrohRemoteHelloLine(line: string): IrohRemoteHello {
 			`Failed to parse Iroh remote handshake: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
-	return parseIrohRemoteHello(parsed);
+	return parseIrohRemoteHello(parsed, options);
 }
 
 export function parseIrohRemoteHandshakeResponseLine(line: string): IrohRemoteHandshakeResponse {
@@ -123,7 +130,7 @@ export function parseIrohRemoteHandshakeResponseLine(line: string): IrohRemoteHa
 	return parseIrohRemoteHandshakeResponse(parsed);
 }
 
-export function parseIrohRemoteHello(value: unknown): IrohRemoteHello {
+export function parseIrohRemoteHello(value: unknown, options: IrohRemoteHelloParseOptions = {}): IrohRemoteHello {
 	const hello = expectRecord(value, "Iroh remote handshake");
 	if (hello.type !== IROH_REMOTE_HELLO_TYPE) {
 		throw new Error("unexpected handshake type");
@@ -133,7 +140,7 @@ export function parseIrohRemoteHello(value: unknown): IrohRemoteHello {
 	}
 
 	const workspace = expectWorkspaceName(hello.workspace, "handshake workspace");
-	const mode = parseIrohRemoteHelloMode(hello);
+	const mode = parseIrohRemoteHelloMode(hello, options);
 	return {
 		type: IROH_REMOTE_HELLO_TYPE,
 		protocol: IROH_REMOTE_ALPN,
@@ -153,13 +160,17 @@ export function parseIrohRemoteHandshakeResponse(value: unknown): IrohRemoteHand
 	if (response.success === true) {
 		const hostNodeId = expectOptionalString(response.hostNodeId, "handshake response hostNodeId");
 		const features = parseOptionalFeatures(response.features);
+		const modeMetadata = parseOptionalHandshakeSuccessMode(response);
+		if (hasHandshakeSuccessModeMetadata(modeMetadata) && hostNodeId === undefined) {
+			throw new Error("handshake response hostNodeId is required for stream mode success");
+		}
 		const success: IrohRemoteHandshakeSuccess = {
 			type: IROH_REMOTE_HANDSHAKE_TYPE,
 			success: true,
 			workspace: expectString(response.workspace, "handshake response workspace"),
 			clientNodeId: expectString(response.clientNodeId, "handshake response clientNodeId"),
 			...(features === undefined ? {} : { features }),
-			...parseOptionalHandshakeSuccessMode(response),
+			...modeMetadata,
 			child: expectOptionalString(response.child, "handshake response child"),
 		};
 		return hostNodeId === undefined ? success : { ...success, hostNodeId };
@@ -297,10 +308,16 @@ function hasAsciiControlCharacter(value: string): boolean {
 	return false;
 }
 
-function parseIrohRemoteHelloMode(hello: Record<string, unknown>): IrohRemoteHelloMode {
+function parseIrohRemoteHelloMode(
+	hello: Record<string, unknown>,
+	options: IrohRemoteHelloParseOptions,
+): IrohRemoteHelloMode {
 	const modeKeys = (["conversation", "workspaceDiscovery", "workspaceManagement"] as const).filter(
 		(key) => hello[key] !== undefined,
 	);
+	if (modeKeys.length === 0 && options.allowLegacyWorkspaceMode === true) {
+		return { mode: "legacyWorkspace" };
+	}
 	if (modeKeys.length !== 1) {
 		throw new IrohRemoteHandshakeError(
 			"invalid_conversation_target",
@@ -386,6 +403,19 @@ function expectKnownFields(value: Record<string, unknown>, label: string, allowe
 	}
 }
 
+function expectKnownResponseFields(
+	value: Record<string, unknown>,
+	label: string,
+	allowedFields: readonly string[],
+): void {
+	const allowed = new Set(allowedFields);
+	for (const field of Object.keys(value)) {
+		if (!allowed.has(field)) {
+			throw new Error(`${label} has unexpected field ${field}`);
+		}
+	}
+}
+
 function expectRemoteSessionId(value: unknown, label: string): string {
 	const sessionId = expectStringForOutcome(value, label, "invalid_conversation_target");
 	if (!/^[a-z0-9_-]{1,128}$/.test(sessionId)) {
@@ -455,6 +485,19 @@ function parseOptionalHandshakeSuccessMode(
 	return { workspaceManagement: parseWorkspaceManagementResponseMetadata(response.workspaceManagement) };
 }
 
+function hasHandshakeSuccessModeMetadata(
+	metadata: Pick<
+		IrohRemoteHandshakeSuccess,
+		"sessionId" | "conversation" | "workspaceDiscovery" | "workspaceManagement"
+	>,
+): boolean {
+	return (
+		metadata.conversation !== undefined ||
+		metadata.workspaceDiscovery !== undefined ||
+		metadata.workspaceManagement !== undefined
+	);
+}
+
 function assertRequiredHandshakeFeatures(features: string[] | undefined): void {
 	if (
 		features === undefined ||
@@ -467,6 +510,7 @@ function assertRequiredHandshakeFeatures(features: string[] | undefined): void {
 
 function parseConversationHandshakeMetadata(value: unknown): IrohRemoteConversationHandshakeMetadata {
 	const metadata = expectRecord(value, "handshake response conversation");
+	expectKnownResponseFields(metadata, "handshake response conversation", ["target", "sessionId", "selection"]);
 	const conversation: IrohRemoteConversationHandshakeMetadata = {
 		target: expectConversationTargetKind(metadata.target, "handshake response conversation target"),
 		sessionId: expectRemoteSessionIdForResponse(metadata.sessionId, "handshake response conversation sessionId"),
@@ -511,6 +555,7 @@ function expectRemoteSessionIdForResponse(value: unknown, label: string): string
 
 function parseWorkspaceDiscoveryResponseMetadata(value: unknown): IrohRemoteWorkspaceDiscoveryTarget {
 	const metadata = expectRecord(value, "handshake response workspaceDiscovery");
+	expectKnownResponseFields(metadata, "handshake response workspaceDiscovery", ["purpose"]);
 	if (metadata.purpose !== "list_sessions") {
 		throw new Error("handshake response workspaceDiscovery purpose must be list_sessions");
 	}
@@ -519,6 +564,7 @@ function parseWorkspaceDiscoveryResponseMetadata(value: unknown): IrohRemoteWork
 
 function parseWorkspaceManagementResponseMetadata(value: unknown): IrohRemoteWorkspaceManagementTarget {
 	const metadata = expectRecord(value, "handshake response workspaceManagement");
+	expectKnownResponseFields(metadata, "handshake response workspaceManagement", ["purpose"]);
 	if (metadata.purpose !== "unregister_workspace") {
 		throw new Error("handshake response workspaceManagement purpose must be unregister_workspace");
 	}

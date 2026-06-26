@@ -197,7 +197,8 @@ async function runHostCommand(args) {
 }
 
 async function runClient(ticket, clientStatePath, args, options = {}) {
-	const client = spawnScript(clientScript, [ticket, "--state", clientStatePath, ...args]);
+	const helloArgs = options.helloMode === "conversation" ? [] : ["--legacy-workspace-hello"];
+	const client = spawnScript(clientScript, [ticket, "--state", clientStatePath, ...helloArgs, ...args]);
 	const exit = await waitForExit(client.child, options.label ?? "client", client.output, {
 		expectSuccess: options.expectSuccess ?? true,
 		timeoutMs: options.timeoutMs,
@@ -221,16 +222,45 @@ async function bindRawClientEndpoint(relayMode, secretKey) {
 	return endpoint;
 }
 
-function createRawConversationHello(payload, clientLabel, clientNodeId) {
-	return {
+function getHostClientHelloMode(hostArgs) {
+	return hasFlagArg(hostArgs, "integrated-volt") ? "conversation" : "legacyWorkspace";
+}
+
+function createRawHello(payload, clientLabel, clientNodeId, options = {}) {
+	const hello = {
 		type: "volt_iroh_hello",
 		protocol: ALPN_TEXT,
 		workspace: payload.workspace,
 		secret: payload.secret,
 		clientLabel,
 		clientNodeId,
-		conversation: { target: "last" },
 	};
+	if (options.helloMode === "conversation") {
+		return { ...hello, conversation: options.conversation ?? { target: "last" } };
+	}
+	if (options.helloMode === "workspaceDiscovery") {
+		return { ...hello, workspaceDiscovery: { purpose: "list_sessions" } };
+	}
+	if (options.helloMode === "workspaceManagement") {
+		return { ...hello, workspaceManagement: { purpose: "unregister_workspace" } };
+	}
+	return hello;
+}
+
+function assertConversationHandshakeResponse(handshakeResponse, label, options = {}) {
+	const expectedTarget = options.conversation?.target ?? "last";
+	assert(
+		handshakeResponse.hostNodeId &&
+			Array.isArray(handshakeResponse.features) &&
+			handshakeResponse.features.includes("multi_streams.v1") &&
+			handshakeResponse.features.includes("conversation_streams.v1") &&
+			typeof handshakeResponse.sessionId === "string" &&
+			handshakeResponse.sessionId.length > 0 &&
+			handshakeResponse.conversation?.target === expectedTarget &&
+			handshakeResponse.conversation?.sessionId === handshakeResponse.sessionId &&
+			["resumed", "created", "created_missing_last"].includes(handshakeResponse.conversation?.selection),
+		`Expected ${label} conversation handshake metadata, got:\n${JSON.stringify(handshakeResponse)}`,
+	);
 }
 
 async function runRawRpcClient(ticket, command, options = {}) {
@@ -244,10 +274,11 @@ async function runRawRpcClient(ticket, command, options = {}) {
 		await stream.send.writeAll(
 			toBytes(
 				serializeJsonLine(
-					createRawConversationHello(
+					createRawHello(
 						payload,
 						options.clientLabel ?? `raw-node-${process.pid}`,
 						endpoint.id().toString(),
+						options,
 					),
 				),
 			),
@@ -258,6 +289,9 @@ async function runRawRpcClient(ticket, command, options = {}) {
 		const handshakeResponse = JSON.parse(handshake.line);
 		if (handshakeResponse.type !== "volt_iroh_handshake" || !handshakeResponse.success) {
 			throw new Error(handshakeResponse.error ?? "Raw RPC handshake rejected");
+		}
+		if (options.helloMode === "conversation") {
+			assertConversationHandshakeResponse(handshakeResponse, "raw RPC", options);
 		}
 
 		await stream.send.writeAll(toBytes(serializeJsonLine(command)));
@@ -323,10 +357,11 @@ async function openRawAuthorizedClientOnEndpoint(endpoint, ticket, options = {})
 		await stream.send.writeAll(
 			toBytes(
 				serializeJsonLine(
-					createRawConversationHello(
+					createRawHello(
 						payload,
 						options.clientLabel ?? `raw-node-${process.pid}`,
 						endpoint.id().toString(),
+						options,
 					),
 				),
 			),
@@ -340,6 +375,9 @@ async function openRawAuthorizedClientOnEndpoint(endpoint, ticket, options = {})
 		}
 		if (handshakeResponse.success !== true && options.expectSuccess !== false) {
 			throw new Error(handshakeResponse.error ?? "Raw RPC handshake rejected");
+		}
+		if (handshakeResponse.success === true && options.helloMode === "conversation") {
+			assertConversationHandshakeResponse(handshakeResponse, "raw authorized client", options);
 		}
 		return {
 			connection,
@@ -360,7 +398,7 @@ async function openRawAuthorizedStreamOnConnection(rawClient, ticket, options = 
 	await stream.send.writeAll(
 		toBytes(
 			serializeJsonLine(
-				createRawConversationHello(payload, options.clientLabel ?? `raw-node-${process.pid}`, rawClient.nodeId),
+				createRawHello(payload, options.clientLabel ?? `raw-node-${process.pid}`, rawClient.nodeId, options),
 			),
 		),
 	);
@@ -372,6 +410,9 @@ async function openRawAuthorizedStreamOnConnection(rawClient, ticket, options = 
 	}
 	if (handshakeResponse.success !== true && options.expectSuccess !== false) {
 		throw new Error(handshakeResponse.error ?? "Raw RPC handshake rejected");
+	}
+	if (handshakeResponse.success === true && options.helloMode === "conversation") {
+		assertConversationHandshakeResponse(handshakeResponse, "raw authorized stream", options);
 	}
 	return { handshakeResponse, rest: handshake.rest, stream };
 }
@@ -890,7 +931,10 @@ async function runHostClientOnce({ clientArgs, clientStatePath, hostArgs, hostSt
 	const host = startHost(["--state", hostStatePath, "--once", ...hostArgs]);
 	try {
 		const ticket = await waitForFirstStdoutLine(host.child, host.output, `${label} host`);
-		const clientOutput = await runClient(ticket, clientStatePath, clientArgs, { label: `${label} client` });
+		const clientOutput = await runClient(ticket, clientStatePath, clientArgs, {
+			helloMode: getHostClientHelloMode(hostArgs),
+			label: `${label} client`,
+		});
 		await waitForExit(host.child, `${label} host`, host.output);
 		return { clientOutput, hostOutput: host.output, ticket };
 	} finally {
@@ -920,6 +964,7 @@ async function expectHostClientFailure({ clientArgs, clientStatePath, hostArgs, 
 		const ticket = await waitForFirstStdoutLine(host.child, host.output, `${label} host`);
 		const clientOutput = await runClient(ticket, clientStatePath, clientArgs, {
 			expectSuccess: false,
+			helloMode: getHostClientHelloMode(hostArgs),
 			label: `${label} client`,
 		});
 		await waitForExit(host.child, `${label} host`, host.output);
@@ -966,6 +1011,7 @@ async function runHostClientWithTicketOnce({
 		}
 		const clientOutput = await runClient(clientTicket, clientStatePath, clientArgs, {
 			expectSuccess,
+			helloMode: getHostClientHelloMode(hostArgs),
 			label: `${label} client`,
 			timeoutMs: clientTimeoutMs,
 		});
@@ -1250,6 +1296,35 @@ async function rawCommandFilterScenario() {
 	});
 }
 
+async function nonIntegratedStreamModeUnsupportedScenario() {
+	await withStateDir("non-integrated-stream-mode-unsupported", async ({ stateDir }) => {
+		for (const helloMode of ["conversation", "workspaceDiscovery", "workspaceManagement"]) {
+			const hostStatePath = join(stateDir, `${helloMode}.json`);
+			const host = startHost(["--state", hostStatePath, "--once"]);
+			let rawClient;
+			try {
+				const ticket = await waitForFirstStdoutLine(host.child, host.output, `${helloMode} unsupported host`);
+				rawClient = await openRawAuthorizedClient(ticket, {
+					clientLabel: `${helloMode} unsupported client`,
+					expectSuccess: false,
+					helloMode,
+				});
+				assert(
+					rawClient.handshakeResponse.success === false &&
+						rawClient.handshakeResponse.outcome === "conversation_streams_unsupported",
+					`Expected ${helloMode} to fail with conversation_streams_unsupported, got:\n${JSON.stringify(
+						rawClient.handshakeResponse,
+					)}`,
+				);
+				await waitForExit(host.child, `${helloMode} unsupported host`, host.output);
+			} finally {
+				await closeRawAuthorizedClient(rawClient);
+				await stopProcess(host.child);
+			}
+		}
+	});
+}
+
 async function integratedRawCommandFilterScenario() {
 	await withStateDir("integrated-filter", async ({ hostStatePath, stateDir }) => {
 		const agentDir = await createIntegratedVoltAgentDir(stateDir);
@@ -1270,7 +1345,7 @@ async function integratedRawCommandFilterScenario() {
 			const lines = await runRawRpcClient(
 				ticket,
 				{ id: "bash-integrated-1", type: "bash", command: "echo blocked" },
-				{ finishSend: true },
+				{ finishSend: true, helloMode: "conversation" },
 			);
 			await waitForExit(host.child, "integrated raw command filter host", host.output);
 			const responses = lines.map((line) => JSON.parse(line));
@@ -1318,7 +1393,7 @@ async function integratedVoltGetStateScenario() {
 			const lines = await runRawRpcClient(
 				ticket,
 				{ id: "state-integrated", type: "get_state" },
-				{ finishSend: true },
+				{ finishSend: true, helloMode: "conversation" },
 			);
 			await waitForExit(host.child, "integrated Volt host", host.output);
 			const responses = lines.map((line) => JSON.parse(line));
@@ -1501,6 +1576,7 @@ async function integratedVoltDetachReattachRuntimeScenario() {
 
 			rawClient = await openRawAuthorizedClientOnEndpoint(endpoint, ticket, {
 				clientLabel: "detach client",
+				helloMode: "conversation",
 			});
 			const firstState = await readRawRpcResponse(
 				rawClient,
@@ -1526,6 +1602,7 @@ async function integratedVoltDetachReattachRuntimeScenario() {
 
 			rawClient = await openRawAuthorizedClientOnEndpoint(endpoint, ticket, {
 				clientLabel: "detach client",
+				helloMode: "conversation",
 			});
 			const secondState = await readRawRpcResponse(
 				rawClient,
@@ -1613,6 +1690,7 @@ async function integratedVoltDetachedRuntimeTtlScenario() {
 
 			rawClient = await openRawAuthorizedClientOnEndpoint(endpoint, ticket, {
 				clientLabel: "ttl client",
+				helloMode: "conversation",
 			});
 			const state = await readRawRpcResponse(
 				rawClient,
@@ -1697,6 +1775,7 @@ async function integratedVoltActiveDetachReconnectTranscriptScenario() {
 
 			rawClient = await openRawAuthorizedClientOnEndpoint(endpoint, ticket, {
 				clientLabel: "active detach client",
+				helloMode: "conversation",
 			});
 			const initialState = await readRawRpcResponse(
 				rawClient,
@@ -1729,6 +1808,7 @@ async function integratedVoltActiveDetachReconnectTranscriptScenario() {
 
 			differentClient = await openRawAuthorizedClientOnEndpoint(differentEndpoint, ticket, {
 				clientLabel: "different active detach client",
+				helloMode: "conversation",
 				expectSuccess: false,
 			});
 			assert(
@@ -1742,6 +1822,7 @@ async function integratedVoltActiveDetachReconnectTranscriptScenario() {
 
 			rawClient = await openRawAuthorizedClientOnEndpoint(endpoint, ticket, {
 				clientLabel: "active detach client",
+				helloMode: "conversation",
 			});
 			const reattachedState = await readRawRpcResponse(
 				rawClient,
@@ -1796,6 +1877,7 @@ async function integratedVoltActiveDetachReconnectTranscriptScenario() {
 
 			const revokedClient = await openRawAuthorizedClientOnEndpoint(endpoint, ticket, {
 				clientLabel: "active detach client",
+				helloMode: "conversation",
 				expectSuccess: false,
 			});
 			assert(
@@ -1884,9 +1966,11 @@ async function integratedVoltMultiWorkspaceRuntimeIsolationScenario() {
 
 			rawClient = await openRawAuthorizedClientOnEndpoint(endpoint, alphaTicket, {
 				clientLabel: "multi-workspace runtime client",
+				helloMode: "conversation",
 			});
 			const betaStream = await openRawAuthorizedStreamOnConnection(rawClient, betaTicket, {
 				clientLabel: "multi-workspace runtime client",
+				helloMode: "conversation",
 			});
 			betaClient = {
 				connection: rawClient.connection,
@@ -2138,6 +2222,7 @@ async function nativeIrohMultiStreamLifecycleScenario() {
 
 			alphaClient = await openRawAuthorizedClientOnEndpoint(endpoint, alphaTicket, {
 				clientLabel: "native multi-stream client",
+				helloMode: "conversation",
 			});
 			assert(
 				alphaClient.handshakeResponse.features?.includes("multi_streams.v1"),
@@ -2145,6 +2230,7 @@ async function nativeIrohMultiStreamLifecycleScenario() {
 			);
 			const betaStream = await openRawAuthorizedStreamOnConnection(alphaClient, betaTicket, {
 				clientLabel: "native multi-stream client",
+				helloMode: "conversation",
 			});
 			assert(
 				betaStream.handshakeResponse.features?.includes("multi_streams.v1"),
@@ -2240,6 +2326,7 @@ async function nativeIrohMultiStreamLifecycleScenario() {
 
 			const reattachedAlphaStream = await openRawAuthorizedStreamOnConnection(betaClient, alphaReconnectTicket, {
 				clientLabel: "native multi-stream client",
+				helloMode: "conversation",
 			});
 			reattachedAlphaClient = {
 				connection: betaClient.connection,
@@ -2302,6 +2389,7 @@ async function nativeIrohMultiStreamLifecycleScenario() {
 
 			revokedClient = await openRawAuthorizedClientOnEndpoint(endpoint, alphaReconnectTicket, {
 				clientLabel: "native multi-stream client",
+				helloMode: "conversation",
 				expectSuccess: false,
 			});
 			assert(
@@ -2347,6 +2435,7 @@ async function duplicateActiveConnectionScenario() {
 				const ticket = await waitForFirstStdoutLine(host.child, host.output, "duplicate active host");
 				firstClient = await openRawAuthorizedClientOnEndpoint(endpoint, ticket, {
 					clientLabel: "duplicate active client",
+					helloMode: "conversation",
 				});
 				const firstState = await readRawRpcResponse(
 					firstClient,
@@ -2357,6 +2446,7 @@ async function duplicateActiveConnectionScenario() {
 
 				duplicateStream = await openRawAuthorizedStreamOnConnection(firstClient, ticket, {
 					clientLabel: "duplicate active client",
+					helloMode: "conversation",
 					expectSuccess: false,
 				});
 				assert(
@@ -2382,6 +2472,7 @@ async function duplicateActiveConnectionScenario() {
 				replacementClient = await withOperationTimeout(
 					openRawAuthorizedClientOnEndpoint(replacementEndpoint, reconnectTicket, {
 						clientLabel: "duplicate active client",
+						helloMode: "conversation",
 					}),
 					"duplicate active replacement connect",
 					2000,
@@ -2425,6 +2516,7 @@ async function duplicateActiveConnectionScenario() {
 				);
 				firstClient = await openRawAuthorizedClientOnEndpoint(endpoint, reconnectTicket, {
 					clientLabel: "duplicate active client",
+					helloMode: "conversation",
 				});
 				const reconnectState = await readRawRpcResponse(
 					firstClient,
@@ -2513,7 +2605,7 @@ async function integratedVoltProfileScenario() {
 			const lines = await runRawRpcClient(
 				ticket,
 				{ id: "state-profile", type: "get_state" },
-				{ finishSend: true },
+				{ finishSend: true, helloMode: "conversation" },
 			);
 			await waitForExit(host.child, "integrated profile host", host.output);
 			const responses = lines.map((line) => JSON.parse(line));
@@ -2572,7 +2664,11 @@ async function integratedVoltEnvProfileScenario() {
 		try {
 			const ticket = await waitForFirstStdoutLine(host.child, host.output, "integrated env profile host");
 			assert(ticket.startsWith(TICKET_PREFIX), `Expected first stdout line to be a ticket, got:\n${host.output.stdout}`);
-			const lines = await runRawRpcClient(ticket, { id: "state-env-profile", type: "get_state" }, { finishSend: true });
+			const lines = await runRawRpcClient(
+				ticket,
+				{ id: "state-env-profile", type: "get_state" },
+				{ finishSend: true, helloMode: "conversation" },
+			);
 			await waitForExit(host.child, "integrated env profile host", host.output);
 			await access(join(agentDir, "prompts", "agent.md"));
 			await access(join(workspacePath, ".volt", "prompts", "project.md"));
@@ -3464,7 +3560,11 @@ async function auditLogScenario() {
 			const ticket = await waitForFirstStdoutLine(host.child, host.output, "audit runtime failure host");
 			let runtimeError;
 			try {
-				await runRawRpcClient(ticket, { id: "state-runtime-failure", type: "get_state" }, { finishSend: true });
+				await runRawRpcClient(
+					ticket,
+					{ id: "state-runtime-failure", type: "get_state" },
+					{ finishSend: true, helloMode: "conversation" },
+				);
 			} catch (error) {
 				runtimeError = error;
 			}
@@ -3736,6 +3836,7 @@ const scenarios = [
 	["source Volt retry-cancelled half-close prompt", halfClosedSourceVoltRetryCancelledScenario],
 	["source Volt queued steer half-close", halfClosedSourceVoltQueuedSteerScenario],
 	["raw command filter", rawCommandFilterScenario],
+	["non-integrated stream mode unsupported", nonIntegratedStreamModeUnsupportedScenario],
 	["integrated raw command filter", integratedRawCommandFilterScenario],
 	["integrated Volt get_state", integratedVoltGetStateScenario],
 	["integrated Volt reconnect session", integratedVoltReconnectSessionScenario],

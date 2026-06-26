@@ -38,6 +38,8 @@ Options:
   --get-state            Send get_state instead of prompt.
   --interactive          Keep the Iroh connection open and read prompts from stdin.
   --client-label <label> Client label sent during pairing. Defaults to this process.
+  --legacy-workspace-hello
+                         Send the pre-conversation workspace-scoped hello for spawned host compatibility tests.
   --state <path>         Client state path. Defaults to ~/.volt/agent/remote/iroh-sidecar-client.json.
   --timeout-ms <ms>      Exit if no completion arrives before timeout. Defaults to 30000.
   --verbose              Print non-text RPC events.
@@ -310,6 +312,11 @@ async function sendRpcCommand(send, command) {
 	await writeIrohStream(send, Buffer.from(serializeJsonLine(command), "utf8"));
 }
 
+function createLegacyWorkspaceHello(hello) {
+	const { mode: _mode, conversation: _conversation, workspaceDiscovery: _workspaceDiscovery, workspaceManagement: _workspaceManagement, ...legacyHello } = hello;
+	return legacyHello;
+}
+
 function waitForResponse(state, id) {
 	return new Promise((resolveResponse) => {
 		state.responseResolvers.set(id, resolveResponse);
@@ -506,7 +513,14 @@ async function main() {
 		clientNodeId: endpoint.id().toString(),
 	});
 
-	await clientEngine.writeHello(stream, payload);
+	const hello = clientEngine.createHello(payload);
+	await writeIrohStream(
+		stream.send,
+		Buffer.from(
+			serializeJsonLine(hasFlag(flags, "legacy-workspace-hello") ? createLegacyWorkspaceHello(hello) : hello),
+			"utf8",
+		),
+	);
 	const handshake = await clientEngine.readHandshakeResponse(stream.recv, { expectedHostNodeId: payload.nodeId });
 	if (!handshake.response.success) {
 		const outcomePrefix = handshake.response.outcome ? `${handshake.response.outcome}: ` : "";

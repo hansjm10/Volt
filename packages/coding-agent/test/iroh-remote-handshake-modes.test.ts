@@ -123,6 +123,18 @@ describe("Iroh remote handshake stream modes", () => {
 			mode: "workspaceManagement",
 			workspaceManagement: { purpose: "unregister_workspace" },
 		});
+		expect(
+			parseIrohRemoteHelloLine(
+				JSON.stringify({
+					type: "volt_iroh_hello",
+					protocol: IROH_REMOTE_ALPN,
+					workspace: "volt",
+				}),
+				{ allowLegacyWorkspaceMode: true },
+			),
+		).toMatchObject({
+			mode: "legacyWorkspace",
+		});
 
 		for (const invalid of [
 			{},
@@ -200,6 +212,21 @@ describe("Iroh remote handshake stream modes", () => {
 				conversation: { target: "last", sessionId: "abc123", selection: "resumed" },
 				features: ["multi_streams.v1"],
 			}),
+			responseLine({
+				hostNodeId: undefined,
+				sessionId: "abc123",
+				conversation: { target: "last", sessionId: "abc123", selection: "resumed" },
+			}),
+			responseLine({
+				sessionId: "abc123",
+				conversation: { target: "last", sessionId: "abc123", selection: "resumed", extra: true },
+			}),
+			responseLine({
+				workspaceDiscovery: { purpose: "list_sessions", extra: true },
+			}),
+			responseLine({
+				workspaceManagement: { purpose: "unregister_workspace", extra: true },
+			}),
 		]) {
 			expect(() => parseIrohRemoteHandshakeResponseLine(invalid)).toThrow();
 		}
@@ -226,6 +253,22 @@ describe("Iroh remote handshake stream modes", () => {
 		expect(invalid.written).toMatchObject({
 			success: false,
 			outcome: "invalid_conversation_target",
+		});
+
+		const unsupportedConversation = await readHandshakeForHello(hostEngine, {
+			...baseHello,
+			conversation: { target: "last" },
+		});
+		expect(unsupportedConversation.handshake).toMatchObject({
+			ok: false,
+			response: {
+				success: false,
+				outcome: "conversation_streams_unsupported",
+			},
+		});
+		expect(unsupportedConversation.written).toMatchObject({
+			success: false,
+			outcome: "conversation_streams_unsupported",
 		});
 
 		const conversation = await readHandshakeForHello(

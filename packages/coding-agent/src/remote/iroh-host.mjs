@@ -36,6 +36,7 @@ import {
 	IROH_REMOTE_ALPN,
 	IrohRemoteAuditLogger,
 	IrohRemoteActiveStreamRegistry,
+	IrohRemoteHandshakeError,
 	IrohRemoteHostEngine,
 	IrohRemoteHostStateManager,
 	IrohRemoteInMemoryPushNotificationDeduper,
@@ -1856,6 +1857,22 @@ async function rejectDuplicateActiveConnection(stream, authorization, options) {
 	await Promise.resolve(stream.recv.stop?.(0n)).catch(() => {});
 }
 
+async function rejectUnsupportedConversationStreams(stream, handshake, options) {
+	const error = new IrohRemoteHandshakeError(
+		"conversation_streams_unsupported",
+		"conversation stream modes require integrated Volt host mode",
+	);
+	await logAudit(options.auditLogger, {
+		type: "handshake_rejected",
+		clientNodeId: handshake.authorization.client.nodeId,
+		workspace: handshake.authorization.workspace.name,
+		success: false,
+		error: error.message,
+		details: { mode: handshake.hello.mode, outcome: error.outcome },
+	});
+	await sendHandshakeError(stream, error, options);
+}
+
 function getHandshakeChildLabel(options) {
 	return options.integratedVolt || options.useVolt ? "volt" : "fake-rpc";
 }
@@ -1943,6 +1960,7 @@ async function handleConnectionStream(
 	replaceExistingWorkspaceStream,
 ) {
 	const handshake = await options.hostEngine.readHandshake(stream, remoteId, {
+		allowLegacyWorkspaceMode: !options.integratedVolt,
 		child: getHandshakeChildLabel(options),
 		maxLineBytes: DEFAULT_IROH_REMOTE_HANDSHAKE_MAX_LINE_BYTES,
 		timeoutMs: DEFAULT_IROH_REMOTE_HANDSHAKE_TIMEOUT_MS,
@@ -1959,9 +1977,19 @@ async function handleConnectionStream(
 	}
 
 	if (handshake.hello.mode !== "conversation") {
-		await writeIrohRemoteHandshakeResponse(stream.send, handshake.response);
-		await stream.send.finish?.();
-		await Promise.resolve(stream.recv.stop?.(0n)).catch(() => {});
+		if (!options.integratedVolt) {
+			if (handshake.hello.mode !== "legacyWorkspace") {
+				await rejectUnsupportedConversationStreams(stream, handshake, options);
+				return;
+			}
+		} else {
+			await writeIrohRemoteHandshakeResponse(stream.send, handshake.response);
+			await stream.send.finish?.();
+			await Promise.resolve(stream.recv.stop?.(0n)).catch(() => {});
+			return;
+		}
+	} else if (!options.integratedVolt) {
+		await rejectUnsupportedConversationStreams(stream, handshake, options);
 		return;
 	}
 
