@@ -1,6 +1,7 @@
 export interface IrohRemoteActiveStreamEntry {
 	readonly clientNodeId: string;
 	readonly workspaceName: string;
+	readonly sessionId: string;
 	readonly connectionId: string;
 	readonly streamId: string;
 	close(reason: string): Promise<void> | void;
@@ -46,6 +47,14 @@ export class IrohRemoteActiveStreamRegistry {
 		return this.entriesForClientNodeId(clientNodeId).filter((entry) => entry.workspaceName === workspaceName);
 	}
 
+	entriesForConversation(
+		clientNodeId: string,
+		workspaceName: string,
+		sessionId: string,
+	): IrohRemoteActiveStreamEntry[] {
+		return this.entriesForWorkspace(clientNodeId, workspaceName).filter((entry) => entry.sessionId === sessionId);
+	}
+
 	entriesForConnection(connectionId: string): IrohRemoteActiveStreamEntry[] {
 		return Array.from(this.entriesByConnectionId.get(connectionId) ?? []);
 	}
@@ -53,6 +62,20 @@ export class IrohRemoteActiveStreamRegistry {
 	hasWorkspaceOnConnection(clientNodeId: string, workspaceName: string, connectionId: string): boolean {
 		return this.entriesForConnection(connectionId).some(
 			(entry) => entry.clientNodeId === clientNodeId && entry.workspaceName === workspaceName,
+		);
+	}
+
+	hasConversationOnConnection(
+		clientNodeId: string,
+		workspaceName: string,
+		sessionId: string,
+		connectionId: string,
+	): boolean {
+		return this.entriesForConnection(connectionId).some(
+			(entry) =>
+				entry.clientNodeId === clientNodeId &&
+				entry.workspaceName === workspaceName &&
+				entry.sessionId === sessionId,
 		);
 	}
 

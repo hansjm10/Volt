@@ -553,6 +553,47 @@ describe("Iroh remote core helpers", () => {
 			error: "client is not paired",
 		});
 		expect(
+			createIrohRemoteHandshakeFailure("duplicate conversation connection", {
+				hostNodeId: "host-node",
+				outcome: "duplicate_conversation_connection",
+				workspace: "volt",
+				sessionId: "abc123",
+				retryAfterMs: 500,
+			}),
+		).toEqual({
+			type: "volt_iroh_handshake",
+			success: false,
+			outcome: "duplicate_conversation_connection",
+			hostNodeId: "host-node",
+			workspace: "volt",
+			sessionId: "abc123",
+			retryAfterMs: 500,
+			error: "duplicate conversation connection",
+		});
+		expect(
+			parseIrohRemoteHandshakeResponseLine(
+				JSON.stringify({
+					type: "volt_iroh_handshake",
+					success: false,
+					outcome: "duplicate_conversation_connection",
+					hostNodeId: "host-node",
+					workspace: "volt",
+					sessionId: "abc123",
+					retryAfterMs: 500,
+					error: "duplicate conversation connection",
+				}),
+			),
+		).toEqual({
+			type: "volt_iroh_handshake",
+			success: false,
+			outcome: "duplicate_conversation_connection",
+			hostNodeId: "host-node",
+			workspace: "volt",
+			sessionId: "abc123",
+			retryAfterMs: 500,
+			error: "duplicate conversation connection",
+		});
+		expect(
 			parseIrohRemoteHandshakeResponseLine(
 				JSON.stringify({
 					type: "volt_iroh_handshake",

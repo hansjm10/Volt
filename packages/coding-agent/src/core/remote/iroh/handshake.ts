@@ -92,6 +92,9 @@ export interface IrohRemoteHandshakeFailure {
 	success: false;
 	outcome?: IrohRemoteOutcome;
 	hostNodeId?: string;
+	workspace?: string;
+	sessionId?: string;
+	retryAfterMs?: number;
 	error: string;
 }
 
@@ -180,6 +183,9 @@ export function parseIrohRemoteHandshakeResponse(value: unknown): IrohRemoteHand
 	if (response.success === false) {
 		const outcome = expectOptionalOutcome(response.outcome, "handshake response outcome");
 		const hostNodeId = expectOptionalString(response.hostNodeId, "handshake response hostNodeId");
+		const workspace = expectOptionalString(response.workspace, "handshake response workspace");
+		const sessionId = expectOptionalRemoteSessionId(response.sessionId, "handshake response sessionId");
+		const retryAfterMs = expectOptionalNumber(response.retryAfterMs, "handshake response retryAfterMs");
 		const failure: IrohRemoteHandshakeFailure = {
 			type: IROH_REMOTE_HANDSHAKE_TYPE,
 			success: false,
@@ -189,6 +195,9 @@ export function parseIrohRemoteHandshakeResponse(value: unknown): IrohRemoteHand
 			...failure,
 			...(outcome === undefined ? {} : { outcome }),
 			...(hostNodeId === undefined ? {} : { hostNodeId }),
+			...(workspace === undefined ? {} : { workspace }),
+			...(sessionId === undefined ? {} : { sessionId }),
+			...(retryAfterMs === undefined ? {} : { retryAfterMs }),
 		};
 	}
 	throw new Error("handshake response success must be a boolean");
@@ -223,13 +232,22 @@ export function createIrohRemoteHandshakeSuccess(options: {
 
 export function createIrohRemoteHandshakeFailure(
 	error: string,
-	options: { hostNodeId?: string; outcome?: IrohRemoteHostHandshakeFailureOutcome } = {},
+	options: {
+		hostNodeId?: string;
+		outcome?: IrohRemoteHostHandshakeFailureOutcome;
+		workspace?: string;
+		sessionId?: string;
+		retryAfterMs?: number;
+	} = {},
 ): IrohRemoteHandshakeFailure {
 	return {
 		type: IROH_REMOTE_HANDSHAKE_TYPE,
 		success: false,
 		...(options.outcome === undefined ? {} : { outcome: options.outcome }),
 		...(options.hostNodeId === undefined ? {} : { hostNodeId: options.hostNodeId }),
+		...(options.workspace === undefined ? {} : { workspace: options.workspace }),
+		...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+		...(options.retryAfterMs === undefined ? {} : { retryAfterMs: options.retryAfterMs }),
 		error,
 	};
 }
@@ -287,6 +305,16 @@ function expectOptionalString(value: unknown, label: string): string | undefined
 		return undefined;
 	}
 	return expectString(value, label);
+}
+
+function expectOptionalNumber(value: unknown, label: string): number | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		throw new Error(`${label} must be a finite number`);
+	}
+	return value;
 }
 
 function expectWorkspaceName(value: unknown, label: string): string {
@@ -446,6 +474,13 @@ function expectRemoteSessionId(value: unknown, label: string): string {
 		);
 	}
 	return sessionId;
+}
+
+function expectOptionalRemoteSessionId(value: unknown, label: string): string | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+	return expectRemoteSessionIdForResponse(value, label);
 }
 
 function expectOptionalOutcome(value: unknown, label: string): IrohRemoteOutcome | undefined {

@@ -40,6 +40,7 @@ import {
 	IrohRemoteHostEngine,
 	IrohRemoteHostStateManager,
 	IrohRemoteInMemoryPushNotificationDeduper,
+	isIrohRemoteSessionId,
 	DEFAULT_IROH_REMOTE_PUSH_RELAY_URL,
 	IrohRemotePushNotificationDispatcher,
 	IrohRemotePushRelayHttpClient,
@@ -78,6 +79,8 @@ const DEFAULT_READ_LIMIT = 64 * 1024;
 const DEFAULT_STATE_PATH = join(getAgentDir(), "remote", "iroh-host.json");
 const ACTIVE_REVOKE_CLOSE_REASON = "revoked";
 const ACTIVE_REPLACE_CLOSE_REASON = "replaced";
+const DUPLICATE_CONVERSATION_RETRY_AFTER_MS = 500;
+const LEGACY_WORKSPACE_SESSION_ID = "legacy-workspace";
 let activeConnectionSequence = 0;
 let activeStreamSequence = 0;
 const PROMPT_COMPLETION_RPC_TYPES = new Set(["prompt", "steer", "follow_up"]);
@@ -797,11 +800,17 @@ async function logRpcChildStopped(child, childCommand, authorization, options) {
 async function sendHandshakeError(stream, error, options) {
 	const message = error instanceof Error ? error.message : String(error);
 	const outcome = typeof error?.outcome === "string" ? error.outcome : undefined;
+	const workspace = typeof error?.workspace === "string" ? error.workspace : undefined;
+	const sessionId = typeof error?.sessionId === "string" ? error.sessionId : undefined;
+	const retryAfterMs = typeof error?.retryAfterMs === "number" ? error.retryAfterMs : undefined;
 	await writeIrohRemoteHandshakeResponse(
 		stream.send,
 		createIrohRemoteHandshakeFailure(message, {
 			hostNodeId: options.hostNodeId,
 			...(outcome === undefined ? {} : { outcome }),
+			...(workspace === undefined ? {} : { workspace }),
+			...(sessionId === undefined ? {} : { sessionId }),
+			...(retryAfterMs === undefined ? {} : { retryAfterMs }),
 		}),
 	);
 	await stream.send.finish?.();
@@ -1305,7 +1314,7 @@ async function runSpawnedRpcConnection(stream, handshake, authorization, options
 	return child;
 }
 
-async function runIntegratedVoltConnection(stream, handshake, authorization, options) {
+async function runIntegratedVoltConnection(stream, handshake, authorization, connection, connectionId, streamId, options) {
 	let entry;
 	let sessionSelection;
 	try {
@@ -1323,6 +1332,26 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, opt
 		return;
 	}
 
+	if (hasActiveStreamForConversationOnConnection(options, authorization, entry.sessionId, connectionId)) {
+		await rejectDuplicateActiveConnection(stream, authorization, options, entry.sessionId);
+		return;
+	}
+
+	const matchingActiveStreams = getActiveStreamsForConversation(options, authorization, entry.sessionId);
+	if (matchingActiveStreams.length > 0) {
+		await rejectDuplicateActiveConnection(stream, authorization, options, entry.sessionId);
+		return;
+	}
+
+	const activeStream = registerActiveStream(
+		options,
+		authorization,
+		entry.sessionId,
+		stream,
+		connection,
+		connectionId,
+		streamId,
+	);
 	let subscriber;
 	let subscriberError;
 	try {
@@ -1363,6 +1392,7 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, opt
 				subscriberError,
 			);
 		}
+		activeStream.remove();
 	}
 }
 
@@ -1445,14 +1475,14 @@ async function logRemoteSessionSelection(selection, authorization, options) {
 	});
 }
 
-function getIntegratedRuntimeRegistryKey(authorization) {
-	return `${authorization.client.nodeId}\0${authorization.workspace.name}`;
+function getIntegratedRuntimeRegistryKey(clientNodeId, workspaceName, sessionId) {
+	return `${clientNodeId}\0${workspaceName}\0${sessionId}`;
 }
 
 function getIntegratedRuntimeDetails(entry, extraDetails = {}) {
 	return {
 		runtime: "integrated-volt",
-		sessionId: entry.runtime.session.sessionId,
+		sessionId: entry.sessionId,
 		subscriberCount: entry.subscribers.size,
 		active: entry.runtime.session.isStreaming,
 		...extraDetails,
@@ -1482,12 +1512,29 @@ async function createIntegratedRuntimeEntry(handshake, authorization, options) {
 			projectTrusted: getProjectTrustedForWorkspace(options, authorization.workspace),
 		});
 		runtime = runtimeResult.runtime;
+		const sessionId = runtime.session.sessionId;
+		const owner = findIntegratedRuntimeOwner(options, authorization.workspace.name, sessionId);
+		if (owner && owner.clientNodeId !== authorization.client.nodeId) {
+			throw createConversationOpenError("conversation_in_use", "conversation is already in use", {
+				workspace: authorization.workspace.name,
+				sessionId,
+			});
+		}
+		if (owner) {
+			await runtime.dispose().catch(() => {});
+			return { entry: owner, sessionSelection: createConversationSessionSelectionFromEntry(owner) };
+		}
 		const entry = {
-			key: getIntegratedRuntimeRegistryKey(authorization),
+			key: getIntegratedRuntimeRegistryKey(
+				authorization.client.nodeId,
+				authorization.workspace.name,
+				sessionId,
+			),
 			clientNodeId: authorization.client.nodeId,
 			workspaceName: authorization.workspace.name,
+			sessionId,
 			runtime,
-			recordedSessionId: runtime.session.sessionId,
+			recordedSessionId: sessionId,
 			subscribers: new Set(),
 			detachedAt: undefined,
 			detachedRuntimeRetention: undefined,
@@ -1496,7 +1543,7 @@ async function createIntegratedRuntimeEntry(handshake, authorization, options) {
 		await options.hostEngine.setClientLastSessionId(
 			authorization.client.nodeId,
 			authorization.workspace.name,
-			runtime.session.sessionId,
+			sessionId,
 		);
 		await logRemoteSessionSelection(runtimeResult.sessionSelection, authorization, options);
 		await logAudit(options.auditLogger, {
@@ -1532,11 +1579,44 @@ function createIrohRuntimeConversationTarget(hello, authorization) {
 		: { target: "last", resumeSessionId: previousSessionId };
 }
 
+function getResolvedTargetSessionId(hello, authorization) {
+	if (hello.mode !== "conversation") {
+		return undefined;
+	}
+	if (hello.conversation.target === "session") {
+		return hello.conversation.sessionId;
+	}
+	if (hello.conversation.target !== "last") {
+		return undefined;
+	}
+	const previousSessionId = authorization.client.lastSessionIdByWorkspace?.[authorization.workspace.name];
+	return isIrohRemoteSessionId(previousSessionId) ? previousSessionId : undefined;
+}
+
+function findIntegratedRuntimeEntry(options, clientNodeId, workspaceName, sessionId) {
+	return options.integratedRuntimes.get(getIntegratedRuntimeRegistryKey(clientNodeId, workspaceName, sessionId));
+}
+
+function findIntegratedRuntimeOwner(options, workspaceName, sessionId) {
+	for (const entry of options.integratedRuntimes.values()) {
+		if (entry.workspaceName === workspaceName && entry.sessionId === sessionId) {
+			return entry;
+		}
+	}
+	return undefined;
+}
+
+function createConversationOpenError(outcome, message, details = {}) {
+	const error = new IrohRemoteHandshakeError(outcome, message);
+	Object.assign(error, details);
+	return error;
+}
+
 function createConversationSessionSelectionFromEntry(entry) {
 	return {
 		kind: "resumed",
-		requestedSessionId: entry.runtime.session.sessionId,
-		sessionId: entry.runtime.session.sessionId,
+		requestedSessionId: entry.sessionId,
+		sessionId: entry.sessionId,
 	};
 }
 
@@ -1551,7 +1631,7 @@ function getHandshakeConversationSelection(sessionSelection) {
 }
 
 function createIntegratedConversationHandshakeResponse(handshake, authorization, entry, sessionSelection, options) {
-	const sessionId = entry.runtime.session.sessionId;
+	const sessionId = entry.sessionId;
 	return createIrohRemoteHandshakeSuccess({
 		child: handshake.response.child,
 		clientNodeId: authorization.client.nodeId,
@@ -1568,13 +1648,27 @@ function createIntegratedConversationHandshakeResponse(handshake, authorization,
 }
 
 async function getOrCreateIntegratedRuntimeEntry(handshake, authorization, options) {
-	const key = getIntegratedRuntimeRegistryKey(authorization);
-	const existing = options.integratedRuntimes.get(key);
-	if (existing) {
-		if (!shouldReplaceIrohRemoteIntegratedRuntimeForAuthorization(authorization)) {
-			return { entry: existing, created: false, sessionSelection: createConversationSessionSelectionFromEntry(existing) };
+	const targetSessionId = getResolvedTargetSessionId(handshake.hello, authorization);
+	if (targetSessionId !== undefined) {
+		const owner = findIntegratedRuntimeOwner(options, authorization.workspace.name, targetSessionId);
+		if (owner && owner.clientNodeId !== authorization.client.nodeId) {
+			throw createConversationOpenError("conversation_in_use", "conversation is already in use", {
+				workspace: authorization.workspace.name,
+				sessionId: targetSessionId,
+			});
 		}
-		await stopIntegratedRuntimeEntry(existing, options, "fresh_pairing_replaced_runtime");
+		const existing = findIntegratedRuntimeEntry(
+			options,
+			authorization.client.nodeId,
+			authorization.workspace.name,
+			targetSessionId,
+		);
+		if (existing) {
+			if (!shouldReplaceIrohRemoteIntegratedRuntimeForAuthorization(authorization)) {
+				return { entry: existing, created: false, sessionSelection: createConversationSessionSelectionFromEntry(existing) };
+			}
+			await stopIntegratedRuntimeEntry(existing, options, "fresh_pairing_replaced_runtime");
+		}
 	}
 	return { ...(await createIntegratedRuntimeEntry(handshake, authorization, options)), created: true };
 }
@@ -1773,10 +1867,11 @@ async function closeClientConnectionsForClient(options, nodeId, reason) {
 	return entries.length;
 }
 
-function registerActiveStream(options, authorization, stream, connection, connectionId, streamId) {
+function registerActiveStream(options, authorization, sessionId, stream, connection, connectionId, streamId) {
 	const entry = {
 		clientNodeId: authorization.client.nodeId,
 		connectionId,
+		sessionId,
 		streamId,
 		workspaceName: authorization.workspace.name,
 		close: (reason) => closeIrohRemoteStream(stream, reason),
@@ -1790,10 +1885,27 @@ function getActiveStreamsForAuthorization(options, authorization) {
 	return options.activeStreams.entriesForWorkspace(authorization.client.nodeId, authorization.workspace.name);
 }
 
+function getActiveStreamsForConversation(options, authorization, sessionId) {
+	return options.activeStreams.entriesForConversation(
+		authorization.client.nodeId,
+		authorization.workspace.name,
+		sessionId,
+	);
+}
+
 function hasActiveStreamForAuthorizationOnConnection(options, authorization, connectionId) {
 	return options.activeStreams.hasWorkspaceOnConnection(
 		authorization.client.nodeId,
 		authorization.workspace.name,
+		connectionId,
+	);
+}
+
+function hasActiveStreamForConversationOnConnection(options, authorization, sessionId, connectionId) {
+	return options.activeStreams.hasConversationOnConnection(
+		authorization.client.nodeId,
+		authorization.workspace.name,
+		sessionId,
 		connectionId,
 	);
 }
@@ -1839,19 +1951,29 @@ async function closeReplacedActiveStreams(options, authorization, replacementStr
 	return { replaced: true, closedCount: replacedEntries.length };
 }
 
-async function rejectDuplicateActiveConnection(stream, authorization, options) {
-	const error = "client already connected";
+async function rejectDuplicateActiveConnection(stream, authorization, options, sessionId) {
+	const error = "duplicate conversation connection";
 	await logAudit(options.auditLogger, {
 		type: "duplicate_connection_rejected",
 		clientNodeId: authorization.client.nodeId,
 		workspace: authorization.workspace.name,
 		success: false,
 		error,
-		details: { source: "active_stream_registry" },
+		details: {
+			retryAfterMs: DUPLICATE_CONVERSATION_RETRY_AFTER_MS,
+			sessionId,
+			source: "active_stream_registry",
+		},
 	});
 	await writeIrohRemoteHandshakeResponse(
 		stream.send,
-		createIrohRemoteHandshakeFailure(error, { hostNodeId: options.hostNodeId }),
+		createIrohRemoteHandshakeFailure(error, {
+			hostNodeId: options.hostNodeId,
+			outcome: "duplicate_conversation_connection",
+			workspace: authorization.workspace.name,
+			sessionId,
+			retryAfterMs: DUPLICATE_CONVERSATION_RETRY_AFTER_MS,
+		}),
 	);
 	await stream.send.finish?.();
 	await Promise.resolve(stream.recv.stop?.(0n)).catch(() => {});
@@ -1993,30 +2115,47 @@ async function handleConnectionStream(
 		return;
 	}
 
+	if (options.integratedVolt) {
+		await runIntegratedVoltConnection(
+			stream,
+			handshake,
+			handshake.authorization,
+			connection,
+			connectionId,
+			streamId,
+			options,
+		);
+		return;
+	}
+
 	if (hasActiveStreamForAuthorizationOnConnection(options, handshake.authorization, connectionId)) {
-		await rejectDuplicateActiveConnection(stream, handshake.authorization, options);
+		await rejectDuplicateActiveConnection(stream, handshake.authorization, options, LEGACY_WORKSPACE_SESSION_ID);
 		return;
 	}
 
 	const matchingActiveStreams = getActiveStreamsForAuthorization(options, handshake.authorization);
 	if (matchingActiveStreams.length > 0 && !replaceExistingWorkspaceStream) {
-		await rejectDuplicateActiveConnection(stream, handshake.authorization, options);
+		await rejectDuplicateActiveConnection(stream, handshake.authorization, options, LEGACY_WORKSPACE_SESSION_ID);
 		return;
 	}
 	const replacedEntries = replaceExistingWorkspaceStream
 		? takeActiveStreamsForAuthorization(options, handshake.authorization)
 		: [];
 	let child;
-	const activeStream = registerActiveStream(options, handshake.authorization, stream, connection, connectionId, streamId);
+	const activeStream = registerActiveStream(
+		options,
+		handshake.authorization,
+		LEGACY_WORKSPACE_SESSION_ID,
+		stream,
+		connection,
+		connectionId,
+		streamId,
+	);
 	if (replaceExistingWorkspaceStream) {
 		await closeReplacedActiveStreams(options, handshake.authorization, streamId, replacedEntries);
 	}
 
 	try {
-		if (options.integratedVolt) {
-			await runIntegratedVoltConnection(stream, handshake, handshake.authorization, options);
-			return;
-		}
 		child = await runSpawnedRpcConnection(stream, handshake, handshake.authorization, options);
 	} finally {
 		if (child && child.exitCode === null && !child.killed) child.kill();

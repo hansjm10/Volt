@@ -3,13 +3,14 @@ import { type IrohRemoteActiveStreamEntry, IrohRemoteActiveStreamRegistry } from
 
 function makeEntry(
 	overrides: Partial<
-		Pick<IrohRemoteActiveStreamEntry, "clientNodeId" | "workspaceName" | "connectionId" | "streamId">
+		Pick<IrohRemoteActiveStreamEntry, "clientNodeId" | "workspaceName" | "sessionId" | "connectionId" | "streamId">
 	> = {},
 ): IrohRemoteActiveStreamEntry & { closeReasons: string[] } {
 	const closeReasons: string[] = [];
 	return {
 		clientNodeId: overrides.clientNodeId ?? "client-a",
 		workspaceName: overrides.workspaceName ?? "alpha",
+		sessionId: overrides.sessionId ?? "session-1",
 		connectionId: overrides.connectionId ?? "conn-1",
 		streamId: overrides.streamId ?? "stream-1",
 		closeReasons,
@@ -28,8 +29,10 @@ describe("IrohRemoteActiveStreamRegistry", () => {
 		expect(registry.size).toBe(1);
 		expect(registry.entriesForClientNodeId("client-a")).toEqual([entry]);
 		expect(registry.entriesForWorkspace("client-a", "alpha")).toEqual([entry]);
+		expect(registry.entriesForConversation("client-a", "alpha", "session-1")).toEqual([entry]);
 		expect(registry.entriesForConnection("conn-1")).toEqual([entry]);
 		expect(registry.hasWorkspaceOnConnection("client-a", "alpha", "conn-1")).toBe(true);
+		expect(registry.hasConversationOnConnection("client-a", "alpha", "session-1", "conn-1")).toBe(true);
 
 		remove();
 		remove();
@@ -37,8 +40,10 @@ describe("IrohRemoteActiveStreamRegistry", () => {
 		expect(registry.size).toBe(0);
 		expect(registry.entriesForClientNodeId("client-a")).toEqual([]);
 		expect(registry.entriesForWorkspace("client-a", "alpha")).toEqual([]);
+		expect(registry.entriesForConversation("client-a", "alpha", "session-1")).toEqual([]);
 		expect(registry.entriesForConnection("conn-1")).toEqual([]);
 		expect(registry.hasWorkspaceOnConnection("client-a", "alpha", "conn-1")).toBe(false);
+		expect(registry.hasConversationOnConnection("client-a", "alpha", "session-1", "conn-1")).toBe(false);
 	});
 
 	test("allows the same client to hold different workspaces concurrently", () => {
@@ -56,9 +61,14 @@ describe("IrohRemoteActiveStreamRegistry", () => {
 		expect(registry.entriesForConnection("conn-1")).toEqual([alpha, beta]);
 	});
 
-	test("matches duplicates only for the same client and workspace", () => {
+	test("matches duplicates only for the same client workspace and session", () => {
 		const registry = new IrohRemoteActiveStreamRegistry();
 		const alpha = makeEntry({ workspaceName: "alpha", streamId: "stream-alpha" });
+		const alphaOtherSession = makeEntry({
+			workspaceName: "alpha",
+			sessionId: "session-2",
+			streamId: "stream-alpha-other-session",
+		});
 		const otherClientAlpha = makeEntry({
 			clientNodeId: "client-b",
 			workspaceName: "alpha",
@@ -67,13 +77,19 @@ describe("IrohRemoteActiveStreamRegistry", () => {
 		const beta = makeEntry({ workspaceName: "beta", streamId: "stream-beta" });
 
 		registry.register(alpha);
+		registry.register(alphaOtherSession);
 		registry.register(otherClientAlpha);
 		registry.register(beta);
 
-		expect(registry.entriesForWorkspace("client-a", "alpha")).toEqual([alpha]);
+		expect(registry.entriesForWorkspace("client-a", "alpha")).toEqual([alpha, alphaOtherSession]);
+		expect(registry.entriesForConversation("client-a", "alpha", "session-1")).toEqual([alpha]);
+		expect(registry.entriesForConversation("client-a", "alpha", "session-2")).toEqual([alphaOtherSession]);
 		expect(registry.entriesForWorkspace("client-b", "alpha")).toEqual([otherClientAlpha]);
 		expect(registry.entriesForWorkspace("client-a", "beta")).toEqual([beta]);
 		expect(registry.hasWorkspaceOnConnection("client-a", "alpha", "conn-1")).toBe(true);
+		expect(registry.hasConversationOnConnection("client-a", "alpha", "session-1", "conn-1")).toBe(true);
+		expect(registry.hasConversationOnConnection("client-a", "alpha", "session-2", "conn-1")).toBe(true);
+		expect(registry.hasConversationOnConnection("client-a", "alpha", "missing-session", "conn-1")).toBe(false);
 		expect(registry.hasWorkspaceOnConnection("client-b", "alpha", "conn-1")).toBe(true);
 		expect(registry.hasWorkspaceOnConnection("client-a", "missing", "conn-1")).toBe(false);
 	});

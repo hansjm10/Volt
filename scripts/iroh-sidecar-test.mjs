@@ -2421,6 +2421,7 @@ async function duplicateActiveConnectionScenario() {
 		let firstClient;
 		let replacementClient;
 		let duplicateStream;
+		let firstSessionId;
 		try {
 			const host = startHost([
 				"--state",
@@ -2443,6 +2444,8 @@ async function duplicateActiveConnectionScenario() {
 					"duplicate active first get_state",
 				);
 				assert(firstState.event.success === true, "Expected first duplicate-active client get_state to succeed");
+				firstSessionId = firstState.event.data?.sessionId;
+				assert(firstSessionId, `Expected first duplicate-active session id, got ${JSON.stringify(firstState.event)}`);
 
 				duplicateStream = await openRawAuthorizedStreamOnConnection(firstClient, ticket, {
 					clientLabel: "duplicate active client",
@@ -2451,7 +2454,10 @@ async function duplicateActiveConnectionScenario() {
 				});
 				assert(
 					duplicateStream.handshakeResponse.success === false &&
-						duplicateStream.handshakeResponse.error === "client already connected",
+						duplicateStream.handshakeResponse.outcome === "duplicate_conversation_connection" &&
+						duplicateStream.handshakeResponse.workspace === "duplicate" &&
+						duplicateStream.handshakeResponse.sessionId === firstSessionId &&
+						duplicateStream.handshakeResponse.retryAfterMs === 500,
 					`Expected duplicate handshake rejection, got ${JSON.stringify(duplicateStream.handshakeResponse)}`,
 				);
 				await Promise.resolve(duplicateStream.stream.send.finish?.()).catch(() => {});
@@ -2473,8 +2479,31 @@ async function duplicateActiveConnectionScenario() {
 					openRawAuthorizedClientOnEndpoint(replacementEndpoint, reconnectTicket, {
 						clientLabel: "duplicate active client",
 						helloMode: "conversation",
+						expectSuccess: false,
 					}),
 					"duplicate active replacement connect",
+					2000,
+				);
+				assert(
+					replacementClient.handshakeResponse.success === false &&
+						replacementClient.handshakeResponse.outcome === "duplicate_conversation_connection" &&
+						replacementClient.handshakeResponse.workspace === "duplicate" &&
+						replacementClient.handshakeResponse.sessionId === firstSessionId,
+					`Expected active replacement to be rejected, got ${JSON.stringify(replacementClient.handshakeResponse)}`,
+				);
+				closeRawConnection(replacementClient.connection);
+				replacementClient = undefined;
+
+				closeRawConnection(firstClient.connection);
+				await waitForRawConnectionClosed(firstClient.connection, "duplicate active first closed before reconnect");
+				firstClient = undefined;
+
+				replacementClient = await withOperationTimeout(
+					openRawAuthorizedClientOnEndpoint(replacementEndpoint, reconnectTicket, {
+						clientLabel: "duplicate active client",
+						helloMode: "conversation",
+					}),
+					"duplicate active reconnect after close",
 					2000,
 				);
 				const replacementState = await readRawRpcResponse(
@@ -2483,8 +2512,6 @@ async function duplicateActiveConnectionScenario() {
 					"duplicate active replacement get_state",
 				);
 				assert(replacementState.event.success === true, "Expected replacement duplicate-active client to succeed");
-				await waitForRawConnectionClosed(firstClient.connection, "duplicate active replaced first");
-				firstClient = undefined;
 
 				closeRawConnection(replacementClient.connection);
 				replacementClient = undefined;
@@ -2540,21 +2567,15 @@ async function duplicateActiveConnectionScenario() {
 						event.clientNodeId === endpoint.id().toString() &&
 						event.workspace === "duplicate" &&
 						event.success === false &&
-						event.error === "client already connected",
+						event.error === "duplicate conversation connection" &&
+						event.details?.sessionId === firstSessionId &&
+						event.details?.retryAfterMs === 500,
 				),
 				"Expected duplicate_connection_rejected audit event",
 			);
 			assert(
-				auditEvents.some(
-					(event) =>
-						event.type === "duplicate_connection_replaced" &&
-						event.clientNodeId === endpoint.id().toString() &&
-						event.workspace === "duplicate" &&
-						event.success === true &&
-						event.details?.closeReason === "replaced" &&
-						event.details?.closedCount === 1,
-				),
-				"Expected duplicate_connection_replaced audit event",
+				!auditEvents.some((event) => event.type === "duplicate_connection_replaced"),
+				"Did not expect duplicate_connection_replaced audit event",
 			);
 		} finally {
 			await Promise.resolve(duplicateStream?.stream?.send?.finish?.()).catch(() => {});
@@ -2562,6 +2583,175 @@ async function duplicateActiveConnectionScenario() {
 			await replacementEndpoint?.close();
 			closeRawConnection(firstClient?.connection);
 			await endpoint.close();
+		}
+	});
+}
+
+async function integratedVoltSameWorkspaceConversationOwnershipScenario() {
+	await withStateDir("integrated-same-workspace-conversations", async ({ hostStatePath, stateDir }) => {
+		const agentDir = await createIntegratedVoltAgentDir(stateDir);
+		const workspacePath = join(stateDir, "workspace");
+		await mkdir(workspacePath, { recursive: true });
+		const endpoint = await bindRawClientEndpoint("disabled");
+		const secondEndpoint = await bindRawClientEndpoint("disabled");
+		let firstClient;
+		let newSessionClient;
+		let duplicateSessionStream;
+		let secondClient;
+		let reattachedClient;
+
+		async function pairClient(label) {
+			const pairCommand = spawnSourceCli([
+				"remote",
+				"pair",
+				"--state",
+				hostStatePath,
+				"--workspace",
+				"same",
+				"--allow-tools",
+				DEFAULT_TEST_ALLOW_TOOLS,
+				"--label",
+				label,
+			]);
+			await waitForExit(pairCommand.child, `${label} pair command`, pairCommand.output);
+			const ticket = pairCommand.output.stdout.trim();
+			assert(ticket.startsWith(TICKET_PREFIX), `Expected ${label} pair command ticket, got:\n${pairCommand.output.stdout}`);
+			return ticket;
+		}
+
+		const host = startHost([
+			"--state",
+			hostStatePath,
+			"--agent-dir",
+			agentDir,
+			"--workspace",
+			`same=${workspacePath}`,
+			"--integrated-volt",
+			"--no-pairing",
+		]);
+		try {
+			await waitForHostReady(host.child, host.output, "integrated same-workspace conversations host");
+			const firstTicket = await pairClient("same workspace first client");
+			const secondTicket = await pairClient("same workspace second client");
+
+			firstClient = await openRawAuthorizedClientOnEndpoint(endpoint, firstTicket, {
+				clientLabel: "same workspace first client",
+				helloMode: "conversation",
+			});
+			const firstState = await readRawRpcResponse(
+				firstClient,
+				{ id: "state-same-first", type: "get_state" },
+				"same workspace first get_state",
+			);
+			const firstSessionId = firstState.event.data?.sessionId;
+			assert(
+				firstState.event.success === true && firstSessionId,
+				`Expected first same-workspace state with session, got ${JSON.stringify(firstState.event)}`,
+			);
+
+			const newSessionStream = await openRawAuthorizedStreamOnConnection(firstClient, firstTicket, {
+				clientLabel: "same workspace first client",
+				helloMode: "conversation",
+				conversation: { target: "new" },
+			});
+			newSessionClient = {
+				connection: firstClient.connection,
+				handshakeResponse: newSessionStream.handshakeResponse,
+				nodeId: firstClient.nodeId,
+				rest: newSessionStream.rest,
+				stream: newSessionStream.stream,
+			};
+			const newSessionState = await readRawRpcResponse(
+				newSessionClient,
+				{ id: "state-same-new", type: "get_state" },
+				"same workspace new-session get_state",
+			);
+			const newSessionId = newSessionState.event.data?.sessionId;
+			assert(
+				newSessionState.event.success === true && newSessionId && newSessionId !== firstSessionId,
+				`Expected same workspace target:new to create a distinct concurrent session, got ${JSON.stringify(newSessionState.event)}`,
+			);
+
+			const firstStillUsable = await readRawRpcResponse(
+				firstClient,
+				{ id: "state-same-first-still-usable", type: "get_state" },
+				"same workspace first still usable",
+			);
+			assert(
+				firstStillUsable.event.data?.sessionId === firstSessionId,
+				`Expected first same-workspace stream to remain on ${firstSessionId}, got ${JSON.stringify(firstStillUsable.event)}`,
+			);
+
+			duplicateSessionStream = await openRawAuthorizedStreamOnConnection(firstClient, firstTicket, {
+				clientLabel: "same workspace first client",
+				helloMode: "conversation",
+				conversation: { target: "session", sessionId: firstSessionId },
+				expectSuccess: false,
+			});
+			assert(
+				duplicateSessionStream.handshakeResponse.success === false &&
+					duplicateSessionStream.handshakeResponse.outcome === "duplicate_conversation_connection" &&
+					duplicateSessionStream.handshakeResponse.workspace === "same" &&
+					duplicateSessionStream.handshakeResponse.sessionId === firstSessionId &&
+					duplicateSessionStream.handshakeResponse.retryAfterMs === 500,
+				`Expected same-session duplicate rejection with identity details, got ${JSON.stringify(
+					duplicateSessionStream.handshakeResponse,
+				)}`,
+			);
+			await Promise.resolve(duplicateSessionStream.stream.send.finish?.()).catch(() => {});
+			duplicateSessionStream = undefined;
+
+			secondClient = await openRawAuthorizedClientOnEndpoint(secondEndpoint, secondTicket, {
+				clientLabel: "same workspace second client",
+				helloMode: "conversation",
+				conversation: { target: "session", sessionId: firstSessionId },
+				expectSuccess: false,
+			});
+			assert(
+				secondClient.handshakeResponse.success === false &&
+					secondClient.handshakeResponse.outcome === "conversation_in_use" &&
+					secondClient.handshakeResponse.workspace === "same" &&
+					secondClient.handshakeResponse.sessionId === firstSessionId,
+				`Expected cross-client same-session ownership rejection, got ${JSON.stringify(secondClient.handshakeResponse)}`,
+			);
+			closeRawConnection(secondClient.connection);
+			secondClient = undefined;
+
+			await closeRawStream(firstClient);
+			reattachedClient = await openRawAuthorizedStreamOnConnection(newSessionClient, firstTicket, {
+				clientLabel: "same workspace first client",
+				helloMode: "conversation",
+				conversation: { target: "session", sessionId: firstSessionId },
+			});
+			const reattached = {
+				connection: newSessionClient.connection,
+				handshakeResponse: reattachedClient.handshakeResponse,
+				nodeId: newSessionClient.nodeId,
+				rest: reattachedClient.rest,
+				stream: reattachedClient.stream,
+			};
+			const reattachedState = await readRawRpcResponse(
+				reattached,
+				{ id: "state-same-reattached", type: "get_state" },
+				"same workspace reattached get_state",
+			);
+			assert(
+				reattachedState.event.data?.sessionId === firstSessionId,
+				`Expected detached same-session reattach while another same-workspace session is active, got ${JSON.stringify(
+					reattachedState.event,
+				)}`,
+			);
+			await closeRawStream(reattached);
+			reattachedClient = undefined;
+		} finally {
+			await Promise.resolve(duplicateSessionStream?.stream?.send?.finish?.()).catch(() => {});
+			await closeRawStream(reattachedClient);
+			closeRawConnection(secondClient?.connection);
+			await closeRawStream(newSessionClient);
+			closeRawConnection(firstClient?.connection ?? newSessionClient?.connection);
+			await endpoint.close();
+			await secondEndpoint.close();
+			await stopProcess(host.child);
 		}
 	});
 }
@@ -3846,6 +4036,7 @@ const scenarios = [
 	["integrated Volt multi-workspace runtime isolation", integratedVoltMultiWorkspaceRuntimeIsolationScenario],
 	["native Iroh multi-stream lifecycle", nativeIrohMultiStreamLifecycleScenario],
 	["duplicate active connection", duplicateActiveConnectionScenario],
+	["integrated Volt same-workspace conversation ownership", integratedVoltSameWorkspaceConversationOwnershipScenario],
 	["integrated Volt profile", integratedVoltProfileScenario],
 	["integrated Volt env profile", integratedVoltEnvProfileScenario],
 	["malformed handshake", malformedHandshakeScenario],
