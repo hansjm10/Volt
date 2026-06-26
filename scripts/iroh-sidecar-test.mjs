@@ -2163,6 +2163,7 @@ async function nativeIrohMultiStreamLifecycleScenario() {
 		const endpoint = await bindRawClientEndpoint("disabled");
 		let alphaClient;
 		let betaClient;
+		let reopenedBetaClient;
 		let reattachedAlphaClient;
 		let revokedClient;
 
@@ -2307,23 +2308,6 @@ async function nativeIrohMultiStreamLifecycleScenario() {
 				`Expected beta stream to remain active after alpha closed, got ${JSON.stringify(betaAfterAlphaClose.event)}`,
 			);
 
-			const betaAbort = await readRawRpcResponse(
-				betaClient,
-				{ id: "abort-native-beta", type: "abort" },
-				"native multi-stream beta abort",
-			);
-			assert(betaAbort.event.success === true, `Expected beta abort success, got ${JSON.stringify(betaAbort.event)}`);
-			const betaAfterAbort = await readRawRpcResponse(
-				betaClient,
-				{ id: "state-native-beta-after-abort", type: "get_state" },
-				"native multi-stream beta get_state after abort",
-			);
-			assert(
-				betaAfterAbort.event.data?.sessionId === betaSessionId &&
-					betaAfterAbort.event.data?.isStreaming === false,
-				`Expected beta to stop streaming after abort, got ${JSON.stringify(betaAfterAbort.event)}`,
-			);
-
 			const reattachedAlphaStream = await openRawAuthorizedStreamOnConnection(betaClient, alphaReconnectTicket, {
 				clientLabel: "native multi-stream client",
 				helloMode: "conversation",
@@ -2343,7 +2327,75 @@ async function nativeIrohMultiStreamLifecycleScenario() {
 			assert(
 				alphaReattachedState.event.data?.sessionId === alphaSessionId &&
 					alphaReattachedState.event.data?.isStreaming === true,
-				`Expected alpha to keep streaming after beta abort, got ${JSON.stringify(alphaReattachedState.event)}`,
+				`Expected alpha to reattach while beta remains active, got ${JSON.stringify(alphaReattachedState.event)}`,
+			);
+
+			const betaAbort = await readRawRpcResponse(
+				betaClient,
+				{ id: "abort-native-beta", type: "abort" },
+				"native multi-stream beta abort",
+			);
+			assert(betaAbort.event.success === true, `Expected beta abort success, got ${JSON.stringify(betaAbort.event)}`);
+			const betaAfterAbortError = await withOperationTimeout(
+				readRawRpcResponse(
+					betaClient,
+					{ id: "state-native-beta-after-abort", type: "get_state" },
+					"native multi-stream beta get_state after abort",
+					1000,
+				).then(
+					() => undefined,
+					(error) => error,
+				),
+				"native multi-stream beta aborted stream close",
+				2000,
+			);
+			assert(
+				betaAfterAbortError instanceof Error,
+				"Expected beta abort to invalidate the aborted stream",
+			);
+			const alphaAfterBetaAbort = await readRawRpcResponse(
+				reattachedAlphaClient,
+				{ id: "state-native-alpha-after-beta-abort", type: "get_state" },
+				"native multi-stream alpha after beta abort",
+			);
+			assert(
+				alphaAfterBetaAbort.event.data?.sessionId === alphaSessionId &&
+					alphaAfterBetaAbort.event.data?.isStreaming === true,
+				`Expected alpha sibling stream to keep streaming after beta abort, got ${JSON.stringify(
+					alphaAfterBetaAbort.event,
+				)}`,
+			);
+			await waitForAuditEvent(
+				auditPath,
+				(event) =>
+					event.type === "remote_runtime_stopped" &&
+					event.workspace === "beta" &&
+					event.details?.sessionId === betaSessionId &&
+					event.details?.reason === "abort",
+				"native multi-stream beta abort runtime stop",
+			);
+
+			const reopenedBetaStream = await openRawAuthorizedStreamOnConnection(betaClient, betaTicket, {
+				clientLabel: "native multi-stream client",
+				helloMode: "conversation",
+				conversation: { target: "session", sessionId: betaSessionId },
+			});
+			reopenedBetaClient = {
+				connection: betaClient.connection,
+				handshakeResponse: reopenedBetaStream.handshakeResponse,
+				nodeId: betaClient.nodeId,
+				rest: reopenedBetaStream.rest,
+				stream: reopenedBetaStream.stream,
+			};
+			const betaReopenedState = await readRawRpcResponse(
+				reopenedBetaClient,
+				{ id: "state-native-beta-reopened-after-abort", type: "get_state" },
+				"native multi-stream beta reopened after abort",
+			);
+			assert(
+				betaReopenedState.event.data?.sessionId === betaSessionId &&
+					betaReopenedState.event.data?.isStreaming === false,
+				`Expected beta target:session to reopen after abort, got ${JSON.stringify(betaReopenedState.event)}`,
 			);
 
 			fakeOpenAI.releaseResponse();
@@ -2400,6 +2452,7 @@ async function nativeIrohMultiStreamLifecycleScenario() {
 		} finally {
 			await closeRawStream(alphaClient);
 			await closeRawStream(reattachedAlphaClient);
+			await closeRawStream(reopenedBetaClient);
 			await closeRawStream(betaClient);
 			closeRawConnection(revokedClient?.connection);
 			closeRawConnection(betaClient?.connection ?? alphaClient?.connection ?? reattachedAlphaClient?.connection);
@@ -2716,6 +2769,44 @@ async function integratedVoltSameWorkspaceConversationOwnershipScenario() {
 			);
 			closeRawConnection(secondClient.connection);
 			secondClient = undefined;
+
+			const newSessionAbort = await readRawRpcResponse(
+				newSessionClient,
+				{ id: "abort-same-new", type: "abort" },
+				"same workspace new-session abort",
+			);
+			assert(
+				newSessionAbort.event.success === true,
+				`Expected same-workspace new-session abort success, got ${JSON.stringify(newSessionAbort.event)}`,
+			);
+			const newSessionAfterAbortError = await withOperationTimeout(
+				readRawRpcResponse(
+					newSessionClient,
+					{ id: "state-same-new-after-abort", type: "get_state" },
+					"same workspace new-session get_state after abort",
+					1000,
+				).then(
+					() => undefined,
+					(error) => error,
+				),
+				"same workspace aborted stream close",
+				2000,
+			);
+			assert(
+				newSessionAfterAbortError instanceof Error,
+				"Expected same-workspace abort to invalidate the aborted stream",
+			);
+			const firstAfterNewSessionAbort = await readRawRpcResponse(
+				firstClient,
+				{ id: "state-same-first-after-new-abort", type: "get_state" },
+				"same workspace first get_state after new-session abort",
+			);
+			assert(
+				firstAfterNewSessionAbort.event.data?.sessionId === firstSessionId,
+				`Expected first same-workspace sibling stream to survive new-session abort, got ${JSON.stringify(
+					firstAfterNewSessionAbort.event,
+				)}`,
+			);
 
 			await closeRawStream(firstClient);
 			reattachedClient = await openRawAuthorizedStreamOnConnection(newSessionClient, firstTicket, {

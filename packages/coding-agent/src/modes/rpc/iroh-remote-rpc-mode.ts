@@ -25,6 +25,7 @@ export interface IrohRemoteRpcModeOptions extends IrohRpcTransportOptions {
 	decorateOutbound?: IrohRemoteOutboundValueDecorator;
 	disposeRuntimeOnClose?: boolean;
 	notificationDelivery?: IrohRemotePushNotificationDelivery;
+	onResponseWritten?: (response: Record<string, unknown>) => void | Promise<void>;
 	onSessionChanged?: (session: RpcSessionChange) => void | Promise<void>;
 	registerPushTarget?: (args: unknown) => Promise<RpcRegisterPushTargetResponse>;
 	remoteCommandHandler?: (command: Record<string, unknown>) => object | Promise<object | undefined> | undefined;
@@ -75,6 +76,7 @@ interface IrohRemoteCloseDeferringRpcTransportOptions {
 	transport: RpcTransport;
 	getCompletionState?: () => IrohRemoteCompletionState;
 	onCommandCompleted?: (completion: IrohRemoteCompletedCommand) => void | Promise<void>;
+	onResponseWritten?: (response: Record<string, unknown>) => void | Promise<void>;
 	waitForPromptCompletion(): Promise<void>;
 }
 
@@ -124,6 +126,7 @@ export function runIrohRemoteRpcMode(
 			sentNotificationEventIds.add(notification.eventId);
 			await deliverCompletionNotification(notification);
 		},
+		onResponseWritten: options.onResponseWritten,
 		waitForPromptCompletion: () => runtimeHost.session.waitForIdle(),
 	});
 
@@ -599,6 +602,15 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 		}
 	};
 
+	const notifyResponseWritten = async (value: object, writeResult: void | Promise<void>): Promise<void> => {
+		await writeResult;
+		const response = value as Record<string, unknown>;
+		if (response.type !== "response") {
+			return;
+		}
+		await options.onResponseWritten?.(response);
+	};
+
 	const transport: IrohRemoteCloseDeferringRpcTransport = {
 		setRpcModeStartupComplete(startupComplete) {
 			rpcModeStartupComplete = startupComplete;
@@ -623,6 +635,9 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 				throw error;
 			}
 			trackOutboundResponse(value);
+			if (options.onResponseWritten && (value as Record<string, unknown>).type === "response") {
+				return notifyResponseWritten(value, result);
+			}
 			return result;
 		},
 		onLine(handler: RpcLineHandler): () => void {

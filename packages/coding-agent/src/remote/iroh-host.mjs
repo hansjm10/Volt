@@ -1317,8 +1317,13 @@ async function runSpawnedRpcConnection(stream, handshake, authorization, options
 async function runIntegratedVoltConnection(stream, handshake, authorization, connection, connectionId, streamId, options) {
 	let entry;
 	let sessionSelection;
+	let createdRuntime = false;
 	try {
-		({ entry, sessionSelection } = await getOrCreateIntegratedRuntimeEntry(handshake, authorization, options));
+		({ entry, sessionSelection, created: createdRuntime } = await getOrCreateIntegratedRuntimeEntry(
+			handshake,
+			authorization,
+			options,
+		));
 	} catch (error) {
 		await logAudit(options.auditLogger, {
 			type: "runtime_failure",
@@ -1333,28 +1338,48 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, con
 	}
 
 	if (hasActiveStreamForConversationOnConnection(options, authorization, entry.sessionId, connectionId)) {
+		if (createdRuntime) {
+			await cleanupUncommittedIntegratedRuntimeEntry(entry, sessionSelection, options);
+		}
 		await rejectDuplicateActiveConnection(stream, authorization, options, entry.sessionId);
 		return;
 	}
 
 	const matchingActiveStreams = getActiveStreamsForConversation(options, authorization, entry.sessionId);
 	if (matchingActiveStreams.length > 0) {
+		if (createdRuntime) {
+			await cleanupUncommittedIntegratedRuntimeEntry(entry, sessionSelection, options);
+		}
 		await rejectDuplicateActiveConnection(stream, authorization, options, entry.sessionId);
 		return;
 	}
 
-	const activeStream = registerActiveStream(
-		options,
-		authorization,
-		entry.sessionId,
-		stream,
-		connection,
-		connectionId,
-		streamId,
-	);
+	let activeStream;
 	let subscriber;
 	let subscriberError;
+	let handshakeCommitted = false;
+	let abortStreamInvalidated = false;
+	const invalidateStreamAfterAbortResponse = async (response) => {
+		if (response.command !== "abort" || response.success !== true || abortStreamInvalidated) {
+			return;
+		}
+		abortStreamInvalidated = true;
+		activeStream?.remove();
+		await stopIntegratedRuntimeEntry(entry, options, "abort");
+		closeIrohRemoteStream(stream, "abort");
+	};
 	try {
+		await commitIntegratedRuntimeEntry(entry, sessionSelection, authorization, options);
+		handshakeCommitted = true;
+		activeStream = registerActiveStream(
+			options,
+			authorization,
+			entry.sessionId,
+			stream,
+			connection,
+			connectionId,
+			streamId,
+		);
 		await writeIrohRemoteHandshakeResponse(
 			stream.send,
 			createIntegratedConversationHandshakeResponse(handshake, authorization, entry, sessionSelection, options),
@@ -1365,6 +1390,7 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, con
 			decorateOutbound: (value) => decorateRemoteHostState(value, authorization, options),
 			disposeRuntimeOnClose: false,
 			notificationDelivery: pushDispatcher,
+			onResponseWritten: invalidateStreamAfterAbortResponse,
 			onSessionChanged: async (session) => {
 				if (session.sessionId === entry.recordedSessionId) return;
 				entry.recordedSessionId = session.sessionId;
@@ -1382,6 +1408,11 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, con
 		await rpcMode;
 	} catch (error) {
 		subscriberError = error;
+		if (!handshakeCommitted) {
+			await cleanupUncommittedIntegratedRuntimeEntry(entry, sessionSelection, options);
+			await sendHandshakeError(stream, error, options);
+			return;
+		}
 	} finally {
 		if (subscriber) {
 			await detachIntegratedRuntimeSubscriber(
@@ -1391,8 +1422,14 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, con
 				subscriberError ? "transport_error" : "transport_closed",
 				subscriberError,
 			);
+		} else if (handshakeCommitted && !abortStreamInvalidated) {
+			await detachIntegratedRuntimeWithoutSubscriber(
+				entry,
+				options,
+				subscriberError ? "transport_error" : "transport_closed",
+			);
 		}
-		activeStream.remove();
+		activeStream?.remove();
 	}
 }
 
@@ -1502,6 +1539,7 @@ async function logIntegratedRuntimeAudit(options, entry, type, details = {}, suc
 
 async function createIntegratedRuntimeEntry(handshake, authorization, options) {
 	let runtime;
+	let sessionSelection;
 	try {
 		const runtimeResult = await createIrohRemoteAgentRuntimeWithSessionSelection({
 			agentDir: options.agentDir,
@@ -1512,6 +1550,7 @@ async function createIntegratedRuntimeEntry(handshake, authorization, options) {
 			projectTrusted: getProjectTrustedForWorkspace(options, authorization.workspace),
 		});
 		runtime = runtimeResult.runtime;
+		sessionSelection = runtimeResult.sessionSelection;
 		const sessionId = runtime.session.sessionId;
 		const owner = findIntegratedRuntimeOwner(options, authorization.workspace.name, sessionId);
 		if (owner && owner.clientNodeId !== authorization.client.nodeId) {
@@ -1521,8 +1560,8 @@ async function createIntegratedRuntimeEntry(handshake, authorization, options) {
 			});
 		}
 		if (owner) {
-			await runtime.dispose().catch(() => {});
-			return { entry: owner, sessionSelection: createConversationSessionSelectionFromEntry(owner) };
+			await cleanupUncommittedRuntime(runtime, sessionSelection);
+			return { entry: owner, created: false, sessionSelection: createConversationSessionSelectionFromEntry(owner) };
 		}
 		const entry = {
 			key: getIntegratedRuntimeRegistryKey(
@@ -1539,27 +1578,71 @@ async function createIntegratedRuntimeEntry(handshake, authorization, options) {
 			detachedAt: undefined,
 			detachedRuntimeRetention: undefined,
 		};
+		return { entry, created: true, sessionSelection };
+	} catch (error) {
+		if (runtime) {
+			await cleanupUncommittedRuntime(runtime, sessionSelection);
+		}
+		throw error;
+	}
+}
+
+async function commitIntegratedRuntimeEntry(entry, sessionSelection, authorization, options) {
+	const owner = findIntegratedRuntimeOwner(options, authorization.workspace.name, entry.sessionId);
+	if (owner && owner !== entry) {
+		throw createConversationOpenError("conversation_in_use", "conversation is already in use", {
+			workspace: authorization.workspace.name,
+			sessionId: entry.sessionId,
+		});
+	}
+
+	const inserted = options.integratedRuntimes.get(entry.key) !== entry;
+	if (inserted) {
 		options.integratedRuntimes.set(entry.key, entry);
+	}
+
+	try {
 		await options.hostEngine.setClientLastSessionId(
 			authorization.client.nodeId,
 			authorization.workspace.name,
-			sessionId,
+			entry.sessionId,
 		);
-		await logRemoteSessionSelection(runtimeResult.sessionSelection, authorization, options);
-		await logAudit(options.auditLogger, {
-			type: "runtime_started",
-			clientNodeId: authorization.client.nodeId,
-			workspace: authorization.workspace.name,
-			success: true,
-			details: getIntegratedRuntimeDetails(entry),
-		});
-		await logIntegratedRuntimeAudit(options, entry, "remote_runtime_started", { reason: "created" });
-		return { entry, sessionSelection: runtimeResult.sessionSelection };
+		await logRemoteSessionSelection(sessionSelection, authorization, options);
+		if (inserted) {
+			await logAudit(options.auditLogger, {
+				type: "runtime_started",
+				clientNodeId: authorization.client.nodeId,
+				workspace: authorization.workspace.name,
+				success: true,
+				details: getIntegratedRuntimeDetails(entry),
+			});
+			await logIntegratedRuntimeAudit(options, entry, "remote_runtime_started", { reason: "created" });
+		}
 	} catch (error) {
-		if (runtime) {
-			await runtime.dispose().catch(() => {});
+		if (inserted && options.integratedRuntimes.get(entry.key) === entry) {
+			options.integratedRuntimes.delete(entry.key);
 		}
 		throw error;
+	}
+}
+
+async function cleanupUncommittedIntegratedRuntimeEntry(entry, sessionSelection, options) {
+	if (options.integratedRuntimes.get(entry.key) === entry) {
+		options.integratedRuntimes.delete(entry.key);
+	}
+	cancelIntegratedRuntimeRetention(entry);
+	entry.subscribers.clear();
+	await cleanupUncommittedRuntime(entry.runtime, sessionSelection);
+}
+
+async function cleanupUncommittedRuntime(runtime, sessionSelection) {
+	const sessionFile = runtime.session.sessionFile;
+	await runtime.dispose().catch(() => {});
+	if (sessionSelection?.kind === "resumed") {
+		return;
+	}
+	if (typeof sessionFile === "string" && sessionFile.length > 0) {
+		await rm(sessionFile, { force: true }).catch(() => {});
 	}
 }
 
@@ -1670,7 +1753,7 @@ async function getOrCreateIntegratedRuntimeEntry(handshake, authorization, optio
 			await stopIntegratedRuntimeEntry(existing, options, "fresh_pairing_replaced_runtime");
 		}
 	}
-	return { ...(await createIntegratedRuntimeEntry(handshake, authorization, options)), created: true };
+	return createIntegratedRuntimeEntry(handshake, authorization, options);
 }
 
 let integratedRuntimeSubscriberSequence = 0;
@@ -1710,6 +1793,21 @@ async function detachIntegratedRuntimeSubscriber(entry, subscriber, options, rea
 		errorMessage,
 	);
 	if (entry.subscribers.size > 0) {
+		return;
+	}
+	entry.detachedAt = Date.now();
+	await logIntegratedRuntimeAudit(options, entry, "remote_runtime_detached", {
+		detachedAt: entry.detachedAt,
+		reason,
+	});
+	scheduleIntegratedRuntimeRetention(entry, options, reason);
+}
+
+async function detachIntegratedRuntimeWithoutSubscriber(entry, options, reason) {
+	if (options.integratedRuntimes.get(entry.key) !== entry || entry.subscribers.size > 0) {
+		return;
+	}
+	if (entry.detachedAt !== undefined) {
 		return;
 	}
 	entry.detachedAt = Date.now();
