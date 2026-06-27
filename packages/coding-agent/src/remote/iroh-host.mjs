@@ -1,13 +1,10 @@
 import { Buffer } from "node:buffer";
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { once } from "node:events";
-import { constants, rmSync } from "node:fs";
-import { access, mkdir, realpath, rm, stat } from "node:fs/promises";
+import { rmSync } from "node:fs";
+import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import { createServer } from "node:net";
 import { hostname, userInfo } from "node:os";
-import { fileURLToPath } from "node:url";
-import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import lockfile from "proper-lockfile";
 import {
@@ -24,9 +21,7 @@ import {
 	formatIrohRemoteTicketQrCode,
 	getDefaultSessionDir,
 	getIrohRemoteControlPath,
-	getIrohRemoteRpcFilterResult,
 	getIrohRemoteUnsafeAllowedTools,
-	getIrohRemoteVoltRpcToolArgs,
 	getIrohRemoteWorkspaceAvailabilityStatus,
 	handleIrohRemoteWorkspaceUnregisterRpcCommand,
 	hasTrustRequiringProjectResources,
@@ -52,14 +47,11 @@ import {
 	parseIrohRemoteControlRequest,
 	ProjectTrustStore,
 	resolveIrohRemoteWorkspaceProjectTrusted,
-	pipeIrohRemoteOutboundJsonlReadable,
 	readIrohRemoteHostState,
 	requestIrohRemoteActiveRevocation,
 	sanitizeIrohRemoteOutbound,
-	sanitizeIrohRemoteOutboundJsonLine,
 	selectIrohRemoteWorkspace,
 	serializeJsonLine,
-	serializeIrohRemoteRpcFilterRejection,
 	SessionManager,
 	writeIrohRemoteHandshakeResponse,
 	writeIrohRemoteHostState,
@@ -77,8 +69,6 @@ let EndpointTicket;
 let RelayMode;
 let presetMinimal;
 let presetN0;
-const HOST_ENTRYPOINT_DIR = dirname(fileURLToPath(import.meta.url));
-const PACKAGE_DIR = resolve(HOST_ENTRYPOINT_DIR, "..", "..");
 const ALPN = Array.from(Buffer.from(IROH_REMOTE_ALPN, "utf8"));
 const CONTROL_REQUEST_MAX_BYTES = 16 * 1024;
 const DEFAULT_READ_LIMIT = 64 * 1024;
@@ -86,7 +76,6 @@ const DEFAULT_STATE_PATH = join(getAgentDir(), "remote", "iroh-host.json");
 const ACTIVE_REVOKE_CLOSE_REASON = "revoked";
 const ACTIVE_REPLACE_CLOSE_REASON = "replaced";
 const DUPLICATE_CONVERSATION_RETRY_AFTER_MS = 500;
-const LEGACY_WORKSPACE_SESSION_ID = "legacy-workspace";
 const WORKSPACE_DISCOVERY_STREAM_SESSION_ID = "$workspace-discovery";
 const WORKSPACE_MANAGEMENT_STREAM_SESSION_ID = "$workspace-management";
 const WORKSPACE_UNREGISTERED_CLOSE_REASON = "workspace_unregistered";
@@ -102,32 +91,11 @@ const REMOTE_TRANSCRIPT_CURSOR_MAX_SCALARS = 512;
 const REMOTE_TRANSCRIPT_TEXT_MAX_SCALARS = 12_000;
 let activeConnectionSequence = 0;
 let activeStreamSequence = 0;
-const PROMPT_COMPLETION_RPC_TYPES = new Set(["prompt", "steer", "follow_up"]);
 const INTEGRATED_CONVERSATION_UNSUPPORTED_RPC_TYPES = new Set([
 	"new_session",
 	"switch_session_by_id",
 	"get_messages",
 ]);
-const RESPONSE_COMPLETION_RPC_TYPES = new Set([
-	"abort",
-	"new_session",
-	"set_client_capabilities",
-	"get_pending_host_actions",
-	"get_state",
-	"get_transcript",
-	"get_ui_capabilities",
-	"get_ui_actions",
-	"get_ui_action_completions",
-	"invoke_ui_action",
-	"list_sessions",
-	"register_push_target",
-	"register_live_activity",
-	"unregister_live_activity",
-	"switch_session_by_id",
-	"unregister_workspace",
-]);
-const UI_ACTION_PROMPT_COMPLETION_STATUSES = new Set(["accepted", "queued"]);
-const PROMPT_COMPLETION_SETTLE_MS = 100;
 const BOOLEAN_FLAGS = new Set([
 	"approve",
 	"help",
@@ -136,7 +104,6 @@ const BOOLEAN_FLAGS = new Set([
 	"no-pairing",
 	"once",
 	"register-workspace",
-	"use-volt",
 	"yes",
 ]);
 const VALUE_FLAGS = new Set([
@@ -148,10 +115,8 @@ const VALUE_FLAGS = new Set([
 	"push-relay-auth-token",
 	"push-relay-url",
 	"relay",
-	"source-volt",
 	"state",
 	"unregister-workspace",
-	"volt-bin",
 	"workspace",
 ]);
 function parseFlags(argv) {
@@ -206,11 +171,6 @@ function getFlag(flags, name, fallback) {
 
 function hasFlag(flags, name) {
 	return flags.has(name) && flags.get(name) !== "false";
-}
-
-async function writeNodeStream(writable, chunk) {
-	if (writable.write(chunk)) return;
-	await once(writable, "drain");
 }
 
 async function readLineFromIroh(recv, initial = Buffer.alloc(0), options = {}) {
@@ -684,10 +644,7 @@ Serve options:
   --relay <disabled|default> Iroh relay preset. Defaults to default; use disabled for LAN-only testing.
   --state <path>             Host state path. Defaults to ~/.volt/agent/remote/iroh-host.json.
   --audit <path>             Host audit JSONL path. Defaults to <state>.audit.jsonl.
-  --use-volt                 Spawn volt --mode rpc instead of the fake RPC child.
-  --source-volt <repo-root>  Spawn Volt from a source checkout. Implies --use-volt.
-  --integrated-volt          Run Volt's runtime in-process over Iroh.
-  --volt-bin <path>          Volt executable for --use-volt. Defaults to volt.
+  --integrated-volt          Accepted for compatibility; the host always runs Volt in-process.
   --allow-tools <list>       Tool allowlist passed to Volt. Defaults to the saved workspace allowlist or read,bash,edit,write,grep,find,ls.
                               bash, edit, or write can modify host state and require confirmation.
   --profile <name>           Volt settings profile for integrated Volt runtime.
@@ -974,75 +931,6 @@ async function unregisterWorkspace(flags, positionals) {
 	console.error(`unregistered workspace: ${workspaceName}`);
 }
 
-function getPlatformVoltBin(voltBin) {
-	return process.platform === "win32" && voltBin === "volt" ? "volt.cmd" : voltBin;
-}
-
-function isPathCommand(command) {
-	return isAbsolute(command) || command.includes("/") || command.includes("\\");
-}
-
-function getExecutableCandidates(command) {
-	if (process.platform !== "win32") return [command];
-
-	const lowerCommand = command.toLowerCase();
-	const extensions = (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
-		.split(";")
-		.map((extension) => extension.trim())
-		.filter((extension) => extension.length > 0);
-	if (extensions.some((extension) => lowerCommand.endsWith(extension.toLowerCase()))) {
-		return [command];
-	}
-	return [command, ...extensions.map((extension) => `${command}${extension}`)];
-}
-
-async function isExecutable(path) {
-	try {
-		await access(path, constants.X_OK);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-async function findExecutable(command) {
-	const candidates = getExecutableCandidates(command);
-	if (isPathCommand(command)) {
-		for (const candidate of candidates) {
-			const candidatePath = isAbsolute(candidate) ? candidate : resolve(candidate);
-			if (await isExecutable(candidatePath)) return candidatePath;
-		}
-		return undefined;
-	}
-
-	const pathEntries = (process.env.PATH ?? "").split(delimiter).filter((entry) => entry.length > 0);
-	for (const pathEntry of pathEntries) {
-		for (const candidate of candidates) {
-			const candidatePath = join(pathEntry, candidate);
-			if (await isExecutable(candidatePath)) return candidatePath;
-		}
-	}
-	return undefined;
-}
-
-function sourceCheckoutVoltBinHint(workspace) {
-	if (process.platform === "win32") {
-		return "If testing a source checkout on Windows, run from an environment that can execute volt-test.sh or pass a built volt.cmd path.";
-	}
-	return `If testing a source checkout, pass --volt-bin ${resolve(workspace.path, "volt-test.sh")}.`;
-}
-
-async function resolveSourceVoltRunner(sourceVolt) {
-	const runnerPath = resolve(sourceVolt, "scripts", "run-coding-agent-source.mjs");
-	try {
-		const runnerStat = await stat(runnerPath);
-		if (runnerStat.isFile()) return runnerPath;
-	} catch (error) {
-		if (error && error.code !== "ENOENT") throw error;
-	}
-	throw new Error(`Volt source runner is not available: ${runnerPath}`);
-}
-
 function selectServeWorkspace(state, workspaceSpec, allowTools, cwd) {
 	if (workspaceSpec !== undefined || state.workspaces.length === 0) {
 		return selectIrohRemoteWorkspace(state, workspaceSpec, allowTools, cwd);
@@ -1058,23 +946,6 @@ function selectServeWorkspace(state, workspaceSpec, allowTools, cwd) {
 
 async function preflightRpcChild(options, workspace) {
 	await assertWorkspaceDirectory(workspace);
-	if (options.integratedVolt) {
-		return;
-	}
-	if (options.sourceVolt) {
-		options.resolvedSourceVoltRunner = await resolveSourceVoltRunner(options.sourceVolt);
-		return;
-	}
-	if (!options.useVolt) return;
-
-	const voltBin = getPlatformVoltBin(options.voltBin);
-	const resolvedVoltBin = await findExecutable(voltBin);
-	if (!resolvedVoltBin) {
-		throw new Error(
-			`Volt executable is not available: ${voltBin}. Install Volt globally or pass --volt-bin <path>. ${sourceCheckoutVoltBinHint(workspace)}`,
-		);
-	}
-	options.resolvedVoltBin = resolvedVoltBin;
 }
 
 async function bindEndpoint(relayMode, state, statePath) {
@@ -1104,127 +975,8 @@ async function bindEndpoint(relayMode, state, statePath) {
 	return endpoint;
 }
 
-function isWindowsCommandShim(command) {
-	if (process.platform !== "win32") return false;
-	const lowerCommand = command.toLowerCase();
-	return lowerCommand.endsWith(".cmd") || lowerCommand.endsWith(".bat");
-}
-
-function spawnProcess(command, args, options) {
-	if (!isWindowsCommandShim(command)) {
-		return spawn(command, args, options);
-	}
-	return spawn(process.env.ComSpec ?? process.env.COMSPEC ?? "cmd.exe", ["/d", "/s", "/c", command, ...args], options);
-}
-
 function getProjectTrustedForWorkspace(options, workspace) {
 	return options.getProjectTrustedForWorkspace?.(workspace) === true;
-}
-
-function spawnRpcChild(options, workspace, allowTools) {
-	if (options.sourceVolt) {
-		const runnerPath =
-			options.resolvedSourceVoltRunner ?? resolve(options.sourceVolt, "scripts", "run-coding-agent-source.mjs");
-		const args = [runnerPath, "--mode", "rpc", ...getIrohRemoteVoltRpcToolArgs(allowTools)];
-		if (getProjectTrustedForWorkspace(options, workspace)) args.push("--approve");
-		return {
-			command: process.execPath,
-			args,
-			child: spawnProcess(process.execPath, args, {
-				cwd: workspace.path,
-				stdio: ["pipe", "pipe", "pipe"],
-			}),
-		};
-	}
-
-	if (!options.useVolt) {
-		const fakeRpcPath = join(PACKAGE_DIR, "examples", "remote", "iroh-sidecar", "fake-rpc.mjs");
-		const args = [fakeRpcPath];
-		return {
-			command: process.execPath,
-			args,
-			child: spawnProcess(process.execPath, args, {
-				cwd: workspace.path,
-				stdio: ["pipe", "pipe", "pipe"],
-			}),
-		};
-	}
-
-	const voltBin = options.resolvedVoltBin ?? getPlatformVoltBin(options.voltBin);
-	const args = ["--mode", "rpc", ...getIrohRemoteVoltRpcToolArgs(allowTools)];
-	if (getProjectTrustedForWorkspace(options, workspace)) args.push("--approve");
-	return {
-		command: voltBin,
-		args,
-		child: spawnProcess(voltBin, args, {
-			cwd: workspace.path,
-			stdio: ["pipe", "pipe", "pipe"],
-		}),
-	};
-}
-
-function formatCommand(command, args) {
-	return [command, ...args].join(" ");
-}
-
-async function waitForChildSpawn(child, commandText, workspace) {
-	await new Promise((resolveSpawn, rejectSpawn) => {
-		const cleanup = () => {
-			child.off("spawn", handleSpawn);
-			child.off("error", handleError);
-		};
-		const handleSpawn = () => {
-			cleanup();
-			resolveSpawn();
-		};
-		const handleError = (error) => {
-			cleanup();
-			rejectSpawn(
-				new Error(`Failed to spawn RPC child (${commandText}) in ${workspace.path}: ${error.message}`),
-			);
-		};
-		child.once("spawn", handleSpawn);
-		child.once("error", handleError);
-	});
-}
-
-function attachChildLogging(child) {
-	if (!child.stderr) return;
-	child.stderr.setEncoding("utf8");
-	child.stderr.on("data", (chunk) => {
-		for (const line of chunk.split("\n")) {
-			if (line.trim().length > 0) process.stderr.write(`[volt-rpc] ${line}\n`);
-		}
-	});
-}
-
-async function waitForChildExitOrTimeout(child) {
-	if (child.exitCode !== null || child.signalCode !== null) return true;
-	await Promise.race([
-		once(child, "exit").then(() => true),
-		new Promise((resolveDelay) => {
-			setTimeout(() => resolveDelay(false), 500);
-		}),
-	]);
-	return child.exitCode !== null || child.signalCode !== null;
-}
-
-async function logRpcChildStopped(child, childCommand, authorization, options) {
-	const stopped = await waitForChildExitOrTimeout(child);
-	await logAudit(options.auditLogger, {
-		type: "child_stopped",
-		clientNodeId: authorization.client.nodeId,
-		workspace: authorization.workspace.name,
-		success: stopped,
-		error: stopped ? undefined : "RPC child did not exit before audit timeout",
-		details: {
-			command: childCommand,
-			exitCode: child.exitCode,
-			killed: child.killed,
-			pid: child.pid,
-			signal: child.signalCode,
-		},
-	});
 }
 
 async function sendHandshakeError(stream, error, options) {
@@ -1280,23 +1032,6 @@ function isExpectedApplicationClose(error) {
 			message.includes(`reason: b"${ACTIVE_REPLACE_CLOSE_REASON}"`) ||
 			message.includes(`reason: b"${WORKSPACE_UNREGISTERED_CLOSE_REASON}"`))
 	);
-}
-
-function createIrohSendQueue(send) {
-	let pendingWrite = Promise.resolve();
-	let finishPromise;
-	return {
-		write(chunk) {
-			if (chunk.length === 0 || finishPromise) return pendingWrite;
-			const bytes = Array.from(Buffer.from(chunk));
-			pendingWrite = pendingWrite.then(() => send.writeAll(bytes));
-			return pendingWrite;
-		},
-		async finish() {
-			finishPromise ??= pendingWrite.then(() => send.finish());
-			await finishPromise;
-		},
-	};
 }
 
 function getCurrentUserName() {
@@ -1406,350 +1141,16 @@ function decorateRemoteUiActionResponse(value) {
 	};
 }
 
-function createRemoteRpcCompletionTracker(sendQueue) {
-	let clientInputEnded = false;
-	let pendingPromptCompletions = 0;
-	let completionSettled = false;
-	let runningAgent = false;
-	let pendingCompaction = false;
-	let promptCompletionTimer;
-	let retryInProgress = false;
-	let waitingForContinuation = false;
-	const pendingResponseIds = new Set();
-	const pendingResponseCommands = new Map();
-	let resolveCompletion;
-	let rejectCompletion;
-	const completion = new Promise((resolve, reject) => {
-		resolveCompletion = resolve;
-		rejectCompletion = reject;
-	});
-
-	const getPendingResponseCommandCount = () => {
-		let count = 0;
-		for (const value of pendingResponseCommands.values()) count += value;
-		return count;
-	};
-	const addPendingResponseCommand = (command) => {
-		pendingResponseCommands.set(command, (pendingResponseCommands.get(command) ?? 0) + 1);
-	};
-	const completePendingResponseCommand = (command) => {
-		const count = pendingResponseCommands.get(command) ?? 0;
-		if (count <= 1) {
-			pendingResponseCommands.delete(command);
-			return;
-		}
-		pendingResponseCommands.set(command, count - 1);
-	};
-	const completePendingResponse = (event) => {
-		if (typeof event.id === "string" && pendingResponseIds.delete(event.id)) {
-			return true;
-		}
-		if (pendingResponseCommands.has(event.command)) {
-			completePendingResponseCommand(event.command);
-			return true;
-		}
-		return false;
-	};
-	const clearPromptCompletionTimer = () => {
-		if (!promptCompletionTimer) return;
-		clearTimeout(promptCompletionTimer);
-		promptCompletionTimer = undefined;
-	};
-	const hasPendingPromptContinuation = () => {
-		return runningAgent || waitingForContinuation || retryInProgress || pendingCompaction;
-	};
-	const completePendingPromptCompletion = () => {
-		clearPromptCompletionTimer();
-		if (pendingPromptCompletions > 0) pendingPromptCompletions -= 1;
-		if (pendingPromptCompletions > 0 && !hasPendingPromptContinuation()) {
-			schedulePendingPromptCompletion();
-			return;
-		}
-		maybeComplete();
-	};
-	const schedulePendingPromptCompletion = () => {
-		if (pendingPromptCompletions <= 0) {
-			maybeComplete();
-			return;
-		}
-		clearPromptCompletionTimer();
-		promptCompletionTimer = setTimeout(() => {
-			promptCompletionTimer = undefined;
-			if (hasPendingPromptContinuation()) return;
-			completePendingPromptCompletion();
-		}, PROMPT_COMPLETION_SETTLE_MS);
-	};
-	const maybeComplete = () => {
-		if (
-			completionSettled ||
-			!clientInputEnded ||
-			pendingPromptCompletions > 0 ||
-			pendingResponseIds.size > 0 ||
-			getPendingResponseCommandCount() > 0
-		) {
-			return;
-		}
-		completionSettled = true;
-		clearPromptCompletionTimer();
-		sendQueue.finish().then(resolveCompletion, rejectCompletion);
-	};
-
-	return {
-		completion,
-		markChildOutputLine(line) {
-			let event;
-			try {
-				event = JSON.parse(line);
-			} catch {
-				return;
-			}
-			if (typeof event !== "object" || event === null || typeof event.type !== "string") return;
-
-			if (event.type === "agent_start") {
-				runningAgent = true;
-				waitingForContinuation = false;
-				clearPromptCompletionTimer();
-				return;
-			}
-
-			if (event.type === "queue_update") {
-				if (hasPendingPromptContinuation()) {
-					clearPromptCompletionTimer();
-				} else {
-					schedulePendingPromptCompletion();
-				}
-				return;
-			}
-
-			if (event.type === "auto_retry_start") {
-				retryInProgress = true;
-				runningAgent = true;
-				waitingForContinuation = false;
-				clearPromptCompletionTimer();
-				return;
-			}
-
-			if (event.type === "auto_retry_end") {
-				retryInProgress = false;
-				runningAgent = false;
-				waitingForContinuation = false;
-				if (event.success === false && !hasPendingPromptContinuation()) schedulePendingPromptCompletion();
-				return;
-			}
-
-			if (event.type === "compaction_start") {
-				pendingCompaction = true;
-				runningAgent = false;
-				waitingForContinuation = false;
-				clearPromptCompletionTimer();
-				return;
-			}
-
-			if (event.type === "compaction_end") {
-				pendingCompaction = false;
-				waitingForContinuation = event.willRetry === true;
-				if (!waitingForContinuation && !hasPendingPromptContinuation()) schedulePendingPromptCompletion();
-				return;
-			}
-
-			if (event.type === "agent_end") {
-				runningAgent = false;
-				if (event.willRetry) {
-					waitingForContinuation = true;
-					clearPromptCompletionTimer();
-					return;
-				}
-				waitingForContinuation = false;
-				if (!hasPendingPromptContinuation()) schedulePendingPromptCompletion();
-				return;
-			}
-
-			if (event.type !== "response" || typeof event.command !== "string") return;
-			const completedTrackedResponse = completePendingResponse(event);
-			if (
-				completedTrackedResponse &&
-				event.success === true &&
-				shouldWaitForRemoteRpcPromptCompletion(event.command, event)
-			) {
-				pendingPromptCompletions += 1;
-				if (!hasPendingPromptContinuation()) schedulePendingPromptCompletion();
-			}
-			maybeComplete();
-		},
-		markClientInputEnded() {
-			clientInputEnded = true;
-			maybeComplete();
-		},
-		registerForwardedCommand(command) {
-			if (typeof command?.type !== "string") return;
-			if (PROMPT_COMPLETION_RPC_TYPES.has(command.type)) {
-				if (typeof command.id === "string") {
-					pendingResponseIds.add(command.id);
-					return;
-				}
-				addPendingResponseCommand(command.type);
-				return;
-			}
-			if (!RESPONSE_COMPLETION_RPC_TYPES.has(command.type)) return;
-			if (typeof command.id === "string") {
-				pendingResponseIds.add(command.id);
-				return;
-			}
-			addPendingResponseCommand(command.type);
-		},
-	};
-}
-
-function shouldWaitForRemoteRpcPromptCompletion(command, response) {
-	if (PROMPT_COMPLETION_RPC_TYPES.has(command)) {
-		return true;
-	}
-	if (command !== "invoke_ui_action") {
-		return false;
-	}
-	return UI_ACTION_PROMPT_COMPLETION_STATUSES.has(response.data?.status);
-}
-
-async function writeRemoteRpcLineToChild(
-	line,
-	writable,
-	initialAuthorization,
+async function runIntegratedVoltConnection(
+	stream,
+	handshake,
+	authorization,
+	connection,
+	connectionId,
+	streamId,
 	options,
-	writeToClient,
-	rpcCompletionTracker,
-	sanitizerOptions,
+	replaceExistingConversationStream,
 ) {
-	const filterResult = getIrohRemoteRpcFilterResult(line);
-	if (!filterResult.allowed) {
-		await writeToClient(
-			sanitizeIrohRemoteOutboundJsonLine(serializeIrohRemoteRpcFilterRejection(filterResult.response), sanitizerOptions),
-		);
-		return;
-	}
-	const remoteHostResponse = await handleRemoteHostRpcCommand(filterResult.command, initialAuthorization, options);
-	if (remoteHostResponse) {
-		await writeToClient(
-			sanitizeIrohRemoteOutboundJsonLine(`${JSON.stringify(remoteHostResponse)}\n`, sanitizerOptions),
-		);
-		return;
-	}
-	rpcCompletionTracker.registerForwardedCommand(filterResult.command);
-	await writeNodeStream(writable, Buffer.from(`${line}\n`, "utf8"));
-}
-
-async function pipeFilteredIrohRpcToNodeWritable(
-	recv,
-	writable,
-	initial,
-	initialAuthorization,
-	options,
-	writeToClient,
-	rpcCompletionTracker,
-	sanitizerOptions,
-) {
-	let buffer = Buffer.from(initial);
-
-	while (true) {
-		const result = await readLineFromIroh(recv, buffer, { maxLineBytes: DEFAULT_IROH_RPC_MAX_LINE_BYTES });
-		if (result.line === undefined) {
-			if (result.rest.length > 0) {
-				await writeRemoteRpcLineToChild(
-					result.rest.toString("utf8"),
-					writable,
-					initialAuthorization,
-					options,
-					writeToClient,
-					rpcCompletionTracker,
-					sanitizerOptions,
-				);
-			}
-			rpcCompletionTracker.markClientInputEnded();
-			return;
-		}
-
-		await writeRemoteRpcLineToChild(
-			result.line,
-			writable,
-			initialAuthorization,
-			options,
-			writeToClient,
-			rpcCompletionTracker,
-			sanitizerOptions,
-		);
-		buffer = result.rest;
-	}
-}
-
-async function runSpawnedRpcConnection(stream, handshake, authorization, options) {
-	const spawnedChild = spawnRpcChild(options, authorization.workspace, authorization.allowTools);
-	const child = spawnedChild.child;
-	const childCommand = formatCommand(spawnedChild.command, spawnedChild.args);
-	attachChildLogging(child);
-	try {
-		await waitForChildSpawn(child, childCommand, authorization.workspace);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		await logAudit(options.auditLogger, {
-			type: "child_start_failed",
-			clientNodeId: authorization.client.nodeId,
-			workspace: authorization.workspace.name,
-			success: false,
-			error: message,
-			details: { command: childCommand },
-		});
-		await sendHandshakeError(stream, message, options);
-		return child;
-	}
-
-	await logAudit(options.auditLogger, {
-		type: "child_started",
-		clientNodeId: authorization.client.nodeId,
-		workspace: authorization.workspace.name,
-		success: true,
-		details: { command: childCommand, pid: child.pid },
-	});
-	await writeIrohRemoteHandshakeResponse(stream.send, handshake.response);
-
-	const sendQueue = createIrohSendQueue(stream.send);
-	const rpcCompletionTracker = createRemoteRpcCompletionTracker(sendQueue);
-	const clientToChild = pipeFilteredIrohRpcToNodeWritable(
-		stream.recv,
-		child.stdin,
-		handshake.initialInput,
-		authorization,
-		options,
-		(chunk) => sendQueue.write(chunk),
-		rpcCompletionTracker,
-		{ workspacePath: authorization.workspace.path },
-	).catch((error) => {
-		if (!child.killed) child.kill();
-		throw error;
-	});
-	const childToClient = pipeIrohRemoteOutboundJsonlReadable(child.stdout, {
-		decorate: (value) => decorateRemoteHostState(value, authorization, options),
-		workspacePath: authorization.workspace.path,
-		writeLine: (line) => sendQueue.write(line),
-		onLine: (line) => {
-			rpcCompletionTracker.markChildOutputLine(line);
-		},
-	}).then(() => sendQueue.finish());
-	const childError = new Promise((_, rejectChildError) => {
-		child.once("error", (error) => {
-			rejectChildError(new Error(`RPC child error (${childCommand}): ${error.message}`));
-		});
-	});
-	const clientToChildFailure = clientToChild.then(() => new Promise(() => {}));
-
-	try {
-		await Promise.race([childToClient, childError, clientToChildFailure, rpcCompletionTracker.completion]);
-	} finally {
-		if (child.exitCode === null && !child.killed) child.kill();
-		await logRpcChildStopped(child, childCommand, authorization, options);
-	}
-	return child;
-}
-
-async function runIntegratedVoltConnection(stream, handshake, authorization, connection, connectionId, streamId, options) {
 	let entry;
 	let sessionSelection;
 	let createdRuntime = false;
@@ -1782,12 +1183,17 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, con
 
 	const matchingActiveStreams = getActiveStreamsForConversation(options, authorization, entry.sessionId);
 	if (matchingActiveStreams.length > 0) {
-		if (createdRuntime) {
-			await cleanupUncommittedIntegratedRuntimeEntry(entry, sessionSelection, options);
+		if (!replaceExistingConversationStream) {
+			if (createdRuntime) {
+				await cleanupUncommittedIntegratedRuntimeEntry(entry, sessionSelection, options);
+			}
+			await rejectDuplicateActiveConnection(stream, authorization, options, entry.sessionId);
+			return;
 		}
-		await rejectDuplicateActiveConnection(stream, authorization, options, entry.sessionId);
-		return;
 	}
+	const replacedEntries = replaceExistingConversationStream
+		? takeActiveStreamsForConversation(options, authorization, entry.sessionId)
+		: [];
 
 	let activeStream;
 	let subscriber;
@@ -1815,6 +1221,9 @@ async function runIntegratedVoltConnection(stream, handshake, authorization, con
 			connectionId,
 			streamId,
 		);
+		if (replacedEntries.length > 0) {
+			await closeReplacedActiveStreams(options, authorization, streamId, replacedEntries);
+		}
 		await writeIrohRemoteHandshakeResponse(
 			stream.send,
 			createIntegratedConversationHandshakeResponse(handshake, authorization, entry, sessionSelection, options),
@@ -2888,23 +2297,11 @@ function registerActiveStream(options, authorization, sessionId, stream, connect
 	return { entry, remove };
 }
 
-function getActiveStreamsForAuthorization(options, authorization) {
-	return options.activeStreams.entriesForWorkspace(authorization.client.nodeId, authorization.workspace.name);
-}
-
 function getActiveStreamsForConversation(options, authorization, sessionId) {
 	return options.activeStreams.entriesForConversation(
 		authorization.client.nodeId,
 		authorization.workspace.name,
 		sessionId,
-	);
-}
-
-function hasActiveStreamForAuthorizationOnConnection(options, authorization, connectionId) {
-	return options.activeStreams.hasWorkspaceOnConnection(
-		authorization.client.nodeId,
-		authorization.workspace.name,
-		connectionId,
 	);
 }
 
@@ -2917,16 +2314,12 @@ function hasActiveStreamForConversationOnConnection(options, authorization, sess
 	);
 }
 
-function takeActiveStreamsForAuthorization(options, authorization) {
-	const matchingEntries = getActiveStreamsForAuthorization(options, authorization);
-	if (matchingEntries.length === 0) {
-		return [];
-	}
-
-	for (const entry of matchingEntries) {
-		options.activeStreams.unregister(entry);
-	}
-	return matchingEntries;
+function takeActiveStreamsForConversation(options, authorization, sessionId) {
+	return options.activeStreams.takeEntriesForConversation(
+		authorization.client.nodeId,
+		authorization.workspace.name,
+		sessionId,
+	);
 }
 
 async function closeReplacedActiveStreams(options, authorization, replacementStreamId, replacedEntries) {
@@ -2986,24 +2379,8 @@ async function rejectDuplicateActiveConnection(stream, authorization, options, s
 	await Promise.resolve(stream.recv.stop?.(0n)).catch(() => {});
 }
 
-async function rejectUnsupportedConversationStreams(stream, handshake, options) {
-	const error = new IrohRemoteHandshakeError(
-		"conversation_streams_unsupported",
-		"conversation stream modes require integrated Volt host mode",
-	);
-	await logAudit(options.auditLogger, {
-		type: "handshake_rejected",
-		clientNodeId: handshake.authorization.client.nodeId,
-		workspace: handshake.authorization.workspace.name,
-		success: false,
-		error: error.message,
-		details: { mode: handshake.hello.mode, outcome: error.outcome },
-	});
-	await sendHandshakeError(stream, error, options);
-}
-
-function getHandshakeChildLabel(options) {
-	return options.integratedVolt || options.useVolt ? "volt" : "fake-rpc";
+function getHandshakeChildLabel() {
+	return "volt";
 }
 
 function getRemoteTerminalReason(reason) {
@@ -3114,11 +2491,10 @@ async function handleConnectionStream(
 	connectionId,
 	streamId,
 	options,
-	replaceExistingWorkspaceStream,
+	replaceExistingConversationStream,
 ) {
 	const handshake = await options.hostEngine.readHandshake(stream, remoteId, {
-		allowLegacyWorkspaceMode: !options.integratedVolt,
-		child: getHandshakeChildLabel(options),
+		child: getHandshakeChildLabel(),
 		maxLineBytes: DEFAULT_IROH_REMOTE_HANDSHAKE_MAX_LINE_BYTES,
 		timeoutMs: DEFAULT_IROH_REMOTE_HANDSHAKE_TIMEOUT_MS,
 		writeSuccessResponse: false,
@@ -3140,25 +2516,8 @@ async function handleConnectionStream(
 	}
 
 	if (handshake.hello.mode !== "conversation") {
-		if (!options.integratedVolt) {
-			if (handshake.hello.mode !== "legacyWorkspace") {
-				await rejectUnsupportedConversationStreams(stream, handshake, options);
-				return;
-			}
-		} else {
-			if (handshake.hello.mode === "workspaceDiscovery") {
-				await runIntegratedWorkspaceDiscoveryConnection(
-					stream,
-					handshake,
-					handshake.authorization,
-					connection,
-					connectionId,
-					streamId,
-					options,
-				);
-				return;
-			}
-			await runIntegratedWorkspaceManagementConnection(
+		if (handshake.hello.mode === "workspaceDiscovery") {
+			await runIntegratedWorkspaceDiscoveryConnection(
 				stream,
 				handshake,
 				handshake.authorization,
@@ -3169,13 +2528,7 @@ async function handleConnectionStream(
 			);
 			return;
 		}
-	} else if (!options.integratedVolt) {
-		await rejectUnsupportedConversationStreams(stream, handshake, options);
-		return;
-	}
-
-	if (options.integratedVolt) {
-		await runIntegratedVoltConnection(
+		await runIntegratedWorkspaceManagementConnection(
 			stream,
 			handshake,
 			handshake.authorization,
@@ -3187,39 +2540,16 @@ async function handleConnectionStream(
 		return;
 	}
 
-	if (hasActiveStreamForAuthorizationOnConnection(options, handshake.authorization, connectionId)) {
-		await rejectDuplicateActiveConnection(stream, handshake.authorization, options, LEGACY_WORKSPACE_SESSION_ID);
-		return;
-	}
-
-	const matchingActiveStreams = getActiveStreamsForAuthorization(options, handshake.authorization);
-	if (matchingActiveStreams.length > 0 && !replaceExistingWorkspaceStream) {
-		await rejectDuplicateActiveConnection(stream, handshake.authorization, options, LEGACY_WORKSPACE_SESSION_ID);
-		return;
-	}
-	const replacedEntries = replaceExistingWorkspaceStream
-		? takeActiveStreamsForAuthorization(options, handshake.authorization)
-		: [];
-	let child;
-	const activeStream = registerActiveStream(
-		options,
-		handshake.authorization,
-		LEGACY_WORKSPACE_SESSION_ID,
+	await runIntegratedVoltConnection(
 		stream,
+		handshake,
+		handshake.authorization,
 		connection,
 		connectionId,
 		streamId,
+		options,
+		replaceExistingConversationStream,
 	);
-	if (replaceExistingWorkspaceStream) {
-		await closeReplacedActiveStreams(options, handshake.authorization, streamId, replacedEntries);
-	}
-
-	try {
-		child = await runSpawnedRpcConnection(stream, handshake, handshake.authorization, options);
-	} finally {
-		if (child && child.exitCode === null && !child.killed) child.kill();
-		activeStream.remove();
-	}
 }
 
 function closeConnection(connection, reason) {
@@ -3267,7 +2597,7 @@ async function handleConnection(incoming, options) {
 				: connection.acceptBi());
 			acceptedStreamCount++;
 			const streamId = `stream-${++activeStreamSequence}`;
-			const replaceExistingWorkspaceStream = acceptedStreamCount === 1;
+			const replaceExistingConversationStream = acceptedStreamCount === 1;
 			const task = handleConnectionStream(
 				stream,
 				connection,
@@ -3275,7 +2605,7 @@ async function handleConnection(incoming, options) {
 				connectionId,
 				streamId,
 				options,
-				replaceExistingWorkspaceStream,
+				replaceExistingConversationStream,
 			)
 				.catch((error) => {
 					if (!isExpectedApplicationClose(error)) {
@@ -3580,7 +2910,6 @@ async function serve(flags) {
 	const relayMode = getRelayMode(flags);
 	const startupTicketMode = getStartupTicketMode(flags);
 	const startupPairingEnabled = startupTicketMode === "pairing";
-	const sourceVolt = getFlag(flags, "source-volt");
 	const trustState = getRemoteWorkspaceTrustState(flags, workspace);
 	const confirmation = await confirmRemoteWorkspaceAccess({
 		allowTools,
@@ -3610,7 +2939,7 @@ async function serve(flags) {
 				trustStore: trustState.trustStore,
 			}),
 		hostEngine: undefined,
-		integratedVolt: hasFlag(flags, "integrated-volt"),
+		integratedVolt: true,
 		integratedRuntimes: new Map(),
 		profile: getFlag(flags, "profile"),
 		pushNotificationDeduper: new IrohRemoteInMemoryPushNotificationDeduper(),
@@ -3623,11 +2952,8 @@ async function serve(flags) {
 		hostNodeId: undefined,
 		ticketExpiresAt: undefined,
 		once: hasFlag(flags, "once"),
-		sourceVolt: sourceVolt ? resolve(sourceVolt) : undefined,
 		stateManager,
 		statePath,
-		useVolt: Boolean(sourceVolt) || hasFlag(flags, "use-volt"),
-		voltBin: getFlag(flags, "volt-bin", "volt"),
 		workspace,
 	};
 	await preflightRpcChild(options, workspace);
@@ -3694,9 +3020,7 @@ async function serve(flags) {
 		console.error(
 			`push relay: ${effectivePushRelayUrl}${pushRelayUrl ? "" : " (managed default)"}${pushRelayAuthToken ? " with bearer auth" : ""}`,
 		);
-		console.error(
-			`child: ${options.integratedVolt ? "in-process volt remote host" : options.sourceVolt ? `${process.execPath} ${options.resolvedSourceVoltRunner} --mode rpc` : options.useVolt ? `${options.resolvedVoltBin ?? getPlatformVoltBin(options.voltBin)} --mode rpc` : "fake-rpc"}`,
-		);
+		console.error("child: in-process volt remote host");
 		console.error(`pairing: ${startupPairingEnabled ? "enabled" : "disabled"}`);
 		if (ticket !== undefined && ticketLabel !== undefined) {
 			printTicket(ticket, ticketLabel);

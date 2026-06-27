@@ -111,7 +111,7 @@ Host handshake failure outcomes:
 | --- | --- |
 | `invalid_workspace` | The workspace field is malformed. |
 | `invalid_conversation_target` | The stream mode, target, purpose, or session ID syntax is malformed or unsupported. |
-| `conversation_streams_unsupported` | The reached host mode cannot provide conversation-bound mobile streams. |
+| `conversation_streams_unsupported` | Reserved for hosts that cannot provide conversation-bound mobile streams. Current `volt remote host` builds are conversation-only. |
 | `pairing_secret_expired` | The supplied pairing secret matches an expired pending ticket or retained expired tombstone. |
 | `pairing_secret_consumed` | The supplied pairing secret matches a retained consumed tombstone and this client is not the paired recovery node. |
 | `client_unknown` | The host does not know this client node ID and no active, expired, or consumed pairing secret applies. |
@@ -130,13 +130,13 @@ Client-local reconnect outcomes are not sent by the host: `host_unreachable` mea
 
 A successful pairing stores the client as authorized for the workstation represented by the host state file. That paired client can use any registered workspace name in that state file, including workspaces registered later, without scanning another QR. Revocation blocks that client node ID from every registered workspace. The client's persisted `allowedTools` grant applies across all selected workspaces; registering a workspace does not add built-in tools. When the persisted grant is the default built-in list, the host also exposes active tools registered by loaded extensions in the selected workspace.
 
-A paired client may open multiple conversation streams, including multiple sessions in the same registered workspace. The identity key is authoritative client node ID, workspace name, and resolved session ID. If the same authoritative client opens the same workspace/session twice, the host rejects the new stream and preserves the existing stream:
+A paired client may open multiple conversation streams, including multiple sessions in the same registered workspace. The identity key is authoritative client node ID, workspace name, and resolved session ID. If the same authoritative client opens the same workspace/session twice on one live Iroh connection, the host rejects the new stream and preserves the existing stream:
 
 ```json
 {"type":"volt_iroh_handshake","success":false,"outcome":"duplicate_conversation_connection","hostNodeId":"<authoritative-host-node-id>","workspace":"volt","sessionId":"abc123","retryAfterMs":500,"error":"duplicate conversation connection"}
 ```
 
-If a different authoritative client owns the resolved workspace/session, the host rejects with `conversation_in_use` and includes the resolved workspace/session identity.
+If the duplicate is the first conversation stream on a new Iroh connection from the same authoritative client, the host treats the previous active stream as stale, closes it with reason `replaced`, and accepts the new stream as the subscriber to the existing integrated runtime. If a different authoritative client owns the resolved workspace/session, the host rejects with `conversation_in_use` and includes the resolved workspace/session identity.
 
 ## Stream feature compatibility
 
@@ -189,9 +189,7 @@ The successful response uses the normal RPC response shape:
 
 `abort` is the only direct remote cancellation command in v1. Command names such as `cancel`, `cancel_run`, `detach`, and `disconnect` are not forwarded by the remote command allowlist. App-level disconnect without stop should close the stream only; clients reconnect by opening a new authorized stream, then calling `get_state` and `get_transcript`.
 
-The default integrated `volt remote host` runtime treats an authorized stream as a subscriber to host-owned session state. When the only subscriber detaches during active work, the prompt continues on the host. The same authoritative Iroh node ID, workspace, and session can reconnect to the detached runtime; `get_state.isStreaming` reports whether work is still active, and `get_transcript` recovers persisted output. Idle detached integrated runtimes are retained for 30 minutes by default, configurable with `--detached-runtime-ttl-ms`.
-
-Compatibility modes that spawn `volt --mode rpc` through `--use-volt` or `--source-volt` remain connection-scoped. A disconnect can terminate the spawned child and any in-memory active work unless a future persistent child registry is added. Mobile clients that depend on detach/reconnect during active work should use the integrated host path.
+The integrated `volt remote host` runtime treats an authorized stream as a subscriber to host-owned session state. When the only subscriber detaches during active work, the prompt continues on the host. The same authoritative Iroh node ID, workspace, and session can reconnect to the detached runtime; `get_state.isStreaming` reports whether work is still active, and `get_transcript` recovers persisted output. Idle detached integrated runtimes are retained for 30 minutes by default, configurable with `--detached-runtime-ttl-ms`.
 
 Host process exit, host crash, or explicit host shutdown are separate from client detach and can stop in-memory work because the runtime is gone. A reconnect after host exit requires a new host process and can recover only persisted session state.
 
@@ -234,7 +232,7 @@ Workspace management streams accept only `unregister_workspace`. Any other valid
 
 All other command types receive a JSONL `response` with `success:false` and are not forwarded to the local Volt RPC process. Within the remote surface, only `abort` is a direct cancellation command.
 
-`register_push_target` registers mobile-issued relay credentials with the host. The client must first register its raw FCM token with the Volt push relay; it must not send that raw FCM token to the desktop host. The host persists the relay target id and target-scoped auth token so it can notify the phone after the Iroh stream detaches. `relayUrl` is accepted as app registration metadata, but host delivery uses the desktop host's configured relay URL (`--push-relay-url` / `VOLT_PUSH_RELAY_URL`) and does not let clients redirect delivery:
+`register_push_target` registers mobile-issued relay credentials with the host. The client must first register its raw FCM token with the Volt push relay; it must not send that raw FCM token to the desktop host. The host persists the relay target id and target-scoped auth token so it can notify the phone after the Iroh stream detaches. When an ActivityKit push token is available, the same command may include a `liveActivity` delivery channel containing the raw ActivityKit token plus its lowercase SHA-256 hash; the host stores that channel so it can ask the relay to update the Live Activity later. `relayUrl` is accepted as app registration metadata, but host delivery uses the desktop host's configured relay URL (`--push-relay-url` / `VOLT_PUSH_RELAY_URL`) and does not let clients redirect delivery:
 
 ```json
 {
@@ -247,7 +245,13 @@ All other command types receive a JSONL `response` with `success:false` and are 
     "pushTargetAuthToken": "<relay-target-auth-token>",
     "relayUrl": "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay",
     "tokenHash": "sha256:<fcm-token-hash>",
-    "enabled": true
+    "enabled": true,
+    "liveActivity": {
+      "activityId": "activity-one",
+      "pushToken": "<activitykit-push-token-hex>",
+      "tokenEnvironment": "production",
+      "tokenHash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
   }
 }
 ```
@@ -258,7 +262,7 @@ The successful response is:
 {"id":"push-1","type":"response","command":"register_push_target","success":true,"data":{"status":"registered","pushTargetId":"<relay-target-id>"}}
 ```
 
-`register_live_activity` binds an ActivityKit Live Activity to the current conversation stream. The app sends the activity identity and a lowercase SHA-256 token hash that references an already registered delivery channel; it does not send the raw ActivityKit push token to the desktop host:
+`register_live_activity` binds an ActivityKit Live Activity to the current conversation stream. The app sends the activity identity and a lowercase SHA-256 token hash that references the previously acknowledged `register_push_target.args.liveActivity` delivery channel. It does not repeat the raw ActivityKit push token in `register_live_activity`:
 
 ```json
 {
@@ -273,7 +277,7 @@ The successful response is:
 }
 ```
 
-The host validates that `workspaceName` and `sessionId` match the bound stream, validates the activity payload, resolves `tokenHash` through the existing delivery channel for the authoritative client, and returns stable errors such as `session_mismatch`, `invalid_live_activity_registration`, `invalid_live_activity_token`, or `unknown_live_activity_token`. `unregister_live_activity` uses the same stream-bound workspace/session/activity identity without a token hash and is idempotent for the matching registration.
+The host validates that `workspaceName` and `sessionId` match the bound stream, validates the activity payload, resolves `tokenHash` through the existing ActivityKit delivery channel for the authoritative client, and returns stable errors such as `session_mismatch`, `invalid_live_activity_registration`, `invalid_live_activity_token`, or `unknown_live_activity_token`. `unregister_live_activity` uses the same stream-bound workspace/session/activity identity without a token hash and is idempotent for the matching registration.
 
 Completion notifications sent through the relay, or over JSONL as `notification_request` when no push target is available, include the safe workspace name when the host knows it:
 

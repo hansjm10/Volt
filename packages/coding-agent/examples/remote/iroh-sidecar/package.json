@@ -3,11 +3,10 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "Demo clients for tunneling Volt RPC over Iroh",
-  "scripts": {
-    "client": "node source-aware-run.mjs client.mjs",
-    "fake-rpc": "node fake-rpc.mjs"
-  },
+	"description": "Demo clients for tunneling Volt RPC over Iroh",
+	"scripts": {
+		"client": "node source-aware-run.mjs client.mjs"
+	},
   "dependencies": {
     "@number0/iroh": "1.0.0"
   }

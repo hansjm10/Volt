@@ -66,9 +66,6 @@ export type IrohRemoteHelloMode =
 	| {
 			mode: "workspaceManagement";
 			workspaceManagement: IrohRemoteWorkspaceManagementTarget;
-	  }
-	| {
-			mode: "legacyWorkspace";
 	  };
 
 interface IrohRemoteHelloBase {
@@ -81,10 +78,6 @@ interface IrohRemoteHelloBase {
 }
 
 export type IrohRemoteHello = IrohRemoteHelloBase & IrohRemoteHelloMode;
-
-export interface IrohRemoteHelloParseOptions {
-	allowLegacyWorkspaceMode?: boolean;
-}
 
 export const IROH_REMOTE_SESSION_ID_PATTERN = /^[a-z0-9_-]{1,128}$/;
 
@@ -126,7 +119,7 @@ export class IrohRemoteHandshakeError extends Error {
 	}
 }
 
-export function parseIrohRemoteHelloLine(line: string, options: IrohRemoteHelloParseOptions = {}): IrohRemoteHello {
+export function parseIrohRemoteHelloLine(line: string): IrohRemoteHello {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(line);
@@ -136,7 +129,7 @@ export function parseIrohRemoteHelloLine(line: string, options: IrohRemoteHelloP
 			`Failed to parse Iroh remote handshake: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
-	return parseIrohRemoteHello(parsed, options);
+	return parseIrohRemoteHello(parsed);
 }
 
 export function parseIrohRemoteHandshakeResponseLine(line: string): IrohRemoteHandshakeResponse {
@@ -151,7 +144,7 @@ export function parseIrohRemoteHandshakeResponseLine(line: string): IrohRemoteHa
 	return parseIrohRemoteHandshakeResponse(parsed);
 }
 
-export function parseIrohRemoteHello(value: unknown, options: IrohRemoteHelloParseOptions = {}): IrohRemoteHello {
+export function parseIrohRemoteHello(value: unknown): IrohRemoteHello {
 	const hello = expectRecord(value, "Iroh remote handshake");
 	if (hello.type !== IROH_REMOTE_HELLO_TYPE) {
 		throw new Error("unexpected handshake type");
@@ -161,7 +154,7 @@ export function parseIrohRemoteHello(value: unknown, options: IrohRemoteHelloPar
 	}
 
 	const workspace = expectWorkspaceName(hello.workspace, "handshake workspace");
-	const mode = parseIrohRemoteHelloMode(hello, options);
+	const mode = parseIrohRemoteHelloMode(hello);
 	return {
 		type: IROH_REMOTE_HELLO_TYPE,
 		protocol: IROH_REMOTE_ALPN,
@@ -412,16 +405,10 @@ export function isIrohRemoteSessionId(value: unknown): value is string {
 	return typeof value === "string" && IROH_REMOTE_SESSION_ID_PATTERN.test(value);
 }
 
-function parseIrohRemoteHelloMode(
-	hello: Record<string, unknown>,
-	options: IrohRemoteHelloParseOptions,
-): IrohRemoteHelloMode {
+function parseIrohRemoteHelloMode(hello: Record<string, unknown>): IrohRemoteHelloMode {
 	const modeKeys = (["conversation", "workspaceDiscovery", "workspaceManagement"] as const).filter(
 		(key) => hello[key] !== undefined,
 	);
-	if (modeKeys.length === 0 && options.allowLegacyWorkspaceMode === true) {
-		return { mode: "legacyWorkspace" };
-	}
 	if (modeKeys.length !== 1) {
 		throw new IrohRemoteHandshakeError(
 			"invalid_conversation_target",

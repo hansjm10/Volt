@@ -94,15 +94,6 @@ export function usesDefaultIrohRemoteAllowTools(allowTools: string | undefined):
 	return tools.length === defaultTools.size && tools.every((tool) => defaultTools.has(tool));
 }
 
-export function getIrohRemoteVoltRpcToolArgs(allowTools: string | undefined): string[] {
-	const normalizedAllowTools = parseIrohRemoteAllowTools(allowTools).join(",");
-	const args = ["--tools", normalizedAllowTools];
-	if (usesDefaultIrohRemoteAllowTools(normalizedAllowTools)) {
-		args.push("--allow-unlisted-extension-tools");
-	}
-	return args;
-}
-
 export function getIrohRemoteUnsafeAllowedTools(allowTools: string): string[] {
 	const unsafeTools: string[] = [];
 	const seenUnsafeTools = new Set<string>();

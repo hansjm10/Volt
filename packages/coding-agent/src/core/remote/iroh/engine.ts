@@ -107,7 +107,6 @@ export type IrohRemoteHostHandshakeResult =
 	  };
 
 export interface IrohRemoteHostReadHandshakeOptions extends IrohRemoteHandshakeLineReadOptions {
-	allowLegacyWorkspaceMode?: boolean;
 	child?: string;
 	conversationSession?: {
 		selection: IrohRemoteConversationSelection;
@@ -359,9 +358,7 @@ export class IrohRemoteHostEngine {
 				);
 			}
 
-			const hello = parseIrohRemoteHelloLine(handshake.line, {
-				allowLegacyWorkspaceMode: options.allowLegacyWorkspaceMode,
-			});
+			const hello = parseIrohRemoteHelloLine(handshake.line);
 			const authorization = await this.authorizeHello(hello, remoteNodeId);
 			if (!authorization.ok) {
 				return await this.writeHandshakeResult(stream, {
@@ -489,9 +486,6 @@ export class IrohRemoteHostEngine {
 				...common,
 				workspaceManagement: { purpose: hello.workspaceManagement.purpose },
 			});
-		}
-		if (hello.mode === "legacyWorkspace") {
-			return createIrohRemoteHandshakeSuccess(common);
 		}
 		if (options.conversationSession === undefined) {
 			if (options.writeSuccessResponse === false) {

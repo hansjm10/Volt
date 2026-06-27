@@ -67,6 +67,18 @@ export class IrohRemoteActiveStreamRegistry {
 		return this.entriesForWorkspace(clientNodeId, workspaceName).filter((entry) => entry.sessionId === sessionId);
 	}
 
+	takeEntriesForConversation(
+		clientNodeId: string,
+		workspaceName: string,
+		sessionId: string,
+	): IrohRemoteActiveStreamEntry[] {
+		const entries = this.entriesForConversation(clientNodeId, workspaceName, sessionId);
+		for (const entry of entries) {
+			this.unregister(entry);
+		}
+		return entries;
+	}
+
 	entriesForConnection(connectionId: string): IrohRemoteActiveStreamEntry[] {
 		return Array.from(this.entriesByConnectionId.get(connectionId) ?? []);
 	}

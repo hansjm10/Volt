@@ -95,6 +95,34 @@ describe("IrohRemoteActiveStreamRegistry", () => {
 		expect(registry.hasWorkspaceOnConnection("client-a", "missing", "conn-1")).toBe(false);
 	});
 
+	test("takes conversation entries for replacement without touching unrelated streams", () => {
+		const registry = new IrohRemoteActiveStreamRegistry();
+		const staleConversation = makeEntry({ connectionId: "conn-1", streamId: "stream-stale" });
+		const sameWorkspaceOtherSession = makeEntry({
+			connectionId: "conn-1",
+			sessionId: "session-2",
+			streamId: "stream-other-session",
+		});
+		const sameSessionOtherClient = makeEntry({
+			clientNodeId: "client-b",
+			connectionId: "conn-2",
+			streamId: "stream-other-client",
+		});
+
+		registry.register(staleConversation);
+		registry.register(sameWorkspaceOtherSession);
+		registry.register(sameSessionOtherClient);
+
+		expect(registry.takeEntriesForConversation("client-a", "alpha", "session-1")).toEqual([staleConversation]);
+
+		expect(registry.size).toBe(2);
+		expect(registry.entriesForConversation("client-a", "alpha", "session-1")).toEqual([]);
+		expect(registry.entriesForConversation("client-a", "alpha", "session-2")).toEqual([sameWorkspaceOtherSession]);
+		expect(registry.entriesForConversation("client-b", "alpha", "session-1")).toEqual([sameSessionOtherClient]);
+		expect(registry.entriesForConnection("conn-1")).toEqual([sameWorkspaceOtherSession]);
+		expect(registry.entriesForConnection("conn-2")).toEqual([sameSessionOtherClient]);
+	});
+
 	test("removes only the affected connection entries during connection cleanup", () => {
 		const registry = new IrohRemoteActiveStreamRegistry();
 		const alpha = makeEntry({ connectionId: "conn-1", workspaceName: "alpha", streamId: "stream-alpha" });

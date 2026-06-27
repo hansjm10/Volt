@@ -4071,7 +4071,7 @@ describe("Iroh remote core helpers", () => {
 		expect(remoteWorkspaceSanitized.cwd).toBe("/workspace/src");
 	});
 
-	test("sanitizes remote outbound JSONL lines for sidecar spawned children", () => {
+	test("sanitizes remote outbound JSONL lines for remote streams", () => {
 		const line = `${JSON.stringify({
 			id: "/Users/jordan/private/request-id",
 			type: "response",

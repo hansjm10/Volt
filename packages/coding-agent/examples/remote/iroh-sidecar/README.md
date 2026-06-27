@@ -2,7 +2,7 @@
 
 This example tunnels Volt RPC JSONL over an Iroh QUIC bidirectional stream.
 
-The supported preview host lives in Volt itself: `volt remote host` launches `packages/coding-agent/src/remote/iroh-host.mjs` from source checkouts, or the copied `dist/remote/iroh-host.mjs` from package installs. This directory keeps demo clients, fake-RPC fixtures, and compatibility wrappers for local remote-host testing.
+The supported preview host lives in Volt itself: `volt remote host` launches `packages/coding-agent/src/remote/iroh-host.mjs` from source checkouts, or the copied `dist/remote/iroh-host.mjs` from package installs. This directory keeps demo clients and wrappers for local remote-host testing.
 
 ## Install
 
@@ -25,9 +25,7 @@ npm install --ignore-scripts
 From the repository root:
 
 ```bash
-npm run iroh:poc:smoke                  # local fake-RPC smoke test
-npm run iroh:poc:test                   # local fake-RPC scenario tests
-npm run iroh:poc:host                   # product host with the fake-RPC child
+npm run iroh:poc:host                   # integrated source Volt host
 npm run iroh:poc:host:volt              # integrated source Volt host for this checkout
 npm run iroh:poc:client -- "<ticket>"    # one-shot client
 npm run iroh:poc:client -- "<ticket>" --interactive  # persistent prompt loop
@@ -47,17 +45,7 @@ npm run iroh:poc:client -- "<ticket>" --message "List top-level files."
 
 Use `npm run --silent ...` if you want stdout to contain only the ticket or client output.
 
-## Local fake-RPC scenario tests
-
-Run the automated local scenario suite when changing the remote host bridge:
-
-```bash
-npm run iroh:poc:test
-```
-
-The suite starts local host/client processes with isolated temporary state and covers fake-RPC prompt streaming, remote command filtering, `get_state`, first-class `volt remote pair`, `volt remote status`, pairing persistence, multi-workspace reconnect without another QR, reconnect session resume, missing-session fallback, duplicate active connection rejection, `--no-pairing` rejection, active revocation, unsafe tool gates, expired tickets, and workspace preflight failures.
-
-## Local fake-RPC smoke test
+## Local integrated smoke test
 
 Terminal 1:
 
@@ -77,12 +65,6 @@ Or keep the connection open:
 
 ```bash
 npm run iroh:poc:client -- "<ticket>" --interactive
-```
-
-Expected output for the one-shot command:
-
-```text
-fake RPC response over Iroh: hello from another device
 ```
 
 The first successful connection persists the host key, client key, registered workspaces, and paired client allowlist in state files:
@@ -171,16 +153,10 @@ node scripts/run-coding-agent-source.mjs remote host --workspace volt=. --allow-
 
 Remote sessions follow normal project trust behavior. Saved workspace trust is honored; otherwise choose `trust` in the host prompt or add `--approve` only when the host user trusts project-local settings/resources for the exposed workspace.
 
-Terminal 1, when testing another source checkout as a spawned RPC child from this directory:
+Terminal 1, when testing another repository path with the integrated host:
 
 ```bash
-npm run iroh:poc:host -- --source-volt /path/to/volt --workspace volt=/path/to/volt --allow-tools read,grep,find,ls
-```
-
-Terminal 1, when `volt` is globally installed on the host `PATH`:
-
-```bash
-npm run iroh:poc:host -- --use-volt --workspace volt=/path/to/repo --allow-tools read,grep,find,ls
+npm run iroh:poc:host -- --workspace volt=/path/to/repo --allow-tools read,grep,find,ls
 ```
 
 Terminal 2, one-shot commands:
@@ -203,7 +179,7 @@ Interactive commands:
 - `/quit` or `/exit` exits the client.
 - Ctrl+C aborts a running prompt; Ctrl+C while idle exits.
 
-The default relay mode is suitable for cross-network testing; the ticket carries the relay mode to the client. On Windows, a global install normally resolves through `volt.cmd` automatically when `--volt-bin` is omitted.
+The default relay mode is suitable for cross-network testing; the ticket carries the relay mode to the client.
 
 ## Relay mode
 
@@ -222,7 +198,7 @@ Remote host support is a preview feature and should be treated as remote access 
 - Remote access is opt-in; nothing listens until the host command starts.
 - Pairing tickets contain a short-lived one-time secret for adding a client to the allowlist. Persisted state stores hashes and non-secret metadata, not raw secrets.
 - Paired clients are persisted until revoked.
-- Any paired client can control the integrated runtime or spawned RPC child for registered workspace names in the same host state file.
+- Any paired client can control the integrated runtime for registered workspace names in the same host state file.
 - Pairing is workstation-scoped in this preview. A paired client can use registered workspace names added later without another QR scan, and revocation blocks that client from every registered workspace.
 - Real Volt RPC can use only built-in tools allowed by the client's persisted `allowedTools` grant. That grant applies across all registered workspaces; when it is the default built-in list, active extension tools in the selected workspace are also exposed.
 - Use a custom read-only tool list (`read,grep,find,ls`) unless the client, workspace, and loaded extensions are trusted.

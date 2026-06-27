@@ -123,18 +123,15 @@ describe("Iroh remote handshake stream modes", () => {
 			mode: "workspaceManagement",
 			workspaceManagement: { purpose: "unregister_workspace" },
 		});
-		expect(
+		expect(() =>
 			parseIrohRemoteHelloLine(
 				JSON.stringify({
 					type: "volt_iroh_hello",
 					protocol: IROH_REMOTE_ALPN,
 					workspace: "volt",
 				}),
-				{ allowLegacyWorkspaceMode: true },
 			),
-		).toMatchObject({
-			mode: "legacyWorkspace",
-		});
+		).toThrow("Iroh remote hello must include exactly one stream mode");
 
 		for (const invalid of [
 			{},

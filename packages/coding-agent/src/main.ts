@@ -115,9 +115,6 @@ Host options are forwarded to the integrated Iroh remote host. Common options:
   --relay <disabled|default>    Iroh relay preset. Defaults to default; use disabled for LAN-only testing
   --state <path>                Host state path
   --audit <path>                Host audit JSONL path
-  --use-volt                    Spawn volt --mode rpc instead of the integrated runtime
-  --source-volt <repo-root>     Spawn Volt from a source checkout. Implies --use-volt
-  --volt-bin <path>             Volt executable for --use-volt
   --allow-tools <list>          Remote tool allowlist. Defaults to the saved workspace allowlist or default remote tools.
                                 bash, edit, or write can modify host state and require confirmation.
   --profile <name>              Volt settings profile
@@ -253,14 +250,7 @@ function addDefaultRemoteHostStateArgs(args: readonly string[]): string[] {
 }
 
 function addDefaultRemoteHostRuntimeArgs(args: readonly string[]): string[] {
-	if (
-		argsIncludeOption(args, "--integrated-volt") ||
-		argsIncludeOption(args, "--source-volt") ||
-		argsIncludeOption(args, "--use-volt")
-	) {
-		return [...args];
-	}
-	return ["--integrated-volt", ...args];
+	return [...args];
 }
 
 function parseRemoteManagementArgs(args: readonly string[]): RemoteManagementArgs {

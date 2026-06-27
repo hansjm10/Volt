@@ -76,7 +76,6 @@ export {
 	type IrohRemoteHandshakeSuccess,
 	type IrohRemoteHello,
 	type IrohRemoteHelloMode,
-	type IrohRemoteHelloParseOptions,
 	type IrohRemoteHostHandshakeMetadata,
 	type IrohRemoteWorkspaceDiscoveryTarget,
 	type IrohRemoteWorkspaceManagementTarget,
@@ -123,7 +122,6 @@ export {
 export {
 	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 	getIrohRemoteUnsafeAllowedTools,
-	getIrohRemoteVoltRpcToolArgs,
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_CONVERSATION_STREAMS_FEATURE,
 	IROH_REMOTE_HANDSHAKE_TYPE,
