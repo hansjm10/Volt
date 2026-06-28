@@ -21,6 +21,7 @@ import type {
 	AgentTool,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
+	PendingToolExecution,
 	QueueMode,
 	StreamFn,
 	ToolExecutionMode,
@@ -56,16 +57,22 @@ const DEFAULT_MODEL = {
 	maxTokens: 0,
 } satisfies Model<any>;
 
-type MutableAgentState = Omit<AgentState, "isStreaming" | "streamingMessage" | "pendingToolCalls" | "errorMessage"> & {
+type RuntimeStateKeys =
+	| "isStreaming"
+	| "streamingMessage"
+	| "pendingToolCalls"
+	| "pendingToolExecutions"
+	| "errorMessage";
+
+type MutableAgentState = Omit<AgentState, RuntimeStateKeys> & {
 	isStreaming: boolean;
 	streamingMessage?: AgentMessage;
 	pendingToolCalls: Set<string>;
+	pendingToolExecutions: Map<string, PendingToolExecution>;
 	errorMessage?: string;
 };
 
-function createMutableAgentState(
-	initialState?: Partial<Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">>,
-): MutableAgentState {
+function createMutableAgentState(initialState?: Partial<Omit<AgentState, RuntimeStateKeys>>): MutableAgentState {
 	let tools = initialState?.tools?.slice() ?? [];
 	let messages = initialState?.messages?.slice() ?? [];
 
@@ -88,13 +95,14 @@ function createMutableAgentState(
 		isStreaming: false,
 		streamingMessage: undefined,
 		pendingToolCalls: new Set<string>(),
+		pendingToolExecutions: new Map<string, PendingToolExecution>(),
 		errorMessage: undefined,
 	};
 }
 
 /** Options for constructing an {@link Agent}. */
 export interface AgentOptions {
-	initialState?: Partial<Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">>;
+	initialState?: Partial<Omit<AgentState, RuntimeStateKeys>>;
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	streamFn?: StreamFn;
@@ -316,6 +324,7 @@ export class Agent {
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
+		this._state.pendingToolExecutions = new Map<string, PendingToolExecution>();
 		this._state.errorMessage = undefined;
 		this.clearFollowUpQueue();
 		this.clearSteeringQueue();
@@ -495,6 +504,7 @@ export class Agent {
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
+		this._state.pendingToolExecutions = new Map<string, PendingToolExecution>();
 		this.activeRun?.resolve();
 		this.activeRun = undefined;
 	}
@@ -525,6 +535,14 @@ export class Agent {
 				const pendingToolCalls = new Set(this._state.pendingToolCalls);
 				pendingToolCalls.add(event.toolCallId);
 				this._state.pendingToolCalls = pendingToolCalls;
+
+				const pendingToolExecutions = new Map(this._state.pendingToolExecutions);
+				pendingToolExecutions.set(event.toolCallId, {
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+					args: event.args,
+				});
+				this._state.pendingToolExecutions = pendingToolExecutions;
 				break;
 			}
 
@@ -532,6 +550,10 @@ export class Agent {
 				const pendingToolCalls = new Set(this._state.pendingToolCalls);
 				pendingToolCalls.delete(event.toolCallId);
 				this._state.pendingToolCalls = pendingToolCalls;
+
+				const pendingToolExecutions = new Map(this._state.pendingToolExecutions);
+				pendingToolExecutions.delete(event.toolCallId);
+				this._state.pendingToolExecutions = pendingToolExecutions;
 				break;
 			}
 

@@ -1229,6 +1229,7 @@ async function runIntegratedVoltConnection(
 			createIntegratedConversationHandshakeResponse(handshake, authorization, entry, sessionSelection, options),
 		);
 		subscriber = await attachIntegratedRuntimeSubscriber(entry, options);
+		await replayIntegratedRuntimeWorkflowEvents(activeStream.entry, entry);
 		const pushDispatcher = createPushNotificationDispatcher(authorization, options);
 		const rpcMode = runIrohRemoteRpcMode(entry.runtime, {
 			decorateOutbound: (value) => decorateRemoteHostState(value, authorization, options),
@@ -1236,9 +1237,10 @@ async function runIntegratedVoltConnection(
 			notificationDelivery: pushDispatcher,
 			onResponseWritten: invalidateStreamAfterAbortResponse,
 			onSessionChanged: async (session) => {
-				if (session.sessionId === entry.recordedSessionId) return;
-				entry.recordedSessionId = session.sessionId;
-				await recordRemoteSessionChange(session, authorization, options);
+				await handleIntegratedRuntimeSessionChanged(entry, activeStream?.entry, session, authorization, options);
+			},
+			onWorkflowEvent: async (event) => {
+				await handleIntegratedRuntimeWorkflowEvent(entry, options, event, activeStream?.entry);
 			},
 			registerPushTarget: pushDispatcher
 				? (args) => pushDispatcher.registerPushTarget(args)
@@ -1779,6 +1781,100 @@ async function recordRemoteSessionChange(session, authorization, options) {
 	}
 }
 
+async function handleIntegratedRuntimeSessionChanged(entry, activeStreamEntry, session, authorization, options) {
+	if (session.sessionId !== entry.sessionId) {
+		await rekeyIntegratedRuntimeEntry(entry, activeStreamEntry, session.sessionId, options);
+	}
+	if (session.sessionId === entry.recordedSessionId) return;
+	entry.recordedSessionId = session.sessionId;
+	await recordRemoteSessionChange(session, authorization, options);
+}
+
+async function rekeyIntegratedRuntimeEntry(entry, activeStreamEntry, nextSessionId, options) {
+	const previousSessionId = entry.sessionId;
+	const previousKey = entry.key;
+	const nextKey = getIntegratedRuntimeRegistryKey(entry.clientNodeId, entry.workspaceName, nextSessionId);
+	const existing = options.integratedRuntimes.get(nextKey);
+	if (existing && existing !== entry) {
+		await stopIntegratedRuntimeEntry(existing, options, "session_change_replaced_runtime");
+	}
+	if (options.integratedRuntimes.get(previousKey) === entry) {
+		options.integratedRuntimes.delete(previousKey);
+	}
+	entry.previousSessionIds.add(previousSessionId);
+	entry.sessionId = nextSessionId;
+	entry.key = nextKey;
+	options.integratedRuntimes.set(nextKey, entry);
+	if (activeStreamEntry) {
+		activeStreamEntry.sessionId = nextSessionId;
+	}
+	await logIntegratedRuntimeAudit(options, entry, "remote_runtime_session_changed", {
+		previousSessionId,
+		sessionId: nextSessionId,
+	});
+}
+
+function getWorkflowEventId(event) {
+	return typeof event.workflowId === "string" && event.workflowId.trim() ? event.workflowId.trim() : undefined;
+}
+
+function getWorkflowToolCallId(event) {
+	return typeof event.toolCallId === "string" && event.toolCallId.trim() ? event.toolCallId.trim() : undefined;
+}
+
+function recordIntegratedRuntimeWorkflowEvent(entry, event) {
+	const workflowId = getWorkflowEventId(event);
+	if (!workflowId) return;
+	if (event.type === "workflow_start" || event.type === "workflow_update") {
+		const state = entry.activeWorkflows.get(workflowId) ?? { workflowEvent: undefined, activeTools: new Map() };
+		state.workflowEvent = event;
+		entry.activeWorkflows.set(workflowId, state);
+		return;
+	}
+	if (event.type === "workflow_end") {
+		entry.activeWorkflows.delete(workflowId);
+		return;
+	}
+	if (event.type === "tool_execution_start") {
+		const toolCallId = getWorkflowToolCallId(event);
+		if (!toolCallId) return;
+		const state = entry.activeWorkflows.get(workflowId) ?? { workflowEvent: undefined, activeTools: new Map() };
+		state.activeTools.set(toolCallId, event);
+		entry.activeWorkflows.set(workflowId, state);
+		return;
+	}
+	if (event.type === "tool_execution_end") {
+		const toolCallId = getWorkflowToolCallId(event);
+		if (!toolCallId) return;
+		entry.activeWorkflows.get(workflowId)?.activeTools.delete(toolCallId);
+	}
+}
+
+async function handleIntegratedRuntimeWorkflowEvent(entry, options, event, excludedActiveStreamEntry) {
+	recordIntegratedRuntimeWorkflowEvent(entry, event);
+	const activeStreams = options.activeStreams.entriesForConversation(
+		entry.clientNodeId,
+		entry.workspaceName,
+		entry.sessionId,
+	);
+	await Promise.allSettled(
+		activeStreams
+			.filter((activeStream) => activeStream !== excludedActiveStreamEntry && activeStream.write)
+			.map((activeStream) => Promise.resolve(activeStream.write(event))),
+	);
+}
+
+async function replayIntegratedRuntimeWorkflowEvents(activeStreamEntry, entry) {
+	for (const state of entry.activeWorkflows.values()) {
+		if (state.workflowEvent) {
+			await Promise.resolve(activeStreamEntry.write?.(state.workflowEvent)).catch(() => {});
+		}
+		for (const toolEvent of state.activeTools.values()) {
+			await Promise.resolve(activeStreamEntry.write?.(toolEvent)).catch(() => {});
+		}
+	}
+}
+
 async function logRemoteSessionSelection(selection, authorization, options) {
 	const common = {
 		clientNodeId: authorization.client.nodeId,
@@ -1806,6 +1902,15 @@ async function logRemoteSessionSelection(selection, authorization, options) {
 			type: "session_created",
 			success: true,
 			details: { reason: "missing_on_resume", sessionId: selection.sessionId },
+		});
+		return;
+	}
+	if (selection.kind === "session_rekeyed") {
+		await logAudit(options.auditLogger, {
+			...common,
+			type: "session_rekeyed",
+			success: true,
+			details: { requestedSessionId: selection.requestedSessionId, sessionId: selection.sessionId },
 		});
 		return;
 	}
@@ -1879,6 +1984,8 @@ async function createIntegratedRuntimeEntry(handshake, authorization, options) {
 			sessionId,
 			runtime,
 			recordedSessionId: sessionId,
+			previousSessionIds: new Set(),
+			activeWorkflows: new Map(),
 			subscribers: new Set(),
 			detachedAt: undefined,
 			detachedRuntimeRetention: undefined,
@@ -1982,7 +2089,20 @@ function getResolvedTargetSessionId(hello, authorization) {
 }
 
 function findIntegratedRuntimeEntry(options, clientNodeId, workspaceName, sessionId) {
-	return options.integratedRuntimes.get(getIntegratedRuntimeRegistryKey(clientNodeId, workspaceName, sessionId));
+	const direct = options.integratedRuntimes.get(getIntegratedRuntimeRegistryKey(clientNodeId, workspaceName, sessionId));
+	if (direct) {
+		return direct;
+	}
+	for (const entry of options.integratedRuntimes.values()) {
+		if (
+			entry.clientNodeId === clientNodeId &&
+			entry.workspaceName === workspaceName &&
+			entry.previousSessionIds?.has(sessionId)
+		) {
+			return entry;
+		}
+	}
+	return undefined;
 }
 
 function findIntegratedRuntimeOwner(options, workspaceName, sessionId) {
@@ -2000,7 +2120,14 @@ function createConversationOpenError(outcome, message, details = {}) {
 	return error;
 }
 
-function createConversationSessionSelectionFromEntry(entry) {
+function createConversationSessionSelectionFromEntry(entry, requestedSessionId = entry.sessionId) {
+	if (requestedSessionId !== entry.sessionId) {
+		return {
+			kind: "session_rekeyed",
+			requestedSessionId,
+			sessionId: entry.sessionId,
+		};
+	}
 	return {
 		kind: "resumed",
 		requestedSessionId: entry.sessionId,
@@ -2015,11 +2142,16 @@ function getHandshakeConversationSelection(sessionSelection) {
 	if (sessionSelection.kind === "created") {
 		return "created";
 	}
+	if (sessionSelection.kind === "session_rekeyed") {
+		return "session_rekeyed";
+	}
 	return "resumed";
 }
 
 function createIntegratedConversationHandshakeResponse(handshake, authorization, entry, sessionSelection, options) {
 	const sessionId = entry.sessionId;
+	const requestedSessionId =
+		sessionSelection.kind === "session_rekeyed" ? sessionSelection.requestedSessionId : undefined;
 	return createIrohRemoteHandshakeSuccess({
 		child: handshake.response.child,
 		clientNodeId: authorization.client.nodeId,
@@ -2032,6 +2164,7 @@ function createIntegratedConversationHandshakeResponse(handshake, authorization,
 			target: handshake.hello.conversation.target,
 			sessionId,
 			selection: getHandshakeConversationSelection(sessionSelection),
+			...(requestedSessionId === undefined ? {} : { requestedSessionId }),
 		},
 	});
 }
@@ -2054,7 +2187,13 @@ async function getOrCreateIntegratedRuntimeEntry(handshake, authorization, optio
 		);
 		if (existing) {
 			if (!shouldReplaceIrohRemoteIntegratedRuntimeForAuthorization(authorization)) {
-				return { entry: existing, created: false, sessionSelection: createConversationSessionSelectionFromEntry(existing) };
+				const requestedSessionId =
+					handshake.hello.conversation.target === "session" ? targetSessionId : existing.sessionId;
+				return {
+					entry: existing,
+					created: false,
+					sessionSelection: createConversationSessionSelectionFromEntry(existing, requestedSessionId),
+				};
 			}
 			await stopIntegratedRuntimeEntry(existing, options, "fresh_pairing_replaced_runtime");
 		}
@@ -2131,6 +2270,7 @@ async function stopIntegratedRuntimeEntry(entry, options, reason) {
 	cancelIntegratedRuntimeRetention(entry);
 	options.integratedRuntimes.delete(entry.key);
 	entry.subscribers.clear();
+	entry.activeWorkflows.clear();
 	entry.detachedAt = undefined;
 	const wasActive = entry.runtime.session.isStreaming;
 	const removedLiveActivityCount = await options.stateManager.removeClientLiveActivitiesForSession(
@@ -2277,7 +2417,6 @@ async function closeClientConnectionsForClient(options, nodeId, reason) {
 }
 
 function registerActiveStream(options, authorization, sessionId, stream, connection, connectionId, streamId, details = {}) {
-	const terminalSessionId = Object.hasOwn(details, "terminalSessionId") ? details.terminalSessionId : sessionId;
 	const entry = {
 		clientNodeId: authorization.client.nodeId,
 		connectionId,
@@ -2288,10 +2427,11 @@ function registerActiveStream(options, authorization, sessionId, stream, connect
 			closeIrohRemoteStreamWithTerminal(stream, reason, {
 				authorization,
 				hostNodeId: options.hostNodeId,
-				sessionId: terminalSessionId,
+				sessionId: Object.hasOwn(details, "terminalSessionId") ? details.terminalSessionId : entry.sessionId,
 				workspace: authorization.workspace.name,
 			}),
 		closeConnection: (reason) => closeConnection(connection, reason),
+		write: (value) => writeIrohRemoteJsonLine(stream.send, value, authorization),
 	};
 	const remove = options.activeStreams.register(entry);
 	return { entry, remove };

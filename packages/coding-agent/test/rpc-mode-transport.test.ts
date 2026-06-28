@@ -37,8 +37,12 @@ interface RpcModeHarness {
 function createStateSession(sessionId: string) {
 	return {
 		agent: {
+			state: {
+				pendingToolExecutions: new Map(),
+			},
 			subscribe: vi.fn(() => () => {}),
 		},
+		activeCompaction: undefined,
 		autoCompactionEnabled: true,
 		bindExtensions: vi.fn(async () => {}),
 		followUpMode: "one-at-a-time" as const,

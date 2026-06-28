@@ -15,6 +15,7 @@ import {
 	getUiActionDescriptors,
 } from "../../core/rpc/ui-actions.ts";
 import type {
+	RpcActiveToolExecution,
 	RpcClientCapabilityFeature,
 	RpcCommand,
 	RpcHostActionRequest,
@@ -254,6 +255,15 @@ export async function handleRpcCommand(
 		// =================================================================
 
 		case "get_state": {
+			const activeCompaction = session.activeCompaction;
+			const activeTools = [...session.agent.state.pendingToolExecutions.values()].map(
+				(execution): RpcActiveToolExecution => ({
+					toolCallId: execution.toolCallId,
+					toolName: execution.toolName,
+					status: "started",
+					args: { ...execution.args },
+				}),
+			);
 			const state: RpcSessionState = {
 				model: session.model,
 				thinkingLevel: session.thinkingLevel,
@@ -267,6 +277,8 @@ export async function handleRpcCommand(
 				autoCompactionEnabled: session.autoCompactionEnabled,
 				messageCount: session.messages.length,
 				pendingMessageCount: session.pendingMessageCount,
+				...(activeTools.length === 0 ? {} : { activeTools }),
+				...(activeCompaction ? { activeCompaction } : {}),
 			};
 			return createRpcSuccessResponse(id, "get_state", state);
 		}

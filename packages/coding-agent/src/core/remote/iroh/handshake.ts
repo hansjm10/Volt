@@ -26,12 +26,13 @@ export type IrohRemoteConversationTarget =
 			sessionId: string;
 	  };
 
-export type IrohRemoteConversationSelection = "resumed" | "created" | "created_missing_last";
+export type IrohRemoteConversationSelection = "resumed" | "created" | "created_missing_last" | "session_rekeyed";
 
 export interface IrohRemoteConversationHandshakeMetadata {
 	target: IrohRemoteConversationTarget["target"];
 	sessionId: string;
 	selection: IrohRemoteConversationSelection;
+	requestedSessionId?: string;
 }
 
 export interface IrohRemoteWorkspaceDiscoveryTarget {
@@ -698,11 +699,21 @@ function assertRequiredHandshakeFeatures(features: string[] | undefined): void {
 
 function parseConversationHandshakeMetadata(value: unknown): IrohRemoteConversationHandshakeMetadata {
 	const metadata = expectRecord(value, "handshake response conversation");
-	expectKnownResponseFields(metadata, "handshake response conversation", ["target", "sessionId", "selection"]);
+	expectKnownResponseFields(metadata, "handshake response conversation", [
+		"target",
+		"sessionId",
+		"selection",
+		"requestedSessionId",
+	]);
+	const requestedSessionId = expectOptionalRemoteSessionId(
+		metadata.requestedSessionId,
+		"handshake response conversation requestedSessionId",
+	);
 	const conversation: IrohRemoteConversationHandshakeMetadata = {
 		target: expectConversationTargetKind(metadata.target, "handshake response conversation target"),
 		sessionId: expectRemoteSessionIdForResponse(metadata.sessionId, "handshake response conversation sessionId"),
 		selection: expectConversationSelection(metadata.selection, "handshake response conversation selection"),
+		...(requestedSessionId === undefined ? {} : { requestedSessionId }),
 	};
 	assertConversationTargetSelection(conversation);
 	return conversation;
@@ -718,13 +729,33 @@ function expectConversationTargetKind(value: unknown, label: string): IrohRemote
 
 function expectConversationSelection(value: unknown, label: string): IrohRemoteConversationSelection {
 	const selection = expectString(value, label);
-	if (selection === "resumed" || selection === "created" || selection === "created_missing_last") {
+	if (
+		selection === "resumed" ||
+		selection === "created" ||
+		selection === "created_missing_last" ||
+		selection === "session_rekeyed"
+	) {
 		return selection;
 	}
 	throw new Error(`${label} must be a supported conversation selection`);
 }
 
 function assertConversationTargetSelection(conversation: IrohRemoteConversationHandshakeMetadata): void {
+	if (conversation.selection === "session_rekeyed") {
+		if (conversation.target !== "session") {
+			throw new Error("handshake response session_rekeyed selection requires session target");
+		}
+		if (conversation.requestedSessionId === undefined) {
+			throw new Error("handshake response session_rekeyed selection requires requestedSessionId");
+		}
+		if (conversation.requestedSessionId === conversation.sessionId) {
+			throw new Error("handshake response session_rekeyed selection requires a different sessionId");
+		}
+		return;
+	}
+	if (conversation.requestedSessionId !== undefined) {
+		throw new Error("handshake response requestedSessionId requires session_rekeyed selection");
+	}
 	if (conversation.target === "new" && conversation.selection !== "created") {
 		throw new Error("handshake response new target must use created selection");
 	}

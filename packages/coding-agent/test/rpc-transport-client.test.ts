@@ -1090,6 +1090,25 @@ describe("createInProcessRpcClient", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
+	test("exposes active compaction metadata in state", async () => {
+		const dispose = vi.fn(async () => {});
+		const runtimeHost = createRuntimeHost(dispose, async () => {}, {
+			activeCompaction: { reason: "threshold", startedAt: 1_782_470_400_000 },
+			isCompacting: true,
+		});
+		const client = await createInProcessRpcClient(runtimeHost);
+
+		try {
+			await expect(client.getState()).resolves.toMatchObject({
+				isCompacting: true,
+				activeCompaction: { reason: "threshold", startedAt: 1_782_470_400_000 },
+			});
+		} finally {
+			await client.stop();
+		}
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
 	test("exposes native UI action discovery and local invocation capability", async () => {
 		const dispose = vi.fn(async () => {});
 		const abortRun = vi.fn(async () => {});
@@ -1791,6 +1810,7 @@ function createRuntimeHost(
 	resources: {
 		abort?: () => Promise<void>;
 		agentDir?: string;
+		activeCompaction?: { reason: "manual" | "threshold" | "overflow"; startedAt: number };
 		compact?: (customInstructions?: string) => Promise<ReturnType<typeof createCompactionResult>>;
 		commands?: ResolvedCommand[];
 		cwd?: string;
@@ -1848,7 +1868,13 @@ function createRuntimeHost(
 			bindExtensions: vi.fn(bindExtensions),
 			subscribe: vi.fn(() => () => {}),
 			agent: {
+				state: {
+					pendingToolExecutions: new Map(),
+				},
 				subscribe: vi.fn(() => () => {}),
+			},
+			get activeCompaction() {
+				return resources.activeCompaction;
 			},
 			get model() {
 				return resources.model;

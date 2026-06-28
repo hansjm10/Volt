@@ -138,11 +138,12 @@ function createTestSession(sessionId: string, leafId: string | null) {
 		sessionFile: `/sessions/${sessionId}.jsonl`,
 		sessionId,
 		sessionManager: {
+			getBranch: vi.fn((): object[] => []),
 			getLeafId: (): string | null => session.leafId,
 		},
 		settingsManager: {},
 		steeringMode: "all" as const,
-		subscribe: vi.fn((_handler: (event: object) => void) => () => {}),
+		subscribe: vi.fn((_handler: (event: AgentSessionEvent) => void) => () => {}),
 		thinkingLevel: "off" as const,
 		waitForIdle: vi.fn(async () => {}),
 		agent: {
@@ -893,6 +894,82 @@ describe("Iroh remote notification requests", () => {
 		};
 		await vi.waitFor(() => expect(relayClient.sendNotification).toHaveBeenCalledWith(expectedNotification));
 		expect(getNotifications(send)).toEqual([]);
+
+		recv.end();
+		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("streams displayed review custom messages as transcript entries after session rebind", async () => {
+		const initialSession = createTestSession("initial-session", "initial-entry");
+		const reviewSession = createTestSession("review-session", "review-entry");
+		const reviewContent = [{ type: "text" as const, text: "Review findings" }];
+		reviewSession.sessionManager.getBranch.mockReturnValue([
+			{
+				type: "custom_message",
+				id: "review-entry",
+				parentId: null,
+				timestamp: "2026-06-27T00:00:00.000Z",
+				customType: "review",
+				content: reviewContent,
+				display: true,
+			},
+		]);
+		const reviewSessionHandlers: Array<(event: AgentSessionEvent) => void> = [];
+		reviewSession.subscribe.mockImplementation((handler: (event: AgentSessionEvent) => void) => {
+			reviewSessionHandlers.push(handler);
+			return () => {
+				const index = reviewSessionHandlers.indexOf(handler);
+				if (index !== -1) {
+					reviewSessionHandlers.splice(index, 1);
+				}
+			};
+		});
+		let currentSession = initialSession;
+		const setRebindSession = vi.fn();
+		const runtimeHost = {
+			get session() {
+				return currentSession;
+			},
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession,
+		} as unknown as AgentSessionRuntime;
+		const { modePromise, recv, send } = await startIrohRpcMode(runtimeHost, initialSession);
+		const rebindSession = setRebindSession.mock.calls[0]?.[0] as (() => Promise<void>) | undefined;
+		if (!rebindSession) {
+			throw new Error("Expected runIrohRemoteRpcMode to register a session rebind callback");
+		}
+
+		currentSession = reviewSession;
+		await rebindSession();
+		for (const handler of reviewSessionHandlers) {
+			handler({
+				type: "message_end",
+				message: {
+					role: "custom",
+					customType: "review",
+					content: reviewContent,
+					display: true,
+					timestamp: Date.now(),
+				},
+			} as AgentSessionEvent);
+		}
+
+		await vi.waitFor(() =>
+			expect(parseWrittenObjects(send)).toContainEqual({
+				type: "transcript_entry",
+				entry: {
+					entryId: "review-entry",
+					createdAt: "2026-06-27T00:00:00.000Z",
+					role: "assistant",
+					text: "Review findings",
+					truncated: false,
+				},
+				final: true,
+			}),
+		);
 
 		recv.end();
 		await expect(modePromise).resolves.toBeUndefined();

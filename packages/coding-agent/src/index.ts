@@ -5,10 +5,12 @@ export { type Args, parseArgs } from "./cli/args.ts";
 // Config paths
 export { getAgentDir, getDocsPath, getExamplesPath, getPackageDir, getReadmePath, VERSION } from "./config.ts";
 export {
+	type ActiveCompaction,
 	AgentSession,
 	type AgentSessionConfig,
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
+	type CompactionReason,
 	type ModelCycleResult,
 	type ParsedSkillBlock,
 	type PromptOptions,
@@ -607,6 +609,8 @@ export {
 	type IrohRemoteRpcModeOptions,
 	type ModelInfo,
 	type PrintModeOptions,
+	type RpcActiveCompaction,
+	type RpcActiveToolExecution,
 	RpcClient,
 	type RpcClientCapabilityFeature,
 	type RpcClientEvent,

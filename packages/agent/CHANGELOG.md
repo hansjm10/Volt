@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `AgentState.pendingToolExecutions` so host integrations can inspect the names and arguments for currently running tool calls.
+
 ## [0.79.6] - 2026-06-16
 
 ## [0.79.5] - 2026-06-16

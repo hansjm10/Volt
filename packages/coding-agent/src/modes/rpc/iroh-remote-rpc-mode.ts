@@ -1,6 +1,7 @@
 import type { AgentSessionEvent } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import { REVIEW_BRANCH_ACTION_ID, REVIEW_UNCOMMITTED_ACTION_ID } from "../../core/host-actions.ts";
+import type { CustomMessage } from "../../core/messages.ts";
 import {
 	createIrohRemoteFilteredRpcTransport,
 	createIrohRemoteOutboundFilteredRpcTransport,
@@ -19,8 +20,8 @@ import {
 	type RpcLineHandler,
 	type RpcTransport,
 } from "../../core/rpc/index.ts";
-import type { SessionEntry } from "../../core/session-manager.ts";
-import { type RpcSessionChange, runRpcMode } from "./rpc-mode.ts";
+import type { CustomMessageEntry, SessionEntry, SessionMessageEntry } from "../../core/session-manager.ts";
+import { type RpcModeOptions, type RpcSessionChange, runRpcMode } from "./rpc-mode.ts";
 import type { RpcRegisterPushTargetResponse } from "./rpc-types.ts";
 
 export interface IrohRemoteRpcModeOptions extends IrohRpcTransportOptions {
@@ -29,6 +30,7 @@ export interface IrohRemoteRpcModeOptions extends IrohRpcTransportOptions {
 	notificationDelivery?: IrohRemotePushNotificationDelivery;
 	onResponseWritten?: (response: Record<string, unknown>) => void | Promise<void>;
 	onSessionChanged?: (session: RpcSessionChange) => void | Promise<void>;
+	onWorkflowEvent?: RpcModeOptions["onWorkflowEvent"];
 	registerPushTarget?: (args: unknown) => Promise<RpcRegisterPushTargetResponse>;
 	remoteCommandHandler?: (command: Record<string, unknown>) => object | Promise<object | undefined> | undefined;
 	remoteWorkspacePath?: string;
@@ -100,6 +102,8 @@ export function runIrohRemoteRpcMode(
 ): Promise<void> {
 	const sentNotificationEventIds = new Set<string>();
 	let detachLiveActivityUpdates: (() => void) | undefined;
+	let detachTranscriptEntryEvents: (() => void) | undefined;
+	let transportClosed = false;
 	const attachLiveActivityUpdates = () => {
 		detachLiveActivityUpdates?.();
 		detachLiveActivityUpdates = attachIrohRemoteLiveActivityUpdates(
@@ -114,10 +118,14 @@ export function runIrohRemoteRpcMode(
 		transport: createIrohRpcTransport(options),
 		workspacePath: options.workspacePath,
 	});
-	const detachTranscriptEntryEvents = attachIrohRemoteTranscriptEntryEvents(runtimeHost, outboundTransport, {
-		remoteWorkspacePath: options.remoteWorkspacePath,
-		workspacePath: options.workspacePath,
-	});
+	const attachTranscriptEntryEvents = () => {
+		detachTranscriptEntryEvents?.();
+		detachTranscriptEntryEvents = attachIrohRemoteTranscriptEntryEvents(runtimeHost, outboundTransport, {
+			remoteWorkspacePath: options.remoteWorkspacePath,
+			workspacePath: options.workspacePath,
+		});
+	};
+	attachTranscriptEntryEvents();
 	const deliverCompletionNotification = async (notification: IrohRemoteNotificationRequest): Promise<void> => {
 		if (options.notificationDelivery) {
 			const deliveryStatus = await options.notificationDelivery.deliverNotification(notification);
@@ -156,15 +164,20 @@ export function runIrohRemoteRpcMode(
 		allowUiActionInvocation: true,
 		disposeRuntimeOnClose: options.disposeRuntimeOnClose,
 		onSessionChanged: async (session) => {
-			attachLiveActivityUpdates();
+			if (!transportClosed) {
+				attachLiveActivityUpdates();
+				attachTranscriptEntryEvents();
+			}
 			await options.onSessionChanged?.(session);
 		},
+		onWorkflowEvent: options.onWorkflowEvent,
 		requireRemoteSafeUiActions: true,
 		transport: remoteHostCommandTransport,
 		exitProcess: false,
 		registerPushTarget: options.registerPushTarget,
 	}).finally(() => {
-		detachTranscriptEntryEvents();
+		transportClosed = true;
+		detachTranscriptEntryEvents?.();
 		detachLiveActivityUpdates?.();
 	});
 }
@@ -200,24 +213,62 @@ function attachIrohRemoteTranscriptEntryEvents(
 	});
 }
 
+type IrohRemoteTranscriptSourceEntry = SessionMessageEntry | CustomMessageEntry;
+
 function findPersistedMessageEntry(
 	runtimeHost: AgentSessionRuntime,
 	message: unknown,
-): Extract<SessionEntry, { type: "message" }> | undefined {
+): IrohRemoteTranscriptSourceEntry | undefined {
 	const branch = runtimeHost.session.sessionManager.getBranch();
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index];
 		if (entry.type === "message" && entry.message === message) {
 			return entry;
 		}
+		if (entry.type === "custom_message" && isMatchingReviewCustomMessageEntry(entry, message)) {
+			return entry;
+		}
 	}
 	return undefined;
 }
 
+function isMatchingReviewCustomMessageEntry(entry: CustomMessageEntry, message: unknown): message is CustomMessage {
+	if (entry.customType !== "review" || entry.display !== true || !isReviewCustomMessage(message)) {
+		return false;
+	}
+	return customMessageContentMatches(entry.content, message.content);
+}
+
+function isReviewCustomMessage(message: unknown): message is CustomMessage {
+	if (typeof message !== "object" || message === null || Array.isArray(message)) {
+		return false;
+	}
+	const candidate = message as Partial<CustomMessage>;
+	return candidate.role === "custom" && candidate.customType === "review" && candidate.display === true;
+}
+
+function customMessageContentMatches(left: CustomMessageEntry["content"], right: CustomMessage["content"]): boolean {
+	if (typeof left === "string" || typeof right === "string") {
+		return left === right;
+	}
+	try {
+		return JSON.stringify(left) === JSON.stringify(right);
+	} catch {
+		return false;
+	}
+}
+
 function createIrohRemoteTranscriptEntryEvent(
-	entry: Extract<SessionEntry, { type: "message" }>,
+	entry: IrohRemoteTranscriptSourceEntry,
 	options: IrohRemoteTranscriptEventOptions,
 ): Record<string, unknown> | undefined {
+	if (entry.type === "custom_message") {
+		if (entry.customType !== "review" || entry.display !== true) {
+			return undefined;
+		}
+		const text = extractIrohRemoteTranscriptContentText(entry.content);
+		return text ? createIrohRemoteTranscriptEntryEventValue(entry, "assistant", text, options) : undefined;
+	}
 	const message = entry.message;
 	if (message.role === "user" || message.role === "assistant") {
 		const text = extractIrohRemoteTranscriptContentText(message.content);

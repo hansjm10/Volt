@@ -67,12 +67,17 @@ async function toolExecution(model: Model<string>) {
 		},
 	});
 
-	const pendingToolCallsDuringEvents: Array<{ type: AgentEvent["type"]; ids: string[] }> = [];
+	const pendingToolCallsDuringEvents: Array<{
+		type: AgentEvent["type"];
+		ids: string[];
+		executions: Array<{ toolCallId: string; toolName: string; args: Readonly<Record<string, unknown>> }>;
+	}> = [];
 	agent.subscribe((event) => {
 		if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
 			pendingToolCallsDuringEvents.push({
 				type: event.type,
 				ids: [...agent.state.pendingToolCalls],
+				executions: [...agent.state.pendingToolExecutions.values()],
 			});
 		}
 	});
@@ -91,8 +96,12 @@ async function toolExecution(model: Model<string>) {
 	expect(getTextContent(finalMessage)).toContain("56088");
 	expect(agent.state.pendingToolCalls.size).toBe(0);
 	expect(pendingToolCallsDuringEvents).toEqual([
-		{ type: "tool_execution_start", ids: ["calc-1"] },
-		{ type: "tool_execution_end", ids: [] },
+		{
+			type: "tool_execution_start",
+			ids: ["calc-1"],
+			executions: [{ toolCallId: "calc-1", toolName: "calculate", args: { expression: "123 * 456" } }],
+		},
+		{ type: "tool_execution_end", ids: [], executions: [] },
 	]);
 }
 

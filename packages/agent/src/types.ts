@@ -308,6 +308,13 @@ export interface CustomAgentMessages {
  */
 export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];
 
+/** Tool call currently being executed by the agent. */
+export interface PendingToolExecution {
+	toolCallId: string;
+	toolName: string;
+	args: Readonly<Record<string, unknown>>;
+}
+
 /**
  * Public agent state.
  *
@@ -337,6 +344,8 @@ export interface AgentState {
 	readonly streamingMessage?: AgentMessage;
 	/** Tool call ids currently executing. */
 	readonly pendingToolCalls: ReadonlySet<string>;
+	/** Tool calls currently executing, keyed by tool call id. */
+	readonly pendingToolExecutions: ReadonlyMap<string, PendingToolExecution>;
 	/** Error message from the most recent failed or aborted assistant turn, if any. */
 	readonly errorMessage?: string;
 }

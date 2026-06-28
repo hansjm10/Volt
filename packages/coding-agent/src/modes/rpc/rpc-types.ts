@@ -1,4 +1,6 @@
 export type {
+	RpcActiveCompaction,
+	RpcActiveToolExecution,
 	RpcClientCapabilityFeature,
 	RpcCommand,
 	RpcCommandType,

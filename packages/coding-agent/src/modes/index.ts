@@ -36,6 +36,8 @@ export {
 export { type RpcModeOptions, type RpcSessionChange, runRpcMode } from "./rpc/rpc-mode.ts";
 export { RpcTransportClient, type RpcTransportClientOptions } from "./rpc/rpc-transport-client.ts";
 export type {
+	RpcActiveCompaction,
+	RpcActiveToolExecution,
 	RpcClientCapabilityFeature,
 	RpcCommand,
 	RpcExtensionUIRequest,

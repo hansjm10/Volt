@@ -34,7 +34,12 @@ import {
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
 } from "../../core/output-guard.ts";
-import { REMOTE_REVIEW_TOOL_NAMES, runReviewWorkflow } from "../../core/review.ts";
+import {
+	REMOTE_REVIEW_TOOL_NAMES,
+	type ReviewWorkflowEvent,
+	type ReviewWorkflowToolEvent,
+	runReviewWorkflow,
+} from "../../core/review.ts";
 import type { RpcTransport } from "../../core/rpc/transport.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
@@ -121,6 +126,8 @@ export interface RpcModeOptions {
 	onSessionChanged?: (session: RpcSessionChange) => void | Promise<void>;
 	/** Called after initial startup has completed and the RPC transport is accepting commands. */
 	onReady?: () => void;
+	/** Called for review workflow events even if the client transport has already detached. */
+	onWorkflowEvent?: (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent) => void | Promise<void>;
 	/** Defaults to true. Remote transports can disable this until their action allowlist is widened. */
 	allowUiActionInvocation?: boolean;
 	/** Defaults to false. Remote transports should only expose and invoke actions marked remote-safe. */
@@ -656,9 +663,19 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		await rebindSession();
 	});
 
+	const notifySessionChanged = async (): Promise<void> => {
+		if (options.onSessionChanged && session.sessionId !== lastNotifiedSessionId) {
+			lastNotifiedSessionId = session.sessionId;
+			await options.onSessionChanged({ sessionFile: session.sessionFile, sessionId: session.sessionId });
+		}
+	};
+
 	const rebindSession = async (): Promise<void> => {
-		if (shuttingDown) return;
 		session = runtimeHost.session;
+		if (shuttingDown) {
+			await notifySessionChanged();
+			return;
+		}
 		setSessionHostInteraction(session);
 		await session.bindExtensions({
 			uiContext: createExtensionUIContext(),
@@ -694,10 +711,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			},
 		});
 		if (shuttingDown) return;
-		if (options.onSessionChanged && session.sessionId !== lastNotifiedSessionId) {
-			lastNotifiedSessionId = session.sessionId;
-			await options.onSessionChanged({ sessionFile: session.sessionFile, sessionId: session.sessionId });
-		}
+		await notifySessionChanged();
 
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
@@ -711,6 +725,18 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				requestTransportFailureShutdown(transportError);
 			}
 		});
+	};
+
+	const handleReviewWorkflowEvent = (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent): void => {
+		try {
+			const result = options.onWorkflowEvent?.(event);
+			if (result) {
+				void Promise.resolve(result).catch(() => {});
+			}
+		} catch (error) {
+			void error;
+		}
+		output(event);
 	};
 
 	const createHostActionContext = (): HostActionInvocationContext => ({
@@ -747,7 +773,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				requireProjectTrust: reviewOptions.remote,
 				requireConfirmation: reviewOptions.requireConfirmation,
 				confirm: ({ title, message }) => createExtensionUIContext().confirm(title, message),
-				onEvent: output,
+				onEvent: handleReviewWorkflowEvent,
 			}),
 	});
 

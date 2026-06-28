@@ -1,10 +1,11 @@
 export interface IrohRemoteActiveStreamEntry {
 	readonly clientNodeId: string;
 	readonly workspaceName: string;
-	readonly sessionId: string;
+	sessionId: string;
 	readonly connectionId: string;
 	readonly streamId: string;
 	close(reason: string): Promise<void> | void;
+	write?(value: object): Promise<void> | void;
 	closeConnection?(reason: string): Promise<void> | void;
 }
 

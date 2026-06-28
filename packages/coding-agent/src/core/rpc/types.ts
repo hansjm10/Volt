@@ -353,6 +353,19 @@ export interface RpcSessionListItem {
 	current: boolean;
 }
 
+export interface RpcActiveToolExecution {
+	toolCallId: string;
+	toolName: string;
+	status: "started";
+	args?: Record<string, unknown>;
+}
+
+export interface RpcActiveCompaction {
+	reason: "manual" | "threshold" | "overflow";
+	/** Unix epoch milliseconds when the active compaction started. */
+	startedAt: number;
+}
+
 export interface RpcSessionState {
 	model?: RpcModel;
 	thinkingLevel: ThinkingLevel;
@@ -366,6 +379,8 @@ export interface RpcSessionState {
 	autoCompactionEnabled: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
+	activeTools?: RpcActiveToolExecution[];
+	activeCompaction?: RpcActiveCompaction;
 }
 
 export type RpcTranscriptToolStatus = "started" | "completed" | "failed";
