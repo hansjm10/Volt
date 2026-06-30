@@ -18,8 +18,6 @@
 		"check:pinned-deps": "node scripts/check-pinned-deps.mjs",
 		"check:shrinkwrap": "node scripts/generate-coding-agent-shrinkwrap.mjs --check",
 		"check:ts-imports": "node scripts/check-ts-relative-imports.mjs",
-		"swe-pruner:start": "node scripts/swe-pruner-service.mjs start --background",
-		"swe-pruner:stop": "node scripts/swe-pruner-service.mjs stop",
 		"iroh:poc:install": "npm install --ignore-scripts",
 		"iroh:poc:test": "node --conditions volt-source scripts/iroh-sidecar-test.mjs",
 		"iroh:poc:host": "node --conditions volt-source scripts/iroh-sidecar-run.mjs host",

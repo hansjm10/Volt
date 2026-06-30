@@ -45,7 +45,6 @@
 - Added Iroh remote push target registration and generic completion delivery through the managed Volt push relay, with mobile-issued relay credentials persisted on the host instead of raw FCM registration tokens.
 - Added a Firebase Cloud Functions managed push relay implementation for app-side FCM token registration and target-scoped host delivery auth.
 - Added native UI action argument schema validation and `get_ui_action_completions` RPC support for descriptor-backed command arguments.
-- Added a `swe-pruner.ts` example extension that finds task-relevant excerpts in local files through a local SWE-Pruner service, persists its settings in global or project config, and includes npm scripts for starting and stopping the local service.
 
 ### Fixed
 
@@ -99,7 +98,6 @@
 - Documented the Iroh remote supported-preview user workflow, security model, relay guidance, state/audit paths, and Node-only host support boundary across README, usage, security, protocol, design, and sidecar docs.
 - Documented the Iroh remote v1 preview duplicate-connection policy: reject a second active connection for the same client/workspace instead of replacing the existing runtime.
 - Documented the native UI action protocol across RPC, Iroh remote, extension command, prompt-template, skill, and iOS client docs.
-- Updated the SWE-Pruner example extension guidance to prefer semantic pruning after candidate-file discovery and clarify when to use search, LSP, or full reads instead.
 - Changed store install/update confirmations and summaries to show package names and concise source labels instead of full git source strings.
 - Changed the interactive `/store` browser to list available packages immediately, with search available from the package list.
 - Updated the `/review` selector to offer base-branch review first and show local branches with `main`/`master` prioritized.
