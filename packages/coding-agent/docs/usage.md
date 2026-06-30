@@ -109,6 +109,59 @@ When the review finishes, volt starts a **fresh session seeded only with the num
 
 Set the `reviewModel` setting (e.g. `"anthropic/claude-opus-4-5"`) to review with a different model than the active session; otherwise the current model is used.
 
+## Subagents (MVP)
+
+Subagents are named child Volt sessions with isolated context. Volt includes a built-in `general` subagent for ad hoc delegated tasks. Additional subagents are discovered from markdown files:
+
+- `~/.volt/agent/agents/*.md` for user agents
+- `.volt/agents/*.md` for project agents, only when the project is trusted
+
+File-backed definitions override built-in definitions with the same `name`. Project agents with the same `name` override user agents only after project trust is active. Without trust, project definitions are ignored.
+
+Definition format:
+
+```markdown
+---
+name: scout
+description: Fast codebase reconnaissance
+tools: read, grep, find, ls
+model: claude-haiku-4-5
+thinking: off
+---
+
+You are a scout. Find relevant files and return concise findings.
+```
+
+Required fields are `name`, `description`, and the markdown body. Optional `tools` is a comma-separated list, `model` is a model pattern/id, and `thinking` is a thinking level. Child tools are clamped by the parent session's active tool policy, so a subagent cannot gain tools the parent did not expose.
+
+The built-in `subagent` tool is active by default when a `SubagentManager` is available, including normal CLI sessions. If you pass an explicit `--tools` allowlist, include `subagent` to keep delegation available; disable it with `--exclude-tools subagent`, `--no-builtin-tools`, or `--no-tools`.
+
+The current built-in tool supports three modes. Provide exactly one mode per call:
+
+```json
+{ "agent": "scout", "task": "Find the auth entry points" }
+```
+
+```json
+{
+  "tasks": [
+    { "agent": "scout", "task": "Find auth entry points" },
+    { "agent": "planner", "task": "Plan a minimal fix" }
+  ]
+}
+```
+
+```json
+{
+  "chain": [
+    { "agent": "scout", "task": "Find auth entry points" },
+    { "agent": "planner", "task": "Plan a fix using {previous}" }
+  ]
+}
+```
+
+Parallel mode is limited to 8 tasks with max concurrency 4. Results are returned in input order, and mixed success/failure runs return a combined status summary instead of hiding partial results. Chain mode runs steps sequentially, replaces `{previous}` with the prior successful step output, returns the final successful step output when all steps complete, and stops at the first failed step with details for executed steps. Tool-style child sessions are ephemeral, use isolated context, and return child final assistant text to the parent. Model-visible subagent output is capped at 50 KB per task or chain step; metadata such as subagent ID, session ID, source, status, usage, and truncation/error details is kept in tool details.
+
 ## Context Files
 
 Volt loads `AGENTS.md` or `CLAUDE.md` at startup from:
@@ -220,7 +273,8 @@ Common management commands:
 ```bash
 volt remote status                         # persisted state, workspaces, clients, tools, state/audit paths
 volt remote clients                        # paired client JSON without secrets
-volt remote revoke <node-id>               # revoke future access; live hosts also close active streams/connections
+volt remote revoke <node-id>               # revoke one client; live hosts also close active streams/connections
+volt remote revoke --all                   # revoke every paired client
 volt remote approve-repair <node-id>       # allow a revoked phone identity to re-pair with a fresh ticket
 volt remote host --register-workspace .    # register current directory by basename
 volt remote host --register-workspace other=<workspace-dir>
@@ -241,7 +295,7 @@ Options to know:
 
 Security and support boundary:
 
-- The default remote tool grant enables the built-in tools `read,bash,edit,write,grep,find,ls` plus active tools registered by loaded extensions. Custom `--allow-tools` grants that differ from the default built-in list are strict; name extension tools explicitly when using one.
+- The default remote tool grant enables the built-in tools `read,bash,edit,write,grep,find,ls,subagent` plus active tools registered by loaded extensions. Custom `--allow-tools` grants that differ from the default built-in list are strict; name extension tools explicitly when using one. The `subagent` tool can only run built-in or discovered named definitions, and child tools are clamped by the remote session's active tool grant.
 - Granting `bash`, `edit`, or `write` can modify host files or run shell commands. Extension tools run code installed on the host and may do the same. TTY host startup asks for confirmation and offers `trust` to continue while trusting project-local workspace resources; noninteractive unsafe grants, including the default grant, require `--yes`.
 - `--register-workspace` is a local desktop action. It stores a workspace name and realpath in the selected host state file, without starting a remote API for clients to create, rename, browse, or path-map workspaces. In a TTY, registration also offers `trust` when the workspace has project-local Volt resources; `--register-workspace --approve` saves workspace trust noninteractively. Removing a workspace unregisters the saved name from host state only; it does not delete files.
 - Bare `volt remote host` exposes the current working directory. If that directory is already registered, the saved workspace name and tool defaults are reused; otherwise the host registers it by basename.
@@ -317,7 +371,7 @@ cat README.md | volt -p "Summarize this text"
 | `--no-builtin-tools`, `-nbt` | Disable built-in tools but keep extension/custom tools enabled |
 | `--no-tools`, `-nt` | Disable all tools |
 
-Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
+Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `subagent`. The `subagent` tool is active by default when a manager is available and only runs built-in or discovered named definitions from the ResourceLoader.
 
 ### Resource Options
 
@@ -415,6 +469,6 @@ volt --exclude-tools ask_question
 
 Volt keeps the core small and pushes workflow-specific behavior into extensions, skills, prompt templates, and packages.
 
-It intentionally does not include built-in MCP, sub-agents, permission popups, plan mode, to-dos, or background bash. You can build or install those workflows as extensions or packages, or use external tools such as containers and tmux.
+It intentionally does not include built-in MCP, permission popups, plan mode, to-dos, background bash, or advanced subagent orchestration. The core subagent MVP is limited to built-in/discovered named agents and the single/parallel/chain `subagent` tool; richer workflows can be built as extensions or external tools.
 
 For the full rationale, see the project documentation and extension examples.

@@ -19,12 +19,15 @@ import type {
 	RpcClientCapabilityFeature,
 	RpcCommand,
 	RpcHostActionRequest,
+	RpcListSubagentsResponse,
 	RpcPendingHostActionsResponse,
 	RpcRegisterPushTargetResponse,
 	RpcResponse,
 	RpcSessionListItem,
 	RpcSessionState,
 	RpcSlashCommand,
+	RpcSubagentStartResponse,
+	RpcTranscriptResponse,
 	UiActionCapabilities,
 } from "./rpc-types.ts";
 
@@ -34,6 +37,20 @@ export interface RpcCommandDispatcherOptions {
 	allowUiActionInvocation: boolean;
 	requireRemoteSafeUiActions: boolean;
 	registerPushTarget: ((args: unknown) => Promise<RpcRegisterPushTargetResponse>) | undefined;
+}
+
+export interface RpcSubagentLifecycleController {
+	list(): RpcListSubagentsResponse;
+	start(agent: string, prompt: string): Promise<RpcSubagentStartResponse>;
+	abort(subagentId: string): Promise<void>;
+	getState(subagentId: string): Promise<RpcSessionState>;
+	getTranscript(options: {
+		subagentId: string;
+		limit?: number;
+		beforeEntryId?: string;
+	}): Promise<RpcTranscriptResponse>;
+	dispose(subagentId: string): Promise<void>;
+	disposeAll(): Promise<void>;
 }
 
 export interface RpcCommandDispatcherContext {
@@ -46,6 +63,7 @@ export interface RpcCommandDispatcherContext {
 	setClientCapabilities(features: RpcClientCapabilityFeature[]): void;
 	getPendingHostActionRequests(): RpcHostActionRequest[];
 	cancelPendingHostActionRequests(message?: string): void;
+	subagents: RpcSubagentLifecycleController;
 }
 
 function getUiActionCapabilities(invocationEnabled: boolean): UiActionCapabilities {
@@ -289,6 +307,52 @@ export async function handleRpcCommand(
 				limit: command.limit,
 			});
 			return createRpcSuccessResponse(id, "get_transcript", transcript);
+		}
+
+		// =================================================================
+		// Subagents (local RPC only)
+		// =================================================================
+
+		case "list_subagents": {
+			return createRpcSuccessResponse(id, "list_subagents", context.subagents.list());
+		}
+
+		case "subagent_start": {
+			return createRpcSuccessResponse(
+				id,
+				"subagent_start",
+				await context.subagents.start(command.agent, command.prompt),
+			);
+		}
+
+		case "subagent_abort": {
+			await context.subagents.abort(command.subagentId);
+			return createRpcSuccessResponse(id, "subagent_abort");
+		}
+
+		case "subagent_get_state": {
+			return createRpcSuccessResponse(
+				id,
+				"subagent_get_state",
+				await context.subagents.getState(command.subagentId),
+			);
+		}
+
+		case "subagent_get_transcript": {
+			return createRpcSuccessResponse(
+				id,
+				"subagent_get_transcript",
+				await context.subagents.getTranscript({
+					subagentId: command.subagentId,
+					limit: command.limit,
+					beforeEntryId: command.beforeEntryId,
+				}),
+			);
+		}
+
+		case "subagent_dispose": {
+			await context.subagents.dispose(command.subagentId);
+			return createRpcSuccessResponse(id, "subagent_dispose");
 		}
 
 		// =================================================================

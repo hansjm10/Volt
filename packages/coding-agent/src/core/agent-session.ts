@@ -96,6 +96,7 @@ import {
 	createAllToolDefinitions,
 	createDefaultWebSearchOperations,
 	DEFAULT_ACTIVE_TOOL_NAMES,
+	type SubagentToolManager,
 } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 
@@ -180,7 +181,7 @@ export interface AgentSessionConfig {
 	customTools?: ToolDefinition[];
 	/** Model registry for API key resolution and model discovery */
 	modelRegistry: ModelRegistry;
-	/** Initial active built-in tool names. Default: [read, bash, edit, write, web_search] */
+	/** Initial active built-in tool names. Default: read, bash, edit, write, web_search, and subagent when a manager is supplied. */
 	initialActiveToolNames?: string[];
 	/** Optional allowlist of tool names. When provided, only these tool names are exposed. */
 	allowedToolNames?: string[];
@@ -201,6 +202,8 @@ export interface AgentSessionConfig {
 	sessionStartEvent?: SessionStartEvent;
 	/** Optional host interaction bridge for blocking host-initiated actions. */
 	hostInteraction?: HostInteraction;
+	/** Optional manager enabling the built-in subagent tool when selected. */
+	subagentToolManager?: SubagentToolManager;
 }
 
 export interface ExtensionBindings {
@@ -342,6 +345,7 @@ export class AgentSession {
 	// LSP diagnostics manager (created unless lsp.enabled is false)
 	private _lspManager?: LspManager;
 	private _hostInteraction?: HostInteraction;
+	private _subagentToolManager?: SubagentToolManager;
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -370,6 +374,7 @@ export class AgentSession {
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._hostInteraction = config.hostInteraction;
+		this._subagentToolManager = config.subagentToolManager;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -832,6 +837,19 @@ export class AgentSession {
 		return this.agent.state.systemPrompt;
 	}
 
+	/**
+	 * Append fixed context to this session's base system prompt.
+	 * Used by subagent runtimes to apply a selected definition before any turns run.
+	 */
+	appendSystemPromptContext(context: string): void {
+		const trimmed = context.trim();
+		if (!trimmed) {
+			return;
+		}
+		this._baseSystemPrompt = [this._baseSystemPrompt, trimmed].filter(Boolean).join("\n\n");
+		this.agent.state.systemPrompt = this._baseSystemPrompt;
+	}
+
 	/** Current retry attempt (0 if not retrying) */
 	get retryAttempt(): number {
 		return this._retryAttempt;
@@ -843,6 +861,10 @@ export class AgentSession {
 	 */
 	getActiveToolNames(): string[] {
 		return this.agent.state.tools.map((t) => t.name);
+	}
+
+	getSubagentToolManager(): SubagentToolManager | undefined {
+		return this._subagentToolManager;
 	}
 
 	/**
@@ -2584,6 +2606,14 @@ export class AgentSession {
 						}),
 					},
 					lsp: { provider: this._lspManager },
+					...(this._subagentToolManager
+						? {
+								subagent: {
+									manager: this._subagentToolManager,
+									getAllowedTools: () => this.getActiveToolNames(),
+								},
+							}
+						: {}),
 				});
 
 		this._baseToolDefinitions = new Map(
@@ -2612,7 +2642,11 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: [...DEFAULT_ACTIVE_TOOL_NAMES, ...(this._lspManager ? ["lsp"] : [])];
+			: [
+					...DEFAULT_ACTIVE_TOOL_NAMES,
+					...(this._subagentToolManager ? ["subagent"] : []),
+					...(this._lspManager ? ["lsp"] : []),
+				];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,

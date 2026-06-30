@@ -29,9 +29,11 @@ import {
 	createLsTool,
 	createReadOnlyTools,
 	createReadTool,
+	createSubagentTool,
 	createWebSearchTool,
 	createWriteTool,
 	DEFAULT_ACTIVE_TOOL_NAMES,
+	type SubagentToolManager,
 	type ToolName,
 	withFileMutationQueue,
 } from "./tools/index.ts";
@@ -58,15 +60,16 @@ export interface CreateAgentSessionOptions {
 	 * Optional default tool suppression mode when no explicit allowlist is provided.
 	 *
 	 * - "all": start with no tools enabled
-	 * - "builtin": disable the default built-in tools (read, bash, edit, write, web_search)
-	 *   but keep extension/custom tools enabled
+	 * - "builtin": disable the default built-in tools (read, bash, edit, write,
+	 *   web_search, and subagent when a manager is supplied) but keep extension/custom tools enabled
 	 */
 	noTools?: "all" | "builtin";
 	/**
 	 * Optional allowlist of tool names.
 	 *
-	 * When omitted, volt enables the default built-in tools (read, bash, edit, write, web_search)
-	 * and leaves extension/custom tools enabled unless `noTools` changes that default.
+	 * When omitted, volt enables the default built-in tools (read, bash, edit, write,
+	 * web_search, and subagent when a manager is supplied) and leaves extension/custom tools enabled
+	 * unless `noTools` changes that default.
 	 * When provided, only the listed tool names are enabled.
 	 */
 	tools?: string[];
@@ -91,6 +94,8 @@ export interface CreateAgentSessionOptions {
 	sessionStartEvent?: SessionStartEvent;
 	/** Optional host interaction bridge for blocking host-initiated actions. */
 	hostInteraction?: HostInteraction;
+	/** Optional manager enabling the built-in subagent tool when selected. */
+	subagentToolManager?: SubagentToolManager;
 }
 
 /** Result from createAgentSession */
@@ -132,6 +137,7 @@ export {
 	createFindTool,
 	createLsTool,
 	createLspTool,
+	createSubagentTool,
 	createWebSearchTool,
 };
 
@@ -256,6 +262,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	const defaultActiveToolNames: ToolName[] = [...DEFAULT_ACTIVE_TOOL_NAMES];
+	if (options.subagentToolManager) {
+		defaultActiveToolNames.push("subagent");
+	}
 	if (resolveLspConfig(settingsManager.getLspSettings()).enabled) {
 		defaultActiveToolNames.push("lsp");
 	}
@@ -407,6 +416,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
 		hostInteraction: options.hostInteraction,
+		subagentToolManager: options.subagentToolManager,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 

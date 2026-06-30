@@ -764,6 +764,7 @@ export function createReviewResourceLoader(cwd: string, agentDir: string): Resou
 		getSkills: () => ({ skills: [], diagnostics: [] }),
 		getPrompts: () => ({ prompts: [], diagnostics: [] }),
 		getThemes: () => ({ themes: [], diagnostics: [] }),
+		getSubagents: () => ({ definitions: [], diagnostics: [] }),
 		getAgentsFiles: () => ({ agentsFiles }),
 		getSystemPrompt: () => REVIEW_SYSTEM_PROMPT,
 		getAppendSystemPrompt: () => [],

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "./protocol.ts";
+import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS, normalizeIrohRemoteAllowTools } from "./protocol.ts";
 
 export interface IrohRemoteWorkspace {
 	name: string;
@@ -190,10 +190,11 @@ function serializeIrohRemoteHostState(state: IrohRemoteHostState): IrohRemoteHos
 
 export function parseIrohRemoteWorkspace(value: unknown): IrohRemoteWorkspace {
 	const workspace = expectRecord(value, "Iroh remote workspace");
+	const allowedTools = expectOptionalString(workspace.allowedTools, "workspace allowedTools");
 	return {
 		name: expectString(workspace.name, "workspace name"),
 		path: expectString(workspace.path, "workspace path"),
-		allowedTools: expectOptionalString(workspace.allowedTools, "workspace allowedTools"),
+		allowedTools: allowedTools === undefined ? undefined : normalizeIrohRemoteAllowTools(allowedTools),
 	};
 }
 
@@ -205,7 +206,9 @@ export function parseIrohRemoteClient(value: unknown): IrohRemoteClient {
 		allowedWorkspaces: parseArray(client.allowedWorkspaces, "client allowedWorkspaces", (entry) =>
 			expectString(entry, "client allowed workspace"),
 		),
-		allowedTools: expectOptionalString(client.allowedTools, "client allowedTools") ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+		allowedTools: normalizeIrohRemoteAllowTools(
+			expectOptionalString(client.allowedTools, "client allowedTools") ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+		),
 		pairedAt: expectNumber(client.pairedAt, "client pairedAt"),
 		lastSeenAt: expectNumber(client.lastSeenAt, "client lastSeenAt"),
 		...parseOptionalStringRecordProperty(
@@ -276,8 +279,9 @@ export function parseIrohRemoteRevokedClient(value: unknown): IrohRemoteRevokedC
 		allowedWorkspaces: parseArray(client.allowedWorkspaces, "revoked client allowedWorkspaces", (entry) =>
 			expectString(entry, "revoked client allowed workspace"),
 		),
-		allowedTools:
+		allowedTools: normalizeIrohRemoteAllowTools(
 			expectOptionalString(client.allowedTools, "revoked client allowedTools") ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+		),
 		pairedAt: expectNumber(client.pairedAt, "revoked client pairedAt"),
 		lastSeenAt: expectNumber(client.lastSeenAt, "revoked client lastSeenAt"),
 		revokedAt: expectNumber(client.revokedAt, "revoked client revokedAt"),
@@ -325,7 +329,9 @@ export function parseIrohRemotePendingPairingTicket(value: unknown): IrohRemoteP
 	return {
 		secretHash: expectString(ticket.secretHash, "pending pairing ticket secretHash"),
 		workspace: expectString(ticket.workspace, "pending pairing ticket workspace"),
-		allowedTools: expectString(ticket.allowedTools, "pending pairing ticket allowedTools"),
+		allowedTools: normalizeIrohRemoteAllowTools(
+			expectString(ticket.allowedTools, "pending pairing ticket allowedTools"),
+		),
 		expiresAt: expectNumber(ticket.expiresAt, "pending pairing ticket expiresAt"),
 		createdAt: expectNumber(ticket.createdAt, "pending pairing ticket createdAt"),
 		...(labelHint === undefined ? {} : { labelHint }),

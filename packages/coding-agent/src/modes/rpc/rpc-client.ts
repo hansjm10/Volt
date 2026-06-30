@@ -3,7 +3,14 @@ import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import { RpcClientBase } from "./rpc-client-base.ts";
 import type { RpcCommand, RpcExtensionUIResponse, RpcHostActionResponse } from "./rpc-types.ts";
 
-export type { ModelInfo, RpcClientEvent, RpcEventListener, RpcExtensionErrorEvent } from "./rpc-client-base.ts";
+export type {
+	ModelInfo,
+	RpcClientEvent,
+	RpcEventListener,
+	RpcExtensionErrorEvent,
+	RpcSubagentEndEvent,
+	RpcSubagentEvent,
+} from "./rpc-client-base.ts";
 export type { RpcWorkflowEvent, RpcWorkflowToolEvent } from "./rpc-types.ts";
 
 export interface RpcClientOptions {

@@ -399,6 +399,7 @@ export class IrohRemotePushNotificationDispatcher implements IrohRemotePushNotif
 		try {
 			const relayResult = await this.sendLiveActivityUpdateWithRetry(relayRequest);
 			if (relayResult.status === "invalid_target") {
+				await this.stateManager.pruneClientLiveActivityDeliveryChannel(this.clientNodeId, registration, this.now());
 				await this.logPushDelivery(
 					pushTarget,
 					update.eventId,
@@ -656,7 +657,6 @@ function findRegisteredLiveActivityPushTarget(
 ): IrohRemotePushTarget | undefined {
 	return client?.pushTargets?.find((target) => {
 		return (
-			target.enabled &&
 			target.id === registration.pushTargetId &&
 			target.platform === registration.platform &&
 			target.liveActivity?.tokenHash === registration.tokenHash &&

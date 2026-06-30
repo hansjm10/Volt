@@ -145,6 +145,82 @@ describe("RPC transcript projection", () => {
 		expect(serialized).not.toContain("image-bytes");
 	});
 
+	test("projects bounded subagent args and details for rich remote transcript rendering", () => {
+		const session = SessionManager.inMemory("/workspace");
+		session.appendMessage(
+			assistant(
+				[
+					{ type: "text", text: "Delegating." },
+					{
+						type: "toolCall",
+						id: "subagent-call",
+						name: "subagent",
+						arguments: {
+							agent: "general",
+							task: "Review the implementation",
+						},
+					},
+				],
+				20,
+			),
+		);
+		const subagentResult: ToolResultMessage<{
+			mode: string;
+			status: string;
+			agent: { name: string; source: string };
+			summary: { total: number; completed: number; failed: number; aborted: number; running: number };
+			output: { text: string; bytes: number; truncated: boolean; maxBytes: number };
+		}> = {
+			role: "toolResult",
+			toolCallId: "subagent-call",
+			toolName: "subagent",
+			content: [{ type: "text", text: "model-visible child output" }],
+			details: {
+				mode: "single",
+				status: "completed",
+				agent: { name: "general", source: "built-in" },
+				summary: { total: 1, completed: 1, failed: 0, aborted: 0, running: 0 },
+				output: {
+					text: `Child answer ${"x".repeat(1_500)}`,
+					bytes: 1_513,
+					truncated: false,
+					maxBytes: 50_000,
+				},
+			},
+			isError: false,
+			timestamp: 30,
+		};
+		session.appendMessage(subagentResult);
+
+		const transcript = projectSessionTranscript(session);
+		const toolItem = transcript.items.find((item) => item.role === "tool");
+
+		expect(toolItem).toMatchObject({
+			role: "tool",
+			toolName: "subagent",
+			status: "completed",
+			args: { agent: "general", task: "Review the implementation" },
+			details: {
+				mode: "single",
+				status: "completed",
+				agent: { name: "general", source: "built-in" },
+				summary: { total: 1, completed: 1, failed: 0, aborted: 0, running: 0 },
+				output: {
+					bytes: 1_513,
+					truncated: false,
+					maxBytes: 50_000,
+				},
+			},
+		});
+		if (!toolItem || toolItem.role !== "tool") {
+			throw new Error("expected subagent tool item");
+		}
+		const output = (toolItem.details?.output as { text?: unknown } | undefined)?.text;
+		expect(output).toEqual(expect.stringContaining("Child answer"));
+		expect(output).toEqual(expect.stringContaining("[truncated]"));
+		expect(JSON.stringify(transcript)).not.toContain("model-visible child output");
+	});
+
 	test("projects displayed review seed messages so remote clients can continue from findings", () => {
 		const session = SessionManager.inMemory("/workspace");
 		session.appendCustomMessageEntry("review", "Automated review result\n\nFindings:\n1. Fix the bug", true, {

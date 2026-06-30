@@ -18,6 +18,7 @@ import {
 } from "../../core/remote/iroh/index.ts";
 import { getDefaultSessionDir, SessionManager } from "../../core/session-manager.ts";
 import { SettingsManager } from "../../core/settings-manager.ts";
+import { SubagentManager } from "../../core/subagents/index.ts";
 import { runMigrations } from "../../migrations.ts";
 import { resolvePath } from "../../utils/paths.ts";
 
@@ -99,12 +100,19 @@ export async function createIrohRemoteAgentRuntimeWithSessionSelection(
 			agentDir: runtimeOptions.agentDir,
 			settingsManager,
 		});
+		const subagentManager = new SubagentManager({
+			createRuntime,
+			cwd: runtimeOptions.cwd,
+			agentDir: runtimeOptions.agentDir,
+			resourceLoader: services.resourceLoader,
+		});
 		const created = await createAgentSessionFromServices({
 			services,
 			sessionManager: runtimeOptions.sessionManager,
 			sessionStartEvent: runtimeOptions.sessionStartEvent,
 			tools,
 			allowUnlistedExtensionTools,
+			subagentToolManager: subagentManager,
 		});
 		return {
 			...created,

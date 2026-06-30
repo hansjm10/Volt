@@ -14,6 +14,7 @@ import type { HostActionDecisionKind, HostActionRequest, HostActionUpdate } from
 import type { SourceInfo } from "../source-info.ts";
 
 export type RpcModel = Model<Api>;
+export type RpcSubagentDefinitionSource = "built-in" | "user" | "project";
 
 // ============================================================================
 // RPC Commands
@@ -69,6 +70,14 @@ export type RpcCommand =
 	// State
 	| { id?: string; type: "get_state" }
 	| { id?: string; type: "get_transcript"; limit?: number; beforeEntryId?: string }
+
+	// Subagents (local RPC only)
+	| { id?: string; type: "list_subagents" }
+	| { id?: string; type: "subagent_start"; agent: string; prompt: string }
+	| { id?: string; type: "subagent_abort"; subagentId: string }
+	| { id?: string; type: "subagent_get_state"; subagentId: string }
+	| { id?: string; type: "subagent_get_transcript"; subagentId: string; limit?: number; beforeEntryId?: string }
+	| { id?: string; type: "subagent_dispose"; subagentId: string }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -283,6 +292,35 @@ export interface RpcPendingHostActionsResponse {
 }
 
 // ============================================================================
+// RPC Subagents
+// ============================================================================
+
+export interface RpcSubagentSourceInfo {
+	source: SourceInfo["source"];
+	scope: SourceInfo["scope"];
+	origin: SourceInfo["origin"];
+}
+
+export interface RpcSubagentDefinition {
+	name: string;
+	description: string;
+	source: RpcSubagentDefinitionSource;
+	sourceInfo: RpcSubagentSourceInfo;
+	tools?: string[];
+	model?: string;
+	thinking?: string;
+}
+
+export interface RpcListSubagentsResponse {
+	subagents: RpcSubagentDefinition[];
+}
+
+export interface RpcSubagentStartResponse {
+	subagentId: string;
+	sessionId: string;
+}
+
+// ============================================================================
 // RPC Push Notifications
 // ============================================================================
 
@@ -402,6 +440,8 @@ export interface RpcTranscriptToolItem extends RpcTranscriptBaseItem {
 	status: RpcTranscriptToolStatus;
 	path?: string;
 	summary: string;
+	args?: Record<string, unknown>;
+	details?: Record<string, unknown>;
 	diffPreview?: string;
 	patchPreview?: string;
 }
@@ -501,6 +541,20 @@ export type RpcResponse =
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
 	| { id?: string; type: "response"; command: "get_transcript"; success: true; data: RpcTranscriptResponse }
+
+	// Subagents (local RPC only)
+	| { id?: string; type: "response"; command: "list_subagents"; success: true; data: RpcListSubagentsResponse }
+	| { id?: string; type: "response"; command: "subagent_start"; success: true; data: RpcSubagentStartResponse }
+	| { id?: string; type: "response"; command: "subagent_abort"; success: true }
+	| { id?: string; type: "response"; command: "subagent_get_state"; success: true; data: RpcSessionState }
+	| {
+			id?: string;
+			type: "response";
+			command: "subagent_get_transcript";
+			success: true;
+			data: RpcTranscriptResponse;
+	  }
+	| { id?: string; type: "response"; command: "subagent_dispose"; success: true }
 
 	// Model
 	| {

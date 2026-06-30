@@ -122,6 +122,9 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	}
 
 	// Always include these
+	addGuideline(
+		'Write tests against observable behavior and public contracts, not implementation text; avoid source-content assertions like file.contains("SomeView(...)") unless the feature is a textual artifact.',
+	);
 	addGuideline("Be concise in your responses");
 	addGuideline("Show file paths clearly when working with files");
 

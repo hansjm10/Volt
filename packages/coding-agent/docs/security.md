@@ -61,11 +61,11 @@ Supported preview safety model:
 - Nothing listens until the host user runs `volt remote host`.
 - Workspaces are registered locally by the desktop user with saved names; clients cannot request arbitrary host paths.
 - Registering a workspace is a local desktop action. Remote clients cannot create, rename, delete files, browse host paths, or path-map host workspaces from the app. A reviewed remote unregister request may remove a known workspace name from host state only; it does not delete files.
-- The default remote tool grant includes the built-in coding tools `read,bash,edit,write,grep,find,ls` plus active tools registered by loaded extensions. Custom grants that differ from the default built-in list are strict; extension tools must be named explicitly there.
+- The default remote tool grant includes the built-in coding tools `read,bash,edit,write,grep,find,ls,subagent` plus active tools registered by loaded extensions. Custom grants that differ from the default built-in list are strict; extension tools must be named explicitly there. The `subagent` tool only starts built-in or discovered named definitions, and child tools are clamped by the remote session's active tool grant.
 - Pairing tickets are short-lived, one-time credentials. Persisted state stores secret hashes and non-secret metadata, not raw pairing secrets.
 - Pairing through `volt remote pair` requires a running host control channel; offline ticket generation from persisted state is not supported.
 - Mobile-facing `volt remote host --mobile` startup does not create an active pairing ticket. Add phones explicitly with `volt remote pair`.
-- Paired clients are persisted until revoked with `volt remote revoke <node-id>`.
+- Paired clients are persisted until revoked with `volt remote revoke <node-id>` or `volt remote revoke --all`.
 - After pairing, saved-host reconnect uses the persisted client node ID and a secret-free client saved-host record. Ordinary app reconnect, temporary network loss, or host restart with the same host state path should not require scanning another QR.
 - Pairing is workstation-scoped for the host state file. A paired phone can reconnect to any registered workspace name in that state file, including workspaces registered after pairing, without another QR scan. The app receives and selects names and host feature strings only, never host-local paths.
 - Integrated hosts advertise `multi_streams.v1` and `conversation_streams.v1`. Mobile conversation streams bind at handshake time to one authorized workspace/session target, and the host-observed Iroh client node ID is authoritative for authorization, runtime ownership, revocation, audit, and Live Activity routing.

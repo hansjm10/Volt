@@ -59,6 +59,7 @@ import {
 	type IrohRemoteTicketPayload,
 	type IrohRemoteWorkspace,
 	listenIrohRemoteControlServer,
+	normalizeIrohRemoteAllowTools,
 	parseIrohRemoteHandshakeResponseLine,
 	parseIrohRemoteHelloLine,
 	parseIrohRemoteHostState,
@@ -1216,6 +1217,41 @@ describe("Iroh remote core helpers", () => {
 			"write",
 			"web_search",
 		]);
+	});
+
+	test("normalizes legacy default remote tool grants to include subagent", () => {
+		const legacyDefaultGrant = "read,bash,edit,write,grep,find,ls";
+
+		expect(normalizeIrohRemoteAllowTools(legacyDefaultGrant)).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+		expect(normalizeIrohRemoteAllowTools("read")).toBe("read");
+		expect(
+			parseIrohRemoteHostState({
+				workspaces: [{ name: "volt", path: "/workspace", allowedTools: legacyDefaultGrant }],
+				clients: [
+					{
+						nodeId: "client-node",
+						label: "phone",
+						allowedWorkspaces: [],
+						allowedTools: legacyDefaultGrant,
+						pairedAt: 10,
+						lastSeenAt: 20,
+					},
+				],
+				pendingPairingTickets: [
+					{
+						secretHash: "sha256:pending",
+						workspace: "volt",
+						allowedTools: legacyDefaultGrant,
+						createdAt: 30,
+						expiresAt: 40,
+					},
+				],
+			}),
+		).toMatchObject({
+			workspaces: [{ allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS }],
+			clients: [{ allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS }],
+			pendingPairingTickets: [{ allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS }],
+		});
 	});
 
 	test("selects and upserts workspace definitions", async () => {

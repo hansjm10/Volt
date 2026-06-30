@@ -8,7 +8,12 @@ export const IROH_REMOTE_HOST_FEATURES = [
 	IROH_REMOTE_MULTI_STREAMS_FEATURE,
 	IROH_REMOTE_CONVERSATION_STREAMS_FEATURE,
 ] as const;
-export const DEFAULT_IROH_REMOTE_ALLOW_TOOLS = "read,bash,edit,write,web_search,grep,find,ls";
+export const DEFAULT_IROH_REMOTE_ALLOW_TOOLS = "read,bash,edit,write,web_search,grep,find,ls,subagent";
+const LEGACY_DEFAULT_IROH_REMOTE_ALLOW_TOOL_SETS: readonly string[][] = [
+	["read", "bash", "edit", "write", "grep", "find", "ls"],
+	["read", "bash", "edit", "write", "web_search", "grep", "find", "ls"],
+	["read", "bash", "edit", "write", "grep", "find", "ls", "subagent"],
+];
 export const IROH_REMOTE_UNSAFE_TOOL_NAMES = ["bash", "edit", "write", "web_search"] as const;
 export const IROH_REMOTE_OUTCOMES = [
 	"host_unreachable",
@@ -79,19 +84,37 @@ export class IrohRemoteOutcomeError extends Error {
 	}
 }
 
+export function normalizeIrohRemoteAllowTools(allowTools: string | undefined): string {
+	const tools = parseIrohRemoteAllowToolNames(allowTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+	if (
+		tools.length === 0 ||
+		LEGACY_DEFAULT_IROH_REMOTE_ALLOW_TOOL_SETS.some((legacy) => sameIrohRemoteAllowToolSet(tools, legacy))
+	) {
+		return DEFAULT_IROH_REMOTE_ALLOW_TOOLS;
+	}
+	return tools.join(",");
+}
+
 export function parseIrohRemoteAllowTools(allowTools: string | undefined): string[] {
-	const requestedAllowTools = allowTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS;
-	const tools = requestedAllowTools
-		.split(",")
-		.map((tool) => tool.trim())
-		.filter((tool) => tool.length > 0);
-	return tools.length > 0 ? tools : DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(",");
+	return normalizeIrohRemoteAllowTools(allowTools).split(",");
 }
 
 export function usesDefaultIrohRemoteAllowTools(allowTools: string | undefined): boolean {
 	const tools = parseIrohRemoteAllowTools(allowTools);
 	const defaultTools = new Set(DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(","));
 	return tools.length === defaultTools.size && tools.every((tool) => defaultTools.has(tool));
+}
+
+function parseIrohRemoteAllowToolNames(allowTools: string): string[] {
+	return allowTools
+		.split(",")
+		.map((tool) => tool.trim())
+		.filter((tool) => tool.length > 0);
+}
+
+function sameIrohRemoteAllowToolSet(left: readonly string[], right: readonly string[]): boolean {
+	const rightTools = new Set(right);
+	return left.length === rightTools.size && left.every((tool) => rightTools.has(tool));
 }
 
 export function getIrohRemoteUnsafeAllowedTools(allowTools: string): string[] {

@@ -77,3 +77,4 @@ For the full first-run flow, see [Quickstart](quickstart.md).
 ## Development
 
 - [Development](development.md) - local setup, project structure, and debugging.
+- [Core subagents design](subagents-design.md) - implemented local MVP boundary and deferred remote/package work for first-class subagents.

@@ -1,6 +1,7 @@
 import { stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { isIrohRemoteWorkspaceName } from "./handshake.ts";
+import { normalizeIrohRemoteAllowTools } from "./protocol.ts";
 import type { IrohRemoteHostState, IrohRemoteWorkspace } from "./state.ts";
 
 export type IrohRemoteWorkspaceAvailabilityStatus = "available" | "missing" | "unavailable";
@@ -66,7 +67,7 @@ export function upsertIrohRemoteWorkspace(
 	const savedWorkspace: IrohRemoteWorkspace = {
 		name: workspace.name,
 		path: workspace.path,
-		...(savedAllowedTools === undefined ? {} : { allowedTools: savedAllowedTools }),
+		...(savedAllowedTools === undefined ? {} : { allowedTools: normalizeIrohRemoteAllowTools(savedAllowedTools) }),
 	};
 	const existing = state.workspaces.find((entry) => entry.name === workspace.name);
 	if (!existing) {

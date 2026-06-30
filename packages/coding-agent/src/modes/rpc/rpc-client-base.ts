@@ -4,6 +4,7 @@ import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.t
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { ExtensionError } from "../../core/extensions/index.ts";
+import type { SubagentEvent, SubagentResult } from "../../core/subagents/index.ts";
 import type {
 	RpcClientCapabilityFeature,
 	RpcCommand,
@@ -12,10 +13,12 @@ import type {
 	RpcHostActionRequest,
 	RpcHostActionResponse,
 	RpcHostActionUpdate,
+	RpcListSubagentsResponse,
 	RpcResponse,
 	RpcSessionListItem,
 	RpcSessionState,
 	RpcSlashCommand,
+	RpcSubagentStartResponse,
 	RpcTranscriptResponse,
 	RpcWorkflowEvent,
 	RpcWorkflowToolEvent,
@@ -53,6 +56,8 @@ export interface ModelInfo {
 }
 
 export type RpcExtensionErrorEvent = { type: "extension_error" } & ExtensionError;
+export type RpcSubagentEvent = { type: "subagent_event"; subagentId: string; event: SubagentEvent };
+export type RpcSubagentEndEvent = { type: "subagent_end"; subagentId: string; result: SubagentResult };
 export type RpcClientEvent =
 	| AgentSessionEvent
 	| RpcWorkflowEvent
@@ -60,6 +65,8 @@ export type RpcClientEvent =
 	| RpcExtensionUIRequest
 	| RpcHostActionRequest
 	| RpcHostActionUpdate
+	| RpcSubagentEvent
+	| RpcSubagentEndEvent
 	| RpcExtensionErrorEvent;
 export type RpcEventListener = (event: RpcClientEvent) => void;
 
@@ -184,6 +191,48 @@ export abstract class RpcClientBase {
 			streamingBehavior: options.streamingBehavior,
 		});
 		return this.getData(response);
+	}
+
+	/** List discovered subagent definitions available to local RPC clients. */
+	async listSubagents(): Promise<RpcListSubagentsResponse> {
+		const response = await this.send({ type: "list_subagents" });
+		return this.getData(response);
+	}
+
+	/** Start a local RPC-managed subagent and send its initial prompt. */
+	async startSubagent(agent: string, prompt: string): Promise<RpcSubagentStartResponse> {
+		const response = await this.send({ type: "subagent_start", agent, prompt });
+		return this.getData(response);
+	}
+
+	/** Abort and dispose a local RPC-managed subagent. */
+	async abortSubagent(subagentId: string): Promise<void> {
+		await this.send({ type: "subagent_abort", subagentId });
+	}
+
+	/** Get state for a local RPC-managed subagent. */
+	async getSubagentState(subagentId: string): Promise<RpcSessionState> {
+		const response = await this.send({ type: "subagent_get_state", subagentId });
+		return this.getData(response);
+	}
+
+	/** Get a transcript projection for a local RPC-managed subagent. */
+	async getSubagentTranscript(
+		subagentId: string,
+		options: { limit?: number; beforeEntryId?: string } = {},
+	): Promise<RpcTranscriptResponse> {
+		const response = await this.send({
+			type: "subagent_get_transcript",
+			subagentId,
+			limit: options.limit,
+			beforeEntryId: options.beforeEntryId,
+		});
+		return this.getData(response);
+	}
+
+	/** Dispose a local RPC-managed subagent without sending an abort request first. */
+	async disposeSubagent(subagentId: string): Promise<void> {
+		await this.send({ type: "subagent_dispose", subagentId });
 	}
 
 	/** Set model by provider and ID. */

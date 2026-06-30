@@ -268,6 +268,115 @@ Response:
 
 Messages are `AgentMessage` objects (see [Message Types](#message-types)).
 
+### Subagents (local RPC only)
+
+Local RPC clients can manage definition-backed subagents over the same connection. These commands are local RPC only for now; Iroh remote transports reject them until a later explicit remote policy slice.
+
+#### list_subagents
+
+List built-in and discovered subagent definition summaries. The response omits definition file paths, source paths, base directories, and system prompts.
+
+```json
+{"type": "list_subagents"}
+```
+
+Response:
+```json
+{
+  "type": "response",
+  "command": "list_subagents",
+  "success": true,
+  "data": {
+    "subagents": [
+      {
+        "name": "scout",
+        "description": "Fast codebase reconnaissance",
+        "source": "project",
+        "sourceInfo": {"source": "local", "scope": "project", "origin": "top-level"},
+        "tools": ["read", "grep", "find", "ls"],
+        "model": "claude-haiku-4-5",
+        "thinking": "off"
+      }
+    ]
+  }
+}
+```
+
+#### subagent_start
+
+Start a definition-backed child subagent, send its initial prompt, and return after the prompt is accepted. Child tools are clamped by the current parent/session tool policy.
+
+```json
+{"type": "subagent_start", "agent": "scout", "prompt": "Find auth code"}
+```
+
+Response:
+```json
+{
+  "type": "response",
+  "command": "subagent_start",
+  "success": true,
+  "data": {"subagentId": "sa_123", "sessionId": "child-session-id"}
+}
+```
+
+Child events are wrapped on the parent RPC stream:
+
+```json
+{"type": "subagent_event", "subagentId": "sa_123", "event": {"type": "agent_start"}}
+{"type": "subagent_end", "subagentId": "sa_123", "result": {"id": "sa_123", "sessionId": "child-session-id", "event": {"type": "agent_end", "messages": [], "willRetry": false}}}
+```
+
+`subagent_event.event` is the child RPC event. `subagent_end.result` is emitted after the terminal child `agent_end` where `willRetry !== true`.
+
+#### subagent_abort
+
+Abort and dispose a local RPC-managed subagent.
+
+```json
+{"type": "subagent_abort", "subagentId": "sa_123"}
+```
+
+Response:
+```json
+{"type": "response", "command": "subagent_abort", "success": true}
+```
+
+#### subagent_get_state
+
+Get the child session state for an active local RPC-managed subagent.
+
+```json
+{"type": "subagent_get_state", "subagentId": "sa_123"}
+```
+
+Response data uses the same shape as [`get_state`](#get_state).
+
+#### subagent_get_transcript
+
+Get the child transcript projection for an active local RPC-managed subagent.
+
+```json
+{"type": "subagent_get_transcript", "subagentId": "sa_123", "limit": 100, "beforeEntryId": "entry-id"}
+```
+
+Response data uses the same shape as [`get_transcript`](#get_transcript).
+
+#### subagent_dispose
+
+Dispose a local RPC-managed subagent and remove it from this RPC connection's active subagent map. Later commands for the same `subagentId` fail with the normal RPC error shape.
+
+```json
+{"type": "subagent_dispose", "subagentId": "sa_123"}
+```
+
+Response:
+```json
+{"type": "response", "command": "subagent_dispose", "success": true}
+```
+
+Active RPC-started subagents are scoped to the RPC connection/runtime and are disposed on RPC shutdown and session replacement.
+
 ### Native UI Actions
 
 Native UI action commands let typed clients discover host-owned actions for native cards, buttons, toggles, pickers, and command palettes. They are distinct from raw slash command strings: slash commands are presentation aliases, while action ids are the invocation contract.
@@ -1147,6 +1256,8 @@ Events are streamed to stdout as JSON lines during agent operation. Events do NO
 | `compaction_end` | Compaction completes |
 | `auto_retry_start` | Auto-retry begins (after transient error) |
 | `auto_retry_end` | Auto-retry completes (success or final failure) |
+| `subagent_event` | Wrapped child event from a local RPC-managed subagent |
+| `subagent_end` | Terminal completion result for a local RPC-managed subagent |
 | `extension_error` | Extension threw an error |
 
 ### agent_start

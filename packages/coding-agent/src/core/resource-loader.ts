@@ -18,6 +18,7 @@ import { SettingsManager } from "./settings-manager.ts";
 import type { Skill } from "./skills.ts";
 import { loadSkills } from "./skills.ts";
 import { createSourceInfo, type SourceInfo } from "./source-info.ts";
+import { discoverSubagentDefinitions, type SubagentDefinition } from "./subagents/index.ts";
 
 export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;
@@ -29,11 +30,17 @@ export interface ResourceLoaderReloadOptions {
 	resolveProjectTrust?: (input: { extensionsResult: LoadExtensionsResult }) => Promise<boolean>;
 }
 
+export interface ResourceLoaderSubagentsResult {
+	definitions: SubagentDefinition[];
+	diagnostics: ResourceDiagnostic[];
+}
+
 export interface ResourceLoader {
 	getExtensions(): LoadExtensionsResult;
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
+	getSubagents(): ResourceLoaderSubagentsResult;
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
 	getSystemPrompt(): string | undefined;
 	getAppendSystemPrompt(): string[];
@@ -197,6 +204,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private promptDiagnostics: ResourceDiagnostic[];
 	private themes: Theme[];
 	private themeDiagnostics: ResourceDiagnostic[];
+	private subagents: SubagentDefinition[];
+	private subagentDiagnostics: ResourceDiagnostic[];
 	private agentsFiles: Array<{ path: string; content: string }>;
 	private systemPrompt?: string;
 	private appendSystemPrompt: string[];
@@ -244,6 +253,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.promptDiagnostics = [];
 		this.themes = [];
 		this.themeDiagnostics = [];
+		this.subagents = [];
+		this.subagentDiagnostics = [];
 		this.agentsFiles = [];
 		this.appendSystemPrompt = [];
 		this.lastSkillPaths = [];
@@ -268,6 +279,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] } {
 		return { themes: this.themes, diagnostics: this.themeDiagnostics };
+	}
+
+	getSubagents(): ResourceLoaderSubagentsResult {
+		return { definitions: this.subagents, diagnostics: this.subagentDiagnostics };
 	}
 
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> } {
@@ -448,6 +463,14 @@ export class DefaultResourceLoader implements ResourceLoader {
 				this.themeDiagnostics.push({ type: "error", message: "Theme path does not exist", path: resolved });
 			}
 		}
+
+		const subagents = discoverSubagentDefinitions({
+			cwd: this.cwd,
+			agentDir: this.agentDir,
+			projectTrusted: this.settingsManager.isProjectTrusted(),
+		});
+		this.subagents = subagents.definitions;
+		this.subagentDiagnostics = subagents.diagnostics;
 
 		const agentsFiles = {
 			agentsFiles: this.noContextFiles

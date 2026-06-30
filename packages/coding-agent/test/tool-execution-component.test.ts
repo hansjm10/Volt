@@ -6,6 +6,7 @@ import { getReadmePath } from "../src/config.ts";
 import type { ToolDefinition } from "../src/core/extensions/types.ts";
 import { type BashOperations, createBashToolDefinition } from "../src/core/tools/bash.ts";
 import { createReadTool, createReadToolDefinition } from "../src/core/tools/read.ts";
+import { createSubagentToolDefinition, type SubagentToolDetails } from "../src/core/tools/subagent.ts";
 import { createWriteToolDefinition } from "../src/core/tools/write.ts";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
@@ -28,6 +29,37 @@ function createFakeTui(): TUI {
 	return {
 		requestRender: () => {},
 	} as unknown as TUI;
+}
+
+function createSubagentRenderDefinition() {
+	return createSubagentToolDefinition({
+		manager: {
+			getDefinition: () => {
+				throw new Error("not used");
+			},
+			startByName: async () => {
+				throw new Error("not used");
+			},
+		},
+	});
+}
+
+function createSubagentUsage(): NonNullable<SubagentToolDetails["usage"]> {
+	return {
+		turns: 1,
+		messages: { user: 1, assistant: 1, toolCalls: 0, toolResults: 0, total: 2 },
+		tokens: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, total: 30 },
+		cost: 0,
+	};
+}
+
+function createSubagentOutput(text: string): NonNullable<NonNullable<SubagentToolDetails["tasks"]>[number]["output"]> {
+	return {
+		text,
+		bytes: Buffer.byteLength(text, "utf8"),
+		truncated: false,
+		maxBytes: 50 * 1024,
+	};
 }
 
 describe("ToolExecutionComponent parity", () => {
@@ -342,6 +374,218 @@ describe("ToolExecutionComponent parity", () => {
 		component.updateResult({ content: [{ type: "text", text: "done" }], details: {}, isError: false }, false);
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered).toContain("arg:bar");
+	});
+
+	test("renders built-in subagent single results compactly until expanded", () => {
+		const component = new ToolExecutionComponent(
+			"subagent",
+			"tool-subagent-single",
+			{ agent: "scout", task: "Inspect the auth flow" },
+			{},
+			createSubagentRenderDefinition(),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "final answer" }],
+				details: {
+					mode: "single",
+					status: "completed",
+					subagentId: "sa_1",
+					sessionId: "session_1",
+					agent: { name: "scout", source: "user" },
+					usage: createSubagentUsage(),
+					output: createSubagentOutput("final answer"),
+				} satisfies SubagentToolDetails,
+				isError: false,
+			},
+			false,
+		);
+
+		const collapsed = stripAnsi(component.render(120).join("\n"));
+		expect(collapsed).toContain("subagent scout");
+		expect(collapsed).toContain("scout (user) completed");
+		expect(collapsed).toContain("Inspect the auth flow");
+		expect(collapsed).toContain("1 turn");
+		expect(collapsed).not.toContain("final answer");
+
+		component.setExpanded(true);
+		const expanded = stripAnsi(component.render(120).join("\n"));
+		expect(expanded).toContain("final answer");
+	});
+
+	test("renders built-in subagent parallel statuses in stable order", () => {
+		const component = new ToolExecutionComponent(
+			"subagent",
+			"tool-subagent-parallel",
+			{
+				tasks: [
+					{ agent: "alpha", task: "First task" },
+					{ agent: "beta", task: "Second task" },
+				],
+			},
+			{},
+			createSubagentRenderDefinition(),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "combined" }],
+				details: {
+					mode: "parallel",
+					status: "partial",
+					summary: { total: 2, completed: 1, failed: 1, aborted: 0, maxTasks: 8, maxConcurrency: 4 },
+					tasks: [
+						{
+							index: 0,
+							subagentId: "sa_alpha",
+							sessionId: "session_alpha",
+							agent: { name: "alpha", source: "user" },
+							status: "completed",
+							usage: createSubagentUsage(),
+							output: createSubagentOutput("alpha output"),
+						},
+						{
+							index: 1,
+							subagentId: "sa_beta",
+							sessionId: "session_beta",
+							agent: { name: "beta", source: "project" },
+							status: "failed",
+							output: createSubagentOutput("beta failed"),
+							error: { message: "beta failed" },
+						},
+					],
+				} satisfies SubagentToolDetails,
+				isError: false,
+			},
+			false,
+		);
+
+		const collapsed = stripAnsi(component.render(140).join("\n"));
+		expect(collapsed).toContain("subagent parallel 1/2 completed, 1 failed");
+		expect(collapsed.indexOf("Task 1: alpha (user) completed")).toBeLessThan(
+			collapsed.indexOf("Task 2: beta (project) failed"),
+		);
+		expect(collapsed).toContain("First task");
+		expect(collapsed).toContain("Second task");
+
+		component.setExpanded(true);
+		const expanded = stripAnsi(component.render(140).join("\n"));
+		expect(expanded).toContain("alpha output");
+		expect(expanded).toContain("beta failed");
+	});
+
+	test("renders built-in subagent running progress compactly", () => {
+		const component = new ToolExecutionComponent(
+			"subagent",
+			"tool-subagent-running",
+			{
+				tasks: [
+					{ agent: "alpha", task: "First task" },
+					{ agent: "beta", task: "Second task" },
+				],
+			},
+			{},
+			createSubagentRenderDefinition(),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "Subagent parallel: 0/2 completed, 2 running" }],
+				details: {
+					mode: "parallel",
+					status: "running",
+					summary: { total: 2, completed: 0, failed: 0, aborted: 0, running: 2, maxTasks: 8, maxConcurrency: 4 },
+					tasks: [
+						{
+							index: 0,
+							subagentId: "sa_alpha",
+							sessionId: "session_alpha",
+							agent: { name: "alpha", source: "user" },
+							status: "running",
+						},
+						{
+							index: 1,
+							subagentId: "sa_beta",
+							sessionId: "session_beta",
+							agent: { name: "beta", source: "project" },
+							status: "running",
+						},
+					],
+				} satisfies SubagentToolDetails,
+				isError: false,
+			},
+			true,
+		);
+
+		const collapsed = stripAnsi(component.render(140).join("\n"));
+		expect(collapsed).toContain("subagent parallel 0/2 completed, 2 running");
+		expect(collapsed).toContain("Task 1: alpha (user) running");
+		expect(collapsed).toContain("Task 2: beta (project) running");
+		expect(collapsed).toContain("First task");
+		expect(collapsed).toContain("Second task");
+	});
+
+	test("renders built-in subagent chain steps with expanded outputs", () => {
+		const component = new ToolExecutionComponent(
+			"subagent",
+			"tool-subagent-chain",
+			{
+				chain: [
+					{ agent: "first", task: "Collect facts" },
+					{ agent: "second", task: "Use {previous} to decide" },
+				],
+			},
+			{},
+			createSubagentRenderDefinition(),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.setExpanded(true);
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "second output" }],
+				details: {
+					mode: "chain",
+					status: "completed",
+					summary: { total: 2, completed: 2, failed: 0, aborted: 0 },
+					steps: [
+						{
+							index: 0,
+							subagentId: "sa_first",
+							sessionId: "session_first",
+							agent: { name: "first", source: "user" },
+							status: "completed",
+							usage: createSubagentUsage(),
+							output: createSubagentOutput("first output"),
+						},
+						{
+							index: 1,
+							subagentId: "sa_second",
+							sessionId: "session_second",
+							agent: { name: "second", source: "user" },
+							status: "completed",
+							usage: createSubagentUsage(),
+							output: createSubagentOutput("second output"),
+						},
+					],
+				} satisfies SubagentToolDetails,
+				isError: false,
+			},
+			false,
+		);
+
+		const expanded = stripAnsi(component.render(140).join("\n"));
+		expect(expanded).toContain("subagent chain 2/2 completed");
+		expect(expanded).toContain("Step 1: first (user) completed");
+		expect(expanded).toContain("Task: Collect facts");
+		expect(expanded).toContain("first output");
+		expect(expanded).toContain("Step 2: second (user) completed");
+		expect(expanded).toContain("Task: Use {previous} to decide");
+		expect(expanded).toContain("second output");
 	});
 
 	test("falls back when custom renderers are absent", () => {

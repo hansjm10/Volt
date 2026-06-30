@@ -51,6 +51,7 @@ import {
 	type IrohRemoteWorkspace,
 	type IrohRemoteWorkspaceAvailabilityStatus,
 	isIrohRemoteRelayMode,
+	normalizeIrohRemoteAllowTools,
 	requestIrohRemoteActiveRevocation,
 	requestIrohRemotePairingTicket,
 } from "./core/remote/iroh/index.ts";
@@ -63,6 +64,7 @@ import {
 } from "./core/session-cwd.ts";
 import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
+import { SubagentManager } from "./core/subagents/index.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
@@ -104,7 +106,7 @@ function printRemoteCommandHelp(): void {
   volt remote pair [options]
   volt remote status [options]
   volt remote clients [options]
-  volt remote revoke <node-id> [options]
+  volt remote revoke <node-id>|--all [options]
   volt remote approve-repair <node-id> [options]
 
 Host options are forwarded to the integrated Iroh remote host. Common options:
@@ -140,6 +142,7 @@ Pair options:
 Client management options:
   --state <path>                Host state path
   --audit <path>                Audit JSONL path for status/revoke/approve-repair
+  --all                         Revoke every paired client (revoke command only)
 `);
 }
 
@@ -149,6 +152,10 @@ interface RemoteManagementArgs {
 	help: boolean;
 	positionals: string[];
 	statePath: string;
+}
+
+interface RemoteRevokeArgs extends RemoteManagementArgs {
+	all: boolean;
 }
 
 interface RemotePairArgs {
@@ -291,6 +298,50 @@ function parseRemoteManagementArgs(args: readonly string[]): RemoteManagementArg
 	}
 
 	return { auditPath, help: false, positionals, statePath: resolvePath(statePath) };
+}
+
+function parseRemoteRevokeArgs(args: readonly string[]): RemoteRevokeArgs {
+	const positionals: string[] = [];
+	let all = false;
+	let auditPath: string | undefined;
+	let statePath = getDefaultIrohRemoteStatePath();
+
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--help" || arg === "-h") {
+			return { all, auditPath, help: true, positionals, statePath };
+		}
+		if (arg === "--all") {
+			all = true;
+			continue;
+		}
+
+		const eqIndex = arg.indexOf("=");
+		const flag = eqIndex === -1 ? arg : arg.slice(0, eqIndex);
+		const inlineValue = eqIndex === -1 ? undefined : arg.slice(eqIndex + 1);
+		if (flag === "--state" || flag === "--audit") {
+			const value = inlineValue ?? args[index + 1];
+			if (value === undefined || value.startsWith("-")) {
+				return { all, auditPath, error: `${flag} requires a value`, help: false, positionals, statePath };
+			}
+			if (inlineValue === undefined) {
+				index++;
+			}
+			if (flag === "--state") {
+				statePath = resolvePath(value);
+			} else {
+				auditPath = resolvePath(value);
+			}
+			continue;
+		}
+
+		if (arg.startsWith("-")) {
+			return { all, auditPath, error: `Unknown remote revoke option: ${arg}`, help: false, positionals, statePath };
+		}
+		positionals.push(arg);
+	}
+
+	return { all, auditPath, help: false, positionals, statePath: resolvePath(statePath) };
 }
 
 function parseRemoteHostUnregisterArgs(args: readonly string[]): RemoteHostUnregisterArgs {
@@ -537,7 +588,9 @@ async function handleRemotePairCommand(args: readonly string[]): Promise<void> {
 		return;
 	}
 
-	const allowTools = parsed.allowTools ?? workspace.allowedTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS;
+	const allowTools = normalizeIrohRemoteAllowTools(
+		parsed.allowTools ?? workspace.allowedTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+	);
 	let unsafeApproval: IrohRemoteUnsafeApproval | undefined;
 	try {
 		unsafeApproval = await confirmUnsafeRemotePairToolGrant(allowTools, parsed.yes);
@@ -750,8 +803,53 @@ async function handleRemoteClientsCommand(args: readonly string[]): Promise<void
 	console.log(JSON.stringify(clients, null, 2));
 }
 
+async function logRemoteClientRevocation(
+	auditLogger: IrohRemoteAuditLogger,
+	nodeId: string,
+	success: boolean,
+	error?: string,
+): Promise<void> {
+	try {
+		await auditLogger.log({
+			type: "client_revoked",
+			clientNodeId: nodeId,
+			success,
+			...(error === undefined ? {} : { error }),
+		});
+	} catch {
+		// Audit logging is best-effort for local client management commands.
+	}
+}
+
+type ActiveRemoteRevocationStatus = "available" | "unavailable";
+
+async function reportActiveRemoteRevocation(statePath: string, nodeId: string): Promise<ActiveRemoteRevocationStatus> {
+	try {
+		const activeRevocation = await requestIrohRemoteActiveRevocation({
+			statePath,
+			request: {
+				type: IROH_REMOTE_REVOKE_CONTROL_REQUEST_TYPE,
+				nodeId,
+			},
+		});
+		if (activeRevocation.success && activeRevocation.closed) {
+			console.error(`Active connection revoked for ${nodeId}`);
+		} else if (activeRevocation.success) {
+			console.error(`No active live connection found for ${nodeId}`);
+		} else {
+			console.error(`Active live revocation unavailable for ${nodeId}: ${activeRevocation.error}`);
+		}
+		return "available";
+	} catch (error) {
+		console.error(
+			`Active live revocation unavailable for ${nodeId}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return "unavailable";
+	}
+}
+
 async function handleRemoteRevokeCommand(args: readonly string[]): Promise<void> {
-	const parsed = parseRemoteManagementArgs(args);
+	const parsed = parseRemoteRevokeArgs(args);
 	if (parsed.help) {
 		printRemoteCommandHelp();
 		return;
@@ -759,6 +857,50 @@ async function handleRemoteRevokeCommand(args: readonly string[]): Promise<void>
 	if (parsed.error) {
 		console.error(chalk.red(`Error: ${parsed.error}`));
 		process.exitCode = 1;
+		return;
+	}
+
+	const stateManager = new IrohRemoteHostStateManager({ statePath: parsed.statePath });
+	const auditLogger = new IrohRemoteAuditLogger({
+		path: parsed.auditPath ?? getDefaultIrohRemoteAuditPath(parsed.statePath),
+	});
+
+	if (parsed.all) {
+		if (parsed.positionals.length > 0) {
+			console.error(chalk.red(`Error: Unexpected remote revoke argument: ${parsed.positionals[0]}`));
+			process.exitCode = 1;
+			return;
+		}
+
+		const clients = await stateManager.listClients();
+		if (clients.length === 0) {
+			console.error("No paired clients to revoke");
+			return;
+		}
+
+		const revokedNodeIds: string[] = [];
+		const revokedAt = Date.now();
+		for (const client of clients) {
+			const result = await stateManager.revokeClient(client.nodeId, revokedAt);
+			await logRemoteClientRevocation(
+				auditLogger,
+				client.nodeId,
+				result.revoked,
+				result.revoked ? undefined : "client not found",
+			);
+			if (result.revoked) {
+				revokedNodeIds.push(client.nodeId);
+			}
+		}
+
+		for (const nodeId of revokedNodeIds) {
+			const activeStatus = await reportActiveRemoteRevocation(parsed.statePath, nodeId);
+			if (activeStatus === "unavailable") {
+				break;
+			}
+		}
+
+		console.error(`Revoked ${revokedNodeIds.length} client${revokedNodeIds.length === 1 ? "" : "s"}`);
 		return;
 	}
 
@@ -774,21 +916,13 @@ async function handleRemoteRevokeCommand(args: readonly string[]): Promise<void>
 		return;
 	}
 
-	const stateManager = new IrohRemoteHostStateManager({ statePath: parsed.statePath });
 	const result = await stateManager.revokeClient(nodeId);
-	const auditLogger = new IrohRemoteAuditLogger({
-		path: parsed.auditPath ?? getDefaultIrohRemoteAuditPath(parsed.statePath),
-	});
-	try {
-		await auditLogger.log({
-			type: "client_revoked",
-			clientNodeId: nodeId,
-			success: result.revoked,
-			error: result.revoked ? undefined : "client not found",
-		});
-	} catch {
-		// Audit logging is best-effort for local client management commands.
-	}
+	await logRemoteClientRevocation(
+		auditLogger,
+		nodeId,
+		result.revoked,
+		result.revoked ? undefined : "client not found",
+	);
 
 	if (!result.revoked) {
 		console.error(chalk.red(`Error: No client found for ${nodeId}`));
@@ -796,26 +930,7 @@ async function handleRemoteRevokeCommand(args: readonly string[]): Promise<void>
 		return;
 	}
 
-	try {
-		const activeRevocation = await requestIrohRemoteActiveRevocation({
-			statePath: parsed.statePath,
-			request: {
-				type: IROH_REMOTE_REVOKE_CONTROL_REQUEST_TYPE,
-				nodeId,
-			},
-		});
-		if (activeRevocation.success && activeRevocation.closed) {
-			console.error(`Active connection revoked for ${nodeId}`);
-		} else if (activeRevocation.success) {
-			console.error(`No active live connection found for ${nodeId}`);
-		} else {
-			console.error(`Active live revocation unavailable for ${nodeId}: ${activeRevocation.error}`);
-		}
-	} catch (error) {
-		console.error(
-			`Active live revocation unavailable for ${nodeId}: ${error instanceof Error ? error.message : String(error)}`,
-		);
-	}
+	await reportActiveRemoteRevocation(parsed.statePath, nodeId);
 	console.error(`Revoked ${nodeId}`);
 }
 
@@ -1665,6 +1780,12 @@ export async function main(args: string[], options?: MainOptions) {
 			}
 		}
 
+		const subagentManager = new SubagentManager({
+			createRuntime,
+			cwd,
+			agentDir,
+			resourceLoader,
+		});
 		const created = await createAgentSessionFromServices({
 			services,
 			sessionManager,
@@ -1677,6 +1798,7 @@ export async function main(args: string[], options?: MainOptions) {
 			excludeTools: sessionOptions.excludeTools,
 			noTools: sessionOptions.noTools,
 			customTools: sessionOptions.customTools,
+			subagentToolManager: subagentManager,
 		});
 		const cliThinkingOverride = parsed.thinking !== undefined || cliThinkingFromModel;
 		if (created.session.model && cliThinkingOverride) {

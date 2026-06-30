@@ -140,6 +140,7 @@ export {
 	isIrohRemoteHostHandshakeFailureOutcome,
 	isIrohRemoteOutcome,
 	isIrohRemoteRelayMode,
+	normalizeIrohRemoteAllowTools,
 	parseIrohRemoteAllowTools,
 	usesDefaultIrohRemoteAllowTools,
 } from "./protocol.ts";

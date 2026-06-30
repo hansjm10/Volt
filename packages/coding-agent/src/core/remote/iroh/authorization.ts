@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import type { IrohRemoteHello } from "./handshake.ts";
-import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS, type IrohRemoteHostHandshakeFailureOutcome } from "./protocol.ts";
+import {
+	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+	type IrohRemoteHostHandshakeFailureOutcome,
+	normalizeIrohRemoteAllowTools,
+} from "./protocol.ts";
 import type {
 	IrohRemoteClient,
 	IrohRemoteHostState,
@@ -207,7 +211,9 @@ export function authorizeIrohRemoteClient(
 				pairingSecretExpired: false,
 			};
 		}
-		const allowedTools = matchingPendingPairingTicket?.allowedTools ?? options.allowTools;
+		const allowedTools = normalizeIrohRemoteAllowTools(
+			matchingPendingPairingTicket?.allowedTools ?? options.allowTools,
+		);
 		const allowedWorkspace = matchingPendingPairingTicket?.workspace ?? workspace.name;
 		const ticketExpiresAt = matchingPendingPairingTicket?.expiresAt ?? options.pairingExpiresAt;
 		const client: IrohRemoteClient = {
@@ -257,7 +263,9 @@ export function authorizeIrohRemoteClient(
 		};
 	}
 
-	const persistedAllowedTools = existingClient.allowedTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS;
+	const persistedAllowedTools = normalizeIrohRemoteAllowTools(
+		existingClient.allowedTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+	);
 	existingClient.lastSeenAt = now;
 	existingClient.allowedTools = persistedAllowedTools;
 	if (hello.clientLabel) {

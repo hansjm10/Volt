@@ -181,6 +181,79 @@ session = runtime.session;
 unsubscribe = session.subscribe(() => {});
 ```
 
+### SubagentManager
+
+`SubagentManager` starts isolated child runtimes through the same runtime factory used by `AgentSessionRuntime`. Named starts use definitions from `ResourceLoader.getSubagents()`; project definitions are present only when project trust is active.
+
+```typescript
+import {
+  type CreateAgentSessionRuntimeFactory,
+  createAgentSession,
+  createAgentSessionFromServices,
+  createAgentSessionServices,
+  getAgentDir,
+  SubagentManager,
+} from "@earendil-works/volt-coding-agent";
+
+const cwd = process.cwd();
+const agentDir = getAgentDir();
+
+const parentServices = await createAgentSessionServices({ cwd, agentDir });
+const childAllowedTools = ["read", "grep", "find", "ls"];
+
+const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {
+  const services = await createAgentSessionServices({ cwd, agentDir });
+  return {
+    ...(await createAgentSessionFromServices({
+      services,
+      sessionManager,
+      sessionStartEvent,
+      tools: childAllowedTools,
+    })),
+    services,
+    diagnostics: services.diagnostics,
+  };
+};
+
+const subagents = new SubagentManager({
+  createRuntime,
+  cwd,
+  agentDir,
+  resourceLoader: parentServices.resourceLoader,
+  allowedTools: childAllowedTools,
+});
+
+const handle = await subagents.startByName("scout");
+try {
+  const done = handle.waitForEnd();
+  await handle.prompt("Find the auth entry points");
+  const result = await done;
+  const transcript = await handle.getTranscript();
+  console.log(result.sessionId, transcript.items.at(-1));
+} finally {
+  await handle.dispose();
+}
+```
+
+To expose the built-in `subagent` tool in an SDK-created parent session, pass the manager as `subagentToolManager`. It is active by default when no explicit tool allowlist is provided:
+
+```typescript
+const { session } = await createAgentSession({
+  subagentToolManager: subagents,
+});
+```
+
+If you pass `tools`, the allowlist remains strict and must include `subagent` when delegation should stay available:
+
+```typescript
+const { session } = await createAgentSession({
+  tools: ["subagent", "read", "grep", "find", "ls"],
+  subagentToolManager: subagents,
+});
+```
+
+The built-in tool supports single `{ agent: string, task: string }`, parallel `{ tasks: Array<{ agent: string, task: string }> }`, and chain `{ chain: Array<{ agent: string, task: string }> }` calls. Parallel mode is capped at 8 tasks with max concurrency 4, keeps result ordering stable, and returns mixed-status details for partial failures. Chain mode runs sequentially, replaces `{previous}` with the prior successful step output, returns the final successful step output on full success, and stops at the first failed step. It caps model-visible child output at 50 KB per task/step and stores subagent ID, session ID, source, status, usage, truncation, and error metadata in tool details.
+
 ### Prompting and Message Queueing
 
 `PromptOptions` controls prompt expansion, queueing behavior while streaming, and prompt preflight notifications:
@@ -468,10 +541,10 @@ const { session } = await createAgentSession({ resourceLoader: loader });
 
 Specify which built-in tools to enable:
 
-- Built-in tool names: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`
-- Default built-ins: `read`, `bash`, `edit`, `write`
+- Built-in tool names: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `subagent`
+- Default built-ins: `read`, `bash`, `edit`, `write`, and `subagent` when `subagentToolManager` is supplied
 - `noTools: "all"` disables all tools
-- `noTools: "builtin"` disables default built-ins while keeping extension and custom tools enabled
+- `noTools: "builtin"` disables default built-ins, including `subagent`, while keeping extension and custom tools enabled
 - `excludeTools` disables specific built-in, extension, or custom tool names after any `tools` allowlist is applied
 
 The `edit` tool returns `details.diff` for Volt's TUI display and `details.patch` as a standard unified patch for SDK consumers.
@@ -848,6 +921,7 @@ const extensions = loader.getExtensions();
 const skills = loader.getSkills();
 const prompts = loader.getPrompts();
 const themes = loader.getThemes();
+const subagents = loader.getSubagents();
 const contextFiles = loader.getAgentsFiles().agentsFiles;
 ```
 
@@ -1134,6 +1208,7 @@ The main entry point exports:
 createAgentSession
 createAgentSessionRuntime
 AgentSessionRuntime
+SubagentManager
 
 // RPC clients and transports
 RpcClient
@@ -1167,7 +1242,7 @@ SettingsManager
 createCodingTools
 createReadOnlyTools
 createReadTool, createBashTool, createEditTool, createWriteTool
-createGrepTool, createFindTool, createLsTool
+createGrepTool, createFindTool, createLsTool, createSubagentTool
 
 // Types
 type CreateAgentSessionOptions

@@ -32,6 +32,8 @@ export {
 	type RpcClientOptions,
 	type RpcEventListener,
 	type RpcExtensionErrorEvent,
+	type RpcSubagentEndEvent,
+	type RpcSubagentEvent,
 } from "./rpc/rpc-client.ts";
 export { type RpcModeOptions, type RpcSessionChange, runRpcMode } from "./rpc/rpc-mode.ts";
 export { RpcTransportClient, type RpcTransportClientOptions } from "./rpc/rpc-transport-client.ts";
@@ -45,6 +47,7 @@ export type {
 	RpcHostActionRequest,
 	RpcHostActionResponse,
 	RpcHostActionUpdate,
+	RpcListSubagentsResponse,
 	RpcLiveActivityRegistration,
 	RpcPendingHostActionsResponse,
 	RpcPushPlatform,
@@ -54,6 +57,10 @@ export type {
 	RpcResponse,
 	RpcSessionListItem,
 	RpcSessionState,
+	RpcSubagentDefinition,
+	RpcSubagentDefinitionSource,
+	RpcSubagentSourceInfo,
+	RpcSubagentStartResponse,
 	RpcTranscriptItem,
 	RpcTranscriptResponse,
 	RpcTranscriptToolStatus,

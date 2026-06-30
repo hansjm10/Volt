@@ -59,6 +59,18 @@ describe("buildSystemPrompt", () => {
 				"- When reading volt docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
 			);
 		});
+
+		test("discourages source-text tests for ordinary behavior", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain(
+				"Write tests against observable behavior and public contracts, not implementation text",
+			);
+		});
 	});
 
 	describe("custom tool snippets", () => {

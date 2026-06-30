@@ -5,6 +5,14 @@
 ### Added
 
 - Added a built-in `web_search` tool, enabled by default across SDK, CLI/RPC, and Iroh remote sessions. It uses the OpenAI/Codex search backend for authenticated OpenAI models, supports a custom Volt JSON endpoint via `VOLT_WEB_SEARCH_URL`, and falls back to Brave Search via `BRAVE_SEARCH_API_KEY`.
+- Added core subagent definition parsing, trusted user/project discovery plumbing, ResourceLoader exposure, and a local in-process SubagentManager skeleton.
+- Added definition-backed `SubagentManager.startByName()` support that applies discovered subagent prompts, tool policy intersections, model selection, and thinking levels to child runtimes.
+- Added a built-in `subagent` tool for MVP single-task, parallel, and chain delegation to discovered child agents, with bounded per-task/step model-visible output and child metadata details.
+- Added a built-in `general` subagent for ad hoc delegated tasks when no user or project subagent definition exists.
+- Added custom interactive rendering for built-in `subagent` tool calls and single/parallel/chain results.
+- Added live progress partial updates for built-in `subagent` tool single, parallel, and chain delegation.
+- Added local RPC subagent lifecycle commands for listing, starting, observing, aborting, inspecting, and disposing definition-backed child agents.
+- Added MVP subagent usage and SDK documentation covering definition discovery, project trust, explicit tool enablement, child isolation, and output limits.
 - Added active tool executions to RPC `get_state` responses so remote clients can restore in-flight tool cards after reconnecting.
 - Added host-initiated RPC action requests so clients can approve blocking host workflows; missing trusted LSP server binaries can now prompt for installation, run the host-owned install command, and retry diagnostics.
 - Added Pi extension package compatibility: `volt install` now reads `pi` manifests when no `volt` manifest is present and aliases Pi core imports to Volt modules at extension load time.
@@ -31,7 +39,7 @@
 - Added typed core Iroh remote helpers for tickets, handshakes, host state, client authorization, workspaces, remote RPC command filtering, and an in-process Iroh remote RPC mode wrapper.
 - Added typed Iroh remote host/client engines with bounded handshake reads, host state management, audit logging, and pair/list/revoke operations.
 - Added default JSONL audit logging to the Iroh remote host for pairing, authorization, rejection, revocation, connection lifecycle, and integrated runtime startup failures.
-- Added `volt remote clients` and `volt remote revoke <node-id>` for managing paired Iroh remote clients from the main CLI.
+- Added `volt remote clients`, `volt remote revoke <node-id>`, and `volt remote revoke --all` for managing paired Iroh remote clients from the main CLI.
 - Added `volt remote pair` to request first-class pairing tickets from a running Iroh remote host control channel.
 - Added `volt remote status` for deterministic persisted Iroh remote host state inspection without printing secrets or secret hashes.
 - Added Iroh remote protocol v1 documentation and compatibility vectors for tickets, handshakes, LF JSONL framing, command filtering, and outbound redaction.
@@ -49,6 +57,7 @@
 
 ### Fixed
 
+- Fixed legacy Iroh remote default tool grants so saved workspaces, clients, and pairing tickets are upgraded to include the built-in `subagent` tool.
 - Fixed `get_ui_actions` palette scope responses so they return only palette descriptors instead of all actions.
 - Fixed `volt remote host` source entrypoint startup by exporting the Iroh remote workspace unregister RPC helpers from the package root, and added a source export check to keep the host entrypoint imports in sync.
 - Fixed `volt remote host` source entrypoint startup by exporting the Iroh remote RPC tool-argument helper from the package root.
@@ -90,6 +99,8 @@
 
 ### Changed
 
+- Changed the built-in `subagent` tool to be active by default when a subagent manager is available, including the default remote tool grant, while preserving explicit tool allowlists and opt-outs.
+- Changed the default coding-agent prompt to discourage source-text assertions for ordinary behavior tests.
 - Changed `volt remote host` to default to Iroh relay/discovery mode `default`, keeping saved-host reconnect tickets usable across host restarts unless `--relay disabled` is explicitly passed.
 - Changed Iroh remote host startup and workspace registration prompts to offer a `trust` choice for project-local workspace resources, with saved workspace trust honored by remote sessions.
 - Changed Iroh remote host startup to require TTY confirmation or `--yes` before granting unsafe remote tools (`bash`, `edit`, or `write`) and to audit accepted unsafe grants.

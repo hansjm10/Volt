@@ -41,6 +41,7 @@ import {
 	runReviewWorkflow,
 } from "../../core/review.ts";
 import type { RpcTransport } from "../../core/rpc/transport.ts";
+import type { SubagentDefinition, SubagentHandle } from "../../core/subagents/index.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
@@ -49,6 +50,7 @@ import {
 	getRpcErrorResponseTarget,
 	HOST_ACTION_REQUESTS_CAPABILITY,
 	handleRpcCommand,
+	type RpcSubagentLifecycleController,
 } from "./rpc-command-dispatcher.ts";
 import { validateRpcCommandPayload } from "./rpc-command-validation.ts";
 import type {
@@ -59,8 +61,13 @@ import type {
 	RpcHostActionRequest,
 	RpcHostActionResponse,
 	RpcHostActionUpdate,
+	RpcListSubagentsResponse,
 	RpcRegisterPushTargetResponse,
 	RpcResponse,
+	RpcSessionState,
+	RpcSubagentDefinition,
+	RpcSubagentStartResponse,
+	RpcTranscriptResponse,
 } from "./rpc-types.ts";
 
 // Re-export types for consumers
@@ -72,6 +79,7 @@ export type {
 	RpcHostActionRequest,
 	RpcHostActionResponse,
 	RpcHostActionUpdate,
+	RpcListSubagentsResponse,
 	RpcLiveActivityRegistration,
 	RpcPendingHostActionsResponse,
 	RpcPushPlatform,
@@ -80,6 +88,10 @@ export type {
 	RpcRegisterPushTargetResponse,
 	RpcResponse,
 	RpcSessionState,
+	RpcSubagentDefinition,
+	RpcSubagentDefinitionSource,
+	RpcSubagentSourceInfo,
+	RpcSubagentStartResponse,
 	RpcWorkflowEvent,
 	RpcWorkflowKind,
 	RpcWorkflowStatus,
@@ -300,6 +312,134 @@ function getRpcHostActionBridge(runtimeHost: AgentSessionRuntime): RpcHostAction
 	return bridge;
 }
 
+interface RpcSubagentEntry {
+	handle: SubagentHandle;
+	unsubscribe: () => void;
+	disposed: boolean;
+}
+
+function toRpcSubagentDefinition(definition: SubagentDefinition): RpcSubagentDefinition {
+	return {
+		name: definition.name,
+		description: definition.description,
+		source: definition.source,
+		sourceInfo: {
+			source: definition.sourceInfo.source,
+			scope: definition.sourceInfo.scope,
+			origin: definition.sourceInfo.origin,
+		},
+		...(definition.tools ? { tools: definition.tools } : {}),
+		...(definition.model ? { model: definition.model } : {}),
+		...(definition.thinking ? { thinking: definition.thinking } : {}),
+	};
+}
+
+class RpcSubagentLifecycle implements RpcSubagentLifecycleController {
+	private readonly getSession: () => AgentSession;
+	private readonly output: (event: object) => void;
+	private readonly active = new Map<string, RpcSubagentEntry>();
+
+	constructor(options: { getSession: () => AgentSession; output: (event: object) => void }) {
+		this.getSession = options.getSession;
+		this.output = options.output;
+	}
+
+	list(): RpcListSubagentsResponse {
+		return {
+			subagents: this.getSession().resourceLoader.getSubagents().definitions.map(toRpcSubagentDefinition),
+		};
+	}
+
+	async start(agent: string, prompt: string): Promise<RpcSubagentStartResponse> {
+		const session = this.getSession();
+		const manager = session.getSubagentToolManager();
+		if (!manager) {
+			throw new Error("Subagent manager is not available");
+		}
+
+		const handle = await manager.startByName(agent, { allowedTools: session.getActiveToolNames() });
+		let entry: RpcSubagentEntry | undefined;
+		const unsubscribe = handle.onEvent((event) => {
+			if (entry?.disposed) {
+				return;
+			}
+			this.output({ type: "subagent_event", subagentId: handle.id, event });
+		});
+		entry = { handle, unsubscribe, disposed: false };
+		this.active.set(handle.id, entry);
+		void handle.waitForEnd().then(
+			(result) => {
+				if (!entry?.disposed) {
+					this.output({ type: "subagent_end", subagentId: handle.id, result });
+				}
+			},
+			() => undefined,
+		);
+
+		try {
+			await handle.prompt(prompt);
+		} catch (error) {
+			await this.disposeEntry(handle.id, entry).catch(() => undefined);
+			throw error;
+		}
+
+		return { subagentId: handle.id, sessionId: handle.sessionId };
+	}
+
+	async abort(subagentId: string): Promise<void> {
+		const entry = this.getEntry(subagentId);
+		try {
+			await entry.handle.abort();
+		} finally {
+			await this.disposeEntry(subagentId, entry);
+		}
+	}
+
+	async getState(subagentId: string): Promise<RpcSessionState> {
+		return this.getEntry(subagentId).handle.getState();
+	}
+
+	async getTranscript(options: {
+		subagentId: string;
+		limit?: number;
+		beforeEntryId?: string;
+	}): Promise<RpcTranscriptResponse> {
+		return this.getEntry(options.subagentId).handle.getTranscript({
+			limit: options.limit,
+			beforeEntryId: options.beforeEntryId,
+		});
+	}
+
+	async dispose(subagentId: string): Promise<void> {
+		await this.disposeEntry(subagentId, this.getEntry(subagentId));
+	}
+
+	async disposeAll(): Promise<void> {
+		const entries = Array.from(this.active.entries());
+		await Promise.all(
+			entries.map(([subagentId, entry]) => this.disposeEntry(subagentId, entry).catch(() => undefined)),
+		);
+	}
+
+	private getEntry(subagentId: string): RpcSubagentEntry {
+		const entry = this.active.get(subagentId);
+		if (!entry || entry.disposed) {
+			throw new Error(`Subagent ${subagentId} is not active`);
+		}
+		return entry;
+	}
+
+	private async disposeEntry(subagentId: string, entry: RpcSubagentEntry): Promise<void> {
+		if (entry.disposed) {
+			return;
+		}
+		entry.disposed = true;
+		this.active.delete(subagentId);
+		entry.unsubscribe();
+		await entry.handle.dispose();
+	}
+}
+
 /**
  * Run in RPC mode.
  * Listens for JSON commands from the transport, outputs events and responses to it.
@@ -388,6 +528,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			requestTransportFailureShutdown(writeError);
 		}
 	};
+	const rpcSubagents = new RpcSubagentLifecycle({ getSession: () => session, output });
 
 	// Pending extension UI requests waiting for response
 	const pendingExtensionRequests = new Map<
@@ -671,6 +812,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	};
 
 	const rebindSession = async (): Promise<void> => {
+		await rpcSubagents.disposeAll();
 		session = runtimeHost.session;
 		if (shuttingDown) {
 			await notifySessionChanged();
@@ -795,6 +937,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		},
 		getPendingHostActionRequests: () => hostActionBridge.getPendingRequests(),
 		cancelPendingHostActionRequests,
+		subagents: rpcSubagents,
 	});
 
 	let detachInput = () => {};
@@ -828,6 +971,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		try {
 			cancelPendingExtensionRequests();
 			detachHostActionBridge();
+			await rpcSubagents.disposeAll();
 			if (shouldDisposeRuntimeOnClose) {
 				cancelPendingHostActionRequests();
 			}
@@ -895,6 +1039,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 					}
 					unsubscribe?.();
 					unsubscribeBackpressure?.();
+					await rpcSubagents.disposeAll();
 					if (shouldDisposeRuntimeOnClose) {
 						await runtimeHost.dispose();
 					}

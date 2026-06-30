@@ -531,13 +531,14 @@ Management commands:
 ```bash
 volt remote status                         # persisted state, workspaces, clients, tools, state/audit paths
 volt remote clients                        # paired client JSON
-volt remote revoke <node-id>               # revoke future access and close active connections when the host is live
+volt remote revoke <node-id>               # revoke one client and close active connections when the host is live
+volt remote revoke --all                   # revoke every paired client
 volt remote host --workspace volt=/path/to/repo --no-pairing
 ```
 
 Security defaults and limitations:
 
-- The default remote tool grant enables built-in `read,bash,edit,write,grep,find,ls` plus active tools registered by loaded extensions. Custom grants that differ from the default built-in list are strict; name extension tools explicitly when using one.
+- The default remote tool grant enables built-in `read,bash,edit,write,grep,find,ls,subagent` plus active tools registered by loaded extensions. Custom grants that differ from the default built-in list are strict; name extension tools explicitly when using one. The `subagent` tool only starts built-in or discovered named definitions, and child tools are clamped by the remote session's active tool grant.
 - Granting `bash`, `edit`, or `write` can modify the host or run shell commands. Extension tools run code installed on the host and may do the same. TTY host startup asks for confirmation and offers `trust` to continue while trusting workspace resources; noninteractive unsafe grants require `--yes`.
 - Pairing tickets are short-lived, one-time credentials. `volt remote host` shows the startup ticket as a terminal QR code by default when stderr is a TTY. `volt remote pair` requires a running host control channel; it does not generate offline tickets from persisted state.
 - Remote workspaces are selected by saved name, not arbitrary client-provided paths.

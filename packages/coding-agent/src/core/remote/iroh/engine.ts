@@ -33,6 +33,7 @@ import {
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_HOST_FEATURES,
 	type IrohRemoteRelayMode,
+	normalizeIrohRemoteAllowTools,
 } from "./protocol.ts";
 import {
 	type IrohRemoteClient,
@@ -180,7 +181,7 @@ export class IrohRemoteHostEngine {
 	private pairingWorkspaceName: string | undefined;
 
 	constructor(options: IrohRemoteHostEngineOptions) {
-		this.allowTools = options.allowTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS;
+		this.allowTools = normalizeIrohRemoteAllowTools(options.allowTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
 		this.auditLogger = options.auditLogger ?? new IrohRemoteAuditLogger();
 		this.classifyWorkspaceAvailability = options.classifyWorkspaceAvailability;
 		this.hostNodeId = options.hostNodeId;
@@ -202,7 +203,9 @@ export class IrohRemoteHostEngine {
 			const createdAt = this.now();
 			const expiresAt =
 				options.expiresAt ?? createdAt + (options.ttlMs ?? DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS);
-			const allowTools = options.allowTools ?? workspace.allowedTools ?? this.allowTools;
+			const allowTools = normalizeIrohRemoteAllowTools(
+				options.allowTools ?? workspace.allowedTools ?? this.allowTools,
+			);
 			this.pairingAllowTools = allowTools;
 			this.pairingSecret = secret;
 			this.pairingExpiresAt = expiresAt;
@@ -313,10 +316,11 @@ export class IrohRemoteHostEngine {
 		remoteNodeId: string,
 	): Promise<IrohRemoteClientAuthorizationResult> {
 		await this.ensureRuntimePairingWorkspaceRegistered();
-		const allowTools =
+		const allowTools = normalizeIrohRemoteAllowTools(
 			this.pairingSecret !== undefined && hello.secret === this.pairingSecret
 				? (this.pairingAllowTools ?? this.allowTools)
-				: this.allowTools;
+				: this.allowTools,
+		);
 		const result = await this.stateManager.authorizeClient(hello, remoteNodeId, {
 			allowTools,
 			classifyWorkspaceAvailability: this.classifyWorkspaceAvailability,
@@ -403,7 +407,7 @@ export class IrohRemoteHostEngine {
 	}
 
 	setAllowTools(allowTools: string): void {
-		this.allowTools = allowTools;
+		this.allowTools = normalizeIrohRemoteAllowTools(allowTools);
 	}
 
 	clearPairingSecretForWorkspace(workspaceName: string): boolean {

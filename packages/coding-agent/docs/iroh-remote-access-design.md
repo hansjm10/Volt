@@ -161,7 +161,7 @@ Required controls for preview:
 Default tool grant:
 
 ```bash
-volt remote host --workspace volt=. --allow-tools read,bash,edit,write,grep,find,ls
+volt remote host --workspace volt=. --allow-tools read,bash,edit,write,grep,find,ls,subagent
 ```
 
 The default grant includes write, shell, and active extension tools, and the write/shell tools require explicit host approval. TTY host and pair commands prompt before accepting `bash`, `edit`, or `write`; noninteractive flows must pass `--yes`:
@@ -189,7 +189,7 @@ Suggested shape:
     {
       "nodeId": "<client-node-id>",
       "label": "Jordan iPhone",
-      "allowedTools": "read,bash,edit,write,grep,find,ls",
+      "allowedTools": "read,bash,edit,write,grep,find,ls,subagent",
       "lastSessionIdByWorkspace": {
         "volt": "<session-id>"
       }
@@ -220,6 +220,7 @@ volt remote pair --workspace volt
 volt remote status
 volt remote clients
 volt remote revoke <node-id>
+volt remote revoke --all
 volt remote host --register-workspace app=<workspace-dir>
 volt remote host --unregister-workspace app
 
@@ -320,7 +321,7 @@ These are outside the host preview support boundary:
 
 Resolved preview decisions:
 
-- Remote clients use the default built-in tool grant (`read,bash,edit,write,grep,find,ls`) plus active extension tools unless configured otherwise, and keep their pair-time built-in tool grant on reconnect.
+- Remote clients use the default built-in tool grant (`read,bash,edit,write,grep,find,ls,subagent`) plus active extension tools unless configured otherwise, and keep their pair-time built-in tool grant on reconnect.
 - Remote outbound state/events normalize workspace paths to `/workspace`, keep generic host paths intact, and only use dedicated redaction for host-only session, export, and bash-output paths.
 - Pairing is workstation-scoped by host state file; clients select registered workspace names and cannot request arbitrary host paths.
 - Mobile-facing host startup skips startup pairing; Pair Phone is the explicit `volt remote pair` path.

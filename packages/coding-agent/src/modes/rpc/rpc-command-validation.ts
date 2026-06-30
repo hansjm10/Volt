@@ -170,6 +170,21 @@ export function validateRpcCommandPayload(value: unknown): string | undefined {
 				validateOptionalField(value, "beforeEntryId", isString, "a string") ??
 				validateOptionalField(value, "limit", isNumber, "a number")
 			);
+		case "subagent_start":
+			return (
+				validateRequiredField(value, "agent", isString, "a string") ??
+				validateRequiredField(value, "prompt", isString, "a string")
+			);
+		case "subagent_abort":
+		case "subagent_get_state":
+		case "subagent_dispose":
+			return validateRequiredField(value, "subagentId", isString, "a string");
+		case "subagent_get_transcript":
+			return (
+				validateRequiredField(value, "subagentId", isString, "a string") ??
+				validateOptionalField(value, "beforeEntryId", isString, "a string") ??
+				validateOptionalField(value, "limit", isNumber, "a number")
+			);
 		case "set_model":
 			return (
 				validateRequiredField(value, "provider", isString, "a string") ??

@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 import {
+	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 	getIrohRemoteControlPath,
 	IROH_REMOTE_PAIR_CONTROL_RESPONSE_TYPE,
 	IROH_REMOTE_REVOKE_CONTROL_RESPONSE_TYPE,
@@ -92,7 +93,9 @@ describe("remote CLI", () => {
 		const helpText = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
 		expect(helpText).toContain("volt remote pair [options]");
 		expect(helpText).toContain("volt remote status [options]");
+		expect(helpText).toContain("volt remote revoke <node-id>|--all [options]");
 		expect(helpText).toContain("volt remote approve-repair <node-id> [options]");
+		expect(helpText).toContain("--all");
 		expect(helpText).toContain("--register-workspace");
 		expect(helpText).toContain("--unregister-workspace");
 		expect(helpText).toContain("web_search can make network requests with host credentials");
@@ -415,6 +418,45 @@ describe("remote CLI", () => {
 			relayMode: "disabled",
 		});
 		expect(logSpy.mock.calls.map(([message]) => String(message))).toEqual(["volt+iroh://v1/mock-ticket"]);
+		expect(errorSpy).not.toHaveBeenCalled();
+		expect(process.exitCode).toBeUndefined();
+	});
+
+	it("upgrades legacy default remote pair tool grants to include subagent", async () => {
+		const statePath = join(tempDir, "host.json");
+		await writeIrohRemoteHostState(statePath, {
+			hostSecretKey: undefined,
+			workspaces: [{ name: "project", path: projectDir, allowedTools: "read,bash,edit,write,grep,find,ls" }],
+			clients: [],
+		});
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		let requestBody: Record<string, unknown> | undefined;
+
+		await withMockPairControlServer(
+			statePath,
+			(request) => {
+				requestBody = request;
+				return {
+					type: IROH_REMOTE_PAIR_CONTROL_RESPONSE_TYPE,
+					success: true,
+					expiresAt: 125,
+					ticket: "volt+iroh://v1/default-ticket",
+				};
+			},
+			async () => {
+				await expect(
+					main(["remote", "pair", "--state", statePath, "--workspace", "project", "--yes"]),
+				).resolves.toBeUndefined();
+			},
+		);
+
+		expect(requestBody).toMatchObject({
+			allowTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+			unsafeApproval: "yes_flag",
+			workspace: "project",
+		});
+		expect(logSpy.mock.calls.map(([message]) => String(message))).toEqual(["volt+iroh://v1/default-ticket"]);
 		expect(errorSpy).not.toHaveBeenCalled();
 		expect(process.exitCode).toBeUndefined();
 	});
@@ -762,6 +804,91 @@ describe("remote CLI", () => {
 			clientNodeId: "client-node",
 			success: true,
 		});
+		expect(process.exitCode).toBeUndefined();
+	});
+
+	it("revokes all paired Iroh clients", async () => {
+		const statePath = join(tempDir, "host.json");
+		const auditPath = join(tempDir, "host.audit.jsonl");
+		await writeIrohRemoteHostState(statePath, {
+			hostSecretKey: undefined,
+			workspaces: [{ name: "project", path: projectDir, allowedTools: "read" }],
+			clients: [
+				{
+					nodeId: "client-a",
+					label: "phone a",
+					allowedWorkspaces: ["project"],
+					allowedTools: "read",
+					pairedAt: 10,
+					lastSeenAt: 20,
+				},
+				{
+					nodeId: "client-b",
+					label: "phone b",
+					allowedWorkspaces: ["project"],
+					allowedTools: "read,grep",
+					pairedAt: 11,
+					lastSeenAt: 21,
+				},
+			],
+			revokedClients: [
+				{
+					nodeId: "old-client",
+					label: "old phone",
+					allowedWorkspaces: ["project"],
+					allowedTools: "read",
+					pairedAt: 1,
+					lastSeenAt: 2,
+					revokedAt: 3,
+				},
+			],
+		});
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const requestBodies: Record<string, unknown>[] = [];
+
+		await withMockPairControlServer(
+			statePath,
+			(request) => {
+				requestBodies.push(request);
+				return {
+					type: IROH_REMOTE_REVOKE_CONTROL_RESPONSE_TYPE,
+					success: true,
+					closed: true,
+					closedCount: 1,
+				};
+			},
+			async () => {
+				await expect(
+					main(["remote", "revoke", "--all", "--state", statePath, "--audit", auditPath]),
+				).resolves.toBeUndefined();
+			},
+		);
+
+		expect(requestBodies).toEqual([
+			{ type: "volt_iroh_revoke_request", nodeId: "client-a" },
+			{ type: "volt_iroh_revoke_request", nodeId: "client-b" },
+		]);
+		const savedState = await readIrohRemoteHostState(statePath);
+		expect(savedState.clients).toEqual([]);
+		expect(savedState.revokedClients?.map((client) => client.nodeId).sort()).toEqual([
+			"client-a",
+			"client-b",
+			"old-client",
+		]);
+		expect(logSpy).not.toHaveBeenCalled();
+		const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
+		expect(stderr).toContain("Active connection revoked for client-a");
+		expect(stderr).toContain("Active connection revoked for client-b");
+		expect(stderr).toContain("Revoked 2 clients");
+		const auditEvents = readFileSync(auditPath, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		expect(auditEvents).toEqual([
+			expect.objectContaining({ type: "client_revoked", clientNodeId: "client-a", success: true }),
+			expect.objectContaining({ type: "client_revoked", clientNodeId: "client-b", success: true }),
+		]);
 		expect(process.exitCode).toBeUndefined();
 	});
 

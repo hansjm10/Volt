@@ -16,6 +16,10 @@ const SUMMARY_TEXT_LIMIT = 1_000;
 const TOOL_SUMMARY_LIMIT = 1_000;
 const TOOL_COMMAND_LIMIT = 500;
 const MUTATION_PREVIEW_LIMIT = 4_000;
+const SUBAGENT_AGENT_LIMIT = 200;
+const SUBAGENT_TASK_LIMIT = 1_000;
+const SUBAGENT_ERROR_LIMIT = 1_000;
+const SUBAGENT_OUTPUT_LIMIT = 1_000;
 
 interface StoredToolCall {
 	id: string;
@@ -170,7 +174,212 @@ function projectToolResult(
 	if (patchPreview) {
 		item.patchPreview = patchPreview;
 	}
+	if (message.toolName === "subagent") {
+		const subagentArgs = projectSubagentArgs(args);
+		if (subagentArgs) {
+			item.args = subagentArgs;
+		}
+		const subagentDetails = projectSubagentDetails(details);
+		if (subagentDetails) {
+			item.details = subagentDetails;
+		}
+	}
 	return item;
+}
+
+function projectSubagentArgs(args: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+	if (!args) {
+		return undefined;
+	}
+	const projected: Record<string, unknown> = {};
+	const agent = getStringArg(args, "agent");
+	if (agent) {
+		projected.agent = boundSummary(agent, SUBAGENT_AGENT_LIMIT);
+	}
+	const task = getStringArg(args, "task");
+	if (task) {
+		projected.task = boundText(task, SUBAGENT_TASK_LIMIT);
+	}
+	const tasks = projectSubagentInputArray(args.tasks);
+	if (tasks) {
+		projected.tasks = tasks;
+	}
+	const chain = projectSubagentInputArray(args.chain);
+	if (chain) {
+		projected.chain = chain;
+	}
+	return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectSubagentInputArray(value: unknown): Record<string, string>[] | undefined {
+	if (!Array.isArray(value)) {
+		return undefined;
+	}
+	const projected = value
+		.map((item) => {
+			if (!isRecord(item)) {
+				return undefined;
+			}
+			const agent = getStringArg(item, "agent");
+			const task = getStringArg(item, "task");
+			if (!agent || !task) {
+				return undefined;
+			}
+			return {
+				agent: boundSummary(agent, SUBAGENT_AGENT_LIMIT),
+				task: boundText(task, SUBAGENT_TASK_LIMIT),
+			};
+		})
+		.filter((item): item is { agent: string; task: string } => item !== undefined);
+	return projected.length > 0 ? projected : undefined;
+}
+
+function projectSubagentDetails(details: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+	if (!details) {
+		return undefined;
+	}
+	const projected: Record<string, unknown> = {};
+	copyBoundedString(details, projected, "mode", SUBAGENT_AGENT_LIMIT);
+	copyBoundedString(details, projected, "status", SUBAGENT_AGENT_LIMIT);
+	const summary = projectSubagentSummary(details.summary);
+	if (summary) {
+		projected.summary = summary;
+	}
+	const agent = projectSubagentAgent(details.agent);
+	if (agent) {
+		projected.agent = agent;
+	}
+	const output = projectSubagentOutput(details.output);
+	if (output) {
+		projected.output = output;
+	}
+	const error = projectSubagentError(details.error);
+	if (error) {
+		projected.error = error;
+	}
+	const tasks = projectSubagentDetailArray(details.tasks);
+	if (tasks) {
+		projected.tasks = tasks;
+	}
+	const steps = projectSubagentDetailArray(details.steps);
+	if (steps) {
+		projected.steps = steps;
+	}
+	return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectSubagentSummary(value: unknown): Record<string, number> | undefined {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+	const projected: Record<string, number> = {};
+	for (const key of [
+		"total",
+		"completed",
+		"failed",
+		"aborted",
+		"running",
+		"maxTasks",
+		"maxConcurrency",
+		"stoppedAt",
+	]) {
+		const numberValue = getFiniteNumber(value, key);
+		if (numberValue !== undefined) {
+			projected[key] = numberValue;
+		}
+	}
+	return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectSubagentDetailArray(value: unknown): Record<string, unknown>[] | undefined {
+	if (!Array.isArray(value)) {
+		return undefined;
+	}
+	const projected = value
+		.map((item) => (isRecord(item) ? projectSubagentTaskDetails(item) : undefined))
+		.filter((item): item is Record<string, unknown> => item !== undefined);
+	return projected.length > 0 ? projected : undefined;
+}
+
+function projectSubagentTaskDetails(item: Record<string, unknown>): Record<string, unknown> | undefined {
+	const projected: Record<string, unknown> = {};
+	const index = getFiniteNumber(item, "index");
+	if (index !== undefined) {
+		projected.index = index;
+	}
+	const agent = projectSubagentAgent(item.agent);
+	if (agent) {
+		projected.agent = agent;
+	}
+	copyBoundedString(item, projected, "status", SUBAGENT_AGENT_LIMIT);
+	const error = projectSubagentError(item.error);
+	if (error) {
+		projected.error = error;
+	}
+	return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectSubagentAgent(value: unknown): Record<string, string> | undefined {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+	const projected: Record<string, string> = {};
+	const name = getStringArg(value, "name");
+	if (name) {
+		projected.name = boundSummary(name, SUBAGENT_AGENT_LIMIT);
+	}
+	const source = getStringArg(value, "source");
+	if (source) {
+		projected.source = boundSummary(source, SUBAGENT_AGENT_LIMIT);
+	}
+	return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectSubagentOutput(value: unknown): Record<string, unknown> | undefined {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+	const projected: Record<string, unknown> = {};
+	const text = getStringArg(value, "text");
+	if (text) {
+		projected.text = boundText(text, SUBAGENT_OUTPUT_LIMIT);
+	}
+	for (const key of ["bytes", "omittedBytes", "maxBytes"]) {
+		const numberValue = getFiniteNumber(value, key);
+		if (numberValue !== undefined) {
+			projected[key] = numberValue;
+		}
+	}
+	const truncated = value.truncated;
+	if (typeof truncated === "boolean") {
+		projected.truncated = truncated;
+	}
+	return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectSubagentError(value: unknown): Record<string, string> | undefined {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+	const message = getStringArg(value, "message");
+	return message ? { message: boundText(message, SUBAGENT_ERROR_LIMIT) } : undefined;
+}
+
+function copyBoundedString(
+	from: Record<string, unknown>,
+	to: Record<string, unknown>,
+	key: string,
+	limit: number,
+): void {
+	const value = getStringArg(from, key);
+	if (value) {
+		to[key] = boundText(value, limit);
+	}
+}
+
+function getFiniteNumber(record: Record<string, unknown>, key: string): number | undefined {
+	const value = record[key];
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function projectBashExecution(
