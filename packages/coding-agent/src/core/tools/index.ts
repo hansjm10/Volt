@@ -71,6 +71,22 @@ export {
 	truncateTail,
 } from "./truncate.ts";
 export {
+	createDefaultWebSearchOperations,
+	createWebSearchTool,
+	createWebSearchToolDefinition,
+	type DefaultWebSearchOperationsOptions,
+	type WebSearchFetcher,
+	type WebSearchModelContext,
+	type WebSearchModelContextProvider,
+	type WebSearchOperations,
+	type WebSearchRequest,
+	type WebSearchResponse,
+	type WebSearchResult,
+	type WebSearchToolDetails,
+	type WebSearchToolInput,
+	type WebSearchToolOptions,
+} from "./web-search.ts";
+export {
 	createWriteTool,
 	createWriteToolDefinition,
 	type WriteOperations,
@@ -88,18 +104,32 @@ import { createGrepTool, createGrepToolDefinition, type GrepToolOptions } from "
 import { createLsTool, createLsToolDefinition, type LsToolOptions } from "./ls.ts";
 import { createLspTool, createLspToolDefinition, type LspToolOptions } from "./lsp.ts";
 import { createReadTool, createReadToolDefinition, type ReadToolOptions } from "./read.ts";
+import { createWebSearchTool, createWebSearchToolDefinition, type WebSearchToolOptions } from "./web-search.ts";
 import { createWriteTool, createWriteToolDefinition, type WriteToolOptions } from "./write.ts";
 
 export type Tool = AgentTool<any>;
 export type ToolDef = ToolDefinition<any, any>;
-export type ToolName = "read" | "bash" | "edit" | "write" | "grep" | "find" | "ls" | "lsp";
-export const allToolNames: Set<ToolName> = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "lsp"]);
+export type ToolName = "read" | "bash" | "edit" | "write" | "web_search" | "grep" | "find" | "ls" | "lsp";
+export const DEFAULT_ACTIVE_TOOL_NAMES: readonly ToolName[] = ["read", "bash", "edit", "write", "web_search"];
+export const READ_ONLY_TOOL_NAMES: readonly ToolName[] = ["read", "web_search", "grep", "find", "ls"];
+export const allToolNames: Set<ToolName> = new Set([
+	"read",
+	"bash",
+	"edit",
+	"write",
+	"web_search",
+	"grep",
+	"find",
+	"ls",
+	"lsp",
+]);
 
 export interface ToolsOptions {
 	read?: ReadToolOptions;
 	bash?: BashToolOptions;
 	write?: WriteToolOptions;
 	edit?: EditToolOptions;
+	webSearch?: WebSearchToolOptions;
 	grep?: GrepToolOptions;
 	find?: FindToolOptions;
 	ls?: LsToolOptions;
@@ -116,6 +146,8 @@ export function createToolDefinition(toolName: ToolName, cwd: string, options?: 
 			return createEditToolDefinition(cwd, options?.edit);
 		case "write":
 			return createWriteToolDefinition(cwd, options?.write);
+		case "web_search":
+			return createWebSearchToolDefinition(cwd, options?.webSearch);
 		case "grep":
 			return createGrepToolDefinition(cwd, options?.grep);
 		case "find":
@@ -139,6 +171,8 @@ export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptio
 			return createEditTool(cwd, options?.edit);
 		case "write":
 			return createWriteTool(cwd, options?.write);
+		case "web_search":
+			return createWebSearchTool(cwd, options?.webSearch);
 		case "grep":
 			return createGrepTool(cwd, options?.grep);
 		case "find":
@@ -158,12 +192,14 @@ export function createCodingToolDefinitions(cwd: string, options?: ToolsOptions)
 		createBashToolDefinition(cwd, options?.bash),
 		createEditToolDefinition(cwd, options?.edit),
 		createWriteToolDefinition(cwd, options?.write),
+		createWebSearchToolDefinition(cwd, options?.webSearch),
 	];
 }
 
 export function createReadOnlyToolDefinitions(cwd: string, options?: ToolsOptions): ToolDef[] {
 	return [
 		createReadToolDefinition(cwd, options?.read),
+		createWebSearchToolDefinition(cwd, options?.webSearch),
 		createGrepToolDefinition(cwd, options?.grep),
 		createFindToolDefinition(cwd, options?.find),
 		createLsToolDefinition(cwd, options?.ls),
@@ -176,6 +212,7 @@ export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): R
 		bash: createBashToolDefinition(cwd, options?.bash),
 		edit: createEditToolDefinition(cwd, options?.edit),
 		write: createWriteToolDefinition(cwd, options?.write),
+		web_search: createWebSearchToolDefinition(cwd, options?.webSearch),
 		grep: createGrepToolDefinition(cwd, options?.grep),
 		find: createFindToolDefinition(cwd, options?.find),
 		ls: createLsToolDefinition(cwd, options?.ls),
@@ -189,12 +226,14 @@ export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[] {
 		createBashTool(cwd, options?.bash),
 		createEditTool(cwd, options?.edit),
 		createWriteTool(cwd, options?.write),
+		createWebSearchTool(cwd, options?.webSearch),
 	];
 }
 
 export function createReadOnlyTools(cwd: string, options?: ToolsOptions): Tool[] {
 	return [
 		createReadTool(cwd, options?.read),
+		createWebSearchTool(cwd, options?.webSearch),
 		createGrepTool(cwd, options?.grep),
 		createFindTool(cwd, options?.find),
 		createLsTool(cwd, options?.ls),
@@ -207,6 +246,7 @@ export function createAllTools(cwd: string, options?: ToolsOptions): Record<Tool
 		bash: createBashTool(cwd, options?.bash),
 		edit: createEditTool(cwd, options?.edit),
 		write: createWriteTool(cwd, options?.write),
+		web_search: createWebSearchTool(cwd, options?.webSearch),
 		grep: createGrepTool(cwd, options?.grep),
 		find: createFindTool(cwd, options?.find),
 		ls: createLsTool(cwd, options?.ls),

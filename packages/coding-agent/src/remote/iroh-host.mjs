@@ -243,8 +243,9 @@ Serve options:
   --source-volt <repo-root>  Spawn Volt from a source checkout. Implies --use-volt.
   --integrated-volt          Run Volt's runtime in-process over Iroh.
   --volt-bin <path>          Volt executable for --use-volt. Defaults to volt.
-  --allow-tools <list>       Tool allowlist passed to Volt. Defaults to the saved workspace allowlist or read,bash,edit,write,grep,find,ls.
-                              bash, edit, or write can modify host state and require confirmation.
+  --allow-tools <list>       Tool allowlist passed to Volt. Defaults to the saved workspace allowlist or read,bash,edit,write,web_search,grep,find,ls.
+                              bash/edit/write can mutate host state; web_search can make network requests with host credentials.
+                              These grants require confirmation.
   --profile <name>           Volt settings profile for integrated Volt runtime.
   --agent-dir <path>         Volt agent config directory for integrated Volt runtime.
   --push-relay-url <url>     Volt push relay URL. Defaults to the managed Volt relay or VOLT_PUSH_RELAY_URL.
@@ -340,7 +341,7 @@ function formatUnsafeToolWarning(unsafeTools) {
 	const formattedTools = unsafeTools.join(", ");
 	return [
 		`Unsafe remote tools requested: ${formattedTools}.`,
-		"These tools can modify files or run shell commands on the host through a paired remote client.",
+		"These tools can modify files, run shell commands, or make network requests using host credentials through a paired remote client.",
 	].join("\n");
 }
 

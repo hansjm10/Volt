@@ -115,7 +115,8 @@ Host options are forwarded to the integrated Iroh remote host. Common options:
   --source-volt <repo-root>     Spawn Volt from a source checkout. Implies --use-volt
   --volt-bin <path>             Volt executable for --use-volt
   --allow-tools <list>          Remote tool allowlist. Defaults to the saved workspace allowlist or default remote tools.
-                                bash, edit, or write can modify host state and require confirmation.
+                                bash/edit/write can mutate host state; web_search can make network requests with host credentials.
+                                These grants require confirmation.
   --profile <name>              Volt settings profile
   --agent-dir <path>            Volt agent config directory
   --push-relay-url <url>        Volt push relay URL. Defaults to the managed Volt relay or VOLT_PUSH_RELAY_URL.
@@ -423,7 +424,7 @@ async function confirmUnsafeRemotePairToolGrant(
 
 	const warning = [
 		`Unsafe remote tools requested: ${unsafeTools.join(", ")}.`,
-		"These tools can modify files or run shell commands on the host through a paired remote client.",
+		"These tools can modify files, run shell commands, or make network requests using host credentials through a paired remote client.",
 	].join("\n");
 	if (yes) return "yes_flag";
 	if (!process.stdin.isTTY || !process.stderr.isTTY) {

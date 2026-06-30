@@ -158,6 +158,8 @@ export type {
 	// Events - User Bash
 	UserBashEvent,
 	UserBashEventResult,
+	WebSearchToolCallEvent,
+	WebSearchToolResultEvent,
 	WidgetPlacement,
 	WorkingIndicatorOptions,
 	WriteToolCallEvent,
@@ -173,6 +175,7 @@ export {
 	isLsToolResult,
 	isReadToolResult,
 	isToolCallEventType,
+	isWebSearchToolResult,
 	isWriteToolResult,
 } from "./types.ts";
 export { wrapRegisteredTool, wrapRegisteredTools } from "./wrapper.ts";

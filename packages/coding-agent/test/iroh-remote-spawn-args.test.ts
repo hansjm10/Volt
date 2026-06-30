@@ -18,12 +18,12 @@ describe("Iroh remote spawned Volt RPC tool arguments", () => {
 	});
 
 	it("treats equivalent default allowlists as default grants", () => {
-		const reorderedDefaultTools = "ls, find, grep, write, edit, bash, read";
+		const reorderedDefaultTools = "ls, find, grep, web_search, write, edit, bash, read";
 
 		expect(usesDefaultIrohRemoteAllowTools(reorderedDefaultTools)).toBe(true);
 		expect(getIrohRemoteVoltRpcToolArgs(reorderedDefaultTools)).toEqual([
 			"--tools",
-			"ls,find,grep,write,edit,bash,read",
+			"ls,find,grep,web_search,write,edit,bash,read",
 			"--allow-unlisted-extension-tools",
 		]);
 	});

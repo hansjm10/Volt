@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added a built-in `web_search` tool, enabled by default across SDK, CLI/RPC, and Iroh remote sessions. It uses the OpenAI/Codex search backend for authenticated OpenAI models, supports a custom Volt JSON endpoint via `VOLT_WEB_SEARCH_URL`, and falls back to Brave Search via `BRAVE_SEARCH_API_KEY`.
 - Added host-initiated RPC action requests so clients can approve blocking host workflows; missing trusted LSP server binaries can now prompt for installation, run the host-owned install command, and retry diagnostics.
 - Added Pi extension package compatibility: `volt install` now reads `pi` manifests when no `volt` manifest is present and aliases Pi core imports to Volt modules at extension load time.
 - Added an experimental first-time setup flow behind `PI_EXPERIMENTAL=1` that asks for a dark/light theme choice (preselecting the detected appearance) and opt-in analytics data sharing on first launch with the default agent directory; opting in stores a `trackingId` in `settings.json`.

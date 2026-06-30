@@ -1005,8 +1005,18 @@ describe("Iroh remote core helpers", () => {
 	});
 
 	test("detects unsafe remote tool grants", () => {
-		expect(getIrohRemoteUnsafeAllowedTools(DEFAULT_IROH_REMOTE_ALLOW_TOOLS)).toEqual(["bash", "edit", "write"]);
-		expect(getIrohRemoteUnsafeAllowedTools("read,bash, edit,write,bash,custom")).toEqual(["bash", "edit", "write"]);
+		expect(getIrohRemoteUnsafeAllowedTools(DEFAULT_IROH_REMOTE_ALLOW_TOOLS)).toEqual([
+			"bash",
+			"edit",
+			"write",
+			"web_search",
+		]);
+		expect(getIrohRemoteUnsafeAllowedTools("read,bash, edit,write,bash,web_search,custom")).toEqual([
+			"bash",
+			"edit",
+			"write",
+			"web_search",
+		]);
 	});
 
 	test("selects and upserts workspace definitions", async () => {

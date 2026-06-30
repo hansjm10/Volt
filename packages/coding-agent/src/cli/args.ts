@@ -235,7 +235,7 @@ export function printHelp(extensionFlags?: ExtensionFlag[]): void {
 					})
 					.join("\n")}\n`
 			: "";
-	console.log(`${chalk.bold(APP_NAME)} - AI coding assistant with read, bash, edit, write tools
+	console.log(`${chalk.bold(APP_NAME)} - AI coding assistant with read, bash, edit, write, web_search tools
 
 ${chalk.bold("Usage:")}
   ${APP_NAME} [options] [@files...] [messages...]
@@ -393,12 +393,16 @@ ${chalk.bold("Environment Variables:")}
   AWS_SECRET_ACCESS_KEY            - AWS secret key for Amazon Bedrock
   AWS_BEARER_TOKEN_BEDROCK         - Bedrock API key (bearer token)
   AWS_REGION                       - AWS region for Amazon Bedrock (e.g., us-east-1)
+  BRAVE_SEARCH_API_KEY             - Brave Search API key for the built-in web_search tool
   ${ENV_AGENT_DIR.padEnd(32)} - Config directory (default: ~/${CONFIG_DIR_NAME}/agent)
   ${ENV_SESSION_DIR.padEnd(32)} - Session storage directory (overridden by --session-dir)
   VOLT_PACKAGE_DIR                   - Override package directory (for Nix/Guix store paths)
   VOLT_PROFILE                       - Apply a named settings profile
   VOLT_OFFLINE                       - Disable startup network operations when set to 1/true/yes
   VOLT_TELEMETRY                     - Override install telemetry when set to 1/true/yes or 0/false/no
+  VOLT_WEB_SEARCH_URL                - Custom JSON endpoint for the web_search tool
+  VOLT_WEB_SEARCH_API_KEY            - Optional bearer token for VOLT_WEB_SEARCH_URL
+  VOLT_WEB_SEARCH_MODE               - Codex search mode: cached (default) or live
   VOLT_LATEST_VERSION_URL            - Enable hosted version checks against this JSON endpoint
   VOLT_REPORT_INSTALL_URL            - Enable hosted install reports against this endpoint
   VOLT_SHARE_VIEWER_URL              - Base URL for /share command viewer links
@@ -408,6 +412,7 @@ ${chalk.bold("Built-in Tool Names:")}
   bash   - Execute bash commands
   edit   - Edit files with find/replace
   write  - Write files (creates/overwrites)
+  web_search - Search the web (on by default; uses OpenAI/Codex search when available, or BRAVE_SEARCH_API_KEY / VOLT_WEB_SEARCH_URL)
   grep   - Search file contents (read-only, off by default)
   find   - Find files by glob pattern (read-only, off by default)
   ls     - List directory contents (read-only, off by default)

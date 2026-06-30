@@ -29,7 +29,9 @@ import {
 	createLsTool,
 	createReadOnlyTools,
 	createReadTool,
+	createWebSearchTool,
 	createWriteTool,
+	DEFAULT_ACTIVE_TOOL_NAMES,
 	type ToolName,
 	withFileMutationQueue,
 } from "./tools/index.ts";
@@ -56,14 +58,14 @@ export interface CreateAgentSessionOptions {
 	 * Optional default tool suppression mode when no explicit allowlist is provided.
 	 *
 	 * - "all": start with no tools enabled
-	 * - "builtin": disable the default built-in tools (read, bash, edit, write)
+	 * - "builtin": disable the default built-in tools (read, bash, edit, write, web_search)
 	 *   but keep extension/custom tools enabled
 	 */
 	noTools?: "all" | "builtin";
 	/**
 	 * Optional allowlist of tool names.
 	 *
-	 * When omitted, volt enables the default built-in tools (read, bash, edit, write)
+	 * When omitted, volt enables the default built-in tools (read, bash, edit, write, web_search)
 	 * and leaves extension/custom tools enabled unless `noTools` changes that default.
 	 * When provided, only the listed tool names are enabled.
 	 */
@@ -130,6 +132,7 @@ export {
 	createFindTool,
 	createLsTool,
 	createLspTool,
+	createWebSearchTool,
 };
 
 // Helper Functions
@@ -252,7 +255,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
 	}
 
-	const defaultActiveToolNames: ToolName[] = ["read", "bash", "edit", "write"];
+	const defaultActiveToolNames: ToolName[] = [...DEFAULT_ACTIVE_TOOL_NAMES];
 	if (resolveLspConfig(settingsManager.getLspSettings()).enabled) {
 		defaultActiveToolNames.push("lsp");
 	}

@@ -94,7 +94,7 @@ describe("remote CLI", () => {
 		expect(helpText).toContain("volt remote status [options]");
 		expect(helpText).toContain("volt remote approve-repair <node-id> [options]");
 		expect(helpText).toContain("--register-workspace");
-		expect(helpText).toContain("bash, edit, or write can modify host state and require confirmation");
+		expect(helpText).toContain("web_search can make network requests with host credentials");
 		expect(helpText).toContain("--mobile");
 		expect(helpText).toContain("--yes");
 		expect(helpText).toContain("without trusting the workspace");

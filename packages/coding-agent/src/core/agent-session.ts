@@ -92,7 +92,11 @@ import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
-import { createAllToolDefinitions } from "./tools/index.ts";
+import {
+	createAllToolDefinitions,
+	createDefaultWebSearchOperations,
+	DEFAULT_ACTIVE_TOOL_NAMES,
+} from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 
 // ============================================================================
@@ -169,7 +173,7 @@ export interface AgentSessionConfig {
 	customTools?: ToolDefinition[];
 	/** Model registry for API key resolution and model discovery */
 	modelRegistry: ModelRegistry;
-	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
+	/** Initial active built-in tool names. Default: [read, bash, edit, write, web_search] */
 	initialActiveToolNames?: string[];
 	/** Optional allowlist of tool names. When provided, only these tool names are exposed. */
 	allowedToolNames?: string[];
@@ -2539,6 +2543,29 @@ export class AgentSession {
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 					edit: { diagnosticsProvider: this._lspManager },
 					write: { diagnosticsProvider: this._lspManager },
+					webSearch: {
+						operations: createDefaultWebSearchOperations({
+							modelContext: async () => {
+								const model = this.model;
+								if (!model) {
+									return undefined;
+								}
+								if (model.provider !== "openai" && model.provider !== "openai-codex") {
+									return { model };
+								}
+								const auth = await this._modelRegistry.getApiKeyAndHeaders(model);
+								if (!auth.ok) {
+									throw new Error(auth.error);
+								}
+								return {
+									model,
+									apiKey: auth.apiKey,
+									headers: auth.headers,
+									sessionId: this.sessionManager.getSessionId(),
+								};
+							},
+						}),
+					},
 					lsp: { provider: this._lspManager },
 				});
 
@@ -2568,7 +2595,7 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write", ...(this._lspManager ? ["lsp"] : [])];
+			: [...DEFAULT_ACTIVE_TOOL_NAMES, ...(this._lspManager ? ["lsp"] : [])];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,

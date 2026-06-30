@@ -225,6 +225,15 @@ function summarizeToolResult(
 			TOOL_SUMMARY_LIMIT,
 		);
 	}
+	if (toolName === "web_search") {
+		const query = getStringArg(args, "query");
+		return boundSummary(
+			query
+				? `Searched web for ${boundSummary(query, TOOL_COMMAND_LIMIT)} (${statusText})`
+				: `Searched web (${statusText})`,
+			TOOL_SUMMARY_LIMIT,
+		);
+	}
 	if (toolName === "grep") {
 		const pattern = getStringArg(args, "pattern");
 		const patternText = pattern ? ` for ${pattern}` : "";
