@@ -241,6 +241,7 @@ export class IrohRemoteHostStateManager {
 				return undefined;
 			}
 			pushTarget.enabled = false;
+			delete pushTarget.liveActivity;
 			pushTarget.updatedAt = now;
 			await this.saveUnlocked(state);
 			return clonePushTarget(pushTarget);
@@ -256,7 +257,6 @@ export class IrohRemoteHostStateManager {
 			const client = state.clients.find((entry) => entry.nodeId === nodeId);
 			const pushTarget = client?.pushTargets?.find(
 				(entry) =>
-					entry.enabled &&
 					entry.platform === lookup.platform &&
 					entry.liveActivity?.tokenHash === lookup.tokenHash &&
 					entry.liveActivity.tokenEnvironment === lookup.tokenEnvironment,

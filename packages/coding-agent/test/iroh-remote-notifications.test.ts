@@ -606,6 +606,58 @@ describe("Iroh remote notification requests", () => {
 		});
 	});
 
+	test("sends Live Activity updates when completion notifications are disabled", async () => {
+		const stateManager = createStateManagerWithClient(
+			[
+				createEnabledPushTarget({
+					enabled: false,
+					liveActivity: {
+						activityId: "activity-1",
+						pushToken: "activity-token",
+						tokenHash: LIVE_ACTIVITY_TOKEN_HASH,
+						tokenEnvironment: "production",
+						updatedAt: 20,
+					},
+				}),
+			],
+			[createLiveActivityRegistration()],
+		);
+		const relayClient = createRelayClient({
+			sendLiveActivityUpdate: vi.fn(async () => ({ status: "sent" as const })),
+		});
+		const dispatcher = new IrohRemotePushNotificationDispatcher({
+			clientNodeId: "paired-client",
+			relayClient,
+			retryDelayMs: 0,
+			stateManager,
+		});
+		const contentState = {
+			status: "running" as const,
+			statusText: "Using read",
+			currentTool: { name: "read", symbolName: "doc.text.magnifyingglass", status: "started" as const },
+			recentTools: [{ name: "read", symbolName: "doc.text.magnifyingglass", status: "started" as const }],
+			sessionID: "session-one",
+			workspaceName: "volt-app",
+			updatedAtEpochSeconds: 123,
+		};
+
+		await expect(
+			dispatcher.deliverLiveActivityUpdate({
+				eventId: "live-activity:session-one:run-1:2",
+				kind: "live_activity_update",
+				contentState,
+			}),
+		).resolves.toBe("sent");
+
+		expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledWith(
+			expect.objectContaining({
+				pushTargetId: "relay-target-1",
+				activityPushToken: "activity-token",
+				contentState,
+			}),
+		);
+	});
+
 	test("routes Live Activity updates through the matching workspace and session registration", async () => {
 		const stateManager = createStateManagerWithClient(
 			[
@@ -1072,7 +1124,17 @@ describe("Iroh remote notification requests", () => {
 				session.leafId = "conversation-run";
 			},
 		);
-		const stateManager = createStateManagerWithClient([createEnabledPushTarget()]);
+		const stateManager = createStateManagerWithClient([
+			createEnabledPushTarget({
+				liveActivity: {
+					activityId: "activity-1",
+					pushToken: "activity-token",
+					tokenHash: LIVE_ACTIVITY_TOKEN_HASH,
+					tokenEnvironment: "production",
+					updatedAt: 20,
+				},
+			}),
+		]);
 		const relayClient = createRelayClient({
 			sendNotification: vi.fn(async () => ({ status: "invalid_target" as const })),
 		});
@@ -1100,6 +1162,7 @@ describe("Iroh remote notification requests", () => {
 		await vi.waitFor(async () => {
 			const state = await stateManager.getState();
 			expect(state.clients[0].pushTargets?.[0]).toMatchObject({ enabled: false, updatedAt: 500 });
+			expect(state.clients[0].pushTargets?.[0]).not.toHaveProperty("liveActivity");
 		});
 		expect(getNotifications(send)).toEqual([]);
 
