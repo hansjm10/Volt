@@ -10,6 +10,7 @@ import { SettingsManager } from "../src/core/settings-manager.ts";
 import {
 	createDefaultWebFetchOperations,
 	createWebFetchTool,
+	extractHtml,
 	extractUrls,
 	htmlToText,
 	normalizeFetchUrl,
@@ -464,5 +465,100 @@ describe("htmlToText", () => {
 
 	it("decodes entities and keeps line breaks", () => {
 		expect(htmlToText("<p>a &amp; b<br>c &#65;</p>")).toBe("a & b\nc A");
+	});
+
+	it("handles markup that defeats tag-stripping regexes", () => {
+		// A '>' inside an attribute value ends the tag too early for /<[^>]+>/.
+		expect(htmlToText('<p>before</p><a title="a>b">link</a><p>after</p>')).toBe("before\nlink\nafter");
+		// An unclosed <script> never matches a paired strip pattern, leaking its body.
+		expect(htmlToText("<p>before</p><script>var x = 1; alert('leak')</script>")).toBe("before");
+		expect(htmlToText("<p>before</p><script>var x = 1; alert('leak')")).toBe("before");
+	});
+
+	it("keeps whitespace inside pre and code blocks", () => {
+		expect(htmlToText("<pre>line one\n  indented\n    deeper\nline four</pre>")).toBe(
+			"line one\n  indented\n    deeper\nline four",
+		);
+		expect(htmlToText("<pre><code>def f():\n    return 1\n</code></pre>")).toBe("def f():\n    return 1");
+	});
+
+	it("renders lists and table rows readably", () => {
+		expect(htmlToText("<ul><li>Item A</li><li>Item B</li></ul>")).toBe("- Item A\n- Item B");
+		expect(htmlToText("<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>")).toBe(
+			"a\tb\nc\td",
+		);
+	});
+
+	it("drops navigation and footer chrome but keeps headers and asides", () => {
+		const html =
+			"<nav>Home About Contact</nav><header>Page Heading</header>" +
+			"<main><p>Body text.</p></main><aside>Note: important</aside><footer>Copyright 2026</footer>";
+		const text = htmlToText(html);
+		expect(text).toContain("Body text.");
+		expect(text).toContain("Page Heading");
+		expect(text).toContain("Note: important");
+		expect(text).not.toContain("Home About Contact");
+		expect(text).not.toContain("Copyright 2026");
+	});
+
+	it("recovers from malformed markup", () => {
+		// Unclosed <p> elements are still separate paragraphs after tree construction.
+		expect(htmlToText("<p>one<p>two<div>three")).toBe("one\n\ntwo\n\nthree");
+	});
+
+	it("reads the document title", () => {
+		expect(extractHtml("<html><head><title>T &amp; T</title></head><body>x</body></html>").title).toBe("T & T");
+		expect(extractHtml("<html><body>x</body></html>").title).toBeUndefined();
+	});
+});
+
+describe("private address detection", () => {
+	// Exercised through normalizeFetchUrl-adjacent behaviour: the resolver seam lets
+	// a test assert the guard directly for every textual spelling of an address.
+	async function fetchWith(address: string): Promise<string> {
+		const operations = createDefaultWebFetchOperations({
+			env: {},
+			fetcher: async () => new Response("should not be reached", { status: 200 }),
+			resolveHost: async () => [address],
+		});
+		try {
+			await operations.fetch({ url: "https://looks-public.example.com/", maxBytes: 20_000 });
+			return "ALLOWED";
+		} catch (error) {
+			return (error as Error).message;
+		}
+	}
+
+	it("blocks every spelling of a non-public address", async () => {
+		const blocked = [
+			"127.0.0.1",
+			"10.0.0.1",
+			"192.168.1.1",
+			"172.16.0.1",
+			"169.254.169.254",
+			"100.64.0.1",
+			"0.0.0.0",
+			"::1",
+			// Same address, written out in full rather than compressed.
+			"0:0:0:0:0:0:0:1",
+			"fe80::1",
+			"fd00::1",
+			"ff02::1",
+			// IPv4-mapped loopback, in both the dotted and hexadecimal serializations.
+			"::ffff:127.0.0.1",
+			"::ffff:7f00:1",
+			// IPv4-compatible and NAT64 embeddings of loopback.
+			"::127.0.0.1",
+			"64:ff9b::7f00:1",
+		];
+		for (const address of blocked) {
+			expect(await fetchWith(address), address).toContain("non-public address");
+		}
+	});
+
+	it("allows genuinely public addresses", async () => {
+		for (const address of ["93.184.216.34", "8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946"]) {
+			expect(await fetchWith(address), address).not.toContain("non-public address");
+		}
 	});
 });

@@ -1,10 +1,10 @@
 import { lookup } from "node:dns/promises";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
 import { Text } from "@hansjm10/volt-tui";
+import { Window } from "happy-dom";
 import { type Static, Type } from "typebox";
 import { VERSION } from "../../config.ts";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
-import { decodeHtmlEntity } from "../../utils/html.ts";
 import { getVoltUserAgent } from "../../utils/volt-user-agent.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import type { Theme } from "../theme/runtime.ts";
@@ -130,10 +130,68 @@ function parseIpv4(value: string): number[] | undefined {
 }
 
 /**
+ * Expand any textual IPv6 form into its 16 bytes.
+ *
+ * Matching IPv6 by string shape does not work: the same address has many
+ * spellings, and `::ffff:127.0.0.1` serializes as `::ffff:7f00:1`, which no
+ * dotted-quad pattern catches. Comparing bytes removes the whole class of
+ * alternate-encoding bypasses.
+ */
+function parseIpv6(value: string): number[] | undefined {
+	if (!value.includes(":")) return undefined;
+	const halves = value.split("::");
+	if (halves.length > 2) return undefined;
+
+	const expand = (part: string): number[] | undefined => {
+		if (part.length === 0) return [];
+		const bytes: number[] = [];
+		const groups = part.split(":");
+		for (let index = 0; index < groups.length; index++) {
+			const group = groups[index];
+			// A trailing IPv4 literal represents the last four bytes.
+			if (group.includes(".")) {
+				if (index !== groups.length - 1) return undefined;
+				const quad = parseIpv4(group);
+				if (!quad) return undefined;
+				bytes.push(...quad);
+				continue;
+			}
+			if (!/^[0-9a-f]{1,4}$/.test(group)) return undefined;
+			const word = Number.parseInt(group, 16);
+			bytes.push((word >> 8) & 0xff, word & 0xff);
+		}
+		return bytes;
+	};
+
+	const head = expand(halves[0]);
+	const tail = halves.length === 2 ? expand(halves[1]) : [];
+	if (!head || !tail) return undefined;
+	if (halves.length === 1) return head.length === 16 ? head : undefined;
+	const gap = 16 - head.length - tail.length;
+	if (gap < 0) return undefined;
+	return [...head, ...new Array(gap).fill(0), ...tail];
+}
+
+/** True when these four bytes are not routable on the public internet. */
+function isPrivateIpv4(bytes: number[]): boolean {
+	const [a, b] = bytes;
+	if (a === 0 || a === 10 || a === 127) return true;
+	if (a === 169 && b === 254) return true;
+	if (a === 172 && b >= 16 && b <= 31) return true;
+	if (a === 192 && b === 168) return true;
+	if (a === 100 && b >= 64 && b <= 127) return true;
+	if (a === 192 && b === 0) return true;
+	if (a === 198 && (b === 18 || b === 19)) return true;
+	if (a >= 224) return true;
+	return false;
+}
+
+/**
  * Reject addresses that are not routable on the public internet.
  *
  * Covers loopback, RFC1918, carrier-grade NAT, link-local (including the cloud
- * instance-metadata address), benchmarking, multicast, and reserved space.
+ * instance-metadata address), benchmarking, multicast, and reserved space, plus
+ * the IPv6 equivalents and every embedding of an IPv4 address inside IPv6.
  */
 function isPrivateAddress(address: string): boolean {
 	const value = address
@@ -141,25 +199,40 @@ function isPrivateAddress(address: string): boolean {
 		.toLowerCase()
 		.replace(/^\[|\]$/g, "");
 
-	const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(value);
-	const ipv4 = parseIpv4(mapped ? mapped[1] : value);
+	const ipv4 = parseIpv4(value);
 	if (ipv4) {
-		const [a, b] = ipv4;
-		if (a === 0 || a === 10 || a === 127) return true;
-		if (a === 169 && b === 254) return true;
-		if (a === 172 && b >= 16 && b <= 31) return true;
-		if (a === 192 && b === 168) return true;
-		if (a === 100 && b >= 64 && b <= 127) return true;
-		if (a === 192 && b === 0) return true;
-		if (a === 198 && (b === 18 || b === 19)) return true;
-		if (a >= 224) return true;
+		return isPrivateIpv4(ipv4);
+	}
+
+	const ipv6 = parseIpv6(value);
+	if (!ipv6) {
+		// Not an address literal at all; hostname rules handle those.
 		return false;
 	}
 
-	if (value === "::" || value === "::1") return true;
+	if (ipv6.every((byte) => byte === 0)) return true;
+	if (ipv6.slice(0, 15).every((byte) => byte === 0) && ipv6[15] === 1) return true;
 	// Unique-local fc00::/7 and link-local fe80::/10.
-	if (/^f[cd][0-9a-f]{2}:/.test(value)) return true;
-	if (/^fe[89ab][0-9a-f]:/.test(value)) return true;
+	if ((ipv6[0] & 0xfe) === 0xfc) return true;
+	if (ipv6[0] === 0xfe && (ipv6[1] & 0xc0) === 0x80) return true;
+	// Multicast ff00::/8.
+	if (ipv6[0] === 0xff) return true;
+
+	// IPv4-mapped ::ffff:0:0/96, IPv4-compatible ::/96, and NAT64 64:ff9b::/96 all
+	// carry an IPv4 destination in the last four bytes.
+	const embedded = ipv6.slice(12);
+	const prefix = ipv6.slice(0, 12);
+	const isMapped = prefix.slice(0, 10).every((byte) => byte === 0) && prefix[10] === 0xff && prefix[11] === 0xff;
+	const isCompatible = prefix.every((byte) => byte === 0);
+	const isNat64 =
+		ipv6[0] === 0x00 &&
+		ipv6[1] === 0x64 &&
+		ipv6[2] === 0xff &&
+		ipv6[3] === 0x9b &&
+		prefix.slice(4).every((b) => b === 0);
+	if (isMapped || isCompatible || isNat64) {
+		return isPrivateIpv4(embedded);
+	}
 	return false;
 }
 
@@ -268,42 +341,170 @@ async function defaultResolveHost(hostname: string): Promise<string[]> {
 	return results.map((entry) => entry.address);
 }
 
-function decodeEntities(value: string): string {
-	return value.replace(/&(#?[a-zA-Z0-9]{1,10});/g, (match, entity: string) => decodeHtmlEntity(entity) ?? match);
+const TEXT_NODE = 3;
+const ELEMENT_NODE = 1;
+
+/** Elements whose content is markup, styling, or scripting rather than page text. */
+const NON_CONTENT_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "SVG", "TEMPLATE", "HEAD", "IFRAME", "CANVAS"]);
+/**
+ * Site furniture dropped before extraction.
+ *
+ * NAV and FOOTER are reliably chrome. HEADER and ASIDE are not: headers often
+ * carry the page heading and asides carry callouts, so they are kept even though
+ * dropping them would shrink output further.
+ */
+const CHROME_TAGS = new Set(["NAV", "FOOTER"]);
+/** Elements that start and end a line of output. */
+const BLOCK_TAGS = new Set([
+	"ADDRESS",
+	"ARTICLE",
+	"ASIDE",
+	"BLOCKQUOTE",
+	"DD",
+	"DIV",
+	"DL",
+	"DT",
+	"FIELDSET",
+	"FIGCAPTION",
+	"FIGURE",
+	"FOOTER",
+	"FORM",
+	"H1",
+	"H2",
+	"H3",
+	"H4",
+	"H5",
+	"H6",
+	"HEADER",
+	"HR",
+	"LI",
+	"MAIN",
+	"NAV",
+	"OL",
+	"P",
+	"PRE",
+	"SECTION",
+	"TABLE",
+	"TBODY",
+	"TFOOT",
+	"THEAD",
+	"TR",
+	"UL",
+]);
+/** Table cells separate with a tab so one row stays on one line. */
+const CELL_TAGS = new Set(["TD", "TH"]);
+
+/** Structural subset of the DOM this walker needs, so happy-dom types stay internal. */
+interface DomNode {
+	nodeType: number;
+	data?: string;
+	tagName?: string;
+	childNodes: Iterable<DomNode>;
 }
 
-function extractTitle(html: string): string | undefined {
-	const match = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
-	if (!match) return undefined;
-	const title = decodeEntities(match[1].replace(/\s+/g, " ")).trim();
-	return title.length > 0 ? title : undefined;
+export interface ExtractedHtml {
+	text: string;
+	title?: string;
 }
 
-/** Minimal HTML-to-text: enough for reading prose, without an HTML parser dependency. */
-export function htmlToText(html: string): string {
-	const stripped = html
-		.replace(/<!--[\s\S]*?-->/g, " ")
-		.replace(/<(script|style|noscript|svg|template|head)\b[^>]*>[\s\S]*?<\/\1>/gi, " ");
+/**
+ * Convert HTML to readable text.
+ *
+ * Uses a real HTML parser rather than tag-stripping regexes, which mishandle
+ * attributes containing `>` and leak the body of an unclosed `<script>`. Text
+ * inside `<pre>` keeps its whitespace so code samples survive.
+ */
+export function extractHtml(html: string): ExtractedHtml {
+	const window = new Window({ settings: { disableJavaScriptEvaluation: true } });
+	try {
+		const document = window.document;
+		document.write(html);
 
-	const withBreaks = stripped
-		.replace(/<br\s*\/?>/gi, "\n")
-		.replace(/<li\b[^>]*>/gi, "\n- ")
-		.replace(/<\/(p|div|section|article|li|tr|h[1-6]|blockquote|pre|ul|ol|table)>/gi, "\n")
-		.replace(/<(p|div|section|article|tr|h[1-6]|blockquote|pre)\b[^>]*>/gi, "\n");
+		const lines: string[] = [];
+		let current = "";
+		let currentIsPre = false;
 
-	const text = decodeEntities(withBreaks.replace(/<[^>]+>/g, " "));
+		const flush = (): void => {
+			// Leading whitespace is meaningful inside <pre> and noise everywhere else.
+			lines.push(currentIsPre ? current.replace(/\s+$/, "") : current.trim());
+			current = "";
+			currentIsPre = false;
+		};
 
-	const lines: string[] = [];
-	for (const line of text.split("\n")) {
-		const collapsed = line.replace(/[^\S\n]+/g, " ").trim();
-		if (collapsed.length === 0) {
-			if (lines.length > 0 && lines[lines.length - 1] !== "") lines.push("");
-			continue;
+		const appendPre = (value: string): void => {
+			const parts = value.split("\n");
+			current += parts[0];
+			currentIsPre = true;
+			for (let index = 1; index < parts.length; index++) {
+				flush();
+				currentIsPre = true;
+				current = parts[index];
+			}
+		};
+
+		const walk = (node: DomNode, inPre: boolean): void => {
+			if (node.nodeType === TEXT_NODE) {
+				const raw = node.data ?? "";
+				if (inPre) {
+					appendPre(raw);
+					return;
+				}
+				current += raw.replace(/\s+/g, " ");
+				return;
+			}
+			if (node.nodeType !== ELEMENT_NODE) {
+				return;
+			}
+			const tag = node.tagName ?? "";
+			if (NON_CONTENT_TAGS.has(tag) || CHROME_TAGS.has(tag)) {
+				return;
+			}
+			if (tag === "BR") {
+				flush();
+				return;
+			}
+			if (CELL_TAGS.has(tag)) {
+				if (current.length > 0 && !current.endsWith("\t")) {
+					current += "\t";
+				}
+				for (const child of node.childNodes) walk(child, inPre);
+				return;
+			}
+			const block = BLOCK_TAGS.has(tag);
+			const pre = inPre || tag === "PRE";
+			if (block) flush();
+			if (tag === "LI") current += "- ";
+			for (const child of node.childNodes) walk(child, pre);
+			// A list item or table row ends at its next sibling or at the container
+			// close, so flushing here too would put a blank line between every bullet
+			// and every row.
+			if (block && tag !== "LI" && tag !== "TR") flush();
+		};
+
+		const root = (document.body ?? document.documentElement) as unknown as DomNode | null;
+		if (root) walk(root, false);
+		flush();
+
+		const output: string[] = [];
+		for (const line of lines) {
+			if (line.length === 0) {
+				if (output.length > 0 && output[output.length - 1] !== "") output.push("");
+				continue;
+			}
+			output.push(line);
 		}
-		lines.push(collapsed);
+		while (output.length > 0 && output[output.length - 1] === "") output.pop();
+
+		const title = document.title?.trim();
+		return { text: output.join("\n"), ...(title ? { title } : {}) };
+	} finally {
+		window.close();
 	}
-	while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-	return lines.join("\n");
+}
+
+/** Readable text of an HTML document. */
+export function htmlToText(html: string): string {
+	return extractHtml(html).text;
 }
 
 function isTextualContentType(contentType: string): boolean {
@@ -388,12 +589,13 @@ export function createDefaultWebFetchOperations(options: DefaultWebFetchOperatio
 			const body = await response.text();
 			const bounded = body.length > MAX_DOWNLOAD_BYTES ? body.slice(0, MAX_DOWNLOAD_BYTES) : body;
 			const isHtml = /html/i.test(contentType) || /^\s*<(!doctype html|html)\b/i.test(bounded);
+			const extracted = isHtml ? extractHtml(bounded) : undefined;
 
 			return {
 				url: current.toString(),
-				...(isHtml ? { title: extractTitle(bounded) } : {}),
+				...(extracted?.title ? { title: extracted.title } : {}),
 				...(contentType ? { contentType } : {}),
-				content: isHtml ? htmlToText(bounded) : bounded.trim(),
+				content: extracted ? extracted.text : bounded.trim(),
 			};
 		},
 	};

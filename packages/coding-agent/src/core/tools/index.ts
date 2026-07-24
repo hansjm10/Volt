@@ -109,6 +109,8 @@ export {
 	createWebFetchTool,
 	createWebFetchToolDefinition,
 	type DefaultWebFetchOperationsOptions,
+	type ExtractedHtml,
+	extractHtml,
 	extractUrls,
 	htmlToText,
 	normalizeFetchUrl,

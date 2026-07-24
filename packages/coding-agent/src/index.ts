@@ -733,6 +733,8 @@ export {
 	type EditToolDetails,
 	type EditToolInput,
 	type EditToolOptions,
+	type ExtractedHtml,
+	extractHtml,
 	extractUrls,
 	FALLBACK_MAX_LINES,
 	type FindOperations,
