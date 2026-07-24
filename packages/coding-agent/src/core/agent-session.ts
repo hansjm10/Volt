@@ -141,6 +141,7 @@ import {
 	createDefaultWebSearchOperations,
 	DEFAULT_ACTIVE_TOOL_NAMES,
 	extractUrls,
+	extractWebSearchResultUrls,
 	type SubagentToolManager,
 } from "./tools/index.ts";
 import {
@@ -4268,10 +4269,9 @@ export class AgentSession {
 	/**
 	 * URLs that web_fetch is permitted to read.
 	 *
-	 * Only user messages and tool results count. Assistant output is deliberately
-	 * excluded: once the model has read untrusted content, a URL it writes is not
-	 * evidence that the URL belongs in this conversation, and fetching it would be
-	 * a way to send context to an attacker-chosen host.
+	 * Only user messages and canonical URL fields from successful web_search
+	 * results count. Assistant and model-controlled tool output are deliberately
+	 * excluded because they can construct attacker-chosen exfiltration URLs.
 	 */
 	private _collectFetchableUrls(): string[] {
 		const urls: string[] = [];
@@ -4286,10 +4286,10 @@ export class AgentSession {
 						urls.push(...extractUrls(part.text));
 					}
 				}
-			} else if (message.role === "toolResult") {
+			} else if (message.role === "toolResult" && message.toolName === "web_search" && !message.isError) {
 				for (const part of message.content) {
 					if (part.type === "text") {
-						urls.push(...extractUrls(part.text));
+						urls.push(...extractWebSearchResultUrls(part.text));
 					}
 				}
 			}

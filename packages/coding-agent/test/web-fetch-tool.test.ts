@@ -1,6 +1,9 @@
+import { once } from "node:events";
 import { mkdirSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { getModel } from "@hansjm10/volt-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
@@ -242,6 +245,19 @@ describe("web_fetch network operations", () => {
 		expect(response.content).not.toContain("<");
 	});
 
+	it("binds each request to the addresses that passed validation", async () => {
+		let pinnedAddresses: unknown;
+		const fetcher: WebFetchFetcher = async (...args: unknown[]) => {
+			pinnedAddresses = args[2];
+			return new Response("ok", { status: 200, headers: { "content-type": "text/plain" } });
+		};
+		const operations = createDefaultWebFetchOperations({ env: {}, fetcher, resolveHost: publicHost });
+
+		await operations.fetch({ url: "https://example.com/doc", maxBytes: 20_000 });
+
+		expect(pinnedAddresses).toEqual(["93.184.216.34"]);
+	});
+
 	it("refuses non-http schemes and internal hostnames", async () => {
 		let called = false;
 		const fetcher: WebFetchFetcher = async () => {
@@ -369,6 +385,33 @@ describe("web_fetch network operations", () => {
 		expect(response.content).toBe("line one\nline two");
 		expect(response.title).toBeUndefined();
 	});
+
+	it("cancels an oversized response before consuming the entire stream", async () => {
+		const chunk = new Uint8Array(1024 * 1024).fill(0x61);
+		let pulls = 0;
+		let cancelled = false;
+		const body = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				pulls++;
+				controller.enqueue(chunk);
+				if (pulls === 20) {
+					controller.close();
+				}
+			},
+			cancel() {
+				cancelled = true;
+			},
+		});
+		const fetcher: WebFetchFetcher = async () =>
+			new Response(body, { status: 200, headers: { "content-type": "text/plain" } });
+		const operations = createDefaultWebFetchOperations({ env: {}, fetcher, resolveHost: publicHost });
+
+		const response = await operations.fetch({ url: "https://example.com/unbounded", maxBytes: 20_000 });
+
+		expect(new TextEncoder().encode(response.content)).toHaveLength(5 * 1024 * 1024);
+		expect(pulls).toBeLessThan(20);
+		expect(cancelled).toBe(true);
+	});
 });
 
 describe("web_fetch session integration", () => {
@@ -403,9 +446,12 @@ describe("web_fetch session integration", () => {
 	// Reserved by RFC 2606, so resolution fails before any request is made.
 	const USER_URL = "https://user-supplied.invalid/doc";
 	const SEARCH_URL = "https://from-search.invalid/page";
+	const SEARCH_SNIPPET_URL = "https://snippet-invented.invalid/trap";
+	const BASH_URL = "https://bash-invented.invalid/exfil";
+	const FAILED_SEARCH_URL = "https://failed-search.invalid/trap";
 	const ASSISTANT_URL = "https://assistant-invented.invalid/x";
 
-	it("permits URLs from the user and tool results but not ones the assistant wrote", async () => {
+	it("permits user and web_search result URLs without trusting model-controlled tool output", async () => {
 		const { session } = await createSession();
 		const model = session.model!;
 		session.agent.state.messages = [
@@ -431,8 +477,24 @@ describe("web_fetch session integration", () => {
 				role: "toolResult",
 				toolCallId: "call-1",
 				toolName: "web_search",
-				content: [{ type: "text", text: `[1] A page\nURL: ${SEARCH_URL}\nSnippet: something` }],
+				content: [{ type: "text", text: `[1] A page\nURL: ${SEARCH_URL}\nSnippet: ${SEARCH_SNIPPET_URL}` }],
 				isError: false,
+				timestamp: Date.now(),
+			},
+			{
+				role: "toolResult",
+				toolCallId: "call-2",
+				toolName: "bash",
+				content: [{ type: "text", text: `URL: ${BASH_URL}` }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+			{
+				role: "toolResult",
+				toolCallId: "call-3",
+				toolName: "web_search",
+				content: [{ type: "text", text: `URL: ${FAILED_SEARCH_URL}` }],
+				isError: true,
 				timestamp: Date.now(),
 			},
 		];
@@ -443,10 +505,13 @@ describe("web_fetch session integration", () => {
 
 		await expect(tool!.execute("session-1", { url: "https://never-mentioned.invalid/" })).rejects.toThrow(blocked);
 		await expect(tool!.execute("session-2", { url: ASSISTANT_URL })).rejects.toThrow(blocked);
+		await expect(tool!.execute("session-3", { url: BASH_URL })).rejects.toThrow(blocked);
+		await expect(tool!.execute("session-4", { url: SEARCH_SNIPPET_URL })).rejects.toThrow(blocked);
+		await expect(tool!.execute("session-5", { url: FAILED_SEARCH_URL })).rejects.toThrow(blocked);
 
 		// These are allowed, so they fail later (name resolution) rather than on the allowlist.
 		for (const allowed of [USER_URL, SEARCH_URL]) {
-			const error = await tool!.execute("session-3", { url: allowed }).then(
+			const error = await tool!.execute("session-6", { url: allowed }).then(
 				() => undefined,
 				(thrown: unknown) => thrown as Error,
 			);
@@ -459,6 +524,33 @@ describe("web_fetch session integration", () => {
 });
 
 describe("htmlToText", () => {
+	it("does not load stylesheets or frames while parsing untrusted HTML", async () => {
+		const requests: string[] = [];
+		const server = createServer((request, response) => {
+			requests.push(request.url ?? "");
+			response.writeHead(200, { "content-type": request.url === "/style.css" ? "text/css" : "text/html" });
+			response.end(request.url === "/style.css" ? "body { color: red; }" : "<p>private frame</p>");
+		});
+		server.listen(0, "127.0.0.1");
+		await once(server, "listening");
+		const address = server.address();
+		if (!address || typeof address === "string") {
+			throw new Error("Expected a TCP test server");
+		}
+
+		try {
+			extractHtml(
+				`<html><head><link rel="stylesheet" href="http://127.0.0.1:${address.port}/style.css"></head>` +
+					`<body><iframe src="http://127.0.0.1:${address.port}/frame"></iframe><p>public body</p></body></html>`,
+			);
+			await delay(50);
+			expect(requests).toEqual([]);
+		} finally {
+			server.close();
+			await once(server, "close");
+		}
+	});
+
 	it("collapses runs of blank lines to a single paragraph break", () => {
 		expect(htmlToText("<p>one</p>\n\n\n<p>two</p>")).toBe("one\n\ntwo");
 	});

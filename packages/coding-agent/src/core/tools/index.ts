@@ -112,6 +112,7 @@ export {
 	type ExtractedHtml,
 	extractHtml,
 	extractUrls,
+	extractWebSearchResultUrls,
 	htmlToText,
 	normalizeFetchUrl,
 	type WebFetchFetcher,

@@ -1,8 +1,10 @@
 import { lookup } from "node:dns/promises";
+import { isIP, type LookupFunction } from "node:net";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
 import { Text } from "@hansjm10/volt-tui";
 import { Window } from "happy-dom";
 import { type Static, Type } from "typebox";
+import { Agent, fetch as undiciFetch } from "undici";
 import { VERSION } from "../../config.ts";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
 import { getVoltUserAgent } from "../../utils/volt-user-agent.ts";
@@ -59,7 +61,11 @@ export interface WebFetchOperations {
 	fetch: (request: WebFetchRequest, signal?: AbortSignal) => Promise<WebFetchResponse> | WebFetchResponse;
 }
 
-export type WebFetchFetcher = (input: string, init: RequestInit) => Promise<Response>;
+export type WebFetchFetcher = (
+	input: string,
+	init: RequestInit,
+	validatedAddresses: readonly string[],
+) => Promise<Response>;
 
 /** Resolves a hostname to its addresses so private targets can be rejected. */
 export type WebFetchHostResolver = (hostname: string) => Promise<string[]>;
@@ -75,17 +81,17 @@ export interface DefaultWebFetchOperationsOptions {
  * Supplies the URLs that already appeared in the conversation.
  *
  * Yields URLs, not the text they were found in; use {@link extractUrls} to pull
- * them out of message or tool-result text first.
+ * them out of trusted message text first.
  */
 export type WebFetchUrlSource = () => Iterable<string>;
 
 /**
  * Which URLs the model is allowed to fetch.
  *
- * `conversation` is the safe mode: only URLs the user supplied or that arrived in
- * a tool result may be fetched, so a model that has read untrusted content cannot
- * construct a URL to exfiltrate context to. `unrestricted` is an explicit opt-out
- * for embedders that have no conversation to check against.
+ * `conversation` is the safe mode: only URLs the user supplied or that arrived as
+ * trusted discovery results may be fetched, so a model that has read untrusted
+ * content cannot construct a URL to exfiltrate context to. `unrestricted` is an
+ * explicit opt-out for embedders that have no conversation to check against.
  */
 export type WebFetchUrlPolicy = { type: "conversation"; urls: WebFetchUrlSource } | { type: "unrestricted" };
 
@@ -252,6 +258,18 @@ export function extractUrls(text: string): string[] {
 	return found;
 }
 
+/** Extract only the canonical result URL fields emitted by web_search. */
+export function extractWebSearchResultUrls(text: string): string[] {
+	const found: string[] = [];
+	for (const line of text.split(/\r?\n/)) {
+		const match = /^URL:\s*(\S+)\s*$/.exec(line);
+		if (match && normalizeFetchUrl(match[1]) !== undefined) {
+			found.push(match[1]);
+		}
+	}
+	return found;
+}
+
 /**
  * Canonical form used to compare a requested URL against the conversation.
  *
@@ -304,7 +322,12 @@ function isBlockedHostname(hostname: string): boolean {
 	return host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal");
 }
 
-async function assertFetchableUrl(raw: string, resolveHost: WebFetchHostResolver): Promise<URL> {
+interface ValidatedWebFetchUrl {
+	url: URL;
+	addresses: string[];
+}
+
+async function assertFetchableUrl(raw: string, resolveHost: WebFetchHostResolver): Promise<ValidatedWebFetchUrl> {
 	let url: URL;
 	try {
 		url = new URL(raw);
@@ -318,6 +341,9 @@ async function assertFetchableUrl(raw: string, resolveHost: WebFetchHostResolver
 	if (isBlockedHostname(url.hostname)) {
 		throw new Error(`web_fetch refuses to fetch internal host ${url.hostname}`);
 	}
+	if (isPrivateAddress(url.hostname)) {
+		throw new Error(`web_fetch refuses to fetch ${url.hostname}: resolves to non-public address ${url.hostname}`);
+	}
 
 	// A public-looking hostname can still resolve to a private address, so check
 	// what it actually resolves to rather than trusting its shape.
@@ -326,11 +352,14 @@ async function assertFetchableUrl(raw: string, resolveHost: WebFetchHostResolver
 		throw new Error(`web_fetch could not resolve ${url.hostname}`);
 	}
 	for (const address of addresses) {
+		if (isIP(address) === 0) {
+			throw new Error(`web_fetch received an invalid address for ${url.hostname}: ${address}`);
+		}
 		if (isPrivateAddress(address)) {
 			throw new Error(`web_fetch refuses to fetch ${url.hostname}: resolves to non-public address ${address}`);
 		}
 	}
-	return url;
+	return { url, addresses };
 }
 
 async function defaultResolveHost(hostname: string): Promise<string[]> {
@@ -415,7 +444,21 @@ export interface ExtractedHtml {
  * inside `<pre>` keeps its whitespace so code samples survive.
  */
 export function extractHtml(html: string): ExtractedHtml {
-	const window = new Window({ settings: { disableJavaScriptEvaluation: true } });
+	const window = new Window({
+		settings: {
+			enableJavaScriptEvaluation: false,
+			disableJavaScriptFileLoading: true,
+			disableCSSFileLoading: true,
+			enableImageFileLoading: false,
+			handleDisabledFileLoadingAsSuccess: true,
+			navigation: {
+				disableMainFrameNavigation: true,
+				disableChildFrameNavigation: true,
+				disableChildPageNavigation: true,
+				disableFallbackToSetURL: true,
+			},
+		},
+	});
 	try {
 		const document = window.document;
 		document.write(html);
@@ -519,9 +562,76 @@ function isTextualContentType(contentType: string): boolean {
 	);
 }
 
+function createPinnedDispatcher(addresses: readonly string[]): Agent {
+	const records: Array<{ address: string; family: 4 | 6 }> = [];
+	for (const address of addresses) {
+		const family = isIP(address);
+		if (family !== 4 && family !== 6) {
+			throw new Error(`web_fetch cannot pin invalid address ${address}`);
+		}
+		records.push({ address, family });
+	}
+
+	const pinnedLookup: LookupFunction = (_hostname, options, callback) => {
+		const requestedFamily = options.family === 4 || options.family === 6 ? options.family : undefined;
+		const matching = requestedFamily ? records.filter((record) => record.family === requestedFamily) : records;
+		if (matching.length === 0) {
+			const error = new Error("No validated address matches the requested address family") as NodeJS.ErrnoException;
+			error.code = "ENOTFOUND";
+			callback(error, []);
+			return;
+		}
+		if (options.all) {
+			callback(null, matching);
+			return;
+		}
+		callback(null, matching[0].address, matching[0].family);
+	};
+
+	return new Agent({
+		connections: 1,
+		connect: { lookup: pinnedLookup },
+	});
+}
+
+async function readBoundedResponseBody(response: Response): Promise<string> {
+	if (!response.body) {
+		return "";
+	}
+
+	const bytes = new Uint8Array(MAX_DOWNLOAD_BYTES);
+	const reader = response.body.getReader();
+	let length = 0;
+	try {
+		while (length < bytes.byteLength) {
+			const { done, value } = await reader.read();
+			if (done) {
+				break;
+			}
+			const accepted = value.subarray(0, bytes.byteLength - length);
+			bytes.set(accepted, length);
+			length += accepted.byteLength;
+			if (length === bytes.byteLength) {
+				await reader.cancel();
+				break;
+			}
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	return new TextDecoder().decode(bytes.subarray(0, length));
+}
+
+async function discardResponseBody(response: Response | undefined): Promise<void> {
+	if (!response?.body || response.bodyUsed) {
+		return;
+	}
+	await response.body.cancel().catch(() => undefined);
+}
+
 export function createDefaultWebFetchOperations(options: DefaultWebFetchOperationsOptions = {}): WebFetchOperations {
 	const env = options.env ?? process.env;
-	const fetcher = options.fetcher ?? ((input, init) => globalThis.fetch(input, init));
+	const fetcher = options.fetcher;
 	const resolveHost = options.resolveHost ?? defaultResolveHost;
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
@@ -536,67 +646,92 @@ export function createDefaultWebFetchOperations(options: DefaultWebFetchOperatio
 
 			let current = await assertFetchableUrl(request.url, resolveHost);
 			let response: Response | undefined;
+			let dispatcher: Agent | undefined;
 
-			// Redirects are followed by hand so every hop is re-validated; letting fetch
-			// follow them would allow a public URL to bounce to an internal address.
-			for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-				try {
-					response = await fetcher(current.toString(), {
-						method: "GET",
-						redirect: "manual",
-						headers: {
+			try {
+				// Redirects are followed by hand so every hop is re-validated and
+				// connected through only the DNS addresses validated for that hop.
+				for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+					try {
+						const headers = {
 							"User-Agent": getVoltUserAgent(VERSION),
 							accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
-						},
-						signal: requestSignal,
-					});
-				} catch (error) {
-					if (signal?.aborted) {
-						throw new Error("Operation aborted");
+						};
+						const init: RequestInit = {
+							method: "GET",
+							redirect: "manual",
+							headers,
+							signal: requestSignal,
+						};
+						if (fetcher) {
+							response = await fetcher(current.url.toString(), init, current.addresses);
+						} else {
+							dispatcher = createPinnedDispatcher(current.addresses);
+							response = (await undiciFetch(current.url.toString(), {
+								method: "GET",
+								redirect: "manual",
+								headers,
+								signal: requestSignal,
+								dispatcher,
+							})) as unknown as Response;
+						}
+					} catch (error) {
+						await dispatcher?.close().catch(() => undefined);
+						dispatcher = undefined;
+						if (signal?.aborted) {
+							throw new Error("Operation aborted");
+						}
+						if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
+							throw new Error(`web_fetch request timed out after ${timeoutMs}ms`);
+						}
+						const message = error instanceof Error ? error.message : String(error);
+						throw new Error(`web_fetch request failed: ${message}`);
 					}
-					if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
-						throw new Error(`web_fetch request timed out after ${timeoutMs}ms`);
+
+					if (response.status < 300 || response.status >= 400) {
+						break;
 					}
-					const message = error instanceof Error ? error.message : String(error);
-					throw new Error(`web_fetch request failed: ${message}`);
+					const location = response.headers.get("location");
+					if (!location) {
+						break;
+					}
+					if (hop === MAX_REDIRECTS) {
+						throw new Error(`web_fetch exceeded ${MAX_REDIRECTS} redirects starting at ${request.url}`);
+					}
+					const redirectUrl = new URL(location, current.url).toString();
+					await discardResponseBody(response);
+					response = undefined;
+					await dispatcher?.close();
+					dispatcher = undefined;
+					current = await assertFetchableUrl(redirectUrl, resolveHost);
 				}
 
-				if (response.status < 300 || response.status >= 400) {
-					break;
+				if (!response) {
+					throw new Error(`web_fetch request failed: ${request.url}`);
 				}
-				const location = response.headers.get("location");
-				if (!location) {
-					break;
+				if (!response.ok) {
+					throw new Error(`web_fetch returned HTTP ${response.status} for ${current.url.toString()}`);
 				}
-				if (hop === MAX_REDIRECTS) {
-					throw new Error(`web_fetch exceeded ${MAX_REDIRECTS} redirects starting at ${request.url}`);
+
+				const contentType = response.headers.get("content-type") ?? "";
+				if (contentType && !isTextualContentType(contentType)) {
+					throw new Error(`web_fetch cannot read content type ${contentType.split(";", 1)[0].trim()}`);
 				}
-				current = await assertFetchableUrl(new URL(location, current).toString(), resolveHost);
-			}
 
-			if (!response) {
-				throw new Error(`web_fetch request failed: ${request.url}`);
-			}
-			if (!response.ok) {
-				throw new Error(`web_fetch returned HTTP ${response.status} for ${current.toString()}`);
-			}
+				const body = await readBoundedResponseBody(response);
+				const isHtml = /html/i.test(contentType) || /^\s*<(!doctype html|html)\b/i.test(body);
+				const extracted = isHtml ? extractHtml(body) : undefined;
 
-			const contentType = response.headers.get("content-type") ?? "";
-			if (contentType && !isTextualContentType(contentType)) {
-				throw new Error(`web_fetch cannot read content type ${contentType.split(";", 1)[0].trim()}`);
+				return {
+					url: current.url.toString(),
+					...(extracted?.title ? { title: extracted.title } : {}),
+					...(contentType ? { contentType } : {}),
+					content: extracted ? extracted.text : body.trim(),
+				};
+			} finally {
+				await discardResponseBody(response);
+				await dispatcher?.close().catch(() => undefined);
 			}
-
-			const body = await response.text();
-			const bounded = body.length > MAX_DOWNLOAD_BYTES ? body.slice(0, MAX_DOWNLOAD_BYTES) : body;
-			const isHtml = /html/i.test(contentType) || /^\s*<(!doctype html|html)\b/i.test(bounded);
-			const extracted = isHtml ? extractHtml(bounded) : undefined;
-
-			return {
-				url: current.toString(),
-				...(extracted?.title ? { title: extracted.title } : {}),
-				...(contentType ? { contentType } : {}),
-				content: extracted ? extracted.text : bounded.trim(),
-			};
 		},
 	};
 }
