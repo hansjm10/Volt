@@ -58,7 +58,12 @@ import {
 	isStandaloneBinary,
 	VERSION,
 } from "../../config.ts";
-import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	parseSkillBlock,
+	QueueClearPersistenceError,
+} from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import type {
 	AutocompleteProviderFactory,
@@ -3231,18 +3236,20 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.suspend", () => this.handleCtrlZ());
 		this.defaultEditor.onAction("app.thinking.cycle", () => this.cycleThinkingLevel());
 		this.defaultEditor.onAction("app.mode.toggle", () => this.toggleAgentMode());
-		this.defaultEditor.onAction("app.model.cycleForward", () => this.cycleModel("forward"));
-		this.defaultEditor.onAction("app.model.cycleBackward", () => this.cycleModel("backward"));
+		this.defaultEditor.onAction("app.model.cycleForward", () => this.runKeyAction(() => this.cycleModel("forward")));
+		this.defaultEditor.onAction("app.model.cycleBackward", () =>
+			this.runKeyAction(() => this.cycleModel("backward")),
+		);
 
 		// Global debug handler on TUI (works regardless of focus)
 		this.ui.onDebug = () => this.handleDebugCommand();
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
-		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
-		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
-		this.defaultEditor.onAction("app.message.dequeue", () => this.handleDequeue());
-		this.defaultEditor.onAction("app.session.new", () => this.handleClearCommand());
+		this.defaultEditor.onAction("app.editor.external", () => this.runKeyAction(() => this.openExternalEditor()));
+		this.defaultEditor.onAction("app.message.followUp", () => this.runKeyAction(() => this.handleFollowUp()));
+		this.defaultEditor.onAction("app.message.dequeue", () => this.runKeyAction(() => this.handleDequeue()));
+		this.defaultEditor.onAction("app.session.new", () => this.runKeyAction(() => this.handleClearCommand()));
 		this.defaultEditor.onAction("app.session.tree", () => this.showTreeSelector());
 		this.defaultEditor.onAction("app.session.fork", () => this.showUserMessageSelector());
 		this.defaultEditor.onAction("app.session.resume", () => this.showSessionSelector());
@@ -4536,8 +4543,30 @@ export class InteractiveMode {
 		}
 	}
 
+	/**
+	 * Run an async keybinding handler from CustomEditor's synchronous `() => void`
+	 * dispatch. Without this the returned promise is dropped, and a rejection
+	 * becomes an unhandled rejection that Node raises as an uncaught exception —
+	 * tearing the TUI down through uncaughtCrash instead of reporting the error.
+	 */
+	private runKeyAction(action: () => Promise<void>): void {
+		void action().catch((error) => {
+			this.showError(error instanceof Error ? error.message : String(error));
+		});
+	}
+
 	private async handleDequeue(): Promise<void> {
-		const restored = await this.restoreQueuedMessagesToEditor();
+		let restored: number;
+		try {
+			restored = await this.restoreQueuedMessagesToEditor();
+		} catch (error) {
+			if (error instanceof QueueClearPersistenceError) {
+				// The text is back in the editor; only its cancellation is unrecorded.
+				this.showError(`Failed to persist queued-message cancellation: ${error.message}`);
+				return;
+			}
+			throw error;
+		}
 		if (restored === 0) {
 			this.showStatus("No queued messages to restore");
 		} else {
@@ -4850,22 +4879,43 @@ export class InteractiveMode {
 		};
 	}
 
+	/** Drain the compaction queue, which is local state and cannot fail to clear. */
+	private drainCompactionQueue(): { steering: string[]; followUp: string[] } {
+		const steering = this.compactionQueuedMessages.filter((msg) => msg.mode === "steer").map((msg) => msg.text);
+		const followUp = this.compactionQueuedMessages.filter((msg) => msg.mode === "followUp").map((msg) => msg.text);
+		this.compactionQueuedMessages = [];
+		return { steering, followUp };
+	}
+
 	/**
 	 * Clear all queued messages and return their contents.
 	 * Clears both session queue and compaction queue.
+	 *
+	 * When the session queue was revoked but its cancellation could not be
+	 * persisted, the compaction queue is drained too and both sets are re-thrown
+	 * on the error, so a caller recovering the text sees every queued message
+	 * rather than half of them.
 	 */
 	private async clearAllQueues(): Promise<{ steering: string[]; followUp: string[] }> {
-		const { steering, followUp } = await this.session.clearQueue();
-		const compactionSteering = this.compactionQueuedMessages
-			.filter((msg) => msg.mode === "steer")
-			.map((msg) => msg.text);
-		const compactionFollowUp = this.compactionQueuedMessages
-			.filter((msg) => msg.mode === "followUp")
-			.map((msg) => msg.text);
-		this.compactionQueuedMessages = [];
+		let session: { steering: string[]; followUp: string[] };
+		try {
+			session = await this.session.clearQueue();
+		} catch (error) {
+			if (error instanceof QueueClearPersistenceError) {
+				const compaction = this.drainCompactionQueue();
+				throw new QueueClearPersistenceError(error, {
+					steering: [...error.steering, ...compaction.steering],
+					followUp: [...error.followUp, ...compaction.followUp],
+				});
+			}
+			// The session queue was never revoked, so nothing was lost and the
+			// compaction queue stays where it is.
+			throw error;
+		}
+		const compaction = this.drainCompactionQueue();
 		return {
-			steering: [...steering, ...compactionSteering],
-			followUp: [...followUp, ...compactionFollowUp],
+			steering: [...session.steering, ...compaction.steering],
+			followUp: [...session.followUp, ...compaction.followUp],
 		};
 	}
 
@@ -4892,19 +4942,31 @@ export class InteractiveMode {
 		let queues: Awaited<ReturnType<InteractiveMode["clearAllQueues"]>>;
 		try {
 			queues = await this.clearAllQueues();
+		} catch (error) {
+			if (error instanceof QueueClearPersistenceError) {
+				// The queues were already revoked when persistence failed, so the
+				// error carries the only remaining copy of what the user typed. Put
+				// it back before letting the caller report the failure.
+				this.putQueuedTextInEditor([...error.steering, ...error.followUp], options?.currentText);
+			}
+			throw error;
 		} finally {
 			if (options?.abort) {
 				this.agent.abort();
 			}
 		}
-		const allQueued = [...queues.steering, ...queues.followUp];
+		return this.putQueuedTextInEditor([...queues.steering, ...queues.followUp], options?.currentText);
+	}
+
+	/** Prepend cleared queue text to the editor, keeping any draft already there. */
+	private putQueuedTextInEditor(allQueued: string[], currentText?: string): number {
 		if (allQueued.length === 0) {
 			this.updatePendingMessagesDisplay();
 			return 0;
 		}
 		const queuedText = allQueued.join("\n\n");
-		const currentText = options?.currentText ?? this.editor.getText();
-		const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
+		const draftText = currentText ?? this.editor.getText();
+		const combinedText = [queuedText, draftText].filter((t) => t.trim()).join("\n\n");
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		return allQueued.length;

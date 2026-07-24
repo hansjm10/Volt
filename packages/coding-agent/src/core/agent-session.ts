@@ -420,6 +420,24 @@ export class ClientInputOutcomeAmbiguousError extends Error {
 	readonly code = "client_input_outcome_ambiguous";
 }
 
+/**
+ * Raised when {@link AgentSession.clearQueue} revoked the runtime queues but their
+ * cancellation could not be made durable. The queues are already gone, so the
+ * captured text is carried on the error: it is the only remaining copy of what the
+ * user typed, and callers restoring input to an editor must recover it from here.
+ */
+export class QueueClearPersistenceError extends Error {
+	readonly code = "queue_clear_persistence_failed";
+	readonly steering: string[];
+	readonly followUp: string[];
+
+	constructor(cause: Error, queues: { steering: string[]; followUp: string[] }) {
+		super(cause.message, { cause });
+		this.steering = queues.steering;
+		this.followUp = queues.followUp;
+	}
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -3135,7 +3153,13 @@ export class AgentSession {
 	/**
 	 * Clear all queued messages and return them.
 	 * Useful for restoring to editor when user aborts.
+	 *
+	 * Durability is awaited only when clearing actually records something: queued
+	 * input with a durable client identity. Runtime ownership is revoked before that
+	 * await, so a persistence failure cannot put the text back. It is instead carried
+	 * on the thrown {@link QueueClearPersistenceError} for callers that must not lose it.
 	 * @returns Object with steering and followUp arrays
+	 * @throws QueueClearPersistenceError when the cleared state could not be persisted
 	 */
 	async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
 		const steering = this._steeringMessages.map((entry) => entry.text);
@@ -3153,14 +3177,22 @@ export class AgentSession {
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 
-		try {
-			await this.sessionManager.flush();
-		} catch (error) {
-			for (const [clientMessageId, operation] of queuedOperations) {
-				operation.rejectAccepted(error instanceof Error ? error : new Error(String(error)));
-				this._liveClientInputs.delete(clientMessageId);
+		// Runtime-only queue entries carry a local-queue identity and never reach the
+		// WAL, so clearing them appends nothing. Awaiting the durable watermark in
+		// that case records no cancellation and only inherits an unrelated earlier
+		// failure, which would fail the one action a fail-stopped session still owes
+		// the user: handing their unsent text back.
+		if (queuedOperations.length > 0) {
+			try {
+				await this.sessionManager.flush();
+			} catch (error) {
+				const persistenceError = error instanceof Error ? error : new Error(String(error));
+				for (const [clientMessageId, operation] of queuedOperations) {
+					operation.rejectAccepted(persistenceError);
+					this._liveClientInputs.delete(clientMessageId);
+				}
+				throw new QueueClearPersistenceError(persistenceError, { steering, followUp });
 			}
-			throw error;
 		}
 
 		for (const [clientMessageId, operation] of queuedOperations) {

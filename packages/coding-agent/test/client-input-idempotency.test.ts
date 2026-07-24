@@ -5,7 +5,11 @@ import type { AgentTool } from "@hansjm10/volt-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ClientInputConflictError, ClientInputOutcomeAmbiguousError } from "../src/core/agent-session.ts";
+import {
+	ClientInputConflictError,
+	ClientInputOutcomeAmbiguousError,
+	QueueClearPersistenceError,
+} from "../src/core/agent-session.ts";
 import { createIrohRemotePresetAccess } from "../src/core/remote/iroh/access-grant.ts";
 import type { IrohRemoteClientAuthorizationSuccess } from "../src/core/remote/iroh/authorization.ts";
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
@@ -444,6 +448,58 @@ describe("durable client input idempotency", () => {
 			releaseFlush();
 		}
 		await clearing;
+	});
+
+	it("cancels runtime-only queued input without awaiting unrelated durability", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		// Local TUI-style queue entries have no durable client identity, so clearing
+		// them records nothing and must not inherit an earlier persistence failure.
+		await harness.session.steer("steered draft");
+		await harness.session.followUp("follow-up draft");
+
+		const flush = vi.spyOn(harness.sessionManager, "flush").mockRejectedValue(new Error("ENOSPC"));
+		try {
+			await expect(harness.session.clearQueue()).resolves.toEqual({
+				steering: ["steered draft"],
+				followUp: ["follow-up draft"],
+			});
+			expect(flush).not.toHaveBeenCalled();
+		} finally {
+			flush.mockRestore();
+		}
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("carries the cleared queue text on the error when cancellation cannot be persisted", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await harness.session.steer("steered draft", undefined, "clear-steer-flush-failure");
+		await harness.session.followUp("follow-up draft", undefined, "clear-follow-flush-failure");
+
+		const flushFailure = new Error("ENOSPC: no space left on device");
+		const flush = vi.spyOn(harness.sessionManager, "flush").mockRejectedValue(flushFailure);
+		let thrown: unknown;
+		try {
+			await harness.session.clearQueue();
+		} catch (error) {
+			thrown = error;
+		} finally {
+			flush.mockRestore();
+		}
+
+		// The runtime queues are revoked before durability is awaited, so the error
+		// holds the only surviving copy of what the user typed.
+		expect(thrown).toBeInstanceOf(QueueClearPersistenceError);
+		const persistenceError = thrown as QueueClearPersistenceError;
+		expect(persistenceError.steering).toEqual(["steered draft"]);
+		expect(persistenceError.followUp).toEqual(["follow-up draft"]);
+		expect(persistenceError.cause).toBe(flushFailure);
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
 	});
 
 	it("keeps local runtime queue identities outside the forgeable client ID domain", async () => {
