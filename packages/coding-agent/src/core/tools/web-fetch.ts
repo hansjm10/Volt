@@ -71,8 +71,31 @@ export interface DefaultWebFetchOperationsOptions {
 	timeoutMs?: number;
 }
 
+/**
+ * Supplies the URLs that already appeared in the conversation.
+ *
+ * Yields URLs, not the text they were found in; use {@link extractUrls} to pull
+ * them out of message or tool-result text first.
+ */
+export type WebFetchUrlSource = () => Iterable<string>;
+
+/**
+ * Which URLs the model is allowed to fetch.
+ *
+ * `conversation` is the safe mode: only URLs the user supplied or that arrived in
+ * a tool result may be fetched, so a model that has read untrusted content cannot
+ * construct a URL to exfiltrate context to. `unrestricted` is an explicit opt-out
+ * for embedders that have no conversation to check against.
+ */
+export type WebFetchUrlPolicy = { type: "conversation"; urls: WebFetchUrlSource } | { type: "unrestricted" };
+
 export interface WebFetchToolOptions {
 	operations?: WebFetchOperations;
+	/**
+	 * Defaults to an empty conversation allowlist, so a tool wired without a URL
+	 * source refuses everything rather than silently allowing model-authored URLs.
+	 */
+	urlPolicy?: WebFetchUrlPolicy;
 }
 
 type RenderableWebFetchResult = {
@@ -138,6 +161,67 @@ function isPrivateAddress(address: string): boolean {
 	if (/^f[cd][0-9a-f]{2}:/.test(value)) return true;
 	if (/^fe[89ab][0-9a-f]:/.test(value)) return true;
 	return false;
+}
+
+/** URLs in prose usually end before sentence punctuation or a closing bracket. */
+const URL_IN_TEXT = /https?:\/\/[^\s<>"'`]+/gi;
+const URL_TRAILING_NOISE = /[.,;:!?'"`)\]}]+$/;
+
+/** Collect http(s) URLs from free text, such as a user message or a tool result. */
+export function extractUrls(text: string): string[] {
+	const found: string[] = [];
+	for (const match of text.matchAll(URL_IN_TEXT)) {
+		const trimmed = match[0].replace(URL_TRAILING_NOISE, "");
+		if (trimmed.length > 0) {
+			found.push(trimmed);
+		}
+	}
+	return found;
+}
+
+/**
+ * Canonical form used to compare a requested URL against the conversation.
+ *
+ * Case in the scheme and host, a bare trailing slash, and the fragment are not
+ * meaningful differences; everything else is kept so a different path or query
+ * is a different URL.
+ */
+export function normalizeFetchUrl(value: string): string | undefined {
+	let url: URL;
+	try {
+		url = new URL(value.trim());
+	} catch {
+		return undefined;
+	}
+	if (url.protocol !== "http:" && url.protocol !== "https:") {
+		return undefined;
+	}
+	// Userinfo is not part of the identity of a page, so ignoring it would let
+	// `https://secret@allowed.example/page` pass as `https://allowed.example/page`
+	// and carry data out in the credentials. Refuse to canonicalize it instead.
+	if (url.username !== "" || url.password !== "") {
+		return undefined;
+	}
+	const path = url.pathname === "/" ? "" : url.pathname;
+	return `${url.protocol}//${url.host.toLowerCase()}${path}${url.search}`;
+}
+
+function assertUrlAllowed(url: string, policy: WebFetchUrlPolicy): void {
+	if (policy.type === "unrestricted") {
+		return;
+	}
+	const target = normalizeFetchUrl(url);
+	if (target !== undefined) {
+		for (const candidate of policy.urls()) {
+			if (normalizeFetchUrl(candidate) === target) {
+				return;
+			}
+		}
+	}
+	throw new Error(
+		`web_fetch can only read URLs that already appeared in this conversation, and ${url} did not. ` +
+			"Use web_search to find the page, or ask the user for the URL.",
+	);
 }
 
 function isBlockedHostname(hostname: string): boolean {
@@ -384,15 +468,16 @@ export function createWebFetchToolDefinition(
 	options?: WebFetchToolOptions,
 ): ToolDefinition<typeof webFetchSchema, WebFetchToolDetails> {
 	const ops = options?.operations ?? createDefaultWebFetchOperations();
+	const urlPolicy: WebFetchUrlPolicy = options?.urlPolicy ?? { type: "conversation", urls: () => [] };
 	return {
 		name: "web_fetch",
 		label: "web_fetch",
 		description:
-			"Fetch a single http(s) URL and return its readable text. Use after web_search when a result's snippet is not enough, or when the user supplies a URL. Returns page text with HTML markup removed.",
+			"Fetch a single http(s) URL and return its readable text. Use after web_search when a result's snippet is not enough, or when the user supplies a URL. Only URLs that already appeared in this conversation can be fetched. Returns page text with HTML markup removed.",
 		promptSnippet: "Fetch the readable text of a URL",
 		promptGuidelines: [
 			"Use web_fetch to read a specific page, and web_search to discover pages.",
-			"Prefer URLs that came from web_search results or from the user; do not guess URLs.",
+			"web_fetch only accepts URLs already present in the conversation, so search for a page or ask the user for its URL rather than constructing one.",
 			"Raise maxBytes only when the default output is truncated and the rest of the page is needed.",
 		],
 		parameters: webFetchSchema,
@@ -404,6 +489,11 @@ export function createWebFetchToolDefinition(
 			if (!url) {
 				throw new Error("web_fetch url must not be empty");
 			}
+			// Checked here rather than inside the operations so that swapping the
+			// network implementation cannot bypass the allowlist. Redirect targets are
+			// deliberately exempt: they are revalidated for SSRF, but a redirect from an
+			// allowed URL is part of fetching that URL.
+			assertUrlAllowed(url, urlPolicy);
 			const request: WebFetchRequest = { url, maxBytes: normalizeMaxBytes(params.maxBytes) };
 			const response = await ops.fetch(request, signal);
 			if (signal?.aborted) {

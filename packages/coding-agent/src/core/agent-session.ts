@@ -140,6 +140,7 @@ import {
 	createAllToolDefinitions,
 	createDefaultWebSearchOperations,
 	DEFAULT_ACTIVE_TOOL_NAMES,
+	extractUrls,
 	type SubagentToolManager,
 } from "./tools/index.ts";
 import {
@@ -4264,6 +4265,38 @@ export class AgentSession {
 		this.setActiveToolsByName([...new Set(nextActiveToolNames)]);
 	}
 
+	/**
+	 * URLs that web_fetch is permitted to read.
+	 *
+	 * Only user messages and tool results count. Assistant output is deliberately
+	 * excluded: once the model has read untrusted content, a URL it writes is not
+	 * evidence that the URL belongs in this conversation, and fetching it would be
+	 * a way to send context to an attacker-chosen host.
+	 */
+	private _collectFetchableUrls(): string[] {
+		const urls: string[] = [];
+		for (const message of this.messages) {
+			if (message.role === "user") {
+				if (typeof message.content === "string") {
+					urls.push(...extractUrls(message.content));
+					continue;
+				}
+				for (const part of message.content) {
+					if (part.type === "text") {
+						urls.push(...extractUrls(part.text));
+					}
+				}
+			} else if (message.role === "toolResult") {
+				for (const part of message.content) {
+					if (part.type === "text") {
+						urls.push(...extractUrls(part.text));
+					}
+				}
+			}
+		}
+		return urls;
+	}
+
 	private _buildRuntime(options: {
 		activeToolNames?: string[];
 		flagValues?: Map<string, boolean | string>;
@@ -4336,6 +4369,9 @@ export class AgentSession {
 								};
 							},
 						}),
+					},
+					webFetch: {
+						urlPolicy: { type: "conversation", urls: () => this._collectFetchableUrls() },
 					},
 					lsp: { provider: this._lspManager },
 					...(subagentToolManager

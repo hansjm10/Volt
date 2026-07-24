@@ -109,7 +109,9 @@ export {
 	createWebFetchTool,
 	createWebFetchToolDefinition,
 	type DefaultWebFetchOperationsOptions,
+	extractUrls,
 	htmlToText,
+	normalizeFetchUrl,
 	type WebFetchFetcher,
 	type WebFetchHostResolver,
 	type WebFetchOperations,
@@ -118,6 +120,8 @@ export {
 	type WebFetchToolDetails,
 	type WebFetchToolInput,
 	type WebFetchToolOptions,
+	type WebFetchUrlPolicy,
+	type WebFetchUrlSource,
 } from "./web-fetch.ts";
 export {
 	BRAVE_SEARCH_AUTH_PROVIDER,

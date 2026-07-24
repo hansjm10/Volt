@@ -1,12 +1,23 @@
-import { describe, expect, it } from "vitest";
+import { mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { getModel } from "@hansjm10/volt-ai";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
+import { createAgentSession } from "../src/core/sdk.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { SettingsManager } from "../src/core/settings-manager.ts";
 import {
 	createDefaultWebFetchOperations,
 	createWebFetchTool,
+	extractUrls,
 	htmlToText,
+	normalizeFetchUrl,
 	type WebFetchFetcher,
 	type WebFetchHostResolver,
 	type WebFetchOperations,
 	type WebFetchRequest,
+	type WebFetchUrlPolicy,
 } from "../src/index.ts";
 
 function getTextOutput(result: { content: Array<{ type: string; text?: string }> }): string {
@@ -21,6 +32,17 @@ function getTextOutput(result: { content: Array<{ type: string; text?: string }>
 
 /** Every hostname resolves to a public address unless a test says otherwise. */
 const publicHost: WebFetchHostResolver = async () => ["93.184.216.34"];
+
+/** Most tool tests are about fetching, not about the allowlist. */
+const UNRESTRICTED: WebFetchUrlPolicy = { type: "unrestricted" };
+
+function conversationWith(...urls: string[]): WebFetchUrlPolicy {
+	return { type: "conversation", urls: () => urls };
+}
+
+function okOperations(): WebFetchOperations {
+	return { fetch: async (request) => ({ url: request.url, content: "page text" }) };
+}
 
 function htmlResponse(body: string, init: ResponseInit = {}): Response {
 	return new Response(body, { status: 200, headers: { "content-type": "text/html" }, ...init });
@@ -40,7 +62,7 @@ describe("web_fetch tool", () => {
 				};
 			},
 		};
-		const tool = createWebFetchTool(process.cwd(), { operations });
+		const tool = createWebFetchTool(process.cwd(), { operations, urlPolicy: UNRESTRICTED });
 
 		const result = await tool.execute("web-fetch-1", { url: "  https://example.com/article  " });
 
@@ -64,7 +86,7 @@ describe("web_fetch tool", () => {
 				return { url: "https://example.com/big", content: "x".repeat(50_000) };
 			},
 		};
-		const tool = createWebFetchTool(process.cwd(), { operations });
+		const tool = createWebFetchTool(process.cwd(), { operations, urlPolicy: UNRESTRICTED });
 
 		const result = await tool.execute("web-fetch-2", { url: "https://example.com/big", maxBytes: 10 });
 
@@ -77,7 +99,7 @@ describe("web_fetch tool", () => {
 		const operations: WebFetchOperations = {
 			fetch: async () => ({ url: "https://example.com/final", content: "done" }),
 		};
-		const tool = createWebFetchTool(process.cwd(), { operations });
+		const tool = createWebFetchTool(process.cwd(), { operations, urlPolicy: UNRESTRICTED });
 
 		const result = await tool.execute("web-fetch-3", { url: "https://example.com/start" });
 
@@ -93,7 +115,7 @@ describe("web_fetch tool", () => {
 				return { url: "https://example.com", content: "" };
 			},
 		};
-		const tool = createWebFetchTool(process.cwd(), { operations });
+		const tool = createWebFetchTool(process.cwd(), { operations, urlPolicy: UNRESTRICTED });
 
 		await expect(tool.execute("web-fetch-4", { url: "   " })).rejects.toThrow("web_fetch url must not be empty");
 
@@ -103,6 +125,97 @@ describe("web_fetch tool", () => {
 			"Operation aborted",
 		);
 		expect(called).toBe(false);
+	});
+});
+
+describe("web_fetch conversation allowlist", () => {
+	it("refuses a URL that never appeared in the conversation", async () => {
+		let called = false;
+		const operations: WebFetchOperations = {
+			fetch: async () => {
+				called = true;
+				return { url: "https://evil.example.com", content: "" };
+			},
+		};
+		const tool = createWebFetchTool(process.cwd(), {
+			operations,
+			urlPolicy: conversationWith("https://docs.example.com/guide"),
+		});
+
+		await expect(tool.execute("allow-1", { url: "https://evil.example.com/exfil?data=secret" })).rejects.toThrow(
+			"web_fetch can only read URLs that already appeared in this conversation",
+		);
+		expect(called).toBe(false);
+	});
+
+	it("allows a URL that appeared in the conversation", async () => {
+		const tool = createWebFetchTool(process.cwd(), {
+			operations: okOperations(),
+			urlPolicy: conversationWith(...extractUrls("see https://docs.example.com/guide for details")),
+		});
+
+		const result = await tool.execute("allow-2", { url: "https://docs.example.com/guide" });
+
+		expect(result.details?.url).toBe("https://docs.example.com/guide");
+	});
+
+	it("ignores case, trailing slash, and fragment when matching", async () => {
+		const tool = createWebFetchTool(process.cwd(), {
+			operations: okOperations(),
+			urlPolicy: conversationWith("HTTPS://Docs.Example.com/guide#section-2"),
+		});
+
+		await expect(tool.execute("allow-3", { url: "https://docs.example.com/guide" })).resolves.toBeDefined();
+	});
+
+	it("does not treat a different path or query as the same URL", async () => {
+		const tool = createWebFetchTool(process.cwd(), {
+			operations: okOperations(),
+			urlPolicy: conversationWith("https://docs.example.com/guide"),
+		});
+
+		await expect(tool.execute("allow-4", { url: "https://docs.example.com/guide/../../etc" })).rejects.toThrow(
+			"already appeared in this conversation",
+		);
+		await expect(tool.execute("allow-5", { url: "https://docs.example.com/guide?x=1" })).rejects.toThrow(
+			"already appeared in this conversation",
+		);
+	});
+
+	it("refuses everything when no URL source is wired", async () => {
+		const tool = createWebFetchTool(process.cwd(), { operations: okOperations() });
+
+		await expect(tool.execute("allow-6", { url: "https://docs.example.com/guide" })).rejects.toThrow(
+			"already appeared in this conversation",
+		);
+	});
+
+	it("extracts URLs from prose without swallowing trailing punctuation", () => {
+		expect(extractUrls("See https://a.example.com/x, and (https://b.example.com/y).")).toEqual([
+			"https://a.example.com/x",
+			"https://b.example.com/y",
+		]);
+		expect(extractUrls("URL: https://c.example.com/z\nnext line")).toEqual(["https://c.example.com/z"]);
+		expect(extractUrls("no links here")).toEqual([]);
+	});
+
+	it("normalizes only non-meaningful differences", () => {
+		expect(normalizeFetchUrl("HTTPS://Example.COM/")).toBe("https://example.com");
+		expect(normalizeFetchUrl("https://example.com/a?b=1#frag")).toBe("https://example.com/a?b=1");
+		expect(normalizeFetchUrl("ftp://example.com/a")).toBeUndefined();
+		expect(normalizeFetchUrl("not a url")).toBeUndefined();
+	});
+
+	it("refuses credentials smuggled into an otherwise allowed URL", async () => {
+		const tool = createWebFetchTool(process.cwd(), {
+			operations: okOperations(),
+			urlPolicy: conversationWith("https://docs.example.com/guide"),
+		});
+
+		expect(normalizeFetchUrl("https://secret@docs.example.com/guide")).toBeUndefined();
+		await expect(tool.execute("allow-7", { url: "https://secret@docs.example.com/guide" })).rejects.toThrow(
+			"already appeared in this conversation",
+		);
 	});
 });
 
@@ -254,6 +367,93 @@ describe("web_fetch network operations", () => {
 
 		expect(response.content).toBe("line one\nline two");
 		expect(response.title).toBeUndefined();
+	});
+});
+
+describe("web_fetch session integration", () => {
+	let tempDir: string;
+	let agentDir: string;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `volt-web-fetch-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		agentDir = join(tempDir, "agent");
+		mkdirSync(agentDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	async function createSession() {
+		const settingsManager = SettingsManager.create(tempDir, agentDir);
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const resourceLoader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		await resourceLoader.reload();
+		return createAgentSession({
+			cwd: tempDir,
+			agentDir,
+			model: getModel("anthropic", "claude-sonnet-4-5")!,
+			settingsManager,
+			sessionManager,
+			resourceLoader,
+		});
+	}
+
+	// Reserved by RFC 2606, so resolution fails before any request is made.
+	const USER_URL = "https://user-supplied.invalid/doc";
+	const SEARCH_URL = "https://from-search.invalid/page";
+	const ASSISTANT_URL = "https://assistant-invented.invalid/x";
+
+	it("permits URLs from the user and tool results but not ones the assistant wrote", async () => {
+		const { session } = await createSession();
+		const model = session.model!;
+		session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: `Please read ${USER_URL}` }], timestamp: Date.now() },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: `I should also read ${ASSISTANT_URL}` }],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			},
+			{
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "web_search",
+				content: [{ type: "text", text: `[1] A page\nURL: ${SEARCH_URL}\nSnippet: something` }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+		];
+
+		const tool = session.agent.state.tools.find((candidate) => candidate.name === "web_fetch");
+		expect(tool).toBeDefined();
+		const blocked = "web_fetch can only read URLs that already appeared in this conversation";
+
+		await expect(tool!.execute("session-1", { url: "https://never-mentioned.invalid/" })).rejects.toThrow(blocked);
+		await expect(tool!.execute("session-2", { url: ASSISTANT_URL })).rejects.toThrow(blocked);
+
+		// These are allowed, so they fail later (name resolution) rather than on the allowlist.
+		for (const allowed of [USER_URL, SEARCH_URL]) {
+			const error = await tool!.execute("session-3", { url: allowed }).then(
+				() => undefined,
+				(thrown: unknown) => thrown as Error,
+			);
+			expect(error).toBeInstanceOf(Error);
+			expect(error?.message).not.toContain(blocked);
+		}
+
+		session.dispose();
 	});
 });
 
