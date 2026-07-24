@@ -383,6 +383,10 @@ function projectToolArgs(
 			copyNumberArg(args, projected, "limit");
 			copyNumberArg(args, projected, "recencyDays");
 			break;
+		case "web_fetch":
+			copyStringArg(args, projected, "url");
+			copyNumberArg(args, projected, "maxBytes");
+			break;
 		default:
 			break;
 	}
@@ -751,6 +755,13 @@ function summarizeToolResult(
 			query
 				? `Searched web for ${boundSummary(query, TOOL_COMMAND_LIMIT)} (${statusText})`
 				: `Searched web (${statusText})`,
+			TOOL_SUMMARY_LIMIT,
+		);
+	}
+	if (toolName === "web_fetch") {
+		const url = getStringArg(args, "url");
+		return boundSummary(
+			url ? `Fetched ${boundSummary(url, TOOL_COMMAND_LIMIT)} (${statusText})` : `Fetched URL (${statusText})`,
 			TOOL_SUMMARY_LIMIT,
 		);
 	}

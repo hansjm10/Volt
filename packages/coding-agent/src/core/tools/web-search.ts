@@ -10,6 +10,7 @@ import type { Theme } from "../theme/runtime.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+import { cleanProviderContent, FALLBACK_MAX_LINES, parseProviderContent } from "./web-search-extract.ts";
 
 const DEFAULT_LIMIT = 5;
 const MAX_LIMIT = 10;
@@ -435,11 +436,14 @@ function extractChatGptAccountId(token: string): string {
 	return accountId;
 }
 
-function codexResponseLength(limit: number): "short" | "medium" | "long" {
-	if (limit <= 3) return "short";
-	if (limit <= 7) return "medium";
-	return "long";
-}
+/**
+ * Page depth requested from the Codex backend.
+ *
+ * Only the provider's per-result snippet survives extraction, so deeper page text is
+ * fetched, billed, and then discarded. Asking for more results must not ask for
+ * longer pages.
+ */
+const CODEX_RESPONSE_LENGTH = "short";
 
 function codexExternalWebAccess(env: Record<string, string | undefined>): boolean {
 	return env.VOLT_WEB_SEARCH_MODE?.trim().toLowerCase() === "live";
@@ -462,7 +466,7 @@ function buildCodexSearchBody(
 		model: context.model.id,
 		commands: {
 			search_query: [searchQuery],
-			response_length: codexResponseLength(request.limit),
+			response_length: CODEX_RESPONSE_LENGTH,
 		},
 		settings: {
 			allowed_callers: ["direct"],
@@ -629,7 +633,11 @@ function createOutput(
 	text: string;
 	details: WebSearchToolDetails;
 } {
-	const normalizedResults = response.results
+	// Backends that answer with a prose blob (OpenAI/Codex) leave `results` empty.
+	// Recovering the hits from the blob keeps page bodies out of the transcript and
+	// makes `limit` mean something on that path.
+	const rawResults = response.results.length > 0 ? response.results : parseProviderContent(response.content);
+	const normalizedResults = rawResults
 		.map((result) => parseSearchResult(result))
 		.filter((result): result is WebSearchResult => result !== undefined);
 	const results = normalizedResults.slice(0, request.limit);
@@ -644,8 +652,8 @@ function createOutput(
 		lines.push(`Recency: ${formatRecency(request.recencyDays)}`);
 	}
 
-	if (response.content) {
-		lines.push("", response.content.trim());
+	if (results.length === 0 && response.content) {
+		lines.push("", cleanProviderContent(response.content));
 	} else if (results.length === 0) {
 		lines.push("", "No web results found");
 	} else {
@@ -670,7 +678,7 @@ function createOutput(
 	}
 
 	const rawOutput = lines.join("\n");
-	const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+	const truncation = truncateHead(rawOutput, { maxLines: FALLBACK_MAX_LINES });
 	const details: WebSearchToolDetails = {
 		query: request.query,
 		...(response.query ? { submittedQuery: response.query } : {}),

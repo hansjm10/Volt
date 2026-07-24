@@ -59,7 +59,16 @@ describe("native planning state", () => {
 	it("keeps Plan tools read-only and restores the exact requested Build set", async () => {
 		const { session } = await createPlanningSession();
 		const planTools = session.getActiveToolNames();
-		expect(planTools).toEqual(["read", "web_search", "grep", "find", "ls", "update_plan", "submit_plan"]);
+		expect(planTools).toEqual([
+			"read",
+			"web_search",
+			"web_fetch",
+			"grep",
+			"find",
+			"ls",
+			"update_plan",
+			"submit_plan",
+		]);
 		expect(planTools).not.toContain("bash");
 		expect(planTools).not.toContain("mutate_everything");
 

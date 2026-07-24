@@ -1312,6 +1312,7 @@ describe("Iroh remote core helpers", () => {
 			"edit",
 			"write",
 			"web_search",
+			"web_fetch",
 		]);
 		expect(getIrohRemoteUnsafeAllowedTools("read,bash, edit,write,bash,web_search,custom")).toEqual([
 			"bash",
