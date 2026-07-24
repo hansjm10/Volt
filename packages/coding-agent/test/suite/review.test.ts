@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, type SimpleStreamOptions } from "@hansjm10/volt-ai";
@@ -538,9 +538,16 @@ describe("resolveReviewTarget", () => {
 		const repo = createRepo();
 		const binDir = join(repo, "bin");
 		mkdirSync(binDir);
-		const ghPath = join(binDir, "gh");
-		writeFileSync(ghPath, "#!/bin/sh\necho 'private-repository.example' >&2\nexit 1\n");
-		chmodSync(ghPath, 0o755);
+		const ghPath = join(binDir, process.platform === "win32" ? "gh.exe" : "gh");
+		if (process.platform === "win32") {
+			// Windows process lookup ignores extensionless scripts. A copied Node
+			// executable resolves its first argument (`pr`) as this fixture script.
+			copyFileSync(process.execPath, ghPath);
+			writeFileSync(join(repo, "pr"), "console.error('private-repository.example'); process.exit(1);\n");
+		} else {
+			writeFileSync(ghPath, "#!/bin/sh\necho 'private-repository.example' >&2\nexit 1\n");
+			chmodSync(ghPath, 0o755);
+		}
 		const originalPath = process.env.PATH;
 		process.env.PATH = `${binDir}${delimiter}${originalPath ?? ""}`;
 		try {

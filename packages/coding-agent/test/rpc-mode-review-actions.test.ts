@@ -188,6 +188,7 @@ function makeSession(sessionId: string, initialFastModeEnabled = false) {
 		settingsManager: {},
 		sessionFile: `/sessions/${sessionId}.jsonl`,
 		sessionId,
+		sessionManager: { flush: vi.fn(async () => {}) },
 	};
 }
 

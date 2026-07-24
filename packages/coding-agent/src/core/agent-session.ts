@@ -399,6 +399,8 @@ interface LiveClientInputOperation {
 	acceptedForDispatch: boolean;
 	dispatchBoundaryPersisted: boolean;
 	completion: Promise<void>;
+	attachCompletion(completion: Promise<void>): void;
+	rejectCompletion(error: Error): void;
 	queued: boolean;
 }
 
@@ -521,6 +523,7 @@ export class AgentSession {
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
 	private _disposed = false;
+	private _disposePromise?: Promise<void>;
 
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
@@ -849,6 +852,7 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<AgentMessage | undefined> => {
+		if (this._disposed) return undefined;
 		if (event.type === "agent_end") {
 			// All message/tool persistence for this run precedes agent_end. A branch
 			// rebase may now proceed while post-run extension/compaction work winds
@@ -867,7 +871,20 @@ export class AgentSession {
 				const steeringIndex = this._steeringMessages.findIndex((entry) => entry.queueEntryId === queueEntryId);
 				if (steeringIndex !== -1) {
 					const entry = this._steeringMessages[steeringIndex]!;
+					const operation = entry.clientMessageId ? this._liveClientInputs.get(entry.clientMessageId) : undefined;
 					this._dequeuedQueueClientMessageIds.set(queueEntryId, entry.clientMessageId ?? null);
+					await this._markClientInputDispatchStarted(entry.clientMessageId, operation);
+					if (
+						this._disposed ||
+						!this._steeringMessages.some((candidate) => candidate.queueEntryId === entry.queueEntryId) ||
+						(entry.clientMessageId !== undefined &&
+							(this._liveClientInputs.get(entry.clientMessageId) !== operation ||
+								this.sessionManager.getClientInput(entry.clientMessageId)?.state === "failed"))
+					) {
+						this._dequeuedQueueClientMessageIds.delete(queueEntryId);
+						this.agent.abort();
+						return undefined;
+					}
 					this._startDequeuedClientInput(entry);
 					this._steeringMessages.splice(steeringIndex, 1);
 					this._emitQueueUpdate();
@@ -876,7 +893,22 @@ export class AgentSession {
 					const followUpIndex = this._followUpMessages.findIndex((entry) => entry.queueEntryId === queueEntryId);
 					if (followUpIndex !== -1) {
 						const entry = this._followUpMessages[followUpIndex]!;
+						const operation = entry.clientMessageId
+							? this._liveClientInputs.get(entry.clientMessageId)
+							: undefined;
 						this._dequeuedQueueClientMessageIds.set(queueEntryId, entry.clientMessageId ?? null);
+						await this._markClientInputDispatchStarted(entry.clientMessageId, operation);
+						if (
+							this._disposed ||
+							!this._followUpMessages.some((candidate) => candidate.queueEntryId === entry.queueEntryId) ||
+							(entry.clientMessageId !== undefined &&
+								(this._liveClientInputs.get(entry.clientMessageId) !== operation ||
+									this.sessionManager.getClientInput(entry.clientMessageId)?.state === "failed"))
+						) {
+							this._dequeuedQueueClientMessageIds.delete(queueEntryId);
+							this.agent.abort();
+							return undefined;
+						}
 						this._startDequeuedClientInput(entry);
 						this._followUpMessages.splice(followUpIndex, 1);
 						this._emitQueueUpdate();
@@ -910,10 +942,11 @@ export class AgentSession {
 			normalizedEvent.message.role === "user" &&
 			normalizedEvent.message.clientMessageId !== undefined
 		) {
-			this._markClientInputDispatchStarted(
+			await this._markClientInputDispatchStarted(
 				normalizedEvent.message.clientMessageId,
 				this._liveClientInputs.get(normalizedEvent.message.clientMessageId),
 			);
+			if (this._disposed) return undefined;
 		}
 
 		// Extensions can functionally replace a finalized message. Feed the
@@ -922,7 +955,9 @@ export class AgentSession {
 		let replacement: AgentMessage | undefined;
 		try {
 			replacement = await this._emitExtensionEvent(normalizedEvent);
+			if (this._disposed) return undefined;
 		} catch (error) {
+			if (this._disposed) return undefined;
 			let fatalError = error instanceof Error ? error : new Error(String(error));
 			if (
 				error instanceof ExtensionMessageRoleMismatchError &&
@@ -934,7 +969,7 @@ export class AgentSession {
 				const operation = this._liveClientInputs.get(clientMessageId);
 				if (operation) {
 					try {
-						this._failLiveClientInput(clientMessageId, operation, fatalError);
+						await this._failLiveClientInput(clientMessageId, operation, fatalError);
 					} catch (transitionError) {
 						fatalError = transitionError instanceof Error ? transitionError : new Error(String(transitionError));
 					}
@@ -984,6 +1019,7 @@ export class AgentSession {
 				this.sessionManager.appendMessage(handledEvent.message);
 			}
 			if (handledEvent.message.role === "user" && handledEvent.message.clientMessageId !== undefined) {
+				await this.sessionManager.flush();
 				this._completeLiveClientInput(handledEvent.message.clientMessageId, "admitted");
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
@@ -1167,11 +1203,10 @@ export class AgentSession {
 		return this._conversationGenerationRevision;
 	}
 
-	private _emitConversationGenerationChange(change: ConversationGenerationChange): void {
+	private _notifyConversationGenerationChange(change: ConversationGenerationChange): void {
 		if (change.previousLeafId === change.nextLeafId) {
 			return;
 		}
-		this._conversationGenerationRevision++;
 		for (const listener of this._conversationGenerationListeners) {
 			try {
 				listener(change);
@@ -1219,12 +1254,18 @@ export class AgentSession {
 	 * Remove all listeners and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
-	dispose(): void {
-		if (this._disposed) {
-			return;
+	dispose(): Promise<void> {
+		if (this._disposePromise) {
+			return this._disposePromise;
 		}
 		this._disposed = true;
 		this._dequeuedQueueClientMessageIds.clear();
+		const disposalError = new Error("Session disposed before client input completed");
+		for (const operation of this._liveClientInputs.values()) {
+			operation.rejectAccepted(disposalError);
+			operation.rejectCompletion(disposalError);
+		}
+		this._liveClientInputs.clear();
 
 		try {
 			// Persist terminal markers for in-flight tool calls FIRST: dispose
@@ -1234,6 +1275,32 @@ export class AgentSession {
 			// (e.g. a daemon runtime torn down for a lease handoff) leaves a
 			// dangling toolCall in the transcript.
 			this._persistAbortedResultsForDanglingToolCalls();
+			// Bash results completed during a turn were intentionally deferred for
+			// transcript ordering. Place them after synthesized tool results before
+			// sealing the final persistence watermark.
+			this._flushPendingBashMessages();
+		} catch {
+			// Persistence failures are reflected by the final drain promise.
+		}
+		const persistenceDrain = this.sessionManager.closePersistence();
+		let subagentDrain: Promise<void>;
+		let mcpDrain: Promise<void>;
+		try {
+			subagentDrain = this._subagentToolManager?.dispose?.() ?? Promise.resolve();
+		} catch (error) {
+			subagentDrain = Promise.reject(error);
+		}
+		try {
+			mcpDrain = this._mcpManager?.dispose() ?? Promise.resolve();
+		} catch (error) {
+			mcpDrain = Promise.reject(error);
+		}
+		this._disposePromise = Promise.allSettled([persistenceDrain, subagentDrain, mcpDrain]).then((results) => {
+			const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+			if (rejected) throw rejected.reason;
+		});
+
+		try {
 			this.abortRetry();
 			this.abortCompaction();
 			this.abortBranchSummary();
@@ -1245,10 +1312,8 @@ export class AgentSession {
 			this._lspManager?.dispose();
 			this._unsubscribeMcpManager?.();
 			this._unsubscribeMcpManager = undefined;
-			void this._subagentToolManager?.dispose?.().catch(() => undefined);
-			void this._mcpManager?.dispose();
 		} catch {
-			// Dispose must succeed even if an abort hook throws.
+			// Dispose must continue even if an abort hook throws.
 		}
 
 		this._extensionRunner.invalidate(
@@ -1268,6 +1333,8 @@ export class AgentSession {
 		this._eventListeners = [];
 		this._conversationGenerationListeners.clear();
 		cleanupSessionResources(this.sessionId);
+		this._disposePromise ??= this.sessionManager.flush();
+		return this._disposePromise;
 	}
 
 	/**
@@ -1352,6 +1419,10 @@ export class AgentSession {
 
 	getPlanningState(): PlanningState {
 		return this.planningState;
+	}
+
+	flushPlanningState(): Promise<void> {
+		return this.sessionManager.flush();
 	}
 
 	decorateProviderMessages(messages: AgentMessage[]): AgentMessage[] {
@@ -1804,13 +1875,13 @@ export class AgentSession {
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
 
-	private _beginClientInput(
+	private async _beginClientInput(
 		command: ClientInputCommand,
 		message: string,
 		images: ImageContent[] | undefined,
 		clientMessageId: string | undefined,
 		streamingBehavior?: "steer" | "followUp",
-	): ClientInputAdmission {
+	): Promise<ClientInputAdmission> {
 		if (clientMessageId === undefined) {
 			return { kind: "none" };
 		}
@@ -1852,14 +1923,30 @@ export class AgentSession {
 		// Accepted remains recoverable throughout abortable preflight. Immediate
 		// and queued input complete only through their canonical identified user
 		// append, so a daemon restart never guesses whether provider work began.
-		const operation = this._createLiveClientInputOperation(command, semanticDigest);
+		const operation = this._createLiveClientInputOperation(command, semanticDigest, command === "prompt");
 		this._liveClientInputs.set(clientMessageId, operation);
+		try {
+			// A newly accepted remote identity is not acknowledged until its receipt
+			// and every earlier commit have reached the durable queue watermark.
+			await this.sessionManager.flush();
+			if (this._disposed) {
+				throw new Error("Session disposed before client input admission completed");
+			}
+		} catch (error) {
+			if (this._liveClientInputs.get(clientMessageId) === operation) {
+				this._liveClientInputs.delete(clientMessageId);
+			}
+			const persistenceError = error instanceof Error ? error : new Error(String(error));
+			operation.rejectAccepted(persistenceError);
+			throw persistenceError;
+		}
 		return { kind: "start", operation };
 	}
 
 	private _createLiveClientInputOperation(
 		command: ClientInputCommand,
 		semanticDigest: string,
+		completionPending = false,
 	): LiveClientInputOperation {
 		let resolveAccepted!: (outcome: PromptAdmissionOutcome) => void;
 		let rejectAccepted!: (error: Error) => void;
@@ -1868,6 +1955,15 @@ export class AgentSession {
 			rejectAccepted = reject;
 		});
 		void accepted.catch(() => {});
+		let resolveCompletion!: () => void;
+		let rejectCompletionPromise!: (error: unknown) => void;
+		const completion = new Promise<void>((resolve, reject) => {
+			resolveCompletion = resolve;
+			rejectCompletionPromise = reject;
+		});
+		void completion.catch(() => {});
+		let completionAttached = !completionPending;
+		if (!completionPending) resolveCompletion();
 		const operation: LiveClientInputOperation = {
 			command,
 			semanticDigest,
@@ -1875,7 +1971,15 @@ export class AgentSession {
 			acceptanceSettled: false,
 			acceptedForDispatch: false,
 			dispatchBoundaryPersisted: false,
-			completion: Promise.resolve(),
+			completion,
+			attachCompletion(nextCompletion) {
+				if (completionAttached) return;
+				completionAttached = true;
+				void nextCompletion.then(resolveCompletion, rejectCompletionPromise);
+			},
+			rejectCompletion(error) {
+				rejectCompletionPromise(error);
+			},
 			queued: false,
 			resolveAccepted(outcome) {
 				if (operation.acceptanceSettled) return;
@@ -1892,12 +1996,12 @@ export class AgentSession {
 		return operation;
 	}
 
-	private _failLiveClientInput(
+	private async _failLiveClientInput(
 		clientMessageId: string,
 		operation: LiveClientInputOperation,
 		error: Error,
 		reason: "queue_cleared" | "dispatch_failed" = "dispatch_failed",
-	): void {
+	): Promise<void> {
 		const current = this._liveClientInputs.get(clientMessageId);
 		if (current !== operation) return;
 		const admissionWasAcknowledged = operation.acceptanceSettled;
@@ -1905,6 +2009,7 @@ export class AgentSession {
 		let terminalPersisted = false;
 		try {
 			this.sessionManager.transitionClientInput(clientMessageId, "failed", error.message);
+			await this.sessionManager.flush();
 			terminalPersisted = true;
 		} catch (transitionError) {
 			reportedError =
@@ -1929,12 +2034,15 @@ export class AgentSession {
 		this._liveClientInputs.delete(clientMessageId);
 	}
 
-	private _markClientInputDispatchStarted(
+	private async _markClientInputDispatchStarted(
 		clientMessageId: string | undefined,
 		operation: LiveClientInputOperation | undefined,
-	): void {
+	): Promise<void> {
 		if (clientMessageId === undefined || operation === undefined) {
 			return;
+		}
+		if (this._disposed) {
+			throw new Error("Session disposed before client input dispatch");
 		}
 		const record = this.sessionManager.getClientInput(clientMessageId);
 		// The durable record is authoritative. An input hook may already have
@@ -1944,6 +2052,10 @@ export class AgentSession {
 		// the earlier one.
 		if (record?.state === "accepted") {
 			this.sessionManager.transitionClientInput(clientMessageId, "started");
+			await this.sessionManager.flush();
+			if (this._disposed) {
+				throw new Error("Session disposed before client input dispatch");
+			}
 		} else if (operation.dispatchBoundaryPersisted) {
 			return;
 		}
@@ -1959,7 +2071,7 @@ export class AgentSession {
 			(outcome) => preflightResult?.({ success: true, outcome }),
 			() => preflightResult?.({ success: false }),
 		);
-		return operation.completion;
+		return operation.accepted.then(() => operation.completion);
 	}
 
 	/**
@@ -2304,31 +2416,45 @@ export class AgentSession {
 	 * @throws Error if streaming and no streamingBehavior specified
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
-	prompt(text: string, options?: PromptOptions): Promise<void> {
+	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		if (this._disposed) {
+			throw new Error("Cannot prompt a disposed session");
+		}
 		if (this._hasSessionOperationBarrier) {
-			return Promise.reject(new Error("Cannot prompt while a session mutation is active"));
+			throw new Error("Cannot prompt while a session mutation is active");
+		}
+		const assertConversationGenerationCurrent = this._captureConversationGenerationAssertion(
+			options?.assertConversationGenerationCurrent,
+		);
+		assertConversationGenerationCurrent();
+		this._assertRecoveredClientInputOrdering(options?.clientMessageId);
+		const admission: ClientInputAdmission =
+			options?.clientMessageId === undefined
+				? { kind: "none" }
+				: await this._beginClientInput(
+						"prompt",
+						text,
+						options.images,
+						options.clientMessageId,
+						options.streamingBehavior,
+					);
+		try {
+			assertConversationGenerationCurrent();
+		} catch (error) {
+			if (admission.kind === "start" && options?.clientMessageId !== undefined) {
+				if (this._liveClientInputs.get(options.clientMessageId) === admission.operation) {
+					this._liveClientInputs.delete(options.clientMessageId);
+				}
+				const normalized = error instanceof Error ? error : new Error(String(error));
+				admission.operation.rejectAccepted(normalized);
+				admission.operation.rejectCompletion(normalized);
+			}
+			throw error;
 		}
 		const isRunning = this.isStreaming;
 		const shouldQueue = isRunning || this._activePromptTransactions.size > 0 || this._abortPromise !== undefined;
 		const allowQueue = isRunning && this._abortPromise === undefined;
 		const abortGeneration = this._abortGeneration;
-		const assertConversationGenerationCurrent = this._captureConversationGenerationAssertion(
-			options?.assertConversationGenerationCurrent,
-		);
-		let admission: ClientInputAdmission;
-		try {
-			assertConversationGenerationCurrent();
-			this._assertRecoveredClientInputOrdering(options?.clientMessageId);
-			admission = this._beginClientInput(
-				"prompt",
-				text,
-				options?.images,
-				options?.clientMessageId,
-				options?.streamingBehavior,
-			);
-		} catch (error) {
-			return Promise.reject(error);
-		}
 		if (admission.kind === "completed") {
 			options?.preflightResult?.({ success: true, outcome: "completed" });
 			return Promise.resolve();
@@ -2375,6 +2501,7 @@ export class AgentSession {
 				);
 				if (operation && clientMessageId && outcome === "handled") {
 					this.sessionManager.transitionClientInput(clientMessageId, "completed");
+					await this.sessionManager.flush();
 					this._completeLiveClientInput(clientMessageId, "completed");
 				} else if (!operation && outcome === "handled") {
 					// Local/prompt-backed UI actions have no durable client identity, but
@@ -2384,13 +2511,13 @@ export class AgentSession {
 			} catch (error) {
 				const normalized = error instanceof Error ? error : new Error(String(error));
 				if (operation && clientMessageId && !operation.acceptedForDispatch) {
-					this._failLiveClientInput(clientMessageId, operation, normalized);
+					await this._failLiveClientInput(clientMessageId, operation, normalized);
 				}
 				throw normalized;
 			}
 		});
 		if (operation) {
-			operation.completion = completion;
+			operation.attachCompletion(completion);
 			void completion
 				.finally(() => {
 					if (clientMessageId && this._liveClientInputs.get(clientMessageId) === operation && !operation.queued) {
@@ -2427,9 +2554,9 @@ export class AgentSession {
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via volt.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
-				const handled = await this._tryExecuteExtensionCommand(text, transactionId, () => {
-					this._markClientInputDispatchStarted(options?.clientMessageId, operation);
-				});
+				const handled = await this._tryExecuteExtensionCommand(text, transactionId, () =>
+					this._markClientInputDispatchStarted(options?.clientMessageId, operation),
+				);
 				assertConversationGenerationCurrent();
 				if (handled) {
 					// Extension command executed, no prompt to send
@@ -2445,7 +2572,7 @@ export class AgentSession {
 				// before entering them. A later durable queued payload safely returns
 				// this receipt to recoverable `accepted`; a crash in between never
 				// re-executes an uncertain hook.
-				this._markClientInputDispatchStarted(options?.clientMessageId, operation);
+				await this._markClientInputDispatchStarted(options?.clientMessageId, operation);
 				const inputResult = await this._extensionRunner.emitInput(
 					currentText,
 					currentImages,
@@ -2526,7 +2653,7 @@ export class AgentSession {
 			// invoke side-effect-capable compaction, before_agent_start, and message
 			// hooks. Persist the ambiguous dispatch boundary before any of them so a
 			// crash never replays extension or provider side effects.
-			this._markClientInputDispatchStarted(options?.clientMessageId, operation);
+			await this._markClientInputDispatchStarted(options?.clientMessageId, operation);
 
 			// Check if we need to compact before sending (catches aborted responses)
 			const lastAssistant = this._findLastAssistantMessage();
@@ -2642,7 +2769,7 @@ export class AgentSession {
 	private async _tryExecuteExtensionCommand(
 		text: string,
 		transactionId: symbol,
-		onWillExecute?: () => void,
+		onWillExecute?: () => Promise<void>,
 	): Promise<boolean> {
 		// Parse command name and args
 		const spaceIndex = text.indexOf(" ");
@@ -2655,7 +2782,7 @@ export class AgentSession {
 		// A command handler is an arbitrary side-effect boundary with no canonical
 		// user append. Persist `started` first so a crash can only replay an
 		// explicit ambiguous outcome, never execute the handler twice.
-		onWillExecute?.();
+		await onWillExecute?.();
 
 		// Command transactions must not wait on themselves or each other.
 		// waitForIdle still waits for active runs and non-command prompt work.
@@ -2718,11 +2845,17 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async steer(text: string, images?: ImageContent[], clientMessageId?: string): Promise<void> {
+		if (this._disposed) {
+			throw new Error("Cannot queue input on a disposed session");
+		}
 		if (this._hasSessionOperationBarrier) {
 			throw new Error("Cannot queue input while a session mutation is active");
 		}
 		this._assertRecoveredClientInputOrdering(clientMessageId);
-		const admission = this._beginClientInput("steer", text, images, clientMessageId);
+		const admission: ClientInputAdmission =
+			clientMessageId === undefined
+				? { kind: "none" }
+				: await this._beginClientInput("steer", text, images, clientMessageId);
 		if (admission.kind === "completed") return;
 		if (admission.kind === "live") {
 			await admission.operation.accepted;
@@ -2744,7 +2877,7 @@ export class AgentSession {
 		} catch (error) {
 			const normalized = error instanceof Error ? error : new Error(String(error));
 			if (operation && clientMessageId) {
-				this._failLiveClientInput(clientMessageId, operation, normalized);
+				await this._failLiveClientInput(clientMessageId, operation, normalized);
 			}
 			throw normalized;
 		}
@@ -2758,11 +2891,17 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async followUp(text: string, images?: ImageContent[], clientMessageId?: string): Promise<void> {
+		if (this._disposed) {
+			throw new Error("Cannot queue input on a disposed session");
+		}
 		if (this._hasSessionOperationBarrier) {
 			throw new Error("Cannot queue input while a session mutation is active");
 		}
 		this._assertRecoveredClientInputOrdering(clientMessageId);
-		const admission = this._beginClientInput("follow_up", text, images, clientMessageId);
+		const admission: ClientInputAdmission =
+			clientMessageId === undefined
+				? { kind: "none" }
+				: await this._beginClientInput("follow_up", text, images, clientMessageId);
 		if (admission.kind === "completed") return;
 		if (admission.kind === "live") {
 			await admission.operation.accepted;
@@ -2784,7 +2923,7 @@ export class AgentSession {
 		} catch (error) {
 			const normalized = error instanceof Error ? error : new Error(String(error));
 			if (operation && clientMessageId) {
-				this._failLiveClientInput(clientMessageId, operation, normalized);
+				await this._failLiveClientInput(clientMessageId, operation, normalized);
 			}
 			throw normalized;
 		}
@@ -2803,6 +2942,10 @@ export class AgentSession {
 				message: text,
 				...(images === undefined ? {} : { images }),
 			});
+			await this.sessionManager.flush();
+			if (this._disposed) {
+				throw new Error("Session disposed before queued input admission completed");
+			}
 		}
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
@@ -2840,6 +2983,10 @@ export class AgentSession {
 				message: text,
 				...(images === undefined ? {} : { images }),
 			});
+			await this.sessionManager.flush();
+			if (this._disposed) {
+				throw new Error("Session disposed before queued input admission completed");
+			}
 		}
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
@@ -2990,22 +3137,40 @@ export class AgentSession {
 	 * Useful for restoring to editor when user aborts.
 	 * @returns Object with steering and followUp arrays
 	 */
-	clearQueue(): { steering: string[]; followUp: string[] } {
+	async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
 		const steering = this._steeringMessages.map((entry) => entry.text);
 		const followUp = this._followUpMessages.map((entry) => entry.text);
+		const queuedOperations = [...this._liveClientInputs].filter(([, operation]) => operation.queued);
+		const terminalError = new Error("client_input_failed: queued input was cleared before canonical consumption");
+
+		for (const [clientMessageId] of queuedOperations) {
+			this.sessionManager.transitionClientInput(clientMessageId, "failed", terminalError.message);
+		}
+		// Revoke runtime queue ownership synchronously so the agent cannot dequeue
+		// input after its terminal WAL record has been accepted for persistence.
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this.agent.clearAllQueues();
-		for (const [clientMessageId, operation] of this._liveClientInputs) {
-			if (!operation.queued) continue;
-			this._failLiveClientInput(
-				clientMessageId,
-				operation,
-				new Error("client_input_failed: queued input was cleared before canonical consumption"),
-				"queue_cleared",
-			);
-		}
 		this._emitQueueUpdate();
+
+		try {
+			await this.sessionManager.flush();
+		} catch (error) {
+			for (const [clientMessageId, operation] of queuedOperations) {
+				operation.rejectAccepted(error instanceof Error ? error : new Error(String(error)));
+				this._liveClientInputs.delete(clientMessageId);
+			}
+			throw error;
+		}
+
+		for (const [clientMessageId, operation] of queuedOperations) {
+			const admissionWasAcknowledged = operation.acceptanceSettled;
+			operation.rejectAccepted(terminalError);
+			this._liveClientInputs.delete(clientMessageId);
+			if (admissionWasAcknowledged) {
+				this._emitClientInputOutcome(clientMessageId, "failed", "queue_cleared");
+			}
+		}
 		return { steering, followUp };
 	}
 
@@ -3087,6 +3252,7 @@ export class AgentSession {
 		}
 
 		this.setThinkingLevel(thinkingLevel, { persistDefault });
+		await Promise.all([this.sessionManager.flush(), this.settingsManager.flush()]);
 
 		await this._emitModelSelect(model, previousModel, "set");
 	}
@@ -3121,6 +3287,7 @@ export class AgentSession {
 		this.agent.state.model = next.model;
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 		this.setThinkingLevel(thinkingLevel);
+		await Promise.all([this.sessionManager.flush(), this.settingsManager.flush()]);
 
 		await this._emitModelSelect(next.model, currentModel, "cycle");
 
@@ -3144,6 +3311,7 @@ export class AgentSession {
 		this.agent.state.model = nextModel;
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 		this.setThinkingLevel(thinkingLevel);
+		await Promise.all([this.sessionManager.flush(), this.settingsManager.flush()]);
 
 		await this._emitModelSelect(nextModel, currentModel, "cycle");
 
@@ -3492,6 +3660,7 @@ export class AgentSession {
 
 			assertConversationGenerationCurrent?.();
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
+			await this.sessionManager.flush();
 			this._proactiveCompactionAttempted = false;
 			const compactionResult = await this._finalizeCompaction(
 				summary,
@@ -3848,6 +4017,7 @@ export class AgentSession {
 
 			assertConversationCurrent();
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
+			await this.sessionManager.flush();
 			this._proactiveCompactionAttempted = false;
 			const result = await this._finalizeCompaction(
 				summary,
@@ -4424,6 +4594,7 @@ export class AgentSession {
 		try {
 			const previousFlagValues = this._extensionRunner.getFlagValues();
 			await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
+			await this.sessionManager.flush();
 			await this.settingsManager.reload();
 			this.syncAgentRuntimeSettingsFromSettings();
 			this._modelRegistry.clearRegisteredProviders();
@@ -4461,6 +4632,7 @@ export class AgentSession {
 				await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
 				await this.extendResourcesFromExtensions("reload");
 			}
+			await this.sessionManager.flush();
 		} finally {
 			this._reloadInProgress = false;
 		}
@@ -4614,6 +4786,9 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; operations?: BashOperations },
 	): Promise<BashResult> {
+		if (this._disposed) {
+			throw new Error("Cannot execute bash on a disposed session");
+		}
 		if (this._hasSessionOperationBarrier) {
 			throw new Error("Cannot execute bash while a session mutation is active");
 		}
@@ -4647,6 +4822,7 @@ export class AgentSession {
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		if (this._disposed) return;
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
 			command,
@@ -5002,6 +5178,20 @@ export class AgentSession {
 				this.sessionManager.appendLabelChange(targetId, label);
 			}
 
+			const conversationGenerationChange = {
+				previousLeafId: oldLeafId,
+				nextLeafId: this.sessionManager.getLeafId(),
+			};
+			if (conversationGenerationChange.previousLeafId !== conversationGenerationChange.nextLeafId) {
+				// Invalidate prompt authority as soon as the in-memory leaf changes. The
+				// observer notification remains behind the durability boundary below.
+				this._conversationGenerationRevision++;
+			}
+
+			// Summary and label entries must be durable before the new branch state
+			// and its extension events are published.
+			await this.sessionManager.flush();
+
 			// Update agent state
 			const sessionContext = this.sessionManager.buildSessionContext();
 			const previousModel = this.model;
@@ -5036,10 +5226,7 @@ export class AgentSession {
 			if (this.model) {
 				await this._emitModelSelect(this.model, previousModel, "restore");
 			}
-			this._emitConversationGenerationChange({
-				previousLeafId: oldLeafId,
-				nextLeafId: this.sessionManager.getLeafId(),
-			});
+			this._notifyConversationGenerationChange(conversationGenerationChange);
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({
@@ -5192,6 +5379,7 @@ export class AgentSession {
 	 * @returns Path to exported file
 	 */
 	async exportToHtml(outputPath?: string): Promise<string> {
+		await this.sessionManager.flush();
 		const configuredThemeName = this.settingsManager.getTheme();
 		const themeName = configuredThemeName && getThemeByName(configuredThemeName) ? configuredThemeName : undefined;
 

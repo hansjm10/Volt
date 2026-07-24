@@ -6,29 +6,26 @@ import {
 	constants,
 	createReadStream,
 	existsSync,
-	fchmodSync,
 	fstatSync,
-	fsyncSync,
-	ftruncateSync,
 	openSync,
 	readdirSync,
 	readSync,
 	statSync,
-	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
 import { basename, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
-import { writeDurableAtomicFileSync } from "../utils/durable-atomic-write.ts";
+import { writeDurableAtomicFile, writeDurableAtomicFileSync } from "../utils/durable-atomic-write.ts";
 import { canonicalizePath, normalizePath, resolvePath } from "../utils/paths.ts";
 import {
 	ensurePrivateDirectorySync,
 	hardenPrivateRegularFileSync,
+	openPrivateRegularFile,
 	PRIVATE_DIRECTORY_MODE,
 	PRIVATE_FILE_MODE,
-	writePrivateNewFileSync,
+	writePrivateNewFile,
 } from "../utils/private-files.ts";
 import {
 	type BashExecutionMessage,
@@ -968,21 +965,37 @@ function parseSessionEntryLine(line: string): FileEntry | null {
  * Opening a session is deliberately read-only: target discovery and phone
  * relay attach may inspect a file while another lease owner is writing it.
  * Repair therefore happens only when this manager is actually appending, and
- * repair plus append share one no-follow descriptor. Any repair is fsynced
- * before the new boundary is written.
+ * any repair is fsynced before the new boundary is written. Windows reopens
+ * the verified file with O_APPEND because its O_APPEND handles cannot truncate;
+ * other platforms use one no-follow append descriptor throughout.
  */
-function appendSessionFileEntry(filePath: string, content: string, durable: boolean): void {
-	const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-	const fd = openSync(filePath, constants.O_RDWR | constants.O_APPEND | noFollow);
-	try {
-		const fileStat = fstatSync(fd);
-		if (!fileStat.isFile() || fileStat.nlink !== 1) {
-			throw new Error(`Refusing to append non-private session file: ${filePath}`);
+const sessionFileOperationQueues = new Map<string, Promise<void>>();
+
+/** Serialize filesystem mutations across managers that temporarily share one session file. */
+function serializeSessionFileOperation(filePath: string, operation: () => Promise<void>): Promise<void> {
+	const previous = sessionFileOperationQueues.get(filePath) ?? Promise.resolve();
+	const task = previous.then(operation);
+	const lane = task.catch(() => {});
+	sessionFileOperationQueues.set(filePath, lane);
+	return task.finally(() => {
+		if (sessionFileOperationQueues.get(filePath) === lane) {
+			sessionFileOperationQueues.delete(filePath);
 		}
-		fchmodSync(fd, PRIVATE_FILE_MODE);
+	});
+}
+
+async function appendSessionFileEntry(filePath: string, content: string, durable: boolean): Promise<void> {
+	// Windows rejects ftruncate on a descriptor opened with O_APPEND. Inspect and
+	// repair without it, then reopen with OS-level append semantics for the entry.
+	const appendFlag = process.platform === "win32" ? 0 : constants.O_APPEND;
+	let handle = await openPrivateRegularFile(filePath, constants.O_RDWR | appendFlag);
+	let failed = false;
+	try {
+		const fileStat = await handle.stat();
+		let appendOffset = fileStat.size;
 		if (fileStat.size > 0) {
 			const lastByte = Buffer.allocUnsafe(1);
-			if (readSync(fd, lastByte, 0, 1, fileStat.size - 1) !== 1) {
+			if ((await handle.read(lastByte, 0, 1, fileStat.size - 1)).bytesRead !== 1) {
 				throw new Error(`Failed to inspect session tail: ${filePath}`);
 			}
 			if (lastByte[0] !== 0x0a) {
@@ -993,7 +1006,7 @@ function appendSessionFileEntry(filePath: string, content: string, durable: bool
 				while (cursor > 0 && !foundDelimiter) {
 					const length = Math.min(scanBuffer.length, cursor);
 					const offset = cursor - length;
-					const bytesRead = readSync(fd, scanBuffer, 0, length, offset);
+					const { bytesRead } = await handle.read(scanBuffer, 0, length, offset);
 					if (bytesRead !== length) throw new Error(`Failed to inspect session tail: ${filePath}`);
 					for (let index = length - 1; index >= 0; index--) {
 						if (scanBuffer[index] === 0x0a) {
@@ -1009,8 +1022,7 @@ function appendSessionFileEntry(filePath: string, content: string, durable: bool
 				const finalRecord = Buffer.allocUnsafe(finalRecordLength);
 				let bytesLoaded = 0;
 				while (bytesLoaded < finalRecordLength) {
-					const bytesRead = readSync(
-						fd,
+					const { bytesRead } = await handle.read(
 						finalRecord,
 						bytesLoaded,
 						finalRecordLength - bytesLoaded,
@@ -1021,17 +1033,44 @@ function appendSessionFileEntry(filePath: string, content: string, durable: bool
 				}
 
 				if (parseSessionEntryLine(finalRecord.toString("utf8"))) {
-					writeFileSync(fd, "\n", "utf8");
+					const { bytesWritten } = await handle.write("\n", fileStat.size, "utf8");
+					if (bytesWritten !== 1) throw new Error(`Failed to repair session tail: ${filePath}`);
+					appendOffset = fileStat.size + 1;
 				} else {
-					ftruncateSync(fd, finalRecordOffset);
+					await handle.truncate(finalRecordOffset);
+					appendOffset = finalRecordOffset;
 				}
-				fsyncSync(fd);
+				await handle.sync();
 			}
 		}
-		writeFileSync(fd, content, "utf8");
-		if (durable) fsyncSync(fd);
+		let appendPosition: number | null = appendOffset;
+		if (process.platform === "win32") {
+			await handle.close();
+			handle = await openPrivateRegularFile(filePath, constants.O_WRONLY | constants.O_APPEND);
+			appendPosition = null;
+		}
+		const entryBuffer = Buffer.from(content, "utf8");
+		let bytesWritten = 0;
+		while (bytesWritten < entryBuffer.length) {
+			const result = await handle.write(
+				entryBuffer,
+				bytesWritten,
+				entryBuffer.length - bytesWritten,
+				appendPosition === null ? null : appendPosition + bytesWritten,
+			);
+			if (result.bytesWritten === 0) throw new Error(`Failed to append session entry: ${filePath}`);
+			bytesWritten += result.bytesWritten;
+		}
+		if (durable) await handle.sync();
+	} catch (error) {
+		failed = true;
+		throw error;
 	} finally {
-		closeSync(fd);
+		if (failed) {
+			await handle.close().catch(() => {});
+		} else {
+			await handle.close();
+		}
 	}
 }
 
@@ -1515,6 +1554,12 @@ export class SessionManager {
 	private sessionFileNeedsMigration = false;
 	/** First uncertain persistence failure. This manager remains fail-stopped until reloaded. */
 	private persistenceError: Error | undefined;
+	/** Prevents a disposed persisted session from accepting work after its final drain watermark. */
+	private persistenceClosed = false;
+	/** Settled internal lane used to serialize immutable filesystem work. */
+	private persistenceQueue: Promise<void> = Promise.resolve();
+	/** Promise for all persistence work accepted through the latest synchronous mutation. */
+	private persistenceWatermark: Promise<void> = Promise.resolve();
 	private readonly entryListeners = new Set<SessionEntryListener>();
 	private readonly branchListeners = new Set<SessionBranchListener>();
 
@@ -1591,7 +1636,6 @@ export class SessionManager {
 		this.clientInputsById.clear();
 		this.leafId = null;
 		this.nextOrdinal = 1;
-		this.persistenceError = undefined;
 		this.sessionFileNeedsMigration = false;
 		this.flushed = false;
 
@@ -1609,7 +1653,6 @@ export class SessionManager {
 		this.clientInputsById.clear();
 		this.leafId = null;
 		this.nextOrdinal = 1;
-		this.persistenceError = undefined;
 		const currentVersion =
 			(this.fileEntries.find((entry) => entry.type === "session") as SessionHeader | undefined)?.version ===
 			CURRENT_SESSION_VERSION;
@@ -1659,12 +1702,48 @@ export class SessionManager {
 		}
 	}
 
+	private _enqueuePersistence(write: () => Promise<void>): void {
+		const task = this.persistenceQueue.then(async () => {
+			if (this.persistenceError) throw this.persistenceError;
+			try {
+				await write();
+			} catch (error) {
+				this.persistenceError ??= error instanceof Error ? error : new Error(String(error));
+				throw this.persistenceError;
+			}
+		});
+		// Keep the serialization lane fulfilled so later accepted work can observe
+		// the sticky error and stop without touching disk. The public watermark
+		// retains rejection for flush callers.
+		this.persistenceQueue = task.catch(() => {});
+		this.persistenceWatermark = task;
+		void task.catch(() => {});
+	}
+
+	private _serializeFileEntries(): string {
+		return `${this.fileEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+	}
+
+	private _createFile(): void {
+		if (!this.persist || !this.sessionFile) return;
+		const filePath = this.sessionFile;
+		const content = this._serializeFileEntries();
+		this._enqueuePersistence(() =>
+			serializeSessionFileOperation(filePath, () => writePrivateNewFile(filePath, content)),
+		);
+	}
+
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		writeDurableAtomicFileSync(
-			this.sessionFile,
-			`${this.fileEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
-			{ directoryMode: PRIVATE_DIRECTORY_MODE, fileMode: PRIVATE_FILE_MODE },
+		const filePath = this.sessionFile;
+		const content = this._serializeFileEntries();
+		this._enqueuePersistence(() =>
+			serializeSessionFileOperation(filePath, () =>
+				writeDurableAtomicFile(filePath, content, {
+					directoryMode: PRIVATE_DIRECTORY_MODE,
+					fileMode: PRIVATE_FILE_MODE,
+				}),
+			),
 		);
 		this.sessionFileNeedsMigration = false;
 	}
@@ -1695,31 +1774,36 @@ export class SessionManager {
 
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
-		const appendEntry = (content: string) =>
-			appendSessionFileEntry(this.sessionFile!, content, isSessionDurabilityBoundary(entry));
+		const filePath = this.sessionFile;
+		const appendEntry = () => {
+			const content = `${JSON.stringify(entry)}\n`;
+			this._enqueuePersistence(() =>
+				serializeSessionFileOperation(filePath, () =>
+					appendSessionFileEntry(filePath, content, isSessionDurabilityBoundary(entry)),
+				),
+			);
+		};
 
 		const hasFlushContent = this.fileEntries.some(isSessionFileFlushContent);
 		if (!hasFlushContent) {
 			if ((entry.type === "fast_mode_change" || entry.type === "planning_state_change") && !this.flushed) {
-				this._rewriteFile();
+				this._createFile();
 				this.flushed = true;
 			} else if (this.flushed) {
-				appendEntry(`${JSON.stringify(entry)}\n`);
+				appendEntry();
 			} else {
-				// Mark as not flushed so when conversation content arrives, all entries get written.
+				// Keep the session virtual until content with an explicit materialization
+				// contract arrives.
 				this.flushed = false;
 			}
 			return;
 		}
 
 		if (!this.flushed) {
-			writePrivateNewFileSync(
-				this.sessionFile,
-				`${this.fileEntries.map((fileEntry) => JSON.stringify(fileEntry)).join("\n")}\n`,
-			);
+			this._createFile();
 			this.flushed = true;
 		} else {
-			appendEntry(`${JSON.stringify(entry)}\n`);
+			appendEntry();
 		}
 	}
 
@@ -1727,33 +1811,18 @@ export class SessionManager {
 		this._assertPersistenceHealthy();
 		if (this.sessionFileNeedsMigration) {
 			// Rewriting is a writer action. Deferring it until the first append keeps
-			// every discovery/open path content-read-only.
-			try {
-				this._rewriteFile();
-				this.flushed = true;
-			} catch (error) {
-				this.persistenceError = error instanceof Error ? error : new Error(String(error));
-				throw this.persistenceError;
-			}
+			// every discovery/open path content-read-only. Queueing it before the
+			// append preserves commit order without blocking the caller.
+			this._rewriteFile();
+			this.flushed = true;
 		}
-		const previousLeafId = this.leafId;
-		const assignedOrdinal = this.nextOrdinal++;
-		entry.ordinal = assignedOrdinal;
+		entry.ordinal = this.nextOrdinal++;
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		if (!isClientInputWalEntry(entry)) {
 			this.leafId = entry.id;
 		}
-		try {
-			this._persist(entry);
-		} catch (error) {
-			this.fileEntries.pop();
-			this.byId.delete(entry.id);
-			this.leafId = previousLeafId;
-			this.nextOrdinal = assignedOrdinal;
-			this.persistenceError = error instanceof Error ? error : new Error(String(error));
-			throw this.persistenceError;
-		}
+		this._persist(entry);
 		this._indexClientInputEntry(entry);
 		if (isClientInputWalEntry(entry)) {
 			return;
@@ -1769,11 +1838,27 @@ export class SessionManager {
 	}
 
 	private _assertPersistenceHealthy(): void {
+		if (this.persistenceClosed) {
+			throw new Error("Session persistence is closed");
+		}
 		if (!this.persistenceError) return;
 		throw new Error(
 			"Session persistence is fail-stopped after an uncertain write; reload the session before retrying",
 			{ cause: this.persistenceError },
 		);
+	}
+
+	/** Wait for every filesystem operation accepted before this call. */
+	flush(): Promise<void> {
+		return this.persistenceWatermark;
+	}
+
+	/** Seal a persisted manager against later writes and drain its final accepted watermark. */
+	closePersistence(): Promise<void> {
+		if (this.persist) {
+			this.persistenceClosed = true;
+		}
+		return this.flush();
 	}
 
 	private _indexClientInputEntry(entry: SessionEntry): void {
@@ -2024,10 +2109,11 @@ export class SessionManager {
 	}
 
 	/**
-	 * Observe public conversation entries after they are indexed and durably
-	 * appended. Host-only admission WAL records are intentionally excluded. The
-	 * callback runs synchronously at the commit boundary so ordered projections
-	 * can place transcript mutations in the same causal lane as live events.
+	 * Observe public conversation entries after they are indexed and accepted
+	 * into the ordered persistence lane. Host-only admission WAL records are
+	 * intentionally excluded. The callback runs synchronously at the in-memory
+	 * commit boundary so ordered projections stay in the same causal lane as live
+	 * events; callers that require disk durability must await flush().
 	 */
 	subscribeEntries(listener: SessionEntryListener): () => void {
 		this.entryListeners.add(listener);
@@ -2579,7 +2665,7 @@ export class SessionManager {
 					entry.type === "planning_state_change",
 			);
 			if (shouldWriteImmediately) {
-				this._rewriteFile();
+				this._createFile();
 				this.flushed = true;
 			} else {
 				this.flushed = false;

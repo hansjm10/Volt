@@ -35,6 +35,7 @@ describe("review custom-message sessions", () => {
 		session.appendCustomMessageEntry("review", "Automated review result\n\nFindings:\n1. Fix the bug", true, {
 			findings: [{ title: "Fix the bug" }],
 		});
+		await session.flush();
 
 		expect(existsSync(sessionFile!)).toBe(true);
 		expect(readFileSync(sessionFile!, "utf8")).toContain('"type":"custom_message"');

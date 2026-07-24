@@ -161,6 +161,7 @@ describe("resolveIrohRemoteSessionTarget", () => {
 			manager.reserveClientInput("handled-terminal", "prompt", { message: "/handled" });
 			manager.transitionClientInput("handled-terminal", "started");
 			manager.transitionClientInput("handled-terminal", "completed");
+			await manager.flush();
 			const sessionFile = manager.getSessionFile()!;
 			expect(await SessionManager.listAll(tempDir)).toEqual([]);
 

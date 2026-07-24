@@ -202,7 +202,7 @@ describe("SubagentManager", () => {
 			const originalDispose = result.session.dispose.bind(result.session);
 			result.session.dispose = () => {
 				disposedSessionCount += 1;
-				originalDispose();
+				return originalDispose();
 			};
 			return {
 				...result,

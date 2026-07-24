@@ -205,6 +205,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const targetManager = SessionManager.create(runtimeHost.cwd, originalSession.sessionManager.getSessionDir());
 		targetManager.appendMessage({ role: "user", content: "target", timestamp: 1 });
 		targetManager.appendMessage(fauxAssistantMessage("target assistant"));
+		await targetManager.flush();
 		const targetFile = targetManager.getSessionFile();
 		expect(targetFile).toBeDefined();
 
@@ -227,6 +228,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const targetManager = SessionManager.create(runtimeHost.cwd, originalSession.sessionManager.getSessionDir());
 		targetManager.appendMessage({ role: "user", content: "target", timestamp: 1 });
 		targetManager.appendMessage(fauxAssistantMessage("target assistant"));
+		await targetManager.flush();
 		const targetFile = targetManager.getSessionFile();
 		expect(targetFile).toBeDefined();
 
@@ -375,6 +377,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const targetManager = SessionManager.create(runtimeHost.cwd, originalSession.sessionManager.getSessionDir());
 		targetManager.appendMessage({ role: "user", content: "target", timestamp: 1 });
 		targetManager.appendMessage(fauxAssistantMessage("target assistant"));
+		await targetManager.flush();
 		const targetFile = targetManager.getSessionFile();
 		expect(targetFile).toBeDefined();
 
@@ -464,10 +467,11 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 		const compaction = originalSession.compact();
 		await compactionStarted;
-		originalSession.dispose();
+		const disposal = originalSession.dispose();
 		releaseCompaction();
 
 		await expect(compaction).rejects.toThrow("Compaction cancelled");
+		await disposal;
 		expect(subscribe).not.toHaveBeenCalled();
 		expect(originalSession.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
 	});
@@ -483,6 +487,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const originalSession = runtimeHost.session;
 		const currentSessionFile = originalSession.sessionFile;
 		expect(currentSessionFile).toBeDefined();
+		await originalSession.sessionManager.flush();
 		const collisionFile = join(runtimeHost.cwd, "same-id-collision.jsonl");
 		copyFileSync(currentSessionFile!, collisionFile);
 		const prepare = vi.fn(async () => undefined);
@@ -883,6 +888,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			delivery: "steer",
 			message: "older durable input",
 		});
+		await targetManager.flush();
 		const targetFile = targetManager.getSessionFile();
 		expect(targetFile).toBeDefined();
 		faux.setResponses([fauxAssistantMessage("older done"), fauxAssistantMessage("fresh done")]);
@@ -919,6 +925,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			delivery: "steer",
 			message: "older durable input",
 		});
+		await targetManager.flush();
 		await runtimeHost.startRecoveredClientInputs();
 		const withSession = vi.fn(async () => {});
 		const replay = vi

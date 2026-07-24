@@ -770,7 +770,7 @@ describe("subagent tool", () => {
 				event.runtime.session.dispose = () => {
 					childDisposeCount += 1;
 					childEndCountAtDispose = childAgentEnds.length;
-					dispose();
+					return dispose();
 				};
 			},
 		});

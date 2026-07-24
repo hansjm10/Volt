@@ -116,12 +116,12 @@ function settingsSnapshot(settings: SettingsManager): object {
 	};
 }
 
-afterEach(() => {
+afterEach(async () => {
 	const tempDirs = new Set<string>();
 	const fauxProviders = new Set<FauxProviderRegistration>();
 	while (runtimes.length > 0) {
 		const runtime = runtimes.pop()!;
-		runtime.session.dispose();
+		await runtime.session.dispose();
 		tempDirs.add(runtime.tempDir);
 		fauxProviders.add(runtime.faux);
 	}
@@ -142,7 +142,7 @@ describe("issue #110: durable Fast mode state", () => {
 			expect(first.manager.buildSessionContext().fastMode).toEqual({ enabled: true });
 			expect(buildRpcSessionState(first.session).fastModeEnabled).toBe(true);
 			const sessionFile = first.manager.getSessionFile()!;
-			first.session.dispose();
+			await first.session.dispose();
 
 			const resumed = await createRuntime({
 				provider,
@@ -175,7 +175,7 @@ describe("issue #110: durable Fast mode state", () => {
 		first.session.setFastModeEnabled(true);
 		const sessionFile = first.manager.getSessionFile()!;
 		const secondModel = first.modelRegistry.find("openai", "second")!;
-		first.session.dispose();
+		await first.session.dispose();
 
 		const resumed = await createRuntime({
 			provider: "openai",
@@ -204,8 +204,7 @@ describe("issue #110: durable Fast mode state", () => {
 		first.session.setFastModeEnabled(true);
 		const firstFile = first.manager.getSessionFile()!;
 		const secondFile = second.manager.getSessionFile()!;
-		first.session.dispose();
-		second.session.dispose();
+		await Promise.all([first.session.dispose(), second.session.dispose()]);
 
 		const reopenedFirst = await createRuntime({
 			provider: "openai",

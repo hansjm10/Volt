@@ -51,6 +51,7 @@ describe("SessionManager session origin", () => {
 		const subagentSession = SessionManager.create(cwd, sessionDir, { origin: "subagent" });
 		subagentSession.appendMessage(assistantMessage("delegated run reply"));
 		expect(subagentSession.getHeader()?.origin).toBe("subagent");
+		await Promise.all([userSession.flush(), subagentSession.flush()]);
 
 		const infos = await SessionManager.list(cwd, sessionDir);
 		const byId = new Map(infos.map((info) => [info.id, info]));

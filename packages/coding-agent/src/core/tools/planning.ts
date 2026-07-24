@@ -41,6 +41,7 @@ export const PLAN_MODE_READ_ONLY_TOOL_NAMES = ["read", "web_search", "grep", "fi
 
 export interface PlanningToolController {
 	getPlanningState(): PlanningState;
+	flushPlanningState(): Promise<void>;
 	updatePlan(input: {
 		planId?: string;
 		expectedRevision?: number;
@@ -76,6 +77,7 @@ export function createPlanningToolDefinitions(
 						note: step.note?.trim() || undefined,
 					})),
 				});
+				await controller.flushPlanningState();
 				const planning = controller.getPlanningState();
 				return {
 					content: [{ type: "text", text: stateResultText(planning) }],
@@ -99,6 +101,7 @@ export function createPlanningToolDefinitions(
 					title: input.title.trim(),
 					summary: input.summary.trim(),
 				});
+				await controller.flushPlanningState();
 				const planning = controller.getPlanningState();
 				return {
 					content: [{ type: "text", text: stateResultText(planning) }],

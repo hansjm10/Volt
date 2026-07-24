@@ -254,7 +254,9 @@ export async function handleRpcCommand(
 
 		case "set_agent_mode": {
 			context.assertConversationGenerationCurrent();
-			return createRpcSuccessResponse(id, "set_agent_mode", session.setAgentMode(command.mode));
+			const planning = session.setAgentMode(command.mode);
+			await session.sessionManager.flush();
+			return createRpcSuccessResponse(id, "set_agent_mode", planning);
 		}
 
 		case "plan_execute": {
@@ -269,20 +271,16 @@ export async function handleRpcCommand(
 
 		case "plan_change": {
 			context.assertConversationGenerationCurrent();
-			return createRpcSuccessResponse(
-				id,
-				"plan_change",
-				session.changePlan(command.planId, command.expectedRevision),
-			);
+			const planning = session.changePlan(command.planId, command.expectedRevision);
+			await session.sessionManager.flush();
+			return createRpcSuccessResponse(id, "plan_change", planning);
 		}
 
 		case "plan_discard": {
 			context.assertConversationGenerationCurrent();
-			return createRpcSuccessResponse(
-				id,
-				"plan_discard",
-				session.discardPlan(command.planId, command.expectedRevision),
-			);
+			const planning = session.discardPlan(command.planId, command.expectedRevision);
+			await session.sessionManager.flush();
+			return createRpcSuccessResponse(id, "plan_discard", planning);
 		}
 
 		// =================================================================
@@ -356,6 +354,7 @@ export async function handleRpcCommand(
 					command.args,
 					{ requireRemoteSafe: options.requireRemoteSafeUiActions },
 				);
+				await session.sessionManager.flush();
 				const launchReviewWorkflow =
 					response.status === "accepted" && response.workflowId !== undefined
 						? context.takePendingReviewWorkflowLaunch?.(response.workflowId)
@@ -808,6 +807,7 @@ export async function handleRpcCommand(
 
 		case "set_thinking_level": {
 			session.setThinkingLevel(command.level, { persistDefault: command.persistDefault });
+			await Promise.all([session.sessionManager.flush(), session.settingsManager.flush()]);
 			return createRpcSuccessResponse(id, "set_thinking_level", { level: session.thinkingLevel });
 		}
 
@@ -816,6 +816,7 @@ export async function handleRpcCommand(
 			if (!level) {
 				return createRpcSuccessResponse(id, "cycle_thinking_level", null);
 			}
+			await Promise.all([session.sessionManager.flush(), session.settingsManager.flush()]);
 			return createRpcSuccessResponse(id, "cycle_thinking_level", { level });
 		}
 
@@ -949,6 +950,7 @@ export async function handleRpcCommand(
 
 		case "set_session_name": {
 			runSessionRenameHostAction(context.createHostActionContext(), command.name);
+			await session.sessionManager.flush();
 			return createRpcSuccessResponse(id, "set_session_name");
 		}
 

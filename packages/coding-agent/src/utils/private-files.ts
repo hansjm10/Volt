@@ -12,6 +12,8 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { lstat, open, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 
 export const PRIVATE_DIRECTORY_MODE = 0o700;
@@ -23,6 +25,35 @@ function assertPrivateRegularFile(stat: ReturnType<typeof fstatSync>, filePath: 
 	}
 	if (stat.nlink !== 1) {
 		throw new Error(`Refusing to use multiply-linked private file: ${filePath}`);
+	}
+}
+
+/** Open an existing owner-only regular file without following a symlink leaf. */
+export async function openPrivateRegularFile(filePath: string, flags: number): Promise<FileHandle> {
+	const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+	const handle = await open(filePath, flags | noFollow);
+	try {
+		const handleStat = await handle.stat();
+		assertPrivateRegularFile(handleStat, filePath);
+		if (noFollow === 0) {
+			// Platforms without O_NOFOLLOW need a post-open identity check. A symlink
+			// leaf has different lstat identity from the object the handle followed;
+			// a concurrent replacement with another regular file also mismatches.
+			const pathStat = await lstat(filePath);
+			if (
+				pathStat.isSymbolicLink() ||
+				!pathStat.isFile() ||
+				pathStat.dev !== handleStat.dev ||
+				pathStat.ino !== handleStat.ino
+			) {
+				throw new Error(`Refusing to use non-private file path: ${filePath}`);
+			}
+		}
+		await handle.chmod(PRIVATE_FILE_MODE);
+		return handle;
+	} catch (error) {
+		await handle.close().catch(() => {});
+		throw error;
 	}
 }
 
@@ -93,6 +124,43 @@ export function createPrivateTempDirectorySync(prefixPath: string): string {
 	const directoryPath = mkdtempSync(prefixPath);
 	chmodSync(directoryPath, PRIVATE_DIRECTORY_MODE);
 	return directoryPath;
+}
+
+/** Create a new owner-only file asynchronously without ever replacing an existing path. */
+export async function writePrivateNewFile(filePath: string, content: string): Promise<void> {
+	const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+	let handle: FileHandle | undefined;
+	let created = false;
+	try {
+		handle = await open(
+			filePath,
+			constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow,
+			PRIVATE_FILE_MODE,
+		);
+		created = true;
+		assertPrivateRegularFile(await handle.stat(), filePath);
+		await handle.chmod(PRIVATE_FILE_MODE);
+		await handle.writeFile(content, "utf8");
+		await handle.sync();
+		await handle.close();
+		handle = undefined;
+		if (process.platform !== "win32") {
+			const parentHandle = await open(dirname(filePath), "r");
+			try {
+				await parentHandle.sync();
+			} finally {
+				await parentHandle.close();
+			}
+		}
+	} catch (error) {
+		if (handle) {
+			await handle.close().catch(() => {});
+		}
+		if (created) {
+			await rm(filePath, { force: true }).catch(() => {});
+		}
+		throw error;
+	}
 }
 
 /** Create a new owner-only scratch file without ever replacing an existing path. */

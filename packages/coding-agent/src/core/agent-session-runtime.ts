@@ -665,7 +665,7 @@ export class AgentSessionRuntime {
 		try {
 			await this.session.getSubagentToolManager()?.dispose?.();
 		} finally {
-			this.session.dispose();
+			await this.session.dispose();
 		}
 	}
 
@@ -673,7 +673,7 @@ export class AgentSessionRuntime {
 		try {
 			await session.getSubagentToolManager()?.dispose?.();
 		} finally {
-			session.dispose();
+			await session.dispose();
 		}
 	}
 
@@ -727,6 +727,7 @@ export class AgentSessionRuntime {
 					this.lifecycleRevision++;
 				});
 				created = await options.create();
+				await created.session.sessionManager.flush();
 				this.applyReplacement(created);
 				applied = true;
 				await options.afterApply?.();
@@ -886,8 +887,10 @@ export class AgentSessionRuntime {
 		}
 		if (withSession) {
 			await withSession(this.session.createReplacedSessionContext());
+			await this.session.sessionManager.flush();
 			return { seeded: true };
 		}
+		await this.session.sessionManager.flush();
 		return { seeded: false };
 	}
 
@@ -1071,6 +1074,7 @@ export class AgentSessionRuntime {
 			};
 			const result = sourceSession.activatePlan(planId, expectedRevision, execution);
 			if (result.activated) {
+				await sourceSession.sessionManager.flush();
 				void sourceSession
 					.sendCustomMessage(
 						{
@@ -1128,7 +1132,13 @@ export class AgentSessionRuntime {
 				if (!execution) {
 					throw new Error("Plan execution session was not initialized");
 				}
-				sourceManager.appendPlanningState({
+				// The source AgentSession has been disposed and its persistence lane
+				// sealed before this post-replacement handoff callback. Reopen persisted
+				// sources as the new exclusive writer; in-memory sources remain reusable.
+				const handoffManager = sourceSessionFile
+					? SessionManager.open(sourceSessionFile, sourceManager.getSessionDir())
+					: sourceManager;
+				handoffManager.appendPlanningState({
 					mode: "build",
 					plan: {
 						...sourcePlan,
@@ -1138,6 +1148,12 @@ export class AgentSessionRuntime {
 						execution,
 					},
 				});
+				await handoffManager.flush();
+				if (sourceSessionFile) {
+					// Keep references held by lifecycle observers coherent with the durable
+					// handoff record while leaving the old manager sealed against writes.
+					sourceManager.setSessionFile(sourceSessionFile);
+				}
 				const activePlan = this.session.planningState.plan;
 				void context
 					.sendMessage(
@@ -1194,6 +1210,7 @@ export class AgentSessionRuntime {
 			await options.setup(sessionManager);
 			this.assertStructuralOperationCurrent(operation);
 		}
+		await sessionManager.flush();
 
 		const replacement = await this.replaceCurrentSession({
 			operation,
@@ -1279,6 +1296,7 @@ export class AgentSessionRuntime {
 				return { cancelled: false, seeded: replacement.seeded, selectedText };
 			}
 
+			await this.session.sessionManager.flush();
 			const sessionManager = SessionManager.open(currentSessionFile, sessionDir);
 			const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
 			if (!forkedSessionPath) {
@@ -1364,6 +1382,7 @@ export class AgentSessionRuntime {
 		}
 
 		const previousSessionFile = this.session.sessionFile;
+		await this.session.sessionManager.flush();
 		if (resolve(destinationPath) !== resolvedPath) {
 			copyFileSync(resolvedPath, destinationPath);
 		}
@@ -1426,7 +1445,7 @@ export class AgentSessionRuntime {
 				try {
 					await this.session.getSubagentToolManager()?.dispose?.();
 				} finally {
-					this.session.dispose();
+					await this.session.dispose();
 					this.sessionInvalidated = true;
 					this.lifecycleRevision++;
 				}

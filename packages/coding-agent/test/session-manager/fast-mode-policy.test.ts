@@ -57,6 +57,7 @@ describe("SessionManager Fast mode policy", () => {
 		const manager = SessionManager.create(dir, dir);
 		manager.appendThinkingLevelChange("high");
 		manager.appendFastModeChange(true);
+		await manager.flush();
 		const sessionFile = manager.getSessionFile();
 
 		expect(sessionFile).toBeDefined();
@@ -72,13 +73,14 @@ describe("SessionManager Fast mode policy", () => {
 		expect(SessionManager.continueRecent(dir, dir).getSessionId()).toBe(manager.getSessionId());
 	});
 
-	it("durably writes a message-free branched session with Fast state", () => {
+	it("durably writes a message-free branched session with Fast state", async () => {
 		const dir = createTempDir();
 		const manager = SessionManager.create(dir, dir);
 		manager.appendThinkingLevelChange("high");
 		const fastEntryId = manager.appendFastModeChange(true);
 
 		const branchedFile = manager.createBranchedSession(fastEntryId);
+		await manager.flush();
 
 		expect(branchedFile).toBeDefined();
 		expect(existsSync(branchedFile!)).toBe(true);
@@ -90,10 +92,11 @@ describe("SessionManager Fast mode policy", () => {
 		});
 	});
 
-	it("rejects malformed persisted Fast state", () => {
+	it("rejects malformed persisted Fast state", async () => {
 		const dir = createTempDir();
 		const manager = SessionManager.create(dir, dir);
 		manager.appendFastModeChange(true);
+		await manager.flush();
 		const sessionFile = manager.getSessionFile()!;
 		const records = readFileSync(sessionFile, "utf8")
 			.trim()
@@ -113,6 +116,7 @@ describe("SessionManager Fast mode policy", () => {
 		vi.stubEnv("VOLT_CODING_AGENT_DIR", agentDir);
 		const manager = SessionManager.create(cwd, sessionDir);
 		manager.appendFastModeChange(true);
+		await manager.flush();
 
 		expect(await SessionManager.listAll()).toEqual([]);
 		expect(await SessionManager.listAll(undefined, { includeMessageFreeDurable: true })).toMatchObject([

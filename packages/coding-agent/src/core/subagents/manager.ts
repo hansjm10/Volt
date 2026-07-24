@@ -1003,7 +1003,10 @@ export class SubagentManager {
 					if (delegation.scopeLease.owned) delegation.scopeLease.scope.dispose();
 				},
 				onDispose: rollbackRuntimeRegistration,
-				waitForIdle: () => runtime.session.waitForIdle(),
+				waitForIdle: async () => {
+					await runtime.session.waitForIdle();
+					await runtime.session.sessionManager.flush();
+				},
 			});
 			delegation.reservation.commit(id, () => {
 				void runtime.session.abort();

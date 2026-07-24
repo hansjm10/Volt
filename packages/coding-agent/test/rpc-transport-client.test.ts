@@ -2245,6 +2245,7 @@ function createRuntimeHost(
 		getAvailable: vi.fn(() => resources.availableModels ?? []),
 	};
 	const settingsManager = {
+		flush: vi.fn(async () => {}),
 		getReviewModel: vi.fn(() => undefined),
 		isProjectTrusted: vi.fn(() => true),
 	};
@@ -2326,6 +2327,7 @@ function createRuntimeHost(
 				),
 			},
 			sessionManager: {
+				flush: vi.fn(async () => {}),
 				getCwd: vi.fn(() => resources.cwd ?? tmpdir()),
 			},
 			promptTemplates: resources.prompts ?? [],

@@ -461,7 +461,7 @@ describe("createBranchedSession", () => {
 		expect(entries.map((e) => e.id)).toEqual([id1, id2, id4, id5]);
 	});
 
-	it("does not duplicate entries when forking from first user message", () => {
+	it("does not duplicate entries when forking from first user message", async () => {
 		const tempDir = join(tmpdir(), `session-fork-dedup-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
 
@@ -486,6 +486,7 @@ describe("createBranchedSession", () => {
 
 			// Now the assistant responds
 			session.appendMessage(assistantMsg("new answer"));
+			await session.flush();
 
 			// File should now exist with exactly one header and no duplicate IDs
 			expect(existsSync(newFile!)).toBe(true);
@@ -505,7 +506,7 @@ describe("createBranchedSession", () => {
 		}
 	});
 
-	it("writes file immediately when forking from a point with assistant messages", () => {
+	it("writes file immediately when forking from a point with assistant messages", async () => {
 		const tempDir = join(tmpdir(), `session-fork-with-assistant-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
 
@@ -519,6 +520,7 @@ describe("createBranchedSession", () => {
 			// Fork including the assistant message
 			const newFile = session.createBranchedSession(id2);
 			expect(newFile).toBeDefined();
+			await session.flush();
 
 			// Path includes an assistant, so file should be written immediately
 			expect(existsSync(newFile!)).toBe(true);

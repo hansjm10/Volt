@@ -1642,7 +1642,9 @@ export class InteractiveMode {
 			uiContext,
 			mode: "tui",
 			abortHandler: () => {
-				this.restoreQueuedMessagesToEditor({ abort: true });
+				void this.restoreQueuedMessagesToEditor({ abort: true }).catch((error) => {
+					this.showError(`Failed to persist queued-message cancellation: ${String(error)}`);
+				});
 			},
 			commandContextActions: {
 				waitForIdle: () => this.session.waitForIdle(),
@@ -2250,7 +2252,9 @@ export class InteractiveMode {
 			isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 			signal: this.session.agent.signal,
 			abort: () => {
-				this.restoreQueuedMessagesToEditor({ abort: true });
+				void this.restoreQueuedMessagesToEditor({ abort: true }).catch((error) => {
+					this.showError(`Failed to persist queued-message cancellation: ${String(error)}`);
+				});
 			},
 			hasPendingMessages: () => this.session.pendingMessageCount > 0,
 			shutdown: () => {
@@ -3193,7 +3197,9 @@ export class InteractiveMode {
 				return;
 			}
 			if (this.session.isStreaming) {
-				this.restoreQueuedMessagesToEditor({ abort: true });
+				void this.restoreQueuedMessagesToEditor({ abort: true }).catch((error) => {
+					this.showError(`Failed to persist queued-message cancellation: ${String(error)}`);
+				});
 			} else if (this.session.isBashRunning) {
 				this.session.abortBash();
 			} else if (this.isBashMode) {
@@ -4530,8 +4536,8 @@ export class InteractiveMode {
 		}
 	}
 
-	private handleDequeue(): void {
-		const restored = this.restoreQueuedMessagesToEditor();
+	private async handleDequeue(): Promise<void> {
+		const restored = await this.restoreQueuedMessagesToEditor();
 		if (restored === 0) {
 			this.showStatus("No queued messages to restore");
 		} else {
@@ -4848,8 +4854,8 @@ export class InteractiveMode {
 	 * Clear all queued messages and return their contents.
 	 * Clears both session queue and compaction queue.
 	 */
-	private clearAllQueues(): { steering: string[]; followUp: string[] } {
-		const { steering, followUp } = this.session.clearQueue();
+	private async clearAllQueues(): Promise<{ steering: string[]; followUp: string[] }> {
+		const { steering, followUp } = await this.session.clearQueue();
 		const compactionSteering = this.compactionQueuedMessages
 			.filter((msg) => msg.mode === "steer")
 			.map((msg) => msg.text);
@@ -4882,14 +4888,18 @@ export class InteractiveMode {
 		}
 	}
 
-	private restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
-		const { steering, followUp } = this.clearAllQueues();
-		const allQueued = [...steering, ...followUp];
-		if (allQueued.length === 0) {
-			this.updatePendingMessagesDisplay();
+	private async restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): Promise<number> {
+		let queues: Awaited<ReturnType<InteractiveMode["clearAllQueues"]>>;
+		try {
+			queues = await this.clearAllQueues();
+		} finally {
 			if (options?.abort) {
 				this.agent.abort();
 			}
+		}
+		const allQueued = [...queues.steering, ...queues.followUp];
+		if (allQueued.length === 0) {
+			this.updatePendingMessagesDisplay();
 			return 0;
 		}
 		const queuedText = allQueued.join("\n\n");
@@ -4897,9 +4907,6 @@ export class InteractiveMode {
 		const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
-		if (options?.abort) {
-			this.agent.abort();
-		}
 		return allQueued.length;
 	}
 
@@ -4931,7 +4938,9 @@ export class InteractiveMode {
 		this.updatePendingMessagesDisplay();
 
 		const restoreQueue = (error: unknown) => {
-			this.session.clearQueue();
+			void this.session.clearQueue().catch((clearError) => {
+				this.showError(`Failed to persist queued-message cancellation: ${String(clearError)}`);
+			});
 			this.compactionQueuedMessages = queuedMessages;
 			this.updatePendingMessagesDisplay();
 			this.showError(
@@ -6629,8 +6638,15 @@ export class InteractiveMode {
 					renameSession: async (sessionFilePath: string, nextName: string | undefined) => {
 						const next = (nextName ?? "").trim();
 						if (!next) return;
+						const currentSessionFile = this.sessionManager.getSessionFile();
+						if (currentSessionFile && path.resolve(currentSessionFile) === path.resolve(sessionFilePath)) {
+							this.session.setSessionName(next);
+							await this.sessionManager.flush();
+							return;
+						}
 						const mgr = SessionManager.open(sessionFilePath);
 						mgr.appendSessionInfo(next);
+						await mgr.flush();
 					},
 					showRenameHint: true,
 					keybindings: this.keybindings,
@@ -7206,7 +7222,7 @@ export class InteractiveMode {
 
 		try {
 			if (outputPath?.endsWith(".jsonl")) {
-				const filePath = this.session.exportToJsonl(outputPath);
+				const filePath = await this.session.exportToJsonl(outputPath);
 				this.showStatus(`Session exported to: ${filePath}`);
 			} else {
 				const filePath = await this.session.exportToHtml(outputPath);

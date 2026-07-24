@@ -605,7 +605,7 @@ describe("Iroh remote notification requests", () => {
 			pendingMessageCount: 0,
 			sessionFile: "/sessions/session-one.jsonl",
 			sessionId: "session-one",
-			sessionManager: { getLeafId: () => "run-one" },
+			sessionManager: { flush: vi.fn(async () => {}), getLeafId: () => "run-one" },
 			settingsManager: {},
 			steeringMode: "all" as const,
 			subscribe: vi.fn((handler: (event: AgentSessionEvent) => void) => {

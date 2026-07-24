@@ -13,7 +13,7 @@
 import type { AgentTool } from "@hansjm10/volt-agent-core";
 import { type Static, Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
-import { createHarness } from "./test-harness.ts";
+import { createHarness, createHarnessWithExtensions } from "./test-harness.ts";
 
 const hangToolSchema = Type.Object({});
 
@@ -67,8 +67,9 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 				expect(hasPersistedToolCall).toBe(true);
 			});
 
-			harness.session.dispose();
-			await promptPromise;
+			const disposal = harness.session.dispose();
+			expect(harness.session.dispose()).toBe(disposal);
+			await Promise.all([disposal, promptPromise]);
 
 			const context = harness.sessionManager.buildSessionContext();
 			const toolResults = context.messages.filter((message) => message.role === "toolResult");
@@ -91,7 +92,7 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 		try {
 			await harness.session.prompt("hello");
 			const before = harness.sessionManager.buildSessionContext().messages.length;
-			harness.session.dispose();
+			await harness.session.dispose();
 			const after = harness.sessionManager.buildSessionContext().messages.length;
 			expect(after).toBe(before);
 		} finally {
@@ -129,8 +130,7 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 				expect(hangStarted).toBe(true);
 			});
 
-			harness.session.dispose();
-			await promptPromise;
+			await Promise.all([harness.session.dispose(), promptPromise]);
 
 			const context = harness.sessionManager.buildSessionContext();
 			const toolResults = context.messages.filter((message) => message.role === "toolResult");
@@ -141,6 +141,91 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 			expect(hangResults).toHaveLength(1);
 			expect(hangResults[0]?.isError).toBe(true);
 		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("fences an in-flight extension handler from appending after disposal drains", async () => {
+		let releaseAssistant!: () => void;
+		let markAssistantEntered!: () => void;
+		const assistantEntered = new Promise<void>((resolve) => {
+			markAssistantEntered = resolve;
+		});
+		const assistantGate = new Promise<void>((resolve) => {
+			releaseAssistant = resolve;
+		});
+		const harness = await createHarnessWithExtensions({
+			responses: ["late assistant"],
+			extensionFactories: [
+				(volt) => {
+					volt.on("message_end", async (event) => {
+						if (event.message.role !== "assistant") return;
+						markAssistantEntered();
+						await assistantGate;
+					});
+				},
+			],
+		});
+		try {
+			const prompt = harness.session.prompt("start").catch(() => {});
+			await assistantEntered;
+			await harness.session.dispose();
+			expect(harness.sessionManager.buildSessionContext().messages.map((message) => message.role)).toEqual(["user"]);
+
+			releaseAssistant();
+			await prompt;
+			expect(harness.sessionManager.buildSessionContext().messages.map((message) => message.role)).toEqual(["user"]);
+		} finally {
+			releaseAssistant();
+			harness.cleanup();
+		}
+	});
+
+	it("prevents client-input WAL transitions after the final disposal watermark", async () => {
+		const harness = createHarness({ responses: ["ok"] });
+		let releaseFlush!: () => void;
+		const flushGate = new Promise<void>((resolve) => {
+			releaseFlush = resolve;
+		});
+		const flush = vi.spyOn(harness.sessionManager, "flush").mockReturnValue(flushGate);
+		try {
+			const prompt = harness.session.prompt("admission race", { clientMessageId: "dispose-admission-race" });
+			await vi.waitFor(() => expect(flush).toHaveBeenCalledOnce());
+
+			const disposal = harness.session.dispose();
+			expect(flush).toHaveBeenCalledTimes(2);
+			releaseFlush();
+			await disposal;
+			await expect(prompt).rejects.toThrow("disposed");
+			expect(harness.sessionManager.getClientInput("dispose-admission-race")?.state).toBe("accepted");
+		} finally {
+			releaseFlush();
+			harness.cleanup();
+		}
+	});
+
+	it("does not resolve disposal until the persistence watermark drains", async () => {
+		const harness = createHarness({ responses: ["ok"] });
+		let releaseFlush!: () => void;
+		const flushGate = new Promise<void>((resolve) => {
+			releaseFlush = resolve;
+		});
+		vi.spyOn(harness.sessionManager, "flush").mockReturnValue(flushGate);
+		try {
+			let settled = false;
+			const rawDisposal = harness.session.dispose();
+			expect(harness.session.dispose()).toBe(rawDisposal);
+			const disposal = rawDisposal.then(() => {
+				settled = true;
+			});
+			await Promise.resolve();
+			expect(settled).toBe(false);
+
+			releaseFlush();
+			await disposal;
+			expect(settled).toBe(true);
+		} finally {
+			releaseFlush();
 			harness.cleanup();
 		}
 	});
