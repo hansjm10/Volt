@@ -138,6 +138,47 @@ describe("durable client input idempotency", () => {
 		expect(getUserTexts(harness)).toEqual(["authority race"]);
 	});
 
+	it("fences an identified prompt receipt flush against concurrent abort", async () => {
+		const manager = SessionManager.inMemory();
+		const harness = await createHarness({ sessionManager: manager });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("retry completed")]);
+		let releaseFlush!: () => void;
+		let markFlushEntered!: () => void;
+		const flushEntered = new Promise<void>((resolve) => {
+			markFlushEntered = resolve;
+		});
+		const flushGate = new Promise<void>((resolve) => {
+			releaseFlush = resolve;
+		});
+		vi.spyOn(manager, "flush").mockImplementationOnce(() => {
+			markFlushEntered();
+			return flushGate;
+		});
+
+		const promptOutcome = harness.session
+			.prompt("abort receipt race", { clientMessageId: "abort-receipt-race" })
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		await flushEntered;
+		await expect(harness.session.abort()).resolves.toBeUndefined();
+		releaseFlush();
+
+		expect(await promptOutcome).toMatchObject({
+			message: "Client input admission was aborted before its receipt became durable",
+		});
+		expect(getUserTexts(harness)).toEqual([]);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(manager.getClientInput("abort-receipt-race")?.state).toBe("accepted");
+
+		await expect(
+			harness.session.prompt("abort receipt race", { clientMessageId: "abort-receipt-race" }),
+		).resolves.toBeUndefined();
+		expect(getUserTexts(harness)).toEqual(["abort receipt race"]);
+	});
+
 	it("includes exact ordered image bytes and streaming behavior in the semantic identity", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -378,6 +419,73 @@ describe("durable client input idempotency", () => {
 		expect(sideEffects).toBe(1);
 	});
 
+	it.each([{ boundary: "command" as const }, { boundary: "input_hook" as const }])(
+		"does not cross a persisted $boundary dispatch boundary after concurrent abort",
+		async ({ boundary }) => {
+			let sideEffects = 0;
+			const clientMessageId = `abort-${boundary}-dispatch`;
+			const harness = await createHarness({
+				extensionFactories: [
+					(volt) => {
+						if (boundary === "command") {
+							volt.registerCommand("side-effect", {
+								handler: async () => {
+									sideEffects++;
+								},
+							});
+							return;
+						}
+						volt.on("input", () => {
+							sideEffects++;
+							return { action: "handled" };
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("must remain unused")]);
+			const originalFlush = harness.sessionManager.flush.bind(harness.sessionManager);
+			let releaseDispatch!: () => void;
+			let markDispatchEntered!: () => void;
+			const dispatchEntered = new Promise<void>((resolve) => {
+				markDispatchEntered = resolve;
+			});
+			const dispatchGate = new Promise<void>((resolve) => {
+				releaseDispatch = resolve;
+			});
+			let dispatchGated = false;
+			vi.spyOn(harness.sessionManager, "flush").mockImplementation(() => {
+				const watermark = originalFlush();
+				if (!dispatchGated && harness.sessionManager.getClientInput(clientMessageId)?.state === "started") {
+					dispatchGated = true;
+					markDispatchEntered();
+					return watermark.then(() => dispatchGate);
+				}
+				return watermark;
+			});
+
+			const promptOutcome = harness.session
+				.prompt(boundary === "command" ? "/side-effect" : "handle in input hook", { clientMessageId })
+				.then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+			await dispatchEntered;
+			const abort = harness.session.abort();
+			releaseDispatch();
+			await abort;
+
+			expect(await promptOutcome).toMatchObject({
+				message: "Client input was aborted while persisting its dispatch boundary",
+			});
+			expect(sideEffects).toBe(0);
+			expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("failed");
+			expect(harness.sessionManager.getClientInputRecoveryPlan()).toEqual({ kind: "idle", records: [] });
+			expect(getUserTexts(harness)).toEqual([]);
+			expect(harness.getPendingResponseCount()).toBe(1);
+		},
+	);
+
 	it("enqueues duplicate steer and follow-up inputs once and rejects cross-command id reuse", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -449,6 +557,59 @@ describe("durable client input idempotency", () => {
 		}
 		await clearing;
 	});
+
+	it.each([
+		{ command: "steer" as const, clientMessageId: "clear-pending-steer" },
+		{ command: "followUp" as const, clientMessageId: "clear-pending-follow" },
+	])(
+		"keeps a pending $command admission visible to concurrent queue clearing",
+		async ({ command, clientMessageId }) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const originalFlush = harness.sessionManager.flush.bind(harness.sessionManager);
+			let releaseQueueFlush!: () => void;
+			let markQueueFlushEntered!: () => void;
+			const queueFlushEntered = new Promise<void>((resolve) => {
+				markQueueFlushEntered = resolve;
+			});
+			const queueFlushGate = new Promise<void>((resolve) => {
+				releaseQueueFlush = resolve;
+			});
+			let queueFlushGated = false;
+			vi.spyOn(harness.sessionManager, "flush").mockImplementation(() => {
+				const watermark = originalFlush();
+				if (!queueFlushGated && harness.sessionManager.getClientInput(clientMessageId)?.queuedInput !== undefined) {
+					queueFlushGated = true;
+					markQueueFlushEntered();
+					return watermark.then(() => queueFlushGate);
+				}
+				return watermark;
+			});
+
+			const queueOutcome = (
+				command === "steer"
+					? harness.session.steer("clear pending admission", undefined, clientMessageId)
+					: harness.session.followUp("clear pending admission", undefined, clientMessageId)
+			).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await queueFlushEntered;
+			try {
+				await expect(harness.session.clearQueue()).resolves.toEqual({ steering: [], followUp: [] });
+				expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("failed");
+			} finally {
+				releaseQueueFlush();
+			}
+
+			expect(await queueOutcome).toMatchObject({
+				message: "Queued input admission was cleared before runtime publication",
+			});
+			expect(harness.session.getSteeringMessages()).toEqual([]);
+			expect(harness.session.getFollowUpMessages()).toEqual([]);
+			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		},
+	);
 
 	it("cancels runtime-only queued input without awaiting unrelated durability", async () => {
 		const harness = await createHarness();

@@ -402,6 +402,7 @@ interface LiveClientInputOperation {
 	completion: Promise<void>;
 	attachCompletion(completion: Promise<void>): void;
 	rejectCompletion(error: Error): void;
+	/** Owns a durable queue admission, including while its flush is still pending. */
 	queued: boolean;
 }
 
@@ -1948,6 +1949,7 @@ export class AgentSession {
 		if (clientMessageId === undefined) {
 			return { kind: "none" };
 		}
+		const abortGeneration = this._abortGeneration;
 		const input = {
 			message,
 			...(images === undefined ? {} : { images }),
@@ -1995,12 +1997,16 @@ export class AgentSession {
 			if (this._disposed) {
 				throw new Error("Session disposed before client input admission completed");
 			}
+			if (abortGeneration !== this._abortGeneration) {
+				throw new Error("Client input admission was aborted before its receipt became durable");
+			}
 		} catch (error) {
 			if (this._liveClientInputs.get(clientMessageId) === operation) {
 				this._liveClientInputs.delete(clientMessageId);
 			}
 			const persistenceError = error instanceof Error ? error : new Error(String(error));
 			operation.rejectAccepted(persistenceError);
+			operation.rejectCompletion(persistenceError);
 			throw persistenceError;
 		}
 		return { kind: "start", operation };
@@ -2100,12 +2106,16 @@ export class AgentSession {
 	private async _markClientInputDispatchStarted(
 		clientMessageId: string | undefined,
 		operation: LiveClientInputOperation | undefined,
+		abortGeneration = this._abortGeneration,
 	): Promise<void> {
 		if (clientMessageId === undefined || operation === undefined) {
 			return;
 		}
 		if (this._disposed) {
 			throw new Error("Session disposed before client input dispatch");
+		}
+		if (abortGeneration !== this._abortGeneration) {
+			throw new Error("Client input was aborted before its dispatch boundary");
 		}
 		const record = this.sessionManager.getClientInput(clientMessageId);
 		// The durable record is authoritative. An input hook may already have
@@ -2118,6 +2128,9 @@ export class AgentSession {
 			await this.sessionManager.flush();
 			if (this._disposed) {
 				throw new Error("Session disposed before client input dispatch");
+			}
+			if (abortGeneration !== this._abortGeneration) {
+				throw new Error("Client input was aborted while persisting its dispatch boundary");
 			}
 		} else if (operation.dispatchBoundaryPersisted) {
 			return;
@@ -2618,7 +2631,7 @@ export class AgentSession {
 			// Extension commands manage their own LLM interaction via volt.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
 				const handled = await this._tryExecuteExtensionCommand(text, transactionId, () =>
-					this._markClientInputDispatchStarted(options?.clientMessageId, operation),
+					this._markClientInputDispatchStarted(options?.clientMessageId, operation, abortGeneration),
 				);
 				assertConversationGenerationCurrent();
 				if (handled) {
@@ -2635,7 +2648,7 @@ export class AgentSession {
 				// before entering them. A later durable queued payload safely returns
 				// this receipt to recoverable `accepted`; a crash in between never
 				// re-executes an uncertain hook.
-				await this._markClientInputDispatchStarted(options?.clientMessageId, operation);
+				await this._markClientInputDispatchStarted(options?.clientMessageId, operation, abortGeneration);
 				const inputResult = await this._extensionRunner.emitInput(
 					currentText,
 					currentImages,
@@ -2677,9 +2690,9 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages, options.clientMessageId);
+					await this._queueFollowUp(expandedText, currentImages, options.clientMessageId, operation);
 				} else {
-					await this._queueSteer(expandedText, currentImages, options.clientMessageId);
+					await this._queueSteer(expandedText, currentImages, options.clientMessageId, operation);
 				}
 				preflightResult?.({ success: true, outcome: "admitted" });
 				return "queued";
@@ -2716,7 +2729,7 @@ export class AgentSession {
 			// invoke side-effect-capable compaction, before_agent_start, and message
 			// hooks. Persist the ambiguous dispatch boundary before any of them so a
 			// crash never replays extension or provider side effects.
-			await this._markClientInputDispatchStarted(options?.clientMessageId, operation);
+			await this._markClientInputDispatchStarted(options?.clientMessageId, operation, abortGeneration);
 
 			// Check if we need to compact before sending (catches aborted responses)
 			const lastAssistant = this._findLastAssistantMessage();
@@ -2935,7 +2948,7 @@ export class AgentSession {
 			let expandedText = this._expandSkillCommand(text);
 			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-			await this._queueSteer(expandedText, images, clientMessageId);
+			await this._queueSteer(expandedText, images, clientMessageId, operation);
 			operation?.resolveAccepted("admitted");
 		} catch (error) {
 			const normalized = error instanceof Error ? error : new Error(String(error));
@@ -2981,7 +2994,7 @@ export class AgentSession {
 			let expandedText = this._expandSkillCommand(text);
 			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-			await this._queueFollowUp(expandedText, images, clientMessageId);
+			await this._queueFollowUp(expandedText, images, clientMessageId, operation);
 			operation?.resolveAccepted("admitted");
 		} catch (error) {
 			const normalized = error instanceof Error ? error : new Error(String(error));
@@ -2993,23 +3006,56 @@ export class AgentSession {
 	}
 
 	/**
+	 * Persist queue ownership before runtime publication so clearQueue can revoke
+	 * an admission while its durability watermark is still pending.
+	 */
+	private async _persistQueuedClientInputAdmission(
+		delivery: "steer" | "follow_up",
+		text: string,
+		images: ImageContent[] | undefined,
+		clientMessageId: string | undefined,
+		operation: LiveClientInputOperation | undefined,
+	): Promise<void> {
+		if (clientMessageId === undefined) {
+			return;
+		}
+		if (operation === undefined || this._liveClientInputs.get(clientMessageId) !== operation) {
+			throw new Error("Client input lost queue admission ownership before persistence");
+		}
+		this.sessionManager.markClientInputQueued(clientMessageId, {
+			delivery,
+			message: text,
+			...(images === undefined ? {} : { images }),
+		});
+		// clearQueue must see the admission before the durability await so its
+		// successful return also revokes work that has not reached agent-core yet.
+		operation.queued = true;
+		await this.sessionManager.flush();
+		if (this._disposed) {
+			throw new Error("Session disposed before queued input admission completed");
+		}
+		if (
+			this._liveClientInputs.get(clientMessageId) !== operation ||
+			!operation.queued ||
+			this.sessionManager.getClientInput(clientMessageId)?.state !== "accepted"
+		) {
+			throw new Error("Queued input admission was cleared before runtime publication");
+		}
+	}
+
+	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[], clientMessageId?: string): Promise<void> {
+	private async _queueSteer(
+		text: string,
+		images?: ImageContent[],
+		clientMessageId?: string,
+		operation?: LiveClientInputOperation,
+	): Promise<void> {
 		if (this.pendingMessageCount >= AGENT_SESSION_MAX_QUEUED_MESSAGES) {
 			throw new Error(`Agent queue is limited to ${AGENT_SESSION_MAX_QUEUED_MESSAGES} messages`);
 		}
-		if (clientMessageId !== undefined) {
-			this.sessionManager.markClientInputQueued(clientMessageId, {
-				delivery: "steer",
-				message: text,
-				...(images === undefined ? {} : { images }),
-			});
-			await this.sessionManager.flush();
-			if (this._disposed) {
-				throw new Error("Session disposed before queued input admission completed");
-			}
-		}
+		await this._persistQueuedClientInputAdmission("steer", text, images, clientMessageId, operation);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -3026,31 +3072,22 @@ export class AgentSession {
 			...(clientMessageId === undefined ? {} : { clientMessageId }),
 			text,
 		});
-		if (clientMessageId !== undefined) {
-			const operation = this._liveClientInputs.get(clientMessageId);
-			if (operation) operation.queued = true;
-		}
 		this._emitQueueUpdate();
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[], clientMessageId?: string): Promise<void> {
+	private async _queueFollowUp(
+		text: string,
+		images?: ImageContent[],
+		clientMessageId?: string,
+		operation?: LiveClientInputOperation,
+	): Promise<void> {
 		if (this.pendingMessageCount >= AGENT_SESSION_MAX_QUEUED_MESSAGES) {
 			throw new Error(`Agent queue is limited to ${AGENT_SESSION_MAX_QUEUED_MESSAGES} messages`);
 		}
-		if (clientMessageId !== undefined) {
-			this.sessionManager.markClientInputQueued(clientMessageId, {
-				delivery: "follow_up",
-				message: text,
-				...(images === undefined ? {} : { images }),
-			});
-			await this.sessionManager.flush();
-			if (this._disposed) {
-				throw new Error("Session disposed before queued input admission completed");
-			}
-		}
+		await this._persistQueuedClientInputAdmission("follow_up", text, images, clientMessageId, operation);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -3067,10 +3104,6 @@ export class AgentSession {
 			...(clientMessageId === undefined ? {} : { clientMessageId }),
 			text,
 		});
-		if (clientMessageId !== undefined) {
-			const operation = this._liveClientInputs.get(clientMessageId);
-			if (operation) operation.queued = true;
-		}
 		this._emitQueueUpdate();
 	}
 
