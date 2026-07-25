@@ -280,6 +280,19 @@ describe("web_fetch network operations", () => {
 		expect(response.content).not.toContain("\uFFFD");
 	});
 
+	it("bounds retained title metadata independently of page text", async () => {
+		const title = "😀&amp;".repeat(1_000);
+		const fetcher: WebFetchFetcher = async () =>
+			htmlResponse(`<html><head><title>${title}</title></head><body><main>body</main></body></html>`);
+		const operations = createDefaultWebFetchOperations({ env: {}, fetcher, resolveHost: publicHost });
+
+		const response = await operations.fetch({ url: "https://example.com/large-title", maxBytes: 100 });
+
+		expect(Buffer.byteLength(response.title ?? "", "utf8")).toBe(1_024);
+		expect(response.title).not.toContain("\uFFFD");
+		expect(response.content).toBe("body");
+	});
+
 	it("binds each request to the addresses that passed validation", async () => {
 		let pinnedAddresses: unknown;
 		const fetcher: WebFetchFetcher = async (...args: unknown[]) => {

@@ -21,6 +21,8 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_REDIRECTS = 5;
 /** Hard ceiling on the response body we will read, before truncation. */
 const MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024;
+/** Keep attacker-controlled page metadata small when persisted in tool details. */
+const MAX_TITLE_BYTES = 1_024;
 /** Prevent pathological markup from growing htmlparser2's open-element stack. */
 const MAX_HTML_NESTING_DEPTH = 4_096;
 
@@ -553,6 +555,7 @@ export function extractHtml(html: string, limits: { maxBytes?: number; maxLines?
 	let preDepth = 0;
 	let suppressedDepth = 0;
 	let titleDepth = 0;
+	let titleBytes = 0;
 	let elementDepth = 0;
 	let textLimitReached = maxBytes === 0 || maxLines === 0;
 	let parser: Parser | undefined;
@@ -667,8 +670,19 @@ export function extractHtml(html: string, limits: { maxBytes?: number; maxLines?
 				if (tag === "pre") preDepth++;
 			},
 			ontext(value) {
-				if (titleDepth > 0) {
-					titleParts.push(value);
+				if (titleDepth > 0 && titleBytes < MAX_TITLE_BYTES) {
+					let titlePart = "";
+					for (const character of value) {
+						const characterBytes = Buffer.byteLength(character, "utf8");
+						if (titleBytes + characterBytes > MAX_TITLE_BYTES) {
+							break;
+						}
+						titlePart += character;
+						titleBytes += characterBytes;
+					}
+					if (titlePart.length > 0) {
+						titleParts.push(titlePart);
+					}
 				}
 				if (suppressedDepth > 0) {
 					return;
