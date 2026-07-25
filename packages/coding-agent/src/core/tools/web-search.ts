@@ -9,7 +9,8 @@ import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/type
 import type { Theme } from "../theme/runtime.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+import { formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+import { cleanProviderContent, FALLBACK_MAX_LINES, parseProviderContent } from "./web-search-extract.ts";
 
 const DEFAULT_LIMIT = 5;
 const MAX_LIMIT = 10;
@@ -629,7 +630,11 @@ function createOutput(
 	text: string;
 	details: WebSearchToolDetails;
 } {
-	const normalizedResults = response.results
+	// Backends that answer with a prose blob (OpenAI/Codex) leave `results` empty.
+	// Recovering the hits from the blob keeps page bodies out of the transcript and
+	// makes `limit` mean something on that path.
+	const rawResults = response.results.length > 0 ? response.results : parseProviderContent(response.content);
+	const normalizedResults = rawResults
 		.map((result) => parseSearchResult(result))
 		.filter((result): result is WebSearchResult => result !== undefined);
 	const results = normalizedResults.slice(0, request.limit);
@@ -644,8 +649,8 @@ function createOutput(
 		lines.push(`Recency: ${formatRecency(request.recencyDays)}`);
 	}
 
-	if (response.content) {
-		lines.push("", response.content.trim());
+	if (results.length === 0 && response.content) {
+		lines.push("", cleanProviderContent(response.content));
 	} else if (results.length === 0) {
 		lines.push("", "No web results found");
 	} else {
@@ -670,7 +675,7 @@ function createOutput(
 	}
 
 	const rawOutput = lines.join("\n");
-	const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+	const truncation = truncateHead(rawOutput, { maxLines: FALLBACK_MAX_LINES });
 	const details: WebSearchToolDetails = {
 		query: request.query,
 		...(response.query ? { submittedQuery: response.query } : {}),
@@ -684,7 +689,9 @@ function createOutput(
 	}
 	if (truncation.truncated) {
 		details.truncation = truncation;
-		notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+		const limit =
+			truncation.truncatedBy === "lines" ? `${truncation.maxLines} lines` : formatSize(truncation.maxBytes);
+		notices.push(`${limit} limit reached`);
 	}
 
 	let text = truncation.content;
@@ -740,7 +747,11 @@ function formatWebSearchResult(
 	if (resultLimit || truncation?.truncated) {
 		const warnings: string[] = [];
 		if (resultLimit) warnings.push(`${resultLimit} results limit`);
-		if (truncation?.truncated) warnings.push(`${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit`);
+		if (truncation?.truncated) {
+			const limit =
+				truncation.truncatedBy === "lines" ? `${truncation.maxLines} lines` : formatSize(truncation.maxBytes);
+			warnings.push(`${limit} limit`);
+		}
 		text += `\n${theme.fg("warning", `[Truncated: ${warnings.join(", ")}]`)}`;
 	}
 	return text;

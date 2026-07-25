@@ -4,10 +4,36 @@ import { describe, expect, it } from "vitest";
 import {
 	createDefaultWebSearchOperations,
 	createWebSearchTool,
+	FALLBACK_MAX_LINES,
+	MAX_SNIPPET_CHARS,
+	parseProviderContent,
 	type WebSearchFetcher,
 	type WebSearchOperations,
 	type WebSearchRequest,
 } from "../src/index.ts";
+
+// Codex wraps citation ids in private-use-area delimiters.
+const CITE_START = "\u{E200}";
+const CITE_MID = "\u{E202}";
+const CITE_END = "\u{E201}";
+
+function citation(index: number): string {
+	return `${CITE_START}cite${CITE_MID}turn1search${index}${CITE_END}`;
+}
+
+/** Build a blob shaped like real Codex search output: header, detail line, page body. */
+function codexBlob(count: number, options: { body?: string } = {}): string {
+	const body = options.body ?? "Page body text";
+	const parts: string[] = [];
+	for (let i = 0; i < count; i++) {
+		parts.push(`Result ${i} title (https://example.com/${i})`);
+		parts.push(
+			`${citation(i)} [wordlim: 200] Published: 3 months ago; Crawled: 2 months ago; Snippet body for result ${i}.`,
+		);
+		parts.push("", `# Result ${i} heading`, body, "");
+	}
+	return parts.join("\n");
+}
 
 function getTextOutput(result: { content: Array<{ type: string; text?: string }> }): string {
 	return result.content
@@ -299,6 +325,26 @@ describe("web_search tool", () => {
 		});
 	});
 
+	it("requests a medium OpenAI response when the result limit is in the middle tier", async () => {
+		const fetcher: WebSearchFetcher = async (_input, init) => {
+			expect(getJsonBody(init)).toMatchObject({
+				commands: { response_length: "medium" },
+			});
+			return new Response(JSON.stringify({ output: "OpenAI search output" }), { status: 200 });
+		};
+		const operations = createDefaultWebSearchOperations({
+			env: {},
+			fetcher,
+			modelContext: () => ({
+				model: modelForSearch(),
+				apiKey: "sk-openai",
+				sessionId: "session-openai-medium",
+			}),
+		});
+
+		await operations.search({ query: "Volt AI", limit: 5 });
+	});
+
 	it("does not use Codex alpha search for custom providers using the Codex responses adapter", async () => {
 		let called = false;
 		const fetcher: WebSearchFetcher = async () => {
@@ -482,5 +528,186 @@ describe("web_search tool", () => {
 			"web_search is not configured. Use an authenticated OpenAI/OpenAI Codex model, set VOLT_WEB_SEARCH_URL, or set BRAVE_SEARCH_API_KEY.",
 		);
 		expect(called).toBe(false);
+	});
+});
+
+describe("web_search provider blob extraction", () => {
+	it("extracts results from a Codex blob and keeps page bodies out of the output", async () => {
+		const operations: WebSearchOperations = {
+			search: async () => ({
+				provider: "openai-codex",
+				query: "libuv uv_kill",
+				results: [],
+				content: codexBlob(2, { body: "GIANT PAGE BODY" }),
+			}),
+		};
+		const tool = createWebSearchTool(process.cwd(), { operations });
+
+		const result = await tool.execute("web-search-blob-1", { query: "libuv uv_kill" });
+
+		expect(result.details?.results).toEqual([
+			{
+				title: "Result 0 title",
+				url: "https://example.com/0",
+				snippet: "Snippet body for result 0.",
+				source: "example.com",
+				publishedAt: "3 months ago",
+			},
+			{
+				title: "Result 1 title",
+				url: "https://example.com/1",
+				snippet: "Snippet body for result 1.",
+				source: "example.com",
+				publishedAt: "3 months ago",
+			},
+		]);
+
+		const text = getTextOutput(result);
+		expect(text).toContain("[1] Result 0 title");
+		expect(text).toContain("URL: https://example.com/0");
+		expect(text).not.toContain("GIANT PAGE BODY");
+		expect(text).not.toContain("wordlim");
+		expect(text).not.toContain(CITE_START);
+	});
+
+	it("applies the caller's limit to results recovered from a blob", async () => {
+		const operations: WebSearchOperations = {
+			search: async (request) => ({
+				provider: "openai-codex",
+				query: request.query,
+				results: [],
+				content: codexBlob(11),
+			}),
+		};
+		const tool = createWebSearchTool(process.cwd(), { operations });
+
+		const result = await tool.execute("web-search-blob-2", { query: "many hits", limit: 5 });
+
+		expect(result.details?.results).toHaveLength(5);
+		expect(result.details?.resultLimitReached).toBe(5);
+		expect(getTextOutput(result)).toContain("[5] Result 4 title");
+		expect(getTextOutput(result)).not.toContain("[6] ");
+	});
+
+	it("caps long snippets", async () => {
+		const operations: WebSearchOperations = {
+			search: async () => ({
+				provider: "openai-codex",
+				query: "long snippet",
+				results: [],
+				content: `A title (https://example.com/long)\n${citation(0)} [wordlim: 200] ${"x".repeat(900)}`,
+			}),
+		};
+		const tool = createWebSearchTool(process.cwd(), { operations });
+
+		const result = await tool.execute("web-search-blob-3", { query: "long snippet" });
+
+		const snippet = result.details?.results[0]?.snippet ?? "";
+		expect(snippet.length).toBeLessThanOrEqual(MAX_SNIPPET_CHARS + 3);
+		expect(snippet.endsWith("...")).toBe(true);
+	});
+
+	it("labels a hit that has a URL but no title", () => {
+		const results = parseProviderContent(
+			`(https://www.n0.computer/)\n${citation(0)} [wordlim: 200] Crawled: today; iroh`,
+		);
+
+		expect(results).toEqual([{ title: "n0.computer", url: "https://www.n0.computer/", snippet: "iroh" }]);
+	});
+
+	it("parses result URLs containing balanced parentheses", () => {
+		const results = parseProviderContent(
+			`Function (mathematics) (https://en.wikipedia.org/wiki/Function_(mathematics))\n${citation(0)} [wordlim: 200] A relation between sets.`,
+		);
+
+		expect(results).toEqual([
+			{
+				title: "Function (mathematics)",
+				url: "https://en.wikipedia.org/wiki/Function_(mathematics)",
+				snippet: "A relation between sets.",
+			},
+		]);
+	});
+
+	it("does not treat body prose ending in a URL as a result header", () => {
+		const blob = [
+			"Real title (https://example.com/real)",
+			`${citation(0)} [wordlim: 200] Real snippet.`,
+			"",
+			"As an alternative, there is `EndTask` (https://msdn.microsoft.com/library/ms633492)",
+			"which does something else entirely.",
+		].join("\n");
+
+		expect(parseProviderContent(blob)).toEqual([
+			{ title: "Real title", url: "https://example.com/real", snippet: "Real snippet." },
+		]);
+	});
+
+	it("falls back to a cleaned blob when nothing parses", async () => {
+		const noisy = [
+			"Some heading",
+			"Copy link",
+			"More actions",
+			"  * Fork 3.9k",
+			"a repeated line of real content",
+			"",
+			"",
+			"a repeated line of real content",
+			`${citation(6)} [wordlim: 200] trailing marker text`,
+		].join("\n");
+		const operations: WebSearchOperations = {
+			search: async () => ({ provider: "openai-codex", query: "unparseable", results: [], content: noisy }),
+		};
+		const tool = createWebSearchTool(process.cwd(), { operations });
+
+		const result = await tool.execute("web-search-blob-4", { query: "unparseable" });
+
+		expect(result.details?.results).toEqual([]);
+		const text = getTextOutput(result);
+		expect(text).toContain("Some heading");
+		expect(text).not.toContain("Copy link");
+		expect(text).not.toContain("More actions");
+		expect(text).not.toContain("Fork 3.9k");
+		expect(text).not.toContain("wordlim");
+		expect(text.match(/a repeated line of real content/g)).toHaveLength(1);
+	});
+
+	it("truncates an oversized fallback blob by line count", async () => {
+		const operations: WebSearchOperations = {
+			search: async () => ({
+				provider: "openai-codex",
+				query: "huge",
+				results: [],
+				// Distinct lines so deduplication cannot shrink it below the cap.
+				content: Array.from({ length: FALLBACK_MAX_LINES * 2 }, (_, i) => `unique content line ${i}`).join("\n"),
+			}),
+		};
+		const tool = createWebSearchTool(process.cwd(), { operations });
+
+		const result = await tool.execute("web-search-blob-5", { query: "huge" });
+
+		expect(result.details?.truncation?.truncated).toBe(true);
+		expect(result.details?.truncation?.truncatedBy).toBe("lines");
+		expect(getTextOutput(result)).toContain(`${FALLBACK_MAX_LINES} lines limit reached`);
+		expect(getTextOutput(result)).not.toContain("50.0KB limit reached");
+	});
+
+	it("leaves structured backends untouched", async () => {
+		const operations: WebSearchOperations = {
+			search: async () => ({
+				provider: "brave",
+				query: "structured",
+				results: [{ title: "Brave hit", url: "https://example.com/brave", snippet: "From Brave" }],
+				content: "a blob that must be ignored when results are present",
+			}),
+		};
+		const tool = createWebSearchTool(process.cwd(), { operations });
+
+		const result = await tool.execute("web-search-blob-6", { query: "structured" });
+
+		expect(result.details?.results).toEqual([
+			{ title: "Brave hit", url: "https://example.com/brave", snippet: "From Brave", source: "example.com" },
+		]);
+		expect(getTextOutput(result)).not.toContain("must be ignored");
 	});
 });

@@ -37,7 +37,7 @@ const submitPlanSchema = Type.Object(
 );
 
 export const NATIVE_PLAN_TOOL_NAMES = new Set(["update_plan", "submit_plan"]);
-export const PLAN_MODE_READ_ONLY_TOOL_NAMES = ["read", "web_search", "grep", "find", "ls"] as const;
+export const PLAN_MODE_READ_ONLY_TOOL_NAMES = ["read", "web_search", "web_fetch", "grep", "find", "ls"] as const;
 
 export interface PlanningToolController {
 	getPlanningState(): PlanningState;
