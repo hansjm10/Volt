@@ -41,6 +41,7 @@ import {
 	createReadTool,
 	createSubagentRegistryTool,
 	createSubagentTool,
+	createWebFetchTool,
 	createWebSearchTool,
 	createWriteTool,
 	DEFAULT_ACTIVE_TOOL_NAMES,
@@ -169,6 +170,7 @@ export {
 	createLspTool,
 	createSubagentRegistryTool,
 	createSubagentTool,
+	createWebFetchTool,
 	createWebSearchTool,
 };
 

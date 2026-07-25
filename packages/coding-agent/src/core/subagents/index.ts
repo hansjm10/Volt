@@ -55,7 +55,7 @@ const BUILT_IN_GENERAL_SUBAGENT_FILE_PATH = "builtin:general";
 const BUILT_IN_RESEARCHER_SUBAGENT_FILE_PATH = "builtin:researcher";
 const BUILT_IN_DESIGN_DOC_SUBAGENT_FILE_PATH = "builtin:design-doc";
 const BUILT_IN_SECURITY_REVIEWER_SUBAGENT_FILE_PATH = "builtin:security-reviewer";
-const BUILT_IN_READ_ONLY_TOOLS = ["read", "web_search", "grep", "find", "ls"];
+const BUILT_IN_READ_ONLY_TOOLS = ["read", "web_search", "web_fetch", "grep", "find", "ls"];
 const BUILT_IN_DELEGATING_READ_ONLY_TOOLS = [...BUILT_IN_READ_ONLY_TOOLS, "subagent", SUBAGENT_REGISTRY_TOOL_NAME];
 
 export function createBuiltInSubagentDefinitions(): SubagentDefinition[] {

@@ -959,6 +959,10 @@ function projectRemoteToolArgs(
 			copyRemoteNumber(args, projected, "limit");
 			copyRemoteNumber(args, projected, "recencyDays");
 			break;
+		case "web_fetch":
+			copyRemoteString(args, projected, "url", authorization, REMOTE_TOOL_ARGUMENT_MAX_SCALARS);
+			copyRemoteNumber(args, projected, "maxBytes");
+			break;
 		default:
 			break;
 	}

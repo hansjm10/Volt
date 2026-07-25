@@ -140,6 +140,7 @@ import {
 	createAllToolDefinitions,
 	createDefaultWebSearchOperations,
 	DEFAULT_ACTIVE_TOOL_NAMES,
+	extractUrls,
 	type SubagentToolManager,
 } from "./tools/index.ts";
 import {
@@ -4264,6 +4265,55 @@ export class AgentSession {
 		this.setActiveToolsByName([...new Set(nextActiveToolNames)]);
 	}
 
+	/**
+	 * URLs that web_fetch is permitted to read.
+	 *
+	 * Only top-level user messages and structured results from successful
+	 * web_search calls count. Delegated prompts, assistant messages, and rendered
+	 * tool output are excluded because they can contain model- or attacker-chosen
+	 * URLs.
+	 */
+	private _collectFetchableUrls(): string[] {
+		const urls: string[] = [];
+		// A delegated task is persisted as a user-role message so it can start the
+		// child turn, but its author is the parent model. It must not grant the
+		// child permission to fetch model-constructed URLs.
+		const trustUserMessageUrls = this._subagentToolManager?.isSubagentRuntime?.() !== true;
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type !== "message") {
+				continue;
+			}
+			const message = entry.message;
+			if (message.role === "user" && trustUserMessageUrls) {
+				if (typeof message.content === "string") {
+					urls.push(...extractUrls(message.content));
+					continue;
+				}
+				for (const part of message.content) {
+					if (part.type === "text") {
+						urls.push(...extractUrls(part.text));
+					}
+				}
+			} else if (message.role === "toolResult" && message.toolName === "web_search" && !message.isError) {
+				const details: unknown = message.details;
+				if (
+					typeof details !== "object" ||
+					details === null ||
+					!("results" in details) ||
+					!Array.isArray(details.results)
+				) {
+					continue;
+				}
+				for (const result of details.results) {
+					if (typeof result === "object" && result !== null && "url" in result && typeof result.url === "string") {
+						urls.push(result.url);
+					}
+				}
+			}
+		}
+		return urls;
+	}
+
 	private _buildRuntime(options: {
 		activeToolNames?: string[];
 		flagValues?: Map<string, boolean | string>;
@@ -4336,6 +4386,9 @@ export class AgentSession {
 								};
 							},
 						}),
+					},
+					webFetch: {
+						urlPolicy: { type: "conversation", urls: () => this._collectFetchableUrls() },
 					},
 					lsp: { provider: this._lspManager },
 					...(subagentToolManager

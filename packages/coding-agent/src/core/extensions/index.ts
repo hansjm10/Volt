@@ -158,6 +158,8 @@ export type {
 	// Events - User Bash
 	UserBashEvent,
 	UserBashEventResult,
+	WebFetchToolCallEvent,
+	WebFetchToolResultEvent,
 	WebSearchToolCallEvent,
 	WebSearchToolResultEvent,
 	WidgetPlacement,
@@ -175,6 +177,7 @@ export {
 	isLsToolResult,
 	isReadToolResult,
 	isToolCallEventType,
+	isWebFetchToolResult,
 	isWebSearchToolResult,
 	isWriteToolResult,
 } from "./types.ts";
