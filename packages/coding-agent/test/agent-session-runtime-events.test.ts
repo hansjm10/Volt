@@ -1380,6 +1380,42 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		).toThrow(/disposed/);
 	});
 
+	it("keeps the source session active when fork destination persistence fails", async () => {
+		const events: RecordedSessionEvent[] = [];
+		const { runtimeHost } = await createRuntimeHost((volt) => {
+			volt.on("session_shutdown", (event) => {
+				events.push(event);
+			});
+		});
+		await runtimeHost.session.prompt("source prompt");
+		const originalSession = runtimeHost.session;
+		const originalSessionId = originalSession.sessionId;
+		const targetEntry = originalSession.sessionManager
+			.getEntries()
+			.find((entry) => entry.type === "message" && entry.message.role === "assistant");
+		if (!targetEntry) {
+			throw new Error("Expected an assistant entry to fork");
+		}
+		const destinationFailure = new Error("ENOSPC: fork destination write failed");
+		const originalFlush = SessionManager.prototype.flush;
+		const flush = vi.spyOn(SessionManager.prototype, "flush").mockImplementation(function (this: SessionManager) {
+			if (this.getSessionId() !== originalSessionId) {
+				return Promise.reject(destinationFailure);
+			}
+			return originalFlush.call(this);
+		});
+
+		try {
+			await expect(runtimeHost.fork(targetEntry.id, { position: "at" })).rejects.toBe(destinationFailure);
+		} finally {
+			flush.mockRestore();
+		}
+
+		expect(runtimeHost.session).toBe(originalSession);
+		expect(events).toEqual([]);
+		await expect(originalSession.prompt("source still works")).resolves.toBeUndefined();
+	});
+
 	it("emits session_before_fork and session_start and honors cancellation", async () => {
 		const events: RecordedSessionEvent[] = [];
 		let cancelNextFork = false;

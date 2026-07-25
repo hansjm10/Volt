@@ -892,7 +892,13 @@ export class AgentSession {
 					const entry = this._steeringMessages[steeringIndex]!;
 					const operation = entry.clientMessageId ? this._liveClientInputs.get(entry.clientMessageId) : undefined;
 					this._dequeuedQueueClientMessageIds.set(queueEntryId, entry.clientMessageId ?? null);
-					await this._markClientInputDispatchStarted(entry.clientMessageId, operation);
+					try {
+						await this._markClientInputDispatchStarted(entry.clientMessageId, operation);
+					} catch (error) {
+						const dispatchError = error instanceof Error ? error : new Error(String(error));
+						this._fenceFailedQueuedDispatch(entry, operation, dispatchError);
+						throw dispatchError;
+					}
 					if (
 						this._disposed ||
 						!this._steeringMessages.some((candidate) => candidate.queueEntryId === entry.queueEntryId) ||
@@ -916,7 +922,13 @@ export class AgentSession {
 							? this._liveClientInputs.get(entry.clientMessageId)
 							: undefined;
 						this._dequeuedQueueClientMessageIds.set(queueEntryId, entry.clientMessageId ?? null);
-						await this._markClientInputDispatchStarted(entry.clientMessageId, operation);
+						try {
+							await this._markClientInputDispatchStarted(entry.clientMessageId, operation);
+						} catch (error) {
+							const dispatchError = error instanceof Error ? error : new Error(String(error));
+							this._fenceFailedQueuedDispatch(entry, operation, dispatchError);
+							throw dispatchError;
+						}
 						if (
 							this._disposed ||
 							!this._followUpMessages.some((candidate) => candidate.queueEntryId === entry.queueEntryId) ||
@@ -1062,6 +1074,38 @@ export class AgentSession {
 			return handledEvent.message;
 		}
 	};
+
+	private _fenceFailedQueuedDispatch(
+		entry: AgentSessionQueuedMessage,
+		operation: LiveClientInputOperation | undefined,
+		error: Error,
+	): void {
+		this._dequeuedQueueClientMessageIds.delete(entry.queueEntryId);
+		const steeringIndex = this._steeringMessages.findIndex(
+			(candidate) => candidate.queueEntryId === entry.queueEntryId,
+		);
+		if (steeringIndex !== -1) {
+			this._steeringMessages.splice(steeringIndex, 1);
+		}
+		const followUpIndex = this._followUpMessages.findIndex(
+			(candidate) => candidate.queueEntryId === entry.queueEntryId,
+		);
+		if (followUpIndex !== -1) {
+			this._followUpMessages.splice(followUpIndex, 1);
+		}
+		if (
+			entry.clientMessageId !== undefined &&
+			operation !== undefined &&
+			this._liveClientInputs.get(entry.clientMessageId) === operation
+		) {
+			operation.queued = false;
+			operation.rejectAccepted(error);
+			operation.rejectCompletion(error);
+			this._liveClientInputs.delete(entry.clientMessageId);
+		}
+		this._emitQueueUpdate();
+		this.agent.abort();
+	}
 
 	private _startDequeuedClientInput(entry: AgentSessionQueuedMessage): void {
 		const clientMessageId = entry.clientMessageId;
@@ -3167,39 +3211,52 @@ export class AgentSession {
 		const followUp = this._followUpMessages.map((entry) => entry.text);
 		const queuedOperations = [...this._liveClientInputs].filter(([, operation]) => operation.queued);
 		const terminalError = new Error("client_input_failed: queued input was cleared before canonical consumption");
+		let persistenceError: Error | undefined;
 
-		for (const [clientMessageId] of queuedOperations) {
-			this.sessionManager.transitionClientInput(clientMessageId, "failed", terminalError.message);
+		try {
+			for (const [clientMessageId] of queuedOperations) {
+				this.sessionManager.transitionClientInput(clientMessageId, "failed", terminalError.message);
+			}
+		} catch (error) {
+			persistenceError = error instanceof Error ? error : new Error(String(error));
 		}
-		// Revoke runtime queue ownership synchronously so the agent cannot dequeue
-		// input after its terminal WAL record has been accepted for persistence.
+		// Runtime ownership must be revoked even when the terminal transition is
+		// rejected synchronously by a closed or fail-stopped persistence manager.
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
+		for (const [clientMessageId, operation] of queuedOperations) {
+			operation.queued = false;
+			if (this._liveClientInputs.get(clientMessageId) === operation) {
+				this._liveClientInputs.delete(clientMessageId);
+			}
+		}
 
 		// Runtime-only queue entries carry a local-queue identity and never reach the
 		// WAL, so clearing them appends nothing. Awaiting the durable watermark in
 		// that case records no cancellation and only inherits an unrelated earlier
 		// failure, which would fail the one action a fail-stopped session still owes
 		// the user: handing their unsent text back.
-		if (queuedOperations.length > 0) {
+		if (queuedOperations.length > 0 && persistenceError === undefined) {
 			try {
 				await this.sessionManager.flush();
 			} catch (error) {
-				const persistenceError = error instanceof Error ? error : new Error(String(error));
-				for (const [clientMessageId, operation] of queuedOperations) {
-					operation.rejectAccepted(persistenceError);
-					this._liveClientInputs.delete(clientMessageId);
-				}
-				throw new QueueClearPersistenceError(persistenceError, { steering, followUp });
+				persistenceError = error instanceof Error ? error : new Error(String(error));
 			}
+		}
+
+		if (persistenceError !== undefined) {
+			for (const [, operation] of queuedOperations) {
+				operation.rejectAccepted(persistenceError);
+				operation.rejectCompletion(persistenceError);
+			}
+			throw new QueueClearPersistenceError(persistenceError, { steering, followUp });
 		}
 
 		for (const [clientMessageId, operation] of queuedOperations) {
 			const admissionWasAcknowledged = operation.acceptanceSettled;
 			operation.rejectAccepted(terminalError);
-			this._liveClientInputs.delete(clientMessageId);
 			if (admissionWasAcknowledged) {
 				this._emitClientInputOutcome(clientMessageId, "failed", "queue_cleared");
 			}

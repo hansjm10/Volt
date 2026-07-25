@@ -83,7 +83,7 @@ export interface RpcCommandDispatcherContext {
 	 * invocation. The dispatcher launches it only after the accepted response is
 	 * enqueued, so the response precedes workflow_start on the shared lane.
 	 */
-	takePendingReviewWorkflowLaunch?(workflowId: string): (() => void) | undefined;
+	takePendingReviewWorkflow?(workflowId: string): { launch: () => void; cancel: () => void } | undefined;
 	subagents: RpcSubagentLifecycleController;
 }
 
@@ -354,18 +354,23 @@ export async function handleRpcCommand(
 					command.args,
 					{ requireRemoteSafe: options.requireRemoteSafeUiActions },
 				);
-				await session.sessionManager.flush();
-				const launchReviewWorkflow =
+				const pendingReviewWorkflow =
 					response.status === "accepted" && response.workflowId !== undefined
-						? context.takePendingReviewWorkflowLaunch?.(response.workflowId)
+						? context.takePendingReviewWorkflow?.(response.workflowId)
 						: undefined;
-				if (launchReviewWorkflow) {
+				try {
+					await session.sessionManager.flush();
+				} catch (error) {
+					pendingReviewWorkflow?.cancel();
+					throw error;
+				}
+				if (pendingReviewWorkflow) {
 					try {
 						context.output(createRpcSuccessResponse(id, "invoke_ui_action", response));
 					} finally {
 						// The workflow must always launch once registered; an unlaunched
 						// entry would pin the active set (and daemon retention) forever.
-						launchReviewWorkflow();
+						pendingReviewWorkflow.launch();
 					}
 					return undefined;
 				}

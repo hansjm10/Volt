@@ -502,6 +502,39 @@ describe("durable client input idempotency", () => {
 		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
 	});
 
+	it("revokes identified queues when terminal persistence rejects synchronously", async () => {
+		const tempDir = createTempDir();
+		tempDirs.push(tempDir);
+		const manager = SessionManager.create(tempDir, tempDir);
+		const harness = await createHarness({ sessionManager: manager });
+		harnesses.push(harness);
+		await harness.session.steer("restore steer", undefined, "clear-closed-steer");
+		await harness.session.followUp("restore follow-up", undefined, "clear-closed-follow");
+		await manager.closePersistence();
+
+		let thrown: unknown;
+		try {
+			await harness.session.clearQueue();
+		} catch (error) {
+			thrown = error;
+		}
+
+		expect(thrown).toBeInstanceOf(QueueClearPersistenceError);
+		const persistenceError = thrown as QueueClearPersistenceError;
+		expect(persistenceError.cause).toMatchObject({ message: "Session persistence is closed" });
+		expect(persistenceError.steering).toEqual(["restore steer"]);
+		expect(persistenceError.followUp).toEqual(["restore follow-up"]);
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		await expect(harness.session.steer("restore steer", undefined, "clear-closed-steer")).rejects.toThrow(
+			"Session persistence is closed",
+		);
+		await expect(harness.session.followUp("restore follow-up", undefined, "clear-closed-follow")).rejects.toThrow(
+			"Session persistence is closed",
+		);
+	});
+
 	it("keeps local runtime queue identities outside the forgeable client ID domain", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -728,6 +761,71 @@ describe("durable client input idempotency", () => {
 
 		expect(stateImmediatelyAfterClear).toBe("started");
 		expect(harness.sessionManager.getClientInput("client-consuming")?.state).toBe("completed");
+	});
+
+	it.each([
+		{ command: "steer" as const, clientMessageId: "steer-dispatch-flush-failure" },
+		{ command: "followUp" as const, clientMessageId: "follow-dispatch-flush-failure" },
+	])("fences a dequeued $command when its started boundary is not durable", async ({ command, clientMessageId }) => {
+		let releaseTool!: () => void;
+		let markToolStarted!: () => void;
+		const toolStarted = new Promise<void>((resolve) => {
+			markToolStarted = resolve;
+		});
+		const toolGate = new Promise<void>((resolve) => {
+			releaseTool = resolve;
+		});
+		const waitTool: AgentTool = {
+			name: "wait-for-dispatch-flush-failure",
+			label: "Wait",
+			description: "Wait for queued dispatch",
+			parameters: Type.Object({}),
+			execute: async () => {
+				markToolStarted();
+				await toolGate;
+				return { content: [{ type: "text", text: "released" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [waitTool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait-for-dispatch-flush-failure", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("current turn done"),
+			fauxAssistantMessage("queued turn must not run"),
+		]);
+		const run = harness.session.prompt("start").catch(() => {});
+		await toolStarted;
+		const queuedText = `${command} must not run`;
+		await (command === "steer"
+			? harness.session.steer(queuedText, undefined, clientMessageId)
+			: harness.session.followUp(queuedText, undefined, clientMessageId));
+
+		const originalFlush = harness.sessionManager.flush.bind(harness.sessionManager);
+		const dispatchFailure = new Error(`injected ${command} dispatch flush failure`);
+		let rejectedDispatch = false;
+		vi.spyOn(harness.sessionManager, "flush").mockImplementation(() => {
+			if (!rejectedDispatch && harness.sessionManager.getClientInput(clientMessageId)?.state === "started") {
+				rejectedDispatch = true;
+				return Promise.reject(dispatchFailure);
+			}
+			return originalFlush();
+		});
+
+		releaseTool();
+		await vi.waitFor(() => expect(rejectedDispatch).toBe(true));
+		await run;
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(false));
+
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("started");
+		expect(getUserTexts(harness)).not.toContain(queuedText);
+		await expect(
+			command === "steer"
+				? harness.session.steer(queuedText, undefined, clientMessageId)
+				: harness.session.followUp(queuedText, undefined, clientMessageId),
+		).rejects.toBeInstanceOf(ClientInputOutcomeAmbiguousError);
 	});
 
 	it("does not publish a dequeued message after concurrent queue clearing", async () => {

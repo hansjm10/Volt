@@ -1302,6 +1302,7 @@ export class AgentSessionRuntime {
 			if (!forkedSessionPath) {
 				throw new Error("Failed to create forked session");
 			}
+			await sessionManager.flush();
 			const replacement = await this.replaceCurrentSession({
 				operation,
 				reason: "fork",
