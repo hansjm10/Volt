@@ -1114,7 +1114,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	// Review workflows registered by invoke_ui_action but not yet executing; the
 	// dispatcher launches them after the accepted response is enqueued so the
 	// response deterministically precedes workflow_start on the shared lane.
-	const pendingReviewWorkflowLaunches = new Map<string, () => void>();
+	const pendingReviewWorkflows = new Map<string, { launch: () => void; cancel: () => void }>();
 
 	const createHostActionContext = (
 		commandSession: AgentSession = session,
@@ -1203,7 +1203,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 					}
 				},
 			});
-			pendingReviewWorkflowLaunches.set(descriptor.workflowId, launch);
+			pendingReviewWorkflows.set(descriptor.workflowId, {
+				launch,
+				cancel: () => runtimeHost.reviewWorkflows.cancel(descriptor.workflowId),
+			});
 			return {
 				status: "accepted",
 				workflowId: descriptor.workflowId,
@@ -1247,10 +1250,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			getPendingHostActionRequests: () => hostActionBridge.getPendingRequests(),
 			cancelPendingHostActionRequests,
 			assertConversationGenerationCurrent,
-			takePendingReviewWorkflowLaunch: (workflowId: string) => {
-				const launch = pendingReviewWorkflowLaunches.get(workflowId);
-				pendingReviewWorkflowLaunches.delete(workflowId);
-				return launch;
+			takePendingReviewWorkflow: (workflowId: string) => {
+				const pending = pendingReviewWorkflows.get(workflowId);
+				pendingReviewWorkflows.delete(workflowId);
+				return pending;
 			},
 			subagents: rpcSubagents,
 		};
@@ -1311,7 +1314,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			detachHostActionBridge();
 			detachReviewWorkflowSink();
 			await rpcSubagents.disposeAll();
-			pendingReviewWorkflowLaunches.clear();
+			pendingReviewWorkflows.clear();
 			if (shouldDisposeRuntimeOnClose) {
 				cancelPendingHostActionRequests();
 			}

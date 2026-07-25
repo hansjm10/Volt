@@ -100,7 +100,7 @@ describe("loadEntriesFromFile", () => {
 		expect(entries[1]?.type).toBe("message");
 	});
 
-	it("durably normalizes complete and torn unterminated tails before appending", () => {
+	it("durably normalizes complete and torn unterminated tails before appending", async () => {
 		const completeFile = join(tempDir, "complete-tail.jsonl");
 		writeFileSync(
 			completeFile,
@@ -110,6 +110,7 @@ describe("loadEntriesFromFile", () => {
 		const complete = SessionManager.open(completeFile, tempDir);
 		expect(readFileSync(completeFile, "utf8")).toBe(completeTailBeforeOpen);
 		complete.reserveClientInput("after-complete-tail", "prompt", { message: "hello" });
+		await complete.flush();
 		expect(() => SessionManager.open(completeFile, tempDir)).not.toThrow();
 		expect(readFileSync(completeFile, "utf8")).toContain('"clientMessageId":"after-complete-tail"');
 
@@ -123,6 +124,7 @@ describe("loadEntriesFromFile", () => {
 		const repaired = SessionManager.open(tornFile, tempDir);
 		expect(readFileSync(tornFile, "utf8")).toBe(tornTailBeforeOpen);
 		repaired.reserveClientInput("after-torn-tail", "prompt", { message: "hello" });
+		await repaired.flush();
 		const reopened = SessionManager.open(tornFile, tempDir);
 		expect(reopened.getClientInput("after-torn-tail")?.state).toBe("accepted");
 		expect(readFileSync(tornFile, "utf8")).not.toContain('{"type":"client_input_sta\n');
@@ -277,7 +279,7 @@ describe("SessionManager custom flat session directory", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	function createPersistedSession(cwd: string, label: string): string {
+	async function createPersistedSession(cwd: string, label: string): Promise<string> {
 		const session = SessionManager.create(cwd, tempDir);
 		session.appendMessage({ role: "user", content: label, timestamp: Date.now() });
 		session.appendMessage({
@@ -297,6 +299,7 @@ describe("SessionManager custom flat session directory", () => {
 			stopReason: "stop",
 			timestamp: Date.now(),
 		});
+		await session.flush();
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) {
 			throw new Error("Expected persisted session file");
@@ -305,9 +308,9 @@ describe("SessionManager custom flat session directory", () => {
 	}
 
 	it("scopes current-folder APIs by cwd while listing all flat sessions", async () => {
-		const sessionA = createPersistedSession(projectA, "from A");
+		const sessionA = await createPersistedSession(projectA, "from A");
 		await new Promise((r) => setTimeout(r, 10));
-		const sessionB = createPersistedSession(projectB, "from B");
+		const sessionB = await createPersistedSession(projectB, "from B");
 
 		const currentA = await SessionManager.list(projectA, tempDir);
 		expect(currentA.map((session) => session.path)).toEqual([sessionA]);

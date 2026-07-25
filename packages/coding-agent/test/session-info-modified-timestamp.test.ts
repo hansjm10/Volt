@@ -7,7 +7,7 @@ import type { SessionHeader } from "../src/core/session-manager.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
 
-function createSessionFile(path: string): void {
+async function createSessionFile(path: string): Promise<void> {
 	const header: SessionHeader = {
 		type: "session",
 		id: "test-session",
@@ -37,6 +37,7 @@ function createSessionFile(path: string): void {
 		stopReason: "stop",
 		timestamp: Date.now(),
 	});
+	await mgr.flush();
 }
 
 describe("SessionInfo.modified", () => {
@@ -48,7 +49,7 @@ describe("SessionInfo.modified", () => {
 
 	it("uses last user/assistant message timestamp instead of file mtime", async () => {
 		const filePath = join(tmpdir(), `volt-session-${Date.now()}-modified.jsonl`);
-		createSessionFile(filePath);
+		await createSessionFile(filePath);
 
 		const before = await stat(filePath);
 		// Ensure the file mtime can differ from our message timestamp even on coarse filesystems.
@@ -73,6 +74,7 @@ describe("SessionInfo.modified", () => {
 			stopReason: "stop",
 			timestamp: msgTime,
 		});
+		await mgr.flush();
 
 		const sessions = await SessionManager.list("/tmp", dirname(filePath));
 		const s = sessions.find((x) => x.path === filePath);

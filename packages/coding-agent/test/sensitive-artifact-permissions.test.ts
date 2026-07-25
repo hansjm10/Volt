@@ -36,11 +36,12 @@ describe.skipIf(process.platform === "win32")("sensitive artifact permissions", 
 		rmSync(root, { recursive: true, force: true });
 	});
 
-	it("keeps session directories private across create, open, branch, and fork paths", () => {
+	it("keeps session directories private across create, open, branch, and fork paths", async () => {
 		const sessionDir = join(root, "sessions");
 		mkdirSync(sessionDir, { mode: 0o777 });
 		const manager = SessionManager.create(cwd, sessionDir);
 		const leafId = manager.appendCustomMessageEntry("test", "secret", true);
+		await manager.flush();
 		const sessionFile = manager.getSessionFile();
 		expect(sessionFile).toBeDefined();
 		expect(mode(sessionDir)).toBe(0o700);
@@ -53,6 +54,7 @@ describe.skipIf(process.platform === "win32")("sensitive artifact permissions", 
 		expect(mode(sessionFile!)).toBe(0o600);
 
 		const branchedFile = reopened.createBranchedSession(leafId);
+		await reopened.flush();
 		expect(branchedFile).toBeDefined();
 		expect(mode(branchedFile!)).toBe(0o600);
 
@@ -94,10 +96,11 @@ describe.skipIf(process.platform === "win32")("sensitive artifact permissions", 
 		expect(readFileSync(sessionFile, "utf8")).toBe(original);
 	});
 
-	it("rejects linked session sources", () => {
+	it("rejects linked session sources", async () => {
 		const sessionDir = join(root, "sessions");
 		const manager = SessionManager.create(cwd, sessionDir);
 		manager.appendCustomMessageEntry("test", "secret", true);
+		await manager.flush();
 		const sessionFile = manager.getSessionFile()!;
 		const symbolicLink = join(root, "linked-session.jsonl");
 		symlinkSync(sessionFile, symbolicLink);
@@ -111,6 +114,7 @@ describe.skipIf(process.platform === "win32")("sensitive artifact permissions", 
 	it("writes HTML and JSONL exports privately without following destination symlinks", async () => {
 		const manager = SessionManager.create(cwd, join(root, "sessions"));
 		manager.appendCustomMessageEntry("test", "secret", true);
+		await manager.flush();
 
 		const exportDir = join(root, "exports", "nested");
 		const htmlPath = join(exportDir, "session.html");

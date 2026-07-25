@@ -188,6 +188,7 @@ function makeSession(sessionId: string, initialFastModeEnabled = false) {
 		settingsManager: {},
 		sessionFile: `/sessions/${sessionId}.jsonl`,
 		sessionId,
+		sessionManager: { flush: vi.fn(async () => {}) },
 	};
 }
 
@@ -437,6 +438,38 @@ describe("RPC mode detached review actions", () => {
 				}),
 			),
 		);
+
+		getCloseHandler()?.();
+		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("cancels a registered review when accepted-response durability fails", async () => {
+		const runtimeHost = makeRuntimeHost();
+		const { transport, writes, getLineHandler, getCloseHandler } = createCollectingTransport();
+		const { modePromise } = await startMode(runtimeHost, transport);
+		const flushFailure = new Error("ENOSPC: accepted response is not durable");
+		vi.spyOn(runtimeHost.session.sessionManager, "flush").mockRejectedValueOnce(flushFailure);
+
+		getLineHandler()(
+			JSON.stringify({ id: "review-flush-failure", type: "invoke_ui_action", action: "review.uncommitted" }),
+		);
+
+		await vi.waitFor(() =>
+			expect(writes).toContainEqual({
+				id: "review-flush-failure",
+				type: "response",
+				command: "invoke_ui_action",
+				success: false,
+				error: flushFailure.message,
+			}),
+		);
+		expect(reviewMocks.executeReviewWorkflow).not.toHaveBeenCalled();
+		expect(runtimeHost.reviewWorkflows.hasActiveWorkflows).toBe(false);
+		expect(runtimeHost.reviewWorkflows.get("review:test")).toMatchObject({
+			workflowId: "review:test",
+			status: "cancelled",
+		});
+		expect(writes).not.toContainEqual(expect.objectContaining({ type: "workflow_start" }));
 
 		getCloseHandler()?.();
 		await expect(modePromise).resolves.toBeUndefined();

@@ -506,7 +506,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 		},
 	);
 
-	it("persists and echoes client message identity across sanitized live and bootstrap projections", () => {
+	it("persists and echoes client message identity across sanitized live and bootstrap projections", async () => {
 		const root = mkdtempSync(join(tmpdir(), "volt-client-message-id-"));
 		const workspacePath = join(root, "workspace");
 		const sessionDir = join(root, "sessions");
@@ -544,6 +544,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 				text: "Read /workspace/fixture.txt",
 			});
 			expect(bootstrap?.items).toEqual([live]);
+			await manager.flush();
 			expect(readFileSync(manager.getSessionFile()!, "utf8")).toContain('"clientMessageId":"client-message-42"');
 		} finally {
 			rmSync(root, { recursive: true, force: true });

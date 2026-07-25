@@ -443,7 +443,10 @@ export class SettingsManager {
 	private modifiedProjectProfileNestedFields: ModifiedProfileNestedFields = new Map(); // Track project profile nested field modifications
 	private globalSettingsLoadError: Error | null = null; // Track if global settings file had parse errors
 	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
+	/** Settled serialization lane; write errors are recorded without blocking later settings writes. */
 	private writeQueue: Promise<void> = Promise.resolve();
+	/** Latest accepted write, retained as a rejecting durability watermark for flush callers. */
+	private writeWatermark: Promise<void> = Promise.resolve();
 	private errors: SettingsError[];
 	private sessionOverrides: Settings = {}; // Runtime overrides (e.g. CLI flags), reapplied on every re-merge
 
@@ -900,17 +903,18 @@ export class SettingsManager {
 	}
 
 	private enqueueWrite(scope: SettingsScope, task: () => void): void {
-		this.writeQueue = this.writeQueue
-			.then(() => {
-				if (scope === "project") {
-					this.assertProjectTrustedForWrite();
-				}
-				task();
-				this.clearModifiedScope(scope);
-			})
-			.catch((error) => {
-				this.recordError(scope, error);
-			});
+		const write = this.writeQueue.then(() => {
+			if (scope === "project") {
+				this.assertProjectTrustedForWrite();
+			}
+			task();
+			this.clearModifiedScope(scope);
+		});
+		this.writeQueue = write.catch((error) => {
+			this.recordError(scope, error);
+		});
+		this.writeWatermark = write;
+		void write.catch(() => {});
 	}
 
 	private cloneModifiedNestedFields(source: Map<keyof Settings, Set<string>>): Map<keyof Settings, Set<string>> {
@@ -1130,7 +1134,7 @@ export class SettingsManager {
 	}
 
 	async flush(): Promise<void> {
-		await this.writeQueue;
+		await this.writeWatermark;
 	}
 
 	drainErrors(): SettingsError[] {

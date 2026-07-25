@@ -83,7 +83,7 @@ export interface RpcCommandDispatcherContext {
 	 * invocation. The dispatcher launches it only after the accepted response is
 	 * enqueued, so the response precedes workflow_start on the shared lane.
 	 */
-	takePendingReviewWorkflowLaunch?(workflowId: string): (() => void) | undefined;
+	takePendingReviewWorkflow?(workflowId: string): { launch: () => void; cancel: () => void } | undefined;
 	subagents: RpcSubagentLifecycleController;
 }
 
@@ -254,7 +254,9 @@ export async function handleRpcCommand(
 
 		case "set_agent_mode": {
 			context.assertConversationGenerationCurrent();
-			return createRpcSuccessResponse(id, "set_agent_mode", session.setAgentMode(command.mode));
+			const planning = session.setAgentMode(command.mode);
+			await session.sessionManager.flush();
+			return createRpcSuccessResponse(id, "set_agent_mode", planning);
 		}
 
 		case "plan_execute": {
@@ -269,20 +271,16 @@ export async function handleRpcCommand(
 
 		case "plan_change": {
 			context.assertConversationGenerationCurrent();
-			return createRpcSuccessResponse(
-				id,
-				"plan_change",
-				session.changePlan(command.planId, command.expectedRevision),
-			);
+			const planning = session.changePlan(command.planId, command.expectedRevision);
+			await session.sessionManager.flush();
+			return createRpcSuccessResponse(id, "plan_change", planning);
 		}
 
 		case "plan_discard": {
 			context.assertConversationGenerationCurrent();
-			return createRpcSuccessResponse(
-				id,
-				"plan_discard",
-				session.discardPlan(command.planId, command.expectedRevision),
-			);
+			const planning = session.discardPlan(command.planId, command.expectedRevision);
+			await session.sessionManager.flush();
+			return createRpcSuccessResponse(id, "plan_discard", planning);
 		}
 
 		// =================================================================
@@ -356,17 +354,23 @@ export async function handleRpcCommand(
 					command.args,
 					{ requireRemoteSafe: options.requireRemoteSafeUiActions },
 				);
-				const launchReviewWorkflow =
+				const pendingReviewWorkflow =
 					response.status === "accepted" && response.workflowId !== undefined
-						? context.takePendingReviewWorkflowLaunch?.(response.workflowId)
+						? context.takePendingReviewWorkflow?.(response.workflowId)
 						: undefined;
-				if (launchReviewWorkflow) {
+				try {
+					await session.sessionManager.flush();
+				} catch (error) {
+					pendingReviewWorkflow?.cancel();
+					throw error;
+				}
+				if (pendingReviewWorkflow) {
 					try {
 						context.output(createRpcSuccessResponse(id, "invoke_ui_action", response));
 					} finally {
 						// The workflow must always launch once registered; an unlaunched
 						// entry would pin the active set (and daemon retention) forever.
-						launchReviewWorkflow();
+						pendingReviewWorkflow.launch();
 					}
 					return undefined;
 				}
@@ -808,6 +812,7 @@ export async function handleRpcCommand(
 
 		case "set_thinking_level": {
 			session.setThinkingLevel(command.level, { persistDefault: command.persistDefault });
+			await Promise.all([session.sessionManager.flush(), session.settingsManager.flush()]);
 			return createRpcSuccessResponse(id, "set_thinking_level", { level: session.thinkingLevel });
 		}
 
@@ -816,6 +821,7 @@ export async function handleRpcCommand(
 			if (!level) {
 				return createRpcSuccessResponse(id, "cycle_thinking_level", null);
 			}
+			await Promise.all([session.sessionManager.flush(), session.settingsManager.flush()]);
 			return createRpcSuccessResponse(id, "cycle_thinking_level", { level });
 		}
 
@@ -949,6 +955,7 @@ export async function handleRpcCommand(
 
 		case "set_session_name": {
 			runSessionRenameHostAction(context.createHostActionContext(), command.name);
+			await session.sessionManager.flush();
 			return createRpcSuccessResponse(id, "set_session_name");
 		}
 

@@ -234,6 +234,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			...(options.projectTrusted !== undefined ? { projectTrusted: options.projectTrusted } : {}),
 		});
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+	await sessionManager.flush();
 
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({ cwd: projectCwd, agentDir, settingsManager });
@@ -245,6 +246,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let existingSession = sessionManager.buildSessionContext();
 	if (options.agentMode !== undefined && existingSession.planning.mode !== options.agentMode) {
 		sessionManager.appendPlanningState({ ...existingSession.planning, mode: options.agentMode });
+		await sessionManager.flush();
 		existingSession = sessionManager.buildSessionContext();
 	}
 	const existingBranch = sessionManager.getBranch();
@@ -483,6 +485,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	if (options.thinkingLevel !== undefined || !hasThinkingEntry) {
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}
+	await sessionManager.flush();
 
 	const session = new AgentSession({
 		agent,

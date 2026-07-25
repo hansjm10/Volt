@@ -15,6 +15,7 @@ export {
 	type ParsedSkillBlock,
 	type PromptOptions,
 	parseSkillBlock,
+	QueueClearPersistenceError,
 	type SessionStats,
 } from "./core/agent-session.ts";
 // Auth and model registry

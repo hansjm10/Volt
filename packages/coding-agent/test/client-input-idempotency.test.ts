@@ -5,7 +5,11 @@ import type { AgentTool } from "@hansjm10/volt-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ClientInputConflictError, ClientInputOutcomeAmbiguousError } from "../src/core/agent-session.ts";
+import {
+	ClientInputConflictError,
+	ClientInputOutcomeAmbiguousError,
+	QueueClearPersistenceError,
+} from "../src/core/agent-session.ts";
 import { createIrohRemotePresetAccess } from "../src/core/remote/iroh/access-grant.ts";
 import type { IrohRemoteClientAuthorizationSuccess } from "../src/core/remote/iroh/authorization.ts";
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
@@ -57,9 +61,11 @@ describe("durable client input idempotency", () => {
 	const harnesses: Harness[] = [];
 	const tempDirs: string[] = [];
 
-	afterEach(() => {
+	afterEach(async () => {
 		while (harnesses.length > 0) {
-			harnesses.pop()?.cleanup();
+			const harness = harnesses.pop()!;
+			await harness.session.dispose();
+			harness.cleanup();
 		}
 		while (tempDirs.length > 0) {
 			const tempDir = tempDirs.pop();
@@ -101,6 +107,76 @@ describe("durable client input idempotency", () => {
 			ClientInputConflictError,
 		);
 		expect(getUserTexts(harness)).toEqual(["original"]);
+	});
+
+	it("removes a live admission when its conversation authority expires during receipt flush", async () => {
+		const manager = SessionManager.inMemory();
+		const harness = await createHarness({ sessionManager: manager });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("retry completed")]);
+		let releaseFlush!: () => void;
+		const flushGate = new Promise<void>((resolve) => {
+			releaseFlush = resolve;
+		});
+		const flush = vi.spyOn(manager, "flush").mockImplementationOnce(() => flushGate);
+		let authorityCurrent = true;
+
+		const first = harness.session.prompt("authority race", {
+			clientMessageId: "authority-race",
+			assertConversationGenerationCurrent: () => {
+				if (!authorityCurrent) throw new Error("stale conversation authority");
+			},
+		});
+		await vi.waitFor(() => expect(flush).toHaveBeenCalledOnce());
+		authorityCurrent = false;
+		releaseFlush();
+		await expect(first).rejects.toThrow("stale conversation authority");
+
+		await expect(
+			harness.session.prompt("authority race", { clientMessageId: "authority-race" }),
+		).resolves.toBeUndefined();
+		expect(getUserTexts(harness)).toEqual(["authority race"]);
+	});
+
+	it("fences an identified prompt receipt flush against concurrent abort", async () => {
+		const manager = SessionManager.inMemory();
+		const harness = await createHarness({ sessionManager: manager });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("retry completed")]);
+		let releaseFlush!: () => void;
+		let markFlushEntered!: () => void;
+		const flushEntered = new Promise<void>((resolve) => {
+			markFlushEntered = resolve;
+		});
+		const flushGate = new Promise<void>((resolve) => {
+			releaseFlush = resolve;
+		});
+		vi.spyOn(manager, "flush").mockImplementationOnce(() => {
+			markFlushEntered();
+			return flushGate;
+		});
+
+		const promptOutcome = harness.session
+			.prompt("abort receipt race", { clientMessageId: "abort-receipt-race" })
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		await flushEntered;
+		await expect(harness.session.abort()).resolves.toBeUndefined();
+		releaseFlush();
+
+		expect(await promptOutcome).toMatchObject({
+			message: "Client input admission was aborted before its receipt became durable",
+		});
+		expect(getUserTexts(harness)).toEqual([]);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(manager.getClientInput("abort-receipt-race")?.state).toBe("accepted");
+
+		await expect(
+			harness.session.prompt("abort receipt race", { clientMessageId: "abort-receipt-race" }),
+		).resolves.toBeUndefined();
+		expect(getUserTexts(harness)).toEqual(["abort receipt race"]);
 	});
 
 	it("includes exact ordered image bytes and streaming behavior in the semantic identity", async () => {
@@ -343,6 +419,73 @@ describe("durable client input idempotency", () => {
 		expect(sideEffects).toBe(1);
 	});
 
+	it.each([{ boundary: "command" as const }, { boundary: "input_hook" as const }])(
+		"does not cross a persisted $boundary dispatch boundary after concurrent abort",
+		async ({ boundary }) => {
+			let sideEffects = 0;
+			const clientMessageId = `abort-${boundary}-dispatch`;
+			const harness = await createHarness({
+				extensionFactories: [
+					(volt) => {
+						if (boundary === "command") {
+							volt.registerCommand("side-effect", {
+								handler: async () => {
+									sideEffects++;
+								},
+							});
+							return;
+						}
+						volt.on("input", () => {
+							sideEffects++;
+							return { action: "handled" };
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("must remain unused")]);
+			const originalFlush = harness.sessionManager.flush.bind(harness.sessionManager);
+			let releaseDispatch!: () => void;
+			let markDispatchEntered!: () => void;
+			const dispatchEntered = new Promise<void>((resolve) => {
+				markDispatchEntered = resolve;
+			});
+			const dispatchGate = new Promise<void>((resolve) => {
+				releaseDispatch = resolve;
+			});
+			let dispatchGated = false;
+			vi.spyOn(harness.sessionManager, "flush").mockImplementation(() => {
+				const watermark = originalFlush();
+				if (!dispatchGated && harness.sessionManager.getClientInput(clientMessageId)?.state === "started") {
+					dispatchGated = true;
+					markDispatchEntered();
+					return watermark.then(() => dispatchGate);
+				}
+				return watermark;
+			});
+
+			const promptOutcome = harness.session
+				.prompt(boundary === "command" ? "/side-effect" : "handle in input hook", { clientMessageId })
+				.then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+			await dispatchEntered;
+			const abort = harness.session.abort();
+			releaseDispatch();
+			await abort;
+
+			expect(await promptOutcome).toMatchObject({
+				message: "Client input was aborted while persisting its dispatch boundary",
+			});
+			expect(sideEffects).toBe(0);
+			expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("failed");
+			expect(harness.sessionManager.getClientInputRecoveryPlan()).toEqual({ kind: "idle", records: [] });
+			expect(getUserTexts(harness)).toEqual([]);
+			expect(harness.getPendingResponseCount()).toBe(1);
+		},
+	);
+
 	it("enqueues duplicate steer and follow-up inputs once and rejects cross-command id reuse", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -374,7 +517,7 @@ describe("durable client input idempotency", () => {
 			ClientInputConflictError,
 		);
 
-		harness.session.clearQueue();
+		await harness.session.clearQueue();
 		expect(harness.sessionManager.getClientInput("client-steer")?.state).toBe("failed");
 		expect(harness.sessionManager.getClientInput("client-follow")?.state).toBe("failed");
 		expect(terminalOutcomes).toEqual([
@@ -391,6 +534,166 @@ describe("durable client input idempotency", () => {
 				reason: "queue_cleared",
 			},
 		]);
+	});
+
+	it("revokes runtime queue ownership before awaiting cleared-input durability", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await harness.session.steer("must not dequeue", undefined, "clear-before-flush");
+		let releaseFlush!: () => void;
+		const flushGate = new Promise<void>((resolve) => {
+			releaseFlush = resolve;
+		});
+		vi.spyOn(harness.sessionManager, "flush").mockReturnValue(flushGate);
+
+		const clearing = harness.session.clearQueue();
+		try {
+			expect(harness.session.getSteeringMessages()).toEqual([]);
+			expect(harness.session.getFollowUpMessages()).toEqual([]);
+			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+			expect(harness.sessionManager.getClientInput("clear-before-flush")?.state).toBe("failed");
+		} finally {
+			releaseFlush();
+		}
+		await clearing;
+	});
+
+	it.each([
+		{ command: "steer" as const, clientMessageId: "clear-pending-steer" },
+		{ command: "followUp" as const, clientMessageId: "clear-pending-follow" },
+	])(
+		"keeps a pending $command admission visible to concurrent queue clearing",
+		async ({ command, clientMessageId }) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const originalFlush = harness.sessionManager.flush.bind(harness.sessionManager);
+			let releaseQueueFlush!: () => void;
+			let markQueueFlushEntered!: () => void;
+			const queueFlushEntered = new Promise<void>((resolve) => {
+				markQueueFlushEntered = resolve;
+			});
+			const queueFlushGate = new Promise<void>((resolve) => {
+				releaseQueueFlush = resolve;
+			});
+			let queueFlushGated = false;
+			vi.spyOn(harness.sessionManager, "flush").mockImplementation(() => {
+				const watermark = originalFlush();
+				if (!queueFlushGated && harness.sessionManager.getClientInput(clientMessageId)?.queuedInput !== undefined) {
+					queueFlushGated = true;
+					markQueueFlushEntered();
+					return watermark.then(() => queueFlushGate);
+				}
+				return watermark;
+			});
+
+			const queueOutcome = (
+				command === "steer"
+					? harness.session.steer("clear pending admission", undefined, clientMessageId)
+					: harness.session.followUp("clear pending admission", undefined, clientMessageId)
+			).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await queueFlushEntered;
+			try {
+				await expect(harness.session.clearQueue()).resolves.toEqual({ steering: [], followUp: [] });
+				expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("failed");
+			} finally {
+				releaseQueueFlush();
+			}
+
+			expect(await queueOutcome).toMatchObject({
+				message: "Queued input admission was cleared before runtime publication",
+			});
+			expect(harness.session.getSteeringMessages()).toEqual([]);
+			expect(harness.session.getFollowUpMessages()).toEqual([]);
+			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		},
+	);
+
+	it("cancels runtime-only queued input without awaiting unrelated durability", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		// Local TUI-style queue entries have no durable client identity, so clearing
+		// them records nothing and must not inherit an earlier persistence failure.
+		await harness.session.steer("steered draft");
+		await harness.session.followUp("follow-up draft");
+
+		const flush = vi.spyOn(harness.sessionManager, "flush").mockRejectedValue(new Error("ENOSPC"));
+		try {
+			await expect(harness.session.clearQueue()).resolves.toEqual({
+				steering: ["steered draft"],
+				followUp: ["follow-up draft"],
+			});
+			expect(flush).not.toHaveBeenCalled();
+		} finally {
+			flush.mockRestore();
+		}
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("carries the cleared queue text on the error when cancellation cannot be persisted", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await harness.session.steer("steered draft", undefined, "clear-steer-flush-failure");
+		await harness.session.followUp("follow-up draft", undefined, "clear-follow-flush-failure");
+
+		const flushFailure = new Error("ENOSPC: no space left on device");
+		const flush = vi.spyOn(harness.sessionManager, "flush").mockRejectedValue(flushFailure);
+		let thrown: unknown;
+		try {
+			await harness.session.clearQueue();
+		} catch (error) {
+			thrown = error;
+		} finally {
+			flush.mockRestore();
+		}
+
+		// The runtime queues are revoked before durability is awaited, so the error
+		// holds the only surviving copy of what the user typed.
+		expect(thrown).toBeInstanceOf(QueueClearPersistenceError);
+		const persistenceError = thrown as QueueClearPersistenceError;
+		expect(persistenceError.steering).toEqual(["steered draft"]);
+		expect(persistenceError.followUp).toEqual(["follow-up draft"]);
+		expect(persistenceError.cause).toBe(flushFailure);
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("revokes identified queues when terminal persistence rejects synchronously", async () => {
+		const tempDir = createTempDir();
+		tempDirs.push(tempDir);
+		const manager = SessionManager.create(tempDir, tempDir);
+		const harness = await createHarness({ sessionManager: manager });
+		harnesses.push(harness);
+		await harness.session.steer("restore steer", undefined, "clear-closed-steer");
+		await harness.session.followUp("restore follow-up", undefined, "clear-closed-follow");
+		await manager.closePersistence();
+
+		let thrown: unknown;
+		try {
+			await harness.session.clearQueue();
+		} catch (error) {
+			thrown = error;
+		}
+
+		expect(thrown).toBeInstanceOf(QueueClearPersistenceError);
+		const persistenceError = thrown as QueueClearPersistenceError;
+		expect(persistenceError.cause).toMatchObject({ message: "Session persistence is closed" });
+		expect(persistenceError.steering).toEqual(["restore steer"]);
+		expect(persistenceError.followUp).toEqual(["restore follow-up"]);
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		await expect(harness.session.steer("restore steer", undefined, "clear-closed-steer")).rejects.toThrow(
+			"Session persistence is closed",
+		);
+		await expect(harness.session.followUp("restore follow-up", undefined, "clear-closed-follow")).rejects.toThrow(
+			"Session persistence is closed",
+		);
 	});
 
 	it("keeps local runtime queue identities outside the forgeable client ID domain", async () => {
@@ -435,6 +738,7 @@ describe("durable client input idempotency", () => {
 			).rejects.toThrow(`injected ${command} enqueue failure`);
 			expect(manager.getClientInput(clientMessageId)).toMatchObject({ state: "failed" });
 			expect(manager.getRecoverableQueuedClientInputs()).toEqual([]);
+			await manager.flush();
 			expect(harness.session.getSteeringMessages()).toEqual([]);
 			expect(harness.session.getFollowUpMessages()).toEqual([]);
 			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
@@ -529,6 +833,7 @@ describe("durable client input idempotency", () => {
 		});
 		expect(harness.sessionManager.getClientInput("hook-queue-pass")?.state).toBe("accepted");
 		expect(harness.sessionManager.getClientInput("hook-queue-transform")?.state).toBe("accepted");
+		await harness.sessionManager.flush();
 		const reopened = SessionManager.open(
 			harness.sessionManager.getSessionFile()!,
 			harness.sessionManager.getSessionDir(),
@@ -540,6 +845,7 @@ describe("durable client input idempotency", () => {
 
 		releaseTool();
 		await run;
+		await harness.sessionManager.flush();
 		for (const clientMessageId of ["hook-queue-pass", "hook-queue-transform"]) {
 			expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("completed");
 			const entries = readFileSync(harness.sessionManager.getSessionFile()!, "utf8")
@@ -603,7 +909,7 @@ describe("durable client input idempotency", () => {
 				event.message.role === "user" &&
 				event.message.clientMessageId === "client-consuming"
 			) {
-				harness.session.clearQueue();
+				void harness.session.clearQueue();
 				stateImmediatelyAfterClear = harness.sessionManager.getClientInput("client-consuming")?.state;
 			}
 		});
@@ -618,11 +924,153 @@ describe("durable client input idempotency", () => {
 		expect(harness.sessionManager.getClientInput("client-consuming")?.state).toBe("completed");
 	});
 
+	it.each([
+		{ command: "steer" as const, clientMessageId: "steer-dispatch-flush-failure" },
+		{ command: "followUp" as const, clientMessageId: "follow-dispatch-flush-failure" },
+	])("fences a dequeued $command when its started boundary is not durable", async ({ command, clientMessageId }) => {
+		let releaseTool!: () => void;
+		let markToolStarted!: () => void;
+		const toolStarted = new Promise<void>((resolve) => {
+			markToolStarted = resolve;
+		});
+		const toolGate = new Promise<void>((resolve) => {
+			releaseTool = resolve;
+		});
+		const waitTool: AgentTool = {
+			name: "wait-for-dispatch-flush-failure",
+			label: "Wait",
+			description: "Wait for queued dispatch",
+			parameters: Type.Object({}),
+			execute: async () => {
+				markToolStarted();
+				await toolGate;
+				return { content: [{ type: "text", text: "released" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [waitTool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait-for-dispatch-flush-failure", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("current turn done"),
+			fauxAssistantMessage("queued turn must not run"),
+		]);
+		const run = harness.session.prompt("start").catch(() => {});
+		await toolStarted;
+		const queuedText = `${command} must not run`;
+		await (command === "steer"
+			? harness.session.steer(queuedText, undefined, clientMessageId)
+			: harness.session.followUp(queuedText, undefined, clientMessageId));
+
+		const originalFlush = harness.sessionManager.flush.bind(harness.sessionManager);
+		const dispatchFailure = new Error(`injected ${command} dispatch flush failure`);
+		let rejectedDispatch = false;
+		vi.spyOn(harness.sessionManager, "flush").mockImplementation(() => {
+			if (!rejectedDispatch && harness.sessionManager.getClientInput(clientMessageId)?.state === "started") {
+				rejectedDispatch = true;
+				return Promise.reject(dispatchFailure);
+			}
+			return originalFlush();
+		});
+
+		releaseTool();
+		await vi.waitFor(() => expect(rejectedDispatch).toBe(true));
+		await run;
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(false));
+
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("started");
+		expect(getUserTexts(harness)).not.toContain(queuedText);
+		await expect(
+			command === "steer"
+				? harness.session.steer(queuedText, undefined, clientMessageId)
+				: harness.session.followUp(queuedText, undefined, clientMessageId),
+		).rejects.toBeInstanceOf(ClientInputOutcomeAmbiguousError);
+	});
+
+	it("does not publish a dequeued message after concurrent queue clearing", async () => {
+		let releaseTool!: () => void;
+		let markToolStarted!: () => void;
+		const toolStarted = new Promise<void>((resolve) => {
+			markToolStarted = resolve;
+		});
+		const toolGate = new Promise<void>((resolve) => {
+			releaseTool = resolve;
+		});
+		const waitTool: AgentTool = {
+			name: "wait",
+			label: "Wait",
+			description: "Wait for the dequeue race",
+			parameters: Type.Object({}),
+			execute: async () => {
+				markToolStarted();
+				await toolGate;
+				return { content: [{ type: "text", text: "released" }], details: {} };
+			},
+		};
+		const publishedClientIds: string[] = [];
+		const harness = await createHarness({
+			tools: [waitTool],
+			extensionFactories: [
+				(volt) => {
+					volt.on("message_start", (event) => {
+						if (event.message.role === "user" && event.message.clientMessageId) {
+							publishedClientIds.push(event.message.clientMessageId);
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		const run = harness.session.prompt("start").catch(() => {});
+		await toolStarted;
+		await harness.session.steer("cancel during dequeue", undefined, "clear-dequeue-race");
+
+		const originalFlush = harness.sessionManager.flush.bind(harness.sessionManager);
+		let releaseDispatch!: () => void;
+		let markDispatchEntered!: () => void;
+		const dispatchEntered = new Promise<void>((resolve) => {
+			markDispatchEntered = resolve;
+		});
+		const dispatchGate = new Promise<void>((resolve) => {
+			releaseDispatch = resolve;
+		});
+		let dispatchGated = false;
+		vi.spyOn(harness.sessionManager, "flush").mockImplementation(() => {
+			const watermark = originalFlush();
+			if (!dispatchGated && harness.sessionManager.getClientInput("clear-dequeue-race")?.state === "started") {
+				dispatchGated = true;
+				markDispatchEntered();
+				return watermark.then(() => dispatchGate);
+			}
+			return watermark;
+		});
+
+		releaseTool();
+		await dispatchEntered;
+		try {
+			await harness.session.clearQueue();
+		} finally {
+			releaseDispatch();
+		}
+		await run;
+
+		expect(publishedClientIds).not.toContain("clear-dequeue-race");
+		expect(harness.sessionManager.getClientInput("clear-dequeue-race")?.state).toBe("failed");
+		expect(getUserTexts(harness)).not.toContain("cancel during dequeue");
+	});
+
 	it("starts an accepted-but-not-started receipt after JSONL reload", async () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
 		const manager = SessionManager.create(tempDir, tempDir);
 		manager.reserveClientInput("client-accepted", "prompt", { message: "resume me" });
+		await manager.flush();
 		const sessionFile = manager.getSessionFile();
 		expect(sessionFile).toBeDefined();
 		expect(existsSync(sessionFile!)).toBe(true);
@@ -637,7 +1085,7 @@ describe("durable client input idempotency", () => {
 		expect(reopened.getClientInput("client-accepted")?.state).toBe("completed");
 	});
 
-	it("reloads exact queued inputs in durable admission order and deduplicates the queue record", () => {
+	it("reloads exact queued inputs in durable admission order and deduplicates the queue record", async () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
 		const manager = SessionManager.create(tempDir, tempDir);
@@ -662,6 +1110,7 @@ describe("durable client input idempotency", () => {
 			images: [image],
 		});
 		image.data = "bXV0YXRlZA==";
+		await manager.flush();
 
 		const queuedEntries = readFileSync(manager.getSessionFile()!, "utf8")
 			.trim()
@@ -711,6 +1160,7 @@ describe("durable client input idempotency", () => {
 		manager.reserveClientInput("queued-b", "follow_up", { message: "later b" });
 		manager.markClientInputQueued("queued-b", { delivery: "follow_up", message: "later b" });
 		manager.transitionClientInput("ambiguous-a", "started");
+		await manager.flush();
 
 		const reopened = SessionManager.open(manager.getSessionFile()!, tempDir);
 		expect(reopened.getClientInputRecoveryPlan()).toMatchObject({
@@ -749,6 +1199,7 @@ describe("durable client input idempotency", () => {
 		manager.markClientInputQueued("recover-steer", { delivery: "steer", message: "steer expanded" });
 		manager.reserveClientInput("recover-follow", "follow_up", { message: "follow original" });
 		manager.markClientInputQueued("recover-follow", { delivery: "follow_up", message: "follow expanded" });
+		await manager.flush();
 		const reopened = SessionManager.open(manager.getSessionFile()!, tempDir);
 		const harness = await createHarness({ sessionManager: reopened });
 		harnesses.push(harness);
@@ -788,6 +1239,7 @@ describe("durable client input idempotency", () => {
 		const manager = SessionManager.create(tempDir, tempDir);
 		manager.reserveClientInput("recover-started", "steer", { message: "recover me" });
 		manager.markClientInputQueued("recover-started", { delivery: "steer", message: "recover me" });
+		await manager.flush();
 		const reopened = SessionManager.open(manager.getSessionFile()!, tempDir);
 		const harness = await createHarness({ sessionManager: reopened });
 		harnesses.push(harness);
@@ -816,6 +1268,7 @@ describe("durable client input idempotency", () => {
 		const manager = SessionManager.create(tempDir, tempDir);
 		manager.reserveClientInput("recover-silent-cancel", "steer", { message: "original" });
 		manager.markClientInputQueued("recover-silent-cancel", { delivery: "steer", message: "expanded" });
+		await manager.flush();
 		const reopened = SessionManager.open(manager.getSessionFile()!, tempDir);
 		const harness = await createHarness({ sessionManager: reopened });
 		harnesses.push(harness);
@@ -842,6 +1295,7 @@ describe("durable client input idempotency", () => {
 		const manager = SessionManager.create(tempDir, tempDir);
 		manager.reserveClientInput("recover-committed", "steer", { message: "original" });
 		manager.markClientInputQueued("recover-committed", { delivery: "steer", message: "expanded" });
+		await manager.flush();
 		const reopened = SessionManager.open(manager.getSessionFile()!, tempDir);
 		const harness = await createHarness({ sessionManager: reopened });
 		harnesses.push(harness);
@@ -885,11 +1339,12 @@ describe("durable client input idempotency", () => {
 		expect(reopened.buildSessionContext().messages).toHaveLength(1);
 	});
 
-	it("fails closed before persisting an oversized queued replay payload", () => {
+	it("fails closed before persisting an oversized queued replay payload", async () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
 		const manager = SessionManager.create(tempDir, tempDir);
 		manager.reserveClientInput("queued-oversized", "steer", { message: "small original" });
+		await manager.flush();
 
 		expect(() =>
 			manager.markClientInputQueued("queued-oversized", {
@@ -1020,6 +1475,7 @@ describe("durable client input idempotency", () => {
 		const manager = SessionManager.create(tempDir, tempDir);
 		manager.reserveClientInput("recovered-older", "steer", { message: "older" });
 		manager.markClientInputQueued("recovered-older", { delivery: "steer", message: "older" });
+		await manager.flush();
 		const reopened = SessionManager.open(manager.getSessionFile()!, tempDir);
 		const harness = await createHarness({ sessionManager: reopened });
 		harnesses.push(harness);
@@ -1032,7 +1488,7 @@ describe("durable client input idempotency", () => {
 		// accepted outcome instead of creating or reordering work.
 		await expect(harness.session.steer("older", undefined, "recovered-older")).resolves.toBeUndefined();
 
-		harness.session.clearQueue();
+		await harness.session.clearQueue();
 		harness.setResponses([fauxAssistantMessage("fresh done")]);
 		await expect(harness.session.prompt("fresh", { clientMessageId: "fresh-after-clear" })).resolves.toBeUndefined();
 		expect(reopened.getClientInput("fresh-after-clear")?.state).toBe("completed");
@@ -1041,7 +1497,7 @@ describe("durable client input idempotency", () => {
 	it("admits only canonical bounded ASCII client identities", () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
-		const manager = SessionManager.create(tempDir, tempDir);
+		const manager = SessionManager.inMemory();
 		const maximumId = `client:${"x".repeat(249)}`;
 
 		expect(maximumId).toHaveLength(256);
@@ -1072,7 +1528,7 @@ describe("durable client input idempotency", () => {
 		const timestamp = new Date().toISOString();
 		const invalidId = `client-${"\0".repeat(40)}`;
 		const input = { message: "must not reload", images: [] };
-		const validManager = SessionManager.create(tempDir, tempDir);
+		const validManager = SessionManager.inMemory();
 		const semanticDigest = validManager.reserveClientInput("digest-source", "prompt", input).record.semanticDigest;
 		writeFileSync(
 			sessionFile,
@@ -1099,7 +1555,7 @@ describe("durable client input idempotency", () => {
 		expect(() => SessionManager.open(sessionFile, tempDir)).toThrow("Client input id must match");
 	});
 
-	it("migrates a v4 session by dropping unreplayable legacy WAL and preserving canonical transcript", () => {
+	it("migrates a v4 session by dropping unreplayable legacy WAL and preserving canonical transcript", async () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
 		const sessionFile = join(tempDir, "legacy-v4.jsonl");
@@ -1157,6 +1613,7 @@ describe("durable client input idempotency", () => {
 		// lease owner's file. The first actual writer commits the migration.
 		expect(readFileSync(sessionFile, "utf8")).toBe(onDiskBeforeOpen);
 		reopened.appendCustomMessageEntry("migration-test", "writer acquired", true);
+		await reopened.flush();
 		expect(
 			readFileSync(sessionFile, "utf8")
 				.trim()
@@ -1192,13 +1649,14 @@ describe("durable client input idempotency", () => {
 		expect(() => SessionManager.open(sessionFile, tempDir)).toThrow("receipt payload is invalid");
 	});
 
-	it("fails closed for invalid v5 WAL state, error, and commit ordinal fields", () => {
+	it("fails closed for invalid v5 WAL state, error, and commit ordinal fields", async () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
 		const manager = SessionManager.create(tempDir, tempDir);
 		manager.reserveClientInput("wal-fields", "steer", { message: "original" });
 		manager.markClientInputQueued("wal-fields", { delivery: "steer", message: "queued" });
 		manager.transitionClientInput("wal-fields", "started");
+		await manager.flush();
 		const entries = readFileSync(manager.getSessionFile()!, "utf8")
 			.trim()
 			.split("\n")
@@ -1239,7 +1697,7 @@ describe("durable client input idempotency", () => {
 		}
 	});
 
-	it("fails closed when a committed interior JSONL line could hide a dispatch boundary", () => {
+	it("fails closed when a committed interior JSONL line could hide a dispatch boundary", async () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
 		const manager = SessionManager.create(tempDir, tempDir);
@@ -1247,6 +1705,7 @@ describe("durable client input idempotency", () => {
 		manager.markClientInputQueued("interior-corruption", { delivery: "steer", message: "queued" });
 		manager.transitionClientInput("interior-corruption", "started");
 		manager.appendCustomMessageEntry("later-valid-entry", "later", true);
+		await manager.flush();
 		const lines = readFileSync(manager.getSessionFile()!, "utf8").trim().split("\n");
 		const stateIndex = lines.findIndex(
 			(line) => (JSON.parse(line) as { type: string }).type === "client_input_state",
@@ -1266,6 +1725,7 @@ describe("durable client input idempotency", () => {
 		const manager = SessionManager.create(tempDir, tempDir);
 		manager.reserveClientInput("client-started", "prompt", { message: "do not replay" });
 		manager.transitionClientInput("client-started", "started");
+		await manager.flush();
 		const sessionFile = manager.getSessionFile();
 		expect(sessionFile).toBeDefined();
 
@@ -1281,7 +1741,7 @@ describe("durable client input idempotency", () => {
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 
-	it("infers completion from the canonical user entry when rebuilding the all-entry index", () => {
+	it("infers completion from the canonical user entry when rebuilding the all-entry index", async () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
 		const manager = SessionManager.create(tempDir, tempDir);
@@ -1293,6 +1753,7 @@ describe("durable client input idempotency", () => {
 			clientMessageId: "client-canonical",
 			timestamp: Date.now(),
 		});
+		await manager.flush();
 		const sessionFile = manager.getSessionFile();
 		expect(sessionFile).toBeDefined();
 
@@ -1393,6 +1854,7 @@ describe("durable client input idempotency", () => {
 			clientMessageId: "persisted-complete",
 			timestamp: Date.now(),
 		});
+		await completed.flush();
 		const reopenedCompleted = SessionManager.open(completed.getSessionFile()!, completedDir);
 		const completedHarness = await createHarness({ sessionManager: reopenedCompleted });
 		harnesses.push(completedHarness);
@@ -1405,6 +1867,7 @@ describe("durable client input idempotency", () => {
 		failed.reserveClientInput("persisted-failed", "prompt", { message: "still failed" });
 		failed.transitionClientInput("persisted-failed", "started");
 		failed.transitionClientInput("persisted-failed", "failed", "persisted precommit failure");
+		await failed.flush();
 		const reopenedFailed = SessionManager.open(failed.getSessionFile()!, failedDir);
 		const failedHarness = await createHarness({ sessionManager: reopenedFailed });
 		harnesses.push(failedHarness);
@@ -1416,7 +1879,7 @@ describe("durable client input idempotency", () => {
 		expect(getUserTexts(failedHarness)).toEqual([]);
 	});
 
-	it("keeps host WAL out of every public conversation and bootstrap projection", () => {
+	it("keeps host WAL out of every public conversation and bootstrap projection", async () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
 		const manager = SessionManager.create(tempDir, tempDir);
@@ -1424,6 +1887,7 @@ describe("durable client input idempotency", () => {
 		manager.subscribeEntries((entry) => observedEntryTypes.push(entry.type));
 		const receipt = manager.reserveClientInput("private-wal", "prompt", { message: "visible later" });
 		manager.transitionClientInput("private-wal", "started");
+		await manager.flush();
 		const persistedTypes = readFileSync(manager.getSessionFile()!, "utf8")
 			.trim()
 			.split("\n")
@@ -1473,6 +1937,7 @@ describe("durable client input idempotency", () => {
 			items: [{ entryId: userEntryId, role: "user", clientMessageId: "private-wal" }],
 			head: { entryId: userEntryId },
 		});
+		await manager.flush();
 	});
 
 	it("keeps WAL-only files out of local and remote session enumeration until canonical content commits", async () => {
@@ -1485,6 +1950,7 @@ describe("durable client input idempotency", () => {
 		manager.reserveClientInput("private-list-wal", "prompt", { message: "visible later" });
 		manager.transitionClientInput("private-list-wal", "started");
 		manager.transitionClientInput("private-list-wal", "failed", "preflight rejected");
+		await manager.flush();
 		const sessionFile = manager.getSessionFile();
 		expect(sessionFile).toBeDefined();
 		expect(existsSync(sessionFile!)).toBe(true);
@@ -1511,6 +1977,7 @@ describe("durable client input idempotency", () => {
 			content: [{ type: "text", text: "visible later" }],
 			timestamp: Date.now(),
 		});
+		await reopened.flush();
 
 		expect(await SessionManager.list(workspaceDir, sessionDir)).toMatchObject([
 			{ id: manager.getSessionId(), messageCount: 1, firstMessage: "visible later" },
@@ -1521,7 +1988,7 @@ describe("durable client input idempotency", () => {
 		]);
 	});
 
-	it("does not copy recoverable input WAL into a forked conversation", () => {
+	it("does not copy recoverable input WAL into a forked conversation", async () => {
 		const sourceDir = createTempDir();
 		const targetDir = createTempDir();
 		tempDirs.push(sourceDir, targetDir);
@@ -1531,8 +1998,10 @@ describe("durable client input idempotency", () => {
 			delivery: "follow_up",
 			message: "source only",
 		});
+		await source.flush();
 
 		const fork = SessionManager.forkFrom(source.getSessionFile()!, targetDir, targetDir);
+		await fork.flush();
 		expect(fork.getClientInput("source-queued")).toBeUndefined();
 		expect(fork.getRecoverableQueuedClientInputs()).toEqual([]);
 		expect(
@@ -1543,7 +2012,7 @@ describe("durable client input idempotency", () => {
 		).toEqual(["session"]);
 	});
 
-	it("drops transport identity with WAL when forking or extracting a completed conversation", () => {
+	it("drops transport identity with WAL when forking or extracting a completed conversation", async () => {
 		const sourceDir = createTempDir();
 		const forkDir = createTempDir();
 		tempDirs.push(sourceDir, forkDir);
@@ -1557,8 +2026,10 @@ describe("durable client input idempotency", () => {
 			timestamp: Date.now(),
 		});
 		const assistantId = source.appendMessage(fauxAssistantMessage("source answer"));
+		await source.flush();
 
 		const fork = SessionManager.forkFrom(source.getSessionFile()!, forkDir, forkDir);
+		await fork.flush();
 		expect(fork.buildSessionContext().messages[0]).not.toHaveProperty("clientMessageId");
 		expect(() => SessionManager.open(fork.getSessionFile()!, forkDir)).not.toThrow();
 
@@ -1568,26 +2039,22 @@ describe("durable client input idempotency", () => {
 		expect(() => SessionManager.open(extractedFile!, sourceDir)).not.toThrow();
 	});
 
-	it("fail-stops a dirty manager after an uncertain persistence failure", () => {
+	it("fail-stops a dirty manager after an uncertain persistence failure", async () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
 		const manager = SessionManager.create(tempDir, tempDir);
-		const persistence = manager as unknown as { _persist(entry: SessionEntry): void };
-		const originalPersist = persistence._persist;
-		persistence._persist = () => {
-			throw new Error("injected append failure");
-		};
+		mkdirSync(manager.getSessionFile()!);
 
-		expect(() => manager.reserveClientInput("uncertain", "prompt", { message: "uncertain" })).toThrow(
-			"injected append failure",
-		);
+		expect(manager.reserveClientInput("uncertain", "prompt", { message: "uncertain" }).record.state).toBe("accepted");
+		await expect(manager.flush()).rejects.toThrow();
 		expect(manager.getEntries()).toEqual([]);
-		persistence._persist = originalPersist;
-		expect(() => manager.reserveClientInput("uncertain", "prompt", { message: "uncertain" })).toThrow(
+		expect(() => manager.reserveClientInput("later", "prompt", { message: "later" })).toThrow(
 			"Session persistence is fail-stopped after an uncertain write",
 		);
+		await expect(manager.flush()).rejects.toThrow();
 
-		manager.newSession();
-		expect(manager.reserveClientInput("fresh", "prompt", { message: "fresh" }).record.state).toBe("accepted");
+		const freshManager = SessionManager.create(tempDir, tempDir);
+		expect(freshManager.reserveClientInput("fresh", "prompt", { message: "fresh" }).record.state).toBe("accepted");
+		await freshManager.flush();
 	});
 });

@@ -205,6 +205,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const targetManager = SessionManager.create(runtimeHost.cwd, originalSession.sessionManager.getSessionDir());
 		targetManager.appendMessage({ role: "user", content: "target", timestamp: 1 });
 		targetManager.appendMessage(fauxAssistantMessage("target assistant"));
+		await targetManager.flush();
 		const targetFile = targetManager.getSessionFile();
 		expect(targetFile).toBeDefined();
 
@@ -227,6 +228,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const targetManager = SessionManager.create(runtimeHost.cwd, originalSession.sessionManager.getSessionDir());
 		targetManager.appendMessage({ role: "user", content: "target", timestamp: 1 });
 		targetManager.appendMessage(fauxAssistantMessage("target assistant"));
+		await targetManager.flush();
 		const targetFile = targetManager.getSessionFile();
 		expect(targetFile).toBeDefined();
 
@@ -375,6 +377,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const targetManager = SessionManager.create(runtimeHost.cwd, originalSession.sessionManager.getSessionDir());
 		targetManager.appendMessage({ role: "user", content: "target", timestamp: 1 });
 		targetManager.appendMessage(fauxAssistantMessage("target assistant"));
+		await targetManager.flush();
 		const targetFile = targetManager.getSessionFile();
 		expect(targetFile).toBeDefined();
 
@@ -464,10 +467,11 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 		const compaction = originalSession.compact();
 		await compactionStarted;
-		originalSession.dispose();
+		const disposal = originalSession.dispose();
 		releaseCompaction();
 
 		await expect(compaction).rejects.toThrow("Compaction cancelled");
+		await disposal;
 		expect(subscribe).not.toHaveBeenCalled();
 		expect(originalSession.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
 	});
@@ -483,6 +487,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const originalSession = runtimeHost.session;
 		const currentSessionFile = originalSession.sessionFile;
 		expect(currentSessionFile).toBeDefined();
+		await originalSession.sessionManager.flush();
 		const collisionFile = join(runtimeHost.cwd, "same-id-collision.jsonl");
 		copyFileSync(currentSessionFile!, collisionFile);
 		const prepare = vi.fn(async () => undefined);
@@ -883,6 +888,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			delivery: "steer",
 			message: "older durable input",
 		});
+		await targetManager.flush();
 		const targetFile = targetManager.getSessionFile();
 		expect(targetFile).toBeDefined();
 		faux.setResponses([fauxAssistantMessage("older done"), fauxAssistantMessage("fresh done")]);
@@ -919,6 +925,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			delivery: "steer",
 			message: "older durable input",
 		});
+		await targetManager.flush();
 		await runtimeHost.startRecoveredClientInputs();
 		const withSession = vi.fn(async () => {});
 		const replay = vi
@@ -1371,6 +1378,42 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				},
 			}),
 		).toThrow(/disposed/);
+	});
+
+	it("keeps the source session active when fork destination persistence fails", async () => {
+		const events: RecordedSessionEvent[] = [];
+		const { runtimeHost } = await createRuntimeHost((volt) => {
+			volt.on("session_shutdown", (event) => {
+				events.push(event);
+			});
+		});
+		await runtimeHost.session.prompt("source prompt");
+		const originalSession = runtimeHost.session;
+		const originalSessionId = originalSession.sessionId;
+		const targetEntry = originalSession.sessionManager
+			.getEntries()
+			.find((entry) => entry.type === "message" && entry.message.role === "assistant");
+		if (!targetEntry) {
+			throw new Error("Expected an assistant entry to fork");
+		}
+		const destinationFailure = new Error("ENOSPC: fork destination write failed");
+		const originalFlush = SessionManager.prototype.flush;
+		const flush = vi.spyOn(SessionManager.prototype, "flush").mockImplementation(function (this: SessionManager) {
+			if (this.getSessionId() !== originalSessionId) {
+				return Promise.reject(destinationFailure);
+			}
+			return originalFlush.call(this);
+		});
+
+		try {
+			await expect(runtimeHost.fork(targetEntry.id, { position: "at" })).rejects.toBe(destinationFailure);
+		} finally {
+			flush.mockRestore();
+		}
+
+		expect(runtimeHost.session).toBe(originalSession);
+		expect(events).toEqual([]);
+		await expect(originalSession.prompt("source still works")).resolves.toBeUndefined();
 	});
 
 	it("emits session_before_fork and session_start and honors cancellation", async () => {

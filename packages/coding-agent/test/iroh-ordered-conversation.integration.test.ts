@@ -257,6 +257,7 @@ describe("Iroh ordered conversation integration", () => {
 			const finalMessage = fauxAssistantMessage("Hello", { timestamp: 4 });
 			fixture.emit({ type: "message_end", message: finalMessage });
 			const committedEntryId = fixture.manager.appendMessage(finalMessage);
+			await fixture.manager.flush();
 
 			const sessionFile = fixture.manager.getSessionFile();
 			expect(sessionFile).toBeDefined();
@@ -399,6 +400,7 @@ describe("Iroh ordered conversation integration", () => {
 			});
 			const sessionFile = fixture.manager.getSessionFile();
 			expect(sessionFile).toBeDefined();
+			await fixture.manager.flush();
 			const persisted = readFileSync(sessionFile!, "utf8");
 			expect(persisted).toContain(`"id":"${committedEntryId}"`);
 			expect(persisted).toContain('"text":"1\\n2\\n3"');

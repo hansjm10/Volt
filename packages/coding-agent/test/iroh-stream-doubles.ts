@@ -149,6 +149,7 @@ export function createTestSession(sessionId: string, leafId: string | null) {
 		sessionFile: `/sessions/${sessionId}.jsonl`,
 		sessionId,
 		sessionManager: {
+			flush: vi.fn(async () => {}),
 			getBranch: vi.fn((): object[] => []),
 			getClientInput: vi.fn(() => undefined),
 			getBranchWindow: ({
@@ -177,7 +178,7 @@ export function createTestSession(sessionId: string, leafId: string | null) {
 			getLeafId: (): string | null => session.leafId,
 			getSessionId: (): string => sessionId,
 		},
-		settingsManager: {},
+		settingsManager: { flush: vi.fn(async () => {}) },
 		steeringMode: "all" as const,
 		subscribe: vi.fn((_handler: (event: AgentSessionEvent) => void) => () => {}),
 		thinkingLevel: "off" as const,

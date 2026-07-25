@@ -781,6 +781,7 @@ describe("new session into a worktree (§5.2.1 cwd/sessionDir overrides)", () =>
 			stopReason: "stop",
 			timestamp: Date.now(),
 		});
+		await fixture.runtime.session.sessionManager.flush();
 		const listed = await SessionManager.list(parentCwd, fixture.parentSessionDir);
 		expect(listed.some((info) => info.id === fixture.runtime.session.sessionManager.getSessionId())).toBe(true);
 	});

@@ -676,6 +676,7 @@ describe("AgentSessionRuntime characterization", () => {
 			await otherRuntime.dispose();
 		});
 		await otherRuntime.session.prompt("other");
+		await otherRuntime.session.sessionManager.flush();
 		const otherSessionFile = otherRuntime.session.sessionFile!;
 
 		await runtime.switchSession(otherSessionFile);
@@ -751,6 +752,7 @@ describe("AgentSessionRuntime characterization", () => {
 		await otherRuntime.session.setModel(faux.getModel("faux-2")!);
 		otherRuntime.session.setThinkingLevel("off");
 		await otherRuntime.session.prompt("hello");
+		await otherRuntime.session.sessionManager.flush();
 		const targetSessionFile = otherRuntime.session.sessionFile!;
 
 		await runtime.switchSession(targetSessionFile);

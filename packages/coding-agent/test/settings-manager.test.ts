@@ -3,7 +3,7 @@ import { homedir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS } from "../src/core/http-dispatcher.ts";
-import { SettingsManager } from "../src/core/settings-manager.ts";
+import { SettingsManager, type SettingsStorage } from "../src/core/settings-manager.ts";
 
 describe("SettingsManager", () => {
 	const testDir = join(process.cwd(), "test-settings-tmp");
@@ -674,6 +674,32 @@ describe("SettingsManager", () => {
 	});
 
 	describe("error tracking", () => {
+		it("should reject a failed write watermark while allowing a later settings write", async () => {
+			let globalSettings: string | undefined;
+			let failNextWrite = true;
+			const storage: SettingsStorage = {
+				withLock(scope, update) {
+					const current = scope === "global" ? globalSettings : undefined;
+					const next = update(current);
+					if (next === undefined) return;
+					if (failNextWrite) {
+						failNextWrite = false;
+						throw new Error("injected settings write failure");
+					}
+					if (scope === "global") globalSettings = next;
+				},
+			};
+			const manager = SettingsManager.fromStorage(storage);
+
+			manager.setTheme("first");
+			await expect(manager.flush()).rejects.toThrow("injected settings write failure");
+			expect(manager.drainErrors().map(({ error }) => error.message)).toEqual(["injected settings write failure"]);
+
+			manager.setTheme("second");
+			await expect(manager.flush()).resolves.toBeUndefined();
+			expect(JSON.parse(globalSettings ?? "{}")).toMatchObject({ theme: "second" });
+		});
+
 		it("should collect and clear load errors via drainErrors", () => {
 			const globalSettingsPath = join(agentDir, "settings.json");
 			const projectSettingsPath = join(projectDir, ".volt", "settings.json");

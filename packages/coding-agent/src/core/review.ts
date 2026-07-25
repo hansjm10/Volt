@@ -1866,7 +1866,7 @@ async function runReviewSession(options: RunReviewOptions): Promise<ReviewRunRes
 	// An abort during session creation fires before the listener below is
 	// attached, and AbortSignal does not invoke listeners added after the fact.
 	if (options.signal?.aborted) {
-		session.dispose();
+		await session.dispose();
 		return { aborted: true, raw: "" };
 	}
 
@@ -1920,6 +1920,6 @@ async function runReviewSession(options: RunReviewOptions): Promise<ReviewRunRes
 	} finally {
 		unsubscribe();
 		options.signal?.removeEventListener("abort", onAbort);
-		session.dispose();
+		await session.dispose();
 	}
 }
