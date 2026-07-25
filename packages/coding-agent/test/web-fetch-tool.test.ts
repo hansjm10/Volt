@@ -269,6 +269,16 @@ describe("web_fetch network operations", () => {
 		expect(response.content).not.toContain("<");
 	});
 
+	it("bounds HTML extraction to the requested output size", async () => {
+		const fetcher: WebFetchFetcher = async () => htmlResponse(`<main>${"é".repeat(10_000)}</main>`);
+		const operations = createDefaultWebFetchOperations({ env: {}, fetcher, resolveHost: publicHost });
+
+		const response = await operations.fetch({ url: "https://example.com/large-html", maxBytes: 1_001 });
+
+		expect(Buffer.byteLength(response.content, "utf8")).toBeLessThanOrEqual(1_001);
+		expect(response.content).not.toContain("\uFFFD");
+	});
+
 	it("binds each request to the addresses that passed validation", async () => {
 		let pinnedAddresses: unknown;
 		const fetcher: WebFetchFetcher = async (...args: unknown[]) => {
@@ -748,6 +758,31 @@ describe("htmlToText", () => {
 		const html = `<body>${"<span></span>".repeat(82_000)}<p>useful text</p></body>`;
 		expect(new TextEncoder().encode(html).byteLength).toBeGreaterThan(1024 * 1024);
 		expect(htmlToText(html)).toBe("useful text");
+	});
+
+	it("bounds retained lines while preserving content after empty block boundaries", () => {
+		const html = `<p>start</p>${"<div></div>".repeat(100_000)}<p>end</p>`;
+
+		expect(extractHtml(html, { maxBytes: 100, maxLines: 3 }).text).toBe("start\n\nend");
+	});
+
+	it("bounds newline-heavy preformatted content without splitting every line", () => {
+		const html = `<pre>${"\n".repeat(100_000)}unreachable</pre>`;
+
+		expect(extractHtml(html, { maxBytes: 100, maxLines: 4 }).text).toBe("\n\n\n");
+	});
+
+	it("stops parsing before pathological nesting grows the parser stack", () => {
+		const html = `${"<span>".repeat(5_000)}unreachable${"</span>".repeat(5_000)}`;
+
+		expect(extractHtml(html).text).toBe("");
+	});
+
+	it("bounds extracted UTF-8 bytes without returning a partial character", () => {
+		const extracted = extractHtml(`<p>${"😀".repeat(100)}</p>`, { maxBytes: 17 });
+
+		expect(extracted.text).toBe("😀😀😀😀");
+		expect(Buffer.byteLength(extracted.text, "utf8")).toBe(16);
 	});
 
 	it("keeps whitespace inside pre and code blocks", () => {

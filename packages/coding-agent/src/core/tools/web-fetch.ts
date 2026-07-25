@@ -12,7 +12,7 @@ import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/type
 import type { Theme } from "../theme/runtime.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+import { DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
 
 const DEFAULT_MAX_BYTES = 20_000;
 const MIN_MAX_BYTES = 1_000;
@@ -21,6 +21,8 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_REDIRECTS = 5;
 /** Hard ceiling on the response body we will read, before truncation. */
 const MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024;
+/** Prevent pathological markup from growing htmlparser2's open-element stack. */
+const MAX_HTML_NESTING_DEPTH = 4_096;
 
 const webFetchSchema = Type.Object({
 	url: Type.String({
@@ -522,6 +524,13 @@ interface ExtractedLine {
 	preformatted: boolean;
 }
 
+function normalizeExtractionLimit(value: number | undefined, maximum: number): number {
+	if (value === undefined || !Number.isFinite(value)) {
+		return maximum;
+	}
+	return Math.min(maximum, Math.max(0, Math.floor(value)));
+}
+
 /**
  * Convert HTML to readable text.
  *
@@ -529,37 +538,112 @@ interface ExtractedLine {
  * attributes containing `>` and leak the body of an unclosed `<script>`.
  * Entity decoding and malformed-tag recovery remain parser-managed without
  * allocating a browser document. Text inside `<pre>` keeps its whitespace so
- * code samples survive.
+ * code samples survive. Extraction is bounded while parsing so boundary-heavy
+ * markup and newline-heavy preformatted content cannot amplify into millions of
+ * retained line objects.
  */
-export function extractHtml(html: string): ExtractedHtml {
+export function extractHtml(html: string, limits: { maxBytes?: number; maxLines?: number } = {}): ExtractedHtml {
+	const maxBytes = normalizeExtractionLimit(limits.maxBytes, MAX_MAX_BYTES);
+	const maxLines = normalizeExtractionLimit(limits.maxLines, DEFAULT_MAX_LINES);
 	const lines: ExtractedLine[] = [];
 	const titleParts: string[] = [];
 	let current = "";
+	let currentBytes = 0;
+	let outputBytes = 0;
 	let preDepth = 0;
 	let suppressedDepth = 0;
 	let titleDepth = 0;
+	let elementDepth = 0;
+	let textLimitReached = maxBytes === 0 || maxLines === 0;
+	let parser: Parser | undefined;
+
+	const reachTextLimit = (): void => {
+		textLimitReached = true;
+		parser?.pause();
+	};
 
 	const flush = (): void => {
 		// Leading whitespace is meaningful inside <pre> and noise everywhere else.
-		lines.push({
-			text: preDepth > 0 ? current.replace(/\s+$/, "") : current.trim(),
-			preformatted: preDepth > 0,
-		});
+		const preformatted = preDepth > 0;
+		const text = preformatted ? current.replace(/\s+$/, "") : current.trim();
 		current = "";
-	};
+		currentBytes = 0;
 
-	const appendPre = (value: string): void => {
-		const parts = value.split("\n");
-		current += parts[0];
-		for (let index = 1; index < parts.length; index++) {
-			flush();
-			current = parts[index];
+		if (!preformatted && text.length === 0) {
+			const lastLine = lines[lines.length - 1];
+			if (!lastLine || lastLine.text.length === 0) {
+				return;
+			}
+		}
+		if (lines.length >= maxLines) {
+			reachTextLimit();
+			return;
+		}
+
+		const separatorBytes = lines.length > 0 ? 1 : 0;
+		const textBytes = Buffer.byteLength(text, "utf8");
+		if (outputBytes + separatorBytes + textBytes > maxBytes) {
+			reachTextLimit();
+			return;
+		}
+		lines.push({ text, preformatted });
+		outputBytes += separatorBytes + textBytes;
+		if (lines.length >= maxLines || outputBytes >= maxBytes) {
+			reachTextLimit();
 		}
 	};
 
-	const parser = new Parser(
+	const append = (value: string): void => {
+		if (value.length === 0 || textLimitReached) {
+			return;
+		}
+
+		const separatorBytes = lines.length > 0 && current.length === 0 ? 1 : 0;
+		const remainingBytes = maxBytes - outputBytes - separatorBytes - currentBytes;
+		if (remainingBytes <= 0) {
+			reachTextLimit();
+			return;
+		}
+
+		const valueBytes = Buffer.byteLength(value, "utf8");
+		if (valueBytes <= remainingBytes) {
+			current += value;
+			currentBytes += valueBytes;
+			return;
+		}
+
+		const buffer = Buffer.from(value, "utf8");
+		let end = remainingBytes;
+		while (end > 0 && (buffer[end] & 0xc0) === 0x80) {
+			end--;
+		}
+		current += buffer.subarray(0, end).toString("utf8");
+		currentBytes += end;
+		reachTextLimit();
+	};
+
+	const appendPre = (value: string): void => {
+		let start = 0;
+		while (!textLimitReached) {
+			const newline = value.indexOf("\n", start);
+			if (newline === -1) {
+				append(value.slice(start));
+				return;
+			}
+			append(value.slice(start, newline));
+			flush();
+			start = newline + 1;
+		}
+	};
+
+	parser = new Parser(
 		{
-			onopentag(tag) {
+			onopentagname(tag) {
+				elementDepth++;
+				if (elementDepth > MAX_HTML_NESTING_DEPTH) {
+					parser?.pause();
+					return;
+				}
 				if (tag === "title") {
 					titleDepth++;
 				}
@@ -573,13 +657,13 @@ export function extractHtml(html: string): ExtractedHtml {
 				}
 				if (CELL_TAGS.has(tag)) {
 					if (current.length > 0 && !current.endsWith("\t")) {
-						current += "\t";
+						append("\t");
 					}
 					return;
 				}
 				const block = BLOCK_TAGS.has(tag);
 				if (block) flush();
-				if (tag === "li") current += "- ";
+				if (tag === "li") append("- ");
 				if (tag === "pre") preDepth++;
 			},
 			ontext(value) {
@@ -589,12 +673,15 @@ export function extractHtml(html: string): ExtractedHtml {
 				if (suppressedDepth > 0) {
 					return;
 				}
+				if (textLimitReached) {
+					return;
+				}
 				if (preDepth > 0) {
 					appendPre(value);
 					return;
 				}
 				const normalized = value.replace(/\s+/g, " ");
-				current += current.endsWith(" ") && normalized.startsWith(" ") ? normalized.slice(1) : normalized;
+				append(current.endsWith(" ") && normalized.startsWith(" ") ? normalized.slice(1) : normalized);
 			},
 			onclosetag(tag) {
 				if (tag === "title" && titleDepth > 0) {
@@ -602,6 +689,7 @@ export function extractHtml(html: string): ExtractedHtml {
 				}
 				if (suppressedDepth > 0) {
 					suppressedDepth--;
+					elementDepth--;
 					return;
 				}
 				const block = BLOCK_TAGS.has(tag);
@@ -610,6 +698,7 @@ export function extractHtml(html: string): ExtractedHtml {
 				// between every bullet and every row.
 				if (block && tag !== "li" && tag !== "tr") flush();
 				if (tag === "pre" && preDepth > 0) preDepth--;
+				elementDepth--;
 			},
 		},
 		{ decodeEntities: true },
@@ -617,24 +706,12 @@ export function extractHtml(html: string): ExtractedHtml {
 	parser.end(html);
 	flush();
 
-	const output: ExtractedLine[] = [];
-	for (const line of lines) {
-		if (line.preformatted) {
-			output.push(line);
-			continue;
-		}
-		if (line.text.length === 0) {
-			if (output.length > 0 && output[output.length - 1]?.text !== "") output.push(line);
-			continue;
-		}
-		output.push(line);
-	}
-	while (output.length > 0 && !output[output.length - 1]?.preformatted && output[output.length - 1]?.text === "") {
-		output.pop();
+	while (lines.length > 0 && !lines[lines.length - 1]?.preformatted && lines[lines.length - 1]?.text === "") {
+		lines.pop();
 	}
 
 	const title = titleParts.join("").trim();
-	return { text: output.map((line) => line.text).join("\n"), ...(title ? { title } : {}) };
+	return { text: lines.map((line) => line.text).join("\n"), ...(title ? { title } : {}) };
 }
 
 /** Readable text of an HTML document. */
@@ -841,7 +918,9 @@ export function createDefaultWebFetchOperations(options: DefaultWebFetchOperatio
 				const boundedBody = await readBoundedResponseBody(response);
 				const body = boundedBody.content;
 				const isHtml = /html/i.test(contentType) || /^\s*<(!doctype html|html)\b/i.test(body);
-				const extracted = isHtml ? extractHtml(body) : undefined;
+				const extracted = isHtml
+					? extractHtml(body, { maxBytes: request.maxBytes, maxLines: DEFAULT_MAX_LINES })
+					: undefined;
 
 				return {
 					url: current.url.toString(),
