@@ -3013,12 +3013,9 @@ export class AgentSession {
 		delivery: "steer" | "follow_up",
 		text: string,
 		images: ImageContent[] | undefined,
-		clientMessageId: string | undefined,
+		clientMessageId: string,
 		operation: LiveClientInputOperation | undefined,
 	): Promise<void> {
-		if (clientMessageId === undefined) {
-			return;
-		}
 		if (operation === undefined || this._liveClientInputs.get(clientMessageId) !== operation) {
 			throw new Error("Client input lost queue admission ownership before persistence");
 		}
@@ -3055,7 +3052,9 @@ export class AgentSession {
 		if (this.pendingMessageCount >= AGENT_SESSION_MAX_QUEUED_MESSAGES) {
 			throw new Error(`Agent queue is limited to ${AGENT_SESSION_MAX_QUEUED_MESSAGES} messages`);
 		}
-		await this._persistQueuedClientInputAdmission("steer", text, images, clientMessageId, operation);
+		if (clientMessageId !== undefined) {
+			await this._persistQueuedClientInputAdmission("steer", text, images, clientMessageId, operation);
+		}
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -3087,7 +3086,9 @@ export class AgentSession {
 		if (this.pendingMessageCount >= AGENT_SESSION_MAX_QUEUED_MESSAGES) {
 			throw new Error(`Agent queue is limited to ${AGENT_SESSION_MAX_QUEUED_MESSAGES} messages`);
 		}
-		await this._persistQueuedClientInputAdmission("follow_up", text, images, clientMessageId, operation);
+		if (clientMessageId !== undefined) {
+			await this._persistQueuedClientInputAdmission("follow_up", text, images, clientMessageId, operation);
+		}
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);

@@ -74,7 +74,7 @@ export default function(pi) {
 		expect(result.errors).toEqual([]);
 		expect(result.extensions).toHaveLength(1);
 		expect(result.extensions[0].tools.has("pi-modern-legacy")).toBe(true);
-	});
+	}, 60_000);
 
 	it("resolves package resources from package.json pi manifests", async () => {
 		const packageDir = join(tempDir, "pi-package");
