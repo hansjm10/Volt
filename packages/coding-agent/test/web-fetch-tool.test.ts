@@ -99,6 +99,24 @@ describe("web_fetch tool", () => {
 		expect(getTextOutput(result)).toContain("limit reached");
 	});
 
+	it("reports when the raw download was truncated before extraction", async () => {
+		const operations: WebFetchOperations = {
+			fetch: async () => ({
+				url: "https://example.com/oversized",
+				content: "",
+				downloadTruncation: { maxBytes: 5 * 1024 * 1024 },
+			}),
+		};
+		const tool = createWebFetchTool(process.cwd(), { operations, urlPolicy: UNRESTRICTED });
+
+		const result = await tool.execute("web-fetch-download-truncation", {
+			url: "https://example.com/oversized",
+		});
+
+		expect(result.details?.downloadTruncation).toEqual({ maxBytes: 5 * 1024 * 1024 });
+		expect(getTextOutput(result)).toContain("[Download truncated at 5.0MB]");
+	});
+
 	it("records the final URL when redirected", async () => {
 		const operations: WebFetchOperations = {
 			fetch: async () => ({ url: "https://example.com/final", content: "done" }),
@@ -199,6 +217,12 @@ describe("web_fetch conversation allowlist", () => {
 			"https://a.example.com/x",
 			"https://b.example.com/y",
 		]);
+		expect(extractUrls("Read https://en.wikipedia.org/wiki/Function_(mathematics).")).toEqual([
+			"https://en.wikipedia.org/wiki/Function_(mathematics)",
+		]);
+		expect(extractUrls("Wrapped (https://example.com/path_(nested))).")).toEqual([
+			"https://example.com/path_(nested)",
+		]);
 		expect(extractUrls("URL: https://c.example.com/z\nnext line")).toEqual(["https://c.example.com/z"]);
 		expect(extractUrls("no links here")).toEqual([]);
 	});
@@ -256,6 +280,23 @@ describe("web_fetch network operations", () => {
 		await operations.fetch({ url: "https://example.com/doc", maxBytes: 20_000 });
 
 		expect(pinnedAddresses).toEqual(["93.184.216.34"]);
+	});
+
+	it("normalizes a public IPv6 literal without passing brackets to DNS or the socket", async () => {
+		let pinnedAddresses: readonly string[] | undefined;
+		const fetcher: WebFetchFetcher = async (_input, _init, validatedAddresses) => {
+			pinnedAddresses = validatedAddresses;
+			return new Response("ok", { status: 200, headers: { "content-type": "text/plain" } });
+		};
+		const operations = createDefaultWebFetchOperations({ env: {}, fetcher });
+
+		const response = await operations.fetch({
+			url: "https://[2606:4700:4700::1111]/",
+			maxBytes: 20_000,
+		});
+
+		expect(response.content).toBe("ok");
+		expect(pinnedAddresses).toEqual(["2606:4700:4700::1111"]);
 	});
 
 	it("refuses non-http schemes and internal hostnames", async () => {
@@ -409,8 +450,34 @@ describe("web_fetch network operations", () => {
 		const response = await operations.fetch({ url: "https://example.com/unbounded", maxBytes: 20_000 });
 
 		expect(new TextEncoder().encode(response.content)).toHaveLength(5 * 1024 * 1024);
+		expect(response.downloadTruncation).toEqual({ maxBytes: 5 * 1024 * 1024 });
 		expect(pulls).toBeLessThan(20);
 		expect(cancelled).toBe(true);
+	});
+
+	it("reports raw truncation when HTML extraction removes the partial body", async () => {
+		const fetcher: WebFetchFetcher = async () =>
+			htmlResponse(`<script>${"x".repeat(6 * 1024 * 1024)}</script><main>useful text</main>`);
+		const operations = createDefaultWebFetchOperations({ env: {}, fetcher, resolveHost: publicHost });
+
+		const response = await operations.fetch({ url: "https://example.com/script-heavy", maxBytes: 20_000 });
+
+		expect(response.content).toBe("");
+		expect(response.downloadTruncation).toEqual({ maxBytes: 5 * 1024 * 1024 });
+	});
+
+	it("does not mark an exactly 5 MiB response as truncated", async () => {
+		const fetcher: WebFetchFetcher = async () =>
+			new Response(new Uint8Array(5 * 1024 * 1024).fill(0x61), {
+				status: 200,
+				headers: { "content-type": "text/plain" },
+			});
+		const operations = createDefaultWebFetchOperations({ env: {}, fetcher, resolveHost: publicHost });
+
+		const response = await operations.fetch({ url: "https://example.com/exact", maxBytes: 20_000 });
+
+		expect(new TextEncoder().encode(response.content)).toHaveLength(5 * 1024 * 1024);
+		expect(response.downloadTruncation).toBeUndefined();
 	});
 });
 
@@ -454,50 +521,52 @@ describe("web_fetch session integration", () => {
 	it("permits user and web_search result URLs without trusting model-controlled tool output", async () => {
 		const { session } = await createSession();
 		const model = session.model!;
-		session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: `Please read ${USER_URL}` }], timestamp: Date.now() },
-			{
-				role: "assistant",
-				content: [{ type: "text", text: `I should also read ${ASSISTANT_URL}` }],
-				api: model.api,
-				provider: model.provider,
-				model: model.id,
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "stop",
-				timestamp: Date.now(),
+		session.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: `Please read ${USER_URL}` }],
+			timestamp: Date.now(),
+		});
+		session.sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: `I should also read ${ASSISTANT_URL}` }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
-			{
-				role: "toolResult",
-				toolCallId: "call-1",
-				toolName: "web_search",
-				content: [{ type: "text", text: `[1] A page\nURL: ${SEARCH_URL}\nSnippet: ${SEARCH_SNIPPET_URL}` }],
-				isError: false,
-				timestamp: Date.now(),
-			},
-			{
-				role: "toolResult",
-				toolCallId: "call-2",
-				toolName: "bash",
-				content: [{ type: "text", text: `URL: ${BASH_URL}` }],
-				isError: false,
-				timestamp: Date.now(),
-			},
-			{
-				role: "toolResult",
-				toolCallId: "call-3",
-				toolName: "web_search",
-				content: [{ type: "text", text: `URL: ${FAILED_SEARCH_URL}` }],
-				isError: true,
-				timestamp: Date.now(),
-			},
-		];
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		session.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "web_search",
+			content: [{ type: "text", text: `[1] A page\nURL: ${SEARCH_URL}\nSnippet: ${SEARCH_SNIPPET_URL}` }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		session.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-2",
+			toolName: "bash",
+			content: [{ type: "text", text: `URL: ${BASH_URL}` }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		session.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-3",
+			toolName: "web_search",
+			content: [{ type: "text", text: `URL: ${FAILED_SEARCH_URL}` }],
+			isError: true,
+			timestamp: Date.now(),
+		});
 
 		const tool = session.agent.state.tools.find((candidate) => candidate.name === "web_fetch");
 		expect(tool).toBeDefined();
@@ -519,6 +588,55 @@ describe("web_fetch session integration", () => {
 			expect(error?.message).not.toContain(blocked);
 		}
 
+		session.dispose();
+	});
+
+	it("preserves trusted URL provenance after compaction removes the source message from model context", async () => {
+		const { session } = await createSession();
+		const model = session.model!;
+		session.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: `Please read ${USER_URL}` }],
+			timestamp: Date.now(),
+		});
+		const firstKeptEntryId = session.sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "I will keep working." }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		session.sessionManager.appendCompaction("The earlier user message was summarized.", firstKeptEntryId, 1_000);
+		session.agent.state.messages = session.sessionManager.buildSessionContext().messages;
+		expect(
+			session.agent.state.messages.some(
+				(message) =>
+					message.role === "user" &&
+					(typeof message.content === "string"
+						? message.content.includes(USER_URL)
+						: message.content.some((part) => part.type === "text" && part.text.includes(USER_URL))),
+			),
+		).toBe(false);
+
+		const tool = session.agent.state.tools.find((candidate) => candidate.name === "web_fetch");
+		const blocked = "web_fetch can only read URLs that already appeared in this conversation";
+		const error = await tool!.execute("session-compacted", { url: USER_URL }).then(
+			() => undefined,
+			(thrown: unknown) => thrown as Error,
+		);
+
+		expect(error).toBeInstanceOf(Error);
+		expect(error?.message).not.toContain(blocked);
 		session.dispose();
 	});
 });
@@ -636,12 +754,21 @@ describe("private address detection", () => {
 			"169.254.169.254",
 			"100.64.0.1",
 			"0.0.0.0",
+			"192.0.2.1",
+			"198.51.100.1",
+			"203.0.113.1",
 			"::1",
+			"::1%lo",
 			// Same address, written out in full rather than compressed.
 			"0:0:0:0:0:0:0:1",
 			"fe80::1",
 			"fd00::1",
 			"ff02::1",
+			"64:ff9b:1::1",
+			"100::1",
+			"2001:db8::1",
+			"3fff::1",
+			"5f00::1",
 			// IPv4-mapped loopback, in both the dotted and hexadecimal serializations.
 			"::ffff:127.0.0.1",
 			"::ffff:7f00:1",
@@ -655,7 +782,14 @@ describe("private address detection", () => {
 	});
 
 	it("allows genuinely public addresses", async () => {
-		for (const address of ["93.184.216.34", "8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946"]) {
+		for (const address of [
+			"93.184.216.34",
+			"8.8.8.8",
+			"192.0.0.9",
+			"2606:2800:220:1:248:1893:25c8:1946",
+			"2001:3::1",
+			"64:ff9b::808:808",
+		]) {
 			expect(await fetchWith(address), address).not.toContain("non-public address");
 		}
 	});

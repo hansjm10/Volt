@@ -115,6 +115,7 @@ export {
 	extractWebSearchResultUrls,
 	htmlToText,
 	normalizeFetchUrl,
+	type WebFetchDownloadTruncation,
 	type WebFetchFetcher,
 	type WebFetchHostResolver,
 	type WebFetchOperations,

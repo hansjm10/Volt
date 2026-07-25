@@ -27,7 +27,7 @@ const WORDLIM_MARKER = /\[wordlim:\s*\d+\]/;
 const WORDLIM_MARKERS = /\[wordlim:\s*\d+\]/g;
 
 /** A result header is a whole line ending in a parenthesized URL. Titles may be empty. */
-const RESULT_HEADER = /^(.{0,200}?) ?\((https?:\/\/[^\s)]+)\)$/;
+const RESULT_HEADER = /^(.{0,200}?) ?\((https?:\/\/\S+)\)$/;
 const PUBLISHED_PREFIX = /^Published:\s*([^;]+);\s*/;
 const CRAWLED_PREFIX = /^Crawled:\s*[^;]+;\s*/;
 const SEPARATOR_LINE = /^-{8,}$/;

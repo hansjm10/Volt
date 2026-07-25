@@ -47,6 +47,11 @@ export interface WebFetchResponse {
 	title?: string;
 	contentType?: string;
 	content: string;
+	downloadTruncation?: WebFetchDownloadTruncation;
+}
+
+export interface WebFetchDownloadTruncation {
+	maxBytes: number;
 }
 
 export interface WebFetchToolDetails {
@@ -55,6 +60,7 @@ export interface WebFetchToolDetails {
 	title?: string;
 	contentType?: string;
 	truncation?: TruncationResult;
+	downloadTruncation?: WebFetchDownloadTruncation;
 }
 
 export interface WebFetchOperations {
@@ -178,36 +184,60 @@ function parseIpv6(value: string): number[] | undefined {
 	return [...head, ...new Array(gap).fill(0), ...tail];
 }
 
-/** True when these four bytes are not routable on the public internet. */
-function isPrivateIpv4(bytes: number[]): boolean {
-	const [a, b] = bytes;
+/** True when these four bytes are not globally reachable. */
+function isNonPublicIpv4(bytes: number[]): boolean {
+	const [a, b, c, d] = bytes;
 	if (a === 0 || a === 10 || a === 127) return true;
 	if (a === 169 && b === 254) return true;
 	if (a === 172 && b >= 16 && b <= 31) return true;
 	if (a === 192 && b === 168) return true;
 	if (a === 100 && b >= 64 && b <= 127) return true;
-	if (a === 192 && b === 0) return true;
+	if (a === 192 && b === 0 && c === 0 && d !== 9 && d !== 10) return true;
+	if (a === 192 && b === 0 && c === 2) return true;
+	if (a === 192 && b === 88 && c === 99) return true;
 	if (a === 198 && (b === 18 || b === 19)) return true;
+	if (a === 198 && b === 51 && c === 100) return true;
+	if (a === 203 && b === 0 && c === 113) return true;
 	if (a >= 224) return true;
 	return false;
+}
+
+function matchesPrefix(bytes: readonly number[], prefix: readonly number[], prefixLength: number): boolean {
+	const fullBytes = Math.floor(prefixLength / 8);
+	for (let index = 0; index < fullBytes; index++) {
+		if (bytes[index] !== prefix[index]) {
+			return false;
+		}
+	}
+	const remainingBits = prefixLength % 8;
+	if (remainingBits === 0) {
+		return true;
+	}
+	const mask = (0xff << (8 - remainingBits)) & 0xff;
+	return (bytes[fullBytes] & mask) === (prefix[fullBytes] & mask);
+}
+
+function unbracketAddress(value: string): string {
+	const trimmed = value.trim().toLowerCase();
+	return trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
 }
 
 /**
  * Reject addresses that are not routable on the public internet.
  *
- * Covers loopback, RFC1918, carrier-grade NAT, link-local (including the cloud
- * instance-metadata address), benchmarking, multicast, and reserved space, plus
- * the IPv6 equivalents and every embedding of an IPv4 address inside IPv6.
+ * The ranges mirror the IANA IPv4 and IPv6 special-purpose registries. Scoped
+ * IPv6 forms are rejected before parsing so a resolver cannot pass `::1%lo`
+ * through as a syntactically valid but unclassified address.
  */
-function isPrivateAddress(address: string): boolean {
-	const value = address
-		.trim()
-		.toLowerCase()
-		.replace(/^\[|\]$/g, "");
+function isNonPublicAddress(address: string): boolean {
+	const value = unbracketAddress(address);
+	if (value.includes("%")) {
+		return true;
+	}
 
 	const ipv4 = parseIpv4(value);
 	if (ipv4) {
-		return isPrivateIpv4(ipv4);
+		return isNonPublicIpv4(ipv4);
 	}
 
 	const ipv6 = parseIpv6(value);
@@ -216,41 +246,78 @@ function isPrivateAddress(address: string): boolean {
 		return false;
 	}
 
-	if (ipv6.every((byte) => byte === 0)) return true;
-	if (ipv6.slice(0, 15).every((byte) => byte === 0) && ipv6[15] === 1) return true;
-	// Unique-local fc00::/7 and link-local fe80::/10.
-	if ((ipv6[0] & 0xfe) === 0xfc) return true;
-	if (ipv6[0] === 0xfe && (ipv6[1] & 0xc0) === 0x80) return true;
-	// Multicast ff00::/8.
-	if (ipv6[0] === 0xff) return true;
-
-	// IPv4-mapped ::ffff:0:0/96, IPv4-compatible ::/96, and NAT64 64:ff9b::/96 all
-	// carry an IPv4 destination in the last four bytes.
-	const embedded = ipv6.slice(12);
-	const prefix = ipv6.slice(0, 12);
-	const isMapped = prefix.slice(0, 10).every((byte) => byte === 0) && prefix[10] === 0xff && prefix[11] === 0xff;
-	const isCompatible = prefix.every((byte) => byte === 0);
-	const isNat64 =
-		ipv6[0] === 0x00 &&
-		ipv6[1] === 0x64 &&
-		ipv6[2] === 0xff &&
-		ipv6[3] === 0x9b &&
-		prefix.slice(4).every((b) => b === 0);
-	if (isMapped || isCompatible || isNat64) {
-		return isPrivateIpv4(embedded);
+	const ipv4MappedPrefix = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
+	if (matchesPrefix(ipv6, ipv4MappedPrefix, 96)) {
+		return true;
 	}
+
+	// The well-known NAT64 prefix is globally reachable, but it must not be used
+	// to translate a non-public IPv4 destination.
+	const nat64Prefix = [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
+	if (matchesPrefix(ipv6, nat64Prefix, 96)) {
+		return isNonPublicIpv4(ipv6.slice(12));
+	}
+
+	// Ordinary globally routable IPv6 unicast space is 2000::/3.
+	if (!matchesPrefix(ipv6, [0x20], 3)) {
+		return true;
+	}
+
+	// IANA marks a handful of assignments inside 2001::/23 as globally
+	// reachable. Check those longest-prefix exceptions before rejecting the
+	// surrounding protocol-assignment block.
+	const globallyReachableProtocolAssignments = [
+		{ prefix: [0x20, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], length: 128 },
+		{ prefix: [0x20, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2], length: 128 },
+		{ prefix: [0x20, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3], length: 128 },
+		{ prefix: [0x20, 0x01, 0x00, 0x03], length: 32 },
+		{ prefix: [0x20, 0x01, 0x00, 0x04, 0x01, 0x12], length: 48 },
+		{ prefix: [0x20, 0x01, 0x00, 0x20], length: 28 },
+		{ prefix: [0x20, 0x01, 0x00, 0x30], length: 28 },
+	];
+	if (globallyReachableProtocolAssignments.some(({ prefix, length }) => matchesPrefix(ipv6, prefix, length))) {
+		return false;
+	}
+
+	if (matchesPrefix(ipv6, [0x20, 0x01, 0x00], 23)) return true;
+	if (matchesPrefix(ipv6, [0x20, 0x01, 0x0d, 0xb8], 32)) return true;
+	if (matchesPrefix(ipv6, [0x20, 0x02], 16)) return true;
+	if (matchesPrefix(ipv6, [0x3f, 0xff, 0x00], 20)) return true;
 	return false;
 }
 
 /** URLs in prose usually end before sentence punctuation or a closing bracket. */
 const URL_IN_TEXT = /https?:\/\/[^\s<>"'`]+/gi;
-const URL_TRAILING_NOISE = /[.,;:!?'"`)\]}]+$/;
+const URL_TRAILING_PUNCTUATION = /[.,;:!?'"`]+$/;
+const URL_CLOSING_DELIMITERS = new Map([
+	[")", "("],
+	["]", "["],
+	["}", "{"],
+]);
+
+function trimUrlTrailingNoise(value: string): string {
+	let trimmed = value.replace(URL_TRAILING_PUNCTUATION, "");
+	while (trimmed.length > 0) {
+		const closing = trimmed.at(-1);
+		const opening = closing ? URL_CLOSING_DELIMITERS.get(closing) : undefined;
+		if (!closing || !opening) {
+			break;
+		}
+		const openingCount = [...trimmed].filter((character) => character === opening).length;
+		const closingCount = [...trimmed].filter((character) => character === closing).length;
+		if (closingCount <= openingCount) {
+			break;
+		}
+		trimmed = trimmed.slice(0, -1).replace(URL_TRAILING_PUNCTUATION, "");
+	}
+	return trimmed;
+}
 
 /** Collect http(s) URLs from free text, such as a user message or a tool result. */
 export function extractUrls(text: string): string[] {
 	const found: string[] = [];
 	for (const match of text.matchAll(URL_IN_TEXT)) {
-		const trimmed = match[0].replace(URL_TRAILING_NOISE, "");
+		const trimmed = trimUrlTrailingNoise(match[0]);
 		if (trimmed.length > 0) {
 			found.push(trimmed);
 		}
@@ -338,35 +405,40 @@ async function assertFetchableUrl(raw: string, resolveHost: WebFetchHostResolver
 	if (url.protocol !== "http:" && url.protocol !== "https:") {
 		throw new Error(`web_fetch only supports http and https URLs, got ${url.protocol}`);
 	}
-	if (isBlockedHostname(url.hostname)) {
+	const hostname = unbracketAddress(url.hostname);
+	if (isBlockedHostname(hostname)) {
 		throw new Error(`web_fetch refuses to fetch internal host ${url.hostname}`);
 	}
-	if (isPrivateAddress(url.hostname)) {
+	if (isNonPublicAddress(hostname)) {
 		throw new Error(`web_fetch refuses to fetch ${url.hostname}: resolves to non-public address ${url.hostname}`);
 	}
 
 	// A public-looking hostname can still resolve to a private address, so check
 	// what it actually resolves to rather than trusting its shape.
-	const addresses = await resolveHost(url.hostname);
-	if (addresses.length === 0) {
+	const resolvedAddresses = await resolveHost(hostname);
+	if (resolvedAddresses.length === 0) {
 		throw new Error(`web_fetch could not resolve ${url.hostname}`);
 	}
-	for (const address of addresses) {
-		if (isIP(address) === 0) {
-			throw new Error(`web_fetch received an invalid address for ${url.hostname}: ${address}`);
-		}
-		if (isPrivateAddress(address)) {
+	const addresses: string[] = [];
+	for (const address of resolvedAddresses) {
+		const normalizedAddress = unbracketAddress(address);
+		if (isNonPublicAddress(normalizedAddress)) {
 			throw new Error(`web_fetch refuses to fetch ${url.hostname}: resolves to non-public address ${address}`);
 		}
+		if (isIP(normalizedAddress) === 0) {
+			throw new Error(`web_fetch received an invalid address for ${url.hostname}: ${address}`);
+		}
+		addresses.push(normalizedAddress);
 	}
 	return { url, addresses };
 }
 
 async function defaultResolveHost(hostname: string): Promise<string[]> {
-	if (isPrivateAddress(hostname)) {
-		return [hostname];
+	const normalizedHostname = unbracketAddress(hostname);
+	if (isIP(normalizedHostname) !== 0 || isNonPublicAddress(normalizedHostname)) {
+		return [normalizedHostname];
 	}
-	const results = await lookup(hostname, { all: true });
+	const results = await lookup(normalizedHostname, { all: true });
 	return results.map((entry) => entry.address);
 }
 
@@ -555,11 +627,15 @@ function isTextualContentType(contentType: string): boolean {
 function createPinnedDispatcher(addresses: readonly string[]): Agent {
 	const records: Array<{ address: string; family: 4 | 6 }> = [];
 	for (const address of addresses) {
-		const family = isIP(address);
+		const normalizedAddress = unbracketAddress(address);
+		if (isNonPublicAddress(normalizedAddress)) {
+			throw new Error(`web_fetch cannot pin non-public address ${address}`);
+		}
+		const family = isIP(normalizedAddress);
 		if (family !== 4 && family !== 6) {
 			throw new Error(`web_fetch cannot pin invalid address ${address}`);
 		}
-		records.push({ address, family });
+		records.push({ address: normalizedAddress, family });
 	}
 
 	const pinnedLookup: LookupFunction = (_hostname, options, callback) => {
@@ -584,12 +660,19 @@ function createPinnedDispatcher(addresses: readonly string[]): Agent {
 	});
 }
 
-async function readBoundedResponseBody(response: Response): Promise<string> {
+interface BoundedResponseBody {
+	content: string;
+	truncated: boolean;
+}
+
+async function readBoundedResponseBody(response: Response): Promise<BoundedResponseBody> {
 	if (!response.body) {
-		return "";
+		return { content: "", truncated: false };
 	}
 
-	const bytes = new Uint8Array(MAX_DOWNLOAD_BYTES);
+	// Read one byte beyond the ceiling so an exactly 5 MiB response is not
+	// incorrectly reported as truncated.
+	const bytes = new Uint8Array(MAX_DOWNLOAD_BYTES + 1);
 	const reader = response.body.getReader();
 	let length = 0;
 	try {
@@ -609,7 +692,11 @@ async function readBoundedResponseBody(response: Response): Promise<string> {
 	} finally {
 		reader.releaseLock();
 	}
-	return new TextDecoder().decode(bytes.subarray(0, length));
+	const truncated = length > MAX_DOWNLOAD_BYTES;
+	return {
+		content: new TextDecoder().decode(bytes.subarray(0, Math.min(length, MAX_DOWNLOAD_BYTES))),
+		truncated,
+	};
 }
 
 async function discardResponseBody(response: Response | undefined): Promise<void> {
@@ -708,7 +795,8 @@ export function createDefaultWebFetchOperations(options: DefaultWebFetchOperatio
 					throw new Error(`web_fetch cannot read content type ${contentType.split(";", 1)[0].trim()}`);
 				}
 
-				const body = await readBoundedResponseBody(response);
+				const boundedBody = await readBoundedResponseBody(response);
+				const body = boundedBody.content;
 				const isHtml = /html/i.test(contentType) || /^\s*<(!doctype html|html)\b/i.test(body);
 				const extracted = isHtml ? extractHtml(body) : undefined;
 
@@ -717,6 +805,7 @@ export function createDefaultWebFetchOperations(options: DefaultWebFetchOperatio
 					...(extracted?.title ? { title: extracted.title } : {}),
 					...(contentType ? { contentType } : {}),
 					content: extracted ? extracted.text : body.trim(),
+					...(boundedBody.truncated ? { downloadTruncation: { maxBytes: MAX_DOWNLOAD_BYTES } } : {}),
 				};
 			} finally {
 				await discardResponseBody(response);
@@ -745,6 +834,7 @@ function createOutput(
 		...(response.url !== request.url ? { requestedUrl: request.url } : {}),
 		...(response.title ? { title: response.title } : {}),
 		...(response.contentType ? { contentType: response.contentType } : {}),
+		...(response.downloadTruncation ? { downloadTruncation: response.downloadTruncation } : {}),
 	};
 
 	let text = truncation.content;
@@ -752,6 +842,9 @@ function createOutput(
 		details.truncation = truncation;
 		const limit = truncation.truncatedBy === "lines" ? `${truncation.maxLines} lines` : formatSize(request.maxBytes);
 		text += `\n\n[${limit} limit reached]`;
+	}
+	if (response.downloadTruncation) {
+		text += `\n\n[Download truncated at ${formatSize(response.downloadTruncation.maxBytes)}]`;
 	}
 	return { text, details };
 }
@@ -786,6 +879,12 @@ function formatWebFetchResult(
 	}
 	if (result.details?.truncation?.truncated) {
 		text += `\n${theme.fg("warning", `[Truncated: ${formatSize(result.details.truncation.maxBytes)} limit]`)}`;
+	}
+	if (result.details?.downloadTruncation) {
+		text += `\n${theme.fg(
+			"warning",
+			`[Download truncated: ${formatSize(result.details.downloadTruncation.maxBytes)} limit]`,
+		)}`;
 	}
 	return text;
 }

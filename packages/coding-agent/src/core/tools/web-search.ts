@@ -436,14 +436,11 @@ function extractChatGptAccountId(token: string): string {
 	return accountId;
 }
 
-/**
- * Page depth requested from the Codex backend.
- *
- * Only the provider's per-result snippet survives extraction, so deeper page text is
- * fetched, billed, and then discarded. Asking for more results must not ask for
- * longer pages.
- */
-const CODEX_RESPONSE_LENGTH = "short";
+function codexResponseLength(limit: number): "short" | "medium" | "long" {
+	if (limit <= 3) return "short";
+	if (limit <= 7) return "medium";
+	return "long";
+}
 
 function codexExternalWebAccess(env: Record<string, string | undefined>): boolean {
 	return env.VOLT_WEB_SEARCH_MODE?.trim().toLowerCase() === "live";
@@ -466,7 +463,7 @@ function buildCodexSearchBody(
 		model: context.model.id,
 		commands: {
 			search_query: [searchQuery],
-			response_length: CODEX_RESPONSE_LENGTH,
+			response_length: codexResponseLength(request.limit),
 		},
 		settings: {
 			allowed_callers: ["direct"],

@@ -780,6 +780,7 @@ export {
 	truncateHead,
 	truncateLine,
 	truncateTail,
+	type WebFetchDownloadTruncation,
 	type WebFetchFetcher,
 	type WebFetchHostResolver,
 	type WebFetchOperations,

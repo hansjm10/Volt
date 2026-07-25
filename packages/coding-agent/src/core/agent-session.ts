@@ -4275,7 +4275,11 @@ export class AgentSession {
 	 */
 	private _collectFetchableUrls(): string[] {
 		const urls: string[] = [];
-		for (const message of this.messages) {
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type !== "message") {
+				continue;
+			}
+			const message = entry.message;
 			if (message.role === "user") {
 				if (typeof message.content === "string") {
 					urls.push(...extractUrls(message.content));

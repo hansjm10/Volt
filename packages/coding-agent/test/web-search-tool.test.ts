@@ -290,7 +290,7 @@ describe("web_search tool", () => {
 				model: "codex-test",
 				commands: {
 					search_query: [{ q: "Volt remote host" }],
-					response_length: "short",
+					response_length: "long",
 				},
 				settings: {
 					allowed_callers: ["direct"],
@@ -323,6 +323,26 @@ describe("web_search tool", () => {
 			results: [],
 			content: "Codex search output",
 		});
+	});
+
+	it("requests a medium OpenAI response when the result limit is in the middle tier", async () => {
+		const fetcher: WebSearchFetcher = async (_input, init) => {
+			expect(getJsonBody(init)).toMatchObject({
+				commands: { response_length: "medium" },
+			});
+			return new Response(JSON.stringify({ output: "OpenAI search output" }), { status: 200 });
+		};
+		const operations = createDefaultWebSearchOperations({
+			env: {},
+			fetcher,
+			modelContext: () => ({
+				model: modelForSearch(),
+				apiKey: "sk-openai",
+				sessionId: "session-openai-medium",
+			}),
+		});
+
+		await operations.search({ query: "Volt AI", limit: 5 });
 	});
 
 	it("does not use Codex alpha search for custom providers using the Codex responses adapter", async () => {
@@ -593,6 +613,20 @@ describe("web_search provider blob extraction", () => {
 		);
 
 		expect(results).toEqual([{ title: "n0.computer", url: "https://www.n0.computer/", snippet: "iroh" }]);
+	});
+
+	it("parses result URLs containing balanced parentheses", () => {
+		const results = parseProviderContent(
+			`Function (mathematics) (https://en.wikipedia.org/wiki/Function_(mathematics))\n${citation(0)} [wordlim: 200] A relation between sets.`,
+		);
+
+		expect(results).toEqual([
+			{
+				title: "Function (mathematics)",
+				url: "https://en.wikipedia.org/wiki/Function_(mathematics)",
+				snippet: "A relation between sets.",
+			},
+		]);
 	});
 
 	it("does not treat body prose ending in a URL as a result header", () => {
