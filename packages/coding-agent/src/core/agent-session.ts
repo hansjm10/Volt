@@ -141,7 +141,6 @@ import {
 	createDefaultWebSearchOperations,
 	DEFAULT_ACTIVE_TOOL_NAMES,
 	extractUrls,
-	extractWebSearchResultUrls,
 	type SubagentToolManager,
 } from "./tools/index.ts";
 import {
@@ -4269,9 +4268,9 @@ export class AgentSession {
 	/**
 	 * URLs that web_fetch is permitted to read.
 	 *
-	 * Only user messages and canonical URL fields from successful web_search
-	 * results count. Assistant and model-controlled tool output are deliberately
-	 * excluded because they can construct attacker-chosen exfiltration URLs.
+	 * Only user messages and structured results from successful web_search calls
+	 * count. Assistant and rendered tool output are deliberately excluded because
+	 * they can contain attacker-chosen URLs.
 	 */
 	private _collectFetchableUrls(): string[] {
 		const urls: string[] = [];
@@ -4291,9 +4290,18 @@ export class AgentSession {
 					}
 				}
 			} else if (message.role === "toolResult" && message.toolName === "web_search" && !message.isError) {
-				for (const part of message.content) {
-					if (part.type === "text") {
-						urls.push(...extractWebSearchResultUrls(part.text));
+				const details: unknown = message.details;
+				if (
+					typeof details !== "object" ||
+					details === null ||
+					!("results" in details) ||
+					!Array.isArray(details.results)
+				) {
+					continue;
+				}
+				for (const result of details.results) {
+					if (typeof result === "object" && result !== null && "url" in result && typeof result.url === "string") {
+						urls.push(result.url);
 					}
 				}
 			}

@@ -688,7 +688,8 @@ describe("web_search provider blob extraction", () => {
 
 		expect(result.details?.truncation?.truncated).toBe(true);
 		expect(result.details?.truncation?.truncatedBy).toBe("lines");
-		expect(getTextOutput(result)).toContain("limit reached");
+		expect(getTextOutput(result)).toContain(`${FALLBACK_MAX_LINES} lines limit reached`);
+		expect(getTextOutput(result)).not.toContain("50.0KB limit reached");
 	});
 
 	it("leaves structured backends untouched", async () => {

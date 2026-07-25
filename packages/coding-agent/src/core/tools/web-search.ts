@@ -9,7 +9,7 @@ import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/type
 import type { Theme } from "../theme/runtime.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+import { formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
 import { cleanProviderContent, FALLBACK_MAX_LINES, parseProviderContent } from "./web-search-extract.ts";
 
 const DEFAULT_LIMIT = 5;
@@ -689,7 +689,9 @@ function createOutput(
 	}
 	if (truncation.truncated) {
 		details.truncation = truncation;
-		notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+		const limit =
+			truncation.truncatedBy === "lines" ? `${truncation.maxLines} lines` : formatSize(truncation.maxBytes);
+		notices.push(`${limit} limit reached`);
 	}
 
 	let text = truncation.content;
@@ -745,7 +747,11 @@ function formatWebSearchResult(
 	if (resultLimit || truncation?.truncated) {
 		const warnings: string[] = [];
 		if (resultLimit) warnings.push(`${resultLimit} results limit`);
-		if (truncation?.truncated) warnings.push(`${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit`);
+		if (truncation?.truncated) {
+			const limit =
+				truncation.truncatedBy === "lines" ? `${truncation.maxLines} lines` : formatSize(truncation.maxBytes);
+			warnings.push(`${limit} limit`);
+		}
 		text += `\n${theme.fg("warning", `[Truncated: ${warnings.join(", ")}]`)}`;
 	}
 	return text;

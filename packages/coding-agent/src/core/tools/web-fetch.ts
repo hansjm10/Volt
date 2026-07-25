@@ -325,18 +325,6 @@ export function extractUrls(text: string): string[] {
 	return found;
 }
 
-/** Extract only the canonical result URL fields emitted by web_search. */
-export function extractWebSearchResultUrls(text: string): string[] {
-	const found: string[] = [];
-	for (const line of text.split(/\r?\n/)) {
-		const match = /^URL:\s*(\S+)\s*$/.exec(line);
-		if (match && normalizeFetchUrl(match[1]) !== undefined) {
-			found.push(match[1]);
-		}
-	}
-	return found;
-}
-
 /**
  * Canonical form used to compare a requested URL against the conversation.
  *
@@ -394,7 +382,39 @@ interface ValidatedWebFetchUrl {
 	addresses: string[];
 }
 
-async function assertFetchableUrl(raw: string, resolveHost: WebFetchHostResolver): Promise<ValidatedWebFetchUrl> {
+async function resolveHostWithSignal(
+	hostname: string,
+	resolveHost: WebFetchHostResolver,
+	signal: AbortSignal,
+): Promise<string[]> {
+	if (signal.aborted) {
+		throw signal.reason instanceof Error ? signal.reason : new Error("Operation aborted");
+	}
+	return new Promise((resolve, reject) => {
+		const onAbort = (): void => {
+			reject(signal.reason instanceof Error ? signal.reason : new Error("Operation aborted"));
+		};
+		const settle = (callback: () => void): void => {
+			signal.removeEventListener("abort", onAbort);
+			callback();
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			resolveHost(hostname).then(
+				(addresses) => settle(() => resolve(addresses)),
+				(error: unknown) => settle(() => reject(error)),
+			);
+		} catch (error) {
+			settle(() => reject(error));
+		}
+	});
+}
+
+async function assertFetchableUrl(
+	raw: string,
+	resolveHost: WebFetchHostResolver,
+	signal: AbortSignal,
+): Promise<ValidatedWebFetchUrl> {
 	let url: URL;
 	try {
 		url = new URL(raw);
@@ -415,7 +435,7 @@ async function assertFetchableUrl(raw: string, resolveHost: WebFetchHostResolver
 
 	// A public-looking hostname can still resolve to a private address, so check
 	// what it actually resolves to rather than trusting its shape.
-	const resolvedAddresses = await resolveHost(hostname);
+	const resolvedAddresses = await resolveHostWithSignal(hostname, resolveHost, signal);
 	if (resolvedAddresses.length === 0) {
 		throw new Error(`web_fetch could not resolve ${url.hostname}`);
 	}
@@ -497,6 +517,11 @@ export interface ExtractedHtml {
 	title?: string;
 }
 
+interface ExtractedLine {
+	text: string;
+	preformatted: boolean;
+}
+
 /**
  * Convert HTML to readable text.
  *
@@ -507,28 +532,27 @@ export interface ExtractedHtml {
  * code samples survive.
  */
 export function extractHtml(html: string): ExtractedHtml {
-	const lines: string[] = [];
+	const lines: ExtractedLine[] = [];
 	const titleParts: string[] = [];
 	let current = "";
-	let currentIsPre = false;
 	let preDepth = 0;
 	let suppressedDepth = 0;
 	let titleDepth = 0;
 
 	const flush = (): void => {
 		// Leading whitespace is meaningful inside <pre> and noise everywhere else.
-		lines.push(currentIsPre ? current.replace(/\s+$/, "") : current.trim());
+		lines.push({
+			text: preDepth > 0 ? current.replace(/\s+$/, "") : current.trim(),
+			preformatted: preDepth > 0,
+		});
 		current = "";
-		currentIsPre = false;
 	};
 
 	const appendPre = (value: string): void => {
 		const parts = value.split("\n");
 		current += parts[0];
-		currentIsPre = true;
 		for (let index = 1; index < parts.length; index++) {
 			flush();
-			currentIsPre = true;
 			current = parts[index];
 		}
 	};
@@ -593,18 +617,24 @@ export function extractHtml(html: string): ExtractedHtml {
 	parser.end(html);
 	flush();
 
-	const output: string[] = [];
+	const output: ExtractedLine[] = [];
 	for (const line of lines) {
-		if (line.length === 0) {
-			if (output.length > 0 && output[output.length - 1] !== "") output.push("");
+		if (line.preformatted) {
+			output.push(line);
+			continue;
+		}
+		if (line.text.length === 0) {
+			if (output.length > 0 && output[output.length - 1]?.text !== "") output.push(line);
 			continue;
 		}
 		output.push(line);
 	}
-	while (output.length > 0 && output[output.length - 1] === "") output.pop();
+	while (output.length > 0 && !output[output.length - 1]?.preformatted && output[output.length - 1]?.text === "") {
+		output.pop();
+	}
 
 	const title = titleParts.join("").trim();
-	return { text: output.join("\n"), ...(title ? { title } : {}) };
+	return { text: output.map((line) => line.text).join("\n"), ...(title ? { title } : {}) };
 }
 
 /** Readable text of an HTML document. */
@@ -720,8 +750,21 @@ export function createDefaultWebFetchOperations(options: DefaultWebFetchOperatio
 
 			const timeoutSignal = AbortSignal.timeout(timeoutMs);
 			const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+			const validateUrl = async (url: string): Promise<ValidatedWebFetchUrl> => {
+				try {
+					return await assertFetchableUrl(url, resolveHost, requestSignal);
+				} catch (error) {
+					if (signal?.aborted) {
+						throw new Error("Operation aborted");
+					}
+					if (requestSignal.aborted) {
+						throw new Error(`web_fetch request timed out after ${timeoutMs}ms`);
+					}
+					throw error;
+				}
+			};
 
-			let current = await assertFetchableUrl(request.url, resolveHost);
+			let current = await validateUrl(request.url);
 			let response: Response | undefined;
 			let dispatcher: Agent | undefined;
 
@@ -780,7 +823,7 @@ export function createDefaultWebFetchOperations(options: DefaultWebFetchOperatio
 					response = undefined;
 					await dispatcher?.close();
 					dispatcher = undefined;
-					current = await assertFetchableUrl(redirectUrl, resolveHost);
+					current = await validateUrl(redirectUrl);
 				}
 
 				if (!response) {
@@ -878,7 +921,10 @@ function formatWebFetchResult(
 		}
 	}
 	if (result.details?.truncation?.truncated) {
-		text += `\n${theme.fg("warning", `[Truncated: ${formatSize(result.details.truncation.maxBytes)} limit]`)}`;
+		const truncation = result.details.truncation;
+		const limit =
+			truncation.truncatedBy === "lines" ? `${truncation.maxLines} lines` : formatSize(truncation.maxBytes);
+		text += `\n${theme.fg("warning", `[Truncated: ${limit} limit]`)}`;
 	}
 	if (result.details?.downloadTruncation) {
 		text += `\n${theme.fg(

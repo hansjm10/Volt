@@ -364,6 +364,45 @@ describe("web_fetch network operations", () => {
 		expect(seen).toEqual(["https://example.com/start"]);
 	});
 
+	it("times out while resolving the initial hostname", async () => {
+		const operations = createDefaultWebFetchOperations({
+			env: {},
+			fetcher: async () => new Response("should not be reached", { status: 200 }),
+			resolveHost: async () => new Promise<string[]>(() => {}),
+			timeoutMs: 10,
+		});
+
+		await expect(operations.fetch({ url: "https://example.com/start", maxBytes: 20_000 })).rejects.toThrow(
+			"web_fetch request timed out after 10ms",
+		);
+	});
+
+	it("cancels while resolving a redirect target", async () => {
+		let markRedirectResolutionStarted!: () => void;
+		const redirectResolutionStarted = new Promise<void>((resolve) => {
+			markRedirectResolutionStarted = resolve;
+		});
+		const operations = createDefaultWebFetchOperations({
+			env: {},
+			fetcher: async () =>
+				new Response(null, { status: 302, headers: { location: "https://redirect.example/final" } }),
+			resolveHost: async (hostname) => {
+				if (hostname === "example.com") {
+					return ["93.184.216.34"];
+				}
+				markRedirectResolutionStarted();
+				return new Promise<string[]>(() => {});
+			},
+		});
+		const controller = new AbortController();
+		const pending = operations.fetch({ url: "https://example.com/start", maxBytes: 20_000 }, controller.signal);
+
+		await redirectResolutionStarted;
+		controller.abort();
+
+		await expect(pending).rejects.toThrow("Operation aborted");
+	});
+
 	it("stops after too many redirects", async () => {
 		let hops = 0;
 		const fetcher: WebFetchFetcher = async () => {
@@ -514,6 +553,7 @@ describe("web_fetch session integration", () => {
 	const USER_URL = "https://user-supplied.invalid/doc";
 	const SEARCH_URL = "https://from-search.invalid/page";
 	const SEARCH_SNIPPET_URL = "https://snippet-invented.invalid/trap";
+	const FALLBACK_SEARCH_URL = "https://fallback-invented.invalid/trap";
 	const BASH_URL = "https://bash-invented.invalid/exfil";
 	const FAILED_SEARCH_URL = "https://failed-search.invalid/trap";
 	const ASSISTANT_URL = "https://assistant-invented.invalid/x";
@@ -548,6 +588,11 @@ describe("web_fetch session integration", () => {
 			toolCallId: "call-1",
 			toolName: "web_search",
 			content: [{ type: "text", text: `[1] A page\nURL: ${SEARCH_URL}\nSnippet: ${SEARCH_SNIPPET_URL}` }],
+			details: {
+				query: "a page",
+				provider: "test",
+				results: [{ title: "A page", url: SEARCH_URL }],
+			},
 			isError: false,
 			timestamp: Date.now(),
 		});
@@ -567,6 +612,19 @@ describe("web_fetch session integration", () => {
 			isError: true,
 			timestamp: Date.now(),
 		});
+		session.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-4",
+			toolName: "web_search",
+			content: [{ type: "text", text: `Unstructured search fallback\nURL: ${FALLBACK_SEARCH_URL}` }],
+			details: {
+				query: "unstructured",
+				provider: "test",
+				results: [],
+			},
+			isError: false,
+			timestamp: Date.now(),
+		});
 
 		const tool = session.agent.state.tools.find((candidate) => candidate.name === "web_fetch");
 		expect(tool).toBeDefined();
@@ -577,10 +635,11 @@ describe("web_fetch session integration", () => {
 		await expect(tool!.execute("session-3", { url: BASH_URL })).rejects.toThrow(blocked);
 		await expect(tool!.execute("session-4", { url: SEARCH_SNIPPET_URL })).rejects.toThrow(blocked);
 		await expect(tool!.execute("session-5", { url: FAILED_SEARCH_URL })).rejects.toThrow(blocked);
+		await expect(tool!.execute("session-6", { url: FALLBACK_SEARCH_URL })).rejects.toThrow(blocked);
 
 		// These are allowed, so they fail later (name resolution) rather than on the allowlist.
 		for (const allowed of [USER_URL, SEARCH_URL]) {
-			const error = await tool!.execute("session-6", { url: allowed }).then(
+			const error = await tool!.execute("session-7", { url: allowed }).then(
 				() => undefined,
 				(thrown: unknown) => thrown as Error,
 			);
@@ -695,7 +754,10 @@ describe("htmlToText", () => {
 		expect(htmlToText("<pre>line one\n  indented\n    deeper\nline four</pre>")).toBe(
 			"line one\n  indented\n    deeper\nline four",
 		);
-		expect(htmlToText("<pre><code>def f():\n    return 1\n</code></pre>")).toBe("def f():\n    return 1");
+		expect(htmlToText("<pre><code>def f():\n    return 1\n</code></pre>")).toBe("def f():\n    return 1\n");
+		const blankLines = "\n\nline one\n\n\nline two\n\n";
+		expect(htmlToText(`<pre><code>${blankLines}</code></pre>`)).toBe(blankLines);
+		expect(htmlToText("<pre><br><br>line<br><br></pre>")).toBe("\n\nline\n\n");
 	});
 
 	it("renders lists and table rows readably", () => {
