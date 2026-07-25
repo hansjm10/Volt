@@ -567,6 +567,12 @@ describe("htmlToText", () => {
 		expect(htmlToText("<p>before</p><script>var x = 1; alert('leak')")).toBe("before");
 	});
 
+	it("extracts element-heavy documents without retaining a browser DOM", () => {
+		const html = `<body>${"<span></span>".repeat(82_000)}<p>useful text</p></body>`;
+		expect(new TextEncoder().encode(html).byteLength).toBeGreaterThan(1024 * 1024);
+		expect(htmlToText(html)).toBe("useful text");
+	});
+
 	it("keeps whitespace inside pre and code blocks", () => {
 		expect(htmlToText("<pre>line one\n  indented\n    deeper\nline four</pre>")).toBe(
 			"line one\n  indented\n    deeper\nline four",

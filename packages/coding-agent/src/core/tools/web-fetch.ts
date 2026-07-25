@@ -2,7 +2,7 @@ import { lookup } from "node:dns/promises";
 import { isIP, type LookupFunction } from "node:net";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
 import { Text } from "@hansjm10/volt-tui";
-import { Window } from "happy-dom";
+import { Parser } from "htmlparser2";
 import { type Static, Type } from "typebox";
 import { Agent, fetch as undiciFetch } from "undici";
 import { VERSION } from "../../config.ts";
@@ -370,11 +370,8 @@ async function defaultResolveHost(hostname: string): Promise<string[]> {
 	return results.map((entry) => entry.address);
 }
 
-const TEXT_NODE = 3;
-const ELEMENT_NODE = 1;
-
 /** Elements whose content is markup, styling, or scripting rather than page text. */
-const NON_CONTENT_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "SVG", "TEMPLATE", "HEAD", "IFRAME", "CANVAS"]);
+const NON_CONTENT_TAGS = new Set(["script", "style", "noscript", "svg", "template", "head", "iframe", "canvas"]);
 /**
  * Site furniture dropped before extraction.
  *
@@ -382,54 +379,46 @@ const NON_CONTENT_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "SVG", "TEMPLAT
  * carry the page heading and asides carry callouts, so they are kept even though
  * dropping them would shrink output further.
  */
-const CHROME_TAGS = new Set(["NAV", "FOOTER"]);
+const CHROME_TAGS = new Set(["nav", "footer"]);
 /** Elements that start and end a line of output. */
 const BLOCK_TAGS = new Set([
-	"ADDRESS",
-	"ARTICLE",
-	"ASIDE",
-	"BLOCKQUOTE",
-	"DD",
-	"DIV",
-	"DL",
-	"DT",
-	"FIELDSET",
-	"FIGCAPTION",
-	"FIGURE",
-	"FOOTER",
-	"FORM",
-	"H1",
-	"H2",
-	"H3",
-	"H4",
-	"H5",
-	"H6",
-	"HEADER",
-	"HR",
-	"LI",
-	"MAIN",
-	"NAV",
-	"OL",
-	"P",
-	"PRE",
-	"SECTION",
-	"TABLE",
-	"TBODY",
-	"TFOOT",
-	"THEAD",
-	"TR",
-	"UL",
+	"address",
+	"article",
+	"aside",
+	"blockquote",
+	"dd",
+	"div",
+	"dl",
+	"dt",
+	"fieldset",
+	"figcaption",
+	"figure",
+	"footer",
+	"form",
+	"h1",
+	"h2",
+	"h3",
+	"h4",
+	"h5",
+	"h6",
+	"header",
+	"hr",
+	"li",
+	"main",
+	"nav",
+	"ol",
+	"p",
+	"pre",
+	"section",
+	"table",
+	"tbody",
+	"tfoot",
+	"thead",
+	"tr",
+	"ul",
 ]);
 /** Table cells separate with a tab so one row stays on one line. */
-const CELL_TAGS = new Set(["TD", "TH"]);
-
-/** Structural subset of the DOM this walker needs, so happy-dom types stay internal. */
-interface DomNode {
-	nodeType: number;
-	data?: string;
-	tagName?: string;
-	childNodes: Iterable<DomNode>;
-}
+const CELL_TAGS = new Set(["td", "th"]);
 
 export interface ExtractedHtml {
 	text: string;
@@ -439,110 +428,111 @@ export interface ExtractedHtml {
 /**
  * Convert HTML to readable text.
  *
- * Uses a real HTML parser rather than tag-stripping regexes, which mishandle
- * attributes containing `>` and leak the body of an unclosed `<script>`. Text
- * inside `<pre>` keeps its whitespace so code samples survive.
+ * Uses a non-DOM event parser rather than tag-stripping regexes, which mishandle
+ * attributes containing `>` and leak the body of an unclosed `<script>`.
+ * Entity decoding and malformed-tag recovery remain parser-managed without
+ * allocating a browser document. Text inside `<pre>` keeps its whitespace so
+ * code samples survive.
  */
 export function extractHtml(html: string): ExtractedHtml {
-	const window = new Window({
-		settings: {
-			enableJavaScriptEvaluation: false,
-			disableJavaScriptFileLoading: true,
-			disableCSSFileLoading: true,
-			enableImageFileLoading: false,
-			handleDisabledFileLoadingAsSuccess: true,
-			navigation: {
-				disableMainFrameNavigation: true,
-				disableChildFrameNavigation: true,
-				disableChildPageNavigation: true,
-				disableFallbackToSetURL: true,
-			},
-		},
-	});
-	try {
-		const document = window.document;
-		document.write(html);
+	const lines: string[] = [];
+	const titleParts: string[] = [];
+	let current = "";
+	let currentIsPre = false;
+	let preDepth = 0;
+	let suppressedDepth = 0;
+	let titleDepth = 0;
 
-		const lines: string[] = [];
-		let current = "";
-		let currentIsPre = false;
+	const flush = (): void => {
+		// Leading whitespace is meaningful inside <pre> and noise everywhere else.
+		lines.push(currentIsPre ? current.replace(/\s+$/, "") : current.trim());
+		current = "";
+		currentIsPre = false;
+	};
 
-		const flush = (): void => {
-			// Leading whitespace is meaningful inside <pre> and noise everywhere else.
-			lines.push(currentIsPre ? current.replace(/\s+$/, "") : current.trim());
-			current = "";
-			currentIsPre = false;
-		};
-
-		const appendPre = (value: string): void => {
-			const parts = value.split("\n");
-			current += parts[0];
+	const appendPre = (value: string): void => {
+		const parts = value.split("\n");
+		current += parts[0];
+		currentIsPre = true;
+		for (let index = 1; index < parts.length; index++) {
+			flush();
 			currentIsPre = true;
-			for (let index = 1; index < parts.length; index++) {
-				flush();
-				currentIsPre = true;
-				current = parts[index];
-			}
-		};
+			current = parts[index];
+		}
+	};
 
-		const walk = (node: DomNode, inPre: boolean): void => {
-			if (node.nodeType === TEXT_NODE) {
-				const raw = node.data ?? "";
-				if (inPre) {
-					appendPre(raw);
+	const parser = new Parser(
+		{
+			onopentag(tag) {
+				if (tag === "title") {
+					titleDepth++;
+				}
+				if (suppressedDepth > 0 || NON_CONTENT_TAGS.has(tag) || CHROME_TAGS.has(tag)) {
+					suppressedDepth++;
 					return;
 				}
-				current += raw.replace(/\s+/g, " ");
-				return;
-			}
-			if (node.nodeType !== ELEMENT_NODE) {
-				return;
-			}
-			const tag = node.tagName ?? "";
-			if (NON_CONTENT_TAGS.has(tag) || CHROME_TAGS.has(tag)) {
-				return;
-			}
-			if (tag === "BR") {
-				flush();
-				return;
-			}
-			if (CELL_TAGS.has(tag)) {
-				if (current.length > 0 && !current.endsWith("\t")) {
-					current += "\t";
+				if (tag === "br") {
+					flush();
+					return;
 				}
-				for (const child of node.childNodes) walk(child, inPre);
-				return;
-			}
-			const block = BLOCK_TAGS.has(tag);
-			const pre = inPre || tag === "PRE";
-			if (block) flush();
-			if (tag === "LI") current += "- ";
-			for (const child of node.childNodes) walk(child, pre);
-			// A list item or table row ends at its next sibling or at the container
-			// close, so flushing here too would put a blank line between every bullet
-			// and every row.
-			if (block && tag !== "LI" && tag !== "TR") flush();
-		};
+				if (CELL_TAGS.has(tag)) {
+					if (current.length > 0 && !current.endsWith("\t")) {
+						current += "\t";
+					}
+					return;
+				}
+				const block = BLOCK_TAGS.has(tag);
+				if (block) flush();
+				if (tag === "li") current += "- ";
+				if (tag === "pre") preDepth++;
+			},
+			ontext(value) {
+				if (titleDepth > 0) {
+					titleParts.push(value);
+				}
+				if (suppressedDepth > 0) {
+					return;
+				}
+				if (preDepth > 0) {
+					appendPre(value);
+					return;
+				}
+				const normalized = value.replace(/\s+/g, " ");
+				current += current.endsWith(" ") && normalized.startsWith(" ") ? normalized.slice(1) : normalized;
+			},
+			onclosetag(tag) {
+				if (tag === "title" && titleDepth > 0) {
+					titleDepth--;
+				}
+				if (suppressedDepth > 0) {
+					suppressedDepth--;
+					return;
+				}
+				const block = BLOCK_TAGS.has(tag);
+				// A list item or table row ends at its next sibling or at the
+				// container close, so flushing here too would put a blank line
+				// between every bullet and every row.
+				if (block && tag !== "li" && tag !== "tr") flush();
+				if (tag === "pre" && preDepth > 0) preDepth--;
+			},
+		},
+		{ decodeEntities: true },
+	);
+	parser.end(html);
+	flush();
 
-		const root = (document.body ?? document.documentElement) as unknown as DomNode | null;
-		if (root) walk(root, false);
-		flush();
-
-		const output: string[] = [];
-		for (const line of lines) {
-			if (line.length === 0) {
-				if (output.length > 0 && output[output.length - 1] !== "") output.push("");
-				continue;
-			}
-			output.push(line);
+	const output: string[] = [];
+	for (const line of lines) {
+		if (line.length === 0) {
+			if (output.length > 0 && output[output.length - 1] !== "") output.push("");
+			continue;
 		}
-		while (output.length > 0 && output[output.length - 1] === "") output.pop();
-
-		const title = document.title?.trim();
-		return { text: output.join("\n"), ...(title ? { title } : {}) };
-	} finally {
-		window.close();
+		output.push(line);
 	}
+	while (output.length > 0 && output[output.length - 1] === "") output.pop();
+
+	const title = titleParts.join("").trim();
+	return { text: output.join("\n"), ...(title ? { title } : {}) };
 }
 
 /** Readable text of an HTML document. */
