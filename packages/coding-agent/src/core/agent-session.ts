@@ -4268,18 +4268,23 @@ export class AgentSession {
 	/**
 	 * URLs that web_fetch is permitted to read.
 	 *
-	 * Only user messages and structured results from successful web_search calls
-	 * count. Assistant and rendered tool output are deliberately excluded because
-	 * they can contain attacker-chosen URLs.
+	 * Only top-level user messages and structured results from successful
+	 * web_search calls count. Delegated prompts, assistant messages, and rendered
+	 * tool output are excluded because they can contain model- or attacker-chosen
+	 * URLs.
 	 */
 	private _collectFetchableUrls(): string[] {
 		const urls: string[] = [];
+		// A delegated task is persisted as a user-role message so it can start the
+		// child turn, but its author is the parent model. It must not grant the
+		// child permission to fetch model-constructed URLs.
+		const trustUserMessageUrls = this._subagentToolManager?.isSubagentRuntime?.() !== true;
 		for (const entry of this.sessionManager.getBranch()) {
 			if (entry.type !== "message") {
 				continue;
 			}
 			const message = entry.message;
-			if (message.role === "user") {
+			if (message.role === "user" && trustUserMessageUrls) {
 				if (typeof message.content === "string") {
 					urls.push(...extractUrls(message.content));
 					continue;

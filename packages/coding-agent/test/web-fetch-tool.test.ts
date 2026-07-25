@@ -17,6 +17,7 @@ import {
 	extractUrls,
 	htmlToText,
 	normalizeFetchUrl,
+	type SubagentToolManager,
 	type WebFetchFetcher,
 	type WebFetchHostResolver,
 	type WebFetchOperations,
@@ -544,11 +545,23 @@ describe("web_fetch session integration", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	async function createSession() {
+	async function createSession(options: { subagentRuntime?: boolean } = {}) {
 		const settingsManager = SettingsManager.create(tempDir, agentDir);
 		const sessionManager = SessionManager.inMemory(tempDir);
 		const resourceLoader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 		await resourceLoader.reload();
+		const subagentToolManager: SubagentToolManager | undefined = options.subagentRuntime
+			? {
+					isSubagentRuntime: () => true,
+					listAvailableDefinitions: () => [],
+					getDefinition: () => {
+						throw new Error("No subagent definitions are available");
+					},
+					startByName: async () => {
+						throw new Error("No subagent definitions are available");
+					},
+				}
+			: undefined;
 		return createAgentSession({
 			cwd: tempDir,
 			agentDir,
@@ -556,6 +569,7 @@ describe("web_fetch session integration", () => {
 			settingsManager,
 			sessionManager,
 			resourceLoader,
+			subagentToolManager,
 		});
 	}
 
@@ -657,6 +671,42 @@ describe("web_fetch session integration", () => {
 			expect(error?.message).not.toContain(blocked);
 		}
 
+		session.dispose();
+	});
+
+	it("does not trust a parent-model task URL in a delegated child session", async () => {
+		const { session } = await createSession({ subagentRuntime: true });
+		session.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: `Research ${USER_URL}` }],
+			timestamp: Date.now(),
+		});
+		session.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "delegated-search",
+			toolName: "web_search",
+			content: [{ type: "text", text: `URL: ${SEARCH_URL}` }],
+			details: {
+				query: "delegated research",
+				provider: "test",
+				results: [{ title: "A search result", url: SEARCH_URL }],
+			},
+			isError: false,
+			timestamp: Date.now(),
+		});
+
+		const tool = session.agent.state.tools.find((candidate) => candidate.name === "web_fetch");
+		expect(tool).toBeDefined();
+		const blocked = "web_fetch can only read URLs that already appeared in this conversation";
+
+		await expect(tool!.execute("delegated-task-url", { url: USER_URL })).rejects.toThrow(blocked);
+
+		const searchError = await tool!.execute("delegated-search-url", { url: SEARCH_URL }).then(
+			() => undefined,
+			(thrown: unknown) => thrown as Error,
+		);
+		expect(searchError).toBeInstanceOf(Error);
+		expect(searchError?.message).not.toContain(blocked);
 		session.dispose();
 	});
 
