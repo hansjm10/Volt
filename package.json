@@ -22,7 +22,7 @@
 		"changeset:add": "node scripts/changelog.mjs add",
 		"changeset:draft": "node scripts/draft-changeset.mjs",
 		"check:changesets": "node scripts/check-changesets.mjs",
-		"check:release-security": "node --test scripts/release-security.test.mjs scripts/bootstrap-npm-packages.test.mjs scripts/changelog.test.mjs scripts/check-changesets.test.mjs scripts/draft-changeset.test.mjs",
+		"check:release-security": "node --test scripts/release-security.test.mjs scripts/bootstrap-npm-packages.test.mjs scripts/changelog.test.mjs scripts/check-changesets.test.mjs scripts/draft-changeset.test.mjs scripts/edit-tool-stats.test.mjs",
 		"check:rpc-contract": "node scripts/generate-rpc-schema.ts --check",
 		"check:shrinkwrap": "node scripts/generate-coding-agent-shrinkwrap.mjs --check",
 		"check:ts-imports": "node scripts/check-ts-relative-imports.mjs",
