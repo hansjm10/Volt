@@ -54,4 +54,6 @@ jobs:
           node scripts/check-changesets.mjs --require --base FETCH_HEAD
 
       - name: Test
+        env:
+          VOLT_TEST_REQUIRE_NATIVE_IROH: '1'
         run: npm test
