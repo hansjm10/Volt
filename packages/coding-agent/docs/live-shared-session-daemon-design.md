@@ -1024,7 +1024,7 @@ Each milestone leaves `./test.sh` green. Branch implements M1-M8 (+M10 docs) in 
 | Version skew after `npm update` leaves an old daemon serving | §3.8 idle auto-restart + warning; `status` always reports both versions. |
 | Secret-key migration bug forces re-pairing | Byte-identical key assertion in migration tests; legacy file kept as `.migrated` for manual recovery. |
 | Two TUIs in the same workspace fight over one session | Explicit `held_by_tui` denial + read-only open; multi-TUI is a stated non-goal. |
-| Unix socket path length limits (104/108 bytes) with deep home dirs | Compute at startup; if too long, fall back to `$XDG_RUNTIME_DIR/voltd-<uid>.sock` (or `/tmp/voltd-<uid>/voltd.sock` mode 0700) and record the actual path in the pidfile, which clients read when the default probe fails. |
+| Unix socket path length limits (104/108 bytes) with deep home dirs | Compute at startup; if too long, fall back to an agent-directory-scoped socket at `$XDG_RUNTIME_DIR/voltd-<uid>-<hash>.sock` (or `/tmp/voltd-<uid>/voltd-<hash>.sock` with the directory mode 0700) and record the actual path in the pidfile, which clients read when the default probe fails. |
 
 ### 14.2 Appendix A: iroh-host.mjs function → new home mapping (port checklist)
 
