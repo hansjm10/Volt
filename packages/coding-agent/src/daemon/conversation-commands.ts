@@ -1043,6 +1043,7 @@ function projectRemoteSubagentArgs(
 	}
 	copyRemoteNumber(args, projected, "cursor");
 	copyRemoteString(args, projected, "follow", authorization, 200);
+	copyRemoteString(args, projected, "resume", authorization, 200);
 	return Object.keys(projected).length > 0 ? projected : undefined;
 }
 

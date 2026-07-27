@@ -459,6 +459,7 @@ function projectSubagentArgs(args: Record<string, unknown> | undefined): Record<
 	copyBooleanArg(args, projected, "list");
 	copyNumberArg(args, projected, "cursor");
 	copyStringArg(args, projected, "follow", SUBAGENT_ID_LIMIT);
+	copyStringArg(args, projected, "resume", SUBAGENT_ID_LIMIT);
 	// The one-time confirm token is consumed by the call and omitted here, as
 	// in the daemon and iroh projections.
 	return Object.keys(projected).length > 0 ? projected : undefined;

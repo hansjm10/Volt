@@ -325,7 +325,10 @@ export interface SubagentToolManager {
 	/** Result of an existing run, waiting for completion when still running, for follow mode. */
 	followDelegation?(subagentId: string, options?: { signal?: AbortSignal }): Promise<SubagentFollowResult>;
 	/** Reload an interrupted recovered run and let it finish, for resume mode (issue #129 §5). */
-	resumeDelegation?(subagentId: string, options?: { signal?: AbortSignal }): Promise<SubagentFollowResult>;
+	resumeDelegation?(
+		subagentId: string,
+		options?: { signal?: AbortSignal; allowedTools?: string[] },
+	): Promise<SubagentFollowResult>;
 	dispose?(): Promise<void>;
 	/** Recover pre-restart delegation records before registry reads (issue #129). */
 	ensureRegistryHydrated?(): Promise<void>;
@@ -348,6 +351,8 @@ export interface SubagentToolOptions {
 
 export interface SubagentRegistryToolOptions {
 	manager: SubagentToolManager;
+	/** Return the parent/session tool policy to clamp resumed child tools at execution time. */
+	getAllowedTools?: () => string[] | undefined;
 	maxOutputBytes?: number;
 	maxAggregateOutputBytes?: number;
 }
@@ -523,7 +528,7 @@ function readTreeTaskInput(value: unknown): { agent?: string; task?: string } {
 }
 
 function treeTaskInputs(args: unknown, mode: SubagentToolMode): Array<{ agent?: string; task?: string }> {
-	if (!isRecord(args) || mode === "list" || mode === "follow") {
+	if (!isRecord(args) || mode === "list" || mode === "follow" || mode === "resume") {
 		return [];
 	}
 	if (mode === "single") {
@@ -1226,7 +1231,8 @@ function formatDelegationListRecord(record: SubagentRegistryRecord, now: number)
 				: record.followability === "dependency-cycle"
 					? "dependency cycle; not followable"
 					: "followable";
-	return `${id} ${agentName} ${record.status} [${followability}] (${age}, parent: ${parentId})${task}${error}`;
+	const resumable = record.hydrated === true && record.status === "aborted" ? " [resumable]" : "";
+	return `${id} ${agentName} ${record.status} [${followability}]${resumable} (${age}, parent: ${parentId})${task}${error}`;
 }
 
 function formatDelegationListPageText(
@@ -1553,6 +1559,7 @@ async function executeSubagentRegistryOperation(
 	normalized: Extract<NormalizedSubagentToolInput, { mode: "list" | "follow" | "resume" }>,
 	options: {
 		manager: SubagentToolManager;
+		getAllowedTools?: () => string[] | undefined;
 		maxOutputBytes: number;
 		maxAggregateOutputBytes: number;
 	},
@@ -1567,8 +1574,10 @@ async function executeSubagentRegistryOperation(
 			content: [{ type: "text", text: `Resuming interrupted subagent run ${normalized.subagentId}` }],
 			details: { mode: "resume", status: "running", subagentId: normalized.subagentId },
 		});
+		const allowedTools = options.getAllowedTools?.();
 		const resumed = await options.manager.resumeDelegation(normalized.subagentId, {
 			...(signal ? { signal } : {}),
+			...(allowedTools ? { allowedTools } : {}),
 		});
 		const output = truncateModelVisibleOutput(
 			resumed.output || resumed.error || "(no output)",
@@ -1936,7 +1945,7 @@ class SubagentConversationSummaryComponent implements Component {
 	}
 
 	private getItems(): SubagentConversationItem[] {
-		if (this.details?.mode === "single" || this.details?.mode === "follow") {
+		if (this.details?.mode === "single" || this.details?.mode === "follow" || this.details?.mode === "resume") {
 			return [
 				{
 					index: 0,
@@ -2080,7 +2089,8 @@ class SubagentConversationSummaryComponent implements Component {
 		const safeWidth = Math.max(1, width);
 		const isRegistryQuery =
 			this.details?.mode === "list" ||
-			(!this.details && (this.args?.list !== undefined || this.args?.follow !== undefined));
+			(!this.details &&
+				(this.args?.list !== undefined || this.args?.follow !== undefined || this.args?.resume !== undefined));
 		if (isRegistryQuery) {
 			const title = this.currentTheme.bold(this.currentTheme.fg("accent", "Subagent registry"));
 			const summary = this.currentTheme.fg("muted", this.details ? formatSummary(this.details) : "querying…");
@@ -2219,7 +2229,7 @@ export function createSubagentToolDefinition(
 				"parallel { tasks: [{ agent, task }, ...] }",
 				"chain { chain: [{ agent, task }, ...] }",
 				...(includeListMode ? ["list { list: true, cursor?: number }"] : []),
-				...(includeFollowMode ? ['follow { follow: "sa_..." }'] : []),
+				...(includeFollowMode ? ['follow { follow: "sa_..." }', 'resume { resume: "sa_..." }'] : []),
 			].join(", ")}.`,
 			`Parallel mode runs up to ${DEFAULT_SUBAGENT_PARALLEL_MAX_TASKS} tasks with max concurrency ${DEFAULT_SUBAGENT_PARALLEL_MAX_CONCURRENCY}.`,
 			`Chain mode runs up to ${DEFAULT_SUBAGENT_CHAIN_MAX_STEPS} steps sequentially, replacing {previous} with bounded XML-escaped untrusted prior output and stopping at the first failed step.`,
@@ -2297,7 +2307,12 @@ export function createSubagentToolDefinition(
 			if (normalized.mode === "list" || normalized.mode === "follow" || normalized.mode === "resume") {
 				return executeSubagentRegistryOperation(
 					normalized,
-					{ manager: options.manager, maxOutputBytes, maxAggregateOutputBytes },
+					{
+						manager: options.manager,
+						getAllowedTools: options.getAllowedTools,
+						maxOutputBytes,
+						maxAggregateOutputBytes,
+					},
 					signal,
 					onUpdate,
 				);
@@ -2823,7 +2838,10 @@ export function createSubagentRegistryToolDefinition(
 					]
 				: []),
 			...(includeFollowMode
-				? ['Follow mode { follow: "sa_..." } accepts only records marked followable and returns that run by id.']
+				? [
+						'Follow mode { follow: "sa_..." } accepts only records marked followable and returns that run by id.',
+						'Resume mode { resume: "sa_..." } reloads a record marked resumable from its transcript and lets it finish its task.',
+					]
 				: []),
 		].join(" "),
 		promptSnippet:
@@ -2867,7 +2885,12 @@ export function createSubagentRegistryToolDefinition(
 			}
 			return executeSubagentRegistryOperation(
 				normalized,
-				{ manager: options.manager, maxOutputBytes, maxAggregateOutputBytes },
+				{
+					manager: options.manager,
+					getAllowedTools: options.getAllowedTools,
+					maxOutputBytes,
+					maxAggregateOutputBytes,
+				},
 				signal,
 				onUpdate,
 			);

@@ -4874,7 +4874,14 @@ export class AgentSession {
 								},
 							}
 						: {}),
-					...(subagentRegistryManager ? { subagentRegistry: { manager: subagentRegistryManager } } : {}),
+					...(subagentRegistryManager
+						? {
+								subagentRegistry: {
+									manager: subagentRegistryManager,
+									getAllowedTools: () => this.getActiveToolNames(),
+								},
+							}
+						: {}),
 					...(this._mcpManager ? { mcp: { manager: this._mcpManager } } : {}),
 				});
 

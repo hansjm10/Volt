@@ -629,7 +629,7 @@ describe("issue #129", () => {
 			expect(text).toContain("researched the task");
 
 			const record = context.manager.listDelegations().find((candidate) => candidate.id === "sa_resume");
-			expect(record).toMatchObject({ status: "completed" });
+			expect(record).toMatchObject({ status: "completed", task: "finish the audit" });
 			expect(record?.hydrated).toBeUndefined();
 
 			// The resumed turn appended to the same child transcript.
@@ -673,6 +673,38 @@ describe("issue #129", () => {
 			expect(followed.output).toBe("finished report");
 		} finally {
 			await restarted.dispose();
+		}
+	});
+
+	it("resume prompt rejection restores the record and surfaces the real cause", async () => {
+		const parent = createPersistedParent();
+		const sessionDir = parent.getSessionDir();
+		const interrupted = SessionManager.create(tmpdir(), sessionDir);
+		interrupted.appendMessage({ role: "user", content: "auth-blocked work", timestamp: Date.now() });
+		interrupted.appendMessage(fauxAssistantMessage("partial"));
+		interrupted.appendMessage({ role: "user", content: "continue", timestamp: Date.now() });
+		await interrupted.flush();
+		parent.appendSubagentSpawn({
+			toolCallId: "call_auth",
+			subagentId: "sa_auth",
+			agent: "researcher",
+			childSessionId: interrupted.getSessionId(),
+			childSessionFile: interrupted.getSessionFile()!,
+			requestKey: "rk-auth",
+		});
+		await parent.flush();
+
+		// The runtime starts, but the first prompt is rejected before acceptance
+		// (no API key): the run never re-registers, so the interrupted record
+		// must be restored and the real cause surfaced — not an unknown-id
+		// follow error.
+		const context = await createTestContext({ withConfiguredAuth: false, parentSessionManager: parent });
+		try {
+			await expect(context.manager.resumeDelegation("sa_auth")).rejects.toThrow(/API key/i);
+			const record = context.manager.listDelegations().find((candidate) => candidate.id === "sa_auth");
+			expect(record).toMatchObject({ status: "aborted", hydrated: true });
+		} finally {
+			await context.cleanup();
 		}
 	});
 

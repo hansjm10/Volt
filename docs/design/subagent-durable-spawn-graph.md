@@ -17,11 +17,17 @@
 > and the standalone `subagent_registry` tool (follow-gated): `claimResume`
 > atomically removes the interrupted record so the run re-registers under its
 > original id through the live pipeline, a start failure restores the record,
-> and no dedup preflight applies. Known skews: after a resume the registry
-> record's task shows the continuation prompt, and the original spawn edge
-> stays unsettled — a later restart hydrates the now-completed child as
-> completed-unclaimed, a benign re-offer suppressed by the notice dedup when
-> previously offered. Prior art: Codex
+> and no dedup preflight applies; an unpublished prompt rejection also
+> restores the record and surfaces its cause, and resumed children are
+> clamped to the caller's live tool policy like fresh spawns. Known skews:
+> the re-registered record's startedAt resets and its parentId/path re-root
+> to the resuming runtime; the original spawn edge stays unsettled — a later
+> restart hydrates the now-completed child as completed-unclaimed, a benign
+> re-offer suppressed by the notice dedup when previously offered. Known
+> limitation: a child killed inside its client-input WAL window reloads with
+> a blocked recovery plan that rejects the resume prompt — the record is
+> restored and the error surfaced, but such children need the WAL ambiguity
+> resolved before they can resume. Prior art: Codex
 > CLI persists parent→child spawn edges in a SQLite `agent_graph_store` and
 > resumes whole descendant trees from rollout files on session resume
 > (`resume_agent_from_rollout`, lazy `ensure_v2_agent_loaded`); OpenCode makes

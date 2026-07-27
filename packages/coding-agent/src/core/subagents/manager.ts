@@ -153,6 +153,11 @@ export interface SubagentStartOptions {
 	 * run re-occupies its claimed registry record. Set only by resumeDelegation.
 	 */
 	resumeSubagentId?: string;
+	/**
+	 * §5 resume: the interrupted run's original task, restored on the
+	 * re-registered record instead of the continuation prompt.
+	 */
+	resumeTaskLabel?: string;
 }
 
 /** Tool-call attribution for one durable spawn edge. */
@@ -349,10 +354,6 @@ function resolveEffectiveTools(options: {
 const RESUME_ID_PREVIEW_CHARS = 120;
 const SUBAGENT_RESUME_PROMPT =
 	"You were interrupted before completing your task. Review the conversation so far, finish the original task, and reply with your complete final report.";
-
-function boundResumeId(id: string): string {
-	return id.length <= RESUME_ID_PREVIEW_CHARS ? id : `${id.slice(0, RESUME_ID_PREVIEW_CHARS - 1)}…`;
-}
 
 function messageText(content: Message["content"]): string {
 	if (typeof content === "string") {
@@ -784,12 +785,19 @@ export class SubagentManager {
 	 * and delegation-scope checks apply as for a new start; a start failure
 	 * restores the interrupted record.
 	 */
-	async resumeDelegation(subagentId: string, options: { signal?: AbortSignal } = {}): Promise<SubagentFollowResult> {
+	async resumeDelegation(
+		subagentId: string,
+		options: { signal?: AbortSignal; allowedTools?: string[] } = {},
+	): Promise<SubagentFollowResult> {
 		await this.ensureRegistryHydrated();
 		const claim = this.getRegistry().claimResume(subagentId);
 		if (!claim) {
+			const preview =
+				subagentId.length <= RESUME_ID_PREVIEW_CHARS
+					? subagentId
+					: `${subagentId.slice(0, RESUME_ID_PREVIEW_CHARS - 1)}…`;
 			throw new Error(
-				`Subagent run "${boundResumeId(subagentId)}" is not a resumable interrupted recovery. Use { follow: "<id>" } for completed runs or { list: true } to inspect the registry.`,
+				`Subagent run "${preview}" is not a resumable interrupted recovery. Use { follow: "<id>" } for completed runs or { list: true } to inspect the registry.`,
 			);
 		}
 		let handle: SubagentHandle;
@@ -800,6 +808,8 @@ export class SubagentManager {
 			handle = await this.startByName(claim.agentName, {
 				sessionManager: SessionManager.open(claim.childSessionFile),
 				resumeSubagentId: subagentId,
+				...(claim.task !== undefined ? { resumeTaskLabel: claim.task } : {}),
+				...(options.allowedTools ? { allowedTools: options.allowedTools } : {}),
 			});
 		} catch (error) {
 			claim.rollback();
@@ -809,16 +819,24 @@ export class SubagentManager {
 			void handle.abort().catch(() => undefined);
 		};
 		options.signal?.addEventListener("abort", onAbort, { once: true });
-		if (options.signal?.aborted) {
-			onAbort();
-		}
 		try {
+			// An abort that landed while the runtime was being prepared no-ops
+			// against the idle session; honor it before spending a turn.
+			if (options.signal?.aborted) {
+				throw new Error("Operation aborted");
+			}
 			const completion = handle.waitForEnd();
 			await handle.prompt(SUBAGENT_RESUME_PROMPT);
 			await completion;
-		} catch {
-			// The live settlement pipeline records the terminal outcome
-			// (including failures and aborts); fall through to report it.
+		} catch (error) {
+			// A published run settles through the live pipeline and is reported
+			// below. An unpublished failure (prompt rejected before acceptance,
+			// pre-prompt abort) never re-registered the id: restore the record
+			// and surface the real cause instead of an unknown-id follow error.
+			if (this.getRegistry().get(subagentId) === undefined) {
+				claim.rollback();
+				throw error;
+			}
 		} finally {
 			options.signal?.removeEventListener("abort", onAbort);
 			await handle.dispose().catch(() => undefined);
@@ -1157,7 +1175,7 @@ export class SubagentManager {
 					},
 					path: subagentContext.path,
 				});
-				this.getRegistry().setTask(id, message);
+				this.getRegistry().setTask(id, options.resumeTaskLabel ?? message);
 				this.registerActivity(id, runtime, definitionOptions?.definition, message);
 			};
 			handle = new LocalSubagentHandle({

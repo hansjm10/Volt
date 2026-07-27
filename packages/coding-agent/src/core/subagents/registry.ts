@@ -150,6 +150,11 @@ export class SubagentRegistry {
 	private nextSequence = 0;
 
 	register(options: { id: string; parentId?: string; agent: SubagentRegistryRecord["agent"]; path: string[] }): void {
+		if (this.entries.has(options.id)) {
+			// Re-registering a live id would corrupt the running list and orphan
+			// waiters; §5 resume upholds this by claiming the record first.
+			throw new Error(`Subagent run "${options.id}" is already registered`);
+		}
 		const entry: SubagentRegistryEntry = {
 			id: options.id,
 			sequence: this.nextSequence++,
