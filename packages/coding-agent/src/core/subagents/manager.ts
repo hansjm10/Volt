@@ -373,6 +373,22 @@ function collectSettledToolCallIds(sessionManager: SessionManager): Set<string> 
 	return settled;
 }
 
+/** ToolCall ids present anywhere in the transcript; an edge without one is stranded (design §3). */
+function collectToolCallIds(sessionManager: SessionManager): Set<string> {
+	const ids = new Set<string>();
+	for (const entry of sessionManager.getEntries()) {
+		if (entry.type !== "message" || entry.message.role !== "assistant") {
+			continue;
+		}
+		for (const block of entry.message.content) {
+			if (block.type === "toolCall") {
+				ids.add(block.id);
+			}
+		}
+	}
+	return ids;
+}
+
 interface HydratedChildState {
 	status: Exclude<SubagentRegistryStatus, "running">;
 	task?: string;
@@ -1334,6 +1350,7 @@ export class SubagentManager {
 		visitedFiles: Set<string>,
 	): Promise<void> {
 		const settledToolCallIds = collectSettledToolCallIds(sessionManager);
+		const presentToolCallIds = collectToolCallIds(sessionManager);
 		for (const edge of sessionManager.getSubagentSpawnEntries()) {
 			if (
 				typeof edge.subagentId !== "string" ||
@@ -1354,6 +1371,7 @@ export class SubagentManager {
 				...(parentRegistryId !== undefined ? { parentId: parentRegistryId } : {}),
 				agent: { name: edge.agent },
 				path,
+				...(presentToolCallIds.has(edge.toolCallId) ? {} : { stranded: true }),
 				startedAt,
 			};
 			if (typeof edge.childSessionFile !== "string" || visitedFiles.has(edge.childSessionFile)) {

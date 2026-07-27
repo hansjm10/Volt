@@ -27,6 +27,8 @@ export interface SubagentRegistryRecord {
 	hydrated?: true;
 	/** True once a hydrated run's result has been delivered through follow (issue #129 §4). */
 	claimed?: true;
+	/** True for a hydrated edge whose toolCall is absent from its transcript; never offered by the §4 notice. */
+	stranded?: true;
 	startedAt: number;
 	finishedAt?: number;
 	error?: string;
@@ -83,6 +85,7 @@ interface SubagentRegistryEntry {
 	status: SubagentRegistryStatus;
 	hydrated: boolean;
 	claimed: boolean;
+	stranded: boolean;
 	startedAt: number;
 	finishedAt: number | undefined;
 	error: string | undefined;
@@ -148,6 +151,7 @@ export class SubagentRegistry {
 			status: "running",
 			hydrated: false,
 			claimed: false,
+			stranded: false,
 			startedAt: Date.now(),
 			finishedAt: undefined,
 			error: undefined,
@@ -175,6 +179,8 @@ export class SubagentRegistry {
 		status: Exclude<SubagentRegistryStatus, "running">;
 		output?: string;
 		error?: string;
+		/** The edge's toolCall is absent from its transcript (design §3 stranded case). */
+		stranded?: boolean;
 		startedAt: number;
 		finishedAt: number;
 	}): void {
@@ -193,6 +199,7 @@ export class SubagentRegistry {
 			status: options.status,
 			hydrated: true,
 			claimed: false,
+			stranded: options.stranded === true,
 			startedAt: options.startedAt,
 			finishedAt: options.finishedAt,
 			error: options.error === undefined ? undefined : boundText(options.error, REGISTRY_ERROR_LIMIT_CHARS),
@@ -523,6 +530,7 @@ export class SubagentRegistry {
 			status: entry.status,
 			...(entry.hydrated ? { hydrated: true as const } : {}),
 			...(entry.claimed ? { claimed: true as const } : {}),
+			...(entry.stranded ? { stranded: true as const } : {}),
 			startedAt: entry.startedAt,
 			...(entry.finishedAt !== undefined ? { finishedAt: entry.finishedAt } : {}),
 			...(entry.error !== undefined ? { error: entry.error } : {}),

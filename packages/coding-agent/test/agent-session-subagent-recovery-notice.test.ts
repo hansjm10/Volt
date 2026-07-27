@@ -25,7 +25,10 @@ function record(overrides: Partial<SubagentRegistryRecord> & { id: string }): Su
 	};
 }
 
-function createStubManager(records: SubagentRegistryRecord[]): {
+function createStubManager(
+	records: SubagentRegistryRecord[],
+	options: { isSubagentRuntime?: boolean } = {},
+): {
 	manager: SubagentToolManager;
 	hydrateCalls: () => number;
 } {
@@ -37,6 +40,7 @@ function createStubManager(records: SubagentRegistryRecord[]): {
 		startByName: () => {
 			throw new Error("not used");
 		},
+		isSubagentRuntime: () => options.isSubagentRuntime === true,
 		ensureRegistryHydrated,
 		listDelegations: () => records,
 	};
@@ -56,9 +60,10 @@ function noticeEntries(harness: { sessionManager: { getEntries(): Array<{ type: 
 describe("subagent recovery notice", () => {
 	it("offers unclaimed completed recoveries once, before the first user message", async () => {
 		const { manager, hydrateCalls } = createStubManager([
-			record({ id: "sa_unclaimed", task: "inspect the incident" }),
+			record({ id: "sa_unclaimed", task: "inspect\nthe   incident" }),
 			record({ id: "sa_interrupted", status: "aborted", error: "Interrupted before completion" }),
 			record({ id: "sa_claimed", claimed: true }),
+			record({ id: "sa_stranded", stranded: true }),
 			record({ id: "sa_live", hydrated: undefined, status: "completed" }),
 		]);
 		const harness = createHarness({ responses: ["ok", "ok"], subagentToolManager: manager });
@@ -73,8 +78,16 @@ describe("subagent recovery notice", () => {
 			expect(text).toContain("inspect the incident");
 			expect(text).not.toContain("sa_interrupted");
 			expect(text).not.toContain("sa_claimed");
+			expect(text).not.toContain("sa_stranded");
 			expect(text).not.toContain("sa_live");
 			expect(text).toContain('{ "follow": "<id>" }');
+
+			// The feature's point: the model sees the notice in THIS turn's
+			// provider context, not after the next reload. Custom messages reach
+			// the provider transformed, so assert on the notice text.
+			const firstTurnContext = JSON.stringify(harness.faux.contexts[0]?.messages ?? []);
+			expect(firstTurnContext).toContain("Subagent recovery:");
+			expect(firstTurnContext).toContain("sa_unclaimed");
 
 			// The notice precedes the user message in entry order.
 			const entries = harness.sessionManager.getEntries();
@@ -118,6 +131,22 @@ describe("subagent recovery notice", () => {
 		try {
 			await harness.session.prompt("hello");
 			expect(noticeEntries(harness)).toHaveLength(0);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("never leaks a root-registry notice into a subagent child runtime", async () => {
+		// Children share the root registry, so recovered root work is visible
+		// through listDelegations — but a child transcript must stay clean.
+		const { manager, hydrateCalls } = createStubManager([record({ id: "sa_unclaimed" })], {
+			isSubagentRuntime: true,
+		});
+		const harness = createHarness({ responses: ["ok"], subagentToolManager: manager });
+		try {
+			await harness.session.prompt("do the delegated task");
+			expect(noticeEntries(harness)).toHaveLength(0);
+			expect(hydrateCalls()).toBe(0);
 		} finally {
 			harness.cleanup();
 		}

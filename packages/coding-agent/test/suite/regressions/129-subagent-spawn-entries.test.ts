@@ -1,7 +1,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage } from "@hansjm10/volt-ai";
+import { fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { describe, expect, it } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
@@ -437,6 +437,53 @@ describe("issue #129", () => {
 			expect(records).toMatchObject([
 				{ id: "sa_recoverable", status: "completed", hydrated: true, task: "recoverable work" },
 			]);
+		} finally {
+			await restarted.dispose();
+		}
+	});
+
+	it("marks edges without a matching toolCall in the transcript as stranded", async () => {
+		const parent = createPersistedParent();
+		const sessionDir = parent.getSessionDir();
+		const makeChild = (task: string, report: string): SessionManager => {
+			const child = SessionManager.create(tmpdir(), sessionDir);
+			child.appendMessage({ role: "user", content: task, timestamp: Date.now() });
+			child.appendMessage(fauxAssistantMessage(report));
+			return child;
+		};
+		const linkedChild = makeChild("linked work", "linked report");
+		const strandedChild = makeChild("stranded work", "stranded report");
+		await linkedChild.flush();
+		await strandedChild.flush();
+
+		parent.appendMessage(
+			fauxAssistantMessage([fauxToolCall("subagent", {}, { id: "call_linked" })], { stopReason: "toolUse" }),
+		);
+		parent.appendSubagentSpawn({
+			toolCallId: "call_linked",
+			subagentId: "sa_linked",
+			agent: "researcher",
+			childSessionId: linkedChild.getSessionId(),
+			childSessionFile: linkedChild.getSessionFile()!,
+			requestKey: "rk-1",
+		});
+		parent.appendSubagentSpawn({
+			toolCallId: "call_gone",
+			subagentId: "sa_stranded",
+			agent: "researcher",
+			childSessionId: strandedChild.getSessionId(),
+			childSessionFile: strandedChild.getSessionFile()!,
+			requestKey: "rk-2",
+		});
+		await parent.flush();
+
+		const restarted = createRestartedManager(parent);
+		try {
+			await restarted.ensureRegistryHydrated();
+			const byId = new Map(restarted.listDelegations().map((record) => [record.id, record]));
+			expect(byId.get("sa_linked")).toMatchObject({ status: "completed" });
+			expect(byId.get("sa_linked")?.stranded).toBeUndefined();
+			expect(byId.get("sa_stranded")).toMatchObject({ status: "completed", stranded: true });
 		} finally {
 			await restarted.dispose();
 		}

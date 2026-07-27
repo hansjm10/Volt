@@ -457,10 +457,6 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 export const SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE = "subagent_recovery";
 const SUBAGENT_RECOVERY_NOTICE_MAX_LISTED = 8;
 
-function truncateHead(text: string, limit: number): string {
-	return text.length <= limit ? text : `${text.slice(0, Math.max(1, limit - 1))}…`;
-}
-
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -1463,19 +1459,29 @@ export class AgentSession {
 	}
 
 	/**
-	 * One-shot per session lifetime (issue #129, design §4): after a reload,
-	 * surface completed-but-unclaimed subagent results recovered by registry
-	 * hydration as one compact context notice. Deduplication is durable — the
-	 * notice is itself a persisted custom message listing the offered run ids,
-	 * so a later restart never re-offers them even though in-memory claim
-	 * state does not survive.
+	 * One-shot per session lifetime (issue #129, design §4): the first model
+	 * turn after a reload surfaces completed-but-unclaimed subagent results
+	 * recovered by registry hydration as one compact context message, injected
+	 * into live agent state so the model sees it this turn. Deduplication is
+	 * durable — the notice is itself a persisted custom message listing the
+	 * offered run ids, so a later restart never re-offers them even though
+	 * in-memory claim state does not survive (a run claimed without ever being
+	 * offered can therefore be offered once after another restart — a benign
+	 * duplicate).
 	 */
 	private async _maybeAppendSubagentRecoveryNotice(): Promise<void> {
-		if (this._subagentRecoveryNoticeDone || this.isBusy) {
+		if (this._subagentRecoveryNoticeDone) {
 			return;
 		}
 		const manager = this._subagentToolManager;
-		if (!manager?.ensureRegistryHydrated || typeof manager.listDelegations !== "function") {
+		if (typeof manager?.ensureRegistryHydrated !== "function" || typeof manager.listDelegations !== "function") {
+			this._subagentRecoveryNoticeDone = true;
+			return;
+		}
+		// Child runtimes share the root registry: recovered root work must not
+		// leak a false notice (with root-only follow syntax) into a child's
+		// fresh transcript.
+		if (manager.isSubagentRuntime?.() === true) {
 			this._subagentRecoveryNoticeDone = true;
 			return;
 		}
@@ -1483,11 +1489,21 @@ export class AgentSession {
 		try {
 			await manager.ensureRegistryHydrated();
 		} catch {
+			// Deliberate forfeit for this process lifetime: a hydration failure
+			// would almost certainly repeat, and the durable state remains for
+			// the next load.
 			return;
 		}
-		const recovered = manager
-			.listDelegations()
-			.filter((record) => record.hydrated === true && record.status === "completed" && record.claimed !== true);
+		const recovered = manager.listDelegations().filter(
+			(record) =>
+				record.hydrated === true &&
+				record.status === "completed" &&
+				record.claimed !== true &&
+				// Stranded edges (no matching toolCall in this transcript, e.g.
+				// after a branch extraction) hydrate for list/follow but are
+				// never offered into a conversation that lacks the call.
+				record.stranded !== true,
+		);
 		if (recovered.length === 0) {
 			return;
 		}
@@ -1512,20 +1528,33 @@ export class AgentSession {
 		}
 		const shown = fresh.slice(0, SUBAGENT_RECOVERY_NOTICE_MAX_LISTED);
 		const lines = shown.map((record) => {
-			const task = record.task === undefined ? "" : `: ${truncateHead(record.task, 80)}`;
+			const preview = record.task?.replace(/\s+/g, " ").trim();
+			const task = preview ? `: ${preview.length <= 80 ? preview : `${preview.slice(0, 79)}…`}` : "";
 			return `- ${record.id} (${record.agent.name}${task})`;
 		});
 		const text = [
 			`Subagent recovery: ${fresh.length} subagent run${fresh.length === 1 ? "" : "s"} completed before this session reloaded, but the result${fresh.length === 1 ? "" : "s"} never reached this conversation:`,
 			...lines,
+			// Overflow ids are still recorded as offered below: the list hint is
+			// their only surfacing, a deliberate bound on notice size.
 			...(fresh.length > shown.length
 				? [`…and ${fresh.length - shown.length} more (inspect with { "list": true }).`]
 				: []),
 			`Retrieve a result with the subagent tool: { "follow": "<id>" }.`,
 		].join("\n");
-		this.sessionManager.appendCustomMessageEntry(SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE, text, true, {
-			subagentIds: fresh.map((record) => record.id),
-		});
+		// Injects into live agent state and emits message events (idle branch of
+		// _sendCustomMessage): the model must see the notice in THIS turn, not
+		// after the next reload.
+		await this._sendCustomMessage(
+			{
+				customType: SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE,
+				content: text,
+				display: true,
+				details: { subagentIds: fresh.map((record) => record.id) },
+			},
+			undefined,
+			true,
+		);
 	}
 
 	/**
@@ -2396,6 +2425,10 @@ export class AgentSession {
 		if (this._disposed || abortGeneration !== this._abortGeneration) {
 			return;
 		}
+		// Turn-start seam: every first model turn after a load passes through
+		// here (direct prompts, recovered-input replay, triggered custom
+		// messages), behind the admission and generation fences.
+		await this._maybeAppendSubagentRecoveryNotice();
 		this._proactiveCompactionStopped = false;
 		this._drainFollowUpsOnNextContinuation = false;
 		const conversationGenerationRevision = this._conversationGenerationRevision;
@@ -2611,7 +2644,6 @@ export class AgentSession {
 			options?.assertConversationGenerationCurrent,
 		);
 		assertConversationGenerationCurrent();
-		await this._maybeAppendSubagentRecoveryNotice();
 		this._assertRecoveredClientInputOrdering(options?.clientMessageId);
 		const admission: ClientInputAdmission =
 			options?.clientMessageId === undefined

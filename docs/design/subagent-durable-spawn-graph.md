@@ -9,7 +9,10 @@
 > per-tool-call — see the corrected bullet) and maps statuses onto the
 > existing union with a `hydrated` marker; §4's notice dedupe is durable via
 > the persisted notice itself (in-memory `claimed` flags need not survive
-> restarts). §5 pending. Prior art: Codex
+> restarts), the notice is injected into live agent state at the turn-start
+> seam (`_runAgentPrompt`) so the appending process's model sees it, child
+> runtimes are gated out (they share the root registry), and stranded edges
+> carry a `stranded` marker that excludes them from the notice. §5 pending. Prior art: Codex
 > CLI persists parent→child spawn edges in a SQLite `agent_graph_store` and
 > resumes whole descendant trees from rollout files on session resume
 > (`resume_agent_from_rollout`, lazy `ensure_v2_agent_loaded`); OpenCode makes
