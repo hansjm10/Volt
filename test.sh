@@ -22,6 +22,9 @@ fi
 # Skip local LLM tests (ollama, lmstudio)
 export VOLT_NO_LOCAL_LLM=1
 
+# Require native Iroh integration suites to run.
+export VOLT_TEST_REQUIRE_NATIVE_IROH=1
+
 # Unset API keys (see packages/ai/src/stream.ts getEnvApiKey)
 unset ANTHROPIC_API_KEY
 unset ANTHROPIC_OAUTH_TOKEN
