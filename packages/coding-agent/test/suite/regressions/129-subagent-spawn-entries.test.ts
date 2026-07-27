@@ -11,8 +11,13 @@ import {
 import type { ResourceLoader } from "../../../src/core/resource-loader.ts";
 import { SessionManager } from "../../../src/core/session-manager.ts";
 import { createSyntheticSourceInfo } from "../../../src/core/source-info.ts";
-import { type SubagentDefinition, SubagentManager } from "../../../src/core/subagents/index.ts";
-import { createSubagentTool } from "../../../src/core/tools/index.ts";
+import {
+	type SubagentDefinition,
+	SubagentDelegationScope,
+	SubagentManager,
+	SubagentRegistry,
+} from "../../../src/core/subagents/index.ts";
+import { createSubagentTool, type SubagentToolManager } from "../../../src/core/tools/index.ts";
 import { createTestResourceLoader } from "../../utilities.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
@@ -706,6 +711,94 @@ describe("issue #129", () => {
 		} finally {
 			await context.cleanup();
 		}
+	});
+
+	it("resume is refused when child delegation policy denies a fresh start", async () => {
+		const sessionDir = mkdtempSync(join(tmpdir(), "issue-129-policy-"));
+		const interrupted = SessionManager.create(tmpdir(), sessionDir);
+		interrupted.appendMessage({ role: "user", content: "deep work", timestamp: Date.now() });
+		interrupted.appendMessage(fauxAssistantMessage("partial"));
+		await interrupted.flush();
+
+		const registry = new SubagentRegistry();
+		registry.hydrate({
+			id: "sa_deep",
+			agent: { name: "researcher" },
+			path: ["researcher"],
+			status: "aborted",
+			error: "Interrupted before completion",
+			childSessionFile: interrupted.getSessionFile()!,
+			startedAt: 1,
+			finishedAt: 2,
+		});
+		// A depth-exhausted child runtime sharing the tree registry: resume must
+		// flow through the same policy reservation as a fresh start.
+		const manager = new SubagentManager({
+			createRuntime: async () => {
+				throw new Error("Policy denial must reject before runtime creation");
+			},
+			cwd: tmpdir(),
+			agentDir: tmpdir(),
+			resourceLoader: {
+				...createTestResourceLoader(),
+				getSubagents: () => ({ definitions: [createDefinition()], diagnostics: [] }),
+			},
+			requestTimeoutMs: 5_000,
+			subagentContext: {
+				depth: 1,
+				agentName: "researcher",
+				subagentId: "sa_parent",
+				path: ["researcher"],
+				delegationScope: new SubagentDelegationScope(),
+				registry,
+				maxSubagentDepth: 1,
+			},
+		});
+		const startSpy = vi.spyOn(manager, "startByName");
+		try {
+			await expect(manager.resumeDelegation("sa_deep", { allowedTools: ["read"] })).rejects.toThrow(
+				/maxSubagentDepth/,
+			);
+			// The caller's tool policy was threaded into the ordinary start path.
+			expect(startSpy).toHaveBeenCalledWith(
+				"researcher",
+				expect.objectContaining({ allowedTools: ["read"], resumeSubagentId: "sa_deep" }),
+			);
+			expect(registry.get("sa_deep")).toMatchObject({ status: "aborted", hydrated: true });
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	it("resume threads the caller tool policy from the tool into the manager", async () => {
+		let received: { allowedTools?: string[] } | undefined;
+		const stub: SubagentToolManager = {
+			getDefinition: () => {
+				throw new Error("not used");
+			},
+			startByName: () => {
+				throw new Error("not used");
+			},
+			ensureRegistryHydrated: async () => {},
+			listDelegations: () => [],
+			followDelegation: async () => {
+				throw new Error("not used");
+			},
+			resumeDelegation: async (subagentId, options) => {
+				received = options ?? {};
+				return {
+					id: subagentId,
+					agent: { name: "researcher" },
+					status: "completed",
+					output: "ok",
+					startedAt: 1,
+					finishedAt: 2,
+				};
+			},
+		};
+		const tool = createSubagentTool(tmpdir(), { manager: stub, getAllowedTools: () => ["read", "bash"] });
+		await tool.execute("call_thread", { resume: "sa_x" });
+		expect(received).toMatchObject({ allowedTools: ["read", "bash"] });
 	});
 
 	it("resume start failure restores the interrupted record", async () => {

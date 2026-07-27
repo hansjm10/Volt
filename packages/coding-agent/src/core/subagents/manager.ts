@@ -1428,7 +1428,13 @@ export class SubagentManager {
 			[],
 			undefined,
 			new Set([this.parentSessionManager.getSessionFile() ?? ""]),
-		);
+		).catch((error) => {
+			// Per-edge failures are contained inside the walk; an unexpected
+			// rejection here must not brick every later registry read on a
+			// memoized failure — drop the memo so the next read retries.
+			this.hydrationPromise = undefined;
+			throw error;
+		});
 		return this.hydrationPromise;
 	}
 
@@ -1457,7 +1463,7 @@ export class SubagentManager {
 			const settled = settledToolCallIds.has(edge.toolCallId) || registry.get(edge.subagentId) !== undefined;
 			const path = [...ancestorPath, edge.agent];
 			const parsedStart = Date.parse(edge.timestamp);
-			const startedAt = Number.isNaN(parsedStart) ? 0 : parsedStart;
+			const startedAt = Number.isNaN(parsedStart) ? Date.now() : parsedStart;
 			const base = {
 				id: edge.subagentId,
 				...(parentRegistryId !== undefined ? { parentId: parentRegistryId } : {}),

@@ -185,12 +185,15 @@ field-level validation, and session rewrites can strand them:
 
 - an edge missing required fields (hand-edited or corrupted files) is skipped;
 - an edge whose `toolCallId` has no matching toolCall in the transcript
-  (possible after branch extraction or a session clear replaces the entry set
-  while a child is still publishing) hydrates as a plain registry record but
-  never produces a §4 recovery notice; "in the transcript" is file-scoped by
-  design — a toolCall on an abandoned branch still counts, because the notice
-  text is self-contained and cross-branch result reuse is the registry's
-  purpose;
+  hydrates as a plain registry record but never produces a §4 recovery
+  notice; "in the transcript" is file-scoped by design — a toolCall on an
+  abandoned branch still counts, because the notice text is self-contained
+  and cross-branch result reuse is the registry's purpose. Stranded edges
+  arise only from the concurrent-publish window (a child publishing while a
+  session clear replaces the entry set): branch extraction and forks rebuild
+  from public entries, so spawn edges do not copy into the new file at all —
+  pre-existing children are recoverable only through the original file, which
+  the new header's `parentSession` names;
 - an edge whose `childSessionFile` is missing or unreadable records status
   `unrecoverable` rather than failing hydration.
 
@@ -227,8 +230,9 @@ work.
 
 Integrated-runtimes' TTL reaping of detached children becomes safe rather than
 lossy: a reaped child's report remains recoverable via hydration. After a
-daemon restart, child conversation entries are not eagerly re-registered;
-attaching to a parent hydrates its registry, and `resume` re-creates child
+daemon restart, child conversation entries are not eagerly re-registered; the
+first model-facing registry read after attach (a tool's registry operation or
+the first-prompt notice) hydrates the registry, and `resume` re-creates child
 runtimes (and their attachable entries) on demand.
 
 ## Testing
@@ -243,8 +247,7 @@ faux provider harness:
   `subagent_spawn` entries alone.
 - Spawn-entry commit point: a rejected first prompt (ghost spawn, #56 suite)
   produces no entry.
-- Hydration of grandchildren via recursive spawn entries; scope usage
-  rehydrated and enforced.
+- Hydration of grandchildren via recursive spawn entries.
 - `resume` on an interrupted child completes the task in the reloaded runtime;
   `resume` refused when depth/policy would deny a fresh start.
 - Projection: `subagent_spawn` entries and `completed-unclaimed` records pass

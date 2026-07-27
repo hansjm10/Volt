@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-internal(subagents): Parent transcripts durably record subagent spawn edges, and reopened sessions hydrate unclaimed pre-restart child results into the delegation registry for list and follow. ([#129](https://github.com/volt-hq/Volt/issues/129))
+improvement(subagents): Reopened sessions recover pre-restart subagent runs from durable spawn records: results that never reached the conversation become listable and followable again. ([#129](https://github.com/volt-hq/Volt/issues/129))
