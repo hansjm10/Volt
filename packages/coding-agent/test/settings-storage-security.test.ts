@@ -26,7 +26,7 @@ describe("file settings storage security", () => {
 		const { agentDir, storage } = createStorage();
 		const settingsPath = join(agentDir, "settings.json");
 		storage.withLock("global", () => '{"theme":"one"}');
-		const firstInode = statSync(settingsPath).ino;
+		const firstInode = statSync(settingsPath, { bigint: true }).ino;
 
 		storage.withLock("global", (current) => {
 			expect(current).toBe('{"theme":"one"}');
@@ -34,7 +34,7 @@ describe("file settings storage security", () => {
 		});
 
 		expect(readFileSync(settingsPath, "utf8")).toBe('{"theme":"two"}');
-		expect(statSync(settingsPath).ino).not.toBe(firstInode);
+		expect(statSync(settingsPath, { bigint: true }).ino).not.toBe(firstInode);
 	});
 
 	test("uses private and shareable POSIX modes", (context) => {
