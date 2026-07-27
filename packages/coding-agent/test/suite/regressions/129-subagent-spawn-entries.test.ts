@@ -489,6 +489,66 @@ describe("issue #129", () => {
 		}
 	});
 
+	it("recovers an unsettled grandchild beneath a settled child edge", async () => {
+		const parent = createPersistedParent();
+		const sessionDir = parent.getSessionDir();
+
+		const grandchild = SessionManager.create(tmpdir(), sessionDir);
+		grandchild.appendMessage({ role: "user", content: "orphaned leaf work", timestamp: Date.now() });
+		grandchild.appendMessage(fauxAssistantMessage("orphaned leaf report"));
+		await grandchild.flush();
+
+		// The child settled in the parent (its failure was captured as a task
+		// error), but its own toolCall to the grandchild never settled.
+		const child = SessionManager.create(tmpdir(), sessionDir);
+		child.appendMessage({ role: "user", content: "branch task", timestamp: Date.now() });
+		child.appendMessage(
+			fauxAssistantMessage([fauxToolCall("subagent", {}, { id: "call_leaf" })], { stopReason: "toolUse" }),
+		);
+		child.appendSubagentSpawn({
+			toolCallId: "call_leaf",
+			subagentId: "sa_orphaned_leaf",
+			agent: "general",
+			childSessionId: grandchild.getSessionId(),
+			childSessionFile: grandchild.getSessionFile()!,
+			requestKey: "rk-leaf",
+		});
+		await child.flush();
+
+		parent.appendSubagentSpawn({
+			toolCallId: "call_settled_branch",
+			subagentId: "sa_settled_branch",
+			agent: "researcher",
+			childSessionId: child.getSessionId(),
+			childSessionFile: child.getSessionFile()!,
+			requestKey: "rk-branch",
+		});
+		parent.appendMessage({
+			role: "toolResult",
+			toolCallId: "call_settled_branch",
+			toolName: "subagent",
+			content: [{ type: "text", text: "branch failed: budget exhausted" }],
+			isError: true,
+			timestamp: Date.now(),
+		});
+		await parent.flush();
+
+		const restarted = createRestartedManager(parent);
+		try {
+			await restarted.ensureRegistryHydrated();
+			const byId = new Map(restarted.listDelegations().map((record) => [record.id, record]));
+			expect(byId.has("sa_settled_branch")).toBe(false);
+			expect(byId.get("sa_orphaned_leaf")).toMatchObject({
+				status: "completed",
+				parentId: "sa_settled_branch",
+				path: ["researcher", "general"],
+				task: "orphaned leaf work",
+			});
+		} finally {
+			await restarted.dispose();
+		}
+	});
+
 	it("hydrates grandchildren recursively from child transcript edges", async () => {
 		const parent = createPersistedParent();
 		const sessionDir = parent.getSessionDir();

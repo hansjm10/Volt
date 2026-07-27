@@ -331,6 +331,8 @@ export interface HarnessOptions {
 	baseToolsOverride?: Record<string, AgentTool>;
 	/** Subagent tool manager for the session (stub or real). */
 	subagentToolManager?: SubagentToolManager;
+	/** Session manager override (e.g. a reopened persisted session). Default: in-memory. */
+	sessionManager?: SessionManager;
 	/** Optional resource loader override. */
 	resourceLoader?: ResourceLoader;
 	/** Inline extensions to load into the session resource loader. */
@@ -384,7 +386,7 @@ function createHarnessWithResourceLoader(
 		streamFn,
 	});
 
-	const sessionManager = SessionManager.inMemory();
+	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
 
 	if (options.settings) {

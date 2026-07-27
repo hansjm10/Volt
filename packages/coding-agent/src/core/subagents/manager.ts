@@ -399,9 +399,17 @@ interface HydratedChildState {
 
 /** Terminal state of a child run derived from its persisted transcript alone. */
 function deriveHydratedChildState(child: SessionManager, fallbackTime: number): HydratedChildState {
+	// The task comes from the raw entry stream, not the built context: a child
+	// that auto-compacted mid-run replaces its early messages with a summary,
+	// and the summary must not masquerade as the original task.
+	let task: string | undefined;
+	for (const entry of child.getEntries()) {
+		if (entry.type === "message" && entry.message.role === "user") {
+			task = messageText(entry.message.content) || undefined;
+			break;
+		}
+	}
 	const messages = child.buildSessionContext().messages;
-	const firstUser = messages.find((message) => message.role === "user");
-	const task = firstUser ? messageText(firstUser.content) || undefined : undefined;
 	const last = messages.at(-1);
 	const finishedAt = typeof last?.timestamp === "number" ? last.timestamp : fallbackTime;
 	if (last?.role === "assistant") {
@@ -415,10 +423,11 @@ function deriveHydratedChildState(child: SessionManager, fallbackTime: number): 
 			};
 		}
 		if (assistant.stopReason === "stop" || assistant.stopReason === "length") {
+			const output = messageText(assistant.content);
 			return {
 				status: "completed",
 				...(task !== undefined ? { task } : {}),
-				output: messageText(assistant.content),
+				...(output ? { output } : {}),
 				finishedAt,
 			};
 		}
@@ -1360,9 +1369,11 @@ export class SubagentManager {
 			) {
 				continue;
 			}
-			if (settledToolCallIds.has(edge.toolCallId) || registry.get(edge.subagentId)) {
-				continue;
-			}
+			// A settled edge needs no record, but its transcript can hold
+			// unsettled descendant edges (e.g. a grandchild that completed while
+			// its parent's failure was captured as a task error), so the walk
+			// still descends into every child transcript.
+			const settled = settledToolCallIds.has(edge.toolCallId) || registry.get(edge.subagentId) !== undefined;
 			const path = [...ancestorPath, edge.agent];
 			const parsedStart = Date.parse(edge.timestamp);
 			const startedAt = Number.isNaN(parsedStart) ? 0 : parsedStart;
@@ -1374,13 +1385,26 @@ export class SubagentManager {
 				...(presentToolCallIds.has(edge.toolCallId) ? {} : { stranded: true }),
 				startedAt,
 			};
-			if (typeof edge.childSessionFile !== "string" || visitedFiles.has(edge.childSessionFile)) {
-				registry.hydrate({
-					...base,
-					status: "failed",
-					error: "Child session was not persisted; its result is unrecoverable.",
-					finishedAt: startedAt,
-				});
+			if (typeof edge.childSessionFile !== "string") {
+				if (!settled) {
+					registry.hydrate({
+						...base,
+						status: "failed",
+						error: "Child session was not persisted; its result is unrecoverable.",
+						finishedAt: startedAt,
+					});
+				}
+				continue;
+			}
+			if (visitedFiles.has(edge.childSessionFile)) {
+				if (!settled) {
+					registry.hydrate({
+						...base,
+						status: "failed",
+						error: "Child transcript is already attributed to another edge; its result is unrecoverable.",
+						finishedAt: startedAt,
+					});
+				}
 				continue;
 			}
 			visitedFiles.add(edge.childSessionFile);
@@ -1396,23 +1420,27 @@ export class SubagentManager {
 				}
 				child = SessionManager.open(edge.childSessionFile);
 			} catch {
-				registry.hydrate({
-					...base,
-					status: "failed",
-					error: "Child transcript is missing or unreadable; its result is unrecoverable.",
-					finishedAt: startedAt,
-				});
+				if (!settled) {
+					registry.hydrate({
+						...base,
+						status: "failed",
+						error: "Child transcript is missing or unreadable; its result is unrecoverable.",
+						finishedAt: startedAt,
+					});
+				}
 				continue;
 			}
-			const state = deriveHydratedChildState(child, startedAt);
-			registry.hydrate({
-				...base,
-				status: state.status,
-				...(state.task !== undefined ? { task: state.task } : {}),
-				...(state.output !== undefined ? { output: state.output } : {}),
-				...(state.error !== undefined ? { error: state.error } : {}),
-				finishedAt: state.finishedAt,
-			});
+			if (!settled) {
+				const state = deriveHydratedChildState(child, startedAt);
+				registry.hydrate({
+					...base,
+					status: state.status,
+					...(state.task !== undefined ? { task: state.task } : {}),
+					...(state.output !== undefined ? { output: state.output } : {}),
+					...(state.error !== undefined ? { error: state.error } : {}),
+					finishedAt: state.finishedAt,
+				});
+			}
 			await this.hydrateSpawnEdges(registry, child, path, edge.subagentId, visitedFiles);
 		}
 	}

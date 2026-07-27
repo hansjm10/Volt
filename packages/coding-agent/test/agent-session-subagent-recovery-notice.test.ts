@@ -5,12 +5,19 @@
  * transcript.
  */
 
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { describe, expect, it, vi } from "vitest";
 import { SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE } from "../src/core/agent-session.ts";
-import type { CustomMessageEntry } from "../src/core/session-manager.ts";
-import type { SubagentRegistryRecord } from "../src/core/subagents/index.ts";
+import type { ResourceLoader } from "../src/core/resource-loader.ts";
+import { type CustomMessageEntry, SessionManager } from "../src/core/session-manager.ts";
+import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
+import { type SubagentDefinition, SubagentManager, type SubagentRegistryRecord } from "../src/core/subagents/index.ts";
 import type { SubagentToolManager } from "../src/core/tools/index.ts";
 import { createHarness } from "./test-harness.ts";
+import { createTestResourceLoader } from "./utilities.ts";
 
 function record(overrides: Partial<SubagentRegistryRecord> & { id: string }): SubagentRegistryRecord {
 	return {
@@ -144,6 +151,98 @@ describe("subagent recovery notice", () => {
 			expect(noticeEntries(harness)).toHaveLength(0);
 		} finally {
 			harness.cleanup();
+		}
+	});
+
+	it("skips without persisting when the subagent tool is not active", async () => {
+		const { manager } = createStubManager([record({ id: "sa_unclaimed" })]);
+		// baseToolsOverride replaces the toolset, so "subagent" is not active
+		// even though the manager is wired.
+		const harness = createHarness({ responses: ["ok"], subagentToolManager: manager, baseToolsOverride: {} });
+		try {
+			await harness.session.prompt("hello");
+			expect(noticeEntries(harness)).toHaveLength(0);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("end to end: reopened transcript hydrates, offers, and follow returns the report", async () => {
+		const sessionDir = mkdtempSync(join(tmpdir(), "issue-129-e2e-"));
+		const parent = SessionManager.create(tmpdir(), sessionDir);
+		parent.appendMessage(
+			fauxAssistantMessage([fauxToolCall("subagent", {}, { id: "call_e2e" })], { stopReason: "toolUse" }),
+		);
+		const child = SessionManager.create(tmpdir(), sessionDir);
+		child.appendMessage({ role: "user", content: "audit the daemon", timestamp: Date.now() });
+		child.appendMessage(fauxAssistantMessage("daemon audit report"));
+		await child.flush();
+		parent.appendSubagentSpawn({
+			toolCallId: "call_e2e",
+			subagentId: "sa_e2e",
+			agent: "researcher",
+			childSessionId: child.getSessionId(),
+			childSessionFile: child.getSessionFile()!,
+			requestKey: "rk-e2e",
+		});
+		// The incident shape: dispose synthesized an abort marker, which is not
+		// settlement.
+		parent.appendMessage({
+			role: "toolResult",
+			toolCallId: "call_e2e",
+			toolName: "subagent",
+			content: [{ type: "text", text: "Operation aborted: the session closed before this tool call completed." }],
+			isError: true,
+			timestamp: Date.now(),
+		});
+		await parent.flush();
+
+		const definition: SubagentDefinition = {
+			name: "researcher",
+			description: "Research the task",
+			systemPrompt: "Research the task.",
+			source: "user",
+			sourceInfo: createSyntheticSourceInfo(join(tmpdir(), "issue-129-e2e.md"), {
+				source: "local",
+				scope: "user",
+			}),
+			filePath: join(tmpdir(), "issue-129-e2e.md"),
+		};
+		const resourceLoader: ResourceLoader = {
+			...createTestResourceLoader(),
+			getSubagents: () => ({ definitions: [definition], diagnostics: [] }),
+		};
+		const reopened = SessionManager.open(parent.getSessionFile()!);
+		const manager = new SubagentManager({
+			createRuntime: async () => {
+				throw new Error("Hydration must not create runtimes");
+			},
+			cwd: tmpdir(),
+			agentDir: tmpdir(),
+			resourceLoader,
+			requestTimeoutMs: 5_000,
+			parentSessionManager: reopened,
+		});
+		const harness = createHarness({
+			responses: ["ok"],
+			sessionManager: reopened,
+			subagentToolManager: manager,
+		});
+		try {
+			await harness.session.prompt("continue where we left off");
+
+			const notices = noticeEntries(harness);
+			expect(notices).toHaveLength(1);
+			const text = notices[0].content as string;
+			expect(text).toContain("sa_e2e");
+			expect(text).toContain("audit the daemon");
+
+			const followed = await manager.followDelegation("sa_e2e");
+			expect(followed.status).toBe("completed");
+			expect(followed.output).toBe("daemon audit report");
+		} finally {
+			harness.cleanup();
+			await manager.dispose();
 		}
 	});
 

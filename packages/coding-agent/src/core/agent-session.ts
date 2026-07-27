@@ -456,6 +456,7 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 /** Custom-message type of the persisted §4 subagent recovery notice (issue #129). */
 export const SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE = "subagent_recovery";
 const SUBAGENT_RECOVERY_NOTICE_MAX_LISTED = 8;
+const SUBAGENT_RECOVERY_NOTICE_TASK_PREVIEW_CHARS = 80;
 
 export class AgentSession {
 	readonly agent: Agent;
@@ -1467,7 +1468,10 @@ export class AgentSession {
 	 * offered run ids, so a later restart never re-offers them even though
 	 * in-memory claim state does not survive (a run claimed without ever being
 	 * offered can therefore be offered once after another restart — a benign
-	 * duplicate).
+	 * duplicate). The reverse skew also exists: a persisted notice whose turn
+	 * was fence-canceled, or that the user immediately branched away from,
+	 * records its ids as offered without the model acting on them — those runs
+	 * stay visible through registry list and the spawn-confirmation preflight.
 	 */
 	private async _maybeAppendSubagentRecoveryNotice(): Promise<void> {
 		if (this._subagentRecoveryNoticeDone) {
@@ -1482,6 +1486,14 @@ export class AgentSession {
 		// leak a false notice (with root-only follow syntax) into a child's
 		// fresh transcript.
 		if (manager.isSubagentRuntime?.() === true) {
+			this._subagentRecoveryNoticeDone = true;
+			return;
+		}
+		// The offer is only actionable while the subagent tool is active; with
+		// it excluded (tool policy, no definitions) nothing is persisted, so
+		// the burned flag self-heals on the next load when the tool may be
+		// back.
+		if (!this.getActiveToolNames().includes("subagent")) {
 			this._subagentRecoveryNoticeDone = true;
 			return;
 		}
@@ -1526,11 +1538,16 @@ export class AgentSession {
 		if (fresh.length === 0) {
 			return;
 		}
+		// Registry eviction (500 terminal records) can drop the oldest hydrated
+		// runs before this reads them — pathological volume, accepted.
 		const shown = fresh.slice(0, SUBAGENT_RECOVERY_NOTICE_MAX_LISTED);
 		const lines = shown.map((record) => {
 			const preview = record.task?.replace(/\s+/g, " ").trim();
-			const task = preview ? `: ${preview.length <= 80 ? preview : `${preview.slice(0, 79)}…`}` : "";
-			return `- ${record.id} (${record.agent.name}${task})`;
+			const bounded =
+				preview && preview.length > SUBAGENT_RECOVERY_NOTICE_TASK_PREVIEW_CHARS
+					? `${preview.slice(0, SUBAGENT_RECOVERY_NOTICE_TASK_PREVIEW_CHARS - 1)}…`
+					: preview;
+			return `- ${record.id} (${record.agent.name}${bounded ? `: ${bounded}` : ""})`;
 		});
 		const text = [
 			`Subagent recovery: ${fresh.length} subagent run${fresh.length === 1 ? "" : "s"} completed before this session reloaded, but the result${fresh.length === 1 ? "" : "s"} never reached this conversation:`,
@@ -1542,10 +1559,11 @@ export class AgentSession {
 				: []),
 			`Retrieve a result with the subagent tool: { "follow": "<id>" }.`,
 		].join("\n");
-		// A dispose during the hydration awaits fail-stops persistence, and a
-		// turn that started would steer instead of preceding the user message;
-		// skipping is safe both ways — the burned flag self-heals on next load.
-		if (this._disposed || this.isStreaming) {
+		// A dispose during the hydration awaits fail-stops persistence, a turn
+		// that started would steer instead of preceding the user message, and a
+		// session mutation barrier would make the append throw; skipping is safe
+		// in every case — the burned flag self-heals on next load.
+		if (this._disposed || this.isStreaming || this._hasSessionOperationBarrier) {
 			return;
 		}
 		// Injects into live agent state and emits message events (idle branch):
