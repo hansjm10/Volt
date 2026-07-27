@@ -27,12 +27,12 @@ describe("project trust store security", () => {
 		const store = new ProjectTrustStore(agentDir);
 		store.set(workspace, true);
 		const trustPath = join(agentDir, "trust.json");
-		const firstInode = statSync(trustPath).ino;
+		const firstInode = statSync(trustPath, { bigint: true }).ino;
 
 		store.set(workspace, false);
 
 		expect(store.get(workspace)).toBe(false);
-		expect(statSync(trustPath).ino).not.toBe(firstInode);
+		expect(statSync(trustPath, { bigint: true }).ino).not.toBe(firstInode);
 	});
 
 	test("uses owner-only POSIX modes", (context) => {
