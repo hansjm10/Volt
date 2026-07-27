@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import type { AgentMessage, ThinkingLevel } from "@hansjm10/volt-agent-core";
+import type { AssistantMessage, Message, TextContent } from "@hansjm10/volt-ai";
 import { createInProcessRpcClient, type InProcessRpcClient } from "../../modes/rpc/in-process-rpc-client.ts";
 import type { RpcClientEvent } from "../../modes/rpc/rpc-client-base.ts";
 import type { SessionStats } from "../agent-session.ts";
@@ -26,6 +28,7 @@ import {
 	SubagentRegistry,
 	type SubagentRegistryRecord,
 	type SubagentRegistrySnapshot,
+	type SubagentRegistryStatus,
 	type SubagentSpawnConfirmationLease,
 	type SubagentSpawnConfirmationPreflight,
 } from "./registry.ts";
@@ -139,6 +142,29 @@ export interface SubagentStartOptions {
 	requestTimeoutMs?: number;
 	/** Shared root budget for all descendants created by one delegation tool call. */
 	delegationScope?: SubagentDelegationScope;
+	/**
+	 * Attribution for the durable spawn edge recorded in the parent transcript at
+	 * the publish commit point (issue #129). Omitted for programmatic starts,
+	 * which record no edge and are invisible to registry hydration.
+	 */
+	spawnRecord?: SubagentSpawnRecordContext;
+	/**
+	 * §5 resume: reuse this id instead of minting a fresh one, so the resumed
+	 * run re-occupies its claimed registry record. Set only by resumeDelegation.
+	 */
+	resumeSubagentId?: string;
+	/**
+	 * §5 resume: the interrupted run's original task, restored on the
+	 * re-registered record instead of the continuation prompt.
+	 */
+	resumeTaskLabel?: string;
+}
+
+/** Tool-call attribution for one durable spawn edge. */
+export interface SubagentSpawnRecordContext {
+	toolCallId: string;
+	/** createSubagentSpawnRequestKey hash of the originating spawn request. */
+	requestKey: string;
 }
 
 export interface SubagentStartByNameOptions extends SubagentStartOptions {
@@ -323,6 +349,109 @@ function resolveEffectiveTools(options: {
 
 	const excluded = new Set(normalizedExcluded);
 	return effectiveTools.filter((toolName) => !excluded.has(toolName));
+}
+
+const RESUME_ID_PREVIEW_CHARS = 120;
+const SUBAGENT_RESUME_PROMPT =
+	"You were interrupted before completing your task. Review the conversation so far, finish the original task, and reply with your complete final report.";
+
+function messageText(content: Message["content"]): string {
+	if (typeof content === "string") {
+		return content;
+	}
+	return content
+		.filter((part): part is TextContent => part.type === "text" && typeof part.text === "string")
+		.map((part) => part.text)
+		.join("\n")
+		.trim();
+}
+
+/**
+ * ToolCall ids of this transcript's settled subagent results. A synthesized
+ * abort marker (agent-loop abort or dispose-time persistence, both prefixed
+ * "Operation aborted") is not settlement: its children remain recoverable
+ * (design §§2, 4 of docs/design/subagent-durable-spawn-graph.md).
+ */
+function collectSettledToolCallIds(sessionManager: SessionManager): Set<string> {
+	const settled = new Set<string>();
+	for (const entry of sessionManager.getEntries()) {
+		if (entry.type !== "message" || entry.message.role !== "toolResult") {
+			continue;
+		}
+		const message = entry.message;
+		if (message.isError && messageText(message.content).startsWith("Operation aborted")) {
+			continue;
+		}
+		settled.add(message.toolCallId);
+	}
+	return settled;
+}
+
+/** ToolCall ids present anywhere in the transcript; an edge without one is stranded (design §3). */
+function collectToolCallIds(sessionManager: SessionManager): Set<string> {
+	const ids = new Set<string>();
+	for (const entry of sessionManager.getEntries()) {
+		if (entry.type !== "message" || entry.message.role !== "assistant") {
+			continue;
+		}
+		for (const block of entry.message.content) {
+			if (block.type === "toolCall") {
+				ids.add(block.id);
+			}
+		}
+	}
+	return ids;
+}
+
+interface HydratedChildState {
+	status: Exclude<SubagentRegistryStatus, "running">;
+	task?: string;
+	output?: string;
+	error?: string;
+	finishedAt: number;
+}
+
+/** Terminal state of a child run derived from its persisted transcript alone. */
+function deriveHydratedChildState(child: SessionManager, fallbackTime: number): HydratedChildState {
+	// The task comes from the raw entry stream, not the built context: a child
+	// that auto-compacted mid-run replaces its early messages with a summary,
+	// and the summary must not masquerade as the original task.
+	let task: string | undefined;
+	for (const entry of child.getEntries()) {
+		if (entry.type === "message" && entry.message.role === "user") {
+			task = messageText(entry.message.content) || undefined;
+			break;
+		}
+	}
+	const messages = child.buildSessionContext().messages;
+	const last = messages.at(-1);
+	const finishedAt = typeof last?.timestamp === "number" ? last.timestamp : fallbackTime;
+	if (last?.role === "assistant") {
+		const assistant = last as AssistantMessage;
+		if (assistant.stopReason === "error") {
+			return {
+				status: "failed",
+				...(task !== undefined ? { task } : {}),
+				error: assistant.errorMessage || "The run failed before producing a result.",
+				finishedAt,
+			};
+		}
+		if (assistant.stopReason === "stop" || assistant.stopReason === "length") {
+			const output = messageText(assistant.content);
+			return {
+				status: "completed",
+				...(task !== undefined ? { task } : {}),
+				...(output ? { output } : {}),
+				finishedAt,
+			};
+		}
+	}
+	return {
+		status: "aborted",
+		...(task !== undefined ? { task } : {}),
+		error: "Interrupted before completion: the runtime closed mid-turn.",
+		finishedAt,
+	};
 }
 
 class LocalSubagentHandle implements SubagentHandle {
@@ -568,6 +697,7 @@ export class SubagentManager {
 	private readonly agentDir: string;
 	private readonly resourceLoader?: ResourceLoader;
 	private readonly parentSessionManager?: SessionManager;
+	private hydrationPromise: Promise<void> | undefined;
 	private readonly allowedTools?: string[];
 	private readonly subagentContext?: SubagentRuntimeContext;
 	private readonly delegationLimits?: SubagentDelegationScopeLimits;
@@ -645,6 +775,73 @@ export class SubagentManager {
 	/** Result of an existing run in the tree, waiting for completion when still running. */
 	followDelegation(subagentId: string, options: { signal?: AbortSignal } = {}): Promise<SubagentFollowResult> {
 		return this.getRegistry().follow(this.subagentContext?.subagentId, subagentId, options.signal);
+	}
+
+	/**
+	 * §5 resume: reload an interrupted recovered run from its child transcript
+	 * and prompt it to finish its original task. The run re-registers under
+	 * its original id through the live pipeline, so settlement, list, and
+	 * follow behave as for any run started by this process. Depth, policy,
+	 * and delegation-scope checks apply as for a new start; a start failure
+	 * restores the interrupted record.
+	 */
+	async resumeDelegation(
+		subagentId: string,
+		options: { signal?: AbortSignal; allowedTools?: string[] } = {},
+	): Promise<SubagentFollowResult> {
+		await this.ensureRegistryHydrated();
+		const claim = this.getRegistry().claimResume(subagentId);
+		if (!claim) {
+			const preview =
+				subagentId.length <= RESUME_ID_PREVIEW_CHARS
+					? subagentId
+					: `${subagentId.slice(0, RESUME_ID_PREVIEW_CHARS - 1)}…`;
+			throw new Error(
+				`Subagent run "${preview}" is not a resumable interrupted recovery. Use { follow: "<id>" } for completed runs or { list: true } to inspect the registry.`,
+			);
+		}
+		let handle: SubagentHandle;
+		try {
+			if (!existsSync(claim.childSessionFile)) {
+				throw new Error("The interrupted run's transcript no longer exists; it cannot be resumed.");
+			}
+			handle = await this.startByName(claim.agentName, {
+				sessionManager: SessionManager.open(claim.childSessionFile),
+				resumeSubagentId: subagentId,
+				...(claim.task !== undefined ? { resumeTaskLabel: claim.task } : {}),
+				...(options.allowedTools ? { allowedTools: options.allowedTools } : {}),
+			});
+		} catch (error) {
+			claim.rollback();
+			throw error;
+		}
+		const onAbort = () => {
+			void handle.abort().catch(() => undefined);
+		};
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			// An abort that landed while the runtime was being prepared no-ops
+			// against the idle session; honor it before spending a turn.
+			if (options.signal?.aborted) {
+				throw new Error("Operation aborted");
+			}
+			const completion = handle.waitForEnd();
+			await handle.prompt(SUBAGENT_RESUME_PROMPT);
+			await completion;
+		} catch (error) {
+			// A published run settles through the live pipeline and is reported
+			// below. An unpublished failure (prompt rejected before acceptance,
+			// pre-prompt abort) never re-registered the id: restore the record
+			// and surface the real cause instead of an unknown-id follow error.
+			if (this.getRegistry().get(subagentId) === undefined) {
+				claim.rollback();
+				throw error;
+			}
+		} finally {
+			options.signal?.removeEventListener("abort", onAbort);
+			await handle.dispose().catch(() => undefined);
+		}
+		return this.followDelegation(subagentId, options);
 	}
 
 	private getRegistry(): SubagentRegistry {
@@ -904,7 +1101,7 @@ export class SubagentManager {
 		const cwd = options.cwd ?? this.cwd;
 		const agentDir = options.agentDir ?? this.agentDir;
 		const sessionManager = options.sessionManager ?? this.createDefaultChildSessionManager(cwd);
-		const id = `sa_${randomUUID()}`;
+		const id = options.resumeSubagentId ?? `sa_${randomUUID()}`;
 		if (!delegation) {
 			throw new Error("Subagent delegation scope is required");
 		}
@@ -968,6 +1165,7 @@ export class SubagentManager {
 				runtimeRegistration?.commit();
 				runtimeRegistration = undefined;
 				published = true;
+				this.recordSpawnEdge(options.spawnRecord, id, definitionOptions?.definition, runtime);
 				this.getRegistry().register({
 					id,
 					...(this.subagentContext ? { parentId: this.subagentContext.subagentId } : {}),
@@ -977,7 +1175,7 @@ export class SubagentManager {
 					},
 					path: subagentContext.path,
 				});
-				this.getRegistry().setTask(id, message);
+				this.getRegistry().setTask(id, options.resumeTaskLabel ?? message);
 				this.registerActivity(id, runtime, definitionOptions?.definition, message);
 			};
 			handle = new LocalSubagentHandle({
@@ -1182,6 +1380,157 @@ export class SubagentManager {
 			origin: "subagent",
 			...(parentSession ? { parentSession } : {}),
 		});
+	}
+
+	private recordSpawnEdge(
+		spawnRecord: SubagentSpawnRecordContext | undefined,
+		id: string,
+		definition: SubagentDefinition | undefined,
+		runtime: AgentSessionRuntime,
+	): void {
+		if (!spawnRecord || !this.parentSessionManager?.isPersisted()) return;
+		// Both identity fields come from the runtime's own session manager: a
+		// factory that swaps managers must not produce an edge whose id and file
+		// disagree.
+		const childSessionManager = runtime.session.sessionManager;
+		const childSessionFile = childSessionManager.getSessionFile();
+		try {
+			this.parentSessionManager.appendSubagentSpawn({
+				toolCallId: spawnRecord.toolCallId,
+				requestKey: spawnRecord.requestKey,
+				subagentId: id,
+				agent: definition?.name ?? "subagent",
+				childSessionId: childSessionManager.getSessionId(),
+				...(childSessionFile !== undefined ? { childSessionFile } : {}),
+			});
+		} catch {
+			// The child is already running: losing the recovery edge must not turn
+			// an accepted spawn into a failure. A fail-stopped parent transcript has
+			// already lost recoverability wholesale.
+		}
+	}
+
+	/**
+	 * Recover pre-restart delegation records from persisted transcripts into
+	 * the registry (issue #129, design §3). Root-manager only — descendants
+	 * share the root registry. Lazy and idempotent; awaited from the async
+	 * model-facing paths before registry reads. Failures are contained per
+	 * edge: an unreadable child transcript records an unrecoverable run
+	 * instead of failing hydration.
+	 */
+	async ensureRegistryHydrated(): Promise<void> {
+		if (this.subagentContext || !this.parentSessionManager?.isPersisted()) {
+			return;
+		}
+		this.hydrationPromise ??= this.hydrateSpawnEdges(
+			this.getRegistry(),
+			this.parentSessionManager,
+			[],
+			undefined,
+			new Set([this.parentSessionManager.getSessionFile() ?? ""]),
+		).catch((error) => {
+			// Per-edge failures are contained inside the walk; an unexpected
+			// rejection here must not brick every later registry read on a
+			// memoized failure — drop the memo so the next read retries.
+			this.hydrationPromise = undefined;
+			throw error;
+		});
+		return this.hydrationPromise;
+	}
+
+	private async hydrateSpawnEdges(
+		registry: SubagentRegistry,
+		sessionManager: SessionManager,
+		ancestorPath: string[],
+		parentRegistryId: string | undefined,
+		visitedFiles: Set<string>,
+	): Promise<void> {
+		const settledToolCallIds = collectSettledToolCallIds(sessionManager);
+		const presentToolCallIds = collectToolCallIds(sessionManager);
+		for (const edge of sessionManager.getSubagentSpawnEntries()) {
+			if (
+				typeof edge.subagentId !== "string" ||
+				edge.subagentId.length === 0 ||
+				typeof edge.toolCallId !== "string" ||
+				typeof edge.agent !== "string"
+			) {
+				continue;
+			}
+			// A settled edge needs no record, but its transcript can hold
+			// unsettled descendant edges (e.g. a grandchild that completed while
+			// its parent's failure was captured as a task error), so the walk
+			// still descends into every child transcript.
+			const settled = settledToolCallIds.has(edge.toolCallId) || registry.get(edge.subagentId) !== undefined;
+			const path = [...ancestorPath, edge.agent];
+			const parsedStart = Date.parse(edge.timestamp);
+			const startedAt = Number.isNaN(parsedStart) ? Date.now() : parsedStart;
+			const base = {
+				id: edge.subagentId,
+				...(parentRegistryId !== undefined ? { parentId: parentRegistryId } : {}),
+				agent: { name: edge.agent },
+				path,
+				...(presentToolCallIds.has(edge.toolCallId) ? {} : { stranded: true }),
+				startedAt,
+			};
+			if (typeof edge.childSessionFile !== "string") {
+				if (!settled) {
+					registry.hydrate({
+						...base,
+						status: "failed",
+						error: "Child session was not persisted; its result is unrecoverable.",
+						finishedAt: startedAt,
+					});
+				}
+				continue;
+			}
+			if (visitedFiles.has(edge.childSessionFile)) {
+				if (!settled) {
+					registry.hydrate({
+						...base,
+						status: "failed",
+						error: "Child transcript is already attributed to another edge; its result is unrecoverable.",
+						finishedAt: startedAt,
+					});
+				}
+				continue;
+			}
+			visitedFiles.add(edge.childSessionFile);
+			// One macrotask per child keeps multi-megabyte transcript loads from
+			// monopolizing the event loop (the #46/#123 lesson).
+			await new Promise((resolve) => setImmediate(resolve));
+			let child: SessionManager;
+			try {
+				// open() treats a missing path as a fresh session, so absence needs
+				// an explicit check to classify the edge as unrecoverable.
+				if (!existsSync(edge.childSessionFile)) {
+					throw new Error("child transcript file does not exist");
+				}
+				child = SessionManager.open(edge.childSessionFile);
+			} catch {
+				if (!settled) {
+					registry.hydrate({
+						...base,
+						status: "failed",
+						error: "Child transcript is missing or unreadable; its result is unrecoverable.",
+						finishedAt: startedAt,
+					});
+				}
+				continue;
+			}
+			if (!settled) {
+				const state = deriveHydratedChildState(child, startedAt);
+				registry.hydrate({
+					...base,
+					status: state.status,
+					...(state.task !== undefined ? { task: state.task } : {}),
+					...(state.output !== undefined ? { output: state.output } : {}),
+					...(state.error !== undefined ? { error: state.error } : {}),
+					childSessionFile: edge.childSessionFile,
+					finishedAt: state.finishedAt,
+				});
+			}
+			await this.hydrateSpawnEdges(registry, child, path, edge.subagentId, visitedFiles);
+		}
 	}
 
 	private async notifyRuntimeCreated(options: {

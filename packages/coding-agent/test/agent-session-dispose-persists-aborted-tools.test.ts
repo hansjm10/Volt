@@ -17,10 +17,10 @@ import { createHarness, createHarnessWithExtensions } from "./test-harness.ts";
 
 const hangToolSchema = Type.Object({});
 
-function createHangingTool(onStarted: () => void): AgentTool<typeof hangToolSchema> {
+function createHangingTool(onStarted: () => void, name = "hang"): AgentTool<typeof hangToolSchema> {
 	return {
-		name: "hang",
-		label: "hang",
+		name,
+		label: name,
 		description: "Hangs until aborted",
 		parameters: hangToolSchema,
 		execute: (_toolCallId, _params: Static<typeof hangToolSchema>, signal) => {
@@ -82,6 +82,96 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 			expect(toolResults[0]?.content).toEqual([
 				{ type: "text", text: "Operation aborted: the session closed before this tool call completed." },
 			]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("attaches child sessions from durable spawn edges to a dangling subagent call", async () => {
+		let toolStarted = false;
+		const harness = createHarness({
+			responses: [
+				{
+					toolCalls: [
+						{
+							id: "tc-subagent-1",
+							name: "subagent",
+							args: {
+								tasks: [
+									{ agent: "researcher", task: "audit one" },
+									{ agent: "researcher", task: "audit two" },
+								],
+							},
+						},
+					],
+				},
+				"ok",
+			],
+			baseToolsOverride: {
+				subagent: createHangingTool(() => {
+					toolStarted = true;
+				}, "subagent"),
+			},
+		});
+		try {
+			const promptPromise = harness.session.prompt("delegate the audits").catch(() => {});
+			await vi.waitFor(() => {
+				expect(toolStarted).toBe(true);
+				const context = harness.sessionManager.buildSessionContext();
+				const hasPersistedToolCall = context.messages.some(
+					(message) =>
+						message.role === "assistant" &&
+						message.content.some((block) => block.type === "toolCall" && block.id === "tc-subagent-1"),
+				);
+				expect(hasPersistedToolCall).toBe(true);
+			});
+
+			// The real subagent tool records these at the publish commit point.
+			harness.sessionManager.appendSubagentSpawn({
+				toolCallId: "tc-subagent-1",
+				subagentId: "sa_one",
+				agent: "researcher",
+				childSessionId: "child-session-1",
+				requestKey: "rk-1",
+			});
+			harness.sessionManager.appendSubagentSpawn({
+				toolCallId: "tc-subagent-1",
+				subagentId: "sa_two",
+				agent: "researcher",
+				childSessionId: "child-session-2",
+				requestKey: "rk-1",
+			});
+
+			await Promise.all([harness.session.dispose(), promptPromise]);
+
+			const context = harness.sessionManager.buildSessionContext();
+			const toolResults = context.messages.filter((message) => message.role === "toolResult");
+			expect(toolResults).toHaveLength(1);
+			expect(toolResults[0]).toMatchObject({
+				toolCallId: "tc-subagent-1",
+				toolName: "subagent",
+				isError: true,
+				details: {
+					mode: "parallel",
+					status: "aborted",
+					childSessions: [
+						{
+							index: 0,
+							subagentId: "sa_one",
+							sessionId: "child-session-1",
+							agent: { name: "researcher" },
+							status: "aborted",
+						},
+						{
+							index: 1,
+							subagentId: "sa_two",
+							sessionId: "child-session-2",
+							agent: { name: "researcher" },
+							status: "aborted",
+						},
+					],
+				},
+			});
 		} finally {
 			harness.cleanup();
 		}

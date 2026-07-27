@@ -27,10 +27,12 @@ import type {
 import { AssistantStreamNormalizer } from "@hansjm10/volt-ai";
 import { AgentSession, type AgentSessionEvent } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import { convertToLlm } from "../src/core/messages.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import type { Settings } from "../src/core/settings-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import type { SubagentToolManager } from "../src/core/tools/index.ts";
 import type { ExtensionFactory, ResourceLoader } from "../src/index.ts";
 import {
 	type CreateTestExtensionsResultInput,
@@ -327,6 +329,10 @@ export interface HarnessOptions {
 	tools?: AgentTool[];
 	/** Base tools override (replaces built-in read/bash/edit/write). */
 	baseToolsOverride?: Record<string, AgentTool>;
+	/** Subagent tool manager for the session (stub or real). */
+	subagentToolManager?: SubagentToolManager;
+	/** Session manager override (e.g. a reopened persisted session). Default: in-memory. */
+	sessionManager?: SessionManager;
 	/** Optional resource loader override. */
 	resourceLoader?: ResourceLoader;
 	/** Inline extensions to load into the session resource loader. */
@@ -373,10 +379,14 @@ function createHarnessWithResourceLoader(
 			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
 			tools: options.tools ?? [],
 		},
+		// Mirror production (sdk.ts): custom/bash messages convert to user
+		// messages for the provider instead of agent-core's default filtering,
+		// so faux contexts see what real models see.
+		convertToLlm,
 		streamFn,
 	});
 
-	const sessionManager = SessionManager.inMemory();
+	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
 
 	if (options.settings) {
@@ -395,6 +405,7 @@ function createHarnessWithResourceLoader(
 		modelRegistry,
 		resourceLoader,
 		baseToolsOverride: options.baseToolsOverride,
+		subagentToolManager: options.subagentToolManager,
 	});
 
 	const events: AgentSessionEvent[] = [];

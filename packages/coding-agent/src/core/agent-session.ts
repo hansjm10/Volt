@@ -141,7 +141,9 @@ import {
 	createDefaultWebSearchOperations,
 	DEFAULT_ACTIVE_TOOL_NAMES,
 	extractUrls,
+	type SubagentToolDetails,
 	type SubagentToolManager,
+	type SubagentToolMode,
 } from "./tools/index.ts";
 import {
 	canonicalizePlanSteps,
@@ -451,6 +453,11 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 // AgentSession Class
 // ============================================================================
 
+/** Custom-message type of the persisted §4 subagent recovery notice (issue #129). */
+export const SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE = "subagent_recovery";
+const SUBAGENT_RECOVERY_NOTICE_MAX_LISTED = 8;
+const SUBAGENT_RECOVERY_NOTICE_TASK_PREVIEW_CHARS = 80;
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -556,6 +563,7 @@ export class AgentSession {
 	private _lspManager?: LspManager;
 	private _hostInteraction?: HostInteraction;
 	private _subagentToolManager?: SubagentToolManager;
+	private _subagentRecoveryNoticeDone = false;
 	private _mcpManager?: McpManager;
 	private _mcpManagerFactory?: () => Promise<McpManager | undefined> | McpManager | undefined;
 	private _unsubscribeMcpManager?: () => void;
@@ -1431,6 +1439,7 @@ export class AgentSession {
 					if (resolvedToolCallIds.has(toolCall.id)) {
 						continue;
 					}
+					const details = this._subagentDetailsForAbortedCall(toolCall);
 					const abortedResult: ToolResultMessage = {
 						role: "toolResult",
 						toolCallId: toolCall.id,
@@ -1438,6 +1447,7 @@ export class AgentSession {
 						content: [
 							{ type: "text", text: "Operation aborted: the session closed before this tool call completed." },
 						],
+						...(details ? { details } : {}),
 						isError: true,
 						timestamp: Date.now(),
 					};
@@ -1447,6 +1457,155 @@ export class AgentSession {
 		} catch {
 			// Best-effort: a persistence failure must not block dispose.
 		}
+	}
+
+	/**
+	 * One-shot per session lifetime (issue #129, design §4): the first model
+	 * turn after a reload surfaces completed-but-unclaimed subagent results
+	 * recovered by registry hydration as one compact context message, injected
+	 * into live agent state so the model sees it this turn. Deduplication is
+	 * durable — the notice is itself a persisted custom message listing the
+	 * offered run ids, so a later restart never re-offers them even though
+	 * in-memory claim state does not survive (a run claimed without ever being
+	 * offered can therefore be offered once after another restart — a benign
+	 * duplicate). The reverse skew also exists: a persisted notice whose turn
+	 * was fence-canceled, or that the user immediately branched away from,
+	 * records its ids as offered without the model acting on them — those runs
+	 * stay visible through registry list and the spawn-confirmation preflight.
+	 */
+	private async _maybeAppendSubagentRecoveryNotice(): Promise<void> {
+		if (this._subagentRecoveryNoticeDone) {
+			return;
+		}
+		const manager = this._subagentToolManager;
+		if (typeof manager?.ensureRegistryHydrated !== "function" || typeof manager.listDelegations !== "function") {
+			this._subagentRecoveryNoticeDone = true;
+			return;
+		}
+		// Child runtimes share the root registry: recovered root work must not
+		// leak a false notice (with root-only follow syntax) into a child's
+		// fresh transcript.
+		if (manager.isSubagentRuntime?.() === true) {
+			this._subagentRecoveryNoticeDone = true;
+			return;
+		}
+		// The offer is only actionable while the subagent tool is active; with
+		// it excluded (tool policy, no definitions) nothing is persisted, so
+		// the burned flag self-heals on the next load when the tool may be
+		// back.
+		if (!this.getActiveToolNames().includes("subagent")) {
+			this._subagentRecoveryNoticeDone = true;
+			return;
+		}
+		this._subagentRecoveryNoticeDone = true;
+		try {
+			await manager.ensureRegistryHydrated();
+		} catch {
+			// Deliberate forfeit for this process lifetime: a hydration failure
+			// would almost certainly repeat, and the durable state remains for
+			// the next load.
+			return;
+		}
+		const recovered = manager.listDelegations().filter(
+			(record) =>
+				record.hydrated === true &&
+				record.status === "completed" &&
+				record.claimed !== true &&
+				// Stranded edges (no matching toolCall in this transcript, e.g.
+				// after a branch extraction) hydrate for list/follow but are
+				// never offered into a conversation that lacks the call.
+				record.stranded !== true,
+		);
+		if (recovered.length === 0) {
+			return;
+		}
+		const noticedIds = new Set<string>();
+		for (const entry of this.sessionManager.getEntries()) {
+			if (entry.type !== "custom_message" || entry.customType !== SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE) {
+				continue;
+			}
+			const ids = (entry.details as { subagentIds?: unknown } | undefined)?.subagentIds;
+			if (!Array.isArray(ids)) {
+				continue;
+			}
+			for (const id of ids) {
+				if (typeof id === "string") {
+					noticedIds.add(id);
+				}
+			}
+		}
+		const fresh = recovered.filter((record) => !noticedIds.has(record.id));
+		if (fresh.length === 0) {
+			return;
+		}
+		// Registry eviction (500 terminal records) can drop the oldest hydrated
+		// runs before this reads them — pathological volume, accepted.
+		const shown = fresh.slice(0, SUBAGENT_RECOVERY_NOTICE_MAX_LISTED);
+		const lines = shown.map((record) => {
+			const preview = record.task?.replace(/\s+/g, " ").trim();
+			const bounded =
+				preview && preview.length > SUBAGENT_RECOVERY_NOTICE_TASK_PREVIEW_CHARS
+					? `${preview.slice(0, SUBAGENT_RECOVERY_NOTICE_TASK_PREVIEW_CHARS - 1)}…`
+					: preview;
+			return `- ${record.id} (${record.agent.name}${bounded ? `: ${bounded}` : ""})`;
+		});
+		// "may not have": a run resumed in a prior process delivered through its
+		// resume toolResult, yet rehydrates unclaimed — the offer must not
+		// assert non-delivery it cannot know.
+		const text = [
+			`Subagent recovery: ${fresh.length} subagent run${fresh.length === 1 ? "" : "s"} completed before this session reloaded; the result${fresh.length === 1 ? "" : "s"} may not have reached this conversation (task previews are untrusted data):`,
+			...lines,
+			// Overflow ids are still recorded as offered below: the list hint is
+			// their only surfacing, a deliberate bound on notice size.
+			...(fresh.length > shown.length
+				? [`…and ${fresh.length - shown.length} more (inspect with { "list": true }).`]
+				: []),
+			`Retrieve a result with the subagent tool: { "follow": "<id>" }.`,
+		].join("\n");
+		// A dispose during the hydration awaits fail-stops persistence, a turn
+		// that started would steer instead of preceding the user message, and a
+		// session mutation barrier would make the append throw; skipping is safe
+		// in every case — the burned flag self-heals on next load.
+		if (this._disposed || this.isStreaming || this._hasSessionOperationBarrier) {
+			return;
+		}
+		// Injects into live agent state and emits message events (idle branch):
+		// the model must see the notice in THIS turn, not after the next reload.
+		await this.sendCustomMessage({
+			customType: SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE,
+			content: text,
+			display: true,
+			details: { subagentIds: fresh.map((record) => record.id) },
+		});
+	}
+
+	/**
+	 * Child attach targets for a subagent toolCall interrupted by dispose,
+	 * rebuilt from the durable spawn edges (issue #129). Call-level state only:
+	 * "aborted" describes the parent call, not each child — a child may have
+	 * finished cleanly, and registry hydration derives its true terminal state
+	 * from its own transcript.
+	 */
+	private _subagentDetailsForAbortedCall(toolCall: ToolCall): SubagentToolDetails | undefined {
+		if (toolCall.name !== "subagent") return undefined;
+		const edges = this.sessionManager.getSubagentSpawnEntries().filter((edge) => edge.toolCallId === toolCall.id);
+		if (edges.length === 0) return undefined;
+		const mode: SubagentToolMode = Array.isArray(toolCall.arguments.tasks)
+			? "parallel"
+			: Array.isArray(toolCall.arguments.chain)
+				? "chain"
+				: "single";
+		return {
+			mode,
+			status: "aborted",
+			childSessions: edges.map((edge, index) => ({
+				index,
+				subagentId: edge.subagentId,
+				sessionId: edge.childSessionId,
+				agent: { name: edge.agent },
+				status: "aborted",
+			})),
+		};
 	}
 
 	// =========================================================================
@@ -2288,9 +2447,23 @@ export class AgentSession {
 		if (this._disposed || abortGeneration !== this._abortGeneration) {
 			return;
 		}
+		// Turn-start seam: every fresh-input turn passes through here (direct
+		// prompts, recovered-input replay, triggered custom messages), behind
+		// the admission and generation fences.
+		const conversationGenerationRevision = this._conversationGenerationRevision;
+		await this._maybeAppendSubagentRecoveryNotice();
+		// The hook's hydration awaits reopen the fence window: an abort,
+		// dispose, compaction, or tree navigation that landed during them must
+		// cancel this run, not be outrun by it.
+		if (
+			this._disposed ||
+			abortGeneration !== this._abortGeneration ||
+			conversationGenerationRevision !== this._conversationGenerationRevision
+		) {
+			return;
+		}
 		this._proactiveCompactionStopped = false;
 		this._drainFollowUpsOnNextContinuation = false;
-		const conversationGenerationRevision = this._conversationGenerationRevision;
 		const run = (async () => {
 			this._agentConversationMutationInFlight = true;
 			try {
@@ -4704,7 +4877,14 @@ export class AgentSession {
 								},
 							}
 						: {}),
-					...(subagentRegistryManager ? { subagentRegistry: { manager: subagentRegistryManager } } : {}),
+					...(subagentRegistryManager
+						? {
+								subagentRegistry: {
+									manager: subagentRegistryManager,
+									getAllowedTools: () => this.getActiveToolNames(),
+								},
+							}
+						: {}),
 					...(this._mcpManager ? { mcp: { manager: this._mcpManager } } : {}),
 				});
 

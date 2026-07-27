@@ -250,3 +250,69 @@ describe("SubagentRegistry", () => {
 		expect(ids.has("sa_509")).toBe(true);
 	});
 });
+
+describe("SubagentRegistry hydrate and claimResume", () => {
+	function hydrateAborted(registry: SubagentRegistry, id: string, childSessionFile = "/tmp/child.jsonl"): void {
+		registry.hydrate({
+			id,
+			agent: { name: "researcher" },
+			path: ["researcher"],
+			status: "aborted",
+			error: "Interrupted before completion",
+			childSessionFile,
+			startedAt: 1,
+			finishedAt: 2,
+		});
+	}
+
+	it("claims only hydrated aborted records with a known transcript", () => {
+		const registry = new SubagentRegistry();
+		registry.hydrate({
+			id: "sa_done",
+			agent: { name: "researcher" },
+			path: ["researcher"],
+			status: "completed",
+			output: "report",
+			startedAt: 1,
+			finishedAt: 2,
+		});
+		hydrateAborted(registry, "sa_stuck");
+		registerRunning(registry, "sa_live");
+
+		expect(registry.claimResume("sa_done")).toBeUndefined();
+		expect(registry.claimResume("sa_live")).toBeUndefined();
+		expect(registry.claimResume("sa_missing")).toBeUndefined();
+		const claim = registry.claimResume("sa_stuck");
+		expect(claim).toMatchObject({ agentName: "researcher", childSessionFile: "/tmp/child.jsonl" });
+		// Claimed: gone from the registry until re-registered or rolled back.
+		expect(registry.get("sa_stuck")).toBeUndefined();
+		expect(registry.claimResume("sa_stuck")).toBeUndefined();
+	});
+
+	it("rollback restores the record and is idempotent", () => {
+		const registry = new SubagentRegistry();
+		hydrateAborted(registry, "sa_stuck");
+		const claim = registry.claimResume("sa_stuck");
+		claim?.rollback();
+		expect(registry.get("sa_stuck")).toMatchObject({ status: "aborted", hydrated: true });
+		claim?.rollback();
+		expect(registry.list().filter((record) => record.id === "sa_stuck")).toHaveLength(1);
+	});
+
+	it("rollback is a no-op once the resumed run re-registered the id", () => {
+		const registry = new SubagentRegistry();
+		hydrateAborted(registry, "sa_stuck");
+		const claim = registry.claimResume("sa_stuck");
+		registerRunning(registry, "sa_stuck");
+		claim?.rollback();
+		const record = registry.get("sa_stuck");
+		expect(record).toMatchObject({ status: "running" });
+		expect(record?.hydrated).toBeUndefined();
+	});
+
+	it("register throws on a live duplicate id", () => {
+		const registry = new SubagentRegistry();
+		registerRunning(registry, "sa_live");
+		expect(() => registerRunning(registry, "sa_live")).toThrow(/already registered/);
+	});
+});

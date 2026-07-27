@@ -23,6 +23,12 @@ export interface SubagentRegistryRecord {
 	status: SubagentRegistryStatus;
 	/** Caller-relative follow safety. Present on records returned for a specific runtime. */
 	followability?: SubagentRegistryFollowability;
+	/** True for runs recovered from persisted transcripts rather than started by this process. */
+	hydrated?: true;
+	/** True once a hydrated run's result has been delivered through follow (issue #129 §4). */
+	claimed?: true;
+	/** True for a hydrated edge whose toolCall is absent from its transcript; never offered by the §4 notice. */
+	stranded?: true;
 	startedAt: number;
 	finishedAt?: number;
 	error?: string;
@@ -66,6 +72,15 @@ export interface SubagentSpawnConfirmationLease {
 	release(): void;
 }
 
+/** An interrupted recovered run claimed for resume (issue #129 §5). */
+export interface SubagentResumeClaim {
+	agentName: string;
+	childSessionFile: string;
+	task?: string;
+	/** Restore the interrupted record when the resume fails to start. */
+	rollback(): void;
+}
+
 interface SubagentRegistryEntry {
 	id: string;
 	/** Monotonic registration order, so listing stays stable within one millisecond. */
@@ -77,6 +92,11 @@ interface SubagentRegistryEntry {
 	path: string[];
 	task: string | undefined;
 	status: SubagentRegistryStatus;
+	hydrated: boolean;
+	claimed: boolean;
+	stranded: boolean;
+	/** Hydrated runs only: the child transcript path a §5 resume reloads. Never exposed on records. */
+	childSessionFile: string | undefined;
 	startedAt: number;
 	finishedAt: number | undefined;
 	error: string | undefined;
@@ -130,6 +150,11 @@ export class SubagentRegistry {
 	private nextSequence = 0;
 
 	register(options: { id: string; parentId?: string; agent: SubagentRegistryRecord["agent"]; path: string[] }): void {
+		if (this.entries.has(options.id)) {
+			// Re-registering a live id would corrupt the running list and orphan
+			// waiters; §5 resume upholds this by claiming the record first.
+			throw new Error(`Subagent run "${options.id}" is already registered`);
+		}
 		const entry: SubagentRegistryEntry = {
 			id: options.id,
 			sequence: this.nextSequence++,
@@ -140,6 +165,10 @@ export class SubagentRegistry {
 			path: [...options.path],
 			task: undefined,
 			status: "running",
+			hydrated: false,
+			claimed: false,
+			stranded: false,
+			childSessionFile: undefined,
 			startedAt: Date.now(),
 			finishedAt: undefined,
 			error: undefined,
@@ -149,6 +178,91 @@ export class SubagentRegistry {
 		this.entries.set(options.id, entry);
 		this.appendRunning(entry);
 		this.evictOldestTerminal();
+	}
+
+	/**
+	 * Register a run recovered from persisted transcripts in a terminal state
+	 * (issue #129). Hydrated entries behave like ordinary terminal records —
+	 * follow returns them immediately — but keep their historical timestamps
+	 * and are marked so consumers can tell recovered pre-restart work from
+	 * runs started by this process. No-op when the id is already known.
+	 */
+	hydrate(options: {
+		id: string;
+		parentId?: string;
+		agent: SubagentRegistryRecord["agent"];
+		path: string[];
+		task?: string;
+		status: Exclude<SubagentRegistryStatus, "running">;
+		output?: string;
+		error?: string;
+		/** The edge's toolCall is absent from its transcript (design §3 stranded case). */
+		stranded?: boolean;
+		/** Child transcript path enabling a §5 resume of interrupted runs. */
+		childSessionFile?: string;
+		startedAt: number;
+		finishedAt: number;
+	}): void {
+		if (this.entries.has(options.id)) {
+			return;
+		}
+		const entry: SubagentRegistryEntry = {
+			id: options.id,
+			sequence: this.nextSequence++,
+			previousRunning: undefined,
+			nextRunning: undefined,
+			parentId: options.parentId,
+			agent: { ...options.agent },
+			path: [...options.path],
+			task: options.task === undefined ? undefined : boundText(options.task, REGISTRY_TASK_LIMIT_CHARS),
+			status: options.status,
+			hydrated: true,
+			claimed: false,
+			stranded: options.stranded === true,
+			childSessionFile: options.childSessionFile,
+			startedAt: options.startedAt,
+			finishedAt: options.finishedAt,
+			error: options.error === undefined ? undefined : boundText(options.error, REGISTRY_ERROR_LIMIT_CHARS),
+			output: options.output === undefined ? undefined : boundText(options.output, REGISTRY_OUTPUT_LIMIT_CHARS),
+			waiters: [],
+		};
+		this.entries.set(options.id, entry);
+		this.insertTerminal(entry);
+		this.evictOldestTerminal();
+	}
+
+	/**
+	 * Atomically claim an interrupted recovered run for a §5 resume: the
+	 * terminal hydrated record is removed so the resumed run can re-register
+	 * under its original id through the ordinary live pipeline. Only hydrated
+	 * `aborted` records with a known child transcript qualify — completed
+	 * recoveries are followed, not resumed. No dedup preflight applies:
+	 * claiming an existing record by id cannot duplicate work.
+	 */
+	claimResume(id: string): SubagentResumeClaim | undefined {
+		const entry = this.entries.get(id);
+		if (!entry || !entry.hydrated || entry.status !== "aborted" || entry.childSessionFile === undefined) {
+			return undefined;
+		}
+		this.entries.delete(id);
+		const terminalIndex = this.terminalEntries.indexOf(entry);
+		if (terminalIndex !== -1) {
+			this.terminalEntries.splice(terminalIndex, 1);
+		}
+		let rolledBack = false;
+		return {
+			agentName: entry.agent.name,
+			childSessionFile: entry.childSessionFile,
+			...(entry.task !== undefined ? { task: entry.task } : {}),
+			rollback: () => {
+				if (rolledBack || this.entries.has(id)) {
+					return;
+				}
+				rolledBack = true;
+				this.entries.set(id, entry);
+				this.insertTerminal(entry);
+			},
+		};
 	}
 
 	setTask(id: string, task: string): void {
@@ -317,6 +431,11 @@ export class SubagentRegistry {
 			);
 		}
 		if (entry.status !== "running") {
+			// Delivering a recovered result claims it: the §4 recovery notice
+			// stops offering runs whose reports already reached a conversation.
+			if (entry.hydrated) {
+				entry.claimed = true;
+			}
 			return this.toFollowResult(entry);
 		}
 		if (signal?.aborted) {
@@ -463,6 +582,9 @@ export class SubagentRegistry {
 			path: [...entry.path],
 			...(entry.task !== undefined ? { task: entry.task } : {}),
 			status: entry.status,
+			...(entry.hydrated ? { hydrated: true as const } : {}),
+			...(entry.claimed ? { claimed: true as const } : {}),
+			...(entry.stranded ? { stranded: true as const } : {}),
 			startedAt: entry.startedAt,
 			...(entry.finishedAt !== undefined ? { finishedAt: entry.finishedAt } : {}),
 			...(entry.error !== undefined ? { error: entry.error } : {}),
