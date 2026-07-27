@@ -12,7 +12,16 @@
 > restarts), the notice is injected into live agent state at the turn-start
 > seam (`_runAgentPrompt`) so the appending process's model sees it, child
 > runtimes are gated out (they share the root registry), and stranded edges
-> carry a `stranded` marker that excludes them from the notice. §5 pending. Prior art: Codex
+> carry a `stranded` marker that excludes them from the notice. §5 is
+> implemented as a `resume` mode on both the subagent tool's registry modes
+> and the standalone `subagent_registry` tool (follow-gated): `claimResume`
+> atomically removes the interrupted record so the run re-registers under its
+> original id through the live pipeline, a start failure restores the record,
+> and no dedup preflight applies. Known skews: after a resume the registry
+> record's task shows the continuation prompt, and the original spawn edge
+> stays unsettled — a later restart hydrates the now-completed child as
+> completed-unclaimed, a benign re-offer suppressed by the notice dedup when
+> previously offered. Prior art: Codex
 > CLI persists parent→child spawn edges in a SQLite `agent_graph_store` and
 > resumes whole descendant trees from rollout files on session resume
 > (`resume_agent_from_rollout`, lazy `ensure_v2_agent_loaded`); OpenCode makes

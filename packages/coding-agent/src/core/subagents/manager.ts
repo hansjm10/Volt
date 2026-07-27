@@ -148,6 +148,11 @@ export interface SubagentStartOptions {
 	 * which record no edge and are invisible to registry hydration.
 	 */
 	spawnRecord?: SubagentSpawnRecordContext;
+	/**
+	 * §5 resume: reuse this id instead of minting a fresh one, so the resumed
+	 * run re-occupies its claimed registry record. Set only by resumeDelegation.
+	 */
+	resumeSubagentId?: string;
 }
 
 /** Tool-call attribution for one durable spawn edge. */
@@ -339,6 +344,14 @@ function resolveEffectiveTools(options: {
 
 	const excluded = new Set(normalizedExcluded);
 	return effectiveTools.filter((toolName) => !excluded.has(toolName));
+}
+
+const RESUME_ID_PREVIEW_CHARS = 120;
+const SUBAGENT_RESUME_PROMPT =
+	"You were interrupted before completing your task. Review the conversation so far, finish the original task, and reply with your complete final report.";
+
+function boundResumeId(id: string): string {
+	return id.length <= RESUME_ID_PREVIEW_CHARS ? id : `${id.slice(0, RESUME_ID_PREVIEW_CHARS - 1)}…`;
 }
 
 function messageText(content: Message["content"]): string {
@@ -763,6 +776,56 @@ export class SubagentManager {
 		return this.getRegistry().follow(this.subagentContext?.subagentId, subagentId, options.signal);
 	}
 
+	/**
+	 * §5 resume: reload an interrupted recovered run from its child transcript
+	 * and prompt it to finish its original task. The run re-registers under
+	 * its original id through the live pipeline, so settlement, list, and
+	 * follow behave as for any run started by this process. Depth, policy,
+	 * and delegation-scope checks apply as for a new start; a start failure
+	 * restores the interrupted record.
+	 */
+	async resumeDelegation(subagentId: string, options: { signal?: AbortSignal } = {}): Promise<SubagentFollowResult> {
+		await this.ensureRegistryHydrated();
+		const claim = this.getRegistry().claimResume(subagentId);
+		if (!claim) {
+			throw new Error(
+				`Subagent run "${boundResumeId(subagentId)}" is not a resumable interrupted recovery. Use { follow: "<id>" } for completed runs or { list: true } to inspect the registry.`,
+			);
+		}
+		let handle: SubagentHandle;
+		try {
+			if (!existsSync(claim.childSessionFile)) {
+				throw new Error("The interrupted run's transcript no longer exists; it cannot be resumed.");
+			}
+			handle = await this.startByName(claim.agentName, {
+				sessionManager: SessionManager.open(claim.childSessionFile),
+				resumeSubagentId: subagentId,
+			});
+		} catch (error) {
+			claim.rollback();
+			throw error;
+		}
+		const onAbort = () => {
+			void handle.abort().catch(() => undefined);
+		};
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		if (options.signal?.aborted) {
+			onAbort();
+		}
+		try {
+			const completion = handle.waitForEnd();
+			await handle.prompt(SUBAGENT_RESUME_PROMPT);
+			await completion;
+		} catch {
+			// The live settlement pipeline records the terminal outcome
+			// (including failures and aborts); fall through to report it.
+		} finally {
+			options.signal?.removeEventListener("abort", onAbort);
+			await handle.dispose().catch(() => undefined);
+		}
+		return this.followDelegation(subagentId, options);
+	}
+
 	private getRegistry(): SubagentRegistry {
 		if (this.subagentContext) {
 			return this.subagentContext.registry;
@@ -1020,7 +1083,7 @@ export class SubagentManager {
 		const cwd = options.cwd ?? this.cwd;
 		const agentDir = options.agentDir ?? this.agentDir;
 		const sessionManager = options.sessionManager ?? this.createDefaultChildSessionManager(cwd);
-		const id = `sa_${randomUUID()}`;
+		const id = options.resumeSubagentId ?? `sa_${randomUUID()}`;
 		if (!delegation) {
 			throw new Error("Subagent delegation scope is required");
 		}
@@ -1438,6 +1501,7 @@ export class SubagentManager {
 					...(state.task !== undefined ? { task: state.task } : {}),
 					...(state.output !== undefined ? { output: state.output } : {}),
 					...(state.error !== undefined ? { error: state.error } : {}),
+					childSessionFile: edge.childSessionFile,
 					finishedAt: state.finishedAt,
 				});
 			}

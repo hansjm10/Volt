@@ -72,6 +72,15 @@ export interface SubagentSpawnConfirmationLease {
 	release(): void;
 }
 
+/** An interrupted recovered run claimed for resume (issue #129 §5). */
+export interface SubagentResumeClaim {
+	agentName: string;
+	childSessionFile: string;
+	task?: string;
+	/** Restore the interrupted record when the resume fails to start. */
+	rollback(): void;
+}
+
 interface SubagentRegistryEntry {
 	id: string;
 	/** Monotonic registration order, so listing stays stable within one millisecond. */
@@ -86,6 +95,8 @@ interface SubagentRegistryEntry {
 	hydrated: boolean;
 	claimed: boolean;
 	stranded: boolean;
+	/** Hydrated runs only: the child transcript path a §5 resume reloads. Never exposed on records. */
+	childSessionFile: string | undefined;
 	startedAt: number;
 	finishedAt: number | undefined;
 	error: string | undefined;
@@ -152,6 +163,7 @@ export class SubagentRegistry {
 			hydrated: false,
 			claimed: false,
 			stranded: false,
+			childSessionFile: undefined,
 			startedAt: Date.now(),
 			finishedAt: undefined,
 			error: undefined,
@@ -181,6 +193,8 @@ export class SubagentRegistry {
 		error?: string;
 		/** The edge's toolCall is absent from its transcript (design §3 stranded case). */
 		stranded?: boolean;
+		/** Child transcript path enabling a §5 resume of interrupted runs. */
+		childSessionFile?: string;
 		startedAt: number;
 		finishedAt: number;
 	}): void {
@@ -200,6 +214,7 @@ export class SubagentRegistry {
 			hydrated: true,
 			claimed: false,
 			stranded: options.stranded === true,
+			childSessionFile: options.childSessionFile,
 			startedAt: options.startedAt,
 			finishedAt: options.finishedAt,
 			error: options.error === undefined ? undefined : boundText(options.error, REGISTRY_ERROR_LIMIT_CHARS),
@@ -209,6 +224,40 @@ export class SubagentRegistry {
 		this.entries.set(options.id, entry);
 		this.insertTerminal(entry);
 		this.evictOldestTerminal();
+	}
+
+	/**
+	 * Atomically claim an interrupted recovered run for a §5 resume: the
+	 * terminal hydrated record is removed so the resumed run can re-register
+	 * under its original id through the ordinary live pipeline. Only hydrated
+	 * `aborted` records with a known child transcript qualify — completed
+	 * recoveries are followed, not resumed. No dedup preflight applies:
+	 * claiming an existing record by id cannot duplicate work.
+	 */
+	claimResume(id: string): SubagentResumeClaim | undefined {
+		const entry = this.entries.get(id);
+		if (!entry || !entry.hydrated || entry.status !== "aborted" || entry.childSessionFile === undefined) {
+			return undefined;
+		}
+		this.entries.delete(id);
+		const terminalIndex = this.terminalEntries.indexOf(entry);
+		if (terminalIndex !== -1) {
+			this.terminalEntries.splice(terminalIndex, 1);
+		}
+		let rolledBack = false;
+		return {
+			agentName: entry.agent.name,
+			childSessionFile: entry.childSessionFile,
+			...(entry.task !== undefined ? { task: entry.task } : {}),
+			rollback: () => {
+				if (rolledBack || this.entries.has(id)) {
+					return;
+				}
+				rolledBack = true;
+				this.entries.set(id, entry);
+				this.insertTerminal(entry);
+			},
+		};
 	}
 
 	setTask(id: string, task: string): void {

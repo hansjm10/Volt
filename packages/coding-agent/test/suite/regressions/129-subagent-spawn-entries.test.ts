@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -595,6 +595,111 @@ describe("issue #129", () => {
 				path: ["researcher", "general"],
 				task: "leaf task",
 			});
+		} finally {
+			await restarted.dispose();
+		}
+	});
+
+	it("resume reloads an interrupted run through the subagent tool without confirmation", async () => {
+		const parent = createPersistedParent();
+		const sessionDir = parent.getSessionDir();
+		const interrupted = SessionManager.create(tmpdir(), sessionDir);
+		interrupted.appendMessage({ role: "user", content: "finish the audit", timestamp: Date.now() });
+		interrupted.appendMessage(fauxAssistantMessage("starting the audit"));
+		interrupted.appendMessage({ role: "user", content: "continue", timestamp: Date.now() });
+		await interrupted.flush();
+		parent.appendSubagentSpawn({
+			toolCallId: "call_resume",
+			subagentId: "sa_resume",
+			agent: "researcher",
+			childSessionId: interrupted.getSessionId(),
+			childSessionFile: interrupted.getSessionFile()!,
+			requestKey: "rk-resume",
+		});
+		await parent.flush();
+
+		const reopened = SessionManager.open(parent.getSessionFile()!);
+		const context = await createTestContext({ withConfiguredAuth: true, parentSessionManager: reopened });
+		try {
+			const tool = createSubagentTool(tmpdir(), { manager: context.manager });
+			// Resume takes no preflight/confirm round-trip: one call starts it.
+			const result = await tool.execute("call_do_resume", { resume: "sa_resume" });
+			const text = textFromResult(result);
+			expect(text).toContain("Resumed subagent run sa_resume");
+			expect(text).toContain("researched the task");
+
+			const record = context.manager.listDelegations().find((candidate) => candidate.id === "sa_resume");
+			expect(record).toMatchObject({ status: "completed" });
+			expect(record?.hydrated).toBeUndefined();
+
+			// The resumed turn appended to the same child transcript.
+			await vi.waitFor(() => {
+				const childEntries = SessionManager.open(interrupted.getSessionFile()!).getEntries();
+				const hasResumedReport = childEntries.some(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						JSON.stringify(entry.message.content).includes("researched the task"),
+				);
+				expect(hasResumedReport).toBe(true);
+			});
+		} finally {
+			await context.cleanup();
+		}
+	});
+
+	it("resume rejects completed recoveries and unknown ids while follow still works", async () => {
+		const parent = createPersistedParent();
+		const sessionDir = parent.getSessionDir();
+		const completedChild = SessionManager.create(tmpdir(), sessionDir);
+		completedChild.appendMessage({ role: "user", content: "settled work", timestamp: Date.now() });
+		completedChild.appendMessage(fauxAssistantMessage("finished report"));
+		await completedChild.flush();
+		parent.appendSubagentSpawn({
+			toolCallId: "call_completed",
+			subagentId: "sa_completed",
+			agent: "researcher",
+			childSessionId: completedChild.getSessionId(),
+			childSessionFile: completedChild.getSessionFile()!,
+			requestKey: "rk-c",
+		});
+		await parent.flush();
+
+		const restarted = createRestartedManager(parent);
+		try {
+			await expect(restarted.resumeDelegation("sa_completed")).rejects.toThrow(/not a resumable/);
+			await expect(restarted.resumeDelegation("sa_missing")).rejects.toThrow(/not a resumable/);
+			const followed = await restarted.followDelegation("sa_completed");
+			expect(followed.output).toBe("finished report");
+		} finally {
+			await restarted.dispose();
+		}
+	});
+
+	it("resume start failure restores the interrupted record", async () => {
+		const parent = createPersistedParent();
+		const sessionDir = parent.getSessionDir();
+		const interrupted = SessionManager.create(tmpdir(), sessionDir);
+		interrupted.appendMessage({ role: "user", content: "ghost work", timestamp: Date.now() });
+		interrupted.appendMessage(fauxAssistantMessage("partial"));
+		interrupted.appendMessage({ role: "user", content: "continue", timestamp: Date.now() });
+		await interrupted.flush();
+		// The agent definition no longer exists in the restarted process.
+		parent.appendSubagentSpawn({
+			toolCallId: "call_ghost",
+			subagentId: "sa_ghost",
+			agent: "ghost-agent",
+			childSessionId: interrupted.getSessionId(),
+			childSessionFile: interrupted.getSessionFile()!,
+			requestKey: "rk-g",
+		});
+		await parent.flush();
+
+		const restarted = createRestartedManager(parent);
+		try {
+			await expect(restarted.resumeDelegation("sa_ghost")).rejects.toThrow();
+			const record = restarted.listDelegations().find((candidate) => candidate.id === "sa_ghost");
+			expect(record).toMatchObject({ status: "aborted", hydrated: true });
 		} finally {
 			await restarted.dispose();
 		}
