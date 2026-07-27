@@ -245,7 +245,12 @@ function classifyErrorKind(text, isError, matchedResult) {
 	if (!isError) return null;
 	const normalized = text.toLowerCase();
 	if (normalized.includes("file not found")) return "file_not_found";
-	if (normalized.includes("could not find the exact text")) return "not_found_exact_text";
+	if (
+		normalized.includes("could not find the exact text") ||
+		/^could not find edits\[\d+\] in /m.test(normalized)
+	) {
+		return "not_found_exact_text";
+	}
 	if (normalized.includes("found multiple occurrences") || /^found \d+ occurrences/m.test(normalized)) {
 		return "multiple_occurrences";
 	}
