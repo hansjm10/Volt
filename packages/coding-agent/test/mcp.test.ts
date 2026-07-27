@@ -441,13 +441,13 @@ describe("MCP support", () => {
 		const config = createTestConfig(tempDir);
 		const writer = new McpConfigWriter({ cwd: tempDir, agentDir: tempDir, projectTrusted: true });
 		const configPath = writer.setServerEnabled(config.servers.fake, false).path;
-		const firstInode = statSync(configPath).ino;
+		const firstInode = statSync(configPath, { bigint: true }).ino;
 		writer.setServerDirectTools(config.servers.fake, ["read_note"]);
 		const persisted = JSON.parse(readFileSync(configPath, "utf8")) as {
 			servers?: Record<string, { enabled?: boolean; directTools?: string[] }>;
 		};
 		expect(persisted.servers?.fake).toEqual({ enabled: false, directTools: ["read_note"] });
-		expect(statSync(configPath).ino).not.toBe(firstInode);
+		expect(statSync(configPath, { bigint: true }).ino).not.toBe(firstInode);
 	});
 
 	it("uses an owner-only POSIX mode for MCP config", (context) => {
