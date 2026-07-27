@@ -22,8 +22,13 @@ fi
 # Skip local LLM tests (ollama, lmstudio)
 export VOLT_NO_LOCAL_LLM=1
 
-# Require native Iroh integration suites to run.
-export VOLT_TEST_REQUIRE_NATIVE_IROH=1
+# Require native Iroh integration suites on supported host platforms.
+IROH_PLATFORM=$(node -p '`${process.platform}-${process.arch}`')
+case "$IROH_PLATFORM" in
+    darwin-arm64|linux-arm64|linux-x64|win32-arm64|win32-x64)
+        export VOLT_TEST_REQUIRE_NATIVE_IROH=1
+        ;;
+esac
 
 # Unset API keys (see packages/ai/src/stream.ts getEnvApiKey)
 unset ANTHROPIC_API_KEY
