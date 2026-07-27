@@ -24,6 +24,20 @@ describe("daemon fallback socket dir hardening", () => {
 		}
 	});
 
+	posixIt("assigns distinct stable fallback sockets to long agent directories", () => {
+		const longRoot = join(tmpdir(), "a".repeat(120));
+		const firstAgentDir = join(longRoot, "first-agent");
+		const secondAgentDir = join(longRoot, "second-agent");
+
+		const firstSocketPath = getDaemonSocketPath(firstAgentDir);
+		const secondSocketPath = getDaemonSocketPath(secondAgentDir);
+
+		expect(firstSocketPath).toBe(getDaemonSocketPath(firstAgentDir));
+		expect(firstSocketPath).not.toBe(secondSocketPath);
+		expect(Buffer.byteLength(firstSocketPath, "utf8")).toBeLessThanOrEqual(100);
+		expect(Buffer.byteLength(secondSocketPath, "utf8")).toBeLessThanOrEqual(100);
+	});
+
 	posixIt("tightens loose permissions on a pre-existing fallback socket dir we own", () => {
 		dir = mkdtempSync(join(tmpdir(), "voltd-paths-"));
 		const agentDir = join(dir, "agent");
