@@ -41,6 +41,50 @@ import {
 	versionFromReleaseTag,
 } from "./verify-release-provenance.mjs";
 
+/**
+ * Repository-scoping variables git exports to hook processes.
+ *
+ * Deliberately not every GIT_* name: GIT_EXEC_PATH and friends tell git where
+ * its own helpers live, and dropping those breaks git outright. Only the ones
+ * that redirect a command at a different repository belong here.
+ */
+const GIT_REPO_SCOPING_ENV = [
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	"GIT_COMMON_DIR",
+	"GIT_DIR",
+	"GIT_INDEX_FILE",
+	"GIT_INDEX_VERSION",
+	"GIT_NAMESPACE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_PREFIX",
+	"GIT_QUARANTINE_PATH",
+	"GIT_WORK_TREE",
+];
+
+function scrubGitRepoScopingEnv(env) {
+	for (const name of GIT_REPO_SCOPING_ENV) delete env[name];
+	return env;
+}
+
+/**
+ * This suite builds throwaway git repositories and shells out to `git` against
+ * them. Run from a git hook — which is exactly what the pre-commit `npm run
+ * check` does — those commands inherit GIT_DIR and GIT_INDEX_FILE from the
+ * commit in progress, so each one silently retargets the developer's real
+ * repository instead of the fixture.
+ *
+ * Committing from a worktree makes that destructive. GIT_DIR is then
+ * `.git/worktrees/<name>`, whose config writes delegate to the shared
+ * `.git/config`, and a fixture `git init` against it infers a bare repository
+ * and writes `core.bare = true` there. Every checkout backed by that config —
+ * including the developer's main one — starts failing with "this operation must
+ * be run in a work tree" until the value is hand-repaired.
+ *
+ * Scrub once, before any fixture runs, so every child process started from here
+ * (git, npm, and the node command fixtures) begins from a clean slate.
+ */
+scrubGitRepoScopingEnv(process.env);
+
 const isWindows = process.platform === "win32";
 
 function prependPath(...directories) {
@@ -1990,6 +2034,42 @@ with tarfile.open(sys.argv[1], "w:gz") as archive:
 		assert.notEqual(unsafe.status, 0);
 		assert.match(unsafe.stderr, /only regular files and directories/);
 		assert.equal(existsSync(join(unsafeHome, ".volt", "bin")), false);
+	} finally {
+		rmSync(directory, { force: true, recursive: true });
+	}
+});
+
+test("fixture git commands are insulated from a hook's inherited GIT_DIR", () => {
+	const directory = mkdtempSync(join(tmpdir(), "volt-git-env-scrub-"));
+	try {
+		const outer = join(directory, "outer");
+		const fixture = join(directory, "fixture");
+		mkdirSync(outer);
+		mkdirSync(fixture);
+		execFileSync("git", ["init"], { cwd: outer, stdio: "ignore" });
+
+		// A hook environment: git points every child at the commit's repository.
+		const hookEnv = { ...process.env, GIT_DIR: join(outer, ".git"), GIT_WORK_TREE: outer };
+
+		// Establish the hazard is real rather than hypothetical: inheriting those
+		// variables makes an init inside `fixture` operate on `outer` instead, so
+		// the fixture never gets a repository of its own.
+		execFileSync("git", ["init"], { cwd: fixture, env: hookEnv, stdio: "ignore" });
+		assert.equal(
+			existsSync(join(fixture, ".git")),
+			false,
+			"expected an inherited GIT_DIR to retarget the fixture's git init",
+		);
+
+		// Scrubbed, the same command builds the fixture's own repository.
+		execFileSync("git", ["init"], { cwd: fixture, env: scrubGitRepoScopingEnv({ ...hookEnv }), stdio: "ignore" });
+		assert.ok(existsSync(join(fixture, ".git")), "expected the scrubbed env to init the fixture repository");
+
+		// And the suite's own environment carries none of them, so every helper
+		// in this file is covered without threading an env through each call.
+		for (const name of GIT_REPO_SCOPING_ENV) {
+			assert.equal(process.env[name], undefined, `${name} must not leak into fixture commands`);
+		}
 	} finally {
 		rmSync(directory, { force: true, recursive: true });
 	}
