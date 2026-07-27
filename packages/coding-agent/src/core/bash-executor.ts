@@ -73,6 +73,31 @@ export async function executeBashWithOperations(
 		}
 	};
 
+	// createWriteStream creates the file as soon as the stream opens, so
+	// fullOutputPath exists long before the buffered writes land. Callers read
+	// that path the moment this function returns, so every exit path must wait
+	// for the flush instead of firing end() and walking away.
+	const closeTempFile = async (): Promise<void> => {
+		const stream = tempFileStream;
+		if (!stream) {
+			return;
+		}
+		tempFileStream = undefined;
+		await new Promise<void>((resolve, reject) => {
+			const onError = (error: Error) => {
+				stream.off("finish", onFinish);
+				reject(error);
+			};
+			const onFinish = () => {
+				stream.off("error", onError);
+				resolve();
+			};
+			stream.once("error", onError);
+			stream.once("finish", onFinish);
+			stream.end();
+		});
+	};
+
 	const decoder = new TextDecoder();
 
 	const onData = (data: Buffer) => {
@@ -115,9 +140,7 @@ export async function executeBashWithOperations(
 		if (truncationResult.truncated) {
 			ensureTempFile();
 		}
-		if (tempFileStream) {
-			tempFileStream.end();
-		}
+		await closeTempFile();
 		const cancelled = options?.signal?.aborted ?? false;
 
 		return {
@@ -135,9 +158,7 @@ export async function executeBashWithOperations(
 			if (truncationResult.truncated) {
 				ensureTempFile();
 			}
-			if (tempFileStream) {
-				tempFileStream.end();
-			}
+			await closeTempFile();
 			return {
 				output: truncationResult.truncated ? truncationResult.content : fullOutput,
 				exitCode: undefined,
@@ -147,9 +168,8 @@ export async function executeBashWithOperations(
 			};
 		}
 
-		if (tempFileStream) {
-			tempFileStream.end();
-		}
+		// A flush failure here must not mask the execution failure being rethrown.
+		await closeTempFile().catch(() => {});
 
 		throw err;
 	}
