@@ -167,7 +167,7 @@ Set `VOLT_SKIP_VERSION_CHECK=1` to disable the Volt version update check. Use `-
 | `retry.provider.maxRetries` | number | `0` | Provider/SDK retry attempts |
 | `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested delay before failing (60s) |
 
-With the defaults, agent-level retries wait for up to 126 seconds in total across six attempts. Press Escape during the retry countdown to stop retrying.
+With the defaults, agent-level retries wait for up to 126 seconds in total across six attempts. In interactive mode, press the configured interrupt key (Escape by default) during the retry countdown to stop retrying.
 
 When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g., Google's "quota will reset after 5h"), the request fails immediately with an informative error instead of waiting silently. Set to `0` to disable the cap.
 
