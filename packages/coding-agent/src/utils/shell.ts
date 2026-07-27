@@ -178,38 +178,177 @@ export function untrackDetachedChildPid(pid: number): void {
 }
 
 export function killTrackedDetachedChildren(): void {
+	// One process-table read shared across every tracked child: this runs from
+	// shutdown signal handlers, and a snapshot per child would multiply the
+	// blocking cost by the number of in-flight commands.
+	const table = process.platform === "win32" ? undefined : readChildrenByParent();
 	for (const pid of trackedDetachedChildPids) {
-		killProcessTree(pid);
+		killProcessTree(pid, table);
 	}
 	trackedDetachedChildPids.clear();
 }
 
+/** Grace period between SIGTERM and SIGKILL when tearing down a process tree. */
+const SIGKILL_ESCALATION_MS = 200;
+/** Cap on the process-table read so enumeration cannot stall a shutdown path. */
+const PROCESS_TABLE_TIMEOUT_MS = 1000;
+
 /**
- * Kill a process and all its children (cross-platform)
+ * Guard every signalling entry point: `process.kill(-1, ...)` would signal every
+ * process the user can reach, and pid 1 is init.
  */
-export function killProcessTree(pid: number): void {
-	if (process.platform === "win32") {
-		// Use taskkill on Windows to kill process tree
-		try {
-			spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
-				stdio: "ignore",
-				detached: true,
-				windowsHide: true,
-			});
-		} catch {
-			// Ignore errors if taskkill fails
-		}
-	} else {
-		// Use SIGKILL on Unix/Linux/Mac
-		try {
-			process.kill(-pid, "SIGKILL");
-		} catch {
-			// Fallback to killing just the child if process group kill fails
-			try {
-				process.kill(pid, "SIGKILL");
-			} catch {
-				// Process already dead
-			}
+function isSignalablePid(pid: number): boolean {
+	return Number.isInteger(pid) && pid > 1;
+}
+
+/** Deliver a signal, tolerating a target that has already exited. */
+function signalPid(pid: number, signal: NodeJS.Signals): void {
+	if (!isSignalablePid(pid)) return;
+	try {
+		process.kill(pid, signal);
+	} catch {
+		// Already gone, or not ours to signal.
+	}
+}
+
+function isProcessAlive(pid: number): boolean {
+	if (!isSignalablePid(pid)) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Read the whole process table once and index it by parent.
+ *
+ * Deliberately one spawn rather than a `pgrep -P` per node: this runs on abort,
+ * timeout, and shutdown signal handlers, and a per-node walk costs ~18ms each,
+ * which on a large build tree blocks the event loop for seconds.
+ */
+function readChildrenByParent(): Map<number, number[]> | undefined {
+	const result = spawnSync("ps", ["-Ao", "pid=,ppid="], {
+		encoding: "utf8",
+		timeout: PROCESS_TABLE_TIMEOUT_MS,
+		maxBuffer: 8 * 1024 * 1024,
+	});
+	if (result.error || typeof result.stdout !== "string") return undefined;
+	const childrenByParent = new Map<number, number[]>();
+	for (const line of result.stdout.split("\n")) {
+		const fields = line.trim().split(/\s+/);
+		const pid = Number.parseInt(fields[0] ?? "", 10);
+		const ppid = Number.parseInt(fields[1] ?? "", 10);
+		if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
+		const siblings = childrenByParent.get(ppid);
+		if (siblings) siblings.push(pid);
+		else childrenByParent.set(ppid, [pid]);
+	}
+	return childrenByParent;
+}
+
+/**
+ * Collect every descendant of `pid`, deepest first.
+ *
+ * Signalling the process group is the primary mechanism, but a child that calls
+ * setsid/setpgid becomes its own group leader and is no longer a member of the
+ * group we signal — test runners and daemons do this routinely, and such a
+ * child survives the group kill entirely. Walking parentage catches those.
+ *
+ * This must run BEFORE anything is killed: once an intermediate parent dies its
+ * children are reparented to init and the ppid trail back to us is gone.
+ */
+function collectDescendantPids(pid: number, table?: Map<number, number[]>): number[] {
+	if (process.platform === "win32") return [];
+	const childrenByParent = table ?? readChildrenByParent();
+	// No usable process table: fall back to group-only signalling, i.e. the
+	// behavior that predated the sweep.
+	if (!childrenByParent) return [];
+	const collected: number[] = [];
+	const seen = new Set<number>([pid]);
+	const queue: number[] = [pid];
+	// Deliberately uncapped. A breadth-first cap truncates whole levels, which
+	// would drop exactly the deep escaped descendants the group kill cannot
+	// reach — the failure this sweep exists to prevent, reappearing on any tree
+	// large enough to hit the limit. `seen` bounds the walk to each pid once,
+	// and the table is already in memory, so the traversal is map lookups.
+	while (queue.length > 0) {
+		const parent = queue.shift();
+		if (parent === undefined) break;
+		for (const childPid of childrenByParent.get(parent) ?? []) {
+			if (!isSignalablePid(childPid) || seen.has(childPid)) continue;
+			seen.add(childPid);
+			collected.push(childPid);
+			queue.push(childPid);
 		}
 	}
+	// Deepest first, so a parent cannot spawn replacements while we work upward.
+	return collected.reverse();
+}
+
+function killWindowsTree(pid: number): void {
+	try {
+		spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
+			stdio: "ignore",
+			detached: true,
+			windowsHide: true,
+		});
+	} catch {
+		// Ignore errors if taskkill fails
+	}
+}
+
+/** Signal the process group, then each descendant that escaped it. */
+function signalProcessTree(pid: number, descendants: number[], signal: NodeJS.Signals): void {
+	try {
+		process.kill(-pid, signal);
+	} catch {
+		// Fall back to the leader alone if the group is already gone.
+		signalPid(pid, signal);
+	}
+	for (const descendant of descendants) signalPid(descendant, signal);
+}
+
+/**
+ * Kill a process and all its children (cross-platform), synchronously.
+ *
+ * Stays synchronous because shutdown signal handlers cannot await; use
+ * {@link terminateProcessTree} anywhere a graceful stop can be awaited.
+ */
+export function killProcessTree(pid: number, table?: Map<number, number[]>): void {
+	if (!isSignalablePid(pid)) return;
+	if (process.platform === "win32") {
+		killWindowsTree(pid);
+		return;
+	}
+	signalProcessTree(pid, collectDescendantPids(pid, table), "SIGKILL");
+}
+
+/**
+ * Kill a process tree, giving it a brief chance to exit on SIGTERM first so it
+ * can remove temp files and reap its own children before being force-killed.
+ */
+export async function terminateProcessTree(pid: number, isExited?: () => boolean): Promise<void> {
+	if (!isSignalablePid(pid)) return;
+	if (process.platform === "win32") {
+		killWindowsTree(pid);
+		return;
+	}
+
+	const descendants = collectDescendantPids(pid);
+	signalProcessTree(pid, descendants, "SIGTERM");
+
+	await new Promise((resolve) => setTimeout(resolve, SIGKILL_ESCALATION_MS));
+
+	// The leader exiting says nothing about the rest of the tree: a descendant
+	// that ignores SIGTERM routinely outlives the shell that spawned it, which
+	// is the whole reason this sweep exists. So the force phase is skipped only
+	// when nothing is left alive — never on the leader's status alone.
+	// Re-checking liveness here also keeps SIGKILL off pids that already exited
+	// and may have been recycled during the grace period.
+	const survivors = descendants.filter(isProcessAlive);
+	const leaderAlive = isExited?.() === true ? false : isProcessAlive(pid);
+	if (!leaderAlive && survivors.length === 0) return;
+	signalProcessTree(pid, survivors, "SIGKILL");
 }
