@@ -149,13 +149,17 @@ export function rotateWindowsDaemonSocketSecret(agentDir: string = getAgentDir()
 	return getWindowsNamedPipePath(agentDir);
 }
 
-function getFallbackSocketPath(): string {
+function getFallbackSocketPath(agentDir: string): string {
 	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+	const scope = createHash("sha256").update(agentDir).digest("hex").slice(0, 32);
 	const runtimeDir = process.env.XDG_RUNTIME_DIR;
 	if (runtimeDir) {
-		return join(runtimeDir, `voltd-${uid}.sock`);
+		const runtimePath = join(runtimeDir, `voltd-${uid}-${scope}.sock`);
+		if (Buffer.byteLength(runtimePath, "utf8") <= MAX_SOCKET_PATH_BYTES) {
+			return runtimePath;
+		}
 	}
-	return join(`/tmp/voltd-${uid}`, "voltd.sock");
+	return join(`/tmp/voltd-${uid}`, `voltd-${scope}.sock`);
 }
 
 /**
@@ -186,7 +190,7 @@ export function getDaemonSocketPath(agentDir: string = getAgentDir()): string {
 	if (Buffer.byteLength(defaultPath, "utf8") <= MAX_SOCKET_PATH_BYTES) {
 		return defaultPath;
 	}
-	return getFallbackSocketPath();
+	return getFallbackSocketPath(agentDir);
 }
 
 export function getDaemonPaths(agentDir: string = getAgentDir()): DaemonPaths {

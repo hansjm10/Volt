@@ -10,7 +10,7 @@ import { waitForChildProcess } from "../../utils/child-process.ts";
 import {
 	getShellConfig,
 	getShellEnv,
-	killProcessTree,
+	terminateProcessTree,
 	trackDetachedChildPid,
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
@@ -21,12 +21,59 @@ import { formatDuration, getTextOutput, invalidArgText, str } from "./render-uti
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
 
+/**
+ * Seconds of silence after which a command is presumed hung and killed.
+ *
+ * A wall-clock limit is a poor hang detector: it has to be set higher than the
+ * command's legitimate runtime, so the gap between "hung" and "killed" is pure
+ * dead time. Silence is the signal that actually distinguishes a hung command
+ * from a slow one, and it does not require guessing how long the work takes.
+ *
+ * Sized against gemini-cli's `tools.shell.inactivityTimeout`, which also
+ * defaults to 300s. Plenty of legitimate commands (dependency installs, release
+ * builds) go quiet for minutes at a time, and a false kill costs more than a
+ * slower detection.
+ */
+const DEFAULT_STALL_TIMEOUT_SECONDS = 300;
+
+/** Upper bound applied to explicitly requested timeouts. */
+const MAX_TIMEOUT_SECONDS = 3600;
+
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	timeout: Type.Optional(
+		Type.Number({
+			description: `Overall wall-clock limit in seconds (max ${MAX_TIMEOUT_SECONDS}). Usually unnecessary: a command that goes silent for ${DEFAULT_STALL_TIMEOUT_SECONDS}s is killed automatically, so there is no need to inflate this to protect against hangs.`,
+		}),
+	),
+	stallTimeout: Type.Optional(
+		Type.Number({
+			description: `Seconds without output before the command is presumed hung and killed (default ${DEFAULT_STALL_TIMEOUT_SECONDS}, max ${MAX_TIMEOUT_SECONDS}, 0 disables). Raise this only for commands that are legitimately silent for long stretches.`,
+		}),
+	),
 });
 
 export type BashToolInput = Static<typeof bashSchema>;
+
+/**
+ * Normalize a caller-supplied timeout to a usable number of seconds.
+ * Returns undefined for absent, non-finite, or non-positive values.
+ */
+function clampTimeoutSeconds(value: number | undefined): number | undefined {
+	if (value === undefined || !Number.isFinite(value) || value <= 0) return undefined;
+	return Math.min(value, MAX_TIMEOUT_SECONDS);
+}
+
+/**
+ * Resolve the silence deadline. Only an exact 0 disables it — a malformed or
+ * negative value falls back to the default rather than silently switching the
+ * safeguard off.
+ */
+function resolveStallSeconds(value: number | undefined): number {
+	if (value === 0) return 0;
+	if (value === undefined || !Number.isFinite(value) || value < 0) return DEFAULT_STALL_TIMEOUT_SECONDS;
+	return Math.min(value, MAX_TIMEOUT_SECONDS);
+}
 
 export interface BashToolDetails {
 	truncation?: TruncationResult;
@@ -86,8 +133,19 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 			if (child.pid) trackDetachedChildPid(child.pid);
 			let timedOut = false;
 			let timeoutHandle: NodeJS.Timeout | undefined;
-			const onAbort = () => {
-				if (child.pid) killProcessTree(child.pid);
+			// Lets the teardown skip its SIGKILL escalation once the shell is gone,
+			// so a recycled pid is never signalled.
+			let exited = false;
+			child.once("exit", () => {
+				exited = true;
+			});
+			// The wall timeout and an abort can both fire; without this guard each
+			// would run its own process-table sweep and signal rounds.
+			let tornDown = false;
+			const teardown = () => {
+				if (tornDown || exited || !child.pid) return;
+				tornDown = true;
+				void terminateProcessTree(child.pid, () => exited);
 			};
 
 			try {
@@ -95,7 +153,7 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 				if (timeout !== undefined && timeout > 0) {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
-						if (child.pid) killProcessTree(child.pid);
+						teardown();
 					}, timeout * 1000);
 				}
 				// Stream stdout and stderr.
@@ -103,8 +161,8 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 				child.stderr?.on("data", onData);
 				// Handle abort signal by killing the entire process tree.
 				if (signal) {
-					if (signal.aborted) onAbort();
-					else signal.addEventListener("abort", onAbort, { once: true });
+					if (signal.aborted) teardown();
+					else signal.addEventListener("abort", teardown, { once: true });
 				}
 				// Handle shell spawn errors and wait for the process to terminate without hanging
 				// on inherited stdio handles held by detached descendants.
@@ -119,7 +177,7 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 			} finally {
 				if (child.pid) untrackDetachedChildPid(child.pid);
 				if (timeoutHandle) clearTimeout(timeoutHandle);
-				if (signal) signal.removeEventListener("abort", onAbort);
+				if (signal) signal.removeEventListener("abort", teardown);
 			}
 		},
 	};
@@ -174,7 +232,9 @@ class BashResultRenderComponent extends Container {
 
 function formatBashCall(args: { command?: string; timeout?: number } | undefined): string {
 	const command = str(args?.command);
-	const timeout = args?.timeout as number | undefined;
+	// Show the limit actually in force, not the raw request, so an inflated
+	// value is not displayed as though it were honored.
+	const timeout = clampTimeoutSeconds(args?.timeout as number | undefined);
 	const timeoutSuffix = timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "";
 	const commandDisplay =
 		command === null
@@ -277,16 +337,18 @@ export function createBashToolDefinition(
 	return {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. A command that produces no output for ${DEFAULT_STALL_TIMEOUT_SECONDS}s is killed as hung, so long-running commands do not need a large timeout to be safe.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
 		parameters: bashSchema,
 		async execute(
 			_toolCallId,
-			{ command, timeout }: { command: string; timeout?: number },
+			{ command, timeout, stallTimeout }: { command: string; timeout?: number; stallTimeout?: number },
 			signal?: AbortSignal,
 			onUpdate?,
 			_ctx?,
 		) {
+			const wallTimeout = clampTimeoutSeconds(timeout);
+			const stallSeconds = resolveStallSeconds(stallTimeout);
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);
 			const output = new OutputAccumulator({ tempFilePrefix: "volt-bash" });
@@ -335,7 +397,37 @@ export function createBashToolDefinition(
 				onUpdate({ content: [], details: undefined });
 			}
 
+			const stallController = new AbortController();
+			// Latched when each cause fires. Re-reading signal.aborted in the catch
+			// block instead would mislabel a stall as a plain abort whenever the run
+			// is torn down between the kill and the error surfacing, hiding from the
+			// model that the command hung — so it would retry the same hang.
+			let abortCause: "stall" | "caller" | undefined;
+			const markCallerAbort = () => {
+				abortCause ??= "caller";
+			};
+			let stallTimer: NodeJS.Timeout | undefined;
+
+			const clearStallTimer = () => {
+				if (stallTimer) {
+					clearTimeout(stallTimer);
+					stallTimer = undefined;
+				}
+			};
+
+			// Re-armed on every chunk, so the deadline tracks silence rather than
+			// total runtime: a command that keeps talking is never killed by it.
+			const armStallTimer = () => {
+				clearStallTimer();
+				if (stallSeconds <= 0) return;
+				stallTimer = setTimeout(() => {
+					abortCause ??= "stall";
+					stallController.abort();
+				}, stallSeconds * 1000);
+			};
+
 			const handleData = (data: Buffer) => {
+				armStallTimer();
 				if (!acceptingOutput) return;
 				output.append(data);
 				scheduleOutputUpdate();
@@ -376,10 +468,16 @@ export function createBashToolDefinition(
 			try {
 				let exitCode: number | null;
 				try {
+					armStallTimer();
+					if (signal) {
+						if (signal.aborted) markCallerAbort();
+						else signal.addEventListener("abort", markCallerAbort, { once: true });
+					}
+					const execSignal = signal ? AbortSignal.any([signal, stallController.signal]) : stallController.signal;
 					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
 						onData: handleData,
-						signal,
-						timeout,
+						signal: execSignal,
+						timeout: wallTimeout,
 						env: spawnContext.env,
 					});
 					exitCode = result.exitCode;
@@ -387,6 +485,17 @@ export function createBashToolDefinition(
 					const snapshot = await finishOutput();
 					const { text } = formatOutput(snapshot, "");
 					if (err instanceof Error && err.message === "aborted") {
+						// Whichever cause fired first wins: a caller abort makes the
+						// command fall silent as a side effect, and a stall kill can be
+						// followed by a caller abort before this branch runs.
+						if (abortCause === "stall") {
+							throw new Error(
+								appendStatus(
+									text,
+									`Command produced no output for ${stallSeconds} seconds and was killed as hung. If this command is legitimately silent for longer, pass a larger stallTimeout.`,
+								),
+							);
+						}
 						throw new Error(appendStatus(text, "Command aborted"));
 					}
 					if (err instanceof Error && err.message.startsWith("timeout:")) {
@@ -404,6 +513,8 @@ export function createBashToolDefinition(
 				return { content: [{ type: "text", text: outputText }], details };
 			} finally {
 				clearUpdateTimer();
+				clearStallTimer();
+				signal?.removeEventListener("abort", markCallerAbort);
 			}
 		},
 		// The result renderer shows its own "Elapsed/Took" duration line, so the

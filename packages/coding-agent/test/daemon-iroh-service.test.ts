@@ -9,6 +9,7 @@ import type { IrohBiStreamLike } from "../src/core/rpc/iroh-transport.ts";
 import { createDaemonClient, type DaemonClient } from "../src/daemon/control-client.ts";
 import type { ControlEvent } from "../src/daemon/control-protocol.ts";
 import {
+	formatIrohLoadError,
 	type IrohConnectionLike,
 	type IrohEndpointLike,
 	type IrohIncomingLike,
@@ -33,6 +34,15 @@ import { readLineFromIroh } from "../src/daemon/workspace-streams.ts";
 
 const native = loadIrohModule();
 const nativeAvailable = native.iroh !== undefined;
+const nativeRequired = process.env.VOLT_TEST_REQUIRE_NATIVE_IROH === "1";
+
+describe("native Iroh test prerequisite", () => {
+	it("loads the native adapter when required", () => {
+		if (nativeRequired && !native.iroh) {
+			throw new Error(formatIrohLoadError(native.error));
+		}
+	});
+});
 
 interface PhoneEndpoint {
 	connect(addr: unknown, alpn: number[]): Promise<PhoneConnection>;
