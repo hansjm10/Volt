@@ -89,6 +89,17 @@ describe("subagent recovery notice", () => {
 			expect(firstTurnContext).toContain("Subagent recovery:");
 			expect(firstTurnContext).toContain("sa_unclaimed");
 
+			// Live clients observe the notice through message events at append
+			// time, not only via a later transcript reload.
+			expect(
+				harness.events.some(
+					(event) =>
+						event.type === "message_end" &&
+						event.message.role === "custom" &&
+						event.message.customType === SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE,
+				),
+			).toBe(true);
+
 			// The notice precedes the user message in entry order.
 			const entries = harness.sessionManager.getEntries();
 			const noticeIndex = entries.findIndex((entry) => entry.id === notices[0].id);

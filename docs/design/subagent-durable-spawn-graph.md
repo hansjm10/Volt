@@ -172,7 +172,10 @@ field-level validation, and session rewrites can strand them:
 - an edge whose `toolCallId` has no matching toolCall in the transcript
   (possible after branch extraction or a session clear replaces the entry set
   while a child is still publishing) hydrates as a plain registry record but
-  never produces a §4 recovery notice;
+  never produces a §4 recovery notice; "in the transcript" is file-scoped by
+  design — a toolCall on an abandoned branch still counts, because the notice
+  text is self-contained and cross-branch result reuse is the registry's
+  purpose;
 - an edge whose `childSessionFile` is missing or unreadable records status
   `unrecoverable` rather than failing hydration.
 
@@ -245,8 +248,10 @@ faux provider harness:
   are UX gaps, not correctness liabilities. If the discovery gap starts to
   matter, layer the bounded hybrid: the daemon's persisted state additionally
   records recently hosted parent sessions and hydrates only those on restart —
-  no format changes required. Hydration I/O runs off the event loop (per the
-  #46/#123 lesson).
+  no format changes required. Hydration yields a macrotask per child transcript
+  load; the loads themselves are still synchronous reads (`SessionManager.open`),
+  so fully off-event-loop hydration remains a follow-up (per the #46/#123
+  lesson).
 - **`resume` takes no dedup preflight.** The preflight prevents duplicate
   spawns; `resume` claims an existing registry record by id, so duplication is
   structurally impossible.

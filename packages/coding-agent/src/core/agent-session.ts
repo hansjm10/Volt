@@ -1542,19 +1542,20 @@ export class AgentSession {
 				: []),
 			`Retrieve a result with the subagent tool: { "follow": "<id>" }.`,
 		].join("\n");
-		// Injects into live agent state and emits message events (idle branch of
-		// _sendCustomMessage): the model must see the notice in THIS turn, not
-		// after the next reload.
-		await this._sendCustomMessage(
-			{
-				customType: SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE,
-				content: text,
-				display: true,
-				details: { subagentIds: fresh.map((record) => record.id) },
-			},
-			undefined,
-			true,
-		);
+		// A dispose during the hydration awaits fail-stops persistence, and a
+		// turn that started would steer instead of preceding the user message;
+		// skipping is safe both ways — the burned flag self-heals on next load.
+		if (this._disposed || this.isStreaming) {
+			return;
+		}
+		// Injects into live agent state and emits message events (idle branch):
+		// the model must see the notice in THIS turn, not after the next reload.
+		await this.sendCustomMessage({
+			customType: SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE,
+			content: text,
+			display: true,
+			details: { subagentIds: fresh.map((record) => record.id) },
+		});
 	}
 
 	/**
@@ -2425,13 +2426,23 @@ export class AgentSession {
 		if (this._disposed || abortGeneration !== this._abortGeneration) {
 			return;
 		}
-		// Turn-start seam: every first model turn after a load passes through
-		// here (direct prompts, recovered-input replay, triggered custom
-		// messages), behind the admission and generation fences.
+		// Turn-start seam: every fresh-input turn passes through here (direct
+		// prompts, recovered-input replay, triggered custom messages), behind
+		// the admission and generation fences.
+		const conversationGenerationRevision = this._conversationGenerationRevision;
 		await this._maybeAppendSubagentRecoveryNotice();
+		// The hook's hydration awaits reopen the fence window: an abort,
+		// dispose, compaction, or tree navigation that landed during them must
+		// cancel this run, not be outrun by it.
+		if (
+			this._disposed ||
+			abortGeneration !== this._abortGeneration ||
+			conversationGenerationRevision !== this._conversationGenerationRevision
+		) {
+			return;
+		}
 		this._proactiveCompactionStopped = false;
 		this._drainFollowUpsOnNextContinuation = false;
-		const conversationGenerationRevision = this._conversationGenerationRevision;
 		const run = (async () => {
 			this._agentConversationMutationInFlight = true;
 			try {
