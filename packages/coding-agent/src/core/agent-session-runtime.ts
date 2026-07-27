@@ -25,7 +25,7 @@ import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
 import {
 	assertValidSessionId,
-	isClientInputWalEntry,
+	isHostOnlySessionEntry,
 	type SessionEntry,
 	type SessionInfo,
 	SessionManager,
@@ -826,9 +826,10 @@ export class AgentSessionRuntime {
 			return () => {};
 		}
 		return session.sessionManager.subscribeEntries((entry) => {
-			// Defense in depth: host admission WAL records are never transcript
-			// commits, even if a custom SessionManager emits them.
-			if (isClientInputWalEntry(entry)) return;
+			// Defense in depth: host-only sidecar records (admission WAL, subagent
+			// spawn edges) are never transcript commits, even if a custom
+			// SessionManager emits them.
+			if (isHostOnlySessionEntry(entry)) return;
 			// Planning snapshots are durable branch-local state, not transcript
 			// rows. Clients receive them through planning_state_changed and every
 			// bootstrap/checkpoint instead.

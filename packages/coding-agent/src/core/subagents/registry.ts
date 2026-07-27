@@ -23,6 +23,8 @@ export interface SubagentRegistryRecord {
 	status: SubagentRegistryStatus;
 	/** Caller-relative follow safety. Present on records returned for a specific runtime. */
 	followability?: SubagentRegistryFollowability;
+	/** True for runs recovered from persisted transcripts rather than started by this process. */
+	hydrated?: true;
 	startedAt: number;
 	finishedAt?: number;
 	error?: string;
@@ -77,6 +79,7 @@ interface SubagentRegistryEntry {
 	path: string[];
 	task: string | undefined;
 	status: SubagentRegistryStatus;
+	hydrated: boolean;
 	startedAt: number;
 	finishedAt: number | undefined;
 	error: string | undefined;
@@ -140,6 +143,7 @@ export class SubagentRegistry {
 			path: [...options.path],
 			task: undefined,
 			status: "running",
+			hydrated: false,
 			startedAt: Date.now(),
 			finishedAt: undefined,
 			error: undefined,
@@ -148,6 +152,50 @@ export class SubagentRegistry {
 		};
 		this.entries.set(options.id, entry);
 		this.appendRunning(entry);
+		this.evictOldestTerminal();
+	}
+
+	/**
+	 * Register a run recovered from persisted transcripts in a terminal state
+	 * (issue #129). Hydrated entries behave like ordinary terminal records —
+	 * follow returns them immediately — but keep their historical timestamps
+	 * and are marked so consumers can tell recovered pre-restart work from
+	 * runs started by this process. No-op when the id is already known.
+	 */
+	hydrate(options: {
+		id: string;
+		parentId?: string;
+		agent: SubagentRegistryRecord["agent"];
+		path: string[];
+		task?: string;
+		status: Exclude<SubagentRegistryStatus, "running">;
+		output?: string;
+		error?: string;
+		startedAt: number;
+		finishedAt: number;
+	}): void {
+		if (this.entries.has(options.id)) {
+			return;
+		}
+		const entry: SubagentRegistryEntry = {
+			id: options.id,
+			sequence: this.nextSequence++,
+			previousRunning: undefined,
+			nextRunning: undefined,
+			parentId: options.parentId,
+			agent: { ...options.agent },
+			path: [...options.path],
+			task: options.task === undefined ? undefined : boundText(options.task, REGISTRY_TASK_LIMIT_CHARS),
+			status: options.status,
+			hydrated: true,
+			startedAt: options.startedAt,
+			finishedAt: options.finishedAt,
+			error: options.error === undefined ? undefined : boundText(options.error, REGISTRY_ERROR_LIMIT_CHARS),
+			output: options.output === undefined ? undefined : boundText(options.output, REGISTRY_OUTPUT_LIMIT_CHARS),
+			waiters: [],
+		};
+		this.entries.set(options.id, entry);
+		this.insertTerminal(entry);
 		this.evictOldestTerminal();
 	}
 
@@ -463,6 +511,7 @@ export class SubagentRegistry {
 			path: [...entry.path],
 			...(entry.task !== undefined ? { task: entry.task } : {}),
 			status: entry.status,
+			...(entry.hydrated ? { hydrated: true as const } : {}),
 			startedAt: entry.startedAt,
 			...(entry.finishedAt !== undefined ? { finishedAt: entry.finishedAt } : {}),
 			...(entry.error !== undefined ? { error: entry.error } : {}),

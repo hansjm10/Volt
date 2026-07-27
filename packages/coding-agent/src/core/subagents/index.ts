@@ -509,6 +509,7 @@ export {
 	type SubagentResult,
 	type SubagentRuntimeCreatedEvent,
 	type SubagentRuntimeRegistration,
+	type SubagentSpawnRecordContext,
 	type SubagentStartByNameOptions,
 	type SubagentStartOptions,
 } from "./manager.ts";

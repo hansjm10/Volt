@@ -141,7 +141,9 @@ import {
 	createDefaultWebSearchOperations,
 	DEFAULT_ACTIVE_TOOL_NAMES,
 	extractUrls,
+	type SubagentToolDetails,
 	type SubagentToolManager,
+	type SubagentToolMode,
 } from "./tools/index.ts";
 import {
 	canonicalizePlanSteps,
@@ -1431,6 +1433,7 @@ export class AgentSession {
 					if (resolvedToolCallIds.has(toolCall.id)) {
 						continue;
 					}
+					const details = this._subagentDetailsForAbortedCall(toolCall);
 					const abortedResult: ToolResultMessage = {
 						role: "toolResult",
 						toolCallId: toolCall.id,
@@ -1438,6 +1441,7 @@ export class AgentSession {
 						content: [
 							{ type: "text", text: "Operation aborted: the session closed before this tool call completed." },
 						],
+						...(details ? { details } : {}),
 						isError: true,
 						timestamp: Date.now(),
 					};
@@ -1447,6 +1451,35 @@ export class AgentSession {
 		} catch {
 			// Best-effort: a persistence failure must not block dispose.
 		}
+	}
+
+	/**
+	 * Child attach targets for a subagent toolCall interrupted by dispose,
+	 * rebuilt from the durable spawn edges (issue #129). Call-level state only:
+	 * "aborted" describes the parent call, not each child — a child may have
+	 * finished cleanly, and registry hydration derives its true terminal state
+	 * from its own transcript.
+	 */
+	private _subagentDetailsForAbortedCall(toolCall: ToolCall): SubagentToolDetails | undefined {
+		if (toolCall.name !== "subagent") return undefined;
+		const edges = this.sessionManager.getSubagentSpawnEntries().filter((edge) => edge.toolCallId === toolCall.id);
+		if (edges.length === 0) return undefined;
+		const mode: SubagentToolMode = Array.isArray(toolCall.arguments.tasks)
+			? "parallel"
+			: Array.isArray(toolCall.arguments.chain)
+				? "chain"
+				: "single";
+		return {
+			mode,
+			status: "aborted",
+			childSessions: edges.map((edge, index) => ({
+				index,
+				subagentId: edge.subagentId,
+				sessionId: edge.childSessionId,
+				agent: { name: edge.agent },
+				status: "aborted",
+			})),
+		};
 	}
 
 	// =========================================================================

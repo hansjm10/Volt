@@ -316,6 +316,8 @@ export interface SubagentToolManager {
 	/** Result of an existing run, waiting for completion when still running, for follow mode. */
 	followDelegation?(subagentId: string, options?: { signal?: AbortSignal }): Promise<SubagentFollowResult>;
 	dispose?(): Promise<void>;
+	/** Recover pre-restart delegation records before registry reads (issue #129). */
+	ensureRegistryHydrated?(): Promise<void>;
 	/** Optional live activity feed used by interactive hosts. */
 	listActivities?(): readonly SubagentActivity[];
 	subscribeActivities?(listener: SubagentActivityListener): () => void;
@@ -2207,7 +2209,7 @@ export function createSubagentToolDefinition(
 		parameters: createSubagentSchema(availableNames, includeListMode, includeFollowMode, requiresSpawnConfirmation),
 		executionMode: "sequential",
 		async execute(
-			_toolCallId,
+			toolCallId,
 			params,
 			signal,
 			onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
@@ -2217,6 +2219,9 @@ export function createSubagentToolDefinition(
 			}
 
 			const normalized = normalizeSubagentToolInput(params);
+			// Registry reads (list/follow, dedup preflight) must see pre-restart
+			// runs recovered from persisted transcripts.
+			await options.manager.ensureRegistryHydrated?.();
 			if ((normalized.mode === "list" && !includeListMode) || (normalized.mode === "follow" && !includeFollowMode)) {
 				if (!registryModesRequested) {
 					throw new Error(`Use the ${SUBAGENT_REGISTRY_TOOL_NAME} tool for registry list and follow operations.`);
@@ -2250,9 +2255,9 @@ export function createSubagentToolDefinition(
 					);
 				}
 			}
+			const requestKey = createSubagentSpawnRequestKey(normalized);
 			let spawnConfirmationLease: SubagentSpawnConfirmationLease | undefined;
 			if (requiresSpawnConfirmation) {
-				const requestKey = createSubagentSpawnRequestKey(normalized);
 				spawnConfirmationLease = normalized.confirm
 					? options.manager.claimSpawnConfirmation?.(requestKey, normalized.confirm)
 					: undefined;
@@ -2416,6 +2421,7 @@ export function createSubagentToolDefinition(
 						const startPromise = options.manager.startByName(task.agent, {
 							allowedTools: options.getAllowedTools?.(),
 							...(delegationLease ? { delegationScope: delegationLease.scope } : {}),
+							spawnRecord: { toolCallId, requestKey },
 						});
 						void startPromise
 							.then((startedHandle) => {
@@ -2779,6 +2785,7 @@ export function createSubagentRegistryToolDefinition(
 			if (signal?.aborted) {
 				throw new Error("Operation aborted");
 			}
+			await options.manager.ensureRegistryHydrated?.();
 			const normalized = normalizeSubagentToolInput(params);
 			if (normalized.mode !== "list" && normalized.mode !== "follow") {
 				throw new Error(

@@ -270,6 +270,31 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	display: boolean;
 }
 
+/**
+ * Durable spawn edge for one subagent child started by a `subagent` tool call.
+ * Host metadata only: never part of model context, branch navigation, forks, or
+ * transcript projection. Appended at the two-phase publish commit point, so a
+ * recorded edge always refers to a child whose first prompt was accepted.
+ *
+ * Edge state is derived, not stored: an edge is settled when its toolCallId
+ * has a persisted toolResult produced by the tool itself. A missing result or
+ * a dispose-time synthesized aborted result leaves the edge recoverable —
+ * see docs/design/subagent-durable-spawn-graph.md §4. Registry hydration
+ * reads these entries together with the named child transcripts to recover
+ * results after a crash or runtime disposal (issue #129).
+ */
+export interface SubagentSpawnEntry extends SessionEntryBase {
+	type: "subagent_spawn";
+	toolCallId: string;
+	subagentId: string;
+	agent: string;
+	childSessionId: string;
+	/** Absolute child session file path at spawn time. Absent for in-memory children. */
+	childSessionFile?: string;
+	/** Dedup request key of the originating spawn request. Never projected to clients. */
+	requestKey: string;
+}
+
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */
 export type SessionEntry =
 	| SessionMessageEntry
@@ -285,7 +310,8 @@ export type SessionEntry =
 	| CustomEntry
 	| CustomMessageEntry
 	| LabelEntry
-	| SessionInfoEntry;
+	| SessionInfoEntry
+	| SubagentSpawnEntry;
 
 /** Host-only input admission WAL records. These never participate in the conversation branch or projection. */
 export function isClientInputWalEntry(
@@ -296,6 +322,15 @@ export function isClientInputWalEntry(
 		entry.type === "client_input_queued" ||
 		entry.type === "client_input_state"
 	);
+}
+
+/**
+ * Host-only sidecar records sharing the JSONL for crash recovery. They never
+ * advance the branch leaf, never enter model context or transcript projection,
+ * and never copy into forks.
+ */
+export function isHostOnlySessionEntry(entry: FileEntry): boolean {
+	return isClientInputWalEntry(entry) || entry.type === "subagent_spawn";
 }
 
 const CLIENT_INPUT_ID_MAX_CHARACTERS = RPC_CLIENT_MESSAGE_ID_MAX_CHARS;
@@ -1281,6 +1316,10 @@ function isSessionDurabilityBoundary(entry: SessionEntry): boolean {
 		entry.type === "thinking_level_change" ||
 		entry.type === "model_change" ||
 		isClientInputWalEntry(entry) ||
+		// A spawn edge that only reaches the page cache when the process dies
+		// cannot recover its child; it gets the same fsync treatment as the
+		// client-input WAL.
+		entry.type === "subagent_spawn" ||
 		(entry.type === "message" && entry.message.role === "user" && typeof entry.message.clientMessageId === "string")
 	);
 }
@@ -1686,7 +1725,7 @@ export class SessionManager {
 				this.nextOrdinal = Math.max(this.nextOrdinal, (entry.ordinal ?? 0) + 1);
 			}
 			this.byId.set(entry.id, entry);
-			if (!isClientInputWalEntry(entry)) {
+			if (!isHostOnlySessionEntry(entry)) {
 				this.leafId = entry.id;
 			}
 			this._indexClientInputEntry(entry);
@@ -1819,12 +1858,12 @@ export class SessionManager {
 		entry.ordinal = this.nextOrdinal++;
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
-		if (!isClientInputWalEntry(entry)) {
+		if (!isHostOnlySessionEntry(entry)) {
 			this.leafId = entry.id;
 		}
 		this._persist(entry);
 		this._indexClientInputEntry(entry);
-		if (isClientInputWalEntry(entry)) {
+		if (isHostOnlySessionEntry(entry)) {
 			return;
 		}
 		for (const listener of this.entryListeners) {
@@ -2110,8 +2149,9 @@ export class SessionManager {
 
 	/**
 	 * Observe public conversation entries after they are indexed and accepted
-	 * into the ordered persistence lane. Host-only admission WAL records are
-	 * intentionally excluded. The callback runs synchronously at the in-memory
+	 * into the ordered persistence lane. Host-only sidecar records (admission
+	 * WAL, subagent spawn edges) are intentionally excluded. The callback runs
+	 * synchronously at the in-memory
 	 * commit boundary so ordered projections stay in the same causal lane as live
 	 * events; callers that require disk durability must await flush().
 	 */
@@ -2329,7 +2369,7 @@ export class SessionManager {
 
 	getEntry(id: string): SessionEntry | undefined {
 		const entry = this.byId.get(id);
-		return entry && !isClientInputWalEntry(entry) ? entry : undefined;
+		return entry && !isHostOnlySessionEntry(entry) ? entry : undefined;
 	}
 
 	/**
@@ -2339,7 +2379,7 @@ export class SessionManager {
 		if (!this.getEntry(parentId)) return [];
 		const children: SessionEntry[] = [];
 		for (const entry of this.byId.values()) {
-			if (entry.parentId === parentId && !isClientInputWalEntry(entry)) {
+			if (entry.parentId === parentId && !isHostOnlySessionEntry(entry)) {
 				children.push(entry);
 			}
 		}
@@ -2382,9 +2422,46 @@ export class SessionManager {
 	}
 
 	/**
+	 * Record a durable spawn edge for a subagent child whose first prompt was
+	 * accepted. Host metadata only: the entry never advances the branch leaf and
+	 * is invisible to getEntries()/getBranch()/context building. Read back with
+	 * getSubagentSpawnEntries() during registry hydration.
+	 */
+	appendSubagentSpawn(spawn: {
+		toolCallId: string;
+		subagentId: string;
+		agent: string;
+		childSessionId: string;
+		childSessionFile?: string;
+		requestKey: string;
+	}): string {
+		this._assertPersistenceHealthy();
+		const entry: SubagentSpawnEntry = {
+			type: "subagent_spawn",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			toolCallId: spawn.toolCallId,
+			subagentId: spawn.subagentId,
+			agent: spawn.agent,
+			childSessionId: spawn.childSessionId,
+			...(spawn.childSessionFile !== undefined ? { childSessionFile: spawn.childSessionFile } : {}),
+			requestKey: spawn.requestKey,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** All durable spawn edges in file order, including edges recorded on other branches. */
+	getSubagentSpawnEntries(): SubagentSpawnEntry[] {
+		return this.fileEntries.filter((entry): entry is SubagentSpawnEntry => entry.type === "subagent_spawn");
+	}
+
+	/**
 	 * Walk from entry to root, returning all entries in path order.
 	 * Includes all conversation entry types (messages, compaction, model changes, etc.)
-	 * while traversing transparently across any legacy host-only WAL parents.
+	 * while traversing transparently across any host-only sidecar parents
+	 * (admission WAL, subagent spawn edges).
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
@@ -2392,7 +2469,7 @@ export class SessionManager {
 		const startId = fromId ?? this.leafId;
 		let current = startId ? this.getEntry(startId) : undefined;
 		while (current) {
-			if (!isClientInputWalEntry(current)) {
+			if (!isHostOnlySessionEntry(current)) {
 				path.push(current);
 			}
 			current = current.parentId ? this.byId.get(current.parentId) : undefined;
@@ -2434,12 +2511,12 @@ export class SessionManager {
 				throw new Error("Session branch contains a parent cycle");
 			}
 			seen.add(current.id);
-			if (!isClientInputWalEntry(current)) {
+			if (!isHostOnlySessionEntry(current)) {
 				reverseWindow.push(current);
 			}
 			current = current.parentId ? this.byId.get(current.parentId) : undefined;
 		}
-		while (current && isClientInputWalEntry(current)) {
+		while (current && isHostOnlySessionEntry(current)) {
 			if (seen.has(current.id)) {
 				throw new Error("Session branch contains a parent cycle");
 			}
@@ -2475,14 +2552,14 @@ export class SessionManager {
 	}
 
 	/**
-	 * Get all conversation entries (excludes the header and host-only admission WAL).
+	 * Get all conversation entries (excludes the header and host-only sidecar records).
 	 * Returns a shallow copy.
 	 * The session is append-only: use appendXXX() to add entries, branch() to
 	 * change the leaf pointer. Entries cannot be modified or deleted.
 	 */
 	getEntries(): SessionEntry[] {
 		return this.fileEntries.filter(
-			(entry): entry is SessionEntry => entry.type !== "session" && !isClientInputWalEntry(entry),
+			(entry): entry is SessionEntry => entry.type !== "session" && !isHostOnlySessionEntry(entry),
 		);
 	}
 
@@ -2841,7 +2918,7 @@ export class SessionManager {
 		const forkEntries = [
 			newHeader,
 			...sourceEntries
-				.filter((entry): entry is SessionEntry => entry.type !== "session" && !isClientInputWalEntry(entry))
+				.filter((entry): entry is SessionEntry => entry.type !== "session" && !isHostOnlySessionEntry(entry))
 				.map(withoutClientInputIdentity),
 		];
 		writeDurableAtomicFileSync(newSessionFile, `${forkEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, {
