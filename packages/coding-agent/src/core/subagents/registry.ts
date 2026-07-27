@@ -25,6 +25,8 @@ export interface SubagentRegistryRecord {
 	followability?: SubagentRegistryFollowability;
 	/** True for runs recovered from persisted transcripts rather than started by this process. */
 	hydrated?: true;
+	/** True once a hydrated run's result has been delivered through follow (issue #129 §4). */
+	claimed?: true;
 	startedAt: number;
 	finishedAt?: number;
 	error?: string;
@@ -80,6 +82,7 @@ interface SubagentRegistryEntry {
 	task: string | undefined;
 	status: SubagentRegistryStatus;
 	hydrated: boolean;
+	claimed: boolean;
 	startedAt: number;
 	finishedAt: number | undefined;
 	error: string | undefined;
@@ -144,6 +147,7 @@ export class SubagentRegistry {
 			task: undefined,
 			status: "running",
 			hydrated: false,
+			claimed: false,
 			startedAt: Date.now(),
 			finishedAt: undefined,
 			error: undefined,
@@ -188,6 +192,7 @@ export class SubagentRegistry {
 			task: options.task === undefined ? undefined : boundText(options.task, REGISTRY_TASK_LIMIT_CHARS),
 			status: options.status,
 			hydrated: true,
+			claimed: false,
 			startedAt: options.startedAt,
 			finishedAt: options.finishedAt,
 			error: options.error === undefined ? undefined : boundText(options.error, REGISTRY_ERROR_LIMIT_CHARS),
@@ -365,6 +370,11 @@ export class SubagentRegistry {
 			);
 		}
 		if (entry.status !== "running") {
+			// Delivering a recovered result claims it: the §4 recovery notice
+			// stops offering runs whose reports already reached a conversation.
+			if (entry.hydrated) {
+				entry.claimed = true;
+			}
 			return this.toFollowResult(entry);
 		}
 		if (signal?.aborted) {
@@ -512,6 +522,7 @@ export class SubagentRegistry {
 			...(entry.task !== undefined ? { task: entry.task } : {}),
 			status: entry.status,
 			...(entry.hydrated ? { hydrated: true as const } : {}),
+			...(entry.claimed ? { claimed: true as const } : {}),
 			startedAt: entry.startedAt,
 			...(entry.finishedAt !== undefined ? { finishedAt: entry.finishedAt } : {}),
 			...(entry.error !== undefined ? { error: entry.error } : {}),

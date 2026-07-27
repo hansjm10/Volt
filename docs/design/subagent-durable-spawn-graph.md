@@ -1,12 +1,15 @@
 # Design: Durable subagent spawn graph and lazy result recovery
 
-> **Status: in progress (2026-07-27).** Tracking issue: #129. §§1-3 are
+> **Status: in progress (2026-07-27).** Tracking issue: #129. §§1-4 are
 > implemented with regression tests (`129-subagent-spawn-entries.test.ts`,
-> dispose suite). Deviations: §2 sources linkage from the durable spawn edges
-> rather than the tool's live activity (same data, already durable, no
-> coupling to tool internals); §3 does not rehydrate delegation-scope usage
-> (scopes are per-tool-call — see the corrected bullet) and maps statuses onto
-> the existing union with a `hydrated` marker. §§4-5 pending. Prior art: Codex
+> dispose suite, `agent-session-subagent-recovery-notice.test.ts`).
+> Deviations: §2 sources linkage from the durable spawn edges rather than the
+> tool's live activity (same data, already durable, no coupling to tool
+> internals); §3 does not rehydrate delegation-scope usage (scopes are
+> per-tool-call — see the corrected bullet) and maps statuses onto the
+> existing union with a `hydrated` marker; §4's notice dedupe is durable via
+> the persisted notice itself (in-memory `claimed` flags need not survive
+> restarts). §5 pending. Prior art: Codex
 > CLI persists parent→child spawn edges in a SQLite `agent_graph_store` and
 > resumes whole descendant trees from rollout files on session resume
 > (`resume_agent_from_rollout`, lazy `ensure_v2_agent_loaded`); OpenCode makes

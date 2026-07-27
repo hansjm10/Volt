@@ -453,6 +453,14 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 // AgentSession Class
 // ============================================================================
 
+/** Custom-message type of the persisted §4 subagent recovery notice (issue #129). */
+export const SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE = "subagent_recovery";
+const SUBAGENT_RECOVERY_NOTICE_MAX_LISTED = 8;
+
+function truncateHead(text: string, limit: number): string {
+	return text.length <= limit ? text : `${text.slice(0, Math.max(1, limit - 1))}…`;
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -558,6 +566,7 @@ export class AgentSession {
 	private _lspManager?: LspManager;
 	private _hostInteraction?: HostInteraction;
 	private _subagentToolManager?: SubagentToolManager;
+	private _subagentRecoveryNoticeDone = false;
 	private _mcpManager?: McpManager;
 	private _mcpManagerFactory?: () => Promise<McpManager | undefined> | McpManager | undefined;
 	private _unsubscribeMcpManager?: () => void;
@@ -1451,6 +1460,72 @@ export class AgentSession {
 		} catch {
 			// Best-effort: a persistence failure must not block dispose.
 		}
+	}
+
+	/**
+	 * One-shot per session lifetime (issue #129, design §4): after a reload,
+	 * surface completed-but-unclaimed subagent results recovered by registry
+	 * hydration as one compact context notice. Deduplication is durable — the
+	 * notice is itself a persisted custom message listing the offered run ids,
+	 * so a later restart never re-offers them even though in-memory claim
+	 * state does not survive.
+	 */
+	private async _maybeAppendSubagentRecoveryNotice(): Promise<void> {
+		if (this._subagentRecoveryNoticeDone || this.isBusy) {
+			return;
+		}
+		const manager = this._subagentToolManager;
+		if (!manager?.ensureRegistryHydrated || typeof manager.listDelegations !== "function") {
+			this._subagentRecoveryNoticeDone = true;
+			return;
+		}
+		this._subagentRecoveryNoticeDone = true;
+		try {
+			await manager.ensureRegistryHydrated();
+		} catch {
+			return;
+		}
+		const recovered = manager
+			.listDelegations()
+			.filter((record) => record.hydrated === true && record.status === "completed" && record.claimed !== true);
+		if (recovered.length === 0) {
+			return;
+		}
+		const noticedIds = new Set<string>();
+		for (const entry of this.sessionManager.getEntries()) {
+			if (entry.type !== "custom_message" || entry.customType !== SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE) {
+				continue;
+			}
+			const ids = (entry.details as { subagentIds?: unknown } | undefined)?.subagentIds;
+			if (!Array.isArray(ids)) {
+				continue;
+			}
+			for (const id of ids) {
+				if (typeof id === "string") {
+					noticedIds.add(id);
+				}
+			}
+		}
+		const fresh = recovered.filter((record) => !noticedIds.has(record.id));
+		if (fresh.length === 0) {
+			return;
+		}
+		const shown = fresh.slice(0, SUBAGENT_RECOVERY_NOTICE_MAX_LISTED);
+		const lines = shown.map((record) => {
+			const task = record.task === undefined ? "" : `: ${truncateHead(record.task, 80)}`;
+			return `- ${record.id} (${record.agent.name}${task})`;
+		});
+		const text = [
+			`Subagent recovery: ${fresh.length} subagent run${fresh.length === 1 ? "" : "s"} completed before this session reloaded, but the result${fresh.length === 1 ? "" : "s"} never reached this conversation:`,
+			...lines,
+			...(fresh.length > shown.length
+				? [`…and ${fresh.length - shown.length} more (inspect with { "list": true }).`]
+				: []),
+			`Retrieve a result with the subagent tool: { "follow": "<id>" }.`,
+		].join("\n");
+		this.sessionManager.appendCustomMessageEntry(SUBAGENT_RECOVERY_NOTICE_CUSTOM_TYPE, text, true, {
+			subagentIds: fresh.map((record) => record.id),
+		});
 	}
 
 	/**
@@ -2536,6 +2611,7 @@ export class AgentSession {
 			options?.assertConversationGenerationCurrent,
 		);
 		assertConversationGenerationCurrent();
+		await this._maybeAppendSubagentRecoveryNotice();
 		this._assertRecoveredClientInputOrdering(options?.clientMessageId);
 		const admission: ClientInputAdmission =
 			options?.clientMessageId === undefined
