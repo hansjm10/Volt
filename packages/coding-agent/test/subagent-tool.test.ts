@@ -164,6 +164,11 @@ describe("subagent tool", () => {
 		expect(tool.description).toContain("design-doc");
 		expect(tool.description).toContain("security-reviewer");
 		expect(tool.description).not.toContain("red-test-runner");
+		expect(tool.promptGuidelines).toContain("Use only the subagent names exposed by this tool.");
+		expect(tool.promptGuidelines?.join("\n")).not.toContain(
+			"Use subagent when a named specialized agent should handle focused work",
+		);
+		expect(tool.promptGuidelines?.join("\n")).not.toContain("Scale delegation to task complexity");
 	});
 
 	it("advertises only registry modes implemented by custom managers", async () => {
