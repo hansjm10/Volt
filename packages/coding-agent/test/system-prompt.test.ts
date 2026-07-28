@@ -146,8 +146,11 @@ describe("buildSystemPrompt", () => {
 				"Do not spawn a subagent merely because a request asks for depth, thoroughness, research, investigation, review, or touches multiple files.",
 			);
 			expect(prompt).toContain("when the user or applicable project instructions explicitly request it");
-			expect(prompt).toContain("a concrete, self-contained, non-critical-path side task");
-			expect(prompt).toContain("If there is no useful local work to continue, do the task yourself.");
+			expect(prompt).toContain(
+				"the benefit from specialization or isolation materially outweighs the synchronous startup, latency, and coordination cost",
+			);
+			expect(prompt).toContain("If that benefit is not clear, do the task yourself.");
+			expect(prompt).not.toContain("while you continue useful, non-overlapping local work");
 			expect(prompt).not.toContain(
 				"Delegate only when it improves quality, coverage, or latency; do not delegate simple direct edits.",
 			);
