@@ -146,7 +146,7 @@ const transcriptBaseProperties = {
 export const RpcTranscriptTextItemSchema = Type.Object(
 	{
 		...transcriptBaseProperties,
-		role: stringEnum(["user", "assistant"]),
+		role: stringEnum(["user", "assistant", "system"]),
 		text: Type.String(),
 		/** Stable submitting-client identity. Present only on remotely submitted user messages. */
 		clientMessageId: Type.Optional(Type.String()),

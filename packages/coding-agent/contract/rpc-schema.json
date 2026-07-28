@@ -10065,7 +10065,8 @@
 					"type": "string",
 					"enum": [
 						"user",
-						"assistant"
+						"assistant",
+						"system"
 					]
 				},
 				"text": {

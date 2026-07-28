@@ -31,6 +31,7 @@ import {
 	measureConversationProjectionUtf8BytesWithin,
 } from "../core/rpc/conversation-projection-limits.ts";
 import { getRpcErrorResponseTarget } from "../core/rpc/correlation.ts";
+import { getRemoteVisibleCustomMessageRole } from "../core/rpc/custom-message-projection.ts";
 import { extractMessageImages, projectMessageImages } from "../core/rpc/transcript.ts";
 import type { RpcConversationAssistantPart, RpcKeepAwakeStatus } from "../core/rpc/types.ts";
 import { REMOTE_TRANSCRIPT_DEFAULT_MAX_SERIALIZED_BYTES } from "../core/rpc/wire-limits.ts";
@@ -588,11 +589,12 @@ export function projectRemoteTranscriptEntry(
 		return item.text.length > 0 ? item : undefined;
 	}
 	if (entry.type === "custom_message") {
-		if (entry.customType !== "review" || entry.display !== true) {
+		const role = getRemoteVisibleCustomMessageRole(entry.customType, entry.display);
+		if (role === undefined) {
 			return undefined;
 		}
 		const text = extractTranscriptContentText(entry.content);
-		return text ? createRemoteTranscriptItem(entry, "assistant", text, authorization) : undefined;
+		return text ? createRemoteTranscriptItem(entry, role, text, authorization) : undefined;
 	}
 	if (entry.type !== "message" || !entry.message || typeof entry.message !== "object") {
 		return undefined;
@@ -1456,7 +1458,7 @@ function getRemoteTranscriptEntryCanonicalText(
 		return sanitize(entry.summary);
 	}
 	if (entry.type === "custom_message") {
-		if (entry.customType !== "review" || entry.display !== true) {
+		if (getRemoteVisibleCustomMessageRole(entry.customType, entry.display) === undefined) {
 			return undefined;
 		}
 		return sanitize(extractTranscriptContentText(entry.content));
