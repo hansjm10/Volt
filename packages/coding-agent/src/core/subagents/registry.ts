@@ -52,7 +52,7 @@ export interface SubagentFollowResult {
 	finishedAt: number;
 }
 
-export type SubagentSpawnConfirmationStatus = "reserved" | "pending" | "claimed";
+export type SubagentSpawnConfirmationStatus = "unreserved" | "reserved" | "pending" | "claimed";
 
 /** Atomic registry snapshot and reservation result for a proposed spawn request. */
 export interface SubagentSpawnConfirmationPreflight {
@@ -62,7 +62,7 @@ export interface SubagentSpawnConfirmationPreflight {
 	/** Full-registry status counts when records is bounded. */
 	statusCounts?: Record<SubagentRegistryStatus, number>;
 	status: SubagentSpawnConfirmationStatus;
-	expiresAt: number;
+	expiresAt?: number;
 	/** Present only when this call created the reservation. */
 	token?: string;
 }
@@ -330,6 +330,33 @@ export class SubagentRegistry {
 	get(id: string): SubagentRegistryRecord | undefined {
 		const entry = this.entries.get(id);
 		return entry ? this.toRecord(entry) : undefined;
+	}
+
+	/** Inspect current runs and exact-request state without creating a confirmation token. */
+	inspectSpawnConfirmation(
+		requestKey: string,
+		followerId?: string,
+		followerParentId?: string,
+	): SubagentSpawnConfirmationPreflight {
+		const snapshot = this.snapshotForFollower(SPAWN_CONFIRMATION_RECORD_LIMIT, followerId, followerParentId);
+		const registrySummary = {
+			records: snapshot.records,
+			total: snapshot.total,
+			statusCounts: this.getStatusCounts(),
+		};
+		this.pruneExpiredSpawnConfirmations(Date.now());
+		const existing = this.spawnConfirmations.get(requestKey);
+		return existing
+			? { ...registrySummary, status: existing.status, expiresAt: existing.expiresAt }
+			: { ...registrySummary, status: "unreserved" };
+	}
+
+	/** Revoke a pending exact-request token after capacity becomes unavailable. */
+	cancelPendingSpawnConfirmation(requestKey: string): void {
+		const confirmation = this.spawnConfirmations.get(requestKey);
+		if (confirmation?.status === "pending") {
+			this.spawnConfirmations.delete(requestKey);
+		}
 	}
 
 	/**

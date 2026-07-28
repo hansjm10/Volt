@@ -485,8 +485,20 @@ export function discoverSubagentDefinitions(options: DiscoverSubagentDefinitions
 	};
 }
 
+export type {
+	SubagentCallerDepthCapacitySnapshot,
+	SubagentCapacityLimitSnapshot,
+	SubagentSpawnCapacityConstraint,
+	SubagentSpawnCapacityMode,
+	SubagentSpawnCapacityPhase,
+	SubagentSpawnCapacityProposal,
+	SubagentSpawnCapacitySnapshot,
+	SubagentTreeCapacitySnapshot,
+} from "./capacity.ts";
 export {
 	DEFAULT_SUBAGENT_DELEGATION_LIMITS,
+	type SubagentDelegationBatchReservation,
+	type SubagentDelegationBatchReservationOptions,
 	type SubagentDelegationReservation,
 	SubagentDelegationScope,
 	type SubagentDelegationScopeLimits,
@@ -510,6 +522,9 @@ export {
 	type SubagentResult,
 	type SubagentRuntimeCreatedEvent,
 	type SubagentRuntimeRegistration,
+	type SubagentSpawnAdmissionResult,
+	type SubagentSpawnBatchLease,
+	type SubagentSpawnPreflight,
 	type SubagentSpawnRecordContext,
 	type SubagentStartByNameOptions,
 	type SubagentStartOptions,

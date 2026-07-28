@@ -19,8 +19,12 @@ import type {
 	SubagentHandle,
 	SubagentRegistryRecord,
 	SubagentResult,
-	SubagentSpawnConfirmationLease,
+	SubagentSpawnAdmissionResult,
+	SubagentSpawnBatchLease,
+	SubagentSpawnCapacityProposal,
+	SubagentSpawnCapacitySnapshot,
 	SubagentSpawnConfirmationPreflight,
+	SubagentSpawnPreflight,
 	SubagentStartByNameOptions,
 } from "../subagents/index.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "../subagents/tool-names.ts";
@@ -272,6 +276,8 @@ export interface SubagentToolDetails {
 	aggregateOutput?: SubagentToolOutputDetails;
 	/** Root-scoped recursive delegation accounting and final consumption. */
 	delegation?: SubagentDelegationScopeSnapshot;
+	/** Advisory or admitted whole-batch capacity associated with this spawn request. */
+	capacity?: SubagentSpawnCapacitySnapshot;
 	/** Epoch ms when execution started (single: task start; parallel/chain: overall start). */
 	startedAt?: number;
 	/** Overall duration in ms once execution reaches a terminal status. */
@@ -318,10 +324,16 @@ export interface SubagentToolManager {
 	/** Atomically list and reserve an exact spawn request across the session tree. */
 	prepareSpawnConfirmation?(
 		requestKey: string,
+		proposal: SubagentSpawnCapacityProposal,
 		options?: { reissuePending?: boolean },
-	): SubagentSpawnConfirmationPreflight;
-	/** Atomically claim a reserved exact spawn request. */
-	claimSpawnConfirmation?(requestKey: string, token: string): SubagentSpawnConfirmationLease | undefined;
+	): SubagentSpawnPreflight;
+	/** Atomically claim and capacity-admit a reserved exact spawn request. */
+	claimSpawnConfirmation?(
+		requestKey: string,
+		token: string,
+		proposal: SubagentSpawnCapacityProposal,
+		options?: { signal?: AbortSignal },
+	): SubagentSpawnAdmissionResult;
 	/** Result of an existing run, waiting for completion when still running, for follow mode. */
 	followDelegation?(subagentId: string, options?: { signal?: AbortSignal }): Promise<SubagentFollowResult>;
 	/** Reload an interrupted recovered run and let it finish, for resume mode (issue #129 §5). */
@@ -1348,37 +1360,67 @@ function createSubagentSpawnRequestKey(
 	return createHash("sha256").update(serialized).digest("hex");
 }
 
+type SubagentSpawnPreflightOutcome = "advisory" | "invalid-confirmation" | "admission-rejected";
+
+function createSubagentSpawnCapacityProposal(
+	normalized: Extract<NormalizedSubagentToolInput, { mode: "single" | "parallel" | "chain" }>,
+): SubagentSpawnCapacityProposal {
+	return {
+		mode: normalized.mode,
+		requestedStarts: normalized.tasks.length,
+		peakConcurrentStarts:
+			normalized.mode === "parallel"
+				? Math.min(normalized.tasks.length, DEFAULT_SUBAGENT_PARALLEL_MAX_CONCURRENCY)
+				: 1,
+	};
+}
+
 function createSubagentSpawnPreflightResult(
 	registryResult: AgentToolResult<SubagentToolDetails>,
-	preflight: SubagentSpawnConfirmationPreflight,
-	confirmationRejected: boolean,
+	preflight: SubagentSpawnPreflight,
+	outcome: SubagentSpawnPreflightOutcome,
 	maxBytes: number,
 	includeFollowMode: boolean,
 ): AgentToolResult<SubagentToolDetails> {
-	const status = confirmationRejected
-		? "The supplied confirmation token was not valid for this exact spawn request."
-		: "A registry preflight was completed.";
-	const confirmationInstruction = preflight.token
-		? `To start this exact request, repeat it unchanged with { "confirm": "${preflight.token}" } within 5 minutes. The token is one-time use.`
-		: preflight.status === "claimed"
-			? includeFollowMode
-				? "An identical request is already being started or run elsewhere in this session, so no new confirmation token was issued. Reuse its result, following it only when the registry marks it [followable]."
-				: "An identical request is already being started or run elsewhere in this session, so no new confirmation token was issued. Avoid starting another copy."
-			: "An identical request already has a pending confirmation elsewhere in this session, so no new confirmation token was issued. Reuse that pending request or retry after it expires.";
+	const status =
+		outcome === "admission-rejected"
+			? "Subagent batch admission was rejected. Zero children started."
+			: outcome === "invalid-confirmation"
+				? "The supplied confirmation token was not valid for this exact spawn request. No subagents were started."
+				: "A registry and capacity preflight was completed. No subagents were started.";
+	const confirmationInstruction = !preflight.capacity.fits
+		? `This proposal does not fit the current capacity constraints: ${preflight.capacity.constraints.join(", ") || "capacity unavailable"}. No usable confirmation token was issued. Reduce the batch, work locally, or return delegation upward.`
+		: preflight.token
+			? `To start this exact request, repeat it unchanged with { "confirm": "${preflight.token}" } within 5 minutes. The token is one-time use.`
+			: preflight.status === "claimed"
+				? includeFollowMode
+					? "An identical request is already being started or run elsewhere in this session, so no new confirmation token was issued. Reuse its result, following it only when the registry marks it [followable]."
+					: "An identical request is already being started or run elsewhere in this session, so no new confirmation token was issued. Avoid starting another copy."
+				: preflight.status === "pending"
+					? "An identical request already has a pending confirmation elsewhere in this session, so no new confirmation token was issued. Reuse that pending request or retry after it expires."
+					: "No confirmation token was issued for this request.";
 	const instructions = [
-		`${status} No subagents were started.`,
+		status,
+		`Capacity phase: ${preflight.capacity.phase}.`,
 		includeFollowMode
 			? "Review the session-wide registry below and reuse equivalent work instead of spawning a duplicate. Follow only records marked [followable]."
 			: "Review the session-wide registry below and avoid spawning duplicate work.",
 		confirmationInstruction,
 	].join("\n");
-	// The instructions carry the one-time confirmation token, so only the
-	// registry listing competes for the byte budget: a small aggregate limit
-	// must never truncate away the only way to confirm a spawn.
+	// The token and capacity guidance are non-truncatable. Only the registry
+	// listing competes for the byte budget.
 	const registryBudget = Math.max(0, maxBytes - Buffer.byteLength(`${instructions}\n\n`, "utf8"));
 	const registryText = truncateModelVisibleOutput(getTextContent(registryResult), registryBudget).text;
 	const text = registryText ? `${instructions}\n\n${registryText}` : instructions;
-	return { ...registryResult, content: [{ type: "text", text }] };
+	return {
+		...registryResult,
+		content: [{ type: "text", text }],
+		details: {
+			...registryResult.details,
+			...(outcome === "admission-rejected" ? { status: "failed" as const } : {}),
+			capacity: preflight.capacity,
+		},
+	};
 }
 
 function normalizeSubagentToolInput(params: SubagentToolInput): NormalizedSubagentToolInput {
@@ -2246,7 +2288,7 @@ export function createSubagentToolDefinition(
 				: []),
 			...(requiresSpawnConfirmation
 				? [
-						"Starting a single, parallel, or chain request is two-phase: the first request returns a live registry preflight and one-time confirmation token without starting any subagents.",
+						"Starting a single, parallel, or chain request is two-phase: the first request returns live registry and advisory capacity snapshots without starting subagents; confirmation atomically admits the whole batch before any child starts.",
 					]
 				: []),
 			"Child subagent tools are clamped to the current parent/session tool policy.",
@@ -2257,8 +2299,8 @@ export function createSubagentToolDefinition(
 			...(requiresSpawnConfirmation
 				? [
 						includeFollowMode
-							? "The first spawn request only lists the session-wide registry. Review it, reuse equivalent work, follow only records marked [followable], and repeat the exact request with the returned confirmation token only when a new run is still needed."
-							: "The first spawn request only lists the session-wide registry. Review it, avoid duplicating equivalent work, and repeat the exact request with the returned confirmation token only when a new run is still needed.",
+							? "The first spawn request returns the session-wide registry and current capacity. Review it, reuse equivalent work, follow only records marked [followable], and repeat the exact request with the returned confirmation token only when the whole batch fits and a new run is still needed."
+							: "The first spawn request returns the session-wide registry and current capacity. Review it, avoid duplicating equivalent work, and repeat the exact request with the returned confirmation token only when the whole batch fits and a new run is still needed.",
 					]
 				: includeListMode && includeFollowMode
 					? [
@@ -2335,17 +2377,27 @@ export function createSubagentToolDefinition(
 				}
 			}
 			const requestKey = createSubagentSpawnRequestKey(normalized);
-			let spawnConfirmationLease: SubagentSpawnConfirmationLease | undefined;
+			const capacityProposal = createSubagentSpawnCapacityProposal(normalized);
+			let spawnBatchLease: SubagentSpawnBatchLease | undefined;
+			let admittedCapacity: SubagentSpawnCapacitySnapshot | undefined;
 			if (requiresSpawnConfirmation) {
-				spawnConfirmationLease = normalized.confirm
-					? options.manager.claimSpawnConfirmation?.(requestKey, normalized.confirm)
+				const admission = normalized.confirm
+					? options.manager.claimSpawnConfirmation?.(requestKey, normalized.confirm, capacityProposal, {
+							signal,
+						})
 					: undefined;
-				if (!spawnConfirmationLease) {
-					// A failed claim rotates a still-pending token so a garbled confirm
-					// cannot lock this exact request out until the reservation expires.
-					const preflight = normalized.confirm
-						? options.manager.prepareSpawnConfirmation?.(requestKey, { reissuePending: true })
-						: options.manager.prepareSpawnConfirmation?.(requestKey);
+				if (admission?.status === "admitted") {
+					spawnBatchLease = admission.lease;
+					admittedCapacity = admission.capacity;
+				} else {
+					const preflight =
+						admission?.status === "capacity-rejected"
+							? admission.preflight
+							: normalized.confirm
+								? options.manager.prepareSpawnConfirmation?.(requestKey, capacityProposal, {
+										reissuePending: true,
+									})
+								: options.manager.prepareSpawnConfirmation?.(requestKey, capacityProposal);
 					if (!preflight) {
 						throw new Error("The subagent spawn confirmation registry is not available in this session.");
 					}
@@ -2359,7 +2411,11 @@ export function createSubagentToolDefinition(
 					return createSubagentSpawnPreflightResult(
 						registryResult,
 						preflight,
-						normalized.confirm !== undefined,
+						admission?.status === "capacity-rejected"
+							? "admission-rejected"
+							: normalized.confirm
+								? "invalid-confirmation"
+								: "advisory",
 						maxAggregateOutputBytes,
 						includeFollowMode,
 					);
@@ -2368,9 +2424,11 @@ export function createSubagentToolDefinition(
 			const executionStartedAt = Date.now();
 			let delegationLease: SubagentDelegationScopeLease | undefined;
 			try {
-				delegationLease = options.manager.createDelegationScope?.({ signal });
+				delegationLease = spawnBatchLease
+					? { scope: spawnBatchLease.scope, owned: false }
+					: options.manager.createDelegationScope?.({ signal });
 			} catch (error) {
-				spawnConfirmationLease?.release();
+				spawnBatchLease?.release();
 				throw error;
 			}
 			const activeHandles = new Set<SubagentHandle>();
@@ -2384,8 +2442,11 @@ export function createSubagentToolDefinition(
 			const abortPromise = new Promise<never>((_resolve, reject) => {
 				abortReject = reject;
 			});
-			const withDelegation = (details: SubagentToolDetails): SubagentToolDetails =>
-				delegationLease ? { ...details, delegation: delegationLease.scope.snapshot() } : details;
+			const withDelegation = (details: SubagentToolDetails): SubagentToolDetails => ({
+				...details,
+				...(delegationLease ? { delegation: delegationLease.scope.snapshot() } : {}),
+				...(admittedCapacity ? { capacity: admittedCapacity } : {}),
+			});
 
 			const emitToolUpdate = (details: SubagentToolDetails, text: string): void => {
 				if (!onUpdate || !acceptingUpdates || signal?.aborted) {
@@ -2499,7 +2560,11 @@ export function createSubagentToolDefinition(
 						definition = options.manager.getDefinition(task.agent);
 						const startPromise = options.manager.startByName(task.agent, {
 							allowedTools: options.getAllowedTools?.(),
-							...(delegationLease ? { delegationScope: delegationLease.scope } : {}),
+							...(spawnBatchLease
+								? { spawnBatchLease }
+								: delegationLease
+									? { delegationScope: delegationLease.scope }
+									: {}),
 							spawnRecord: { toolCallId, requestKey },
 						});
 						void startPromise
@@ -2761,7 +2826,7 @@ export function createSubagentToolDefinition(
 					try {
 						if (delegationLease?.owned) delegationLease.scope.dispose();
 					} finally {
-						spawnConfirmationLease?.release();
+						spawnBatchLease?.release();
 					}
 				}
 			}

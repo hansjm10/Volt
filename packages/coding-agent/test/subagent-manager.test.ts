@@ -1088,6 +1088,207 @@ describe("SubagentManager", () => {
 		expect(scope.snapshot()).toMatchObject({ startsUsed: 100, activeDescendants: 0 });
 	});
 
+	it("atomically holds and recycles batch start and active permits", () => {
+		const scope = new SubagentDelegationScope({ limits: { maxStarts: 3, maxActiveDescendants: 1, maxDepth: 2 } });
+		cleanups.push(() => scope.dispose());
+		expect(scope.capacitySnapshot()).toMatchObject({
+			maxStarts: { maximum: 3, used: 0, reserved: 0, remaining: 3 },
+			maxActiveDescendants: { maximum: 1, used: 0, reserved: 0, remaining: 1 },
+			maxDepth: { maximum: 2, used: 0, reserved: 0, remaining: 2 },
+		});
+
+		const batch = scope.reserveBatch({ requestedStarts: 3, peakActiveDescendants: 1, depth: 1 });
+		expect(scope.capacitySnapshot()).toMatchObject({
+			maxStarts: { used: 0, reserved: 3, remaining: 0 },
+			maxActiveDescendants: { used: 0, reserved: 1, remaining: 0 },
+			maxDepth: { used: 0, reserved: 1, remaining: 1 },
+		});
+		expect(() => scope.reserve("direct", 1)).toThrow(/used or reserved 3 subagent starts/);
+
+		const first = batch.reserve("first");
+		first.commit("sa_first", () => undefined);
+		expect(() => batch.reserve("second")).toThrow(/no available active permits/);
+		first.release();
+
+		const failedStart = batch.reserve("failed");
+		failedStart.rollback();
+		expect(scope.capacitySnapshot()).toMatchObject({
+			maxStarts: { used: 1, reserved: 2, remaining: 0 },
+			maxActiveDescendants: { used: 0, reserved: 1, remaining: 0 },
+		});
+
+		const second = batch.reserve("second");
+		second.commit("sa_second", () => undefined);
+		second.release();
+		batch.release();
+		expect(scope.capacitySnapshot()).toMatchObject({
+			maxStarts: { used: 2, reserved: 0, remaining: 1 },
+			maxActiveDescendants: { used: 0, reserved: 0, remaining: 1 },
+		});
+	});
+
+	it("refunds unused batch permits when the delegation scope aborts", () => {
+		const scope = new SubagentDelegationScope({ limits: { maxStarts: 2, maxActiveDescendants: 2 } });
+		cleanups.push(() => scope.dispose());
+		scope.reserveBatch({ requestedStarts: 2, peakActiveDescendants: 2, depth: 1 });
+		expect(scope.capacitySnapshot().maxStarts.reserved).toBe(2);
+
+		scope.abort(new Error("stop batch"));
+
+		expect(scope.capacitySnapshot()).toMatchObject({
+			maxStarts: { used: 0, reserved: 0, remaining: 2 },
+			maxActiveDescendants: { used: 0, reserved: 0, remaining: 2 },
+			aborted: true,
+		});
+	});
+
+	it("reports unlimited root capacity and admitted batch reservations", async () => {
+		const { manager } = await createTestManager();
+		const proposal = { mode: "parallel" as const, requestedStarts: 2, peakConcurrentStarts: 2 };
+		const preflight = manager.prepareSpawnConfirmation("root-batch", proposal);
+
+		expect(preflight.capacity).toMatchObject({
+			phase: "advisory",
+			proposal,
+			caller: {
+				maxChildAgents: { maximum: null, used: 0, reserved: 0, remaining: null },
+				depth: { maximum: null, used: 0, reserved: 0, remaining: null },
+			},
+			tree: {
+				maxStarts: { maximum: 100, used: 0, reserved: 0, remaining: 100 },
+				maxActiveDescendants: { maximum: 16, used: 0, reserved: 0, remaining: 16 },
+				maxDepth: { maximum: 5, used: 0, reserved: 0, remaining: 5 },
+			},
+			fits: true,
+			constraints: [],
+		});
+		if (!preflight.token) throw new Error("expected root confirmation token");
+		const admission = manager.claimSpawnConfirmation("root-batch", preflight.token, proposal);
+		expect(admission.status).toBe("admitted");
+		if (admission.status !== "admitted") throw new Error("expected admitted root batch");
+		expect(admission.capacity).toMatchObject({
+			phase: "admitted",
+			caller: { maxChildAgents: { maximum: null, used: 0, reserved: 2, remaining: null } },
+			tree: {
+				maxStarts: { used: 0, reserved: 2, remaining: 98 },
+				maxActiveDescendants: { used: 0, reserved: 2, remaining: 14 },
+				maxDepth: { used: 0, reserved: 1, remaining: 4 },
+			},
+		});
+		admission.lease.release();
+	});
+
+	it("rejects confirmation atomically when caller capacity changed after preflight", async () => {
+		const scope = new SubagentDelegationScope({
+			limits: { maxStarts: 4, maxActiveDescendants: 4, maxDepth: 3 },
+		});
+		cleanups.push(() => scope.dispose());
+		const resourceLoader = createSubagentResourceLoader([createDefinition({ name: "researcher" })]);
+		const { manager } = await createTestManager({
+			resourceLoader,
+			subagentContext: createTestSubagentContext({
+				depth: 1,
+				agentName: "researcher",
+				path: ["researcher"],
+				delegationScope: scope,
+				allowedSubagents: ["researcher"],
+				maxSubagentDepth: 3,
+				maxChildAgents: 2,
+			}),
+		});
+		const proposal = { mode: "parallel" as const, requestedStarts: 2, peakConcurrentStarts: 2 };
+		const preflight = manager.prepareSpawnConfirmation("racing-batch", proposal);
+		if (!preflight.token) throw new Error("expected confirmation token");
+
+		const direct = await manager.startByName("researcher");
+		const admission = manager.claimSpawnConfirmation("racing-batch", preflight.token, proposal);
+
+		expect(admission.status).toBe("capacity-rejected");
+		if (admission.status !== "capacity-rejected") throw new Error("expected capacity rejection");
+		expect(admission.preflight.capacity).toMatchObject({
+			phase: "admission-rejected",
+			caller: { maxChildAgents: { maximum: 2, used: 1, reserved: 0, remaining: 1 } },
+			fits: false,
+			constraints: ["caller-max-child-agents"],
+		});
+		expect(scope.capacitySnapshot().maxStarts).toMatchObject({ used: 1, reserved: 0 });
+		expect(manager.claimSpawnConfirmation("racing-batch", preflight.token, proposal).status).toBe("invalid");
+		await direct.dispose();
+	});
+
+	it("admits only one competing batch within the caller start budget", async () => {
+		const scope = createTestDelegationScope();
+		const { manager } = await createTestManager({
+			subagentContext: createTestSubagentContext({
+				depth: 1,
+				agentName: "coordinator",
+				path: ["coordinator"],
+				delegationScope: scope,
+				allowedSubagents: ["worker"],
+				maxSubagentDepth: 3,
+				maxChildAgents: 3,
+			}),
+		});
+		const proposal = { mode: "parallel" as const, requestedStarts: 2, peakConcurrentStarts: 2 };
+		const first = manager.prepareSpawnConfirmation("batch-a", proposal);
+		const second = manager.prepareSpawnConfirmation("batch-b", proposal);
+		if (!first.token || !second.token) throw new Error("expected competing confirmation tokens");
+
+		const firstAdmission = manager.claimSpawnConfirmation("batch-a", first.token, proposal);
+		const secondAdmission = manager.claimSpawnConfirmation("batch-b", second.token, proposal);
+
+		expect(firstAdmission.status).toBe("admitted");
+		expect(secondAdmission.status).toBe("capacity-rejected");
+		if (firstAdmission.status !== "admitted" || secondAdmission.status !== "capacity-rejected") {
+			throw new Error("unexpected competing admission results");
+		}
+		expect(secondAdmission.preflight.capacity).toMatchObject({
+			caller: { maxChildAgents: { maximum: 3, used: 0, reserved: 2, remaining: 1 } },
+			constraints: ["caller-max-child-agents"],
+		});
+		firstAdmission.lease.release();
+	});
+
+	it("rolls a failed pre-creation batch start back into the admission", async () => {
+		const scope = createTestDelegationScope();
+		const resourceLoader = createSubagentResourceLoader([
+			createDefinition({ name: "bad-thinking", thinking: "turbo" }),
+		]);
+		const { manager } = await createTestManager({
+			resourceLoader,
+			subagentContext: createTestSubagentContext({
+				depth: 1,
+				agentName: "coordinator",
+				path: ["coordinator"],
+				delegationScope: scope,
+				allowedSubagents: ["bad-thinking"],
+				maxSubagentDepth: 3,
+				maxChildAgents: 2,
+			}),
+		});
+		const proposal = { mode: "parallel" as const, requestedStarts: 2, peakConcurrentStarts: 2 };
+		const preflight = manager.prepareSpawnConfirmation("rollback-batch", proposal);
+		if (!preflight.token) throw new Error("expected rollback confirmation token");
+		const admission = manager.claimSpawnConfirmation("rollback-batch", preflight.token, proposal);
+		if (admission.status !== "admitted") throw new Error("expected admitted rollback batch");
+
+		await expect(manager.startByName("bad-thinking", { spawnBatchLease: admission.lease })).rejects.toBeInstanceOf(
+			SubagentDefinitionConfigurationError,
+		);
+		expect(scope.capacitySnapshot()).toMatchObject({
+			maxStarts: { used: 0, reserved: 2 },
+			maxActiveDescendants: { used: 0, reserved: 2 },
+		});
+		expect(manager.listAvailableDefinitions()).toEqual([]);
+
+		admission.lease.release();
+		expect(scope.capacitySnapshot()).toMatchObject({
+			maxStarts: { used: 0, reserved: 0 },
+			maxActiveDescendants: { used: 0, reserved: 0 },
+		});
+		expect(manager.listAvailableDefinitions().map((definition) => definition.name)).toEqual(["bad-thinking"]);
+	});
+
 	it("passes nested delegation paths to child runtime context", async () => {
 		const observedContexts: Array<SubagentRuntimeContext | undefined> = [];
 		const resourceLoader = createSubagentResourceLoader([
