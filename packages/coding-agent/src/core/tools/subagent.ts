@@ -2203,7 +2203,7 @@ export function createSubagentToolDefinition(
 		? availableNames.length > 0
 			? `Use only these available subagent names: ${availableNames.join(", ")}.`
 			: "No subagents are currently available for delegation."
-		: "Prefer specialized built-ins when they fit: researcher for evidence, design-doc for planning/RFCs, security-reviewer for security review, and general for ad hoc delegation.";
+		: "Use only the subagent names exposed by this tool.";
 	const maxOutputBytes = Math.min(
 		requirePositiveInteger(options.maxOutputBytes ?? DEFAULT_SUBAGENT_OUTPUT_MAX_BYTES, "maxOutputBytes"),
 		DEFAULT_SUBAGENT_OUTPUT_MAX_BYTES,
@@ -2253,9 +2253,7 @@ export function createSubagentToolDefinition(
 		].join(" "),
 		promptSnippet: "Delegate tasks to named isolated subagents",
 		promptGuidelines: [
-			"Use subagent when a named specialized agent should handle focused work in an isolated context.",
 			availableGuideline,
-			"Scale delegation to task complexity, avoid duplicate assignments, and stop spawning once existing evidence is sufficient.",
 			...(requiresSpawnConfirmation
 				? [
 						includeFollowMode

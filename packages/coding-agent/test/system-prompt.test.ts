@@ -133,6 +133,25 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain("Choose only among the agent names exposed by the subagent tool");
 			expect(prompt).not.toContain("Prefer specialized built-ins when they fit: researcher");
 		});
+
+		test("makes subagent delegation local-first by default", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain("Work locally by default.");
+			expect(prompt).toContain(
+				"Do not spawn a subagent merely because a request asks for depth, thoroughness, research, investigation, review, or touches multiple files.",
+			);
+			expect(prompt).toContain("when the user or applicable project instructions explicitly request it");
+			expect(prompt).toContain("a concrete, self-contained, non-critical-path side task");
+			expect(prompt).toContain("If there is no useful local work to continue, do the task yourself.");
+			expect(prompt).not.toContain(
+				"Delegate only when it improves quality, coverage, or latency; do not delegate simple direct edits.",
+			);
+		});
 	});
 
 	describe("custom tool snippets", () => {
