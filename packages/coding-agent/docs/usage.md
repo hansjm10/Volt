@@ -117,6 +117,8 @@ Set the `reviewModel` setting (e.g. `"anthropic/claude-opus-4-5"`) to review wit
 
 Subagents are named child Volt sessions with isolated context. Volt includes built-in subagents for common workflows:
 
+Volt's default model policy is local-first: the root agent normally completes work itself. It delegates when the user or project requests it, or when a bounded, self-contained task benefits enough from specialization or context isolation to justify synchronous coordination. Model-facing `subagent` calls are awaited until their child work finishes, so delegation does not let the root agent continue working concurrently.
+
 | Name | Purpose | Tool posture |
 | --- | --- | --- |
 | `general` | Ad hoc delegated tasks | Broad normal tools plus registry access, but no `subagent` spawning tool |

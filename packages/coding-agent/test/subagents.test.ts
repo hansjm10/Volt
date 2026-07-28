@@ -209,7 +209,10 @@ describe("subagent definitions", () => {
 		expect(researcher?.tools).toContain("subagent_registry");
 		expect(researcher?.tools).not.toContain("bash");
 		expect(researcher?.tools).not.toContain("lsp");
-		expect(researcher?.systemPrompt).toContain("When delegation is allowed by the base policy");
+		expect(researcher?.systemPrompt).toContain(
+			"Follow any applicable delegation policy; otherwise remain local-first.",
+		);
+		expect(researcher?.systemPrompt).not.toContain("base policy");
 		expect(researcher?.systemPrompt).not.toContain("would benefit from a fresh, narrower researcher context");
 		expect(designDoc).toMatchObject({
 			description: "Design document planner and synthesizer for sourced technical decisions",
@@ -218,7 +221,10 @@ describe("subagent definitions", () => {
 			maxChildAgents: 8,
 		});
 		expect(designDoc?.tools).toBeUndefined();
-		expect(designDoc?.systemPrompt).toContain("Follow the base delegation policy");
+		expect(designDoc?.systemPrompt).toContain(
+			"Follow any applicable delegation policy; otherwise remain local-first.",
+		);
+		expect(designDoc?.systemPrompt).not.toContain("base delegation policy");
 		expect(designDoc?.systemPrompt).not.toContain("use 2-4 children");
 		expect(designDoc?.systemPrompt).not.toContain("Use the subagent tool for broad or uncertain work");
 		expect(securityReviewer).toMatchObject({
@@ -231,7 +237,10 @@ describe("subagent definitions", () => {
 		expect(securityReviewer?.tools).not.toContain("bash");
 		expect(securityReviewer?.tools).not.toContain("lsp");
 		expect(securityReviewer?.tools).not.toContain("write");
-		expect(securityReviewer?.systemPrompt).toContain("When delegation is allowed by the base policy");
+		expect(securityReviewer?.systemPrompt).toContain(
+			"Follow any applicable delegation policy; otherwise remain local-first.",
+		);
+		expect(securityReviewer?.systemPrompt).not.toContain("base policy");
 		expect(securityReviewer?.systemPrompt).not.toContain("when it improves coverage");
 		expect(result.diagnostics).toEqual([]);
 		expect(result.userAgentsDir).toBe(join(agentDir, "agents"));
