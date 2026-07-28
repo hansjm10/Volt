@@ -235,7 +235,9 @@ Core exposes a `subagent` tool when a `SubagentManager` exists and its current d
 - Parallel: `{ "tasks": [{ "agent": "scout", "task": "..." }] }`, capped at 8 tasks
 - Chain: `{ "chain": [{ "agent": "scout", "task": "... {previous}" }] }`, capped at 8 steps
 
-Spawn modes are two-phase when the manager exposes the shared atomic confirmation API. The first request lists the live registry and reserves a SHA-256 key derived from the normalized mode and ordered agent/task inputs; it starts nothing and returns an opaque one-time token. Repeating the exact request with `confirm` claims that reservation and starts the run. Exact duplicate agent/task pairs inside one parallel request are rejected before preflight.
+Spawn modes are two-phase when the manager exposes the shared atomic confirmation API. The first request lists the live registry and returns a JSON-safe advisory capacity snapshot for the exact proposal: requested starts; peak width (one for single/chain, up to four for parallel); caller `maxChildAgents` and local-depth headroom; tree start, active-descendant, and depth headroom; `fits`; and machine-readable constraints. Unlimited maxima and remaining values are `null`. The registry reserves a SHA-256 key derived from the normalized mode and ordered agent/task inputs only when the proposal currently fits; a non-fitting request starts nothing, receives no usable token, and is directed to reduce the batch, work locally, or return delegation upward. Exact duplicate agent/task pairs inside one parallel request are rejected before preflight.
+
+Repeating the exact request with `confirm` atomically claims its one-time registry token and reserves the whole batch in `SubagentManager` before any child starts. Admission holds every caller/tree start permit plus only the proposal's peak active width, so sequential chains are not charged as fully concurrent. Direct and competing batch starts account for held permits. Each `startByName()` consumes a pre-reserved caller/tree permit; active permits return to an admitted chain or parallel worker as children settle. Starts that created a child remain consumed, while unused permits are refunded after pre-creation failure, abort, early chain termination, or tool settlement. Capacity changes between preflight and confirmation return a structured `admission-rejected` result stating that zero children started; provider/runtime/child failures after admission remain ordinary per-task failures with child metadata.
 
 A standard `subagent_registry` tool is registered only for runtimes whose manager has a `SubagentRuntimeContext`, independently of whether spawning is currently available. It supports:
 
@@ -254,6 +256,7 @@ The tool result returns:
 - child session id when available
 - bounded transcript/tool summary
 - usage and cost when available
+- advisory or admitted capacity phase, proposal, headroom, fit, and constraints when confirmation is enabled
 
 Model-visible output is capped at 50 KB per task/step, while parallel results and registry list pages have a 100 KB aggregate cap; details payloads additionally bound task entries and retained output text so unbounded task counts stay under remote frame limits. Chain `{previous}` substitution uses that bounded output, XML-escapes it, and wraps it as untrusted prior data instead of forwarding raw child text. Delegation tool calls have no automatic deadline by default, but the shared delegation scope enforces tree-wide depth/start/active/turn/token/cost ceilings (deadline opt-in via `maxDurationMs`); SDK callers may opt into a call-specific `runTimeoutMs`, and users or parents can cancel explicitly. Full child output remains in child session state when available; tool details include status, usage, truncation, error metadata, and a final snapshot of tree-wide accounting.
 
@@ -408,6 +411,9 @@ Integration tests:
 - max-depth children omit `subagent` spawning while retaining callable `subagent_registry` list/follow access
 - registry tool calls project through stdio, loopback, and Iroh as ordinary tool events
 - concurrent identical spawn requests across separate tool instances share one atomic registry reservation
+- advisory preflight exposes caller/tree headroom and issues no token when the whole proposal cannot fit
+- confirmation atomically reserves caller starts, tree starts, and peak active width so competing batches cannot partially start
+- unused admission permits return after abort, pre-creation failure, and early chain termination
 - parallel children respect concurrency limits
 - child provider/tool errors do not crash parent runtime
 - app-visible sessions keep the selected workspace/session identity through the existing remote flow

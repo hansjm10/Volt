@@ -664,6 +664,8 @@ export {
 	type SubagentActivityEvent,
 	type SubagentActivityListener,
 	type SubagentActivityStatus,
+	type SubagentCallerDepthCapacitySnapshot,
+	type SubagentCapacityLimitSnapshot,
 	type SubagentDefinition,
 	SubagentDefinitionConfigurationError,
 	SubagentDefinitionNotFoundError,
@@ -683,8 +685,17 @@ export {
 	type SubagentResult,
 	type SubagentRuntimeCreatedEvent,
 	type SubagentRuntimeRegistration,
+	type SubagentSpawnAdmissionResult,
+	type SubagentSpawnBatchLease,
+	type SubagentSpawnCapacityConstraint,
+	type SubagentSpawnCapacityMode,
+	type SubagentSpawnCapacityPhase,
+	type SubagentSpawnCapacityProposal,
+	type SubagentSpawnCapacitySnapshot,
+	type SubagentSpawnPreflight,
 	type SubagentStartByNameOptions,
 	type SubagentStartOptions,
+	type SubagentTreeCapacitySnapshot,
 } from "./core/subagents/index.ts";
 // Theme utilities for custom tools and extensions
 export {

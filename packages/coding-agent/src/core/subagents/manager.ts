@@ -16,7 +16,15 @@ import { parseModelPattern } from "../model-resolver.ts";
 import type { ResourceLoader } from "../resource-loader.ts";
 import type { RpcSessionState, RpcTranscriptResponse } from "../rpc/types.ts";
 import { SessionManager } from "../session-manager.ts";
+import type {
+	SubagentCapacityLimitSnapshot,
+	SubagentSpawnCapacityConstraint,
+	SubagentSpawnCapacityPhase,
+	SubagentSpawnCapacityProposal,
+	SubagentSpawnCapacitySnapshot,
+} from "./capacity.ts";
 import {
+	type SubagentDelegationBatchReservation,
 	type SubagentDelegationReservation,
 	SubagentDelegationScope,
 	type SubagentDelegationScopeLimits,
@@ -29,7 +37,6 @@ import {
 	type SubagentRegistryRecord,
 	type SubagentRegistrySnapshot,
 	type SubagentRegistryStatus,
-	type SubagentSpawnConfirmationLease,
 	type SubagentSpawnConfirmationPreflight,
 } from "./registry.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "./tool-names.ts";
@@ -135,6 +142,22 @@ export interface SubagentDelegationScopeLease {
 	owned: boolean;
 }
 
+export interface SubagentSpawnPreflight extends SubagentSpawnConfirmationPreflight {
+	capacity: SubagentSpawnCapacitySnapshot;
+}
+
+/** Opaque whole-batch admission consumed only by the manager that issued it. */
+export interface SubagentSpawnBatchLease {
+	readonly scope: SubagentDelegationScope;
+	readonly capacity: SubagentSpawnCapacitySnapshot;
+	release(): void;
+}
+
+export type SubagentSpawnAdmissionResult =
+	| { status: "admitted"; capacity: SubagentSpawnCapacitySnapshot; lease: SubagentSpawnBatchLease }
+	| { status: "invalid" }
+	| { status: "capacity-rejected"; preflight: SubagentSpawnPreflight };
+
 export interface SubagentStartOptions {
 	cwd?: string;
 	agentDir?: string;
@@ -142,6 +165,8 @@ export interface SubagentStartOptions {
 	requestTimeoutMs?: number;
 	/** Shared root budget for all descendants created by one delegation tool call. */
 	delegationScope?: SubagentDelegationScope;
+	/** Whole-batch admission issued by this manager for a confirmed spawn request. */
+	spawnBatchLease?: SubagentSpawnBatchLease;
 	/**
 	 * Attribution for the durable spawn edge recorded in the parent transcript at
 	 * the publish commit point (issue #129). Omitted for programmatic starts,
@@ -206,6 +231,16 @@ const MAX_RETAINED_ACTIVITIES = 50;
 const MAX_RETAINED_ACTIVITY_EVENTS = 2_000;
 const DELEGATION_SNAPSHOT_MAX_RECORDS = 25;
 
+interface SubagentCallerBatchReservation {
+	reserve(): () => void;
+	release(): void;
+}
+
+interface SubagentBatchAdmissionState {
+	caller: SubagentCallerBatchReservation;
+	tree: SubagentDelegationBatchReservation;
+}
+
 interface MutableSubagentActivity {
 	id: string;
 	sessionId: string;
@@ -227,6 +262,31 @@ interface MutableSubagentActivity {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function capacityLimitSnapshot(
+	maximum: number | undefined,
+	used: number,
+	reserved: number,
+): SubagentCapacityLimitSnapshot {
+	return {
+		maximum: maximum === undefined || !Number.isFinite(maximum) ? null : maximum,
+		used,
+		reserved,
+		remaining: maximum === undefined || !Number.isFinite(maximum) ? null : Math.max(0, maximum - used - reserved),
+	};
+}
+
+function validateCapacityProposal(proposal: SubagentSpawnCapacityProposal): void {
+	if (!Number.isSafeInteger(proposal.requestedStarts) || proposal.requestedStarts <= 0) {
+		throw new Error("Subagent capacity requestedStarts must be a positive safe integer");
+	}
+	if (!Number.isSafeInteger(proposal.peakConcurrentStarts) || proposal.peakConcurrentStarts <= 0) {
+		throw new Error("Subagent capacity peakConcurrentStarts must be a positive safe integer");
+	}
+	if (proposal.peakConcurrentStarts > proposal.requestedStarts) {
+		throw new Error("Subagent capacity peakConcurrentStarts cannot exceed requestedStarts");
+	}
 }
 
 /** Start-time system prompt context containing only registry-controlled run metadata. */
@@ -710,6 +770,8 @@ export class SubagentManager {
 	private readonly activities = new Map<string, MutableSubagentActivity>();
 	private readonly activityListeners = new Set<SubagentActivityListener>();
 	private childStartCount = 0;
+	private reservedChildStartCount = 0;
+	private readonly batchAdmissions = new WeakMap<SubagentSpawnBatchLease, SubagentBatchAdmissionState>();
 	private disposePromise: Promise<void> | undefined;
 	private pendingStartCount = 0;
 	private readonly pendingStartWaiters = new Set<() => void>();
@@ -758,18 +820,95 @@ export class SubagentManager {
 
 	prepareSpawnConfirmation(
 		requestKey: string,
+		proposal: SubagentSpawnCapacityProposal,
 		options?: { reissuePending?: boolean },
-	): SubagentSpawnConfirmationPreflight {
-		return this.getRegistry().prepareSpawnConfirmation(
-			requestKey,
-			this.subagentContext?.subagentId,
-			undefined,
-			options,
-		);
+	): SubagentSpawnPreflight {
+		validateCapacityProposal(proposal);
+		const scopeLease = this.createDelegationScope();
+		const capacity = this.createSpawnCapacitySnapshot(proposal, "advisory", scopeLease.scope);
+		if (scopeLease.owned) {
+			scopeLease.scope.dispose();
+		}
+		const registry = this.getRegistry();
+		if (!capacity.fits) {
+			registry.cancelPendingSpawnConfirmation(requestKey);
+			return {
+				...registry.inspectSpawnConfirmation(requestKey, this.subagentContext?.subagentId),
+				capacity,
+			};
+		}
+		return {
+			...registry.prepareSpawnConfirmation(requestKey, this.subagentContext?.subagentId, undefined, options),
+			capacity,
+		};
 	}
 
-	claimSpawnConfirmation(requestKey: string, token: string): SubagentSpawnConfirmationLease | undefined {
-		return this.getRegistry().claimSpawnConfirmation(requestKey, token);
+	claimSpawnConfirmation(
+		requestKey: string,
+		token: string,
+		proposal: SubagentSpawnCapacityProposal,
+		options: { signal?: AbortSignal } = {},
+	): SubagentSpawnAdmissionResult {
+		validateCapacityProposal(proposal);
+		const registry = this.getRegistry();
+		const confirmation = registry.claimSpawnConfirmation(requestKey, token);
+		if (!confirmation) {
+			return { status: "invalid" };
+		}
+
+		const scopeLease = this.createDelegationScope(options);
+		const advisory = this.createSpawnCapacitySnapshot(proposal, "advisory", scopeLease.scope);
+		if (!advisory.fits) {
+			confirmation.release();
+			if (scopeLease.owned) {
+				scopeLease.scope.dispose();
+			}
+			return {
+				status: "capacity-rejected",
+				preflight: {
+					...registry.inspectSpawnConfirmation(requestKey, this.subagentContext?.subagentId),
+					capacity: { ...advisory, phase: "admission-rejected" },
+				},
+			};
+		}
+
+		const caller = this.reserveCallerBatch(proposal.requestedStarts);
+		let tree: SubagentDelegationBatchReservation;
+		try {
+			tree = scopeLease.scope.reserveBatch({
+				requestedStarts: proposal.requestedStarts,
+				peakActiveDescendants: proposal.peakConcurrentStarts,
+				depth: (this.subagentContext?.depth ?? 0) + 1,
+			});
+		} catch (error) {
+			caller.release();
+			confirmation.release();
+			if (scopeLease.owned) {
+				scopeLease.scope.dispose();
+			}
+			throw error;
+		}
+
+		const capacity = this.createSpawnCapacitySnapshot(proposal, "admitted", scopeLease.scope, true);
+		let released = false;
+		let lease: SubagentSpawnBatchLease;
+		lease = {
+			scope: scopeLease.scope,
+			capacity,
+			release: () => {
+				if (released) return;
+				released = true;
+				this.batchAdmissions.delete(lease);
+				tree.release();
+				caller.release();
+				confirmation.release();
+				if (scopeLease.owned) {
+					scopeLease.scope.dispose();
+				}
+			},
+		};
+		this.batchAdmissions.set(lease, { caller, tree });
+		return { status: "admitted", capacity, lease };
 	}
 
 	/** Result of an existing run in the tree, waiting for completion when still running. */
@@ -901,7 +1040,8 @@ export class SubagentManager {
 		if (
 			context &&
 			((context.maxSubagentDepth !== undefined && context.depth >= context.maxSubagentDepth) ||
-				(context.maxChildAgents !== undefined && this.childStartCount >= context.maxChildAgents))
+				(context.maxChildAgents !== undefined &&
+					this.childStartCount + this.reservedChildStartCount >= context.maxChildAgents))
 		) {
 			return [];
 		}
@@ -938,9 +1078,19 @@ export class SubagentManager {
 		let treeReservation: SubagentDelegationReservation | undefined;
 		try {
 			const definition = this.getDefinition(agentName, { resourceLoader: options.resourceLoader });
-			releaseReservation = this.reserveChildStart(definition.name);
-			scopeLease = this.resolveDelegationScope(options.delegationScope);
-			treeReservation = scopeLease.scope.reserve(definition.name, (this.subagentContext?.depth ?? 0) + 1);
+			if (options.spawnBatchLease) {
+				const admission = this.batchAdmissions.get(options.spawnBatchLease);
+				if (!admission) {
+					throw new Error("Cannot start subagent: the spawn batch admission is invalid or released.");
+				}
+				releaseReservation = admission.caller.reserve();
+				scopeLease = { scope: options.spawnBatchLease.scope, owned: false };
+				treeReservation = admission.tree.reserve(definition.name);
+			} else {
+				releaseReservation = this.reserveChildStart(definition.name);
+				scopeLease = this.resolveDelegationScope(options.delegationScope);
+				treeReservation = scopeLease.scope.reserve(definition.name, (this.subagentContext?.depth ?? 0) + 1);
+			}
 			return await this.startRuntime(
 				options,
 				{
@@ -977,46 +1127,141 @@ export class SubagentManager {
 		await this.disposePromise;
 	}
 
+	private createSpawnCapacitySnapshot(
+		proposal: SubagentSpawnCapacityProposal,
+		phase: SubagentSpawnCapacityPhase,
+		scope: SubagentDelegationScope,
+		admitted = false,
+	): SubagentSpawnCapacitySnapshot {
+		const context = this.subagentContext;
+		const callerDepth = context?.depth ?? 0;
+		const callerDepthReserved = this.reservedChildStartCount > 0 ? 1 : 0;
+		const caller = {
+			maxChildAgents: capacityLimitSnapshot(
+				context?.maxChildAgents,
+				this.childStartCount,
+				this.reservedChildStartCount,
+			),
+			depth: capacityLimitSnapshot(context?.maxSubagentDepth, callerDepth, callerDepthReserved),
+		};
+		const tree = scope.capacitySnapshot();
+		const constraints: SubagentSpawnCapacityConstraint[] = [];
+		if (tree.disposed) constraints.push("delegation-scope-disposed");
+		if (tree.aborted) constraints.push("delegation-scope-aborted");
+		if (caller.maxChildAgents.remaining !== null && caller.maxChildAgents.remaining < proposal.requestedStarts) {
+			constraints.push("caller-max-child-agents");
+		}
+		if (caller.depth.maximum !== null && callerDepth + 1 > caller.depth.maximum) {
+			constraints.push("caller-max-subagent-depth");
+		}
+		if (tree.maxStarts.remaining !== null && tree.maxStarts.remaining < proposal.requestedStarts) {
+			constraints.push("tree-max-starts");
+		}
+		if (
+			tree.maxActiveDescendants.remaining !== null &&
+			tree.maxActiveDescendants.remaining < proposal.peakConcurrentStarts
+		) {
+			constraints.push("tree-max-active-descendants");
+		}
+		if (tree.maxDepth.maximum !== null && callerDepth + 1 > tree.maxDepth.maximum) {
+			constraints.push("tree-max-depth");
+		}
+		return {
+			phase,
+			proposal: { ...proposal },
+			caller,
+			tree,
+			fits: admitted || constraints.length === 0,
+			constraints: admitted ? [] : constraints,
+		};
+	}
+
+	private reserveCallerBatch(requestedStarts: number): SubagentCallerBatchReservation {
+		const context = this.subagentContext;
+		if (
+			context?.maxChildAgents !== undefined &&
+			this.childStartCount + this.reservedChildStartCount + requestedStarts > context.maxChildAgents
+		) {
+			throw new Error(
+				`Subagent "${context.agentName}" cannot reserve ${requestedStarts} child starts within maxChildAgents ${context.maxChildAgents}.`,
+			);
+		}
+		if (context?.maxSubagentDepth !== undefined && context.depth >= context.maxSubagentDepth) {
+			throw new Error(
+				`Subagent "${context.agentName}" cannot reserve child starts at maxSubagentDepth ${context.maxSubagentDepth}.`,
+			);
+		}
+
+		let remainingStarts = requestedStarts;
+		let released = false;
+		this.reservedChildStartCount += remainingStarts;
+		return {
+			reserve: () => {
+				if (released || remainingStarts <= 0) {
+					throw new Error("Cannot start subagent: the admitted caller reservation has no remaining permits.");
+				}
+				remainingStarts -= 1;
+				this.reservedChildStartCount = Math.max(0, this.reservedChildStartCount - 1);
+				this.childStartCount += 1;
+				let rolledBack = false;
+				return () => {
+					if (rolledBack) return;
+					rolledBack = true;
+					this.childStartCount = Math.max(0, this.childStartCount - 1);
+					if (!released) {
+						remainingStarts += 1;
+						this.reservedChildStartCount += 1;
+					}
+				};
+			},
+			release: () => {
+				if (released) return;
+				released = true;
+				this.reservedChildStartCount = Math.max(0, this.reservedChildStartCount - remainingStarts);
+				remainingStarts = 0;
+			},
+		};
+	}
+
 	private reserveChildStart(agentName: string | undefined): () => void {
 		const context = this.subagentContext;
-		if (!context) {
-			return () => undefined;
-		}
+		if (context) {
+			if (!agentName) {
+				throw new Error(`Subagent "${context.agentName}" cannot start unnamed child subagents.`);
+			}
 
-		if (!agentName) {
-			throw new Error(`Subagent "${context.agentName}" cannot start unnamed child subagents.`);
-		}
+			if (context.maxSubagentDepth !== undefined && context.depth >= context.maxSubagentDepth) {
+				throw new Error(
+					`Subagent "${context.agentName}" cannot delegate to "${agentName}": maxSubagentDepth ${context.maxSubagentDepth} reached at depth ${context.depth}.`,
+				);
+			}
 
-		if (context.maxSubagentDepth !== undefined && context.depth >= context.maxSubagentDepth) {
-			throw new Error(
-				`Subagent "${context.agentName}" cannot delegate to "${agentName}": maxSubagentDepth ${context.maxSubagentDepth} reached at depth ${context.depth}.`,
-			);
-		}
+			const allowedSubagents = normalizeUniqueNames(context.allowedSubagents);
+			if (allowedSubagents && allowedSubagents.length === 0) {
+				throw new Error(
+					`Subagent "${context.agentName}" cannot delegate to "${agentName}": no child subagents are allowed.`,
+				);
+			}
+			if (allowedSubagents && !allowedSubagents.includes(agentName)) {
+				throw new Error(
+					`Subagent "${context.agentName}" cannot delegate to "${agentName}". Allowed subagents: ${allowedSubagents.join(", ")}.`,
+				);
+			}
 
-		const allowedSubagents = normalizeUniqueNames(context.allowedSubagents);
-		if (allowedSubagents && allowedSubagents.length === 0) {
-			throw new Error(
-				`Subagent "${context.agentName}" cannot delegate to "${agentName}": no child subagents are allowed.`,
-			);
-		}
-		if (allowedSubagents && !allowedSubagents.includes(agentName)) {
-			throw new Error(
-				`Subagent "${context.agentName}" cannot delegate to "${agentName}". Allowed subagents: ${allowedSubagents.join(", ")}.`,
-			);
-		}
-
-		if (context.maxChildAgents !== undefined && this.childStartCount >= context.maxChildAgents) {
-			throw new Error(
-				`Subagent "${context.agentName}" cannot start more than ${context.maxChildAgents} child subagent${context.maxChildAgents === 1 ? "" : "s"}.`,
-			);
+			if (
+				context.maxChildAgents !== undefined &&
+				this.childStartCount + this.reservedChildStartCount >= context.maxChildAgents
+			) {
+				throw new Error(
+					`Subagent "${context.agentName}" cannot start more than ${context.maxChildAgents} child subagent${context.maxChildAgents === 1 ? "" : "s"}.`,
+				);
+			}
 		}
 
 		this.childStartCount += 1;
 		let released = false;
 		return () => {
-			if (released) {
-				return;
-			}
+			if (released) return;
 			released = true;
 			this.childStartCount = Math.max(0, this.childStartCount - 1);
 		};

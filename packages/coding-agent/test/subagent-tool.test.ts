@@ -9,6 +9,7 @@ import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
 	createAgentSessionServices,
+	type SubagentRuntimeContext,
 } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ResourceLoader } from "../src/core/resource-loader.ts";
@@ -27,6 +28,9 @@ import {
 	SubagentRegistry,
 	type SubagentResult,
 	type SubagentRuntimeCreatedEvent,
+	type SubagentSpawnCapacityPhase,
+	type SubagentSpawnCapacityProposal,
+	type SubagentSpawnCapacitySnapshot,
 } from "../src/core/subagents/index.ts";
 import {
 	createSubagentRegistryTool,
@@ -120,6 +124,71 @@ function createStats(sessionId: string): SessionStats {
 		totalMessages: 2,
 		tokens: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, total: 30 },
 		cost: 0,
+	};
+}
+
+function createRootCapacitySnapshot(
+	proposal: SubagentSpawnCapacityProposal,
+	phase: SubagentSpawnCapacityPhase,
+	scope: SubagentDelegationScope,
+): SubagentSpawnCapacitySnapshot {
+	const admitted = phase === "admitted";
+	return {
+		phase,
+		proposal: { ...proposal },
+		caller: {
+			maxChildAgents: {
+				maximum: null,
+				used: 0,
+				reserved: admitted ? proposal.requestedStarts : 0,
+				remaining: null,
+			},
+			depth: { maximum: null, used: 0, reserved: admitted ? 1 : 0, remaining: null },
+		},
+		tree: scope.capacitySnapshot(),
+		fits: true,
+		constraints: [],
+	};
+}
+
+function createConfirmationManagerMethods(registry: SubagentRegistry): {
+	prepareSpawnConfirmation: NonNullable<SubagentToolManager["prepareSpawnConfirmation"]>;
+	claimSpawnConfirmation: NonNullable<SubagentToolManager["claimSpawnConfirmation"]>;
+} {
+	return {
+		prepareSpawnConfirmation: (requestKey, proposal, options) => {
+			const scope = new SubagentDelegationScope();
+			const capacity = createRootCapacitySnapshot(proposal, "advisory", scope);
+			scope.dispose();
+			return {
+				...registry.prepareSpawnConfirmation(requestKey, undefined, undefined, options),
+				capacity,
+			};
+		},
+		claimSpawnConfirmation: (requestKey, token, proposal) => {
+			const confirmation = registry.claimSpawnConfirmation(requestKey, token);
+			if (!confirmation) return { status: "invalid" };
+			const scope = new SubagentDelegationScope();
+			const tree = scope.reserveBatch({
+				requestedStarts: proposal.requestedStarts,
+				peakActiveDescendants: proposal.peakConcurrentStarts,
+				depth: 1,
+			});
+			const capacity = createRootCapacitySnapshot(proposal, "admitted", scope);
+			return {
+				status: "admitted",
+				capacity,
+				lease: {
+					scope,
+					capacity,
+					release: () => {
+						tree.release();
+						confirmation.release();
+						scope.dispose();
+					},
+				},
+			};
+		},
 	};
 }
 
@@ -229,9 +298,7 @@ describe("subagent tool", () => {
 		}
 		const confirmationOnlyManager = {
 			...baseManager,
-			prepareSpawnConfirmation: (requestKey: string) => confirmationRegistry.prepareSpawnConfirmation(requestKey),
-			claimSpawnConfirmation: (requestKey: string, token: string) =>
-				confirmationRegistry.claimSpawnConfirmation(requestKey, token),
+			...createConfirmationManagerMethods(confirmationRegistry),
 		} satisfies SubagentToolManager;
 		const confirmationDefinition = createSubagentToolDefinition({ manager: confirmationOnlyManager });
 		expect(confirmationDefinition.parameters.properties).not.toHaveProperty("list");
@@ -359,6 +426,7 @@ describe("subagent tool", () => {
 		simpleResponses?: FauxResponseStep[];
 		settings?: Partial<Settings>;
 		onRuntimeCreated?: (event: SubagentRuntimeCreatedEvent) => void | Promise<void>;
+		subagentContext?: SubagentRuntimeContext;
 	}) {
 		const tempDir = join(tmpdir(), `subagent-tool-manager-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
@@ -402,6 +470,7 @@ describe("subagent tool", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			resourceLoader,
+			...(options.subagentContext ? { subagentContext: options.subagentContext } : {}),
 			onRuntimeCreated: options.onRuntimeCreated,
 			requestTimeoutMs: 5_000,
 		});
@@ -529,9 +598,7 @@ describe("subagent tool", () => {
 			isSubagentRuntime: () => true,
 			listAvailableDefinitions: () => [],
 			listDelegations: () => childRegistry.list(),
-			prepareSpawnConfirmation: (requestKey: string) => childRegistry.prepareSpawnConfirmation(requestKey),
-			claimSpawnConfirmation: (requestKey: string, token: string) =>
-				childRegistry.claimSpawnConfirmation(requestKey, token),
+			...createConfirmationManagerMethods(childRegistry),
 			followDelegation: async () => {
 				throw new Error("not implemented");
 			},
@@ -617,8 +684,7 @@ describe("subagent tool", () => {
 			getDefinition: () => scout,
 			listAvailableDefinitions: () => [scout],
 			listDelegations: () => registry.list(),
-			prepareSpawnConfirmation: (requestKey) => registry.prepareSpawnConfirmation(requestKey),
-			claimSpawnConfirmation: (requestKey, token) => registry.claimSpawnConfirmation(requestKey, token),
+			...createConfirmationManagerMethods(registry),
 			startByName,
 		});
 		const firstManager = createManager();
@@ -667,6 +733,141 @@ describe("subagent tool", () => {
 		expect(startByName).toHaveBeenCalledOnce();
 		expect(snapshotRegistry).toHaveBeenCalledTimes(5);
 		expect(snapshotRegistry).toHaveBeenCalledWith(50);
+	});
+
+	it("reports parallel peak width separately from sequential chain width", async () => {
+		const registry = new SubagentRegistry();
+		const proposals: SubagentSpawnCapacityProposal[] = [];
+		const confirmation = createConfirmationManagerMethods(registry);
+		const manager = {
+			getDefinition: (agentName: string) => createDefinition(agentName),
+			startByName: async () => createCompletedHandle("unused"),
+			prepareSpawnConfirmation: (
+				requestKey: string,
+				proposal: SubagentSpawnCapacityProposal,
+				options?: { reissuePending?: boolean },
+			) => {
+				proposals.push(proposal);
+				return confirmation.prepareSpawnConfirmation(requestKey, proposal, options);
+			},
+			claimSpawnConfirmation: confirmation.claimSpawnConfirmation,
+		} satisfies SubagentToolManager;
+		const tool = createSubagentTool(process.cwd(), { manager });
+		const tasks = Array.from({ length: 5 }, (_value, index) => ({
+			agent: `agent-${index}`,
+			task: `task-${index}`,
+		}));
+
+		const parallel = await tool.execute("parallel-preflight", { tasks });
+		const chain = await tool.execute("chain-preflight", { chain: tasks });
+
+		expect(proposals).toEqual([
+			{ mode: "parallel", requestedStarts: 5, peakConcurrentStarts: 4 },
+			{ mode: "chain", requestedStarts: 5, peakConcurrentStarts: 1 },
+		]);
+		expect(parallel.details.capacity?.proposal.peakConcurrentStarts).toBe(4);
+		expect(chain.details.capacity?.proposal.peakConcurrentStarts).toBe(1);
+	});
+
+	it("issues no token and starts nothing for an over-capacity batch", async () => {
+		const scope = new SubagentDelegationScope({ limits: { maxStarts: 8, maxActiveDescendants: 4 } });
+		cleanups.push({ cleanup: () => scope.dispose() });
+		const registry = new SubagentRegistry();
+		const manager = await createRealManager({
+			definitions: [createDefinition("researcher")],
+			responses: [fauxAssistantMessage("unused")],
+			subagentContext: {
+				depth: 1,
+				agentName: "researcher",
+				subagentId: "sa_parent",
+				path: ["researcher"],
+				delegationScope: scope,
+				registry,
+				allowedSubagents: ["researcher"],
+				maxSubagentDepth: 3,
+				maxChildAgents: 2,
+			},
+		});
+		const tool = createSubagentTool(process.cwd(), { manager });
+
+		const result = await tool.execute("over-capacity", {
+			tasks: [
+				{ agent: "researcher", task: "one" },
+				{ agent: "researcher", task: "two" },
+				{ agent: "researcher", task: "three" },
+			],
+		});
+		const text = textFromResult(result);
+
+		expect(text).toContain("No subagents were started");
+		expect(text).toContain("No usable confirmation token was issued");
+		expect(text).toContain("Reduce the batch, work locally, or return delegation upward");
+		expect(text).not.toContain('"confirm": "');
+		expect(result.details).toMatchObject({
+			mode: "list",
+			status: "completed",
+			capacity: {
+				phase: "advisory",
+				proposal: { mode: "parallel", requestedStarts: 3, peakConcurrentStarts: 3 },
+				caller: { maxChildAgents: { maximum: 2, used: 0, reserved: 0, remaining: 2 } },
+				fits: false,
+				constraints: ["caller-max-child-agents"],
+			},
+		});
+		expect(manager.listDelegations()).toEqual([]);
+		expect(scope.snapshot()).toMatchObject({ startsUsed: 0, activeDescendants: 0 });
+	});
+
+	it("returns an all-or-nothing admission rejection when capacity changes after preflight", async () => {
+		const scope = new SubagentDelegationScope({ limits: { maxStarts: 8, maxActiveDescendants: 4 } });
+		cleanups.push({ cleanup: () => scope.dispose() });
+		const registry = new SubagentRegistry();
+		const manager = await createRealManager({
+			definitions: [createDefinition("researcher")],
+			responses: [fauxAssistantMessage("unused")],
+			subagentContext: {
+				depth: 1,
+				agentName: "researcher",
+				subagentId: "sa_parent",
+				path: ["researcher"],
+				delegationScope: scope,
+				registry,
+				allowedSubagents: ["researcher"],
+				maxSubagentDepth: 3,
+				maxChildAgents: 2,
+			},
+		});
+		const tool = createSubagentTool(process.cwd(), { manager });
+		const request = {
+			tasks: [
+				{ agent: "researcher", task: "one" },
+				{ agent: "researcher", task: "two" },
+			],
+		};
+		const preflight = await tool.execute("race-preflight", request);
+		const direct = await manager.startByName("researcher");
+
+		const result = await tool.execute("race-confirm", {
+			...request,
+			confirm: confirmationTokenFromResult(preflight),
+		});
+		const text = textFromResult(result);
+
+		expect(text).toContain("Subagent batch admission was rejected. Zero children started.");
+		expect(text).toContain("Reduce the batch, work locally, or return delegation upward");
+		expect(result.details).toMatchObject({
+			mode: "list",
+			status: "failed",
+			capacity: {
+				phase: "admission-rejected",
+				fits: false,
+				constraints: ["caller-max-child-agents"],
+			},
+		});
+		expect(result.details.tasks).toBeUndefined();
+		expect(manager.listDelegations()).toEqual([]);
+		expect(scope.snapshot()).toMatchObject({ startsUsed: 1, activeDescendants: 1 });
+		await direct.dispose();
 	});
 
 	it("respects explicit subagent tool policy opt-outs and allowlists", async () => {
@@ -743,6 +944,102 @@ describe("subagent tool", () => {
 			peakActiveDescendants: 1,
 			maxDepthReached: 1,
 		});
+		expect(result.details.capacity).toMatchObject({
+			phase: "admitted",
+			proposal: { mode: "single", requestedStarts: 1, peakConcurrentStarts: 1 },
+			fits: true,
+			constraints: [],
+		});
+	});
+
+	it("keeps a post-admission child failure distinct from admission rejection", async () => {
+		const manager = await createRealManager({
+			definitions: [createDefinition("scout", { source: "project" })],
+			responses: [fauxAssistantMessage("", { stopReason: "error", errorMessage: "provider child failed" })],
+		});
+		const tool = createSubagentTool(process.cwd(), { manager, getAllowedTools: () => [] });
+		const preflight = await tool.execute("failed-child-preflight", { agent: "scout", task: "fail after start" });
+
+		const result = await tool.execute("failed-child-confirm", {
+			agent: "scout",
+			task: "fail after start",
+			confirm: confirmationTokenFromResult(preflight),
+		});
+
+		expect(textFromResult(result)).toBe("provider child failed");
+		expect(result.details).toMatchObject({
+			mode: "single",
+			status: "failed",
+			subagentId: expect.stringMatching(/^sa_/),
+			error: { message: "provider child failed" },
+			capacity: { phase: "admitted", fits: true, constraints: [] },
+			childSessions: [{ status: "failed" }],
+		});
+		expect(result.details.capacity?.phase).not.toBe("admission-rejected");
+		expect(manager.listDelegations()).toEqual([
+			expect.objectContaining({ id: result.details.subagentId, status: "failed" }),
+		]);
+	});
+
+	it("refunds unused chain admission after an early child failure", async () => {
+		const scope = new SubagentDelegationScope({ limits: { maxStarts: 6, maxActiveDescendants: 2 } });
+		cleanups.push({ cleanup: () => scope.dispose() });
+		const registry = new SubagentRegistry();
+		const manager = await createRealManager({
+			definitions: [createDefinition("good"), createDefinition("bad"), createDefinition("skipped")],
+			responses: [
+				fauxAssistantMessage("seed"),
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "bad failed" }),
+			],
+			subagentContext: {
+				depth: 1,
+				agentName: "coordinator",
+				subagentId: "sa_coordinator",
+				path: ["coordinator"],
+				delegationScope: scope,
+				registry,
+				allowedSubagents: ["good", "bad", "skipped"],
+				maxSubagentDepth: 3,
+				maxChildAgents: 3,
+			},
+		});
+		const tool = createSubagentTool(process.cwd(), { manager });
+		const request = {
+			chain: [
+				{ agent: "good", task: "start" },
+				{ agent: "bad", task: "fail after {previous}" },
+				{ agent: "skipped", task: "must not start" },
+			],
+		};
+		const preflight = await tool.execute("chain-capacity-preflight", request);
+
+		const result = await tool.execute("chain-capacity-confirm", {
+			...request,
+			confirm: confirmationTokenFromResult(preflight),
+		});
+		const after = manager.prepareSpawnConfirmation("after-chain", {
+			mode: "single",
+			requestedStarts: 1,
+			peakConcurrentStarts: 1,
+		});
+
+		expect(result.details).toMatchObject({
+			mode: "chain",
+			status: "partial",
+			summary: { total: 2, completed: 1, failed: 1, stoppedAt: 1 },
+			capacity: { phase: "admitted" },
+			steps: [{ status: "completed" }, { status: "failed", error: { message: "bad failed" } }],
+		});
+		expect(result.details.steps?.some((step) => step.agent.name === "skipped")).toBe(false);
+		expect(after.capacity).toMatchObject({
+			caller: { maxChildAgents: { maximum: 3, used: 2, reserved: 0, remaining: 1 } },
+			tree: {
+				maxStarts: { used: 2, reserved: 0, remaining: 4 },
+				maxActiveDescendants: { used: 0, reserved: 0, remaining: 2 },
+			},
+			fits: true,
+		});
+		expect(after.token).toBeTruthy();
 	});
 
 	it("returns recovered child output after overflow compaction before default cleanup", async () => {
@@ -1648,9 +1945,7 @@ describe("subagent tool", () => {
 		const manager = {
 			getDefinition: () => createDefinition("general"),
 			startByName: async () => createCompletedHandle("unused"),
-			prepareSpawnConfirmation: (requestKey: string) => registry.prepareSpawnConfirmation(requestKey),
-			claimSpawnConfirmation: (requestKey: string, token: string) =>
-				registry.claimSpawnConfirmation(requestKey, token),
+			...createConfirmationManagerMethods(registry),
 		} satisfies SubagentToolManager;
 		const tool = createSubagentTool(process.cwd(), { manager, maxAggregateOutputBytes: 80 });
 
@@ -1762,10 +2057,7 @@ describe("subagent tool", () => {
 		const manager = {
 			getDefinition: () => createDefinition("scout"),
 			startByName: async () => createCompletedHandle("spawned", { id: "sa_reissue", sessionId: "session_reissue" }),
-			prepareSpawnConfirmation: (requestKey: string, options?: { reissuePending?: boolean }) =>
-				registry.prepareSpawnConfirmation(requestKey, undefined, undefined, options),
-			claimSpawnConfirmation: (requestKey: string, token: string) =>
-				registry.claimSpawnConfirmation(requestKey, token),
+			...createConfirmationManagerMethods(registry),
 		} satisfies SubagentToolManager;
 		const tool = createSubagentTool(process.cwd(), { manager });
 		const request = { agent: "scout", task: "inspect auth" };

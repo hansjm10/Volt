@@ -86,6 +86,23 @@ describe("SubagentRegistry", () => {
 		expect(afterRelease.token).not.toBe(first.token);
 	});
 
+	it("inspects and revokes exact-request confirmation state without issuing a token", () => {
+		const registry = new SubagentRegistry();
+
+		const empty = registry.inspectSpawnConfirmation("request");
+		expect(empty).toMatchObject({ status: "unreserved", records: [], total: 0 });
+		expect(empty.token).toBeUndefined();
+
+		const reserved = registry.prepareSpawnConfirmation("request");
+		expect(reserved.token).toBeTruthy();
+		registry.cancelPendingSpawnConfirmation("request");
+
+		const revoked = registry.inspectSpawnConfirmation("request");
+		expect(revoked.status).toBe("unreserved");
+		expect(revoked.token).toBeUndefined();
+		expect(registry.claimSpawnConfirmation("request", reserved.token ?? "")).toBeUndefined();
+	});
+
 	it("returns completed results immediately and bounds stored output", async () => {
 		const registry = new SubagentRegistry();
 		registerRunning(registry, "sa_1", { task: "research file x" });
