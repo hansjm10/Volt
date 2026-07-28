@@ -11,6 +11,7 @@ export interface PlanProgress {
 export interface RenderPlanContentOptions {
 	includeTitle?: boolean;
 	includeSummary?: boolean;
+	includeChecklistHeader?: boolean;
 }
 
 export function usesAsciiPlanMarkers(): boolean {
@@ -87,6 +88,19 @@ export function renderPlanContentLines(
 		lines.push("");
 	}
 
+	if (options.includeChecklistHeader) {
+		const progress = getPlanProgress(plan);
+		appendWrappedPlanLine(
+			lines,
+			" ",
+			`${currentTheme.bold(currentTheme.fg("text", "Checklist"))}${currentTheme.fg(
+				"dim",
+				` · ${progress.completed}/${progress.total} complete`,
+			)}`,
+			width,
+		);
+	}
+
 	if (plan.steps.length === 0) {
 		appendWrappedPlanLine(lines, " ", currentTheme.fg("dim", "No checklist steps yet."), width);
 		return lines;
@@ -95,10 +109,16 @@ export function renderPlanContentLines(
 	for (const step of plan.steps) {
 		const marker = currentTheme.fg(markerColor(step.status), planStepMarker(step.status));
 		const textColor = step.status === "in_progress" ? "accent" : step.status === "completed" ? "muted" : "text";
-		const content = `${currentTheme.fg(textColor, step.text)}${
-			step.note ? currentTheme.fg("dim", ` · ${step.note}`) : ""
-		}`;
-		appendWrappedPlanLine(lines, ` ${marker} `, content, width);
+		const prefix = ` ${marker} `;
+		appendWrappedPlanLine(lines, prefix, currentTheme.fg(textColor, step.text), width);
+		if (step.note) {
+			appendWrappedPlanLine(
+				lines,
+				" ".repeat(visibleWidth(prefix)),
+				currentTheme.fg("muted", `Note: ${step.note}`),
+				width,
+			);
+		}
 	}
 	return lines;
 }

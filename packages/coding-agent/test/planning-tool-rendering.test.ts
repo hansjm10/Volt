@@ -54,7 +54,7 @@ describe("planning tool TUI rendering", () => {
 		initTheme("dark");
 	});
 
-	it("shows semantic collapsed state instead of serialized JSON and expands the complete plan", () => {
+	it("shows semantic collapsed state and expands the checklist without repeating plan context", () => {
 		const planning: PlanningState = { mode: "plan", plan: createPlan() };
 		const definition = createPlanningToolDefinitions(createController(planning))[0];
 		const component = new ToolExecutionComponent(
@@ -94,12 +94,18 @@ describe("planning tool TUI rendering", () => {
 		expect(collapsed).not.toContain("EXPANDED_STEP_TAIL");
 
 		component.setExpanded(true);
-		const expanded = normalized(component, 80);
-		expect(expanded).toContain("Readable planning tools");
-		expect(expanded).toContain("complete expanded summary");
+		const expandedLines = component.render(80);
+		const expandedPlainLines = expandedLines.map(stripAnsi);
+		const expanded = expandedPlainLines.join("\n").replace(/\s+/g, " ");
+		expect(expanded).toContain("update plan · 3 steps [success]");
+		expect(expanded).not.toContain("Readable planning tools");
+		expect(expanded).not.toContain("complete expanded summary");
+		expect(expanded).toContain("Checklist · 1/3 complete");
 		expect(expanded).toContain("EXPANDED_STEP_TAIL");
-		expect(expanded).toContain("EXPANDED_NOTE_TAIL");
-		for (const line of component.render(80)) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
+		expect(expandedPlainLines.find((line) => line.includes("EXPANDED_NOTE_TAIL"))?.trim()).toBe(
+			"Note: Confirmed by a focused tool-card test EXPANDED_NOTE_TAIL",
+		);
+		for (const line of expandedLines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
 	});
 
 	it.each([

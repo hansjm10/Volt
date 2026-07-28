@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { type Component, truncateToWidth } from "@hansjm10/volt-tui";
+import { type Component, truncateToWidth, visibleWidth } from "@hansjm10/volt-tui";
 import { type Static, Type } from "typebox";
 import { keyText } from "../../modes/interactive/components/keybinding-hints.ts";
 import {
@@ -117,6 +117,7 @@ class PlanningToolResultComponent implements Component {
 	private currentTheme: Theme;
 	private isError: boolean;
 	private showImages: boolean;
+	private includePlanContext: boolean;
 
 	constructor(
 		result: AgentToolResult<PlanningState>,
@@ -124,12 +125,14 @@ class PlanningToolResultComponent implements Component {
 		currentTheme: Theme,
 		isError: boolean,
 		showImages: boolean,
+		includePlanContext: boolean,
 	) {
 		this.result = result;
 		this.expanded = expanded;
 		this.currentTheme = currentTheme;
 		this.isError = isError;
 		this.showImages = showImages;
+		this.includePlanContext = includePlanContext;
 	}
 
 	setState(
@@ -138,12 +141,14 @@ class PlanningToolResultComponent implements Component {
 		currentTheme: Theme,
 		isError: boolean,
 		showImages: boolean,
+		includePlanContext: boolean,
 	): void {
 		this.result = result;
 		this.expanded = expanded;
 		this.currentTheme = currentTheme;
 		this.isError = isError;
 		this.showImages = showImages;
+		this.includePlanContext = includePlanContext;
 	}
 
 	render(width: number): string[] {
@@ -172,15 +177,23 @@ class PlanningToolResultComponent implements Component {
 						: "accent";
 		const status = `${this.currentTheme.bold(this.currentTheme.fg(phaseColor, planPhaseLabel(plan)))}${this.currentTheme.fg(
 			"dim",
-			` · revision ${plan.revision} · ${progress.completed}/${progress.total} complete`,
+			this.expanded
+				? ` · revision ${plan.revision}`
+				: ` · revision ${plan.revision} · ${progress.completed}/${progress.total} complete`,
 		)}`;
 		const lines: string[] = [];
 		const expandKey = keyText("app.tools.expand");
 		const expandHint = expandKey ? this.currentTheme.fg("dim", ` · ${expandKey} details`) : "";
 		appendWrappedPlanLine(lines, "", this.expanded ? status : `${status}${expandHint}`, width);
 		if (this.expanded) {
-			lines.push("");
-			lines.push(...renderPlanContentLines(plan, width, this.currentTheme, { includeTitle: true }));
+			if (this.includePlanContext) lines.push("");
+			lines.push(
+				...renderPlanContentLines(plan, width, this.currentTheme, {
+					includeTitle: this.includePlanContext,
+					includeSummary: this.includePlanContext,
+					includeChecklistHeader: true,
+				}),
+			);
 		}
 		return lines;
 	}
@@ -197,12 +210,20 @@ function renderPlanningResult(
 	options: ToolRenderResultOptions,
 	currentTheme: Theme,
 	context: PlanningResultContext,
+	includePlanContext = true,
 ): Component {
 	const component =
 		context.lastComponent instanceof PlanningToolResultComponent
 			? context.lastComponent
-			: new PlanningToolResultComponent(result, options.expanded, currentTheme, context.isError, context.showImages);
-	component.setState(result, options.expanded, currentTheme, context.isError, context.showImages);
+			: new PlanningToolResultComponent(
+					result,
+					options.expanded,
+					currentTheme,
+					context.isError,
+					context.showImages,
+					includePlanContext,
+				);
+	component.setState(result, options.expanded, currentTheme, context.isError, context.showImages, includePlanContext);
 	return component;
 }
 
@@ -230,8 +251,9 @@ class PlanningToolCallComponent implements Component {
 		if (width <= 0) return [];
 		const label = this.currentTheme.fg("toolTitle", this.currentTheme.bold(this.label));
 		if (!this.detail) return [truncateToWidth(label, width, "")];
-		if (!this.expanded) {
-			return [truncateToWidth(`${label}${this.currentTheme.fg("muted", ` · ${this.detail}`)}`, width)];
+		const inline = `${label}${this.currentTheme.fg("muted", ` · ${this.detail}`)}`;
+		if (!this.expanded || visibleWidth(inline) + " [success]".length <= width) {
+			return [truncateToWidth(inline, width)];
 		}
 		const lines = [truncateToWidth(label, width, "")];
 		appendWrappedPlanLine(lines, "  ", this.currentTheme.fg("muted", this.detail), width);
@@ -304,7 +326,9 @@ export function createPlanningToolDefinitions(
 					context.lastComponent,
 				);
 			},
-			renderResult: renderPlanningResult,
+			renderResult(result, options, currentTheme, context) {
+				return renderPlanningResult(result, options, currentTheme, context, false);
+			},
 			async execute(_toolCallId, input) {
 				controller.updatePlan({
 					...input,
@@ -374,7 +398,9 @@ export function createPlanningToolDefinitions(
 					context.lastComponent,
 				);
 			},
-			renderResult: renderPlanningResult,
+			renderResult(result, options, currentTheme, context) {
+				return renderPlanningResult(result, options, currentTheme, context, false);
+			},
 			async execute(_toolCallId, input) {
 				const plan = controller.updatePlanProgress({
 					planId: input.planId,

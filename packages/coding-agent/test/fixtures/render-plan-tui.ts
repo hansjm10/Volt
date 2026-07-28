@@ -1,9 +1,8 @@
 import { Editor } from "@hansjm10/volt-tui";
 import { TUI } from "../../../tui/src/tui.ts";
-import { defaultEditorTheme } from "../../../tui/test/test-themes.ts";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
 import type { PlanningState, PlanState } from "../../src/core/planning.ts";
-import { initTheme } from "../../src/core/theme/runtime.ts";
+import { getEditorTheme, initTheme, theme } from "../../src/core/theme/runtime.ts";
 import { createPlanningToolDefinitions, type PlanningToolController } from "../../src/core/tools/planning.ts";
 import { PlanDetailsComponent, PlanStatusComponent } from "../../src/modes/interactive/components/plan-status.ts";
 import { ToolExecutionComponent } from "../../src/modes/interactive/components/tool-execution.ts";
@@ -54,7 +53,7 @@ const details = new PlanDetailsComponent({
 	requestRender: () => undefined,
 });
 const status = new PlanStatusComponent(planning);
-const editor = new Editor(tui, defaultEditorTheme, {
+const editor = new Editor(tui, getEditorTheme(), {
 	topBorderLabel: "PLAN · AGENT READ-ONLY",
 	placeholder: "Tell Volt what to change in the plan",
 });
@@ -93,9 +92,13 @@ tool.setExpanded(process.env.VOLT_PLAN_EXPANDED === "1");
 const primaryLines = process.env.VOLT_PLAN_SCENARIO === "tools" ? tool.render(width) : details.render(width);
 const statusLines = status.render(width);
 const editorLines = editor.render(width);
-const footer = "Shift+Tab build/plan  Ctrl+Shift+T thinking";
-const fixedRows = primaryLines.length + statusLines.length + editorLines.length + 1;
+const footer = theme.fg("dim", "Shift+Tab build/plan  Ctrl+Shift+T thinking");
+const reservedBottomRows = statusLines.length + editorLines.length + 1;
+const availablePrimaryRows = Math.max(0, height - reservedBottomRows);
+const visiblePrimaryLines = primaryLines.slice(Math.max(0, primaryLines.length - availablePrimaryRows));
+const fixedRows = visiblePrimaryLines.length + reservedBottomRows;
 const spacer = Array.from({ length: Math.max(0, height - fixedRows) }, () => "");
-const lines = [...primaryLines, ...spacer, ...statusLines, ...editorLines, footer];
+const lines = [...visiblePrimaryLines, ...spacer, ...statusLines, ...editorLines, footer];
+const output = lines.slice(0, height).map((line) => `${line}\u001b[0m`);
 
-process.stdout.write(`\u001b[2J\u001b[H${lines.slice(0, height).join("\n")}`);
+process.stdout.write(`\u001b[2J${output.map((line, index) => `\u001b[${index + 1};1H${line}`).join("")}`);
