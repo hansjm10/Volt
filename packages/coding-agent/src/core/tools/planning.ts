@@ -84,7 +84,16 @@ export interface PlanningToolController {
 }
 
 function stateResultText(state: PlanningState): string {
-	return JSON.stringify(state);
+	if (!state.plan) {
+		return JSON.stringify({ mode: state.mode, plan: null });
+	}
+	return JSON.stringify({
+		mode: state.mode,
+		planId: state.plan.id,
+		revision: state.plan.revision,
+		phase: state.plan.phase,
+		steps: state.plan.steps,
+	});
 }
 
 export function createPlanningToolDefinitions(

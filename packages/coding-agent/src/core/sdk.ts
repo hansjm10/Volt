@@ -21,7 +21,13 @@ import { McpOutputStore } from "./mcp/output-store.ts";
 import { convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import { findInitialModel } from "./model-resolver.ts";
-import type { AgentMode } from "./planning.ts";
+import {
+	type AgentMode,
+	formatPlanCheckpoint,
+	PLAN_CHECKPOINT_CUSTOM_TYPE,
+	PLAN_EXECUTION_CUSTOM_TYPE,
+	type PlanningState,
+} from "./planning.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
@@ -48,6 +54,26 @@ import {
 	type SubagentToolManager,
 	withFileMutationQueue,
 } from "./tools/index.ts";
+
+function hasCanonicalPlanningMessage(messages: AgentMessage[], planning: PlanningState, checkpoint: string): boolean {
+	const plan = planning.plan;
+	if (!plan) return true;
+	return messages.some((message) => {
+		if (
+			message.role === "custom" &&
+			(message.customType === PLAN_CHECKPOINT_CUSTOM_TYPE || message.customType === PLAN_EXECUTION_CUSTOM_TYPE)
+		) {
+			return typeof message.content === "string" && message.content.includes(checkpoint);
+		}
+		if (message.role !== "toolResult") return false;
+		const details = message.details as { plan?: { id?: unknown; revision?: unknown } } | undefined;
+		return details?.plan?.id === plan.id && details.plan.revision === plan.revision;
+	});
+}
+
+function planningStateNeedsCheckpoint(planning: PlanningState): boolean {
+	return planning.plan !== null && (planning.mode === "plan" || planning.plan.phase === "active");
+}
 
 export interface CreateAgentSessionOptions {
 	/** Runtime working directory for tools and session metadata. Default: process.cwd() */
@@ -249,6 +275,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		await sessionManager.flush();
 		existingSession = sessionManager.buildSessionContext();
 	}
+	if (options.sessionStartEvent?.reason !== "new" && planningStateNeedsCheckpoint(existingSession.planning)) {
+		const checkpoint = formatPlanCheckpoint(existingSession.planning);
+		if (checkpoint && !hasCanonicalPlanningMessage(existingSession.messages, existingSession.planning, checkpoint)) {
+			sessionManager.appendCustomMessageEntry(PLAN_CHECKPOINT_CUSTOM_TYPE, checkpoint, false, undefined);
+			await sessionManager.flush();
+			existingSession = sessionManager.buildSessionContext();
+		}
+	}
 	const existingBranch = sessionManager.getBranch();
 	const hasExistingSessionState = existingBranch.length > 0;
 	const isNewSession = !hasExistingSessionState || options.sessionStartEvent?.reason === "new";
@@ -400,7 +434,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
-	const planningSessionRef: { current?: AgentSession } = {};
 
 	agent = new Agent({
 		initialState: {
@@ -463,8 +496,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		inferenceSpeed: existingSession.fastMode.enabled ? "fast" : "standard",
 		transformContext: async (messages) => {
 			const runner = extensionRunnerRef.current;
-			const extensionMessages = runner ? await runner.emitContext(messages) : messages;
-			return planningSessionRef.current?.decorateProviderMessages(extensionMessages) ?? extensionMessages;
+			return runner ? runner.emitContext(messages) : messages;
 		},
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),
@@ -507,7 +539,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		mcpManager,
 		mcpManagerFactory: options.disableMcp || options.mcpManager ? undefined : createDefaultMcpManager,
 	});
-	planningSessionRef.current = session;
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {

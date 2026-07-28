@@ -47,6 +47,20 @@ The trusted Plan-mode prompt directs the model to investigate relevant code, con
 
 The safe research surface now includes non-mutating LSP actions. Plan mode uses an explicit action allowlist, so `rename`, `fix`, and unknown future LSP actions fail closed.
 
+## Cache-safe model context
+
+Plan state is not rendered into the system prompt or appended ephemerally to every provider request. The system prompt contains only static policy selected by mode and phase, so draft and progress revisions leave provider instructions byte-identical.
+
+Canonical state reaches the model through append-only context:
+
+- planning tool results return plan ID, revision, phase, and steps
+- both execution strategies persist one complete activation checkpoint from the active plan, including actual statuses and notes
+- host-driven transitions such as Change Plan and manual Plan-mode re-entry persist a checkpoint
+- compaction appends a fresh checkpoint after the new context boundary
+- restoration adds a checkpoint only when the current revision is absent from retained tool results or prior checkpoints
+
+This preserves Codex WebSocket continuation and provider prefix caching during ordinary planning and execution turns. Mode, phase, or tool-policy boundaries may still cause one intentional cache miss.
+
 ## Deliberately deferred
 
 This POC does not yet add:

@@ -103,7 +103,9 @@ import {
 	type AgentMode,
 	assertPlanRevision,
 	clonePlanningState,
-	formatPlanForAgent,
+	formatPlanCheckpoint,
+	formatPlanPolicy,
+	PLAN_CHECKPOINT_CUSTOM_TYPE,
 	type PlanExecution,
 	type PlanningState,
 	type PlanState,
@@ -1686,23 +1688,6 @@ export class AgentSession {
 		return this.sessionManager.flush();
 	}
 
-	decorateProviderMessages(messages: AgentMessage[]): AgentMessage[] {
-		const instructions = formatPlanForAgent(this._planningState);
-		if (!instructions) {
-			return messages;
-		}
-		return [
-			...messages,
-			{
-				role: "custom",
-				customType: "volt-planning-state",
-				content: instructions,
-				display: false,
-				timestamp: Date.now(),
-			},
-		];
-	}
-
 	/** Whether the session is processing a response or a session-level continuation. */
 	get isStreaming(): boolean {
 		return this.agent.state.isStreaming || this._activePromptRuns.size > 0;
@@ -1846,21 +1831,71 @@ export class AgentSession {
 		if (!this._planningRuntimeInitialized) {
 			return;
 		}
-		const effective =
-			this._planningState.mode === "plan"
-				? [...PLAN_MODE_READ_ONLY_TOOL_NAMES, "update_plan", "submit_plan"]
-				: this._planningState.plan?.phase === "active"
-					? [...this._requestedBuildToolNames, "update_plan_progress", "request_replan"]
-					: [...this._requestedBuildToolNames];
-		this._setEffectiveToolsByName([...new Set(effective)]);
+		const effective = [
+			...new Set(
+				this._planningState.mode === "plan"
+					? [...PLAN_MODE_READ_ONLY_TOOL_NAMES, "update_plan", "submit_plan"]
+					: this._planningState.plan?.phase === "active"
+						? [...this._requestedBuildToolNames, "update_plan_progress", "request_replan"]
+						: [...this._requestedBuildToolNames],
+			),
+		];
+		const availableEffective = effective.filter((name) => this._toolRegistry.has(name));
+		const active = this.getActiveToolNames();
+		if (
+			active.length !== availableEffective.length ||
+			active.some((name, index) => name !== availableEffective[index])
+		) {
+			this._setEffectiveToolsByName(effective);
+		}
 		this._applyTrustedPlanningInstructionsToSystemPrompt();
 	}
 
 	private _applyTrustedPlanningInstructionsToSystemPrompt(systemPrompt = this._baseSystemPrompt): void {
-		const instructions = formatPlanForAgent(this._planningState);
-		this.agent.state.systemPrompt = instructions
-			? [systemPrompt, instructions].filter(Boolean).join("\n\n")
-			: systemPrompt;
+		const policy = formatPlanPolicy(this._planningState.mode, this._planningState.plan?.phase);
+		const next = policy ? [systemPrompt, policy].filter(Boolean).join("\n\n") : systemPrompt;
+		if (this.agent.state.systemPrompt !== next) {
+			this.agent.state.systemPrompt = next;
+		}
+	}
+
+	private _planningStateNeedsCheckpoint(state: PlanningState): boolean {
+		return state.plan !== null && (state.mode === "plan" || state.plan.phase === "active");
+	}
+
+	private _appendPlanningCheckpointEntry(state: PlanningState): boolean {
+		if (!this._planningStateNeedsCheckpoint(state)) return false;
+		const content = formatPlanCheckpoint(state);
+		if (!content) return false;
+		this.sessionManager.appendCustomMessageEntry(PLAN_CHECKPOINT_CUSTOM_TYPE, content, false, undefined);
+		return true;
+	}
+
+	private _deliverPlanningCheckpoint(state: PlanningState): void {
+		if (!this._planningStateNeedsCheckpoint(state)) return;
+		const content = formatPlanCheckpoint(state);
+		if (!content) return;
+		const message = {
+			role: "custom" as const,
+			customType: PLAN_CHECKPOINT_CUSTOM_TYPE,
+			content,
+			display: false,
+			details: undefined,
+			timestamp: Date.now(),
+		} satisfies CustomMessage;
+		if (this.isStreaming) {
+			this.agent.steer(message);
+			return;
+		}
+		this.agent.state.messages.push(message);
+		this.sessionManager.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display,
+			message.details,
+		);
+		this._emit({ type: "message_start", message });
+		this._emit({ type: "message_end", message });
 	}
 
 	private _commitPlanningState(next: PlanningState): PlanningState {
@@ -1893,12 +1928,18 @@ export class AgentSession {
 			this._planResearchObserved = false;
 		}
 		if (mode === "plan" && plan?.phase === "active") {
-			return this._commitPlanningState({ mode, plan: this._draftFromExecutedPlan(plan) });
+			const next = this._commitPlanningState({ mode, plan: this._draftFromExecutedPlan(plan) });
+			this._deliverPlanningCheckpoint(next);
+			return next;
 		}
 		if (mode === "plan" && (plan?.phase === "completed" || plan?.phase === "handed_off")) {
 			return this._commitPlanningState({ mode, plan: null });
 		}
-		return this._commitPlanningState({ ...clonePlanningState(this._planningState), mode });
+		const next = this._commitPlanningState({ ...clonePlanningState(this._planningState), mode });
+		if (mode === "plan" && next.plan?.phase === "draft") {
+			this._deliverPlanningCheckpoint(next);
+		}
+		return next;
 	}
 
 	toggleAgentMode(): PlanningState {
@@ -2070,7 +2111,7 @@ export class AgentSession {
 			throw new Error("Only a ready plan can be changed");
 		}
 		this._planResearchObserved = false;
-		return this._commitPlanningState({
+		const next = this._commitPlanningState({
 			mode: "plan",
 			plan: {
 				...this._planningState.plan,
@@ -2078,6 +2119,8 @@ export class AgentSession {
 				phase: "draft",
 			},
 		});
+		this._deliverPlanningCheckpoint(next);
+		return next;
 	}
 
 	discardPlan(planId: string, expectedRevision: number): PlanningState {
@@ -3942,13 +3985,21 @@ export class AgentSession {
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<CompactionResult> {
 		assertConversationGenerationCurrent?.();
+		if (this._appendPlanningCheckpointEntry(this._planningState)) {
+			await this.sessionManager.flush();
+		}
 		const newEntries = this.sessionManager.getEntries();
 		const sessionContext = this.sessionManager.buildSessionContext();
 		let messages = sessionContext.messages;
 		if (dropTrailingErrorMessage) {
-			const lastMsg = messages[messages.length - 1];
-			if (lastMsg?.role === "assistant" && (lastMsg as AssistantMessage).stopReason === "error") {
-				messages = messages.slice(0, -1);
+			const lastIndex =
+				messages.at(-1)?.role === "custom" &&
+				(messages.at(-1) as CustomMessage).customType === PLAN_CHECKPOINT_CUSTOM_TYPE
+					? messages.length - 2
+					: messages.length - 1;
+			const candidate = messages[lastIndex];
+			if (candidate?.role === "assistant" && (candidate as AssistantMessage).stopReason === "error") {
+				messages = [...messages.slice(0, lastIndex), ...messages.slice(lastIndex + 1)];
 			}
 		}
 		this.agent.state.messages = messages;

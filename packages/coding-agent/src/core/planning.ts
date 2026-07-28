@@ -39,6 +39,8 @@ export const DEFAULT_PLANNING_STATE: PlanningState = Object.freeze({ mode: "buil
 export const PLAN_MAX_STEPS = 64;
 export const PLAN_MAX_SERIALIZED_BYTES = 128 * 1024;
 export const RESERVED_PLAN_COMMAND_NAMES: ReadonlySet<string> = new Set(["plan", "build"]);
+export const PLAN_CHECKPOINT_CUSTOM_TYPE = "volt-plan-checkpoint";
+export const PLAN_EXECUTION_CUSTOM_TYPE = "volt-plan-execution";
 export const RESERVED_PLAN_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"update_plan",
 	"submit_plan",
@@ -227,33 +229,30 @@ export function assertPlanRevision(
 	}
 }
 
-export function formatPlanForAgent(state: PlanningState): string {
-	if (state.mode === "build" && state.plan?.phase !== "active") {
-		return "";
+export function formatPlanPolicy(mode: AgentMode, phase?: PlanPhase): string {
+	if (mode === "plan") {
+		return [
+			"[VOLT PLAN MODE — TRUSTED HOST POLICY]",
+			"Research before drafting. Begin with at least one targeted read-only exploration pass through the relevant code, configuration, tests, documentation, or history.",
+			"Resolve discoverable repository facts with tools before asking the user. Ask only about intent, preferences, or tradeoffs that the workspace cannot answer.",
+			"Distinguish evidence from assumptions, evaluate meaningful alternatives, and make the result decision-complete with explicit verification criteria.",
+			"Use update_plan to create or completely replace the implementation checklist, preserving canonical ids only for unchanged steps. Finish by calling submit_plan.",
+			"Do not attempt file mutation, shell execution, mutating language-server actions, MCP calls, extension tools, or delegation. LSP rename and fix actions are blocked.",
+		].join("\n");
 	}
-	const header =
-		state.mode === "plan"
-			? [
-					"[VOLT PLAN MODE — TRUSTED HOST POLICY]",
-					"Research before drafting. Begin with at least one targeted read-only exploration pass through the relevant code, configuration, tests, documentation, or history.",
-					"Resolve discoverable repository facts with tools before asking the user. Ask only about intent, preferences, or tradeoffs that the workspace cannot answer.",
-					"Distinguish evidence from assumptions, evaluate meaningful alternatives, and make the result decision-complete with explicit verification criteria.",
-					"Use update_plan to create or completely replace the implementation checklist, preserving canonical ids only for unchanged steps. Finish by calling submit_plan.",
-					"Do not attempt file mutation, shell execution, mutating language-server actions, MCP calls, extension tools, or delegation. LSP rename and fix actions are blocked.",
-				].join("\n")
-			: state.plan?.phase === "active"
-				? [
-						"[VOLT APPROVED PLAN — TRUSTED HOST STATE]",
-						"Execute the exact approved checklist. Its title, summary, step text, order, and scope are immutable during execution.",
-						"Use update_plan_progress only to change status or attach concise execution evidence to existing step ids.",
-						"If implementation evidence requires a structural change, call request_replan with the reason. It pauses execution, returns the plan to draft, and requires fresh user approval.",
-					].join("\n")
-				: "";
-	if (!state.plan) {
-		return header;
+	if (phase === "active") {
+		return [
+			"[VOLT APPROVED PLAN — TRUSTED HOST POLICY]",
+			"Execute the exact approved checklist. Its title, summary, step text, order, and scope are immutable during execution.",
+			"Use update_plan_progress only to change status or attach concise execution evidence to existing step ids.",
+			"If implementation evidence requires a structural change, call request_replan with the reason. It pauses execution, returns the plan to draft, and requires fresh user approval.",
+		].join("\n");
 	}
-	const title = state.plan.title ? `Title: ${state.plan.title}\n` : "";
-	const summary = state.plan.summary ? `Summary: ${state.plan.summary}\n` : "";
+	return "";
+}
+
+export function formatPlanCheckpoint(state: PlanningState): string {
+	if (!state.plan) return "";
 	const steps =
 		state.plan.steps.length === 0
 			? "(No checklist steps yet.)"
@@ -264,11 +263,14 @@ export function formatPlanForAgent(state: PlanningState): string {
 					})
 					.join("\n");
 	return [
-		header,
+		"[VOLT PLAN CHECKPOINT — TRUSTED HOST STATE]",
+		`Mode: ${state.mode}`,
 		`Plan id: ${state.plan.id}`,
 		`Revision: ${state.plan.revision}`,
 		`Phase: ${state.plan.phase}`,
-		title + summary + steps,
+		state.plan.title ? `Title: ${state.plan.title}` : "",
+		state.plan.summary ? `Summary: ${state.plan.summary}` : "",
+		`Checklist:\n${steps}`,
 	]
 		.filter(Boolean)
 		.join("\n\n");
@@ -277,9 +279,7 @@ export function formatPlanForAgent(state: PlanningState): string {
 export function createPlanExecutionPrompt(plan: PlanState): string {
 	return [
 		`Execute the approved plan${plan.title ? `: ${plan.title}` : "."}`,
-		plan.summary ? `\n${plan.summary}` : "",
-		"\nWork through the immutable checklist, keep existing step statuses current with update_plan_progress, and verify the completed result. If the approved scope must change, pause with request_replan instead of rewriting it.",
-	]
-		.filter(Boolean)
-		.join("");
+		"Work through the immutable checklist, keep existing step statuses current with update_plan_progress, and verify the completed result. If the approved scope must change, pause with request_replan instead of rewriting it.",
+		formatPlanCheckpoint({ mode: "build", plan }),
+	].join("\n\n");
 }

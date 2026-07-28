@@ -4,7 +4,12 @@ import { join } from "node:path";
 import { getModel } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { PLAN_MAX_SERIALIZED_BYTES, parsePlanningState, StalePlanRevisionError } from "../src/core/planning.ts";
+import {
+	createPlanExecutionPrompt,
+	PLAN_MAX_SERIALIZED_BYTES,
+	parsePlanningState,
+	StalePlanRevisionError,
+} from "../src/core/planning.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -59,6 +64,7 @@ describe("native planning state", () => {
 	it("keeps Plan tools read-only and restores the exact requested Build set", async () => {
 		const { session } = await createPlanningSession();
 		const planTools = session.getActiveToolNames();
+		expect(await session.agent.transformContext?.([])).toEqual([]);
 		expect(planTools).toEqual([
 			"read",
 			"web_search",
@@ -128,6 +134,10 @@ describe("native planning state", () => {
 		});
 		expect(draft.revision).toBe(1);
 		expect(draft.steps.every((step) => step.id.length > 0 && step.status === "pending")).toBe(true);
+		const draftPolicy = session.state.systemPrompt;
+		expect(draftPolicy).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
+		expect(draftPolicy).not.toContain(draft.id);
+		expect(draftPolicy).not.toContain("Revision:");
 		expect(() =>
 			session.updatePlan({
 				planId: draft.id,
@@ -154,6 +164,7 @@ describe("native planning state", () => {
 		});
 		expect(ready.phase).toBe("ready");
 		expect(ready.revision).toBe(2);
+		expect(session.state.systemPrompt).toBe(draftPolicy);
 
 		session.setAgentMode("build");
 		expect(session.planningState.plan).toMatchObject({ id: draft.id, phase: "ready" });
@@ -192,15 +203,28 @@ describe("native planning state", () => {
 		).toThrow("only in Plan mode");
 
 		const active = session.planningState.plan!;
-		const progressed = session.updatePlanProgress({
+		const executionPolicy = session.state.systemPrompt;
+		const executionTools = session.getActiveToolNames();
+		expect(executionPolicy).toContain("[VOLT APPROVED PLAN — TRUSTED HOST POLICY]");
+		expect(executionPolicy).not.toContain(active.id);
+		expect(executionPolicy).not.toContain("Revision:");
+		const progressTool = session.state.tools.find((tool) => tool.name === "update_plan_progress")!;
+		const progressResult = await progressTool.execute("progress-1", {
 			planId: active.id,
 			expectedRevision: active.revision,
 			updates: [{ id: active.steps[0]!.id, status: "completed", note: "Architecture inspected" }],
 		});
+		const progressText = progressResult.content.find((content) => content.type === "text")?.text ?? "";
+		expect(progressText).toContain(`"planId":"${active.id}"`);
+		expect(progressText).not.toContain(active.summary!);
+		expect(progressText).not.toContain("execution");
+		const progressed = session.planningState.plan!;
 		expect(progressed.steps.map((step) => ({ id: step.id, text: step.text }))).toEqual(
 			active.steps.map((step) => ({ id: step.id, text: step.text })),
 		);
 		expect(progressed.steps[0]).toMatchObject({ status: "completed", note: "Architecture inspected" });
+		expect(session.state.systemPrompt).toBe(executionPolicy);
+		expect(session.getActiveToolNames()).toEqual(executionTools);
 		expect(() =>
 			session.updatePlanProgress({
 				planId: progressed.id,
@@ -246,6 +270,9 @@ describe("native planning state", () => {
 			approvedRevision: revisedReady.revision,
 		});
 		const reactivatedPlan = reactivated.planning.plan!;
+		const executionCheckpoint = createPlanExecutionPrompt(reactivatedPlan);
+		expect(executionCheckpoint).toContain("[x] Inspect the architecture — Architecture inspected");
+		expect(executionCheckpoint).toContain(`Revision: ${reactivatedPlan.revision}`);
 		const completed = session.updatePlanProgress({
 			planId: reactivatedPlan.id,
 			expectedRevision: reactivatedPlan.revision,
@@ -281,8 +308,67 @@ describe("native planning state", () => {
 		expect(replanning).toMatchObject({ mode: "plan", plan: { phase: "draft" } });
 		expect(replanning.plan?.execution).toBeUndefined();
 		expect(() => parsePlanningState(replanning)).not.toThrow();
+		const checkpoints = session.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom_message" && entry.customType === "volt-plan-checkpoint");
+		expect(checkpoints).toHaveLength(1);
+		expect(checkpoints[0]).toMatchObject({
+			content: expect.stringContaining(`Revision: ${replanning.plan!.revision}`),
+			display: false,
+		});
 		expect(session.getActiveToolNames()).toContain("update_plan");
 		expect(session.getActiveToolNames()).not.toContain("update_plan_progress");
+		await session.dispose();
+	});
+
+	it("restores a missing canonical plan checkpoint once", async () => {
+		const settingsManager = SettingsManager.create(tempDir, agentDir);
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const resourceLoader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		await resourceLoader.reload();
+		sessionManager.appendMessage({ role: "user", content: "Continue the active plan", timestamp: 1 });
+		sessionManager.appendPlanningState({
+			mode: "build",
+			plan: {
+				id: "restored-plan",
+				revision: 7,
+				phase: "active",
+				title: "Restored plan",
+				summary: "Resume from durable state.",
+				steps: [{ id: "restored-step", text: "Finish the implementation", status: "in_progress", note: "Started" }],
+				execution: {
+					id: "restored-execution",
+					approvedRevision: 6,
+					strategy: "retain_context",
+					sourceSessionId: sessionManager.getSessionId(),
+					targetSessionId: sessionManager.getSessionId(),
+				},
+			},
+		});
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir,
+			model: getModel("anthropic", "claude-sonnet-4-5")!,
+			settingsManager,
+			sessionManager,
+			resourceLoader,
+			sessionStartEvent: { type: "session_start", reason: "resume" },
+		});
+		const checkpoints = session.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom_message" && entry.customType === "volt-plan-checkpoint");
+		expect(checkpoints).toHaveLength(1);
+		expect(checkpoints[0]).toMatchObject({
+			content: expect.stringContaining("Revision: 7"),
+			display: false,
+		});
+		expect(session.messages.at(-1)).toMatchObject({
+			role: "custom",
+			customType: "volt-plan-checkpoint",
+			content: expect.stringContaining("[>] Finish the implementation — Started"),
+		});
+		expect(session.state.systemPrompt).not.toContain("restored-plan");
 		await session.dispose();
 	});
 

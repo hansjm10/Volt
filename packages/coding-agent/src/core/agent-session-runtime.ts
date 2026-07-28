@@ -14,6 +14,7 @@ import type {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import {
 	createPlanExecutionPrompt,
+	PLAN_EXECUTION_CUSTOM_TYPE,
 	type PlanExecution,
 	type PlanExecutionStrategy,
 	type PlanningState,
@@ -1079,7 +1080,7 @@ export class AgentSessionRuntime {
 				void sourceSession
 					.sendCustomMessage(
 						{
-							customType: "volt-plan-execution",
+							customType: PLAN_EXECUTION_CUSTOM_TYPE,
 							content: createPlanExecutionPrompt(result.planning.plan!),
 							display: true,
 						},
@@ -1156,11 +1157,14 @@ export class AgentSessionRuntime {
 					sourceManager.setSessionFile(sourceSessionFile);
 				}
 				const activePlan = this.session.planningState.plan;
+				if (!activePlan || activePlan.phase !== "active") {
+					throw new Error("Plan execution session did not restore its active plan");
+				}
 				void context
 					.sendMessage(
 						{
-							customType: "volt-plan-execution",
-							content: createPlanExecutionPrompt(activePlan ?? sourcePlan),
+							customType: PLAN_EXECUTION_CUSTOM_TYPE,
+							content: createPlanExecutionPrompt(activePlan),
 							display: true,
 						},
 						{ triggerTurn: true },
