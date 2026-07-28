@@ -15,8 +15,9 @@ export interface SubagentDelegationScopeSnapshot {
 }
 
 /**
- * Hard tree-wide ceilings shared by every descendant of one delegation scope.
- * Each limit accepts `Number.POSITIVE_INFINITY` as an explicit unlimited opt-in.
+ * Tree-wide limits shared by every descendant of one delegation scope.
+ * Structural limits reject new spawns; finite consumption budgets abort the
+ * admitted tree when crossed. Every limit accepts `Number.POSITIVE_INFINITY`.
  */
 export interface SubagentDelegationScopeLimits {
 	/** Deepest delegation depth a descendant may start at; root children start at depth 1. */
@@ -25,13 +26,13 @@ export interface SubagentDelegationScopeLimits {
 	maxStarts?: number;
 	/** Concurrently active descendant runtimes across the whole tree. */
 	maxActiveDescendants?: number;
-	/** Total assistant turns consumed across all descendants before the tree aborts. */
+	/** Finite total assistant turns allowed across all descendants before the tree aborts. */
 	maxTurns?: number;
-	/** Total tokens consumed across all descendants before the tree aborts. */
+	/** Finite total tokens allowed across all descendants before the tree aborts. */
 	maxTotalTokens?: number;
-	/** Total provider cost in USD consumed across all descendants before the tree aborts. */
+	/** Finite total provider cost in USD allowed across all descendants before the tree aborts. */
 	maxTotalCostUsd?: number;
-	/** Wall-clock lifetime of the tree before it aborts. Unlimited by default. */
+	/** Finite wall-clock lifetime of the tree before it aborts. */
 	maxDurationMs?: number;
 }
 
@@ -39,9 +40,9 @@ export const DEFAULT_SUBAGENT_DELEGATION_LIMITS: Required<SubagentDelegationScop
 	maxDepth: 5,
 	maxStarts: 100,
 	maxActiveDescendants: 16,
-	maxTurns: 1_000,
-	maxTotalTokens: 50_000_000,
-	maxTotalCostUsd: 100,
+	maxTurns: Number.POSITIVE_INFINITY,
+	maxTotalTokens: Number.POSITIVE_INFINITY,
+	maxTotalCostUsd: Number.POSITIVE_INFINITY,
 	maxDurationMs: Number.POSITIVE_INFINITY,
 };
 
@@ -65,7 +66,7 @@ export interface SubagentDelegationBatchReservationOptions {
 
 export interface SubagentDelegationScopeOptions {
 	signal?: AbortSignal;
-	/** Ceiling overrides; omitted limits use DEFAULT_SUBAGENT_DELEGATION_LIMITS. */
+	/** Limit overrides; omitted structural limits keep safeguards and consumption budgets stay unlimited. */
 	limits?: SubagentDelegationScopeLimits;
 }
 
@@ -85,9 +86,9 @@ function requirePositiveSafeInteger(value: number, name: string): void {
 }
 
 function resolveLimits(overrides: SubagentDelegationScopeLimits | undefined): Required<SubagentDelegationScopeLimits> {
-	// Explicitly-undefined overrides must fall back to the default, never
-	// silently disable a ceiling: every comparison against undefined is false,
-	// which would grant the Infinity opt-in without anyone opting in.
+	// Explicitly-undefined overrides use the category-specific defaults instead
+	// of bypassing resolution: structural safeguards stay finite while
+	// consumption budgets stay unlimited unless a host supplies finite values.
 	const limits: Required<SubagentDelegationScopeLimits> = { ...DEFAULT_SUBAGENT_DELEGATION_LIMITS };
 	for (const key of Object.keys(limits) as Array<keyof SubagentDelegationScopeLimits>) {
 		const value = overrides?.[key];
@@ -104,9 +105,9 @@ function resolveLimits(overrides: SubagentDelegationScopeLimits | undefined): Re
 
 /**
  * Shared, root-owned accounting and cancellation scope for one recursive
- * delegation tree. Reservations enforce the depth, start, and concurrency
- * ceilings fail-closed; consumption ceilings (turns, tokens, cost, deadline)
- * abort the whole tree once crossed.
+ * delegation tree. Reservations enforce the default depth, start, and
+ * concurrency ceilings without aborting admitted descendants; opt-in finite
+ * consumption budgets (turns, tokens, cost, deadline) abort the whole tree.
  */
 export class SubagentDelegationScope {
 	readonly id: string;

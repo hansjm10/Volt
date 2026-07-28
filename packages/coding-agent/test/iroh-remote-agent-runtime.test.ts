@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "../src/core/remote/iroh/index.ts";
 import { CURRENT_SESSION_VERSION } from "../src/core/session-manager.ts";
+import { SubagentManager } from "../src/core/subagents/index.ts";
 import {
 	createIrohRemoteAgentRuntime,
 	createIrohRemoteAgentRuntimeWithSessionSelection,
@@ -15,6 +16,39 @@ import {
 
 const SAVED_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "HOME"] as const;
 const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY"] as const;
+
+function expectFormerConsumptionThresholdsAreUnlimited(manager: SubagentManager): void {
+	const cases: Array<{
+		name: string;
+		consume(scope: ReturnType<SubagentManager["createDelegationScope"]>["scope"]): void;
+	}> = [
+		{
+			name: "turns",
+			consume: (scope) => {
+				for (let index = 0; index <= 1_000; index += 1) scope.recordTurn();
+			},
+		},
+		{ name: "tokens", consume: (scope) => scope.recordUsage(50_000_001, 0) },
+		{ name: "cost", consume: (scope) => scope.recordUsage(0, 100.01) },
+	];
+
+	for (const testCase of cases) {
+		const lease = manager.createDelegationScope();
+		expect(lease.owned).toBe(true);
+		let descendantAborted = false;
+		const reservation = lease.scope.reserve(`${testCase.name}-probe`, 1);
+		reservation.commit(`sa_iroh-${testCase.name}-probe`, () => {
+			descendantAborted = true;
+		});
+
+		testCase.consume(lease.scope);
+
+		expect(lease.scope.signal.aborted).toBe(false);
+		expect(descendantAborted).toBe(false);
+		reservation.release();
+		lease.scope.dispose();
+	}
+}
 
 describe("createIrohRemoteAgentRuntime", () => {
 	let tempDir: string;
@@ -153,6 +187,26 @@ export default function (volt) {
 			expect(runtime.session.getActiveToolNames()).toEqual(
 				DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(",").filter((name) => name !== "subagent_registry"),
 			);
+		} finally {
+			errorSpy.mockRestore();
+			await runtime?.dispose();
+		}
+	});
+
+	it("keeps Iroh runtime subagent consumption budgets unlimited", async () => {
+		writeRuntimeConfig({});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		let runtime: Awaited<ReturnType<typeof createIrohRemoteAgentRuntime>> | undefined;
+		try {
+			runtime = await createIrohRemoteAgentRuntime({ agentDir, cwd });
+			const manager = runtime.session.getSubagentToolManager();
+			expect(manager).toBeInstanceOf(SubagentManager);
+			if (!(manager instanceof SubagentManager)) {
+				throw new Error("expected the Iroh runtime to create a SubagentManager");
+			}
+
+			expectFormerConsumptionThresholdsAreUnlimited(manager);
 		} finally {
 			errorSpy.mockRestore();
 			await runtime?.dispose();
