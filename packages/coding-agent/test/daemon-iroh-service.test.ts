@@ -139,6 +139,7 @@ function withInjectedIncomings(endpoint: IrohEndpointLike, incomings: readonly I
 function withDeferredIncoming(
 	endpoint: IrohEndpointLike,
 	incomingReady: Promise<void>,
+	onAcceptStarted: () => void,
 	incoming: IrohIncomingLike,
 ): IrohEndpointLike {
 	let delivered = false;
@@ -149,6 +150,7 @@ function withDeferredIncoming(
 		async acceptNext() {
 			if (!delivered) {
 				delivered = true;
+				onAcceptStarted();
 				await incomingReady;
 				return incoming;
 			}
@@ -804,6 +806,7 @@ describe.skipIf(!nativeAvailable)("voltd iroh pre-registration ownership", () =>
 		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-late-incoming-refusal-"));
 		const incomingGate = createDeferred();
 		const refuseGate = createDeferred();
+		let acceptStarted = false;
 		let refuseStarted = false;
 		let refuseSettled = false;
 		let daemonStopped = false;
@@ -822,7 +825,15 @@ describe.skipIf(!nativeAvailable)("voltd iroh pre-registration ownership", () =>
 			createIrohDaemonService(
 				{ relayMode: "disabled" },
 				{
-					decorateEndpoint: (endpoint) => withDeferredIncoming(endpoint, incomingGate.promise, incoming),
+					decorateEndpoint: (endpoint) =>
+						withDeferredIncoming(
+							endpoint,
+							incomingGate.promise,
+							() => {
+								acceptStarted = true;
+							},
+							incoming,
+						),
 				},
 			),
 		]);
@@ -841,6 +852,7 @@ describe.skipIf(!nativeAvailable)("voltd iroh pre-registration ownership", () =>
 				authToken: status.authToken,
 				reconnect: false,
 			});
+			await expect.poll(() => acceptStarted, { timeout: 15_000 }).toBe(true);
 
 			const shutdownResponse = await control.request({ type: "shutdown" });
 			expect(shutdownResponse.type).toBe("ok");
