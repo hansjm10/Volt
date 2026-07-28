@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { SubagentCapacityLimitSnapshot, SubagentTreeCapacitySnapshot } from "./capacity.ts";
 
 export interface SubagentDelegationScopeSnapshot {
 	id: string;
@@ -50,10 +51,37 @@ export interface SubagentDelegationReservation {
 	rollback(): void;
 }
 
+/** Tree permits atomically held for one admitted spawn batch. */
+export interface SubagentDelegationBatchReservation {
+	reserve(agentName: string): SubagentDelegationReservation;
+	release(): void;
+}
+
+export interface SubagentDelegationBatchReservationOptions {
+	requestedStarts: number;
+	peakActiveDescendants: number;
+	depth: number;
+}
+
 export interface SubagentDelegationScopeOptions {
 	signal?: AbortSignal;
 	/** Ceiling overrides; omitted limits use DEFAULT_SUBAGENT_DELEGATION_LIMITS. */
 	limits?: SubagentDelegationScopeLimits;
+}
+
+function capacityLimitSnapshot(maximum: number, used: number, reserved: number): SubagentCapacityLimitSnapshot {
+	return {
+		maximum: Number.isFinite(maximum) ? maximum : null,
+		used,
+		reserved,
+		remaining: Number.isFinite(maximum) ? Math.max(0, maximum - used - reserved) : null,
+	};
+}
+
+function requirePositiveSafeInteger(value: number, name: string): void {
+	if (!Number.isSafeInteger(value) || value <= 0) {
+		throw new Error(`${name} must be a positive safe integer`);
+	}
 }
 
 function resolveLimits(overrides: SubagentDelegationScopeLimits | undefined): Required<SubagentDelegationScopeLimits> {
@@ -92,9 +120,13 @@ export class SubagentDelegationScope {
 	private readonly onExternalAbort: (() => void) | undefined;
 	private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 	private startsUsed = 0;
+	private reservedStarts = 0;
 	private activeDescendants = 0;
+	private reservedActiveDescendants = 0;
 	private peakActiveDescendants = 0;
 	private maxDepthReached = 0;
+	private readonly reservedBatchDepths = new Map<symbol, number>();
+	private readonly batchReleases = new Set<() => void>();
 	private turnsUsed = 0;
 	private tokensUsed = 0;
 	private costUsd = 0;
@@ -126,26 +158,38 @@ export class SubagentDelegationScope {
 		}
 	}
 
+	capacitySnapshot(): SubagentTreeCapacitySnapshot {
+		let highestReservedDepth = this.maxDepthReached;
+		for (const depth of this.reservedBatchDepths.values()) {
+			highestReservedDepth = Math.max(highestReservedDepth, depth);
+		}
+		return {
+			maxStarts: capacityLimitSnapshot(this.limits.maxStarts, this.startsUsed, this.reservedStarts),
+			maxActiveDescendants: capacityLimitSnapshot(
+				this.limits.maxActiveDescendants,
+				this.activeDescendants,
+				this.reservedActiveDescendants,
+			),
+			maxDepth: capacityLimitSnapshot(
+				this.limits.maxDepth,
+				this.maxDepthReached,
+				Math.max(0, highestReservedDepth - this.maxDepthReached),
+			),
+			aborted: this.signal.aborted,
+			disposed: this.disposed,
+		};
+	}
+
 	reserve(agentName: string, depth: number): SubagentDelegationReservation {
-		if (this.disposed) {
-			throw new Error(`Cannot delegate to "${agentName}": delegation scope ${this.id} is disposed.`);
-		}
-		if (this.signal.aborted) {
-			throw this.abortReason();
-		}
-		if (depth > this.limits.maxDepth) {
+		this.assertAvailable(agentName, depth);
+		if (this.startsUsed + this.reservedStarts >= this.limits.maxStarts) {
 			throw new Error(
-				`Cannot delegate to "${agentName}": depth ${depth} exceeds the delegation tree limit of ${this.limits.maxDepth} (maxDepth).`,
+				`Cannot delegate to "${agentName}": the delegation tree already used or reserved ${this.startsUsed + this.reservedStarts} subagent starts, the limit of ${this.limits.maxStarts} (maxStarts).`,
 			);
 		}
-		if (this.startsUsed >= this.limits.maxStarts) {
+		if (this.activeDescendants + this.reservedActiveDescendants >= this.limits.maxActiveDescendants) {
 			throw new Error(
-				`Cannot delegate to "${agentName}": the delegation tree already started ${this.startsUsed} subagents, the limit of ${this.limits.maxStarts} (maxStarts).`,
-			);
-		}
-		if (this.activeDescendants >= this.limits.maxActiveDescendants) {
-			throw new Error(
-				`Cannot delegate to "${agentName}": ${this.activeDescendants} descendants are already active, the limit of ${this.limits.maxActiveDescendants} (maxActiveDescendants). Wait for running subagents to finish.`,
+				`Cannot delegate to "${agentName}": ${this.activeDescendants + this.reservedActiveDescendants} descendant slots are already active or reserved, the limit of ${this.limits.maxActiveDescendants} (maxActiveDescendants). Wait for running subagents to finish.`,
 			);
 		}
 
@@ -153,36 +197,91 @@ export class SubagentDelegationScope {
 		this.activeDescendants += 1;
 		this.peakActiveDescendants = Math.max(this.peakActiveDescendants, this.activeDescendants);
 		this.maxDepthReached = Math.max(this.maxDepthReached, depth);
-		let committed = false;
+		return this.createReservation();
+	}
+
+	reserveBatch(options: SubagentDelegationBatchReservationOptions): SubagentDelegationBatchReservation {
+		requirePositiveSafeInteger(options.requestedStarts, "requestedStarts");
+		requirePositiveSafeInteger(options.peakActiveDescendants, "peakActiveDescendants");
+		requirePositiveSafeInteger(options.depth, "depth");
+		if (options.peakActiveDescendants > options.requestedStarts) {
+			throw new Error("peakActiveDescendants cannot exceed requestedStarts");
+		}
+		this.assertAvailable("subagent batch", options.depth);
+		if (this.startsUsed + this.reservedStarts + options.requestedStarts > this.limits.maxStarts) {
+			throw new Error(
+				`Cannot reserve subagent batch: ${options.requestedStarts} starts exceed the delegation tree's remaining maxStarts capacity.`,
+			);
+		}
+		if (
+			this.activeDescendants + this.reservedActiveDescendants + options.peakActiveDescendants >
+			this.limits.maxActiveDescendants
+		) {
+			throw new Error(
+				`Cannot reserve subagent batch: peak width ${options.peakActiveDescendants} exceeds the delegation tree's remaining maxActiveDescendants capacity.`,
+			);
+		}
+
+		const depthKey = Symbol("subagent-batch-depth");
+		let remainingStarts = options.requestedStarts;
+		let availableActiveDescendants = options.peakActiveDescendants;
 		let released = false;
-		let subagentId: string | undefined;
+		this.reservedStarts += remainingStarts;
+		this.reservedActiveDescendants += availableActiveDescendants;
+		this.reservedBatchDepths.set(depthKey, options.depth);
 
 		const release = (): void => {
 			if (released) return;
 			released = true;
-			this.activeDescendants = Math.max(0, this.activeDescendants - 1);
-			if (subagentId) {
-				this.activeAborters.delete(subagentId);
-			}
+			this.reservedStarts = Math.max(0, this.reservedStarts - remainingStarts);
+			this.reservedActiveDescendants = Math.max(0, this.reservedActiveDescendants - availableActiveDescendants);
+			remainingStarts = 0;
+			availableActiveDescendants = 0;
+			this.reservedBatchDepths.delete(depthKey);
+			this.signal.removeEventListener("abort", release);
+			this.batchReleases.delete(release);
 		};
+		this.signal.addEventListener("abort", release, { once: true });
+		this.batchReleases.add(release);
 
 		return {
-			commit: (id, abort) => {
-				if (committed || released) return;
-				committed = true;
-				subagentId = id;
-				if (this.signal.aborted) {
-					abort();
-					return;
+			reserve: (agentName) => {
+				if (released) {
+					throw new Error("Cannot start subagent: the admitted batch reservation was released.");
 				}
-				this.activeAborters.set(id, abort);
+				this.assertAvailable(agentName, options.depth);
+				if (remainingStarts <= 0) {
+					throw new Error("Cannot start subagent: the admitted batch has no remaining start permits.");
+				}
+				if (availableActiveDescendants <= 0) {
+					throw new Error("Cannot start subagent: the admitted batch has no available active permits.");
+				}
+
+				remainingStarts -= 1;
+				availableActiveDescendants -= 1;
+				this.reservedStarts = Math.max(0, this.reservedStarts - 1);
+				this.reservedActiveDescendants = Math.max(0, this.reservedActiveDescendants - 1);
+				this.startsUsed += 1;
+				this.activeDescendants += 1;
+				this.peakActiveDescendants = Math.max(this.peakActiveDescendants, this.activeDescendants);
+				this.maxDepthReached = Math.max(this.maxDepthReached, options.depth);
+
+				return this.createReservation(
+					() => {
+						if (!released && remainingStarts > 0 && !this.signal.aborted && !this.disposed) {
+							availableActiveDescendants += 1;
+							this.reservedActiveDescendants += 1;
+						}
+					},
+					() => {
+						if (!released && !this.signal.aborted && !this.disposed) {
+							remainingStarts += 1;
+							this.reservedStarts += 1;
+						}
+					},
+				);
 			},
 			release,
-			rollback: () => {
-				if (committed || released) return;
-				this.startsUsed = Math.max(0, this.startsUsed - 1);
-				release();
-			},
 		};
 	}
 
@@ -250,6 +349,9 @@ export class SubagentDelegationScope {
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
+		for (const release of Array.from(this.batchReleases)) {
+			release();
+		}
 		if (this.deadlineTimer) {
 			clearTimeout(this.deadlineTimer);
 			this.deadlineTimer = undefined;
@@ -261,6 +363,57 @@ export class SubagentDelegationScope {
 			this.abort(new Error("Subagent delegation scope disposed"));
 		}
 		this.activeAborters.clear();
+	}
+
+	private createReservation(
+		onActiveReleased: () => void = () => undefined,
+		onStartRolledBack: () => void = () => undefined,
+	): SubagentDelegationReservation {
+		let committed = false;
+		let released = false;
+		let subagentId: string | undefined;
+		const releaseActive = (): void => {
+			if (released) return;
+			released = true;
+			this.activeDescendants = Math.max(0, this.activeDescendants - 1);
+			if (subagentId) {
+				this.activeAborters.delete(subagentId);
+			}
+			onActiveReleased();
+		};
+		return {
+			commit: (id, abort) => {
+				if (committed || released) return;
+				committed = true;
+				subagentId = id;
+				if (this.signal.aborted) {
+					abort();
+					return;
+				}
+				this.activeAborters.set(id, abort);
+			},
+			release: releaseActive,
+			rollback: () => {
+				if (committed || released) return;
+				this.startsUsed = Math.max(0, this.startsUsed - 1);
+				onStartRolledBack();
+				releaseActive();
+			},
+		};
+	}
+
+	private assertAvailable(agentName: string, depth: number): void {
+		if (this.disposed) {
+			throw new Error(`Cannot delegate to "${agentName}": delegation scope ${this.id} is disposed.`);
+		}
+		if (this.signal.aborted) {
+			throw this.abortReason();
+		}
+		if (depth > this.limits.maxDepth) {
+			throw new Error(
+				`Cannot delegate to "${agentName}": depth ${depth} exceeds the delegation tree limit of ${this.limits.maxDepth} (maxDepth).`,
+			);
+		}
 	}
 
 	private abortReason(): Error {
