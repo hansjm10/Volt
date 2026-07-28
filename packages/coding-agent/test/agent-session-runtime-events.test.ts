@@ -268,7 +268,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const draft = runtimeHost.session.updatePlan({
 			title: "Retain context",
 			summary: "Execute in the current session.",
-			steps: [{ text: "Implement the change", status: "pending" }],
+			steps: [{ text: "Implement the change" }],
 		});
 		const ready = runtimeHost.session.submitPlan({
 			planId: draft.id,
@@ -311,7 +311,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const draft = runtimeHost.session.updatePlan({
 			title: "Clear context",
 			summary: "Execute from only the approved plan.",
-			steps: [{ text: "Implement the isolated change", status: "pending" }],
+			steps: [{ text: "Implement the isolated change" }],
 		});
 		const ready = runtimeHost.session.submitPlan({
 			planId: draft.id,

@@ -39,7 +39,12 @@ export const DEFAULT_PLANNING_STATE: PlanningState = Object.freeze({ mode: "buil
 export const PLAN_MAX_STEPS = 64;
 export const PLAN_MAX_SERIALIZED_BYTES = 128 * 1024;
 export const RESERVED_PLAN_COMMAND_NAMES: ReadonlySet<string> = new Set(["plan", "build"]);
-export const RESERVED_PLAN_TOOL_NAMES: ReadonlySet<string> = new Set(["update_plan", "submit_plan"]);
+export const RESERVED_PLAN_TOOL_NAMES: ReadonlySet<string> = new Set([
+	"update_plan",
+	"submit_plan",
+	"update_plan_progress",
+	"request_replan",
+]);
 
 const AGENT_MODES = new Set<AgentMode>(["build", "plan"]);
 const PLAN_PHASES = new Set<PlanPhase>(["draft", "ready", "active", "completed", "handed_off"]);
@@ -230,13 +235,18 @@ export function formatPlanForAgent(state: PlanningState): string {
 		state.mode === "plan"
 			? [
 					"[VOLT PLAN MODE — TRUSTED HOST POLICY]",
-					"You are planning. Explore with the available read-only tools, maintain the structured checklist with update_plan, and finish by calling submit_plan.",
-					"Do not attempt file mutation, shell execution, language-server actions, MCP calls, extension tools, or delegation.",
+					"Research before drafting. Begin with at least one targeted read-only exploration pass through the relevant code, configuration, tests, documentation, or history.",
+					"Resolve discoverable repository facts with tools before asking the user. Ask only about intent, preferences, or tradeoffs that the workspace cannot answer.",
+					"Distinguish evidence from assumptions, evaluate meaningful alternatives, and make the result decision-complete with explicit verification criteria.",
+					"Use update_plan to create or completely replace the implementation checklist, preserving canonical ids only for unchanged steps. Finish by calling submit_plan.",
+					"Do not attempt file mutation, shell execution, mutating language-server actions, MCP calls, extension tools, or delegation. LSP rename and fix actions are blocked.",
 				].join("\n")
 			: state.plan?.phase === "active"
 				? [
 						"[VOLT APPROVED PLAN — TRUSTED HOST STATE]",
-						"Execute the approved checklist. Keep it current with update_plan as work progresses. You may add, remove, reorder, or rewrite steps when implementation evidence requires it.",
+						"Execute the exact approved checklist. Its title, summary, step text, order, and scope are immutable during execution.",
+						"Use update_plan_progress only to change status or attach concise execution evidence to existing step ids.",
+						"If implementation evidence requires a structural change, call request_replan with the reason. It pauses execution, returns the plan to draft, and requires fresh user approval.",
 					].join("\n")
 				: "";
 	if (!state.plan) {
@@ -268,7 +278,7 @@ export function createPlanExecutionPrompt(plan: PlanState): string {
 	return [
 		`Execute the approved plan${plan.title ? `: ${plan.title}` : "."}`,
 		plan.summary ? `\n${plan.summary}` : "",
-		"\nWork through the structured checklist, keep statuses current with update_plan, and verify the completed result.",
+		"\nWork through the immutable checklist, keep existing step statuses current with update_plan_progress, and verify the completed result. If the approved scope must change, pause with request_replan instead of rewriting it.",
 	]
 		.filter(Boolean)
 		.join("");

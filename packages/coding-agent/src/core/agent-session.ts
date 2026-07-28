@@ -101,7 +101,6 @@ import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
 import {
 	type AgentMode,
-	assertPlanningStateWithinBounds,
 	assertPlanRevision,
 	clonePlanningState,
 	formatPlanForAgent,
@@ -109,6 +108,7 @@ import {
 	type PlanningState,
 	type PlanState,
 	type PlanStepStatus,
+	parsePlanningState,
 } from "./planning.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
@@ -448,6 +448,17 @@ export class QueueClearPersistenceError extends Error {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const PLAN_MODE_READ_ONLY_LSP_ACTIONS = new Set([
+	"definition",
+	"references",
+	"implementations",
+	"type-definition",
+	"callers",
+	"callees",
+	"hover",
+	"symbols",
+	"diagnostics",
+]);
 
 // ============================================================================
 // AgentSession Class
@@ -558,6 +569,7 @@ export class AgentSession {
 	private _planningState: PlanningState;
 	private _requestedBuildToolNames: string[] = [];
 	private _planningRuntimeInitialized = false;
+	private _planResearchObserved = false;
 
 	// LSP diagnostics manager (created unless lsp.enabled is false)
 	private _lspManager?: LspManager;
@@ -712,6 +724,25 @@ export class AgentSession {
 							: `Tool ${toolCall.name} is no longer active for this session.`,
 				};
 			}
+			if (this._planningState.mode === "plan" && toolCall.name === "lsp") {
+				const action =
+					typeof args === "object" && args !== null && "action" in args
+						? (args as { action?: unknown }).action
+						: undefined;
+				if (typeof action !== "string" || !PLAN_MODE_READ_ONLY_LSP_ACTIONS.has(action)) {
+					return {
+						block: true,
+						reason: `Plan mode policy blocked the mutating or unknown LSP action ${JSON.stringify(action)}.`,
+					};
+				}
+			}
+			if (this._planningState.mode === "plan" && toolCall.name === "submit_plan" && !this._planResearchObserved) {
+				return {
+					block: true,
+					reason:
+						"Plan mode requires at least one successful read-only exploration tool call before submitting a plan.",
+				};
+			}
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_call")) {
 				return undefined;
@@ -733,6 +764,13 @@ export class AgentSession {
 		};
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+			if (
+				!isError &&
+				this._planningState.mode === "plan" &&
+				PLAN_MODE_READ_ONLY_TOOL_NAMES.includes(toolCall.name as (typeof PLAN_MODE_READ_ONLY_TOOL_NAMES)[number])
+			) {
+				this._planResearchObserved = true;
+			}
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_result")) {
 				return undefined;
@@ -1812,7 +1850,7 @@ export class AgentSession {
 			this._planningState.mode === "plan"
 				? [...PLAN_MODE_READ_ONLY_TOOL_NAMES, "update_plan", "submit_plan"]
 				: this._planningState.plan?.phase === "active"
-					? [...this._requestedBuildToolNames, "update_plan"]
+					? [...this._requestedBuildToolNames, "update_plan_progress", "request_replan"]
 					: [...this._requestedBuildToolNames];
 		this._setEffectiveToolsByName([...new Set(effective)]);
 		this._applyTrustedPlanningInstructionsToSystemPrompt();
@@ -1826,18 +1864,39 @@ export class AgentSession {
 	}
 
 	private _commitPlanningState(next: PlanningState): PlanningState {
-		assertPlanningStateWithinBounds(next);
-		this.sessionManager.appendPlanningState(next);
-		this._planningState = clonePlanningState(next);
+		const parsed = parsePlanningState(next);
+		this.sessionManager.appendPlanningState(parsed);
+		this._planningState = clonePlanningState(parsed);
 		this._syncPlanningRuntime();
 		const snapshot = clonePlanningState(this._planningState);
 		this._emit({ type: "planning_state_changed", planning: snapshot });
 		return snapshot;
 	}
 
+	private _draftFromExecutedPlan(plan: PlanState): PlanState {
+		return {
+			id: plan.id,
+			revision: plan.revision + 1,
+			phase: "draft",
+			...(plan.title ? { title: plan.title } : {}),
+			...(plan.summary ? { summary: plan.summary } : {}),
+			steps: plan.steps.map((step) => ({ ...step })),
+		};
+	}
+
 	setAgentMode(mode: AgentMode): PlanningState {
 		if (mode === this._planningState.mode) {
 			return this.planningState;
+		}
+		const plan = this._planningState.plan;
+		if (mode === "plan") {
+			this._planResearchObserved = false;
+		}
+		if (mode === "plan" && plan?.phase === "active") {
+			return this._commitPlanningState({ mode, plan: this._draftFromExecutedPlan(plan) });
+		}
+		if (mode === "plan" && (plan?.phase === "completed" || plan?.phase === "handed_off")) {
+			return this._commitPlanningState({ mode, plan: null });
 		}
 		return this._commitPlanningState({ ...clonePlanningState(this._planningState), mode });
 	}
@@ -1851,10 +1910,10 @@ export class AgentSession {
 		expectedRevision?: number;
 		title?: string;
 		summary?: string;
-		steps: Array<{ id?: string; text: string; status?: PlanStepStatus; note?: string }>;
+		steps: Array<{ id?: string; text: string }>;
 	}): PlanState {
-		if (this._planningState.mode !== "plan" && this._planningState.plan?.phase !== "active") {
-			throw new Error("update_plan is available only in Plan mode or during approved plan execution");
+		if (this._planningState.mode !== "plan") {
+			throw new Error("update_plan is available only in Plan mode");
 		}
 		if (input.steps.length > 64) {
 			throw new Error("Plans may contain at most 64 steps");
@@ -1866,6 +1925,9 @@ export class AgentSession {
 		}
 		const previous = this._planningState.plan;
 		if (previous) {
+			if (previous.phase !== "draft") {
+				throw new Error("Only a draft plan can be updated");
+			}
 			if (input.planId === undefined || input.expectedRevision === undefined) {
 				throw new Error("Updating an existing plan requires planId and expectedRevision");
 			}
@@ -1873,24 +1935,108 @@ export class AgentSession {
 		} else if (input.planId !== undefined || input.expectedRevision !== undefined) {
 			throw new Error("A new plan must not provide planId or expectedRevision");
 		}
+		const title = input.title?.trim() || previous?.title;
+		const summary = input.summary?.trim() || previous?.summary;
 		const steps = canonicalizePlanSteps(input.steps, previous ?? undefined);
-		const phase =
-			previous?.phase === "active" || previous?.phase === "completed"
-				? steps.length > 0 && steps.every((step) => step.status === "completed")
-					? "completed"
-					: "active"
-				: "draft";
+		if (
+			previous &&
+			previous.title === title &&
+			previous.summary === summary &&
+			previous.steps.length === steps.length &&
+			previous.steps.every((step, index) => {
+				const next = steps[index];
+				return (
+					next !== undefined &&
+					step.id === next.id &&
+					step.text === next.text &&
+					step.status === next.status &&
+					step.note === next.note
+				);
+			})
+		) {
+			throw new Error("Plan update made no changes; continue research or submit the current draft");
+		}
 		const plan: PlanState = {
 			id: previous?.id ?? randomUUID(),
 			revision: (previous?.revision ?? 0) + 1,
-			phase,
-			...(input.title?.trim() || previous?.title ? { title: input.title?.trim() || previous?.title } : {}),
-			...(input.summary?.trim() || previous?.summary ? { summary: input.summary?.trim() || previous?.summary } : {}),
+			phase: "draft",
+			...(title ? { title } : {}),
+			...(summary ? { summary } : {}),
 			steps,
-			...(previous?.execution ? { execution: { ...previous.execution } } : {}),
 		};
-		this._commitPlanningState({ mode: this._planningState.mode, plan });
+		this._commitPlanningState({ mode: "plan", plan });
 		return { ...plan, steps: plan.steps.map((step) => ({ ...step })) };
+	}
+
+	updatePlanProgress(input: {
+		planId: string;
+		expectedRevision: number;
+		updates: Array<{ id: string; status: PlanStepStatus; note?: string }>;
+	}): PlanState {
+		if (this._planningState.mode !== "build" || this._planningState.plan?.phase !== "active") {
+			throw new Error("update_plan_progress is available only during approved plan execution");
+		}
+		assertPlanRevision(this._planningState, input.planId, input.expectedRevision);
+		if (input.updates.length === 0) {
+			throw new Error("At least one plan progress update is required");
+		}
+		const updates = new Map<string, { status: PlanStepStatus; note?: string }>();
+		const knownIds = new Set(this._planningState.plan.steps.map((step) => step.id));
+		for (const update of input.updates) {
+			const id = update.id.trim();
+			if (!id || !knownIds.has(id)) {
+				throw new Error(`Plan progress references an unknown step id: ${update.id}`);
+			}
+			if (updates.has(id)) {
+				throw new Error(`Plan progress duplicates step id: ${id}`);
+			}
+			updates.set(id, {
+				status: update.status,
+				...(update.note === undefined ? {} : { note: update.note }),
+			});
+		}
+		const steps = this._planningState.plan.steps.map((step) => {
+			const update = updates.get(step.id);
+			if (!update) return { ...step };
+			const note = update.note === undefined ? step.note : update.note.trim() || undefined;
+			return {
+				id: step.id,
+				text: step.text,
+				status: update.status,
+				...(note ? { note } : {}),
+			};
+		});
+		if (
+			this._planningState.plan.steps.every((step, index) => {
+				const next = steps[index];
+				return next !== undefined && step.status === next.status && step.note === next.note;
+			})
+		) {
+			throw new Error("Plan progress update made no changes");
+		}
+		const plan: PlanState = {
+			...this._planningState.plan,
+			revision: this._planningState.plan.revision + 1,
+			phase: steps.every((step) => step.status === "completed") ? "completed" : "active",
+			steps,
+		};
+		this._commitPlanningState({ mode: "build", plan });
+		return { ...plan, steps: plan.steps.map((step) => ({ ...step })) };
+	}
+
+	requestReplan(input: { planId: string; expectedRevision: number; reason: string }): PlanningState {
+		if (this._planningState.mode !== "build" || this._planningState.plan?.phase !== "active") {
+			throw new Error("request_replan is available only during approved plan execution");
+		}
+		assertPlanRevision(this._planningState, input.planId, input.expectedRevision);
+		if (!input.reason.trim()) {
+			throw new Error("request_replan requires implementation evidence");
+		}
+		this._planResearchObserved = false;
+		return this._commitPlanningState({
+			mode: "plan",
+			plan: this._draftFromExecutedPlan(this._planningState.plan),
+		});
 	}
 
 	submitPlan(input: { planId: string; expectedRevision: number; title: string; summary: string }): PlanState {
@@ -1898,6 +2044,9 @@ export class AgentSession {
 			throw new Error("submit_plan is available only in Plan mode");
 		}
 		assertPlanRevision(this._planningState, input.planId, input.expectedRevision);
+		if (this._planningState.plan.phase !== "draft") {
+			throw new Error("Only a draft plan can be submitted");
+		}
 		if (this._planningState.plan.steps.length === 0) {
 			throw new Error("A plan must contain at least one checklist step");
 		}
@@ -1920,6 +2069,7 @@ export class AgentSession {
 		if (this._planningState.plan.phase !== "ready") {
 			throw new Error("Only a ready plan can be changed");
 		}
+		this._planResearchObserved = false;
 		return this._commitPlanningState({
 			mode: "plan",
 			plan: {
@@ -1932,6 +2082,7 @@ export class AgentSession {
 
 	discardPlan(planId: string, expectedRevision: number): PlanningState {
 		assertPlanRevision(this._planningState, planId, expectedRevision);
+		this._planResearchObserved = false;
 		return this._commitPlanningState({ mode: this._planningState.mode, plan: null });
 	}
 

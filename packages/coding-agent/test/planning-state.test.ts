@@ -66,11 +66,47 @@ describe("native planning state", () => {
 			"grep",
 			"find",
 			"ls",
+			"lsp",
 			"update_plan",
 			"submit_plan",
 		]);
 		expect(planTools).not.toContain("bash");
 		expect(planTools).not.toContain("mutate_everything");
+
+		const submitBeforeResearch = await session.agent.beforeToolCall?.({
+			toolCall: { type: "toolCall", id: "submit-early", name: "submit_plan", arguments: {} },
+			args: {},
+		} as never);
+		expect(submitBeforeResearch).toMatchObject({ block: true });
+
+		const readOnlyLspCall = {
+			type: "toolCall" as const,
+			id: "lsp-read",
+			name: "lsp",
+			arguments: { action: "diagnostics" },
+		};
+		const readOnlyLsp = await session.agent.beforeToolCall?.({
+			toolCall: readOnlyLspCall,
+			args: { action: "diagnostics" },
+		} as never);
+		expect(readOnlyLsp).toBeUndefined();
+		await session.agent.afterToolCall?.({
+			toolCall: readOnlyLspCall,
+			args: { action: "diagnostics" },
+			result: { content: [{ type: "text", text: "No diagnostics" }] },
+			isError: false,
+		} as never);
+		const submitAfterResearch = await session.agent.beforeToolCall?.({
+			toolCall: { type: "toolCall", id: "submit-after-read", name: "submit_plan", arguments: {} },
+			args: {},
+		} as never);
+		expect(submitAfterResearch).toBeUndefined();
+
+		const mutatingLsp = await session.agent.beforeToolCall?.({
+			toolCall: { type: "toolCall", id: "lsp-fix", name: "lsp", arguments: { action: "fix" } },
+			args: { action: "fix" },
+		} as never);
+		expect(mutatingLsp).toMatchObject({ block: true });
 
 		session.setAgentMode("build");
 		const buildTools = session.getActiveToolNames();
@@ -83,18 +119,24 @@ describe("native planning state", () => {
 		session.dispose();
 	});
 
-	it("fences revisions, preserves drafts, and permits active checklist changes", async () => {
+	it("freezes approved scope, tracks progress separately, and requires reapproval for replanning", async () => {
 		const { session } = await createPlanningSession();
 		const draft = session.updatePlan({
 			title: "Implement native planning",
 			summary: "Wire the shared state through every surface.",
-			steps: [
-				{ text: "Inspect the architecture", status: "completed" },
-				{ text: "Implement the workflow", status: "in_progress" },
-			],
+			steps: [{ text: "Inspect the architecture" }, { text: "Implement the workflow" }],
 		});
 		expect(draft.revision).toBe(1);
-		expect(draft.steps.every((step) => step.id.length > 0)).toBe(true);
+		expect(draft.steps.every((step) => step.id.length > 0 && step.status === "pending")).toBe(true);
+		expect(() =>
+			session.updatePlan({
+				planId: draft.id,
+				expectedRevision: draft.revision,
+				title: draft.title,
+				summary: draft.summary,
+				steps: draft.steps.map((step) => ({ id: step.id, text: step.text })),
+			}),
+		).toThrow("made no changes");
 		expect(() =>
 			session.submitPlan({
 				planId: draft.id,
@@ -137,23 +179,111 @@ describe("native planning state", () => {
 			activated: true,
 			planning: { mode: "build", plan: { phase: "active" } },
 		});
-		expect(session.getActiveToolNames()).toContain("update_plan");
+		expect(session.getActiveToolNames()).toContain("update_plan_progress");
+		expect(session.getActiveToolNames()).toContain("request_replan");
+		expect(session.getActiveToolNames()).not.toContain("update_plan");
 		expect(session.getActiveToolNames()).not.toContain("submit_plan");
+		expect(() =>
+			session.updatePlan({
+				planId: draft.id,
+				expectedRevision: activated.planning.plan!.revision,
+				steps: [{ text: "Replace the approved scope" }],
+			}),
+		).toThrow("only in Plan mode");
 
 		const active = session.planningState.plan!;
-		const completed = session.updatePlan({
+		const progressed = session.updatePlanProgress({
 			planId: active.id,
 			expectedRevision: active.revision,
-			title: active.title,
-			summary: active.summary,
+			updates: [{ id: active.steps[0]!.id, status: "completed", note: "Architecture inspected" }],
+		});
+		expect(progressed.steps.map((step) => ({ id: step.id, text: step.text }))).toEqual(
+			active.steps.map((step) => ({ id: step.id, text: step.text })),
+		);
+		expect(progressed.steps[0]).toMatchObject({ status: "completed", note: "Architecture inspected" });
+		expect(() =>
+			session.updatePlanProgress({
+				planId: progressed.id,
+				expectedRevision: progressed.revision,
+				updates: [{ id: "unknown", status: "completed" }],
+			}),
+		).toThrow("unknown step id");
+
+		const replanning = session.requestReplan({
+			planId: progressed.id,
+			expectedRevision: progressed.revision,
+			reason: "Implementation revealed a required verification step",
+		});
+		expect(replanning).toMatchObject({
+			mode: "plan",
+			plan: { phase: "draft", revision: progressed.revision + 1 },
+		});
+		expect(replanning.plan?.execution).toBeUndefined();
+		expect(() => parsePlanningState(replanning)).not.toThrow();
+
+		const revised = session.updatePlan({
+			planId: replanning.plan!.id,
+			expectedRevision: replanning.plan!.revision,
+			title: replanning.plan!.title,
+			summary: replanning.plan!.summary,
 			steps: [
-				...active.steps.map((step) => ({ ...step, status: "completed" as const })),
-				{ text: "Verify the coordinated surfaces", status: "completed" },
+				...replanning.plan!.steps.map((step) => ({ id: step.id, text: step.text })),
+				{ text: "Verify the coordinated surfaces" },
 			],
 		});
+		expect(revised.steps[0]).toMatchObject({ status: "completed", note: "Architecture inspected" });
+		expect(revised.steps.at(-1)).toMatchObject({ status: "pending" });
+
+		const revisedReady = session.submitPlan({
+			planId: revised.id,
+			expectedRevision: revised.revision,
+			title: revised.title!,
+			summary: revised.summary!,
+		});
+		const reactivated = session.activatePlan(revised.id, revisedReady.revision, {
+			...execution,
+			id: "execution-2",
+			approvedRevision: revisedReady.revision,
+		});
+		const reactivatedPlan = reactivated.planning.plan!;
+		const completed = session.updatePlanProgress({
+			planId: reactivatedPlan.id,
+			expectedRevision: reactivatedPlan.revision,
+			updates: reactivatedPlan.steps
+				.filter((step) => step.status !== "completed")
+				.map((step) => ({ id: step.id, status: "completed" as const })),
+		});
 		expect(completed.phase).toBe("completed");
-		expect(completed.revision).toBe(active.revision + 1);
-		session.dispose();
+		expect(session.getActiveToolNames()).not.toContain("update_plan_progress");
+		expect(session.getActiveToolNames()).not.toContain("request_replan");
+		await session.dispose();
+	});
+
+	it("turns manual Plan-mode re-entry during execution into a valid draft", async () => {
+		const { session } = await createPlanningSession();
+		session.setAgentMode("plan");
+		const draft = session.updatePlan({ steps: [{ text: "Implement the approved change" }] });
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Approved change",
+			summary: "Implement and verify the approved change.",
+		});
+		session.activatePlan(ready.id, ready.revision, {
+			id: "execution-manual-replan",
+			approvedRevision: ready.revision,
+			strategy: "retain_context",
+			sourceSessionId: session.sessionId,
+			targetSessionId: session.sessionId,
+		});
+
+		const replanning = session.setAgentMode("plan");
+		expect(replanning).toMatchObject({ mode: "plan", plan: { phase: "draft" } });
+		expect(replanning.plan?.execution).toBeUndefined();
+		expect(() => parsePlanningState(replanning)).not.toThrow();
+		expect(session.getActiveToolNames()).toContain("update_plan");
+		expect(session.getActiveToolNames()).not.toContain("update_plan_progress");
+		await session.dispose();
 	});
 
 	it("rejects too many steps and oversized semantic state", () => {

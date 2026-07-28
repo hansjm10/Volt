@@ -209,7 +209,7 @@ Configure delivery in [settings](docs/settings.md): `steeringMode` and `followUp
 
 ## Plan Mode
 
-Plan mode lets the agent inspect the workspace with read-only tools and maintain a structured checklist before implementation. Start it with `volt --plan`, `/plan`, or Shift+Tab. Drafts and ready plans are stored on the active session branch and survive compaction, reconnects, and branch switching.
+Plan mode makes the agent research the workspace with read-only tools before it can submit a structured implementation checklist. Its research surface includes file and web inspection plus non-mutating LSP queries; LSP rename/fix actions remain blocked. Start it with `volt --plan`, `/plan`, or Shift+Tab. Drafts and ready plans are stored on the active session branch and survive compaction, reconnects, and branch switching.
 
 When the agent submits a plan, Volt offers exactly:
 
@@ -217,7 +217,7 @@ When the agent submits a plan, Volt offers exactly:
 2. **Execute Plan & Clear Context** — create and select a linked execution session containing the approved plan but none of the prior conversation.
 3. **Change Plan** — return the ready plan to draft and focus the normal editor for feedback.
 
-During execution, the agent keeps checklist progress current with `update_plan`. Switching to Build by itself never approves a ready plan, and explicit `!` shell commands remain available because Plan mode constrains agent tools rather than the host shell.
+Approval freezes the plan title, summary, step text, order, and scope. During execution, the agent can update only existing step status and evidence with `update_plan_progress`. If implementation reveals that the scope must change, `request_replan` pauses execution, returns the plan to draft without its approval metadata, and ends the run so the revision must be approved again. Switching to Build by itself never approves a ready plan, and explicit `!` shell commands remain available because Plan mode constrains agent tools rather than the host shell.
 
 ---
 
