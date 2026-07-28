@@ -126,7 +126,11 @@ export interface SubagentManagerOptions {
 	allowedTools?: string[];
 	/** Current subagent identity and delegation policy when this manager belongs to a child runtime. */
 	subagentContext?: SubagentRuntimeContext;
-	/** Tree-wide ceiling overrides applied to delegation scopes this manager creates. */
+	/**
+	 * Tree-wide limit overrides for scopes this manager creates. Structural
+	 * admission ceilings have finite defaults; consumption budgets abort only
+	 * when this option supplies finite values.
+	 */
 	delegationLimits?: SubagentDelegationScopeLimits;
 	requestTimeoutMs?: number;
 	/** Keep child runtimes alive after the hidden loopback client detaches. Another owner must retain/dispose them. */
@@ -163,7 +167,7 @@ export interface SubagentStartOptions {
 	agentDir?: string;
 	sessionManager?: SessionManager;
 	requestTimeoutMs?: number;
-	/** Shared root budget for all descendants created by one delegation tool call. */
+	/** Shared root admission and accounting scope for all descendants created by one delegation tool call. */
 	delegationScope?: SubagentDelegationScope;
 	/** Whole-batch admission issued by this manager for a confirmed spawn request. */
 	spawnBatchLease?: SubagentSpawnBatchLease;

@@ -280,7 +280,26 @@ When the built-in `subagent` tool's manager implements the atomic spawn-confirma
 
 Custom runtime factories that support nested delegation must construct each child session's manager with the `subagentContext` passed to `CreateAgentSessionRuntimeFactory`. Explicit `tools` and `excludeTools` policies treat `subagent` and `subagent_registry` as separate names; omitting the registry name from an explicit child allowlist disables direct registry calls and its snapshot guidance, but not the spawn tool's internal registry preflight.
 
-Parallel mode accepts up to 8 tasks per call with max concurrency 4, rejects exact duplicate agent/task pairs before starting, keeps result ordering stable, and returns mixed-status details for partial failures. Chain mode runs up to 8 steps sequentially, replaces `{previous}` with the prior successful step output, returns the final successful step output on full success, and stops at the first failed step. Recursive delegation is fail-closed unless `allowedSubagents` is explicit, and every descendant shares the root delegation scope's cancellation signal and hard tree-wide ceilings: by default depth 5, 100 starts, 16 active descendants, 1,000 turns, 50 million tokens, and $100 cost, with no wall-clock deadline. `SubagentManagerOptions.delegationLimits` overrides each ceiling and `Number.POSITIVE_INFINITY` is the explicit unlimited opt-in; exhausted reservation ceilings fail new starts, while crossing a consumption ceiling aborts the whole tree. Model-visible output is capped at 50 KB per task/step and 100 KB in aggregate for parallel and list modes. Details payloads retain at most 100 task entries per snapshot with one shared aggregate output-text byte budget — omitted entries are counted in `summary.omittedTasks` and full output stays reachable through child sessions and the registry — so details stay well under remote frame limits regardless of future cap changes; tool details also store the final tree-budget snapshot.
+Parallel mode accepts up to 8 tasks per call with max concurrency 4, rejects exact duplicate agent/task pairs before starting, keeps result ordering stable, and returns mixed-status details for partial failures. Chain mode runs up to 8 steps sequentially, replaces `{previous}` with the prior successful step output, returns the final successful step output on full success, and stops at the first failed step. Recursive delegation is fail-closed unless `allowedSubagents` is explicit, and every descendant shares the root delegation scope's cancellation signal and accounting. Structural spawn safeguards default to depth 5, 100 starts, and 16 active descendants; exhausting one rejects a new spawn without aborting admitted descendants. Turn, token, cost, and deadline budgets are unlimited by default. A host opts into aborting consumption budgets by supplying finite `SubagentManagerOptions.delegationLimits`; every field also accepts `Number.POSITIVE_INFINITY` explicitly. Model-visible output is capped at 50 KB per task/step and 100 KB in aggregate for parallel and list modes. Details payloads retain at most 100 task entries per snapshot with one shared aggregate output-text byte budget — omitted entries are counted in `summary.omittedTasks` and full output stays reachable through child sessions and the registry — so details stay well under remote frame limits regardless of future cap changes; tool details also store the final tree-budget snapshot.
+
+For example, an SDK host can opt into finite tree-wide consumption budgets:
+
+```typescript
+const budgetedSubagents = new SubagentManager({
+  createRuntime,
+  cwd,
+  agentDir,
+  resourceLoader: parentServices.resourceLoader,
+  delegationLimits: {
+    maxTurns: 250,
+    maxTotalTokens: 2_000_000,
+    maxTotalCostUsd: 25,
+    maxDurationMs: 30 * 60 * 1000,
+  },
+});
+```
+
+Crossing any configured finite consumption budget aborts that delegation tree and its active descendants.
 
 ### Prompting and Message Queueing
 
