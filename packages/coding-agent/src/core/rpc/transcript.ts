@@ -4,6 +4,7 @@ import type { ImageContent } from "@hansjm10/volt-ai";
 import { type BashExecutionMessage, extractVisibleTextContent } from "../messages.ts";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "../subagents/tool-names.ts";
+import { getRemoteVisibleCustomMessageRole } from "./custom-message-projection.ts";
 import type {
 	RpcMessageImage,
 	RpcTranscriptItem,
@@ -249,14 +250,15 @@ function projectTranscriptItems(entries: SessionEntry[]): RpcTranscriptItem[] {
 }
 
 function projectCustomMessage(entry: Extract<SessionEntry, { type: "custom_message" }>): RpcTranscriptItem | undefined {
-	if (!entry.display || entry.customType !== "review") {
+	const role = getRemoteVisibleCustomMessageRole(entry.customType, entry.display);
+	if (role === undefined) {
 		return undefined;
 	}
 	const text = boundText(extractVisibleTextContent(entry.content), MESSAGE_TEXT_LIMIT);
 	if (!text) {
 		return undefined;
 	}
-	return { id: entry.id, role: "assistant", text, timestamp: normalizeTimestamp(entry.timestamp) };
+	return { id: entry.id, role, text, timestamp: normalizeTimestamp(entry.timestamp) };
 }
 
 function collectToolCalls(entries: SessionEntry[]): Map<string, StoredToolCall> {

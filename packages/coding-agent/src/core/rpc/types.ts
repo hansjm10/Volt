@@ -317,7 +317,7 @@ export type RpcTranscriptToolStatus = Static<typeof RpcTranscriptToolStatusSchem
 /** Convenience supertype of the transcript item variants. */
 export interface RpcTranscriptBaseItem {
 	id: string;
-	role: "user" | "assistant" | "tool" | "summary";
+	role: "user" | "assistant" | "system" | "tool" | "summary";
 	timestamp: string;
 }
 
