@@ -53,7 +53,7 @@ export function getIrohRemoteWorkingDirectoryValidationError(value: string): str
 	return undefined;
 }
 export const DEFAULT_IROH_REMOTE_ALLOW_TOOLS =
-	"read,bash,edit,write,web_search,web_fetch,grep,find,ls,subagent,subagent_registry,mcp";
+	"read,bash,edit,write,web_search,web_fetch,grep,find,ls,inspect,lsp,subagent,subagent_registry,mcp";
 export const IROH_REMOTE_UNSAFE_TOOL_NAMES = ["bash", "edit", "write", "web_search", "web_fetch"] as const;
 export const IROH_REMOTE_OUTCOMES = [
 	"host_unreachable",
