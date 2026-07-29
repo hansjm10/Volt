@@ -237,7 +237,7 @@ export function formatPlanPolicy(mode: AgentMode, phase?: PlanPhase): string {
 			"Resolve discoverable repository facts with tools before asking the user. Ask only about intent, preferences, or tradeoffs that the workspace cannot answer.",
 			"Distinguish evidence from assumptions, evaluate meaningful alternatives, and make the result decision-complete with explicit verification criteria.",
 			"Use update_plan to create or completely replace the implementation checklist, preserving canonical ids only for unchanged steps. Finish by calling submit_plan.",
-			"Do not attempt file mutation, shell execution, mutating language-server actions, MCP calls, extension tools, or delegation. LSP rename and fix actions are blocked.",
+			"The host-enforced research capability profile permits workspace/network reads, vetted Git/GitHub inspection, and explicitly trusted integration reads. Arbitrary process execution, mutation, untrusted integrations, custom tools, and delegation are blocked.",
 		].join("\n");
 	}
 	if (phase === "active") {

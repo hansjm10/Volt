@@ -30,6 +30,7 @@ export type McpServerStatus =
 export type McpAuthState = "none" | "required" | "pending" | "authenticated" | "failed";
 export type McpRecentCallStatus = "started" | "completed" | "failed" | "cancelled";
 export type McpCallerSurface = "model" | "tui" | "rpc" | "mobile" | "print" | "json" | "unknown";
+export type McpMetadataCategory = "tools" | "resources" | "prompts";
 
 export interface McpSettings {
 	enabled: boolean;
@@ -59,6 +60,11 @@ export interface McpAuthConfig {
 	tokenEndpointAuthMethod?: "client_secret_basic" | "client_secret_post" | "none";
 }
 
+export interface McpTrustedReadsConfig {
+	resources: boolean;
+	tools: string[];
+}
+
 export interface McpServerConfig {
 	enabled: boolean;
 	displayName?: string;
@@ -67,6 +73,7 @@ export interface McpServerConfig {
 	includeTools: string[];
 	excludeTools: string[];
 	directTools: boolean | string[];
+	trustedReads: McpTrustedReadsConfig;
 	connectTimeoutMs?: number;
 	callTimeoutMs?: number;
 	idleTimeoutMs?: number;
@@ -131,7 +138,9 @@ export interface McpServerMetadata {
 	tools: SdkTool[];
 	resources: Resource[];
 	prompts: Prompt[];
-	lastSeenAt: string;
+	toolsLastSeenAt: string;
+	resourcesLastSeenAt: string;
+	promptsLastSeenAt: string;
 }
 
 export interface McpMetadataRefreshResult {
@@ -159,6 +168,7 @@ export interface McpToolSummary {
 	title?: string;
 	description?: string;
 	risk: McpRisk;
+	trustedRead: boolean;
 	inputSchema?: unknown;
 	outputSchema?: unknown;
 	annotations?: Record<string, unknown>;
@@ -300,6 +310,7 @@ export interface McpSearchMatch {
 	title: string;
 	summary: string;
 	risk: McpRisk;
+	trustedRead: boolean;
 	metadataHash: string;
 	call: string;
 	describe: string;
@@ -362,4 +373,5 @@ export interface McpClientFactory {
 export interface McpGatewayExecutionContext {
 	mode: "tui" | "rpc" | "json" | "print" | "unknown";
 	caller?: "model" | "user";
+	restrictedTrustedRead?: boolean;
 }

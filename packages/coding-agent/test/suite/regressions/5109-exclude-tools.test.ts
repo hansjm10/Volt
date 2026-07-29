@@ -90,7 +90,7 @@ describe("regression #5109: exclude tools", () => {
 	it("does not restore excluded tools when entering Plan mode", async () => {
 		const harness = await createHarness({ excludedToolNames: ["read"] });
 		try {
-			harness.session.setAgentMode("plan");
+			await harness.session.setAgentMode("plan");
 
 			expect(toolNames(harness.session.getAllTools())).not.toContain("read");
 			expect(harness.session.getActiveToolNames()).not.toContain("read");

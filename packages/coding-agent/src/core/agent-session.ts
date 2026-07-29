@@ -100,6 +100,15 @@ import type { McpManagerEvent } from "./mcp/types.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
 import {
+	authorizeToolOperation,
+	getTrustedToolOperationResolver,
+	isToolVisibleUnderGrant,
+	type OperationResolution,
+	operationProvidesResearchEvidence,
+	RESEARCH_OPERATION_GRANT_PROFILE,
+	type ToolOperationResolver,
+} from "./operation-authorization.ts";
+import {
 	type AgentMode,
 	assertPlanRevision,
 	clonePlanningState,
@@ -147,12 +156,7 @@ import {
 	type SubagentToolManager,
 	type SubagentToolMode,
 } from "./tools/index.ts";
-import {
-	canonicalizePlanSteps,
-	createPlanningToolDefinitions,
-	NATIVE_PLAN_TOOL_NAMES,
-	PLAN_MODE_READ_ONLY_TOOL_NAMES,
-} from "./tools/planning.ts";
+import { canonicalizePlanSteps, createPlanningToolDefinitions, NATIVE_PLAN_TOOL_NAMES } from "./tools/planning.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 
 // ============================================================================
@@ -450,17 +454,6 @@ export class QueueClearPersistenceError extends Error {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-const PLAN_MODE_READ_ONLY_LSP_ACTIONS = new Set([
-	"definition",
-	"references",
-	"implementations",
-	"type-definition",
-	"callers",
-	"callees",
-	"hover",
-	"symbols",
-	"diagnostics",
-]);
 
 // ============================================================================
 // AgentSession Class
@@ -569,9 +562,12 @@ export class AgentSession {
 	private _modelRegistry: ModelRegistry;
 	private _fastModeEnabled = false;
 	private _planningState: PlanningState;
+	private _planningTransitionQueue: Promise<void> = Promise.resolve();
 	private _requestedBuildToolNames: string[] = [];
 	private _planningRuntimeInitialized = false;
 	private _planResearchObserved = false;
+	private _trustedHostToolNames: Set<string> = new Set();
+	private _authorizedOperationResolutions: Map<string, OperationResolution> = new Map();
 
 	// LSP diagnostics manager (created unless lsp.enabled is false)
 	private _lspManager?: LspManager;
@@ -581,6 +577,7 @@ export class AgentSession {
 	private _mcpManager?: McpManager;
 	private _mcpManagerFactory?: () => Promise<McpManager | undefined> | McpManager | undefined;
 	private _unsubscribeMcpManager?: () => void;
+	private _directMcpToolNames: Set<string> = new Set();
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -722,54 +719,63 @@ export class AgentSession {
 					block: true,
 					reason:
 						this._planningState.mode === "plan"
-							? `Plan mode policy blocked ${toolCall.name}. Only read-only exploration and native plan tools are available.`
+							? `The active research capability profile does not expose ${toolCall.name}.`
 							: `Tool ${toolCall.name} is no longer active for this session.`,
 				};
 			}
-			if (this._planningState.mode === "plan" && toolCall.name === "lsp") {
-				const action =
-					typeof args === "object" && args !== null && "action" in args
-						? (args as { action?: unknown }).action
-						: undefined;
-				if (typeof action !== "string" || !PLAN_MODE_READ_ONLY_LSP_ACTIONS.has(action)) {
-					return {
-						block: true,
-						reason: `Plan mode policy blocked the mutating or unknown LSP action ${JSON.stringify(action)}.`,
-					};
-				}
-			}
-			if (this._planningState.mode === "plan" && toolCall.name === "submit_plan" && !this._planResearchObserved) {
-				return {
-					block: true,
-					reason:
-						"Plan mode requires at least one successful read-only exploration tool call before submitting a plan.",
-				};
-			}
+
 			const runner = this._extensionRunner;
-			if (!runner.hasHandlers("tool_call")) {
-				return undefined;
+			let extensionDecision: { block?: boolean; reason?: string } | undefined;
+			if (runner.hasHandlers("tool_call")) {
+				try {
+					extensionDecision = await runner.emitToolCall({
+						type: "tool_call",
+						toolName: toolCall.name,
+						toolCallId: toolCall.id,
+						input: args as Record<string, unknown>,
+					});
+				} catch (err) {
+					if (err instanceof Error) {
+						throw err;
+					}
+					throw new Error(`Extension failed, blocking execution: ${String(err)}`);
+				}
+				if (extensionDecision?.block) {
+					return extensionDecision;
+				}
 			}
 
-			try {
-				return await runner.emitToolCall({
-					type: "tool_call",
-					toolName: toolCall.name,
-					toolCallId: toolCall.id,
-					input: args as Record<string, unknown>,
-				});
-			} catch (err) {
-				if (err instanceof Error) {
-					throw err;
+			if (this._planningState.mode === "plan") {
+				const decision = authorizeToolOperation(
+					this._getTrustedOperationResolver(toolCall.name),
+					args,
+					RESEARCH_OPERATION_GRANT_PROFILE,
+				);
+				if (!decision.allowed) {
+					return {
+						block: true,
+						reason: `The research capability profile blocked ${toolCall.name}: ${decision.reason ?? "operation denied"}.`,
+					};
 				}
-				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
+				if (toolCall.name === "submit_plan" && !this._planResearchObserved) {
+					return {
+						block: true,
+						reason: "Plan mode requires at least one successful read operation before submitting a plan.",
+					};
+				}
+				this._authorizedOperationResolutions.set(toolCall.id, decision.resolution);
 			}
+			return extensionDecision;
 		};
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+			const resolution = this._authorizedOperationResolutions.get(toolCall.id);
+			this._authorizedOperationResolutions.delete(toolCall.id);
 			if (
 				!isError &&
 				this._planningState.mode === "plan" &&
-				PLAN_MODE_READ_ONLY_TOOL_NAMES.includes(toolCall.name as (typeof PLAN_MODE_READ_ONLY_TOOL_NAMES)[number])
+				resolution !== undefined &&
+				operationProvidesResearchEvidence(resolution)
 			) {
 				this._planResearchObserved = true;
 			}
@@ -1779,18 +1785,19 @@ export class AgentSession {
 		return this._toolDefinitions.get(name)?.definition;
 	}
 
+	private _getTrustedOperationResolver(name: string): ToolOperationResolver | undefined {
+		const source = this._toolDefinitions.get(name)?.sourceInfo;
+		if (source?.source !== "builtin" || !this._trustedHostToolNames.has(name)) {
+			return undefined;
+		}
+		return getTrustedToolOperationResolver(name, {
+			...(this._mcpManager ? { integrationReadAuthority: this._mcpManager } : {}),
+		});
+	}
+
 	private _isToolVisibleToCurrentMode(name: string): boolean {
-		if (this._planningState.mode === "plan") {
+		if (this._planningState.mode === "plan" || NATIVE_PLAN_TOOL_NAMES.has(name)) {
 			return this.getActiveToolNames().includes(name);
-		}
-		if (NATIVE_PLAN_TOOL_NAMES.has(name)) {
-			return this.getActiveToolNames().includes(name);
-		}
-		if (PLAN_MODE_READ_ONLY_TOOL_NAMES.includes(name as (typeof PLAN_MODE_READ_ONLY_TOOL_NAMES)[number])) {
-			return (
-				(this._allowedToolNames === undefined || this._allowedToolNames.has(name)) &&
-				!this._excludedToolNames?.has(name)
-			);
 		}
 		return true;
 	}
@@ -1834,7 +1841,9 @@ export class AgentSession {
 		const effective = [
 			...new Set(
 				this._planningState.mode === "plan"
-					? [...PLAN_MODE_READ_ONLY_TOOL_NAMES, "update_plan", "submit_plan"]
+					? Array.from(this._toolRegistry.keys()).filter((name) =>
+							isToolVisibleUnderGrant(this._getTrustedOperationResolver(name), RESEARCH_OPERATION_GRANT_PROFILE),
+						)
 					: this._planningState.plan?.phase === "active"
 						? [...this._requestedBuildToolNames, "update_plan_progress", "request_replan"]
 						: [...this._requestedBuildToolNames],
@@ -1849,6 +1858,41 @@ export class AgentSession {
 			this._setEffectiveToolsByName(effective);
 		}
 		this._applyTrustedPlanningInstructionsToSystemPrompt();
+	}
+
+	private async _prepareUnrestrictedMcpForBuild(): Promise<void> {
+		if (!this._mcpManager) {
+			return;
+		}
+		await this._mcpManager.startEagerServers();
+		const previousDirectToolNames = this._directMcpToolNames;
+		const directDefinitions = createMcpDirectToolDefinitions(this._mcpManager);
+		for (const name of previousDirectToolNames) {
+			this._baseToolDefinitions.delete(name);
+		}
+		for (const definition of directDefinitions) {
+			this._baseToolDefinitions.set(definition.name, definition as ToolDefinition);
+		}
+		this._directMcpToolNames = new Set(directDefinitions.map((definition) => definition.name));
+
+		const previouslyRequestedDirectTools = new Set(
+			this._requestedBuildToolNames.filter((name) => previousDirectToolNames.has(name)),
+		);
+		const requestedBuildTools = this._requestedBuildToolNames.filter((name) => !previousDirectToolNames.has(name));
+		for (const definition of directDefinitions) {
+			const wasPreviouslyAvailable = previousDirectToolNames.has(definition.name);
+			if (
+				wasPreviouslyAvailable
+					? previouslyRequestedDirectTools.has(definition.name)
+					: (this._allowedToolNames === undefined || this._allowedToolNames.has(definition.name)) &&
+						!this._excludedToolNames?.has(definition.name)
+			) {
+				requestedBuildTools.push(definition.name);
+			}
+		}
+		const requestedBuildToolNames = [...new Set(requestedBuildTools)];
+		this._refreshToolRegistry({ activeToolNames: requestedBuildToolNames });
+		this.setActiveToolsByName(requestedBuildToolNames.filter((name) => this._toolRegistry.has(name)));
 	}
 
 	private _applyTrustedPlanningInstructionsToSystemPrompt(systemPrompt = this._baseSystemPrompt): void {
@@ -1919,7 +1963,23 @@ export class AgentSession {
 		};
 	}
 
-	setAgentMode(mode: AgentMode): PlanningState {
+	private _enqueuePlanningTransition<T>(transition: () => Promise<T>): Promise<T> {
+		const result = this._planningTransitionQueue.then(transition);
+		this._planningTransitionQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
+	setAgentMode(mode: AgentMode): Promise<PlanningState> {
+		return this._enqueuePlanningTransition(() => this._setAgentMode(mode));
+	}
+
+	private async _setAgentMode(mode: AgentMode): Promise<PlanningState> {
+		if (mode === "build" && this._planningState.mode === "plan") {
+			await this._prepareUnrestrictedMcpForBuild();
+		}
 		if (mode === this._planningState.mode) {
 			return this.planningState;
 		}
@@ -1942,8 +2002,8 @@ export class AgentSession {
 		return next;
 	}
 
-	toggleAgentMode(): PlanningState {
-		return this.setAgentMode(this.agentMode === "plan" ? "build" : "plan");
+	toggleAgentMode(): Promise<PlanningState> {
+		return this._enqueuePlanningTransition(() => this._setAgentMode(this.agentMode === "plan" ? "build" : "plan"));
 	}
 
 	updatePlan(input: {
@@ -2133,8 +2193,31 @@ export class AgentSession {
 		planId: string,
 		expectedRevision: number,
 		execution: PlanExecution,
-	): { planning: PlanningState; activated: boolean } {
-		const currentPlan = this._planningState.plan;
+	): Promise<{ planning: PlanningState; activated: boolean }> {
+		return this._enqueuePlanningTransition(() => this._activatePlan(planId, expectedRevision, execution));
+	}
+
+	private async _activatePlan(
+		planId: string,
+		expectedRevision: number,
+		execution: PlanExecution,
+	): Promise<{ planning: PlanningState; activated: boolean }> {
+		let currentPlan = this._planningState.plan;
+		if (
+			currentPlan?.id === planId &&
+			currentPlan.execution?.approvedRevision === expectedRevision &&
+			currentPlan.execution.strategy === execution.strategy
+		) {
+			return { planning: this.planningState, activated: false };
+		}
+		assertPlanRevision(this._planningState, planId, expectedRevision);
+		if (this._planningState.plan.phase !== "ready") {
+			throw new Error("Only a ready plan can be executed");
+		}
+		if (this._planningState.mode === "plan") {
+			await this._prepareUnrestrictedMcpForBuild();
+		}
+		currentPlan = this._planningState.plan;
 		if (
 			currentPlan?.id === planId &&
 			currentPlan.execution?.approvedRevision === expectedRevision &&
@@ -2160,8 +2243,20 @@ export class AgentSession {
 		};
 	}
 
-	markPlanHandedOff(planId: string, expectedRevision: number, execution: PlanExecution): PlanningState {
+	markPlanHandedOff(planId: string, expectedRevision: number, execution: PlanExecution): Promise<PlanningState> {
+		return this._enqueuePlanningTransition(() => this._markPlanHandedOff(planId, expectedRevision, execution));
+	}
+
+	private async _markPlanHandedOff(
+		planId: string,
+		expectedRevision: number,
+		execution: PlanExecution,
+	): Promise<PlanningState> {
 		assertPlanRevision(this._planningState, planId, expectedRevision);
+		if (this._planningState.mode === "plan") {
+			await this._prepareUnrestrictedMcpForBuild();
+			assertPlanRevision(this._planningState, planId, expectedRevision);
+		}
 		return this._commitPlanningState({
 			mode: "build",
 			plan: {
@@ -5003,6 +5098,7 @@ export class AgentSession {
 		}
 
 		const directMcpToolDefinitions = this._mcpManager ? createMcpDirectToolDefinitions(this._mcpManager) : [];
+		this._directMcpToolNames = new Set(directMcpToolDefinitions.map((definition) => definition.name));
 		const isSubagentRuntime = this._subagentToolManager?.isSubagentRuntime?.() === true;
 		const subagentToolManager =
 			this._subagentToolManager &&
@@ -5087,14 +5183,23 @@ export class AgentSession {
 								},
 							}
 						: {}),
-					...(this._mcpManager ? { mcp: { manager: this._mcpManager } } : {}),
+					...(this._mcpManager
+						? {
+								mcp: {
+									manager: this._mcpManager,
+									isRestrictedTrustedRead: () => this._planningState.mode === "plan",
+								},
+							}
+						: {}),
 				});
 
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
 		);
+		this._trustedHostToolNames = new Set(this._baseToolsOverride ? [] : Object.keys(baseToolDefinitions));
 		for (const definition of createPlanningToolDefinitions(this)) {
 			this._baseToolDefinitions.set(definition.name, definition as ToolDefinition);
+			this._trustedHostToolNames.add(definition.name);
 		}
 		for (const definition of directMcpToolDefinitions) {
 			this._baseToolDefinitions.set(definition.name, definition as ToolDefinition);

@@ -18,7 +18,11 @@ export {
 	mergeMcpConfigFile,
 	normalizeMcpDirectToolSegment,
 	normalizeMcpServerId,
+	serverHasTrustedReads,
+	serverHasTrustedToolReads,
 	serverMatchesToolFilters,
+	serverTrustsResourceReads,
+	serverTrustsToolRead,
 	stableStringify,
 } from "./config.ts";
 export { hasProjectMcpConfig, type LoadMcpConfigOptions, loadMcpConfig } from "./config-loader.ts";
@@ -46,9 +50,13 @@ export {
 export { McpOAuthStore, type McpOAuthStoredRecord } from "./oauth-store.ts";
 export { McpOutputStore, type McpOutputStoreOptions, type McpStoredOutputChunk } from "./output-store.ts";
 export { getMcpRpcCapabilities, listMcpRpcServers, type McpRpcCapabilities } from "./rpc.ts";
-export { classifyMcpToolRisk, sanitizeMcpArguments } from "./safety.ts";
+export { classifyMcpToolRisk, isMcpToolTrustedReadCandidate, sanitizeMcpArguments } from "./safety.ts";
 export { searchMcpMetadata } from "./search.ts";
-export { McpServerSupervisor, type McpServerSupervisorOptions } from "./server-supervisor.ts";
+export {
+	type McpMetadataRefreshOptions,
+	McpServerSupervisor,
+	type McpServerSupervisorOptions,
+} from "./server-supervisor.ts";
 export type {
 	McpAuthConfig,
 	McpAuthRequestDetails,
@@ -87,4 +95,5 @@ export type {
 	McpToolMetadata,
 	McpToolSummary,
 	McpTransportKind,
+	McpTrustedReadsConfig,
 } from "./types.ts";

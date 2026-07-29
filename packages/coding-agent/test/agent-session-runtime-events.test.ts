@@ -264,7 +264,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 	it("starts one revision-fenced retained-context plan execution", async () => {
 		const { runtimeHost } = await createRuntimeHost(() => {});
-		runtimeHost.session.setAgentMode("plan");
+		await runtimeHost.session.setAgentMode("plan");
 		const draft = runtimeHost.session.updatePlan({
 			title: "Retain context",
 			summary: "Execute in the current session.",
@@ -313,7 +313,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const sourceSessionFile = runtimeHost.session.sessionFile;
 		expect(sourceSessionFile).toBeDefined();
 
-		runtimeHost.session.setAgentMode("plan");
+		await runtimeHost.session.setAgentMode("plan");
 		const draft = runtimeHost.session.updatePlan({
 			title: "Clear context",
 			summary: "Execute from only the approved plan.",

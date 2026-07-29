@@ -98,7 +98,7 @@ interface AgentSession {
 
   // Planning
   planningState: PlanningState;
-  setAgentMode(mode: "build" | "plan"): PlanningState;
+  setAgentMode(mode: "build" | "plan"): Promise<PlanningState>;
   changePlan(planId: string, expectedRevision: number): PlanningState;
   discardPlan(planId: string, expectedRevision: number): PlanningState;
 
@@ -124,6 +124,8 @@ interface AgentSession {
   dispose(): void;
 }
 ```
+
+Always await `setAgentMode()` before reading `planningState`, `agentMode`, or active tools. In particular, a Plan-to-Build transition waits for unrestricted MCP startup and direct-tool restoration before the returned Build state is exposed. Mode and plan-execution transitions are serialized in invocation order; a queued toggle derives its target only after earlier transitions commit.
 
 Session replacement APIs such as new-session, resume, fork, and import live on `AgentSessionRuntime`, not on `AgentSession`.
 Approving a ready plan also lives there:

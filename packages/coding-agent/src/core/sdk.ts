@@ -41,6 +41,7 @@ import {
 	createEditTool,
 	createFindTool,
 	createGrepTool,
+	createInspectionTool,
 	createLspTool,
 	createLsTool,
 	createReadOnlyTools,
@@ -193,6 +194,7 @@ export {
 	createGrepTool,
 	createFindTool,
 	createLsTool,
+	createInspectionTool,
 	createLspTool,
 	createSubagentRegistryTool,
 	createSubagentTool,
@@ -367,7 +369,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			sessionId: sessionManager.getSessionId(),
 			workspaceId: projectCwd,
 		});
-		await manager.startEagerServers().catch(() => undefined);
+		await manager
+			.startEagerServers(undefined, {
+				trustedReadsOnly: sessionManager.buildSessionContext().planning.mode === "plan",
+			})
+			.catch(() => undefined);
 		return manager;
 	};
 	const mcpManager = options.disableMcp ? undefined : (options.mcpManager ?? (await createDefaultMcpManager()));

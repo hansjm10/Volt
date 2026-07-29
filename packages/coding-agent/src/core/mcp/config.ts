@@ -94,6 +94,19 @@ function asDirectTools(value: unknown): boolean | string[] {
 	return false;
 }
 
+function asTrustedReads(value: unknown): { resources: boolean; tools: string[] } {
+	if (!isRecord(value)) {
+		return { resources: false, tools: [] };
+	}
+	const tools = isStringArray(value.tools)
+		? [...new Set(value.tools.map((tool) => tool.trim()).filter((tool) => tool.length > 0))]
+		: [];
+	return {
+		resources: asBoolean(value.resources) ?? false,
+		tools,
+	};
+}
+
 function asAuthConfig(value: unknown): McpAuthConfig | undefined {
 	if (!isRecord(value)) {
 		return undefined;
@@ -351,6 +364,7 @@ function normalizeServer(
 		includeTools: isStringArray(server.includeTools) ? [...server.includeTools] : [],
 		excludeTools: isStringArray(server.excludeTools) ? [...server.excludeTools] : [],
 		directTools: asDirectTools(server.directTools),
+		trustedReads: asTrustedReads(server.trustedReads),
 		connectTimeoutMs: asFiniteNumber(server.connectTimeoutMs),
 		callTimeoutMs: asFiniteNumber(server.callTimeoutMs),
 		idleTimeoutMs: asFiniteNumber(server.idleTimeoutMs),
@@ -398,6 +412,22 @@ export function serverMatchesToolFilters(server: McpResolvedServerConfig, toolNa
 	return !server.excludeTools.includes(toolName);
 }
 
+export function serverHasTrustedToolReads(server: McpResolvedServerConfig): boolean {
+	return server.trustedReads.tools.some((toolName) => serverMatchesToolFilters(server, toolName));
+}
+
+export function serverHasTrustedReads(server: McpResolvedServerConfig): boolean {
+	return server.trustedReads.resources || serverHasTrustedToolReads(server);
+}
+
+export function serverTrustsResourceReads(server: McpResolvedServerConfig): boolean {
+	return server.trustedReads.resources;
+}
+
+export function serverTrustsToolRead(server: McpResolvedServerConfig, toolName: string): boolean {
+	return server.trustedReads.tools.includes(toolName) && serverMatchesToolFilters(server, toolName);
+}
+
 export function getServerTimeoutMs(
 	server: McpResolvedServerConfig,
 	settings: McpSettings,
@@ -443,6 +473,7 @@ export function hashMcpServerConfig(server: McpResolvedServerConfig): string {
 		includeTools: server.includeTools,
 		excludeTools: server.excludeTools,
 		directTools: server.directTools,
+		trustedReads: server.trustedReads,
 		connectTimeoutMs: server.connectTimeoutMs,
 		callTimeoutMs: server.callTimeoutMs,
 		idleTimeoutMs: server.idleTimeoutMs,

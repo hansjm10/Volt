@@ -8,12 +8,14 @@ import { getMcpServerAuthState } from "../src/core/mcp/auth.ts";
 import {
 	createEmptyMcpMergedConfig,
 	finalizeMcpConfig,
+	hashMcpServerConfig,
 	mergeMcpConfigFile,
 	sourceForMcpConfigPath,
 } from "../src/core/mcp/config.ts";
 import { loadMcpConfig } from "../src/core/mcp/config-loader.ts";
 import { McpConfigWriter } from "../src/core/mcp/config-writer.ts";
 import { createMcpDirectToolDefinitions } from "../src/core/mcp/direct-tools.ts";
+import { createMcpToolDefinition } from "../src/core/mcp/gateway-tool.ts";
 import { McpManager } from "../src/core/mcp/manager.ts";
 import { McpMetadataCache } from "../src/core/mcp/metadata-cache.ts";
 import {
@@ -24,7 +26,7 @@ import {
 } from "../src/core/mcp/oauth-flow.ts";
 import { McpOAuthStore } from "../src/core/mcp/oauth-store.ts";
 import { McpOutputStore } from "../src/core/mcp/output-store.ts";
-import { classifyMcpToolRisk, sanitizeMcpArguments } from "../src/core/mcp/safety.ts";
+import { classifyMcpToolRisk, isMcpToolTrustedReadCandidate, sanitizeMcpArguments } from "../src/core/mcp/safety.ts";
 import type {
 	McpClientConnection,
 	McpClientFactory,
@@ -69,6 +71,19 @@ function createGatewayContext(): McpGatewayExecutionContext {
 	};
 }
 
+interface Deferred<T> {
+	promise: Promise<T>;
+	resolve(value: T): void;
+}
+
+function createDeferred<T>(): Deferred<T> {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((promiseResolve) => {
+		resolve = promiseResolve;
+	});
+	return { promise, resolve };
+}
+
 function createFakeFactory(output: string): McpClientFactory {
 	const readNoteTool: SdkTool = {
 		name: "read_note",
@@ -97,6 +112,64 @@ function createFakeFactory(output: string): McpClientFactory {
 				close: async () => undefined,
 			}) as McpClientConnection,
 	};
+}
+
+interface MetadataRequestCounts {
+	tools: number;
+	resources: number;
+	prompts: number;
+	calls: number;
+}
+
+function createMetadataCountingManager(
+	tempDir: string,
+	trustedReads: { resources: boolean; tools: string[] },
+	options: { failResources?: boolean } = {},
+): { manager: McpManager; counts: MetadataRequestCounts } {
+	const counts: MetadataRequestCounts = { tools: 0, resources: 0, prompts: 0, calls: 0 };
+	const manager = new McpManager({
+		config: createTestConfig(tempDir, { trustedReads }),
+		clientFactory: {
+			connect: async () =>
+				({
+					getServerVersion: () => ({ name: "fake", version: "1.0.0" }),
+					listTools: async () => {
+						counts.tools += 1;
+						return {
+							tools: [
+								{
+									name: "read_note",
+									description: "Read a note",
+									inputSchema: { type: "object" },
+									annotations: { readOnlyHint: true },
+								},
+							],
+						};
+					},
+					listResources: async () => {
+						counts.resources += 1;
+						if (options.failResources) {
+							throw new Error("resource metadata failed");
+						}
+						return { resources: [{ uri: "file:///note", name: "note" }] };
+					},
+					readResource: async () => ({ contents: [] }),
+					listPrompts: async () => {
+						counts.prompts += 1;
+						return { prompts: [{ name: "summarize" }] };
+					},
+					getPrompt: async () => ({ messages: [] }),
+					callTool: async () => {
+						counts.calls += 1;
+						return { content: [{ type: "text", text: "read" }] };
+					},
+					close: async () => undefined,
+				}) as McpClientConnection,
+		},
+		metadataCache: new McpMetadataCache({ agentDir: tempDir }),
+		outputStore: new McpOutputStore({ agentDir: tempDir, maxOutputBytes: 4096, maxOutputLines: 100 }),
+	});
+	return { manager, counts };
 }
 
 describe("MCP support", () => {
@@ -207,6 +280,394 @@ describe("MCP support", () => {
 		await manager.disconnectServer("fake");
 	});
 
+	it("propagates protocol-level MCP failures through gateway and direct tool results", async () => {
+		const tempDir = makeTempDir();
+		tempDirs.push(tempDir);
+		const config = createTestConfig(tempDir, { directTools: ["read_note"] });
+		const manager = new McpManager({
+			config,
+			clientFactory: {
+				connect: async () => {
+					const connection = await createFakeFactory("unused").connect(config.servers.fake, {});
+					return {
+						...connection,
+						callTool: async () => ({
+							content: [{ type: "text", text: "server rejected the read" }],
+							isError: true,
+						}),
+					};
+				},
+			},
+			metadataCache: new McpMetadataCache({ agentDir: tempDir }),
+			outputStore: new McpOutputStore({ agentDir: tempDir, maxOutputBytes: 4096, maxOutputLines: 100 }),
+		});
+		const gateway = createMcpToolDefinition({ manager });
+		const result = await gateway.execute(
+			"mcp-protocol-error",
+			{ action: "call", server: "fake", tool: "read_note" },
+			undefined,
+			undefined,
+			undefined as never,
+		);
+
+		expect(result).toMatchObject({ isError: true });
+		expect(result.details.result).toMatchObject({
+			action: "call",
+			status: "failed",
+			isError: true,
+			content: "server rejected the read",
+		});
+		expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining('"status": "failed"') });
+
+		const direct = createMcpDirectToolDefinitions(manager);
+		expect(direct).toHaveLength(1);
+		const directResult = await direct[0].execute(
+			"mcp-direct-protocol-error",
+			{},
+			undefined,
+			undefined,
+			undefined as never,
+		);
+		expect(directResult).toMatchObject({
+			isError: true,
+			details: {
+				result: expect.objectContaining({ action: "call", status: "failed", isError: true }),
+			},
+		});
+		await manager.dispose();
+	});
+
+	it("requires explicit trusted-read config plus non-conflicting server annotations", async () => {
+		const tempDir = makeTempDir();
+		tempDirs.push(tempDir);
+		const configured = createTestConfig(tempDir, {
+			trustedReads: { resources: true, tools: ["read_note", "update_note", "read_note"] },
+		});
+		expect(configured.servers.fake.trustedReads).toEqual({
+			resources: true,
+			tools: ["read_note", "update_note"],
+		});
+		const manager = new McpManager({
+			config: configured,
+			clientFactory: createFakeFactory("trusted-output"),
+			metadataCache: new McpMetadataCache({ agentDir: tempDir }),
+			outputStore: new McpOutputStore({ agentDir: tempDir, maxOutputBytes: 4096, maxOutputLines: 100 }),
+		});
+		expect(manager.hasTrustedReads("fake")).toBe(true);
+		expect(manager.hasTrustedResourceReads("fake")).toBe(true);
+		expect(manager.isTrustedToolRead("fake", "read_note")).toBe(false);
+
+		await manager.connectServer("fake");
+		expect(manager.isTrustedToolRead("fake", "read_note")).toBe(true);
+		expect(manager.isTrustedToolRead("fake", "update_note")).toBe(false);
+		expect(manager.search("note").matches).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ tool: "read_note", trustedRead: true }),
+				expect.objectContaining({ tool: "update_note", trustedRead: false }),
+			]),
+		);
+		const listed = await manager.listTools("fake");
+		expect(listed.tools.find((tool) => tool.name === "read_note")?.trustedRead).toBe(true);
+		expect(listed.tools.find((tool) => tool.name === "update_note")?.trustedRead).toBe(false);
+		expect(await manager.describe("fake", "read_note")).toMatchObject({ trustedRead: true });
+
+		const changedTrust = createTestConfig(tempDir, {
+			trustedReads: { resources: false, tools: ["read_note"] },
+		});
+		expect(hashMcpServerConfig(changedTrust.servers.fake)).not.toBe(hashMcpServerConfig(configured.servers.fake));
+		await manager.dispose();
+	});
+
+	it("revalidates fresh metadata before a restricted trusted-read gateway call", async () => {
+		const tempDir = makeTempDir();
+		tempDirs.push(tempDir);
+		let metadataReads = 0;
+		let toolCalls = 0;
+		const manager = new McpManager({
+			config: createTestConfig(tempDir, {
+				trustedReads: { resources: false, tools: ["read_note"] },
+			}),
+			clientFactory: {
+				connect: async () =>
+					({
+						getServerVersion: () => ({ name: "fake", version: "1.0.0" }),
+						listTools: async () => {
+							metadataReads += 1;
+							return {
+								tools: [
+									{
+										name: "read_note",
+										description: metadataReads === 1 ? "Read a note" : "Update a note",
+										inputSchema: { type: "object" },
+										annotations: { readOnlyHint: metadataReads === 1 },
+									},
+								],
+							};
+						},
+						listResources: async () => ({ resources: [] }),
+						readResource: async () => ({ contents: [] }),
+						listPrompts: async () => ({ prompts: [] }),
+						getPrompt: async () => ({ messages: [] }),
+						callTool: async () => {
+							toolCalls += 1;
+							return { content: [{ type: "text", text: "should not run" }] };
+						},
+						close: async () => undefined,
+					}) as McpClientConnection,
+			},
+			metadataCache: new McpMetadataCache({ agentDir: tempDir }),
+			outputStore: new McpOutputStore({ agentDir: tempDir, maxOutputBytes: 4096, maxOutputLines: 100 }),
+		});
+		await manager.connectServer("fake");
+		expect(manager.isTrustedToolRead("fake", "read_note")).toBe(true);
+
+		const gateway = createMcpToolDefinition({ manager, isRestrictedTrustedRead: () => true });
+		await expect(
+			gateway.execute(
+				"mcp-race",
+				{ action: "call", server: "fake", tool: "read_note" },
+				undefined,
+				undefined,
+				undefined as never,
+			),
+		).rejects.toThrow("not an effectively trusted read");
+		expect(metadataReads).toBe(2);
+		expect(toolCalls).toBe(0);
+		await manager.dispose();
+	});
+
+	it("limits restricted metadata refreshes to authorized categories", async () => {
+		const restrictedContext: McpGatewayExecutionContext = {
+			mode: "rpc",
+			restrictedTrustedRead: true,
+		};
+
+		const toolsDir = makeTempDir();
+		tempDirs.push(toolsDir);
+		const toolsOnly = createMetadataCountingManager(toolsDir, {
+			resources: false,
+			tools: ["read_note"],
+		});
+		await toolsOnly.manager.connectServer("fake");
+		expect(toolsOnly.counts).toEqual({ tools: 1, resources: 1, prompts: 1, calls: 0 });
+		toolsOnly.counts.tools = 0;
+		toolsOnly.counts.resources = 0;
+		toolsOnly.counts.prompts = 0;
+		await toolsOnly.manager.startEagerServers(undefined, { trustedReadsOnly: true });
+		await toolsOnly.manager.handleGatewayInput({ action: "connect", server: "fake" }, restrictedContext);
+		await toolsOnly.manager.handleGatewayInput({ action: "list_tools", server: "fake" }, restrictedContext);
+		await toolsOnly.manager.handleGatewayInput(
+			{ action: "describe", server: "fake", tool: "read_note" },
+			restrictedContext,
+		);
+		await toolsOnly.manager.handleGatewayInput(
+			{ action: "call", server: "fake", tool: "read_note" },
+			restrictedContext,
+		);
+		expect(toolsOnly.counts).toEqual({ tools: 5, resources: 0, prompts: 0, calls: 1 });
+		expect(toolsOnly.manager.getServer("fake")).toMatchObject({ resourceCount: 1, promptCount: 1 });
+		await toolsOnly.manager.dispose();
+
+		const resourcesDir = makeTempDir();
+		tempDirs.push(resourcesDir);
+		const resourcesOnly = createMetadataCountingManager(resourcesDir, { resources: true, tools: [] });
+		await resourcesOnly.manager.startEagerServers(undefined, { trustedReadsOnly: true });
+		await resourcesOnly.manager.handleGatewayInput({ action: "connect", server: "fake" }, restrictedContext);
+		await expect(
+			resourcesOnly.manager.handleGatewayInput({ action: "list_tools", server: "fake" }, restrictedContext),
+		).rejects.toThrow("no configured trusted tool reads");
+		expect(resourcesOnly.counts).toEqual({ tools: 0, resources: 2, prompts: 0, calls: 0 });
+		await resourcesOnly.manager.dispose();
+
+		const mixedDir = makeTempDir();
+		tempDirs.push(mixedDir);
+		const mixed = createMetadataCountingManager(mixedDir, { resources: true, tools: ["read_note"] });
+		await mixed.manager.startEagerServers(undefined, { trustedReadsOnly: true });
+		expect(mixed.counts).toEqual({ tools: 1, resources: 1, prompts: 0, calls: 0 });
+		await mixed.manager.dispose();
+
+		const unrestrictedDir = makeTempDir();
+		tempDirs.push(unrestrictedDir);
+		const unrestricted = createMetadataCountingManager(unrestrictedDir, { resources: false, tools: [] });
+		await unrestricted.manager.startEagerServers();
+		expect(unrestricted.counts).toEqual({ tools: 1, resources: 1, prompts: 1, calls: 0 });
+		await unrestricted.manager.dispose();
+
+		const failingDir = makeTempDir();
+		tempDirs.push(failingDir);
+		const failing = createMetadataCountingManager(
+			failingDir,
+			{ resources: true, tools: [] },
+			{ failResources: true },
+		);
+		await expect(
+			failing.manager.handleGatewayInput({ action: "connect", server: "fake" }, restrictedContext),
+		).rejects.toThrow("resource metadata failed");
+		expect(failing.counts).toEqual({ tools: 0, resources: 1, prompts: 0, calls: 0 });
+		await failing.manager.dispose();
+	});
+
+	it("keeps stale tool metadata stale after a resource-only refresh", async () => {
+		const tempDir = makeTempDir();
+		tempDirs.push(tempDir);
+		const config = createTestConfig(tempDir, {
+			directTools: true,
+			metadataRefreshMs: 1_000,
+			trustedReads: { resources: true, tools: [] },
+		});
+		const tool: SdkTool = {
+			name: "read_note",
+			description: "Read a note",
+			inputSchema: { type: "object" },
+			annotations: { readOnlyHint: true },
+		};
+		let cacheNow = Date.now() - 2_000;
+		const metadataCache = new McpMetadataCache({ agentDir: tempDir, now: () => cacheNow });
+		metadataCache.set(
+			"fake",
+			{
+				server: "fake",
+				serverVersion: "fake@1.0.0",
+				configHash: hashMcpServerConfig(config.servers.fake),
+				tools: [tool],
+				resources: [{ uri: "file:///old", name: "old" }],
+				prompts: [{ name: "old_prompt" }],
+			},
+			["tools", "resources", "prompts"],
+		);
+		cacheNow = Date.now();
+		const counts: MetadataRequestCounts = { tools: 0, resources: 0, prompts: 0, calls: 0 };
+		const manager = new McpManager({
+			config,
+			clientFactory: {
+				connect: async () =>
+					({
+						getServerVersion: () => ({ name: "fake", version: "1.0.0" }),
+						listTools: async () => {
+							counts.tools += 1;
+							return { tools: [tool] };
+						},
+						listResources: async () => {
+							counts.resources += 1;
+							return { resources: [{ uri: "file:///fresh", name: "fresh" }] };
+						},
+						readResource: async () => ({ contents: [] }),
+						listPrompts: async () => {
+							counts.prompts += 1;
+							return { prompts: [] };
+						},
+						getPrompt: async () => ({ messages: [] }),
+						callTool: async () => ({ content: [] }),
+						close: async () => undefined,
+					}) as McpClientConnection,
+			},
+			metadataCache,
+			outputStore: new McpOutputStore({ agentDir: tempDir }),
+		});
+
+		await manager.startEagerServers(undefined, { trustedReadsOnly: true });
+		expect(counts).toEqual({ tools: 0, resources: 1, prompts: 0, calls: 0 });
+		expect(manager.search("note").matches).toEqual([]);
+		expect(manager.getDirectToolCandidates()).toEqual([]);
+
+		const listed = await manager.listTools("fake");
+		expect(listed).toMatchObject({ stale: false, tools: [expect.objectContaining({ name: "read_note" })] });
+		expect(counts).toEqual({ tools: 1, resources: 1, prompts: 0, calls: 0 });
+		expect(listed.tools[0]?.lastSeenAt).toBe(metadataCache.get("fake")?.toolsLastSeenAt);
+		await manager.dispose();
+	});
+
+	it("merges concurrent disjoint metadata refreshes without losing either category", async () => {
+		const tempDir = makeTempDir();
+		tempDirs.push(tempDir);
+		const config = createTestConfig(tempDir, {
+			trustedReads: { resources: true, tools: [] },
+		});
+		const tool: SdkTool = {
+			name: "read_note",
+			description: "Read a note",
+			inputSchema: { type: "object" },
+			annotations: { readOnlyHint: true },
+		};
+		const toolsStarted = createDeferred<void>();
+		const resourcesStarted = createDeferred<void>();
+		const toolsResult = createDeferred<{ tools: SdkTool[] }>();
+		const resourcesResult = createDeferred<{ resources: Array<{ uri: string; name: string }> }>();
+		const metadataCache = new McpMetadataCache({ agentDir: tempDir });
+		const manager = new McpManager({
+			config,
+			clientFactory: {
+				connect: async () =>
+					({
+						getServerVersion: () => ({ name: "fake", version: "1.0.0" }),
+						listTools: async () => {
+							toolsStarted.resolve();
+							return toolsResult.promise;
+						},
+						listResources: async () => {
+							resourcesStarted.resolve();
+							return resourcesResult.promise;
+						},
+						readResource: async () => ({ contents: [] }),
+						listPrompts: async () => ({ prompts: [] }),
+						getPrompt: async () => ({ messages: [] }),
+						callTool: async () => ({ content: [] }),
+						close: async () => undefined,
+					}) as McpClientConnection,
+			},
+			metadataCache,
+			outputStore: new McpOutputStore({ agentDir: tempDir }),
+		});
+		const restrictedContext: McpGatewayExecutionContext = { mode: "rpc", restrictedTrustedRead: true };
+
+		const resourceRefresh = manager.handleGatewayInput({ action: "connect", server: "fake" }, restrictedContext);
+		const toolRefresh = manager.listTools("fake");
+		await Promise.all([toolsStarted.promise, resourcesStarted.promise]);
+		toolsResult.resolve({ tools: [tool] });
+		await toolRefresh;
+		resourcesResult.resolve({ resources: [{ uri: "file:///fresh", name: "fresh" }] });
+		await resourceRefresh;
+
+		const metadata = metadataCache.get("fake");
+		expect(metadata).toMatchObject({
+			tools: [expect.objectContaining({ name: "read_note" })],
+			resources: [{ uri: "file:///fresh", name: "fresh" }],
+		});
+		expect(metadata?.toolsLastSeenAt).toBeDefined();
+		expect(metadata?.resourcesLastSeenAt).toBeDefined();
+		expect(metadata?.promptsLastSeenAt).toBe(new Date(0).toISOString());
+		expect(manager.search("note").matches).toEqual([expect.objectContaining({ tool: "read_note" })]);
+		await manager.dispose();
+	});
+
+	it("applies normal tool filters before trusting reads or starting trusted-read servers", async () => {
+		const tempDir = makeTempDir();
+		tempDirs.push(tempDir);
+		let connections = 0;
+		const factory = createFakeFactory("filtered-output");
+		const manager = new McpManager({
+			config: createTestConfig(tempDir, {
+				includeTools: ["update_note"],
+				excludeTools: ["read_note"],
+				trustedReads: { resources: false, tools: ["read_note"] },
+			}),
+			clientFactory: {
+				connect: async (...args) => {
+					connections += 1;
+					return factory.connect(...args);
+				},
+			},
+			metadataCache: new McpMetadataCache({ agentDir: tempDir }),
+			outputStore: new McpOutputStore({ agentDir: tempDir, maxOutputBytes: 4096, maxOutputLines: 100 }),
+		});
+
+		expect(manager.hasTrustedReads("fake")).toBe(false);
+		expect(manager.isTrustedToolRead("fake", "read_note")).toBe(false);
+		await manager.startEagerServers(undefined, { trustedReadsOnly: true });
+		expect(connections).toBe(0);
+		await manager.dispose();
+	});
+
 	it("bounds persistent MCP output caches and scopes entries strictly", () => {
 		const tempDir = makeTempDir();
 		tempDirs.push(tempDir);
@@ -257,6 +718,55 @@ describe("MCP support", () => {
 		expect(shaped.cache).toBeUndefined();
 	});
 
+	it("persists category freshness, resets untouched freshness on identity changes, and discards v1 caches", () => {
+		const legacyDir = makeTempDir();
+		tempDirs.push(legacyDir);
+		mkdirSync(join(legacyDir, "mcp"), { recursive: true });
+		writeFileSync(
+			join(legacyDir, "mcp", "metadata-cache.json"),
+			JSON.stringify({
+				version: 1,
+				servers: {
+					fake: {
+						server: "fake",
+						metadataHash: "legacy",
+						tools: [],
+						resources: [],
+						prompts: [],
+						lastSeenAt: new Date().toISOString(),
+					},
+				},
+			}),
+		);
+		expect(new McpMetadataCache({ agentDir: legacyDir }).getAll()).toEqual([]);
+
+		const tempDir = makeTempDir();
+		tempDirs.push(tempDir);
+		let now = Date.parse("2026-01-01T00:00:00.000Z");
+		const cache = new McpMetadataCache({ agentDir: tempDir, now: () => now });
+		const base = {
+			server: "fake",
+			serverVersion: "fake@1.0.0",
+			configHash: "config-one",
+			tools: [{ name: "read_note", inputSchema: { type: "object" } } satisfies SdkTool],
+			resources: [{ uri: "file:///old", name: "old" }],
+			prompts: [{ name: "old_prompt" }],
+		};
+		const initial = cache.set("fake", base, ["tools", "resources", "prompts"]);
+		now += 100;
+		const partial = cache.set("fake", { ...base, resources: [{ uri: "file:///new", name: "new" }] }, ["resources"]);
+		expect(partial.toolsLastSeenAt).toBe(initial.toolsLastSeenAt);
+		expect(partial.resourcesLastSeenAt).not.toBe(initial.resourcesLastSeenAt);
+		expect(partial.promptsLastSeenAt).toBe(initial.promptsLastSeenAt);
+
+		now += 100;
+		const changedIdentity = cache.set("fake", { ...base, configHash: "config-two" }, ["tools"]);
+		expect(changedIdentity.toolsLastSeenAt).toBe(new Date(now).toISOString());
+		expect(changedIdentity.resourcesLastSeenAt).toBe(new Date(0).toISOString());
+		expect(changedIdentity.promptsLastSeenAt).toBe(new Date(0).toISOString());
+		expect(() => cache.set("fake", base, [])).toThrow("at least one refreshed category");
+	});
+
 	it("prunes stale and excess MCP metadata cache entries", () => {
 		const tempDir = makeTempDir();
 		tempDirs.push(tempDir);
@@ -268,11 +778,11 @@ describe("MCP support", () => {
 			now: () => now,
 		});
 		const metadata = { tools: [], resources: [], prompts: [] };
-		cache.set("one", { server: "one", ...metadata });
+		cache.set("one", { server: "one", ...metadata }, ["tools", "resources", "prompts"]);
 		now += 100;
-		cache.set("two", { server: "two", ...metadata });
+		cache.set("two", { server: "two", ...metadata }, ["tools", "resources", "prompts"]);
 		now += 100;
-		cache.set("three", { server: "three", ...metadata });
+		cache.set("three", { server: "three", ...metadata }, ["tools", "resources", "prompts"]);
 		expect(cache.get("one")).toBeUndefined();
 		expect(cache.getAll().map((entry) => entry.server)).toEqual(["two", "three"]);
 
@@ -290,7 +800,7 @@ describe("MCP support", () => {
 		const tempDir = makeTempDir();
 		tempDirs.push(tempDir);
 		const cache = new McpMetadataCache({ agentDir: tempDir, maxBytes: 240 });
-		cache.set("one", { server: "one", tools: [], resources: [], prompts: [] });
+		cache.set("one", { server: "one", tools: [], resources: [], prompts: [] }, ["tools", "resources", "prompts"]);
 
 		const cachePath = join(tempDir, "mcp", "metadata-cache.json");
 		expect(statSync(cachePath).size).toBeLessThanOrEqual(240);
@@ -725,7 +1235,25 @@ describe("MCP support", () => {
 		tempDirs.push(server.source.baseDir);
 
 		expect(classifyMcpToolRisk({ name: "delete_file", description: "", annotations: {} })).toBe("destructive");
+		expect(classifyMcpToolRisk({ name: "bulkDeleteRecords", description: "", annotations: {} })).toBe("destructive");
+		expect(classifyMcpToolRisk({ name: "UpdateAccount", description: "", annotations: {} })).toBe("write");
+		expect(classifyMcpToolRisk({ name: "HTTPPostRequest", description: "", annotations: {} })).toBe("write");
 		expect(classifyMcpToolRisk({ name: "read_file", description: "", annotations: {} })).toBe("read");
+		const conflictingTrustedReads: Array<[string, "write" | "destructive"]> = [
+			["closeIssue", "write"],
+			["closingIssue", "write"],
+			["approvePullRequest", "write"],
+			["approvedPullRequest", "write"],
+			["archiveProject", "destructive"],
+			["archivingProject", "destructive"],
+			["executeCommand", "write"],
+			["executedCommand", "write"],
+		];
+		for (const [name, risk] of conflictingTrustedReads) {
+			const tool = { name, description: "", annotations: { readOnlyHint: true } };
+			expect(classifyMcpToolRisk(tool)).toBe(risk);
+			expect(isMcpToolTrustedReadCandidate(tool)).toBe(false);
+		}
 		expect(sanitizeMcpArguments({ apiKey: "secret", nested: { password: "p", keep: "visible" } })).toEqual({
 			apiKey: "[redacted]",
 			nested: { password: "[redacted]", keep: "visible" },

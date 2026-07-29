@@ -47,7 +47,7 @@ export interface HostActionInvocationContext extends HostActionDescriptorContext
 	afterSessionSwitch?: () => Promise<void>;
 	renameSession(name: string): void;
 	setFastModeEnabled?(enabled: boolean): void;
-	setAgentMode?(mode: AgentMode): PlanningState;
+	setAgentMode?(mode: AgentMode): Promise<PlanningState>;
 	executePlan?(
 		planId: string,
 		expectedRevision: number,
@@ -625,7 +625,7 @@ export function isRemoteSafeBuiltinHostActionId(actionId: string): boolean {
 	return REMOTE_SAFE_BUILTIN_HOST_ACTION_IDS.has(actionId);
 }
 
-function invokeAgentModeAction(
+async function invokeAgentModeAction(
 	context: HostActionInvocationContext,
 	args: unknown,
 ): Promise<UiActionInvocationResponse> {
@@ -638,15 +638,15 @@ function invokeAgentModeAction(
 		throw new Error("Agent mode is not available in this host");
 	}
 	const previousMode = context.session.planningState?.mode;
-	setAgentMode(mode);
-	return Promise.resolve({
+	await setAgentMode(mode);
+	return {
 		action: AGENT_MODE_ACTION_ID,
 		status: "completed",
 		state: createAgentModeState(context),
 		stateChanged: previousMode !== mode,
 		actionsChanged: previousMode !== mode,
 		message: mode === "plan" ? "Plan mode enabled" : "Build mode enabled",
-	});
+	};
 }
 
 async function invokePlanExecuteAction(

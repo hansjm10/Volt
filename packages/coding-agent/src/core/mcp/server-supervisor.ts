@@ -25,6 +25,7 @@ import type {
 	McpCallProgress,
 	McpClientConnection,
 	McpClientFactory,
+	McpMetadataCategory,
 	McpRecentCallSummary,
 	McpRequestOptions,
 	McpResolvedServerConfig,
@@ -44,6 +45,13 @@ export interface McpServerSupervisorOptions {
 	oauthStore?: McpOAuthStore;
 	/** Fired whenever status or auth state actually changes value. */
 	onStateChanged?: (supervisor: McpServerSupervisor) => void;
+}
+
+export interface McpMetadataRefreshOptions {
+	tools?: boolean;
+	resources?: boolean;
+	prompts?: boolean;
+	strict?: boolean;
 }
 
 function isAbortError(error: unknown): boolean {
@@ -85,6 +93,7 @@ export class McpServerSupervisor {
 	private liveToolCountValue: number | undefined;
 	private idleTimer: NodeJS.Timeout | undefined;
 	private connecting: Promise<McpClientConnection> | undefined;
+	private metadataCommitQueue: Promise<void> = Promise.resolve();
 	private connectGeneration = 0;
 	private recentCallsValue: McpRecentCallSummary[] = [];
 	private onStateChanged: ((supervisor: McpServerSupervisor) => void) | undefined;
@@ -242,23 +251,52 @@ export class McpServerSupervisor {
 		}
 	}
 
-	async refreshMetadata(signal?: AbortSignal): Promise<McpServerMetadata> {
+	async refreshMetadata(signal?: AbortSignal, options: McpMetadataRefreshOptions = {}): Promise<McpServerMetadata> {
+		const refreshTools = options.tools ?? true;
+		const refreshResources = options.resources ?? true;
+		const refreshPrompts = options.prompts ?? true;
+		const refreshedCategories: McpMetadataCategory[] = [];
+		if (refreshTools) refreshedCategories.push("tools");
+		if (refreshResources) refreshedCategories.push("resources");
+		if (refreshPrompts) refreshedCategories.push("prompts");
+		if (refreshedCategories.length === 0) {
+			throw new Error(`MCP metadata refresh requires at least one category: ${this.server.id}`);
+		}
 		const connection = await this.connect(signal);
 		this.setState({ status: "discovering" });
 		try {
-			const tools = await this.listAllTools(connection, signal);
-			const resources = await this.listAllResources(connection, signal).catch((): Resource[] => []);
-			const prompts = await this.listAllPrompts(connection, signal).catch((): Prompt[] => []);
+			const tools = refreshTools ? await this.listAllTools(connection, signal) : undefined;
+			const resources = refreshResources
+				? options.strict
+					? await this.listAllResources(connection, signal)
+					: await this.listAllResources(connection, signal).catch((): Resource[] => [])
+				: undefined;
+			const prompts = refreshPrompts
+				? options.strict
+					? await this.listAllPrompts(connection, signal)
+					: await this.listAllPrompts(connection, signal).catch((): Prompt[] => [])
+				: undefined;
 			const serverVersion = connection.getServerVersion();
-			const metadata = this.metadataCache.set(this.server.id, {
-				server: this.server.id,
-				...(serverVersion ? { serverVersion: `${serverVersion.name}@${serverVersion.version}` } : {}),
-				configHash: hashMcpServerConfig(this.server),
-				tools: uniqueByName(tools).filter((tool) => serverMatchesToolFilters(this.server, tool.name)),
-				resources,
-				prompts,
+			const metadata = await this.commitMetadata(() => {
+				const cached = this.cachedMetadata;
+				return this.metadataCache.set(
+					this.server.id,
+					{
+						server: this.server.id,
+						...(serverVersion ? { serverVersion: `${serverVersion.name}@${serverVersion.version}` } : {}),
+						configHash: hashMcpServerConfig(this.server),
+						tools: refreshTools
+							? uniqueByName(tools ?? []).filter((tool) => serverMatchesToolFilters(this.server, tool.name))
+							: (cached?.tools ?? []),
+						resources: refreshResources ? (resources ?? []) : (cached?.resources ?? []),
+						prompts: refreshPrompts ? (prompts ?? []) : (cached?.prompts ?? []),
+					},
+					refreshedCategories,
+				);
 			});
-			this.liveToolCountValue = metadata.tools.length;
+			if (refreshTools) {
+				this.liveToolCountValue = metadata.tools.length;
+			}
 			this.setState({ status: "ready" });
 			this.resetIdleTimer();
 			return metadata;
@@ -417,6 +455,15 @@ export class McpServerSupervisor {
 			cursor = result.nextCursor;
 		} while (cursor);
 		return prompts;
+	}
+
+	private async commitMetadata(commit: () => McpServerMetadata): Promise<McpServerMetadata> {
+		const result = this.metadataCommitQueue.then(commit, commit);
+		this.metadataCommitQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
 	}
 
 	private resetIdleTimer(): void {

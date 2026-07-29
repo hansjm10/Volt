@@ -1,9 +1,20 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getModel } from "@hansjm10/volt-ai";
+import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { AuthStorage } from "../src/core/auth-storage.ts";
+import {
+	createEmptyMcpMergedConfig,
+	finalizeMcpConfig,
+	mergeMcpConfigFile,
+	sourceForMcpConfigPath,
+} from "../src/core/mcp/config.ts";
+import { McpManager } from "../src/core/mcp/manager.ts";
+import { McpMetadataCache } from "../src/core/mcp/metadata-cache.ts";
+import { McpOutputStore } from "../src/core/mcp/output-store.ts";
+import type { McpClientConnection } from "../src/core/mcp/types.ts";
 import {
 	createPlanExecutionPrompt,
 	PLAN_MAX_SERIALIZED_BYTES,
@@ -14,6 +25,55 @@ import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+
+class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
+	constructor() {
+		super(
+			(event) => event.type === "done" || event.type === "error",
+			(event) => {
+				if (event.type === "done") return event.message;
+				if (event.type === "error") return event.error;
+				throw new Error("Unexpected event type");
+			},
+		);
+	}
+}
+
+interface Deferred<T> {
+	promise: Promise<T>;
+	resolve(value: T): void;
+}
+
+function createDeferred<T>(): Deferred<T> {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((promiseResolve) => {
+		resolve = promiseResolve;
+	});
+	return { promise, resolve };
+}
+
+function createAssistantMessage(
+	content: AssistantMessage["content"],
+	stopReason: "stop" | "toolUse",
+): AssistantMessage {
+	return {
+		role: "assistant",
+		content,
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason,
+		timestamp: Date.now(),
+	};
+}
 
 describe("native planning state", () => {
 	let tempDir: string;
@@ -29,9 +89,13 @@ describe("native planning state", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	async function createPlanningSession() {
+	async function createPlanningSession(
+		options: { tools?: string[]; excludeTools?: string[]; mcpManager?: McpManager } = {},
+	) {
 		const settingsManager = SettingsManager.create(tempDir, agentDir);
 		const sessionManager = SessionManager.inMemory(tempDir);
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey("anthropic", "test-api-key");
 		const resourceLoader = new DefaultResourceLoader({
 			cwd: tempDir,
 			agentDir,
@@ -42,10 +106,14 @@ describe("native planning state", () => {
 			cwd: tempDir,
 			agentDir,
 			model: getModel("anthropic", "claude-sonnet-4-5")!,
+			authStorage,
 			settingsManager,
 			sessionManager,
 			resourceLoader,
 			agentMode: "plan",
+			...(options.tools ? { tools: options.tools } : {}),
+			...(options.excludeTools ? { excludeTools: options.excludeTools } : {}),
+			...(options.mcpManager ? { mcpManager: options.mcpManager } : {}),
 			customTools: [
 				{
 					name: "mutate_everything",
@@ -72,6 +140,7 @@ describe("native planning state", () => {
 			"grep",
 			"find",
 			"ls",
+			"inspect",
 			"lsp",
 			"update_plan",
 			"submit_plan",
@@ -114,15 +183,325 @@ describe("native planning state", () => {
 		} as never);
 		expect(mutatingLsp).toMatchObject({ block: true });
 
-		session.setAgentMode("build");
+		await session.setAgentMode("build");
 		const buildTools = session.getActiveToolNames();
 		expect(buildTools).toContain("mutate_everything");
 		expect(buildTools).not.toContain("update_plan");
 		expect(buildTools).not.toContain("submit_plan");
 
-		session.setAgentMode("plan");
+		await session.setAgentMode("plan");
 		expect(session.getActiveToolNames()).toEqual(planTools);
 		session.dispose();
+	});
+
+	it("does not count a protocol-level MCP failure as successful Plan research", async () => {
+		const source = sourceForMcpConfigPath(join(agentDir, "mcp.json"), {
+			scope: "user",
+			label: "test",
+			precedence: 1,
+			shared: false,
+		});
+		const merged = createEmptyMcpMergedConfig();
+		mergeMcpConfigFile(
+			merged,
+			{
+				servers: {
+					fake: {
+						command: "fake-mcp",
+						trustedReads: { tools: ["read_note"] },
+					},
+				},
+			},
+			source,
+		);
+		const manager = new McpManager({
+			config: finalizeMcpConfig(merged),
+			clientFactory: {
+				connect: async () =>
+					({
+						getServerVersion: () => ({ name: "fake", version: "1.0.0" }),
+						listTools: async () => ({
+							tools: [
+								{
+									name: "read_note",
+									description: "Read a note",
+									inputSchema: { type: "object" },
+									annotations: { readOnlyHint: true },
+								},
+							],
+						}),
+						listResources: async () => ({ resources: [] }),
+						readResource: async () => ({ contents: [] }),
+						listPrompts: async () => ({ prompts: [] }),
+						getPrompt: async () => ({ messages: [] }),
+						callTool: async () => ({
+							content: [{ type: "text", text: "read failed" }],
+							isError: true,
+						}),
+						close: async () => undefined,
+					}) as McpClientConnection,
+			},
+			metadataCache: new McpMetadataCache({ agentDir }),
+			outputStore: new McpOutputStore({ agentDir, maxOutputBytes: 4096, maxOutputLines: 100 }),
+		});
+		await manager.connectServer("fake");
+		const { session } = await createPlanningSession({ mcpManager: manager });
+		const draft = session.updatePlan({ steps: [{ text: "Implement the researched change" }] });
+		const toolEvents: Array<{ toolName: string; result: unknown; isError: boolean }> = [];
+		const unsubscribe = session.subscribe((event) => {
+			if (event.type === "tool_execution_end") {
+				toolEvents.push({ toolName: event.toolName, result: event.result, isError: event.isError });
+			}
+		});
+		let request = 0;
+		session.agent.streamFn = () => {
+			const current = request;
+			request += 1;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (current === 0) {
+					const message = createAssistantMessage(
+						[
+							{
+								type: "toolCall",
+								id: "mcp-failed-read",
+								name: "mcp",
+								arguments: { action: "call", server: "fake", tool: "read_note" },
+							},
+						],
+						"toolUse",
+					);
+					stream.push({ type: "done", seq: 1, reason: "toolUse", message });
+					return;
+				}
+				if (current === 1) {
+					const message = createAssistantMessage(
+						[
+							{
+								type: "toolCall",
+								id: "submit-after-mcp-failure",
+								name: "submit_plan",
+								arguments: {
+									planId: draft.id,
+									expectedRevision: draft.revision,
+									title: "Blocked plan",
+									summary: "This must remain blocked after failed research.",
+								},
+							},
+						],
+						"toolUse",
+					);
+					stream.push({ type: "done", seq: 1, reason: "toolUse", message });
+					return;
+				}
+				const message = createAssistantMessage([{ type: "text", text: "blocked" }], "stop");
+				stream.push({ type: "done", seq: 1, reason: "stop", message });
+			});
+			return stream;
+		};
+
+		await session.prompt("Research before submitting the plan");
+		unsubscribe();
+
+		expect(toolEvents).toEqual([
+			expect.objectContaining({
+				toolName: "mcp",
+				isError: true,
+				result: expect.objectContaining({
+					isError: true,
+					details: {
+						result: expect.objectContaining({ action: "call", status: "failed", content: "read failed" }),
+					},
+				}),
+			}),
+			expect.objectContaining({
+				toolName: "submit_plan",
+				isError: true,
+				result: expect.objectContaining({
+					content: [
+						expect.objectContaining({
+							text: expect.stringContaining("requires at least one successful read operation"),
+						}),
+					],
+				}),
+			}),
+		]);
+		expect(
+			session.messages.find((message) => message.role === "toolResult" && message.toolName === "mcp"),
+		).toMatchObject({
+			isError: true,
+			details: {
+				result: expect.objectContaining({ action: "call", status: "failed", content: "read failed" }),
+			},
+		});
+		expect(session.planningState.plan).toMatchObject({ id: draft.id, phase: "draft" });
+		await session.dispose();
+	});
+
+	it("restores skipped eager MCP direct tools before retained-context execution enters Build", async () => {
+		const source = sourceForMcpConfigPath(join(agentDir, "mcp-direct.json"), {
+			scope: "user",
+			label: "test",
+			precedence: 1,
+			shared: false,
+		});
+		const merged = createEmptyMcpMergedConfig();
+		mergeMcpConfigFile(
+			merged,
+			{
+				servers: {
+					fake: {
+						command: "fake-mcp",
+						lifecycle: "eager",
+						directTools: ["read_note"],
+					},
+				},
+			},
+			source,
+		);
+		let connections = 0;
+		const manager = new McpManager({
+			config: finalizeMcpConfig(merged),
+			clientFactory: {
+				connect: async () => {
+					connections += 1;
+					return {
+						getServerVersion: () => ({ name: "fake", version: "1.0.0" }),
+						listTools: async () => ({
+							tools: [
+								{
+									name: "read_note",
+									description: "Read a note",
+									inputSchema: { type: "object" },
+									annotations: { readOnlyHint: true },
+								},
+							],
+						}),
+						listResources: async () => ({ resources: [] }),
+						readResource: async () => ({ contents: [] }),
+						listPrompts: async () => ({ prompts: [] }),
+						getPrompt: async () => ({ messages: [] }),
+						callTool: async () => ({ content: [{ type: "text", text: "read" }] }),
+						close: async () => undefined,
+					} as McpClientConnection;
+				},
+			},
+			metadataCache: new McpMetadataCache({ agentDir }),
+			outputStore: new McpOutputStore({ agentDir, maxOutputBytes: 4096, maxOutputLines: 100 }),
+		});
+		await manager.startEagerServers(undefined, { trustedReadsOnly: true });
+		expect(connections).toBe(0);
+		expect(manager.getDirectToolCandidates()).toEqual([]);
+
+		const directToolName = "mcp__fake__read_note";
+		const { session } = await createPlanningSession({ mcpManager: manager, tools: ["mcp", directToolName] });
+		expect(session.getActiveToolNames()).not.toContain(directToolName);
+		const draft = session.updatePlan({ steps: [{ text: "Implement with the MCP context" }] });
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Use restored MCP",
+			summary: "Retain context and restore the full Build tool surface.",
+		});
+		const activated = await session.activatePlan(ready.id, ready.revision, {
+			id: "execution-mcp-restore",
+			approvedRevision: ready.revision,
+			strategy: "retain_context",
+			sourceSessionId: session.sessionId,
+			targetSessionId: session.sessionId,
+		});
+
+		expect(activated.planning.mode).toBe("build");
+		expect(connections).toBe(1);
+		expect(session.getActiveToolNames()).toContain(directToolName);
+		expect(session.getToolDefinition(directToolName)).toBeDefined();
+
+		session.setActiveToolsByName(["mcp"]);
+		await session.setAgentMode("plan");
+		await session.setAgentMode("build");
+		expect(session.getActiveToolNames()).not.toContain(directToolName);
+		await session.dispose();
+	});
+
+	it("serializes concurrent toggles so each derives its target from committed state", async () => {
+		const source = sourceForMcpConfigPath(join(agentDir, "mcp-toggle.json"), {
+			scope: "user",
+			label: "test",
+			precedence: 1,
+			shared: false,
+		});
+		const merged = createEmptyMcpMergedConfig();
+		mergeMcpConfigFile(
+			merged,
+			{
+				servers: {
+					fake: {
+						command: "fake-mcp",
+						lifecycle: "eager",
+					},
+				},
+			},
+			source,
+		);
+		const metadataStarted = createDeferred<void>();
+		const finishMetadata = createDeferred<void>();
+		const manager = new McpManager({
+			config: finalizeMcpConfig(merged),
+			clientFactory: {
+				connect: async () =>
+					({
+						getServerVersion: () => ({ name: "fake", version: "1.0.0" }),
+						listTools: async () => {
+							metadataStarted.resolve();
+							await finishMetadata.promise;
+							return { tools: [] };
+						},
+						listResources: async () => ({ resources: [] }),
+						readResource: async () => ({ contents: [] }),
+						listPrompts: async () => ({ prompts: [] }),
+						getPrompt: async () => ({ messages: [] }),
+						callTool: async () => ({ content: [] }),
+						close: async () => undefined,
+					}) as McpClientConnection,
+			},
+			metadataCache: new McpMetadataCache({ agentDir }),
+			outputStore: new McpOutputStore({ agentDir, maxOutputBytes: 4096, maxOutputLines: 100 }),
+		});
+		const { session } = await createPlanningSession({ mcpManager: manager });
+		const committedModes: string[] = [];
+		const unsubscribe = session.subscribe((event) => {
+			if (event.type === "planning_state_changed") committedModes.push(event.planning.mode);
+		});
+
+		const firstToggle = session.toggleAgentMode();
+		const secondToggle = session.toggleAgentMode();
+		await metadataStarted.promise;
+		expect(session.agentMode).toBe("plan");
+		finishMetadata.resolve();
+		const [first, second] = await Promise.all([firstToggle, secondToggle]);
+
+		expect(first.mode).toBe("build");
+		expect(second.mode).toBe("plan");
+		expect(session.agentMode).toBe("plan");
+		expect(committedModes).toEqual(["build", "plan"]);
+		unsubscribe();
+		await session.dispose();
+	});
+
+	it("preserves allowlist and exclusion policy across Plan and Build profiles", async () => {
+		const allowed = await createPlanningSession({ tools: ["read", "bash", "mutate_everything"] });
+		expect(allowed.session.getActiveToolNames()).toEqual(["read", "update_plan", "submit_plan"]);
+		await allowed.session.setAgentMode("build");
+		expect(allowed.session.getActiveToolNames()).toEqual(["read", "bash", "mutate_everything"]);
+		allowed.session.dispose();
+
+		const excluded = await createPlanningSession({ excludeTools: ["read", "inspect"] });
+		expect(excluded.session.getActiveToolNames()).not.toContain("read");
+		expect(excluded.session.getActiveToolNames()).not.toContain("inspect");
+		await excluded.session.setAgentMode("build");
+		expect(excluded.session.getActiveToolNames()).not.toContain("read");
+		expect(excluded.session.getActiveToolNames()).not.toContain("inspect");
+		excluded.session.dispose();
 	});
 
 	it("freezes approved scope, tracks progress separately, and requires reapproval for replanning", async () => {
@@ -166,9 +545,9 @@ describe("native planning state", () => {
 		expect(ready.revision).toBe(2);
 		expect(session.state.systemPrompt).toBe(draftPolicy);
 
-		session.setAgentMode("build");
+		await session.setAgentMode("build");
 		expect(session.planningState.plan).toMatchObject({ id: draft.id, phase: "ready" });
-		session.setAgentMode("plan");
+		await session.setAgentMode("plan");
 		const changed = session.changePlan(draft.id, ready.revision);
 		expect(changed).toMatchObject({ mode: "plan", plan: { phase: "draft", revision: 3 } });
 
@@ -185,7 +564,7 @@ describe("native planning state", () => {
 			sourceSessionId: session.sessionId,
 			targetSessionId: session.sessionId,
 		};
-		const activated = session.activatePlan(draft.id, readyAgain.revision, execution);
+		const activated = await session.activatePlan(draft.id, readyAgain.revision, execution);
 		expect(activated).toMatchObject({
 			activated: true,
 			planning: { mode: "build", plan: { phase: "active" } },
@@ -264,7 +643,7 @@ describe("native planning state", () => {
 			title: revised.title!,
 			summary: revised.summary!,
 		});
-		const reactivated = session.activatePlan(revised.id, revisedReady.revision, {
+		const reactivated = await session.activatePlan(revised.id, revisedReady.revision, {
 			...execution,
 			id: "execution-2",
 			approvedRevision: revisedReady.revision,
@@ -288,7 +667,7 @@ describe("native planning state", () => {
 
 	it("turns manual Plan-mode re-entry during execution into a valid draft", async () => {
 		const { session } = await createPlanningSession();
-		session.setAgentMode("plan");
+		await session.setAgentMode("plan");
 		const draft = session.updatePlan({ steps: [{ text: "Implement the approved change" }] });
 		const ready = session.submitPlan({
 			planId: draft.id,
@@ -296,7 +675,7 @@ describe("native planning state", () => {
 			title: "Approved change",
 			summary: "Implement and verify the approved change.",
 		});
-		session.activatePlan(ready.id, ready.revision, {
+		await session.activatePlan(ready.id, ready.revision, {
 			id: "execution-manual-replan",
 			approvedRevision: ready.revision,
 			strategy: "retain_context",
@@ -304,7 +683,7 @@ describe("native planning state", () => {
 			targetSessionId: session.sessionId,
 		});
 
-		const replanning = session.setAgentMode("plan");
+		const replanning = await session.setAgentMode("plan");
 		expect(replanning).toMatchObject({ mode: "plan", plan: { phase: "draft" } });
 		expect(replanning.plan?.execution).toBeUndefined();
 		expect(() => parsePlanningState(replanning)).not.toThrow();

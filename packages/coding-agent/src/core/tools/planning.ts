@@ -77,7 +77,6 @@ const requestReplanSchema = Type.Object(
 );
 
 export const NATIVE_PLAN_TOOL_NAMES = new Set(["update_plan", "submit_plan", "update_plan_progress", "request_replan"]);
-export const PLAN_MODE_READ_ONLY_TOOL_NAMES = ["read", "web_search", "web_fetch", "grep", "find", "ls", "lsp"] as const;
 
 export interface PlanningToolController {
 	getPlanningState(): PlanningState;

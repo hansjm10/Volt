@@ -1074,7 +1074,7 @@ export class AgentSessionRuntime {
 				sourceSessionId: sourceSession.sessionId,
 				targetSessionId: sourceSession.sessionId,
 			};
-			const result = sourceSession.activatePlan(planId, expectedRevision, execution);
+			const result = await sourceSession.activatePlan(planId, expectedRevision, execution);
 			if (result.activated) {
 				await sourceSession.sessionManager.flush();
 				void sourceSession

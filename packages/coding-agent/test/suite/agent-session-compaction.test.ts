@@ -156,7 +156,7 @@ describe("AgentSession compaction characterization", () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 		seedCompactableSession(harness);
-		harness.session.setAgentMode("plan");
+		await harness.session.setAgentMode("plan");
 		const draft = harness.session.updatePlan({ steps: [{ text: "Finish after compaction" }] });
 		const ready = harness.session.submitPlan({
 			planId: draft.id,
@@ -164,7 +164,7 @@ describe("AgentSession compaction characterization", () => {
 			title: "Compacted plan",
 			summary: "Keep canonical state across compaction.",
 		});
-		harness.session.activatePlan(ready.id, ready.revision, {
+		await harness.session.activatePlan(ready.id, ready.revision, {
 			id: "compaction-execution",
 			approvedRevision: ready.revision,
 			strategy: "retain_context",

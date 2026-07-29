@@ -3235,7 +3235,7 @@ export class InteractiveMode {
 		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
 		this.defaultEditor.onAction("app.suspend", () => this.handleCtrlZ());
 		this.defaultEditor.onAction("app.thinking.cycle", () => this.cycleThinkingLevel());
-		this.defaultEditor.onAction("app.mode.toggle", () => this.toggleAgentMode());
+		this.defaultEditor.onAction("app.mode.toggle", () => this.runKeyAction(() => this.toggleAgentMode()));
 		this.defaultEditor.onAction("app.model.cycleForward", () => this.runKeyAction(() => this.cycleModel("forward")));
 		this.defaultEditor.onAction("app.model.cycleBackward", () =>
 			this.runKeyAction(() => this.cycleModel("backward")),
@@ -3378,13 +3378,13 @@ export class InteractiveMode {
 			// Handle commands
 			if (text === "/plan") {
 				this.editor.setText("");
-				this.refreshPlanningUi(this.session.setAgentMode("plan"));
+				this.refreshPlanningUi(await this.session.setAgentMode("plan"));
 				this.showStatus("Plan mode: agent tools are read-only");
 				return;
 			}
 			if (text === "/build") {
 				this.editor.setText("");
-				this.refreshPlanningUi(this.session.setAgentMode("build"));
+				this.refreshPlanningUi(await this.session.setAgentMode("build"));
 				this.showStatus("Build mode");
 				return;
 			}
@@ -4589,8 +4589,8 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private toggleAgentMode(): void {
-		const planning = this.session.toggleAgentMode();
+	private async toggleAgentMode(): Promise<void> {
+		const planning = await this.session.toggleAgentMode();
 		this.refreshPlanningUi(planning);
 		this.showStatus(planning.mode === "plan" ? "Plan mode: agent tools are read-only" : "Build mode");
 	}

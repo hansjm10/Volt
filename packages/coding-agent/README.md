@@ -209,7 +209,11 @@ Configure delivery in [settings](docs/settings.md): `steeringMode` and `followUp
 
 ## Plan Mode
 
-Plan mode makes the agent research the workspace with read-only tools before it can submit a structured implementation checklist. Its research surface includes file and web inspection plus non-mutating LSP queries; LSP rename/fix actions remain blocked. Start it with `volt --plan`, `/plan`, or Shift+Tab. Drafts and ready plans are stored on the active session branch and survive compaction, reconnects, and branch switching.
+Plan mode makes the agent research the workspace with authorized read operations before it can submit a structured implementation checklist. Its research surface includes file and web inspection, non-mutating LSP queries, structured Git/GitHub inspection, and explicitly trusted MCP reads. LSP rename/fix actions, unrestricted Bash, extension/custom tools, and unresolved operations remain blocked. Start it with `volt --plan`, `/plan`, or Shift+Tab. Drafts and ready plans are stored on the active session branch and survive compaction, reconnects, and branch switching.
+
+Repository inspection uses the native `inspect` tool, which executes fixed read operations directly without a shell. Supported operations cover `git status`, log/show/diff/blame, branches/tags/refs, plus `gh issue`, `gh pr`, and `gh search` reads. For example, the model can request `git.log` with literal arguments such as `["--oneline", "-20"]` or `gh.pr.view` with `["123", "--comments"]`. Each Git operation has a positive option grammar; unknown, negated, mutating, helper-enabling, pager, and output-file flags fail closed, while repository-configured fsmonitor, diff/textconv, hook, pager, and signature helpers are disabled. GitHub operations require the `gh` CLI and its normal host authentication, such as `gh auth login` performed by the user outside the agent tool call.
+
+Authorization is host-owned and operation-sensitive: Plan selects a reusable research capability profile rather than trusting a tool’s name or a mode-specific safety flag. Volt checks the concrete arguments again after extension hooks, and successful read capabilities satisfy the research-before-submit gate. MCP tool trust is effective only after normal include/exclude filters, and restricted MCP calls refresh and revalidate exact-name trust, `readOnlyHint`, and risk immediately before invocation; protocol-level failures do not count as research. Returning to Build first awaits unrestricted eager/keep-alive MCP startup and restores direct tools from fresh metadata under the session’s tool policy. A future restricted mode can reuse this profile or grant a subset without changing tool definitions.
 
 When the agent submits a plan, Volt offers exactly:
 
@@ -386,6 +390,8 @@ Place in `~/.volt/agent/extensions/`, `.volt/extensions/`, or a [volt package](#
 ### MCP Servers
 
 Volt can connect to Model Context Protocol (MCP) servers using native config files at `~/.volt/agent/mcp.json`, shared `~/.config/mcp/mcp.json`, trusted project `.mcp.json`, or trusted project `.volt/mcp.json`. Configured servers are exposed to the model through one `mcp` gateway tool for status, discovery/search, tool calls, resources, prompts, and cached large-output reads.
+
+Restricted read profiles such as Plan require explicit per-server `trustedReads` configuration. Resource reads require `"resources": true`; tool reads require an exact tool name in `"tools"`, permission under normal include/exclude filters, fresh metadata with `readOnlyHint: true`, and no conflicting write/destructive classification. Volt refreshes and revalidates that evidence immediately before a restricted tool invocation. Server annotations alone never grant access, and prompts, auth/configuration, lifecycle management, and ambiguous calls remain unavailable. Returning to Build awaits unrestricted eager/keep-alive startup and rebuilds direct tools from fresh metadata before exposing the Build tool surface. See the MCP guide for an example and the full trust boundary.
 
 HTTP/SSE MCP servers with `auth: { "type": "oauth" }` can be authenticated with `volt mcp auth <server>` for browser PKCE or `volt mcp auth-device <server>` for device-code auth. Tokens stay on the host in MCP auth storage.
 
@@ -624,7 +630,7 @@ cat README.md | volt -p "Summarize this text"
 | `--no-builtin-tools`, `-nbt` | Disable built-in tools by default but keep extension/custom tools enabled |
 | `--no-tools`, `-nt` | Disable all tools by default |
 
-Available built-in tools: `read`, `bash`, `edit`, `write`, `web_search`, `grep`, `find`, `ls`, `lsp` (when enabled), `subagent` (when available), `mcp` (when MCP servers are configured)
+Available built-in tools: `read`, `bash`, `edit`, `write`, `web_search`, `grep`, `find`, `ls`, `inspect`, `lsp` (when enabled), `subagent` (when available), `mcp` (when MCP servers are configured)
 
 ### Resource Options
 

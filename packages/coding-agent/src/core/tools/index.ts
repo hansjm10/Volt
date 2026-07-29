@@ -44,6 +44,19 @@ export {
 	type GrepToolOptions,
 } from "./grep.ts";
 export {
+	createInspectionTool,
+	createInspectionToolDefinition,
+	createLocalInspectionOperations,
+	INSPECTION_OPERATIONS,
+	type InspectionOperation,
+	type InspectionOperations,
+	type InspectionToolDetails,
+	type InspectionToolInput,
+	type InspectionToolOptions,
+	type ResolvedInspectionCommand,
+	resolveInspectionCommand,
+} from "./inspect.ts";
+export {
 	createLsTool,
 	createLsToolDefinition,
 	type LsOperations,
@@ -166,6 +179,7 @@ import { type BashToolOptions, createBashTool, createBashToolDefinition } from "
 import { createEditTool, createEditToolDefinition, type EditToolOptions } from "./edit.ts";
 import { createFindTool, createFindToolDefinition, type FindToolOptions } from "./find.ts";
 import { createGrepTool, createGrepToolDefinition, type GrepToolOptions } from "./grep.ts";
+import { createInspectionTool, createInspectionToolDefinition, type InspectionToolOptions } from "./inspect.ts";
 import { createLsTool, createLsToolDefinition, type LsToolOptions } from "./ls.ts";
 import { createLspTool, createLspToolDefinition, type LspToolOptions } from "./lsp.ts";
 import { createReadTool, createReadToolDefinition, type ReadToolOptions } from "./read.ts";
@@ -193,6 +207,7 @@ export type CoreToolName =
 	| "grep"
 	| "find"
 	| "ls"
+	| "inspect"
 	| "lsp";
 export type ToolName = CoreToolName | "subagent" | typeof SUBAGENT_REGISTRY_TOOL_NAME | "mcp";
 export const DEFAULT_ACTIVE_TOOL_NAMES: readonly CoreToolName[] = [
@@ -203,7 +218,15 @@ export const DEFAULT_ACTIVE_TOOL_NAMES: readonly CoreToolName[] = [
 	"web_search",
 	"web_fetch",
 ];
-export const READ_ONLY_TOOL_NAMES: readonly CoreToolName[] = ["read", "web_search", "web_fetch", "grep", "find", "ls"];
+export const READ_ONLY_TOOL_NAMES: readonly CoreToolName[] = [
+	"read",
+	"web_search",
+	"web_fetch",
+	"grep",
+	"find",
+	"ls",
+	"inspect",
+];
 export const allToolNames: Set<ToolName> = new Set([
 	"read",
 	"bash",
@@ -214,6 +237,7 @@ export const allToolNames: Set<ToolName> = new Set([
 	"grep",
 	"find",
 	"ls",
+	"inspect",
 	"lsp",
 	"subagent",
 	SUBAGENT_REGISTRY_TOOL_NAME,
@@ -230,6 +254,7 @@ export interface ToolsOptions {
 	grep?: GrepToolOptions;
 	find?: FindToolOptions;
 	ls?: LsToolOptions;
+	inspect?: InspectionToolOptions;
 	lsp?: LspToolOptions;
 	subagent?: SubagentToolOptions;
 	subagentRegistry?: SubagentRegistryToolOptions;
@@ -256,6 +281,8 @@ export function createToolDefinition(toolName: ToolName, cwd: string, options?: 
 			return createFindToolDefinition(cwd, options?.find);
 		case "ls":
 			return createLsToolDefinition(cwd, options?.ls);
+		case "inspect":
+			return createInspectionToolDefinition(cwd, options?.inspect);
 		case "lsp":
 			return createLspToolDefinition(cwd, options?.lsp);
 		case "subagent":
@@ -298,6 +325,8 @@ export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptio
 			return createFindTool(cwd, options?.find);
 		case "ls":
 			return createLsTool(cwd, options?.ls);
+		case "inspect":
+			return createInspectionTool(cwd, options?.inspect);
 		case "lsp":
 			return createLspTool(cwd, options?.lsp);
 		case "subagent":
@@ -339,6 +368,7 @@ export function createReadOnlyToolDefinitions(cwd: string, options?: ToolsOption
 		createGrepToolDefinition(cwd, options?.grep),
 		createFindToolDefinition(cwd, options?.find),
 		createLsToolDefinition(cwd, options?.ls),
+		createInspectionToolDefinition(cwd, options?.inspect),
 	];
 }
 
@@ -356,6 +386,7 @@ export function createAllToolDefinitions(
 		grep: createGrepToolDefinition(cwd, options?.grep),
 		find: createFindToolDefinition(cwd, options?.find),
 		ls: createLsToolDefinition(cwd, options?.ls),
+		inspect: createInspectionToolDefinition(cwd, options?.inspect),
 		lsp: createLspToolDefinition(cwd, options?.lsp),
 		...(options?.subagent ? { subagent: createSubagentToolDefinition(options.subagent) } : {}),
 		...(options?.subagentRegistry
@@ -384,6 +415,7 @@ export function createReadOnlyTools(cwd: string, options?: ToolsOptions): Tool[]
 		createGrepTool(cwd, options?.grep),
 		createFindTool(cwd, options?.find),
 		createLsTool(cwd, options?.ls),
+		createInspectionTool(cwd, options?.inspect),
 	];
 }
 
@@ -401,6 +433,7 @@ export function createAllTools(
 		grep: createGrepTool(cwd, options?.grep),
 		find: createFindTool(cwd, options?.find),
 		ls: createLsTool(cwd, options?.ls),
+		inspect: createInspectionTool(cwd, options?.inspect),
 		lsp: createLspTool(cwd, options?.lsp),
 		...(options?.subagent ? { subagent: createSubagentTool(cwd, options.subagent) } : {}),
 		...(options?.subagentRegistry

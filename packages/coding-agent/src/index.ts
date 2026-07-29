@@ -592,6 +592,7 @@ export {
 	createEditTool,
 	createFindTool,
 	createGrepTool,
+	createInspectionTool,
 	createLsTool,
 	createReadOnlyTools,
 	createReadTool,
