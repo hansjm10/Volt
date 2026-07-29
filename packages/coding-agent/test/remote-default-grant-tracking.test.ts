@@ -19,6 +19,13 @@ const WORKSPACE = { name: "volt", path: "/workspace" };
 const CODING_GRANT = createIrohRemotePresetAccess("coding").rpcGrant;
 /** The default grant as persisted by daemons that predate the current default. */
 const LEGACY_SNAPSHOT = "read,bash,edit,write,web_search,grep,find,ls,subagent,subagent_registry,mcp";
+/**
+ * The immediate pre-#153 default (no inspect/lsp). Deliberately stays pinned:
+ * with no way to distinguish a re-stamped snapshot from an explicit grant that
+ * equaled the old default, freezing is the security-conservative reading.
+ * Pre-existing pairings re-pair or reset access to start tracking.
+ */
+const PRE_INSPECT_SNAPSHOT = "read,bash,edit,write,web_search,web_fetch,grep,find,ls,subagent,subagent_registry,mcp";
 
 const RAW_CLIENT_BASE = {
 	nodeId: "client-node",
@@ -175,6 +182,36 @@ describe("default grant tracking: state load and round-trip", () => {
 	it("preserves a legacy (old-default) snapshot verbatim on load", () => {
 		const state = parseRawState({ clients: [{ ...RAW_CLIENT_BASE, allowedTools: LEGACY_SNAPSHOT }] });
 		expect(state.clients[0]?.allowedTools).toBe(LEGACY_SNAPSHOT);
+	});
+
+	it("keeps the immediate pre-#153 default snapshot pinned rather than inferring tracking", () => {
+		const state = parseRawState({ clients: [{ ...RAW_CLIENT_BASE, allowedTools: PRE_INSPECT_SNAPSHOT }] });
+		expect(state.clients[0]?.allowedTools).toBe(PRE_INSPECT_SNAPSHOT);
+	});
+
+	it("canonicalizes pending pairing tickets on load like client records", () => {
+		const state = parseRawState({
+			pendingPairingTickets: [
+				{
+					secretHash: "sha256:default",
+					workspace: WORKSPACE.name,
+					allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+					rpcGrant: CODING_GRANT,
+					createdAt: 1,
+					expiresAt: 10,
+				},
+				{
+					secretHash: "sha256:custom",
+					workspace: WORKSPACE.name,
+					allowedTools: "read",
+					rpcGrant: CODING_GRANT,
+					createdAt: 1,
+					expiresAt: 10,
+				},
+			],
+		});
+		expect(state.pendingPairingTickets?.[0]).not.toHaveProperty("allowedTools");
+		expect(state.pendingPairingTickets?.[1]?.allowedTools).toBe("read");
 	});
 
 	it("applies the same rules to revoked-client records", () => {

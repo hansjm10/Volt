@@ -259,6 +259,7 @@ export class IrohRemoteHostEngine {
 				workspace: payload.workspace,
 				details: {
 					allowedTools: normalizeIrohRemoteAllowTools(pendingPairingTicket.allowedTools),
+					usesDefaultTools: pendingPairingTicket.allowedTools === undefined,
 					rpcGrant: pendingPairingTicket.rpcGrant,
 					createdAt: pendingPairingTicket.createdAt,
 					expiresAt: pendingPairingTicket.expiresAt,
@@ -304,6 +305,7 @@ export class IrohRemoteHostEngine {
 						expectedRevision,
 						revision: result.client.rpcGrant.revision,
 						allowedTools: normalizeIrohRemoteAllowTools(result.client.allowedTools),
+						usesDefaultTools: result.client.allowedTools === undefined,
 						rpcCapabilities: result.client.rpcGrant.capabilities,
 					}
 				: { expectedRevision, currentRevision: result.currentRevision },
@@ -590,6 +592,7 @@ export class IrohRemoteHostEngine {
 				success: false,
 				details: {
 					allowedTools: normalizeIrohRemoteAllowTools(ticket.allowedTools),
+					usesDefaultTools: ticket.allowedTools === undefined,
 					rpcGrant: ticket.rpcGrant,
 					createdAt: ticket.createdAt,
 					expiresAt: ticket.expiresAt,
@@ -607,6 +610,7 @@ export class IrohRemoteHostEngine {
 			details: result.consumedPairingTicket
 				? {
 						allowedTools: normalizeIrohRemoteAllowTools(result.consumedPairingTicket.allowedTools),
+						usesDefaultTools: result.consumedPairingTicket.allowedTools === undefined,
 						rpcGrant: result.consumedPairingTicket.rpcGrant,
 						createdAt: result.consumedPairingTicket.createdAt,
 						expiresAt: result.consumedPairingTicket.expiresAt,

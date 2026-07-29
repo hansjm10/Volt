@@ -700,6 +700,7 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 							expectedRevision: request.expectedRevision,
 							revision: updated.client.rpcGrant.revision,
 							allowedTools: normalizeIrohRemoteAllowTools(updated.client.allowedTools),
+							usesDefaultTools: updated.client.allowedTools === undefined,
 							rpcCapabilities: updated.client.rpcGrant.capabilities,
 						},
 					})

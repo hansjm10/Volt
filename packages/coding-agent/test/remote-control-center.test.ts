@@ -257,6 +257,37 @@ describe("RemoteControlCenterComponent", () => {
 		expect(text).toContain("/tmp/volt");
 	});
 
+	it("labels default-tracking and deny-all device grants", async () => {
+		const backend = new FakeBackend({
+			kind: "online",
+			status: status({
+				clients: [
+					{
+						clientNodeId: "tracking-node-1234567890",
+						label: "Tracking phone",
+						pairedAtMs: Date.now() - 60_000,
+						lastSeenAtMs: Date.now() - 5_000,
+						allowedTools: ["read", "grep"],
+						usesDefaultTools: true,
+					},
+					{
+						clientNodeId: "denyall-node-1234567890",
+						label: "Chat phone",
+						pairedAtMs: Date.now() - 60_000,
+						lastSeenAtMs: Date.now() - 5_000,
+						allowedTools: [],
+					},
+				],
+			}),
+		});
+		const { component } = createComponent(backend, 45);
+		await component.start();
+		const text = component.render(120).map(stripAnsi).join("\n");
+
+		expect(text).toContain("Tools: read, grep (default)");
+		expect(text).toContain("Tools: none");
+	});
+
 	it("renders compatibility defaults for an older protocol-v1 daemon", async () => {
 		const legacyStatus = status({
 			capabilities: undefined,

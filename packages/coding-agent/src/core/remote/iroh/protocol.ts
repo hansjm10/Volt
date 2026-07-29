@@ -54,7 +54,8 @@ export function getIrohRemoteWorkingDirectoryValidationError(value: string): str
 }
 export const DEFAULT_IROH_REMOTE_ALLOW_TOOLS =
 	"read,bash,edit,write,web_search,web_fetch,grep,find,ls,inspect,lsp,subagent,subagent_registry,mcp";
-export const IROH_REMOTE_UNSAFE_TOOL_NAMES = ["bash", "edit", "write", "web_search", "web_fetch"] as const;
+// lsp is listed because its rename/fix actions apply workspace-wide edits.
+export const IROH_REMOTE_UNSAFE_TOOL_NAMES = ["bash", "edit", "write", "web_search", "web_fetch", "lsp"] as const;
 export const IROH_REMOTE_OUTCOMES = [
 	"host_unreachable",
 	"invalid_workspace",
@@ -153,6 +154,12 @@ export function usesDefaultIrohRemoteAllowTools(allowTools: string | undefined):
  * resolve against the CURRENT default at use time, so new builtin tools reach
  * default-grant clients without per-record migrations. The empty string is a
  * real grant (deny-all), never collapsed to `undefined`.
+ *
+ * Intent is deliberately inferred, not recorded: an explicit list that equals
+ * the default set becomes tracking, and a snapshot of a *previous* default
+ * stays pinned (indistinguishable from an explicit grant that equaled it, so
+ * freezing is the security-conservative reading; such records re-pair or reset
+ * access to start tracking).
  */
 export function canonicalizePersistedIrohRemoteAllowTools(allowTools: string | undefined): string | undefined {
 	if (allowTools === undefined || usesDefaultIrohRemoteAllowTools(allowTools)) {
