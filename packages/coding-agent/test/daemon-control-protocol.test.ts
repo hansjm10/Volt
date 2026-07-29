@@ -94,7 +94,7 @@ describe("control protocol framing", () => {
 					title: "Your plan is ready",
 					body: "Open Volt to review and approve it.",
 					sessionId: "s-1",
-					workspace: "volt",
+					workspaceName: "volt",
 					planId: "plan-1",
 				},
 			},
@@ -237,7 +237,7 @@ describe("control protocol framing", () => {
 				title: "Your review is ready",
 				body: "PR #151 completed with 4 findings.",
 				sessionId: "s-1",
-				workspace: "volt",
+				workspaceName: "volt",
 				workflowId: "review:one",
 			},
 		};
@@ -251,11 +251,21 @@ describe("control protocol framing", () => {
 		for (const notification of [
 			{ ...reviewNotificationRequest.notification, title: "Review\nready" },
 			{ ...reviewNotificationRequest.notification, body: "Open /Users/private/review.diff" },
-			{ ...reviewNotificationRequest.notification, workspace: "private/path" },
+			{ ...reviewNotificationRequest.notification, workspaceName: "private/path" },
 			{ ...reviewNotificationRequest.notification, workflowId: "w".repeat(129) },
 		]) {
 			expect(isControlRequest({ ...reviewNotificationRequest, notification })).toBe(false);
 		}
+		expect(
+			isControlRequest({
+				...reviewNotificationRequest,
+				notification: {
+					...reviewNotificationRequest.notification,
+					workspaceName: undefined,
+					workspace: "volt",
+				},
+			}),
+		).toBe(false);
 		expect(
 			isControlRequest({
 				type: "relay_live_activity_delivery",

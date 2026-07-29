@@ -3899,7 +3899,7 @@ class IrohDaemonService {
 		if (notification.sessionId !== undefined && notification.sessionId !== request.sessionId) {
 			return { ok: false, code: "session_mismatch", message: "notification session does not match relay session" };
 		}
-		if (notification.workspace !== undefined && notification.workspace !== request.workspaceName) {
+		if (notification.workspaceName !== undefined && notification.workspaceName !== request.workspaceName) {
 			return {
 				ok: false,
 				code: "workspace_mismatch",
@@ -3913,7 +3913,7 @@ class IrohDaemonService {
 		const scopedNotification: IrohRemotePushNotificationIntent = {
 			...notification,
 			sessionId: notification.sessionId ?? request.sessionId,
-			workspace: notification.workspace ?? request.workspaceName,
+			workspaceName: notification.workspaceName ?? request.workspaceName,
 		};
 		try {
 			const status = await this.createPushNotificationDispatcher(authorization.authorization).deliverNotification(

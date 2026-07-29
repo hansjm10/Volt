@@ -1799,12 +1799,12 @@ describe("Iroh remote notification requests", () => {
 			kind: "conversation_completed",
 			title: "Volt finished in volt-app",
 			body: "Your conversation is ready.",
-			workspace: "volt-app",
+			workspaceName: "volt-app",
 			data: {
 				eventId: "conversation:session-one:conversation-run:completed",
 				kind: "conversation_completed",
 				sessionId: "session-one",
-				workspace: "volt-app",
+				workspaceName: "volt-app",
 			},
 		};
 		await vi.waitFor(() => expect(relayClient.sendNotification).toHaveBeenCalledWith(expectedNotification));
@@ -1870,7 +1870,7 @@ describe("Iroh remote notification requests", () => {
 			title: "Your plan is ready",
 			body: "Open Volt to review and approve it.",
 			sessionId: "session-one",
-			workspace: "volt-app",
+			workspaceName: "volt-app",
 			planId: "plan-one",
 		};
 		await vi.waitFor(() =>
@@ -1896,13 +1896,13 @@ describe("Iroh remote notification requests", () => {
 			kind: expectedIntent.kind,
 			title: expectedIntent.title,
 			body: expectedIntent.body,
-			workspace: expectedIntent.workspace,
+			workspaceName: expectedIntent.workspaceName,
 			planId: expectedIntent.planId,
 			data: {
 				eventId: expectedIntent.eventId,
 				kind: expectedIntent.kind,
 				sessionId: expectedIntent.sessionId,
-				workspace: expectedIntent.workspace,
+				workspaceName: expectedIntent.workspaceName,
 				planId: expectedIntent.planId,
 			},
 		});
@@ -2647,7 +2647,7 @@ describe("Iroh remote notification requests", () => {
 					title: "Volt finished in volt-app",
 					body: "Your conversation is ready.",
 					sessionId: "session-one",
-					workspace: "volt-app",
+					workspaceName: "volt-app",
 				},
 			]),
 		);

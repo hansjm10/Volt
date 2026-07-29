@@ -103,7 +103,7 @@ export interface IrohRemoteNotificationRequest {
 	title: string;
 	body: string;
 	sessionId?: string;
-	workspace?: string;
+	workspaceName?: string;
 	planId?: string;
 	workflowId?: string;
 }
@@ -661,7 +661,7 @@ function createIrohRemoteReviewCompletionNotification(
 		title: "Your review is ready",
 		body,
 		sessionId,
-		...(workspaceName === undefined ? {} : { workspace: workspaceName }),
+		...(workspaceName === undefined ? {} : { workspaceName }),
 		workflowId,
 	});
 }
@@ -1538,14 +1538,17 @@ function createIrohRemoteCompletionNotification(
 	if (!isConversationCompletionCommand(completion.command)) {
 		return undefined;
 	}
-	const workspace = sanitizeIrohRemoteNotificationWorkspace(workspaceName);
-	const workspaceDetails = workspace === undefined ? {} : { workspace };
+	const workspaceNameMetadata = sanitizeIrohRemoteNotificationWorkspace(workspaceName);
+	const workspaceDetails = workspaceNameMetadata === undefined ? {} : { workspaceName: workspaceNameMetadata };
 	switch (finalState.terminalOutcome) {
 		case "failed":
 			return createBoundedIrohRemoteNotificationRequest({
 				eventId: `conversation:${finalState.sessionId}:${finalState.runId}:failed`,
 				kind: "host_notice",
-				title: workspace === undefined ? "Volt needs attention" : `Volt needs attention in ${workspace}`,
+				title:
+					workspaceNameMetadata === undefined
+						? "Volt needs attention"
+						: `Volt needs attention in ${workspaceNameMetadata}`,
 				body: "Open Volt to view the error.",
 				sessionId: finalState.sessionId,
 				...workspaceDetails,
@@ -1570,7 +1573,7 @@ function createIrohRemoteCompletionNotification(
 			return createBoundedIrohRemoteNotificationRequest({
 				eventId: `conversation:${finalState.sessionId}:${finalState.runId}:completed`,
 				kind: "conversation_completed",
-				title: workspace === undefined ? "Volt finished" : `Volt finished in ${workspace}`,
+				title: workspaceNameMetadata === undefined ? "Volt finished" : `Volt finished in ${workspaceNameMetadata}`,
 				body: "Your conversation is ready.",
 				sessionId: finalState.sessionId,
 				...workspaceDetails,

@@ -171,7 +171,7 @@ function parseNotification(body) {
 			"kind",
 			"title",
 			"body",
-			"workspace",
+			"workspaceName",
 			"planId",
 			"workflowId",
 			"data",
@@ -183,9 +183,9 @@ function parseNotification(body) {
 	if (!NOTIFICATION_KINDS.has(kind)) {
 		throw new RequestError(400, "kind_is_unsupported");
 	}
-	const workspace = expectOptionalNotificationText(
-		body.workspace,
-		"workspace",
+	const workspaceName = expectOptionalNotificationText(
+		body.workspaceName,
+		"workspaceName",
 		MAX_NOTIFICATION_WORKSPACE_UTF8_BYTES,
 	);
 	const planId = expectOptionalNotificationMetadata(body.planId, "planId", MAX_NOTIFICATION_METADATA_UTF8_BYTES);
@@ -202,15 +202,15 @@ function parseNotification(body) {
 		throw new RequestError(400, "notification_navigation_metadata_mismatch");
 	}
 	const data = expectStringRecord(body.data, "data", { maxEntries: 8, maxKeyLength: 64, maxValueLength: 512 });
-	expectAllowedKeys(data, ["eventId", "kind", "sessionId", "workspace", "planId", "workflowId"], "data");
+	expectAllowedKeys(data, ["eventId", "kind", "sessionId", "workspaceName", "planId", "workflowId"], "data");
 	const sessionId = expectOptionalNotificationMetadata(
 		data.sessionId,
 		"sessionId",
 		MAX_NOTIFICATION_METADATA_UTF8_BYTES,
 	);
-	const dataWorkspace = expectOptionalNotificationText(
-		data.workspace,
-		"data_workspace",
+	const dataWorkspaceName = expectOptionalNotificationText(
+		data.workspaceName,
+		"data_workspaceName",
 		MAX_NOTIFICATION_WORKSPACE_UTF8_BYTES,
 	);
 	const dataPlanId = expectOptionalNotificationMetadata(
@@ -226,7 +226,7 @@ function parseNotification(body) {
 	if (
 		data.eventId !== eventId ||
 		data.kind !== kind ||
-		dataWorkspace !== workspace ||
+		dataWorkspaceName !== workspaceName ||
 		dataPlanId !== planId ||
 		dataWorkflowId !== workflowId
 	) {
@@ -238,7 +238,7 @@ function parseNotification(body) {
 			eventId,
 			kind,
 			...(sessionId === undefined ? {} : { sessionId }),
-			...(workspace === undefined ? {} : { workspace }),
+			...(workspaceName === undefined ? {} : { workspaceName }),
 			...(planId === undefined ? {} : { planId }),
 			...(workflowId === undefined ? {} : { workflowId }),
 		},
@@ -247,7 +247,7 @@ function parseNotification(body) {
 		pushTargetAuthToken: expectString(body.pushTargetAuthToken, "pushTargetAuthToken", 32, 128),
 		pushTargetId: expectString(body.pushTargetId, "pushTargetId", 16, 96),
 		title: expectNotificationText(body.title, "title", MAX_NOTIFICATION_TITLE_UTF8_BYTES),
-		...(workspace === undefined ? {} : { workspace }),
+		...(workspaceName === undefined ? {} : { workspaceName }),
 		...(planId === undefined ? {} : { planId }),
 		...(workflowId === undefined ? {} : { workflowId }),
 	};

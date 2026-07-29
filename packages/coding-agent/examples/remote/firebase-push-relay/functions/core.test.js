@@ -168,13 +168,13 @@ test("notification input preserves bounded Plan and review navigation metadata f
 		kind: "plan_ready",
 		title: "Your plan is ready",
 		body: "Open Volt to review and approve it.",
-		workspace: "volt-app",
+		workspaceName: "volt-app",
 		planId: "plan-one",
 		data: {
 			eventId: "plan:session-one:run-one:ready",
 			kind: "plan_ready",
 			sessionId: "session-one",
-			workspace: "volt-app",
+			workspaceName: "volt-app",
 			planId: "plan-one",
 		},
 	});
@@ -182,7 +182,7 @@ test("notification input preserves bounded Plan and review navigation metadata f
 		eventId: "plan:session-one:run-one:ready",
 		kind: "plan_ready",
 		sessionId: "session-one",
-		workspace: "volt-app",
+		workspaceName: "volt-app",
 		planId: "plan-one",
 	});
 	assert.equal(plan.planId, "plan-one");
@@ -237,6 +237,16 @@ test("notification input rejects control characters, host paths, overlong copy, 
 	);
 	expectRequestError(
 		() => parseNotification({ ...base, data: { ...base.data, command: "git diff HEAD" } }),
+		400,
+		"data_has_unknown_field",
+	);
+	expectRequestError(
+		() => parseNotification({ ...base, workspace: "volt-app" }),
+		400,
+		"notification_has_unknown_field",
+	);
+	expectRequestError(
+		() => parseNotification({ ...base, data: { ...base.data, workspace: "volt-app" } }),
 		400,
 		"data_has_unknown_field",
 	);

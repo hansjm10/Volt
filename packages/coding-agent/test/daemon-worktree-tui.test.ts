@@ -386,7 +386,7 @@ describe("createDaemonAttach + control server integration", () => {
 				title: "Volt finished",
 				body: "Your conversation is ready.",
 				sessionId: "s-relay",
-				workspace: "repo",
+				workspaceName: "repo",
 			}),
 		).resolves.toBe("sent");
 		await expect(

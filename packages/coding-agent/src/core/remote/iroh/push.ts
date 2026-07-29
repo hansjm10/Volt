@@ -45,7 +45,7 @@ export interface IrohRemotePushNotificationIntent {
 	title: string;
 	body: string;
 	sessionId?: string;
-	workspace?: string;
+	workspaceName?: string;
 	planId?: string;
 	workflowId?: string;
 }
@@ -126,7 +126,7 @@ export function sanitizeIrohRemotePushNotificationIntent(
 	const title = sanitizeIrohRemoteNotificationText(value.title, MAX_IROH_REMOTE_NOTIFICATION_TITLE_UTF8_BYTES);
 	const body = sanitizeIrohRemoteNotificationText(value.body, MAX_IROH_REMOTE_NOTIFICATION_BODY_UTF8_BYTES);
 	const sessionId = sanitizeIrohRemoteNotificationMetadata(value.sessionId);
-	const workspace = sanitizeIrohRemoteNotificationWorkspace(value.workspace);
+	const workspaceName = sanitizeIrohRemoteNotificationWorkspace(value.workspaceName);
 	const planId = sanitizeIrohRemoteNotificationMetadata(value.planId);
 	const workflowId = sanitizeIrohRemoteNotificationMetadata(value.workflowId);
 	if (
@@ -136,7 +136,7 @@ export function sanitizeIrohRemotePushNotificationIntent(
 		!title ||
 		!body ||
 		(value.sessionId !== undefined && sessionId === undefined) ||
-		(value.workspace !== undefined && workspace === undefined) ||
+		(value.workspaceName !== undefined && workspaceName === undefined) ||
 		(value.planId !== undefined && planId === undefined) ||
 		(value.workflowId !== undefined && workflowId === undefined) ||
 		(kind === "plan_ready" && (planId === undefined || workflowId !== undefined)) ||
@@ -151,7 +151,7 @@ export function sanitizeIrohRemotePushNotificationIntent(
 		title,
 		body,
 		...(sessionId === undefined ? {} : { sessionId }),
-		...(workspace === undefined ? {} : { workspace }),
+		...(workspaceName === undefined ? {} : { workspaceName }),
 		...(planId === undefined ? {} : { planId }),
 		...(workflowId === undefined ? {} : { workflowId }),
 	};
@@ -166,14 +166,14 @@ export function parseIrohRemotePushNotificationIntent(value: unknown): IrohRemot
 	if (
 		!isRecord(value) ||
 		!Object.keys(value).every((key) =>
-			["eventId", "kind", "title", "body", "sessionId", "workspace", "planId", "workflowId"].includes(key),
+			["eventId", "kind", "title", "body", "sessionId", "workspaceName", "planId", "workflowId"].includes(key),
 		) ||
 		typeof value.eventId !== "string" ||
 		typeof value.kind !== "string" ||
 		typeof value.title !== "string" ||
 		typeof value.body !== "string" ||
 		(value.sessionId !== undefined && typeof value.sessionId !== "string") ||
-		(value.workspace !== undefined && typeof value.workspace !== "string") ||
+		(value.workspaceName !== undefined && typeof value.workspaceName !== "string") ||
 		(value.planId !== undefined && typeof value.planId !== "string") ||
 		(value.workflowId !== undefined && typeof value.workflowId !== "string")
 	) {
@@ -218,14 +218,14 @@ export interface IrohRemotePushRelayNotificationRequest {
 	kind: string;
 	title: string;
 	body: string;
-	workspace?: string;
+	workspaceName?: string;
 	planId?: string;
 	workflowId?: string;
 	data: {
 		eventId: string;
 		kind: string;
 		sessionId?: string;
-		workspace?: string;
+		workspaceName?: string;
 		planId?: string;
 		workflowId?: string;
 	};
@@ -478,7 +478,7 @@ function createRelayNotificationBody(
 		kind: request.kind,
 		title: request.title,
 		body: request.body,
-		...(request.workspace === undefined ? {} : { workspace: request.workspace }),
+		...(request.workspaceName === undefined ? {} : { workspaceName: request.workspaceName }),
 		...(request.planId === undefined ? {} : { planId: request.planId }),
 		...(request.workflowId === undefined ? {} : { workflowId: request.workflowId }),
 		data: request.data,
@@ -935,14 +935,14 @@ function createRelayNotificationRequest(
 		kind: notification.kind,
 		title: notification.title,
 		body: notification.body,
-		...(notification.workspace === undefined ? {} : { workspace: notification.workspace }),
+		...(notification.workspaceName === undefined ? {} : { workspaceName: notification.workspaceName }),
 		...(notification.planId === undefined ? {} : { planId: notification.planId }),
 		...(notification.workflowId === undefined ? {} : { workflowId: notification.workflowId }),
 		data: {
 			eventId: notification.eventId,
 			kind: notification.kind,
 			...(notification.sessionId === undefined ? {} : { sessionId: notification.sessionId }),
-			...(notification.workspace === undefined ? {} : { workspace: notification.workspace }),
+			...(notification.workspaceName === undefined ? {} : { workspaceName: notification.workspaceName }),
 			...(notification.planId === undefined ? {} : { planId: notification.planId }),
 			...(notification.workflowId === undefined ? {} : { workflowId: notification.workflowId }),
 		},
