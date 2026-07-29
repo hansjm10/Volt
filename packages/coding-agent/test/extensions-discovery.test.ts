@@ -78,15 +78,18 @@ describe("extensions discovery", () => {
 		}
 	`;
 
-	it.each(["update_plan", "submit_plan"])("reserves native %s tools", async (name) => {
-		fs.writeFileSync(path.join(extensionsDir, `${name}.ts`), extensionCodeWithTool(name));
+	it.each(["update_plan", "submit_plan", "update_plan_progress", "request_replan"])(
+		"reserves native %s tools",
+		async (name) => {
+			fs.writeFileSync(path.join(extensionsDir, `${name}.ts`), extensionCodeWithTool(name));
 
-		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
-		expect(result.extensions).toEqual([]);
-		expect(result.errors).toEqual([
-			expect.objectContaining({ error: expect.stringContaining("reserved by native Plan mode") }),
-		]);
-	});
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			expect(result.extensions).toEqual([]);
+			expect(result.errors).toEqual([
+				expect.objectContaining({ error: expect.stringContaining("reserved by native Plan mode") }),
+			]);
+		},
+	);
 
 	it("discovers direct .ts files in extensions/", async () => {
 		fs.writeFileSync(path.join(extensionsDir, "foo.ts"), extensionCode);

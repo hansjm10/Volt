@@ -1385,7 +1385,7 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
-	it("sends only response input deltas in websocket-cached mode", async () => {
+	it("keeps the request body stable and sends only response input deltas in websocket-cached mode", async () => {
 		const token = mockToken();
 		const sentBodies: unknown[] = [];
 		const responses = [
@@ -1519,6 +1519,11 @@ describe("openai-codex streaming", () => {
 		expect(secondBody.store).toBe(false);
 		expect(secondBody.previous_response_id).toBe("resp_1");
 		expect(secondBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "Now finish" }] }]);
+		const withoutContinuationInput = (body: Record<string, unknown>) => {
+			const { input: _input, previous_response_id: _previousResponseId, ...rest } = body;
+			return rest;
+		};
+		expect(withoutContinuationInput(secondBody)).toEqual(withoutContinuationInput(firstBody));
 		expect(getOpenAICodexWebSocketDebugStats("session-1")).toMatchObject({
 			requests: 2,
 			connectionsCreated: 1,

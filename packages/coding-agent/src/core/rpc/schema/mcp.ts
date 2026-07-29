@@ -49,6 +49,7 @@ export const RpcMcpToolSummarySchema = Type.Object(
 		title: Type.Optional(Type.String()),
 		description: Type.Optional(Type.String()),
 		risk: RpcMcpRiskSchema,
+		trustedRead: Type.Boolean(),
 		inputSchema: Type.Optional(opaque<unknown>("MCP SDK JSON schema; passed through verbatim")),
 		outputSchema: Type.Optional(opaque<unknown>("MCP SDK JSON schema; passed through verbatim")),
 		annotations: Type.Optional(Type.Record(Type.String(), Type.Unknown())),

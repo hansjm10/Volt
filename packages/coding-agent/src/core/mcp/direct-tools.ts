@@ -58,7 +58,7 @@ export function createMcpDirectToolDefinitions(manager: McpManager): ToolDefinit
 					metadataHash: candidate.metadataHash,
 					result,
 				},
-				...(result.isError ? { isError: true } : {}),
+				...(result.isError || result.status === "failed" ? { isError: true } : {}),
 			};
 		},
 	}));

@@ -12,6 +12,7 @@ Implemented today:
 - browser OAuth authorization-code + PKCE and OAuth device-code auth for HTTP/SSE MCP servers, with host-side token storage
 - persisted enable/disable overlays in Volt-owned MCP config files
 - optional direct tool promotion from fresh cached metadata via `directTools`
+- optional per-server `trustedReads` declarations for operation-authorized reads in restricted session profiles
 - MCP lifecycle event streaming (`mcp_events.v1`): the manager emits `mcp_servers_changed`, `mcp_server_status_changed`, `mcp_auth_request`, `mcp_auth_update`, and `mcp_call_start`/`mcp_call_update`/`mcp_call_end` through the AgentSession event stream, so TUI, RPC, daemon, and mobile clients observe MCP state without polling; the iOS app routes these into live server/auth/call state
 - iOS MCP surfaces: a host-approval card for pushed auth requests (mirroring LSP install approvals), live active-call display in the MCP servers view, and chat transcript tool cards that render gateway and direct-tool calls as `mcp <server>.<tool>` with risk, truncation, and cache-id visibility
 
@@ -108,7 +109,7 @@ Tool rendering:
 
 - Load global MCP config and trusted project MCP config only.
 - Do not prompt for project trust in non-interactive modes; follow existing `defaultProjectTrust`, `--approve`, and `--no-approve` behavior.
-- Do not apply nested MCP tool approvals. If the top-level `mcp` tool is available and the exact server/tool passes include/exclude filters, the call executes.
+- Do not apply nested MCP tool approval prompts. In unrestricted Build sessions, an available top-level `mcp` tool executes calls that pass server/tool filters. Restricted profiles additionally require host-owned operation authorization as described under `trustedReads`.
 - JSON/RPC event streams include MCP status, auth, and call lifecycle events.
 
 ### Daemon and mobile
@@ -176,7 +177,11 @@ Editing shared files requires an explicit command or UI choice.
       },
       "lifecycle": "lazy",
       "includeTools": [],
-      "excludeTools": []
+      "excludeTools": [],
+      "trustedReads": {
+        "resources": false,
+        "tools": ["search_issues", "get_file_contents"]
+      }
     },
     "linear": {
       "enabled": true,
@@ -199,6 +204,7 @@ Common fields:
 - `includeTools?: string[]`
 - `excludeTools?: string[]`
 - `directTools?: boolean | string[]`
+- `trustedReads?: { resources?: boolean; tools?: string[] }`
 - `connectTimeoutMs?: number`
 - `callTimeoutMs?: number`
 - `idleTimeoutMs?: number`
@@ -246,6 +252,21 @@ Non-interactive modes follow existing Volt project trust behavior:
 - `defaultProjectTrust: "always"` trusts project MCP
 - `--approve` trusts for this run
 - `--no-approve` ignores project MCP
+
+### Trusted reads in restricted profiles
+
+`trustedReads` is mode-neutral user trust evidence for restrictive read profiles; it is not a claim made by the MCP server and does not make returned content trusted instructions.
+
+- `resources: true` authorizes that server's resource list/read operations as integration reads.
+- `tools` is an exact-name allowlist. Each listed tool must also pass the server's normal `includeTools`/`excludeTools` filters, have fresh metadata with `readOnlyHint: true`, and have no write or destructive conflict after camelCase, PascalCase, and separator-aware risk tokenization. Missing, stale, filtered, ambiguous, annotation-only, or conflicting metadata fails closed.
+- Status, server listing, and metadata search are discovery operations. Connecting to a server requires at least one configured trusted-read category; describing/listing tools requires configured trusted tools, while listing/reading resources requires `resources: true`. Cached result reads are discovery operations too: replaying stored output needs no per-server trust and does not count as fresh research evidence.
+- Restricted metadata refreshes issue only the protocol operations authorized for that server: tool metadata for configured trusted tools and resource metadata only with `resources: true`. Plan never requests prompt metadata, including during eager startup, connect, list, describe, or pre-call revalidation.
+- Tool prompts, authentication, enable/disable, disconnect/logout, and other lifecycle/configuration actions are not reads. A restricted research profile does not grant them.
+- `includeTools`/`excludeTools` still apply. `trustedReads` can only narrow authority; it does not bypass normal filtering, project trust, authentication, or transport controls.
+- Immediately before a restricted tool invocation, Volt refreshes metadata and revalidates the exact configured tool name, effective filters, `readOnlyHint`, and risk. A metadata change between authorization and execution therefore fails closed.
+- MCP protocol results with `isError: true` or `status: "failed"` remain structured for rendering and audit but propagate as failed top-level agent tool results.
+
+Plan uses Volt's reusable research capability profile, which grants integration discovery/read but not integration prompt/write. Other future restricted modes can reuse the same profile or a capability subset without adding mode-specific fields to MCP config. Before Plan returns to Build, Volt awaits unrestricted eager/keep-alive startup, rebuilds direct tools from fresh metadata, and reapplies the session's allow/exclude policy; servers skipped during restricted startup are therefore available before Build is exposed.
 
 ## Runtime architecture
 
@@ -353,8 +374,8 @@ Startup:
 2. Load metadata cache.
 3. Construct MCP manager.
 4. Register only the native `mcp` tool when MCP is enabled.
-5. Start eager/keep-alive servers from trusted config.
-6. Lazy servers remain cold.
+5. Start eager/keep-alive servers from trusted config. Restricted startup starts only servers with trusted resources or configured, normally filtered trusted tools, and refreshes only those authorized metadata categories without listing prompts.
+6. Lazy servers remain cold. A later transition to Build awaits unrestricted eager/keep-alive startup and rebuilds direct tools from fresh metadata before exposing Build.
 
 Search/describe:
 
@@ -366,11 +387,12 @@ Call:
 
 1. Resolve exact server and tool.
 2. Ensure server is connected.
-3. Refresh metadata if needed.
-4. Call tool with timeout and cancellation.
-5. Truncate/cache output.
-6. Emit events and audit.
-7. Reset idle timer.
+3. Refresh metadata if needed; restricted trusted reads always refresh immediately before invocation.
+4. In a restricted context, revalidate configured exact-name trust, normal filters, `readOnlyHint`, and risk against the refreshed tool.
+5. Call the tool with timeout and cancellation.
+6. Truncate/cache output and propagate protocol-level failed results as top-level tool failures.
+7. Emit events and audit.
+8. Reset the idle timer.
 
 Shutdown:
 
@@ -504,7 +526,7 @@ Schemas are bounded. If a schema is too large, return a compact schema plus an e
 }
 ```
 
-Errors from MCP tool execution are returned as tool results with a clear `isError` result to the model when the protocol reports a tool-level error. Transport/protocol/permission failures are reported as gateway errors.
+Errors from MCP tool execution retain their structured failed call result for rendering and audit and are also marked as top-level agent tool failures when the protocol reports `isError: true` or `status: "failed"`. Transport/protocol/permission failures are reported as gateway errors.
 
 ## Token budget strategy
 
@@ -721,7 +743,7 @@ Risk classes:
 - `destructive`
 - `unknown`
 
-Risk is informational only. Volt does not apply nested MCP tool permissions or approval prompts; availability is controlled by the top-level `mcp` tool plus server `includeTools`/`excludeTools`, project trust, auth, and transport/remote-safety rules.
+Risk remains informational in unrestricted Build sessions, where Volt does not add nested MCP approval prompts. In a restricted profile, however, host-owned operation authorization may use risk only as corroborating evidence: an exact, normally filtered `trustedReads.tools` entry and `readOnlyHint: true` are both required, while write/destructive/unknown conflicts fail closed. Name and description checks tokenize camelCase, PascalCase, acronym, and separator boundaries before matching mutation verbs. Server annotations alone never grant authority, and restricted calls refresh and revalidate immediately before invocation. Normal `includeTools`/`excludeTools`, project trust, auth, and transport/remote-safety rules continue to apply in every mode.
 
 ### Audit
 

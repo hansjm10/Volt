@@ -1,7 +1,16 @@
 import { randomUUID } from "node:crypto";
 import type { CallToolResult, GetPromptResult, ReadResourceResult } from "@modelcontextprotocol/sdk/types.js";
 import type { McpAuditLogger } from "./audit.ts";
-import { getMcpDirectToolName, getServerTimeoutMs, hashMcpServerConfig, serverMatchesToolFilters } from "./config.ts";
+import {
+	getMcpDirectToolName,
+	getServerTimeoutMs,
+	hashMcpServerConfig,
+	serverHasTrustedReads,
+	serverHasTrustedToolReads,
+	serverMatchesToolFilters,
+	serverTrustsResourceReads,
+	serverTrustsToolRead,
+} from "./config.ts";
 import type { McpConfigWriter } from "./config-writer.ts";
 import type { McpMetadataCache } from "./metadata-cache.ts";
 import {
@@ -13,9 +22,9 @@ import {
 } from "./oauth-flow.ts";
 import type { McpOAuthStore } from "./oauth-store.ts";
 import type { McpOutputStore } from "./output-store.ts";
-import { classifyMcpToolRisk } from "./safety.ts";
+import { classifyMcpToolRisk, isMcpToolTrustedReadCandidate } from "./safety.ts";
 import { searchMcpMetadata } from "./search.ts";
-import { McpServerSupervisor } from "./server-supervisor.ts";
+import { type McpMetadataRefreshOptions, McpServerSupervisor } from "./server-supervisor.ts";
 import type {
 	McpCallerSurface,
 	McpClientFactory,
@@ -25,6 +34,7 @@ import type {
 	McpGatewayInput,
 	McpManagerEvent,
 	McpManagerEventListener,
+	McpMetadataCategory,
 	McpPromptSummary,
 	McpRecentCallStatus,
 	McpResolvedConfig,
@@ -99,15 +109,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isMetadataStale(metadata: McpServerMetadata | undefined, maxAgeMs: number): boolean {
+function isMetadataStale(
+	metadata: McpServerMetadata | undefined,
+	maxAgeMs: number,
+	categories: readonly McpMetadataCategory[],
+): boolean {
 	if (!metadata) {
 		return true;
 	}
-	const lastSeenAt = Date.parse(metadata.lastSeenAt);
-	if (!Number.isFinite(lastSeenAt)) {
-		return true;
-	}
-	return Date.now() - lastSeenAt > maxAgeMs;
+	const now = Date.now();
+	return categories.some((category) => {
+		const value =
+			category === "tools"
+				? metadata.toolsLastSeenAt
+				: category === "resources"
+					? metadata.resourcesLastSeenAt
+					: metadata.promptsLastSeenAt;
+		const seenAt = Date.parse(value);
+		return !Number.isFinite(seenAt) || now - seenAt > maxAgeMs;
+	});
+}
+
+const ALL_METADATA_CATEGORIES: readonly McpMetadataCategory[] = Object.freeze(["tools", "resources", "prompts"]);
+const TOOL_METADATA_CATEGORIES: readonly McpMetadataCategory[] = Object.freeze(["tools"]);
+const TOOLS_ONLY_METADATA_REFRESH: McpMetadataRefreshOptions = Object.freeze({
+	tools: true,
+	resources: false,
+	prompts: false,
+	strict: true,
+});
+
+function getRestrictedMetadataRefresh(server: McpResolvedServerConfig): McpMetadataRefreshOptions {
+	return {
+		tools: serverHasTrustedToolReads(server),
+		resources: serverTrustsResourceReads(server),
+		prompts: false,
+		strict: true,
+	};
 }
 
 function isDirectToolEnabled(
@@ -134,11 +172,12 @@ function toToolSummary(
 		...(tool.title ? { title: tool.title } : {}),
 		...(tool.description ? { description: compactText(tool.description, 800) } : {}),
 		risk: classifyMcpToolRisk(tool),
+		trustedRead: serverTrustsToolRead(server, tool.name) && isMcpToolTrustedReadCandidate(tool),
 		inputSchema: tool.inputSchema,
 		...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
 		...(tool.annotations ? { annotations: tool.annotations } : {}),
 		metadataHash: metadata.metadataHash,
-		lastSeenAt: metadata.lastSeenAt,
+		lastSeenAt: metadata.toolsLastSeenAt,
 		stale,
 		direct: isDirectToolEnabled(server.directTools, settingsDirectTools, tool.name),
 	}));
@@ -303,9 +342,10 @@ export class McpManager {
 				continue;
 			}
 			const metadata = supervisor.cachedMetadata;
-			if (!metadata || this.isSupervisorMetadataStale(supervisor, metadata)) {
+			if (!metadata || this.isSupervisorMetadataStale(supervisor, metadata, TOOL_METADATA_CATEGORIES)) {
 				continue;
 			}
+			const toolsLastSeenAt = metadata.toolsLastSeenAt;
 			for (const tool of metadata.tools) {
 				if (
 					!serverMatchesToolFilters(supervisor.server, tool.name) ||
@@ -318,7 +358,7 @@ export class McpManager {
 					tool,
 					risk: classifyMcpToolRisk(tool),
 					metadataHash: metadata.metadataHash,
-					lastSeenAt: metadata.lastSeenAt,
+					lastSeenAt: toolsLastSeenAt,
 					directToolName: getMcpDirectToolName(supervisor.server.id, tool.name),
 				});
 			}
@@ -326,13 +366,50 @@ export class McpManager {
 		return candidates;
 	}
 
-	async startEagerServers(signal?: AbortSignal): Promise<void> {
+	async startEagerServers(signal?: AbortSignal, options: { trustedReadsOnly?: boolean } = {}): Promise<void> {
 		const eager = Array.from(this.supervisors.values()).filter(
 			(supervisor) =>
 				supervisor.server.enabled &&
+				(!options.trustedReadsOnly || serverHasTrustedReads(supervisor.server)) &&
 				(supervisor.server.lifecycle === "eager" || supervisor.server.lifecycle === "keep-alive"),
 		);
-		await Promise.allSettled(eager.map((supervisor) => supervisor.refreshMetadata(signal)));
+		await Promise.allSettled(
+			eager.map((supervisor) =>
+				supervisor.refreshMetadata(
+					signal,
+					options.trustedReadsOnly ? getRestrictedMetadataRefresh(supervisor.server) : undefined,
+				),
+			),
+		);
+	}
+
+	hasTrustedReads(serverId: string): boolean {
+		const server = this.findServerConfig(serverId);
+		return server?.enabled === true && serverHasTrustedReads(server);
+	}
+
+	hasTrustedToolReads(serverId: string): boolean {
+		const server = this.findServerConfig(serverId);
+		return server?.enabled === true && serverHasTrustedToolReads(server);
+	}
+
+	hasTrustedResourceReads(serverId: string): boolean {
+		const server = this.findServerConfig(serverId);
+		return server?.enabled === true && serverTrustsResourceReads(server);
+	}
+
+	isTrustedToolRead(serverId: string, toolName: string): boolean {
+		const server = this.findServerConfig(serverId);
+		const supervisor = this.findSupervisor(serverId);
+		if (!server || !server.enabled || !supervisor || !serverTrustsToolRead(server, toolName)) {
+			return false;
+		}
+		const metadata = supervisor.cachedMetadata;
+		if (!metadata || this.isSupervisorMetadataStale(supervisor, metadata, TOOL_METADATA_CATEGORIES)) {
+			return false;
+		}
+		const tool = metadata.tools.find((entry) => entry.name === toolName);
+		return tool !== undefined && serverMatchesToolFilters(server, tool.name) && isMcpToolTrustedReadCandidate(tool);
 	}
 
 	async dispose(): Promise<void> {
@@ -357,9 +434,13 @@ export class McpManager {
 			case "search":
 				return this.search(input.query ?? "", input.limit);
 			case "describe":
-				return this.describe(requireString(input.server, "server"), requireString(input.tool, "tool"), signal);
+				return this.describe(requireString(input.server, "server"), requireString(input.tool, "tool"), signal, {
+					restrictedTrustedRead: context.restrictedTrustedRead,
+				});
 			case "connect":
-				return this.connectServer(requireString(input.server, "server"), signal);
+				return this.connectServer(requireString(input.server, "server"), signal, {
+					restrictedTrustedRead: context.restrictedTrustedRead,
+				});
 			case "disconnect":
 				return this.disconnectServer(requireString(input.server, "server"));
 			case "set_enabled":
@@ -386,7 +467,9 @@ export class McpManager {
 			case "logout":
 				return this.logoutServer(requireString(input.server, "server"));
 			case "list_tools":
-				return this.listTools(requireString(input.server, "server"), signal);
+				return this.listTools(requireString(input.server, "server"), signal, {
+					restrictedTrustedRead: context.restrictedTrustedRead,
+				});
 			case "call":
 				return this.callTool(input, context, signal);
 			case "list_resources":
@@ -416,9 +499,16 @@ export class McpManager {
 	async connectServer(
 		serverId: string,
 		signal?: AbortSignal,
+		options: { restrictedTrustedRead?: boolean } = {},
 	): Promise<{ action: "connect"; server: McpServerSummary }> {
 		const supervisor = this.getSupervisor(serverId);
-		await supervisor.refreshMetadata(signal);
+		if (options.restrictedTrustedRead && !serverHasTrustedReads(supervisor.server)) {
+			throw new Error(`MCP server has no configured trusted reads: ${serverId}`);
+		}
+		await supervisor.refreshMetadata(
+			signal,
+			options.restrictedTrustedRead ? getRestrictedMetadataRefresh(supervisor.server) : undefined,
+		);
 		return { action: "connect", server: supervisor.getSummary() };
 	}
 
@@ -581,6 +671,7 @@ export class McpManager {
 	async listTools(
 		serverId: string,
 		signal?: AbortSignal,
+		options: { restrictedTrustedRead?: boolean } = {},
 	): Promise<{
 		action: "list_tools";
 		server: string;
@@ -589,11 +680,16 @@ export class McpManager {
 		stale: boolean;
 	}> {
 		const supervisor = this.getSupervisor(serverId);
-		const metadata = await this.getFreshMetadata(supervisor, signal).catch(() => supervisor.cachedMetadata);
+		if (options.restrictedTrustedRead && !serverHasTrustedToolReads(supervisor.server)) {
+			throw new Error(`MCP server has no configured trusted tool reads: ${serverId}`);
+		}
+		const metadata = options.restrictedTrustedRead
+			? await supervisor.refreshMetadata(signal, TOOLS_ONLY_METADATA_REFRESH)
+			: await this.getFreshToolMetadata(supervisor, signal).catch(() => supervisor.cachedMetadata);
 		if (!metadata) {
 			return { action: "list_tools", server: supervisor.server.id, tools: [], stale: true };
 		}
-		const stale = this.isSupervisorMetadataStale(supervisor, metadata);
+		const stale = this.isSupervisorMetadataStale(supervisor, metadata, TOOL_METADATA_CATEGORIES);
 		return {
 			action: "list_tools",
 			server: supervisor.server.id,
@@ -617,7 +713,7 @@ export class McpManager {
 		const missingOrStale: string[] = [];
 		for (const supervisor of this.supervisors.values()) {
 			const metadata = supervisor.cachedMetadata;
-			if (!metadata || this.isSupervisorMetadataStale(supervisor, metadata)) {
+			if (!metadata || this.isSupervisorMetadataStale(supervisor, metadata, TOOL_METADATA_CATEGORIES)) {
 				missingOrStale.push(supervisor.server.id);
 				continue;
 			}
@@ -643,9 +739,19 @@ export class McpManager {
 		};
 	}
 
-	async describe(serverId: string, toolName: string, signal?: AbortSignal): Promise<unknown> {
+	async describe(
+		serverId: string,
+		toolName: string,
+		signal?: AbortSignal,
+		options: { restrictedTrustedRead?: boolean } = {},
+	): Promise<unknown> {
 		const supervisor = this.getSupervisor(serverId);
-		const metadata = await this.getFreshMetadata(supervisor, signal).catch(() => supervisor.cachedMetadata);
+		if (options.restrictedTrustedRead && !serverHasTrustedToolReads(supervisor.server)) {
+			throw new Error(`MCP server has no configured trusted tool reads: ${serverId}`);
+		}
+		const metadata = options.restrictedTrustedRead
+			? await supervisor.refreshMetadata(signal, TOOLS_ONLY_METADATA_REFRESH)
+			: await this.getFreshToolMetadata(supervisor, signal).catch(() => supervisor.cachedMetadata);
 		if (!metadata) {
 			return {
 				action: "describe",
@@ -664,6 +770,7 @@ export class McpManager {
 			tool: tool.name,
 			description: tool.description ?? "",
 			risk: classifyMcpToolRisk(tool),
+			trustedRead: serverTrustsToolRead(supervisor.server, tool.name) && isMcpToolTrustedReadCandidate(tool),
 			inputSchema: tool.inputSchema,
 			annotations: tool.annotations ?? {},
 			metadataHash: metadata.metadataHash,
@@ -851,12 +958,23 @@ export class McpManager {
 		const toolName = requireString(input.tool, "tool");
 		const args = parseArguments(input);
 		const supervisor = this.getSupervisor(serverId);
-		const metadata = await this.getFreshMetadata(supervisor, signal);
+		const metadata = context.restrictedTrustedRead
+			? await supervisor.refreshMetadata(signal, TOOLS_ONLY_METADATA_REFRESH)
+			: await this.getFreshToolMetadata(supervisor, signal);
 		const tool = metadata.tools.find((entry) => entry.name === toolName);
 		if (!tool || !serverMatchesToolFilters(supervisor.server, tool.name)) {
 			throw new Error(`MCP tool not available: ${serverId}.${toolName}`);
 		}
 		const risk = classifyMcpToolRisk(tool);
+		if (
+			context.restrictedTrustedRead &&
+			(!supervisor.server.enabled ||
+				!serverTrustsToolRead(supervisor.server, tool.name) ||
+				tool.annotations?.readOnlyHint !== true ||
+				risk !== "read")
+		) {
+			throw new Error(`MCP tool is not an effectively trusted read: ${serverId}.${toolName}`);
+		}
 		const callId = makeCallId();
 		const startedAt = Date.now();
 		let status: McpRecentCallStatus = "completed";
@@ -955,24 +1073,41 @@ export class McpManager {
 	private isSupervisorMetadataStale(
 		supervisor: McpServerSupervisor,
 		metadata: McpServerMetadata | undefined,
+		categories: readonly McpMetadataCategory[] = ALL_METADATA_CATEGORIES,
 	): boolean {
 		if (metadata && metadata.configHash !== hashMcpServerConfig(supervisor.server)) {
 			return true;
 		}
-		return isMetadataStale(metadata, getServerTimeoutMs(supervisor.server, this.config.settings, "refresh"));
+		return isMetadataStale(
+			metadata,
+			getServerTimeoutMs(supervisor.server, this.config.settings, "refresh"),
+			categories,
+		);
 	}
 
-	private async getFreshMetadata(supervisor: McpServerSupervisor, signal?: AbortSignal): Promise<McpServerMetadata> {
+	private async getFreshToolMetadata(
+		supervisor: McpServerSupervisor,
+		signal?: AbortSignal,
+	): Promise<McpServerMetadata> {
 		const cached = supervisor.cachedMetadata;
-		if (cached && !this.isSupervisorMetadataStale(supervisor, cached)) {
+		if (cached && !this.isSupervisorMetadataStale(supervisor, cached, TOOL_METADATA_CATEGORIES)) {
 			return cached;
 		}
-		return supervisor.refreshMetadata(signal);
+		return supervisor.refreshMetadata(signal, TOOLS_ONLY_METADATA_REFRESH);
+	}
+
+	private findSupervisor(serverId: string): McpServerSupervisor | undefined {
+		const normalized = serverId.trim().toLowerCase();
+		return this.supervisors.get(normalized) ?? this.supervisors.get(serverId);
+	}
+
+	private findServerConfig(serverId: string): McpResolvedServerConfig | undefined {
+		const normalized = serverId.trim().toLowerCase();
+		return this.config.servers[normalized] ?? this.config.servers[serverId];
 	}
 
 	private getSupervisor(serverId: string): McpServerSupervisor {
-		const normalized = serverId.trim().toLowerCase();
-		const supervisor = this.supervisors.get(normalized) ?? this.supervisors.get(serverId);
+		const supervisor = this.findSupervisor(serverId);
 		if (!supervisor) {
 			throw new Error(`MCP server not found: ${serverId}`);
 		}

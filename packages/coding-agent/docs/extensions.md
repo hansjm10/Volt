@@ -1850,17 +1850,21 @@ volt.registerTool({
 });
 ```
 
-**Signaling errors:** To mark a tool execution as failed (sets `isError: true` on the result and reports it to the LLM), throw an error from `execute`. Returning a value never sets the error flag regardless of what properties you include in the return object.
+**Signaling errors:** Throw from `execute` when a failure has no structured result. The agent catches the error, sets `isError: true`, and reports it to the LLM. When a protocol supplies useful failure content or details, return them with `isError: true`; the flag propagates through tool-result hooks, events, and the model-visible result.
 
 **Early termination:** Return `terminate: true` from `execute()` to hint that the automatic follow-up LLM call should be skipped after the current tool batch. This only takes effect when every finalized tool result in that batch is terminating. See [examples/extensions/structured-output.ts](../examples/extensions/structured-output.ts) for a minimal example where the agent ends on a final structured-output tool call.
 
 ```typescript
-// Correct: throw to signal an error
 async execute(toolCallId, params) {
-  if (!isValid(params.input)) {
-    throw new Error(`Invalid input: ${params.input}`);
+  const result = await callProtocol(params.input);
+  if (!result.ok) {
+    return {
+      content: [{ type: "text", text: result.message }],
+      details: result,
+      isError: true,
+    };
   }
-  return { content: [{ type: "text", text: "OK" }], details: {} };
+  return { content: [{ type: "text", text: "OK" }], details: result };
 }
 ```
 
@@ -2602,7 +2606,7 @@ const highlighted = highlightCode(code, lang, theme);
 
 - Extension errors are logged, agent continues
 - `tool_call` errors block the tool (fail-safe)
-- Tool `execute` errors must be signaled by throwing; the thrown error is caught, reported to the LLM with `isError: true`, and execution continues
+- Tool `execute` errors can be thrown or returned as structured results with `isError: true`; both are reported to the LLM as failures and execution continues
 
 ## Mode Behavior
 

@@ -4870,6 +4870,7 @@
 				"server",
 				"name",
 				"risk",
+				"trustedRead",
 				"metadataHash",
 				"lastSeenAt",
 				"stale",
@@ -4890,6 +4891,9 @@
 				},
 				"risk": {
 					"$ref": "#/$defs/RpcMcpRisk"
+				},
+				"trustedRead": {
+					"type": "boolean"
 				},
 				"inputSchema": {
 					"x-volt-opaque": "MCP SDK JSON schema; passed through verbatim"

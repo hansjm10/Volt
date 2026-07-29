@@ -254,7 +254,7 @@ export async function handleRpcCommand(
 
 		case "set_agent_mode": {
 			context.assertConversationGenerationCurrent();
-			const planning = session.setAgentMode(command.mode);
+			const planning = await session.setAgentMode(command.mode);
 			await session.sessionManager.flush();
 			return createRpcSuccessResponse(id, "set_agent_mode", planning);
 		}

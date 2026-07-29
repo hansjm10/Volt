@@ -427,19 +427,28 @@ agent.state.tools = [readFileTool];
 
 ### Error Handling
 
-**Throw an error** when a tool fails. Do not return error messages as content.
+Throw when a tool fails without a structured result:
 
 ```typescript
 execute: async (toolCallId, params, signal, onUpdate) => {
   if (!fs.existsSync(params.path)) {
     throw new Error(`File not found: ${params.path}`);
   }
-  // Return content only on success
-  return { content: [{ type: "text", text: "..." }] };
+  return { content: [{ type: "text", text: "..." }], details: {} };
 }
 ```
 
-Thrown errors are caught by the agent and reported to the LLM as tool errors with `isError: true`.
+Thrown errors are caught by the agent and reported to the LLM as tool errors with `isError: true`. When a protocol returns useful structured failure content or details, preserve them by returning `isError: true`:
+
+```typescript
+return {
+  content: [{ type: "text", text: protocolError.message }],
+  details: protocolError,
+  isError: true,
+};
+```
+
+The resolved result's flag initializes the error outcome seen by `afterToolCall`, `tool_execution_end`, and the persisted tool-result message. `afterToolCall` can still override it.
 
 Return `terminate: true` from `execute()` or `afterToolCall` to hint that the agent should stop after the current tool batch. This only takes effect when every finalized tool result in the batch is terminating. The hint is runtime-only; emitted `toolResult` transcript messages remain standard LLM tool results.
 

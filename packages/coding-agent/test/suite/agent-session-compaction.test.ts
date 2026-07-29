@@ -152,6 +152,44 @@ describe("AgentSession compaction characterization", () => {
 		expect(getStreamCallCount()).toBe(1);
 	});
 
+	it("appends the canonical active plan checkpoint after compaction", async () => {
+		const harness = await createHarness({ withConfiguredAuth: false });
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		await harness.session.setAgentMode("plan");
+		const draft = harness.session.updatePlan({ steps: [{ text: "Finish after compaction" }] });
+		const ready = harness.session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Compacted plan",
+			summary: "Keep canonical state across compaction.",
+		});
+		await harness.session.activatePlan(ready.id, ready.revision, {
+			id: "compaction-execution",
+			approvedRevision: ready.revision,
+			strategy: "retain_context",
+			sourceSessionId: harness.session.sessionId,
+			targetSessionId: harness.session.sessionId,
+		});
+		const active = harness.session.planningState.plan!;
+		useSummaryStreamFn(harness, "summary with active plan");
+
+		await harness.session.compact();
+
+		const checkpoints = harness.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom_message" && entry.customType === "volt-plan-checkpoint");
+		expect(checkpoints).toHaveLength(1);
+		expect(checkpoints[0]).toMatchObject({
+			content: expect.stringContaining(`Revision: ${active.revision}`),
+			display: false,
+		});
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "custom",
+			customType: "volt-plan-checkpoint",
+		});
+	});
+
 	it("auto-compacts with a custom streamFn when registry auth is absent", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);

@@ -26,6 +26,7 @@ import {
 	SubagentDefinitionConfigurationError,
 	SubagentDefinitionNotFoundError,
 	SubagentDelegationScope,
+	type SubagentDelegationScopeLimits,
 	type SubagentEndEvent,
 	SubagentManager,
 	SubagentRegistry,
@@ -48,6 +49,7 @@ interface CreateTestManagerOptions {
 	resourceLoader?: ResourceLoader;
 	allowedTools?: string[];
 	subagentContext?: SubagentRuntimeContext;
+	delegationLimits?: SubagentDelegationScopeLimits;
 	parentSessionManager?: SessionManager;
 	settings?: Partial<Settings>;
 	retainRuntimeOnDispose?: boolean;
@@ -218,6 +220,7 @@ describe("SubagentManager", () => {
 			resourceLoader: options.resourceLoader,
 			allowedTools: options.allowedTools,
 			...(options.subagentContext ? { subagentContext: options.subagentContext } : {}),
+			delegationLimits: options.delegationLimits,
 			parentSessionManager: options.parentSessionManager,
 			retainRuntimeOnDispose: options.retainRuntimeOnDispose,
 			onRuntimeCreated: options.onRuntimeCreated,
@@ -998,43 +1001,55 @@ describe("SubagentManager", () => {
 		expect(scope.snapshot()).toMatchObject({ startsUsed: 4, activeDescendants: 0 });
 	});
 
-	it("enforces tree-wide delegation ceilings by default", () => {
+	it("keeps structural safeguards finite and consumption budgets unlimited by default", () => {
+		expect(DEFAULT_SUBAGENT_DELEGATION_LIMITS).toEqual({
+			maxDepth: 5,
+			maxStarts: 100,
+			maxActiveDescendants: 16,
+			maxTurns: Number.POSITIVE_INFINITY,
+			maxTotalTokens: Number.POSITIVE_INFINITY,
+			maxTotalCostUsd: Number.POSITIVE_INFINITY,
+			maxDurationMs: Number.POSITIVE_INFINITY,
+		});
+
 		const scope = new SubagentDelegationScope();
 		cleanups.push(() => scope.dispose());
-		expect(() => scope.reserve("worker", 6)).toThrow(/depth 6 exceeds the delegation tree limit of 5/);
+		expect(scope.limits).toEqual(DEFAULT_SUBAGENT_DELEGATION_LIMITS);
+		let depthAbortCalls = 0;
+		const depthReservation = scope.reserve("active-worker", 1);
+		depthReservation.commit("sa_active-depth", () => {
+			depthAbortCalls += 1;
+		});
+		expect(() => scope.reserve("deep-worker", 6)).toThrow(/depth 6 exceeds the delegation tree limit of 5/);
+		expect(scope.signal.aborted).toBe(false);
+		expect(depthAbortCalls).toBe(0);
+		depthReservation.release();
 
-		const startLimited = new SubagentDelegationScope({ limits: { maxStarts: 2 } });
+		const startLimited = new SubagentDelegationScope({ limits: { maxStarts: 1 } });
 		cleanups.push(() => startLimited.dispose());
-		startLimited.reserve("worker", 1).release();
-		startLimited.reserve("worker", 1).release();
-		expect(() => startLimited.reserve("worker", 1)).toThrow(/limit of 2 \(maxStarts\)/);
+		let startAbortCalls = 0;
+		const startReservation = startLimited.reserve("active-worker", 1);
+		startReservation.commit("sa_active-start", () => {
+			startAbortCalls += 1;
+		});
+		expect(() => startLimited.reserve("blocked-worker", 1)).toThrow(/limit of 1 \(maxStarts\)/);
+		expect(startLimited.signal.aborted).toBe(false);
+		expect(startAbortCalls).toBe(0);
+		startReservation.release();
 
-		const activeLimited = new SubagentDelegationScope({ limits: { maxActiveDescendants: 1 } });
+		const activeLimited = new SubagentDelegationScope({
+			limits: { maxStarts: 2, maxActiveDescendants: 1 },
+		});
 		cleanups.push(() => activeLimited.dispose());
-		const activeReservation = activeLimited.reserve("worker", 1);
-		expect(() => activeLimited.reserve("worker", 1)).toThrow(/limit of 1 \(maxActiveDescendants\)/);
+		let activeAbortCalls = 0;
+		const activeReservation = activeLimited.reserve("active-worker", 1);
+		activeReservation.commit("sa_active-width", () => {
+			activeAbortCalls += 1;
+		});
+		expect(() => activeLimited.reserve("blocked-worker", 1)).toThrow(/limit of 1 \(maxActiveDescendants\)/);
+		expect(activeLimited.signal.aborted).toBe(false);
+		expect(activeAbortCalls).toBe(0);
 		activeReservation.release();
-		activeLimited.reserve("worker", 1).release();
-
-		const turnLimited = new SubagentDelegationScope({ limits: { maxTurns: 1 } });
-		cleanups.push(() => turnLimited.dispose());
-		turnLimited.recordTurn();
-		expect(turnLimited.signal.aborted).toBe(false);
-		turnLimited.recordTurn();
-		expect(turnLimited.signal.aborted).toBe(true);
-		expect(String(turnLimited.signal.reason)).toContain("maxTurns");
-
-		const tokenLimited = new SubagentDelegationScope({ limits: { maxTotalTokens: 10 } });
-		cleanups.push(() => tokenLimited.dispose());
-		tokenLimited.recordUsage(11, 0);
-		expect(tokenLimited.signal.aborted).toBe(true);
-		expect(String(tokenLimited.signal.reason)).toContain("maxTotalTokens");
-
-		const costLimited = new SubagentDelegationScope({ limits: { maxTotalCostUsd: 1 } });
-		cleanups.push(() => costLimited.dispose());
-		costLimited.recordUsage(0, 1.5);
-		expect(costLimited.signal.aborted).toBe(true);
-		expect(String(costLimited.signal.reason)).toContain("maxTotalCostUsd");
 
 		expect(() => new SubagentDelegationScope({ limits: { maxStarts: 0 } })).toThrow(
 			/maxStarts must be a positive number or Infinity/,
@@ -1043,8 +1058,8 @@ describe("SubagentManager", () => {
 			/maxStarts must be a positive number or Infinity/,
 		);
 
-		// Explicitly-undefined overrides (e.g. unset optional config passed
-		// through) must keep the default ceiling, not silently lift it.
+		// Explicitly undefined overrides preserve each category's default rather
+		// than bypassing structural safeguards or adding a consumption budget.
 		const undefinedOverrides = new SubagentDelegationScope({
 			limits: { maxTotalCostUsd: undefined, maxStarts: undefined },
 		});
@@ -1052,40 +1067,83 @@ describe("SubagentManager", () => {
 		expect(undefinedOverrides.limits).toEqual(DEFAULT_SUBAGENT_DELEGATION_LIMITS);
 	});
 
-	it("records arbitrarily large tree activity with an explicit unlimited opt-in", () => {
-		const scope = new SubagentDelegationScope({
-			limits: {
-				maxDepth: Number.POSITIVE_INFINITY,
-				maxStarts: Number.POSITIVE_INFINITY,
-				maxActiveDescendants: Number.POSITIVE_INFINITY,
-				maxTurns: Number.POSITIVE_INFINITY,
-				maxTotalTokens: Number.POSITIVE_INFINITY,
-				maxTotalCostUsd: Number.POSITIVE_INFINITY,
-			},
-		});
+	it("records large turn, token, and cost consumption without aborting a default scope", () => {
+		const scope = new SubagentDelegationScope();
 		cleanups.push(() => scope.dispose());
-		const reservations = Array.from({ length: 100 }, (_, index) => {
-			const reservation = scope.reserve(`worker-${index}`, 100 + index);
-			reservation.commit(`sa_${index}`, () => undefined);
-			return reservation;
+		let abortCalls = 0;
+		const reservation = scope.reserve("worker", 1);
+		reservation.commit("sa_default-budget", () => {
+			abortCalls += 1;
 		});
 		for (let index = 0; index < 5_000; index += 1) scope.recordTurn();
 		scope.recordUsage(200_000_000, 1_000);
 
 		expect(scope.signal.aborted).toBe(false);
+		expect(abortCalls).toBe(0);
 		expect(scope.snapshot()).toMatchObject({
-			startsUsed: 100,
-			activeDescendants: 100,
-			peakActiveDescendants: 100,
-			maxDepthReached: 199,
+			startsUsed: 1,
+			activeDescendants: 1,
+			peakActiveDescendants: 1,
+			maxDepthReached: 1,
 			turnsUsed: 5_000,
 			tokensUsed: 200_000_000,
 			costUsd: 1_000,
 			aborted: false,
 		});
 
-		for (const reservation of reservations) reservation.release();
-		expect(scope.snapshot()).toMatchObject({ startsUsed: 100, activeDescendants: 0 });
+		reservation.release();
+		expect(scope.snapshot()).toMatchObject({ startsUsed: 1, activeDescendants: 0 });
+	});
+
+	it("applies finite manager consumption overrides with field-specific abort errors", async () => {
+		const { manager } = await createTestManager({
+			delegationLimits: { maxTurns: 1, maxTotalTokens: 10, maxTotalCostUsd: 1 },
+		});
+		const cases: Array<{
+			field: "maxTurns" | "maxTotalTokens" | "maxTotalCostUsd";
+			expectedMessage: string;
+			consume(scope: SubagentDelegationScope): void;
+		}> = [
+			{
+				field: "maxTurns",
+				expectedMessage: "exceeded its 1-turn budget (maxTurns)",
+				consume: (scope) => {
+					scope.recordTurn();
+					scope.recordTurn();
+				},
+			},
+			{
+				field: "maxTotalTokens",
+				expectedMessage: "exceeded its 10-token budget (maxTotalTokens)",
+				consume: (scope) => scope.recordUsage(11, 0),
+			},
+			{
+				field: "maxTotalCostUsd",
+				expectedMessage: "exceeded its $1 cost budget (maxTotalCostUsd)",
+				consume: (scope) => scope.recordUsage(0, 1.5),
+			},
+		];
+
+		for (const [index, testCase] of cases.entries()) {
+			const lease = manager.createDelegationScope();
+			expect(lease.owned).toBe(true);
+			expect(lease.scope.limits[testCase.field]).toBe(
+				testCase.field === "maxTurns" ? 1 : testCase.field === "maxTotalTokens" ? 10 : 1,
+			);
+			let activeAbortCalls = 0;
+			const reservation = lease.scope.reserve("worker", 1);
+			reservation.commit(`sa_finite-budget-${index}`, () => {
+				activeAbortCalls += 1;
+			});
+
+			testCase.consume(lease.scope);
+
+			expect(lease.scope.signal.aborted).toBe(true);
+			expect(String(lease.scope.signal.reason)).toContain(testCase.expectedMessage);
+			expect(activeAbortCalls).toBe(1);
+			reservation.release();
+			lease.scope.dispose();
+		}
 	});
 
 	it("atomically holds and recycles batch start and active permits", () => {

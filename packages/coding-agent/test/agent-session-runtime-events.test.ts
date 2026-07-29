@@ -264,11 +264,11 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 	it("starts one revision-fenced retained-context plan execution", async () => {
 		const { runtimeHost } = await createRuntimeHost(() => {});
-		runtimeHost.session.setAgentMode("plan");
+		await runtimeHost.session.setAgentMode("plan");
 		const draft = runtimeHost.session.updatePlan({
 			title: "Retain context",
 			summary: "Execute in the current session.",
-			steps: [{ text: "Implement the change", status: "pending" }],
+			steps: [{ text: "Implement the change" }],
 		});
 		const ready = runtimeHost.session.submitPlan({
 			planId: draft.id,
@@ -289,6 +289,12 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			.getBranch()
 			.filter((entry) => entry.type === "custom_message" && entry.customType === "volt-plan-execution");
 		expect(executionEntries).toHaveLength(1);
+		expect(executionEntries[0]).toMatchObject({
+			content: expect.stringContaining(`Revision: ${started.planning.plan!.revision}`),
+		});
+		expect(executionEntries[0]).toMatchObject({
+			content: expect.stringContaining(`(id: ${started.planning.plan!.steps[0]!.id})`),
+		});
 
 		const retry = await runtimeHost.executePlan(ready.id, ready.revision, "retain_context");
 		expect(retry.started).toBe(false);
@@ -307,11 +313,11 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const sourceSessionFile = runtimeHost.session.sessionFile;
 		expect(sourceSessionFile).toBeDefined();
 
-		runtimeHost.session.setAgentMode("plan");
+		await runtimeHost.session.setAgentMode("plan");
 		const draft = runtimeHost.session.updatePlan({
 			title: "Clear context",
 			summary: "Execute from only the approved plan.",
-			steps: [{ text: "Implement the isolated change", status: "pending" }],
+			steps: [{ text: "Implement the isolated change" }],
 		});
 		const ready = runtimeHost.session.submitPlan({
 			planId: draft.id,
@@ -358,9 +364,16 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 					entry.message.content === "Source-only conversation",
 			),
 		).toBe(false);
-		expect(
-			childBranch.filter((entry) => entry.type === "custom_message" && entry.customType === "volt-plan-execution"),
-		).toHaveLength(1);
+		const childExecutionEntries = childBranch.filter(
+			(entry) => entry.type === "custom_message" && entry.customType === "volt-plan-execution",
+		);
+		expect(childExecutionEntries).toHaveLength(1);
+		expect(childExecutionEntries[0]).toMatchObject({
+			content: expect.stringContaining(`Revision: ${started.planning.plan!.revision}`),
+		});
+		expect(childExecutionEntries[0]).toMatchObject({
+			content: expect.stringContaining(`(id: ${started.planning.plan!.steps[0]!.id})`),
+		});
 
 		const retry = await runtimeHost.executePlan(ready.id, ready.revision, "new_session");
 		expect(retry).toMatchObject({ selectedSessionId: started.selectedSessionId, started: false });

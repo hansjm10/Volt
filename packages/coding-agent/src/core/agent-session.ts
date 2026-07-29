@@ -100,15 +100,27 @@ import type { McpManagerEvent } from "./mcp/types.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
 import {
+	authorizeToolOperation,
+	getTrustedToolOperationResolver,
+	isToolVisibleUnderGrant,
+	type OperationResolution,
+	operationProvidesResearchEvidence,
+	RESEARCH_OPERATION_GRANT_PROFILE,
+	resolverCanProvideResearchEvidence,
+	type ToolOperationResolver,
+} from "./operation-authorization.ts";
+import {
 	type AgentMode,
-	assertPlanningStateWithinBounds,
 	assertPlanRevision,
 	clonePlanningState,
-	formatPlanForAgent,
+	formatPlanCheckpoint,
+	formatPlanPolicy,
+	PLAN_CHECKPOINT_CUSTOM_TYPE,
 	type PlanExecution,
 	type PlanningState,
 	type PlanState,
 	type PlanStepStatus,
+	parsePlanningState,
 } from "./planning.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
@@ -145,12 +157,7 @@ import {
 	type SubagentToolManager,
 	type SubagentToolMode,
 } from "./tools/index.ts";
-import {
-	canonicalizePlanSteps,
-	createPlanningToolDefinitions,
-	NATIVE_PLAN_TOOL_NAMES,
-	PLAN_MODE_READ_ONLY_TOOL_NAMES,
-} from "./tools/planning.ts";
+import { canonicalizePlanSteps, createPlanningToolDefinitions, NATIVE_PLAN_TOOL_NAMES } from "./tools/planning.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 
 // ============================================================================
@@ -556,8 +563,13 @@ export class AgentSession {
 	private _modelRegistry: ModelRegistry;
 	private _fastModeEnabled = false;
 	private _planningState: PlanningState;
+	private _planningTransitionQueue: Promise<void> = Promise.resolve();
+	private _planningTransitionInFlight = false;
 	private _requestedBuildToolNames: string[] = [];
 	private _planningRuntimeInitialized = false;
+	private _planResearchObserved = false;
+	private _trustedHostToolNames: Set<string> = new Set();
+	private _authorizedOperationResolutions: Map<string, OperationResolution> = new Map();
 
 	// LSP diagnostics manager (created unless lsp.enabled is false)
 	private _lspManager?: LspManager;
@@ -567,6 +579,7 @@ export class AgentSession {
 	private _mcpManager?: McpManager;
 	private _mcpManagerFactory?: () => Promise<McpManager | undefined> | McpManager | undefined;
 	private _unsubscribeMcpManager?: () => void;
+	private _directMcpToolNames: Set<string> = new Set();
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -708,31 +721,74 @@ export class AgentSession {
 					block: true,
 					reason:
 						this._planningState.mode === "plan"
-							? `Plan mode policy blocked ${toolCall.name}. Only read-only exploration and native plan tools are available.`
+							? `The active research capability profile does not expose ${toolCall.name}.`
 							: `Tool ${toolCall.name} is no longer active for this session.`,
 				};
 			}
+
 			const runner = this._extensionRunner;
-			if (!runner.hasHandlers("tool_call")) {
-				return undefined;
+			let extensionDecision: { block?: boolean; reason?: string } | undefined;
+			if (runner.hasHandlers("tool_call")) {
+				try {
+					extensionDecision = await runner.emitToolCall({
+						type: "tool_call",
+						toolName: toolCall.name,
+						toolCallId: toolCall.id,
+						input: args as Record<string, unknown>,
+					});
+				} catch (err) {
+					if (err instanceof Error) {
+						throw err;
+					}
+					throw new Error(`Extension failed, blocking execution: ${String(err)}`);
+				}
+				if (extensionDecision?.block) {
+					return extensionDecision;
+				}
 			}
 
-			try {
-				return await runner.emitToolCall({
-					type: "tool_call",
-					toolName: toolCall.name,
-					toolCallId: toolCall.id,
-					input: args as Record<string, unknown>,
-				});
-			} catch (err) {
-				if (err instanceof Error) {
-					throw err;
+			if (this._planningState.mode === "plan") {
+				const decision = authorizeToolOperation(
+					this._getTrustedOperationResolver(toolCall.name),
+					args,
+					RESEARCH_OPERATION_GRANT_PROFILE,
+				);
+				if (!decision.allowed) {
+					return {
+						block: true,
+						reason: `The research capability profile blocked ${toolCall.name}: ${decision.reason ?? "operation denied"}.`,
+					};
 				}
-				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
+				if (toolCall.name === "submit_plan" && !this._planResearchObserved) {
+					const researchToolAvailable = Array.from(this._toolRegistry.keys()).some((name) =>
+						resolverCanProvideResearchEvidence(
+							this._getTrustedOperationResolver(name),
+							RESEARCH_OPERATION_GRANT_PROFILE,
+						),
+					);
+					return {
+						block: true,
+						reason: researchToolAvailable
+							? "Plan mode requires at least one successful read operation before submitting a plan."
+							: "Plan mode requires research evidence before submitting, but this session exposes no research-capable tools, so submit_plan cannot succeed. Tell the user their host configuration disables every builtin read tool.",
+					};
+				}
+				this._authorizedOperationResolutions.set(toolCall.id, decision.resolution);
 			}
+			return extensionDecision;
 		};
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+			const resolution = this._authorizedOperationResolutions.get(toolCall.id);
+			this._authorizedOperationResolutions.delete(toolCall.id);
+			if (
+				!isError &&
+				this._planningState.mode === "plan" &&
+				resolution !== undefined &&
+				operationProvidesResearchEvidence(resolution)
+			) {
+				this._planResearchObserved = true;
+			}
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_result")) {
 				return undefined;
@@ -886,6 +942,9 @@ export class AgentSession {
 			// rebase may now proceed while post-run extension/compaction work winds
 			// down; the captured run generation fences those continuations.
 			this._agentConversationMutationInFlight = false;
+			// Aborted tool calls can skip afterToolCall, leaving their plan-mode
+			// authorization records behind; no record outlives its run.
+			this._authorizedOperationResolutions.clear();
 		}
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
@@ -1648,23 +1707,6 @@ export class AgentSession {
 		return this.sessionManager.flush();
 	}
 
-	decorateProviderMessages(messages: AgentMessage[]): AgentMessage[] {
-		const instructions = formatPlanForAgent(this._planningState);
-		if (!instructions) {
-			return messages;
-		}
-		return [
-			...messages,
-			{
-				role: "custom",
-				customType: "volt-planning-state",
-				content: instructions,
-				display: false,
-				timestamp: Date.now(),
-			},
-		];
-	}
-
 	/** Whether the session is processing a response or a session-level continuation. */
 	get isStreaming(): boolean {
 		return this.agent.state.isStreaming || this._activePromptRuns.size > 0;
@@ -1756,18 +1798,19 @@ export class AgentSession {
 		return this._toolDefinitions.get(name)?.definition;
 	}
 
+	private _getTrustedOperationResolver(name: string): ToolOperationResolver | undefined {
+		const source = this._toolDefinitions.get(name)?.sourceInfo;
+		if (source?.source !== "builtin" || !this._trustedHostToolNames.has(name)) {
+			return undefined;
+		}
+		return getTrustedToolOperationResolver(name, {
+			...(this._mcpManager ? { integrationReadAuthority: this._mcpManager } : {}),
+		});
+	}
+
 	private _isToolVisibleToCurrentMode(name: string): boolean {
-		if (this._planningState.mode === "plan") {
+		if (this._planningState.mode === "plan" || NATIVE_PLAN_TOOL_NAMES.has(name)) {
 			return this.getActiveToolNames().includes(name);
-		}
-		if (NATIVE_PLAN_TOOL_NAMES.has(name)) {
-			return this.getActiveToolNames().includes(name);
-		}
-		if (PLAN_MODE_READ_ONLY_TOOL_NAMES.includes(name as (typeof PLAN_MODE_READ_ONLY_TOOL_NAMES)[number])) {
-			return (
-				(this._allowedToolNames === undefined || this._allowedToolNames.has(name)) &&
-				!this._excludedToolNames?.has(name)
-			);
 		}
 		return true;
 	}
@@ -1808,42 +1851,191 @@ export class AgentSession {
 		if (!this._planningRuntimeInitialized) {
 			return;
 		}
-		const effective =
-			this._planningState.mode === "plan"
-				? [...PLAN_MODE_READ_ONLY_TOOL_NAMES, "update_plan", "submit_plan"]
-				: this._planningState.plan?.phase === "active"
-					? [...this._requestedBuildToolNames, "update_plan"]
-					: [...this._requestedBuildToolNames];
-		this._setEffectiveToolsByName([...new Set(effective)]);
+		const effective = [
+			...new Set(
+				this._planningState.mode === "plan"
+					? Array.from(this._toolRegistry.keys()).filter((name) =>
+							isToolVisibleUnderGrant(this._getTrustedOperationResolver(name), RESEARCH_OPERATION_GRANT_PROFILE),
+						)
+					: this._planningState.plan?.phase === "active"
+						? [...this._requestedBuildToolNames, "update_plan_progress", "request_replan"]
+						: [...this._requestedBuildToolNames],
+			),
+		];
+		const availableEffective = effective.filter((name) => this._toolRegistry.has(name));
+		const active = this.getActiveToolNames();
+		if (
+			active.length !== availableEffective.length ||
+			active.some((name, index) => name !== availableEffective[index])
+		) {
+			this._setEffectiveToolsByName(effective);
+		}
 		this._applyTrustedPlanningInstructionsToSystemPrompt();
 	}
 
+	private async _prepareUnrestrictedMcpForBuild(): Promise<void> {
+		if (!this._mcpManager) {
+			return;
+		}
+		await this._mcpManager.startEagerServers();
+		const previousDirectToolNames = this._directMcpToolNames;
+		const directDefinitions = createMcpDirectToolDefinitions(this._mcpManager);
+		for (const name of previousDirectToolNames) {
+			this._baseToolDefinitions.delete(name);
+		}
+		for (const definition of directDefinitions) {
+			this._baseToolDefinitions.set(definition.name, definition as ToolDefinition);
+		}
+		this._directMcpToolNames = new Set(directDefinitions.map((definition) => definition.name));
+
+		const previouslyRequestedDirectTools = new Set(
+			this._requestedBuildToolNames.filter((name) => previousDirectToolNames.has(name)),
+		);
+		const requestedBuildTools = this._requestedBuildToolNames.filter((name) => !previousDirectToolNames.has(name));
+		for (const definition of directDefinitions) {
+			const wasPreviouslyAvailable = previousDirectToolNames.has(definition.name);
+			if (
+				wasPreviouslyAvailable
+					? previouslyRequestedDirectTools.has(definition.name)
+					: (this._allowedToolNames === undefined || this._allowedToolNames.has(definition.name)) &&
+						!this._excludedToolNames?.has(definition.name)
+			) {
+				requestedBuildTools.push(definition.name);
+			}
+		}
+		const requestedBuildToolNames = [...new Set(requestedBuildTools)];
+		this._refreshToolRegistry({ activeToolNames: requestedBuildToolNames });
+		this.setActiveToolsByName(requestedBuildToolNames.filter((name) => this._toolRegistry.has(name)));
+	}
+
 	private _applyTrustedPlanningInstructionsToSystemPrompt(systemPrompt = this._baseSystemPrompt): void {
-		const instructions = formatPlanForAgent(this._planningState);
-		this.agent.state.systemPrompt = instructions
-			? [systemPrompt, instructions].filter(Boolean).join("\n\n")
-			: systemPrompt;
+		const policy = formatPlanPolicy(this._planningState.mode, this._planningState.plan?.phase);
+		const next = policy ? [systemPrompt, policy].filter(Boolean).join("\n\n") : systemPrompt;
+		if (this.agent.state.systemPrompt !== next) {
+			this.agent.state.systemPrompt = next;
+		}
+	}
+
+	private _planningStateNeedsCheckpoint(state: PlanningState): boolean {
+		return state.plan !== null && (state.mode === "plan" || state.plan.phase === "active");
+	}
+
+	private _appendPlanningCheckpointEntry(state: PlanningState): boolean {
+		if (!this._planningStateNeedsCheckpoint(state)) return false;
+		const content = formatPlanCheckpoint(state);
+		if (!content) return false;
+		this.sessionManager.appendCustomMessageEntry(PLAN_CHECKPOINT_CUSTOM_TYPE, content, false, undefined);
+		return true;
+	}
+
+	private _deliverPlanningCheckpoint(state: PlanningState): void {
+		if (!this._planningStateNeedsCheckpoint(state)) return;
+		const content = formatPlanCheckpoint(state);
+		if (!content) return;
+		const message = {
+			role: "custom" as const,
+			customType: PLAN_CHECKPOINT_CUSTOM_TYPE,
+			content,
+			display: false,
+			details: undefined,
+			timestamp: Date.now(),
+		} satisfies CustomMessage;
+		if (this.isStreaming) {
+			this.agent.steer(message);
+			return;
+		}
+		this.agent.state.messages.push(message);
+		this.sessionManager.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display,
+			message.details,
+		);
+		this._emit({ type: "message_start", message });
+		this._emit({ type: "message_end", message });
 	}
 
 	private _commitPlanningState(next: PlanningState): PlanningState {
-		assertPlanningStateWithinBounds(next);
-		this.sessionManager.appendPlanningState(next);
-		this._planningState = clonePlanningState(next);
+		const parsed = parsePlanningState(next);
+		this.sessionManager.appendPlanningState(parsed);
+		this._planningState = clonePlanningState(parsed);
 		this._syncPlanningRuntime();
 		const snapshot = clonePlanningState(this._planningState);
 		this._emit({ type: "planning_state_changed", planning: snapshot });
 		return snapshot;
 	}
 
-	setAgentMode(mode: AgentMode): PlanningState {
+	private _draftFromExecutedPlan(plan: PlanState): PlanState {
+		return {
+			id: plan.id,
+			revision: plan.revision + 1,
+			phase: "draft",
+			...(plan.title ? { title: plan.title } : {}),
+			...(plan.summary ? { summary: plan.summary } : {}),
+			steps: plan.steps.map((step) => ({ ...step })),
+		};
+	}
+
+	/**
+	 * Queued transitions may suspend at an await (MCP restoration) while the
+	 * event loop keeps running, so they must re-validate planning state after
+	 * every await before committing, and the synchronous mutators refuse to
+	 * commit while a queued transition is suspended mid-flight.
+	 */
+	private _enqueuePlanningTransition<T>(transition: () => Promise<T>): Promise<T> {
+		const result = this._planningTransitionQueue.then(async () => {
+			this._planningTransitionInFlight = true;
+			try {
+				return await transition();
+			} finally {
+				this._planningTransitionInFlight = false;
+			}
+		});
+		this._planningTransitionQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
+	private _assertNoPlanningTransitionInFlight(action: string): void {
+		if (this._planningTransitionInFlight) {
+			throw new Error(`${action} is unavailable while a planning transition is in progress; retry once it settles`);
+		}
+	}
+
+	setAgentMode(mode: AgentMode): Promise<PlanningState> {
+		return this._enqueuePlanningTransition(() => this._setAgentMode(mode));
+	}
+
+	private async _setAgentMode(mode: AgentMode): Promise<PlanningState> {
+		if (mode === "build" && this._planningState.mode === "plan") {
+			await this._prepareUnrestrictedMcpForBuild();
+		}
 		if (mode === this._planningState.mode) {
 			return this.planningState;
 		}
-		return this._commitPlanningState({ ...clonePlanningState(this._planningState), mode });
+		const plan = this._planningState.plan;
+		if (mode === "plan") {
+			this._planResearchObserved = false;
+		}
+		if (mode === "plan" && plan?.phase === "active") {
+			const next = this._commitPlanningState({ mode, plan: this._draftFromExecutedPlan(plan) });
+			this._deliverPlanningCheckpoint(next);
+			return next;
+		}
+		if (mode === "plan" && (plan?.phase === "completed" || plan?.phase === "handed_off")) {
+			return this._commitPlanningState({ mode, plan: null });
+		}
+		const next = this._commitPlanningState({ ...clonePlanningState(this._planningState), mode });
+		if (mode === "plan" && next.plan?.phase === "draft") {
+			this._deliverPlanningCheckpoint(next);
+		}
+		return next;
 	}
 
-	toggleAgentMode(): PlanningState {
-		return this.setAgentMode(this.agentMode === "plan" ? "build" : "plan");
+	toggleAgentMode(): Promise<PlanningState> {
+		return this._enqueuePlanningTransition(() => this._setAgentMode(this.agentMode === "plan" ? "build" : "plan"));
 	}
 
 	updatePlan(input: {
@@ -1851,10 +2043,11 @@ export class AgentSession {
 		expectedRevision?: number;
 		title?: string;
 		summary?: string;
-		steps: Array<{ id?: string; text: string; status?: PlanStepStatus; note?: string }>;
+		steps: Array<{ id?: string; text: string }>;
 	}): PlanState {
-		if (this._planningState.mode !== "plan" && this._planningState.plan?.phase !== "active") {
-			throw new Error("update_plan is available only in Plan mode or during approved plan execution");
+		this._assertNoPlanningTransitionInFlight("update_plan");
+		if (this._planningState.mode !== "plan") {
+			throw new Error("update_plan is available only in Plan mode");
 		}
 		if (input.steps.length > 64) {
 			throw new Error("Plans may contain at most 64 steps");
@@ -1866,6 +2059,9 @@ export class AgentSession {
 		}
 		const previous = this._planningState.plan;
 		if (previous) {
+			if (previous.phase !== "draft") {
+				throw new Error("Only a draft plan can be updated");
+			}
 			if (input.planId === undefined || input.expectedRevision === undefined) {
 				throw new Error("Updating an existing plan requires planId and expectedRevision");
 			}
@@ -1873,31 +2069,120 @@ export class AgentSession {
 		} else if (input.planId !== undefined || input.expectedRevision !== undefined) {
 			throw new Error("A new plan must not provide planId or expectedRevision");
 		}
+		const title = input.title?.trim() || previous?.title;
+		const summary = input.summary?.trim() || previous?.summary;
 		const steps = canonicalizePlanSteps(input.steps, previous ?? undefined);
-		const phase =
-			previous?.phase === "active" || previous?.phase === "completed"
-				? steps.length > 0 && steps.every((step) => step.status === "completed")
-					? "completed"
-					: "active"
-				: "draft";
+		if (
+			previous &&
+			previous.title === title &&
+			previous.summary === summary &&
+			previous.steps.length === steps.length &&
+			// Ids are deliberately ignored: identical text/status/note in the same
+			// order is the same checklist, and rejecting it keeps a resend without
+			// canonical ids from churning step ids and burning a revision.
+			previous.steps.every((step, index) => {
+				const next = steps[index];
+				return (
+					next !== undefined && step.text === next.text && step.status === next.status && step.note === next.note
+				);
+			})
+		) {
+			throw new Error("Plan update made no changes; continue research or submit the current draft");
+		}
 		const plan: PlanState = {
 			id: previous?.id ?? randomUUID(),
 			revision: (previous?.revision ?? 0) + 1,
-			phase,
-			...(input.title?.trim() || previous?.title ? { title: input.title?.trim() || previous?.title } : {}),
-			...(input.summary?.trim() || previous?.summary ? { summary: input.summary?.trim() || previous?.summary } : {}),
+			phase: "draft",
+			...(title ? { title } : {}),
+			...(summary ? { summary } : {}),
 			steps,
-			...(previous?.execution ? { execution: { ...previous.execution } } : {}),
 		};
-		this._commitPlanningState({ mode: this._planningState.mode, plan });
+		this._commitPlanningState({ mode: "plan", plan });
 		return { ...plan, steps: plan.steps.map((step) => ({ ...step })) };
 	}
 
+	updatePlanProgress(input: {
+		planId: string;
+		expectedRevision: number;
+		updates: Array<{ id: string; status: PlanStepStatus; note?: string }>;
+	}): PlanState {
+		this._assertNoPlanningTransitionInFlight("update_plan_progress");
+		if (this._planningState.mode !== "build" || this._planningState.plan?.phase !== "active") {
+			throw new Error("update_plan_progress is available only during approved plan execution");
+		}
+		assertPlanRevision(this._planningState, input.planId, input.expectedRevision);
+		if (input.updates.length === 0) {
+			throw new Error("At least one plan progress update is required");
+		}
+		const updates = new Map<string, { status: PlanStepStatus; note?: string }>();
+		const knownIds = new Set(this._planningState.plan.steps.map((step) => step.id));
+		for (const update of input.updates) {
+			const id = update.id.trim();
+			if (!id || !knownIds.has(id)) {
+				throw new Error(`Plan progress references an unknown step id: ${update.id}`);
+			}
+			if (updates.has(id)) {
+				throw new Error(`Plan progress duplicates step id: ${id}`);
+			}
+			updates.set(id, {
+				status: update.status,
+				...(update.note === undefined ? {} : { note: update.note }),
+			});
+		}
+		const steps = this._planningState.plan.steps.map((step) => {
+			const update = updates.get(step.id);
+			if (!update) return { ...step };
+			const note = update.note === undefined ? step.note : update.note.trim() || undefined;
+			return {
+				id: step.id,
+				text: step.text,
+				status: update.status,
+				...(note ? { note } : {}),
+			};
+		});
+		if (
+			this._planningState.plan.steps.every((step, index) => {
+				const next = steps[index];
+				return next !== undefined && step.status === next.status && step.note === next.note;
+			})
+		) {
+			throw new Error("Plan progress update made no changes");
+		}
+		const plan: PlanState = {
+			...this._planningState.plan,
+			revision: this._planningState.plan.revision + 1,
+			phase: steps.every((step) => step.status === "completed") ? "completed" : "active",
+			steps,
+		};
+		this._commitPlanningState({ mode: "build", plan });
+		return { ...plan, steps: plan.steps.map((step) => ({ ...step })) };
+	}
+
+	requestReplan(input: { planId: string; expectedRevision: number; reason: string }): PlanningState {
+		this._assertNoPlanningTransitionInFlight("request_replan");
+		if (this._planningState.mode !== "build" || this._planningState.plan?.phase !== "active") {
+			throw new Error("request_replan is available only during approved plan execution");
+		}
+		assertPlanRevision(this._planningState, input.planId, input.expectedRevision);
+		if (!input.reason.trim()) {
+			throw new Error("request_replan requires implementation evidence");
+		}
+		this._planResearchObserved = false;
+		return this._commitPlanningState({
+			mode: "plan",
+			plan: this._draftFromExecutedPlan(this._planningState.plan),
+		});
+	}
+
 	submitPlan(input: { planId: string; expectedRevision: number; title: string; summary: string }): PlanState {
+		this._assertNoPlanningTransitionInFlight("submit_plan");
 		if (this._planningState.mode !== "plan") {
 			throw new Error("submit_plan is available only in Plan mode");
 		}
 		assertPlanRevision(this._planningState, input.planId, input.expectedRevision);
+		if (this._planningState.plan.phase !== "draft") {
+			throw new Error("Only a draft plan can be submitted");
+		}
 		if (this._planningState.plan.steps.length === 0) {
 			throw new Error("A plan must contain at least one checklist step");
 		}
@@ -1916,11 +2201,13 @@ export class AgentSession {
 	}
 
 	changePlan(planId: string, expectedRevision: number): PlanningState {
+		this._assertNoPlanningTransitionInFlight("changePlan");
 		assertPlanRevision(this._planningState, planId, expectedRevision);
 		if (this._planningState.plan.phase !== "ready") {
 			throw new Error("Only a ready plan can be changed");
 		}
-		return this._commitPlanningState({
+		this._planResearchObserved = false;
+		const next = this._commitPlanningState({
 			mode: "plan",
 			plan: {
 				...this._planningState.plan,
@@ -1928,10 +2215,14 @@ export class AgentSession {
 				phase: "draft",
 			},
 		});
+		this._deliverPlanningCheckpoint(next);
+		return next;
 	}
 
 	discardPlan(planId: string, expectedRevision: number): PlanningState {
+		this._assertNoPlanningTransitionInFlight("discardPlan");
 		assertPlanRevision(this._planningState, planId, expectedRevision);
+		this._planResearchObserved = false;
 		return this._commitPlanningState({ mode: this._planningState.mode, plan: null });
 	}
 
@@ -1939,8 +2230,31 @@ export class AgentSession {
 		planId: string,
 		expectedRevision: number,
 		execution: PlanExecution,
-	): { planning: PlanningState; activated: boolean } {
-		const currentPlan = this._planningState.plan;
+	): Promise<{ planning: PlanningState; activated: boolean }> {
+		return this._enqueuePlanningTransition(() => this._activatePlan(planId, expectedRevision, execution));
+	}
+
+	private async _activatePlan(
+		planId: string,
+		expectedRevision: number,
+		execution: PlanExecution,
+	): Promise<{ planning: PlanningState; activated: boolean }> {
+		let currentPlan = this._planningState.plan;
+		if (
+			currentPlan?.id === planId &&
+			currentPlan.execution?.approvedRevision === expectedRevision &&
+			currentPlan.execution.strategy === execution.strategy
+		) {
+			return { planning: this.planningState, activated: false };
+		}
+		assertPlanRevision(this._planningState, planId, expectedRevision);
+		if (this._planningState.plan.phase !== "ready") {
+			throw new Error("Only a ready plan can be executed");
+		}
+		if (this._planningState.mode === "plan") {
+			await this._prepareUnrestrictedMcpForBuild();
+		}
+		currentPlan = this._planningState.plan;
 		if (
 			currentPlan?.id === planId &&
 			currentPlan.execution?.approvedRevision === expectedRevision &&
@@ -1966,8 +2280,26 @@ export class AgentSession {
 		};
 	}
 
-	markPlanHandedOff(planId: string, expectedRevision: number, execution: PlanExecution): PlanningState {
+	markPlanHandedOff(planId: string, expectedRevision: number, execution: PlanExecution): Promise<PlanningState> {
+		return this._enqueuePlanningTransition(() => this._markPlanHandedOff(planId, expectedRevision, execution));
+	}
+
+	private async _markPlanHandedOff(
+		planId: string,
+		expectedRevision: number,
+		execution: PlanExecution,
+	): Promise<PlanningState> {
 		assertPlanRevision(this._planningState, planId, expectedRevision);
+		if (this._planningState.plan.phase !== "ready") {
+			throw new Error("Only a ready plan can be handed off");
+		}
+		if (this._planningState.mode === "plan") {
+			await this._prepareUnrestrictedMcpForBuild();
+			assertPlanRevision(this._planningState, planId, expectedRevision);
+			if (this._planningState.plan.phase !== "ready") {
+				throw new Error("Only a ready plan can be handed off");
+			}
+		}
 		return this._commitPlanningState({
 			mode: "build",
 			plan: {
@@ -3791,13 +4123,21 @@ export class AgentSession {
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<CompactionResult> {
 		assertConversationGenerationCurrent?.();
+		if (this._appendPlanningCheckpointEntry(this._planningState)) {
+			await this.sessionManager.flush();
+		}
 		const newEntries = this.sessionManager.getEntries();
 		const sessionContext = this.sessionManager.buildSessionContext();
 		let messages = sessionContext.messages;
 		if (dropTrailingErrorMessage) {
-			const lastMsg = messages[messages.length - 1];
-			if (lastMsg?.role === "assistant" && (lastMsg as AssistantMessage).stopReason === "error") {
-				messages = messages.slice(0, -1);
+			const lastIndex =
+				messages.at(-1)?.role === "custom" &&
+				(messages.at(-1) as CustomMessage).customType === PLAN_CHECKPOINT_CUSTOM_TYPE
+					? messages.length - 2
+					: messages.length - 1;
+			const candidate = messages[lastIndex];
+			if (candidate?.role === "assistant" && (candidate as AssistantMessage).stopReason === "error") {
+				messages = [...messages.slice(0, lastIndex), ...messages.slice(lastIndex + 1)];
 			}
 		}
 		this.agent.state.messages = messages;
@@ -4801,6 +5141,7 @@ export class AgentSession {
 		}
 
 		const directMcpToolDefinitions = this._mcpManager ? createMcpDirectToolDefinitions(this._mcpManager) : [];
+		this._directMcpToolNames = new Set(directMcpToolDefinitions.map((definition) => definition.name));
 		const isSubagentRuntime = this._subagentToolManager?.isSubagentRuntime?.() === true;
 		const subagentToolManager =
 			this._subagentToolManager &&
@@ -4885,14 +5226,23 @@ export class AgentSession {
 								},
 							}
 						: {}),
-					...(this._mcpManager ? { mcp: { manager: this._mcpManager } } : {}),
+					...(this._mcpManager
+						? {
+								mcp: {
+									manager: this._mcpManager,
+									isRestrictedTrustedRead: () => this._planningState.mode === "plan",
+								},
+							}
+						: {}),
 				});
 
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
 		);
+		this._trustedHostToolNames = new Set(this._baseToolsOverride ? [] : Object.keys(baseToolDefinitions));
 		for (const definition of createPlanningToolDefinitions(this)) {
 			this._baseToolDefinitions.set(definition.name, definition as ToolDefinition);
+			this._trustedHostToolNames.add(definition.name);
 		}
 		for (const definition of directMcpToolDefinitions) {
 			this._baseToolDefinitions.set(definition.name, definition as ToolDefinition);

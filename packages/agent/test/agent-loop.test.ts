@@ -307,6 +307,76 @@ describe("agentLoop with AgentMessage", () => {
 		}
 	});
 
+	it("should propagate structured failures returned by tools", async () => {
+		const toolSchema = Type.Object({});
+		const tool: AgentTool<typeof toolSchema, { code: string }> = {
+			name: "protocol_call",
+			label: "Protocol call",
+			description: "Return a structured protocol failure",
+			parameters: toolSchema,
+			async execute() {
+				return {
+					content: [{ type: "text", text: "server rejected the request" }],
+					details: { code: "rejected" },
+					isError: true,
+				};
+			},
+		};
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+		let hookOutcome: { isError: boolean; details: unknown } | undefined;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			afterToolCall: async ({ result, isError }) => {
+				hookOutcome = { isError, details: result.details };
+				return undefined;
+			},
+		};
+		let callIndex = 0;
+		const stream = agentLoop([createUserMessage("call the protocol")], context, config, undefined, () => {
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex === 0
+						? createAssistantMessage(
+								[{ type: "toolCall", id: "tool-error", name: "protocol_call", arguments: {} }],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				mockStream.push({ type: "done", seq: 1, reason: callIndex === 0 ? "toolUse" : "stop", message });
+				callIndex += 1;
+			});
+			return mockStream;
+		});
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const messages = await stream.result();
+
+		expect(hookOutcome).toEqual({ isError: true, details: { code: "rejected" } });
+		expect(events.find((event) => event.type === "tool_execution_end")).toMatchObject({
+			type: "tool_execution_end",
+			isError: true,
+			result: {
+				content: [{ type: "text", text: "server rejected the request" }],
+				details: { code: "rejected" },
+				isError: true,
+			},
+		});
+		expect(messages.find((message) => message.role === "toolResult")).toMatchObject({
+			role: "toolResult",
+			isError: true,
+			content: [{ type: "text", text: "server rejected the request" }],
+			details: { code: "rejected" },
+		});
+	});
+
 	it("should execute mutated beforeToolCall args without revalidation", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		const executed: Array<string | number> = [];

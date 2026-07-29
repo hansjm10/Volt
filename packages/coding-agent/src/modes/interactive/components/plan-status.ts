@@ -2,39 +2,15 @@ import { type Component, getKeybindings, truncateToWidth, visibleWidth } from "@
 import type { PlanningState, PlanState } from "../../../core/planning.ts";
 import { theme } from "../../../core/theme/runtime.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
-import { keyHint, rawKeyHint } from "./keybinding-hints.ts";
-
-function asciiOnly(): boolean {
-	const termProgram = process.env.TERM_PROGRAM ?? "";
-	return process.env.VOLT_ASCII === "1" || process.env.TERM === "linux" || termProgram === "";
-}
-
-function phaseLabel(plan: PlanState): string {
-	switch (plan.phase) {
-		case "ready":
-			return "READY";
-		case "active":
-			return "EXECUTING";
-		case "completed":
-			return "COMPLETE";
-		case "handed_off":
-			return "HANDED OFF";
-		default:
-			return "DRAFT";
-	}
-}
-
-function progress(plan: PlanState): { completed: number; total: number; percent: number } {
-	const total = plan.steps.length;
-	const completed = plan.steps.filter((step) => step.status === "completed").length;
-	return { completed, total, percent: total === 0 ? 0 : Math.round((completed / total) * 100) };
-}
-
-function currentStep(plan: PlanState): string | undefined {
-	return (
-		plan.steps.find((step) => step.status === "in_progress") ?? plan.steps.find((step) => step.status === "pending")
-	)?.text;
-}
+import { keyHint, keyText, rawKeyHint } from "./keybinding-hints.ts";
+import {
+	appendWrappedPlanLine,
+	getCurrentPlanStep,
+	getPlanProgress,
+	planPhaseLabel,
+	renderPlanContentLines,
+	usesAsciiPlanMarkers,
+} from "./plan-content.ts";
 
 /** Bounded one/two-line branch-local plan summary kept directly above the editor. */
 export class PlanStatusComponent implements Component {
@@ -57,7 +33,7 @@ export class PlanStatusComponent implements Component {
 		const plan = this.planning.plan;
 		if (!plan && this.planning.mode === "build") return [];
 
-		const mark = asciiOnly() ? "PLAN" : "◆ PLAN";
+		const mark = usesAsciiPlanMarkers() ? "PLAN" : "◆ PLAN";
 		if (!plan) {
 			return [
 				truncateToWidth(
@@ -67,14 +43,16 @@ export class PlanStatusComponent implements Component {
 			];
 		}
 
-		const { completed, total, percent } = progress(plan);
-		const left = theme.bold(theme.fg(plan.phase === "ready" ? "warning" : "accent", `${mark} ${phaseLabel(plan)}`));
+		const { completed, total, percent } = getPlanProgress(plan);
+		const left = theme.bold(
+			theme.fg(plan.phase === "ready" ? "warning" : "accent", `${mark} ${planPhaseLabel(plan)}`),
+		);
 		const right = theme.fg("dim", `${completed}/${total} · ${percent}%`);
 		const gap = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
 		const lines = [truncateToWidth(`${left}${gap}${right}`, width)];
 		if (width < 100) return lines;
 
-		const step = currentStep(plan);
+		const step = getCurrentPlanStep(plan);
 		if (plan.phase === "handed_off" && plan.execution) {
 			lines.push(truncateToWidth(theme.fg("muted", ` Execution session: ${plan.execution.targetSessionId}`), width));
 		} else if (step) {
@@ -93,6 +71,7 @@ export type PlanDetailsAction = "retain_context" | "new_session" | "change";
  * ready-state selector never displaces draft feedback input.
  */
 export class PlanDetailsComponent implements Component {
+	private static readonly RESERVED_OUTSIDE_ROWS = 7;
 	private plan: PlanState;
 	private readonly getTerminalRows: () => number;
 	private readonly onAction: (action: PlanDetailsAction) => void;
@@ -100,6 +79,8 @@ export class PlanDetailsComponent implements Component {
 	private readonly requestRender: () => void;
 	private actionIndex = 0;
 	private scrollOffset = 0;
+	private lastPageSize = 1;
+	private lastMaxScroll = 0;
 
 	constructor(options: {
 		plan: PlanState;
@@ -116,8 +97,8 @@ export class PlanDetailsComponent implements Component {
 	}
 
 	setPlan(plan: PlanState): void {
+		if (plan.id !== this.plan.id) this.scrollOffset = 0;
 		this.plan = plan;
-		this.scrollOffset = Math.min(this.scrollOffset, Math.max(0, plan.steps.length - 1));
 	}
 
 	invalidate(): void {
@@ -128,47 +109,72 @@ export class PlanDetailsComponent implements Component {
 		if (width <= 0) return [];
 		const compact = width < 100;
 		const border = new DynamicBorder().render(width)[0]!;
-		const title = theme.bold(theme.fg("accent", this.plan.title ?? "Plan Details"));
-		const progressValue = progress(this.plan);
-		const lines = [
-			border,
-			truncateToWidth(
-				` ${title}${theme.fg("dim", ` · ${progressValue.completed}/${progressValue.total} complete`)}`,
-				width,
-			),
-		];
+		const titleLines: string[] = [];
+		appendWrappedPlanLine(titleLines, " ", theme.bold(theme.fg("accent", this.plan.title ?? "Plan Details")), width);
 
-		if (!compact) {
-			if (this.plan.summary) {
-				lines.push(truncateToWidth(` ${theme.fg("muted", this.plan.summary)}`, width));
+		const bodyContent = renderPlanContentLines(this.plan, width, theme);
+		const footer = this.renderFooter(width, compact, border);
+		const headerRows = 2 + titleLines.length;
+		const targetRows = Math.max(
+			headerRows + footer.length + 2,
+			this.getTerminalRows() - PlanDetailsComponent.RESERVED_OUTSIDE_ROWS,
+		);
+		const pageSize = Math.max(2, targetRows - headerRows - footer.length);
+		const maxScroll = Math.max(0, bodyContent.length - pageSize);
+		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScroll));
+		this.lastPageSize = pageSize;
+		this.lastMaxScroll = maxScroll;
+		const end = Math.min(bodyContent.length, this.scrollOffset + pageSize);
+
+		const progress = getPlanProgress(this.plan);
+		const position = maxScroll > 0 ? ` · rows ${this.scrollOffset + 1}–${end}/${bodyContent.length}` : "";
+		const metadata = truncateToWidth(
+			` ${theme.fg("dim", `${progress.completed}/${progress.total} complete${position}`)}`,
+			width,
+			"",
+		);
+
+		return [border, ...titleLines, metadata, ...bodyContent.slice(this.scrollOffset, end), ...footer];
+	}
+
+	handleInput(data: string): void {
+		const kb = getKeybindings();
+		if (kb.matches(data, "tui.select.cancel")) {
+			this.onClose();
+			return;
+		}
+		if (this.plan.phase === "ready") {
+			if (kb.matches(data, "tui.editor.cursorLeft") || kb.matches(data, "tui.select.up")) {
+				this.actionIndex = (this.actionIndex + 2) % 3;
+				this.requestRender();
+				return;
 			}
-			const availableRows = Math.max(2, Math.min(10, this.getTerminalRows() - 14));
-			const maxOffset = Math.max(0, this.plan.steps.length - availableRows);
-			this.scrollOffset = Math.min(this.scrollOffset, maxOffset);
-			for (const step of this.plan.steps.slice(this.scrollOffset, this.scrollOffset + availableRows)) {
-				const marker =
-					step.status === "completed"
-						? asciiOnly()
-							? "[x]"
-							: "✓"
-						: step.status === "in_progress"
-							? asciiOnly()
-								? "[>]"
-								: "→"
-							: asciiOnly()
-								? "[ ]"
-								: "○";
-				lines.push(
-					truncateToWidth(
-						` ${theme.fg(step.status === "in_progress" ? "accent" : "text", `${marker} ${step.text}`)}${
-							step.note ? theme.fg("dim", ` · ${step.note}`) : ""
-						}`,
-						width,
-					),
-				);
+			if (kb.matches(data, "tui.editor.cursorRight") || kb.matches(data, "tui.select.down")) {
+				this.actionIndex = (this.actionIndex + 1) % 3;
+				this.requestRender();
+				return;
 			}
+			if (kb.matches(data, "tui.select.confirm")) {
+				this.onAction((["retain_context", "new_session", "change"] as const)[this.actionIndex]!);
+				return;
+			}
+		} else if (kb.matches(data, "tui.select.up")) {
+			this.scrollBy(-1);
+			return;
+		} else if (kb.matches(data, "tui.select.down")) {
+			this.scrollBy(1);
+			return;
 		}
 
+		if (kb.matches(data, "tui.editor.pageUp")) {
+			this.scrollBy(-this.lastPageSize);
+		} else if (kb.matches(data, "tui.editor.pageDown")) {
+			this.scrollBy(this.lastPageSize);
+		}
+	}
+
+	private renderFooter(width: number, compact: boolean, border: string): string[] {
+		const lines: string[] = [];
 		if (this.plan.phase === "ready") {
 			const actions = ["Execute Plan", "Execute Plan & Clear Context", "Change Plan"];
 			lines.push("");
@@ -196,45 +202,19 @@ export class PlanDetailsComponent implements Component {
 				);
 			}
 		}
-		lines.push(
-			truncateToWidth(
-				` ${this.plan.phase === "ready" ? `${rawKeyHint("←/→", "choose")}  ${keyHint("tui.select.confirm", "confirm")}  ` : ""}${keyHint("tui.editor.pageUp", "scroll")}  ${keyHint("tui.select.cancel", "close")}`,
-				width,
-			),
-		);
+
+		const actionHints =
+			this.plan.phase === "ready"
+				? `${rawKeyHint("←/→", "choose")}  ${keyHint("tui.select.confirm", "confirm")}  `
+				: `${rawKeyHint(`${keyText("tui.select.up")}/${keyText("tui.select.down")}`, "scroll")}  `;
+		const pageHint = rawKeyHint(`${keyText("tui.editor.pageUp")}/${keyText("tui.editor.pageDown")}`, "page");
+		lines.push(truncateToWidth(` ${actionHints}${pageHint}  ${keyHint("tui.select.cancel", "close")}`, width, ""));
 		lines.push(border);
 		return lines;
 	}
 
-	handleInput(data: string): void {
-		const kb = getKeybindings();
-		if (kb.matches(data, "tui.select.cancel")) {
-			this.onClose();
-			return;
-		}
-		if (this.plan.phase === "ready") {
-			if (kb.matches(data, "tui.editor.cursorLeft") || kb.matches(data, "tui.select.up")) {
-				this.actionIndex = (this.actionIndex + 2) % 3;
-				this.requestRender();
-				return;
-			}
-			if (kb.matches(data, "tui.editor.cursorRight") || kb.matches(data, "tui.select.down")) {
-				this.actionIndex = (this.actionIndex + 1) % 3;
-				this.requestRender();
-				return;
-			}
-			if (kb.matches(data, "tui.select.confirm")) {
-				this.onAction((["retain_context", "new_session", "change"] as const)[this.actionIndex]!);
-				return;
-			}
-		}
-		const pageSize = Math.max(1, Math.min(10, this.getTerminalRows() - 14));
-		if (kb.matches(data, "tui.editor.pageUp")) {
-			this.scrollOffset = Math.max(0, this.scrollOffset - pageSize);
-			this.requestRender();
-		} else if (kb.matches(data, "tui.editor.pageDown")) {
-			this.scrollOffset = Math.min(Math.max(0, this.plan.steps.length - pageSize), this.scrollOffset + pageSize);
-			this.requestRender();
-		}
+	private scrollBy(delta: number): void {
+		this.scrollOffset = Math.max(0, Math.min(this.lastMaxScroll, this.scrollOffset + delta));
+		this.requestRender();
 	}
 }

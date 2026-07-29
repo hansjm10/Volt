@@ -50,6 +50,7 @@ export interface McpGatewayToolDetails {
 
 export interface McpGatewayToolOptions {
 	manager: McpManager;
+	isRestrictedTrustedRead?: () => boolean;
 }
 
 function formatCall(args: McpGatewayInput | undefined, theme: Theme): string {
@@ -70,6 +71,16 @@ function formatCall(args: McpGatewayInput | undefined, theme: Theme): string {
 	return `${theme.fg("toolTitle", theme.bold("mcp"))} ${theme.fg("accent", action ?? "...")}`;
 }
 
+function isFailedGatewayCall(result: unknown): boolean {
+	return (
+		typeof result === "object" &&
+		result !== null &&
+		"action" in result &&
+		result.action === "call" &&
+		(("isError" in result && result.isError === true) || ("status" in result && result.status === "failed"))
+	);
+}
+
 function formatResult(result: unknown, expanded: boolean, theme: Theme): string {
 	const text = JSON.stringify(result, null, 2) ?? "null";
 	if (expanded) {
@@ -84,10 +95,14 @@ function formatResult(result: unknown, expanded: boolean, theme: Theme): string 
 	return `\n${theme.fg("toolOutput", displayLines.join("\n"))}${suffix}`;
 }
 
-function createExecutionContext(ctx: ExtensionContext | undefined): McpGatewayExecutionContext {
+function createExecutionContext(
+	ctx: ExtensionContext | undefined,
+	isRestrictedTrustedRead: (() => boolean) | undefined,
+): McpGatewayExecutionContext {
 	return {
 		mode: ctx?.mode ?? "unknown",
 		caller: "model",
+		...(isRestrictedTrustedRead?.() === true ? { restrictedTrustedRead: true } : {}),
 	};
 }
 
@@ -113,12 +128,13 @@ export function createMcpToolDefinition(
 			}
 			const result = await options.manager.handleGatewayInput(
 				params as McpGatewayInput,
-				createExecutionContext(ctx),
+				createExecutionContext(ctx, options.isRestrictedTrustedRead),
 				signal,
 			);
 			return {
 				content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
 				details: { result },
+				...(isFailedGatewayCall(result) ? { isError: true } : {}),
 			};
 		},
 		renderCall(args, theme, context) {

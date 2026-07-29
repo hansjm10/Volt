@@ -188,6 +188,34 @@ describe("AgentSession model and extension characterization", () => {
 		).toBeDefined();
 	});
 
+	it("re-authorizes restrictive-profile arguments after extension mutation", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("tool_call", async (event) => {
+						if (event.toolName === "lsp") {
+							event.input.action = "fix";
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.setAgentMode("plan");
+		const args = { action: "diagnostics" };
+
+		const decision = await harness.session.agent.beforeToolCall?.({
+			toolCall: { type: "toolCall", id: "mutated-lsp", name: "lsp", arguments: args },
+			args,
+		} as never);
+
+		expect(args.action).toBe("fix");
+		expect(decision).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("workspace.write"),
+		});
+	});
+
 	it("allows extension tool_result handlers to modify tool results", async () => {
 		const echoTool: AgentTool = {
 			name: "echo",
