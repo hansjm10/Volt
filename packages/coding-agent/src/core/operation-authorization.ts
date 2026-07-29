@@ -154,7 +154,10 @@ function createMcpResolver(authority: IntegrationReadAuthority): ToolOperationRe
 				return resolved("integration.discover");
 			}
 			if (action === "read_cache") {
-				return resolved("integration.read");
+				// Cached output was already observed when the originating call ran, so
+				// replaying it is recall, not fresh research evidence, and it needs no
+				// per-server trust.
+				return resolved("integration.discover");
 			}
 			if (
 				action === "disconnect" ||
@@ -276,5 +279,18 @@ export function operationProvidesResearchEvidence(resolution: OperationResolutio
 	return (
 		resolution.kind === "resolved" &&
 		resolution.capabilities.some((capability) => RESEARCH_EVIDENCE_CAPABILITIES.has(capability))
+	);
+}
+
+/** Whether a tool can execute at least one operation under the profile that would count as research evidence. */
+export function resolverCanProvideResearchEvidence(
+	resolver: ToolOperationResolver | undefined,
+	profile: OperationGrantProfile,
+): boolean {
+	if (!resolver) return false;
+	return resolver.advertisedCapabilitySets.some(
+		(capabilities) =>
+			capabilities.every((capability) => profile.capabilities.has(capability)) &&
+			capabilities.some((capability) => RESEARCH_EVIDENCE_CAPABILITIES.has(capability)),
 	);
 }

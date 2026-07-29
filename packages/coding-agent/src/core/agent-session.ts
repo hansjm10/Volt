@@ -106,6 +106,7 @@ import {
 	type OperationResolution,
 	operationProvidesResearchEvidence,
 	RESEARCH_OPERATION_GRANT_PROFILE,
+	resolverCanProvideResearchEvidence,
 	type ToolOperationResolver,
 } from "./operation-authorization.ts";
 import {
@@ -563,6 +564,7 @@ export class AgentSession {
 	private _fastModeEnabled = false;
 	private _planningState: PlanningState;
 	private _planningTransitionQueue: Promise<void> = Promise.resolve();
+	private _planningTransitionInFlight = false;
 	private _requestedBuildToolNames: string[] = [];
 	private _planningRuntimeInitialized = false;
 	private _planResearchObserved = false;
@@ -758,9 +760,17 @@ export class AgentSession {
 					};
 				}
 				if (toolCall.name === "submit_plan" && !this._planResearchObserved) {
+					const researchToolAvailable = Array.from(this._toolRegistry.keys()).some((name) =>
+						resolverCanProvideResearchEvidence(
+							this._getTrustedOperationResolver(name),
+							RESEARCH_OPERATION_GRANT_PROFILE,
+						),
+					);
 					return {
 						block: true,
-						reason: "Plan mode requires at least one successful read operation before submitting a plan.",
+						reason: researchToolAvailable
+							? "Plan mode requires at least one successful read operation before submitting a plan."
+							: "Plan mode requires research evidence before submitting, but this session exposes no research-capable tools, so submit_plan cannot succeed. Tell the user their host configuration disables every builtin read tool.",
 					};
 				}
 				this._authorizedOperationResolutions.set(toolCall.id, decision.resolution);
@@ -932,6 +942,9 @@ export class AgentSession {
 			// rebase may now proceed while post-run extension/compaction work winds
 			// down; the captured run generation fences those continuations.
 			this._agentConversationMutationInFlight = false;
+			// Aborted tool calls can skip afterToolCall, leaving their plan-mode
+			// authorization records behind; no record outlives its run.
+			this._authorizedOperationResolutions.clear();
 		}
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
@@ -1963,13 +1976,32 @@ export class AgentSession {
 		};
 	}
 
+	/**
+	 * Queued transitions may suspend at an await (MCP restoration) while the
+	 * event loop keeps running, so they must re-validate planning state after
+	 * every await before committing, and the synchronous mutators refuse to
+	 * commit while a queued transition is suspended mid-flight.
+	 */
 	private _enqueuePlanningTransition<T>(transition: () => Promise<T>): Promise<T> {
-		const result = this._planningTransitionQueue.then(transition);
+		const result = this._planningTransitionQueue.then(async () => {
+			this._planningTransitionInFlight = true;
+			try {
+				return await transition();
+			} finally {
+				this._planningTransitionInFlight = false;
+			}
+		});
 		this._planningTransitionQueue = result.then(
 			() => undefined,
 			() => undefined,
 		);
 		return result;
+	}
+
+	private _assertNoPlanningTransitionInFlight(action: string): void {
+		if (this._planningTransitionInFlight) {
+			throw new Error(`${action} is unavailable while a planning transition is in progress; retry once it settles`);
+		}
 	}
 
 	setAgentMode(mode: AgentMode): Promise<PlanningState> {
@@ -2013,6 +2045,7 @@ export class AgentSession {
 		summary?: string;
 		steps: Array<{ id?: string; text: string }>;
 	}): PlanState {
+		this._assertNoPlanningTransitionInFlight("update_plan");
 		if (this._planningState.mode !== "plan") {
 			throw new Error("update_plan is available only in Plan mode");
 		}
@@ -2044,14 +2077,13 @@ export class AgentSession {
 			previous.title === title &&
 			previous.summary === summary &&
 			previous.steps.length === steps.length &&
+			// Ids are deliberately ignored: identical text/status/note in the same
+			// order is the same checklist, and rejecting it keeps a resend without
+			// canonical ids from churning step ids and burning a revision.
 			previous.steps.every((step, index) => {
 				const next = steps[index];
 				return (
-					next !== undefined &&
-					step.id === next.id &&
-					step.text === next.text &&
-					step.status === next.status &&
-					step.note === next.note
+					next !== undefined && step.text === next.text && step.status === next.status && step.note === next.note
 				);
 			})
 		) {
@@ -2074,6 +2106,7 @@ export class AgentSession {
 		expectedRevision: number;
 		updates: Array<{ id: string; status: PlanStepStatus; note?: string }>;
 	}): PlanState {
+		this._assertNoPlanningTransitionInFlight("update_plan_progress");
 		if (this._planningState.mode !== "build" || this._planningState.plan?.phase !== "active") {
 			throw new Error("update_plan_progress is available only during approved plan execution");
 		}
@@ -2126,6 +2159,7 @@ export class AgentSession {
 	}
 
 	requestReplan(input: { planId: string; expectedRevision: number; reason: string }): PlanningState {
+		this._assertNoPlanningTransitionInFlight("request_replan");
 		if (this._planningState.mode !== "build" || this._planningState.plan?.phase !== "active") {
 			throw new Error("request_replan is available only during approved plan execution");
 		}
@@ -2141,6 +2175,7 @@ export class AgentSession {
 	}
 
 	submitPlan(input: { planId: string; expectedRevision: number; title: string; summary: string }): PlanState {
+		this._assertNoPlanningTransitionInFlight("submit_plan");
 		if (this._planningState.mode !== "plan") {
 			throw new Error("submit_plan is available only in Plan mode");
 		}
@@ -2166,6 +2201,7 @@ export class AgentSession {
 	}
 
 	changePlan(planId: string, expectedRevision: number): PlanningState {
+		this._assertNoPlanningTransitionInFlight("changePlan");
 		assertPlanRevision(this._planningState, planId, expectedRevision);
 		if (this._planningState.plan.phase !== "ready") {
 			throw new Error("Only a ready plan can be changed");
@@ -2184,6 +2220,7 @@ export class AgentSession {
 	}
 
 	discardPlan(planId: string, expectedRevision: number): PlanningState {
+		this._assertNoPlanningTransitionInFlight("discardPlan");
 		assertPlanRevision(this._planningState, planId, expectedRevision);
 		this._planResearchObserved = false;
 		return this._commitPlanningState({ mode: this._planningState.mode, plan: null });
@@ -2253,9 +2290,15 @@ export class AgentSession {
 		execution: PlanExecution,
 	): Promise<PlanningState> {
 		assertPlanRevision(this._planningState, planId, expectedRevision);
+		if (this._planningState.plan.phase !== "ready") {
+			throw new Error("Only a ready plan can be handed off");
+		}
 		if (this._planningState.mode === "plan") {
 			await this._prepareUnrestrictedMcpForBuild();
 			assertPlanRevision(this._planningState, planId, expectedRevision);
+			if (this._planningState.plan.phase !== "ready") {
+				throw new Error("Only a ready plan can be handed off");
+			}
 		}
 		return this._commitPlanningState({
 			mode: "build",

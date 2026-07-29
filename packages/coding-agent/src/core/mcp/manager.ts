@@ -132,7 +132,7 @@ function isMetadataStale(
 
 const ALL_METADATA_CATEGORIES: readonly McpMetadataCategory[] = Object.freeze(["tools", "resources", "prompts"]);
 const TOOL_METADATA_CATEGORIES: readonly McpMetadataCategory[] = Object.freeze(["tools"]);
-const RESTRICTED_TOOL_METADATA_REFRESH: McpMetadataRefreshOptions = Object.freeze({
+const TOOLS_ONLY_METADATA_REFRESH: McpMetadataRefreshOptions = Object.freeze({
 	tools: true,
 	resources: false,
 	prompts: false,
@@ -684,7 +684,7 @@ export class McpManager {
 			throw new Error(`MCP server has no configured trusted tool reads: ${serverId}`);
 		}
 		const metadata = options.restrictedTrustedRead
-			? await supervisor.refreshMetadata(signal, RESTRICTED_TOOL_METADATA_REFRESH)
+			? await supervisor.refreshMetadata(signal, TOOLS_ONLY_METADATA_REFRESH)
 			: await this.getFreshToolMetadata(supervisor, signal).catch(() => supervisor.cachedMetadata);
 		if (!metadata) {
 			return { action: "list_tools", server: supervisor.server.id, tools: [], stale: true };
@@ -750,7 +750,7 @@ export class McpManager {
 			throw new Error(`MCP server has no configured trusted tool reads: ${serverId}`);
 		}
 		const metadata = options.restrictedTrustedRead
-			? await supervisor.refreshMetadata(signal, RESTRICTED_TOOL_METADATA_REFRESH)
+			? await supervisor.refreshMetadata(signal, TOOLS_ONLY_METADATA_REFRESH)
 			: await this.getFreshToolMetadata(supervisor, signal).catch(() => supervisor.cachedMetadata);
 		if (!metadata) {
 			return {
@@ -959,7 +959,7 @@ export class McpManager {
 		const args = parseArguments(input);
 		const supervisor = this.getSupervisor(serverId);
 		const metadata = context.restrictedTrustedRead
-			? await supervisor.refreshMetadata(signal, RESTRICTED_TOOL_METADATA_REFRESH)
+			? await supervisor.refreshMetadata(signal, TOOLS_ONLY_METADATA_REFRESH)
 			: await this.getFreshToolMetadata(supervisor, signal);
 		const tool = metadata.tools.find((entry) => entry.name === toolName);
 		if (!tool || !serverMatchesToolFilters(supervisor.server, tool.name)) {
@@ -1093,7 +1093,7 @@ export class McpManager {
 		if (cached && !this.isSupervisorMetadataStale(supervisor, cached, TOOL_METADATA_CATEGORIES)) {
 			return cached;
 		}
-		return supervisor.refreshMetadata(signal, RESTRICTED_TOOL_METADATA_REFRESH);
+		return supervisor.refreshMetadata(signal, TOOLS_ONLY_METADATA_REFRESH);
 	}
 
 	private findSupervisor(serverId: string): McpServerSupervisor | undefined {

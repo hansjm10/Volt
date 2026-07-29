@@ -6,6 +6,7 @@ import {
 	isToolVisibleUnderGrant,
 	operationProvidesResearchEvidence,
 	RESEARCH_OPERATION_GRANT_PROFILE,
+	resolverCanProvideResearchEvidence,
 } from "../src/core/operation-authorization.ts";
 
 function createIntegrationAuthority(): IntegrationReadAuthority {
@@ -32,6 +33,12 @@ describe("operation authorization", () => {
 		expect(isToolVisibleUnderGrant(updatePlan, RESEARCH_OPERATION_GRANT_PROFILE)).toBe(true);
 		expect(isToolVisibleUnderGrant(updateProgress, RESEARCH_OPERATION_GRANT_PROFILE)).toBe(false);
 		expect(isToolVisibleUnderGrant(undefined, RESEARCH_OPERATION_GRANT_PROFILE)).toBe(false);
+
+		expect(resolverCanProvideResearchEvidence(read, RESEARCH_OPERATION_GRANT_PROFILE)).toBe(true);
+		expect(resolverCanProvideResearchEvidence(inspect, RESEARCH_OPERATION_GRANT_PROFILE)).toBe(true);
+		expect(resolverCanProvideResearchEvidence(updatePlan, RESEARCH_OPERATION_GRANT_PROFILE)).toBe(false);
+		expect(resolverCanProvideResearchEvidence(write, RESEARCH_OPERATION_GRANT_PROFILE)).toBe(false);
+		expect(resolverCanProvideResearchEvidence(undefined, RESEARCH_OPERATION_GRANT_PROFILE)).toBe(false);
 
 		const readDecision = authorizeToolOperation(read, { path: "README.md" }, RESEARCH_OPERATION_GRANT_PROFILE);
 		expect(readDecision).toMatchObject({
@@ -115,10 +122,12 @@ describe("operation authorization", () => {
 				resolution: { capabilities: ["integration.discover"] },
 			});
 		}
-		expect(authorizeToolOperation(mcp, { action: "read_cache" }, RESEARCH_OPERATION_GRANT_PROFILE)).toMatchObject({
+		const readCache = authorizeToolOperation(mcp, { action: "read_cache" }, RESEARCH_OPERATION_GRANT_PROFILE);
+		expect(readCache).toMatchObject({
 			allowed: true,
-			resolution: { capabilities: ["integration.read"] },
+			resolution: { capabilities: ["integration.discover"] },
 		});
+		expect(operationProvidesResearchEvidence(readCache.resolution)).toBe(false);
 		for (const action of ["connect", "describe", "list_tools"]) {
 			expect(
 				authorizeToolOperation(mcp, { action, server: "trusted" }, RESEARCH_OPERATION_GRANT_PROFILE),

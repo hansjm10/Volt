@@ -665,6 +665,79 @@ describe("native planning state", () => {
 		await session.dispose();
 	});
 
+	it("rejects id-less duplicate drafts and non-ready handoffs", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({
+			title: "Harden lifecycle",
+			summary: "Guard the transition boundaries.",
+			steps: [{ text: "Audit transitions" }, { text: "Add guards" }],
+		});
+		expect(() =>
+			session.updatePlan({
+				planId: draft.id,
+				expectedRevision: draft.revision,
+				steps: draft.steps.map((step) => ({ text: step.text })),
+			}),
+		).toThrow("made no changes");
+		expect(session.planningState.plan).toMatchObject({ id: draft.id, revision: draft.revision });
+
+		const execution = {
+			id: "handoff-1",
+			approvedRevision: draft.revision,
+			strategy: "new_session" as const,
+			sourceSessionId: session.sessionId,
+			targetSessionId: "target-session",
+		};
+		await expect(session.markPlanHandedOff(draft.id, draft.revision, execution)).rejects.toThrow(
+			"Only a ready plan can be handed off",
+		);
+
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Harden lifecycle",
+			summary: "Guard the transition boundaries.",
+		});
+		const handedOff = await session.markPlanHandedOff(draft.id, ready.revision, {
+			...execution,
+			approvedRevision: ready.revision,
+		});
+		expect(handedOff).toMatchObject({ mode: "build", plan: { phase: "handed_off" } });
+		await session.dispose();
+	});
+
+	it("refuses synchronous plan mutations while a queued transition is suspended", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({
+			title: "Guarded",
+			summary: "Synchronous mutators must not interleave with suspended transitions.",
+			steps: [{ text: "Hold the boundary" }],
+		});
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const internals = session as unknown as { _prepareUnrestrictedMcpForBuild(): Promise<void> };
+		const original = internals._prepareUnrestrictedMcpForBuild.bind(session);
+		internals._prepareUnrestrictedMcpForBuild = async () => {
+			await gate;
+			await original();
+		};
+		const transition = session.setAgentMode("build");
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(() =>
+			session.updatePlan({
+				planId: draft.id,
+				expectedRevision: draft.revision,
+				steps: [{ text: "Rewrite mid-transition" }],
+			}),
+		).toThrow("while a planning transition is in progress");
+		release();
+		await transition;
+		expect(session.planningState).toMatchObject({ mode: "build", plan: { id: draft.id, revision: draft.revision } });
+		await session.dispose();
+	});
+
 	it("turns manual Plan-mode re-entry during execution into a valid draft", async () => {
 		const { session } = await createPlanningSession();
 		await session.setAgentMode("plan");
