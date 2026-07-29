@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import type { RpcRegisterPushTargetArgs, RpcRegisterPushTargetResponse } from "../../rpc/types.ts";
 import type { IrohRemoteAuditEventInput, IrohRemoteAuditLogger } from "./audit.ts";
@@ -16,6 +17,24 @@ export const DEFAULT_IROH_REMOTE_PUSH_RELAY_RETRY_DELAY_MS = 250;
 export const DEFAULT_IROH_REMOTE_PUSH_RELAY_TIMEOUT_MS = 10_000;
 export const DEFAULT_IROH_REMOTE_PUSH_RELAY_URL = "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay";
 export const MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES = 256;
+export const MAX_IROH_REMOTE_NOTIFICATION_TITLE_UTF8_BYTES = 128;
+export const MAX_IROH_REMOTE_NOTIFICATION_BODY_UTF8_BYTES = 512;
+export const MAX_IROH_REMOTE_NOTIFICATION_TARGET_UTF8_BYTES = 256;
+export const MAX_IROH_REMOTE_NOTIFICATION_WORKSPACE_UTF8_BYTES = 128;
+export const MAX_IROH_REMOTE_NOTIFICATION_METADATA_UTF8_BYTES = 128;
+export const MAX_IROH_REMOTE_NOTIFICATION_EVENT_ID_UTF8_BYTES = 512;
+export const MAX_IROH_REMOTE_NOTIFICATION_KIND_UTF8_BYTES = 64;
+
+const NOTIFICATION_UNSAFE_CHARACTERS = /[\p{Cc}\p{Cf}\p{Cs}]/gu;
+const NOTIFICATION_UNSAFE_CHARACTER = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const NOTIFICATION_PATH_SEPARATOR = /[/\\]/u;
+const IROH_REMOTE_NOTIFICATION_KINDS = new Set([
+	"conversation_completed",
+	"plan_ready",
+	"review_completed",
+	"action_completed",
+	"host_notice",
+]);
 
 export type IrohRemotePushTargetRegistrationRequest = RpcRegisterPushTargetArgs;
 export type IrohRemotePushTargetRegistrationResult = RpcRegisterPushTargetResponse;
@@ -27,6 +46,149 @@ export interface IrohRemotePushNotificationIntent {
 	body: string;
 	sessionId?: string;
 	workspace?: string;
+	planId?: string;
+	workflowId?: string;
+}
+
+function boundNotificationUtf8(value: string, maxBytes: number): string {
+	let bounded = "";
+	for (const character of value) {
+		if (Buffer.byteLength(bounded, "utf8") + Buffer.byteLength(character, "utf8") > maxBytes) {
+			break;
+		}
+		bounded += character;
+	}
+	return bounded;
+}
+
+/** Sanitize one path-free lock-screen text fragment and apply a UTF-8 byte cap. */
+export function sanitizeIrohRemoteNotificationText(value: string, maxBytes: number): string | undefined {
+	const normalized = value.replace(NOTIFICATION_UNSAFE_CHARACTERS, " ").replace(/\s+/gu, " ").trim();
+	if (!normalized || NOTIFICATION_PATH_SEPARATOR.test(normalized)) {
+		return undefined;
+	}
+	return boundNotificationUtf8(normalized, maxBytes).trim() || undefined;
+}
+
+/** Accept only the bounded target descriptions produced by the built-in review resolvers. */
+export function sanitizeIrohRemoteNotificationTarget(value: string | undefined): string | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+	const target = sanitizeIrohRemoteNotificationText(value, MAX_IROH_REMOTE_NOTIFICATION_TARGET_UTF8_BYTES);
+	if (!target) {
+		return undefined;
+	}
+	if (
+		target === "uncommitted changes" ||
+		/^PR #[1-9]\d*$/u.test(target) ||
+		/^commit [0-9a-f]{7,64}$/iu.test(target) ||
+		/^branch changes vs [A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(target)
+	) {
+		return target;
+	}
+	return undefined;
+}
+
+export function sanitizeIrohRemoteNotificationWorkspace(value: string | undefined): string | undefined {
+	return value === undefined
+		? undefined
+		: sanitizeIrohRemoteNotificationText(value, MAX_IROH_REMOTE_NOTIFICATION_WORKSPACE_UTF8_BYTES);
+}
+
+export function sanitizeIrohRemoteNotificationMetadata(
+	value: string | undefined,
+	maxBytes = MAX_IROH_REMOTE_NOTIFICATION_METADATA_UTF8_BYTES,
+): string | undefined {
+	if (
+		value === undefined ||
+		value !== value.trim() ||
+		/\s/u.test(value) ||
+		NOTIFICATION_UNSAFE_CHARACTER.test(value)
+	) {
+		return undefined;
+	}
+	if (!value || NOTIFICATION_PATH_SEPARATOR.test(value) || Buffer.byteLength(value, "utf8") > maxBytes) {
+		return undefined;
+	}
+	return value;
+}
+
+/** Normalize a trusted notification intent before either push or JSONL delivery. */
+export function sanitizeIrohRemotePushNotificationIntent(
+	value: IrohRemotePushNotificationIntent,
+): IrohRemotePushNotificationIntent | undefined {
+	const eventId = sanitizeIrohRemoteNotificationMetadata(
+		value.eventId,
+		MAX_IROH_REMOTE_NOTIFICATION_EVENT_ID_UTF8_BYTES,
+	);
+	const kind = sanitizeIrohRemoteNotificationMetadata(value.kind, MAX_IROH_REMOTE_NOTIFICATION_KIND_UTF8_BYTES);
+	const title = sanitizeIrohRemoteNotificationText(value.title, MAX_IROH_REMOTE_NOTIFICATION_TITLE_UTF8_BYTES);
+	const body = sanitizeIrohRemoteNotificationText(value.body, MAX_IROH_REMOTE_NOTIFICATION_BODY_UTF8_BYTES);
+	const sessionId = sanitizeIrohRemoteNotificationMetadata(value.sessionId);
+	const workspace = sanitizeIrohRemoteNotificationWorkspace(value.workspace);
+	const planId = sanitizeIrohRemoteNotificationMetadata(value.planId);
+	const workflowId = sanitizeIrohRemoteNotificationMetadata(value.workflowId);
+	if (
+		!eventId ||
+		!kind ||
+		!IROH_REMOTE_NOTIFICATION_KINDS.has(kind) ||
+		!title ||
+		!body ||
+		(value.sessionId !== undefined && sessionId === undefined) ||
+		(value.workspace !== undefined && workspace === undefined) ||
+		(value.planId !== undefined && planId === undefined) ||
+		(value.workflowId !== undefined && workflowId === undefined) ||
+		(kind === "plan_ready" && (planId === undefined || workflowId !== undefined)) ||
+		(kind === "review_completed" && (workflowId === undefined || planId !== undefined)) ||
+		(kind !== "plan_ready" && kind !== "review_completed" && (planId !== undefined || workflowId !== undefined))
+	) {
+		return undefined;
+	}
+	return {
+		eventId,
+		kind,
+		title,
+		body,
+		...(sessionId === undefined ? {} : { sessionId }),
+		...(workspace === undefined ? {} : { workspace }),
+		...(planId === undefined ? {} : { planId }),
+		...(workflowId === undefined ? {} : { workflowId }),
+	};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Strict control-plane parser: unsafe or non-canonical text is rejected, not silently rewritten. */
+export function parseIrohRemotePushNotificationIntent(value: unknown): IrohRemotePushNotificationIntent | undefined {
+	if (
+		!isRecord(value) ||
+		!Object.keys(value).every((key) =>
+			["eventId", "kind", "title", "body", "sessionId", "workspace", "planId", "workflowId"].includes(key),
+		) ||
+		typeof value.eventId !== "string" ||
+		typeof value.kind !== "string" ||
+		typeof value.title !== "string" ||
+		typeof value.body !== "string" ||
+		(value.sessionId !== undefined && typeof value.sessionId !== "string") ||
+		(value.workspace !== undefined && typeof value.workspace !== "string") ||
+		(value.planId !== undefined && typeof value.planId !== "string") ||
+		(value.workflowId !== undefined && typeof value.workflowId !== "string")
+	) {
+		return undefined;
+	}
+	const sanitized = sanitizeIrohRemotePushNotificationIntent(value as unknown as IrohRemotePushNotificationIntent);
+	if (!sanitized) {
+		return undefined;
+	}
+	for (const [key, entry] of Object.entries(sanitized)) {
+		if (value[key] !== entry) {
+			return undefined;
+		}
+	}
+	return Object.keys(value).length === Object.keys(sanitized).length ? sanitized : undefined;
 }
 
 export interface IrohRemoteLiveActivityContentState {
@@ -57,11 +219,15 @@ export interface IrohRemotePushRelayNotificationRequest {
 	title: string;
 	body: string;
 	workspace?: string;
+	planId?: string;
+	workflowId?: string;
 	data: {
 		eventId: string;
 		kind: string;
 		sessionId?: string;
 		workspace?: string;
+		planId?: string;
+		workflowId?: string;
 	};
 }
 
@@ -313,6 +479,8 @@ function createRelayNotificationBody(
 		title: request.title,
 		body: request.body,
 		...(request.workspace === undefined ? {} : { workspace: request.workspace }),
+		...(request.planId === undefined ? {} : { planId: request.planId }),
+		...(request.workflowId === undefined ? {} : { workflowId: request.workflowId }),
 		data: request.data,
 	};
 }
@@ -531,38 +699,44 @@ export class IrohRemotePushNotificationDispatcher implements IrohRemotePushNotif
 	async deliverNotification(
 		notification: IrohRemotePushNotificationIntent,
 	): Promise<IrohRemotePushNotificationDeliveryStatus> {
-		if (!(await this.markDeliveryIntent(notification.eventId, notification.kind))) {
+		const sanitized = sanitizeIrohRemotePushNotificationIntent(notification);
+		if (!sanitized) {
+			return "failed";
+		}
+		if (!(await this.markDeliveryIntent(sanitized.eventId, sanitized.kind))) {
 			return "duplicate";
 		}
 
 		const client = await this.stateManager.getClient(this.clientNodeId);
 		const pushTarget = selectEnabledPushTarget(client?.pushTargets ?? []);
 		if (!pushTarget) {
-			await this.logPushFallback(notification.eventId, notification.kind, "no_push_target");
+			this.deduper.unmark(this.clientNodeId, sanitized.eventId);
+			await this.logPushFallback(sanitized.eventId, sanitized.kind, "no_push_target");
 			return "no_push_target";
 		}
 
-		const relayRequest = createRelayNotificationRequest(pushTarget, notification);
+		const relayRequest = createRelayNotificationRequest(pushTarget, sanitized);
 		try {
 			const relayResult = await this.sendNotificationWithRetry(relayRequest);
 			if (relayResult.status === "invalid_target") {
 				await this.stateManager.disableClientPushTarget(this.clientNodeId, pushTarget.id, this.now());
+				this.deduper.unmark(this.clientNodeId, sanitized.eventId);
 				await this.logPushDelivery(
 					pushTarget,
-					notification.eventId,
-					notification.kind,
+					sanitized.eventId,
+					sanitized.kind,
 					false,
 					"push target is invalid or unregistered",
 				);
 				return "invalid_target";
 			}
-			await this.logPushDelivery(pushTarget, notification.eventId, notification.kind, true);
+			await this.logPushDelivery(pushTarget, sanitized.eventId, sanitized.kind, true);
 			return "sent";
 		} catch (error: unknown) {
 			// Release the dedup claim so a transient relay failure can be retried on a
 			// later re-emission instead of being permanently suppressed as delivered.
-			this.deduper.unmark(this.clientNodeId, notification.eventId);
-			await this.logPushDelivery(pushTarget, notification.eventId, notification.kind, false, toErrorMessage(error));
+			this.deduper.unmark(this.clientNodeId, sanitized.eventId);
+			await this.logPushDelivery(pushTarget, sanitized.eventId, sanitized.kind, false, toErrorMessage(error));
 			return "failed";
 		}
 	}
@@ -754,7 +928,6 @@ function createRelayNotificationRequest(
 	pushTarget: IrohRemotePushTarget,
 	notification: IrohRemotePushNotificationIntent,
 ): IrohRemotePushRelayNotificationRequest {
-	const workspace = getSafeNotificationWorkspace(notification.workspace);
 	return {
 		pushTargetId: pushTarget.id,
 		pushTargetAuthToken: pushTarget.pushTargetAuthToken,
@@ -762,25 +935,18 @@ function createRelayNotificationRequest(
 		kind: notification.kind,
 		title: notification.title,
 		body: notification.body,
-		...(workspace === undefined ? {} : { workspace }),
+		...(notification.workspace === undefined ? {} : { workspace: notification.workspace }),
+		...(notification.planId === undefined ? {} : { planId: notification.planId }),
+		...(notification.workflowId === undefined ? {} : { workflowId: notification.workflowId }),
 		data: {
 			eventId: notification.eventId,
 			kind: notification.kind,
 			...(notification.sessionId === undefined ? {} : { sessionId: notification.sessionId }),
-			...(workspace === undefined ? {} : { workspace }),
+			...(notification.workspace === undefined ? {} : { workspace: notification.workspace }),
+			...(notification.planId === undefined ? {} : { planId: notification.planId }),
+			...(notification.workflowId === undefined ? {} : { workflowId: notification.workflowId }),
 		},
 	};
-}
-
-function getSafeNotificationWorkspace(workspace: string | undefined): string | undefined {
-	if (workspace === undefined) {
-		return undefined;
-	}
-	const trimmed = workspace.trim();
-	if (trimmed.length === 0 || trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("\0")) {
-		return undefined;
-	}
-	return trimmed;
 }
 
 function createRelayLiveActivityRequest(

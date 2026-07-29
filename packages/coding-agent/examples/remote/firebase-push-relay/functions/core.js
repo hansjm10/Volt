@@ -12,7 +12,22 @@ const MAX_GENERIC_STRING_LENGTH = 4096;
 const MAX_LIVE_ACTIVITY_FUTURE_SECONDS = 30 * 24 * 60 * 60;
 const MAX_LIVE_ACTIVITY_PAST_SECONDS = 24 * 60 * 60;
 const MAX_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES = 256;
+const MAX_NOTIFICATION_TITLE_UTF8_BYTES = 128;
+const MAX_NOTIFICATION_BODY_UTF8_BYTES = 512;
+const MAX_NOTIFICATION_WORKSPACE_UTF8_BYTES = 128;
+const MAX_NOTIFICATION_METADATA_UTF8_BYTES = 128;
+const MAX_NOTIFICATION_EVENT_ID_UTF8_BYTES = 512;
+const MAX_NOTIFICATION_KIND_UTF8_BYTES = 64;
 const MAX_CLOCK_SKEW_SECONDS = 5 * 60;
+const NOTIFICATION_UNSAFE_CHARACTER = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const NOTIFICATION_PATH_SEPARATOR = /[/\\]/u;
+const NOTIFICATION_KINDS = new Set([
+	"conversation_completed",
+	"plan_ready",
+	"review_completed",
+	"action_completed",
+	"host_notice",
+]);
 const FORBIDDEN_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 class RequestError extends Error {
@@ -149,26 +164,92 @@ function parsePushTargetRevocation(body) {
 function parseNotification(body) {
 	expectAllowedKeys(
 		body,
-		["pushTargetId", "pushTargetAuthToken", "eventId", "kind", "title", "body", "workspace", "data"],
+		[
+			"pushTargetId",
+			"pushTargetAuthToken",
+			"eventId",
+			"kind",
+			"title",
+			"body",
+			"workspace",
+			"planId",
+			"workflowId",
+			"data",
+		],
 		"notification",
 	);
-	const eventId = expectString(body.eventId, "eventId", 1, 128);
-	const kind = expectString(body.kind, "kind", 1, 64);
-	const data = expectStringRecord(body.data, "data", { maxEntries: 16, maxKeyLength: 64, maxValueLength: 1024 });
-	const workspace = expectOptionalString(body.workspace, "workspace", 1, 128);
+	const eventId = expectNotificationMetadata(body.eventId, "eventId", MAX_NOTIFICATION_EVENT_ID_UTF8_BYTES);
+	const kind = expectNotificationMetadata(body.kind, "kind", MAX_NOTIFICATION_KIND_UTF8_BYTES);
+	if (!NOTIFICATION_KINDS.has(kind)) {
+		throw new RequestError(400, "kind_is_unsupported");
+	}
+	const workspace = expectOptionalNotificationText(
+		body.workspace,
+		"workspace",
+		MAX_NOTIFICATION_WORKSPACE_UTF8_BYTES,
+	);
+	const planId = expectOptionalNotificationMetadata(body.planId, "planId", MAX_NOTIFICATION_METADATA_UTF8_BYTES);
+	const workflowId = expectOptionalNotificationMetadata(
+		body.workflowId,
+		"workflowId",
+		MAX_NOTIFICATION_METADATA_UTF8_BYTES,
+	);
+	if (
+		(kind === "plan_ready" && (planId === undefined || workflowId !== undefined)) ||
+		(kind === "review_completed" && (workflowId === undefined || planId !== undefined)) ||
+		(kind !== "plan_ready" && kind !== "review_completed" && (planId !== undefined || workflowId !== undefined))
+	) {
+		throw new RequestError(400, "notification_navigation_metadata_mismatch");
+	}
+	const data = expectStringRecord(body.data, "data", { maxEntries: 8, maxKeyLength: 64, maxValueLength: 512 });
+	expectAllowedKeys(data, ["eventId", "kind", "sessionId", "workspace", "planId", "workflowId"], "data");
+	const sessionId = expectOptionalNotificationMetadata(
+		data.sessionId,
+		"sessionId",
+		MAX_NOTIFICATION_METADATA_UTF8_BYTES,
+	);
+	const dataWorkspace = expectOptionalNotificationText(
+		data.workspace,
+		"data_workspace",
+		MAX_NOTIFICATION_WORKSPACE_UTF8_BYTES,
+	);
+	const dataPlanId = expectOptionalNotificationMetadata(
+		data.planId,
+		"data_planId",
+		MAX_NOTIFICATION_METADATA_UTF8_BYTES,
+	);
+	const dataWorkflowId = expectOptionalNotificationMetadata(
+		data.workflowId,
+		"data_workflowId",
+		MAX_NOTIFICATION_METADATA_UTF8_BYTES,
+	);
+	if (
+		data.eventId !== eventId ||
+		data.kind !== kind ||
+		dataWorkspace !== workspace ||
+		dataPlanId !== planId ||
+		dataWorkflowId !== workflowId
+	) {
+		throw new RequestError(400, "notification_data_mismatch");
+	}
 	return {
-		body: expectString(body.body, "body", 1, 1024),
+		body: expectNotificationText(body.body, "body", MAX_NOTIFICATION_BODY_UTF8_BYTES),
 		data: {
-			...data,
 			eventId,
 			kind,
+			...(sessionId === undefined ? {} : { sessionId }),
+			...(workspace === undefined ? {} : { workspace }),
+			...(planId === undefined ? {} : { planId }),
+			...(workflowId === undefined ? {} : { workflowId }),
 		},
 		eventId,
 		kind,
 		pushTargetAuthToken: expectString(body.pushTargetAuthToken, "pushTargetAuthToken", 32, 128),
 		pushTargetId: expectString(body.pushTargetId, "pushTargetId", 16, 96),
-		title: expectString(body.title, "title", 1, 128),
+		title: expectNotificationText(body.title, "title", MAX_NOTIFICATION_TITLE_UTF8_BYTES),
 		...(workspace === undefined ? {} : { workspace }),
+		...(planId === undefined ? {} : { planId }),
+		...(workflowId === undefined ? {} : { workflowId }),
 	};
 }
 
@@ -427,6 +508,46 @@ function expectOptionalString(value, label, minimumLength, maximumLength) {
 	return expectString(value, label, minimumLength, maximumLength);
 }
 
+function expectNotificationText(value, label, maximumByteLength) {
+	if (
+		typeof value !== "string" ||
+		value !== value.trim() ||
+		/\s{2,}/u.test(value) ||
+		NOTIFICATION_UNSAFE_CHARACTER.test(value) ||
+		NOTIFICATION_PATH_SEPARATOR.test(value) ||
+		Buffer.byteLength(value, "utf8") > maximumByteLength ||
+		value.length === 0
+	) {
+		throw new RequestError(400, `${label}_has_invalid_notification_text`);
+	}
+	return value;
+}
+
+function expectOptionalNotificationText(value, label, maximumByteLength) {
+	if (value === undefined) return undefined;
+	return expectNotificationText(value, label, maximumByteLength);
+}
+
+function expectNotificationMetadata(value, label, maximumByteLength) {
+	if (
+		typeof value !== "string" ||
+		value !== value.trim() ||
+		/\s/u.test(value) ||
+		NOTIFICATION_UNSAFE_CHARACTER.test(value) ||
+		NOTIFICATION_PATH_SEPARATOR.test(value) ||
+		Buffer.byteLength(value, "utf8") > maximumByteLength ||
+		value.length === 0
+	) {
+		throw new RequestError(400, `${label}_has_invalid_notification_metadata`);
+	}
+	return value;
+}
+
+function expectOptionalNotificationMetadata(value, label, maximumByteLength) {
+	if (value === undefined) return undefined;
+	return expectNotificationMetadata(value, label, maximumByteLength);
+}
+
 function expectOptionalUTF8String(value, label, maximumByteLength) {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string" || /^[\s]*$/.test(value) || Buffer.byteLength(value, "utf8") > maximumByteLength) {
@@ -508,6 +629,11 @@ module.exports = {
 	DEFAULT_PUBLIC_RELAY_URL,
 	DEFAULT_PUSH_TARGET_TTL_MS,
 	MAX_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
+	MAX_NOTIFICATION_BODY_UTF8_BYTES,
+	MAX_NOTIFICATION_EVENT_ID_UTF8_BYTES,
+	MAX_NOTIFICATION_METADATA_UTF8_BYTES,
+	MAX_NOTIFICATION_TITLE_UTF8_BYTES,
+	MAX_NOTIFICATION_WORKSPACE_UTF8_BYTES,
 	MAX_REQUEST_BYTES,
 	RequestError,
 	assertRequestEnvelope,

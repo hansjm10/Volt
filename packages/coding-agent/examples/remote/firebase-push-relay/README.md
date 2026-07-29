@@ -9,7 +9,7 @@ This deploys Volt's managed push relay contract to Firebase Cloud Functions. The
 - Target credentials are stored only as SHA-256 hashes. FCM tokens remain raw because Firebase Messaging needs them, so Firestore access is denied to clients and project IAM must stay least-privilege.
 - Targets expire after 30 days by default. Every delivery rejects an expired target immediately; the deployed Firestore TTL policy deletes expired documents asynchronously.
 - The app validates a cached target through the credential-authenticated status route before reuse. A host-side revoke therefore causes fresh App Check registration instead of leaving the phone stuck on a dead credential.
-- Registration, notification, Live Activity, and revocation bodies have a 16 KiB total cap plus explicit field, string, object-depth, key-count, array-count, and timestamp bounds.
+- Registration, notification, Live Activity, and revocation bodies have a 16 KiB total cap plus explicit field, UTF-8 string, object-depth, key-count, array-count, and timestamp bounds. Notification copy and metadata reject controls and path separators; FCM data is restricted to event, kind, workspace/session authority, and one navigation ID, so commands, diffs, and host paths cannot be forwarded.
 - Each target reserves a delivery quota slot in a Firestore transaction before FCM is called. Failures consume the slot, so a failing send cannot create a hot retry loop.
 - Registration also has a per-instance burst cap. The function has bounded concurrency, instance count, memory, and request time. These are defense-in-depth controls, not substitutes for a project-level budget and edge rate limit.
 - `relayUrl` is returned only from the validated `PUSH_RELAY_URL` setting (or the compiled production URL); request `Host` and forwarding headers are never reflected.
@@ -23,8 +23,22 @@ The function remains publicly invokable because an unattached iOS app must reach
 - `POST /v1/push-targets`: mobile app registration with `X-Firebase-AppCheck`; body `{ provider:"fcm", platform:"ios", token, enabled }`; returns `{ pushTargetId, pushTargetAuthToken, relayUrl, tokenHash, expiresAtEpochSeconds }`.
 - `POST /v1/push-targets/revoke`: app or host cleanup with `{ pushTargetId, pushTargetAuthToken }`; returns `revoked` or idempotent `already_revoked`.
 - `POST /v1/push-targets/status`: credential-authenticated cache validation; returns `{ status:"active", expiresAtEpochSeconds }`, or `401`/`404`/`410` when the cached credential must be replaced.
-- `POST /v1/notifications`: desktop delivery with `{ pushTargetId, pushTargetAuthToken, eventId, kind, title, body, workspace?, data }`.
+- `POST /v1/notifications`: desktop delivery with `{ pushTargetId, pushTargetAuthToken, eventId, kind, title, body, workspace?, planId?, workflowId?, data }`.
 - `POST /v1/live-activities`: desktop delivery with `{ pushTargetId, pushTargetAuthToken, activityId, activityPushToken, tokenEnvironment?, eventId, kind, contentState, activityEvent?, staleDateEpochSeconds?, dismissalDateEpochSeconds? }`.
+
+Notification delivery accepts `conversation_completed`, `plan_ready`, `review_completed`, `action_completed`, and `host_notice` kinds. `plan_ready` requires `planId`; `review_completed` requires `workflowId`; the two navigation fields are mutually exclusive and forbidden on other kinds. The relay requires top-level and `data` values to agree, then forwards this bounded FCM data shape unchanged:
+
+```json
+{
+  "eventId": "plan:session-one:run-one:ready",
+  "kind": "plan_ready",
+  "sessionId": "session-one",
+  "workspace": "volt-app",
+  "planId": "plan-one"
+}
+```
+
+`workflowId` replaces `planId` for review completion. Notification titles are limited to 128 UTF-8 bytes, bodies to 512, workspace/session/navigation values to 128, event IDs to 512, and kinds to 64. Unknown FCM data fields, mismatched metadata, control/format/surrogate characters, whitespace in identifiers, and path separators are rejected. The host uses the same bounded title, body, workspace/session authority, navigation ID, and stable event ID for managed push and JSONL fallback. Plan-ready copy is `Your plan is ready` / `Open Volt to review and approve it.` Review copy is `Your review is ready` with a safe host-produced target and zero/one/many/unknown findings wording.
 
 The Live Activity `contentState` is the exact semantic ActivityKit state:
 
