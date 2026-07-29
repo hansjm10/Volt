@@ -395,11 +395,12 @@ describe("createDaemonAttach + control server integration", () => {
 				kind: "live_activity_update",
 				activityEvent: "update",
 				contentState: {
+					operationKind: "conversation",
+					operationID: "s-relay",
 					status: "running",
-					statusText: "Volt is thinking",
-					recentTools: [],
 					sessionID: "s-relay",
 					workspaceName: "repo",
+					operationStartedAtEpochSeconds: 120,
 					updatedAtEpochSeconds: 123,
 				},
 			}),
@@ -416,6 +417,15 @@ describe("createDaemonAttach + control server integration", () => {
 			clientNodeId: "n-1",
 			workspaceName: "repo",
 			sessionId: "s-relay",
+			update: {
+				contentState: {
+					operationKind: "conversation",
+					operationID: "s-relay",
+					status: "running",
+					sessionID: "s-relay",
+					workspaceName: "repo",
+				},
+			},
 		});
 	});
 

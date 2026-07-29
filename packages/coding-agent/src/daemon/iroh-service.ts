@@ -36,7 +36,6 @@ import { resolveIrohRemoteWorkspaceProjectTrusted } from "../core/remote/iroh/ho
 import { IROH_REMOTE_ALPN, resolveIrohRemoteRuntimeToolPolicy } from "../core/remote/iroh/protocol.ts";
 import {
 	IrohRemoteInMemoryPushNotificationDeduper,
-	type IrohRemoteLiveActivityUpdateIntent,
 	type IrohRemotePushNotificationDeliveryStatus,
 	IrohRemotePushNotificationDispatcher,
 	type IrohRemotePushNotificationIntent,
@@ -3928,10 +3927,10 @@ class IrohDaemonService {
 		request: Extract<ControlRequest, { type: "relay_live_activity_delivery" }>,
 	): Promise<RelayPushDeliveryResult> {
 		const contentState = request.update.contentState;
-		if (contentState.sessionID !== undefined && contentState.sessionID !== request.sessionId) {
+		if (contentState.sessionID !== request.sessionId) {
 			return { ok: false, code: "session_mismatch", message: "Live Activity session does not match relay session" };
 		}
-		if (contentState.workspaceName !== undefined && contentState.workspaceName !== request.workspaceName) {
+		if (contentState.workspaceName !== request.workspaceName) {
 			return {
 				ok: false,
 				code: "workspace_mismatch",
@@ -3942,18 +3941,10 @@ class IrohDaemonService {
 		if (!authorization.ok) {
 			return authorization;
 		}
-		const scopedUpdate: IrohRemoteLiveActivityUpdateIntent = {
-			...request.update,
-			contentState: {
-				...contentState,
-				sessionID: contentState.sessionID ?? request.sessionId,
-				workspaceName: contentState.workspaceName ?? request.workspaceName,
-			},
-		};
 		try {
 			const status = await this.createPushNotificationDispatcher(
 				authorization.authorization,
-			).deliverLiveActivityUpdate(scopedUpdate);
+			).deliverLiveActivityUpdate(request.update);
 			return { ok: true, status };
 		} catch {
 			return { ok: true, status: "failed" };

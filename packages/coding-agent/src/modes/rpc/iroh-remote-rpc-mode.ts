@@ -11,14 +11,15 @@ import {
 	createIrohRemoteProjectionSanitizer,
 	createIrohRemoteRpcErrorResponse,
 	type IrohRemoteLiveActivityContentState,
-	type IrohRemoteLiveActivityToolGlyph,
 	type IrohRemoteLiveActivityUpdateIntent,
 	type IrohRemoteOutboundValueDecorator,
 	type IrohRemotePushNotificationDelivery,
 	type IrohRemoteRpcGrant,
+	MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
 	sanitizeIrohRemoteOutbound,
 	sanitizeIrohRemoteTranscriptText,
 } from "../../core/remote/iroh/index.ts";
+import type { ReviewWorkflowEvent } from "../../core/review.ts";
 import { getRpcErrorResponseTarget } from "../../core/rpc/correlation.ts";
 import {
 	type ConversationProjectionPreparedValue,
@@ -530,24 +531,44 @@ function attachIrohRemoteLiveActivityUpdates(
 		return () => {};
 	}
 	const updater = new IrohRemoteLiveActivityUpdater(runtimeHost, delivery, workspaceName);
-	const unsubscribe = runtimeHost.session.subscribe((event) => {
-		void updater.handle(event).catch(() => {});
+	const unsubscribeSession = runtimeHost.session.subscribe((event) => {
+		void updater.handleSessionEvent(event).catch(() => {});
 	});
+	const unsubscribeReviews =
+		runtimeHost.reviewWorkflows?.attachSink((event) => {
+			if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
+				return;
+			}
+			void updater.handleReviewEvent(event).catch(() => {});
+		}) ?? (() => {});
 	updater.start();
-	return unsubscribe;
+	return () => {
+		updater.stop();
+		unsubscribeSession();
+		unsubscribeReviews();
+	};
+}
+
+interface IrohRemoteLiveActivityOperation {
+	kind: IrohRemoteLiveActivityContentState["operationKind"];
+	id: string;
+	subject?: string;
+	startedAtEpochSeconds: number;
 }
 
 class IrohRemoteLiveActivityUpdater {
 	private readonly delivery: Required<Pick<IrohRemotePushNotificationDelivery, "deliverLiveActivityUpdate">>;
 	private readonly runtimeHost: AgentSessionRuntime;
 	private readonly workspaceName: string | undefined;
-	private readonly toolIndexesByCallId = new Map<string, number>();
 	private readonly instanceId = randomUUID();
 	private deliveryQueue: Promise<void> = Promise.resolve();
-	private recentTools: IrohRemoteLiveActivityToolGlyph[] = [];
+	private eventQueue: Promise<void> = Promise.resolve();
+	private currentState: IrohRemoteLiveActivityContentState | undefined;
+	private ordinaryOperation: IrohRemoteLiveActivityOperation | undefined;
 	private sequence = 0;
-	private active = false;
-	private pendingTerminalStatus: "completed" | "failed" | undefined;
+	private ordinaryActive = false;
+	private stopped = false;
+	private pendingOrdinaryTerminalStatus: IrohRemoteLiveActivityContentState["status"] | undefined;
 
 	constructor(
 		runtimeHost: AgentSessionRuntime,
@@ -563,116 +584,198 @@ class IrohRemoteLiveActivityUpdater {
 	}
 
 	start(): void {
-		if (!this.runtimeHost.session.isStreaming) {
+		void this.enqueueEvent(async () => {
+			const session = this.runtimeHost.session;
+			this.ordinaryActive = session.isBusy || session.isStreaming;
+			if (this.ordinaryActive) {
+				this.refreshOrdinaryOperation();
+			}
+			await this.projectRunningOperation();
+		}).catch(() => {});
+	}
+
+	stop(): void {
+		this.stopped = true;
+	}
+
+	handleSessionEvent(event: AgentSessionEvent): Promise<void> {
+		return this.enqueueEvent(async () => {
+			switch (event.type) {
+				case "agent_start":
+					if (!this.ordinaryActive) {
+						this.ordinaryOperation = undefined;
+					}
+					this.ordinaryActive = true;
+					this.pendingOrdinaryTerminalStatus = undefined;
+					this.refreshOrdinaryOperation();
+					await this.projectRunningOperation();
+					break;
+				case "planning_state_changed":
+					if (!this.ordinaryActive) {
+						return;
+					}
+					this.refreshOrdinaryOperation();
+					await this.projectRunningOperation();
+					break;
+				case "agent_end":
+					if (!this.ordinaryActive) {
+						return;
+					}
+					this.pendingOrdinaryTerminalStatus = liveActivityStatusForRunOutcome(
+						getRunTerminalOutcome(event.messages),
+					);
+					break;
+				case "agent_settled": {
+					if (!this.ordinaryActive || this.pendingOrdinaryTerminalStatus === undefined) {
+						return;
+					}
+					const operation = this.ordinaryOperation;
+					const status = this.pendingOrdinaryTerminalStatus;
+					this.ordinaryActive = false;
+					this.ordinaryOperation = undefined;
+					this.pendingOrdinaryTerminalStatus = undefined;
+					if (await this.projectRunningOperation()) {
+						return;
+					}
+					if (operation) {
+						await this.projectOperation(operation, status);
+					}
+					break;
+				}
+				default:
+					break;
+			}
+		});
+	}
+
+	handleReviewEvent(event: ReviewWorkflowEvent): Promise<void> {
+		return this.enqueueEvent(async () => {
+			if (event.type !== "workflow_end") {
+				await this.projectRunningOperation();
+				return;
+			}
+			if (await this.projectRunningOperation()) {
+				return;
+			}
+			const operation = this.resolveReviewOperation(event.workflowId);
+			if (operation) {
+				await this.projectOperation(operation, event.status);
+			}
+		});
+	}
+
+	private enqueueEvent(operation: () => Promise<void>): Promise<void> {
+		const queued = this.eventQueue.then(async () => {
+			if (!this.stopped) {
+				await operation();
+			}
+		});
+		this.eventQueue = queued.catch(() => {});
+		return queued;
+	}
+
+	private refreshOrdinaryOperation(): void {
+		const sessionID = nonEmptyLiveActivityString(this.runtimeHost.session.sessionId);
+		const workspaceName = nonEmptyLiveActivityString(this.workspaceName);
+		if (!sessionID || !workspaceName) {
+			this.ordinaryOperation = undefined;
 			return;
 		}
-		this.active = true;
-		void this.sendUpdate("running").catch(() => {});
+		const planning = this.runtimeHost.session.getPlanningState?.() ?? { mode: "build" as const, plan: null };
+		const kind = planning.mode === "plan" ? "planCreation" : "conversation";
+		const previous = this.ordinaryOperation;
+		this.ordinaryOperation = {
+			kind,
+			id: sessionID,
+			...(kind === "planCreation" && planning.plan?.title
+				? { subject: boundLiveActivitySubject(planning.plan.title) }
+				: {}),
+			startedAtEpochSeconds:
+				previous?.kind === kind && previous.id === sessionID
+					? previous.startedAtEpochSeconds
+					: Math.floor(Date.now() / 1000),
+		};
 	}
 
-	async handle(event: AgentSessionEvent): Promise<void> {
-		switch (event.type) {
-			case "agent_start":
-				this.active = true;
-				this.pendingTerminalStatus = undefined;
-				this.recentTools = [];
-				this.toolIndexesByCallId.clear();
-				await this.sendUpdate("running");
-				break;
-			case "tool_execution_start":
-				this.active = true;
-				if (this.recordTool(event.toolCallId, createLiveActivityToolGlyph(event.toolName, "started"))) {
-					await this.sendUpdate("running");
-				}
-				break;
-			case "tool_execution_end":
-				this.active = true;
-				if (
-					this.recordTool(
-						event.toolCallId,
-						createLiveActivityToolGlyph(event.toolName, event.isError ? "failed" : "completed"),
-					)
-				) {
-					await this.sendUpdate("running");
-				}
-				break;
-			case "agent_end":
-				if (!this.active) {
-					return;
-				}
-				this.pendingTerminalStatus = getRunTerminalOutcome(event.messages) === "completed" ? "completed" : "failed";
-				break;
-			case "agent_settled": {
-				if (!this.active || this.pendingTerminalStatus === undefined) {
-					return;
-				}
-				const terminalStatus = this.pendingTerminalStatus;
-				// End the old run synchronously so delayed delivery cannot clear state
-				// established by a newer agent_start handler.
-				this.active = false;
-				this.pendingTerminalStatus = undefined;
-				this.toolIndexesByCallId.clear();
-				await this.sendUpdate(terminalStatus);
-				break;
-			}
-			default:
-				break;
+	private resolveReviewOperation(workflowId?: string): IrohRemoteLiveActivityOperation | undefined {
+		const reviewWorkflows = this.runtimeHost.reviewWorkflows;
+		if (!reviewWorkflows) {
+			return undefined;
 		}
+		const descriptor =
+			workflowId === undefined
+				? reviewWorkflows
+						.list()
+						.filter((review) => review.status === "running")
+						.at(-1)
+				: reviewWorkflows.get(workflowId);
+		if (!descriptor || (descriptor.status === "running" && descriptor.workflowId.trim().length === 0)) {
+			return undefined;
+		}
+		const id = nonEmptyLiveActivityString(descriptor.workflowId);
+		return id
+			? {
+					kind: "review",
+					id,
+					startedAtEpochSeconds: Math.max(0, Math.floor(descriptor.startedAt / 1000)),
+				}
+			: undefined;
 	}
 
-	private recordTool(toolCallId: string | undefined, tool: IrohRemoteLiveActivityToolGlyph): boolean {
-		const normalizedCallId = typeof toolCallId === "string" && toolCallId.length > 0 ? toolCallId : undefined;
-		if (normalizedCallId) {
-			const existingIndex = this.toolIndexesByCallId.get(normalizedCallId);
-			if (existingIndex !== undefined && existingIndex < this.recentTools.length) {
-				this.recentTools[existingIndex] = tool;
-				return true;
-			}
+	private async projectRunningOperation(): Promise<boolean> {
+		const review = this.resolveReviewOperation();
+		if (review) {
+			await this.projectOperation(review, "running");
+			return true;
 		}
-		if (this.recentTools.at(-1)?.name === tool.name) {
+		if (!this.ordinaryActive) {
 			return false;
 		}
-		this.recentTools.push(tool);
-		while (this.recentTools.length > 6) {
-			this.recentTools.shift();
-			for (const [callId, index] of this.toolIndexesByCallId) {
-				if (index === 0) {
-					this.toolIndexesByCallId.delete(callId);
-				} else {
-					this.toolIndexesByCallId.set(callId, index - 1);
-				}
-			}
+		this.refreshOrdinaryOperation();
+		if (!this.ordinaryOperation) {
+			return false;
 		}
-		if (normalizedCallId) {
-			this.toolIndexesByCallId.set(normalizedCallId, this.recentTools.length - 1);
-		}
+		await this.projectOperation(this.ordinaryOperation, "running");
 		return true;
 	}
 
-	private async sendUpdate(
+	private async projectOperation(
+		operation: IrohRemoteLiveActivityOperation,
 		status: IrohRemoteLiveActivityContentState["status"],
-		activityEvent: "update" | "end" = "update",
 	): Promise<void> {
+		const sessionID = nonEmptyLiveActivityString(this.runtimeHost.session.sessionId);
+		const workspaceName = nonEmptyLiveActivityString(this.workspaceName);
+		if (!sessionID || !workspaceName) {
+			return;
+		}
 		const nowSeconds = Math.floor(Date.now() / 1000);
-		const currentTool = this.recentTools.at(-1);
-		const completionState = getIrohRemoteCompletionState(this.runtimeHost);
+		const operationStartedAtEpochSeconds =
+			this.currentState?.operationKind === operation.kind &&
+			this.currentState.operationID === operation.id &&
+			(status !== "running" || this.currentState.status === "running")
+				? this.currentState.operationStartedAtEpochSeconds
+				: operation.startedAtEpochSeconds;
+		const updatedAtEpochSeconds = Math.max(nowSeconds, operationStartedAtEpochSeconds);
 		const contentState: IrohRemoteLiveActivityContentState = {
+			operationKind: operation.kind,
+			operationID: operation.id,
 			status,
-			statusText: liveActivityStatusText(status, currentTool),
-			...(currentTool === undefined ? {} : { currentTool }),
-			recentTools: this.recentTools.slice(-6),
-			sessionID: completionState.sessionId,
-			...(this.workspaceName === undefined ? {} : { workspaceName: this.workspaceName }),
-			updatedAtEpochSeconds: nowSeconds,
+			...(operation.subject === undefined ? {} : { subject: operation.subject }),
+			sessionID,
+			workspaceName,
+			operationStartedAtEpochSeconds,
+			updatedAtEpochSeconds,
 		};
+		if (hasSameLiveActivitySemantics(this.currentState, contentState)) {
+			return;
+		}
+		this.currentState = contentState;
 		const update: IrohRemoteLiveActivityUpdateIntent = {
-			eventId: `live-activity:${completionState.sessionId}:${completionState.runId ?? "active"}:${this.instanceId}:${++this.sequence}`,
-			kind: activityEvent === "end" ? "live_activity_end" : "live_activity_update",
-			activityEvent,
+			eventId: `live-activity:${this.instanceId}:${++this.sequence}`,
+			kind: "live_activity_update",
+			activityEvent: "update",
 			contentState,
-			...(activityEvent === "end"
-				? { dismissalDateEpochSeconds: nowSeconds + 45 }
-				: { staleDateEpochSeconds: nowSeconds + 90 }),
+			staleDateEpochSeconds: updatedAtEpochSeconds + 90,
 		};
 		const delivery = this.deliveryQueue.then(() => this.delivery.deliverLiveActivityUpdate(update));
 		this.deliveryQueue = delivery.then(
@@ -683,24 +786,50 @@ class IrohRemoteLiveActivityUpdater {
 	}
 }
 
-function createLiveActivityToolGlyph(
-	toolName: string | undefined,
-	status: IrohRemoteLiveActivityToolGlyph["status"],
-): IrohRemoteLiveActivityToolGlyph {
-	const name = sanitizeLiveActivityToolName(toolName);
-	return {
-		name,
-		symbolName: liveActivitySymbolNameForTool(name),
-		status,
-	};
+function nonEmptyLiveActivityString(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	return trimmed ? value : undefined;
 }
 
-function sanitizeLiveActivityToolName(toolName: string | undefined): string {
-	const trimmed = toolName?.trim();
+function boundLiveActivitySubject(value: string): string | undefined {
+	const trimmed = value.trim();
 	if (!trimmed) {
-		return "tool";
+		return undefined;
 	}
-	return trimmed.slice(0, 32);
+	let bounded = "";
+	for (const character of trimmed) {
+		if (
+			Buffer.byteLength(bounded, "utf8") + Buffer.byteLength(character, "utf8") >
+			MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES
+		) {
+			break;
+		}
+		bounded += character;
+	}
+	return bounded || undefined;
+}
+
+function hasSameLiveActivitySemantics(
+	current: IrohRemoteLiveActivityContentState | undefined,
+	next: IrohRemoteLiveActivityContentState,
+): boolean {
+	return (
+		current?.operationKind === next.operationKind &&
+		current.operationID === next.operationID &&
+		current.status === next.status &&
+		current.subject === next.subject &&
+		current.sessionID === next.sessionID &&
+		current.workspaceName === next.workspaceName
+	);
+}
+
+function liveActivityStatusForRunOutcome(
+	outcome: IrohRemoteRunTerminalOutcome,
+): IrohRemoteLiveActivityContentState["status"] {
+	if (outcome === "aborted") {
+		return "cancelled";
+	}
+	return outcome;
 }
 
 export function createIrohRemoteHostCommandRpcTransport(
@@ -854,62 +983,6 @@ function getIrohRemoteRpcErrorTarget(line: string): { id: string | undefined; co
 		return getRpcErrorResponseTarget(parsed);
 	} catch {
 		return { id: undefined, command: "parse" };
-	}
-}
-
-function liveActivityStatusText(
-	status: IrohRemoteLiveActivityContentState["status"],
-	currentTool: IrohRemoteLiveActivityToolGlyph | undefined,
-): string {
-	if (status === "completed") {
-		return "Volt finished";
-	}
-	if (status === "failed") {
-		return "Volt needs attention";
-	}
-	if (status === "waiting") {
-		return "Waiting for input";
-	}
-	return currentTool ? `Using ${currentTool.name}` : "Volt is thinking";
-}
-
-function liveActivitySymbolNameForTool(toolName: string): string {
-	switch (toolName.toLowerCase()) {
-		case "read":
-			return "doc.text.magnifyingglass";
-		case "write":
-			return "square.and.pencil";
-		case "edit":
-			return "pencil.and.outline";
-		case "bash":
-		case "shell":
-		case "terminal":
-			return "terminal";
-		case "find":
-		case "grep":
-		case "search":
-		case "rg":
-			return "magnifyingglass";
-		case "lsp":
-			return "point.3.connected.trianglepath.dotted";
-		case "build":
-		case "build_sim":
-		case "build_run_sim":
-			return "hammer";
-		case "test":
-		case "test_sim":
-			return "checkmark.seal";
-		case "screenshot":
-		case "snapshot_ui":
-			return "camera.viewfinder";
-		case "tap":
-		case "touch":
-		case "gesture":
-		case "swipe":
-		case "drag":
-			return "hand.tap";
-		default:
-			return "sparkles";
 	}
 }
 

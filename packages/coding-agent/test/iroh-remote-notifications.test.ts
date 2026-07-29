@@ -1,8 +1,10 @@
+import { Buffer } from "node:buffer";
 import type { AgentMessage } from "@hansjm10/volt-agent-core";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentSessionEvent, PromptPreflightResult } from "../src/core/agent-session.ts";
 import { type AgentSessionRuntime, isConversationTranscriptCommittedEvent } from "../src/core/agent-session-runtime.ts";
 import { REVIEW_UNCOMMITTED_ACTION_ID } from "../src/core/host-actions.ts";
+import type { PlanningState } from "../src/core/planning.ts";
 import type { IrohRemoteClientAuthorizationSuccess } from "../src/core/remote/iroh/authorization.ts";
 import {
 	createEmptyIrohRemoteHostState,
@@ -10,6 +12,7 @@ import {
 	hashIrohRemotePushToken,
 	IrohRemoteAuditLogger,
 	IrohRemoteHostStateManager,
+	type IrohRemoteLiveActivityContentState,
 	type IrohRemoteLiveActivityRegistration,
 	type IrohRemoteLiveActivityUpdateIntent,
 	IrohRemotePushNotificationDispatcher,
@@ -18,6 +21,7 @@ import {
 	type IrohRemotePushRelayNotificationRequest,
 	type IrohRemotePushTarget,
 } from "../src/core/remote/iroh/index.ts";
+import type { ExecuteReviewWorkflowResult } from "../src/core/review.ts";
 import { ReviewWorkflowManager } from "../src/core/review-workflows.ts";
 import type { SessionEntry } from "../src/core/session-manager.ts";
 import { createRemoteConversationTranscriptEntry } from "../src/daemon/conversation-commands.ts";
@@ -173,6 +177,60 @@ function publishTestTranscriptCommit(runtimeHost: AgentSessionRuntime, entry: Se
 	runtimeHost.publishConversationProjectionEvent({ type: "conversation_transcript_committed", entry });
 }
 
+function createLiveActivityContentState(
+	overrides: Partial<IrohRemoteLiveActivityContentState> = {},
+): IrohRemoteLiveActivityContentState {
+	return {
+		operationKind: "conversation",
+		operationID: "session-one",
+		status: "running",
+		sessionID: "session-one",
+		workspaceName: "volt-app",
+		operationStartedAtEpochSeconds: 100,
+		updatedAtEpochSeconds: 123,
+		...overrides,
+	};
+}
+
+function startTestReview(
+	manager: ReviewWorkflowManager,
+	workflowId: string,
+): {
+	finish(result: ExecuteReviewWorkflowResult): void;
+} {
+	let finish: (result: ExecuteReviewWorkflowResult) => void = () => {};
+	const result = new Promise<ExecuteReviewWorkflowResult>((resolve) => {
+		finish = resolve;
+	});
+	const { launch } = manager.start({
+		prepared: {
+			workflowId,
+			action: "review.uncommitted",
+			resolution: {
+				description: "private review target",
+				workflowDescription: "uncommitted changes",
+				diffCommand: "git diff HEAD",
+				diff: "private diff",
+				truncated: false,
+			},
+		},
+		execute: async (hooks) => {
+			hooks.onEvent({
+				type: "workflow_start",
+				workflowId,
+				kind: "review",
+				action: "review.uncommitted",
+				title: "Review",
+				message: "Reviewing uncommitted changes.",
+				status: "running",
+			});
+			return result;
+		},
+	});
+	launch();
+	return { finish };
+}
+
 function createLiveActivityRegistration(
 	overrides: Partial<IrohRemoteLiveActivityRegistration> = {},
 ): IrohRemoteLiveActivityRegistration {
@@ -292,14 +350,10 @@ describe("Iroh remote notification requests", () => {
 				activityPushToken: "activity-token",
 				eventId: "event-1",
 				kind: "live_activity_update",
-				contentState: {
-					status: "running",
-					statusText: "Using read",
-					currentTool: { name: "read", symbolName: "doc.text.magnifyingglass", status: "started" },
-					recentTools: [{ name: "read", symbolName: "doc.text.magnifyingglass", status: "started" }],
+				contentState: createLiveActivityContentState({
+					operationID: "session-1",
 					sessionID: "session-1",
-					updatedAtEpochSeconds: 123,
-				},
+				}),
 				staleDateEpochSeconds: 213,
 			}),
 		).resolves.toEqual({ status: "sent" });
@@ -319,7 +373,13 @@ describe("Iroh remote notification requests", () => {
 		expect(body).toMatchObject({
 			activityId: "activity-1",
 			activityPushToken: "activity-token",
-			contentState: { statusText: "Using read" },
+			contentState: {
+				operationKind: "conversation",
+				operationID: "session-1",
+				status: "running",
+				sessionID: "session-1",
+				workspaceName: "volt-app",
+			},
 			eventId: "event-1",
 			pushTargetId: "relay-target-1",
 		});
@@ -339,12 +399,7 @@ describe("Iroh remote notification requests", () => {
 			tokenEnvironment: "development",
 			eventId: "event-1",
 			kind: "live_activity_update",
-			contentState: {
-				status: "running",
-				statusText: "Using read",
-				recentTools: [],
-				updatedAtEpochSeconds: 123,
-			},
+			contentState: createLiveActivityContentState(),
 		});
 
 		const init = fetcher.mock.calls[0]?.[1];
@@ -372,12 +427,7 @@ describe("Iroh remote notification requests", () => {
 				activityPushToken: "activity-token",
 				eventId: "event-1",
 				kind: "live_activity_update",
-				contentState: {
-					status: "running",
-					statusText: "Using read",
-					recentTools: [],
-					updatedAtEpochSeconds: 123,
-				},
+				contentState: createLiveActivityContentState(),
 			}),
 		).resolves.toEqual({ status: "invalid_target" });
 	});
@@ -636,6 +686,7 @@ describe("Iroh remote notification requests", () => {
 				}),
 			},
 			stream: { recv, send },
+			workspaceName: "volt-app",
 			workspacePath: "/workspace",
 		});
 
@@ -663,7 +714,7 @@ describe("Iroh remote notification requests", () => {
 		await expect(modePromise).resolves.toBeUndefined();
 	});
 
-	test("sends Live Activity tool state through the push relay when an activity target exists", async () => {
+	test("sends semantic Live Activity state through the push relay when an activity target exists", async () => {
 		const stateManager = createStateManagerWithClient(
 			[
 				createEnabledPushTarget({
@@ -687,15 +738,7 @@ describe("Iroh remote notification requests", () => {
 			retryDelayMs: 0,
 			stateManager,
 		});
-		const contentState = {
-			status: "running" as const,
-			statusText: "Using read",
-			currentTool: { name: "read", symbolName: "doc.text.magnifyingglass", status: "started" as const },
-			recentTools: [{ name: "read", symbolName: "doc.text.magnifyingglass", status: "started" as const }],
-			sessionID: "session-one",
-			workspaceName: "volt-app",
-			updatedAtEpochSeconds: 123,
-		};
+		const contentState = createLiveActivityContentState();
 
 		await expect(
 			dispatcher.deliverLiveActivityUpdate({
@@ -717,6 +760,48 @@ describe("Iroh remote notification requests", () => {
 			contentState,
 			staleDateEpochSeconds: 213,
 		});
+	});
+
+	test("retries transient Live Activity relay failures with the same semantic update", async () => {
+		const stateManager = createStateManagerWithClient(
+			[
+				createEnabledPushTarget({
+					liveActivity: {
+						activityId: "activity-1",
+						pushToken: "activity-token",
+						tokenHash: LIVE_ACTIVITY_TOKEN_HASH,
+						tokenEnvironment: "production",
+						updatedAt: 20,
+					},
+				}),
+			],
+			[createLiveActivityRegistration()],
+		);
+		let attempts = 0;
+		const sendLiveActivityUpdate = vi.fn(async (_request: unknown) => {
+			attempts += 1;
+			if (attempts < 3) {
+				throw new Error("transient relay failure");
+			}
+			return { status: "sent" as const };
+		});
+		const dispatcher = new IrohRemotePushNotificationDispatcher({
+			clientNodeId: "paired-client",
+			relayClient: createRelayClient({ sendLiveActivityUpdate }),
+			retryAttempts: 3,
+			retryDelayMs: 0,
+			stateManager,
+		});
+		const update: IrohRemoteLiveActivityUpdateIntent = {
+			eventId: "live-activity:retry",
+			kind: "live_activity_update",
+			contentState: createLiveActivityContentState(),
+			staleDateEpochSeconds: 213,
+		};
+
+		await expect(dispatcher.deliverLiveActivityUpdate(update)).resolves.toBe("sent");
+		expect(sendLiveActivityUpdate).toHaveBeenCalledTimes(3);
+		expect(sendLiveActivityUpdate.mock.calls[0]?.[0]).toEqual(sendLiveActivityUpdate.mock.calls[2]?.[0]);
 	});
 
 	test("sends Live Activity updates when completion notifications are disabled", async () => {
@@ -744,15 +829,7 @@ describe("Iroh remote notification requests", () => {
 			retryDelayMs: 0,
 			stateManager,
 		});
-		const contentState = {
-			status: "running" as const,
-			statusText: "Using read",
-			currentTool: { name: "read", symbolName: "doc.text.magnifyingglass", status: "started" as const },
-			recentTools: [{ name: "read", symbolName: "doc.text.magnifyingglass", status: "started" as const }],
-			sessionID: "session-one",
-			workspaceName: "volt-app",
-			updatedAtEpochSeconds: 123,
-		};
+		const contentState = createLiveActivityContentState();
 
 		await expect(
 			dispatcher.deliverLiveActivityUpdate({
@@ -819,15 +896,7 @@ describe("Iroh remote notification requests", () => {
 			retryDelayMs: 0,
 			stateManager,
 		});
-		const contentState = {
-			status: "running" as const,
-			statusText: "Using read",
-			currentTool: { name: "read", symbolName: "doc.text.magnifyingglass", status: "started" as const },
-			recentTools: [{ name: "read", symbolName: "doc.text.magnifyingglass", status: "started" as const }],
-			sessionID: "session-one",
-			workspaceName: "volt-app",
-			updatedAtEpochSeconds: 123,
-		};
+		const contentState = createLiveActivityContentState();
 
 		await expect(
 			dispatcher.deliverLiveActivityUpdate({
@@ -893,15 +962,10 @@ describe("Iroh remote notification requests", () => {
 			retryDelayMs: 0,
 			stateManager,
 		});
-		const contentState = {
-			status: "running" as const,
-			statusText: "Using bash",
-			currentTool: { name: "bash", symbolName: "terminal", status: "started" as const },
-			recentTools: [{ name: "bash", symbolName: "terminal", status: "started" as const }],
+		const contentState = createLiveActivityContentState({
+			operationID: "session-two",
 			sessionID: "session-two",
-			workspaceName: "volt-app",
-			updatedAtEpochSeconds: 123,
-		};
+		});
 
 		await expect(
 			dispatcher.deliverLiveActivityUpdate({
@@ -981,31 +1045,9 @@ describe("Iroh remote notification requests", () => {
 		await expect(stateManager.getClient("paired-client")).resolves.not.toHaveProperty("liveActivities");
 	});
 
-	test("Live Activity updater sends running state and keeps completed activities updateable", async () => {
+	test("Live Activity updater projects conversation state, suppresses tool events, and keeps terminal activities updateable", async () => {
 		const session = createTestSession("session-one", "conversation-run");
-		const stateManager = createStateManagerWithClient(
-			[
-				createEnabledPushTarget({
-					liveActivity: {
-						activityId: "activity-1",
-						pushToken: "activity-token",
-						tokenHash: LIVE_ACTIVITY_TOKEN_HASH,
-						tokenEnvironment: "production",
-						updatedAt: 20,
-					},
-				}),
-			],
-			[createLiveActivityRegistration()],
-		);
-		const relayClient = createRelayClient({
-			sendLiveActivityUpdate: vi.fn(async () => ({ status: "sent" as const })),
-		});
-		const dispatcher = new IrohRemotePushNotificationDispatcher({
-			clientNodeId: "paired-client",
-			relayClient,
-			retryDelayMs: 0,
-			stateManager,
-		});
+		const updates: IrohRemoteLiveActivityUpdateIntent[] = [];
 		const runtimeHost = {
 			session,
 			newSession: vi.fn(async () => ({ cancelled: true })),
@@ -1015,102 +1057,289 @@ describe("Iroh remote notification requests", () => {
 			setRebindSession: vi.fn(),
 		} as unknown as AgentSessionRuntime;
 		const { modePromise, recv } = await startIrohRpcMode(runtimeHost, session, {
-			notificationDelivery: dispatcher,
+			notificationDelivery: {
+				deliverNotification: vi.fn(async () => "no_push_target" as const),
+				deliverLiveActivityUpdate: vi.fn(async (update: IrohRemoteLiveActivityUpdateIntent) => {
+					updates.push(update);
+					return "sent" as const;
+				}),
+			},
 			workspaceName: "volt-app",
 		});
-		const sessionHandlers = session.subscribe.mock.calls.map((call) => call[0] as (event: object) => void);
-		if (sessionHandlers.length === 0) {
-			throw new Error("Expected Live Activity session subscription");
-		}
-		const emitSessionEvent = (event: object) => {
+		const sessionHandlers = session.subscribe.mock.calls.map((call) => call[0] as (event: AgentSessionEvent) => void);
+		const emit = (event: AgentSessionEvent) => {
 			for (const handler of sessionHandlers) {
 				handler(event);
 			}
 		};
 
-		emitSessionEvent({ type: "agent_start" });
-		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(1));
-		expect(relayClient.sendLiveActivityUpdate).toHaveBeenLastCalledWith(
-			expect.objectContaining({
-				activityEvent: "update",
-				contentState: expect.objectContaining({ status: "running", statusText: "Volt is thinking" }),
-				kind: "live_activity_update",
-			}),
-		);
+		emit({ type: "agent_start" });
+		await vi.waitFor(() => expect(updates).toHaveLength(1));
+		const running = updates[0]!;
+		expect(running).toMatchObject({
+			activityEvent: "update",
+			kind: "live_activity_update",
+			contentState: {
+				operationKind: "conversation",
+				operationID: "session-one",
+				status: "running",
+				sessionID: "session-one",
+				workspaceName: "volt-app",
+				operationStartedAtEpochSeconds: expect.any(Number),
+				updatedAtEpochSeconds: expect.any(Number),
+			},
+		});
+		expect(running.staleDateEpochSeconds).toBe(running.contentState.updatedAtEpochSeconds + 90);
 
-		emitSessionEvent({ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: {} });
-		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(2));
-		expect(relayClient.sendLiveActivityUpdate).toHaveBeenLastCalledWith(
-			expect.objectContaining({
-				contentState: expect.objectContaining({
-					currentTool: expect.objectContaining({ name: "read", status: "started" }),
-					status: "running",
-					statusText: "Using read",
+		emit({ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: {} });
+		emit({ type: "tool_execution_end", toolCallId: "read-1", toolName: "read", result: {}, isError: false });
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(updates).toHaveLength(1);
+
+		emit({ type: "agent_end", messages: [], willRetry: false });
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(updates).toHaveLength(1);
+		emit({ type: "agent_start" });
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(updates).toHaveLength(1);
+
+		emit({ type: "agent_end", messages: [], willRetry: false });
+		emit({ type: "agent_settled" });
+		await vi.waitFor(() => expect(updates).toHaveLength(2));
+		expect(updates[1]).toMatchObject({
+			activityEvent: "update",
+			kind: "live_activity_update",
+			contentState: {
+				operationKind: "conversation",
+				operationID: "session-one",
+				status: "completed",
+				operationStartedAtEpochSeconds: running.contentState.operationStartedAtEpochSeconds,
+			},
+		});
+		expect(updates).not.toContainEqual(expect.objectContaining({ activityEvent: "end", kind: "live_activity_end" }));
+		expect(new Set(updates.map((update) => update.eventId)).size).toBe(updates.length);
+
+		recv.end();
+		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("Live Activity updater projects Plan creation and bounded title changes with a stable start time", async () => {
+		const session = createTestSession("session-one", "plan-run");
+		let planning: PlanningState = { mode: "plan", plan: null };
+		Object.defineProperty(session, "getPlanningState", { value: () => planning });
+		const updates: IrohRemoteLiveActivityUpdateIntent[] = [];
+		const runtimeHost = {
+			session,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const { modePromise, recv } = await startIrohRpcMode(runtimeHost, session, {
+			notificationDelivery: {
+				deliverNotification: vi.fn(async () => "no_push_target" as const),
+				deliverLiveActivityUpdate: vi.fn(async (update: IrohRemoteLiveActivityUpdateIntent) => {
+					updates.push(update);
+					return "sent" as const;
 				}),
-				kind: "live_activity_update",
+			},
+			workspaceName: "volt-app",
+		});
+		const handlers = session.subscribe.mock.calls.map((call) => call[0] as (event: AgentSessionEvent) => void);
+		const emit = (event: AgentSessionEvent) => {
+			for (const handler of handlers) handler(event);
+		};
+
+		emit({ type: "agent_start" });
+		await vi.waitFor(() => expect(updates).toHaveLength(1));
+		expect(updates[0]?.contentState).toMatchObject({
+			operationKind: "planCreation",
+			operationID: "session-one",
+			status: "running",
+		});
+		expect(updates[0]?.contentState).not.toHaveProperty("subject");
+		const startedAt = updates[0]!.contentState.operationStartedAtEpochSeconds;
+
+		const title = "🚀".repeat(100);
+		planning = {
+			mode: "plan",
+			plan: { id: "plan-one", revision: 1, phase: "draft", title, steps: [] },
+		};
+		emit({ type: "planning_state_changed", planning });
+		await vi.waitFor(() => expect(updates).toHaveLength(2));
+		expect(updates[1]?.contentState).toMatchObject({
+			operationKind: "planCreation",
+			operationID: "session-one",
+			status: "running",
+			operationStartedAtEpochSeconds: startedAt,
+			subject: "🚀".repeat(64),
+		});
+		expect(Buffer.byteLength(updates[1]!.contentState.subject ?? "", "utf8")).toBe(256);
+
+		planning = { ...planning, plan: { ...planning.plan!, revision: 2, title: "Renamed plan" } };
+		emit({ type: "planning_state_changed", planning });
+		await vi.waitFor(() => expect(updates).toHaveLength(3));
+		expect(updates[2]?.contentState).toMatchObject({
+			operationStartedAtEpochSeconds: startedAt,
+			subject: "Renamed plan",
+		});
+
+		recv.end();
+		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("Live Activity updater observes detached review-only work and omits review subjects", async () => {
+		const session = createTestSession("session-one", "review-run");
+		const reviewWorkflows = new ReviewWorkflowManager();
+		const updates: IrohRemoteLiveActivityUpdateIntent[] = [];
+		const runtimeHost = {
+			session,
+			reviewWorkflows,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const { modePromise, recv } = await startIrohRpcMode(runtimeHost, session, {
+			notificationDelivery: {
+				deliverNotification: vi.fn(async () => "no_push_target" as const),
+				deliverLiveActivityUpdate: vi.fn(async (update: IrohRemoteLiveActivityUpdateIntent) => {
+					updates.push(update);
+					return "sent" as const;
+				}),
+			},
+			workspaceName: "volt-app",
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(updates).toEqual([]);
+
+		const review = startTestReview(reviewWorkflows, "review:one");
+		await vi.waitFor(() => expect(updates).toHaveLength(1));
+		const running = updates[0]!.contentState;
+		expect(running).toMatchObject({
+			operationKind: "review",
+			operationID: "review:one",
+			status: "running",
+			sessionID: "session-one",
+			workspaceName: "volt-app",
+		});
+		expect(running).not.toHaveProperty("subject");
+
+		review.finish({ status: "completed", raw: "private result", findingsCount: 0 });
+		await vi.waitFor(() => expect(updates).toHaveLength(2));
+		expect(updates[1]?.contentState).toMatchObject({
+			operationKind: "review",
+			operationID: "review:one",
+			status: "completed",
+			operationStartedAtEpochSeconds: running.operationStartedAtEpochSeconds,
+		});
+
+		recv.end();
+		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("Live Activity updater keeps concurrent reviews running and terminalizes only the last review", async () => {
+		const session = createTestSession("session-one", "review-run");
+		const reviewWorkflows = new ReviewWorkflowManager();
+		const updates: IrohRemoteLiveActivityUpdateIntent[] = [];
+		const runtimeHost = {
+			session,
+			reviewWorkflows,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const { modePromise, recv } = await startIrohRpcMode(runtimeHost, session, {
+			notificationDelivery: {
+				deliverNotification: vi.fn(async () => "no_push_target" as const),
+				deliverLiveActivityUpdate: vi.fn(async (update: IrohRemoteLiveActivityUpdateIntent) => {
+					updates.push(update);
+					return "sent" as const;
+				}),
+			},
+			workspaceName: "volt-app",
+		});
+
+		const first = startTestReview(reviewWorkflows, "review:first");
+		await vi.waitFor(() => expect(updates.at(-1)?.contentState.operationID).toBe("review:first"));
+		const second = startTestReview(reviewWorkflows, "review:second");
+		await vi.waitFor(() => expect(updates.at(-1)?.contentState.operationID).toBe("review:second"));
+
+		second.finish({ status: "cancelled" });
+		await vi.waitFor(() =>
+			expect(updates.at(-1)?.contentState).toMatchObject({
+				operationID: "review:first",
+				status: "running",
 			}),
 		);
-
-		emitSessionEvent({
-			type: "tool_execution_end",
-			toolCallId: "read-1",
-			toolName: "read",
-			result: {},
-			isError: false,
-		});
-		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(3));
-		emitSessionEvent({
-			type: "tool_execution_end",
-			toolCallId: "read-2",
-			toolName: "read",
-			result: {},
-			isError: false,
-		});
-		await new Promise((resolve) => setImmediate(resolve));
-		expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(3);
-
-		emitSessionEvent({
-			type: "tool_execution_end",
-			toolCallId: "bash-1",
-			toolName: "bash",
-			result: {},
-			isError: false,
-		});
-		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(4));
-		// A raw agent_end may be followed by proactive compaction and another
-		// agent run, so it must not publish a terminal state yet.
-		emitSessionEvent({ type: "agent_end", messages: [], willRetry: false });
-		await new Promise((resolve) => setImmediate(resolve));
-		expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(4);
-
-		emitSessionEvent({ type: "agent_start" });
-		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(5));
-		expect(relayClient.sendLiveActivityUpdate).toHaveBeenLastCalledWith(
+		expect(updates).not.toContainEqual(
 			expect.objectContaining({
-				activityEvent: "update",
-				contentState: expect.objectContaining({ status: "running", statusText: "Volt is thinking" }),
-				kind: "live_activity_update",
+				contentState: expect.objectContaining({ operationID: "review:second", status: "cancelled" }),
 			}),
 		);
 
-		emitSessionEvent({ type: "agent_end", messages: [], willRetry: false });
-		await new Promise((resolve) => setImmediate(resolve));
-		expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(5);
-		emitSessionEvent({ type: "agent_settled" });
-		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(6));
-		expect(relayClient.sendLiveActivityUpdate).toHaveBeenLastCalledWith(
+		first.finish({ status: "failed", errorMessage: "private provider failure" });
+		await vi.waitFor(() =>
+			expect(updates.at(-1)?.contentState).toMatchObject({
+				operationID: "review:first",
+				status: "failed",
+			}),
+		);
+
+		recv.end();
+		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("Live Activity updater falls directly from a finished review to overlapping conversation work", async () => {
+		const session = createTestSession("session-one", "conversation-run");
+		const reviewWorkflows = new ReviewWorkflowManager();
+		const updates: IrohRemoteLiveActivityUpdateIntent[] = [];
+		const runtimeHost = {
+			session,
+			reviewWorkflows,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const { modePromise, recv } = await startIrohRpcMode(runtimeHost, session, {
+			notificationDelivery: {
+				deliverNotification: vi.fn(async () => "no_push_target" as const),
+				deliverLiveActivityUpdate: vi.fn(async (update: IrohRemoteLiveActivityUpdateIntent) => {
+					updates.push(update);
+					return "sent" as const;
+				}),
+			},
+			workspaceName: "volt-app",
+		});
+		const handlers = session.subscribe.mock.calls.map((call) => call[0] as (event: AgentSessionEvent) => void);
+		for (const handler of handlers) handler({ type: "agent_start" });
+		await vi.waitFor(() => expect(updates.at(-1)?.contentState.operationKind).toBe("conversation"));
+
+		const review = startTestReview(reviewWorkflows, "review:overlap");
+		await vi.waitFor(() => expect(updates.at(-1)?.contentState.operationKind).toBe("review"));
+		review.finish({ status: "completed", raw: "private result", findingsCount: 1 });
+		await vi.waitFor(() =>
+			expect(updates.at(-1)?.contentState).toMatchObject({ operationKind: "conversation", status: "running" }),
+		);
+		expect(updates).not.toContainEqual(
 			expect.objectContaining({
-				activityEvent: "update",
-				contentState: expect.objectContaining({ status: "completed", statusText: "Volt finished" }),
-				kind: "live_activity_update",
+				contentState: expect.objectContaining({ operationID: "review:overlap", status: "completed" }),
 			}),
 		);
-		expect(relayClient.sendLiveActivityUpdate).not.toHaveBeenCalledWith(
-			expect.objectContaining({ activityEvent: "end", kind: "live_activity_end" }),
-		);
 
-		emitSessionEvent({ type: "agent_start" });
-		await vi.waitFor(() => expect(relayClient.sendLiveActivityUpdate).toHaveBeenCalledTimes(7));
+		for (const handler of handlers) {
+			handler({ type: "agent_end", messages: [], willRetry: false });
+			handler({ type: "agent_settled" });
+		}
+		await vi.waitFor(() =>
+			expect(updates.at(-1)?.contentState).toMatchObject({ operationKind: "conversation", status: "completed" }),
+		);
 
 		recv.end();
 		await expect(modePromise).resolves.toBeUndefined();
@@ -1148,6 +1377,7 @@ describe("Iroh remote notification requests", () => {
 					return "sent" as const;
 				}),
 			},
+			workspaceName: "volt-app",
 		});
 		const handlers = session.subscribe.mock.calls.map((call) => call[0] as (event: AgentSessionEvent) => void);
 		const emit = (event: AgentSessionEvent) => {
@@ -1227,13 +1457,58 @@ describe("Iroh remote notification requests", () => {
 			expect(updates).toContainEqual(
 				expect.objectContaining({
 					activityEvent: "update",
-					contentState: expect.objectContaining({ status: "failed", statusText: "Volt needs attention" }),
+					contentState: expect.objectContaining({
+						operationKind: "conversation",
+						operationID: "session-one",
+						status: "failed",
+					}),
 					kind: "live_activity_update",
 				}),
 			),
 		);
 		expect(updates).not.toContainEqual(
 			expect.objectContaining({ contentState: expect.objectContaining({ status: "completed" }) }),
+		);
+
+		recv.end();
+		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("Live Activity updater maps aborted conversation runs to cancelled", async () => {
+		const session = createTestSession("session-one", "conversation-run");
+		const updates: IrohRemoteLiveActivityUpdateIntent[] = [];
+		const runtimeHost = {
+			session,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const { modePromise, recv } = await startIrohRpcMode(runtimeHost, session, {
+			notificationDelivery: {
+				deliverNotification: vi.fn(async () => "no_push_target" as const),
+				deliverLiveActivityUpdate: vi.fn(async (update: IrohRemoteLiveActivityUpdateIntent) => {
+					updates.push(update);
+					return "sent" as const;
+				}),
+			},
+			workspaceName: "volt-app",
+		});
+		const handlers = session.subscribe.mock.calls.map((call) => call[0] as (event: AgentSessionEvent) => void);
+		for (const handler of handlers) {
+			handler({ type: "agent_start" });
+			handler({
+				type: "agent_end",
+				messages: [createAssistantMessage({ stopReason: "aborted" })],
+				willRetry: false,
+			});
+			handler({ type: "agent_settled" });
+		}
+		await vi.waitFor(() =>
+			expect(updates).toContainEqual(
+				expect.objectContaining({ contentState: expect.objectContaining({ status: "cancelled" }) }),
+			),
 		);
 
 		recv.end();

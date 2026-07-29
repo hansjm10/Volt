@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const {
 	DEFAULT_ALLOWED_FIREBASE_APP_ID,
+	MAX_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
 	MAX_REQUEST_BYTES,
 	RequestError,
 	assertVerifiedAppCheck,
@@ -222,8 +223,9 @@ test("revocation rechecks credentials inside the delete transaction", async () =
 	assert.equal(committedDeleteCount, 0);
 });
 
-test("Live Activity input is typed, bounded, and fresh", () => {
+test("Live Activity input accepts and forwards the bounded semantic content state", () => {
 	const now = 2_000_000_000;
+	const subject = "🚀".repeat(MAX_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES / 4);
 	const parsed = parseLiveActivityUpdate(
 		{
 			pushTargetId: "fcm_12345678901234567890",
@@ -231,39 +233,150 @@ test("Live Activity input is typed, bounded, and fresh", () => {
 			activityId: "activity-1",
 			activityPushToken: "activity-token-value",
 			eventId: "event-1",
-			kind: "tool_update",
+			kind: "live_activity_update",
 			contentState: {
+				operationKind: "planCreation",
+				operationID: "session-one",
 				status: "running",
-				statusText: "Running",
-				recentTools: [{ name: "Read", symbolName: "doc", status: "completed" }],
+				subject,
+				sessionID: "session-one",
+				workspaceName: "volt-app",
+				operationStartedAtEpochSeconds: now - 60,
 				updatedAtEpochSeconds: now,
 			},
+			staleDateEpochSeconds: now + 90,
 		},
 		now,
 	);
-	assert.equal(parsed.contentState.updatedAtEpochSeconds, now);
+	assert.deepEqual(parsed.contentState, {
+		operationKind: "planCreation",
+		operationID: "session-one",
+		status: "running",
+		subject,
+		sessionID: "session-one",
+		workspaceName: "volt-app",
+		operationStartedAtEpochSeconds: now - 60,
+		updatedAtEpochSeconds: now,
+	});
+	assert.equal(parsed.staleDateEpochSeconds, now + 90);
+	assert.ok(Buffer.byteLength(JSON.stringify(parsed.contentState), "utf8") < 4 * 1024);
+});
+
+test("Live Activity input rejects old tool payloads and malformed semantic state", () => {
+	const now = 2_000_000_000;
+	const base = {
+		pushTargetId: "fcm_12345678901234567890",
+		pushTargetAuthToken: "a".repeat(32),
+		activityId: "activity-1",
+		activityPushToken: "activity-token-value",
+		eventId: "event-1",
+		kind: "live_activity_update",
+	};
+	const contentState = {
+		operationKind: "conversation",
+		operationID: "session-one",
+		status: "running",
+		sessionID: "session-one",
+		workspaceName: "volt-app",
+		operationStartedAtEpochSeconds: now - 60,
+		updatedAtEpochSeconds: now,
+	};
 	expectRequestError(
 		() =>
 			parseLiveActivityUpdate(
 				{
-					pushTargetId: "fcm_12345678901234567890",
-					pushTargetAuthToken: "a".repeat(32),
-					activityId: "activity-1",
-					activityPushToken: "activity-token-value",
-					eventId: "event-1",
-					kind: "tool_update",
+					...base,
 					contentState: {
 						status: "running",
 						statusText: "Running",
 						recentTools: [],
-						updatedAtEpochSeconds: now - 86_401,
+						updatedAtEpochSeconds: now,
 					},
 				},
 				now,
 			),
 		400,
-		"updatedAtEpochSeconds_out_of_range",
+		"contentState_has_unknown_field",
 	);
+	expectRequestError(
+		() => parseLiveActivityUpdate({ ...base, contentState: { ...contentState, operationID: "" } }, now),
+		400,
+		"operationID_has_invalid_length",
+	);
+	expectRequestError(
+		() => parseLiveActivityUpdate({ ...base, contentState: { ...contentState, status: "waiting" } }, now),
+		400,
+		"status_must_be_running_or_completed_or_failed_or_cancelled",
+	);
+	expectRequestError(
+		() =>
+			parseLiveActivityUpdate(
+				{ ...base, contentState: { ...contentState, operationKind: "review", subject: "private target" } },
+				now,
+			),
+		400,
+		"subject_requires_plan_creation",
+	);
+	expectRequestError(
+		() =>
+			parseLiveActivityUpdate(
+				{
+					...base,
+					contentState: {
+						...contentState,
+						operationKind: "planCreation",
+						subject: "🚀".repeat(MAX_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES / 4 + 1),
+					},
+				},
+				now,
+			),
+		400,
+		"subject_has_invalid_utf8_length",
+	);
+	expectRequestError(
+		() =>
+			parseLiveActivityUpdate(
+				{
+					...base,
+					contentState: { ...contentState, operationStartedAtEpochSeconds: now + 1 },
+				},
+				now,
+			),
+		400,
+		"operationStartedAtEpochSeconds_after_updatedAtEpochSeconds",
+	);
+});
+
+test("Live Activity input rejects stale and future semantic updates", () => {
+	const now = 2_000_000_000;
+	const base = {
+		pushTargetId: "fcm_12345678901234567890",
+		pushTargetAuthToken: "a".repeat(32),
+		activityId: "activity-1",
+		activityPushToken: "activity-token-value",
+		eventId: "event-1",
+		kind: "live_activity_update",
+	};
+	const contentState = {
+		operationKind: "conversation",
+		operationID: "session-one",
+		status: "running",
+		sessionID: "session-one",
+		workspaceName: "volt-app",
+		operationStartedAtEpochSeconds: now - 86_500,
+		updatedAtEpochSeconds: now,
+	};
+	for (const updatedAtEpochSeconds of [now - 86_401, now + 301]) {
+		expectRequestError(
+			() =>
+				parseLiveActivityUpdate(
+					{ ...base, contentState: { ...contentState, updatedAtEpochSeconds } },
+					now,
+				),
+			400,
+			"updatedAtEpochSeconds_out_of_range",
+		);
+	}
 });
 
 test("missing and elapsed expiry timestamps are invalid", () => {

@@ -24,7 +24,24 @@ The function remains publicly invokable because an unattached iOS app must reach
 - `POST /v1/push-targets/revoke`: app or host cleanup with `{ pushTargetId, pushTargetAuthToken }`; returns `revoked` or idempotent `already_revoked`.
 - `POST /v1/push-targets/status`: credential-authenticated cache validation; returns `{ status:"active", expiresAtEpochSeconds }`, or `401`/`404`/`410` when the cached credential must be replaced.
 - `POST /v1/notifications`: desktop delivery with `{ pushTargetId, pushTargetAuthToken, eventId, kind, title, body, workspace?, data }`.
-- `POST /v1/live-activities`: desktop delivery with `{ pushTargetId, pushTargetAuthToken, activityId, activityPushToken, tokenEnvironment?, eventId, kind, contentState, ... }`.
+- `POST /v1/live-activities`: desktop delivery with `{ pushTargetId, pushTargetAuthToken, activityId, activityPushToken, tokenEnvironment?, eventId, kind, contentState, activityEvent?, staleDateEpochSeconds?, dismissalDateEpochSeconds? }`.
+
+The Live Activity `contentState` is the exact semantic ActivityKit state:
+
+```json
+{
+  "operationKind": "planCreation",
+  "operationID": "session-one",
+  "status": "running",
+  "subject": "Implement semantic Live Activities",
+  "sessionID": "session-one",
+  "workspaceName": "volt",
+  "operationStartedAtEpochSeconds": 1785312000,
+  "updatedAtEpochSeconds": 1785312060
+}
+```
+
+`operationKind` is `conversation`, `planCreation`, or `review`; `status` is `running`, `completed`, `failed`, or `cancelled`. Every identity field is required. `subject` is optional, limited to 256 UTF-8 bytes, and accepted only for `planCreation`; conversation and review subjects remain private. The operation start must not follow the update timestamp, and update timestamps outside the relay freshness window are rejected. Unknown fields and the former tool-oriented state are rejected. The bounded content state remains well below ActivityKit's 4 KiB payload limit.
 
 Volt host state stores only the opaque relay target id, the target-scoped credential, and optional token hashes.
 
