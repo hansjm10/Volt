@@ -404,9 +404,10 @@ export class IrohRemoteHostStateManager {
 				workspace !== undefined &&
 				workspaceStatus === "available" &&
 				(options.validateWorkspace === undefined || (await options.validateWorkspace(workspace)));
+			const defaultAllowTools = options.defaultAllowTools ?? this.defaultAllowTools;
 			const result = authorizeIrohRemoteClient(state, hello, remoteNodeId, {
-				...(this.defaultAllowTools === undefined ? {} : { defaultAllowTools: this.defaultAllowTools }),
 				...options,
+				...(defaultAllowTools === undefined ? {} : { defaultAllowTools }),
 				workspace: workspaceAvailable ? workspace : undefined,
 				workspaceStatuses,
 			});

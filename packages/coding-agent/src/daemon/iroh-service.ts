@@ -3743,7 +3743,11 @@ class IrohDaemonService {
 						details: {
 							expectedRevision: request.expectedRevision,
 							...(updated.ok
-								? { revision: updated.client.rpcGrant.revision }
+								? {
+										revision: updated.client.rpcGrant.revision,
+										allowedTools: normalizeIrohRemoteAllowTools(updated.client.allowedTools),
+										usesDefaultTools: updated.client.allowedTools === undefined,
+									}
 								: { currentRevision: updated.currentRevision }),
 						},
 					});

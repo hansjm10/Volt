@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createIrohRemotePresetAccess } from "../src/core/remote/iroh/access-grant.ts";
 import { authorizeIrohRemoteClient, hashIrohRemotePairingSecret } from "../src/core/remote/iroh/authorization.ts";
@@ -13,6 +16,7 @@ import {
 	createEmptyIrohRemoteHostState,
 	type IrohRemoteHostState,
 	parseIrohRemoteHostState,
+	writeIrohRemoteHostState,
 } from "../src/core/remote/iroh/state.ts";
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
 
@@ -415,6 +419,97 @@ describe("default grant tracking: cross-default upgrades", () => {
 		if (!consumed.ok) throw new Error(consumed.error);
 		expect(consumed.allowTools).toBe(DEFAULT_B);
 		expect(consumed.client).not.toHaveProperty("allowedTools");
+	});
+
+	it("engine-level injection travels the production pair/reconnect chain", async () => {
+		// Injection ONLY at engine construction — pins the engine's constructor
+		// resolution, its forwarding into stateManager.authorizeClient, and the
+		// manager's authorization path, the exact links production traverses.
+		const manager = new IrohRemoteHostStateManager({ initialState: createEmptyIrohRemoteHostState() });
+		await manager.upsertWorkspace({ ...WORKSPACE });
+		const engineA = new IrohRemoteHostEngine({
+			stateManager: manager,
+			workspace: { ...WORKSPACE },
+			defaultAllowTools: DEFAULT_A,
+			now: () => 1,
+		});
+		await engineA.pair({
+			workspace: WORKSPACE.name,
+			irohTicket: "endpoint-ticket",
+			secret: "one-time-secret",
+			expiresAt: 100,
+		});
+		const paired = await engineA.authorizeHello(makeHello(WORKSPACE.name, "one-time-secret"), "client-node");
+		if (!paired.ok) throw new Error(paired.error);
+		expect(paired.allowTools).toBe(DEFAULT_A);
+		expect(paired.client).not.toHaveProperty("allowedTools");
+
+		const engineB = new IrohRemoteHostEngine({
+			stateManager: manager,
+			workspace: { ...WORKSPACE },
+			defaultAllowTools: DEFAULT_B,
+			now: () => 200,
+		});
+		const reconnected = await engineB.authorizeHello(makeHello(WORKSPACE.name), "client-node");
+		if (!reconnected.ok) throw new Error(reconnected.error);
+		expect(reconnected.allowTools).toBe(DEFAULT_B);
+		expect(reconnected.client).not.toHaveProperty("allowedTools");
+	});
+
+	it("manager-level injection fills authorizeClient calls that pass no default", async () => {
+		// A reordered DEFAULT_B grant only canonicalizes to tracking against the
+		// manager's injected default, so deleting the manager's default-fill
+		// (rather than the caller's option) fails this test.
+		const manager = new IrohRemoteHostStateManager({
+			initialState: createEmptyIrohRemoteHostState(),
+			defaultAllowTools: DEFAULT_B,
+		});
+		await manager.upsertWorkspace({ ...WORKSPACE });
+		const paired = await manager.authorizeClient(makeHello(WORKSPACE.name, "secret"), "client-node", {
+			allowTools: DEFAULT_B.split(",").reverse().join(","),
+			pairingSecret: "secret",
+			pairingExpiresAt: 200,
+			now: 100,
+		});
+		if (!paired.ok) throw new Error(paired.error);
+		expect(paired.allowTools).toBe(DEFAULT_B);
+		expect(paired.client).not.toHaveProperty("allowedTools");
+	});
+
+	it("a per-call defaultAllowTools of undefined does not clobber the manager's default", async () => {
+		const manager = new IrohRemoteHostStateManager({
+			initialState: createEmptyIrohRemoteHostState(),
+			defaultAllowTools: DEFAULT_B,
+		});
+		await manager.upsertWorkspace({ ...WORKSPACE });
+		const paired = await manager.authorizeClient(makeHello(WORKSPACE.name, "secret"), "client-node", {
+			allowTools: DEFAULT_B,
+			defaultAllowTools: undefined,
+			pairingSecret: "secret",
+			pairingExpiresAt: 200,
+			now: 100,
+		});
+		if (!paired.ok) throw new Error(paired.error);
+		expect(paired.allowTools).toBe(DEFAULT_B);
+		expect(paired.client).not.toHaveProperty("allowedTools");
+	});
+
+	it("file-backed state loads canonicalize against the manager's injected default", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "volt-grant-tracking-"));
+		try {
+			const statePath = join(dir, "state.json");
+			await writeIrohRemoteHostState(statePath, {
+				...createEmptyIrohRemoteHostState(),
+				workspaces: [{ ...WORKSPACE }],
+				clients: [{ ...RAW_CLIENT_BASE, allowedTools: DEFAULT_A }],
+			});
+			const underB = new IrohRemoteHostStateManager({ statePath, defaultAllowTools: DEFAULT_B });
+			expect((await underB.getState()).clients[0]?.allowedTools).toBe("read,grep,ls");
+			const underA = new IrohRemoteHostStateManager({ statePath, defaultAllowTools: DEFAULT_A });
+			expect((await underA.getState()).clients[0]).not.toHaveProperty("allowedTools");
+		} finally {
+			await rm(dir, { force: true, recursive: true });
+		}
 	});
 
 	it("updateClientAccess clears a grant that equals the manager's injected default", async () => {

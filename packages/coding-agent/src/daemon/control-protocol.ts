@@ -253,9 +253,9 @@ export interface ControlClientStatus {
 export function createControlClientStatus(client: IrohRemoteClient): ControlClientStatus {
 	return {
 		clientNodeId: client.nodeId,
-		...(client.label === undefined ? {} : { label: client.label }),
-		pairedAtMs: client.pairedAt ?? 0,
-		lastSeenAtMs: client.lastSeenAt ?? 0,
+		label: client.label,
+		pairedAtMs: client.pairedAt,
+		lastSeenAtMs: client.lastSeenAt,
 		allowedTools: parseIrohRemoteAllowTools(client.allowedTools),
 		usesDefaultTools: client.allowedTools === undefined,
 		rpcGrant: parseIrohRemoteRpcGrant(client.rpcGrant, "client rpcGrant"),

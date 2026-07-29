@@ -152,7 +152,7 @@ export function usesDefaultIrohRemoteAllowTools(
 	defaultAllowTools: string = DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 ): boolean {
 	const tools = new Set(parseIrohRemoteAllowTools(allowTools, defaultAllowTools));
-	const defaultTools = new Set(defaultAllowTools.split(","));
+	const defaultTools = new Set(parseIrohRemoteAllowToolNames(defaultAllowTools));
 	return tools.size === defaultTools.size && Array.from(tools).every((tool) => defaultTools.has(tool));
 }
 
@@ -208,7 +208,7 @@ export function resolveIrohRemoteRuntimeToolPolicy(
 	options: ResolveIrohRemoteRuntimeToolPolicyOptions,
 ): IrohRemoteRuntimeToolPolicy {
 	const defaultAllowTools = options.defaultAllowTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS;
-	const defaultTools = new Set(defaultAllowTools.split(","));
+	const defaultTools = new Set(parseIrohRemoteAllowToolNames(defaultAllowTools));
 	const layers: Array<{ tools: string[]; toolSet: Set<string>; allowUnlistedExtensionTools: boolean }> = [];
 	const addStringLayer = (allowTools: string): void => {
 		const tools = uniqueIrohRemoteAllowToolNames(parseIrohRemoteAllowTools(allowTools, defaultAllowTools));
@@ -248,7 +248,7 @@ export function isIrohRemoteRuntimeToolPolicyWithin(
 	if (policy.allowUnlistedExtensionTools && !ceiling.allowUnlistedExtensionTools) {
 		return false;
 	}
-	const defaultTools = new Set(defaultAllowTools.split(","));
+	const defaultTools = new Set(parseIrohRemoteAllowToolNames(defaultAllowTools));
 	const ceilingTools = new Set(ceiling.tools);
 	return policy.tools.every(
 		(tool) => ceilingTools.has(tool) || (ceiling.allowUnlistedExtensionTools && !defaultTools.has(tool)),
