@@ -7,13 +7,15 @@
 
 import type { AgentMessage, StreamFn, ThinkingLevel } from "@hansjm10/volt-agent-core";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@hansjm10/volt-ai";
-import { completeSimple } from "@hansjm10/volt-ai";
+import { completeSimple, isContextOverflow } from "@hansjm10/volt-ai";
+import { sleep } from "../../utils/sleep.ts";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "../messages.ts";
+import { isTransientProviderError } from "../provider-errors.ts";
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.ts";
 import {
 	computeFileLists,
@@ -127,6 +129,12 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
 };
+
+export interface SummarizationRetryOptions {
+	maxRetries: number;
+	baseDelayMs: number;
+	maxDelayMs: number;
+}
 
 // ============================================================================
 // Token calculation
@@ -611,6 +619,59 @@ function getSummarizationText(response: AssistantMessage, operation: string): st
 		.join("\n");
 }
 
+function createSummarizationAbortError(operation: string): Error {
+	const error = new Error(`${operation} cancelled`);
+	error.name = "AbortError";
+	return error;
+}
+
+async function completeSummarizationText(
+	operation: string,
+	model: Model<any>,
+	context: Context,
+	options: SimpleStreamOptions,
+	streamFn: StreamFn | undefined,
+	retry: SummarizationRetryOptions | undefined,
+): Promise<string> {
+	const maxRetries = Math.max(0, Math.floor(retry?.maxRetries ?? 0));
+	let retryCount = 0;
+
+	while (true) {
+		if (options.signal?.aborted) {
+			throw createSummarizationAbortError(operation);
+		}
+		let response: AssistantMessage | undefined;
+		try {
+			response = await completeSummarization(model, context, options, streamFn);
+			return getSummarizationText(response, operation);
+		} catch (error) {
+			if (options.signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+				throw createSummarizationAbortError(operation);
+			}
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			const contextOverflow = response !== undefined && isContextOverflow(response, model.contextWindow);
+			if (retryCount >= maxRetries || contextOverflow || !isTransientProviderError(errorMessage)) {
+				if (retryCount === 0) {
+					throw error;
+				}
+				throw new Error(`${operation} failed after ${retryCount + 1} attempts: ${errorMessage}`, {
+					cause: error,
+				});
+			}
+			retryCount += 1;
+			const delayMs = Math.min(
+				Math.max(0, retry?.maxDelayMs ?? 0),
+				Math.max(0, retry?.baseDelayMs ?? 0) * 2 ** (retryCount - 1),
+			);
+			try {
+				await sleep(delayMs, options.signal);
+			} catch {
+				throw createSummarizationAbortError(operation);
+			}
+		}
+	}
+}
+
 /**
  * Generate a summary of the conversation using the LLM.
  * If previousSummary is provided, uses the update prompt to merge.
@@ -627,6 +688,7 @@ export async function generateSummary(
 	thinkingLevel?: ThinkingLevel,
 	streamFn?: StreamFn,
 	env?: Record<string, string>,
+	retry?: SummarizationRetryOptions,
 ): Promise<string> {
 	const requestedMaxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
@@ -683,14 +745,14 @@ export async function generateSummary(
 		tokenPlan.thinkingLevel,
 	);
 
-	const response = await completeSummarization(
+	return completeSummarizationText(
+		"Summarization",
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		completionOptions,
 		streamFn,
+		retry,
 	);
-
-	return getSummarizationText(response, "Summarization");
 }
 
 // ============================================================================
@@ -811,6 +873,122 @@ Summarize the prefix to provide context for the retained suffix:
 
 Be concise. Focus on what's needed to understand the kept suffix.`;
 
+const TURN_PREFIX_UPDATE_PROMPT = `The messages above are the next chronological part of a turn prefix that was too large to keep. Update the existing prefix summary in <previous-summary> tags.
+
+Preserve useful details from the existing summary, incorporate the new work, and use this EXACT format:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done across all summarized prefix chunks]
+
+## Context for Suffix
+- [Information needed to understand the retained recent work]
+
+Be concise. Preserve exact file paths, function names, and error messages.`;
+
+const SUMMARIZATION_CHUNK_MAX_CHARS = 75_000;
+
+function getSummarizationChunkBudget(model: Model<any>): number {
+	const contextWindow = model.contextWindow > 0 ? model.contextWindow : DEFAULT_SUMMARIZATION_CONTEXT_WINDOW;
+	return Math.max(
+		MIN_SUMMARIZATION_SOURCE_CHARS,
+		Math.min(SUMMARIZATION_CHUNK_MAX_CHARS, Math.floor(contextWindow * 0.25)),
+	);
+}
+
+function groupMessagesForSummarization(messages: AgentMessage[]): AgentMessage[][] {
+	const groups: AgentMessage[][] = [];
+	for (let index = 0; index < messages.length; index += 1) {
+		const message = messages[index];
+		const group = [message];
+		if (message.role === "assistant" && message.content.some((content) => content.type === "toolCall")) {
+			while (messages[index + 1]?.role === "toolResult") {
+				group.push(messages[index + 1]);
+				index += 1;
+			}
+		}
+		groups.push(group);
+	}
+	return groups;
+}
+
+function chunkMessagesForSummarization(messages: AgentMessage[], maxChars: number): AgentMessage[][] {
+	const chunks: AgentMessage[][] = [];
+	let current: AgentMessage[] = [];
+	let currentChars = 0;
+
+	for (const group of groupMessagesForSummarization(messages)) {
+		const groupChars = serializeConversation(convertToLlm(group), {
+			maxChars: Number.MAX_SAFE_INTEGER,
+		}).length;
+		const separatorChars = current.length === 0 ? 0 : 2;
+		if (current.length > 0 && currentChars + separatorChars + groupChars > maxChars) {
+			chunks.push(current);
+			current = [];
+			currentChars = 0;
+		}
+		current.push(...group);
+		currentChars += (currentChars === 0 ? 0 : 2) + groupChars;
+	}
+	if (current.length > 0) {
+		chunks.push(current);
+	}
+	return chunks;
+}
+
+async function generateSummaryInChunks(
+	messages: AgentMessage[],
+	model: Model<any>,
+	reserveTokens: number,
+	apiKey: string | undefined,
+	headers: Record<string, string> | undefined,
+	signal: AbortSignal | undefined,
+	customInstructions: string | undefined,
+	previousSummary: string | undefined,
+	thinkingLevel: ThinkingLevel | undefined,
+	streamFn: StreamFn | undefined,
+	env: Record<string, string> | undefined,
+	retry: SummarizationRetryOptions | undefined,
+): Promise<string> {
+	const chunks = chunkMessagesForSummarization(messages, getSummarizationChunkBudget(model));
+	if (chunks.length === 0) {
+		return generateSummary(
+			[],
+			model,
+			reserveTokens,
+			apiKey,
+			headers,
+			signal,
+			customInstructions,
+			previousSummary,
+			thinkingLevel,
+			streamFn,
+			env,
+			retry,
+		);
+	}
+	let summary = previousSummary;
+	for (const chunk of chunks) {
+		summary = await generateSummary(
+			chunk,
+			model,
+			reserveTokens,
+			apiKey,
+			headers,
+			signal,
+			customInstructions,
+			summary,
+			thinkingLevel,
+			streamFn,
+			env,
+			retry,
+		);
+	}
+	return summary ?? "No prior history.";
+}
+
 /**
  * Generate summaries for compaction using prepared data.
  * Returns CompactionResult - SessionManager adds uuid/parentUuid when saving.
@@ -828,6 +1006,7 @@ export async function compact(
 	thinkingLevel?: ThinkingLevel,
 	streamFn?: StreamFn,
 	env?: Record<string, string>,
+	retry?: SummarizationRetryOptions,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -844,40 +1023,81 @@ export async function compact(
 	let summary: string;
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		// Generate both summaries in parallel
-		const [historyResult, turnPrefixResult] = await Promise.all([
-			messagesToSummarize.length > 0
-				? generateSummary(
-						messagesToSummarize,
+		// Generate both summaries in parallel under one child cancellation scope.
+		// A terminal failure aborts its sibling, and both requests settle before
+		// compaction reports the original failure to its caller.
+		const summariesAbortController = new AbortController();
+		const abortSummaries = (): void => summariesAbortController.abort();
+		if (signal?.aborted) {
+			abortSummaries();
+		} else {
+			signal?.addEventListener("abort", abortSummaries, { once: true });
+		}
+		let firstFailure: unknown;
+		let hasFailure = false;
+		const runSummary = async (operation: () => Promise<string>): Promise<string> => {
+			try {
+				return await operation();
+			} catch (error) {
+				if (!hasFailure) {
+					hasFailure = true;
+					firstFailure = error;
+					abortSummaries();
+				}
+				throw error;
+			}
+		};
+		let summaryResults: [PromiseSettledResult<string>, PromiseSettledResult<string>];
+		try {
+			summaryResults = await Promise.allSettled([
+				runSummary(() =>
+					messagesToSummarize.length > 0
+						? generateSummaryInChunks(
+								messagesToSummarize,
+								model,
+								settings.reserveTokens,
+								apiKey,
+								headers,
+								summariesAbortController.signal,
+								customInstructions,
+								previousSummary,
+								thinkingLevel,
+								streamFn,
+								env,
+								retry,
+							)
+						: Promise.resolve("No prior history."),
+				),
+				runSummary(() =>
+					generateTurnPrefixSummary(
+						turnPrefixMessages,
 						model,
 						settings.reserveTokens,
 						apiKey,
 						headers,
-						signal,
-						customInstructions,
-						previousSummary,
+						env,
+						summariesAbortController.signal,
 						thinkingLevel,
 						streamFn,
-						env,
-					)
-				: Promise.resolve("No prior history."),
-			generateTurnPrefixSummary(
-				turnPrefixMessages,
-				model,
-				settings.reserveTokens,
-				apiKey,
-				headers,
-				env,
-				signal,
-				thinkingLevel,
-				streamFn,
-			),
-		]);
+						retry,
+					),
+				),
+			]);
+		} finally {
+			signal?.removeEventListener("abort", abortSummaries);
+		}
+		if (hasFailure) {
+			throw firstFailure;
+		}
+		const [historySummary, turnPrefixSummary] = summaryResults;
+		if (historySummary.status !== "fulfilled" || turnPrefixSummary.status !== "fulfilled") {
+			throw new Error("Split compaction summaries failed without an error");
+		}
 		// Merge into single summary
-		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
+		summary = `${historySummary.value}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixSummary.value}`;
 	} else {
 		// Just generate history summary
-		summary = await generateSummary(
+		summary = await generateSummaryInChunks(
 			messagesToSummarize,
 			model,
 			settings.reserveTokens,
@@ -889,6 +1109,7 @@ export async function compact(
 			thinkingLevel,
 			streamFn,
 			env,
+			retry,
 		);
 	}
 
@@ -921,13 +1142,49 @@ async function generateTurnPrefixSummary(
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	streamFn?: StreamFn,
+	retry?: SummarizationRetryOptions,
+): Promise<string> {
+	const chunks = chunkMessagesForSummarization(messages, getSummarizationChunkBudget(model));
+	let summary: string | undefined;
+	for (const chunk of chunks) {
+		summary = await generateTurnPrefixSummaryChunk(
+			chunk,
+			model,
+			reserveTokens,
+			apiKey,
+			headers,
+			env,
+			signal,
+			thinkingLevel,
+			streamFn,
+			summary,
+			retry,
+		);
+	}
+	return summary ?? "No earlier turn context.";
+}
+
+async function generateTurnPrefixSummaryChunk(
+	messages: AgentMessage[],
+	model: Model<any>,
+	reserveTokens: number,
+	apiKey: string | undefined,
+	headers: Record<string, string> | undefined,
+	env: Record<string, string> | undefined,
+	signal: AbortSignal | undefined,
+	thinkingLevel: ThinkingLevel | undefined,
+	streamFn: StreamFn | undefined,
+	previousSummary: string | undefined,
+	retry: SummarizationRetryOptions | undefined,
 ): Promise<string> {
 	const requestedMaxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	); // Smaller budget for turn prefix
 	const llmMessages = convertToLlm(messages);
-	const fixedPromptChars = SUMMARIZATION_SYSTEM_PROMPT.length + TURN_PREFIX_SUMMARIZATION_PROMPT.length + 64;
+	const basePrompt = previousSummary ? TURN_PREFIX_UPDATE_PROMPT : TURN_PREFIX_SUMMARIZATION_PROMPT;
+	const fixedPromptChars =
+		SUMMARIZATION_SYSTEM_PROMPT.length + basePrompt.length + (previousSummary?.length ?? 0) + 128;
 	const contextWindow = model.contextWindow > 0 ? model.contextWindow : DEFAULT_SUMMARIZATION_CONTEXT_WINDOW;
 	const outputCapacity = getSummarizationOutputTokenBudget(
 		contextWindow,
@@ -941,7 +1198,11 @@ async function generateTurnPrefixSummary(
 	const conversationText = serializeConversation(llmMessages, {
 		maxChars: getConversationCharBudget(contextWindow, tokenPlan.effectiveOutputTokens, fixedPromptChars),
 	});
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
+	const promptText = [
+		`<conversation>\n${conversationText}\n</conversation>`,
+		...(previousSummary ? [`<previous-summary>\n${previousSummary}\n</previous-summary>`] : []),
+		basePrompt,
+	].join("\n\n");
 	const summarizationMessages = [
 		{
 			role: "user" as const,
@@ -950,12 +1211,12 @@ async function generateTurnPrefixSummary(
 		},
 	];
 
-	const response = await completeSummarization(
+	return completeSummarizationText(
+		"Turn prefix summarization",
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		createSummarizationOptions(model, tokenPlan.maxTokens, apiKey, headers, env, signal, tokenPlan.thinkingLevel),
 		streamFn,
+		retry,
 	);
-
-	return getSummarizationText(response, "Turn prefix summarization");
 }

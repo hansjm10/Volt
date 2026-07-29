@@ -486,10 +486,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 					reason: "threshold",
 					willRetry: boolean,
 					continueAfterCompaction: boolean,
-					continueWithoutCompaction: boolean,
 				): Promise<boolean>;
 			}
-		)._runAutoCompaction("threshold", false, true, true);
+		)._runAutoCompaction("threshold", false, true);
 		await authStarted.promise;
 
 		await session.abort();
@@ -783,7 +782,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		await checkCompaction(errorAssistant);
 
-		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false, false, false, undefined);
+		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false, false, undefined);
 	});
 
 	it("should not trigger threshold compaction for error messages when no prior usage exists", async () => {
