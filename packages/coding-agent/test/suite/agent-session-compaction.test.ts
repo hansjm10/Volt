@@ -13,6 +13,9 @@ type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
 	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
 	_shouldStopForProactiveCompaction: (context: unknown) => boolean;
+	_handlePostAgentRun: () => Promise<boolean>;
+	_lastAssistantMessage: AssistantMessage | undefined;
+	_proactiveCompactionState: "idle" | "scheduled" | "compacting";
 };
 
 function createUsage(totalTokens: number) {
@@ -63,6 +66,35 @@ function useSummaryStreamFn(harness: Harness, summary: string): () => number {
 				usage: createUsage(10),
 			};
 			stream.push({ type: "done", seq: 1, reason: "stop", message });
+		});
+		return stream;
+	};
+	return () => callCount;
+}
+
+function useSummaryResponses(
+	harness: Harness,
+	responses: AssistantMessage[],
+	onOptions?: (options: { reasoning?: string } | undefined) => void,
+): () => number {
+	let callCount = 0;
+	harness.session.agent.streamFn = (model, _context, options) => {
+		const response = responses[Math.min(callCount, responses.length - 1)];
+		callCount += 1;
+		onOptions?.(options);
+		const stream = createAssistantMessageEventStream();
+		queueMicrotask(() => {
+			stream.push({
+				type: "done",
+				seq: 1,
+				reason: "stop",
+				message: {
+					...response,
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+				},
+			});
 		});
 		return stream;
 	};
@@ -202,6 +234,117 @@ describe("AgentSession compaction characterization", () => {
 		const compactionEntries = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
 		expect(compactionEntries).toHaveLength(1);
 		expect(getStreamCallCount()).toBe(1);
+	});
+
+	it("uses the model's lowest supported reasoning for compaction instead of the session level", async () => {
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			models: [{ id: "reasoning-model", reasoning: true }],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.session.agent.state.model = {
+			...harness.session.agent.state.model,
+			thinkingLevelMap: { off: "none", minimal: null, xhigh: "xhigh", max: "max" },
+		};
+		harness.session.agent.state.thinkingLevel = "xhigh";
+		const reasoningLevels: Array<string | undefined> = [];
+		useSummaryResponses(harness, [fauxAssistantMessage("minimal summary")], (options) => {
+			reasoningLevels.push(options?.reasoning);
+		});
+
+		await harness.session.compact();
+
+		expect(reasoningLevels).toEqual(["low"]);
+	});
+
+	it("retries transient auto-compaction summarization failures", async () => {
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const getCallCount = useSummaryResponses(harness, [
+			fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: "service unavailable request-id=req_first",
+			}),
+			fauxAssistantMessage("summary after retry"),
+		]);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(false);
+
+		expect(getCallCount()).toBe(2);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+	});
+
+	it("fails closed after transient auto-compaction retries are exhausted", async () => {
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const getCallCount = useSummaryResponses(harness, [
+			fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: "server is overloaded request-id=req_last",
+			}),
+		]);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await expect(sessionInternals._runAutoCompaction("threshold", false)).rejects.toThrow(
+			"Summarization failed after 3 attempts",
+		);
+
+		expect(getCallCount()).toBe(3);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			aborted: false,
+			willRetry: false,
+			errorMessage: expect.stringContaining("request-id=req_last"),
+		});
+	});
+
+	it("does not resume a proactively interrupted run after compaction exhaustion", async () => {
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		useSummaryResponses(harness, [
+			fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: "service unavailable",
+			}),
+		]);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		sessionInternals._lastAssistantMessage = createAssistant(harness, {
+			stopReason: "toolUse",
+			totalTokens: harness.getModel().contextWindow,
+		});
+		sessionInternals._proactiveCompactionState = "scheduled";
+
+		await expect(sessionInternals._handlePostAgentRun()).rejects.toThrow("Summarization failed after 2 attempts");
+
+		expect(sessionInternals._proactiveCompactionState).toBe("idle");
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
+	});
+
+	it("does not resume a proactively interrupted run after compaction cancellation", async () => {
+		const harness = await createHarness({ withConfiguredAuth: false });
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		sessionInternals._lastAssistantMessage = createAssistant(harness, {
+			stopReason: "toolUse",
+			totalTokens: harness.getModel().contextWindow,
+		});
+		sessionInternals._proactiveCompactionState = "scheduled";
+		vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+		await expect(sessionInternals._handlePostAgentRun()).resolves.toBe(false);
 	});
 
 	it("excludes a stripped trailing error message from estimatedTokensAfter when retrying", async () => {
@@ -431,7 +574,7 @@ describe("AgentSession compaction characterization", () => {
 
 		await sessionInternals._checkCompaction(errorAssistant);
 
-		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false, false, false, undefined);
+		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false, false, undefined);
 	});
 
 	it("does not trigger threshold compaction for error messages when no prior usage exists", async () => {

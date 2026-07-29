@@ -177,6 +177,121 @@ describe("generateSummary reasoning options", () => {
 		await expect(summary).rejects.toMatchObject({ name: "AbortError", message: "Summarization cancelled" });
 	});
 
+	it("retries only transient summarization failures", async () => {
+		completeSimpleMock
+			.mockResolvedValueOnce({
+				...mockSummaryResponse,
+				stopReason: "error",
+				errorMessage: "server is overloaded request-id=req_retry",
+			})
+			.mockResolvedValueOnce(mockSummaryResponse);
+
+		await expect(
+			generateSummary(
+				messages,
+				createModel(false),
+				2_000,
+				"test-key",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{ maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+			),
+		).resolves.toContain("Test summary");
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+
+		completeSimpleMock.mockReset();
+		completeSimpleMock.mockResolvedValue({
+			...mockSummaryResponse,
+			stopReason: "error",
+			errorMessage: "insufficient_quota",
+		});
+
+		await expect(
+			generateSummary(
+				messages,
+				createModel(false),
+				2_000,
+				"test-key",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{ maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+			),
+		).rejects.toThrow("insufficient_quota");
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+	});
+
+	it.each([
+		"server error: Your input exceeds the context window of this model",
+		"maximum context is 128000; requested 150000 tokens",
+		"request too large for 1050000 context window",
+		"invalid value: 5000",
+	])("does not retry deterministic summarization failure: %s", async (errorMessage) => {
+		completeSimpleMock.mockResolvedValue({
+			...mockSummaryResponse,
+			stopReason: "error",
+			errorMessage,
+		});
+
+		await expect(
+			generateSummary(
+				messages,
+				createModel(false),
+				2_000,
+				"test-key",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{ maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+			),
+		).rejects.toThrow(errorMessage);
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("aborts compaction retry backoff without issuing another request", async () => {
+		vi.useFakeTimers();
+		const abortController = new AbortController();
+		completeSimpleMock.mockResolvedValue({
+			...mockSummaryResponse,
+			stopReason: "error",
+			errorMessage: "service unavailable",
+		});
+
+		const summary = generateSummary(
+			messages,
+			createModel(false),
+			2_000,
+			"test-key",
+			undefined,
+			abortController.signal,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ maxRetries: 2, baseDelayMs: 60_000, maxDelayMs: 60_000 },
+		);
+		await vi.waitFor(() => expect(completeSimpleMock).toHaveBeenCalledTimes(1));
+		abortController.abort();
+
+		await expect(summary).rejects.toMatchObject({ name: "AbortError", message: "Summarization cancelled" });
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+		vi.useRealTimers();
+	});
+
 	it("rejects an aborted turn-prefix summary instead of compacting with partial text", async () => {
 		completeSimpleMock.mockResolvedValue({
 			...mockSummaryResponse,
@@ -215,5 +330,122 @@ describe("generateSummary reasoning options", () => {
 		await compact(preparation, createModel(false, 128000), "test-key");
 
 		expect(completeSimpleMock.mock.calls.map((call) => call[2]?.maxTokens)).toEqual([128000, 128000]);
+	});
+
+	it("chunks a long turn prefix chronologically", async () => {
+		const longPrefix = Array.from({ length: 90 }, (_, index) => ({
+			role: "user" as const,
+			content: `prefix-${index} ${"x".repeat(2_000)}`,
+			timestamp: Date.now() + index,
+		}));
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: [],
+			turnPrefixMessages: longPrefix,
+			isSplitTurn: true,
+			tokensBefore: 250_000,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 },
+		};
+		let responseIndex = 0;
+		completeSimpleMock.mockImplementation(async () => ({
+			...mockSummaryResponse,
+			content: [{ type: "text", text: `prefix summary ${responseIndex++}` }],
+		}));
+
+		await compact(preparation, createModel(false, 128_000, 272_000), "test-key");
+
+		expect(completeSimpleMock.mock.calls.length).toBeGreaterThan(1);
+		const prompts = completeSimpleMock.mock.calls.map((call) => call[1].messages[0].content[0].text as string);
+		expect(prompts[0]).toContain("prefix-0");
+		expect(prompts.at(-1)).toContain("prefix-89");
+		expect(prompts.slice(1).every((prompt) => prompt.includes("<previous-summary>"))).toBe(true);
+		expect(prompts.every((prompt) => prompt.length < 80_000)).toBe(true);
+	});
+
+	it("retries only the failed split-summary branch", async () => {
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: messages,
+			turnPrefixMessages: messages,
+			isSplitTurn: true,
+			tokensBefore: 60_000,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2_000, keepRecentTokens: 1_000 },
+		};
+		let historyAttempts = 0;
+		let prefixAttempts = 0;
+		completeSimpleMock.mockImplementation(async (_model, context) => {
+			const prompt = context.messages[0].content[0].text as string;
+			if (prompt.includes("PREFIX of a turn")) {
+				prefixAttempts += 1;
+				if (prefixAttempts === 1) {
+					return {
+						...mockSummaryResponse,
+						stopReason: "error",
+						errorMessage: "service unavailable",
+					};
+				}
+				return { ...mockSummaryResponse, content: [{ type: "text", text: "prefix recovered" }] };
+			}
+			historyAttempts += 1;
+			return mockSummaryResponse;
+		});
+
+		await compact(
+			preparation,
+			createModel(false),
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ maxRetries: 1, baseDelayMs: 1, maxDelayMs: 1 },
+		);
+
+		expect(historyAttempts).toBe(1);
+		expect(prefixAttempts).toBe(2);
+	});
+
+	it("cancels and settles a split-summary sibling after terminal failure", async () => {
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: messages,
+			turnPrefixMessages: messages,
+			isSplitTurn: true,
+			tokensBefore: 60_000,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2_000, keepRecentTokens: 1_000 },
+		};
+		let historyAborted = false;
+		completeSimpleMock.mockImplementation((_model, context, options) => {
+			const prompt = context.messages[0].content[0].text as string;
+			if (prompt.includes("PREFIX of a turn")) {
+				return Promise.resolve({
+					...mockSummaryResponse,
+					stopReason: "error",
+					errorMessage: "insufficient_quota",
+				});
+			}
+			return new Promise<AssistantMessage>((_resolve, reject) => {
+				const abort = (): void => {
+					historyAborted = true;
+					const error = new Error("history cancelled");
+					error.name = "AbortError";
+					reject(error);
+				};
+				if (options.signal?.aborted) {
+					abort();
+				} else {
+					options.signal?.addEventListener("abort", abort, { once: true });
+				}
+			});
+		});
+
+		await expect(compact(preparation, createModel(false), "test-key")).rejects.toThrow("insufficient_quota");
+		expect(historyAborted).toBe(true);
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2);
 	});
 });

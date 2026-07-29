@@ -85,7 +85,7 @@ const GPT_5_6_MODELS = [
 		cost: { input: 1, output: 6, cacheRead: 0.1, cacheWrite: 1.25 },
 	},
 ] as const;
-const GPT_5_6_MODEL_IDS = new Set<string>(GPT_5_6_MODELS.map((model) => model.id));
+const GPT_5_6_MODEL_IDS = new Set<string>(["gpt-5.6", ...GPT_5_6_MODELS.map((model) => model.id)]);
 
 const MOONSHOT_CN_MIRRORED_MODEL_IDS = new Set(["kimi-k2.7-code", "kimi-k2.7-code-highspeed"]);
 

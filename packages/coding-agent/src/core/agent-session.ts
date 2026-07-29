@@ -59,6 +59,7 @@ import {
 	estimateMessagesTokens,
 	generateBranchSummary,
 	prepareCompaction,
+	type SummarizationRetryOptions,
 	shouldCompact,
 } from "./compaction/index.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
@@ -123,6 +124,7 @@ import {
 	parsePlanningState,
 } from "./planning.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
+import { isTransientProviderError } from "./provider-errors.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { UiActionStateDescriptor } from "./rpc/types.ts";
 import type {
@@ -455,6 +457,8 @@ export class QueueClearPersistenceError extends Error {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const MAX_COMPACTION_SUMMARY_RETRIES = 3;
+const MAX_COMPACTION_RETRY_DELAY_MS = 30_000;
 
 // ============================================================================
 // AgentSession Class
@@ -511,13 +515,11 @@ export class AgentSession {
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _activeCompaction: ActiveCompaction | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
-	/** Set when shouldStopAfterTurn interrupted the run for a threshold compaction. */
-	private _proactiveCompactionStopped = false;
 	/**
-	 * Guards against repeated proactive stops when compaction cannot make progress.
-	 * Re-armed by a successful compaction or the next user prompt.
+	 * Coordinates the agent-loop stop with its mandatory compaction. A failed
+	 * compaction returns to idle but never resumes the interrupted run.
 	 */
-	private _proactiveCompactionAttempted = false;
+	private _proactiveCompactionState: "idle" | "scheduled" | "compacting" = "idle";
 	private _drainFollowUpsOnNextContinuation = false;
 
 	// Branch summarization state
@@ -950,7 +952,7 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
-			this._proactiveCompactionAttempted = false;
+			this._proactiveCompactionState = "idle";
 			const queueEntryId = event.message.clientMessageId;
 			if (queueEntryId !== undefined) {
 				// Check steering queue first. Queue identity, never display text,
@@ -2794,7 +2796,7 @@ export class AgentSession {
 		) {
 			return;
 		}
-		this._proactiveCompactionStopped = false;
+		this._proactiveCompactionState = "idle";
 		this._drainFollowUpsOnNextContinuation = false;
 		const run = (async () => {
 			this._agentConversationMutationInFlight = true;
@@ -2925,14 +2927,14 @@ export class AgentSession {
 			// persisted messages remain historical truth, but it cannot compact,
 			// retry, or continue against the newly selected branch.
 			this._lastAssistantMessage = undefined;
-			this._proactiveCompactionStopped = false;
+			this._proactiveCompactionState = "idle";
 			this._settleRetry(false, "Conversation branch changed");
 			return false;
 		}
 		const conversationGenerationChanged = (): boolean =>
 			conversationGenerationRevision !== this._conversationGenerationRevision;
 		const abandonStaleConversationRun = (): false => {
-			this._proactiveCompactionStopped = false;
+			this._proactiveCompactionState = "idle";
 			this._settleRetry(false, "Conversation branch changed");
 			return false;
 		};
@@ -2942,16 +2944,19 @@ export class AgentSession {
 			return false;
 		}
 
-		if (this._proactiveCompactionStopped) {
-			this._proactiveCompactionStopped = false;
+		if (this._proactiveCompactionState === "scheduled") {
+			this._proactiveCompactionState = "compacting";
 			// The run was interrupted mid-task by _shouldStopForProactiveCompaction,
-			// so always resume it, even when compaction bails or fails, unless the
-			// session was disposed while compaction was in flight.
-			await this._runAutoCompaction("threshold", false, true, true);
+			// so resume it only after mandatory compaction succeeds. A failure
+			// rejects the prompt and leaves the durable transcript retryable.
+			const shouldContinue = await this._runAutoCompaction("threshold", false, true);
 			if (conversationGenerationChanged()) {
 				return abandonStaleConversationRun();
 			}
-			return !this._disposed && (abortGeneration === this._abortGeneration || this.agent.hasQueuedMessages());
+			if (!shouldContinue) {
+				return false;
+			}
+			return !this._disposed && abortGeneration === this._abortGeneration;
 		}
 
 		if (this._isRetryableError(msg)) {
@@ -4104,6 +4109,27 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private _getSummarizationRetryOptions(): SummarizationRetryOptions {
+		const settings = this.settingsManager.getRetrySettings();
+		return {
+			maxRetries: settings.enabled ? Math.min(MAX_COMPACTION_SUMMARY_RETRIES, Math.max(0, settings.maxRetries)) : 0,
+			baseDelayMs: Math.max(0, settings.baseDelayMs),
+			maxDelayMs: Math.min(
+				MAX_COMPACTION_RETRY_DELAY_MS,
+				Math.max(0, this.settingsManager.getProviderRetrySettings().maxRetryDelayMs),
+			),
+		};
+	}
+
+	private _getSummarizationThinkingLevel(): ThinkingLevel | undefined {
+		if (!this.model?.reasoning) {
+			return undefined;
+		}
+
+		const level = clampThinkingLevel(this.model, "minimal");
+		return level === "off" ? undefined : level;
+	}
+
 	/**
 	 * Shared epilogue for manual and auto compaction: rebuild the session
 	 * context from the new boundary, update agent state, notify extensions,
@@ -4280,9 +4306,10 @@ export class AgentSession {
 					headers,
 					customInstructions,
 					this._compactionAbortController.signal,
-					this.thinkingLevel,
+					this._getSummarizationThinkingLevel(),
 					this.agent.streamFn,
 					env,
+					this._getSummarizationRetryOptions(),
 				);
 				assertConversationGenerationCurrent?.();
 				summary = result.summary;
@@ -4298,7 +4325,7 @@ export class AgentSession {
 			assertConversationGenerationCurrent?.();
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
 			await this.sessionManager.flush();
-			this._proactiveCompactionAttempted = false;
+			this._proactiveCompactionState = "idle";
 			const compactionResult = await this._finalizeCompaction(
 				summary,
 				firstKeptEntryId,
@@ -4365,7 +4392,7 @@ export class AgentSession {
 			if (context.toolBatchTerminated && hasQueuedMessages) {
 				this._drainFollowUpsOnNextContinuation = true;
 			}
-			if (this._proactiveCompactionAttempted) return false;
+			if (this._proactiveCompactionState !== "idle") return false;
 			// Only interrupt turns that would otherwise continue with another LLM
 			// call. Queued steering/follow-up messages also force a continuation,
 			// including after a plain response or a terminating tool batch.
@@ -4382,8 +4409,7 @@ export class AgentSession {
 			// loop starts another provider request.
 			const contextTokens = estimateContextTokens(context.context.messages).tokens;
 			if (!shouldCompact(contextTokens, model.contextWindow ?? 0, settings)) return false;
-			this._proactiveCompactionAttempted = true;
-			this._proactiveCompactionStopped = true;
+			this._proactiveCompactionState = "scheduled";
 			return true;
 		} catch {
 			return false;
@@ -4453,7 +4479,7 @@ export class AgentSession {
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.state.messages = messages.slice(0, -1);
 			}
-			return await this._runAutoCompaction("overflow", true, false, false, assertConversationGenerationCurrent);
+			return await this._runAutoCompaction("overflow", true, false, assertConversationGenerationCurrent);
 		}
 
 		// Case 2: Threshold - context is getting large. Estimate from the live
@@ -4490,9 +4516,9 @@ export class AgentSession {
 					(content) => (content.type === "text" && content.text.trim().length > 0) || content.type === "toolCall",
 				);
 			if (continueAfterCompaction) {
-				return await this._runAutoCompaction("threshold", false, true, false, assertConversationGenerationCurrent);
+				return await this._runAutoCompaction("threshold", false, true, assertConversationGenerationCurrent);
 			}
-			return await this._runAutoCompaction("threshold", false, false, false, assertConversationGenerationCurrent);
+			return await this._runAutoCompaction("threshold", false, false, assertConversationGenerationCurrent);
 		}
 		return false;
 	}
@@ -4504,7 +4530,6 @@ export class AgentSession {
 		reason: "overflow" | "threshold",
 		willRetry: boolean,
 		continueAfterCompaction = false,
-		continueWithoutCompaction = false,
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
@@ -4530,52 +4555,17 @@ export class AgentSession {
 			this._emit({ type: "compaction_start", reason });
 			assertConversationCurrent();
 			if (!this.model) {
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted: false,
-					willRetry: canContinue() && continueWithoutCompaction,
-				});
-				return false;
+				throw new Error("Auto-compaction requires a selected model");
 			}
 
-			let apiKey: string | undefined;
-			let headers: Record<string, string> | undefined;
-			let env: Record<string, string> | undefined;
-			if (this.agent.streamFn === streamSimple) {
-				const authResult = await this._modelRegistry.getApiKeyAndHeaders(this.model);
-				assertConversationCurrent();
-				if (!authResult.ok || !authResult.apiKey) {
-					this._emit({
-						type: "compaction_end",
-						reason,
-						result: undefined,
-						aborted: false,
-						willRetry: canContinue() && continueWithoutCompaction,
-					});
-					return false;
-				}
-				apiKey = authResult.apiKey;
-				headers = authResult.headers;
-				env = authResult.env;
-			} else {
-				({ apiKey, headers, env } = await this._getCompactionRequestAuth(this.model));
-				assertConversationCurrent();
-			}
+			const { apiKey, headers, env } = await this._getCompactionRequestAuth(this.model);
+			assertConversationCurrent();
 
 			const pathEntries = this.sessionManager.getBranch();
 
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted: false,
-					willRetry: canContinue() && continueWithoutCompaction,
-				});
-				return false;
+				throw new Error("Auto-compaction could not find a safe compaction boundary");
 			}
 
 			let extensionCompaction: CompactionResult | undefined;
@@ -4593,14 +4583,7 @@ export class AgentSession {
 				assertConversationCurrent();
 
 				if (extensionResult?.cancel) {
-					this._emit({
-						type: "compaction_end",
-						reason,
-						result: undefined,
-						aborted: true,
-						willRetry: canContinue() && continueWithoutCompaction,
-					});
-					return false;
+					throw new Error("Auto-compaction was cancelled by an extension");
 				}
 
 				if (extensionResult?.compaction) {
@@ -4630,9 +4613,10 @@ export class AgentSession {
 					headers,
 					undefined,
 					this._autoCompactionAbortController.signal,
-					this.thinkingLevel,
+					this._getSummarizationThinkingLevel(),
 					this.agent.streamFn,
 					env,
+					this._getSummarizationRetryOptions(),
 				);
 				assertConversationCurrent();
 				summary = compactResult.summary;
@@ -4647,7 +4631,7 @@ export class AgentSession {
 					reason,
 					result: undefined,
 					aborted: true,
-					willRetry: canContinue() && continueWithoutCompaction,
+					willRetry: false,
 				});
 				return false;
 			}
@@ -4655,7 +4639,7 @@ export class AgentSession {
 			assertConversationCurrent();
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
 			await this.sessionManager.flush();
-			this._proactiveCompactionAttempted = false;
+			this._proactiveCompactionState = "idle";
 			const result = await this._finalizeCompaction(
 				summary,
 				firstKeptEntryId,
@@ -4703,7 +4687,7 @@ export class AgentSession {
 				reason,
 				result: undefined,
 				aborted,
-				willRetry: canContinue() && continueWithoutCompaction,
+				willRetry: false,
 				...(aborted
 					? {}
 					: {
@@ -4713,8 +4697,12 @@ export class AgentSession {
 									: `Auto-compaction failed: ${errorMessage}`,
 						}),
 			});
-			return false;
+			if (aborted) {
+				return false;
+			}
+			throw error;
 		} finally {
+			this._proactiveCompactionState = "idle";
 			this._activeCompaction = undefined;
 			this._autoCompactionAbortController = undefined;
 		}
@@ -5372,12 +5360,6 @@ export class AgentSession {
 	// Auto-Retry
 	// =========================================================================
 
-	private _isNonRetryableProviderLimitError(errorMessage: string): boolean {
-		return /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing/i.test(
-			errorMessage,
-		);
-	}
-
 	/**
 	 * Check if an error is retryable (overloaded, rate limit, server errors).
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
@@ -5390,11 +5372,7 @@ export class AgentSession {
 		if (isContextOverflow(message, contextWindow)) return false;
 
 		const err = message.errorMessage;
-		if (this._isNonRetryableProviderLimitError(err)) return false;
-		// Match: overloaded_error, provider returned error, rate limit, 429, 500, 502, 503, 504, service unavailable, network/connection errors (including connection lost), WebSocket transport closes/errors, fetch failed, premature stream endings, HTTP/2 closed before response, terminated, retry delay exceeded
-		return /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|stream ended before message_stop|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i.test(
-			err,
-		);
+		return isTransientProviderError(err);
 	}
 
 	/**
