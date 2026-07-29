@@ -7,7 +7,7 @@ import {
 } from "./access-grant.ts";
 import type { IrohRemoteHello } from "./handshake.ts";
 import {
-	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+	canonicalizePersistedIrohRemoteAllowTools,
 	type IrohRemoteHostHandshakeFailureOutcome,
 	normalizeIrohRemoteAllowTools,
 } from "./protocol.ts";
@@ -263,9 +263,14 @@ export function authorizeIrohRemoteClient(
 				pairingSecretExpired: false,
 			};
 		}
-		const allowedTools = normalizeIrohRemoteAllowTools(
-			matchingPendingPairingTicket?.allowedTools ?? options.allowTools,
-		);
+		// A consumed ticket is the grant authority even when it carries no
+		// customized tools: absence there means default-grant intent, so the new
+		// client record tracks the current default instead of freezing a snapshot.
+		const requestedAllowTools = matchingPendingPairingTicket
+			? matchingPendingPairingTicket.allowedTools
+			: options.allowTools;
+		const persistedAllowedTools = canonicalizePersistedIrohRemoteAllowTools(requestedAllowTools);
+		const allowedTools = normalizeIrohRemoteAllowTools(persistedAllowedTools);
 		let rpcGrant: IrohRemoteRpcGrant;
 		try {
 			const selectedGrant = parseIrohRemoteRpcGrant(
@@ -298,7 +303,7 @@ export function authorizeIrohRemoteClient(
 			nodeId: remoteNodeId,
 			label: hello.clientLabel || matchingPendingPairingTicket?.labelHint || remoteNodeId.slice(0, 12),
 			allowedWorkspaces: [],
-			allowedTools,
+			...(persistedAllowedTools === undefined ? {} : { allowedTools: persistedAllowedTools }),
 			rpcGrant,
 			pairedAt: now,
 			lastSeenAt: now,
@@ -342,17 +347,16 @@ export function authorizeIrohRemoteClient(
 		};
 	}
 
-	const persistedAllowedTools = normalizeIrohRemoteAllowTools(
-		existingClient.allowedTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
-	);
+	// Reconnects never write the grant back: a tracking client (no persisted
+	// allowedTools) must keep resolving against the current default.
+	const effectiveAllowTools = normalizeIrohRemoteAllowTools(existingClient.allowedTools);
 	existingClient.lastSeenAt = now;
-	existingClient.allowedTools = persistedAllowedTools;
 	if (hello.clientLabel) {
 		existingClient.label = hello.clientLabel;
 	}
 	return {
 		ok: true,
-		allowTools: persistedAllowedTools,
+		allowTools: effectiveAllowTools,
 		client: existingClient,
 		...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
 		paired: false,

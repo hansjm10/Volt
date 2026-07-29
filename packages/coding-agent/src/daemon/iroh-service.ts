@@ -33,7 +33,12 @@ import {
 	writeIrohRemoteHandshakeResponse,
 } from "../core/remote/iroh/handshake-reader.ts";
 import { resolveIrohRemoteWorkspaceProjectTrusted } from "../core/remote/iroh/host-policy.ts";
-import { IROH_REMOTE_ALPN, resolveIrohRemoteRuntimeToolPolicy } from "../core/remote/iroh/protocol.ts";
+import {
+	IROH_REMOTE_ALPN,
+	normalizeIrohRemoteAllowTools,
+	parseIrohRemoteAllowTools,
+	resolveIrohRemoteRuntimeToolPolicy,
+} from "../core/remote/iroh/protocol.ts";
 import {
 	IrohRemoteInMemoryPushNotificationDeduper,
 	type IrohRemoteLiveActivityUpdateIntent,
@@ -2367,7 +2372,7 @@ class IrohDaemonService {
 				},
 				authorization: {
 					clientNodeId: authorization.client.nodeId,
-					allowedTools: authorization.client.allowedTools,
+					allowedTools: normalizeIrohRemoteAllowTools(authorization.client.allowedTools),
 					rpcGrant: authorization.client.rpcGrant,
 					workspaceName,
 					workspacePath: authorization.workspace.path,
@@ -3767,7 +3772,8 @@ class IrohDaemonService {
 						label: updated.client.label,
 						pairedAtMs: updated.client.pairedAt,
 						lastSeenAtMs: updated.client.lastSeenAt,
-						allowedTools: updated.client.allowedTools.length === 0 ? [] : updated.client.allowedTools.split(","),
+						allowedTools: parseIrohRemoteAllowTools(updated.client.allowedTools),
+						usesDefaultTools: updated.client.allowedTools === undefined,
 						rpcGrant: updated.client.rpcGrant,
 					},
 				});
@@ -3878,7 +3884,7 @@ class IrohDaemonService {
 			ok: true,
 			authorization: {
 				ok: true,
-				allowTools: client.allowedTools,
+				allowTools: normalizeIrohRemoteAllowTools(client.allowedTools),
 				client,
 				paired: true,
 				pairingSecretConsumed: false,
@@ -4014,7 +4020,7 @@ class IrohDaemonService {
 		}
 		const authorization: IrohRemoteClientAuthorizationSuccess = {
 			ok: true,
-			allowTools: client.allowedTools,
+			allowTools: normalizeIrohRemoteAllowTools(client.allowedTools),
 			client,
 			paired: true,
 			pairingSecretConsumed: false,

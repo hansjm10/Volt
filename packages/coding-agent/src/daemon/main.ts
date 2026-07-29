@@ -12,6 +12,7 @@ import {
 	parseIrohRemoteRpcGrant,
 } from "../core/remote/iroh/access-grant.ts";
 import { IrohRemoteAuditLogger } from "../core/remote/iroh/audit.ts";
+import { normalizeIrohRemoteAllowTools, parseIrohRemoteAllowTools } from "../core/remote/iroh/protocol.ts";
 import { IrohRemotePushRelayHttpClient, revokeIrohRemoteClientPushTargets } from "../core/remote/iroh/push.ts";
 import {
 	IROH_REMOTE_WORKSPACE_HAS_WORKTREES_ERROR,
@@ -488,10 +489,8 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 			...(client.label === undefined ? {} : { label: client.label }),
 			pairedAtMs: client.pairedAt ?? 0,
 			lastSeenAtMs: client.lastSeenAt ?? 0,
-			allowedTools: client.allowedTools
-				.split(",")
-				.map((tool) => tool.trim())
-				.filter((tool) => tool.length > 0),
+			allowedTools: parseIrohRemoteAllowTools(client.allowedTools),
+			usesDefaultTools: client.allowedTools === undefined,
 			rpcGrant: parseIrohRemoteRpcGrant(client.rpcGrant, "client rpcGrant"),
 		}));
 	const toRevokedClientStatuses = (): ControlRevokedClientStatus[] =>
@@ -700,7 +699,7 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 						details: {
 							expectedRevision: request.expectedRevision,
 							revision: updated.client.rpcGrant.revision,
-							allowedTools: updated.client.allowedTools,
+							allowedTools: normalizeIrohRemoteAllowTools(updated.client.allowedTools),
 							rpcCapabilities: updated.client.rpcGrant.capabilities,
 						},
 					})
@@ -713,7 +712,8 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 						label: updated.client.label,
 						pairedAtMs: updated.client.pairedAt,
 						lastSeenAtMs: updated.client.lastSeenAt,
-						allowedTools: updated.client.allowedTools.length === 0 ? [] : updated.client.allowedTools.split(","),
+						allowedTools: parseIrohRemoteAllowTools(updated.client.allowedTools),
+						usesDefaultTools: updated.client.allowedTools === undefined,
 						rpcGrant: updated.client.rpcGrant,
 					},
 				});

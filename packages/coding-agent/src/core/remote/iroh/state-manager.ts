@@ -8,6 +8,7 @@ import {
 	type IrohRemoteClientAuthorizationResult,
 } from "./authorization.ts";
 import type { IrohRemoteHello } from "./handshake.ts";
+import { canonicalizePersistedIrohRemoteAllowTools } from "./protocol.ts";
 import {
 	createEmptyIrohRemoteHostState,
 	type IrohRemoteClient,
@@ -445,7 +446,12 @@ export class IrohRemoteHostStateManager {
 			if (currentGrant.revision === Number.MAX_SAFE_INTEGER) {
 				return { ok: false, reason: "revision_exhausted", currentRevision: currentGrant.revision };
 			}
-			client.allowedTools = access.allowedTools;
+			const persistedAllowedTools = canonicalizePersistedIrohRemoteAllowTools(access.allowedTools);
+			if (persistedAllowedTools === undefined) {
+				delete client.allowedTools;
+			} else {
+				client.allowedTools = persistedAllowedTools;
+			}
 			client.rpcGrant = {
 				...cloneIrohRemoteRpcGrant(access.rpcGrant),
 				revision: expectedRevision + 1,
@@ -785,7 +791,7 @@ export class IrohRemoteHostStateManager {
 				nodeId: client.nodeId,
 				label: client.label,
 				allowedWorkspaces: [...client.allowedWorkspaces],
-				allowedTools: client.allowedTools,
+				...(client.allowedTools === undefined ? {} : { allowedTools: client.allowedTools }),
 				rpcGrant: parseIrohRemoteRpcGrant(client.rpcGrant, "client rpcGrant"),
 				pairedAt: client.pairedAt,
 				lastSeenAt: client.lastSeenAt,

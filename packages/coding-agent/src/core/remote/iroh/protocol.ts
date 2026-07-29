@@ -146,6 +146,21 @@ export function usesDefaultIrohRemoteAllowTools(allowTools: string | undefined):
 	return tools.size === defaultTools.size && Array.from(tools).every((tool) => defaultTools.has(tool));
 }
 
+/**
+ * Reduce a grant to its persistence representation. A persisted grant never has
+ * default-grant semantics: default-equivalent grants (set equality, so order,
+ * duplicates, and whitespace do not matter) are represented as `undefined` and
+ * resolve against the CURRENT default at use time, so new builtin tools reach
+ * default-grant clients without per-record migrations. The empty string is a
+ * real grant (deny-all), never collapsed to `undefined`.
+ */
+export function canonicalizePersistedIrohRemoteAllowTools(allowTools: string | undefined): string | undefined {
+	if (allowTools === undefined || usesDefaultIrohRemoteAllowTools(allowTools)) {
+		return undefined;
+	}
+	return uniqueIrohRemoteAllowToolNames(parseIrohRemoteAllowToolNames(allowTools)).join(",");
+}
+
 export interface IrohRemoteRuntimeToolPolicy {
 	tools: string[];
 	allowUnlistedExtensionTools: boolean;

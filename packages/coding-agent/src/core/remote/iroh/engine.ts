@@ -29,6 +29,7 @@ import {
 } from "./handshake-reader.ts";
 import { createIrohRemoteHostMetadata } from "./metadata.ts";
 import {
+	canonicalizePersistedIrohRemoteAllowTools,
 	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_HOST_FEATURES,
@@ -219,9 +220,12 @@ export class IrohRemoteHostEngine {
 			const createdAt = this.now();
 			const expiresAt =
 				options.expiresAt ?? createdAt + (options.ttlMs ?? DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS);
-			const allowTools = normalizeIrohRemoteAllowTools(
-				options.allowTools ?? workspace.allowedTools ?? this.allowTools,
-			);
+			const requestedAllowTools = options.allowTools ?? workspace.allowedTools ?? this.allowTools;
+			// Tickets carry customization intent, not a resolved snapshot: a
+			// default-grant ticket stays default even if the default changes
+			// between mint and consume.
+			const persistedAllowTools = canonicalizePersistedIrohRemoteAllowTools(requestedAllowTools);
+			const allowTools = normalizeIrohRemoteAllowTools(persistedAllowTools);
 			const rpcGrant = cloneIrohRemoteRpcGrant(options.rpcGrant ?? this.rpcGrant);
 			this.pairingAllowTools = allowTools;
 			this.pairingRpcGrant = rpcGrant;
@@ -231,7 +235,7 @@ export class IrohRemoteHostEngine {
 			const pendingPairingTicket = await this.stateManager.addPendingPairingTicket({
 				secretHash: hashIrohRemotePairingSecret(secret),
 				workspace: workspace.name,
-				allowedTools: allowTools,
+				...(persistedAllowTools === undefined ? {} : { allowedTools: persistedAllowTools }),
 				rpcGrant,
 				expiresAt,
 				createdAt,
@@ -254,7 +258,7 @@ export class IrohRemoteHostEngine {
 				type: "pairing_ticket_created",
 				workspace: payload.workspace,
 				details: {
-					allowedTools: pendingPairingTicket.allowedTools,
+					allowedTools: normalizeIrohRemoteAllowTools(pendingPairingTicket.allowedTools),
 					rpcGrant: pendingPairingTicket.rpcGrant,
 					createdAt: pendingPairingTicket.createdAt,
 					expiresAt: pendingPairingTicket.expiresAt,
@@ -299,7 +303,7 @@ export class IrohRemoteHostEngine {
 				? {
 						expectedRevision,
 						revision: result.client.rpcGrant.revision,
-						allowedTools: result.client.allowedTools,
+						allowedTools: normalizeIrohRemoteAllowTools(result.client.allowedTools),
 						rpcCapabilities: result.client.rpcGrant.capabilities,
 					}
 				: { expectedRevision, currentRevision: result.currentRevision },
@@ -585,7 +589,7 @@ export class IrohRemoteHostEngine {
 				workspace: ticket.workspace,
 				success: false,
 				details: {
-					allowedTools: ticket.allowedTools,
+					allowedTools: normalizeIrohRemoteAllowTools(ticket.allowedTools),
 					rpcGrant: ticket.rpcGrant,
 					createdAt: ticket.createdAt,
 					expiresAt: ticket.expiresAt,
@@ -602,7 +606,7 @@ export class IrohRemoteHostEngine {
 			success: true,
 			details: result.consumedPairingTicket
 				? {
-						allowedTools: result.consumedPairingTicket.allowedTools,
+						allowedTools: normalizeIrohRemoteAllowTools(result.consumedPairingTicket.allowedTools),
 						rpcGrant: result.consumedPairingTicket.rpcGrant,
 						createdAt: result.consumedPairingTicket.createdAt,
 						expiresAt: result.consumedPairingTicket.expiresAt,

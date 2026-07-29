@@ -240,8 +240,10 @@ export interface ControlClientStatus {
 	pairedAtMs: number;
 	/** Added to protocol v1 after launch; absent on older running daemons. */
 	lastSeenAtMs?: number;
-	/** Persisted headless tool grant for this paired device. */
+	/** Effective headless tool grant for this paired device. */
 	allowedTools?: string[];
+	/** True when the device has no customized grant and tracks the daemon's current default. */
+	usesDefaultTools?: boolean;
 	rpcGrant?: IrohRemoteRpcGrant;
 }
 
