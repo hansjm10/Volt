@@ -36,7 +36,6 @@ import { resolveIrohRemoteWorkspaceProjectTrusted } from "../core/remote/iroh/ho
 import {
 	IROH_REMOTE_ALPN,
 	normalizeIrohRemoteAllowTools,
-	parseIrohRemoteAllowTools,
 	resolveIrohRemoteRuntimeToolPolicy,
 } from "../core/remote/iroh/protocol.ts";
 import {
@@ -70,6 +69,7 @@ import {
 	CONTROL_WORKTREES_CAPABILITY,
 	type ControlLeaseStatus,
 	type ControlRequest,
+	createControlClientStatus,
 	RELAY_RPC_COMMAND_TYPES,
 	type RelayCloseReason,
 } from "./control-protocol.ts";
@@ -3767,15 +3767,7 @@ class IrohDaemonService {
 				connection.send({
 					type: "client_access_updated",
 					id: request.id,
-					client: {
-						clientNodeId: updated.client.nodeId,
-						label: updated.client.label,
-						pairedAtMs: updated.client.pairedAt,
-						lastSeenAtMs: updated.client.lastSeenAt,
-						allowedTools: parseIrohRemoteAllowTools(updated.client.allowedTools),
-						usesDefaultTools: updated.client.allowedTools === undefined,
-						rpcGrant: updated.client.rpcGrant,
-					},
+					client: createControlClientStatus(updated.client),
 				});
 				return true;
 			}

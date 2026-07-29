@@ -12,7 +12,7 @@ import {
 	parseIrohRemoteRpcGrant,
 } from "../core/remote/iroh/access-grant.ts";
 import { IrohRemoteAuditLogger } from "../core/remote/iroh/audit.ts";
-import { normalizeIrohRemoteAllowTools, parseIrohRemoteAllowTools } from "../core/remote/iroh/protocol.ts";
+import { normalizeIrohRemoteAllowTools } from "../core/remote/iroh/protocol.ts";
 import { IrohRemotePushRelayHttpClient, revokeIrohRemoteClientPushTargets } from "../core/remote/iroh/push.ts";
 import {
 	IROH_REMOTE_WORKSPACE_HAS_WORKTREES_ERROR,
@@ -36,7 +36,12 @@ import type {
 	ControlRevokedClientStatus,
 	ControlWorkspaceStatus,
 } from "./control-protocol.ts";
-import { CONTROL_PAIR_CANCEL_CAPABILITY, CONTROL_RPC_GRANTS_CAPABILITY, PROTOCOL_VERSION } from "./control-protocol.ts";
+import {
+	CONTROL_PAIR_CANCEL_CAPABILITY,
+	CONTROL_RPC_GRANTS_CAPABILITY,
+	createControlClientStatus,
+	PROTOCOL_VERSION,
+} from "./control-protocol.ts";
 import {
 	type ControlConnection,
 	type ControlServer,
@@ -483,16 +488,7 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 		void shutdown(reason);
 	};
 
-	const toClientStatuses = (): ControlClientStatus[] =>
-		state.state.clients.map((client) => ({
-			clientNodeId: client.nodeId,
-			...(client.label === undefined ? {} : { label: client.label }),
-			pairedAtMs: client.pairedAt ?? 0,
-			lastSeenAtMs: client.lastSeenAt ?? 0,
-			allowedTools: parseIrohRemoteAllowTools(client.allowedTools),
-			usesDefaultTools: client.allowedTools === undefined,
-			rpcGrant: parseIrohRemoteRpcGrant(client.rpcGrant, "client rpcGrant"),
-		}));
+	const toClientStatuses = (): ControlClientStatus[] => state.state.clients.map(createControlClientStatus);
 	const toRevokedClientStatuses = (): ControlRevokedClientStatus[] =>
 		state.state.revokedClients.map((client) => ({
 			clientNodeId: client.nodeId,
@@ -708,15 +704,7 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 				connection.send({
 					type: "client_access_updated",
 					id: request.id,
-					client: {
-						clientNodeId: updated.client.nodeId,
-						label: updated.client.label,
-						pairedAtMs: updated.client.pairedAt,
-						lastSeenAtMs: updated.client.lastSeenAt,
-						allowedTools: parseIrohRemoteAllowTools(updated.client.allowedTools),
-						usesDefaultTools: updated.client.allowedTools === undefined,
-						rpcGrant: updated.client.rpcGrant,
-					},
+					client: createControlClientStatus(updated.client),
 				});
 				return;
 			}

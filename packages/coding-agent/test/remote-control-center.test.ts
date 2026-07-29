@@ -1,7 +1,7 @@
 import { visibleWidth } from "@hansjm10/volt-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { IrohRemoteAccessPresetName } from "../src/core/remote/iroh/access-grant.ts";
-import { IROH_REMOTE_ALPN } from "../src/core/remote/iroh/protocol.ts";
+import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS, IROH_REMOTE_ALPN } from "../src/core/remote/iroh/protocol.ts";
 import { encodeIrohRemoteTicketPayload } from "../src/core/remote/iroh/ticket.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../src/core/slash-commands.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
@@ -267,7 +267,7 @@ describe("RemoteControlCenterComponent", () => {
 						label: "Tracking phone",
 						pairedAtMs: Date.now() - 60_000,
 						lastSeenAtMs: Date.now() - 5_000,
-						allowedTools: ["read", "grep"],
+						allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(","),
 						usesDefaultTools: true,
 					},
 					{
@@ -282,9 +282,9 @@ describe("RemoteControlCenterComponent", () => {
 		});
 		const { component } = createComponent(backend, 45);
 		await component.start();
-		const text = component.render(120).map(stripAnsi).join("\n");
+		const text = component.render(200).map(stripAnsi).join("\n");
 
-		expect(text).toContain("Tools: read, grep (default)");
+		expect(text).toContain(`Tools: ${DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(",").join(", ")} (default)`);
 		expect(text).toContain("Tools: none");
 	});
 
