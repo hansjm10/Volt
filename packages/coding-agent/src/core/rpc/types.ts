@@ -29,6 +29,7 @@ import type {
 	RpcExtensionErrorEventSchema,
 	RpcExtensionUIRequestSchema,
 	RpcExtensionUIResponseSchema,
+	RpcGitContextChangedEventSchema,
 	RpcHostActionRequestSchema,
 	RpcHostActionResponseSchema,
 	RpcHostActionUpdateSchema,
@@ -39,6 +40,7 @@ import type {
 	RpcSubagentEventSchema,
 	RpcUiActionStateChangedEventSchema,
 } from "./schema/events.ts";
+import type { RpcGitContextSchema } from "./schema/git-context.ts";
 import type {
 	RpcMcpAuthResponseSchema,
 	RpcMcpCapabilitiesResponseSchema,
@@ -294,6 +296,8 @@ export type RpcSlashCommand = Static<typeof RpcSlashCommandSchema>;
 // ============================================================================
 
 export type RpcSessionListItem = Static<typeof RpcSessionListItemSchema>;
+/** Path-free host-observed metadata for one active session worktree. */
+export type RpcGitContext = Static<typeof RpcGitContextSchema>;
 export type RpcActiveToolExecution = Static<typeof RpcActiveToolExecutionSchema>;
 export type RpcActiveCompaction = Static<typeof RpcActiveCompactionSchema>;
 export type RpcActiveRetry = Static<typeof RpcActiveRetrySchema>;
@@ -400,6 +404,8 @@ export type RpcSubagentEndEvent = Static<typeof RpcSubagentEndEventSchema>;
 export type RpcSubagentDisposedEvent = Static<typeof RpcSubagentDisposedEventSchema>;
 /** Model catalog changed; clients re-fetch get_available_models. */
 export type RpcModelsChangedEvent = Static<typeof RpcModelsChangedEventSchema>;
+/** Full replacement of the active session's path-free Git context. */
+export type RpcGitContextChangedEvent = Static<typeof RpcGitContextChangedEventSchema>;
 /** Settled, bounded state of a host UI action. */
 export type RpcUiActionStateChangedEvent = Static<typeof RpcUiActionStateChangedEventSchema>;
 /** Full authoritative planning snapshot emitted after every mutation. */

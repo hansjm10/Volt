@@ -5,6 +5,7 @@ import type { ExtensionUIContext } from "../src/core/extensions/index.ts";
 import type { HostInteraction } from "../src/core/host-interaction.ts";
 import { isStdoutTakenOver, restoreStdout } from "../src/core/output-guard.ts";
 import type { RpcCloseHandler, RpcTransport } from "../src/core/rpc/transport.ts";
+import type { RpcGitContext } from "../src/core/rpc/types.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { runRpcMode as runRpcModeImpl } from "../src/modes/rpc/rpc-mode.ts";
 
@@ -54,7 +55,7 @@ interface RpcModeHarness {
 	writes: object[];
 }
 
-function createStateSession(sessionId: string) {
+function createStateSession(sessionId: string, gitContext: RpcGitContext | null = null) {
 	return {
 		agent: {
 			state: {
@@ -66,6 +67,10 @@ function createStateSession(sessionId: string) {
 		autoCompactionEnabled: true,
 		bindExtensions: vi.fn(async () => {}),
 		followUpMode: "one-at-a-time" as const,
+		gitContextProvider: {
+			getSnapshot: vi.fn(() => gitContext),
+			refresh: vi.fn(() => new Promise(() => {})),
+		},
 		isCompacting: false,
 		isStreaming: false,
 		messages: [],
@@ -278,6 +283,52 @@ describe("RPC mode caller-provided transports", () => {
 
 		closeHandler?.();
 		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("get_state returns the cached Git replacement without waiting for refresh", async () => {
+		const gitContext: RpcGitContext = {
+			repository: "workspace",
+			head: { kind: "branch", name: "main", oid: "0123456789abcdef0123456789abcdef01234567" },
+			upstream: null,
+			base: null,
+			status: {
+				staged: { added: 0, modified: 0, deleted: 0, renamed: 0 },
+				unstaged: { added: 0, modified: 0, deleted: 0, renamed: 0 },
+				untracked: 0,
+				conflicted: 0,
+				total: 0,
+				clean: true,
+			},
+			operation: null,
+			revision: 1,
+			observedAt: "2026-07-29T00:00:00.000Z",
+			stale: false,
+		};
+		const session = createStateSession("git-state-session", gitContext);
+		const runtimeHost = {
+			session,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const rpc = await startRpcModeHarness(runtimeHost);
+		try {
+			rpc.send({ id: "git-state", type: "get_state" });
+			await vi.waitFor(() =>
+				expect(rpc.writes).toContainEqual(
+					expect.objectContaining({
+						id: "git-state",
+						data: expect.objectContaining({ gitContext }),
+					}),
+				),
+			);
+			expect(session.gitContextProvider.refresh).not.toHaveBeenCalled();
+		} finally {
+			rpc.close();
+			await rpc.modePromise.catch(() => {});
+		}
 	});
 
 	test("serializes regular commands so state reads wait for pending session switches", async () => {

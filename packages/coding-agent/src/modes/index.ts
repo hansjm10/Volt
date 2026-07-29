@@ -46,6 +46,8 @@ export type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcGitContext,
+	RpcGitContextChangedEvent,
 	RpcHostActionRequest,
 	RpcHostActionResponse,
 	RpcHostActionUpdate,

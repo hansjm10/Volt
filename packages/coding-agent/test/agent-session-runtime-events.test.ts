@@ -1,9 +1,10 @@
+import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AgentSession } from "../src/core/agent-session.ts";
+import { AgentSession, type AgentSessionEvent } from "../src/core/agent-session.ts";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -90,6 +91,31 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 		return { runtimeHost, faux };
 	}
+
+	it("bridges Git replacements and explicitly refreshes after recorded Bash", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => undefined);
+		const events: AgentSessionEvent[] = [];
+		const unsubscribe = runtimeHost.session.subscribe((event) => events.push(event));
+		execFileSync("git", ["init", "--initial-branch=main"], { cwd: runtimeHost.cwd, stdio: "ignore" });
+
+		await runtimeHost.session.gitContextProvider.refresh();
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: "git_context_changed",
+				gitContext: expect.objectContaining({ head: { kind: "unborn", name: "main" }, stale: false }),
+			}),
+		);
+
+		const scheduleRefresh = vi.spyOn(runtimeHost.session.gitContextProvider, "scheduleRefresh");
+		runtimeHost.session.recordBashResult("touch changed", {
+			output: "",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+		});
+		expect(scheduleRefresh).toHaveBeenCalledOnce();
+		unsubscribe();
+	});
 
 	it("emits session_before_switch and session_start for new and resume flows", async () => {
 		const events: RecordedSessionEvent[] = [];
@@ -1138,6 +1164,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 					availableThinkingLevels: ["off"],
 					fastModeEnabled: false,
 					planning: { mode: "build", plan: null },
+					gitContext: null,
 					isStreaming: false,
 					isCompacting: false,
 					steeringMode: "one-at-a-time",
@@ -1225,6 +1252,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 					availableThinkingLevels: ["off"],
 					fastModeEnabled: false,
 					planning: { mode: "build", plan: null },
+					gitContext: null,
 					isStreaming: false,
 					isCompacting: false,
 					steeringMode: "one-at-a-time",
@@ -1315,6 +1343,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 					availableThinkingLevels: ["off"],
 					fastModeEnabled: false,
 					planning: { mode: "build", plan: null },
+					gitContext: null,
 					isStreaming: false,
 					isCompacting: false,
 					steeringMode: "one-at-a-time",

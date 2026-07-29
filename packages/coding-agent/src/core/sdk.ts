@@ -8,6 +8,7 @@ import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { AuthStorage } from "./auth-storage.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
+import { GitContextProvider } from "./git-context-provider.ts";
 import type { HostInteraction } from "./host-interaction.ts";
 import { resolveLspConfig } from "./lsp/config.ts";
 import { McpAuditLogger } from "./mcp/audit.ts";
@@ -127,6 +128,8 @@ export interface CreateAgentSessionOptions {
 
 	/** Session manager. Default: SessionManager.create(cwd) */
 	sessionManager?: SessionManager;
+	/** Shared cwd-bound Git context provider. A bounded provider is created when omitted. */
+	gitContextProvider?: GitContextProvider;
 
 	/** Settings profile to apply when creating the default SettingsManager. */
 	profile?: string;
@@ -525,10 +528,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 	await sessionManager.flush();
 
+	const gitContextProvider = options.gitContextProvider ?? (await GitContextProvider.create(cwd));
 	const session = new AgentSession({
 		agent,
 		sessionManager,
 		settingsManager,
+		gitContextProvider,
 		cwd,
 		scopedModels: options.scopedModels,
 		resourceLoader,

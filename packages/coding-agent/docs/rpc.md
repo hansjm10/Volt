@@ -188,6 +188,25 @@ Response:
     "thinkingLevel": "medium",
     "availableThinkingLevels": ["off", "minimal", "low", "medium", "high"],
     "fastModeEnabled": true,
+    "planning": {"mode": "build", "plan": null},
+    "gitContext": {
+      "repository": "volt",
+      "head": {"kind": "branch", "name": "feat/rpc-git-context", "oid": "0123456789abcdef0123456789abcdef01234567"},
+      "upstream": {"ref": "origin/feat/rpc-git-context", "ahead": 2, "behind": 0},
+      "base": {"ref": "origin/main", "ahead": 3, "behind": 0},
+      "status": {
+        "staged": {"added": 1, "modified": 0, "deleted": 0, "renamed": 0},
+        "unstaged": {"added": 0, "modified": 1, "deleted": 0, "renamed": 0},
+        "untracked": 0,
+        "conflicted": 0,
+        "total": 2,
+        "clean": false
+      },
+      "operation": null,
+      "revision": 4,
+      "observedAt": "2026-07-29T17:00:00.000Z",
+      "stale": false
+    },
     "isStreaming": false,
     "isBusy": true,
     "isCompacting": true,
@@ -205,6 +224,17 @@ Response:
 ```
 
 The `model` field is a full [Model](#model) object or `null`. `availableThinkingLevels` lists the thinking levels the current model supports (`["off"]` for non-reasoning models). `fastModeEnabled` is the authoritative branch-local Fast state used by initial and replacement conversation bootstraps. `isStreaming` indicates an active provider run or session-level continuation; `isBusy` also includes asynchronous prompt preflight and standalone session operations such as manual compaction and tree navigation. The `sessionName` field is the display name set via `set_session_name`, or omitted if not set. `activeCompaction` is present only while context compaction is currently running; `startedAt` is Unix epoch milliseconds.
+
+`gitContext` is a required nullable field read from a host-owned cache; `get_state` never waits for Git. It is `null` when the session cwd is not a usable Git worktree or before an initial scan has succeeded. A non-null value has these semantics:
+
+- `repository` is a bounded display name derived from the common Git repository, or a trusted host workspace-name override. It is never an absolute path or remote URL.
+- `head` is one of `{kind:"branch",name,oid}`, `{kind:"detached",oid}`, or `{kind:"unborn",name}`. Object IDs accept both SHA-1 and SHA-256 forms.
+- `upstream` is the local tracking-ref comparison from porcelain-v2 status, or `null`. `base` is the optional managed-worktree comparison against its recorded local base ref, or `null`. Both report `ahead` and `behind`; the base comparison is computed against the HEAD object ID captured by the same scan.
+- `status.staged` and `status.unstaged` independently count added, modified, deleted, and renamed paths. A path changed in both index and worktree contributes to both groups but only once to `total`. Copies count as added, type changes count as modified, conflicts are counted only in `conflicted`, ignored paths are excluded, and `clean` is equivalent to `total === 0`.
+- `operation` is `null` or a host-detected merge, rebase, cherry-pick, revert, bisect, or sequencer operation. Rebase metadata may include `step` and `total`.
+- `revision` is monotonic only for one provider lifetime. `observedAt` advances only after a complete successful scan. On a later scan failure, Volt retains the last good value, increments its revision once, and sets `stale:true`; recovery emits another replacement with `stale:false`.
+
+Collection is local-only and performs no fetch. It uses bounded, fixed-argument Git reads and never includes changed path names, absolute checkout paths, remote URLs, credentials, or diff content. Git context is not persisted in session JSONL and is not added to model context, extension prompts, handshake `remoteHost`, or host-global metadata.
 
 #### get_transcript
 
@@ -1397,6 +1427,7 @@ Events are streamed to stdout as JSON lines during agent operation. Events do NO
 | `subagent_disposed` | Host released a local RPC-managed subagent; terminal for its event stream |
 | `extension_error` | Extension threw an error |
 | `models_changed` | Available model catalog changed on disk (login, logout, or API key save) |
+| `git_context_changed` | Full replacement of the active session's nullable cached Git context |
 | `mcp_servers_changed` | MCP server list or enablement changed (`servers`: full summary list) |
 | `mcp_server_status_changed` | An MCP server's status or auth state changed (`server`: full summary) |
 | `mcp_auth_request` | An MCP OAuth flow needs user action (`serverId`, `auth`: flow, URL/device-code details) |
@@ -1731,6 +1762,36 @@ Emitted when an extension throws an error.
   "error": "Error message..."
 }
 ```
+
+### git_context_changed
+
+Emitted after the cached Git context changes semantically, becomes stale, recovers, or changes to/from `null`. The payload is a full replacement, never a patch:
+
+```json
+{
+  "type": "git_context_changed",
+  "gitContext": {
+    "repository": "volt",
+    "head": {"kind": "branch", "name": "main", "oid": "0123456789abcdef0123456789abcdef01234567"},
+    "upstream": null,
+    "base": null,
+    "status": {
+      "staged": {"added": 0, "modified": 0, "deleted": 0, "renamed": 0},
+      "unstaged": {"added": 0, "modified": 1, "deleted": 0, "renamed": 0},
+      "untracked": 0,
+      "conflicted": 0,
+      "total": 1,
+      "clean": false
+    },
+    "operation": null,
+    "revision": 2,
+    "observedAt": "2026-07-29T17:00:00.000Z",
+    "stale": false
+  }
+}
+```
+
+`gitContext` may be `null`. A fresh `get_state` or conversation bootstrap is authoritative and resets any client-side provider-revision baseline; apply later events in stream order. Ordered remote events also carry the normal top-level `delivery` position.
 
 ### models_changed
 

@@ -598,7 +598,7 @@ export class InteractiveMode {
 		this.editorContainer.addChild(this.editor as Component);
 		this.planStatus = new PlanStatusComponent(this.session.planningState);
 		this.planStatusContainer.addChild(this.planStatus);
-		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
+		this.footerDataProvider = new FooterDataProvider(this.session.gitContextProvider);
 		this.footer = new FooterComponent(this.session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
 
@@ -2150,7 +2150,7 @@ export class InteractiveMode {
 		configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
 		this.footer.setSession(this.session);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
-		this.footerDataProvider.setCwd(this.sessionManager.getCwd());
+		this.footerDataProvider.setGitContextProvider(this.session.gitContextProvider);
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
 		this.ui.setShowHardwareCursor(this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
@@ -6284,7 +6284,7 @@ export class InteractiveMode {
 		}
 		const control: DaemonWorktreeControl = opened.control;
 		try {
-			let target: { id: string; path: string; branch: string } | undefined;
+			let target: { id: string; path: string; branch: string; baseRef?: string } | undefined;
 			if (createRequested) {
 				const created = await control.createWorktree(requestedName);
 				if (!created.ok) {
@@ -6321,7 +6321,12 @@ export class InteractiveMode {
 			}
 
 			const sessionDir = getDefaultSessionDir(control.workspacePath, agentDir);
-			const result = await this.runtimeHost.newSession({ cwd: target.path, sessionDir });
+			const result = await this.runtimeHost.newSession({
+				cwd: target.path,
+				sessionDir,
+				workspaceName: control.workspaceName,
+				baseRef: target.baseRef,
+			});
 			if (result.cancelled) {
 				this.showStatus("Worktree session cancelled");
 				return;

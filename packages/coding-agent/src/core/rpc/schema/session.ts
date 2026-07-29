@@ -5,6 +5,7 @@
 
 import { Type } from "typebox";
 import { RpcModelSchema, rpcModelProperties } from "./external.ts";
+import { RpcGitContextSchema } from "./git-context.ts";
 import { readonlyArrayOf, stringEnum } from "./helpers.ts";
 import { RpcPlanningStateSchema } from "./planning.ts";
 import { RpcThinkingLevelSchema } from "./primitives.ts";
@@ -98,6 +99,8 @@ export const RpcSessionStateSchema = Type.Object(
 		fastModeEnabled: Type.Boolean(),
 		/** Authoritative branch-local agent mode and structured plan snapshot. */
 		planning: RpcPlanningStateSchema,
+		/** Path-free host Git metadata, or null when the cwd is not a usable worktree. */
+		gitContext: Type.Union([RpcGitContextSchema, Type.Null()]),
 		/** Whether a provider run or session-level continuation is active. */
 		isStreaming: Type.Boolean(),
 		/** Whether any prompt work, including asynchronous preflight, is active. */

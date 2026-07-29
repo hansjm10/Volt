@@ -38,6 +38,7 @@ const buildSnapshot =
 			availableThinkingLevels: ["off", "high"],
 			fastModeEnabled: source.fastModeEnabled,
 			planning: { mode: "build", plan: null },
+			gitContext: null,
 			isStreaming: false,
 			isCompacting: false,
 			steeringMode: "all",

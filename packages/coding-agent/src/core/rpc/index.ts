@@ -83,6 +83,8 @@ export type {
 	RpcConversationWorkflowSnapshot,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcGitContext,
+	RpcGitContextChangedEvent,
 	RpcHostActionRequest,
 	RpcHostActionResponse,
 	RpcHostActionUpdate,
