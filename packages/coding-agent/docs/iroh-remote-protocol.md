@@ -314,6 +314,40 @@ The successful response is:
 
 The host validates that `workspaceName` and `sessionId` match the bound stream, validates the activity payload, resolves `tokenHash` through the existing ActivityKit delivery channel for the authoritative client, and returns stable errors such as `session_mismatch`, `invalid_live_activity_registration`, `invalid_live_activity_token`, or `unknown_live_activity_token`. `unregister_live_activity` uses the same stream-bound workspace/session/activity identity without a token hash and is idempotent for the matching registration.
 
+Once registered, the host sends semantic ActivityKit content state through the push relay:
+
+```json
+{
+  "operationKind": "planCreation",
+  "operationID": "abc123",
+  "status": "running",
+  "subject": "Implement semantic Live Activities",
+  "sessionID": "abc123",
+  "workspaceName": "volt",
+  "operationStartedAtEpochSeconds": 1785312000,
+  "updatedAtEpochSeconds": 1785312060
+}
+```
+
+The exact content-state contract is:
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `operationKind` | yes | `conversation`, `planCreation`, or `review`. |
+| `operationID` | yes | The session ID for conversation and Plan creation, or the detached review workflow ID for review. |
+| `status` | yes | `running`, `completed`, `failed`, or `cancelled`. |
+| `subject` | no | The Plan title only, bounded to 256 UTF-8 bytes. |
+| `sessionID` | yes | The stream-bound conversation session ID. |
+| `workspaceName` | yes | The stream-bound registered workspace name. |
+| `operationStartedAtEpochSeconds` | yes | Stable Unix epoch seconds for the current semantic operation. |
+| `updatedAtEpochSeconds` | yes | Unix epoch seconds for this update; never earlier than the operation start. |
+
+Running-state precedence is the newest active detached review, then an active Plan-mode creation run, then an ordinary conversation run. Review subjects are always omitted, as are conversation prompts, tool names, tool arguments, review targets, and review output. Tool execution events do not change Live Activity state. A Plan title change updates `subject` without changing the operation start time; semantically unchanged snapshots are suppressed.
+
+Attaching or reattaching a stream while work is active emits a fresh current snapshot with a unique event ID. Running and terminal deliveries use `activityEvent:"update"` and carry `staleDateEpochSeconds` 90 seconds after the content-state update time. An ordinary `agent_end` is not terminal because retries, compaction, or queued continuations may follow; the host waits for `agent_settled`, maps an aborted run to `cancelled`, and then sends the terminal update. While reviews overlap, completion of one review keeps the newest remaining review running. If the last review ends while Plan or conversation work remains active, the host falls directly back to that running operation without an intermediate review terminal state; otherwise it sends the final review outcome. Terminal updates do not end or unregister the Activity, so a later reattach or new operation can update the same registered Activity.
+
+The relay requires this exact bounded shape, verifies timestamp freshness, rejects unknown and former tool-oriented fields, and requires `sessionID`/`workspaceName` to equal the daemon-bound relay conversation identity.
+
 Completion notifications sent through the relay, or over JSONL as `notification_request` when no push target is available, include the safe workspace name when the host knows it:
 
 ```json

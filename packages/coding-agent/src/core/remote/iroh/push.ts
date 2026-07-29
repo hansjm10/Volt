@@ -15,6 +15,7 @@ export const DEFAULT_IROH_REMOTE_PUSH_RELAY_RETRY_ATTEMPTS = 3;
 export const DEFAULT_IROH_REMOTE_PUSH_RELAY_RETRY_DELAY_MS = 250;
 export const DEFAULT_IROH_REMOTE_PUSH_RELAY_TIMEOUT_MS = 10_000;
 export const DEFAULT_IROH_REMOTE_PUSH_RELAY_URL = "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay";
+export const MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES = 256;
 
 export type IrohRemotePushTargetRegistrationRequest = RpcRegisterPushTargetArgs;
 export type IrohRemotePushTargetRegistrationResult = RpcRegisterPushTargetResponse;
@@ -28,19 +29,14 @@ export interface IrohRemotePushNotificationIntent {
 	workspace?: string;
 }
 
-export interface IrohRemoteLiveActivityToolGlyph {
-	name: string;
-	symbolName: string;
-	status: "started" | "completed" | "failed";
-}
-
 export interface IrohRemoteLiveActivityContentState {
-	status: "running" | "completed" | "failed" | "waiting";
-	statusText: string;
-	currentTool?: IrohRemoteLiveActivityToolGlyph;
-	recentTools: IrohRemoteLiveActivityToolGlyph[];
-	sessionID?: string;
-	workspaceName?: string;
+	operationKind: "conversation" | "planCreation" | "review";
+	operationID: string;
+	status: "running" | "completed" | "failed" | "cancelled";
+	subject?: string;
+	sessionID: string;
+	workspaceName: string;
+	operationStartedAtEpochSeconds: number;
 	updatedAtEpochSeconds: number;
 }
 
@@ -838,9 +834,6 @@ function selectLiveActivityRegistration(
 ): IrohRemoteLiveActivityRegistration | undefined {
 	const workspaceName = contentState.workspaceName;
 	const sessionId = contentState.sessionID;
-	if (!workspaceName || !sessionId) {
-		return undefined;
-	}
 	return (client?.liveActivities ?? [])
 		.filter((registration) => {
 			return registration.workspaceName === workspaceName && registration.sessionId === sessionId;

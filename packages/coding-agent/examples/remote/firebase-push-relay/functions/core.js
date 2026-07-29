@@ -11,6 +11,7 @@ const MAX_TOTAL_VALUES = 160;
 const MAX_GENERIC_STRING_LENGTH = 4096;
 const MAX_LIVE_ACTIVITY_FUTURE_SECONDS = 30 * 24 * 60 * 60;
 const MAX_LIVE_ACTIVITY_PAST_SECONDS = 24 * 60 * 60;
+const MAX_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES = 256;
 const MAX_CLOCK_SKEW_SECONDS = 5 * 60;
 const FORBIDDEN_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -222,45 +223,54 @@ function expectLiveActivityContentState(value, nowEpochSeconds) {
 	}
 	expectAllowedKeys(
 		value,
-		["status", "statusText", "currentTool", "recentTools", "sessionID", "workspaceName", "updatedAtEpochSeconds"],
+		[
+			"operationKind",
+			"operationID",
+			"status",
+			"subject",
+			"sessionID",
+			"workspaceName",
+			"operationStartedAtEpochSeconds",
+			"updatedAtEpochSeconds",
+		],
 		"contentState",
 	);
-	if (!Array.isArray(value.recentTools) || value.recentTools.length > 12) {
-		throw new RequestError(400, "recentTools_must_be_bounded_array");
+	const operationKind = expectOneOf(
+		value.operationKind,
+		["conversation", "planCreation", "review"],
+		"operationKind",
+	);
+	const subject = expectOptionalUTF8String(
+		value.subject,
+		"subject",
+		MAX_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
+	);
+	if (subject !== undefined && operationKind !== "planCreation") {
+		throw new RequestError(400, "subject_requires_plan_creation");
 	}
+	const operationStartedAtEpochSeconds = expectEpochSeconds(
+		value.operationStartedAtEpochSeconds,
+		"operationStartedAtEpochSeconds",
+	);
 	const updatedAtEpochSeconds = expectEpochSeconds(value.updatedAtEpochSeconds, "updatedAtEpochSeconds");
+	if (operationStartedAtEpochSeconds > updatedAtEpochSeconds) {
+		throw new RequestError(400, "operationStartedAtEpochSeconds_after_updatedAtEpochSeconds");
+	}
 	if (
 		updatedAtEpochSeconds < nowEpochSeconds - MAX_LIVE_ACTIVITY_PAST_SECONDS ||
 		updatedAtEpochSeconds > nowEpochSeconds + MAX_CLOCK_SKEW_SECONDS
 	) {
 		throw new RequestError(400, "updatedAtEpochSeconds_out_of_range");
 	}
-	const currentTool = value.currentTool === undefined ? undefined : expectToolGlyph(value.currentTool, "currentTool");
-	const recentTools = value.recentTools.map((entry, index) => expectToolGlyph(entry, `recentTools_${index}`));
 	return {
-		status: expectOneOf(value.status, ["running", "completed", "failed", "waiting"], "status"),
-		statusText: expectString(value.statusText, "statusText", 1, 128),
-		...(currentTool === undefined ? {} : { currentTool }),
-		recentTools,
-		...(value.sessionID === undefined
-			? {}
-			: { sessionID: expectString(value.sessionID, "sessionID", 1, 128) }),
-		...(value.workspaceName === undefined
-			? {}
-			: { workspaceName: expectString(value.workspaceName, "workspaceName", 1, 128) }),
+		operationKind,
+		operationID: expectString(value.operationID, "operationID", 1, 128),
+		status: expectOneOf(value.status, ["running", "completed", "failed", "cancelled"], "status"),
+		...(subject === undefined ? {} : { subject }),
+		sessionID: expectString(value.sessionID, "sessionID", 1, 128),
+		workspaceName: expectString(value.workspaceName, "workspaceName", 1, 128),
+		operationStartedAtEpochSeconds,
 		updatedAtEpochSeconds,
-	};
-}
-
-function expectToolGlyph(value, label) {
-	if (!isRecord(value)) {
-		throw new RequestError(400, `${label}_must_be_object`);
-	}
-	expectAllowedKeys(value, ["name", "symbolName", "status"], label);
-	return {
-		name: expectString(value.name, `${label}_name`, 1, 64),
-		symbolName: expectString(value.symbolName, `${label}_symbolName`, 1, 64),
-		status: expectOneOf(value.status, ["started", "completed", "failed"], `${label}_status`),
 	};
 }
 
@@ -417,6 +427,14 @@ function expectOptionalString(value, label, minimumLength, maximumLength) {
 	return expectString(value, label, minimumLength, maximumLength);
 }
 
+function expectOptionalUTF8String(value, label, maximumByteLength) {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || /^[\s]*$/.test(value) || Buffer.byteLength(value, "utf8") > maximumByteLength) {
+		throw new RequestError(400, `${label}_has_invalid_utf8_length`);
+	}
+	return value;
+}
+
 function expectBoolean(value, label) {
 	if (typeof value !== "boolean") {
 		throw new RequestError(400, `${label}_must_be_boolean`);
@@ -489,6 +507,7 @@ module.exports = {
 	DEFAULT_ALLOWED_FIREBASE_APP_ID,
 	DEFAULT_PUBLIC_RELAY_URL,
 	DEFAULT_PUSH_TARGET_TTL_MS,
+	MAX_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
 	MAX_REQUEST_BYTES,
 	RequestError,
 	assertRequestEnvelope,

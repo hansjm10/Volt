@@ -196,7 +196,6 @@ export {
 	hashIrohRemotePushToken,
 	IrohRemoteInMemoryPushNotificationDeduper,
 	type IrohRemoteLiveActivityContentState,
-	type IrohRemoteLiveActivityToolGlyph,
 	type IrohRemoteLiveActivityUpdateIntent,
 	type IrohRemotePushNotificationDeduper,
 	type IrohRemotePushNotificationDelivery,
@@ -213,6 +212,7 @@ export {
 	type IrohRemotePushRelayNotificationResult,
 	type IrohRemotePushTargetRegistrationRequest,
 	type IrohRemotePushTargetRegistrationResult,
+	MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
 	parseRegisterPushTargetArgs,
 } from "./push.ts";
 export {

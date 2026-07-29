@@ -8,10 +8,11 @@ import {
 	parseIrohRemoteRpcGrant,
 } from "../core/remote/iroh/access-grant.ts";
 import { parseIrohRemoteAllowTools } from "../core/remote/iroh/protocol.ts";
-import type {
-	IrohRemoteLiveActivityUpdateIntent,
-	IrohRemotePushNotificationDeliveryStatus,
-	IrohRemotePushNotificationIntent,
+import {
+	type IrohRemoteLiveActivityUpdateIntent,
+	type IrohRemotePushNotificationDeliveryStatus,
+	type IrohRemotePushNotificationIntent,
+	MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
 } from "../core/remote/iroh/push.ts";
 import type { IrohRemoteClient } from "../core/remote/iroh/state.ts";
 
@@ -530,7 +531,7 @@ function isOptionalString(value: unknown): boolean {
 }
 
 function isOptionalNumber(value: unknown): boolean {
-	return value === undefined || typeof value === "number";
+	return value === undefined || (Number.isSafeInteger(value) && (value as number) >= 0);
 }
 
 function isControlAccessSelection(value: Record<string, unknown>, allowDefault: boolean): boolean {
@@ -565,29 +566,60 @@ function isPushDeliveryStatus(value: unknown): value is IrohRemotePushNotificati
 	);
 }
 
-function isLiveActivityToolGlyph(value: unknown): boolean {
+function hasOnlyKeys(value: Record<string, unknown>, allowedKeys: ReadonlySet<string>): boolean {
+	return Object.keys(value).every((key) => allowedKeys.has(key));
+}
+
+function isBoundedLiveActivityIdentifier(value: unknown): value is string {
 	return (
-		isRecord(value) &&
-		typeof value.name === "string" &&
-		typeof value.symbolName === "string" &&
-		(value.status === "started" || value.status === "completed" || value.status === "failed")
+		typeof value === "string" &&
+		value.trim().length > 0 &&
+		Array.from(value).length <= 128 &&
+		Buffer.byteLength(value, "utf8") <= 512
 	);
 }
 
 function isLiveActivityContentState(value: unknown): boolean {
+	if (
+		!isRecord(value) ||
+		!hasOnlyKeys(
+			value,
+			new Set([
+				"operationKind",
+				"operationID",
+				"status",
+				"subject",
+				"sessionID",
+				"workspaceName",
+				"operationStartedAtEpochSeconds",
+				"updatedAtEpochSeconds",
+			]),
+		)
+	) {
+		return false;
+	}
+	const validSubject =
+		value.subject === undefined ||
+		(typeof value.subject === "string" &&
+			value.subject.trim().length > 0 &&
+			Buffer.byteLength(value.subject, "utf8") <= MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES);
 	return (
-		isRecord(value) &&
+		(value.operationKind === "conversation" ||
+			value.operationKind === "planCreation" ||
+			value.operationKind === "review") &&
+		isBoundedLiveActivityIdentifier(value.operationID) &&
 		(value.status === "running" ||
 			value.status === "completed" ||
 			value.status === "failed" ||
-			value.status === "waiting") &&
-		typeof value.statusText === "string" &&
-		(value.currentTool === undefined || isLiveActivityToolGlyph(value.currentTool)) &&
-		Array.isArray(value.recentTools) &&
-		value.recentTools.every(isLiveActivityToolGlyph) &&
-		isOptionalString(value.sessionID) &&
-		isOptionalString(value.workspaceName) &&
-		typeof value.updatedAtEpochSeconds === "number"
+			value.status === "cancelled") &&
+		validSubject &&
+		(value.subject === undefined || value.operationKind === "planCreation") &&
+		isBoundedLiveActivityIdentifier(value.sessionID) &&
+		isBoundedLiveActivityIdentifier(value.workspaceName) &&
+		Number.isSafeInteger(value.operationStartedAtEpochSeconds) &&
+		(value.operationStartedAtEpochSeconds as number) >= 0 &&
+		Number.isSafeInteger(value.updatedAtEpochSeconds) &&
+		(value.updatedAtEpochSeconds as number) >= (value.operationStartedAtEpochSeconds as number)
 	);
 }
 
