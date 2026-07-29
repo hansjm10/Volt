@@ -1223,7 +1223,7 @@ describe("Iroh remote core helpers", () => {
 						nodeId: "client-node",
 						label: "phone",
 						allowedWorkspaces: ["volt"],
-						allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+						allowedTools: "read,grep",
 						rpcGrant: CODING_RPC_GRANT,
 						pairedAt: 10,
 						lastSeenAt: 20,
@@ -1235,7 +1235,7 @@ describe("Iroh remote core helpers", () => {
 						nodeId: "revoked-node",
 						label: "revoked phone",
 						allowedWorkspaces: ["volt"],
-						allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+						allowedTools: "read,grep",
 						rpcGrant: CODING_RPC_GRANT,
 						pairedAt: 11,
 						lastSeenAt: 21,
@@ -1248,7 +1248,7 @@ describe("Iroh remote core helpers", () => {
 					{
 						secretHash: "sha256:pending",
 						workspace: "volt",
-						allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+						allowedTools: "read,grep",
 						rpcGrant: CODING_RPC_GRANT,
 						createdAt: 30,
 						expiresAt: 40,
@@ -1313,6 +1313,7 @@ describe("Iroh remote core helpers", () => {
 			"write",
 			"web_search",
 			"web_fetch",
+			"lsp",
 		]);
 		expect(getIrohRemoteUnsafeAllowedTools("read,bash, edit,write,bash,web_search,custom")).toEqual([
 			"bash",
@@ -1548,11 +1549,12 @@ describe("Iroh remote core helpers", () => {
 			nodeId: "client-node",
 			label: "phone",
 			allowedWorkspaces: [],
-			allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 			rpcGrant: CODING_RPC_GRANT,
 			pairedAt: 100,
 			lastSeenAt: 100,
 		});
+		// A default-grant pairing persists no snapshot; it tracks the current default.
+		expect(paired.client).not.toHaveProperty("allowedTools");
 		expect(state.pairingSecretTombstones).toEqual([
 			{
 				secretHash: hashIrohRemotePairingSecret("secret"),
@@ -1603,7 +1605,7 @@ describe("Iroh remote core helpers", () => {
 		expect(persisted.paired).toBe(false);
 		expect(persisted.allowTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
 		expect(persisted.client.label).toBe("renamed phone");
-		expect(persisted.client.allowedTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+		expect(persisted.client).not.toHaveProperty("allowedTools");
 		expect(persisted.client.lastSeenAt).toBe(150);
 
 		expect(() =>
@@ -1805,7 +1807,6 @@ describe("Iroh remote core helpers", () => {
 				nodeId: "client-node",
 				label: "phone",
 				allowedWorkspaces: [],
-				allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 				rpcGrant: CODING_RPC_GRANT,
 				pairedAt: 100,
 				lastSeenAt: 100,
@@ -1853,7 +1854,7 @@ describe("Iroh remote core helpers", () => {
 		}
 		expect(paired.paired).toBe(true);
 		expect(paired.allowTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
-		expect(paired.client.allowedTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+		expect(paired.client).not.toHaveProperty("allowedTools");
 
 		const restartedHostEngine = new IrohRemoteHostEngine({
 			allowTools: "bash",
@@ -1871,7 +1872,7 @@ describe("Iroh remote core helpers", () => {
 		expect(reconnected.paired).toBe(false);
 		expect(reconnected.allowTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
 		expect(reconnected.client.label).toBe("renamed phone");
-		expect(reconnected.client.allowedTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+		expect(reconnected.client).not.toHaveProperty("allowedTools");
 		expect(reconnected.client.lastSeenAt).toBe(200);
 	});
 
@@ -2179,7 +2180,6 @@ describe("Iroh remote core helpers", () => {
 				nodeId: "client-node",
 				label: "phone",
 				allowedWorkspaces: [],
-				allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 				rpcGrant: createIrohRemotePresetAccess("coding", 2).rpcGrant,
 				pairedAt: 100,
 				lastSeenAt: 100,
@@ -2401,7 +2401,6 @@ describe("Iroh remote core helpers", () => {
 			{
 				secretHash: hashIrohRemotePairingSecret(secret),
 				workspace: "volt",
-				allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 				rpcGrant: CODING_RPC_GRANT,
 				createdAt: 100,
 				expiresAt: 150,
@@ -2422,7 +2421,6 @@ describe("Iroh remote core helpers", () => {
 				{
 					secretHash: hashIrohRemotePairingSecret(secret),
 					workspace: "volt",
-					allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 					rpcGrant: CODING_RPC_GRANT,
 					createdAt: 100,
 					expiresAt: 150,

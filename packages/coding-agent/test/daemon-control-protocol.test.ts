@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { describe, expect, it } from "vitest";
+import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "../src/core/remote/iroh/protocol.ts";
 import {
 	CONTROL_MAX_LINE_BYTES,
 	type ControlEvent,
@@ -7,6 +8,7 @@ import {
 	ControlLineDecoder,
 	type ControlRequest,
 	type ControlResponse,
+	createControlClientStatus,
 	encodeControlLine,
 	type HelloAck,
 	type HelloMessage,
@@ -397,5 +399,35 @@ describe("control protocol framing", () => {
 		const withNewline = Buffer.concat([Buffer.alloc(CONTROL_MAX_LINE_BYTES + 1, 0x61), Buffer.from("\n")]);
 		const freshDecoder = new ControlLineDecoder();
 		expect(() => freshDecoder.push(withNewline)).toThrow(ControlFrameTooLargeError);
+	});
+});
+
+describe("createControlClientStatus", () => {
+	const baseClient = {
+		nodeId: "client-node",
+		label: "phone",
+		allowedWorkspaces: [],
+		rpcGrant: RPC_GRANT,
+		pairedAt: 100,
+		lastSeenAt: 200,
+	};
+
+	it("reports a tracking client as the resolved default with usesDefaultTools", () => {
+		const status = createControlClientStatus(baseClient);
+		expect(status.allowedTools).toEqual(DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(","));
+		expect(status.usesDefaultTools).toBe(true);
+		expect(status).toMatchObject({ clientNodeId: "client-node", label: "phone", pairedAtMs: 100, lastSeenAtMs: 200 });
+	});
+
+	it("reports a pinned client's exact grant without the default marker", () => {
+		const status = createControlClientStatus({ ...baseClient, allowedTools: "read,grep" });
+		expect(status.allowedTools).toEqual(["read", "grep"]);
+		expect(status.usesDefaultTools).toBe(false);
+	});
+
+	it("reports a deny-all client as an empty grant, never the default", () => {
+		const status = createControlClientStatus({ ...baseClient, allowedTools: "" });
+		expect(status.allowedTools).toEqual([]);
+		expect(status.usesDefaultTools).toBe(false);
 	});
 });

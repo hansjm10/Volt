@@ -1113,7 +1113,11 @@ export class RemoteControlCenterComponent implements Component {
 				tone: "text",
 			});
 			rows.push({
-				text: `  Tools: ${client.allowedTools ? client.allowedTools.join(", ") || "none" : "not reported"}`,
+				text: `  Tools: ${
+					client.allowedTools
+						? `${client.allowedTools.join(", ") || "none"}${client.usesDefaultTools ? " (default)" : ""}`
+						: "not reported"
+				}`,
 				tone: "dim",
 			});
 		}

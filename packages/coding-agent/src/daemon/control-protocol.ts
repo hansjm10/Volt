@@ -7,12 +7,14 @@ import {
 	parseIrohRemoteRpcCapabilities,
 	parseIrohRemoteRpcGrant,
 } from "../core/remote/iroh/access-grant.ts";
+import { parseIrohRemoteAllowTools } from "../core/remote/iroh/protocol.ts";
 import {
 	type IrohRemoteLiveActivityUpdateIntent,
 	type IrohRemotePushNotificationDeliveryStatus,
 	type IrohRemotePushNotificationIntent,
 	MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
 } from "../core/remote/iroh/push.ts";
+import type { IrohRemoteClient } from "../core/remote/iroh/state.ts";
 
 /**
  * Wire types and framing for the voltd control plane: JSONL over the unix
@@ -241,9 +243,24 @@ export interface ControlClientStatus {
 	pairedAtMs: number;
 	/** Added to protocol v1 after launch; absent on older running daemons. */
 	lastSeenAtMs?: number;
-	/** Persisted headless tool grant for this paired device. */
+	/** Resolved device grant, before workspace/daemon ceilings are applied. */
 	allowedTools?: string[];
+	/** True when the device has no customized grant and tracks the daemon's current default. */
+	usesDefaultTools?: boolean;
 	rpcGrant?: IrohRemoteRpcGrant;
+}
+
+/** Single mapping from a persisted client record to its control-socket status. */
+export function createControlClientStatus(client: IrohRemoteClient): ControlClientStatus {
+	return {
+		clientNodeId: client.nodeId,
+		label: client.label,
+		pairedAtMs: client.pairedAt,
+		lastSeenAtMs: client.lastSeenAt,
+		allowedTools: parseIrohRemoteAllowTools(client.allowedTools),
+		usesDefaultTools: client.allowedTools === undefined,
+		rpcGrant: parseIrohRemoteRpcGrant(client.rpcGrant, "client rpcGrant"),
+	};
 }
 
 export interface ControlRevokedClientStatus {

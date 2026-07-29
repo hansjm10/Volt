@@ -1,7 +1,7 @@
 import { visibleWidth } from "@hansjm10/volt-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { IrohRemoteAccessPresetName } from "../src/core/remote/iroh/access-grant.ts";
-import { IROH_REMOTE_ALPN } from "../src/core/remote/iroh/protocol.ts";
+import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS, IROH_REMOTE_ALPN } from "../src/core/remote/iroh/protocol.ts";
 import { encodeIrohRemoteTicketPayload } from "../src/core/remote/iroh/ticket.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../src/core/slash-commands.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
@@ -255,6 +255,37 @@ describe("RemoteControlCenterComponent", () => {
 		expect(text).toContain("Detached runtime retention: 30m");
 		expect(text).toContain("Jordan's iPhone");
 		expect(text).toContain("/tmp/volt");
+	});
+
+	it("labels default-tracking and deny-all device grants", async () => {
+		const backend = new FakeBackend({
+			kind: "online",
+			status: status({
+				clients: [
+					{
+						clientNodeId: "tracking-node-1234567890",
+						label: "Tracking phone",
+						pairedAtMs: Date.now() - 60_000,
+						lastSeenAtMs: Date.now() - 5_000,
+						allowedTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(","),
+						usesDefaultTools: true,
+					},
+					{
+						clientNodeId: "denyall-node-1234567890",
+						label: "Chat phone",
+						pairedAtMs: Date.now() - 60_000,
+						lastSeenAtMs: Date.now() - 5_000,
+						allowedTools: [],
+					},
+				],
+			}),
+		});
+		const { component } = createComponent(backend, 45);
+		await component.start();
+		const text = component.render(200).map(stripAnsi).join("\n");
+
+		expect(text).toContain(`Tools: ${DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(",").join(", ")} (default)`);
+		expect(text).toContain("Tools: none");
 	});
 
 	it("renders compatibility defaults for an older protocol-v1 daemon", async () => {
