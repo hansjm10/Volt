@@ -1240,6 +1240,128 @@ describe("Iroh remote notification requests", () => {
 		await expect(modePromise).resolves.toBeUndefined();
 	});
 
+	test("Live Activity updater delivers detached review settlement after the RPC stream closes", async () => {
+		const session = createTestSession("session-one", "review-run");
+		const reviewWorkflows = new ReviewWorkflowManager();
+		const updates: IrohRemoteLiveActivityUpdateIntent[] = [];
+		const runtimeHost = {
+			session,
+			reviewWorkflows,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const { modePromise, recv } = await startIrohRpcMode(runtimeHost, session, {
+			clientNodeId: "paired-client",
+			notificationDelivery: {
+				deliverNotification: vi.fn(async () => "no_push_target" as const),
+				deliverLiveActivityUpdate: vi.fn(async (update: IrohRemoteLiveActivityUpdateIntent) => {
+					updates.push(update);
+					return "sent" as const;
+				}),
+			},
+			workspaceName: "volt-app",
+		});
+
+		const review = startTestReview(reviewWorkflows, "review:detached");
+		await vi.waitFor(() =>
+			expect(updates.at(-1)?.contentState).toMatchObject({
+				operationID: "review:detached",
+				status: "running",
+			}),
+		);
+
+		recv.end();
+		await expect(modePromise).resolves.toBeUndefined();
+		review.finish({ status: "completed", raw: "private result", findingsCount: 0 });
+
+		await vi.waitFor(() =>
+			expect(updates.at(-1)?.contentState).toMatchObject({
+				operationID: "review:detached",
+				status: "completed",
+			}),
+		);
+		expect(updates.map((update) => update.contentState.status)).toEqual(["running", "completed"]);
+	});
+
+	test("Live Activity updater hands retained review ownership to a reattached stream", async () => {
+		const session = createTestSession("session-one", "review-run");
+		const reviewWorkflows = new ReviewWorkflowManager();
+		const firstUpdates: IrohRemoteLiveActivityUpdateIntent[] = [];
+		const secondUpdates: IrohRemoteLiveActivityUpdateIntent[] = [];
+		const runtimeHost = {
+			session,
+			reviewWorkflows,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const firstMode = await startIrohRpcMode(runtimeHost, session, {
+			clientNodeId: "paired-client",
+			notificationDelivery: {
+				deliverNotification: vi.fn(async () => "no_push_target" as const),
+				deliverLiveActivityUpdate: vi.fn(async (update: IrohRemoteLiveActivityUpdateIntent) => {
+					firstUpdates.push(update);
+					return "sent" as const;
+				}),
+			},
+			workspaceName: "volt-app",
+		});
+		const review = startTestReview(reviewWorkflows, "review:reattach");
+		await vi.waitFor(() => expect(firstUpdates.at(-1)?.contentState.status).toBe("running"));
+
+		firstMode.recv.end();
+		await expect(firstMode.modePromise).resolves.toBeUndefined();
+		session.bindExtensions.mockClear();
+		const secondMode = await startIrohRpcMode(runtimeHost, session, {
+			clientNodeId: "paired-client",
+			notificationDelivery: {
+				deliverNotification: vi.fn(async () => "no_push_target" as const),
+				deliverLiveActivityUpdate: vi.fn(async (update: IrohRemoteLiveActivityUpdateIntent) => {
+					secondUpdates.push(update);
+					return "sent" as const;
+				}),
+			},
+			workspaceName: "volt-app",
+		});
+		await vi.waitFor(() =>
+			expect(secondUpdates.at(-1)?.contentState).toMatchObject({
+				operationID: "review:reattach",
+				status: "running",
+			}),
+		);
+
+		const handlers = session.subscribe.mock.calls.map((call) => call[0] as (event: AgentSessionEvent) => void);
+		for (const handler of handlers) {
+			handler({ type: "agent_start" });
+		}
+		review.finish({ status: "completed", raw: "private result", findingsCount: 0 });
+
+		await vi.waitFor(() =>
+			expect(secondUpdates.at(-1)?.contentState).toMatchObject({
+				operationKind: "conversation",
+				status: "running",
+			}),
+		);
+		expect(firstUpdates).toHaveLength(1);
+		expect(secondUpdates.map((update) => [update.contentState.operationKind, update.contentState.status])).toEqual([
+			["review", "running"],
+			["conversation", "running"],
+		]);
+		expect([...firstUpdates, ...secondUpdates]).not.toContainEqual(
+			expect.objectContaining({
+				contentState: expect.objectContaining({ operationKind: "review", status: "completed" }),
+			}),
+		);
+
+		secondMode.recv.end();
+		await expect(secondMode.modePromise).resolves.toBeUndefined();
+	});
+
 	test("Live Activity updater keeps concurrent reviews running and terminalizes only the last review", async () => {
 		const session = createTestSession("session-one", "review-run");
 		const reviewWorkflows = new ReviewWorkflowManager();

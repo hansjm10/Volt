@@ -2011,6 +2011,7 @@ export class InteractiveMode {
 				let relayedSessionId = offer.sessionId;
 				await runIrohRemoteRpcMode(this.runtimeHost, {
 					rpcGrant,
+					clientNodeId: authorizationSubset.clientNodeId,
 					stream: relayedStream,
 					disposeRuntimeOnClose: false,
 					workspaceName: authorization.workspace.name,

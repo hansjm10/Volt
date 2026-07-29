@@ -2900,6 +2900,7 @@ class IrohDaemonService {
 			const responseContext = this.getResponseContext();
 			await runIrohRemoteRpcMode(entry.runtime, {
 				rpcGrant: authorization.client.rpcGrant,
+				clientNodeId: authorization.client.nodeId,
 				isRpcGrantCurrent: () => this.isAuthorizationGrantCurrent(authorization),
 				decorateOutbound: (value) => decorateRemoteHostState(value, authorization, responseContext),
 				disposeRuntimeOnClose: false,

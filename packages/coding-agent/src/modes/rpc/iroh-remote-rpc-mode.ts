@@ -38,6 +38,8 @@ import type { RpcRegisterPushTargetResponse } from "./rpc-types.ts";
 
 export interface IrohRemoteRpcModeOptions extends IrohRpcTransportOptions {
 	rpcGrant: IrohRemoteRpcGrant;
+	/** Stable paired-client identity for Live Activity observer handoff across stream reattachment. */
+	clientNodeId?: string;
 	/** Recheck persisted authority at each command boundary when the host owns grant state. */
 	isRpcGrantCurrent?: () => boolean | Promise<boolean>;
 	decorateOutbound?: IrohRemoteOutboundValueDecorator;
@@ -172,6 +174,7 @@ export function runIrohRemoteRpcMode(
 			runtimeHost,
 			options.notificationDelivery,
 			options.workspaceName,
+			options.clientNodeId,
 		);
 	};
 	const irohTransport = createIrohRpcTransport(options);
@@ -522,13 +525,32 @@ function decorateIrohRemoteToolExecutionEnd(value: object, options: IrohRemoteTr
 	return Object.keys(outputFields).length > 0 ? { ...value, ...outputFields } : value;
 }
 
+type IrohRemoteLiveActivityAttachmentKey = string | IrohRemotePushNotificationDelivery;
+
+interface IrohRemoteLiveActivityAttachment {
+	dispose(): void;
+	retire(): void;
+}
+
+const liveActivityAttachmentsByRuntime = new WeakMap<
+	AgentSessionRuntime,
+	Map<IrohRemoteLiveActivityAttachmentKey, IrohRemoteLiveActivityAttachment>
+>();
+
 function attachIrohRemoteLiveActivityUpdates(
 	runtimeHost: AgentSessionRuntime,
 	delivery: IrohRemotePushNotificationDelivery | undefined,
 	workspaceName: string | undefined,
+	clientNodeId: string | undefined,
 ): () => void {
 	if (!delivery?.deliverLiveActivityUpdate) {
 		return () => {};
+	}
+	const attachmentKey = clientNodeId ?? delivery;
+	let attachments = liveActivityAttachmentsByRuntime.get(runtimeHost);
+	if (!attachments) {
+		attachments = new Map();
+		liveActivityAttachmentsByRuntime.set(runtimeHost, attachments);
 	}
 	const updater = new IrohRemoteLiveActivityUpdater(runtimeHost, delivery, workspaceName);
 	const unsubscribeSession = runtimeHost.session.subscribe((event) => {
@@ -541,12 +563,47 @@ function attachIrohRemoteLiveActivityUpdates(
 			}
 			void updater.handleReviewEvent(event).catch(() => {});
 		}) ?? (() => {});
-	updater.start();
-	return () => {
+	let disposed = false;
+	let retirementStarted = false;
+	let attachment: IrohRemoteLiveActivityAttachment;
+	const dispose = () => {
+		if (disposed) {
+			return;
+		}
+		disposed = true;
 		updater.stop();
 		unsubscribeSession();
 		unsubscribeReviews();
+		if (attachments.get(attachmentKey) === attachment) {
+			attachments.delete(attachmentKey);
+			if (attachments.size === 0) {
+				liveActivityAttachmentsByRuntime.delete(runtimeHost);
+			}
+		}
 	};
+	const retire = () => {
+		if (disposed || retirementStarted) {
+			return;
+		}
+		retirementStarted = true;
+		const reviewWorkflows = runtimeHost.reviewWorkflows;
+		if (!reviewWorkflows?.hasActiveWorkflows) {
+			dispose();
+			return;
+		}
+		void (async () => {
+			do {
+				await reviewWorkflows.waitForIdle();
+				await updater.waitForIdle();
+			} while (reviewWorkflows.hasActiveWorkflows);
+		})().then(dispose, dispose);
+	};
+	attachment = { dispose, retire };
+	const previousAttachment = attachments.get(attachmentKey);
+	attachments.set(attachmentKey, attachment);
+	previousAttachment?.dispose();
+	updater.start();
+	return retire;
 }
 
 interface IrohRemoteLiveActivityOperation {
@@ -596,6 +653,10 @@ class IrohRemoteLiveActivityUpdater {
 
 	stop(): void {
 		this.stopped = true;
+	}
+
+	waitForIdle(): Promise<void> {
+		return this.eventQueue;
 	}
 
 	handleSessionEvent(event: AgentSessionEvent): Promise<void> {
