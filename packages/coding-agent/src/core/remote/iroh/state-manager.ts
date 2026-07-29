@@ -48,6 +48,8 @@ export interface IrohRemoteHostStateManagerOptions {
 	statePath?: string;
 	/** Custom persistence (e.g. the voltd state envelope); mutually exclusive with statePath. */
 	store?: IrohRemoteHostStateStore;
+	/** Default grant to canonicalize/resolve against; tests inject alternate defaults. */
+	defaultAllowTools?: string;
 }
 
 export interface IrohRemoteClientRevocationResult {
@@ -166,6 +168,7 @@ export function isIrohRemoteWorktreePersistenceError(error: unknown): error is I
 export class IrohRemoteHostStateManager {
 	private readonly statePath: string | undefined;
 	private readonly store: IrohRemoteHostStateStore | undefined;
+	private readonly defaultAllowTools: string | undefined;
 	private operationQueue: Promise<void> = Promise.resolve();
 	private state: IrohRemoteHostState | undefined;
 
@@ -180,6 +183,7 @@ export class IrohRemoteHostStateManager {
 		}
 		this.statePath = options.statePath;
 		this.store = options.store;
+		this.defaultAllowTools = options.defaultAllowTools;
 		this.state = options.initialState ? cloneHostState(options.initialState) : undefined;
 	}
 
@@ -401,6 +405,7 @@ export class IrohRemoteHostStateManager {
 				workspaceStatus === "available" &&
 				(options.validateWorkspace === undefined || (await options.validateWorkspace(workspace)));
 			const result = authorizeIrohRemoteClient(state, hello, remoteNodeId, {
+				...(this.defaultAllowTools === undefined ? {} : { defaultAllowTools: this.defaultAllowTools }),
 				...options,
 				workspace: workspaceAvailable ? workspace : undefined,
 				workspaceStatuses,
@@ -446,7 +451,10 @@ export class IrohRemoteHostStateManager {
 			if (currentGrant.revision === Number.MAX_SAFE_INTEGER) {
 				return { ok: false, reason: "revision_exhausted", currentRevision: currentGrant.revision };
 			}
-			const persistedAllowedTools = canonicalizePersistedIrohRemoteAllowTools(access.allowedTools);
+			const persistedAllowedTools = canonicalizePersistedIrohRemoteAllowTools(
+				access.allowedTools,
+				this.defaultAllowTools,
+			);
 			if (persistedAllowedTools === undefined) {
 				delete client.allowedTools;
 			} else {
@@ -892,7 +900,7 @@ export class IrohRemoteHostStateManager {
 			return this.state;
 		}
 		if (this.statePath) {
-			this.state = await readIrohRemoteHostState(this.statePath);
+			this.state = await readIrohRemoteHostState(this.statePath, { defaultAllowTools: this.defaultAllowTools });
 			return this.state;
 		}
 		this.state ??= createEmptyIrohRemoteHostState();

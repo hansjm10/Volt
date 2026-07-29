@@ -4,6 +4,7 @@ import { authorizeIrohRemoteClient, hashIrohRemotePairingSecret } from "../src/c
 import { IrohRemoteHostEngine } from "../src/core/remote/iroh/engine.ts";
 import { parseIrohRemoteHelloLine } from "../src/core/remote/iroh/handshake.ts";
 import {
+	canonicalizePersistedIrohRemoteAllowTools,
 	DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 	IROH_REMOTE_ALPN,
 	resolveIrohRemoteRuntimeToolPolicy,
@@ -300,6 +301,142 @@ describe("default grant tracking: updateClientAccess", () => {
 		});
 		expect(result.ok).toBe(true);
 		expect((await manager.getState()).clients[0]?.allowedTools).toBe("");
+	});
+});
+
+describe("default grant tracking: cross-default upgrades", () => {
+	// Synthetic defaults standing in for two releases of the daemon: pairing
+	// happens under A, the daemon restarts with the widened default B.
+	const DEFAULT_A = "read,grep,ls";
+	const DEFAULT_B = "read,grep,ls,inspect";
+
+	it("canonicalizes against the injected default, not the compiled one", () => {
+		expect(canonicalizePersistedIrohRemoteAllowTools("ls, grep ,read", DEFAULT_A)).toBeUndefined();
+		expect(canonicalizePersistedIrohRemoteAllowTools(DEFAULT_A, DEFAULT_B)).toBe("read,grep,ls");
+	});
+
+	it("a tracking client pairs under default A and resolves under default B", () => {
+		const state = makeState();
+		const paired = authorizeIrohRemoteClient(state, makeHello(WORKSPACE.name, "secret"), "client-node", {
+			allowTools: DEFAULT_A,
+			defaultAllowTools: DEFAULT_A,
+			pairingSecret: "secret",
+			pairingExpiresAt: 200,
+			workspace: WORKSPACE,
+			now: 100,
+		});
+		if (!paired.ok) throw new Error(paired.error);
+		expect(paired.allowTools).toBe(DEFAULT_A);
+		expect(paired.client).not.toHaveProperty("allowedTools");
+
+		const reconnected = authorizeIrohRemoteClient(state, makeHello(WORKSPACE.name), "client-node", {
+			allowTools: DEFAULT_B,
+			defaultAllowTools: DEFAULT_B,
+			workspace: WORKSPACE,
+			now: 200,
+		});
+		if (!reconnected.ok) throw new Error(reconnected.error);
+		expect(reconnected.allowTools).toBe(DEFAULT_B);
+		expect(state.clients[0]).not.toHaveProperty("allowedTools");
+	});
+
+	it("a pinned client keeps its grant across the default change", () => {
+		const state = makeState();
+		const paired = authorizeIrohRemoteClient(state, makeHello(WORKSPACE.name, "secret"), "client-node", {
+			allowTools: "read",
+			defaultAllowTools: DEFAULT_A,
+			pairingSecret: "secret",
+			pairingExpiresAt: 200,
+			workspace: WORKSPACE,
+			now: 100,
+		});
+		if (!paired.ok) throw new Error(paired.error);
+		const reconnected = authorizeIrohRemoteClient(state, makeHello(WORKSPACE.name), "client-node", {
+			allowTools: DEFAULT_B,
+			defaultAllowTools: DEFAULT_B,
+			workspace: WORKSPACE,
+			now: 200,
+		});
+		if (!reconnected.ok) throw new Error(reconnected.error);
+		expect(reconnected.allowTools).toBe("read");
+	});
+
+	it("a snapshot of default A loads as pinned under default B but heals under default A", () => {
+		const raw = { workspaces: [WORKSPACE], clients: [{ ...RAW_CLIENT_BASE, allowedTools: DEFAULT_A }] };
+		const underB = parseIrohRemoteHostState(JSON.parse(JSON.stringify(raw)), { defaultAllowTools: DEFAULT_B });
+		expect(underB.clients[0]?.allowedTools).toBe("read,grep,ls");
+		const underA = parseIrohRemoteHostState(JSON.parse(JSON.stringify(raw)), { defaultAllowTools: DEFAULT_A });
+		expect(underA.clients[0]).not.toHaveProperty("allowedTools");
+	});
+
+	it("runtime policy follows the injected default for tracking grants and freezes pinned ones", () => {
+		const tracking = resolveIrohRemoteRuntimeToolPolicy({
+			clientAllowTools: DEFAULT_B,
+			daemonAllowTools: null,
+			defaultAllowTools: DEFAULT_B,
+		});
+		expect(tracking.tools).toEqual(DEFAULT_B.split(","));
+		expect(tracking.allowUnlistedExtensionTools).toBe(true);
+
+		const pinned = resolveIrohRemoteRuntimeToolPolicy({
+			clientAllowTools: DEFAULT_A,
+			daemonAllowTools: null,
+			defaultAllowTools: DEFAULT_B,
+		});
+		expect(pinned.tools).toEqual(DEFAULT_A.split(","));
+		expect(pinned.allowUnlistedExtensionTools).toBe(false);
+	});
+
+	it("a default-intent ticket minted under default A grants default B when consumed under B", async () => {
+		const manager = new IrohRemoteHostStateManager({ initialState: createEmptyIrohRemoteHostState() });
+		await manager.upsertWorkspace({ ...WORKSPACE });
+		const engine = new IrohRemoteHostEngine({
+			stateManager: manager,
+			workspace: { ...WORKSPACE },
+			defaultAllowTools: DEFAULT_A,
+			allowTools: DEFAULT_A,
+			now: () => 1,
+		});
+		await engine.pair({
+			workspace: WORKSPACE.name,
+			irohTicket: "endpoint-ticket",
+			secret: "one-time-secret",
+			expiresAt: 100,
+		});
+		const state = await manager.getState();
+		expect(state.pendingPairingTickets?.[0]).not.toHaveProperty("allowedTools");
+
+		const consumed = authorizeIrohRemoteClient(state, makeHello(WORKSPACE.name, "one-time-secret"), "client-node", {
+			allowTools: DEFAULT_B,
+			defaultAllowTools: DEFAULT_B,
+			workspace: WORKSPACE,
+			now: 50,
+		});
+		if (!consumed.ok) throw new Error(consumed.error);
+		expect(consumed.allowTools).toBe(DEFAULT_B);
+		expect(consumed.client).not.toHaveProperty("allowedTools");
+	});
+
+	it("updateClientAccess clears a grant that equals the manager's injected default", async () => {
+		const manager = new IrohRemoteHostStateManager({
+			initialState: createEmptyIrohRemoteHostState(),
+			defaultAllowTools: DEFAULT_B,
+		});
+		await manager.upsertWorkspace({ ...WORKSPACE });
+		const paired = await manager.authorizeClient(makeHello(WORKSPACE.name, "secret"), "client-node", {
+			allowTools: "read",
+			defaultAllowTools: DEFAULT_B,
+			pairingSecret: "secret",
+			pairingExpiresAt: 200,
+			now: 100,
+		});
+		expect(paired.ok).toBe(true);
+		const updated = await manager.updateClientAccess("client-node", 1, {
+			allowedTools: "inspect,ls,grep,read",
+			rpcGrant: CODING_GRANT,
+		});
+		expect(updated.ok).toBe(true);
+		expect((await manager.getState()).clients[0]).not.toHaveProperty("allowedTools");
 	});
 });
 

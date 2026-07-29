@@ -157,7 +157,15 @@ export function createEmptyIrohRemoteHostState(): IrohRemoteHostState {
 	};
 }
 
-export async function readIrohRemoteHostState(path: string): Promise<IrohRemoteHostState> {
+export interface IrohRemoteStateParseOptions {
+	/** Default grant to canonicalize against; tests inject alternate defaults. */
+	defaultAllowTools?: string;
+}
+
+export async function readIrohRemoteHostState(
+	path: string,
+	options?: IrohRemoteStateParseOptions,
+): Promise<IrohRemoteHostState> {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(await readFile(path, "utf8"));
@@ -167,14 +175,14 @@ export async function readIrohRemoteHostState(path: string): Promise<IrohRemoteH
 		}
 		throw error;
 	}
-	return parseIrohRemoteHostState(parsed);
+	return parseIrohRemoteHostState(parsed, options);
 }
 
 export async function writeIrohRemoteHostState(path: string, state: IrohRemoteHostState): Promise<void> {
 	await writeDurableAtomicFile(path, `${JSON.stringify(serializeIrohRemoteHostState(state), null, 2)}\n`);
 }
 
-export function parseIrohRemoteHostState(value: unknown): IrohRemoteHostState {
+export function parseIrohRemoteHostState(value: unknown, options?: IrohRemoteStateParseOptions): IrohRemoteHostState {
 	const state = expectRecord(value, "Iroh remote host state");
 	return {
 		hostSecretKey: parseOptionalByteArray(state.hostSecretKey, "hostSecretKey"),
@@ -185,12 +193,12 @@ export function parseIrohRemoteHostState(value: unknown): IrohRemoteHostState {
 		),
 		workspaces: parseArray(state.workspaces, "workspaces", parseIrohRemoteWorkspace),
 		worktrees: parseOptionalArray(state.worktrees, "worktrees", parseIrohRemoteWorkspaceWorktree),
-		clients: parseArray(state.clients, "clients", parseIrohRemoteClient),
-		revokedClients: parseOptionalArray(state.revokedClients, "revokedClients", parseIrohRemoteRevokedClient),
-		pendingPairingTickets: parseOptionalArray(
-			state.pendingPairingTickets,
-			"pendingPairingTickets",
-			parseIrohRemotePendingPairingTicket,
+		clients: parseArray(state.clients, "clients", (entry) => parseIrohRemoteClient(entry, options)),
+		revokedClients: parseOptionalArray(state.revokedClients, "revokedClients", (entry) =>
+			parseIrohRemoteRevokedClient(entry, options),
+		),
+		pendingPairingTickets: parseOptionalArray(state.pendingPairingTickets, "pendingPairingTickets", (entry) =>
+			parseIrohRemotePendingPairingTicket(entry, options),
 		),
 	};
 }
@@ -283,10 +291,11 @@ function expectOptionalWorkspaceRelativePath(value: unknown, label: string): str
 	return value;
 }
 
-export function parseIrohRemoteClient(value: unknown): IrohRemoteClient {
+export function parseIrohRemoteClient(value: unknown, options?: IrohRemoteStateParseOptions): IrohRemoteClient {
 	const client = expectRecord(value, "Iroh remote client");
 	const allowedTools = canonicalizePersistedIrohRemoteAllowTools(
 		expectOptionalAllowTools(client.allowedTools, "client allowedTools"),
+		options?.defaultAllowTools,
 	);
 	return {
 		nodeId: expectString(client.nodeId, "client nodeId"),
@@ -428,11 +437,15 @@ function compareLiveActivityAge(
 	);
 }
 
-export function parseIrohRemoteRevokedClient(value: unknown): IrohRemoteRevokedClient {
+export function parseIrohRemoteRevokedClient(
+	value: unknown,
+	options?: IrohRemoteStateParseOptions,
+): IrohRemoteRevokedClient {
 	const client = expectRecord(value, "Iroh remote revoked client");
 	const rePairApprovedAt = expectOptionalNumber(client.rePairApprovedAt, "revoked client rePairApprovedAt");
 	const allowedTools = canonicalizePersistedIrohRemoteAllowTools(
 		expectOptionalAllowTools(client.allowedTools, "revoked client allowedTools"),
+		options?.defaultAllowTools,
 	);
 	return {
 		nodeId: expectString(client.nodeId, "revoked client nodeId"),
@@ -483,11 +496,15 @@ export function parseIrohRemotePairingSecretTombstone(value: unknown): IrohRemot
 	};
 }
 
-export function parseIrohRemotePendingPairingTicket(value: unknown): IrohRemotePendingPairingTicket {
+export function parseIrohRemotePendingPairingTicket(
+	value: unknown,
+	options?: IrohRemoteStateParseOptions,
+): IrohRemotePendingPairingTicket {
 	const ticket = expectRecord(value, "Iroh remote pending pairing ticket");
 	const labelHint = expectOptionalString(ticket.labelHint, "pending pairing ticket labelHint");
 	const allowedTools = canonicalizePersistedIrohRemoteAllowTools(
 		expectOptionalAllowTools(ticket.allowedTools, "pending pairing ticket allowedTools"),
+		options?.defaultAllowTools,
 	);
 	return {
 		secretHash: expectString(ticket.secretHash, "pending pairing ticket secretHash"),

@@ -39,6 +39,8 @@ export const DEFAULT_IROH_REMOTE_RE_PAIR_APPROVAL_TTL_MS = 30 * 60 * 1000;
 
 export interface AuthorizeIrohRemoteClientOptions {
 	allowTools: string;
+	/** Default grant to resolve tracking clients against; tests inject alternate defaults. */
+	defaultAllowTools?: string;
 	rpcGrant?: IrohRemoteRpcGrant;
 	classifyWorkspaceAvailability?: IrohRemoteWorkspaceAvailabilityClassifier;
 	pairingExpiresAt?: number;
@@ -269,8 +271,11 @@ export function authorizeIrohRemoteClient(
 		const requestedAllowTools = matchingPendingPairingTicket
 			? matchingPendingPairingTicket.allowedTools
 			: options.allowTools;
-		const persistedAllowedTools = canonicalizePersistedIrohRemoteAllowTools(requestedAllowTools);
-		const allowedTools = normalizeIrohRemoteAllowTools(persistedAllowedTools);
+		const persistedAllowedTools = canonicalizePersistedIrohRemoteAllowTools(
+			requestedAllowTools,
+			options.defaultAllowTools,
+		);
+		const allowedTools = normalizeIrohRemoteAllowTools(persistedAllowedTools, options.defaultAllowTools);
 		let rpcGrant: IrohRemoteRpcGrant;
 		try {
 			const selectedGrant = parseIrohRemoteRpcGrant(
@@ -349,7 +354,7 @@ export function authorizeIrohRemoteClient(
 
 	// Reconnects never write the grant back: a tracking client (no persisted
 	// allowedTools) must keep resolving against the current default.
-	const effectiveAllowTools = normalizeIrohRemoteAllowTools(existingClient.allowedTools);
+	const effectiveAllowTools = normalizeIrohRemoteAllowTools(existingClient.allowedTools, options.defaultAllowTools);
 	existingClient.lastSeenAt = now;
 	if (hello.clientLabel) {
 		existingClient.label = hello.clientLabel;

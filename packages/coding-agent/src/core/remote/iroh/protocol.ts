@@ -131,19 +131,28 @@ export class IrohRemoteOutcomeError extends Error {
 	}
 }
 
-export function normalizeIrohRemoteAllowTools(allowTools: string | undefined): string {
-	const tools = parseIrohRemoteAllowToolNames(allowTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+export function normalizeIrohRemoteAllowTools(
+	allowTools: string | undefined,
+	defaultAllowTools: string = DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+): string {
+	const tools = parseIrohRemoteAllowToolNames(allowTools ?? defaultAllowTools);
 	return tools.join(",");
 }
 
-export function parseIrohRemoteAllowTools(allowTools: string | undefined): string[] {
-	const normalized = normalizeIrohRemoteAllowTools(allowTools);
+export function parseIrohRemoteAllowTools(
+	allowTools: string | undefined,
+	defaultAllowTools: string = DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+): string[] {
+	const normalized = normalizeIrohRemoteAllowTools(allowTools, defaultAllowTools);
 	return normalized.length === 0 ? [] : normalized.split(",");
 }
 
-export function usesDefaultIrohRemoteAllowTools(allowTools: string | undefined): boolean {
-	const tools = new Set(parseIrohRemoteAllowTools(allowTools));
-	const defaultTools = new Set(DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(","));
+export function usesDefaultIrohRemoteAllowTools(
+	allowTools: string | undefined,
+	defaultAllowTools: string = DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+): boolean {
+	const tools = new Set(parseIrohRemoteAllowTools(allowTools, defaultAllowTools));
+	const defaultTools = new Set(defaultAllowTools.split(","));
 	return tools.size === defaultTools.size && Array.from(tools).every((tool) => defaultTools.has(tool));
 }
 
@@ -161,8 +170,11 @@ export function usesDefaultIrohRemoteAllowTools(allowTools: string | undefined):
  * freezing is the security-conservative reading; such records re-pair or reset
  * access to start tracking).
  */
-export function canonicalizePersistedIrohRemoteAllowTools(allowTools: string | undefined): string | undefined {
-	if (allowTools === undefined || usesDefaultIrohRemoteAllowTools(allowTools)) {
+export function canonicalizePersistedIrohRemoteAllowTools(
+	allowTools: string | undefined,
+	defaultAllowTools: string = DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
+): string | undefined {
+	if (allowTools === undefined || usesDefaultIrohRemoteAllowTools(allowTools, defaultAllowTools)) {
 		return undefined;
 	}
 	return uniqueIrohRemoteAllowToolNames(parseIrohRemoteAllowToolNames(allowTools)).join(",");
@@ -180,6 +192,8 @@ export interface ResolveIrohRemoteRuntimeToolPolicyOptions {
 	workspaceAllowTools?: string;
 	/** Exact daemon ceiling. Null means unrestricted; an empty array denies every tool. */
 	daemonAllowTools: readonly string[] | null;
+	/** Default grant to resolve against; tests inject alternate defaults here. */
+	defaultAllowTools?: string;
 }
 
 /**
@@ -193,14 +207,15 @@ export interface ResolveIrohRemoteRuntimeToolPolicyOptions {
 export function resolveIrohRemoteRuntimeToolPolicy(
 	options: ResolveIrohRemoteRuntimeToolPolicyOptions,
 ): IrohRemoteRuntimeToolPolicy {
-	const defaultTools = new Set(DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(","));
+	const defaultAllowTools = options.defaultAllowTools ?? DEFAULT_IROH_REMOTE_ALLOW_TOOLS;
+	const defaultTools = new Set(defaultAllowTools.split(","));
 	const layers: Array<{ tools: string[]; toolSet: Set<string>; allowUnlistedExtensionTools: boolean }> = [];
 	const addStringLayer = (allowTools: string): void => {
-		const tools = uniqueIrohRemoteAllowToolNames(parseIrohRemoteAllowTools(allowTools));
+		const tools = uniqueIrohRemoteAllowToolNames(parseIrohRemoteAllowTools(allowTools, defaultAllowTools));
 		layers.push({
 			tools,
 			toolSet: new Set(tools),
-			allowUnlistedExtensionTools: usesDefaultIrohRemoteAllowTools(allowTools),
+			allowUnlistedExtensionTools: usesDefaultIrohRemoteAllowTools(allowTools, defaultAllowTools),
 		});
 	};
 
@@ -228,11 +243,12 @@ export function resolveIrohRemoteRuntimeToolPolicy(
 export function isIrohRemoteRuntimeToolPolicyWithin(
 	policy: IrohRemoteRuntimeToolPolicy,
 	ceiling: IrohRemoteRuntimeToolPolicy,
+	defaultAllowTools: string = DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 ): boolean {
 	if (policy.allowUnlistedExtensionTools && !ceiling.allowUnlistedExtensionTools) {
 		return false;
 	}
-	const defaultTools = new Set(DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(","));
+	const defaultTools = new Set(defaultAllowTools.split(","));
 	const ceilingTools = new Set(ceiling.tools);
 	return policy.tools.every(
 		(tool) => ceilingTools.has(tool) || (ceiling.allowUnlistedExtensionTools && !defaultTools.has(tool)),
