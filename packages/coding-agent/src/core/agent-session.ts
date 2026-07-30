@@ -729,6 +729,10 @@ export class AgentSession {
 	 * new runner without reinstalling hooks. Extension-specific tool wrappers are still used to adapt
 	 * registered tool execution to the extension context. Tool call and tool result interception now
 	 * happens here instead of in wrappers.
+	 *
+	 * Install-once is a contract: external wrappers — e.g. the SubagentManager per-child turn budget —
+	 * chain and later restore `agent.beforeToolCall`/`agent.shouldStopAfterTurn`. Reinstalling either
+	 * hook after construction would silently discard such wrappers.
 	 */
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {

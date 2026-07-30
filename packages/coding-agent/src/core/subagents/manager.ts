@@ -1386,6 +1386,11 @@ export class SubagentManager {
 			this.markActivityAbortRequested(id);
 			void runtime.session.abort().catch(() => undefined);
 		};
+		// Wrapping these agent hooks relies on AgentSession installing them exactly
+		// once in its constructor (see AgentSession._installAgentToolHooks) and
+		// never reinstalling them afterwards; a reinstall would silently drop this
+		// turn-budget enforcement. The originals are chained here and restored by
+		// unsubscribeScopeAccounting on every terminal and error path.
 		const originalBeforeToolCall = runtime.session.agent.beforeToolCall;
 		const originalShouldStopAfterTurn = runtime.session.agent.shouldStopAfterTurn;
 		runtime.session.agent.beforeToolCall = async (context, signal) => {

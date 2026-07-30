@@ -1115,6 +1115,72 @@ describe("SubagentManager", () => {
 		});
 	});
 
+	it("keeps the warning stage consistent with an overridden per-runtime maxTurns", () => {
+		// An unset warning clamps to the smaller explicit cap instead of silently never firing.
+		const clamped = new SubagentDelegationScope({ turnLimits: { maxTurns: 50 } });
+		cleanups.push(() => clamped.dispose());
+		expect(clamped.turnLimits).toEqual({ warnAtTurns: 50, maxTurns: 50 });
+
+		// An explicit finite warning with an infinite cap keeps the warning stage only.
+		const warningOnly = new SubagentDelegationScope({
+			turnLimits: { warnAtTurns: 200, maxTurns: Number.POSITIVE_INFINITY },
+		});
+		cleanups.push(() => warningOnly.dispose());
+		expect(warningOnly.turnLimits).toEqual({ warnAtTurns: 200, maxTurns: Number.POSITIVE_INFINITY });
+
+		// An explicit warning above a finite cap is rejected instead of never firing.
+		expect(() => new SubagentDelegationScope({ turnLimits: { warnAtTurns: 200 } })).toThrow(
+			/warnAtTurns \(200\) must not exceed maxTurns \(120\)/,
+		);
+		expect(() => new SubagentDelegationScope({ turnLimits: { warnAtTurns: 300, maxTurns: 200 } })).toThrow(
+			/warnAtTurns \(300\) must not exceed maxTurns \(200\)/,
+		);
+	});
+
+	it("merges the warning into the final-report turn when the clamped stages coincide", async () => {
+		let warningPromptSeen = false;
+		let finalReportPromptSeen = false;
+		const resourceLoader = createSubagentResourceLoader([createDefinition({ name: "researcher" })]);
+		const { manager } = await createTestManager({
+			resourceLoader,
+			noTools: false,
+			turnLimits: { maxTurns: 2 },
+			responses: [
+				fauxAssistantMessage(fauxToolCall("subagent_registry", { list: true }), {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage(fauxToolCall("subagent_registry", { list: true }), {
+					stopReason: "toolUse",
+				}),
+				(context) => {
+					const serializedMessages = JSON.stringify(context.messages);
+					warningPromptSeen = serializedMessages.includes(
+						"Stop broad exploration, finish the current line of inquiry",
+					);
+					finalReportPromptSeen = serializedMessages.includes(
+						"Do not call any more tools. Return your best final report now",
+					);
+					return fauxAssistantMessage("Merged-stage final report");
+				},
+			],
+		});
+
+		const handle = await manager.startByName("researcher");
+		const completion = handle.waitForEnd();
+		await handle.prompt("Work straight through a merged warning and report stage");
+		const result = await completion;
+
+		expect(warningPromptSeen).toBe(false);
+		expect(finalReportPromptSeen).toBe(true);
+		expect(result.event.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "Merged-stage final report" }],
+		});
+		expect(manager.listActivities()).toEqual([
+			expect.objectContaining({ id: handle.id, status: "completed", abortRequested: false }),
+		]);
+	});
+
 	it("warns a working child and grants a tool-blocked final report turn at the limit", async () => {
 		let warningPromptSeen = false;
 		let finalReportPromptSeen = false;

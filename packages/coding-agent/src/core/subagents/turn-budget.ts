@@ -17,6 +17,19 @@ export interface SubagentTurnBudgetEvent {
 	maxTurns: number;
 }
 
+/**
+ * Resolve turn-limit overrides against the defaults so the two stages stay
+ * consistent:
+ *
+ * - An explicit `maxTurns` of `Infinity` with no explicit `warnAtTurns`
+ *   disables both stages.
+ * - An unset `warnAtTurns` clamps to `min(default warnAtTurns, maxTurns)` so a
+ *   small explicit `maxTurns` never silently skips the warning stage.
+ * - An explicit `warnAtTurns` above a finite `maxTurns` is rejected instead of
+ *   silently never firing.
+ * - `warnAtTurns === maxTurns` is legal: the warning merges into the
+ *   final-report turn because `recordTurn` checks `maxTurns` first.
+ */
 export function resolveSubagentTurnLimits(overrides: SubagentTurnLimits | undefined): Required<SubagentTurnLimits> {
 	const limits: Required<SubagentTurnLimits> = { ...DEFAULT_SUBAGENT_TURN_LIMITS };
 	for (const key of Object.keys(limits) as Array<keyof SubagentTurnLimits>) {
@@ -29,8 +42,17 @@ export function resolveSubagentTurnLimits(overrides: SubagentTurnLimits | undefi
 		}
 		limits[key] = value;
 	}
-	if (overrides?.maxTurns === Number.POSITIVE_INFINITY && overrides.warnAtTurns === undefined) {
-		limits.warnAtTurns = Number.POSITIVE_INFINITY;
+	if (overrides?.warnAtTurns === undefined) {
+		// The default maxTurns is finite, so an infinite maxTurns is always an
+		// explicit opt-out that disables both stages.
+		limits.warnAtTurns =
+			limits.maxTurns === Number.POSITIVE_INFINITY
+				? Number.POSITIVE_INFINITY
+				: Math.min(limits.warnAtTurns, limits.maxTurns);
+	} else if (limits.warnAtTurns > limits.maxTurns) {
+		throw new Error(
+			`Subagent turn limit warnAtTurns (${limits.warnAtTurns}) must not exceed maxTurns (${limits.maxTurns})`,
+		);
 	}
 	return limits;
 }
