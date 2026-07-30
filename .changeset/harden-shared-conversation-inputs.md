@@ -2,4 +2,6 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(remote): Made shared-session recovery reliable across daemon restarts and branch changes, rejected stale device mutations after conversation rebases, kept input acknowledgements and queued delivery durable, bounded outstanding input and canonical completion records, attributed audits to the acting device, and retired Live Activities for every attached device.
+fix(remote): Shared conversations now recover reliably across daemon restarts and branch changes while rejecting stale or duplicate device input.
+
+Input acknowledgements and queued delivery remain durable, outstanding records are bounded, audits identify the acting device, and Live Activities retire for every attached device.
