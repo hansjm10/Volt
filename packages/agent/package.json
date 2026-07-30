@@ -1,6 +1,6 @@
 {
 	"name": "@hansjm10/volt-agent-core",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "General-purpose agent with transport abstraction, state management, and attachment support",
 	"type": "module",
 	"main": "./dist/index.js",
@@ -34,7 +34,7 @@
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {
-		"@hansjm10/volt-ai": "^0.1.0",
+		"@hansjm10/volt-ai": "^0.2.0",
 		"ignore": "7.0.5",
 		"typebox": "1.1.38",
 		"yaml": "2.9.0"

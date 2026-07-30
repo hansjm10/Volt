@@ -1,17 +1,17 @@
 {
 	"name": "@hansjm10/volt-coding-agent",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"lockfileVersion": 3,
 	"requires": true,
 	"packages": {
 		"": {
 			"name": "@hansjm10/volt-coding-agent",
-			"version": "0.1.0",
+			"version": "0.2.0",
 			"license": "MIT",
 			"dependencies": {
-				"@hansjm10/volt-agent-core": "^0.1.0",
-				"@hansjm10/volt-ai": "^0.1.0",
-				"@hansjm10/volt-tui": "^0.1.0",
+				"@hansjm10/volt-agent-core": "^0.2.0",
+				"@hansjm10/volt-ai": "^0.2.0",
+				"@hansjm10/volt-tui": "^0.2.0",
 				"@jimp/core": "1.6.1",
 				"@jimp/js-bmp": "1.6.1",
 				"@jimp/js-gif": "1.6.1",
@@ -517,11 +517,11 @@
 			"hasInstallScript": true
 		},
 		"node_modules/@hansjm10/volt-agent-core": {
-			"version": "0.1.0",
-			"resolved": "https://registry.npmjs.org/@hansjm10/volt-agent-core/-/volt-agent-core-0.1.0.tgz",
+			"version": "0.2.0",
+			"resolved": "https://registry.npmjs.org/@hansjm10/volt-agent-core/-/volt-agent-core-0.2.0.tgz",
 			"license": "MIT",
 			"dependencies": {
-				"@hansjm10/volt-ai": "^0.1.0",
+				"@hansjm10/volt-ai": "^0.2.0",
 				"ignore": "7.0.5",
 				"typebox": "1.1.38",
 				"yaml": "2.9.0"
@@ -531,8 +531,8 @@
 			}
 		},
 		"node_modules/@hansjm10/volt-ai": {
-			"version": "0.1.0",
-			"resolved": "https://registry.npmjs.org/@hansjm10/volt-ai/-/volt-ai-0.1.0.tgz",
+			"version": "0.2.0",
+			"resolved": "https://registry.npmjs.org/@hansjm10/volt-ai/-/volt-ai-0.2.0.tgz",
 			"license": "MIT",
 			"dependencies": {
 				"@anthropic-ai/sdk": "0.91.1",
@@ -554,8 +554,8 @@
 			}
 		},
 		"node_modules/@hansjm10/volt-tui": {
-			"version": "0.1.0",
-			"resolved": "https://registry.npmjs.org/@hansjm10/volt-tui/-/volt-tui-0.1.0.tgz",
+			"version": "0.2.0",
+			"resolved": "https://registry.npmjs.org/@hansjm10/volt-tui/-/volt-tui-0.2.0.tgz",
 			"license": "MIT",
 			"dependencies": {
 				"get-east-asian-width": "1.6.0",

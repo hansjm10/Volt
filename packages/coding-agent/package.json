@@ -1,6 +1,6 @@
 {
 	"name": "@hansjm10/volt-coding-agent",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Coding agent CLI with read, bash, edit, write, web_search tools and session management",
 	"type": "module",
 	"voltConfig": {
@@ -56,9 +56,9 @@
 		"prepublishOnly": "npm run clean && npm run build && npm run shrinkwrap"
 	},
 	"dependencies": {
-		"@hansjm10/volt-agent-core": "^0.1.0",
-		"@hansjm10/volt-ai": "^0.1.0",
-		"@hansjm10/volt-tui": "^0.1.0",
+		"@hansjm10/volt-agent-core": "^0.2.0",
+		"@hansjm10/volt-ai": "^0.2.0",
+		"@hansjm10/volt-tui": "^0.2.0",
 		"@jimp/core": "1.6.1",
 		"@jimp/js-bmp": "1.6.1",
 		"@jimp/js-gif": "1.6.1",
