@@ -8,7 +8,7 @@ import {
 	fauxToolCall,
 	registerFauxProvider,
 } from "@hansjm10/volt-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -1316,6 +1316,101 @@ describe("SubagentManager", () => {
 		expect(manager.listActivities()).toEqual([
 			expect.objectContaining({ id: handle.id, status: "aborted", abortRequested: true }),
 		]);
+	});
+
+	it("keeps a re-prompted child in report-only mode after it finishes at its turn limit", async () => {
+		let childSession: SubagentRuntimeCreatedEvent["runtime"]["session"] | undefined;
+		const resourceLoader = createSubagentResourceLoader([createDefinition({ name: "researcher" })]);
+		const { manager } = await createTestManager({
+			resourceLoader,
+			noTools: false,
+			turnLimits: { warnAtTurns: 1, maxTurns: 2 },
+			onRuntimeCreated: (event) => {
+				childSession = event.runtime.session;
+			},
+			responses: [
+				fauxAssistantMessage(fauxToolCall("subagent_registry", { list: true }), { stopReason: "toolUse" }),
+				fauxAssistantMessage("Finished naturally at the limit"),
+				fauxAssistantMessage("Tool-free follow-up answer"),
+				fauxAssistantMessage(fauxToolCall("subagent_registry", { list: true }), { stopReason: "toolUse" }),
+			],
+		});
+
+		const handle = await manager.startByName("researcher");
+		// handle.prompt resolves at prompt acceptance, so re-prompt runs are
+		// awaited through their agent_end events.
+		const waitForNextEnd = (): Promise<SubagentEndEvent> =>
+			new Promise((resolve) => {
+				const unsubscribe = handle.onEvent((event) => {
+					if (event.type !== "agent_end") return;
+					unsubscribe();
+					resolve(event);
+				});
+			});
+		const completion = handle.waitForEnd();
+		await handle.prompt("Work up to this subagent's turn limit");
+		await completion;
+		if (!childSession) throw new Error("expected the child session");
+		expect(manager.listActivities()).toEqual([
+			expect.objectContaining({ id: handle.id, status: "completed", abortRequested: false }),
+		]);
+
+		// A re-prompt after the natural at-limit finish stays report-only: one
+		// tool-free reply per prompt, no abort.
+		const abortSpy = vi.spyOn(childSession, "abort");
+		const followUpEnd = waitForNextEnd();
+		await handle.prompt("Answer one follow-up question");
+		expect((await followUpEnd).messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "Tool-free follow-up answer" }],
+		});
+		expect(abortSpy).not.toHaveBeenCalled();
+		// agent_end precedes full run settlement; wait for idle before re-prompting.
+		await childSession.waitForIdle();
+
+		// Requesting a tool on a later re-prompt is blocked and aborts only this
+		// child's session; the run stops after that single turn.
+		const refusalEnd = waitForNextEnd();
+		await handle.prompt("Try to use tools again");
+		const refusalMessages = (await refusalEnd).messages;
+		expect(refusalMessages.filter((message) => message.role === "assistant")).toHaveLength(1);
+		const blockedResult = refusalMessages.find((message) => message.role === "toolResult");
+		expect(JSON.stringify(blockedResult)).toContain("turn budget is exhausted");
+		expect(abortSpy).toHaveBeenCalled();
+	});
+
+	it("preserves an externally chained hook wrapper installed after spawn", async () => {
+		let childSession: SubagentRuntimeCreatedEvent["runtime"]["session"] | undefined;
+		let externalBeforeToolCall: unknown;
+		let externalShouldStopAfterTurn: unknown;
+		const { manager } = await createTestManager({
+			onRuntimeCreated: (event) => {
+				const agent = event.runtime.session.agent;
+				const innerBeforeToolCall = agent.beforeToolCall;
+				const innerShouldStopAfterTurn = agent.shouldStopAfterTurn;
+				const wrappedBeforeToolCall: typeof innerBeforeToolCall = async (context, signal) =>
+					innerBeforeToolCall?.(context, signal);
+				const wrappedShouldStopAfterTurn: typeof innerShouldStopAfterTurn = async (context, signal) =>
+					(await innerShouldStopAfterTurn?.(context, signal)) ?? false;
+				agent.beforeToolCall = wrappedBeforeToolCall;
+				agent.shouldStopAfterTurn = wrappedShouldStopAfterTurn;
+				externalBeforeToolCall = wrappedBeforeToolCall;
+				externalShouldStopAfterTurn = wrappedShouldStopAfterTurn;
+				childSession = event.runtime.session;
+			},
+		});
+
+		const handle = await manager.start();
+		const completion = handle.waitForEnd();
+		await handle.prompt("finish quickly");
+		await completion;
+		await handle.dispose();
+
+		if (!childSession) throw new Error("expected the child session");
+		// Teardown must not clobber the externally chained wrappers: the budget
+		// wrappers are no longer the installed hooks, so restore is skipped.
+		expect(childSession.agent.beforeToolCall).toBe(externalBeforeToolCall);
+		expect(childSession.agent.shouldStopAfterTurn).toBe(externalShouldStopAfterTurn);
 	});
 
 	it("applies finite manager aggregate consumption overrides with field-specific abort errors", async () => {
