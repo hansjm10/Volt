@@ -42,6 +42,9 @@ on:
 
 permissions: {}
 
+env:
+  RELEASE_OWNER: hansjm10
+
 concurrency:
   group: release-approval-${{ inputs.version }}
   cancel-in-progress: false
@@ -72,14 +75,13 @@ jobs:
           CONFIRM_RELEASE: ${{ inputs.confirm_release }}
           LICENSE_COMPLIANCE_APPROVED: ${{ inputs.license_compliance_approved }}
           NATIVE_SMOKE_TESTS_APPROVED: ${{ inputs.native_smoke_tests_approved }}
-          REPOSITORY_OWNER: ${{ github.repository_owner }}
           RUN_ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           UNSIGNED_WINDOWS_ACKNOWLEDGED: ${{ inputs.unsigned_windows_acknowledged }}
         shell: bash
         run: |
-          if [[ "${RUN_ACTOR}" != "${REPOSITORY_OWNER}" ]] || [[ "${TRIGGERING_ACTOR}" != "${REPOSITORY_OWNER}" ]]; then
-            echo "Only the repository owner may approve a release" >&2
+          if [[ "${RUN_ACTOR}" != "${RELEASE_OWNER}" ]] || [[ "${TRIGGERING_ACTOR}" != "${RELEASE_OWNER}" ]]; then
+            echo "Only the designated release owner may approve a release" >&2
             exit 1
           fi
           if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
@@ -302,7 +304,6 @@ jobs:
       - name: Repeat mutable GitHub state checks without a write credential
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          REPOSITORY_OWNER: ${{ github.repository_owner }}
           RUN_ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         with:
@@ -316,8 +317,8 @@ jobs:
             const baseMessage = Buffer.from(process.env.TAG_MESSAGE_BASE64, "base64").toString("utf8");
             const expectedMessage = `${baseMessage}\nRelease-Approval-Run: ${context.runId}`;
 
-            if (process.env.RUN_ACTOR !== process.env.REPOSITORY_OWNER || process.env.TRIGGERING_ACTOR !== process.env.REPOSITORY_OWNER) {
-              core.setFailed("Only the repository owner may authorize or rerun a release");
+            if (process.env.RUN_ACTOR !== process.env.RELEASE_OWNER || process.env.TRIGGERING_ACTOR !== process.env.RELEASE_OWNER) {
+              core.setFailed("Only the designated release owner may authorize or rerun a release");
               return;
             }
             const main = await github.rest.repos.getBranch({ owner, repo, branch: "main" });
