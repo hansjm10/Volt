@@ -14,10 +14,19 @@ export interface SubagentDelegationScopeSnapshot {
 	aborted: boolean;
 }
 
+export interface SubagentTurnBudgetEvent {
+	stage: "warning" | "final-report" | "exceeded";
+	turnsUsed: number;
+	warnAtTurns: number;
+	maxTurns: number;
+}
+
 /**
  * Tree-wide limits shared by every descendant of one delegation scope.
- * Structural limits reject new spawns; finite consumption budgets abort the
- * admitted tree when crossed. Every limit accepts `Number.POSITIVE_INFINITY`.
+ * Structural limits reject new spawns. The finite turn budget first requests
+ * a final report, then aborts if crossed; other finite consumption budgets
+ * abort the admitted tree when crossed. Every limit accepts
+ * `Number.POSITIVE_INFINITY`.
  */
 export interface SubagentDelegationScopeLimits {
 	/** Deepest delegation depth a descendant may start at; root children start at depth 1. */
@@ -26,7 +35,9 @@ export interface SubagentDelegationScopeLimits {
 	maxStarts?: number;
 	/** Concurrently active descendant runtimes across the whole tree. */
 	maxActiveDescendants?: number;
-	/** Finite total assistant turns allowed across all descendants before the tree aborts. */
+	/** Total assistant turns across all descendants that trigger a wrap-up warning. */
+	warnAtTurns?: number;
+	/** Total assistant turns across all descendants before a tool-blocked final report is required. */
 	maxTurns?: number;
 	/** Finite total tokens allowed across all descendants before the tree aborts. */
 	maxTotalTokens?: number;
@@ -40,7 +51,8 @@ export const DEFAULT_SUBAGENT_DELEGATION_LIMITS: Required<SubagentDelegationScop
 	maxDepth: 5,
 	maxStarts: 100,
 	maxActiveDescendants: 16,
-	maxTurns: Number.POSITIVE_INFINITY,
+	warnAtTurns: 80,
+	maxTurns: 120,
 	maxTotalTokens: Number.POSITIVE_INFINITY,
 	maxTotalCostUsd: Number.POSITIVE_INFINITY,
 	maxDurationMs: Number.POSITIVE_INFINITY,
@@ -66,7 +78,7 @@ export interface SubagentDelegationBatchReservationOptions {
 
 export interface SubagentDelegationScopeOptions {
 	signal?: AbortSignal;
-	/** Limit overrides; omitted structural limits keep safeguards and consumption budgets stay unlimited. */
+	/** Limit overrides; omitted values use the built-in structural and turn safeguards. */
 	limits?: SubagentDelegationScopeLimits;
 }
 
@@ -87,8 +99,8 @@ function requirePositiveSafeInteger(value: number, name: string): void {
 
 function resolveLimits(overrides: SubagentDelegationScopeLimits | undefined): Required<SubagentDelegationScopeLimits> {
 	// Explicitly-undefined overrides use the category-specific defaults instead
-	// of bypassing resolution: structural safeguards stay finite while
-	// consumption budgets stay unlimited unless a host supplies finite values.
+	// of bypassing resolution: structural and turn safeguards stay finite while
+	// token, cost, and deadline budgets stay unlimited.
 	const limits: Required<SubagentDelegationScopeLimits> = { ...DEFAULT_SUBAGENT_DELEGATION_LIMITS };
 	for (const key of Object.keys(limits) as Array<keyof SubagentDelegationScopeLimits>) {
 		const value = overrides?.[key];
@@ -100,14 +112,18 @@ function resolveLimits(overrides: SubagentDelegationScopeLimits | undefined): Re
 		}
 		limits[key] = value;
 	}
+	if (overrides?.maxTurns === Number.POSITIVE_INFINITY && overrides.warnAtTurns === undefined) {
+		limits.warnAtTurns = Number.POSITIVE_INFINITY;
+	}
 	return limits;
 }
 
 /**
  * Shared, root-owned accounting and cancellation scope for one recursive
  * delegation tree. Reservations enforce the default depth, start, and
- * concurrency ceilings without aborting admitted descendants; opt-in finite
- * consumption budgets (turns, tokens, cost, deadline) abort the whole tree.
+ * concurrency ceilings without aborting admitted descendants. Turn accounting
+ * emits staged wrap-up events before aborting; opt-in finite token, cost, and
+ * deadline budgets abort the whole tree.
  */
 export class SubagentDelegationScope {
 	readonly id: string;
@@ -299,8 +315,8 @@ export class SubagentDelegationScope {
 		}
 	}
 
-	recordTurn(): void {
-		if (this.signal.aborted || this.disposed) return;
+	recordTurn(): SubagentTurnBudgetEvent | undefined {
+		if (this.signal.aborted || this.disposed) return undefined;
 		this.turnsUsed += 1;
 		if (this.turnsUsed > this.limits.maxTurns) {
 			this.abort(
@@ -308,7 +324,30 @@ export class SubagentDelegationScope {
 					`Subagent delegation tree ${this.id} exceeded its ${this.limits.maxTurns}-turn budget (maxTurns).`,
 				),
 			);
+			return {
+				stage: "exceeded",
+				turnsUsed: this.turnsUsed,
+				warnAtTurns: this.limits.warnAtTurns,
+				maxTurns: this.limits.maxTurns,
+			};
 		}
+		if (this.turnsUsed === this.limits.maxTurns) {
+			return {
+				stage: "final-report",
+				turnsUsed: this.turnsUsed,
+				warnAtTurns: this.limits.warnAtTurns,
+				maxTurns: this.limits.maxTurns,
+			};
+		}
+		if (this.turnsUsed === this.limits.warnAtTurns) {
+			return {
+				stage: "warning",
+				turnsUsed: this.turnsUsed,
+				warnAtTurns: this.limits.warnAtTurns,
+				maxTurns: this.limits.maxTurns,
+			};
+		}
+		return undefined;
 	}
 
 	recordUsage(tokens: number, costUsd: number): void {

@@ -161,4 +161,5 @@ export {
 	type SubagentResult,
 	type SubagentStartByNameOptions,
 	type SubagentStartOptions,
+	type SubagentTurnBudgetEvent,
 } from "./subagents/index.ts";

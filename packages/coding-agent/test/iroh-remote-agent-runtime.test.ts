@@ -17,17 +17,31 @@ import {
 const SAVED_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "HOME"] as const;
 const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY"] as const;
 
-function expectFormerConsumptionThresholdsAreUnlimited(manager: SubagentManager): void {
+function expectDefaultTurnStagesAndUnlimitedUsageBudgets(manager: SubagentManager): void {
+	const turnLease = manager.createDelegationScope();
+	expect(turnLease.owned).toBe(true);
+	let turnDescendantAborted = false;
+	const turnReservation = turnLease.scope.reserve("turn-probe", 1);
+	turnReservation.commit("sa_iroh-turn-probe", () => {
+		turnDescendantAborted = true;
+	});
+	for (let turn = 1; turn < 80; turn += 1) {
+		expect(turnLease.scope.recordTurn()).toBeUndefined();
+	}
+	expect(turnLease.scope.recordTurn()).toMatchObject({ stage: "warning", turnsUsed: 80, maxTurns: 120 });
+	for (let turn = 81; turn < 120; turn += 1) {
+		expect(turnLease.scope.recordTurn()).toBeUndefined();
+	}
+	expect(turnLease.scope.recordTurn()).toMatchObject({ stage: "final-report", turnsUsed: 120, maxTurns: 120 });
+	expect(turnLease.scope.signal.aborted).toBe(false);
+	expect(turnDescendantAborted).toBe(false);
+	turnReservation.release();
+	turnLease.scope.dispose();
+
 	const cases: Array<{
 		name: string;
 		consume(scope: ReturnType<SubagentManager["createDelegationScope"]>["scope"]): void;
 	}> = [
-		{
-			name: "turns",
-			consume: (scope) => {
-				for (let index = 0; index <= 1_000; index += 1) scope.recordTurn();
-			},
-		},
 		{ name: "tokens", consume: (scope) => scope.recordUsage(50_000_001, 0) },
 		{ name: "cost", consume: (scope) => scope.recordUsage(0, 100.01) },
 	];
@@ -193,7 +207,7 @@ export default function (volt) {
 		}
 	});
 
-	it("keeps Iroh runtime subagent consumption budgets unlimited", async () => {
+	it("uses staged Iroh turn defaults while leaving token and cost budgets unlimited", async () => {
 		writeRuntimeConfig({});
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -206,7 +220,7 @@ export default function (volt) {
 				throw new Error("expected the Iroh runtime to create a SubagentManager");
 			}
 
-			expectFormerConsumptionThresholdsAreUnlimited(manager);
+			expectDefaultTurnStagesAndUnlimitedUsageBudgets(manager);
 		} finally {
 			errorSpy.mockRestore();
 			await runtime?.dispose();

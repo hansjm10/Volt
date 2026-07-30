@@ -128,8 +128,9 @@ export interface SubagentManagerOptions {
 	subagentContext?: SubagentRuntimeContext;
 	/**
 	 * Tree-wide limit overrides for scopes this manager creates. Structural
-	 * admission ceilings have finite defaults; consumption budgets abort only
-	 * when this option supplies finite values.
+	 * admission ceilings and staged turn limits have finite defaults. Token,
+	 * cost, and deadline budgets abort only when this option supplies finite
+	 * values.
 	 */
 	delegationLimits?: SubagentDelegationScopeLimits;
 	requestTimeoutMs?: number;
@@ -1360,9 +1361,57 @@ export class SubagentManager {
 			delegation.scopeLease.scope,
 		);
 		const runtime = await this.createChildRuntime({ cwd, agentDir, sessionManager, subagentContext });
-		const unsubscribeScopeAccounting = runtime.session.subscribe((event) => {
+		let requiresFinalTurnReport = false;
+		const originalBeforeToolCall = runtime.session.agent.beforeToolCall;
+		runtime.session.agent.beforeToolCall = async (context, signal) => {
+			if (requiresFinalTurnReport) {
+				return {
+					block: true,
+					reason:
+						"The shared subagent turn budget is exhausted. Do not use tools; return your best final report now.",
+				};
+			}
+			return originalBeforeToolCall?.(context, signal);
+		};
+		const unsubscribeSessionAccounting = runtime.session.subscribe((event) => {
 			if (event.type === "turn_end") {
-				delegation.scopeLease.scope.recordTurn();
+				const requestedTool =
+					event.message.role === "assistant" &&
+					event.message.content.some((content) => content.type === "toolCall");
+				if (requiresFinalTurnReport) {
+					if (requestedTool) {
+						this.markActivityAbortRequested(id);
+						delegation.scopeLease.scope.abort(
+							new Error(
+								`Subagent delegation tree ${delegation.scopeLease.scope.id} did not return a final report after reaching its ${delegation.scopeLease.scope.limits.maxTurns}-turn budget (maxTurns).`,
+							),
+						);
+					}
+					return;
+				}
+				const turnBudgetEvent = delegation.scopeLease.scope.recordTurn();
+				if (!requestedTool || !turnBudgetEvent) return;
+				if (turnBudgetEvent.stage === "warning") {
+					void runtime.session
+						.steer(
+							`The shared subagent tree has used ${turnBudgetEvent.turnsUsed} of its ${turnBudgetEvent.maxTurns} allowed turns. Stop broad exploration, finish the current line of inquiry, and begin synthesizing a report.`,
+						)
+						.catch(() => undefined);
+					return;
+				}
+				if (turnBudgetEvent.stage === "final-report") {
+					requiresFinalTurnReport = true;
+					void runtime.session
+						.steer(
+							`The shared subagent tree has reached its ${turnBudgetEvent.maxTurns}-turn limit. Do not call any more tools. Return your best final report now, including useful findings, evidence, and any unresolved gaps.`,
+						)
+						.catch((error: unknown) => {
+							this.markActivityAbortRequested(id);
+							delegation.scopeLease.scope.abort(
+								new Error(`Failed to request the subagent's final turn report: ${errorMessage(error)}`),
+							);
+						});
+				}
 				return;
 			}
 			if (event.type !== "message_end" || event.message.role !== "assistant") return;
@@ -1372,6 +1421,10 @@ export class SubagentManager {
 				usage.cost.total,
 			);
 		});
+		const unsubscribeScopeAccounting = (): void => {
+			unsubscribeSessionAccounting();
+			runtime.session.agent.beforeToolCall = originalBeforeToolCall;
+		};
 		let client: InProcessRpcClient | undefined;
 		let runtimeRegistration: SubagentRuntimeRegistration | undefined;
 		let rollbackRuntimeRegistrationPromise: Promise<void> | undefined;

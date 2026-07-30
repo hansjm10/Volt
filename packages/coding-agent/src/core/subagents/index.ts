@@ -504,6 +504,7 @@ export {
 	type SubagentDelegationScopeLimits,
 	type SubagentDelegationScopeOptions,
 	type SubagentDelegationScopeSnapshot,
+	type SubagentTurnBudgetEvent,
 } from "./delegation-scope.ts";
 export {
 	type SubagentActivity,

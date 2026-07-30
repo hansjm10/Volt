@@ -1001,12 +1001,13 @@ describe("SubagentManager", () => {
 		expect(scope.snapshot()).toMatchObject({ startsUsed: 4, activeDescendants: 0 });
 	});
 
-	it("keeps structural safeguards finite and consumption budgets unlimited by default", () => {
+	it("keeps structural and turn safeguards finite while other consumption budgets remain unlimited", () => {
 		expect(DEFAULT_SUBAGENT_DELEGATION_LIMITS).toEqual({
 			maxDepth: 5,
 			maxStarts: 100,
 			maxActiveDescendants: 16,
-			maxTurns: Number.POSITIVE_INFINITY,
+			warnAtTurns: 80,
+			maxTurns: 120,
 			maxTotalTokens: Number.POSITIVE_INFINITY,
 			maxTotalCostUsd: Number.POSITIVE_INFINITY,
 			maxDurationMs: Number.POSITIVE_INFINITY,
@@ -1059,7 +1060,7 @@ describe("SubagentManager", () => {
 		);
 
 		// Explicitly undefined overrides preserve each category's default rather
-		// than bypassing structural safeguards or adding a consumption budget.
+		// than bypassing structural or turn safeguards.
 		const undefinedOverrides = new SubagentDelegationScope({
 			limits: { maxTotalCostUsd: undefined, maxStarts: undefined },
 		});
@@ -1067,7 +1068,7 @@ describe("SubagentManager", () => {
 		expect(undefinedOverrides.limits).toEqual(DEFAULT_SUBAGENT_DELEGATION_LIMITS);
 	});
 
-	it("records large turn, token, and cost consumption without aborting a default scope", () => {
+	it("stages the default turn limit while leaving token and cost accounting unlimited", () => {
 		const scope = new SubagentDelegationScope();
 		cleanups.push(() => scope.dispose());
 		let abortCalls = 0;
@@ -1075,7 +1076,24 @@ describe("SubagentManager", () => {
 		reservation.commit("sa_default-budget", () => {
 			abortCalls += 1;
 		});
-		for (let index = 0; index < 5_000; index += 1) scope.recordTurn();
+		for (let turn = 1; turn < 80; turn += 1) {
+			expect(scope.recordTurn()).toBeUndefined();
+		}
+		expect(scope.recordTurn()).toEqual({
+			stage: "warning",
+			turnsUsed: 80,
+			warnAtTurns: 80,
+			maxTurns: 120,
+		});
+		for (let turn = 81; turn < 120; turn += 1) {
+			expect(scope.recordTurn()).toBeUndefined();
+		}
+		expect(scope.recordTurn()).toEqual({
+			stage: "final-report",
+			turnsUsed: 120,
+			warnAtTurns: 80,
+			maxTurns: 120,
+		});
 		scope.recordUsage(200_000_000, 1_000);
 
 		expect(scope.signal.aborted).toBe(false);
@@ -1085,14 +1103,120 @@ describe("SubagentManager", () => {
 			activeDescendants: 1,
 			peakActiveDescendants: 1,
 			maxDepthReached: 1,
-			turnsUsed: 5_000,
+			turnsUsed: 120,
 			tokensUsed: 200_000_000,
 			costUsd: 1_000,
 			aborted: false,
 		});
 
+		expect(scope.recordTurn()).toEqual({
+			stage: "exceeded",
+			turnsUsed: 121,
+			warnAtTurns: 80,
+			maxTurns: 120,
+		});
+		expect(scope.signal.aborted).toBe(true);
+		expect(abortCalls).toBe(1);
 		reservation.release();
 		expect(scope.snapshot()).toMatchObject({ startsUsed: 1, activeDescendants: 0 });
+	});
+
+	it("lets hosts explicitly opt out of both default turn stages", () => {
+		const scope = new SubagentDelegationScope({ limits: { maxTurns: Number.POSITIVE_INFINITY } });
+		cleanups.push(() => scope.dispose());
+
+		expect(scope.limits).toMatchObject({
+			warnAtTurns: Number.POSITIVE_INFINITY,
+			maxTurns: Number.POSITIVE_INFINITY,
+		});
+		for (let turn = 0; turn < 1_000; turn += 1) {
+			expect(scope.recordTurn()).toBeUndefined();
+		}
+		expect(scope.signal.aborted).toBe(false);
+	});
+
+	it("warns a working child and grants a tool-blocked final report turn at the limit", async () => {
+		let warningPromptSeen = false;
+		let finalReportPromptSeen = false;
+		const scope = new SubagentDelegationScope({ limits: { warnAtTurns: 1, maxTurns: 2 } });
+		cleanups.push(() => scope.dispose());
+		const resourceLoader = createSubagentResourceLoader([createDefinition({ name: "researcher" })]);
+		const { manager } = await createTestManager({
+			resourceLoader,
+			noTools: false,
+			responses: [
+				fauxAssistantMessage(fauxToolCall("subagent_registry", { list: true }), {
+					stopReason: "toolUse",
+				}),
+				(context) => {
+					warningPromptSeen = JSON.stringify(context.messages).includes(
+						"Stop broad exploration, finish the current line of inquiry",
+					);
+					return fauxAssistantMessage(fauxToolCall("subagent_registry", { list: true }), {
+						stopReason: "toolUse",
+					});
+				},
+				(context) => {
+					finalReportPromptSeen = JSON.stringify(context.messages).includes(
+						"Do not call any more tools. Return your best final report now",
+					);
+					return fauxAssistantMessage("Best available research report");
+				},
+			],
+		});
+
+		const handle = await manager.startByName("researcher", { delegationScope: scope });
+		const completion = handle.waitForEnd();
+		await handle.prompt("Research until the shared turn limit");
+		const result = await completion;
+
+		expect(warningPromptSeen).toBe(true);
+		expect(finalReportPromptSeen).toBe(true);
+		expect(result.event.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "Best available research report" }],
+		});
+		expect(scope.snapshot()).toMatchObject({
+			turnsUsed: 2,
+			activeDescendants: 0,
+			aborted: false,
+		});
+		expect(manager.listActivities()).toEqual([
+			expect.objectContaining({ id: handle.id, status: "completed", abortRequested: false }),
+		]);
+	});
+
+	it("blocks tools and aborts when the final report turn tries to continue working", async () => {
+		const scope = new SubagentDelegationScope({ limits: { warnAtTurns: 1, maxTurns: 2 } });
+		cleanups.push(() => scope.dispose());
+		const resourceLoader = createSubagentResourceLoader([createDefinition({ name: "researcher" })]);
+		const { manager } = await createTestManager({
+			resourceLoader,
+			noTools: false,
+			responses: [
+				fauxAssistantMessage(fauxToolCall("subagent_registry", { list: true }), {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage(fauxToolCall("subagent_registry", { list: true }), {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage(fauxToolCall("subagent_registry", { list: true }), {
+					stopReason: "toolUse",
+				}),
+			],
+		});
+
+		const handle = await manager.startByName("researcher", { delegationScope: scope });
+		const completion = handle.waitForEnd();
+		await handle.prompt("Keep researching past the shared turn limit");
+		await completion;
+
+		expect(scope.signal.aborted).toBe(true);
+		expect(String(scope.signal.reason)).toContain("did not return a final report");
+		expect(scope.snapshot()).toMatchObject({ turnsUsed: 2, activeDescendants: 0, aborted: true });
+		expect(manager.listActivities()).toEqual([
+			expect.objectContaining({ id: handle.id, status: "aborted", abortRequested: true }),
+		]);
 	});
 
 	it("applies finite manager consumption overrides with field-specific abort errors", async () => {

@@ -697,6 +697,7 @@ export {
 	type SubagentStartByNameOptions,
 	type SubagentStartOptions,
 	type SubagentTreeCapacitySnapshot,
+	type SubagentTurnBudgetEvent,
 } from "./core/subagents/index.ts";
 // Theme utilities for custom tools and extensions
 export {
