@@ -528,7 +528,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 	await sessionManager.flush();
 
-	const gitContextProvider = options.gitContextProvider ?? (await GitContextProvider.create(cwd));
+	const gitContextProvider = options.gitContextProvider ?? new GitContextProvider(cwd);
+	if (!options.gitContextProvider) void gitContextProvider.refresh();
 	const session = new AgentSession({
 		agent,
 		sessionManager,

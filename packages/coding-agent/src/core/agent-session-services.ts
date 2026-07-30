@@ -171,10 +171,13 @@ export async function createAgentSessionServices(
 		settingsManager,
 	});
 	await resourceLoader.reload(options.resourceLoaderReloadOptions);
-	const gitContextProvider = await GitContextProvider.create(cwd, {
+	// Fire-and-forget initial scan: session creation never waits for Git, and
+	// state reads serve null until the first scan lands.
+	const gitContextProvider = new GitContextProvider(cwd, {
 		workspaceName: options.workspaceName,
 		baseRef: options.baseRef,
 	});
+	void gitContextProvider.refresh();
 
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
 	const extensionsResult = resourceLoader.getExtensions();

@@ -1366,18 +1366,21 @@ export class SubagentManager {
 			delegation.scopeLease.scope,
 		);
 		const runtime = await this.createChildRuntime({ cwd, agentDir, sessionManager, subagentContext });
-		const unsubscribeScopeAccounting = runtime.session.subscribe((event) => {
-			if (event.type === "turn_end") {
-				delegation.scopeLease.scope.recordTurn();
-				return;
-			}
-			if (event.type !== "message_end" || event.message.role !== "assistant") return;
-			const usage = event.message.usage;
-			delegation.scopeLease.scope.recordUsage(
-				usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
-				usage.cost.total,
-			);
-		});
+		const unsubscribeScopeAccounting = runtime.session.subscribe(
+			(event) => {
+				if (event.type === "turn_end") {
+					delegation.scopeLease.scope.recordTurn();
+					return;
+				}
+				if (event.type !== "message_end" || event.message.role !== "assistant") return;
+				const usage = event.message.usage;
+				delegation.scopeLease.scope.recordUsage(
+					usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+					usage.cost.total,
+				);
+			},
+			{ monitorGitContext: false },
+		);
 		let client: InProcessRpcClient | undefined;
 		let runtimeRegistration: SubagentRuntimeRegistration | undefined;
 		let rollbackRuntimeRegistrationPromise: Promise<void> | undefined;

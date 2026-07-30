@@ -113,47 +113,51 @@ function checkedOid(value: string): string {
 	return value;
 }
 
-/** Parse one complete `git status --porcelain=v2 --branch -z` result without retaining paths. */
-export function parseGitStatusPorcelainV2(output: Buffer | string): ParsedGitStatus {
-	const records = (typeof output === "string" ? output : output.toString("utf8")).split("\0");
-	let oid: string | null = null;
-	let unborn = false;
-	let branchName: string | null = null;
-	let upstreamRef: string | null = null;
-	let ahead = 0;
-	let behind = 0;
-	const staged = emptyChangeCounts();
-	const unstaged = emptyChangeCounts();
-	let untracked = 0;
-	let conflicted = 0;
-	let total = 0;
+/** Incremental `git status --porcelain=v2 --branch -z` record consumer that never retains paths. */
+export class GitStatusParser {
+	private oid: string | null = null;
+	private unborn = false;
+	private branchName: string | null = null;
+	private upstreamRef: string | null = null;
+	private ahead = 0;
+	private behind = 0;
+	private readonly staged = emptyChangeCounts();
+	private readonly unstaged = emptyChangeCounts();
+	private untracked = 0;
+	private conflicted = 0;
+	private total = 0;
+	private expectRenameSource = false;
 
-	for (let index = 0; index < records.length; index++) {
-		const record = records[index];
-		if (!record) continue;
+	addRecord(record: string): void {
+		if (this.expectRenameSource) {
+			if (!record) throw new GitCommandError("Rename status record omitted its source path");
+			this.expectRenameSource = false;
+			return;
+		}
+		if (!record) return;
 		if (record.startsWith("# branch.oid ")) {
 			const value = record.slice("# branch.oid ".length);
-			if (value === "(initial)") unborn = true;
-			else oid = checkedOid(value);
-			continue;
+			if (value === "(initial)") this.unborn = true;
+			else this.oid = checkedOid(value);
+			return;
 		}
 		if (record.startsWith("# branch.head ")) {
-			branchName = checkedRef(record.slice("# branch.head ".length), "branch name");
-			continue;
+			this.branchName = checkedRef(record.slice("# branch.head ".length), "branch name");
+			return;
 		}
 		if (record.startsWith("# branch.upstream ")) {
-			upstreamRef = checkedRef(record.slice("# branch.upstream ".length), "upstream ref");
-			continue;
+			this.upstreamRef = checkedRef(record.slice("# branch.upstream ".length), "upstream ref");
+			return;
 		}
 		if (record.startsWith("# branch.ab ")) {
 			const match = /^# branch\.ab \+(\d+) -(\d+)$/.exec(record);
 			if (!match) throw new GitCommandError("Invalid upstream comparison in Git status output");
-			ahead = Number(match[1]);
-			behind = Number(match[2]);
-			if (!Number.isSafeInteger(ahead) || !Number.isSafeInteger(behind)) {
+			this.ahead = Number(match[1]);
+			this.behind = Number(match[2]);
+			if (!Number.isSafeInteger(this.ahead) || !Number.isSafeInteger(this.behind)) {
 				throw new GitCommandError("Upstream comparison exceeds the safe integer range");
 			}
-			continue;
+			return;
 		}
 
 		if (record.startsWith("1 ") || record.startsWith("2 ")) {
@@ -162,53 +166,64 @@ export function parseGitStatusPorcelainV2(output: Buffer | string): ParsedGitSta
 			if (!x || !y || !".MADRCUT".includes(x) || !".MADRCUT".includes(y)) {
 				throw new GitCommandError("Invalid ordinary status record");
 			}
-			incrementChangeCount(staged, x);
-			incrementChangeCount(unstaged, y);
-			total++;
-			if (record.startsWith("2 ")) {
-				if (!records[index + 1]) throw new GitCommandError("Rename status record omitted its source path");
-				index++;
-			}
-			continue;
+			incrementChangeCount(this.staged, x);
+			incrementChangeCount(this.unstaged, y);
+			this.total++;
+			if (record.startsWith("2 ")) this.expectRenameSource = true;
+			return;
 		}
 		if (record.startsWith("u ")) {
-			conflicted++;
-			total++;
-			continue;
+			this.conflicted++;
+			this.total++;
+			return;
 		}
 		if (record.startsWith("? ")) {
-			untracked++;
-			total++;
-			continue;
+			this.untracked++;
+			this.total++;
+			return;
 		}
-		if (record.startsWith("! ") || record.startsWith("# ")) continue;
+		if (record.startsWith("! ") || record.startsWith("# ")) return;
 		throw new GitCommandError("Unknown record in Git status output");
 	}
 
-	if (!branchName) throw new GitCommandError("Git status output omitted branch.head");
-	let head: GitHead;
-	if (unborn) {
-		if (branchName === "(detached)") throw new GitCommandError("Invalid detached unborn HEAD");
-		head = { kind: "unborn", name: branchName };
-	} else if (branchName === "(detached)") {
-		head = { kind: "detached", oid: checkedOid(oid ?? "") };
-	} else {
-		head = { kind: "branch", name: branchName, oid: checkedOid(oid ?? "") };
-	}
+	finish(): ParsedGitStatus {
+		if (this.expectRenameSource) throw new GitCommandError("Rename status record omitted its source path");
+		if (!this.branchName) throw new GitCommandError("Git status output omitted branch.head");
+		let head: GitHead;
+		if (this.unborn) {
+			if (this.branchName === "(detached)") throw new GitCommandError("Invalid detached unborn HEAD");
+			head = { kind: "unborn", name: this.branchName };
+		} else if (this.branchName === "(detached)") {
+			head = { kind: "detached", oid: checkedOid(this.oid ?? "") };
+		} else {
+			head = { kind: "branch", name: this.branchName, oid: checkedOid(this.oid ?? "") };
+		}
 
-	const status: GitStatusCounts = {
-		staged,
-		unstaged,
-		untracked,
-		conflicted,
-		total,
-		clean: total === 0,
-	};
-	return Object.freeze({
-		head: Object.freeze(head),
-		upstream: upstreamRef ? Object.freeze({ ref: upstreamRef, ahead, behind }) : null,
-		status: freezeStatus(status),
-	});
+		const status: GitStatusCounts = {
+			staged: this.staged,
+			unstaged: this.unstaged,
+			untracked: this.untracked,
+			conflicted: this.conflicted,
+			total: this.total,
+			clean: this.total === 0,
+		};
+		return Object.freeze({
+			head: Object.freeze(head),
+			upstream: this.upstreamRef
+				? Object.freeze({ ref: this.upstreamRef, ahead: this.ahead, behind: this.behind })
+				: null,
+			status: freezeStatus(status),
+		});
+	}
+}
+
+/** Parse one complete `git status --porcelain=v2 --branch -z` result without retaining paths. */
+export function parseGitStatusPorcelainV2(output: Buffer | string): ParsedGitStatus {
+	const parser = new GitStatusParser();
+	for (const record of (typeof output === "string" ? output : output.toString("utf8")).split("\0")) {
+		parser.addRecord(record);
+	}
+	return parser.finish();
 }
 
 function freezeStatus(status: GitStatusCounts): GitStatusCounts {
@@ -293,6 +308,12 @@ interface RunGitOptions {
 	readonly maxStderrBytes: number;
 	readonly signal?: AbortSignal;
 	readonly children: Set<ChildProcess>;
+	/**
+	 * Consume NUL-delimited stdout records as they stream instead of buffering
+	 * stdout, so total output size is unbounded while `maxStdoutBytes` bounds
+	 * only one pending record. A thrown GitCommandError terminates the command.
+	 */
+	readonly onStdoutRecord?: (record: string) => void;
 }
 
 function runGit(args: readonly string[], options: RunGitOptions): Promise<Buffer> {
@@ -329,7 +350,31 @@ function runGit(args: readonly string[], options: RunGitOptions): Promise<Buffer
 		const onAbort = (): void => terminate(new GitCommandError("Git command cancelled", "cancelled"));
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 
+		const onStdoutRecord = options.onStdoutRecord;
+		let pendingRecord: Buffer = Buffer.alloc(0);
+		const consumeRecords = (chunk: Buffer): void => {
+			const buffer = pendingRecord.length === 0 ? chunk : Buffer.concat([pendingRecord, chunk]);
+			let start = 0;
+			try {
+				for (let index = buffer.indexOf(0, start); index !== -1; index = buffer.indexOf(0, start)) {
+					onStdoutRecord?.(buffer.subarray(start, index).toString("utf8"));
+					start = index + 1;
+				}
+			} catch (error) {
+				terminate(error instanceof GitCommandError ? error : new GitCommandError("Invalid Git command output"));
+				return;
+			}
+			pendingRecord = buffer.subarray(start);
+			if (pendingRecord.length > options.maxStdoutBytes) {
+				terminate(new GitCommandError("Git command output exceeded its bound", "output"));
+			}
+		};
 		child.stdout?.on("data", (chunk: Buffer) => {
+			if (terminalError) return;
+			if (onStdoutRecord) {
+				consumeRecords(chunk);
+				return;
+			}
 			stdoutBytes += chunk.length;
 			if (stdoutBytes > options.maxStdoutBytes) {
 				terminate(new GitCommandError("Git command output exceeded its bound", "output"));
@@ -355,6 +400,14 @@ function runGit(args: readonly string[], options: RunGitOptions): Promise<Buffer
 			if (code !== 0) {
 				reject(new GitCommandError("Git command failed", "exit"));
 				return;
+			}
+			if (onStdoutRecord && pendingRecord.length > 0) {
+				try {
+					onStdoutRecord(pendingRecord.toString("utf8"));
+				} catch (error) {
+					reject(error instanceof GitCommandError ? error : new GitCommandError("Invalid Git command output"));
+					return;
+				}
 			}
 			resolve(Buffer.concat(stdout, stdoutBytes));
 		});
@@ -396,6 +449,7 @@ export class GitContextProvider {
 	private revision = 0;
 	private pollDelayMs: number;
 	private observationCount = 0;
+	private rerunRequested = false;
 	private disposed = false;
 
 	constructor(cwd: string, options: GitContextProviderOptions = {}) {
@@ -445,12 +499,23 @@ export class GitContextProvider {
 		};
 	}
 
+	/**
+	 * Scan now, or join the scan already in flight. A join also schedules one
+	 * follow-up scan, so a change landing mid-scan is never silently dropped.
+	 */
 	refresh(signal?: AbortSignal): Promise<RpcGitContext | null> {
 		if (this.disposed) return Promise.resolve(this.cachedSnapshot);
-		if (this.refreshPromise) return this.refreshPromise;
+		if (this.refreshPromise) {
+			this.rerunRequested = true;
+			return this.refreshPromise;
+		}
 		const refresh = this.performRefresh(signal);
 		const wrapped = refresh.finally(() => {
 			if (this.refreshPromise === wrapped) this.refreshPromise = null;
+			if (this.rerunRequested) {
+				this.rerunRequested = false;
+				if (!this.disposed) this.scheduleRefresh(0);
+			}
 		});
 		this.refreshPromise = wrapped;
 		return wrapped;
@@ -491,16 +556,17 @@ export class GitContextProvider {
 				return this.cachedSnapshot;
 			}
 
-			const parsed = parseGitStatusPorcelainV2(
-				await runGit(STATUS_ARGS, {
-					cwd: location.worktreeRoot,
-					timeoutMs: this.options.commandTimeoutMs,
-					maxStdoutBytes: this.options.maxStdoutBytes,
-					maxStderrBytes: this.options.maxStderrBytes,
-					signal,
-					children: this.children,
-				}),
-			);
+			const statusParser = new GitStatusParser();
+			await runGit(STATUS_ARGS, {
+				cwd: location.worktreeRoot,
+				timeoutMs: this.options.commandTimeoutMs,
+				maxStdoutBytes: this.options.maxStdoutBytes,
+				maxStderrBytes: this.options.maxStderrBytes,
+				signal,
+				children: this.children,
+				onStdoutRecord: (record) => statusParser.addRecord(record),
+			});
+			const parsed = statusParser.finish();
 			const base = await this.readBaseComparison(location, parsed.head, signal);
 			const content: SnapshotContent = {
 				repository: getGitRepositoryDisplayName(location, this.options.workspaceName).slice(
@@ -517,7 +583,7 @@ export class GitContextProvider {
 			this.pollDelayMs = this.options.pollIntervalMs;
 		} catch (error) {
 			if (this.disposed) return this.cachedSnapshot;
-			if (error instanceof GitCommandError && error.kind === "timeout") {
+			if (!(error instanceof GitCommandError && error.kind === "cancelled")) {
 				this.pollDelayMs = Math.min(
 					Math.max(this.pollDelayMs * 2, this.options.pollIntervalMs),
 					MAX_POLL_INTERVAL_MS,

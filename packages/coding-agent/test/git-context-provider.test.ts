@@ -304,6 +304,7 @@ describe("GitContextProvider", () => {
 			stale: true,
 			revision: 2,
 		});
+		expect((provider as unknown as { pollDelayMs: number }).pollDelayMs).toBeGreaterThan(30_000);
 		process.env.PATH = originalPath;
 		await provider.refresh();
 		expect(provider.getSnapshot()).toMatchObject({ stale: false, revision: 3 });
@@ -318,9 +319,39 @@ describe("GitContextProvider", () => {
 		expect(provider.getSnapshot()).toBeNull();
 		provider.dispose();
 
-		installFakeGit("head -c 2048 /dev/zero");
+		installFakeGit("head -c 2048 /dev/zero | tr '\\0' 'a'");
 		provider = await GitContextProvider.create(repository, { maxStdoutBytes: 64 });
 		expect(provider.getSnapshot()).toBeNull();
+		provider.dispose();
+	});
+
+	it("streams large untracked listings past the per-record output bound", async () => {
+		const repository = initRepository("untracked-flood");
+		commitFile(repository, "tracked.txt", "base\n");
+		for (let index = 0; index < 120; index++) {
+			writeFileSync(join(repository, `untracked-${index}.txt`), "x\n");
+		}
+		const provider = await GitContextProvider.create(repository, { maxStdoutBytes: 256 });
+		expect(provider.getSnapshot()).toMatchObject({
+			stale: false,
+			status: { untracked: 120, total: 120, clean: false },
+		});
+		provider.dispose();
+	});
+
+	it("schedules a follow-up scan when a refresh arrives mid-scan", async () => {
+		const repository = createSyntheticWorktree("rerun-repository");
+		const countFile = join(tempDirectory("git-rerun-count"), "calls");
+		installFakeGit(
+			`echo call >> ${JSON.stringify(countFile)}\nsleep 0.05\nprintf '# branch.oid ${SHA1}\\0# branch.head main\\0'`,
+		);
+		const provider = new GitContextProvider(repository);
+		const first = provider.refresh();
+		expect(provider.refresh()).toBe(first);
+		await first;
+		expect(gitCallCount(countFile)).toBe(1);
+		// The joined refresh reruns even with no observers keeping a poll alive.
+		await waitFor(() => gitCallCount(countFile) >= 2);
 		provider.dispose();
 	});
 
