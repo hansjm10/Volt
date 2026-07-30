@@ -647,6 +647,7 @@ describe("Iroh remote notification requests", () => {
 			autoCompactionEnabled: false,
 			bindExtensions: vi.fn(async () => {}),
 			followUpMode: "all" as const,
+			gitContextProvider: { getSnapshot: () => null },
 			isCompacting: false,
 			isStreaming: false,
 			messages: [],

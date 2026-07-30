@@ -72,6 +72,7 @@ function createState(sessionId: string): RpcSessionState {
 		availableThinkingLevels: ["off"],
 		fastModeEnabled: false,
 		planning: { mode: "build", plan: null },
+		gitContext: null,
 		isStreaming: false,
 		isCompacting: false,
 		steeringMode: "one-at-a-time",

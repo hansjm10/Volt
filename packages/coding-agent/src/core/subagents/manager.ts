@@ -119,6 +119,8 @@ export interface SubagentManagerOptions {
 	createRuntime: CreateAgentSessionRuntimeFactory;
 	cwd: string;
 	agentDir: string;
+	workspaceName?: string;
+	baseRef?: string;
 	resourceLoader?: ResourceLoader;
 	/** Parent session used to create durable child sessions when start options do not supply one. */
 	parentSessionManager?: SessionManager;
@@ -759,6 +761,8 @@ export class SubagentManager {
 	private readonly createRuntime: CreateAgentSessionRuntimeFactory;
 	private readonly cwd: string;
 	private readonly agentDir: string;
+	private readonly workspaceName?: string;
+	private readonly baseRef?: string;
 	private readonly resourceLoader?: ResourceLoader;
 	private readonly parentSessionManager?: SessionManager;
 	private hydrationPromise: Promise<void> | undefined;
@@ -786,6 +790,8 @@ export class SubagentManager {
 		this.createRuntime = options.createRuntime;
 		this.cwd = options.cwd;
 		this.agentDir = options.agentDir;
+		this.workspaceName = options.workspaceName;
+		this.baseRef = options.baseRef;
 		this.resourceLoader = options.resourceLoader;
 		this.parentSessionManager = options.parentSessionManager;
 		this.allowedTools = normalizeUniqueNames(options.allowedTools);
@@ -1360,18 +1366,21 @@ export class SubagentManager {
 			delegation.scopeLease.scope,
 		);
 		const runtime = await this.createChildRuntime({ cwd, agentDir, sessionManager, subagentContext });
-		const unsubscribeScopeAccounting = runtime.session.subscribe((event) => {
-			if (event.type === "turn_end") {
-				delegation.scopeLease.scope.recordTurn();
-				return;
-			}
-			if (event.type !== "message_end" || event.message.role !== "assistant") return;
-			const usage = event.message.usage;
-			delegation.scopeLease.scope.recordUsage(
-				usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
-				usage.cost.total,
-			);
-		});
+		const unsubscribeScopeAccounting = runtime.session.subscribe(
+			(event) => {
+				if (event.type === "turn_end") {
+					delegation.scopeLease.scope.recordTurn();
+					return;
+				}
+				if (event.type !== "message_end" || event.message.role !== "assistant") return;
+				const usage = event.message.usage;
+				delegation.scopeLease.scope.recordUsage(
+					usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+					usage.cost.total,
+				);
+			},
+			{ monitorGitContext: false },
+		);
 		let client: InProcessRpcClient | undefined;
 		let runtimeRegistration: SubagentRuntimeRegistration | undefined;
 		let rollbackRuntimeRegistrationPromise: Promise<void> | undefined;
@@ -1906,6 +1915,8 @@ export class SubagentManager {
 			cwd: options.cwd,
 			agentDir: options.agentDir,
 			sessionManager: options.sessionManager,
+			workspaceName: this.workspaceName,
+			baseRef: this.baseRef,
 			...(options.subagentContext ? { subagentContext: options.subagentContext } : {}),
 		});
 	}

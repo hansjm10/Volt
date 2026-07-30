@@ -19,6 +19,13 @@
 			"imagesMaxUtf8Bytes": 1572864,
 			"maxSerializedBytes": 2097152
 		},
+		"gitContext": {
+			"repositoryMaxChars": 256,
+			"refMaxChars": 1024,
+			"oidMaxChars": 64,
+			"oidPattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+			"observedAtMaxChars": 32
+		},
 		"sessionState": {
 			"maxSerializedBytes": 786432,
 			"modelMaxSerializedBytes": 32768,
@@ -3978,6 +3985,276 @@
 					"additionalProperties": false
 				}
 			]
+		},
+		"RpcGitChangeCounts": {
+			"type": "object",
+			"required": [
+				"added",
+				"modified",
+				"deleted",
+				"renamed"
+			],
+			"properties": {
+				"added": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				},
+				"modified": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				},
+				"deleted": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				},
+				"renamed": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcGitComparison": {
+			"type": "object",
+			"required": [
+				"ref",
+				"ahead",
+				"behind"
+			],
+			"properties": {
+				"ref": {
+					"$ref": "#/$defs/RpcGitRef"
+				},
+				"ahead": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				},
+				"behind": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcGitContext": {
+			"type": "object",
+			"required": [
+				"repository",
+				"head",
+				"upstream",
+				"base",
+				"status",
+				"operation",
+				"revision",
+				"observedAt",
+				"stale"
+			],
+			"properties": {
+				"repository": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 256
+				},
+				"head": {
+					"$ref": "#/$defs/RpcGitHead"
+				},
+				"upstream": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/RpcGitComparison"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"base": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/RpcGitComparison"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"status": {
+					"$ref": "#/$defs/RpcGitStatusCounts"
+				},
+				"operation": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/RpcGitOperation"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"revision": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 9007199254740991
+				},
+				"observedAt": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 32
+				},
+				"stale": {
+					"type": "boolean"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcGitContextChangedEvent": {
+			"type": "object",
+			"required": [
+				"type",
+				"gitContext"
+			],
+			"properties": {
+				"type": {
+					"type": "string",
+					"const": "git_context_changed"
+				},
+				"gitContext": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/RpcGitContext"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"delivery": {
+					"$ref": "#/$defs/RpcConversationDeliveryPosition"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcGitHead": {
+			"anyOf": [
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"name",
+						"oid"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "branch"
+						},
+						"name": {
+							"$ref": "#/$defs/RpcGitRef"
+						},
+						"oid": {
+							"$ref": "#/$defs/RpcGitObjectId"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"oid"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "detached"
+						},
+						"oid": {
+							"$ref": "#/$defs/RpcGitObjectId"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"name"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "unborn"
+						},
+						"name": {
+							"$ref": "#/$defs/RpcGitRef"
+						}
+					},
+					"additionalProperties": false
+				}
+			]
+		},
+		"RpcGitObjectId": {
+			"type": "string",
+			"minLength": 40,
+			"maxLength": 64,
+			"pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+		},
+		"RpcGitOperation": {
+			"type": "object",
+			"required": [
+				"kind"
+			],
+			"properties": {
+				"kind": {
+					"type": "string",
+					"enum": [
+						"merge",
+						"rebase",
+						"cherry_pick",
+						"revert",
+						"bisect",
+						"sequencer"
+					]
+				},
+				"step": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				},
+				"total": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcGitRef": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 1024
+		},
+		"RpcGitStatusCounts": {
+			"type": "object",
+			"required": [
+				"staged",
+				"unstaged",
+				"untracked",
+				"conflicted",
+				"total",
+				"clean"
+			],
+			"properties": {
+				"staged": {
+					"$ref": "#/$defs/RpcGitChangeCounts"
+				},
+				"unstaged": {
+					"$ref": "#/$defs/RpcGitChangeCounts"
+				},
+				"untracked": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				},
+				"conflicted": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				},
+				"total": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				},
+				"clean": {
+					"type": "boolean"
+				}
+			},
+			"additionalProperties": false
 		},
 		"RpcHostActionMetadataValue": {
 			"anyOf": [
@@ -9099,6 +9376,9 @@
 					"$ref": "#/$defs/RpcModelsChangedEvent"
 				},
 				{
+					"$ref": "#/$defs/RpcGitContextChangedEvent"
+				},
+				{
 					"$ref": "#/$defs/RpcUiActionStateChangedEvent"
 				},
 				{
@@ -9152,6 +9432,7 @@
 				"availableThinkingLevels",
 				"fastModeEnabled",
 				"planning",
+				"gitContext",
 				"isStreaming",
 				"isCompacting",
 				"steeringMode",
@@ -9181,6 +9462,16 @@
 				},
 				"planning": {
 					"$ref": "#/$defs/RpcPlanningState"
+				},
+				"gitContext": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/RpcGitContext"
+						},
+						{
+							"type": "null"
+						}
+					]
 				},
 				"isStreaming": {
 					"type": "boolean"

@@ -56,6 +56,7 @@ describe("worktree runtime plumbing (createRuntime seam)", () => {
 			workspaceName: "ws",
 			path: worktreePath,
 			branch: "volt/fix-login",
+			baseRef: "origin/main",
 			createdAt: 1,
 			sessionIds: [],
 		};
@@ -166,6 +167,8 @@ describe("worktree runtime plumbing (createRuntime seam)", () => {
 			conversationTarget: { target: "new" },
 			cwd: worktreePath,
 			projectCwd: worktreePath,
+			workspaceName: "ws",
+			baseRef: "origin/main",
 			sessionDir: getDefaultSessionDir(workspacePath, agentDir),
 			projectTrusted: true, // evaluated against the PARENT path
 			profile: undefined,

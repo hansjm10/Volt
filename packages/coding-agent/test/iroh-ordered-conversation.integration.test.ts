@@ -96,6 +96,7 @@ function createSnapshotBuilder(manager: SessionManager, sessionId: string): Conv
 				availableThinkingLevels: ["off"],
 				fastModeEnabled: false,
 				planning: { mode: "build", plan: null },
+				gitContext: null,
 				isStreaming: activeAssistant !== null,
 				isBusy: activeAssistant !== null,
 				isCompacting: false,
@@ -146,6 +147,10 @@ async function createFixture(
 		...createIrohTestSession(sessionId, null),
 		sessionFile: manager.getSessionFile(),
 		sessionManager: manager,
+		gitContextProvider: {
+			getSnapshot: () => null,
+			retainObservation: () => () => undefined,
+		},
 		subscribe: vi.fn((listener: (event: object) => void) => {
 			listeners.add(listener);
 			return () => listeners.delete(listener);

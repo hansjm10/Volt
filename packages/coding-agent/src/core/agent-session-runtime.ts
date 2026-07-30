@@ -161,6 +161,8 @@ export type CreateAgentSessionRuntimeFactory = (options: {
 	projectTrustContext?: ProjectTrustContext;
 	profile?: string;
 	subagentContext?: SubagentRuntimeContext;
+	workspaceName?: string;
+	baseRef?: string;
 }) => Promise<CreateAgentSessionRuntimeResult>;
 
 /**
@@ -617,6 +619,14 @@ export class AgentSessionRuntime {
 		return this.services.settingsManager.getRequestedProfile();
 	}
 
+	private getReplacementGitContextOptions(cwd: string): { workspaceName?: string; baseRef?: string } {
+		if (resolvePath(cwd) !== resolvePath(this.cwd)) return {};
+		return {
+			workspaceName: this.services.workspaceName,
+			baseRef: this.services.baseRef,
+		};
+	}
+
 	private async emitBeforeSwitch(
 		reason: "new" | "resume",
 		targetSessionFile?: string,
@@ -814,7 +824,10 @@ export class AgentSessionRuntime {
 		};
 		return {
 			subscribe: (listener) =>
-				typeof sessionLike.subscribe === "function" ? sessionLike.subscribe((event) => listener(event)) : () => {},
+				typeof sessionLike.subscribe === "function"
+					? sessionLike.subscribe((event) => listener(event), { monitorGitContext: false })
+					: () => {},
+			retainObservation: () => session.gitContextProvider.retainObservation(),
 			subscribeGenerationChanges: (listener) =>
 				typeof sessionLike.subscribeConversationGenerationChanges === "function"
 					? sessionLike.subscribeConversationGenerationChanges(() => listener())
@@ -1006,6 +1019,7 @@ export class AgentSessionRuntime {
 					cwd: sessionManager.getCwd(),
 					agentDir: this.services.agentDir,
 					sessionManager,
+					...this.getReplacementGitContextOptions(sessionManager.getCwd()),
 					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
 					projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
 					profile: this.getReplacementProfile(),
@@ -1022,6 +1036,10 @@ export class AgentSessionRuntime {
 		cwd?: string;
 		/** Override the session dir (e.g. the parent workspace's default dir for worktree sessions). */
 		sessionDir?: string;
+		/** Host-owned workspace display name for the replacement Git context. */
+		workspaceName?: string;
+		/** Trusted managed-worktree base ref for the replacement Git context. */
+		baseRef?: string;
 		setup?: (sessionManager: SessionManager) => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 		/** Internal remote mutation lease revalidated at every awaited replacement boundary. */
@@ -1189,6 +1207,8 @@ export class AgentSessionRuntime {
 					parentSession?: string;
 					cwd?: string;
 					sessionDir?: string;
+					workspaceName?: string;
+					baseRef?: string;
 					setup?: (sessionManager: SessionManager) => Promise<void>;
 					withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 					assertConversationGenerationCurrent?: () => void;
@@ -1226,6 +1246,9 @@ export class AgentSessionRuntime {
 					cwd,
 					agentDir: this.services.agentDir,
 					sessionManager,
+					...this.getReplacementGitContextOptions(cwd),
+					...(options?.workspaceName === undefined ? {} : { workspaceName: options.workspaceName }),
+					...(options?.baseRef === undefined ? {} : { baseRef: options.baseRef }),
 					sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
 					profile: this.getReplacementProfile(),
 					subagentContext: this.subagentContext,
@@ -1292,6 +1315,7 @@ export class AgentSessionRuntime {
 							cwd: this.cwd,
 							agentDir: this.services.agentDir,
 							sessionManager,
+							...this.getReplacementGitContextOptions(this.cwd),
 							sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 							profile: this.getReplacementProfile(),
 							subagentContext: this.subagentContext,
@@ -1318,6 +1342,7 @@ export class AgentSessionRuntime {
 						cwd: sessionManager.getCwd(),
 						agentDir: this.services.agentDir,
 						sessionManager,
+						...this.getReplacementGitContextOptions(sessionManager.getCwd()),
 						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 						profile: this.getReplacementProfile(),
 						subagentContext: this.subagentContext,
@@ -1343,6 +1368,7 @@ export class AgentSessionRuntime {
 					cwd: this.cwd,
 					agentDir: this.services.agentDir,
 					sessionManager,
+					...this.getReplacementGitContextOptions(this.cwd),
 					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 					profile: this.getReplacementProfile(),
 					subagentContext: this.subagentContext,
@@ -1404,6 +1430,7 @@ export class AgentSessionRuntime {
 					cwd: sessionManager.getCwd(),
 					agentDir: this.services.agentDir,
 					sessionManager,
+					...this.getReplacementGitContextOptions(sessionManager.getCwd()),
 					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
 					profile: this.getReplacementProfile(),
 					subagentContext: this.subagentContext,
@@ -1477,6 +1504,8 @@ export async function createAgentSessionRuntime(
 		sessionStartEvent?: SessionStartEvent;
 		profile?: string;
 		subagentContext?: SubagentRuntimeContext;
+		workspaceName?: string;
+		baseRef?: string;
 	},
 ): Promise<AgentSessionRuntime> {
 	assertSessionCwdExists(options.sessionManager, options.cwd);
