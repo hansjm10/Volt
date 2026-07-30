@@ -2,6 +2,8 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-feature(subagents): Subagents can now discover every delegated run in the session and reuse results through bounded, paginated registry list mode and follow mode instead of starting a duplicate.
+feature(subagents): [Subagents can now discover and follow runs across the session tree](https://volt-cli.dev/docs/usage/#subagents-mvp), with bounded pagination and confirmation before duplicate work starts.
 
-Child runtimes expose registry access through `subagent_registry`, while root sessions retain list/follow compatibility on `subagent`. Children with registry access also start with a bounded snapshot of already-recorded runs in their context. Follow waits on running runs are deadlock-checked and rejected when they could never resolve.
+Spawn preflights show the live registry and require an exact one-time confirmation before starting agents. Admission is atomic, confirmation tokens remain available under small output limits, and mismatched tokens rotate without locking out the request. ([#146](https://github.com/volt-hq/Volt/issues/146))
+
+Child runtimes use `subagent_registry`, while root sessions retain list and follow compatibility on `subagent`. Registry access remains available when policy prevents further spawning and is advertised only when supported. Pages use stable newest-first cursors, current, ancestor, and dependency-cycle runs are non-followable, and followed output is marked as untrusted data. Explicit registry calls and failures remain visible in the TUI, while successful spawn preflights stay hidden.

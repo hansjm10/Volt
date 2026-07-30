@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(subagents): Hid subagent presentation until a child agent is actually created.
+fix(subagents): Delegation UI now stays hidden until a child agent is created, including for nested preflights.

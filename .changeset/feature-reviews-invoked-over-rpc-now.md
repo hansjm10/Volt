@@ -2,4 +2,6 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-feature(remote): Reviews invoked over RPC now run detached: invoke_ui_action returns immediately with a workflowId, other commands keep working while the review runs, progress streams as workflow events, and findings are fetched (get_review_result), listed (list_review_workflows), cancelled (cancel_workflow), or opened in a fresh session (open_review_session) on demand instead of force-switching the client's session. ([#66](https://github.com/volt-hq/Volt/issues/66))
+feature(review): [Remote clients can now run detached reviews](https://volt-cli.dev/docs/rpc/#detached-review-workflows) of uncommitted changes, branches, commits, and pull requests while the conversation remains available. ([#66](https://github.com/volt-hq/Volt/issues/66), [#80](https://github.com/volt-hq/Volt/issues/80))
+
+Accepted invocations return a workflow ID immediately and stream sanitized progress events. Clients can fetch findings, list or cancel workflows, and open completed findings in a fresh session on demand.
