@@ -5,7 +5,7 @@ import { fauxAssistantMessage, registerFauxProvider } from "@hansjm10/volt-ai";
 import { expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { restoreStdout } from "../src/core/output-guard.ts";
-import { SubagentManager } from "../src/core/subagents/index.ts";
+import { DEFAULT_SUBAGENT_TURN_LIMITS, SubagentManager } from "../src/core/subagents/index.ts";
 import { main } from "../src/main.ts";
 
 const ENV_KEYS = [
@@ -16,7 +16,12 @@ const ENV_KEYS = [
 	"VOLT_SKIP_VERSION_CHECK",
 ] as const;
 
-function expectFormerConsumptionThresholdsAreUnlimited(manager: SubagentManager): void {
+function expectDefaultPerRuntimeTurnStagesAndUnlimitedAggregateBudgets(manager: SubagentManager): void {
+	const configuredScope = manager.createDelegationScope();
+	expect(configuredScope.owned).toBe(true);
+	expect(configuredScope.scope.turnLimits).toEqual(DEFAULT_SUBAGENT_TURN_LIMITS);
+	configuredScope.scope.dispose();
+
 	const cases: Array<{
 		name: string;
 		consume(scope: ReturnType<SubagentManager["createDelegationScope"]>["scope"]): void;
@@ -24,7 +29,7 @@ function expectFormerConsumptionThresholdsAreUnlimited(manager: SubagentManager)
 		{
 			name: "turns",
 			consume: (scope) => {
-				for (let index = 0; index <= 1_000; index += 1) scope.recordTurn();
+				for (let turn = 0; turn < 1_000; turn += 1) scope.recordTurn();
 			},
 		},
 		{ name: "tokens", consume: (scope) => scope.recordUsage(50_000_001, 0) },
@@ -49,7 +54,7 @@ function expectFormerConsumptionThresholdsAreUnlimited(manager: SubagentManager)
 	}
 }
 
-it("keeps CLI-created print-mode subagent consumption budgets unlimited", async () => {
+it("uses per-runtime CLI turn defaults while leaving aggregate consumption budgets unlimited", async () => {
 	const tempDir = mkdtempSync(join(tmpdir(), "volt-cli-subagent-defaults-"));
 	const workspace = join(tempDir, "workspace");
 	const agentDir = join(tempDir, "agent");
@@ -83,7 +88,7 @@ it("keeps CLI-created print-mode subagent consumption budgets unlimited", async 
 	vi.spyOn(AgentSession.prototype, "getSubagentToolManager").mockImplementation(function (this: AgentSession) {
 		const manager = getSubagentToolManager.call(this);
 		if (!inspectedManager && manager instanceof SubagentManager) {
-			expectFormerConsumptionThresholdsAreUnlimited(manager);
+			expectDefaultPerRuntimeTurnStagesAndUnlimitedAggregateBudgets(manager);
 			inspectedManager = true;
 		}
 		return manager;

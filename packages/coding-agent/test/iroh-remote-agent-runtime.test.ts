@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "../src/core/remote/iroh/index.ts";
 import { CURRENT_SESSION_VERSION } from "../src/core/session-manager.ts";
-import { SubagentManager } from "../src/core/subagents/index.ts";
+import { DEFAULT_SUBAGENT_TURN_LIMITS, SubagentManager } from "../src/core/subagents/index.ts";
 import {
 	createIrohRemoteAgentRuntime,
 	createIrohRemoteAgentRuntimeWithSessionSelection,
@@ -17,7 +17,12 @@ import {
 const SAVED_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "HOME"] as const;
 const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY"] as const;
 
-function expectFormerConsumptionThresholdsAreUnlimited(manager: SubagentManager): void {
+function expectDefaultPerRuntimeTurnStagesAndUnlimitedAggregateBudgets(manager: SubagentManager): void {
+	const configuredScope = manager.createDelegationScope();
+	expect(configuredScope.owned).toBe(true);
+	expect(configuredScope.scope.turnLimits).toEqual(DEFAULT_SUBAGENT_TURN_LIMITS);
+	configuredScope.scope.dispose();
+
 	const cases: Array<{
 		name: string;
 		consume(scope: ReturnType<SubagentManager["createDelegationScope"]>["scope"]): void;
@@ -25,7 +30,7 @@ function expectFormerConsumptionThresholdsAreUnlimited(manager: SubagentManager)
 		{
 			name: "turns",
 			consume: (scope) => {
-				for (let index = 0; index <= 1_000; index += 1) scope.recordTurn();
+				for (let turn = 0; turn < 1_000; turn += 1) scope.recordTurn();
 			},
 		},
 		{ name: "tokens", consume: (scope) => scope.recordUsage(50_000_001, 0) },
@@ -193,7 +198,7 @@ export default function (volt) {
 		}
 	});
 
-	it("keeps Iroh runtime subagent consumption budgets unlimited", async () => {
+	it("uses per-runtime Iroh turn defaults while leaving aggregate consumption budgets unlimited", async () => {
 		writeRuntimeConfig({});
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -206,7 +211,7 @@ export default function (volt) {
 				throw new Error("expected the Iroh runtime to create a SubagentManager");
 			}
 
-			expectFormerConsumptionThresholdsAreUnlimited(manager);
+			expectDefaultPerRuntimeTurnStagesAndUnlimitedAggregateBudgets(manager);
 		} finally {
 			errorSpy.mockRestore();
 			await runtime?.dispose();

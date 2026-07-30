@@ -40,6 +40,7 @@ import {
 	type SubagentSpawnConfirmationPreflight,
 } from "./registry.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "./tool-names.ts";
+import { SubagentTurnBudget, type SubagentTurnLimits } from "./turn-budget.ts";
 
 export type SubagentEvent = RpcClientEvent;
 export type SubagentEndEvent = Extract<SubagentEvent, { type: "agent_end" }>;
@@ -130,10 +131,12 @@ export interface SubagentManagerOptions {
 	subagentContext?: SubagentRuntimeContext;
 	/**
 	 * Tree-wide limit overrides for scopes this manager creates. Structural
-	 * admission ceilings have finite defaults; consumption budgets abort only
-	 * when this option supplies finite values.
+	 * admission ceilings have finite defaults; aggregate token, cost, and
+	 * deadline budgets abort only when this option supplies finite values.
 	 */
 	delegationLimits?: SubagentDelegationScopeLimits;
+	/** Per-child turn safeguards; every parallel, chained, or nested runtime receives its own budget. */
+	turnLimits?: SubagentTurnLimits;
 	requestTimeoutMs?: number;
 	/** Keep child runtimes alive after the hidden loopback client detaches. Another owner must retain/dispose them. */
 	retainRuntimeOnDispose?: boolean;
@@ -769,6 +772,7 @@ export class SubagentManager {
 	private readonly allowedTools?: string[];
 	private readonly subagentContext?: SubagentRuntimeContext;
 	private readonly delegationLimits?: SubagentDelegationScopeLimits;
+	private readonly turnLimits?: SubagentTurnLimits;
 	private readonly requestTimeoutMs?: number;
 	private readonly retainRuntimeOnDispose: boolean;
 	private readonly onRuntimeCreated?: (
@@ -797,6 +801,7 @@ export class SubagentManager {
 		this.allowedTools = normalizeUniqueNames(options.allowedTools);
 		this.subagentContext = options.subagentContext;
 		this.delegationLimits = options.delegationLimits;
+		this.turnLimits = options.turnLimits;
 		this.requestTimeoutMs = options.requestTimeoutMs;
 		this.retainRuntimeOnDispose = options.retainRuntimeOnDispose ?? false;
 		this.onRuntimeCreated = options.onRuntimeCreated;
@@ -813,7 +818,11 @@ export class SubagentManager {
 			return { scope: inherited, owned: false };
 		}
 		return {
-			scope: new SubagentDelegationScope({ limits: this.delegationLimits, ...options }),
+			scope: new SubagentDelegationScope({
+				limits: this.delegationLimits,
+				turnLimits: this.turnLimits,
+				...options,
+			}),
 			owned: true,
 		};
 	}
@@ -1305,7 +1314,10 @@ export class SubagentManager {
 		const inherited = this.subagentContext?.delegationScope;
 		if (inherited) return { scope: inherited, owned: false };
 		if (requested) return { scope: requested, owned: false };
-		return { scope: new SubagentDelegationScope({ limits: this.delegationLimits }), owned: true };
+		return {
+			scope: new SubagentDelegationScope({ limits: this.delegationLimits, turnLimits: this.turnLimits }),
+			owned: true,
+		};
 	}
 
 	/**
@@ -1366,10 +1378,97 @@ export class SubagentManager {
 			delegation.scopeLease.scope,
 		);
 		const runtime = await this.createChildRuntime({ cwd, agentDir, sessionManager, subagentContext });
-		const unsubscribeScopeAccounting = runtime.session.subscribe(
+		const turnBudget = new SubagentTurnBudget(delegation.scopeLease.scope.turnLimits);
+		let requiresFinalTurnReport = false;
+		let stopAfterTurnForBudget = false;
+		const abortForTurnBudget = (): void => {
+			stopAfterTurnForBudget = true;
+			this.markActivityAbortRequested(id);
+			void runtime.session.abort().catch(() => undefined);
+		};
+		// AgentSession installs these hooks exactly once in its constructor and
+		// throws on any reinstall (see AgentSession._installAgentToolHooks), so the
+		// budget wrappers chained here cannot be silently dropped. The wiring
+		// persists for the runtime's whole lifetime — re-prompted children keep
+		// their report-only posture — and the originals are restored on dispose (or
+		// spawn failure), but only while the budget wrapper is still the installed
+		// hook.
+		const originalBeforeToolCall = runtime.session.agent.beforeToolCall;
+		const originalShouldStopAfterTurn = runtime.session.agent.shouldStopAfterTurn;
+		const budgetBeforeToolCall: NonNullable<typeof originalBeforeToolCall> = async (context, signal) => {
+			if (requiresFinalTurnReport) {
+				// This block reason is the guaranteed instruction channel for the
+				// report stage; the steer message below is only best-effort.
+				return {
+					block: true,
+					reason: "This subagent's turn budget is exhausted. Do not use tools; return your best final report now.",
+				};
+			}
+			return originalBeforeToolCall?.(context, signal);
+		};
+		const budgetShouldStopAfterTurn: NonNullable<typeof originalShouldStopAfterTurn> = async (context, signal) => {
+			// A budget stop deliberately skips the original hook
+			// (AgentSession._shouldStopForProactiveCompaction): its side effects —
+			// scheduling threshold compaction with an automatic resume and draining
+			// queued follow-ups on the next continuation — only apply to runs that
+			// keep going, and a scheduled auto-resume would contradict this stop.
+			if (stopAfterTurnForBudget) return true;
+			return (await originalShouldStopAfterTurn?.(context, signal)) ?? false;
+		};
+		runtime.session.agent.beforeToolCall = budgetBeforeToolCall;
+		runtime.session.agent.shouldStopAfterTurn = budgetShouldStopAfterTurn;
+		const unsubscribeSessionAccounting = runtime.session.subscribe(
 			(event) => {
 				if (event.type === "turn_end") {
+					// turn_end also fires for error/aborted turns; those deliberately
+					// consume budget so a flaky child still converges on its report
+					// stage instead of retrying without bound.
 					delegation.scopeLease.scope.recordTurn();
+					const requestedTool =
+						event.message.role === "assistant" &&
+						event.message.content.some((content) => content.type === "toolCall");
+					if (requiresFinalTurnReport) {
+						stopAfterTurnForBudget = true;
+						if (requestedTool) abortForTurnBudget();
+						return;
+					}
+					const turnBudgetEvent = turnBudget.recordTurn();
+					if (!turnBudgetEvent) return;
+					if (turnBudgetEvent.stage === "exceeded") {
+						// Defensive backstop only: both final-report branches below keep
+						// requiresFinalTurnReport set, which short-circuits before
+						// recordTurn, so this handler never advances the budget past
+						// maxTurns itself.
+						abortForTurnBudget();
+						return;
+					}
+					if (turnBudgetEvent.stage === "warning") {
+						if (!requestedTool) return;
+						// Best-effort: steer() is async and races the loop's steering
+						// pickup after this turn, so the message may only reach the model
+						// one turn later. Enforcement never depends on it — the
+						// beforeToolCall block reason is the guaranteed channel.
+						void runtime.session
+							.steer(
+								`This subagent has used ${turnBudgetEvent.turnsUsed} of its ${turnBudgetEvent.maxTurns} allowed turns. Stop broad exploration, finish the current line of inquiry, and begin synthesizing a report.`,
+							)
+							.catch(() => undefined);
+						return;
+					}
+					if (!requestedTool) {
+						// The child finished naturally at its limit. Keep the report-only
+						// posture so a later re-prompt yields tool-blocked one-turn
+						// replies instead of burning a turn into the exceeded backstop.
+						requiresFinalTurnReport = true;
+						stopAfterTurnForBudget = true;
+						return;
+					}
+					requiresFinalTurnReport = true;
+					void runtime.session
+						.steer(
+							`This subagent has reached its ${turnBudgetEvent.maxTurns}-turn limit. Do not call any more tools. Return your best final report now, including useful findings, evidence, and any unresolved gaps.`,
+						)
+						.catch((_error: unknown) => abortForTurnBudget());
 					return;
 				}
 				if (event.type !== "message_end" || event.message.role !== "assistant") return;
@@ -1381,6 +1480,18 @@ export class SubagentManager {
 			},
 			{ monitorGitContext: false },
 		);
+		const teardownBudgetWiring = (): void => {
+			unsubscribeSessionAccounting();
+			// Restore each hook only while the budget wrapper is still installed;
+			// if another wrapper chained over it after spawn, reassigning the
+			// original here would silently discard that wrapper's chain.
+			if (runtime.session.agent.beforeToolCall === budgetBeforeToolCall) {
+				runtime.session.agent.beforeToolCall = originalBeforeToolCall;
+			}
+			if (runtime.session.agent.shouldStopAfterTurn === budgetShouldStopAfterTurn) {
+				runtime.session.agent.shouldStopAfterTurn = originalShouldStopAfterTurn;
+			}
+		};
 		let client: InProcessRpcClient | undefined;
 		let runtimeRegistration: SubagentRuntimeRegistration | undefined;
 		let rollbackRuntimeRegistrationPromise: Promise<void> | undefined;
@@ -1453,12 +1564,17 @@ export class SubagentManager {
 					await rollbackRuntimeRegistration();
 				},
 				onAbortRequested: () => this.markActivityAbortRequested(id),
+				// Turn-budget wiring outlives the first terminal: scope accounting on
+				// a disposed scope is a guarded no-op, while the per-runtime turn
+				// posture keeps applying to re-prompts until the runtime is disposed.
 				onTerminal: () => {
-					unsubscribeScopeAccounting();
 					delegation.reservation.release();
 					if (delegation.scopeLease.owned) delegation.scopeLease.scope.dispose();
 				},
-				onDispose: rollbackRuntimeRegistration,
+				onDispose: async () => {
+					teardownBudgetWiring();
+					await rollbackRuntimeRegistration();
+				},
 				waitForIdle: async () => {
 					await runtime.session.waitForIdle();
 					await runtime.session.sessionManager.flush();
@@ -1491,7 +1607,7 @@ export class SubagentManager {
 			);
 			return handle;
 		} catch (error) {
-			unsubscribeScopeAccounting();
+			teardownBudgetWiring();
 			await client?.stop().catch(() => undefined);
 			await rollbackRuntimeRegistration();
 			await runtime.dispose().catch(() => undefined);

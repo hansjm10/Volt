@@ -576,6 +576,8 @@ export class AgentSession {
 	private _requestedBuildToolNames: string[] = [];
 	private _planningRuntimeInitialized = false;
 	private _planResearchObserved = false;
+	/** Guards the install-once agent hook contract; see _installAgentToolHooks. */
+	private _agentToolHooksInstalled = false;
 	private _trustedHostToolNames: Set<string> = new Set();
 	private _authorizedOperationResolutions: Map<string, OperationResolution> = new Map();
 
@@ -636,7 +638,6 @@ export class AgentSession {
 			{ monitor: false },
 		);
 		this._installAgentToolHooks();
-		this.agent.shouldStopAfterTurn = (context) => this._shouldStopForProactiveCompaction(context);
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -729,8 +730,20 @@ export class AgentSession {
 	 * new runner without reinstalling hooks. Extension-specific tool wrappers are still used to adapt
 	 * registered tool execution to the extension context. Tool call and tool result interception now
 	 * happens here instead of in wrappers.
+	 *
+	 * Install-once is an enforced contract: external wrappers — e.g. the SubagentManager per-child
+	 * turn budget — chain and later restore `agent.beforeToolCall`/`agent.shouldStopAfterTurn`.
+	 * Reinstalling any of these hooks after construction would silently discard such wrappers, so a
+	 * second call throws instead.
 	 */
 	private _installAgentToolHooks(): void {
+		if (this._agentToolHooksInstalled) {
+			throw new Error(
+				"Agent tool hooks are installed exactly once per AgentSession; reinstalling would silently drop external hook wrappers such as the subagent turn budget.",
+			);
+		}
+		this._agentToolHooksInstalled = true;
+		this.agent.shouldStopAfterTurn = (context) => this._shouldStopForProactiveCompaction(context);
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
 			if (!this.getActiveToolNames().includes(toolCall.name)) {
 				return {

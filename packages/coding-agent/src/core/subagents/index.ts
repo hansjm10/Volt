@@ -540,3 +540,8 @@ export {
 	type SubagentSpawnConfirmationPreflight,
 	type SubagentSpawnConfirmationStatus,
 } from "./registry.ts";
+export {
+	DEFAULT_SUBAGENT_TURN_LIMITS,
+	type SubagentTurnBudgetEvent,
+	type SubagentTurnLimits,
+} from "./turn-budget.ts";
