@@ -36,7 +36,7 @@ completed.
 
   Build and smoke-test the native matrix: macOS arm64/x64, Linux arm64/x64,
   and Windows arm64/x64. The official Linux runtime requires glibc 2.28 or
-  newer and does not support Alpine/musl. Windows beta executables are not
+  newer and does not support Alpine/musl. Windows executables are not
   Authenticode-signed; verify and record this disclosure and the final archive
   checksums before inviting testers.
 
@@ -95,4 +95,4 @@ candidate workflow run, exact candidate commit, workflow run ID, artifact
 digest, attestation verification, `source-commit.txt`, runtime and binary-license
 manifest approval, native-platform smoke results, unsigned-Windows disclosure,
 owner authorization run, protected annotated tag, and generated checksums
-before inviting beta users.
+before inviting users.
