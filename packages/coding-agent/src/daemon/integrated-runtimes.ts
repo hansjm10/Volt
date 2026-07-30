@@ -519,6 +519,8 @@ export class IntegratedRuntimeRegistry {
 				conversationTarget: createIrohRuntimeConversationTarget(handshake.hello, authorization),
 				cwd: initialDirectory.absolutePath,
 				projectCwd: rootPath,
+				workspaceName: authorization.workspace.name,
+				baseRef: worktree?.baseRef,
 				sessionDir: getDefaultSessionDir(authorization.workspace.path, this.options.agentDir),
 				validateCwd: async (cwd) => {
 					await resolveRuntimeWorkingDirectory(rootPath, cwd);

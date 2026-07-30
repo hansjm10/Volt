@@ -59,6 +59,8 @@ type ActiveAssistantSourceEvent = object;
 /** Minimal synchronous source surface implemented by AgentSession adapters. */
 export interface ConversationProjectionSource {
 	subscribe(listener: (event: object) => void): () => void;
+	/** Retain expensive source observation only while at least one remote subscriber is active. */
+	retainObservation?(): () => void;
 	/** Optional atomic source-generation hook for navigation and other rebases. */
 	subscribeGenerationChanges?(listener: () => void): () => void;
 }
@@ -665,6 +667,7 @@ const CONVERSATION_SOURCE_EVENT_TYPES = new Set([
 	"session_info_changed",
 	"thinking_level_changed",
 	"planning_state_changed",
+	"git_context_changed",
 	"ui_action_state_changed",
 	"auto_retry_start",
 	"auto_retry_end",
@@ -764,6 +767,7 @@ export class ConversationProjectionFeed {
 	private source: ConversationProjectionSource;
 	private detachSourceEvents: () => void = () => {};
 	private detachGenerationChanges: () => void = () => {};
+	private releaseSourceObservation: (() => void) | undefined;
 	private activeAssistantSourceEvent?: ActiveAssistantSourceEvent;
 	private readonly subscribers = new Set<ConversationProjectionSubscriber>();
 	private readonly subscribersById = new Map<string, ConversationProjectionSubscriber>();
@@ -887,6 +891,7 @@ export class ConversationProjectionFeed {
 
 		const ready = createDeferred<void>();
 		try {
+			if (this.subscribers.size === 1) this.startSourceObservation();
 			const subscriptionId = subscriber.subscriptionId;
 			const branchEpoch = this._branchEpoch;
 			const bootstrap = this.createBootstrap(subscriber, "bootstrap", 0);
@@ -1103,6 +1108,7 @@ export class ConversationProjectionFeed {
 		// observable. Waiting until commit leaves a window where the source has
 		// already changed but an old correlated reply can still mutate host state.
 		this.notifyAllSubscriberAuthorityChanging();
+		this.stopSourceObservation();
 		this.detachSourceEvents();
 		this.detachGenerationChanges();
 		this.source = source;
@@ -1115,6 +1121,7 @@ export class ConversationProjectionFeed {
 		this._branchEpoch = this.mintId("branchEpoch");
 		this.sourceRebindPending = true;
 		this.bindSourceListeners();
+		if (this.subscribers.size > 0) this.startSourceObservation();
 	}
 
 	/** Publish a source previously installed by beginSourceRebind as cursor zero. */
@@ -1174,6 +1181,7 @@ export class ConversationProjectionFeed {
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
+		this.stopSourceObservation();
 		this.detachSourceEvents();
 		this.detachGenerationChanges();
 		for (const subscriber of [...this.subscribers]) {
@@ -1189,6 +1197,16 @@ export class ConversationProjectionFeed {
 		this.detachSourceEvents = this.source.subscribe((event) => this.handleSourceEvent(event));
 		this.detachGenerationChanges =
 			this.source.subscribeGenerationChanges?.(() => this.rotateForBranchRebase()) ?? (() => {});
+	}
+
+	private startSourceObservation(): void {
+		if (this.releaseSourceObservation) return;
+		this.releaseSourceObservation = this.source.retainObservation?.();
+	}
+
+	private stopSourceObservation(): void {
+		this.releaseSourceObservation?.();
+		this.releaseSourceObservation = undefined;
 	}
 
 	private handleSourceEvent(event: object): void {
@@ -1869,6 +1887,7 @@ export class ConversationProjectionFeed {
 		subscriber.active = false;
 		this.subscribers.delete(subscriber);
 		this.subscribersById.delete(subscriber.subscriptionId);
+		if (this.subscribers.size === 0) this.stopSourceObservation();
 		subscriber.authorityChangeListeners.clear();
 		const closeError = error ?? new Error("Conversation projection subscription detached");
 		for (const item of subscriber.pending.splice(0)) item.deferred?.reject(closeError);

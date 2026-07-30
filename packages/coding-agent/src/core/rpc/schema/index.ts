@@ -36,6 +36,11 @@ import {
 	RPC_CONVERSATION_INPUT_MAX_IMAGES,
 	RPC_CONVERSATION_INPUT_MAX_SERIALIZED_BYTES,
 	RPC_CONVERSATION_INPUT_MESSAGE_MAX_UTF8_BYTES,
+	RPC_GIT_CONTEXT_OBSERVED_AT_MAX_CHARS,
+	RPC_GIT_CONTEXT_OID_MAX_CHARS,
+	RPC_GIT_CONTEXT_OID_PATTERN,
+	RPC_GIT_CONTEXT_REF_MAX_CHARS,
+	RPC_GIT_CONTEXT_REPOSITORY_MAX_CHARS,
 	RPC_PROJECTION_STRING_MAX_UTF8_BYTES,
 	RPC_REMOTE_ERROR_STRINGS,
 	RPC_RETRY_AFTER_MS_MAX,
@@ -72,6 +77,7 @@ import {
 	RpcExtensionErrorEventSchema,
 	RpcExtensionUIRequestSchema,
 	RpcExtensionUIResponseSchema,
+	RpcGitContextChangedEventSchema,
 	RpcHostActionMetadataValueSchema,
 	RpcHostActionRequestSchema,
 	RpcHostActionResponseSchema,
@@ -98,6 +104,16 @@ import {
 	RpcToolCallSchema,
 	RpcUsageSchema,
 } from "./external.ts";
+import {
+	RpcGitChangeCountsSchema,
+	RpcGitComparisonSchema,
+	RpcGitContextSchema,
+	RpcGitHeadSchema,
+	RpcGitObjectIdSchema,
+	RpcGitOperationSchema,
+	RpcGitRefSchema,
+	RpcGitStatusCountsSchema,
+} from "./git-context.ts";
 import {
 	RpcMcpAuthResponseSchema,
 	RpcMcpAuthStateSchema,
@@ -279,6 +295,7 @@ export const RpcServerEventSchema = Type.Union([
 	RpcSubagentEndEventSchema,
 	RpcSubagentDisposedEventSchema,
 	RpcModelsChangedEventSchema,
+	RpcGitContextChangedEventSchema,
 	RpcUiActionStateChangedEventSchema,
 	RpcPlanningStateChangedEventSchema,
 ]);
@@ -309,6 +326,17 @@ const SHARED_SCHEMAS: Record<string, TSchema> = {
 	RpcRegisterPushTargetArgs: RpcRegisterPushTargetArgsSchema,
 	RpcClientCapabilityFeature: RpcClientCapabilityFeatureSchema,
 	RpcMcpAuthFlow: RpcMcpAuthFlowSchema,
+
+	// Git context
+	RpcGitObjectId: RpcGitObjectIdSchema,
+	RpcGitRef: RpcGitRefSchema,
+	RpcGitHead: RpcGitHeadSchema,
+	RpcGitComparison: RpcGitComparisonSchema,
+	RpcGitChangeCounts: RpcGitChangeCountsSchema,
+	RpcGitStatusCounts: RpcGitStatusCountsSchema,
+	RpcGitOperation: RpcGitOperationSchema,
+	RpcGitContext: RpcGitContextSchema,
+	RpcGitContextChangedEvent: RpcGitContextChangedEventSchema,
 
 	// Assistant message family (volt-ai wire projections)
 	RpcTextContent: RpcTextContentSchema,
@@ -511,6 +539,13 @@ export const RPC_WIRE_LIMITS = {
 		imageDataMaxUtf8Bytes: RPC_CONVERSATION_INPUT_IMAGE_DATA_MAX_UTF8_BYTES,
 		imagesMaxUtf8Bytes: RPC_CONVERSATION_INPUT_IMAGES_MAX_UTF8_BYTES,
 		maxSerializedBytes: RPC_CONVERSATION_INPUT_MAX_SERIALIZED_BYTES,
+	},
+	gitContext: {
+		repositoryMaxChars: RPC_GIT_CONTEXT_REPOSITORY_MAX_CHARS,
+		refMaxChars: RPC_GIT_CONTEXT_REF_MAX_CHARS,
+		oidMaxChars: RPC_GIT_CONTEXT_OID_MAX_CHARS,
+		oidPattern: RPC_GIT_CONTEXT_OID_PATTERN,
+		observedAtMaxChars: RPC_GIT_CONTEXT_OBSERVED_AT_MAX_CHARS,
 	},
 	sessionState: {
 		maxSerializedBytes: RPC_SESSION_STATE_MAX_SERIALIZED_BYTES,

@@ -1875,16 +1875,19 @@ async function runReviewSession(options: RunReviewOptions): Promise<ReviewRunRes
 	};
 	options.signal?.addEventListener("abort", onAbort, { once: true });
 
-	const unsubscribe = session.subscribe((event) => {
-		options.onSessionEvent?.(event);
-		if (event.type === "tool_execution_start") {
-			const summary = summarizeToolArgs(event.args);
-			options.onProgress?.(summary ? `${event.toolName}: ${summary}` : event.toolName);
-			emitReviewWorkflowToolEvent(options.onEvent, options, event);
-		} else if (event.type === "tool_execution_end") {
-			emitReviewWorkflowToolEvent(options.onEvent, options, event);
-		}
-	});
+	const unsubscribe = session.subscribe(
+		(event) => {
+			options.onSessionEvent?.(event);
+			if (event.type === "tool_execution_start") {
+				const summary = summarizeToolArgs(event.args);
+				options.onProgress?.(summary ? `${event.toolName}: ${summary}` : event.toolName);
+				emitReviewWorkflowToolEvent(options.onEvent, options, event);
+			} else if (event.type === "tool_execution_end") {
+				emitReviewWorkflowToolEvent(options.onEvent, options, event);
+			}
+		},
+		{ monitorGitContext: false },
+	);
 
 	try {
 		await session.prompt(buildReviewPrompt(options.resolved), { expandPromptTemplates: false });

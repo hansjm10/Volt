@@ -179,6 +179,10 @@ function makeSession(sessionId: string, initialFastModeEnabled = false) {
 			fastModeEnabled = enabled;
 		}),
 		getAvailableThinkingLevels: vi.fn(() => ["off"]),
+		gitContextProvider: {
+			getSnapshot: () => null,
+			retainObservation: () => () => undefined,
+		},
 		steeringMode: "all",
 		followUpMode: "all",
 		autoCompactionEnabled: false,

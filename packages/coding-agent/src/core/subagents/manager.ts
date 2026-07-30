@@ -120,6 +120,8 @@ export interface SubagentManagerOptions {
 	createRuntime: CreateAgentSessionRuntimeFactory;
 	cwd: string;
 	agentDir: string;
+	workspaceName?: string;
+	baseRef?: string;
 	resourceLoader?: ResourceLoader;
 	/** Parent session used to create durable child sessions when start options do not supply one. */
 	parentSessionManager?: SessionManager;
@@ -762,6 +764,8 @@ export class SubagentManager {
 	private readonly createRuntime: CreateAgentSessionRuntimeFactory;
 	private readonly cwd: string;
 	private readonly agentDir: string;
+	private readonly workspaceName?: string;
+	private readonly baseRef?: string;
 	private readonly resourceLoader?: ResourceLoader;
 	private readonly parentSessionManager?: SessionManager;
 	private hydrationPromise: Promise<void> | undefined;
@@ -790,6 +794,8 @@ export class SubagentManager {
 		this.createRuntime = options.createRuntime;
 		this.cwd = options.cwd;
 		this.agentDir = options.agentDir;
+		this.workspaceName = options.workspaceName;
+		this.baseRef = options.baseRef;
 		this.resourceLoader = options.resourceLoader;
 		this.parentSessionManager = options.parentSessionManager;
 		this.allowedTools = normalizeUniqueNames(options.allowedTools);
@@ -1395,51 +1401,54 @@ export class SubagentManager {
 			if (stopAfterTurnForBudget) return true;
 			return (await originalShouldStopAfterTurn?.(context, signal)) ?? false;
 		};
-		const unsubscribeSessionAccounting = runtime.session.subscribe((event) => {
-			if (event.type === "turn_end") {
-				delegation.scopeLease.scope.recordTurn();
-				const requestedTool =
-					event.message.role === "assistant" &&
-					event.message.content.some((content) => content.type === "toolCall");
-				if (requiresFinalTurnReport) {
-					stopAfterTurnForBudget = true;
-					if (requestedTool) abortForTurnBudget();
-					return;
-				}
-				const turnBudgetEvent = turnBudget.recordTurn();
-				if (!turnBudgetEvent) return;
-				if (turnBudgetEvent.stage === "exceeded") {
-					abortForTurnBudget();
-					return;
-				}
-				if (turnBudgetEvent.stage === "warning") {
-					if (!requestedTool) return;
+		const unsubscribeSessionAccounting = runtime.session.subscribe(
+			(event) => {
+				if (event.type === "turn_end") {
+					delegation.scopeLease.scope.recordTurn();
+					const requestedTool =
+						event.message.role === "assistant" &&
+						event.message.content.some((content) => content.type === "toolCall");
+					if (requiresFinalTurnReport) {
+						stopAfterTurnForBudget = true;
+						if (requestedTool) abortForTurnBudget();
+						return;
+					}
+					const turnBudgetEvent = turnBudget.recordTurn();
+					if (!turnBudgetEvent) return;
+					if (turnBudgetEvent.stage === "exceeded") {
+						abortForTurnBudget();
+						return;
+					}
+					if (turnBudgetEvent.stage === "warning") {
+						if (!requestedTool) return;
+						void runtime.session
+							.steer(
+								`This subagent has used ${turnBudgetEvent.turnsUsed} of its ${turnBudgetEvent.maxTurns} allowed turns. Stop broad exploration, finish the current line of inquiry, and begin synthesizing a report.`,
+							)
+							.catch(() => undefined);
+						return;
+					}
+					if (!requestedTool) {
+						stopAfterTurnForBudget = true;
+						return;
+					}
+					requiresFinalTurnReport = true;
 					void runtime.session
 						.steer(
-							`This subagent has used ${turnBudgetEvent.turnsUsed} of its ${turnBudgetEvent.maxTurns} allowed turns. Stop broad exploration, finish the current line of inquiry, and begin synthesizing a report.`,
+							`This subagent has reached its ${turnBudgetEvent.maxTurns}-turn limit. Do not call any more tools. Return your best final report now, including useful findings, evidence, and any unresolved gaps.`,
 						)
-						.catch(() => undefined);
+						.catch((_error: unknown) => abortForTurnBudget());
 					return;
 				}
-				if (!requestedTool) {
-					stopAfterTurnForBudget = true;
-					return;
-				}
-				requiresFinalTurnReport = true;
-				void runtime.session
-					.steer(
-						`This subagent has reached its ${turnBudgetEvent.maxTurns}-turn limit. Do not call any more tools. Return your best final report now, including useful findings, evidence, and any unresolved gaps.`,
-					)
-					.catch((_error: unknown) => abortForTurnBudget());
-				return;
-			}
-			if (event.type !== "message_end" || event.message.role !== "assistant") return;
-			const usage = event.message.usage;
-			delegation.scopeLease.scope.recordUsage(
-				usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
-				usage.cost.total,
-			);
-		});
+				if (event.type !== "message_end" || event.message.role !== "assistant") return;
+				const usage = event.message.usage;
+				delegation.scopeLease.scope.recordUsage(
+					usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+					usage.cost.total,
+				);
+			},
+			{ monitorGitContext: false },
+		);
 		const unsubscribeScopeAccounting = (): void => {
 			unsubscribeSessionAccounting();
 			runtime.session.agent.beforeToolCall = originalBeforeToolCall;
@@ -1979,6 +1988,8 @@ export class SubagentManager {
 			cwd: options.cwd,
 			agentDir: options.agentDir,
 			sessionManager: options.sessionManager,
+			workspaceName: this.workspaceName,
+			baseRef: this.baseRef,
 			...(options.subagentContext ? { subagentContext: options.subagentContext } : {}),
 		});
 	}

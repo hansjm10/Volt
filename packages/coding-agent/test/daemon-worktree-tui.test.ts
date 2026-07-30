@@ -712,7 +712,13 @@ describe("trust pinning helpers (§5.2.1)", () => {
 
 describe("new session into a worktree (§5.2.1 cwd/sessionDir overrides)", () => {
 	function createRuntimeFixture(parentCwd: string, agentDir: string) {
-		const createdSessions: Array<{ cwd: string; sessionDir: string; sessionFile: string | undefined }> = [];
+		const createdSessions: Array<{
+			cwd: string;
+			sessionDir: string;
+			sessionFile: string | undefined;
+			workspaceName?: string;
+			baseRef?: string;
+		}> = [];
 		const makeSessionDouble = (sessionManager: SessionManager): AgentSession =>
 			({
 				sessionManager,
@@ -734,11 +740,18 @@ describe("new session into a worktree (§5.2.1 cwd/sessionDir overrides)", () =>
 				settingsManager: { getRequestedProfile: () => undefined },
 			}) as unknown as AgentSessionServices;
 		const createRuntime = vi.fn(
-			async (options: { cwd: string; sessionManager: SessionManager }): Promise<CreateAgentSessionRuntimeResult> => {
+			async (options: {
+				cwd: string;
+				sessionManager: SessionManager;
+				workspaceName?: string;
+				baseRef?: string;
+			}): Promise<CreateAgentSessionRuntimeResult> => {
 				createdSessions.push({
 					cwd: options.cwd,
 					sessionDir: options.sessionManager.getSessionDir(),
 					sessionFile: options.sessionManager.getSessionFile(),
+					workspaceName: options.workspaceName,
+					baseRef: options.baseRef,
 				});
 				return {
 					session: makeSessionDouble(options.sessionManager),
@@ -765,12 +778,19 @@ describe("new session into a worktree (§5.2.1 cwd/sessionDir overrides)", () =>
 		mkdirSync(worktreeCwd, { recursive: true });
 		const fixture = createRuntimeFixture(parentCwd, agentDir);
 
-		const result = await fixture.runtime.newSession({ cwd: worktreeCwd, sessionDir: fixture.parentSessionDir });
+		const result = await fixture.runtime.newSession({
+			cwd: worktreeCwd,
+			sessionDir: fixture.parentSessionDir,
+			workspaceName: "parent-workspace",
+			baseRef: "origin/main",
+		});
 		expect(result).toEqual({ cancelled: false, seeded: false });
 		expect(fixture.createdSessions).toHaveLength(1);
 		const created = fixture.createdSessions[0]!;
 		expect(created.cwd).toBe(worktreeCwd);
 		expect(created.sessionDir).toBe(fixture.parentSessionDir);
+		expect(created.workspaceName).toBe("parent-workspace");
+		expect(created.baseRef).toBe("origin/main");
 		expect(fixture.runtime.session.sessionManager.getCwd()).toBe(worktreeCwd);
 		// §5.1.7 pin: the parent-dir listing includes the worktree session once it
 		// has persisted content (session files flush on the first assistant message).

@@ -132,6 +132,10 @@ export function createTestSession(sessionId: string, leafId: string | null) {
 		autoCompactionEnabled: false,
 		bindExtensions: vi.fn(async () => {}),
 		followUpMode: "all" as const,
+		gitContextProvider: {
+			getSnapshot: () => null,
+			retainObservation: () => () => undefined,
+		},
 		isCompacting: false,
 		isStreaming: false,
 		messages: [] as AgentMessage[],
@@ -239,6 +243,7 @@ export function createTestIrohConversationOptions(runtimeHost: AgentSessionRunti
 						typeof session.getPlanningState === "function"
 							? session.getPlanningState()
 							: { mode: "build", plan: null },
+					gitContext: session.gitContextProvider.getSnapshot(),
 					isStreaming: session.isStreaming,
 					isCompacting: session.isCompacting,
 					steeringMode: session.steeringMode,

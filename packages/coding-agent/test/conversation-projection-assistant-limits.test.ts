@@ -63,6 +63,7 @@ const snapshotBuilder: ConversationProjectionSnapshotBuilder = (context) => ({
 		availableThinkingLevels: ["off"],
 		fastModeEnabled: false,
 		planning: { mode: "build", plan: null },
+		gitContext: null,
 		isStreaming: context.activeAssistant !== null,
 		isCompacting: false,
 		steeringMode: "all",
