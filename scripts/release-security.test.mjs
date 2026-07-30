@@ -1225,11 +1225,13 @@ test("release preparation is owner-triggered and can only open a reviewed releas
 	assert.match(workflow, /permissions: \{\}/);
 	assert.match(workflow, /target:\s+description:[\s\S]*?type: choice\s+options:\s+- patch\s+- minor/);
 	assert.doesNotMatch(workflow.slice(workflow.indexOf("      target:"), workflow.indexOf("permissions:")), /- major/);
+	assert.match(workflow, /env:\s+RELEASE_OWNER: hansjm10/);
+	assert.doesNotMatch(workflow, /github\.repository_owner|REPOSITORY_OWNER/);
 	assert.match(workflow, /RUN_ACTOR: \$\{\{ github\.actor \}\}/);
 	assert.match(workflow, /TRIGGERING_ACTOR: \$\{\{ github\.triggering_actor \}\}/);
 	assert.match(
 		workflow,
-		/"\$\{RUN_ACTOR\}" != "\$\{REPOSITORY_OWNER\}".*\|\|.*"\$\{TRIGGERING_ACTOR\}" != "\$\{REPOSITORY_OWNER\}"/,
+		/"\$\{RUN_ACTOR\}" != "\$\{RELEASE_OWNER\}".*\|\|.*"\$\{TRIGGERING_ACTOR\}" != "\$\{RELEASE_OWNER\}"/,
 	);
 	assert.match(workflow, /"\$\{GITHUB_REF\}" != "refs\/heads\/main"/);
 	assert.match(workflow, /"\$\{RELEASE_TARGET\}" != "patch" && "\$\{RELEASE_TARGET\}" != "minor"/);
@@ -1310,11 +1312,13 @@ test("release approval separates read-only authorization, App tagging, and publi
 
 	assert.match(preflight, /permissions:\s+actions: read\s+attestations: read\s+contents: read/);
 	assert.doesNotMatch(preflight, /actions: write|attestations: write|contents: write/);
+	assert.match(workflow, /env:\s+RELEASE_OWNER: hansjm10/);
+	assert.doesNotMatch(workflow, /github\.repository_owner|REPOSITORY_OWNER/);
 	assert.match(preflight, /RUN_ACTOR: \$\{\{ github\.actor \}\}/);
 	assert.match(preflight, /TRIGGERING_ACTOR: \$\{\{ github\.triggering_actor \}\}/);
 	assert.match(
 		preflight,
-		/"\$\{RUN_ACTOR\}" != "\$\{REPOSITORY_OWNER\}".*\|\|.*"\$\{TRIGGERING_ACTOR\}" != "\$\{REPOSITORY_OWNER\}"/,
+		/"\$\{RUN_ACTOR\}" != "\$\{RELEASE_OWNER\}".*\|\|.*"\$\{TRIGGERING_ACTOR\}" != "\$\{RELEASE_OWNER\}"/,
 	);
 	assert.match(preflight, /"\$\{GITHUB_REF\}" != "refs\/heads\/main"/);
 	assert.match(preflight, /\^\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\$/);
@@ -1415,6 +1419,10 @@ test("release approval separates read-only authorization, App tagging, and publi
 	const outsideTagRelease = workflow.slice(0, workflow.indexOf("  tag-release:")) + workflow.slice(workflow.indexOf("  dispatch-publication:"));
 	assert.doesNotMatch(outsideTagRelease, /VOLT_RELEASE_APP|steps\.release-app\.outputs\.token|actions\/create-github-app-token/);
 	assert.match(tagRelease, /github-token: \$\{\{ steps\.release-app\.outputs\.token \}\}/);
+	assert.match(
+		tagRelease,
+		/process\.env\.RUN_ACTOR !== process\.env\.RELEASE_OWNER \|\| process\.env\.TRIGGERING_ACTOR !== process\.env\.RELEASE_OWNER/,
+	);
 	const privilegedTagMutation = tagRelease.slice(tagRelease.indexOf("      - name: Create and read back"));
 	assert.match(privilegedTagMutation, /github\.rest\.repos\.getBranch\(\{ owner, repo, branch: "main" \}\)/);
 	assert.match(privilegedTagMutation, /main\.data\.commit\.sha !== candidateCommit/);
@@ -1586,11 +1594,13 @@ test("pre-tag standalone candidates build the exact main commit without publishi
 	const buildJob = workflow.slice(workflow.indexOf("  build-standalone:"), workflow.indexOf("  assemble:"));
 	const assembleJob = workflow.slice(workflow.indexOf("  assemble:"));
 	assert.match(workflow, /workflow_dispatch:/);
+	assert.match(workflow, /env:\s+RELEASE_OWNER: hansjm10/);
+	assert.doesNotMatch(workflow, /github\.repository_owner|REPOSITORY_OWNER/);
 	assert.match(validateJob, /RUN_ACTOR: \$\{\{ github\.actor \}\}/);
 	assert.match(validateJob, /TRIGGERING_ACTOR: \$\{\{ github\.triggering_actor \}\}/);
 	assert.match(
 		validateJob,
-		/"\$\{RUN_ACTOR\}" != "\$\{REPOSITORY_OWNER\}".*\|\|.*"\$\{TRIGGERING_ACTOR\}" != "\$\{REPOSITORY_OWNER\}"/,
+		/"\$\{RUN_ACTOR\}" != "\$\{RELEASE_OWNER\}".*\|\|.*"\$\{TRIGGERING_ACTOR\}" != "\$\{RELEASE_OWNER\}"/,
 	);
 	assert.match(workflow, /\^\[0-9a-f\]\{40\}\$/);
 	assert.match(workflow, /git rev-parse HEAD/);

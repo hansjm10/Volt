@@ -45,6 +45,8 @@ with GitHub Actions OIDC.
 ## Security invariants
 
 - All four npm packages remain lockstep versioned.
+- The designated release owner login is source-pinned to `hansjm10`; organization
+  ownership is not treated as a user identity.
 - The release commit must be the exact current commit on protected `main`.
 - The approved candidate commit, workflow run, artifact digest, attestation,
   `source-commit.txt`, and archive checksums must all identify the same bytes.
@@ -103,7 +105,7 @@ The preparation job must:
    release changes.
 5. Report the planned version and expected post-merge validation steps.
 
-The repository owner reviews the pull request's generated changelog section,
+The designated release owner reviews the pull request's generated changelog section,
 package metadata, lockfiles, shrinkwrap, and generated artifacts, waits for
 required checks, and merges it. Consumed `.changeset/` fragments are deleted in
 the same commit. The candidate SHA is the resulting commit on `main`, not the
@@ -126,7 +128,7 @@ needs write access to run it from the Actions UI. See
 After the release pull request is merged, **Build Standalone Candidate** runs
 for the exact lowercase 40-character `main` SHA. It must reject a commit that
 does not exactly equal the current remote `main` tip, and both the original and
-rerun actor must be the repository owner.
+rerun actor must be the designated release owner.
 
 The workflow builds and smoke-tests the native matrix:
 
@@ -210,7 +212,8 @@ and restrict it to runs from `main`; the environment has no required reviewer.
 
 Preflight must fail unless all of the following are true:
 
-- both `github.actor` and `github.triggering_actor` are the repository owner;
+- both `github.actor` and `github.triggering_actor` are the source-pinned
+  designated release owner, `hansjm10`;
 - the workflow runs from `refs/heads/main`;
 - `candidate_commit` is the exact current `main` commit;
 - the prepared commit, package versions, and the product changelog heading
