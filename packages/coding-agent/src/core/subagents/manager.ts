@@ -40,6 +40,7 @@ import {
 	type SubagentSpawnConfirmationPreflight,
 } from "./registry.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "./tool-names.ts";
+import { SubagentTurnBudget, type SubagentTurnLimits } from "./turn-budget.ts";
 
 export type SubagentEvent = RpcClientEvent;
 export type SubagentEndEvent = Extract<SubagentEvent, { type: "agent_end" }>;
@@ -128,11 +129,12 @@ export interface SubagentManagerOptions {
 	subagentContext?: SubagentRuntimeContext;
 	/**
 	 * Tree-wide limit overrides for scopes this manager creates. Structural
-	 * admission ceilings and staged turn limits have finite defaults. Token,
-	 * cost, and deadline budgets abort only when this option supplies finite
-	 * values.
+	 * admission ceilings have finite defaults; aggregate token, cost, and
+	 * deadline budgets abort only when this option supplies finite values.
 	 */
 	delegationLimits?: SubagentDelegationScopeLimits;
+	/** Per-child turn safeguards; every parallel, chained, or nested runtime receives its own budget. */
+	turnLimits?: SubagentTurnLimits;
 	requestTimeoutMs?: number;
 	/** Keep child runtimes alive after the hidden loopback client detaches. Another owner must retain/dispose them. */
 	retainRuntimeOnDispose?: boolean;
@@ -766,6 +768,7 @@ export class SubagentManager {
 	private readonly allowedTools?: string[];
 	private readonly subagentContext?: SubagentRuntimeContext;
 	private readonly delegationLimits?: SubagentDelegationScopeLimits;
+	private readonly turnLimits?: SubagentTurnLimits;
 	private readonly requestTimeoutMs?: number;
 	private readonly retainRuntimeOnDispose: boolean;
 	private readonly onRuntimeCreated?: (
@@ -792,6 +795,7 @@ export class SubagentManager {
 		this.allowedTools = normalizeUniqueNames(options.allowedTools);
 		this.subagentContext = options.subagentContext;
 		this.delegationLimits = options.delegationLimits;
+		this.turnLimits = options.turnLimits;
 		this.requestTimeoutMs = options.requestTimeoutMs;
 		this.retainRuntimeOnDispose = options.retainRuntimeOnDispose ?? false;
 		this.onRuntimeCreated = options.onRuntimeCreated;
@@ -808,7 +812,11 @@ export class SubagentManager {
 			return { scope: inherited, owned: false };
 		}
 		return {
-			scope: new SubagentDelegationScope({ limits: this.delegationLimits, ...options }),
+			scope: new SubagentDelegationScope({
+				limits: this.delegationLimits,
+				turnLimits: this.turnLimits,
+				...options,
+			}),
 			owned: true,
 		};
 	}
@@ -1300,7 +1308,10 @@ export class SubagentManager {
 		const inherited = this.subagentContext?.delegationScope;
 		if (inherited) return { scope: inherited, owned: false };
 		if (requested) return { scope: requested, owned: false };
-		return { scope: new SubagentDelegationScope({ limits: this.delegationLimits }), owned: true };
+		return {
+			scope: new SubagentDelegationScope({ limits: this.delegationLimits, turnLimits: this.turnLimits }),
+			owned: true,
+		};
 	}
 
 	/**
@@ -1361,57 +1372,65 @@ export class SubagentManager {
 			delegation.scopeLease.scope,
 		);
 		const runtime = await this.createChildRuntime({ cwd, agentDir, sessionManager, subagentContext });
+		const turnBudget = new SubagentTurnBudget(delegation.scopeLease.scope.turnLimits);
 		let requiresFinalTurnReport = false;
+		let stopAfterTurnForBudget = false;
+		const abortForTurnBudget = (): void => {
+			stopAfterTurnForBudget = true;
+			this.markActivityAbortRequested(id);
+			void runtime.session.abort().catch(() => undefined);
+		};
 		const originalBeforeToolCall = runtime.session.agent.beforeToolCall;
+		const originalShouldStopAfterTurn = runtime.session.agent.shouldStopAfterTurn;
 		runtime.session.agent.beforeToolCall = async (context, signal) => {
 			if (requiresFinalTurnReport) {
 				return {
 					block: true,
-					reason:
-						"The shared subagent turn budget is exhausted. Do not use tools; return your best final report now.",
+					reason: "This subagent's turn budget is exhausted. Do not use tools; return your best final report now.",
 				};
 			}
 			return originalBeforeToolCall?.(context, signal);
 		};
+		runtime.session.agent.shouldStopAfterTurn = async (context, signal) => {
+			if (stopAfterTurnForBudget) return true;
+			return (await originalShouldStopAfterTurn?.(context, signal)) ?? false;
+		};
 		const unsubscribeSessionAccounting = runtime.session.subscribe((event) => {
 			if (event.type === "turn_end") {
+				delegation.scopeLease.scope.recordTurn();
 				const requestedTool =
 					event.message.role === "assistant" &&
 					event.message.content.some((content) => content.type === "toolCall");
 				if (requiresFinalTurnReport) {
-					if (requestedTool) {
-						this.markActivityAbortRequested(id);
-						delegation.scopeLease.scope.abort(
-							new Error(
-								`Subagent delegation tree ${delegation.scopeLease.scope.id} did not return a final report after reaching its ${delegation.scopeLease.scope.limits.maxTurns}-turn budget (maxTurns).`,
-							),
-						);
-					}
+					stopAfterTurnForBudget = true;
+					if (requestedTool) abortForTurnBudget();
 					return;
 				}
-				const turnBudgetEvent = delegation.scopeLease.scope.recordTurn();
-				if (!requestedTool || !turnBudgetEvent) return;
+				const turnBudgetEvent = turnBudget.recordTurn();
+				if (!turnBudgetEvent) return;
+				if (turnBudgetEvent.stage === "exceeded") {
+					abortForTurnBudget();
+					return;
+				}
 				if (turnBudgetEvent.stage === "warning") {
+					if (!requestedTool) return;
 					void runtime.session
 						.steer(
-							`The shared subagent tree has used ${turnBudgetEvent.turnsUsed} of its ${turnBudgetEvent.maxTurns} allowed turns. Stop broad exploration, finish the current line of inquiry, and begin synthesizing a report.`,
+							`This subagent has used ${turnBudgetEvent.turnsUsed} of its ${turnBudgetEvent.maxTurns} allowed turns. Stop broad exploration, finish the current line of inquiry, and begin synthesizing a report.`,
 						)
 						.catch(() => undefined);
 					return;
 				}
-				if (turnBudgetEvent.stage === "final-report") {
-					requiresFinalTurnReport = true;
-					void runtime.session
-						.steer(
-							`The shared subagent tree has reached its ${turnBudgetEvent.maxTurns}-turn limit. Do not call any more tools. Return your best final report now, including useful findings, evidence, and any unresolved gaps.`,
-						)
-						.catch((error: unknown) => {
-							this.markActivityAbortRequested(id);
-							delegation.scopeLease.scope.abort(
-								new Error(`Failed to request the subagent's final turn report: ${errorMessage(error)}`),
-							);
-						});
+				if (!requestedTool) {
+					stopAfterTurnForBudget = true;
+					return;
 				}
+				requiresFinalTurnReport = true;
+				void runtime.session
+					.steer(
+						`This subagent has reached its ${turnBudgetEvent.maxTurns}-turn limit. Do not call any more tools. Return your best final report now, including useful findings, evidence, and any unresolved gaps.`,
+					)
+					.catch((_error: unknown) => abortForTurnBudget());
 				return;
 			}
 			if (event.type !== "message_end" || event.message.role !== "assistant") return;
@@ -1424,6 +1443,7 @@ export class SubagentManager {
 		const unsubscribeScopeAccounting = (): void => {
 			unsubscribeSessionAccounting();
 			runtime.session.agent.beforeToolCall = originalBeforeToolCall;
+			runtime.session.agent.shouldStopAfterTurn = originalShouldStopAfterTurn;
 		};
 		let client: InProcessRpcClient | undefined;
 		let runtimeRegistration: SubagentRuntimeRegistration | undefined;

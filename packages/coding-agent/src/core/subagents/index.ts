@@ -504,7 +504,6 @@ export {
 	type SubagentDelegationScopeLimits,
 	type SubagentDelegationScopeOptions,
 	type SubagentDelegationScopeSnapshot,
-	type SubagentTurnBudgetEvent,
 } from "./delegation-scope.ts";
 export {
 	type SubagentActivity,
@@ -541,3 +540,8 @@ export {
 	type SubagentSpawnConfirmationPreflight,
 	type SubagentSpawnConfirmationStatus,
 } from "./registry.ts";
+export {
+	DEFAULT_SUBAGENT_TURN_LIMITS,
+	type SubagentTurnBudgetEvent,
+	type SubagentTurnLimits,
+} from "./turn-budget.ts";

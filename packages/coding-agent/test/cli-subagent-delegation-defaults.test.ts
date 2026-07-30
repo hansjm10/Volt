@@ -5,7 +5,7 @@ import { fauxAssistantMessage, registerFauxProvider } from "@hansjm10/volt-ai";
 import { expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { restoreStdout } from "../src/core/output-guard.ts";
-import { SubagentManager } from "../src/core/subagents/index.ts";
+import { DEFAULT_SUBAGENT_TURN_LIMITS, SubagentManager } from "../src/core/subagents/index.ts";
 import { main } from "../src/main.ts";
 
 const ENV_KEYS = [
@@ -16,31 +16,22 @@ const ENV_KEYS = [
 	"VOLT_SKIP_VERSION_CHECK",
 ] as const;
 
-function expectDefaultTurnStagesAndUnlimitedUsageBudgets(manager: SubagentManager): void {
-	const turnLease = manager.createDelegationScope();
-	expect(turnLease.owned).toBe(true);
-	let turnDescendantAborted = false;
-	const turnReservation = turnLease.scope.reserve("turn-probe", 1);
-	turnReservation.commit("sa_cli-turn-probe", () => {
-		turnDescendantAborted = true;
-	});
-	for (let turn = 1; turn < 80; turn += 1) {
-		expect(turnLease.scope.recordTurn()).toBeUndefined();
-	}
-	expect(turnLease.scope.recordTurn()).toMatchObject({ stage: "warning", turnsUsed: 80, maxTurns: 120 });
-	for (let turn = 81; turn < 120; turn += 1) {
-		expect(turnLease.scope.recordTurn()).toBeUndefined();
-	}
-	expect(turnLease.scope.recordTurn()).toMatchObject({ stage: "final-report", turnsUsed: 120, maxTurns: 120 });
-	expect(turnLease.scope.signal.aborted).toBe(false);
-	expect(turnDescendantAborted).toBe(false);
-	turnReservation.release();
-	turnLease.scope.dispose();
+function expectDefaultPerRuntimeTurnStagesAndUnlimitedAggregateBudgets(manager: SubagentManager): void {
+	const configuredScope = manager.createDelegationScope();
+	expect(configuredScope.owned).toBe(true);
+	expect(configuredScope.scope.turnLimits).toEqual(DEFAULT_SUBAGENT_TURN_LIMITS);
+	configuredScope.scope.dispose();
 
 	const cases: Array<{
 		name: string;
 		consume(scope: ReturnType<SubagentManager["createDelegationScope"]>["scope"]): void;
 	}> = [
+		{
+			name: "turns",
+			consume: (scope) => {
+				for (let turn = 0; turn < 1_000; turn += 1) scope.recordTurn();
+			},
+		},
 		{ name: "tokens", consume: (scope) => scope.recordUsage(50_000_001, 0) },
 		{ name: "cost", consume: (scope) => scope.recordUsage(0, 100.01) },
 	];
@@ -63,7 +54,7 @@ function expectDefaultTurnStagesAndUnlimitedUsageBudgets(manager: SubagentManage
 	}
 }
 
-it("uses staged CLI turn defaults while leaving token and cost budgets unlimited", async () => {
+it("uses per-runtime CLI turn defaults while leaving aggregate consumption budgets unlimited", async () => {
 	const tempDir = mkdtempSync(join(tmpdir(), "volt-cli-subagent-defaults-"));
 	const workspace = join(tempDir, "workspace");
 	const agentDir = join(tempDir, "agent");
@@ -97,7 +88,7 @@ it("uses staged CLI turn defaults while leaving token and cost budgets unlimited
 	vi.spyOn(AgentSession.prototype, "getSubagentToolManager").mockImplementation(function (this: AgentSession) {
 		const manager = getSubagentToolManager.call(this);
 		if (!inspectedManager && manager instanceof SubagentManager) {
-			expectDefaultTurnStagesAndUnlimitedUsageBudgets(manager);
+			expectDefaultPerRuntimeTurnStagesAndUnlimitedAggregateBudgets(manager);
 			inspectedManager = true;
 		}
 		return manager;

@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-improvement(subagents): Warn long-running subagents at 80 turns and require a final report after 120 turns.
+improvement(subagents): Warn each long-running subagent at 80 turns and require its final report after 120 turns.

@@ -655,6 +655,7 @@ export { createSyntheticSourceInfo } from "./core/source-info.ts";
 export {
 	createBuiltInSubagentDefinitions,
 	DEFAULT_SUBAGENT_DELEGATION_LIMITS,
+	DEFAULT_SUBAGENT_TURN_LIMITS,
 	type DiscoverSubagentDefinitionsOptions,
 	discoverSubagentDefinitions,
 	type FileSubagentDefinitionSource,
@@ -698,6 +699,7 @@ export {
 	type SubagentStartOptions,
 	type SubagentTreeCapacitySnapshot,
 	type SubagentTurnBudgetEvent,
+	type SubagentTurnLimits,
 } from "./core/subagents/index.ts";
 // Theme utilities for custom tools and extensions
 export {
