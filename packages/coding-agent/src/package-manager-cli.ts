@@ -365,7 +365,7 @@ interface SelfUpdatePlan {
 	note?: string;
 }
 
-const BETA_SELF_UPDATE_PACKAGE_SPEC = `${PACKAGE_NAME}@beta`;
+const LATEST_SELF_UPDATE_PACKAGE_SPEC = `${PACKAGE_NAME}@latest`;
 const HOSTED_PACKAGE_NAME_RE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 
 function normalizeHostedPackageName(packageName: string | undefined): string | undefined {
@@ -379,14 +379,14 @@ function normalizeHostedPackageName(packageName: string | undefined): string | u
 
 async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 	if (force) {
-		return { packageSpec: BETA_SELF_UPDATE_PACKAGE_SPEC, shouldRun: true };
+		return { packageSpec: LATEST_SELF_UPDATE_PACKAGE_SPEC, shouldRun: true };
 	}
 
 	try {
 		const latestRelease = await getLatestVoltRelease(VERSION);
 		const hostedPackageName = normalizeHostedPackageName(latestRelease?.packageName);
 		const targetPackageName = hostedPackageName ?? PACKAGE_NAME;
-		const packageSpec = `${targetPackageName}@beta`;
+		const packageSpec = `${targetPackageName}@latest`;
 		if (
 			!latestRelease ||
 			(hostedPackageName !== undefined && hostedPackageName !== PACKAGE_NAME) ||
@@ -395,11 +395,11 @@ async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 			return { packageSpec, shouldRun: true, ...(latestRelease?.note ? { note: latestRelease.note } : {}) };
 		}
 	} catch {
-		return { packageSpec: BETA_SELF_UPDATE_PACKAGE_SPEC, shouldRun: true };
+		return { packageSpec: LATEST_SELF_UPDATE_PACKAGE_SPEC, shouldRun: true };
 	}
 
 	console.log(chalk.green(`${APP_NAME} is already up to date (v${VERSION})`));
-	return { packageSpec: BETA_SELF_UPDATE_PACKAGE_SPEC, shouldRun: false };
+	return { packageSpec: LATEST_SELF_UPDATE_PACKAGE_SPEC, shouldRun: false };
 }
 
 async function runSelfUpdateStep(step: Pick<SelfUpdateCommand, "command" | "args" | "display">): Promise<void> {

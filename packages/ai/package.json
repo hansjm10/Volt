@@ -61,7 +61,7 @@
 	],
 	"publishConfig": {
 		"access": "public",
-		"tag": "beta"
+		"tag": "latest"
 	},
 	"scripts": {
 		"clean": "shx rm -rf dist",

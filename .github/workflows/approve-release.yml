@@ -28,7 +28,7 @@ on:
         required: true
         type: boolean
       unsigned_windows_acknowledged:
-        description: 'I acknowledge that Windows beta executables are currently unsigned'
+        description: 'I acknowledge that Windows executables are currently unsigned'
         required: true
         type: boolean
       authorization_phrase:
@@ -173,7 +173,7 @@ jobs:
             echo "- Candidate commit: \`${CANDIDATE_COMMIT}\`"
             echo "- Candidate run: \`${CANDIDATE_RUN_ID}\`"
             echo "- Candidate artifact: \`${CANDIDATE_ARTIFACT_DIGEST}\`"
-            echo "- Owner authorization and all beta acknowledgements: verified"
+            echo "- Owner authorization and all release acknowledgements: verified"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Resolve the immutable approved artifact ID
@@ -450,18 +450,18 @@ jobs:
                 name: releaseTag,
                 body: "Release publication is in progress. This draft is published only after npm and exact asset verification succeed.",
                 draft: true,
-                prerelease: true,
+                prerelease: false,
                 make_latest: "false",
               });
-            } else if (!matches[0].draft || !matches[0].prerelease) {
-              throw new Error(`Existing ${releaseTag} release is not the expected draft prerelease`);
+            } else if (!matches[0].draft || matches[0].prerelease) {
+              throw new Error(`Existing ${releaseTag} release is not the expected stable draft`);
             }
 
             core.setOutput("tag", releaseTag);
             await core.summary
               .addHeading(`Authorized ${releaseTag}`)
               .addRaw(`Annotated tag verified at \`${candidateCommit}\`.\n`)
-              .addRaw("A draft prerelease exists and publication can now be dispatched.\n")
+              .addRaw("A stable draft release exists and publication can now be dispatched.\n")
               .write();
 
   dispatch-publication:

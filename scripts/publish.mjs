@@ -19,7 +19,7 @@ const packages = [
 		requiredPackFiles: ["dist/remote/iroh-native-adapter.cjs"],
 	},
 ];
-const NPM_DIST_TAG = "beta";
+const NPM_DIST_TAG = "latest";
 
 const dryRun = process.argv.includes("--dry-run");
 const unknownArgs = process.argv.slice(2).filter((arg) => arg !== "--dry-run");
