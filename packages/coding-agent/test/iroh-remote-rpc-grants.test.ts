@@ -60,6 +60,9 @@ describe("Iroh remote RPC grants", () => {
 		const chat = createIrohRemotePresetAccess("chat");
 		const full = createIrohRemotePresetAccess("full");
 		expect(coding.allowedTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+		expect(full.allowedTools).toBe(DEFAULT_IROH_REMOTE_ALLOW_TOOLS);
+		expect(coding.allowedTools.split(",")).toContain("image_gen");
+		expect(full.allowedTools.split(",")).toContain("image_gen");
 		expect(review.allowedTools).toBe("read,grep,find,ls");
 		expect(chat.allowedTools).toBe("");
 		expect(coding.rpcGrant.capabilities).toEqual([

@@ -39,7 +39,7 @@ const DEFAULT_SYNC_OPERATIONS: DurableAtomicWriteSyncOperations = {
  */
 export async function writeDurableAtomicFile(
 	path: string,
-	content: string,
+	content: string | Uint8Array,
 	options: { directoryMode?: number; fileMode?: number; operations?: DurableAtomicWriteOperations } = {},
 ): Promise<void> {
 	const operations = options.operations ?? DEFAULT_OPERATIONS;
@@ -51,7 +51,11 @@ export async function writeDurableAtomicFile(
 	await operations.mkdir(parentPath, { recursive: true, mode: options.directoryMode ?? 0o700 });
 	try {
 		tempHandle = await operations.open(tempPath, "wx", options.fileMode ?? 0o600);
-		await tempHandle.writeFile(content, "utf8");
+		if (typeof content === "string") {
+			await tempHandle.writeFile(content, "utf8");
+		} else {
+			await tempHandle.writeFile(content);
+		}
 		await tempHandle.sync();
 		await tempHandle.close();
 		tempHandle = undefined;

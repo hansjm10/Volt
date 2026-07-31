@@ -15,7 +15,7 @@
 
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type {
 	Agent,
 	AgentEvent,
@@ -43,6 +43,7 @@ import {
 	modelsAreEqual,
 	streamSimple,
 } from "@hansjm10/volt-ai";
+import { getAgentDir } from "../config.ts";
 import { writeDurableAtomicFileSync } from "../utils/durable-atomic-write.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -156,6 +157,7 @@ import {
 	createDefaultWebSearchOperations,
 	DEFAULT_ACTIVE_TOOL_NAMES,
 	extractUrls,
+	isCodexImageGenerationModel,
 	type SubagentToolDetails,
 	type SubagentToolManager,
 	type SubagentToolMode,
@@ -293,6 +295,8 @@ export interface AgentSessionConfig {
 	settingsManager: SettingsManager;
 	gitContextProvider?: GitContextProvider;
 	cwd: string;
+	/** Global config directory used for session-owned artifacts. Default: ~/.volt/agent */
+	agentDir?: string;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	/** Resource loader for skills, prompts, themes, context files, system prompt */
@@ -550,6 +554,7 @@ export class AgentSession {
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
+	private _agentDir: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
@@ -611,6 +616,7 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		this._agentDir = resolvePath(config.agentDir ?? getAgentDir());
 		this._modelRegistry = config.modelRegistry;
 		const restoredContext = this.sessionManager.buildSessionContext();
 		this._restoreFastModePolicy(restoredContext.fastMode);
@@ -643,7 +649,6 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
-		this._requestedBuildToolNames = this.getActiveToolNames();
 		this._planningRuntimeInitialized = true;
 		this._syncPlanningRuntime();
 		this._recoverDurableQueuedClientInputs();
@@ -1855,7 +1860,14 @@ export class AgentSession {
 		});
 	}
 
+	private _isToolAvailableToCurrentModel(name: string): boolean {
+		return name !== "image_gen" || isCodexImageGenerationModel(this.model);
+	}
+
 	private _isToolVisibleToCurrentMode(name: string): boolean {
+		if (!this._isToolAvailableToCurrentModel(name)) {
+			return false;
+		}
 		if (this._planningState.mode === "plan" || NATIVE_PLAN_TOOL_NAMES.has(name)) {
 			return this.getActiveToolNames().includes(name);
 		}
@@ -1882,7 +1894,7 @@ export class AgentSession {
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
 			const tool = this._toolRegistry.get(name);
-			if (tool) {
+			if (tool && this._isToolAvailableToCurrentModel(name)) {
 				tools.push(tool);
 				validToolNames.push(name);
 			}
@@ -1909,7 +1921,9 @@ export class AgentSession {
 						: [...this._requestedBuildToolNames],
 			),
 		];
-		const availableEffective = effective.filter((name) => this._toolRegistry.has(name));
+		const availableEffective = effective.filter(
+			(name) => this._toolRegistry.has(name) && this._isToolAvailableToCurrentModel(name),
+		);
 		const active = this.getActiveToolNames();
 		if (
 			active.length !== availableEffective.length ||
@@ -3926,6 +3940,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		this.agent.state.model = model;
+		this._syncPlanningRuntime();
 		if (persistDefault) {
 			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 		}
@@ -3964,6 +3979,7 @@ export class AgentSession {
 
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		this.agent.state.model = next.model;
+		this._syncPlanningRuntime();
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 		this.setThinkingLevel(thinkingLevel);
 		await Promise.all([this.sessionManager.flush(), this.settingsManager.flush()]);
@@ -3988,6 +4004,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		this.agent.state.model = nextModel;
+		this._syncPlanningRuntime();
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 		this.setThinkingLevel(thinkingLevel);
 		await Promise.all([this.sessionManager.flush(), this.settingsManager.flush()]);
@@ -4863,6 +4880,7 @@ export class AgentSession {
 		if (refreshedModel) {
 			if (refreshedModel !== currentModel) {
 				this.agent.state.model = refreshedModel;
+				this._syncPlanningRuntime();
 			}
 			return;
 		}
@@ -4873,12 +4891,14 @@ export class AgentSession {
 		const fallbackModel = scopedFallback ?? this._modelRegistry.getAvailable()[0];
 		if (!fallbackModel) {
 			(this.agent.state as unknown as { model: Model<any> | undefined }).model = undefined;
+			this._syncPlanningRuntime();
 			return;
 		}
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.sessionManager.appendModelChange(fallbackModel.provider, fallbackModel.id);
 		this.agent.state.model = fallbackModel;
+		this._syncPlanningRuntime();
 		this.setThinkingLevel(thinkingLevel, { persistDefault: false });
 	}
 
@@ -5101,7 +5121,11 @@ export class AgentSession {
 			}
 		}
 
-		this.setActiveToolsByName([...new Set(nextActiveToolNames)]);
+		const resolvedRequestedToolNames = [...new Set(nextActiveToolNames)];
+		if (!this._planningRuntimeInitialized) {
+			this._requestedBuildToolNames = resolvedRequestedToolNames.filter((name) => !NATIVE_PLAN_TOOL_NAMES.has(name));
+		}
+		this.setActiveToolsByName(resolvedRequestedToolNames);
 	}
 
 	/**
@@ -5200,6 +5224,33 @@ export class AgentSession {
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 					edit: { diagnosticsProvider: this._lspManager },
 					write: { diagnosticsProvider: this._lspManager },
+					imageGen: {
+						modelContext: async () => {
+							const model = this.model;
+							if (!isCodexImageGenerationModel(model)) return undefined;
+							const auth = await this._modelRegistry.getApiKeyAndHeaders(model);
+							if (!auth.ok) throw new Error(auth.error);
+							return { model, apiKey: auth.apiKey, headers: auth.headers };
+						},
+						recentImages: (count) => {
+							const images: ImageContent[] = [];
+							for (let messageIndex = this.agent.state.messages.length - 1; messageIndex >= 0; messageIndex--) {
+								const message = this.agent.state.messages[messageIndex];
+								if (message.role !== "user" && message.role !== "custom" && message.role !== "toolResult") {
+									continue;
+								}
+								if (!Array.isArray(message.content)) continue;
+								for (let contentIndex = message.content.length - 1; contentIndex >= 0; contentIndex--) {
+									const content = message.content[contentIndex];
+									if (content.type !== "image") continue;
+									images.push(content);
+									if (images.length === count) return images.reverse();
+								}
+							}
+							return images.reverse();
+						},
+						outputRoot: join(this._agentDir, "generated_images", this.sessionManager.getSessionId()),
+					},
 					webSearch: {
 						operations: createDefaultWebSearchOperations({
 							fallbackBraveApiKey: () =>
@@ -5942,6 +5993,7 @@ export class AgentSession {
 				? restoredThinkingLevel
 				: this._clampThinkingLevel(restoredThinkingLevel, availableThinkingLevels);
 			this._restoreFastModePolicy(sessionContext.fastMode);
+			this._syncPlanningRuntime();
 			if (this.thinkingLevel !== previousThinkingLevel) {
 				this._emitCommittedEvent({ type: "thinking_level_changed", level: this.thinkingLevel });
 				void this._extensionRunner.emit({

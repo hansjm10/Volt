@@ -536,16 +536,16 @@ describe("default grant tracking: cross-default upgrades", () => {
 });
 
 describe("default grant tracking: runtime policy semantics", () => {
-	it("exposes the plan-mode research tools to default-grant remote sessions", () => {
-		// #153: phone-hosted sessions must not be a worse research environment
-		// than the TUI — the vetted git/gh inspection tool and language-server
-		// reads belong in the default remote grant.
+	it("exposes research and Codex image-generation tools to default-grant remote sessions", () => {
+		// Phone-hosted sessions use the canonical current default directly: the
+		// research surface and image generation must not require a separate grant.
 		const policy = resolveIrohRemoteRuntimeToolPolicy({
 			clientAllowTools: DEFAULT_IROH_REMOTE_ALLOW_TOOLS,
 			daemonAllowTools: null,
 		});
 		expect(policy.tools).toContain("inspect");
 		expect(policy.tools).toContain("lsp");
+		expect(policy.tools).toContain("image_gen");
 	});
 
 	it("keeps the extension-tool wildcard for tracking clients", () => {

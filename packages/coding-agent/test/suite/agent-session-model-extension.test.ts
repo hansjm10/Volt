@@ -1,14 +1,32 @@
+import { Buffer } from "node:buffer";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { AgentTool, ThinkingLevel } from "@hansjm10/volt-agent-core";
-import { fauxAssistantMessage, fauxToolCall, type Model } from "@hansjm10/volt-ai";
+import { fauxAssistantMessage, fauxToolCall, type Model, type ToolResultMessage } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BuildSystemPromptOptions, ExtensionAPI } from "../../src/index.ts";
 import { createHarness, getAssistantTexts, type Harness } from "./harness.ts";
+
+const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg==";
+
+function codexToken(): string {
+	const payload = Buffer.from(
+		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "account-123" } }),
+	).toString("base64url");
+	return `header.${payload}.signature`;
+}
+
+function distinctPngData(suffix: number): string {
+	return Buffer.concat([Buffer.from(PNG_BASE64, "base64"), Buffer.from([suffix])]).toString("base64");
+}
 
 describe("AgentSession model and extension characterization", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.restoreAllMocks();
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
@@ -42,6 +60,149 @@ describe("AgentSession model and extension characterization", () => {
 				.filter((entry) => entry.type === "model_change")
 				.map((entry) => `${entry.provider}/${entry.modelId}`),
 		).toEqual([`${nextModel.provider}/${nextModel.id}`]);
+	});
+
+	it("exposes image_gen only for Codex models and preserves its requested state across switches", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const fauxModel = harness.getModel();
+		harness.authStorage.setRuntimeApiKey("openai-codex", "codex-key");
+		harness.session.modelRegistry.registerProvider("openai-codex", {
+			baseUrl: "https://chatgpt.com/backend-api",
+			apiKey: "codex-key",
+			api: "openai-codex-responses",
+			models: [
+				{
+					id: "gpt-codex-test",
+					name: "GPT Codex Test",
+					api: "openai-codex-responses",
+					reasoning: true,
+					input: ["text", "image"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 16_384,
+					baseUrl: "https://chatgpt.com/backend-api",
+				},
+			],
+		});
+		const codexModel = harness.session.modelRegistry.find("openai-codex", "gpt-codex-test");
+		expect(codexModel).toBeDefined();
+
+		expect(harness.session.getAllTools().map((tool) => tool.name)).not.toContain("image_gen");
+		expect(harness.session.getActiveToolNames()).not.toContain("image_gen");
+		expect(harness.session.getToolDefinition("image_gen")).toBeUndefined();
+
+		await harness.session.setModel(codexModel!, { persistDefault: false });
+		expect(harness.session.getAllTools().map((tool) => tool.name)).toContain("image_gen");
+		expect(harness.session.getActiveToolNames()).toContain("image_gen");
+		expect(harness.session.getToolDefinition("image_gen")).toBeDefined();
+		expect(harness.session.systemPrompt).toContain("- image_gen: Generate or edit images with GPT Image 2");
+
+		await harness.session.setModel(fauxModel, { persistDefault: false });
+		expect(harness.session.getActiveToolNames()).not.toContain("image_gen");
+		await harness.session.setModel(codexModel!, { persistDefault: false });
+		expect(harness.session.getActiveToolNames()).toContain("image_gen");
+
+		harness.session.setActiveToolsByName(
+			harness.session.getActiveToolNames().filter((toolName) => toolName !== "image_gen"),
+		);
+		await harness.session.setModel(fauxModel, { persistDefault: false });
+		await harness.session.setModel(codexModel!, { persistDefault: false });
+		expect(harness.session.getActiveToolNames()).not.toContain("image_gen");
+	});
+
+	it("edits RPC attachments and earlier conversation images from a session-scoped agentDir", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const generatedImageData = distinctPngData(1);
+		const customImageData = distinctPngData(2);
+		const rpcImageData = distinctPngData(3);
+
+		harness.setResponses([fauxAssistantMessage("seeded"), fauxAssistantMessage("ready to edit")]);
+		await harness.session.prompt("seed conversation");
+		const priorGeneratedResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "generated-image-call",
+			toolName: "image_gen",
+			content: [
+				{ type: "text", text: "Generated image" },
+				{ type: "image", mimeType: "image/png", data: generatedImageData },
+			],
+			details: {},
+			isError: false,
+			timestamp: Date.now(),
+		};
+		harness.session.agent.state.messages.push(priorGeneratedResult);
+		harness.session.agent.state.messages.push({
+			role: "custom",
+			customType: "reference_image",
+			content: [{ type: "image", mimeType: "image/png", data: customImageData }],
+			display: false,
+			timestamp: Date.now(),
+		});
+		await harness.session.prompt("Edit these attached references", {
+			images: [{ type: "image", mimeType: "image/png", data: rpcImageData }],
+			clientMessageId: "rpc-image-edit",
+			source: "rpc",
+		});
+
+		const token = codexToken();
+		harness.authStorage.setRuntimeApiKey("openai-codex", token);
+		harness.session.modelRegistry.registerProvider("openai-codex", {
+			baseUrl: "https://chatgpt.com/backend-api",
+			apiKey: token,
+			api: "openai-codex-responses",
+			models: [
+				{
+					id: "gpt-codex-image-edit",
+					name: "GPT Codex Image Edit",
+					api: "openai-codex-responses",
+					reasoning: true,
+					input: ["text", "image"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 16_384,
+					baseUrl: "https://chatgpt.com/backend-api",
+				},
+			],
+		});
+		const codexModel = harness.session.modelRegistry.find("openai-codex", "gpt-codex-image-edit");
+		expect(codexModel).toBeDefined();
+		await harness.session.setModel(codexModel!, { persistDefault: false });
+
+		const fetcher = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+			const body = JSON.parse(init?.body as string) as { images: Array<{ image_url: string }> };
+			expect(body.images).toEqual([
+				{ image_url: `data:image/png;base64,${generatedImageData}` },
+				{ image_url: `data:image/png;base64,${customImageData}` },
+				{ image_url: `data:image/png;base64,${rpcImageData}` },
+			]);
+			return new Response(JSON.stringify({ data: [{ b64_json: PNG_BASE64 }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		vi.stubGlobal("fetch", fetcher);
+
+		const imageGen = harness.session.agent.state.tools.find((tool) => tool.name === "image_gen");
+		expect(imageGen).toBeDefined();
+		const result = await imageGen!.execute("call/rpc edit", {
+			prompt: "Combine the references",
+			num_last_images_to_include: 3,
+		});
+		const expectedOutputPath = join(
+			harness.tempDir,
+			"generated_images",
+			harness.sessionManager.getSessionId(),
+			"call_rpc_edit.png",
+		);
+		expect(fetcher).toHaveBeenCalledOnce();
+		expect(result.details).toMatchObject({
+			operation: "edit",
+			outputPath: expectedOutputPath,
+			referencedConversationImageCount: 3,
+		});
+		expect(await readFile(expectedOutputPath)).toEqual(Buffer.from(PNG_BASE64, "base64"));
 	});
 
 	it("cycles through scoped models and preserves the scoped thinking preference", async () => {

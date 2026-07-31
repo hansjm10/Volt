@@ -190,7 +190,9 @@ export default function (volt) {
 			expect(existsSync(join(agentDir, "commands"))).toBe(false);
 			expect(readdirSync(join(agentDir, "sessions"))).toHaveLength(1);
 			expect(runtime.session.getActiveToolNames()).toEqual(
-				DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(",").filter((name) => name !== "subagent_registry"),
+				DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(",").filter(
+					(name) => name !== "subagent_registry" && name !== "image_gen",
+				),
 			);
 		} finally {
 			errorSpy.mockRestore();
@@ -231,7 +233,9 @@ export default function (volt) {
 			expect(runtime.session.getAllTools().map((tool) => tool.name)).toContain("remote_extension_tool");
 			expect(runtime.session.getActiveToolNames()).toEqual(
 				expect.arrayContaining([
-					...DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(",").filter((name) => name !== "subagent_registry"),
+					...DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(",").filter(
+						(name) => name !== "subagent_registry" && name !== "image_gen",
+					),
 					"remote_extension_tool",
 				]),
 			);

@@ -44,6 +44,20 @@ export {
 	type GrepToolOptions,
 } from "./grep.ts";
 export {
+	createImageGenTool,
+	createImageGenToolDefinition,
+	type ImageGenFetcher,
+	type ImageGenModelContext,
+	type ImageGenModelContextProvider,
+	type ImageGenRecentImagesProvider,
+	type ImageGenReferenceFileHandle,
+	type ImageGenReferenceFileOperations,
+	type ImageGenToolDetails,
+	type ImageGenToolInput,
+	type ImageGenToolOptions,
+	isCodexImageGenerationModel,
+} from "./image-gen.ts";
+export {
 	createInspectionTool,
 	createInspectionToolDefinition,
 	createLocalInspectionOperations,
@@ -179,6 +193,7 @@ import { type BashToolOptions, createBashTool, createBashToolDefinition } from "
 import { createEditTool, createEditToolDefinition, type EditToolOptions } from "./edit.ts";
 import { createFindTool, createFindToolDefinition, type FindToolOptions } from "./find.ts";
 import { createGrepTool, createGrepToolDefinition, type GrepToolOptions } from "./grep.ts";
+import { createImageGenTool, createImageGenToolDefinition, type ImageGenToolOptions } from "./image-gen.ts";
 import { createInspectionTool, createInspectionToolDefinition, type InspectionToolOptions } from "./inspect.ts";
 import { createLsTool, createLsToolDefinition, type LsToolOptions } from "./ls.ts";
 import { createLspTool, createLspToolDefinition, type LspToolOptions } from "./lsp.ts";
@@ -202,6 +217,7 @@ export type CoreToolName =
 	| "bash"
 	| "edit"
 	| "write"
+	| "image_gen"
 	| "web_search"
 	| "web_fetch"
 	| "grep"
@@ -215,6 +231,7 @@ export const DEFAULT_ACTIVE_TOOL_NAMES: readonly CoreToolName[] = [
 	"bash",
 	"edit",
 	"write",
+	"image_gen",
 	"web_search",
 	"web_fetch",
 ];
@@ -232,6 +249,7 @@ export const allToolNames: Set<ToolName> = new Set([
 	"bash",
 	"edit",
 	"write",
+	"image_gen",
 	"web_search",
 	"web_fetch",
 	"grep",
@@ -255,6 +273,7 @@ export interface ToolsOptions {
 	find?: FindToolOptions;
 	ls?: LsToolOptions;
 	inspect?: InspectionToolOptions;
+	imageGen?: ImageGenToolOptions;
 	lsp?: LspToolOptions;
 	subagent?: SubagentToolOptions;
 	subagentRegistry?: SubagentRegistryToolOptions;
@@ -271,6 +290,8 @@ export function createToolDefinition(toolName: ToolName, cwd: string, options?: 
 			return createEditToolDefinition(cwd, options?.edit);
 		case "write":
 			return createWriteToolDefinition(cwd, options?.write);
+		case "image_gen":
+			return createImageGenToolDefinition(cwd, options?.imageGen);
 		case "web_search":
 			return createWebSearchToolDefinition(cwd, options?.webSearch);
 		case "web_fetch":
@@ -315,6 +336,8 @@ export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptio
 			return createEditTool(cwd, options?.edit);
 		case "write":
 			return createWriteTool(cwd, options?.write);
+		case "image_gen":
+			return createImageGenTool(cwd, options?.imageGen);
 		case "web_search":
 			return createWebSearchTool(cwd, options?.webSearch);
 		case "web_fetch":
@@ -381,6 +404,7 @@ export function createAllToolDefinitions(
 		bash: createBashToolDefinition(cwd, options?.bash),
 		edit: createEditToolDefinition(cwd, options?.edit),
 		write: createWriteToolDefinition(cwd, options?.write),
+		image_gen: createImageGenToolDefinition(cwd, options?.imageGen),
 		web_search: createWebSearchToolDefinition(cwd, options?.webSearch),
 		web_fetch: createWebFetchToolDefinition(cwd, options?.webFetch),
 		grep: createGrepToolDefinition(cwd, options?.grep),
@@ -428,6 +452,7 @@ export function createAllTools(
 		bash: createBashTool(cwd, options?.bash),
 		edit: createEditTool(cwd, options?.edit),
 		write: createWriteTool(cwd, options?.write),
+		image_gen: createImageGenTool(cwd, options?.imageGen),
 		web_search: createWebSearchTool(cwd, options?.webSearch),
 		web_fetch: createWebFetchTool(cwd, options?.webFetch),
 		grep: createGrepTool(cwd, options?.grep),

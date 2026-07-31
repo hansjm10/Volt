@@ -599,13 +599,13 @@ const { session } = await createAgentSession({ resourceLoader: loader });
 
 Specify which built-in tools to enable:
 
-- Built-in tool names: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `subagent`, and child-only `subagent_registry`
-- Default built-ins: `read`, `bash`, `edit`, `write`, `subagent` when spawning is available, and `subagent_registry` when the manager belongs to a child runtime
+- Built-in tool names: `read`, `bash`, `edit`, `write`, `image_gen`, `web_search`, `web_fetch`, `grep`, `find`, `ls`, `inspect`, `lsp`, `subagent`, child-only `subagent_registry`, and `mcp`
+- Default built-ins: `read`, `bash`, `edit`, `write`, `web_search`, `web_fetch`, `image_gen` when an OpenAI Codex model is selected, `subagent` when spawning is available, and `subagent_registry` when the manager belongs to a child runtime
 - `noTools: "all"` disables all tools
 - `noTools: "builtin"` disables default built-ins, including `subagent`, while keeping extension and custom tools enabled
 - `excludeTools` disables specific built-in, extension, or custom tool names after any `tools` allowlist is applied
 
-The `edit` tool returns `details.diff` for Volt's TUI display and `details.patch` as a standard unified patch for SDK consumers.
+The `edit` tool returns `details.diff` for Volt's TUI display and `details.patch` as a standard unified patch for SDK consumers. The Codex-only `image_gen` tool can read and upload local reference images and write generated PNG files; include it in an explicit `tools` allowlist when an SDK session should retain that authority.
 
 ```typescript
 import { createAgentSession } from "@hansjm10/volt-coding-agent";
@@ -1299,8 +1299,9 @@ SettingsManager
 // Tool factories
 createCodingTools
 createReadOnlyTools
-createReadTool, createBashTool, createEditTool, createWriteTool
-createGrepTool, createFindTool, createLsTool, createSubagentTool, createSubagentRegistryTool
+createReadTool, createBashTool, createEditTool, createWriteTool, createImageGenTool
+createWebSearchTool, createWebFetchTool, createGrepTool, createFindTool, createLsTool
+createInspectionTool, createLspTool, createSubagentTool, createSubagentRegistryTool, createMcpTool
 
 // Types
 type CreateAgentSessionOptions

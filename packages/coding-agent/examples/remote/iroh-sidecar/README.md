@@ -199,12 +199,12 @@ Remote host support is a preview feature and should be treated as remote access 
 - Paired clients are persisted until revoked.
 - Any paired client can control the integrated runtime for registered workspace names in the same host state file.
 - Pairing is workstation-scoped in this preview. A paired client can use registered workspace names added later without another QR scan, and revocation blocks that client from every registered workspace.
-- Real Volt RPC can use only built-in tools allowed by the client's persisted `allowedTools` grant. That grant applies across all registered workspaces; when it is the default built-in list, active extension tools in the selected workspace are also exposed.
+- Real Volt RPC can use only built-in tools allowed by the client's persisted `allowedTools` grant. That grant applies across all registered workspaces; when it is the default built-in list, active extension tools in the selected workspace are also exposed. The `coding` and `full` RPC presets use the default list, including Codex-only `image_gen`.
 - Use a custom read-only tool list (`read,grep,find,ls`) unless the client, workspace, and loaded extensions are trusted.
-- `--allow-tools` grants that include `bash`, `edit`, or `write` can modify host files or run shell commands; extension tools run code installed on the host and may do the same. TTY host and pair commands ask for confirmation on unsafe built-in grants, and noninteractive commands must pass `--yes`.
+- `--allow-tools` grants that include `bash`, `edit`, `write`, or `image_gen` can modify host files; `bash` can run shell commands, and `image_gen` can read and upload local reference images and write generated PNG files. Extension tools run code installed on the host and may do the same. TTY host and pair commands ask for confirmation on unsafe built-in grants, and noninteractive commands must pass `--yes`.
 - Workspaces are registered locally and selected by saved name, not arbitrary client-provided paths. Remote clients cannot register, edit, delete, or map workspace paths.
 - Remote sessions do not bypass project trust. Saved workspace trust is honored; otherwise choose `trust` in the host prompt or use `--approve` only when the host user trusts project-local resources.
 - Default state and audit paths are `~/.volt/agent/daemon/state.json` and `~/.volt/agent/remote/iroh-host.audit.jsonl`.
-- Do not expose sensitive workspaces or run with `bash,edit,write` unless the client is trusted.
+- Do not expose sensitive workspaces or run with `bash,edit,write,image_gen` unless the client is trusted.
 
 See [Using Volt](../../../docs/usage.md#remote-access-over-iroh-preview), [Security](../../../docs/security.md#remote-access-over-iroh-preview), and [the design document](../../../docs/iroh-remote-access-design.md) for the product security model.
