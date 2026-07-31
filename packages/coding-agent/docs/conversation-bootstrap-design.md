@@ -6,6 +6,7 @@
 - Source branches at diagnosis: `Volt@7f3a873f` (`feat/stream-resync-rpc`), `volt-app@cbd0eb9` (`agent/stream-resync-recovery`)
 - Breaking changes: intentional. Volt is pre-alpha with no compatibility obligation; the app and daemon move together.
 - Supersedes: the resumable-event-stream proposal in §8 of `transcript-delta-catchup-design.md`. It does not supersede that document's persisted transcript/cache design.
+- Amended by: [Workspace Authority Generations and Retirement](workspace-authority-lifecycle-design.md), which scopes conversation ownership to an exact workspace authority generation and defines authority-tightening retirement.
 
 All paths are relative to `Volt/packages/coding-agent/` unless prefixed with `volt-app/`. Symbol names are the durable anchors; line numbers in investigation notes may drift.
 
@@ -438,6 +439,12 @@ Physical response delivery is not conversation ownership. Successful synchronous
 to the final ordered FIFO settles the RPC command's logical response obligation. Its physical delivery receipt remains
 owned by the stream lifecycle and may be rejected on retirement without delaying ingress EOF, admitted runtime
 operations, or conversation disposal.
+
+Conversation ownership is scoped to `(workspaceName, workspaceGeneration, sessionId)`, not merely workspace name and
+session ID. Workspace replacement, unregister, client access tightening, and revoke are authority-tightening
+operations: they synchronously close generation admission and use the terminal retirement and TUI acknowledgement
+barriers specified by [Workspace Authority Generations and Retirement](workspace-authority-lifecycle-design.md).
+Unlike ordinary handoff, those operations abort old-authority work rather than draining it to completion.
 
 ### I19. Durable client-input idempotency
 

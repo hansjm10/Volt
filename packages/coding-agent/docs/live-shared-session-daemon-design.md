@@ -3,6 +3,7 @@
 - Status: Accepted (implementation-ready)
 - Workspaces: `Volt/packages/coding-agent` (primary), `volt-app` (iOS deltas, section 10)
 - Supersedes: the host-process model described in `docs/iroh-remote-access-design.md` (that doc gets a superseded banner; see M10)
+- Amended by: [Workspace Authority Generations and Retirement](workspace-authority-lifecycle-design.md), which makes workspace generation part of every remote ownership identity and defines the mutation retirement barrier.
 - Breaking changes: allowed and taken freely (pre-alpha, zero users) EXCEPT the Pi extension API contract in `src/core/extensions/types.ts` (`ExtensionContext`, `ExtensionAPI`, `ExtensionUIContext`), which MUST remain source-compatible.
 
 All file paths in this document are relative to `Volt/packages/coding-agent/` unless prefixed with `volt-app/` or otherwise absolute. Line numbers reference the tree at design time and are anchors, not contracts; re-locate by symbol name when they drift.
@@ -18,7 +19,7 @@ Today, remote iOS access requires a foreground `volt remote host` process: a 373
 This RFC replaces that model with:
 
 1. **voltd** — a persistent, detached, Node-only daemon packaged inside `@hansjm10/volt-coding-agent`. It owns the stable Iroh node identity, pairing/revocation state, push + Live Activity dispatch, the workspace registry, an audit log, headless integrated runtimes, and a **conversation lease broker**. It is auto-spawned by `volt` startup when `remote.background` is enabled and is managed via `volt daemon start|stop|status|restart|logs|install-service`.
-2. **Conversation leases** — exactly one owner process per `(workspaceName, sessionId)` holds the live `AgentSessionRuntime` + `ExtensionRunner` + tools. The TUI owns leases for sessions it has open (full Pi extension fidelity, `ctx.mode === "tui"`); the daemon owns leases for headless sessions (`ctx.mode === "rpc"`, documented degradation). The lease key **drops** `clientNodeId`.
+2. **Conversation leases** — exactly one owner process per `(workspaceName, workspaceGeneration, sessionId)` holds the live `AgentSessionRuntime` + `ExtensionRunner` + tools. The TUI owns leases for sessions it has open (full Pi extension fidelity, `ctx.mode === "tui"`); the daemon owns leases for headless sessions (`ctx.mode === "rpc"`, documented degradation). The lease identity **drops** `clientNodeId` but includes the exact workspace authority generation as required by the [workspace authority amendment](workspace-authority-lifecycle-design.md).
 3. **Byte relay** — when the TUI owns a lease, the daemon authenticates the phone's Iroh conversation stream itself, then relays the framed JSONL bytes over the unix control socket to the TUI, which serves the stream with the existing `runIrohRemoteRpcMode(runtime, { stream: relayedStream, disposeRuntimeOnClose: false, ... })` against its in-process runtime. Phone prompts render live in the TUI because `InteractiveMode` renders user messages from `message_start` events regardless of origin (interactive-mode.ts L3008-3015).
 4. **Turn-boundary handoff** in both directions, with a draining state and a read-only viewer feed so a user opening the TUI mid-remote-turn watches the turn finish before taking ownership.
 5. **Abort redesign** — phone abort becomes "stop current turn" without stream closure or runtime disposal, deleting the host's `invalidateStreamAfterAbortResponse` behavior (iroh-host.mjs L1556-1564) and the iOS abort→expect-closure→reopen dance.
@@ -93,11 +94,12 @@ Lease ownership decides which box terminates the phone's conversation stream:
 
 ### 2.2 Ownership invariants
 
-1. **One runtime per conversation.** For any `(workspaceName, sessionId)`, at most one process holds a live `AgentSessionRuntime`. All phone streams and the TUI view fan out from that single runtime via `AgentSession.subscribe` (agent-session.ts L744-754; `_emit` L522-526 iterates subscribers).
+1. **One runtime per conversation authority.** For any `(workspaceName, workspaceGeneration, sessionId)`, at most one process holds a live `AgentSessionRuntime`. All phone streams and the TUI view fan out from that single runtime via `AgentSession.subscribe` (agent-session.ts L744-754; `_emit` L522-526 iterates subscribers). A same-name lease or runtime from another workspace generation is stale and cannot be reused.
 2. **Extensions co-locate with the runtime.** Handoff = dispose old runtime (`session_shutdown`) + fresh load in the new owner (`session_start` from the session file). Never state migration. There is no `session_switched` event in the codebase and none is added.
 3. **The session file is the source of truth across handoffs.** Both owners flush via the existing session persistence (JSONL tree format, `docs/session-format.md`, dir `join(agentDir, "sessions", "--<cwd-mangled>--")`, `SessionManager` in `src/core/session-manager.ts`).
-4. **The daemon always terminates Iroh.** The TUI never runs an Iroh node. Auth, handshake parsing, target resolution, and lease lookup happen in the daemon before any bytes reach the TUI.
+4. **The daemon always terminates Iroh.** The TUI never runs an Iroh node. Auth, handshake parsing, target resolution, and generation-scoped lease lookup happen in the daemon before any bytes reach the TUI.
 5. **Daemon integration is strictly additive for the TUI.** If the daemon is unreachable, every lease/relay/push-forward call silently no-ops and the TUI behaves exactly as today. `remote.background` controls auto-spawn; supported TUIs may still join a daemon started by another process.
+6. **Workspace authority changes are terminal barriers.** Replace, unregister, client access tightening, and revoke synchronously fence old authority and await daemon/TUI retirement before reporting success. The normative mutation protocol is defined by the [workspace authority amendment](workspace-authority-lifecycle-design.md).
 
 ### 2.3 Stream routing decision (daemon, per phone conversation stream)
 
@@ -106,7 +108,7 @@ phone opens conversation stream
   -> engine accepts, handshake read + client auth (existing handshake.ts / authorization.ts)
   -> resolveIrohRemoteSessionTarget(handshake.target)   [pure helper, §3.7]
        last | new | session -> concrete sessionId (+ selection kind created/created_after_missing/resumed)
-  -> leaseBroker.lookup(workspaceName, sessionId)
+  -> leaseBroker.lookup(workspaceName, workspaceGeneration, sessionId)
        tui-owned        -> mint relay token, send relay_offer to owning TUI, pipe bytes (§5.6)
        daemon-active    -> attach stream to existing daemon runtime (multi-subscriber)
        daemon-detached  -> cancel retention timer, reattach (state -> daemon-active)
