@@ -115,6 +115,7 @@ import {
 	type IrohConnectionLike,
 	type IrohEndpointLike,
 	type IrohModuleLike,
+	type IrohNativeLoadResult,
 	loadIrohModule,
 } from "./iroh-native.ts";
 import { IrohRemoteResourceGuard } from "./iroh-resource-guard.ts";
@@ -162,6 +163,7 @@ const DUPLICATE_CONVERSATION_RETRY_AFTER_MS = 500;
 const RELAY_OFFER_RETRY_AFTER_MS = 1000;
 const WORKSPACE_DISCOVERY_STREAM_SESSION_ID = "$workspace-discovery";
 const WORKSPACE_MANAGEMENT_STREAM_SESSION_ID = "$workspace-management";
+const IROH_ENDPOINT_ONLINE_TIMEOUT_MS = 10_000;
 const IROH_ENDPOINT_READY_TIMEOUT_MS = 15_000;
 const IROH_UNAUTHENTICATED_CONNECTION_TIMEOUT_MS = 15_000;
 const SHUTDOWN_RUNTIME_IDLE_CAP_MS = 60_000;
@@ -277,6 +279,10 @@ export interface IrohDaemonServiceDependencies {
 	decorateEndpoint?(endpoint: IrohEndpointLike): IrohEndpointLike;
 	/** Decorate an accepted raw stream before lifecycle fencing (test-only failure injection). */
 	decorateAcceptedStream?(stream: IrohBiStreamLike): IrohBiStreamLike;
+	/** Override native module loading for deterministic daemon tests. */
+	loadIrohModule?(): IrohNativeLoadResult;
+	/** Override the bounded endpoint-online wait for deterministic daemon tests. */
+	endpointOnlineTimeoutMs?: number;
 }
 
 export interface ResolvedIrohRelayConfig {
@@ -576,7 +582,7 @@ export function createIrohDaemonService(
 ): VoltdServiceExtension {
 	return (services: VoltdRuntimeServices) => {
 		const log = services.logger.child("iroh");
-		const loaded = loadIrohModule();
+		const loaded = dependencies.loadIrohModule?.() ?? loadIrohModule();
 		if (!loaded.iroh) {
 			log("warn", formatIrohLoadError(loaded.error));
 			return {
@@ -1070,11 +1076,39 @@ class IrohDaemonService {
 			// dispose owns and bounds those tasks instead.
 			releaseStartupAdmission();
 			if (this.relayMode !== "disabled") {
-				const onlineTask = Promise.resolve(endpoint.online());
+				const onlineTimeoutMs = this.dependencies.endpointOnlineTimeoutMs ?? IROH_ENDPOINT_ONLINE_TIMEOUT_MS;
+				const onlineTimeoutLabel =
+					onlineTimeoutMs % 1000 === 0 ? `${onlineTimeoutMs / 1000}s` : `${onlineTimeoutMs}ms`;
+				const onlineFailureGuidance =
+					this.relayMode === "production"
+						? `${
+								this.relayAuthToken === undefined ? "No production relay auth token is configured. " : ""
+							}Verify relay reachability, VOLT_IROH_RELAY_URLS, and VOLT_IROH_RELAY_AUTH_TOKEN, then restart the daemon; or set VOLT_IROH_RELAY_MODE=disabled before restarting for LAN-only connections.`
+						: "Verify network access to the development relays and restart the daemon, or set VOLT_IROH_RELAY_MODE=disabled before restarting for LAN-only connections.";
+				const onlineTimeoutMessage = `Iroh endpoint did not establish a relay connection within ${onlineTimeoutLabel}. ${onlineFailureGuidance}`;
+				this.log("info", "iroh endpoint bound; waiting for relay connection", {
+					relayMode: this.relayMode,
+					...(this.relayMode === "production"
+						? { relayUrls: this.relayUrls, relayAuthConfigured: this.relayAuthToken !== undefined }
+						: {}),
+				});
+				const boundEndpoint = endpoint;
+				const onlineTask = Promise.resolve().then(() => boundEndpoint.online());
 				this.trackNativeLifecycleTask(onlineTask);
-				const online = await waitUntilAdmissionCancelled(
-					onlineTask.then(() => true),
-					startupAdmission.signal,
+				const online = await withTimeout(
+					waitUntilAdmissionCancelled(
+						onlineTask.then(
+							() => true,
+							(error: unknown) => {
+								throw new Error(
+									`Iroh endpoint relay connection failed: ${error instanceof Error ? error.message : String(error)}. ${onlineFailureGuidance}`,
+								);
+							},
+						),
+						startupAdmission.signal,
+					),
+					onlineTimeoutMs,
+					onlineTimeoutMessage,
 				);
 				if (online !== true) {
 					this.retireEndpoint(endpoint, "iroh endpoint disposal after cancelled online failed");
