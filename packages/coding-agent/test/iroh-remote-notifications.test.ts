@@ -195,6 +195,7 @@ function createLiveActivityContentState(
 function startTestReview(
 	manager: ReviewWorkflowManager,
 	workflowId: string,
+	targetDescription = "uncommitted changes",
 ): {
 	finish(result: ExecuteReviewWorkflowResult): void;
 } {
@@ -208,7 +209,7 @@ function startTestReview(
 			action: "review.uncommitted",
 			resolution: {
 				description: "private review target",
-				workflowDescription: "uncommitted changes",
+				workflowDescription: targetDescription,
 				diffCommand: "git diff HEAD",
 				diff: "private diff",
 				truncated: false,
@@ -1799,16 +1800,113 @@ describe("Iroh remote notification requests", () => {
 			kind: "conversation_completed",
 			title: "Volt finished in volt-app",
 			body: "Your conversation is ready.",
-			workspace: "volt-app",
+			workspaceName: "volt-app",
 			data: {
 				eventId: "conversation:session-one:conversation-run:completed",
 				kind: "conversation_completed",
 				sessionId: "session-one",
-				workspace: "volt-app",
+				workspaceName: "volt-app",
 			},
 		};
 		await vi.waitFor(() => expect(relayClient.sendNotification).toHaveBeenCalledWith(expectedNotification));
 		expect(getNotifications(send)).toEqual([]);
+
+		recv.end();
+		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("emits plan-ready instead of generic completion and preserves equivalent push metadata", async () => {
+		const session = createTestSession("session-one", "before-run");
+		let planning: PlanningState = {
+			mode: "plan",
+			plan: { id: "plan-one", revision: 1, phase: "draft", steps: [] },
+		};
+		Object.defineProperty(session, "getPlanningState", { value: () => planning });
+		session.prompt.mockImplementation(
+			async (
+				_message: string,
+				options?: { preflightResult?: (result: PromptPreflightResult) => void },
+			): Promise<void> => {
+				options?.preflightResult?.({ success: true, outcome: "admitted" });
+				session.leafId = "plan-run";
+				planning = {
+					mode: "plan",
+					plan: {
+						id: "plan-one",
+						revision: 2,
+						phase: "ready",
+						title: `${"🚀".repeat(100)}\n/Users/private/project\ngit diff HEAD`,
+						steps: [],
+					},
+				};
+			},
+		);
+		const runtimeHost = {
+			...createStableSessionRunner(() => session),
+			session,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const { modePromise, recv, send } = await startIrohRpcMode(runtimeHost, session, {
+			workspaceName: "volt-app",
+		});
+
+		recv.pushLine(
+			JSON.stringify(
+				withCurrentConversationAuthority(send, {
+					id: "prompt-1",
+					type: "prompt",
+					clientMessageId: "client-prompt-1",
+					message: "make a plan",
+				}),
+			),
+		);
+
+		const expectedIntent = {
+			eventId: "plan:session-one:plan-run:ready",
+			kind: "plan_ready",
+			title: "Your plan is ready",
+			body: "Open Volt to review and approve it.",
+			sessionId: "session-one",
+			workspaceName: "volt-app",
+			planId: "plan-one",
+		};
+		await vi.waitFor(() =>
+			expect(getNotifications(send)).toEqual([{ type: "notification_request", ...expectedIntent }]),
+		);
+		expect(getNotifications(send)).not.toContainEqual(expect.objectContaining({ kind: "conversation_completed" }));
+		expect(JSON.stringify(getNotifications(send))).not.toContain("Users/private");
+		expect(JSON.stringify(getNotifications(send))).not.toContain("git diff");
+
+		const stateManager = createStateManagerWithClient([createEnabledPushTarget()]);
+		const relayClient = createRelayClient();
+		const dispatcher = new IrohRemotePushNotificationDispatcher({
+			clientNodeId: "paired-client",
+			relayClient,
+			retryDelayMs: 0,
+			stateManager,
+		});
+		await expect(dispatcher.deliverNotification(expectedIntent)).resolves.toBe("sent");
+		expect(relayClient.sendNotification).toHaveBeenCalledWith({
+			pushTargetId: "relay-target-1",
+			pushTargetAuthToken: "relay-target-auth-token",
+			eventId: expectedIntent.eventId,
+			kind: expectedIntent.kind,
+			title: expectedIntent.title,
+			body: expectedIntent.body,
+			workspaceName: expectedIntent.workspaceName,
+			planId: expectedIntent.planId,
+			data: {
+				eventId: expectedIntent.eventId,
+				kind: expectedIntent.kind,
+				sessionId: expectedIntent.sessionId,
+				workspaceName: expectedIntent.workspaceName,
+				planId: expectedIntent.planId,
+			},
+		});
 
 		recv.end();
 		await expect(modePromise).resolves.toBeUndefined();
@@ -2550,7 +2648,7 @@ describe("Iroh remote notification requests", () => {
 					title: "Volt finished in volt-app",
 					body: "Your conversation is ready.",
 					sessionId: "session-one",
-					workspace: "volt-app",
+					workspaceName: "volt-app",
 				},
 			]),
 		);
@@ -2750,6 +2848,128 @@ describe("Iroh remote notification requests", () => {
 		await expect(modePromise).resolves.toBeUndefined();
 	});
 
+	test("formats zero, one, many, and unknown review finding counts from retained workflow records", async () => {
+		const session = createTestSession("session-one", "review-run");
+		const reviewWorkflows = new ReviewWorkflowManager();
+		const runtimeHost = {
+			session,
+			reviewWorkflows,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const { modePromise, recv, send } = await startIrohRpcMode(runtimeHost, session);
+		const completions: Array<[string, ExecuteReviewWorkflowResult]> = [
+			["review:zero", { status: "completed", raw: "private", findingsCount: 0 }],
+			["review:one", { status: "completed", raw: "private", findingsCount: 1 }],
+			["review:many", { status: "completed", raw: "private", findingsCount: 4 }],
+			["review:unknown", { status: "completed", raw: "private" }],
+		];
+		for (const [index, [workflowId, result]] of completions.entries()) {
+			startTestReview(reviewWorkflows, workflowId, "PR #123").finish(result);
+			await vi.waitFor(() => expect(getNotifications(send)).toHaveLength(index + 1));
+		}
+
+		expect(getNotifications(send).map((notification) => notification.body)).toEqual([
+			"PR #123 completed with no issues found.",
+			"PR #123 completed with 1 finding.",
+			"PR #123 completed with 4 findings.",
+			"PR #123 completed. Open Volt to see the findings.",
+		]);
+		expect(getNotifications(send).map((notification) => notification.workflowId)).toEqual([
+			"review:zero",
+			"review:one",
+			"review:many",
+			"review:unknown",
+		]);
+
+		recv.end();
+		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("omits malicious review targets and cancelled reviews from lock-screen delivery", async () => {
+		const session = createTestSession("session-one", "review-run");
+		const reviewWorkflows = new ReviewWorkflowManager();
+		const runtimeHost = {
+			session,
+			reviewWorkflows,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const { modePromise, recv, send } = await startIrohRpcMode(runtimeHost, session);
+		startTestReview(
+			reviewWorkflows,
+			"review:malicious",
+			`${"PR #123".repeat(100)}\n/Users/private/project\ngit diff HEAD`,
+		).finish({ status: "completed", raw: "private diff", findingsCount: 2 });
+		await vi.waitFor(() => expect(getNotifications(send)).toHaveLength(1));
+		expect(getNotifications(send)[0]).toMatchObject({
+			body: "Review completed with 2 findings.",
+			workflowId: "review:malicious",
+		});
+		expect(JSON.stringify(getNotifications(send))).not.toContain("Users/private");
+		expect(JSON.stringify(getNotifications(send))).not.toContain("git diff");
+
+		startTestReview(reviewWorkflows, "review:cancelled").finish({ status: "cancelled" });
+		await reviewWorkflows.waitForIdle();
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(getNotifications(send)).toHaveLength(1);
+
+		recv.end();
+		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("retains detached review completion for reconnect and does not repeat an already delivered event", async () => {
+		const session = createTestSession("session-one", "review-run");
+		const reviewWorkflows = new ReviewWorkflowManager();
+		const runtimeHost = {
+			session,
+			reviewWorkflows,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const firstMode = await startIrohRpcMode(runtimeHost, session, { clientNodeId: "paired-client" });
+		const review = startTestReview(reviewWorkflows, "review:reconnect", "PR #151");
+		firstMode.recv.end();
+		await expect(firstMode.modePromise).resolves.toBeUndefined();
+		review.finish({ status: "completed", raw: "private", findingsCount: 0 });
+		await reviewWorkflows.waitForIdle();
+		expect(getNotifications(firstMode.send)).toEqual([]);
+
+		session.bindExtensions.mockClear();
+		const secondMode = await startIrohRpcMode(runtimeHost, session, { clientNodeId: "paired-client" });
+		await vi.waitFor(() =>
+			expect(getNotifications(secondMode.send)).toEqual([
+				{
+					type: "notification_request",
+					eventId: "review:reconnect:completed",
+					kind: "review_completed",
+					title: "Your review is ready",
+					body: "PR #151 completed with no issues found.",
+					sessionId: "session-one",
+					workflowId: "review:reconnect",
+				},
+			]),
+		);
+		secondMode.recv.end();
+		await expect(secondMode.modePromise).resolves.toBeUndefined();
+
+		session.bindExtensions.mockClear();
+		const thirdMode = await startIrohRpcMode(runtimeHost, session, { clientNodeId: "paired-client" });
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(getNotifications(thirdMode.send)).toEqual([]);
+		thirdMode.recv.end();
+		await expect(thirdMode.modePromise).resolves.toBeUndefined();
+	});
+
 	test("emits one review completion notification after a detached remote review completes", async () => {
 		const currentSession = createTestSession("initial-session", "initial-run");
 		const runtimeHost = {
@@ -2785,9 +3005,10 @@ describe("Iroh remote notification requests", () => {
 					type: "notification_request",
 					eventId: "review:test:completed",
 					kind: "review_completed",
-					title: "Review complete",
-					body: "Open Volt to see the findings.",
+					title: "Your review is ready",
+					body: "uncommitted changes completed with 1 finding.",
 					sessionId: "initial-session",
+					workflowId: "review:test",
 				},
 			]),
 		);

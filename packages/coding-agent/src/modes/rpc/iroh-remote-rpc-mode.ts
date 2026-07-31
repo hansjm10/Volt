@@ -5,6 +5,7 @@ import type { AgentMessage } from "@hansjm10/volt-agent-core";
 import type { AgentSessionEvent } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import { extractVisibleTextContent } from "../../core/messages.ts";
+import type { AgentMode, PlanPhase } from "../../core/planning.ts";
 import {
 	createIrohRemoteFilteredRpcTransport,
 	createIrohRemoteOutboundFilteredRpcTransport,
@@ -14,12 +15,22 @@ import {
 	type IrohRemoteLiveActivityUpdateIntent,
 	type IrohRemoteOutboundValueDecorator,
 	type IrohRemotePushNotificationDelivery,
+	type IrohRemotePushNotificationIntent,
 	type IrohRemoteRpcGrant,
 	MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
 	sanitizeIrohRemoteOutbound,
 	sanitizeIrohRemoteTranscriptText,
 } from "../../core/remote/iroh/index.ts";
+import {
+	MAX_IROH_REMOTE_NOTIFICATION_TITLE_UTF8_BYTES,
+	sanitizeIrohRemoteNotificationMetadata,
+	sanitizeIrohRemoteNotificationTarget,
+	sanitizeIrohRemoteNotificationText,
+	sanitizeIrohRemoteNotificationWorkspace,
+	sanitizeIrohRemotePushNotificationIntent,
+} from "../../core/remote/iroh/push.ts";
 import type { ReviewWorkflowEvent } from "../../core/review.ts";
+import type { ReviewWorkflowResultRecord } from "../../core/review-workflows.ts";
 import { getRpcErrorResponseTarget } from "../../core/rpc/correlation.ts";
 import {
 	type ConversationProjectionPreparedValue,
@@ -80,6 +91,7 @@ export interface IrohRemoteConversationLifecycle {
 
 export type IrohRemoteNotificationKind =
 	| "conversation_completed"
+	| "plan_ready"
 	| "review_completed"
 	| "action_completed"
 	| "host_notice";
@@ -91,7 +103,9 @@ export interface IrohRemoteNotificationRequest {
 	title: string;
 	body: string;
 	sessionId?: string;
-	workspace?: string;
+	workspaceName?: string;
+	planId?: string;
+	workflowId?: string;
 }
 
 type IrohRemoteRunTerminalOutcome = "completed" | "failed" | "aborted";
@@ -100,6 +114,10 @@ export interface IrohRemoteCompletionState {
 	sessionId: string;
 	runId?: string;
 	terminalOutcome?: IrohRemoteRunTerminalOutcome;
+	planningMode: AgentMode;
+	planPhase?: PlanPhase;
+	planId?: string;
+	planTitle?: string;
 }
 
 export interface IrohRemoteCompletedCommand {
@@ -146,12 +164,9 @@ interface IrohRemoteHostCommandRpcTransportOptions {
 	writeResponse?: (value: object) => void | Promise<void>;
 }
 
-/**
- * Cap on the per-stream completion-notification dedup set. Duplicate suppression
- * only needs recent history, so a very long-lived relay stream doing thousands of
- * turns evicts oldest-first rather than growing the set without bound.
- */
+/** Runtime/client reconciliation retains only recent terminal delivery history. */
 const MAX_SENT_NOTIFICATION_EVENT_IDS = 512;
+const MAX_PENDING_NOTIFICATION_EVENT_IDS = 512;
 
 /**
  * Scalar cap for tool result text shipped to remote clients (transcript entries
@@ -165,8 +180,8 @@ export function runIrohRemoteRpcMode(
 	runtimeHost: AgentSessionRuntime,
 	options: IrohRemoteRpcModeOptions,
 ): Promise<void> {
-	const sentNotificationEventIds = new Set<string>();
 	let detachLiveActivityUpdates: (() => void) | undefined;
+	let notificationDelivery: IrohRemoteNotificationDeliveryAttachment | undefined;
 	let transportClosed = false;
 	const attachLiveActivityUpdates = () => {
 		detachLiveActivityUpdates?.();
@@ -234,53 +249,6 @@ export function runIrohRemoteRpcMode(
 	};
 	let writeOrderedControl = (value: object): Promise<void> => Promise.resolve(outboundTransport.write(value));
 	let writeOrderedTerminal = (value: object): Promise<void> => Promise.resolve(outboundTransport.write(value));
-	const deliverCompletionNotification = async (notification: IrohRemoteNotificationRequest): Promise<void> => {
-		if (options.notificationDelivery) {
-			const deliveryStatus = await options.notificationDelivery.deliverNotification(notification);
-			if (deliveryStatus === "sent" || deliveryStatus === "duplicate") {
-				return;
-			}
-		}
-		await writeOrderedControl(notification);
-	};
-	const deliverNotificationOnce = async (notification: IrohRemoteNotificationRequest): Promise<void> => {
-		if (sentNotificationEventIds.has(notification.eventId)) {
-			return;
-		}
-		if (sentNotificationEventIds.size >= MAX_SENT_NOTIFICATION_EVENT_IDS) {
-			// Set preserves insertion order, so the first value is the oldest.
-			const oldest = sentNotificationEventIds.values().next().value;
-			if (oldest !== undefined) {
-				sentNotificationEventIds.delete(oldest);
-			}
-		}
-		sentNotificationEventIds.add(notification.eventId);
-		try {
-			await deliverCompletionNotification(notification);
-		} catch (error: unknown) {
-			sentNotificationEventIds.delete(notification.eventId);
-			throw error;
-		}
-	};
-	// Detached reviews complete via workflow_end events rather than a blocking
-	// invoke_ui_action response, so the review-completed push is keyed on the
-	// runtime-scoped workflow event stream.
-	const detachReviewWorkflowNotifications =
-		runtimeHost.reviewWorkflows?.attachSink((event) => {
-			if (event.type !== "workflow_end" || event.kind !== "review" || event.status !== "completed") {
-				return;
-			}
-			const workspace = getSafeNotificationWorkspace(options.workspaceName);
-			void deliverNotificationOnce({
-				type: "notification_request",
-				eventId: `${event.workflowId}:completed`,
-				kind: "review_completed",
-				title: workspace === undefined ? "Review complete" : `Review complete in ${workspace}`,
-				body: "Open Volt to see the findings.",
-				sessionId: runtimeHost.session.sessionId,
-				...(workspace === undefined ? {} : { workspace }),
-			}).catch(() => {});
-		}) ?? (() => {});
 	const closeDeferringTransport = createIrohRemoteCloseDeferringRpcTransport({
 		transport: outboundTransport,
 		preparedTransport: preparedOutboundTransport,
@@ -288,7 +256,7 @@ export function runIrohRemoteRpcMode(
 		onCommandCompleted: async (completion) => {
 			const notification = createIrohRemoteCompletionNotification(completion, options.workspaceName);
 			if (notification) {
-				await deliverNotificationOnce(notification);
+				await notificationDelivery?.deliver(notification);
 			}
 		},
 		onResponseWritten: options.onResponseWritten,
@@ -414,6 +382,12 @@ export function runIrohRemoteRpcMode(
 		settleDeliveryAfterRetirement(orderedSubscription.fenceAndEnqueueTerminal(value, admitPreparedResponse));
 	writeOrderedControl = enqueueOrderedControl;
 	writeOrderedTerminal = enqueueOrderedTerminal;
+	notificationDelivery = attachIrohRemoteNotificationDelivery(runtimeHost, {
+		clientNodeId: options.clientNodeId,
+		delivery: options.notificationDelivery,
+		workspaceName: options.workspaceName,
+		writeJsonl: enqueueOrderedControl,
+	});
 	const lifecycle: IrohRemoteConversationLifecycle = {
 		write: enqueueOrderedControl,
 		async terminate() {
@@ -474,13 +448,242 @@ export function runIrohRemoteRpcMode(
 		},
 	}).finally(() => {
 		transportClosed = true;
-		detachReviewWorkflowNotifications();
+		notificationDelivery?.detach();
 		detachSessionWillProject?.();
 		detachRawCloseRetirement();
 		retireConversation();
 		detachLiveActivityUpdates?.();
 		resolveModeSettled();
 	});
+}
+
+const anonymousNotificationClient = Symbol("anonymous-iroh-notification-client");
+type IrohRemoteNotificationClientKey = string | typeof anonymousNotificationClient;
+
+interface IrohRemoteNotificationDeliveryAttachment {
+	deliver(notification: IrohRemoteNotificationRequest): Promise<void>;
+	detach(): void;
+}
+
+interface IrohRemoteNotificationDeliveryAttachmentOptions {
+	clientNodeId?: string;
+	delivery?: IrohRemotePushNotificationDelivery;
+	workspaceName?: string;
+	writeJsonl(notification: IrohRemoteNotificationRequest): Promise<void>;
+}
+
+interface IrohRemoteActiveNotificationAttachment {
+	token: object;
+	writeJsonl(notification: IrohRemoteNotificationRequest): Promise<void>;
+}
+
+const notificationReconcilersByRuntime = new WeakMap<
+	AgentSessionRuntime,
+	Map<IrohRemoteNotificationClientKey, IrohRemoteNotificationDeliveryReconciler>
+>();
+
+class IrohRemoteNotificationDeliveryReconciler {
+	private readonly deliveredEventIds = new Set<string>();
+	private readonly pendingNotifications = new Map<string, IrohRemoteNotificationRequest>();
+	private readonly runtimeHost: AgentSessionRuntime;
+	private currentAttachment: IrohRemoteActiveNotificationAttachment | undefined;
+	private deliveryQueue: Promise<void> = Promise.resolve();
+	private pushDelivery: IrohRemotePushNotificationDelivery | undefined;
+	private workspaceName: string | undefined;
+
+	constructor(runtimeHost: AgentSessionRuntime) {
+		this.runtimeHost = runtimeHost;
+		runtimeHost.reviewWorkflows?.attachSink((event) => {
+			if (event.type !== "workflow_end" || event.kind !== "review" || event.status !== "completed") {
+				return;
+			}
+			const record = runtimeHost.reviewWorkflows?.get(event.workflowId);
+			if (record?.status !== "completed") {
+				return;
+			}
+			const notification = createIrohRemoteReviewCompletionNotification(
+				record,
+				runtimeHost.session.sessionId,
+				this.workspaceName,
+			);
+			if (notification) {
+				void this.deliver(notification);
+			}
+		});
+	}
+
+	attach(options: IrohRemoteNotificationDeliveryAttachmentOptions): IrohRemoteNotificationDeliveryAttachment {
+		const token = {};
+		this.currentAttachment = { token, writeJsonl: options.writeJsonl };
+		this.workspaceName = options.workspaceName;
+		this.pushDelivery = options.delivery;
+		for (const descriptor of this.runtimeHost.reviewWorkflows?.list() ?? []) {
+			if (descriptor.status !== "completed") {
+				continue;
+			}
+			const record = this.runtimeHost.reviewWorkflows?.get(descriptor.workflowId);
+			if (record?.status !== "completed") {
+				continue;
+			}
+			const notification = createIrohRemoteReviewCompletionNotification(
+				record,
+				this.runtimeHost.session.sessionId,
+				this.workspaceName,
+			);
+			if (notification) {
+				this.queueNotification(notification);
+			}
+		}
+		void this.enqueueFlush();
+		return {
+			deliver: (notification) => this.deliver(notification),
+			detach: () => {
+				if (this.currentAttachment?.token === token) {
+					this.currentAttachment = undefined;
+				}
+			},
+		};
+	}
+
+	deliver(notification: IrohRemoteNotificationRequest): Promise<void> {
+		this.queueNotification(notification);
+		return this.enqueueFlush();
+	}
+
+	private queueNotification(notification: IrohRemoteNotificationRequest): void {
+		const bounded = createBoundedIrohRemoteNotificationRequest(notification);
+		if (!bounded || this.deliveredEventIds.has(bounded.eventId) || this.pendingNotifications.has(bounded.eventId)) {
+			return;
+		}
+		while (this.pendingNotifications.size >= MAX_PENDING_NOTIFICATION_EVENT_IDS) {
+			const oldest = this.pendingNotifications.keys().next().value;
+			if (oldest === undefined) {
+				break;
+			}
+			this.pendingNotifications.delete(oldest);
+		}
+		this.pendingNotifications.set(bounded.eventId, bounded);
+	}
+
+	private enqueueFlush(): Promise<void> {
+		const flush = this.deliveryQueue.then(() => this.flush());
+		this.deliveryQueue = flush.catch(() => {});
+		return flush;
+	}
+
+	private async flush(): Promise<void> {
+		for (const [eventId, notification] of [...this.pendingNotifications]) {
+			if (this.deliveredEventIds.has(eventId)) {
+				this.pendingNotifications.delete(eventId);
+				continue;
+			}
+			if (this.pushDelivery) {
+				try {
+					const status = await this.pushDelivery.deliverNotification(notification);
+					if (status === "sent" || status === "duplicate") {
+						this.markDelivered(eventId);
+						continue;
+					}
+				} catch {
+					// Preserve the pending intent for JSONL fallback or a later reconnect.
+				}
+			}
+			const attachment = this.currentAttachment;
+			if (!attachment) {
+				continue;
+			}
+			try {
+				await attachment.writeJsonl(notification);
+				this.markDelivered(eventId);
+			} catch {
+				// The stream detached while writing. Keep the intent for reattachment.
+			}
+		}
+	}
+
+	private markDelivered(eventId: string): void {
+		this.pendingNotifications.delete(eventId);
+		if (this.deliveredEventIds.has(eventId)) {
+			return;
+		}
+		while (this.deliveredEventIds.size >= MAX_SENT_NOTIFICATION_EVENT_IDS) {
+			const oldest = this.deliveredEventIds.values().next().value;
+			if (oldest === undefined) {
+				break;
+			}
+			this.deliveredEventIds.delete(oldest);
+		}
+		this.deliveredEventIds.add(eventId);
+	}
+}
+
+function attachIrohRemoteNotificationDelivery(
+	runtimeHost: AgentSessionRuntime,
+	options: IrohRemoteNotificationDeliveryAttachmentOptions,
+): IrohRemoteNotificationDeliveryAttachment {
+	let reconcilers = notificationReconcilersByRuntime.get(runtimeHost);
+	if (!reconcilers) {
+		reconcilers = new Map();
+		notificationReconcilersByRuntime.set(runtimeHost, reconcilers);
+	}
+	const key = options.clientNodeId ?? anonymousNotificationClient;
+	let reconciler = reconcilers.get(key);
+	if (!reconciler) {
+		reconciler = new IrohRemoteNotificationDeliveryReconciler(runtimeHost);
+		reconcilers.set(key, reconciler);
+	}
+	return reconciler.attach(options);
+}
+
+function createIrohRemoteReviewCompletionNotification(
+	record: ReviewWorkflowResultRecord,
+	sessionId: string,
+	workspaceName: string | undefined,
+): IrohRemoteNotificationRequest | undefined {
+	const workflowId = sanitizeIrohRemoteNotificationMetadata(record.workflowId);
+	if (!workflowId) {
+		return undefined;
+	}
+	const target = sanitizeIrohRemoteNotificationTarget(record.target.description) ?? "Review";
+	const findingsCount =
+		Number.isSafeInteger(record.findingsCount) && (record.findingsCount ?? -1) >= 0
+			? record.findingsCount
+			: undefined;
+	const body =
+		findingsCount === undefined
+			? `${target} completed. Open Volt to see the findings.`
+			: findingsCount === 0
+				? `${target} completed with no issues found.`
+				: `${target} completed with ${findingsCount} finding${findingsCount === 1 ? "" : "s"}.`;
+	return createBoundedIrohRemoteNotificationRequest({
+		eventId: `${workflowId}:completed`,
+		kind: "review_completed",
+		title: "Your review is ready",
+		body,
+		sessionId,
+		...(workspaceName === undefined ? {} : { workspaceName }),
+		workflowId,
+	});
+}
+
+function isIrohRemoteNotificationKind(value: string): value is IrohRemoteNotificationKind {
+	return (
+		value === "conversation_completed" ||
+		value === "plan_ready" ||
+		value === "review_completed" ||
+		value === "action_completed" ||
+		value === "host_notice"
+	);
+}
+
+function createBoundedIrohRemoteNotificationRequest(
+	intent: IrohRemotePushNotificationIntent,
+): IrohRemoteNotificationRequest | undefined {
+	const sanitized = sanitizeIrohRemotePushNotificationIntent(intent);
+	if (!sanitized || !isIrohRemoteNotificationKind(sanitized.kind)) {
+		return undefined;
+	}
+	return { type: "notification_request", ...sanitized, kind: sanitized.kind };
 }
 
 interface IrohRemoteTranscriptEventOptions {
@@ -1310,10 +1513,20 @@ export function createIrohRemoteCloseDeferringRpcTransport(
 }
 
 function getIrohRemoteCompletionState(runtimeHost: AgentSessionRuntime): IrohRemoteCompletionState {
+	const planning = runtimeHost.session.getPlanningState?.() ?? { mode: "build" as const, plan: null };
+	const planId = sanitizeIrohRemoteNotificationMetadata(planning.plan?.id);
+	const planTitle =
+		planning.plan?.title === undefined
+			? undefined
+			: sanitizeIrohRemoteNotificationText(planning.plan.title, MAX_IROH_REMOTE_NOTIFICATION_TITLE_UTF8_BYTES);
 	return {
 		sessionId: runtimeHost.session.sessionId,
 		runId: runtimeHost.session.sessionManager.getLeafId() ?? undefined,
 		terminalOutcome: getRunTerminalOutcome(runtimeHost.session.messages),
+		planningMode: planning.mode,
+		...(planning.plan === null ? {} : { planPhase: planning.plan.phase }),
+		...(planId === undefined ? {} : { planId }),
+		...(planTitle === undefined ? {} : { planTitle }),
 	};
 }
 
@@ -1325,51 +1538,55 @@ function createIrohRemoteCompletionNotification(
 	if (!finalState) {
 		return undefined;
 	}
-	const workspace = getSafeNotificationWorkspace(workspaceName);
-	const workspaceDetails = workspace === undefined ? {} : { workspace };
-	if (isConversationCompletionCommand(completion.command)) {
-		switch (finalState.terminalOutcome) {
-			case "failed":
-				return {
-					type: "notification_request",
-					eventId: `conversation:${finalState.sessionId}:${finalState.runId}:failed`,
-					kind: "host_notice",
-					title: workspace === undefined ? "Volt needs attention" : `Volt needs attention in ${workspace}`,
-					body: "Open Volt to view the error.",
-					sessionId: finalState.sessionId,
-					...workspaceDetails,
-				};
-			case "aborted":
-				return undefined;
-			case "completed":
-				return {
-					type: "notification_request",
-					eventId: `conversation:${finalState.sessionId}:${finalState.runId}:completed`,
-					kind: "conversation_completed",
-					title: workspace === undefined ? "Volt finished" : `Volt finished in ${workspace}`,
-					body: "Your conversation is ready.",
-					sessionId: finalState.sessionId,
-					...workspaceDetails,
-				};
-		}
-	}
-	return undefined;
-}
-
-function getSafeNotificationWorkspace(workspaceName: string | undefined): string | undefined {
-	if (workspaceName === undefined) {
+	if (!isConversationCompletionCommand(completion.command)) {
 		return undefined;
 	}
-	const trimmed = workspaceName.trim();
-	if (trimmed.length === 0 || trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("\0")) {
-		return undefined;
+	const workspaceNameMetadata = sanitizeIrohRemoteNotificationWorkspace(workspaceName);
+	const workspaceDetails = workspaceNameMetadata === undefined ? {} : { workspaceName: workspaceNameMetadata };
+	switch (finalState.terminalOutcome) {
+		case "failed":
+			return createBoundedIrohRemoteNotificationRequest({
+				eventId: `conversation:${finalState.sessionId}:${finalState.runId}:failed`,
+				kind: "host_notice",
+				title:
+					workspaceNameMetadata === undefined
+						? "Volt needs attention"
+						: `Volt needs attention in ${workspaceNameMetadata}`,
+				body: "Open Volt to view the error.",
+				sessionId: finalState.sessionId,
+				...workspaceDetails,
+			});
+		case "aborted":
+			return undefined;
+		case "completed":
+			if (finalState.planningMode === "plan" && finalState.planPhase === "ready") {
+				if (!finalState.planId) {
+					return undefined;
+				}
+				return createBoundedIrohRemoteNotificationRequest({
+					eventId: `plan:${finalState.sessionId}:${finalState.runId}:ready`,
+					kind: "plan_ready",
+					title: "Your plan is ready",
+					body: "Open Volt to review and approve it.",
+					sessionId: finalState.sessionId,
+					...workspaceDetails,
+					planId: finalState.planId,
+				});
+			}
+			return createBoundedIrohRemoteNotificationRequest({
+				eventId: `conversation:${finalState.sessionId}:${finalState.runId}:completed`,
+				kind: "conversation_completed",
+				title: workspaceNameMetadata === undefined ? "Volt finished" : `Volt finished in ${workspaceNameMetadata}`,
+				body: "Your conversation is ready.",
+				sessionId: finalState.sessionId,
+				...workspaceDetails,
+			});
 	}
-	return trimmed;
 }
 
 function getChangedFinalCompletionState(
 	completion: IrohRemoteCompletedCommand,
-): { sessionId: string; runId: string; terminalOutcome: IrohRemoteRunTerminalOutcome } | undefined {
+): (IrohRemoteCompletionState & { runId: string; terminalOutcome: IrohRemoteRunTerminalOutcome }) | undefined {
 	const finalState = completion.finalState;
 	if (!finalState?.runId) {
 		return undefined;
@@ -1379,7 +1596,7 @@ function getChangedFinalCompletionState(
 		return undefined;
 	}
 	return {
-		sessionId: finalState.sessionId,
+		...finalState,
 		runId: finalState.runId,
 		terminalOutcome: finalState.terminalOutcome ?? "completed",
 	};
