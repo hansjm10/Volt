@@ -2,10 +2,11 @@ import { Buffer } from "node:buffer";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, extname, join } from "node:path";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
-import type { Api, Model } from "@hansjm10/volt-ai";
+import type { Api, ImageContent, Model } from "@hansjm10/volt-ai";
 import { type Static, Type } from "typebox";
 import { getAgentDir, VERSION } from "../../config.ts";
-import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
+import { decodeImageToPng } from "../../utils/image-codec.ts";
+import { detectSupportedImageMimeType } from "../../utils/mime.ts";
 import { getVoltUserAgent } from "../../utils/volt-user-agent.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import { resolveToCwd } from "./path-utils.ts";
@@ -26,6 +27,13 @@ const imageGenSchema = Type.Object({
 		Type.Array(Type.String({ description: "Path to a local input image" }), {
 			description: "Up to 5 local images to edit or use as references",
 			maxItems: MAX_REFERENCE_IMAGES,
+		}),
+	),
+	num_last_images_to_include: Type.Optional(
+		Type.Integer({
+			description: "Number of recent conversation images to edit or use as references",
+			minimum: 1,
+			maximum: MAX_REFERENCE_IMAGES,
 		}),
 	),
 	output_path: Type.Optional(
@@ -50,8 +58,13 @@ export type ImageGenModelContextProvider = () =>
 
 export type ImageGenFetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+export type ImageGenRecentImagesProvider = (
+	count: number,
+) => Promise<readonly ImageContent[]> | readonly ImageContent[];
+
 export interface ImageGenToolOptions {
 	modelContext?: ImageGenModelContextProvider;
+	recentImages?: ImageGenRecentImagesProvider;
 	fetcher?: ImageGenFetcher;
 	outputRoot?: string;
 	timeoutMs?: number;
@@ -62,6 +75,7 @@ export interface ImageGenToolDetails {
 	operation: "generate" | "edit";
 	outputPath: string;
 	referencedImagePaths?: string[];
+	referencedConversationImageCount?: number;
 	size?: string;
 	quality?: string;
 }
@@ -125,16 +139,41 @@ function defaultOutputPath(outputRoot: string, toolCallId: string): string {
 	return join(outputRoot, `${sanitizeFileStem(toolCallId)}.png`);
 }
 
-async function referenceImage(path: string, cwd: string): Promise<{ path: string; image_url: string }> {
-	const absolutePath = resolveToCwd(path, cwd);
-	const mimeType = await detectSupportedImageMimeTypeFromFile(absolutePath);
-	if (!mimeType) {
-		throw new Error(`Referenced file is not a supported image: ${path}`);
+interface ImageReference {
+	path?: string;
+	image_url: string;
+}
+
+async function normalizeReferenceImage(data: Uint8Array, description: string): Promise<string> {
+	const detectedMimeType = detectSupportedImageMimeType(data);
+	if (!detectedMimeType) {
+		throw new Error(`${description} is not a supported image`);
 	}
+	if (detectedMimeType !== "image/gif") {
+		return `data:${detectedMimeType};base64,${Buffer.from(data).toString("base64")}`;
+	}
+	const png = await decodeImageToPng(data);
+	if (!png) {
+		throw new Error(`${description} could not be converted from GIF to PNG`);
+	}
+	return `data:image/png;base64,${Buffer.from(png).toString("base64")}`;
+}
+
+async function referenceImage(path: string, cwd: string): Promise<ImageReference> {
+	const absolutePath = resolveToCwd(path, cwd);
 	const data = await readFile(absolutePath);
 	return {
 		path: absolutePath,
-		image_url: `data:${mimeType};base64,${data.toString("base64")}`,
+		image_url: await normalizeReferenceImage(data, `Referenced file ${path}`),
+	};
+}
+
+async function conversationReferenceImage(image: ImageContent, index: number): Promise<ImageReference> {
+	return {
+		image_url: await normalizeReferenceImage(
+			Buffer.from(image.data, "base64"),
+			`Recent conversation image ${index + 1}`,
+		),
 	};
 }
 
@@ -193,10 +232,12 @@ export function createImageGenToolDefinition(
 		name: "image_gen",
 		label: "image_gen",
 		description:
-			"Generate or edit an image with OpenAI GPT Image 2. Reference up to 5 local images and optionally choose where the generated PNG is saved.",
+			"Generate or edit an image with OpenAI GPT Image 2. Reference up to 5 local or recent conversation images and optionally choose where the generated PNG is saved.",
 		promptSnippet: "Generate or edit images with GPT Image 2",
 		promptGuidelines: [
 			"Use image_gen when the user asks to create or edit an image and a Codex model is selected.",
+			"For edits, use referenced_image_paths when every target has a local path; otherwise set num_last_images_to_include to the smallest recent-image count that includes every target.",
+			"Never provide both referenced_image_paths and num_last_images_to_include.",
 			"Set output_path when the image should become a repository asset; otherwise it is saved in Volt's generated-images directory.",
 		],
 		parameters: imageGenSchema,
@@ -204,6 +245,10 @@ export function createImageGenToolDefinition(
 			if (signal?.aborted) throw new Error("Operation aborted");
 			const prompt = params.prompt.trim();
 			if (!prompt) throw new Error("image_gen prompt must not be empty");
+			const outputPath = params.output_path
+				? resolveToCwd(params.output_path, cwd)
+				: defaultOutputPath(outputRoot, toolCallId);
+			ensurePngOutputPath(outputPath);
 
 			const context = await options.modelContext?.();
 			if (!context || !isCodexImageGenerationModel(context.model)) {
@@ -214,10 +259,37 @@ export function createImageGenToolDefinition(
 			}
 
 			const requestedPaths = params.referenced_image_paths ?? [];
+			const requestedConversationImageCount = params.num_last_images_to_include;
 			if (requestedPaths.length > MAX_REFERENCE_IMAGES) {
 				throw new Error(`referenced_image_paths must contain at most ${MAX_REFERENCE_IMAGES} paths`);
 			}
-			const references = await Promise.all(requestedPaths.map((path) => referenceImage(path, cwd)));
+			if (
+				requestedConversationImageCount !== undefined &&
+				(!Number.isInteger(requestedConversationImageCount) ||
+					requestedConversationImageCount < 1 ||
+					requestedConversationImageCount > MAX_REFERENCE_IMAGES)
+			) {
+				throw new Error(`num_last_images_to_include must be between 1 and ${MAX_REFERENCE_IMAGES}`);
+			}
+			if (requestedPaths.length > 0 && requestedConversationImageCount !== undefined) {
+				throw new Error("Provide only one of referenced_image_paths or num_last_images_to_include");
+			}
+
+			let references: ImageReference[] = [];
+			if (requestedPaths.length > 0) {
+				references = await Promise.all(requestedPaths.map((path) => referenceImage(path, cwd)));
+			} else if (requestedConversationImageCount !== undefined) {
+				const recentImages = await options.recentImages?.(requestedConversationImageCount);
+				if (!recentImages) {
+					throw new Error("Recent conversation images are unavailable in this session");
+				}
+				if (recentImages.length !== requestedConversationImageCount) {
+					throw new Error(
+						`Requested the last ${requestedConversationImageCount} conversation images, but only ${recentImages.length} were available`,
+					);
+				}
+				references = await Promise.all(recentImages.map(conversationReferenceImage));
+			}
 			const operation = references.length > 0 ? "edit" : "generate";
 			const endpointOperation = operation === "edit" ? "edits" : "generations";
 			const headers = new Headers(context.model.headers);
@@ -275,19 +347,20 @@ export function createImageGenToolDefinition(
 				throw new Error("OpenAI Codex image generation returned invalid image data");
 			}
 
-			const outputPath = params.output_path
-				? resolveToCwd(params.output_path, cwd)
-				: defaultOutputPath(outputRoot, toolCallId);
-			ensurePngOutputPath(outputPath);
 			await mkdir(dirname(outputPath), { recursive: true });
 			await writeFile(outputPath, imageBytes);
 
-			const referencedImagePaths = references.map((reference) => reference.path);
+			const referencedImagePaths = references.flatMap((reference) =>
+				reference.path === undefined ? [] : [reference.path],
+			);
 			const details: ImageGenToolDetails = {
 				model: IMAGE_MODEL,
 				operation,
 				outputPath,
 				...(referencedImagePaths.length > 0 ? { referencedImagePaths } : {}),
+				...(requestedConversationImageCount !== undefined
+					? { referencedConversationImageCount: requestedConversationImageCount }
+					: {}),
 				...(parsed.size ? { size: parsed.size } : {}),
 				...(parsed.quality ? { quality: parsed.quality } : {}),
 			};

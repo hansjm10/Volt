@@ -2,11 +2,12 @@ import { Buffer } from "node:buffer";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, Model } from "@hansjm10/volt-ai";
+import type { Api, ImageContent, Model } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createImageGenTool, type ImageGenFetcher, isCodexImageGenerationModel } from "../src/index.ts";
 
 const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg==";
+const GIF_BASE64 = "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
 
 const tempDirs: string[] = [];
 
@@ -146,6 +147,99 @@ describe("image_gen tool", () => {
 			outputPath: expectedOutputPath,
 			referencedImagePaths: [referencePath],
 		});
+	});
+
+	it("edits the exact recent conversation images in provider order", async () => {
+		const cwd = await createTempDir();
+		const firstImage = { type: "image", mimeType: "image/png", data: PNG_BASE64 } as const;
+		const secondData = Buffer.concat([Buffer.from(PNG_BASE64, "base64"), Buffer.from([1])]).toString("base64");
+		const secondImage = { type: "image", mimeType: "image/jpeg", data: secondData } as const;
+		const recentImages = vi.fn<(count: number) => readonly ImageContent[]>(() => [firstImage, secondImage]);
+		const fetcher = vi.fn<ImageGenFetcher>(async (input, init) => {
+			expect(input).toBe("https://chatgpt.com/backend-api/codex/images/edits");
+			expect(JSON.parse(init?.body as string)).toMatchObject({
+				images: [
+					{ image_url: `data:image/png;base64,${PNG_BASE64}` },
+					{ image_url: `data:image/png;base64,${secondData}` },
+				],
+			});
+			return jsonResponse({ data: [{ b64_json: PNG_BASE64 }] });
+		});
+		const tool = createImageGenTool(cwd, {
+			fetcher,
+			outputRoot: join(cwd, "generated"),
+			recentImages,
+			modelContext: () => ({ model: codexModel(), apiKey: codexToken() }),
+		});
+
+		const result = await tool.execute("conversation-edit", {
+			prompt: "Combine the references",
+			num_last_images_to_include: 2,
+		});
+
+		expect(recentImages).toHaveBeenCalledWith(2);
+		expect(result.details).toMatchObject({
+			operation: "edit",
+			referencedConversationImageCount: 2,
+		});
+	});
+
+	it("rejects ambiguous or insufficient conversation image selectors without fetching", async () => {
+		const cwd = await createTempDir();
+		const fetcher = vi.fn<ImageGenFetcher>();
+		const tool = createImageGenTool(cwd, {
+			fetcher,
+			recentImages: () => [{ type: "image", mimeType: "image/png", data: PNG_BASE64 }],
+			modelContext: () => ({ model: codexModel(), apiKey: codexToken() }),
+		});
+
+		await expect(
+			tool.execute("ambiguous", {
+				prompt: "Edit",
+				referenced_image_paths: ["reference.png"],
+				num_last_images_to_include: 1,
+			}),
+		).rejects.toThrow("Provide only one of referenced_image_paths or num_last_images_to_include");
+		await expect(tool.execute("insufficient", { prompt: "Edit", num_last_images_to_include: 2 })).rejects.toThrow(
+			"Requested the last 2 conversation images, but only 1 were available",
+		);
+		expect(fetcher).not.toHaveBeenCalled();
+	});
+
+	it("converts referenced GIFs to PNG before sending an edit", async () => {
+		const cwd = await createTempDir();
+		await writeFile(join(cwd, "reference.gif"), Buffer.from(GIF_BASE64, "base64"));
+		const fetcher = vi.fn<ImageGenFetcher>(async (_input, init) => {
+			const body = JSON.parse(init?.body as string) as { images: Array<{ image_url: string }> };
+			expect(body.images).toHaveLength(1);
+			expect(body.images[0]?.image_url).toMatch(/^data:image\/png;base64,/);
+			expect(body.images[0]?.image_url).not.toContain(GIF_BASE64);
+			return jsonResponse({ data: [{ b64_json: PNG_BASE64 }] });
+		});
+		const tool = createImageGenTool(cwd, {
+			fetcher,
+			outputRoot: join(cwd, "generated"),
+			modelContext: () => ({ model: codexModel(), apiKey: codexToken() }),
+		});
+
+		await tool.execute("gif-edit", {
+			prompt: "Edit the GIF",
+			referenced_image_paths: ["reference.gif"],
+		});
+		expect(fetcher).toHaveBeenCalledOnce();
+	});
+
+	it("rejects non-PNG output paths before resolving auth or fetching", async () => {
+		const cwd = await createTempDir();
+		const fetcher = vi.fn<ImageGenFetcher>();
+		const modelContext = vi.fn(() => ({ model: codexModel(), apiKey: codexToken() }));
+		const tool = createImageGenTool(cwd, { fetcher, modelContext });
+
+		await expect(tool.execute("bad-output", { prompt: "A fox", output_path: "fox.jpg" })).rejects.toThrow(
+			"image_gen output_path must use a .png extension",
+		);
+		expect(modelContext).not.toHaveBeenCalled();
+		expect(fetcher).not.toHaveBeenCalled();
 	});
 
 	it("rejects execution without a selected Codex model", async () => {

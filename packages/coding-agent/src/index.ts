@@ -776,6 +776,7 @@ export {
 	type ImageGenFetcher,
 	type ImageGenModelContext,
 	type ImageGenModelContextProvider,
+	type ImageGenRecentImagesProvider,
 	type ImageGenToolDetails,
 	type ImageGenToolInput,
 	type ImageGenToolOptions,

@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { Buffer } from "node:buffer";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { type FauxProviderRegistration, getModel, registerFauxProvider } from "@hansjm10/volt-ai";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
@@ -10,6 +11,15 @@ import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createTestResourceLoader } from "./utilities.ts";
+
+const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg==";
+
+function codexToken(): string {
+	const payload = Buffer.from(
+		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "account-123" } }),
+	).toString("base64url");
+	return `header.${payload}.signature`;
+}
 
 function toDisplayPath(path: string): string {
 	return path.replace(/\\/g, "/");
@@ -31,6 +41,8 @@ describe("createAgentSession session manager defaults", () => {
 	});
 
 	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.restoreAllMocks();
 		while (sessions.length > 0) {
 			sessions.pop()?.dispose();
 		}
@@ -61,6 +73,64 @@ describe("createAgentSession session manager defaults", () => {
 		expect(sessionFile ? dirname(sessionFile) : undefined).toBe(expectedSessionDir);
 
 		session.dispose();
+	});
+
+	it("uses agentDir and session identity for generated image artifacts", async () => {
+		const token = codexToken();
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey("openai-codex", token);
+		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		modelRegistry.registerProvider("openai-codex", {
+			baseUrl: "https://chatgpt.com/backend-api",
+			apiKey: token,
+			api: "openai-codex-responses",
+			models: [
+				{
+					id: "gpt-codex-image-output",
+					name: "GPT Codex Image Output",
+					api: "openai-codex-responses",
+					reasoning: true,
+					input: ["text", "image"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 16_384,
+					baseUrl: "https://chatgpt.com/backend-api",
+				},
+			],
+		});
+		const model = modelRegistry.find("openai-codex", "gpt-codex-image-output");
+		expect(model).toBeDefined();
+		const sessionManager = SessionManager.inMemory(cwd);
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			model: model!,
+			authStorage,
+			modelRegistry,
+			settingsManager: SettingsManager.inMemory(),
+			resourceLoader: createTestResourceLoader(),
+			sessionManager,
+			disableMcp: true,
+		});
+		sessions.push(session);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(
+				async () =>
+					new Response(JSON.stringify({ data: [{ b64_json: PNG_BASE64 }] }), {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					}),
+			),
+		);
+
+		const imageGen = session.agent.state.tools.find((tool) => tool.name === "image_gen");
+		expect(imageGen).toBeDefined();
+		const result = await imageGen!.execute("sdk/output", { prompt: "A fox" });
+		const expectedPath = join(agentDir, "generated_images", sessionManager.getSessionId(), "sdk_output.png");
+
+		expect(result.details).toMatchObject({ outputPath: expectedPath });
+		expect(readFileSync(expectedPath)).toEqual(Buffer.from(PNG_BASE64, "base64"));
 	});
 
 	it("keeps an explicit sessionManager override", async () => {

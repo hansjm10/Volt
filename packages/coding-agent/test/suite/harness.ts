@@ -56,6 +56,7 @@ export function getAssistantTexts(harness: Harness): string[] {
 }
 
 export interface HarnessOptions {
+	agentDir?: string;
 	models?: FauxModelDefinition[];
 	settings?: Partial<Settings>;
 	systemPrompt?: string;
@@ -175,6 +176,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		sessionManager,
 		settingsManager,
 		cwd: tempDir,
+		agentDir: options.agentDir ?? tempDir,
 		modelRegistry,
 		resourceLoader,
 		baseToolsOverride: toolMap,

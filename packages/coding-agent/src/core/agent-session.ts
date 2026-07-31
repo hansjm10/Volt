@@ -15,7 +15,7 @@
 
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type {
 	Agent,
 	AgentEvent,
@@ -43,6 +43,7 @@ import {
 	modelsAreEqual,
 	streamSimple,
 } from "@hansjm10/volt-ai";
+import { getAgentDir } from "../config.ts";
 import { writeDurableAtomicFileSync } from "../utils/durable-atomic-write.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -294,6 +295,8 @@ export interface AgentSessionConfig {
 	settingsManager: SettingsManager;
 	gitContextProvider?: GitContextProvider;
 	cwd: string;
+	/** Global config directory used for session-owned artifacts. Default: ~/.volt/agent */
+	agentDir?: string;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	/** Resource loader for skills, prompts, themes, context files, system prompt */
@@ -551,6 +554,7 @@ export class AgentSession {
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
+	private _agentDir: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
@@ -612,6 +616,7 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		this._agentDir = resolvePath(config.agentDir ?? getAgentDir());
 		this._modelRegistry = config.modelRegistry;
 		const restoredContext = this.sessionManager.buildSessionContext();
 		this._restoreFastModePolicy(restoredContext.fastMode);
@@ -5227,6 +5232,24 @@ export class AgentSession {
 							if (!auth.ok) throw new Error(auth.error);
 							return { model, apiKey: auth.apiKey, headers: auth.headers };
 						},
+						recentImages: (count) => {
+							const images: ImageContent[] = [];
+							for (let messageIndex = this.agent.state.messages.length - 1; messageIndex >= 0; messageIndex--) {
+								const message = this.agent.state.messages[messageIndex];
+								if (message.role !== "user" && message.role !== "custom" && message.role !== "toolResult") {
+									continue;
+								}
+								if (!Array.isArray(message.content)) continue;
+								for (let contentIndex = message.content.length - 1; contentIndex >= 0; contentIndex--) {
+									const content = message.content[contentIndex];
+									if (content.type !== "image") continue;
+									images.push(content);
+									if (images.length === count) return images.reverse();
+								}
+							}
+							return images.reverse();
+						},
+						outputRoot: join(this._agentDir, "generated_images", this.sessionManager.getSessionId()),
 					},
 					webSearch: {
 						operations: createDefaultWebSearchOperations({
