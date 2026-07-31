@@ -156,6 +156,7 @@ import {
 	createDefaultWebSearchOperations,
 	DEFAULT_ACTIVE_TOOL_NAMES,
 	extractUrls,
+	isCodexImageGenerationModel,
 	type SubagentToolDetails,
 	type SubagentToolManager,
 	type SubagentToolMode,
@@ -643,7 +644,6 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
-		this._requestedBuildToolNames = this.getActiveToolNames();
 		this._planningRuntimeInitialized = true;
 		this._syncPlanningRuntime();
 		this._recoverDurableQueuedClientInputs();
@@ -1855,7 +1855,14 @@ export class AgentSession {
 		});
 	}
 
+	private _isToolAvailableToCurrentModel(name: string): boolean {
+		return name !== "image_gen" || isCodexImageGenerationModel(this.model);
+	}
+
 	private _isToolVisibleToCurrentMode(name: string): boolean {
+		if (!this._isToolAvailableToCurrentModel(name)) {
+			return false;
+		}
 		if (this._planningState.mode === "plan" || NATIVE_PLAN_TOOL_NAMES.has(name)) {
 			return this.getActiveToolNames().includes(name);
 		}
@@ -1882,7 +1889,7 @@ export class AgentSession {
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
 			const tool = this._toolRegistry.get(name);
-			if (tool) {
+			if (tool && this._isToolAvailableToCurrentModel(name)) {
 				tools.push(tool);
 				validToolNames.push(name);
 			}
@@ -1909,7 +1916,9 @@ export class AgentSession {
 						: [...this._requestedBuildToolNames],
 			),
 		];
-		const availableEffective = effective.filter((name) => this._toolRegistry.has(name));
+		const availableEffective = effective.filter(
+			(name) => this._toolRegistry.has(name) && this._isToolAvailableToCurrentModel(name),
+		);
 		const active = this.getActiveToolNames();
 		if (
 			active.length !== availableEffective.length ||
@@ -3926,6 +3935,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		this.agent.state.model = model;
+		this._syncPlanningRuntime();
 		if (persistDefault) {
 			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 		}
@@ -3964,6 +3974,7 @@ export class AgentSession {
 
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		this.agent.state.model = next.model;
+		this._syncPlanningRuntime();
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 		this.setThinkingLevel(thinkingLevel);
 		await Promise.all([this.sessionManager.flush(), this.settingsManager.flush()]);
@@ -3988,6 +3999,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		this.agent.state.model = nextModel;
+		this._syncPlanningRuntime();
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 		this.setThinkingLevel(thinkingLevel);
 		await Promise.all([this.sessionManager.flush(), this.settingsManager.flush()]);
@@ -4863,6 +4875,7 @@ export class AgentSession {
 		if (refreshedModel) {
 			if (refreshedModel !== currentModel) {
 				this.agent.state.model = refreshedModel;
+				this._syncPlanningRuntime();
 			}
 			return;
 		}
@@ -4873,12 +4886,14 @@ export class AgentSession {
 		const fallbackModel = scopedFallback ?? this._modelRegistry.getAvailable()[0];
 		if (!fallbackModel) {
 			(this.agent.state as unknown as { model: Model<any> | undefined }).model = undefined;
+			this._syncPlanningRuntime();
 			return;
 		}
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.sessionManager.appendModelChange(fallbackModel.provider, fallbackModel.id);
 		this.agent.state.model = fallbackModel;
+		this._syncPlanningRuntime();
 		this.setThinkingLevel(thinkingLevel, { persistDefault: false });
 	}
 
@@ -5101,7 +5116,11 @@ export class AgentSession {
 			}
 		}
 
-		this.setActiveToolsByName([...new Set(nextActiveToolNames)]);
+		const resolvedRequestedToolNames = [...new Set(nextActiveToolNames)];
+		if (!this._planningRuntimeInitialized) {
+			this._requestedBuildToolNames = resolvedRequestedToolNames.filter((name) => !NATIVE_PLAN_TOOL_NAMES.has(name));
+		}
+		this.setActiveToolsByName(resolvedRequestedToolNames);
 	}
 
 	/**
@@ -5200,6 +5219,15 @@ export class AgentSession {
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 					edit: { diagnosticsProvider: this._lspManager },
 					write: { diagnosticsProvider: this._lspManager },
+					imageGen: {
+						modelContext: async () => {
+							const model = this.model;
+							if (!isCodexImageGenerationModel(model)) return undefined;
+							const auth = await this._modelRegistry.getApiKeyAndHeaders(model);
+							if (!auth.ok) throw new Error(auth.error);
+							return { model, apiKey: auth.apiKey, headers: auth.headers };
+						},
+					},
 					webSearch: {
 						operations: createDefaultWebSearchOperations({
 							fallbackBraveApiKey: () =>
@@ -5942,6 +5970,7 @@ export class AgentSession {
 				? restoredThinkingLevel
 				: this._clampThinkingLevel(restoredThinkingLevel, availableThinkingLevels);
 			this._restoreFastModePolicy(sessionContext.fastMode);
+			this._syncPlanningRuntime();
 			if (this.thinkingLevel !== previousThinkingLevel) {
 				this._emitCommittedEvent({ type: "thinking_level_changed", level: this.thinkingLevel });
 				void this._extensionRunner.emit({

@@ -44,6 +44,55 @@ describe("AgentSession model and extension characterization", () => {
 		).toEqual([`${nextModel.provider}/${nextModel.id}`]);
 	});
 
+	it("exposes image_gen only for Codex models and preserves its requested state across switches", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const fauxModel = harness.getModel();
+		harness.authStorage.setRuntimeApiKey("openai-codex", "codex-key");
+		harness.session.modelRegistry.registerProvider("openai-codex", {
+			baseUrl: "https://chatgpt.com/backend-api",
+			apiKey: "codex-key",
+			api: "openai-codex-responses",
+			models: [
+				{
+					id: "gpt-codex-test",
+					name: "GPT Codex Test",
+					api: "openai-codex-responses",
+					reasoning: true,
+					input: ["text", "image"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 16_384,
+					baseUrl: "https://chatgpt.com/backend-api",
+				},
+			],
+		});
+		const codexModel = harness.session.modelRegistry.find("openai-codex", "gpt-codex-test");
+		expect(codexModel).toBeDefined();
+
+		expect(harness.session.getAllTools().map((tool) => tool.name)).not.toContain("image_gen");
+		expect(harness.session.getActiveToolNames()).not.toContain("image_gen");
+		expect(harness.session.getToolDefinition("image_gen")).toBeUndefined();
+
+		await harness.session.setModel(codexModel!, { persistDefault: false });
+		expect(harness.session.getAllTools().map((tool) => tool.name)).toContain("image_gen");
+		expect(harness.session.getActiveToolNames()).toContain("image_gen");
+		expect(harness.session.getToolDefinition("image_gen")).toBeDefined();
+		expect(harness.session.systemPrompt).toContain("- image_gen: Generate or edit images with GPT Image 2");
+
+		await harness.session.setModel(fauxModel, { persistDefault: false });
+		expect(harness.session.getActiveToolNames()).not.toContain("image_gen");
+		await harness.session.setModel(codexModel!, { persistDefault: false });
+		expect(harness.session.getActiveToolNames()).toContain("image_gen");
+
+		harness.session.setActiveToolsByName(
+			harness.session.getActiveToolNames().filter((toolName) => toolName !== "image_gen"),
+		);
+		await harness.session.setModel(fauxModel, { persistDefault: false });
+		await harness.session.setModel(codexModel!, { persistDefault: false });
+		expect(harness.session.getActiveToolNames()).not.toContain("image_gen");
+	});
+
 	it("cycles through scoped models and preserves the scoped thinking preference", async () => {
 		const harness = await createHarness({
 			models: [
