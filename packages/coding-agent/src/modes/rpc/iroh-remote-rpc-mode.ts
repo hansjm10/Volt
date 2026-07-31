@@ -51,6 +51,8 @@ export interface IrohRemoteRpcModeOptions extends IrohRpcTransportOptions {
 	rpcGrant: IrohRemoteRpcGrant;
 	/** Stable paired-client identity for Live Activity observer handoff across stream reattachment. */
 	clientNodeId?: string;
+	/** Stop terminally fenced ingress while preserving already-admitted ordered output. */
+	isRpcIngressOpen?: () => boolean;
 	/** Recheck persisted authority at each command boundary when the host owns grant state. */
 	isRpcGrantCurrent?: () => boolean | Promise<boolean>;
 	decorateOutbound?: IrohRemoteOutboundValueDecorator;
@@ -271,6 +273,7 @@ export function runIrohRemoteRpcMode(
 		rpcGrant: options.rpcGrant,
 		writeRejectedResponse: (value) => writeOrderedControl(value),
 		writeStaleGrantResponse: (value) => writeOrderedTerminal(value),
+		isRpcIngressOpen: options.isRpcIngressOpen,
 		isRpcGrantCurrent: options.isRpcGrantCurrent,
 		onRpcGrantStale: () => retireConversationStream(),
 	});

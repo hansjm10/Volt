@@ -12,6 +12,7 @@ import {
 	CONTROL_WORKTREES_CAPABILITY,
 	type ControlEvent,
 	type ControlWorktreeStatus,
+	type LeaseReleaseReason,
 	type LeaseState,
 	type RelayPreamble,
 } from "../../daemon/control-protocol.ts";
@@ -57,6 +58,48 @@ export interface RelayRpcForwardResult {
 	workspaceMetadata?: { workspaceNames: string[]; workspaces: Array<{ name: string; status: string }> };
 }
 
+export interface RelayWorkspaceUnregisterRetirement {
+	isIngressOpen(): boolean;
+	observeForwardedResponse(command: Record<string, unknown>, response: Record<string, unknown>): void;
+	onResponseWritten(response: Record<string, unknown>): Promise<void>;
+	finalize(): Promise<void>;
+}
+
+export function createRelayWorkspaceUnregisterRetirement(
+	daemonAttach: Pick<DaemonAttach, "release">,
+	getSessionId: () => string,
+): RelayWorkspaceUnregisterRetirement {
+	let workspaceUnregistered = false;
+	let releasePromise: Promise<void> | undefined;
+	const release = (): Promise<void> => {
+		releasePromise ??= daemonAttach.release(getSessionId(), "workspace_unregistered");
+		return releasePromise;
+	};
+	return {
+		isIngressOpen: () => !workspaceUnregistered,
+		observeForwardedResponse(command, response) {
+			if (
+				command.type === "unregister_workspace" &&
+				response.type === "response" &&
+				response.command === "unregister_workspace" &&
+				response.success === true
+			) {
+				workspaceUnregistered = true;
+			}
+		},
+		async onResponseWritten(response) {
+			if (workspaceUnregistered && response.command === "unregister_workspace" && response.success === true) {
+				await release();
+			}
+		},
+		async finalize() {
+			if (workspaceUnregistered) {
+				await release();
+			}
+		},
+	};
+}
+
 export interface RelayNotificationDeliveryForwarder {
 	deliverNotification(
 		clientNodeId: string,
@@ -85,7 +128,7 @@ export interface DaemonAttach {
 	/** Connect, resolve (or auto-register) the cwd workspace. Never throws. */
 	start(): Promise<void>;
 	acquire(sessionId: string): Promise<AcquireOutcome>;
-	release(sessionId: string): Promise<void>;
+	release(sessionId: string, reason?: LeaseReleaseReason): Promise<void>;
 	prepareRekey(oldSessionId: string, newSessionId: string): Promise<DaemonAttachRekeyTransaction | undefined>;
 	/**
 	 * Forward a state-touching RPC command from a relayed phone conversation to
@@ -560,7 +603,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 				return NOOP_OUTCOME;
 			}
 		},
-		async release(sessionId: string) {
+		async release(sessionId: string, reason = "quit") {
 			if (currentSessionId === sessionId) {
 				currentSessionId = undefined;
 			}
@@ -573,7 +616,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 				return;
 			}
 			try {
-				await activeClient.request({ type: "lease_release", workspaceName, sessionId });
+				await activeClient.request({ type: "lease_release", workspaceName, sessionId, reason });
 			} catch {
 				// Daemon-side implicit release on disconnect covers this.
 			}
@@ -606,6 +649,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 									type: "lease_release",
 									workspaceName: connectedWorkspaceName,
 									sessionId: oldSessionId,
+									reason: "switch",
 								});
 							} catch {
 								// The old connection may already have released this lease.
@@ -660,6 +704,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 									type: "lease_release",
 									workspaceName: disposeWorkspaceName,
 									sessionId: disposedSessionId,
+									reason: "quit",
 								});
 							} catch {
 								// Disconnect cleanup releases any server-side owner.
@@ -731,7 +776,12 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					}
 					try {
 						if (phase === "committed") {
-							await activeClient.request({ type: "lease_release", workspaceName, sessionId: newSessionId });
+							await activeClient.request({
+								type: "lease_release",
+								workspaceName,
+								sessionId: newSessionId,
+								reason: "quit",
+							});
 						} else {
 							await activeClient.request({ type: "lease_rekey_dispose", transactionId });
 						}

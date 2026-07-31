@@ -185,6 +185,7 @@ async function createFixture(
 	options: {
 		recv?: ManualIrohRecvStream;
 		send?: ManualIrohSendStream;
+		isRpcIngressOpen?: () => boolean;
 		isRpcGrantCurrent?: () => boolean | Promise<boolean>;
 		onClientCapabilitiesChanged?: (features: string[]) => void;
 		onConversationLifecycleReady?: (lifecycle: IrohRemoteConversationLifecycle) => void;
@@ -250,6 +251,7 @@ async function createFixture(
 			? {}
 			: { onConversationLifecycleReady: options.onConversationLifecycleReady }),
 		...(options.onResponseWritten === undefined ? {} : { onResponseWritten: options.onResponseWritten }),
+		...(options.isRpcIngressOpen === undefined ? {} : { isRpcIngressOpen: options.isRpcIngressOpen }),
 		...(options.isRpcGrantCurrent === undefined ? {} : { isRpcGrantCurrent: options.isRpcGrantCurrent }),
 		...(options.remoteCommandHandler === undefined ? {} : { remoteCommandHandler: options.remoteCommandHandler }),
 	});
@@ -506,6 +508,52 @@ describe("Iroh ordered conversation integration", () => {
 			expect(frames).not.toContainEqual(expect.objectContaining({ type: "turn_start" }));
 			expect(frames).not.toContainEqual(expect.objectContaining({ id: "stale-1", type: "response" }));
 			expect(send.finished).toBe(true);
+		} finally {
+			send.releaseBlockedWrite();
+			await fixture.close();
+		}
+	});
+
+	it("preserves an admitted terminal response while dropping pipelined ingress", async () => {
+		let ingressOpen = true;
+		const send = new GatedIrohSendStream();
+		const remoteCommandHandler = vi.fn(async (command: Record<string, unknown>) => {
+			if (command.type === "unregister_workspace") {
+				ingressOpen = false;
+			}
+			return {
+				id: command.id,
+				type: "response",
+				command: command.type,
+				success: true,
+			};
+		});
+		const fixture = await createFixture(() => {}, {
+			send,
+			isRpcIngressOpen: () => ingressOpen,
+			remoteCommandHandler,
+		});
+		try {
+			const blockedWriteStarted = send.blockNextWrite();
+			fixture.recv.pushLine(
+				JSON.stringify({ id: "remove", type: "unregister_workspace", workspaceName: "scratch" }),
+			);
+			await blockedWriteStarted;
+			fixture.recv.pushLine(JSON.stringify({ id: "pipelined", type: "get_state" }));
+			await new Promise<void>((resolve) => setImmediate(resolve));
+
+			expect(remoteCommandHandler).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ id: "remove", type: "unregister_workspace" }),
+			);
+			expect(parseWrittenObjects(send).map((frame) => frame.type)).toEqual(["conversation_bootstrap"]);
+
+			send.releaseBlockedWrite();
+			await vi.waitFor(() =>
+				expect(parseWrittenObjects(send)).toContainEqual(
+					expect.objectContaining({ id: "remove", command: "unregister_workspace", success: true }),
+				),
+			);
+			expect(parseWrittenObjects(send)).not.toContainEqual(expect.objectContaining({ id: "pipelined" }));
 		} finally {
 			send.releaseBlockedWrite();
 			await fixture.close();

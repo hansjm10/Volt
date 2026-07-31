@@ -6,6 +6,10 @@
  * are doubles.
  */
 
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
@@ -16,7 +20,8 @@ import { writeIrohRemoteHandshakeResponse } from "../src/core/remote/iroh/handsh
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
 import type { RpcConversationAuthority } from "../src/core/rpc/types.ts";
 import { createDaemonClient, type DaemonClient } from "../src/daemon/control-client.ts";
-import { type ControlServer, startControlServer } from "../src/daemon/control-server.ts";
+import type { ControlRequest } from "../src/daemon/control-protocol.ts";
+import { type ControlConnection, type ControlServer, startControlServer } from "../src/daemon/control-server.ts";
 import {
 	handleIntegratedConversationRpcCommand,
 	REMOTE_SESSION_LIST_CURSOR_TTL_MS,
@@ -26,7 +31,16 @@ import {
 	decorateRemoteHostState,
 	type IntegratedConversationSessionSelection,
 } from "../src/daemon/handshake-responses.ts";
-import { type RelayLifecycleOwner, RelayRegistry } from "../src/daemon/relay-stream.ts";
+import { LeaseBroker } from "../src/daemon/lease-broker.ts";
+import { ensureDaemonDirs, getDaemonPaths } from "../src/daemon/paths.ts";
+import { type RelayLifecycleOwner, type RelayOutcome, RelayRegistry } from "../src/daemon/relay-stream.ts";
+import {
+	createDaemonAttach,
+	createRelayWorkspaceUnregisterRetirement,
+	type DaemonAttach,
+	type DaemonRelayOffer,
+	type OpenedRelay,
+} from "../src/modes/interactive/daemon-attach.ts";
 import { adaptRelaySocketToIrohStream } from "../src/modes/interactive/relay-stream-adapter.ts";
 import { runIrohRemoteRpcMode } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
 import { createTestIrohConversationOptions, createTestSession } from "./iroh-stream-doubles.ts";
@@ -175,6 +189,181 @@ async function startDaemonHarness(): Promise<DaemonHarness> {
 	return { socketPath: endpoint.socketPath, registry, server };
 }
 
+interface OwnedRelayDaemonHarness {
+	agentDir: string;
+	workspaceDir: string;
+	registry: RelayRegistry;
+	broker: LeaseBroker;
+	server: ControlServer;
+	attach: DaemonAttach;
+}
+
+async function startOwnedRelayDaemonHarness(): Promise<OwnedRelayDaemonHarness> {
+	const agentDir = mkdtempSync(join(tmpdir(), "volt-dualfe-owned-"));
+	const workspaceDir = mkdtempSync(join(tmpdir(), "volt-dualfe-owned-ws-"));
+	const paths = getDaemonPaths(agentDir);
+	ensureDaemonDirs(paths);
+	const authToken = randomUUID();
+	const registry = new RelayRegistry();
+	let workspaceRegistered = true;
+	let server: ControlServer;
+	const broker = new LeaseBroker({
+		isRuntimeStreaming: () => false,
+		waitForRuntimeIdle: async () => {},
+		disposeRuntime: async () => {},
+		closePhoneStreams: () => {},
+		closeRelays: (record, reason) => {
+			for (const relayId of Array.from(record.relayIds)) {
+				void registry.get(relayId)?.close(reason);
+			}
+		},
+		beginTuiLeaseHandoff: () => {},
+		commitTuiLeaseHandoff: () => {},
+		cancelTuiLeaseHandoff: () => {},
+		releaseTuiLease: () => {},
+		prepareTuiLeaseRekey: () => {},
+		commitTuiLeaseRekey: () => {},
+		rollbackTuiLeaseRekey: () => {},
+		audit: () => {},
+	});
+	const handleRequest = async (connection: ControlConnection, request: ControlRequest): Promise<void> => {
+		switch (request.type) {
+			case "status":
+				connection.send({
+					type: "status_result",
+					id: request.id,
+					version: "0.0.0-test",
+					protocolVersion: 1,
+					pid: process.pid,
+					startedAtMs: 0,
+					leases: broker.list().map((record) => ({
+						workspaceName: record.workspaceName,
+						sessionId: record.sessionId,
+						state: record.state,
+						relayCount: record.relayIds.size,
+						streamCount: record.streamCount,
+					})),
+					phoneConnections: registry.activeCount(),
+					workspaces: workspaceRegistered ? [{ name: WORKSPACE.name, path: workspaceDir }] : [],
+					clients: [],
+					keepAwake: { enabled: false, state: "disabled" },
+				});
+				return;
+			case "lease_acquire": {
+				const outcome = await broker.acquireForTui({
+					connectionId: connection.connectionId,
+					workspaceName: request.workspaceName,
+					sessionId: request.sessionId,
+					force: request.force,
+				});
+				connection.send(
+					outcome.kind === "granted"
+						? {
+								type: "lease_granted",
+								id: request.id,
+								workspaceName: request.workspaceName,
+								sessionId: request.sessionId,
+								handoff: outcome.handoff,
+							}
+						: {
+								type: "lease_denied",
+								id: request.id,
+								reason: outcome.kind === "denied" ? outcome.reason : "draining_elsewhere",
+							},
+				);
+				return;
+			}
+			case "lease_release": {
+				const released = broker.releaseFromTui(
+					connection.connectionId,
+					request.workspaceName,
+					request.sessionId,
+					request.reason,
+				);
+				connection.send(
+					released.ok
+						? { type: "ok", id: request.id }
+						: { type: "error", id: request.id, code: released.code, message: "lease not held" },
+				);
+				return;
+			}
+			case "relay_rpc": {
+				const authorized = registry.authorizeRpc(request.relayId, connection.connectionId, {
+					clientNodeId: request.clientNodeId,
+					workspaceName: request.workspaceName,
+					sessionId: request.sessionId,
+				});
+				if (!authorized.ok) {
+					connection.send({
+						type: "error",
+						id: request.id,
+						code: authorized.code,
+						message: authorized.message,
+					});
+					return;
+				}
+				if (request.command.type !== "unregister_workspace") {
+					connection.send({ type: "error", id: request.id, code: "unsupported", message: request.command.type });
+					return;
+				}
+				workspaceRegistered = false;
+				connection.send({
+					type: "relay_rpc_result",
+					id: request.id,
+					response: {
+						type: "response",
+						id: request.command.id,
+						command: "unregister_workspace",
+						success: true,
+						data: { removedWorkspace: WORKSPACE.name, workspaceNames: [], workspaces: [] },
+					},
+					workspaceMetadata: { workspaceNames: [], workspaces: [] },
+				});
+				return;
+			}
+			default:
+				connection.send({ type: "error", id: request.id, code: "unsupported", message: request.type });
+		}
+	};
+	server = await startControlServer({
+		socketPath: paths.socketPath,
+		version: "0.0.0-test",
+		authToken,
+		handlers: {
+			onRequest: handleRequest,
+			onConnectionClosed: (connection) => broker.releaseAllForConnection(connection.connectionId),
+			relayAdmission: {
+				admitRelay: (hello, socket, bufferedRemainder) =>
+					registry.admit(hello.relayId, hello.relayToken, socket, bufferedRemainder),
+			},
+		},
+	});
+	writeFileSync(
+		paths.pidfilePath,
+		`${JSON.stringify({
+			pid: process.pid,
+			version: "0.0.0-test",
+			startedAtMs: Date.now(),
+			socketPath: paths.socketPath,
+			token: authToken,
+		})}\n`,
+		{ mode: 0o600 },
+	);
+	const attach = createDaemonAttach({ cwd: workspaceDir, agentDir, autoStart: false });
+	await attach.start();
+	expect(await attach.acquire(SESSION_ID)).toMatchObject({ kind: "granted" });
+	cleanups.push(async () => {
+		await attach.dispose();
+		await Promise.all(
+			registry.all().map((relay) => relay.close("host_shutdown", { pendingMessage: "daemon shutting down" })),
+		);
+		await server.close();
+		rmSync(agentDir, { recursive: true, force: true });
+		rmSync(workspaceDir, { recursive: true, force: true });
+	});
+	return { agentDir, workspaceDir, registry, broker, server, attach };
+}
+
 /** Daemon side of one phone attach: the phone stream paused behind a minted relay offer. */
 function mintPhoneRelay(registry: RelayRegistry, clientNodeId: string, streamId: string) {
 	const phone = new FakePhoneIrohStream();
@@ -212,6 +401,71 @@ function mintPhoneRelay(registry: RelayRegistry, clientNodeId: string, streamId:
 		onSettled: settle,
 	});
 	return { phone, relay, settle };
+}
+
+function mintOwnedPhoneRelay(harness: OwnedRelayDaemonHarness, clientNodeId: string, streamId: string) {
+	const record = harness.broker.lookup(WORKSPACE.name, SESSION_ID);
+	const ownerControlConnectionId = record?.tuiConnectionId;
+	if (!ownerControlConnectionId) {
+		throw new Error("TUI lease has no control owner");
+	}
+	const phone = new FakePhoneIrohStream();
+	let framesAtSettlement: Array<Record<string, unknown>> = [];
+	const settle = vi.fn((outcome: RelayOutcome) => {
+		framesAtSettlement = phone.receivedFrames();
+		harness.broker.unregisterRelay(WORKSPACE.name, SESSION_ID, relay.relayId);
+		harness.server.sendTo(ownerControlConnectionId, {
+			type: "relay_closed",
+			relayId: relay.relayId,
+			reason: outcome.reason,
+		});
+	});
+	const relay = harness.registry.mint({
+		workspaceName: WORKSPACE.name,
+		sessionId: SESSION_ID,
+		clientNodeId,
+		ownerControlConnectionId,
+		connectionId: `conn-${clientNodeId}`,
+		streamId,
+		stream: phone,
+		preamble: {
+			handshake: { hello: createPhoneHello(SESSION_ID), response: HANDSHAKE_RESPONSE },
+			authorization: {
+				clientNodeId,
+				workspaceName: WORKSPACE.name,
+				workspacePath: harness.workspaceDir,
+				allowedTools: "",
+				rpcGrant: RPC_GRANT,
+			},
+			hostNodeId: "n-daemon-host",
+			relayMode: "development",
+			connectionId: `conn-${clientNodeId}`,
+			streamId,
+			resolvedTarget: {
+				sessionId: SESSION_ID,
+				selection: "resumed",
+				requestedSessionId: SESSION_ID,
+				workspaceName: WORKSPACE.name,
+				workspacePath: harness.workspaceDir,
+			},
+		},
+		rejectPending: () => {},
+		onSettled: settle,
+	});
+	if (!harness.broker.registerRelay(WORKSPACE.name, SESSION_ID, relay.relayId)) {
+		throw new Error("TUI lease rejected relay registration");
+	}
+	harness.server.sendTo(ownerControlConnectionId, {
+		type: "relay_offer",
+		relayId: relay.relayId,
+		relayToken: relay.relayToken,
+		workspaceName: WORKSPACE.name,
+		sessionId: SESSION_ID,
+		clientNodeId,
+		connectionId: relay.connectionId,
+		streamId,
+	});
+	return { phone, relay, settle, framesAtSettlement: () => framesAtSettlement };
 }
 
 /**
@@ -279,7 +533,108 @@ async function serveRelayFromTui(
 	return { relayedStream, done };
 }
 
+async function serveOwnedRelayFromTui(
+	daemonAttach: DaemonAttach,
+	offer: DaemonRelayOffer,
+	openRelay: () => Promise<OpenedRelay>,
+	runtimeHost: AgentSessionRuntime,
+): Promise<void> {
+	const opened = await openRelay();
+	const relayedStream = adaptRelaySocketToIrohStream(opened.stream);
+	const handshake = opened.preamble.handshake as { hello: IrohRemoteHello; response: IrohRemoteHandshakeSuccess };
+	const authorizationSubset = opened.preamble.authorization;
+	const authorization = createAuthorization(authorizationSubset.clientNodeId);
+	const responseContext = { hostNodeId: opened.preamble.hostNodeId, relayMode: opened.preamble.relayMode };
+	const resolvedTarget = opened.preamble.resolvedTarget;
+	const sessionSelection: IntegratedConversationSessionSelection =
+		resolvedTarget.selection === "created"
+			? { kind: "created", sessionId: resolvedTarget.sessionId }
+			: {
+					kind: resolvedTarget.selection,
+					requestedSessionId: resolvedTarget.requestedSessionId ?? resolvedTarget.sessionId,
+					sessionId: resolvedTarget.sessionId,
+				};
+	const handshakeResponse = createIntegratedConversationHandshakeResponse(
+		{ hello: handshake.hello, response: handshake.response },
+		authorization,
+		SESSION_ID,
+		sessionSelection,
+		responseContext,
+	);
+	await writeIrohRemoteHandshakeResponse(relayedStream.send, handshakeResponse);
+	const conversationOptions = createTestIrohConversationOptions(runtimeHost);
+	let relayedSessionId = offer.sessionId;
+	const retirement = createRelayWorkspaceUnregisterRetirement(daemonAttach, () => relayedSessionId);
+	try {
+		await runIrohRemoteRpcMode(runtimeHost, {
+			...conversationOptions,
+			stream: relayedStream,
+			disposeRuntimeOnClose: false,
+			workspaceName: WORKSPACE.name,
+			workspacePath: authorizationSubset.workspacePath,
+			rpcGrant: authorizationSubset.rpcGrant,
+			isRpcIngressOpen: retirement.isIngressOpen,
+			suppressExtensionUiRequests: true,
+			decorateOutbound: (value) => decorateRemoteHostState(value, authorization, responseContext),
+			onResponseWritten: retirement.onResponseWritten,
+			remoteCommandHandler: async (command) => {
+				if (command.type === "unregister_workspace") {
+					const forwarded = await daemonAttach.forwardRelayRpc(
+						authorizationSubset.clientNodeId,
+						relayedSessionId,
+						command as { type: string } & Record<string, unknown>,
+					);
+					if (!forwarded) {
+						return undefined;
+					}
+					retirement.observeForwardedResponse(command, forwarded.response);
+					if (forwarded.workspaceMetadata) {
+						authorization.workspaceNames = [...forwarded.workspaceMetadata.workspaceNames];
+						authorization.workspaces = forwarded.workspaceMetadata.workspaces.map((workspace) => ({
+							...workspace,
+						})) as typeof authorization.workspaces;
+					}
+					return forwarded.response;
+				}
+				return handleIntegratedConversationRpcCommand(
+					command as { type: string } & Record<string, unknown>,
+					authorization,
+					{
+						stateManager: new IrohRemoteHostStateManager(),
+						sessionListCursors: new Map(),
+						sessionListCursorTtlMs: REMOTE_SESSION_LIST_CURSOR_TTL_MS,
+					},
+					runtimeHost,
+				);
+			},
+			onSessionChanged: (session) => {
+				relayedSessionId = session.sessionId;
+			},
+		});
+	} finally {
+		await retirement.finalize();
+		relayedStream.close();
+		opened.finished();
+	}
+}
+
 describe("dual-frontend relayed conversation (§12.3.3)", () => {
+	it("falls back to one reasoned release when unregister response delivery never completes", async () => {
+		const release = vi.fn(async () => {});
+		const retirement = createRelayWorkspaceUnregisterRetirement({ release }, () => SESSION_ID);
+		retirement.observeForwardedResponse(
+			{ type: "unregister_workspace" },
+			{ type: "response", command: "unregister_workspace", success: true },
+		);
+		expect(retirement.isIngressOpen()).toBe(false);
+		expect(release).not.toHaveBeenCalled();
+
+		await retirement.finalize();
+		await retirement.finalize();
+		expect(release).toHaveBeenCalledTimes(1);
+		expect(release).toHaveBeenCalledWith(SESSION_ID, "workspace_unregistered");
+	});
+
 	it("serves two co-attached phones from one TUI runtime: prompts land, events fan out, abort keeps both relays open", async () => {
 		const { socketPath, registry } = await startDaemonHarness();
 		const fanout = createFanoutSession(SESSION_ID);
@@ -431,4 +786,72 @@ describe("dual-frontend relayed conversation (§12.3.3)", () => {
 		await vi.waitFor(() => expect(registry.activeCount()).toBe(0));
 		expect(dispose).not.toHaveBeenCalled();
 	});
+
+	it("delivers relay unregister before retiring every relay, lease record, and local relay tracker", async () => {
+		const harness = await startOwnedRelayDaemonHarness();
+		const fanout = createFanoutSession(SESSION_ID);
+		const dispose = vi.fn(async () => {});
+		const runtimeHost = {
+			...createStableSessionRunner(() => fanout.session),
+			session: fanout.session,
+			newSession: vi.fn(async () => ({ cancelled: true })),
+			switchSession: vi.fn(async () => ({ cancelled: true })),
+			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+			dispose,
+			setRebindSession: vi.fn(),
+			listSessions: vi.fn(async () => []),
+		} as unknown as AgentSessionRuntime;
+		const relayServers: Promise<void>[] = [];
+		harness.attach.onRelayOffer((offer, openRelay) => {
+			relayServers.push(serveOwnedRelayFromTui(harness.attach, offer, openRelay, runtimeHost));
+		});
+
+		const attachA = mintOwnedPhoneRelay(harness, "n-phone-a", "st-unregister-1");
+		const attachB = mintOwnedPhoneRelay(harness, "n-phone-b", "st-unregister-2");
+		await vi.waitFor(() => {
+			expect(harness.attach.relayCount()).toBe(2);
+			expect(harness.registry.activeCount()).toBe(2);
+			expect(relayServers).toHaveLength(2);
+			for (const attach of [attachA, attachB]) {
+				expect(attach.phone.receivedFrames().some((frame) => frame.type === "conversation_bootstrap")).toBe(true);
+			}
+		});
+
+		attachA.phone.sendLine({
+			id: "remove-relayed-workspace",
+			type: "unregister_workspace",
+			workspaceName: WORKSPACE.name,
+		});
+		attachA.phone.sendLine({ id: "pipelined-after-unregister", type: "get_state" });
+
+		await vi.waitFor(() => {
+			expect(attachA.settle).toHaveBeenCalledTimes(1);
+			expect(attachB.settle).toHaveBeenCalledTimes(1);
+			expect(harness.registry.activeCount()).toBe(0);
+			expect(harness.attach.relayCount()).toBe(0);
+		});
+		await Promise.all(relayServers);
+
+		const unregisterResponse = attachA.phone
+			.receivedFrames()
+			.find((frame) => frame.command === "unregister_workspace");
+		expect(unregisterResponse).toMatchObject({
+			id: "remove-relayed-workspace",
+			type: "response",
+			command: "unregister_workspace",
+			success: true,
+			data: { removedWorkspace: WORKSPACE.name, workspaceNames: [], workspaces: [] },
+		});
+		expect(
+			attachA
+				.framesAtSettlement()
+				.some((frame) => frame.command === "unregister_workspace" && frame.success === true),
+		).toBe(true);
+		expect(attachA.phone.receivedFrames().some((frame) => frame.id === "pipelined-after-unregister")).toBe(false);
+		expect(attachA.settle.mock.calls[0]?.[0]?.reason).toBe("workspace_unregistered");
+		expect(attachB.settle.mock.calls[0]?.[0]?.reason).toBe("workspace_unregistered");
+		expect(harness.broker.lookup(WORKSPACE.name, SESSION_ID)).toBeUndefined();
+		expect(await harness.attach.listRuntimeStates(WORKSPACE.name)).toEqual(new Map());
+		expect(dispose).not.toHaveBeenCalled();
+	}, 20_000);
 });
