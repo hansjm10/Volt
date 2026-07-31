@@ -6,6 +6,8 @@ import {
 	type AuthorizeIrohRemoteClientOptions,
 	authorizeIrohRemoteClient,
 	type IrohRemoteClientAuthorizationResult,
+	type IrohRemoteClientAuthorizationSuccess,
+	isIrohRemoteClientAllowedForWorkspace,
 } from "./authorization.ts";
 import type { IrohRemoteHello } from "./handshake.ts";
 import { canonicalizePersistedIrohRemoteAllowTools } from "./protocol.ts";
@@ -428,6 +430,21 @@ export class IrohRemoteHostStateManager {
 			const state = await this.loadUnlocked();
 			const client = state.clients.find((entry) => entry.nodeId === nodeId);
 			return client ? cloneClient(client) : undefined;
+		});
+	}
+
+	/** Atomically revalidate every persisted authority component captured by a stream handshake. */
+	async isAuthorizationCurrent(authorization: IrohRemoteClientAuthorizationSuccess): Promise<boolean> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const client = state.clients.find((entry) => entry.nodeId === authorization.client.nodeId);
+			const workspace = state.workspaces.find((entry) => entry.name === authorization.workspace.name);
+			return (
+				client?.rpcGrant?.revision === authorization.client.rpcGrant.revision &&
+				isIrohRemoteClientAllowedForWorkspace(client, authorization.workspace.name) &&
+				workspace?.path === authorization.workspace.path &&
+				workspace.allowedTools === authorization.workspace.allowedTools
+			);
 		});
 	}
 

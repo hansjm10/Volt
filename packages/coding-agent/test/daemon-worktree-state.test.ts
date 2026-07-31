@@ -2,6 +2,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createIrohRemotePresetAccess } from "../src/core/remote/iroh/access-grant.ts";
+import type { IrohRemoteClientAuthorizationSuccess } from "../src/core/remote/iroh/authorization.ts";
 import {
 	createEmptyIrohRemoteHostState,
 	type IrohRemoteHostState,
@@ -242,6 +244,46 @@ describe("worktree state manager operations", () => {
 		await expect(manager.unregisterWorkspace("ws")).resolves.toEqual({ name: "ws", path: "/tmp/ws" });
 		expect((await manager.getState()).workspaces.map((workspace) => workspace.name)).toEqual(["other"]);
 		expect((await manager.listWorktrees("other")).map((worktree) => worktree.id)).toEqual(["other-tree"]);
+	});
+});
+
+describe("stream authorization freshness", () => {
+	it("invalidates an unchanged client grant when its workspace registration is removed or changed", async () => {
+		const rpcGrant = createIrohRemotePresetAccess("full").rpcGrant;
+		const workspace = { name: "ws", path: "/tmp/ws", allowedTools: "read" };
+		const authorization: IrohRemoteClientAuthorizationSuccess = {
+			ok: true,
+			allowTools: "read",
+			client: {
+				nodeId: "n-phone",
+				label: "phone",
+				allowedWorkspaces: ["ws"],
+				allowedTools: "read",
+				rpcGrant,
+				pairedAt: 1,
+				lastSeenAt: 2,
+			},
+			paired: false,
+			pairingSecretConsumed: false,
+			workspace,
+			workspaceNames: ["ws"],
+			workspaces: [{ name: "ws", status: "available" }],
+		};
+		const manager = new IrohRemoteHostStateManager({
+			initialState: {
+				...createEmptyIrohRemoteHostState(),
+				workspaces: [workspace],
+				clients: [authorization.client],
+			},
+		});
+
+		await expect(manager.isAuthorizationCurrent(authorization)).resolves.toBe(true);
+		await manager.unregisterWorkspace("ws");
+		await expect(manager.isAuthorizationCurrent(authorization)).resolves.toBe(false);
+		await manager.upsertWorkspace({ ...workspace, path: "/tmp/replacement" });
+		await expect(manager.isAuthorizationCurrent(authorization)).resolves.toBe(false);
+		await manager.upsertWorkspace({ ...workspace, allowedTools: "read,bash" });
+		await expect(manager.isAuthorizationCurrent(authorization)).resolves.toBe(false);
 	});
 });
 

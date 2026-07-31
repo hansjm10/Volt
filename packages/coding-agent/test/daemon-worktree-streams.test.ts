@@ -352,6 +352,28 @@ describe("manage_worktrees management stream", () => {
 		expect(closeStream).toHaveBeenCalledWith("access_updated");
 	});
 
+	it("closes before a command when the workspace was removed without changing the client grant", async () => {
+		const authorization = createAuthorization();
+		const stateManager = new IrohRemoteHostStateManager({
+			initialState: {
+				workspaces: [authorization.workspace],
+				worktrees: [],
+				clients: [authorization.client],
+			},
+		});
+		await stateManager.unregisterWorkspace(authorization.workspace.name);
+
+		const { frames, backend, closeStream } = await runStream(
+			[{ id: "1", type: "create_worktree", workspaceName: "ws" }],
+			authorization.client.rpcGrant,
+			() => stateManager.isAuthorizationCurrent(authorization),
+		);
+
+		expect(frames).toEqual([]);
+		expect(backend.createWorktree).not.toHaveBeenCalled();
+		expect(closeStream).toHaveBeenCalledWith("access_updated");
+	});
+
 	it("denies utility commands without the required capability", async () => {
 		const { frames, backend } = await runStream(
 			[{ id: "1", type: "create_worktree", workspaceName: "ws" }],

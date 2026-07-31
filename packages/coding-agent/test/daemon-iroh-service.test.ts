@@ -686,9 +686,28 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 		let control: DaemonClient | undefined;
 		let phone: PhoneEndpoint | undefined;
 		let connection: PhoneConnection | undefined;
+		let pauseRacingPublications = false;
+		let conversationPublicationStarted = false;
+		let utilityPublicationStarted = false;
+		const conversationPublicationGate = createDeferred();
+		const utilityPublicationGate = createDeferred();
 		const controlEvents: ControlEvent[] = [];
 		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
-			createIrohDaemonService({ relayMode: "disabled" }),
+			createIrohDaemonService(
+				{ relayMode: "disabled" },
+				{
+					beforeAuthorizedStreamPublication: async (kind) => {
+						if (!pauseRacingPublications) return;
+						if (kind === "conversation") {
+							conversationPublicationStarted = true;
+							await conversationPublicationGate.promise;
+						} else if (kind === "workspace_discovery") {
+							utilityPublicationStarted = true;
+							await utilityPublicationGate.promise;
+						}
+					},
+				},
+			),
 		]);
 
 		try {
@@ -747,6 +766,34 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 			const delivery = bootstrap.value.delivery as { subscriptionId: string };
 			const transcript = bootstrap.value.transcript as { branchEpoch: string };
 
+			pauseRacingPublications = true;
+			const racingConversation = await connection.openBi();
+			await writeJsonLine(racingConversation, {
+				type: "volt_iroh_hello",
+				protocol: IROH_REMOTE_ALPN,
+				workspace: "ws",
+				clientLabel: "vitest-racing-conversation",
+				conversation: { target: "new" },
+			});
+			await expect.poll(() => conversationPublicationStarted).toBe(true);
+
+			const racingUtility = await connection.openBi();
+			await writeJsonLine(racingUtility, {
+				type: "volt_iroh_hello",
+				protocol: IROH_REMOTE_ALPN,
+				workspace: "ws",
+				clientLabel: "vitest-racing-utility",
+				workspaceDiscovery: { purpose: "list_sessions" },
+			});
+			await writeJsonLine(racingUtility, { id: "stale-list", type: "list_sessions" });
+			await expect.poll(() => utilityPublicationStarted).toBe(true);
+			const racingUtilityHandshake = await readJsonLine(racingUtility);
+			expect(racingUtilityHandshake.value).toMatchObject({
+				type: "volt_iroh_handshake",
+				success: true,
+				workspace: "ws",
+			});
+
 			await writeJsonLine(stream, {
 				id: "remove-live",
 				type: "unregister_workspace",
@@ -769,17 +816,32 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 				success: true,
 				data: { removedWorkspace: "ws", workspaceNames: [], workspaces: [] },
 			});
-			const terminal = await readJsonLineMatching(
-				stream,
-				unregisterResponse.rest,
-				(value) => value.type === "remote_terminal",
-			);
+			const terminal = await readJsonLine(stream, unregisterResponse.rest);
 			expect(terminal.value).toMatchObject({
 				type: "remote_terminal",
 				reason: "workspace_unregistered",
 				workspace: "ws",
 				sessionId: conversation.sessionId,
 			});
+
+			conversationPublicationGate.resolve();
+			utilityPublicationGate.resolve();
+			let racingConversationFailure: Record<string, unknown> | undefined;
+			try {
+				racingConversationFailure = (await readJsonLine(racingConversation)).value;
+			} catch {
+				// A reset before any success handshake is also a valid stale-attach rejection.
+			}
+			expect(racingConversationFailure?.success).not.toBe(true);
+			let racingUtilityTail: string | undefined;
+			try {
+				racingUtilityTail = (
+					await readLineFromIroh(racingUtility.recv, racingUtilityHandshake.rest, { maxLineBytes: 1024 * 1024 })
+				).line;
+			} catch {
+				// A native reset also proves the queued utility command was not served.
+			}
+			expect(racingUtilityTail).toBeUndefined();
 
 			await expect
 				.poll(async () => {
@@ -804,6 +866,8 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 			}
 			expect(postUnregisterLine).toBeUndefined();
 		} finally {
+			conversationPublicationGate.resolve();
+			utilityPublicationGate.resolve();
 			connection?.close(0n, Array.from(Buffer.from("done", "utf8")));
 			await phone?.close().catch(() => {});
 			if (!daemonStopped && control !== undefined) {

@@ -277,6 +277,11 @@ export interface IrohDaemonServiceDependencies {
 	decorateEndpoint?(endpoint: IrohEndpointLike): IrohEndpointLike;
 	/** Decorate an accepted raw stream before lifecycle fencing (test-only failure injection). */
 	decorateAcceptedStream?(stream: IrohBiStreamLike): IrohBiStreamLike;
+	/** Pause an authorized attach immediately before its first ownership publication (test-only race injection). */
+	beforeAuthorizedStreamPublication?(
+		kind: "conversation" | "workspace_discovery" | "workspace_management" | "worktree_management" | "relay",
+		authorization: IrohRemoteClientAuthorizationSuccess,
+	): void | Promise<void>;
 }
 
 export interface ResolvedIrohRelayConfig {
@@ -871,9 +876,8 @@ class IrohDaemonService {
 		};
 	}
 
-	private async isAuthorizationGrantCurrent(authorization: IrohRemoteClientAuthorizationSuccess): Promise<boolean> {
-		const client = await this.stateManager.getClient(authorization.client.nodeId);
-		return client?.rpcGrant.revision === authorization.client.rpcGrant.revision;
+	private isAuthorizationCurrent(authorization: IrohRemoteClientAuthorizationSuccess): Promise<boolean> {
+		return this.stateManager.isAuthorizationCurrent(authorization);
 	}
 
 	private getCommandContext(conversation?: {
@@ -1748,7 +1752,9 @@ class IrohDaemonService {
 		owner: IrohPhysicalStreamOwner,
 	): Promise<void> {
 		await writeIrohRemoteHandshakeResponse(stream.send, handshake.response);
-		if (!this.admission.isOpen) {
+		await this.dependencies.beforeAuthorizedStreamPublication?.("workspace_discovery", handshake.authorization);
+		if (!this.admission.isOpen || !(await this.isAuthorizationCurrent(handshake.authorization))) {
+			await owner.close("access_updated_during_attach").catch(() => {});
 			return;
 		}
 		const activeStream = this.registerActiveStream(
@@ -1766,7 +1772,7 @@ class IrohDaemonService {
 					stream,
 					initialInput: handshake.initialInput,
 					authorization: handshake.authorization,
-					isRpcGrantCurrent: () => this.isAuthorizationGrantCurrent(handshake.authorization),
+					isRpcGrantCurrent: () => this.isAuthorizationCurrent(handshake.authorization),
 					closeStream: (reason) => {
 						void owner.close(reason ?? "stream_closed").catch(() => {});
 					},
@@ -1786,7 +1792,9 @@ class IrohDaemonService {
 		owner: IrohPhysicalStreamOwner,
 	): Promise<void> {
 		await writeIrohRemoteHandshakeResponse(stream.send, handshake.response);
-		if (!this.admission.isOpen) {
+		await this.dependencies.beforeAuthorizedStreamPublication?.("workspace_management", handshake.authorization);
+		if (!this.admission.isOpen || !(await this.isAuthorizationCurrent(handshake.authorization))) {
+			await owner.close("access_updated_during_attach").catch(() => {});
 			return;
 		}
 		const activeStream = this.registerActiveStream(
@@ -1804,7 +1812,7 @@ class IrohDaemonService {
 					stream,
 					initialInput: handshake.initialInput,
 					authorization: handshake.authorization,
-					isRpcGrantCurrent: () => this.isAuthorizationGrantCurrent(handshake.authorization),
+					isRpcGrantCurrent: () => this.isAuthorizationCurrent(handshake.authorization),
 					closeStream: (reason) => {
 						activeStream.remove();
 						void owner.close(reason ?? "stream_closed").catch(() => {});
@@ -1856,7 +1864,9 @@ class IrohDaemonService {
 		owner: IrohPhysicalStreamOwner,
 	): Promise<void> {
 		await writeIrohRemoteHandshakeResponse(stream.send, handshake.response);
-		if (!this.admission.isOpen) {
+		await this.dependencies.beforeAuthorizedStreamPublication?.("worktree_management", handshake.authorization);
+		if (!this.admission.isOpen || !(await this.isAuthorizationCurrent(handshake.authorization))) {
+			await owner.close("access_updated_during_attach").catch(() => {});
 			return;
 		}
 		const sanitizerOverrides: RemoteSanitizerOverrides = {
@@ -1877,7 +1887,7 @@ class IrohDaemonService {
 					stream,
 					initialInput: handshake.initialInput,
 					authorization: handshake.authorization,
-					isRpcGrantCurrent: () => this.isAuthorizationGrantCurrent(handshake.authorization),
+					isRpcGrantCurrent: () => this.isAuthorizationCurrent(handshake.authorization),
 					closeStream: (reason) => {
 						void owner.close(reason ?? "stream_closed").catch(() => {});
 					},
@@ -2314,7 +2324,8 @@ class IrohDaemonService {
 		// The target-resolution awaits above can race an access update or revoke.
 		// Recheck immediately before the synchronous mint so stale authorization
 		// cannot create a new pending offer after control-plane invalidation acks.
-		if (!(await this.isAuthorizationGrantCurrent(authorization))) {
+		await this.dependencies.beforeAuthorizedStreamPublication?.("relay", authorization);
+		if (!(await this.isAuthorizationCurrent(authorization))) {
 			await this.sendHandshakeError(stream, { message: "client access changed; reconnect" });
 			return;
 		}
@@ -2701,6 +2712,24 @@ class IrohDaemonService {
 					throw error;
 				}
 			}
+			await this.dependencies.beforeAuthorizedStreamPublication?.("conversation", authorization);
+			if (!(await this.isAuthorizationCurrent(authorization))) {
+				this.leaseBroker.abortDaemonAttach(daemonAttachClaim);
+				try {
+					if (createdRuntime) {
+						await this.runtimes.abortPreparedEntry(entry, sessionSelection, attachClaim);
+					} else {
+						await this.runtimes.detachWithoutSubscriber(entry, attachClaim, "access_updated_during_attach");
+					}
+				} finally {
+					attachClaim.release();
+				}
+				await this.sendHandshakeError(
+					stream,
+					new Error("client or workspace authority changed during conversation attach; reconnect"),
+				);
+				return;
+			}
 			const committedSessionId = entry.sessionId;
 			const { outcome: brokerCommit, installedProvisionalOwner } =
 				entry.coordinator.commitDaemonRuntime(daemonAttachClaim);
@@ -2821,7 +2850,7 @@ class IrohDaemonService {
 							workspacePath: entry.worktreePath,
 							additionalRedactedPaths: [authorization.workspace.path, getWorktreesRoot(this.services.agentDir)],
 						};
-			if (!(await this.isAuthorizationGrantCurrent(authorization))) {
+			if (!(await this.isAuthorizationCurrent(authorization))) {
 				await detachCommittedAttach("access_updated_during_attach");
 				await this.sendHandshakeError(
 					stream,
@@ -2912,7 +2941,7 @@ class IrohDaemonService {
 			await runIrohRemoteRpcMode(entry.runtime, {
 				rpcGrant: authorization.client.rpcGrant,
 				clientNodeId: authorization.client.nodeId,
-				isRpcGrantCurrent: () => (workspaceUnregistered ? false : this.isAuthorizationGrantCurrent(authorization)),
+				isRpcGrantCurrent: () => (workspaceUnregistered ? false : this.isAuthorizationCurrent(authorization)),
 				decorateOutbound: (value) => decorateRemoteHostState(value, authorization, responseContext),
 				disposeRuntimeOnClose: false,
 				notificationDelivery: pushDispatcher,
@@ -2939,7 +2968,7 @@ class IrohDaemonService {
 					queueMicrotask(() => {
 						void (async () => {
 							try {
-								await activeStream?.entry.write?.({
+								await activeStream?.entry.writeTerminal?.({
 									type: "remote_terminal",
 									reason: WORKSPACE_UNREGISTERED_CLOSE_REASON,
 									workspace: authorization.workspace.name,
@@ -2965,6 +2994,7 @@ class IrohDaemonService {
 				onConversationLifecycleReady: (lifecycle) => {
 					if (activeStream?.entry) {
 						activeStream.entry.write = lifecycle.write;
+						activeStream.entry.writeTerminal = lifecycle.writeTerminal;
 						activeStream.entry.terminate = lifecycle.terminate;
 					}
 				},

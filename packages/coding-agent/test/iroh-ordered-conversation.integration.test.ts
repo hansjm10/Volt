@@ -11,7 +11,7 @@ import type { ConversationProjectionSnapshotBuilder } from "../src/core/rpc/conv
 import type { IrohBytes } from "../src/core/rpc/iroh-transport.ts";
 import type { RpcConversationTranscriptItem } from "../src/core/rpc/types.ts";
 import { type SessionEntry, SessionManager } from "../src/core/session-manager.ts";
-import { runIrohRemoteRpcMode } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
+import { type IrohRemoteConversationLifecycle, runIrohRemoteRpcMode } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
 import {
 	createTestSession as createIrohTestSession,
 	ManualIrohRecvStream,
@@ -187,6 +187,8 @@ async function createFixture(
 		send?: ManualIrohSendStream;
 		isRpcGrantCurrent?: () => boolean | Promise<boolean>;
 		onClientCapabilitiesChanged?: (features: string[]) => void;
+		onConversationLifecycleReady?: (lifecycle: IrohRemoteConversationLifecycle) => void;
+		onResponseWritten?: (response: Record<string, unknown>) => void | Promise<void>;
 		waitForPhysicalStartup?: boolean;
 		configureRuntimeHost?: (runtimeHost: AgentSessionRuntime) => void;
 		remoteCommandHandler?: (command: Record<string, unknown>) => object | Promise<object | undefined> | undefined;
@@ -244,6 +246,10 @@ async function createFixture(
 		...(options.onClientCapabilitiesChanged === undefined
 			? {}
 			: { onClientCapabilitiesChanged: options.onClientCapabilitiesChanged }),
+		...(options.onConversationLifecycleReady === undefined
+			? {}
+			: { onConversationLifecycleReady: options.onConversationLifecycleReady }),
+		...(options.onResponseWritten === undefined ? {} : { onResponseWritten: options.onResponseWritten }),
 		...(options.isRpcGrantCurrent === undefined ? {} : { isRpcGrantCurrent: options.isRpcGrantCurrent }),
 		...(options.remoteCommandHandler === undefined ? {} : { remoteCommandHandler: options.remoteCommandHandler }),
 	});
@@ -557,6 +563,62 @@ describe("Iroh ordered conversation integration", () => {
 			replacementRecv.end();
 			await replacementMode;
 			await expect(fixture.close()).rejects.toBe(readError);
+		}
+	});
+
+	it("fences queued projection output before a post-response workspace terminal", async () => {
+		const send = new GatedIrohSendStream();
+		let lifecycle: IrohRemoteConversationLifecycle | undefined;
+		let terminalTask = Promise.resolve();
+		const fixture = await createFixture(() => {}, {
+			send,
+			onConversationLifecycleReady: (readyLifecycle) => {
+				lifecycle = readyLifecycle;
+			},
+			onResponseWritten: (response) => {
+				if (response.command !== "unregister_workspace" || response.success !== true) {
+					return;
+				}
+				queueMicrotask(() => {
+					terminalTask = (async () => {
+						await lifecycle?.writeTerminal({ type: "remote_terminal", reason: "workspace_unregistered" });
+						await lifecycle?.terminate();
+					})();
+				});
+			},
+			remoteCommandHandler: async (command) => ({
+				id: command.id,
+				type: "response",
+				command: command.type,
+				success: true,
+			}),
+		});
+		try {
+			const blockedResponseStarted = send.blockNextWrite();
+			fixture.recv.pushLine(
+				JSON.stringify({ id: "remove", type: "unregister_workspace", workspaceName: "scratch" }),
+			);
+			await blockedResponseStarted;
+
+			fixture.emit({ type: "agent_start" });
+			fixture.emit({ type: "turn_start" });
+			send.releaseBlockedWrite();
+
+			await fixture.modePromise;
+			await terminalTask;
+			expect(parseWrittenObjects(send)).toEqual([
+				expect.objectContaining({ type: "conversation_bootstrap" }),
+				{
+					id: "remove",
+					type: "response",
+					command: "unregister_workspace",
+					success: true,
+				},
+				{ type: "remote_terminal", reason: "workspace_unregistered" },
+			]);
+		} finally {
+			send.releaseBlockedWrite();
+			await fixture.close();
 		}
 	});
 

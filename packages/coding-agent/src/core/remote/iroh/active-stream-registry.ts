@@ -10,6 +10,8 @@ export interface IrohRemoteActiveStreamEntry {
 	/** Retire the stream-local projection/RPC mode and await its logical shutdown. */
 	terminate?(): Promise<void>;
 	write?(value: object): Promise<void> | void;
+	/** Fence pending projection output and write the stream's final frame. */
+	writeTerminal?(value: object): Promise<void> | void;
 }
 
 export class IrohRemoteActiveStreamRegistry {

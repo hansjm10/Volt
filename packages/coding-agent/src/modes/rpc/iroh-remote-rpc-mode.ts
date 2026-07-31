@@ -86,6 +86,8 @@ export interface IrohRemoteRpcModeOptions extends IrohRpcTransportOptions {
 
 export interface IrohRemoteConversationLifecycle {
 	write(value: object): Promise<void>;
+	/** Discard queued projection output and make this the final frame. */
+	writeTerminal(value: object): Promise<void>;
 	terminate(): Promise<void>;
 }
 
@@ -390,6 +392,7 @@ export function runIrohRemoteRpcMode(
 	});
 	const lifecycle: IrohRemoteConversationLifecycle = {
 		write: enqueueOrderedControl,
+		writeTerminal: enqueueOrderedTerminal,
 		async terminate() {
 			retireConversation();
 			await modeSettled;
