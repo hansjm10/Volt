@@ -881,6 +881,7 @@ class IrohDaemonService {
 		workspacePath?: string;
 		entry: IntegratedRuntimeEntry;
 		streamEntry?: IrohRemoteActiveStreamEntry;
+		onWorkspaceUnregistered?: () => void;
 	}): ConversationCommandContext {
 		return {
 			agentDir: this.services.agentDir,
@@ -923,6 +924,9 @@ class IrohDaemonService {
 						? { streamEntry: conversation.streamEntry, runtimeEntry: conversation.entry, workspacePath }
 						: {},
 				);
+				if (excludeOwn) {
+					conversation.onWorkspaceUnregistered?.();
+				}
 			},
 			...(conversation === undefined
 				? {}
@@ -2672,6 +2676,8 @@ class IrohDaemonService {
 		// as uncommitted and dispose ownership shared with another attach.
 		let attachDetached = false;
 		let retireRuntimeAfterStreamLifecycle = false;
+		let workspaceUnregistered = false;
+		let workspaceUnregisterClosureScheduled = false;
 		let handshakeResponseWritten = false;
 		let resolveStreamLifecycleSettled = () => {};
 		const streamLifecycleSettled = new Promise<void>((resolve) => {
@@ -2906,7 +2912,7 @@ class IrohDaemonService {
 			await runIrohRemoteRpcMode(entry.runtime, {
 				rpcGrant: authorization.client.rpcGrant,
 				clientNodeId: authorization.client.nodeId,
-				isRpcGrantCurrent: () => this.isAuthorizationGrantCurrent(authorization),
+				isRpcGrantCurrent: () => (workspaceUnregistered ? false : this.isAuthorizationGrantCurrent(authorization)),
 				decorateOutbound: (value) => decorateRemoteHostState(value, authorization, responseContext),
 				disposeRuntimeOnClose: false,
 				notificationDelivery: pushDispatcher,
@@ -2916,6 +2922,37 @@ class IrohDaemonService {
 						streamEntry.capabilities = new Set(features);
 						this.pushThemeTokensToStream(streamEntry);
 					}
+				},
+				onResponseWritten: (response) => {
+					if (
+						!workspaceUnregistered ||
+						workspaceUnregisterClosureScheduled ||
+						response.command !== "unregister_workspace" ||
+						response.success !== true
+					) {
+						return;
+					}
+					workspaceUnregisterClosureScheduled = true;
+					// The response write has physically completed. Admit the explicit
+					// terminal frame on the next microtask so the ordered feed can finish
+					// the current response before retiring its requesting stream.
+					queueMicrotask(() => {
+						void (async () => {
+							try {
+								await activeStream?.entry.write?.({
+									type: "remote_terminal",
+									reason: WORKSPACE_UNREGISTERED_CLOSE_REASON,
+									workspace: authorization.workspace.name,
+									sessionId: entry.sessionId,
+									hostNodeId: this.hostNodeId,
+								});
+							} catch {
+								// The response is already delivered; terminal delivery is best-effort.
+							} finally {
+								await owner.close(WORKSPACE_UNREGISTERED_CLOSE_REASON).catch(() => {});
+							}
+						})();
+					});
 				},
 				buildConversationSnapshot: createRemoteConversationSnapshotBuilder({
 					authorization,
@@ -2954,6 +2991,10 @@ class IrohDaemonService {
 							workspacePath: authorization.workspace.path,
 							entry,
 							streamEntry: activeStream?.entry,
+							onWorkspaceUnregistered: () => {
+								workspaceUnregistered = true;
+								activeStream?.remove();
+							},
 						}),
 						entry.runtime,
 					),
@@ -3021,8 +3062,14 @@ class IrohDaemonService {
 				resolveStreamLifecycleSettled();
 				attachClaim.release();
 			}
+			if (workspaceUnregistered) {
+				retireRuntimeAfterStreamLifecycle = true;
+			}
 			if (retireRuntimeAfterStreamLifecycle) {
-				await this.runtimes.stopEntry(entry, "daemon_runtime_owner_fenced");
+				await this.runtimes.stopEntry(
+					entry,
+					workspaceUnregistered ? WORKSPACE_UNREGISTERED_CLOSE_REASON : "daemon_runtime_owner_fenced",
+				);
 			}
 		}
 	}

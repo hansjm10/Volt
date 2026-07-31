@@ -328,7 +328,7 @@ describe("Iroh RPC transport", () => {
 
 		await transport.write({ text: "a\u2028b" });
 		recv.push(Buffer.from(`${serializeJsonLine({ first: true })}{"text":"x\u2029y"}\r`));
-		recv.push(Buffer.from('\n{"final":true}'));
+		recv.push(Buffer.from('\n{"final":true}\n'));
 		recv.end();
 
 		await expect(closed).resolves.toBeUndefined();
@@ -420,6 +420,65 @@ describe("Iroh RPC transport", () => {
 
 		await expect(writePromise).rejects.toBe(writeError);
 		await expect(flushPromise).rejects.toBe(writeError);
+	});
+
+	test("drops a partial frame on read failure and gives its replacement clean framing", async () => {
+		const failedRecv = new ManualIrohRecvStream();
+		const failedTransport = createIrohRpcTransport({
+			stream: { recv: failedRecv, send: new ManualIrohSendStream() },
+		});
+		const readError = new Error("injected read failure after partial frame");
+		const failedLines: string[] = [];
+		const closeErrors: Array<Error | undefined> = [];
+		failedTransport.onLine((line) => {
+			failedLines.push(line);
+		});
+		const failedClose = new Promise<void>((resolve) => {
+			failedTransport.onClose?.((error) => {
+				closeErrors.push(error);
+				resolve();
+			});
+		});
+
+		failedRecv.push(Buffer.from('{"id":"partial","type":"get_state"'));
+		failedRecv.fail(readError);
+		failedRecv.end();
+
+		await failedClose;
+		expect(failedLines).toEqual([]);
+		expect(closeErrors).toEqual([readError]);
+
+		const replacementRecv = new ManualIrohRecvStream();
+		const replacementTransport = createIrohRpcTransport({
+			stream: { recv: replacementRecv, send: new ManualIrohSendStream() },
+		});
+		const replacementLines: string[] = [];
+		replacementTransport.onLine((line) => {
+			replacementLines.push(line);
+		});
+		const replacementClose = waitForTransportClose(replacementTransport);
+
+		replacementRecv.push(Buffer.from('{"id":"fresh","type":"get_state"}\n'));
+		replacementRecv.end();
+
+		await expect(replacementClose).resolves.toBeUndefined();
+		expect(replacementLines).toEqual(['{"id":"fresh","type":"get_state"}']);
+	});
+
+	test("does not dispatch an unterminated frame on clean EOF", async () => {
+		const recv = new ManualIrohRecvStream();
+		const transport = createIrohRpcTransport({ stream: { recv, send: new ManualIrohSendStream() } });
+		const receivedLines: string[] = [];
+		transport.onLine((line) => {
+			receivedLines.push(line);
+		});
+		const closed = waitForTransportClose(transport);
+
+		recv.push(Buffer.from('{"id":"partial","type":"get_state"'));
+		recv.end();
+
+		await expect(closed).resolves.toBeUndefined();
+		expect(receivedLines).toEqual([]);
 	});
 
 	test("reports Iroh read errors as close failures", async () => {

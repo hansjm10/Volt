@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { describe, expect, it, vi } from "vitest";
 import { createIrohRemotePresetAccess, type IrohRemoteRpcGrant } from "../src/core/remote/iroh/access-grant.ts";
 import { type IrohRemoteAuditEvent, IrohRemoteAuditLogger } from "../src/core/remote/iroh/audit.ts";
@@ -309,6 +310,30 @@ describe("manage_worktrees management stream", () => {
 			success: true,
 			details: { source: "remote_worktree_management_stream", worktreeId: "fix-login" },
 		});
+	});
+
+	it("does not dispatch an unterminated utility command", async () => {
+		const recv = new ManualIrohRecvStream();
+		const send = new ManualIrohSendStream();
+		const backend = createBackend();
+		recv.end();
+
+		await runWorktreeManagementStream(
+			{
+				stream: { recv, send },
+				initialInput: Buffer.from(JSON.stringify({ id: "partial", type: "create_worktree", workspaceName: "ws" })),
+				authorization: createAuthorization(),
+				isRpcGrantCurrent: () => true,
+				closeStream: vi.fn(),
+			},
+			{
+				auditLogger: new IrohRemoteAuditLogger(),
+				worktrees: backend,
+			},
+		);
+
+		expect(parseWrittenObjects(send)).toEqual([]);
+		expect(backend.createWorktree).not.toHaveBeenCalled();
 	});
 
 	it("closes before executing the next command when the persisted grant revision becomes stale", async () => {

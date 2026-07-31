@@ -1,7 +1,8 @@
 import { Buffer } from "node:buffer";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { registerFauxProvider } from "@hansjm10/volt-ai";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { IROH_REMOTE_ALPN } from "../src/core/remote/iroh/protocol.ts";
 import { decodeIrohRemoteTicketPayload } from "../src/core/remote/iroh/ticket.ts";
@@ -192,6 +193,21 @@ async function readJsonLine(
 		throw new Error("stream ended before a line was received");
 	}
 	return { value: JSON.parse(result.line) as Record<string, unknown>, rest: result.rest };
+}
+
+async function readJsonLineMatching(
+	stream: IrohBiStreamLike,
+	rest: Buffer,
+	predicate: (value: Record<string, unknown>) => boolean,
+): Promise<{ value: Record<string, unknown>; rest: Buffer }> {
+	let buffered = rest;
+	while (true) {
+		const result = await readJsonLine(stream, buffered);
+		if (predicate(result.value)) {
+			return result;
+		}
+		buffered = result.rest;
+	}
 }
 
 describe("relay config resolution", () => {
@@ -653,6 +669,153 @@ describe.skipIf(!nativeAvailable)("voltd iroh service (loopback)", () => {
 		await revokedConnection.closed();
 		await phone.close();
 	}, 60_000);
+});
+
+describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => {
+	it("delivers the response before retiring conversation authority and runtime ownership", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-live-unregister-"));
+		const workspaceDir = join(agentDir, "ws");
+		mkdirSync(workspaceDir, { recursive: true });
+		const faux = registerFauxProvider();
+		const model = faux.getModel();
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			`${JSON.stringify({ defaultProvider: model.provider, defaultModel: model.id }, null, 2)}\n`,
+		);
+		let daemonStopped = false;
+		let control: DaemonClient | undefined;
+		let phone: PhoneEndpoint | undefined;
+		let connection: PhoneConnection | undefined;
+		const controlEvents: ControlEvent[] = [];
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			createIrohDaemonService({ relayMode: "disabled" }),
+		]);
+
+		try {
+			let status: DaemonProbeResult = await probeDaemon(agentDir);
+			for (let attempt = 0; !status.healthy && attempt < 100; attempt++) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				status = await probeDaemon(agentDir);
+			}
+			expect(status.healthy).toBe(true);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+				onEvent: (event) => controlEvents.push(event),
+			});
+			expect(await control.request({ type: "workspace_register", name: "ws", path: workspaceDir })).toMatchObject({
+				type: "ok",
+			});
+			const pairStarted = await control.request({ type: "pair_request", workspaceName: "ws", access: "full" });
+			expect(pairStarted).toMatchObject({ type: "pair_started" });
+			if (pairStarted.type !== "pair_started") throw new Error("pair request did not start");
+			let ticket: string | undefined;
+			await expect
+				.poll(() => {
+					const event = controlEvents.find(
+						(candidate) => candidate.type === "pairing_progress" && candidate.phase === "ticket",
+					);
+					ticket = event?.type === "pairing_progress" ? event.ticket : undefined;
+					return ticket;
+				})
+				.toBeTypeOf("string");
+			const payload = decodeIrohRemoteTicketPayload(ticket as string);
+			const iroh = native.iroh;
+			if (!iroh) throw new Error("native iroh unavailable");
+			const endpointTicket = (
+				iroh.EndpointTicket as unknown as { fromString(value: string): { endpointAddr(): unknown } }
+			).fromString(payload.irohTicket);
+			phone = await createPhoneEndpoint();
+			connection = await phone.connect(endpointTicket.endpointAddr(), ALPN);
+			const stream = await connection.openBi();
+			await writeJsonLine(stream, {
+				type: "volt_iroh_hello",
+				protocol: IROH_REMOTE_ALPN,
+				workspace: "ws",
+				secret: payload.secret,
+				clientLabel: "vitest-live-unregister",
+				conversation: { target: "new" },
+			});
+			const handshake = await readJsonLine(stream);
+			expect(handshake.value).toMatchObject({ type: "volt_iroh_handshake", success: true, workspace: "ws" });
+			const bootstrap = await readJsonLine(stream, handshake.rest);
+			expect(bootstrap.value.type).toBe("conversation_bootstrap");
+			const conversation = bootstrap.value.conversation as { sessionId: string };
+			const delivery = bootstrap.value.delivery as { subscriptionId: string };
+			const transcript = bootstrap.value.transcript as { branchEpoch: string };
+
+			await writeJsonLine(stream, {
+				id: "remove-live",
+				type: "unregister_workspace",
+				workspaceName: "ws",
+				conversationAuthority: {
+					sessionId: conversation.sessionId,
+					subscriptionId: delivery.subscriptionId,
+					branchEpoch: transcript.branchEpoch,
+				},
+			});
+			const unregisterResponse = await readJsonLineMatching(
+				stream,
+				bootstrap.rest,
+				(value) => value.type === "response" && value.command === "unregister_workspace",
+			);
+			expect(unregisterResponse.value).toMatchObject({
+				id: "remove-live",
+				type: "response",
+				command: "unregister_workspace",
+				success: true,
+				data: { removedWorkspace: "ws", workspaceNames: [], workspaces: [] },
+			});
+			const terminal = await readJsonLineMatching(
+				stream,
+				unregisterResponse.rest,
+				(value) => value.type === "remote_terminal",
+			);
+			expect(terminal.value).toMatchObject({
+				type: "remote_terminal",
+				reason: "workspace_unregistered",
+				workspace: "ws",
+				sessionId: conversation.sessionId,
+			});
+
+			await expect
+				.poll(async () => {
+					const current = await control?.request({ type: "status" });
+					return current?.type === "status_result" ? current.leases : undefined;
+				})
+				.toEqual([]);
+			await expect(control.request({ type: "workspace_unregister", name: "ws" })).resolves.toMatchObject({
+				type: "error",
+				code: "not_found",
+			});
+			await expect
+				.poll(() => readFileSync(getDaemonPaths(agentDir).auditPath, "utf8"))
+				.toContain('"reason":"workspace_unregistered"');
+			await writeJsonLine(stream, { id: "stale", type: "get_state" }).catch(() => {});
+			let postUnregisterLine: string | undefined;
+			try {
+				postUnregisterLine = (await readLineFromIroh(stream.recv, terminal.rest, { maxLineBytes: 1024 * 1024 }))
+					.line;
+			} catch {
+				// A native reset is also a valid terminal observation.
+			}
+			expect(postUnregisterLine).toBeUndefined();
+		} finally {
+			connection?.close(0n, Array.from(Buffer.from("done", "utf8")));
+			await phone?.close().catch(() => {});
+			if (!daemonStopped && control !== undefined) {
+				await control.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+				daemonStopped = true;
+			}
+			await control?.close();
+			faux.unregister();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
 });
 
 describe.skipIf(!nativeAvailable)("voltd iroh startup ownership", () => {
