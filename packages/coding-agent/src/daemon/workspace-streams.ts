@@ -4,6 +4,11 @@ import {
 	getMissingIrohRemoteRpcCapability,
 	parseIrohRemoteRpcGrant,
 } from "../core/remote/iroh/access-grant.ts";
+import {
+	handleIrohRemoteAgentLaunchRpcCommand,
+	IROH_REMOTE_AGENT_LAUNCH_RPC_TYPES,
+	type IrohRemoteAgentLaunchRpcBackend,
+} from "../core/remote/iroh/agent-launch.ts";
 import type { IrohRemoteAuditLogger } from "../core/remote/iroh/audit.ts";
 import type { IrohRemoteClientAuthorizationSuccess } from "../core/remote/iroh/authorization.ts";
 import { isIrohRemoteWorkspaceName } from "../core/remote/iroh/handshake.ts";
@@ -388,6 +393,81 @@ export async function runWorkspaceManagementStream(
 			context.closeStream(WORKSPACE_UNREGISTERED_CLOSE_REASON);
 		}
 		return true;
+	});
+}
+
+export interface AgentLaunchStreamHooks {
+	auditLogger: IrohRemoteAuditLogger;
+	agents: IrohRemoteAgentLaunchRpcBackend;
+	additionalRedactedPaths?: string[];
+}
+
+/** Serve a manage_agents workspaceManagement stream: launch catalog and cold creation only. */
+export async function runAgentLaunchManagementStream(
+	context: WorkspaceStreamContext,
+	hooks: AgentLaunchStreamHooks,
+): Promise<void> {
+	const { stream, authorization } = context;
+	const sanitizerOverrides = { additionalRedactedPaths: hooks.additionalRedactedPaths };
+	await runWorkspaceUtilityRpcLoop(stream, context.initialInput, async (line) => {
+		if (!(await context.isRpcGrantCurrent())) {
+			context.closeStream("access_updated");
+			return true;
+		}
+		const parsed = parseRemoteRpcCommandLine(line);
+		if (!parsed.ok) {
+			await writeIrohRemoteJsonLine(stream.send, parsed.response, authorization, sanitizerOverrides);
+			return false;
+		}
+		if (!IROH_REMOTE_AGENT_LAUNCH_RPC_TYPES.has(parsed.command.type)) {
+			await writeIrohRemoteJsonLine(
+				stream.send,
+				createIrohRemoteRpcErrorResponse(
+					getRpcResponseId(parsed.command),
+					parsed.command.type,
+					"unsupported_on_workspace_management_stream",
+				),
+				authorization,
+				sanitizerOverrides,
+			);
+			return false;
+		}
+		const denied = getUtilityCapabilityDenial(parsed.command, authorization);
+		if (denied) {
+			await writeIrohRemoteJsonLine(stream.send, denied, authorization, sanitizerOverrides);
+			return false;
+		}
+		const result = await handleIrohRemoteAgentLaunchRpcCommand(parsed.command, {
+			authorizedWorkspaceName: authorization.workspace.name,
+			backend: hooks.agents,
+		});
+		if (!result.handled) return false;
+		if (parsed.command.type === "create_agent") {
+			const data = result.response.success ? result.response.data : undefined;
+			const success =
+				result.response.success &&
+				typeof data === "object" &&
+				data !== null &&
+				"kind" in data &&
+				data.kind !== "error";
+			await hooks.auditLogger
+				.log({
+					type: "agent_launched",
+					clientNodeId: authorization.client.nodeId,
+					workspace: authorization.workspace.name,
+					success,
+					...(success ? {} : { error: result.response.success ? "agent_launch_failed" : result.response.error }),
+					details: {
+						source: "remote_agent_management_stream",
+						...(success && "sessionId" in data && typeof data.sessionId === "string"
+							? { sessionId: data.sessionId }
+							: {}),
+					},
+				})
+				.catch(() => undefined);
+		}
+		await writeIrohRemoteJsonLine(stream.send, result.response, authorization, sanitizerOverrides);
+		return false;
 	});
 }
 

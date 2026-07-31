@@ -1,8 +1,12 @@
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import type { Socket } from "node:net";
 import { relative, resolve, sep } from "node:path";
+import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
+import { createAgentSessionServices } from "../core/agent-session-services.ts";
+import { clonePlanningState, DEFAULT_PLANNING_STATE } from "../core/planning.ts";
 import {
 	createIrohRemoteExplicitAccess,
 	createIrohRemotePresetAccess,
@@ -15,6 +19,18 @@ import {
 } from "../core/remote/iroh/access-grant.ts";
 import type { IrohRemoteActiveStreamEntry } from "../core/remote/iroh/active-stream-registry.ts";
 import { IrohRemoteActiveStreamRegistry } from "../core/remote/iroh/active-stream-registry.ts";
+import {
+	createIrohRemoteAgentLaunchOptions,
+	createIrohRemoteAgentLaunchSessionId,
+	digestIrohRemoteAgentLaunchRequest,
+	type IrohRemoteAgentLaunchConfiguredConfig,
+	type IrohRemoteAgentLaunchOptions,
+	type IrohRemoteAgentLaunchResolvedPlacement,
+	type IrohRemoteAgentLaunchResult,
+	type IrohRemoteAgentLaunchRpcBackend,
+	type IrohRemoteCreateAgentRequest,
+	resolveIrohRemoteAgentLaunchConfig,
+} from "../core/remote/iroh/agent-launch.ts";
 import type { IrohRemoteClientAuthorizationSuccess } from "../core/remote/iroh/authorization.ts";
 import { hashIrohRemotePairingSecret } from "../core/remote/iroh/authorization.ts";
 import {
@@ -59,9 +75,11 @@ import {
 import { getIrohRemoteWorkspaceAvailabilityStatus } from "../core/remote/iroh/workspace.ts";
 import type { IrohRemoteWorktreeRpcBackend } from "../core/remote/iroh/worktree-rpc.ts";
 import type { IrohBiStreamLike } from "../core/rpc/iroh-transport.ts";
-import { getDefaultSessionDir } from "../core/session-manager.ts";
+import { getDefaultSessionDir, SessionManager } from "../core/session-manager.ts";
+import { SettingsManager } from "../core/settings-manager.ts";
 import { getCurrentThemeName, getResolvedThemeColors } from "../core/theme/runtime.ts";
 import { ProjectTrustStore } from "../core/trust-manager.ts";
+import { createIrohRemoteAgentRuntimeWithSessionSelection } from "../modes/rpc/iroh-remote-agent-runtime.ts";
 import { runIrohRemoteRpcMode } from "../modes/rpc/iroh-remote-rpc-mode.ts";
 import {
 	CONTROL_RPC_GRANTS_CAPABILITY,
@@ -138,6 +156,7 @@ import { ViewerFeedRegistry } from "./viewer-feed.ts";
 import { isPathInside, type WorkspaceDirectoryResolution } from "./workspace-directory.ts";
 import {
 	type RemoteSanitizerOverrides,
+	runAgentLaunchManagementStream,
 	runWorkspaceDiscoveryStream,
 	runWorkspaceManagementStream,
 	runWorktreeManagementStream,
@@ -279,7 +298,13 @@ export interface IrohDaemonServiceDependencies {
 	decorateAcceptedStream?(stream: IrohBiStreamLike): IrohBiStreamLike;
 	/** Pause an authorized attach immediately before its first ownership publication (test-only race injection). */
 	beforeAuthorizedStreamPublication?(
-		kind: "conversation" | "workspace_discovery" | "workspace_management" | "worktree_management" | "relay",
+		kind:
+			| "conversation"
+			| "workspace_discovery"
+			| "workspace_management"
+			| "worktree_management"
+			| "agent_management"
+			| "relay",
 		authorization: IrohRemoteClientAuthorizationSuccess,
 	): void | Promise<void>;
 }
@@ -624,6 +649,7 @@ class IrohDaemonService {
 	private readonly relayUrls: string[];
 	private readonly relayAuthToken: string | undefined;
 	private readonly relayConfigWarning: string | undefined;
+	private readonly profile: string | undefined;
 	private readonly log: ReturnType<VoltdRuntimeServices["logger"]["child"]>;
 	private readonly stateManager: IrohRemoteHostStateManager;
 	private readonly activeStreams = new IrohRemoteActiveStreamRegistry();
@@ -641,6 +667,10 @@ class IrohDaemonService {
 	private readonly resourceGuard = new IrohRemoteResourceGuard();
 	private readonly pendingPairRequests = new Map<string, PendingPairRequest>();
 	private readonly sessionListCursors = new Map<string, RemoteSessionListCursorEntry>();
+	private readonly agentLaunchOperations = new Map<
+		string,
+		{ requestDigest: string; promise: Promise<IrohRemoteAgentLaunchResult> }
+	>();
 	private readonly pushRelayClient: IrohRemotePushRelayHttpClient;
 	private readonly pushNotificationDeduper = new IrohRemoteInMemoryPushNotificationDeduper();
 	private readonly trustStore: ProjectTrustStore;
@@ -670,6 +700,7 @@ class IrohDaemonService {
 		this.relayMode = relayConfig.relayMode;
 		this.relayUrls = relayConfig.relayUrls;
 		this.relayConfigWarning = relayConfig.warning;
+		this.profile = config.profile;
 		const envRelayAuthToken = process.env.VOLT_IROH_RELAY_AUTH_TOKEN?.trim();
 		this.relayAuthToken =
 			config.relayAuthToken ??
@@ -833,6 +864,43 @@ class IrohDaemonService {
 			throw new Error("iroh host engine is not ready");
 		}
 		return this.engine;
+	}
+
+	private async reconcileAgentLaunchesOnStart(signal: AbortSignal): Promise<void> {
+		try {
+			const state = await this.stateManager.getState();
+			for (const workspace of state.workspaces) {
+				if (signal.aborted) return;
+				const sessionDir = getDefaultSessionDir(workspace.path, this.services.agentDir);
+				const sessions = await SessionManager.list(workspace.path, sessionDir, undefined, {
+					includeMessageFreeDurable: true,
+				});
+				for (const session of sessions) {
+					if (signal.aborted) return;
+					try {
+						const manager = SessionManager.open(session.path, sessionDir);
+						const records = manager.getAgentLaunchRecords();
+						if (records.length === 0 || records.every((record) => record.commit !== undefined)) continue;
+						const record = records.find((candidate) => candidate.commit === undefined);
+						if (record?.receipt.placement.kind === "worktree" && record.receipt.placement.created) {
+							await this.worktrees
+								.remove(workspace, record.receipt.placement.worktreeId, { force: true })
+								.catch(() => undefined);
+						}
+						await rm(session.path, { force: true });
+					} catch (error) {
+						this.log("warn", "failed to reconcile an incomplete agent launch", {
+							workspace: workspace.name,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
+			}
+		} catch (error) {
+			this.log("warn", "agent launch startup reconciliation failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	private async pruneWorktreesOnStart(signal: AbortSignal): Promise<void> {
@@ -1004,6 +1072,7 @@ class IrohDaemonService {
 			// Reconcile worktree records/checkouts before the endpoint starts taking
 			// conversations. The startup admission lease keeps every state mutation
 			// inside the durable quiesce barrier, while its abort signal cancels git.
+			await this.reconcileAgentLaunchesOnStart(startupAdmission.signal);
 			await this.pruneWorktreesOnStart(startupAdmission.signal);
 			if (!startupAdmission.isCurrent()) {
 				this.ready.reject(new Error("iroh service shut down before endpoint startup"));
@@ -1589,6 +1658,10 @@ class IrohDaemonService {
 				await this.runWorktreeManagement(stream, handshake, connectionId, streamId, owner);
 				return;
 			}
+			if (handshake.hello.workspaceManagement.purpose === "manage_agents") {
+				await this.runAgentLaunchManagement(stream, handshake, connectionId, streamId, owner);
+				return;
+			}
 			await this.runWorkspaceManagement(stream, handshake, connectionId, streamId, owner);
 			return;
 		}
@@ -1852,6 +1925,363 @@ class IrohDaemonService {
 			);
 		} finally {
 			activeStream.remove();
+		}
+	}
+
+	/** Serve a manage_agents workspaceManagement stream (agent_launch.v1). */
+	private async runAgentLaunchManagement(
+		stream: IrohBiStreamLike,
+		handshake: Extract<IrohRemoteHostHandshakeResult, { ok: true }>,
+		connectionId: string,
+		streamId: string,
+		owner: IrohPhysicalStreamOwner,
+	): Promise<void> {
+		await writeIrohRemoteHandshakeResponse(stream.send, handshake.response);
+		await this.dependencies.beforeAuthorizedStreamPublication?.("agent_management", handshake.authorization);
+		if (!this.admission.isOpen || !(await this.isAuthorizationCurrent(handshake.authorization))) {
+			await owner.close("access_updated_during_attach").catch(() => undefined);
+			return;
+		}
+		const sanitizerOverrides: RemoteSanitizerOverrides = {
+			additionalRedactedPaths: [getWorktreesRoot(this.services.agentDir)],
+		};
+		const activeStream = this.registerActiveStream(
+			handshake.authorization,
+			WORKSPACE_MANAGEMENT_STREAM_SESSION_ID,
+			stream,
+			owner,
+			connectionId,
+			streamId,
+			{ terminalSessionId: undefined, sanitizerOverrides },
+		);
+		try {
+			await runAgentLaunchManagementStream(
+				{
+					stream,
+					initialInput: handshake.initialInput,
+					authorization: handshake.authorization,
+					isRpcGrantCurrent: () => this.isAuthorizationCurrent(handshake.authorization),
+					closeStream: (reason) => {
+						void owner.close(reason ?? "stream_closed").catch(() => undefined);
+					},
+				},
+				{
+					auditLogger: this.services.auditLogger,
+					agents: this.createAgentLaunchRpcBackend(handshake.authorization),
+					additionalRedactedPaths: sanitizerOverrides.additionalRedactedPaths,
+				},
+			);
+		} finally {
+			activeStream.remove();
+		}
+	}
+
+	private createAgentLaunchRpcBackend(
+		authorization: IrohRemoteClientAuthorizationSuccess,
+	): IrohRemoteAgentLaunchRpcBackend {
+		const workspace = authorization.workspace;
+		return {
+			getAgentLaunchOptions: async () => this.getAgentLaunchOptions(workspace),
+			createAgent: async (_workspaceName, request) => {
+				const operationKey = `${authorization.client.nodeId}\u0000${workspace.name}\u0000${request.launchId}`;
+				const requestDigest = digestIrohRemoteAgentLaunchRequest(workspace.name, request);
+				const existing = this.agentLaunchOperations.get(operationKey);
+				if (existing) {
+					return existing.requestDigest === requestDigest
+						? existing.promise
+						: {
+								kind: "error",
+								error: {
+									kind: "launch_conflict",
+									message: "launch id is already being used by a different request",
+								},
+							};
+				}
+				const operation = this.createConfiguredDetachedAgent(authorization, request).finally(() => {
+					if (this.agentLaunchOperations.get(operationKey)?.promise === operation) {
+						this.agentLaunchOperations.delete(operationKey);
+					}
+				});
+				this.agentLaunchOperations.set(operationKey, { requestDigest, promise: operation });
+				return operation;
+			},
+		};
+	}
+
+	private async getAgentLaunchOptions(workspace: IrohRemoteWorkspace): Promise<IrohRemoteAgentLaunchOptions> {
+		const projectTrusted = resolveIrohRemoteWorkspaceProjectTrusted(workspace, { trustStore: this.trustStore });
+		const settingsManager = SettingsManager.create(workspace.path, this.services.agentDir, {
+			profile: this.profile,
+			projectTrusted,
+		});
+		const services = await createAgentSessionServices({
+			cwd: workspace.path,
+			projectCwd: workspace.path,
+			agentDir: this.services.agentDir,
+			settingsManager,
+			workspaceName: workspace.name,
+		});
+		return createIrohRemoteAgentLaunchOptions(workspace.name, services);
+	}
+
+	private async createConfiguredDetachedAgent(
+		authorization: IrohRemoteClientAuthorizationSuccess,
+		request: IrohRemoteCreateAgentRequest,
+	): Promise<IrohRemoteAgentLaunchResult> {
+		if (!this.admission.isOpen) {
+			return { kind: "error", error: { kind: "host_shutdown", message: "host is shutting down" } };
+		}
+		const workspace = authorization.workspace;
+		const sessionId = createIrohRemoteAgentLaunchSessionId(
+			authorization.client.nodeId,
+			workspace.name,
+			request.launchId,
+		);
+		const sessionDir = getDefaultSessionDir(workspace.path, this.services.agentDir);
+		const requestDigest = digestIrohRemoteAgentLaunchRequest(workspace.name, request);
+		const existingSession = await SessionManager.findForResume(sessionDir, sessionId);
+		if (existingSession) {
+			const manager = SessionManager.open(existingSession.path, sessionDir);
+			const record = manager.getAgentLaunchRecord(request.launchId);
+			if (record?.receipt.requestDigest !== requestDigest) {
+				return {
+					kind: "error",
+					error: { kind: "launch_conflict", message: "launch id was already used by a different request" },
+				};
+			}
+			if (record.commit) {
+				return {
+					kind: "existing",
+					launchId: request.launchId,
+					sessionId,
+					placement: record.receipt.placement,
+					config: record.receipt.config,
+				};
+			}
+			if (record?.receipt.placement.kind === "worktree" && record.receipt.placement.created) {
+				const removed = await this.worktrees
+					.remove(workspace, record.receipt.placement.worktreeId, { force: true })
+					.catch(() => ({ ok: false as const, error: "cleanup_failed" }));
+				if (!removed.ok) {
+					return {
+						kind: "error",
+						error: {
+							kind: "cleanup_required",
+							message: "an interrupted launch worktree could not be removed",
+							worktreeId: record.receipt.placement.worktreeId,
+						},
+					};
+				}
+			}
+			await rm(existingSession.path, { force: true });
+		}
+
+		let options: IrohRemoteAgentLaunchOptions;
+		try {
+			options = await this.getAgentLaunchOptions(workspace);
+		} catch {
+			return {
+				kind: "error",
+				error: { kind: "internal_error", message: "agent launch catalog is unavailable" },
+			};
+		}
+		if (request.catalogRevision !== options.revision) {
+			return {
+				kind: "error",
+				error: {
+					kind: "stale_catalog",
+					message: "agent launch catalog changed",
+					currentRevision: options.revision,
+				},
+			};
+		}
+		const resolvedConfig = resolveIrohRemoteAgentLaunchConfig(options, request.config);
+		if (!resolvedConfig.ok) return { kind: "error", error: resolvedConfig.error };
+		const config: IrohRemoteAgentLaunchConfiguredConfig = resolvedConfig.config;
+
+		let resolvedPlacement: IrohRemoteAgentLaunchResolvedPlacement;
+		let worktree: IrohRemoteWorkspaceWorktree | undefined;
+		try {
+			if (request.placement.kind === "workspace") {
+				resolvedPlacement = {
+					kind: "workspace",
+					...(request.placement.workingDirectory === undefined
+						? {}
+						: { workingDirectory: request.placement.workingDirectory }),
+				};
+			} else if (request.placement.kind === "existing_worktree") {
+				worktree = await this.worktrees.findWorktree(workspace.name, request.placement.worktreeId);
+				if (!worktree) {
+					return {
+						kind: "error",
+						error: { kind: "placement_unavailable", message: "requested worktree is unavailable" },
+					};
+				}
+				resolvedPlacement = {
+					kind: "worktree",
+					worktreeId: worktree.id,
+					branch: worktree.branch,
+					created: false,
+					...(request.placement.workingDirectory === undefined
+						? {}
+						: { workingDirectory: request.placement.workingDirectory }),
+				};
+			} else {
+				const worktreeId =
+					request.placement.worktreeName ??
+					`agent-${digestIrohRemoteAgentLaunchRequest(workspace.name, request).slice(0, 12)}`;
+				const created = await this.worktrees.create(workspace, {
+					id: worktreeId,
+					...(request.placement.branch === undefined ? {} : { branch: request.placement.branch }),
+					...(request.placement.baseRef === undefined ? {} : { baseRef: request.placement.baseRef }),
+					...(request.placement.workingDirectory === undefined
+						? {}
+						: { workingDirectory: request.placement.workingDirectory }),
+				});
+				if (!created.ok) {
+					return {
+						kind: "error",
+						error: { kind: "placement_unavailable", message: "worktree could not be created" },
+					};
+				}
+				worktree = created.worktree;
+				resolvedPlacement = {
+					kind: "worktree",
+					worktreeId: worktree.id,
+					branch: worktree.branch,
+					created: true,
+					...(request.placement.workingDirectory === undefined
+						? {}
+						: { workingDirectory: request.placement.workingDirectory }),
+				};
+			}
+		} catch {
+			return {
+				kind: "error",
+				error: { kind: "placement_unavailable", message: "agent placement is unavailable" },
+			};
+		}
+
+		const compensateCreatedWorktree = async (
+			fallback: IrohRemoteAgentLaunchResult,
+		): Promise<IrohRemoteAgentLaunchResult> => {
+			if (resolvedPlacement.kind !== "worktree" || !resolvedPlacement.created) return fallback;
+			const removed = await this.worktrees
+				.remove(workspace, resolvedPlacement.worktreeId, { force: true })
+				.catch(() => ({ ok: false as const, error: "cleanup_failed" }));
+			if (removed.ok) return fallback;
+			return {
+				kind: "error",
+				error: {
+					kind: "cleanup_required",
+					message: "the launch failed and its worktree could not be removed",
+					worktreeId: resolvedPlacement.worktreeId,
+				},
+			};
+		};
+
+		let directory: WorkspaceDirectoryResolution;
+		try {
+			directory = await this.resolveConversationWorkingDirectory({
+				workspace,
+				rootPath: worktree?.path ?? workspace.path,
+				workingDirectory: request.placement.workingDirectory,
+				...(worktree === undefined ? {} : { worktree }),
+			});
+		} catch {
+			return compensateCreatedWorktree({
+				kind: "error",
+				error: { kind: "placement_unavailable", message: "agent working directory is unavailable" },
+			});
+		}
+		const cwd = directory.absolutePath;
+		const daemonAttachBegin = this.leaseBroker.beginDaemonAttach(workspace.name, sessionId);
+		if (daemonAttachBegin.kind !== "proceed") {
+			return compensateCreatedWorktree({
+				kind: "error",
+				error: { kind: "launch_conflict", message: "session ownership changed during launch" },
+			});
+		}
+		const daemonAttachClaim = daemonAttachBegin.claim;
+		let sessionManager: SessionManager | undefined;
+		let runtimeEntry: IntegratedRuntimeEntry | undefined;
+		let unregisteredRuntime: AgentSessionRuntime | undefined;
+		try {
+			sessionManager = SessionManager.create(cwd, sessionDir, { id: sessionId });
+			sessionManager.appendModelChange(config.model.provider, config.model.modelId);
+			sessionManager.appendThinkingLevelChange(config.thinkingLevel);
+			sessionManager.appendFastModeChange(config.fastModeEnabled);
+			sessionManager.appendPlanningState({ ...clonePlanningState(DEFAULT_PLANNING_STATE), mode: config.agentMode });
+			const receipt = sessionManager.appendAgentLaunchReceipt({
+				launchId: request.launchId,
+				requestDigest,
+				request,
+				placement: resolvedPlacement,
+				config,
+			});
+			await sessionManager.flush();
+			const resolvedSessionTarget = {
+				sessionId,
+				sessionFilePath: sessionManager.getSessionFile(),
+				selection: "created" as const,
+				workspaceName: workspace.name,
+				workspacePath: workspace.path,
+				sessionManager,
+			};
+			const projectTrusted = resolveIrohRemoteWorkspaceProjectTrusted(workspace, { trustStore: this.trustStore });
+			const toolPolicy = resolveIrohRemoteRuntimeToolPolicy({
+				clientAllowTools: authorization.allowTools,
+				workspaceAllowTools: workspace.allowedTools,
+				daemonAllowTools: this.services.state.state.settings.allowTools,
+			});
+			const created = await createIrohRemoteAgentRuntimeWithSessionSelection({
+				cwd,
+				projectCwd: worktree?.path ?? workspace.path,
+				agentDir: this.services.agentDir,
+				profile: this.profile,
+				workspaceName: workspace.name,
+				projectTrusted,
+				toolPolicy,
+				resolvedSessionTarget,
+				launchConfig: {
+					model: config.model,
+					thinkingLevel: config.thinkingLevel,
+					agentMode: config.agentMode,
+				},
+			});
+			unregisteredRuntime = created.runtime;
+			if (worktree) await this.worktrees.bindSession(workspace.name, worktree.id, sessionId);
+			sessionManager.appendAgentLaunchCommit(receipt.id, request.launchId);
+			await sessionManager.flush();
+			const runtimeForRegistration = unregisteredRuntime;
+			unregisteredRuntime = undefined;
+			runtimeEntry = await this.runtimes.registerDetachedRuntime({
+				clientNodeId: authorization.client.nodeId,
+				workspaceName: workspace.name,
+				sessionId,
+				runtime: runtimeForRegistration,
+				toolPolicy,
+				daemonAttachClaim,
+				...(worktree === undefined ? {} : { worktree }),
+				...(resolvedPlacement.workingDirectory === undefined
+					? {}
+					: { workingDirectory: resolvedPlacement.workingDirectory }),
+			});
+			this.requireEngine().setClientLastSessionId(authorization.client.nodeId, workspace.name, sessionId);
+			return { kind: "created", launchId: request.launchId, sessionId, placement: resolvedPlacement, config };
+		} catch {
+			await unregisteredRuntime?.dispose().catch(() => undefined);
+			if (runtimeEntry) {
+				await this.runtimes.stopEntry(runtimeEntry, "agent_cold_launch_rollback").catch(() => undefined);
+			} else {
+				this.leaseBroker.abortDaemonAttach(daemonAttachClaim);
+			}
+			const sessionFile = sessionManager?.getSessionFile();
+			if (sessionFile) await rm(sessionFile, { force: true }).catch(() => undefined);
+			return compensateCreatedWorktree({
+				kind: "error",
+				error: { kind: "internal_error", message: "agent launch could not be completed" },
+			});
 		}
 	}
 

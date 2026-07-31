@@ -9,6 +9,7 @@ import {
 	parseIrohRemoteHelloLine,
 } from "../src/core/remote/iroh/handshake.ts";
 import {
+	IROH_REMOTE_AGENT_LAUNCH_FEATURE,
 	IROH_REMOTE_AGENT_SETTLED_FEATURE,
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_HOST_FEATURES,
@@ -56,6 +57,8 @@ describe("worktrees.v1 capability flag", () => {
 		expect([...IROH_REMOTE_HOST_FEATURES]).toContain("session_runtime_state.v1");
 		expect(IROH_REMOTE_PLANNING_STATE_FEATURE).toBe("planning_state.v1");
 		expect([...IROH_REMOTE_HOST_FEATURES]).toContain("planning_state.v1");
+		expect(IROH_REMOTE_AGENT_LAUNCH_FEATURE).toBe("agent_launch.v1");
+		expect([...IROH_REMOTE_HOST_FEATURES]).toContain("agent_launch.v1");
 	});
 
 	test("worktrees.v1 is NOT a required handshake feature (old hosts still parse)", () => {
@@ -151,6 +154,9 @@ describe("hello: worktreeId on conversation targets", () => {
 		expect(parseHello({ workspaceManagement: { purpose: "unregister_workspace" } })).toMatchObject({
 			workspaceManagement: { purpose: "unregister_workspace" },
 		});
+		expect(parseHello({ workspaceManagement: { purpose: "manage_agents" } })).toMatchObject({
+			workspaceManagement: { purpose: "manage_agents" },
+		});
 		expect(() => parseHello({ workspaceManagement: { purpose: "manage_everything" } })).toThrow();
 	});
 });
@@ -204,6 +210,9 @@ describe("handshake response: worktreeId echo", () => {
 		expect(
 			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceManagement: { purpose: "manage_worktrees" } })),
 		).toMatchObject({ success: true, workspaceManagement: { purpose: "manage_worktrees" } });
+		expect(
+			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceManagement: { purpose: "manage_agents" } })),
+		).toMatchObject({ success: true, workspaceManagement: { purpose: "manage_agents" } });
 		expect(() =>
 			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceManagement: { purpose: "bogus" } })),
 		).toThrow();

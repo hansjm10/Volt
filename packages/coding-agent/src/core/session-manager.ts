@@ -35,6 +35,11 @@ import {
 	createCustomMessage,
 } from "./messages.ts";
 import { clonePlanningState, DEFAULT_PLANNING_STATE, type PlanningState, parsePlanningState } from "./planning.ts";
+import type {
+	IrohRemoteAgentLaunchConfiguredConfig,
+	IrohRemoteAgentLaunchResolvedPlacement,
+	IrohRemoteCreateAgentRequest,
+} from "./remote/iroh/agent-launch.ts";
 import {
 	RPC_CLIENT_MESSAGE_ID_MAX_CHARS,
 	RPC_CLIENT_MESSAGE_ID_PATTERN_SOURCE,
@@ -200,6 +205,29 @@ export interface PlanningStateChangeEntry extends SessionEntryBase {
 	planning: PlanningState;
 }
 
+/** Durable host-only reservation for an idempotent cold agent launch. */
+export interface AgentLaunchReceiptEntry extends SessionEntryBase {
+	type: "agent_launch_receipt";
+	launchId: string;
+	requestDigest: string;
+	request: IrohRemoteCreateAgentRequest;
+	placement: IrohRemoteAgentLaunchResolvedPlacement;
+	config: IrohRemoteAgentLaunchConfiguredConfig;
+}
+
+/** Durable terminal publication for a cold agent launch reservation. */
+export interface AgentLaunchCommitEntry extends SessionEntryBase {
+	type: "agent_launch_commit";
+	receiptId: string;
+	launchId: string;
+	sessionId: string;
+}
+
+export interface AgentLaunchRecord {
+	receipt: AgentLaunchReceiptEntry;
+	commit?: AgentLaunchCommitEntry;
+}
+
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	type: "compaction";
 	summary: string;
@@ -305,6 +333,8 @@ export type SessionEntry =
 	| FastModeChangeEntry
 	| ModelChangeEntry
 	| PlanningStateChangeEntry
+	| AgentLaunchReceiptEntry
+	| AgentLaunchCommitEntry
 	| CompactionEntry
 	| BranchSummaryEntry
 	| CustomEntry
@@ -330,7 +360,12 @@ export function isClientInputWalEntry(
  * and never copy into forks.
  */
 export function isHostOnlySessionEntry(entry: FileEntry): boolean {
-	return isClientInputWalEntry(entry) || entry.type === "subagent_spawn";
+	return (
+		isClientInputWalEntry(entry) ||
+		entry.type === "subagent_spawn" ||
+		entry.type === "agent_launch_receipt" ||
+		entry.type === "agent_launch_commit"
+	);
 }
 
 const CLIENT_INPUT_ID_MAX_CHARACTERS = RPC_CLIENT_MESSAGE_ID_MAX_CHARS;
@@ -1303,6 +1338,8 @@ function isDisplayedCustomMessage(entry: SessionEntry): entry is CustomMessageEn
 function isSessionFileFlushContent(entry: FileEntry): boolean {
 	return (
 		entry.type === "client_input_receipt" ||
+		entry.type === "agent_launch_receipt" ||
+		entry.type === "agent_launch_commit" ||
 		entry.type === "planning_state_change" ||
 		(entry.type === "message" && entry.message.role === "assistant") ||
 		(entry.type === "custom_message" && entry.display)
@@ -1315,6 +1352,8 @@ function isSessionDurabilityBoundary(entry: SessionEntry): boolean {
 		entry.type === "planning_state_change" ||
 		entry.type === "thinking_level_change" ||
 		entry.type === "model_change" ||
+		entry.type === "agent_launch_receipt" ||
+		entry.type === "agent_launch_commit" ||
 		isClientInputWalEntry(entry) ||
 		// A spawn edge that only reaches the page cache when the process dies
 		// cannot recover its child; it gets the same fsync treatment as the
@@ -2419,6 +2458,86 @@ export class SessionManager {
 			this.labelTimestampsById.delete(targetId);
 		}
 		return entry.id;
+	}
+
+	getAgentLaunchRecords(): AgentLaunchRecord[] {
+		return this.fileEntries
+			.filter((entry): entry is AgentLaunchReceiptEntry => entry.type === "agent_launch_receipt")
+			.map((receipt) => this.getAgentLaunchRecord(receipt.launchId)!)
+			.map((record) => structuredClone(record));
+	}
+
+	getAgentLaunchRecord(launchId: string): AgentLaunchRecord | undefined {
+		const receipts = this.fileEntries.filter(
+			(entry): entry is AgentLaunchReceiptEntry =>
+				entry.type === "agent_launch_receipt" && entry.launchId === launchId,
+		);
+		if (receipts.length === 0) return undefined;
+		if (receipts.length !== 1) {
+			throw new Error(`Agent launch ${JSON.stringify(launchId)} has conflicting durable receipts`);
+		}
+		const receipt = receipts[0]!;
+		const commits = this.fileEntries.filter(
+			(entry): entry is AgentLaunchCommitEntry =>
+				entry.type === "agent_launch_commit" && entry.receiptId === receipt.id,
+		);
+		if (commits.length > 1) {
+			throw new Error(`Agent launch ${JSON.stringify(launchId)} has conflicting durable commits`);
+		}
+		return {
+			receipt: structuredClone(receipt),
+			...(commits[0] === undefined ? {} : { commit: structuredClone(commits[0]) }),
+		};
+	}
+
+	appendAgentLaunchReceipt(input: {
+		launchId: string;
+		requestDigest: string;
+		request: IrohRemoteCreateAgentRequest;
+		placement: IrohRemoteAgentLaunchResolvedPlacement;
+		config: IrohRemoteAgentLaunchConfiguredConfig;
+	}): AgentLaunchReceiptEntry {
+		this._assertPersistenceHealthy();
+		const existing = this.getAgentLaunchRecord(input.launchId);
+		if (existing) {
+			if (existing.receipt.requestDigest !== input.requestDigest) {
+				throw new Error(`Agent launch ${JSON.stringify(input.launchId)} conflicts with its durable receipt`);
+			}
+			return existing.receipt;
+		}
+		const entry: AgentLaunchReceiptEntry = {
+			type: "agent_launch_receipt",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			launchId: input.launchId,
+			requestDigest: input.requestDigest,
+			request: structuredClone(input.request),
+			placement: structuredClone(input.placement),
+			config: structuredClone(input.config),
+		};
+		this._appendEntry(entry);
+		return structuredClone(entry);
+	}
+
+	appendAgentLaunchCommit(receiptId: string, launchId: string): AgentLaunchCommitEntry {
+		this._assertPersistenceHealthy();
+		const record = this.getAgentLaunchRecord(launchId);
+		if (!record || record.receipt.id !== receiptId) {
+			throw new Error(`Agent launch receipt not found: ${launchId}`);
+		}
+		if (record.commit) return record.commit;
+		const entry: AgentLaunchCommitEntry = {
+			type: "agent_launch_commit",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			receiptId,
+			launchId,
+			sessionId: this.sessionId,
+		};
+		this._appendEntry(entry);
+		return structuredClone(entry);
 	}
 
 	/**

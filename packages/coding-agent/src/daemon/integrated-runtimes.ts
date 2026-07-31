@@ -43,7 +43,7 @@ import {
 	type ConversationSubscriber,
 } from "./conversation-coordinator.ts";
 import type { IntegratedConversationSessionSelection } from "./handshake-responses.ts";
-import type { DaemonRuntimeOwnerCapability } from "./lease-broker.ts";
+import type { DaemonAttachClaim, DaemonRuntimeOwnerCapability } from "./lease-broker.ts";
 import { isPathInside, resolveWorkspaceDirectory, type WorkspaceDirectoryResolution } from "./workspace-directory.ts";
 import { getRegisteredWorkingDirectoryForWorktree } from "./worktree-manager.ts";
 
@@ -697,6 +697,73 @@ export class IntegratedRuntimeRegistry {
 			entry.runtime.setPrepareSessionReplacement?.((target) => this.prepareEntrySessionReplacement(entry, target));
 		}
 		return entry;
+	}
+
+	async registerDetachedRuntime(options: {
+		clientNodeId: string;
+		workspaceName: string;
+		sessionId: string;
+		runtime: AgentSessionRuntime;
+		toolPolicy: IrohRemoteRuntimeToolPolicy;
+		daemonAttachClaim: DaemonAttachClaim;
+		worktree?: IrohRemoteWorkspaceWorktree;
+		workingDirectory?: string;
+	}): Promise<IntegratedRuntimeEntry> {
+		if (
+			this.findOwner(options.workspaceName, options.sessionId) ||
+			this.getSessionRekeyReservation(this.getRegistryKey(options.workspaceName, options.sessionId)) !== undefined
+		) {
+			throw new Error(`conversation runtime already active for ${options.workspaceName}/${options.sessionId}`);
+		}
+		const entry = this.createEntryRecord({
+			clientNodeId: options.clientNodeId,
+			workspaceName: options.workspaceName,
+			sessionId: options.sessionId,
+			runtime: options.runtime,
+			...(options.worktree === undefined
+				? {}
+				: {
+						worktreeId: options.worktree.id,
+						worktreePath: options.worktree.path,
+						...(options.worktree.sourceRootRelativePath === undefined
+							? {}
+							: { worktreeSourceRootRelativePath: options.worktree.sourceRootRelativePath }),
+					}),
+			...(options.workingDirectory === undefined ? {} : { workingDirectory: options.workingDirectory }),
+			toolPolicy: options.toolPolicy,
+		});
+		const { outcome, installedProvisionalOwner } = entry.coordinator.commitDaemonRuntime(options.daemonAttachClaim);
+		if (!outcome.ok) {
+			await options.runtime.dispose().catch(() => undefined);
+			throw new Error(`detached runtime lease could not be committed: ${outcome.reason}`);
+		}
+		try {
+			if (this.findOwner(options.workspaceName, options.sessionId)) {
+				throw new Error(`conversation runtime already active for ${options.workspaceName}/${options.sessionId}`);
+			}
+			this.entries.set(entry.key, entry);
+			entry.coordinator.activateRuntime();
+			entry.coordinator.markDetached();
+			const finalized = entry.coordinator.finalizeDaemonRuntimeCommit(outcome.token);
+			if (finalized.kind === "fenced") {
+				throw new Error("detached runtime lease was fenced during publication");
+			}
+			this.scheduleRetention(entry, "agent_cold_launch");
+			await this.logEntryAudit(entry, "remote_runtime_started", { reason: "agent_cold_launch" });
+			await this.logEntryAudit(entry, "remote_runtime_detached", {
+				detachedAt: entry.detachedAt,
+				reason: "agent_cold_launch",
+			});
+			return entry;
+		} catch (error) {
+			if (entry.lifecycle === "active" && this.entries.get(entry.key) === entry) {
+				await this.stopEntry(entry, "agent_cold_launch_failed").catch(() => undefined);
+			} else {
+				entry.coordinator.rollbackDaemonRuntimeCommit(outcome.token, outcome.owner, installedProvisionalOwner);
+				await options.runtime.dispose().catch(() => undefined);
+			}
+			throw error;
+		}
 	}
 
 	private registerSubagentRuntime(

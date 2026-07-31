@@ -178,6 +178,473 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcAgentLaunchConfig": {
+			"type": "object",
+			"required": [
+				"fastModeEnabled",
+				"agentMode"
+			],
+			"properties": {
+				"model": {
+					"$ref": "#/$defs/RpcAgentLaunchModelSelection"
+				},
+				"thinkingLevel": {
+					"$ref": "#/$defs/RpcThinkingLevel"
+				},
+				"fastModeEnabled": {
+					"type": "boolean"
+				},
+				"agentMode": {
+					"$ref": "#/$defs/RpcAgentMode"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcAgentLaunchConfiguredConfig": {
+			"type": "object",
+			"required": [
+				"kind",
+				"model",
+				"thinkingLevel",
+				"fastModeEnabled",
+				"agentMode"
+			],
+			"properties": {
+				"kind": {
+					"type": "string",
+					"const": "configured"
+				},
+				"model": {
+					"$ref": "#/$defs/RpcAgentLaunchModelSelection"
+				},
+				"thinkingLevel": {
+					"$ref": "#/$defs/RpcThinkingLevel"
+				},
+				"fastModeEnabled": {
+					"type": "boolean"
+				},
+				"agentMode": {
+					"$ref": "#/$defs/RpcAgentMode"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcAgentLaunchError": {
+			"anyOf": [
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"message"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "invalid_request"
+						},
+						"message": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"message",
+						"currentRevision"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "stale_catalog"
+						},
+						"message": {
+							"type": "string"
+						},
+						"currentRevision": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"message"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "model_unavailable"
+						},
+						"message": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"message"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "thinking_level_unsupported"
+						},
+						"message": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"message"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "fast_mode_unsupported"
+						},
+						"message": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"message"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "placement_unavailable"
+						},
+						"message": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"message",
+						"worktreeId"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "cleanup_required"
+						},
+						"message": {
+							"type": "string"
+						},
+						"worktreeId": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"message"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "launch_conflict"
+						},
+						"message": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"message"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "host_shutdown"
+						},
+						"message": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"message"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "internal_error"
+						},
+						"message": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				}
+			]
+		},
+		"RpcAgentLaunchModelSelection": {
+			"type": "object",
+			"required": [
+				"provider",
+				"modelId"
+			],
+			"properties": {
+				"provider": {
+					"type": "string",
+					"minLength": 1
+				},
+				"modelId": {
+					"type": "string",
+					"minLength": 1
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcAgentLaunchOptions": {
+			"type": "object",
+			"required": [
+				"workspaceName",
+				"revision",
+				"models",
+				"defaultConfig"
+			],
+			"properties": {
+				"workspaceName": {
+					"type": "string",
+					"minLength": 1
+				},
+				"revision": {
+					"type": "string",
+					"minLength": 1
+				},
+				"models": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/RpcCatalogModel"
+					}
+				},
+				"defaultConfig": {
+					"$ref": "#/$defs/RpcAgentLaunchConfiguredConfig"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcAgentLaunchPlacement": {
+			"anyOf": [
+				{
+					"type": "object",
+					"required": [
+						"kind"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "workspace"
+						},
+						"workingDirectory": {
+							"type": "string",
+							"minLength": 1
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"worktreeId"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "existing_worktree"
+						},
+						"worktreeId": {
+							"type": "string",
+							"minLength": 1
+						},
+						"workingDirectory": {
+							"type": "string",
+							"minLength": 1
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "new_worktree"
+						},
+						"worktreeName": {
+							"type": "string",
+							"minLength": 1
+						},
+						"branch": {
+							"type": "string",
+							"minLength": 1
+						},
+						"baseRef": {
+							"type": "string",
+							"minLength": 1
+						},
+						"workingDirectory": {
+							"type": "string",
+							"minLength": 1
+						}
+					},
+					"additionalProperties": false
+				}
+			]
+		},
+		"RpcAgentLaunchResolvedPlacement": {
+			"anyOf": [
+				{
+					"type": "object",
+					"required": [
+						"kind"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "workspace"
+						},
+						"workingDirectory": {
+							"type": "string",
+							"minLength": 1
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"worktreeId",
+						"branch",
+						"created"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "worktree"
+						},
+						"worktreeId": {
+							"type": "string",
+							"minLength": 1
+						},
+						"branch": {
+							"type": "string",
+							"minLength": 1
+						},
+						"created": {
+							"type": "boolean"
+						},
+						"workingDirectory": {
+							"type": "string",
+							"minLength": 1
+						}
+					},
+					"additionalProperties": false
+				}
+			]
+		},
+		"RpcAgentLaunchResult": {
+			"anyOf": [
+				{
+					"$ref": "#/$defs/RpcAgentLaunchSuccess"
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"error"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "error"
+						},
+						"error": {
+							"$ref": "#/$defs/RpcAgentLaunchError"
+						}
+					},
+					"additionalProperties": false
+				}
+			]
+		},
+		"RpcAgentLaunchSuccess": {
+			"type": "object",
+			"required": [
+				"kind",
+				"launchId",
+				"sessionId",
+				"placement",
+				"config"
+			],
+			"properties": {
+				"kind": {
+					"anyOf": [
+						{
+							"type": "string",
+							"const": "created"
+						},
+						{
+							"type": "string",
+							"const": "existing"
+						}
+					]
+				},
+				"launchId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"sessionId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"placement": {
+					"$ref": "#/$defs/RpcAgentLaunchResolvedPlacement"
+				},
+				"config": {
+					"$ref": "#/$defs/RpcAgentLaunchConfiguredConfig"
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcAgentMode": {
 			"type": "string",
 			"enum": [
@@ -607,6 +1074,12 @@
 					"$ref": "#/$defs/RpcCommand.get_web_search_status"
 				},
 				{
+					"$ref": "#/$defs/RpcCommand.get_agent_launch_options"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.create_agent"
+				},
+				{
 					"$ref": "#/$defs/RpcCommand.upload_device_logs"
 				},
 				{
@@ -869,6 +1342,12 @@
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.get_web_search_status"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.get_agent_launch_options"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.create_agent"
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.upload_device_logs"
@@ -1264,6 +1743,49 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcCommand.create_agent": {
+			"type": "object",
+			"required": [
+				"type",
+				"workspaceName",
+				"launchId",
+				"catalogRevision",
+				"placement",
+				"config"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "create_agent"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"workspaceName": {
+					"type": "string",
+					"pattern": "^\\S(?:[\\s\\S]*\\S)?$",
+					"x-volt-expected": "be a non-empty workspace name"
+				},
+				"launchId": {
+					"type": "string",
+					"pattern": "^[a-z0-9_-]{1,128}$"
+				},
+				"catalogRevision": {
+					"type": "string",
+					"minLength": 1
+				},
+				"placement": {
+					"$ref": "#/$defs/RpcAgentLaunchPlacement"
+				},
+				"config": {
+					"$ref": "#/$defs/RpcAgentLaunchConfig"
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcCommand.cycle_model": {
 			"type": "object",
 			"required": [
@@ -1396,6 +1918,31 @@
 				},
 				"entryId": {
 					"type": "string"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcCommand.get_agent_launch_options": {
+			"type": "object",
+			"required": [
+				"type",
+				"workspaceName"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "get_agent_launch_options"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"workspaceName": {
+					"type": "string",
+					"pattern": "^\\S(?:[\\s\\S]*\\S)?$",
+					"x-volt-expected": "be a non-empty workspace name"
 				}
 			},
 			"additionalProperties": false
@@ -6208,6 +6755,12 @@
 					"$ref": "#/$defs/RpcResponse.get_web_search_status"
 				},
 				{
+					"$ref": "#/$defs/RpcResponse.get_agent_launch_options"
+				},
+				{
+					"$ref": "#/$defs/RpcResponse.create_agent"
+				},
+				{
 					"$ref": "#/$defs/RpcResponse.upload_device_logs"
 				},
 				{
@@ -6670,6 +7223,36 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcResponse.create_agent": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "create_agent"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"$ref": "#/$defs/RpcAgentLaunchResult"
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcResponse.cycle_model": {
 			"type": "object",
 			"required": [
@@ -6904,6 +7487,36 @@
 						}
 					},
 					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.get_agent_launch_options": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "get_agent_launch_options"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"$ref": "#/$defs/RpcAgentLaunchOptions"
 				}
 			},
 			"additionalProperties": false

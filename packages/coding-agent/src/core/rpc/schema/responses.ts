@@ -9,6 +9,7 @@ import type { AgentMessage } from "@hansjm10/volt-agent-core";
 import { type TLiteral, type TObject, type TOptional, type TSchema, type TString, Type } from "typebox";
 import type { RpcCommandType } from "../types.ts";
 import { RPC_STABLE_ERROR_CODES } from "../wire-limits.ts";
+import { RpcAgentLaunchOptionsSchema, RpcAgentLaunchResultSchema } from "./agent-launch.ts";
 import { RpcPendingHostActionsResponseSchema } from "./events.ts";
 import { RpcModelSchema } from "./external.ts";
 import { opaque, openStringEnum } from "./helpers.ts";
@@ -355,6 +356,8 @@ export const RPC_RESPONSE_SCHEMAS = {
 		"get_web_search_status",
 		Type.Object({ webSearch: RpcWebSearchStatusSchema }, { additionalProperties: false }),
 	),
+	get_agent_launch_options: dataResponse("get_agent_launch_options", RpcAgentLaunchOptionsSchema),
+	create_agent: dataResponse("create_agent", RpcAgentLaunchResultSchema),
 
 	// Device diagnostics
 	upload_device_logs: dataResponse(

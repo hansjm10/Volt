@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import type { ThinkingLevel } from "@hansjm10/volt-agent-core";
 import { ENV_AGENT_DIR, getAgentDir } from "../../config.ts";
 import {
 	type AgentSessionRuntime,
@@ -9,6 +10,7 @@ import { createAgentSessionFromServices, createAgentSessionServices } from "../.
 import { formatNoModelsAvailableMessage } from "../../core/auth-guidance.ts";
 import { AuthStorage } from "../../core/auth-storage.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "../../core/http-dispatcher.ts";
+import type { AgentMode } from "../../core/planning.ts";
 import {
 	type IrohRemoteRuntimeToolPolicy,
 	parseIrohRemoteAllowTools,
@@ -56,6 +58,12 @@ export interface IrohRemoteAgentRuntimeOptions {
 	sessionDir?: string;
 	/** Validate the resolved session cwd before services/tools are created. */
 	validateCwd?: (cwd: string) => Promise<void> | void;
+	/** Explicit cold-launch policy. Omitted for every existing conversation path. */
+	launchConfig?: {
+		model: { provider: string; modelId: string };
+		thinkingLevel: ThinkingLevel;
+		agentMode: AgentMode;
+	};
 }
 
 export interface IrohRemoteSubagentRuntimeCreatedEvent extends SubagentRuntimeCreatedEvent {
@@ -156,10 +164,21 @@ export async function createIrohRemoteAgentRuntimeWithSessionSelection(
 						})
 				: undefined,
 		});
+		const launchModel = options.launchConfig
+			? services.modelRegistry.find(options.launchConfig.model.provider, options.launchConfig.model.modelId)
+			: undefined;
+		if (options.launchConfig && (!launchModel || !services.modelRegistry.hasConfiguredAuth(launchModel))) {
+			throw new Error(
+				`Launch model is unavailable: ${options.launchConfig.model.provider}/${options.launchConfig.model.modelId}`,
+			);
+		}
 		const created = await createAgentSessionFromServices({
 			services,
 			sessionManager: runtimeOptions.sessionManager,
 			sessionStartEvent: runtimeOptions.sessionStartEvent,
+			model: launchModel,
+			thinkingLevel: options.launchConfig?.thinkingLevel,
+			agentMode: options.launchConfig?.agentMode,
 			tools,
 			allowUnlistedExtensionTools,
 			subagentToolManager: subagentManager,

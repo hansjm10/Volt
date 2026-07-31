@@ -84,6 +84,33 @@ clients, and pending pairing tickets. The daemon logs and audits this expected
 migration as `legacy_remote_access_dropped`; it is not corruption. Every old
 client must pair again to receive an explicit current grant.
 
+## Configured remote agent launch
+
+Hosts advertising `agent_launch.v1` expose a workspace-scoped `manage_agents`
+stream. A paired client reads `get_agent_launch_options`, then submits
+`create_agent` with that catalog revision, a client launch UUID, placement,
+and the complete session-only model, thinking, Fast, and Build/Plan policy.
+Catalog discovery requires `model.select.v1`; creation requires
+`conversation.control.v1`, plus `model.select.v1` for explicit model or
+thinking choices and `worktrees.manage.v1` for new-worktree placement. Launch
+choices do not mutate host defaults and do not require `host.manage.v1`.
+
+The daemon validates the revision and full request before publication. It
+persists a host-only receipt keyed by authenticated client, workspace, and
+launch UUID, seeds the predetermined session with the effective configuration,
+and only then publishes the detached runtime. Identical concurrent calls and
+retries after a lost response return the original result; conflicting reuse is
+rejected. If a request created a worktree and later fails, the daemon removes
+that worktree before reporting failure or returns `cleanup_required` when it
+cannot guarantee compensation.
+
+Creation does not open a conversation stream or deliver input. After
+`create_agent` commits, the client attaches with `conversation.target:\"session\"`
+using the returned session ID and sends the initial prompt through the normal
+receipt-safe conversation path. This keeps the atomic boundary around agent
+identity, placement, and configuration while preserving ordinary prompt
+ownership and retry semantics.
+
 ## Conversation leases
 
 Exactly one process owns the live runtime for each `(workspace, session)`

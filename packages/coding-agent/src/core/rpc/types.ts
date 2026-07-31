@@ -13,6 +13,16 @@
 
 import type { Api, Model } from "@hansjm10/volt-ai";
 import type { Static } from "typebox";
+import type {
+	RpcAgentLaunchConfigSchema,
+	RpcAgentLaunchConfiguredConfigSchema,
+	RpcAgentLaunchErrorSchema,
+	RpcAgentLaunchModelSelectionSchema,
+	RpcAgentLaunchOptionsSchema,
+	RpcAgentLaunchPlacementSchema,
+	RpcAgentLaunchResolvedPlacementSchema,
+	RpcAgentLaunchResultSchema,
+} from "./schema/agent-launch.ts";
 import type { RPC_COMMAND_SCHEMAS, RpcClientCapabilityFeatureSchema } from "./schema/commands.ts";
 import type {
 	RpcConversationActiveAssistantSchema,
@@ -161,6 +171,15 @@ export type RpcSubagentDefinitionSource = Static<typeof RpcSubagentDefinitionSou
  * another client's rebind cannot act on the replacement conversation.
  */
 export type RpcConversationAuthority = Static<typeof RpcConversationAuthoritySchema>;
+
+export type RpcAgentLaunchModelSelection = Static<typeof RpcAgentLaunchModelSelectionSchema>;
+export type RpcAgentLaunchConfig = Static<typeof RpcAgentLaunchConfigSchema>;
+export type RpcAgentLaunchConfiguredConfig = Static<typeof RpcAgentLaunchConfiguredConfigSchema>;
+export type RpcAgentLaunchPlacement = Static<typeof RpcAgentLaunchPlacementSchema>;
+export type RpcAgentLaunchResolvedPlacement = Static<typeof RpcAgentLaunchResolvedPlacementSchema>;
+export type RpcAgentLaunchError = Static<typeof RpcAgentLaunchErrorSchema>;
+export type RpcAgentLaunchResult = Static<typeof RpcAgentLaunchResultSchema>;
+export type RpcAgentLaunchOptions = Static<typeof RpcAgentLaunchOptionsSchema>;
 
 // ============================================================================
 // RPC Commands
