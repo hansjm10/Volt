@@ -358,13 +358,30 @@ Attaching or reattaching a stream while work is active emits a fresh current sna
 
 The relay requires this exact bounded shape, verifies timestamp freshness, rejects unknown and former tool-oriented fields, and requires `sessionID`/`workspaceName` to equal the daemon-bound relay conversation identity.
 
-Completion notifications sent through the relay, or over JSONL as `notification_request` when no push target is available, include the safe workspace name when the host knows it:
+Completion notifications use one canonical intent for managed push delivery and JSONL fallback. The JSONL shape is `notification_request`; the relay receives the same `eventId`, `kind`, title, body, `workspaceName`/`sessionId` authority, and `planId` or `workflowId`, and forwards those exact metadata fields in FCM `data`.
+
+| Outcome | `kind` | Title | Body | Navigation |
+| --- | --- | --- | --- | --- |
+| Successful ordinary prompt | `conversation_completed` | `Volt finished` (optionally `in <workspace>`) | `Your conversation is ready.` | session only |
+| Successful prompt ending in Plan mode with a ready plan | `plan_ready` | `Your plan is ready` | `Open Volt to review and approve it.` | `planId` |
+| Completed review, zero findings | `review_completed` | `Your review is ready` | `<target> completed with no issues found.` | `workflowId` |
+| Completed review, one finding | `review_completed` | `Your review is ready` | `<target> completed with 1 finding.` | `workflowId` |
+| Completed review, multiple findings | `review_completed` | `Your review is ready` | `<target> completed with N findings.` | `workflowId` |
+| Completed review, unknown count | `review_completed` | `Your review is ready` | `<target> completed. Open Volt to see the findings.` | `workflowId` |
+
+A ready Plan emits `plan_ready` instead of `conversation_completed` for that prompt. Failed prompts retain the `host_notice` error copy, aborted prompts emit no completion notification, and cancelled or failed reviews do not emit `review_completed`.
 
 ```json
-{"type":"notification_request","eventId":"conversation:session-one:run-one:completed","kind":"conversation_completed","title":"Volt finished in volt-app","body":"Your conversation is ready.","sessionId":"session-one","workspace":"volt-app"}
+{"type":"notification_request","eventId":"plan:session-one:run-one:ready","kind":"plan_ready","title":"Your plan is ready","body":"Open Volt to review and approve it.","sessionId":"session-one","workspaceName":"volt-app","planId":"plan-one"}
 ```
 
-The `workspace` field is a registered workspace name only. It must never contain a host-local path.
+```json
+{"type":"notification_request","eventId":"review:one:completed","kind":"review_completed","title":"Your review is ready","body":"PR #151 completed with 4 findings.","sessionId":"session-one","workspaceName":"volt-app","workflowId":"review:one"}
+```
+
+Review targets come only from the host's bounded workflow target record: `PR #N`, `uncommitted changes`, a canonical commit, or a path-free branch comparison. Unsafe or unavailable targets fall back to `Review`; commands, diffs, pull request titles/bodies, and host paths are never copied into a notification. Notification titles are limited to 128 UTF-8 bytes, bodies to 512, review targets to 256, workspace and navigation/session identifiers to 128, event IDs to 512, and kinds to 64. Host construction removes unsafe copy before delivery, and strict control/relay boundaries reject path separators plus control, format, or surrogate characters; metadata also rejects whitespace.
+
+`workspaceName` is the sole notification workspace key, contains a registered workspace name only, and never carries a host-local path; the former `workspace` key is rejected. `sessionId` remains the stream/runtime authority. `planId` and `workflowId` are mutually exclusive stable navigation identifiers and appear only on their matching kind. A retained runtime reconciles completed review records per paired client: a completion that lands while detached remains pending, is retried through push when available or delivered over JSONL after reattachment, and a stable `eventId` is surfaced at most once for that runtime/client.
 
 `unregister_workspace` on a workspace management stream removes a registered workspace name from the host state file without deleting files:
 

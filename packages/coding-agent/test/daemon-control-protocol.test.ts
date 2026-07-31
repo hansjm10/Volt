@@ -89,12 +89,13 @@ describe("control protocol framing", () => {
 				workspaceName: "volt",
 				sessionId: "s-1",
 				notification: {
-					eventId: "conversation:s-1:run-1:completed",
-					kind: "conversation_completed",
-					title: "Volt finished",
-					body: "Your conversation is ready.",
+					eventId: "plan:s-1:run-1:ready",
+					kind: "plan_ready",
+					title: "Your plan is ready",
+					body: "Open Volt to review and approve it.",
 					sessionId: "s-1",
-					workspace: "volt",
+					workspaceName: "volt",
+					planId: "plan-1",
 				},
 			},
 			{
@@ -222,6 +223,47 @@ describe("control protocol framing", () => {
 				workspaceName: "volt",
 				sessionId: "s-1",
 				notification: { eventId: "e-1", kind: "conversation_completed", title: "Volt finished" },
+			}),
+		).toBe(false);
+		const reviewNotificationRequest = {
+			type: "relay_notification_delivery",
+			id: "review",
+			clientNodeId: "n-1",
+			workspaceName: "volt",
+			sessionId: "s-1",
+			notification: {
+				eventId: "review:one:completed",
+				kind: "review_completed",
+				title: "Your review is ready",
+				body: "PR #151 completed with 4 findings.",
+				sessionId: "s-1",
+				workspaceName: "volt",
+				workflowId: "review:one",
+			},
+		};
+		expect(isControlRequest(reviewNotificationRequest)).toBe(true);
+		expect(
+			isControlRequest({
+				...reviewNotificationRequest,
+				notification: { ...reviewNotificationRequest.notification, planId: "plan-1" },
+			}),
+		).toBe(false);
+		for (const notification of [
+			{ ...reviewNotificationRequest.notification, title: "Review\nready" },
+			{ ...reviewNotificationRequest.notification, body: "Open /Users/private/review.diff" },
+			{ ...reviewNotificationRequest.notification, workspaceName: "private/path" },
+			{ ...reviewNotificationRequest.notification, workflowId: "w".repeat(129) },
+		]) {
+			expect(isControlRequest({ ...reviewNotificationRequest, notification })).toBe(false);
+		}
+		expect(
+			isControlRequest({
+				...reviewNotificationRequest,
+				notification: {
+					...reviewNotificationRequest.notification,
+					workspaceName: undefined,
+					workspace: "volt",
+				},
 			}),
 		).toBe(false);
 		expect(

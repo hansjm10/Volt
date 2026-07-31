@@ -3,6 +3,9 @@ const { test } = require("node:test");
 const {
 	DEFAULT_ALLOWED_FIREBASE_APP_ID,
 	MAX_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
+	MAX_NOTIFICATION_BODY_UTF8_BYTES,
+	MAX_NOTIFICATION_METADATA_UTF8_BYTES,
+	MAX_NOTIFICATION_TITLE_UTF8_BYTES,
 	MAX_REQUEST_BYTES,
 	RequestError,
 	assertVerifiedAppCheck,
@@ -147,13 +150,105 @@ test("registration and notification schemas reject unknown and oversized values"
 				pushTargetId: "fcm_12345678901234567890",
 				pushTargetAuthToken: "a".repeat(32),
 				eventId: "event-1",
-				kind: "completed",
+				kind: "conversation_completed",
 				title: "Volt",
 				body: "x".repeat(1025),
-				data: {},
+				data: { eventId: "event-1", kind: "conversation_completed" },
 			}),
 		400,
-		"body_has_invalid_length",
+		"body_has_invalid_notification_text",
+	);
+});
+
+test("notification input preserves bounded Plan and review navigation metadata for FCM", () => {
+	const plan = parseNotification({
+		pushTargetId: "fcm_12345678901234567890",
+		pushTargetAuthToken: "a".repeat(32),
+		eventId: "plan:session-one:run-one:ready",
+		kind: "plan_ready",
+		title: "Your plan is ready",
+		body: "Open Volt to review and approve it.",
+		workspaceName: "volt-app",
+		planId: "plan-one",
+		data: {
+			eventId: "plan:session-one:run-one:ready",
+			kind: "plan_ready",
+			sessionId: "session-one",
+			workspaceName: "volt-app",
+			planId: "plan-one",
+		},
+	});
+	assert.deepEqual(plan.data, {
+		eventId: "plan:session-one:run-one:ready",
+		kind: "plan_ready",
+		sessionId: "session-one",
+		workspaceName: "volt-app",
+		planId: "plan-one",
+	});
+	assert.equal(plan.planId, "plan-one");
+
+	const review = parseNotification({
+		pushTargetId: "fcm_12345678901234567890",
+		pushTargetAuthToken: "a".repeat(32),
+		eventId: "review:one:completed",
+		kind: "review_completed",
+		title: "Your review is ready",
+		body: "PR #151 completed with 4 findings.",
+		workflowId: "review:one",
+		data: {
+			eventId: "review:one:completed",
+			kind: "review_completed",
+			sessionId: "session-one",
+			workflowId: "review:one",
+		},
+	});
+	assert.equal(review.workflowId, "review:one");
+	assert.equal(review.data.workflowId, "review:one");
+});
+
+test("notification input rejects control characters, host paths, overlong copy, and metadata drift", () => {
+	const base = {
+		pushTargetId: "fcm_12345678901234567890",
+		pushTargetAuthToken: "a".repeat(32),
+		eventId: "review:one:completed",
+		kind: "review_completed",
+		title: "Your review is ready",
+		body: "Review completed with 1 finding.",
+		workflowId: "review:one",
+		data: {
+			eventId: "review:one:completed",
+			kind: "review_completed",
+			workflowId: "review:one",
+		},
+	};
+	for (const [field, value, message] of [
+		["title", "Review\nready", "title_has_invalid_notification_text"],
+		["body", "Open /Users/private/review.diff", "body_has_invalid_notification_text"],
+		["title", "🚀".repeat(Math.floor(MAX_NOTIFICATION_TITLE_UTF8_BYTES / 4) + 1), "title_has_invalid_notification_text"],
+		["body", "x".repeat(MAX_NOTIFICATION_BODY_UTF8_BYTES + 1), "body_has_invalid_notification_text"],
+		["workflowId", "w".repeat(MAX_NOTIFICATION_METADATA_UTF8_BYTES + 1), "workflowId_has_invalid_notification_metadata"],
+	]) {
+		expectRequestError(() => parseNotification({ ...base, [field]: value }), 400, message);
+	}
+	expectRequestError(
+		() => parseNotification({ ...base, data: { ...base.data, workflowId: "review:other" } }),
+		400,
+		"notification_data_mismatch",
+	);
+	expectRequestError(
+		() => parseNotification({ ...base, data: { ...base.data, command: "git diff HEAD" } }),
+		400,
+		"data_has_unknown_field",
+	);
+	expectRequestError(
+		() => parseNotification({ ...base, workspace: "volt-app" }),
+		400,
+		"notification_has_unknown_field",
+	);
+	expectRequestError(
+		() => parseNotification({ ...base, data: { ...base.data, workspace: "volt-app" } }),
+		400,
+		"data_has_unknown_field",
 	);
 });
 

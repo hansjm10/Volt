@@ -13,6 +13,7 @@ import {
 	type IrohRemotePushNotificationDeliveryStatus,
 	type IrohRemotePushNotificationIntent,
 	MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
+	parseIrohRemotePushNotificationIntent,
 } from "../core/remote/iroh/push.ts";
 import type { IrohRemoteClient } from "../core/remote/iroh/state.ts";
 
@@ -526,10 +527,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isOptionalString(value: unknown): boolean {
-	return value === undefined || typeof value === "string";
-}
-
 function isOptionalNumber(value: unknown): boolean {
 	return value === undefined || (Number.isSafeInteger(value) && (value as number) >= 0);
 }
@@ -624,15 +621,7 @@ function isLiveActivityContentState(value: unknown): boolean {
 }
 
 function isPushNotificationIntent(value: unknown): value is IrohRemotePushNotificationIntent {
-	return (
-		isRecord(value) &&
-		typeof value.eventId === "string" &&
-		typeof value.kind === "string" &&
-		typeof value.title === "string" &&
-		typeof value.body === "string" &&
-		isOptionalString(value.sessionId) &&
-		isOptionalString(value.workspace)
-	);
+	return parseIrohRemotePushNotificationIntent(value) !== undefined;
 }
 
 function isLiveActivityUpdateIntent(value: unknown): value is IrohRemoteLiveActivityUpdateIntent {
