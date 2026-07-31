@@ -1,10 +1,15 @@
 import { Buffer } from "node:buffer";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, ImageContent, Model } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createImageGenTool, type ImageGenFetcher, isCodexImageGenerationModel } from "../src/index.ts";
+import {
+	createImageGenTool,
+	type ImageGenFetcher,
+	type ImageGenReferenceFileOperations,
+	isCodexImageGenerationModel,
+} from "../src/index.ts";
 
 const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg==";
 const GIF_BASE64 = "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
@@ -52,6 +57,34 @@ function jsonResponse(body: unknown, status = 200): Response {
 	});
 }
 
+function createReferenceFileOperations(
+	entries: Record<string, { data: Uint8Array; isFile?: boolean; size?: number }>,
+	events: string[],
+): ImageGenReferenceFileOperations {
+	return {
+		open: vi.fn(async (path) => {
+			const entry = entries[path];
+			if (!entry) throw new Error("missing simulated file");
+			events.push(`open:${path}`);
+			return {
+				stat: vi.fn(async () => {
+					events.push(`stat:${path}`);
+					return { isFile: () => entry.isFile ?? true, size: entry.size ?? entry.data.length };
+				}),
+				read: vi.fn(async (buffer, offset, length, position) => {
+					events.push(`read:${path}`);
+					const availableData = entry.data.subarray(position, Math.min(entry.data.length, position + length));
+					buffer.set(availableData, offset);
+					return { bytesRead: length };
+				}),
+				close: vi.fn(async () => {
+					events.push(`close:${path}`);
+				}),
+			};
+		}),
+	};
+}
+
 afterEach(async () => {
 	vi.restoreAllMocks();
 	await Promise.all(tempDirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
@@ -74,6 +107,7 @@ describe("image_gen tool", () => {
 				prompt: "A luminous Volt logo",
 				background: "auto",
 				model: "gpt-image-2",
+				output_format: "png",
 				quality: "auto",
 				size: "auto",
 			});
@@ -100,6 +134,9 @@ describe("image_gen tool", () => {
 
 		expect(fetcher).toHaveBeenCalledOnce();
 		expect(await readFile(outputPath)).toEqual(Buffer.from(PNG_BASE64, "base64"));
+		if (process.platform !== "win32") {
+			expect((await stat(outputPath)).mode & 0o777).toBe(0o644);
+		}
 		expect(result.content).toEqual([
 			{ type: "text", text: `Generated image saved to ${outputPath}` },
 			{ type: "image", mimeType: "image/png", data: PNG_BASE64 },
@@ -141,6 +178,9 @@ describe("image_gen tool", () => {
 
 		const expectedOutputPath = join(outputRoot, "call_edit_2.png");
 		expect(await readFile(expectedOutputPath)).toEqual(Buffer.from(PNG_BASE64, "base64"));
+		if (process.platform !== "win32") {
+			expect((await stat(expectedOutputPath)).mode & 0o777).toBe(0o600);
+		}
 		expect(result.details).toEqual({
 			model: "gpt-image-2",
 			operation: "edit",
@@ -206,6 +246,144 @@ describe("image_gen tool", () => {
 		expect(fetcher).not.toHaveBeenCalled();
 	});
 
+	it("rejects non-regular, empty, oversized, and excessive local references before fetching", async () => {
+		const cwd = await createTempDir();
+		const png = Buffer.from(PNG_BASE64, "base64");
+		const paths = {
+			directory: join(cwd, "directory.png"),
+			empty: join(cwd, "empty.png"),
+			large: join(cwd, "large.png"),
+			first: join(cwd, "first.png"),
+			second: join(cwd, "second.png"),
+		};
+		const events: string[] = [];
+		const fetcher = vi.fn<ImageGenFetcher>();
+		const referenceFileOperations = createReferenceFileOperations(
+			{
+				[paths.directory]: { data: png, isFile: false },
+				[paths.empty]: { data: Buffer.alloc(0) },
+				[paths.large]: { data: png, size: 50 * 1024 * 1024 },
+				[paths.first]: { data: png, size: 26 * 1024 * 1024 },
+				[paths.second]: { data: png, size: 25 * 1024 * 1024 },
+			},
+			events,
+		);
+		const tool = createImageGenTool(cwd, {
+			fetcher,
+			referenceFileOperations,
+			modelContext: () => ({ model: codexModel(), apiKey: codexToken() }),
+		});
+
+		await expect(
+			tool.execute("directory", { prompt: "Edit", referenced_image_paths: ["directory.png"] }),
+		).rejects.toThrow("must be a regular file");
+		await expect(tool.execute("empty", { prompt: "Edit", referenced_image_paths: ["empty.png"] })).rejects.toThrow(
+			"must not be empty",
+		);
+		await expect(tool.execute("large", { prompt: "Edit", referenced_image_paths: ["large.png"] })).rejects.toThrow(
+			"must be smaller than 50 MB",
+		);
+		await expect(
+			tool.execute("combined", {
+				prompt: "Edit",
+				referenced_image_paths: ["first.png", "second.png"],
+			}),
+		).rejects.toThrow("50 MB combined decoded size limit");
+		expect(fetcher).not.toHaveBeenCalled();
+		expect(events).toEqual([
+			`open:${paths.directory}`,
+			`stat:${paths.directory}`,
+			`close:${paths.directory}`,
+			`open:${paths.empty}`,
+			`stat:${paths.empty}`,
+			`close:${paths.empty}`,
+			`open:${paths.large}`,
+			`stat:${paths.large}`,
+			`close:${paths.large}`,
+			`open:${paths.first}`,
+			`stat:${paths.first}`,
+			`read:${paths.first}`,
+			`close:${paths.first}`,
+			`open:${paths.second}`,
+			`stat:${paths.second}`,
+			`close:${paths.second}`,
+		]);
+	});
+
+	it("loads local references sequentially and closes each bounded handle on validation failure", async () => {
+		const cwd = await createTempDir();
+		const firstPath = join(cwd, "first.png");
+		const invalidPath = join(cwd, "invalid.png");
+		const events: string[] = [];
+		const fetcher = vi.fn<ImageGenFetcher>();
+		const tool = createImageGenTool(cwd, {
+			fetcher,
+			referenceFileOperations: createReferenceFileOperations(
+				{
+					[firstPath]: { data: Buffer.from(PNG_BASE64, "base64") },
+					[invalidPath]: { data: Buffer.from("not an image") },
+				},
+				events,
+			),
+			modelContext: () => ({ model: codexModel(), apiKey: codexToken() }),
+		});
+
+		await expect(
+			tool.execute("sequential", {
+				prompt: "Edit",
+				referenced_image_paths: ["first.png", "invalid.png"],
+			}),
+		).rejects.toThrow("Referenced file invalid.png is not a supported image");
+		expect(events).toEqual([
+			`open:${firstPath}`,
+			`stat:${firstPath}`,
+			`read:${firstPath}`,
+			`close:${firstPath}`,
+			`open:${invalidPath}`,
+			`stat:${invalidPath}`,
+			`read:${invalidPath}`,
+			`close:${invalidPath}`,
+		]);
+		expect(fetcher).not.toHaveBeenCalled();
+	});
+
+	it("rejects more than five local references before opening files or fetching", async () => {
+		const cwd = await createTempDir();
+		const fetcher = vi.fn<ImageGenFetcher>();
+		const referenceFileOperations: ImageGenReferenceFileOperations = { open: vi.fn() };
+		const tool = createImageGenTool(cwd, {
+			fetcher,
+			referenceFileOperations,
+			modelContext: () => ({ model: codexModel(), apiKey: codexToken() }),
+		});
+
+		await expect(
+			tool.execute("too-many", {
+				prompt: "Edit",
+				referenced_image_paths: ["1.png", "2.png", "3.png", "4.png", "5.png", "6.png"],
+			}),
+		).rejects.toThrow("at most 5 paths");
+		expect(referenceFileOperations.open).not.toHaveBeenCalled();
+		expect(fetcher).not.toHaveBeenCalled();
+	});
+
+	it("rejects an oversized decoded conversation reference before fetching", async () => {
+		const cwd = await createTempDir();
+		const fetcher = vi.fn<ImageGenFetcher>();
+		const oversizedImage = Buffer.alloc(50 * 1024 * 1024, 0);
+		Buffer.from(PNG_BASE64, "base64").copy(oversizedImage);
+		const tool = createImageGenTool(cwd, {
+			fetcher,
+			recentImages: () => [{ type: "image", mimeType: "image/png", data: oversizedImage.toString("base64") }],
+			modelContext: () => ({ model: codexModel(), apiKey: codexToken() }),
+		});
+
+		await expect(
+			tool.execute("large-conversation-image", { prompt: "Edit", num_last_images_to_include: 1 }),
+		).rejects.toThrow("must be smaller than 50 MB");
+		expect(fetcher).not.toHaveBeenCalled();
+	});
+
 	it("converts referenced GIFs to PNG before sending an edit", async () => {
 		const cwd = await createTempDir();
 		await writeFile(join(cwd, "reference.gif"), Buffer.from(GIF_BASE64, "base64"));
@@ -254,6 +432,31 @@ describe("image_gen tool", () => {
 			"image_gen is available only when an OpenAI Codex model is selected",
 		);
 		expect(fetcher).not.toHaveBeenCalled();
+	});
+
+	it("preserves an existing output when responses contain malformed base64, non-PNG, or truncated PNG data", async () => {
+		const cwd = await createTempDir();
+		const outputPath = join(cwd, "existing.png");
+		const original = Buffer.from("existing output");
+		const truncatedPng = Buffer.from(PNG_BASE64, "base64").subarray(0, 32).toString("base64");
+		const cases = [
+			{ data: "%%%%", error: "invalid base64 image data" },
+			{ data: ` ${PNG_BASE64} `, error: "invalid base64 image data" },
+			{ data: GIF_BASE64, error: "non-PNG image data" },
+			{ data: truncatedPng, error: "malformed PNG image data" },
+		];
+
+		for (const testCase of cases) {
+			await writeFile(outputPath, original);
+			const tool = createImageGenTool(cwd, {
+				fetcher: async () => jsonResponse({ data: [{ b64_json: testCase.data }] }),
+				modelContext: () => ({ model: codexModel(), apiKey: codexToken() }),
+			});
+			await expect(tool.execute("bad-response", { prompt: "A fox", output_path: outputPath })).rejects.toThrow(
+				testCase.error,
+			);
+			expect(await readFile(outputPath)).toEqual(original);
+		}
 	});
 
 	it("surfaces Codex API error messages without writing an output", async () => {

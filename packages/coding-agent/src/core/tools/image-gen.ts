@@ -1,10 +1,11 @@
 import { Buffer } from "node:buffer";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, extname, join } from "node:path";
+import { open } from "node:fs/promises";
+import { extname, join } from "node:path";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
 import type { Api, ImageContent, Model } from "@hansjm10/volt-ai";
 import { type Static, Type } from "typebox";
 import { getAgentDir, VERSION } from "../../config.ts";
+import { writeDurableAtomicFile } from "../../utils/durable-atomic-write.ts";
 import { decodeImageToPng } from "../../utils/image-codec.ts";
 import { detectSupportedImageMimeType } from "../../utils/mime.ts";
 import { getVoltUserAgent } from "../../utils/volt-user-agent.ts";
@@ -14,6 +15,8 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 
 const IMAGE_MODEL = "gpt-image-2";
 const MAX_REFERENCE_IMAGES = 5;
+const MAX_REFERENCE_BYTES = 50 * 1024 * 1024;
+const MAX_REFERENCE_MEGABYTES = 50;
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const JWT_CLAIM_PATH = "https://api.openai.com/auth";
@@ -62,11 +65,24 @@ export type ImageGenRecentImagesProvider = (
 	count: number,
 ) => Promise<readonly ImageContent[]> | readonly ImageContent[];
 
+export interface ImageGenReferenceFileHandle {
+	close(): Promise<void>;
+	read(buffer: Uint8Array, offset: number, length: number, position: number): Promise<{ bytesRead: number }>;
+	stat(): Promise<{ isFile(): boolean; size: number }>;
+}
+
+export interface ImageGenReferenceFileOperations {
+	open(path: string, flags: "r"): Promise<ImageGenReferenceFileHandle>;
+}
+
+const DEFAULT_REFERENCE_FILE_OPERATIONS: ImageGenReferenceFileOperations = { open };
+
 export interface ImageGenToolOptions {
 	modelContext?: ImageGenModelContextProvider;
 	recentImages?: ImageGenRecentImagesProvider;
 	fetcher?: ImageGenFetcher;
 	outputRoot?: string;
+	referenceFileOperations?: ImageGenReferenceFileOperations;
 	timeoutMs?: number;
 }
 
@@ -159,21 +175,103 @@ async function normalizeReferenceImage(data: Uint8Array, description: string): P
 	return `data:image/png;base64,${Buffer.from(png).toString("base64")}`;
 }
 
-async function referenceImage(path: string, cwd: string): Promise<ImageReference> {
-	const absolutePath = resolveToCwd(path, cwd);
-	const data = await readFile(absolutePath);
-	return {
-		path: absolutePath,
-		image_url: await normalizeReferenceImage(data, `Referenced file ${path}`),
+function decodeStrictBase64(value: string, description: string): Buffer {
+	const invalid = (): never => {
+		throw new Error(`${description} is not valid non-empty base64`);
 	};
+	if (value.length === 0 || value.length % 4 !== 0) invalid();
+	const paddingLength = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+	const dataLength = value.length - paddingLength;
+	let finalValue = 0;
+	for (let index = 0; index < dataLength; index++) {
+		const code = value.charCodeAt(index);
+		let decodedValue = -1;
+		if (code >= 65 && code <= 90) decodedValue = code - 65;
+		else if (code >= 97 && code <= 122) decodedValue = code - 71;
+		else if (code >= 48 && code <= 57) decodedValue = code + 4;
+		else if (code === 43) decodedValue = 62;
+		else if (code === 47) decodedValue = 63;
+		if (decodedValue < 0) invalid();
+		finalValue = decodedValue;
+	}
+	for (let index = dataLength; index < value.length; index++) {
+		if (value[index] !== "=") invalid();
+	}
+	if ((paddingLength === 2 && (finalValue & 0x0f) !== 0) || (paddingLength === 1 && (finalValue & 0x03) !== 0)) {
+		invalid();
+	}
+	const decoded = Buffer.from(value, "base64");
+	if (decoded.length === 0) invalid();
+	return decoded;
 }
 
-async function conversationReferenceImage(image: ImageContent, index: number): Promise<ImageReference> {
+function ensureReferenceBudget(size: number, description: string, totalBytes: number): void {
+	if (!Number.isSafeInteger(size) || size < 0) {
+		throw new Error(`${description} has an invalid size`);
+	}
+	if (size === 0) {
+		throw new Error(`${description} must not be empty`);
+	}
+	if (size >= MAX_REFERENCE_BYTES) {
+		throw new Error(`${description} must be smaller than ${MAX_REFERENCE_MEGABYTES} MB`);
+	}
+	if (totalBytes + size > MAX_REFERENCE_BYTES) {
+		throw new Error(
+			`Reference images exceed the ${MAX_REFERENCE_MEGABYTES} MB combined decoded size limit; use fewer or smaller images`,
+		);
+	}
+}
+
+async function referenceImage(
+	path: string,
+	cwd: string,
+	totalBytes: number,
+	operations: ImageGenReferenceFileOperations,
+): Promise<{ reference: ImageReference; size: number }> {
+	const absolutePath = resolveToCwd(path, cwd);
+	const description = `Referenced file ${path}`;
+	const handle = await operations.open(absolutePath, "r").catch((error: unknown) => {
+		throw new Error(`${description} could not be opened: ${error instanceof Error ? error.message : String(error)}`);
+	});
+	try {
+		const stats = await handle.stat();
+		if (!stats.isFile()) {
+			throw new Error(`${description} must be a regular file`);
+		}
+		ensureReferenceBudget(stats.size, description, totalBytes);
+
+		const data = Buffer.allocUnsafe(stats.size);
+		let offset = 0;
+		while (offset < data.length) {
+			const { bytesRead } = await handle.read(data, offset, data.length - offset, offset);
+			if (bytesRead === 0) {
+				throw new Error(`${description} changed while it was being read; retry with a stable file`);
+			}
+			offset += bytesRead;
+		}
+		return {
+			reference: {
+				path: absolutePath,
+				image_url: await normalizeReferenceImage(data, description),
+			},
+			size: data.length,
+		};
+	} finally {
+		await handle.close();
+	}
+}
+
+async function conversationReferenceImage(
+	image: ImageContent,
+	index: number,
+	totalBytes: number,
+): Promise<{ reference: ImageReference; size: number }> {
+	const description = `Recent conversation image ${index + 1}`;
+	const data = decodeStrictBase64(image.data, description);
+	ensureReferenceBudget(data.length, description, totalBytes);
 	return {
-		image_url: await normalizeReferenceImage(
-			Buffer.from(image.data, "base64"),
-			`Recent conversation image ${index + 1}`,
-		),
+		reference: { image_url: await normalizeReferenceImage(data, description) },
+		size: data.length,
 	};
 }
 
@@ -203,8 +301,8 @@ function parseImageResponse(body: unknown): ImageApiResponse {
 	if (!isRecord(first)) {
 		throw new Error("OpenAI Codex image generation returned no image data");
 	}
-	const b64Json = getString(first, "b64_json");
-	if (!b64Json) {
+	const b64Json = first.b64_json;
+	if (typeof b64Json !== "string" || b64Json.length === 0) {
 		throw new Error("OpenAI Codex image generation returned no image data");
 	}
 	return {
@@ -226,6 +324,7 @@ export function createImageGenToolDefinition(
 ): ToolDefinition<typeof imageGenSchema, ImageGenToolDetails> {
 	const fetcher = options.fetcher ?? ((input, init) => globalThis.fetch(input, init));
 	const outputRoot = options.outputRoot ?? join(getAgentDir(), "generated_images");
+	const referenceFileOperations = options.referenceFileOperations ?? DEFAULT_REFERENCE_FILE_OPERATIONS;
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
 	return {
@@ -275,9 +374,14 @@ export function createImageGenToolDefinition(
 				throw new Error("Provide only one of referenced_image_paths or num_last_images_to_include");
 			}
 
-			let references: ImageReference[] = [];
+			const references: ImageReference[] = [];
+			let totalReferenceBytes = 0;
 			if (requestedPaths.length > 0) {
-				references = await Promise.all(requestedPaths.map((path) => referenceImage(path, cwd)));
+				for (const path of requestedPaths) {
+					const loaded = await referenceImage(path, cwd, totalReferenceBytes, referenceFileOperations);
+					references.push(loaded.reference);
+					totalReferenceBytes += loaded.size;
+				}
 			} else if (requestedConversationImageCount !== undefined) {
 				const recentImages = await options.recentImages?.(requestedConversationImageCount);
 				if (!recentImages) {
@@ -288,7 +392,11 @@ export function createImageGenToolDefinition(
 						`Requested the last ${requestedConversationImageCount} conversation images, but only ${recentImages.length} were available`,
 					);
 				}
-				references = await Promise.all(recentImages.map(conversationReferenceImage));
+				for (const [index, image] of recentImages.entries()) {
+					const loaded = await conversationReferenceImage(image, index, totalReferenceBytes);
+					references.push(loaded.reference);
+					totalReferenceBytes += loaded.size;
+				}
 			}
 			const operation = references.length > 0 ? "edit" : "generate";
 			const endpointOperation = operation === "edit" ? "edits" : "generations";
@@ -306,6 +414,7 @@ export function createImageGenToolDefinition(
 				prompt,
 				background: "auto",
 				model: IMAGE_MODEL,
+				output_format: "png",
 				quality: "auto",
 				size: "auto",
 			};
@@ -342,13 +451,24 @@ export function createImageGenToolDefinition(
 			}
 			const parsed = parseImageResponse(responseBody);
 			const imageData = parsed.data[0].b64_json;
-			const imageBytes = Buffer.from(imageData, "base64");
-			if (imageBytes.length === 0) {
-				throw new Error("OpenAI Codex image generation returned invalid image data");
+			let imageBytes: Buffer;
+			try {
+				imageBytes = decodeStrictBase64(imageData, "OpenAI Codex image generation response");
+			} catch {
+				throw new Error("OpenAI Codex image generation returned invalid base64 image data");
+			}
+			if (detectSupportedImageMimeType(imageBytes) !== "image/png") {
+				throw new Error("OpenAI Codex image generation returned non-PNG image data");
+			}
+			if (!(await decodeImageToPng(imageBytes))) {
+				throw new Error("OpenAI Codex image generation returned malformed PNG image data");
 			}
 
-			await mkdir(dirname(outputPath), { recursive: true });
-			await writeFile(outputPath, imageBytes);
+			await writeDurableAtomicFile(
+				outputPath,
+				imageBytes,
+				params.output_path ? { directoryMode: 0o755, fileMode: 0o644 } : undefined,
+			);
 
 			const referencedImagePaths = references.flatMap((reference) =>
 				reference.path === undefined ? [] : [reference.path],

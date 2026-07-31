@@ -50,6 +50,8 @@ export {
 	type ImageGenModelContext,
 	type ImageGenModelContextProvider,
 	type ImageGenRecentImagesProvider,
+	type ImageGenReferenceFileHandle,
+	type ImageGenReferenceFileOperations,
 	type ImageGenToolDetails,
 	type ImageGenToolInput,
 	type ImageGenToolOptions,

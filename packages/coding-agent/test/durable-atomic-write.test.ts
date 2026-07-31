@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { describe, expect, it, vi } from "vitest";
 import {
 	type DurableAtomicWriteOperations,
@@ -15,8 +16,12 @@ function createOperations(events: string[]): DurableAtomicWriteOperations {
 			const kind = flags === "r" ? "parent" : "temp";
 			events.push(`open:${kind}`);
 			return {
-				writeFile: vi.fn(async (content: string) => {
-					events.push(`write:${content}`);
+				writeFile: vi.fn(async (content: string | Uint8Array) => {
+					events.push(
+						typeof content === "string"
+							? `write:${content}`
+							: `write-binary:${Buffer.from(content).toString("hex")}`,
+					);
 				}),
 				sync: vi.fn(async () => {
 					events.push(`sync:${kind}`);
@@ -76,6 +81,23 @@ describe("durable atomic writes", () => {
 			"mkdir",
 			"open:temp",
 			"write:payload",
+			"sync:temp",
+			"close:temp",
+			"rename",
+			...(process.platform === "win32" ? [] : ["open:parent", "sync:parent", "close:parent"]),
+		]);
+	});
+
+	it("writes binary content without changing the asynchronous durability ordering", async () => {
+		const events: string[] = [];
+		await writeDurableAtomicFile("/images/generated.png", Uint8Array.from([0, 1, 2, 255]), {
+			operations: createOperations(events),
+		});
+
+		expect(events).toEqual([
+			"mkdir",
+			"open:temp",
+			"write-binary:000102ff",
 			"sync:temp",
 			"close:temp",
 			"rename",

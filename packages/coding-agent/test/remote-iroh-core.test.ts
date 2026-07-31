@@ -1311,14 +1311,16 @@ describe("Iroh remote core helpers", () => {
 			"bash",
 			"edit",
 			"write",
+			"image_gen",
 			"web_search",
 			"web_fetch",
 			"lsp",
 		]);
-		expect(getIrohRemoteUnsafeAllowedTools("read,bash, edit,write,bash,web_search,custom")).toEqual([
+		expect(getIrohRemoteUnsafeAllowedTools("read,bash, edit,write,bash,image_gen,web_search,custom")).toEqual([
 			"bash",
 			"edit",
 			"write",
+			"image_gen",
 			"web_search",
 		]);
 	});
