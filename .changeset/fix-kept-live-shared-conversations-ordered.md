@@ -3,7 +3,7 @@
 "@hansjm10/volt-ai": minor
 ---
 
-breaking(remote): Kept live shared conversations ordered and complete across app reconnects and stream recovery.
+breaking(remote): Remote conversations now use an atomic resumable attachment and input-delivery protocol across reconnects and daemon restarts.
 
 Remote conversation clients must upgrade with the daemon because conversation attachment now uses the versioned atomic bootstrap-and-tail protocol instead of the legacy snapshot replay sequence.
 

@@ -1,4 +1,4 @@
-import { BOOTSTRAP_VERSION } from "./verify-npm-package-bootstrap.mjs";
+import { BOOTSTRAP_VERSION, INITIAL_BETA_VERSION } from "./verify-npm-package-bootstrap.mjs";
 
 export const NPM_PROVENANCE_PREDICATE_TYPE = "https://slsa.dev/provenance/v1";
 export const NPM_PUBLISHED_METADATA_FIELDS = ["name", "version", "gitHead", "repository", "dist-tags", "dist"];
@@ -27,14 +27,14 @@ export function assertPublishedPackageMatchesRelease({
 	) {
 		throw new Error(`${name}@${version} has unexpected repository metadata`);
 	}
-	if (metadata["dist-tags"]?.beta !== version) {
-		throw new Error(`${name}@${version} is published but the beta dist-tag does not point to it`);
+	if (metadata["dist-tags"]?.latest !== version) {
+		throw new Error(`${name}@${version} is published but the latest dist-tag does not point to it`);
 	}
-	if (
-		metadata["dist-tags"]?.bootstrap !== BOOTSTRAP_VERSION ||
-		metadata["dist-tags"]?.latest !== BOOTSTRAP_VERSION
-	) {
-		throw new Error(`${name}@${version} must keep bootstrap and latest on the inert placeholder`);
+	if (metadata["dist-tags"]?.bootstrap !== BOOTSTRAP_VERSION) {
+		throw new Error(`${name}@${version} must keep bootstrap on the inert placeholder`);
+	}
+	if (metadata["dist-tags"]?.beta !== INITIAL_BETA_VERSION) {
+		throw new Error(`${name}@${version} must preserve the historical beta dist-tag on ${INITIAL_BETA_VERSION}`);
 	}
 	if (typeof packed.integrity !== "string" || metadata.dist?.integrity !== packed.integrity) {
 		throw new Error(`${name}@${version} registry tarball does not match the package built from the release tag`);

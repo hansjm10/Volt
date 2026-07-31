@@ -2,4 +2,6 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-improvement(remote): Clients can send report_stream_discontinuity to request an assistant-stream recovery snapshot after client-side frame loss (for example a mid-turn attach), unfreezing the live transcript instead of waiting for the message boundary.
+improvement(remote): Remote clients can request a correlated assistant-stream recovery snapshot after detecting frame loss, restoring live transcripts without waiting for the message boundary.
+
+Recovery validates the client's exact stream position and continues from a matching checkpoint.

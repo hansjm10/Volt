@@ -45,6 +45,8 @@ with GitHub Actions OIDC.
 ## Security invariants
 
 - All four npm packages remain lockstep versioned.
+- The designated release owner login is source-pinned to `hansjm10`; organization
+  ownership is not treated as a user identity.
 - The release commit must be the exact current commit on protected `main`.
 - The approved candidate commit, workflow run, artifact digest, attestation,
   `source-commit.txt`, and archive checksums must all identify the same bytes.
@@ -103,7 +105,7 @@ The preparation job must:
    release changes.
 5. Report the planned version and expected post-merge validation steps.
 
-The repository owner reviews the pull request's generated changelog section,
+The designated release owner reviews the pull request's generated changelog section,
 package metadata, lockfiles, shrinkwrap, and generated artifacts, waits for
 required checks, and merges it. Consumed `.changeset/` fragments are deleted in
 the same commit. The candidate SHA is the resulting commit on `main`, not the
@@ -126,7 +128,7 @@ needs write access to run it from the Actions UI. See
 After the release pull request is merged, **Build Standalone Candidate** runs
 for the exact lowercase 40-character `main` SHA. It must reject a commit that
 does not exactly equal the current remote `main` tip, and both the original and
-rerun actor must be the repository owner.
+rerun actor must be the designated release owner.
 
 The workflow builds and smoke-tests the native matrix:
 
@@ -177,8 +179,8 @@ before starting **Approve Release**. At minimum, the owner verifies:
 - Node runtime and copied license checksums match the pinned compliance data;
 - prohibited generated artifacts and excluded examples are absent;
 - native smoke-test results are acceptable; and
-- Windows executables remain intentionally unsigned for beta and that fact is
-  disclosed in the release notes.
+- Windows executables remain intentionally unsigned and that fact is disclosed
+  in the release notes.
 
 ### 3. Approve Release
 
@@ -210,7 +212,8 @@ and restrict it to runs from `main`; the environment has no required reviewer.
 
 Preflight must fail unless all of the following are true:
 
-- both `github.actor` and `github.triggering_actor` are the repository owner;
+- both `github.actor` and `github.triggering_actor` are the source-pinned
+  designated release owner, `hansjm10`;
 - the workflow runs from `refs/heads/main`;
 - `candidate_commit` is the exact current `main` commit;
 - the prepared commit, package versions, and the product changelog heading
@@ -249,8 +252,10 @@ GitHub's Git database APIs. Both operations require `Contents: write`; see the
 force update and fails if the reference already exists. It reads the tag back
 and verifies the tag object, target commit, and message before continuing.
 
-The same authorized job creates or verifies the draft prerelease for the exact
-new tag. It fails if a release already exists in any other state.
+The same authorized job creates or verifies the stable draft release for the
+exact new tag. Drafts cannot be marked latest, so the publisher marks it latest
+atomically when publishing. Approval fails if a release already exists in any
+other state.
 
 Finally, a separate job grants the ordinary `GITHUB_TOKEN` only
 `actions: write` and dispatches **Publish Release** with `ref` set to the new
@@ -287,13 +292,13 @@ Publication is divided into least-privilege jobs:
    `actions: read` only.
 2. **Publish npm** uses the `npm-publish` environment with `contents: read` and
    `id-token: write`. It builds, checks, tests, packs, and publishes the four
-   packages in dependency order under `beta` through npm trusted publishing.
-   It preserves `latest` and `bootstrap` on the inert placeholder. Existing
-   versions are skipped only after exact integrity, provenance, repository,
-   and dist-tag verification.
+   packages in dependency order under `latest` through npm trusted publishing.
+   It preserves `bootstrap` on the inert placeholder and `beta` on the
+   historical `0.1.0`. Existing versions are skipped only after exact integrity,
+   provenance, repository, and dist-tag verification.
 3. **Publish GitHub Release** runs only after npm succeeds. It uses the
    `binary-release` environment and receives `contents: write`. It requires the
-   exact draft prerelease created by **Approve Release**; it never creates a
+   exact stable draft created by **Approve Release**; it never creates a
    release. It uploads exactly eight public assets: the six approved archives,
    `SHA256SUMS`, and `release-record.json`. `source-commit.txt` and the release
    notes are verified internal publication inputs, not public assets. It
@@ -540,11 +545,15 @@ Never create a parallel tag manually after approval has begun.
 5. Confirm the GitHub Release remains a draft until npm succeeds and every
    release-asset digest is verified.
 6. Confirm the release publishes and displays GitHub's immutable indicator.
-7. Verify each npm package's exact version, provenance, and `beta` tag. Confirm
-   `latest` and `bootstrap` still point to the inert placeholder while Volt is
-   in beta.
-8. Verify the public release archives against `SHA256SUMS` and the release
-   attestation.
+7. Verify each npm package's exact version and provenance. Confirm `latest`
+   points to the new stable version, `beta` remains on historical `0.1.0`, and
+   `bootstrap` remains on the inert placeholder.
+8. Confirm GitHub identifies the release as non-prerelease and latest, then
+   verify the public archives against `SHA256SUMS` and the release attestation.
+9. For the first stable release only, update the public site, installers, and
+   installation docs from explicit `@beta` references to unqualified stable
+   installs after npm `latest` is verified. Do not merge that launch update
+   before `latest` points to the stable version.
 
 ## Recovery and rollback
 

@@ -575,7 +575,7 @@ describe("package commands", () => {
 		}
 	});
 
-	it("uses global npmCommand and the beta package spec for forced self updates without checking the api", async () => {
+	it("uses global npmCommand and the latest package spec for forced self updates without checking the api", async () => {
 		const globalPrefix = join(tempDir, "global-prefix");
 		const projectPrefix = join(tempDir, "project-prefix");
 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@hansjm10", "volt-coding-agent");
@@ -618,7 +618,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 			expect(fetchMock).not.toHaveBeenCalled();
 			const recordedArgs = JSON.parse(readFileSync(recordPath, "utf-8")) as string[];
 			expect(recordedArgs).toContain(globalPrefix);
-			expect(recordedArgs).toContain(`${PACKAGE_NAME}@beta`);
+			expect(recordedArgs).toContain(`${PACKAGE_NAME}@latest`);
 			expect(recordedArgs).not.toContain(PACKAGE_NAME);
 			expect(recordedArgs).not.toContain(projectPrefix);
 		} finally {
@@ -627,7 +627,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		}
 	});
 
-	it("uses profile npmCommand and the beta package spec for forced self updates", async () => {
+	it("uses profile npmCommand and the latest package spec for forced self updates", async () => {
 		const selfUpdatePrefix = join(tempDir, "self-update-prefix");
 		const selfPackageDir = join(selfUpdatePrefix, "lib", "node_modules", "@hansjm10", "volt-coding-agent");
 		const fakeGlobalNpmPath = join(tempDir, "fake-global-npm.cjs");
@@ -674,7 +674,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify({label:${JSON
 			expect(fetchMock).not.toHaveBeenCalled();
 			const recorded = JSON.parse(readFileSync(recordPath, "utf-8")) as { label?: string; args?: string[] };
 			expect(recorded.label).toBe("profile");
-			expect(recorded.args).toContain(`${PACKAGE_NAME}@beta`);
+			expect(recorded.args).toContain(`${PACKAGE_NAME}@latest`);
 			expect(recorded.args).not.toContain(PACKAGE_NAME);
 		} finally {
 			logSpy.mockRestore();
@@ -686,7 +686,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify({label:${JSON
 		{ description: "omits packageName", responsePackageName: undefined },
 		{ description: "returns the current package name", responsePackageName: PACKAGE_NAME },
 		{ description: "returns an invalid install spec", responsePackageName: "--registry=https://evil.example" },
-	])("uses the beta package spec when the hosted update check $description", async ({ responsePackageName }) => {
+	])("uses the latest package spec when the hosted update check $description", async ({ responsePackageName }) => {
 		const globalPrefix = join(tempDir, "global-prefix");
 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@hansjm10", "volt-coding-agent");
 		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
@@ -727,7 +727,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 			expect(errorSpy).not.toHaveBeenCalled();
 			expect(fetchMock).toHaveBeenCalledOnce();
 			const recordedArgs = JSON.parse(readFileSync(recordPath, "utf-8")) as string[];
-			expect(recordedArgs).toContain(`${PACKAGE_NAME}@beta`);
+			expect(recordedArgs).toContain(`${PACKAGE_NAME}@latest`);
 			expect(recordedArgs).not.toContain(PACKAGE_NAME);
 			if (responsePackageName) {
 				expect(recordedArgs).not.toContain(responsePackageName);
@@ -738,7 +738,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		}
 	});
 
-	it("migrates to the active beta package after removing the old package", async () => {
+	it("migrates to the active latest package after removing the old package", async () => {
 		const globalPrefix = join(tempDir, "global-prefix");
 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@hansjm10", "volt-coding-agent");
 		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
@@ -782,7 +782,7 @@ else {
 			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
 			expect(recordedCalls).toEqual([
 				expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
-				expect.arrayContaining(["install", "-g", `${activePackageName}@beta`]),
+				expect.arrayContaining(["install", "-g", `${activePackageName}@latest`]),
 			]);
 		} finally {
 			logSpy.mockRestore();
@@ -799,7 +799,7 @@ else {
 		const fakeNpmPath = join(tempDir, "fake-npm-fail.cjs");
 		const recordPath = join(tempDir, "self-update-fail.json");
 		const activePackageName = PACKAGE_NAME === "@new-scope/volt" ? "@newer-scope/volt" : "@new-scope/volt";
-		const targetSpec = `${activePackageName}@beta`;
+		const targetSpec = `${activePackageName}@latest`;
 		const rollbackSpec = `${PACKAGE_NAME}@${VERSION}`;
 		mkdirSync(selfPackageDir, { recursive: true });
 		writeFileSync(

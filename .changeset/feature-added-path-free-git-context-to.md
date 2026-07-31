@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-feature(remote): Added path-free Git context to RPC session state and live conversation updates.
+improvement(remote): Remote clients can now display [path-free Git context](https://volt-cli.dev/docs/rpc/#get_state), including branch, divergence, operation, and status, from session state and live updates.

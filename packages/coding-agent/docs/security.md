@@ -50,7 +50,7 @@ running it.
 
 Standalone builds intentionally exclude the native Iroh adapter and the
 source-repository Doom overlay example. The official Linux runtime requires
-glibc 2.28 or newer and does not support Alpine/musl. Windows beta executables
+glibc 2.28 or newer and does not support Alpine/musl. Windows executables
 are not Authenticode-signed, so Windows may show an unknown-publisher warning;
 the published SHA-256 checksum is the release authenticity check. macOS
 executables are ad-hoc signed after SEA injection, not Developer ID notarized.

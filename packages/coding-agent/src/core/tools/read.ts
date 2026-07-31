@@ -253,7 +253,7 @@ export function createReadToolDefinition(
 									if (!resized) {
 										const reason =
 											mimeType === "image/webp"
-												? "WebP exceeds the inline limits and this beta does not include a local WebP resize codec."
+												? "WebP exceeds the inline limits and Volt does not include a local WebP resize codec."
 												: "Image could not be resized below the inline image size limit.";
 										let textNote = `Read image file [${mimeType}]\n[Image omitted: ${reason}]`;
 										if (nonVisionImageNote) textNote += `\n${nonVisionImageNote}`;

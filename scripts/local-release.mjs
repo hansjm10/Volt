@@ -125,14 +125,16 @@ function currentBinaryPlatform() {
 function buildStandaloneBinaryRelease(targetDirectory, archiveDirectory) {
 	const platform = currentBinaryPlatform();
 	const binaryBuildDirectory = join(archiveDirectory, "binary-build");
-	run("./scripts/build-binaries.sh", [
+	const script = "./scripts/build-binaries.sh";
+	const args = [
 		"--skip-install",
 		"--skip-build",
 		"--platform",
 		platform,
 		"--out",
-		binaryBuildDirectory,
-	]);
+		process.platform === "win32" ? binaryBuildDirectory.replaceAll("\\", "/") : binaryBuildDirectory,
+	];
+	run(process.platform === "win32" ? "bash" : script, process.platform === "win32" ? [script, ...args] : args);
 	rmSync(targetDirectory, { force: true, recursive: true });
 	cpSync(join(binaryBuildDirectory, platform), targetDirectory, { recursive: true });
 	const archiveName = platform.startsWith("windows-") ? `volt-${platform}.zip` : `volt-${platform}.tar.gz`;

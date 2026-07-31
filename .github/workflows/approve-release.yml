@@ -28,7 +28,7 @@ on:
         required: true
         type: boolean
       unsigned_windows_acknowledged:
-        description: 'I acknowledge that Windows beta executables are currently unsigned'
+        description: 'I acknowledge that Windows executables are currently unsigned'
         required: true
         type: boolean
       authorization_phrase:
@@ -41,6 +41,9 @@ on:
         type: boolean
 
 permissions: {}
+
+env:
+  RELEASE_OWNER: hansjm10
 
 concurrency:
   group: release-approval-${{ inputs.version }}
@@ -72,14 +75,13 @@ jobs:
           CONFIRM_RELEASE: ${{ inputs.confirm_release }}
           LICENSE_COMPLIANCE_APPROVED: ${{ inputs.license_compliance_approved }}
           NATIVE_SMOKE_TESTS_APPROVED: ${{ inputs.native_smoke_tests_approved }}
-          REPOSITORY_OWNER: ${{ github.repository_owner }}
           RUN_ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           UNSIGNED_WINDOWS_ACKNOWLEDGED: ${{ inputs.unsigned_windows_acknowledged }}
         shell: bash
         run: |
-          if [[ "${RUN_ACTOR}" != "${REPOSITORY_OWNER}" ]] || [[ "${TRIGGERING_ACTOR}" != "${REPOSITORY_OWNER}" ]]; then
-            echo "Only the repository owner may approve a release" >&2
+          if [[ "${RUN_ACTOR}" != "${RELEASE_OWNER}" ]] || [[ "${TRIGGERING_ACTOR}" != "${RELEASE_OWNER}" ]]; then
+            echo "Only the designated release owner may approve a release" >&2
             exit 1
           fi
           if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
@@ -173,7 +175,7 @@ jobs:
             echo "- Candidate commit: \`${CANDIDATE_COMMIT}\`"
             echo "- Candidate run: \`${CANDIDATE_RUN_ID}\`"
             echo "- Candidate artifact: \`${CANDIDATE_ARTIFACT_DIGEST}\`"
-            echo "- Owner authorization and all beta acknowledgements: verified"
+            echo "- Owner authorization and all release acknowledgements: verified"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Resolve the immutable approved artifact ID
@@ -302,7 +304,6 @@ jobs:
       - name: Repeat mutable GitHub state checks without a write credential
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          REPOSITORY_OWNER: ${{ github.repository_owner }}
           RUN_ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         with:
@@ -316,8 +317,8 @@ jobs:
             const baseMessage = Buffer.from(process.env.TAG_MESSAGE_BASE64, "base64").toString("utf8");
             const expectedMessage = `${baseMessage}\nRelease-Approval-Run: ${context.runId}`;
 
-            if (process.env.RUN_ACTOR !== process.env.REPOSITORY_OWNER || process.env.TRIGGERING_ACTOR !== process.env.REPOSITORY_OWNER) {
-              core.setFailed("Only the repository owner may authorize or rerun a release");
+            if (process.env.RUN_ACTOR !== process.env.RELEASE_OWNER || process.env.TRIGGERING_ACTOR !== process.env.RELEASE_OWNER) {
+              core.setFailed("Only the designated release owner may authorize or rerun a release");
               return;
             }
             const main = await github.rest.repos.getBranch({ owner, repo, branch: "main" });
@@ -450,18 +451,18 @@ jobs:
                 name: releaseTag,
                 body: "Release publication is in progress. This draft is published only after npm and exact asset verification succeed.",
                 draft: true,
-                prerelease: true,
+                prerelease: false,
                 make_latest: "false",
               });
-            } else if (!matches[0].draft || !matches[0].prerelease) {
-              throw new Error(`Existing ${releaseTag} release is not the expected draft prerelease`);
+            } else if (!matches[0].draft || matches[0].prerelease) {
+              throw new Error(`Existing ${releaseTag} release is not the expected stable draft`);
             }
 
             core.setOutput("tag", releaseTag);
             await core.summary
               .addHeading(`Authorized ${releaseTag}`)
               .addRaw(`Annotated tag verified at \`${candidateCommit}\`.\n`)
-              .addRaw("A draft prerelease exists and publication can now be dispatched.\n")
+              .addRaw("A stable draft release exists and publication can now be dispatched.\n")
               .write();
 
   dispatch-publication:
