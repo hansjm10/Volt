@@ -439,11 +439,15 @@ export class IrohRemoteHostStateManager {
 			const state = await this.loadUnlocked();
 			const client = state.clients.find((entry) => entry.nodeId === authorization.client.nodeId);
 			const workspace = state.workspaces.find((entry) => entry.name === authorization.workspace.name);
+			const workspaceGeneration = (state.workspaceGenerations ?? []).find(
+				(record) => record.workspaceName === authorization.workspace.name,
+			)?.generation;
 			return (
 				client?.rpcGrant?.revision === authorization.client.rpcGrant.revision &&
 				isIrohRemoteClientAllowedForWorkspace(client, authorization.workspace.name) &&
 				workspace?.path === authorization.workspace.path &&
-				workspace.allowedTools === authorization.workspace.allowedTools
+				workspace.allowedTools === authorization.workspace.allowedTools &&
+				workspaceGeneration === authorization.workspaceGeneration
 			);
 		});
 	}
@@ -1021,6 +1025,8 @@ function cloneHostState(state: IrohRemoteHostState): IrohRemoteHostState {
 		pairingSecretTombstones: (state.pairingSecretTombstones ?? []).map((tombstone) =>
 			clonePairingSecretTombstone(tombstone),
 		),
+		workspaceGenerationCounter: state.workspaceGenerationCounter ?? 0,
+		workspaceGenerations: (state.workspaceGenerations ?? []).map((record) => ({ ...record })),
 		workspaces: state.workspaces.map((workspace) => cloneWorkspace(workspace)),
 		worktrees: (state.worktrees ?? []).map((worktree) => cloneWorktree(worktree)),
 		clients: state.clients.map((client) => cloneClient(client)),
