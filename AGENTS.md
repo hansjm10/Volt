@@ -182,17 +182,20 @@ intended default provider for both install forms.
 3. Run **Build Standalone Candidate** on `main` with that exact SHA. Download
    the combined artifact, verify its GitHub attestation, `source-commit.txt`,
    `release-record.json`, `SHA256SUMS`, all six archives and their manifests,
-   binary-license compliance, native smoke tests, and the unsigned-Windows beta
+   binary-license compliance, native smoke tests, and the unsigned-Windows
    disclosure. Record the run ID and the exact `sha256:` artifact digest from
    the workflow summary.
 4. Run **Approve Release** on `main`. Enter the version, candidate SHA, run ID,
    artifact digest, exact authorization phrase, and every acknowledgement. The
    owner-only workflow creates the annotated tag through the repository-scoped
-   Release Tagger App, creates a draft prerelease, and explicitly dispatches
+   Release Tagger App, creates a stable draft release, and explicitly dispatches
    **Publish Release** at that tag.
 5. Confirm npm trusted publishing succeeds before the draft GitHub Release is
    published. Confirm the published release contains only the approved assets,
-   and verify all four npm versions, provenance, and the `beta` dist-tag.
+   and verify all four npm versions and provenance, `latest` on the new stable
+   version, `beta` on the historical `0.1.0`, and `bootstrap` on the inert
+   placeholder. For the first stable release, only then update public installers
+   and installation docs from `@beta` to unqualified stable installs.
 
 Normal release automation never pushes directly to `main`, creates a tag from
 an ordinary `GITHUB_TOKEN`, publishes npm locally, stores an npm token, rebuilds

@@ -1,273 +1,119 @@
-import { execFile, spawnSync } from "child_process";
-import { existsSync, type FSWatcher, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-let resolvedBranch = "main";
-
-vi.mock("child_process", () => ({
-	execFile: vi.fn(
-		(
-			_command: string,
-			args: readonly string[],
-			_options: unknown,
-			callback: (error: Error | null, stdout: string, stderr: string) => void,
-		) => {
-			if (args[1] === "symbolic-ref") {
-				setTimeout(
-					() =>
-						callback(
-							resolvedBranch ? null : new Error("detached"),
-							resolvedBranch ? `${resolvedBranch}\n` : "",
-							"",
-						),
-					0,
-				);
-				return;
-			}
-			setTimeout(() => callback(new Error("unsupported"), "", ""), 0);
-		},
-	),
-	spawnSync: vi.fn((_command: string, args: readonly string[]) => {
-		if (args[1] === "symbolic-ref") {
-			return { status: resolvedBranch ? 0 : 1, stdout: resolvedBranch ? `${resolvedBranch}\n` : "", stderr: "" };
-		}
-		return { status: 1, stdout: "", stderr: "" };
-	}),
-}));
-
+import { describe, expect, it, vi } from "vitest";
 import { FooterDataProvider } from "../src/core/footer-data-provider.ts";
+import type { GitContextListener, GitContextProvider } from "../src/core/git-context-provider.ts";
+import type { RpcGitContext } from "../src/core/rpc/types.ts";
 
-type WorktreeFixture = {
-	worktreeDir: string;
-	reftableDir: string;
-};
+const OID = "0123456789abcdef0123456789abcdef01234567";
 
-function createPlainReftableRepo(tempDir: string): string {
-	const repoDir = join(tempDir, "repo");
-	mkdirSync(join(repoDir, ".git", "reftable"), { recursive: true });
-	writeFileSync(join(repoDir, ".git", "HEAD"), "ref: refs/heads/.invalid\n");
-	return repoDir;
+function snapshot(head: RpcGitContext["head"], revision = 1): RpcGitContext {
+	return {
+		repository: "repository",
+		head,
+		upstream: null,
+		base: null,
+		status: {
+			staged: { added: 0, modified: 0, deleted: 0, renamed: 0 },
+			unstaged: { added: 0, modified: 0, deleted: 0, renamed: 0 },
+			untracked: 0,
+			conflicted: 0,
+			total: 0,
+			clean: true,
+		},
+		operation: null,
+		revision,
+		observedAt: "2026-07-29T00:00:00.000Z",
+		stale: false,
+	};
 }
 
-function createPlainRepo(tempDir: string): string {
-	const repoDir = join(tempDir, "repo");
-	mkdirSync(join(repoDir, ".git"), { recursive: true });
-	writeFileSync(join(repoDir, ".git", "HEAD"), "ref: refs/heads/main\n");
-	return repoDir;
-}
+class FakeGitContextProvider {
+	private listeners = new Set<GitContextListener>();
+	private current: RpcGitContext | null;
 
-function createReftableWorktree(tempDir: string): WorktreeFixture {
-	const repoDir = join(tempDir, "repo");
-	const commonGitDir = join(repoDir, ".git");
-	const gitDir = join(commonGitDir, "worktrees", "src");
-	const worktreeDir = join(tempDir, "worktree");
-	const reftableDir = join(commonGitDir, "reftable");
+	constructor(current: RpcGitContext | null) {
+		this.current = current;
+	}
 
-	mkdirSync(gitDir, { recursive: true });
-	mkdirSync(reftableDir, { recursive: true });
-	mkdirSync(worktreeDir, { recursive: true });
+	getSnapshot(): RpcGitContext | null {
+		return this.current;
+	}
 
-	writeFileSync(join(worktreeDir, ".git"), `gitdir: ${gitDir}\n`);
-	writeFileSync(join(gitDir, "HEAD"), "ref: refs/heads/.invalid\n");
-	writeFileSync(join(gitDir, "commondir"), "../..\n");
-	writeFileSync(join(reftableDir, "tables.list"), "0\n");
+	subscribe(listener: GitContextListener): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
 
-	return { worktreeDir, reftableDir };
-}
+	emit(next: RpcGitContext | null): void {
+		this.current = next;
+		for (const listener of this.listeners) listener(next);
+	}
 
-async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void> {
-	const startedAt = Date.now();
-	while (!condition()) {
-		if (Date.now() - startedAt > timeoutMs) {
-			throw new Error("Timed out waiting for condition");
-		}
-		await new Promise((resolve) => setTimeout(resolve, 10));
+	get listenerCount(): number {
+		return this.listeners.size;
+	}
+
+	asProvider(): GitContextProvider {
+		return this as unknown as GitContextProvider;
 	}
 }
 
-function emitReftableChange(provider: FooterDataProvider): void {
-	const watcher = (provider as unknown as { reftableWatcher: FSWatcher | null }).reftableWatcher;
-	if (!watcher) {
-		throw new Error("Expected reftable watcher");
-	}
-	watcher.emit("change", "change", "tables.list");
-}
+describe("FooterDataProvider", () => {
+	it("projects branch, detached, unborn, and non-Git snapshots", () => {
+		const gitContext = new FakeGitContextProvider(snapshot({ kind: "branch", name: "main", oid: OID }));
+		const provider = new FooterDataProvider(gitContext.asProvider());
+		expect(provider.getGitBranch()).toBe("main");
 
-describe("FooterDataProvider reftable branch detection", () => {
-	let originalCwd: string;
-	let tempDir: string;
-
-	beforeEach(() => {
-		originalCwd = process.cwd();
-		tempDir = mkdtempSync(join(tmpdir(), "footer-data-provider-"));
-		resolvedBranch = "main";
-		vi.mocked(spawnSync).mockClear();
-		vi.mocked(execFile).mockClear();
+		gitContext.emit(snapshot({ kind: "detached", oid: OID }, 2));
+		expect(provider.getGitBranch()).toBe("detached");
+		gitContext.emit(snapshot({ kind: "unborn", name: "new-branch" }, 3));
+		expect(provider.getGitBranch()).toBe("new-branch");
+		gitContext.emit(null);
+		expect(provider.getGitBranch()).toBeNull();
+		provider.dispose();
 	});
 
-	afterEach(() => {
-		process.chdir(originalCwd);
-		if (tempDir && existsSync(tempDir)) {
-			rmSync(tempDir, { recursive: true, force: true });
-		}
+	it("notifies only when the displayed branch changes", () => {
+		const gitContext = new FakeGitContextProvider(snapshot({ kind: "branch", name: "main", oid: OID }));
+		const provider = new FooterDataProvider(gitContext.asProvider());
+		const listener = vi.fn();
+		provider.onBranchChange(listener);
+
+		gitContext.emit({ ...snapshot({ kind: "branch", name: "main", oid: OID }, 2), stale: true });
+		expect(listener).not.toHaveBeenCalled();
+		gitContext.emit(snapshot({ kind: "branch", name: "feature", oid: OID }, 3));
+		expect(listener).toHaveBeenCalledTimes(1);
+		provider.dispose();
 	});
 
-	it("uses HEAD directly in a regular repo from a nested directory", () => {
-		const repoDir = createPlainRepo(tempDir);
-		const nestedDir = join(repoDir, "src", "nested");
-		mkdirSync(nestedDir, { recursive: true });
-		process.chdir(nestedDir);
+	it("rebinds to a replacement provider while preserving extension footer state", () => {
+		const first = new FakeGitContextProvider(snapshot({ kind: "branch", name: "main", oid: OID }));
+		const second = new FakeGitContextProvider(snapshot({ kind: "branch", name: "worktree", oid: OID }));
+		const provider = new FooterDataProvider(first.asProvider());
+		const listener = vi.fn();
+		provider.onBranchChange(listener);
+		provider.setExtensionStatus("extension", "ready");
+		provider.setAvailableProviderCount(3);
 
-		const provider = new FooterDataProvider(nestedDir);
-		try {
-			expect(provider.getGitBranch()).toBe("main");
-			expect(vi.mocked(spawnSync)).not.toHaveBeenCalled();
-		} finally {
-			provider.dispose();
-		}
+		provider.setGitContextProvider(second.asProvider());
+		expect(first.listenerCount).toBe(0);
+		expect(second.listenerCount).toBe(1);
+		expect(provider.getGitBranch()).toBe("worktree");
+		expect(provider.getExtensionStatuses().get("extension")).toBe("ready");
+		expect(provider.getAvailableProviderCount()).toBe(3);
+		expect(listener).toHaveBeenCalledTimes(1);
+		provider.dispose();
+		expect(second.listenerCount).toBe(0);
 	});
 
-	it("resolves the branch via git when HEAD is .invalid in a reftable repo", () => {
-		const repoDir = createPlainReftableRepo(tempDir);
-		process.chdir(repoDir);
-
-		const provider = new FooterDataProvider(repoDir);
-		try {
-			expect(provider.getGitBranch()).toBe("main");
-			expect(vi.mocked(spawnSync)).toHaveBeenCalledWith(
-				"git",
-				["--no-optional-locks", "symbolic-ref", "--quiet", "--short", "HEAD"],
-				expect.objectContaining({
-					cwd: expect.stringMatching(/repo$/),
-					encoding: "utf8",
-					stdio: ["ignore", "pipe", "ignore"],
-				}),
-			);
-		} finally {
-			provider.dispose();
-		}
-	});
-
-	it("resolves the branch via git in a reftable-backed worktree", () => {
-		const { worktreeDir } = createReftableWorktree(tempDir);
-		process.chdir(worktreeDir);
-
-		const provider = new FooterDataProvider(worktreeDir);
-		try {
-			expect(provider.getGitBranch()).toBe("main");
-		} finally {
-			provider.dispose();
-		}
-	});
-
-	it("treats an unresolved .invalid reftable HEAD as detached", () => {
-		const repoDir = createPlainReftableRepo(tempDir);
-		process.chdir(repoDir);
-		resolvedBranch = "";
-
-		const provider = new FooterDataProvider(repoDir);
-		try {
-			expect(provider.getGitBranch()).toBe("detached");
-		} finally {
-			provider.dispose();
-		}
-	});
-
-	it("does not notify listeners when reftable updates keep the same branch", async () => {
-		const { worktreeDir } = createReftableWorktree(tempDir);
-		process.chdir(worktreeDir);
-
-		const provider = new FooterDataProvider(worktreeDir);
-		try {
-			expect(provider.getGitBranch()).toBe("main");
-			vi.mocked(spawnSync).mockClear();
-			const onBranchChange = vi.fn();
-			provider.onBranchChange(onBranchChange);
-
-			emitReftableChange(provider);
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
-
-			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
-			expect(vi.mocked(spawnSync)).not.toHaveBeenCalled();
-			expect(provider.getGitBranch()).toBe("main");
-			expect(onBranchChange).not.toHaveBeenCalled();
-		} finally {
-			provider.dispose();
-		}
-	});
-
-	it("debounces rapid reftable updates into a single async refresh", async () => {
-		const { worktreeDir } = createReftableWorktree(tempDir);
-		process.chdir(worktreeDir);
-
-		const provider = new FooterDataProvider(worktreeDir);
-		try {
-			expect(provider.getGitBranch()).toBe("main");
-			vi.mocked(execFile).mockClear();
-
-			emitReftableChange(provider);
-			emitReftableChange(provider);
-			emitReftableChange(provider);
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
-			await new Promise((resolve) => setTimeout(resolve, 650));
-
-			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
-		} finally {
-			provider.dispose();
-		}
-	});
-
-	it("updates the cached branch when the reftable directory changes", async () => {
-		const { worktreeDir } = createReftableWorktree(tempDir);
-		process.chdir(worktreeDir);
-
-		const provider = new FooterDataProvider(worktreeDir);
-		try {
-			expect(provider.getGitBranch()).toBe("main");
-			resolvedBranch = "foo";
-			const onBranchChange = vi.fn();
-			provider.onBranchChange(onBranchChange);
-
-			emitReftableChange(provider);
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
-			await waitFor(() => provider.getGitBranch() === "foo");
-
-			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
-			expect(provider.getGitBranch()).toBe("foo");
-			expect(onBranchChange).toHaveBeenCalledTimes(1);
-		} finally {
-			provider.dispose();
-		}
-	});
-
-	it("retries git watchers 5 seconds after an async fs.watch error", async () => {
-		vi.useFakeTimers();
-		const repoDir = createPlainRepo(tempDir);
-		process.chdir(repoDir);
-
-		const provider = new FooterDataProvider(repoDir);
-		try {
-			const providerWithInternals = provider as unknown as {
-				headWatcher: FSWatcher | null;
-			};
-			const originalWatcher = providerWithInternals.headWatcher;
-			expect(originalWatcher).not.toBeNull();
-			expect(originalWatcher?.listenerCount("error")).toBeGreaterThan(0);
-
-			originalWatcher?.emit("error", new Error("simulated EMFILE"));
-			expect(providerWithInternals.headWatcher).toBeNull();
-
-			await vi.advanceTimersByTimeAsync(4999);
-			expect(providerWithInternals.headWatcher).toBeNull();
-
-			await vi.advanceTimersByTimeAsync(1);
-			expect(providerWithInternals.headWatcher).not.toBeNull();
-			expect(providerWithInternals.headWatcher).not.toBe(originalWatcher);
-		} finally {
-			provider.dispose();
-			vi.useRealTimers();
-		}
+	it("updates and clears extension statuses independently of Git context", () => {
+		const gitContext = new FakeGitContextProvider(null);
+		const provider = new FooterDataProvider(gitContext.asProvider());
+		provider.setExtensionStatus("one", "first");
+		provider.setExtensionStatus("two", "second");
+		provider.setExtensionStatus("one", undefined);
+		expect([...provider.getExtensionStatuses()]).toEqual([["two", "second"]]);
+		provider.clearExtensionStatuses();
+		expect(provider.getExtensionStatuses().size).toBe(0);
+		provider.dispose();
 	});
 });

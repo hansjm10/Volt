@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { SubagentCapacityLimitSnapshot, SubagentTreeCapacitySnapshot } from "./capacity.ts";
+import { resolveSubagentTurnLimits, type SubagentTurnLimits } from "./turn-budget.ts";
 
 export interface SubagentDelegationScopeSnapshot {
 	id: string;
@@ -16,8 +17,9 @@ export interface SubagentDelegationScopeSnapshot {
 
 /**
  * Tree-wide limits shared by every descendant of one delegation scope.
- * Structural limits reject new spawns; finite consumption budgets abort the
- * admitted tree when crossed. Every limit accepts `Number.POSITIVE_INFINITY`.
+ * Structural limits reject new spawns; finite aggregate consumption budgets
+ * abort the admitted tree when crossed. Every limit accepts
+ * `Number.POSITIVE_INFINITY`.
  */
 export interface SubagentDelegationScopeLimits {
 	/** Deepest delegation depth a descendant may start at; root children start at depth 1. */
@@ -26,8 +28,6 @@ export interface SubagentDelegationScopeLimits {
 	maxStarts?: number;
 	/** Concurrently active descendant runtimes across the whole tree. */
 	maxActiveDescendants?: number;
-	/** Finite total assistant turns allowed across all descendants before the tree aborts. */
-	maxTurns?: number;
 	/** Finite total tokens allowed across all descendants before the tree aborts. */
 	maxTotalTokens?: number;
 	/** Finite total provider cost in USD allowed across all descendants before the tree aborts. */
@@ -40,7 +40,6 @@ export const DEFAULT_SUBAGENT_DELEGATION_LIMITS: Required<SubagentDelegationScop
 	maxDepth: 5,
 	maxStarts: 100,
 	maxActiveDescendants: 16,
-	maxTurns: Number.POSITIVE_INFINITY,
 	maxTotalTokens: Number.POSITIVE_INFINITY,
 	maxTotalCostUsd: Number.POSITIVE_INFINITY,
 	maxDurationMs: Number.POSITIVE_INFINITY,
@@ -66,8 +65,10 @@ export interface SubagentDelegationBatchReservationOptions {
 
 export interface SubagentDelegationScopeOptions {
 	signal?: AbortSignal;
-	/** Limit overrides; omitted structural limits keep safeguards and consumption budgets stay unlimited. */
+	/** Tree-wide limit overrides; omitted structural limits keep their built-in safeguards. */
 	limits?: SubagentDelegationScopeLimits;
+	/** Per-runtime turn limit overrides inherited by every child in this scope. */
+	turnLimits?: SubagentTurnLimits;
 }
 
 function capacityLimitSnapshot(maximum: number, used: number, reserved: number): SubagentCapacityLimitSnapshot {
@@ -87,8 +88,8 @@ function requirePositiveSafeInteger(value: number, name: string): void {
 
 function resolveLimits(overrides: SubagentDelegationScopeLimits | undefined): Required<SubagentDelegationScopeLimits> {
 	// Explicitly-undefined overrides use the category-specific defaults instead
-	// of bypassing resolution: structural safeguards stay finite while
-	// consumption budgets stay unlimited unless a host supplies finite values.
+	// of bypassing resolution: structural safeguards stay finite while token,
+	// cost, and deadline budgets stay unlimited.
 	const limits: Required<SubagentDelegationScopeLimits> = { ...DEFAULT_SUBAGENT_DELEGATION_LIMITS };
 	for (const key of Object.keys(limits) as Array<keyof SubagentDelegationScopeLimits>) {
 		const value = overrides?.[key];
@@ -106,14 +107,16 @@ function resolveLimits(overrides: SubagentDelegationScopeLimits | undefined): Re
 /**
  * Shared, root-owned accounting and cancellation scope for one recursive
  * delegation tree. Reservations enforce the default depth, start, and
- * concurrency ceilings without aborting admitted descendants; opt-in finite
- * consumption budgets (turns, tokens, cost, deadline) abort the whole tree.
+ * concurrency ceilings without aborting admitted descendants. Aggregate turn
+ * accounting remains observable, while opt-in finite token, cost, and deadline
+ * budgets abort the whole tree. Turn enforcement is local to each runtime.
  */
 export class SubagentDelegationScope {
 	readonly id: string;
 	readonly startedAt: number;
 	readonly signal: AbortSignal;
 	readonly limits: Required<SubagentDelegationScopeLimits>;
+	readonly turnLimits: Required<SubagentTurnLimits>;
 
 	private readonly controller = new AbortController();
 	private readonly activeAborters = new Map<string, () => void>();
@@ -138,6 +141,7 @@ export class SubagentDelegationScope {
 		this.startedAt = Date.now();
 		this.signal = this.controller.signal;
 		this.limits = resolveLimits(options.limits);
+		this.turnLimits = resolveSubagentTurnLimits(options.turnLimits);
 		this.externalSignal = options.signal;
 		this.onExternalAbort = options.signal
 			? () => this.abort(options.signal?.reason ?? new Error("Operation aborted"))
@@ -302,13 +306,6 @@ export class SubagentDelegationScope {
 	recordTurn(): void {
 		if (this.signal.aborted || this.disposed) return;
 		this.turnsUsed += 1;
-		if (this.turnsUsed > this.limits.maxTurns) {
-			this.abort(
-				new Error(
-					`Subagent delegation tree ${this.id} exceeded its ${this.limits.maxTurns}-turn budget (maxTurns).`,
-				),
-			);
-		}
 	}
 
 	recordUsage(tokens: number, costUsd: number): void {

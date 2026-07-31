@@ -41,6 +41,10 @@ export interface IrohRemoteAgentRuntimeOptions {
 	cwd: string;
 	/** Project/config root for .volt resources. Defaults to cwd. */
 	projectCwd?: string;
+	/** Host-owned workspace display name for Git context. */
+	workspaceName?: string;
+	/** Trusted managed-worktree base ref for Git context. */
+	baseRef?: string;
 	onSubagentRuntimeCreated?: (
 		event: IrohRemoteSubagentRuntimeCreatedEvent,
 	) => SubagentRuntimeRegistration | Promise<SubagentRuntimeRegistration> | Promise<void> | void;
@@ -128,11 +132,15 @@ export async function createIrohRemoteAgentRuntimeWithSessionSelection(
 			projectCwd,
 			agentDir: runtimeOptions.agentDir,
 			settingsManager,
+			workspaceName: runtimeOptions.workspaceName ?? options.workspaceName,
+			baseRef: runtimeOptions.baseRef ?? options.baseRef,
 		});
 		const subagentManager = new SubagentManager({
 			createRuntime,
 			cwd: runtimeOptions.cwd,
 			agentDir: runtimeOptions.agentDir,
+			workspaceName: services.workspaceName,
+			baseRef: services.baseRef,
 			resourceLoader: services.resourceLoader,
 			parentSessionManager: runtimeOptions.sessionManager,
 			...(runtimeOptions.subagentContext ? { subagentContext: runtimeOptions.subagentContext } : {}),

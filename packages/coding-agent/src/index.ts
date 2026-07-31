@@ -162,8 +162,16 @@ export {
 	wrapRegisteredTool,
 	wrapRegisteredTools,
 } from "./core/extensions/index.ts";
-// Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
+// Footer data provider (Git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
+export {
+	detectGitOperation,
+	GitContextProvider,
+	type GitContextProviderOptions,
+	type GitContextSubscriptionOptions,
+	type ParsedGitStatus,
+	parseGitStatusPorcelainV2,
+} from "./core/git-context-provider.ts";
 export type {
 	HostActionDecision,
 	HostActionDecisionKind,
@@ -655,6 +663,7 @@ export { createSyntheticSourceInfo } from "./core/source-info.ts";
 export {
 	createBuiltInSubagentDefinitions,
 	DEFAULT_SUBAGENT_DELEGATION_LIMITS,
+	DEFAULT_SUBAGENT_TURN_LIMITS,
 	type DiscoverSubagentDefinitionsOptions,
 	discoverSubagentDefinitions,
 	type FileSubagentDefinitionSource,
@@ -697,6 +706,8 @@ export {
 	type SubagentStartByNameOptions,
 	type SubagentStartOptions,
 	type SubagentTreeCapacitySnapshot,
+	type SubagentTurnBudgetEvent,
+	type SubagentTurnLimits,
 } from "./core/subagents/index.ts";
 // Theme utilities for custom tools and extensions
 export {
@@ -861,6 +872,8 @@ export {
 	type RpcExtensionErrorEvent,
 	type RpcExtensionUIRequest,
 	type RpcExtensionUIResponse,
+	type RpcGitContext,
+	type RpcGitContextChangedEvent,
 	type RpcHostActionRequest,
 	type RpcHostActionResponse,
 	type RpcHostActionUpdate,

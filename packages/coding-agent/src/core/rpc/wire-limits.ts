@@ -61,6 +61,16 @@ export const RPC_ACTIVE_TOOL_DETAILS_MAX_SERIALIZED_BYTES = 20 * 1024;
 export const RPC_PROJECTION_STRING_MAX_UTF8_BYTES = 4 * 1024;
 
 // ============================================================================
+// Git context
+// ============================================================================
+
+export const RPC_GIT_CONTEXT_REPOSITORY_MAX_CHARS = 256;
+export const RPC_GIT_CONTEXT_REF_MAX_CHARS = 1024;
+export const RPC_GIT_CONTEXT_OID_MAX_CHARS = 64;
+export const RPC_GIT_CONTEXT_OID_PATTERN = "^(?:[0-9a-f]{40}|[0-9a-f]{64})$";
+export const RPC_GIT_CONTEXT_OBSERVED_AT_MAX_CHARS = 32;
+
+// ============================================================================
 // UI action-state events
 // ============================================================================
 

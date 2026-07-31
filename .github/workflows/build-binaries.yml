@@ -451,7 +451,7 @@ jobs:
       - name: Verify publish left the checkout unchanged
         run: git diff --exit-code HEAD
 
-      - name: Verify published beta channel
+      - name: Verify published stable channel
         shell: bash
         run: |
           VERSION="${RELEASE_TAG#v}"
@@ -506,7 +506,7 @@ jobs:
           name: release-${{ env.RELEASE_TAG }}
           path: release-artifacts
 
-      - name: Finalize pre-authorized GitHub prerelease
+      - name: Finalize pre-authorized stable GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -545,12 +545,12 @@ jobs:
           fi
 
           if ! release_json=$(gh release view "${RELEASE_TAG}" --json assets,isDraft,isPrerelease,tagName); then
-            echo "Release approval must create the draft prerelease before publication" >&2
+            echo "Release approval must create the stable draft before publication" >&2
             exit 1
           fi
           if [[ "$(jq -r '.tagName' <<<"${release_json}")" != "${RELEASE_TAG}" ]] || \
-             [[ "$(jq -r '.isPrerelease' <<<"${release_json}")" != "true" ]]; then
-            echo "Pre-authorized GitHub release must be a prerelease for ${RELEASE_TAG}" >&2
+             [[ "$(jq -r '.isPrerelease' <<<"${release_json}")" != "false" ]]; then
+            echo "Pre-authorized GitHub release must be stable for ${RELEASE_TAG}" >&2
             exit 1
           fi
           is_draft=$(jq -r '.isDraft' <<<"${release_json}")
@@ -597,7 +597,7 @@ jobs:
           release_json=$(gh release view "${RELEASE_TAG}" --json assets,isDraft,isPrerelease,tagName)
           current_is_draft=$(jq -r '.isDraft' <<<"${release_json}")
           if [[ "$(jq -r '.tagName' <<<"${release_json}")" != "${RELEASE_TAG}" ]] || \
-             [[ "$(jq -r '.isPrerelease' <<<"${release_json}")" != "true" ]] || \
+             [[ "$(jq -r '.isPrerelease' <<<"${release_json}")" != "false" ]] || \
              [[ "${current_is_draft}" != "${is_draft}" ]]; then
             echo "Release identity or draft state changed during publication" >&2
             exit 1
@@ -619,21 +619,24 @@ jobs:
             fi
           done
 
-          if [[ "${is_draft}" == "false" ]]; then
-            echo "Published release assets are exact; leaving the release unchanged."
-            exit 0
+          if [[ "${is_draft}" == "true" ]]; then
+            gh release edit "${RELEASE_TAG}" \
+              --draft=false \
+              --prerelease=false \
+              --latest \
+              --title "${RELEASE_TAG}" \
+              --notes-file release-notes.md
           fi
-
-          gh release edit "${RELEASE_TAG}" \
-            --draft=false \
-            --prerelease \
-            --title "${RELEASE_TAG}" \
-            --notes-file release-notes.md
 
           final_json=$(gh release view "${RELEASE_TAG}" --json assets,isDraft,isPrerelease,tagName)
           if [[ "$(jq -r '.isDraft' <<<"${final_json}")" != "false" ]] || \
-             [[ "$(jq -r '.isPrerelease' <<<"${final_json}")" != "true" ]] || \
+             [[ "$(jq -r '.isPrerelease' <<<"${final_json}")" != "false" ]] || \
              [[ "$(jq -r '.tagName' <<<"${final_json}")" != "${RELEASE_TAG}" ]]; then
-            echo "GitHub prerelease did not reach the expected published state" >&2
+            echo "Stable GitHub release did not reach the expected published state" >&2
+            exit 1
+          fi
+          latest_tag=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
+          if [[ "${latest_tag}" != "${RELEASE_TAG}" ]]; then
+            echo "GitHub latest release is ${latest_tag}, expected ${RELEASE_TAG}" >&2
             exit 1
           fi

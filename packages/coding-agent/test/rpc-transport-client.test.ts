@@ -2277,6 +2277,10 @@ function createRuntimeHost(
 		},
 		session: {
 			bindExtensions: vi.fn(bindExtensions),
+			gitContextProvider: {
+				getSnapshot: () => null,
+				retainObservation: () => () => undefined,
+			},
 			subscribe: vi.fn((listener: (event: AgentSessionEvent) => void) => {
 				sessionListeners.add(listener);
 				return () => sessionListeners.delete(listener);

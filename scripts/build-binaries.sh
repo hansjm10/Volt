@@ -11,9 +11,9 @@ REPO_ROOT=$(pwd -P)
 DEFAULT_OUTPUT_DIR="$REPO_ROOT/packages/coding-agent/binaries"
 
 if [[ -z "${VOLT_PYTHON:-}" ]]; then
-	if command -v python3 >/dev/null 2>&1; then
+	if command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1; then
 		VOLT_PYTHON=python3
-	elif command -v python >/dev/null 2>&1; then
+	elif command -v python >/dev/null 2>&1 && python --version >/dev/null 2>&1; then
 		VOLT_PYTHON=python
 	else
 		echo "Python 3 is required to create deterministic release archives" >&2

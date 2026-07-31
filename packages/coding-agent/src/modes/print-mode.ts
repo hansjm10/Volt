@@ -108,15 +108,18 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		reportProjectionDiagnostics("json-print", streamProjector?.endStream().diagnostics ?? []);
 		const projector = new StreamProjector();
 		streamProjector = projector;
-		unsubscribe = session.subscribe((event) => {
-			if (mode === "json") {
-				const batch = projector.push(event);
-				reportProjectionDiagnostics("json-print", batch.diagnostics);
-				for (const frame of batch.frames) {
-					writeRawStdout(`${JSON.stringify(frame)}\n`);
+		unsubscribe = session.subscribe(
+			(event) => {
+				if (mode === "json") {
+					const batch = projector.push(event);
+					reportProjectionDiagnostics("json-print", batch.diagnostics);
+					for (const frame of batch.frames) {
+						writeRawStdout(`${JSON.stringify(frame)}\n`);
+					}
 				}
-			}
-		});
+			},
+			{ monitorGitContext: false },
+		);
 	};
 
 	try {

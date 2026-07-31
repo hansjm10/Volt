@@ -92,6 +92,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { GitContextProvider } from "./git-context-provider.ts";
 import type { HostInteraction } from "./host-interaction.ts";
 import { resolveLspConfig } from "./lsp/config.ts";
 import { LspManager, type LspServerStatus } from "./lsp/manager.ts";
@@ -126,7 +127,7 @@ import {
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import { isTransientProviderError } from "./provider-errors.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
-import type { UiActionStateDescriptor } from "./rpc/types.ts";
+import type { RpcGitContext, UiActionStateDescriptor } from "./rpc/types.ts";
 import type {
 	BranchSummaryEntry,
 	ClientInputCommand,
@@ -248,6 +249,7 @@ export type AgentSessionEvent =
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| { type: "planning_state_changed"; planning: PlanningState }
+	| { type: "git_context_changed"; gitContext: RpcGitContext | null }
 	| {
 			type: "ui_action_state_changed";
 			action: string;
@@ -289,6 +291,7 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
+	gitContextProvider?: GitContextProvider;
 	cwd: string;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
@@ -473,12 +476,15 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
+	readonly gitContextProvider: GitContextProvider;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
+	private _unsubscribeGitContext?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
+	private readonly _eventListenerGitObservations = new Set<() => void>();
 	private readonly _conversationGenerationListeners = new Set<ConversationGenerationListener>();
 	private _conversationGenerationRevision = 0;
 
@@ -570,6 +576,8 @@ export class AgentSession {
 	private _requestedBuildToolNames: string[] = [];
 	private _planningRuntimeInitialized = false;
 	private _planResearchObserved = false;
+	/** Guards the install-once agent hook contract; see _installAgentToolHooks. */
+	private _agentToolHooksInstalled = false;
 	private _trustedHostToolNames: Set<string> = new Set();
 	private _authorizedOperationResolutions: Map<string, OperationResolution> = new Map();
 
@@ -597,6 +605,8 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
+		this.gitContextProvider = config.gitContextProvider ?? new GitContextProvider(config.cwd);
+		if (!config.gitContextProvider) void this.gitContextProvider.refresh();
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
@@ -621,8 +631,13 @@ export class AgentSession {
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+		this._unsubscribeGitContext = this.gitContextProvider.subscribe(
+			(gitContext) => {
+				this._emit({ type: "git_context_changed", gitContext });
+			},
+			{ monitor: false },
+		);
 		this._installAgentToolHooks();
-		this.agent.shouldStopAfterTurn = (context) => this._shouldStopForProactiveCompaction(context);
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -715,8 +730,20 @@ export class AgentSession {
 	 * new runner without reinstalling hooks. Extension-specific tool wrappers are still used to adapt
 	 * registered tool execution to the extension context. Tool call and tool result interception now
 	 * happens here instead of in wrappers.
+	 *
+	 * Install-once is an enforced contract: external wrappers — e.g. the SubagentManager per-child
+	 * turn budget — chain and later restore `agent.beforeToolCall`/`agent.shouldStopAfterTurn`.
+	 * Reinstalling any of these hooks after construction would silently discard such wrappers, so a
+	 * second call throws instead.
 	 */
 	private _installAgentToolHooks(): void {
+		if (this._agentToolHooksInstalled) {
+			throw new Error(
+				"Agent tool hooks are installed exactly once per AgentSession; reinstalling would silently drop external hook wrappers such as the subagent turn budget.",
+			);
+		}
+		this._agentToolHooksInstalled = true;
+		this.agent.shouldStopAfterTurn = (context) => this._shouldStopForProactiveCompaction(context);
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
 			if (!this.getActiveToolNames().includes(toolCall.name)) {
 				return {
@@ -824,8 +851,11 @@ export class AgentSession {
 
 	/** Emit an event to all listeners */
 	private _emit(event: AgentSessionEvent): void {
-		for (const l of this._eventListeners) {
-			l(event);
+		if (event.type === "tool_execution_end" || event.type === "agent_settled") {
+			this.gitContextProvider.scheduleRefresh();
+		}
+		for (const listener of this._eventListeners) {
+			listener(event);
 		}
 	}
 
@@ -1305,14 +1335,24 @@ export class AgentSession {
 	 * Session persistence is handled internally (saves messages on message_end).
 	 * Multiple listeners can be added. Returns unsubscribe function for this listener.
 	 */
-	subscribe(listener: AgentSessionEventListener): () => void {
+	subscribe(listener: AgentSessionEventListener, options: { monitorGitContext?: boolean } = {}): () => void {
 		this._eventListeners.push(listener);
+		const releaseGitObservation =
+			options.monitorGitContext === false ? undefined : this.gitContextProvider.retainObservation();
+		if (releaseGitObservation) this._eventListenerGitObservations.add(releaseGitObservation);
+		let unsubscribed = false;
 
 		// Return unsubscribe function for this specific listener
 		return () => {
+			if (unsubscribed) return;
+			unsubscribed = true;
 			const index = this._eventListeners.indexOf(listener);
 			if (index !== -1) {
 				this._eventListeners.splice(index, 1);
+			}
+			if (releaseGitObservation) {
+				this._eventListenerGitObservations.delete(releaseGitObservation);
+				releaseGitObservation();
 			}
 		};
 	}
@@ -1463,6 +1503,11 @@ export class AgentSession {
 			this._extensionRunnerRef.current = undefined;
 		}
 		this._disconnectFromAgent();
+		this._unsubscribeGitContext?.();
+		this._unsubscribeGitContext = undefined;
+		for (const releaseObservation of this._eventListenerGitObservations) releaseObservation();
+		this._eventListenerGitObservations.clear();
+		this.gitContextProvider.dispose();
 		this._eventListeners = [];
 		this._conversationGenerationListeners.clear();
 		cleanupSessionResources(this.sessionId);
@@ -5530,6 +5575,7 @@ export class AgentSession {
 			// Save to session
 			this.sessionManager.appendMessage(bashMessage);
 		}
+		this.gitContextProvider.scheduleRefresh();
 	}
 
 	/**

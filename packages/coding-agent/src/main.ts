@@ -714,6 +714,8 @@ export async function main(args: string[], options?: MainOptions) {
 			agentDir,
 			authStorage,
 			settingsManager: runtimeSettingsManager,
+			workspaceName: runtimeOptions.workspaceName,
+			baseRef: runtimeOptions.baseRef,
 			extensionFlagValues: parsed.unknownFlags,
 			resourceLoaderReloadOptions:
 				shouldResolveProjectTrust && trustPath !== undefined
@@ -797,6 +799,8 @@ export async function main(args: string[], options?: MainOptions) {
 			createRuntime,
 			cwd,
 			agentDir,
+			workspaceName: services.workspaceName,
+			baseRef: services.baseRef,
 			resourceLoader,
 			parentSessionManager: sessionManager,
 			...(subagentContext ? { subagentContext } : {}),

@@ -24,6 +24,7 @@ import type {
 	RpcConversationAssistantPart,
 	RpcConversationBootstrapEvent,
 	RpcConversationTranscriptItem,
+	RpcGitContext,
 	RpcSessionState,
 	RpcWorkflowEvent,
 	RpcWorkflowToolEvent,
@@ -38,14 +39,41 @@ const EMPTY_USAGE: Usage = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+const TEST_GIT_CONTEXT: RpcGitContext = {
+	repository: "workspace",
+	head: { kind: "branch", name: "main", oid: "0123456789abcdef0123456789abcdef01234567" },
+	upstream: null,
+	base: null,
+	status: {
+		staged: { added: 0, modified: 0, deleted: 0, renamed: 0 },
+		unstaged: { added: 0, modified: 0, deleted: 0, renamed: 0 },
+		untracked: 0,
+		conflicted: 0,
+		total: 0,
+		clean: true,
+	},
+	operation: null,
+	revision: 1,
+	observedAt: "2026-07-29T00:00:00.000Z",
+	stale: false,
+};
+
 class TestSource implements ConversationProjectionSource {
 	private readonly listeners = new Set<(event: object) => void>();
 	private readonly branchListeners = new Set<() => void>();
 	revision = 0;
+	observationCount = 0;
 
 	subscribe(listener: (event: object) => void): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
+	}
+
+	retainObservation(): () => void {
+		this.observationCount++;
+		return () => {
+			this.observationCount--;
+		};
 	}
 
 	subscribeGenerationChanges(listener: () => void): () => void {
@@ -110,6 +138,7 @@ function snapshotBuilder(source: TestSource, label = "test"): ConversationProjec
 			availableThinkingLevels: ["off"],
 			fastModeEnabled: false,
 			planning: { mode: "build", plan: null },
+			gitContext: null,
 			isStreaming: activeAssistant !== null,
 			isCompacting: false,
 			steeringMode: "one-at-a-time",
@@ -449,6 +478,7 @@ function oracleSnapshotBuilder(
 				availableThinkingLevels: ["off"],
 				fastModeEnabled: false,
 				planning: { mode: "build", plan: null },
+				gitContext: null,
 				isStreaming: context.activeAssistant !== null,
 				isCompacting: false,
 				steeringMode: "one-at-a-time",
@@ -551,6 +581,21 @@ describe("ConversationProjectionFeed", () => {
 		feed.dispose();
 	});
 
+	it("retains expensive source observation only while subscribers are attached", async () => {
+		const source = new TestSource();
+		const feed = new ConversationProjectionFeed(source);
+		expect(source.observationCount).toBe(0);
+		const first = feed.attach({ write: () => {}, buildSnapshot: snapshotBuilder(source) });
+		const second = feed.attach({ write: () => {}, buildSnapshot: snapshotBuilder(source) });
+		await Promise.all([first.ready, second.ready]);
+		expect(source.observationCount).toBe(1);
+		first.detach();
+		expect(source.observationCount).toBe(1);
+		second.detach();
+		expect(source.observationCount).toBe(0);
+		feed.dispose();
+	});
+
 	it("enqueues bootstrap first at cursor zero, then contiguous top-level delivery", async () => {
 		const source = new TestSource();
 		const writes: object[] = [];
@@ -577,6 +622,42 @@ describe("ConversationProjectionFeed", () => {
 			type: "workflow_update",
 			workflowId: "wf-1",
 			kind: "review",
+			delivery: { subscriptionId: subscription.subscriptionId, cursor: 1 },
+		});
+		feed.dispose();
+	});
+
+	it("bootstraps Git context and carries full replacements in ordered stream position", async () => {
+		const source = new TestSource();
+		const writes: object[] = [];
+		const feed = new ConversationProjectionFeed(source, { createId: makeIds("git") });
+		const subscription = feed.attach({
+			write: (value) => {
+				writes.push(value);
+			},
+			buildSnapshot: (context) => {
+				const snapshot = snapshotBuilder(source)(context);
+				return { ...snapshot, state: { ...snapshot.state, gitContext: TEST_GIT_CONTEXT } };
+			},
+		});
+		await subscription.ready;
+		expect(writes[0]).toMatchObject({
+			type: "conversation_bootstrap",
+			state: { gitContext: TEST_GIT_CONTEXT },
+			delivery: { cursor: 0 },
+		});
+
+		const replacement: RpcGitContext = {
+			...TEST_GIT_CONTEXT,
+			status: { ...TEST_GIT_CONTEXT.status, untracked: 1, total: 1, clean: false },
+			revision: 2,
+			observedAt: "2026-07-29T00:00:01.000Z",
+		};
+		source.emit({ type: "git_context_changed", gitContext: replacement });
+		await subscription.flush();
+		expect(writes[1]).toEqual({
+			type: "git_context_changed",
+			gitContext: replacement,
 			delivery: { subscriptionId: subscription.subscriptionId, cursor: 1 },
 		});
 		feed.dispose();

@@ -11,7 +11,7 @@ The four Volt package names are declared in their package manifests:
 - `@hansjm10/volt-tui`
 - `@hansjm10/volt-coding-agent`
 
-The initial Volt beta uses lockstep version `0.1.0` and the npm `beta` dist-tag.
+The initial Volt beta used lockstep version `0.1.0` and the npm `beta` dist-tag.
 Before releasing it, reserve the four names with a non-installable
 `0.0.0-bootstrap.0` placeholder under the `bootstrap` dist-tag. npm requires
 every package to have a `latest` tag, so `latest` also remains pinned to this
@@ -74,11 +74,15 @@ outside the automated release:
    `@beta`; an unqualified install intentionally resolves to the placeholder.
 8. Verify the final GitHub release assets and checksums match the approved
    candidate and release record.
+9. Starting with stable `0.2.0`, publish all four packages under `latest`, keep
+   `beta` on the historical `0.1.0`, and keep `bootstrap` on
+   `0.0.0-bootstrap.0`. Unqualified npm installs then resolve to the current
+   stable release.
 
 npm requires a package to exist before a trusted-publisher relationship can be
 configured. Only the non-installable name-reservation placeholder uses the npm
-account's approved interactive authentication; the real `0.1.0` and subsequent
-versions use the trusted publisher. Do not add a long-lived publish token to the
+account's approved interactive authentication; `0.1.0` and subsequent versions
+use the trusted publisher. Do not add a long-lived publish token to the
 workflow as a shortcut.
 See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) and
 [publishing scoped public packages](https://docs.npmjs.com/creating-and-publishing-scoped-public-packages/).

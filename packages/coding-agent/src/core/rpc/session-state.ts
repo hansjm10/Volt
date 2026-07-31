@@ -630,6 +630,7 @@ export function buildRpcSessionState(session: AgentSession): RpcSessionState {
 		fastModeEnabled: session.fastModeEnabled,
 		planning:
 			typeof session.getPlanningState === "function" ? session.getPlanningState() : { ...DEFAULT_PLANNING_STATE },
+		gitContext: session.gitContextProvider.getSnapshot(),
 		isStreaming: session.isStreaming,
 		isBusy: session.isBusy,
 		isCompacting: session.isCompacting,

@@ -18,6 +18,7 @@ import {
 	RPC_UI_ACTION_STATE_VALUE_MAX_CHARS,
 } from "../wire-limits.ts";
 import { RpcConversationDeliveryPositionSchema } from "./conversation.ts";
+import { RpcGitContextSchema } from "./git-context.ts";
 import { opaque, stringEnum } from "./helpers.ts";
 
 // ============================================================================
@@ -233,6 +234,16 @@ export const RpcSubagentDisposedEventSchema = Type.Object(
 /** Model catalog changed; clients re-fetch get_available_models. */
 export const RpcModelsChangedEventSchema = Type.Object(
 	{ type: Type.Literal("models_changed") },
+	{ additionalProperties: false },
+);
+
+/** Full replacement of the active session's path-free Git context. */
+export const RpcGitContextChangedEventSchema = Type.Object(
+	{
+		type: Type.Literal("git_context_changed"),
+		gitContext: Type.Union([RpcGitContextSchema, Type.Null()]),
+		delivery: Type.Optional(RpcConversationDeliveryPositionSchema),
+	},
 	{ additionalProperties: false },
 );
 

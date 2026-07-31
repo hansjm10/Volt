@@ -5,6 +5,7 @@ import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AuthStorage } from "./auth-storage.ts";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
+import { GitContextProvider } from "./git-context-provider.ts";
 import type { HostInteraction } from "./host-interaction.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { AgentMode } from "./planning.ts";
@@ -51,6 +52,10 @@ export interface CreateAgentSessionServicesOptions {
 	extensionFlagValues?: Map<string, boolean | string>;
 	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">;
 	resourceLoaderReloadOptions?: ResourceLoaderReloadOptions;
+	/** Optional host-owned display name for Git context. */
+	workspaceName?: string;
+	/** Optional trusted local base ref for managed-worktree divergence. */
+	baseRef?: string;
 }
 
 /**
@@ -90,6 +95,9 @@ export interface AgentSessionServices {
 	settingsManager: SettingsManager;
 	modelRegistry: ModelRegistry;
 	resourceLoader: ResourceLoader;
+	gitContextProvider: GitContextProvider;
+	workspaceName?: string;
+	baseRef?: string;
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 }
 
@@ -163,6 +171,13 @@ export async function createAgentSessionServices(
 		settingsManager,
 	});
 	await resourceLoader.reload(options.resourceLoaderReloadOptions);
+	// Fire-and-forget initial scan: session creation never waits for Git, and
+	// state reads serve null until the first scan lands.
+	const gitContextProvider = new GitContextProvider(cwd, {
+		workspaceName: options.workspaceName,
+		baseRef: options.baseRef,
+	});
+	void gitContextProvider.refresh();
 
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
 	const extensionsResult = resourceLoader.getExtensions();
@@ -188,6 +203,9 @@ export async function createAgentSessionServices(
 		settingsManager,
 		modelRegistry,
 		resourceLoader,
+		gitContextProvider,
+		workspaceName: options.workspaceName,
+		baseRef: options.baseRef,
 		diagnostics,
 	};
 }
@@ -210,6 +228,7 @@ export async function createAgentSessionFromServices(
 		settingsManager: options.services.settingsManager,
 		modelRegistry: options.services.modelRegistry,
 		resourceLoader: options.services.resourceLoader,
+		gitContextProvider: options.services.gitContextProvider,
 		sessionManager: options.sessionManager,
 		model: options.model,
 		thinkingLevel: options.thinkingLevel,

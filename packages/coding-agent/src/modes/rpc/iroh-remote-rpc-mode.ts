@@ -756,9 +756,12 @@ function attachIrohRemoteLiveActivityUpdates(
 		liveActivityAttachmentsByRuntime.set(runtimeHost, attachments);
 	}
 	const updater = new IrohRemoteLiveActivityUpdater(runtimeHost, delivery, workspaceName);
-	const unsubscribeSession = runtimeHost.session.subscribe((event) => {
-		void updater.handleSessionEvent(event).catch(() => {});
-	});
+	const unsubscribeSession = runtimeHost.session.subscribe(
+		(event) => {
+			void updater.handleSessionEvent(event).catch(() => {});
+		},
+		{ monitorGitContext: false },
+	);
 	const unsubscribeReviews =
 		runtimeHost.reviewWorkflows?.attachSink((event) => {
 			if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {

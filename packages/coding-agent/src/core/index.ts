@@ -133,6 +133,7 @@ export {
 export { createSyntheticSourceInfo } from "./source-info.ts";
 export {
 	createBuiltInSubagentDefinitions,
+	DEFAULT_SUBAGENT_TURN_LIMITS,
 	type DiscoverSubagentDefinitionsOptions,
 	discoverSubagentDefinitions,
 	type FileSubagentDefinitionSource,
@@ -161,4 +162,6 @@ export {
 	type SubagentResult,
 	type SubagentStartByNameOptions,
 	type SubagentStartOptions,
+	type SubagentTurnBudgetEvent,
+	type SubagentTurnLimits,
 } from "./subagents/index.ts";

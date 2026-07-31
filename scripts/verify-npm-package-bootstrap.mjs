@@ -2,12 +2,12 @@
 
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RELEASE_PACKAGES, versionFromReleaseTag } from "./verify-release-provenance.mjs";
 
 export const BOOTSTRAP_VERSION = "0.0.0-bootstrap.0";
-const INITIAL_RELEASE_VERSION = "0.1.0";
+export const INITIAL_BETA_VERSION = "0.1.0";
 
 function usage() {
 	return "Usage: node scripts/verify-npm-package-bootstrap.mjs <preflight|tag> --version X.Y.Z [--initial]";
@@ -35,7 +35,7 @@ export function parseBootstrapVerificationArgs(args) {
 
 	if (!version) throw new Error(usage());
 	versionFromReleaseTag(`v${version}`);
-	if (initial && (mode !== "preflight" || version !== INITIAL_RELEASE_VERSION)) {
+	if (initial && (mode !== "preflight" || version !== INITIAL_BETA_VERSION)) {
 		throw new Error("--initial is only valid for the preflight of the 0.1.0 release");
 	}
 	return { initial, mode, version };
@@ -52,6 +52,22 @@ function validatePackageIdentity(expectedName, metadata) {
 	}
 }
 
+function verifyEstablishedPackageChannels(expectedName, versions, metadata) {
+	const distTags = metadata["dist-tags"];
+	if (!distTags || typeof distTags !== "object" || Array.isArray(distTags)) {
+		throw new Error(`${expectedName} has malformed npm dist-tags metadata`);
+	}
+	if (!versions.includes(INITIAL_BETA_VERSION) || distTags.beta !== INITIAL_BETA_VERSION) {
+		throw new Error(`${expectedName} must preserve the historical beta dist-tag on ${INITIAL_BETA_VERSION}`);
+	}
+	if (distTags.bootstrap !== BOOTSTRAP_VERSION) {
+		throw new Error(`${expectedName} must keep bootstrap on the inert placeholder`);
+	}
+	if (distTags.latest !== BOOTSTRAP_VERSION && !versions.includes(distTags.latest)) {
+		throw new Error(`${expectedName} latest must point to a published stable version or the inert placeholder`);
+	}
+}
+
 export function verifyPreflightPackageMetadata(expectedName, targetVersion, metadata, options = {}) {
 	validatePackageIdentity(expectedName, metadata);
 	const versions = normalizedVersions(metadata);
@@ -59,7 +75,10 @@ export function verifyPreflightPackageMetadata(expectedName, targetVersion, meta
 		throw new Error(`${expectedName}@${targetVersion} is already published; refusing to create or replace its release tag`);
 	}
 
-	if (!options.initial) return;
+	if (!options.initial) {
+		verifyEstablishedPackageChannels(expectedName, versions, metadata);
+		return;
+	}
 	if (versions.length !== 1 || versions[0] !== BOOTSTRAP_VERSION) {
 		throw new Error(`${expectedName} must contain only placeholder version ${BOOTSTRAP_VERSION} before the initial release`);
 	}
@@ -81,38 +100,48 @@ export function verifyPreflightPackageMetadata(expectedName, targetVersion, meta
 export function verifyTagWorkflowPackageMetadata(expectedName, targetVersion, metadata) {
 	validatePackageIdentity(expectedName, metadata);
 	const versions = normalizedVersions(metadata);
-	if (!versions.includes(targetVersion) && targetVersion === INITIAL_RELEASE_VERSION) {
-		verifyPreflightPackageMetadata(expectedName, targetVersion, metadata, { initial: true });
+	if (targetVersion === INITIAL_BETA_VERSION) {
+		if (!versions.includes(targetVersion)) {
+			verifyPreflightPackageMetadata(expectedName, targetVersion, metadata, { initial: true });
+			return;
+		}
+		if (metadata["dist-tags"]?.beta !== targetVersion) {
+			throw new Error(`${expectedName}@${targetVersion} is published but beta does not point to it`);
+		}
+		if (
+			metadata["dist-tags"]?.bootstrap !== BOOTSTRAP_VERSION ||
+			metadata["dist-tags"]?.latest !== BOOTSTRAP_VERSION
+		) {
+			throw new Error(`${expectedName}@${targetVersion} must keep bootstrap and latest on the inert placeholder`);
+		}
 		return;
 	}
-	if (versions.includes(targetVersion) && metadata["dist-tags"]?.beta !== targetVersion) {
-		throw new Error(`${expectedName}@${targetVersion} is published but beta does not point to it`);
-	}
-	if (
-		versions.includes(targetVersion) &&
-		(metadata["dist-tags"]?.bootstrap !== BOOTSTRAP_VERSION || metadata["dist-tags"]?.latest !== BOOTSTRAP_VERSION)
-	) {
-		throw new Error(`${expectedName}@${targetVersion} must keep bootstrap and latest on the inert placeholder`);
+
+	verifyEstablishedPackageChannels(expectedName, versions, metadata);
+	if (versions.includes(targetVersion) && metadata["dist-tags"].latest !== targetVersion) {
+		throw new Error(`${expectedName}@${targetVersion} is published but latest does not point to it`);
 	}
 }
 
 export function npmViewPackageMetadata(name, run = spawnSync) {
-	const result = run(
-		process.platform === "win32" ? "npm.cmd" : "npm",
-		[
-			"view",
-			`${name}@${BOOTSTRAP_VERSION}`,
-			"name",
-			"versions",
-			"dist-tags",
-			"--json",
-			"--registry=https://registry.npmjs.org/",
-		],
-		{
-			encoding: "utf8",
-			timeout: 30_000,
-		},
-	);
+	const npmArgs = [
+		"view",
+		`${name}@${BOOTSTRAP_VERSION}`,
+		"name",
+		"versions",
+		"dist-tags",
+		"--json",
+		"--registry=https://registry.npmjs.org/",
+	];
+	const result = process.platform === "win32"
+		? run(process.execPath, [join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"), ...npmArgs], {
+				encoding: "utf8",
+				timeout: 30_000,
+			})
+		: run("npm", npmArgs, {
+				encoding: "utf8",
+				timeout: 30_000,
+			});
 	if (result.error) throw result.error;
 	if (result.status !== 0) {
 		const output = [result.stdout, result.stderr].filter(Boolean).join("\n");

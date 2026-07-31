@@ -14,6 +14,7 @@ import {
 } from "./npm-publish-verification.mjs";
 import {
 	BOOTSTRAP_VERSION,
+	INITIAL_BETA_VERSION,
 	npmViewPackageMetadata,
 	parseBootstrapVerificationArgs,
 	verifyPreflightPackageMetadata,
@@ -659,6 +660,7 @@ if (process.argv.join(" ").includes("/artifacts?")) {
 
 test("npm bootstrap verification reserves names without publishing the real initial version", () => {
 	assert.equal(BOOTSTRAP_VERSION, "0.0.0-bootstrap.0");
+	assert.equal(INITIAL_BETA_VERSION, "0.1.0");
 	assert.deepEqual(parseBootstrapVerificationArgs(["preflight", "--version", "0.1.0", "--initial"]), {
 		initial: true,
 		mode: "preflight",
@@ -718,7 +720,7 @@ test("npm bootstrap verification reserves names without publishing the real init
 		return { status: 0, stdout: JSON.stringify(placeholder), stderr: "" };
 	});
 	assert.deepEqual(queried, placeholder);
-	assert.equal(queriedArgs[1], `${name}@${BOOTSTRAP_VERSION}`);
+	assert.ok(queriedArgs.includes(`${name}@${BOOTSTRAP_VERSION}`));
 	assert.doesNotThrow(() =>
 		verifyPreflightPackageMetadata(name, "0.1.1", {
 			name,
@@ -728,7 +730,7 @@ test("npm bootstrap verification reserves names without publishing the real init
 	);
 });
 
-test("tag workflow bootstrap verification supports absent, partial, and idempotent publication", () => {
+test("tag workflow verification supports the historical beta and idempotent stable publication", () => {
 	const name = "@hansjm10/volt-ai";
 	assert.doesNotThrow(() =>
 		verifyTagWorkflowPackageMetadata(name, "0.1.0", {
@@ -746,21 +748,35 @@ test("tag workflow bootstrap verification supports absent, partial, and idempote
 			}),
 		/only placeholder version/,
 	);
+	const initialBeta = {
+		name,
+		versions: [BOOTSTRAP_VERSION, INITIAL_BETA_VERSION],
+		"dist-tags": { beta: INITIAL_BETA_VERSION, bootstrap: BOOTSTRAP_VERSION, latest: BOOTSTRAP_VERSION },
+	};
+	assert.doesNotThrow(() => verifyTagWorkflowPackageMetadata(name, INITIAL_BETA_VERSION, initialBeta));
+	assert.doesNotThrow(() => verifyTagWorkflowPackageMetadata(name, "0.2.0", initialBeta));
 	assert.doesNotThrow(() =>
-		verifyTagWorkflowPackageMetadata(name, "0.1.0", {
-			name,
-			versions: [BOOTSTRAP_VERSION, "0.1.0"],
-			"dist-tags": { beta: "0.1.0", bootstrap: BOOTSTRAP_VERSION, latest: BOOTSTRAP_VERSION },
+		verifyTagWorkflowPackageMetadata(name, "0.2.0", {
+			...initialBeta,
+			versions: [...initialBeta.versions, "0.2.0"],
+			"dist-tags": { ...initialBeta["dist-tags"], latest: "0.2.0" },
 		}),
 	);
 	assert.throws(
 		() =>
-			verifyTagWorkflowPackageMetadata(name, "0.1.0", {
-				name,
-				versions: [BOOTSTRAP_VERSION, "0.1.0"],
-				"dist-tags": { beta: BOOTSTRAP_VERSION, bootstrap: BOOTSTRAP_VERSION, latest: BOOTSTRAP_VERSION },
+			verifyTagWorkflowPackageMetadata(name, "0.2.0", {
+				...initialBeta,
+				versions: [...initialBeta.versions, "0.2.0"],
 			}),
-		/beta does not point to it/,
+		/latest does not point to it/,
+	);
+	assert.throws(
+		() =>
+			verifyTagWorkflowPackageMetadata(name, "0.2.0", {
+				...initialBeta,
+				"dist-tags": { ...initialBeta["dist-tags"], beta: BOOTSTRAP_VERSION },
+			}),
+		/preserve the historical beta/,
 	);
 });
 
@@ -879,7 +895,7 @@ test("published docs are user-facing: docs.json navigation is the allowlist for 
 	);
 });
 
-test("release tooling publishes only the canonical Volt package identities under the beta dist-tag", () => {
+test("release tooling publishes only the canonical Volt package identities under the latest dist-tag", () => {
 	assert.deepEqual(RELEASE_PACKAGE_IDENTITIES, [
 		{ directory: "packages/ai", name: "@hansjm10/volt-ai" },
 		{ directory: "packages/tui", name: "@hansjm10/volt-tui" },
@@ -888,7 +904,7 @@ test("release tooling publishes only the canonical Volt package identities under
 	]);
 	const publishScript = readFileSync("scripts/publish.mjs", "utf8");
 	const publishVerification = readFileSync("scripts/npm-publish-verification.mjs", "utf8");
-	assert.match(publishScript, /const NPM_DIST_TAG = "beta";/);
+	assert.match(publishScript, /const NPM_DIST_TAG = "latest";/);
 	assert.match(publishScript, /"--tag", NPM_DIST_TAG/);
 	assert.ok(publishScript.indexOf('run("npm", ["publish"') < publishScript.lastIndexOf("verifyPublishedPackageAfterPublish({"));
 	assert.match(publishVerification, /DEFAULT_POST_PUBLISH_VERIFICATION_ATTEMPTS = 61/);
@@ -901,19 +917,19 @@ test("idempotent npm publication requires exact release bytes and provenance", (
 	assert.deepEqual(NPM_PUBLISHED_METADATA_FIELDS, ["name", "version", "gitHead", "repository", "dist-tags", "dist"]);
 	const release = {
 		name: "@hansjm10/volt-ai",
-		version: "0.1.0",
+		version: "0.2.0",
 		directory: "packages/ai",
 		sourceCommit: "a".repeat(40),
 		packed: { integrity: "sha512-release" },
 		metadata: {
 			name: "@hansjm10/volt-ai",
-			version: "0.1.0",
+			version: "0.2.0",
 			gitHead: "a".repeat(40),
 			repository: {
 				url: "git+https://github.com/volt-hq/Volt.git",
 				directory: "packages/ai",
 			},
-			"dist-tags": { beta: "0.1.0", bootstrap: "0.0.0-bootstrap.0", latest: "0.0.0-bootstrap.0" },
+			"dist-tags": { beta: "0.1.0", bootstrap: "0.0.0-bootstrap.0", latest: "0.2.0" },
 			dist: {
 				integrity: "sha512-release",
 				attestations: {
@@ -954,6 +970,28 @@ test("idempotent npm publication requires exact release bytes and provenance", (
 			metadata: { ...release.metadata, gitHead: undefined },
 		}),
 	);
+	assert.throws(
+		() =>
+			assertPublishedPackageMatchesRelease({
+				...release,
+				metadata: {
+					...release.metadata,
+					"dist-tags": { ...release.metadata["dist-tags"], latest: INITIAL_BETA_VERSION },
+				},
+			}),
+		/latest dist-tag does not point to it/,
+	);
+	assert.throws(
+		() =>
+			assertPublishedPackageMatchesRelease({
+				...release,
+				metadata: {
+					...release.metadata,
+					"dist-tags": { ...release.metadata["dist-tags"], beta: release.version },
+				},
+			}),
+		/preserve the historical beta/,
+	);
 
 	const visibilityQueries = [];
 	const sleeps = [];
@@ -972,7 +1010,7 @@ test("idempotent npm publication requires exact release bytes and provenance", (
 		},
 	);
 	assert.equal(published, release.metadata);
-	assert.deepEqual(visibilityQueries, ["@hansjm10/volt-ai@0.1.0", "@hansjm10/volt-ai@0.1.0"]);
+	assert.deepEqual(visibilityQueries, ["@hansjm10/volt-ai@0.2.0", "@hansjm10/volt-ai@0.2.0"]);
 	assert.deepEqual(sleeps, [25]);
 	assert.equal(logs.length, 1);
 	assert.match(logs[0], /waiting for npm registry metadata/);
@@ -1187,11 +1225,13 @@ test("release preparation is owner-triggered and can only open a reviewed releas
 	assert.match(workflow, /permissions: \{\}/);
 	assert.match(workflow, /target:\s+description:[\s\S]*?type: choice\s+options:\s+- patch\s+- minor/);
 	assert.doesNotMatch(workflow.slice(workflow.indexOf("      target:"), workflow.indexOf("permissions:")), /- major/);
+	assert.match(workflow, /env:\s+RELEASE_OWNER: hansjm10/);
+	assert.doesNotMatch(workflow, /github\.repository_owner|REPOSITORY_OWNER/);
 	assert.match(workflow, /RUN_ACTOR: \$\{\{ github\.actor \}\}/);
 	assert.match(workflow, /TRIGGERING_ACTOR: \$\{\{ github\.triggering_actor \}\}/);
 	assert.match(
 		workflow,
-		/"\$\{RUN_ACTOR\}" != "\$\{REPOSITORY_OWNER\}".*\|\|.*"\$\{TRIGGERING_ACTOR\}" != "\$\{REPOSITORY_OWNER\}"/,
+		/"\$\{RUN_ACTOR\}" != "\$\{RELEASE_OWNER\}".*\|\|.*"\$\{TRIGGERING_ACTOR\}" != "\$\{RELEASE_OWNER\}"/,
 	);
 	assert.match(workflow, /"\$\{GITHUB_REF\}" != "refs\/heads\/main"/);
 	assert.match(workflow, /"\$\{RELEASE_TARGET\}" != "patch" && "\$\{RELEASE_TARGET\}" != "minor"/);
@@ -1272,11 +1312,13 @@ test("release approval separates read-only authorization, App tagging, and publi
 
 	assert.match(preflight, /permissions:\s+actions: read\s+attestations: read\s+contents: read/);
 	assert.doesNotMatch(preflight, /actions: write|attestations: write|contents: write/);
+	assert.match(workflow, /env:\s+RELEASE_OWNER: hansjm10/);
+	assert.doesNotMatch(workflow, /github\.repository_owner|REPOSITORY_OWNER/);
 	assert.match(preflight, /RUN_ACTOR: \$\{\{ github\.actor \}\}/);
 	assert.match(preflight, /TRIGGERING_ACTOR: \$\{\{ github\.triggering_actor \}\}/);
 	assert.match(
 		preflight,
-		/"\$\{RUN_ACTOR\}" != "\$\{REPOSITORY_OWNER\}".*\|\|.*"\$\{TRIGGERING_ACTOR\}" != "\$\{REPOSITORY_OWNER\}"/,
+		/"\$\{RUN_ACTOR\}" != "\$\{RELEASE_OWNER\}".*\|\|.*"\$\{TRIGGERING_ACTOR\}" != "\$\{RELEASE_OWNER\}"/,
 	);
 	assert.match(preflight, /"\$\{GITHUB_REF\}" != "refs\/heads\/main"/);
 	assert.match(preflight, /\^\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\$/);
@@ -1377,6 +1419,10 @@ test("release approval separates read-only authorization, App tagging, and publi
 	const outsideTagRelease = workflow.slice(0, workflow.indexOf("  tag-release:")) + workflow.slice(workflow.indexOf("  dispatch-publication:"));
 	assert.doesNotMatch(outsideTagRelease, /VOLT_RELEASE_APP|steps\.release-app\.outputs\.token|actions\/create-github-app-token/);
 	assert.match(tagRelease, /github-token: \$\{\{ steps\.release-app\.outputs\.token \}\}/);
+	assert.match(
+		tagRelease,
+		/process\.env\.RUN_ACTOR !== process\.env\.RELEASE_OWNER \|\| process\.env\.TRIGGERING_ACTOR !== process\.env\.RELEASE_OWNER/,
+	);
 	const privilegedTagMutation = tagRelease.slice(tagRelease.indexOf("      - name: Create and read back"));
 	assert.match(privilegedTagMutation, /github\.rest\.repos\.getBranch\(\{ owner, repo, branch: "main" \}\)/);
 	assert.match(privilegedTagMutation, /main\.data\.commit\.sha !== candidateCommit/);
@@ -1388,8 +1434,8 @@ test("release approval separates read-only authorization, App tagging, and publi
 	assert.match(tagRelease, /object: candidateCommit,\s+type: "commit"/);
 	assert.doesNotMatch(tagRelease, /git\.(?:updateRef|deleteRef)|force:\s*true|git push|gh api/);
 	assert.match(tagRelease, /github\.rest\.repos\.createRelease\(\{/);
-	assert.match(tagRelease, /draft: true,\s+prerelease: true,\s+make_latest: "false"/);
-	assert.match(tagRelease, /!matches\[0\]\.draft \|\| !matches\[0\]\.prerelease/);
+	assert.match(tagRelease, /draft: true,\s+prerelease: false,\s+make_latest: "false"/);
+	assert.match(tagRelease, /!matches\[0\]\.draft \|\| matches\[0\]\.prerelease/);
 
 	assert.match(dispatch, /needs: \[preflight, tag-release\]/);
 	assert.match(dispatch, /permissions:\s+actions: write\s+contents: read/);
@@ -1523,8 +1569,8 @@ test("publisher is dispatch-only, tag-bound, approval-bound, and cannot replace 
 	assert.match(releaseJob, /internal_files=\("\$\{release_assets\[@\]\}" release-notes\.md source-commit\.txt\)/);
 	assert.match(releaseJob, /exactly ten top-level files/);
 	assert.match(releaseJob, /gh release view "\$\{RELEASE_TAG\}" --json assets,isDraft,isPrerelease,tagName/);
-	assert.match(releaseJob, /Release approval must create the draft prerelease before publication/);
-	assert.match(releaseJob, /Pre-authorized GitHub release must be a prerelease/);
+	assert.match(releaseJob, /Release approval must create the stable draft before publication/);
+	assert.match(releaseJob, /Pre-authorized GitHub release must be stable/);
 	assert.match(releaseJob, /Release contains an unexpected asset/);
 	assert.doesNotMatch(workflow, /gh release create|--clobber/);
 	const compareExisting = releaseJob.indexOf('for existing_asset in "${existing_assets[@]}"; do', releaseJob.indexOf("compare_dir="));
@@ -1535,9 +1581,11 @@ test("publisher is dispatch-only, tag-bound, approval-bound, and cannot replace 
 	assert.match(releaseJob, /gh release upload "\$\{RELEASE_TAG\}" "\$\{asset\}"/);
 	assert.match(releaseJob, /Release asset set does not exactly match the approved public asset set/);
 	assert.equal(releaseJob.match(/Refusing to replace existing release asset with different bytes/g)?.length, 2);
-	assert.ok(releaseJob.indexOf('if [[ "${is_draft}" == "false" ]]') < releaseJob.indexOf("gh release edit"));
-	assert.match(releaseJob, /gh release edit "\$\{RELEASE_TAG\}" \\\s+--draft=false \\\s+--prerelease/);
-	assert.match(releaseJob, /GitHub prerelease did not reach the expected published state/);
+	assert.match(releaseJob, /if \[\[ "\$\{is_draft\}" == "true" \]\]/);
+	assert.match(releaseJob, /gh release edit "\$\{RELEASE_TAG\}" \\\s+--draft=false \\\s+--prerelease=false \\\s+--latest/);
+	assert.match(releaseJob, /Stable GitHub release did not reach the expected published state/);
+	assert.match(releaseJob, /releases\/latest/);
+	assert.match(releaseJob, /GitHub latest release is/);
 });
 
 test("pre-tag standalone candidates build the exact main commit without publishing", () => {
@@ -1546,11 +1594,13 @@ test("pre-tag standalone candidates build the exact main commit without publishi
 	const buildJob = workflow.slice(workflow.indexOf("  build-standalone:"), workflow.indexOf("  assemble:"));
 	const assembleJob = workflow.slice(workflow.indexOf("  assemble:"));
 	assert.match(workflow, /workflow_dispatch:/);
+	assert.match(workflow, /env:\s+RELEASE_OWNER: hansjm10/);
+	assert.doesNotMatch(workflow, /github\.repository_owner|REPOSITORY_OWNER/);
 	assert.match(validateJob, /RUN_ACTOR: \$\{\{ github\.actor \}\}/);
 	assert.match(validateJob, /TRIGGERING_ACTOR: \$\{\{ github\.triggering_actor \}\}/);
 	assert.match(
 		validateJob,
-		/"\$\{RUN_ACTOR\}" != "\$\{REPOSITORY_OWNER\}".*\|\|.*"\$\{TRIGGERING_ACTOR\}" != "\$\{REPOSITORY_OWNER\}"/,
+		/"\$\{RUN_ACTOR\}" != "\$\{RELEASE_OWNER\}".*\|\|.*"\$\{TRIGGERING_ACTOR\}" != "\$\{RELEASE_OWNER\}"/,
 	);
 	assert.match(workflow, /\^\[0-9a-f\]\{40\}\$/);
 	assert.match(workflow, /git rev-parse HEAD/);
@@ -1642,7 +1692,7 @@ test("published packages and binary build include the repository license and not
 		assert.deepEqual(manifest.contributors, ["Mario Zechner", "Jordan Hans"]);
 		assert.equal(manifest.repository.url, "git+https://github.com/volt-hq/Volt.git");
 		assert.equal(manifest.repository.directory, directory);
-		assert.deepEqual(manifest.publishConfig, { access: "public", tag: "beta" });
+		assert.deepEqual(manifest.publishConfig, { access: "public", tag: "latest" });
 	}
 	const buildScript = readFileSync("scripts/build-binaries.sh", "utf8");
 	const standaloneBuild = readFileSync("scripts/build-standalone.mjs", "utf8");
@@ -1750,7 +1800,7 @@ test("published packages and binary build include the repository license and not
 	assert.match(betaReadiness, /Prove the npm daemon distribution/);
 	assert.match(betaReadiness, /Node\.js 22\.23\.1/);
 	assert.match(betaReadiness, /glibc 2\.28/);
-	assert.match(betaReadiness, /Windows beta executables are not\s+Authenticode-signed/);
+	assert.match(betaReadiness, /Windows executables are not\s+Authenticode-signed/);
 	assert.match(betaReadiness, /Resolve Doom source-archive provenance/);
 });
 

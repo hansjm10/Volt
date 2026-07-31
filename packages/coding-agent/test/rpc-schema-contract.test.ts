@@ -13,11 +13,13 @@ import {
 } from "../src/core/rpc/schema/conversation.ts";
 import {
 	RpcExtensionUIRequestSchema,
+	RpcGitContextChangedEventSchema,
 	RpcHostActionRequestSchema,
 	RpcHostActionUpdateSchema,
 	RpcModelsChangedEventSchema,
 } from "../src/core/rpc/schema/events.ts";
 import { RpcApiSchema } from "../src/core/rpc/schema/external.ts";
+import { RpcGitContextSchema } from "../src/core/rpc/schema/git-context.ts";
 import { RpcPlanningStateChangedEventSchema } from "../src/core/rpc/schema/planning.ts";
 import { RpcWorkflowEventSchema } from "../src/core/rpc/schema/projections.ts";
 import { RPC_RESPONSE_SCHEMAS, RpcErrorResponseSchema } from "../src/core/rpc/schema/responses.ts";
@@ -27,6 +29,7 @@ import { StreamProjector } from "../src/core/rpc/stream-projection.ts";
 import type {
 	RpcConversationBootstrapEvent,
 	RpcExtensionUIRequest,
+	RpcGitContext,
 	RpcHostActionRequest,
 	RpcHostActionUpdate,
 	RpcTranscriptEntryEvent,
@@ -229,6 +232,43 @@ describe("RPC contract emission conformance", () => {
 		expect(Compile(RpcErrorResponseSchema).Errors(coded)).toEqual([]);
 	});
 
+	test("Git context and full-replacement events enforce path-free field bounds", () => {
+		const gitContext: RpcGitContext = {
+			repository: "workspace",
+			head: { kind: "branch", name: "main", oid: "0123456789abcdef0123456789abcdef01234567" },
+			upstream: { ref: "origin/main", ahead: 2, behind: 1 },
+			base: { ref: "main", ahead: 3, behind: 0 },
+			status: {
+				staged: { added: 1, modified: 2, deleted: 3, renamed: 4 },
+				unstaged: { added: 4, modified: 3, deleted: 2, renamed: 1 },
+				untracked: 5,
+				conflicted: 1,
+				total: 12,
+				clean: false,
+			},
+			operation: { kind: "rebase", step: 2, total: 4 },
+			revision: 7,
+			observedAt: "2026-07-29T00:00:00.000Z",
+			stale: false,
+		};
+		expect(check(RpcGitContextSchema, gitContext)).toBe(true);
+		expect(
+			check(RpcGitContextChangedEventSchema, {
+				type: "git_context_changed",
+				gitContext,
+				delivery: { subscriptionId: "sub-1", cursor: 8 },
+			}),
+		).toBe(true);
+		expect(check(RpcGitContextChangedEventSchema, { type: "git_context_changed", gitContext: null })).toBe(true);
+		expect(check(RpcGitContextSchema, { ...gitContext, repository: "r".repeat(257) })).toBe(false);
+		expect(
+			check(RpcGitContextSchema, {
+				...gitContext,
+				head: { kind: "detached", oid: "not-an-object-id" },
+			}),
+		).toBe(false);
+	});
+
 	test("planning events require complete phase-consistent snapshots", () => {
 		const execution = {
 			id: "execution-1",
@@ -288,6 +328,7 @@ describe("RPC contract emission conformance", () => {
 				availableThinkingLevels: ["off", "high"],
 				fastModeEnabled: true,
 				planning: { mode: "build", plan: null },
+				gitContext: null,
 				isStreaming: false,
 				isCompacting: false,
 				steeringMode: "all",
