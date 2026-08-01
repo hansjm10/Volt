@@ -341,8 +341,24 @@ export class IrohRemoteHostEngine {
 	setClientLastSessionIdIfAuthorizationCurrent(
 		authorization: IrohRemoteClientAuthorizationSuccess,
 		sessionId: string,
+		expectedPreviousSessionId: string | undefined,
+		whileAuthorizationLocked?: () => Promise<void>,
 	) {
-		return this.stateManager.setClientLastSessionIdIfAuthorizationCurrent(authorization, sessionId);
+		return this.stateManager.setClientLastSessionIdIfAuthorizationCurrent(
+			authorization,
+			sessionId,
+			expectedPreviousSessionId,
+			whileAuthorizationLocked,
+		);
+	}
+
+	setClientLastSessionIdIfCurrent(
+		nodeId: string,
+		workspace: string,
+		expectedSessionId: string | undefined,
+		nextSessionId: string,
+	): Promise<boolean> {
+		return this.stateManager.setClientLastSessionIdIfCurrent(nodeId, workspace, expectedSessionId, nextSessionId);
 	}
 
 	restoreClientLastSessionIdIfCurrent(

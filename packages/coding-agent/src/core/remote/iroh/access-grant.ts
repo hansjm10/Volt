@@ -228,7 +228,9 @@ export function getIrohRemoteRpcCommandCapabilities(
 			typeof command.config === "object" && command.config !== null && !Array.isArray(command.config)
 				? (command.config as Record<string, unknown>)
 				: undefined;
-		if (config?.model !== undefined || config?.thinkingLevel !== undefined) required.push("model.select.v1");
+		if (config?.model !== undefined || config?.thinkingLevel !== undefined || config?.fastModeEnabled === true) {
+			required.push("model.select.v1");
+		}
 		const placement =
 			typeof command.placement === "object" && command.placement !== null && !Array.isArray(command.placement)
 				? (command.placement as Record<string, unknown>)

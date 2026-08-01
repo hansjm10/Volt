@@ -23,6 +23,8 @@ async function createLaunchFixture(committed = false): Promise<LaunchFixture> {
 	const receipt = manager.appendAgentLaunchReceipt({
 		launchId: "launch-1",
 		requestDigest: "digest-1",
+		clientNodeId: "client-node",
+		previousSessionId: "session-old",
 		request: {
 			launchId: "launch-1",
 			catalogRevision: "revision-1",
@@ -58,6 +60,7 @@ afterEach(async () => {
 });
 
 describe("incomplete agent launch startup reconciliation", () => {
+	const restoreSelection = async () => {};
 	test.each(["returned failure", "thrown failure"])(
 		"retains the receipt after a %s and removes it on a later successful cleanup",
 		async (failureKind) => {
@@ -75,6 +78,7 @@ describe("incomplete agent launch startup reconciliation", () => {
 					sessionFile: fixture.sessionFile,
 					record: fixture.record,
 					removeWorktree: failedRemove,
+					restoreSelection,
 					log,
 				}),
 			).resolves.toEqual({ kind: "cleanup_required", worktreeId: "launch-worktree" });
@@ -100,6 +104,7 @@ describe("incomplete agent launch startup reconciliation", () => {
 					sessionFile: fixture.sessionFile,
 					record: fixture.record,
 					removeWorktree,
+					restoreSelection,
 				}),
 			).resolves.toEqual({ kind: "cleaned" });
 			expect(removeWorktree).toHaveBeenCalledWith(fixture.workspace, "launch-worktree");
@@ -118,6 +123,7 @@ describe("incomplete agent launch startup reconciliation", () => {
 				sessionFile: fixture.sessionFile,
 				record: fixture.record,
 				removeWorktree: unverifiedRemoval,
+				restoreSelection,
 			}),
 		).resolves.toEqual({ kind: "cleanup_required", worktreeId: "launch-worktree" });
 		expect(existsSync(fixture.sessionFile)).toBe(true);
@@ -134,10 +140,58 @@ describe("incomplete agent launch startup reconciliation", () => {
 				sessionFile: fixture.sessionFile,
 				record: fixture.record,
 				removeWorktree: verifiedRemoval,
+				restoreSelection,
 			}),
 		).resolves.toEqual({ kind: "cleaned" });
 		expect(verifiedRemoval).toHaveBeenCalledWith(fixture.workspace, "launch-worktree");
 		expect(existsSync(fixture.sessionFile)).toBe(false);
+	});
+
+	test("releases an existing-worktree reservation without removing its checkout", async () => {
+		const fixture = await createLaunchFixture();
+		fixture.record.receipt.placement = {
+			kind: "worktree",
+			worktreeId: "launch-worktree",
+			branch: "feature/existing",
+			created: false,
+		};
+		const removeWorktree = vi.fn(async () => ({ ok: true as const }));
+		const releaseWorktreeReservation = vi.fn(async () => {});
+
+		await expect(
+			cleanupIncompleteAgentLaunch({
+				workspace: fixture.workspace,
+				sessionId: "agent-session",
+				sessionFile: fixture.sessionFile,
+				record: fixture.record,
+				removeWorktree,
+				releaseWorktreeReservation,
+				restoreSelection: async () => {},
+			}),
+		).resolves.toEqual({ kind: "cleaned" });
+		expect(removeWorktree).not.toHaveBeenCalled();
+		expect(releaseWorktreeReservation).toHaveBeenCalledWith("volt", "launch-worktree", "digest-1", "agent-session");
+	});
+
+	test("does not remove the session file after recovery cancellation", async () => {
+		const fixture = await createLaunchFixture();
+		const controller = new AbortController();
+		controller.abort(new Error("recovery deadline"));
+		const removeWorktree = vi.fn(async () => ({ ok: true as const }));
+
+		await expect(
+			cleanupIncompleteAgentLaunch({
+				workspace: fixture.workspace,
+				sessionId: "agent-session",
+				sessionFile: fixture.sessionFile,
+				record: fixture.record,
+				removeWorktree,
+				restoreSelection: async () => {},
+				signal: controller.signal,
+			}),
+		).rejects.toThrow("recovery deadline");
+		expect(removeWorktree).not.toHaveBeenCalled();
+		expect(existsSync(fixture.sessionFile)).toBe(true);
 	});
 
 	test("leaves committed launch sessions and their worktrees untouched", async () => {
@@ -151,6 +205,7 @@ describe("incomplete agent launch startup reconciliation", () => {
 				sessionFile: fixture.sessionFile,
 				record: fixture.record,
 				removeWorktree,
+				restoreSelection,
 			}),
 		).resolves.toEqual({ kind: "committed" });
 		expect(removeWorktree).not.toHaveBeenCalled();

@@ -13,7 +13,11 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type IrohRemoteAuditEvent, IrohRemoteAuditLogger } from "../src/core/remote/iroh/audit.ts";
-import type { IrohRemoteHostState, IrohRemoteWorkspace } from "../src/core/remote/iroh/state.ts";
+import type {
+	IrohRemoteHostState,
+	IrohRemoteWorkspace,
+	IrohRemoteWorkspaceWorktree,
+} from "../src/core/remote/iroh/state.ts";
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
 import { getDefaultSessionDir, getDefaultSessionDirPath } from "../src/core/session-manager.ts";
 import {
@@ -23,6 +27,7 @@ import {
 	isValidGitRefSyntax,
 	WORKTREE_ID_PATTERN,
 	type WorktreeGitRunner,
+	type WorktreeLaunchBranchReservation,
 	WorktreeManager,
 	WorktreeRetentionSweeper,
 } from "../src/daemon/worktree-manager.ts";
@@ -166,6 +171,43 @@ describe("worktree manager (fake git)", () => {
 		expect(git.calls.at(-1)?.args.slice(0, 2)).toEqual(["worktree", "add"]);
 	});
 
+	it("hides pending launch worktrees until their owner finalizes them", async () => {
+		const launchKey = "a".repeat(64);
+		const baseOid = "b".repeat(40);
+		const git = createFakeGit((args) =>
+			args[0] === "rev-parse" && args[1] === "--verify" ? { ok: true, stdout: `${baseOid}\n` } : { ok: true },
+		);
+		const manager = createManager(git.runGit);
+
+		const created = await manager.create(workspace, {
+			id: "pending-launch",
+			baseRef: "main",
+			launchReservationKey: launchKey,
+			launchSessionId: "agent-session",
+			beforeCreate: () => {},
+		});
+		expect(created.ok).toBe(true);
+		expect(await manager.findWorktree("repo", "pending-launch")).toBeUndefined();
+		expect(await manager.list(workspace)).toEqual([]);
+		expect(await manager.findWorktree("repo", "pending-launch", { includePending: true })).toMatchObject({
+			pendingLaunchKey: launchKey,
+		});
+		await expect(manager.bindSession("repo", "pending-launch", "other-session")).rejects.toThrow("unavailable");
+		await expect(
+			manager.finalizeLaunchWorktree("repo", "pending-launch", launchKey, "other-session"),
+		).rejects.toThrow("ownership changed");
+		await expect(manager.remove(workspace, "pending-launch", { force: true })).resolves.toMatchObject({
+			ok: false,
+			error: "worktree_busy",
+		});
+
+		await manager.bindSession("repo", "pending-launch", "agent-session", launchKey);
+		await manager.finalizeLaunchWorktree("repo", "pending-launch", launchKey, "agent-session");
+		const finalized = await manager.findWorktree("repo", "pending-launch");
+		expect(finalized).toMatchObject({ id: "pending-launch", sessionIds: ["agent-session"] });
+		expect(finalized?.pendingLaunchKey).toBeUndefined();
+	});
+
 	it("does not create a checkout or record when the reservation callback fails", async () => {
 		const git = okGit();
 		const manager = createManager(git.runGit);
@@ -182,9 +224,25 @@ describe("worktree manager (fake git)", () => {
 		expect(await stateManager.listWorktrees("repo")).toEqual([]);
 	});
 
-	it("idempotently removes absent and recordless incomplete-launch checkouts", async () => {
+	it("idempotently removes absent and recordless incomplete-launch checkouts with their branches", async () => {
 		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "incomplete");
+		const branchOid = "a".repeat(40);
+		const branchReservation = {
+			branch: "volt/incomplete",
+			expectedOid: branchOid,
+			ownershipRef: `refs/volt/agent-launches/${"b".repeat(64)}`,
+		};
+		let reserved = false;
 		const git = createFakeGit((args) => {
+			if (args.includes("symbolic-ref")) {
+				return { ok: true, stdout: "volt/incomplete\n" };
+			}
+			if (args[0] === "for-each-ref" && args[2] === branchReservation.ownershipRef) {
+				return { ok: true, stdout: reserved ? `${branchOid}\n` : "" };
+			}
+			if (args[0] === "for-each-ref") {
+				return { ok: true, stdout: `${branchOid}\n` };
+			}
 			if (args[0] === "worktree" && args[1] === "remove") {
 				rmSync(checkout, { recursive: true, force: true });
 			}
@@ -192,17 +250,311 @@ describe("worktree manager (fake git)", () => {
 		});
 		const manager = createManager(git.runGit);
 
-		await expect(manager.removeIncompleteLaunch(workspace, "incomplete")).resolves.toEqual({ ok: true });
-		expect(git.calls).toEqual([]);
+		await expect(
+			manager.removeIncompleteLaunch(workspace, "incomplete", undefined, branchReservation, "agent-session"),
+		).resolves.toEqual({ ok: true });
+		expect(git.calls.some((call) => call.args[0] === "update-ref")).toBe(false);
 
+		reserved = true;
 		mkdirSync(checkout, { recursive: true });
-		await expect(manager.removeIncompleteLaunch(workspace, "incomplete")).resolves.toEqual({ ok: true });
+		await expect(
+			manager.removeIncompleteLaunch(workspace, "incomplete", undefined, branchReservation, "agent-session"),
+		).resolves.toEqual({ ok: true });
 		expect(existsSync(checkout)).toBe(false);
 		expect(git.calls).toContainEqual({
-			args: ["worktree", "remove", "--force", checkout],
+			args: ["update-ref", "--stdin"],
 			cwd: realpathSync(workspaceDir),
 		});
-		expect(git.calls.at(-1)).toEqual({ args: ["worktree", "prune"], cwd: realpathSync(workspaceDir) });
+		expect(git.calls.some(({ args }) => args[0] === "worktree" && args[1] === "remove")).toBe(false);
+		expect(readdirSync(join(getWorktreesRoot(agentDir), "recovery"))).toHaveLength(1);
+	});
+
+	it("finishes state cleanup after refs were durably deleted before record persistence", async () => {
+		const worktreeId = "refs-cleaned";
+		const recoveryPath = join(getWorktreesRoot(agentDir), "recovery", `${worktreeId}-1-abcdef`);
+		const branchReservation = {
+			branch: "volt/refs-cleaned",
+			expectedOid: "a".repeat(40),
+			ownershipRef: `refs/volt/agent-launches/${"c".repeat(64)}`,
+		};
+		const git = createFakeGit((args) => {
+			if (args[0] === "for-each-ref") return { ok: true, stdout: "" };
+			if (args.includes("status")) return { ok: true, stdout: "" };
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+		mkdirSync(recoveryPath, { recursive: true });
+		await stateManager.upsertWorktree({
+			id: worktreeId,
+			workspaceName: workspace.name,
+			path: recoveryPath,
+			branch: branchReservation.branch,
+			pendingLaunchKey: branchReservation.ownershipRef.slice(-64),
+			pendingLaunchSessionId: "agent-session",
+			createdAt: 1,
+			sessionIds: ["agent-session"],
+		});
+
+		await expect(
+			manager.removeIncompleteLaunch(workspace, worktreeId, undefined, branchReservation, "agent-session"),
+		).resolves.toEqual({ ok: true });
+		expect(await stateManager.listWorktrees("repo")).toEqual([]);
+		expect(existsSync(recoveryPath)).toBe(true);
+	});
+
+	it("clears pending ownership but leaves an unreadable post-ref-cleanup recovery unmarked", async () => {
+		const worktreeId = "refs-cleaned-unreadable";
+		const recoveryPath = join(getWorktreesRoot(agentDir), "recovery", `${worktreeId}-1-abcdef`);
+		const branchReservation = {
+			branch: "volt/refs-cleaned-unreadable",
+			expectedOid: "a".repeat(40),
+			ownershipRef: `refs/volt/agent-launches/${"e".repeat(64)}`,
+		};
+		const git = createFakeGit((args) => {
+			if (args[0] === "for-each-ref") return { ok: true, stdout: "" };
+			if (args.includes("status")) return { ok: false, stderr: "invalid gitdir" };
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+		mkdirSync(recoveryPath, { recursive: true });
+		await stateManager.upsertWorktree({
+			id: worktreeId,
+			workspaceName: workspace.name,
+			path: recoveryPath,
+			branch: branchReservation.branch,
+			pendingLaunchKey: branchReservation.ownershipRef.slice(-64),
+			pendingLaunchSessionId: "agent-session",
+			createdAt: 1,
+			sessionIds: ["agent-session"],
+		});
+
+		await expect(
+			manager.removeIncompleteLaunch(workspace, worktreeId, undefined, branchReservation, "agent-session"),
+		).resolves.toEqual({ ok: true });
+		expect(await stateManager.listWorktrees("repo")).toEqual([]);
+		await expect(manager.prune(workspace, { purgeRecovery: true })).resolves.toMatchObject({
+			purgedRecoveryCheckouts: [],
+		});
+		expect(existsSync(recoveryPath)).toBe(true);
+	});
+
+	it("preserves ignored data in an incomplete-launch checkout for manual recovery", async () => {
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "dirty-launch");
+		const expectedOid = "a".repeat(40);
+		const branchReservation = {
+			branch: "volt/dirty-launch",
+			expectedOid,
+			ownershipRef: `refs/volt/agent-launches/${"d".repeat(64)}`,
+		};
+		const git = createFakeGit((args) => {
+			if (args[0] === "for-each-ref") return { ok: true, stdout: `${expectedOid}\n` };
+			if (args.includes("status")) return { ok: true, stdout: "!! .env\n" };
+			return { ok: true, stdout: `${branchReservation.branch}\n` };
+		});
+		const manager = createManager(git.runGit);
+		await stateManager.upsertWorktree({
+			id: "dirty-launch",
+			workspaceName: workspace.name,
+			path: checkout,
+			branch: branchReservation.branch,
+			pendingLaunchKey: branchReservation.ownershipRef.slice(-64),
+			pendingLaunchSessionId: "agent-session",
+			createdAt: 1,
+			sessionIds: ["agent-session"],
+		});
+		mkdirSync(checkout, { recursive: true });
+
+		await expect(
+			manager.removeIncompleteLaunch(workspace, "dirty-launch", undefined, branchReservation, "agent-session"),
+		).resolves.toMatchObject({ ok: false, error: "worktree_dirty" });
+		expect(existsSync(checkout)).toBe(true);
+		expect(await manager.findWorktree("repo", "dirty-launch", { includePending: true })).toBeDefined();
+		expect(git.calls.some((call) => call.args[0] === "update-ref")).toBe(false);
+	});
+
+	it("serializes existing-worktree launch reservation against removal", async () => {
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "existing-launch");
+		const git = createFakeGit((args) => {
+			if (args[0] === "worktree" && args[1] === "add") mkdirSync(checkout, { recursive: true });
+			if (args[0] === "worktree" && args[1] === "remove") rmSync(checkout, { recursive: true, force: true });
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+		await expect(
+			manager.create(workspace, { id: "existing-launch", branch: "feature/existing", baseRef: "main" }),
+		).resolves.toMatchObject({ ok: true });
+		const reservationStarted = createDeferred();
+		const finishReservation = createDeferred();
+		const launchKey = "e".repeat(64);
+		const reserving = manager.reserveWorktreeForLaunch(
+			workspace,
+			"existing-launch",
+			launchKey,
+			"agent-session",
+			async () => {
+				reservationStarted.resolve();
+				await finishReservation.promise;
+			},
+		);
+		await reservationStarted.promise;
+		let removalSettled = false;
+		const removing = manager.remove(workspace, "existing-launch", { force: true }).finally(() => {
+			removalSettled = true;
+		});
+		await Promise.resolve();
+		expect(removalSettled).toBe(false);
+
+		finishReservation.resolve();
+		await expect(reserving).resolves.toMatchObject({ ok: true });
+		await manager.bindSession("repo", "existing-launch", "agent-session", launchKey);
+		await expect(manager.resolveSessionWorktree("repo", "agent-session")).resolves.toBeUndefined();
+		await expect(manager.beginRuntimePreparation("repo", "existing-launch")).rejects.toThrow(
+			"unavailable for runtime preparation",
+		);
+		await expect(removing).resolves.toMatchObject({ ok: false, error: "worktree_busy" });
+		expect(existsSync(checkout)).toBe(true);
+		await manager.releaseLaunchWorktree("repo", "existing-launch", launchKey, "agent-session");
+		expect(await manager.findWorktree("repo", "existing-launch")).toBeDefined();
+	});
+
+	it("fences removal and cold reservation during normal runtime preparation", async () => {
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "preparing-runtime");
+		const git = createFakeGit((args) => {
+			if (args[0] === "worktree" && args[1] === "add") mkdirSync(checkout, { recursive: true });
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "preparing-runtime" });
+		const preparation = await manager.beginRuntimePreparation("repo", "preparing-runtime");
+
+		await expect(manager.remove(workspace, "preparing-runtime", { force: true })).resolves.toMatchObject({
+			ok: false,
+			error: "worktree_busy",
+		});
+		await expect(
+			manager.reserveWorktreeForLaunch(
+				workspace,
+				"preparing-runtime",
+				"a".repeat(64),
+				"agent-session",
+				async () => {},
+			),
+		).resolves.toMatchObject({ ok: false, error: "worktree_busy" });
+		await expect(preparation.publish(() => "published")).resolves.toBe("published");
+	});
+
+	it("rejects an existing-worktree launch reservation with a TUI-owned bound session", async () => {
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "active-launch");
+		const git = createFakeGit((args) => {
+			if (args[0] === "worktree" && args[1] === "add") mkdirSync(checkout, { recursive: true });
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "active-launch" });
+		await manager.bindSession("repo", "active-launch", "active-session");
+		const beforeReserve = vi.fn();
+
+		await expect(
+			manager.reserveWorktreeForLaunch(workspace, "active-launch", "a".repeat(64), "agent-session", beforeReserve),
+		).resolves.toMatchObject({ ok: false, error: "worktree_busy" });
+		expect(beforeReserve).not.toHaveBeenCalled();
+	});
+
+	it("serializes incomplete cleanup against force-remove and same-id recreation", async () => {
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "launch-race");
+		const expectedOid = "a".repeat(40);
+		const branchReservation = {
+			branch: "volt/launch-race",
+			expectedOid,
+			ownershipRef: `refs/volt/agent-launches/${"c".repeat(64)}`,
+		};
+		const cleanupPaused = createDeferred();
+		const finishCleanup = createDeferred();
+		let ownershipExists = true;
+		let branchExists = true;
+		let pauseOwnershipLookup = true;
+		const git = createFakeGit((args) => {
+			if (args[0] === "for-each-ref" && args[2] === branchReservation.ownershipRef) {
+				if (pauseOwnershipLookup) {
+					pauseOwnershipLookup = false;
+					cleanupPaused.resolve();
+				}
+				return { ok: true, stdout: ownershipExists ? `${expectedOid}\n` : "" };
+			}
+			if (args[0] === "for-each-ref") {
+				return { ok: true, stdout: branchExists ? `${expectedOid}\n` : "" };
+			}
+			if (args.includes("symbolic-ref")) {
+				return { ok: true, stdout: `${branchReservation.branch}\n` };
+			}
+			if (args[0] === "update-ref" && args[2] === `refs/heads/${branchReservation.branch}`) {
+				branchExists = false;
+			}
+			if (args[0] === "update-ref" && args[2] === branchReservation.ownershipRef) {
+				ownershipExists = false;
+			}
+			if (args[0] === "worktree" && args[1] === "remove") {
+				rmSync(checkout, { recursive: true, force: true });
+			}
+			if (args[0] === "worktree" && args[1] === "add") {
+				mkdirSync(checkout, { recursive: true });
+			}
+			return { ok: true };
+		});
+		const manager = createManager(async (args, cwd, options) => {
+			if (args[0] === "for-each-ref" && args[2] === branchReservation.ownershipRef && pauseOwnershipLookup) {
+				const result = git.runGit(args, cwd, options);
+				await finishCleanup.promise;
+				return result;
+			}
+			return git.runGit(args, cwd, options);
+		});
+		await stateManager.upsertWorktree({
+			id: "launch-race",
+			workspaceName: workspace.name,
+			path: checkout,
+			branch: branchReservation.branch,
+			pendingLaunchKey: branchReservation.ownershipRef.slice(-64),
+			pendingLaunchSessionId: "agent-session",
+			createdAt: 1,
+			sessionIds: [],
+		});
+		mkdirSync(checkout, { recursive: true });
+
+		const cleaning = manager.removeIncompleteLaunch(
+			workspace,
+			"launch-race",
+			undefined,
+			branchReservation,
+			"agent-session",
+		);
+		await cleanupPaused.promise;
+		let replacementSettled = false;
+		const replacing = manager.remove(workspace, "launch-race", { force: true }).finally(() => {
+			replacementSettled = true;
+		});
+		await Promise.resolve();
+		expect(replacementSettled).toBe(false);
+
+		finishCleanup.resolve();
+		await expect(replacing).resolves.toMatchObject({ ok: false, error: "worktree_busy" });
+		await expect(cleaning).resolves.toEqual({ ok: true });
+		await expect(manager.remove(workspace, "launch-race", { force: true })).resolves.toEqual({
+			ok: false,
+			error: "worktree_not_found",
+		});
+		await expect(
+			manager.create(workspace, {
+				id: "launch-race",
+				branch: "replacement/launch-race",
+				baseRef: "main",
+			}),
+		).resolves.toMatchObject({
+			ok: true,
+			worktree: { id: "launch-race", branch: "replacement/launch-race" },
+		});
+		expect(existsSync(checkout)).toBe(true);
+		expect((await stateManager.listWorktrees("repo"))[0]?.branch).toBe("replacement/launch-race");
 	});
 
 	it("serializes workspace unregister with create through child persistence", async () => {
@@ -607,7 +959,117 @@ describe("worktree manager (fake git)", () => {
 		expect(await stateManager.listWorktrees("repo")).toHaveLength(0);
 	});
 
-	it("refuses to remove a busy worktree unless forced", async () => {
+	it("preserves ignored files during non-force removal", async () => {
+		const git = createFakeGit((args) => (args.includes("status") ? { ok: true, stdout: "!! .env\n" } : { ok: true }));
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "ignored" });
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "ignored");
+		mkdirSync(checkout, { recursive: true });
+
+		await expect(manager.remove(workspace, "ignored")).resolves.toEqual({
+			ok: false,
+			error: "worktree_dirty",
+			detail: "dirty",
+		});
+		expect(git.calls).toContainEqual({
+			args: ["-C", checkout, "--no-optional-locks", "status", "--porcelain", "--ignored=matching"],
+			cwd: realpathSync(workspaceDir),
+		});
+		expect(git.calls.some(({ args }) => args[0] === "worktree" && args[1] === "remove")).toBe(false);
+	});
+
+	it("preserves initialized submodules during non-force removal", async () => {
+		const git = createFakeGit((args) => {
+			if (args.includes("status") && args.includes("submodule")) {
+				return { ok: true, stdout: ` ${"a".repeat(40)} dependencies/nested\n` };
+			}
+			if (args.includes("status")) return { ok: true, stdout: "" };
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "submodule-data" });
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "submodule-data");
+		mkdirSync(checkout, { recursive: true });
+
+		await expect(manager.remove(workspace, "submodule-data")).resolves.toMatchObject({
+			ok: false,
+			error: "worktree_dirty",
+		});
+		expect(existsSync(checkout)).toBe(true);
+		expect(await manager.listRecoveryCheckouts()).toEqual([]);
+	});
+
+	it.each([
+		[40, "dependencies/nested"],
+		[64, "dependencies/nested"],
+		[40, "deps/foo (bar)"],
+	])(
+		"preserves data in uninitialized SHA-%i submodule directory %s during non-force removal",
+		async (oidLength, submodulePath) => {
+			const git = createFakeGit((args) => {
+				if (args.includes("submodule")) {
+					return { ok: true, stdout: `-${"a".repeat(oidLength)} ${submodulePath}\n` };
+				}
+				if (args.includes("status")) return { ok: true, stdout: "" };
+				return { ok: true };
+			});
+			const manager = createManager(git.runGit);
+			await manager.create(workspace, { id: "uninitialized-submodule-data" });
+			const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "uninitialized-submodule-data");
+			const submoduleDirectory = join(checkout, submodulePath);
+			mkdirSync(submoduleDirectory, { recursive: true });
+			writeFileSync(join(submoduleDirectory, ".env"), "secret");
+
+			await expect(manager.remove(workspace, "uninitialized-submodule-data")).resolves.toMatchObject({
+				ok: false,
+				error: "worktree_dirty",
+			});
+			expect(existsSync(submoduleDirectory)).toBe(true);
+			expect(await manager.listRecoveryCheckouts()).toEqual([]);
+		},
+	);
+
+	it("quarantines ignored data created concurrently with non-force removal", async () => {
+		let statusCalls = 0;
+		const git = createFakeGit((args) => {
+			if (args.includes("submodule")) return { ok: true, stdout: "" };
+			if (!args.includes("status")) return { ok: true };
+			statusCalls += 1;
+			return { ok: true, stdout: statusCalls === 1 ? "" : "!! .env\n" };
+		});
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "raced-ignored" });
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "raced-ignored");
+		mkdirSync(checkout, { recursive: true });
+
+		await expect(manager.remove(workspace, "raced-ignored")).resolves.toMatchObject({
+			ok: false,
+			error: "worktree_dirty",
+		});
+		expect(existsSync(checkout)).toBe(false);
+		const recoveries = await manager.listRecoveryCheckouts();
+		expect(recoveries).toHaveLength(1);
+		expect((await stateManager.listWorktrees("repo"))[0]?.path).toBe(recoveries[0]);
+	});
+
+	it("explicitly purges unowned recovery checkouts", async () => {
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "clean-recovery");
+		const git = createFakeGit((args) => {
+			if (args[0] === "worktree" && args[1] === "add") mkdirSync(checkout, { recursive: true });
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "clean-recovery" });
+		await expect(manager.remove(workspace, "clean-recovery")).resolves.toEqual({ ok: true });
+		expect(await manager.listRecoveryCheckouts()).toHaveLength(1);
+
+		await expect(manager.prune(workspace, { purgeRecovery: true })).resolves.toMatchObject({
+			purgedRecoveryCheckouts: [expect.stringContaining("clean-recovery-")],
+		});
+		expect(await manager.listRecoveryCheckouts()).toEqual([]);
+	});
+
+	it("refuses to remove an active worktree even when forced", async () => {
 		const git = okGit();
 		const busySessions = new Set(["s-live"]);
 		const manager = createManager(git.runGit, {
@@ -619,7 +1081,19 @@ describe("worktree manager (fake git)", () => {
 		mkdirSync(getWorktreeCheckoutPath(agentDir, workspaceDir, "busy"), { recursive: true });
 
 		expect(await manager.remove(workspace, "busy")).toEqual({ ok: false, error: "worktree_busy" });
-		expect(await manager.remove(workspace, "busy", { force: true })).toEqual({ ok: true });
+		expect(await manager.remove(workspace, "busy", { force: true })).toEqual({
+			ok: false,
+			error: "worktree_busy",
+		});
+		busySessions.clear();
+		expect(await manager.remove(workspace, "busy", { force: true })).toEqual({
+			ok: false,
+			error: "worktree_busy",
+		});
+
+		await manager.create(workspace, { id: "unbound-force" });
+		mkdirSync(getWorktreeCheckoutPath(agentDir, workspaceDir, "unbound-force"), { recursive: true });
+		expect(await manager.remove(workspace, "unbound-force", { force: true })).toEqual({ ok: true });
 	});
 
 	it("returns worktree_not_found for unknown ids", async () => {
@@ -648,6 +1122,40 @@ describe("worktree manager (fake git)", () => {
 		expect(quarantined).toHaveLength(1);
 		expect(existsSync(join(workspaceWorktreesDir, quarantined[0] ?? "", "keep.txt"))).toBe(true);
 		expect(git.calls.at(-1)).toEqual({ args: ["worktree", "prune"], cwd: realpathSync(workspaceDir) });
+	});
+
+	it("serializes prune against a newly created worktree generation", async () => {
+		const pruneStarted = createDeferred();
+		const finishPrune = createDeferred();
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "after-prune");
+		let pausePrune = true;
+		const git = createFakeGit((args) => {
+			if (args[0] === "worktree" && args[1] === "add") mkdirSync(checkout, { recursive: true });
+			return { ok: true };
+		});
+		const manager = createManager(async (args, cwd, options) => {
+			if (args[0] === "worktree" && args[1] === "prune" && pausePrune) {
+				pausePrune = false;
+				pruneStarted.resolve();
+				await finishPrune.promise;
+			}
+			return git.runGit(args, cwd, options);
+		});
+
+		const pruning = manager.prune(workspace);
+		await pruneStarted.promise;
+		let createSettled = false;
+		const creating = manager.create(workspace, { id: "after-prune", baseRef: "main" }).finally(() => {
+			createSettled = true;
+		});
+		await Promise.resolve();
+		expect(createSettled).toBe(false);
+
+		finishPrune.resolve();
+		await expect(pruning).resolves.toEqual({ removedRecords: [], orphanCheckouts: [] });
+		await expect(creating).resolves.toMatchObject({ ok: true, worktree: { id: "after-prune" } });
+		expect(existsSync(checkout)).toBe(true);
+		expect(await stateManager.listWorktrees("repo")).toHaveLength(1);
 	});
 
 	it("cancels an in-flight git prune without publishing a successful startup audit", async () => {
@@ -813,6 +1321,7 @@ describe("worktree manager (fake git)", () => {
 		const busySessions = new Set<string>();
 		const manager = createManager(git.runGit, {
 			hasActiveRuntimeForSession: (_workspaceName, sessionId) => busySessions.has(sessionId),
+			reserveSessionsForRemoval: () => () => {},
 		});
 		expect((await manager.create(workspace, { id: "ttl", baseRef: "main" })).ok).toBe(true);
 		await manager.bindSession("repo", "ttl", "s-ttl");
@@ -840,7 +1349,6 @@ describe("worktree manager (fake git)", () => {
 		behaviors.merged = true;
 
 		expect(await manager.removeIfCleanAndMerged(workspace, "ttl")).toEqual({ removed: true });
-		expect(await stateManager.listWorktrees("repo")).toHaveLength(0);
 		expect(await manager.removeIfCleanAndMerged(workspace, "ttl")).toEqual({
 			removed: false,
 			reason: "worktree_not_found",
@@ -1045,6 +1553,127 @@ describe("worktree manager (real git integration)", () => {
 			expect(existsSync(created.worktree.path)).toBe(false);
 			expect(git(["worktree", "list", "--porcelain"])).not.toContain("feature-x");
 			expect(await stateManager.listWorktrees("repo")).toHaveLength(0);
+		} finally {
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("removes an interrupted launch branch so the identical worktree request can retry", async () => {
+		const agentDir = realpathSync(mkdtempSync(join(tmpdir(), "volt-worktree-git-retry-")));
+		const repoDir = join(agentDir, "repo");
+		mkdirSync(repoDir, { recursive: true });
+		try {
+			const git = (args: string[], cwd: string = repoDir) =>
+				execFileSync("git", args, {
+					cwd,
+					encoding: "utf8",
+					env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+				});
+			git(["init", "--initial-branch=main"]);
+			git(["config", "user.email", "test@example.com"]);
+			git(["config", "user.name", "Test"]);
+			writeFileSync(join(repoDir, "readme.md"), "hello\n");
+			git(["add", "readme.md"]);
+			git(["commit", "-m", "init"]);
+
+			const stateManager = new IrohRemoteHostStateManager({
+				initialState: { workspaces: [{ name: "repo", path: repoDir }], worktrees: [], clients: [] },
+			});
+			const workspace: IrohRemoteWorkspace = { name: "repo", path: repoDir };
+			const manager = new WorktreeManager({
+				agentDir,
+				stateManager,
+				auditLogger: new IrohRemoteAuditLogger(),
+			});
+			let branchReservation: WorktreeLaunchBranchReservation | undefined;
+			const createOptions = {
+				id: "retry-launch",
+				branch: "agent/retry-launch",
+				baseRef: "main",
+				launchReservationKey: "a".repeat(64),
+				launchSessionId: "agent-session",
+				beforeCreate: (_worktree: IrohRemoteWorkspaceWorktree, reservation?: WorktreeLaunchBranchReservation) => {
+					branchReservation = reservation;
+				},
+			};
+
+			const interrupted = await manager.create(workspace, createOptions);
+			expect(interrupted.ok).toBe(true);
+			if (!interrupted.ok) {
+				return;
+			}
+			expect(
+				await manager.removeIncompleteLaunch(
+					workspace,
+					createOptions.id,
+					undefined,
+					branchReservation,
+					"agent-session",
+				),
+			).toEqual({ ok: true });
+			expect(existsSync(interrupted.worktree.path)).toBe(false);
+			expect(git(["branch", "--list", "agent/retry-launch"]).trim()).toBe("");
+
+			const retried = await manager.create(workspace, createOptions);
+			expect(retried.ok).toBe(true);
+			if (retried.ok) {
+				expect(git(["rev-parse", "--abbrev-ref", "HEAD"], retried.worktree.path).trim()).toBe("agent/retry-launch");
+			}
+
+			// Crash boundary: the atomic ref reservation committed, but no checkout
+			// or daemon record exists yet. The durable ownership ref still makes the
+			// launch branch safe to identify and remove.
+			const branchOnlyOid = git(["rev-parse", "HEAD"]).trim();
+			const branchOnlyReservation: WorktreeLaunchBranchReservation = {
+				branch: "agent/branch-only",
+				expectedOid: branchOnlyOid,
+				ownershipRef: `refs/volt/agent-launches/${"c".repeat(64)}`,
+			};
+			git(["update-ref", `refs/heads/${branchOnlyReservation.branch}`, branchOnlyOid]);
+			git(["update-ref", branchOnlyReservation.ownershipRef, branchOnlyOid]);
+			expect(
+				await manager.removeIncompleteLaunch(
+					workspace,
+					"branch-only",
+					undefined,
+					branchOnlyReservation,
+					"agent-session",
+				),
+			).toEqual({ ok: true });
+			expect(git(["branch", "--list", branchOnlyReservation.branch]).trim()).toBe("");
+			expect(git(["for-each-ref", "--format=%(refname)", branchOnlyReservation.ownershipRef]).trim()).toBe("");
+
+			const branchOnlyRetry = await manager.create(workspace, {
+				id: "branch-only",
+				branch: branchOnlyReservation.branch,
+				baseRef: "main",
+				launchReservationKey: "c".repeat(64),
+				beforeCreate: () => {},
+			});
+			expect(branchOnlyRetry.ok).toBe(true);
+
+			git(["branch", "preexisting", "main"]);
+			let conflictReservation: WorktreeLaunchBranchReservation | undefined;
+			const conflict = await manager.create(workspace, {
+				id: "branch-conflict",
+				branch: "preexisting",
+				baseRef: "main",
+				launchReservationKey: "d".repeat(64),
+				beforeCreate: (_worktree, reservation) => {
+					conflictReservation = reservation;
+				},
+			});
+			expect(conflict.ok).toBe(false);
+			expect(
+				await manager.removeIncompleteLaunch(
+					workspace,
+					"branch-conflict",
+					undefined,
+					conflictReservation,
+					"agent-session",
+				),
+			).toEqual({ ok: true });
+			expect(git(["rev-parse", "preexisting"]).trim()).toBe(branchOnlyOid);
 		} finally {
 			rmSync(agentDir, { recursive: true, force: true });
 		}

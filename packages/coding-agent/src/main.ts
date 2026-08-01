@@ -177,6 +177,14 @@ type ResolvedSession =
 	| { type: "global"; path: string; cwd: string } // Found in different project
 	| { type: "not_found"; arg: string }; // Not found anywhere
 
+function openOrdinarySession(path: string, sessionDir?: string): SessionManager {
+	const manager = SessionManager.open(path, sessionDir);
+	if (manager.getAgentLaunchRecords().some((record) => record.commit === undefined)) {
+		throw new Error("Session is reserved for incomplete agent launch recovery");
+	}
+	return manager;
+}
+
 /**
  * Resolve a session argument to a file path.
  * If it looks like a path, use as-is. Otherwise try to match as session ID prefix.
@@ -188,6 +196,7 @@ async function findLocalSessionByExactId(
 ): Promise<{ type: "local"; path: string } | undefined> {
 	const localSessions = await SessionManager.list(cwd, sessionDir, undefined, {
 		includeMessageFreeDurable: true,
+		includeUncommittedAgentLaunch: true,
 	});
 	const localMatch = localSessions.find((s) => s.id === sessionId);
 	return localMatch ? { type: "local", path: localMatch.path } : undefined;
@@ -337,7 +346,7 @@ async function createSessionManager(
 		switch (resolved.type) {
 			case "path":
 			case "local":
-				return SessionManager.open(resolved.path, sessionDir);
+				return openOrdinarySession(resolved.path, sessionDir);
 
 			case "global": {
 				console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
@@ -379,7 +388,7 @@ async function createSessionManager(
 	if (parsed.sessionId) {
 		const existingSession = await findLocalSessionByExactId(parsed.sessionId, cwd, sessionDir);
 		if (existingSession) {
-			return SessionManager.open(existingSession.path, sessionDir);
+			return openOrdinarySession(existingSession.path, sessionDir);
 		}
 	}
 

@@ -129,10 +129,27 @@ const CREATE_AGENT_VALIDATOR = Compile(RPC_COMMAND_SCHEMAS.create_agent);
 export async function createIrohRemoteAgentLaunchOptions(
 	workspaceName: string,
 	services: AgentSessionServices,
+	signal?: AbortSignal,
 ): Promise<IrohRemoteAgentLaunchOptions> {
 	services.modelRegistry.refreshFromDisk();
 	const providers = new Set(services.modelRegistry.getAll().map((model) => model.provider));
-	await Promise.all(Array.from(providers, (provider) => services.modelRegistry.getApiKeyForProvider(provider)));
+	signal?.throwIfAborted();
+	const providerRefresh = Promise.all(
+		Array.from(providers, (provider) => services.modelRegistry.getApiKeyForProvider(provider)),
+	);
+	if (signal) {
+		await new Promise<void>((resolve, reject) => {
+			const onAbort = () => reject(signal.reason);
+			if (signal.aborted) {
+				onAbort();
+			} else {
+				signal.addEventListener("abort", onAbort, { once: true });
+			}
+			providerRefresh.then(() => resolve(), reject).finally(() => signal.removeEventListener("abort", onAbort));
+		});
+	} else {
+		await providerRefresh;
+	}
 	// OAuth refresh can alter provider model metadata (for example a subscription
 	// endpoint). Rebuild once after every provider refresh before serializing.
 	services.modelRegistry.refresh();

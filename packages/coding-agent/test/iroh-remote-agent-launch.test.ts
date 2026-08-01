@@ -157,6 +157,13 @@ describe("agent_launch.v1 RPC", () => {
 			getIrohRemoteRpcCommandCapabilities({
 				type: "create_agent",
 				...request,
+				config: { ...request.config, fastModeEnabled: true },
+			} as never),
+		).toEqual(["conversation.control.v1", "model.select.v1"]);
+		expect(
+			getIrohRemoteRpcCommandCapabilities({
+				type: "create_agent",
+				...request,
 				placement: { kind: "new_worktree" },
 				config: {
 					model: { provider: "test", modelId: "model" },

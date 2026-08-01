@@ -31,8 +31,8 @@ Commands:
                                 List daemon-managed worktrees.
   worktree remove <id> [--workspace <name>] [--force]
                                 Remove a worktree (refuses dirty/busy without --force).
-  worktree prune [--workspace <name>]
-                                Reconcile worktree records against the filesystem.
+  worktree prune [--workspace <name>] [--purge-recovery]
+                                Reconcile records; explicitly purge unowned recovery checkouts.
   worktree diff <id> [--workspace <name>]
                                 Show the worktree branch's diff against its base ref.
 
@@ -723,9 +723,11 @@ async function handleWorktreeCommand(args: string[]): Promise<void> {
 			console.error(`removed worktree ${worktreeId}`);
 			return;
 		}
+		const purgeRecovery = rest.includes("--purge-recovery");
 		const response = await session.client.request({
 			type: "worktree_prune",
 			...(workspaceName === undefined ? {} : { workspaceName }),
+			...(purgeRecovery ? { purgeRecovery } : {}),
 		});
 		if (reportControlError(response, "worktree prune")) {
 			return;
@@ -738,7 +740,8 @@ async function handleWorktreeCommand(args: string[]): Promise<void> {
 		for (const result of response.results) {
 			console.error(
 				`${result.workspaceName}: removed ${result.removedRecords.length} record(s), ` +
-					`quarantined ${result.orphanCheckouts.length} orphan checkout(s)`,
+					`quarantined ${result.orphanCheckouts.length} orphan checkout(s), ` +
+					`purged ${result.purgedRecoveryCheckouts?.length ?? 0} recovery checkout(s)`,
 			);
 		}
 	} finally {

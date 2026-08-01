@@ -66,5 +66,32 @@ describe("detached agent launch publication", () => {
 		expect(broker.lookup("volt", "agent-session")).toMatchObject({ state: "unowned", pendingDaemonAttaches: 1 });
 		broker.abortDaemonAttach(attach.claim);
 		expect(broker.lookup("volt", "agent-session")).toBeUndefined();
+
+		const pendingDispose = vi.fn(async () => {});
+		const pendingRuntime = {
+			session: createTestSession("pending-session", null),
+			dispose: pendingDispose,
+		} as unknown as AgentSessionRuntime;
+		const pendingAttach = broker.beginDaemonAttach("volt", "pending-session");
+		if (pendingAttach.kind !== "proceed") throw new Error("expected pending launch daemon attach claim");
+		const pendingEntry = await registry.registerDetachedRuntime({
+			clientNodeId: "client-node",
+			workspaceName: "volt",
+			sessionId: "pending-session",
+			runtime: pendingRuntime,
+			toolPolicy: { tools: ["read"], allowUnlistedExtensionTools: false },
+			daemonAttachClaim: pendingAttach.claim,
+			launchPending: true,
+		});
+		expect(pendingEntry.detachedRuntimeRetention).toBeUndefined();
+		const attachClaim = pendingEntry.coordinator.createAttachClaim("client-node");
+		expect(() => registry.assertEntryAttachable(pendingEntry, attachClaim)).toThrow(
+			"conversation runtime ownership changed during attach",
+		);
+		registry.finalizeDetachedRuntimeLaunch(pendingEntry);
+		expect(pendingEntry.detachedRuntimeRetention).toBeDefined();
+		expect(() => registry.assertEntryAttachable(pendingEntry, attachClaim)).not.toThrow();
+		await registry.stopEntry(pendingEntry, "test_cleanup");
+		expect(pendingDispose).toHaveBeenCalledOnce();
 	});
 });

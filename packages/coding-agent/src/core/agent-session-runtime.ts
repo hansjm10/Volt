@@ -93,6 +93,7 @@ export interface AgentSessionReplacementTransaction {
 export interface AgentSessionReplacementTarget {
 	previousSessionId: string;
 	sessionId: string;
+	cwd?: string;
 }
 
 /**
@@ -725,7 +726,11 @@ export class AgentSessionRuntime {
 		try {
 			await this.abortAndJoinRecoveredClientInputs(this.session);
 			this.assertStructuralOperationCurrent(options.operation);
-			const transaction = await this.prepareSessionReplacement?.({ previousSessionId, sessionId });
+			const transaction = await this.prepareSessionReplacement?.({
+				previousSessionId,
+				sessionId,
+				cwd: options.sessionManager.getCwd(),
+			});
 			let invalidated = false;
 			let created: CreateAgentSessionRuntimeResult | undefined;
 			let applied = false;

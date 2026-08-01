@@ -86,7 +86,7 @@ describe("agent launch session selection state", () => {
 		});
 
 		await expect(
-			stateManager.setClientLastSessionIdIfAuthorizationCurrent(authorization, "session-new"),
+			stateManager.setClientLastSessionIdIfAuthorizationCurrent(authorization, "session-new", "session-old"),
 		).rejects.toThrow("save failed");
 		expect((await stateManager.getClient("client-node"))?.lastSessionIdByWorkspace).toEqual({
 			volt: "session-old",
@@ -100,7 +100,7 @@ describe("agent launch session selection state", () => {
 		await stateManager.updateClientAccess("client-node", RPC_GRANT.revision, createIrohRemotePresetAccess("coding"));
 
 		await expect(
-			stateManager.setClientLastSessionIdIfAuthorizationCurrent(authorization, "session-new"),
+			stateManager.setClientLastSessionIdIfAuthorizationCurrent(authorization, "session-new", "session-old"),
 		).resolves.toEqual({ ok: false, reason: "authorization_changed" });
 		expect((await stateManager.getClient("client-node"))?.lastSessionIdByWorkspace).toEqual({
 			volt: "session-old",
@@ -112,7 +112,11 @@ describe("agent launch session selection state", () => {
 		const authorization = createAuthorization(state);
 		const stateManager = new IrohRemoteHostStateManager({ initialState: state });
 
-		const selected = await stateManager.setClientLastSessionIdIfAuthorizationCurrent(authorization, "session-new");
+		const selected = await stateManager.setClientLastSessionIdIfAuthorizationCurrent(
+			authorization,
+			"session-new",
+			"session-old",
+		);
 		expect(selected).toMatchObject({ ok: true, previousSessionId: "session-old" });
 		await expect(
 			stateManager.restoreClientLastSessionIdIfCurrent("client-node", "volt", "session-other", "session-old"),

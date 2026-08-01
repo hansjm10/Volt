@@ -205,14 +205,23 @@ export interface PlanningStateChangeEntry extends SessionEntryBase {
 	planning: PlanningState;
 }
 
+export interface AgentLaunchBranchReservation {
+	branch: string;
+	expectedOid: string;
+	ownershipRef: string;
+}
+
 /** Durable host-only reservation for an idempotent cold agent launch. */
 export interface AgentLaunchReceiptEntry extends SessionEntryBase {
 	type: "agent_launch_receipt";
 	launchId: string;
 	requestDigest: string;
+	clientNodeId: string;
+	previousSessionId: string | null;
 	request: IrohRemoteCreateAgentRequest;
 	placement: IrohRemoteAgentLaunchResolvedPlacement;
 	config: IrohRemoteAgentLaunchConfiguredConfig;
+	branchReservation?: AgentLaunchBranchReservation;
 }
 
 /** Durable terminal publication for a cold agent launch reservation. */
@@ -1270,6 +1279,70 @@ function sessionCwdMatches(cwd: string | undefined, resolvedCwd: string): boolea
 }
 
 /** Exported for testing */
+function hasUncommittedAgentLaunch(filePath: string): boolean {
+	const receiptIds = new Set<string>();
+	const committedReceiptIds = new Set<string>();
+	let fd: number | undefined;
+	try {
+		const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+		fd = openSync(filePath, constants.O_RDONLY | noFollow);
+		const decoder = new StringDecoder("utf8");
+		const chunk = Buffer.allocUnsafe(64 * 1024);
+		let pending = "";
+		let totalBytes = 0;
+		let sawHeader = false;
+		const currentDecision = () => [...receiptIds].some((receiptId) => !committedReceiptIds.has(receiptId));
+		const processLine = (line: string): boolean | undefined => {
+			const type = /"type"\s*:\s*"([^"]+)"/.exec(line)?.[1];
+			if (!sawHeader) {
+				if (type !== "session") return true;
+				sawHeader = true;
+				return undefined;
+			}
+			if (type !== "agent_launch_receipt" && type !== "agent_launch_commit") {
+				if (receiptIds.size === 0 || !currentDecision()) return false;
+				return undefined;
+			}
+			const entry = parseSessionEntryLine(line.replace(/\r$/, ""));
+			if (!entry) return true;
+			if (entry.type === "agent_launch_receipt") receiptIds.add(entry.id);
+			if (entry.type === "agent_launch_commit") committedReceiptIds.add(entry.receiptId);
+			if (receiptIds.size > 32 || committedReceiptIds.size > 32) return true;
+			return undefined;
+		};
+		while (true) {
+			const bytesRead = readSync(fd, chunk, 0, chunk.length, null);
+			if (bytesRead === 0) break;
+			totalBytes += bytesRead;
+			if (totalBytes > 8 * 1024 * 1024) return true;
+			let text = decoder.write(chunk.subarray(0, bytesRead));
+			while (text.length > 0) {
+				const newline = text.indexOf("\n");
+				pending += newline < 0 ? text : text.slice(0, newline);
+				text = newline < 0 ? "" : text.slice(newline + 1);
+				if (newline >= 0) {
+					const decision = processLine(pending);
+					if (decision !== undefined) return decision;
+					pending = "";
+				} else if (pending.length > 64 * 1024) {
+					const decision = processLine(pending);
+					return decision ?? true;
+				}
+			}
+		}
+		pending += decoder.end();
+		if (pending.length > 0) {
+			const decision = processLine(pending);
+			if (decision !== undefined) return decision;
+		}
+		return currentDecision();
+	} catch {
+		return true;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
+
 export function findMostRecentSession(sessionDir: string, cwd?: string): string | null {
 	const resolvedSessionDir = normalizePath(sessionDir);
 	const resolvedCwd = cwd ? resolvePath(cwd) : undefined;
@@ -1287,7 +1360,10 @@ export function findMostRecentSession(sessionDir: string, cwd?: string): string 
 			.map(({ path }) => ({ path, mtime: statSync(path).mtime }))
 			.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
 
-		return files[0]?.path || null;
+		for (const file of files) {
+			if (!hasUncommittedAgentLaunch(file.path)) return file.path;
+		}
+		return null;
 	} catch {
 		return null;
 	}
@@ -1438,8 +1514,70 @@ export function summarizeSessionEntries(entries: Iterable<SessionEntry>): Sessio
 	};
 }
 
-async function buildSessionInfo(filePath: string, includeMessageFreeDurable = false): Promise<SessionInfo | null> {
+interface AgentLaunchRecoverySession {
+	id: string;
+	path: string;
+	records: AgentLaunchRecord[];
+}
+
+async function readAgentLaunchRecoverySession(
+	filePath: string,
+	signal: AbortSignal,
+): Promise<AgentLaunchRecoverySession | undefined> {
+	signal.throwIfAborted();
+	hardenPrivateRegularFileSync(filePath);
+	let header: SessionHeader | undefined;
+	const receipts: AgentLaunchReceiptEntry[] = [];
+	const commits: AgentLaunchCommitEntry[] = [];
+	const processEntry = (entry: FileEntry): void => {
+		if (!header) {
+			if (entry.type !== "session") throw new Error(`Invalid session header in ${filePath}`);
+			header = entry;
+		} else if (entry.type === "agent_launch_receipt") {
+			receipts.push(entry);
+		} else if (entry.type === "agent_launch_commit") {
+			commits.push(entry);
+		}
+	};
+	const stream = createReadStream(filePath, { encoding: "utf8", signal });
+	let pending = "";
+	for await (const chunk of stream) {
+		signal.throwIfAborted();
+		pending += chunk;
+		let newline = pending.indexOf("\n");
+		while (newline >= 0) {
+			const line = pending.slice(0, newline).replace(/\r$/, "");
+			pending = pending.slice(newline + 1);
+			const entry = parseSessionEntryLine(line);
+			if (!entry) throw new Error(`Invalid committed session entry in ${filePath}`);
+			processEntry(entry);
+			newline = pending.indexOf("\n");
+		}
+	}
+	if (pending.length > 0) {
+		const finalEntry = parseSessionEntryLine(pending.replace(/\r$/, ""));
+		if (finalEntry) processEntry(finalEntry);
+	}
+	if (!header || receipts.length === 0) return undefined;
+	const records = receipts.map((receipt) => {
+		if (receipts.filter((candidate) => candidate.launchId === receipt.launchId).length !== 1) {
+			throw new Error(`Agent launch ${JSON.stringify(receipt.launchId)} has conflicting durable receipts`);
+		}
+		const matchingCommits = commits.filter((commit) => commit.receiptId === receipt.id);
+		if (matchingCommits.length > 1) {
+			throw new Error(`Agent launch ${JSON.stringify(receipt.launchId)} has conflicting durable commits`);
+		}
+		return {
+			receipt: structuredClone(receipt),
+			...(matchingCommits[0] === undefined ? {} : { commit: structuredClone(matchingCommits[0]) }),
+		};
+	});
+	return { id: header.id, path: filePath, records };
+}
+
+async function buildSessionInfo(filePath: string, options: SessionListOptions = {}): Promise<SessionInfo | null> {
 	try {
+		options.signal?.throwIfAborted();
 		hardenPrivateRegularFileSync(filePath);
 		const stats = await stat(filePath);
 		let header: SessionHeader | null = null;
@@ -1447,11 +1585,12 @@ async function buildSessionInfo(filePath: string, includeMessageFreeDurable = fa
 		let name: string | undefined;
 
 		const rl = createInterface({
-			input: createReadStream(filePath, { encoding: "utf8" }),
+			input: createReadStream(filePath, { encoding: "utf8", signal: options.signal }),
 			crlfDelay: Infinity,
 		});
 
 		for await (const line of rl) {
+			options.signal?.throwIfAborted();
 			const entry = parseSessionEntryLine(line);
 			if (!entry) continue;
 
@@ -1474,6 +1613,15 @@ async function buildSessionInfo(filePath: string, includeMessageFreeDurable = fa
 		if (!header) return null;
 
 		const summary = summarizeSessionEntries(entries);
+		const committedLaunchReceiptIds = new Set(
+			entries.filter((entry) => entry.type === "agent_launch_commit").map((entry) => entry.receiptId),
+		);
+		const hasUncommittedAgentLaunch = entries.some(
+			(entry) => entry.type === "agent_launch_receipt" && !committedLaunchReceiptIds.has(entry.id),
+		);
+		if (hasUncommittedAgentLaunch && !options.includeUncommittedAgentLaunch) {
+			return null;
+		}
 		// A client-input receipt must be durable before admission, but that private
 		// recovery boundary must not materialize an otherwise nonexistent
 		// conversation in session selectors. Keep the file available for explicit
@@ -1482,7 +1630,10 @@ async function buildSessionInfo(filePath: string, includeMessageFreeDurable = fa
 		if (summary.messageCount === 0) {
 			const hasFastModePolicy = entries.some((entry) => entry.type === "fast_mode_change");
 			const hasPrivateClientInputWal = entries.some(isClientInputWalEntry);
-			if ((hasFastModePolicy && !includeMessageFreeDurable) || (!hasFastModePolicy && hasPrivateClientInputWal)) {
+			if (
+				(hasFastModePolicy && !options.includeMessageFreeDurable) ||
+				(!hasFastModePolicy && hasPrivateClientInputWal)
+			) {
 				return null;
 			}
 		}
@@ -1511,6 +1662,7 @@ async function buildSessionInfo(filePath: string, includeMessageFreeDurable = fa
 			allMessagesText: summary.allMessagesText,
 		};
 	} catch {
+		options.signal?.throwIfAborted();
 		return null;
 	}
 }
@@ -1519,6 +1671,8 @@ export type SessionListProgress = (loaded: number, total: number) => void;
 
 export interface SessionListOptions {
 	includeMessageFreeDurable?: boolean;
+	includeUncommittedAgentLaunch?: boolean;
+	signal?: AbortSignal;
 }
 
 const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
@@ -1526,19 +1680,20 @@ const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
 async function buildSessionInfosWithConcurrency(
 	files: string[],
 	onLoaded: () => void,
-	includeMessageFreeDurable = false,
+	options: SessionListOptions = {},
 ): Promise<(SessionInfo | null)[]> {
 	const results: (SessionInfo | null)[] = new Array(files.length).fill(null);
 	const inFlight = new Set<Promise<void>>();
 	let nextIndex = 0;
 
 	const startNext = (): void => {
+		options.signal?.throwIfAborted();
 		const index = nextIndex++;
 		const file = files[index];
 		if (!file) return;
 
 		let task: Promise<void>;
-		task = buildSessionInfo(file, includeMessageFreeDurable)
+		task = buildSessionInfo(file, options)
 			.then((info) => {
 				results[index] = info;
 			})
@@ -1553,11 +1708,13 @@ async function buildSessionInfosWithConcurrency(
 	};
 
 	while (nextIndex < files.length || inFlight.size > 0) {
+		options.signal?.throwIfAborted();
 		while (nextIndex < files.length && inFlight.size < MAX_CONCURRENT_SESSION_INFO_LOADS) {
 			startNext();
 		}
 		if (inFlight.size > 0) {
 			await Promise.race(inFlight);
+			options.signal?.throwIfAborted();
 		}
 	}
 
@@ -1569,9 +1726,10 @@ async function listSessionsFromDir(
 	onProgress?: SessionListProgress,
 	progressOffset = 0,
 	progressTotal?: number,
-	includeMessageFreeDurable = false,
+	options: SessionListOptions = {},
 ): Promise<SessionInfo[]> {
 	const sessions: SessionInfo[] = [];
+	options.signal?.throwIfAborted();
 	if (!existsSync(dir)) {
 		return sessions;
 	}
@@ -1589,7 +1747,7 @@ async function listSessionsFromDir(
 				loaded++;
 				onProgress?.(progressOffset + loaded, total);
 			},
-			includeMessageFreeDurable,
+			options,
 		);
 		for (const info of results) {
 			if (info) {
@@ -1597,6 +1755,7 @@ async function listSessionsFromDir(
 			}
 		}
 	} catch {
+		options.signal?.throwIfAborted();
 		// Return empty list on error
 	}
 
@@ -1836,7 +1995,7 @@ export class SessionManager {
 
 	/**
 	 * Durably correct the cwd of a write-ahead cold-launch reservation after its
-	 * managed worktree exists. This is intentionally unavailable once any
+	 * managed worktree placement is reserved. This is intentionally unavailable once any
 	 * conversation/config entry or launch commit has been appended.
 	 */
 	relocateUncommittedAgentLaunch(cwd: string, launchId: string): void {
@@ -1847,7 +2006,6 @@ export class SessionManager {
 			!record ||
 			record.commit !== undefined ||
 			record.receipt.placement.kind !== "worktree" ||
-			!record.receipt.placement.created ||
 			receipts.length !== 1 ||
 			receipts[0]?.launchId !== launchId ||
 			this.fileEntries.some((entry) => entry.type !== "session" && entry.type !== "agent_launch_receipt")
@@ -2525,9 +2683,12 @@ export class SessionManager {
 	appendAgentLaunchReceipt(input: {
 		launchId: string;
 		requestDigest: string;
+		clientNodeId: string;
+		previousSessionId: string | null;
 		request: IrohRemoteCreateAgentRequest;
 		placement: IrohRemoteAgentLaunchResolvedPlacement;
 		config: IrohRemoteAgentLaunchConfiguredConfig;
+		branchReservation?: AgentLaunchBranchReservation;
 	}): AgentLaunchReceiptEntry {
 		this._assertPersistenceHealthy();
 		const existing = this.getAgentLaunchRecord(input.launchId);
@@ -2544,9 +2705,14 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			launchId: input.launchId,
 			requestDigest: input.requestDigest,
+			clientNodeId: input.clientNodeId,
+			previousSessionId: input.previousSessionId,
 			request: structuredClone(input.request),
 			placement: structuredClone(input.placement),
 			config: structuredClone(input.config),
+			...(input.branchReservation === undefined
+				? {}
+				: { branchReservation: structuredClone(input.branchReservation) }),
 		};
 		this._appendEntry(entry);
 		return structuredClone(entry);
@@ -2975,6 +3141,37 @@ export class SessionManager {
 		return new SessionManager(cwd, dir, undefined, true);
 	}
 
+	static async listAgentLaunchRecoverySessions(
+		sessionDir: string,
+		signal: AbortSignal,
+	): Promise<AgentLaunchRecoverySession[]> {
+		const dir = normalizePath(sessionDir);
+		signal.throwIfAborted();
+		if (!existsSync(dir)) return [];
+		ensurePrivateDirectorySync(dir, { hardenExisting: false });
+		const files = (await readdir(dir)).filter((name) => name.endsWith(".jsonl")).map((name) => join(dir, name));
+		const sessions = new Map<string, AgentLaunchRecoverySession>();
+		const ambiguousSessionIds = new Set<string>();
+		for (const filePath of files) {
+			signal.throwIfAborted();
+			let session: AgentLaunchRecoverySession | undefined;
+			try {
+				session = await readAgentLaunchRecoverySession(filePath, signal);
+			} catch {
+				signal.throwIfAborted();
+				continue;
+			}
+			if (!session || ambiguousSessionIds.has(session.id)) continue;
+			if (sessions.has(session.id)) {
+				sessions.delete(session.id);
+				ambiguousSessionIds.add(session.id);
+				continue;
+			}
+			sessions.set(session.id, session);
+		}
+		return [...sessions.values()];
+	}
+
 	/**
 	 * Strict daemon-only lookup for a reconnect target. Unlike user-facing
 	 * selectors, this includes WAL-only sessions and fails closed when the target
@@ -2983,6 +3180,7 @@ export class SessionManager {
 	static async findForResume(
 		sessionDir: string,
 		sessionId: string,
+		options: { includeUncommittedAgentLaunch?: boolean } = {},
 	): Promise<{ id: string; path: string } | undefined> {
 		assertValidSessionId(sessionId);
 		const dir = normalizePath(sessionDir);
@@ -3003,6 +3201,12 @@ export class SessionManager {
 			const manager = SessionManager.open(filePath, dir);
 			if (manager.getSessionId() !== sessionId) {
 				throw new Error(`Session file identity changed while opening ${sessionId}`);
+			}
+			if (
+				!options.includeUncommittedAgentLaunch &&
+				manager.getAgentLaunchRecords().some((record) => record.commit === undefined)
+			) {
+				throw new Error(`Session ${sessionId} is reserved for incomplete agent launch recovery`);
 			}
 			matches.push(filePath);
 		}
@@ -3096,9 +3300,9 @@ export class SessionManager {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
 		const resolvedCwd = resolvePath(cwd);
-		const sessions = (
-			await listSessionsFromDir(dir, onProgress, 0, undefined, options?.includeMessageFreeDurable)
-		).filter((session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd));
+		const sessions = (await listSessionsFromDir(dir, onProgress, 0, undefined, options)).filter(
+			(session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd),
+		);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 		return sessions;
 	}
@@ -3135,13 +3339,7 @@ export class SessionManager {
 					? onProgressOrOptions
 					: options;
 		if (customSessionDir) {
-			const sessions = await listSessionsFromDir(
-				customSessionDir,
-				progress,
-				0,
-				undefined,
-				listOptions?.includeMessageFreeDurable,
-			);
+			const sessions = await listSessionsFromDir(customSessionDir, progress, 0, undefined, listOptions);
 			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 			return sessions;
 		}
@@ -3180,7 +3378,7 @@ export class SessionManager {
 					loaded++;
 					progress?.(loaded, totalFiles);
 				},
-				listOptions?.includeMessageFreeDurable,
+				listOptions,
 			);
 
 			for (const info of results) {
