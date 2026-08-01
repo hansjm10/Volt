@@ -384,6 +384,23 @@
 					"properties": {
 						"kind": {
 							"type": "string",
+							"const": "authorization_changed"
+						},
+						"message": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"kind",
+						"message"
+					],
+					"properties": {
+						"kind": {
+							"type": "string",
 							"const": "host_shutdown"
 						},
 						"message": {

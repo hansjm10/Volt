@@ -708,6 +708,8 @@ export class IntegratedRuntimeRegistry {
 		daemonAttachClaim: DaemonAttachClaim;
 		worktree?: IrohRemoteWorkspaceWorktree;
 		workingDirectory?: string;
+		/** Final async authority check before the synchronous lease/registry publication. */
+		publicationFence?: () => Promise<void>;
 	}): Promise<IntegratedRuntimeEntry> {
 		if (
 			this.findOwner(options.workspaceName, options.sessionId) ||
@@ -732,9 +734,21 @@ export class IntegratedRuntimeRegistry {
 			...(options.workingDirectory === undefined ? {} : { workingDirectory: options.workingDirectory }),
 			toolPolicy: options.toolPolicy,
 		});
-		const { outcome, installedProvisionalOwner } = entry.coordinator.commitDaemonRuntime(options.daemonAttachClaim);
+		let committed: ReturnType<ConversationCoordinator["commitDaemonRuntime"]>;
+		try {
+			await options.publicationFence?.();
+			committed = entry.coordinator.commitDaemonRuntime(options.daemonAttachClaim);
+		} catch (error) {
+			await entry.coordinator
+				.beginRuntimeRetirement("agent_cold_launch_publication_fenced", () => options.runtime.dispose())
+				.settled.catch(() => undefined);
+			throw error;
+		}
+		const { outcome, installedProvisionalOwner } = committed;
 		if (!outcome.ok) {
-			await options.runtime.dispose().catch(() => undefined);
+			await entry.coordinator
+				.beginRuntimeRetirement("agent_cold_launch_lease_rejected", () => options.runtime.dispose())
+				.settled.catch(() => undefined);
 			throw new Error(`detached runtime lease could not be committed: ${outcome.reason}`);
 		}
 		try {
@@ -747,6 +761,9 @@ export class IntegratedRuntimeRegistry {
 			const finalized = entry.coordinator.finalizeDaemonRuntimeCommit(outcome.token);
 			if (finalized.kind === "fenced") {
 				throw new Error("detached runtime lease was fenced during publication");
+			}
+			if (!entry.coordinator.syncDaemonRuntimeStreamCount()) {
+				throw new Error("detached runtime lease was fenced during detached publication");
 			}
 			this.scheduleRetention(entry, "agent_cold_launch");
 			await this.logEntryAudit(entry, "remote_runtime_started", { reason: "agent_cold_launch" });

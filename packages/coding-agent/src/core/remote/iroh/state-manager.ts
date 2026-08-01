@@ -73,6 +73,10 @@ export type IrohRemoteClientAccessUpdateResult =
 			currentRevision?: number;
 	  };
 
+export type IrohRemoteAuthorizedSessionSelectionResult =
+	| { ok: true; client: IrohRemoteGrantedClient; previousSessionId: string | undefined }
+	| { ok: false; reason: "authorization_changed" };
+
 export interface IrohRemoteLiveActivityDeliveryChannelLookup {
 	tokenHash: string;
 	tokenEnvironment: IrohRemotePushTokenEnvironment;
@@ -437,14 +441,7 @@ export class IrohRemoteHostStateManager {
 	async isAuthorizationCurrent(authorization: IrohRemoteClientAuthorizationSuccess): Promise<boolean> {
 		return this.runExclusive(async () => {
 			const state = await this.loadUnlocked();
-			const client = state.clients.find((entry) => entry.nodeId === authorization.client.nodeId);
-			const workspace = state.workspaces.find((entry) => entry.name === authorization.workspace.name);
-			return (
-				client?.rpcGrant?.revision === authorization.client.rpcGrant.revision &&
-				isIrohRemoteClientAllowedForWorkspace(client, authorization.workspace.name) &&
-				workspace?.path === authorization.workspace.path &&
-				workspace.allowedTools === authorization.workspace.allowedTools
-			);
+			return isAuthorizationCurrentInState(state, authorization);
 		});
 	}
 
@@ -505,12 +502,75 @@ export class IrohRemoteHostStateManager {
 			if (!client) {
 				return undefined;
 			}
+			const previousState = cloneHostState(state);
 			client.lastSessionIdByWorkspace = {
 				...(client.lastSessionIdByWorkspace ?? {}),
 				[workspace]: sessionId,
 			};
-			await this.saveUnlocked(state);
+			try {
+				await this.saveUnlocked(state);
+			} catch (error) {
+				await this.restoreAfterFailedPersistence(previousState);
+				throw error;
+			}
 			return cloneClient(client);
+		});
+	}
+
+	async setClientLastSessionIdIfAuthorizationCurrent(
+		authorization: IrohRemoteClientAuthorizationSuccess,
+		sessionId: string,
+	): Promise<IrohRemoteAuthorizedSessionSelectionResult> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			if (!isAuthorizationCurrentInState(state, authorization)) {
+				return { ok: false, reason: "authorization_changed" };
+			}
+			const client = state.clients.find((entry) => entry.nodeId === authorization.client.nodeId)!;
+			const previousState = cloneHostState(state);
+			const previousSessionId = client.lastSessionIdByWorkspace?.[authorization.workspace.name];
+			client.lastSessionIdByWorkspace = {
+				...(client.lastSessionIdByWorkspace ?? {}),
+				[authorization.workspace.name]: sessionId,
+			};
+			try {
+				await this.saveUnlocked(state);
+			} catch (error) {
+				await this.restoreAfterFailedPersistence(previousState);
+				throw error;
+			}
+			return { ok: true, client: cloneClient(client), previousSessionId };
+		});
+	}
+
+	async restoreClientLastSessionIdIfCurrent(
+		nodeId: string,
+		workspace: string,
+		expectedSessionId: string,
+		previousSessionId: string | undefined,
+	): Promise<boolean> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const client = state.clients.find((entry) => entry.nodeId === nodeId);
+			if (client?.lastSessionIdByWorkspace?.[workspace] !== expectedSessionId) {
+				return false;
+			}
+			const previousState = cloneHostState(state);
+			if (previousSessionId === undefined) {
+				delete client.lastSessionIdByWorkspace[workspace];
+				if (Object.keys(client.lastSessionIdByWorkspace).length === 0) {
+					delete client.lastSessionIdByWorkspace;
+				}
+			} else {
+				client.lastSessionIdByWorkspace[workspace] = previousSessionId;
+			}
+			try {
+				await this.saveUnlocked(state);
+			} catch (error) {
+				await this.restoreAfterFailedPersistence(previousState);
+				throw error;
+			}
+			return true;
 		});
 	}
 
@@ -974,6 +1034,21 @@ export class IrohRemoteHostStateManager {
 			return removedCount;
 		});
 	}
+}
+
+function isAuthorizationCurrentInState(
+	state: IrohRemoteHostState,
+	authorization: IrohRemoteClientAuthorizationSuccess,
+): boolean {
+	const client = state.clients.find((entry) => entry.nodeId === authorization.client.nodeId);
+	const workspace = state.workspaces.find((entry) => entry.name === authorization.workspace.name);
+	return (
+		client?.rpcGrant?.revision === authorization.client.rpcGrant.revision &&
+		client.allowedTools === authorization.client.allowedTools &&
+		isIrohRemoteClientAllowedForWorkspace(client, authorization.workspace.name) &&
+		workspace?.path === authorization.workspace.path &&
+		workspace.allowedTools === authorization.workspace.allowedTools
+	);
 }
 
 function cloneAuthorizationResult(result: IrohRemoteClientAuthorizationResult): IrohRemoteClientAuthorizationResult {

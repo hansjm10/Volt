@@ -48,12 +48,26 @@ function backend(): IrohRemoteAgentLaunchRpcBackend {
 describe("agent_launch.v1 RPC", () => {
 	test("strictly parses create_agent and binds it to the authorized workspace", async () => {
 		const result = await handleIrohRemoteAgentLaunchRpcCommand(
-			{ type: "create_agent", workspaceName: "volt", ...request },
+			{
+				id: "request-1",
+				type: "create_agent",
+				conversationAuthority: {
+					sessionId: "session-1",
+					subscriptionId: "subscription-1",
+					branchEpoch: "branch-1",
+				},
+				workspaceName: "volt",
+				...request,
+			},
 			{ authorizedWorkspaceName: "volt", backend: backend() },
 		);
 		expect(result).toMatchObject({
 			handled: true,
-			response: { success: true, data: { kind: "created", launchId: "launch-1", sessionId: "agent-session" } },
+			response: {
+				id: "request-1",
+				success: true,
+				data: { kind: "created", launchId: "launch-1", sessionId: "agent-session" },
+			},
 		});
 
 		const extra = await handleIrohRemoteAgentLaunchRpcCommand(
@@ -62,11 +76,61 @@ describe("agent_launch.v1 RPC", () => {
 		);
 		expect(extra).toMatchObject({ handled: true, response: { success: false, error: "invalid_request" } });
 
+		const nonStringId = await handleIrohRemoteAgentLaunchRpcCommand(
+			{ id: 123, type: "create_agent", workspaceName: "volt", ...request },
+			{ authorizedWorkspaceName: "volt", backend: backend() },
+		);
+		expect(nonStringId).toEqual({
+			handled: true,
+			response: { type: "response", command: "create_agent", success: false, error: "invalid_request" },
+		});
+
 		const mismatched = await handleIrohRemoteAgentLaunchRpcCommand(
 			{ type: "create_agent", workspaceName: "other", ...request },
 			{ authorizedWorkspaceName: "volt", backend: backend() },
 		);
 		expect(mismatched).toMatchObject({ handled: true, response: { success: false, error: "session_mismatch" } });
+	});
+
+	test("contains launch backend failures as correlated RPC responses", async () => {
+		const failingBackend: IrohRemoteAgentLaunchRpcBackend = {
+			getAgentLaunchOptions: async () => {
+				throw new Error("catalog failed");
+			},
+			createAgent: async () => {
+				throw new Error("create failed");
+			},
+		};
+		await expect(
+			handleIrohRemoteAgentLaunchRpcCommand(
+				{ id: "catalog-request", type: "get_agent_launch_options", workspaceName: "volt" },
+				{ authorizedWorkspaceName: "volt", backend: failingBackend },
+			),
+		).resolves.toEqual({
+			handled: true,
+			response: {
+				id: "catalog-request",
+				type: "response",
+				command: "get_agent_launch_options",
+				success: false,
+				error: "agent_launch_catalog_unavailable",
+			},
+		});
+		await expect(
+			handleIrohRemoteAgentLaunchRpcCommand(
+				{ id: "create-request", type: "create_agent", workspaceName: "volt", ...request },
+				{ authorizedWorkspaceName: "volt", backend: failingBackend },
+			),
+		).resolves.toEqual({
+			handled: true,
+			response: {
+				id: "create-request",
+				type: "response",
+				command: "create_agent",
+				success: false,
+				error: "agent_launch_unavailable",
+			},
+		});
 	});
 
 	test("derives stable client/workspace-scoped session ids and request digests", () => {

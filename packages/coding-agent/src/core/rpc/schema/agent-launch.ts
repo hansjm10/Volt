@@ -114,6 +114,10 @@ export const RpcAgentLaunchErrorSchema = Type.Union([
 		{ additionalProperties: false },
 	),
 	Type.Object({ kind: Type.Literal("launch_conflict"), message: Type.String() }, { additionalProperties: false }),
+	Type.Object(
+		{ kind: Type.Literal("authorization_changed"), message: Type.String() },
+		{ additionalProperties: false },
+	),
 	Type.Object({ kind: Type.Literal("host_shutdown"), message: Type.String() }, { additionalProperties: false }),
 	Type.Object({ kind: Type.Literal("internal_error"), message: Type.String() }, { additionalProperties: false }),
 ]);

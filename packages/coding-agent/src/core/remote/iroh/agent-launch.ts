@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import type { ThinkingLevel } from "@hansjm10/volt-agent-core";
 import { type Api, getSupportedThinkingLevels, type Model, supportsFastInference } from "@hansjm10/volt-ai";
+import { Compile } from "typebox/compile";
 import type { AgentSessionServices } from "../../agent-session-services.ts";
 import { DEFAULT_THINKING_LEVEL } from "../../defaults.ts";
 import { findInitialModel } from "../../model-resolver.ts";
+import { RPC_COMMAND_SCHEMAS } from "../../rpc/schema/commands.ts";
 import type { RpcAgentMode, RpcCatalogModel } from "../../rpc/types.ts";
 import { isIrohRemoteSessionId, isIrohRemoteWorkspaceName } from "./handshake.ts";
 import { isIrohRemoteWorkingDirectory, isIrohRemoteWorktreeId } from "./protocol.ts";
@@ -66,6 +68,7 @@ export type IrohRemoteAgentLaunchError =
 	| { kind: "placement_unavailable"; message: string }
 	| { kind: "cleanup_required"; message: string; worktreeId: string }
 	| { kind: "launch_conflict"; message: string }
+	| { kind: "authorization_changed"; message: string }
 	| { kind: "host_shutdown"; message: string }
 	| { kind: "internal_error"; message: string };
 
@@ -120,16 +123,8 @@ export type IrohRemoteAgentLaunchRpcResult =
 	| { handled: true; response: IrohRemoteAgentLaunchRpcResponse };
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const GET_OPTIONS_FIELDS = new Set(["id", "type", "workspaceName"]);
-const CREATE_AGENT_FIELDS = new Set([
-	"id",
-	"type",
-	"workspaceName",
-	"launchId",
-	"catalogRevision",
-	"placement",
-	"config",
-]);
+const GET_AGENT_LAUNCH_OPTIONS_VALIDATOR = Compile(RPC_COMMAND_SCHEMAS.get_agent_launch_options);
+const CREATE_AGENT_VALIDATOR = Compile(RPC_COMMAND_SCHEMAS.create_agent);
 
 export async function createIrohRemoteAgentLaunchOptions(
 	workspaceName: string,
@@ -252,9 +247,11 @@ export async function handleIrohRemoteAgentLaunchRpcCommand(
 		handled: true,
 		response: createIrohRemoteRpcErrorResponse(id, commandType, error),
 	});
-	const allowedFields =
-		commandType === IROH_REMOTE_GET_AGENT_LAUNCH_OPTIONS_RPC_TYPE ? GET_OPTIONS_FIELDS : CREATE_AGENT_FIELDS;
-	if (Object.keys(command).some((field) => !allowedFields.has(field))) {
+	const validator =
+		commandType === IROH_REMOTE_GET_AGENT_LAUNCH_OPTIONS_RPC_TYPE
+			? GET_AGENT_LAUNCH_OPTIONS_VALIDATOR
+			: CREATE_AGENT_VALIDATOR;
+	if (!validator.Check(command)) {
 		return fail("invalid_request");
 	}
 	if (!isIrohRemoteWorkspaceName(command.workspaceName)) {
@@ -264,31 +261,39 @@ export async function handleIrohRemoteAgentLaunchRpcCommand(
 		return fail("session_mismatch");
 	}
 	if (commandType === IROH_REMOTE_GET_AGENT_LAUNCH_OPTIONS_RPC_TYPE) {
-		return {
-			handled: true,
-			response: {
-				...(id === undefined ? {} : { id }),
-				type: "response",
-				command: IROH_REMOTE_GET_AGENT_LAUNCH_OPTIONS_RPC_TYPE,
-				success: true,
-				data: await options.backend.getAgentLaunchOptions(command.workspaceName),
-			},
-		};
+		try {
+			return {
+				handled: true,
+				response: {
+					...(id === undefined ? {} : { id }),
+					type: "response",
+					command: IROH_REMOTE_GET_AGENT_LAUNCH_OPTIONS_RPC_TYPE,
+					success: true,
+					data: await options.backend.getAgentLaunchOptions(command.workspaceName),
+				},
+			};
+		} catch {
+			return fail("agent_launch_catalog_unavailable");
+		}
 	}
 	const request = parseCreateAgentRequest(command);
 	if (!request.ok) {
 		return fail(request.error);
 	}
-	return {
-		handled: true,
-		response: {
-			...(id === undefined ? {} : { id }),
-			type: "response",
-			command: IROH_REMOTE_CREATE_AGENT_RPC_TYPE,
-			success: true,
-			data: await options.backend.createAgent(command.workspaceName, request.value),
-		},
-	};
+	try {
+		return {
+			handled: true,
+			response: {
+				...(id === undefined ? {} : { id }),
+				type: "response",
+				command: IROH_REMOTE_CREATE_AGENT_RPC_TYPE,
+				success: true,
+				data: await options.backend.createAgent(command.workspaceName, request.value),
+			},
+		};
+	} catch {
+		return fail("agent_launch_unavailable");
+	}
 }
 
 function parseCreateAgentRequest(
