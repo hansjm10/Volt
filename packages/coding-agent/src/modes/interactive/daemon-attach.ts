@@ -700,35 +700,50 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			const contextChanged = workspaceName !== previousWorkspaceName || resolvedWorktreeId !== previousWorktreeId;
 			let targetLeasePreacquired = false;
 			if (contextChanged && activeClient && workspaceName && state === "connected") {
-				if (!(await ensureWorktreeBinding(activeClient, workspaceName, newSessionId, false))) {
-					pendingRekeyTransactionId = undefined;
-					resolvedWorkspaceName = previousWorkspaceName;
-					resolvedWorktreeId = previousWorktreeId;
-					boundWorktreeSessionId = previousBoundWorktreeSessionId;
-					throw new Error("replacement session could not be bound to its worktree");
-				}
-				const targetAcquireResponse = await activeClient.request({
-					type: "lease_acquire",
-					workspaceName,
-					sessionId: newSessionId,
-				});
-				const targetAcquire = parseAcquireResponse(
-					targetAcquireResponse as { type: string } & Record<string, unknown>,
-					(id) => activeClient.waitForResponse(id) as Promise<{ type: string } & Record<string, unknown>>,
-				);
-				if (targetAcquire.kind === "denied" || targetAcquire.kind === "noop") {
-					pendingRekeyTransactionId = undefined;
-					resolvedWorkspaceName = previousWorkspaceName;
-					resolvedWorktreeId = previousWorktreeId;
-					boundWorktreeSessionId = previousBoundWorktreeSessionId;
-					throw new Error(
-						targetAcquire.kind === "denied"
-							? `replacement session lease denied: ${targetAcquire.reason}`
-							: "replacement session lease was not acquired",
+				let targetAcquireStarted = false;
+				try {
+					if (!(await ensureWorktreeBinding(activeClient, workspaceName, newSessionId, false))) {
+						throw new Error("replacement session could not be bound to its worktree");
+					}
+					targetAcquireStarted = true;
+					const targetAcquireResponse = await activeClient.request({
+						type: "lease_acquire",
+						workspaceName,
+						sessionId: newSessionId,
+					});
+					const targetAcquire = parseAcquireResponse(
+						targetAcquireResponse as { type: string } & Record<string, unknown>,
+						(id) => activeClient.waitForResponse(id) as Promise<{ type: string } & Record<string, unknown>>,
 					);
+					if (targetAcquire.kind === "denied" || targetAcquire.kind === "noop") {
+						throw new Error(
+							targetAcquire.kind === "denied"
+								? `replacement session lease denied: ${targetAcquire.reason}`
+								: "replacement session lease was not acquired",
+						);
+					}
+					if (targetAcquire.kind === "pending") await targetAcquire.granted;
+					targetLeasePreacquired = true;
+				} catch (error) {
+					if (targetAcquireStarted) {
+						await activeClient
+							.request({
+								type: "lease_release",
+								workspaceName,
+								sessionId: newSessionId,
+								reason: "switch",
+							})
+							.catch(() => {});
+					}
+					pendingRekeyTransactionId = undefined;
+					resolvedWorkspaceName = previousWorkspaceName;
+					resolvedWorktreeId = previousWorktreeId;
+					boundWorktreeSessionId = previousBoundWorktreeSessionId;
+					if (state === "connected" && heldSessionId !== oldSessionId) {
+						await ensureLeaseAfterConnected().catch(() => {});
+					}
+					throw error;
 				}
-				if (targetAcquire.kind === "pending") await targetAcquire.granted;
-				targetLeasePreacquired = true;
 			}
 			if (
 				heldSessionId !== oldSessionId ||
