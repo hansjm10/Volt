@@ -18,7 +18,6 @@ import {
 	type IrohRemoteLiveActivityRegistration,
 } from "../src/core/remote/iroh/state.ts";
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
-import type { SubagentRuntimeRegistration } from "../src/core/subagents/index.ts";
 import {
 	ConversationCoordinatorRegistry,
 	type ConversationCoordinatorRekeyReservation,
@@ -1769,14 +1768,7 @@ describe("daemon co-attach (one runtime per conversation)", () => {
 		expect(setClientLastSessionId).toHaveBeenLastCalledWith("n-phone-a", "ws", "parent-session");
 
 		setClientLastSessionId.mockClear();
-		const registration = (
-			registry as unknown as {
-				registerSubagentRuntime(
-					event: { id: string; parentSessionId: string; runtime: AgentSessionRuntime; sessionId: string },
-					authorization: IrohRemoteClientAuthorizationSuccess,
-				): SubagentRuntimeRegistration;
-			}
-		).registerSubagentRuntime(
+		const registration = await registry.registerSubagentRuntime(
 			{ id: "sa-child", parentSessionId: "parent-session", runtime: childRuntime, sessionId: "child-session" },
 			phone,
 		);
@@ -1839,14 +1831,7 @@ describe("daemon co-attach (one runtime per conversation)", () => {
 		await registry.commitEntry(parent.entry, parent.sessionSelection, phone, parent.attachClaim);
 		parent.attachClaim.release();
 
-		const registration = (
-			registry as unknown as {
-				registerSubagentRuntime(
-					event: { id: string; parentSessionId: string; runtime: AgentSessionRuntime; sessionId: string },
-					authorization: IrohRemoteClientAuthorizationSuccess,
-				): SubagentRuntimeRegistration;
-			}
-		).registerSubagentRuntime(
+		const registration = await registry.registerSubagentRuntime(
 			{ id: "sa-child", parentSessionId: "parent-session", runtime: childRuntime, sessionId: "child-session" },
 			phone,
 		);
