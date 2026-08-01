@@ -391,6 +391,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 	let state: DaemonAttachConnectionState = "reconnecting";
 	let connectionGeneration = 0;
 	let resolvedWorkspaceName: string | undefined;
+	let resolvedContextCwd = options.cwd;
 	let resolvedWorktreeId: string | undefined;
 	let boundWorktreeSessionId: string | undefined;
 	let stagedWorktreeContext: { workspaceName: string; worktreeId: string } | undefined;
@@ -503,7 +504,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			if (!activeClient) {
 				return;
 			}
-			const workspace = await resolveDaemonWorkspaceForCwd(activeClient, options.cwd, log);
+			const workspace = await resolveDaemonWorkspaceForCwd(activeClient, resolvedContextCwd, log);
 			if (workspace) {
 				resolvedWorkspaceName = workspace.name;
 				resolvedWorktreeId = workspace.worktreeId;
@@ -672,6 +673,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 				throw new Error("conversation lease rekey already in progress");
 			}
 			const previousWorkspaceName = resolvedWorkspaceName;
+			const previousContextCwd = resolvedContextCwd;
 			const previousWorktreeId = resolvedWorktreeId;
 			const previousBoundWorktreeSessionId = boundWorktreeSessionId;
 			const activeClient = client;
@@ -693,9 +695,14 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 				throw error;
 			}
 			stagedWorktreeContext = undefined;
+			resolvedContextCwd = targetCwd ?? options.cwd;
 			if (targetContext) {
 				resolvedWorkspaceName = targetContext.name;
 				resolvedWorktreeId = targetContext.worktreeId;
+				boundWorktreeSessionId = undefined;
+			} else if (!activeClient || state !== "connected") {
+				resolvedWorkspaceName = undefined;
+				resolvedWorktreeId = undefined;
 				boundWorktreeSessionId = undefined;
 			}
 			const workspaceName = resolvedWorkspaceName;
@@ -742,6 +749,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					}
 					pendingRekeyTransactionId = undefined;
 					resolvedWorkspaceName = previousWorkspaceName;
+					resolvedContextCwd = previousContextCwd;
 					resolvedWorktreeId = previousWorktreeId;
 					boundWorktreeSessionId = previousBoundWorktreeSessionId;
 					if (state === "connected" && heldSessionId !== oldSessionId) {
@@ -765,6 +773,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 						if (phase !== "prepared") {
 							return;
 						}
+						if (!resolvedWorkspaceName && state === "connected") await resolveWorkspace();
 						if (targetLeasePreacquired && targetLeaseConnectionGeneration !== connectionGeneration) {
 							const reconnectClient = client;
 							const reconnectWorkspaceName = resolvedWorkspaceName;
@@ -867,6 +876,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 						phase = "rolled_back";
 						pendingRekeyTransactionId = undefined;
 						resolvedWorkspaceName = previousWorkspaceName;
+						resolvedContextCwd = previousContextCwd;
 						resolvedWorktreeId = previousWorktreeId;
 						boundWorktreeSessionId = previousBoundWorktreeSessionId;
 						currentSessionId = oldSessionId;
@@ -911,6 +921,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 						}
 						if (phase !== "committed") {
 							resolvedWorkspaceName = previousWorkspaceName;
+							resolvedContextCwd = previousContextCwd;
 							resolvedWorktreeId = previousWorktreeId;
 							boundWorktreeSessionId = previousBoundWorktreeSessionId;
 						}
@@ -930,6 +941,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			if (prepared.type !== "lease_rekey_prepared") {
 				pendingRekeyTransactionId = undefined;
 				resolvedWorkspaceName = previousWorkspaceName;
+				resolvedContextCwd = previousContextCwd;
 				resolvedWorktreeId = previousWorktreeId;
 				boundWorktreeSessionId = previousBoundWorktreeSessionId;
 				throw new Error(
@@ -976,6 +988,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					phase = "rolled_back";
 					pendingRekeyTransactionId = undefined;
 					resolvedWorkspaceName = previousWorkspaceName;
+					resolvedContextCwd = previousContextCwd;
 					resolvedWorktreeId = previousWorktreeId;
 					boundWorktreeSessionId = previousBoundWorktreeSessionId;
 					currentSessionId = oldSessionId;
@@ -1004,6 +1017,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					}
 					if (phase !== "committed") {
 						resolvedWorkspaceName = previousWorkspaceName;
+						resolvedContextCwd = previousContextCwd;
 						resolvedWorktreeId = previousWorktreeId;
 						boundWorktreeSessionId = previousBoundWorktreeSessionId;
 					}
