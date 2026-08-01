@@ -792,7 +792,7 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 				workspace: "ws",
 				secret: payload.secret,
 				clientLabel: "vitest-live-unregister",
-				conversation: { target: "new" },
+				conversation: { target: "new", sessionId: "live-unregister-session" },
 			});
 			const handshake = await readJsonLine(stream);
 			expect(handshake.value).toMatchObject({ type: "volt_iroh_handshake", success: true, workspace: "ws" });
@@ -809,7 +809,7 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 				protocol: IROH_REMOTE_ALPN,
 				workspace: "ws",
 				clientLabel: "vitest-racing-conversation",
-				conversation: { target: "new" },
+				conversation: { target: "new", sessionId: "racing-conversation-session" },
 			});
 			await expect.poll(() => conversationPublicationStarted).toBe(true);
 

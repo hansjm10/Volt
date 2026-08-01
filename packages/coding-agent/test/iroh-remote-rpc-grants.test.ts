@@ -383,7 +383,7 @@ describe("Iroh remote RPC grants", () => {
 			secret: "durable-secret",
 			clientLabel: "phone",
 			mode: "conversation" as const,
-			conversation: { target: "new" as const },
+			conversation: { target: "new" as const, sessionId: "new-session" },
 		};
 
 		failNextWrite = true;

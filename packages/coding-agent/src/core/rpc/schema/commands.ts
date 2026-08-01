@@ -8,7 +8,6 @@
  */
 
 import { type TLiteral, type TObject, type TOptional, type TProperties, type TString, Type } from "typebox";
-import { RpcAgentLaunchConfigSchema, RpcAgentLaunchPlacementSchema } from "./agent-launch.ts";
 import { openStringEnum, stringEnum } from "./helpers.ts";
 import { RpcAgentModeSchema, RpcPlanExecutionStrategySchema } from "./planning.ts";
 import {
@@ -195,15 +194,8 @@ export const RPC_COMMAND_SCHEMAS = {
 		apiKey: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 	}),
 	get_web_search_status: commandSchema("get_web_search_status", {}),
-	get_agent_launch_options: commandSchema("get_agent_launch_options", {
+	get_agent_options: commandSchema("get_agent_options", {
 		workspaceName: workspaceNameSchema,
-	}),
-	create_agent: commandSchema("create_agent", {
-		workspaceName: workspaceNameSchema,
-		launchId: Type.String({ pattern: "^[a-z0-9_-]{1,128}$" }),
-		catalogRevision: Type.String({ minLength: 1 }),
-		placement: RpcAgentLaunchPlacementSchema,
-		config: RpcAgentLaunchConfigSchema,
 	}),
 
 	// Device diagnostics

@@ -194,14 +194,8 @@ export type WorktreeError =
 export type WorktreeGitRunner = (
 	args: string[],
 	cwd: string,
-	options?: { signal?: AbortSignal; input?: string },
+	options?: { signal?: AbortSignal },
 ) => Promise<{ ok: boolean; code: number | null; stdout: string; stderr: string }>;
-
-export interface WorktreeLaunchBranchReservation {
-	branch: string;
-	expectedOid: string;
-	ownershipRef: string;
-}
 
 export interface WorktreeManagerOptions {
 	agentDir: string;
@@ -263,16 +257,13 @@ export function createDefaultWorktreeGitRunner(): WorktreeGitRunner {
 		try {
 			const child = spawnProcess("git", args, {
 				cwd,
-				stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+				stdio: ["ignore", "pipe", "pipe"],
 				...(options.signal === undefined ? {} : { signal: options.signal }),
 			});
 			let stdout = "";
 			let stderr = "";
 			child.stdout?.setEncoding("utf8");
 			child.stderr?.setEncoding("utf8");
-			if (options.input !== undefined) {
-				child.stdin?.end(options.input);
-			}
 			child.stdout?.on("data", (chunk: string) => {
 				stdout += chunk;
 			});
@@ -357,19 +348,6 @@ export class WorktreeManager {
 		throw new Error("could not allocate a unique worktree recovery path");
 	}
 
-	private isRecoveryCheckoutPath(path: string, worktreeId: string): boolean {
-		const recoveryRoot = resolve(getWorktreesRoot(this.agentDir), "recovery");
-		const candidate = resolve(path);
-		const relativePath = relative(recoveryRoot, candidate);
-		return (
-			relativePath.length > 0 &&
-			!relativePath.startsWith(`..${sep}`) &&
-			!isAbsolute(relativePath) &&
-			!relativePath.includes(sep) &&
-			basename(candidate).startsWith(`${worktreeId}-`)
-		);
-	}
-
 	private async markRecoverySafeToPurge(recoveryPath: string, workspaceName: string): Promise<void> {
 		await writeDurableAtomicFile(join(recoveryPath, RECOVERY_PURGE_MARKER), `${JSON.stringify({ workspaceName })}\n`);
 	}
@@ -386,19 +364,7 @@ export class WorktreeManager {
 	/** git worktree add; persists the record durably after git succeeds. */
 	async create(
 		workspace: IrohRemoteWorkspace,
-		options: {
-			id?: string;
-			branch?: string;
-			baseRef?: string;
-			workingDirectory?: string;
-			launchReservationKey?: string;
-			launchSessionId?: string;
-			signal?: AbortSignal;
-			beforeCreate?: (
-				worktree: IrohRemoteWorkspaceWorktree,
-				branchReservation?: WorktreeLaunchBranchReservation,
-			) => void | Promise<void>;
-		} = {},
+		options: { id?: string; branch?: string; baseRef?: string; workingDirectory?: string; signal?: AbortSignal } = {},
 	): Promise<WorktreeResult<{ worktree: IrohRemoteWorkspaceWorktree }>> {
 		const id = options.id ?? generateWorktreeIdSlug();
 		if (!WORKTREE_ID_PATTERN.test(id)) {
@@ -412,12 +378,6 @@ export class WorktreeManager {
 		if (!isValidGitRefSyntax(baseRef)) {
 			return { ok: false, error: "git_failed", detail: "invalid baseRef ref syntax" };
 		}
-		if (
-			options.launchReservationKey !== undefined &&
-			(!/^[0-9a-f]{64}$/.test(options.launchReservationKey) || options.beforeCreate === undefined)
-		) {
-			return { ok: false, error: "git_failed", detail: "invalid launch reservation" };
-		}
 
 		try {
 			const result = await this.stateManager.runWorkspaceWorktreeLifecycle<
@@ -430,15 +390,12 @@ export class WorktreeManager {
 				if (existing.some((entry) => entry.id === id) || existsSync(checkoutPath)) {
 					return { result: { ok: false, error: "worktree_exists" } };
 				}
-
 				const source = await this.resolveCreateSource(
 					registeredWorkspace,
 					options.workingDirectory,
 					options.signal,
 				);
-				if (!source.ok) {
-					return { result: source };
-				}
+				if (!source.ok) return { result: source };
 				const repoCheck = await this.runGit(["rev-parse", "--git-common-dir"], source.source.sourceRootPath, {
 					signal: options.signal,
 				});
@@ -449,17 +406,25 @@ export class WorktreeManager {
 						]),
 					};
 				}
-
-				// Resolve a defaulted base to a concrete ref (the source checkout's branch,
-				// falling back to its commit sha) so merge-back guidance — aheadBehind,
-				// retention merge checks, `worktree diff` — has a stable base later.
 				const recordedBaseRef =
 					options.baseRef ?? (await this.resolveDefaultBaseRef(source.source.sourceRootPath, options.signal));
-
 				await mkdir(getWorkspaceWorktreesDir(this.agentDir, registeredWorkspace.path), {
 					recursive: true,
 					mode: 0o700,
 				});
+				options.signal?.throwIfAborted();
+				const added = await this.runGit(
+					["worktree", "add", checkoutPath, "-b", branch, baseRef],
+					source.source.sourceRootPath,
+					{ signal: options.signal },
+				);
+				if (!added.ok) {
+					return {
+						result: this.mapGitFailure(added.stderr, registeredWorkspace, checkoutPath, [
+							source.source.sourceRootPath,
+						]),
+					};
+				}
 				const worktree: IrohRemoteWorkspaceWorktree = {
 					id,
 					workspaceName: registeredWorkspace.name,
@@ -469,98 +434,19 @@ export class WorktreeManager {
 						: { sourceRootRelativePath: source.source.sourceRootRelativePath }),
 					branch,
 					...(recordedBaseRef === undefined ? {} : { baseRef: recordedBaseRef }),
-					...(options.launchReservationKey === undefined
-						? {}
-						: { pendingLaunchKey: options.launchReservationKey }),
-					...(options.launchSessionId === undefined ? {} : { pendingLaunchSessionId: options.launchSessionId }),
 					createdAt: this.now(),
 					sessionIds: [],
 				};
-				let branchReservation: WorktreeLaunchBranchReservation | undefined;
-				if (options.launchReservationKey !== undefined) {
-					const baseCommit = await this.runGit(
-						["rev-parse", "--verify", `${baseRef}^{commit}`],
-						source.source.sourceRootPath,
-						{ signal: options.signal },
-					);
-					const expectedOid = baseCommit.ok ? baseCommit.stdout.trim() : "";
-					if (!/^[0-9a-f]{40,64}$/i.test(expectedOid)) {
-						return {
-							result: baseCommit.ok
-								? { ok: false, error: "git_failed", detail: "launch base commit could not be verified" }
-								: this.mapGitFailure(baseCommit.stderr, registeredWorkspace, checkoutPath, [
-										source.source.sourceRootPath,
-									]),
-						};
-					}
-					branchReservation = {
-						branch,
-						expectedOid,
-						ownershipRef: `refs/volt/agent-launches/${options.launchReservationKey}`,
-					};
-				}
-				options.signal?.throwIfAborted();
-				await options.beforeCreate?.(structuredClone(worktree), branchReservation);
-				options.signal?.throwIfAborted();
-				let added: Awaited<ReturnType<WorktreeGitRunner>>;
-				if (branchReservation === undefined) {
-					added = await this.runGit(
-						["worktree", "add", checkoutPath, "-b", branch, baseRef],
-						source.source.sourceRootPath,
-						{ signal: options.signal },
-					);
-				} else {
-					const reserved = await this.runGit(["update-ref", "--stdin"], source.source.sourceRootPath, {
-						signal: options.signal,
-						input:
-							`start\n` +
-							`create refs/heads/${branch} ${branchReservation.expectedOid}\n` +
-							`create ${branchReservation.ownershipRef} ${branchReservation.expectedOid}\n` +
-							"prepare\ncommit\n",
-					});
-					if (!reserved.ok) {
-						return {
-							result: this.mapGitFailure(reserved.stderr, registeredWorkspace, checkoutPath, [
-								source.source.sourceRootPath,
-							]),
-						};
-					}
-					added = await this.runGit(["worktree", "add", checkoutPath, branch], source.source.sourceRootPath, {
-						signal: options.signal,
-					});
-				}
-				if (!added.ok) {
-					return {
-						result: this.mapGitFailure(added.stderr, registeredWorkspace, checkoutPath, [
-							source.source.sourceRootPath,
-						]),
-					};
-				}
-
 				return { result: { ok: true, worktree }, worktree };
 			});
-			if (result.ok) {
-				try {
-					await this.flushState?.();
-				} catch {
-					return {
-						ok: false,
-						error: "git_failed",
-						detail: "worktree state could not be flushed; the checkout and daemon record were preserved",
-					};
-				}
-			}
+			if (result.ok) await this.flushState?.();
 			return result;
 		} catch (error) {
 			if (isIrohRemoteWorktreeParentWorkspaceNotFoundError(error)) {
 				return { ok: false, error: "worktree_source_unregistered" };
 			}
 			if (isIrohRemoteWorktreePersistenceError(error)) {
-				return {
-					ok: false,
-					error: "git_failed",
-					detail: "worktree state could not be persisted; the created checkout was preserved for recovery",
-				};
+				return { ok: false, error: "git_failed", detail: "worktree state could not be persisted" };
 			}
 			throw error;
 		}
@@ -818,9 +704,7 @@ export class WorktreeManager {
 	}
 
 	async list(workspace: IrohRemoteWorkspace): Promise<WorktreeStatus[]> {
-		const records = (await this.stateManager.listWorktrees(workspace.name)).filter(
-			(record) => record.pendingLaunchKey === undefined,
-		);
+		const records = await this.stateManager.listWorktrees(workspace.name);
 		const gitListBySourceRoot = new Map<string, Set<string> | undefined>();
 		const statuses: WorktreeStatus[] = [];
 		for (const record of records) {
@@ -961,15 +845,6 @@ export class WorktreeManager {
 					if (this.runtimePreparations.has(`${current.workspace.name}\0${worktreeId}`)) {
 						return { result: { ok: false, error: "worktree_busy" } };
 					}
-					if (record.pendingLaunchKey !== undefined) {
-						return {
-							result: {
-								ok: false,
-								error: "worktree_busy",
-								detail: "worktree belongs to an incomplete agent launch",
-							},
-						};
-					}
 					if (record.sessionIds.length > 0) {
 						releaseSessionRemoval = this.reserveSessionsForRemoval?.(current.workspace.name, record.sessionIds);
 						if (!releaseSessionRemoval) {
@@ -1069,325 +944,6 @@ export class WorktreeManager {
 	}
 
 	/**
-	 * Idempotent force-removal for an incomplete launch reservation. The launch
-	 * branch and its ownership ref are created atomically, so recovery can prove
-	 * ownership even when a crash leaves only refs and no checkout or state record.
-	 */
-	async removeIncompleteLaunch(
-		workspace: IrohRemoteWorkspace,
-		worktreeId: string,
-		workingDirectory: string | undefined,
-		branchReservation: WorktreeLaunchBranchReservation | undefined,
-		expectedSessionId: string,
-		options: { signal?: AbortSignal } = {},
-	): Promise<WorktreeResult<Record<never, never>>> {
-		if (!WORKTREE_ID_PATTERN.test(worktreeId)) {
-			return { ok: false, error: "invalid_worktree_id" };
-		}
-		if (
-			branchReservation === undefined ||
-			!isValidGitRefSyntax(branchReservation.branch) ||
-			!/^[0-9a-f]{40,64}$/i.test(branchReservation.expectedOid) ||
-			!/^refs\/volt\/agent-launches\/[0-9a-f]{64}$/.test(branchReservation.ownershipRef)
-		) {
-			return { ok: false, error: "git_failed", detail: "incomplete launch branch ownership is unavailable" };
-		}
-
-		const { signal } = options;
-		let preservedRecovery = false;
-		let cleanRecoveryPath: string | undefined;
-		let pruneRecoverySourceRoot: string | undefined;
-		try {
-			const result = await this.stateManager.runWorkspaceWorktreeLifecycle<WorktreeResult<{ quarantined?: true }>>(
-				workspace.name,
-				async (current) => {
-					const expectedCheckoutPath = getWorktreeCheckoutPath(this.agentDir, current.workspace.path, worktreeId);
-					const record = current.worktrees.find((candidate) => candidate.id === worktreeId);
-					const checkoutPath = record?.path ?? expectedCheckoutPath;
-					if (
-						record !== undefined &&
-						!isSamePath(record.path, expectedCheckoutPath) &&
-						!this.isRecoveryCheckoutPath(record.path, worktreeId)
-					) {
-						return {
-							result: {
-								ok: false,
-								error: "worktree_busy",
-								detail: "worktree id belongs to a checkout outside the incomplete launch reservation",
-							},
-						};
-					}
-					if (
-						record !== undefined &&
-						(record.pendingLaunchKey !== branchReservation.ownershipRef.slice(-64) ||
-							record.pendingLaunchSessionId !== expectedSessionId ||
-							record.branch !== branchReservation.branch ||
-							record.sessionIds.some((sessionId) => sessionId !== expectedSessionId) ||
-							record.sessionIds.some((sessionId) =>
-								this.hasActiveRuntimeForSession?.(current.workspace.name, sessionId),
-							))
-					) {
-						return {
-							result: {
-								ok: false,
-								error: "worktree_busy",
-								detail: "worktree ownership changed during incomplete launch recovery",
-							},
-						};
-					}
-
-					let sourceRootPath: string | undefined;
-					let sourceRootRelativePath: string | undefined;
-					if (record === undefined) {
-						const source = await this.resolveCreateSource(current.workspace, workingDirectory, signal);
-						if (!source.ok) {
-							return { result: source };
-						}
-						sourceRootPath = source.source.sourceRootPath;
-						sourceRootRelativePath = source.source.sourceRootRelativePath;
-					} else {
-						sourceRootPath = await this.resolveRecordSourceRootPath(current.workspace, record);
-					}
-					if (sourceRootPath === undefined) {
-						return {
-							result: {
-								ok: false,
-								error: "not_a_git_repository",
-								detail: "worktree source repository is unavailable",
-							},
-						};
-					}
-
-					const ownership = await this.runGit(
-						["for-each-ref", "--format=%(objectname)", branchReservation.ownershipRef],
-						sourceRootPath,
-						{ signal },
-					);
-					if (!ownership.ok) {
-						return {
-							result: this.mapGitFailure(ownership.stderr, current.workspace, checkoutPath, [sourceRootPath]),
-						};
-					}
-					const ownershipOid = ownership.stdout.trim();
-					if (ownershipOid.length === 0) {
-						const branch = await this.runGit(
-							["for-each-ref", "--format=%(objectname)", `refs/heads/${branchReservation.branch}`],
-							sourceRootPath,
-							{ signal },
-						);
-						if (!branch.ok) {
-							return {
-								result: this.mapGitFailure(branch.stderr, current.workspace, checkoutPath, [sourceRootPath]),
-							};
-						}
-						const branchOid = branch.stdout.trim();
-						if (
-							record !== undefined &&
-							this.isRecoveryCheckoutPath(checkoutPath, worktreeId) &&
-							branchOid.length === 0
-						) {
-							if (existsSync(checkoutPath)) {
-								const status = await this.runGit(
-									["-C", checkoutPath, "--no-optional-locks", "status", "--porcelain", "--ignored=matching"],
-									sourceRootPath,
-									{ signal },
-								);
-								if (
-									status.ok &&
-									status.stdout.trim().length === 0 &&
-									!(await this.hasSubmoduleData(checkoutPath, sourceRootPath, signal))
-								) {
-									cleanRecoveryPath = checkoutPath;
-									pruneRecoverySourceRoot = sourceRootPath;
-								}
-							}
-							return { result: { ok: true }, removeWorktreeIds: [worktreeId] };
-						}
-						if (!existsSync(checkoutPath)) {
-							if (record === undefined) {
-								// The atomic branch+ownership transaction never committed. Any
-								// branch at this name predates the launch and must remain untouched.
-								return { result: { ok: true } };
-							}
-							if (branch.stdout.trim().length === 0) {
-								// Recovery completed its Git cleanup and crashed before the
-								// matching daemon record removal was persisted.
-								return { result: { ok: true }, removeWorktreeIds: [worktreeId] };
-							}
-						}
-						return {
-							result: {
-								ok: false,
-								error: "git_failed",
-								detail: "incomplete launch branch ownership could not be verified",
-							},
-						};
-					}
-					if (ownershipOid !== branchReservation.expectedOid) {
-						return {
-							result: {
-								ok: false,
-								error: "worktree_busy",
-								detail: "incomplete launch ownership ref changed during recovery",
-							},
-						};
-					}
-
-					if (existsSync(checkoutPath)) {
-						const status = await this.runGit(
-							["-C", checkoutPath, "--no-optional-locks", "status", "--porcelain", "--ignored=matching"],
-							sourceRootPath,
-							{ signal },
-						);
-						if (
-							!status.ok ||
-							status.stdout.trim().length > 0 ||
-							(await this.hasSubmoduleData(checkoutPath, sourceRootPath, signal))
-						) {
-							return {
-								result: {
-									ok: false,
-									error: "worktree_dirty",
-									detail: "incomplete launch checkout contains uncommitted changes",
-								},
-							};
-						}
-						const symbolicBranch = await this.runGit(
-							["-C", checkoutPath, "symbolic-ref", "--short", "-q", "HEAD"],
-							sourceRootPath,
-							{ signal },
-						);
-						if (!symbolicBranch.ok || symbolicBranch.stdout.trim() !== branchReservation.branch) {
-							return {
-								result: {
-									ok: false,
-									error: "worktree_busy",
-									detail: "incomplete launch checkout branch changed during recovery",
-								},
-							};
-						}
-					}
-
-					const checkoutAlreadyInRecovery = this.isRecoveryCheckoutPath(checkoutPath, worktreeId);
-					signal?.throwIfAborted();
-					if (existsSync(checkoutPath) && !checkoutAlreadyInRecovery) {
-						try {
-							// Rename closes the pathname race before the final ignored-file
-							// check. Any raced data is preserved for manual recovery.
-							const recoveryPath = await this.quarantineCheckout(checkoutPath, worktreeId);
-							const finalStatus = await this.runGit(
-								["-C", recoveryPath, "--no-optional-locks", "status", "--porcelain", "--ignored=matching"],
-								sourceRootPath,
-								{ signal },
-							);
-							if (
-								!finalStatus.ok ||
-								finalStatus.stdout.trim().length > 0 ||
-								(await this.hasSubmoduleData(recoveryPath, sourceRootPath, signal))
-							) {
-								preservedRecovery = true;
-								const preserved = record
-									? { ...record, path: recoveryPath }
-									: {
-											id: worktreeId,
-											workspaceName: current.workspace.name,
-											path: recoveryPath,
-											...(sourceRootRelativePath === undefined ? {} : { sourceRootRelativePath }),
-											branch: branchReservation.branch,
-											pendingLaunchKey: branchReservation.ownershipRef.slice(-64),
-											pendingLaunchSessionId: expectedSessionId,
-											createdAt: this.now(),
-											sessionIds: [expectedSessionId],
-										};
-								return {
-									result: {
-										ok: false,
-										error: "worktree_dirty",
-										detail: `checkout changed during cleanup and was preserved at ${recoveryPath}`,
-									},
-									worktree: preserved,
-								};
-							}
-							const quarantined = record
-								? { ...record, path: recoveryPath }
-								: {
-										id: worktreeId,
-										workspaceName: current.workspace.name,
-										path: recoveryPath,
-										...(sourceRootRelativePath === undefined ? {} : { sourceRootRelativePath }),
-										branch: branchReservation.branch,
-										pendingLaunchKey: branchReservation.ownershipRef.slice(-64),
-										pendingLaunchSessionId: expectedSessionId,
-										createdAt: this.now(),
-										sessionIds: [expectedSessionId],
-									};
-							return { result: { ok: true, quarantined: true }, worktree: quarantined };
-						} catch (error) {
-							return {
-								result: {
-									ok: false,
-									error: "git_failed",
-									detail: error instanceof Error ? error.message : String(error),
-								},
-							};
-						}
-					} else if (checkoutAlreadyInRecovery) {
-						cleanRecoveryPath = checkoutPath;
-					}
-					signal?.throwIfAborted();
-					const branchRef = `refs/heads/${branchReservation.branch}`;
-					const released = await this.runGit(["update-ref", "--stdin"], sourceRootPath, {
-						signal,
-						input:
-							`start\n` +
-							`delete ${branchRef} ${branchReservation.expectedOid}\n` +
-							`delete ${branchReservation.ownershipRef} ${branchReservation.expectedOid}\n` +
-							"prepare\ncommit\n",
-					});
-					if (!released.ok) {
-						return {
-							result: this.mapGitFailure(released.stderr, current.workspace, checkoutPath, [sourceRootPath]),
-						};
-					}
-					pruneRecoverySourceRoot = sourceRootPath;
-					return {
-						result: { ok: true },
-						...(record === undefined ? {} : { removeWorktreeIds: [worktreeId] }),
-					};
-				},
-			);
-			if (result.ok || preservedRecovery) {
-				await this.flushState?.();
-			}
-			if (result.ok && result.quarantined) {
-				return this.removeIncompleteLaunch(
-					workspace,
-					worktreeId,
-					workingDirectory,
-					branchReservation,
-					expectedSessionId,
-					options,
-				);
-			}
-			if (result.ok && cleanRecoveryPath && pruneRecoverySourceRoot) {
-				const pruned = await this.runGit(["worktree", "prune"], pruneRecoverySourceRoot, { signal });
-				if (pruned.ok) {
-					await this.markRecoverySafeToPurge(cleanRecoveryPath, workspace.name).catch(() => undefined);
-				}
-			}
-			return result;
-		} catch (error) {
-			if (isIrohRemoteWorktreeParentWorkspaceNotFoundError(error)) {
-				return { ok: false, error: "worktree_source_unregistered" };
-			}
-			if (isIrohRemoteWorktreePersistenceError(error)) {
-				return { ok: false, error: "git_failed", detail: "worktree cleanup state could not be persisted" };
-			}
-			throw error;
-		}
-	}
-
-	/**
 	 * Reconcile persisted records vs filesystem vs `git worktree list`. Drops
 	 * records without checkouts, quarantines unrecognized checkout directories
 	 * (rename, never delete), and runs `git worktree prune` in each known source checkout.
@@ -1433,7 +989,7 @@ export class WorktreeManager {
 				const sourceRootPath = await this.resolveRecordSourceRootPath(current.workspace, record);
 				if (signal?.aborted) return outcome();
 				if (sourceRootPath !== undefined) sourceRootPaths.add(sourceRootPath);
-				if (record.pendingLaunchKey === undefined && !existsSync(record.path)) removedRecords.push(record.id);
+				if (!existsSync(record.path)) removedRecords.push(record.id);
 			}
 			const parentSourceRootPath = await this.resolveRecordSourceRootPath(current.workspace, {
 				id: "root",
@@ -1533,9 +1089,7 @@ export class WorktreeManager {
 		sessionId: string,
 	): Promise<IrohRemoteWorkspaceWorktree | undefined> {
 		const bound = await this.stateManager.findWorktreeForSession(workspaceName, sessionId);
-		if (bound) {
-			return bound.pendingLaunchKey === undefined || bound.pendingLaunchSessionId !== sessionId ? bound : undefined;
-		}
+		if (bound) return bound;
 		return this.resolveSessionWorktreeByStoredCwd(workspaceName, sessionId);
 	}
 
@@ -1552,9 +1106,7 @@ export class WorktreeManager {
 		workspaceName: string,
 		sessionId: string,
 	): Promise<IrohRemoteWorkspaceWorktree | undefined> {
-		const worktrees = (await this.stateManager.listWorktrees(workspaceName)).filter(
-			(worktree) => worktree.pendingLaunchKey === undefined,
-		);
+		const worktrees = await this.stateManager.listWorktrees(workspaceName);
 		if (worktrees.length === 0) {
 			return undefined;
 		}
@@ -1610,12 +1162,7 @@ export class WorktreeManager {
 		const token = Symbol(key);
 		await this.stateManager.runWorkspaceWorktreeLifecycle(workspaceName, async (current) => {
 			const record = current.worktrees.find((entry) => entry.id === worktreeId);
-			if (
-				!record ||
-				record.pendingLaunchKey !== undefined ||
-				!existsSync(record.path) ||
-				this.runtimePreparations.has(key)
-			) {
+			if (!record || !existsSync(record.path) || this.runtimePreparations.has(key)) {
 				throw new Error(`Worktree ${worktreeId} is unavailable for runtime preparation`);
 			}
 			this.runtimePreparations.set(key, token);
@@ -1626,13 +1173,7 @@ export class WorktreeManager {
 			publish: <T>(publish: () => T) =>
 				this.stateManager.runWorkspaceWorktreeLifecycle(workspaceName, async (current) => {
 					const record = current.worktrees.find((entry) => entry.id === worktreeId);
-					if (
-						settled ||
-						this.runtimePreparations.get(key) !== token ||
-						!record ||
-						record.pendingLaunchKey !== undefined ||
-						!existsSync(record.path)
-					) {
+					if (settled || this.runtimePreparations.get(key) !== token || !record || !existsSync(record.path)) {
 						throw new Error(`Worktree ${worktreeId} is unavailable for runtime publication`);
 					}
 					const result = publish();
@@ -1660,16 +1201,11 @@ export class WorktreeManager {
 		workspaceName: string,
 		worktreeId: string,
 		sessionId: string,
-		pendingLaunchKey?: string,
 		afterPersistWhileLocked?: () => Promise<void>,
 	): Promise<void> {
 		await this.stateManager.runWorkspaceWorktreeLifecycle(workspaceName, async (current) => {
 			const record = current.worktrees.find((entry) => entry.id === worktreeId);
-			if (
-				record === undefined ||
-				(record.pendingLaunchKey !== undefined &&
-					(record.pendingLaunchKey !== pendingLaunchKey || record.pendingLaunchSessionId !== sessionId))
-			) {
+			if (record === undefined) {
 				throw new Error(`Worktree ${worktreeId} is unavailable for session binding`);
 			}
 			const bound = structuredClone(record);
@@ -1689,104 +1225,9 @@ export class WorktreeManager {
 		if (afterPersistWhileLocked === undefined) await this.flushState?.();
 	}
 
-	async reserveWorktreeForLaunch(
-		workspace: IrohRemoteWorkspace,
-		worktreeId: string,
-		pendingLaunchKey: string,
-		launchSessionId: string,
-		beforeReserve: (worktree: IrohRemoteWorkspaceWorktree) => void | Promise<void>,
-	): Promise<WorktreeResult<{ worktree: IrohRemoteWorkspaceWorktree }>> {
-		if (!/^[0-9a-f]{64}$/.test(pendingLaunchKey)) {
-			return { ok: false, error: "git_failed", detail: "invalid launch reservation" };
-		}
-		try {
-			const result = await this.stateManager.runWorkspaceWorktreeLifecycle<
-				WorktreeResult<{ worktree: IrohRemoteWorkspaceWorktree }>
-			>(workspace.name, async (current) => {
-				const record = current.worktrees.find((entry) => entry.id === worktreeId);
-				if (
-					!record ||
-					record.pendingLaunchKey !== undefined ||
-					!existsSync(record.path) ||
-					record.sessionIds.length > 0 ||
-					this.runtimePreparations.has(`${current.workspace.name}\0${worktreeId}`)
-				) {
-					return { result: { ok: false, error: "worktree_busy" } };
-				}
-				await beforeReserve(structuredClone(record));
-				const reserved = structuredClone(record);
-				reserved.pendingLaunchKey = pendingLaunchKey;
-				reserved.pendingLaunchSessionId = launchSessionId;
-				return { result: { ok: true, worktree: reserved }, worktree: reserved };
-			});
-			if (result.ok) await this.flushState?.();
-			return result;
-		} catch (error) {
-			if (isIrohRemoteWorktreeParentWorkspaceNotFoundError(error)) {
-				return { ok: false, error: "worktree_source_unregistered" };
-			}
-			if (isIrohRemoteWorktreePersistenceError(error)) {
-				return { ok: false, error: "git_failed", detail: "worktree launch reservation could not be persisted" };
-			}
-			throw error;
-		}
-	}
-
-	async releaseLaunchWorktree(
-		workspaceName: string,
-		worktreeId: string,
-		pendingLaunchKey: string,
-		sessionId: string,
-	): Promise<void> {
-		await this.stateManager.runWorkspaceWorktreeLifecycle(workspaceName, async (current) => {
-			const record = current.worktrees.find((entry) => entry.id === worktreeId);
-			if (record === undefined || record.pendingLaunchKey === undefined) return { result: undefined };
-			if (record.pendingLaunchKey !== pendingLaunchKey || record.pendingLaunchSessionId !== sessionId) {
-				throw new Error(`Worktree ${worktreeId} launch ownership changed before release`);
-			}
-			const released = structuredClone(record);
-			delete released.pendingLaunchKey;
-			delete released.pendingLaunchSessionId;
-			released.sessionIds = released.sessionIds.filter((candidate) => candidate !== sessionId);
-			return { result: undefined, worktree: released };
-		});
-		await this.flushState?.();
-	}
-
-	async finalizeLaunchWorktree(
-		workspaceName: string,
-		worktreeId: string,
-		pendingLaunchKey: string,
-		sessionId: string,
-	): Promise<void> {
-		await this.stateManager.runWorkspaceWorktreeLifecycle(workspaceName, async (current) => {
-			const record = current.worktrees.find((entry) => entry.id === worktreeId);
-			if (
-				record === undefined ||
-				record.pendingLaunchKey !== pendingLaunchKey ||
-				record.pendingLaunchSessionId !== sessionId
-			) {
-				if (record?.pendingLaunchKey === undefined) return { result: undefined };
-				throw new Error(`Worktree ${worktreeId} launch ownership changed before finalization`);
-			}
-			const finalized = structuredClone(record);
-			delete finalized.pendingLaunchKey;
-			delete finalized.pendingLaunchSessionId;
-			return { result: undefined, worktree: finalized };
-		});
-		await this.flushState?.();
-	}
-
-	async findWorktree(
-		workspaceName: string,
-		worktreeId: string,
-		options: { includePending?: boolean } = {},
-	): Promise<IrohRemoteWorkspaceWorktree | undefined> {
+	async findWorktree(workspaceName: string, worktreeId: string): Promise<IrohRemoteWorkspaceWorktree | undefined> {
 		const records = await this.stateManager.listWorktrees(workspaceName);
-		return records.find(
-			(entry) =>
-				entry.id === worktreeId && (options.includePending === true || entry.pendingLaunchKey === undefined),
-		);
+		return records.find((entry) => entry.id === worktreeId);
 	}
 
 	/**
@@ -2237,7 +1678,7 @@ export async function handleWorktreeControlRequest(
 	if (request.type === "worktree_resolve") {
 		const worktrees = await hooks.stateManager.listWorktrees();
 		const match = worktrees
-			.filter((worktree) => worktree.pendingLaunchKey === undefined && isPathContained(worktree.path, request.path))
+			.filter((worktree) => isPathContained(worktree.path, request.path))
 			.sort((left, right) => right.path.length - left.path.length)[0];
 		const workspace = match ? findWorkspace(match.workspaceName) : undefined;
 		if (!match || !workspace) {

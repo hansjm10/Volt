@@ -10,7 +10,7 @@ import {
 } from "../../core/host-actions.ts";
 import { getMcpRpcCapabilities, listMcpRpcServers } from "../../core/mcp/rpc.ts";
 import type { McpGatewayExecutionContext } from "../../core/mcp/types.ts";
-import { toIrohRemoteAgentLaunchCatalogModel } from "../../core/remote/iroh/agent-launch.ts";
+import { toIrohRemoteAgentOptionsCatalogModel } from "../../core/remote/iroh/agent-options.ts";
 import { createReviewSeedMessage } from "../../core/review.ts";
 import { getRpcErrorResponseTarget, isUsableRpcConversationIdentifier } from "../../core/rpc/correlation.ts";
 import { buildRpcSessionState } from "../../core/rpc/session-state.ts";
@@ -105,7 +105,7 @@ function getUiActionCapabilities(invocationEnabled: boolean): UiActionCapabiliti
 }
 
 function toCatalogModel(model: RpcModel): RpcCatalogModel {
-	return toIrohRemoteAgentLaunchCatalogModel(model);
+	return toIrohRemoteAgentOptionsCatalogModel(model);
 }
 
 function getPromptExtensionCommandName(message: string): string | undefined {

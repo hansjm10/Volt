@@ -9,7 +9,7 @@ import {
 	parseIrohRemoteHelloLine,
 } from "../src/core/remote/iroh/handshake.ts";
 import {
-	IROH_REMOTE_AGENT_LAUNCH_FEATURE,
+	IROH_REMOTE_AGENT_OPTIONS_FEATURE,
 	IROH_REMOTE_AGENT_SETTLED_FEATURE,
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_HOST_FEATURES,
@@ -57,8 +57,8 @@ describe("worktrees.v1 capability flag", () => {
 		expect([...IROH_REMOTE_HOST_FEATURES]).toContain("session_runtime_state.v1");
 		expect(IROH_REMOTE_PLANNING_STATE_FEATURE).toBe("planning_state.v1");
 		expect([...IROH_REMOTE_HOST_FEATURES]).toContain("planning_state.v1");
-		expect(IROH_REMOTE_AGENT_LAUNCH_FEATURE).toBe("agent_launch.v1");
-		expect([...IROH_REMOTE_HOST_FEATURES]).toContain("agent_launch.v1");
+		expect(IROH_REMOTE_AGENT_OPTIONS_FEATURE).toBe("agent_options.v1");
+		expect([...IROH_REMOTE_HOST_FEATURES]).toContain("agent_options.v1");
 	});
 
 	test("worktrees.v1 is NOT a required handshake feature (old hosts still parse)", () => {
@@ -93,13 +93,17 @@ describe("worktrees.v1 capability flag", () => {
 
 describe("hello: worktreeId on conversation targets", () => {
 	test("accepts worktreeId only on target new", () => {
-		expect(parseHello({ conversation: { target: "new", worktreeId: "fix-login" } })).toMatchObject({
+		expect(
+			parseHello({ conversation: { target: "new", sessionId: "new-session", worktreeId: "fix-login" } }),
+		).toMatchObject({
 			mode: "conversation",
-			conversation: { target: "new", worktreeId: "fix-login" },
+			conversation: { target: "new", sessionId: "new-session", worktreeId: "fix-login" },
 		});
-		// Plain new stays exactly as before (no worktreeId key).
-		const plain = parseHello({ conversation: { target: "new" } });
-		expect(plain).toMatchObject({ mode: "conversation", conversation: { target: "new" } });
+		const plain = parseHello({ conversation: { target: "new", sessionId: "new-session" } });
+		expect(plain).toMatchObject({
+			mode: "conversation",
+			conversation: { target: "new", sessionId: "new-session" },
+		});
 		if (plain.mode === "conversation") {
 			expect(plain.conversation).not.toHaveProperty("worktreeId");
 		}
@@ -116,15 +120,25 @@ describe("hello: worktreeId on conversation targets", () => {
 
 	test("pattern-validates worktreeId and keeps the field allowlist strict", () => {
 		for (const invalid of ["UPPER", "-leading", "a/b", "../evil", "", "a".repeat(65), 42, null, true]) {
-			expect(() => parseHello({ conversation: { target: "new", worktreeId: invalid } })).toThrow();
+			expect(() =>
+				parseHello({ conversation: { target: "new", sessionId: "new-session", worktreeId: invalid } }),
+			).toThrow();
 		}
-		expect(() => parseHello({ conversation: { target: "new", worktreeId: "fix-login", extra: true } })).toThrow();
+		expect(() =>
+			parseHello({
+				conversation: { target: "new", sessionId: "new-session", worktreeId: "fix-login", extra: true },
+			}),
+		).toThrow();
 	});
 
 	test("accepts workingDirectory only on target new and validates relative POSIX paths", () => {
-		expect(parseHello({ conversation: { target: "new", workingDirectory: "packages/app" } })).toMatchObject({
+		expect(
+			parseHello({
+				conversation: { target: "new", sessionId: "new-session", workingDirectory: "packages/app" },
+			}),
+		).toMatchObject({
 			mode: "conversation",
-			conversation: { target: "new", workingDirectory: "packages/app" },
+			conversation: { target: "new", sessionId: "new-session", workingDirectory: "packages/app" },
 		});
 		for (const invalid of [
 			"",
@@ -139,7 +153,9 @@ describe("hello: worktreeId on conversation targets", () => {
 			"C:/repo",
 			42,
 		]) {
-			expect(() => parseHello({ conversation: { target: "new", workingDirectory: invalid } })).toThrow();
+			expect(() =>
+				parseHello({ conversation: { target: "new", sessionId: "new-session", workingDirectory: invalid } }),
+			).toThrow();
 		}
 		expect(() => parseHello({ conversation: { target: "last", workingDirectory: "packages/app" } })).toThrow(
 			"must not include workingDirectory",
@@ -154,8 +170,8 @@ describe("hello: worktreeId on conversation targets", () => {
 		expect(parseHello({ workspaceManagement: { purpose: "unregister_workspace" } })).toMatchObject({
 			workspaceManagement: { purpose: "unregister_workspace" },
 		});
-		expect(parseHello({ workspaceManagement: { purpose: "manage_agents" } })).toMatchObject({
-			workspaceManagement: { purpose: "manage_agents" },
+		expect(parseHello({ workspaceDiscovery: { purpose: "agent_options" } })).toMatchObject({
+			workspaceDiscovery: { purpose: "agent_options" },
 		});
 		expect(() => parseHello({ workspaceManagement: { purpose: "manage_everything" } })).toThrow();
 	});
@@ -211,8 +227,8 @@ describe("handshake response: worktreeId echo", () => {
 			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceManagement: { purpose: "manage_worktrees" } })),
 		).toMatchObject({ success: true, workspaceManagement: { purpose: "manage_worktrees" } });
 		expect(
-			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceManagement: { purpose: "manage_agents" } })),
-		).toMatchObject({ success: true, workspaceManagement: { purpose: "manage_agents" } });
+			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceDiscovery: { purpose: "agent_options" } })),
+		).toMatchObject({ success: true, workspaceDiscovery: { purpose: "agent_options" } });
 		expect(() =>
 			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceManagement: { purpose: "bogus" } })),
 		).toThrow();
@@ -271,7 +287,7 @@ describe("integrated conversation handshake response echo", () => {
 		protocol: IROH_REMOTE_ALPN,
 		workspace: "volt",
 		mode: "conversation",
-		conversation: { target: "new", worktreeId: "fix-login" },
+		conversation: { target: "new", sessionId: "abc123", worktreeId: "fix-login" },
 	} as IrohRemoteHello;
 	const handshakeResponse = {
 		child: "volt",

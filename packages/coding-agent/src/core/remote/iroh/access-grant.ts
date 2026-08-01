@@ -221,23 +221,7 @@ export function getIrohRemoteRpcCommandCapabilities(
 	if (command.type === "create_worktree" || command.type === "remove_worktree") {
 		return ["worktrees.manage.v1"];
 	}
-	if (command.type === "get_agent_launch_options") return ["model.select.v1"];
-	if (command.type === "create_agent") {
-		const required: IrohRemoteRpcCapability[] = ["conversation.control.v1"];
-		const config =
-			typeof command.config === "object" && command.config !== null && !Array.isArray(command.config)
-				? (command.config as Record<string, unknown>)
-				: undefined;
-		if (config?.model !== undefined || config?.thinkingLevel !== undefined || config?.fastModeEnabled === true) {
-			required.push("model.select.v1");
-		}
-		const placement =
-			typeof command.placement === "object" && command.placement !== null && !Array.isArray(command.placement)
-				? (command.placement as Record<string, unknown>)
-				: undefined;
-		if (placement?.kind === "new_worktree") required.push("worktrees.manage.v1");
-		return required;
-	}
+	if (command.type === "get_agent_options") return ["model.select.v1"];
 	if (command.type === "unregister_workspace") return ["workspace.manage.v1"];
 	if (command.type === "upload_device_logs") return ["diagnostics.upload.v1"];
 	return undefined;
@@ -248,10 +232,12 @@ export function getIrohRemoteStreamCapability(options: {
 	purpose?: string;
 }): IrohRemoteRpcCapability | undefined {
 	if (options.mode === "conversation") return "conversation.observe.v1";
-	if (options.mode === "workspaceDiscovery") return "conversation.observe.v1";
-	// Utility management streams are command-sensitive: the stream itself has no
-	// wider gate than each parsed command.
-	if (options.purpose === "manage_worktrees" || options.purpose === "manage_agents") return undefined;
+	if (options.mode === "workspaceDiscovery") {
+		return options.purpose === "agent_options" ? "model.select.v1" : "conversation.observe.v1";
+	}
+	// Worktree management is command-sensitive: the stream itself has no wider
+	// gate than each parsed command.
+	if (options.purpose === "manage_worktrees") return undefined;
 	if (options.purpose === "unregister_workspace") return "workspace.manage.v1";
 	return undefined;
 }

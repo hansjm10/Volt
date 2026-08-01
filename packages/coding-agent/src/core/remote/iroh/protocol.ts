@@ -11,7 +11,7 @@ export const IROH_REMOTE_WORKING_DIRECTORIES_FEATURE = "working_directories.v1";
 export const IROH_REMOTE_AGENT_SETTLED_FEATURE = "agent_settled.v1";
 export const IROH_REMOTE_SESSION_RUNTIME_STATE_FEATURE = "session_runtime_state.v1";
 export const IROH_REMOTE_PLANNING_STATE_FEATURE = "planning_state.v1";
-export const IROH_REMOTE_AGENT_LAUNCH_FEATURE = "agent_launch.v1";
+export const IROH_REMOTE_AGENT_OPTIONS_FEATURE = "agent_options.v1";
 export const IROH_REMOTE_HOST_FEATURES = [
 	IROH_REMOTE_MULTI_STREAMS_FEATURE,
 	IROH_REMOTE_CONVERSATION_STREAMS_FEATURE,
@@ -20,7 +20,7 @@ export const IROH_REMOTE_HOST_FEATURES = [
 	IROH_REMOTE_AGENT_SETTLED_FEATURE,
 	IROH_REMOTE_SESSION_RUNTIME_STATE_FEATURE,
 	IROH_REMOTE_PLANNING_STATE_FEATURE,
-	IROH_REMOTE_AGENT_LAUNCH_FEATURE,
+	IROH_REMOTE_AGENT_OPTIONS_FEATURE,
 ] as const;
 
 /** Daemon-managed worktree ids: lowercase slug, unique per workspace. */

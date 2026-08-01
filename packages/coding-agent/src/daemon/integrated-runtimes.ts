@@ -43,7 +43,7 @@ import {
 	type ConversationSubscriber,
 } from "./conversation-coordinator.ts";
 import type { IntegratedConversationSessionSelection } from "./handshake-responses.ts";
-import type { DaemonAttachClaim, DaemonRuntimeOwnerCapability } from "./lease-broker.ts";
+import type { DaemonRuntimeOwnerCapability } from "./lease-broker.ts";
 import { isPathInside, resolveWorkspaceDirectory, type WorkspaceDirectoryResolution } from "./workspace-directory.ts";
 import { getRegisteredWorkingDirectoryForWorktree, type WorktreeRuntimePreparation } from "./worktree-manager.ts";
 
@@ -59,8 +59,6 @@ export interface IntegratedRuntimeEntry {
 	readonly sessionId: string;
 	runtime: AgentSessionRuntime;
 	readonly lifecycle: "prepared" | "active" | "retiring" | "retired";
-	/** Active ownership fenced from subscriber attach until a cold launch commits durably. */
-	launchPending: boolean;
 	/** Monotonic ownership generation; rekey/retirement invalidates captured attaches. */
 	readonly generation: number;
 	/** Exactly-one terminal owner; concurrent cleanup paths join this promise. */
@@ -170,7 +168,7 @@ export function createIrohRuntimeConversationTarget(
 		throw new Error("integrated runtime requires a conversation stream");
 	}
 	if (hello.conversation.target === "new") {
-		return { target: "new" };
+		return { target: "new", sessionId: hello.conversation.sessionId };
 	}
 	if (hello.conversation.target === "session") {
 		return { target: "session", sessionId: hello.conversation.sessionId };
@@ -186,7 +184,7 @@ export function getResolvedTargetSessionId(
 	if (hello.mode !== "conversation") {
 		return undefined;
 	}
-	if (hello.conversation.target === "session") {
+	if (hello.conversation.target === "session" || hello.conversation.target === "new") {
 		return hello.conversation.sessionId;
 	}
 	if (hello.conversation.target !== "last") {
@@ -311,6 +309,15 @@ export class IntegratedRuntimeRegistry {
 	private readonly options: IntegratedRuntimeRegistryOptions;
 	readonly coordinators: ConversationCoordinatorRegistry;
 	private readonly entries = new Map<string, IntegratedRuntimeEntry>();
+	private readonly namedSessionCreations = new Map<
+		string,
+		{
+			entry?: IntegratedRuntimeEntry;
+			published: Promise<void>;
+			resolvePublished(): void;
+			rejectPublished(error: unknown): void;
+		}
+	>();
 	private readonly sessionRekeyReservationsBySource = new Map<string, IntegratedRuntimeEntry>();
 	private readonly sessionRekeyReservationsByTarget = new Map<string, IntegratedRuntimeEntry>();
 
@@ -379,7 +386,6 @@ export class IntegratedRuntimeRegistry {
 		this.assertAttachClaimCurrent(entry, claim);
 		if (
 			entry.lifecycle !== "active" ||
-			entry.launchPending ||
 			this.entries.get(entry.key) !== entry ||
 			this.getSessionRekeyReservation(entry.key) !== undefined
 		) {
@@ -421,10 +427,25 @@ export class IntegratedRuntimeRegistry {
 			// runtime for the target (conversation_in_use is retired; single-user model).
 			const existing = this.findOwner(authorization.workspace.name, targetSessionId);
 			if (existing) {
-				if (existing.lifecycle !== "active" || existing.launchPending) {
-					throw this.createAttachRetryError(existing, "conversation runtime is not ready for attach");
+				if (existing.lifecycle !== "active") {
+					throw this.createAttachRetryError(existing, "conversation runtime is retiring");
 				}
-				if (!shouldReplaceIrohRemoteIntegratedRuntimeForAuthorization(authorization)) {
+				if (handshake.hello.mode === "conversation" && handshake.hello.conversation.target === "new") {
+					if (
+						handshake.hello.conversation.worktreeId !== existing.worktreeId ||
+						handshake.hello.conversation.workingDirectory !== existing.workingDirectory
+					) {
+						throw createConversationOpenError(
+							"invalid_conversation_target",
+							"session id is already bound to different placement",
+							{ workspace: authorization.workspace.name, sessionId: targetSessionId },
+						);
+					}
+				}
+				if (
+					(handshake.hello.mode === "conversation" && handshake.hello.conversation.target === "new") ||
+					!shouldReplaceIrohRemoteIntegratedRuntimeForAuthorization(authorization)
+				) {
 					assertAttachAdmissionOpen(options.signal);
 					const attachingPolicy = this.resolveToolPolicy(authorization);
 					if (!isIrohRemoteRuntimeToolPolicyWithin(existing.toolPolicy, attachingPolicy)) {
@@ -455,6 +476,39 @@ export class IntegratedRuntimeRegistry {
 					};
 				}
 				await waitForAttachAdmission(this.stopEntry(existing, "fresh_pairing_replaced_runtime"), options.signal);
+			}
+		}
+		if (handshake.hello.mode === "conversation" && handshake.hello.conversation.target === "new") {
+			const key = this.getRegistryKey(authorization.workspace.name, handshake.hello.conversation.sessionId);
+			const pending = this.namedSessionCreations.get(key);
+			if (pending) {
+				await waitForAttachAdmission(pending.published, options.signal);
+				return this.getOrCreateEntry(handshake, authorization, options);
+			}
+			let resolvePublished = () => {};
+			let rejectPublished = (_error: unknown) => {};
+			const published = new Promise<void>((resolve, reject) => {
+				resolvePublished = resolve;
+				rejectPublished = reject;
+			});
+			void published.catch(() => undefined);
+			const reservation: {
+				entry?: IntegratedRuntimeEntry;
+				published: Promise<void>;
+				resolvePublished(): void;
+				rejectPublished(error: unknown): void;
+			} = { published, resolvePublished, rejectPublished };
+			this.namedSessionCreations.set(key, reservation);
+			try {
+				const created = await this.createEntry(handshake, authorization, options);
+				reservation.entry = created.entry;
+				return created;
+			} catch (error) {
+				if (this.namedSessionCreations.get(key) === reservation) {
+					this.namedSessionCreations.delete(key);
+					reservation.rejectPublished(error);
+				}
+				throw error;
 			}
 		}
 		return this.createEntry(handshake, authorization, options);
@@ -558,6 +612,18 @@ export class IntegratedRuntimeRegistry {
 				worktree === undefined
 					? runtimeDirectory.relativePath
 					: getRegisteredWorkingDirectoryForWorktree(worktree, runtimeDirectory.relativePath);
+			if (
+				handshake.hello.mode === "conversation" &&
+				handshake.hello.conversation.target === "new" &&
+				sessionSelection.kind === "resumed" &&
+				requestedWorkingDirectory !== remoteWorkingDirectory
+			) {
+				throw createConversationOpenError(
+					"invalid_conversation_target",
+					"session id is already bound to a different working directory",
+					{ workspace: authorization.workspace.name, sessionId: runtime.session.sessionId },
+				);
+			}
 			const echoedWorkingDirectory =
 				handshake.hello.mode === "conversation" &&
 				handshake.hello.conversation.target === "new" &&
@@ -656,7 +722,6 @@ export class IntegratedRuntimeRegistry {
 		worktreeSourceRootRelativePath?: string;
 		workingDirectory?: string;
 		toolPolicy: IrohRemoteRuntimeToolPolicy;
-		launchPending?: boolean;
 	}): IntegratedRuntimeEntry {
 		const coordinator = this.coordinators.reserveRuntime(options.workspaceName, options.sessionId);
 		const entry: IntegratedRuntimeEntry = {
@@ -670,7 +735,6 @@ export class IntegratedRuntimeRegistry {
 				return coordinator.sessionId;
 			},
 			runtime: options.runtime,
-			launchPending: options.launchPending === true,
 			get lifecycle() {
 				const lifecycle = coordinator.runtimeLifecycle;
 				if (lifecycle === undefined) throw new Error("integrated runtime lost its coordinator lifecycle");
@@ -719,101 +783,6 @@ export class IntegratedRuntimeRegistry {
 			entry.runtime.setPrepareSessionReplacement?.((target) => this.prepareEntrySessionReplacement(entry, target));
 		}
 		return entry;
-	}
-
-	async registerDetachedRuntime(options: {
-		clientNodeId: string;
-		workspaceName: string;
-		sessionId: string;
-		runtime: AgentSessionRuntime;
-		toolPolicy: IrohRemoteRuntimeToolPolicy;
-		daemonAttachClaim: DaemonAttachClaim;
-		worktree?: IrohRemoteWorkspaceWorktree;
-		workingDirectory?: string;
-		/** Final async authority check before the synchronous lease/registry publication. */
-		publicationFence?: () => Promise<void>;
-		/** Publish ownership but reject attaches until finalizeDetachedRuntimeLaunch. */
-		launchPending?: boolean;
-	}): Promise<IntegratedRuntimeEntry> {
-		if (
-			this.findOwner(options.workspaceName, options.sessionId) ||
-			this.getSessionRekeyReservation(this.getRegistryKey(options.workspaceName, options.sessionId)) !== undefined
-		) {
-			throw new Error(`conversation runtime already active for ${options.workspaceName}/${options.sessionId}`);
-		}
-		const entry = this.createEntryRecord({
-			clientNodeId: options.clientNodeId,
-			workspaceName: options.workspaceName,
-			sessionId: options.sessionId,
-			runtime: options.runtime,
-			...(options.worktree === undefined
-				? {}
-				: {
-						worktreeId: options.worktree.id,
-						worktreePath: options.worktree.path,
-						...(options.worktree.sourceRootRelativePath === undefined
-							? {}
-							: { worktreeSourceRootRelativePath: options.worktree.sourceRootRelativePath }),
-					}),
-			...(options.workingDirectory === undefined ? {} : { workingDirectory: options.workingDirectory }),
-			toolPolicy: options.toolPolicy,
-			launchPending: options.launchPending,
-		});
-		let committed: ReturnType<ConversationCoordinator["commitDaemonRuntime"]>;
-		try {
-			await options.publicationFence?.();
-			committed = entry.coordinator.commitDaemonRuntime(options.daemonAttachClaim);
-		} catch (error) {
-			await entry.coordinator
-				.beginRuntimeRetirement("agent_cold_launch_publication_fenced", () => options.runtime.dispose())
-				.settled.catch(() => undefined);
-			throw error;
-		}
-		const { outcome, installedProvisionalOwner } = committed;
-		if (!outcome.ok) {
-			await entry.coordinator
-				.beginRuntimeRetirement("agent_cold_launch_lease_rejected", () => options.runtime.dispose())
-				.settled.catch(() => undefined);
-			throw new Error(`detached runtime lease could not be committed: ${outcome.reason}`);
-		}
-		try {
-			if (this.findOwner(options.workspaceName, options.sessionId)) {
-				throw new Error(`conversation runtime already active for ${options.workspaceName}/${options.sessionId}`);
-			}
-			this.entries.set(entry.key, entry);
-			entry.coordinator.activateRuntime();
-			entry.coordinator.markDetached();
-			const finalized = entry.coordinator.finalizeDaemonRuntimeCommit(outcome.token);
-			if (finalized.kind === "fenced") {
-				throw new Error("detached runtime lease was fenced during publication");
-			}
-			if (!entry.coordinator.syncDaemonRuntimeStreamCount()) {
-				throw new Error("detached runtime lease was fenced during detached publication");
-			}
-			if (!entry.launchPending) this.scheduleRetention(entry, "agent_cold_launch");
-			await this.logEntryAudit(entry, "remote_runtime_started", { reason: "agent_cold_launch" });
-			await this.logEntryAudit(entry, "remote_runtime_detached", {
-				detachedAt: entry.detachedAt,
-				reason: "agent_cold_launch",
-			});
-			return entry;
-		} catch (error) {
-			if (entry.lifecycle === "active" && this.entries.get(entry.key) === entry) {
-				await this.stopEntry(entry, "agent_cold_launch_failed").catch(() => undefined);
-			} else {
-				entry.coordinator.rollbackDaemonRuntimeCommit(outcome.token, outcome.owner, installedProvisionalOwner);
-				await options.runtime.dispose().catch(() => undefined);
-			}
-			throw error;
-		}
-	}
-
-	finalizeDetachedRuntimeLaunch(entry: IntegratedRuntimeEntry): void {
-		if (entry.lifecycle !== "active" || this.entries.get(entry.key) !== entry) {
-			throw new Error("detached launch runtime ownership changed before finalization");
-		}
-		entry.launchPending = false;
-		this.scheduleRetention(entry, "agent_cold_launch_finalized");
 	}
 
 	async registerSubagentRuntime(
@@ -979,6 +948,11 @@ export class IntegratedRuntimeRegistry {
 				throw this.createAttachRetryError(entry, "conversation runtime ownership changed during commit");
 			}
 			entry.coordinator.activateRuntime();
+			const namedCreation = this.namedSessionCreations.get(entry.key);
+			if (namedCreation?.entry === entry) {
+				this.namedSessionCreations.delete(entry.key);
+				namedCreation.resolvePublished();
+			}
 		} catch (error) {
 			// A concurrent stop owns a retiring entry until disposal completes. Do
 			// not remove it here or stopEntry would return early and leak its runtime.
@@ -1026,6 +1000,11 @@ export class IntegratedRuntimeRegistry {
 		await entry.worktreePreparation?.release().catch(() => undefined);
 		delete entry.worktreePreparation;
 		await cleanupUncommittedRuntime(entry.runtime, sessionSelection);
+		const namedCreation = this.namedSessionCreations.get(entry.key);
+		if (namedCreation?.entry === entry) {
+			this.namedSessionCreations.delete(entry.key);
+			namedCreation.rejectPublished(new Error("caller-named session creation was aborted before publication"));
+		}
 		if (this.entries.get(entry.key) === entry) {
 			this.entries.delete(entry.key);
 		}

@@ -136,15 +136,20 @@ function createAuthorization(clientNodeId: string, allowTools = "read"): IrohRem
 	};
 }
 
+let newSessionSequence = 0;
+
 function createHello(
-	target: IrohRemoteHello["mode"] extends never ? never : { target: "new" } | { target: "session"; sessionId: string },
+	target: { target: "new"; sessionId?: string } | { target: "session"; sessionId: string },
 ): IrohRemoteHello {
 	return {
 		type: "volt_iroh_hello",
 		protocol: "volt-rpc/0",
 		workspace: "ws",
 		mode: "conversation",
-		conversation: target,
+		conversation:
+			target.target === "new"
+				? { ...target, sessionId: target.sessionId ?? `new-session-${++newSessionSequence}` }
+				: target,
 	} as IrohRemoteHello;
 }
 

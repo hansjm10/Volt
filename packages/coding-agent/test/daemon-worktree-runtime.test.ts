@@ -28,13 +28,18 @@ const HANDSHAKE_RESPONSE = {
 	features: ["multi_streams.v1", "conversation_streams.v1", "worktrees.v1"],
 } as unknown as IrohRemoteHandshakeSuccess;
 
+let newSessionSequence = 0;
+
 function createConversationHello(conversation: Record<string, unknown>): IrohRemoteHello {
 	return {
 		type: "volt_iroh_hello",
 		protocol: "volt-rpc/0",
 		workspace: "ws",
 		mode: "conversation",
-		conversation,
+		conversation:
+			conversation.target === "new" && conversation.sessionId === undefined
+				? { ...conversation, sessionId: `new-session-${++newSessionSequence}` }
+				: conversation,
 	} as unknown as IrohRemoteHello;
 }
 
@@ -159,12 +164,12 @@ describe("worktree runtime plumbing (createRuntime seam)", () => {
 
 		const created = await registry.getOrCreateEntry({ hello, response: HANDSHAKE_RESPONSE }, authorization);
 		expect(created.created).toBe(true);
-		expect(resolveWorktree).toHaveBeenCalledExactlyOnceWith("ws", hello, undefined);
+		expect(resolveWorktree).toHaveBeenCalledExactlyOnceWith("ws", hello, "new-session-1");
 		expect(createRuntimeCalls).toHaveLength(1);
 		expect(createRuntimeCalls[0]).toMatchObject({
 			agentDir,
 			toolPolicy: { tools: ["read"], allowUnlistedExtensionTools: false },
-			conversationTarget: { target: "new" },
+			conversationTarget: { target: "new", sessionId: "new-session-1" },
 			cwd: worktreePath,
 			projectCwd: worktreePath,
 			workspaceName: "ws",
@@ -308,6 +313,58 @@ describe("worktree runtime plumbing (createRuntime seam)", () => {
 			sessionDir: getDefaultSessionDir(workspacePath, agentDir),
 		});
 		expect(created.entry.workingDirectory).toBe("packages/app");
+		await registry.stopAll("test_cleanup");
+	});
+
+	it("concurrent target-new retries with the same session id publish one runtime", async () => {
+		const { registry, createRuntimeCalls } = createRegistry({ sessionId: "same-session" });
+		const hello = createConversationHello({ target: "new", sessionId: "same-session" });
+
+		const first = await registry.getOrCreateEntry({ hello, response: HANDSHAKE_RESPONSE }, authorization);
+		const retryPromise = registry.getOrCreateEntry({ hello, response: HANDSHAKE_RESPONSE }, authorization);
+		await registry.commitEntry(first.entry, first.sessionSelection, authorization, first.attachClaim);
+		const retry = await retryPromise;
+
+		expect(createRuntimeCalls).toHaveLength(1);
+		expect(first.created).toBe(true);
+		expect(retry.created).toBe(false);
+		expect(retry.entry).toBe(first.entry);
+		expect(retry.sessionSelection).toEqual({
+			kind: "resumed",
+			requestedSessionId: "same-session",
+			sessionId: "same-session",
+		});
+		first.attachClaim.release();
+		retry.attachClaim.release();
+		await registry.stopAll("test_cleanup");
+	});
+
+	it("rejects a target-new retry when placement differs from the published runtime", async () => {
+		mkdirSync(join(workspacePath, "packages/app"), { recursive: true });
+		const { registry } = createRegistry({ sessionId: "placed-session" });
+		const created = await registry.getOrCreateEntry(
+			{
+				hello: createConversationHello({
+					target: "new",
+					sessionId: "placed-session",
+					workingDirectory: "packages/app",
+				}),
+				response: HANDSHAKE_RESPONSE,
+			},
+			authorization,
+		);
+		await registry.commitEntry(created.entry, created.sessionSelection, authorization, created.attachClaim);
+
+		await expect(
+			registry.getOrCreateEntry(
+				{
+					hello: createConversationHello({ target: "new", sessionId: "placed-session" }),
+					response: HANDSHAKE_RESPONSE,
+				},
+				authorization,
+			),
+		).rejects.toMatchObject({ outcome: "invalid_conversation_target" });
+		created.attachClaim.release();
 		await registry.stopAll("test_cleanup");
 	});
 

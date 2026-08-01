@@ -42,8 +42,8 @@ function createFakeStore(existing: Array<{ id: string; path: string }> = []): Fa
 				getSessionFile: () => session.path,
 			};
 		},
-		create() {
-			const id = `fresh-${++createSequence}`;
+		create(requestedId) {
+			const id = requestedId ?? `fresh-${++createSequence}`;
 			store.createdIds.push(id);
 			return {
 				getSessionId: () => id,
@@ -59,17 +59,27 @@ async function resolve(target: IrohRemoteSessionTarget, store: FakeStore) {
 }
 
 describe("resolveIrohRemoteSessionTarget", () => {
-	it("creates a fresh session for target new", async () => {
+	it("creates the caller-named session for target new", async () => {
 		const store = createFakeStore([{ id: "existing", path: "/s/existing.jsonl" }]);
-		const resolved = await resolve({ kind: "new" }, store);
+		const resolved = await resolve({ kind: "new", sessionId: "caller-session" }, store);
 		expect(resolved.selection).toBe("created");
-		expect(resolved.sessionId).toBe("fresh-1");
+		expect(resolved.sessionId).toBe("caller-session");
 		expect(resolved.requestedSessionId).toBeUndefined();
 		expect(resolved.sessionFilePath).toBeUndefined();
 		expect(resolved.workspaceName).toBe("volt");
 		expect(resolved.workspacePath).toBe("/tmp/volt-workspace");
-		expect(store.createdIds).toEqual(["fresh-1"]);
+		expect(store.createdIds).toEqual(["caller-session"]);
 		expect(store.openedPaths).toEqual([]);
+	});
+
+	it("resumes the same caller-named session on retry", async () => {
+		const store = createFakeStore([{ id: "caller-session", path: "/s/caller-session.jsonl" }]);
+		const resolved = await resolve({ kind: "new", sessionId: "caller-session" }, store);
+		expect(resolved.selection).toBe("resumed");
+		expect(resolved.sessionId).toBe("caller-session");
+		expect(resolved.requestedSessionId).toBeUndefined();
+		expect(store.createdIds).toEqual([]);
+		expect(store.openedPaths).toEqual(["/s/caller-session.jsonl"]);
 	});
 
 	it("creates a fresh session for target last without a remembered id", async () => {

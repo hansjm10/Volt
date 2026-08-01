@@ -84,32 +84,32 @@ clients, and pending pairing tickets. The daemon logs and audits this expected
 migration as `legacy_remote_access_dropped`; it is not corruption. Every old
 client must pair again to receive an explicit current grant.
 
-## Configured remote agent launch
+## Configured remote agents
 
-Hosts advertising `agent_launch.v1` expose a workspace-scoped `manage_agents`
-stream. A paired client reads `get_agent_launch_options`, then submits
-`create_agent` with that catalog revision, a client launch UUID, placement,
-and the complete session-only model, thinking, Fast, and Build/Plan policy.
-Catalog discovery requires `model.select.v1`; creation requires
-`conversation.control.v1`, plus `model.select.v1` for explicit model or
-thinking choices and `worktrees.manage.v1` for new-worktree placement. Launch
-choices do not mutate host defaults and do not require `host.manage.v1`.
+Hosts advertising `agent_options.v1` expose a read-only workspace-discovery
+stream with purpose `agent_options`. `get_agent_options` requires
+`model.select.v1`, is bound to the stream-authorized workspace, and returns the
+current authenticated model catalog plus a complete default model, thinking,
+Fast, and Build/Plan configuration. Discovery creates no session or runtime,
+changes no selection, provisions no worktree, and does not mutate host
+defaults.
 
-The daemon validates the revision and full request before publication. It
-persists a host-only receipt keyed by authenticated client, workspace, and
-launch UUID, seeds the predetermined session with the effective configuration,
-and only then publishes the detached runtime. Identical concurrent calls and
-retries after a lost response return the original result; conflicting reuse is
-rejected. If a request created a worktree and later fails, the daemon removes
-that worktree before reporting failure or returns `cleanup_required` when it
-cannot guarantee compensation.
+Clients own configured-agent setup. They keep one caller-generated session ID
+for the retry intent, optionally provision a deterministic worktree through
+`create_worktree`, then open a normal conversation with `target:"new"`, that
+session ID, and the chosen placement. The first attach creates the exact
+session identity; identical retries resume it, including after daemon restart,
+and concurrent attempts wait for the same runtime publication. Reusing the ID
+with a different workspace, worktree, or working directory fails closed.
 
-Creation does not open a conversation stream or deliver input. After
-`create_agent` commits, the client attaches with `conversation.target:\"session\"`
-using the returned session ID and sends the initial prompt through the normal
-receipt-safe conversation path. This keeps the atomic boundary around agent
-identity, placement, and configuration while preserving ordinary prompt
-ownership and retry semantics.
+After attach, clients apply model, thinking level, Fast mode, and Build/Plan
+mode as session-only commands, in that order, before sending the initial prompt.
+A configuration failure leaves one empty resumable session and sends no prompt.
+A successfully provisioned worktree is intentionally retained if a later step
+fails; the client offers retry or explicit removal instead of expecting the
+daemon to roll unrelated resources back. Prompt retries use the normal stable
+command-ID receipt path, so neither configured attach nor prompt delivery needs
+a launch receipt or transaction store.
 
 ## Conversation leases
 
@@ -145,7 +145,8 @@ run a session inside a **daemon-managed git worktree**: an isolated checkout
 on its own branch under `~/.volt/agent/worktrees/` (0700). Create worktrees
 with `volt remote worktree add`, from the TUI's `/worktree` command, or from a
 paired phone (`manage_worktrees` stream, gated on the `worktrees.v1` feature);
-then open a conversation with `target:"new"` plus a `worktreeId`.
+then open a conversation with `target:"new"`, a caller-generated `sessionId`,
+and a `worktreeId`.
 
 Key behaviors:
 

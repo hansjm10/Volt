@@ -59,16 +59,10 @@ import {
 	RPC_WIRE_MAX_SAFE_INTEGER,
 } from "../wire-limits.ts";
 import {
-	RpcAgentLaunchConfigSchema,
-	RpcAgentLaunchConfiguredConfigSchema,
-	RpcAgentLaunchErrorSchema,
-	RpcAgentLaunchModelSelectionSchema,
-	RpcAgentLaunchOptionsSchema,
-	RpcAgentLaunchPlacementSchema,
-	RpcAgentLaunchResolvedPlacementSchema,
-	RpcAgentLaunchResultSchema,
-	RpcAgentLaunchSuccessSchema,
-} from "./agent-launch.ts";
+	RpcAgentOptionsDefaultConfigSchema,
+	RpcAgentOptionsModelSelectionSchema,
+	RpcAgentOptionsSchema,
+} from "./agent-options.ts";
 import { RPC_COMMAND_SCHEMAS, RpcClientCapabilityFeatureSchema, RpcMcpAuthFlowSchema } from "./commands.ts";
 import {
 	RpcConversationActiveAssistantSchema,
@@ -338,16 +332,10 @@ const SHARED_SCHEMAS: Record<string, TSchema> = {
 	RpcClientCapabilityFeature: RpcClientCapabilityFeatureSchema,
 	RpcMcpAuthFlow: RpcMcpAuthFlowSchema,
 
-	// Cold agent launch
-	RpcAgentLaunchModelSelection: RpcAgentLaunchModelSelectionSchema,
-	RpcAgentLaunchConfig: RpcAgentLaunchConfigSchema,
-	RpcAgentLaunchConfiguredConfig: RpcAgentLaunchConfiguredConfigSchema,
-	RpcAgentLaunchPlacement: RpcAgentLaunchPlacementSchema,
-	RpcAgentLaunchResolvedPlacement: RpcAgentLaunchResolvedPlacementSchema,
-	RpcAgentLaunchError: RpcAgentLaunchErrorSchema,
-	RpcAgentLaunchSuccess: RpcAgentLaunchSuccessSchema,
-	RpcAgentLaunchResult: RpcAgentLaunchResultSchema,
-	RpcAgentLaunchOptions: RpcAgentLaunchOptionsSchema,
+	// Configurable agent options
+	RpcAgentOptionsModelSelection: RpcAgentOptionsModelSelectionSchema,
+	RpcAgentOptionsDefaultConfig: RpcAgentOptionsDefaultConfigSchema,
+	RpcAgentOptions: RpcAgentOptionsSchema,
 
 	// Git context
 	RpcGitObjectId: RpcGitObjectIdSchema,

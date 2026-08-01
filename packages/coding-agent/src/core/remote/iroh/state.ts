@@ -31,10 +31,6 @@ export interface IrohRemoteWorkspaceWorktree {
 	sourceRootRelativePath?: string;
 	branch: string;
 	baseRef?: string;
-	/** Durable owner while a cold launch is incomplete; hidden from ordinary worktree consumers. */
-	pendingLaunchKey?: string;
-	/** Session being created by the pending launch; prior bound sessions remain resolvable. */
-	pendingLaunchSessionId?: string;
 	createdAt: number;
 	/** Sessions bound to this worktree (usually exactly one). */
 	sessionIds: string[];
@@ -315,14 +311,6 @@ export function parseIrohRemoteWorkspaceWorktree(value: unknown): IrohRemoteWork
 		worktree.sourceRootRelativePath,
 		"worktree sourceRootRelativePath",
 	);
-	const pendingLaunchKey = expectOptionalString(worktree.pendingLaunchKey, "worktree pendingLaunchKey");
-	const pendingLaunchSessionId = expectOptionalString(
-		worktree.pendingLaunchSessionId,
-		"worktree pendingLaunchSessionId",
-	);
-	if (pendingLaunchKey !== undefined && !/^[0-9a-f]{64}$/.test(pendingLaunchKey)) {
-		throw new Error("worktree pendingLaunchKey must be a SHA-256 digest");
-	}
 	return {
 		id: expectWorktreeId(worktree.id),
 		workspaceName: expectString(worktree.workspaceName, "worktree workspaceName"),
@@ -330,8 +318,6 @@ export function parseIrohRemoteWorkspaceWorktree(value: unknown): IrohRemoteWork
 		...(sourceRootRelativePath === undefined ? {} : { sourceRootRelativePath }),
 		branch: expectString(worktree.branch, "worktree branch"),
 		...(baseRef === undefined ? {} : { baseRef }),
-		...(pendingLaunchKey === undefined ? {} : { pendingLaunchKey }),
-		...(pendingLaunchSessionId === undefined ? {} : { pendingLaunchSessionId }),
 		createdAt: expectNumber(worktree.createdAt, "worktree createdAt"),
 		sessionIds: parseArray(worktree.sessionIds, "worktree sessionIds", (entry) =>
 			expectString(entry, "worktree session id"),
