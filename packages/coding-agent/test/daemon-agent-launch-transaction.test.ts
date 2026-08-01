@@ -23,6 +23,7 @@ import { ConversationCoordinatorRegistry } from "../src/daemon/conversation-coor
 import { IntegratedRuntimeRegistry } from "../src/daemon/integrated-runtimes.ts";
 import { IrohDaemonAdmissionGate, IrohDaemonService } from "../src/daemon/iroh-service.ts";
 import { LeaseBroker } from "../src/daemon/lease-broker.ts";
+import type { WorktreeManager } from "../src/daemon/worktree-manager.ts";
 import { createTestSession } from "./iroh-stream-doubles.ts";
 
 const cleanupPaths: string[] = [];
@@ -73,6 +74,7 @@ async function createHarness(options: {
 	beforePublication?: (stateManager: IrohRemoteHostStateManager) => Promise<void>;
 	beforeCommitFlush?: () => Promise<void>;
 	failSelectionPersistence?: boolean;
+	worktrees?: Pick<WorktreeManager, "bindSession" | "create" | "removeIncompleteLaunch">;
 }): Promise<LaunchHarness> {
 	const agentDir = await mkdtemp(join(tmpdir(), "volt-launch-transaction-"));
 	cleanupPaths.push(agentDir);
@@ -170,7 +172,7 @@ async function createHarness(options: {
 		services: { agentDir, state: { state: { settings: { allowTools: null } } } },
 		profile: undefined,
 		trustStore: new ProjectTrustStore(agentDir),
-		worktrees: {},
+		worktrees: options.worktrees ?? {},
 		leaseBroker: broker,
 		runtimes,
 		log: vi.fn(),
@@ -205,6 +207,69 @@ afterEach(async () => {
 });
 
 describe("cold agent launch transaction", () => {
+	test("persists a worktree receipt before creation can escape and converges an identical retry", async () => {
+		let createCount = 0;
+		let removeCount = 0;
+		let harness: LaunchHarness;
+		const worktreePath = join(tmpdir(), "volt-planned-agent-worktree");
+		const worktrees: Pick<WorktreeManager, "bindSession" | "create" | "removeIncompleteLaunch"> = {
+			bindSession: async () => {},
+			create: async (_workspace, createOptions = {}) => {
+				createCount++;
+				if (createCount === 1) {
+					await createOptions.beforeCreate?.({
+						id: "launch-worktree",
+						workspaceName: "volt",
+						path: worktreePath,
+						branch: "volt/launch-worktree",
+						createdAt: 1,
+						sessionIds: [],
+					});
+					const sessionId = createIrohRemoteAgentLaunchSessionId("client-node", "volt", "launch-worktree");
+					const sessionDir = getDefaultSessionDir(harness.workspacePath, harness.agentDir);
+					const session = await SessionManager.findForResume(sessionDir, sessionId);
+					expect(session).toBeDefined();
+					expect(
+						SessionManager.open(session!.path, sessionDir).getAgentLaunchRecord("launch-worktree"),
+					).toMatchObject({
+						receipt: { placement: { kind: "worktree", created: true, worktreeId: "launch-worktree" } },
+						commit: undefined,
+					});
+				}
+				return { ok: false as const, error: "git_failed" as const };
+			},
+			removeIncompleteLaunch: async () => {
+				removeCount++;
+				return removeCount === 1 ? { ok: false as const, error: "git_failed" as const } : { ok: true as const };
+			},
+		};
+		harness = await createHarness({ worktrees });
+		const request: IrohRemoteCreateAgentRequest = {
+			...REQUEST,
+			launchId: "launch-worktree",
+			placement: { kind: "new_worktree", worktreeName: "launch-worktree" },
+		};
+
+		await expect(
+			harness.service.createConfiguredDetachedAgent(harness.authorization, request),
+		).resolves.toMatchObject({
+			kind: "error",
+			error: { kind: "cleanup_required", worktreeId: "launch-worktree" },
+		});
+		const sessionId = createIrohRemoteAgentLaunchSessionId("client-node", "volt", request.launchId);
+		const sessionDir = getDefaultSessionDir(harness.workspacePath, harness.agentDir);
+		await expect(SessionManager.findForResume(sessionDir, sessionId)).resolves.toBeDefined();
+
+		await expect(
+			harness.service.createConfiguredDetachedAgent(harness.authorization, request),
+		).resolves.toMatchObject({
+			kind: "error",
+			error: { kind: "placement_unavailable" },
+		});
+		expect(removeCount).toBe(2);
+		await expect(SessionManager.findForResume(sessionDir, sessionId)).resolves.toBeUndefined();
+	});
+
 	test("commits a created launch last and returns existing for an identical retry", async () => {
 		const harness = await createHarness({});
 

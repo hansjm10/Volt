@@ -107,6 +107,39 @@ describe("incomplete agent launch startup reconciliation", () => {
 		},
 	);
 
+	test("removes the receipt only when recovery verifies the worktree is already absent", async () => {
+		const fixture = await createLaunchFixture();
+		const unverifiedRemoval = vi.fn(async () => ({ ok: false as const, error: "worktree_not_found" }));
+
+		await expect(
+			cleanupIncompleteAgentLaunch({
+				workspace: fixture.workspace,
+				sessionId: "agent-session",
+				sessionFile: fixture.sessionFile,
+				record: fixture.record,
+				removeWorktree: unverifiedRemoval,
+			}),
+		).resolves.toEqual({ kind: "cleanup_required", worktreeId: "launch-worktree" });
+		expect(existsSync(fixture.sessionFile)).toBe(true);
+
+		const verifiedRemoval = vi.fn(async () => ({
+			ok: false as const,
+			error: "worktree_not_found",
+			verifiedAbsent: true,
+		}));
+		await expect(
+			cleanupIncompleteAgentLaunch({
+				workspace: fixture.workspace,
+				sessionId: "agent-session",
+				sessionFile: fixture.sessionFile,
+				record: fixture.record,
+				removeWorktree: verifiedRemoval,
+			}),
+		).resolves.toEqual({ kind: "cleaned" });
+		expect(verifiedRemoval).toHaveBeenCalledWith(fixture.workspace, "launch-worktree");
+		expect(existsSync(fixture.sessionFile)).toBe(false);
+	});
+
 	test("leaves committed launch sessions and their worktrees untouched", async () => {
 		const fixture = await createLaunchFixture(true);
 		const removeWorktree = vi.fn(async () => ({ ok: true as const }));

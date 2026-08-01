@@ -316,7 +316,13 @@ export class WorktreeManager {
 	/** git worktree add; persists the record durably after git succeeds. */
 	async create(
 		workspace: IrohRemoteWorkspace,
-		options: { id?: string; branch?: string; baseRef?: string; workingDirectory?: string } = {},
+		options: {
+			id?: string;
+			branch?: string;
+			baseRef?: string;
+			workingDirectory?: string;
+			beforeCreate?: (worktree: IrohRemoteWorkspaceWorktree) => void | Promise<void>;
+		} = {},
 	): Promise<WorktreeResult<{ worktree: IrohRemoteWorkspaceWorktree }>> {
 		const id = options.id ?? generateWorktreeIdSlug();
 		if (!WORKTREE_ID_PATTERN.test(id)) {
@@ -365,18 +371,6 @@ export class WorktreeManager {
 					recursive: true,
 					mode: 0o700,
 				});
-				const added = await this.runGit(
-					["worktree", "add", checkoutPath, "-b", branch, baseRef],
-					source.source.sourceRootPath,
-				);
-				if (!added.ok) {
-					return {
-						result: this.mapGitFailure(added.stderr, registeredWorkspace, checkoutPath, [
-							source.source.sourceRootPath,
-						]),
-					};
-				}
-
 				const worktree: IrohRemoteWorkspaceWorktree = {
 					id,
 					workspaceName: registeredWorkspace.name,
@@ -389,6 +383,19 @@ export class WorktreeManager {
 					createdAt: this.now(),
 					sessionIds: [],
 				};
+				await options.beforeCreate?.(structuredClone(worktree));
+				const added = await this.runGit(
+					["worktree", "add", checkoutPath, "-b", branch, baseRef],
+					source.source.sourceRootPath,
+				);
+				if (!added.ok) {
+					return {
+						result: this.mapGitFailure(added.stderr, registeredWorkspace, checkoutPath, [
+							source.source.sourceRootPath,
+						]),
+					};
+				}
+
 				return { result: { ok: true, worktree }, worktree };
 			});
 			if (result.ok) {
@@ -809,6 +816,75 @@ export class WorktreeManager {
 		await this.stateManager.removeWorktree(workspace.name, worktreeId);
 		await this.flushState?.();
 		return { ok: true };
+	}
+
+	/**
+	 * Idempotent force-removal for an incomplete launch reservation. Unlike the
+	 * user-facing remove path, a missing record is successful only when the
+	 * deterministic checkout is also absent. If creation escaped without its
+	 * daemon record, use the original working directory to remove that checkout
+	 * through its source repository.
+	 */
+	async removeIncompleteLaunch(
+		workspace: IrohRemoteWorkspace,
+		worktreeId: string,
+		workingDirectory?: string,
+	): Promise<WorktreeResult<Record<never, never>>> {
+		const record = await this.findWorktree(workspace.name, worktreeId);
+		if (record) {
+			return this.remove(workspace, worktreeId, { force: true });
+		}
+		if (!WORKTREE_ID_PATTERN.test(worktreeId)) {
+			return { ok: false, error: "invalid_worktree_id" };
+		}
+		try {
+			return await this.stateManager.runWorkspaceWorktreeLifecycle<WorktreeResult<Record<never, never>>>(
+				workspace.name,
+				async (current) => {
+					if (current.worktrees.some((candidate) => candidate.id === worktreeId)) {
+						return {
+							result: {
+								ok: false,
+								error: "worktree_busy",
+								detail: "worktree state changed during incomplete-launch recovery; retry cleanup",
+							},
+						};
+					}
+					const checkoutPath = getWorktreeCheckoutPath(this.agentDir, current.workspace.path, worktreeId);
+					if (!existsSync(checkoutPath)) {
+						return { result: { ok: true } };
+					}
+					const source = await this.resolveCreateSource(current.workspace, workingDirectory);
+					if (!source.ok) {
+						return { result: source };
+					}
+					const removed = await this.runGit(
+						["worktree", "remove", "--force", checkoutPath],
+						source.source.sourceRootPath,
+					);
+					if (existsSync(checkoutPath)) {
+						return {
+							result: removed.ok
+								? {
+										ok: false,
+										error: "git_failed",
+										detail: "git reported successful recovery removal but the checkout remains",
+									}
+								: this.mapGitFailure(removed.stderr, current.workspace, checkoutPath, [
+										source.source.sourceRootPath,
+									]),
+						};
+					}
+					await this.runGit(["worktree", "prune"], source.source.sourceRootPath).catch(() => undefined);
+					return { result: { ok: true } };
+				},
+			);
+		} catch (error) {
+			if (isIrohRemoteWorktreeParentWorkspaceNotFoundError(error)) {
+				return { ok: false, error: "worktree_source_unregistered" };
+			}
+			throw error;
+		}
 	}
 
 	/**

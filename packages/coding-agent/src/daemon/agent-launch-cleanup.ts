@@ -15,7 +15,7 @@ export async function cleanupIncompleteAgentLaunch(options: {
 	removeWorktree: (
 		workspace: IrohRemoteWorkspace,
 		worktreeId: string,
-	) => Promise<{ ok: true } | { ok: false; error: string }>;
+	) => Promise<{ ok: true } | { ok: false; error: string; verifiedAbsent?: boolean }>;
 	log?: (message: string, details: Record<string, unknown>) => void;
 }): Promise<IncompleteAgentLaunchCleanupResult> {
 	if (options.record.commit !== undefined) {
@@ -27,8 +27,8 @@ export async function cleanupIncompleteAgentLaunch(options: {
 		let removalError: string | undefined;
 		try {
 			const result = await options.removeWorktree(options.workspace, placement.worktreeId);
-			removed = result.ok;
-			if (!result.ok) removalError = result.error;
+			removed = result.ok || (result.error === "worktree_not_found" && result.verifiedAbsent === true);
+			if (!result.ok && !removed) removalError = result.error;
 		} catch (error) {
 			removalError = error instanceof Error ? error.message : String(error);
 		}

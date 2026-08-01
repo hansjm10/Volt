@@ -1834,6 +1834,38 @@ export class SessionManager {
 		return this.cwd;
 	}
 
+	/**
+	 * Durably correct the cwd of a write-ahead cold-launch reservation after its
+	 * managed worktree exists. This is intentionally unavailable once any
+	 * conversation/config entry or launch commit has been appended.
+	 */
+	relocateUncommittedAgentLaunch(cwd: string, launchId: string): void {
+		this._assertPersistenceHealthy();
+		const record = this.getAgentLaunchRecord(launchId);
+		const receipts = this.fileEntries.filter((entry) => entry.type === "agent_launch_receipt");
+		if (
+			!record ||
+			record.commit !== undefined ||
+			record.receipt.placement.kind !== "worktree" ||
+			!record.receipt.placement.created ||
+			receipts.length !== 1 ||
+			receipts[0]?.launchId !== launchId ||
+			this.fileEntries.some((entry) => entry.type !== "session" && entry.type !== "agent_launch_receipt")
+		) {
+			throw new Error(`Agent launch ${JSON.stringify(launchId)} is not an uncommitted worktree reservation`);
+		}
+		const nextCwd = resolvePath(cwd);
+		if (nextCwd === this.cwd) return;
+		const header = this.getHeader();
+		if (!header) {
+			throw new Error("Session has no header");
+		}
+		this.cwd = nextCwd;
+		header.cwd = nextCwd;
+		this._rewriteFile();
+		this.flushed = true;
+	}
+
 	getSessionDir(): string {
 		return this.sessionDir;
 	}

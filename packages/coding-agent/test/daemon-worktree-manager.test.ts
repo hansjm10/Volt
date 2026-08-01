@@ -148,6 +148,63 @@ describe("worktree manager (fake git)", () => {
 		expect(records[0]?.id).toBe("fix-login");
 	});
 
+	it("runs the durable reservation callback before git worktree add", async () => {
+		const git = okGit();
+		const manager = createManager(git.runGit);
+		const beforeCreate = vi.fn(async (plannedWorktree) => {
+			expect(plannedWorktree).toMatchObject({
+				id: "reserved",
+				workspaceName: "repo",
+				branch: "volt/reserved",
+				sessionIds: [],
+			});
+			expect(git.calls.some((call) => call.args[0] === "worktree" && call.args[1] === "add")).toBe(false);
+		});
+
+		await expect(manager.create(workspace, { id: "reserved", beforeCreate })).resolves.toMatchObject({ ok: true });
+		expect(beforeCreate).toHaveBeenCalledOnce();
+		expect(git.calls.at(-1)?.args.slice(0, 2)).toEqual(["worktree", "add"]);
+	});
+
+	it("does not create a checkout or record when the reservation callback fails", async () => {
+		const git = okGit();
+		const manager = createManager(git.runGit);
+
+		await expect(
+			manager.create(workspace, {
+				id: "reservation-failure",
+				beforeCreate: async () => {
+					throw new Error("receipt flush failed");
+				},
+			}),
+		).rejects.toThrow("receipt flush failed");
+		expect(git.calls.some((call) => call.args[0] === "worktree" && call.args[1] === "add")).toBe(false);
+		expect(await stateManager.listWorktrees("repo")).toEqual([]);
+	});
+
+	it("idempotently removes absent and recordless incomplete-launch checkouts", async () => {
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "incomplete");
+		const git = createFakeGit((args) => {
+			if (args[0] === "worktree" && args[1] === "remove") {
+				rmSync(checkout, { recursive: true, force: true });
+			}
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+
+		await expect(manager.removeIncompleteLaunch(workspace, "incomplete")).resolves.toEqual({ ok: true });
+		expect(git.calls).toEqual([]);
+
+		mkdirSync(checkout, { recursive: true });
+		await expect(manager.removeIncompleteLaunch(workspace, "incomplete")).resolves.toEqual({ ok: true });
+		expect(existsSync(checkout)).toBe(false);
+		expect(git.calls).toContainEqual({
+			args: ["worktree", "remove", "--force", checkout],
+			cwd: realpathSync(workspaceDir),
+		});
+		expect(git.calls.at(-1)).toEqual({ args: ["worktree", "prune"], cwd: realpathSync(workspaceDir) });
+	});
+
 	it("serializes workspace unregister with create through child persistence", async () => {
 		const addStarted = createDeferred();
 		const finishAdd = createDeferred();
