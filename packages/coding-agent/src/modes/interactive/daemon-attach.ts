@@ -702,10 +702,10 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			if (contextChanged && activeClient && workspaceName && state === "connected") {
 				let targetAcquireStarted = false;
 				try {
-					if (!(await ensureWorktreeBinding(activeClient, workspaceName, newSessionId, false))) {
+					targetAcquireStarted = true;
+					if (!(await ensureWorktreeBinding(activeClient, workspaceName, newSessionId, true))) {
 						throw new Error("replacement session could not be bound to its worktree");
 					}
-					targetAcquireStarted = true;
 					const targetAcquireResponse = await activeClient.request({
 						type: "lease_acquire",
 						workspaceName,
@@ -765,7 +765,12 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 						if (
 							bindClient &&
 							bindWorkspaceName &&
-							!(await ensureWorktreeBinding(bindClient, bindWorkspaceName, newSessionId, false))
+							!(await ensureWorktreeBinding(
+								bindClient,
+								bindWorkspaceName,
+								newSessionId,
+								!targetLeasePreacquired,
+							))
 						) {
 							throw new Error("replacement session could not be bound to its worktree");
 						}
