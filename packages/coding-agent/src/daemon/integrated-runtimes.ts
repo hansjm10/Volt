@@ -816,10 +816,10 @@ export class IntegratedRuntimeRegistry {
 		this.scheduleRetention(entry, "agent_cold_launch_finalized");
 	}
 
-	private registerSubagentRuntime(
+	async registerSubagentRuntime(
 		event: IrohRemoteSubagentRuntimeCreatedEvent,
 		authorization: IrohRemoteClientAuthorizationSuccess,
-	): SubagentRuntimeRegistration {
+	): Promise<SubagentRuntimeRegistration> {
 		const workspaceName = authorization.workspace.name;
 		const parentEntry = this.findOwner(workspaceName, event.parentSessionId);
 		if (!parentEntry || parentEntry.lifecycle !== "active") {
@@ -831,6 +831,12 @@ export class IntegratedRuntimeRegistry {
 		) {
 			throw new Error(`Subagent session ${event.sessionId} is already active`);
 		}
+		if (parentEntry.worktreeId !== undefined) {
+			if (!this.options.bindWorktreeSession) {
+				throw new Error(`Worktree binding is unavailable for subagent session ${event.sessionId}`);
+			}
+			await this.options.bindWorktreeSession(workspaceName, parentEntry.worktreeId, event.sessionId);
+		}
 		const entry = this.createEntryRecord({
 			clientNodeId: authorization.client.nodeId,
 			workspaceName,
@@ -838,6 +844,12 @@ export class IntegratedRuntimeRegistry {
 			runtime: event.runtime,
 			parentSessionId: event.parentSessionId,
 			subagentId: event.id,
+			...(parentEntry.worktreeId === undefined ? {} : { worktreeId: parentEntry.worktreeId }),
+			...(parentEntry.worktreePath === undefined ? {} : { worktreePath: parentEntry.worktreePath }),
+			...(parentEntry.worktreeSourceRootRelativePath === undefined
+				? {}
+				: { worktreeSourceRootRelativePath: parentEntry.worktreeSourceRootRelativePath }),
+			...(parentEntry.workingDirectory === undefined ? {} : { workingDirectory: parentEntry.workingDirectory }),
 			toolPolicy: parentEntry.toolPolicy,
 		});
 		let state: "prepared" | "committed" | "rolled-back" = "prepared";

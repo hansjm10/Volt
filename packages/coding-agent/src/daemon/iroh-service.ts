@@ -2634,6 +2634,7 @@ export class IrohDaemonService {
 				projectTrusted,
 				toolPolicy,
 				resolvedSessionTarget,
+				onSubagentRuntimeCreated: (event) => this.runtimes.registerSubagentRuntime(event, authorization),
 				launchConfig: {
 					model: config.model,
 					thinkingLevel: config.thinkingLevel,
