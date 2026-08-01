@@ -3563,7 +3563,8 @@ export class IrohDaemonService {
 			await runIrohRemoteRpcMode(entry.runtime, {
 				rpcGrant: authorization.client.rpcGrant,
 				clientNodeId: authorization.client.nodeId,
-				isRpcGrantCurrent: () => (workspaceUnregistered ? false : this.isAuthorizationCurrent(authorization)),
+				isRpcIngressOpen: () => !workspaceUnregistered,
+				isRpcGrantCurrent: () => this.isAuthorizationCurrent(authorization),
 				decorateOutbound: (value) => decorateRemoteHostState(value, authorization, responseContext),
 				disposeRuntimeOnClose: false,
 				notificationDelivery: pushDispatcher,
@@ -4210,6 +4211,7 @@ export class IrohDaemonService {
 					connection.connectionId,
 					request.workspaceName,
 					request.sessionId,
+					request.reason,
 				);
 				if (!result.ok) {
 					connection.send({ type: "error", id: request.id, code: result.code, message: "lease not held" });

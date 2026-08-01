@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { LeaseReleaseReason } from "./control-protocol.ts";
 
 /**
  * Conversation lease broker: the single authority on which process owns the
@@ -14,8 +15,6 @@ export type LeaseHandoff = "cold" | "warm" | "none";
 
 export type LeaseDenyReason = "held_by_tui" | "force_unsupported" | "draining_elsewhere";
 export type DaemonAttachRejectionReason = "tui_owned" | "draining" | "runtime_owner_fenced";
-
-export type LeaseReleaseReason = "quit" | "switch" | "connection_lost" | "rekey" | "shutdown" | "retention_expired";
 
 export interface LeaseRecord {
 	key: string;
@@ -184,7 +183,7 @@ export interface LeaseBrokerEffects {
 	/** Close open relays for a tui-owned lease. */
 	closeRelays(
 		record: LeaseRecord,
-		reason: "lease_transferred" | "session_rekeyed_reconnect" | "host_shutdown" | "error",
+		reason: "lease_transferred" | "session_rekeyed_reconnect" | "workspace_unregistered" | "host_shutdown" | "error",
 	): void;
 	/** Reserve the stable conversation authority before daemon-runtime retirement begins. */
 	beginTuiLeaseHandoff(workspaceName: string, sessionId: string, connectionId: string): void;
@@ -1075,7 +1074,10 @@ export class LeaseBroker {
 			return { ok: false, code: "not_held" };
 		}
 		this.clearTuiRekeyReservationsForRecord(record);
-		this.effects.closeRelays(record, "lease_transferred");
+		this.effects.closeRelays(
+			record,
+			reason === "workspace_unregistered" ? "workspace_unregistered" : "lease_transferred",
+		);
 		record.relayIds.clear();
 		record.state = "unowned";
 		record.tuiConnectionId = undefined;

@@ -42,7 +42,13 @@ describe("control protocol framing", () => {
 			{ type: "shutdown", id: "2" },
 			{ type: "lease_acquire", id: "3", workspaceName: "volt", sessionId: "s-1" },
 			{ type: "lease_acquire", id: "3b", workspaceName: "volt", sessionId: "s-1", force: true },
-			{ type: "lease_release", id: "4", workspaceName: "volt", sessionId: "s-1" },
+			{
+				type: "lease_release",
+				id: "4",
+				workspaceName: "volt",
+				sessionId: "s-1",
+				reason: "workspace_unregistered",
+			},
 			{
 				type: "lease_rekey_prepare",
 				id: "5",
@@ -203,6 +209,12 @@ describe("control protocol framing", () => {
 
 	it("rejects a prepared-rekey response without its transaction id", () => {
 		expect(isControlResponse({ type: "lease_rekey_prepared", id: "5a" })).toBe(false);
+	});
+
+	it("rejects lease release without a recognized reason", () => {
+		const request = { type: "lease_release", id: "4", workspaceName: "volt", sessionId: "s-1" };
+		expect(isControlRequest(request)).toBe(false);
+		expect(isControlRequest({ ...request, reason: "workspace_removed" })).toBe(false);
 	});
 
 	it("rejects pair_request with a malformed workspace", () => {

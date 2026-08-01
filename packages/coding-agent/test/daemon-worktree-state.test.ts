@@ -39,23 +39,31 @@ function createWorktree(overrides: Partial<IrohRemoteWorkspaceWorktree> = {}): I
 function createHostStateWithWorktrees(): IrohRemoteHostState {
 	return {
 		...createEmptyIrohRemoteHostState(),
+		workspaceGenerationCounter: 4,
+		workspaceGenerations: [{ workspaceName: "ws", generation: 4 }],
 		workspaces: [{ name: "ws", path: "/tmp/ws" }],
 		worktrees: [createWorktree()],
 	};
 }
 
 describe("worktree state round-trips (all five enumeration sites)", () => {
-	it("parseIrohRemoteHostState preserves worktrees and parses old files without the key to []", () => {
+	it("parseIrohRemoteHostState preserves worktrees and workspace generations with legacy defaults", () => {
 		const parsed = parseIrohRemoteHostState({
+			workspaceGenerationCounter: 4,
+			workspaceGenerations: [{ workspaceName: "ws", generation: 4 }],
 			workspaces: [{ name: "ws", path: "/tmp/ws" }],
 			clients: [],
 			worktrees: [createWorktree()],
 		});
 		expect(parsed.worktrees).toEqual([createWorktree()]);
+		expect(parsed.workspaceGenerationCounter).toBe(4);
+		expect(parsed.workspaceGenerations).toEqual([{ workspaceName: "ws", generation: 4 }]);
 
-		// Old state files never carried the key: they must load cleanly as [].
+		// Old state files never carried these keys: they must load cleanly with empty metadata.
 		const legacy = parseIrohRemoteHostState({ workspaces: [], clients: [] });
 		expect(legacy.worktrees).toEqual([]);
+		expect(legacy.workspaceGenerationCounter).toBe(0);
+		expect(legacy.workspaceGenerations).toEqual([]);
 	});
 
 	it("rejects malformed worktree entries with the standard error shape", () => {
@@ -69,6 +77,28 @@ describe("worktree state round-trips (all five enumeration sites)", () => {
 			"worktree sessionIds",
 		);
 		expect(() => parseIrohRemoteHostState({ workspaces: [], clients: [], worktrees: [{ id: "x" }] })).toThrow();
+		for (const generationState of [
+			{ workspaceGenerationCounter: -1, workspaceGenerations: [] },
+			{ workspaceGenerationCounter: 1.5, workspaceGenerations: [] },
+			{ workspaceGenerationCounter: 1, workspaceGenerations: [{ workspaceName: "ws", generation: 0 }] },
+			{ workspaceGenerationCounter: 1, workspaceGenerations: [{ workspaceName: "ws", generation: 2 }] },
+			{
+				workspaceGenerationCounter: 2,
+				workspaceGenerations: [
+					{ workspaceName: "ws", generation: 1 },
+					{ workspaceName: "ws", generation: 2 },
+				],
+			},
+			{
+				workspaceGenerationCounter: 1,
+				workspaceGenerations: [
+					{ workspaceName: "ws", generation: 1 },
+					{ workspaceName: "other", generation: 1 },
+				],
+			},
+		]) {
+			expect(() => parseIrohRemoteHostState({ workspaces: [], clients: [], ...generationState })).toThrow();
+		}
 		// A missing baseRef stays absent (optional).
 		const withoutBaseRef = { ...createWorktree() } as Record<string, unknown>;
 		delete withoutBaseRef.baseRef;
@@ -82,6 +112,8 @@ describe("worktree state round-trips (all five enumeration sites)", () => {
 			await writeIrohRemoteHostState(statePath, createHostStateWithWorktrees());
 			const reread = await readIrohRemoteHostState(statePath);
 			expect(reread.worktrees).toEqual([createWorktree()]);
+			expect(reread.workspaceGenerationCounter).toBe(4);
+			expect(reread.workspaceGenerations).toEqual([{ workspaceName: "ws", generation: 4 }]);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -94,17 +126,31 @@ describe("worktree state round-trips (all five enumeration sites)", () => {
 		// Mutating the returned clone must not leak into the manager's state.
 		state.worktrees?.[0]?.sessionIds.push("s-injected");
 		state.worktrees?.pop();
+		const generationRecord = state.workspaceGenerations?.[0];
+		if (generationRecord) generationRecord.generation = 99;
+		state.workspaceGenerations?.pop();
 		const fresh = await manager.getState();
 		expect(fresh.worktrees).toEqual([createWorktree()]);
+		expect(fresh.workspaceGenerations).toEqual([{ workspaceName: "ws", generation: 4 }]);
 	});
 
 	it("voltdStateToHostState/hostStateToVoltdState carry worktrees both ways", () => {
 		const settings = createEmptyVoltdState().settings;
 		const voltd = hostStateToVoltdState(createHostStateWithWorktrees(), settings);
 		expect(voltd.worktrees).toEqual([createWorktree()]);
-		expect(voltdStateToHostState(voltd).worktrees).toEqual([createWorktree()]);
-		// Host state without the collection maps to [] on the return trip.
-		expect(hostStateToVoltdState({ workspaces: [], clients: [] }, settings).worktrees).toEqual([]);
+		expect(voltd.workspaceGenerationCounter).toBe(4);
+		expect(voltd.workspaceGenerations).toEqual([{ workspaceName: "ws", generation: 4 }]);
+		expect(voltdStateToHostState(voltd)).toMatchObject({
+			worktrees: [createWorktree()],
+			workspaceGenerationCounter: 4,
+			workspaceGenerations: [{ workspaceName: "ws", generation: 4 }],
+		});
+		// Host state without the collections maps to empty defaults on the return trip.
+		expect(hostStateToVoltdState({ workspaces: [], clients: [] }, settings)).toMatchObject({
+			worktrees: [],
+			workspaceGenerationCounter: 0,
+			workspaceGenerations: [],
+		});
 	});
 
 	it("parseVoltdState preserves worktrees and defaults them for old daemon state files", () => {
@@ -113,12 +159,20 @@ describe("worktree state round-trips (all five enumeration sites)", () => {
 			JSON.parse(JSON.stringify(hostStateToVoltdState(createHostStateWithWorktrees(), settings))),
 		);
 		expect(withWorktrees.worktrees).toEqual([createWorktree()]);
+		expect(withWorktrees.workspaceGenerationCounter).toBe(4);
+		expect(withWorktrees.workspaceGenerations).toEqual([{ workspaceName: "ws", generation: 4 }]);
 
 		const oldFile = JSON.parse(
 			JSON.stringify(hostStateToVoltdState(createHostStateWithWorktrees(), settings)),
 		) as Record<string, unknown>;
 		delete oldFile.worktrees;
-		expect(parseVoltdState(oldFile).worktrees).toEqual([]);
+		delete oldFile.workspaceGenerationCounter;
+		delete oldFile.workspaceGenerations;
+		expect(parseVoltdState(oldFile)).toMatchObject({
+			worktrees: [],
+			workspaceGenerationCounter: 0,
+			workspaceGenerations: [],
+		});
 	});
 });
 
@@ -280,10 +334,42 @@ describe("stream authorization freshness", () => {
 		await expect(manager.isAuthorizationCurrent(authorization)).resolves.toBe(true);
 		await manager.unregisterWorkspace("ws");
 		await expect(manager.isAuthorizationCurrent(authorization)).resolves.toBe(false);
+
+		await manager.upsertWorkspace(workspace);
+		const firstReplacementState = await manager.getState();
+		expect(firstReplacementState.workspaceGenerationCounter).toBe(1);
+		expect(firstReplacementState.workspaceGenerations).toEqual([{ workspaceName: "ws", generation: 1 }]);
+		await expect(manager.isAuthorizationCurrent(authorization)).resolves.toBe(false);
+		const firstReplacementAuthorization = { ...authorization, workspaceGeneration: 1 };
+		await expect(manager.isAuthorizationCurrent(firstReplacementAuthorization)).resolves.toBe(true);
+
+		await manager.upsertWorkspace(workspace);
+		await manager.upsertWorkspace({ ...workspace, allowedTools: " read " });
+		expect((await manager.getState()).workspaceGenerationCounter).toBe(1);
 		await manager.upsertWorkspace({ ...workspace, path: "/tmp/replacement" });
-		await expect(manager.isAuthorizationCurrent(authorization)).resolves.toBe(false);
-		await manager.upsertWorkspace({ ...workspace, allowedTools: "read,bash" });
-		await expect(manager.isAuthorizationCurrent(authorization)).resolves.toBe(false);
+		await expect(manager.isAuthorizationCurrent(firstReplacementAuthorization)).resolves.toBe(false);
+		await manager.upsertWorkspace(workspace);
+		const revertedState = await manager.getState();
+		expect(revertedState.workspaceGenerationCounter).toBe(3);
+		await expect(manager.isAuthorizationCurrent(firstReplacementAuthorization)).resolves.toBe(false);
+		await expect(manager.isAuthorizationCurrent({ ...authorization, workspaceGeneration: 3 })).resolves.toBe(true);
+	});
+
+	it("fails closed without mutating a registration when the generation counter is exhausted", async () => {
+		const workspace = { name: "ws", path: "/tmp/ws" };
+		const manager = new IrohRemoteHostStateManager({
+			initialState: {
+				...createEmptyIrohRemoteHostState(),
+				workspaceGenerationCounter: Number.MAX_SAFE_INTEGER,
+				workspaceGenerations: [{ workspaceName: "ws", generation: Number.MAX_SAFE_INTEGER }],
+				workspaces: [workspace],
+			},
+		});
+
+		await expect(manager.upsertWorkspace({ ...workspace, path: "/tmp/replacement" })).rejects.toThrow(
+			"Workspace generation counter is exhausted",
+		);
+		expect((await manager.getState()).workspaces).toEqual([workspace]);
 	});
 });
 

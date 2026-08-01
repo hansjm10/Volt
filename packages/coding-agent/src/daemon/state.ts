@@ -27,6 +27,8 @@ export interface VoltdStateFileV1 {
 	irohSecretKey?: number[];
 	clients: IrohRemoteClient[];
 	revokedClients: IrohRemoteRevokedClient[];
+	workspaceGenerationCounter: NonNullable<IrohRemoteHostState["workspaceGenerationCounter"]>;
+	workspaceGenerations: NonNullable<IrohRemoteHostState["workspaceGenerations"]>;
 	workspaces: IrohRemoteWorkspace[];
 	worktrees: IrohRemoteWorkspaceWorktree[];
 	pendingPairingTickets: IrohRemotePendingPairingTicket[];
@@ -110,6 +112,8 @@ export function createEmptyVoltdState(): VoltdStateFileV1 {
 		irohSecretKey: undefined,
 		clients: [],
 		revokedClients: [],
+		workspaceGenerationCounter: 0,
+		workspaceGenerations: [],
 		workspaces: [],
 		worktrees: [],
 		pendingPairingTickets: [],
@@ -126,6 +130,8 @@ export function voltdStateToHostState(state: VoltdStateFileV1): IrohRemoteHostSt
 		hostSecretKey: state.irohSecretKey,
 		clients: state.clients,
 		revokedClients: state.revokedClients,
+		workspaceGenerationCounter: state.workspaceGenerationCounter,
+		workspaceGenerations: state.workspaceGenerations,
 		workspaces: state.workspaces,
 		worktrees: state.worktrees,
 		pendingPairingTickets: state.pendingPairingTickets,
@@ -142,6 +148,8 @@ export function hostStateToVoltdState(
 		irohSecretKey: hostState.hostSecretKey,
 		clients: hostState.clients,
 		revokedClients: hostState.revokedClients ?? [],
+		workspaceGenerationCounter: hostState.workspaceGenerationCounter ?? 0,
+		workspaceGenerations: hostState.workspaceGenerations ?? [],
 		workspaces: hostState.workspaces,
 		worktrees: hostState.worktrees ?? [],
 		pendingPairingTickets: hostState.pendingPairingTickets ?? [],

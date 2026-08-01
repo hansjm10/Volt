@@ -180,6 +180,32 @@ function withStalledRead(
 	};
 }
 
+function withGatedUnregisterResponse(
+	stream: IrohBiStreamLike,
+	onWriteStarted: () => void,
+	writeGate: Promise<void>,
+): IrohBiStreamLike {
+	let gated = false;
+	const finish = stream.send.finish?.bind(stream.send);
+	const reset = stream.send.reset?.bind(stream.send);
+	return {
+		recv: stream.recv,
+		send: {
+			async writeAll(bytes) {
+				const line = Buffer.from(bytes).toString("utf8");
+				if (!gated && line.includes('"command":"unregister_workspace"') && line.includes('"success":true')) {
+					gated = true;
+					onWriteStarted();
+					await writeGate;
+				}
+				await stream.send.writeAll(bytes);
+			},
+			...(finish === undefined ? {} : { finish }),
+			...(reset === undefined ? {} : { reset }),
+		},
+	};
+}
+
 async function writeJsonLine(stream: IrohBiStreamLike, value: object): Promise<void> {
 	await stream.send.writeAll(Array.from(Buffer.from(`${JSON.stringify(value)}\n`, "utf8")));
 }
@@ -691,6 +717,8 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 		let utilityPublicationStarted = false;
 		const conversationPublicationGate = createDeferred();
 		const utilityPublicationGate = createDeferred();
+		const unregisterResponseWriteGate = createDeferred();
+		let unregisterResponseWriteStarted = false;
 		const controlEvents: ControlEvent[] = [];
 		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
 			createIrohDaemonService(
@@ -706,6 +734,14 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 							await utilityPublicationGate.promise;
 						}
 					},
+					decorateAcceptedStream: (stream) =>
+						withGatedUnregisterResponse(
+							stream,
+							() => {
+								unregisterResponseWriteStarted = true;
+							},
+							unregisterResponseWriteGate.promise,
+						),
 				},
 			),
 		]);
@@ -804,6 +840,9 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 					branchEpoch: transcript.branchEpoch,
 				},
 			});
+			await expect.poll(() => unregisterResponseWriteStarted).toBe(true);
+			await writeJsonLine(stream, { id: "pipelined", type: "get_state" });
+			unregisterResponseWriteGate.resolve();
 			const unregisterResponse = await readJsonLineMatching(
 				stream,
 				bootstrap.rest,
@@ -822,6 +861,33 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 				reason: "workspace_unregistered",
 				workspace: "ws",
 				sessionId: conversation.sessionId,
+			});
+
+			await expect(
+				control.request({ type: "workspace_register", name: "ws", path: workspaceDir }),
+			).resolves.toMatchObject({ type: "ok" });
+			pauseRacingPublications = false;
+			const freshUtility = await connection.openBi();
+			await writeJsonLine(freshUtility, {
+				type: "volt_iroh_hello",
+				protocol: IROH_REMOTE_ALPN,
+				workspace: "ws",
+				clientLabel: "vitest-fresh-utility",
+				workspaceDiscovery: { purpose: "list_sessions" },
+			});
+			const freshUtilityHandshake = await readJsonLine(freshUtility);
+			expect(freshUtilityHandshake.value).toMatchObject({
+				type: "volt_iroh_handshake",
+				success: true,
+				workspace: "ws",
+			});
+			await writeJsonLine(freshUtility, { id: "fresh-list", type: "list_sessions" });
+			const freshListResponse = await readJsonLine(freshUtility, freshUtilityHandshake.rest);
+			expect(freshListResponse.value).toMatchObject({
+				id: "fresh-list",
+				type: "response",
+				command: "list_sessions",
+				success: true,
 			});
 
 			conversationPublicationGate.resolve();
@@ -850,13 +916,11 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 				})
 				.toEqual([]);
 			await expect(control.request({ type: "workspace_unregister", name: "ws" })).resolves.toMatchObject({
-				type: "error",
-				code: "not_found",
+				type: "ok",
 			});
 			await expect
 				.poll(() => readFileSync(getDaemonPaths(agentDir).auditPath, "utf8"))
 				.toContain('"reason":"workspace_unregistered"');
-			await writeJsonLine(stream, { id: "stale", type: "get_state" }).catch(() => {});
 			let postUnregisterLine: string | undefined;
 			try {
 				postUnregisterLine = (await readLineFromIroh(stream.recv, terminal.rest, { maxLineBytes: 1024 * 1024 }))
@@ -868,6 +932,7 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 		} finally {
 			conversationPublicationGate.resolve();
 			utilityPublicationGate.resolve();
+			unregisterResponseWriteGate.resolve();
 			connection?.close(0n, Array.from(Buffer.from("done", "utf8")));
 			await phone?.close().catch(() => {});
 			if (!daemonStopped && control !== undefined) {
