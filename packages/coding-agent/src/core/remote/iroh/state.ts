@@ -15,6 +15,11 @@ export interface IrohRemoteWorkspace {
 	allowedTools?: string;
 }
 
+export interface IrohRemoteWorkspaceGeneration {
+	workspaceName: string;
+	generation: number;
+}
+
 /** A daemon-managed git worktree, keyed under its parent workspace. */
 export interface IrohRemoteWorkspaceWorktree {
 	/** ^[a-z0-9][a-z0-9._-]{0,63}$ — unique per workspace. */
@@ -138,6 +143,8 @@ export interface IrohRemotePairingSecretTombstone {
 export interface IrohRemoteHostState {
 	hostSecretKey?: number[];
 	pairingSecretTombstones?: IrohRemotePairingSecretTombstone[];
+	workspaceGenerationCounter?: number;
+	workspaceGenerations?: IrohRemoteWorkspaceGeneration[];
 	workspaces: IrohRemoteWorkspace[];
 	worktrees?: IrohRemoteWorkspaceWorktree[];
 	clients: IrohRemoteClient[];
@@ -149,6 +156,8 @@ export function createEmptyIrohRemoteHostState(): IrohRemoteHostState {
 	return {
 		hostSecretKey: undefined,
 		pairingSecretTombstones: [],
+		workspaceGenerationCounter: 0,
+		workspaceGenerations: [],
 		workspaces: [],
 		worktrees: [],
 		clients: [],
@@ -191,6 +200,7 @@ export function parseIrohRemoteHostState(value: unknown, options?: IrohRemoteSta
 			"pairingSecretTombstones",
 			parseIrohRemotePairingSecretTombstone,
 		),
+		...parseWorkspaceGenerationState(state),
 		workspaces: parseArray(state.workspaces, "workspaces", parseIrohRemoteWorkspace),
 		worktrees: parseOptionalArray(state.worktrees, "worktrees", parseIrohRemoteWorkspaceWorktree),
 		clients: parseArray(state.clients, "clients", (entry) => parseIrohRemoteClient(entry, options)),
@@ -207,6 +217,8 @@ function serializeIrohRemoteHostState(state: IrohRemoteHostState): IrohRemoteHos
 	return {
 		hostSecretKey: state.hostSecretKey ? [...state.hostSecretKey] : undefined,
 		pairingSecretTombstones: (state.pairingSecretTombstones ?? []).map((tombstone) => ({ ...tombstone })),
+		workspaceGenerationCounter: state.workspaceGenerationCounter ?? 0,
+		workspaceGenerations: (state.workspaceGenerations ?? []).map((record) => ({ ...record })),
 		workspaces: state.workspaces.map((workspace) => ({ ...workspace })),
 		worktrees: (state.worktrees ?? []).map((worktree) => ({ ...worktree, sessionIds: [...worktree.sessionIds] })),
 		clients: state.clients.map((client) => ({
@@ -240,6 +252,45 @@ function serializeIrohRemoteHostState(state: IrohRemoteHostState): IrohRemoteHos
 			...ticket,
 			...(ticket.rpcGrant === undefined ? {} : { rpcGrant: cloneIrohRemoteRpcGrant(ticket.rpcGrant) }),
 		})),
+	};
+}
+
+function parseWorkspaceGenerationState(state: Record<string, unknown>): {
+	workspaceGenerationCounter: number;
+	workspaceGenerations: IrohRemoteWorkspaceGeneration[];
+} {
+	const workspaceGenerationCounter =
+		state.workspaceGenerationCounter === undefined
+			? 0
+			: expectNonNegativeSafeInteger(state.workspaceGenerationCounter, "workspaceGenerationCounter");
+	const workspaceGenerations = parseOptionalArray(
+		state.workspaceGenerations,
+		"workspaceGenerations",
+		parseIrohRemoteWorkspaceGeneration,
+	);
+	const workspaceNames = new Set<string>();
+	const generations = new Set<number>();
+	for (const record of workspaceGenerations) {
+		if (workspaceNames.has(record.workspaceName)) {
+			throw new Error(`workspaceGenerations contains duplicate workspace name: ${record.workspaceName}`);
+		}
+		if (generations.has(record.generation)) {
+			throw new Error(`workspaceGenerations contains duplicate generation: ${record.generation}`);
+		}
+		if (record.generation > workspaceGenerationCounter) {
+			throw new Error("workspace generation cannot exceed workspaceGenerationCounter");
+		}
+		workspaceNames.add(record.workspaceName);
+		generations.add(record.generation);
+	}
+	return { workspaceGenerationCounter, workspaceGenerations };
+}
+
+function parseIrohRemoteWorkspaceGeneration(value: unknown): IrohRemoteWorkspaceGeneration {
+	const record = expectRecord(value, "Iroh remote workspace generation");
+	return {
+		workspaceName: expectString(record.workspaceName, "workspace generation workspaceName"),
+		generation: expectPositiveSafeInteger(record.generation, "workspace generation"),
 	};
 }
 
@@ -693,6 +744,14 @@ function expectNonNegativeSafeInteger(value: unknown, label: string): number {
 	const parsed = expectNumber(value, label);
 	if (!Number.isSafeInteger(parsed) || parsed < 0) {
 		throw new Error(`${label} must be a non-negative safe integer`);
+	}
+	return parsed;
+}
+
+function expectPositiveSafeInteger(value: unknown, label: string): number {
+	const parsed = expectNumber(value, label);
+	if (!Number.isSafeInteger(parsed) || parsed < 1) {
+		throw new Error(`${label} must be a positive safe integer`);
 	}
 	return parsed;
 }

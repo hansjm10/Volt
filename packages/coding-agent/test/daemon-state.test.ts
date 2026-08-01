@@ -74,6 +74,8 @@ function createGrantedHostState(): IrohRemoteHostState {
 	const state = createLegacyState();
 	return {
 		...state,
+		workspaceGenerationCounter: 7,
+		workspaceGenerations: [{ workspaceName: "volt", generation: 7 }],
 		clients: state.clients.map((client) => ({ ...client, rpcGrant: grant })),
 		revokedClients: state.revokedClients?.map((client) => ({ ...client, rpcGrant: grant })),
 		pendingPairingTickets: state.pendingPairingTickets?.map((ticket) => ({ ...ticket, rpcGrant: grant })),
@@ -105,6 +107,8 @@ describe("voltd state migration", () => {
 		expect(migrated?.state.revokedClients).toEqual([]);
 		expect(migrated?.state.pendingPairingTickets).toEqual([]);
 		expect(migrated?.state.workspaces[0]?.name).toBe("volt");
+		expect(migrated?.state.workspaceGenerationCounter).toBe(0);
+		expect(migrated?.state.workspaceGenerations).toEqual([]);
 		expect(migrated?.state.settings.detachedRuntimeTtlMs).toBe(30 * 60 * 1000);
 		expect(migrated?.droppedAccess).toEqual({ clients: 1, revokedClients: 1, pendingPairingTickets: 1 });
 	});
@@ -169,7 +173,13 @@ describe("voltd state migration", () => {
 		await store.close();
 		const parsed = parseVoltdState(JSON.parse(readFileSync(statePath, "utf8")));
 		expect(parsed.irohSecretKey).toEqual(SECRET_KEY_BYTES);
-		expect(store.getHostState().hostSecretKey).toEqual(SECRET_KEY_BYTES);
+		expect(parsed.workspaceGenerationCounter).toBe(7);
+		expect(parsed.workspaceGenerations).toEqual([{ workspaceName: "volt", generation: 7 }]);
+		expect(store.getHostState()).toMatchObject({
+			hostSecretKey: SECRET_KEY_BYTES,
+			workspaceGenerationCounter: 7,
+			workspaceGenerations: [{ workspaceName: "volt", generation: 7 }],
+		});
 	});
 
 	it("rejects an unparseable state file without modifying it", async () => {

@@ -6,6 +6,8 @@ import {
 	type AuthorizeIrohRemoteClientOptions,
 	authorizeIrohRemoteClient,
 	type IrohRemoteClientAuthorizationResult,
+	type IrohRemoteClientAuthorizationSuccess,
+	isIrohRemoteClientAllowedForWorkspace,
 } from "./authorization.ts";
 import type { IrohRemoteHello } from "./handshake.ts";
 import { canonicalizePersistedIrohRemoteAllowTools } from "./protocol.ts";
@@ -428,6 +430,25 @@ export class IrohRemoteHostStateManager {
 			const state = await this.loadUnlocked();
 			const client = state.clients.find((entry) => entry.nodeId === nodeId);
 			return client ? cloneClient(client) : undefined;
+		});
+	}
+
+	/** Atomically revalidate every persisted authority component captured by a stream handshake. */
+	async isAuthorizationCurrent(authorization: IrohRemoteClientAuthorizationSuccess): Promise<boolean> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const client = state.clients.find((entry) => entry.nodeId === authorization.client.nodeId);
+			const workspace = state.workspaces.find((entry) => entry.name === authorization.workspace.name);
+			const workspaceGeneration = (state.workspaceGenerations ?? []).find(
+				(record) => record.workspaceName === authorization.workspace.name,
+			)?.generation;
+			return (
+				client?.rpcGrant?.revision === authorization.client.rpcGrant.revision &&
+				isIrohRemoteClientAllowedForWorkspace(client, authorization.workspace.name) &&
+				workspace?.path === authorization.workspace.path &&
+				workspace.allowedTools === authorization.workspace.allowedTools &&
+				workspaceGeneration === authorization.workspaceGeneration
+			);
 		});
 	}
 
@@ -1004,6 +1025,8 @@ function cloneHostState(state: IrohRemoteHostState): IrohRemoteHostState {
 		pairingSecretTombstones: (state.pairingSecretTombstones ?? []).map((tombstone) =>
 			clonePairingSecretTombstone(tombstone),
 		),
+		workspaceGenerationCounter: state.workspaceGenerationCounter ?? 0,
+		workspaceGenerations: (state.workspaceGenerations ?? []).map((record) => ({ ...record })),
 		workspaces: state.workspaces.map((workspace) => cloneWorkspace(workspace)),
 		worktrees: (state.worktrees ?? []).map((worktree) => cloneWorktree(worktree)),
 		clients: state.clients.map((client) => cloneClient(client)),

@@ -25,6 +25,8 @@ export interface IrohRemoteFilteredRpcTransportOptions {
 	writeRejectedResponse?: (value: object) => void | Promise<void>;
 	/** Atomically fence queued output and write the stale-authority rejection last. */
 	writeStaleGrantResponse?: (value: object) => void | Promise<void>;
+	/** Stop terminally fenced ingress without cancelling already-admitted ordered output. */
+	isRpcIngressOpen?: () => boolean;
 	/** Recheck persisted authority before even parsing/capability-filtering input. */
 	isRpcGrantCurrent?: () => boolean | Promise<boolean>;
 	/** Retire the stream immediately after the stale rejection owns its ordered slot. */
@@ -90,6 +92,9 @@ export function createIrohRemoteFilteredRpcTransport(
 		},
 		onLine(handler: RpcLineHandler): () => void {
 			return options.transport.onLine(async (line) => {
+				if (options.isRpcIngressOpen && !options.isRpcIngressOpen()) {
+					return;
+				}
 				if (options.isRpcGrantCurrent && !(await options.isRpcGrantCurrent())) {
 					const staticResult = getStaticIrohRemoteRpcFilterResult(line);
 					const target = staticResult.allowed

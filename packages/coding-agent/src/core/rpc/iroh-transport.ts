@@ -225,9 +225,9 @@ async function readIrohJsonl(
 	while (true) {
 		const result = await readIrohJsonlLine(recv, buffer, { readLimit, maxLineBytes });
 		if (result.line === undefined) {
-			if (result.rest.length > 0) {
-				await onLine(normalizeJsonlLine(result.rest).toString("utf8"));
-			}
+			// JSONL frames are complete only after LF. Discard an unterminated
+			// suffix on EOF; a peer failure must never promote partial bytes into
+			// an RPC command or let them contaminate a replacement stream.
 			break;
 		}
 		await onLine(result.line);

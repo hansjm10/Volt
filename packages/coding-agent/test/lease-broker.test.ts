@@ -1013,13 +1013,16 @@ describe("LeaseBroker", () => {
 		expect(broker.lookup("ws", "s1")?.state).toBe("daemon-detached");
 	});
 
-	it("releases tui leases back to unowned and closes relays", async () => {
+	it("retires workspace-unregistered TUI leases and all relays with the terminal reason", async () => {
 		const { broker, effects } = createHarness();
 		await broker.acquireForTui({ connectionId: "c-1", workspaceName: "ws", sessionId: "s1" });
 		broker.registerRelay("ws", "s1", "rl-1");
-		const released = broker.releaseFromTui("c-1", "ws", "s1");
+		broker.registerRelay("ws", "s1", "rl-2");
+		const released = broker.releaseFromTui("c-1", "ws", "s1", "workspace_unregistered");
 		expect(released).toEqual({ ok: true });
-		expect(effects.closedRelays).toEqual([{ key: "ws/s1", reason: "lease_transferred" }]);
+		expect(effects.closedRelays).toEqual([{ key: "ws/s1", reason: "workspace_unregistered" }]);
+		expect(effects.handoffs.at(-1)).toEqual({ phase: "release", key: "ws/s1", connectionId: "c-1" });
+		expect(effects.audits.at(-1)?.details.reason).toBe("workspace_unregistered");
 		expect(broker.lookup("ws", "s1")).toBeUndefined();
 	});
 

@@ -139,12 +139,8 @@ async function runWorkspaceUtilityRpcLoop(
 	while (true) {
 		const result = await readLineFromIroh(stream.recv, buffer);
 		if (result.line === undefined) {
-			if (result.rest.length > 0) {
-				const shouldClose = await handleCommand(result.rest.toString("utf8"));
-				if (shouldClose) {
-					return;
-				}
-			}
+			// Utility streams use the same strict LF-delimited framing as the
+			// conversation transport. Never dispatch a trailing partial frame.
 			return;
 		}
 

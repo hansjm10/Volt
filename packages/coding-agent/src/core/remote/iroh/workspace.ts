@@ -71,15 +71,34 @@ export function upsertIrohRemoteWorkspace(
 	};
 	const existing = state.workspaces.find((entry) => entry.name === workspace.name);
 	if (!existing) {
+		allocateIrohRemoteWorkspaceGeneration(state, workspace.name);
 		state.workspaces.push(savedWorkspace);
 		return savedWorkspace;
 	}
 
+	const nextAllowedTools = savedWorkspace.allowedTools ?? existing.allowedTools;
+	if (existing.path === savedWorkspace.path && existing.allowedTools === nextAllowedTools) {
+		return existing;
+	}
+	allocateIrohRemoteWorkspaceGeneration(state, workspace.name);
 	existing.path = savedWorkspace.path;
-	if (savedAllowedTools !== undefined) {
-		existing.allowedTools = savedAllowedTools;
+	if (savedWorkspace.allowedTools !== undefined) {
+		existing.allowedTools = savedWorkspace.allowedTools;
 	}
 	return existing;
+}
+
+function allocateIrohRemoteWorkspaceGeneration(state: IrohRemoteHostState, workspaceName: string): void {
+	const currentGeneration = state.workspaceGenerationCounter ?? 0;
+	if (currentGeneration === Number.MAX_SAFE_INTEGER) {
+		throw new Error("Workspace generation counter is exhausted");
+	}
+	const generation = currentGeneration + 1;
+	state.workspaceGenerationCounter = generation;
+	state.workspaceGenerations = [
+		...(state.workspaceGenerations ?? []).filter((record) => record.workspaceName !== workspaceName),
+		{ workspaceName, generation },
+	];
 }
 
 export function getIrohRemoteWorkspaceNameAlias(name: string): string {

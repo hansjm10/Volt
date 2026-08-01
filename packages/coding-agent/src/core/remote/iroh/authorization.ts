@@ -60,6 +60,8 @@ export interface IrohRemoteClientAuthorizationSuccess {
 	paired: boolean;
 	pairingSecretConsumed: boolean;
 	workspace: IrohRemoteWorkspace;
+	/** Persisted registration identity captured atomically with this authorization. */
+	workspaceGeneration?: number;
 	workspaceNames: string[];
 	workspaces: IrohRemoteWorkspaceStatus[];
 }
@@ -347,6 +349,7 @@ export function authorizeIrohRemoteClient(
 			paired: true,
 			pairingSecretConsumed: true,
 			workspace,
+			...getWorkspaceGenerationProperty(state, workspace.name),
 			workspaceNames,
 			workspaces,
 		};
@@ -367,9 +370,20 @@ export function authorizeIrohRemoteClient(
 		paired: false,
 		pairingSecretConsumed: false,
 		workspace,
+		...getWorkspaceGenerationProperty(state, workspace.name),
 		workspaceNames,
 		workspaces,
 	};
+}
+
+function getWorkspaceGenerationProperty(
+	state: IrohRemoteHostState,
+	workspaceName: string,
+): { workspaceGeneration?: number } {
+	const generation = (state.workspaceGenerations ?? []).find(
+		(record) => record.workspaceName === workspaceName,
+	)?.generation;
+	return generation === undefined ? {} : { workspaceGeneration: generation };
 }
 
 function getIrohRemoteWorkspaceStatuses(

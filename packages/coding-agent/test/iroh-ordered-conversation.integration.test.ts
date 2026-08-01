@@ -8,9 +8,10 @@ import { AgentSessionRuntime, isConversationTranscriptCommittedEvent } from "../
 import type { AgentSessionServices } from "../src/core/agent-session-services.ts";
 import { createIrohRemotePresetAccess } from "../src/core/remote/iroh/access-grant.ts";
 import type { ConversationProjectionSnapshotBuilder } from "../src/core/rpc/conversation-projection-feed.ts";
+import type { IrohBytes } from "../src/core/rpc/iroh-transport.ts";
 import type { RpcConversationTranscriptItem } from "../src/core/rpc/types.ts";
 import { type SessionEntry, SessionManager } from "../src/core/session-manager.ts";
-import { runIrohRemoteRpcMode } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
+import { type IrohRemoteConversationLifecycle, runIrohRemoteRpcMode } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
 import {
 	createTestSession as createIrohTestSession,
 	ManualIrohRecvStream,
@@ -28,6 +29,59 @@ interface OrderedConversationFixture {
 	readonly sessionId: string;
 	emit(event: object): void;
 	close(): Promise<void>;
+}
+
+type FaultInjectedRead = { type: "data"; bytes: IrohBytes } | { type: "end" } | { type: "error"; error: Error };
+
+class PartialFailureIrohRecvStream extends ManualIrohRecvStream {
+	private readonly faultQueue: FaultInjectedRead[] = [];
+	private readonly faultReaders: Array<{
+		resolve(value: IrohBytes | undefined): void;
+		reject(error: Error): void;
+	}> = [];
+
+	override read(_sizeLimit: number): Promise<IrohBytes | undefined> {
+		const queued = this.faultQueue.shift();
+		if (queued) {
+			return this.resolveFault(queued);
+		}
+		return new Promise((resolve, reject) => {
+			this.faultReaders.push({ resolve, reject });
+		});
+	}
+
+	push(bytes: IrohBytes): void {
+		this.enqueueFault({ type: "data", bytes });
+	}
+
+	fail(error: Error): void {
+		this.enqueueFault({ type: "error", error });
+	}
+
+	override pushLine(line: string): void {
+		this.push(Buffer.from(`${line}\n`, "utf8"));
+	}
+
+	override end(): void {
+		this.enqueueFault({ type: "end" });
+	}
+
+	private enqueueFault(queued: FaultInjectedRead): void {
+		const reader = this.faultReaders.shift();
+		if (!reader) {
+			this.faultQueue.push(queued);
+			return;
+		}
+		if (queued.type === "data") reader.resolve(queued.bytes);
+		else if (queued.type === "end") reader.resolve(undefined);
+		else reader.reject(queued.error);
+	}
+
+	private resolveFault(queued: FaultInjectedRead): Promise<IrohBytes | undefined> {
+		if (queued.type === "data") return Promise.resolve(queued.bytes);
+		if (queued.type === "end") return Promise.resolve(undefined);
+		return Promise.reject(queued.error);
+	}
 }
 
 class GatedIrohSendStream extends ManualIrohSendStream {
@@ -129,9 +183,13 @@ function createSnapshotBuilder(manager: SessionManager, sessionId: string): Conv
 async function createFixture(
 	preload: (emit: (event: object) => void) => void,
 	options: {
+		recv?: ManualIrohRecvStream;
 		send?: ManualIrohSendStream;
+		isRpcIngressOpen?: () => boolean;
 		isRpcGrantCurrent?: () => boolean | Promise<boolean>;
 		onClientCapabilitiesChanged?: (features: string[]) => void;
+		onConversationLifecycleReady?: (lifecycle: IrohRemoteConversationLifecycle) => void;
+		onResponseWritten?: (response: Record<string, unknown>) => void | Promise<void>;
 		waitForPhysicalStartup?: boolean;
 		configureRuntimeHost?: (runtimeHost: AgentSessionRuntime) => void;
 		remoteCommandHandler?: (command: Record<string, unknown>) => object | Promise<object | undefined> | undefined;
@@ -171,7 +229,7 @@ async function createFixture(
 	};
 	preload(emit);
 
-	const recv = new ManualIrohRecvStream();
+	const recv = options.recv ?? new ManualIrohRecvStream();
 	const send = options.send ?? new ManualIrohSendStream();
 	const modePromise = runIrohRemoteRpcMode(runtimeHost, {
 		rpcGrant: createIrohRemotePresetAccess("full").rpcGrant,
@@ -189,6 +247,11 @@ async function createFixture(
 		...(options.onClientCapabilitiesChanged === undefined
 			? {}
 			: { onClientCapabilitiesChanged: options.onClientCapabilitiesChanged }),
+		...(options.onConversationLifecycleReady === undefined
+			? {}
+			: { onConversationLifecycleReady: options.onConversationLifecycleReady }),
+		...(options.onResponseWritten === undefined ? {} : { onResponseWritten: options.onResponseWritten }),
+		...(options.isRpcIngressOpen === undefined ? {} : { isRpcIngressOpen: options.isRpcIngressOpen }),
 		...(options.isRpcGrantCurrent === undefined ? {} : { isRpcGrantCurrent: options.isRpcGrantCurrent }),
 		...(options.remoteCommandHandler === undefined ? {} : { remoteCommandHandler: options.remoteCommandHandler }),
 	});
@@ -445,6 +508,162 @@ describe("Iroh ordered conversation integration", () => {
 			expect(frames).not.toContainEqual(expect.objectContaining({ type: "turn_start" }));
 			expect(frames).not.toContainEqual(expect.objectContaining({ id: "stale-1", type: "response" }));
 			expect(send.finished).toBe(true);
+		} finally {
+			send.releaseBlockedWrite();
+			await fixture.close();
+		}
+	});
+
+	it("preserves an admitted terminal response while dropping pipelined ingress", async () => {
+		let ingressOpen = true;
+		const send = new GatedIrohSendStream();
+		const remoteCommandHandler = vi.fn(async (command: Record<string, unknown>) => {
+			if (command.type === "unregister_workspace") {
+				ingressOpen = false;
+			}
+			return {
+				id: command.id,
+				type: "response",
+				command: command.type,
+				success: true,
+			};
+		});
+		const fixture = await createFixture(() => {}, {
+			send,
+			isRpcIngressOpen: () => ingressOpen,
+			remoteCommandHandler,
+		});
+		try {
+			const blockedWriteStarted = send.blockNextWrite();
+			fixture.recv.pushLine(
+				JSON.stringify({ id: "remove", type: "unregister_workspace", workspaceName: "scratch" }),
+			);
+			await blockedWriteStarted;
+			fixture.recv.pushLine(JSON.stringify({ id: "pipelined", type: "get_state" }));
+			await new Promise<void>((resolve) => setImmediate(resolve));
+
+			expect(remoteCommandHandler).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ id: "remove", type: "unregister_workspace" }),
+			);
+			expect(parseWrittenObjects(send).map((frame) => frame.type)).toEqual(["conversation_bootstrap"]);
+
+			send.releaseBlockedWrite();
+			await vi.waitFor(() =>
+				expect(parseWrittenObjects(send)).toContainEqual(
+					expect.objectContaining({ id: "remove", command: "unregister_workspace", success: true }),
+				),
+			);
+			expect(parseWrittenObjects(send)).not.toContainEqual(expect.objectContaining({ id: "pipelined" }));
+		} finally {
+			send.releaseBlockedWrite();
+			await fixture.close();
+		}
+	});
+
+	it("replaces a failed partial-frame stream with clean framing and fresh authority", async () => {
+		const failedRecv = new PartialFailureIrohRecvStream();
+		const remoteCommandHandler = vi.fn(async (command: Record<string, unknown>) => ({
+			id: command.id,
+			type: "response",
+			command: command.type,
+			success: true,
+		}));
+		const fixture = await createFixture(() => {}, { recv: failedRecv, remoteCommandHandler });
+		const firstBootstrap = parseWrittenObjects(fixture.send)[0]!;
+		const readError = new Error("injected conversation read failure after partial frame");
+
+		failedRecv.push(Buffer.from('{"id":"partial","type":"list_sessions"'));
+		failedRecv.fail(readError);
+
+		await expect(fixture.modePromise).rejects.toBe(readError);
+		expect(remoteCommandHandler).not.toHaveBeenCalled();
+
+		const replacementRecv = new ManualIrohRecvStream();
+		const replacementSend = new ManualIrohSendStream();
+		const replacementMode = runIrohRemoteRpcMode(fixture.runtimeHost, {
+			rpcGrant: createIrohRemotePresetAccess("full").rpcGrant,
+			disposeRuntimeOnClose: false,
+			stream: { recv: replacementRecv, send: replacementSend },
+			workspacePath: fixture.manager.getCwd(),
+			buildConversationSnapshot: createSnapshotBuilder(fixture.manager, fixture.sessionId),
+			projectConversationExternal: (event) => event,
+			remoteCommandHandler,
+		});
+		void replacementMode.catch(() => {});
+		try {
+			await vi.waitFor(() => expect(parseWrittenObjects(replacementSend)[0]?.type).toBe("conversation_bootstrap"));
+			const replacementBootstrap = parseWrittenObjects(replacementSend)[0]!;
+			expect(replacementBootstrap.conversation).toMatchObject({ sessionId: fixture.sessionId });
+			expect((replacementBootstrap.delivery as { subscriptionId: string }).subscriptionId).not.toBe(
+				(firstBootstrap.delivery as { subscriptionId: string }).subscriptionId,
+			);
+
+			replacementRecv.pushLine(JSON.stringify({ id: "fresh", type: "list_sessions" }));
+			await vi.waitFor(() =>
+				expect(parseWrittenObjects(replacementSend)).toContainEqual(
+					expect.objectContaining({ id: "fresh", command: "list_sessions", success: true }),
+				),
+			);
+			expect(remoteCommandHandler).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ id: "fresh", type: "list_sessions" }),
+			);
+		} finally {
+			replacementRecv.end();
+			await replacementMode;
+			await expect(fixture.close()).rejects.toBe(readError);
+		}
+	});
+
+	it("fences queued projection output before a post-response workspace terminal", async () => {
+		const send = new GatedIrohSendStream();
+		let lifecycle: IrohRemoteConversationLifecycle | undefined;
+		let terminalTask = Promise.resolve();
+		const fixture = await createFixture(() => {}, {
+			send,
+			onConversationLifecycleReady: (readyLifecycle) => {
+				lifecycle = readyLifecycle;
+			},
+			onResponseWritten: (response) => {
+				if (response.command !== "unregister_workspace" || response.success !== true) {
+					return;
+				}
+				queueMicrotask(() => {
+					terminalTask = (async () => {
+						await lifecycle?.writeTerminal({ type: "remote_terminal", reason: "workspace_unregistered" });
+						await lifecycle?.terminate();
+					})();
+				});
+			},
+			remoteCommandHandler: async (command) => ({
+				id: command.id,
+				type: "response",
+				command: command.type,
+				success: true,
+			}),
+		});
+		try {
+			const blockedResponseStarted = send.blockNextWrite();
+			fixture.recv.pushLine(
+				JSON.stringify({ id: "remove", type: "unregister_workspace", workspaceName: "scratch" }),
+			);
+			await blockedResponseStarted;
+
+			fixture.emit({ type: "agent_start" });
+			fixture.emit({ type: "turn_start" });
+			send.releaseBlockedWrite();
+
+			await fixture.modePromise;
+			await terminalTask;
+			expect(parseWrittenObjects(send)).toEqual([
+				expect.objectContaining({ type: "conversation_bootstrap" }),
+				{
+					id: "remove",
+					type: "response",
+					command: "unregister_workspace",
+					success: true,
+				},
+				{ type: "remote_terminal", reason: "workspace_unregistered" },
+			]);
 		} finally {
 			send.releaseBlockedWrite();
 			await fixture.close();

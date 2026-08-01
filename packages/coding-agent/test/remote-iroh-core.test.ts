@@ -1204,6 +1204,8 @@ describe("Iroh remote core helpers", () => {
 
 			const state: IrohRemoteHostState = {
 				hostSecretKey: [1, 2, 3],
+				workspaceGenerationCounter: 1,
+				workspaceGenerations: [{ workspaceName: "volt", generation: 1 }],
 				pairingSecretTombstones: [
 					{
 						secretHash: "sha256:used",
@@ -2611,6 +2613,8 @@ describe("Iroh remote core helpers", () => {
 		});
 		expect(await stateManager.getState()).toEqual({
 			hostSecretKey: [1, 2, 3],
+			workspaceGenerationCounter: 0,
+			workspaceGenerations: [],
 			pairingSecretTombstones: [
 				{
 					secretHash: "sha256:consumed",
@@ -2838,6 +2842,55 @@ describe("Iroh remote core helpers", () => {
 		expect(state.workspaces).toEqual([{ name: "alphabet", path: "/alphabet", allowedTools: "read,grep" }]);
 		expect(state.clients).toEqual([expect.objectContaining({ nodeId: "client-node" })]);
 		expect(state.pendingPairingTickets).toEqual([expect.objectContaining({ workspace: "alphabet" })]);
+	});
+
+	test("captures workspace generations and fences identical re-registration and change-revert ABA", async () => {
+		const workspace = { name: "alpha", path: "/alpha", allowedTools: "read" };
+		const stateManager = new IrohRemoteHostStateManager({
+			initialState: {
+				...createEmptyIrohRemoteHostState(),
+				workspaces: [workspace],
+				clients: [
+					{
+						nodeId: "client-node",
+						label: "phone",
+						allowedWorkspaces: ["alpha"],
+						allowedTools: "read",
+						rpcGrant: CODING_RPC_GRANT,
+						pairedAt: 1,
+						lastSeenAt: 2,
+					},
+				],
+			},
+		});
+		const authorize = () =>
+			stateManager.authorizeClient(makeHello("alpha"), "client-node", {
+				allowTools: "read",
+				now: 100,
+			});
+
+		const legacyAuthorization = await authorize();
+		if (!legacyAuthorization.ok) throw new Error(legacyAuthorization.error);
+		expect(legacyAuthorization).not.toHaveProperty("workspaceGeneration");
+		await stateManager.upsertWorkspace(workspace);
+		expect((await stateManager.getState()).workspaceGenerationCounter).toBe(0);
+
+		await stateManager.unregisterWorkspace("alpha");
+		await stateManager.upsertWorkspace(workspace);
+		await expect(stateManager.isAuthorizationCurrent(legacyAuthorization)).resolves.toBe(false);
+		const replacementAuthorization = await authorize();
+		if (!replacementAuthorization.ok) throw new Error(replacementAuthorization.error);
+		expect(replacementAuthorization.workspaceGeneration).toBe(1);
+		await expect(stateManager.isAuthorizationCurrent(replacementAuthorization)).resolves.toBe(true);
+
+		await stateManager.upsertWorkspace({ ...workspace, path: "/replacement" });
+		await stateManager.upsertWorkspace(workspace);
+		expect((await stateManager.getState()).workspaceGenerationCounter).toBe(3);
+		await expect(stateManager.isAuthorizationCurrent(replacementAuthorization)).resolves.toBe(false);
+		const revertedAuthorization = await authorize();
+		if (!revertedAuthorization.ok) throw new Error(revertedAuthorization.error);
+		expect(revertedAuthorization.workspaceGeneration).toBe(3);
+		await expect(stateManager.isAuthorizationCurrent(revertedAuthorization)).resolves.toBe(true);
 	});
 
 	test("host engine does not re-register an unregistered primary workspace from stale pairing state", async () => {

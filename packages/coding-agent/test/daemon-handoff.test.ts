@@ -201,7 +201,12 @@ async function startDaemonHalf(
 				return;
 			}
 			case "lease_release": {
-				const result = broker.releaseFromTui(connection.connectionId, request.workspaceName, request.sessionId);
+				const result = broker.releaseFromTui(
+					connection.connectionId,
+					request.workspaceName,
+					request.sessionId,
+					request.reason,
+				);
 				connection.send(
 					result.ok
 						? { type: "ok", id: request.id }

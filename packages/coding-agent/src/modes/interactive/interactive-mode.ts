@@ -206,12 +206,14 @@ import {
 	type AcquireOutcome,
 	createDaemonAttach,
 	createDisabledDaemonAttach,
+	createRelayWorkspaceUnregisterRetirement,
 	type DaemonAttach,
 	type DaemonRelayOffer,
 	type DaemonWorktreeControl,
 	getRelayServingSanitizerOptions,
 	type OpenedRelay,
 	openDaemonWorktreeControl,
+	type RelayWorkspaceUnregisterRetirement,
 } from "./daemon-attach.ts";
 import { DrainViewerComponent } from "./drain-viewer.ts";
 import { collectPromptImageAttachments, MAX_PROMPT_IMAGE_ATTACHMENTS } from "./prompt-image-attachments.ts";
@@ -1989,6 +1991,7 @@ export class InteractiveMode {
 					};
 
 		const server = (async () => {
+			let workspaceUnregisterRetirement: RelayWorkspaceUnregisterRetirement | undefined;
 			try {
 				// The TUI writes the handshake success response itself, keeping
 				// construction identical to the daemon-owned path.
@@ -2009,8 +2012,13 @@ export class InteractiveMode {
 				// the first change and the daemon's lookup would silently no-op, leaving
 				// the lease keyed on an old session id.
 				let relayedSessionId = offer.sessionId;
+				workspaceUnregisterRetirement = createRelayWorkspaceUnregisterRetirement(
+					this.daemonAttach,
+					() => relayedSessionId,
+				);
 				await runIrohRemoteRpcMode(this.runtimeHost, {
 					rpcGrant,
+					isRpcIngressOpen: workspaceUnregisterRetirement.isIngressOpen,
 					clientNodeId: authorizationSubset.clientNodeId,
 					stream: relayedStream,
 					disposeRuntimeOnClose: false,
@@ -2035,6 +2043,7 @@ export class InteractiveMode {
 					onReady: () => {
 						void this.runtimeHost.startRecoveredClientInputs().catch(() => undefined);
 					},
+					onResponseWritten: (response) => workspaceUnregisterRetirement?.onResponseWritten(response),
 					initialInput: handshake.initialInput,
 					notificationDelivery: {
 						deliverNotification: (notification) =>
@@ -2068,6 +2077,7 @@ export class InteractiveMode {
 									"daemon_unavailable",
 								);
 							}
+							workspaceUnregisterRetirement?.observeForwardedResponse(rpcCommand, forwarded.response);
 							if (forwarded.workspaceMetadata) {
 								authorization.workspaceNames = [...forwarded.workspaceMetadata.workspaceNames];
 								authorization.workspaces = forwarded.workspaceMetadata.workspaces.map((workspace) => ({
@@ -2100,6 +2110,7 @@ export class InteractiveMode {
 			} catch {
 				// Relay teardown surfaces to the phone via the daemon's close reason.
 			} finally {
+				await workspaceUnregisterRetirement?.finalize();
 				relayedStream.close();
 				opened.finished();
 			}
