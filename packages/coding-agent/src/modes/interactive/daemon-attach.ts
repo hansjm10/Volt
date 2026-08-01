@@ -389,6 +389,7 @@ export interface CreateDaemonAttachOptions {
 export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAttach {
 	let client: DaemonClient | undefined;
 	let state: DaemonAttachConnectionState = "reconnecting";
+	let connectionGeneration = 0;
 	let resolvedWorkspaceName: string | undefined;
 	let resolvedWorktreeId: string | undefined;
 	let boundWorktreeSessionId: string | undefined;
@@ -602,6 +603,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					onConnectionStateChange: (next) => {
 						state = next;
 						if (next !== "connected") {
+							connectionGeneration++;
 							heldSessionId = undefined;
 						}
 						if (next === "connected") {
@@ -698,7 +700,9 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			}
 			const workspaceName = resolvedWorkspaceName;
 			const contextChanged = workspaceName !== previousWorkspaceName || resolvedWorktreeId !== previousWorktreeId;
+			const sourceLeaseConnectionGeneration = connectionGeneration;
 			let targetLeasePreacquired = false;
+			let targetLeaseConnectionGeneration: number | undefined;
 			if (contextChanged && activeClient && workspaceName && state === "connected") {
 				let targetAcquireStarted = false;
 				try {
@@ -724,6 +728,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					}
 					if (targetAcquire.kind === "pending") await targetAcquire.granted;
 					targetLeasePreacquired = true;
+					targetLeaseConnectionGeneration = connectionGeneration;
 				} catch (error) {
 					if (targetAcquireStarted) {
 						await activeClient
@@ -759,6 +764,31 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					async commit() {
 						if (phase !== "prepared") {
 							return;
+						}
+						if (targetLeasePreacquired && targetLeaseConnectionGeneration !== connectionGeneration) {
+							const reconnectClient = client;
+							const reconnectWorkspaceName = resolvedWorkspaceName;
+							if (!reconnectClient || !reconnectWorkspaceName || state !== "connected") {
+								throw new Error("replacement session lease was lost during reconnect");
+							}
+							if (!(await ensureWorktreeBinding(reconnectClient, reconnectWorkspaceName, newSessionId, true))) {
+								throw new Error("replacement session lease could not be reacquired");
+							}
+							const response = await reconnectClient.request({
+								type: "lease_acquire",
+								workspaceName: reconnectWorkspaceName,
+								sessionId: newSessionId,
+							});
+							const outcome = parseAcquireResponse(
+								response as { type: string } & Record<string, unknown>,
+								(id) =>
+									reconnectClient.waitForResponse(id) as Promise<{ type: string } & Record<string, unknown>>,
+							);
+							if (outcome.kind === "denied" || outcome.kind === "noop") {
+								throw new Error("replacement session lease could not be reacquired");
+							}
+							if (outcome.kind === "pending") await outcome.granted;
+							targetLeaseConnectionGeneration = connectionGeneration;
 						}
 						const bindClient = client;
 						const bindWorkspaceName = resolvedWorkspaceName;
@@ -840,7 +870,12 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 						resolvedWorktreeId = previousWorktreeId;
 						boundWorktreeSessionId = previousBoundWorktreeSessionId;
 						currentSessionId = oldSessionId;
-						heldSessionId = state === "connected" && client === activeClient ? previousHeldSessionId : undefined;
+						heldSessionId =
+							state === "connected" &&
+							client === activeClient &&
+							connectionGeneration === sourceLeaseConnectionGeneration
+								? previousHeldSessionId
+								: undefined;
 						if (state === "connected" && heldSessionId !== oldSessionId) {
 							await ensureLeaseAfterConnected().catch(() => {});
 						}
