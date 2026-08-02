@@ -93,9 +93,9 @@ describe("Iroh remote handshake stream modes", () => {
 			mode: "conversation",
 			conversation: { target: "last" },
 		});
-		expect(parseHello({ conversation: { target: "new" } })).toMatchObject({
+		expect(parseHello({ conversation: { target: "new", sessionId: "new-session" } })).toMatchObject({
 			mode: "conversation",
-			conversation: { target: "new" },
+			conversation: { target: "new", sessionId: "new-session" },
 		});
 		expect(parseHello({ conversation: { target: "session", sessionId: "abc_123-id" } })).toMatchObject({
 			mode: "conversation",
@@ -104,6 +104,10 @@ describe("Iroh remote handshake stream modes", () => {
 		expect(parseHello({ workspaceDiscovery: { purpose: "list_sessions" } })).toMatchObject({
 			mode: "workspaceDiscovery",
 			workspaceDiscovery: { purpose: "list_sessions" },
+		});
+		expect(parseHello({ workspaceDiscovery: { purpose: "agent_options" } })).toMatchObject({
+			mode: "workspaceDiscovery",
+			workspaceDiscovery: { purpose: "agent_options" },
 		});
 		expect(parseHello({ workspaceManagement: { purpose: "unregister_workspace" } })).toMatchObject({
 			mode: "workspaceManagement",
@@ -123,7 +127,8 @@ describe("Iroh remote handshake stream modes", () => {
 			{},
 			{ conversation: { target: "last" }, workspaceDiscovery: { purpose: "list_sessions" } },
 			{ conversation: { target: "last", sessionId: "abc" } },
-			{ conversation: { target: "new", sessionId: "abc" } },
+			{ conversation: { target: "new" } },
+			{ conversation: { target: "new", sessionId: "ABC" } },
 			{ conversation: { target: "session" } },
 			{ conversation: { target: "session", sessionId: "ABC" } },
 			{ conversation: { target: "unknown" } },
@@ -141,6 +146,7 @@ describe("Iroh remote handshake stream modes", () => {
 	test("parses handshake mode metadata and target selection matrices", () => {
 		for (const [target, selection] of [
 			["new", "created"],
+			["new", "resumed"],
 			["session", "resumed"],
 			["last", "resumed"],
 			["last", "created"],
@@ -187,16 +193,15 @@ describe("Iroh remote handshake stream modes", () => {
 			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceDiscovery: { purpose: "list_sessions" } })),
 		).toMatchObject({ success: true, workspaceDiscovery: { purpose: "list_sessions" } });
 		expect(
+			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceDiscovery: { purpose: "agent_options" } })),
+		).toMatchObject({ success: true, workspaceDiscovery: { purpose: "agent_options" } });
+		expect(
 			parseIrohRemoteHandshakeResponseLine(
 				responseLine({ workspaceManagement: { purpose: "unregister_workspace" } }),
 			),
 		).toMatchObject({ success: true, workspaceManagement: { purpose: "unregister_workspace" } });
 
 		for (const invalid of [
-			responseLine({
-				sessionId: "abc123",
-				conversation: { target: "new", sessionId: "abc123", selection: "resumed" },
-			}),
 			responseLine({
 				sessionId: "abc123",
 				conversation: { target: "session", sessionId: "abc123", selection: "created" },

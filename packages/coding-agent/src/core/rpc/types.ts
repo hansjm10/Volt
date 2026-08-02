@@ -13,6 +13,11 @@
 
 import type { Api, Model } from "@hansjm10/volt-ai";
 import type { Static } from "typebox";
+import type {
+	RpcAgentOptionsDefaultConfigSchema,
+	RpcAgentOptionsModelSelectionSchema,
+	RpcAgentOptionsSchema,
+} from "./schema/agent-options.ts";
 import type { RPC_COMMAND_SCHEMAS, RpcClientCapabilityFeatureSchema } from "./schema/commands.ts";
 import type {
 	RpcConversationActiveAssistantSchema,
@@ -161,6 +166,10 @@ export type RpcSubagentDefinitionSource = Static<typeof RpcSubagentDefinitionSou
  * another client's rebind cannot act on the replacement conversation.
  */
 export type RpcConversationAuthority = Static<typeof RpcConversationAuthoritySchema>;
+
+export type RpcAgentOptionsModelSelection = Static<typeof RpcAgentOptionsModelSelectionSchema>;
+export type RpcAgentOptionsDefaultConfig = Static<typeof RpcAgentOptionsDefaultConfigSchema>;
+export type RpcAgentOptions = Static<typeof RpcAgentOptionsSchema>;
 
 // ============================================================================
 // RPC Commands

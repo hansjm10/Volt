@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { createEmptyIrohRemoteHostState, type IrohRemoteHostState } from "../src/core/remote/iroh/state.ts";
-import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
+import {
+	IrohRemoteHostStateManager,
+	IrohRemoteStatePersistenceAmbiguousError,
+} from "../src/core/remote/iroh/state-manager.ts";
 
 function createState(): IrohRemoteHostState {
 	const state = createEmptyIrohRemoteHostState();
@@ -62,6 +65,27 @@ describe("relayed client session selection transaction", () => {
 			"old",
 			"old",
 		]);
+	});
+
+	it("surfaces an ambiguous outcome when failed persistence cannot be durably compensated", async () => {
+		let persisted = createState();
+		let writes = 0;
+		const manager = new IrohRemoteHostStateManager({
+			store: {
+				read: () => cloneState(persisted),
+				write: (state) => {
+					writes += 1;
+					if (writes === 1) persisted = cloneState(state);
+					throw new Error("durability unknown");
+				},
+			},
+		});
+
+		await expect(manager.setClientsLastSessionId(["phone-a", "phone-b"], "ws", "new")).rejects.toBeInstanceOf(
+			IrohRemoteStatePersistenceAmbiguousError,
+		);
+		expect(writes).toBe(2);
+		expect(persisted.clients.map((client) => client.lastSessionIdByWorkspace?.ws)).toEqual(["new", "new"]);
 	});
 
 	it("rejects the whole selection when any attached client is unknown", async () => {

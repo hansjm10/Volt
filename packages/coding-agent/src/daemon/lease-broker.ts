@@ -253,6 +253,7 @@ export class LeaseBroker {
 	private readonly daemonRekeyReservationsByTarget = new Map<string, DaemonLeaseRekeyReservation>();
 	/** TUI acquires serialized behind a runtime publication, grouped for disconnect cancellation. */
 	private readonly pendingTuiAcquireBarriers = new Map<string, Set<PendingTuiAcquireBarrier>>();
+	private readonly worktreeRemovalReservations = new Set<string>();
 
 	constructor(effects: LeaseBrokerEffects) {
 		this.effects = effects;
@@ -264,6 +265,32 @@ export class LeaseBroker {
 
 	list(): LeaseRecord[] {
 		return Array.from(this.records.values());
+	}
+
+	reserveSessionsForWorktreeRemoval(workspaceName: string, sessionIds: string[]): (() => void) | undefined {
+		const keys = sessionIds.map((sessionId) => getLeaseKey(workspaceName, sessionId));
+		if (
+			keys.some((key) => {
+				if (
+					this.worktreeRemovalReservations.has(key) ||
+					this.tuiRekeyReservationsByTarget.has(key) ||
+					this.daemonRekeyReservationsByTarget.has(key)
+				) {
+					return true;
+				}
+				const record = this.records.get(key);
+				return (
+					record !== undefined &&
+					(record.state !== "unowned" || record.pendingDaemonAttaches > 0 || record.streamCount > 0)
+				);
+			})
+		) {
+			return undefined;
+		}
+		for (const key of keys) this.worktreeRemovalReservations.add(key);
+		return () => {
+			for (const key of keys) this.worktreeRemovalReservations.delete(key);
+		};
 	}
 
 	private getOrCreateRecord(workspaceName: string, sessionId: string): LeaseRecord {
@@ -306,6 +333,7 @@ export class LeaseBroker {
 		}
 		const attachKey = getLeaseKey(workspaceName, sessionId);
 		if (
+			this.worktreeRemovalReservations.has(attachKey) ||
 			this.tuiRekeyReservationsBySource.has(attachKey) ||
 			this.tuiRekeyReservationsByTarget.has(attachKey) ||
 			this.daemonRekeyReservationsBySource.has(attachKey) ||
@@ -349,6 +377,7 @@ export class LeaseBroker {
 		this.abortDaemonAttach(claim);
 		const key = getLeaseKey(workspaceName, sessionId);
 		if (
+			this.worktreeRemovalReservations.has(key) ||
 			this.tuiRekeyReservationsBySource.has(key) ||
 			this.tuiRekeyReservationsByTarget.has(key) ||
 			this.daemonRekeyReservationsBySource.has(key) ||
@@ -731,7 +760,11 @@ export class LeaseBroker {
 			return { kind: "denied", reason: "force_unsupported" };
 		}
 		for (;;) {
-			const targetReservation = this.tuiRekeyReservationsByTarget.get(getLeaseKey(workspaceName, sessionId));
+			const leaseKey = getLeaseKey(workspaceName, sessionId);
+			if (this.worktreeRemovalReservations.has(leaseKey)) {
+				return { kind: "denied", reason: "draining_elsewhere" };
+			}
+			const targetReservation = this.tuiRekeyReservationsByTarget.get(leaseKey);
 			if (targetReservation) {
 				this.effects.audit({
 					type: "lease_denied",
@@ -1142,6 +1175,9 @@ export class LeaseBroker {
 		}
 
 		if (sourceKey !== targetKey) {
+			if (this.worktreeRemovalReservations.has(targetKey)) {
+				return { ok: false, code: "transition_in_progress" };
+			}
 			const displaced = this.records.get(targetKey);
 			const targetReservation = this.tuiRekeyReservationsByTarget.get(targetKey);
 			const daemonTargetReservation = this.daemonRekeyReservationsByTarget.get(targetKey);
@@ -1209,7 +1245,10 @@ export class LeaseBroker {
 			this.clearTuiRekeyReservation(reservation);
 			return { ok: false, code: "not_held" };
 		}
-		if (reservation.sourceKey !== reservation.targetKey && this.records.has(reservation.targetKey)) {
+		if (
+			reservation.sourceKey !== reservation.targetKey &&
+			(this.records.has(reservation.targetKey) || this.worktreeRemovalReservations.has(reservation.targetKey))
+		) {
 			return { ok: false, code: "target_in_use" };
 		}
 
@@ -1302,6 +1341,7 @@ export class LeaseBroker {
 		}
 		if (sourceKey !== targetKey) {
 			if (
+				this.worktreeRemovalReservations.has(targetKey) ||
 				this.records.has(targetKey) ||
 				this.tuiRekeyReservationsByTarget.has(targetKey) ||
 				this.daemonRekeyReservationsByTarget.has(targetKey)
@@ -1347,7 +1387,10 @@ export class LeaseBroker {
 			this.clearDaemonRekeyReservation(reservation);
 			return { ok: false, code: "not_held" };
 		}
-		if (reservation.sourceKey !== reservation.targetKey && this.records.has(reservation.targetKey)) {
+		if (
+			reservation.sourceKey !== reservation.targetKey &&
+			(this.records.has(reservation.targetKey) || this.worktreeRemovalReservations.has(reservation.targetKey))
+		) {
 			return { ok: false, code: "target_in_use" };
 		}
 		this.clearDaemonRekeyReservation(reservation);
@@ -1412,6 +1455,7 @@ export class LeaseBroker {
 		}
 		const newKey = getLeaseKey(workspaceName, newSessionId);
 		if (
+			this.worktreeRemovalReservations.has(newKey) ||
 			this.tuiRekeyReservationsBySource.has(record.key) ||
 			this.tuiRekeyReservationsByTarget.has(newKey) ||
 			this.daemonRekeyReservationsBySource.has(record.key) ||

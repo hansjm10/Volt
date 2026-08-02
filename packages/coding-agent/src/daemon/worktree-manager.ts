@@ -1,6 +1,6 @@
 import { createHash, randomInt } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, readdir, realpath, rename } from "node:fs/promises";
+import { mkdir, readdir, realpath, rename, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import type { IrohRemoteAuditLogger } from "../core/remote/iroh/audit.ts";
 import { IROH_REMOTE_WORKTREE_ID_PATTERN } from "../core/remote/iroh/protocol.ts";
@@ -12,6 +12,7 @@ import {
 } from "../core/remote/iroh/state-manager.ts";
 import { getDefaultSessionDirPath, readSessionHeader } from "../core/session-manager.ts";
 import { spawnProcess, waitForChildProcess } from "../utils/child-process.ts";
+import { writeDurableAtomicFile } from "../utils/durable-atomic-write.ts";
 import { ensurePrivateDirectorySync } from "../utils/private-files.ts";
 import type { ControlRequest, ControlWorktreeStatus } from "./control-protocol.ts";
 import type { ControlConnection } from "./control-server.ts";
@@ -23,6 +24,8 @@ export function getWorktreesRoot(agentDir: string): string {
 }
 
 export const WORKTREE_ID_PATTERN = IROH_REMOTE_WORKTREE_ID_PATTERN;
+const MAX_RECOVERY_CHECKOUTS = 32;
+const RECOVERY_PURGE_MARKER = ".volt-safe-to-purge.json";
 
 /**
  * Encode a workspace path into the per-workspace worktrees directory segment,
@@ -204,6 +207,7 @@ export interface WorktreeManagerOptions {
 	maxWorktreesPerWorkspace?: number;
 	/** Seam for "is a runtime using this worktree" (wired to IntegratedRuntimeRegistry). */
 	hasActiveRuntimeForSession?: (workspaceName: string, sessionId: string) => boolean;
+	reserveSessionsForRemoval?: (workspaceName: string, sessionIds: string[]) => (() => void) | undefined;
 	/** Durable-write seam (VoltdStateStore.flush); records must survive a crash the moment they exist. */
 	flushState?: () => Promise<void>;
 	now?: () => number;
@@ -219,6 +223,11 @@ export interface WorktreeStatus extends IrohRemoteWorkspaceWorktree {
 }
 
 export type WorktreeResult<T> = ({ ok: true } & T) | { ok: false; error: WorktreeError; detail?: string };
+
+export interface WorktreeRuntimePreparation {
+	publish<T>(publish: () => T): Promise<T>;
+	release(): Promise<void>;
+}
 
 interface WorktreeSourceResolution {
 	/** Selected directory under the registered workspace, preserving the remote relative path. */
@@ -299,8 +308,12 @@ export class WorktreeManager {
 	private readonly runGit: WorktreeGitRunner;
 	private readonly maxWorktreesPerWorkspace: number;
 	private readonly hasActiveRuntimeForSession: ((workspaceName: string, sessionId: string) => boolean) | undefined;
+	private readonly reserveSessionsForRemoval:
+		| ((workspaceName: string, sessionIds: string[]) => (() => void) | undefined)
+		| undefined;
 	private readonly flushState: (() => Promise<void>) | undefined;
 	private readonly now: () => number;
+	private readonly runtimePreparations = new Map<string, symbol>();
 
 	constructor(options: WorktreeManagerOptions) {
 		this.agentDir = options.agentDir;
@@ -309,14 +322,49 @@ export class WorktreeManager {
 		this.runGit = options.runGit ?? createDefaultWorktreeGitRunner();
 		this.maxWorktreesPerWorkspace = options.maxWorktreesPerWorkspace ?? DEFAULT_MAX_WORKTREES_PER_WORKSPACE;
 		this.hasActiveRuntimeForSession = options.hasActiveRuntimeForSession;
+		this.reserveSessionsForRemoval = options.reserveSessionsForRemoval;
 		this.flushState = options.flushState;
 		this.now = options.now ?? Date.now;
+	}
+
+	private async quarantineCheckout(checkoutPath: string, worktreeId: string): Promise<string> {
+		const recoveryRoot = join(getWorktreesRoot(this.agentDir), "recovery");
+		ensurePrivateDirectorySync(recoveryRoot);
+		const recoveries = await readdir(recoveryRoot, { withFileTypes: true });
+		if (recoveries.filter((entry) => entry.isDirectory()).length >= MAX_RECOVERY_CHECKOUTS) {
+			throw new Error(
+				`worktree recovery quota of ${MAX_RECOVERY_CHECKOUTS} checkouts is full; run worktree prune --purge-recovery`,
+			);
+		}
+		for (let attempt = 0; attempt < 10; attempt += 1) {
+			const recoveryPath = join(
+				recoveryRoot,
+				`${worktreeId}-${this.now()}-${randomInt(0x1000000).toString(16).padStart(6, "0")}`,
+			);
+			if (existsSync(recoveryPath)) continue;
+			await rename(checkoutPath, recoveryPath);
+			return recoveryPath;
+		}
+		throw new Error("could not allocate a unique worktree recovery path");
+	}
+
+	private async markRecoverySafeToPurge(recoveryPath: string, workspaceName: string): Promise<void> {
+		await writeDurableAtomicFile(join(recoveryPath, RECOVERY_PURGE_MARKER), `${JSON.stringify({ workspaceName })}\n`);
+	}
+
+	async listRecoveryCheckouts(): Promise<string[]> {
+		const recoveryRoot = join(getWorktreesRoot(this.agentDir), "recovery");
+		if (!existsSync(recoveryRoot)) return [];
+		return (await readdir(recoveryRoot, { withFileTypes: true }))
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => join(recoveryRoot, entry.name))
+			.sort();
 	}
 
 	/** git worktree add; persists the record durably after git succeeds. */
 	async create(
 		workspace: IrohRemoteWorkspace,
-		options: { id?: string; branch?: string; baseRef?: string; workingDirectory?: string } = {},
+		options: { id?: string; branch?: string; baseRef?: string; workingDirectory?: string; signal?: AbortSignal } = {},
 	): Promise<WorktreeResult<{ worktree: IrohRemoteWorkspaceWorktree }>> {
 		const id = options.id ?? generateWorktreeIdSlug();
 		if (!WORKTREE_ID_PATTERN.test(id)) {
@@ -342,12 +390,15 @@ export class WorktreeManager {
 				if (existing.some((entry) => entry.id === id) || existsSync(checkoutPath)) {
 					return { result: { ok: false, error: "worktree_exists" } };
 				}
-
-				const source = await this.resolveCreateSource(registeredWorkspace, options.workingDirectory);
-				if (!source.ok) {
-					return { result: source };
-				}
-				const repoCheck = await this.runGit(["rev-parse", "--git-common-dir"], source.source.sourceRootPath);
+				const source = await this.resolveCreateSource(
+					registeredWorkspace,
+					options.workingDirectory,
+					options.signal,
+				);
+				if (!source.ok) return { result: source };
+				const repoCheck = await this.runGit(["rev-parse", "--git-common-dir"], source.source.sourceRootPath, {
+					signal: options.signal,
+				});
 				if (!repoCheck.ok) {
 					return {
 						result: this.mapGitFailure(repoCheck.stderr, registeredWorkspace, checkoutPath, [
@@ -355,19 +406,17 @@ export class WorktreeManager {
 						]),
 					};
 				}
-
-				// Resolve a defaulted base to a concrete ref (the source checkout's branch,
-				// falling back to its commit sha) so merge-back guidance — aheadBehind,
-				// retention merge checks, `worktree diff` — has a stable base later.
-				const recordedBaseRef = options.baseRef ?? (await this.resolveDefaultBaseRef(source.source.sourceRootPath));
-
+				const recordedBaseRef =
+					options.baseRef ?? (await this.resolveDefaultBaseRef(source.source.sourceRootPath, options.signal));
 				await mkdir(getWorkspaceWorktreesDir(this.agentDir, registeredWorkspace.path), {
 					recursive: true,
 					mode: 0o700,
 				});
+				options.signal?.throwIfAborted();
 				const added = await this.runGit(
 					["worktree", "add", checkoutPath, "-b", branch, baseRef],
 					source.source.sourceRootPath,
+					{ signal: options.signal },
 				);
 				if (!added.ok) {
 					return {
@@ -376,7 +425,6 @@ export class WorktreeManager {
 						]),
 					};
 				}
-
 				const worktree: IrohRemoteWorkspaceWorktree = {
 					id,
 					workspaceName: registeredWorkspace.name,
@@ -391,28 +439,14 @@ export class WorktreeManager {
 				};
 				return { result: { ok: true, worktree }, worktree };
 			});
-			if (result.ok) {
-				try {
-					await this.flushState?.();
-				} catch {
-					return {
-						ok: false,
-						error: "git_failed",
-						detail: "worktree state could not be flushed; the checkout and daemon record were preserved",
-					};
-				}
-			}
+			if (result.ok) await this.flushState?.();
 			return result;
 		} catch (error) {
 			if (isIrohRemoteWorktreeParentWorkspaceNotFoundError(error)) {
 				return { ok: false, error: "worktree_source_unregistered" };
 			}
 			if (isIrohRemoteWorktreePersistenceError(error)) {
-				return {
-					ok: false,
-					error: "git_failed",
-					detail: "worktree state could not be persisted; the created checkout was preserved for recovery",
-				};
+				return { ok: false, error: "git_failed", detail: "worktree state could not be persisted" };
 			}
 			throw error;
 		}
@@ -601,6 +635,7 @@ export class WorktreeManager {
 	private async resolveCreateSource(
 		workspace: IrohRemoteWorkspace,
 		workingDirectory?: string,
+		signal?: AbortSignal,
 	): Promise<WorktreeResult<{ source: WorktreeSourceResolution }>> {
 		const workspaceDirectory = await this.validateWorkingDirectory(workspace, workingDirectory);
 		if (!workspaceDirectory.ok) {
@@ -609,6 +644,7 @@ export class WorktreeManager {
 		const topLevel = await this.runGit(
 			["-C", workspaceDirectory.directory.absolutePath, "rev-parse", "--show-toplevel"],
 			workspace.path,
+			{ signal },
 		);
 		if (!topLevel.ok) {
 			const detail = sanitizeGitDetail(topLevel.stderr, [
@@ -726,13 +762,13 @@ export class WorktreeManager {
 	}
 
 	/** Concrete base for a defaulted create: current branch name, else commit sha. */
-	private async resolveDefaultBaseRef(sourceRootPath: string): Promise<string | undefined> {
-		const symbolic = await this.runGit(["symbolic-ref", "--short", "-q", "HEAD"], sourceRootPath);
+	private async resolveDefaultBaseRef(sourceRootPath: string, signal?: AbortSignal): Promise<string | undefined> {
+		const symbolic = await this.runGit(["symbolic-ref", "--short", "-q", "HEAD"], sourceRootPath, { signal });
 		const shortRef = symbolic.ok ? symbolic.stdout.trim() : "";
 		if (shortRef.length > 0 && isValidGitRefSyntax(shortRef)) {
 			return shortRef;
 		}
-		const sha = await this.runGit(["rev-parse", "HEAD"], sourceRootPath);
+		const sha = await this.runGit(["rev-parse", "HEAD"], sourceRootPath, { signal });
 		const shaValue = sha.ok ? sha.stdout.trim() : "";
 		return /^[0-9a-f]{4,64}$/i.test(shaValue) ? shaValue : undefined;
 	}
@@ -761,6 +797,33 @@ export class WorktreeManager {
 		return { behind: Number.parseInt(match[1], 10), ahead: Number.parseInt(match[2], 10) };
 	}
 
+	private async hasSubmoduleData(
+		checkoutPath: string,
+		sourceRootPath: string,
+		signal?: AbortSignal,
+	): Promise<boolean> {
+		const submodules = await this.runGit(["-C", checkoutPath, "submodule", "status", "--recursive"], sourceRootPath, {
+			signal,
+		});
+		if (!submodules.ok) return true;
+		for (const line of submodules.stdout.split(/\r?\n/)) {
+			if (line.length === 0) continue;
+			if (!line.startsWith("-")) return true;
+			const match = /^-([0-9a-f]{64}|[0-9a-f]{40}) (.+)$/i.exec(line);
+			if (!match?.[2]) return true;
+			const submodulePath = match[2];
+			if (submodulePath.length === 0 || submodulePath.startsWith('"')) return true;
+			const absolutePath = resolve(checkoutPath, submodulePath);
+			if (getContainedRelativePath(checkoutPath, absolutePath) === null) return true;
+			try {
+				if (existsSync(absolutePath) && (await readdir(absolutePath)).length > 0) return true;
+			} catch {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/** Refuses dirty/busy unless force; `git worktree remove [--force]`, then drops the record. */
 	async remove(
 		workspace: IrohRemoteWorkspace,
@@ -768,47 +831,116 @@ export class WorktreeManager {
 		options: { force?: boolean } = {},
 	): Promise<WorktreeResult<Record<never, never>>> {
 		const force = options.force === true;
-		const records = await this.stateManager.listWorktrees(workspace.name);
-		const record = records.find((entry) => entry.id === worktreeId);
-		if (!record) {
-			return { ok: false, error: "worktree_not_found" };
-		}
-		if (!force && this.hasActiveRuntimeForSession) {
-			const busy = record.sessionIds.some((sessionId) =>
-				this.hasActiveRuntimeForSession?.(workspace.name, sessionId),
+		let preservedRecovery = false;
+		let cleanRecoveryPath: string | undefined;
+		let releaseSessionRemoval: (() => void) | undefined;
+		try {
+			const result = await this.stateManager.runWorkspaceWorktreeLifecycle<WorktreeResult<Record<never, never>>>(
+				workspace.name,
+				async (current) => {
+					const record = current.worktrees.find((entry) => entry.id === worktreeId);
+					if (!record) {
+						return { result: { ok: false, error: "worktree_not_found" } };
+					}
+					if (this.runtimePreparations.has(`${current.workspace.name}\0${worktreeId}`)) {
+						return { result: { ok: false, error: "worktree_busy" } };
+					}
+					if (record.sessionIds.length > 0) {
+						releaseSessionRemoval = this.reserveSessionsForRemoval?.(current.workspace.name, record.sessionIds);
+						if (!releaseSessionRemoval) {
+							return { result: { ok: false, error: "worktree_busy" } };
+						}
+					}
+					const sourceRootPath = await this.resolveRecordSourceRootPath(current.workspace, record);
+					if (existsSync(record.path)) {
+						if (sourceRootPath === undefined) {
+							return {
+								result: {
+									ok: false,
+									error: "not_a_git_repository",
+									detail: "worktree source repository is unavailable",
+								},
+							};
+						}
+						if (!force) {
+							const status = await this.runGit(
+								["-C", record.path, "--no-optional-locks", "status", "--porcelain", "--ignored=matching"],
+								sourceRootPath,
+							);
+							if (
+								!status.ok ||
+								status.stdout.trim().length > 0 ||
+								(await this.hasSubmoduleData(record.path, sourceRootPath))
+							) {
+								return { result: { ok: false, error: "worktree_dirty", detail: "dirty" } };
+							}
+						}
+						if (force) {
+							const removed = await this.runGit(["worktree", "remove", "--force", record.path], sourceRootPath);
+							if (!removed.ok) {
+								return {
+									result: this.mapGitFailure(removed.stderr, current.workspace, record.path, [sourceRootPath]),
+								};
+							}
+						} else {
+							try {
+								const recoveryPath = await this.quarantineCheckout(record.path, record.id);
+								const finalStatus = await this.runGit(
+									["-C", recoveryPath, "--no-optional-locks", "status", "--porcelain", "--ignored=matching"],
+									sourceRootPath,
+								);
+								if (
+									!finalStatus.ok ||
+									finalStatus.stdout.trim().length > 0 ||
+									(await this.hasSubmoduleData(recoveryPath, sourceRootPath))
+								) {
+									preservedRecovery = true;
+									return {
+										result: {
+											ok: false,
+											error: "worktree_dirty",
+											detail: `checkout changed during removal and was preserved at ${recoveryPath}`,
+										},
+										worktree: { ...record, path: recoveryPath },
+									};
+								}
+								cleanRecoveryPath = recoveryPath;
+							} catch (error) {
+								return {
+									result: {
+										ok: false,
+										error: "git_failed",
+										detail: error instanceof Error ? error.message : String(error),
+									},
+								};
+							}
+							await this.runGit(["worktree", "prune"], sourceRootPath).catch(() => undefined);
+						}
+					} else if (sourceRootPath !== undefined) {
+						// Checkout vanished out-of-band: clear the stale gitdir entry best-effort.
+						await this.runGit(["worktree", "prune"], sourceRootPath).catch(() => undefined);
+					}
+					return { result: { ok: true }, removeWorktreeIds: [worktreeId] };
+				},
 			);
-			if (busy) {
-				return { ok: false, error: "worktree_busy" };
+			if (result.ok || preservedRecovery) {
+				await this.flushState?.();
 			}
+			if (result.ok && cleanRecoveryPath) {
+				await this.markRecoverySafeToPurge(cleanRecoveryPath, workspace.name).catch(() => undefined);
+			}
+			return result;
+		} catch (error) {
+			if (isIrohRemoteWorktreeParentWorkspaceNotFoundError(error)) {
+				return { ok: false, error: "worktree_source_unregistered" };
+			}
+			if (isIrohRemoteWorktreePersistenceError(error)) {
+				return { ok: false, error: "git_failed", detail: "worktree removal state could not be persisted" };
+			}
+			throw error;
+		} finally {
+			releaseSessionRemoval?.();
 		}
-		const sourceRootPath = await this.resolveRecordSourceRootPath(workspace, record);
-		if (existsSync(record.path)) {
-			if (sourceRootPath === undefined) {
-				return { ok: false, error: "not_a_git_repository", detail: "worktree source repository is unavailable" };
-			}
-			if (!force) {
-				const status = await this.runGit(
-					["-C", record.path, "--no-optional-locks", "status", "--porcelain"],
-					sourceRootPath,
-				);
-				if (status.ok && status.stdout.trim().length > 0) {
-					return { ok: false, error: "worktree_dirty", detail: "dirty" };
-				}
-			}
-			const args = force ? ["worktree", "remove", "--force", record.path] : ["worktree", "remove", record.path];
-			const removed = await this.runGit(args, sourceRootPath);
-			if (!removed.ok) {
-				return this.mapGitFailure(removed.stderr, workspace, record.path, [sourceRootPath]);
-			}
-		} else {
-			// Checkout vanished out-of-band: clear the stale gitdir entry best-effort.
-			if (sourceRootPath !== undefined) {
-				await this.runGit(["worktree", "prune"], sourceRootPath).catch(() => undefined);
-			}
-		}
-		await this.stateManager.removeWorktree(workspace.name, worktreeId);
-		await this.flushState?.();
-		return { ok: true };
 	}
 
 	/**
@@ -818,90 +950,90 @@ export class WorktreeManager {
 	 */
 	async prune(
 		workspace: IrohRemoteWorkspace,
-		options: { signal?: AbortSignal } = {},
-	): Promise<{ removedRecords: string[]; orphanCheckouts: string[] }> {
+		options: { signal?: AbortSignal; purgeRecovery?: boolean } = {},
+	): Promise<{ removedRecords: string[]; orphanCheckouts: string[]; purgedRecoveryCheckouts?: string[] }> {
 		const { signal } = options;
-		const records = await this.stateManager.listWorktrees(workspace.name);
-		const removedRecords: string[] = [];
-		const orphanCheckouts: string[] = [];
-		const finish = async (audit: boolean): Promise<{ removedRecords: string[]; orphanCheckouts: string[] }> => {
-			if (removedRecords.length > 0) {
-				await this.flushState?.();
-			}
-			if (audit) {
-				await this.logAudit({
-					type: "worktree_pruned",
-					workspace: workspace.name,
-					success: true,
-					details: { removedRecords, orphanCheckouts },
-				});
-			}
-			return { removedRecords, orphanCheckouts };
-		};
-		if (signal?.aborted) {
-			return finish(false);
-		}
-		const sourceRootPaths = new Set<string>();
-		for (const record of records) {
-			const sourceRootPath = await this.resolveRecordSourceRootPath(workspace, record);
-			if (signal?.aborted) {
-				return finish(false);
-			}
-			if (sourceRootPath !== undefined) {
-				sourceRootPaths.add(sourceRootPath);
-			}
-			if (!existsSync(record.path)) {
-				await this.stateManager.removeWorktree(workspace.name, record.id);
-				removedRecords.push(record.id);
-				if (signal?.aborted) {
-					return finish(false);
+		if (signal?.aborted) return { removedRecords: [], orphanCheckouts: [] };
+		let purgedRecoveryCheckouts: string[] | undefined;
+		let completed = false;
+		const result = await this.stateManager.runWorkspaceWorktreeLifecycle<{
+			removedRecords: string[];
+			orphanCheckouts: string[];
+		}>(workspace.name, async (current) => {
+			if (options.purgeRecovery) {
+				const ownedPaths = new Set(current.allWorktrees.map((record) => resolve(record.path)));
+				purgedRecoveryCheckouts = [];
+				for (const recoveryPath of await this.listRecoveryCheckouts()) {
+					if (ownedPaths.has(resolve(recoveryPath))) continue;
+					let marker: { workspaceName?: unknown };
+					try {
+						marker = JSON.parse(readFileSync(join(recoveryPath, RECOVERY_PURGE_MARKER), "utf8")) as {
+							workspaceName?: unknown;
+						};
+					} catch {
+						continue;
+					}
+					if (marker.workspaceName !== workspace.name) continue;
+					await rm(recoveryPath, { recursive: true, force: true });
+					purgedRecoveryCheckouts.push(basename(recoveryPath));
 				}
 			}
-		}
-		const parentSourceRootPath = await this.resolveRecordSourceRootPath(workspace, {
-			id: "root",
-			workspaceName: workspace.name,
-			path: workspace.path,
-			branch: "HEAD",
-			createdAt: 0,
-			sessionIds: [],
+			const removedRecords: string[] = [];
+			const orphanCheckouts: string[] = [];
+			const outcome = () => ({
+				result: { removedRecords, orphanCheckouts },
+				...(removedRecords.length === 0 ? {} : { removeWorktreeIds: removedRecords }),
+			});
+			const sourceRootPaths = new Set<string>();
+			for (const record of current.worktrees) {
+				const sourceRootPath = await this.resolveRecordSourceRootPath(current.workspace, record);
+				if (signal?.aborted) return outcome();
+				if (sourceRootPath !== undefined) sourceRootPaths.add(sourceRootPath);
+				if (!existsSync(record.path)) removedRecords.push(record.id);
+			}
+			const parentSourceRootPath = await this.resolveRecordSourceRootPath(current.workspace, {
+				id: "root",
+				workspaceName: current.workspace.name,
+				path: current.workspace.path,
+				branch: "HEAD",
+				createdAt: 0,
+				sessionIds: [],
+			});
+			if (signal?.aborted) return outcome();
+			if (parentSourceRootPath !== undefined) sourceRootPaths.add(parentSourceRootPath);
+			const workspaceDir = getWorkspaceWorktreesDir(this.agentDir, current.workspace.path);
+			const recordedPaths = new Set(current.worktrees.map((record) => resolve(record.path)));
+			if (existsSync(workspaceDir)) {
+				for (const entry of await readdir(workspaceDir, { withFileTypes: true })) {
+					if (signal?.aborted) return outcome();
+					if (!entry.isDirectory() || entry.name.includes(".orphan-")) continue;
+					const entryPath = resolve(join(workspaceDir, entry.name));
+					if (recordedPaths.has(entryPath)) continue;
+					try {
+						await rename(entryPath, `${entryPath}.orphan-${this.now()}`);
+						orphanCheckouts.push(entry.name);
+					} catch {
+						// Quarantine is best-effort; a busy directory stays put for the next prune.
+					}
+				}
+			}
+			for (const sourceRootPath of sourceRootPaths) {
+				if (signal?.aborted) return outcome();
+				await this.runGit(["worktree", "prune"], sourceRootPath, { signal }).catch(() => undefined);
+			}
+			completed = signal?.aborted !== true;
+			return outcome();
 		});
-		if (signal?.aborted) {
-			return finish(false);
+		if (result.removedRecords.length > 0) await this.flushState?.();
+		if (completed) {
+			await this.logAudit({
+				type: "worktree_pruned",
+				workspace: workspace.name,
+				success: true,
+				details: result,
+			});
 		}
-		if (parentSourceRootPath !== undefined) {
-			sourceRootPaths.add(parentSourceRootPath);
-		}
-		const workspaceDir = getWorkspaceWorktreesDir(this.agentDir, workspace.path);
-		const recordedPaths = new Set(records.map((record) => resolve(record.path)));
-		if (existsSync(workspaceDir)) {
-			for (const entry of await readdir(workspaceDir, { withFileTypes: true })) {
-				if (signal?.aborted) {
-					return finish(false);
-				}
-				if (!entry.isDirectory() || entry.name.includes(".orphan-")) {
-					continue;
-				}
-				const entryPath = resolve(join(workspaceDir, entry.name));
-				if (recordedPaths.has(entryPath)) {
-					continue;
-				}
-				const quarantinePath = `${entryPath}.orphan-${this.now()}`;
-				try {
-					await rename(entryPath, quarantinePath);
-					orphanCheckouts.push(entry.name);
-				} catch {
-					// Quarantine is best-effort; a busy directory stays put for the next prune.
-				}
-			}
-		}
-		for (const sourceRootPath of sourceRootPaths) {
-			if (signal?.aborted) {
-				return finish(false);
-			}
-			await this.runGit(["worktree", "prune"], sourceRootPath, { signal }).catch(() => undefined);
-		}
-		return finish(signal?.aborted !== true);
+		return purgedRecoveryCheckouts === undefined ? result : { ...result, purgedRecoveryCheckouts };
 	}
 
 	/**
@@ -931,10 +1063,10 @@ export class WorktreeManager {
 			return { removed: false, reason: "source_unavailable" };
 		}
 		const status = await this.runGit(
-			["-C", record.path, "--no-optional-locks", "status", "--porcelain"],
+			["-C", record.path, "--no-optional-locks", "status", "--porcelain", "--ignored=matching"],
 			sourceRootPath,
 		);
-		if (!status.ok || status.stdout.trim().length > 0) {
+		if (!status.ok || status.stdout.trim().length > 0 || (await this.hasSubmoduleData(record.path, sourceRootPath))) {
 			return { removed: false, reason: "dirty" };
 		}
 		const merged = await this.runGit(
@@ -957,9 +1089,7 @@ export class WorktreeManager {
 		sessionId: string,
 	): Promise<IrohRemoteWorkspaceWorktree | undefined> {
 		const bound = await this.stateManager.findWorktreeForSession(workspaceName, sessionId);
-		if (bound) {
-			return bound;
-		}
+		if (bound) return bound;
 		return this.resolveSessionWorktreeByStoredCwd(workspaceName, sessionId);
 	}
 
@@ -1027,9 +1157,72 @@ export class WorktreeManager {
 		return match.worktree;
 	}
 
-	async bindSession(workspaceName: string, worktreeId: string, sessionId: string): Promise<void> {
-		await this.stateManager.bindWorktreeSession(workspaceName, worktreeId, sessionId);
-		await this.flushState?.();
+	async beginRuntimePreparation(workspaceName: string, worktreeId: string): Promise<WorktreeRuntimePreparation> {
+		const key = `${workspaceName}\0${worktreeId}`;
+		const token = Symbol(key);
+		await this.stateManager.runWorkspaceWorktreeLifecycle(workspaceName, async (current) => {
+			const record = current.worktrees.find((entry) => entry.id === worktreeId);
+			if (!record || !existsSync(record.path) || this.runtimePreparations.has(key)) {
+				throw new Error(`Worktree ${worktreeId} is unavailable for runtime preparation`);
+			}
+			this.runtimePreparations.set(key, token);
+			return { result: undefined };
+		});
+		let settled = false;
+		return {
+			publish: <T>(publish: () => T) =>
+				this.stateManager.runWorkspaceWorktreeLifecycle(workspaceName, async (current) => {
+					const record = current.worktrees.find((entry) => entry.id === worktreeId);
+					if (settled || this.runtimePreparations.get(key) !== token || !record || !existsSync(record.path)) {
+						throw new Error(`Worktree ${worktreeId} is unavailable for runtime publication`);
+					}
+					const result = publish();
+					settled = true;
+					this.runtimePreparations.delete(key);
+					return { result };
+				}),
+			release: async () => {
+				if (settled) return;
+				try {
+					await this.stateManager.runWorkspaceWorktreeLifecycle(workspaceName, async () => {
+						if (this.runtimePreparations.get(key) === token) this.runtimePreparations.delete(key);
+						settled = true;
+						return { result: undefined };
+					});
+				} finally {
+					if (this.runtimePreparations.get(key) === token) this.runtimePreparations.delete(key);
+					settled = true;
+				}
+			},
+		};
+	}
+
+	async bindSession(
+		workspaceName: string,
+		worktreeId: string,
+		sessionId: string,
+		afterPersistWhileLocked?: () => Promise<void>,
+	): Promise<void> {
+		await this.stateManager.runWorkspaceWorktreeLifecycle(workspaceName, async (current) => {
+			const record = current.worktrees.find((entry) => entry.id === worktreeId);
+			if (record === undefined) {
+				throw new Error(`Worktree ${worktreeId} is unavailable for session binding`);
+			}
+			const bound = structuredClone(record);
+			if (!bound.sessionIds.includes(sessionId)) bound.sessionIds.push(sessionId);
+			return {
+				result: undefined,
+				worktree: bound,
+				afterPersistWhileLocked:
+					afterPersistWhileLocked === undefined
+						? undefined
+						: async () => {
+								await this.flushState?.();
+								await afterPersistWhileLocked();
+							},
+			};
+		});
+		if (afterPersistWhileLocked === undefined) await this.flushState?.();
 	}
 
 	async findWorktree(workspaceName: string, worktreeId: string): Promise<IrohRemoteWorkspaceWorktree | undefined> {
@@ -1361,6 +1554,12 @@ export type WorktreeControlRequest = Extract<
 export interface WorktreeControlRequestHooks {
 	manager: WorktreeManager;
 	stateManager: IrohRemoteHostStateManager;
+	bindWorktreeSession?: (
+		workspaceName: string,
+		worktreeId: string,
+		sessionId: string,
+		acquireLease: boolean,
+	) => Promise<boolean>;
 	/** Force-remove hook that stops bound runtimes first (wired by the iroh service). */
 	removeWorktree?: (
 		workspace: IrohRemoteWorkspace,
@@ -1478,7 +1677,9 @@ export async function handleWorktreeControlRequest(
 
 	if (request.type === "worktree_resolve") {
 		const worktrees = await hooks.stateManager.listWorktrees();
-		const match = worktrees.find((worktree) => isPathContained(worktree.path, request.path));
+		const match = worktrees
+			.filter((worktree) => isPathContained(worktree.path, request.path))
+			.sort((left, right) => right.path.length - left.path.length)[0];
 		const workspace = match ? findWorkspace(match.workspaceName) : undefined;
 		if (!match || !workspace) {
 			connection.send({
@@ -1516,7 +1717,26 @@ export async function handleWorktreeControlRequest(
 			});
 			return;
 		}
-		await hooks.manager.bindSession(request.workspaceName, request.worktreeId, request.sessionId);
+		let bound = true;
+		if (hooks.bindWorktreeSession) {
+			bound = await hooks.bindWorktreeSession(
+				request.workspaceName,
+				request.worktreeId,
+				request.sessionId,
+				request.acquireLease === true,
+			);
+		} else {
+			await hooks.manager.bindSession(request.workspaceName, request.worktreeId, request.sessionId);
+		}
+		if (!bound) {
+			connection.send({
+				type: "error",
+				id: request.id,
+				code: "worktree_busy",
+				message: `Worktree ${request.worktreeId} is unavailable for lease acquisition`,
+			});
+			return;
+		}
 		connection.send({ type: "ok", id: request.id });
 		return;
 	}
@@ -1549,9 +1769,14 @@ export async function handleWorktreeControlRequest(
 		sendWorkspaceNotFound(workspaces.missing);
 		return;
 	}
-	const results: Array<{ workspaceName: string; removedRecords: string[]; orphanCheckouts: string[] }> = [];
+	const results: Array<{
+		workspaceName: string;
+		removedRecords: string[];
+		orphanCheckouts: string[];
+		purgedRecoveryCheckouts?: string[];
+	}> = [];
 	for (const workspace of workspaces.workspaces) {
-		const pruned = await hooks.manager.prune(workspace);
+		const pruned = await hooks.manager.prune(workspace, { purgeRecovery: request.purgeRecovery === true });
 		results.push({ workspaceName: workspace.name, ...pruned });
 	}
 	connection.send({ type: "worktree_prune_result", id: request.id, results });

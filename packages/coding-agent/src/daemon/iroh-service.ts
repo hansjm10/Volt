@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { Socket } from "node:net";
 import { relative, resolve, sep } from "node:path";
+import { createAgentSessionServices } from "../core/agent-session-services.ts";
 import {
 	createIrohRemoteExplicitAccess,
 	createIrohRemotePresetAccess,
@@ -15,6 +16,11 @@ import {
 } from "../core/remote/iroh/access-grant.ts";
 import type { IrohRemoteActiveStreamEntry } from "../core/remote/iroh/active-stream-registry.ts";
 import { IrohRemoteActiveStreamRegistry } from "../core/remote/iroh/active-stream-registry.ts";
+import {
+	createIrohRemoteAgentOptions,
+	type IrohRemoteAgentOptions,
+	type IrohRemoteAgentOptionsRpcBackend,
+} from "../core/remote/iroh/agent-options.ts";
 import type { IrohRemoteClientAuthorizationSuccess } from "../core/remote/iroh/authorization.ts";
 import { hashIrohRemotePairingSecret } from "../core/remote/iroh/authorization.ts";
 import {
@@ -60,6 +66,7 @@ import { getIrohRemoteWorkspaceAvailabilityStatus } from "../core/remote/iroh/wo
 import type { IrohRemoteWorktreeRpcBackend } from "../core/remote/iroh/worktree-rpc.ts";
 import type { IrohBiStreamLike } from "../core/rpc/iroh-transport.ts";
 import { getDefaultSessionDir } from "../core/session-manager.ts";
+import { SettingsManager } from "../core/settings-manager.ts";
 import { getCurrentThemeName, getResolvedThemeColors } from "../core/theme/runtime.ts";
 import { ProjectTrustStore } from "../core/trust-manager.ts";
 import { runIrohRemoteRpcMode } from "../modes/rpc/iroh-remote-rpc-mode.ts";
@@ -624,6 +631,7 @@ class IrohDaemonService {
 	private readonly relayUrls: string[];
 	private readonly relayAuthToken: string | undefined;
 	private readonly relayConfigWarning: string | undefined;
+	private readonly profile: string | undefined;
 	private readonly log: ReturnType<VoltdRuntimeServices["logger"]["child"]>;
 	private readonly stateManager: IrohRemoteHostStateManager;
 	private readonly activeStreams = new IrohRemoteActiveStreamRegistry();
@@ -670,6 +678,7 @@ class IrohDaemonService {
 		this.relayMode = relayConfig.relayMode;
 		this.relayUrls = relayConfig.relayUrls;
 		this.relayConfigWarning = relayConfig.warning;
+		this.profile = config.profile;
 		const envRelayAuthToken = process.env.VOLT_IROH_RELAY_AUTH_TOKEN?.trim();
 		this.relayAuthToken =
 			config.relayAuthToken ??
@@ -708,6 +717,8 @@ class IrohDaemonService {
 			resolveWorktree: (workspaceName, hello, targetSessionId) =>
 				this.resolveConversationWorktree(workspaceName, hello, targetSessionId),
 			resolveWorkingDirectory: (options) => this.resolveConversationWorkingDirectory(options),
+			prepareWorktreeRuntime: (workspaceName, worktreeId) =>
+				this.worktrees.beginRuntimePreparation(workspaceName, worktreeId),
 			bindWorktreeSession: (workspaceName, worktreeId, sessionId) =>
 				this.worktrees.bindSession(workspaceName, worktreeId, sessionId),
 			onRuntimeDisposed: (entry) => {
@@ -720,8 +731,15 @@ class IrohDaemonService {
 			agentDir: services.agentDir,
 			stateManager: this.stateManager,
 			auditLogger: services.auditLogger,
-			hasActiveRuntimeForSession: (workspaceName, sessionId) =>
-				this.runtimes.findOwner(workspaceName, sessionId) !== undefined,
+			hasActiveRuntimeForSession: (workspaceName, sessionId) => {
+				const lease = this.leaseBroker.lookup(workspaceName, sessionId);
+				return (
+					this.runtimes.findOwner(workspaceName, sessionId) !== undefined ||
+					(lease !== undefined && lease.state !== "unowned")
+				);
+			},
+			reserveSessionsForRemoval: (workspaceName, sessionIds) =>
+				this.leaseBroker.reserveSessionsForWorktreeRemoval(workspaceName, sessionIds),
 			flushState: () => services.state.flush(),
 		});
 		this.worktreeRetention = new WorktreeRetentionSweeper({
@@ -1555,7 +1573,9 @@ class IrohDaemonService {
 			mode: handshake.hello.mode,
 			...(handshake.hello.mode === "workspaceManagement"
 				? { purpose: handshake.hello.workspaceManagement.purpose }
-				: {}),
+				: handshake.hello.mode === "workspaceDiscovery"
+					? { purpose: handshake.hello.workspaceDiscovery.purpose }
+					: {}),
 		});
 		if (
 			streamCapability !== undefined &&
@@ -1767,6 +1787,14 @@ class IrohDaemonService {
 			{ terminalSessionId: undefined },
 		);
 		try {
+			const discoveryHooks =
+				handshake.hello.mode === "workspaceDiscovery" &&
+				handshake.hello.workspaceDiscovery.purpose === "agent_options"
+					? {
+							purpose: "agent_options" as const,
+							agentOptions: this.createAgentOptionsRpcBackend(handshake.authorization.workspace),
+						}
+					: { purpose: "list_sessions" as const, commandContext: this.getCommandContext() };
 			await runWorkspaceDiscoveryStream(
 				{
 					stream,
@@ -1777,11 +1805,44 @@ class IrohDaemonService {
 						void owner.close(reason ?? "stream_closed").catch(() => {});
 					},
 				},
-				{ commandContext: this.getCommandContext() },
+				discoveryHooks,
 			);
 		} finally {
 			activeStream.remove();
 		}
+	}
+
+	private createAgentOptionsRpcBackend(workspace: IrohRemoteWorkspace): IrohRemoteAgentOptionsRpcBackend {
+		return {
+			getAgentOptions: async () => {
+				const admission = this.admission.tryAcquire();
+				if (!admission) throw new Error("host is shutting down");
+				try {
+					return await this.getAgentOptions(workspace, admission.signal);
+				} finally {
+					admission.release();
+				}
+			},
+		};
+	}
+
+	private async getAgentOptions(
+		workspace: IrohRemoteWorkspace,
+		signal?: AbortSignal,
+	): Promise<IrohRemoteAgentOptions> {
+		const projectTrusted = resolveIrohRemoteWorkspaceProjectTrusted(workspace, { trustStore: this.trustStore });
+		const settingsManager = SettingsManager.create(workspace.path, this.services.agentDir, {
+			profile: this.profile,
+			projectTrusted,
+		});
+		const services = await createAgentSessionServices({
+			cwd: workspace.path,
+			projectCwd: workspace.path,
+			agentDir: this.services.agentDir,
+			settingsManager,
+			workspaceName: workspace.name,
+		});
+		return createIrohRemoteAgentOptions(workspace.name, services, signal);
 	}
 
 	private async runWorkspaceManagement(
@@ -1972,11 +2033,20 @@ class IrohDaemonService {
 			return undefined;
 		}
 		if (hello.conversation.target === "new") {
-			const worktreeId = hello.conversation.worktreeId;
-			if (worktreeId === undefined) {
-				return undefined;
+			const requestedWorktreeId = hello.conversation.worktreeId;
+			const boundWorktree =
+				targetSessionId === undefined
+					? undefined
+					: await this.worktrees.resolveSessionWorktree(workspaceName, targetSessionId);
+			if (boundWorktree !== undefined && boundWorktree.id !== requestedWorktreeId) {
+				throw createConversationOpenError(
+					"invalid_conversation_target",
+					"session id is already bound to a different worktree placement",
+					{ workspace: workspaceName, sessionId: targetSessionId },
+				);
 			}
-			const worktree = await this.worktrees.findWorktree(workspaceName, worktreeId);
+			if (requestedWorktreeId === undefined) return undefined;
+			const worktree = boundWorktree ?? (await this.worktrees.findWorktree(workspaceName, requestedWorktreeId));
 			if (!worktree || !existsSync(worktree.path)) {
 				throw createConversationOpenError("invalid_conversation_target", "unknown or unavailable worktree", {
 					workspace: workspaceName,
@@ -3922,6 +3992,32 @@ class IrohDaemonService {
 					await handleWorktreeControlRequest(connection, request, {
 						manager: this.worktrees,
 						stateManager: this.stateManager,
+						bindWorktreeSession: async (workspaceName, worktreeId, sessionId, acquireLease) => {
+							let acquired = !acquireLease;
+							const leaseDenied = new Error("worktree lease acquisition denied");
+							try {
+								await this.worktrees.bindSession(
+									workspaceName,
+									worktreeId,
+									sessionId,
+									acquireLease
+										? async () => {
+												const outcome = await this.leaseBroker.acquireForTui({
+													connectionId: connection.connectionId,
+													workspaceName,
+													sessionId,
+												});
+												if (outcome.kind === "denied") throw leaseDenied;
+												acquired = true;
+											}
+										: undefined,
+								);
+							} catch (error) {
+								if (error === leaseDenied) return false;
+								throw error;
+							}
+							return acquired;
+						},
 						removeWorktree: (workspace, worktreeId, force) =>
 							this.removeWorkspaceWorktree(workspace, worktreeId, force),
 					});

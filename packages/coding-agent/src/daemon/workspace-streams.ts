@@ -4,6 +4,10 @@ import {
 	getMissingIrohRemoteRpcCapability,
 	parseIrohRemoteRpcGrant,
 } from "../core/remote/iroh/access-grant.ts";
+import {
+	handleIrohRemoteAgentOptionsRpcCommand,
+	type IrohRemoteAgentOptionsRpcBackend,
+} from "../core/remote/iroh/agent-options.ts";
 import type { IrohRemoteAuditLogger } from "../core/remote/iroh/audit.ts";
 import type { IrohRemoteClientAuthorizationSuccess } from "../core/remote/iroh/authorization.ts";
 import { isIrohRemoteWorkspaceName } from "../core/remote/iroh/handshake.ts";
@@ -177,7 +181,9 @@ export interface WorkspaceStreamContext {
 /** Serve a workspaceDiscovery stream: list_sessions only. */
 export async function runWorkspaceDiscoveryStream(
 	context: WorkspaceStreamContext,
-	hooks: Pick<WorkspaceStreamHooks, "commandContext">,
+	hooks:
+		| { purpose: "list_sessions"; commandContext: ConversationCommandContext }
+		| { purpose: "agent_options"; agentOptions: IrohRemoteAgentOptionsRpcBackend },
 ): Promise<void> {
 	const { stream, authorization } = context;
 	await runWorkspaceUtilityRpcLoop(stream, context.initialInput, async (line) => {
@@ -190,7 +196,8 @@ export async function runWorkspaceDiscoveryStream(
 			await writeIrohRemoteJsonLine(stream.send, parsed.response, authorization);
 			return false;
 		}
-		if (parsed.command.type !== "list_sessions") {
+		const expectedType = hooks.purpose === "agent_options" ? "get_agent_options" : "list_sessions";
+		if (parsed.command.type !== expectedType) {
 			await writeIrohRemoteJsonLine(
 				stream.send,
 				createIrohRemoteRpcErrorResponse(
@@ -205,6 +212,16 @@ export async function runWorkspaceDiscoveryStream(
 		const denied = getUtilityCapabilityDenial(parsed.command, authorization);
 		if (denied) {
 			await writeIrohRemoteJsonLine(stream.send, denied, authorization);
+			return false;
+		}
+		if (hooks.purpose === "agent_options") {
+			const result = await handleIrohRemoteAgentOptionsRpcCommand(parsed.command, {
+				authorizedWorkspaceName: authorization.workspace.name,
+				backend: hooks.agentOptions,
+			});
+			if (result.handled) {
+				await writeIrohRemoteJsonLine(stream.send, result.response, authorization);
+			}
 			return false;
 		}
 		await writeIrohRemoteJsonLine(

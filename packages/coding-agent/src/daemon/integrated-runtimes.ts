@@ -45,7 +45,7 @@ import {
 import type { IntegratedConversationSessionSelection } from "./handshake-responses.ts";
 import type { DaemonRuntimeOwnerCapability } from "./lease-broker.ts";
 import { isPathInside, resolveWorkspaceDirectory, type WorkspaceDirectoryResolution } from "./workspace-directory.ts";
-import { getRegisteredWorkingDirectoryForWorktree } from "./worktree-manager.ts";
+import { getRegisteredWorkingDirectoryForWorktree, type WorktreeRuntimePreparation } from "./worktree-manager.ts";
 
 export type IntegratedRuntimeSubscriber = ConversationSubscriber;
 
@@ -75,6 +75,8 @@ export interface IntegratedRuntimeEntry {
 	readonly detachedRuntimeRetention: DetachedRuntimeRetentionHandle | undefined;
 	parentSessionId?: string;
 	subagentId?: string;
+	/** Held until prepared runtime ownership is inserted into the registry. */
+	worktreePreparation?: WorktreeRuntimePreparation;
 	/** Set when the runtime cwd is a daemon-managed worktree checkout. */
 	worktreeId?: string;
 	/** Host-local checkout path (sanitizer root); never sent on the wire. */
@@ -125,6 +127,8 @@ export interface IntegratedRuntimeRegistryOptions {
 		workingDirectory?: string;
 		worktree?: IrohRemoteWorkspaceWorktree;
 	}) => Promise<WorkspaceDirectoryResolution>;
+	/** Reserve the worktree before runtime initialization and atomically publish or release it. */
+	prepareWorktreeRuntime?: (workspaceName: string, worktreeId: string) => Promise<WorktreeRuntimePreparation>;
 	/** Persist the sessionId → worktree binding after a created worktree conversation. */
 	bindWorktreeSession?: (workspaceName: string, worktreeId: string, sessionId: string) => Promise<void>;
 	/** Lease-broker seam: invoked when a runtime's session id changes (rekey). */
@@ -164,7 +168,7 @@ export function createIrohRuntimeConversationTarget(
 		throw new Error("integrated runtime requires a conversation stream");
 	}
 	if (hello.conversation.target === "new") {
-		return { target: "new" };
+		return { target: "new", sessionId: hello.conversation.sessionId };
 	}
 	if (hello.conversation.target === "session") {
 		return { target: "session", sessionId: hello.conversation.sessionId };
@@ -180,7 +184,7 @@ export function getResolvedTargetSessionId(
 	if (hello.mode !== "conversation") {
 		return undefined;
 	}
-	if (hello.conversation.target === "session") {
+	if (hello.conversation.target === "session" || hello.conversation.target === "new") {
 		return hello.conversation.sessionId;
 	}
 	if (hello.conversation.target !== "last") {
@@ -305,6 +309,15 @@ export class IntegratedRuntimeRegistry {
 	private readonly options: IntegratedRuntimeRegistryOptions;
 	readonly coordinators: ConversationCoordinatorRegistry;
 	private readonly entries = new Map<string, IntegratedRuntimeEntry>();
+	private readonly namedSessionCreations = new Map<
+		string,
+		{
+			entry?: IntegratedRuntimeEntry;
+			published: Promise<void>;
+			resolvePublished(): void;
+			rejectPublished(error: unknown): void;
+		}
+	>();
 	private readonly sessionRekeyReservationsBySource = new Map<string, IntegratedRuntimeEntry>();
 	private readonly sessionRekeyReservationsByTarget = new Map<string, IntegratedRuntimeEntry>();
 
@@ -417,7 +430,22 @@ export class IntegratedRuntimeRegistry {
 				if (existing.lifecycle !== "active") {
 					throw this.createAttachRetryError(existing, "conversation runtime is retiring");
 				}
-				if (!shouldReplaceIrohRemoteIntegratedRuntimeForAuthorization(authorization)) {
+				if (handshake.hello.mode === "conversation" && handshake.hello.conversation.target === "new") {
+					if (
+						handshake.hello.conversation.worktreeId !== existing.worktreeId ||
+						handshake.hello.conversation.workingDirectory !== existing.workingDirectory
+					) {
+						throw createConversationOpenError(
+							"invalid_conversation_target",
+							"session id is already bound to different placement",
+							{ workspace: authorization.workspace.name, sessionId: targetSessionId },
+						);
+					}
+				}
+				if (
+					(handshake.hello.mode === "conversation" && handshake.hello.conversation.target === "new") ||
+					!shouldReplaceIrohRemoteIntegratedRuntimeForAuthorization(authorization)
+				) {
 					assertAttachAdmissionOpen(options.signal);
 					const attachingPolicy = this.resolveToolPolicy(authorization);
 					if (!isIrohRemoteRuntimeToolPolicyWithin(existing.toolPolicy, attachingPolicy)) {
@@ -448,6 +476,39 @@ export class IntegratedRuntimeRegistry {
 					};
 				}
 				await waitForAttachAdmission(this.stopEntry(existing, "fresh_pairing_replaced_runtime"), options.signal);
+			}
+		}
+		if (handshake.hello.mode === "conversation" && handshake.hello.conversation.target === "new") {
+			const key = this.getRegistryKey(authorization.workspace.name, handshake.hello.conversation.sessionId);
+			const pending = this.namedSessionCreations.get(key);
+			if (pending) {
+				await waitForAttachAdmission(pending.published, options.signal);
+				return this.getOrCreateEntry(handshake, authorization, options);
+			}
+			let resolvePublished = () => {};
+			let rejectPublished = (_error: unknown) => {};
+			const published = new Promise<void>((resolve, reject) => {
+				resolvePublished = resolve;
+				rejectPublished = reject;
+			});
+			void published.catch(() => undefined);
+			const reservation: {
+				entry?: IntegratedRuntimeEntry;
+				published: Promise<void>;
+				resolvePublished(): void;
+				rejectPublished(error: unknown): void;
+			} = { published, resolvePublished, rejectPublished };
+			this.namedSessionCreations.set(key, reservation);
+			try {
+				const created = await this.createEntry(handshake, authorization, options);
+				reservation.entry = created.entry;
+				return created;
+			} catch (error) {
+				if (this.namedSessionCreations.get(key) === reservation) {
+					this.namedSessionCreations.delete(key);
+					reservation.rejectPublished(error);
+				}
+				throw error;
 			}
 		}
 		return this.createEntry(handshake, authorization, options);
@@ -483,6 +544,7 @@ export class IntegratedRuntimeRegistry {
 	}> {
 		let runtime: AgentSessionRuntime | undefined;
 		let sessionSelection: IntegratedConversationSessionSelection | undefined;
+		let worktreePreparation: WorktreeRuntimePreparation | undefined;
 		try {
 			// Resolve any worktree binding first: explicit worktreeId on "new", or a
 			// persisted sessionId binding on resume. Trust and allowTools stay pinned
@@ -499,6 +561,13 @@ export class IntegratedRuntimeRegistry {
 						options.signal,
 					)
 				: undefined;
+			if (worktree !== undefined && this.options.prepareWorktreeRuntime) {
+				worktreePreparation = await waitForAttachAdmission(
+					this.options.prepareWorktreeRuntime(authorization.workspace.name, worktree.id),
+					options.signal,
+					(latePreparation) => latePreparation.release(),
+				);
+			}
 			const rootPath = worktree?.path ?? authorization.workspace.path;
 			const requestedWorkingDirectory = getRequestedWorkingDirectory(handshake.hello);
 			assertAttachAdmissionOpen(options.signal);
@@ -543,6 +612,18 @@ export class IntegratedRuntimeRegistry {
 				worktree === undefined
 					? runtimeDirectory.relativePath
 					: getRegisteredWorkingDirectoryForWorktree(worktree, runtimeDirectory.relativePath);
+			if (
+				handshake.hello.mode === "conversation" &&
+				handshake.hello.conversation.target === "new" &&
+				sessionSelection.kind === "resumed" &&
+				requestedWorkingDirectory !== remoteWorkingDirectory
+			) {
+				throw createConversationOpenError(
+					"invalid_conversation_target",
+					"session id is already bound to a different working directory",
+					{ workspace: authorization.workspace.name, sessionId: runtime.session.sessionId },
+				);
+			}
 			const echoedWorkingDirectory =
 				handshake.hello.mode === "conversation" &&
 				handshake.hello.conversation.target === "new" &&
@@ -598,7 +679,8 @@ export class IntegratedRuntimeRegistry {
 				clientNodeId: authorization.client.nodeId,
 				workspaceName: authorization.workspace.name,
 				sessionId,
-				runtime,
+				runtime: runtime!,
+				...(worktreePreparation === undefined ? {} : { worktreePreparation }),
 				...(worktree === undefined
 					? {}
 					: {
@@ -611,6 +693,7 @@ export class IntegratedRuntimeRegistry {
 				...(echoedWorkingDirectory === undefined ? {} : { workingDirectory: echoedWorkingDirectory }),
 				toolPolicy,
 			});
+			worktreePreparation = undefined;
 			return {
 				entry,
 				attachClaim: this.createAttachClaim(entry, authorization.client.nodeId),
@@ -618,6 +701,7 @@ export class IntegratedRuntimeRegistry {
 				sessionSelection,
 			};
 		} catch (error) {
+			await worktreePreparation?.release().catch(() => undefined);
 			if (runtime) {
 				await cleanupUncommittedRuntime(runtime, sessionSelection);
 			}
@@ -632,6 +716,7 @@ export class IntegratedRuntimeRegistry {
 		runtime: AgentSessionRuntime;
 		parentSessionId?: string;
 		subagentId?: string;
+		worktreePreparation?: WorktreeRuntimePreparation;
 		worktreeId?: string;
 		worktreePath?: string;
 		worktreeSourceRootRelativePath?: string;
@@ -682,6 +767,7 @@ export class IntegratedRuntimeRegistry {
 			},
 			...(options.parentSessionId === undefined ? {} : { parentSessionId: options.parentSessionId }),
 			...(options.subagentId === undefined ? {} : { subagentId: options.subagentId }),
+			...(options.worktreePreparation === undefined ? {} : { worktreePreparation: options.worktreePreparation }),
 			...(options.worktreeId === undefined ? {} : { worktreeId: options.worktreeId }),
 			...(options.worktreePath === undefined ? {} : { worktreePath: options.worktreePath }),
 			...(options.worktreeSourceRootRelativePath === undefined
@@ -699,10 +785,10 @@ export class IntegratedRuntimeRegistry {
 		return entry;
 	}
 
-	private registerSubagentRuntime(
+	async registerSubagentRuntime(
 		event: IrohRemoteSubagentRuntimeCreatedEvent,
 		authorization: IrohRemoteClientAuthorizationSuccess,
-	): SubagentRuntimeRegistration {
+	): Promise<SubagentRuntimeRegistration> {
 		const workspaceName = authorization.workspace.name;
 		const parentEntry = this.findOwner(workspaceName, event.parentSessionId);
 		if (!parentEntry || parentEntry.lifecycle !== "active") {
@@ -714,6 +800,12 @@ export class IntegratedRuntimeRegistry {
 		) {
 			throw new Error(`Subagent session ${event.sessionId} is already active`);
 		}
+		if (parentEntry.worktreeId !== undefined) {
+			if (!this.options.bindWorktreeSession) {
+				throw new Error(`Worktree binding is unavailable for subagent session ${event.sessionId}`);
+			}
+			await this.options.bindWorktreeSession(workspaceName, parentEntry.worktreeId, event.sessionId);
+		}
 		const entry = this.createEntryRecord({
 			clientNodeId: authorization.client.nodeId,
 			workspaceName,
@@ -721,6 +813,12 @@ export class IntegratedRuntimeRegistry {
 			runtime: event.runtime,
 			parentSessionId: event.parentSessionId,
 			subagentId: event.id,
+			...(parentEntry.worktreeId === undefined ? {} : { worktreeId: parentEntry.worktreeId }),
+			...(parentEntry.worktreePath === undefined ? {} : { worktreePath: parentEntry.worktreePath }),
+			...(parentEntry.worktreeSourceRootRelativePath === undefined
+				? {}
+				: { worktreeSourceRootRelativePath: parentEntry.worktreeSourceRootRelativePath }),
+			...(parentEntry.workingDirectory === undefined ? {} : { workingDirectory: parentEntry.workingDirectory }),
 			toolPolicy: parentEntry.toolPolicy,
 		});
 		let state: "prepared" | "committed" | "rolled-back" = "prepared";
@@ -796,7 +894,15 @@ export class IntegratedRuntimeRegistry {
 		const inserted = this.entries.get(entry.key) !== entry;
 		assertAttachAdmissionOpen(signal);
 		if (inserted) {
-			this.entries.set(entry.key, entry);
+			if (entry.worktreePreparation) {
+				await entry.worktreePreparation.publish(() => {
+					assertAttachAdmissionOpen(signal);
+					this.entries.set(entry.key, entry);
+				});
+				delete entry.worktreePreparation;
+			} else {
+				this.entries.set(entry.key, entry);
+			}
 		}
 
 		try {
@@ -842,10 +948,20 @@ export class IntegratedRuntimeRegistry {
 				throw this.createAttachRetryError(entry, "conversation runtime ownership changed during commit");
 			}
 			entry.coordinator.activateRuntime();
+			const namedCreation = this.namedSessionCreations.get(entry.key);
+			if (namedCreation?.entry === entry) {
+				this.namedSessionCreations.delete(entry.key);
+				namedCreation.resolvePublished();
+			}
 		} catch (error) {
 			// A concurrent stop owns a retiring entry until disposal completes. Do
 			// not remove it here or stopEntry would return early and leak its runtime.
-			if (inserted && entry.lifecycle === "prepared" && this.entries.get(entry.key) === entry) {
+			if (
+				inserted &&
+				entry.worktreeId === undefined &&
+				entry.lifecycle === "prepared" &&
+				this.entries.get(entry.key) === entry
+			) {
 				this.entries.delete(entry.key);
 			}
 			throw error;
@@ -880,11 +996,18 @@ export class IntegratedRuntimeRegistry {
 		if (entry.subscribers.size !== 0) {
 			throw new Error("Cannot abort a prepared conversation runtime with attached subscribers");
 		}
+		this.cancelRetention(entry);
+		await entry.worktreePreparation?.release().catch(() => undefined);
+		delete entry.worktreePreparation;
+		await cleanupUncommittedRuntime(entry.runtime, sessionSelection);
+		const namedCreation = this.namedSessionCreations.get(entry.key);
+		if (namedCreation?.entry === entry) {
+			this.namedSessionCreations.delete(entry.key);
+			namedCreation.rejectPublished(new Error("caller-named session creation was aborted before publication"));
+		}
 		if (this.entries.get(entry.key) === entry) {
 			this.entries.delete(entry.key);
 		}
-		this.cancelRetention(entry);
-		await cleanupUncommittedRuntime(entry.runtime, sessionSelection);
 	}
 
 	async attachSubscriber(

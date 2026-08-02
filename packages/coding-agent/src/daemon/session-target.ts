@@ -9,7 +9,7 @@ import { SessionManager } from "../core/session-manager.ts";
  */
 export type IrohRemoteSessionTarget =
 	| { kind: "last"; resumeSessionId?: string }
-	| { kind: "new" }
+	| { kind: "new"; sessionId: string }
 	| { kind: "session"; sessionId: string };
 
 export type IrohRemoteSessionTargetSelection = "created" | "created_after_missing" | "resumed";
@@ -37,7 +37,7 @@ export interface SessionTargetSessionStore<H extends SessionTargetSessionHandle 
 	/** Strict internal lookup that may include selector-hidden WAL-only sessions. */
 	find?(sessionId: string): Promise<{ id: string; path: string } | undefined>;
 	open(path: string): H;
-	create(): H;
+	create(sessionId?: string): H;
 }
 
 export interface ResolvedSessionTargetWithManager<H extends SessionTargetSessionHandle = SessionTargetSessionHandle>
@@ -49,7 +49,7 @@ export interface ResolvedSessionTargetWithManager<H extends SessionTargetSession
  * Resolve a conversation target to a concrete session, matching the historical
  * behavior of createIrohRemoteAgentRuntimeWithSessionSelection exactly:
  *
- * - new: always create -> "created"
+ * - new: create the caller-named id once, or resume that exact id on retry
  * - last without a remembered id: create -> "created"
  * - last with a remembered id: open if it exists -> "resumed", else create -> "created_after_missing"
  * - session: open if it exists -> "resumed", else throw session_unavailable
@@ -74,17 +74,13 @@ export async function resolveIrohRemoteSessionTarget<H extends SessionTargetSess
 		sessionManager,
 	});
 
-	if (target.kind === "new") {
-		return resolved(sessions.create(), "created");
-	}
-
 	const requestedSessionId = target.kind === "last" ? target.resumeSessionId : target.sessionId;
 	if (requestedSessionId === undefined) {
 		return resolved(sessions.create(), "created");
 	}
 
 	if (!isIrohRemoteSessionId(requestedSessionId)) {
-		if (target.kind === "session") {
+		if (target.kind === "session" || target.kind === "new") {
 			throw new IrohRemoteOutcomeError("session_unavailable", "session not found in workspace");
 		}
 		return resolved(sessions.create(), "created_after_missing", requestedSessionId);
@@ -105,6 +101,9 @@ export async function resolveIrohRemoteSessionTarget<H extends SessionTargetSess
 		if (target.kind === "session") {
 			throw new IrohRemoteOutcomeError("session_unavailable", "session not found in workspace");
 		}
+		if (target.kind === "new") {
+			return resolved(sessions.create(requestedSessionId), "created");
+		}
 		return resolved(sessions.create(), "created_after_missing", requestedSessionId);
 	}
 
@@ -113,7 +112,7 @@ export async function resolveIrohRemoteSessionTarget<H extends SessionTargetSess
 		if (sessionManager.getSessionId() !== requestedSessionId) {
 			throw new Error("session identity changed while opening resume target");
 		}
-		return resolved(sessionManager, "resumed", requestedSessionId);
+		return resolved(sessionManager, "resumed", target.kind === "new" ? undefined : requestedSessionId);
 	} catch {
 		// Lookup and open cannot be atomic across an arbitrary injected store. Fail
 		// closed if the target disappears, is replaced, or no longer claims the
@@ -143,8 +142,8 @@ export function createSessionManagerTargetStore(
 		open(path: string) {
 			return SessionManager.open(path, sessionDir, options.preserveSessionCwd ? undefined : cwd);
 		},
-		create() {
-			return SessionManager.create(cwd, sessionDir);
+		create(sessionId) {
+			return SessionManager.create(cwd, sessionDir, sessionId === undefined ? undefined : { id: sessionId });
 		},
 	};
 }

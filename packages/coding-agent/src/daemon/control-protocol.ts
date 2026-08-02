@@ -145,11 +145,19 @@ export type ControlRequest =
 	  }
 	| { type: "worktree_list"; id: string; workspaceName?: string }
 	| { type: "worktree_remove"; id: string; workspaceName: string; worktreeId: string; force?: boolean }
-	| { type: "worktree_prune"; id: string; workspaceName?: string }
+	| { type: "worktree_prune"; id: string; workspaceName?: string; purgeRecovery?: boolean }
 	/** Resolve a filesystem path to the daemon-managed worktree containing it. */
 	| { type: "worktree_resolve"; id: string; path: string }
 	/** Bind a session id to a worktree (TUI-created worktree sessions). */
-	| { type: "worktree_bind"; id: string; workspaceName: string; worktreeId: string; sessionId: string }
+	| {
+			type: "worktree_bind";
+			id: string;
+			workspaceName: string;
+			worktreeId: string;
+			sessionId: string;
+			/** Direct managed-checkout startup: acquire the lease on this same connection while binding. */
+			acquireLease?: boolean;
+	  }
 	| { type: "theme_set"; id: string; theme: string } // name; daemon resolves + broadcasts
 	| { type: "keep_awake_set"; id: string; enabled: boolean } // hold/release the host sleep-prevention assertion
 	| { type: "viewer_subscribe"; id: string; viewerFeedId: string }
@@ -343,7 +351,12 @@ export type ControlResponse =
 	| {
 			type: "worktree_prune_result";
 			id: string;
-			results: Array<{ workspaceName: string; removedRecords: string[]; orphanCheckouts: string[] }>;
+			results: Array<{
+				workspaceName: string;
+				removedRecords: string[];
+				orphanCheckouts: string[];
+				purgedRecoveryCheckouts?: string[];
+			}>;
 	  }
 	| { type: "pair_started"; id: string; requestId: string }
 	| {
@@ -777,8 +790,12 @@ export function isControlRequest(value: unknown): value is ControlRequest {
 				(value.baseRef === undefined || typeof value.baseRef === "string")
 			);
 		case "worktree_list":
-		case "worktree_prune":
 			return value.workspaceName === undefined || typeof value.workspaceName === "string";
+		case "worktree_prune":
+			return (
+				(value.workspaceName === undefined || typeof value.workspaceName === "string") &&
+				(value.purgeRecovery === undefined || typeof value.purgeRecovery === "boolean")
+			);
 		case "worktree_remove":
 			return (
 				typeof value.workspaceName === "string" &&
@@ -791,7 +808,8 @@ export function isControlRequest(value: unknown): value is ControlRequest {
 			return (
 				typeof value.workspaceName === "string" &&
 				typeof value.worktreeId === "string" &&
-				typeof value.sessionId === "string"
+				typeof value.sessionId === "string" &&
+				(value.acquireLease === undefined || typeof value.acquireLease === "boolean")
 			);
 		case "theme_set":
 			return typeof value.theme === "string";

@@ -148,6 +148,23 @@ describe("worktree manager (fake git)", () => {
 		expect(records[0]?.id).toBe("fix-login");
 	});
 
+	it("fences removal during normal runtime preparation", async () => {
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "preparing-runtime");
+		const git = createFakeGit((args) => {
+			if (args[0] === "worktree" && args[1] === "add") mkdirSync(checkout, { recursive: true });
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "preparing-runtime" });
+		const preparation = await manager.beginRuntimePreparation("repo", "preparing-runtime");
+
+		await expect(manager.remove(workspace, "preparing-runtime", { force: true })).resolves.toMatchObject({
+			ok: false,
+			error: "worktree_busy",
+		});
+		await expect(preparation.publish(() => "published")).resolves.toBe("published");
+	});
+
 	it("serializes workspace unregister with create through child persistence", async () => {
 		const addStarted = createDeferred();
 		const finishAdd = createDeferred();
@@ -224,7 +241,7 @@ describe("worktree manager (fake git)", () => {
 		expect(result).toEqual({
 			ok: false,
 			error: "git_failed",
-			detail: "worktree state could not be persisted; the created checkout was preserved for recovery",
+			detail: "worktree state could not be persisted",
 		});
 		expect(existsSync(join(expectedCheckout, "keep.txt"))).toBe(true);
 		expect((await failingStateManager.getState()).worktrees).toEqual([]);
@@ -550,7 +567,117 @@ describe("worktree manager (fake git)", () => {
 		expect(await stateManager.listWorktrees("repo")).toHaveLength(0);
 	});
 
-	it("refuses to remove a busy worktree unless forced", async () => {
+	it("preserves ignored files during non-force removal", async () => {
+		const git = createFakeGit((args) => (args.includes("status") ? { ok: true, stdout: "!! .env\n" } : { ok: true }));
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "ignored" });
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "ignored");
+		mkdirSync(checkout, { recursive: true });
+
+		await expect(manager.remove(workspace, "ignored")).resolves.toEqual({
+			ok: false,
+			error: "worktree_dirty",
+			detail: "dirty",
+		});
+		expect(git.calls).toContainEqual({
+			args: ["-C", checkout, "--no-optional-locks", "status", "--porcelain", "--ignored=matching"],
+			cwd: realpathSync(workspaceDir),
+		});
+		expect(git.calls.some(({ args }) => args[0] === "worktree" && args[1] === "remove")).toBe(false);
+	});
+
+	it("preserves initialized submodules during non-force removal", async () => {
+		const git = createFakeGit((args) => {
+			if (args.includes("status") && args.includes("submodule")) {
+				return { ok: true, stdout: ` ${"a".repeat(40)} dependencies/nested\n` };
+			}
+			if (args.includes("status")) return { ok: true, stdout: "" };
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "submodule-data" });
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "submodule-data");
+		mkdirSync(checkout, { recursive: true });
+
+		await expect(manager.remove(workspace, "submodule-data")).resolves.toMatchObject({
+			ok: false,
+			error: "worktree_dirty",
+		});
+		expect(existsSync(checkout)).toBe(true);
+		expect(await manager.listRecoveryCheckouts()).toEqual([]);
+	});
+
+	it.each([
+		[40, "dependencies/nested"],
+		[64, "dependencies/nested"],
+		[40, "deps/foo (bar)"],
+	])(
+		"preserves data in uninitialized SHA-%i submodule directory %s during non-force removal",
+		async (oidLength, submodulePath) => {
+			const git = createFakeGit((args) => {
+				if (args.includes("submodule")) {
+					return { ok: true, stdout: `-${"a".repeat(oidLength)} ${submodulePath}\n` };
+				}
+				if (args.includes("status")) return { ok: true, stdout: "" };
+				return { ok: true };
+			});
+			const manager = createManager(git.runGit);
+			await manager.create(workspace, { id: "uninitialized-submodule-data" });
+			const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "uninitialized-submodule-data");
+			const submoduleDirectory = join(checkout, submodulePath);
+			mkdirSync(submoduleDirectory, { recursive: true });
+			writeFileSync(join(submoduleDirectory, ".env"), "secret");
+
+			await expect(manager.remove(workspace, "uninitialized-submodule-data")).resolves.toMatchObject({
+				ok: false,
+				error: "worktree_dirty",
+			});
+			expect(existsSync(submoduleDirectory)).toBe(true);
+			expect(await manager.listRecoveryCheckouts()).toEqual([]);
+		},
+	);
+
+	it("quarantines ignored data created concurrently with non-force removal", async () => {
+		let statusCalls = 0;
+		const git = createFakeGit((args) => {
+			if (args.includes("submodule")) return { ok: true, stdout: "" };
+			if (!args.includes("status")) return { ok: true };
+			statusCalls += 1;
+			return { ok: true, stdout: statusCalls === 1 ? "" : "!! .env\n" };
+		});
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "raced-ignored" });
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "raced-ignored");
+		mkdirSync(checkout, { recursive: true });
+
+		await expect(manager.remove(workspace, "raced-ignored")).resolves.toMatchObject({
+			ok: false,
+			error: "worktree_dirty",
+		});
+		expect(existsSync(checkout)).toBe(false);
+		const recoveries = await manager.listRecoveryCheckouts();
+		expect(recoveries).toHaveLength(1);
+		expect((await stateManager.listWorktrees("repo"))[0]?.path).toBe(recoveries[0]);
+	});
+
+	it("explicitly purges unowned recovery checkouts", async () => {
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "clean-recovery");
+		const git = createFakeGit((args) => {
+			if (args[0] === "worktree" && args[1] === "add") mkdirSync(checkout, { recursive: true });
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "clean-recovery" });
+		await expect(manager.remove(workspace, "clean-recovery")).resolves.toEqual({ ok: true });
+		expect(await manager.listRecoveryCheckouts()).toHaveLength(1);
+
+		await expect(manager.prune(workspace, { purgeRecovery: true })).resolves.toMatchObject({
+			purgedRecoveryCheckouts: [expect.stringContaining("clean-recovery-")],
+		});
+		expect(await manager.listRecoveryCheckouts()).toEqual([]);
+	});
+
+	it("refuses to remove an active worktree even when forced", async () => {
 		const git = okGit();
 		const busySessions = new Set(["s-live"]);
 		const manager = createManager(git.runGit, {
@@ -562,7 +689,19 @@ describe("worktree manager (fake git)", () => {
 		mkdirSync(getWorktreeCheckoutPath(agentDir, workspaceDir, "busy"), { recursive: true });
 
 		expect(await manager.remove(workspace, "busy")).toEqual({ ok: false, error: "worktree_busy" });
-		expect(await manager.remove(workspace, "busy", { force: true })).toEqual({ ok: true });
+		expect(await manager.remove(workspace, "busy", { force: true })).toEqual({
+			ok: false,
+			error: "worktree_busy",
+		});
+		busySessions.clear();
+		expect(await manager.remove(workspace, "busy", { force: true })).toEqual({
+			ok: false,
+			error: "worktree_busy",
+		});
+
+		await manager.create(workspace, { id: "unbound-force" });
+		mkdirSync(getWorktreeCheckoutPath(agentDir, workspaceDir, "unbound-force"), { recursive: true });
+		expect(await manager.remove(workspace, "unbound-force", { force: true })).toEqual({ ok: true });
 	});
 
 	it("returns worktree_not_found for unknown ids", async () => {
@@ -591,6 +730,40 @@ describe("worktree manager (fake git)", () => {
 		expect(quarantined).toHaveLength(1);
 		expect(existsSync(join(workspaceWorktreesDir, quarantined[0] ?? "", "keep.txt"))).toBe(true);
 		expect(git.calls.at(-1)).toEqual({ args: ["worktree", "prune"], cwd: realpathSync(workspaceDir) });
+	});
+
+	it("serializes prune against a newly created worktree generation", async () => {
+		const pruneStarted = createDeferred();
+		const finishPrune = createDeferred();
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "after-prune");
+		let pausePrune = true;
+		const git = createFakeGit((args) => {
+			if (args[0] === "worktree" && args[1] === "add") mkdirSync(checkout, { recursive: true });
+			return { ok: true };
+		});
+		const manager = createManager(async (args, cwd, options) => {
+			if (args[0] === "worktree" && args[1] === "prune" && pausePrune) {
+				pausePrune = false;
+				pruneStarted.resolve();
+				await finishPrune.promise;
+			}
+			return git.runGit(args, cwd, options);
+		});
+
+		const pruning = manager.prune(workspace);
+		await pruneStarted.promise;
+		let createSettled = false;
+		const creating = manager.create(workspace, { id: "after-prune", baseRef: "main" }).finally(() => {
+			createSettled = true;
+		});
+		await Promise.resolve();
+		expect(createSettled).toBe(false);
+
+		finishPrune.resolve();
+		await expect(pruning).resolves.toEqual({ removedRecords: [], orphanCheckouts: [] });
+		await expect(creating).resolves.toMatchObject({ ok: true, worktree: { id: "after-prune" } });
+		expect(existsSync(checkout)).toBe(true);
+		expect(await stateManager.listWorktrees("repo")).toHaveLength(1);
 	});
 
 	it("cancels an in-flight git prune without publishing a successful startup audit", async () => {
@@ -756,6 +929,7 @@ describe("worktree manager (fake git)", () => {
 		const busySessions = new Set<string>();
 		const manager = createManager(git.runGit, {
 			hasActiveRuntimeForSession: (_workspaceName, sessionId) => busySessions.has(sessionId),
+			reserveSessionsForRemoval: () => () => {},
 		});
 		expect((await manager.create(workspace, { id: "ttl", baseRef: "main" })).ok).toBe(true);
 		await manager.bindSession("repo", "ttl", "s-ttl");
@@ -783,7 +957,6 @@ describe("worktree manager (fake git)", () => {
 		behaviors.merged = true;
 
 		expect(await manager.removeIfCleanAndMerged(workspace, "ttl")).toEqual({ removed: true });
-		expect(await stateManager.listWorktrees("repo")).toHaveLength(0);
 		expect(await manager.removeIfCleanAndMerged(workspace, "ttl")).toEqual({
 			removed: false,
 			reason: "worktree_not_found",

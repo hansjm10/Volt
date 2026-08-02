@@ -58,6 +58,11 @@ import {
 	RPC_TRANSCRIPT_PAGE_MAX_ITEMS,
 	RPC_WIRE_MAX_SAFE_INTEGER,
 } from "../wire-limits.ts";
+import {
+	RpcAgentOptionsDefaultConfigSchema,
+	RpcAgentOptionsModelSelectionSchema,
+	RpcAgentOptionsSchema,
+} from "./agent-options.ts";
 import { RPC_COMMAND_SCHEMAS, RpcClientCapabilityFeatureSchema, RpcMcpAuthFlowSchema } from "./commands.ts";
 import {
 	RpcConversationActiveAssistantSchema,
@@ -326,6 +331,11 @@ const SHARED_SCHEMAS: Record<string, TSchema> = {
 	RpcRegisterPushTargetArgs: RpcRegisterPushTargetArgsSchema,
 	RpcClientCapabilityFeature: RpcClientCapabilityFeatureSchema,
 	RpcMcpAuthFlow: RpcMcpAuthFlowSchema,
+
+	// Configurable agent options
+	RpcAgentOptionsModelSelection: RpcAgentOptionsModelSelectionSchema,
+	RpcAgentOptionsDefaultConfig: RpcAgentOptionsDefaultConfigSchema,
+	RpcAgentOptions: RpcAgentOptionsSchema,
 
 	// Git context
 	RpcGitObjectId: RpcGitObjectIdSchema,

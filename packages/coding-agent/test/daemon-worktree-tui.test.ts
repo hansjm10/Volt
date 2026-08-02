@@ -233,7 +233,7 @@ describe("resolveDaemonWorkspaceForCwd (§5.2.2 auto-registration fix)", () => {
 			}),
 		});
 		const resolved = await resolveDaemonWorkspaceForCwd(client, HOST_WORKTREE_PATH);
-		expect(resolved).toEqual({ name: "repo", path: HOST_PARENT_PATH });
+		expect(resolved).toEqual({ name: "repo", path: HOST_PARENT_PATH, worktreeId: "fix-login" });
 		expect(client.requests.some((req) => req.type === "workspace_register")).toBe(false);
 	});
 
@@ -246,11 +246,11 @@ describe("resolveDaemonWorkspaceForCwd (§5.2.2 auto-registration fix)", () => {
 		expect(register).toMatchObject({ name: "project", path: projectPath });
 	});
 
-	it("prefers the longest path-prefix match without touching worktree_resolve", async () => {
+	it("prefers the longest path-prefix match after checking managed worktrees", async () => {
 		const client = createFakeClient({ workspaces: [{ name: "repo", path: HOST_PARENT_PATH }] });
 		const resolved = await resolveDaemonWorkspaceForCwd(client, join(HOST_PARENT_PATH, "sub", "dir"));
 		expect(resolved).toEqual({ name: "repo", path: HOST_PARENT_PATH });
-		expect(client.requests.map((req) => req.type)).toEqual(["status"]);
+		expect(client.requests.map((req) => req.type)).toEqual(["status", "worktree_resolve"]);
 	});
 });
 
@@ -349,8 +349,15 @@ describe("createDaemonAttach + control server integration", () => {
 
 		expect(outcome).toEqual({ kind: "granted", handoff: "none" });
 		expect(attach.workspaceName()).toBe("repo");
-		const lease = harness.requests.find((request) => request.type === "lease_acquire");
-		expect(lease).toMatchObject({ workspaceName: "repo", sessionId: "s-worktree" });
+		const bindIndex = harness.requests.findIndex((request) => request.type === "worktree_bind");
+		const leaseIndex = harness.requests.findIndex((request) => request.type === "lease_acquire");
+		expect(harness.requests[bindIndex]).toMatchObject({
+			workspaceName: "repo",
+			worktreeId: "fix-login",
+			sessionId: "s-worktree",
+		});
+		expect(bindIndex).toBeLessThan(leaseIndex);
+		expect(harness.requests[leaseIndex]).toMatchObject({ workspaceName: "repo", sessionId: "s-worktree" });
 		// §5.2.2: no bogus workspace was auto-registered for the worktree path.
 		expect(harness.requests.some((request) => request.type === "workspace_register")).toBe(false);
 		// §5.2.3: the daemon can gate relay offers on the TUI's capability. The

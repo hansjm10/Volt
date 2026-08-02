@@ -1771,8 +1771,8 @@ export class InteractiveMode {
 		});
 		await this.daemonAttach.start();
 		const acquireOutcome = await this.acquireCurrentSessionLease();
-		this.runtimeHost.setPrepareSessionReplacement(async ({ previousSessionId, sessionId }) => {
-			const rekey = await this.daemonAttach.prepareRekey(previousSessionId, sessionId);
+		this.runtimeHost.setPrepareSessionReplacement(async ({ previousSessionId, sessionId, cwd }) => {
+			const rekey = await this.daemonAttach.prepareRekey(previousSessionId, sessionId, cwd);
 			if (!rekey) {
 				return undefined;
 			}
@@ -6294,6 +6294,7 @@ export class InteractiveMode {
 			return;
 		}
 		const control: DaemonWorktreeControl = opened.control;
+		let restoreWorktreeContext: (() => void) | undefined;
 		try {
 			let target: { id: string; path: string; branch: string; baseRef?: string } | undefined;
 			if (createRequested) {
@@ -6332,25 +6333,29 @@ export class InteractiveMode {
 			}
 
 			const sessionDir = getDefaultSessionDir(control.workspacePath, agentDir);
+			restoreWorktreeContext = this.daemonAttach.setWorktreeContext(control.workspaceName, target.id);
 			const result = await this.runtimeHost.newSession({
 				cwd: target.path,
 				sessionDir,
 				workspaceName: control.workspaceName,
 				baseRef: target.baseRef,
+				setup: async (sessionManager) => {
+					const bound = await control.bindSession(target.id, sessionManager.getSessionId());
+					if (!bound) throw new Error(`Worktree ${target.id} is unavailable for session binding`);
+				},
 			});
 			if (result.cancelled) {
 				this.showStatus("Worktree session cancelled");
 				return;
 			}
-			// Record the session→worktree binding so daemon resume/relay follows the
-			// worktree cwd (best-effort; the header cwd is authoritative locally).
-			await control.bindSession(target.id, this.session.sessionId);
+			restoreWorktreeContext = undefined;
 			this.renderCurrentSessionState();
 			this.showStatus(`New session in worktree ${target.id} (branch ${target.branch}) — ${target.path}`);
 			this.ui.requestRender();
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		} finally {
+			restoreWorktreeContext?.();
 			await control.close().catch(() => {});
 		}
 	}

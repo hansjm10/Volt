@@ -185,6 +185,72 @@
 				"plan"
 			]
 		},
+		"RpcAgentOptions": {
+			"type": "object",
+			"required": [
+				"workspaceName",
+				"models",
+				"defaultConfig"
+			],
+			"properties": {
+				"workspaceName": {
+					"type": "string",
+					"minLength": 1
+				},
+				"models": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/RpcCatalogModel"
+					}
+				},
+				"defaultConfig": {
+					"$ref": "#/$defs/RpcAgentOptionsDefaultConfig"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcAgentOptionsDefaultConfig": {
+			"type": "object",
+			"required": [
+				"model",
+				"thinkingLevel",
+				"fastModeEnabled",
+				"agentMode"
+			],
+			"properties": {
+				"model": {
+					"$ref": "#/$defs/RpcAgentOptionsModelSelection"
+				},
+				"thinkingLevel": {
+					"$ref": "#/$defs/RpcThinkingLevel"
+				},
+				"fastModeEnabled": {
+					"type": "boolean"
+				},
+				"agentMode": {
+					"$ref": "#/$defs/RpcAgentMode"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcAgentOptionsModelSelection": {
+			"type": "object",
+			"required": [
+				"provider",
+				"modelId"
+			],
+			"properties": {
+				"provider": {
+					"type": "string",
+					"minLength": 1
+				},
+				"modelId": {
+					"type": "string",
+					"minLength": 1
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcApi": {
 			"type": "string",
 			"x-volt-known-values": [
@@ -607,6 +673,9 @@
 					"$ref": "#/$defs/RpcCommand.get_web_search_status"
 				},
 				{
+					"$ref": "#/$defs/RpcCommand.get_agent_options"
+				},
+				{
 					"$ref": "#/$defs/RpcCommand.upload_device_logs"
 				},
 				{
@@ -869,6 +938,9 @@
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.get_web_search_status"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.get_agent_options"
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.upload_device_logs"
@@ -1396,6 +1468,31 @@
 				},
 				"entryId": {
 					"type": "string"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcCommand.get_agent_options": {
+			"type": "object",
+			"required": [
+				"type",
+				"workspaceName"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "get_agent_options"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"workspaceName": {
+					"type": "string",
+					"pattern": "^\\S(?:[\\s\\S]*\\S)?$",
+					"x-volt-expected": "be a non-empty workspace name"
 				}
 			},
 			"additionalProperties": false
@@ -6208,6 +6305,9 @@
 					"$ref": "#/$defs/RpcResponse.get_web_search_status"
 				},
 				{
+					"$ref": "#/$defs/RpcResponse.get_agent_options"
+				},
+				{
 					"$ref": "#/$defs/RpcResponse.upload_device_logs"
 				},
 				{
@@ -6904,6 +7004,36 @@
 						}
 					},
 					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.get_agent_options": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "get_agent_options"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"$ref": "#/$defs/RpcAgentOptions"
 				}
 			},
 			"additionalProperties": false

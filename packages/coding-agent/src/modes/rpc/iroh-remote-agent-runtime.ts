@@ -70,6 +70,7 @@ export type IrohRemoteAgentRuntimeConversationTarget =
 	  }
 	| {
 			target: "new";
+			sessionId?: string;
 	  }
 	| {
 			target: "session";
@@ -241,7 +242,7 @@ function getSessionTarget(options: IrohRemoteAgentRuntimeOptions): IrohRemoteSes
 	if (target.target === "session") {
 		return { kind: "session", sessionId: target.sessionId };
 	}
-	return { kind: "new" };
+	return target.sessionId === undefined ? { kind: "last" } : { kind: "new", sessionId: target.sessionId };
 }
 
 function getConversationTarget(options: IrohRemoteAgentRuntimeOptions): IrohRemoteAgentRuntimeConversationTarget {

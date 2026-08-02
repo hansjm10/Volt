@@ -221,6 +221,7 @@ export function getIrohRemoteRpcCommandCapabilities(
 	if (command.type === "create_worktree" || command.type === "remove_worktree") {
 		return ["worktrees.manage.v1"];
 	}
+	if (command.type === "get_agent_options") return ["model.select.v1"];
 	if (command.type === "unregister_workspace") return ["workspace.manage.v1"];
 	if (command.type === "upload_device_logs") return ["diagnostics.upload.v1"];
 	return undefined;
@@ -231,9 +232,11 @@ export function getIrohRemoteStreamCapability(options: {
 	purpose?: string;
 }): IrohRemoteRpcCapability | undefined {
 	if (options.mode === "conversation") return "conversation.observe.v1";
-	if (options.mode === "workspaceDiscovery") return "conversation.observe.v1";
-	// manage_worktrees is command-sensitive: listing requires observe while
-	// create/remove require worktrees.manage, so the stream itself has no wider gate.
+	if (options.mode === "workspaceDiscovery") {
+		return options.purpose === "agent_options" ? "model.select.v1" : "conversation.observe.v1";
+	}
+	// Worktree management is command-sensitive: the stream itself has no wider
+	// gate than each parsed command.
 	if (options.purpose === "manage_worktrees") return undefined;
 	if (options.purpose === "unregister_workspace") return "workspace.manage.v1";
 	return undefined;

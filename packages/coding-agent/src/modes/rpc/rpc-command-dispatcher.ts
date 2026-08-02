@@ -1,5 +1,3 @@
-import type { ThinkingLevel } from "@hansjm10/volt-agent-core";
-import { getSupportedThinkingLevels, supportsFastInference } from "@hansjm10/volt-ai";
 import type { AgentSession } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import {
@@ -12,6 +10,7 @@ import {
 } from "../../core/host-actions.ts";
 import { getMcpRpcCapabilities, listMcpRpcServers } from "../../core/mcp/rpc.ts";
 import type { McpGatewayExecutionContext } from "../../core/mcp/types.ts";
+import { toIrohRemoteAgentOptionsCatalogModel } from "../../core/remote/iroh/agent-options.ts";
 import { createReviewSeedMessage } from "../../core/review.ts";
 import { getRpcErrorResponseTarget, isUsableRpcConversationIdentifier } from "../../core/rpc/correlation.ts";
 import { buildRpcSessionState } from "../../core/rpc/session-state.ts";
@@ -106,11 +105,7 @@ function getUiActionCapabilities(invocationEnabled: boolean): UiActionCapabiliti
 }
 
 function toCatalogModel(model: RpcModel): RpcCatalogModel {
-	return {
-		...model,
-		availableThinkingLevels: getSupportedThinkingLevels(model) as ThinkingLevel[],
-		supportsFastMode: supportsFastInference(model),
-	};
+	return toIrohRemoteAgentOptionsCatalogModel(model);
 }
 
 function getPromptExtensionCommandName(message: string): string | undefined {

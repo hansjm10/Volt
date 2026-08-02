@@ -338,6 +338,43 @@ export class IrohRemoteHostEngine {
 		return this.stateManager.setClientLastSessionId(nodeId, workspace, sessionId);
 	}
 
+	setClientLastSessionIdIfAuthorizationCurrent(
+		authorization: IrohRemoteClientAuthorizationSuccess,
+		sessionId: string,
+		expectedPreviousSessionId: string | undefined,
+		whileAuthorizationLocked?: () => Promise<void>,
+	) {
+		return this.stateManager.setClientLastSessionIdIfAuthorizationCurrent(
+			authorization,
+			sessionId,
+			expectedPreviousSessionId,
+			whileAuthorizationLocked,
+		);
+	}
+
+	setClientLastSessionIdIfCurrent(
+		nodeId: string,
+		workspace: string,
+		expectedSessionId: string | undefined,
+		nextSessionId: string,
+	): Promise<boolean> {
+		return this.stateManager.setClientLastSessionIdIfCurrent(nodeId, workspace, expectedSessionId, nextSessionId);
+	}
+
+	restoreClientLastSessionIdIfCurrent(
+		nodeId: string,
+		workspace: string,
+		expectedSessionId: string,
+		previousSessionId: string | undefined,
+	): Promise<boolean> {
+		return this.stateManager.restoreClientLastSessionIdIfCurrent(
+			nodeId,
+			workspace,
+			expectedSessionId,
+			previousSessionId,
+		);
+	}
+
 	async authorizeHello(hello: IrohRemoteHello, remoteNodeId: string): Promise<IrohRemoteClientAuthorizationResult> {
 		return this.runAuthorizationExclusive(() => this.authorizeHelloUnlocked(hello, remoteNodeId));
 	}

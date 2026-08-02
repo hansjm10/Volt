@@ -194,6 +194,9 @@ export const RPC_COMMAND_SCHEMAS = {
 		apiKey: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 	}),
 	get_web_search_status: commandSchema("get_web_search_status", {}),
+	get_agent_options: commandSchema("get_agent_options", {
+		workspaceName: workspaceNameSchema,
+	}),
 
 	// Device diagnostics
 	upload_device_logs: commandSchema("upload_device_logs", {
