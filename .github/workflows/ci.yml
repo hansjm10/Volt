@@ -83,4 +83,7 @@ jobs:
 
       - name: Test
         shell: bash
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: ./test.sh
