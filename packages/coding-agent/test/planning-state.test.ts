@@ -194,6 +194,81 @@ describe("native planning state", () => {
 		session.dispose();
 	});
 
+	it("preserves successful research when user feedback revises a ready plan", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({ steps: [{ text: "Implement the researched change" }] });
+		const researchCall = {
+			type: "toolCall" as const,
+			id: "feedback-research",
+			name: "lsp",
+			arguments: { action: "diagnostics" },
+		};
+		expect(
+			await session.agent.beforeToolCall?.({
+				toolCall: researchCall,
+				args: { action: "diagnostics" },
+			} as never),
+		).toBeUndefined();
+		await session.agent.afterToolCall?.({
+			toolCall: researchCall,
+			args: { action: "diagnostics" },
+			result: { content: [{ type: "text", text: "No diagnostics" }] },
+			isError: false,
+		} as never);
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Researched change",
+			summary: "Implement the researched change.",
+		});
+
+		const changed = session.changePlan(ready.id, ready.revision);
+		const revised = session.updatePlan({
+			planId: changed.plan!.id,
+			expectedRevision: changed.plan!.revision,
+			title: changed.plan!.title,
+			summary: changed.plan!.summary,
+			steps: [
+				...changed.plan!.steps.map((step) => ({ id: step.id, text: step.text })),
+				{ text: "Create a pull request" },
+			],
+		});
+		const submitAfterFeedback = await session.agent.beforeToolCall?.({
+			toolCall: {
+				type: "toolCall",
+				id: "submit-after-feedback",
+				name: "submit_plan",
+				arguments: {
+					planId: revised.id,
+					expectedRevision: revised.revision,
+					title: revised.title,
+					summary: revised.summary,
+				},
+			},
+			args: {
+				planId: revised.id,
+				expectedRevision: revised.revision,
+				title: revised.title,
+				summary: revised.summary,
+			},
+		} as never);
+		expect(submitAfterFeedback).toBeUndefined();
+
+		await session.setAgentMode("build");
+		await session.setAgentMode("plan");
+		const submitAfterFreshEntry = await session.agent.beforeToolCall?.({
+			toolCall: {
+				type: "toolCall",
+				id: "submit-after-fresh-entry",
+				name: "submit_plan",
+				arguments: {},
+			},
+			args: {},
+		} as never);
+		expect(submitAfterFreshEntry).toMatchObject({ block: true });
+		await session.dispose();
+	});
+
 	it("does not count a protocol-level MCP failure as successful Plan research", async () => {
 		const source = sourceForMcpConfigPath(join(agentDir, "mcp.json"), {
 			scope: "user",

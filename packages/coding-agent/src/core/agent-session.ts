@@ -2267,7 +2267,8 @@ export class AgentSession {
 		if (this._planningState.plan.phase !== "ready") {
 			throw new Error("Only a ready plan can be changed");
 		}
-		this._planResearchObserved = false;
+		// This is feedback on an already researched submission in the same runtime.
+		// Preserve that evidence so checklist revisions do not require an unrelated read.
 		const next = this._commitPlanningState({
 			mode: "plan",
 			plan: {
