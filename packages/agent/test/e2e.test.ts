@@ -280,7 +280,7 @@ describe("Agent.continue() with faux provider", () => {
 			await expect(agent.continue()).rejects.toThrow("No messages to continue from");
 		});
 
-		it("throws when last message is assistant", async () => {
+		it("stops without requesting when the last message is assistant and no user delivery is pending", async () => {
 			const faux = createFauxRegistration();
 			const model = faux.getModel();
 			const agent = new Agent({
@@ -309,9 +309,8 @@ describe("Agent.continue() with faux provider", () => {
 			};
 			agent.state.messages = [assistantMessage];
 
-			await expect(agent.continue()).rejects.toThrow(
-				"Cannot continue from an assistant message without a pending user delivery",
-			);
+			await expect(agent.continue()).resolves.toBeUndefined();
+			expect(agent.state.messages).toEqual([assistantMessage]);
 		});
 	});
 

@@ -315,6 +315,9 @@ async function streamAssistantResponse(
 
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
 	const llmMessages = await config.convertToLlm(messages);
+	if (llmMessages.at(-1)?.role === "assistant") {
+		throw new Error("Cannot request with an assistant message at the provider transcript tail");
+	}
 
 	// Build LLM context
 	const llmContext: Context = {

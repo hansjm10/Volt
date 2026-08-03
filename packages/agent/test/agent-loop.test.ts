@@ -8,7 +8,7 @@ import {
 } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { agentLoop, agentLoopContinue, runAgentLoop } from "../src/agent-loop.ts";
+import { agentLoop, agentLoopContinue, runAgentLoop, runAgentLoopContinue } from "../src/agent-loop.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
 
 // Mock stream for testing - mimics MockAssistantStream
@@ -1539,6 +1539,33 @@ describe("agentLoopContinue with AgentMessage", () => {
 		};
 
 		expect(() => agentLoopContinue(context, config)).toThrow("Cannot continue: no messages in context");
+	});
+
+	it("rejects an assistant-tail request without an admitted user delivery", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [createAssistantMessage([{ type: "text", text: "Done" }])],
+			tools: [],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+		let providerCalls = 0;
+
+		await expect(
+			runAgentLoopContinue(
+				context,
+				config,
+				() => {},
+				undefined,
+				() => {
+					providerCalls++;
+					throw new Error("provider must not run");
+				},
+			),
+		).rejects.toThrow("Cannot request with an assistant message at the provider transcript tail");
+		expect(providerCalls).toBe(0);
 	});
 
 	it("should continue from existing context without emitting user message events", async () => {

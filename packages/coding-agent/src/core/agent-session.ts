@@ -1438,8 +1438,8 @@ export class AgentSession {
 			this.abortBranchSummary();
 			this.abortBash();
 			this.agent.abort();
-			// Drain queued steering/follow-up messages so a run that settles after
-			// dispose cannot restart via the queued-message continuation path.
+			// Dispose revokes every delivery that has not crossed its commit boundary.
+			this.agent.discardPendingPrompt();
 			this.agent.clearAllQueues();
 			this._lspManager?.dispose();
 			this._unsubscribeMcpManager?.();
@@ -1987,6 +1987,15 @@ export class AgentSession {
 			messages: checkpoint ? [checkpoint, ...preparation.messages] : preparation.messages,
 			commit: () => {
 				preparation.commit?.();
+				const currentPlan = this._planningState.plan;
+				if (
+					this._planningState.mode === "plan" &&
+					currentPlan?.id === readyPlan.id &&
+					currentPlan.revision === readyPlan.revision + 1 &&
+					currentPlan.phase === "draft"
+				) {
+					return;
+				}
 				this._changeReadyPlanToDraft(readyPlan.id, readyPlan.revision, false);
 			},
 		};
@@ -3897,6 +3906,7 @@ export class AgentSession {
 		this.abortRetry();
 		this.abortCompaction();
 		this.agent.abort();
+		this.agent.discardPendingPrompt();
 		const idlePromise = this.waitForIdle();
 		const abortPromise = idlePromise.finally(() => {
 			if (this._abortPromise === abortPromise) {

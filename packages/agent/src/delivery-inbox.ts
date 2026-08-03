@@ -9,7 +9,7 @@ export interface InboxDelivery<TKind extends string, TMessage> {
 
 type LeaseEntry<TKind extends string, TMessage> = {
 	delivery: InboxDelivery<TKind, TMessage>;
-	status: "leased" | "begun" | "revoked";
+	status: "leased" | "emitting" | "committed" | "revoked";
 };
 
 /** Opaque capability for one FIFO selection owned by a dispatcher decision. */
@@ -31,16 +31,23 @@ export class DeliveryLease<TKind extends string, TMessage> {
 		return this.active && this.entries.some((entry) => entry.delivery.deliveryId === deliveryId);
 	}
 
-	/** Atomically transfer a still-live delivery out of revocable queue ownership. */
-	begin(deliveryId: string): InboxDelivery<TKind, TMessage> | undefined {
+	/** Commit a still-live delivery while keeping synchronous commit observers from revoking it. */
+	begin(deliveryId: string, commit?: () => void): InboxDelivery<TKind, TMessage> | undefined {
 		if (!this.active) return undefined;
 		const entry = this.entries.find((candidate) => candidate.delivery.deliveryId === deliveryId);
 		if (entry?.status !== "leased") return undefined;
-		entry.status = "begun";
+		entry.status = "emitting";
+		try {
+			commit?.();
+		} catch (error) {
+			entry.status = "leased";
+			throw error;
+		}
+		entry.status = "committed";
 		return entry.delivery;
 	}
 
-	/** Restore only deliveries whose begin boundary was never crossed. */
+	/** Restore only deliveries whose commit boundary was never crossed. */
 	rollback(): readonly InboxDelivery<TKind, TMessage>[] {
 		if (!this.active) return [];
 		this.active = false;

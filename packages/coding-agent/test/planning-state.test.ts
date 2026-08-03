@@ -360,6 +360,58 @@ describe("native planning state", () => {
 		await session.dispose();
 	});
 
+	it("commits one ready-plan transition when an all-mode batch admits multiple feedback deliveries", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({ steps: [{ text: "Revise the approved change" }] });
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Approved change",
+			summary: "Revise the approved change.",
+		});
+		await session.setAgentMode("build");
+		session.agent.state.messages = [createAssistantMessage([{ type: "text", text: "Build tail" }], "stop")];
+		session.agent.steeringMode = "all";
+		await session.steer("First revision request");
+		await session.steer("Second revision request");
+		const providerUserTexts: string[] = [];
+		let providerCalls = 0;
+		session.agent.streamFn = (_model, context) => {
+			providerCalls++;
+			providerUserTexts.push(
+				...context.messages.flatMap((message) => {
+					if (message.role !== "user") return [];
+					if (typeof message.content === "string") return [message.content];
+					return message.content.flatMap((part) => (part.type === "text" ? [part.text] : []));
+				}),
+			);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					seq: 1,
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "Revising both requests" }], "stop"),
+				});
+			});
+			return stream;
+		};
+
+		await session.agent.continue();
+
+		expect(providerCalls).toBe(1);
+		expect(
+			providerUserTexts.filter((text) => text === "First revision request" || text === "Second revision request"),
+		).toEqual(["First revision request", "Second revision request"]);
+		expect(session.planningState).toMatchObject({
+			mode: "plan",
+			plan: { id: ready.id, phase: "draft", revision: ready.revision + 1 },
+		});
+		expect(session.agent.state.errorMessage).toBeUndefined();
+		expect(session.getSteeringMessages()).toEqual([]);
+		await session.dispose();
+	});
+
 	it.each(["steer", "followUp"] as const)(
 		"returns queued %s feedback to draft and preserves same-generation research",
 		async (streamingBehavior) => {

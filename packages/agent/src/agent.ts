@@ -176,7 +176,6 @@ type DispatcherStartState = {
 	firstDecision: boolean;
 	providerRequestPending: boolean;
 	pendingToolContinuation: boolean;
-	assistantTail: boolean;
 };
 
 type ActiveRun = {
@@ -336,6 +335,11 @@ export class Agent {
 		return [...this.clearSteeringQueue(), ...this.clearFollowUpQueue()];
 	}
 
+	/** Discard an initial prompt whose delivery has not committed. */
+	discardPendingPrompt(): string[] {
+		return this.clearDeliveries("prompt");
+	}
+
 	/** Returns true when the inbox has a pending or leased delivery. */
 	hasQueuedMessages(): boolean {
 		return this.inbox.hasPending();
@@ -383,13 +387,17 @@ export class Agent {
 				"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
 			);
 		}
+		if (this.inbox.hasPending("prompt")) {
+			throw new Error(
+				"Agent has a retained prompt. Call continue() to resume it or discardPendingPrompt() to cancel it.",
+			);
+		}
 		this.pausedState = undefined;
 		this.enqueueDelivery("prompt", this.normalizePromptInput(input, images));
 		await this.runDispatcher({
 			firstDecision: true,
 			providerRequestPending: false,
 			pendingToolContinuation: false,
-			assistantTail: false,
 		});
 	}
 
@@ -405,15 +413,10 @@ export class Agent {
 		const pausedState = this.pausedState;
 		this.pausedState = undefined;
 		const assistantTail = lastMessage?.role === "assistant";
-		if (assistantTail && !this.hasPendingUserDelivery()) {
-			this.pausedState = pausedState;
-			throw new Error("Cannot continue from an assistant message without a pending user delivery");
-		}
 		await this.runDispatcher({
 			firstDecision: true,
 			providerRequestPending: pausedState?.providerRequestPending ?? (lastMessage !== undefined && !assistantTail),
 			pendingToolContinuation: pausedState?.pendingToolContinuation ?? false,
-			assistantTail,
 		});
 	}
 
@@ -466,10 +469,6 @@ export class Agent {
 			this.preparedDeliveryCommits.delete(delivery.deliveryId);
 		}
 		return revoked.map((delivery) => delivery.deliveryId);
-	}
-
-	private hasPendingUserDelivery(): boolean {
-		return this.inbox.list().some((delivery) => delivery.messages.some((message) => message.role === "user"));
 	}
 
 	private selectPendingDeliveries(kind: AgentDeliveryKind, mode: QueueMode): PendingDelivery[] {
@@ -533,14 +532,6 @@ export class Agent {
 		this.pausedState = undefined;
 		const leasedDeliveries = selected.length > 0 ? await this.prepareLeasedDeliveries(selected) : [];
 		const deliveries = [...leasedDeliveries, ...(action.deliveries ?? [])];
-		if (
-			isFirstDecision &&
-			startState.assistantTail &&
-			!deliveries.some((delivery) => delivery.messages.some((message) => message.role === "user"))
-		) {
-			this.rollbackActiveLease();
-			throw new Error("Cannot continue from an assistant message without a pending user delivery");
-		}
 		return {
 			type: "request",
 			reason: action.reason,
@@ -586,10 +577,9 @@ export class Agent {
 	private beginActiveDelivery(delivery: AgentLoopDelivery): boolean {
 		if (delivery.deliveryId === undefined) return true;
 		if (!this.activeLease?.owns(delivery.deliveryId)) return true;
-		if (!this.activeLease.begin(delivery.deliveryId)) return false;
 		const commit = this.preparedDeliveryCommits.get(delivery.deliveryId);
+		if (!this.activeLease.begin(delivery.deliveryId, commit)) return false;
 		this.preparedDeliveryCommits.delete(delivery.deliveryId);
-		commit?.();
 		return true;
 	}
 

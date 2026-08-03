@@ -153,7 +153,7 @@ When you use the `Agent` class, assistant `message_end` processing is treated as
 await agent.continue();
 ```
 
-A provider-ready transcript normally ends in `user` or `toolResult`. An assistant tail requires a pending user delivery. An empty transcript can resume only when dispatcher-owned work remains, such as an initial prompt retained after abort during `agent_start`.
+A provider-ready transcript normally ends in `user` or `toolResult`. After `nextAction` resolves, deliveries are admitted, and custom messages are converted, the provider transcript must not end in `assistant`; an admitted delivery can supply the required user input. An empty transcript can resume only when dispatcher-owned work remains, such as an initial prompt retained after abort during `agent_start`. A retained prompt blocks a new `prompt()` call until it is resumed with `continue()` or canceled with `discardPendingPrompt()`.
 
 ### Event Types
 
@@ -292,9 +292,12 @@ await agent.prompt({ role: "user", content: "Hello", timestamp: Date.now() });
 // Resume saved dispatcher state, or continue a provider-ready user/tool-result tail.
 await agent.continue();
 
-// An assistant tail can continue only when a pending user delivery supplies the
-// next request. continue() uses the same inbox dispatcher; it does not drain a
-// separate queue path.
+// An assistant tail can request only when an admitted user delivery supplies
+// the next input. continue() uses the same inbox dispatcher; it does not drain
+// a separate queue path.
+
+// Cancel an initial prompt retained by an abort before delivery admission.
+agent.discardPendingPrompt();
 ```
 
 ### State Management
@@ -375,14 +378,15 @@ const followUpMode = agent.followUpMode;
 const revokedSteeringIds = agent.clearSteeringQueue();
 const revokedFollowUpIds = agent.clearFollowUpQueue();
 const revokedDeliveryIds = agent.clearAllQueues();
+const discardedPromptIds = agent.discardPendingPrompt();
 ```
 
-The clear methods return the exact runtime IDs they revoked. They remove queued entries and leases whose begin boundary has not been crossed; a delivery whose synchronous begin succeeded is authoritative and cannot be partially revoked.
+The clear methods return the exact runtime IDs they revoked. The steering/follow-up methods do not discard a retained initial prompt; `discardPendingPrompt()` does that explicitly. They remove queued entries and leases whose commit boundary has not been crossed; a committed delivery is authoritative and cannot be partially revoked.
 
 When steering messages are selected after a turn completes:
 1. All tool calls from the current assistant message have already finished.
 2. The dispatcher leases each selected delivery and runs side-effect-free `prepareDelivery` work.
-3. Synchronous begin transfers ownership and runs the staged `commit`, then emits `delivery_start`.
+3. Synchronous begin marks the delivery as emitting, runs the staged `commit`, and either restores it on failure or commits ownership before emitting `delivery_start`.
 4. Delivery message events finalize the messages into context.
 5. `prepareRequest` observes the post-delivery context.
 6. The LLM responds on the next turn.

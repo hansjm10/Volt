@@ -35,6 +35,20 @@ describe("DeliveryInbox", () => {
 		expect(inbox.list()).toEqual([second]);
 	});
 
+	it("restores a delivery when its synchronous commit fails", () => {
+		const inbox = createInbox();
+		const delivery = inbox.enqueue("steer", ["retry me"]);
+		const lease = inbox.lease(inbox.select("steer", "one-at-a-time"));
+
+		expect(() =>
+			lease.begin(delivery.deliveryId, () => {
+				throw new Error("commit failed");
+			}),
+		).toThrow("commit failed");
+		expect(lease.rollback()).toEqual([delivery]);
+		expect(inbox.list()).toEqual([delivery]);
+	});
+
 	it("returns exact pending and leased revocations in admission order", () => {
 		const inbox = createInbox();
 		const first = inbox.enqueue("steer", ["first"]);

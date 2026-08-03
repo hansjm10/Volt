@@ -749,12 +749,45 @@ describe("Agent", () => {
 		expect(providerCalls).toBe(0);
 		expect(agent.state.messages).toEqual([]);
 		expect(agent.hasQueuedMessages()).toBe(true);
+		await expect(agent.prompt("Replacement prompt")).rejects.toThrow("Agent has a retained prompt");
 
 		await agent.continue();
 
 		expect(providerCalls).toBe(1);
 		expect(providerUserTexts).toEqual(["Initial prompt"]);
 		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("can discard an initial prompt retained after abort", async () => {
+		let abortFirstStart = true;
+		const providerUserTexts: Array<string | undefined> = [];
+		const agent = new Agent({
+			streamFn: (_model, context) => {
+				providerUserTexts.push(
+					context.messages
+						.map(getUserText)
+						.filter((text) => text !== undefined)
+						.at(-1),
+				);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.subscribe((event) => {
+			if (event.type === "agent_start" && abortFirstStart) {
+				abortFirstStart = false;
+				agent.abort();
+			}
+		});
+
+		await agent.prompt("Canceled prompt");
+		expect(agent.discardPendingPrompt()).toHaveLength(1);
+		await agent.prompt("Replacement prompt");
+
+		expect(providerUserTexts).toEqual(["Replacement prompt"]);
 	});
 
 	it("claims the dispatcher before asynchronous direct delivery preparation", async () => {
@@ -886,6 +919,44 @@ describe("Agent", () => {
 		expect(preparedBatches).toEqual([["First steering"], ["First steering"], ["Second steering"]]);
 		expect(providerUserTexts).toEqual(["First steering", "Second steering"]);
 		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("restores a delivery when its staged commit throws", async () => {
+		let failCommit = true;
+		let providerCalls = 0;
+		const agent = new Agent({
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				commit: () => {
+					if (failCommit) throw new Error("commit failed");
+				},
+			}),
+			streamFn: () => {
+				providerCalls++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.state.messages = [createAssistantMessage("tail")];
+		agent.steer({
+			role: "user",
+			content: [{ type: "text", text: "retry me" }],
+			timestamp: Date.now(),
+		});
+
+		await agent.continue();
+		expect(agent.state.errorMessage).toBe("commit failed");
+		expect(agent.hasQueuedMessages()).toBe(true);
+		expect(providerCalls).toBe(0);
+
+		failCommit = false;
+		await agent.continue();
+		expect(agent.state.messages.map(getUserText).filter(Boolean)).toEqual(["retry me"]);
+		expect(agent.hasQueuedMessages()).toBe(false);
+		expect(providerCalls).toBe(1);
 	});
 
 	it("commits only the delivery whose message_start began when a batch listener fails", async () => {
@@ -1040,6 +1111,45 @@ describe("Agent", () => {
 		await agent.prompt("commit me");
 
 		expect(observedCommitted).toBe(true);
+	});
+
+	it("allows nextAction to attach the required user delivery from an assistant tail", async () => {
+		let attached = false;
+		let providerUserTexts: Array<string | undefined> = [];
+		const agent = new Agent({
+			nextAction: (context) => {
+				if (attached) return context.defaultAction;
+				attached = true;
+				return {
+					type: "request",
+					reason: "delivery",
+					deliveries: [
+						{
+							messages: [
+								{
+									role: "user",
+									content: [{ type: "text", text: "host delivery" }],
+									timestamp: Date.now(),
+								},
+							],
+						},
+					],
+				};
+			},
+			streamFn: (_model, context) => {
+				providerUserTexts = context.messages.map(getUserText).filter((text) => text !== undefined);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.state.messages = [createAssistantMessage("tail")];
+
+		await agent.continue();
+
+		expect(providerUserTexts).toEqual(["host delivery"]);
 	});
 
 	it("continue() should process queued follow-up messages after an assistant turn", async () => {
