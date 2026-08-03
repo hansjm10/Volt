@@ -86,4 +86,5 @@ jobs:
         env:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
+          VITEST_MAX_FORKS: '2'
         run: ./test.sh
