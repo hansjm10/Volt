@@ -151,7 +151,6 @@ describe("Agent", () => {
 		expect(events).toEqual([
 			"agent_start",
 			"turn_start",
-			"delivery_start",
 			"message_start",
 			"message_end",
 			"message_start",
@@ -722,77 +721,15 @@ describe("Agent", () => {
 		await firstPrompt.catch(() => {});
 	});
 
-	it("resumes an initial prompt that was aborted during agent_start", async () => {
-		let abortFirstStart = true;
-		let providerCalls = 0;
-		let providerUserTexts: Array<string | undefined> = [];
-		const agent = new Agent({
-			streamFn: (_model, context) => {
-				providerCalls++;
-				providerUserTexts = context.messages.map(getUserText).filter((text) => text !== undefined);
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
-				});
-				return stream;
-			},
-		});
-		agent.subscribe((event) => {
-			if (event.type === "agent_start" && abortFirstStart) {
-				abortFirstStart = false;
-				agent.abort();
-			}
-		});
-
-		await agent.prompt("Initial prompt");
-
-		expect(providerCalls).toBe(0);
-		expect(agent.state.messages).toEqual([]);
-		expect(agent.hasQueuedMessages()).toBe(true);
-
-		await agent.continue();
-
-		expect(providerCalls).toBe(1);
-		expect(providerUserTexts).toEqual(["Initial prompt"]);
-		expect(agent.hasQueuedMessages()).toBe(false);
-	});
-
-	it("claims the dispatcher before asynchronous direct delivery preparation", async () => {
-		const preparationStarted = createDeferred();
-		const releasePreparation = createDeferred();
-		const agent = new Agent({
-			prepareDelivery: async (delivery) => {
-				if (delivery.kind === "prompt") {
-					preparationStarted.resolve();
-					await releasePreparation.promise;
-				}
-				return { messages: [...delivery.messages] };
-			},
-			streamFn: () => {
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("ok") });
-				});
-				return stream;
-			},
-		});
-
-		const firstPrompt = agent.prompt("first");
-		await preparationStarted.promise;
-		await expect(agent.prompt("second")).rejects.toThrow("Agent is already processing a prompt");
-		releasePreparation.resolve();
-		await firstPrompt;
-	});
-
 	it("restores follow-up messages when loop preparation fails and delivers them on retry", async () => {
 		let failPreparation = true;
 		let providerCalls = 0;
 		const agent = new Agent({
-			prepareDelivery: (delivery) => {
-				if (delivery.kind === "followUp" && failPreparation) {
+			prepareQueuedMessages: (messages, delivery) => {
+				if (delivery === "followUp" && failPreparation) {
 					throw new Error("queue preparation failed");
 				}
-				return { messages: [...delivery.messages] };
+				return messages;
 			},
 			streamFn: () => {
 				providerCalls++;
@@ -833,15 +770,15 @@ describe("Agent", () => {
 		const preparedBatches: Array<Array<string | undefined>> = [];
 		const providerUserTexts: Array<string | undefined> = [];
 		const agent = new Agent({
-			prepareDelivery: async (delivery) => {
-				if (delivery.kind !== "steer") return { messages: [...delivery.messages] };
-				preparedBatches.push(delivery.messages.map(getUserText));
+			prepareQueuedMessages: async (messages, delivery) => {
+				if (delivery !== "steer") return messages;
+				preparedBatches.push(messages.map(getUserText));
 				if (failPreparation) {
 					preparationStarted.resolve();
 					await releasePreparation.promise;
 					throw new Error("queue preparation failed");
 				}
-				return { messages: [...delivery.messages] };
+				return messages;
 			},
 			streamFn: (_model, context) => {
 				providerUserTexts.push(
@@ -868,6 +805,7 @@ describe("Agent", () => {
 		});
 
 		const continuation = agent.continue();
+		const preparationFailure = expect(continuation).rejects.toThrow("queue preparation failed");
 		await preparationStarted.promise;
 		agent.steer({
 			role: "user",
@@ -875,9 +813,8 @@ describe("Agent", () => {
 			timestamp: Date.now() + 1,
 		});
 		releasePreparation.resolve();
-		await continuation;
+		await preparationFailure;
 
-		expect(agent.state.errorMessage).toBe("queue preparation failed");
 		expect(agent.hasQueuedMessages()).toBe(true);
 
 		failPreparation = false;
@@ -886,160 +823,6 @@ describe("Agent", () => {
 		expect(preparedBatches).toEqual([["First steering"], ["First steering"], ["Second steering"]]);
 		expect(providerUserTexts).toEqual(["First steering", "Second steering"]);
 		expect(agent.hasQueuedMessages()).toBe(false);
-	});
-
-	it("commits only the delivery whose message_start began when a batch listener fails", async () => {
-		const delivered: string[] = [];
-		let failFirst = true;
-		const agent = new Agent({
-			steeringMode: "all",
-			streamFn: () => {
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("ok") });
-				});
-				return stream;
-			},
-		});
-		agent.state.messages = [createAssistantMessage("tail")];
-		const firstId = agent.steer({
-			role: "user",
-			content: [{ type: "text", text: "first" }],
-			timestamp: Date.now(),
-		});
-		const secondId = agent.steer({
-			role: "user",
-			content: [{ type: "text", text: "second" }],
-			timestamp: Date.now() + 1,
-		});
-		const seenDeliveryIds: string[] = [];
-		const unsubscribe = agent.subscribe((event) => {
-			if (event.type !== "message_start" || event.message.role !== "user") return;
-			const text = getUserText(event.message);
-			if (text) delivered.push(text);
-			if (event.deliveryId) seenDeliveryIds.push(event.deliveryId);
-			if (failFirst) {
-				failFirst = false;
-				throw new Error("pre-delivery listener failed");
-			}
-		});
-
-		await agent.continue();
-		expect(agent.state.errorMessage).toBe("pre-delivery listener failed");
-		expect(agent.hasQueuedMessages()).toBe(true);
-		unsubscribe();
-		await agent.continue();
-
-		expect(delivered).toEqual(["first"]);
-		expect(seenDeliveryIds).toEqual([firstId]);
-		expect(secondId).not.toBe(firstId);
-		expect(agent.state.messages.map(getUserText).filter(Boolean)).toEqual(["second"]);
-		expect(agent.hasQueuedMessages()).toBe(false);
-	});
-
-	it("does not emit deliveries revoked after an all-mode action resolves", async () => {
-		const deliveredUserTexts: string[] = [];
-		let providerUserTexts: Array<string | undefined> = [];
-		let revokedIds: string[] = [];
-		const agent = new Agent({
-			steeringMode: "all",
-			streamFn: (_model, context) => {
-				providerUserTexts = context.messages.map(getUserText).filter((text) => text !== undefined);
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
-				});
-				return stream;
-			},
-		});
-		agent.state.messages = [createAssistantMessage("tail")];
-		const firstId = agent.steer({
-			role: "user",
-			content: [{ type: "text", text: "first" }],
-			timestamp: Date.now(),
-		});
-		const secondId = agent.steer({
-			role: "user",
-			content: [{ type: "text", text: "second" }],
-			timestamp: Date.now() + 1,
-		});
-		agent.subscribe((event) => {
-			if (event.type !== "message_start" || event.message.role !== "user") return;
-			const text = getUserText(event.message);
-			if (text) deliveredUserTexts.push(text);
-			if (text === "first") revokedIds = agent.clearSteeringQueue();
-		});
-
-		await agent.continue();
-
-		expect(deliveredUserTexts).toEqual(["first"]);
-		expect(revokedIds).toEqual([secondId]);
-		expect(revokedIds).not.toContain(firstId);
-		expect(providerUserTexts).toEqual(["first"]);
-		expect(agent.state.messages.map(getUserText).filter((text) => text !== undefined)).toEqual(["first"]);
-		expect(agent.hasQueuedMessages()).toBe(false);
-	});
-
-	it("does not commit or request a delivery revoked during turn_start", async () => {
-		let stagedCommits = 0;
-		let providerCalls = 0;
-		let revokedIds: string[] = [];
-		const agent = new Agent({
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				commit: () => {
-					stagedCommits++;
-				},
-			}),
-			streamFn: () => {
-				providerCalls++;
-				throw new Error("provider must not run");
-			},
-		});
-		agent.state.messages = [createAssistantMessage("tail")];
-		const deliveryId = agent.steer({
-			role: "user",
-			content: [{ type: "text", text: "revoke me" }],
-			timestamp: Date.now(),
-		});
-		agent.subscribe((event) => {
-			if (event.type === "turn_start") revokedIds = agent.clearSteeringQueue();
-		});
-
-		await agent.continue();
-
-		expect(revokedIds).toEqual([deliveryId]);
-		expect(stagedCommits).toBe(0);
-		expect(providerCalls).toBe(0);
-		expect(agent.state.messages.map(getUserText).filter(Boolean)).toEqual([]);
-		expect(agent.hasQueuedMessages()).toBe(false);
-	});
-
-	it("runs a staged commit before publishing delivery_start", async () => {
-		let committed = false;
-		let observedCommitted = false;
-		const agent = new Agent({
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				commit: () => {
-					committed = true;
-				},
-			}),
-			streamFn: () => {
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("done") });
-				});
-				return stream;
-			},
-		});
-		agent.subscribe((event) => {
-			if (event.type === "delivery_start") observedCommitted = committed;
-		});
-
-		await agent.prompt("commit me");
-
-		expect(observedCommitted).toBe(true);
 	});
 
 	it("continue() should process queued follow-up messages after an assistant turn", async () => {
@@ -1080,7 +863,7 @@ describe("Agent", () => {
 		expect(agent.state.messages[agent.state.messages.length - 1].role).toBe("assistant");
 	});
 
-	it("continue() resumes a provider-ready tool result before draining follow-up", async () => {
+	it("continue() can drain a queued follow-up after a terminating tool batch", async () => {
 		let sawFollowUp = false;
 		const agent = new Agent({
 			streamFn: (_model, context) => {
@@ -1113,15 +896,10 @@ describe("Agent", () => {
 			timestamp: Date.now(),
 		});
 
-		await agent.continue();
+		await agent.continue({ drainFollowUps: true });
 
 		expect(sawFollowUp).toBe(true);
-		expect(agent.state.messages.map((message) => message.role)).toEqual([
-			"toolResult",
-			"assistant",
-			"user",
-			"assistant",
-		]);
+		expect(agent.state.messages.map((message) => message.role)).toEqual(["toolResult", "user", "assistant"]);
 	});
 
 	it("continue() should keep one-at-a-time steering semantics from assistant tail", async () => {
@@ -1169,7 +947,7 @@ describe("Agent", () => {
 		expect(responseCount).toBe(2);
 	});
 
-	it("stops after the current turn when nextAction returns stop", async () => {
+	it("stops after the current turn when shouldStopAfterTurn returns true", async () => {
 		const toolSchema = Type.Object({});
 		const tool: AgentTool<typeof toolSchema, undefined> = {
 			name: "noop_tool",
@@ -1202,13 +980,9 @@ describe("Agent", () => {
 
 		// Assigned after construction, mirroring how hosts install session hooks.
 		const hookCalls: Array<{ toolResultCount: number; hasSignal: boolean }> = [];
-		agent.nextAction = (context, signal) => {
-			if (!context.completedTurn) return context.defaultAction;
-			hookCalls.push({
-				toolResultCount: context.completedTurn.toolResults.length,
-				hasSignal: signal !== undefined,
-			});
-			return { type: "stop" };
+		agent.shouldStopAfterTurn = (context, signal) => {
+			hookCalls.push({ toolResultCount: context.toolResults.length, hasSignal: signal !== undefined });
+			return true;
 		};
 
 		agent.followUp({

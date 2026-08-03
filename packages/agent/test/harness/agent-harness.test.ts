@@ -19,7 +19,7 @@ interface AppPromptTemplate extends PromptTemplate {
 
 const registrations: Array<{ unregister(): void }> = [];
 
-function textFromUserMessages(messages: readonly AgentMessage[]): string[] {
+function textFromUserMessages(messages: Array<{ role: string; content: unknown }>): string[] {
 	return messages.flatMap((message) => {
 		if (message.role !== "user") return [];
 		if (typeof message.content === "string") return [message.content];
@@ -116,79 +116,6 @@ describe("AgentHarness", () => {
 
 		expect(userCounts).toEqual([1, 2, 3]);
 		expect(steerQueueLengths).toEqual([1, 2, 1, 0]);
-	});
-
-	it("abort revokes a leased steering delivery during turn_start without losing its payload", async () => {
-		const registration = registerFauxProvider();
-		registrations.push(registration);
-		let providerCalls = 0;
-		registration.setResponses([
-			() => {
-				providerCalls++;
-				return fauxAssistantMessage("first");
-			},
-		]);
-		const harness = new AgentHarness({
-			env: new NodeExecutionEnv({ cwd: process.cwd() }),
-			session: new Session(new InMemorySessionStorage()),
-			model: registration.getModel(),
-		});
-		let turnStarts = 0;
-		let queued = false;
-		let abortResult: ReturnType<typeof harness.abort> | undefined;
-		harness.subscribe(async (event) => {
-			if (event.type === "message_start" && event.message.role === "assistant" && !queued) {
-				queued = true;
-				await harness.steer("cancel before begin");
-			}
-			if (event.type === "turn_start" && ++turnStarts === 2) {
-				abortResult = harness.abort();
-			}
-		});
-
-		await harness.prompt("hello");
-		const aborted = await abortResult;
-
-		expect(providerCalls).toBe(1);
-		expect(aborted?.clearedSteer).toHaveLength(1);
-		expect(textFromUserMessages(aborted?.clearedSteer ?? [])).toEqual(["cancel before begin"]);
-	});
-
-	it("prepares a queued request from the post-delivery session snapshot", async () => {
-		const registration = registerFauxProvider();
-		registrations.push(registration);
-		const requestPrompts: string[] = [];
-		registration.setResponses([
-			(context) => {
-				requestPrompts.push(context.systemPrompt ?? "");
-				return fauxAssistantMessage("first");
-			},
-			(context) => {
-				requestPrompts.push(context.systemPrompt ?? "");
-				return fauxAssistantMessage("second");
-			},
-		]);
-		const session = new Session(new InMemorySessionStorage());
-		const harness = new AgentHarness({
-			env: new NodeExecutionEnv({ cwd: process.cwd() }),
-			session,
-			model: registration.getModel(),
-			systemPrompt: async ({ session: currentSession }) => {
-				const current = await currentSession.buildContext();
-				return `users:${textFromUserMessages(current.messages as AgentMessage[]).join("|")}`;
-			},
-		});
-		let queued = false;
-		harness.subscribe((event) => {
-			if (event.type === "message_start" && event.message.role === "assistant" && !queued) {
-				queued = true;
-				void harness.steer("steer");
-			}
-		});
-
-		await harness.prompt("hello");
-
-		expect(requestPrompts).toEqual(["users:", "users:hello|steer"]);
 	});
 
 	it("appends before_agent_start messages and persists them", async () => {

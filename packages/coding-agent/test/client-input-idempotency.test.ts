@@ -989,7 +989,7 @@ describe("durable client input idempotency", () => {
 		).rejects.toBeInstanceOf(ClientInputOutcomeAmbiguousError);
 	});
 
-	it("does not revoke a delivery whose durable start is already committed", async () => {
+	it("does not publish a dequeued message after concurrent queue clearing", async () => {
 		let releaseTool!: () => void;
 		let markToolStarted!: () => void;
 		const toolStarted = new Promise<void>((resolve) => {
@@ -1053,18 +1053,16 @@ describe("durable client input idempotency", () => {
 
 		releaseTool();
 		await dispatchEntered;
-		let cleared: { steering: string[]; followUp: string[] } | undefined;
 		try {
-			cleared = await harness.session.clearQueue();
+			await harness.session.clearQueue();
 		} finally {
 			releaseDispatch();
 		}
 		await run;
 
-		expect(cleared).toEqual({ steering: [], followUp: [] });
-		expect(publishedClientIds).toContain("clear-dequeue-race");
-		expect(harness.sessionManager.getClientInput("clear-dequeue-race")?.state).toBe("completed");
-		expect(getUserTexts(harness)).toContain("cancel during dequeue");
+		expect(publishedClientIds).not.toContain("clear-dequeue-race");
+		expect(harness.sessionManager.getClientInput("clear-dequeue-race")?.state).toBe("failed");
+		expect(getUserTexts(harness)).not.toContain("cancel during dequeue");
 	});
 
 	it("starts an accepted-but-not-started receipt after JSONL reload", async () => {

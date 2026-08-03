@@ -1382,20 +1382,20 @@ describe("SubagentManager", () => {
 	it("preserves an externally chained hook wrapper installed after spawn", async () => {
 		let childSession: SubagentRuntimeCreatedEvent["runtime"]["session"] | undefined;
 		let externalBeforeToolCall: unknown;
-		let externalNextAction: unknown;
+		let externalShouldStopAfterTurn: unknown;
 		const { manager } = await createTestManager({
 			onRuntimeCreated: (event) => {
 				const agent = event.runtime.session.agent;
 				const innerBeforeToolCall = agent.beforeToolCall;
-				const innerNextAction = agent.nextAction;
+				const innerShouldStopAfterTurn = agent.shouldStopAfterTurn;
 				const wrappedBeforeToolCall: typeof innerBeforeToolCall = async (context, signal) =>
 					innerBeforeToolCall?.(context, signal);
-				const wrappedNextAction: typeof innerNextAction = async (context, signal) =>
-					innerNextAction ? await innerNextAction(context, signal) : context.defaultAction;
+				const wrappedShouldStopAfterTurn: typeof innerShouldStopAfterTurn = async (context, signal) =>
+					(await innerShouldStopAfterTurn?.(context, signal)) ?? false;
 				agent.beforeToolCall = wrappedBeforeToolCall;
-				agent.nextAction = wrappedNextAction;
+				agent.shouldStopAfterTurn = wrappedShouldStopAfterTurn;
 				externalBeforeToolCall = wrappedBeforeToolCall;
-				externalNextAction = wrappedNextAction;
+				externalShouldStopAfterTurn = wrappedShouldStopAfterTurn;
 				childSession = event.runtime.session;
 			},
 		});
@@ -1410,7 +1410,7 @@ describe("SubagentManager", () => {
 		// Teardown must not clobber the externally chained wrappers: the budget
 		// wrappers are no longer the installed hooks, so restore is skipped.
 		expect(childSession.agent.beforeToolCall).toBe(externalBeforeToolCall);
-		expect(childSession.agent.nextAction).toBe(externalNextAction);
+		expect(childSession.agent.shouldStopAfterTurn).toBe(externalShouldStopAfterTurn);
 	});
 
 	it("applies finite manager aggregate consumption overrides with field-specific abort errors", async () => {

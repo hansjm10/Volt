@@ -6,7 +6,6 @@ import {
 	type UserMessage,
 } from "@hansjm10/volt-ai";
 import { runAgentLoop } from "../agent-loop.ts";
-import { DeliveryInbox, type DeliveryLease } from "../delivery-inbox.ts";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -191,9 +190,9 @@ export class AgentHarness<
 	private resources: AgentHarnessResources<TSkill, TPromptTemplate>;
 	private tools = new Map<string, TTool>();
 	private activeToolNames: string[];
-	private readonly deliveryInbox = new DeliveryInbox<"steer" | "followUp", UserMessage>();
-	private activeDeliveryLease?: DeliveryLease<"steer" | "followUp", UserMessage>;
+	private steerQueue: UserMessage[] = [];
 	private steeringQueueMode: QueueMode;
+	private followUpQueue: UserMessage[] = [];
 	private followUpQueueMode: QueueMode;
 	private nextTurnQueue: AgentMessage[] = [];
 	private handlers = new Map<string, Set<AgentHarnessHandler>>();
@@ -312,8 +311,8 @@ export class AgentHarness<
 	private async emitQueueUpdate(): Promise<void> {
 		await this.emitOwn({
 			type: "queue_update",
-			steer: this.deliveryInbox.list("steer").flatMap((delivery) => [...delivery.messages]),
-			followUp: this.deliveryInbox.list("followUp").flatMap((delivery) => [...delivery.messages]),
+			steer: [...this.steerQueue],
+			followUp: [...this.followUpQueue],
 			nextTurn: [...this.nextTurnQueue],
 		});
 	}
@@ -407,23 +406,16 @@ export class AgentHarness<
 		};
 	}
 
-	private leaseQueuedDeliveries(
-		kind: "steer" | "followUp",
-		mode: QueueMode,
-	): Array<{ deliveryId: string; messages: AgentMessage[] }> {
-		const selected = this.deliveryInbox.select(kind, mode);
-		if (selected.length === 0) return [];
-		const lease = this.deliveryInbox.lease(selected);
-		this.activeDeliveryLease = lease;
-		return lease.deliveries.map((delivery) => ({
-			deliveryId: delivery.deliveryId,
-			messages: [...delivery.messages],
-		}));
-	}
-
-	private beginDelivery(deliveryId: string | undefined): boolean {
-		if (deliveryId === undefined || !this.activeDeliveryLease?.owns(deliveryId)) return true;
-		return this.activeDeliveryLease.begin(deliveryId) !== undefined;
+	private async drainQueuedMessages(queue: AgentMessage[], mode: QueueMode): Promise<AgentMessage[]> {
+		const messages = mode === "all" ? queue.splice(0) : queue.splice(0, 1);
+		if (messages.length === 0) return messages;
+		try {
+			await this.emitQueueUpdate();
+			return messages;
+		} catch (error) {
+			queue.unshift(...messages);
+			throw normalizeHookError(error);
+		}
 	}
 
 	private createLoopConfig(
@@ -431,7 +423,6 @@ export class AgentHarness<
 		setTurnState: (turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>) => void,
 	): AgentLoopConfig {
 		const turnState = getTurnState();
-		let firstRequest = true;
 		return {
 			model: turnState.model,
 			reasoning: turnState.thinkingLevel === "off" ? undefined : turnState.thinkingLevel,
@@ -463,41 +454,8 @@ export class AgentHarness<
 					? { content: patch.content, details: patch.details, isError: patch.isError, terminate: patch.terminate }
 					: undefined;
 			},
-			nextAction: async (context) => {
-				const initialDeliveries =
-					context.completedTurn === undefined && context.defaultAction.type === "request"
-						? (context.defaultAction.deliveries ?? [])
-						: [];
-				const steering = this.leaseQueuedDeliveries("steer", this.steeringQueueMode);
-				if (initialDeliveries.length > 0 || steering.length > 0) {
-					return {
-						type: "request",
-						reason:
-							context.defaultAction.type === "request" && context.defaultAction.reason === "continuation"
-								? "continuation"
-								: "delivery",
-						deliveries: [...initialDeliveries, ...steering],
-					};
-				}
-				if (context.defaultAction.type === "request") {
-					return context.defaultAction;
-				}
-				const followUp = this.leaseQueuedDeliveries("followUp", this.followUpQueueMode);
-				return followUp.length > 0
-					? { type: "request", reason: "delivery", deliveries: followUp }
-					: { type: "stop" };
-			},
-			beginDelivery: (delivery) => this.beginDelivery(delivery.deliveryId),
-			prepareRequest: async ({ context }) => {
+			prepareNextTurn: async () => {
 				await this.flushPendingSessionWrites();
-				if (firstRequest) {
-					firstRequest = false;
-					return {
-						context,
-						model: getTurnState().model,
-						thinkingLevel: getTurnState().thinkingLevel,
-					};
-				}
 				const nextTurnState = await this.createTurnState();
 				setTurnState(nextTurnState);
 				return {
@@ -506,6 +464,8 @@ export class AgentHarness<
 					thinkingLevel: nextTurnState.thinkingLevel,
 				};
 			},
+			getSteeringMessages: async () => this.drainQueuedMessages(this.steerQueue, this.steeringQueueMode),
+			getFollowUpMessages: async () => this.drainQueuedMessages(this.followUpQueue, this.followUpQueueMode),
 		};
 	}
 
@@ -548,15 +508,6 @@ export class AgentHarness<
 	}
 
 	private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise<void> {
-		if (
-			event.type === "delivery_start" &&
-			event.deliveryId !== undefined &&
-			this.activeDeliveryLease?.owns(event.deliveryId)
-		) {
-			await this.emitQueueUpdate();
-			await this.emitAny(event, signal);
-			return;
-		}
 		if (event.type === "message_end") {
 			await this.session.appendMessage(event.message);
 			await this.emitAny(event, signal);
@@ -671,8 +622,6 @@ export class AgentHarness<
 			try {
 				await this.flushPendingSessionWrites();
 			} finally {
-				this.deliveryInbox.rollbackActiveLease();
-				this.activeDeliveryLease = undefined;
 				this.runAbortController = undefined;
 			}
 		}
@@ -729,13 +678,13 @@ export class AgentHarness<
 
 	async steer(text: string, options?: { images?: ImageContent[] }): Promise<void> {
 		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot steer while idle");
-		this.deliveryInbox.enqueue("steer", [createUserMessage(text, options?.images)]);
+		this.steerQueue.push(createUserMessage(text, options?.images));
 		await this.emitQueueUpdate();
 	}
 
 	async followUp(text: string, options?: { images?: ImageContent[] }): Promise<void> {
 		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot follow up while idle");
-		this.deliveryInbox.enqueue("followUp", [createUserMessage(text, options?.images)]);
+		this.followUpQueue.push(createUserMessage(text, options?.images));
 		await this.emitQueueUpdate();
 	}
 
@@ -1054,8 +1003,10 @@ export class AgentHarness<
 	}
 
 	async abort(): Promise<AbortResult> {
-		const clearedSteer = this.deliveryInbox.revoke("steer").flatMap((delivery) => [...delivery.messages]);
-		const clearedFollowUp = this.deliveryInbox.revoke("followUp").flatMap((delivery) => [...delivery.messages]);
+		const clearedSteer = [...this.steerQueue];
+		const clearedFollowUp = [...this.followUpQueue];
+		this.steerQueue = [];
+		this.followUpQueue = [];
 		this.runAbortController?.abort();
 		const errors: Error[] = [];
 		try {

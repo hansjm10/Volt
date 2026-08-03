@@ -309,9 +309,7 @@ describe("Agent.continue() with faux provider", () => {
 			};
 			agent.state.messages = [assistantMessage];
 
-			await expect(agent.continue()).rejects.toThrow(
-				"Cannot continue from an assistant message without a pending user delivery",
-			);
+			await expect(agent.continue()).rejects.toThrow("Cannot continue from message role: assistant");
 		});
 	});
 

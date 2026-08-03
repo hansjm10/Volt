@@ -165,7 +165,7 @@ describe("AgentSessionRuntime characterization", () => {
 		const { runtime } = await createRuntimeForTest(() => {});
 
 		// External wrappers (e.g. the SubagentManager turn budget) chain over
-		// agent.beforeToolCall/agent.nextAction and rely on AgentSession
+		// agent.beforeToolCall/agent.shouldStopAfterTurn and rely on AgentSession
 		// never reinstalling them; a reinstall must fail loudly instead of
 		// silently dropping those wrappers.
 		const session = runtime.session as unknown as { _installAgentToolHooks(): void };
