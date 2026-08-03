@@ -194,6 +194,73 @@ describe("native planning state", () => {
 		session.dispose();
 	});
 
+	it("routes direct feedback for a ready Build plan through the Plan delivery seam", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({ steps: [{ text: "Implement the approved change" }] });
+		const researchCall = {
+			type: "toolCall" as const,
+			id: "direct-feedback-research",
+			name: "ls",
+			arguments: { path: "." },
+		};
+		expect(
+			await session.agent.beforeToolCall?.({
+				toolCall: researchCall,
+				args: researchCall.arguments,
+			} as never),
+		).toBeUndefined();
+		await session.agent.afterToolCall?.({
+			toolCall: researchCall,
+			args: researchCall.arguments,
+			result: { content: [{ type: "text", text: "files" }] },
+			isError: false,
+		} as never);
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Approved change",
+			summary: "Implement the approved change.",
+		});
+		await session.setAgentMode("build");
+		expect(session.planningState.plan).toMatchObject({ id: ready.id, phase: "ready" });
+
+		let requestTools: string[] = [];
+		session.agent.streamFn = (_model, context) => {
+			requestTools = (context.tools ?? []).map((tool) => tool.name);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					seq: 1,
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "I will revise it." }], "stop"),
+				});
+			});
+			return stream;
+		};
+
+		await session.prompt("Revise the approved plan");
+
+		expect(session.planningState).toMatchObject({
+			mode: "plan",
+			plan: { id: ready.id, phase: "draft", revision: ready.revision + 1 },
+		});
+		expect(requestTools).toContain("update_plan");
+		expect(requestTools).not.toContain("mutate_everything");
+		const feedbackIndex = session.messages.findIndex(
+			(message) =>
+				message.role === "user" &&
+				Array.isArray(message.content) &&
+				message.content.some((content) => content.type === "text" && content.text === "Revise the approved plan"),
+		);
+		expect(session.messages[feedbackIndex - 1]).toMatchObject({
+			role: "custom",
+			customType: "volt-plan-checkpoint",
+			content: expect.stringContaining("Phase: draft"),
+		});
+		await session.dispose();
+	});
+
 	it.each(["steer", "followUp"] as const)(
 		"returns queued %s feedback to draft and preserves same-generation research",
 		async (streamingBehavior) => {
@@ -477,8 +544,9 @@ describe("native planning state", () => {
 			await run;
 
 			expect(request).toBe(4);
-			expect(requestContexts[0]!.tools).toContain("mutate_everything");
-			expect(requestContexts[0]!.tools).not.toContain("update_plan");
+			expect(requestContexts[0]!.systemPrompt).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
+			expect(requestContexts[0]!.tools).toContain("update_plan");
+			expect(requestContexts[0]!.tools).not.toContain("mutate_everything");
 			expect(requestContexts[1]!.systemPrompt).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
 			expect(requestContexts[1]!.tools).toContain("update_plan");
 			expect(requestContexts[1]!.tools).toContain("submit_plan");

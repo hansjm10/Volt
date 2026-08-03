@@ -423,6 +423,7 @@ export class AgentHarness<
 		setTurnState: (turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>) => void,
 	): AgentLoopConfig {
 		const turnState = getTurnState();
+		let firstRequest = true;
 		return {
 			model: turnState.model,
 			reasoning: turnState.thinkingLevel === "off" ? undefined : turnState.thinkingLevel,
@@ -454,8 +455,34 @@ export class AgentHarness<
 					? { content: patch.content, details: patch.details, isError: patch.isError, terminate: patch.terminate }
 					: undefined;
 			},
-			prepareNextTurn: async () => {
+			nextAction: async (context) => {
+				const initialDeliveries =
+					context.completedTurn === undefined && context.defaultAction.type === "request"
+						? (context.defaultAction.deliveries ?? [])
+						: [];
+				const steering = await this.drainQueuedMessages(this.steerQueue, this.steeringQueueMode);
+				if (initialDeliveries.length > 0 || steering.length > 0) {
+					return {
+						type: "request",
+						deliveries: [...initialDeliveries, ...(steering.length > 0 ? [{ messages: steering }] : [])],
+					};
+				}
+				if (context.defaultAction.type === "request") {
+					return context.defaultAction;
+				}
+				const followUp = await this.drainQueuedMessages(this.followUpQueue, this.followUpQueueMode);
+				return followUp.length > 0 ? { type: "request", deliveries: [{ messages: followUp }] } : { type: "stop" };
+			},
+			prepareRequest: async ({ context }) => {
 				await this.flushPendingSessionWrites();
+				if (firstRequest) {
+					firstRequest = false;
+					return {
+						context,
+						model: getTurnState().model,
+						thinkingLevel: getTurnState().thinkingLevel,
+					};
+				}
 				const nextTurnState = await this.createTurnState();
 				setTurnState(nextTurnState);
 				return {
@@ -464,8 +491,6 @@ export class AgentHarness<
 					thinkingLevel: nextTurnState.thinkingLevel,
 				};
 			},
-			getSteeringMessages: async () => this.drainQueuedMessages(this.steerQueue, this.steeringQueueMode),
-			getFollowUpMessages: async () => this.drainQueuedMessages(this.followUpQueue, this.followUpQueueMode),
 		};
 	}
 

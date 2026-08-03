@@ -116,19 +116,29 @@ The `beforeToolCall` hook runs after `tool_execution_start` and validated argume
 
 Tools can also return `terminate: true` to hint that the automatic follow-up LLM call should be skipped. The loop only stops early when every finalized tool result in that batch sets `terminate: true`. Mixed batches continue normally.
 
-Low-level loop callers can set `shouldStopAfterTurn` to stop gracefully after the current turn completes:
+Low-level loop callers control every request boundary with `nextAction` and prepare only real provider requests with `prepareRequest`:
 
 ```typescript
-const stream = agentLoop(prompts, context, {
+const userMessage = { role: "user", content: "Continue", timestamp: Date.now() };
+const stream = agentLoop([userMessage], context, {
   model,
   convertToLlm,
-  shouldStopAfterTurn: async ({ message, toolResults, context, newMessages }) => {
-    return shouldCompactBeforeNextTurn(context.messages);
+  nextAction: async ({ completedTurn, pendingToolContinuation, defaultAction }) => {
+    if (completedTurn && shouldCompactBeforeNextRequest(completedTurn.message)) {
+      return {
+        type: "pause",
+        pendingToolContinuation,
+      };
+    }
+    return defaultAction;
   },
+  prepareRequest: async () => refreshProviderRequestState(),
 });
 ```
 
-`shouldStopAfterTurn` runs after `turn_end` is emitted and after the assistant response and any tool executions have completed normally. If it returns `true`, the loop emits `agent_end` and exits before polling steering or follow-up queues, and before starting another LLM call. It does not abort the provider stream, does not cancel running tools, and does not alter the assistant message stop reason.
+`nextAction` resolves once before the first request and once after every successful `turn_end`. It returns `request`, `pause`, or `stop`. A `request` can carry deliveries; their message events are finalized before `prepareRequest` runs. `pause` ends the current loop while preserving whether tool results still require a provider continuation. `stop` ends without preserving continuation intent. The loop does not resolve another action after an error or abort.
+
+`prepareRequest` runs immediately before each provider request, after delivered messages are in context. It never runs for a terminal `pause` or `stop`. Terminal `nextAction` work settles before `agent_end` is emitted.
 
 When you use the `Agent` class, assistant `message_end` processing is treated as a barrier before tool preflight begins. That means `beforeToolCall` sees agent state that already includes the assistant message that requested the tool call.
 
@@ -214,8 +224,14 @@ const agent = new Agent({
     }
   },
 
-  // Stop gracefully after a completed turn, before queue polling or another model call.
-  shouldStopAfterTurn: async ({ context }) => shouldCompactBeforeNextTurn(context.messages),
+  // Choose request, pause, or stop at each request boundary.
+  nextAction: async ({ defaultAction }) => defaultAction,
+
+  // Refresh state only when the resolved action will make a provider request.
+  prepareRequest: async ({ context }) => refreshRequestState(context),
+
+  // Prepare an inbox delivery once before its message events are emitted.
+  prepareDelivery: async (delivery) => [...delivery.messages],
 
   // Custom thinking budgets for token-based providers
   thinkingBudgets: {
@@ -267,12 +283,12 @@ await agent.prompt("What's in this image?", [
 // AgentMessage directly
 await agent.prompt({ role: "user", content: "Hello", timestamp: Date.now() });
 
-// Continue from current context (last message must normally be user or toolResult)
+// Resume saved dispatcher state, or continue a provider-ready user/tool-result tail.
 await agent.continue();
 
-// If the transcript ends with an assistant message, explicitly drain one/all queued
-// follow-ups (according to followUpMode) as the continuation input.
-await agent.continue({ drainFollowUps: true });
+// An assistant tail can continue only when a pending user delivery supplies the
+// next request. continue() uses the same inbox dispatcher; it does not drain a
+// separate queue path.
 ```
 
 ### State Management
@@ -285,7 +301,9 @@ agent.state.tools = [myTool];
 agent.toolExecution = "sequential";
 agent.beforeToolCall = async ({ toolCall }) => undefined;
 agent.afterToolCall = async ({ toolCall, result }) => undefined;
-agent.shouldStopAfterTurn = async ({ context }) => shouldCompactBeforeNextTurn(context.messages);
+agent.nextAction = async ({ defaultAction }) => defaultAction;
+agent.prepareRequest = async ({ context }) => refreshRequestState(context);
+agent.prepareDelivery = async (delivery) => [...delivery.messages];
 agent.state.messages = newMessages; // top-level array is copied
 agent.state.messages.push(message);
 agent.reset();
@@ -325,21 +343,21 @@ unsubscribe();
 
 ## Steering and Follow-up
 
-Steering messages let you interrupt the agent while tools are running. Follow-up messages let you queue work after the agent would otherwise stop.
+Immediate prompts, steering messages, and follow-ups enter one Agent-owned inbox as stable deliveries. The active dispatcher alone leases and prepares entries, commits each delivery when its `message_start` event is accepted, and restores only uncommitted entries in FIFO order if preparation or delivery fails. Steering has priority over follow-ups; the configured queue mode controls whether one or all entries of the selected kind are leased.
 
 ```typescript
 agent.steeringMode = "one-at-a-time";
 agent.followUpMode = "one-at-a-time";
 
 // While agent is running tools
-agent.steer({
+const steeringDeliveryId = agent.steer({
   role: "user",
   content: "Stop! Do this instead.",
   timestamp: Date.now(),
 });
 
 // After the agent finishes its current work
-agent.followUp({
+const followUpDeliveryId = agent.followUp({
   role: "user",
   content: "Also summarize the result.",
   timestamp: Date.now(),
@@ -355,12 +373,14 @@ agent.clearAllQueues();
 
 Use clearSteeringQueue, clearFollowUpQueue, or clearAllQueues to drop queued messages.
 
-When steering messages are detected after a turn completes:
-1. All tool calls from the current assistant message have already finished
-2. Steering messages are injected
-3. The LLM responds on the next turn
+When steering messages are selected after a turn completes:
+1. All tool calls from the current assistant message have already finished.
+2. The dispatcher leases and prepares the selected deliveries.
+3. Delivery message events commit them into context.
+4. `prepareRequest` observes the post-delivery context.
+5. The LLM responds on the next turn.
 
-Follow-up messages are checked only when there are no more tool calls and no steering messages. If any are queued, they are injected and another turn runs.
+Follow-ups are selected only when there is no pending tool continuation and no steering delivery. `steer()` and `followUp()` return the runtime delivery ID, and the committing delivery's `message_start`/`message_end` events carry it. This identity is independent of any application-level ID stored on the message.
 
 ## Custom Message Types
 
@@ -488,6 +508,8 @@ const config: AgentLoopConfig = {
   toolExecution: "parallel",  // overridden by per-tool executionMode if set
   beforeToolCall: async ({ toolCall, args, context }) => undefined,
   afterToolCall: async ({ toolCall, result, isError, context }) => undefined,
+  nextAction: async ({ defaultAction }) => defaultAction,
+  prepareRequest: async ({ context }) => refreshRequestState(context),
 };
 
 const userMessage = { role: "user", content: "Hello", timestamp: Date.now() };
