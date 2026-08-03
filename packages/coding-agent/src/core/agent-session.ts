@@ -18,6 +18,7 @@ import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type {
 	Agent,
+	AgentDeliveryPreparation,
 	AgentEvent,
 	AgentLoopNextAction,
 	AgentLoopNextActionContext,
@@ -598,8 +599,9 @@ export class AgentSession {
 	private _toolPromptSnippets: Map<string, string> = new Map();
 	private _toolPromptGuidelines: Map<string, string[]> = new Map();
 
-	// Base system prompt (without extension appends) - used to apply fresh appends each turn
+	// Prompt ownership layers: rebuilt host base, one logical invocation override, trusted policy.
 	private _baseSystemPrompt = "";
+	private _invocationSystemPromptOverride?: string;
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 
 	constructor(config: AgentSessionConfig) {
@@ -746,8 +748,10 @@ export class AgentSession {
 		this._agentToolHooksInstalled = true;
 		const prepareDelivery = this.agent.prepareDelivery;
 		this.agent.prepareDelivery = async (delivery, signal) => {
-			const prepared = prepareDelivery ? await prepareDelivery(delivery, signal) : [...delivery.messages];
-			return this._prepareUserDelivery(prepared);
+			const preparation = prepareDelivery
+				? await prepareDelivery(delivery, signal)
+				: { messages: [...delivery.messages] };
+			return this._prepareUserDelivery(preparation);
 		};
 		const nextAction = this.agent.nextAction;
 		this.agent.nextAction = async (context, signal) => {
@@ -989,10 +993,7 @@ export class AgentSession {
 			// authorization records behind; no record outlives its run.
 			this._authorizedOperationResolutions.clear();
 		}
-		let dequeuedEntry: AgentSessionQueuedMessage | undefined;
-		if (event.type === "message_start" && event.message.role === "user") {
-			this._overflowRecoveryAttempted = false;
-			this._proactiveCompactionState = "idle";
+		if (event.type === "delivery_start") {
 			if (event.deliveryId !== undefined) {
 				const steeringIndex = this._steeringMessages.findIndex((entry) => entry.queueEntryId === event.deliveryId);
 				const followUpIndex = this._followUpMessages.findIndex((entry) => entry.queueEntryId === event.deliveryId);
@@ -1011,7 +1012,6 @@ export class AgentSession {
 					}
 					if (
 						this._disposed ||
-						!queue.some((candidate) => candidate.queueEntryId === entry.queueEntryId) ||
 						(entry.clientMessageId !== undefined &&
 							(this._liveClientInputs.get(entry.clientMessageId) !== operation ||
 								this.sessionManager.getClientInput(entry.clientMessageId)?.state === "failed"))
@@ -1021,11 +1021,16 @@ export class AgentSession {
 					}
 					this._startDequeuedClientInput(entry);
 					queue.splice(queueIndex, 1);
-					dequeuedEntry = entry;
 					this._emitQueueUpdate();
 				}
 			}
-			if (event.message.clientMessageId !== undefined && dequeuedEntry === undefined) {
+			this._emit(event);
+			return undefined;
+		}
+		if (event.type === "message_start" && event.message.role === "user") {
+			this._overflowRecoveryAttempted = false;
+			this._proactiveCompactionState = "idle";
+			if (event.message.clientMessageId !== undefined) {
 				await this._markClientInputDispatchStarted(
 					event.message.clientMessageId,
 					this._liveClientInputs.get(event.message.clientMessageId),
@@ -1753,7 +1758,7 @@ export class AgentSession {
 			return;
 		}
 		this._baseSystemPrompt = [this._baseSystemPrompt, trimmed].filter(Boolean).join("\n\n");
-		this._applyTrustedPlanningInstructionsToSystemPrompt();
+		this._composeEffectiveSystemPrompt();
 	}
 
 	/** Current retry attempt (0 if not retrying) */
@@ -1850,9 +1855,9 @@ export class AgentSession {
 		}
 		this.agent.state.tools = tools;
 
-		// Rebuild base system prompt with new tool set
+		// Rebuild only the host-owned base; invocation and policy layers retain ownership.
 		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
-		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		this._composeEffectiveSystemPrompt();
 	}
 
 	private _syncPlanningRuntime(): void {
@@ -1880,7 +1885,7 @@ export class AgentSession {
 		) {
 			this._setEffectiveToolsByName(effective);
 		}
-		this._applyTrustedPlanningInstructionsToSystemPrompt();
+		this._composeEffectiveSystemPrompt();
 	}
 
 	private async _prepareUnrestrictedMcpForBuild(): Promise<void> {
@@ -1918,9 +1923,10 @@ export class AgentSession {
 		this.setActiveToolsByName(requestedBuildToolNames.filter((name) => this._toolRegistry.has(name)));
 	}
 
-	private _applyTrustedPlanningInstructionsToSystemPrompt(systemPrompt = this._baseSystemPrompt): void {
+	private _composeEffectiveSystemPrompt(): void {
+		const invocationPrompt = this._invocationSystemPromptOverride ?? this._baseSystemPrompt;
 		const policy = formatPlanPolicy(this._planningState.mode, this._planningState.plan?.phase);
-		const next = policy ? [systemPrompt, policy].filter(Boolean).join("\n\n") : systemPrompt;
+		const next = policy ? [invocationPrompt, policy].filter(Boolean).join("\n\n") : invocationPrompt;
 		if (this.agent.state.systemPrompt !== next) {
 			this.agent.state.systemPrompt = next;
 		}
@@ -1970,14 +1976,31 @@ export class AgentSession {
 		this._emit({ type: "message_end", message });
 	}
 
-	private _prepareUserDelivery(messages: AgentMessage[]): AgentMessage[] {
+	private _prepareUserDelivery(preparation: AgentDeliveryPreparation): AgentDeliveryPreparation {
 		const readyPlan = this._planningState.plan?.phase === "ready" ? this._planningState.plan : undefined;
-		if (!readyPlan || !messages.some((message) => message.role === "user")) {
-			return messages;
+		if (!readyPlan || !preparation.messages.some((message) => message.role === "user")) {
+			return preparation;
 		}
-		const next = this._changeReadyPlanToDraft(readyPlan.id, readyPlan.revision, false);
+		const next = this._previewReadyPlanFeedback(readyPlan);
 		const checkpoint = this._createPlanningCheckpointMessage(next);
-		return checkpoint ? [checkpoint, ...messages] : messages;
+		return {
+			messages: checkpoint ? [checkpoint, ...preparation.messages] : preparation.messages,
+			commit: () => {
+				preparation.commit?.();
+				this._changeReadyPlanToDraft(readyPlan.id, readyPlan.revision, false);
+			},
+		};
+	}
+
+	private _previewReadyPlanFeedback(readyPlan: PlanState): PlanningState {
+		return parsePlanningState({
+			mode: "plan",
+			plan: {
+				...readyPlan,
+				revision: readyPlan.revision + 1,
+				phase: "draft",
+			},
+		});
 	}
 
 	private _commitPlanningState(next: PlanningState): PlanningState {
@@ -2247,14 +2270,7 @@ export class AgentSession {
 		) {
 			this._planResearchGeneration = undefined;
 		}
-		const next = this._commitPlanningState({
-			mode: "plan",
-			plan: {
-				...this._planningState.plan,
-				revision: this._planningState.plan.revision + 1,
-				phase: "draft",
-			},
-		});
+		const next = this._commitPlanningState(this._previewReadyPlanFeedback(this._planningState.plan));
 		if (deliverCheckpoint) {
 			this._deliverPlanningCheckpoint(next);
 		}
@@ -3156,6 +3172,7 @@ export class AgentSession {
 			options?.assertConversationGenerationCurrent?.();
 		};
 		let messages: AgentMessage[] | undefined;
+		let ownsInvocationSystemPrompt = false;
 
 		try {
 			assertConversationGenerationCurrent();
@@ -3290,13 +3307,6 @@ export class AgentSession {
 				throw new Error("Prompt aborted before the agent run started");
 			}
 
-			// Direct feedback invalidates a ready approval before extensions inspect
-			// or replace the request prompt. Queued feedback reaches the same
-			// transition later through prepareDelivery when it is actually leased.
-			if (this._planningState.plan?.phase === "ready") {
-				this.changePlan(this._planningState.plan.id, this._planningState.plan.revision);
-			}
-
 			// Build messages array (custom message if any, then user message)
 			messages = [];
 
@@ -3342,13 +3352,19 @@ export class AgentSession {
 					});
 				}
 			}
-			// Apply the per-turn extension prompt before appending trusted planning instructions.
-			this._applyTrustedPlanningInstructionsToSystemPrompt(result?.systemPrompt);
+			// The extension owns one logical invocation layer; planning policy composes above it.
+			this._invocationSystemPromptOverride = result?.systemPrompt;
+			ownsInvocationSystemPrompt = true;
+			this._composeEffectiveSystemPrompt();
 
 			this._pendingNextTurnMessages.splice(0, pendingNextTurnMessages.length);
 			// Name the session only after all abortable preflight work is accepted.
 			this._maybeGenerateSessionName(expandedText, assertConversationGenerationCurrent);
 		} catch (error) {
+			if (ownsInvocationSystemPrompt) {
+				this._invocationSystemPromptOverride = undefined;
+				this._composeEffectiveSystemPrompt();
+			}
 			preflightResult?.({ success: false });
 			throw error;
 		}
@@ -3357,20 +3373,27 @@ export class AgentSession {
 			return "handled";
 		}
 
-		if (this._disposed || abortGeneration !== this._abortGeneration) {
-			preflightResult?.({ success: false });
-			throw new Error("Prompt aborted before the agent run started");
+		try {
+			if (this._disposed || abortGeneration !== this._abortGeneration) {
+				preflightResult?.({ success: false });
+				throw new Error("Prompt aborted before the agent run started");
+			}
+			assertConversationGenerationCurrent();
+			if (!operation) {
+				// Identified inputs acknowledge through their canonical user commit.
+				// Unidentified local/UI-action prompts still need a bounded admission
+				// signal so their caller need not hold lifecycle ownership for the full
+				// provider turn.
+				preflightResult?.({ success: true, outcome: "admitted" });
+			}
+			await this._runAgentPrompt(messages, abortGeneration);
+			return "run";
+		} finally {
+			if (ownsInvocationSystemPrompt) {
+				this._invocationSystemPromptOverride = undefined;
+				this._composeEffectiveSystemPrompt();
+			}
 		}
-		assertConversationGenerationCurrent();
-		if (!operation) {
-			// Identified inputs acknowledge through their canonical user commit.
-			// Unidentified local/UI-action prompts still need a bounded admission
-			// signal so their caller need not hold lifecycle ownership for the full
-			// provider turn.
-			preflightResult?.({ success: true, outcome: "admitted" });
-		}
-		await this._runAgentPrompt(messages, abortGeneration);
-		return "run";
 	}
 
 	/**
@@ -3773,9 +3796,24 @@ export class AgentSession {
 	 * @throws QueueClearPersistenceError when the cleared state could not be persisted
 	 */
 	async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
-		const steering = this._steeringMessages.map((entry) => entry.text);
-		const followUp = this._followUpMessages.map((entry) => entry.text);
-		const queuedOperations = [...this._liveClientInputs].filter(([, operation]) => operation.queued);
+		const publishedEntries = [...this._steeringMessages, ...this._followUpMessages];
+		const publishedClientIds = new Set(
+			publishedEntries.flatMap((entry) => (entry.clientMessageId === undefined ? [] : [entry.clientMessageId])),
+		);
+		const revokedIds = new Set(this.agent.clearAllQueues());
+		const revokedSteering = this._steeringMessages.filter((entry) => revokedIds.has(entry.queueEntryId));
+		const revokedFollowUp = this._followUpMessages.filter((entry) => revokedIds.has(entry.queueEntryId));
+		const steering = revokedSteering.map((entry) => entry.text);
+		const followUp = revokedFollowUp.map((entry) => entry.text);
+		const revokedClientIds = new Set(
+			[...revokedSteering, ...revokedFollowUp].flatMap((entry) =>
+				entry.clientMessageId === undefined ? [] : [entry.clientMessageId],
+			),
+		);
+		const queuedOperations = [...this._liveClientInputs].filter(
+			([clientMessageId, operation]) =>
+				operation.queued && (revokedClientIds.has(clientMessageId) || !publishedClientIds.has(clientMessageId)),
+		);
 		const terminalError = new Error("client_input_failed: queued input was cleared before canonical consumption");
 		let persistenceError: Error | undefined;
 
@@ -3786,11 +3824,10 @@ export class AgentSession {
 		} catch (error) {
 			persistenceError = error instanceof Error ? error : new Error(String(error));
 		}
-		// Runtime ownership must be revoked even when the terminal transition is
-		// rejected synchronously by a closed or fail-stopped persistence manager.
-		this._steeringMessages = [];
-		this._followUpMessages = [];
-		this.agent.clearAllQueues();
+		// Agent-core is the authority for published queue ownership. Entries whose
+		// begin boundary already crossed remain projected until delivery_start settles.
+		this._steeringMessages = this._steeringMessages.filter((entry) => !revokedIds.has(entry.queueEntryId));
+		this._followUpMessages = this._followUpMessages.filter((entry) => !revokedIds.has(entry.queueEntryId));
 		this._emitQueueUpdate();
 		for (const [clientMessageId, operation] of queuedOperations) {
 			operation.queued = false;
@@ -4782,7 +4819,7 @@ export class AgentSession {
 
 		this._resourceLoader.extendResources(extensionPaths);
 		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
-		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		this._composeEffectiveSystemPrompt();
 	}
 
 	private buildExtensionResourcePaths(entries: Array<{ path: string; extensionPath: string }>): Array<{

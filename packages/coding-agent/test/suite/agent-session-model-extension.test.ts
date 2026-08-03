@@ -652,7 +652,7 @@ describe("AgentSession model and extension characterization", () => {
 		).toBe(true);
 	});
 
-	it("preserves before_agent_start system instructions for direct ready-plan feedback", async () => {
+	it("preserves before_agent_start instructions across ready-plan mutation requests", async () => {
 		const extensionInstruction = "extension-ready-plan-instruction";
 		const harness = await createHarness({
 			extensionFactories: [
@@ -674,12 +674,30 @@ describe("AgentSession model and extension characterization", () => {
 		});
 		await harness.session.setAgentMode("build");
 
-		let providerSystemPrompt = "";
-		let providerTools: string[] = [];
+		const requestContexts: Array<{ systemPrompt: string; tools: string[] }> = [];
 		harness.setResponses([
 			(context) => {
-				providerSystemPrompt = context.systemPrompt ?? "";
-				providerTools = context.tools?.map((tool) => tool.name) ?? [];
+				requestContexts.push({
+					systemPrompt: context.systemPrompt ?? "",
+					tools: context.tools?.map((tool) => tool.name) ?? [],
+				});
+				const current = harness.session.planningState.plan!;
+				return fauxAssistantMessage(
+					fauxToolCall("update_plan", {
+						planId: current.id,
+						expectedRevision: current.revision,
+						title: current.title,
+						summary: current.summary,
+						steps: [...current.steps.map((step) => ({ id: step.id, text: step.text })), { text: "Verify it" }],
+					}),
+					{ stopReason: "toolUse" },
+				);
+			},
+			(context) => {
+				requestContexts.push({
+					systemPrompt: context.systemPrompt ?? "",
+					tools: context.tools?.map((tool) => tool.name) ?? [],
+				});
 				return fauxAssistantMessage("done");
 			},
 		]);
@@ -688,12 +706,20 @@ describe("AgentSession model and extension characterization", () => {
 
 		expect(harness.session.planningState).toMatchObject({
 			mode: "plan",
-			plan: { id: ready.id, phase: "draft", revision: ready.revision + 1 },
+			plan: {
+				id: ready.id,
+				phase: "draft",
+				revision: ready.revision + 2,
+				steps: [{ text: "Revise the implementation" }, { text: "Verify it" }],
+			},
 		});
-		expect(providerSystemPrompt).toContain(extensionInstruction);
-		expect(providerSystemPrompt).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
-		expect(providerTools).toContain("update_plan");
-		expect(providerTools).toContain("submit_plan");
+		expect(requestContexts).toHaveLength(2);
+		for (const context of requestContexts) {
+			expect(context.systemPrompt).toContain(extensionInstruction);
+			expect(context.systemPrompt).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
+			expect(context.tools).toContain("update_plan");
+			expect(context.tools).toContain("submit_plan");
+		}
 	});
 
 	it("bindExtensions emits session_start and reload emits session_shutdown then session_start", async () => {

@@ -261,6 +261,105 @@ describe("native planning state", () => {
 		await session.dispose();
 	});
 
+	it("keeps ready planning state unchanged when queued feedback is revoked at turn_start", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({ steps: [{ text: "Keep the approved change" }] });
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Approved change",
+			summary: "Keep the approved change.",
+		});
+		await session.setAgentMode("build");
+		session.agent.state.messages = [createAssistantMessage([{ type: "text", text: "Build tail" }], "stop")];
+		await session.steer("Revoke this feedback");
+		let clearResult: Promise<{ steering: string[]; followUp: string[] }> | undefined;
+		let providerCalls = 0;
+		session.agent.streamFn = () => {
+			providerCalls++;
+			throw new Error("provider must not run");
+		};
+		session.subscribe((event) => {
+			if (event.type === "turn_start") clearResult = session.clearQueue();
+		});
+
+		await session.agent.continue();
+		expect(await clearResult).toEqual({ steering: ["Revoke this feedback"], followUp: [] });
+		expect(providerCalls).toBe(0);
+		expect(session.planningState).toMatchObject({
+			mode: "build",
+			plan: { id: ready.id, revision: ready.revision, phase: "ready" },
+		});
+		expect(session.messages).not.toContainEqual(
+			expect.objectContaining({
+				customType: "volt-plan-checkpoint",
+				content: expect.stringContaining("Phase: draft"),
+			}),
+		);
+		await session.dispose();
+	});
+
+	it("keeps begun plan feedback authoritative through planning and checkpoint observers", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({ steps: [{ text: "Revise after approval" }] });
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Approved change",
+			summary: "Revise after approval.",
+		});
+		await session.setAgentMode("build");
+		session.agent.state.messages = [createAssistantMessage([{ type: "text", text: "Build tail" }], "stop")];
+		await session.steer("Committed feedback");
+		const clearResults: Array<Promise<{ steering: string[]; followUp: string[] }>> = [];
+		session.subscribe((event) => {
+			if (event.type === "planning_state_changed") {
+				clearResults.push(session.clearQueue());
+			}
+			if (
+				event.type === "message_start" &&
+				event.message.role === "custom" &&
+				event.message.customType === "volt-plan-checkpoint"
+			) {
+				clearResults.push(session.clearQueue());
+			}
+		});
+		session.agent.streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					seq: 1,
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "Revising" }], "stop"),
+				});
+			});
+			return stream;
+		};
+
+		await session.agent.continue();
+		expect(await Promise.all(clearResults)).toEqual([
+			{ steering: [], followUp: [] },
+			{ steering: [], followUp: [] },
+		]);
+		expect(session.planningState).toMatchObject({
+			mode: "plan",
+			plan: { id: ready.id, revision: ready.revision + 1, phase: "draft" },
+		});
+		const feedbackIndex = session.messages.findIndex(
+			(message) =>
+				message.role === "user" &&
+				Array.isArray(message.content) &&
+				message.content.some((part) => part.type === "text" && part.text === "Committed feedback"),
+		);
+		expect(session.messages[feedbackIndex - 1]).toMatchObject({
+			role: "custom",
+			customType: "volt-plan-checkpoint",
+			content: expect.stringContaining("Phase: draft"),
+		});
+		await session.dispose();
+	});
+
 	it.each(["steer", "followUp"] as const)(
 		"returns queued %s feedback to draft and preserves same-generation research",
 		async (streamingBehavior) => {

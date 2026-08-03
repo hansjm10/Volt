@@ -111,6 +111,7 @@ export async function runAgentLoop(
 	const currentContext: AgentContext = { ...context, messages: [...context.messages] };
 	const initialAction: AgentLoopNextAction = {
 		type: "request",
+		reason: prompts.length > 0 ? "delivery" : "continuation",
 		...(prompts.length > 0 ? { deliveries: [{ messages: prompts }] } : {}),
 	};
 
@@ -134,7 +135,15 @@ export async function runAgentLoopContinue(
 	const currentContext: AgentContext = { ...context, messages: [...context.messages] };
 
 	await emit({ type: "agent_start" });
-	await runLoop(currentContext, newMessages, config, { type: "request" }, signal, emit, streamFn);
+	await runLoop(
+		currentContext,
+		newMessages,
+		config,
+		{ type: "request", reason: "continuation" },
+		signal,
+		emit,
+		streamFn,
+	);
 	return newMessages;
 }
 
@@ -201,6 +210,10 @@ async function runLoop(
 			emit,
 			config.beginDelivery,
 		);
+		if (action.reason === "delivery" && finalizedDeliveries.length === 0) {
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
 		if (signal?.aborted) {
 			await emit({ type: "agent_end", messages: newMessages });
 			return;
@@ -253,7 +266,7 @@ async function runLoop(
 		await emit({ type: "turn_end", message, toolResults });
 		completedTurn = { message, toolResults, toolBatchTerminated };
 		pendingToolContinuation = toolCalls.length > 0 && !toolBatchTerminated;
-		defaultAction = pendingToolContinuation ? { type: "request" } : { type: "stop" };
+		defaultAction = pendingToolContinuation ? { type: "request", reason: "continuation" } : { type: "stop" };
 	}
 }
 
@@ -267,14 +280,10 @@ async function emitDeliveries(
 	const finalizedDeliveries: AgentLoopDelivery[] = [];
 	for (const delivery of deliveries) {
 		if (beginDelivery && !beginDelivery(delivery)) continue;
+		await emit({ type: "delivery_start", deliveryId: delivery.deliveryId, messages: delivery.messages });
 		const finalizedMessages: AgentMessage[] = [];
-		const commitMessageIndex = delivery.commitMessageIndex ?? 0;
-		for (const [index, message] of delivery.messages.entries()) {
-			const finalizedMessage = await emitCompletedMessage(
-				message,
-				emit,
-				index === commitMessageIndex ? delivery.deliveryId : undefined,
-			);
+		for (const message of delivery.messages) {
+			const finalizedMessage = await emitCompletedMessage(message, emit, delivery.deliveryId);
 			context.messages.push(finalizedMessage);
 			newMessages.push(finalizedMessage);
 			finalizedMessages.push(finalizedMessage);

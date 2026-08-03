@@ -3,4 +3,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(plan): Submitted plans now accept queued revision feedback without redundant research while requiring fresh evidence after tree navigation.
+fix(plan): Submitted plans now accept direct or queued revision feedback transactionally without redundant research, while revoked feedback leaves the ready plan unchanged and tree navigation still requires fresh evidence.
