@@ -254,8 +254,15 @@ describe("native planning state", () => {
 		} as never);
 		expect(submitAfterFeedback).toBeUndefined();
 
+		const readyAfterFeedback = session.submitPlan({
+			planId: revised.id,
+			expectedRevision: revised.revision,
+			title: revised.title!,
+			summary: revised.summary!,
+		});
 		await session.setAgentMode("build");
-		await session.setAgentMode("plan");
+		const changedFromBuild = session.changePlan(readyAfterFeedback.id, readyAfterFeedback.revision);
+		expect(changedFromBuild).toMatchObject({ mode: "plan", plan: { phase: "draft" } });
 		const submitAfterFreshEntry = await session.agent.beforeToolCall?.({
 			toolCall: {
 				type: "toolCall",
