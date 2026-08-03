@@ -493,7 +493,18 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
-			prepareNextTurn: this.prepareNextTurn ? async () => await this.prepareNextTurn?.(this.signal) : undefined,
+			prepareNextTurn: async ({ context }) => {
+				const prepared = await this.prepareNextTurn?.(this.signal);
+				return {
+					context: prepared?.context ?? {
+						...context,
+						systemPrompt: this._state.systemPrompt,
+						tools: this._state.tools.slice(),
+					},
+					model: prepared?.model ?? this._state.model,
+					thinkingLevel: prepared?.thinkingLevel ?? this._state.thinkingLevel,
+				};
+			},
 			shouldStopAfterTurn: async (context) => (await this.shouldStopAfterTurn?.(context, this.signal)) === true,
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,

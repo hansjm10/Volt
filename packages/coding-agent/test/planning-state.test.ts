@@ -339,6 +339,162 @@ describe("native planning state", () => {
 		},
 	);
 
+	it.each(["steer", "followUp"] as const)(
+		"refreshes queued %s feedback from a ready Build plan onto the Plan tool surface",
+		async (streamingBehavior) => {
+			const { session } = await createPlanningSession();
+			const draft = session.updatePlan({ steps: [{ text: "Implement the approved change" }] });
+			const initialResearchCall = {
+				type: "toolCall" as const,
+				id: `initial-build-feedback-research-${streamingBehavior}`,
+				name: "ls",
+				arguments: { path: "." },
+			};
+			expect(
+				await session.agent.beforeToolCall?.({
+					toolCall: initialResearchCall,
+					args: initialResearchCall.arguments,
+				} as never),
+			).toBeUndefined();
+			await session.agent.afterToolCall?.({
+				toolCall: initialResearchCall,
+				args: initialResearchCall.arguments,
+				result: { content: [{ type: "text", text: "agent/" }] },
+				isError: false,
+			} as never);
+			const ready = session.submitPlan({
+				planId: draft.id,
+				expectedRevision: draft.revision,
+				title: "Approved change",
+				summary: "Implement the approved change.",
+			});
+			await session.setAgentMode("build");
+
+			const firstRequestStarted = createDeferred<void>();
+			const releaseFirstRequest = createDeferred<void>();
+			const requestContexts: Array<{ systemPrompt: string; tools: string[] }> = [];
+			let request = 0;
+			session.agent.streamFn = (_model, context) => {
+				const current = request++;
+				requestContexts.push({
+					systemPrompt: context.systemPrompt ?? "",
+					tools: context.tools?.map((tool) => tool.name) ?? [],
+				});
+				const stream = new MockAssistantStream();
+				const respond = (): void => {
+					if (current === 0) {
+						stream.push({
+							type: "done",
+							seq: 1,
+							reason: "stop",
+							message: createAssistantMessage([{ type: "text", text: "Build turn complete" }], "stop"),
+						});
+						return;
+					}
+					const currentPlan = session.planningState.plan!;
+					if (current === 1) {
+						stream.push({
+							type: "done",
+							seq: 1,
+							reason: "toolUse",
+							message: createAssistantMessage(
+								[
+									{
+										type: "toolCall",
+										id: `build-feedback-research-${streamingBehavior}`,
+										name: "ls",
+										arguments: { path: "." },
+									},
+								],
+								"toolUse",
+							),
+						});
+						return;
+					}
+					if (current === 2) {
+						stream.push({
+							type: "done",
+							seq: 1,
+							reason: "toolUse",
+							message: createAssistantMessage(
+								[
+									{
+										type: "toolCall",
+										id: `update-build-feedback-${streamingBehavior}`,
+										name: "update_plan",
+										arguments: {
+											planId: currentPlan.id,
+											expectedRevision: currentPlan.revision,
+											title: currentPlan.title,
+											summary: currentPlan.summary,
+											steps: [
+												...currentPlan.steps.map((step) => ({ id: step.id, text: step.text })),
+												{ text: "Add verification coverage" },
+											],
+										},
+									},
+								],
+								"toolUse",
+							),
+						});
+						return;
+					}
+					stream.push({
+						type: "done",
+						seq: 1,
+						reason: "toolUse",
+						message: createAssistantMessage(
+							[
+								{
+									type: "toolCall",
+									id: `submit-build-feedback-${streamingBehavior}`,
+									name: "submit_plan",
+									arguments: {
+										planId: currentPlan.id,
+										expectedRevision: currentPlan.revision,
+										title: currentPlan.title,
+										summary: currentPlan.summary,
+									},
+								},
+							],
+							"toolUse",
+						),
+					});
+				};
+				if (current === 0) {
+					firstRequestStarted.resolve();
+					void releaseFirstRequest.promise.then(respond);
+				} else {
+					queueMicrotask(respond);
+				}
+				return stream;
+			};
+
+			const run = session.agent.prompt("Continue Build work");
+			await firstRequestStarted.promise;
+			await session.prompt("Add verification coverage", { streamingBehavior });
+			releaseFirstRequest.resolve();
+			await run;
+
+			expect(request).toBe(4);
+			expect(requestContexts[0]!.tools).toContain("mutate_everything");
+			expect(requestContexts[0]!.tools).not.toContain("update_plan");
+			expect(requestContexts[1]!.systemPrompt).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
+			expect(requestContexts[1]!.tools).toContain("update_plan");
+			expect(requestContexts[1]!.tools).toContain("submit_plan");
+			expect(requestContexts[1]!.tools).not.toContain("mutate_everything");
+			expect(session.planningState).toMatchObject({
+				mode: "plan",
+				plan: {
+					id: ready.id,
+					phase: "ready",
+					steps: [{ text: "Implement the approved change" }, { text: "Add verification coverage" }],
+				},
+			});
+			await session.dispose();
+		},
+	);
+
 	it("requires fresh research after tree navigation restores a draft branch", async () => {
 		const { session } = await createPlanningSession();
 		const draft = session.updatePlan({ steps: [{ text: "Implement the researched change" }] });
