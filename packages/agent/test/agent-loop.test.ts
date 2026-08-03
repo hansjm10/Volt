@@ -1188,6 +1188,47 @@ describe("agentLoop with AgentMessage", () => {
 		]);
 	});
 
+	it("does not resolve another action after turn_end observes an abort", async () => {
+		const abortController = new AbortController();
+		let actionCalls = 0;
+		let providerCalls = 0;
+		const events: AgentEvent[] = [];
+		await runAgentLoop(
+			[createUserMessage("hello")],
+			{ systemPrompt: "", messages: [] },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				nextAction: (context) => {
+					actionCalls++;
+					return context.defaultAction;
+				},
+			},
+			async (event) => {
+				events.push(event);
+				if (event.type === "turn_end") abortController.abort();
+			},
+			abortController.signal,
+			() => {
+				providerCalls++;
+				const mockStream = new MockAssistantStream();
+				queueMicrotask(() => {
+					mockStream.push({
+						type: "done",
+						seq: 1,
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "done" }]),
+					});
+				});
+				return mockStream;
+			},
+		);
+
+		expect(actionCalls).toBe(1);
+		expect(providerCalls).toBe(1);
+		expect(events.at(-1)?.type).toBe("agent_end");
+	});
+
 	it("resolves the terminal action after turn_end without preparing another request", async () => {
 		let actionCalls = 0;
 		let requestPreparations = 0;

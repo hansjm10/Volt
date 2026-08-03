@@ -136,7 +136,9 @@ const stream = agentLoop([userMessage], context, {
 });
 ```
 
-`nextAction` resolves once before the first request and once after every successful `turn_end`. It returns `request`, `pause`, or `stop`. A `request` can carry deliveries; their message events are finalized before `prepareRequest` runs. `pause` ends the current loop while preserving whether tool results still require a provider continuation. `stop` ends without preserving continuation intent. The loop does not resolve another action after an error or abort.
+`nextAction` resolves once before the first request and once after every successful `turn_end`. It returns `request`, `pause`, or `stop`. A `request` can carry deliveries; their message events are finalized before `prepareRequest` runs. `pause` ends the current loop while preserving whether tool results still require a provider continuation. `stop` ends without preserving continuation intent. The loop checks its abort signal before resolving each action and does not resolve another action after an error or observed abort.
+
+Low-level integrations with revocable external queues should lease entries in `nextAction` instead of destructively draining them. Configure synchronous `beginDelivery` to atomically move each still-live lease into emission; returning `false` skips an entry revoked after action resolution. Only admitted, finalized deliveries are passed to `prepareRequest`.
 
 `prepareRequest` runs immediately before each provider request, after delivered messages are in context. It never runs for a terminal `pause` or `stop`. Terminal `nextAction` work settles before `agent_end` is emitted.
 
@@ -151,7 +153,7 @@ When you use the `Agent` class, assistant `message_end` processing is treated as
 await agent.continue();
 ```
 
-The last message in context must be `user` or `toolResult` (not `assistant`).
+A provider-ready transcript normally ends in `user` or `toolResult`. An assistant tail requires a pending user delivery. An empty transcript can resume only when dispatcher-owned work remains, such as an initial prompt retained after abort during `agent_start`.
 
 ### Event Types
 
@@ -343,7 +345,7 @@ unsubscribe();
 
 ## Steering and Follow-up
 
-Immediate prompts, steering messages, and follow-ups enter one Agent-owned inbox as stable deliveries. The active dispatcher alone leases and prepares entries, commits each delivery when its `message_start` event is accepted, and restores only uncommitted entries in FIFO order if preparation or delivery fails. Steering has priority over follow-ups; the configured queue mode controls whether one or all entries of the selected kind are leased.
+Immediate prompts, steering messages, and follow-ups enter one Agent-owned inbox as stable deliveries. The active dispatcher alone leases and prepares entries. Immediately before message emission, its synchronous begin gate moves each still-live lease to `emitting`; the configured commit message then moves it to `committed`. Preparation or delivery failure restores leased or emitting entries that never committed, in FIFO order. Queue clearing revokes leased entries that have not begun emission, so a listener can cancel the untouched remainder of an `all` batch without relying on mutable action-array aliases. Steering has priority over follow-ups; the configured queue mode controls whether one or all entries of the selected kind are leased.
 
 ```typescript
 agent.steeringMode = "one-at-a-time";
@@ -371,7 +373,7 @@ agent.clearFollowUpQueue();
 agent.clearAllQueues();
 ```
 
-Use clearSteeringQueue, clearFollowUpQueue, or clearAllQueues to drop queued messages.
+Use clearSteeringQueue, clearFollowUpQueue, or clearAllQueues to drop inbox entries and leased deliveries that have not begun emission. A delivery already emitting cannot be partially revoked.
 
 When steering messages are selected after a turn completes:
 1. All tool calls from the current assistant message have already finished.

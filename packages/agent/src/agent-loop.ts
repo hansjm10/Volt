@@ -162,6 +162,11 @@ async function runLoop(
 	let defaultAction = initialAction;
 
 	while (true) {
+		if (signal?.aborted) {
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
+
 		const actionContext: AgentLoopNextActionContext = {
 			context: currentContext,
 			newMessages,
@@ -185,7 +190,17 @@ async function runLoop(
 		}
 
 		await emit({ type: "turn_start" });
-		const finalizedDeliveries = await emitDeliveries(action.deliveries ?? [], currentContext, newMessages, emit);
+		if (signal?.aborted) {
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
+		const finalizedDeliveries = await emitDeliveries(
+			action.deliveries ?? [],
+			currentContext,
+			newMessages,
+			emit,
+			config.beginDelivery,
+		);
 		if (signal?.aborted) {
 			await emit({ type: "agent_end", messages: newMessages });
 			return;
@@ -247,9 +262,11 @@ async function emitDeliveries(
 	context: AgentContext,
 	newMessages: AgentMessage[],
 	emit: AgentEventSink,
+	beginDelivery?: (delivery: AgentLoopDelivery) => boolean,
 ): Promise<AgentLoopDelivery[]> {
 	const finalizedDeliveries: AgentLoopDelivery[] = [];
 	for (const delivery of deliveries) {
+		if (beginDelivery && !beginDelivery(delivery)) continue;
 		const finalizedMessages: AgentMessage[] = [];
 		const commitMessageIndex = delivery.commitMessageIndex ?? 0;
 		for (const [index, message] of delivery.messages.entries()) {
