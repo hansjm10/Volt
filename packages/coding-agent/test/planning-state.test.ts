@@ -194,12 +194,162 @@ describe("native planning state", () => {
 		session.dispose();
 	});
 
-	it("preserves successful research when user feedback revises a ready plan", async () => {
+	it.each(["steer", "followUp"] as const)(
+		"returns queued %s feedback to draft and preserves same-generation research",
+		async (streamingBehavior) => {
+			const { session } = await createPlanningSession();
+			session.setSessionName("Queued plan feedback");
+			const draft = session.updatePlan({ steps: [{ text: "Implement the researched change" }] });
+			const researchCall = {
+				type: "toolCall" as const,
+				id: `feedback-research-${streamingBehavior}`,
+				name: "lsp",
+				arguments: { action: "diagnostics" },
+			};
+			expect(
+				await session.agent.beforeToolCall?.({
+					toolCall: researchCall,
+					args: { action: "diagnostics" },
+				} as never),
+			).toBeUndefined();
+			await session.agent.afterToolCall?.({
+				toolCall: researchCall,
+				args: { action: "diagnostics" },
+				result: { content: [{ type: "text", text: "No diagnostics" }] },
+				isError: false,
+			} as never);
+
+			const firstRequestStarted = createDeferred<void>();
+			const releaseFirstRequest = createDeferred<void>();
+			let request = 0;
+			session.agent.streamFn = () => {
+				const current = request++;
+				const stream = new MockAssistantStream();
+				const respond = (): void => {
+					if (current === 0) {
+						stream.push({
+							type: "done",
+							seq: 1,
+							reason: "toolUse",
+							message: createAssistantMessage(
+								[
+									{
+										type: "toolCall",
+										id: `submit-before-${streamingBehavior}`,
+										name: "submit_plan",
+										arguments: {
+											planId: draft.id,
+											expectedRevision: draft.revision,
+											title: "Researched change",
+											summary: "Implement the researched change.",
+										},
+									},
+								],
+								"toolUse",
+							),
+						});
+						return;
+					}
+					const currentPlan = session.planningState.plan!;
+					if (current === 1) {
+						expect(currentPlan.phase).toBe("draft");
+						stream.push({
+							type: "done",
+							seq: 1,
+							reason: "toolUse",
+							message: createAssistantMessage(
+								[
+									{
+										type: "toolCall",
+										id: `update-after-${streamingBehavior}`,
+										name: "update_plan",
+										arguments: {
+											planId: currentPlan.id,
+											expectedRevision: currentPlan.revision,
+											title: currentPlan.title,
+											summary: currentPlan.summary,
+											steps: [
+												...currentPlan.steps.map((step) => ({ id: step.id, text: step.text })),
+												{ text: "Add verification coverage" },
+											],
+										},
+									},
+								],
+								"toolUse",
+							),
+						});
+						return;
+					}
+					stream.push({
+						type: "done",
+						seq: 1,
+						reason: "toolUse",
+						message: createAssistantMessage(
+							[
+								{
+									type: "toolCall",
+									id: `submit-after-${streamingBehavior}`,
+									name: "submit_plan",
+									arguments: {
+										planId: currentPlan.id,
+										expectedRevision: currentPlan.revision,
+										title: currentPlan.title,
+										summary: currentPlan.summary,
+									},
+								},
+							],
+							"toolUse",
+						),
+					});
+				};
+				if (current === 0) {
+					firstRequestStarted.resolve();
+					void releaseFirstRequest.promise.then(respond);
+				} else {
+					queueMicrotask(respond);
+				}
+				return stream;
+			};
+
+			const run = session.prompt("Submit the researched plan");
+			await firstRequestStarted.promise;
+			await session.prompt("Add verification coverage", { streamingBehavior });
+			releaseFirstRequest.resolve();
+			await run;
+
+			expect(request).toBe(3);
+			expect(session.planningState.plan).toMatchObject({
+				phase: "ready",
+				steps: [{ text: "Implement the researched change" }, { text: "Add verification coverage" }],
+			});
+			const feedbackIndex = session.messages.findIndex(
+				(message) =>
+					message.role === "user" &&
+					Array.isArray(message.content) &&
+					message.content.some(
+						(content) => content.type === "text" && content.text === "Add verification coverage",
+					),
+			);
+			expect(session.messages[feedbackIndex - 1]).toMatchObject({
+				role: "custom",
+				customType: "volt-plan-checkpoint",
+				content: expect.stringContaining("Phase: draft"),
+			});
+			await session.dispose();
+		},
+	);
+
+	it("requires fresh research after tree navigation restores a draft branch", async () => {
 		const { session } = await createPlanningSession();
 		const draft = session.updatePlan({ steps: [{ text: "Implement the researched change" }] });
+		session.sessionManager.appendMessage({ role: "user", content: "Prepare the plan", timestamp: 1 });
+		const branchPointId = session.sessionManager.appendMessage(
+			createAssistantMessage([{ type: "text", text: "I will research it." }], "stop"),
+		);
+		session.agent.state.messages = session.sessionManager.buildSessionContext().messages;
 		const researchCall = {
 			type: "toolCall" as const,
-			id: "feedback-research",
+			id: "research-before-navigation",
 			name: "lsp",
 			arguments: { action: "diagnostics" },
 		};
@@ -215,64 +365,55 @@ describe("native planning state", () => {
 			result: { content: [{ type: "text", text: "No diagnostics" }] },
 			isError: false,
 		} as never);
-		const ready = session.submitPlan({
+		session.submitPlan({
 			planId: draft.id,
 			expectedRevision: draft.revision,
 			title: "Researched change",
 			summary: "Implement the researched change.",
 		});
 
-		const changed = session.changePlan(ready.id, ready.revision);
-		const revised = session.updatePlan({
-			planId: changed.plan!.id,
-			expectedRevision: changed.plan!.revision,
-			title: changed.plan!.title,
-			summary: changed.plan!.summary,
-			steps: [
-				...changed.plan!.steps.map((step) => ({ id: step.id, text: step.text })),
-				{ text: "Create a pull request" },
-			],
+		await session.navigateTree(branchPointId, { summarize: false });
+		expect(session.planningState).toMatchObject({
+			mode: "plan",
+			plan: { id: draft.id, revision: draft.revision, phase: "draft" },
 		});
-		const submitAfterFeedback = await session.agent.beforeToolCall?.({
-			toolCall: {
-				type: "toolCall",
-				id: "submit-after-feedback",
-				name: "submit_plan",
-				arguments: {
-					planId: revised.id,
-					expectedRevision: revised.revision,
-					title: revised.title,
-					summary: revised.summary,
-				},
+		const submitCall = {
+			type: "toolCall" as const,
+			id: "submit-after-navigation",
+			name: "submit_plan",
+			arguments: {
+				planId: draft.id,
+				expectedRevision: draft.revision,
+				title: "Researched change",
+				summary: "Implement the researched change.",
 			},
-			args: {
-				planId: revised.id,
-				expectedRevision: revised.revision,
-				title: revised.title,
-				summary: revised.summary,
-			},
-		} as never);
-		expect(submitAfterFeedback).toBeUndefined();
+		};
+		expect(
+			await session.agent.beforeToolCall?.({
+				toolCall: submitCall,
+				args: submitCall.arguments,
+			} as never),
+		).toMatchObject({ block: true });
 
-		const readyAfterFeedback = session.submitPlan({
-			planId: revised.id,
-			expectedRevision: revised.revision,
-			title: revised.title!,
-			summary: revised.summary!,
-		});
-		await session.setAgentMode("build");
-		const changedFromBuild = session.changePlan(readyAfterFeedback.id, readyAfterFeedback.revision);
-		expect(changedFromBuild).toMatchObject({ mode: "plan", plan: { phase: "draft" } });
-		const submitAfterFreshEntry = await session.agent.beforeToolCall?.({
-			toolCall: {
-				type: "toolCall",
-				id: "submit-after-fresh-entry",
-				name: "submit_plan",
-				arguments: {},
-			},
-			args: {},
+		const freshResearchCall = { ...researchCall, id: "research-after-navigation" };
+		expect(
+			await session.agent.beforeToolCall?.({
+				toolCall: freshResearchCall,
+				args: { action: "diagnostics" },
+			} as never),
+		).toBeUndefined();
+		await session.agent.afterToolCall?.({
+			toolCall: freshResearchCall,
+			args: { action: "diagnostics" },
+			result: { content: [{ type: "text", text: "No diagnostics" }] },
+			isError: false,
 		} as never);
-		expect(submitAfterFreshEntry).toMatchObject({ block: true });
+		expect(
+			await session.agent.beforeToolCall?.({
+				toolCall: submitCall,
+				args: submitCall.arguments,
+			} as never),
+		).toBeUndefined();
 		await session.dispose();
 	});
 

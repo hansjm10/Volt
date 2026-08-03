@@ -580,7 +580,8 @@ export class AgentSession {
 	private _planningTransitionInFlight = false;
 	private _requestedBuildToolNames: string[] = [];
 	private _planningRuntimeInitialized = false;
-	private _planResearchObserved = false;
+	/** Conversation generation whose successful read currently satisfies the Plan research gate. */
+	private _planResearchGeneration: number | undefined;
 	/** Guards the install-once agent hook contract; see _installAgentToolHooks. */
 	private _agentToolHooksInstalled = false;
 	private _trustedHostToolNames: Set<string> = new Set();
@@ -748,6 +749,11 @@ export class AgentSession {
 			);
 		}
 		this._agentToolHooksInstalled = true;
+		const prepareQueuedMessages = this.agent.prepareQueuedMessages;
+		this.agent.prepareQueuedMessages = async (messages, delivery, signal) => {
+			const prepared = prepareQueuedMessages ? await prepareQueuedMessages(messages, delivery, signal) : messages;
+			return this._prepareQueuedPlanFeedback(prepared);
+		};
 		this.agent.shouldStopAfterTurn = (context) => this._shouldStopForProactiveCompaction(context);
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
 			if (!this.getActiveToolNames().includes(toolCall.name)) {
@@ -793,7 +799,10 @@ export class AgentSession {
 						reason: `The research capability profile blocked ${toolCall.name}: ${decision.reason ?? "operation denied"}.`,
 					};
 				}
-				if (toolCall.name === "submit_plan" && !this._planResearchObserved) {
+				if (
+					toolCall.name === "submit_plan" &&
+					this._planResearchGeneration !== this._conversationGenerationRevision
+				) {
 					const researchToolAvailable = Array.from(this._toolRegistry.keys()).some((name) =>
 						resolverCanProvideResearchEvidence(
 							this._getTrustedOperationResolver(name),
@@ -821,7 +830,7 @@ export class AgentSession {
 				resolution !== undefined &&
 				operationProvidesResearchEvidence(resolution)
 			) {
-				this._planResearchObserved = true;
+				this._planResearchGeneration = this._conversationGenerationRevision;
 			}
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_result")) {
@@ -1989,18 +1998,23 @@ export class AgentSession {
 		return true;
 	}
 
-	private _deliverPlanningCheckpoint(state: PlanningState): void {
-		if (!this._planningStateNeedsCheckpoint(state)) return;
+	private _createPlanningCheckpointMessage(state: PlanningState): CustomMessage | undefined {
+		if (!this._planningStateNeedsCheckpoint(state)) return undefined;
 		const content = formatPlanCheckpoint(state);
-		if (!content) return;
-		const message = {
-			role: "custom" as const,
+		if (!content) return undefined;
+		return {
+			role: "custom",
 			customType: PLAN_CHECKPOINT_CUSTOM_TYPE,
 			content,
 			display: false,
 			details: undefined,
 			timestamp: Date.now(),
-		} satisfies CustomMessage;
+		};
+	}
+
+	private _deliverPlanningCheckpoint(state: PlanningState): void {
+		const message = this._createPlanningCheckpointMessage(state);
+		if (!message) return;
 		if (this.isStreaming) {
 			this.agent.steer(message);
 			return;
@@ -2014,6 +2028,16 @@ export class AgentSession {
 		);
 		this._emit({ type: "message_start", message });
 		this._emit({ type: "message_end", message });
+	}
+
+	private _prepareQueuedPlanFeedback(messages: AgentMessage[]): AgentMessage[] {
+		const readyPlan = this._planningState.plan?.phase === "ready" ? this._planningState.plan : undefined;
+		if (!readyPlan || !messages.some((message) => message.role === "user")) {
+			return messages;
+		}
+		const next = this._changeReadyPlanToDraft(readyPlan.id, readyPlan.revision, false);
+		const checkpoint = this._createPlanningCheckpointMessage(next);
+		return checkpoint ? [checkpoint, ...messages] : messages;
 	}
 
 	private _commitPlanningState(next: PlanningState): PlanningState {
@@ -2078,7 +2102,7 @@ export class AgentSession {
 		}
 		const plan = this._planningState.plan;
 		if (mode === "plan") {
-			this._planResearchObserved = false;
+			this._planResearchGeneration = undefined;
 		}
 		if (mode === "plan" && plan?.phase === "active") {
 			const next = this._commitPlanningState({ mode, plan: this._draftFromExecutedPlan(plan) });
@@ -2228,7 +2252,7 @@ export class AgentSession {
 		if (!input.reason.trim()) {
 			throw new Error("request_replan requires implementation evidence");
 		}
-		this._planResearchObserved = false;
+		this._planResearchGeneration = undefined;
 		return this._commitPlanningState({
 			mode: "plan",
 			plan: this._draftFromExecutedPlan(this._planningState.plan),
@@ -2262,15 +2286,26 @@ export class AgentSession {
 	}
 
 	changePlan(planId: string, expectedRevision: number): PlanningState {
+		return this._changeReadyPlanToDraft(planId, expectedRevision, true);
+	}
+
+	private _changeReadyPlanToDraft(
+		planId: string,
+		expectedRevision: number,
+		deliverCheckpoint: boolean,
+	): PlanningState {
 		this._assertNoPlanningTransitionInFlight("changePlan");
 		assertPlanRevision(this._planningState, planId, expectedRevision);
 		if (this._planningState.plan.phase !== "ready") {
 			throw new Error("Only a ready plan can be changed");
 		}
-		// Same-mode feedback can reuse this runtime's research, but entering Plan
-		// from Build requires fresh evidence before the revised plan is submitted.
-		if (this._planningState.mode !== "plan") {
-			this._planResearchObserved = false;
+		// Only same-generation Plan feedback can reuse the successful read that
+		// supported the ready plan. Build entry and branch navigation fail closed.
+		if (
+			this._planningState.mode !== "plan" ||
+			this._planResearchGeneration !== this._conversationGenerationRevision
+		) {
+			this._planResearchGeneration = undefined;
 		}
 		const next = this._commitPlanningState({
 			mode: "plan",
@@ -2280,14 +2315,16 @@ export class AgentSession {
 				phase: "draft",
 			},
 		});
-		this._deliverPlanningCheckpoint(next);
+		if (deliverCheckpoint) {
+			this._deliverPlanningCheckpoint(next);
+		}
 		return next;
 	}
 
 	discardPlan(planId: string, expectedRevision: number): PlanningState {
 		this._assertNoPlanningTransitionInFlight("discardPlan");
 		assertPlanRevision(this._planningState, planId, expectedRevision);
-		this._planResearchObserved = false;
+		this._planResearchGeneration = undefined;
 		return this._commitPlanningState({ mode: this._planningState.mode, plan: null });
 	}
 
@@ -5968,9 +6005,11 @@ export class AgentSession {
 				nextLeafId: this.sessionManager.getLeafId(),
 			};
 			if (conversationGenerationChange.previousLeafId !== conversationGenerationChange.nextLeafId) {
-				// Invalidate prompt authority as soon as the in-memory leaf changes. The
-				// observer notification remains behind the durability boundary below.
+				// Invalidate prompt authority and runtime-only research evidence as soon
+				// as the in-memory leaf changes. Observer notification remains behind the
+				// durability boundary below.
 				this._conversationGenerationRevision++;
+				this._planResearchGeneration = undefined;
 			}
 
 			// Summary and label entries must be durable before the new branch state
@@ -5981,6 +6020,7 @@ export class AgentSession {
 			const sessionContext = this.sessionManager.buildSessionContext();
 			const previousModel = this.model;
 			const previousThinkingLevel = this.thinkingLevel;
+			const previousPlanningState = clonePlanningState(this._planningState);
 			const wasFastModeEnabled = this._fastModeEnabled;
 			this.agent.state.messages = sessionContext.messages;
 			if (sessionContext.model) {
@@ -5997,7 +6037,11 @@ export class AgentSession {
 				? restoredThinkingLevel
 				: this._clampThinkingLevel(restoredThinkingLevel, availableThinkingLevels);
 			this._restoreFastModePolicy(sessionContext.fastMode);
+			this._planningState = clonePlanningState(sessionContext.planning);
 			this._syncPlanningRuntime();
+			if (JSON.stringify(previousPlanningState) !== JSON.stringify(this._planningState)) {
+				this._emitCommittedEvent({ type: "planning_state_changed", planning: this.planningState });
+			}
 			if (this.thinkingLevel !== previousThinkingLevel) {
 				this._emitCommittedEvent({ type: "thinking_level_changed", level: this.thinkingLevel });
 				void this._extensionRunner.emit({

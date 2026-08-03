@@ -116,6 +116,11 @@ export interface AgentOptions {
 	prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
+	prepareQueuedMessages?: (
+		messages: AgentMessage[],
+		delivery: "steer" | "followUp",
+		signal?: AbortSignal,
+	) => Promise<AgentMessage[]> | AgentMessage[];
 	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext, signal?: AbortSignal) => boolean | Promise<boolean>;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
@@ -209,6 +214,12 @@ export class Agent {
 	public prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
+	/** Prepare drained user queues immediately before their messages enter model context. */
+	public prepareQueuedMessages?: (
+		messages: AgentMessage[],
+		delivery: "steer" | "followUp",
+		signal?: AbortSignal,
+	) => Promise<AgentMessage[]> | AgentMessage[];
 	/**
 	 * Asks the host whether the loop should stop gracefully after the current turn.
 	 * See {@link AgentLoopConfig.shouldStopAfterTurn} for the loop contract.
@@ -242,6 +253,7 @@ export class Agent {
 		this.beforeToolCall = options.beforeToolCall;
 		this.afterToolCall = options.afterToolCall;
 		this.prepareNextTurn = options.prepareNextTurn;
+		this.prepareQueuedMessages = options.prepareQueuedMessages;
 		this.shouldStopAfterTurn = options.shouldStopAfterTurn;
 		this.steeringQueue = new PendingMessageQueue(options.steeringMode ?? "one-at-a-time");
 		this.followUpQueue = new PendingMessageQueue(options.followUpMode ?? "one-at-a-time");
@@ -381,14 +393,14 @@ export class Agent {
 			throw new Error("No messages to continue from");
 		}
 
-		const queuedSteering = this.steeringQueue.drain();
+		const queuedSteering = await this.prepareQueuedMessagesForDelivery(this.steeringQueue.drain(), "steer");
 		if (queuedSteering.length > 0) {
 			await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
 			return;
 		}
 
 		if (lastMessage.role === "assistant" || options.drainFollowUps) {
-			const queuedFollowUps = this.followUpQueue.drain();
+			const queuedFollowUps = await this.prepareQueuedMessagesForDelivery(this.followUpQueue.drain(), "followUp");
 			if (queuedFollowUps.length > 0) {
 				await this.runPromptMessages(queuedFollowUps);
 				return;
@@ -457,6 +469,16 @@ export class Agent {
 		};
 	}
 
+	private async prepareQueuedMessagesForDelivery(
+		messages: AgentMessage[],
+		delivery: "steer" | "followUp",
+	): Promise<AgentMessage[]> {
+		if (messages.length === 0 || !this.prepareQueuedMessages) {
+			return messages;
+		}
+		return await this.prepareQueuedMessages(messages, delivery, this.signal);
+	}
+
 	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
 		return {
@@ -482,9 +504,10 @@ export class Agent {
 					skipInitialSteeringPoll = false;
 					return [];
 				}
-				return this.steeringQueue.drain();
+				return await this.prepareQueuedMessagesForDelivery(this.steeringQueue.drain(), "steer");
 			},
-			getFollowUpMessages: async () => this.followUpQueue.drain(),
+			getFollowUpMessages: async () =>
+				await this.prepareQueuedMessagesForDelivery(this.followUpQueue.drain(), "followUp"),
 		};
 	}
 
