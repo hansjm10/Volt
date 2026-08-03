@@ -4,6 +4,7 @@ const { initializeApp, getApps } = require("firebase-admin/app");
 const { FieldValue, Timestamp, getFirestore } = require("firebase-admin/firestore");
 const { getMessaging } = require("firebase-admin/messaging");
 const { onRequest } = require("firebase-functions/v2/https");
+const { createPushTargetRegistrationHandler } = require("./registration.js");
 const {
 	RequestError,
 	assertRequestEnvelope,
@@ -12,13 +13,10 @@ const {
 	getBoundedPositiveInteger,
 	getConfiguredRelayUrl,
 	getHeader,
-	getPushTargetId,
 	getPushTargetTtlMs,
-	hashToken,
 	isPushTargetExpired,
 	parseLiveActivityUpdate,
 	parseNotification,
-	parsePushTargetRegistration,
 	parsePushTargetRevocation,
 	readJsonBody,
 	revokePushTargetTransaction,
@@ -57,6 +55,16 @@ const maxRegistrationsPerInstancePerMinute = getBoundedPositiveInteger(
 	DEFAULT_REGISTRATIONS_PER_INSTANCE_PER_MINUTE,
 );
 const registrationWindows = new Map();
+const registerPushTarget = createPushTargetRegistrationHandler({
+	enforceRegistrationRateLimit,
+	getPushTargetsCollection,
+	now: Date.now,
+	publicRelayUrl,
+	pushTargetTtlMs,
+	randomPushTargetAuthToken: () => randomBytes(32).toString("base64url"),
+	timestampFromMillis: (value) => Timestamp.fromMillis(value),
+	verifyRegistrationAppCheck,
+});
 
 exports.pushRelay = onRequest(
 	{
@@ -115,34 +123,8 @@ async function routeRequest(request, response) {
 	throw new RequestError(404, "not_found");
 }
 
-async function registerPushTarget(request, response) {
-	const appId = await verifyRegistrationAppCheck(request);
-	enforceRegistrationRateLimit(appId);
-	const registration = parsePushTargetRegistration(readJsonBody(request));
-	const pushTargetId = getPushTargetId(registration.token);
-	const pushTargetAuthToken = randomBytes(32).toString("base64url");
-	const tokenHash = hashToken(registration.token);
-	const nowMs = Date.now();
-	const now = Timestamp.fromMillis(nowMs);
-	await getPushTargetsCollection().doc(pushTargetId).set({
-		appId,
-		createdAt: now,
-		enabled: registration.enabled,
-		expiresAt: Timestamp.fromMillis(nowMs + pushTargetTtlMs),
-		platform: registration.platform,
-		provider: registration.provider,
-		token: registration.token,
-		tokenHash,
-		pushTargetAuthTokenHash: hashToken(pushTargetAuthToken),
-		updatedAt: now,
-	});
-	response.status(201).json({
-		pushTargetId,
-		pushTargetAuthToken,
-		relayUrl: publicRelayUrl,
-		tokenHash,
-		expiresAtEpochSeconds: Math.floor((nowMs + pushTargetTtlMs) / 1000),
-	});
+function getPushTargetsCollection() {
+	return getFirestore().collection(DEFAULT_COLLECTION);
 }
 
 async function verifyRegistrationAppCheck(request) {
