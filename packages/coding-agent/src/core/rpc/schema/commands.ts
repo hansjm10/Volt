@@ -18,8 +18,6 @@ import {
 	RpcConversationDiscontinuityReasonSchema,
 	RpcConversationIdentifierSchema,
 	RpcConversationInputImagesSchema,
-	RpcPushPlatformSchema,
-	RpcPushTokenEnvironmentSchema,
 	RpcQueueModeSchema,
 	RpcRegisterPushTargetArgsSchema,
 	RpcSafeNonNegativeIntegerSchema,
@@ -171,19 +169,6 @@ export const RPC_COMMAND_SCHEMAS = {
 	// Push notifications
 	register_push_target: commandSchema("register_push_target", {
 		args: RpcRegisterPushTargetArgsSchema,
-	}),
-	register_live_activity: commandSchema("register_live_activity", {
-		workspaceName: Type.String(),
-		sessionId: Type.String(),
-		activityId: Type.String(),
-		tokenHash: Type.String(),
-		tokenEnvironment: RpcPushTokenEnvironmentSchema,
-		platform: RpcPushPlatformSchema,
-	}),
-	unregister_live_activity: commandSchema("unregister_live_activity", {
-		workspaceName: Type.String(),
-		sessionId: Type.String(),
-		activityId: Type.String(),
 	}),
 
 	// Remote host management

@@ -2,7 +2,6 @@ import { basename, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 import { VERSION } from "../../config.ts";
 import type {
-	IrohRemoteLiveActivityUpdateIntent,
 	IrohRemotePushNotificationDeliveryStatus,
 	IrohRemotePushNotificationIntent,
 } from "../../core/remote/iroh/push.ts";
@@ -106,11 +105,6 @@ export interface RelayNotificationDeliveryForwarder {
 		sessionId: string,
 		notification: IrohRemotePushNotificationIntent,
 	): Promise<IrohRemotePushNotificationDeliveryStatus>;
-	deliverLiveActivityUpdate(
-		clientNodeId: string,
-		sessionId: string,
-		update: IrohRemoteLiveActivityUpdateIntent,
-	): Promise<IrohRemotePushNotificationDeliveryStatus>;
 }
 
 export interface DaemonAttachRekeyTransaction {
@@ -136,7 +130,7 @@ export interface DaemonAttach {
 	): Promise<DaemonAttachRekeyTransaction | undefined>;
 	/**
 	 * Forward a state-touching RPC command from a relayed phone conversation to
-	 * the daemon (push targets, live activities, workspace unregister). Returns
+	 * the daemon (push targets and workspace unregister). Returns
 	 * undefined when the daemon is unreachable or rejected the request.
 	 */
 	forwardRelayRpc(
@@ -144,7 +138,7 @@ export interface DaemonAttach {
 		sessionId: string,
 		command: Record<string, unknown> & { type: string },
 	): Promise<RelayRpcForwardResult | undefined>;
-	/** Deliver relayed completion pushes and Live Activity APNs through the daemon-owned push backend. */
+	/** Deliver relayed completion pushes through the daemon-owned push backend. */
 	relayNotificationDelivery: RelayNotificationDeliveryForwarder;
 	/** Viewer feed subscription (drain overlay). */
 	viewerSubscribe(viewerFeedId: string): Promise<void>;
@@ -344,9 +338,6 @@ export function createDisabledDaemonAttach(): DaemonAttach {
 		},
 		relayNotificationDelivery: {
 			async deliverNotification() {
-				return "failed";
-			},
-			async deliverLiveActivityUpdate() {
 				return "failed";
 			},
 		},
@@ -1073,25 +1064,6 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 						workspaceName,
 						sessionId,
 						notification,
-					});
-					return response.type === "relay_push_delivery_result" ? response.status : "failed";
-				} catch {
-					return "failed";
-				}
-			},
-			async deliverLiveActivityUpdate(clientNodeId, sessionId, update) {
-				const workspaceName = resolvedWorkspaceName;
-				const activeClient = client;
-				if (!activeClient || !workspaceName) {
-					return "failed";
-				}
-				try {
-					const response = await activeClient.request({
-						type: "relay_live_activity_delivery",
-						clientNodeId,
-						workspaceName,
-						sessionId,
-						update,
 					});
 					return response.type === "relay_push_delivery_result" ? response.status : "failed";
 				} catch {

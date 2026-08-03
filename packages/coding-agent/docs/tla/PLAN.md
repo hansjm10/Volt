@@ -27,12 +27,11 @@ to its states and the close reasons it mints.
 | 3 | **`SessionTarget`** | On connect, does the phone pin the *right* session — never a stale one? | `target ∈ {last_noId,last_withId,new,session}`; `hostSession ∈ {exists,missing,liveMoved}`; wire `selection`; `requestedId?`; client `{Validated,StreamOpened,PinCommitted,RolledBack}` | ghost pin (pinned to requested vs canonical id), rekey without requestedId, requestedId leaking onto created/resumed, `target=session` silently creating a session, producer/validator tuple mismatch. |
 | 4 | **`ClientAuth`** | Can a revoked or stale phone ever get back in? Is a one-time secret really one-time? | `clients`; `revoked[node]`; `pending[secretHash]`; `tomb ∈ {consumed(node),expired}`; logical `clock`; per-hello workspace authz | revoked-client re-entry, one-time secret replayed to a *different* node, expired-secret pairing, workspace-authz cached-at-pairing, check-order regressions. |
 | 5 | **`ClientConn`** | Does the phone reconnect exactly once, never when the user said disconnect, and never confuse abort with detach? | app status; `userRequestedDisconnect`; background flag; per-pin status lattice; closure ledger; monotonic `operationToken`/`reconnectGen`/`attemptId` | ghost reconnect while user-disconnected, double reconnect loop, expected-closure marker mis-consume, abort-conflated-with-detach, stale continuation commit. |
-| 6 | **`PushOrdering`** | Is `register_live_activity` ever accepted before its delivery channel exists? | `pushTarget ∈ {None,Enabled,Disabled}`; `laChannel ∈ {none,pendingAck,confirmed}`; `laReg`; `queuedUnreg` (TTL) | push-ordering violation, stale channel gating a send, reentrant flush dropping a queued unregister, cross-client channel scoping. |
 
 **Build order.** `LeaseBroker` → `RelayViewer` (shares the connection-drop
 trigger; compose the two once each is green solo) → `SessionTarget` → `ClientAuth`
 → `ClientConn` (largest state space; consumes close reasons from 1–3 as an
-abstract input alphabet) → `PushOrdering`.
+abstract input alphabet).
 
 ---
 
@@ -185,56 +184,3 @@ design intent.
 `lease_transferred` on the selected agent re-establishes a live stream — ties back
 to `LeaseBroker`/`RelayViewer` close reasons), `BoundedRetryLoops` (duplicate ≤5,
 lease_draining ≤3 both terminate).
-
-### 3.6 `PushOrdering` — written + verified green
-
-Implemented in `PushOrdering.tla` (63 states). Models the phone/daemon two-phase
-registration, checking `OrderingGate` (the daemon never registers a Live Activity
-without a matching stored delivery channel), `SendAfterConfirm` (the phone never
-sends the LA registration before its channel is confirmed), and
-`StaleChannelInvalidated`. The prose below is the original design intent.
-
-**Safety**
-
-- `DeliveryChannelPrecedesLiveActivity` — `register_live_activity` is sent only
-  when a confirmed delivery channel exists, and the host accepts it only if it
-  resolves the token hash to a stored channel. No LA registration without a prior
-  acked `register_push_target`.
-- `StaleChannelInvalidated` — a channel change clears confirmed/pending so a stale
-  channel can never gate an LA send.
-- `AuthoritativeClientScoping` — every registration is keyed to the authoritative
-  node id on both the direct and `relay_rpc` paths.
-- `UnregisterIdempotent` — unregister removes exactly the matching
-  `(ws,sid,activityId)` and is a no-op otherwise.
-
-**Liveness** — `RegistrationConverges`, `QueuedUnregisterResolves` (queued
-unregister is sent, re-queued, or dropped at its 24h TTL — never lingers),
-`ReentrantEnqueueNotDropped` (a reentrant enqueue during a flush `await` is merged
-back, not silently dropped).
-
----
-
-## 4. Abstraction strategy (shared)
-
-**Keep concrete (load-bearing):** the lease states and exact transition guards;
-the relay `used` single-use bit shared across admit/invalidate; relay/viewer state
-labels and the settled/ended guards; the close-reason enum (model the
-control-protocol superset); the handshake `(target, selection, requestedId)` tuple
-space; the auth check order and the four disjoint state sets keyed by node/secret;
-the app anti-race counters as monotonic tokens with a first-class "stale
-continuation bails" step; the push two-phase ack chain.
-
-**Abstract away:** turns → a boolean `isStreaming` with a nondeterministic end;
-the session file → a version counter; the byte relay → an opaque connected/settled
-channel; the viewer buffer → one bounded capacity + a nondeterministic overflow;
-time/TTL → a small logical clock or fireable expire events (clock may move backward
-only in `ClientAuth`); tokens → opaque identities with equality only; transcript
-content, push payloads, model catalog, migrations, audit.
-
-**Symmetry & bounds.** Clients, workspaces, and sessions are interchangeable →
-symmetry sets. Suggested starting CONSTANTS: 2 nodes, 1 workspace, 2 sessions, 1
-TUI + 1 phone connection, `MaxStreamCount=2`, retry bounds 2 (smaller than
-production 5/3 — liveness that holds at 2 holds at N). Add a state constraint to
-cap the logical clock and counters so TLC's graph stays finite. Symmetry is
-unsound with liveness in TLC, so use it for invariant-only runs and drop it (as the
-shipped `LeaseBroker.cfg` does) when checking properties.

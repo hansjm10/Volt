@@ -83,8 +83,6 @@ import type { ControlConnection } from "./control-server.ts";
 import {
 	type ConversationCommandContext,
 	createKeepAwakeRpcResponse,
-	createRemoteRegisterLiveActivityRpcResponse,
-	createRemoteUnregisterLiveActivityRpcResponse,
 	createRpcSuccessResponse,
 	createWebSearchKeyRpcResponse,
 	getRpcResponseId,
@@ -3301,9 +3299,9 @@ class IrohDaemonService {
 	/**
 	 * Post-unregister host cleanup shared by the control, workspace-management,
 	 * and conversation RPC unregister paths: closes phone streams, stops
-	 * runtimes, drops live activities, and closes TUI relays for the workspace.
-	 * Exclusions keep the requesting stream/runtime/relays alive so the
-	 * unregister response can still be delivered.
+	 * runtimes, and closes TUI relays for the workspace. Exclusions keep the
+	 * requesting stream/runtime/relays alive so the unregister response can still
+	 * be delivered.
 	 */
 	private async cleanupUnregisteredWorkspace(
 		workspaceName: string,
@@ -3325,7 +3323,6 @@ class IrohDaemonService {
 			WORKSPACE_UNREGISTERED_CLOSE_REASON,
 			exclusions.runtimeEntry,
 		);
-		await this.stateManager.removeLiveActivitiesForWorkspace(workspaceName);
 		this.closeRelaysForWorkspace(workspaceName, exclusions.relayIds);
 		if (exclusions.workspacePath !== undefined) {
 			await this.worktrees
@@ -3399,18 +3396,13 @@ class IrohDaemonService {
 			closedStreamCount += await this.stopRuntimeEntryAfterStreams(entry, reason);
 		}
 		const stoppedRuntimeCount = runtimeEntries.length;
-		const removedLiveActivityCount = await this.stateManager.removeClientLiveActivitiesForWorkspace(
-			nodeId,
-			workspaceName,
-		);
 		await this.logAudit({
 			type: "workspace_authorization_removed",
 			clientNodeId: nodeId,
 			workspace: workspaceName,
-			success: closedStreamCount > 0 || stoppedRuntimeCount > 0 || removedLiveActivityCount > 0,
+			success: closedStreamCount > 0 || stoppedRuntimeCount > 0,
 			details: {
 				closedStreamCount,
-				removedLiveActivityCount,
 				source: "authorization_failure",
 				stoppedRuntimeCount,
 			},
@@ -3862,15 +3854,6 @@ class IrohDaemonService {
 				connection.send({ type: "relay_push_delivery_result", id: request.id, status: result.status });
 				return true;
 			}
-			case "relay_live_activity_delivery": {
-				const result = await this.handleRelayLiveActivityDelivery(connection, request);
-				if (!result.ok) {
-					connection.send({ type: "error", id: request.id, code: result.code, message: result.message });
-					return true;
-				}
-				connection.send({ type: "relay_push_delivery_result", id: request.id, status: result.status });
-				return true;
-			}
 			case "client_access_update": {
 				const access =
 					request.access !== undefined
@@ -4100,40 +4083,10 @@ class IrohDaemonService {
 		}
 	}
 
-	private async handleRelayLiveActivityDelivery(
-		connection: ControlConnection,
-		request: Extract<ControlRequest, { type: "relay_live_activity_delivery" }>,
-	): Promise<RelayPushDeliveryResult> {
-		const contentState = request.update.contentState;
-		if (contentState.sessionID !== request.sessionId) {
-			return { ok: false, code: "session_mismatch", message: "Live Activity session does not match relay session" };
-		}
-		if (contentState.workspaceName !== request.workspaceName) {
-			return {
-				ok: false,
-				code: "workspace_mismatch",
-				message: "Live Activity workspace does not match relay workspace",
-			};
-		}
-		const authorization = await this.createRelayDeliveryAuthorization(connection, request);
-		if (!authorization.ok) {
-			return authorization;
-		}
-		try {
-			const status = await this.createPushNotificationDispatcher(
-				authorization.authorization,
-			).deliverLiveActivityUpdate(request.update);
-			return { ok: true, status };
-		} catch {
-			return { ok: true, status: "failed" };
-		}
-	}
-
 	/**
 	 * Execute a state-touching RPC command forwarded from a TUI-owned relay
-	 * against the daemon's real state (§5.6): push targets, live activities,
-	 * and workspace unregistration must land here, not in the TUI's in-memory
-	 * state copy.
+	 * against the daemon's real state (§5.6): push targets and workspace
+	 * unregistration must land here, not in the TUI's in-memory state copy.
 	 */
 	private async handleRelayRpc(
 		connection: ControlConnection,
@@ -4216,24 +4169,6 @@ class IrohDaemonService {
 					},
 				};
 			}
-		}
-		if (command.type === "register_live_activity") {
-			const response = await createRemoteRegisterLiveActivityRpcResponse(
-				command,
-				authorization,
-				this.getCommandContext(),
-				request.sessionId,
-			);
-			return { ok: true, response: response as Record<string, unknown> };
-		}
-		if (command.type === "unregister_live_activity") {
-			const response = await createRemoteUnregisterLiveActivityRpcResponse(
-				command,
-				authorization,
-				this.getCommandContext(),
-				request.sessionId,
-			);
-			return { ok: true, response: response as Record<string, unknown> };
 		}
 		// unregister_workspace: run against the daemon state with the shared host
 		// cleanup, keeping the requesting conversation's own relays open so the

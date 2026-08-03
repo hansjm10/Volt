@@ -1,4 +1,3 @@
-import { Buffer } from "node:buffer";
 import { readFile } from "node:fs/promises";
 import { writeDurableAtomicFile } from "../../../utils/durable-atomic-write.ts";
 import { cloneIrohRemoteRpcGrant, type IrohRemoteRpcGrant, parseIrohRemoteRpcGrant } from "./access-grant.ts";
@@ -38,15 +37,6 @@ export interface IrohRemoteWorkspaceWorktree {
 
 export type IrohRemotePushTargetProvider = "fcm";
 export type IrohRemotePushTargetPlatform = "ios";
-export type IrohRemotePushTokenEnvironment = "development" | "production";
-
-export interface IrohRemoteLiveActivityTarget {
-	activityId: string;
-	pushToken: string;
-	tokenHash?: string;
-	tokenEnvironment?: IrohRemotePushTokenEnvironment;
-	updatedAt: number;
-}
 
 export interface IrohRemotePushTarget {
 	id: string;
@@ -55,28 +45,10 @@ export interface IrohRemotePushTarget {
 	pushTargetAuthToken: string;
 	relayUrl?: string;
 	tokenHash?: string;
-	liveActivity?: IrohRemoteLiveActivityTarget;
 	enabled: boolean;
 	createdAt: number;
 	updatedAt: number;
 }
-
-export interface IrohRemoteLiveActivityRegistration {
-	workspaceName: string;
-	sessionId: string;
-	activityId: string;
-	tokenHash: string;
-	tokenEnvironment: IrohRemotePushTokenEnvironment;
-	platform: IrohRemotePushTargetPlatform;
-	pushTargetId: string;
-	createdAt: number;
-	updatedAt: number;
-}
-
-export const MAX_IROH_REMOTE_LIVE_ACTIVITIES_PER_CLIENT = 32;
-export const MAX_IROH_REMOTE_LIVE_ACTIVITY_SCOPE_BYTES = 512;
-export const MAX_IROH_REMOTE_LIVE_ACTIVITY_ID_BYTES = 512;
-export const MAX_IROH_REMOTE_LIVE_ACTIVITY_ID_CODE_POINTS = 128;
 
 export interface IrohRemoteClient {
 	nodeId: string;
@@ -89,7 +61,6 @@ export interface IrohRemoteClient {
 	lastSeenAt: number;
 	lastSessionIdByWorkspace?: Record<string, string>;
 	pushTargets?: IrohRemotePushTarget[];
-	liveActivities?: IrohRemoteLiveActivityRegistration[];
 }
 
 export type IrohRemoteGrantedClient = IrohRemoteClient & { rpcGrant: IrohRemoteRpcGrant };
@@ -228,17 +199,7 @@ function serializeIrohRemoteHostState(state: IrohRemoteHostState): IrohRemoteHos
 			...(client.lastSessionIdByWorkspace
 				? { lastSessionIdByWorkspace: { ...client.lastSessionIdByWorkspace } }
 				: {}),
-			...(client.pushTargets
-				? {
-						pushTargets: client.pushTargets.map((target) => ({
-							...target,
-							...(target.liveActivity ? { liveActivity: { ...target.liveActivity } } : {}),
-						})),
-					}
-				: {}),
-			...(client.liveActivities
-				? { liveActivities: client.liveActivities.map((registration) => ({ ...registration })) }
-				: {}),
+			...(client.pushTargets ? { pushTargets: client.pushTargets.map((target) => ({ ...target })) } : {}),
 		})),
 		revokedClients: (state.revokedClients ?? []).map((client) => ({
 			...client,
@@ -365,7 +326,6 @@ export function parseIrohRemoteClient(value: unknown, options?: IrohRemoteStateP
 			"client last session id",
 		),
 		...parseOptionalPushTargetsProperty(client.pushTargets, "client pushTargets"),
-		...parseOptionalLiveActivityRegistrationsProperty(client.liveActivities, "client liveActivities"),
 	};
 }
 
@@ -378,114 +338,10 @@ export function parseIrohRemotePushTarget(value: unknown): IrohRemotePushTarget 
 		pushTargetAuthToken: expectString(target.pushTargetAuthToken, "push target pushTargetAuthToken"),
 		relayUrl: expectOptionalString(target.relayUrl, "push target relayUrl"),
 		tokenHash: expectOptionalString(target.tokenHash, "push target tokenHash"),
-		liveActivity: parseOptionalIrohRemoteLiveActivityTarget(target.liveActivity, "push target liveActivity"),
 		enabled: expectBoolean(target.enabled, "push target enabled"),
 		createdAt: expectNumber(target.createdAt, "push target createdAt"),
 		updatedAt: expectNumber(target.updatedAt, "push target updatedAt"),
 	};
-}
-
-function parseOptionalIrohRemoteLiveActivityTarget(
-	value: unknown,
-	label: string,
-): IrohRemoteLiveActivityTarget | undefined {
-	if (value === undefined) {
-		return undefined;
-	}
-	const target = expectRecord(value, label);
-	return {
-		activityId: expectString(target.activityId, `${label} activityId`),
-		pushToken: expectString(target.pushToken, `${label} pushToken`),
-		tokenHash: expectOptionalString(target.tokenHash, `${label} tokenHash`),
-		tokenEnvironment: expectOptionalPushTokenEnvironment(target.tokenEnvironment, `${label} tokenEnvironment`),
-		updatedAt: expectNumber(target.updatedAt, `${label} updatedAt`),
-	};
-}
-
-export function parseIrohRemoteLiveActivityRegistration(value: unknown): IrohRemoteLiveActivityRegistration {
-	const registration = expectRecord(value, "live activity registration");
-	return {
-		workspaceName: expectBoundedUtf8String(
-			registration.workspaceName,
-			"live activity workspaceName",
-			MAX_IROH_REMOTE_LIVE_ACTIVITY_SCOPE_BYTES,
-		),
-		sessionId: expectBoundedUtf8String(
-			registration.sessionId,
-			"live activity sessionId",
-			MAX_IROH_REMOTE_LIVE_ACTIVITY_SCOPE_BYTES,
-		),
-		activityId: expectBoundedUtf8String(
-			registration.activityId,
-			"live activity activityId",
-			MAX_IROH_REMOTE_LIVE_ACTIVITY_ID_BYTES,
-			MAX_IROH_REMOTE_LIVE_ACTIVITY_ID_CODE_POINTS,
-		),
-		tokenHash: expectSha256Hex(registration.tokenHash, "live activity tokenHash"),
-		tokenEnvironment: expectPushTokenEnvironment(registration.tokenEnvironment, "live activity tokenEnvironment"),
-		platform: expectPushTargetPlatform(registration.platform, "live activity platform"),
-		pushTargetId: expectBoundedUtf8String(
-			registration.pushTargetId,
-			"live activity pushTargetId",
-			MAX_IROH_REMOTE_LIVE_ACTIVITY_SCOPE_BYTES,
-		),
-		createdAt: expectNonNegativeSafeInteger(registration.createdAt, "live activity createdAt"),
-		updatedAt: expectNonNegativeSafeInteger(registration.updatedAt, "live activity updatedAt"),
-	};
-}
-
-/**
- * Normalize legacy registration arrays into the same bounded shape enforced at
- * mutation time: one newest entry per workspace/session and the newest 32
- * sessions overall, ordered oldest-first for deterministic future eviction.
- */
-export function normalizeIrohRemoteLiveActivityRegistrations(
-	registrations: readonly IrohRemoteLiveActivityRegistration[],
-): IrohRemoteLiveActivityRegistration[] {
-	interface IndexedRegistration {
-		registration: IrohRemoteLiveActivityRegistration;
-		index: number;
-	}
-
-	const newestBySession = new Map<string, IndexedRegistration>();
-	for (const [index, registration] of registrations.entries()) {
-		const candidate = { registration, index };
-		const key = JSON.stringify([registration.workspaceName, registration.sessionId]);
-		const existing = newestBySession.get(key);
-		if (!existing || compareLiveActivityRecency(existing, candidate) <= 0) {
-			newestBySession.set(key, candidate);
-		}
-	}
-
-	const normalized = [...newestBySession.values()].sort(compareLiveActivityAge);
-	return normalized
-		.slice(Math.max(0, normalized.length - MAX_IROH_REMOTE_LIVE_ACTIVITIES_PER_CLIENT))
-		.map(({ registration }) => registration);
-}
-
-function compareLiveActivityRecency(
-	left: { registration: IrohRemoteLiveActivityRegistration; index: number },
-	right: { registration: IrohRemoteLiveActivityRegistration; index: number },
-): number {
-	return (
-		compareNumbers(left.registration.updatedAt, right.registration.updatedAt) ||
-		compareNumbers(left.registration.createdAt, right.registration.createdAt) ||
-		compareNumbers(left.index, right.index)
-	);
-}
-
-function compareLiveActivityAge(
-	left: { registration: IrohRemoteLiveActivityRegistration; index: number },
-	right: { registration: IrohRemoteLiveActivityRegistration; index: number },
-): number {
-	return (
-		compareNumbers(left.registration.createdAt, right.registration.createdAt) ||
-		compareNumbers(left.registration.updatedAt, right.registration.updatedAt) ||
-		compareStrings(left.registration.workspaceName, right.registration.workspaceName) ||
-		compareStrings(left.registration.sessionId, right.registration.sessionId) ||
-		compareStrings(left.registration.activityId, right.registration.activityId) ||
-		compareNumbers(left.index, right.index)
-	);
 }
 
 export function parseIrohRemoteRevokedClient(
@@ -621,18 +477,6 @@ function parseOptionalPushTargetsProperty(value: unknown, label: string): { push
 	return { pushTargets: parseArray(value, label, parseIrohRemotePushTarget) };
 }
 
-function parseOptionalLiveActivityRegistrationsProperty(
-	value: unknown,
-	label: string,
-): { liveActivities?: IrohRemoteLiveActivityRegistration[] } {
-	if (value === undefined) {
-		return {};
-	}
-	const registrations = parseArray(value, label, parseIrohRemoteLiveActivityRegistration);
-	const normalized = normalizeIrohRemoteLiveActivityRegistrations(registrations);
-	return normalized.length === 0 ? {} : { liveActivities: normalized };
-}
-
 function expectPairingSecretTombstoneOutcome(value: unknown): IrohRemotePairingSecretTombstoneOutcome {
 	if (value === "pairing_secret_consumed" || value === "pairing_secret_expired") {
 		return value;
@@ -654,20 +498,6 @@ function expectPushTargetPlatform(value: unknown, label: string): IrohRemotePush
 	throw new Error(`${label} must be ios`);
 }
 
-function expectPushTokenEnvironment(value: unknown, label: string): IrohRemotePushTokenEnvironment {
-	if (value === "development" || value === "production") {
-		return value;
-	}
-	throw new Error(`${label} must be development or production`);
-}
-
-function expectOptionalPushTokenEnvironment(value: unknown, label: string): IrohRemotePushTokenEnvironment | undefined {
-	if (value === undefined) {
-		return undefined;
-	}
-	return expectPushTokenEnvironment(value, label);
-}
-
 function expectRecord(value: unknown, label: string): Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
 		throw new Error(`${label} must be an object`);
@@ -680,25 +510,6 @@ function expectString(value: unknown, label: string): string {
 		throw new Error(`${label} must be a non-empty string`);
 	}
 	return value;
-}
-
-function expectBoundedUtf8String(value: unknown, label: string, maxBytes: number, maxCodePoints?: number): string {
-	const parsed = expectString(value, label);
-	if (Buffer.byteLength(parsed, "utf8") > maxBytes) {
-		throw new Error(`${label} must be at most ${maxBytes} UTF-8 bytes`);
-	}
-	if (maxCodePoints !== undefined && Array.from(parsed).length > maxCodePoints) {
-		throw new Error(`${label} must contain at most ${maxCodePoints} characters`);
-	}
-	return parsed;
-}
-
-function expectSha256Hex(value: unknown, label: string): string {
-	const parsed = expectString(value, label);
-	if (!/^[0-9a-f]{64}$/.test(parsed)) {
-		throw new Error(`${label} must be a lowercase SHA-256 hex digest`);
-	}
-	return parsed;
 }
 
 function expectOptionalString(value: unknown, label: string): string | undefined {
@@ -754,14 +565,6 @@ function expectPositiveSafeInteger(value: unknown, label: string): number {
 		throw new Error(`${label} must be a positive safe integer`);
 	}
 	return parsed;
-}
-
-function compareNumbers(left: number, right: number): number {
-	return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function compareStrings(left: string, right: string): number {
-	return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function isNodeErrorWithCode(error: unknown, code: string): error is NodeJS.ErrnoException {

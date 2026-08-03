@@ -1194,7 +1194,6 @@ export class IntegratedRuntimeRegistry {
 			);
 		}
 		const wasActive = entry.runtime.session.isBusy;
-		let removedLiveActivityCount = 0;
 		let stopSuccess = true;
 		const stopErrors: string[] = [];
 		// dispose() closes structural admission synchronously, then joins the same
@@ -1217,15 +1216,6 @@ export class IntegratedRuntimeRegistry {
 		}
 		this.cancelRetention(entry);
 		this.entries.delete(entry.key);
-		try {
-			removedLiveActivityCount = await this.options.stateManager.removeLiveActivitiesForWorkspaceSessions(
-				entry.workspaceName,
-				ownedConversationIds,
-			);
-		} catch (error: unknown) {
-			stopSuccess = false;
-			stopErrors.push(`live activity cleanup: ${error instanceof Error ? error.message : String(error)}`);
-		}
 		const stopError = stopErrors.length === 0 ? undefined : stopErrors.join("; ");
 		try {
 			await this.logAudit({
@@ -1234,12 +1224,12 @@ export class IntegratedRuntimeRegistry {
 				workspace: entry.workspaceName,
 				success: stopSuccess,
 				error: stopError,
-				details: this.getEntryDetails(entry, { active: wasActive, reason, removedLiveActivityCount }),
+				details: this.getEntryDetails(entry, { active: wasActive, reason }),
 			});
 			await this.logEntryAudit(
 				entry,
 				"remote_runtime_stopped",
-				{ active: wasActive, reason, removedLiveActivityCount },
+				{ active: wasActive, reason },
 				{ success: stopSuccess, error: stopError },
 			);
 		} finally {

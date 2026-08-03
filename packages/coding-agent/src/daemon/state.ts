@@ -16,10 +16,9 @@ import { DEFAULT_INTEGRATED_DETACHED_RUNTIME_TTL_MS } from "../remote/integrated
 import { writeDurableAtomicFile } from "../utils/durable-atomic-write.ts";
 
 /**
- * Persistent daemon state. The pairing/client sections reuse the legacy host
- * state shapes verbatim (push targets and live-activity registrations stay
- * embedded in each client, as `src/core/remote/iroh/push.ts` expects). The Iroh
- * identity survives migration; pre-grant client authority is intentionally not imported.
+ * Persistent daemon state. The pairing/client sections reuse the remote host
+ * state shapes verbatim, including push targets. The Iroh identity survives
+ * migration; pre-grant client authority is intentionally not imported.
  */
 export interface VoltdStateFileV1 {
 	version: 1;

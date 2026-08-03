@@ -28,8 +28,8 @@ Mobile streams bind during the Iroh handshake to one workspace/session
 conversation: `target:last`, `target:new`, or `target:session`. The iOS app
 renders those conversations as pinned agent tabs, including multiple sessions
 inside the same registered workspace. Commands, transcripts, native actions,
-host actions, notifications, Live Activity registration, and `/workspace` path
-mapping stay scoped to the bound conversation stream.
+host actions, notifications, and `/workspace` path mapping stay scoped to the
+bound conversation stream.
 
 Workspace discovery and management use short-lived utility streams. Discovery
 permits only `list_sessions`; management permits only authorized

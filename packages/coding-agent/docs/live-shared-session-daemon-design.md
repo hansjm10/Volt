@@ -18,7 +18,7 @@ Today, remote iOS access requires a foreground `volt remote host` process: a 373
 
 This RFC replaces that model with:
 
-1. **voltd** — a persistent, detached, Node-only daemon packaged inside `@hansjm10/volt-coding-agent`. It owns the stable Iroh node identity, pairing/revocation state, push + Live Activity dispatch, the workspace registry, an audit log, headless integrated runtimes, and a **conversation lease broker**. It is auto-spawned by `volt` startup when `remote.background` is enabled and is managed via `volt daemon start|stop|status|restart|logs|install-service`.
+1. **voltd** — a persistent, detached, Node-only daemon packaged inside `@hansjm10/volt-coding-agent`. It owns the stable Iroh node identity, pairing/revocation state, push notification dispatch, the workspace registry, an audit log, headless integrated runtimes, and a **conversation lease broker**. It is auto-spawned by `volt` startup when `remote.background` is enabled and is managed via `volt daemon start|stop|status|restart|logs|install-service`.
 2. **Conversation leases** — exactly one owner process per `(workspaceName, workspaceGeneration, sessionId)` holds the live `AgentSessionRuntime` + `ExtensionRunner` + tools. The TUI owns leases for sessions it has open (full Pi extension fidelity, `ctx.mode === "tui"`); the daemon owns leases for headless sessions (`ctx.mode === "rpc"`, documented degradation). The lease identity **drops** `clientNodeId` but includes the exact workspace authority generation as required by the [workspace authority amendment](workspace-authority-lifecycle-design.md).
 3. **Byte relay** — when the TUI owns a lease, the daemon authenticates the phone's Iroh conversation stream itself, then relays the framed JSONL bytes over the unix control socket to the TUI, which serves the stream with the existing `runIrohRemoteRpcMode(runtime, { stream: relayedStream, disposeRuntimeOnClose: false, ... })` against its in-process runtime. Phone prompts render live in the TUI because `InteractiveMode` renders user messages from `message_start` events regardless of origin (interactive-mode.ts L3008-3015).
 4. **Turn-boundary handoff** in both directions, with a draining state and a read-only viewer feed so a user opening the TUI mid-remote-turn watches the turn finish before taking ownership.
@@ -67,7 +67,7 @@ Three processes participate: **voltd** (persistent), **volt TUI** (per-terminal,
    |    iOS app       | <=========================> |                voltd                  |
    |   (volt-app)     |   conversation streams      |  - Iroh node identity (stable key)    |
    +------------------+   workspace/device streams  |  - pairing, revocation, audit         |
-                                                    |  - push relay + Live Activity state   |
+                                                    |  - push notification relay state     |
                                                     |  - workspace registry                 |
                                                     |  - LEASE BROKER (wsName,sessionId)    |
                                                     |  - headless runtimes (ctx.mode=rpc)   |
@@ -163,8 +163,6 @@ export interface VoltdStateFileV1 {
   workspaces: RemoteWorkspaceRecord[];   // reuse/extend type from src/core/remote/iroh/state.ts
   /** Push targets keyed by clientNodeId; shape from src/core/remote/iroh/push.ts. */
   pushTargets: Record<string, RemotePushTargetRecord>;
-  /** Live Activity channels keyed by clientNodeId. */
-  liveActivityChannels: Record<string, RemoteLiveActivityChannelRecord>;
   settings: {
     /** Detached headless runtime retention. Default DEFAULT_INTEGRATED_DETACHED_RUNTIME_TTL_MS
      *  (30 min, src/remote/integrated-runtime-retention.ts L1). */
@@ -184,7 +182,7 @@ Where a named type does not yet exist in `src/core/remote/iroh/state.ts`, define
 `src/daemon/state.ts` exports `migrateLegacyRemoteState(agentDir: string): VoltdStateFileV1 | null`:
 
 1. Runs on daemon startup only when `daemon/state.json` does not exist and `join(agentDir, "remote", "iroh-host.json")` (the default path used by main.ts: `join(getAgentDir(), "remote", "iroh-host.json")`) does.
-2. Maps legacy fields → `VoltdStateFileV1`: secret key (**verbatim** — this is what preserves pairing), clients, revokedClients, workspaces, push targets, live-activity channels. Unknown legacy fields are dropped. Missing sections default to empty.
+2. Maps legacy fields → `VoltdStateFileV1`: secret key (**verbatim** — this is what preserves pairing), clients, revokedClients, workspaces, push targets. Unknown legacy fields are dropped. Missing sections default to empty.
 3. Writes `daemon/state.json`, then renames the legacy file to `remote/iroh-host.json.migrated` (never deleted).
 4. Emits audit event `daemon_started` with `details.migratedFromLegacyState: true`.
 5. Idempotent: if `.migrated` exists and `state.json` exists, nothing happens.
@@ -505,8 +503,8 @@ export type ControlRequest =
   | { type: "viewer_unsubscribe"; id: string; viewerFeedId: string }
   | { type: "relay_rpc"; id: string; clientNodeId: string; workspaceName: string;
       sessionId: string;
-      /** verbatim state-touching RPC command (register_push_target,
-       *  register/unregister_live_activity, unregister_workspace) forwarded from a
+      /** verbatim state-touching RPC command (register_push_target or
+       *  unregister_workspace) forwarded from a
        *  TUI-owned conversation (§6.6); the daemon replies relay_rpc_result with the
        *  verbatim RPC response for the phone */
       command: Record<string, unknown> & { type: string } };
@@ -696,8 +694,7 @@ export interface DaemonAttach {
   acquire(ws: string, sessionId: string): Promise<AcquireOutcome>; // granted|pending(viewer)|denied|noop
   release(ws: string, sessionId: string): Promise<void>;
   rekey(ws: string, oldId: string, newId: string): Promise<void>;
-  forwardPushRegister(ws: string, sessionId: string,
-    kind: "push_target" | "live_activity", payload: unknown): Promise<void>;
+  forwardPushRegister(ws: string, sessionId: string, payload: unknown): Promise<void>;
   onRelayOffer(handler: (offer, openRelay) => void): void;
   relayCount(): number;                      // for footer indicator
   onRelayCountChange(cb: (n: number) => void): void;
@@ -736,9 +733,9 @@ When `onSessionChanged` fires inside a TUI-served relay (or the TUI itself rekey
 
 On DaemonClient reconnect, `daemon-attach` re-sends `lease_acquire` for the currently open session. If the response is `granted{handoff:"warm"}` (daemon had spun up a runtime during the gap), the TUI calls `session.reload()` (agent-session.ts L2657-2681) to absorb file changes; extension lifecycle follows reload semantics (reason `"reload"`). `pending` follows the drain viewer path with the current transcript kept on screen behind the overlay.
 
-### 6.6 Push / Live Activity / workspace forwarding
+### 6.6 Push notification / workspace forwarding
 
-Relayed conversations must keep push working after TUI exit, so push state lives in the daemon. The relay's `remoteCommandHandler` intercepts the state-touching RPC commands (`RELAY_RPC_COMMAND_TYPES`: `register_push_target`, `register_live_activity`, `unregister_live_activity`, `unregister_workspace`) and forwards them verbatim as `relay_rpc` control requests carrying the phone's `clientNodeId` and the TUI's current session id. The daemon executes them against its real state (push dispatcher, live-activity delivery channels, workspace registry with full unregister cleanup) and returns the verbatim RPC response in `relay_rpc_result`, which the TUI relays to the phone; `unregister_workspace` results also carry refreshed workspace metadata for the TUI's authorization decoration. Actual APNs dispatch always happens daemon-side.
+Relayed conversations must keep push working after TUI exit, so push state lives in the daemon. The relay's `remoteCommandHandler` intercepts the state-touching RPC commands (`RELAY_RPC_COMMAND_TYPES`: `register_push_target`, `unregister_workspace`) and forwards them verbatim as `relay_rpc` control requests carrying the phone's `clientNodeId` and the TUI's current session id. The daemon executes them against its real state (push dispatcher and workspace registry with full unregister cleanup) and returns the verbatim RPC response in `relay_rpc_result`, which the TUI relays to the phone; `unregister_workspace` results also carry refreshed workspace metadata for the TUI's authorization decoration. Notification dispatch always happens daemon-side.
 
 ### 6.7 Abort symmetry and command handling
 
@@ -896,7 +893,6 @@ The app keeps advertising BOTH `multi_streams.v1` and `conversation_streams.v1` 
 | D10 | **Transcript merge already multi-origin ready — verify.** | `VoltSession+Transcript.swift` | remoteEntryID dedupe + optimistic reconciliation appending unmatched incoming user entries must accept user entries originating from the TUI. Expected zero code change; add a VoltClient test with an interleaved TUI-origin user entry. |
 | D11 | **Optional: recognize `conversation_leases.v1`.** | `IrohProtocol.swift` feature parsing | If present, the app MAY show "shared with desktop" affordance and expect `lease_transferred` closures; ignoring the feature is fully safe. |
 | D12 | **Extension UI: no `extension_ui_request` while TUI owns the lease.** | `VoltSession+HostActions.swift:381-396` | No code change needed (fewer requests arrive); update in-code comment: only `confirm` is answerable, `select/input/editor` auto-cancelled, and TUI-owned conversations produce none. |
-| D13 | **Push ordering unchanged.** | `VoltSession+LiveActivity.swift` (`confirmedLiveActivityDeliveryChannel`) | `register_push_target` then `register_live_activity` ordering is preserved by the daemon even for relayed conversations (§6.6). No change; add ordering assertion to VoltClient tests. |
 
 ---
 
@@ -939,8 +935,7 @@ Volt entry point: `./test.sh` (repo root of Volt). iOS: VoltClient package tests
 2. **Handoff both directions**: (a) daemon-active + mid-turn fake turn → TUI acquire → `lease_pending` → viewer events observed → turn idle → `lease_granted{warm}` → daemon runtime disposed (extension fixture logs `session_shutdown{quit}`) → phone stream closed `lease_transferred`; (b) TUI release → `unowned` → fake-phone reconnect → lazy resume → transcript continuity (entry appended by TUI visible via `get_transcript`).
 3. **Dual-frontend live session over loopback**: TUI harness (headless InteractiveMode driver or a runtime-level stand-in exercising the relay serving path) owns lease; two fake phones relay-attach concurrently; phone A prompts; assert: TUI runtime received prompt, both phones receive streamed events, `message_start` user entry carries phone origin and is renderable, abort from phone B stops turn with both streams still open.
 4. **Extension fidelity fixture**: a test extension recording lifecycle events + ctx.mode + theme facade results, loaded in both owners across a handoff; assert the §8 table rows it can observe (mode value, dialogs routing, getAllThemes non-empty in rpc mode, shutdown/start reasons).
-5. **Push ordering**: relayed conversation registers push target then live activity via control forwarding; assert daemon dispatch order per client.
-6. **Reconnect/re-acquire**: kill daemon under a lease-holding TUI harness → restart → DaemonClient reconnects → re-acquire → `warm` + reload path invoked.
+5. **Reconnect/re-acquire**: kill daemon under a lease-holding TUI harness → restart → DaemonClient reconnects → re-acquire → `warm` + reload path invoked.
 
 ### 12.4 iOS (VoltClient package tests, volt-app)
 
@@ -948,7 +943,7 @@ Volt entry point: `./test.sh` (repo root of Volt). iOS: VoltClient package tests
 2. Closure reasons: `lease_transferred` and `session_rekeyed_reconnect` → expected-closure, immediate reconnect (D9).
 3. `lease_draining` prompt error → retry with retryAfterMs, composer preserved (D5).
 4. Transcript merge with interleaved TUI-origin user entry → dedup/append correctness (D10).
-5. Duplicate retry loop against fake daemon responses (D4). 6. Push ordering assertion (D13).
+5. Duplicate retry loop against fake daemon responses (D4).
 
 ### 12.5 Manual walk-away verification script
 
@@ -977,7 +972,7 @@ Each milestone leaves `./test.sh` green. Branch implements M1-M8 (+M10 docs) in 
 **Accept**: `volt daemon start/stop/status/restart/logs` work end-to-end on macOS+Linux; migration test §12.2.4 passes; standalone SEA rejected; unit tests §12.2.2 pass; lifecycle integration §12.3.1 passes (minus runtime drain).
 
 ### M3 — Host rewrite: daemon-owned runtimes (parity port)
-**Files**: `src/daemon/integrated-runtimes.ts`, `workspace-streams.ts`; wire `IrohRemoteHostEngine` into daemon main; port pairing (`pair_request` control flow replacing `startPairControlServer`), revocation, push/live-activity (ordering invariant), audit (all existing events + `daemon_started`/`daemon_shutdown`), workflow replay, retention, `onSessionChanged` rekey plumbing (broker stub: everything `daemon-active`/`daemon-detached`), duplicate handling, UNSUPPORTED_RPC rejection. **Delete** `src/remote/iroh-host.mjs`; **delete** main.ts spawn path (L1075-1097) and `volt remote host` (replace with removal error); rewrite `volt remote pair/status/clients/revoke/workspace` as control clients.
+**Files**: `src/daemon/integrated-runtimes.ts`, `workspace-streams.ts`; wire `IrohRemoteHostEngine` into daemon main; port pairing (`pair_request` control flow replacing `startPairControlServer`), revocation, push notifications, audit (all existing events + `daemon_started`/`daemon_shutdown`), workflow replay, retention, `onSessionChanged` rekey plumbing (broker stub: everything `daemon-active`/`daemon-detached`), duplicate handling, UNSUPPORTED_RPC rejection. **Delete** `src/remote/iroh-host.mjs`; **delete** main.ts spawn path (L1075-1097) and `volt remote host` (replace with removal error); rewrite `volt remote pair/status/clients/revoke/workspace` as control clients.
 **Accept**: a phone (or fake-phone harness) pairs, connects, prompts, backgrounds/reattaches within TTL against voltd with behavior parity to the old host; `git grep iroh-host.mjs` only hits docs/changelog; §12.3.1 fully passes.
 
 ### M4 — Lease broker + abort redesign

@@ -144,7 +144,7 @@ export function cloneIrohRemoteRpcGrant(grant: IrohRemoteRpcGrant): IrohRemoteRp
 	return { schemaVersion: 1, revision: grant.revision, capabilities: [...grant.capabilities] };
 }
 
-const BASELINE_COMMANDS = new Set(["register_push_target", "register_live_activity", "unregister_live_activity"]);
+const BASELINE_COMMANDS = new Set(["register_push_target"]);
 const OBSERVE_COMMANDS = new Set([
 	"get_state",
 	"get_transcript",

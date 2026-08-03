@@ -104,27 +104,6 @@ describe("control protocol framing", () => {
 					planId: "plan-1",
 				},
 			},
-			{
-				type: "relay_live_activity_delivery",
-				id: "17",
-				clientNodeId: "n-1",
-				workspaceName: "volt",
-				sessionId: "s-1",
-				update: {
-					eventId: "live-activity:s-1:run-1:1",
-					kind: "live_activity_update",
-					activityEvent: "update",
-					contentState: {
-						operationKind: "conversation",
-						operationID: "s-1",
-						status: "running",
-						sessionID: "s-1",
-						workspaceName: "volt",
-						operationStartedAtEpochSeconds: 120,
-						updatedAtEpochSeconds: 123,
-					},
-				},
-			},
 		];
 		for (const request of requests) {
 			const decoded = roundTrip(request);
@@ -275,69 +254,6 @@ describe("control protocol framing", () => {
 					...reviewNotificationRequest.notification,
 					workspaceName: undefined,
 					workspace: "volt",
-				},
-			}),
-		).toBe(false);
-		expect(
-			isControlRequest({
-				type: "relay_live_activity_delivery",
-				id: "x",
-				clientNodeId: "n-1",
-				workspaceName: "volt",
-				sessionId: "s-1",
-				update: {
-					eventId: "live-activity:old",
-					kind: "live_activity_update",
-					contentState: {
-						status: "running",
-						statusText: "Volt is thinking",
-						recentTools: [],
-						updatedAtEpochSeconds: 123,
-					},
-				},
-			}),
-		).toBe(false);
-		const semanticContentState = {
-			operationKind: "planCreation",
-			operationID: "s-1",
-			status: "running",
-			subject: "Plan title",
-			sessionID: "s-1",
-			workspaceName: "volt",
-			operationStartedAtEpochSeconds: 120,
-			updatedAtEpochSeconds: 123,
-		};
-		const semanticRequest = {
-			type: "relay_live_activity_delivery",
-			id: "x",
-			clientNodeId: "n-1",
-			workspaceName: "volt",
-			sessionId: "s-1",
-			update: {
-				eventId: "live-activity:new",
-				kind: "live_activity_update",
-				contentState: semanticContentState,
-			},
-		};
-		expect(isControlRequest(semanticRequest)).toBe(true);
-		expect(
-			isControlRequest({
-				...semanticRequest,
-				update: {
-					...semanticRequest.update,
-					contentState: { ...semanticContentState, subject: "🚀".repeat(65) },
-				},
-			}),
-		).toBe(false);
-		expect(
-			isControlRequest({
-				...semanticRequest,
-				update: {
-					...semanticRequest.update,
-					contentState: {
-						...semanticContentState,
-						operationStartedAtEpochSeconds: 124,
-					},
 				},
 			}),
 		).toBe(false);

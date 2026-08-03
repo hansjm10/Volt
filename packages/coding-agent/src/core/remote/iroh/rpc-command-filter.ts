@@ -57,8 +57,6 @@ export const IROH_REMOTE_RPC_PASSTHROUGH_TYPES = new Set([
 	"list_sessions",
 	"switch_session_by_id",
 	"register_push_target",
-	"register_live_activity",
-	"unregister_live_activity",
 	"unregister_workspace",
 	// worktrees.v1: create/list only — remove_worktree is management-stream-only.
 	"create_worktree",

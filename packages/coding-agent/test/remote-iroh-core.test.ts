@@ -935,8 +935,6 @@ describe("Iroh remote core helpers", () => {
 			"list_sessions",
 			"switch_session_by_id",
 			"register_push_target",
-			"register_live_activity",
-			"unregister_live_activity",
 			"unregister_workspace",
 			"create_worktree",
 			"list_worktrees",
