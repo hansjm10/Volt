@@ -1,6 +1,7 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { existsSync, type FSWatcher, readFileSync, statSync, watch } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { spawnProcess } from "../utils/child-process.ts";
 import { discoverGitWorktree, type GitWorktreeLocation, getGitRepositoryDisplayName } from "./git-repository.ts";
 import type { RpcGitContext } from "./rpc/types.ts";
 import { RPC_GIT_CONTEXT_REF_MAX_CHARS, RPC_GIT_CONTEXT_REPOSITORY_MAX_CHARS } from "./rpc/wire-limits.ts";
@@ -323,7 +324,7 @@ function runGit(args: readonly string[], options: RunGitOptions): Promise<Buffer
 			return;
 		}
 
-		const child = spawn("git", args, {
+		const child = spawnProcess("git", [...args], {
 			cwd: options.cwd,
 			env: createGitEnvironment(),
 			stdio: ["ignore", "pipe", "pipe"],
