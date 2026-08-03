@@ -159,19 +159,19 @@ class PendingMessageQueue {
 		return this.messages.length > 0;
 	}
 
-	drain(): AgentMessage[] {
-		if (this.mode === "all") {
-			const drained = this.messages.slice();
-			this.messages = [];
-			return drained;
+	async drainPrepared(
+		prepare: (messages: AgentMessage[]) => AgentMessage[] | Promise<AgentMessage[]>,
+	): Promise<AgentMessage[]> {
+		const messages = this.mode === "all" ? this.messages.splice(0) : this.messages.splice(0, 1);
+		if (messages.length === 0) {
+			return messages;
 		}
-
-		const first = this.messages[0];
-		if (!first) {
-			return [];
+		try {
+			return await prepare(messages);
+		} catch (error) {
+			this.messages.unshift(...messages);
+			throw error;
 		}
-		this.messages = this.messages.slice(1);
-		return [first];
 	}
 
 	clear(): void {
@@ -393,14 +393,14 @@ export class Agent {
 			throw new Error("No messages to continue from");
 		}
 
-		const queuedSteering = await this.prepareQueuedMessagesForDelivery(this.steeringQueue.drain(), "steer");
+		const queuedSteering = await this.drainQueuedMessagesForDelivery(this.steeringQueue, "steer");
 		if (queuedSteering.length > 0) {
 			await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
 			return;
 		}
 
 		if (lastMessage.role === "assistant" || options.drainFollowUps) {
-			const queuedFollowUps = await this.prepareQueuedMessagesForDelivery(this.followUpQueue.drain(), "followUp");
+			const queuedFollowUps = await this.drainQueuedMessagesForDelivery(this.followUpQueue, "followUp");
 			if (queuedFollowUps.length > 0) {
 				await this.runPromptMessages(queuedFollowUps);
 				return;
@@ -469,14 +469,13 @@ export class Agent {
 		};
 	}
 
-	private async prepareQueuedMessagesForDelivery(
-		messages: AgentMessage[],
+	private async drainQueuedMessagesForDelivery(
+		queue: PendingMessageQueue,
 		delivery: "steer" | "followUp",
 	): Promise<AgentMessage[]> {
-		if (messages.length === 0 || !this.prepareQueuedMessages) {
-			return messages;
-		}
-		return await this.prepareQueuedMessages(messages, delivery, this.signal);
+		return await queue.drainPrepared(async (messages) =>
+			this.prepareQueuedMessages ? await this.prepareQueuedMessages(messages, delivery, this.signal) : messages,
+		);
 	}
 
 	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
@@ -504,10 +503,9 @@ export class Agent {
 					skipInitialSteeringPoll = false;
 					return [];
 				}
-				return await this.prepareQueuedMessagesForDelivery(this.steeringQueue.drain(), "steer");
+				return await this.drainQueuedMessagesForDelivery(this.steeringQueue, "steer");
 			},
-			getFollowUpMessages: async () =>
-				await this.prepareQueuedMessagesForDelivery(this.followUpQueue.drain(), "followUp"),
+			getFollowUpMessages: async () => await this.drainQueuedMessagesForDelivery(this.followUpQueue, "followUp"),
 		};
 	}
 
