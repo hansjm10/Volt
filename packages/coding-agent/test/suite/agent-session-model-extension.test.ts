@@ -652,6 +652,50 @@ describe("AgentSession model and extension characterization", () => {
 		).toBe(true);
 	});
 
+	it("preserves before_agent_start system instructions for direct ready-plan feedback", async () => {
+		const extensionInstruction = "extension-ready-plan-instruction";
+		const harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("before_agent_start", async (event) => ({
+						systemPrompt: `${event.systemPrompt}\n\n${extensionInstruction}`,
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.setAgentMode("plan");
+		const draft = harness.session.updatePlan({ steps: [{ text: "Revise the implementation" }] });
+		const ready = harness.session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Ready plan",
+			summary: "Revise the implementation.",
+		});
+		await harness.session.setAgentMode("build");
+
+		let providerSystemPrompt = "";
+		let providerTools: string[] = [];
+		harness.setResponses([
+			(context) => {
+				providerSystemPrompt = context.systemPrompt ?? "";
+				providerTools = context.tools?.map((tool) => tool.name) ?? [];
+				return fauxAssistantMessage("done");
+			},
+		]);
+
+		await harness.session.prompt("Revise the ready plan");
+
+		expect(harness.session.planningState).toMatchObject({
+			mode: "plan",
+			plan: { id: ready.id, phase: "draft", revision: ready.revision + 1 },
+		});
+		expect(providerSystemPrompt).toContain(extensionInstruction);
+		expect(providerSystemPrompt).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
+		expect(providerTools).toContain("update_plan");
+		expect(providerTools).toContain("submit_plan");
+	});
+
 	it("bindExtensions emits session_start and reload emits session_shutdown then session_start", async () => {
 		const lifecycleEvents: string[] = [];
 		const harness = await createHarness({

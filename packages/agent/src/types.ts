@@ -241,6 +241,15 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	nextAction?: (context: AgentLoopNextActionContext) => AgentLoopNextAction | Promise<AgentLoopNextAction>;
 
 	/**
+	 * Atomically begin one resolved delivery immediately before its message events.
+	 *
+	 * Return false when a leased delivery was revoked after `nextAction` resolved.
+	 * This hook is synchronous so queue ownership cannot change between admission
+	 * and the first delivery event.
+	 */
+	beginDelivery?: (delivery: AgentLoopDelivery) => boolean;
+
+	/**
 	 * Prepare runtime state for an imminent provider request.
 	 *
 	 * This runs only for a resolved `request`, after all attached deliveries are

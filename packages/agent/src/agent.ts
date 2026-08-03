@@ -167,9 +167,15 @@ type PendingDelivery = {
 	sequence: number;
 };
 
+type DeliveryLeaseStatus = "leased" | "emitting" | "committed" | "revoked";
+
+type LeasedDelivery = {
+	delivery: PendingDelivery;
+	status: DeliveryLeaseStatus;
+};
+
 type DeliveryLease = {
-	uncommitted: PendingDelivery[];
-	deliveries: AgentLoopDelivery[];
+	entries: LeasedDelivery[];
 };
 
 type DispatcherStartState = {
@@ -316,12 +322,12 @@ export class Agent {
 		return this.enqueueDelivery("followUp", [message]);
 	}
 
-	/** Remove all queued or uncommitted steering deliveries. */
+	/** Remove queued steering deliveries that have not begun message emission. */
 	clearSteeringQueue(): void {
 		this.clearDeliveries("steer");
 	}
 
-	/** Remove all queued or uncommitted follow-up deliveries. */
+	/** Remove queued follow-up deliveries that have not begun message emission. */
 	clearFollowUpQueue(): void {
 		this.clearDeliveries("followUp");
 	}
@@ -332,9 +338,12 @@ export class Agent {
 		this.clearFollowUpQueue();
 	}
 
-	/** Returns true when the inbox or active lease has an uncommitted delivery. */
+	/** Returns true when the inbox or active lease has a pending delivery. */
 	hasQueuedMessages(): boolean {
-		return this.inbox.length > 0 || (this.activeLease?.uncommitted.length ?? 0) > 0;
+		return (
+			this.inbox.length > 0 ||
+			this.activeLease?.entries.some((entry) => entry.status === "leased" || entry.status === "emitting") === true
+		);
 	}
 
 	/** Active abort signal for the current run, if any. */
@@ -394,19 +403,19 @@ export class Agent {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
 		const lastMessage = this._state.messages[this._state.messages.length - 1];
-		if (!lastMessage) {
+		if (!lastMessage && !this.hasQueuedMessages()) {
 			throw new Error("No messages to continue from");
 		}
 		const pausedState = this.pausedState;
 		this.pausedState = undefined;
-		const assistantTail = lastMessage.role === "assistant";
+		const assistantTail = lastMessage?.role === "assistant";
 		if (assistantTail && !this.hasPendingUserDelivery()) {
 			this.pausedState = pausedState;
 			throw new Error("Cannot continue from an assistant message without a pending user delivery");
 		}
 		await this.runDispatcher({
 			firstDecision: true,
-			providerRequestPending: pausedState?.providerRequestPending ?? !assistantTail,
+			providerRequestPending: pausedState?.providerRequestPending ?? (lastMessage !== undefined && !assistantTail),
 			pendingToolContinuation: pausedState?.pendingToolContinuation ?? false,
 			assistantTail,
 		});
@@ -460,23 +469,18 @@ export class Agent {
 
 	private clearDeliveries(kind: AgentDeliveryKind): void {
 		this.inbox = this.inbox.filter((delivery) => delivery.kind !== kind);
-		const lease = this.activeLease;
-		if (!lease) return;
-		const revokedIds = new Set(
-			lease.uncommitted.filter((delivery) => delivery.kind === kind).map((delivery) => delivery.deliveryId),
-		);
-		if (revokedIds.size === 0) return;
-		lease.uncommitted = lease.uncommitted.filter((delivery) => !revokedIds.has(delivery.deliveryId));
-		for (let index = lease.deliveries.length - 1; index >= 0; index--) {
-			const deliveryId = lease.deliveries[index]?.deliveryId;
-			if (deliveryId !== undefined && revokedIds.has(deliveryId)) {
-				lease.deliveries.splice(index, 1);
+		for (const entry of this.activeLease?.entries ?? []) {
+			if (entry.status === "leased" && entry.delivery.kind === kind) {
+				entry.status = "revoked";
 			}
 		}
 	}
 
 	private hasPendingUserDelivery(): boolean {
-		return [...this.inbox, ...(this.activeLease?.uncommitted ?? [])].some((delivery) =>
+		const leased = (this.activeLease?.entries ?? []).flatMap((entry) =>
+			entry.status === "leased" || entry.status === "emitting" ? [entry.delivery] : [],
+		);
+		return [...this.inbox, ...leased].some((delivery) =>
 			delivery.messages.some((message) => message.role === "user"),
 		);
 	}
@@ -559,9 +563,13 @@ export class Agent {
 		const selectedIds = new Set(selected.map((delivery) => delivery.deliveryId));
 		const claimed = this.inbox.filter((delivery) => selectedIds.has(delivery.deliveryId));
 		this.inbox = this.inbox.filter((delivery) => !selectedIds.has(delivery.deliveryId));
-		const lease: DeliveryLease = { uncommitted: claimed, deliveries: [] };
+		const lease: DeliveryLease = {
+			entries: claimed.map((delivery) => ({ delivery, status: "leased" })),
+		};
 		this.activeLease = lease;
-		for (const delivery of claimed) {
+		const deliveries: AgentLoopDelivery[] = [];
+		for (const entry of lease.entries) {
+			const { delivery } = entry;
 			const messages = this.prepareDelivery
 				? await this.prepareDelivery(
 						{
@@ -572,7 +580,7 @@ export class Agent {
 						this.signal,
 					)
 				: delivery.messages.slice();
-			if (!lease.uncommitted.includes(delivery)) continue;
+			if (this.activeLease !== lease || entry.status !== "leased") continue;
 			if (messages.length === 0) {
 				throw new Error("prepareDelivery must retain at least one message for an admitted delivery");
 			}
@@ -584,26 +592,41 @@ export class Agent {
 					messages.findIndex((message) => message.role === primaryRole),
 				);
 			}
-			lease.deliveries.push({
+			deliveries.push({
 				deliveryId: delivery.deliveryId,
 				messages,
 				commitMessageIndex,
 			});
 		}
-		return lease.deliveries;
+		return deliveries;
+	}
+
+	private beginActiveDelivery(delivery: AgentLoopDelivery): boolean {
+		if (delivery.deliveryId === undefined) return true;
+		const entry = this.activeLease?.entries.find(
+			(candidate) => candidate.delivery.deliveryId === delivery.deliveryId,
+		);
+		if (!entry) return true;
+		if (entry.status !== "leased") return false;
+		entry.status = "emitting";
+		return true;
 	}
 
 	private commitActiveDelivery(deliveryId: string): void {
-		const lease = this.activeLease;
-		if (!lease) return;
-		lease.uncommitted = lease.uncommitted.filter((delivery) => delivery.deliveryId !== deliveryId);
+		const entry = this.activeLease?.entries.find((candidate) => candidate.delivery.deliveryId === deliveryId);
+		if (entry?.status === "emitting") {
+			entry.status = "committed";
+		}
 	}
 
 	private rollbackActiveLease(): void {
 		const lease = this.activeLease;
 		if (!lease) return;
-		if (lease.uncommitted.length > 0) {
-			this.inbox = [...lease.uncommitted, ...this.inbox].sort((left, right) => left.sequence - right.sequence);
+		const pending = lease.entries.flatMap((entry) =>
+			entry.status === "leased" || entry.status === "emitting" ? [entry.delivery] : [],
+		);
+		if (pending.length > 0) {
+			this.inbox = [...pending, ...this.inbox].sort((left, right) => left.sequence - right.sequence);
 		}
 		this.activeLease = undefined;
 	}
@@ -623,6 +646,7 @@ export class Agent {
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
 			nextAction: async (context) => await this.resolveNextAction(context, startState),
+			beginDelivery: (delivery) => this.beginActiveDelivery(delivery),
 			prepareRequest: async (context) => {
 				const prepared = await this.prepareRequest?.(context, this.signal);
 				return {

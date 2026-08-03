@@ -721,6 +721,41 @@ describe("Agent", () => {
 		await firstPrompt.catch(() => {});
 	});
 
+	it("resumes an initial prompt that was aborted during agent_start", async () => {
+		let abortFirstStart = true;
+		let providerCalls = 0;
+		let providerUserTexts: Array<string | undefined> = [];
+		const agent = new Agent({
+			streamFn: (_model, context) => {
+				providerCalls++;
+				providerUserTexts = context.messages.map(getUserText).filter((text) => text !== undefined);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.subscribe((event) => {
+			if (event.type === "agent_start" && abortFirstStart) {
+				abortFirstStart = false;
+				agent.abort();
+			}
+		});
+
+		await agent.prompt("Initial prompt");
+
+		expect(providerCalls).toBe(0);
+		expect(agent.state.messages).toEqual([]);
+		expect(agent.hasQueuedMessages()).toBe(true);
+
+		await agent.continue();
+
+		expect(providerCalls).toBe(1);
+		expect(providerUserTexts).toEqual(["Initial prompt"]);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
 	it("claims the dispatcher before asynchronous direct delivery preparation", async () => {
 		const preparationStarted = createDeferred();
 		const releasePreparation = createDeferred();
@@ -898,6 +933,38 @@ describe("Agent", () => {
 		expect(seenDeliveryIds).toEqual([firstId]);
 		expect(secondId).not.toBe(firstId);
 		expect(agent.state.messages.map(getUserText).filter(Boolean)).toEqual(["second"]);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("does not emit deliveries revoked after an all-mode action resolves", async () => {
+		const deliveredUserTexts: string[] = [];
+		let providerUserTexts: Array<string | undefined> = [];
+		const agent = new Agent({
+			steeringMode: "all",
+			streamFn: (_model, context) => {
+				providerUserTexts = context.messages.map(getUserText).filter((text) => text !== undefined);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.state.messages = [createAssistantMessage("tail")];
+		agent.steer({ role: "user", content: [{ type: "text", text: "first" }], timestamp: Date.now() });
+		agent.steer({ role: "user", content: [{ type: "text", text: "second" }], timestamp: Date.now() + 1 });
+		agent.subscribe((event) => {
+			if (event.type !== "message_start" || event.message.role !== "user") return;
+			const text = getUserText(event.message);
+			if (text) deliveredUserTexts.push(text);
+			if (text === "first") agent.clearSteeringQueue();
+		});
+
+		await agent.continue();
+
+		expect(deliveredUserTexts).toEqual(["first"]);
+		expect(providerUserTexts).toEqual(["first"]);
+		expect(agent.state.messages.map(getUserText).filter((text) => text !== undefined)).toEqual(["first"]);
 		expect(agent.hasQueuedMessages()).toBe(false);
 	});
 

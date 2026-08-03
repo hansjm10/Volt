@@ -749,12 +749,6 @@ export class AgentSession {
 			const prepared = prepareDelivery ? await prepareDelivery(delivery, signal) : [...delivery.messages];
 			return this._prepareUserDelivery(prepared);
 		};
-		const prepareRequest = this.agent.prepareRequest;
-		this.agent.prepareRequest = async (context, signal) => {
-			const prepared = await prepareRequest?.(context, signal);
-			this._syncPlanningRuntime();
-			return prepared;
-		};
 		const nextAction = this.agent.nextAction;
 		this.agent.nextAction = async (context, signal) => {
 			const action = nextAction ? await nextAction(context, signal) : context.defaultAction;
@@ -3294,6 +3288,13 @@ export class AgentSession {
 			assertConversationGenerationCurrent();
 			if (this._disposed || abortGeneration !== this._abortGeneration) {
 				throw new Error("Prompt aborted before the agent run started");
+			}
+
+			// Direct feedback invalidates a ready approval before extensions inspect
+			// or replace the request prompt. Queued feedback reaches the same
+			// transition later through prepareDelivery when it is actually leased.
+			if (this._planningState.plan?.phase === "ready") {
+				this.changePlan(this._planningState.plan.id, this._planningState.plan.revision);
 			}
 
 			// Build messages array (custom message if any, then user message)
