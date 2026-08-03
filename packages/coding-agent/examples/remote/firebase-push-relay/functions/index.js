@@ -15,7 +15,6 @@ const {
 	getHeader,
 	getPushTargetTtlMs,
 	isPushTargetExpired,
-	parseLiveActivityUpdate,
 	parseNotification,
 	parsePushTargetRevocation,
 	readJsonBody,
@@ -24,7 +23,6 @@ const {
 } = require("./core.js");
 
 const DEFAULT_COLLECTION = "voltPushTargets";
-const DEFAULT_LIVE_ACTIVITY_APNS_TOPIC = "com.hansjm10.volt.push-type.liveactivity";
 const DEFAULT_REGION = "us-central1";
 const DELIVERY_QUOTA_WINDOW_MS = 60_000;
 const DEFAULT_DELIVERIES_PER_TARGET_PER_MINUTE = 30;
@@ -114,10 +112,6 @@ async function routeRequest(request, response) {
 	}
 	if (routePath === "/v1/notifications") {
 		await sendNotification(request, response);
-		return;
-	}
-	if (routePath === "/v1/live-activities") {
-		await sendLiveActivityUpdate(request, response);
 		return;
 	}
 	throw new RequestError(404, "not_found");
@@ -213,45 +207,6 @@ async function sendNotification(request, response) {
 	}
 }
 
-async function sendLiveActivityUpdate(request, response) {
-	const liveActivity = parseLiveActivityUpdate(readJsonBody(request));
-	const authorizedTarget = await reserveAuthorizedPushTarget(liveActivity);
-	const { pushTarget, pushTargetRef } = authorizedTarget;
-
-	if (liveActivity.tokenEnvironment === "development" && process.env.LIVE_ACTIVITY_ALLOW_DEVELOPMENT !== "1") {
-		throw new RequestError(422, "live_activity_environment_unsupported");
-	}
-
-	try {
-		const messageId = await getMessaging().send({
-			token: pushTarget.token,
-			apns: {
-				liveActivityToken: liveActivity.activityPushToken,
-				headers: {
-					"apns-priority": "10",
-					"apns-push-type": "liveactivity",
-					"apns-topic": getLiveActivityApnsTopic(),
-				},
-				payload: {
-					aps: liveActivityApsPayload(liveActivity),
-				},
-			},
-		});
-		await markPushSent(pushTargetRef, liveActivity, messageId);
-		response.status(200).json({ status: "sent", messageId });
-	} catch (error) {
-		if (isInvalidTargetError(error)) {
-			await pushTargetRef.update({
-				lastLiveActivityInvalidAt: FieldValue.serverTimestamp(),
-				lastLiveActivityInvalidReason: getErrorCode(error) || "messaging/invalid-live-activity-target",
-				updatedAt: FieldValue.serverTimestamp(),
-			});
-			throw new RequestError(410, "push_target_invalid");
-		}
-		respondFcmSendFailed(response, "live-activity", liveActivity, error);
-	}
-}
-
 async function reserveAuthorizedPushTarget(request) {
 	const pushTargetRef = getPushTargetsCollection().doc(request.pushTargetId);
 	return getFirestore().runTransaction(async (transaction) => {
@@ -336,25 +291,6 @@ async function disablePushTarget(pushTargetRef, reason) {
 		enabled: false,
 		updatedAt: FieldValue.serverTimestamp(),
 	});
-}
-
-function liveActivityApsPayload(liveActivity) {
-	const aps = {
-		"content-state": liveActivity.contentState,
-		event: liveActivity.activityEvent,
-		timestamp: Math.floor(Date.now() / 1000),
-	};
-	if (liveActivity.staleDateEpochSeconds !== undefined) {
-		aps["stale-date"] = liveActivity.staleDateEpochSeconds;
-	}
-	if (liveActivity.dismissalDateEpochSeconds !== undefined) {
-		aps["dismissal-date"] = liveActivity.dismissalDateEpochSeconds;
-	}
-	return aps;
-}
-
-function getLiveActivityApnsTopic() {
-	return process.env.LIVE_ACTIVITY_APNS_TOPIC || DEFAULT_LIVE_ACTIVITY_APNS_TOPIC;
 }
 
 function respondFcmSendFailed(response, route, request, error) {

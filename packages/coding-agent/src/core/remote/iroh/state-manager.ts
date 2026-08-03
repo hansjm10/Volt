@@ -17,17 +17,12 @@ import {
 	type IrohRemoteGrantedClient,
 	type IrohRemoteGrantedRevokedClient,
 	type IrohRemoteHostState,
-	type IrohRemoteLiveActivityRegistration,
 	type IrohRemotePairingSecretTombstone,
 	type IrohRemotePendingPairingTicket,
 	type IrohRemotePushTarget,
-	type IrohRemotePushTargetPlatform,
-	type IrohRemotePushTokenEnvironment,
 	type IrohRemoteRevokedClient,
 	type IrohRemoteWorkspace,
 	type IrohRemoteWorkspaceWorktree,
-	normalizeIrohRemoteLiveActivityRegistrations,
-	parseIrohRemoteLiveActivityRegistration,
 	readIrohRemoteHostState,
 	writeIrohRemoteHostState,
 } from "./state.ts";
@@ -83,24 +78,6 @@ export type IrohRemoteClientAccessUpdateResult =
 export type IrohRemoteAuthorizedSessionSelectionResult =
 	| { ok: true; client: IrohRemoteGrantedClient; previousSessionId: string | undefined }
 	| { ok: false; reason: "authorization_changed" };
-
-export interface IrohRemoteLiveActivityDeliveryChannelLookup {
-	tokenHash: string;
-	tokenEnvironment: IrohRemotePushTokenEnvironment;
-	platform: IrohRemotePushTargetPlatform;
-}
-
-export interface IrohRemoteLiveActivityRegistrationResult {
-	client?: IrohRemoteClient;
-	registration?: IrohRemoteLiveActivityRegistration;
-	replacedRegistration?: IrohRemoteLiveActivityRegistration;
-}
-
-export interface IrohRemoteLiveActivityPruneResult {
-	liveActivityRemoved: boolean;
-	registrationsRemoved: number;
-	pushTarget?: IrohRemotePushTarget;
-}
 
 export interface IrohRemoteWorkspaceWorktreeLifecycleContext {
 	workspace: IrohRemoteWorkspace;
@@ -710,216 +687,9 @@ export class IrohRemoteHostStateManager {
 				return undefined;
 			}
 			pushTarget.enabled = false;
-			delete pushTarget.liveActivity;
 			pushTarget.updatedAt = now;
 			await this.saveUnlocked(state);
 			return clonePushTarget(pushTarget);
-		});
-	}
-
-	async findClientLiveActivityDeliveryChannel(
-		nodeId: string,
-		lookup: IrohRemoteLiveActivityDeliveryChannelLookup,
-	): Promise<IrohRemotePushTarget | undefined> {
-		return this.runExclusive(async () => {
-			const state = await this.loadUnlocked();
-			const client = state.clients.find((entry) => entry.nodeId === nodeId);
-			const pushTarget = client?.pushTargets?.find(
-				(entry) =>
-					entry.platform === lookup.platform &&
-					entry.liveActivity?.tokenHash === lookup.tokenHash &&
-					entry.liveActivity.tokenEnvironment === lookup.tokenEnvironment,
-			);
-			return pushTarget ? clonePushTarget(pushTarget) : undefined;
-		});
-	}
-
-	async registerClientLiveActivity(
-		nodeId: string,
-		registration: IrohRemoteLiveActivityRegistration,
-	): Promise<IrohRemoteLiveActivityRegistrationResult> {
-		const validatedRegistration = parseIrohRemoteLiveActivityRegistration(registration);
-		return this.runExclusive(async () => {
-			const state = await this.loadUnlocked();
-			const client = state.clients.find((entry) => entry.nodeId === nodeId);
-			if (!client) {
-				return {};
-			}
-			let createdAt = validatedRegistration.createdAt;
-			let replacedRegistration: IrohRemoteLiveActivityRegistration | undefined;
-			const retainedRegistrations: IrohRemoteLiveActivityRegistration[] = [];
-			for (const existingRegistration of client.liveActivities ?? []) {
-				if (
-					(existingRegistration.workspaceName === validatedRegistration.workspaceName &&
-						existingRegistration.sessionId === validatedRegistration.sessionId) ||
-					existingRegistration.activityId === validatedRegistration.activityId
-				) {
-					createdAt = existingRegistration.createdAt;
-					replacedRegistration = existingRegistration;
-					continue;
-				}
-				retainedRegistrations.push(existingRegistration);
-			}
-			const savedRegistration = { ...validatedRegistration, createdAt };
-			client.liveActivities = normalizeIrohRemoteLiveActivityRegistrations([
-				...retainedRegistrations,
-				savedRegistration,
-			]);
-			await this.saveUnlocked(state);
-			return {
-				client: cloneClient(client),
-				registration: cloneLiveActivityRegistration(savedRegistration),
-				...(replacedRegistration
-					? { replacedRegistration: cloneLiveActivityRegistration(replacedRegistration) }
-					: {}),
-			};
-		});
-	}
-
-	async unregisterClientLiveActivity(
-		nodeId: string,
-		workspaceName: string,
-		sessionId: string,
-		activityId: string,
-	): Promise<boolean> {
-		return this.runExclusive(async () => {
-			const state = await this.loadUnlocked();
-			const client = state.clients.find((entry) => entry.nodeId === nodeId);
-			if (!client?.liveActivities) {
-				return false;
-			}
-			const beforeCount = client.liveActivities.length;
-			client.liveActivities = client.liveActivities.filter(
-				(entry) =>
-					entry.workspaceName !== workspaceName ||
-					entry.sessionId !== sessionId ||
-					entry.activityId !== activityId,
-			);
-			const removed = client.liveActivities.length !== beforeCount;
-			if (client.liveActivities.length === 0) {
-				delete client.liveActivities;
-			}
-			if (removed) {
-				await this.saveUnlocked(state);
-			}
-			return removed;
-		});
-	}
-
-	async pruneClientLiveActivityDeliveryChannel(
-		nodeId: string,
-		registration: IrohRemoteLiveActivityRegistration,
-		now = Date.now(),
-	): Promise<IrohRemoteLiveActivityPruneResult> {
-		return this.runExclusive(async () => {
-			const state = await this.loadUnlocked();
-			const client = state.clients.find((entry) => entry.nodeId === nodeId);
-			if (!client) {
-				return { liveActivityRemoved: false, registrationsRemoved: 0 };
-			}
-
-			let registrationsRemoved = 0;
-			if (client.liveActivities) {
-				const beforeCount = client.liveActivities.length;
-				client.liveActivities = client.liveActivities.filter(
-					(entry) => !isSameLiveActivityRegistration(entry, registration),
-				);
-				registrationsRemoved = beforeCount - client.liveActivities.length;
-				if (client.liveActivities.length === 0) {
-					delete client.liveActivities;
-				}
-			}
-
-			const pushTarget = client.pushTargets?.find((entry) => {
-				return (
-					entry.id === registration.pushTargetId &&
-					entry.platform === registration.platform &&
-					entry.liveActivity?.tokenHash === registration.tokenHash &&
-					entry.liveActivity.tokenEnvironment === registration.tokenEnvironment
-				);
-			});
-			const liveActivityRemoved = pushTarget?.liveActivity !== undefined;
-			if (liveActivityRemoved && pushTarget) {
-				delete pushTarget.liveActivity;
-				pushTarget.updatedAt = now;
-			}
-
-			if (registrationsRemoved > 0 || liveActivityRemoved) {
-				await this.saveUnlocked(state);
-			}
-			return {
-				liveActivityRemoved,
-				registrationsRemoved,
-				...(pushTarget ? { pushTarget: clonePushTarget(pushTarget) } : {}),
-			};
-		});
-	}
-
-	async removeClientLiveActivitiesForSession(
-		nodeId: string,
-		workspaceName: string,
-		sessionId: string,
-	): Promise<number> {
-		return this.removeClientLiveActivities(nodeId, (entry) => {
-			return entry.workspaceName === workspaceName && entry.sessionId === sessionId;
-		});
-	}
-
-	async removeClientLiveActivitiesForWorkspace(nodeId: string, workspaceName: string): Promise<number> {
-		return this.removeClientLiveActivities(nodeId, (entry) => entry.workspaceName === workspaceName);
-	}
-
-	/** Remove one runtime's complete conversation-identity history across every paired client. */
-	async removeLiveActivitiesForWorkspaceSessions(
-		workspaceName: string,
-		sessionIds: ReadonlySet<string>,
-	): Promise<number> {
-		const selectedSessionIds = new Set(sessionIds);
-		if (selectedSessionIds.size === 0) {
-			return 0;
-		}
-		return this.runExclusive(async () => {
-			const state = await this.loadUnlocked();
-			let removedCount = 0;
-			for (const client of state.clients) {
-				if (!client.liveActivities) {
-					continue;
-				}
-				const beforeCount = client.liveActivities.length;
-				client.liveActivities = client.liveActivities.filter(
-					(entry) => entry.workspaceName !== workspaceName || !selectedSessionIds.has(entry.sessionId),
-				);
-				removedCount += beforeCount - client.liveActivities.length;
-				if (client.liveActivities.length === 0) {
-					delete client.liveActivities;
-				}
-			}
-			if (removedCount > 0) {
-				await this.saveUnlocked(state);
-			}
-			return removedCount;
-		});
-	}
-
-	async removeLiveActivitiesForWorkspace(workspaceName: string): Promise<number> {
-		return this.runExclusive(async () => {
-			const state = await this.loadUnlocked();
-			let removedCount = 0;
-			for (const client of state.clients) {
-				if (!client.liveActivities) {
-					continue;
-				}
-				const beforeCount = client.liveActivities.length;
-				client.liveActivities = client.liveActivities.filter((entry) => entry.workspaceName !== workspaceName);
-				removedCount += beforeCount - client.liveActivities.length;
-				if (client.liveActivities.length === 0) {
-					delete client.liveActivities;
-				}
-			}
-			if (removedCount > 0) {
-				await this.saveUnlocked(state);
-			}
-			return removedCount;
 		});
 	}
 
@@ -1077,29 +847,6 @@ export class IrohRemoteHostStateManager {
 			);
 		}
 	}
-
-	private async removeClientLiveActivities(
-		nodeId: string,
-		shouldRemove: (registration: IrohRemoteLiveActivityRegistration) => boolean,
-	): Promise<number> {
-		return this.runExclusive(async () => {
-			const state = await this.loadUnlocked();
-			const client = state.clients.find((entry) => entry.nodeId === nodeId);
-			if (!client?.liveActivities) {
-				return 0;
-			}
-			const beforeCount = client.liveActivities.length;
-			client.liveActivities = client.liveActivities.filter((entry) => !shouldRemove(entry));
-			const removedCount = beforeCount - client.liveActivities.length;
-			if (client.liveActivities.length === 0) {
-				delete client.liveActivities;
-			}
-			if (removedCount > 0) {
-				await this.saveUnlocked(state);
-			}
-			return removedCount;
-		});
-	}
 }
 
 function isAuthorizationCurrentInState(
@@ -1154,9 +901,6 @@ function cloneClient(client: IrohRemoteClient): IrohRemoteGrantedClient {
 		rpcGrant: parseIrohRemoteRpcGrant(client.rpcGrant, "client rpcGrant"),
 		...(client.lastSessionIdByWorkspace ? { lastSessionIdByWorkspace: { ...client.lastSessionIdByWorkspace } } : {}),
 		...(client.pushTargets ? { pushTargets: client.pushTargets.map((target) => clonePushTarget(target)) } : {}),
-		...(client.liveActivities
-			? { liveActivities: client.liveActivities.map((registration) => cloneLiveActivityRegistration(registration)) }
-			: {}),
 	};
 }
 
@@ -1188,16 +932,7 @@ function clonePendingPairingTicket(ticket: IrohRemotePendingPairingTicket): Iroh
 }
 
 function clonePushTarget(pushTarget: IrohRemotePushTarget): IrohRemotePushTarget {
-	return {
-		...pushTarget,
-		...(pushTarget.liveActivity ? { liveActivity: { ...pushTarget.liveActivity } } : {}),
-	};
-}
-
-function cloneLiveActivityRegistration(
-	registration: IrohRemoteLiveActivityRegistration,
-): IrohRemoteLiveActivityRegistration {
-	return { ...registration };
+	return { ...pushTarget };
 }
 
 function cloneRevokedClient(client: IrohRemoteRevokedClient): IrohRemoteGrantedRevokedClient {
@@ -1224,19 +959,4 @@ function getRevokedClients(state: IrohRemoteHostState): IrohRemoteRevokedClient[
 
 function isSamePushTargetSlot(a: IrohRemotePushTarget, b: IrohRemotePushTarget): boolean {
 	return a.id === b.id || (a.provider === b.provider && a.platform === b.platform);
-}
-
-function isSameLiveActivityRegistration(
-	a: IrohRemoteLiveActivityRegistration,
-	b: IrohRemoteLiveActivityRegistration,
-): boolean {
-	return (
-		a.workspaceName === b.workspaceName &&
-		a.sessionId === b.sessionId &&
-		a.activityId === b.activityId &&
-		a.tokenHash === b.tokenHash &&
-		a.tokenEnvironment === b.tokenEnvironment &&
-		a.platform === b.platform &&
-		a.pushTargetId === b.pushTargetId
-	);
 }

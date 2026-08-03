@@ -711,8 +711,8 @@ Rules:
 - Bootstrap is cursor 0.
 - The cursor domain is exactly the state consumed by the conversation reducer: transcript mutations, assistant
   projection, tool execution, workflows, queue state, and session/run lifecycle state.
-- Correlated RPC responses, extension dialogs, host notices, notifications, live-activity updates, discovery, and
-  other control-plane envelopes are outside this cursor domain and never mutate the conversation reducer.
+- Correlated RPC responses, extension dialogs, host notices, notifications, discovery, and other control-plane
+  envelopes are outside this cursor domain and never mutate the conversation reducer.
 - MCP server/status/auth/call events are ordered control envelopes without `delivery`; they never consume a
   conversation cursor.
 - The host's canonical external lane is closed to exactly persisted transcript commits, workflow

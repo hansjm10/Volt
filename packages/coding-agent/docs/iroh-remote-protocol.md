@@ -253,8 +253,6 @@ Conversation streams forward or handle these remote commands:
 - `get_ui_action_completions`
 - `invoke_ui_action`
 - `register_push_target`
-- `register_live_activity`
-- `unregister_live_activity`
 - `list_sessions`
 - `create_worktree` (worktrees.v1)
 - `list_worktrees` (worktrees.v1)
@@ -283,7 +281,7 @@ All other command types receive a JSONL `response` with `success:false` and are 
 
 Remote clients observe spawning activity through the parent conversation's `subagent` tool call rather than through the local-only lifecycle commands. Child runtimes expose registry list/follow operations through the ordinary `subagent_registry` tool, including after delegation depth or child-count policy removes the spawning tool. Live `tool_execution_update`/`tool_execution_end` frames, `transcript_entry` frames, and `get_transcript` items carry the same bounded argument/detail projection for both tool names. Spawning details include per-task `status`, `subagentId`/`sessionId` attach targets, and — on hosts that stream delegation trees — bounded live fields per task: `task` (preview), `startedAt`, `durationMs`, `toolCalls`, `tokens`, `currentActivity`, and a recursive `children` array of the same node shape for nested delegation. Registry details include list/follow mode, status, run id, agent, and bounded pagination/output metadata. Trees are depth-capped at 5 levels and all strings are length-bounded and path-sanitized. `get_state` additionally includes the newest projected details on in-flight tool entries in `activeTools`, so a client attaching mid-turn can paint current activity without waiting for the next update frame. Clients must treat all of these fields as optional; older hosts omit them.
 
-`register_push_target` registers mobile-issued relay credentials with the host. The client must first register its raw FCM token with the Volt push relay; it must not send that raw FCM token to the desktop host. The host persists the relay target id and target-scoped auth token so it can notify the phone after the Iroh stream detaches. When an ActivityKit push token is available, the same command may include a `liveActivity` delivery channel containing the raw ActivityKit token plus its lowercase SHA-256 hash; the host stores that channel so it can ask the relay to update the Live Activity later. `relayUrl` is accepted as app registration metadata, but host delivery uses the desktop host's configured relay URL (`--push-relay-url` / `VOLT_PUSH_RELAY_URL`) and does not let clients redirect delivery:
+`register_push_target` registers mobile-issued relay credentials with the host. The client must first register its raw FCM token with the Volt push relay; it must not send that raw FCM token to the desktop host. The host persists the relay target id and target-scoped auth token so it can notify the phone after the Iroh stream detaches. `relayUrl` is accepted as app registration metadata, but host delivery uses the desktop host's configured relay URL (`--push-relay-url` / `VOLT_PUSH_RELAY_URL`) and does not let clients redirect delivery:
 
 ```json
 {
@@ -296,13 +294,7 @@ Remote clients observe spawning activity through the parent conversation's `suba
     "pushTargetAuthToken": "<relay-target-auth-token>",
     "relayUrl": "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay",
     "tokenHash": "sha256:<fcm-token-hash>",
-    "enabled": true,
-    "liveActivity": {
-      "activityId": "activity-one",
-      "pushToken": "<activitykit-push-token-hex>",
-      "tokenEnvironment": "production",
-      "tokenHash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    }
+    "enabled": true
   }
 }
 ```
@@ -312,57 +304,6 @@ The successful response is:
 ```json
 {"id":"push-1","type":"response","command":"register_push_target","success":true,"data":{"status":"registered","pushTargetId":"<relay-target-id>"}}
 ```
-
-`register_live_activity` binds an ActivityKit Live Activity to the current conversation stream. The app sends the activity identity and a lowercase SHA-256 token hash that references the previously acknowledged `register_push_target.args.liveActivity` delivery channel. It does not repeat the raw ActivityKit push token in `register_live_activity`:
-
-```json
-{
-  "id": "live-1",
-  "type": "register_live_activity",
-  "workspaceName": "volt",
-  "sessionId": "abc123",
-  "activityId": "activity-one",
-  "platform": "ios",
-  "tokenEnvironment": "production",
-  "tokenHash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-}
-```
-
-The host validates that `workspaceName` and `sessionId` match the bound stream, validates the activity payload, resolves `tokenHash` through the existing ActivityKit delivery channel for the authoritative client, and returns stable errors such as `session_mismatch`, `invalid_live_activity_registration`, `invalid_live_activity_token`, or `unknown_live_activity_token`. `unregister_live_activity` uses the same stream-bound workspace/session/activity identity without a token hash and is idempotent for the matching registration.
-
-Once registered, the host sends semantic ActivityKit content state through the push relay:
-
-```json
-{
-  "operationKind": "planCreation",
-  "operationID": "abc123",
-  "status": "running",
-  "subject": "Implement semantic Live Activities",
-  "sessionID": "abc123",
-  "workspaceName": "volt",
-  "operationStartedAtEpochSeconds": 1785312000,
-  "updatedAtEpochSeconds": 1785312060
-}
-```
-
-The exact content-state contract is:
-
-| Field | Required | Meaning |
-| --- | --- | --- |
-| `operationKind` | yes | `conversation`, `planCreation`, or `review`. |
-| `operationID` | yes | The session ID for conversation and Plan creation, or the detached review workflow ID for review. |
-| `status` | yes | `running`, `completed`, `failed`, or `cancelled`. |
-| `subject` | no | The Plan title only, bounded to 256 UTF-8 bytes. |
-| `sessionID` | yes | The stream-bound conversation session ID. |
-| `workspaceName` | yes | The stream-bound registered workspace name. |
-| `operationStartedAtEpochSeconds` | yes | Stable Unix epoch seconds for the current semantic operation. |
-| `updatedAtEpochSeconds` | yes | Unix epoch seconds for this update; never earlier than the operation start. |
-
-Running-state precedence is the newest active detached review, then an active Plan-mode creation run, then an ordinary conversation run. Review subjects are always omitted, as are conversation prompts, tool names, tool arguments, review targets, and review output. Tool execution events do not change Live Activity state. A Plan title change updates `subject` without changing the operation start time; semantically unchanged snapshots are suppressed.
-
-Attaching or reattaching a stream while work is active emits a fresh current snapshot with a unique event ID. Running and terminal deliveries use `activityEvent:"update"` and carry `staleDateEpochSeconds` 90 seconds after the content-state update time. An ordinary `agent_end` is not terminal because retries, compaction, or queued continuations may follow; the host waits for `agent_settled`, maps an aborted run to `cancelled`, and then sends the terminal update. While reviews overlap, completion of one review keeps the newest remaining review running. If the last review ends while Plan or conversation work remains active, the host falls directly back to that running operation without an intermediate review terminal state; otherwise it sends the final review outcome. Terminal updates do not end or unregister the Activity, so a later reattach or new operation can update the same registered Activity.
-
-The relay requires this exact bounded shape, verifies timestamp freshness, rejects unknown and former tool-oriented fields, and requires `sessionID`/`workspaceName` to equal the daemon-bound relay conversation identity.
 
 Completion notifications use one canonical intent for managed push delivery and JSONL fallback. The JSONL shape is `notification_request`; the relay receives the same `eventId`, `kind`, title, body, `workspaceName`/`sessionId` authority, and `planId` or `workflowId`, and forwards those exact metadata fields in FCM `data`.
 

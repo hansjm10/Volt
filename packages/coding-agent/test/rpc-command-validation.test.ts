@@ -275,19 +275,6 @@ const invalidPayloadCases: Array<{ name: string; payload: unknown; error: string
 		error: 'Invalid RPC command payload: "content" is required',
 	},
 	{
-		name: "rejects live-activity registrations with unknown token environments",
-		payload: {
-			type: "register_live_activity",
-			workspaceName: "workspace",
-			sessionId: "session",
-			activityId: "activity",
-			tokenHash: "hash",
-			tokenEnvironment: "staging",
-			platform: "ios",
-		},
-		error: 'Invalid RPC command payload: "tokenEnvironment" must be "development" or "production"',
-	},
-	{
 		name: "rejects invalid web search keys",
 		payload: { type: "set_web_search_key", apiKey: 7 },
 		error: 'Invalid RPC command payload: "apiKey" must be a string or null',
@@ -350,11 +337,6 @@ describe("RPC command payload validation", () => {
 					enabled: true,
 					relayUrl: "https://example.com",
 					tokenHash: "token-hash",
-					liveActivity: {
-						activityId: "activity-id",
-						pushToken: "push-token",
-						tokenHash: "live-activity-token-hash",
-					},
 				},
 			}),
 		).toBeUndefined();

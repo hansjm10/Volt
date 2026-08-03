@@ -366,7 +366,7 @@ describe("createDaemonAttach + control server integration", () => {
 		expect(leasePair?.connection.capabilities.has(CONTROL_WORKTREES_CAPABILITY)).toBe(true);
 	});
 
-	it("forwards relayed push and Live Activity delivery through the resolved workspace", async () => {
+	it("forwards relayed notification delivery through the resolved workspace", async () => {
 		const harness = await startControlHarness((connection, request) => {
 			if (request.type === "status") {
 				connection.send(statusResult(request.id, [{ name: "repo", path: HOST_PARENT_PATH }]));
@@ -374,10 +374,6 @@ describe("createDaemonAttach + control server integration", () => {
 			}
 			if (request.type === "relay_notification_delivery") {
 				connection.send({ type: "relay_push_delivery_result", id: request.id, status: "sent" });
-				return;
-			}
-			if (request.type === "relay_live_activity_delivery") {
-				connection.send({ type: "relay_push_delivery_result", id: request.id, status: "invalid_target" });
 				return;
 			}
 			connection.send({ type: "ok", id: request.id });
@@ -396,43 +392,11 @@ describe("createDaemonAttach + control server integration", () => {
 				workspaceName: "repo",
 			}),
 		).resolves.toBe("sent");
-		await expect(
-			attach.relayNotificationDelivery.deliverLiveActivityUpdate("n-1", "s-relay", {
-				eventId: "live-activity:s-relay:run-1:1",
-				kind: "live_activity_update",
-				activityEvent: "update",
-				contentState: {
-					operationKind: "conversation",
-					operationID: "s-relay",
-					status: "running",
-					sessionID: "s-relay",
-					workspaceName: "repo",
-					operationStartedAtEpochSeconds: 120,
-					updatedAtEpochSeconds: 123,
-				},
-			}),
-		).resolves.toBe("invalid_target");
-
 		const notificationRequest = harness.requests.find((request) => request.type === "relay_notification_delivery");
 		expect(notificationRequest).toMatchObject({
 			clientNodeId: "n-1",
 			workspaceName: "repo",
 			sessionId: "s-relay",
-		});
-		const liveActivityRequest = harness.requests.find((request) => request.type === "relay_live_activity_delivery");
-		expect(liveActivityRequest).toMatchObject({
-			clientNodeId: "n-1",
-			workspaceName: "repo",
-			sessionId: "s-relay",
-			update: {
-				contentState: {
-					operationKind: "conversation",
-					operationID: "s-relay",
-					status: "running",
-					sessionID: "s-relay",
-					workspaceName: "repo",
-				},
-			},
 		});
 	});
 

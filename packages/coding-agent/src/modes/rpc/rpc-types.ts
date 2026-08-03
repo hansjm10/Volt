@@ -25,7 +25,6 @@ export type {
 	RpcHostActionResponse,
 	RpcHostActionUpdate,
 	RpcListSubagentsResponse,
-	RpcLiveActivityRegistration,
 	RpcMcpAuthResponse,
 	RpcMcpCapabilitiesResponse,
 	RpcMcpPromptContentResponse,

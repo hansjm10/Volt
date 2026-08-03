@@ -31,13 +31,11 @@ import {
 	RpcKeepAwakeStatusSchema,
 	RpcListSubagentsResponseSchema,
 	RpcPromptResponseSchema,
-	RpcRegisterLiveActivityResponseSchema,
 	RpcRegisterPushTargetResponseSchema,
 	RpcSessionListItemSchema,
 	RpcSessionStateSchema,
 	RpcSubagentStartResponseSchema,
 	RpcTranscriptResponseSchema,
-	RpcUnregisterLiveActivityResponseSchema,
 	RpcWebSearchStatusSchema,
 } from "./session.ts";
 import {
@@ -323,8 +321,6 @@ export const RPC_RESPONSE_SCHEMAS = {
 
 	// Push notifications
 	register_push_target: dataResponse("register_push_target", RpcRegisterPushTargetResponseSchema),
-	register_live_activity: dataResponse("register_live_activity", RpcRegisterLiveActivityResponseSchema),
-	unregister_live_activity: dataResponse("unregister_live_activity", RpcUnregisterLiveActivityResponseSchema),
 
 	// Remote host management
 	unregister_workspace: dataResponse(

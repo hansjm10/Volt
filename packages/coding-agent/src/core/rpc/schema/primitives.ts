@@ -117,17 +117,6 @@ export const RpcUiActionListScopeSchema = stringEnum(["primary", "palette", "all
 
 export const RpcPushProviderSchema = stringEnum(["fcm"]);
 export const RpcPushPlatformSchema = stringEnum(["ios"]);
-export const RpcPushTokenEnvironmentSchema = stringEnum(["development", "production"]);
-
-export const RpcLiveActivityRegistrationSchema = Type.Object(
-	{
-		activityId: Type.String(),
-		pushToken: Type.String(),
-		tokenHash: Type.Optional(Type.String()),
-		tokenEnvironment: Type.Optional(RpcPushTokenEnvironmentSchema),
-	},
-	{ additionalProperties: false },
-);
 
 export const RpcRegisterPushTargetArgsSchema = Type.Object(
 	{
@@ -137,7 +126,6 @@ export const RpcRegisterPushTargetArgsSchema = Type.Object(
 		pushTargetAuthToken: Type.String(),
 		relayUrl: Type.Optional(Type.String()),
 		tokenHash: Type.Optional(Type.String()),
-		liveActivity: Type.Optional(RpcLiveActivityRegistrationSchema),
 		enabled: Type.Boolean(),
 	},
 	{

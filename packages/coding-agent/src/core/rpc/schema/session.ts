@@ -266,22 +266,6 @@ export const RpcRegisterPushTargetResponseSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
-export const RpcRegisterLiveActivityResponseSchema = Type.Object(
-	{
-		status: Type.Literal("registered"),
-		activityId: Type.String(),
-	},
-	{ additionalProperties: false },
-);
-
-export const RpcUnregisterLiveActivityResponseSchema = Type.Object(
-	{
-		status: Type.Literal("unregistered"),
-		activityId: Type.String(),
-	},
-	{ additionalProperties: false },
-);
-
 // ============================================================================
 // Host status + prompt admission
 // ============================================================================

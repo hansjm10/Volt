@@ -647,7 +647,6 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 					});
 					return;
 				}
-				await stateManager.removeLiveActivitiesForWorkspace(request.name);
 				await auditLogger
 					.log({
 						type: "workspace_unregistered",

@@ -13,10 +13,6 @@ import { IrohRemoteActiveStreamRegistry } from "../src/core/remote/iroh/active-s
 import { type IrohRemoteAuditEvent, IrohRemoteAuditLogger } from "../src/core/remote/iroh/audit.ts";
 import type { IrohRemoteClientAuthorizationSuccess } from "../src/core/remote/iroh/authorization.ts";
 import type { IrohRemoteHandshakeSuccess, IrohRemoteHello } from "../src/core/remote/iroh/handshake.ts";
-import {
-	createEmptyIrohRemoteHostState,
-	type IrohRemoteLiveActivityRegistration,
-} from "../src/core/remote/iroh/state.ts";
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
 import {
 	ConversationCoordinatorRegistry,
@@ -724,110 +720,6 @@ describe("daemon co-attach (one runtime per conversation)", () => {
 		activeStreams.unregister(streamB);
 		await registry.stopAll("test_cleanup");
 	});
-
-	it("retires live activities for every client and every owned rekey identity", async () => {
-		const oldSessionId = "activity-shared-old";
-		const newSessionId = "activity-shared-new";
-		const keepSessionId = "activity-unrelated";
-		const registration = (sessionId: string, activityId: string): IrohRemoteLiveActivityRegistration => ({
-			workspaceName: "ws",
-			sessionId,
-			activityId,
-			tokenHash: "a".repeat(64),
-			tokenEnvironment: "production",
-			platform: "ios",
-			pushTargetId: `target-${activityId}`,
-			createdAt: 1,
-			updatedAt: 2,
-		});
-		const phoneA = createAuthorization("n-activity-a");
-		const phoneB = createAuthorization("n-activity-b");
-		const untrackedPhone = createAuthorization("n-activity-untracked");
-		const stateManager = new IrohRemoteHostStateManager({
-			initialState: {
-				...createEmptyIrohRemoteHostState(),
-				workspaces: [{ name: "ws", path: workspacePath }],
-				clients: [
-					{
-						...phoneA.client,
-						liveActivities: [registration(oldSessionId, "a-old"), registration(newSessionId, "a-new")],
-					},
-					{
-						...phoneB.client,
-						liveActivities: [
-							registration(oldSessionId, "b-old"),
-							registration(newSessionId, "b-new"),
-							registration(keepSessionId, "b-keep"),
-						],
-					},
-					{
-						...untrackedPhone.client,
-						liveActivities: [
-							registration(oldSessionId, "untracked-old"),
-							registration(keepSessionId, "untracked-keep"),
-						],
-					},
-				],
-			},
-		});
-		const runtime = {
-			cwd: workspacePath,
-			session: createTestSession(oldSessionId, null),
-			dispose: vi.fn(async () => {}),
-			setRebindSession: vi.fn(),
-			listSessions: vi.fn(async () => []),
-		} as unknown as AgentSessionRuntime;
-		const registry = new IntegratedRuntimeRegistry({
-			agentDir,
-			auditLogger: new IrohRemoteAuditLogger(),
-			stateManager,
-			activeStreams: new IrohRemoteActiveStreamRegistry(),
-			detachedRuntimeTtlMs: () => 60_000,
-			getAllowTools: () => undefined,
-			getProjectTrustedForWorkspace: () => false,
-			setClientLastSessionId: stateManager.setClientLastSessionId.bind(stateManager),
-			createRuntime: async () => ({
-				runtime,
-				sessionSelection: { kind: "created", sessionId: oldSessionId },
-			}),
-		});
-		const created = await registry.getOrCreateEntry(
-			{ hello: createHello({ target: "new" }), response: HANDSHAKE_RESPONSE },
-			phoneA,
-		);
-		await registry.commitEntry(created.entry, created.sessionSelection, phoneA, created.attachClaim);
-		const subscriberA = await registry.attachSubscriber(created.entry, created.attachClaim);
-		const coattach = await registry.getOrCreateEntry(
-			{ hello: createHello({ target: "session", sessionId: oldSessionId }), response: HANDSHAKE_RESPONSE },
-			phoneB,
-		);
-		await registry.commitEntry(coattach.entry, coattach.sessionSelection, phoneB, coattach.attachClaim);
-		const subscriberB = await registry.attachSubscriber(coattach.entry, coattach.attachClaim);
-		created.attachClaim.release();
-		coattach.attachClaim.release();
-		expect(created.entry.recordedSessionIdsByClient.has(phoneB.client.nodeId)).toBe(false);
-
-		await registry.handleSessionChanged(created.entry, undefined, { sessionId: newSessionId }, phoneA);
-		expect(created.entry.previousSessionIds.has(oldSessionId)).toBe(true);
-		expect(created.entry.recordedSessionIdsByClient.has(phoneB.client.nodeId)).toBe(false);
-		await registry.detachSubscriber(created.entry, subscriberB, "test_cleanup");
-		await registry.detachSubscriber(created.entry, subscriberA, "test_cleanup");
-		await registry.stopEntry(created.entry, "test_cleanup");
-
-		const state = await stateManager.getState();
-		const activitiesByClient = Object.fromEntries(
-			state.clients.map((client) => [
-				client.nodeId,
-				(client.liveActivities ?? []).map((activity) => activity.sessionId),
-			]),
-		);
-		expect(activitiesByClient).toEqual({
-			"n-activity-a": [],
-			"n-activity-b": [keepSessionId],
-			"n-activity-untracked": [keepSessionId],
-		});
-	});
-
 	it("preflights daemon-owned rekeys and bulk-commits every attached client", async () => {
 		const activeStreams = new IrohRemoteActiveStreamRegistry();
 		const stateManager = new IrohRemoteHostStateManager();
@@ -1273,50 +1165,6 @@ describe("daemon co-attach (one runtime per conversation)", () => {
 		expect(registry.findOwner("ws", "owned-old")).toBeUndefined();
 		expect(registry.findOwner("ws", "occupied-new")).toBeUndefined();
 	});
-
-	it("disposes and releases ownership even when ancillary live-activity cleanup fails", async () => {
-		const dispose = vi.fn(async () => {});
-		const onRuntimeDisposed = vi.fn();
-		const stateManager = new IrohRemoteHostStateManager();
-		stateManager.removeLiveActivitiesForWorkspaceSessions = vi.fn(async () => {
-			throw new Error("state write failed");
-		});
-		const runtime = {
-			cwd: workspacePath,
-			session: createTestSession("cleanup-session", null),
-			dispose,
-			setRebindSession: vi.fn(),
-			listSessions: vi.fn(async () => []),
-		} as unknown as AgentSessionRuntime;
-		const registry = new IntegratedRuntimeRegistry({
-			agentDir,
-			auditLogger: new IrohRemoteAuditLogger(),
-			stateManager,
-			activeStreams: new IrohRemoteActiveStreamRegistry(),
-			detachedRuntimeTtlMs: () => 60_000,
-			getAllowTools: () => undefined,
-			getProjectTrustedForWorkspace: () => false,
-			setClientLastSessionId: vi.fn(async () => undefined),
-			onRuntimeDisposed,
-			createRuntime: async () => ({
-				runtime,
-				sessionSelection: { kind: "created", sessionId: "cleanup-session" },
-			}),
-		});
-		const phone = createAuthorization("n-phone-a");
-		const created = await registry.getOrCreateEntry(
-			{ hello: createHello({ target: "new" }), response: HANDSHAKE_RESPONSE },
-			phone,
-		);
-		await registry.commitEntry(created.entry, created.sessionSelection, phone, created.attachClaim);
-		created.attachClaim.release();
-
-		await registry.stopEntry(created.entry, "test_cleanup_failure");
-		expect(dispose).toHaveBeenCalledOnce();
-		expect(onRuntimeDisposed).toHaveBeenCalledWith(created.entry, "test_cleanup_failure");
-		expect(registry.findOwner("ws", "cleanup-session")).toBeUndefined();
-	});
-
 	it("does not resurrect a runtime stopped while commit audit publication is paused", async () => {
 		let releaseAudit!: () => void;
 		let markAuditStarted!: () => void;

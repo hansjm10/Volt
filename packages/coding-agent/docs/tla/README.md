@@ -32,7 +32,6 @@ via `./check.sh <Module>`.
 | **`SessionTarget`** | Picking the right session on connect, so a phone never pins the wrong one. | **Verified green** (28 states). `SessionTarget.tla` / `.cfg` |
 | **`ClientAuth`** | Pairing, revoking, and re-pairing a phone. | **Verified green** (9,678 states). `ClientAuth.tla` / `.cfg` |
 | **`ClientConn`** | The phone's own connect / reconnect / detach / abort behavior. | **Verified green** (176 states). `ClientConn.tla` / `.cfg` |
-| **`PushOrdering`** | Push + Live Activity registration must happen in the right order. | **Verified green** (63 states). `PushOrdering.tla` / `.cfg` |
 
 **Running the checker.** `./check.sh` runs TLC on `LeaseBroker` (it auto-downloads
 `tla2tools.jar` on first run; needs a JDK 17+ via `JAVA_HOME` or `java` on PATH).
@@ -197,9 +196,8 @@ It does **not** prove:
 Then `RelayViewer` (shares the connection-drop trigger; where "lost turn" and
 "stuck drain" actually manifest) → `SessionTarget` (small, high value: the
 wrong-pin class) → `ClientAuth` (self-contained, security-critical) → `ClientConn`
-(largest state space; consumes the close reasons above as inputs) → `PushOrdering`
-(narrowest, orthogonal). Model one at a time; only compose `LeaseBroker` +
-`RelayViewer` once each is green solo.
+(largest state space; consumes the close reasons above as inputs). Model one at a
+time; only compose `LeaseBroker` + `RelayViewer` once each is green solo.
 
 Full module scope, per-module invariant/property catalogs, and the shared
 abstraction strategy live in [`PLAN.md`](PLAN.md).

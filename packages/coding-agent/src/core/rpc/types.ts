@@ -68,10 +68,8 @@ import type {
 	RpcConversationAuthoritySchema,
 	RpcConversationBootstrapReasonSchema,
 	RpcConversationDiscontinuityReasonSchema,
-	RpcLiveActivityRegistrationSchema,
 	RpcPushPlatformSchema,
 	RpcPushProviderSchema,
-	RpcPushTokenEnvironmentSchema,
 	RpcRegisterPushTargetArgsSchema,
 	RpcUiActionListScopeSchema,
 } from "./schema/primitives.ts";
@@ -112,7 +110,6 @@ import type {
 	RpcPromptResponseSchema,
 	RpcQueuedMessageSchema,
 	RpcQueueUpdateProjectionSchema,
-	RpcRegisterLiveActivityResponseSchema,
 	RpcRegisterPushTargetResponseSchema,
 	RpcSessionListItemSchema,
 	RpcSessionStateProjectionSchema,
@@ -127,7 +124,6 @@ import type {
 	RpcTranscriptTextItemSchema,
 	RpcTranscriptToolItemSchema,
 	RpcTranscriptToolStatusSchema,
-	RpcUnregisterLiveActivityResponseSchema,
 	RpcWebSearchStatusSchema,
 } from "./schema/session.ts";
 import type {
@@ -274,12 +270,8 @@ export type RpcSubagentStartResponse = Static<typeof RpcSubagentStartResponseSch
 
 export type RpcPushProvider = Static<typeof RpcPushProviderSchema>;
 export type RpcPushPlatform = Static<typeof RpcPushPlatformSchema>;
-export type RpcPushTokenEnvironment = Static<typeof RpcPushTokenEnvironmentSchema>;
-export type RpcLiveActivityRegistration = Static<typeof RpcLiveActivityRegistrationSchema>;
 export type RpcRegisterPushTargetArgs = Static<typeof RpcRegisterPushTargetArgsSchema>;
 export type RpcRegisterPushTargetResponse = Static<typeof RpcRegisterPushTargetResponseSchema>;
-export type RpcRegisterLiveActivityResponse = Static<typeof RpcRegisterLiveActivityResponseSchema>;
-export type RpcUnregisterLiveActivityResponse = Static<typeof RpcUnregisterLiveActivityResponseSchema>;
 
 // ============================================================================
 // RPC MCP management

@@ -2052,18 +2052,12 @@ export class InteractiveMode {
 								relayedSessionId,
 								notification,
 							),
-						deliverLiveActivityUpdate: (update) =>
-							this.daemonAttach.relayNotificationDelivery.deliverLiveActivityUpdate(
-								authorizationSubset.clientNodeId,
-								relayedSessionId,
-								update,
-							),
 					},
 					remoteCommandHandler: async (command) => {
 						const rpcCommand = command as { type: string } & Record<string, unknown>;
 						if (RELAY_RPC_COMMAND_TYPES.has(rpcCommand.type)) {
-							// State-touching commands (push targets, live activities,
-							// workspace unregister) must run against the daemon's state;
+							// State-touching commands (push targets and workspace
+							// unregister) must run against the daemon's state;
 							// the TUI has no host state of its own.
 							const forwarded = await this.daemonAttach.forwardRelayRpc(
 								authorizationSubset.clientNodeId,

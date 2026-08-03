@@ -9,10 +9,8 @@ import {
 } from "../core/remote/iroh/access-grant.ts";
 import { parseIrohRemoteAllowTools } from "../core/remote/iroh/protocol.ts";
 import {
-	type IrohRemoteLiveActivityUpdateIntent,
 	type IrohRemotePushNotificationDeliveryStatus,
 	type IrohRemotePushNotificationIntent,
-	MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
 	parseIrohRemotePushNotificationIntent,
 } from "../core/remote/iroh/push.ts";
 import type { IrohRemoteClient } from "../core/remote/iroh/state.ts";
@@ -175,9 +173,8 @@ export type ControlRequest =
 			sessionId: string;
 			/**
 			 * Verbatim phone RPC command forwarded from a TUI-owned conversation.
-			 * The daemon executes it against its real state (push targets, live
-			 * activities, workspace registry) and returns the RPC response in
-			 * relay_rpc_result.
+			 * The daemon executes it against its real state (push targets and
+			 * workspace registry) and returns the RPC response in relay_rpc_result.
 			 */
 			command: Record<string, unknown> & { type: string };
 	  }
@@ -190,23 +187,11 @@ export type ControlRequest =
 			/** the TUI's current session id for the relayed conversation */
 			sessionId: string;
 			notification: IrohRemotePushNotificationIntent;
-	  }
-	| {
-			type: "relay_live_activity_delivery";
-			id: string;
-			/** paired phone client the relayed conversation belongs to */
-			clientNodeId: string;
-			workspaceName: string;
-			/** the TUI's current session id for the relayed conversation */
-			sessionId: string;
-			update: IrohRemoteLiveActivityUpdateIntent;
 	  };
 
 /** RPC command types the daemon executes on behalf of a TUI relay. */
 export const RELAY_RPC_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"register_push_target",
-	"register_live_activity",
-	"unregister_live_activity",
 	"unregister_workspace",
 	// worktrees.v1: create/list only — remove_worktree is management-stream-only.
 	"create_worktree",
@@ -555,10 +540,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isOptionalNumber(value: unknown): boolean {
-	return value === undefined || (Number.isSafeInteger(value) && (value as number) >= 0);
-}
-
 function isControlAccessSelection(value: Record<string, unknown>, allowDefault: boolean): boolean {
 	if (value.access !== undefined) {
 		return (
@@ -603,77 +584,8 @@ function isPushDeliveryStatus(value: unknown): value is IrohRemotePushNotificati
 	);
 }
 
-function hasOnlyKeys(value: Record<string, unknown>, allowedKeys: ReadonlySet<string>): boolean {
-	return Object.keys(value).every((key) => allowedKeys.has(key));
-}
-
-function isBoundedLiveActivityIdentifier(value: unknown): value is string {
-	return (
-		typeof value === "string" &&
-		value.trim().length > 0 &&
-		Array.from(value).length <= 128 &&
-		Buffer.byteLength(value, "utf8") <= 512
-	);
-}
-
-function isLiveActivityContentState(value: unknown): boolean {
-	if (
-		!isRecord(value) ||
-		!hasOnlyKeys(
-			value,
-			new Set([
-				"operationKind",
-				"operationID",
-				"status",
-				"subject",
-				"sessionID",
-				"workspaceName",
-				"operationStartedAtEpochSeconds",
-				"updatedAtEpochSeconds",
-			]),
-		)
-	) {
-		return false;
-	}
-	const validSubject =
-		value.subject === undefined ||
-		(typeof value.subject === "string" &&
-			value.subject.trim().length > 0 &&
-			Buffer.byteLength(value.subject, "utf8") <= MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES);
-	return (
-		(value.operationKind === "conversation" ||
-			value.operationKind === "planCreation" ||
-			value.operationKind === "review") &&
-		isBoundedLiveActivityIdentifier(value.operationID) &&
-		(value.status === "running" ||
-			value.status === "completed" ||
-			value.status === "failed" ||
-			value.status === "cancelled") &&
-		validSubject &&
-		(value.subject === undefined || value.operationKind === "planCreation") &&
-		isBoundedLiveActivityIdentifier(value.sessionID) &&
-		isBoundedLiveActivityIdentifier(value.workspaceName) &&
-		Number.isSafeInteger(value.operationStartedAtEpochSeconds) &&
-		(value.operationStartedAtEpochSeconds as number) >= 0 &&
-		Number.isSafeInteger(value.updatedAtEpochSeconds) &&
-		(value.updatedAtEpochSeconds as number) >= (value.operationStartedAtEpochSeconds as number)
-	);
-}
-
 function isPushNotificationIntent(value: unknown): value is IrohRemotePushNotificationIntent {
 	return parseIrohRemotePushNotificationIntent(value) !== undefined;
-}
-
-function isLiveActivityUpdateIntent(value: unknown): value is IrohRemoteLiveActivityUpdateIntent {
-	return (
-		isRecord(value) &&
-		typeof value.eventId === "string" &&
-		typeof value.kind === "string" &&
-		(value.activityEvent === undefined || value.activityEvent === "update" || value.activityEvent === "end") &&
-		isLiveActivityContentState(value.contentState) &&
-		isOptionalNumber(value.staleDateEpochSeconds) &&
-		isOptionalNumber(value.dismissalDateEpochSeconds)
-	);
 }
 
 export function parseHelloMessage(value: unknown): HelloMessage | undefined {
@@ -834,13 +746,6 @@ export function isControlRequest(value: unknown): value is ControlRequest {
 				typeof value.workspaceName === "string" &&
 				typeof value.sessionId === "string" &&
 				isPushNotificationIntent(value.notification)
-			);
-		case "relay_live_activity_delivery":
-			return (
-				typeof value.clientNodeId === "string" &&
-				typeof value.workspaceName === "string" &&
-				typeof value.sessionId === "string" &&
-				isLiveActivityUpdateIntent(value.update)
 			);
 		default:
 			return false;

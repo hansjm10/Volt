@@ -369,10 +369,10 @@ Exact touch points:
 
 #### 5.1.6 Lifecycle interactions
 
-- **Workspace unregister:** refuse before changing state when any persisted child worktree exists. The stable conflict is `workspace_has_worktrees`; clients show the worktrees and require explicit `remove_worktree` operations. Dirty, unmerged, busy, missing-checkout, and clean records all block equally, so the state layer never needs to infer whether data is disposable. Per-worktree `force:true` remains the only destructive opt-in and stops bound runtimes first. Once no records remain, unregister may close streams/runtimes and remove workspace-scoped Live Activity/relay state, but it never removes the workspace worktrees directory or unknown/orphan checkout directories. The retained `cleanupUnregisteredWorkspace` compatibility guard is inspection/audit-only and performs no git or filesystem mutation.
+- **Workspace unregister:** refuse before changing state when any persisted child worktree exists. The stable conflict is `workspace_has_worktrees`; clients show the worktrees and require explicit `remove_worktree` operations. Dirty, unmerged, busy, missing-checkout, and clean records all block equally, so the state layer never needs to infer whether data is disposable. Per-worktree `force:true` remains the only destructive opt-in and stops bound runtimes first. Once no records remain, unregister may close streams/runtimes and workspace-scoped relays, but it never removes the workspace worktrees directory or unknown/orphan checkout directories. The retained `cleanupUnregisteredWorkspace` compatibility guard is inspection/audit-only and performs no git or filesystem mutation.
 - **Detached-runtime retention** (`integrated-runtimes.ts:735-760` sweep): Phase 1 does **not** delete worktrees when a runtime is swept — the checkout may hold uncommitted work; the sessionId→worktree binding persists so the session can be resumed later into the same worktree. Cleanup policy is Phase 3.
 - **`lastSessionIdByWorkspace`** (`state.ts:57`, consumed at `integrated-runtimes.ts:100-116`): unchanged. `target:"last"` may resolve to a worktree-bound session; the binding lookup in §5.1.5(1) makes that resume land in the worktree. This is by design (last means last).
-- **Push notifications / live activities:** keyed `{workspaceName, sessionId}` — no change needed.
+- **Push notifications:** keyed `{workspaceName, sessionId}` — no change needed.
 
 #### 5.1.7 Session-dir keying decision (normative)
 

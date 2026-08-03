@@ -9,16 +9,12 @@ const MAX_TOTAL_ARRAY_ENTRIES = 32;
 const MAX_TOTAL_KEYS = 80;
 const MAX_TOTAL_VALUES = 160;
 const MAX_GENERIC_STRING_LENGTH = 4096;
-const MAX_LIVE_ACTIVITY_FUTURE_SECONDS = 30 * 24 * 60 * 60;
-const MAX_LIVE_ACTIVITY_PAST_SECONDS = 24 * 60 * 60;
-const MAX_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES = 256;
 const MAX_NOTIFICATION_TITLE_UTF8_BYTES = 128;
 const MAX_NOTIFICATION_BODY_UTF8_BYTES = 512;
 const MAX_NOTIFICATION_WORKSPACE_UTF8_BYTES = 128;
 const MAX_NOTIFICATION_METADATA_UTF8_BYTES = 128;
 const MAX_NOTIFICATION_EVENT_ID_UTF8_BYTES = 512;
 const MAX_NOTIFICATION_KIND_UTF8_BYTES = 64;
-const MAX_CLOCK_SKEW_SECONDS = 5 * 60;
 const NOTIFICATION_UNSAFE_CHARACTER = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 const NOTIFICATION_PATH_SEPARATOR = /[/\\]/u;
 const NOTIFICATION_KINDS = new Set([
@@ -253,108 +249,6 @@ function parseNotification(body) {
 	};
 }
 
-function parseLiveActivityUpdate(body, nowEpochSeconds = Math.floor(Date.now() / 1000)) {
-	expectAllowedKeys(
-		body,
-		[
-			"pushTargetId",
-			"pushTargetAuthToken",
-			"activityId",
-			"activityPushToken",
-			"tokenEnvironment",
-			"eventId",
-			"kind",
-			"contentState",
-			"activityEvent",
-			"staleDateEpochSeconds",
-			"dismissalDateEpochSeconds",
-		],
-		"live_activity",
-	);
-	return {
-		activityEvent: expectOptionalLiteral(body.activityEvent, ["update", "end"], "activityEvent") || "update",
-		activityPushToken: expectString(body.activityPushToken, "activityPushToken", 16, 4096),
-		activityId: expectString(body.activityId, "activityId", 1, 128),
-		tokenEnvironment: expectOptionalLiteral(
-			body.tokenEnvironment,
-			["development", "production"],
-			"tokenEnvironment",
-		),
-		contentState: expectLiveActivityContentState(body.contentState, nowEpochSeconds),
-		dismissalDateEpochSeconds: expectOptionalEpochSeconds(
-			body.dismissalDateEpochSeconds,
-			"dismissalDateEpochSeconds",
-			nowEpochSeconds,
-		),
-		eventId: expectString(body.eventId, "eventId", 1, 128),
-		kind: expectString(body.kind, "kind", 1, 64),
-		pushTargetAuthToken: expectString(body.pushTargetAuthToken, "pushTargetAuthToken", 32, 128),
-		pushTargetId: expectString(body.pushTargetId, "pushTargetId", 16, 96),
-		staleDateEpochSeconds: expectOptionalEpochSeconds(
-			body.staleDateEpochSeconds,
-			"staleDateEpochSeconds",
-			nowEpochSeconds,
-		),
-	};
-}
-
-function expectLiveActivityContentState(value, nowEpochSeconds) {
-	if (!isRecord(value)) {
-		throw new RequestError(400, "contentState_must_be_object");
-	}
-	expectAllowedKeys(
-		value,
-		[
-			"operationKind",
-			"operationID",
-			"status",
-			"subject",
-			"sessionID",
-			"workspaceName",
-			"operationStartedAtEpochSeconds",
-			"updatedAtEpochSeconds",
-		],
-		"contentState",
-	);
-	const operationKind = expectOneOf(
-		value.operationKind,
-		["conversation", "planCreation", "review"],
-		"operationKind",
-	);
-	const subject = expectOptionalUTF8String(
-		value.subject,
-		"subject",
-		MAX_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
-	);
-	if (subject !== undefined && operationKind !== "planCreation") {
-		throw new RequestError(400, "subject_requires_plan_creation");
-	}
-	const operationStartedAtEpochSeconds = expectEpochSeconds(
-		value.operationStartedAtEpochSeconds,
-		"operationStartedAtEpochSeconds",
-	);
-	const updatedAtEpochSeconds = expectEpochSeconds(value.updatedAtEpochSeconds, "updatedAtEpochSeconds");
-	if (operationStartedAtEpochSeconds > updatedAtEpochSeconds) {
-		throw new RequestError(400, "operationStartedAtEpochSeconds_after_updatedAtEpochSeconds");
-	}
-	if (
-		updatedAtEpochSeconds < nowEpochSeconds - MAX_LIVE_ACTIVITY_PAST_SECONDS ||
-		updatedAtEpochSeconds > nowEpochSeconds + MAX_CLOCK_SKEW_SECONDS
-	) {
-		throw new RequestError(400, "updatedAtEpochSeconds_out_of_range");
-	}
-	return {
-		operationKind,
-		operationID: expectString(value.operationID, "operationID", 1, 128),
-		status: expectOneOf(value.status, ["running", "completed", "failed", "cancelled"], "status"),
-		...(subject === undefined ? {} : { subject }),
-		sessionID: expectString(value.sessionID, "sessionID", 1, 128),
-		workspaceName: expectString(value.workspaceName, "workspaceName", 1, 128),
-		operationStartedAtEpochSeconds,
-		updatedAtEpochSeconds,
-	};
-}
-
 function assertVerifiedAppCheck(verification, allowedAppIds) {
 	if (!isRecord(verification) || typeof verification.appId !== "string") {
 		throw new RequestError(401, "app_check_invalid");
@@ -486,13 +380,6 @@ function expectLiteral(value, expected, label) {
 	return expected;
 }
 
-function expectOneOf(value, expected, label) {
-	if (!expected.includes(value)) {
-		throw new RequestError(400, `${label}_must_be_${expected.join("_or_")}`);
-	}
-	return value;
-}
-
 function expectString(value, label, minimumLength, maximumLength) {
 	if (typeof value !== "string" || value.length < minimumLength || value.length > maximumLength) {
 		throw new RequestError(400, `${label}_has_invalid_length`);
@@ -548,43 +435,11 @@ function expectOptionalNotificationMetadata(value, label, maximumByteLength) {
 	return expectNotificationMetadata(value, label, maximumByteLength);
 }
 
-function expectOptionalUTF8String(value, label, maximumByteLength) {
-	if (value === undefined) return undefined;
-	if (typeof value !== "string" || /^[\s]*$/.test(value) || Buffer.byteLength(value, "utf8") > maximumByteLength) {
-		throw new RequestError(400, `${label}_has_invalid_utf8_length`);
-	}
-	return value;
-}
-
 function expectBoolean(value, label) {
 	if (typeof value !== "boolean") {
 		throw new RequestError(400, `${label}_must_be_boolean`);
 	}
 	return value;
-}
-
-function expectEpochSeconds(value, label) {
-	if (!Number.isSafeInteger(value) || value < 0) {
-		throw new RequestError(400, `${label}_must_be_non_negative_integer`);
-	}
-	return value;
-}
-
-function expectOptionalEpochSeconds(value, label, nowEpochSeconds) {
-	if (value === undefined) return undefined;
-	const parsed = expectEpochSeconds(value, label);
-	if (
-		parsed < nowEpochSeconds - MAX_CLOCK_SKEW_SECONDS ||
-		parsed > nowEpochSeconds + MAX_LIVE_ACTIVITY_FUTURE_SECONDS
-	) {
-		throw new RequestError(400, `${label}_out_of_range`);
-	}
-	return parsed;
-}
-
-function expectOptionalLiteral(value, expected, label) {
-	if (value === undefined) return undefined;
-	return expectOneOf(value, expected, label);
 }
 
 function expectStringRecord(value, label, options) {
@@ -628,7 +483,6 @@ module.exports = {
 	DEFAULT_ALLOWED_FIREBASE_APP_ID,
 	DEFAULT_PUBLIC_RELAY_URL,
 	DEFAULT_PUSH_TARGET_TTL_MS,
-	MAX_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
 	MAX_NOTIFICATION_BODY_UTF8_BYTES,
 	MAX_NOTIFICATION_EVENT_ID_UTF8_BYTES,
 	MAX_NOTIFICATION_METADATA_UTF8_BYTES,
@@ -646,7 +500,6 @@ module.exports = {
 	getPushTargetTtlMs,
 	hashToken,
 	isPushTargetExpired,
-	parseLiveActivityUpdate,
 	parseNotification,
 	parsePushTargetRegistration,
 	parsePushTargetRevocation,

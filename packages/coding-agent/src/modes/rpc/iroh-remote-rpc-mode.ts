@@ -1,8 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Buffer } from "node:buffer";
-import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@hansjm10/volt-agent-core";
-import type { AgentSessionEvent } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import { extractVisibleTextContent } from "../../core/messages.ts";
 import type { AgentMode, PlanPhase } from "../../core/planning.ts";
@@ -11,13 +9,10 @@ import {
 	createIrohRemoteOutboundFilteredRpcTransport,
 	createIrohRemoteProjectionSanitizer,
 	createIrohRemoteRpcErrorResponse,
-	type IrohRemoteLiveActivityContentState,
-	type IrohRemoteLiveActivityUpdateIntent,
 	type IrohRemoteOutboundValueDecorator,
 	type IrohRemotePushNotificationDelivery,
 	type IrohRemotePushNotificationIntent,
 	type IrohRemoteRpcGrant,
-	MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES,
 	sanitizeIrohRemoteOutbound,
 	sanitizeIrohRemoteTranscriptText,
 } from "../../core/remote/iroh/index.ts";
@@ -29,7 +24,6 @@ import {
 	sanitizeIrohRemoteNotificationWorkspace,
 	sanitizeIrohRemotePushNotificationIntent,
 } from "../../core/remote/iroh/push.ts";
-import type { ReviewWorkflowEvent } from "../../core/review.ts";
 import type { ReviewWorkflowResultRecord } from "../../core/review-workflows.ts";
 import { getRpcErrorResponseTarget } from "../../core/rpc/correlation.ts";
 import {
@@ -49,7 +43,7 @@ import type { RpcRegisterPushTargetResponse } from "./rpc-types.ts";
 
 export interface IrohRemoteRpcModeOptions extends IrohRpcTransportOptions {
 	rpcGrant: IrohRemoteRpcGrant;
-	/** Stable paired-client identity for Live Activity observer handoff across stream reattachment. */
+	/** Stable paired-client identity for notification reconciliation across stream reattachment. */
 	clientNodeId?: string;
 	/** Stop terminally fenced ingress while preserving already-admitted ordered output. */
 	isRpcIngressOpen?: () => boolean;
@@ -184,18 +178,7 @@ export function runIrohRemoteRpcMode(
 	runtimeHost: AgentSessionRuntime,
 	options: IrohRemoteRpcModeOptions,
 ): Promise<void> {
-	let detachLiveActivityUpdates: (() => void) | undefined;
 	let notificationDelivery: IrohRemoteNotificationDeliveryAttachment | undefined;
-	let transportClosed = false;
-	const attachLiveActivityUpdates = () => {
-		detachLiveActivityUpdates?.();
-		detachLiveActivityUpdates = attachIrohRemoteLiveActivityUpdates(
-			runtimeHost,
-			options.notificationDelivery,
-			options.workspaceName,
-			options.clientNodeId,
-		);
-	};
 	const irohTransport = createIrohRpcTransport(options);
 	const filteredOutboundTransport = createIrohRemoteOutboundFilteredRpcTransport({
 		decorate: options.decorateOutbound,
@@ -420,12 +403,7 @@ export function runIrohRemoteRpcMode(
 		allowUiActionInvocation: true,
 		disposeRuntimeOnClose: options.disposeRuntimeOnClose,
 		onReady: options.onReady,
-		onSessionChanged: async (session) => {
-			await options.onSessionChanged?.(session);
-			if (!transportClosed) {
-				attachLiveActivityUpdates();
-			}
-		},
+		onSessionChanged: options.onSessionChanged,
 		onClientCapabilitiesChanged: options.onClientCapabilitiesChanged,
 		onWorkflowEvent: options.onWorkflowEvent,
 		requireRemoteSafeUiActions: true,
@@ -453,12 +431,10 @@ export function runIrohRemoteRpcMode(
 			publishExternal: (event) => runtimeHost.publishConversationProjectionEvent(event),
 		},
 	}).finally(() => {
-		transportClosed = true;
 		notificationDelivery?.detach();
 		detachSessionWillProject?.();
 		detachRawCloseRetirement();
 		retireConversation();
-		detachLiveActivityUpdates?.();
 		resolveModeSettled();
 	});
 }
@@ -732,377 +708,6 @@ function decorateIrohRemoteToolExecutionEnd(value: object, options: IrohRemoteTr
 	}
 	const outputFields = sanitizeIrohRemoteToolOutputFields(extractVisibleTextContent(result.content), options);
 	return Object.keys(outputFields).length > 0 ? { ...value, ...outputFields } : value;
-}
-
-type IrohRemoteLiveActivityAttachmentKey = string | IrohRemotePushNotificationDelivery;
-
-interface IrohRemoteLiveActivityAttachment {
-	dispose(): void;
-	retire(): void;
-}
-
-const liveActivityAttachmentsByRuntime = new WeakMap<
-	AgentSessionRuntime,
-	Map<IrohRemoteLiveActivityAttachmentKey, IrohRemoteLiveActivityAttachment>
->();
-
-function attachIrohRemoteLiveActivityUpdates(
-	runtimeHost: AgentSessionRuntime,
-	delivery: IrohRemotePushNotificationDelivery | undefined,
-	workspaceName: string | undefined,
-	clientNodeId: string | undefined,
-): () => void {
-	if (!delivery?.deliverLiveActivityUpdate) {
-		return () => {};
-	}
-	const attachmentKey = clientNodeId ?? delivery;
-	let attachments = liveActivityAttachmentsByRuntime.get(runtimeHost);
-	if (!attachments) {
-		attachments = new Map();
-		liveActivityAttachmentsByRuntime.set(runtimeHost, attachments);
-	}
-	const updater = new IrohRemoteLiveActivityUpdater(runtimeHost, delivery, workspaceName);
-	const unsubscribeSession = runtimeHost.session.subscribe(
-		(event) => {
-			void updater.handleSessionEvent(event).catch(() => {});
-		},
-		{ monitorGitContext: false },
-	);
-	const unsubscribeReviews =
-		runtimeHost.reviewWorkflows?.attachSink((event) => {
-			if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
-				return;
-			}
-			void updater.handleReviewEvent(event).catch(() => {});
-		}) ?? (() => {});
-	let disposed = false;
-	let retirementStarted = false;
-	let attachment: IrohRemoteLiveActivityAttachment;
-	const dispose = () => {
-		if (disposed) {
-			return;
-		}
-		disposed = true;
-		updater.stop();
-		unsubscribeSession();
-		unsubscribeReviews();
-		if (attachments.get(attachmentKey) === attachment) {
-			attachments.delete(attachmentKey);
-			if (attachments.size === 0) {
-				liveActivityAttachmentsByRuntime.delete(runtimeHost);
-			}
-		}
-	};
-	const retire = () => {
-		if (disposed || retirementStarted) {
-			return;
-		}
-		retirementStarted = true;
-		const reviewWorkflows = runtimeHost.reviewWorkflows;
-		if (!reviewWorkflows?.hasActiveWorkflows) {
-			dispose();
-			return;
-		}
-		void (async () => {
-			do {
-				await reviewWorkflows.waitForIdle();
-				await updater.waitForIdle();
-			} while (reviewWorkflows.hasActiveWorkflows);
-		})().then(dispose, dispose);
-	};
-	attachment = { dispose, retire };
-	const previousAttachment = attachments.get(attachmentKey);
-	attachments.set(attachmentKey, attachment);
-	previousAttachment?.dispose();
-	updater.start();
-	return retire;
-}
-
-interface IrohRemoteLiveActivityOperation {
-	kind: IrohRemoteLiveActivityContentState["operationKind"];
-	id: string;
-	subject?: string;
-	startedAtEpochSeconds: number;
-}
-
-class IrohRemoteLiveActivityUpdater {
-	private readonly delivery: Required<Pick<IrohRemotePushNotificationDelivery, "deliverLiveActivityUpdate">>;
-	private readonly runtimeHost: AgentSessionRuntime;
-	private readonly workspaceName: string | undefined;
-	private readonly instanceId = randomUUID();
-	private deliveryQueue: Promise<void> = Promise.resolve();
-	private eventQueue: Promise<void> = Promise.resolve();
-	private currentState: IrohRemoteLiveActivityContentState | undefined;
-	private ordinaryOperation: IrohRemoteLiveActivityOperation | undefined;
-	private sequence = 0;
-	private ordinaryActive = false;
-	private stopped = false;
-	private pendingOrdinaryTerminalStatus: IrohRemoteLiveActivityContentState["status"] | undefined;
-
-	constructor(
-		runtimeHost: AgentSessionRuntime,
-		delivery: IrohRemotePushNotificationDelivery,
-		workspaceName: string | undefined,
-	) {
-		if (!delivery.deliverLiveActivityUpdate) {
-			throw new Error("live activity delivery is unavailable");
-		}
-		this.runtimeHost = runtimeHost;
-		this.delivery = { deliverLiveActivityUpdate: delivery.deliverLiveActivityUpdate.bind(delivery) };
-		this.workspaceName = workspaceName;
-	}
-
-	start(): void {
-		void this.enqueueEvent(async () => {
-			const session = this.runtimeHost.session;
-			this.ordinaryActive = session.isBusy || session.isStreaming;
-			if (this.ordinaryActive) {
-				this.refreshOrdinaryOperation();
-			}
-			await this.projectRunningOperation();
-		}).catch(() => {});
-	}
-
-	stop(): void {
-		this.stopped = true;
-	}
-
-	waitForIdle(): Promise<void> {
-		return this.eventQueue;
-	}
-
-	handleSessionEvent(event: AgentSessionEvent): Promise<void> {
-		return this.enqueueEvent(async () => {
-			switch (event.type) {
-				case "agent_start":
-					if (!this.ordinaryActive) {
-						this.ordinaryOperation = undefined;
-					}
-					this.ordinaryActive = true;
-					this.pendingOrdinaryTerminalStatus = undefined;
-					this.refreshOrdinaryOperation();
-					await this.projectRunningOperation();
-					break;
-				case "planning_state_changed":
-					if (!this.ordinaryActive) {
-						return;
-					}
-					this.refreshOrdinaryOperation();
-					await this.projectRunningOperation();
-					break;
-				case "agent_end":
-					if (!this.ordinaryActive) {
-						return;
-					}
-					this.pendingOrdinaryTerminalStatus = liveActivityStatusForRunOutcome(
-						getRunTerminalOutcome(event.messages),
-					);
-					break;
-				case "agent_settled": {
-					if (!this.ordinaryActive || this.pendingOrdinaryTerminalStatus === undefined) {
-						return;
-					}
-					const operation = this.ordinaryOperation;
-					const status = this.pendingOrdinaryTerminalStatus;
-					this.ordinaryActive = false;
-					this.ordinaryOperation = undefined;
-					this.pendingOrdinaryTerminalStatus = undefined;
-					if (await this.projectRunningOperation()) {
-						return;
-					}
-					if (operation) {
-						await this.projectOperation(operation, status);
-					}
-					break;
-				}
-				default:
-					break;
-			}
-		});
-	}
-
-	handleReviewEvent(event: ReviewWorkflowEvent): Promise<void> {
-		return this.enqueueEvent(async () => {
-			if (event.type !== "workflow_end") {
-				await this.projectRunningOperation();
-				return;
-			}
-			if (await this.projectRunningOperation()) {
-				return;
-			}
-			const operation = this.resolveReviewOperation(event.workflowId);
-			if (operation) {
-				await this.projectOperation(operation, event.status);
-			}
-		});
-	}
-
-	private enqueueEvent(operation: () => Promise<void>): Promise<void> {
-		const queued = this.eventQueue.then(async () => {
-			if (!this.stopped) {
-				await operation();
-			}
-		});
-		this.eventQueue = queued.catch(() => {});
-		return queued;
-	}
-
-	private refreshOrdinaryOperation(): void {
-		const sessionID = nonEmptyLiveActivityString(this.runtimeHost.session.sessionId);
-		const workspaceName = nonEmptyLiveActivityString(this.workspaceName);
-		if (!sessionID || !workspaceName) {
-			this.ordinaryOperation = undefined;
-			return;
-		}
-		const planning = this.runtimeHost.session.getPlanningState?.() ?? { mode: "build" as const, plan: null };
-		const kind = planning.mode === "plan" ? "planCreation" : "conversation";
-		const previous = this.ordinaryOperation;
-		this.ordinaryOperation = {
-			kind,
-			id: sessionID,
-			...(kind === "planCreation" && planning.plan?.title
-				? { subject: boundLiveActivitySubject(planning.plan.title) }
-				: {}),
-			startedAtEpochSeconds:
-				previous?.kind === kind && previous.id === sessionID
-					? previous.startedAtEpochSeconds
-					: Math.floor(Date.now() / 1000),
-		};
-	}
-
-	private resolveReviewOperation(workflowId?: string): IrohRemoteLiveActivityOperation | undefined {
-		const reviewWorkflows = this.runtimeHost.reviewWorkflows;
-		if (!reviewWorkflows) {
-			return undefined;
-		}
-		const descriptor =
-			workflowId === undefined
-				? reviewWorkflows
-						.list()
-						.filter((review) => review.status === "running")
-						.at(-1)
-				: reviewWorkflows.get(workflowId);
-		if (!descriptor || (descriptor.status === "running" && descriptor.workflowId.trim().length === 0)) {
-			return undefined;
-		}
-		const id = nonEmptyLiveActivityString(descriptor.workflowId);
-		return id
-			? {
-					kind: "review",
-					id,
-					startedAtEpochSeconds: Math.max(0, Math.floor(descriptor.startedAt / 1000)),
-				}
-			: undefined;
-	}
-
-	private async projectRunningOperation(): Promise<boolean> {
-		const review = this.resolveReviewOperation();
-		if (review) {
-			await this.projectOperation(review, "running");
-			return true;
-		}
-		if (!this.ordinaryActive) {
-			return false;
-		}
-		this.refreshOrdinaryOperation();
-		if (!this.ordinaryOperation) {
-			return false;
-		}
-		await this.projectOperation(this.ordinaryOperation, "running");
-		return true;
-	}
-
-	private async projectOperation(
-		operation: IrohRemoteLiveActivityOperation,
-		status: IrohRemoteLiveActivityContentState["status"],
-	): Promise<void> {
-		const sessionID = nonEmptyLiveActivityString(this.runtimeHost.session.sessionId);
-		const workspaceName = nonEmptyLiveActivityString(this.workspaceName);
-		if (!sessionID || !workspaceName) {
-			return;
-		}
-		const nowSeconds = Math.floor(Date.now() / 1000);
-		const operationStartedAtEpochSeconds =
-			this.currentState?.operationKind === operation.kind &&
-			this.currentState.operationID === operation.id &&
-			(status !== "running" || this.currentState.status === "running")
-				? this.currentState.operationStartedAtEpochSeconds
-				: operation.startedAtEpochSeconds;
-		const updatedAtEpochSeconds = Math.max(nowSeconds, operationStartedAtEpochSeconds);
-		const contentState: IrohRemoteLiveActivityContentState = {
-			operationKind: operation.kind,
-			operationID: operation.id,
-			status,
-			...(operation.subject === undefined ? {} : { subject: operation.subject }),
-			sessionID,
-			workspaceName,
-			operationStartedAtEpochSeconds,
-			updatedAtEpochSeconds,
-		};
-		if (hasSameLiveActivitySemantics(this.currentState, contentState)) {
-			return;
-		}
-		this.currentState = contentState;
-		const update: IrohRemoteLiveActivityUpdateIntent = {
-			eventId: `live-activity:${this.instanceId}:${++this.sequence}`,
-			kind: "live_activity_update",
-			activityEvent: "update",
-			contentState,
-			staleDateEpochSeconds: updatedAtEpochSeconds + 90,
-		};
-		const delivery = this.deliveryQueue.then(() => this.delivery.deliverLiveActivityUpdate(update));
-		this.deliveryQueue = delivery.then(
-			() => {},
-			() => {},
-		);
-		await delivery;
-	}
-}
-
-function nonEmptyLiveActivityString(value: string | undefined): string | undefined {
-	const trimmed = value?.trim();
-	return trimmed ? value : undefined;
-}
-
-function boundLiveActivitySubject(value: string): string | undefined {
-	const trimmed = value.trim();
-	if (!trimmed) {
-		return undefined;
-	}
-	let bounded = "";
-	for (const character of trimmed) {
-		if (
-			Buffer.byteLength(bounded, "utf8") + Buffer.byteLength(character, "utf8") >
-			MAX_IROH_REMOTE_LIVE_ACTIVITY_SUBJECT_UTF8_BYTES
-		) {
-			break;
-		}
-		bounded += character;
-	}
-	return bounded || undefined;
-}
-
-function hasSameLiveActivitySemantics(
-	current: IrohRemoteLiveActivityContentState | undefined,
-	next: IrohRemoteLiveActivityContentState,
-): boolean {
-	return (
-		current?.operationKind === next.operationKind &&
-		current.operationID === next.operationID &&
-		current.status === next.status &&
-		current.subject === next.subject &&
-		current.sessionID === next.sessionID &&
-		current.workspaceName === next.workspaceName
-	);
-}
-
-function liveActivityStatusForRunOutcome(
-	outcome: IrohRemoteRunTerminalOutcome,
-): IrohRemoteLiveActivityContentState["status"] {
-	if (outcome === "aborted") {
-		return "cancelled";
-	}
-	return outcome;
 }
 
 export function createIrohRemoteHostCommandRpcTransport(

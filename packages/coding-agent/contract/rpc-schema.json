@@ -75,14 +75,11 @@
 		"remoteErrorStrings": [
 			"invalid_cursor",
 			"invalid_limit",
-			"invalid_live_activity_registration",
-			"invalid_live_activity_token",
 			"invalid_request",
 			"invalid_workspace_payload",
 			"session_mismatch",
 			"unexpected_session_id",
 			"unknown_entry",
-			"unknown_live_activity_token",
 			"unsupported_on_workspace_discovery_stream",
 			"unsupported_on_workspace_management_stream",
 			"unsupported_remote_command"
@@ -652,12 +649,6 @@
 					"$ref": "#/$defs/RpcCommand.register_push_target"
 				},
 				{
-					"$ref": "#/$defs/RpcCommand.register_live_activity"
-				},
-				{
-					"$ref": "#/$defs/RpcCommand.unregister_live_activity"
-				},
-				{
 					"$ref": "#/$defs/RpcCommand.unregister_workspace"
 				},
 				{
@@ -917,12 +908,6 @@
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.register_push_target"
-				},
-				{
-					"$ref": "#/$defs/RpcCommand.register_live_activity"
-				},
-				{
-					"$ref": "#/$defs/RpcCommand.unregister_live_activity"
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.unregister_workspace"
@@ -2456,49 +2441,6 @@
 			},
 			"additionalProperties": false
 		},
-		"RpcCommand.register_live_activity": {
-			"type": "object",
-			"required": [
-				"type",
-				"workspaceName",
-				"sessionId",
-				"activityId",
-				"tokenHash",
-				"tokenEnvironment",
-				"platform"
-			],
-			"properties": {
-				"id": {
-					"type": "string"
-				},
-				"type": {
-					"type": "string",
-					"const": "register_live_activity"
-				},
-				"conversationAuthority": {
-					"$ref": "#/$defs/RpcConversationAuthority"
-				},
-				"workspaceName": {
-					"type": "string"
-				},
-				"sessionId": {
-					"type": "string"
-				},
-				"activityId": {
-					"type": "string"
-				},
-				"tokenHash": {
-					"type": "string"
-				},
-				"tokenEnvironment": {
-					"$ref": "#/$defs/RpcPushTokenEnvironment"
-				},
-				"platform": {
-					"$ref": "#/$defs/RpcPushPlatform"
-				}
-			},
-			"additionalProperties": false
-		},
 		"RpcCommand.register_push_target": {
 			"type": "object",
 			"required": [
@@ -3086,37 +3028,6 @@
 					"$ref": "#/$defs/RpcConversationAuthority"
 				},
 				"sessionId": {
-					"type": "string"
-				}
-			},
-			"additionalProperties": false
-		},
-		"RpcCommand.unregister_live_activity": {
-			"type": "object",
-			"required": [
-				"type",
-				"workspaceName",
-				"sessionId",
-				"activityId"
-			],
-			"properties": {
-				"id": {
-					"type": "string"
-				},
-				"type": {
-					"type": "string",
-					"const": "unregister_live_activity"
-				},
-				"conversationAuthority": {
-					"$ref": "#/$defs/RpcConversationAuthority"
-				},
-				"workspaceName": {
-					"type": "string"
-				},
-				"sessionId": {
-					"type": "string"
-				},
-				"activityId": {
 					"type": "string"
 				}
 			},
@@ -4554,28 +4465,6 @@
 					"items": {
 						"$ref": "#/$defs/RpcSubagentDefinition"
 					}
-				}
-			},
-			"additionalProperties": false
-		},
-		"RpcLiveActivityRegistration": {
-			"type": "object",
-			"required": [
-				"activityId",
-				"pushToken"
-			],
-			"properties": {
-				"activityId": {
-					"type": "string"
-				},
-				"pushToken": {
-					"type": "string"
-				},
-				"tokenHash": {
-					"type": "string"
-				},
-				"tokenEnvironment": {
-					"$ref": "#/$defs/RpcPushTokenEnvironment"
 				}
 			},
 			"additionalProperties": false
@@ -6071,13 +5960,6 @@
 				"fcm"
 			]
 		},
-		"RpcPushTokenEnvironment": {
-			"type": "string",
-			"enum": [
-				"development",
-				"production"
-			]
-		},
 		"RpcQueueMode": {
 			"type": "string",
 			"enum": [
@@ -6146,23 +6028,6 @@
 			},
 			"additionalProperties": false
 		},
-		"RpcRegisterLiveActivityResponse": {
-			"type": "object",
-			"required": [
-				"status",
-				"activityId"
-			],
-			"properties": {
-				"status": {
-					"type": "string",
-					"const": "registered"
-				},
-				"activityId": {
-					"type": "string"
-				}
-			},
-			"additionalProperties": false
-		},
 		"RpcRegisterPushTargetArgs": {
 			"type": "object",
 			"required": [
@@ -6190,9 +6055,6 @@
 				},
 				"tokenHash": {
 					"type": "string"
-				},
-				"liveActivity": {
-					"$ref": "#/$defs/RpcLiveActivityRegistration"
 				},
 				"enabled": {
 					"type": "boolean"
@@ -6282,12 +6144,6 @@
 				},
 				{
 					"$ref": "#/$defs/RpcResponse.register_push_target"
-				},
-				{
-					"$ref": "#/$defs/RpcResponse.register_live_activity"
-				},
-				{
-					"$ref": "#/$defs/RpcResponse.unregister_live_activity"
 				},
 				{
 					"$ref": "#/$defs/RpcResponse.unregister_workspace"
@@ -8364,36 +8220,6 @@
 			},
 			"additionalProperties": false
 		},
-		"RpcResponse.register_live_activity": {
-			"type": "object",
-			"required": [
-				"type",
-				"command",
-				"success",
-				"data"
-			],
-			"properties": {
-				"id": {
-					"type": "string"
-				},
-				"type": {
-					"type": "string",
-					"const": "response"
-				},
-				"command": {
-					"type": "string",
-					"const": "register_live_activity"
-				},
-				"success": {
-					"type": "boolean",
-					"const": true
-				},
-				"data": {
-					"$ref": "#/$defs/RpcRegisterLiveActivityResponse"
-				}
-			},
-			"additionalProperties": false
-		},
 		"RpcResponse.register_push_target": {
 			"type": "object",
 			"required": [
@@ -9107,36 +8933,6 @@
 						}
 					},
 					"additionalProperties": false
-				}
-			},
-			"additionalProperties": false
-		},
-		"RpcResponse.unregister_live_activity": {
-			"type": "object",
-			"required": [
-				"type",
-				"command",
-				"success",
-				"data"
-			],
-			"properties": {
-				"id": {
-					"type": "string"
-				},
-				"type": {
-					"type": "string",
-					"const": "response"
-				},
-				"command": {
-					"type": "string",
-					"const": "unregister_live_activity"
-				},
-				"success": {
-					"type": "boolean",
-					"const": true
-				},
-				"data": {
-					"$ref": "#/$defs/RpcUnregisterLiveActivityResponse"
 				}
 			},
 			"additionalProperties": false
@@ -10659,23 +10455,6 @@
 				},
 				"delivery": {
 					"$ref": "#/$defs/RpcConversationDeliveryPosition"
-				}
-			},
-			"additionalProperties": false
-		},
-		"RpcUnregisterLiveActivityResponse": {
-			"type": "object",
-			"required": [
-				"status",
-				"activityId"
-			],
-			"properties": {
-				"status": {
-					"type": "string",
-					"const": "unregistered"
-				},
-				"activityId": {
-					"type": "string"
 				}
 			},
 			"additionalProperties": false
