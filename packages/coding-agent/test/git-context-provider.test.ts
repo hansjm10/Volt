@@ -71,9 +71,9 @@ switch (mode) {
 		process.stdout.write("a".repeat(2_048));
 		break;
 	case "delayed-counted-status":
-		appendFileSync(countFile, "call\\n");
 		await delay(50);
-		process.stdout.write(${JSON.stringify(`# branch.oid ${SHA1}\0# branch.head main\0`)});
+		await new Promise((resolve) => process.stdout.write(${JSON.stringify(`# branch.oid ${SHA1}\0# branch.head main\0`)}, resolve));
+		appendFileSync(countFile, "call\\n");
 		break;
 }
 `,
@@ -398,14 +398,9 @@ describe("GitContextProvider", () => {
 		expect((provider as unknown as { watchers: unknown[] }).watchers.length).toBeGreaterThan(0);
 		await Promise.all([provider.refresh(), provider.refresh(), provider.refresh()]);
 		expect(gitCallCount(countFile)).toBe(2);
-		await waitFor(() => {
-			try {
-				return Number(gitCallCount(countFile)) >= 3;
-			} catch {
-				return false;
-			}
-		});
+		await waitFor(() => gitCallCount(countFile) >= 3);
 		unsubscribe();
+		await waitFor(() => (provider as unknown as { children: Set<unknown> }).children.size === 0);
 		provider.dispose();
 		expect((provider as unknown as { pollTimer: unknown; watchers: unknown[] }).watchers).toEqual([]);
 		expect((provider as unknown as { pollTimer: unknown }).pollTimer).toBeNull();

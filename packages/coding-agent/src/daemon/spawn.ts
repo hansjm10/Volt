@@ -8,7 +8,7 @@ import { type DaemonPaths, ensureDaemonDirs, getDaemonPaths } from "./paths.ts";
 import { verifyPidfileProcess } from "./process-identity.ts";
 import { type InvalidVoltdStateFile, inspectVoltdStateFiles } from "./state.ts";
 
-const SPAWN_HEALTH_TIMEOUT_MS = 5000;
+const SPAWN_HEALTH_TIMEOUT_MS = process.platform === "win32" ? 15_000 : 5_000;
 const SPAWN_HEALTH_POLL_MS = 100;
 export const DAEMON_SHUTDOWN_TIMEOUT_MS = 75_000;
 const DAEMON_EXIT_POLL_MS = 200;
