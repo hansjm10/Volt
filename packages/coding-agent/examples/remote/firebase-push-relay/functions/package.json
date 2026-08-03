@@ -9,7 +9,7 @@
 	},
 	"scripts": {
 		"check": "node --check index.js && node --check registration.js",
-		"test": "node --test core.test.js registration.test.js"
+		"test": "node --test core.test.js index.test.js registration.test.js"
 	},
 	"dependencies": {
 		"firebase-admin": "13.10.0",
