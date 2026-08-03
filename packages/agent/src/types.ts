@@ -120,17 +120,23 @@ export interface AgentLoopCompletedTurn {
 
 /** One stable delivery whose messages enter context together before a request. */
 export interface AgentLoopDelivery {
-	/** Runtime identity propagated on the delivery's commit message events. */
+	/** Runtime identity propagated on the delivery lifecycle and message events. */
 	deliveryId?: string;
 	/** Ordered messages contributed by this delivery. */
 	messages: AgentMessage[];
-	/** Message index that commits the delivery. Defaults to zero. */
-	commitMessageIndex?: number;
 }
+
+/** Authority that keeps a request valid when no attached delivery is admitted. */
+export type AgentLoopRequestReason = "delivery" | "continuation";
 
 /** The dispatcher's explicit decision at a request boundary. */
 export type AgentLoopNextAction =
-	| { type: "request"; deliveries?: AgentLoopDelivery[] }
+	| {
+			type: "request";
+			/** Delivery-dependent requests stop when every attached delivery is revoked. */
+			reason: AgentLoopRequestReason;
+			deliveries?: AgentLoopDelivery[];
+	  }
 	| {
 			type: "pause";
 			/** Tool continuation intent to retain when a higher-level dispatcher resumes. */
@@ -241,11 +247,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	nextAction?: (context: AgentLoopNextActionContext) => AgentLoopNextAction | Promise<AgentLoopNextAction>;
 
 	/**
-	 * Atomically begin one resolved delivery immediately before its message events.
+	 * Atomically begin one resolved delivery immediately before its delivery event.
 	 *
 	 * Return false when a leased delivery was revoked after `nextAction` resolved.
 	 * This hook is synchronous so queue ownership cannot change between admission
-	 * and the first delivery event.
+	 * and the delivery-level commit event.
 	 */
 	beginDelivery?: (delivery: AgentLoopDelivery) => boolean;
 
@@ -443,6 +449,8 @@ export type AgentEvent =
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+	// Delivery lifecycle - ownership is irrevocable before this event is emitted
+	| { type: "delivery_start"; deliveryId?: string; messages: AgentMessage[] }
 	// Message lifecycle - emitted for user, assistant, and toolResult messages
 	| { type: "message_start"; message: AgentMessage; deliveryId?: string }
 	// Only emitted for assistant messages during streaming

@@ -651,7 +651,7 @@ describe("agentLoop with AgentMessage", () => {
 			nextAction: async (actionContext) => {
 				if (actionContext.completedTurn && executed.length >= 1 && !queuedDelivered) {
 					queuedDelivered = true;
-					return { type: "request", deliveries: [{ messages: [queuedUserMessage] }] };
+					return { type: "request", reason: "delivery", deliveries: [{ messages: [queuedUserMessage] }] };
 				}
 				return actionContext.defaultAction;
 			},
@@ -1051,7 +1051,7 @@ describe("agentLoop with AgentMessage", () => {
 			nextAction: async (actionContext) => {
 				if (actionContext.completedTurn && !delivered) {
 					delivered = true;
-					return { type: "request", deliveries: [{ messages: [queuedMessage] }] };
+					return { type: "request", reason: "delivery", deliveries: [{ messages: [queuedMessage] }] };
 				}
 				return actionContext.defaultAction;
 			},
@@ -1175,6 +1175,7 @@ describe("agentLoop with AgentMessage", () => {
 		expect(events.map((event) => event.type)).toEqual([
 			"agent_start",
 			"turn_start",
+			"delivery_start",
 			"message_start",
 			"message_end",
 			"message_start",
@@ -1227,6 +1228,83 @@ describe("agentLoop with AgentMessage", () => {
 		expect(actionCalls).toBe(1);
 		expect(providerCalls).toBe(1);
 		expect(events.at(-1)?.type).toBe("agent_end");
+	});
+
+	it("skips request preparation and provider invocation when a delivery-dependent request is fully revoked", async () => {
+		let requestPreparations = 0;
+		let providerCalls = 0;
+		const events: AgentEvent[] = [];
+		await runAgentLoop(
+			[createUserMessage("revoked")],
+			{ systemPrompt: "", messages: [] },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				beginDelivery: () => false,
+				prepareRequest: () => {
+					requestPreparations++;
+					return undefined;
+				},
+			},
+			async (event) => {
+				events.push(event);
+			},
+			undefined,
+			() => {
+				providerCalls++;
+				throw new Error("provider must not run");
+			},
+		);
+
+		expect(requestPreparations).toBe(0);
+		expect(providerCalls).toBe(0);
+		expect(events.map((event) => event.type)).toEqual(["agent_start", "turn_start", "agent_end"]);
+	});
+
+	it("keeps an independent continuation request valid when every attached delivery is revoked", async () => {
+		let actions = 0;
+		let requestPreparations = 0;
+		let providerCalls = 0;
+		const stream = agentLoopContinue(
+			{ systemPrompt: "", messages: [createUserMessage("existing")] },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				nextAction: () =>
+					actions++ === 0
+						? {
+								type: "request",
+								reason: "continuation",
+								deliveries: [{ deliveryId: "revoked", messages: [createUserMessage("ignored")] }],
+							}
+						: { type: "stop" },
+				beginDelivery: () => false,
+				prepareRequest: () => {
+					requestPreparations++;
+					return undefined;
+				},
+			},
+			undefined,
+			() => {
+				providerCalls++;
+				const response = new MockAssistantStream();
+				queueMicrotask(() => {
+					response.push({
+						type: "done",
+						seq: 1,
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "continued" }]),
+					});
+				});
+				return response;
+			},
+		);
+		for await (const _event of stream) {
+			// consume
+		}
+
+		expect(requestPreparations).toBe(1);
+		expect(providerCalls).toBe(1);
 	});
 
 	it("resolves the terminal action after turn_end without preparing another request", async () => {

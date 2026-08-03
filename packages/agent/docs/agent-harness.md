@@ -135,7 +135,7 @@ Queue modes are live, not turn-snapshotted:
 - `getSteeringMode()` / `setSteeringMode()`
 - `getFollowUpMode()` / `setFollowUpMode()`
 
-Changing a queue mode during a run affects the next queue drain. Queue drains happen only while the harness owns the low-level `nextAction` decision. Steering is selected before a pending tool continuation; follow-ups are selected only when neither steering nor a tool continuation remains.
+Changing a queue mode during a run affects the next delivery lease. Selection happens only while the harness owns the low-level `nextAction` decision. Steering is selected before a pending tool continuation; follow-ups are selected only when neither steering nor a tool continuation remains.
 
 ### Dispatcher actions and request preparation
 
@@ -145,9 +145,9 @@ The harness implements the low-level action protocol rather than polling queues 
 - `stop` ends the harness run when no work remains
 - the low-level `pause` action is available to higher orchestration layers that must preserve continuation intent without issuing another provider request
 
-The low-level loop asks for one action before its first request and once after every successful `turn_end`. It emits and persists selected user messages before calling the harness request-preparation hook. That hook flushes pending writes and, after the first request, creates and applies the next turn snapshot. A terminal action does not create a snapshot for a nonexistent provider request.
+The low-level loop asks for one action before its first request and once after every successful `turn_end`. Queue-backed requests lease selected entries without removing them. Synchronous begin transfers ownership, then `delivery_start` triggers the authoritative queue update before delivery message persistence. The request-preparation hook subsequently flushes pending writes and, after the first request, creates and applies the next turn snapshot. A request whose every delivery was revoked does not prepare a snapshot or call the provider; a terminal action likewise creates no snapshot.
 
-Queue drain notification is transactional: if notification fails, drained messages are restored ahead of messages added concurrently. Error and abort outcomes are terminal and do not poll the queues again.
+Once `delivery_start` occurs, notification failure cannot restore or revoke that begun delivery. Error and abort outcomes are terminal, return only entries still revocable from the shared inbox, and do not poll the queues again.
 
 ## Save points
 
@@ -210,7 +210,7 @@ Agent-emitted messages are persisted on `message_end` to preserve transcript ord
 
 ## Abort
 
-Abort is allowed during a turn. It aborts the low-level run and clears steering/follow-up queues.
+Abort is allowed during a turn. It aborts the low-level run and clears steering/follow-up entries whose begin boundary has not crossed. Its result reports the exact messages actually revoked; begun deliveries remain authoritative.
 
 Abort does not clear `nextTurn` messages. Messages queued with `nextTurn()` survive abort and are inserted before the user message on the next user-initiated turn.
 
@@ -316,7 +316,7 @@ Done:
 - Structural compaction/tree operations restore phase with `finally`.
 - Public harness failures normalize subsystem causes to `AgentHarnessError`.
 - Pending session writes flush one-by-one and are not dropped on failure.
-- Queue drains roll back if queue-update notification fails.
+- Queue updates occur after synchronous delivery begin; begun deliveries never roll back.
 - `message_end` persistence happens before subscriber notification.
 - `abort()` signals cancellation before notifications and still waits for idle through notification errors.
 - Idle model/thinking/tool updates validate and persist before committing in-memory state.
@@ -432,8 +432,8 @@ Status: Done
 Done:
 
 - `AgentHarness` calls `runAgentLoop()` directly.
-- Harness owns run lifecycle, abort controller, action-based queue draining, request-only provider snapshot preparation, provider stream config, event reduction, session persistence, pending write flushing, and save-point synchronization.
-- Harness tests cover prompt construction, queue draining, abort behavior, save-point refresh, pending write ordering, awaited listener settlement, tool hooks, and provider stream wrapping.
+- Harness owns run lifecycle, abort controller, leased delivery selection, request-only provider snapshot preparation, provider stream config, event reduction, session persistence, pending write flushing, and save-point synchronization.
+- Harness tests cover prompt construction, delivery leasing, abort behavior, save-point refresh, pending write ordering, awaited listener settlement, tool hooks, and provider stream wrapping.
 
 Remaining:
 

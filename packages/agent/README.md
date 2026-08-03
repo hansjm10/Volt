@@ -136,11 +136,11 @@ const stream = agentLoop([userMessage], context, {
 });
 ```
 
-`nextAction` resolves once before the first request and once after every successful `turn_end`. It returns `request`, `pause`, or `stop`. A `request` can carry deliveries; their message events are finalized before `prepareRequest` runs. `pause` ends the current loop while preserving whether tool results still require a provider continuation. `stop` ends without preserving continuation intent. The loop checks its abort signal before resolving each action and does not resolve another action after an error or observed abort.
+`nextAction` resolves once before the first request and once after every successful `turn_end`. It returns `request`, `pause`, or `stop`. Every `request` declares its authority: `reason: "delivery"` requires at least one attached delivery to be admitted, while `reason: "continuation"` remains valid independently (for example, after tool results). A delivery-dependent request whose deliveries are all rejected stops without running `prepareRequest` or calling the provider. `pause` preserves pending tool-continuation intent; `stop` ends terminally. The loop checks its abort signal before resolving each action and does not resolve another action after an error or observed abort.
 
-Low-level integrations with revocable external queues should lease entries in `nextAction` instead of destructively draining them. Configure synchronous `beginDelivery` to atomically move each still-live lease into emission; returning `false` skips an entry revoked after action resolution. Only admitted, finalized deliveries are passed to `prepareRequest`.
+Low-level integrations with revocable external queues should lease entries in `nextAction` instead of destructively draining them. Configure synchronous `beginDelivery` to atomically transfer each still-live lease immediately before its `delivery_start` event; returning `false` skips an entry revoked after action resolution. Ownership is irrevocable when `delivery_start` is emitted. Only admitted deliveries are finalized into context and passed to `prepareRequest`.
 
-`prepareRequest` runs immediately before each provider request, after delivered messages are in context. It never runs for a terminal `pause` or `stop`. Terminal `nextAction` work settles before `agent_end` is emitted.
+`prepareRequest` runs immediately before each authorized provider request, after admitted delivery messages are in context. It never runs for a rejected delivery-dependent request or a terminal `pause`/`stop`. Terminal `nextAction` work settles before `agent_end` is emitted.
 
 When you use the `Agent` class, assistant `message_end` processing is treated as a barrier before tool preflight begins. That means `beforeToolCall` sees agent state that already includes the assistant message that requested the tool call.
 
@@ -163,6 +163,7 @@ A provider-ready transcript normally ends in `user` or `toolResult`. An assistan
 | `agent_end` | Final event for the run. Awaited subscribers for this event still count toward settlement |
 | `turn_start` | New turn begins (one LLM call + tool executions) |
 | `turn_end` | Turn completes with assistant message and tool results |
+| `delivery_start` | Delivery ownership is irrevocable; includes its runtime ID and staged messages |
 | `message_start` | Any message begins (user, assistant, toolResult) |
 | `message_update` | **Assistant only.** Includes `assistantMessageEvent` with delta |
 | `message_end` | Message completes |
@@ -232,8 +233,11 @@ const agent = new Agent({
   // Refresh state only when the resolved action will make a provider request.
   prepareRequest: async ({ context }) => refreshRequestState(context),
 
-  // Prepare an inbox delivery once before its message events are emitted.
-  prepareDelivery: async (delivery) => [...delivery.messages],
+  // Stage delivery messages and optional synchronous commit work before admission.
+  prepareDelivery: async (delivery) => ({
+    messages: [...delivery.messages],
+    commit: () => commitApplicationState(delivery.deliveryId),
+  }),
 
   // Custom thinking budgets for token-based providers
   thinkingBudgets: {
@@ -305,7 +309,7 @@ agent.beforeToolCall = async ({ toolCall }) => undefined;
 agent.afterToolCall = async ({ toolCall, result }) => undefined;
 agent.nextAction = async ({ defaultAction }) => defaultAction;
 agent.prepareRequest = async ({ context }) => refreshRequestState(context);
-agent.prepareDelivery = async (delivery) => [...delivery.messages];
+agent.prepareDelivery = async (delivery) => ({ messages: [...delivery.messages] });
 agent.state.messages = newMessages; // top-level array is copied
 agent.state.messages.push(message);
 agent.reset();
@@ -368,21 +372,22 @@ const followUpDeliveryId = agent.followUp({
 const steeringMode = agent.steeringMode;
 const followUpMode = agent.followUpMode;
 
-agent.clearSteeringQueue();
-agent.clearFollowUpQueue();
-agent.clearAllQueues();
+const revokedSteeringIds = agent.clearSteeringQueue();
+const revokedFollowUpIds = agent.clearFollowUpQueue();
+const revokedDeliveryIds = agent.clearAllQueues();
 ```
 
-Use clearSteeringQueue, clearFollowUpQueue, or clearAllQueues to drop inbox entries and leased deliveries that have not begun emission. A delivery already emitting cannot be partially revoked.
+The clear methods return the exact runtime IDs they revoked. They remove queued entries and leases whose begin boundary has not been crossed; a delivery whose synchronous begin succeeded is authoritative and cannot be partially revoked.
 
 When steering messages are selected after a turn completes:
 1. All tool calls from the current assistant message have already finished.
-2. The dispatcher leases and prepares the selected deliveries.
-3. Delivery message events commit them into context.
-4. `prepareRequest` observes the post-delivery context.
-5. The LLM responds on the next turn.
+2. The dispatcher leases each selected delivery and runs side-effect-free `prepareDelivery` work.
+3. Synchronous begin transfers ownership and runs the staged `commit`, then emits `delivery_start`.
+4. Delivery message events finalize the messages into context.
+5. `prepareRequest` observes the post-delivery context.
+6. The LLM responds on the next turn.
 
-Follow-ups are selected only when there is no pending tool continuation and no steering delivery. `steer()` and `followUp()` return the runtime delivery ID, and the committing delivery's `message_start`/`message_end` events carry it. This identity is independent of any application-level ID stored on the message.
+Follow-ups are selected only when there is no pending tool continuation and no steering delivery. `steer()` and `followUp()` return the runtime delivery ID. The committing `delivery_start` event and the delivery's `message_start`/`message_end` events carry that ID, independently of any application-level ID stored on a message.
 
 ## Custom Message Types
 

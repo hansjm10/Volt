@@ -10,6 +10,7 @@ import {
 	type Transport,
 } from "@hansjm10/volt-ai";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { DeliveryInbox, type DeliveryLease, type InboxDelivery } from "./delivery-inbox.ts";
 import type {
 	AfterToolCallContext,
 	AfterToolCallResult,
@@ -116,6 +117,12 @@ export interface AgentDelivery {
 	readonly messages: readonly AgentMessage[];
 }
 
+/** Side-effect-free messages plus work committed only after delivery ownership transfers. */
+export interface AgentDeliveryPreparation {
+	messages: AgentMessage[];
+	commit?: () => void;
+}
+
 /** Options for constructing an {@link Agent}. */
 export interface AgentOptions {
 	initialState?: Partial<Omit<AgentState, RuntimeStateKeys>>;
@@ -127,8 +134,11 @@ export interface AgentOptions {
 	onResponse?: SimpleStreamOptions["onResponse"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
-	/** Prepare a leased inbox delivery before its commit message event. */
-	prepareDelivery?: (delivery: AgentDelivery, signal?: AbortSignal) => Promise<AgentMessage[]> | AgentMessage[];
+	/** Stage a leased inbox delivery before its irrevocable begin boundary. */
+	prepareDelivery?: (
+		delivery: AgentDelivery,
+		signal?: AbortSignal,
+	) => Promise<AgentDeliveryPreparation> | AgentDeliveryPreparation;
 	/** Compose host policy into the dispatcher's single action at each request boundary. */
 	nextAction?: (
 		context: AgentLoopNextActionContext,
@@ -160,23 +170,7 @@ export type AgentEventListener =
 	| ReplacingAgentEventListener
 	| AsyncReplacingAgentEventListener;
 
-type PendingDelivery = {
-	deliveryId: string;
-	kind: AgentDeliveryKind;
-	messages: AgentMessage[];
-	sequence: number;
-};
-
-type DeliveryLeaseStatus = "leased" | "emitting" | "committed" | "revoked";
-
-type LeasedDelivery = {
-	delivery: PendingDelivery;
-	status: DeliveryLeaseStatus;
-};
-
-type DeliveryLease = {
-	entries: LeasedDelivery[];
-};
+type PendingDelivery = InboxDelivery<AgentDeliveryKind, AgentMessage>;
 
 type DispatcherStartState = {
 	firstDecision: boolean;
@@ -200,9 +194,11 @@ type ActiveRun = {
 export class Agent {
 	private _state: MutableAgentState;
 	private readonly listeners = new Set<AgentEventListener>();
-	private inbox: PendingDelivery[] = [];
-	private activeLease?: DeliveryLease;
-	private nextDeliverySequence = 0;
+	private readonly inbox = new DeliveryInbox<AgentDeliveryKind, AgentMessage>(
+		() => `local-queue:${globalThis.crypto.randomUUID()}`,
+	);
+	private activeLease?: DeliveryLease<AgentDeliveryKind, AgentMessage>;
+	private readonly preparedDeliveryCommits = new Map<string, () => void>();
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
 	private pausedState?: Pick<DispatcherStartState, "providerRequestPending" | "pendingToolContinuation">;
@@ -221,8 +217,11 @@ export class Agent {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
-	/** Prepare one dispatcher-owned delivery before it enters model context. */
-	public prepareDelivery?: (delivery: AgentDelivery, signal?: AbortSignal) => Promise<AgentMessage[]> | AgentMessage[];
+	/** Stage one dispatcher-owned delivery before it enters model context. */
+	public prepareDelivery?: (
+		delivery: AgentDelivery,
+		signal?: AbortSignal,
+	) => Promise<AgentDeliveryPreparation> | AgentDeliveryPreparation;
 	/** Resolve a request, resumable pause, or terminal stop at each dispatcher boundary. */
 	public nextAction?: (
 		context: AgentLoopNextActionContext,
@@ -322,28 +321,24 @@ export class Agent {
 		return this.enqueueDelivery("followUp", [message]);
 	}
 
-	/** Remove queued steering deliveries that have not begun message emission. */
-	clearSteeringQueue(): void {
-		this.clearDeliveries("steer");
+	/** Remove queued steering deliveries whose begin boundary has not been crossed. */
+	clearSteeringQueue(): string[] {
+		return this.clearDeliveries("steer");
 	}
 
-	/** Remove queued follow-up deliveries that have not begun message emission. */
-	clearFollowUpQueue(): void {
-		this.clearDeliveries("followUp");
+	/** Remove queued follow-up deliveries whose begin boundary has not been crossed. */
+	clearFollowUpQueue(): string[] {
+		return this.clearDeliveries("followUp");
 	}
 
-	/** Remove all queued steering and follow-up messages. */
-	clearAllQueues(): void {
-		this.clearSteeringQueue();
-		this.clearFollowUpQueue();
+	/** Remove all still-revocable steering and follow-up deliveries. */
+	clearAllQueues(): string[] {
+		return [...this.clearSteeringQueue(), ...this.clearFollowUpQueue()];
 	}
 
-	/** Returns true when the inbox or active lease has a pending delivery. */
+	/** Returns true when the inbox has a pending or leased delivery. */
 	hasQueuedMessages(): boolean {
-		return (
-			this.inbox.length > 0 ||
-			this.activeLease?.entries.some((entry) => entry.status === "leased" || entry.status === "emitting") === true
-		);
+		return this.inbox.hasPending();
 	}
 
 	/** Active abort signal for the current run, if any. */
@@ -373,8 +368,9 @@ export class Agent {
 		this._state.pendingToolCalls = new Set<string>();
 		this._state.pendingToolExecutions = new Map<string, PendingToolExecution>();
 		this._state.errorMessage = undefined;
-		this.inbox = [];
+		this.inbox.reset();
 		this.activeLease = undefined;
+		this.preparedDeliveryCommits.clear();
 		this.pausedState = undefined;
 	}
 
@@ -461,33 +457,23 @@ export class Agent {
 	}
 
 	private enqueueDelivery(kind: AgentDeliveryKind, messages: AgentMessage[]): string {
-		const sequence = this.nextDeliverySequence++;
-		const deliveryId = `local-queue:${globalThis.crypto.randomUUID()}`;
-		this.inbox.push({ deliveryId, kind, messages: messages.slice(), sequence });
-		return deliveryId;
+		return this.inbox.enqueue(kind, messages).deliveryId;
 	}
 
-	private clearDeliveries(kind: AgentDeliveryKind): void {
-		this.inbox = this.inbox.filter((delivery) => delivery.kind !== kind);
-		for (const entry of this.activeLease?.entries ?? []) {
-			if (entry.status === "leased" && entry.delivery.kind === kind) {
-				entry.status = "revoked";
-			}
+	private clearDeliveries(kind: AgentDeliveryKind): string[] {
+		const revoked = this.inbox.revoke(kind);
+		for (const delivery of revoked) {
+			this.preparedDeliveryCommits.delete(delivery.deliveryId);
 		}
+		return revoked.map((delivery) => delivery.deliveryId);
 	}
 
 	private hasPendingUserDelivery(): boolean {
-		const leased = (this.activeLease?.entries ?? []).flatMap((entry) =>
-			entry.status === "leased" || entry.status === "emitting" ? [entry.delivery] : [],
-		);
-		return [...this.inbox, ...leased].some((delivery) =>
-			delivery.messages.some((message) => message.role === "user"),
-		);
+		return this.inbox.list().some((delivery) => delivery.messages.some((message) => message.role === "user"));
 	}
 
 	private selectPendingDeliveries(kind: AgentDeliveryKind, mode: QueueMode): PendingDelivery[] {
-		const matching = this.inbox.filter((delivery) => delivery.kind === kind);
-		return mode === "all" ? matching : matching.slice(0, 1);
+		return [...this.inbox.select(kind, mode)];
 	}
 
 	private async resolveNextAction(
@@ -507,14 +493,17 @@ export class Agent {
 			selected = this.selectPendingDeliveries("steer", this.steeringQueueMode);
 		}
 
-		let providerRequestPending = isFirstDecision && startState.providerRequestPending;
+		const providerRequestPending = isFirstDecision && startState.providerRequestPending;
 		if (selected.length === 0 && !pendingToolContinuation && !providerRequestPending) {
 			selected = this.selectPendingDeliveries("followUp", this.followUpQueueMode);
 		}
+		const hasIndependentContinuation = pendingToolContinuation || providerRequestPending;
 		const suggestedAction: AgentLoopNextAction =
-			selected.length > 0 || pendingToolContinuation || providerRequestPending
-				? { type: "request" }
-				: { type: "stop" };
+			selected.length > 0
+				? { type: "request", reason: hasIndependentContinuation ? "continuation" : "delivery" }
+				: hasIndependentContinuation
+					? { type: "request", reason: "continuation" }
+					: { type: "stop" };
 
 		if (this.signal?.aborted) {
 			this.pausedState = { providerRequestPending, pendingToolContinuation };
@@ -543,10 +532,6 @@ export class Agent {
 
 		this.pausedState = undefined;
 		const leasedDeliveries = selected.length > 0 ? await this.prepareLeasedDeliveries(selected) : [];
-		providerRequestPending ||= pendingToolContinuation;
-		if (selected.length > 0 && leasedDeliveries.length === 0 && !providerRequestPending) {
-			return { type: "stop" };
-		}
 		const deliveries = [...leasedDeliveries, ...(action.deliveries ?? [])];
 		if (
 			isFirstDecision &&
@@ -556,21 +541,19 @@ export class Agent {
 			this.rollbackActiveLease();
 			throw new Error("Cannot continue from an assistant message without a pending user delivery");
 		}
-		return deliveries.length > 0 ? { type: "request", deliveries } : { type: "request" };
+		return {
+			type: "request",
+			reason: action.reason,
+			...(deliveries.length > 0 ? { deliveries } : {}),
+		};
 	}
 
 	private async prepareLeasedDeliveries(selected: PendingDelivery[]): Promise<AgentLoopDelivery[]> {
-		const selectedIds = new Set(selected.map((delivery) => delivery.deliveryId));
-		const claimed = this.inbox.filter((delivery) => selectedIds.has(delivery.deliveryId));
-		this.inbox = this.inbox.filter((delivery) => !selectedIds.has(delivery.deliveryId));
-		const lease: DeliveryLease = {
-			entries: claimed.map((delivery) => ({ delivery, status: "leased" })),
-		};
+		const lease = this.inbox.lease(selected);
 		this.activeLease = lease;
 		const deliveries: AgentLoopDelivery[] = [];
-		for (const entry of lease.entries) {
-			const { delivery } = entry;
-			const messages = this.prepareDelivery
+		for (const delivery of lease.deliveries) {
+			const preparation = this.prepareDelivery
 				? await this.prepareDelivery(
 						{
 							deliveryId: delivery.deliveryId,
@@ -579,23 +562,22 @@ export class Agent {
 						},
 						this.signal,
 					)
-				: delivery.messages.slice();
-			if (this.activeLease !== lease || entry.status !== "leased") continue;
-			if (messages.length === 0) {
+				: { messages: delivery.messages.slice() };
+			if (
+				this.activeLease !== lease ||
+				!lease.deliveries.some((candidate) => candidate.deliveryId === delivery.deliveryId)
+			) {
+				continue;
+			}
+			if (preparation.messages.length === 0) {
 				throw new Error("prepareDelivery must retain at least one message for an admitted delivery");
 			}
-			let commitMessageIndex = messages.findIndex((message) => delivery.messages.includes(message));
-			if (commitMessageIndex === -1) {
-				const primaryRole = delivery.messages[0]?.role;
-				commitMessageIndex = Math.max(
-					0,
-					messages.findIndex((message) => message.role === primaryRole),
-				);
+			if (preparation.commit) {
+				this.preparedDeliveryCommits.set(delivery.deliveryId, preparation.commit);
 			}
 			deliveries.push({
 				deliveryId: delivery.deliveryId,
-				messages,
-				commitMessageIndex,
+				messages: preparation.messages,
 			});
 		}
 		return deliveries;
@@ -603,32 +585,18 @@ export class Agent {
 
 	private beginActiveDelivery(delivery: AgentLoopDelivery): boolean {
 		if (delivery.deliveryId === undefined) return true;
-		const entry = this.activeLease?.entries.find(
-			(candidate) => candidate.delivery.deliveryId === delivery.deliveryId,
-		);
-		if (!entry) return true;
-		if (entry.status !== "leased") return false;
-		entry.status = "emitting";
+		if (!this.activeLease?.owns(delivery.deliveryId)) return true;
+		if (!this.activeLease.begin(delivery.deliveryId)) return false;
+		const commit = this.preparedDeliveryCommits.get(delivery.deliveryId);
+		this.preparedDeliveryCommits.delete(delivery.deliveryId);
+		commit?.();
 		return true;
 	}
 
-	private commitActiveDelivery(deliveryId: string): void {
-		const entry = this.activeLease?.entries.find((candidate) => candidate.delivery.deliveryId === deliveryId);
-		if (entry?.status === "emitting") {
-			entry.status = "committed";
-		}
-	}
-
 	private rollbackActiveLease(): void {
-		const lease = this.activeLease;
-		if (!lease) return;
-		const pending = lease.entries.flatMap((entry) =>
-			entry.status === "leased" || entry.status === "emitting" ? [entry.delivery] : [],
-		);
-		if (pending.length > 0) {
-			this.inbox = [...pending, ...this.inbox].sort((left, right) => left.sequence - right.sequence);
-		}
+		this.inbox.rollbackActiveLease();
 		this.activeLease = undefined;
+		this.preparedDeliveryCommits.clear();
 	}
 
 	private createLoopConfig(startState: DispatcherStartState): AgentLoopConfig {
@@ -728,9 +696,6 @@ export class Agent {
 	 * and `finishRun()` clears runtime-owned state.
 	 */
 	private async processEvents(event: AgentEvent): Promise<AgentMessage | undefined> {
-		if (event.type === "message_start" && event.deliveryId !== undefined) {
-			this.commitActiveDelivery(event.deliveryId);
-		}
 		switch (event.type) {
 			case "message_start":
 				this._state.streamingMessage = event.message;
