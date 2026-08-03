@@ -1,6 +1,6 @@
 /**
  * Tests that an aborted run does not silently issue another provider request
- * between turns, while queued steering messages still get delivered.
+ * between turns, while queued steering messages remain available to resume.
  *
  * Regression: abort() only flips the run's AbortController; the loop had no
  * abort check between turns, so a tool that finished after abort() caused a
@@ -104,7 +104,7 @@ describe("abort between turns", () => {
 		expect(events.at(-1)?.type).toBe("agent_end");
 	});
 
-	it("still delivers queued steering messages after abort", async () => {
+	it("keeps queued steering messages pending for a resume after abort", async () => {
 		let streamCalls = 0;
 		const tool = createNoopTool(() => {
 			agent.steer({ role: "user", content: [{ type: "text", text: "steered input" }], timestamp: Date.now() });
@@ -132,8 +132,20 @@ describe("abort between turns", () => {
 
 		await agent.prompt("run tool");
 
-		// Queued user input survives abort by contract: the steering message is
-		// injected and streamed even though the signal is aborted.
+		// Abort is terminal for this run, so it must neither lease the queued
+		// steering delivery nor start another provider request.
+		expect(streamCalls).toBe(1);
+		expect(
+			agent.state.messages.some(
+				(message) =>
+					message.role === "user" &&
+					Array.isArray(message.content) &&
+					message.content.some((part) => part.type === "text" && part.text === "steered input"),
+			),
+		).toBe(false);
+
+		await agent.continue();
+
 		expect(streamCalls).toBe(2);
 		const userMessages = agent.state.messages.filter((message) => message.role === "user");
 		expect(

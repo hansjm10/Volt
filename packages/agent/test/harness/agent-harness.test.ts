@@ -118,6 +118,43 @@ describe("AgentHarness", () => {
 		expect(steerQueueLengths).toEqual([1, 2, 1, 0]);
 	});
 
+	it("prepares a queued request from the post-delivery session snapshot", async () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		const requestPrompts: string[] = [];
+		registration.setResponses([
+			(context) => {
+				requestPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage("first");
+			},
+			(context) => {
+				requestPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage("second");
+			},
+		]);
+		const session = new Session(new InMemorySessionStorage());
+		const harness = new AgentHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: registration.getModel(),
+			systemPrompt: async ({ session: currentSession }) => {
+				const current = await currentSession.buildContext();
+				return `users:${textFromUserMessages(current.messages as Array<{ role: string; content: unknown }>).join("|")}`;
+			},
+		});
+		let queued = false;
+		harness.subscribe((event) => {
+			if (event.type === "message_start" && event.message.role === "assistant" && !queued) {
+				queued = true;
+				void harness.steer("steer");
+			}
+		});
+
+		await harness.prompt("hello");
+
+		expect(requestPrompts).toEqual(["users:", "users:hello|steer"]);
+	});
+
 	it("appends before_agent_start messages and persists them", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);

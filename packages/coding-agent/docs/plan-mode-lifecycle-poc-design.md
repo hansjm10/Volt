@@ -72,6 +72,14 @@ Canonical state reaches the model through append-only context:
 
 This preserves Codex WebSocket continuation and provider prefix caching during ordinary planning and execution turns. Mode, phase, or tool-policy boundaries may still cause one intentional cache miss.
 
+## User-feedback delivery
+
+Direct prompts, steering, and follow-ups use the same Agent delivery inbox. Runtime delivery IDs identify queue admission and commit independently of external `clientMessageId` values, which remain unchanged for canonical persistence and client idempotency.
+
+One idempotent delivery-preparation hook handles every user delivery mode. When feedback targets a researched `ready` plan, delivery preparation moves it back to `draft` and prefixes the canonical checkpoint before the user message is emitted. Immediately before the resulting provider request, the request-preparation hook refreshes the Plan system prompt, tools, model, and thinking state from the post-delivery session snapshot. Queued and direct feedback therefore see the same revision transition and Plan-safe tool surface from their first request.
+
+Preparation alone does not remove an admitted message. The active dispatcher leases deliveries transactionally, commits each one when its `message_start` event is accepted, and restores only uncommitted deliveries ahead of concurrently admitted work if preparation or delivery fails. Abort, disposal, queue clearing, and tree-generation fences retain their durable admission semantics without repurposing external client IDs.
+
 ## Deliberately deferred
 
 This POC does not yet add:

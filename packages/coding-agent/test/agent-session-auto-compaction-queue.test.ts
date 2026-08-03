@@ -584,23 +584,30 @@ describe("AgentSession auto-compaction queue resume", () => {
 			timestamp: Date.now(),
 		};
 		const context = {
-			message,
-			toolResults: [toolResult],
-			toolBatchTerminated: false,
+			completedTurn: {
+				message,
+				toolResults: [toolResult],
+				toolBatchTerminated: false,
+			},
+			pendingToolContinuation: true,
+			defaultAction: { type: "request" as const },
 			context: { systemPrompt: "", messages: [message, toolResult], tools: [] },
 			newMessages: [],
 		};
 
 		const hook = (
 			session as unknown as {
-				_shouldStopForProactiveCompaction: (context: unknown) => boolean;
+				_resolveProactiveCompactionAction: (context: unknown, action: { type: "request" }) => unknown;
 			}
-		)._shouldStopForProactiveCompaction.bind(session);
+		)._resolveProactiveCompactionAction.bind(session);
 
-		expect(hook(context)).toBe(true);
+		expect(hook(context, { type: "request" })).toEqual({
+			type: "pause",
+			pendingToolContinuation: true,
+		});
 		// A second threshold crossing before any successful compaction must not
-		// interrupt the run again (prevents stop/fail/continue churn every turn).
-		expect(hook(context)).toBe(false);
+		// interrupt the run again (prevents pause/fail/continue churn every turn).
+		expect(hook(context, { type: "request" })).toEqual({ type: "request" });
 	});
 
 	it("should not compact repeatedly after overflow recovery already attempted", async () => {

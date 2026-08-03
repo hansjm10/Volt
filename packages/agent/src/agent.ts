@@ -16,15 +16,18 @@ import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
-	AgentLoopTurnUpdate,
+	AgentLoopDelivery,
+	AgentLoopNextAction,
+	AgentLoopNextActionContext,
+	AgentLoopRequestUpdate,
 	AgentMessage,
 	AgentState,
 	AgentTool,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
 	PendingToolExecution,
+	PrepareRequestContext,
 	QueueMode,
-	ShouldStopAfterTurnContext,
 	StreamFn,
 	ToolExecutionMode,
 } from "./types.ts";
@@ -102,6 +105,17 @@ function createMutableAgentState(initialState?: Partial<Omit<AgentState, Runtime
 	};
 }
 
+/** Delivery class used by the Agent-owned inbox. */
+export type AgentDeliveryKind = "prompt" | "steer" | "followUp";
+
+/** Stable pending delivery passed to `prepareDelivery`. */
+export interface AgentDelivery {
+	/** Runtime inbox identity; never substitutes for an ID carried by a message. */
+	readonly deliveryId: string;
+	readonly kind: AgentDeliveryKind;
+	readonly messages: readonly AgentMessage[];
+}
+
 /** Options for constructing an {@link Agent}. */
 export interface AgentOptions {
 	initialState?: Partial<Omit<AgentState, RuntimeStateKeys>>;
@@ -113,15 +127,18 @@ export interface AgentOptions {
 	onResponse?: SimpleStreamOptions["onResponse"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
-	prepareNextTurn?: (
+	/** Prepare a leased inbox delivery before its commit message event. */
+	prepareDelivery?: (delivery: AgentDelivery, signal?: AbortSignal) => Promise<AgentMessage[]> | AgentMessage[];
+	/** Compose host policy into the dispatcher's single action at each request boundary. */
+	nextAction?: (
+		context: AgentLoopNextActionContext,
 		signal?: AbortSignal,
-	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
-	prepareQueuedMessages?: (
-		messages: AgentMessage[],
-		delivery: "steer" | "followUp",
+	) => AgentLoopNextAction | Promise<AgentLoopNextAction>;
+	/** Refresh runtime state after deliveries finalize and only when a provider request will occur. */
+	prepareRequest?: (
+		context: PrepareRequestContext,
 		signal?: AbortSignal,
-	) => Promise<AgentMessage[]> | AgentMessage[];
-	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext, signal?: AbortSignal) => boolean | Promise<boolean>;
+	) => Promise<AgentLoopRequestUpdate | undefined> | AgentLoopRequestUpdate | undefined;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
 	sessionId?: string;
@@ -143,41 +160,24 @@ export type AgentEventListener =
 	| ReplacingAgentEventListener
 	| AsyncReplacingAgentEventListener;
 
-class PendingMessageQueue {
-	private messages: AgentMessage[] = [];
-	public mode: QueueMode;
+type PendingDelivery = {
+	deliveryId: string;
+	kind: AgentDeliveryKind;
+	messages: AgentMessage[];
+	sequence: number;
+};
 
-	constructor(mode: QueueMode) {
-		this.mode = mode;
-	}
+type DeliveryLease = {
+	uncommitted: PendingDelivery[];
+	deliveries: AgentLoopDelivery[];
+};
 
-	enqueue(message: AgentMessage): void {
-		this.messages.push(message);
-	}
-
-	hasItems(): boolean {
-		return this.messages.length > 0;
-	}
-
-	async drainPrepared(
-		prepare: (messages: AgentMessage[]) => AgentMessage[] | Promise<AgentMessage[]>,
-	): Promise<AgentMessage[]> {
-		const messages = this.mode === "all" ? this.messages.splice(0) : this.messages.splice(0, 1);
-		if (messages.length === 0) {
-			return messages;
-		}
-		try {
-			return await prepare(messages);
-		} catch (error) {
-			this.messages.unshift(...messages);
-			throw error;
-		}
-	}
-
-	clear(): void {
-		this.messages = [];
-	}
-}
+type DispatcherStartState = {
+	firstDecision: boolean;
+	providerRequestPending: boolean;
+	pendingToolContinuation: boolean;
+	assistantTail: boolean;
+};
 
 type ActiveRun = {
 	promise: Promise<void>;
@@ -194,8 +194,12 @@ type ActiveRun = {
 export class Agent {
 	private _state: MutableAgentState;
 	private readonly listeners = new Set<AgentEventListener>();
-	private readonly steeringQueue: PendingMessageQueue;
-	private readonly followUpQueue: PendingMessageQueue;
+	private inbox: PendingDelivery[] = [];
+	private activeLease?: DeliveryLease;
+	private nextDeliverySequence = 0;
+	private steeringQueueMode: QueueMode;
+	private followUpQueueMode: QueueMode;
+	private pausedState?: Pick<DispatcherStartState, "providerRequestPending" | "pendingToolContinuation">;
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -211,23 +215,18 @@ export class Agent {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
-	public prepareNextTurn?: (
+	/** Prepare one dispatcher-owned delivery before it enters model context. */
+	public prepareDelivery?: (delivery: AgentDelivery, signal?: AbortSignal) => Promise<AgentMessage[]> | AgentMessage[];
+	/** Resolve a request, resumable pause, or terminal stop at each dispatcher boundary. */
+	public nextAction?: (
+		context: AgentLoopNextActionContext,
 		signal?: AbortSignal,
-	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
-	/** Prepare drained user queues immediately before their messages enter model context. */
-	public prepareQueuedMessages?: (
-		messages: AgentMessage[],
-		delivery: "steer" | "followUp",
+	) => AgentLoopNextAction | Promise<AgentLoopNextAction>;
+	/** Refresh runtime state immediately before an actual provider request. */
+	public prepareRequest?: (
+		context: PrepareRequestContext,
 		signal?: AbortSignal,
-	) => Promise<AgentMessage[]> | AgentMessage[];
-	/**
-	 * Asks the host whether the loop should stop gracefully after the current turn.
-	 * See {@link AgentLoopConfig.shouldStopAfterTurn} for the loop contract.
-	 */
-	public shouldStopAfterTurn?: (
-		context: ShouldStopAfterTurnContext,
-		signal?: AbortSignal,
-	) => boolean | Promise<boolean>;
+	) => Promise<AgentLoopRequestUpdate | undefined> | AgentLoopRequestUpdate | undefined;
 	private activeRun?: ActiveRun;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
@@ -252,11 +251,11 @@ export class Agent {
 		this.onResponse = options.onResponse;
 		this.beforeToolCall = options.beforeToolCall;
 		this.afterToolCall = options.afterToolCall;
-		this.prepareNextTurn = options.prepareNextTurn;
-		this.prepareQueuedMessages = options.prepareQueuedMessages;
-		this.shouldStopAfterTurn = options.shouldStopAfterTurn;
-		this.steeringQueue = new PendingMessageQueue(options.steeringMode ?? "one-at-a-time");
-		this.followUpQueue = new PendingMessageQueue(options.followUpMode ?? "one-at-a-time");
+		this.prepareDelivery = options.prepareDelivery;
+		this.nextAction = options.nextAction;
+		this.prepareRequest = options.prepareRequest;
+		this.steeringQueueMode = options.steeringMode ?? "one-at-a-time";
+		this.followUpQueueMode = options.followUpMode ?? "one-at-a-time";
 		this.sessionId = options.sessionId;
 		this.thinkingBudgets = options.thinkingBudgets;
 		this.transport = options.transport ?? "auto";
@@ -289,42 +288,42 @@ export class Agent {
 		return this._state;
 	}
 
-	/** Controls how queued steering messages are drained. */
+	/** Controls how queued steering deliveries are claimed. */
 	set steeringMode(mode: QueueMode) {
-		this.steeringQueue.mode = mode;
+		this.steeringQueueMode = mode;
 	}
 
 	get steeringMode(): QueueMode {
-		return this.steeringQueue.mode;
+		return this.steeringQueueMode;
 	}
 
-	/** Controls how queued follow-up messages are drained. */
+	/** Controls how queued follow-up deliveries are claimed. */
 	set followUpMode(mode: QueueMode) {
-		this.followUpQueue.mode = mode;
+		this.followUpQueueMode = mode;
 	}
 
 	get followUpMode(): QueueMode {
-		return this.followUpQueue.mode;
+		return this.followUpQueueMode;
 	}
 
-	/** Queue a message to be injected after the current assistant turn finishes. */
-	steer(message: AgentMessage): void {
-		this.steeringQueue.enqueue(message);
+	/** Queue a delivery to be injected after the current assistant turn finishes. */
+	steer(message: AgentMessage): string {
+		return this.enqueueDelivery("steer", [message]);
 	}
 
-	/** Queue a message to run only after the agent would otherwise stop. */
-	followUp(message: AgentMessage): void {
-		this.followUpQueue.enqueue(message);
+	/** Queue a delivery to run only after the agent would otherwise stop. */
+	followUp(message: AgentMessage): string {
+		return this.enqueueDelivery("followUp", [message]);
 	}
 
-	/** Remove all queued steering messages. */
+	/** Remove all queued or uncommitted steering deliveries. */
 	clearSteeringQueue(): void {
-		this.steeringQueue.clear();
+		this.clearDeliveries("steer");
 	}
 
-	/** Remove all queued follow-up messages. */
+	/** Remove all queued or uncommitted follow-up deliveries. */
 	clearFollowUpQueue(): void {
-		this.followUpQueue.clear();
+		this.clearDeliveries("followUp");
 	}
 
 	/** Remove all queued steering and follow-up messages. */
@@ -333,9 +332,9 @@ export class Agent {
 		this.clearFollowUpQueue();
 	}
 
-	/** Returns true when either queue still contains pending messages. */
+	/** Returns true when the inbox or active lease has an uncommitted delivery. */
 	hasQueuedMessages(): boolean {
-		return this.steeringQueue.hasItems() || this.followUpQueue.hasItems();
+		return this.inbox.length > 0 || (this.activeLease?.uncommitted.length ?? 0) > 0;
 	}
 
 	/** Active abort signal for the current run, if any. */
@@ -365,11 +364,12 @@ export class Agent {
 		this._state.pendingToolCalls = new Set<string>();
 		this._state.pendingToolExecutions = new Map<string, PendingToolExecution>();
 		this._state.errorMessage = undefined;
-		this.clearFollowUpQueue();
-		this.clearSteeringQueue();
+		this.inbox = [];
+		this.activeLease = undefined;
+		this.pausedState = undefined;
 	}
 
-	/** Start a new prompt from text, a single message, or a batch of messages. */
+	/** Start a new prompt through the same inbox dispatcher used by queued input. */
 	async prompt(message: AgentMessage | AgentMessage[]): Promise<void>;
 	async prompt(input: string, images?: ImageContent[]): Promise<void>;
 	async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<void> {
@@ -378,40 +378,38 @@ export class Agent {
 				"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
 			);
 		}
-		const messages = this.normalizePromptInput(input, images);
-		await this.runPromptMessages(messages);
+		this.pausedState = undefined;
+		this.enqueueDelivery("prompt", this.normalizePromptInput(input, images));
+		await this.runDispatcher({
+			firstDecision: true,
+			providerRequestPending: false,
+			pendingToolContinuation: false,
+			assistantTail: false,
+		});
 	}
 
-	/** Continue from the current transcript. The last message must be a user or tool-result message. */
-	async continue(options: { drainFollowUps?: boolean } = {}): Promise<void> {
+	/** Resume dispatcher state or a provider-ready transcript. */
+	async continue(): Promise<void> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
-
 		const lastMessage = this._state.messages[this._state.messages.length - 1];
 		if (!lastMessage) {
 			throw new Error("No messages to continue from");
 		}
-
-		const queuedSteering = await this.drainQueuedMessagesForDelivery(this.steeringQueue, "steer");
-		if (queuedSteering.length > 0) {
-			await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
-			return;
+		const pausedState = this.pausedState;
+		this.pausedState = undefined;
+		const assistantTail = lastMessage.role === "assistant";
+		if (assistantTail && !this.hasPendingUserDelivery()) {
+			this.pausedState = pausedState;
+			throw new Error("Cannot continue from an assistant message without a pending user delivery");
 		}
-
-		if (lastMessage.role === "assistant" || options.drainFollowUps) {
-			const queuedFollowUps = await this.drainQueuedMessagesForDelivery(this.followUpQueue, "followUp");
-			if (queuedFollowUps.length > 0) {
-				await this.runPromptMessages(queuedFollowUps);
-				return;
-			}
-		}
-
-		if (lastMessage.role === "assistant") {
-			throw new Error("Cannot continue from message role: assistant");
-		}
-
-		await this.runContinuation();
+		await this.runDispatcher({
+			firstDecision: true,
+			providerRequestPending: pausedState?.providerRequestPending ?? !assistantTail,
+			pendingToolContinuation: pausedState?.pendingToolContinuation ?? false,
+			assistantTail,
+		});
 	}
 
 	private normalizePromptInput(
@@ -433,31 +431,15 @@ export class Agent {
 		return [{ role: "user", content, timestamp: Date.now() }];
 	}
 
-	private async runPromptMessages(
-		messages: AgentMessage[],
-		options: { skipInitialSteeringPoll?: boolean } = {},
-	): Promise<void> {
+	private async runDispatcher(startState: DispatcherStartState): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
-			await runAgentLoop(
-				messages,
-				this.createContextSnapshot(),
-				this.createLoopConfig(options),
-				(event) => this.processEvents(event),
-				signal,
-				this.streamFn,
-			);
-		});
-	}
-
-	private async runContinuation(): Promise<void> {
-		await this.runWithLifecycle(async (signal) => {
-			await runAgentLoopContinue(
-				this.createContextSnapshot(),
-				this.createLoopConfig(),
-				(event) => this.processEvents(event),
-				signal,
-				this.streamFn,
-			);
+			const context = this.createContextSnapshot();
+			const config = this.createLoopConfig(startState);
+			if (context.messages.length === 0) {
+				await runAgentLoop([], context, config, (event) => this.processEvents(event), signal, this.streamFn);
+				return;
+			}
+			await runAgentLoopContinue(context, config, (event) => this.processEvents(event), signal, this.streamFn);
 		});
 	}
 
@@ -469,17 +451,164 @@ export class Agent {
 		};
 	}
 
-	private async drainQueuedMessagesForDelivery(
-		queue: PendingMessageQueue,
-		delivery: "steer" | "followUp",
-	): Promise<AgentMessage[]> {
-		return await queue.drainPrepared(async (messages) =>
-			this.prepareQueuedMessages ? await this.prepareQueuedMessages(messages, delivery, this.signal) : messages,
+	private enqueueDelivery(kind: AgentDeliveryKind, messages: AgentMessage[]): string {
+		const sequence = this.nextDeliverySequence++;
+		const deliveryId = `local-queue:${globalThis.crypto.randomUUID()}`;
+		this.inbox.push({ deliveryId, kind, messages: messages.slice(), sequence });
+		return deliveryId;
+	}
+
+	private clearDeliveries(kind: AgentDeliveryKind): void {
+		this.inbox = this.inbox.filter((delivery) => delivery.kind !== kind);
+		const lease = this.activeLease;
+		if (!lease) return;
+		const revokedIds = new Set(
+			lease.uncommitted.filter((delivery) => delivery.kind === kind).map((delivery) => delivery.deliveryId),
+		);
+		if (revokedIds.size === 0) return;
+		lease.uncommitted = lease.uncommitted.filter((delivery) => !revokedIds.has(delivery.deliveryId));
+		for (let index = lease.deliveries.length - 1; index >= 0; index--) {
+			const deliveryId = lease.deliveries[index]?.deliveryId;
+			if (deliveryId !== undefined && revokedIds.has(deliveryId)) {
+				lease.deliveries.splice(index, 1);
+			}
+		}
+	}
+
+	private hasPendingUserDelivery(): boolean {
+		return [...this.inbox, ...(this.activeLease?.uncommitted ?? [])].some((delivery) =>
+			delivery.messages.some((message) => message.role === "user"),
 		);
 	}
 
-	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
-		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
+	private selectPendingDeliveries(kind: AgentDeliveryKind, mode: QueueMode): PendingDelivery[] {
+		const matching = this.inbox.filter((delivery) => delivery.kind === kind);
+		return mode === "all" ? matching : matching.slice(0, 1);
+	}
+
+	private async resolveNextAction(
+		context: AgentLoopNextActionContext,
+		startState: DispatcherStartState,
+	): Promise<AgentLoopNextAction> {
+		const isFirstDecision = startState.firstDecision;
+		startState.firstDecision = false;
+		const pendingToolContinuation = isFirstDecision
+			? startState.pendingToolContinuation
+			: context.pendingToolContinuation;
+		let selected: PendingDelivery[] = [];
+		const immediate = this.selectPendingDeliveries("prompt", "all");
+		if (immediate.length > 0) {
+			selected = [...immediate, ...this.selectPendingDeliveries("steer", this.steeringQueueMode)];
+		} else {
+			selected = this.selectPendingDeliveries("steer", this.steeringQueueMode);
+		}
+
+		let providerRequestPending = isFirstDecision && startState.providerRequestPending;
+		if (selected.length === 0 && !pendingToolContinuation && !providerRequestPending) {
+			selected = this.selectPendingDeliveries("followUp", this.followUpQueueMode);
+		}
+		const suggestedAction: AgentLoopNextAction =
+			selected.length > 0 || pendingToolContinuation || providerRequestPending
+				? { type: "request" }
+				: { type: "stop" };
+
+		if (this.signal?.aborted) {
+			this.pausedState = { providerRequestPending, pendingToolContinuation };
+			return { type: "pause", pendingToolContinuation };
+		}
+		const hookContext: AgentLoopNextActionContext = {
+			...context,
+			pendingToolContinuation,
+			defaultAction: suggestedAction,
+		};
+		const action = this.nextAction ? await this.nextAction(hookContext, this.signal) : suggestedAction;
+		if (action.type === "pause") {
+			this.pausedState = {
+				providerRequestPending,
+				pendingToolContinuation: action.pendingToolContinuation ?? pendingToolContinuation,
+			};
+			return {
+				...action,
+				pendingToolContinuation: action.pendingToolContinuation ?? pendingToolContinuation,
+			};
+		}
+		if (action.type === "stop") {
+			this.pausedState = undefined;
+			return action;
+		}
+
+		this.pausedState = undefined;
+		const leasedDeliveries = selected.length > 0 ? await this.prepareLeasedDeliveries(selected) : [];
+		providerRequestPending ||= pendingToolContinuation;
+		if (selected.length > 0 && leasedDeliveries.length === 0 && !providerRequestPending) {
+			return { type: "stop" };
+		}
+		const deliveries = [...leasedDeliveries, ...(action.deliveries ?? [])];
+		if (
+			isFirstDecision &&
+			startState.assistantTail &&
+			!deliveries.some((delivery) => delivery.messages.some((message) => message.role === "user"))
+		) {
+			this.rollbackActiveLease();
+			throw new Error("Cannot continue from an assistant message without a pending user delivery");
+		}
+		return deliveries.length > 0 ? { type: "request", deliveries } : { type: "request" };
+	}
+
+	private async prepareLeasedDeliveries(selected: PendingDelivery[]): Promise<AgentLoopDelivery[]> {
+		const selectedIds = new Set(selected.map((delivery) => delivery.deliveryId));
+		const claimed = this.inbox.filter((delivery) => selectedIds.has(delivery.deliveryId));
+		this.inbox = this.inbox.filter((delivery) => !selectedIds.has(delivery.deliveryId));
+		const lease: DeliveryLease = { uncommitted: claimed, deliveries: [] };
+		this.activeLease = lease;
+		for (const delivery of claimed) {
+			const messages = this.prepareDelivery
+				? await this.prepareDelivery(
+						{
+							deliveryId: delivery.deliveryId,
+							kind: delivery.kind,
+							messages: delivery.messages.slice(),
+						},
+						this.signal,
+					)
+				: delivery.messages.slice();
+			if (!lease.uncommitted.includes(delivery)) continue;
+			if (messages.length === 0) {
+				throw new Error("prepareDelivery must retain at least one message for an admitted delivery");
+			}
+			let commitMessageIndex = messages.findIndex((message) => delivery.messages.includes(message));
+			if (commitMessageIndex === -1) {
+				const primaryRole = delivery.messages[0]?.role;
+				commitMessageIndex = Math.max(
+					0,
+					messages.findIndex((message) => message.role === primaryRole),
+				);
+			}
+			lease.deliveries.push({
+				deliveryId: delivery.deliveryId,
+				messages,
+				commitMessageIndex,
+			});
+		}
+		return lease.deliveries;
+	}
+
+	private commitActiveDelivery(deliveryId: string): void {
+		const lease = this.activeLease;
+		if (!lease) return;
+		lease.uncommitted = lease.uncommitted.filter((delivery) => delivery.deliveryId !== deliveryId);
+	}
+
+	private rollbackActiveLease(): void {
+		const lease = this.activeLease;
+		if (!lease) return;
+		if (lease.uncommitted.length > 0) {
+			this.inbox = [...lease.uncommitted, ...this.inbox].sort((left, right) => left.sequence - right.sequence);
+		}
+		this.activeLease = undefined;
+	}
+
+	private createLoopConfig(startState: DispatcherStartState): AgentLoopConfig {
 		return {
 			model: this._state.model,
 			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
@@ -493,11 +622,12 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
-			prepareNextTurn: async ({ context }) => {
-				const prepared = await this.prepareNextTurn?.(this.signal);
+			nextAction: async (context) => await this.resolveNextAction(context, startState),
+			prepareRequest: async (context) => {
+				const prepared = await this.prepareRequest?.(context, this.signal);
 				return {
 					context: prepared?.context ?? {
-						...context,
+						...context.context,
 						systemPrompt: this._state.systemPrompt,
 						tools: this._state.tools.slice(),
 					},
@@ -505,18 +635,9 @@ export class Agent {
 					thinkingLevel: prepared?.thinkingLevel ?? this._state.thinkingLevel,
 				};
 			},
-			shouldStopAfterTurn: async (context) => (await this.shouldStopAfterTurn?.(context, this.signal)) === true,
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
 			getApiKey: this.getApiKey,
-			getSteeringMessages: async () => {
-				if (skipInitialSteeringPoll) {
-					skipInitialSteeringPoll = false;
-					return [];
-				}
-				return await this.drainQueuedMessagesForDelivery(this.steeringQueue, "steer");
-			},
-			getFollowUpMessages: async () => await this.drainQueuedMessagesForDelivery(this.followUpQueue, "followUp"),
 		};
 	}
 
@@ -539,8 +660,10 @@ export class Agent {
 		try {
 			await executor(abortController.signal);
 		} catch (error) {
+			this.rollbackActiveLease();
 			await this.handleRunFailure(error, abortController.signal.aborted);
 		} finally {
+			this.rollbackActiveLease();
 			this.finishRun();
 		}
 	}
@@ -581,6 +704,9 @@ export class Agent {
 	 * and `finishRun()` clears runtime-owned state.
 	 */
 	private async processEvents(event: AgentEvent): Promise<AgentMessage | undefined> {
+		if (event.type === "message_start" && event.deliveryId !== undefined) {
+			this.commitActiveDelivery(event.deliveryId);
+		}
 		switch (event.type) {
 			case "message_start":
 				this._state.streamingMessage = event.message;

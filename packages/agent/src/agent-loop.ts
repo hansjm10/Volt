@@ -15,11 +15,13 @@ import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
+	AgentLoopDelivery,
+	AgentLoopNextAction,
+	AgentLoopNextActionContext,
 	AgentMessage,
 	AgentTool,
 	AgentToolCall,
 	AgentToolResult,
-	PrepareNextTurnContext,
 	StreamFn,
 } from "./types.ts";
 
@@ -66,12 +68,9 @@ export function agentLoop(
 }
 
 /**
- * Continue an agent loop from the current context without adding a new message.
- * Used for retries - context already has user message or tool results.
- *
- * **Important:** The last message in context must convert to a `user` or `toolResult` message
- * via `convertToLlm`. If it doesn't, the LLM provider will reject the request.
- * This cannot be validated here since `convertToLlm` is only called once per turn.
+ * Continue an agent loop from the current context without an initial delivery.
+ * The next-action dispatcher may still attach a user delivery before the first
+ * request, including when the retained transcript ends with an assistant.
  */
 export function agentLoopContinue(
 	context: AgentContext,
@@ -81,10 +80,6 @@ export function agentLoopContinue(
 ): EventStream<AgentEvent, AgentMessage[]> {
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
-	}
-
-	if (context.messages[context.messages.length - 1].role === "assistant") {
-		throw new Error("Cannot continue from message role: assistant");
 	}
 
 	const stream = createAgentStream();
@@ -112,21 +107,15 @@ export async function runAgentLoop(
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
 ): Promise<AgentMessage[]> {
-	const newMessages: AgentMessage[] = [...prompts];
-	const currentContext: AgentContext = {
-		...context,
-		messages: [...context.messages, ...prompts],
+	const newMessages: AgentMessage[] = [];
+	const currentContext: AgentContext = { ...context, messages: [...context.messages] };
+	const initialAction: AgentLoopNextAction = {
+		type: "request",
+		...(prompts.length > 0 ? { deliveries: [{ messages: prompts }] } : {}),
 	};
 
 	await emit({ type: "agent_start" });
-	await emit({ type: "turn_start" });
-	for (const [index, prompt] of prompts.entries()) {
-		const finalizedPrompt = await emitCompletedMessage(prompt, emit);
-		newMessages[index] = finalizedPrompt;
-		currentContext.messages[context.messages.length + index] = finalizedPrompt;
-	}
-
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn);
+	await runLoop(currentContext, newMessages, config, initialAction, signal, emit, streamFn);
 	return newMessages;
 }
 
@@ -141,17 +130,11 @@ export async function runAgentLoopContinue(
 		throw new Error("Cannot continue: no messages in context");
 	}
 
-	if (context.messages[context.messages.length - 1].role === "assistant") {
-		throw new Error("Cannot continue from message role: assistant");
-	}
-
 	const newMessages: AgentMessage[] = [];
-	const currentContext: AgentContext = { ...context };
+	const currentContext: AgentContext = { ...context, messages: [...context.messages] };
 
 	await emit({ type: "agent_start" });
-	await emit({ type: "turn_start" });
-
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn);
+	await runLoop(currentContext, newMessages, config, { type: "request" }, signal, emit, streamFn);
 	return newMessages;
 }
 
@@ -162,136 +145,129 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
-/**
- * Main loop logic shared by agentLoop and agentLoopContinue.
- */
+/** Main request state machine shared by prompt and continuation runs. */
 async function runLoop(
 	initialContext: AgentContext,
 	newMessages: AgentMessage[],
 	initialConfig: AgentLoopConfig,
+	initialAction: AgentLoopNextAction,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
 ): Promise<void> {
 	let currentContext = initialContext;
 	let config = initialConfig;
-	let firstTurn = true;
-	let completedTurn: PrepareNextTurnContext | undefined;
-	// Check for steering messages at start (user may have typed while waiting)
-	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+	let completedTurn: AgentLoopNextActionContext["completedTurn"];
+	let pendingToolContinuation = false;
+	let defaultAction = initialAction;
 
-	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
-		let hasMoreToolCalls = true;
+		const actionContext: AgentLoopNextActionContext = {
+			context: currentContext,
+			newMessages,
+			completedTurn,
+			pendingToolContinuation,
+			defaultAction,
+		};
+		const resolvedAction = config.nextAction ? await config.nextAction(actionContext) : defaultAction;
+		const action =
+			resolvedAction.type === "pause" && resolvedAction.pendingToolContinuation === undefined
+				? { ...resolvedAction, pendingToolContinuation }
+				: resolvedAction;
 
-		// Inner loop: process tool calls and steering messages
-		while (hasMoreToolCalls || pendingMessages.length > 0) {
-			// An aborted run must not silently start another turn: without this
-			// guard the loop would call transformContext/streamFn (a fresh provider
-			// request) after abort() — e.g. when a tool finished after the run was
-			// aborted. Pending (steering) messages still get delivered: queued user
-			// input survives abort by contract, and the provider stream itself
-			// observes the aborted signal.
-			if (signal?.aborted && pendingMessages.length === 0) {
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
-			if (!firstTurn) {
-				await emit({ type: "turn_start" });
-			} else {
-				firstTurn = false;
-			}
+		if (action.type !== "request") {
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
+		if (signal?.aborted) {
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
 
-			// Process pending messages (inject before next assistant response)
-			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					const finalizedMessage = await emitCompletedMessage(message, emit);
-					currentContext.messages.push(finalizedMessage);
-					newMessages.push(finalizedMessage);
-				}
-				pendingMessages = [];
-			}
+		await emit({ type: "turn_start" });
+		const finalizedDeliveries = await emitDeliveries(action.deliveries ?? [], currentContext, newMessages, emit);
+		if (signal?.aborted) {
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
 
-			if (completedTurn) {
-				const nextTurnSnapshot = await config.prepareNextTurn?.({
-					...completedTurn,
-					context: currentContext,
-				});
-				completedTurn = undefined;
-				if (nextTurnSnapshot) {
-					currentContext = nextTurnSnapshot.context ?? currentContext;
-					config = {
-						...config,
-						model: nextTurnSnapshot.model ?? config.model,
-						reasoning:
-							nextTurnSnapshot.thinkingLevel === undefined
-								? config.reasoning
-								: nextTurnSnapshot.thinkingLevel === "off"
-									? undefined
-									: nextTurnSnapshot.thinkingLevel,
-					};
-				}
-			}
-
-			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
-			newMessages.push(message);
-
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				await emit({ type: "turn_end", message, toolResults: [] });
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
-
-			// Check for tool calls
-			const toolCalls = message.content.filter((c) => c.type === "toolCall");
-
-			const toolResults: ToolResultMessage[] = [];
-			let toolBatchTerminated = false;
-			hasMoreToolCalls = false;
-			if (toolCalls.length > 0) {
-				const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
-				toolResults.push(...executedToolBatch.messages);
-				toolBatchTerminated = executedToolBatch.terminate;
-				hasMoreToolCalls = !toolBatchTerminated;
-
-				for (const result of toolResults) {
-					currentContext.messages.push(result);
-					newMessages.push(result);
-				}
-			}
-
-			await emit({ type: "turn_end", message, toolResults });
-
-			completedTurn = {
-				message,
-				toolResults,
-				toolBatchTerminated,
-				context: currentContext,
-				newMessages,
+		const requestSnapshot = await config.prepareRequest?.({
+			...actionContext,
+			context: currentContext,
+			deliveries: finalizedDeliveries,
+		});
+		if (requestSnapshot) {
+			currentContext = requestSnapshot.context ?? currentContext;
+			config = {
+				...config,
+				model: requestSnapshot.model ?? config.model,
+				reasoning:
+					requestSnapshot.thinkingLevel === undefined
+						? config.reasoning
+						: requestSnapshot.thinkingLevel === "off"
+							? undefined
+							: requestSnapshot.thinkingLevel,
 			};
+		}
+		if (signal?.aborted) {
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
 
-			if (await config.shouldStopAfterTurn?.(completedTurn)) {
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
+		const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+		newMessages.push(message);
+		if (message.stopReason === "error" || message.stopReason === "aborted") {
+			await emit({ type: "turn_end", message, toolResults: [] });
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
+
+		const toolCalls = message.content.filter((content) => content.type === "toolCall");
+		const toolResults: ToolResultMessage[] = [];
+		let toolBatchTerminated = false;
+		if (toolCalls.length > 0) {
+			const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
+			toolResults.push(...executedToolBatch.messages);
+			toolBatchTerminated = executedToolBatch.terminate;
+			for (const result of toolResults) {
+				currentContext.messages.push(result);
+				newMessages.push(result);
 			}
-
-			pendingMessages = (await config.getSteeringMessages?.()) || [];
 		}
 
-		// Agent would stop here. Check for follow-up messages.
-		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
-		if (followUpMessages.length > 0) {
-			// Set as pending so inner loop processes them
-			pendingMessages = followUpMessages;
-			continue;
-		}
-
-		// No more messages, exit
-		break;
+		await emit({ type: "turn_end", message, toolResults });
+		completedTurn = { message, toolResults, toolBatchTerminated };
+		pendingToolContinuation = toolCalls.length > 0 && !toolBatchTerminated;
+		defaultAction = pendingToolContinuation ? { type: "request" } : { type: "stop" };
 	}
+}
 
-	await emit({ type: "agent_end", messages: newMessages });
+async function emitDeliveries(
+	deliveries: AgentLoopDelivery[],
+	context: AgentContext,
+	newMessages: AgentMessage[],
+	emit: AgentEventSink,
+): Promise<AgentLoopDelivery[]> {
+	const finalizedDeliveries: AgentLoopDelivery[] = [];
+	for (const delivery of deliveries) {
+		const finalizedMessages: AgentMessage[] = [];
+		const commitMessageIndex = delivery.commitMessageIndex ?? 0;
+		for (const [index, message] of delivery.messages.entries()) {
+			const finalizedMessage = await emitCompletedMessage(
+				message,
+				emit,
+				index === commitMessageIndex ? delivery.deliveryId : undefined,
+			);
+			context.messages.push(finalizedMessage);
+			newMessages.push(finalizedMessage);
+			finalizedMessages.push(finalizedMessage);
+		}
+		finalizedDeliveries.push({
+			...delivery,
+			messages: finalizedMessages,
+		});
+	}
+	return finalizedDeliveries;
 }
 
 /**
@@ -774,9 +750,10 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 async function emitCompletedMessage<MessageType extends AgentMessage>(
 	message: MessageType,
 	emit: AgentEventSink,
+	deliveryId?: string,
 ): Promise<MessageType> {
-	await emit({ type: "message_start", message });
-	const replacement = await emit({ type: "message_end", message });
+	await emit({ type: "message_start", message, deliveryId });
+	const replacement = await emit({ type: "message_end", message, deliveryId });
 	return resolveMessageReplacement(message, replacement);
 }
 

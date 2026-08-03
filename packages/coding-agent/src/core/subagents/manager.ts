@@ -1394,7 +1394,7 @@ export class SubagentManager {
 		// spawn failure), but only while the budget wrapper is still the installed
 		// hook.
 		const originalBeforeToolCall = runtime.session.agent.beforeToolCall;
-		const originalShouldStopAfterTurn = runtime.session.agent.shouldStopAfterTurn;
+		const originalNextAction = runtime.session.agent.nextAction;
 		const budgetBeforeToolCall: NonNullable<typeof originalBeforeToolCall> = async (context, signal) => {
 			if (requiresFinalTurnReport) {
 				// This block reason is the guaranteed instruction channel for the
@@ -1406,17 +1406,12 @@ export class SubagentManager {
 			}
 			return originalBeforeToolCall?.(context, signal);
 		};
-		const budgetShouldStopAfterTurn: NonNullable<typeof originalShouldStopAfterTurn> = async (context, signal) => {
-			// A budget stop deliberately skips the original hook
-			// (AgentSession._shouldStopForProactiveCompaction): its side effects —
-			// scheduling threshold compaction with an automatic resume and draining
-			// queued follow-ups on the next continuation — only apply to runs that
-			// keep going, and a scheduled auto-resume would contradict this stop.
-			if (stopAfterTurnForBudget) return true;
-			return (await originalShouldStopAfterTurn?.(context, signal)) ?? false;
+		const budgetNextAction: NonNullable<typeof originalNextAction> = async (context, signal) => {
+			if (stopAfterTurnForBudget && context.completedTurn) return { type: "stop" };
+			return originalNextAction ? await originalNextAction(context, signal) : context.defaultAction;
 		};
 		runtime.session.agent.beforeToolCall = budgetBeforeToolCall;
-		runtime.session.agent.shouldStopAfterTurn = budgetShouldStopAfterTurn;
+		runtime.session.agent.nextAction = budgetNextAction;
 		const unsubscribeSessionAccounting = runtime.session.subscribe(
 			(event) => {
 				if (event.type === "turn_end") {
@@ -1461,6 +1456,9 @@ export class SubagentManager {
 						// replies instead of burning a turn into the exceeded backstop.
 						requiresFinalTurnReport = true;
 						stopAfterTurnForBudget = true;
+						// A warning steering delivery may still be waiting. It must not
+						// manufacture a post-run continuation after this terminal turn.
+						void runtime.session.clearQueue().catch(() => undefined);
 						return;
 					}
 					requiresFinalTurnReport = true;
@@ -1488,8 +1486,8 @@ export class SubagentManager {
 			if (runtime.session.agent.beforeToolCall === budgetBeforeToolCall) {
 				runtime.session.agent.beforeToolCall = originalBeforeToolCall;
 			}
-			if (runtime.session.agent.shouldStopAfterTurn === budgetShouldStopAfterTurn) {
-				runtime.session.agent.shouldStopAfterTurn = originalShouldStopAfterTurn;
+			if (runtime.session.agent.nextAction === budgetNextAction) {
+				runtime.session.agent.nextAction = originalNextAction;
 			}
 		};
 		let client: InProcessRpcClient | undefined;

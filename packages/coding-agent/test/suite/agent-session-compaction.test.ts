@@ -12,8 +12,8 @@ import { createHarness, type Harness } from "./harness.ts";
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
 	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
-	_shouldStopForProactiveCompaction: (context: unknown) => boolean;
-	_handlePostAgentRun: () => Promise<boolean>;
+	_resolveProactiveCompactionAction: (context: unknown, action: { type: "request" }) => unknown;
+	_handlePostAgentRun: () => Promise<{ type: "retry" | "pause" | "pending_delivery" | "stop" }>;
 	_lastAssistantMessage: AssistantMessage | undefined;
 	_proactiveCompactionState: "idle" | "scheduled" | "compacting";
 };
@@ -344,7 +344,7 @@ describe("AgentSession compaction characterization", () => {
 		sessionInternals._proactiveCompactionState = "scheduled";
 		vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 
-		await expect(sessionInternals._handlePostAgentRun()).resolves.toBe(false);
+		await expect(sessionInternals._handlePostAgentRun()).resolves.toEqual({ type: "stop" });
 	});
 
 	it("excludes a stripped trailing error message from estimatedTokensAfter when retrying", async () => {
@@ -474,14 +474,21 @@ describe("AgentSession compaction characterization", () => {
 
 			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 			expect(
-				sessionInternals._shouldStopForProactiveCompaction({
-					message,
-					toolResults,
-					toolBatchTerminated: kind === "terminating tool batch",
-					context: { systemPrompt: "", messages: [message, ...toolResults], tools: [] },
-					newMessages: [],
-				}),
-			).toBe(true);
+				sessionInternals._resolveProactiveCompactionAction(
+					{
+						completedTurn: {
+							message,
+							toolResults,
+							toolBatchTerminated: kind === "terminating tool batch",
+						},
+						pendingToolContinuation: false,
+						defaultAction: { type: "request" },
+						context: { systemPrompt: "", messages: [message, ...toolResults], tools: [] },
+						newMessages: [],
+					},
+					{ type: "request" },
+				),
+			).toEqual({ type: "pause", pendingToolContinuation: false });
 		},
 	);
 

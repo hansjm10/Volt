@@ -8,7 +8,7 @@ import {
 } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { agentLoop, agentLoopContinue } from "../src/agent-loop.ts";
+import { agentLoop, agentLoopContinue, runAgentLoop } from "../src/agent-loop.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
 
 // Mock stream for testing - mimics MockAssistantStream
@@ -648,13 +648,12 @@ describe("agentLoop with AgentMessage", () => {
 			model: createModel(),
 			convertToLlm: identityConverter,
 			toolExecution: "sequential",
-			getSteeringMessages: async () => {
-				// Return steering message after tool execution has started.
-				if (executed.length >= 1 && !queuedDelivered) {
+			nextAction: async (actionContext) => {
+				if (actionContext.completedTurn && executed.length >= 1 && !queuedDelivered) {
 					queuedDelivered = true;
-					return [queuedUserMessage];
+					return { type: "request", deliveries: [{ messages: [queuedUserMessage] }] };
 				}
-				return [];
+				return actionContext.defaultAction;
 			},
 		};
 
@@ -964,7 +963,7 @@ describe("agentLoop with AgentMessage", () => {
 		expect(parallelObserved).toBe(true);
 	});
 
-	it("should use prepareNextTurn snapshot before continuing", async () => {
+	it("should use prepareRequest snapshot before continuing", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		const tool: AgentTool<typeof toolSchema, { value: string }> = {
 			name: "echo",
@@ -984,13 +983,11 @@ describe("agentLoop with AgentMessage", () => {
 			tools: [tool],
 		};
 		let convertedSecondTurnSystemPrompt = "";
-		let prepared = false;
 		const config: AgentLoopConfig = {
 			model: createModel(),
 			convertToLlm: identityConverter,
-			prepareNextTurn: async ({ context: currentContext }) => {
-				if (prepared) return undefined;
-				prepared = true;
+			prepareRequest: async ({ context: currentContext, completedTurn }) => {
+				if (!completedTurn) return undefined;
 				return {
 					context: {
 						systemPrompt: "second prompt",
@@ -1046,16 +1043,20 @@ describe("agentLoop with AgentMessage", () => {
 			tools: [],
 		};
 		const queuedMessage = createUserMessage("revise the result");
-		let steeringPoll = 0;
+		let delivered = false;
 		let preparedUserMessages: string[] = [];
 		const config: AgentLoopConfig = {
 			model: createModel(),
 			convertToLlm: identityConverter,
-			getSteeringMessages: async () => {
-				steeringPoll += 1;
-				return steeringPoll === 2 ? [queuedMessage] : [];
+			nextAction: async (actionContext) => {
+				if (actionContext.completedTurn && !delivered) {
+					delivered = true;
+					return { type: "request", deliveries: [{ messages: [queuedMessage] }] };
+				}
+				return actionContext.defaultAction;
 			},
-			prepareNextTurn: async ({ context: currentContext }) => {
+			prepareRequest: async ({ context: currentContext, completedTurn }) => {
+				if (!completedTurn) return undefined;
 				preparedUserMessages = currentContext.messages.flatMap((message) =>
 					message.role === "user" && typeof message.content === "string" ? [message.content] : [],
 				);
@@ -1096,7 +1097,7 @@ describe("agentLoop with AgentMessage", () => {
 		expect(secondTurnSystemPrompt).toBe("second prompt");
 	});
 
-	it("should stop after the current turn when shouldStopAfterTurn returns true", async () => {
+	it("should stop after the current turn when nextAction returns stop", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		const executed: string[] = [];
 		const tool: AgentTool<typeof toolSchema, { value: string }> = {
@@ -1119,28 +1120,20 @@ describe("agentLoop with AgentMessage", () => {
 			tools: [tool],
 		};
 
-		let steeringPolls = 0;
-		let followUpPolls = 0;
 		let callbackToolResultIds: string[] = [];
 		let callbackContextRoles: string[] = [];
 		let callbackToolBatchTerminated: boolean | undefined;
 		const config: AgentLoopConfig = {
 			model: createModel(),
 			convertToLlm: identityConverter,
-			getSteeringMessages: async () => {
-				steeringPolls++;
-				return [];
-			},
-			getFollowUpMessages: async () => {
-				followUpPolls++;
-				return [createUserMessage("follow up should stay queued")];
-			},
-			shouldStopAfterTurn: async ({ message, toolResults, toolBatchTerminated, context }) => {
-				expect(message.role).toBe("assistant");
-				callbackToolResultIds = toolResults.map((toolResult) => toolResult.toolCallId);
-				callbackContextRoles = context.messages.map((contextMessage) => contextMessage.role);
-				callbackToolBatchTerminated = toolBatchTerminated;
-				return true;
+			nextAction: async (actionContext) => {
+				const completedTurn = actionContext.completedTurn;
+				if (!completedTurn) return actionContext.defaultAction;
+				expect(completedTurn.message.role).toBe("assistant");
+				callbackToolResultIds = completedTurn.toolResults.map((toolResult) => toolResult.toolCallId);
+				callbackContextRoles = actionContext.context.messages.map((contextMessage) => contextMessage.role);
+				callbackToolBatchTerminated = completedTurn.toolBatchTerminated;
+				return { type: "stop" };
 			},
 		};
 
@@ -1175,8 +1168,6 @@ describe("agentLoop with AgentMessage", () => {
 		const messages = await stream.result();
 		expect(llmCalls).toBe(1);
 		expect(executed).toEqual(["hello"]);
-		expect(steeringPolls).toBe(1);
-		expect(followUpPolls).toBe(0);
 		expect(callbackToolResultIds).toEqual(["tool-1"]);
 		expect(callbackContextRoles).toEqual(["user", "assistant", "toolResult"]);
 		expect(callbackToolBatchTerminated).toBe(false);
@@ -1195,6 +1186,52 @@ describe("agentLoop with AgentMessage", () => {
 			"turn_end",
 			"agent_end",
 		]);
+	});
+
+	it("resolves the terminal action after turn_end without preparing another request", async () => {
+		let actionCalls = 0;
+		let requestPreparations = 0;
+		let successfulTurns = 0;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			nextAction: (context) => {
+				actionCalls++;
+				if (context.completedTurn) {
+					expect(successfulTurns).toBe(1);
+					return { type: "stop" };
+				}
+				return context.defaultAction;
+			},
+			prepareRequest: () => {
+				requestPreparations++;
+				return undefined;
+			},
+		};
+		await runAgentLoop(
+			[createUserMessage("hello")],
+			{ systemPrompt: "", messages: [] },
+			config,
+			async (event) => {
+				if (event.type === "turn_end") successfulTurns++;
+			},
+			undefined,
+			() => {
+				const mockStream = new MockAssistantStream();
+				queueMicrotask(() => {
+					mockStream.push({
+						type: "done",
+						seq: 1,
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "done" }]),
+					});
+				});
+				return mockStream;
+			},
+		);
+
+		expect(actionCalls).toBe(2);
+		expect(requestPreparations).toBe(1);
 	});
 
 	it("should stop after a tool batch when every tool result sets terminate=true", async () => {
@@ -1223,9 +1260,9 @@ describe("agentLoop with AgentMessage", () => {
 		const config: AgentLoopConfig = {
 			model: createModel(),
 			convertToLlm: identityConverter,
-			shouldStopAfterTurn: (turn) => {
-				toolBatchTerminated = turn.toolBatchTerminated;
-				return false;
+			nextAction: (actionContext) => {
+				toolBatchTerminated = actionContext.completedTurn?.toolBatchTerminated;
+				return actionContext.defaultAction;
 			},
 		};
 
