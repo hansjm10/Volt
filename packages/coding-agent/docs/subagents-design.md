@@ -26,7 +26,7 @@ The implementation reuses Volt's existing primitives instead of introducing a se
 - Iroh conversation streams already provide remote multi-agent streams for the app.
 - Existing RPC `prompt`, `abort`, `get_state`, `get_transcript`, and `agent_end` events remain the transport contract; the session additionally emits `agent_settled` once retries, compaction continuations, and queued continuations finish, and local handles wait for that settlement before releasing child ownership.
 
-The [`examples/extensions/subagent/`](../examples/extensions/subagent/) implementation remains the reference prototype for workflow shape. The core MVP avoids subprocess and JSON-mode parsing fallback.
+The core in-process implementation is the authoritative policy and lifecycle boundary for subagents. Subprocess execution and JSON-mode parsing fallback remain out of scope.
 
 ## Existing building blocks
 
@@ -34,7 +34,6 @@ The [`examples/extensions/subagent/`](../examples/extensions/subagent/) implemen
 - **SDK runtime** ([sdk.md](sdk.md)): creates and replaces `AgentSessionRuntime` instances.
 - **In-process RPC client**: `createInProcessRpcClient()` runs `runRpcMode()` over an in-memory loopback transport.
 - **Iroh remote conversation streams** ([iroh-remote-protocol.md](iroh-remote-protocol.md)): mobile clients can open `conversation.target: "new"` or `"session"` streams. Stream close is detach; `abort` is cancellation.
-- **Subagent extension prototype**: [`../examples/extensions/subagent/`](../examples/extensions/subagent/) defines markdown agents and a `subagent` tool with single, parallel, and chain modes.
 
 ## Goals
 
@@ -61,7 +60,7 @@ The [`examples/extensions/subagent/`](../examples/extensions/subagent/) implemen
 
 ## Agent definitions
 
-Core subagents use the markdown frontmatter shape from the extension prototype:
+Core subagent definitions are markdown files with YAML frontmatter. The frontmatter declares the stable invocation name, user-visible description, requested tool and delegation policy, optional model and thinking configuration, and the markdown body supplies the child prompt context. See the canonical user-facing [Subagents documentation](usage.md#subagents-mvp) for format and behavior:
 
 ```markdown
 ---
