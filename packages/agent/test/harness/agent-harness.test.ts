@@ -118,7 +118,7 @@ describe("AgentHarness", () => {
 		expect(steerQueueLengths).toEqual([1, 2, 1, 0]);
 	});
 
-	it("abort revokes a leased steering delivery during turn_start without losing its payload", async () => {
+	it("abort after a steering delivery begins does not report its payload as revoked", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);
 		let providerCalls = 0;
@@ -128,9 +128,10 @@ describe("AgentHarness", () => {
 				return fauxAssistantMessage("first");
 			},
 		]);
+		const session = new Session(new InMemorySessionStorage());
 		const harness = new AgentHarness({
 			env: new NodeExecutionEnv({ cwd: process.cwd() }),
-			session: new Session(new InMemorySessionStorage()),
+			session,
 			model: registration.getModel(),
 		});
 		let turnStarts = 0;
@@ -139,7 +140,7 @@ describe("AgentHarness", () => {
 		harness.subscribe(async (event) => {
 			if (event.type === "message_start" && event.message.role === "assistant" && !queued) {
 				queued = true;
-				await harness.steer("cancel before begin");
+				await harness.steer("committed before abort");
 			}
 			if (event.type === "turn_start" && ++turnStarts === 2) {
 				abortResult = harness.abort();
@@ -148,10 +149,11 @@ describe("AgentHarness", () => {
 
 		await harness.prompt("hello");
 		const aborted = await abortResult;
+		const persistedMessages = (await session.buildContext()).messages as AgentMessage[];
 
 		expect(providerCalls).toBe(1);
-		expect(aborted?.clearedSteer).toHaveLength(1);
-		expect(textFromUserMessages(aborted?.clearedSteer ?? [])).toEqual(["cancel before begin"]);
+		expect(aborted?.clearedSteer).toEqual([]);
+		expect(textFromUserMessages(persistedMessages)).toEqual(["hello", "committed before abort"]);
 	});
 
 	it("prepares a queued request from the post-delivery session snapshot", async () => {
