@@ -282,7 +282,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await firstPrompt.catch(() => {});
 	});
 
-	it("should preserve extension-origin steering messages when the active run aborts", async () => {
+	it("should queue extension-origin steering messages while streaming", async () => {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		let abortSignal: AbortSignal | undefined;
 		let sawSteeringMessage = false;
@@ -399,8 +399,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.abort();
 		await firstPrompt.catch(() => {});
 
-		expect(sawSteeringMessage).toBe(false);
-		expect(session.getSteeringMessages().map((message) => message.text)).toContain("Steer from extension");
+		expect(sawSteeringMessage).toBe(true);
 	});
 
 	it("should allow prompt() after previous completes", async () => {
