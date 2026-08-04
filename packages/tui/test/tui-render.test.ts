@@ -37,6 +37,12 @@ class LoggingVirtualTerminal extends VirtualTerminal {
 	}
 }
 
+function lineAt(lines: string[], index: number): string {
+	const line = lines[index];
+	assert.notStrictEqual(line, undefined, `Expected rendered line at index ${index}`);
+	return line ?? "";
+}
+
 async function withEnv<T>(updates: Record<string, string | undefined>, run: () => Promise<T>): Promise<T> {
 	const previousValues = new Map<string, string | undefined>();
 	for (const [key, value] of Object.entries(updates)) {
@@ -112,7 +118,7 @@ describe("TUI Kitty image cleanup", () => {
 				{ widthPx: 20, heightPx: 20 },
 			);
 			const imageLines = image.render(40);
-			const imageSequence = imageLines[0];
+			const imageSequence = lineAt(imageLines, 0);
 			component.lines = ["before", ...imageLines, "after"];
 			tui.requestRender();
 			await terminal.waitForRender();
@@ -193,7 +199,7 @@ describe("TUI Kitty image cleanup", () => {
 				{ widthPx: 30, heightPx: 30 },
 			);
 			const imageLines = image.render(40);
-			const imageSequence = imageLines[0];
+			const imageSequence = lineAt(imageLines, 0);
 			component.lines = ["l0", "l1", "l2", "l3", "l4", ...imageLines, "after"];
 			tui.requestRender();
 			await terminal.waitForRender();
@@ -238,7 +244,7 @@ describe("TUI Kitty image cleanup", () => {
 				{ widthPx: 60, heightPx: 60 },
 			);
 			const imageLines = image.render(40);
-			const imageSequence = imageLines[0];
+			const imageSequence = lineAt(imageLines, 0);
 			assert.ok(imageLines.length > terminal.rows, "test image should exceed the viewport height");
 
 			component.lines = ["before", ...imageLines, "after"];

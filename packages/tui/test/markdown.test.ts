@@ -231,9 +231,13 @@ describe("Markdown component", () => {
 			assert.strictEqual(numberedLines.length, 3, `Expected 3 numbered items, got: ${numberedLines.join(", ")}`);
 
 			// Check the actual numbers
-			assert.ok(numberedLines[0].startsWith("1."), `First item should be "1.", got: ${numberedLines[0]}`);
-			assert.ok(numberedLines[1].startsWith("2."), `Second item should be "2.", got: ${numberedLines[1]}`);
-			assert.ok(numberedLines[2].startsWith("3."), `Third item should be "3.", got: ${numberedLines[2]}`);
+			const [firstItem, secondItem, thirdItem] = numberedLines;
+			assert.ok(firstItem, "Expected first numbered item");
+			assert.ok(secondItem, "Expected second numbered item");
+			assert.ok(thirdItem, "Expected third numbered item");
+			assert.ok(firstItem.startsWith("1."), `First item should be "1.", got: ${firstItem}`);
+			assert.ok(secondItem.startsWith("2."), `Second item should be "2.", got: ${secondItem}`);
+			assert.ok(thirdItem.startsWith("3."), `Third item should be "3.", got: ${thirdItem}`);
 		});
 
 		it("should indent wrapped unordered list lines", () => {

@@ -10,8 +10,8 @@ const XtermTerminal = xterm.Terminal;
  */
 export class VirtualTerminal implements Terminal {
 	private xterm: XtermTerminalType;
-	private inputHandler?: (data: string) => void;
-	private resizeHandler?: () => void;
+	private inputHandler: ((data: string) => void) | undefined;
+	private resizeHandler: (() => void) | undefined;
 	private _columns: number;
 	private _rows: number;
 	private _focusState: TerminalFocusState = "unknown";

@@ -3,8 +3,8 @@ import { describe, it } from "node:test";
 import { type Component, parseOsc11BackgroundColor, type Terminal, TUI } from "../src/index.ts";
 
 class TestTerminal implements Terminal {
-	private inputHandler?: (data: string) => void;
-	private resizeHandler?: () => void;
+	private inputHandler: ((data: string) => void) | undefined;
+	private resizeHandler: (() => void) | undefined;
 	private readonly columnCount: number;
 	private readonly rowCount: number;
 	readonly writes: string[] = [];

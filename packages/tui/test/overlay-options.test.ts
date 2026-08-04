@@ -6,7 +6,7 @@ import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class StaticOverlay implements Component {
 	private lines: string[];
-	requestedWidth?: number;
+	requestedWidth: number | undefined;
 
 	constructor(lines: string[], requestedWidth?: number) {
 		this.lines = lines;

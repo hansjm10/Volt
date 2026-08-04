@@ -348,14 +348,12 @@ describe("ProcessTerminal dimensions", () => {
 	it("falls back to COLUMNS and LINES before default dimensions", () => {
 		const previousColumnsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
 		const previousRowsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "rows");
-		const previousColumns = process.env.COLUMNS;
-		const previousLines = process.env.LINES;
+		const { COLUMNS: previousColumns, LINES: previousLines } = process.env;
 
 		try {
 			Object.defineProperty(process.stdout, "columns", { value: undefined, configurable: true });
 			Object.defineProperty(process.stdout, "rows", { value: undefined, configurable: true });
-			process.env.COLUMNS = "123";
-			process.env.LINES = "45";
+			Object.assign(process.env, { COLUMNS: "123", LINES: "45" });
 
 			const terminal = new ProcessTerminal();
 
@@ -373,14 +371,14 @@ describe("ProcessTerminal dimensions", () => {
 				Reflect.deleteProperty(process.stdout, "rows");
 			}
 			if (previousColumns === undefined) {
-				delete process.env.COLUMNS;
+				Reflect.deleteProperty(process.env, "COLUMNS");
 			} else {
-				process.env.COLUMNS = previousColumns;
+				Object.assign(process.env, { COLUMNS: previousColumns });
 			}
 			if (previousLines === undefined) {
-				delete process.env.LINES;
+				Reflect.deleteProperty(process.env, "LINES");
 			} else {
-				process.env.LINES = previousLines;
+				Object.assign(process.env, { LINES: previousLines });
 			}
 		}
 	});

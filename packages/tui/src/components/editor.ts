@@ -282,12 +282,12 @@ export class Editor implements Component, Focusable {
 	private autocompleteTriggerCharacters = [...DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS];
 	private autocompleteTriggerPattern = buildTriggerPattern(this.autocompleteTriggerCharacters);
 	private autocompleteDebouncePattern = buildDebouncePattern(this.autocompleteTriggerCharacters);
-	private autocompleteList?: SelectList;
+	private autocompleteList: SelectList | undefined;
 	private autocompleteState: "regular" | "force" | null = null;
 	private autocompletePrefix: string = "";
 	private autocompleteMaxVisible: number = 5;
-	private autocompleteAbort?: AbortController;
-	private autocompleteDebounceTimer?: ReturnType<typeof setTimeout>;
+	private autocompleteAbort: AbortController | undefined;
+	private autocompleteDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 	private autocompleteRequestTask: Promise<void> = Promise.resolve();
 	private autocompleteStartToken: number = 0;
 	private autocompleteRequestId: number = 0;
@@ -1376,7 +1376,9 @@ export class Editor implements Component, Focusable {
 		let currentVisualCol: number;
 		if (this.snappedFromCursorCol !== null) {
 			const vlIndex = this.findVisualLineAt(visualLines, currentVL.logicalLine, this.snappedFromCursorCol);
-			currentVisualCol = this.snappedFromCursorCol - visualLines[vlIndex].startCol;
+			const resolvedCurrentVL = visualLines[vlIndex];
+			if (!resolvedCurrentVL) return;
+			currentVisualCol = this.snappedFromCursorCol - resolvedCurrentVL.startCol;
 		} else {
 			currentVisualCol = this.state.cursorCol - currentVL.startCol;
 		}
@@ -1417,11 +1419,15 @@ export class Editor implements Component, Focusable {
 					// continuation VLs and land on the first VL past it.
 					const segEnd = seg.index + seg.segment.length;
 					let next = targetVisualLine + 1;
-					while (
-						next < visualLines.length &&
-						visualLines[next].logicalLine === targetVL.logicalLine &&
-						visualLines[next].startCol < segEnd
-					) {
+					while (next < visualLines.length) {
+						const nextVisualLine = visualLines[next];
+						if (
+							!nextVisualLine ||
+							nextVisualLine.logicalLine !== targetVL.logicalLine ||
+							nextVisualLine.startCol >= segEnd
+						) {
+							break;
+						}
 						next++;
 					}
 					if (next < visualLines.length) {

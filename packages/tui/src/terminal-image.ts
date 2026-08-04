@@ -63,15 +63,27 @@ function probeTmuxHyperlinks(): boolean {
 }
 
 export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeTmuxHyperlinks): TerminalCapabilities {
-	const termProgram = process.env.TERM_PROGRAM?.toLowerCase() || "";
-	const terminalEmulator = process.env.TERMINAL_EMULATOR?.toLowerCase() || "";
-	const term = process.env.TERM?.toLowerCase() || "";
-	const colorTerm = process.env.COLORTERM?.toLowerCase() || "";
+	const {
+		TERM_PROGRAM,
+		TERMINAL_EMULATOR,
+		TERM,
+		COLORTERM,
+		TMUX,
+		KITTY_WINDOW_ID,
+		GHOSTTY_RESOURCES_DIR,
+		WEZTERM_PANE,
+		ITERM_SESSION_ID,
+		WT_SESSION,
+	} = process.env;
+	const termProgram = TERM_PROGRAM?.toLowerCase() || "";
+	const terminalEmulator = TERMINAL_EMULATOR?.toLowerCase() || "";
+	const term = TERM?.toLowerCase() || "";
+	const colorTerm = COLORTERM?.toLowerCase() || "";
 	const hasTrueColorHint = colorTerm === "truecolor" || colorTerm === "24bit";
 
 	// Emit OSC 8 hyperlinks only when tmux confirms it forwards.
 	// Image protocols are unreliable under tmux, so leave `images: null`.
-	if (process.env.TMUX || term.startsWith("tmux")) {
+	if (TMUX || term.startsWith("tmux")) {
 		return { images: null, trueColor: hasTrueColorHint, hyperlinks: tmuxForwardsHyperlink() };
 	}
 
@@ -80,23 +92,23 @@ export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeT
 		return { images: null, trueColor: hasTrueColorHint, hyperlinks: false };
 	}
 
-	if (process.env.KITTY_WINDOW_ID || termProgram === "kitty") {
+	if (KITTY_WINDOW_ID || termProgram === "kitty") {
 		return { images: "kitty", trueColor: true, hyperlinks: true };
 	}
 
-	if (termProgram === "ghostty" || term.includes("ghostty") || process.env.GHOSTTY_RESOURCES_DIR) {
+	if (termProgram === "ghostty" || term.includes("ghostty") || GHOSTTY_RESOURCES_DIR) {
 		return { images: "kitty", trueColor: true, hyperlinks: true };
 	}
 
-	if (process.env.WEZTERM_PANE || termProgram === "wezterm") {
+	if (WEZTERM_PANE || termProgram === "wezterm") {
 		return { images: "kitty", trueColor: true, hyperlinks: true };
 	}
 
-	if (process.env.ITERM_SESSION_ID || termProgram === "iterm.app") {
+	if (ITERM_SESSION_ID || termProgram === "iterm.app") {
 		return { images: "iterm2", trueColor: true, hyperlinks: true };
 	}
 
-	if (process.env.WT_SESSION) {
+	if (WT_SESSION) {
 		return { images: null, trueColor: true, hyperlinks: true };
 	}
 
@@ -323,7 +335,7 @@ export function getJpegDimensions(base64Data: string): ImageDimensions | null {
 				continue;
 			}
 
-			const marker = buffer[offset + 1];
+			const marker = buffer.readUInt8(offset + 1);
 
 			if (marker >= 0xc0 && marker <= 0xc2) {
 				const height = buffer.readUInt16BE(offset + 5);
@@ -397,8 +409,8 @@ export function getWebpDimensions(base64Data: string): ImageDimensions | null {
 			return { widthPx: width, heightPx: height };
 		} else if (chunk === "VP8X") {
 			if (buffer.length < 30) return null;
-			const width = (buffer[24] | (buffer[25] << 8) | (buffer[26] << 16)) + 1;
-			const height = (buffer[27] | (buffer[28] << 8) | (buffer[29] << 16)) + 1;
+			const width = buffer.readUIntLE(24, 3) + 1;
+			const height = buffer.readUIntLE(27, 3) + 1;
 			return { widthPx: width, heightPx: height };
 		}
 
@@ -442,10 +454,14 @@ export function renderImage(
 		const sequence = encodeKitty(base64Data, {
 			columns: size.columns,
 			rows: size.rows,
-			imageId: options.imageId,
-			moveCursor: options.moveCursor,
+			...(options.imageId === undefined ? {} : { imageId: options.imageId }),
+			...(options.moveCursor === undefined ? {} : { moveCursor: options.moveCursor }),
 		});
-		return { sequence, rows: size.rows, imageId: options.imageId };
+		return {
+			sequence,
+			rows: size.rows,
+			...(options.imageId === undefined ? {} : { imageId: options.imageId }),
+		};
 	}
 
 	if (caps.images === "iterm2") {

@@ -14,7 +14,7 @@
 		"clean": "npm run clean --workspaces",
 		"build": "cd packages/tui && npm run build && cd ../ai && npm run build && cd ../agent && npm run build && cd ../coding-agent && npm run build",
 		"benchmark:streaming-markdown": "node --experimental-strip-types --conditions volt-source packages/coding-agent/benchmarks/streaming-markdown.ts",
-		"check": "biome check --write --error-on-warnings . && npm run check:pinned-deps && npm run check:changesets && npm run check:ts-imports && npm run check:coding-agent-source-exports && npm run check:shrinkwrap && npm run check:rpc-contract && npm run check:release-security && tsgo --noEmit && npm run check:browser-smoke",
+		"check": "biome check --write --error-on-warnings . && npm run check:pinned-deps && npm run check:changesets && npm run check:ts-imports && npm run check:coding-agent-source-exports && npm run check:shrinkwrap && npm run check:rpc-contract && npm run check:release-security && tsgo --noEmit && tsgo --noEmit -p packages/tui/tsconfig.json && npm run check:browser-smoke",
 		"check:browser-smoke": "node scripts/check-browser-smoke.mjs",
 		"check:coding-agent-source-exports": "node scripts/check-coding-agent-source-exports.mjs",
 		"check:pinned-deps": "node scripts/check-pinned-deps.mjs",
