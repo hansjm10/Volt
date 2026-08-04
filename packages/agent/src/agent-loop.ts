@@ -87,7 +87,7 @@ export function agentLoopContinue(
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
 	}
-	if (context.messages.at(-1)?.role === "assistant" && !config.nextAction) {
+	if (context.messages.at(-1)?.role === "assistant" && !usesNextActionProtocol(config)) {
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
@@ -161,7 +161,7 @@ export async function runAgentLoopContinue(
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
 	}
-	if (context.messages.at(-1)?.role === "assistant" && !config.nextAction) {
+	if (context.messages.at(-1)?.role === "assistant" && !usesNextActionProtocol(config)) {
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
@@ -228,17 +228,13 @@ async function runDispatchedLoop(
 			pendingToolContinuation,
 			defaultAction,
 		};
-		const resolvedAction = await resolveNextAction(config, actionContext);
+		const { action: resolvedAction, transferredDeliveries } = await resolveNextAction(config, actionContext, signal);
 		const action =
 			resolvedAction.type === "pause" && resolvedAction.pendingToolContinuation === undefined
 				? { ...resolvedAction, pendingToolContinuation }
 				: resolvedAction;
 
 		if (action.type !== "request") {
-			await emit({ type: "agent_end", messages: newMessages });
-			return;
-		}
-		if (signal?.aborted) {
 			await emit({ type: "agent_end", messages: newMessages });
 			return;
 		}
@@ -250,30 +246,28 @@ async function runDispatchedLoop(
 			emit,
 			signal,
 			config.beginDelivery,
+			transferredDeliveries,
 		);
 		if (action.reason === "delivery" && finalizedDeliveries.length === 0) {
 			await emit({ type: "agent_end", messages: newMessages });
 			return;
 		}
-		if (signal?.aborted) {
-			await emit({ type: "agent_end", messages: newMessages });
-			return;
-		}
-
 		const requestContext = {
 			...actionContext,
 			context: currentContext,
 			deliveries: finalizedDeliveries,
 		};
-		const requestSnapshot = config.prepareRequest
-			? await config.prepareRequest(requestContext)
-			: completedTurn
-				? await config.prepareNextTurn?.({
-						...completedTurn,
-						context: currentContext,
-						newMessages,
-					})
-				: undefined;
+		const requestSnapshot = signal?.aborted
+			? undefined
+			: config.prepareRequest
+				? await config.prepareRequest(requestContext)
+				: completedTurn
+					? await config.prepareNextTurn?.({
+							...completedTurn,
+							context: currentContext,
+							newMessages,
+						})
+					: undefined;
 		if (requestSnapshot) {
 			currentContext = requestSnapshot.context ?? currentContext;
 			config = {
@@ -287,13 +281,52 @@ async function runDispatchedLoop(
 							: requestSnapshot.thinkingLevel,
 			};
 		}
-		if (signal?.aborted) {
+
+		let turnStarted = false;
+		if (!signal?.aborted) {
+			await emit({ type: "turn_start" });
+			turnStarted = true;
+		}
+		const message = signal?.aborted
+			? undefined
+			: await streamAssistantResponse(
+					currentContext,
+					config,
+					signal,
+					emit,
+					{ cancelOnPreflightAbort: true, validateProviderTail: true },
+					streamFn,
+				);
+		if (!message) {
+			if (!turnStarted) await emit({ type: "turn_start" });
+			const preflightAbortedMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "" }],
+				api: config.model.api,
+				provider: config.model.provider,
+				model: config.model.id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "aborted",
+				errorMessage: "Request was aborted",
+				timestamp: Date.now(),
+			} satisfies AssistantMessage;
+			currentContext.messages.push(preflightAbortedMessage);
+			await emit({ type: "message_start", message: preflightAbortedMessage });
+			const replacement = await emit({ type: "message_end", message: preflightAbortedMessage });
+			const abortedMessage = resolveMessageReplacement(preflightAbortedMessage, replacement);
+			currentContext.messages[currentContext.messages.length - 1] = abortedMessage;
+			newMessages.push(abortedMessage);
+			await emit({ type: "turn_end", message: abortedMessage, toolResults: [] });
 			await emit({ type: "agent_end", messages: newMessages });
 			return;
 		}
-
-		await emit({ type: "turn_start" });
-		const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 		newMessages.push(message);
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
 			await emit({ type: "turn_end", message, toolResults: [] });
@@ -380,7 +413,18 @@ async function runLegacyLoop(
 				}
 			}
 
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+			const message = await streamAssistantResponse(
+				currentContext,
+				config,
+				signal,
+				emit,
+				{ cancelOnPreflightAbort: false, validateProviderTail: false },
+				streamFn,
+			);
+			if (!message) {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -433,11 +477,19 @@ async function runLegacyLoop(
 	await emit({ type: "agent_end", messages: newMessages });
 }
 
+interface ResolvedAgentLoopNextAction {
+	action: AgentLoopNextAction;
+	transferredDeliveries: AgentLoopDelivery[];
+}
+
 async function resolveNextAction(
 	config: AgentLoopConfig,
 	context: AgentLoopNextActionContext,
-): Promise<AgentLoopNextAction> {
-	if (config.nextAction) return await config.nextAction(context);
+	signal: AbortSignal | undefined,
+): Promise<ResolvedAgentLoopNextAction> {
+	if (config.nextAction) {
+		return { action: await config.nextAction(context), transferredDeliveries: [] };
+	}
 
 	if (
 		context.completedTurn &&
@@ -447,24 +499,42 @@ async function resolveNextAction(
 			newMessages: context.newMessages,
 		}))
 	) {
-		return { type: "stop" };
+		return { action: { type: "stop" }, transferredDeliveries: [] };
 	}
 
 	const defaultRequest = context.defaultAction.type === "request" ? context.defaultAction : undefined;
-	const steering = (await config.getSteeringMessages?.()) ?? [];
-	if (steering.length > 0) {
+	if (signal?.aborted) {
 		return {
-			type: "request",
-			reason: defaultRequest?.reason === "continuation" ? "continuation" : "delivery",
-			deliveries: [...(defaultRequest?.deliveries ?? []), { messages: steering }],
+			action: defaultRequest?.reason === "continuation" ? defaultRequest : { type: "stop" },
+			transferredDeliveries: [],
 		};
 	}
-	if (defaultRequest) return defaultRequest;
+	const steering = (await config.getSteeringMessages?.()) ?? [];
+	if (steering.length > 0) {
+		const transferredDelivery: AgentLoopDelivery = { messages: steering };
+		return {
+			action: {
+				type: "request",
+				reason: defaultRequest?.reason === "continuation" ? "continuation" : "delivery",
+				deliveries: [...(defaultRequest?.deliveries ?? []), transferredDelivery],
+			},
+			transferredDeliveries: [transferredDelivery],
+		};
+	}
+	if (defaultRequest) return { action: defaultRequest, transferredDeliveries: [] };
 
+	if (signal?.aborted) {
+		return { action: { type: "stop" }, transferredDeliveries: [] };
+	}
 	const followUps = (await config.getFollowUpMessages?.()) ?? [];
-	return followUps.length > 0
-		? { type: "request", reason: "delivery", deliveries: [{ messages: followUps }] }
-		: { type: "stop" };
+	if (followUps.length === 0) {
+		return { action: { type: "stop" }, transferredDeliveries: [] };
+	}
+	const transferredDelivery: AgentLoopDelivery = { messages: followUps };
+	return {
+		action: { type: "request", reason: "delivery", deliveries: [transferredDelivery] },
+		transferredDeliveries: [transferredDelivery],
+	};
 }
 
 async function emitDeliveries(
@@ -473,15 +543,17 @@ async function emitDeliveries(
 	newMessages: AgentMessage[],
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
-	beginDelivery?: (delivery: AgentLoopDelivery) => boolean,
+	beginDelivery: ((delivery: AgentLoopDelivery) => boolean) | undefined,
+	transferredDeliveries: AgentLoopDelivery[],
 ): Promise<AgentLoopDelivery[]> {
 	const finalizedDeliveries: AgentLoopDelivery[] = [];
 	for (const delivery of deliveries) {
-		if (signal?.aborted) break;
-		if (beginDelivery && !beginDelivery(delivery)) continue;
-		if (delivery.deliveryId !== undefined) {
-			await emit({ type: "delivery_start", deliveryId: delivery.deliveryId, messages: delivery.messages });
+		const ownershipTransferred = transferredDeliveries.includes(delivery);
+		if (!ownershipTransferred) {
+			if (signal?.aborted) continue;
+			if (beginDelivery && !beginDelivery(delivery)) continue;
 		}
+		await emit({ type: "delivery_start", deliveryId: delivery.deliveryId, messages: delivery.messages });
 		const finalizedMessages: AgentMessage[] = [];
 		for (const message of delivery.messages) {
 			const finalizedMessage = await emitCompletedMessage(message, emit, delivery.deliveryId);
@@ -497,6 +569,11 @@ async function emitDeliveries(
 	return finalizedDeliveries;
 }
 
+interface StreamAssistantResponsePolicy {
+	cancelOnPreflightAbort: boolean;
+	validateProviderTail: boolean;
+}
+
 /**
  * Stream an assistant response from the LLM.
  * This is where AgentMessage[] gets transformed to Message[] for the LLM.
@@ -506,17 +583,20 @@ async function streamAssistantResponse(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	policy: StreamAssistantResponsePolicy,
 	streamFn?: StreamFn,
-): Promise<AssistantMessage> {
+): Promise<AssistantMessage | undefined> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
 	if (config.transformContext) {
 		messages = await config.transformContext(messages, signal);
 	}
+	if (policy.cancelOnPreflightAbort && signal?.aborted) return undefined;
 
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
 	const llmMessages = await config.convertToLlm(messages);
-	if (llmMessages.at(-1)?.role === "assistant") {
+	if (policy.cancelOnPreflightAbort && signal?.aborted) return undefined;
+	if (policy.validateProviderTail && llmMessages.at(-1)?.role === "assistant") {
 		throw new Error("Cannot request with an assistant message at the provider transcript tail");
 	}
 
@@ -532,12 +612,15 @@ async function streamAssistantResponse(
 	// Resolve API key (important for expiring tokens)
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+	if (policy.cancelOnPreflightAbort && signal?.aborted) return undefined;
 
-	const response = await streamFunction(config.model, llmContext, {
+	const streamOptions = {
 		...config,
 		apiKey: resolvedApiKey,
 		signal,
-	});
+	};
+	if (policy.cancelOnPreflightAbort && signal?.aborted) return undefined;
+	const response = await streamFunction(config.model, llmContext, streamOptions);
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;

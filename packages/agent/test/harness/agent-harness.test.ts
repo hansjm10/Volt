@@ -550,6 +550,50 @@ describe("AgentHarness", () => {
 		expect(secondRequestText).toEqual(["first", "next", "second"]);
 	});
 
+	it("settles with an aborted assistant when context preflight is aborted", async () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		const session = new Session(new InMemorySessionStorage());
+		const harness = new AgentHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: registration.getModel(),
+		});
+		const contextStarted = deferred();
+		const releaseContext = deferred();
+		const lifecycle: string[] = [];
+		harness.on("context", async (event) => {
+			contextStarted.resolve();
+			await releaseContext.promise;
+			return { messages: event.messages };
+		});
+		harness.subscribe((event) => {
+			if (event.type === "message_start" && event.message.role === "assistant") {
+				lifecycle.push("message_start");
+			} else if (event.type === "message_end" && event.message.role === "assistant") {
+				lifecycle.push(`message_end:${event.message.stopReason}`);
+			} else if (event.type === "turn_end") {
+				lifecycle.push("turn_end");
+			} else if (event.type === "agent_end" || event.type === "settled") {
+				lifecycle.push(event.type);
+			}
+		});
+
+		const promptPromise = harness.prompt("hello");
+		await contextStarted.promise;
+		const abortPromise = harness.abort();
+		releaseContext.resolve();
+		const [response] = await Promise.all([promptPromise, abortPromise]);
+
+		expect(response).toMatchObject({ role: "assistant", stopReason: "aborted" });
+		expect(lifecycle).toEqual(["message_start", "message_end:aborted", "turn_end", "agent_end", "settled"]);
+		const persistedMessages = (await session.getEntries()).flatMap((entry) =>
+			entry.type === "message" ? [entry.message] : [],
+		);
+		expect(persistedMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
+		expect(persistedMessages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+	});
+
 	it("drains follow-up messages one at a time after the agent would otherwise stop", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);
