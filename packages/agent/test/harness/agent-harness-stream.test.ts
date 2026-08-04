@@ -26,6 +26,14 @@ function captureOptions(options: StreamOptions | undefined): StreamOptions {
 	};
 }
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+	let resolve = () => {};
+	const promise = new Promise<void>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
 describe("AgentHarness stream configuration", () => {
 	it("snapshots stream options and merges auth headers before provider request hooks", async () => {
 		let capturedOptions: StreamOptions | undefined;
@@ -77,6 +85,82 @@ describe("AgentHarness stream configuration", () => {
 		});
 		expect(capturedOptions?.headers).toEqual({ "x-base": "base", "x-auth": "auth", "x-hook": "hook" });
 		expect(capturedOptions?.metadata).toEqual({ base: true, hook: true });
+	});
+
+	it("stops before provider hooks when aborted during credential resolution", async () => {
+		const credentialsStarted = deferred();
+		const releaseCredentials = deferred();
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		registration.setResponses([() => fauxAssistantMessage("should not be used")]);
+		const session = new Session(new InMemorySessionStorage());
+		let providerHookCalls = 0;
+		const harness = createHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: registration.getModel(),
+			getApiKeyAndHeaders: async () => {
+				credentialsStarted.resolve();
+				await releaseCredentials.promise;
+				return { apiKey: "secret" };
+			},
+		});
+		harness.on("before_provider_request", () => {
+			providerHookCalls++;
+			return undefined;
+		});
+
+		const promptPromise = harness.prompt("hello");
+		await credentialsStarted.promise;
+		const abortPromise = harness.abort();
+		releaseCredentials.resolve();
+		const response = await promptPromise;
+		await abortPromise;
+		const persistedMessages = await session.buildContext();
+
+		expect(providerHookCalls).toBe(0);
+		expect(registration.state.callCount).toBe(0);
+		expect(registration.getPendingResponseCount()).toBe(1);
+		expect(response).toMatchObject({ role: "assistant", stopReason: "aborted", errorMessage: "Request was aborted" });
+		expect(persistedMessages.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+	});
+
+	it("stops later request hooks and provider startup when aborted in a request hook", async () => {
+		const requestHookStarted = deferred();
+		const releaseRequestHook = deferred();
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		registration.setResponses([() => fauxAssistantMessage("should not be used")]);
+		const session = new Session(new InMemorySessionStorage());
+		const harness = createHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: registration.getModel(),
+		});
+		let laterHookCalls = 0;
+		harness.on("before_provider_request", async () => {
+			requestHookStarted.resolve();
+			await releaseRequestHook.promise;
+			return undefined;
+		});
+		harness.on("before_provider_request", () => {
+			laterHookCalls++;
+			return undefined;
+		});
+
+		const promptPromise = harness.prompt("hello");
+		await requestHookStarted.promise;
+		const abortPromise = harness.abort();
+		releaseRequestHook.resolve();
+		const response = await promptPromise;
+		await abortPromise;
+		const persistedMessages = await session.buildContext();
+
+		expect(laterHookCalls).toBe(0);
+		expect(registration.state.callCount).toBe(0);
+		expect(registration.getPendingResponseCount()).toBe(1);
+		expect(response).toMatchObject({ role: "assistant", stopReason: "aborted", errorMessage: "Request was aborted" });
+		expect(persistedMessages.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
 	});
 
 	it("chains provider request patches and supports deletion semantics", async () => {

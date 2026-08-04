@@ -1,11 +1,13 @@
 import {
 	type AssistantMessage,
+	createAssistantMessageEventStream,
 	type ImageContent,
 	type Model,
 	streamSimple,
 	type UserMessage,
 } from "@hansjm10/volt-ai";
 import { runAgentLoop } from "../agent-loop.ts";
+import { DeliveryInbox, type DeliveryLease } from "../delivery-inbox.ts";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -65,6 +67,13 @@ function createFailureMessage(model: Model<any>, error: unknown, aborted: boolea
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 	};
+}
+
+function createAbortedAssistantStream(model: Model<any>) {
+	const stream = createAssistantMessageEventStream();
+	const message = createFailureMessage(model, new Error("Request was aborted"), true);
+	stream.push({ type: "error", seq: 0, reason: "aborted", error: message });
+	return stream;
 }
 
 function cloneStreamOptions(streamOptions?: AgentHarnessStreamOptions): AgentHarnessStreamOptions {
@@ -155,6 +164,37 @@ function normalizeHookError(error: unknown): AgentHarnessError {
 	return normalizeHarnessError(error, "hook");
 }
 
+function combineEventErrors(errors: readonly Error[], message: string): Error {
+	return errors.length === 1 ? errors[0]! : new AggregateError(errors, message);
+}
+
+function createFailureSettlementError(runError: unknown, settlementError: unknown): AgentHarnessError {
+	const cause = new AggregateError(
+		[toError(runError), toError(settlementError)],
+		"Agent run failed and failure reporting failed",
+	);
+	return new AgentHarnessError("unknown", cause.message, cause);
+}
+
+interface AgentHarnessDeliveryEventState {
+	remainingMessages: Set<AgentMessage>;
+	errors: Error[];
+}
+
+interface AgentHarnessRunEventState {
+	admittedMessages: AgentMessage[];
+	admittedMessageSet: Set<AgentMessage>;
+	messageDeliveryIds: Map<AgentMessage, string | undefined>;
+	startedMessages: Set<AgentMessage>;
+	persistedMessages: AgentMessage[];
+	persistedMessageSet: Set<AgentMessage>;
+	deliveries: Map<string | undefined, AgentHarnessDeliveryEventState>;
+	hasTurnStarted: boolean;
+	turnOpen: boolean;
+	settlementStarted: boolean;
+	terminalEmitted: boolean;
+}
+
 interface AgentHarnessTurnState<
 	TSkill extends Skill = Skill,
 	TPromptTemplate extends PromptTemplate = PromptTemplate,
@@ -190,9 +230,9 @@ export class AgentHarness<
 	private resources: AgentHarnessResources<TSkill, TPromptTemplate>;
 	private tools = new Map<string, TTool>();
 	private activeToolNames: string[];
-	private steerQueue: UserMessage[] = [];
+	private readonly deliveryInbox = new DeliveryInbox<"steer" | "followUp", UserMessage>();
+	private activeDeliveryLease?: DeliveryLease<"steer" | "followUp", UserMessage>;
 	private steeringQueueMode: QueueMode;
-	private followUpQueue: UserMessage[] = [];
 	private followUpQueueMode: QueueMode;
 	private nextTurnQueue: AgentMessage[] = [];
 	private handlers = new Map<string, Set<AgentHarnessHandler>>();
@@ -269,11 +309,13 @@ export class AgentHarness<
 		model: Model<any>,
 		sessionId: string,
 		streamOptions: AgentHarnessStreamOptions,
+		signal?: AbortSignal,
 	): Promise<AgentHarnessStreamOptions> {
 		const handlers = this.getHandlers("before_provider_request");
 		let current = cloneStreamOptions(streamOptions);
 		if (!handlers || handlers.size === 0) return current;
 		for (const handler of handlers) {
+			if (signal?.aborted) break;
 			try {
 				const result = await handler({
 					type: "before_provider_request",
@@ -284,7 +326,9 @@ export class AgentHarness<
 				if (result?.streamOptions) {
 					current = applyStreamOptionsPatch(current, result.streamOptions);
 				}
+				if (signal?.aborted) break;
 			} catch (error) {
+				if (signal?.aborted) break;
 				throw normalizeHookError(error);
 			}
 		}
@@ -311,8 +355,8 @@ export class AgentHarness<
 	private async emitQueueUpdate(): Promise<void> {
 		await this.emitOwn({
 			type: "queue_update",
-			steer: [...this.steerQueue],
-			followUp: [...this.followUpQueue],
+			steer: this.deliveryInbox.list("steer").flatMap((delivery) => [...delivery.messages]),
+			followUp: this.deliveryInbox.list("followUp").flatMap((delivery) => [...delivery.messages]),
 			nextTurn: [...this.nextTurnQueue],
 		});
 	}
@@ -375,13 +419,31 @@ export class AgentHarness<
 
 	private createStreamFn(getTurnState: () => AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>): StreamFn {
 		return async (model, context, streamOptions) => {
+			const signal = streamOptions?.signal;
+			if (signal?.aborted) return createAbortedAssistantStream(model);
+
 			const turnState = getTurnState();
-			const auth = await this.getApiKeyAndHeaders?.(model);
+			let auth: { apiKey: string; headers?: Record<string, string> } | undefined;
+			try {
+				auth = await this.getApiKeyAndHeaders?.(model);
+			} catch (error) {
+				if (signal?.aborted) return createAbortedAssistantStream(model);
+				throw error;
+			}
+			if (signal?.aborted) return createAbortedAssistantStream(model);
+
 			const snapshotOptions: AgentHarnessStreamOptions = {
 				...turnState.streamOptions,
 				headers: mergeHeaders(turnState.streamOptions.headers, auth?.headers),
 			};
-			const requestOptions = await this.emitBeforeProviderRequest(model, turnState.sessionId, snapshotOptions);
+			const requestOptions = await this.emitBeforeProviderRequest(
+				model,
+				turnState.sessionId,
+				snapshotOptions,
+				signal,
+			);
+			if (signal?.aborted) return createAbortedAssistantStream(model);
+
 			return streamSimple(model, context, {
 				cacheRetention: requestOptions.cacheRetention,
 				headers: requestOptions.headers,
@@ -391,13 +453,10 @@ export class AgentHarness<
 				onPayload: async (payload) => await this.emitBeforeProviderPayload(model, payload),
 				onResponse: async (response) => {
 					const headers = { ...(response.headers as Record<string, string>) };
-					await this.emitOwn(
-						{ type: "after_provider_response", status: response.status, headers },
-						streamOptions?.signal,
-					);
+					await this.emitOwn({ type: "after_provider_response", status: response.status, headers }, signal);
 				},
 				reasoning: streamOptions?.reasoning,
-				signal: streamOptions?.signal,
+				signal,
 				sessionId: turnState.sessionId,
 				timeoutMs: requestOptions.timeoutMs,
 				transport: requestOptions.transport,
@@ -406,16 +465,23 @@ export class AgentHarness<
 		};
 	}
 
-	private async drainQueuedMessages(queue: AgentMessage[], mode: QueueMode): Promise<AgentMessage[]> {
-		const messages = mode === "all" ? queue.splice(0) : queue.splice(0, 1);
-		if (messages.length === 0) return messages;
-		try {
-			await this.emitQueueUpdate();
-			return messages;
-		} catch (error) {
-			queue.unshift(...messages);
-			throw normalizeHookError(error);
-		}
+	private leaseQueuedDeliveries(
+		kind: "steer" | "followUp",
+		mode: QueueMode,
+	): Array<{ deliveryId: string; messages: AgentMessage[] }> {
+		const selected = this.deliveryInbox.select(kind, mode);
+		if (selected.length === 0) return [];
+		const lease = this.deliveryInbox.lease(selected);
+		this.activeDeliveryLease = lease;
+		return lease.deliveries.map((delivery) => ({
+			deliveryId: delivery.deliveryId,
+			messages: [...delivery.messages],
+		}));
+	}
+
+	private beginDelivery(deliveryId: string | undefined): boolean {
+		if (deliveryId === undefined || !this.activeDeliveryLease?.owns(deliveryId)) return true;
+		return this.activeDeliveryLease.begin(deliveryId) !== undefined;
 	}
 
 	private createLoopConfig(
@@ -423,6 +489,7 @@ export class AgentHarness<
 		setTurnState: (turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>) => void,
 	): AgentLoopConfig {
 		const turnState = getTurnState();
+		let firstRequest = true;
 		return {
 			model: turnState.model,
 			reasoning: turnState.thinkingLevel === "off" ? undefined : turnState.thinkingLevel,
@@ -454,8 +521,41 @@ export class AgentHarness<
 					? { content: patch.content, details: patch.details, isError: patch.isError, terminate: patch.terminate }
 					: undefined;
 			},
-			prepareNextTurn: async () => {
+			nextAction: async (context) => {
+				const initialDeliveries =
+					context.completedTurn === undefined && context.defaultAction.type === "request"
+						? (context.defaultAction.deliveries ?? [])
+						: [];
+				const steering = this.leaseQueuedDeliveries("steer", this.steeringQueueMode);
+				if (initialDeliveries.length > 0 || steering.length > 0) {
+					return {
+						type: "request",
+						reason:
+							context.defaultAction.type === "request" && context.defaultAction.reason === "continuation"
+								? "continuation"
+								: "delivery",
+						deliveries: [...initialDeliveries, ...steering],
+					};
+				}
+				if (context.defaultAction.type === "request") {
+					return context.defaultAction;
+				}
+				const followUp = this.leaseQueuedDeliveries("followUp", this.followUpQueueMode);
+				return followUp.length > 0
+					? { type: "request", reason: "delivery", deliveries: followUp }
+					: { type: "stop" };
+			},
+			beginDelivery: (delivery) => this.beginDelivery(delivery.deliveryId),
+			prepareRequest: async ({ context }) => {
 				await this.flushPendingSessionWrites();
+				if (firstRequest) {
+					firstRequest = false;
+					return {
+						context,
+						model: getTurnState().model,
+						thinkingLevel: getTurnState().thinkingLevel,
+					};
+				}
 				const nextTurnState = await this.createTurnState();
 				setTurnState(nextTurnState);
 				return {
@@ -464,8 +564,6 @@ export class AgentHarness<
 					thinkingLevel: nextTurnState.thinkingLevel,
 				};
 			},
-			getSteeringMessages: async () => this.drainQueuedMessages(this.steerQueue, this.steeringQueueMode),
-			getFollowUpMessages: async () => this.drainQueuedMessages(this.followUpQueue, this.followUpQueueMode),
 		};
 	}
 
@@ -507,13 +605,89 @@ export class AgentHarness<
 		}
 	}
 
-	private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise<void> {
+	private async handleAgentEvent(
+		event: AgentEvent,
+		state: AgentHarnessRunEventState,
+		signal?: AbortSignal,
+	): Promise<void> {
+		if (event.type === "delivery_start") {
+			for (const message of event.messages) {
+				if (!state.admittedMessageSet.has(message)) {
+					state.admittedMessageSet.add(message);
+					state.admittedMessages.push(message);
+				}
+				state.messageDeliveryIds.set(message, event.deliveryId);
+			}
+			const deliveryState: AgentHarnessDeliveryEventState = {
+				remainingMessages: new Set(event.messages),
+				errors: [],
+			};
+			state.deliveries.set(event.deliveryId, deliveryState);
+			if (event.deliveryId !== undefined && this.activeDeliveryLease?.owns(event.deliveryId)) {
+				try {
+					await this.emitQueueUpdate();
+				} catch (error) {
+					deliveryState.errors.push(toError(error));
+				}
+			}
+			try {
+				await this.emitAny(event, signal);
+			} catch (error) {
+				deliveryState.errors.push(toError(error));
+			}
+			if (deliveryState.remainingMessages.size === 0) {
+				state.deliveries.delete(event.deliveryId);
+				if (deliveryState.errors.length > 0) {
+					throw combineEventErrors(deliveryState.errors, "Delivery notifications failed");
+				}
+			}
+			return;
+		}
+		if (event.type === "message_start") {
+			state.startedMessages.add(event.message);
+			try {
+				await this.emitAny(event, signal);
+			} catch (error) {
+				const deliveryState = state.deliveries.get(event.deliveryId);
+				if (!deliveryState?.remainingMessages.has(event.message)) throw error;
+				deliveryState.errors.push(toError(error));
+			}
+			return;
+		}
 		if (event.type === "message_end") {
 			await this.session.appendMessage(event.message);
+			if (!state.persistedMessageSet.has(event.message)) {
+				state.persistedMessageSet.add(event.message);
+				state.persistedMessages.push(event.message);
+			}
+			let eventError: unknown;
+			try {
+				await this.emitAny(event, signal);
+			} catch (error) {
+				eventError = error;
+			}
+			const deliveryState = state.deliveries.get(event.deliveryId);
+			if (deliveryState?.remainingMessages.delete(event.message)) {
+				if (eventError) deliveryState.errors.push(toError(eventError));
+				if (deliveryState.remainingMessages.size === 0) {
+					state.deliveries.delete(event.deliveryId);
+					if (deliveryState.errors.length > 0) {
+						throw combineEventErrors(deliveryState.errors, "Delivery notifications failed");
+					}
+				}
+				return;
+			}
+			if (eventError) throw eventError;
+			return;
+		}
+		if (event.type === "turn_start") {
+			state.hasTurnStarted = true;
+			state.turnOpen = true;
 			await this.emitAny(event, signal);
 			return;
 		}
 		if (event.type === "turn_end") {
+			state.turnOpen = false;
 			let eventError: unknown;
 			try {
 				await this.emitAny(event, signal);
@@ -529,6 +703,7 @@ export class AgentHarness<
 		if (event.type === "agent_end") {
 			await this.flushPendingSessionWrites();
 			this.phase = "idle";
+			state.terminalEmitted = true;
 			await this.emitAny(event, signal);
 			await this.emitOwn({ type: "settled", nextTurnCount: this.nextTurnQueue.length }, signal);
 			return;
@@ -536,18 +711,51 @@ export class AgentHarness<
 		await this.emitAny(event, signal);
 	}
 
-	private async emitRunFailure(
+	private async settleRunFailure(
+		state: AgentHarnessRunEventState,
 		model: Model<any>,
 		error: unknown,
 		aborted: boolean,
 		signal: AbortSignal,
 	): Promise<AgentMessage[]> {
-		const failureMessage = createFailureMessage(model, error, aborted);
-		await this.handleAgentEvent({ type: "message_start", message: failureMessage }, signal);
-		await this.handleAgentEvent({ type: "message_end", message: failureMessage }, signal);
-		await this.handleAgentEvent({ type: "turn_end", message: failureMessage, toolResults: [] }, signal);
-		await this.handleAgentEvent({ type: "agent_end", messages: [failureMessage] }, signal);
-		return [failureMessage];
+		if (state.settlementStarted || state.terminalEmitted) {
+			throw new AgentHarnessError("invalid_state", "Agent failure settlement already started");
+		}
+		state.settlementStarted = true;
+		const settlementErrors: Error[] = [];
+		const attempt = async (event: AgentEvent): Promise<void> => {
+			try {
+				await this.handleAgentEvent(event, state, signal);
+			} catch (eventError) {
+				settlementErrors.push(toError(eventError));
+			}
+		};
+
+		for (const message of state.admittedMessages) {
+			if (state.persistedMessageSet.has(message)) continue;
+			const deliveryId = state.messageDeliveryIds.get(message);
+			const delivery = deliveryId === undefined ? {} : { deliveryId };
+			if (!state.startedMessages.has(message)) {
+				await attempt({ type: "message_start", message, ...delivery });
+			}
+			if (!state.persistedMessageSet.has(message)) {
+				await attempt({ type: "message_end", message, ...delivery });
+			}
+		}
+
+		if (!state.turnOpen) await attempt({ type: "turn_start" });
+		const failureError = aborted ? new Error("Request was aborted") : error;
+		const failureMessage = createFailureMessage(model, failureError, aborted);
+		await attempt({ type: "message_start", message: failureMessage });
+		await attempt({ type: "message_end", message: failureMessage });
+		await attempt({ type: "turn_end", message: failureMessage, toolResults: [] });
+		const terminalMessages = [...state.persistedMessages];
+		await attempt({ type: "agent_end", messages: terminalMessages });
+
+		if (settlementErrors.length > 0) {
+			throw combineEventErrors(settlementErrors, "Agent failure settlement notifications failed");
+		}
+		return terminalMessages;
 	}
 
 	private async executeTurn(
@@ -582,35 +790,66 @@ export class AgentHarness<
 			activeTurnState = nextTurnState;
 		};
 		this.runAbortController = abortController;
+		const runEventState: AgentHarnessRunEventState = {
+			admittedMessages: [...messages],
+			admittedMessageSet: new Set(messages),
+			messageDeliveryIds: new Map(),
+			startedMessages: new Set(),
+			persistedMessages: [],
+			persistedMessageSet: new Set(),
+			deliveries: new Map(),
+			hasTurnStarted: false,
+			turnOpen: false,
+			settlementStarted: false,
+			terminalEmitted: false,
+		};
+		let terminalMessages: AgentMessage[] | undefined;
 		const runResultPromise = (async () => {
 			try {
 				return await runAgentLoop(
 					messages,
 					this.createContext(turnState, beforeResult?.systemPrompt),
 					this.createLoopConfig(getTurnState, setTurnState),
-					(event) => this.handleAgentEvent(event, abortController.signal),
+					async (event) => {
+						if (event.type === "agent_end" && abortController.signal.aborted && !runEventState.hasTurnStarted) {
+							const abortError = new Error("Request was aborted");
+							try {
+								terminalMessages = await this.settleRunFailure(
+									runEventState,
+									activeTurnState.model,
+									abortError,
+									true,
+									abortController.signal,
+								);
+							} catch (settlementError) {
+								throw createFailureSettlementError(abortError, settlementError);
+							}
+							return;
+						}
+						await this.handleAgentEvent(event, runEventState, abortController.signal);
+					},
 					abortController.signal,
 					this.createStreamFn(getTurnState),
 				);
 			} catch (error) {
+				if (runEventState.settlementStarted || runEventState.terminalEmitted) throw error;
 				try {
-					return await this.emitRunFailure(
+					terminalMessages = await this.settleRunFailure(
+						runEventState,
 						activeTurnState.model,
 						error,
 						abortController.signal.aborted,
 						abortController.signal,
 					);
-				} catch (failureError) {
-					const cause = new AggregateError(
-						[toError(error), toError(failureError)],
-						"Agent run failed and failure reporting failed",
-					);
-					throw new AgentHarnessError("unknown", cause.message, cause);
+					return terminalMessages;
+				} catch (settlementError) {
+					throw createFailureSettlementError(error, settlementError);
 				}
 			}
 		})();
 		try {
-			const newMessages = await runResultPromise;
+			const loopMessages = await runResultPromise;
+			const newMessages = terminalMessages ?? loopMessages;
 			for (let i = newMessages.length - 1; i >= 0; i--) {
 				const message = newMessages[i]!;
 				if (message.role === "assistant") {
@@ -622,6 +861,8 @@ export class AgentHarness<
 			try {
 				await this.flushPendingSessionWrites();
 			} finally {
+				this.deliveryInbox.rollbackActiveLease();
+				this.activeDeliveryLease = undefined;
 				this.runAbortController = undefined;
 			}
 		}
@@ -678,13 +919,13 @@ export class AgentHarness<
 
 	async steer(text: string, options?: { images?: ImageContent[] }): Promise<void> {
 		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot steer while idle");
-		this.steerQueue.push(createUserMessage(text, options?.images));
+		this.deliveryInbox.enqueue("steer", [createUserMessage(text, options?.images)]);
 		await this.emitQueueUpdate();
 	}
 
 	async followUp(text: string, options?: { images?: ImageContent[] }): Promise<void> {
 		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot follow up while idle");
-		this.followUpQueue.push(createUserMessage(text, options?.images));
+		this.deliveryInbox.enqueue("followUp", [createUserMessage(text, options?.images)]);
 		await this.emitQueueUpdate();
 	}
 
@@ -1003,10 +1244,8 @@ export class AgentHarness<
 	}
 
 	async abort(): Promise<AbortResult> {
-		const clearedSteer = [...this.steerQueue];
-		const clearedFollowUp = [...this.followUpQueue];
-		this.steerQueue = [];
-		this.followUpQueue = [];
+		const clearedSteer = this.deliveryInbox.revoke("steer").flatMap((delivery) => [...delivery.messages]);
+		const clearedFollowUp = this.deliveryInbox.revoke("followUp").flatMap((delivery) => [...delivery.messages]);
 		this.runAbortController?.abort();
 		const errors: Error[] = [];
 		try {
