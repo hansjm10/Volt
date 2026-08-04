@@ -649,6 +649,8 @@ const MCP_CONTROL_EVENT_TYPES = new Set([
 	"mcp_call_end",
 ]);
 
+const CONVERSATION_INTERNAL_SOURCE_EVENT_TYPES = new Set(["delivery_start"]);
+
 const CONVERSATION_SOURCE_EVENT_TYPES = new Set([
 	"agent_start",
 	"agent_end",
@@ -1228,6 +1230,9 @@ export class ConversationProjectionFeed {
 				if (!subscriber.active || subscriber.fenced) continue;
 				void this.enqueueControl(subscriber.subscriptionId, event);
 			}
+			return;
+		}
+		if (CONVERSATION_INTERNAL_SOURCE_EVENT_TYPES.has(event.type)) {
 			return;
 		}
 		if (!CONVERSATION_SOURCE_EVENT_TYPES.has(event.type)) {
