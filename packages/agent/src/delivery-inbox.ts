@@ -156,6 +156,7 @@ export class DeliveryInbox<TKind extends string, TMessage> {
 		return mode === "all" ? matching : matching.slice(0, 1);
 	}
 
+	/** Claim per-kind FIFO prefixes, ordered globally by admission in the returned lease. */
 	lease(deliveries: readonly InboxDelivery<TKind, TMessage>[]): DeliveryLease<TKind, TMessage> {
 		if (this.activeLease?.hasRevocableDeliveries()) {
 			throw new Error("Delivery inbox already has an active revocable lease");
@@ -169,6 +170,23 @@ export class DeliveryInbox<TKind extends string, TMessage> {
 				throw new Error(`Delivery is not pending in this inbox: ${delivery.deliveryId}`);
 			}
 			selectedIds.add(delivery.deliveryId);
+		}
+		const selectedByKind = new Map<TKind, Array<InboxDelivery<TKind, TMessage>>>();
+		for (const delivery of deliveries) {
+			const selected = selectedByKind.get(delivery.kind) ?? [];
+			selected.push(delivery);
+			selectedByKind.set(delivery.kind, selected);
+		}
+		for (const [kind, selected] of selectedByKind) {
+			const pending = this.pending.filter((delivery) => delivery.kind === kind);
+			for (const [index, delivery] of selected.entries()) {
+				const expected = pending[index];
+				if (delivery !== expected) {
+					throw new Error(
+						`Delivery selection violates FIFO order for ${kind}: expected ${expected?.deliveryId ?? "none"} before ${delivery.deliveryId}`,
+					);
+				}
+			}
 		}
 		this.activeLease?.rollback();
 		const selected = new Set(deliveries);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DeliveryInbox } from "../src/delivery-inbox.ts";
+import { DeliveryInbox, type DeliveryLease, type InboxDelivery } from "../src/delivery-inbox.ts";
 
 describe("DeliveryInbox", () => {
 	function createInbox(): DeliveryInbox<"steer" | "followUp", string> {
@@ -63,6 +63,26 @@ describe("DeliveryInbox", () => {
 		expect(() => inbox.lease([stale])).toThrow(`Delivery is not pending in this inbox: ${stale.deliveryId}`);
 		expect(inbox.list()).toEqual([pending]);
 		expect(inbox.lease([pending]).deliveries).toEqual([pending]);
+	});
+
+	it("rejects non-FIFO selections while allowing mixed-kind policy order", () => {
+		const inbox = createInbox();
+		const first = inbox.enqueue("steer", ["first"]);
+		const second = inbox.enqueue("steer", ["second"]);
+		const followUp = inbox.enqueue("followUp", ["later"]);
+
+		expect(() => inbox.lease([second])).toThrow(
+			`Delivery selection violates FIFO order for steer: expected ${first.deliveryId} before ${second.deliveryId}`,
+		);
+		expect(() => inbox.lease([second, first])).toThrow(
+			`Delivery selection violates FIFO order for steer: expected ${first.deliveryId} before ${second.deliveryId}`,
+		);
+		expect(inbox.list()).toEqual([first, second, followUp]);
+
+		const lease = inbox.lease([followUp, first]);
+		expect(lease.deliveries).toEqual([first, followUp]);
+		expect(lease.rollback()).toEqual([first, followUp]);
+		expect(inbox.list()).toEqual([first, second, followUp]);
 	});
 
 	it("rejects overlapping leases and restores them ahead of later arrivals", () => {
@@ -295,5 +315,124 @@ describe("DeliveryInbox", () => {
 		expect(inbox.revoke("followUp")).toEqual([]);
 		expect(lease.rollback()).toEqual([]);
 		expect(inbox.hasPending()).toBe(false);
+	});
+
+	it("preserves queue and lease invariants across deterministic operation sequences", () => {
+		type Kind = "steer" | "followUp";
+		type Status = "pending" | "leased" | "terminal";
+		type ModelEntry = {
+			delivery: InboxDelivery<Kind, string>;
+			status: Status;
+		};
+
+		let nextId = 0;
+		let seed = 0x5eed1234;
+		const inbox = new DeliveryInbox<Kind, string>(() => `delivery-${nextId++}`);
+		const model: ModelEntry[] = [];
+		const kinds = ["steer", "followUp"] as const;
+		let activeLease: DeliveryLease<Kind, string> | undefined;
+
+		function nextRandom(limit: number): number {
+			seed = (seed * 1_664_525 + 1_013_904_223) >>> 0;
+			return seed % limit;
+		}
+
+		function project(kind?: Kind, status?: Status): InboxDelivery<Kind, string>[] {
+			return model
+				.filter(
+					(entry) =>
+						(kind === undefined || entry.delivery.kind === kind) &&
+						(status === undefined ? entry.status !== "terminal" : entry.status === status),
+				)
+				.map((entry) => entry.delivery)
+				.sort((left, right) => left.sequence - right.sequence);
+		}
+
+		for (let step = 0; step < 400; step++) {
+			const operation = step < 2 ? 0 : nextRandom(8);
+			const kind = kinds[nextRandom(kinds.length)];
+
+			switch (operation) {
+				case 0:
+				case 7: {
+					const delivery = inbox.enqueue(kind, [`message-${step}`]);
+					model.push({ delivery, status: "pending" });
+					break;
+				}
+				case 1: {
+					if (project(undefined, "leased").length > 0) break;
+					const mode = nextRandom(2) === 0 ? "one-at-a-time" : "all";
+					const selected = inbox.select(kind, mode);
+					if (selected.length === 0) break;
+					const pending = project(kind, "pending");
+					expect(selected).toEqual(mode === "all" ? pending : pending.slice(0, 1));
+					activeLease = inbox.lease(selected);
+					for (const entry of model) {
+						if (selected.includes(entry.delivery)) entry.status = "leased";
+					}
+					break;
+				}
+				case 2: {
+					const leased = project(undefined, "leased");
+					if (!activeLease || leased.length === 0) break;
+					const delivery = leased[nextRandom(leased.length)];
+					expect(activeLease.begin(delivery.deliveryId)).toBe(delivery);
+					const entry = model.find((candidate) => candidate.delivery === delivery);
+					if (entry) entry.status = "terminal";
+					break;
+				}
+				case 3: {
+					const leased = project(undefined, "leased");
+					if (!activeLease || leased.length === 0) break;
+					const delivery = leased[nextRandom(leased.length)];
+					expect(() =>
+						activeLease?.begin(delivery.deliveryId, () => {
+							throw new Error("modeled commit failure");
+						}),
+					).toThrow("modeled commit failure");
+					break;
+				}
+				case 4: {
+					const expected = model
+						.filter(
+							(entry) =>
+								entry.delivery.kind === kind && (entry.status === "pending" || entry.status === "leased"),
+						)
+						.map((entry) => entry.delivery)
+						.sort((left, right) => left.sequence - right.sequence);
+					expect(inbox.revoke(kind)).toEqual(expected);
+					for (const entry of model) {
+						if (expected.includes(entry.delivery)) entry.status = "terminal";
+					}
+					break;
+				}
+				case 5: {
+					const expected = project(undefined, "leased");
+					expect(inbox.rollbackActiveLease()).toEqual(expected);
+					for (const entry of model) {
+						if (entry.status === "leased") entry.status = "pending";
+					}
+					activeLease = undefined;
+					break;
+				}
+				case 6:
+					inbox.reset();
+					for (const entry of model) {
+						if (entry.status !== "terminal") entry.status = "terminal";
+					}
+					activeLease = undefined;
+					break;
+			}
+
+			expect(inbox.list()).toEqual(project());
+			expect(inbox.hasPending()).toBe(project().length > 0);
+			for (const projectedKind of kinds) {
+				expect(inbox.list(projectedKind)).toEqual(project(projectedKind));
+				expect(inbox.hasPending(projectedKind)).toBe(project(projectedKind).length > 0);
+				expect(inbox.select(projectedKind, "all")).toEqual(project(projectedKind, "pending"));
+				expect(inbox.select(projectedKind, "one-at-a-time")).toEqual(project(projectedKind, "pending").slice(0, 1));
+			}
+			if (activeLease) expect(activeLease.deliveries).toEqual(project(undefined, "leased"));
+		}
 	});
 });
