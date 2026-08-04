@@ -111,7 +111,7 @@ describe("configured package actions", () => {
 			scriptPath,
 			[
 				'const { spawn } = require("node:child_process");',
-				'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 750);"], {',
+				'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5_000);"], {',
 				'\tstdio: ["ignore", "inherit", "inherit"],',
 				"});",
 				"child.unref();",
@@ -123,7 +123,7 @@ describe("configured package actions", () => {
 
 		const result = await Promise.race([
 			runCommandPromise,
-			new Promise<"timeout">((resolveTimeout) => setTimeout(() => resolveTimeout("timeout"), 500)),
+			new Promise<"timeout">((resolveTimeout) => setTimeout(() => resolveTimeout("timeout"), 2_000)),
 		]);
 
 		expect(result).toBe("resolved");
