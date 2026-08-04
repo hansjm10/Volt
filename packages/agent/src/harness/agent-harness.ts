@@ -1,5 +1,6 @@
 import {
 	type AssistantMessage,
+	createAssistantMessageEventStream,
 	type ImageContent,
 	type Model,
 	streamSimple,
@@ -66,6 +67,13 @@ function createFailureMessage(model: Model<any>, error: unknown, aborted: boolea
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 	};
+}
+
+function createAbortedAssistantStream(model: Model<any>) {
+	const stream = createAssistantMessageEventStream();
+	const message = createFailureMessage(model, new Error("Request was aborted"), true);
+	stream.push({ type: "error", seq: 0, reason: "aborted", error: message });
+	return stream;
 }
 
 function cloneStreamOptions(streamOptions?: AgentHarnessStreamOptions): AgentHarnessStreamOptions {
@@ -154,6 +162,37 @@ function normalizeHarnessError(error: unknown, fallbackCode: AgentHarnessError["
 
 function normalizeHookError(error: unknown): AgentHarnessError {
 	return normalizeHarnessError(error, "hook");
+}
+
+function combineEventErrors(errors: readonly Error[], message: string): Error {
+	return errors.length === 1 ? errors[0]! : new AggregateError(errors, message);
+}
+
+function createFailureSettlementError(runError: unknown, settlementError: unknown): AgentHarnessError {
+	const cause = new AggregateError(
+		[toError(runError), toError(settlementError)],
+		"Agent run failed and failure reporting failed",
+	);
+	return new AgentHarnessError("unknown", cause.message, cause);
+}
+
+interface AgentHarnessDeliveryEventState {
+	remainingMessages: Set<AgentMessage>;
+	errors: Error[];
+}
+
+interface AgentHarnessRunEventState {
+	admittedMessages: AgentMessage[];
+	admittedMessageSet: Set<AgentMessage>;
+	messageDeliveryIds: Map<AgentMessage, string | undefined>;
+	startedMessages: Set<AgentMessage>;
+	persistedMessages: AgentMessage[];
+	persistedMessageSet: Set<AgentMessage>;
+	deliveries: Map<string | undefined, AgentHarnessDeliveryEventState>;
+	hasTurnStarted: boolean;
+	turnOpen: boolean;
+	settlementStarted: boolean;
+	terminalEmitted: boolean;
 }
 
 interface AgentHarnessTurnState<
@@ -270,11 +309,13 @@ export class AgentHarness<
 		model: Model<any>,
 		sessionId: string,
 		streamOptions: AgentHarnessStreamOptions,
+		signal?: AbortSignal,
 	): Promise<AgentHarnessStreamOptions> {
 		const handlers = this.getHandlers("before_provider_request");
 		let current = cloneStreamOptions(streamOptions);
 		if (!handlers || handlers.size === 0) return current;
 		for (const handler of handlers) {
+			if (signal?.aborted) break;
 			try {
 				const result = await handler({
 					type: "before_provider_request",
@@ -285,7 +326,9 @@ export class AgentHarness<
 				if (result?.streamOptions) {
 					current = applyStreamOptionsPatch(current, result.streamOptions);
 				}
+				if (signal?.aborted) break;
 			} catch (error) {
+				if (signal?.aborted) break;
 				throw normalizeHookError(error);
 			}
 		}
@@ -376,13 +419,31 @@ export class AgentHarness<
 
 	private createStreamFn(getTurnState: () => AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>): StreamFn {
 		return async (model, context, streamOptions) => {
+			const signal = streamOptions?.signal;
+			if (signal?.aborted) return createAbortedAssistantStream(model);
+
 			const turnState = getTurnState();
-			const auth = await this.getApiKeyAndHeaders?.(model);
+			let auth: { apiKey: string; headers?: Record<string, string> } | undefined;
+			try {
+				auth = await this.getApiKeyAndHeaders?.(model);
+			} catch (error) {
+				if (signal?.aborted) return createAbortedAssistantStream(model);
+				throw error;
+			}
+			if (signal?.aborted) return createAbortedAssistantStream(model);
+
 			const snapshotOptions: AgentHarnessStreamOptions = {
 				...turnState.streamOptions,
 				headers: mergeHeaders(turnState.streamOptions.headers, auth?.headers),
 			};
-			const requestOptions = await this.emitBeforeProviderRequest(model, turnState.sessionId, snapshotOptions);
+			const requestOptions = await this.emitBeforeProviderRequest(
+				model,
+				turnState.sessionId,
+				snapshotOptions,
+				signal,
+			);
+			if (signal?.aborted) return createAbortedAssistantStream(model);
+
 			return streamSimple(model, context, {
 				cacheRetention: requestOptions.cacheRetention,
 				headers: requestOptions.headers,
@@ -392,13 +453,10 @@ export class AgentHarness<
 				onPayload: async (payload) => await this.emitBeforeProviderPayload(model, payload),
 				onResponse: async (response) => {
 					const headers = { ...(response.headers as Record<string, string>) };
-					await this.emitOwn(
-						{ type: "after_provider_response", status: response.status, headers },
-						streamOptions?.signal,
-					);
+					await this.emitOwn({ type: "after_provider_response", status: response.status, headers }, signal);
 				},
 				reasoning: streamOptions?.reasoning,
-				signal: streamOptions?.signal,
+				signal,
 				sessionId: turnState.sessionId,
 				timeoutMs: requestOptions.timeoutMs,
 				transport: requestOptions.transport,
@@ -547,22 +605,89 @@ export class AgentHarness<
 		}
 	}
 
-	private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise<void> {
-		if (
-			event.type === "delivery_start" &&
-			event.deliveryId !== undefined &&
-			this.activeDeliveryLease?.owns(event.deliveryId)
-		) {
-			await this.emitQueueUpdate();
-			await this.emitAny(event, signal);
+	private async handleAgentEvent(
+		event: AgentEvent,
+		state: AgentHarnessRunEventState,
+		signal?: AbortSignal,
+	): Promise<void> {
+		if (event.type === "delivery_start") {
+			for (const message of event.messages) {
+				if (!state.admittedMessageSet.has(message)) {
+					state.admittedMessageSet.add(message);
+					state.admittedMessages.push(message);
+				}
+				state.messageDeliveryIds.set(message, event.deliveryId);
+			}
+			const deliveryState: AgentHarnessDeliveryEventState = {
+				remainingMessages: new Set(event.messages),
+				errors: [],
+			};
+			state.deliveries.set(event.deliveryId, deliveryState);
+			if (event.deliveryId !== undefined && this.activeDeliveryLease?.owns(event.deliveryId)) {
+				try {
+					await this.emitQueueUpdate();
+				} catch (error) {
+					deliveryState.errors.push(toError(error));
+				}
+			}
+			try {
+				await this.emitAny(event, signal);
+			} catch (error) {
+				deliveryState.errors.push(toError(error));
+			}
+			if (deliveryState.remainingMessages.size === 0) {
+				state.deliveries.delete(event.deliveryId);
+				if (deliveryState.errors.length > 0) {
+					throw combineEventErrors(deliveryState.errors, "Delivery notifications failed");
+				}
+			}
+			return;
+		}
+		if (event.type === "message_start") {
+			state.startedMessages.add(event.message);
+			try {
+				await this.emitAny(event, signal);
+			} catch (error) {
+				const deliveryState = state.deliveries.get(event.deliveryId);
+				if (!deliveryState?.remainingMessages.has(event.message)) throw error;
+				deliveryState.errors.push(toError(error));
+			}
 			return;
 		}
 		if (event.type === "message_end") {
 			await this.session.appendMessage(event.message);
+			if (!state.persistedMessageSet.has(event.message)) {
+				state.persistedMessageSet.add(event.message);
+				state.persistedMessages.push(event.message);
+			}
+			let eventError: unknown;
+			try {
+				await this.emitAny(event, signal);
+			} catch (error) {
+				eventError = error;
+			}
+			const deliveryState = state.deliveries.get(event.deliveryId);
+			if (deliveryState?.remainingMessages.delete(event.message)) {
+				if (eventError) deliveryState.errors.push(toError(eventError));
+				if (deliveryState.remainingMessages.size === 0) {
+					state.deliveries.delete(event.deliveryId);
+					if (deliveryState.errors.length > 0) {
+						throw combineEventErrors(deliveryState.errors, "Delivery notifications failed");
+					}
+				}
+				return;
+			}
+			if (eventError) throw eventError;
+			return;
+		}
+		if (event.type === "turn_start") {
+			state.hasTurnStarted = true;
+			state.turnOpen = true;
 			await this.emitAny(event, signal);
 			return;
 		}
 		if (event.type === "turn_end") {
+			state.turnOpen = false;
 			let eventError: unknown;
 			try {
 				await this.emitAny(event, signal);
@@ -578,6 +703,7 @@ export class AgentHarness<
 		if (event.type === "agent_end") {
 			await this.flushPendingSessionWrites();
 			this.phase = "idle";
+			state.terminalEmitted = true;
 			await this.emitAny(event, signal);
 			await this.emitOwn({ type: "settled", nextTurnCount: this.nextTurnQueue.length }, signal);
 			return;
@@ -585,18 +711,51 @@ export class AgentHarness<
 		await this.emitAny(event, signal);
 	}
 
-	private async emitRunFailure(
+	private async settleRunFailure(
+		state: AgentHarnessRunEventState,
 		model: Model<any>,
 		error: unknown,
 		aborted: boolean,
 		signal: AbortSignal,
 	): Promise<AgentMessage[]> {
-		const failureMessage = createFailureMessage(model, error, aborted);
-		await this.handleAgentEvent({ type: "message_start", message: failureMessage }, signal);
-		await this.handleAgentEvent({ type: "message_end", message: failureMessage }, signal);
-		await this.handleAgentEvent({ type: "turn_end", message: failureMessage, toolResults: [] }, signal);
-		await this.handleAgentEvent({ type: "agent_end", messages: [failureMessage] }, signal);
-		return [failureMessage];
+		if (state.settlementStarted || state.terminalEmitted) {
+			throw new AgentHarnessError("invalid_state", "Agent failure settlement already started");
+		}
+		state.settlementStarted = true;
+		const settlementErrors: Error[] = [];
+		const attempt = async (event: AgentEvent): Promise<void> => {
+			try {
+				await this.handleAgentEvent(event, state, signal);
+			} catch (eventError) {
+				settlementErrors.push(toError(eventError));
+			}
+		};
+
+		for (const message of state.admittedMessages) {
+			if (state.persistedMessageSet.has(message)) continue;
+			const deliveryId = state.messageDeliveryIds.get(message);
+			const delivery = deliveryId === undefined ? {} : { deliveryId };
+			if (!state.startedMessages.has(message)) {
+				await attempt({ type: "message_start", message, ...delivery });
+			}
+			if (!state.persistedMessageSet.has(message)) {
+				await attempt({ type: "message_end", message, ...delivery });
+			}
+		}
+
+		if (!state.turnOpen) await attempt({ type: "turn_start" });
+		const failureError = aborted ? new Error("Request was aborted") : error;
+		const failureMessage = createFailureMessage(model, failureError, aborted);
+		await attempt({ type: "message_start", message: failureMessage });
+		await attempt({ type: "message_end", message: failureMessage });
+		await attempt({ type: "turn_end", message: failureMessage, toolResults: [] });
+		const terminalMessages = [...state.persistedMessages];
+		await attempt({ type: "agent_end", messages: terminalMessages });
+
+		if (settlementErrors.length > 0) {
+			throw combineEventErrors(settlementErrors, "Agent failure settlement notifications failed");
+		}
+		return terminalMessages;
 	}
 
 	private async executeTurn(
@@ -631,35 +790,66 @@ export class AgentHarness<
 			activeTurnState = nextTurnState;
 		};
 		this.runAbortController = abortController;
+		const runEventState: AgentHarnessRunEventState = {
+			admittedMessages: [...messages],
+			admittedMessageSet: new Set(messages),
+			messageDeliveryIds: new Map(),
+			startedMessages: new Set(),
+			persistedMessages: [],
+			persistedMessageSet: new Set(),
+			deliveries: new Map(),
+			hasTurnStarted: false,
+			turnOpen: false,
+			settlementStarted: false,
+			terminalEmitted: false,
+		};
+		let terminalMessages: AgentMessage[] | undefined;
 		const runResultPromise = (async () => {
 			try {
 				return await runAgentLoop(
 					messages,
 					this.createContext(turnState, beforeResult?.systemPrompt),
 					this.createLoopConfig(getTurnState, setTurnState),
-					(event) => this.handleAgentEvent(event, abortController.signal),
+					async (event) => {
+						if (event.type === "agent_end" && abortController.signal.aborted && !runEventState.hasTurnStarted) {
+							const abortError = new Error("Request was aborted");
+							try {
+								terminalMessages = await this.settleRunFailure(
+									runEventState,
+									activeTurnState.model,
+									abortError,
+									true,
+									abortController.signal,
+								);
+							} catch (settlementError) {
+								throw createFailureSettlementError(abortError, settlementError);
+							}
+							return;
+						}
+						await this.handleAgentEvent(event, runEventState, abortController.signal);
+					},
 					abortController.signal,
 					this.createStreamFn(getTurnState),
 				);
 			} catch (error) {
+				if (runEventState.settlementStarted || runEventState.terminalEmitted) throw error;
 				try {
-					return await this.emitRunFailure(
+					terminalMessages = await this.settleRunFailure(
+						runEventState,
 						activeTurnState.model,
 						error,
 						abortController.signal.aborted,
 						abortController.signal,
 					);
-				} catch (failureError) {
-					const cause = new AggregateError(
-						[toError(error), toError(failureError)],
-						"Agent run failed and failure reporting failed",
-					);
-					throw new AgentHarnessError("unknown", cause.message, cause);
+					return terminalMessages;
+				} catch (settlementError) {
+					throw createFailureSettlementError(error, settlementError);
 				}
 			}
 		})();
 		try {
-			const newMessages = await runResultPromise;
+			const loopMessages = await runResultPromise;
+			const newMessages = terminalMessages ?? loopMessages;
 			for (let i = newMessages.length - 1; i >= 0; i--) {
 				const message = newMessages[i]!;
 				if (message.role === "assistant") {
