@@ -143,6 +143,7 @@ export class DeliveryInbox<TKind extends string, TMessage> {
 	}
 
 	reset(): void {
+		this.activeLease?.rollback();
 		this.pending = [];
 		this.activeLease = undefined;
 	}
