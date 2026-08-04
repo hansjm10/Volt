@@ -150,10 +150,10 @@ describe("Agent", () => {
 
 		expect(events).toEqual([
 			"agent_start",
-			"turn_start",
 			"delivery_start",
 			"message_start",
 			"message_end",
+			"turn_start",
 			"message_start",
 			"message_end",
 			"turn_end",
@@ -820,6 +820,7 @@ describe("Agent", () => {
 	it("restores follow-up messages when loop preparation fails and delivers them on retry", async () => {
 		let failPreparation = true;
 		let providerCalls = 0;
+		const lifecycleEvents: string[] = [];
 		const agent = new Agent({
 			prepareDelivery: (delivery) => {
 				if (delivery.kind === "followUp" && failPreparation) {
@@ -841,9 +842,13 @@ describe("Agent", () => {
 			content: [{ type: "text", text: "Queued follow-up" }],
 			timestamp: Date.now(),
 		});
+		agent.subscribe((event) => {
+			if (event.type === "turn_start" || event.type === "turn_end") lifecycleEvents.push(event.type);
+		});
 
 		await agent.prompt("Initial");
 
+		expect(lifecycleEvents).toEqual(["turn_start", "turn_end", "turn_start", "turn_end"]);
 		expect(providerCalls).toBe(1);
 		expect(agent.state.errorMessage).toBe("queue preparation failed");
 		expect(agent.hasQueuedMessages()).toBe(true);
@@ -1051,7 +1056,7 @@ describe("Agent", () => {
 		expect(agent.hasQueuedMessages()).toBe(false);
 	});
 
-	it("does not commit or request a delivery revoked during turn_start", async () => {
+	it("does not revoke a committed delivery during turn_start", async () => {
 		let stagedCommits = 0;
 		let providerCalls = 0;
 		let revokedIds: string[] = [];
@@ -1064,13 +1069,17 @@ describe("Agent", () => {
 			}),
 			streamFn: () => {
 				providerCalls++;
-				throw new Error("provider must not run");
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
 			},
 		});
 		agent.state.messages = [createAssistantMessage("tail")];
-		const deliveryId = agent.steer({
+		agent.steer({
 			role: "user",
-			content: [{ type: "text", text: "revoke me" }],
+			content: [{ type: "text", text: "committed" }],
 			timestamp: Date.now(),
 		});
 		agent.subscribe((event) => {
@@ -1079,10 +1088,10 @@ describe("Agent", () => {
 
 		await agent.continue();
 
-		expect(revokedIds).toEqual([deliveryId]);
-		expect(stagedCommits).toBe(0);
-		expect(providerCalls).toBe(0);
-		expect(agent.state.messages.map(getUserText).filter(Boolean)).toEqual([]);
+		expect(revokedIds).toEqual([]);
+		expect(stagedCommits).toBe(1);
+		expect(providerCalls).toBe(1);
+		expect(agent.state.messages.map(getUserText).filter(Boolean)).toEqual(["committed"]);
 		expect(agent.hasQueuedMessages()).toBe(false);
 	});
 
