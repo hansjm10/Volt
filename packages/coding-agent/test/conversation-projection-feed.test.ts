@@ -1630,6 +1630,40 @@ describe("ConversationProjectionFeed", () => {
 		feed.dispose();
 	});
 
+	it("ignores internal delivery lifecycle events without consuming a cursor or poisoning the generation", async () => {
+		const source = new TestSource();
+		const writes: object[] = [];
+		const feed = new ConversationProjectionFeed(source, { createId: makeIds("delivery-lifecycle") });
+		const subscription = feed.attach({
+			write: (value) => {
+				writes.push(value);
+			},
+			buildSnapshot: snapshotBuilder(source),
+		});
+		await subscription.ready;
+
+		source.emit({
+			type: "delivery_start",
+			deliveryId: "prompt-1",
+			messages: [{ role: "user", content: "hello", timestamp: 1 }],
+		});
+		source.emit({
+			type: "message_start",
+			deliveryId: "prompt-1",
+			message: { role: "user", content: "hello", timestamp: 1 },
+		});
+		await subscription.flush();
+
+		expect(writes).toHaveLength(2);
+		expect(writes[1]).toMatchObject({
+			type: "message_start",
+			deliveryId: "prompt-1",
+			message: { role: "user", content: "hello" },
+			delivery: { subscriptionId: subscription.subscriptionId, cursor: 1 },
+		});
+		feed.dispose();
+	});
+
 	it("prunes unsent tail while keeping controls on their physical sides of a recovery cut", async () => {
 		const source = new TestSource();
 		const firstWrite = deferredVoid();
