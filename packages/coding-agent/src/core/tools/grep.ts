@@ -2,10 +2,10 @@ import { readFile as fsReadFile, stat as fsStat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
 import { Text } from "@hansjm10/volt-tui";
-import { spawn } from "child_process";
 import path from "path";
 import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
+import { spawnProcess } from "../../utils/child-process.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import type { Theme } from "../theme/runtime.ts";
@@ -219,7 +219,7 @@ export function createGrepToolDefinition(
 						if (glob) args.push("--glob", glob);
 						args.push("--", pattern, searchPath);
 
-						const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+						const child = spawnProcess(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
 						let matchCount = 0;

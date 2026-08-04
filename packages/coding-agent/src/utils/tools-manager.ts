@@ -1,11 +1,12 @@
 import chalk from "chalk";
-import { type SpawnSyncReturns, spawnSync } from "child_process";
+import type { SpawnSyncReturns } from "child_process";
 import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "fs";
 import { arch, platform } from "os";
 import { join } from "path";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { APP_NAME, getBinDir } from "../config.ts";
+import { spawnProcessSync } from "./child-process.ts";
 
 const TOOLS_DIR = getBinDir();
 const NETWORK_TIMEOUT_MS = 10_000;
@@ -73,7 +74,7 @@ const TOOLS: Record<string, ToolConfig> = {
 // Check if a command exists in PATH by trying to run it
 function commandExists(cmd: string): boolean {
 	try {
-		const result = spawnSync(cmd, ["--version"], { stdio: "pipe" });
+		const result = spawnProcessSync(cmd, ["--version"], { encoding: "utf8", stdio: "pipe" });
 		// Check for ENOENT error (command not found)
 		return result.error === undefined || result.error === null;
 	} catch {
@@ -158,15 +159,15 @@ function findBinaryRecursively(rootDir: string, binaryFileName: string): string 
 	return null;
 }
 
-function formatSpawnFailure(result: SpawnSyncReturns<Buffer>): string {
+function formatSpawnFailure(result: SpawnSyncReturns<string>): string {
 	if (result.error?.message) {
 		return result.error.message;
 	}
-	const stderr = result.stderr?.toString().trim();
+	const stderr = result.stderr?.trim();
 	if (stderr) {
 		return stderr;
 	}
-	const stdout = result.stdout?.toString().trim();
+	const stdout = result.stdout?.trim();
 	if (stdout) {
 		return stdout;
 	}
@@ -174,7 +175,7 @@ function formatSpawnFailure(result: SpawnSyncReturns<Buffer>): string {
 }
 
 function runExtractionCommand(command: string, args: string[]): string | null {
-	const result = spawnSync(command, args, { stdio: "pipe" });
+	const result = spawnProcessSync(command, args, { encoding: "utf8", stdio: "pipe" });
 	if (!result.error && result.status === 0) {
 		return null;
 	}
