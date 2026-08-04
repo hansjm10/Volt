@@ -164,28 +164,48 @@ describe("agent loop next-action protocol", () => {
 
 	it("rejects an assistant-tail request without an admitted user delivery", async () => {
 		let providerCalls = 0;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm,
+			nextAction: () => ({ type: "request", reason: "continuation" }),
+		};
+		const streamFn = () => {
+			providerCalls++;
+			return new MockAssistantStream(createAssistantMessage("unexpected"));
+		};
 		await expect(
 			runAgentLoopContinue(
 				{ systemPrompt: "", messages: [createAssistantMessage("paused")] },
-				{
-					model: createModel(),
-					convertToLlm,
-					nextAction: () => ({ type: "request", reason: "continuation" }),
-				},
+				config,
 				() => {},
 				undefined,
-				() => {
-					providerCalls++;
-					return new MockAssistantStream(createAssistantMessage("unexpected"));
-				},
+				streamFn,
 			),
 		).rejects.toThrow("Cannot request with an assistant message at the provider transcript tail");
+
+		const stream = agentLoopContinue(
+			{ systemPrompt: "", messages: [createAssistantMessage("paused")] },
+			config,
+			undefined,
+			streamFn,
+		);
+		await expect(
+			(async () => {
+				for await (const _event of stream) {
+					// Drain until the deferred request validation rejects.
+				}
+			})(),
+		).rejects.toThrow("Cannot request with an assistant message at the provider transcript tail");
+		await expect(stream.result()).rejects.toThrow(
+			"Cannot request with an assistant message at the provider transcript tail",
+		);
 		expect(providerCalls).toBe(0);
 	});
 
-	it("does not prepare or invoke a delivery-dependent request when admission rejects every delivery", async () => {
+	it("does not open a turn or request when admission rejects every delivery", async () => {
 		let preparationCalls = 0;
 		let providerCalls = 0;
+		const events: AgentEvent[] = [];
 		await runAgentLoop(
 			[createUserMessage("revoked")],
 			{ systemPrompt: "", messages: [] },
@@ -198,7 +218,9 @@ describe("agent loop next-action protocol", () => {
 					return undefined;
 				},
 			},
-			() => {},
+			(event) => {
+				events.push(event);
+			},
 			undefined,
 			() => {
 				providerCalls++;
@@ -208,6 +230,51 @@ describe("agent loop next-action protocol", () => {
 
 		expect(preparationCalls).toBe(0);
 		expect(providerCalls).toBe(0);
+		expect(events.map((event) => event.type)).toEqual(["agent_start", "agent_end"]);
+	});
+
+	it("does not begin a later delivery after the run aborts", async () => {
+		const abortController = new AbortController();
+		const begunDeliveryIds: Array<string | undefined> = [];
+		let actionCalls = 0;
+		let providerCalls = 0;
+		const messages = await runAgentLoop(
+			[createUserMessage("default")],
+			{ systemPrompt: "", messages: [] },
+			{
+				model: createModel(),
+				convertToLlm,
+				nextAction: () =>
+					actionCalls++ === 0
+						? {
+								type: "request",
+								reason: "delivery",
+								deliveries: [
+									{ deliveryId: "first", messages: [createUserMessage("first")] },
+									{ deliveryId: "second", messages: [createUserMessage("second")] },
+								],
+							}
+						: { type: "stop" },
+				beginDelivery: (delivery) => {
+					begunDeliveryIds.push(delivery.deliveryId);
+					return true;
+				},
+			},
+			(event) => {
+				if (event.type === "delivery_start" && event.deliveryId === "first") {
+					abortController.abort();
+				}
+			},
+			abortController.signal,
+			() => {
+				providerCalls++;
+				return new MockAssistantStream(createAssistantMessage("unexpected"));
+			},
+		);
+
+		expect(begunDeliveryIds).toEqual(["first"]);
+		expect(providerCalls).toBe(0);
+		expect(messages.flatMap((message) => (message.role === "user" ? [message.content] : []))).toEqual(["first"]);
 	});
 
 	it("settles pause without preparing or opening a request", async () => {
