@@ -9,21 +9,39 @@ export interface InboxDelivery<TKind extends string, TMessage> {
 
 type LeaseEntry<TKind extends string, TMessage> = {
 	delivery: InboxDelivery<TKind, TMessage>;
-	status: "leased" | "emitting" | "committed" | "revoked";
+	status: "leased" | "emitting" | "committed" | "restored" | "revoked";
 };
 
 /** Opaque capability for one FIFO selection owned by a dispatcher decision. */
-export class DeliveryLease<TKind extends string, TMessage> {
-	private readonly inbox: DeliveryInbox<TKind, TMessage>;
-	private readonly entries: LeaseEntry<TKind, TMessage>[];
-	private active = true;
+export interface DeliveryLease<TKind extends string, TMessage> {
+	readonly deliveries: readonly InboxDelivery<TKind, TMessage>[];
+	owns(deliveryId: string): boolean;
+	begin(deliveryId: string, commit?: () => void): InboxDelivery<TKind, TMessage> | undefined;
+	rollback(): readonly InboxDelivery<TKind, TMessage>[];
+}
 
-	constructor(inbox: DeliveryInbox<TKind, TMessage>, deliveries: readonly InboxDelivery<TKind, TMessage>[]) {
-		this.inbox = inbox;
+class InboxDeliveryLease<TKind extends string, TMessage> implements DeliveryLease<TKind, TMessage> {
+	private readonly entries: LeaseEntry<TKind, TMessage>[];
+	private readonly finish: (
+		lease: InboxDeliveryLease<TKind, TMessage>,
+		restored: readonly InboxDelivery<TKind, TMessage>[],
+	) => void;
+	private readonly restoreFailedBegin: (delivery: InboxDelivery<TKind, TMessage>) => void;
+	private active = true;
+	private closeReason?: "rollback" | "discard";
+
+	constructor(
+		deliveries: readonly InboxDelivery<TKind, TMessage>[],
+		finish: (lease: InboxDeliveryLease<TKind, TMessage>, restored: readonly InboxDelivery<TKind, TMessage>[]) => void,
+		restoreFailedBegin: (delivery: InboxDelivery<TKind, TMessage>) => void,
+	) {
 		this.entries = deliveries.map((delivery) => ({ delivery, status: "leased" }));
+		this.finish = finish;
+		this.restoreFailedBegin = restoreFailedBegin;
 	}
 
 	get deliveries(): readonly InboxDelivery<TKind, TMessage>[] {
+		if (!this.active) return [];
 		return this.entries.flatMap((entry) => (entry.status === "leased" ? [entry.delivery] : []));
 	}
 
@@ -40,7 +58,14 @@ export class DeliveryLease<TKind extends string, TMessage> {
 		try {
 			commit?.();
 		} catch (error) {
-			entry.status = "leased";
+			if (this.active) {
+				entry.status = "leased";
+			} else if (this.closeReason === "rollback") {
+				entry.status = "restored";
+				this.restoreFailedBegin(entry.delivery);
+			} else {
+				entry.status = "revoked";
+			}
 			throw error;
 		}
 		entry.status = "committed";
@@ -51,9 +76,26 @@ export class DeliveryLease<TKind extends string, TMessage> {
 	rollback(): readonly InboxDelivery<TKind, TMessage>[] {
 		if (!this.active) return [];
 		this.active = false;
-		const restored = this.entries.flatMap((entry) => (entry.status === "leased" ? [entry.delivery] : []));
-		this.inbox.finishLease(this, restored);
+		this.closeReason = "rollback";
+		const restored: InboxDelivery<TKind, TMessage>[] = [];
+		for (const entry of this.entries) {
+			if (entry.status === "leased") {
+				entry.status = "restored";
+				restored.push(entry.delivery);
+			}
+		}
+		this.finish(this, restored);
 		return restored;
+	}
+
+	discard(): void {
+		if (!this.active) return;
+		this.active = false;
+		this.closeReason = "discard";
+		for (const entry of this.entries) {
+			if (entry.status === "leased") entry.status = "revoked";
+		}
+		this.finish(this, []);
 	}
 
 	revoke(kind: TKind): readonly InboxDelivery<TKind, TMessage>[] {
@@ -83,8 +125,9 @@ export class DeliveryLease<TKind extends string, TMessage> {
 /** Small in-memory FIFO with one explicit revocable lease at a time. */
 export class DeliveryInbox<TKind extends string, TMessage> {
 	private pending: Array<InboxDelivery<TKind, TMessage>> = [];
-	private activeLease?: DeliveryLease<TKind, TMessage>;
+	private activeLease?: InboxDeliveryLease<TKind, TMessage>;
 	private nextSequence = 0;
+	private resetGeneration = 0;
 	private readonly createId: () => string;
 	private readonly issuedIds = new Set<string>();
 
@@ -131,7 +174,15 @@ export class DeliveryInbox<TKind extends string, TMessage> {
 		const selected = new Set(deliveries);
 		const claimed = this.pending.filter((delivery) => selected.has(delivery));
 		this.pending = this.pending.filter((delivery) => !selected.has(delivery));
-		const lease = new DeliveryLease(this, claimed);
+		const resetGeneration = this.resetGeneration;
+		const lease = new InboxDeliveryLease(
+			claimed,
+			(finishedLease, restored) => this.finishLease(finishedLease, restored),
+			(delivery) => {
+				if (this.resetGeneration !== resetGeneration) return;
+				this.pending = [delivery, ...this.pending].sort((left, right) => left.sequence - right.sequence);
+			},
+		);
 		this.activeLease = lease;
 		return lease;
 	}
@@ -159,12 +210,16 @@ export class DeliveryInbox<TKind extends string, TMessage> {
 	}
 
 	reset(): void {
-		this.activeLease?.rollback();
+		this.resetGeneration++;
+		this.activeLease?.discard();
 		this.pending = [];
 		this.activeLease = undefined;
 	}
 
-	finishLease(lease: DeliveryLease<TKind, TMessage>, restored: readonly InboxDelivery<TKind, TMessage>[]): void {
+	private finishLease(
+		lease: InboxDeliveryLease<TKind, TMessage>,
+		restored: readonly InboxDelivery<TKind, TMessage>[],
+	): void {
 		if (this.activeLease !== lease) return;
 		this.pending = [...restored, ...this.pending].sort((left, right) => left.sequence - right.sequence);
 		this.activeLease = undefined;
