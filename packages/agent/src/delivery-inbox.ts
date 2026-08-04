@@ -86,14 +86,20 @@ export class DeliveryInbox<TKind extends string, TMessage> {
 	private activeLease?: DeliveryLease<TKind, TMessage>;
 	private nextSequence = 0;
 	private readonly createId: () => string;
+	private readonly issuedIds = new Set<string>();
 
 	constructor(createId: () => string = () => globalThis.crypto.randomUUID()) {
 		this.createId = createId;
 	}
 
 	enqueue(kind: TKind, messages: readonly TMessage[]): InboxDelivery<TKind, TMessage> {
+		const deliveryId = this.createId();
+		if (this.issuedIds.has(deliveryId)) {
+			throw new Error(`Delivery inbox generated duplicate delivery ID: ${deliveryId}`);
+		}
+		this.issuedIds.add(deliveryId);
 		const delivery: InboxDelivery<TKind, TMessage> = {
-			deliveryId: this.createId(),
+			deliveryId,
 			kind,
 			messages: messages.slice(),
 			sequence: this.nextSequence++,
@@ -111,10 +117,20 @@ export class DeliveryInbox<TKind extends string, TMessage> {
 		if (this.activeLease?.hasRevocableDeliveries()) {
 			throw new Error("Delivery inbox already has an active revocable lease");
 		}
+		const selectedIds = new Set<string>();
+		for (const delivery of deliveries) {
+			if (selectedIds.has(delivery.deliveryId)) {
+				throw new Error(`Delivery selection contains duplicate ID: ${delivery.deliveryId}`);
+			}
+			if (!this.pending.includes(delivery)) {
+				throw new Error(`Delivery is not pending in this inbox: ${delivery.deliveryId}`);
+			}
+			selectedIds.add(delivery.deliveryId);
+		}
 		this.activeLease?.rollback();
-		const selectedIds = new Set(deliveries.map((delivery) => delivery.deliveryId));
-		const claimed = this.pending.filter((delivery) => selectedIds.has(delivery.deliveryId));
-		this.pending = this.pending.filter((delivery) => !selectedIds.has(delivery.deliveryId));
+		const selected = new Set(deliveries);
+		const claimed = this.pending.filter((delivery) => selected.has(delivery));
+		this.pending = this.pending.filter((delivery) => !selected.has(delivery));
 		const lease = new DeliveryLease(this, claimed);
 		this.activeLease = lease;
 		return lease;

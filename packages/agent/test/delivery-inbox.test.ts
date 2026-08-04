@@ -24,6 +24,38 @@ describe("DeliveryInbox", () => {
 		expect(inbox.hasPending("followUp")).toBe(true);
 	});
 
+	it("rejects duplicate generated IDs without mutating the queue", () => {
+		const ids = ["duplicate", "duplicate", "next"];
+		const inbox = new DeliveryInbox<"steer" | "followUp", string>(() => ids.shift() ?? "unexpected");
+		const first = inbox.enqueue("steer", ["first"]);
+
+		expect(() => inbox.enqueue("followUp", ["rejected"])).toThrow(
+			"Delivery inbox generated duplicate delivery ID: duplicate",
+		);
+		const second = inbox.enqueue("followUp", ["second"]);
+
+		expect(second.sequence).toBe(1);
+		expect(inbox.list()).toEqual([first, second]);
+	});
+
+	it("rejects duplicate, stale, and foreign lease selections without mutating the queue", () => {
+		const inbox = createInbox();
+		const pending = inbox.enqueue("steer", ["pending"]);
+		const foreignInbox = new DeliveryInbox<"steer" | "followUp", string>(() => pending.deliveryId);
+		const foreign = foreignInbox.enqueue("steer", ["foreign"]);
+
+		expect(() => inbox.lease([foreign])).toThrow(`Delivery is not pending in this inbox: ${pending.deliveryId}`);
+		expect(() => inbox.lease([pending, pending])).toThrow(
+			`Delivery selection contains duplicate ID: ${pending.deliveryId}`,
+		);
+
+		const stale = inbox.enqueue("followUp", ["stale"]);
+		expect(inbox.revoke("followUp")).toEqual([stale]);
+		expect(() => inbox.lease([stale])).toThrow(`Delivery is not pending in this inbox: ${stale.deliveryId}`);
+		expect(inbox.list()).toEqual([pending]);
+		expect(inbox.lease([pending]).deliveries).toEqual([pending]);
+	});
+
 	it("rejects overlapping leases and restores them ahead of later arrivals", () => {
 		const inbox = createInbox();
 		const first = inbox.enqueue("steer", ["first"]);
@@ -40,6 +72,24 @@ describe("DeliveryInbox", () => {
 		expect(lease.begin(first.deliveryId)).toBeUndefined();
 		expect(lease.revoke("steer")).toEqual([]);
 		expect(lease.rollback()).toEqual([]);
+	});
+
+	it("retires an exhausted lease before leasing later arrivals", () => {
+		const inbox = createInbox();
+		const first = inbox.enqueue("steer", ["first"]);
+		const firstLease = inbox.lease([first]);
+
+		expect(firstLease.begin(first.deliveryId)).toBe(first);
+		expect(firstLease.owns(first.deliveryId)).toBe(true);
+
+		const second = inbox.enqueue("steer", ["second"]);
+		const secondLease = inbox.lease([second]);
+
+		expect(firstLease.owns(first.deliveryId)).toBe(false);
+		expect(firstLease.rollback()).toEqual([]);
+		expect(secondLease.owns(second.deliveryId)).toBe(true);
+		expect(secondLease.begin(second.deliveryId)).toBe(second);
+		expect(inbox.list()).toEqual([]);
 	});
 
 	it("invalidates retained leases on reset and remains reusable", () => {
@@ -61,6 +111,22 @@ describe("DeliveryInbox", () => {
 		expect(inbox.list()).toEqual([next]);
 	});
 
+	it("keeps an emitting delivery terminal when reset runs during commit", () => {
+		const inbox = createInbox();
+		const delivery = inbox.enqueue("steer", ["committed"]);
+		inbox.enqueue("followUp", ["discarded"]);
+		const lease = inbox.lease([delivery]);
+
+		expect(
+			lease.begin(delivery.deliveryId, () => {
+				inbox.reset();
+			}),
+		).toBe(delivery);
+		expect(inbox.list()).toEqual([]);
+		expect(lease.owns(delivery.deliveryId)).toBe(false);
+		expect(lease.begin(delivery.deliveryId)).toBeUndefined();
+	});
+
 	it("protects an emitting delivery from reentrant same-kind revocation", () => {
 		const inbox = createInbox();
 		const first = inbox.enqueue("steer", ["first"]);
@@ -74,6 +140,22 @@ describe("DeliveryInbox", () => {
 		).toBe(first);
 		expect(inbox.list()).toEqual([]);
 		expect(lease.rollback()).toEqual([]);
+	});
+
+	it("restores only unbegun deliveries when rollback runs during commit", () => {
+		const inbox = createInbox();
+		const first = inbox.enqueue("steer", ["first"]);
+		const second = inbox.enqueue("steer", ["second"]);
+		const lease = inbox.lease(inbox.select("steer", "all"));
+
+		expect(
+			lease.begin(first.deliveryId, () => {
+				expect(inbox.rollbackActiveLease()).toEqual([second]);
+			}),
+		).toBe(first);
+		expect(inbox.list()).toEqual([second]);
+		expect(lease.owns(first.deliveryId)).toBe(false);
+		expect(lease.begin(second.deliveryId)).toBeUndefined();
 	});
 
 	it("keeps mixed all-mode begin, revoke, and rollback states terminal", () => {
