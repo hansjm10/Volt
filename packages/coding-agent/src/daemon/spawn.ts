@@ -8,7 +8,7 @@ import { type DaemonPaths, ensureDaemonDirs, getDaemonPaths } from "./paths.ts";
 import { verifyPidfileProcess } from "./process-identity.ts";
 import { type InvalidVoltdStateFile, inspectVoltdStateFiles } from "./state.ts";
 
-const SPAWN_HEALTH_TIMEOUT_MS = 5000;
+const SPAWN_HEALTH_TIMEOUT_MS = process.platform === "win32" ? 15_000 : 5_000;
 const SPAWN_HEALTH_POLL_MS = 100;
 export const DAEMON_SHUTDOWN_TIMEOUT_MS = 75_000;
 const DAEMON_EXIT_POLL_MS = 200;
@@ -243,9 +243,19 @@ export interface EnsureDaemonResult extends DaemonProbeResult {
 	invalidState?: InvalidVoltdStateFile;
 }
 
+export interface EnsureDaemonRunningDependencies {
+	readonly probeDaemon?: (agentDir: string) => Promise<DaemonProbeResult>;
+	readonly spawnDetachedDaemon?: (agentDir: string) => Promise<SpawnDaemonResult>;
+}
+
 /** Probe the socket; if no healthy daemon answers, spawn one detached. */
-export async function ensureDaemonRunning(agentDir: string = getAgentDir()): Promise<EnsureDaemonResult> {
-	let probe = await probeDaemon(agentDir);
+export async function ensureDaemonRunning(
+	agentDir: string = getAgentDir(),
+	dependencies: EnsureDaemonRunningDependencies = {},
+): Promise<EnsureDaemonResult> {
+	const probeRunningDaemon = dependencies.probeDaemon ?? probeDaemon;
+	const spawnDaemon = dependencies.spawnDetachedDaemon ?? spawnDetachedDaemon;
+	let probe = await probeRunningDaemon(agentDir);
 	if (probe.healthy) {
 		return { ...probe, spawned: false };
 	}
@@ -261,7 +271,7 @@ export async function ensureDaemonRunning(agentDir: string = getAgentDir()): Pro
 	}
 	if (probe.state === "shutting-down") {
 		await waitForDaemonExit({ agentDir, socketPath: probe.socketPath });
-		probe = await probeDaemon(agentDir);
+		probe = await probeRunningDaemon(agentDir);
 		if (probe.state !== "not-running") {
 			return { ...probe, spawned: false };
 		}
@@ -277,7 +287,7 @@ export async function ensureDaemonRunning(agentDir: string = getAgentDir()): Pro
 			invalidState,
 		};
 	}
-	const spawned = await spawnDetachedDaemon(agentDir);
+	const spawned = await spawnDaemon(agentDir);
 	if (!spawned.ok) {
 		return {
 			healthy: false,
@@ -287,6 +297,6 @@ export async function ensureDaemonRunning(agentDir: string = getAgentDir()): Pro
 			...(spawned.error === undefined ? {} : { error: spawned.error }),
 		};
 	}
-	const healthyProbe = await probeDaemon(agentDir);
+	const healthyProbe = await probeRunningDaemon(agentDir);
 	return { ...healthyProbe, spawned: true };
 }
