@@ -169,7 +169,8 @@ class PendingMessageQueue {
 		}
 		const clearGeneration = this.clearGeneration;
 		try {
-			return await prepare(messages);
+			const prepared = await prepare(messages);
+			return this.clearGeneration === clearGeneration ? prepared : [];
 		} catch (error) {
 			if (this.clearGeneration === clearGeneration) {
 				this.messages.unshift(...messages);

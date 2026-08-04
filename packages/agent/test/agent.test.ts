@@ -865,6 +865,89 @@ describe("Agent", () => {
 			enqueue: (agent: Agent, message: AgentMessage) => agent.steer(message),
 			clear: (agent: Agent) => agent.clearAllQueues(),
 		},
+	])("discards successfully prepared messages after $name", async ({ delivery, enqueue, clear }) => {
+		const preparationStarted = createDeferred();
+		const releasePreparation = createDeferred();
+		let shouldBlockPreparation = true;
+		const providerUserTexts: Array<string | undefined> = [];
+		const agent = new Agent({
+			prepareQueuedMessages: async (messages, currentDelivery) => {
+				if (currentDelivery === delivery && shouldBlockPreparation) {
+					shouldBlockPreparation = false;
+					preparationStarted.resolve();
+					await releasePreparation.promise;
+				}
+				return messages;
+			},
+			streamFn: (_model, context) => {
+				providerUserTexts.push(
+					context.messages
+						.map(getUserText)
+						.filter((text) => text !== undefined)
+						.at(-1),
+				);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "Initial" }], timestamp: Date.now() - 10 },
+			createAssistantMessage("Initial response"),
+		];
+		enqueue(agent, {
+			role: "user",
+			content: [{ type: "text", text: "Cleared message" }],
+			timestamp: Date.now(),
+		});
+
+		const continuation = agent.continue();
+		const clearedContinuation = expect(continuation).rejects.toThrow("Cannot continue from message role: assistant");
+		await preparationStarted.promise;
+		clear(agent);
+		enqueue(agent, {
+			role: "user",
+			content: [{ type: "text", text: "Replacement message" }],
+			timestamp: Date.now() + 1,
+		});
+		releasePreparation.resolve();
+		await clearedContinuation;
+
+		expect(providerUserTexts).toEqual([]);
+		expect(agent.state.messages.map(getUserText).filter((text) => text !== undefined)).toEqual(["Initial"]);
+		expect(agent.hasQueuedMessages()).toBe(true);
+
+		await agent.continue();
+
+		expect(providerUserTexts).toEqual(["Replacement message"]);
+		expect(agent.state.messages.map(getUserText).filter((text) => text !== undefined)).toEqual([
+			"Initial",
+			"Replacement message",
+		]);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it.each([
+		{
+			name: "steering queue clear",
+			delivery: "steer" as const,
+			enqueue: (agent: Agent, message: AgentMessage) => agent.steer(message),
+			clear: (agent: Agent) => agent.clearSteeringQueue(),
+		},
+		{
+			name: "follow-up queue clear",
+			delivery: "followUp" as const,
+			enqueue: (agent: Agent, message: AgentMessage) => agent.followUp(message),
+			clear: (agent: Agent) => agent.clearFollowUpQueue(),
+		},
+		{
+			name: "all-queues clear",
+			delivery: "steer" as const,
+			enqueue: (agent: Agent, message: AgentMessage) => agent.steer(message),
+			clear: (agent: Agent) => agent.clearAllQueues(),
+		},
 	])("does not restore prepared messages after $name", async ({ delivery, enqueue, clear }) => {
 		const preparationStarted = createDeferred();
 		const releasePreparation = createDeferred();
