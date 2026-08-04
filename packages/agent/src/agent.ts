@@ -145,6 +145,7 @@ export type AgentEventListener =
 
 class PendingMessageQueue {
 	private messages: AgentMessage[] = [];
+	private clearGeneration = 0;
 	public mode: QueueMode;
 
 	constructor(mode: QueueMode) {
@@ -166,16 +167,20 @@ class PendingMessageQueue {
 		if (messages.length === 0) {
 			return messages;
 		}
+		const clearGeneration = this.clearGeneration;
 		try {
 			return await prepare(messages);
 		} catch (error) {
-			this.messages.unshift(...messages);
+			if (this.clearGeneration === clearGeneration) {
+				this.messages.unshift(...messages);
+			}
 			throw error;
 		}
 	}
 
 	clear(): void {
 		this.messages = [];
+		this.clearGeneration++;
 	}
 }
 
@@ -416,7 +421,7 @@ export class Agent {
 
 			await this.runContinuation(activeRun);
 		} catch (error) {
-			this.releaseRun(activeRun);
+			this.finishRun(activeRun);
 			throw error;
 		}
 	}
@@ -541,6 +546,9 @@ export class Agent {
 		});
 		const activeRun = { promise, resolve: resolvePromise, abortController };
 		this.activeRun = activeRun;
+		this._state.isStreaming = true;
+		this._state.streamingMessage = undefined;
+		this._state.errorMessage = undefined;
 		return activeRun;
 	}
 
@@ -557,10 +565,6 @@ export class Agent {
 		if (this.activeRun !== activeRun) {
 			throw new Error("Agent run ownership was lost before execution.");
 		}
-
-		this._state.isStreaming = true;
-		this._state.streamingMessage = undefined;
-		this._state.errorMessage = undefined;
 
 		try {
 			await executor(activeRun.abortController.signal);

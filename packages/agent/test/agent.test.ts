@@ -767,6 +767,8 @@ describe("Agent", () => {
 
 		const firstContinuation = agent.continue();
 		await preparationStarted.promise;
+		expect(agent.state.isStreaming).toBe(true);
+		expect(agent.signal).toBeDefined();
 		let idleResolved = false;
 		const idle = agent.waitForIdle().then(() => {
 			idleResolved = true;
@@ -842,6 +844,62 @@ describe("Agent", () => {
 			"Queued steering",
 		]);
 		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it.each([
+		{
+			name: "steering queue clear",
+			delivery: "steer" as const,
+			enqueue: (agent: Agent, message: AgentMessage) => agent.steer(message),
+			clear: (agent: Agent) => agent.clearSteeringQueue(),
+		},
+		{
+			name: "follow-up queue clear",
+			delivery: "followUp" as const,
+			enqueue: (agent: Agent, message: AgentMessage) => agent.followUp(message),
+			clear: (agent: Agent) => agent.clearFollowUpQueue(),
+		},
+		{
+			name: "all-queues clear",
+			delivery: "steer" as const,
+			enqueue: (agent: Agent, message: AgentMessage) => agent.steer(message),
+			clear: (agent: Agent) => agent.clearAllQueues(),
+		},
+	])("does not restore prepared messages after $name", async ({ delivery, enqueue, clear }) => {
+		const preparationStarted = createDeferred();
+		const releasePreparation = createDeferred();
+		const agent = new Agent({
+			prepareQueuedMessages: async (messages, currentDelivery) => {
+				if (currentDelivery === delivery) {
+					preparationStarted.resolve();
+					await releasePreparation.promise;
+					throw new Error("queue preparation failed");
+				}
+				return messages;
+			},
+		});
+		agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "Initial" }], timestamp: Date.now() - 10 },
+			createAssistantMessage("Initial response"),
+		];
+		enqueue(agent, {
+			role: "user",
+			content: [{ type: "text", text: "Queued message" }],
+			timestamp: Date.now(),
+		});
+
+		const continuation = agent.continue();
+		const preparationFailure = expect(continuation).rejects.toThrow("queue preparation failed");
+		await preparationStarted.promise;
+
+		expect(agent.state.isStreaming).toBe(true);
+		clear(agent);
+		releasePreparation.resolve();
+		await preparationFailure;
+
+		expect(agent.hasQueuedMessages()).toBe(false);
+		expect(agent.state.isStreaming).toBe(false);
+		expect(agent.signal).toBeUndefined();
 	});
 
 	it("restores follow-up messages when loop preparation fails and delivers them on retry", async () => {
