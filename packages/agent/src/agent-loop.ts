@@ -81,7 +81,7 @@ export function agentLoopContinue(
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
 	}
-	if (context.messages.at(-1)?.role === "assistant") {
+	if (context.messages.at(-1)?.role === "assistant" && !config.nextAction) {
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
@@ -133,7 +133,7 @@ export async function runAgentLoopContinue(
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
 	}
-	if (context.messages.at(-1)?.role === "assistant") {
+	if (context.messages.at(-1)?.role === "assistant" && !config.nextAction) {
 		throw new Error("Cannot continue from message role: assistant");
 	}
 

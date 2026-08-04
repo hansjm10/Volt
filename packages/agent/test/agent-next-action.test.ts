@@ -7,7 +7,7 @@ import {
 	type UserMessage,
 } from "@hansjm10/volt-ai";
 import { describe, expect, it } from "vitest";
-import { runAgentLoop } from "../src/agent-loop.ts";
+import { agentLoopContinue, runAgentLoop } from "../src/agent-loop.ts";
 import type { AgentEvent, AgentLoopConfig, AgentMessage } from "../src/types.ts";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -111,6 +111,43 @@ describe("agent loop next-action protocol", () => {
 		expect(preparationCalls).toBe(1);
 		expect(providerCalls).toBe(1);
 		expect(events.some((event) => event.type === "delivery_start" && event.deliveryId === "initial")).toBe(true);
+	});
+
+	it("admits a delivery before continuing from an assistant transcript tail", async () => {
+		let providerCalls = 0;
+		let providerRoles: Message["role"][] = [];
+		const events: AgentEvent[] = [];
+		const stream = agentLoopContinue(
+			{ systemPrompt: "", messages: [createAssistantMessage("paused")] },
+			{
+				model: createModel(),
+				convertToLlm,
+				nextAction: (context) =>
+					context.completedTurn
+						? { type: "stop" }
+						: {
+								type: "request",
+								reason: "delivery",
+								deliveries: [{ deliveryId: "resume", messages: [createUserMessage("resume")] }],
+							},
+			},
+			undefined,
+			(_model, context) => {
+				providerCalls++;
+				providerRoles = context.messages.map((message) => message.role);
+				return new MockAssistantStream(createAssistantMessage("resumed"));
+			},
+		);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const messages = await stream.result();
+
+		expect(providerCalls).toBe(1);
+		expect(providerRoles).toEqual(["assistant", "user"]);
+		expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+		expect(events.some((event) => event.type === "delivery_start" && event.deliveryId === "resume")).toBe(true);
 	});
 
 	it("does not prepare or invoke a delivery-dependent request when admission rejects every delivery", async () => {
