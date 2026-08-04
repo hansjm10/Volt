@@ -135,7 +135,19 @@ Queue modes are live, not turn-snapshotted:
 - `getSteeringMode()` / `setSteeringMode()`
 - `getFollowUpMode()` / `setFollowUpMode()`
 
-Changing a queue mode during a run affects the next queue drain. Queue drains happen at safe points.
+Changing a queue mode during a run affects the next delivery lease. Selection happens only while the harness owns the low-level `nextAction` decision. Steering is selected before a pending tool continuation; follow-ups are selected only when neither steering nor a tool continuation remains.
+
+### Dispatcher actions and request preparation
+
+The harness implements the low-level action protocol rather than polling queues through separate callbacks:
+
+- `request` supplies initial, steering, follow-up, or tool-continuation work
+- `stop` ends the harness run when no work remains
+- the low-level `pause` action is available to higher orchestration layers that must preserve continuation intent without issuing another provider request
+
+The low-level loop asks for one action before its first request and once after every successful `turn_end`. Queue-backed requests lease selected entries without removing them. Synchronous begin transfers ownership, then `delivery_start` triggers the authoritative queue update before delivery message persistence. The request-preparation hook subsequently flushes pending writes and, after the first request, creates and applies the next turn snapshot. A request whose every delivery was revoked does not prepare a snapshot or call the provider; a terminal action likewise creates no snapshot.
+
+Once `delivery_start` occurs, notification failure cannot restore or revoke that begun delivery. Error and abort outcomes are terminal, return only entries still revocable from the shared inbox, and do not poll the queues again.
 
 ## Save points
 
@@ -143,11 +155,12 @@ A save point occurs after an assistant turn and its tool-result messages have co
 
 At a save point the harness:
 
-1. flushes pending session writes after the agent-emitted messages for that turn
-2. creates a fresh turn snapshot if the low-level loop may continue
-3. applies the fresh context/model/thinking-level/stream-options/session-id state before the next provider request
+1. awaits the completed `turn_end` observers
+2. flushes pending session writes after the agent-emitted messages for that turn
+3. emits the harness `save_point` event before the dispatcher chooses the next action
+4. if that action is `request`, creates and applies a fresh context/model/thinking-level/stream-options/session-id snapshot immediately before the provider call
 
-This lets model, thinking level, tool, resource, stream option, and system prompt changes made during a turn affect the next turn in the same run, while never mutating an in-flight provider request. Because provider transport reading is already decoupled by `AssistantMessageStream`, save-point work and hook settlement can be awaited directly to keep transcript/session ordering deterministic. The loop callbacks are not recreated at save points.
+This lets model, thinking level, tool, resource, stream option, and system prompt changes made during a turn affect the next turn in the same run, while never mutating an in-flight provider request. A terminal turn still completes save-point synchronization before `agent_end`, but does not run request preparation. Selected queue messages enter persisted session context before the fresh system-prompt callback and snapshot are evaluated. Because provider transport reading is already decoupled by `AssistantMessageStream`, save-point work and hook settlement can be awaited directly to keep transcript/session ordering deterministic. The loop callbacks are not recreated at save points.
 
 The low-level loop converts harness `ThinkingLevel` to provider `reasoning` at the provider boundary:
 
@@ -156,7 +169,7 @@ The low-level loop converts harness `ThinkingLevel` to provider `reasoning` at t
 
 No state refresh is needed on `agent_end` except flushing leftover pending session writes and clearing the operation phase. The exact `settled` event timing is still under review.
 
-If the system-prompt callback throws while starting `prompt`, `skill`, or `promptFromTemplate`, the operation rejects with `AgentHarnessError` and the harness returns to idle. If it throws from the save-point snapshot created by `prepareNextTurn`, the low-level agent run records an assistant error message.
+If the system-prompt callback throws while starting `prompt`, `skill`, or `promptFromTemplate`, the operation rejects with `AgentHarnessError` and the harness returns to idle. If it throws from a later request snapshot created by `prepareRequest`, the low-level agent run records an assistant error message.
 
 ## Hooks and events
 
@@ -197,7 +210,7 @@ Agent-emitted messages are persisted on `message_end` to preserve transcript ord
 
 ## Abort
 
-Abort is allowed during a turn. It aborts the low-level run and clears steering/follow-up queues.
+Abort is allowed during a turn. It aborts the low-level run and clears steering/follow-up entries whose begin boundary has not crossed. Its result reports the exact messages actually revoked; begun deliveries remain authoritative.
 
 Abort does not clear `nextTurn` messages. Messages queued with `nextTurn()` survive abort and are inserted before the user message on the next user-initiated turn.
 
@@ -303,7 +316,7 @@ Done:
 - Structural compaction/tree operations restore phase with `finally`.
 - Public harness failures normalize subsystem causes to `AgentHarnessError`.
 - Pending session writes flush one-by-one and are not dropped on failure.
-- Queue drains roll back if queue-update notification fails.
+- Queue updates occur after synchronous delivery begin; begun deliveries never roll back.
 - `message_end` persistence happens before subscriber notification.
 - `abort()` signals cancellation before notifications and still waits for idle through notification errors.
 - Idle model/thinking/tool updates validate and persist before committing in-memory state.
@@ -419,8 +432,8 @@ Status: Done
 Done:
 
 - `AgentHarness` calls `runAgentLoop()` directly.
-- Harness owns run lifecycle, abort controller, queue draining, provider stream config, event reduction, session persistence, pending write flushing, and save-point snapshots.
-- Harness tests cover prompt construction, queue draining, abort behavior, save-point refresh, pending write ordering, awaited listener settlement, tool hooks, and provider stream wrapping.
+- Harness owns run lifecycle, abort controller, leased delivery selection, request-only provider snapshot preparation, provider stream config, event reduction, session persistence, pending write flushing, and save-point synchronization.
+- Harness tests cover prompt construction, delivery leasing, abort behavior, save-point refresh, pending write ordering, awaited listener settlement, tool hooks, and provider stream wrapping.
 
 Remaining:
 
