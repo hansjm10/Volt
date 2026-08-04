@@ -19,6 +19,7 @@ import type {
 	AgentTool,
 	AgentToolCall,
 	AgentToolResult,
+	PrepareNextTurnContext,
 	StreamFn,
 } from "./types.ts";
 
@@ -175,6 +176,7 @@ async function runLoop(
 	let currentContext = initialContext;
 	let config = initialConfig;
 	let firstTurn = true;
+	let completedTurn: PrepareNextTurnContext | undefined;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
@@ -210,6 +212,27 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
+			if (completedTurn) {
+				const nextTurnSnapshot = await config.prepareNextTurn?.({
+					...completedTurn,
+					context: currentContext,
+				});
+				completedTurn = undefined;
+				if (nextTurnSnapshot) {
+					currentContext = nextTurnSnapshot.context ?? currentContext;
+					config = {
+						...config,
+						model: nextTurnSnapshot.model ?? config.model,
+						reasoning:
+							nextTurnSnapshot.thinkingLevel === undefined
+								? config.reasoning
+								: nextTurnSnapshot.thinkingLevel === "off"
+									? undefined
+									: nextTurnSnapshot.thinkingLevel,
+					};
+				}
+			}
+
 			// Stream assistant response
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 			newMessages.push(message);
@@ -240,37 +263,15 @@ async function runLoop(
 
 			await emit({ type: "turn_end", message, toolResults });
 
-			const nextTurnContext = {
+			completedTurn = {
 				message,
 				toolResults,
 				toolBatchTerminated,
 				context: currentContext,
 				newMessages,
 			};
-			const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
-			if (nextTurnSnapshot) {
-				currentContext = nextTurnSnapshot.context ?? currentContext;
-				config = {
-					...config,
-					model: nextTurnSnapshot.model ?? config.model,
-					reasoning:
-						nextTurnSnapshot.thinkingLevel === undefined
-							? config.reasoning
-							: nextTurnSnapshot.thinkingLevel === "off"
-								? undefined
-								: nextTurnSnapshot.thinkingLevel,
-				};
-			}
 
-			if (
-				await config.shouldStopAfterTurn?.({
-					message,
-					toolResults,
-					toolBatchTerminated,
-					context: currentContext,
-					newMessages,
-				})
-			) {
+			if (await config.shouldStopAfterTurn?.(completedTurn)) {
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}

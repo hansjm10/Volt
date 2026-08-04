@@ -116,6 +116,11 @@ export interface AgentOptions {
 	prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
+	prepareQueuedMessages?: (
+		messages: AgentMessage[],
+		delivery: "steer" | "followUp",
+		signal?: AbortSignal,
+	) => Promise<AgentMessage[]> | AgentMessage[];
 	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext, signal?: AbortSignal) => boolean | Promise<boolean>;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
@@ -140,6 +145,7 @@ export type AgentEventListener =
 
 class PendingMessageQueue {
 	private messages: AgentMessage[] = [];
+	private clearGeneration = 0;
 	public mode: QueueMode;
 
 	constructor(mode: QueueMode) {
@@ -154,23 +160,28 @@ class PendingMessageQueue {
 		return this.messages.length > 0;
 	}
 
-	drain(): AgentMessage[] {
-		if (this.mode === "all") {
-			const drained = this.messages.slice();
-			this.messages = [];
-			return drained;
+	async drainPrepared(
+		prepare: (messages: AgentMessage[]) => AgentMessage[] | Promise<AgentMessage[]>,
+	): Promise<AgentMessage[]> {
+		const messages = this.mode === "all" ? this.messages.splice(0) : this.messages.splice(0, 1);
+		if (messages.length === 0) {
+			return messages;
 		}
-
-		const first = this.messages[0];
-		if (!first) {
-			return [];
+		const clearGeneration = this.clearGeneration;
+		try {
+			const prepared = await prepare(messages);
+			return this.clearGeneration === clearGeneration ? prepared : [];
+		} catch (error) {
+			if (this.clearGeneration === clearGeneration) {
+				this.messages.unshift(...messages);
+			}
+			throw error;
 		}
-		this.messages = this.messages.slice(1);
-		return [first];
 	}
 
 	clear(): void {
 		this.messages = [];
+		this.clearGeneration++;
 	}
 }
 
@@ -209,6 +220,12 @@ export class Agent {
 	public prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
+	/** Prepare drained user queues immediately before their messages enter model context. */
+	public prepareQueuedMessages?: (
+		messages: AgentMessage[],
+		delivery: "steer" | "followUp",
+		signal?: AbortSignal,
+	) => Promise<AgentMessage[]> | AgentMessage[];
 	/**
 	 * Asks the host whether the loop should stop gracefully after the current turn.
 	 * See {@link AgentLoopConfig.shouldStopAfterTurn} for the loop contract.
@@ -242,6 +259,7 @@ export class Agent {
 		this.beforeToolCall = options.beforeToolCall;
 		this.afterToolCall = options.afterToolCall;
 		this.prepareNextTurn = options.prepareNextTurn;
+		this.prepareQueuedMessages = options.prepareQueuedMessages;
 		this.shouldStopAfterTurn = options.shouldStopAfterTurn;
 		this.steeringQueue = new PendingMessageQueue(options.steeringMode ?? "one-at-a-time");
 		this.followUpQueue = new PendingMessageQueue(options.followUpMode ?? "one-at-a-time");
@@ -381,25 +399,32 @@ export class Agent {
 			throw new Error("No messages to continue from");
 		}
 
-		const queuedSteering = this.steeringQueue.drain();
-		if (queuedSteering.length > 0) {
-			await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
-			return;
-		}
-
-		if (lastMessage.role === "assistant" || options.drainFollowUps) {
-			const queuedFollowUps = this.followUpQueue.drain();
-			if (queuedFollowUps.length > 0) {
-				await this.runPromptMessages(queuedFollowUps);
+		const activeRun = this.reserveRun();
+		try {
+			const signal = activeRun.abortController.signal;
+			const queuedSteering = await this.drainQueuedMessagesForDelivery(this.steeringQueue, "steer", signal);
+			if (queuedSteering.length > 0) {
+				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true }, activeRun);
 				return;
 			}
-		}
 
-		if (lastMessage.role === "assistant") {
-			throw new Error("Cannot continue from message role: assistant");
-		}
+			if (lastMessage.role === "assistant" || options.drainFollowUps) {
+				const queuedFollowUps = await this.drainQueuedMessagesForDelivery(this.followUpQueue, "followUp", signal);
+				if (queuedFollowUps.length > 0) {
+					await this.runPromptMessages(queuedFollowUps, {}, activeRun);
+					return;
+				}
+			}
 
-		await this.runContinuation();
+			if (lastMessage.role === "assistant") {
+				throw new Error("Cannot continue from message role: assistant");
+			}
+
+			await this.runContinuation(activeRun);
+		} catch (error) {
+			this.finishRun(activeRun);
+			throw error;
+		}
 	}
 
 	private normalizePromptInput(
@@ -424,6 +449,7 @@ export class Agent {
 	private async runPromptMessages(
 		messages: AgentMessage[],
 		options: { skipInitialSteeringPoll?: boolean } = {},
+		activeRun?: ActiveRun,
 	): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
 			await runAgentLoop(
@@ -434,10 +460,10 @@ export class Agent {
 				signal,
 				this.streamFn,
 			);
-		});
+		}, activeRun);
 	}
 
-	private async runContinuation(): Promise<void> {
+	private async runContinuation(activeRun?: ActiveRun): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
 			await runAgentLoopContinue(
 				this.createContextSnapshot(),
@@ -446,7 +472,7 @@ export class Agent {
 				signal,
 				this.streamFn,
 			);
-		});
+		}, activeRun);
 	}
 
 	private createContextSnapshot(): AgentContext {
@@ -455,6 +481,16 @@ export class Agent {
 			messages: this._state.messages.slice(),
 			tools: this._state.tools.slice(),
 		};
+	}
+
+	private async drainQueuedMessagesForDelivery(
+		queue: PendingMessageQueue,
+		delivery: "steer" | "followUp",
+		signal = this.signal,
+	): Promise<AgentMessage[]> {
+		return await queue.drainPrepared(async (messages) =>
+			this.prepareQueuedMessages ? await this.prepareQueuedMessages(messages, delivery, signal) : messages,
+		);
 	}
 
 	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
@@ -472,7 +508,18 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
-			prepareNextTurn: this.prepareNextTurn ? async () => await this.prepareNextTurn?.(this.signal) : undefined,
+			prepareNextTurn: async ({ context }) => {
+				const prepared = await this.prepareNextTurn?.(this.signal);
+				return {
+					context: prepared?.context ?? {
+						...context,
+						systemPrompt: this._state.systemPrompt,
+						tools: this._state.tools.slice(),
+					},
+					model: prepared?.model ?? this._state.model,
+					thinkingLevel: prepared?.thinkingLevel ?? this._state.thinkingLevel,
+				};
+			},
 			shouldStopAfterTurn: async (context) => (await this.shouldStopAfterTurn?.(context, this.signal)) === true,
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
@@ -482,13 +529,13 @@ export class Agent {
 					skipInitialSteeringPoll = false;
 					return [];
 				}
-				return this.steeringQueue.drain();
+				return await this.drainQueuedMessagesForDelivery(this.steeringQueue, "steer");
 			},
-			getFollowUpMessages: async () => this.followUpQueue.drain(),
+			getFollowUpMessages: async () => await this.drainQueuedMessagesForDelivery(this.followUpQueue, "followUp"),
 		};
 	}
 
-	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
+	private reserveRun(): ActiveRun {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing.");
 		}
@@ -498,18 +545,34 @@ export class Agent {
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
 		});
-		this.activeRun = { promise, resolve: resolvePromise, abortController };
-
+		const activeRun = { promise, resolve: resolvePromise, abortController };
+		this.activeRun = activeRun;
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
 		this._state.errorMessage = undefined;
+		return activeRun;
+	}
+
+	private releaseRun(activeRun: ActiveRun): void {
+		if (this.activeRun !== activeRun) return;
+		this.activeRun = undefined;
+		activeRun.resolve();
+	}
+
+	private async runWithLifecycle(
+		executor: (signal: AbortSignal) => Promise<void>,
+		activeRun = this.reserveRun(),
+	): Promise<void> {
+		if (this.activeRun !== activeRun) {
+			throw new Error("Agent run ownership was lost before execution.");
+		}
 
 		try {
-			await executor(abortController.signal);
+			await executor(activeRun.abortController.signal);
 		} catch (error) {
-			await this.handleRunFailure(error, abortController.signal.aborted);
+			await this.handleRunFailure(error, activeRun.abortController.signal.aborted);
 		} finally {
-			this.finishRun();
+			this.finishRun(activeRun);
 		}
 	}
 
@@ -532,13 +595,13 @@ export class Agent {
 		await this.processEvents({ type: "agent_end", messages: [finalizedMessage] });
 	}
 
-	private finishRun(): void {
+	private finishRun(activeRun: ActiveRun): void {
+		if (this.activeRun !== activeRun) return;
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
 		this._state.pendingToolExecutions = new Map<string, PendingToolExecution>();
-		this.activeRun?.resolve();
-		this.activeRun = undefined;
+		this.releaseRun(activeRun);
 	}
 
 	/**

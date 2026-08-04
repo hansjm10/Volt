@@ -1,7 +1,13 @@
 import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { Agent, type AgentEvent, type AgentTool, type AgentToolUpdateCallback } from "../src/index.ts";
+import {
+	Agent,
+	type AgentEvent,
+	type AgentMessage,
+	type AgentTool,
+	type AgentToolUpdateCallback,
+} from "../src/index.ts";
 
 // Mock stream that mimics AssistantMessageEventStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -68,6 +74,12 @@ function createDeferred(): {
 		resolve = resolvePromise;
 	});
 	return { promise, resolve };
+}
+
+function getUserText(message: AgentMessage): string | undefined {
+	if (message.role !== "user") return undefined;
+	if (typeof message.content === "string") return message.content;
+	return message.content.find((part) => part.type === "text")?.text;
 }
 
 describe("Agent", () => {
@@ -707,6 +719,383 @@ describe("Agent", () => {
 		// Cleanup
 		agent.abort();
 		await firstPrompt.catch(() => {});
+	});
+
+	it("reserves run ownership before preparing messages for concurrent continue calls", async () => {
+		const preparationStarted = createDeferred();
+		const releasePreparation = createDeferred();
+		let shouldBlockPreparation = true;
+		const providerUserTexts: Array<string | undefined> = [];
+		const agent = new Agent({
+			prepareQueuedMessages: async (messages, delivery) => {
+				if (delivery === "steer" && shouldBlockPreparation) {
+					shouldBlockPreparation = false;
+					preparationStarted.resolve();
+					await releasePreparation.promise;
+				}
+				return messages;
+			},
+			shouldStopAfterTurn: () => true,
+			streamFn: (_model, context) => {
+				providerUserTexts.push(
+					context.messages
+						.map(getUserText)
+						.filter((text) => text !== undefined)
+						.at(-1),
+				);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "Initial" }], timestamp: Date.now() - 10 },
+			createAssistantMessage("Initial response"),
+		];
+		agent.steer({
+			role: "user",
+			content: [{ type: "text", text: "First steering" }],
+			timestamp: Date.now(),
+		});
+		agent.steer({
+			role: "user",
+			content: [{ type: "text", text: "Second steering" }],
+			timestamp: Date.now() + 1,
+		});
+
+		const firstContinuation = agent.continue();
+		await preparationStarted.promise;
+		expect(agent.state.isStreaming).toBe(true);
+		expect(agent.signal).toBeDefined();
+		let idleResolved = false;
+		const idle = agent.waitForIdle().then(() => {
+			idleResolved = true;
+		});
+
+		await expect(agent.continue()).rejects.toThrow(
+			"Agent is already processing. Wait for completion before continuing.",
+		);
+		expect(idleResolved).toBe(false);
+		expect(agent.hasQueuedMessages()).toBe(true);
+
+		releasePreparation.resolve();
+		await Promise.all([firstContinuation, idle]);
+
+		expect(providerUserTexts).toEqual(["First steering"]);
+		expect(agent.hasQueuedMessages()).toBe(true);
+
+		await agent.continue();
+
+		expect(providerUserTexts).toEqual(["First steering", "Second steering"]);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("rejects prompt admission while continue queue preparation owns the run", async () => {
+		const preparationStarted = createDeferred();
+		const releasePreparation = createDeferred();
+		const providerUserTexts: Array<string | undefined> = [];
+		const agent = new Agent({
+			prepareQueuedMessages: async (messages, delivery) => {
+				if (delivery === "steer") {
+					preparationStarted.resolve();
+					await releasePreparation.promise;
+				}
+				return messages;
+			},
+			streamFn: (_model, context) => {
+				providerUserTexts.push(
+					context.messages
+						.map(getUserText)
+						.filter((text) => text !== undefined)
+						.at(-1),
+				);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "Initial" }], timestamp: Date.now() - 10 },
+			createAssistantMessage("Initial response"),
+		];
+		agent.steer({
+			role: "user",
+			content: [{ type: "text", text: "Queued steering" }],
+			timestamp: Date.now(),
+		});
+
+		const continuation = agent.continue();
+		await preparationStarted.promise;
+
+		await expect(agent.prompt("Concurrent prompt")).rejects.toThrow(
+			"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
+		);
+
+		releasePreparation.resolve();
+		await continuation;
+
+		expect(providerUserTexts).toEqual(["Queued steering"]);
+		expect(agent.state.messages.map(getUserText).filter((text) => text !== undefined)).toEqual([
+			"Initial",
+			"Queued steering",
+		]);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it.each([
+		{
+			name: "steering queue clear",
+			delivery: "steer" as const,
+			enqueue: (agent: Agent, message: AgentMessage) => agent.steer(message),
+			clear: (agent: Agent) => agent.clearSteeringQueue(),
+		},
+		{
+			name: "follow-up queue clear",
+			delivery: "followUp" as const,
+			enqueue: (agent: Agent, message: AgentMessage) => agent.followUp(message),
+			clear: (agent: Agent) => agent.clearFollowUpQueue(),
+		},
+		{
+			name: "all-queues clear",
+			delivery: "steer" as const,
+			enqueue: (agent: Agent, message: AgentMessage) => agent.steer(message),
+			clear: (agent: Agent) => agent.clearAllQueues(),
+		},
+	])("discards successfully prepared messages after $name", async ({ delivery, enqueue, clear }) => {
+		const preparationStarted = createDeferred();
+		const releasePreparation = createDeferred();
+		let shouldBlockPreparation = true;
+		const providerUserTexts: Array<string | undefined> = [];
+		const agent = new Agent({
+			prepareQueuedMessages: async (messages, currentDelivery) => {
+				if (currentDelivery === delivery && shouldBlockPreparation) {
+					shouldBlockPreparation = false;
+					preparationStarted.resolve();
+					await releasePreparation.promise;
+				}
+				return messages;
+			},
+			streamFn: (_model, context) => {
+				providerUserTexts.push(
+					context.messages
+						.map(getUserText)
+						.filter((text) => text !== undefined)
+						.at(-1),
+				);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "Initial" }], timestamp: Date.now() - 10 },
+			createAssistantMessage("Initial response"),
+		];
+		enqueue(agent, {
+			role: "user",
+			content: [{ type: "text", text: "Cleared message" }],
+			timestamp: Date.now(),
+		});
+
+		const continuation = agent.continue();
+		const clearedContinuation = expect(continuation).rejects.toThrow("Cannot continue from message role: assistant");
+		await preparationStarted.promise;
+		clear(agent);
+		enqueue(agent, {
+			role: "user",
+			content: [{ type: "text", text: "Replacement message" }],
+			timestamp: Date.now() + 1,
+		});
+		releasePreparation.resolve();
+		await clearedContinuation;
+
+		expect(providerUserTexts).toEqual([]);
+		expect(agent.state.messages.map(getUserText).filter((text) => text !== undefined)).toEqual(["Initial"]);
+		expect(agent.hasQueuedMessages()).toBe(true);
+
+		await agent.continue();
+
+		expect(providerUserTexts).toEqual(["Replacement message"]);
+		expect(agent.state.messages.map(getUserText).filter((text) => text !== undefined)).toEqual([
+			"Initial",
+			"Replacement message",
+		]);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it.each([
+		{
+			name: "steering queue clear",
+			delivery: "steer" as const,
+			enqueue: (agent: Agent, message: AgentMessage) => agent.steer(message),
+			clear: (agent: Agent) => agent.clearSteeringQueue(),
+		},
+		{
+			name: "follow-up queue clear",
+			delivery: "followUp" as const,
+			enqueue: (agent: Agent, message: AgentMessage) => agent.followUp(message),
+			clear: (agent: Agent) => agent.clearFollowUpQueue(),
+		},
+		{
+			name: "all-queues clear",
+			delivery: "steer" as const,
+			enqueue: (agent: Agent, message: AgentMessage) => agent.steer(message),
+			clear: (agent: Agent) => agent.clearAllQueues(),
+		},
+	])("does not restore prepared messages after $name", async ({ delivery, enqueue, clear }) => {
+		const preparationStarted = createDeferred();
+		const releasePreparation = createDeferred();
+		const agent = new Agent({
+			prepareQueuedMessages: async (messages, currentDelivery) => {
+				if (currentDelivery === delivery) {
+					preparationStarted.resolve();
+					await releasePreparation.promise;
+					throw new Error("queue preparation failed");
+				}
+				return messages;
+			},
+		});
+		agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "Initial" }], timestamp: Date.now() - 10 },
+			createAssistantMessage("Initial response"),
+		];
+		enqueue(agent, {
+			role: "user",
+			content: [{ type: "text", text: "Queued message" }],
+			timestamp: Date.now(),
+		});
+
+		const continuation = agent.continue();
+		const preparationFailure = expect(continuation).rejects.toThrow("queue preparation failed");
+		await preparationStarted.promise;
+
+		expect(agent.state.isStreaming).toBe(true);
+		clear(agent);
+		releasePreparation.resolve();
+		await preparationFailure;
+
+		expect(agent.hasQueuedMessages()).toBe(false);
+		expect(agent.state.isStreaming).toBe(false);
+		expect(agent.signal).toBeUndefined();
+	});
+
+	it("restores follow-up messages when loop preparation fails and delivers them on retry", async () => {
+		let failPreparation = true;
+		let providerCalls = 0;
+		const agent = new Agent({
+			prepareQueuedMessages: (messages, delivery) => {
+				if (delivery === "followUp" && failPreparation) {
+					throw new Error("queue preparation failed");
+				}
+				return messages;
+			},
+			streamFn: () => {
+				providerCalls++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.followUp({
+			role: "user",
+			content: [{ type: "text", text: "Queued follow-up" }],
+			timestamp: Date.now(),
+		});
+
+		await agent.prompt("Initial");
+
+		expect(providerCalls).toBe(1);
+		expect(agent.state.errorMessage).toBe("queue preparation failed");
+		expect(agent.hasQueuedMessages()).toBe(true);
+
+		failPreparation = false;
+		await agent.continue();
+
+		expect(providerCalls).toBe(2);
+		expect(agent.hasQueuedMessages()).toBe(false);
+		expect(agent.state.messages.map(getUserText).filter((text) => text !== undefined)).toEqual([
+			"Initial",
+			"Queued follow-up",
+		]);
+	});
+
+	it("restores steering ahead of messages enqueued while continue preparation is pending", async () => {
+		const preparationStarted = createDeferred();
+		const releasePreparation = createDeferred();
+		let failPreparation = true;
+		const preparedBatches: Array<Array<string | undefined>> = [];
+		const providerUserTexts: Array<string | undefined> = [];
+		const agent = new Agent({
+			prepareQueuedMessages: async (messages, delivery) => {
+				if (delivery !== "steer") return messages;
+				preparedBatches.push(messages.map(getUserText));
+				if (failPreparation) {
+					preparationStarted.resolve();
+					await releasePreparation.promise;
+					throw new Error("queue preparation failed");
+				}
+				return messages;
+			},
+			streamFn: (_model, context) => {
+				providerUserTexts.push(
+					context.messages
+						.map(getUserText)
+						.filter((text) => text !== undefined)
+						.at(-1),
+				);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "Initial" }], timestamp: Date.now() - 10 },
+			createAssistantMessage("Initial response"),
+		];
+		agent.steer({
+			role: "user",
+			content: [{ type: "text", text: "First steering" }],
+			timestamp: Date.now(),
+		});
+
+		const continuation = agent.continue();
+		const preparationFailure = expect(continuation).rejects.toThrow("queue preparation failed");
+		await preparationStarted.promise;
+		let idleResolved = false;
+		const idle = agent.waitForIdle().then(() => {
+			idleResolved = true;
+		});
+		expect(idleResolved).toBe(false);
+		agent.steer({
+			role: "user",
+			content: [{ type: "text", text: "Second steering" }],
+			timestamp: Date.now() + 1,
+		});
+		releasePreparation.resolve();
+		await preparationFailure;
+		await idle;
+
+		expect(idleResolved).toBe(true);
+		expect(agent.state.isStreaming).toBe(false);
+		expect(agent.signal).toBeUndefined();
+		expect(agent.hasQueuedMessages()).toBe(true);
+
+		failPreparation = false;
+		await agent.continue();
+
+		expect(preparedBatches).toEqual([["First steering"], ["First steering"], ["Second steering"]]);
+		expect(providerUserTexts).toEqual(["First steering", "Second steering"]);
+		expect(agent.hasQueuedMessages()).toBe(false);
 	});
 
 	it("continue() should process queued follow-up messages after an assistant turn", async () => {

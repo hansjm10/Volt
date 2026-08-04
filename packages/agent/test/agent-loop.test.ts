@@ -1039,6 +1039,63 @@ describe("agentLoop with AgentMessage", () => {
 		expect(convertedSecondTurnSystemPrompt).toBe("second prompt");
 	});
 
+	it("should prepare the next turn after queued messages enter context", async () => {
+		const context: AgentContext = {
+			systemPrompt: "first prompt",
+			messages: [],
+			tools: [],
+		};
+		const queuedMessage = createUserMessage("revise the result");
+		let steeringPoll = 0;
+		let preparedUserMessages: string[] = [];
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			getSteeringMessages: async () => {
+				steeringPoll += 1;
+				return steeringPoll === 2 ? [queuedMessage] : [];
+			},
+			prepareNextTurn: async ({ context: currentContext }) => {
+				preparedUserMessages = currentContext.messages.flatMap((message) =>
+					message.role === "user" && typeof message.content === "string" ? [message.content] : [],
+				);
+				return {
+					context: {
+						...currentContext,
+						systemPrompt: "second prompt",
+					},
+				};
+			},
+		};
+
+		let llmCalls = 0;
+		let secondTurnSystemPrompt = "";
+		const stream = agentLoop([createUserMessage("start")], context, config, undefined, (_model, ctx) => {
+			llmCalls += 1;
+			if (llmCalls === 2) {
+				secondTurnSystemPrompt = ctx.systemPrompt ?? "";
+			}
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				mockStream.push({
+					type: "done",
+					seq: 1,
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: llmCalls === 1 ? "first" : "second" }]),
+				});
+			});
+			return mockStream;
+		});
+
+		for await (const _event of stream) {
+			// consume
+		}
+
+		expect(llmCalls).toBe(2);
+		expect(preparedUserMessages).toEqual(["start", "revise the result"]);
+		expect(secondTurnSystemPrompt).toBe("second prompt");
+	});
+
 	it("should stop after the current turn when shouldStopAfterTurn returns true", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		const executed: string[] = [];
