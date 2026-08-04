@@ -1,15 +1,18 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { detectGitOperation, GitContextProvider, parseGitStatusPorcelainV2 } from "../src/core/git-context-provider.ts";
 import { discoverGitWorktree, getGitRepositoryDisplayName } from "../src/core/git-repository.ts";
 
 const SHA1 = "0123456789abcdef0123456789abcdef01234567";
 const SHA256 = `${SHA1}0123456789abcdef01234567`;
-const originalPath = process.env.PATH;
+const pathEnvironmentKey = Object.keys(process.env).find((key) => key.toUpperCase() === "PATH") ?? "PATH";
+const originalPath = process.env[pathEnvironmentKey];
 const tempDirectories: string[] = [];
+
+type FakeGitMode = "failure" | "hanging" | "oversized-output" | "delayed-counted-status";
 
 function tempDirectory(label: string): string {
 	const directory = mkdtempSync(join(tmpdir(), `${label}-`));
@@ -46,13 +49,43 @@ function createSyntheticWorktree(label = "synthetic-git-context"): string {
 	return directory;
 }
 
-function installFakeGit(script: string): string {
+function installFakeGit(mode: FakeGitMode, countFile?: string): void {
 	const binDirectory = tempDirectory("fake-git-bin");
-	const executable = join(binDirectory, "git");
-	writeFileSync(executable, `#!/bin/sh\n${script}\n`);
-	chmodSync(executable, 0o755);
-	process.env.PATH = `${binDirectory}:${originalPath ?? ""}`;
-	return binDirectory;
+	const fixture = join(binDirectory, "fake-git.mjs");
+	writeFileSync(
+		fixture,
+		`import { appendFileSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
+
+const mode = ${JSON.stringify(mode)};
+const countFile = ${countFile === undefined ? "undefined" : JSON.stringify(countFile)};
+
+switch (mode) {
+	case "failure":
+		process.exitCode = 1;
+		break;
+	case "hanging":
+		await delay(100);
+		break;
+	case "oversized-output":
+		process.stdout.write("a".repeat(2_048));
+		break;
+	case "delayed-counted-status":
+		await delay(50);
+		await new Promise((resolve) => process.stdout.write(${JSON.stringify(`# branch.oid ${SHA1}\0# branch.head main\0`)}, resolve));
+		appendFileSync(countFile, "call\\n");
+		break;
+}
+`,
+	);
+	if (process.platform === "win32") {
+		writeFileSync(join(binDirectory, "git.cmd"), `@echo off\r\n"${process.execPath}" "${fixture}" %*\r\n`);
+	} else {
+		const executable = join(binDirectory, "git");
+		writeFileSync(executable, `#!/bin/sh\nexec "${process.execPath}" "${fixture}" "$@"\n`);
+		chmodSync(executable, 0o755);
+	}
+	process.env[pathEnvironmentKey] = `${binDirectory}${delimiter}${originalPath ?? ""}`;
 }
 
 async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void> {
@@ -64,9 +97,10 @@ async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void
 }
 
 afterEach(() => {
-	process.env.PATH = originalPath;
+	if (originalPath === undefined) delete process.env[pathEnvironmentKey];
+	else process.env[pathEnvironmentKey] = originalPath;
 	while (tempDirectories.length > 0) {
-		rmSync(tempDirectories.pop()!, { recursive: true, force: true });
+		rmSync(tempDirectories.pop()!, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 	}
 });
 
@@ -296,7 +330,7 @@ describe("GitContextProvider", () => {
 		const events: Array<ReturnType<GitContextProvider["getSnapshot"]>> = [];
 		provider.subscribe((snapshot) => events.push(snapshot));
 
-		installFakeGit("exit 1");
+		installFakeGit("failure");
 		await provider.refresh();
 		expect(provider.getSnapshot()).toMatchObject({
 			head: good.head,
@@ -305,7 +339,8 @@ describe("GitContextProvider", () => {
 			revision: 2,
 		});
 		expect((provider as unknown as { pollDelayMs: number }).pollDelayMs).toBeGreaterThan(30_000);
-		process.env.PATH = originalPath;
+		if (originalPath === undefined) delete process.env[pathEnvironmentKey];
+		else process.env[pathEnvironmentKey] = originalPath;
 		await provider.refresh();
 		expect(provider.getSnapshot()).toMatchObject({ stale: false, revision: 3 });
 		expect(events.map((event) => event?.stale)).toEqual([true, false]);
@@ -314,12 +349,12 @@ describe("GitContextProvider", () => {
 
 	it("bounds timeout and output failures", async () => {
 		const repository = createSyntheticWorktree("bounded-repository");
-		installFakeGit("sleep 2");
+		installFakeGit("hanging");
 		let provider = await GitContextProvider.create(repository, { commandTimeoutMs: 25 });
 		expect(provider.getSnapshot()).toBeNull();
 		provider.dispose();
 
-		installFakeGit("head -c 2048 /dev/zero | tr '\\0' 'a'");
+		installFakeGit("oversized-output");
 		provider = await GitContextProvider.create(repository, { maxStdoutBytes: 64 });
 		expect(provider.getSnapshot()).toBeNull();
 		provider.dispose();
@@ -342,9 +377,7 @@ describe("GitContextProvider", () => {
 	it("schedules a follow-up scan when a refresh arrives mid-scan", async () => {
 		const repository = createSyntheticWorktree("rerun-repository");
 		const countFile = join(tempDirectory("git-rerun-count"), "calls");
-		installFakeGit(
-			`echo call >> ${JSON.stringify(countFile)}\nsleep 0.05\nprintf '# branch.oid ${SHA1}\\0# branch.head main\\0'`,
-		);
+		installFakeGit("delayed-counted-status", countFile);
 		const provider = new GitContextProvider(repository);
 		const first = provider.refresh();
 		expect(provider.refresh()).toBe(first);
@@ -352,28 +385,22 @@ describe("GitContextProvider", () => {
 		expect(gitCallCount(countFile)).toBe(1);
 		// The joined refresh reruns even with no observers keeping a poll alive.
 		await waitFor(() => gitCallCount(countFile) >= 2);
+		await waitFor(() => (provider as unknown as { children: Set<unknown> }).children.size === 0);
 		provider.dispose();
 	});
 
 	it("coalesces concurrent refreshes and stops observer polling on disposal", async () => {
 		const repository = createSyntheticWorktree("coalesced-repository");
 		const countFile = join(tempDirectory("git-count"), "calls");
-		installFakeGit(
-			`echo call >> ${JSON.stringify(countFile)}\nsleep 0.05\nprintf '# branch.oid ${SHA1}\\0# branch.head main\\0'`,
-		);
+		installFakeGit("delayed-counted-status", countFile);
 		const provider = await GitContextProvider.create(repository, { pollIntervalMs: 25 });
 		const unsubscribe = provider.subscribe(() => undefined);
 		expect((provider as unknown as { watchers: unknown[] }).watchers.length).toBeGreaterThan(0);
 		await Promise.all([provider.refresh(), provider.refresh(), provider.refresh()]);
 		expect(gitCallCount(countFile)).toBe(2);
-		await waitFor(() => {
-			try {
-				return Number(gitCallCount(countFile)) >= 3;
-			} catch {
-				return false;
-			}
-		});
+		await waitFor(() => gitCallCount(countFile) >= 3);
 		unsubscribe();
+		await waitFor(() => (provider as unknown as { children: Set<unknown> }).children.size === 0);
 		provider.dispose();
 		expect((provider as unknown as { pollTimer: unknown; watchers: unknown[] }).watchers).toEqual([]);
 		expect((provider as unknown as { pollTimer: unknown }).pollTimer).toBeNull();
@@ -402,5 +429,8 @@ describe("GitContextProvider", () => {
 });
 
 function gitCallCount(path: string): number {
-	return Number.parseInt(execFileSync("wc", ["-l", path], { encoding: "utf8" }).trim(), 10);
+	if (!existsSync(path)) return 0;
+	return readFileSync(path, "utf8")
+		.split(/\r?\n/)
+		.filter((line) => line.length > 0).length;
 }
