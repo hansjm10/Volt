@@ -18,25 +18,29 @@ class InputRecorder implements Component {
 	invalidate(): void {}
 }
 
-function withImageTerminal<T>(fn: () => T): T {
-	const prevTermProgram = process.env.TERM_PROGRAM;
-	const prevTerm = process.env.TERM;
-	const prevGhosttyResourcesDir = process.env.GHOSTTY_RESOURCES_DIR;
+function restoreEnvironmentVariable(name: string, value: string | undefined): void {
+	if (value === undefined) Reflect.deleteProperty(process.env, name);
+	else Reflect.set(process.env, name, value);
+}
 
-	process.env.TERM_PROGRAM = "ghostty";
-	delete process.env.TERM;
-	delete process.env.GHOSTTY_RESOURCES_DIR;
+function withImageTerminal<T>(fn: () => T): T {
+	const {
+		TERM_PROGRAM: prevTermProgram,
+		TERM: prevTerm,
+		GHOSTTY_RESOURCES_DIR: prevGhosttyResourcesDir,
+	} = process.env;
+
+	Reflect.set(process.env, "TERM_PROGRAM", "ghostty");
+	Reflect.deleteProperty(process.env, "TERM");
+	Reflect.deleteProperty(process.env, "GHOSTTY_RESOURCES_DIR");
 	resetCapabilitiesCache();
 
 	try {
 		return fn();
 	} finally {
-		if (prevTermProgram === undefined) delete process.env.TERM_PROGRAM;
-		else process.env.TERM_PROGRAM = prevTermProgram;
-		if (prevTerm === undefined) delete process.env.TERM;
-		else process.env.TERM = prevTerm;
-		if (prevGhosttyResourcesDir === undefined) delete process.env.GHOSTTY_RESOURCES_DIR;
-		else process.env.GHOSTTY_RESOURCES_DIR = prevGhosttyResourcesDir;
+		restoreEnvironmentVariable("TERM_PROGRAM", prevTermProgram);
+		restoreEnvironmentVariable("TERM", prevTerm);
+		restoreEnvironmentVariable("GHOSTTY_RESOURCES_DIR", prevGhosttyResourcesDir);
 		resetCapabilitiesCache();
 	}
 }

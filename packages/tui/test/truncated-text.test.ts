@@ -16,7 +16,9 @@ describe("TruncatedText component", () => {
 		assert.strictEqual(lines.length, 1);
 
 		// Line should be exactly 50 visible characters
-		const visibleLen = visibleWidth(lines[0]);
+		const line = lines[0];
+		assert.notStrictEqual(line, undefined);
+		const visibleLen = visibleWidth(line ?? "");
 		assert.strictEqual(visibleLen, 50);
 	});
 
@@ -40,11 +42,14 @@ describe("TruncatedText component", () => {
 
 		assert.strictEqual(lines.length, 1);
 
+		const line = lines[0];
+		assert.notStrictEqual(line, undefined);
+
 		// Should be exactly 30 characters
-		assert.strictEqual(visibleWidth(lines[0]), 30);
+		assert.strictEqual(visibleWidth(line ?? ""), 30);
 
 		// Should contain ellipsis
-		const stripped = lines[0].replace(/\x1b\[[0-9;]*m/g, "");
+		const stripped = (line ?? "").replace(/\x1b\[[0-9;]*m/g, "");
 		assert.ok(stripped.includes("..."));
 	});
 
@@ -55,11 +60,14 @@ describe("TruncatedText component", () => {
 
 		assert.strictEqual(lines.length, 1);
 
+		const line = lines[0];
+		assert.notStrictEqual(line, undefined);
+
 		// Should be exactly 40 visible characters (ANSI codes don't count)
-		assert.strictEqual(visibleWidth(lines[0]), 40);
+		assert.strictEqual(visibleWidth(line ?? ""), 40);
 
 		// Should preserve the color codes
-		assert.ok(lines[0].includes("\x1b["));
+		assert.ok(line?.includes("\x1b["));
 	});
 
 	it("truncates styled text and adds reset code before ellipsis", () => {
@@ -69,11 +77,14 @@ describe("TruncatedText component", () => {
 
 		assert.strictEqual(lines.length, 1);
 
+		const line = lines[0];
+		assert.notStrictEqual(line, undefined);
+
 		// Should be exactly 20 visible characters
-		assert.strictEqual(visibleWidth(lines[0]), 20);
+		assert.strictEqual(visibleWidth(line ?? ""), 20);
 
 		// Should contain reset code before ellipsis
-		assert.ok(lines[0].includes("\x1b[0m..."));
+		assert.ok(line?.includes("\x1b[0m..."));
 	});
 
 	it("handles text that fits exactly", () => {
@@ -83,10 +94,12 @@ describe("TruncatedText component", () => {
 		const lines = text.render(30);
 
 		assert.strictEqual(lines.length, 1);
-		assert.strictEqual(visibleWidth(lines[0]), 30);
+		const line = lines[0];
+		assert.notStrictEqual(line, undefined);
+		assert.strictEqual(visibleWidth(line ?? ""), 30);
 
 		// Should NOT contain ellipsis
-		const stripped = lines[0].replace(/\x1b\[[0-9;]*m/g, "");
+		const stripped = (line ?? "").replace(/\x1b\[[0-9;]*m/g, "");
 		assert.ok(!stripped.includes("..."));
 	});
 
@@ -95,7 +108,9 @@ describe("TruncatedText component", () => {
 		const lines = text.render(30);
 
 		assert.strictEqual(lines.length, 1);
-		assert.strictEqual(visibleWidth(lines[0]), 30);
+		const line = lines[0];
+		assert.notStrictEqual(line, undefined);
+		assert.strictEqual(visibleWidth(line ?? ""), 30);
 	});
 
 	it("stops at newline and only shows first line", () => {
@@ -104,10 +119,12 @@ describe("TruncatedText component", () => {
 		const lines = text.render(40);
 
 		assert.strictEqual(lines.length, 1);
-		assert.strictEqual(visibleWidth(lines[0]), 40);
+		const line = lines[0];
+		assert.notStrictEqual(line, undefined);
+		assert.strictEqual(visibleWidth(line ?? ""), 40);
 
 		// Should only contain "First line"
-		const stripped = lines[0].replace(/\x1b\[[0-9;]*m/g, "").trim();
+		const stripped = (line ?? "").replace(/\x1b\[[0-9;]*m/g, "").trim();
 		assert.ok(stripped.includes("First line"));
 		assert.ok(!stripped.includes("Second line"));
 		assert.ok(!stripped.includes("Third line"));
@@ -119,10 +136,12 @@ describe("TruncatedText component", () => {
 		const lines = text.render(25);
 
 		assert.strictEqual(lines.length, 1);
-		assert.strictEqual(visibleWidth(lines[0]), 25);
+		const line = lines[0];
+		assert.notStrictEqual(line, undefined);
+		assert.strictEqual(visibleWidth(line ?? ""), 25);
 
 		// Should contain ellipsis and not second line
-		const stripped = lines[0].replace(/\x1b\[[0-9;]*m/g, "");
+		const stripped = (line ?? "").replace(/\x1b\[[0-9;]*m/g, "");
 		assert.ok(stripped.includes("..."));
 		assert.ok(!stripped.includes("Second line"));
 	});

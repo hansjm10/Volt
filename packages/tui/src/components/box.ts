@@ -15,10 +15,10 @@ export class Box implements Component {
 	children: Component[] = [];
 	private paddingX: number;
 	private paddingY: number;
-	private bgFn?: (text: string) => string;
+	private bgFn: ((text: string) => string) | undefined;
 
 	// Cache for rendered output
-	private cache?: RenderCache;
+	private cache: RenderCache | undefined;
 
 	constructor(paddingX = 1, paddingY = 1, bgFn?: (text: string) => string) {
 		this.paddingX = paddingX;

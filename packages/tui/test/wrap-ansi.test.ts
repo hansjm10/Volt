@@ -2,6 +2,12 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import { visibleWidth, wrapTextWithAnsi } from "../src/utils.ts";
 
+function lineAt(lines: string[], index: number): string {
+	const line = lines[index];
+	assert.notStrictEqual(line, undefined, `Expected wrapped line at index ${index}`);
+	return line ?? "";
+}
+
 describe("wrapTextWithAnsi", () => {
 	describe("underline styling", () => {
 		it("should not apply underline style before the styled text", () => {
@@ -16,8 +22,9 @@ describe("wrapTextWithAnsi", () => {
 			assert.strictEqual(wrapped[0], "read this thread");
 
 			// Second line should start with underline, have URL content
-			assert.strictEqual(wrapped[1].startsWith(underlineOn), true);
-			assert.ok(wrapped[1].includes("https://"));
+			const secondLine = lineAt(wrapped, 1);
+			assert.strictEqual(secondLine.startsWith(underlineOn), true);
+			assert.ok(secondLine.includes("https://"));
 		});
 
 		it("should not have whitespace before underline reset code", () => {
@@ -27,7 +34,7 @@ describe("wrapTextWithAnsi", () => {
 
 			const wrapped = wrapTextWithAnsi(textWithUnderlinedTrailingSpace, 18);
 
-			assert.ok(!wrapped[0].includes(` ${underlineOff}`));
+			assert.ok(!lineAt(wrapped, 0).includes(` ${underlineOff}`));
 		});
 
 		it("should not bleed underline to padding - each line should end with reset for underline only", () => {
@@ -41,7 +48,7 @@ describe("wrapTextWithAnsi", () => {
 			// Middle lines (with underlined content) should end with underline-off, not full reset
 			// Line 1 and 2 contain underlined URL parts
 			for (let i = 1; i < wrapped.length - 1; i++) {
-				const line = wrapped[i];
+				const line = lineAt(wrapped, i);
 				if (line.includes(underlineOn)) {
 					// Should end with underline off, NOT full reset
 					assert.strictEqual(line.endsWith(underlineOff), true);
@@ -66,7 +73,7 @@ describe("wrapTextWithAnsi", () => {
 
 			// Middle lines should NOT end with full reset (kills background for padding)
 			for (let i = 0; i < wrapped.length - 1; i++) {
-				assert.strictEqual(wrapped[i].endsWith("\x1b[0m"), false);
+				assert.strictEqual(lineAt(wrapped, i).endsWith("\x1b[0m"), false);
 			}
 		});
 
@@ -87,7 +94,7 @@ describe("wrapTextWithAnsi", () => {
 
 			// Lines with underlined content should use underline-off at end, not full reset
 			for (let i = 0; i < wrapped.length - 1; i++) {
-				const line = wrapped[i];
+				const line = lineAt(wrapped, i);
 				// If this line has underline on, it should end with underline off (not full reset)
 				if (
 					(line.includes("[4m") || line.includes("[4;") || line.includes(";4m")) &&
@@ -128,8 +135,8 @@ describe("wrapTextWithAnsi", () => {
 			const wrapped = wrapTextWithAnsi(text, 40);
 
 			assert.strictEqual(wrapped.length, 2);
-			assert.strictEqual(wrapped[0], `${red}This is an example 中文汉字测试段落内容`);
-			assert.strictEqual(wrapped[1], `${red}中文汉字测试段落内容.${reset}`);
+			assert.strictEqual(lineAt(wrapped, 0), `${red}This is an example 中文汉字测试段落内容`);
+			assert.strictEqual(lineAt(wrapped, 1), `${red}中文汉字测试段落内容.${reset}`);
 			for (const line of wrapped) {
 				assert.ok(visibleWidth(line) <= 40);
 			}
@@ -152,7 +159,7 @@ describe("wrapTextWithAnsi", () => {
 
 		it("should truncate trailing whitespace that exceeds width", () => {
 			const twoSpacesWrappedToWidth1 = wrapTextWithAnsi("  ", 1);
-			assert.ok(visibleWidth(twoSpacesWrappedToWidth1[0]) <= 1);
+			assert.ok(visibleWidth(lineAt(twoSpacesWrappedToWidth1, 0)) <= 1);
 		});
 
 		it("should preserve color codes across wraps", () => {
@@ -164,12 +171,12 @@ describe("wrapTextWithAnsi", () => {
 
 			// Each continuation line should start with red code
 			for (let i = 1; i < wrapped.length; i++) {
-				assert.strictEqual(wrapped[i].startsWith(red), true);
+				assert.strictEqual(lineAt(wrapped, i).startsWith(red), true);
 			}
 
 			// Middle lines should not end with full reset
 			for (let i = 0; i < wrapped.length - 1; i++) {
-				assert.strictEqual(wrapped[i].endsWith("\x1b[0m"), false);
+				assert.strictEqual(lineAt(wrapped, i).endsWith("\x1b[0m"), false);
 			}
 		});
 	});
@@ -204,7 +211,7 @@ describe("wrapTextWithAnsi with OSC 8 hyperlinks", () => {
 		const lines = wrapTextWithAnsi(input, 6);
 
 		for (let i = 0; i < lines.length - 1; i++) {
-			const line = lines[i];
+			const line = lineAt(lines, i);
 			// Every non-final line that is inside a hyperlink should end with the close
 			if (line.includes(`\x1b]8;;${url}\x1b\\`)) {
 				assert.ok(
@@ -238,8 +245,9 @@ describe("wrapTextWithAnsi with OSC 8 hyperlinks", () => {
 		// With width 80 everything fits on one line; there should be exactly one
 		// OSC 8 open and one OSC 8 close.
 		assert.strictEqual(lines.length, 1);
-		const openCount = (lines[0].match(/\x1b\]8;;https:[^\x1b]+\x1b\\/g) ?? []).length;
-		const closeCount = (lines[0].match(/\x1b\]8;;\x1b\\/g) ?? []).length;
+		const line = lineAt(lines, 0);
+		const openCount = (line.match(/\x1b\]8;;https:[^\x1b]+\x1b\\/g) ?? []).length;
+		const closeCount = (line.match(/\x1b\]8;;\x1b\\/g) ?? []).length;
 		assert.strictEqual(openCount, 1);
 		assert.strictEqual(closeCount, 1);
 	});

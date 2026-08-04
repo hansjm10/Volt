@@ -400,6 +400,7 @@ class AnsiCodeTracker {
 		if (!match) return;
 
 		const params = match[1];
+		if (params === undefined) return;
 		if (params === "" || params === "0") {
 			// Full reset
 			this.reset();
@@ -410,7 +411,9 @@ class AnsiCodeTracker {
 		const parts = params.split(";");
 		let i = 0;
 		while (i < parts.length) {
-			const code = Number.parseInt(parts[i], 10);
+			const part = parts[i];
+			if (part === undefined) break;
+			const code = Number.parseInt(part, 10);
 
 			// Handle 256-color and RGB codes which consume multiple parameters
 			if (code === 38 || code === 48) {
@@ -755,7 +758,9 @@ function wrapSingleLine(line: string, width: number): string[] {
 			for (let i = 0; i < broken.length - 1; i++) {
 				wrapped.push(broken[i]!);
 			}
-			currentLine = broken[broken.length - 1];
+			const lastBrokenLine = broken.at(-1);
+			if (lastBrokenLine === undefined) continue;
+			currentLine = lastBrokenLine;
 			currentVisibleLength = visibleWidth(currentLine);
 			continue;
 		}

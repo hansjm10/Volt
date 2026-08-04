@@ -18,6 +18,12 @@ import {
 	setCellDimensions,
 } from "../src/terminal-image.ts";
 
+function lineAt(lines: string[], index: number): string {
+	const line = lines[index];
+	assert.notStrictEqual(line, undefined, `Expected rendered line at index ${index}`);
+	return line ?? "";
+}
+
 const ENV_KEYS = [
 	"TERM",
 	"TERM_PROGRAM",
@@ -388,7 +394,7 @@ describe("Kitty image cursor movement", () => {
 			);
 			const lines = image.render(12);
 			assert.strictEqual(lines.length, 5);
-			assert.ok(lines[0].includes(",c=1,r=5"));
+			assert.ok(lineAt(lines, 0).includes(",c=1,r=5"));
 		} finally {
 			resetCapabilitiesCache();
 			setCellDimensions({ widthPx: 9, heightPx: 18 });
@@ -409,10 +415,11 @@ describe("Kitty image cursor movement", () => {
 			const lines = image.render(4);
 			const imageId = image.getImageId();
 			assert.strictEqual(typeof imageId, "number");
-			assert.ok(lines[0].startsWith("\x1b_G"));
-			assert.ok(lines[0].includes(",C=1,"));
-			assert.ok(lines[0].includes(`,i=${imageId}`));
-			assert.ok(lines[0].endsWith("\x1b\\"));
+			const imageLine = lineAt(lines, 0);
+			assert.ok(imageLine.startsWith("\x1b_G"));
+			assert.ok(imageLine.includes(",C=1,"));
+			assert.ok(imageLine.includes(`,i=${imageId}`));
+			assert.ok(imageLine.endsWith("\x1b\\"));
 			assert.deepStrictEqual(lines.slice(1, lines.length), [""]);
 		} finally {
 			resetCapabilitiesCache();

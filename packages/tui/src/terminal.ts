@@ -69,21 +69,20 @@ export function sanitizeNotificationText(text: string): string {
  *   dock bounce, or bell indicator and which multiplexers forward reliably.
  */
 export function detectNotificationProtocol(env: NodeJS.ProcessEnv = process.env): NotificationProtocol {
-	const term = env.TERM ?? "";
-	const termProgram = env.TERM_PROGRAM ?? "";
+	const { TERM: term = "", TERM_PROGRAM: termProgram = "", TMUX, KITTY_WINDOW_ID, ConEmuANSI } = env;
 
 	// Multiplexers drop unknown OSC sequences by default (tmux needs
 	// allow-passthrough); BEL is always forwarded to the outer terminal.
-	if (env.TMUX || termProgram === "tmux" || term.startsWith("screen") || term.startsWith("tmux")) {
+	if (TMUX || termProgram === "tmux" || term.startsWith("screen") || term.startsWith("tmux")) {
 		return "bell";
 	}
 
-	if (term.includes("kitty") || env.KITTY_WINDOW_ID) return "osc99";
+	if (term.includes("kitty") || KITTY_WINDOW_ID) return "osc99";
 	if (termProgram === "WezTerm") return "osc777";
 	if (termProgram === "ghostty" || term.includes("ghostty")) return "osc777";
 	if (term.startsWith("foot") || term.includes("rxvt")) return "osc777";
 	if (termProgram === "iTerm.app") return "osc9";
-	if (env.ConEmuANSI === "ON") return "osc9";
+	if (ConEmuANSI === "ON") return "osc9";
 	return "bell";
 }
 
@@ -139,7 +138,8 @@ function isKeyboardProtocolNegotiationSequencePrefix(sequence: string): boolean 
 }
 
 export function isAppleTerminalSession(): boolean {
-	return process.platform === "darwin" && process.env.TERM_PROGRAM === "Apple_Terminal";
+	const { TERM_PROGRAM } = process.env;
+	return process.platform === "darwin" && TERM_PROGRAM === "Apple_Terminal";
 }
 
 export function normalizeAppleTerminalInput(data: string, isAppleTerminal: boolean, isShiftPressed: boolean): string {
@@ -215,20 +215,20 @@ export interface Terminal {
  */
 export class ProcessTerminal implements Terminal {
 	private wasRaw = false;
-	private inputHandler?: (data: string) => void;
-	private resizeHandler?: () => void;
+	private inputHandler: ((data: string) => void) | undefined;
+	private resizeHandler: (() => void) | undefined;
 	private _kittyProtocolActive = false;
 	private _modifyOtherKeysActive = false;
 	private _focusState: TerminalFocusState = "unknown";
 	public onFocusChange?: (focused: boolean) => void;
 	private keyboardProtocolPushed = false;
 	private keyboardProtocolNegotiationBuffer = "";
-	private keyboardProtocolBufferFlushTimer?: ReturnType<typeof setTimeout>;
-	private stdinBuffer?: StdinBuffer;
-	private stdinDataHandler?: (data: string) => void;
-	private progressInterval?: ReturnType<typeof setInterval>;
+	private keyboardProtocolBufferFlushTimer: ReturnType<typeof setTimeout> | undefined;
+	private stdinBuffer: StdinBuffer | undefined;
+	private stdinDataHandler: ((data: string) => void) | undefined;
+	private progressInterval: ReturnType<typeof setInterval> | undefined;
 	private writeLogPath = (() => {
-		const env = process.env.VOLT_TUI_WRITE_LOG || "";
+		const { VOLT_TUI_WRITE_LOG: env = "" } = process.env;
 		if (!env) return "";
 		try {
 			if (fs.statSync(env).isDirectory()) {
@@ -606,11 +606,13 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	get columns(): number {
-		return process.stdout.columns || Number(process.env.COLUMNS) || 80;
+		const { COLUMNS } = process.env;
+		return process.stdout.columns || Number(COLUMNS) || 80;
 	}
 
 	get rows(): number {
-		return process.stdout.rows || Number(process.env.LINES) || 24;
+		const { LINES } = process.env;
+		return process.stdout.rows || Number(LINES) || 24;
 	}
 
 	moveBy(lines: number): void {

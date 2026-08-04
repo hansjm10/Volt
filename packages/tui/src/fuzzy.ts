@@ -74,11 +74,14 @@ export function fuzzyMatch(query: string, text: string): FuzzyMatch {
 
 	const alphaNumericMatch = queryLower.match(/^(?<letters>[a-z]+)(?<digits>[0-9]+)$/);
 	const numericAlphaMatch = queryLower.match(/^(?<digits>[0-9]+)(?<letters>[a-z]+)$/);
-	const swappedQuery = alphaNumericMatch
-		? `${alphaNumericMatch.groups?.digits ?? ""}${alphaNumericMatch.groups?.letters ?? ""}`
-		: numericAlphaMatch
-			? `${numericAlphaMatch.groups?.letters ?? ""}${numericAlphaMatch.groups?.digits ?? ""}`
-			: "";
+	let swappedQuery = "";
+	if (alphaNumericMatch?.groups) {
+		const { digits, letters } = alphaNumericMatch.groups;
+		swappedQuery = `${digits ?? ""}${letters ?? ""}`;
+	} else if (numericAlphaMatch?.groups) {
+		const { digits, letters } = numericAlphaMatch.groups;
+		swappedQuery = `${letters ?? ""}${digits ?? ""}`;
+	}
 
 	if (!swappedQuery) {
 		return primaryMatch;

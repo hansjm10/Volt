@@ -27,10 +27,10 @@ export class Image implements Component {
 	private dimensions: ImageDimensions;
 	private theme: ImageTheme;
 	private options: ImageOptions;
-	private imageId?: number;
+	private imageId: number | undefined;
 
-	private cachedLines?: string[];
-	private cachedWidth?: number;
+	private cachedLines: string[] | undefined;
+	private cachedWidth: number | undefined;
 
 	constructor(
 		base64Data: string,
@@ -77,7 +77,7 @@ export class Image implements Component {
 			const result = renderImage(this.base64Data, this.dimensions, {
 				maxWidthCells: maxWidth,
 				maxHeightCells: maxHeight,
-				imageId: this.imageId,
+				...(this.imageId === undefined ? {} : { imageId: this.imageId }),
 				moveCursor: false,
 			});
 

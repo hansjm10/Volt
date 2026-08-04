@@ -12,10 +12,12 @@ class StrictStrikethroughTokenizer extends Tokenizer {
 			return undefined;
 		}
 
+		const raw = match[0];
 		const text = match[2];
+		if (raw === undefined || text === undefined) return undefined;
 		return {
 			type: "del",
-			raw: match[0],
+			raw,
 			text,
 			tokens: this.lexer.inlineTokens(text),
 		};
@@ -84,15 +86,15 @@ export class Markdown implements Component {
 	private text: string;
 	private paddingX: number; // Left/right padding
 	private paddingY: number; // Top/bottom padding
-	private defaultTextStyle?: DefaultTextStyle;
+	private defaultTextStyle: DefaultTextStyle | undefined;
 	private theme: MarkdownTheme;
 	private options: MarkdownOptions;
 	private defaultStylePrefix?: string;
 
 	// Cache for rendered output
-	private cachedText?: string;
-	private cachedWidth?: number;
-	private cachedLines?: string[];
+	private cachedText: string | undefined;
+	private cachedWidth: number | undefined;
+	private cachedLines: string[] | undefined;
 
 	constructor(
 		text: string,
@@ -151,6 +153,7 @@ export class Markdown implements Component {
 
 		for (let i = 0; i < tokens.length; i++) {
 			const token = tokens[i];
+			if (!token) continue;
 			const nextToken = tokens[i + 1];
 			const tokenLines = this.renderToken(token, contentWidth, nextToken?.type);
 			for (const tokenLine of tokenLines) {
@@ -408,6 +411,7 @@ export class Markdown implements Component {
 				const renderedQuoteLines: string[] = [];
 				for (let i = 0; i < quoteTokens.length; i++) {
 					const quoteToken = quoteTokens[i];
+					if (!quoteToken) continue;
 					const nextQuoteToken = quoteTokens[i + 1];
 					renderedQuoteLines.push(
 						...this.renderToken(quoteToken, quoteContentWidth, nextQuoteToken?.type, quoteInlineStyleContext),
@@ -577,6 +581,7 @@ export class Markdown implements Component {
 
 		for (let i = 0; i < token.items.length; i++) {
 			const item = token.items[i];
+			if (!item) continue;
 			const isLastItem = i === token.items.length - 1;
 			const bullet = token.ordered
 				? this.options.preserveOrderedListMarkers
@@ -681,17 +686,17 @@ export class Markdown implements Component {
 		// Calculate natural column widths (what each column needs without constraints)
 		const naturalWidths: number[] = [];
 		const minWordWidths: number[] = [];
-		for (let i = 0; i < numCols; i++) {
-			const headerText = this.renderInlineTokens(token.header[i].tokens || [], styleContext);
-			naturalWidths[i] = visibleWidth(headerText);
-			minWordWidths[i] = Math.max(1, this.getLongestWordWidth(headerText, maxUnbrokenWordWidth));
+		for (const header of token.header) {
+			const headerText = this.renderInlineTokens(header.tokens || [], styleContext);
+			naturalWidths.push(visibleWidth(headerText));
+			minWordWidths.push(Math.max(1, this.getLongestWordWidth(headerText, maxUnbrokenWordWidth)));
 		}
 		for (const row of token.rows) {
-			for (let i = 0; i < row.length; i++) {
-				const cellText = this.renderInlineTokens(row[i].tokens || [], styleContext);
-				naturalWidths[i] = Math.max(naturalWidths[i] || 0, visibleWidth(cellText));
+			for (const [i, cell] of row.entries()) {
+				const cellText = this.renderInlineTokens(cell.tokens || [], styleContext);
+				naturalWidths[i] = Math.max(naturalWidths[i] ?? 0, visibleWidth(cellText));
 				minWordWidths[i] = Math.max(
-					minWordWidths[i] || 1,
+					minWordWidths[i] ?? 1,
 					this.getLongestWordWidth(cellText, maxUnbrokenWordWidth),
 				);
 			}
@@ -712,13 +717,13 @@ export class Markdown implements Component {
 				});
 
 				for (let i = 0; i < numCols; i++) {
-					minColumnWidths[i] += growth[i] ?? 0;
+					minColumnWidths[i] = (minColumnWidths[i] ?? 1) + (growth[i] ?? 0);
 				}
 
 				const allocated = growth.reduce((total, width) => total + width, 0);
 				let leftover = remaining - allocated;
 				for (let i = 0; leftover > 0 && i < numCols; i++) {
-					minColumnWidths[i]++;
+					minColumnWidths[i] = (minColumnWidths[i] ?? 1) + 1;
 					leftover--;
 				}
 			}
@@ -732,15 +737,15 @@ export class Markdown implements Component {
 
 		if (totalNaturalWidth <= availableWidth) {
 			// Everything fits naturally
-			columnWidths = naturalWidths.map((width, index) => Math.max(width, minColumnWidths[index]));
+			columnWidths = naturalWidths.map((width, index) => Math.max(width, minColumnWidths[index] ?? 1));
 		} else {
 			// Need to shrink columns to fit
 			const totalGrowPotential = naturalWidths.reduce((total, width, index) => {
-				return total + Math.max(0, width - minColumnWidths[index]);
+				return total + Math.max(0, width - (minColumnWidths[index] ?? 1));
 			}, 0);
 			const extraWidth = Math.max(0, availableForCells - minCellsWidth);
 			columnWidths = minColumnWidths.map((minWidth, index) => {
-				const naturalWidth = naturalWidths[index];
+				const naturalWidth = naturalWidths[index] ?? minWidth;
 				const minWidthDelta = Math.max(0, naturalWidth - minWidth);
 				let grow = 0;
 				if (totalGrowPotential > 0) {
@@ -755,8 +760,10 @@ export class Markdown implements Component {
 			while (remaining > 0) {
 				let grew = false;
 				for (let i = 0; i < numCols && remaining > 0; i++) {
-					if (columnWidths[i] < naturalWidths[i]) {
-						columnWidths[i]++;
+					const columnWidth = columnWidths[i];
+					const naturalWidth = naturalWidths[i];
+					if (columnWidth !== undefined && naturalWidth !== undefined && columnWidth < naturalWidth) {
+						columnWidths[i] = columnWidth + 1;
 						remaining--;
 						grew = true;
 					}
@@ -774,14 +781,14 @@ export class Markdown implements Component {
 		// Render header with wrapping
 		const headerCellLines: string[][] = token.header.map((cell, i) => {
 			const text = this.renderInlineTokens(cell.tokens || [], styleContext);
-			return this.wrapCellText(text, columnWidths[i]);
+			return this.wrapCellText(text, columnWidths[i] ?? 1);
 		});
 		const headerLineCount = Math.max(...headerCellLines.map((c) => c.length));
 
 		for (let lineIdx = 0; lineIdx < headerLineCount; lineIdx++) {
 			const rowParts = headerCellLines.map((cellLines, colIdx) => {
 				const text = cellLines[lineIdx] || "";
-				const padded = text + " ".repeat(Math.max(0, columnWidths[colIdx] - visibleWidth(text)));
+				const padded = text + " ".repeat(Math.max(0, (columnWidths[colIdx] ?? 1) - visibleWidth(text)));
 				return this.theme.bold(padded);
 			});
 			lines.push(`│ ${rowParts.join(" │ ")} │`);
@@ -795,16 +802,17 @@ export class Markdown implements Component {
 		// Render rows with wrapping
 		for (let rowIndex = 0; rowIndex < token.rows.length; rowIndex++) {
 			const row = token.rows[rowIndex];
+			if (!row) continue;
 			const rowCellLines: string[][] = row.map((cell, i) => {
 				const text = this.renderInlineTokens(cell.tokens || [], styleContext);
-				return this.wrapCellText(text, columnWidths[i]);
+				return this.wrapCellText(text, columnWidths[i] ?? 1);
 			});
 			const rowLineCount = Math.max(...rowCellLines.map((c) => c.length));
 
 			for (let lineIdx = 0; lineIdx < rowLineCount; lineIdx++) {
 				const rowParts = rowCellLines.map((cellLines, colIdx) => {
 					const text = cellLines[lineIdx] || "";
-					return text + " ".repeat(Math.max(0, columnWidths[colIdx] - visibleWidth(text)));
+					return text + " ".repeat(Math.max(0, (columnWidths[colIdx] ?? 1) - visibleWidth(text)));
 				});
 				lines.push(`│ ${rowParts.join(" │ ")} │`);
 			}

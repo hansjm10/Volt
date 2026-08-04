@@ -35,11 +35,15 @@ export function parseOsc11BackgroundColor(data: string): RgbColor | undefined {
 		return undefined;
 	}
 
-	const value = match[1].trim();
-	if (value.startsWith("#")) {
-		const hex = value.slice(1);
+	const value = match[1];
+	if (value === undefined) {
+		return undefined;
+	}
+	const normalizedValue = value.trim();
+	if (normalizedValue.startsWith("#")) {
+		const hex = normalizedValue.slice(1);
 		if (/^[0-9a-f]{6}$/i.test(hex)) {
-			return hexToRgb(value);
+			return hexToRgb(normalizedValue);
 		}
 		if (/^[0-9a-f]{12}$/i.test(hex)) {
 			const r = parseOscHexChannel(hex.slice(0, 4));
@@ -50,7 +54,7 @@ export function parseOsc11BackgroundColor(data: string): RgbColor | undefined {
 		return undefined;
 	}
 
-	const rgbValue = value.replace(/^rgba?:/i, "");
+	const rgbValue = normalizedValue.replace(/^rgba?:/i, "");
 	const [red, green, blue] = rgbValue.split("/");
 	if (red === undefined || green === undefined || blue === undefined) {
 		return undefined;

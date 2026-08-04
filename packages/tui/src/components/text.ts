@@ -8,12 +8,12 @@ export class Text implements Component {
 	private text: string;
 	private paddingX: number; // Left/right padding
 	private paddingY: number; // Top/bottom padding
-	private customBgFn?: (text: string) => string;
+	private customBgFn: ((text: string) => string) | undefined;
 
 	// Cache for rendered output
-	private cachedText?: string;
-	private cachedWidth?: number;
-	private cachedLines?: string[];
+	private cachedText: string | undefined;
+	private cachedWidth: number | undefined;
+	private cachedLines: string[] | undefined;
 
 	constructor(text: string = "", paddingX: number = 1, paddingY: number = 1, customBgFn?: (text: string) => string) {
 		this.text = text;
