@@ -3020,7 +3020,7 @@ export class AgentSession {
 		if (abortGeneration !== this._abortGeneration) {
 			this._lastAssistantMessage = undefined;
 			this._settleRetry(false, "Retry cancelled");
-			return this.agent.hasQueuedMessages();
+			return false;
 		}
 		if (conversationGenerationRevision !== this._conversationGenerationRevision) {
 			// The provider run belongs to a branch that is no longer active. Its
@@ -3072,7 +3072,7 @@ export class AgentSession {
 			return false;
 		}
 		if (abortGeneration !== this._abortGeneration) {
-			return this.agent.hasQueuedMessages();
+			return false;
 		}
 
 		if (msg.stopReason === "error") {
