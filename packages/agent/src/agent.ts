@@ -213,7 +213,6 @@ export class Agent {
 	);
 	private activeLease?: DeliveryLease<AgentDeliveryKind, AgentMessage>;
 	private readonly preparedDeliveryCommits = new Map<string, () => void>();
-	private legacyQueuePreparationError?: unknown;
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
 	private pausedState?: Pick<DispatcherStartState, "providerRequestPending" | "pendingToolContinuation">;
@@ -427,14 +426,12 @@ export class Agent {
 			);
 		}
 		this.pausedState = undefined;
-		this.legacyQueuePreparationError = undefined;
 		this.enqueueDelivery("prompt", this.normalizePromptInput(input, images));
 		await this.runDispatcher({
 			firstDecision: true,
 			providerRequestPending: false,
 			pendingToolContinuation: false,
 		});
-		this.legacyQueuePreparationError = undefined;
 	}
 
 	/** Resume dispatcher state or a provider-ready transcript. */
@@ -448,24 +445,13 @@ export class Agent {
 		}
 		const pausedState = this.pausedState;
 		this.pausedState = undefined;
-		this.legacyQueuePreparationError = undefined;
-		const initialMessageCount = this._state.messages.length;
 		const assistantTail = lastMessage?.role === "assistant";
-		if (assistantTail && !this.hasQueuedMessages() && !this.nextAction) {
-			throw new Error("Cannot continue from message role: assistant");
-		}
 		await this.runDispatcher({
 			firstDecision: true,
 			providerRequestPending: pausedState?.providerRequestPending ?? (lastMessage !== undefined && !assistantTail),
 			pendingToolContinuation: pausedState?.pendingToolContinuation ?? false,
 			drainFollowUpsFirst: options.drainFollowUps === true,
 		});
-		const preparationError = this.legacyQueuePreparationError;
-		this.legacyQueuePreparationError = undefined;
-		if (preparationError !== undefined) throw preparationError;
-		if (assistantTail && this._state.messages.length === initialMessageCount) {
-			throw new Error("Cannot continue from message role: assistant");
-		}
 	}
 
 	private normalizePromptInput(
@@ -619,15 +605,10 @@ export class Agent {
 					)
 				: { messages: delivery.messages.slice() };
 			if (delivery.kind !== "prompt" && this.prepareQueuedMessages) {
-				try {
-					preparation = {
-						...preparation,
-						messages: await this.prepareQueuedMessages(preparation.messages, delivery.kind, this.signal),
-					};
-				} catch (error) {
-					this.legacyQueuePreparationError = error;
-					throw error;
-				}
+				preparation = {
+					...preparation,
+					messages: await this.prepareQueuedMessages(preparation.messages, delivery.kind, this.signal),
+				};
 			}
 			if (
 				this.activeLease !== lease ||
