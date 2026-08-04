@@ -197,6 +197,7 @@ type ActiveRun = {
 	promise: Promise<void>;
 	resolve: () => void;
 	abortController: AbortController;
+	turnOpen: boolean;
 };
 
 /**
@@ -693,7 +694,7 @@ export class Agent {
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
 		});
-		this.activeRun = { promise, resolve: resolvePromise, abortController };
+		this.activeRun = { promise, resolve: resolvePromise, abortController, turnOpen: false };
 
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
@@ -711,6 +712,9 @@ export class Agent {
 	}
 
 	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
+		if (!this.activeRun?.turnOpen) {
+			await this.processEvents({ type: "turn_start" });
+		}
 		const failureMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: "" }],
@@ -747,6 +751,10 @@ export class Agent {
 	 */
 	private async processEvents(event: AgentEvent): Promise<AgentMessage | undefined> {
 		switch (event.type) {
+			case "turn_start":
+				if (this.activeRun) this.activeRun.turnOpen = true;
+				break;
+
 			case "message_start":
 				this._state.streamingMessage = event.message;
 				break;
@@ -798,6 +806,7 @@ export class Agent {
 			}
 
 			case "turn_end":
+				if (this.activeRun) this.activeRun.turnOpen = false;
 				if (event.message.role === "assistant" && event.message.errorMessage) {
 					this._state.errorMessage = event.message.errorMessage;
 				}

@@ -3083,14 +3083,16 @@ export class AgentSession {
 		if (conversationGenerationChanged()) {
 			return abandonStaleConversationRun();
 		}
+		if (this._disposed || abortGeneration !== this._abortGeneration) {
+			return false;
+		}
 		if (compacted) {
-			return !this._disposed && (abortGeneration === this._abortGeneration || this.agent.hasQueuedMessages());
+			return true;
 		}
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
-		// here were queued by agent_end extension handlers and need a continuation,
-		// including messages that were already queued when the run was aborted.
-		return !this._disposed && this.agent.hasQueuedMessages();
+		// here were queued by agent_end extension handlers and need a continuation.
+		return this.agent.hasQueuedMessages();
 	}
 
 	/**
