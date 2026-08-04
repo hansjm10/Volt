@@ -293,6 +293,10 @@ async function runDispatchedLoop(
 		}
 
 		await emit({ type: "turn_start" });
+		if (signal?.aborted) {
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
 		const message = await streamAssistantResponse(currentContext, config, signal, emit, true, streamFn);
 		newMessages.push(message);
 		if (message.stopReason === "error" || message.stopReason === "aborted") {

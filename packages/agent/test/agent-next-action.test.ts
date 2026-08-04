@@ -359,6 +359,50 @@ describe("agent loop next-action protocol", () => {
 		expect(events.map((event) => event.type)).toEqual(["agent_start", "agent_end"]);
 	});
 
+	it("does not prepare or issue a provider request after turn_start observes an abort", async () => {
+		const abortController = new AbortController();
+		let transformCalls = 0;
+		let conversionCalls = 0;
+		let credentialCalls = 0;
+		let providerCalls = 0;
+		const events: AgentEvent[] = [];
+		await runAgentLoop(
+			[createUserMessage("hello")],
+			{ systemPrompt: "", messages: [] },
+			{
+				model: createModel(),
+				transformContext: async (messages) => {
+					transformCalls++;
+					return messages;
+				},
+				convertToLlm: (messages) => {
+					conversionCalls++;
+					return convertToLlm(messages);
+				},
+				getApiKey: () => {
+					credentialCalls++;
+					return "unused";
+				},
+				prepareRequest: () => undefined,
+			},
+			(event) => {
+				events.push(event);
+				if (event.type === "turn_start") abortController.abort();
+			},
+			abortController.signal,
+			() => {
+				providerCalls++;
+				return new MockAssistantStream(createAssistantMessage("unexpected"));
+			},
+		);
+
+		expect(transformCalls).toBe(0);
+		expect(conversionCalls).toBe(0);
+		expect(credentialCalls).toBe(0);
+		expect(providerCalls).toBe(0);
+		expect(events.at(-1)?.type).toBe("agent_end");
+	});
+
 	it("does not resolve another action after turn_end observes an abort", async () => {
 		const abortController = new AbortController();
 		let actionCalls = 0;
