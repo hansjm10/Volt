@@ -125,6 +125,29 @@ describe("agent loop next-action protocol", () => {
 		]);
 	});
 
+	it("emits delivery lifecycle for anonymous initial deliveries", async () => {
+		const prompt = createUserMessage("hello");
+		const events: AgentEvent[] = [];
+		await runAgentLoop(
+			[prompt],
+			{ systemPrompt: "", messages: [] },
+			{
+				model: createModel(),
+				convertToLlm,
+				prepareRequest: () => undefined,
+			},
+			(event) => {
+				events.push(event);
+			},
+			undefined,
+			() => new MockAssistantStream(createAssistantMessage("done")),
+		);
+
+		expect(events.filter((event) => event.type === "delivery_start")).toEqual([
+			{ type: "delivery_start", deliveryId: undefined, messages: [prompt] },
+		]);
+	});
+
 	it("admits a delivery before continuing from an assistant transcript tail", async () => {
 		let providerCalls = 0;
 		let providerRoles: Message["role"][] = [];
@@ -160,6 +183,33 @@ describe("agent loop next-action protocol", () => {
 		expect(providerRoles).toEqual(["assistant", "user"]);
 		expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
 		expect(events.some((event) => event.type === "delivery_start" && event.deliveryId === "resume")).toBe(true);
+	});
+
+	it("allows partial protocol adoption to admit steering at an assistant transcript tail", async () => {
+		let steeringAvailable = true;
+		let providerRoles: Message["role"][] = [];
+		const messages = await runAgentLoopContinue(
+			{ systemPrompt: "", messages: [createAssistantMessage("paused")] },
+			{
+				model: createModel(),
+				convertToLlm,
+				getSteeringMessages: async () => {
+					if (!steeringAvailable) return [];
+					steeringAvailable = false;
+					return [createUserMessage("resume")];
+				},
+				prepareRequest: () => undefined,
+			},
+			() => {},
+			undefined,
+			(_model, context) => {
+				providerRoles = context.messages.map((message) => message.role);
+				return new MockAssistantStream(createAssistantMessage("resumed"));
+			},
+		);
+
+		expect(providerRoles).toEqual(["assistant", "user"]);
+		expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
 	});
 
 	it("rejects an assistant-tail request without an admitted user delivery", async () => {
@@ -471,6 +521,30 @@ describe("agent loop next-action protocol", () => {
 			reasoning: "high",
 			roles: ["user"],
 		});
+	});
+
+	it("leaves provider-tail handling unchanged on the legacy path", async () => {
+		let providerCalls = 0;
+		let providerRoles: Message["role"][] = [];
+		const convertedPrompt = createAssistantMessage("converted prompt");
+		await runAgentLoop(
+			[createUserMessage("initial")],
+			{ systemPrompt: "", messages: [] },
+			{
+				model: createModel(),
+				convertToLlm: () => [convertedPrompt],
+			},
+			() => {},
+			undefined,
+			(_model, context) => {
+				providerCalls++;
+				providerRoles = context.messages.map((message) => message.role);
+				return new MockAssistantStream(createAssistantMessage("done"));
+			},
+		);
+
+		expect(providerCalls).toBe(1);
+		expect(providerRoles).toEqual(["assistant"]);
 	});
 
 	it("keeps legacy follow-up polling operational during the stacked migration", async () => {

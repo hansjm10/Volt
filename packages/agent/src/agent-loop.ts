@@ -87,7 +87,7 @@ export function agentLoopContinue(
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
 	}
-	if (context.messages.at(-1)?.role === "assistant" && !config.nextAction) {
+	if (context.messages.at(-1)?.role === "assistant" && !usesNextActionProtocol(config)) {
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
@@ -161,7 +161,7 @@ export async function runAgentLoopContinue(
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
 	}
-	if (context.messages.at(-1)?.role === "assistant" && !config.nextAction) {
+	if (context.messages.at(-1)?.role === "assistant" && !usesNextActionProtocol(config)) {
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
@@ -293,7 +293,7 @@ async function runDispatchedLoop(
 		}
 
 		await emit({ type: "turn_start" });
-		const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+		const message = await streamAssistantResponse(currentContext, config, signal, emit, true, streamFn);
 		newMessages.push(message);
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
 			await emit({ type: "turn_end", message, toolResults: [] });
@@ -380,7 +380,7 @@ async function runLegacyLoop(
 				}
 			}
 
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+			const message = await streamAssistantResponse(currentContext, config, signal, emit, false, streamFn);
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -479,9 +479,7 @@ async function emitDeliveries(
 	for (const delivery of deliveries) {
 		if (signal?.aborted) break;
 		if (beginDelivery && !beginDelivery(delivery)) continue;
-		if (delivery.deliveryId !== undefined) {
-			await emit({ type: "delivery_start", deliveryId: delivery.deliveryId, messages: delivery.messages });
-		}
+		await emit({ type: "delivery_start", deliveryId: delivery.deliveryId, messages: delivery.messages });
 		const finalizedMessages: AgentMessage[] = [];
 		for (const message of delivery.messages) {
 			const finalizedMessage = await emitCompletedMessage(message, emit, delivery.deliveryId);
@@ -506,6 +504,7 @@ async function streamAssistantResponse(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	validateProviderTail: boolean,
 	streamFn?: StreamFn,
 ): Promise<AssistantMessage> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
@@ -516,7 +515,7 @@ async function streamAssistantResponse(
 
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
 	const llmMessages = await config.convertToLlm(messages);
-	if (llmMessages.at(-1)?.role === "assistant") {
+	if (validateProviderTail && llmMessages.at(-1)?.role === "assistant") {
 		throw new Error("Cannot request with an assistant message at the provider transcript tail");
 	}
 
