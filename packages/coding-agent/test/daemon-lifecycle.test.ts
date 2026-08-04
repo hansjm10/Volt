@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createIrohRemotePresetAccess } from "../src/core/remote/iroh/access-grant.ts";
 import { createDaemonClient } from "../src/daemon/control-client.ts";
 import type { ControlEvent } from "../src/daemon/control-protocol.ts";
@@ -12,7 +12,7 @@ import { createDaemonLogger } from "../src/daemon/log.ts";
 import { readPidfile, runVoltDaemon, VOLTD_EXIT_ALREADY_RUNNING } from "../src/daemon/main.ts";
 import { getDaemonPaths } from "../src/daemon/paths.ts";
 import { type RelayLifecycleOwner, RelayRegistry } from "../src/daemon/relay-stream.ts";
-import { type DaemonProbeResult, ensureDaemonRunning, probeDaemon, waitForDaemonExit } from "../src/daemon/spawn.ts";
+import { type DaemonProbeResult, ensureDaemonRunning, probeDaemon } from "../src/daemon/spawn.ts";
 import { createEmptyVoltdState } from "../src/daemon/state.ts";
 import { connectRawRelayClient, FakePhoneIrohStream, type RawRelayClient } from "./relay-doubles.ts";
 
@@ -236,50 +236,39 @@ describe("voltd lifecycle", () => {
 		20_000,
 	);
 
-	win32It(
-		"auto-starts on a fresh pipe when the legacy default pipe is unresponsive",
-		async () => {
-			const paths = getDaemonPaths(agentDir);
-			const precreatedPipe = createServer((socket) => {
-				socket.destroy();
-			});
-			await new Promise<void>((resolve, reject) => {
-				precreatedPipe.once("error", reject);
-				precreatedPipe.listen(paths.socketPath, () => {
-					precreatedPipe.off("error", reject);
-					resolve();
-				});
-			});
-			try {
-				const result = await ensureDaemonRunning(agentDir);
-				expect(result.healthy).toBe(true);
-				expect(result.spawned).toBe(true);
-				expect(result.socketPath).not.toBe(paths.socketPath);
-				const client = createDaemonClient({
-					socketPath: result.socketPath,
-					client: "cli",
-					version: "test",
-					authToken: result.authToken,
-					reconnect: false,
-				});
-				await client.request({ type: "shutdown" });
-				await client.close();
-				expect(
-					await waitForDaemonExit({
-						agentDir,
-						pid: result.pid,
-						socketPath: result.socketPath,
-						timeoutMs: 10_000,
-					}),
-				).toBe("exited");
-			} finally {
-				await new Promise<void>((resolve) => {
-					precreatedPipe.close(() => resolve());
-				});
-			}
-		},
-		30_000,
-	);
+	it("auto-starts when an unmatched endpoint is unresponsive", async () => {
+		const paths = getDaemonPaths(agentDir);
+		const freshSocketPath = `${paths.socketPath}-fresh`;
+		const probes: DaemonProbeResult[] = [
+			{ healthy: false, state: "unresponsive", socketPath: paths.socketPath },
+			{
+				healthy: true,
+				state: "healthy",
+				pid: 123,
+				version: "test",
+				socketPath: freshSocketPath,
+				authToken: "test-token",
+			},
+		];
+		const probe = vi.fn(async () => probes.shift()!);
+		const spawn = vi.fn(async () => ({ ok: true, pid: 123, socketPath: freshSocketPath }));
+
+		const result = await ensureDaemonRunning(agentDir, {
+			probeDaemon: probe,
+			spawnDetachedDaemon: spawn,
+		});
+
+		expect(probe).toHaveBeenCalledTimes(2);
+		expect(spawn).toHaveBeenCalledOnce();
+		expect(spawn).toHaveBeenCalledWith(agentDir);
+		expect(result).toMatchObject({
+			healthy: true,
+			state: "healthy",
+			spawned: true,
+			pid: 123,
+			socketPath: freshSocketPath,
+		});
+	});
 
 	it("request/response correlation works over the control client", async () => {
 		const daemon = runVoltDaemon({ agentDir, foreground: false });
