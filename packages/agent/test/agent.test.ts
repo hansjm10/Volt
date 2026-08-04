@@ -151,6 +151,7 @@ describe("Agent", () => {
 		expect(events).toEqual([
 			"agent_start",
 			"turn_start",
+			"delivery_start",
 			"message_start",
 			"message_end",
 			"message_start",
