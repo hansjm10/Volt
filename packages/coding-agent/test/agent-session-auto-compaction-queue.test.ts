@@ -498,6 +498,60 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(compactionEnds).toEqual([{ aborted: true, willRetry: false }]);
 	});
 
+	it("does not authorize queued continuation when abort lands during post-run compaction", async () => {
+		const model = session.model!;
+		const compactionStarted = createDeferred();
+		const finishCompaction = createDeferred();
+		const assistantMessage: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "done" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 100,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 110,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const internals = session as unknown as {
+			_abortGeneration: number;
+			_conversationGenerationRevision: number;
+			_lastAssistantMessage: AssistantMessage | undefined;
+			_checkCompaction: (message: AssistantMessage) => Promise<boolean>;
+			_handlePostAgentRun: (abortGeneration: number, conversationGenerationRevision: number) => Promise<boolean>;
+		};
+		internals._lastAssistantMessage = assistantMessage;
+		vi.spyOn(internals, "_checkCompaction").mockImplementation(async () => {
+			compactionStarted.resolve();
+			await finishCompaction.promise;
+			return false;
+		});
+
+		const continuation = internals._handlePostAgentRun(
+			internals._abortGeneration,
+			internals._conversationGenerationRevision,
+		);
+		await compactionStarted.promise;
+		session.agent.steer({
+			role: "custom",
+			customType: "test",
+			content: [{ type: "text", text: "retained" }],
+			display: false,
+			timestamp: Date.now(),
+		});
+		await session.abort();
+		finishCompaction.resolve();
+
+		await expect(continuation).resolves.toBe(false);
+		expect(session.agent.hasQueuedMessages()).toBe(true);
+	});
+
 	it("should not continue after disposal during proactive compaction", async () => {
 		const model = session.model!;
 		const compactionStarted = createDeferred();
