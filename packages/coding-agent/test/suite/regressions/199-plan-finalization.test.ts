@@ -261,6 +261,56 @@ describe("regression #199: approved plan finalization", () => {
 		).toHaveLength(1);
 	});
 
+	it("preserves committed prompt preparation when abort revokes its failed delivery", async () => {
+		let predecessorCommits = 0;
+		const harness = await createHarness({
+			prepareDelivery: (delivery) => {
+				const messages = [...delivery.messages];
+				return {
+					messages,
+					commit: () => {
+						predecessorCommits++;
+						messages.unshift(createUserMessage("committed prompt predecessor"));
+					},
+				};
+			},
+		});
+		harnesses.push(harness);
+		await createReadyPlan(harness);
+		harness.setResponses([fauxAssistantMessage("never requested")]);
+
+		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
+		let failDraftPersistence = true;
+		harness.sessionManager.appendPlanningState = (planning) => {
+			if (planning.plan?.phase === "draft" && failDraftPersistence) {
+				throw new Error("prompt planning persistence failed");
+			}
+			return appendPlanningState(planning);
+		};
+
+		await harness.session.agent.prompt(createUserMessage("prompt feedback before abort"));
+		expect(harness.session.agent.state.errorMessage).toBe("prompt planning persistence failed");
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(predecessorCommits).toBe(1);
+
+		await harness.session.abort("host_action");
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		failDraftPersistence = false;
+		await harness.session.dispose("disposal");
+
+		expect(harness.session.planningState.plan?.phase).toBe("draft");
+		const messages = harness.sessionManager.buildSessionContext().messages;
+		expect(messages).toContainEqual(expect.objectContaining({ role: "custom", customType: "volt-plan-checkpoint" }));
+		expect(
+			messages.flatMap((message) =>
+				message.role === "user" && Array.isArray(message.content)
+					? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+					: [],
+			),
+		).toEqual(["committed prompt predecessor", "prompt feedback before abort"]);
+		expect(predecessorCommits).toBe(1);
+	});
+
 	it("promotes committed preparation instead of revoking it when queue clearing follows a planning failure", async () => {
 		let predecessorCommits = 0;
 		const harness = await createHarness({
@@ -322,6 +372,62 @@ describe("regression #199: approved plan finalization", () => {
 		).toEqual(["committed predecessor output", "feedback cleared after partial commit"]);
 		expect(harness.session.planningState.plan?.phase).toBe("draft");
 		expect(harness.sessionManager.getClientInput("committed-preparation-clear")?.state).toBe("completed");
+		expect(predecessorCommits).toBe(1);
+	});
+
+	it("retains committed preparation when queue clearing cannot persist its planning transition", async () => {
+		let predecessorCommits = 0;
+		const harness = await createHarness({
+			prepareDelivery: (delivery) => {
+				const messages = [...delivery.messages];
+				return {
+					messages,
+					commit: () => {
+						predecessorCommits++;
+						messages.unshift(createUserMessage("retained queue predecessor"));
+					},
+				};
+			},
+		});
+		harnesses.push(harness);
+		await createReadyPlan(harness);
+		harness.session.agent.state.messages = [fauxAssistantMessage("Plan tail")];
+		await harness.session.steer("feedback retained after failed queue clear");
+
+		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
+		let failDraftPersistence = true;
+		harness.sessionManager.appendPlanningState = (planning) => {
+			if (planning.plan?.phase === "draft" && failDraftPersistence) {
+				throw new Error("queue clear planning persistence failed");
+			}
+			return appendPlanningState(planning);
+		};
+
+		await harness.session.agent.continue();
+		expect(harness.session.agent.state.errorMessage).toBe("queue clear planning persistence failed");
+		expect(predecessorCommits).toBe(1);
+
+		await expect(harness.session.clearQueue()).rejects.toMatchObject({
+			code: "queue_clear_persistence_failed",
+		});
+		expect(harness.session.planningState.plan?.phase).toBe("ready");
+		expect(
+			harness.sessionManager.buildSessionContext().messages.filter((message) => message.role === "user"),
+		).toEqual([]);
+
+		failDraftPersistence = false;
+		await harness.session.dispose("disposal");
+
+		expect(harness.session.planningState.plan?.phase).toBe("draft");
+		const messages = harness.sessionManager.buildSessionContext().messages;
+		expect(messages).toContainEqual(expect.objectContaining({ role: "custom", customType: "volt-plan-checkpoint" }));
+		expect(
+			messages.flatMap((message) =>
+				message.role === "user" && Array.isArray(message.content)
+					? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+					: [],
+			),
+		).toEqual(["retained queue predecessor", "feedback retained after failed queue clear"]);
 		expect(predecessorCommits).toBe(1);
 	});
 

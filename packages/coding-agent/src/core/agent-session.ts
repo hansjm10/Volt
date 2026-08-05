@@ -1080,8 +1080,14 @@ export class AgentSession {
 
 	private _captureCommittedDeliveryPreparations(): void {
 		for (const [deliveryId, messages] of this._committedDeliveryPreparationMessages) {
+			try {
+				this._prepareUserDelivery({ messages }).commit?.();
+			} catch {
+				// Feedback cannot become canonical without its ready-to-draft transition.
+				// Keep the committed preparation retained when disposal cannot couple them.
+				continue;
+			}
 			this._captureAdmittedDelivery({ deliveryId, messages });
-			this._committedDeliveryPreparationMessages.delete(deliveryId);
 		}
 	}
 
@@ -1137,7 +1143,9 @@ export class AgentSession {
 					this._emitQueueUpdate();
 				}
 			}
-			this._emit(event);
+			// Delivery ownership has already transferred. Projection observers cannot
+			// roll back publication or interrupt the canonical message boundaries.
+			this._emitCommittedEvent(event);
 			return undefined;
 		}
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -1681,6 +1689,12 @@ export class AgentSession {
 				if (operation) durablyAdmittedOperations.add(operation);
 			}
 			this._pendingAdmittedDeliveryMessages.shift();
+			if (
+				pending.deliveryId !== undefined &&
+				!this._pendingAdmittedDeliveryMessages.some((candidate) => candidate.deliveryId === pending.deliveryId)
+			) {
+				this._committedDeliveryPreparationMessages.delete(pending.deliveryId);
+			}
 		}
 	}
 
@@ -4110,6 +4124,9 @@ export class AgentSession {
 				this._prepareUserDelivery({ messages }).commit?.();
 			} catch (error) {
 				persistenceError ??= error instanceof Error ? error : new Error(String(error));
+				// The planning transition and canonical feedback are one transaction.
+				// Keep the committed preparation for a later teardown retry.
+				continue;
 			}
 			try {
 				this._discardAdmittedDelivery(deliveryId);
@@ -4241,9 +4258,9 @@ export class AgentSession {
 	 */
 	abort(source?: AgentAbortSource): Promise<void> {
 		this.agent.abort(source);
-		for (const deliveryId of this.agent.discardPendingPrompt()) {
-			this._committedDeliveryPreparationMessages.delete(deliveryId);
-		}
+		// Revoking an uncommitted prompt does not revoke predecessor work whose
+		// preparation commit already succeeded. Retain it for canonical teardown.
+		this.agent.discardPendingPrompt();
 		this._proactiveCompactionResumeAction = undefined;
 		if (this._abortPromise) {
 			return this._abortPromise;

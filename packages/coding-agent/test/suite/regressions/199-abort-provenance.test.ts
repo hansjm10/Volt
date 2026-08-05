@@ -154,6 +154,43 @@ describe("regression #199: abort provenance persistence", () => {
 		expect(runtimeAbortSources(harness)).toEqual(["remote_request"]);
 	});
 
+	it("keeps delivery-start observer failures from interrupting committed delivery publication", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("first delivery completed"),
+			fauxAssistantMessage("second delivery completed"),
+		]);
+		let failFirstDeliveryPublication = true;
+		harness.session.subscribe((event) => {
+			if (event.type === "delivery_start" && failFirstDeliveryPublication) {
+				failFirstDeliveryPublication = false;
+				throw new Error("delivery observer failed");
+			}
+		});
+
+		await harness.session.prompt("first committed delivery");
+		await harness.session.prompt("second committed delivery");
+
+		const messages = harness.sessionManager.buildSessionContext().messages;
+		expect(
+			messages.flatMap((message) =>
+				message.role === "user" && Array.isArray(message.content)
+					? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+					: [],
+			),
+		).toEqual(["first committed delivery", "second committed delivery"]);
+		expect(
+			messages.flatMap((message) =>
+				message.role === "assistant"
+					? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+					: [],
+			),
+		).toEqual(["first delivery completed", "second delivery completed"]);
+		expect(harness.session.agent.state.errorMessage).toBeUndefined();
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
 	it("persists one replacement marker when disposal interrupts an accepted request", async () => {
 		const responseStarted = deferred();
 		const finishResponse = deferred();
@@ -340,7 +377,7 @@ describe("regression #199: abort provenance persistence", () => {
 		});
 	});
 
-	it("persists predecessor output when disposal follows a later planning commit failure", async () => {
+	it("does not persist committed feedback when disposal cannot persist its planning transition", async () => {
 		let predecessorCommits = 0;
 		const harness = await createHarness({
 			prepareDelivery: (delivery) => {
@@ -389,7 +426,7 @@ describe("regression #199: abort provenance persistence", () => {
 		await harness.session.dispose("disposal");
 
 		const messages = harness.sessionManager.buildSessionContext().messages;
-		expect(messages).toContainEqual(
+		expect(messages).not.toContainEqual(
 			expect.objectContaining({
 				role: "custom",
 				customType: "committed-before-disposal",
@@ -402,7 +439,8 @@ describe("regression #199: abort provenance persistence", () => {
 					? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
 					: [],
 			),
-		).toEqual(["committed predecessor output", "feedback before disposal"]);
+		).toEqual([]);
+		expect(harness.session.planningState.plan?.phase).toBe("ready");
 		expect(predecessorCommits).toBe(1);
 	});
 
