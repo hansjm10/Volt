@@ -349,6 +349,36 @@ describe("Agent", () => {
 		expect(agent.state.isStreaming).toBe(false);
 	});
 
+	it("rejects abort requests once agent_end settlement begins", async () => {
+		const agentEndStarted = createDeferred();
+		const releaseAgentEnd = createDeferred();
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("completed") });
+				});
+				return stream;
+			},
+		});
+		agent.subscribe(async (event) => {
+			if (event.type !== "agent_end") return;
+			agentEndStarted.resolve();
+			await releaseAgentEnd.promise;
+		});
+
+		const prompting = agent.prompt("complete normally");
+		await agentEndStarted.promise;
+		expect(agent.abort("remote_request")).toMatchObject({ accepted: false, source: undefined });
+		releaseAgentEnd.resolve();
+		await prompting;
+
+		const assistants = agent.state.messages.filter((message) => message.role === "assistant");
+		expect(assistants).toHaveLength(1);
+		expect(assistants[0]).toMatchObject({ stopReason: "stop" });
+		expect(assistants[0]?.diagnostics?.filter((diagnostic) => diagnostic.type === "runtime_abort") ?? []).toEqual([]);
+	});
+
 	it("waitForIdle should wait for async subscribers", async () => {
 		const barrier = createDeferred();
 		const agent = new Agent({

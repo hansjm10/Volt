@@ -62,6 +62,21 @@ function createAssistantToolUseMessage(): AssistantMessage {
 	};
 }
 
+function runtimeAbortSources(agent: Agent): unknown[] {
+	return agent.state.messages.flatMap((message) =>
+		message.role === "assistant"
+			? (message.diagnostics ?? []).flatMap((diagnostic) =>
+					diagnostic.type === "runtime_abort" &&
+					diagnostic.details &&
+					typeof diagnostic.details === "object" &&
+					"source" in diagnostic.details
+						? [diagnostic.details.source]
+						: [],
+				)
+			: [],
+	);
+}
+
 function createNoopTool(onExecute?: () => void): AgentTool<ReturnType<typeof Type.Object>> {
 	return {
 		name: "noop_tool",
@@ -197,21 +212,46 @@ describe("abort between turns", () => {
 		releaseTurnEnd.resolve();
 		await prompting;
 
-		const abortSources = agent.state.messages.flatMap((message) =>
-			message.role === "assistant"
-				? (message.diagnostics ?? []).flatMap((diagnostic) =>
-						diagnostic.type === "runtime_abort" &&
-						diagnostic.details &&
-						typeof diagnostic.details === "object" &&
-						"source" in diagnostic.details
-							? [diagnostic.details.source]
-							: [],
-					)
-				: [],
-		);
 		expect(providerCalls).toBe(1);
-		expect(abortSources).toEqual(["remote_request"]);
+		expect(runtimeAbortSources(agent)).toEqual(["remote_request"]);
 		expect(agent.hasQueuedMessages()).toBe(true);
+	});
+
+	it("persists sourced abort provenance when cancellation lands during next-action settlement", async () => {
+		const nextActionStarted = createDeferred();
+		const releaseNextAction = createDeferred();
+		let providerCalls = 0;
+		const agent = new Agent({
+			nextAction: async (context) => {
+				if (!context.completedTurn) return context.defaultAction;
+				nextActionStarted.resolve();
+				await releaseNextAction.promise;
+				return context.defaultAction;
+			},
+			streamFn: () => {
+				providerCalls++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						seq: 1,
+						reason: "stop",
+						message: createAssistantMessage("completed"),
+					});
+				});
+				return stream;
+			},
+		});
+
+		const prompting = agent.prompt("complete before policy settlement");
+		await nextActionStarted.promise;
+		expect(agent.abort("remote_request")).toMatchObject({ accepted: true, source: "remote_request" });
+		releaseNextAction.resolve();
+		await prompting;
+
+		expect(providerCalls).toBe(1);
+		expect(runtimeAbortSources(agent)).toEqual(["remote_request"]);
+		expect(agent.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
 	});
 
 	it("keeps queued steering messages pending for a resume after abort", async () => {

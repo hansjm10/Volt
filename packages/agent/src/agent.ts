@@ -853,7 +853,7 @@ export class Agent {
 
 			case "agent_end":
 				this._state.streamingMessage = undefined;
-				if (this.activeRun) this.activeRun.phase = "terminal_event_settling";
+				if (this.activeRun) this.activeRun.phase = "settled";
 				break;
 		}
 
