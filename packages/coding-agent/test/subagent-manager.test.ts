@@ -2161,6 +2161,47 @@ describe("SubagentManager", () => {
 		});
 	});
 
+	it("preserves an explicit abort source when a retained child is subsequently disposed", async () => {
+		const responseStarted = createDeferred();
+		const finishResponse = createDeferred();
+		let childRuntime: SubagentRuntimeCreatedEvent["runtime"] | undefined;
+		const resourceLoader = createSubagentResourceLoader([createDefinition({ name: "researcher" })]);
+		const { manager } = await createTestManager({
+			resourceLoader,
+			retainRuntimeOnDispose: true,
+			responses: [
+				async () => {
+					responseStarted.resolve();
+					await finishResponse.promise;
+					return fauxAssistantMessage("late response");
+				},
+			],
+			onRuntimeCreated: (event) => {
+				childRuntime = event.runtime;
+			},
+		});
+		cleanups.push(async () => {
+			finishResponse.resolve();
+			await childRuntime?.dispose();
+		});
+
+		const handle = await manager.startByName("researcher");
+		await handle.prompt("abort before disposal");
+		await responseStarted.promise;
+		const abort = handle.abort("remote_request");
+		finishResponse.resolve();
+		await abort;
+		await handle.dispose();
+		if (!childRuntime) throw new Error("expected retained child runtime");
+		await childRuntime.session.waitForIdle();
+
+		expect(childRuntime.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "remote_request" } })],
+		});
+	});
+
 	it("lists only definitions allowed by the current delegation policy", async () => {
 		const resourceLoader = createSubagentResourceLoader([
 			createDefinition({ name: "researcher" }),

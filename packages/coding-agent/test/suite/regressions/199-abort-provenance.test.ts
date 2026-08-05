@@ -1,3 +1,4 @@
+import type { AgentMessage } from "@hansjm10/volt-agent-core";
 import { type AssistantMessage, fauxAssistantMessage } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHarness, type Harness } from "../harness.ts";
@@ -8,6 +9,14 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
 		resolve = promiseResolve;
 	});
 	return { promise, resolve };
+}
+
+function createUserMessage(text: string): Extract<AgentMessage, { role: "user" }> {
+	return {
+		role: "user",
+		content: [{ type: "text", text }],
+		timestamp: Date.now(),
+	};
 }
 
 function persistedAssistantMessages(harness: Harness): AssistantMessage[] {
@@ -245,6 +254,39 @@ describe("regression #199: abort provenance persistence", () => {
 		});
 	});
 
+	it("persists each composed delivery message once when disposal runs during commit", async () => {
+		let harness: Harness;
+		let disposal: Promise<void> | undefined;
+		harness = await createHarness({
+			prepareDelivery: (delivery) => {
+				const messages = [createUserMessage("prepared predecessor"), ...delivery.messages];
+				return {
+					messages,
+					commit: () => {
+						messages.push(createUserMessage("message composed during commit"));
+						disposal = harness.session.dispose("disposal");
+					},
+				};
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("never requested")]);
+
+		await harness.session.prompt("original admitted prompt");
+		await disposal;
+
+		const messages = harness.sessionManager.buildSessionContext().messages;
+		expect(
+			messages.flatMap((message) => {
+				if (message.role !== "user") return [];
+				if (typeof message.content === "string") return [message.content];
+				return message.content.flatMap((part) => (part.type === "text" ? [part.text] : []));
+			}),
+		).toEqual(["prepared predecessor", "original admitted prompt", "message composed during commit"]);
+		expect(messages.filter((message) => message.role === "assistant")).toHaveLength(1);
+		expect(runtimeAbortSources(harness)).toEqual(["disposal"]);
+	});
+
 	it("does not retain delivery admission when a disposing commit fails", async () => {
 		let harness: Harness;
 		let disposal: Promise<void> | undefined;
@@ -287,6 +329,31 @@ describe("regression #199: abort provenance persistence", () => {
 		await compaction.catch(() => undefined);
 
 		expect(abortSpy).toHaveBeenCalledWith("host_action");
+	});
+
+	it("attributes RPC compaction cancellation to a remote request", async () => {
+		const responseStarted = deferred();
+		const finishResponse = deferred();
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await harness.session.bindExtensions({ mode: "rpc" });
+		harness.setResponses([
+			async () => {
+				responseStarted.resolve();
+				await finishResponse.promise;
+				return fauxAssistantMessage("late response");
+			},
+		]);
+		const abortSpy = vi.spyOn(harness.session.agent, "abort");
+
+		const prompt = harness.session.prompt("compact this RPC run");
+		await responseStarted.promise;
+		const compaction = harness.session.compact();
+		finishResponse.resolve();
+		await prompt;
+		await compaction.catch(() => undefined);
+
+		expect(abortSpy).toHaveBeenCalledWith("remote_request");
 	});
 
 	it("deduplicates disposal against a terminal message_end still settling", async () => {

@@ -12,7 +12,7 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
 	return { promise, resolve };
 }
 
-function createUserMessage(text: string): AgentMessage {
+function createUserMessage(text: string): Extract<AgentMessage, { role: "user" }> {
 	return {
 		role: "user",
 		content: [{ type: "text", text }],
@@ -309,6 +309,8 @@ describe("regression #199: approved plan finalization", () => {
 		});
 		const active = harness.session.planningState.plan!;
 		const requestSnapshots: Array<{ tools: string[]; systemPrompt: string }> = [];
+		let retriedRequestContainedQueuedInput: boolean | undefined;
+		let clearedQueuedDeliveries: number | undefined;
 		harness.setResponses([
 			fauxAssistantMessage(
 				fauxToolCall("update_plan_progress", {
@@ -323,6 +325,7 @@ describe("regression #199: approved plan finalization", () => {
 					tools: context.tools?.map((tool) => tool.name) ?? [],
 					systemPrompt: context.systemPrompt ?? "",
 				});
+				harness.session.agent.followUp(createUserMessage("queued during final-response retry"));
 				return fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" });
 			},
 			(context) => {
@@ -330,13 +333,26 @@ describe("regression #199: approved plan finalization", () => {
 					tools: context.tools?.map((tool) => tool.name) ?? [],
 					systemPrompt: context.systemPrompt ?? "",
 				});
+				retriedRequestContainedQueuedInput = JSON.stringify(context.messages).includes(
+					"queued during final-response retry",
+				);
+				clearedQueuedDeliveries = harness.session.agent.clearFollowUpQueue().length;
 				return fauxAssistantMessage("Final response after retry");
+			},
+			(context) => {
+				requestSnapshots.push({
+					tools: context.tools?.map((tool) => tool.name) ?? [],
+					systemPrompt: context.systemPrompt ?? "",
+				});
+				return fauxAssistantMessage("Build tools restored after retry");
 			},
 		]);
 
 		await harness.session.prompt("Complete the approved plan despite a transient failure");
 
 		expect(requestSnapshots).toHaveLength(2);
+		expect(retriedRequestContainedQueuedInput).toBe(false);
+		expect(clearedQueuedDeliveries).toBe(1);
 		for (const snapshot of requestSnapshots) {
 			expect(snapshot.tools).toEqual([]);
 			expect(snapshot.systemPrompt).toContain("[VOLT FINAL RESPONSE — TRUSTED RUNTIME POLICY]");
@@ -344,6 +360,92 @@ describe("regression #199: approved plan finalization", () => {
 		expect(harness.session.messages.at(-1)).toMatchObject({
 			role: "assistant",
 			content: [{ type: "text", text: "Final response after retry" }],
+		});
+
+		await harness.session.prompt("Start a fresh Build turn");
+		expect(requestSnapshots[2]!.tools).toEqual(["build_marker"]);
+		expect(requestSnapshots[2]!.systemPrompt).not.toContain("[VOLT FINAL RESPONSE — TRUSTED RUNTIME POLICY]");
+	});
+
+	it("retains tool-free final-response authority across overflow compaction", async () => {
+		const harness = await createHarness({
+			tools: [createBuildMarkerTool()],
+			initialActiveToolNames: ["build_marker"],
+			settings: { compaction: { enabled: true, keepRecentTokens: 1 } },
+		});
+		harnesses.push(harness);
+		harness.session.setSessionName("final response compaction regression");
+		const olderUser = createUserMessage("older compactable turn");
+		const olderAssistant = fauxAssistantMessage("older completed response");
+		harness.sessionManager.appendMessage(olderUser);
+		harness.sessionManager.appendMessage(olderAssistant);
+		harness.session.agent.state.messages = [olderUser, olderAssistant];
+		await harness.session.setAgentMode("plan");
+		const draft = harness.session.updatePlan({ steps: [{ text: "Finish compacted implementation" }] });
+		const ready = harness.session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Finish compacted implementation",
+			summary: "Complete the approved work after overflow compaction.",
+		});
+		await harness.session.activatePlan(ready.id, ready.revision, {
+			id: "execution-final-response-compaction",
+			approvedRevision: ready.revision,
+			strategy: "retain_context",
+			sourceSessionId: harness.session.sessionId,
+			targetSessionId: harness.session.sessionId,
+		});
+		const active = harness.session.planningState.plan!;
+		const requestSnapshots: Array<{ tools: string[]; systemPrompt: string }> = [];
+		let compactedRequestContainedQueuedInput: boolean | undefined;
+		let clearedQueuedDeliveries: number | undefined;
+		harness.faux.setSimpleResponses([
+			fauxAssistantMessage("compacted final-response context"),
+			fauxAssistantMessage("compacted active-turn prefix"),
+		]);
+		harness.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall("update_plan_progress", {
+					planId: active.id,
+					expectedRevision: active.revision,
+					updates: [{ id: active.steps[0]!.id, status: "completed" }],
+				}),
+				{ stopReason: "toolUse" },
+			),
+			(context) => {
+				requestSnapshots.push({
+					tools: context.tools?.map((tool) => tool.name) ?? [],
+					systemPrompt: context.systemPrompt ?? "",
+				});
+				harness.session.agent.followUp(createUserMessage("queued during final-response compaction"));
+				return fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long" });
+			},
+			(context) => {
+				requestSnapshots.push({
+					tools: context.tools?.map((tool) => tool.name) ?? [],
+					systemPrompt: context.systemPrompt ?? "",
+				});
+				compactedRequestContainedQueuedInput = JSON.stringify(context.messages).includes(
+					"queued during final-response compaction",
+				);
+				clearedQueuedDeliveries = harness.session.agent.clearFollowUpQueue().length;
+				return fauxAssistantMessage("Final response after compaction");
+			},
+		]);
+
+		await harness.session.prompt("Complete the approved plan despite context overflow");
+
+		expect(requestSnapshots).toHaveLength(2);
+		expect(compactedRequestContainedQueuedInput).toBe(false);
+		expect(clearedQueuedDeliveries).toBe(1);
+		for (const snapshot of requestSnapshots) {
+			expect(snapshot.tools).toEqual([]);
+			expect(snapshot.systemPrompt).toContain("[VOLT FINAL RESPONSE — TRUSTED RUNTIME POLICY]");
+		}
+		expect(harness.sessionManager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "Final response after compaction" }],
 		});
 	});
 });
