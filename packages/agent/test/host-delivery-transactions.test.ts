@@ -46,6 +46,14 @@ function createUserMessage(text: string): Extract<AgentMessage, { role: "user" }
 	};
 }
 
+function deferred(): { promise: Promise<void>; resolve(): void } {
+	let resolve = (): void => undefined;
+	const promise = new Promise<void>((promiseResolve) => {
+		resolve = promiseResolve;
+	});
+	return { promise, resolve };
+}
+
 function getUserTexts(messages: readonly AgentMessage[]): string[] {
 	return messages.flatMap((message) => {
 		if (message.role !== "user") return [];
@@ -61,17 +69,15 @@ describe("Agent host delivery transactions", () => {
 		let failPreparation = true;
 		let providerCalls = 0;
 		const preparedIds: string[] = [];
-		const agent = new Agent({
+		let agent!: Agent;
+		agent = new Agent({
 			initialState: { messages: [createAssistantMessage("tail")] },
 			nextAction: (context) => {
 				if (context.completedTurn) return context.defaultAction;
 				initialActionCalls++;
 				if (initialActionCalls > 1) return context.defaultAction;
-				return {
-					type: "request",
-					reason: "delivery",
-					deliveries: [{ messages: [createUserMessage("retained after preparation failure")] }],
-				};
+				agent.hostDelivery(createUserMessage("retained after preparation failure"));
+				return { type: "request", reason: "delivery" };
 			},
 			prepareDelivery: (delivery) => {
 				preparationCalls++;
@@ -92,7 +98,7 @@ describe("Agent host delivery transactions", () => {
 		failPreparation = false;
 		await agent.continue();
 
-		expect(initialActionCalls).toBe(1);
+		expect(initialActionCalls).toBe(2);
 		expect(preparationCalls).toBe(2);
 		expect(new Set(preparedIds).size).toBe(1);
 		expect(providerCalls).toBe(1);
@@ -104,16 +110,14 @@ describe("Agent host delivery transactions", () => {
 		let failCommit = true;
 		let providerCalls = 0;
 		const preparedIds: string[] = [];
-		const agent = new Agent({
+		let agent!: Agent;
+		agent = new Agent({
 			initialState: { messages: [createAssistantMessage("tail")] },
 			nextAction: (context) => {
 				if (attached) return context.defaultAction;
 				attached = true;
-				return {
-					type: "request",
-					reason: "delivery",
-					deliveries: [{ messages: [createUserMessage("retained after begin failure")] }],
-				};
+				agent.hostDelivery(createUserMessage("retained after begin failure"));
+				return { type: "request", reason: "delivery" };
 			},
 			prepareDelivery: (delivery) => {
 				preparedIds.push(delivery.deliveryId);
@@ -143,31 +147,68 @@ describe("Agent host delivery transactions", () => {
 		expect(getUserTexts(agent.state.messages)).toEqual(["retained after begin failure"]);
 	});
 
-	it("assigns unique dispatcher identities when host deliveries reuse an id", async () => {
+	it("awaits asynchronous host commit durability before publishing delivery events", async () => {
+		const commitStarted = deferred();
+		const releaseCommit = deferred();
+		let deliveryStarts = 0;
+		let providerCalls = 0;
+		const agent = new Agent({
+			initialState: { messages: [createAssistantMessage("tail")] },
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				commit: async () => {
+					commitStarted.resolve();
+					await releaseCommit.promise;
+				},
+			}),
+			streamFn: () => {
+				providerCalls++;
+				return new MockAssistantStream(createAssistantMessage("done"));
+			},
+		});
+		agent.hostDelivery(createUserMessage("durable before publication"));
+		agent.subscribe((event) => {
+			if (event.type === "delivery_start") deliveryStarts++;
+		});
+
+		const continuation = agent.continue();
+		await commitStarted.promise;
+
+		expect(agent.clearHostQueue()).toEqual([]);
+		expect(deliveryStarts).toBe(0);
+		expect(providerCalls).toBe(0);
+
+		releaseCommit.resolve();
+		await continuation;
+
+		expect(deliveryStarts).toBe(1);
+		expect(providerCalls).toBe(1);
+		expect(getUserTexts(agent.state.messages)).toEqual(["durable before publication"]);
+	});
+
+	it("assigns unique dispatcher identities to separately admitted host deliveries", async () => {
 		let attached = false;
 		const preparedIds: string[] = [];
 		const committedTexts: string[] = [];
 		const deliveryStartIds: string[] = [];
-		const agent = new Agent({
+		let agent!: Agent;
+		agent = new Agent({
 			initialState: { messages: [createAssistantMessage("tail")] },
 			nextAction: (context) => {
 				if (attached) return context.defaultAction;
 				attached = true;
-				return {
-					type: "request",
-					reason: "delivery",
-					deliveries: [
-						{ deliveryId: "caller-reused-id", messages: [createUserMessage("first")] },
-						{ deliveryId: "caller-reused-id", messages: [createUserMessage("second")] },
-					],
-				};
+				agent.hostDelivery(createUserMessage("first"));
+				agent.hostDelivery(createUserMessage("second"));
+				return { type: "request", reason: "delivery" };
 			},
 			prepareDelivery: (delivery) => {
 				preparedIds.push(delivery.deliveryId);
 				const text = getUserTexts(delivery.messages)[0]!;
 				return {
 					messages: [...delivery.messages],
-					commit: () => committedTexts.push(text),
+					commit: () => {
+						committedTexts.push(text);
+					},
 				};
 			},
 			streamFn: () => new MockAssistantStream(createAssistantMessage("done")),
@@ -199,9 +240,16 @@ describe("Agent host delivery transactions", () => {
 		};
 		let deliveryPreparationIndex = 0;
 		let providerUserTexts: string[] = [];
-		const agent = new Agent({
+		let supplied = false;
+		let agent!: Agent;
+		agent = new Agent({
 			initialState: { messages: [createAssistantMessage("tail")] },
-			nextAction: (context) => (completed ? context.defaultAction : sourceAction),
+			nextAction: (context) => {
+				if (completed || supplied) return context.defaultAction;
+				supplied = true;
+				for (const delivery of sourceAction.deliveries) agent.hostDelivery(delivery.messages);
+				return { type: "request", reason: sourceAction.reason };
+			},
 			prepareDelivery: (delivery) => {
 				deliveryPreparationIndex++;
 				if (failSecondPreparation && deliveryPreparationIndex === 2) {

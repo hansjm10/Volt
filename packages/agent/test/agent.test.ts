@@ -1290,28 +1290,20 @@ describe("Agent", () => {
 		expect(agent.state.errorMessage).toBeUndefined();
 	});
 
-	it("allows nextAction to attach the required user delivery from an assistant tail", async () => {
+	it("lets nextAction request an inbox-owned host delivery from an assistant tail", async () => {
 		let attached = false;
 		let providerUserTexts: Array<string | undefined> = [];
-		const agent = new Agent({
+		let agent!: Agent;
+		agent = new Agent({
 			nextAction: (context) => {
 				if (attached) return context.defaultAction;
 				attached = true;
-				return {
-					type: "request",
-					reason: "delivery",
-					deliveries: [
-						{
-							messages: [
-								{
-									role: "user",
-									content: [{ type: "text", text: "host delivery" }],
-									timestamp: Date.now(),
-								},
-							],
-						},
-					],
-				};
+				agent.hostDelivery({
+					role: "user",
+					content: [{ type: "text", text: "host delivery" }],
+					timestamp: Date.now(),
+				});
+				return { type: "request", reason: "delivery" };
 			},
 			streamFn: (_model, context) => {
 				providerUserTexts = context.messages.map(getUserText).filter((text) => text !== undefined);
@@ -1329,14 +1321,15 @@ describe("Agent", () => {
 		expect(providerUserTexts).toEqual(["host delivery"]);
 	});
 
-	it("prepares and commits nextAction deliveries before publishing them", async () => {
+	it("prepares and commits inbox-owned host deliveries before publishing them", async () => {
 		let attached = false;
 		let preparedKind: string | undefined;
 		let committed = false;
 		let deliveryStartObservedCommit = false;
 		let deliveryId: string | undefined;
 		let providerUserTexts: Array<string | undefined> = [];
-		const agent = new Agent({
+		let agent!: Agent;
+		agent = new Agent({
 			prepareDelivery: (delivery) => {
 				preparedKind = delivery.kind;
 				const messages = [...delivery.messages];
@@ -1355,21 +1348,12 @@ describe("Agent", () => {
 			nextAction: (context) => {
 				if (attached) return context.defaultAction;
 				attached = true;
-				return {
-					type: "request",
-					reason: "delivery",
-					deliveries: [
-						{
-							messages: [
-								{
-									role: "user",
-									content: [{ type: "text", text: "host delivery" }],
-									timestamp: Date.now(),
-								},
-							],
-						},
-					],
-				};
+				agent.hostDelivery({
+					role: "user",
+					content: [{ type: "text", text: "host delivery" }],
+					timestamp: Date.now(),
+				});
+				return { type: "request", reason: "delivery" };
 			},
 			streamFn: (_model, context) => {
 				providerUserTexts = context.messages.map(getUserText).filter((text) => text !== undefined);
@@ -1391,7 +1375,7 @@ describe("Agent", () => {
 
 		expect(preparedKind).toBe("host");
 		expect(deliveryStartObservedCommit).toBe(true);
-		expect(deliveryId).toMatch(/^host-delivery:/);
+		expect(deliveryId).toMatch(/^local-queue:/);
 		expect(providerUserTexts).toEqual(["prepared host context", "host delivery"]);
 	});
 

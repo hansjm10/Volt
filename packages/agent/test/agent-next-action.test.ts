@@ -76,7 +76,7 @@ describe("agent loop next-action protocol", () => {
 		let providerCalls = 0;
 		const events: AgentEvent[] = [];
 		await runAgentLoop(
-			[createUserMessage("hello")],
+			[],
 			{ systemPrompt: "", messages: [] },
 			{
 				model: createModel(),
@@ -85,12 +85,9 @@ describe("agent loop next-action protocol", () => {
 					actionCalls++;
 					if (context.completedTurn) return { type: "stop" };
 					expect(context.defaultAction.type).toBe("request");
-					return {
-						type: "request",
-						reason: "delivery",
-						deliveries: [{ deliveryId: "initial", messages: [createUserMessage("delivered")] }],
-					};
+					return { type: "request", reason: "delivery" };
 				},
+				prepareDeliveries: () => [{ deliveryId: "initial", messages: [createUserMessage("delivered")] }],
 				prepareRequest: ({ deliveries }) => {
 					preparationCalls++;
 					expect(deliveries.map((delivery) => delivery.deliveryId)).toEqual(["initial"]);
@@ -123,6 +120,25 @@ describe("agent loop next-action protocol", () => {
 			{ type: "message_start", deliveryId: "initial" },
 			{ type: "message_end", deliveryId: "initial" },
 		]);
+	});
+
+	it("rejects payloads returned from the policy-only nextAction hook", async () => {
+		await expect(
+			runAgentLoop(
+				[],
+				{ systemPrompt: "", messages: [] },
+				{
+					model: createModel(),
+					convertToLlm,
+					nextAction: () => ({
+						type: "request",
+						reason: "delivery",
+						deliveries: [{ messages: [createUserMessage("not owned")] }],
+					}),
+				},
+				() => {},
+			),
+		).rejects.toThrow("nextAction is policy-only");
 	});
 
 	it("emits delivery lifecycle for anonymous initial deliveries", async () => {
@@ -158,13 +174,8 @@ describe("agent loop next-action protocol", () => {
 				model: createModel(),
 				convertToLlm,
 				nextAction: (context) =>
-					context.completedTurn
-						? { type: "stop" }
-						: {
-								type: "request",
-								reason: "delivery",
-								deliveries: [{ deliveryId: "resume", messages: [createUserMessage("resume")] }],
-							},
+					context.completedTurn ? { type: "stop" } : { type: "request", reason: "delivery" },
+				prepareDeliveries: () => [{ deliveryId: "resume", messages: [createUserMessage("resume")] }],
 			},
 			undefined,
 			(_model, context) => {
@@ -262,22 +273,16 @@ describe("agent loop next-action protocol", () => {
 		let actionCalls = 0;
 		let providerCalls = 0;
 		const messages = await runAgentLoop(
-			[createUserMessage("default")],
+			[],
 			{ systemPrompt: "", messages: [] },
 			{
 				model: createModel(),
 				convertToLlm,
-				nextAction: () =>
-					actionCalls++ === 0
-						? {
-								type: "request",
-								reason: "delivery",
-								deliveries: [
-									{ deliveryId: "first", messages: [createUserMessage("first")] },
-									{ deliveryId: "second", messages: [createUserMessage("second")] },
-								],
-							}
-						: { type: "stop" },
+				nextAction: () => (actionCalls++ === 0 ? { type: "request", reason: "delivery" } : { type: "stop" }),
+				prepareDeliveries: () => [
+					{ deliveryId: "first", messages: [createUserMessage("first")] },
+					{ deliveryId: "second", messages: [createUserMessage("second")] },
+				],
 				beginDelivery: (delivery) => {
 					begunDeliveryIds.push(delivery.deliveryId);
 					return true;
@@ -719,22 +724,16 @@ describe("agent loop next-action protocol", () => {
 		let preparedDeliveryIds: Array<string | undefined> = [];
 		let providerUserTexts: string[] = [];
 		const messages = await runAgentLoop(
-			[createUserMessage("default")],
+			[],
 			{ systemPrompt: "", messages: [] },
 			{
 				model: createModel(),
 				convertToLlm,
-				nextAction: () =>
-					actionCalls++ === 0
-						? {
-								type: "request",
-								reason: "delivery",
-								deliveries: [
-									{ deliveryId: "revoked", messages: [createUserMessage("revoked")] },
-									{ deliveryId: "admitted", messages: [createUserMessage("admitted")] },
-								],
-							}
-						: { type: "stop" },
+				nextAction: () => (actionCalls++ === 0 ? { type: "request", reason: "delivery" } : { type: "stop" }),
+				prepareDeliveries: () => [
+					{ deliveryId: "revoked", messages: [createUserMessage("revoked")] },
+					{ deliveryId: "admitted", messages: [createUserMessage("admitted")] },
+				],
 				beginDelivery: (delivery) => delivery.deliveryId !== "revoked",
 				prepareRequest: ({ deliveries }) => {
 					preparedDeliveryIds = deliveries.map((delivery) => delivery.deliveryId);
@@ -765,14 +764,8 @@ describe("agent loop next-action protocol", () => {
 			{
 				model: createModel(),
 				convertToLlm,
-				nextAction: () =>
-					actionCalls++ === 0
-						? {
-								type: "request",
-								reason: "continuation",
-								deliveries: [{ deliveryId: "revoked", messages: [createUserMessage("ignored")] }],
-							}
-						: { type: "stop" },
+				nextAction: () => (actionCalls++ === 0 ? { type: "request", reason: "continuation" } : { type: "stop" }),
+				prepareDeliveries: () => [{ deliveryId: "revoked", messages: [createUserMessage("ignored")] }],
 				beginDelivery: () => false,
 				prepareRequest: ({ deliveries }) => {
 					preparationCalls++;

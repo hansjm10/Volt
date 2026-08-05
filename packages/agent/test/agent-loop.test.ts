@@ -651,14 +651,12 @@ describe("agentLoop with AgentMessage", () => {
 			nextAction: (action) => {
 				if (executed.length >= 1 && !queuedDelivered) {
 					queuedDelivered = true;
-					return {
-						type: "request",
-						reason: "continuation",
-						deliveries: [{ messages: [queuedUserMessage] }],
-					};
+					return { type: "request", reason: "continuation" };
 				}
 				return action.defaultAction;
 			},
+			prepareDeliveries: ({ completedTurn }) =>
+				completedTurn && queuedDelivered ? [{ messages: [queuedUserMessage] }] : [],
 		};
 
 		const events: AgentEvent[] = [];
@@ -1057,10 +1055,12 @@ describe("agentLoop with AgentMessage", () => {
 			nextAction: (action) => {
 				if (action.completedTurn && !queuedDelivered) {
 					queuedDelivered = true;
-					return { type: "request", reason: "delivery", deliveries: [{ messages: [queuedMessage] }] };
+					return { type: "request", reason: "delivery" };
 				}
 				return action.defaultAction;
 			},
+			prepareDeliveries: ({ completedTurn }) =>
+				completedTurn && queuedDelivered ? [{ messages: [queuedMessage] }] : [],
 			prepareRequest: async ({ context: currentContext }) => {
 				preparedUserMessages = currentContext.messages.flatMap((message) =>
 					message.role === "user" && typeof message.content === "string" ? [message.content] : [],

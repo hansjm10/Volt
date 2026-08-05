@@ -76,8 +76,8 @@ export function agentLoop(
 
 /**
  * Continue an agent loop from the current context without an initial delivery.
- * The next-action dispatcher may still attach a user delivery before the first
- * request, including when the retained transcript ends with an assistant.
+ * The delivery owner may still prepare a user delivery before the first request,
+ * including when the retained transcript ends with an assistant.
  */
 export function agentLoopContinue(
 	context: AgentContext,
@@ -124,11 +124,20 @@ export async function runAgentLoop(
 	const initialAction: AgentLoopNextAction = {
 		type: "request",
 		reason: prompts.length > 0 ? "delivery" : "continuation",
-		...(prompts.length > 0 ? { deliveries: [{ messages: prompts }] } : {}),
 	};
+	const initialDeliveries = prompts.length > 0 ? [{ messages: prompts }] : [];
 
 	await emit({ type: "agent_start" });
-	await runDispatchedLoop(currentContext, newMessages, config, initialAction, signal, emit, streamFn);
+	await runDispatchedLoop(
+		currentContext,
+		newMessages,
+		config,
+		initialAction,
+		initialDeliveries,
+		signal,
+		emit,
+		streamFn,
+	);
 	return newMessages;
 }
 
@@ -150,6 +159,7 @@ export async function runAgentLoopContinue(
 		newMessages,
 		config,
 		{ type: "request", reason: "continuation" },
+		[],
 		signal,
 		emit,
 		streamFn,
@@ -170,6 +180,7 @@ async function runDispatchedLoop(
 	newMessages: AgentMessage[],
 	initialConfig: AgentLoopConfig,
 	initialAction: AgentLoopNextAction,
+	initialDeliveries: AgentLoopDelivery[],
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
@@ -179,6 +190,7 @@ async function runDispatchedLoop(
 	let completedTurn: AgentLoopNextActionContext["completedTurn"];
 	let requestAuthority: AgentRequestAuthority = "provider";
 	let defaultAction = initialAction;
+	let pendingInitialDeliveries = initialDeliveries;
 
 	while (true) {
 		if (signal?.aborted) {
@@ -212,8 +224,11 @@ async function runDispatchedLoop(
 			return;
 		}
 
+		const ownedDeliveries = await config.prepareDeliveries?.(actionContext, action);
+		const deliveries = [...pendingInitialDeliveries, ...(ownedDeliveries ?? [])];
+		pendingInitialDeliveries = [];
 		const finalizedDeliveries = await emitDeliveries(
-			"deliveries" in action ? (action.deliveries ?? []) : [],
+			deliveries,
 			currentContext,
 			newMessages,
 			emit,
@@ -399,7 +414,11 @@ async function resolveNextAction(
 	config: AgentLoopConfig,
 	context: AgentLoopNextActionContext,
 ): Promise<AgentLoopNextAction> {
-	return config.nextAction ? await config.nextAction(context) : context.defaultAction;
+	const action = config.nextAction ? await config.nextAction(context) : context.defaultAction;
+	if ("deliveries" in action) {
+		throw new Error("nextAction is policy-only; admit payloads through the delivery owner");
+	}
+	return action;
 }
 
 async function emitDeliveries(
@@ -408,12 +427,12 @@ async function emitDeliveries(
 	newMessages: AgentMessage[],
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
-	beginDelivery: ((delivery: AgentLoopDelivery) => boolean) | undefined,
+	beginDelivery: ((delivery: AgentLoopDelivery) => boolean | Promise<boolean>) | undefined,
 ): Promise<AgentLoopDelivery[]> {
 	const finalizedDeliveries: AgentLoopDelivery[] = [];
 	for (const delivery of deliveries) {
 		if (signal?.aborted) continue;
-		if (beginDelivery && !beginDelivery(delivery)) continue;
+		if (beginDelivery && !(await beginDelivery(delivery))) continue;
 		await emit({ type: "delivery_start", deliveryId: delivery.deliveryId, messages: delivery.messages });
 		const finalizedMessages: AgentMessage[] = [];
 		for (const message of delivery.messages) {

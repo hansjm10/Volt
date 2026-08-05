@@ -313,11 +313,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 		preexistingNextAction = (context) => {
 			if (!context.completedTurn || deliveryAttached) return context.defaultAction;
 			deliveryAttached = true;
-			return {
-				type: "request",
-				reason: "delivery",
-				deliveries: [{ messages: [hostDelivery] }],
-			};
+			session.agent.hostDelivery(hostDelivery);
+			return { type: "request", reason: "delivery" };
 		};
 
 		session.agent.streamFn = () => {
@@ -372,11 +369,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 		preexistingNextAction = (context) => {
 			if (!context.completedTurn || deliveryAttached) return context.defaultAction;
 			deliveryAttached = true;
-			return {
-				type: "request",
-				reason: "continuation",
-				deliveries: [{ messages: [hostDelivery] }],
-			};
+			session.agent.hostDelivery(hostDelivery);
+			return { type: "request", reason: "continuation" };
 		};
 
 		session.agent.streamFn = () => {
@@ -440,21 +434,12 @@ describe("AgentSession auto-compaction queue resume", () => {
 		preexistingNextAction = (context) => {
 			if (!context.completedTurn || hostActionResolutions > 0) return context.defaultAction;
 			hostActionResolutions++;
-			return {
-				type: "request",
-				reason: "delivery",
-				deliveries: [
-					{
-						messages: [
-							{
-								role: "user",
-								content: [{ type: "text", text: hostDeliveryText }],
-								timestamp: Date.now(),
-							},
-						],
-					},
-				],
-			};
+			session.agent.hostDelivery({
+				role: "user",
+				content: [{ type: "text", text: hostDeliveryText }],
+				timestamp: Date.now(),
+			});
+			return { type: "request", reason: "delivery" };
 		};
 		const prepareDelivery = session.agent.prepareDelivery;
 		if (!prepareDelivery) throw new Error("Expected AgentSession delivery preparation hook");
@@ -541,21 +526,12 @@ describe("AgentSession auto-compaction queue resume", () => {
 		preexistingNextAction = (context) => {
 			if (!context.completedTurn || hostActionResolutions > 0) return context.defaultAction;
 			hostActionResolutions++;
-			return {
-				type: "request",
-				reason: "delivery",
-				deliveries: [
-					{
-						messages: [
-							{
-								role: "user",
-								content: [{ type: "text", text: hostDeliveryText }],
-								timestamp: Date.now(),
-							},
-						],
-					},
-				],
-			};
+			session.agent.hostDelivery({
+				role: "user",
+				content: [{ type: "text", text: hostDeliveryText }],
+				timestamp: Date.now(),
+			});
+			return { type: "request", reason: "delivery" };
 		};
 		session.subscribe((event) => {
 			if (
@@ -660,11 +636,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 			preexistingNextAction = (context) => {
 				if (!context.completedTurn || deliveryAttached) return context.defaultAction;
 				deliveryAttached = true;
-				return {
-					type: "request",
-					reason: "delivery",
-					deliveries: [{ messages: [hostDelivery] }],
-				};
+				session.agent.hostDelivery(hostDelivery);
+				return { type: "request", reason: "delivery" };
 			};
 			session.subscribe((event) => {
 				if (

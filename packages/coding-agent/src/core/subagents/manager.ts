@@ -1417,21 +1417,12 @@ export class SubagentManager {
 			if (pendingBudgetDelivery !== undefined) {
 				const content = pendingBudgetDelivery;
 				pendingBudgetDelivery = undefined;
-				return {
-					type: "request",
-					reason: "delivery",
-					deliveries: [
-						{
-							messages: [
-								{
-									role: "user",
-									content: [{ type: "text", text: content }],
-									timestamp: Date.now(),
-								},
-							],
-						},
-					],
-				};
+				runtime.session.agent.hostDelivery({
+					role: "user",
+					content: [{ type: "text", text: content }],
+					timestamp: Date.now(),
+				});
+				return { type: "request", reason: "delivery" };
 			}
 			// A budget stop deliberately skips proactive compaction: auto-resume
 			// would contradict the terminal budget decision.

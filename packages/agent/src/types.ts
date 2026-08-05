@@ -159,9 +159,8 @@ export type AgentLoopRequestReason = "delivery" | "continuation" | "final_respon
 export type AgentLoopNextAction =
 	| {
 			type: "request";
-			/** Delivery-dependent requests stop when every attached delivery is revoked. */
+			/** Delivery-dependent requests stop when no separately owned delivery is admitted. */
 			reason: AgentLoopRequestReason;
-			deliveries?: AgentLoopDelivery[];
 	  }
 	| {
 			type: "pause";
@@ -269,22 +268,26 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 
 	/**
-	 * Resolve the action before the first request and once after every successful `turn_end`.
+	 * Resolve policy before the first request and once after every successful `turn_end`.
 	 *
-	 * Returning `request` may attach deliveries that are emitted into context before
-	 * request preparation. `pause` ends this invocation while retaining continuation
-	 * intent for a higher-level dispatcher. `stop` ends it terminally.
+	 * `pause` ends this invocation while retaining continuation intent for a
+	 * higher-level dispatcher. `stop` ends it terminally. Delivery payloads are
+	 * owned separately by `prepareDeliveries` and never travel through this policy.
 	 */
 	nextAction?: (context: AgentLoopNextActionContext) => AgentLoopNextAction | Promise<AgentLoopNextAction>;
 
+	/** Lease and prepare deliveries owned by the host for one resolved request. */
+	prepareDeliveries?: (
+		context: AgentLoopNextActionContext,
+		action: Extract<AgentLoopNextAction, { type: "request" }>,
+	) => AgentLoopDelivery[] | Promise<AgentLoopDelivery[]>;
+
 	/**
-	 * Atomically begin one resolved delivery immediately before its delivery event.
+	 * Atomically commit one prepared delivery immediately before its delivery event.
 	 *
-	 * Return false when a leased delivery was revoked after `nextAction` resolved.
-	 * This hook is synchronous so queue ownership cannot change between admission
-	 * and the delivery-level commit event.
+	 * Return false when the owning transaction was revoked before commit began.
 	 */
-	beginDelivery?: (delivery: AgentLoopDelivery) => boolean;
+	beginDelivery?: (delivery: AgentLoopDelivery) => boolean | Promise<boolean>;
 
 	/**
 	 * Prepare runtime state for an imminent provider request.

@@ -264,17 +264,15 @@ describe("regression #199: approved plan finalization", () => {
 	it("prepares hook-supplied user deliveries before exposing them to a ready Build plan", async () => {
 		let suppliedHostDelivery = false;
 		const requestSnapshots: Array<{ tools: string[]; systemPrompt: string }> = [];
-		const harness = await createHarness({
+		let harness!: Harness;
+		harness = await createHarness({
 			tools: [createBuildMarkerTool()],
 			initialActiveToolNames: ["build_marker"],
 			nextAction: (context) => {
 				if (suppliedHostDelivery) return context.defaultAction;
 				suppliedHostDelivery = true;
-				return {
-					type: "request",
-					reason: "delivery",
-					deliveries: [{ messages: [createUserMessage("hook-supplied ready-plan feedback")] }],
-				};
+				harness.session.agent.hostDelivery(createUserMessage("hook-supplied ready-plan feedback"));
+				return { type: "request", reason: "delivery" };
 			},
 		});
 		harnesses.push(harness);

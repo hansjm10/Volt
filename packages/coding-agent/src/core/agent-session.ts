@@ -527,12 +527,10 @@ export class AgentSession {
 	private _activeCompaction: ActiveCompaction | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 	/**
-	 * Coordinates the agent-loop pause with its mandatory compaction. A failed
-	 * compaction returns to idle while retaining any already-resolved host action.
+	 * Coordinates the agent-loop pause with its mandatory compaction. Delivery
+	 * ownership remains in the agent inbox while compaction is scheduled or retried.
 	 */
 	private _proactiveCompactionState: "idle" | "scheduled" | "compacting" = "idle";
-	/** One request resolved before compaction and retained until delivery or request admission. */
-	private _proactiveCompactionResumeAction: AgentLoopNextAction | undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -798,25 +796,8 @@ export class AgentSession {
 		};
 		const nextAction = this.agent.nextAction;
 		this.agent.nextAction = async (context, signal) => {
-			if (this._proactiveCompactionResumeAction) {
-				const action = this._proactiveCompactionResumeAction;
-				// Once handed back to agent-core, dispatcher ownership retains the
-				// action through preparation and begin failures.
-				this._proactiveCompactionResumeAction = undefined;
-				return action;
-			}
 			const action = nextAction ? await nextAction(context, signal) : context.defaultAction;
-			const resolvedAction = this._resolveProactiveCompactionAction(context, action);
-			if (action.type === "request" && resolvedAction.type === "pause") {
-				this._proactiveCompactionResumeAction = action;
-			}
-			return resolvedAction;
-		};
-		const prepareRequest = this.agent.prepareRequest;
-		this.agent.prepareRequest = async (context, signal) => {
-			const update = await prepareRequest?.(context, signal);
-			this._proactiveCompactionResumeAction = undefined;
-			return update;
+			return this._resolveProactiveCompactionAction(context, action);
 		};
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
 			if (!this.getActiveToolNames().includes(toolCall.name)) {
@@ -1072,19 +1053,6 @@ export class AgentSession {
 		if (index !== -1) this._pendingAdmittedDeliveryMessages.splice(index, 1);
 	}
 
-	private _settleProactiveCompactionResumeDelivery(
-		event: Pick<Extract<AgentEvent, { type: "delivery_start" }>, "deliveryId" | "messages">,
-	): void {
-		const action = this._proactiveCompactionResumeAction;
-		if (action?.type !== "request" || !action.deliveries) return;
-		const deliveryIndex = action.deliveries.findIndex(
-			(delivery) => delivery.deliveryId === event.deliveryId && delivery.messages === event.messages,
-		);
-		if (deliveryIndex === -1) return;
-		const deliveries = action.deliveries.filter((_, index) => index !== deliveryIndex);
-		this._proactiveCompactionResumeAction = deliveries.length === 0 ? undefined : { ...action, deliveries };
-	}
-
 	private _captureCommittedDeliveryPreparations(): void {
 		for (const [deliveryId, messages] of this._committedDeliveryPreparationMessages) {
 			try {
@@ -1167,7 +1135,6 @@ export class AgentSession {
 			this._pendingAdmittedDeliveryMessages = [];
 		}
 		if (event.type === "delivery_start") {
-			this._settleProactiveCompactionResumeDelivery(event);
 			this._captureAdmittedDelivery(event);
 		}
 		if (event.type === "agent_end") {
@@ -1633,7 +1600,6 @@ export class AgentSession {
 		const abortAcceptance = this.agent.abort(source);
 		const runAfterAbort = this.agent.activeRunSnapshot;
 		this._disposed = true;
-		this._proactiveCompactionResumeAction = undefined;
 		this._captureCommittedDeliveryPreparations();
 		const durablyAdmittedOperations = new Set<LiveClientInputOperation>();
 
@@ -3330,12 +3296,10 @@ export class AgentSession {
 		// Disposal stops all continuations. Abort stops automatic retry/compaction
 		// resurrection, but intentionally preserves messages queued before abort.
 		if (this._disposed) {
-			this._proactiveCompactionResumeAction = undefined;
 			return false;
 		}
 		if (abortGeneration !== this._abortGeneration) {
 			this._lastAssistantMessage = undefined;
-			this._proactiveCompactionResumeAction = undefined;
 			this._settleRetry(false, "Retry cancelled");
 			return false;
 		}
@@ -3345,7 +3309,6 @@ export class AgentSession {
 			// retry, or continue against the newly selected branch.
 			this._lastAssistantMessage = undefined;
 			this._proactiveCompactionState = "idle";
-			this._proactiveCompactionResumeAction = undefined;
 			this._settleRetry(false, "Conversation branch changed");
 			return false;
 		}
@@ -3353,14 +3316,12 @@ export class AgentSession {
 			conversationGenerationRevision !== this._conversationGenerationRevision;
 		const abandonStaleConversationRun = (): false => {
 			this._proactiveCompactionState = "idle";
-			this._proactiveCompactionResumeAction = undefined;
 			this._settleRetry(false, "Conversation branch changed");
 			return false;
 		};
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
 		if (!msg) {
-			this._proactiveCompactionResumeAction = undefined;
 			return false;
 		}
 
@@ -3374,7 +3335,6 @@ export class AgentSession {
 				return abandonStaleConversationRun();
 			}
 			if (this._disposed || abortGeneration !== this._abortGeneration) {
-				this._proactiveCompactionResumeAction = undefined;
 				return false;
 			}
 			return shouldContinue;
@@ -4350,7 +4310,6 @@ export class AgentSession {
 	 */
 	abort(source?: AgentAbortSource): Promise<void> {
 		this.agent.abort(source);
-		this._proactiveCompactionResumeAction = undefined;
 		if (this._abortPromise) {
 			return this._abortPromise;
 		}
@@ -4364,12 +4323,12 @@ export class AgentSession {
 			// canonical persistence before revoking the delivery it prepared. If that
 			// still fails, leave the delivery retained so fresh input cannot overtake it.
 			const revocableDeliveryIds = [
-				...this.agent.getPendingPromptDeliveryIds(),
-				...this.agent.getRetainedHostDeliveryIds(),
+				...this.agent.getPendingDeliveryIds("prompt"),
+				...this.agent.getPendingDeliveryIds("host"),
 			];
 			if (await this._canonicalizeCommittedDeliveryPreparations(revocableDeliveryIds)) {
 				this.agent.discardPendingPrompt();
-				this.agent.discardRetainedHostDeliveries();
+				this.agent.clearHostQueue();
 			}
 		})().finally(() => {
 			if (this._abortPromise === abortPromise) {

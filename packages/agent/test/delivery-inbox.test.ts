@@ -85,7 +85,7 @@ describe("DeliveryInbox", () => {
 		expect(inbox.list()).toEqual([first, second, followUp]);
 	});
 
-	it("rejects overlapping leases and restores them ahead of later arrivals", () => {
+	it("rejects overlapping leases and restores them ahead of later arrivals", async () => {
 		const inbox = createInbox();
 		const first = inbox.enqueue("steer", ["first"]);
 		const lease = inbox.lease(inbox.select("steer", "one-at-a-time"));
@@ -99,16 +99,16 @@ describe("DeliveryInbox", () => {
 		expect(inbox.rollbackActiveLease()).toEqual([]);
 		expect(lease.deliveries).toEqual([]);
 		expect(lease.owns(first.deliveryId)).toBe(false);
-		expect(lease.begin(first.deliveryId)).toBeUndefined();
+		expect(await lease.begin(first.deliveryId)).toBeUndefined();
 		expect(lease.rollback()).toEqual([]);
 	});
 
-	it("retires an exhausted lease before leasing later arrivals", () => {
+	it("retires an exhausted lease before leasing later arrivals", async () => {
 		const inbox = createInbox();
 		const first = inbox.enqueue("steer", ["first"]);
 		const firstLease = inbox.lease([first]);
 
-		expect(firstLease.begin(first.deliveryId)).toBe(first);
+		expect(await firstLease.begin(first.deliveryId)).toBe(first);
 		expect(firstLease.owns(first.deliveryId)).toBe(true);
 
 		const second = inbox.enqueue("steer", ["second"]);
@@ -117,11 +117,11 @@ describe("DeliveryInbox", () => {
 		expect(firstLease.owns(first.deliveryId)).toBe(false);
 		expect(firstLease.rollback()).toEqual([]);
 		expect(secondLease.owns(second.deliveryId)).toBe(true);
-		expect(secondLease.begin(second.deliveryId)).toBe(second);
+		expect(await secondLease.begin(second.deliveryId)).toBe(second);
 		expect(inbox.list()).toEqual([]);
 	});
 
-	it("invalidates retained leases on reset and remains reusable", () => {
+	it("invalidates retained leases on reset and remains reusable", async () => {
 		const inbox = createInbox();
 		const delivery = inbox.enqueue("steer", ["discarded"]);
 		const lease = inbox.lease([delivery]);
@@ -132,7 +132,7 @@ describe("DeliveryInbox", () => {
 		expect(inbox.hasPending()).toBe(false);
 		expect(lease.deliveries).toEqual([]);
 		expect(lease.owns(delivery.deliveryId)).toBe(false);
-		expect(lease.begin(delivery.deliveryId)).toBeUndefined();
+		expect(await lease.begin(delivery.deliveryId)).toBeUndefined();
 		expect(lease.rollback()).toEqual([]);
 
 		const next = inbox.enqueue("followUp", ["next"]);
@@ -140,46 +140,46 @@ describe("DeliveryInbox", () => {
 		expect(inbox.list()).toEqual([next]);
 	});
 
-	it("keeps an emitting delivery terminal when reset runs during commit", () => {
+	it("keeps a committing delivery terminal when reset runs during commit", async () => {
 		const inbox = createInbox();
 		const delivery = inbox.enqueue("steer", ["committed"]);
 		inbox.enqueue("followUp", ["discarded"]);
 		const lease = inbox.lease([delivery]);
 
 		expect(
-			lease.begin(delivery.deliveryId, () => {
+			await lease.begin(delivery.deliveryId, () => {
 				inbox.reset();
 			}),
 		).toBe(delivery);
 		expect(inbox.list()).toEqual([]);
 		expect(lease.owns(delivery.deliveryId)).toBe(false);
-		expect(lease.begin(delivery.deliveryId)).toBeUndefined();
+		expect(await lease.begin(delivery.deliveryId)).toBeUndefined();
 	});
 
-	it("does not restore an emitting delivery when reset precedes commit failure", () => {
+	it("does not restore a committing delivery when reset precedes commit failure", async () => {
 		const inbox = createInbox();
 		const delivery = inbox.enqueue("steer", ["discarded"]);
 		const lease = inbox.lease([delivery]);
 
-		expect(() =>
+		await expect(
 			lease.begin(delivery.deliveryId, () => {
 				inbox.reset();
 				throw new Error("commit failed");
 			}),
-		).toThrow("commit failed");
+		).rejects.toThrow("commit failed");
 		expect(inbox.list()).toEqual([]);
 		expect(lease.deliveries).toEqual([]);
 		expect(lease.owns(delivery.deliveryId)).toBe(false);
 	});
 
-	it("protects an emitting delivery from reentrant same-kind revocation", () => {
+	it("protects a committing delivery from reentrant same-kind revocation", async () => {
 		const inbox = createInbox();
 		const first = inbox.enqueue("steer", ["first"]);
 		const second = inbox.enqueue("steer", ["second"]);
 		const lease = inbox.lease(inbox.select("steer", "one-at-a-time"));
 
 		expect(
-			lease.begin(first.deliveryId, () => {
+			await lease.begin(first.deliveryId, () => {
 				expect(inbox.revoke("steer")).toEqual([second]);
 			}),
 		).toBe(first);
@@ -187,67 +187,67 @@ describe("DeliveryInbox", () => {
 		expect(lease.rollback()).toEqual([]);
 	});
 
-	it("restores only unbegun deliveries when rollback runs during commit", () => {
+	it("restores only unbegun deliveries when rollback runs during commit", async () => {
 		const inbox = createInbox();
 		const first = inbox.enqueue("steer", ["first"]);
 		const second = inbox.enqueue("steer", ["second"]);
 		const lease = inbox.lease(inbox.select("steer", "all"));
 
 		expect(
-			lease.begin(first.deliveryId, () => {
+			await lease.begin(first.deliveryId, () => {
 				expect(inbox.rollbackActiveLease()).toEqual([second]);
 			}),
 		).toBe(first);
 		expect(inbox.list()).toEqual([second]);
 		expect(lease.owns(first.deliveryId)).toBe(false);
-		expect(lease.begin(second.deliveryId)).toBeUndefined();
+		expect(await lease.begin(second.deliveryId)).toBeUndefined();
 	});
 
-	it("restores a failed emitting delivery after reentrant rollback", () => {
+	it("restores a failed committing delivery after reentrant rollback", async () => {
 		const inbox = createInbox();
 		const first = inbox.enqueue("steer", ["first"]);
 		const second = inbox.enqueue("steer", ["second"]);
 		const lease = inbox.lease(inbox.select("steer", "all"));
 
-		expect(() =>
+		await expect(
 			lease.begin(first.deliveryId, () => {
 				expect(inbox.rollbackActiveLease()).toEqual([second]);
 				throw new Error("commit failed");
 			}),
-		).toThrow("commit failed");
+		).rejects.toThrow("commit failed");
 		expect(inbox.list()).toEqual([first, second]);
 		expect(lease.deliveries).toEqual([]);
 		expect(lease.owns(first.deliveryId)).toBe(false);
 	});
 
-	it("lets reset supersede a failed begin after reentrant rollback", () => {
+	it("lets reset supersede a failed begin after reentrant rollback", async () => {
 		const inbox = createInbox();
 		const first = inbox.enqueue("steer", ["first"]);
 		const second = inbox.enqueue("steer", ["second"]);
 		const lease = inbox.lease(inbox.select("steer", "all"));
 
-		expect(() =>
+		await expect(
 			lease.begin(first.deliveryId, () => {
 				expect(inbox.rollbackActiveLease()).toEqual([second]);
 				inbox.reset();
 				throw new Error("commit failed");
 			}),
-		).toThrow("commit failed");
+		).rejects.toThrow("commit failed");
 		expect(inbox.list()).toEqual([]);
 		expect(lease.deliveries).toEqual([]);
 		expect(lease.owns(first.deliveryId)).toBe(false);
 	});
 
-	it("keeps mixed all-mode begin, revoke, and rollback states terminal", () => {
+	it("keeps mixed all-mode begin, revoke, and rollback states terminal", async () => {
 		const inbox = createInbox();
 		const first = inbox.enqueue("steer", ["first"]);
 		const followUp = inbox.enqueue("followUp", ["later"]);
 		const second = inbox.enqueue("steer", ["second"]);
 		const lease = inbox.lease(inbox.select("steer", "all"));
 
-		expect(lease.begin(first.deliveryId)).toBe(first);
+		expect(await lease.begin(first.deliveryId)).toBe(first);
 		expect(inbox.revoke("steer")).toEqual([second]);
-		expect(lease.begin(second.deliveryId)).toBeUndefined();
+		expect(await lease.begin(second.deliveryId)).toBeUndefined();
 		expect(lease.rollback()).toEqual([]);
 		expect(inbox.list()).toEqual([followUp]);
 	});
@@ -268,33 +268,33 @@ describe("DeliveryInbox", () => {
 		]);
 	});
 
-	it("begins synchronously and rolls back only deliveries that never began", () => {
+	it("commits and rolls back only deliveries whose commit never began", async () => {
 		const inbox = createInbox();
 		const first = inbox.enqueue("steer", ["first"]);
 		const second = inbox.enqueue("steer", ["second"]);
 		const lease = inbox.lease(inbox.select("steer", "all"));
 
-		expect(lease.begin(first.deliveryId)).toBe(first);
-		expect(lease.begin(first.deliveryId)).toBeUndefined();
+		expect(await lease.begin(first.deliveryId)).toBe(first);
+		expect(await lease.begin(first.deliveryId)).toBeUndefined();
 		expect(lease.rollback()).toEqual([second]);
 		expect(inbox.list()).toEqual([second]);
 	});
 
-	it("restores a delivery when its synchronous commit fails", () => {
+	it("restores a delivery when its commit fails", async () => {
 		const inbox = createInbox();
 		const delivery = inbox.enqueue("steer", ["retry me"]);
 		const lease = inbox.lease(inbox.select("steer", "one-at-a-time"));
 
-		expect(() =>
+		await expect(
 			lease.begin(delivery.deliveryId, () => {
 				throw new Error("commit failed");
 			}),
-		).toThrow("commit failed");
+		).rejects.toThrow("commit failed");
 		expect(lease.rollback()).toEqual([delivery]);
 		expect(inbox.list()).toEqual([delivery]);
 	});
 
-	it("returns exact pending and leased revocations in admission order", () => {
+	it("returns exact pending and leased revocations in admission order", async () => {
 		const inbox = createInbox();
 		const first = inbox.enqueue("steer", ["first"]);
 		const second = inbox.enqueue("steer", ["second"]);
@@ -302,22 +302,22 @@ describe("DeliveryInbox", () => {
 		const lease = inbox.lease(inbox.select("steer", "one-at-a-time"));
 
 		expect(inbox.revoke("steer")).toEqual([first, second]);
-		expect(lease.begin(first.deliveryId)).toBeUndefined();
+		expect(await lease.begin(first.deliveryId)).toBeUndefined();
 		expect(inbox.list()).toEqual([followUp]);
 	});
 
-	it("never revokes or restores a delivery after begin", () => {
+	it("never revokes or restores a delivery after begin", async () => {
 		const inbox = createInbox();
 		const delivery = inbox.enqueue("followUp", ["committed"]);
 		const lease = inbox.lease(inbox.select("followUp", "all"));
 
-		expect(lease.begin(delivery.deliveryId)).toBe(delivery);
+		expect(await lease.begin(delivery.deliveryId)).toBe(delivery);
 		expect(inbox.revoke("followUp")).toEqual([]);
 		expect(lease.rollback()).toEqual([]);
 		expect(inbox.hasPending()).toBe(false);
 	});
 
-	it("preserves queue and lease invariants across deterministic operation sequences", () => {
+	it("preserves queue and lease invariants across deterministic operation sequences", async () => {
 		type Kind = "steer" | "followUp";
 		type Status = "pending" | "leased" | "terminal";
 		type ModelEntry = {
@@ -376,7 +376,7 @@ describe("DeliveryInbox", () => {
 					const leased = project(undefined, "leased");
 					if (!activeLease || leased.length === 0) break;
 					const delivery = leased[nextRandom(leased.length)];
-					expect(activeLease.begin(delivery.deliveryId)).toBe(delivery);
+					expect(await activeLease.begin(delivery.deliveryId)).toBe(delivery);
 					const entry = model.find((candidate) => candidate.delivery === delivery);
 					if (entry) entry.status = "terminal";
 					break;
@@ -385,11 +385,11 @@ describe("DeliveryInbox", () => {
 					const leased = project(undefined, "leased");
 					if (!activeLease || leased.length === 0) break;
 					const delivery = leased[nextRandom(leased.length)];
-					expect(() =>
-						activeLease?.begin(delivery.deliveryId, () => {
+					await expect(
+						activeLease.begin(delivery.deliveryId, () => {
 							throw new Error("modeled commit failure");
 						}),
-					).toThrow("modeled commit failure");
+					).rejects.toThrow("modeled commit failure");
 					break;
 				}
 				case 4: {

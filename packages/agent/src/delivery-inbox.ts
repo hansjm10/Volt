@@ -9,14 +9,14 @@ export interface InboxDelivery<TKind extends string, TMessage> {
 
 type LeaseEntry<TKind extends string, TMessage> = {
 	delivery: InboxDelivery<TKind, TMessage>;
-	status: "leased" | "emitting" | "committed" | "restored" | "revoked";
+	status: "leased" | "committing" | "committed" | "restored" | "revoked";
 };
 
 /** Opaque capability for one FIFO selection owned by a dispatcher decision. */
 export interface DeliveryLease<TKind extends string, TMessage> {
 	readonly deliveries: readonly InboxDelivery<TKind, TMessage>[];
 	owns(deliveryId: string): boolean;
-	begin(deliveryId: string, commit?: () => void): InboxDelivery<TKind, TMessage> | undefined;
+	begin(deliveryId: string, commit?: () => void | Promise<void>): Promise<InboxDelivery<TKind, TMessage> | undefined>;
 	rollback(): readonly InboxDelivery<TKind, TMessage>[];
 }
 
@@ -49,14 +49,17 @@ class InboxDeliveryLease<TKind extends string, TMessage> implements DeliveryLeas
 		return this.active && this.entries.some((entry) => entry.delivery.deliveryId === deliveryId);
 	}
 
-	/** Commit a still-live delivery while keeping synchronous commit observers from revoking it. */
-	begin(deliveryId: string, commit?: () => void): InboxDelivery<TKind, TMessage> | undefined {
+	/** Commit a still-live delivery while preventing revocation across async durability work. */
+	async begin(
+		deliveryId: string,
+		commit?: () => void | Promise<void>,
+	): Promise<InboxDelivery<TKind, TMessage> | undefined> {
 		if (!this.active) return undefined;
 		const entry = this.entries.find((candidate) => candidate.delivery.deliveryId === deliveryId);
 		if (entry?.status !== "leased") return undefined;
-		entry.status = "emitting";
+		entry.status = "committing";
 		try {
-			commit?.();
+			await commit?.();
 		} catch (error) {
 			if (this.active) {
 				entry.status = "leased";

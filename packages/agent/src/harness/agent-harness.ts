@@ -479,9 +479,9 @@ export class AgentHarness<
 		}));
 	}
 
-	private beginDelivery(deliveryId: string | undefined): boolean {
+	private async beginDelivery(deliveryId: string | undefined): Promise<boolean> {
 		if (deliveryId === undefined || !this.activeDeliveryLease?.owns(deliveryId)) return true;
-		return this.activeDeliveryLease.begin(deliveryId) !== undefined;
+		return (await this.activeDeliveryLease.begin(deliveryId)) !== undefined;
 	}
 
 	private createLoopConfig(
@@ -528,28 +528,25 @@ export class AgentHarness<
 			},
 			nextAction: async (context) => {
 				if (context.requestAuthority === "final_response") return context.defaultAction;
-				const initialDeliveries =
-					context.completedTurn === undefined && context.defaultAction.type === "request"
-						? (context.defaultAction.deliveries ?? [])
-						: [];
-				const steering = this.leaseQueuedDeliveries("steer", this.steeringQueueMode);
-				if (initialDeliveries.length > 0 || steering.length > 0) {
+				if (this.deliveryInbox.hasPending("steer")) {
 					return {
 						type: "request",
 						reason:
 							context.defaultAction.type === "request" && context.defaultAction.reason === "continuation"
 								? "continuation"
 								: "delivery",
-						deliveries: [...initialDeliveries, ...steering],
 					};
 				}
-				if (context.defaultAction.type === "request") {
-					return context.defaultAction;
-				}
-				const followUp = this.leaseQueuedDeliveries("followUp", this.followUpQueueMode);
-				return followUp.length > 0
-					? { type: "request", reason: "delivery", deliveries: followUp }
+				if (context.defaultAction.type === "request") return context.defaultAction;
+				return this.deliveryInbox.hasPending("followUp")
+					? { type: "request", reason: "delivery" }
 					: { type: "stop" };
+			},
+			prepareDeliveries: (context) => {
+				if (context.requestAuthority === "final_response") return [];
+				const steering = this.leaseQueuedDeliveries("steer", this.steeringQueueMode);
+				if (steering.length > 0 || context.defaultAction.type === "request") return steering;
+				return this.leaseQueuedDeliveries("followUp", this.followUpQueueMode);
 			},
 			beginDelivery: (delivery) => this.beginDelivery(delivery.deliveryId),
 			prepareRequest: async ({ context }) => {

@@ -3,4 +3,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(agent): Prevented queued and host-provided input from being lost or replayed across compaction and planning transitions.
+fix(agent): Unified prompt, queued, and host input under one transactional inbox so delivery survives compaction and commit failures without replay.
