@@ -1073,15 +1073,17 @@ describe("Agent", () => {
 			timestamp: Date.now(),
 		});
 
-		await agent.continue();
+		const failedRun = await agent.continue();
 		expect(agent.state.errorMessage).toBe("commit failed");
-		expect(agent.lastRunFailedDeliveryKind).toBe("steer");
+		expect(failedRun).toMatchObject({
+			status: "delivery_failed",
+			failure: { kind: "steer", phase: "commit", error: expect.objectContaining({ message: "commit failed" }) },
+		});
 		expect(agent.hasQueuedMessages()).toBe(true);
 		expect(providerCalls).toBe(0);
 
 		failCommit = false;
-		await agent.continue();
-		expect(agent.lastRunFailedDeliveryKind).toBeUndefined();
+		expect(await agent.continue()).toEqual({ status: "completed" });
 		expect(agent.state.messages.map(getUserText).filter(Boolean)).toEqual(["retry me"]);
 		expect(agent.hasQueuedMessages()).toBe(false);
 		expect(providerCalls).toBe(1);
@@ -1260,7 +1262,7 @@ describe("Agent", () => {
 		const tail = createAssistantMessage("already complete");
 		agent.state.messages = [tail];
 
-		await expect(agent.continue()).resolves.toBeUndefined();
+		await expect(agent.continue()).resolves.toEqual({ status: "completed" });
 
 		expect(providerCalls).toBe(0);
 		expect(agent.state.messages).toEqual([tail]);
@@ -1405,7 +1407,7 @@ describe("Agent", () => {
 			timestamp: Date.now(),
 		});
 
-		await expect(agent.continue()).resolves.toBeUndefined();
+		await expect(agent.continue()).resolves.toEqual({ status: "completed" });
 
 		const hasQueuedFollowUp = agent.state.messages.some((message) => {
 			if (message.role !== "user") return false;
@@ -1499,7 +1501,7 @@ describe("Agent", () => {
 			timestamp: Date.now() + 1,
 		});
 
-		await expect(agent.continue()).resolves.toBeUndefined();
+		await expect(agent.continue()).resolves.toEqual({ status: "completed" });
 
 		const recentMessages = agent.state.messages.slice(-4);
 		expect(recentMessages.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant"]);

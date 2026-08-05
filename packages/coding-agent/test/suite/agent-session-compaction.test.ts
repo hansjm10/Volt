@@ -12,8 +12,8 @@ import { createHarness, type Harness } from "./harness.ts";
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
 	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
-	_resolveProactiveCompactionAction: (context: unknown, action: { type: "request"; reason: "delivery" }) => unknown;
-	_handlePostAgentRun: () => Promise<boolean>;
+	_gateProactiveCompactionRequest: (context: unknown) => "pause" | "proceed";
+	_handlePostAgentRun: (result: { status: "completed" }) => Promise<boolean>;
 	_lastAssistantMessage: AssistantMessage | undefined;
 	_proactiveCompactionState: "idle" | "scheduled" | "compacting";
 };
@@ -327,7 +327,9 @@ describe("AgentSession compaction characterization", () => {
 		});
 		sessionInternals._proactiveCompactionState = "scheduled";
 
-		await expect(sessionInternals._handlePostAgentRun()).rejects.toThrow("Summarization failed after 2 attempts");
+		await expect(sessionInternals._handlePostAgentRun({ status: "completed" })).rejects.toThrow(
+			"Summarization failed after 2 attempts",
+		);
 
 		expect(sessionInternals._proactiveCompactionState).toBe("idle");
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
@@ -344,7 +346,7 @@ describe("AgentSession compaction characterization", () => {
 		sessionInternals._proactiveCompactionState = "scheduled";
 		vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 
-		await expect(sessionInternals._handlePostAgentRun()).resolves.toBe(false);
+		await expect(sessionInternals._handlePostAgentRun({ status: "completed" })).resolves.toBe(false);
 	});
 
 	it("excludes a stripped trailing error message from estimatedTokensAfter when retrying", async () => {
@@ -474,21 +476,18 @@ describe("AgentSession compaction characterization", () => {
 
 			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 			expect(
-				sessionInternals._resolveProactiveCompactionAction(
-					{
-						completedTurn: {
-							message,
-							toolResults,
-							disposition: kind === "stopping tool batch" ? "stop" : "continue",
-						},
-						requestAuthority: "provider",
-						defaultAction: { type: "stop" },
-						context: { systemPrompt: "", messages: [message, ...toolResults], tools: [] },
-						newMessages: [],
+				sessionInternals._gateProactiveCompactionRequest({
+					completedTurn: {
+						message,
+						toolResults,
+						disposition: kind === "stopping tool batch" ? "stop" : "continue",
 					},
-					{ type: "request", reason: "delivery" },
-				),
-			).toEqual({ type: "pause" });
+					requestAuthority: "provider",
+					defaultAction: { type: "stop" },
+					context: { systemPrompt: "", messages: [message, ...toolResults], tools: [] },
+					newMessages: [],
+				}),
+			).toBe("pause");
 		},
 	);
 

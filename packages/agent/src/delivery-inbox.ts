@@ -16,6 +16,7 @@ type LeaseEntry<TKind extends string, TMessage> = {
 export interface DeliveryLease<TKind extends string, TMessage> {
 	readonly deliveries: readonly InboxDelivery<TKind, TMessage>[];
 	owns(deliveryId: string): boolean;
+	canPrepare(deliveryId: string): boolean;
 	begin(deliveryId: string, commit?: () => void | Promise<void>): Promise<InboxDelivery<TKind, TMessage> | undefined>;
 	rollback(): readonly InboxDelivery<TKind, TMessage>[];
 }
@@ -47,6 +48,13 @@ class InboxDeliveryLease<TKind extends string, TMessage> implements DeliveryLeas
 
 	owns(deliveryId: string): boolean {
 		return this.active && this.entries.some((entry) => entry.delivery.deliveryId === deliveryId);
+	}
+
+	canPrepare(deliveryId: string): boolean {
+		return (
+			this.active &&
+			this.entries.some((entry) => entry.delivery.deliveryId === deliveryId && entry.status === "leased")
+		);
 	}
 
 	/** Commit a still-live delivery while preventing revocation across async durability work. */

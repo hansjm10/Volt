@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@hansjm10/volt-agent-core";
 import { fauxAssistantMessage } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.ts";
+import { createHarness, getUserTexts, type Harness } from "../harness.ts";
 
 function createUserMessage(text: string): Extract<AgentMessage, { role: "user" }> {
 	return {
@@ -11,19 +11,12 @@ function createUserMessage(text: string): Extract<AgentMessage, { role: "user" }
 	};
 }
 
-async function createReadyPlan(harness: Harness): Promise<void> {
-	await harness.session.setAgentMode("plan");
-	const draft = harness.session.updatePlan({
-		title: "Committed preparation",
-		summary: "Keep committed preparation ordered across abort.",
-		steps: [{ text: "Apply feedback" }],
+function deferred(): { promise: Promise<void>; resolve(): void } {
+	let resolve = (): void => undefined;
+	const promise = new Promise<void>((promiseResolve) => {
+		resolve = promiseResolve;
 	});
-	harness.session.submitPlan({
-		planId: draft.id,
-		expectedRevision: draft.revision,
-		title: draft.title!,
-		summary: draft.summary!,
-	});
+	return { promise, resolve };
 }
 
 describe("regression #199: delivery transaction failures", () => {
@@ -33,136 +26,154 @@ describe("regression #199: delivery transaction failures", () => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
-	it("canonicalizes committed prompt preparation before a replacement prompt runs", async () => {
-		let predecessorCommits = 0;
+	it("awaits asynchronous commit durability before delivery publication", async () => {
+		const commitStarted = deferred();
+		const finishCommit = deferred();
 		const harness = await createHarness({
-			prepareDelivery: (delivery) => {
-				const messages = [...delivery.messages];
-				const sourceText = getMessageText(delivery.messages.find((message) => message.role === "user"));
-				return {
-					messages,
-					commit: () => {
-						predecessorCommits++;
-						messages.unshift(createUserMessage(`predecessor for ${sourceText}`));
-					},
-				};
-			},
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				commit: async () => {
+					commitStarted.resolve();
+					await finishCommit.promise;
+				},
+			}),
 		});
 		harnesses.push(harness);
-		await createReadyPlan(harness);
-		harness.setResponses([fauxAssistantMessage("replacement completed")]);
+		harness.setResponses([fauxAssistantMessage("committed")]);
+		let deliveryStarts = 0;
+		harness.session.subscribe((event) => {
+			if (event.type === "delivery_start") deliveryStarts++;
+		});
 
-		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
-		let failDraftPersistence = true;
-		harness.sessionManager.appendPlanningState = (planning) => {
-			if (planning.plan?.phase === "draft" && failDraftPersistence) {
-				throw new Error("transient prompt planning failure");
-			}
-			return appendPlanningState(planning);
-		};
+		const prompt = harness.session.prompt("wait for durable commit");
+		await commitStarted.promise;
+		await new Promise((resolve) => setTimeout(resolve, 0));
 
-		await harness.session.agent.prompt(createUserMessage("feedback before abort"));
-		expect(harness.session.agent.state.errorMessage).toBe("transient prompt planning failure");
-		expect(predecessorCommits).toBe(1);
+		expect(deliveryStarts).toBe(0);
+		expect(harness.getPendingResponseCount()).toBe(1);
 
-		failDraftPersistence = false;
-		await harness.session.abort("host_action");
-		await harness.session.prompt("replacement prompt");
-
-		expect(harness.session.planningState.plan?.phase).toBe("draft");
-		expect(getUserTexts(harness)).toEqual([
-			"predecessor for feedback before abort",
-			"feedback before abort",
-			"predecessor for replacement prompt",
-			"replacement prompt",
-		]);
-		expect(predecessorCommits).toBe(2);
+		finishCommit.resolve();
+		await prompt;
+		expect(deliveryStarts).toBe(1);
+		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
-	it("blocks replacement input while abort cannot canonicalize committed preparation", async () => {
-		let predecessorCommits = 0;
+	it("returns an explicit failure and retains a delivery after commit rejection", async () => {
+		let commitAttempts = 0;
+		let failCommit = true;
 		const harness = await createHarness({
-			prepareDelivery: (delivery) => {
-				const messages = [...delivery.messages];
-				return {
-					messages,
-					commit: () => {
-						predecessorCommits++;
-						messages.unshift(createUserMessage("committed predecessor"));
-					},
-				};
-			},
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				commit: async () => {
+					commitAttempts++;
+					await Promise.resolve();
+					if (failCommit) throw new Error("asynchronous durability failure");
+				},
+			}),
 		});
 		harnesses.push(harness);
-		await createReadyPlan(harness);
-		harness.setResponses([fauxAssistantMessage("must not run")]);
+		harness.setResponses([fauxAssistantMessage("retried")]);
 
-		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
-		let failDraftPersistence = true;
-		harness.sessionManager.appendPlanningState = (planning) => {
-			if (planning.plan?.phase === "draft" && failDraftPersistence) {
-				throw new Error("persistent prompt planning failure");
-			}
-			return appendPlanningState(planning);
-		};
+		const failedRun = await harness.session.agent.prompt(createUserMessage("retry after commit rejection"));
 
-		await harness.session.agent.prompt(createUserMessage("feedback still unsettled"));
-		expect(predecessorCommits).toBe(1);
-
-		await harness.session.abort("host_action");
-		failDraftPersistence = false;
-
-		await expect(harness.session.prompt("replacement must remain blocked")).rejects.toThrow(
-			/committed delivery preparation|retained prompt/,
-		);
+		expect(failedRun).toMatchObject({
+			status: "delivery_failed",
+			failure: {
+				kind: "prompt",
+				phase: "commit",
+				error: expect.objectContaining({ message: "asynchronous durability failure" }),
+			},
+		});
 		expect(harness.getPendingResponseCount()).toBe(1);
 		expect(getUserTexts(harness)).toEqual([]);
 
-		await harness.session.abort("host_action");
-		expect(getUserTexts(harness)).toEqual(["committed predecessor", "feedback still unsettled"]);
-		expect(predecessorCommits).toBe(1);
+		failCommit = false;
+		expect(await harness.session.agent.continue()).toEqual({ status: "completed" });
+
+		expect(commitAttempts).toBe(2);
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(getUserTexts(harness)).toEqual(["retry after commit rejection"]);
 	});
 
-	it("does not promote retained steering preparation when abort only revokes a prompt", async () => {
-		let predecessorCommits = 0;
-		const harness = await createHarness({
-			prepareDelivery: (delivery) => {
-				const messages = [...delivery.messages];
-				return {
-					messages,
+	it.each(["steer", "followUp", "host"] as const)(
+		"bounds automatic continuation after a %s delivery commit fails",
+		async (kind) => {
+			let queuedCommitAttempts = 0;
+			let harness!: Harness;
+			harness = await createHarness({
+				prepareDelivery: (delivery) => ({
+					messages: [...delivery.messages],
 					commit: () => {
-						predecessorCommits++;
-						messages.unshift(createUserMessage("steering predecessor"));
+						if (delivery.kind !== kind) return;
+						queuedCommitAttempts++;
+						throw new Error("persistent queued commit failure");
 					},
-				};
-			},
-		});
+				}),
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				() => {
+					const queuedMessage = createUserMessage("retained queued input");
+					if (kind === "steer") harness.session.agent.steer(queuedMessage);
+					else if (kind === "followUp") harness.session.agent.followUp(queuedMessage);
+					else harness.session.agent.hostDelivery(queuedMessage);
+					return fauxAssistantMessage("initial response");
+				},
+			]);
+
+			await harness.session.prompt("start one bounded run");
+
+			expect(queuedCommitAttempts).toBe(1);
+			expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+			expect(
+				harness.session.messages.filter(
+					(message) => message.role === "assistant" && message.errorMessage === "persistent queued commit failure",
+				),
+			).toHaveLength(1);
+		},
+	);
+
+	it.each(["dispose", "abort"] as const)(
+		"rejects reentrant %s from an asynchronous commit instead of deadlocking",
+		async (lifecycleOperation) => {
+			let harness!: Harness;
+			harness = await createHarness({
+				prepareDelivery: (delivery) => ({
+					messages: [...delivery.messages],
+					commit: async () => {
+						if (lifecycleOperation === "dispose") await harness.session.dispose("disposal");
+						else await harness.session.abort();
+					},
+				}),
+			});
+			harnesses.push(harness);
+
+			const result = await harness.session.agent.prompt(createUserMessage(`reject reentrant ${lifecycleOperation}`));
+
+			expect(result).toMatchObject({
+				status: "delivery_failed",
+				failure: {
+					phase: "commit",
+					error: expect.objectContaining({
+						message: expect.stringContaining(
+							lifecycleOperation === "dispose" ? "Cannot dispose" : "Cannot await",
+						),
+					}),
+				},
+			});
+			expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+			await harness.session.dispose("disposal");
+		},
+	);
+
+	it("drains pending host deliveries during disposal", async () => {
+		const harness = await createHarness();
 		harnesses.push(harness);
-		await createReadyPlan(harness);
-		harness.session.agent.state.messages = [fauxAssistantMessage("tail")];
-		harness.session.agent.steer(createUserMessage("retained steering feedback"));
-		harness.setResponses([fauxAssistantMessage("steering completed")]);
-
-		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
-		let failDraftPersistence = true;
-		harness.sessionManager.appendPlanningState = (planning) => {
-			if (planning.plan?.phase === "draft" && failDraftPersistence) {
-				throw new Error("steering planning failure");
-			}
-			return appendPlanningState(planning);
-		};
-
-		await harness.session.agent.continue();
-		expect(predecessorCommits).toBe(1);
+		harness.session.agent.hostDelivery(createUserMessage("stale host delivery"));
 		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
 
-		failDraftPersistence = false;
-		await harness.session.abort("host_action");
-		expect(getUserTexts(harness)).toEqual([]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		await harness.session.dispose("disposal");
 
-		await harness.session.agent.continue();
-		expect(getUserTexts(harness)).toEqual(["steering predecessor", "retained steering feedback"]);
-		expect(predecessorCommits).toBe(1);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
 	});
 });

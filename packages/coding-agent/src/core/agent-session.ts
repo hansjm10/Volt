@@ -19,14 +19,15 @@ import { basename, dirname, join } from "node:path";
 import type {
 	Agent,
 	AgentAbortSource,
-	AgentDeliveryPreparation,
 	AgentEvent,
-	AgentLoopNextAction,
 	AgentLoopNextActionContext,
 	AgentMessage,
+	AgentRequestGateDecision,
+	AgentRunResult,
 	AgentRunSnapshot,
 	AgentState,
 	AgentTool,
+	PrepareRequestContext,
 	ThinkingLevel,
 } from "@hansjm10/volt-agent-core";
 import type {
@@ -514,10 +515,6 @@ export class AgentSession {
 	private readonly _liveClientInputs = new Map<string, LiveClientInputOperation>();
 	/** Fatal listener error swallowed into agent-core's synthetic error turn. */
 	private _agentEventFatalError: Error | undefined;
-	/** Predecessor commit output retained until later composition retries or teardown makes it canonical. */
-	private readonly _committedDeliveryPreparationMessages = new Map<string, AgentMessage[]>();
-	/** Identified inputs awaiting the durability watermark of promoted preparation. */
-	private readonly _committedDeliveryPreparationClientIds = new Map<string, Set<string>>();
 	private _extensionCommandTransactions = new Set<symbol>();
 	private _activeExtensionCommandHandlers = 0;
 
@@ -753,51 +750,17 @@ export class AgentSession {
 			);
 		}
 		this._agentToolHooksInstalled = true;
-		const prepareDelivery = this.agent.prepareDelivery;
-		this.agent.prepareDelivery = async (delivery, signal): Promise<AgentDeliveryPreparation> => {
-			const committedMessages = this._committedDeliveryPreparationMessages.get(delivery.deliveryId);
-			const preparation = committedMessages
-				? { messages: committedMessages }
-				: prepareDelivery
-					? await prepareDelivery(delivery, signal)
-					: { messages: [...delivery.messages] };
+		const prepareRequest = this.agent.prepareRequest;
+		this.agent.prepareRequest = async (context, signal) => {
 			await this._waitForPlanningTransitions();
-			const predecessorCommit = preparation.commit;
-			const prepared = this._prepareUserDelivery({
-				messages: preparation.messages,
-				...(predecessorCommit
-					? {
-							commit: () => {
-								predecessorCommit();
-								this._committedDeliveryPreparationMessages.set(delivery.deliveryId, preparation.messages);
-							},
-						}
-					: {}),
-			});
-			const messages = prepared.messages;
-			return {
-				messages,
-				commit: () => {
-					// Disposal may run synchronously from a commit observer, before the
-					// delivery_start event can publish this irrevocable admission.
-					this._captureAdmittedDelivery({ deliveryId: delivery.deliveryId, messages });
-					try {
-						prepared.commit?.();
-					} catch (error) {
-						this._discardAdmittedDelivery(delivery.deliveryId);
-						throw error;
-					}
-					this._committedDeliveryPreparationMessages.delete(delivery.deliveryId);
-					// A successful commit may have composed additional messages.
-					this._discardAdmittedDelivery(delivery.deliveryId);
-					this._captureAdmittedDelivery({ deliveryId: delivery.deliveryId, messages });
-				},
-			};
+			this._prepareReadyPlanFeedbackForRequest(context);
+			return prepareRequest ? await prepareRequest(context, signal) : undefined;
 		};
-		const nextAction = this.agent.nextAction;
-		this.agent.nextAction = async (context, signal) => {
-			const action = nextAction ? await nextAction(context, signal) : context.defaultAction;
-			return this._resolveProactiveCompactionAction(context, action);
+		const requestGate = this.agent.requestGate;
+		this.agent.requestGate = async (context, action, signal) => {
+			const predecessorDecision = requestGate ? await requestGate(context, action, signal) : "proceed";
+			if (predecessorDecision === "pause") return predecessorDecision;
+			return this._gateProactiveCompactionRequest(context);
 		};
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
 			if (!this.getActiveToolNames().includes(toolCall.name)) {
@@ -1042,88 +1005,9 @@ export class AgentSession {
 		}
 	}
 
-	private _discardAdmittedDelivery(deliveryId: string | undefined): void {
-		this._pendingAdmittedDeliveryMessages = this._pendingAdmittedDeliveryMessages.filter(
-			(pending) => pending.deliveryId !== deliveryId,
-		);
-	}
-
 	private _settleAdmittedDeliveryMessage(deliveryId: string | undefined): void {
 		const index = this._pendingAdmittedDeliveryMessages.findIndex((message) => message.deliveryId === deliveryId);
 		if (index !== -1) this._pendingAdmittedDeliveryMessages.splice(index, 1);
-	}
-
-	private _captureCommittedDeliveryPreparations(): void {
-		for (const [deliveryId, messages] of this._committedDeliveryPreparationMessages) {
-			try {
-				this._prepareUserDelivery({ messages }).commit?.();
-			} catch {
-				// Feedback cannot become canonical without its ready-to-draft transition.
-				// Keep the committed preparation retained when disposal cannot couple them.
-				continue;
-			}
-			this._captureAdmittedDelivery({ deliveryId, messages });
-		}
-	}
-
-	/** Promote irreversible predecessor output before abort can revoke its source delivery. */
-	private async _canonicalizeCommittedDeliveryPreparations(deliveryIds: readonly string[]): Promise<boolean> {
-		const retainedDeliveryIds = deliveryIds.filter((deliveryId) =>
-			this._committedDeliveryPreparationMessages.has(deliveryId),
-		);
-		if (retainedDeliveryIds.length === 0) return true;
-		try {
-			for (const deliveryId of retainedDeliveryIds) {
-				const messages = this._committedDeliveryPreparationMessages.get(deliveryId);
-				if (!messages) continue;
-				if (messages.length > 0) {
-					this._prepareUserDelivery({ messages }).commit?.();
-				}
-				this._discardAdmittedDelivery(deliveryId);
-				while (messages.length > 0) {
-					const message = messages[0]!;
-					if (message.role === "user" && message.clientMessageId !== undefined) {
-						const record = this.sessionManager.getClientInput(message.clientMessageId);
-						if (record?.state === "accepted") {
-							this.sessionManager.transitionClientInput(message.clientMessageId, "started");
-						}
-						const clientIds = this._committedDeliveryPreparationClientIds.get(deliveryId) ?? new Set();
-						clientIds.add(message.clientMessageId);
-						this._committedDeliveryPreparationClientIds.set(deliveryId, clientIds);
-						const operation = this._liveClientInputs.get(message.clientMessageId);
-						if (operation) operation.queued = false;
-					}
-					if (message.role === "custom") {
-						this.sessionManager.appendCustomMessageEntry(
-							message.customType,
-							message.content,
-							message.display,
-							message.details,
-						);
-					} else if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
-						this.sessionManager.appendMessage(message);
-					}
-					this.agent.state.messages.push(message);
-					this._emitCommittedEvent({ type: "message_start", message });
-					this._emitCommittedEvent({ type: "message_end", message });
-					messages.shift();
-				}
-			}
-			await this.sessionManager.flush();
-			for (const deliveryId of retainedDeliveryIds) {
-				if (this._committedDeliveryPreparationMessages.get(deliveryId)?.length !== 0) continue;
-				for (const clientMessageId of this._committedDeliveryPreparationClientIds.get(deliveryId) ?? []) {
-					this._completeLiveClientInput(clientMessageId, "admitted");
-				}
-				this._committedDeliveryPreparationClientIds.delete(deliveryId);
-				this._committedDeliveryPreparationMessages.delete(deliveryId);
-			}
-			return true;
-		} catch {
-			// Keep both the retained delivery and the remaining transaction. A later
-			// abort or disposal may retry it, while fresh input remains fenced.
-			return false;
-		}
 	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
@@ -1588,19 +1472,15 @@ export class AgentSession {
 		if (this._disposePromise) {
 			return this._disposePromise;
 		}
-		const deliveryCommitSettled = this.agent.activeDeliveryCommitSettled;
-		if (deliveryCommitSettled) {
-			this._disposePromise = deliveryCommitSettled.then(() => {
-				this._disposePromise = undefined;
-				return this.dispose(source);
-			});
-			return this._disposePromise;
+		if (this.agent.isDeliveryCommitInProgress) {
+			return Promise.reject(
+				new Error("Cannot dispose from a delivery commit callback; request disposal after the Agent run settles"),
+			);
 		}
 		const runBeforeAbort = this.agent.activeRunSnapshot;
 		const abortAcceptance = this.agent.abort(source);
 		const runAfterAbort = this.agent.activeRunSnapshot;
 		this._disposed = true;
-		this._captureCommittedDeliveryPreparations();
 		const durablyAdmittedOperations = new Set<LiveClientInputOperation>();
 
 		try {
@@ -1663,6 +1543,7 @@ export class AgentSession {
 			// Drain queued work so a run that settles after dispose cannot restart
 			// through either an uncommitted prompt or a queued continuation.
 			this.agent.discardPendingPrompt();
+			this.agent.clearHostQueue();
 			this.agent.clearAllQueues();
 			this._lspManager?.dispose();
 			this._unsubscribeMcpManager?.();
@@ -1722,12 +1603,6 @@ export class AgentSession {
 				if (operation) durablyAdmittedOperations.add(operation);
 			}
 			this._pendingAdmittedDeliveryMessages.shift();
-			if (
-				pending.deliveryId !== undefined &&
-				!this._pendingAdmittedDeliveryMessages.some((candidate) => candidate.deliveryId === pending.deliveryId)
-			) {
-				this._committedDeliveryPreparationMessages.delete(pending.deliveryId);
-			}
 		}
 	}
 
@@ -2296,28 +2171,25 @@ export class AgentSession {
 		}
 	}
 
-	private _prepareUserDelivery(preparation: AgentDeliveryPreparation): AgentDeliveryPreparation {
-		const readyPlan = this._planningState.plan?.phase === "ready" ? this._planningState.plan : undefined;
-		if (!readyPlan || !preparation.messages.some((message) => message.role === "user")) {
-			return preparation;
+	private _prepareReadyPlanFeedbackForRequest(context: PrepareRequestContext): void {
+		if (!context.deliveries.some((delivery) => delivery.messages.some((message) => message.role === "user"))) {
+			return;
 		}
-		return {
-			messages: preparation.messages,
-			commit: () => {
-				preparation.commit?.();
-				const currentPlan = this._planningState.plan;
-				if (
-					currentPlan?.id !== readyPlan.id ||
-					currentPlan.revision !== readyPlan.revision ||
-					currentPlan.phase !== "ready"
-				) {
-					return;
-				}
-				const next = this._changeReadyPlanToDraft(readyPlan.id, readyPlan.revision, false);
-				const checkpoint = this._createPlanningCheckpointMessage(next);
-				if (checkpoint) preparation.messages.unshift(checkpoint);
-			},
-		};
+		const readyPlan = this._planningState.plan?.phase === "ready" ? this._planningState.plan : undefined;
+		if (!readyPlan) return;
+		const next = this._changeReadyPlanToDraft(readyPlan.id, readyPlan.revision, false);
+		const checkpoint = this._createPlanningCheckpointMessage(next);
+		if (!checkpoint) return;
+		this.agent.state.messages.push(checkpoint);
+		context.context.messages.push(checkpoint);
+		this.sessionManager.appendCustomMessageEntry(
+			checkpoint.customType,
+			checkpoint.content,
+			checkpoint.display,
+			checkpoint.details,
+		);
+		this._emitCommittedEvent({ type: "message_start", message: checkpoint });
+		this._emitCommittedEvent({ type: "message_end", message: checkpoint });
 	}
 
 	private _previewReadyPlanFeedback(readyPlan: PlanState): PlanningState {
@@ -3184,9 +3056,9 @@ export class AgentSession {
 		const run = (async () => {
 			this._agentConversationMutationInFlight = true;
 			try {
-				await this._runAgentOperation(() => this.agent.prompt(messages));
-				while (await this._handlePostAgentRun(abortGeneration, conversationGenerationRevision)) {
-					await this._continueAgent();
+				let result = await this._runAgentOperation(() => this.agent.prompt(messages));
+				while (await this._handlePostAgentRun(result, abortGeneration, conversationGenerationRevision)) {
+					result = await this._continueAgent();
 				}
 			} finally {
 				this._agentConversationMutationInFlight = false;
@@ -3202,14 +3074,15 @@ export class AgentSession {
 		}
 	}
 
-	private async _runAgentOperation(operation: () => Promise<void>): Promise<void> {
+	private async _runAgentOperation<T>(operation: () => Promise<T>): Promise<T> {
 		if (this._agentEventFatalError) {
 			const staleError = this._agentEventFatalError;
 			this._agentEventFatalError = undefined;
 			throw staleError;
 		}
+		let result: T;
 		try {
-			await operation();
+			result = await operation();
 		} catch (error) {
 			const fatalError = this._agentEventFatalError;
 			this._agentEventFatalError = undefined;
@@ -3220,12 +3093,13 @@ export class AgentSession {
 		if (fatalError) {
 			throw fatalError;
 		}
+		return result;
 	}
 
-	private async _continueAgent(): Promise<void> {
+	private async _continueAgent(): Promise<AgentRunResult> {
 		this._agentConversationMutationInFlight = true;
 		try {
-			await this._runAgentOperation(() => this.agent.continue());
+			return await this._runAgentOperation(() => this.agent.continue());
 		} finally {
 			this._agentConversationMutationInFlight = false;
 		}
@@ -3290,6 +3164,7 @@ export class AgentSession {
 	}
 
 	private async _handlePostAgentRun(
+		result: AgentRunResult,
 		abortGeneration = this._abortGeneration,
 		conversationGenerationRevision = this._conversationGenerationRevision,
 	): Promise<boolean> {
@@ -3321,6 +3196,10 @@ export class AgentSession {
 		};
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
+		if (result.status === "delivery_failed") {
+			this._settleRetry(false, result.failure.error.message);
+			return false;
+		}
 		if (!msg) {
 			return false;
 		}
@@ -3338,11 +3217,6 @@ export class AgentSession {
 				return false;
 			}
 			return shouldContinue;
-		}
-
-		if (msg.stopReason === "error" && this.agent.lastRunFailedDeliveryKind === "prompt") {
-			this._settleRetry(false, msg.errorMessage);
-			return false;
 		}
 
 		if (this._isRetryableError(msg)) {
@@ -3393,9 +3267,6 @@ export class AgentSession {
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		if (this._disposed) {
 			throw new Error("Cannot prompt a disposed session");
-		}
-		if (this._committedDeliveryPreparationMessages.size > 0) {
-			throw new Error("Cannot prompt while committed delivery preparation remains unsettled");
 		}
 		if (this._hasSessionOperationBarrier) {
 			throw new Error("Cannot prompt while a session mutation is active");
@@ -3642,11 +3513,13 @@ export class AgentSession {
 				}
 				try {
 					const continuationConversationGenerationRevision = this._conversationGenerationRevision;
-					await this._continueAgent();
+					let result = await this._continueAgent();
 					assertConversationGenerationCurrent();
-					while (await this._handlePostAgentRun(abortGeneration, continuationConversationGenerationRevision)) {
+					while (
+						await this._handlePostAgentRun(result, abortGeneration, continuationConversationGenerationRevision)
+					) {
 						assertConversationGenerationCurrent();
-						await this._continueAgent();
+						result = await this._continueAgent();
 						assertConversationGenerationCurrent();
 					}
 				} finally {
@@ -3836,9 +3709,6 @@ export class AgentSession {
 		if (this._disposed) {
 			throw new Error("Cannot queue input on a disposed session");
 		}
-		if (this._committedDeliveryPreparationMessages.size > 0) {
-			throw new Error("Cannot queue input while committed delivery preparation remains unsettled");
-		}
 		if (this._hasSessionOperationBarrier) {
 			throw new Error("Cannot queue input while a session mutation is active");
 		}
@@ -3884,9 +3754,6 @@ export class AgentSession {
 	async followUp(text: string, images?: ImageContent[], clientMessageId?: string): Promise<void> {
 		if (this._disposed) {
 			throw new Error("Cannot queue input on a disposed session");
-		}
-		if (this._committedDeliveryPreparationMessages.size > 0) {
-			throw new Error("Cannot queue input while committed delivery preparation remains unsettled");
 		}
 		if (this._hasSessionOperationBarrier) {
 			throw new Error("Cannot queue input while a session mutation is active");
@@ -4149,10 +4016,9 @@ export class AgentSession {
 	 * Clear all queued messages and return them.
 	 * Useful for restoring to editor when user aborts.
 	 *
-	 * Durability is awaited when clearing records a terminal client-input outcome or
-	 * promotes preparation whose predecessor already committed. Runtime ownership is
-	 * resolved before that await, so a persistence failure cannot put revocable text
-	 * back. It is instead carried on the thrown {@link QueueClearPersistenceError}.
+	 * Durability is awaited when clearing records a terminal client-input outcome.
+	 * Agent owns revocation; persistence failures cannot restore runtime ownership,
+	 * so the captured text is carried on {@link QueueClearPersistenceError}.
 	 * @returns Object with steering and followUp arrays
 	 * @throws QueueClearPersistenceError when the cleared state could not be persisted
 	 */
@@ -4162,63 +4028,8 @@ export class AgentSession {
 			publishedEntries.flatMap((entry) => (entry.clientMessageId === undefined ? [] : [entry.clientMessageId])),
 		);
 		const revokedIds = new Set(this.agent.clearAllQueues());
-		const committedPreparationIds = new Set(
-			[...revokedIds].filter((deliveryId) => this._committedDeliveryPreparationMessages.has(deliveryId)),
-		);
-		const committedPreparationOperations = new Map<string, LiveClientInputOperation>();
-		let persistenceError: Error | undefined;
-		for (const deliveryId of committedPreparationIds) {
-			const messages = this._committedDeliveryPreparationMessages.get(deliveryId);
-			if (!messages) continue;
-			try {
-				this._prepareUserDelivery({ messages }).commit?.();
-			} catch (error) {
-				persistenceError ??= error instanceof Error ? error : new Error(String(error));
-				// The planning transition and canonical feedback are one transaction.
-				// Keep the committed preparation for a later teardown retry.
-				continue;
-			}
-			try {
-				this._discardAdmittedDelivery(deliveryId);
-				while (messages.length > 0) {
-					const message = messages[0]!;
-					if (message.role === "user" && message.clientMessageId !== undefined) {
-						const record = this.sessionManager.getClientInput(message.clientMessageId);
-						if (record?.state === "accepted") {
-							this.sessionManager.transitionClientInput(message.clientMessageId, "started");
-						}
-						const operation = this._liveClientInputs.get(message.clientMessageId);
-						if (operation) {
-							operation.queued = false;
-							committedPreparationOperations.set(message.clientMessageId, operation);
-						}
-					}
-					if (message.role === "custom") {
-						this.sessionManager.appendCustomMessageEntry(
-							message.customType,
-							message.content,
-							message.display,
-							message.details,
-						);
-					} else if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
-						this.sessionManager.appendMessage(message);
-					}
-					this.agent.state.messages.push(message);
-					this._emitCommittedEvent({ type: "message_start", message });
-					this._emitCommittedEvent({ type: "message_end", message });
-					messages.shift();
-				}
-				this._committedDeliveryPreparationMessages.delete(deliveryId);
-			} catch (error) {
-				persistenceError ??= error instanceof Error ? error : new Error(String(error));
-			}
-		}
-		const revokedSteering = this._steeringMessages.filter(
-			(entry) => revokedIds.has(entry.queueEntryId) && !committedPreparationIds.has(entry.queueEntryId),
-		);
-		const revokedFollowUp = this._followUpMessages.filter(
-			(entry) => revokedIds.has(entry.queueEntryId) && !committedPreparationIds.has(entry.queueEntryId),
-		);
+		const revokedSteering = this._steeringMessages.filter((entry) => revokedIds.has(entry.queueEntryId));
+		const revokedFollowUp = this._followUpMessages.filter((entry) => revokedIds.has(entry.queueEntryId));
 		const steering = revokedSteering.map((entry) => entry.text);
 		const followUp = revokedFollowUp.map((entry) => entry.text);
 		const revokedClientIds = new Set(
@@ -4231,17 +4042,16 @@ export class AgentSession {
 				operation.queued && (revokedClientIds.has(clientMessageId) || !publishedClientIds.has(clientMessageId)),
 		);
 		const terminalError = new Error("client_input_failed: queued input was cleared before canonical consumption");
+		let persistenceError: Error | undefined;
 
 		try {
 			for (const [clientMessageId] of queuedOperations) {
 				this.sessionManager.transitionClientInput(clientMessageId, "failed", terminalError.message);
 			}
 		} catch (error) {
-			persistenceError ??= error instanceof Error ? error : new Error(String(error));
+			persistenceError = error instanceof Error ? error : new Error(String(error));
 		}
-		// Agent-core is the authority for published queue ownership. A preparation
-		// whose predecessor already committed is promoted instead of returned as
-		// revocable text; every other revoked entry is handed back to the caller.
+
 		this._steeringMessages = this._steeringMessages.filter((entry) => !revokedIds.has(entry.queueEntryId));
 		this._followUpMessages = this._followUpMessages.filter((entry) => !revokedIds.has(entry.queueEntryId));
 		this._emitQueueUpdate();
@@ -4252,9 +4062,7 @@ export class AgentSession {
 			}
 		}
 
-		// Runtime-only revocations append nothing, but promoted preparation is now
-		// canonical and must cross the same durability watermark as identified input.
-		if ((queuedOperations.length > 0 || committedPreparationIds.size > 0) && persistenceError === undefined) {
+		if (queuedOperations.length > 0 && persistenceError === undefined) {
 			try {
 				await this.sessionManager.flush();
 			} catch (error) {
@@ -4263,19 +4071,13 @@ export class AgentSession {
 		}
 
 		if (persistenceError !== undefined) {
-			for (const operation of [
-				...committedPreparationOperations.values(),
-				...queuedOperations.map(([, op]) => op),
-			]) {
+			for (const [, operation] of queuedOperations) {
 				operation.rejectAccepted(persistenceError);
 				operation.rejectCompletion(persistenceError);
 			}
 			throw new QueueClearPersistenceError(persistenceError, { steering, followUp });
 		}
 
-		for (const [clientMessageId] of committedPreparationOperations) {
-			this._completeLiveClientInput(clientMessageId, "admitted");
-		}
 		for (const [clientMessageId, operation] of queuedOperations) {
 			const admissionWasAcknowledged = operation.acceptanceSettled;
 			operation.rejectAccepted(terminalError);
@@ -4313,28 +4115,25 @@ export class AgentSession {
 		if (this._abortPromise) {
 			return this._abortPromise;
 		}
+		if (this.agent.isDeliveryCommitInProgress) {
+			return Promise.reject(
+				new Error("Cannot await session abort from a delivery commit callback; wait for the Agent run to settle"),
+			);
+		}
 		this._abortGeneration += 1;
 		this.abortRetry();
 		this.abortCompaction();
 		let abortPromise!: Promise<void>;
-		abortPromise = (async () => {
-			await this.waitForIdle();
-			// A predecessor commit is irreversible. Couple it to planning and
-			// canonical persistence before revoking the delivery it prepared. If that
-			// still fails, leave the delivery retained so fresh input cannot overtake it.
-			const revocableDeliveryIds = [
-				...this.agent.getPendingDeliveryIds("prompt"),
-				...this.agent.getPendingDeliveryIds("host"),
-			];
-			if (await this._canonicalizeCommittedDeliveryPreparations(revocableDeliveryIds)) {
+		abortPromise = this.waitForIdle()
+			.then(() => {
 				this.agent.discardPendingPrompt();
 				this.agent.clearHostQueue();
-			}
-		})().finally(() => {
-			if (this._abortPromise === abortPromise) {
-				this._abortPromise = undefined;
-			}
-		});
+			})
+			.finally(() => {
+				if (this._abortPromise === abortPromise) {
+					this._abortPromise = undefined;
+				}
+			});
 		this._abortPromise = abortPromise;
 		return abortPromise;
 	}
@@ -4871,37 +4670,33 @@ export class AgentSession {
 		this._branchSummaryAbortController?.abort();
 	}
 
-	/** Convert an imminent request into a resumable compaction pause when needed. */
-	private _resolveProactiveCompactionAction(
-		context: AgentLoopNextActionContext,
-		action: AgentLoopNextAction,
-	): AgentLoopNextAction {
+	/** Pause an already-resolved request until mandatory proactive compaction finishes. */
+	private _gateProactiveCompactionRequest(context: AgentLoopNextActionContext): AgentRequestGateDecision {
 		try {
 			if (
 				this._disposed ||
 				context.requestAuthority === "final_response" ||
-				action.type !== "request" ||
 				context.completedTurn === undefined ||
 				this._proactiveCompactionState !== "idle"
 			) {
-				return action;
+				return "proceed";
 			}
 			const message = context.completedTurn.message;
-			if (message.stopReason === "aborted" || message.stopReason === "error") return action;
+			if (message.stopReason === "aborted" || message.stopReason === "error") return "proceed";
 			const settings = this.settingsManager.getCompactionSettings();
 			const model = this.model;
 			if (!settings.enabled || !model || message.provider !== model.provider || message.model !== model.id) {
-				return action;
+				return "proceed";
 			}
 			// Provider usage predates this turn's tool execution. Estimate from the
 			// live context so newly appended tool results are included before the
 			// loop starts another provider request.
 			const contextTokens = estimateContextTokens(context.context.messages).tokens;
-			if (!shouldCompact(contextTokens, model.contextWindow ?? 0, settings)) return action;
+			if (!shouldCompact(contextTokens, model.contextWindow ?? 0, settings)) return "proceed";
 			this._proactiveCompactionState = "scheduled";
-			return { type: "pause" };
+			return "pause";
 		} catch {
-			return action;
+			return "proceed";
 		}
 	}
 

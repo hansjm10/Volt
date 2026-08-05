@@ -125,8 +125,29 @@ export interface AgentDelivery {
 /** Side-effect-free messages plus work committed only after delivery ownership transfers. */
 export interface AgentDeliveryPreparation {
 	messages: AgentMessage[];
+	/**
+	 * Cross the delivery owner's durability boundary.
+	 *
+	 * This callback may be asynchronous, but it must not call lifecycle methods
+	 * that wait for the active Agent run (including AgentSession abort/dispose).
+	 */
 	commit?: () => void | Promise<void>;
 }
+
+export interface AgentDeliveryFailure {
+	readonly deliveryId: string;
+	readonly kind: AgentDeliveryKind;
+	readonly phase: "prepare" | "commit";
+	readonly error: Error;
+}
+
+/** Explicit outcome of one bounded Agent run. */
+export type AgentRunResult =
+	| { readonly status: "completed" }
+	| { readonly status: "delivery_failed"; readonly failure: AgentDeliveryFailure };
+
+export type AgentRequestAction = Extract<AgentLoopNextAction, { type: "request" }>;
+export type AgentRequestGateDecision = "proceed" | "pause";
 
 /** Options for constructing an {@link Agent}. */
 export interface AgentOptions {
@@ -149,6 +170,12 @@ export interface AgentOptions {
 		context: AgentLoopNextActionContext,
 		signal?: AbortSignal,
 	) => AgentLoopNextAction | Promise<AgentLoopNextAction>;
+	/** Pause after policy resolves while retaining the exact request for a later continuation. */
+	requestGate?: (
+		context: AgentLoopNextActionContext,
+		action: AgentRequestAction,
+		signal?: AbortSignal,
+	) => AgentRequestGateDecision | Promise<AgentRequestGateDecision>;
 	/** Refresh runtime state after deliveries finalize and only when a provider request will occur. */
 	prepareRequest?: (
 		context: PrepareRequestContext,
@@ -181,7 +208,12 @@ type DispatcherStartState = {
 	firstDecision: boolean;
 	requestAuthority: AgentRequestAuthority;
 	providerRequestPending: boolean;
+	retainedRequest?: AgentRequestAction;
 	drainFollowUpsFirst?: boolean;
+};
+
+type PausedDispatcherState = Pick<DispatcherStartState, "requestAuthority" | "providerRequestPending"> & {
+	retainedRequest?: AgentRequestAction;
 };
 
 type ActiveRun = {
@@ -193,7 +225,8 @@ type ActiveRun = {
 	abortSource?: AgentAbortSource;
 	diagnosticTimestamp?: number;
 	requestAccepted: boolean;
-	deliveryCommitSettled?: Promise<void>;
+	deliveryCommitInProgress: boolean;
+	deliveryFailure?: AgentDeliveryFailure;
 	phase: "open" | "terminal_event_settling" | "settled";
 };
 
@@ -214,8 +247,7 @@ export class Agent {
 	private readonly preparedDeliveryCommits = new Map<string, () => void | Promise<void>>();
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
-	private pausedState?: Pick<DispatcherStartState, "requestAuthority" | "providerRequestPending">;
-	private _lastRunFailedDeliveryKind?: AgentDeliveryKind;
+	private pausedState?: PausedDispatcherState;
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -241,6 +273,12 @@ export class Agent {
 		context: AgentLoopNextActionContext,
 		signal?: AbortSignal,
 	) => AgentLoopNextAction | Promise<AgentLoopNextAction>;
+	/** Pause after action resolution without discarding the resolved request. */
+	public requestGate?: (
+		context: AgentLoopNextActionContext,
+		action: AgentRequestAction,
+		signal?: AbortSignal,
+	) => AgentRequestGateDecision | Promise<AgentRequestGateDecision>;
 	/** Refresh runtime state immediately before an actual provider request. */
 	public prepareRequest?: (
 		context: PrepareRequestContext,
@@ -272,6 +310,7 @@ export class Agent {
 		this.afterToolCall = options.afterToolCall;
 		this.prepareDelivery = options.prepareDelivery;
 		this.nextAction = options.nextAction;
+		this.requestGate = options.requestGate;
 		this.prepareRequest = options.prepareRequest;
 		this.steeringQueueMode = options.steeringMode ?? "one-at-a-time";
 		this.followUpQueueMode = options.followUpMode ?? "one-at-a-time";
@@ -394,14 +433,9 @@ export class Agent {
 		return Object.freeze({ runId: run.id, accepted: true, source: run.abortSource });
 	}
 
-	/** Delivery kind whose preparation or begin boundary failed in the previous run. */
-	get lastRunFailedDeliveryKind(): AgentDeliveryKind | undefined {
-		return this._lastRunFailedDeliveryKind;
-	}
-
-	/** Settlement boundary for an active delivery commit callback, if one is running. */
-	get activeDeliveryCommitSettled(): Promise<void> | undefined {
-		return this.activeRun?.deliveryCommitSettled;
+	/** True while the active run is awaiting its delivery owner's commit callback. */
+	get isDeliveryCommitInProgress(): boolean {
+		return this.activeRun?.deliveryCommitInProgress === true;
 	}
 
 	/** Immutable lifecycle snapshot for structural teardown. */
@@ -443,9 +477,9 @@ export class Agent {
 	}
 
 	/** Start a new prompt through the same inbox dispatcher used by queued input. */
-	async prompt(message: AgentMessage | AgentMessage[]): Promise<void>;
-	async prompt(input: string, images?: ImageContent[]): Promise<void>;
-	async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<void> {
+	async prompt(message: AgentMessage | AgentMessage[]): Promise<AgentRunResult>;
+	async prompt(input: string, images?: ImageContent[]): Promise<AgentRunResult>;
+	async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<AgentRunResult> {
 		if (this.activeRun) {
 			throw new Error(
 				"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
@@ -459,7 +493,7 @@ export class Agent {
 		this.pausedState = undefined;
 		const lastMessage = this._state.messages[this._state.messages.length - 1];
 		this.enqueueDelivery("prompt", this.normalizePromptInput(input, images));
-		await this.runDispatcher({
+		return await this.runDispatcher({
 			firstDecision: true,
 			requestAuthority: "provider",
 			providerRequestPending: lastMessage !== undefined && lastMessage.role !== "assistant",
@@ -467,7 +501,7 @@ export class Agent {
 	}
 
 	/** Resume dispatcher state or a provider-ready transcript. */
-	async continue(options: { drainFollowUps?: boolean } = {}): Promise<void> {
+	async continue(options: { drainFollowUps?: boolean } = {}): Promise<AgentRunResult> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
@@ -478,13 +512,14 @@ export class Agent {
 		const pausedState = this.pausedState;
 		this.pausedState = undefined;
 		if (lastMessage?.role === "assistant" && !this.hasQueuedMessages() && !this.nextAction && !pausedState) {
-			return;
+			return { status: "completed" };
 		}
-		await this.runDispatcher({
+		return await this.runDispatcher({
 			firstDecision: true,
 			requestAuthority: pausedState?.requestAuthority ?? "provider",
 			providerRequestPending:
 				pausedState?.providerRequestPending ?? (lastMessage !== undefined && lastMessage.role !== "assistant"),
+			retainedRequest: pausedState?.retainedRequest,
 			drainFollowUpsFirst: options.drainFollowUps === true || lastMessage?.role === "assistant",
 		});
 	}
@@ -508,8 +543,8 @@ export class Agent {
 		return [{ role: "user", content, timestamp: Date.now() }];
 	}
 
-	private async runDispatcher(startState: DispatcherStartState): Promise<void> {
-		await this.runWithLifecycle(async (signal) => {
+	private async runDispatcher(startState: DispatcherStartState): Promise<AgentRunResult> {
+		return await this.runWithLifecycle(async (signal) => {
 			const context = this.createContextSnapshot();
 			const config = this.createLoopConfig(startState);
 			if (context.messages.length === 0) {
@@ -551,28 +586,35 @@ export class Agent {
 		const isFirstDecision = startState.firstDecision;
 		startState.firstDecision = false;
 		const requestAuthority = isFirstDecision ? startState.requestAuthority : context.requestAuthority;
+		const retainedRequest = isFirstDecision ? startState.retainedRequest : undefined;
 		const runtimeAction = context.defaultAction;
 		const providerRequestPending = isFirstDecision
 			? startState.providerRequestPending
 			: runtimeAction.type === "request";
 
 		if (this.signal?.aborted) {
-			this.pausedState = { requestAuthority, providerRequestPending };
+			this.pausedState = { requestAuthority, providerRequestPending, retainedRequest };
 			return { type: "pause", requestAuthority };
 		}
 
 		if (requestAuthority === "final_response") {
 			const hookContext = { ...context, requestAuthority, defaultAction: runtimeAction };
-			const action = this.nextAction ? await this.nextAction(hookContext, this.signal) : runtimeAction;
-			if (action.type === "pause") {
+			const resolvedAction =
+				retainedRequest ?? (this.nextAction ? await this.nextAction(hookContext, this.signal) : runtimeAction);
+			if (resolvedAction.type === "pause") {
 				this.pausedState = { requestAuthority, providerRequestPending };
-				return { ...action, requestAuthority };
+				return { ...resolvedAction, requestAuthority };
+			}
+			const action = { type: "request", reason: "final_response" } as const;
+			if ((await this.requestGate?.(hookContext, action, this.signal)) === "pause") {
+				this.pausedState = { requestAuthority, providerRequestPending: true, retainedRequest: action };
+				return { type: "pause", requestAuthority };
 			}
 			// Keep final-response authority until the completed response reaches the
 			// next dispatcher boundary. A host retry or compaction continuation starts
 			// a fresh core run before that boundary when this request fails.
 			this.pausedState = { requestAuthority, providerRequestPending: true };
-			return { type: "request", reason: "final_response" };
+			return action;
 		}
 
 		const hasIndependentRequest = runtimeAction.type === "request" && providerRequestPending;
@@ -594,7 +636,8 @@ export class Agent {
 					? runtimeAction
 					: { type: "stop" };
 		const hookContext = { ...context, requestAuthority, defaultAction: suggestedAction };
-		const action = this.nextAction ? await this.nextAction(hookContext, this.signal) : suggestedAction;
+		const action =
+			retainedRequest ?? (this.nextAction ? await this.nextAction(hookContext, this.signal) : suggestedAction);
 		if (action.type === "pause") {
 			this.pendingDeliverySelection = [];
 			this.pausedState = {
@@ -607,6 +650,15 @@ export class Agent {
 			this.pendingDeliverySelection = [];
 			this.pausedState = undefined;
 			return action;
+		}
+		if ((await this.requestGate?.(hookContext, action, this.signal)) === "pause") {
+			this.pendingDeliverySelection = [];
+			this.pausedState = {
+				requestAuthority,
+				providerRequestPending: true,
+				retainedRequest: action,
+			};
+			return { type: "pause", requestAuthority };
 		}
 
 		this.pausedState = undefined;
@@ -627,6 +679,7 @@ export class Agent {
 		this.activeLease = lease;
 		const deliveries: AgentLoopDelivery[] = [];
 		for (const delivery of lease.deliveries) {
+			if (this.activeLease !== lease || !lease.canPrepare(delivery.deliveryId)) continue;
 			let preparation: AgentDeliveryPreparation;
 			try {
 				preparation = this.prepareDelivery
@@ -640,18 +693,15 @@ export class Agent {
 						)
 					: { messages: delivery.messages.slice() };
 			} catch (error) {
-				this._lastRunFailedDeliveryKind = delivery.kind;
+				if (this.activeLease !== lease || !lease.canPrepare(delivery.deliveryId)) continue;
+				this.recordDeliveryFailure(delivery, "prepare", error);
 				throw error;
 			}
-			if (
-				this.activeLease !== lease ||
-				!lease.deliveries.some((candidate) => candidate.deliveryId === delivery.deliveryId)
-			) {
-				continue;
-			}
+			if (this.activeLease !== lease || !lease.canPrepare(delivery.deliveryId)) continue;
 			if (preparation.messages.length === 0) {
-				this._lastRunFailedDeliveryKind = delivery.kind;
-				throw new Error("prepareDelivery must retain at least one message for an admitted delivery");
+				const error = new Error("prepareDelivery must retain at least one message for an admitted delivery");
+				this.recordDeliveryFailure(delivery, "prepare", error);
+				throw error;
 			}
 			if (preparation.commit) {
 				this.preparedDeliveryCommits.set(delivery.deliveryId, preparation.commit);
@@ -673,12 +723,9 @@ export class Agent {
 		if (!ownsLeasedDelivery) return true;
 		const run = this.activeRun;
 		const requestWasAccepted = run?.requestAccepted ?? false;
-		let settleDeliveryCommit = (): void => undefined;
 		if (run) {
 			run.requestAccepted = true;
-			run.deliveryCommitSettled = new Promise<void>((resolve) => {
-				settleDeliveryCommit = resolve;
-			});
+			run.deliveryCommitInProgress = true;
 		}
 		try {
 			if (!(await this.activeLease?.begin(deliveryId, commit))) {
@@ -688,13 +735,29 @@ export class Agent {
 			this.preparedDeliveryCommits.delete(deliveryId);
 			return true;
 		} catch (error) {
-			this._lastRunFailedDeliveryKind = deliveryKind;
+			if (deliveryKind !== undefined) {
+				this.recordDeliveryFailure(
+					{ deliveryId, kind: deliveryKind, messages: delivery.messages },
+					"commit",
+					error,
+				);
+			}
 			if (run && this.activeRun === run) run.requestAccepted = requestWasAccepted;
 			throw error;
 		} finally {
-			settleDeliveryCommit();
-			if (run && this.activeRun === run) run.deliveryCommitSettled = undefined;
+			if (run && this.activeRun === run) run.deliveryCommitInProgress = false;
 		}
+	}
+
+	private recordDeliveryFailure(delivery: AgentDelivery, phase: "prepare" | "commit", error: unknown): void {
+		const run = this.activeRun;
+		if (!run || run.deliveryFailure) return;
+		run.deliveryFailure = Object.freeze({
+			deliveryId: delivery.deliveryId,
+			kind: delivery.kind,
+			phase,
+			error: error instanceof Error ? error : new Error(String(error)),
+		});
 	}
 
 	private rollbackActiveLease(): void {
@@ -738,7 +801,7 @@ export class Agent {
 		};
 	}
 
-	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
+	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<AgentRunResult> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing.");
 		}
@@ -755,14 +818,15 @@ export class Agent {
 			abortController,
 			turnOpen: false,
 			requestAccepted: false,
+			deliveryCommitInProgress: false,
 			phase: "open",
 		};
 
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
 		this._state.errorMessage = undefined;
-		this._lastRunFailedDeliveryKind = undefined;
 
+		let deliveryFailure: AgentDeliveryFailure | undefined;
 		try {
 			await executor(abortController.signal);
 		} catch (error) {
@@ -770,8 +834,10 @@ export class Agent {
 			await this.handleRunFailure(error, abortController.signal.aborted);
 		} finally {
 			this.rollbackActiveLease();
+			deliveryFailure = this.activeRun?.deliveryFailure;
 			this.finishRun();
 		}
+		return deliveryFailure ? { status: "delivery_failed", failure: deliveryFailure } : { status: "completed" };
 	}
 
 	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {

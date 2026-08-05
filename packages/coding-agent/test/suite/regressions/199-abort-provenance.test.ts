@@ -258,73 +258,7 @@ describe("regression #199: abort provenance persistence", () => {
 		});
 	});
 
-	it("persists a delivery when disposal runs inside its commit callback", async () => {
-		let harness: Harness;
-		let disposal: Promise<void> | undefined;
-		harness = await createHarness({
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				commit: () => {
-					disposal = harness.session.dispose("disposal");
-				},
-			}),
-		});
-		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("never requested")]);
-
-		await harness.session.prompt("commit before disposal", {
-			clientMessageId: "dispose-during-delivery-commit",
-		});
-		await disposal;
-
-		const messages = harness.sessionManager.buildSessionContext().messages;
-		expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
-		expect(messages[0]).toMatchObject({
-			role: "user",
-			clientMessageId: "dispose-during-delivery-commit",
-			content: [{ type: "text", text: "commit before disposal" }],
-		});
-		expect(messages[1]).toMatchObject({
-			role: "assistant",
-			stopReason: "aborted",
-			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
-		});
-	});
-
-	it("persists each composed delivery message once when disposal runs during commit", async () => {
-		let harness: Harness;
-		let disposal: Promise<void> | undefined;
-		harness = await createHarness({
-			prepareDelivery: (delivery) => {
-				const messages = [createUserMessage("prepared predecessor"), ...delivery.messages];
-				return {
-					messages,
-					commit: () => {
-						messages.push(createUserMessage("message composed during commit"));
-						disposal = harness.session.dispose("disposal");
-					},
-				};
-			},
-		});
-		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("never requested")]);
-
-		await harness.session.prompt("original admitted prompt");
-		await disposal;
-
-		const messages = harness.sessionManager.buildSessionContext().messages;
-		expect(
-			messages.flatMap((message) => {
-				if (message.role !== "user") return [];
-				if (typeof message.content === "string") return [message.content];
-				return message.content.flatMap((part) => (part.type === "text" ? [part.text] : []));
-			}),
-		).toEqual(["prepared predecessor", "original admitted prompt", "message composed during commit"]);
-		expect(messages.filter((message) => message.role === "assistant")).toHaveLength(1);
-		expect(runtimeAbortSources(harness)).toEqual(["disposal"]);
-	});
-
-	it("persists ready-plan checkpoint composition when disposal starts at the user boundary", async () => {
+	it("keeps ready-plan state unchanged when disposal starts at the user boundary", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		await harness.session.setAgentMode("plan");
@@ -340,14 +274,6 @@ describe("regression #199: abort provenance persistence", () => {
 		let disposal: Promise<void> | undefined;
 		harness.session.subscribe((event) => {
 			if (event.type !== "message_start" || event.message.role !== "user" || disposal) return;
-			if (
-				!Array.isArray(event.message.content) ||
-				!event.message.content.some(
-					(part) => part.type === "text" && part.text === "Revise after ready-plan approval",
-				)
-			) {
-				return;
-			}
 			disposal = harness.session.dispose("disposal");
 		});
 
@@ -356,28 +282,23 @@ describe("regression #199: abort provenance persistence", () => {
 		await disposal;
 
 		const messages = harness.sessionManager.buildSessionContext().messages;
-		expect(messages.map((message) => message.role)).toEqual(["custom", "user", "assistant"]);
+		expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
 		expect(messages[0]).toMatchObject({
-			role: "custom",
-			customType: "volt-plan-checkpoint",
-			content: expect.stringContaining("Phase: draft"),
-		});
-		expect(messages[1]).toMatchObject({
 			role: "user",
 			content: [{ type: "text", text: "Revise after ready-plan approval" }],
 		});
-		expect(messages[2]).toMatchObject({
+		expect(messages[1]).toMatchObject({
 			role: "assistant",
 			stopReason: "aborted",
 			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
 		});
 		expect(harness.session.planningState).toMatchObject({
-			mode: "plan",
-			plan: { id: ready.id, revision: ready.revision + 1, phase: "draft" },
+			mode: "build",
+			plan: { id: ready.id, revision: ready.revision, phase: "ready" },
 		});
 	});
 
-	it("does not persist committed feedback when disposal cannot persist its planning transition", async () => {
+	it("keeps an admitted delivery canonical when later request preparation fails", async () => {
 		let predecessorCommits = 0;
 		const harness = await createHarness({
 			prepareDelivery: (delivery) => {
@@ -386,82 +307,42 @@ describe("regression #199: abort provenance persistence", () => {
 					messages,
 					commit: () => {
 						predecessorCommits++;
-						messages.unshift(
-							{
-								role: "custom",
-								customType: "committed-before-disposal",
-								content: "External preparation committed",
-								display: false,
-								timestamp: Date.now(),
-							},
-							createUserMessage("committed predecessor output"),
-						);
+						messages.unshift(createUserMessage("committed predecessor output"));
 					},
 				};
 			},
 		});
 		harnesses.push(harness);
 		await harness.session.setAgentMode("plan");
-		const draft = harness.session.updatePlan({ steps: [{ text: "Preserve committed preparation" }] });
+		const draft = harness.session.updatePlan({ steps: [{ text: "Preserve committed delivery" }] });
 		harness.session.submitPlan({
 			planId: draft.id,
 			expectedRevision: draft.revision,
-			title: "Preserve preparation",
-			summary: "Keep external preparation through disposal.",
+			title: "Preserve delivery",
+			summary: "Keep admitted delivery through request failure.",
 		});
 		harness.session.agent.state.messages = [fauxAssistantMessage("Plan tail")];
-		harness.session.agent.steer(createUserMessage("feedback before disposal"));
-		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
-		harness.sessionManager.appendPlanningState = (planning) => {
-			if (planning.plan?.phase === "draft") {
-				throw new Error("planning persistence remains unavailable");
-			}
-			return appendPlanningState(planning);
+		harness.session.agent.steer(createUserMessage("feedback before request failure"));
+		harness.sessionManager.appendPlanningState = () => {
+			throw new Error("planning persistence remains unavailable");
 		};
 
 		await harness.session.agent.continue();
 		expect(harness.session.agent.state.errorMessage).toBe("planning persistence remains unavailable");
 		expect(predecessorCommits).toBe(1);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
 
 		await harness.session.dispose("disposal");
 
-		const messages = harness.sessionManager.buildSessionContext().messages;
-		expect(messages).not.toContainEqual(
-			expect.objectContaining({
-				role: "custom",
-				customType: "committed-before-disposal",
-				content: "External preparation committed",
-			}),
-		);
 		expect(
-			messages.flatMap((message) =>
-				message.role === "user" && Array.isArray(message.content)
-					? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
-					: [],
-			),
-		).toEqual([]);
-		expect(harness.session.planningState.plan?.phase).toBe("ready");
-		expect(predecessorCommits).toBe(1);
-	});
-
-	it("does not retain delivery admission when a disposing commit fails", async () => {
-		let harness: Harness;
-		let disposal: Promise<void> | undefined;
-		harness = await createHarness({
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				commit: () => {
-					disposal = harness.session.dispose("disposal");
-					throw new Error("delivery commit failed");
-				},
-			}),
-		});
-		harnesses.push(harness);
-
-		await harness.session.prompt("do not admit this delivery");
-		await disposal;
-
-		expect(harness.sessionManager.buildSessionContext().messages).toEqual([]);
+			harness.sessionManager
+				.buildSessionContext()
+				.messages.flatMap((message) =>
+					message.role === "user" && Array.isArray(message.content)
+						? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+						: [],
+				),
+		).toEqual(["committed predecessor output", "feedback before request failure"]);
 	});
 
 	it("attributes manual compaction cancellation to the local host action", async () => {

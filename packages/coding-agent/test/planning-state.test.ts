@@ -253,7 +253,7 @@ describe("native planning state", () => {
 				Array.isArray(message.content) &&
 				message.content.some((content) => content.type === "text" && content.text === "Revise the approved plan"),
 		);
-		expect(session.messages[feedbackIndex - 1]).toMatchObject({
+		expect(session.messages[feedbackIndex + 1]).toMatchObject({
 			role: "custom",
 			customType: "volt-plan-checkpoint",
 			content: expect.stringContaining("Phase: draft"),
@@ -357,7 +357,7 @@ describe("native planning state", () => {
 				Array.isArray(message.content) &&
 				message.content.some((part) => part.type === "text" && part.text === "Committed feedback"),
 		);
-		expect(session.messages[feedbackIndex - 1]).toMatchObject({
+		expect(session.messages[feedbackIndex + 1]).toMatchObject({
 			role: "custom",
 			customType: "volt-plan-checkpoint",
 			content: expect.stringContaining("Phase: draft"),
@@ -434,10 +434,7 @@ describe("native planning state", () => {
 		const queuedDeliveryIds = session.getSteeringMessages().map((entry) => entry.queueEntryId);
 		const stagedCommitCalls = new Map<string, number>();
 		let preparationCalls = 0;
-		const prepareDelivery = session.agent.prepareDelivery;
-		if (!prepareDelivery) throw new Error("Expected AgentSession delivery preparation hook");
-		session.agent.prepareDelivery = async (delivery, signal) => {
-			const preparation = await prepareDelivery(delivery, signal);
+		session.agent.prepareDelivery = async (delivery) => {
 			preparationCalls++;
 			if (preparationCalls === 2) {
 				await session.activatePlan(ready.id, ready.revision, {
@@ -449,10 +446,9 @@ describe("native planning state", () => {
 				});
 			}
 			return {
-				messages: preparation.messages,
+				messages: [...delivery.messages],
 				commit: () => {
 					stagedCommitCalls.set(delivery.deliveryId, (stagedCommitCalls.get(delivery.deliveryId) ?? 0) + 1);
-					preparation.commit?.();
 				},
 			};
 		};
@@ -478,9 +474,6 @@ describe("native planning state", () => {
 			return stream;
 		};
 
-		await session.agent.continue();
-		// A failed begin restores the all-mode lease. Retrying exposes whether any
-		// staged commit ran once before the stale planning transition threw.
 		await session.agent.continue();
 
 		expect(session.planningState).toMatchObject({
@@ -637,7 +630,7 @@ describe("native planning state", () => {
 						(content) => content.type === "text" && content.text === "Add verification coverage",
 					),
 			);
-			expect(session.messages[feedbackIndex - 1]).toMatchObject({
+			expect(session.messages[feedbackIndex + 1]).toMatchObject({
 				role: "custom",
 				customType: "volt-plan-checkpoint",
 				content: expect.stringContaining("Phase: draft"),

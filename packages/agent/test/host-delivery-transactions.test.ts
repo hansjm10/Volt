@@ -46,12 +46,14 @@ function createUserMessage(text: string): Extract<AgentMessage, { role: "user" }
 	};
 }
 
-function deferred(): { promise: Promise<void>; resolve(): void } {
+function deferred(): { promise: Promise<void>; resolve(): void; reject(error: Error): void } {
 	let resolve = (): void => undefined;
-	const promise = new Promise<void>((promiseResolve) => {
+	let reject = (_error: Error): void => undefined;
+	const promise = new Promise<void>((promiseResolve, promiseReject) => {
 		resolve = promiseResolve;
+		reject = promiseReject;
 	});
-	return { promise, resolve };
+	return { promise, resolve, reject };
 }
 
 function getUserTexts(messages: readonly AgentMessage[]): string[] {
@@ -184,6 +186,99 @@ describe("Agent host delivery transactions", () => {
 		expect(deliveryStarts).toBe(1);
 		expect(providerCalls).toBe(1);
 		expect(getUserTexts(agent.state.messages)).toEqual(["durable before publication"]);
+	});
+
+	it("retains the exact resolved request while a request gate pauses", async () => {
+		let actionCalls = 0;
+		let gateCalls = 0;
+		let providerCalls = 0;
+		let actionCallsAtProvider = 0;
+		const agent = new Agent({
+			initialState: { messages: [createUserMessage("provider-ready")] },
+			nextAction: () => {
+				actionCalls++;
+				return actionCalls === 1 ? { type: "request", reason: "continuation" } : { type: "stop" };
+			},
+			requestGate: () => (gateCalls++ === 0 ? "pause" : "proceed"),
+			streamFn: () => {
+				providerCalls++;
+				actionCallsAtProvider = actionCalls;
+				return new MockAssistantStream(createAssistantMessage("done"));
+			},
+		});
+
+		await agent.continue();
+		expect(providerCalls).toBe(0);
+
+		await agent.continue();
+
+		expect(actionCallsAtProvider).toBe(1);
+		expect(actionCalls).toBe(2);
+		expect(gateCalls).toBe(2);
+		expect(providerCalls).toBe(1);
+	});
+
+	it("discards a revoked preparation failure without publishing an error turn", async () => {
+		const preparationStarted = deferred();
+		const finishPreparation = deferred();
+		let providerCalls = 0;
+		const agent = new Agent({
+			initialState: { messages: [createAssistantMessage("tail")] },
+			prepareDelivery: async (delivery) => {
+				preparationStarted.resolve();
+				await finishPreparation.promise;
+				return { messages: [...delivery.messages] };
+			},
+			streamFn: () => {
+				providerCalls++;
+				return new MockAssistantStream(createAssistantMessage("unexpected"));
+			},
+		});
+		const deliveryId = agent.hostDelivery(createUserMessage("revoke while preparing"));
+
+		const continuation = agent.continue();
+		await preparationStarted.promise;
+		expect(agent.clearHostQueue()).toEqual([deliveryId]);
+		finishPreparation.reject(new Error("revoked preparation failed"));
+		await continuation;
+
+		expect(agent.state.errorMessage).toBeUndefined();
+		expect(providerCalls).toBe(0);
+		expect(agent.state.messages).toEqual([expect.objectContaining({ role: "assistant" })]);
+	});
+
+	it("does not prepare later deliveries from a revoked all-mode snapshot", async () => {
+		const firstPreparationStarted = deferred();
+		const finishFirstPreparation = deferred();
+		const preparedTexts: string[] = [];
+		let providerCalls = 0;
+		const agent = new Agent({
+			initialState: { messages: [createAssistantMessage("tail")] },
+			prepareDelivery: async (delivery) => {
+				const text = getUserTexts(delivery.messages)[0]!;
+				preparedTexts.push(text);
+				if (text === "first") {
+					firstPreparationStarted.resolve();
+					await finishFirstPreparation.promise;
+				}
+				return { messages: [...delivery.messages] };
+			},
+			streamFn: () => {
+				providerCalls++;
+				return new MockAssistantStream(createAssistantMessage("unexpected"));
+			},
+		});
+		agent.hostDelivery(createUserMessage("first"));
+		agent.hostDelivery(createUserMessage("second"));
+
+		const continuation = agent.continue();
+		await firstPreparationStarted.promise;
+		expect(agent.clearHostQueue()).toHaveLength(2);
+		finishFirstPreparation.resolve();
+		await continuation;
+
+		expect(preparedTexts).toEqual(["first"]);
+		expect(providerCalls).toBe(0);
 	});
 
 	it("assigns unique dispatcher identities to separately admitted host deliveries", async () => {

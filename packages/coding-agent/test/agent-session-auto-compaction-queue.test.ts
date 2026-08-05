@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@hansjm10/volt-agent-core";
+import { Agent, type AgentRunResult } from "@hansjm10/volt-agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@hansjm10/volt-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
@@ -149,7 +149,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(session.pendingMessageCount).toBe(0);
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 
-		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue({ status: "completed" });
 
 		const runAutoCompaction = (
 			session as unknown as {
@@ -421,7 +421,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		);
 	});
 
-	it("retains a resumed one-shot action when queued delivery preparation fails once", async () => {
+	it("retains a resumed one-shot action for explicit retry after delivery preparation fails", async () => {
 		const model = session.model!;
 		const hostDeliveryText = "one-shot host delivery";
 		const steeringText = "steering queued during compaction";
@@ -441,16 +441,14 @@ describe("AgentSession auto-compaction queue resume", () => {
 			});
 			return { type: "request", reason: "delivery" };
 		};
-		const prepareDelivery = session.agent.prepareDelivery;
-		if (!prepareDelivery) throw new Error("Expected AgentSession delivery preparation hook");
-		session.agent.prepareDelivery = async (delivery, signal) => {
+		session.agent.prepareDelivery = async (delivery) => {
 			if (delivery.kind === "steer") {
 				steeringPreparationAttempts++;
 				if (steeringPreparationAttempts === 1) {
 					throw new Error("transient steering preparation failure");
 				}
 			}
-			return await prepareDelivery(delivery, signal);
+			return { messages: [...delivery.messages] };
 		};
 		session.subscribe((event) => {
 			if (event.type === "compaction_start" && !queuedSteering) {
@@ -506,6 +504,10 @@ describe("AgentSession auto-compaction queue resume", () => {
 		};
 
 		await session.prompt("trigger compaction before both deliveries");
+		expect(steeringPreparationAttempts).toBe(1);
+		expect(session.agent.hasQueuedMessages()).toBe(true);
+
+		await session.agent.continue();
 
 		expect(hostActionResolutions).toBe(1);
 		expect(steeringPreparationAttempts).toBe(2);
@@ -820,6 +822,66 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
 	});
 
+	it("replays an action-only continuation after proactive compaction pauses a stopping tool batch", async () => {
+		const model = session.model!;
+		writeFileSync(join(tempDir, "large-action-only-result.txt"), "x".repeat(40_000));
+		let continuationResolved = false;
+		let streamCallCount = 0;
+		session.agent.afterToolCall = async () => ({ disposition: "stop" });
+		preexistingNextAction = (context) => {
+			if (!context.completedTurn || continuationResolved) return context.defaultAction;
+			continuationResolved = true;
+			return { type: "request", reason: "continuation" };
+		};
+		session.agent.streamFn = () => {
+			const callNumber = ++streamCallCount;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message: AssistantMessage = {
+					role: "assistant",
+					content:
+						callNumber === 1
+							? [
+									{
+										type: "toolCall",
+										id: "call-1",
+										name: "read",
+										arguments: { path: "large-action-only-result.txt" },
+									},
+								]
+							: [{ type: "text", text: "continued after compaction" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: callNumber === 1 ? model.contextWindow - 20_000 : 100,
+						output: callNumber === 1 ? 10_000 : 10,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: callNumber === 1 ? model.contextWindow - 10_000 : 110,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: callNumber === 1 ? "toolUse" : "stop",
+					timestamp: Date.now(),
+				};
+				stream.push({ type: "start", seq: 0, snapshot: message, toolState: [] });
+				stream.push({
+					type: "done",
+					seq: 1,
+					reason: message.stopReason === "toolUse" ? "toolUse" : "stop",
+					message,
+				});
+			});
+			return stream;
+		};
+
+		await session.prompt("continue a stopping tool batch once");
+
+		expect(continuationResolved).toBe(true);
+		expect(streamCallCount).toBe(2);
+		expect(sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
+	});
+
 	it("keeps session busy and waitForIdle pending during manual compaction", async () => {
 		const model = session.model!;
 		session.agent.streamFn = () => {
@@ -949,7 +1011,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 			_conversationGenerationRevision: number;
 			_lastAssistantMessage: AssistantMessage | undefined;
 			_checkCompaction: (message: AssistantMessage) => Promise<boolean>;
-			_handlePostAgentRun: (abortGeneration: number, conversationGenerationRevision: number) => Promise<boolean>;
+			_handlePostAgentRun: (
+				result: AgentRunResult,
+				abortGeneration: number,
+				conversationGenerationRevision: number,
+			) => Promise<boolean>;
 		};
 		internals._lastAssistantMessage = assistantMessage;
 		vi.spyOn(internals, "_checkCompaction").mockImplementation(async () => {
@@ -959,6 +1025,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		});
 
 		const continuation = internals._handlePostAgentRun(
+			{ status: "completed" },
 			internals._abortGeneration,
 			internals._conversationGenerationRevision,
 		);
@@ -1070,20 +1137,16 @@ describe("AgentSession auto-compaction queue resume", () => {
 			defaultAction: { type: "request", reason: "continuation" },
 		};
 
-		const hook = (
+		const gate = (
 			session as unknown as {
-				_resolveProactiveCompactionAction: (
-					context: unknown,
-					action: { type: "request"; reason: "continuation" },
-				) => unknown;
+				_gateProactiveCompactionRequest: (context: unknown) => "pause" | "proceed";
 			}
-		)._resolveProactiveCompactionAction.bind(session);
-		const request = { type: "request" as const, reason: "continuation" as const };
+		)._gateProactiveCompactionRequest.bind(session);
 
-		expect(hook(context, request)).toEqual({ type: "pause" });
+		expect(gate(context)).toBe("pause");
 		// A second threshold crossing before any successful compaction must not
 		// interrupt the run again (prevents pause/fail/continue churn every turn).
-		expect(hook(context, request)).toEqual(request);
+		expect(gate(context)).toBe("proceed");
 	});
 
 	it("should not compact repeatedly after overflow recovery already attempted", async () => {
