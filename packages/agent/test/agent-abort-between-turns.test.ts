@@ -104,6 +104,55 @@ describe("abort between turns", () => {
 		expect(events.at(-1)?.type).toBe("agent_end");
 	});
 
+	it("persists sourced abort provenance when a canceled tool batch requests stop", async () => {
+		const toolSchema = Type.Object({});
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "noop_tool",
+			label: "Noop Tool",
+			description: "Stops after cancellation",
+			parameters: toolSchema,
+			async execute() {
+				agent.abort("host_action");
+				return {
+					content: [{ type: "text", text: "stopped" }],
+					details: undefined,
+					disposition: "stop",
+				};
+			},
+		};
+		let streamCalls = 0;
+		const agent = new Agent({
+			initialState: { tools: [tool] },
+			streamFn: () => {
+				streamCalls++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						seq: 1,
+						reason: "toolUse",
+						message: createAssistantToolUseMessage(),
+					});
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("run stopping tool");
+
+		expect(streamCalls).toBe(1);
+		expect(agent.state.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+			diagnostics: [
+				expect.objectContaining({
+					type: "runtime_abort",
+					details: { source: "host_action" },
+				}),
+			],
+		});
+	});
+
 	it("keeps queued steering messages pending for a resume after abort", async () => {
 		let streamCalls = 0;
 		const tool = createNoopTool(() => {

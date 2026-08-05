@@ -342,7 +342,7 @@ async function runDispatchedLoop(
 
 		await emit({ type: "turn_end", message, toolResults });
 		completedTurn = { message, toolResults, disposition };
-		if (signal?.aborted && isFinalResponse && toolCalls.length > 0) {
+		if (signal?.aborted && toolCalls.length > 0) {
 			await emitBoundaryAbort(currentContext, newMessages, config, emit);
 			await emit({ type: "agent_end", messages: newMessages });
 			return;

@@ -1280,6 +1280,7 @@ describe("SubagentManager", () => {
 					finalRequestTools = context.tools?.map((tool) => tool.name) ?? [];
 					return fauxAssistantMessage("Final delegated report");
 				},
+				fauxAssistantMessage(fauxToolCall("subagent_registry", { list: true }), { stopReason: "toolUse" }),
 			],
 		});
 
@@ -1304,6 +1305,22 @@ describe("SubagentManager", () => {
 		expect(manager.listActivities()).toEqual([
 			expect.objectContaining({ id: handle.id, status: "completed", abortRequested: false }),
 		]);
+
+		const abortSpy = vi.spyOn(childSession, "abort");
+		const followUpEnd = new Promise<SubagentEndEvent>((resolve) => {
+			const unsubscribe = handle.onEvent((event) => {
+				if (event.type !== "agent_end") return;
+				unsubscribe();
+				resolve(event);
+			});
+		});
+		await handle.prompt("Try to use a tool after finalizing the plan");
+		const followUpMessages = (await followUpEnd).messages;
+		expect(JSON.stringify(followUpMessages.find((message) => message.role === "toolResult"))).toContain(
+			"turn budget is exhausted",
+		);
+		expect(followUpMessages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+		expect(abortSpy).toHaveBeenCalled();
 	});
 
 	it("gives parallel children independent turn budgets within one shared scope", async () => {
