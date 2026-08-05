@@ -427,6 +427,110 @@ describe("AgentSession auto-compaction queue resume", () => {
 		);
 	});
 
+	it("retains a resumed one-shot action when queued delivery preparation fails once", async () => {
+		const model = session.model!;
+		const hostDeliveryText = "one-shot host delivery";
+		const steeringText = "steering queued during compaction";
+		let hostActionResolutions = 0;
+		let steeringPreparationAttempts = 0;
+		let streamCallCount = 0;
+		let queuedSteering = false;
+		const startedDeliveryTexts: string[] = [];
+		const providerUserTexts: string[][] = [];
+		preexistingNextAction = (context) => {
+			if (!context.completedTurn || hostActionResolutions > 0) return context.defaultAction;
+			hostActionResolutions++;
+			return {
+				type: "request",
+				reason: "delivery",
+				deliveries: [
+					{
+						messages: [
+							{
+								role: "user",
+								content: [{ type: "text", text: hostDeliveryText }],
+								timestamp: Date.now(),
+							},
+						],
+					},
+				],
+			};
+		};
+		const prepareDelivery = session.agent.prepareDelivery;
+		if (!prepareDelivery) throw new Error("Expected AgentSession delivery preparation hook");
+		session.agent.prepareDelivery = async (delivery, signal) => {
+			if (delivery.kind === "steer") {
+				steeringPreparationAttempts++;
+				if (steeringPreparationAttempts === 1) {
+					throw new Error("transient steering preparation failure");
+				}
+			}
+			return await prepareDelivery(delivery, signal);
+		};
+		session.subscribe((event) => {
+			if (event.type === "compaction_start" && !queuedSteering) {
+				queuedSteering = true;
+				session.agent.steer({
+					role: "user",
+					content: [{ type: "text", text: steeringText }],
+					timestamp: Date.now(),
+				});
+			}
+			if (event.type === "delivery_start") {
+				startedDeliveryTexts.push(
+					...event.messages.flatMap((message) =>
+						message.role === "user" && Array.isArray(message.content)
+							? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+							: [],
+					),
+				);
+			}
+		});
+		session.agent.streamFn = (_model, context) => {
+			const callNumber = ++streamCallCount;
+			providerUserTexts.push(
+				context.messages.flatMap((message) => {
+					if (message.role !== "user") return [];
+					if (typeof message.content === "string") return [message.content];
+					return message.content.flatMap((part) => (part.type === "text" ? [part.text] : []));
+				}),
+			);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message: AssistantMessage = {
+					role: "assistant",
+					content: [{ type: "text", text: callNumber === 1 ? "pause for compaction" : "deliveries processed" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: callNumber === 1 ? model.contextWindow - 20_000 : 100,
+						output: callNumber === 1 ? 10_000 : 10,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: callNumber === 1 ? model.contextWindow - 10_000 : 110,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				};
+				stream.push({ type: "start", seq: 0, snapshot: message, toolState: [] });
+				stream.push({ type: "done", seq: 1, reason: "stop", message });
+			});
+			return stream;
+		};
+
+		await session.prompt("trigger compaction before both deliveries");
+
+		expect(hostActionResolutions).toBe(1);
+		expect(steeringPreparationAttempts).toBe(2);
+		expect(streamCallCount).toBe(2);
+		expect(startedDeliveryTexts.filter((text) => text === steeringText)).toHaveLength(1);
+		expect(startedDeliveryTexts.filter((text) => text === hostDeliveryText)).toHaveLength(1);
+		expect(providerUserTexts[1]).toEqual(expect.arrayContaining([steeringText, hostDeliveryText]));
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+	});
+
 	it.each(["throws", "returns false"] as const)(
 		"retains a one-shot next-action delivery when proactive compaction %s before admission",
 		async (failureMode) => {

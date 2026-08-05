@@ -527,7 +527,7 @@ export class AgentSession {
 	 * compaction returns to idle while retaining any already-resolved host action.
 	 */
 	private _proactiveCompactionState: "idle" | "scheduled" | "compacting" = "idle";
-	/** One request already resolved by a wrapped next-action hook before a compaction pause. */
+	/** One request resolved before compaction and retained until delivery or request admission. */
 	private _proactiveCompactionResumeAction: AgentLoopNextAction | undefined;
 
 	// Branch summarization state
@@ -776,9 +776,7 @@ export class AgentSession {
 		const nextAction = this.agent.nextAction;
 		this.agent.nextAction = async (context, signal) => {
 			if (this._proactiveCompactionResumeAction) {
-				const action = this._proactiveCompactionResumeAction;
-				this._proactiveCompactionResumeAction = undefined;
-				return action;
+				return this._proactiveCompactionResumeAction;
 			}
 			const action = nextAction ? await nextAction(context, signal) : context.defaultAction;
 			const resolvedAction = this._resolveProactiveCompactionAction(context, action);
@@ -786,6 +784,12 @@ export class AgentSession {
 				this._proactiveCompactionResumeAction = action;
 			}
 			return resolvedAction;
+		};
+		const prepareRequest = this.agent.prepareRequest;
+		this.agent.prepareRequest = async (context, signal) => {
+			const update = await prepareRequest?.(context, signal);
+			this._proactiveCompactionResumeAction = undefined;
+			return update;
 		};
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
 			if (!this.getActiveToolNames().includes(toolCall.name)) {
@@ -1050,6 +1054,7 @@ export class AgentSession {
 			this._pendingAdmittedDeliveryMessages = [];
 		}
 		if (event.type === "delivery_start") {
+			this._proactiveCompactionResumeAction = undefined;
 			this._captureAdmittedDelivery(event);
 		}
 		if (event.type === "agent_end") {
