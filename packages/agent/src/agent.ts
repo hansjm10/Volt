@@ -566,7 +566,9 @@ export class Agent {
 		const suggestedAction: AgentLoopNextAction =
 			selected.length > 0
 				? { type: "request", reason: hasIndependentRequest ? "continuation" : "delivery" }
-				: runtimeAction;
+				: hasIndependentRequest
+					? runtimeAction
+					: { type: "stop" };
 		const hookContext = { ...context, requestAuthority, defaultAction: suggestedAction };
 		const action = this.nextAction ? await this.nextAction(hookContext, this.signal) : suggestedAction;
 		if (action.type === "pause") {

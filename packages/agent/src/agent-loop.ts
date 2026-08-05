@@ -182,7 +182,7 @@ async function runDispatchedLoop(
 
 	while (true) {
 		if (signal?.aborted) {
-			if (completedTurn && (requestAuthority === "tool_continuation" || requestAuthority === "final_response")) {
+			if (completedTurn) {
 				await emitBoundaryAbort(currentContext, newMessages, config, emit);
 			}
 			await emit({ type: "agent_end", messages: newMessages });
@@ -197,11 +197,7 @@ async function runDispatchedLoop(
 			defaultAction,
 		};
 		const hostAction = await resolveNextAction(config, actionContext);
-		if (
-			signal?.aborted &&
-			completedTurn &&
-			(requestAuthority === "tool_continuation" || requestAuthority === "final_response")
-		) {
+		if (signal?.aborted && completedTurn) {
 			await emitBoundaryAbort(currentContext, newMessages, config, emit);
 			await emit({ type: "agent_end", messages: newMessages });
 			return;
@@ -340,10 +336,13 @@ async function runDispatchedLoop(
 			}
 		}
 
+		const abortedBeforeTurnEnd = signal?.aborted === true;
 		await emit({ type: "turn_end", message, toolResults });
 		completedTurn = { message, toolResults, disposition };
-		if (signal?.aborted && toolCalls.length > 0) {
-			await emitBoundaryAbort(currentContext, newMessages, config, emit);
+		if (signal?.aborted) {
+			if (toolCalls.length > 0 || !abortedBeforeTurnEnd) {
+				await emitBoundaryAbort(currentContext, newMessages, config, emit);
+			}
 			await emit({ type: "agent_end", messages: newMessages });
 			return;
 		}

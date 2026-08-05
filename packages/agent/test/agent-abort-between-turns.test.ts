@@ -26,6 +26,14 @@ class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMe
 	}
 }
 
+function createDeferred(): { promise: Promise<void>; resolve(): void } {
+	let resolve = () => {};
+	const promise = new Promise<void>((promiseResolve) => {
+		resolve = promiseResolve;
+	});
+	return { promise, resolve };
+}
+
 function createAssistantMessage(text: string): AssistantMessage {
 	return {
 		role: "assistant",
@@ -151,6 +159,59 @@ describe("abort between turns", () => {
 				}),
 			],
 		});
+	});
+
+	it("persists sourced abort provenance when cancellation lands during plain turn settlement", async () => {
+		const turnEndStarted = createDeferred();
+		const releaseTurnEnd = createDeferred();
+		let providerCalls = 0;
+		const agent = new Agent({
+			streamFn: () => {
+				providerCalls++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						seq: 1,
+						reason: "stop",
+						message: createAssistantMessage("completed"),
+					});
+				});
+				return stream;
+			},
+		});
+		agent.subscribe(async (event) => {
+			if (event.type !== "turn_end") return;
+			agent.followUp({
+				role: "user",
+				content: [{ type: "text", text: "queued after completion" }],
+				timestamp: Date.now(),
+			});
+			turnEndStarted.resolve();
+			await releaseTurnEnd.promise;
+		});
+
+		const prompting = agent.prompt("complete normally");
+		await turnEndStarted.promise;
+		expect(agent.abort("remote_request")).toMatchObject({ accepted: true, source: "remote_request" });
+		releaseTurnEnd.resolve();
+		await prompting;
+
+		const abortSources = agent.state.messages.flatMap((message) =>
+			message.role === "assistant"
+				? (message.diagnostics ?? []).flatMap((diagnostic) =>
+						diagnostic.type === "runtime_abort" &&
+						diagnostic.details &&
+						typeof diagnostic.details === "object" &&
+						"source" in diagnostic.details
+							? [diagnostic.details.source]
+							: [],
+					)
+				: [],
+		);
+		expect(providerCalls).toBe(1);
+		expect(abortSources).toEqual(["remote_request"]);
+		expect(agent.hasQueuedMessages()).toBe(true);
 	});
 
 	it("keeps queued steering messages pending for a resume after abort", async () => {

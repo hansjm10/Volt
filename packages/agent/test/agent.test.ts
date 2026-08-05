@@ -1235,6 +1235,29 @@ describe("Agent", () => {
 		expect(agent.state.errorMessage).toBeUndefined();
 	});
 
+	it("treats the canonical nextAction default as a no-op at an assistant tail", async () => {
+		let providerCalls = 0;
+		const tail = createAssistantMessage("already complete");
+		const agent = new Agent({
+			initialState: { messages: [tail] },
+			nextAction: (context) => context.defaultAction,
+			streamFn: () => {
+				providerCalls++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("unexpected") });
+				});
+				return stream;
+			},
+		});
+
+		await agent.continue();
+
+		expect(providerCalls).toBe(0);
+		expect(agent.state.messages).toEqual([tail]);
+		expect(agent.state.errorMessage).toBeUndefined();
+	});
+
 	it("allows nextAction to attach the required user delivery from an assistant tail", async () => {
 		let attached = false;
 		let providerUserTexts: Array<string | undefined> = [];
