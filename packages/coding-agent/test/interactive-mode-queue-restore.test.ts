@@ -6,7 +6,7 @@ type CompactionQueuedMessage = { text: string; mode: "steer" | "followUp" };
 
 const restoreQueuedMessagesToEditor = Reflect.get(InteractiveMode.prototype, "restoreQueuedMessagesToEditor") as (
 	this: unknown,
-	options?: { abort?: boolean; currentText?: string },
+	options?: { abortSource?: "keyboard_interrupt" | "host_action"; currentText?: string },
 ) => Promise<number>;
 const runKeyAction = Reflect.get(InteractiveMode.prototype, "runKeyAction") as (
 	this: unknown,
@@ -48,9 +48,9 @@ describe("InteractiveMode queued message restoration", () => {
 			editorText: "in-progress draft",
 		});
 
-		await expect(restoreQueuedMessagesToEditor.call(receiver, { abort: true })).rejects.toBeInstanceOf(
-			QueueClearPersistenceError,
-		);
+		await expect(
+			restoreQueuedMessagesToEditor.call(receiver, { abortSource: "keyboard_interrupt" }),
+		).rejects.toBeInstanceOf(QueueClearPersistenceError);
 
 		// Every queued message survives, including the compaction queue that is
 		// drained alongside the revoked session queue.
@@ -58,7 +58,7 @@ describe("InteractiveMode queued message restoration", () => {
 			"steered draft\n\nqueued for after compaction\n\nfollow-up draft\n\nin-progress draft",
 		);
 		expect(receiver.compactionQueuedMessages).toEqual([]);
-		expect(receiver.agent.abort).toHaveBeenCalledOnce();
+		expect(receiver.agent.abort).toHaveBeenCalledWith("keyboard_interrupt");
 	});
 
 	test("leaves the compaction queue intact when clearing fails before the queues are revoked", async () => {
@@ -70,14 +70,14 @@ describe("InteractiveMode queued message restoration", () => {
 			compactionQueuedMessages,
 		});
 
-		await expect(restoreQueuedMessagesToEditor.call(receiver, { abort: true })).rejects.toThrow(
+		await expect(restoreQueuedMessagesToEditor.call(receiver, { abortSource: "host_action" })).rejects.toThrow(
 			"session persistence is closed",
 		);
 
 		// Nothing was revoked, so nothing needs recovering and the queue stays put.
 		expect(receiver.editor.setText).not.toHaveBeenCalled();
 		expect(receiver.compactionQueuedMessages).toEqual(compactionQueuedMessages);
-		expect(receiver.agent.abort).toHaveBeenCalledOnce();
+		expect(receiver.agent.abort).toHaveBeenCalledWith("host_action");
 	});
 
 	test("restores both queues to the editor on the success path", async () => {
