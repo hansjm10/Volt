@@ -514,7 +514,7 @@ export class AgentSession {
 	private readonly _liveClientInputs = new Map<string, LiveClientInputOperation>();
 	/** Fatal listener error swallowed into agent-core's synthetic error turn. */
 	private _agentEventFatalError: Error | undefined;
-	/** Predecessor commit output retained when later delivery composition must retry. */
+	/** Predecessor commit output retained until later composition retries or teardown makes it canonical. */
 	private readonly _committedDeliveryPreparationMessages = new Map<string, AgentMessage[]>();
 	private _extensionCommandTransactions = new Set<symbol>();
 	private _activeExtensionCommandHandlers = 0;
@@ -1065,6 +1065,26 @@ export class AgentSession {
 		if (index !== -1) this._pendingAdmittedDeliveryMessages.splice(index, 1);
 	}
 
+	private _settleProactiveCompactionResumeDelivery(
+		event: Pick<Extract<AgentEvent, { type: "delivery_start" }>, "deliveryId" | "messages">,
+	): void {
+		const action = this._proactiveCompactionResumeAction;
+		if (action?.type !== "request" || !action.deliveries) return;
+		const deliveryIndex = action.deliveries.findIndex(
+			(delivery) => delivery.deliveryId === event.deliveryId && delivery.messages === event.messages,
+		);
+		if (deliveryIndex === -1) return;
+		const deliveries = action.deliveries.filter((_, index) => index !== deliveryIndex);
+		this._proactiveCompactionResumeAction = deliveries.length === 0 ? undefined : { ...action, deliveries };
+	}
+
+	private _captureCommittedDeliveryPreparations(): void {
+		for (const [deliveryId, messages] of this._committedDeliveryPreparationMessages) {
+			this._captureAdmittedDelivery({ deliveryId, messages });
+			this._committedDeliveryPreparationMessages.delete(deliveryId);
+		}
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<AgentMessage | undefined> => {
 		if (this._disposed) return undefined;
@@ -1074,7 +1094,7 @@ export class AgentSession {
 			this._pendingAdmittedDeliveryMessages = [];
 		}
 		if (event.type === "delivery_start") {
-			this._proactiveCompactionResumeAction = undefined;
+			this._settleProactiveCompactionResumeDelivery(event);
 			this._captureAdmittedDelivery(event);
 		}
 		if (event.type === "agent_end") {
@@ -1539,7 +1559,7 @@ export class AgentSession {
 		const runAfterAbort = this.agent.activeRunSnapshot;
 		this._disposed = true;
 		this._proactiveCompactionResumeAction = undefined;
-		this._committedDeliveryPreparationMessages.clear();
+		this._captureCommittedDeliveryPreparations();
 		const durablyAdmittedOperations = new Set<LiveClientInputOperation>();
 
 		try {
@@ -4065,10 +4085,10 @@ export class AgentSession {
 	 * Clear all queued messages and return them.
 	 * Useful for restoring to editor when user aborts.
 	 *
-	 * Durability is awaited only when clearing actually records something: queued
-	 * input with a durable client identity. Runtime ownership is revoked before that
-	 * await, so a persistence failure cannot put the text back. It is instead carried
-	 * on the thrown {@link QueueClearPersistenceError} for callers that must not lose it.
+	 * Durability is awaited when clearing records a terminal client-input outcome or
+	 * promotes preparation whose predecessor already committed. Runtime ownership is
+	 * resolved before that await, so a persistence failure cannot put revocable text
+	 * back. It is instead carried on the thrown {@link QueueClearPersistenceError}.
 	 * @returns Object with steering and followUp arrays
 	 * @throws QueueClearPersistenceError when the cleared state could not be persisted
 	 */
@@ -4078,9 +4098,58 @@ export class AgentSession {
 			publishedEntries.flatMap((entry) => (entry.clientMessageId === undefined ? [] : [entry.clientMessageId])),
 		);
 		const revokedIds = new Set(this.agent.clearAllQueues());
-		for (const deliveryId of revokedIds) this._committedDeliveryPreparationMessages.delete(deliveryId);
-		const revokedSteering = this._steeringMessages.filter((entry) => revokedIds.has(entry.queueEntryId));
-		const revokedFollowUp = this._followUpMessages.filter((entry) => revokedIds.has(entry.queueEntryId));
+		const committedPreparationIds = new Set(
+			[...revokedIds].filter((deliveryId) => this._committedDeliveryPreparationMessages.has(deliveryId)),
+		);
+		const committedPreparationOperations = new Map<string, LiveClientInputOperation>();
+		let persistenceError: Error | undefined;
+		for (const deliveryId of committedPreparationIds) {
+			const messages = this._committedDeliveryPreparationMessages.get(deliveryId);
+			if (!messages) continue;
+			try {
+				this._prepareUserDelivery({ messages }).commit?.();
+			} catch (error) {
+				persistenceError ??= error instanceof Error ? error : new Error(String(error));
+			}
+			try {
+				this._discardAdmittedDelivery(deliveryId);
+				while (messages.length > 0) {
+					const message = messages[0]!;
+					if (message.role === "user" && message.clientMessageId !== undefined) {
+						const record = this.sessionManager.getClientInput(message.clientMessageId);
+						if (record?.state === "accepted") {
+							this.sessionManager.transitionClientInput(message.clientMessageId, "started");
+						}
+						const operation = this._liveClientInputs.get(message.clientMessageId);
+						if (operation) {
+							operation.queued = false;
+							committedPreparationOperations.set(message.clientMessageId, operation);
+						}
+					}
+					if (message.role === "custom") {
+						this.sessionManager.appendCustomMessageEntry(
+							message.customType,
+							message.content,
+							message.display,
+							message.details,
+						);
+					} else if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
+						this.sessionManager.appendMessage(message);
+					}
+					this.agent.state.messages.push(message);
+					messages.shift();
+				}
+				this._committedDeliveryPreparationMessages.delete(deliveryId);
+			} catch (error) {
+				persistenceError ??= error instanceof Error ? error : new Error(String(error));
+			}
+		}
+		const revokedSteering = this._steeringMessages.filter(
+			(entry) => revokedIds.has(entry.queueEntryId) && !committedPreparationIds.has(entry.queueEntryId),
+		);
+		const revokedFollowUp = this._followUpMessages.filter(
+			(entry) => revokedIds.has(entry.queueEntryId) && !committedPreparationIds.has(entry.queueEntryId),
+		);
 		const steering = revokedSteering.map((entry) => entry.text);
 		const followUp = revokedFollowUp.map((entry) => entry.text);
 		const revokedClientIds = new Set(
@@ -4093,17 +4162,17 @@ export class AgentSession {
 				operation.queued && (revokedClientIds.has(clientMessageId) || !publishedClientIds.has(clientMessageId)),
 		);
 		const terminalError = new Error("client_input_failed: queued input was cleared before canonical consumption");
-		let persistenceError: Error | undefined;
 
 		try {
 			for (const [clientMessageId] of queuedOperations) {
 				this.sessionManager.transitionClientInput(clientMessageId, "failed", terminalError.message);
 			}
 		} catch (error) {
-			persistenceError = error instanceof Error ? error : new Error(String(error));
+			persistenceError ??= error instanceof Error ? error : new Error(String(error));
 		}
-		// Agent-core is the authority for published queue ownership. Entries whose
-		// begin boundary already crossed remain projected until delivery_start settles.
+		// Agent-core is the authority for published queue ownership. A preparation
+		// whose predecessor already committed is promoted instead of returned as
+		// revocable text; every other revoked entry is handed back to the caller.
 		this._steeringMessages = this._steeringMessages.filter((entry) => !revokedIds.has(entry.queueEntryId));
 		this._followUpMessages = this._followUpMessages.filter((entry) => !revokedIds.has(entry.queueEntryId));
 		this._emitQueueUpdate();
@@ -4114,12 +4183,9 @@ export class AgentSession {
 			}
 		}
 
-		// Runtime-only queue entries carry a local-queue identity and never reach the
-		// WAL, so clearing them appends nothing. Awaiting the durable watermark in
-		// that case records no cancellation and only inherits an unrelated earlier
-		// failure, which would fail the one action a fail-stopped session still owes
-		// the user: handing their unsent text back.
-		if (queuedOperations.length > 0 && persistenceError === undefined) {
+		// Runtime-only revocations append nothing, but promoted preparation is now
+		// canonical and must cross the same durability watermark as identified input.
+		if ((queuedOperations.length > 0 || committedPreparationIds.size > 0) && persistenceError === undefined) {
 			try {
 				await this.sessionManager.flush();
 			} catch (error) {
@@ -4128,13 +4194,19 @@ export class AgentSession {
 		}
 
 		if (persistenceError !== undefined) {
-			for (const [, operation] of queuedOperations) {
+			for (const operation of [
+				...committedPreparationOperations.values(),
+				...queuedOperations.map(([, op]) => op),
+			]) {
 				operation.rejectAccepted(persistenceError);
 				operation.rejectCompletion(persistenceError);
 			}
 			throw new QueueClearPersistenceError(persistenceError, { steering, followUp });
 		}
 
+		for (const [clientMessageId] of committedPreparationOperations) {
+			this._completeLiveClientInput(clientMessageId, "admitted");
+		}
 		for (const [clientMessageId, operation] of queuedOperations) {
 			const admissionWasAcknowledged = operation.acceptanceSettled;
 			operation.rejectAccepted(terminalError);

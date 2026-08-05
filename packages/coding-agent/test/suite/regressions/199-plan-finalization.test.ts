@@ -261,6 +261,70 @@ describe("regression #199: approved plan finalization", () => {
 		).toHaveLength(1);
 	});
 
+	it("promotes committed preparation instead of revoking it when queue clearing follows a planning failure", async () => {
+		let predecessorCommits = 0;
+		const harness = await createHarness({
+			prepareDelivery: (delivery) => {
+				const messages = [...delivery.messages];
+				return {
+					messages,
+					commit: () => {
+						predecessorCommits++;
+						messages.unshift(
+							{
+								role: "custom",
+								customType: "committed-preparation",
+								content: "External preparation committed",
+								display: false,
+								timestamp: Date.now(),
+							},
+							createUserMessage("committed predecessor output"),
+						);
+					},
+				};
+			},
+		});
+		harnesses.push(harness);
+		await createReadyPlan(harness);
+		harness.session.agent.state.messages = [fauxAssistantMessage("Plan tail")];
+		await harness.session.steer("feedback cleared after partial commit", undefined, "committed-preparation-clear");
+
+		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
+		let failDraftPersistence = true;
+		harness.sessionManager.appendPlanningState = (planning) => {
+			if (planning.plan?.phase === "draft" && failDraftPersistence) {
+				failDraftPersistence = false;
+				throw new Error("planning persistence failed before queue clear");
+			}
+			return appendPlanningState(planning);
+		};
+
+		await harness.session.agent.continue();
+		expect(harness.session.agent.state.errorMessage).toBe("planning persistence failed before queue clear");
+		expect(predecessorCommits).toBe(1);
+
+		await expect(harness.session.clearQueue()).resolves.toEqual({ steering: [], followUp: [] });
+
+		const messages = harness.sessionManager.buildSessionContext().messages;
+		expect(messages).toContainEqual(
+			expect.objectContaining({
+				role: "custom",
+				customType: "committed-preparation",
+				content: "External preparation committed",
+			}),
+		);
+		expect(
+			messages.flatMap((message) =>
+				message.role === "user" && Array.isArray(message.content)
+					? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+					: [],
+			),
+		).toEqual(["committed predecessor output", "feedback cleared after partial commit"]);
+		expect(harness.session.planningState.plan?.phase).toBe("draft");
+		expect(harness.sessionManager.getClientInput("committed-preparation-clear")?.state).toBe("completed");
+		expect(predecessorCommits).toBe(1);
+	});
+
 	it("does not replay a predecessor commit after a ready-feedback planning observer fails", async () => {
 		let predecessorCommits = 0;
 		const harness = await createHarness({

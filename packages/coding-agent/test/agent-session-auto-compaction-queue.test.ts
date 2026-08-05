@@ -531,6 +531,120 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(session.agent.hasQueuedMessages()).toBe(false);
 	});
 
+	it("retains a one-shot host delivery when an earlier queued dispatch cannot durably start", async () => {
+		const model = session.model!;
+		const hostDeliveryText = "host delivery after queued dispatch failure";
+		const queuedText = "queued delivery with failed durable start";
+		let hostActionResolutions = 0;
+		let hostDeliveryStarts = 0;
+		let streamCallCount = 0;
+		preexistingNextAction = (context) => {
+			if (!context.completedTurn || hostActionResolutions > 0) return context.defaultAction;
+			hostActionResolutions++;
+			return {
+				type: "request",
+				reason: "delivery",
+				deliveries: [
+					{
+						messages: [
+							{
+								role: "user",
+								content: [{ type: "text", text: hostDeliveryText }],
+								timestamp: Date.now(),
+							},
+						],
+					},
+				],
+			};
+		};
+		session.subscribe((event) => {
+			if (
+				event.type === "delivery_start" &&
+				event.messages.some(
+					(message) =>
+						message.role === "user" &&
+						Array.isArray(message.content) &&
+						message.content.some((part) => part.type === "text" && part.text === hostDeliveryText),
+				)
+			) {
+				hostDeliveryStarts++;
+			}
+		});
+		const internals = session as unknown as {
+			_proactiveCompactionState: "idle" | "scheduled" | "compacting";
+			_runAutoCompaction: (
+				reason: "overflow" | "threshold",
+				willRetry: boolean,
+				continueAfterCompaction?: boolean,
+			) => Promise<boolean>;
+		};
+		vi.spyOn(internals, "_runAutoCompaction").mockImplementation(async () => {
+			internals._proactiveCompactionState = "idle";
+			return false;
+		});
+		session.agent.streamFn = () => {
+			const callNumber = ++streamCallCount;
+			const stream = new MockAssistantStream();
+			const respond = (): void => {
+				const message: AssistantMessage = {
+					role: "assistant",
+					content: [{ type: "text", text: callNumber === 1 ? "pause before deliveries" : "host delivered" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: callNumber === 1 ? model.contextWindow - 20_000 : 100,
+						output: callNumber === 1 ? 10_000 : 10,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: callNumber === 1 ? model.contextWindow - 10_000 : 110,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				};
+				stream.push({ type: "start", seq: 0, snapshot: message, toolState: [] });
+				stream.push({ type: "done", seq: 1, reason: "stop", message });
+			};
+			if (callNumber === 1) {
+				void session.steer(queuedText, undefined, "queued-dispatch-before-host").then(respond);
+			} else {
+				queueMicrotask(respond);
+			}
+			return stream;
+		};
+
+		await session.prompt("retain the host action");
+		expect(hostActionResolutions).toBe(1);
+		expect(hostDeliveryStarts).toBe(0);
+
+		const originalFlush = sessionManager.flush.bind(sessionManager);
+		let rejectedDispatch = false;
+		const flush = vi.spyOn(sessionManager, "flush").mockImplementation(() => {
+			if (!rejectedDispatch && sessionManager.getClientInput("queued-dispatch-before-host")?.state === "started") {
+				rejectedDispatch = true;
+				return Promise.reject(new Error("injected queued dispatch flush failure"));
+			}
+			return originalFlush();
+		});
+
+		await session.agent.continue();
+		expect(rejectedDispatch).toBe(true);
+		expect(hostDeliveryStarts).toBe(0);
+		flush.mockRestore();
+
+		await session.agent.continue();
+
+		expect(hostActionResolutions).toBe(1);
+		expect(hostDeliveryStarts).toBe(1);
+		expect(session.agent.state.messages).toContainEqual(
+			expect.objectContaining({
+				role: "user",
+				content: [{ type: "text", text: hostDeliveryText }],
+			}),
+		);
+	});
+
 	it.each(["throws", "returns false"] as const)(
 		"retains a one-shot next-action delivery when proactive compaction %s before admission",
 		async (failureMode) => {

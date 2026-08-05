@@ -340,6 +340,72 @@ describe("regression #199: abort provenance persistence", () => {
 		});
 	});
 
+	it("persists predecessor output when disposal follows a later planning commit failure", async () => {
+		let predecessorCommits = 0;
+		const harness = await createHarness({
+			prepareDelivery: (delivery) => {
+				const messages = [...delivery.messages];
+				return {
+					messages,
+					commit: () => {
+						predecessorCommits++;
+						messages.unshift(
+							{
+								role: "custom",
+								customType: "committed-before-disposal",
+								content: "External preparation committed",
+								display: false,
+								timestamp: Date.now(),
+							},
+							createUserMessage("committed predecessor output"),
+						);
+					},
+				};
+			},
+		});
+		harnesses.push(harness);
+		await harness.session.setAgentMode("plan");
+		const draft = harness.session.updatePlan({ steps: [{ text: "Preserve committed preparation" }] });
+		harness.session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Preserve preparation",
+			summary: "Keep external preparation through disposal.",
+		});
+		harness.session.agent.state.messages = [fauxAssistantMessage("Plan tail")];
+		harness.session.agent.steer(createUserMessage("feedback before disposal"));
+		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
+		harness.sessionManager.appendPlanningState = (planning) => {
+			if (planning.plan?.phase === "draft") {
+				throw new Error("planning persistence remains unavailable");
+			}
+			return appendPlanningState(planning);
+		};
+
+		await harness.session.agent.continue();
+		expect(harness.session.agent.state.errorMessage).toBe("planning persistence remains unavailable");
+		expect(predecessorCommits).toBe(1);
+
+		await harness.session.dispose("disposal");
+
+		const messages = harness.sessionManager.buildSessionContext().messages;
+		expect(messages).toContainEqual(
+			expect.objectContaining({
+				role: "custom",
+				customType: "committed-before-disposal",
+				content: "External preparation committed",
+			}),
+		);
+		expect(
+			messages.flatMap((message) =>
+				message.role === "user" && Array.isArray(message.content)
+					? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+					: [],
+			),
+		).toEqual(["committed predecessor output", "feedback before disposal"]);
+		expect(predecessorCommits).toBe(1);
+	});
+
 	it("does not retain delivery admission when a disposing commit fails", async () => {
 		let harness: Harness;
 		let disposal: Promise<void> | undefined;
