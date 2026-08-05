@@ -523,10 +523,12 @@ export class AgentSession {
 	private _activeCompaction: ActiveCompaction | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 	/**
-	 * Coordinates the agent-loop stop with its mandatory compaction. A failed
+	 * Coordinates the agent-loop pause with its mandatory compaction. A failed
 	 * compaction returns to idle but never resumes the interrupted run.
 	 */
 	private _proactiveCompactionState: "idle" | "scheduled" | "compacting" = "idle";
+	/** One request already resolved by a wrapped next-action hook before a compaction pause. */
+	private _proactiveCompactionResumeAction: AgentLoopNextAction | undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -773,8 +775,17 @@ export class AgentSession {
 		};
 		const nextAction = this.agent.nextAction;
 		this.agent.nextAction = async (context, signal) => {
+			if (this._proactiveCompactionResumeAction) {
+				const action = this._proactiveCompactionResumeAction;
+				this._proactiveCompactionResumeAction = undefined;
+				return action;
+			}
 			const action = nextAction ? await nextAction(context, signal) : context.defaultAction;
-			return this._resolveProactiveCompactionAction(context, action);
+			const resolvedAction = this._resolveProactiveCompactionAction(context, action);
+			if (action.type === "request" && resolvedAction.type === "pause") {
+				this._proactiveCompactionResumeAction = action;
+			}
+			return resolvedAction;
 		};
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
 			if (!this.getActiveToolNames().includes(toolCall.name)) {
@@ -1502,6 +1513,7 @@ export class AgentSession {
 		const abortAcceptance = this.agent.abort(source);
 		const runAfterAbort = this.agent.activeRunSnapshot;
 		this._disposed = true;
+		this._proactiveCompactionResumeAction = undefined;
 		const durablyAdmittedOperations = new Set<LiveClientInputOperation>();
 
 		try {
@@ -3175,10 +3187,12 @@ export class AgentSession {
 		// Disposal stops all continuations. Abort stops automatic retry/compaction
 		// resurrection, but intentionally preserves messages queued before abort.
 		if (this._disposed) {
+			this._proactiveCompactionResumeAction = undefined;
 			return false;
 		}
 		if (abortGeneration !== this._abortGeneration) {
 			this._lastAssistantMessage = undefined;
+			this._proactiveCompactionResumeAction = undefined;
 			this._settleRetry(false, "Retry cancelled");
 			return false;
 		}
@@ -3188,6 +3202,7 @@ export class AgentSession {
 			// retry, or continue against the newly selected branch.
 			this._lastAssistantMessage = undefined;
 			this._proactiveCompactionState = "idle";
+			this._proactiveCompactionResumeAction = undefined;
 			this._settleRetry(false, "Conversation branch changed");
 			return false;
 		}
@@ -3195,12 +3210,14 @@ export class AgentSession {
 			conversationGenerationRevision !== this._conversationGenerationRevision;
 		const abandonStaleConversationRun = (): false => {
 			this._proactiveCompactionState = "idle";
+			this._proactiveCompactionResumeAction = undefined;
 			this._settleRetry(false, "Conversation branch changed");
 			return false;
 		};
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
 		if (!msg) {
+			this._proactiveCompactionResumeAction = undefined;
 			return false;
 		}
 
@@ -3209,14 +3226,21 @@ export class AgentSession {
 			// The run paused mid-task at the next-action boundary, so resume it only
 			// after mandatory compaction succeeds. A failure
 			// rejects the prompt and leaves the durable transcript retryable.
-			const shouldContinue = await this._runAutoCompaction("threshold", false, true);
+			let shouldContinue: boolean;
+			try {
+				shouldContinue = await this._runAutoCompaction("threshold", false, true);
+			} catch (error) {
+				this._proactiveCompactionResumeAction = undefined;
+				throw error;
+			}
 			if (conversationGenerationChanged()) {
 				return abandonStaleConversationRun();
 			}
-			if (!shouldContinue) {
+			if (!shouldContinue || this._disposed || abortGeneration !== this._abortGeneration) {
+				this._proactiveCompactionResumeAction = undefined;
 				return false;
 			}
-			return !this._disposed && abortGeneration === this._abortGeneration;
+			return true;
 		}
 
 		if (this._isRetryableError(msg)) {
@@ -4115,6 +4139,7 @@ export class AgentSession {
 	abort(source?: AgentAbortSource): Promise<void> {
 		this.agent.abort(source);
 		this.agent.discardPendingPrompt();
+		this._proactiveCompactionResumeAction = undefined;
 		if (this._abortPromise) {
 			return this._abortPromise;
 		}

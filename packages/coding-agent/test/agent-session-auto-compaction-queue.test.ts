@@ -94,6 +94,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 	let session: AgentSession;
 	let sessionManager: SessionManager;
 	let tempDir: string;
+	let preexistingNextAction: Agent["nextAction"];
 
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `volt-auto-compaction-queue-${Date.now()}`);
@@ -101,12 +102,14 @@ describe("AgentSession auto-compaction queue resume", () => {
 		vi.useFakeTimers();
 
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		preexistingNextAction = undefined;
 		const agent = new Agent({
 			initialState: {
 				model,
 				systemPrompt: "Test",
 				tools: [],
 			},
+			nextAction: (context, signal) => preexistingNextAction?.(context, signal) ?? context.defaultAction,
 		});
 
 		sessionManager = SessionManager.inMemory();
@@ -296,6 +299,132 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(agentEnds).toHaveLength(2);
 		expect(compactionContinuations).toEqual([true]);
 		expect(sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
+	});
+
+	it("preserves a one-shot next-action delivery across compaction after a completed response", async () => {
+		const model = session.model!;
+		let deliveryAttached = false;
+		let streamCallCount = 0;
+		const hostDelivery = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "host delivery after response" }],
+			timestamp: Date.now(),
+		};
+		preexistingNextAction = (context) => {
+			if (!context.completedTurn || deliveryAttached) return context.defaultAction;
+			deliveryAttached = true;
+			return {
+				type: "request",
+				reason: "delivery",
+				deliveries: [{ messages: [hostDelivery] }],
+			};
+		};
+
+		session.agent.streamFn = () => {
+			const callNumber = ++streamCallCount;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message: AssistantMessage = {
+					role: "assistant",
+					content: [{ type: "text", text: callNumber === 1 ? "first response" : "host delivery processed" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: callNumber === 1 ? model.contextWindow - 20_000 : 100,
+						output: callNumber === 1 ? 10_000 : 10,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: callNumber === 1 ? model.contextWindow - 10_000 : 110,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				};
+				stream.push({ type: "start", seq: 0, snapshot: message, toolState: [] });
+				stream.push({ type: "done", seq: 1, reason: "stop", message });
+			});
+			return stream;
+		};
+
+		await session.prompt("trigger response compaction");
+
+		expect(streamCallCount).toBe(2);
+		expect(session.agent.state.messages).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					role: "user",
+					content: [{ type: "text", text: "host delivery after response" }],
+				}),
+			]),
+		);
+	});
+
+	it("preserves a one-shot next-action delivery across compaction during a tool continuation", async () => {
+		const model = session.model!;
+		let deliveryAttached = false;
+		let streamCallCount = 0;
+		const hostDelivery = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "host delivery during tools" }],
+			timestamp: Date.now(),
+		};
+		preexistingNextAction = (context) => {
+			if (!context.completedTurn || deliveryAttached) return context.defaultAction;
+			deliveryAttached = true;
+			return {
+				type: "request",
+				reason: "continuation",
+				deliveries: [{ messages: [hostDelivery] }],
+			};
+		};
+
+		session.agent.streamFn = () => {
+			const callNumber = ++streamCallCount;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message: AssistantMessage = {
+					role: "assistant",
+					content:
+						callNumber === 1
+							? [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "missing.txt" } }]
+							: [{ type: "text", text: "host delivery processed" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: callNumber === 1 ? model.contextWindow - 20_000 : 100,
+						output: callNumber === 1 ? 10_000 : 10,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: callNumber === 1 ? model.contextWindow - 10_000 : 110,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: callNumber === 1 ? "toolUse" : "stop",
+					timestamp: Date.now(),
+				};
+				stream.push({ type: "start", seq: 0, snapshot: message, toolState: [] });
+				stream.push({
+					type: "done",
+					seq: 1,
+					reason: message.stopReason === "toolUse" ? "toolUse" : "stop",
+					message,
+				});
+			});
+			return stream;
+		};
+
+		await session.prompt("trigger tool compaction");
+
+		expect(streamCallCount).toBe(2);
+		expect(session.agent.state.messages).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					role: "user",
+					content: [{ type: "text", text: "host delivery during tools" }],
+				}),
+			]),
+		);
 	});
 
 	it("should include newly appended tool results in proactive threshold checks", async () => {
