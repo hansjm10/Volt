@@ -22,7 +22,10 @@ export function spawnProcess(
 ): ChildProcessByStdio<null, Readable, Readable>;
 export function spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess;
 export function spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess {
-	return process.platform === "win32" ? crossSpawn(command, args, options) : nodeSpawn(command, args, options);
+	const backgroundOptions = { ...options, windowsHide: true };
+	return process.platform === "win32"
+		? crossSpawn(command, args, backgroundOptions)
+		: nodeSpawn(command, args, backgroundOptions);
 }
 
 export function spawnProcessSync(
@@ -30,9 +33,10 @@ export function spawnProcessSync(
 	args: string[],
 	options: SpawnSyncOptionsWithStringEncoding,
 ): SpawnSyncReturns<string> {
+	const backgroundOptions = { ...options, windowsHide: true };
 	return process.platform === "win32"
-		? crossSpawn.sync(command, args, options)
-		: nodeSpawnSync(command, args, options);
+		? crossSpawn.sync(command, args, backgroundOptions)
+		: nodeSpawnSync(command, args, backgroundOptions);
 }
 
 /**

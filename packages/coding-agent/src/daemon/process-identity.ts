@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawnProcess } from "../utils/child-process.ts";
 import type { PidfileContents } from "./main.ts";
 
 /**
@@ -48,7 +48,7 @@ const VOLTD_COMMAND_MARKERS = [/(?:^|[\s/\\])voltd(?=$|[\s/\\])/, "daemon run --
 
 const defaultRunner: ProcessQueryRunner = (command, args) =>
 	new Promise((resolve) => {
-		const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawnProcess(command, args, { stdio: ["ignore", "pipe", "pipe"] });
 		let output = "";
 		child.stdout?.on("data", (chunk: Buffer) => {
 			output += chunk.toString("utf8");

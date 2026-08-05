@@ -89,6 +89,10 @@ describe("voltd keep_awake_set", () => {
 			method: "caffeinate",
 		});
 		expect(fake.spawn).toHaveBeenCalledTimes(1);
+		expect(fake.spawn).toHaveBeenCalledWith("/usr/bin/caffeinate", ["-i", "-s"], {
+			stdio: ["ignore", "ignore", "ignore"],
+			windowsHide: true,
+		});
 		await vi.waitFor(() => {
 			expect(events.some((event) => event.type === "keep_awake_changed")).toBe(true);
 		});

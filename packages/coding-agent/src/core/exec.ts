@@ -2,8 +2,7 @@
  * Shared command execution utilities for extensions and custom tools.
  */
 
-import { spawn } from "node:child_process";
-import { waitForChildProcess } from "../utils/child-process.ts";
+import { spawnProcess, waitForChildProcess } from "../utils/child-process.ts";
 
 /**
  * Options for executing shell commands.
@@ -38,7 +37,7 @@ export async function execCommand(
 	options?: ExecOptions,
 ): Promise<ExecResult> {
 	return new Promise((resolve) => {
-		const proc = spawn(command, args, {
+		const proc = spawnProcess(command, args, {
 			cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],

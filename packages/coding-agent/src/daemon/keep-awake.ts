@@ -160,7 +160,10 @@ export class KeepAwakeController {
 		const generation = this.generation;
 		let child: ChildProcess;
 		try {
-			child = this.spawn(command.command, command.args, { stdio: ["ignore", "ignore", "ignore"] });
+			child = this.spawn(command.command, command.args, {
+				stdio: ["ignore", "ignore", "ignore"],
+				windowsHide: true,
+			});
 		} catch (error) {
 			this.log("error", `spawn ${command.method} failed: ${String(error)}`);
 			this.handleChildGone(generation, `${command.method} unavailable`);
