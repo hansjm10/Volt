@@ -284,4 +284,66 @@ describe("regression #199: approved plan finalization", () => {
 		expect(requestSnapshots[2]!.tools).toEqual(["build_marker"]);
 		expect(requestSnapshots[2]!.systemPrompt).not.toContain("[VOLT FINAL RESPONSE — TRUSTED RUNTIME POLICY]");
 	});
+
+	it("retains tool-free final-response authority across a transient provider retry", async () => {
+		const harness = await createHarness({
+			tools: [createBuildMarkerTool()],
+			initialActiveToolNames: ["build_marker"],
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		await harness.session.setAgentMode("plan");
+		const draft = harness.session.updatePlan({ steps: [{ text: "Finish implementation" }] });
+		const ready = harness.session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Finish implementation",
+			summary: "Complete the approved work and report it.",
+		});
+		await harness.session.activatePlan(ready.id, ready.revision, {
+			id: "execution-final-response-retry",
+			approvedRevision: ready.revision,
+			strategy: "retain_context",
+			sourceSessionId: harness.session.sessionId,
+			targetSessionId: harness.session.sessionId,
+		});
+		const active = harness.session.planningState.plan!;
+		const requestSnapshots: Array<{ tools: string[]; systemPrompt: string }> = [];
+		harness.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall("update_plan_progress", {
+					planId: active.id,
+					expectedRevision: active.revision,
+					updates: [{ id: active.steps[0]!.id, status: "completed" }],
+				}),
+				{ stopReason: "toolUse" },
+			),
+			(context) => {
+				requestSnapshots.push({
+					tools: context.tools?.map((tool) => tool.name) ?? [],
+					systemPrompt: context.systemPrompt ?? "",
+				});
+				return fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" });
+			},
+			(context) => {
+				requestSnapshots.push({
+					tools: context.tools?.map((tool) => tool.name) ?? [],
+					systemPrompt: context.systemPrompt ?? "",
+				});
+				return fauxAssistantMessage("Final response after retry");
+			},
+		]);
+
+		await harness.session.prompt("Complete the approved plan despite a transient failure");
+
+		expect(requestSnapshots).toHaveLength(2);
+		for (const snapshot of requestSnapshots) {
+			expect(snapshot.tools).toEqual([]);
+			expect(snapshot.systemPrompt).toContain("[VOLT FINAL RESPONSE — TRUSTED RUNTIME POLICY]");
+		}
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "Final response after retry" }],
+		});
+	});
 });

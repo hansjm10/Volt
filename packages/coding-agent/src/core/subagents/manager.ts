@@ -662,7 +662,7 @@ class LocalSubagentHandle implements SubagentHandle {
 			// promise so the manager's terminal handler records "aborted" rather
 			// than "failed".
 			this.onAbortRequested();
-			void this.abortRuntime().catch(() => undefined);
+			void this.abortRuntime("disposal").catch(() => undefined);
 		}
 		this.settleOwnership();
 		if (!this.endSettled) {

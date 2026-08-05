@@ -757,27 +757,40 @@ export class AgentSession {
 			const prepared = prepareDelivery
 				? await prepareDelivery(delivery, signal)
 				: { messages: [...delivery.messages] };
-			if (delivery.kind === "prompt" || !prepared.messages.some((message) => message.role === "user")) {
-				return prepared;
-			}
-			const readyPlan = this._planningState.plan?.phase === "ready" ? this._planningState.plan : undefined;
-			if (!readyPlan) return prepared;
 			const messages = prepared.messages;
+			const readyPlan =
+				delivery.kind !== "prompt" &&
+				messages.some((message) => message.role === "user") &&
+				this._planningState.plan?.phase === "ready"
+					? this._planningState.plan
+					: undefined;
 			return {
 				messages,
 				commit: () => {
-					prepared.commit?.();
-					const current = this._planningState.plan;
-					if (
-						current?.phase !== "ready" ||
-						current.id !== readyPlan.id ||
-						current.revision !== readyPlan.revision
-					) {
-						return;
+					// Disposal may run synchronously from a commit observer, before the
+					// delivery_start event can publish this irrevocable admission.
+					this._captureAdmittedDelivery({ deliveryId: delivery.deliveryId, messages });
+					try {
+						prepared.commit?.();
+						if (readyPlan) {
+							const current = this._planningState.plan;
+							if (
+								current?.phase === "ready" &&
+								current.id === readyPlan.id &&
+								current.revision === readyPlan.revision
+							) {
+								const next = this._changeReadyPlanToDraft(readyPlan.id, readyPlan.revision, false);
+								const checkpoint = this._createPlanningCheckpointMessage(next);
+								if (checkpoint) messages.unshift(checkpoint);
+							}
+						}
+					} catch (error) {
+						this._discardAdmittedDelivery(delivery.deliveryId);
+						throw error;
 					}
-					const next = this._changeReadyPlanToDraft(readyPlan.id, readyPlan.revision, false);
-					const checkpoint = this._createPlanningCheckpointMessage(next);
-					if (checkpoint) messages.unshift(checkpoint);
+					// A successful commit may have composed additional messages.
+					this._discardAdmittedDelivery(delivery.deliveryId);
+					this._captureAdmittedDelivery({ deliveryId: delivery.deliveryId, messages });
 				},
 			};
 		};
@@ -1014,7 +1027,15 @@ export class AgentSession {
 	private _persistedTerminalAgentRunId: string | undefined;
 	private _pendingAdmittedDeliveryMessages: Array<{ deliveryId?: string; message: AgentMessage }> = [];
 
-	private _captureAdmittedDelivery(event: Extract<AgentEvent, { type: "delivery_start" }>): void {
+	private _captureAdmittedDelivery(
+		event: Pick<Extract<AgentEvent, { type: "delivery_start" }>, "deliveryId" | "messages">,
+	): void {
+		if (
+			event.deliveryId !== undefined &&
+			this._pendingAdmittedDeliveryMessages.some((pending) => pending.deliveryId === event.deliveryId)
+		) {
+			return;
+		}
 		for (const message of event.messages) {
 			let persistedMessage = message;
 			if (message.role === "user" && message.clientMessageId !== undefined) {
@@ -1036,6 +1057,12 @@ export class AgentSession {
 				message: persistedMessage,
 			});
 		}
+	}
+
+	private _discardAdmittedDelivery(deliveryId: string | undefined): void {
+		this._pendingAdmittedDeliveryMessages = this._pendingAdmittedDeliveryMessages.filter(
+			(pending) => pending.deliveryId !== deliveryId,
+		);
 	}
 
 	private _settleAdmittedDeliveryMessage(deliveryId: string | undefined): void {
@@ -1556,6 +1583,14 @@ export class AgentSession {
 	 */
 	dispose(source: AgentAbortSource = "disposal"): Promise<void> {
 		if (this._disposePromise) {
+			return this._disposePromise;
+		}
+		const deliveryCommitSettled = this.agent.activeDeliveryCommitSettled;
+		if (deliveryCommitSettled) {
+			this._disposePromise = deliveryCommitSettled.then(() => {
+				this._disposePromise = undefined;
+				return this.dispose(source);
+			});
 			return this._disposePromise;
 		}
 		const runBeforeAbort = this.agent.activeRunSnapshot;
@@ -4513,7 +4548,7 @@ export class AgentSession {
 		this._manualCompactionAdmissionInProgress = true;
 		this._disconnectFromAgent();
 		try {
-			await this.abort();
+			await this.abort(this._extensionMode === "rpc" ? "remote_request" : "host_action");
 			assertConversationCurrent();
 		} catch (error) {
 			this._manualCompactionAdmissionInProgress = false;

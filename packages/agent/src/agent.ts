@@ -193,6 +193,7 @@ type ActiveRun = {
 	abortSource?: AgentAbortSource;
 	diagnosticTimestamp?: number;
 	requestAccepted: boolean;
+	deliveryCommitSettled?: Promise<void>;
 	phase: "open" | "terminal_event_settling" | "settled";
 };
 
@@ -376,6 +377,11 @@ export class Agent {
 		return Object.freeze({ runId: run.id, accepted: true, source: run.abortSource });
 	}
 
+	/** Settlement boundary for a synchronous delivery commit callback, if one is running. */
+	get activeDeliveryCommitSettled(): Promise<void> | undefined {
+		return this.activeRun?.deliveryCommitSettled;
+	}
+
 	/** Immutable lifecycle snapshot for structural teardown. */
 	get activeRunSnapshot(): AgentRunSnapshot | undefined {
 		const run = this.activeRun;
@@ -539,7 +545,10 @@ export class Agent {
 				this.pausedState = { requestAuthority, providerRequestPending };
 				return { ...action, requestAuthority };
 			}
-			this.pausedState = undefined;
+			// Keep final-response authority until the completed response reaches the
+			// next dispatcher boundary. A host retry or compaction continuation starts
+			// a fresh core run before that boundary when this request fails.
+			this.pausedState = { requestAuthority, providerRequestPending: true };
 			return { type: "request", reason: "final_response" };
 		}
 
@@ -621,9 +630,29 @@ export class Agent {
 		if (delivery.deliveryId === undefined) return true;
 		if (!this.activeLease?.owns(delivery.deliveryId)) return true;
 		const commit = this.preparedDeliveryCommits.get(delivery.deliveryId);
-		if (!this.activeLease.begin(delivery.deliveryId, commit)) return false;
-		this.preparedDeliveryCommits.delete(delivery.deliveryId);
-		return true;
+		const run = this.activeRun;
+		const requestWasAccepted = run?.requestAccepted ?? false;
+		let settleDeliveryCommit = (): void => undefined;
+		if (run) {
+			run.requestAccepted = true;
+			run.deliveryCommitSettled = new Promise<void>((resolve) => {
+				settleDeliveryCommit = resolve;
+			});
+		}
+		try {
+			if (!this.activeLease.begin(delivery.deliveryId, commit)) {
+				if (run && this.activeRun === run) run.requestAccepted = requestWasAccepted;
+				return false;
+			}
+			this.preparedDeliveryCommits.delete(delivery.deliveryId);
+			return true;
+		} catch (error) {
+			if (run && this.activeRun === run) run.requestAccepted = requestWasAccepted;
+			throw error;
+		} finally {
+			settleDeliveryCommit();
+			if (run && this.activeRun === run) run.deliveryCommitSettled = undefined;
+		}
 	}
 
 	private rollbackActiveLease(): void {

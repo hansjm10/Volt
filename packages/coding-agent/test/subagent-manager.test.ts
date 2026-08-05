@@ -2118,12 +2118,14 @@ describe("SubagentManager", () => {
 		await worker.dispose();
 	});
 
-	it("records accepted runs disposed before completion as aborted in the registry", async () => {
+	it("records accepted retained runs disposed before completion with disposal provenance", async () => {
 		const responseStarted = createDeferred();
 		const finishResponse = createDeferred();
+		let childRuntime: SubagentRuntimeCreatedEvent["runtime"] | undefined;
 		const resourceLoader = createSubagentResourceLoader([createDefinition({ name: "researcher" })]);
 		const { manager } = await createTestManager({
 			resourceLoader,
+			retainRuntimeOnDispose: true,
 			responses: [
 				async () => {
 					responseStarted.resolve();
@@ -2131,8 +2133,14 @@ describe("SubagentManager", () => {
 					return fauxAssistantMessage("late response");
 				},
 			],
+			onRuntimeCreated: (event) => {
+				childRuntime = event.runtime;
+			},
 		});
-		cleanups.push(() => finishResponse.resolve());
+		cleanups.push(async () => {
+			finishResponse.resolve();
+			await childRuntime?.dispose();
+		});
 
 		const handle = await manager.startByName("researcher");
 		await handle.prompt("run accepted child");
@@ -2140,10 +2148,17 @@ describe("SubagentManager", () => {
 		const disposal = handle.dispose();
 		finishResponse.resolve();
 		await disposal;
+		if (!childRuntime) throw new Error("expected retained child runtime");
+		await childRuntime.session.waitForIdle();
 
 		expect(manager.listDelegations()).toEqual([
 			expect.objectContaining({ agent: { name: "researcher", source: "user" }, status: "aborted" }),
 		]);
+		expect(childRuntime.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
+		});
 	});
 
 	it("lists only definitions allowed by the current delegation policy", async () => {

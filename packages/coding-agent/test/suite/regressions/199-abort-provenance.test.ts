@@ -1,5 +1,5 @@
 import { type AssistantMessage, fauxAssistantMessage } from "@hansjm10/volt-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHarness, type Harness } from "../harness.ts";
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -210,6 +210,83 @@ describe("regression #199: abort provenance persistence", () => {
 			stopReason: "aborted",
 			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
 		});
+	});
+
+	it("persists a delivery when disposal runs inside its commit callback", async () => {
+		let harness: Harness;
+		let disposal: Promise<void> | undefined;
+		harness = await createHarness({
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				commit: () => {
+					disposal = harness.session.dispose("disposal");
+				},
+			}),
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("never requested")]);
+
+		await harness.session.prompt("commit before disposal", {
+			clientMessageId: "dispose-during-delivery-commit",
+		});
+		await disposal;
+
+		const messages = harness.sessionManager.buildSessionContext().messages;
+		expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+		expect(messages[0]).toMatchObject({
+			role: "user",
+			clientMessageId: "dispose-during-delivery-commit",
+			content: [{ type: "text", text: "commit before disposal" }],
+		});
+		expect(messages[1]).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
+		});
+	});
+
+	it("does not retain delivery admission when a disposing commit fails", async () => {
+		let harness: Harness;
+		let disposal: Promise<void> | undefined;
+		harness = await createHarness({
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				commit: () => {
+					disposal = harness.session.dispose("disposal");
+					throw new Error("delivery commit failed");
+				},
+			}),
+		});
+		harnesses.push(harness);
+
+		await harness.session.prompt("do not admit this delivery");
+		await disposal;
+
+		expect(harness.sessionManager.buildSessionContext().messages).toEqual([]);
+	});
+
+	it("attributes manual compaction cancellation to the local host action", async () => {
+		const responseStarted = deferred();
+		const finishResponse = deferred();
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				responseStarted.resolve();
+				await finishResponse.promise;
+				return fauxAssistantMessage("late response");
+			},
+		]);
+		const abortSpy = vi.spyOn(harness.session.agent, "abort");
+
+		const prompt = harness.session.prompt("compact this active run");
+		await responseStarted.promise;
+		const compaction = harness.session.compact();
+		finishResponse.resolve();
+		await prompt;
+		await compaction.catch(() => undefined);
+
+		expect(abortSpy).toHaveBeenCalledWith("host_action");
 	});
 
 	it("deduplicates disposal against a terminal message_end still settling", async () => {
