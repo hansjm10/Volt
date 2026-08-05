@@ -412,7 +412,7 @@ describe("regression #199: approved plan finalization", () => {
 		).toHaveLength(1);
 	});
 
-	it("preserves committed prompt preparation when abort revokes its failed delivery", async () => {
+	it("retains committed prompt preparation until abort can canonicalize its failed delivery", async () => {
 		let predecessorCommits = 0;
 		const harness = await createHarness({
 			prepareDelivery: (delivery) => {
@@ -445,9 +445,10 @@ describe("regression #199: approved plan finalization", () => {
 		expect(predecessorCommits).toBe(1);
 
 		await harness.session.abort("host_action");
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
 		failDraftPersistence = false;
-		await harness.session.dispose("disposal");
+		await harness.session.abort("host_action");
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
 
 		expect(harness.session.planningState.plan?.phase).toBe("draft");
 		const messages = harness.sessionManager.buildSessionContext().messages;

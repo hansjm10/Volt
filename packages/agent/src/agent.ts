@@ -177,6 +177,12 @@ export type AgentEventListener =
 
 type PendingDelivery = InboxDelivery<AgentDeliveryKind, AgentMessage>;
 
+type RetainedHostAction = {
+	type: "request";
+	reason: Extract<AgentLoopNextAction, { type: "request" }>["reason"];
+	deliveries: Array<{ deliveryId: string; messages: AgentMessage[] }>;
+};
+
 type DispatcherStartState = {
 	firstDecision: boolean;
 	requestAuthority: AgentRequestAuthority;
@@ -211,6 +217,8 @@ export class Agent {
 	);
 	private activeLease?: DeliveryLease<AgentDeliveryKind, AgentMessage>;
 	private readonly preparedDeliveryCommits = new Map<string, () => void>();
+	/** Hook-supplied work retained from action resolution through each irrevocable begin. */
+	private retainedHostAction?: RetainedHostAction;
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
 	private pausedState?: Pick<DispatcherStartState, "requestAuthority" | "providerRequestPending">;
@@ -349,6 +357,24 @@ export class Agent {
 		return [...this.clearSteeringQueue(), ...this.clearFollowUpQueue()];
 	}
 
+	/** Dispatcher identities for initial prompts whose delivery has not committed. */
+	getPendingPromptDeliveryIds(): string[] {
+		return this.inbox.list("prompt").map((delivery) => delivery.deliveryId);
+	}
+
+	/** Dispatcher identities for hook-supplied deliveries whose begin boundary has not committed. */
+	getRetainedHostDeliveryIds(): string[] {
+		return this.retainedHostAction?.deliveries.map((delivery) => delivery.deliveryId) ?? [];
+	}
+
+	/** Discard hook-supplied deliveries whose begin boundary has not committed. */
+	discardRetainedHostDeliveries(): string[] {
+		const deliveryIds = this.getRetainedHostDeliveryIds();
+		for (const deliveryId of deliveryIds) this.preparedDeliveryCommits.delete(deliveryId);
+		this.retainedHostAction = undefined;
+		return deliveryIds;
+	}
+
 	/** Discard an initial prompt whose delivery has not committed. */
 	discardPendingPrompt(): string[] {
 		return this.clearDeliveries("prompt");
@@ -422,6 +448,7 @@ export class Agent {
 		this.inbox.reset();
 		this.activeLease = undefined;
 		this.preparedDeliveryCommits.clear();
+		this.retainedHostAction = undefined;
 		this.pausedState = undefined;
 	}
 
@@ -437,6 +464,11 @@ export class Agent {
 		if (this.inbox.hasPending("prompt")) {
 			throw new Error(
 				"Agent has a retained prompt. Call continue() to resume it or discardPendingPrompt() to cancel it.",
+			);
+		}
+		if (this.retainedHostAction) {
+			throw new Error(
+				"Agent has retained host deliveries. Call continue() to resume them before starting a prompt.",
 			);
 		}
 		this.pausedState = undefined;
@@ -576,7 +608,9 @@ export class Agent {
 					? runtimeAction
 					: { type: "stop" };
 		const hookContext = { ...context, requestAuthority, defaultAction: suggestedAction };
-		const action = this.nextAction ? await this.nextAction(hookContext, this.signal) : suggestedAction;
+		let hostAction = this.retainedHostAction;
+		let action: AgentLoopNextAction =
+			hostAction ?? (this.nextAction ? await this.nextAction(hookContext, this.signal) : suggestedAction);
 		if (action.type === "pause") {
 			this.pausedState = {
 				requestAuthority: action.requestAuthority ?? requestAuthority,
@@ -588,11 +622,22 @@ export class Agent {
 			this.pausedState = undefined;
 			return action;
 		}
+		if (!hostAction && action.deliveries && action.deliveries.length > 0) {
+			hostAction = {
+				type: "request",
+				reason: action.reason,
+				deliveries: action.deliveries.map((delivery) => ({
+					deliveryId: `host-delivery:${globalThis.crypto.randomUUID()}`,
+					messages: delivery.messages.slice(),
+				})),
+			};
+			this.retainedHostAction = hostAction;
+			action = hostAction;
+		}
 
 		this.pausedState = undefined;
 		const leasedDeliveries = selected.length > 0 ? await this.prepareLeasedDeliveries(selected) : [];
-		const hostDeliveries =
-			action.deliveries && action.deliveries.length > 0 ? await this.prepareHostDeliveries(action.deliveries) : [];
+		const hostDeliveries = hostAction ? await this.prepareHostDeliveries(hostAction.deliveries) : [];
 		const deliveries = [...leasedDeliveries, ...hostDeliveries];
 		return {
 			type: "request",
@@ -643,21 +688,21 @@ export class Agent {
 		return deliveries;
 	}
 
-	private async prepareHostDeliveries(deliveries: AgentLoopDelivery[]): Promise<AgentLoopDelivery[]> {
+	private async prepareHostDeliveries(deliveries: RetainedHostAction["deliveries"]): Promise<AgentLoopDelivery[]> {
+		const preparedDeliveries: AgentLoopDelivery[] = [];
 		for (const delivery of deliveries) {
-			const deliveryId = delivery.deliveryId ?? `host-delivery:${globalThis.crypto.randomUUID()}`;
 			let preparation: AgentDeliveryPreparation;
 			try {
 				preparation = this.prepareDelivery
 					? await this.prepareDelivery(
 							{
-								deliveryId,
+								deliveryId: delivery.deliveryId,
 								kind: "host",
-								messages: delivery.messages,
+								messages: delivery.messages.slice(),
 							},
 							this.signal,
 						)
-					: { messages: delivery.messages };
+					: { messages: delivery.messages.slice() };
 			} catch (error) {
 				this._lastRunFailedDeliveryKind = "host";
 				throw error;
@@ -666,24 +711,28 @@ export class Agent {
 				this._lastRunFailedDeliveryKind = "host";
 				throw new Error("prepareDelivery must retain at least one message for an admitted delivery");
 			}
-			delivery.deliveryId = deliveryId;
-			delivery.messages = preparation.messages;
 			if (preparation.commit) {
-				this.preparedDeliveryCommits.set(deliveryId, preparation.commit);
+				this.preparedDeliveryCommits.set(delivery.deliveryId, preparation.commit);
 			}
+			preparedDeliveries.push({
+				deliveryId: delivery.deliveryId,
+				messages: preparation.messages,
+			});
 		}
-		return deliveries;
+		return preparedDeliveries;
 	}
 
 	private beginActiveDelivery(delivery: AgentLoopDelivery): boolean {
 		const deliveryId = delivery.deliveryId;
 		if (deliveryId === undefined) return true;
 		const ownsLeasedDelivery = this.activeLease?.owns(deliveryId) === true;
+		const ownsHostDelivery =
+			this.retainedHostAction?.deliveries.some((candidate) => candidate.deliveryId === deliveryId) === true;
 		const deliveryKind = ownsLeasedDelivery
 			? this.activeLease?.deliveries.find((candidate) => candidate.deliveryId === deliveryId)?.kind
 			: "host";
 		const commit = this.preparedDeliveryCommits.get(deliveryId);
-		if (!ownsLeasedDelivery && commit === undefined) return true;
+		if (!ownsLeasedDelivery && !ownsHostDelivery) return true;
 		const run = this.activeRun;
 		const requestWasAccepted = run?.requestAccepted ?? false;
 		let settleDeliveryCommit = (): void => undefined;
@@ -700,6 +749,12 @@ export class Agent {
 			}
 			if (!ownsLeasedDelivery) commit?.();
 			this.preparedDeliveryCommits.delete(deliveryId);
+			if (ownsHostDelivery && this.retainedHostAction) {
+				const deliveries = this.retainedHostAction.deliveries.filter(
+					(candidate) => candidate.deliveryId !== deliveryId,
+				);
+				this.retainedHostAction = deliveries.length === 0 ? undefined : { ...this.retainedHostAction, deliveries };
+			}
 			return true;
 		} catch (error) {
 			this._lastRunFailedDeliveryKind = deliveryKind;

@@ -516,6 +516,8 @@ export class AgentSession {
 	private _agentEventFatalError: Error | undefined;
 	/** Predecessor commit output retained until later composition retries or teardown makes it canonical. */
 	private readonly _committedDeliveryPreparationMessages = new Map<string, AgentMessage[]>();
+	/** Identified inputs awaiting the durability watermark of promoted preparation. */
+	private readonly _committedDeliveryPreparationClientIds = new Map<string, Set<string>>();
 	private _extensionCommandTransactions = new Set<symbol>();
 	private _activeExtensionCommandHandlers = 0;
 
@@ -797,7 +799,11 @@ export class AgentSession {
 		const nextAction = this.agent.nextAction;
 		this.agent.nextAction = async (context, signal) => {
 			if (this._proactiveCompactionResumeAction) {
-				return this._proactiveCompactionResumeAction;
+				const action = this._proactiveCompactionResumeAction;
+				// Once handed back to agent-core, dispatcher ownership retains the
+				// action through preparation and begin failures.
+				this._proactiveCompactionResumeAction = undefined;
+				return action;
 			}
 			const action = nextAction ? await nextAction(context, signal) : context.defaultAction;
 			const resolvedAction = this._resolveProactiveCompactionAction(context, action);
@@ -1089,6 +1095,66 @@ export class AgentSession {
 				continue;
 			}
 			this._captureAdmittedDelivery({ deliveryId, messages });
+		}
+	}
+
+	/** Promote irreversible predecessor output before abort can revoke its source delivery. */
+	private async _canonicalizeCommittedDeliveryPreparations(deliveryIds: readonly string[]): Promise<boolean> {
+		const retainedDeliveryIds = deliveryIds.filter((deliveryId) =>
+			this._committedDeliveryPreparationMessages.has(deliveryId),
+		);
+		if (retainedDeliveryIds.length === 0) return true;
+		try {
+			for (const deliveryId of retainedDeliveryIds) {
+				const messages = this._committedDeliveryPreparationMessages.get(deliveryId);
+				if (!messages) continue;
+				if (messages.length > 0) {
+					this._prepareUserDelivery({ messages }).commit?.();
+				}
+				this._discardAdmittedDelivery(deliveryId);
+				while (messages.length > 0) {
+					const message = messages[0]!;
+					if (message.role === "user" && message.clientMessageId !== undefined) {
+						const record = this.sessionManager.getClientInput(message.clientMessageId);
+						if (record?.state === "accepted") {
+							this.sessionManager.transitionClientInput(message.clientMessageId, "started");
+						}
+						const clientIds = this._committedDeliveryPreparationClientIds.get(deliveryId) ?? new Set();
+						clientIds.add(message.clientMessageId);
+						this._committedDeliveryPreparationClientIds.set(deliveryId, clientIds);
+						const operation = this._liveClientInputs.get(message.clientMessageId);
+						if (operation) operation.queued = false;
+					}
+					if (message.role === "custom") {
+						this.sessionManager.appendCustomMessageEntry(
+							message.customType,
+							message.content,
+							message.display,
+							message.details,
+						);
+					} else if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
+						this.sessionManager.appendMessage(message);
+					}
+					this.agent.state.messages.push(message);
+					this._emitCommittedEvent({ type: "message_start", message });
+					this._emitCommittedEvent({ type: "message_end", message });
+					messages.shift();
+				}
+			}
+			await this.sessionManager.flush();
+			for (const deliveryId of retainedDeliveryIds) {
+				if (this._committedDeliveryPreparationMessages.get(deliveryId)?.length !== 0) continue;
+				for (const clientMessageId of this._committedDeliveryPreparationClientIds.get(deliveryId) ?? []) {
+					this._completeLiveClientInput(clientMessageId, "admitted");
+				}
+				this._committedDeliveryPreparationClientIds.delete(deliveryId);
+				this._committedDeliveryPreparationMessages.delete(deliveryId);
+			}
+			return true;
+		} catch {
+			// Keep both the retained delivery and the remaining transaction. A later
+			// abort or disposal may retry it, while fresh input remains fenced.
+			return false;
 		}
 	}
 
@@ -3368,6 +3434,9 @@ export class AgentSession {
 		if (this._disposed) {
 			throw new Error("Cannot prompt a disposed session");
 		}
+		if (this._committedDeliveryPreparationMessages.size > 0) {
+			throw new Error("Cannot prompt while committed delivery preparation remains unsettled");
+		}
 		if (this._hasSessionOperationBarrier) {
 			throw new Error("Cannot prompt while a session mutation is active");
 		}
@@ -3807,6 +3876,9 @@ export class AgentSession {
 		if (this._disposed) {
 			throw new Error("Cannot queue input on a disposed session");
 		}
+		if (this._committedDeliveryPreparationMessages.size > 0) {
+			throw new Error("Cannot queue input while committed delivery preparation remains unsettled");
+		}
 		if (this._hasSessionOperationBarrier) {
 			throw new Error("Cannot queue input while a session mutation is active");
 		}
@@ -3852,6 +3924,9 @@ export class AgentSession {
 	async followUp(text: string, images?: ImageContent[], clientMessageId?: string): Promise<void> {
 		if (this._disposed) {
 			throw new Error("Cannot queue input on a disposed session");
+		}
+		if (this._committedDeliveryPreparationMessages.size > 0) {
+			throw new Error("Cannot queue input while committed delivery preparation remains unsettled");
 		}
 		if (this._hasSessionOperationBarrier) {
 			throw new Error("Cannot queue input while a session mutation is active");
@@ -4275,9 +4350,6 @@ export class AgentSession {
 	 */
 	abort(source?: AgentAbortSource): Promise<void> {
 		this.agent.abort(source);
-		// Revoking an uncommitted prompt does not revoke predecessor work whose
-		// preparation commit already succeeded. Retain it for canonical teardown.
-		this.agent.discardPendingPrompt();
 		this._proactiveCompactionResumeAction = undefined;
 		if (this._abortPromise) {
 			return this._abortPromise;
@@ -4285,8 +4357,21 @@ export class AgentSession {
 		this._abortGeneration += 1;
 		this.abortRetry();
 		this.abortCompaction();
-		const idlePromise = this.waitForIdle();
-		const abortPromise = idlePromise.finally(() => {
+		let abortPromise!: Promise<void>;
+		abortPromise = (async () => {
+			await this.waitForIdle();
+			// A predecessor commit is irreversible. Couple it to planning and
+			// canonical persistence before revoking the delivery it prepared. If that
+			// still fails, leave the delivery retained so fresh input cannot overtake it.
+			const revocableDeliveryIds = [
+				...this.agent.getPendingPromptDeliveryIds(),
+				...this.agent.getRetainedHostDeliveryIds(),
+			];
+			if (await this._canonicalizeCommittedDeliveryPreparations(revocableDeliveryIds)) {
+				this.agent.discardPendingPrompt();
+				this.agent.discardRetainedHostDeliveries();
+			}
+		})().finally(() => {
 			if (this._abortPromise === abortPromise) {
 				this._abortPromise = undefined;
 			}
