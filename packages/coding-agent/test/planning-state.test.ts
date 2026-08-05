@@ -194,6 +194,229 @@ describe("native planning state", () => {
 		session.dispose();
 	});
 
+	it("routes direct feedback for a ready Build plan through the Plan delivery seam", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({ steps: [{ text: "Implement the approved change" }] });
+		const researchCall = {
+			type: "toolCall" as const,
+			id: "direct-feedback-research",
+			name: "ls",
+			arguments: { path: "." },
+		};
+		expect(
+			await session.agent.beforeToolCall?.({
+				toolCall: researchCall,
+				args: researchCall.arguments,
+			} as never),
+		).toBeUndefined();
+		await session.agent.afterToolCall?.({
+			toolCall: researchCall,
+			args: researchCall.arguments,
+			result: { content: [{ type: "text", text: "files" }] },
+			isError: false,
+		} as never);
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Approved change",
+			summary: "Implement the approved change.",
+		});
+		await session.setAgentMode("build");
+		expect(session.planningState.plan).toMatchObject({ id: ready.id, phase: "ready" });
+
+		let requestTools: string[] = [];
+		session.agent.streamFn = (_model, context) => {
+			requestTools = (context.tools ?? []).map((tool) => tool.name);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					seq: 1,
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "I will revise it." }], "stop"),
+				});
+			});
+			return stream;
+		};
+
+		await session.prompt("Revise the approved plan");
+
+		expect(session.planningState).toMatchObject({
+			mode: "plan",
+			plan: { id: ready.id, phase: "draft", revision: ready.revision + 1 },
+		});
+		expect(requestTools).toContain("update_plan");
+		expect(requestTools).not.toContain("mutate_everything");
+		const feedbackIndex = session.messages.findIndex(
+			(message) =>
+				message.role === "user" &&
+				Array.isArray(message.content) &&
+				message.content.some((content) => content.type === "text" && content.text === "Revise the approved plan"),
+		);
+		expect(session.messages[feedbackIndex - 1]).toMatchObject({
+			role: "custom",
+			customType: "volt-plan-checkpoint",
+			content: expect.stringContaining("Phase: draft"),
+		});
+		await session.dispose();
+	});
+
+	it("keeps ready planning state unchanged when queued feedback is revoked during preparation", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({ steps: [{ text: "Keep the approved change" }] });
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Approved change",
+			summary: "Keep the approved change.",
+		});
+		await session.setAgentMode("build");
+		session.agent.state.messages = [createAssistantMessage([{ type: "text", text: "Build tail" }], "stop")];
+		await session.steer("Revoke this feedback");
+		let clearResult: Promise<{ steering: string[]; followUp: string[] }> | undefined;
+		let providerCalls = 0;
+		session.agent.streamFn = () => {
+			providerCalls++;
+			throw new Error("provider must not run");
+		};
+		const prepareDelivery = session.agent.prepareDelivery;
+		session.agent.prepareDelivery = async (delivery, signal) => {
+			const preparation = prepareDelivery
+				? await prepareDelivery(delivery, signal)
+				: { messages: [...delivery.messages] };
+			clearResult = session.clearQueue();
+			return preparation;
+		};
+
+		await session.agent.continue();
+		expect(await clearResult).toEqual({ steering: ["Revoke this feedback"], followUp: [] });
+		expect(providerCalls).toBe(0);
+		expect(session.planningState).toMatchObject({
+			mode: "build",
+			plan: { id: ready.id, revision: ready.revision, phase: "ready" },
+		});
+		expect(session.messages).not.toContainEqual(
+			expect.objectContaining({
+				customType: "volt-plan-checkpoint",
+				content: expect.stringContaining("Phase: draft"),
+			}),
+		);
+		await session.dispose();
+	});
+
+	it("keeps begun plan feedback authoritative through planning and checkpoint observers", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({ steps: [{ text: "Revise after approval" }] });
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Approved change",
+			summary: "Revise after approval.",
+		});
+		await session.setAgentMode("build");
+		session.agent.state.messages = [createAssistantMessage([{ type: "text", text: "Build tail" }], "stop")];
+		await session.steer("Committed feedback");
+		const clearResults: Array<Promise<{ steering: string[]; followUp: string[] }>> = [];
+		session.subscribe((event) => {
+			if (event.type === "planning_state_changed") {
+				clearResults.push(session.clearQueue());
+			}
+			if (
+				event.type === "message_start" &&
+				event.message.role === "custom" &&
+				event.message.customType === "volt-plan-checkpoint"
+			) {
+				clearResults.push(session.clearQueue());
+			}
+		});
+		session.agent.streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					seq: 1,
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "Revising" }], "stop"),
+				});
+			});
+			return stream;
+		};
+
+		await session.agent.continue();
+		expect(await Promise.all(clearResults)).toEqual([
+			{ steering: [], followUp: [] },
+			{ steering: [], followUp: [] },
+		]);
+		expect(session.planningState).toMatchObject({
+			mode: "plan",
+			plan: { id: ready.id, revision: ready.revision + 1, phase: "draft" },
+		});
+		const feedbackIndex = session.messages.findIndex(
+			(message) =>
+				message.role === "user" &&
+				Array.isArray(message.content) &&
+				message.content.some((part) => part.type === "text" && part.text === "Committed feedback"),
+		);
+		expect(session.messages[feedbackIndex - 1]).toMatchObject({
+			role: "custom",
+			customType: "volt-plan-checkpoint",
+			content: expect.stringContaining("Phase: draft"),
+		});
+		await session.dispose();
+	});
+
+	it("commits one ready-plan transition when an all-mode batch admits multiple feedback deliveries", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({ steps: [{ text: "Revise the approved change" }] });
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Approved change",
+			summary: "Revise the approved change.",
+		});
+		await session.setAgentMode("build");
+		session.agent.state.messages = [createAssistantMessage([{ type: "text", text: "Build tail" }], "stop")];
+		session.agent.steeringMode = "all";
+		await session.steer("First revision request");
+		await session.steer("Second revision request");
+		const providerUserTexts: string[] = [];
+		let providerCalls = 0;
+		session.agent.streamFn = (_model, context) => {
+			providerCalls++;
+			providerUserTexts.push(
+				...context.messages.flatMap((message) => {
+					if (message.role !== "user") return [];
+					if (typeof message.content === "string") return [message.content];
+					return message.content.flatMap((part) => (part.type === "text" ? [part.text] : []));
+				}),
+			);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					seq: 1,
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "Revising both requests" }], "stop"),
+				});
+			});
+			return stream;
+		};
+
+		await session.agent.continue();
+
+		expect(providerCalls).toBe(1);
+		expect(
+			providerUserTexts.filter((text) => text === "First revision request" || text === "Second revision request"),
+		).toEqual(["First revision request", "Second revision request"]);
+		expect(session.planningState).toMatchObject({
+			mode: "plan",
+			plan: { id: ready.id, phase: "draft", revision: ready.revision + 1 },
+		});
+		expect(session.agent.state.errorMessage).toBeUndefined();
+		expect(session.getSteeringMessages()).toEqual([]);
+		await session.dispose();
+	});
+
 	it.each(["steer", "followUp"] as const)(
 		"returns queued %s feedback to draft and preserves same-generation research",
 		async (streamingBehavior) => {
@@ -477,8 +700,9 @@ describe("native planning state", () => {
 			await run;
 
 			expect(request).toBe(4);
-			expect(requestContexts[0]!.tools).toContain("mutate_everything");
-			expect(requestContexts[0]!.tools).not.toContain("update_plan");
+			expect(requestContexts[0]!.systemPrompt).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
+			expect(requestContexts[0]!.tools).toContain("update_plan");
+			expect(requestContexts[0]!.tools).not.toContain("mutate_everything");
 			expect(requestContexts[1]!.systemPrompt).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
 			expect(requestContexts[1]!.tools).toContain("update_plan");
 			expect(requestContexts[1]!.tools).toContain("submit_plan");

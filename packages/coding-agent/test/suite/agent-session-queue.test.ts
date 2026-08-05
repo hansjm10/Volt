@@ -113,6 +113,40 @@ describe("AgentSession queue characterization", () => {
 		expect(commandRuns).toBe(0);
 	});
 
+	it("does not replay an initial prompt canceled during agent_start with the next prompt", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("replacement response")]);
+		let cancellation: Promise<void> | undefined;
+		const unsubscribe = harness.session.agent.subscribe((event) => {
+			if (event.type !== "agent_start" || cancellation) return;
+			cancellation = harness.session.abort();
+		});
+
+		await harness.session.prompt("canceled prompt");
+		await cancellation;
+		unsubscribe();
+		await harness.session.prompt("replacement prompt");
+
+		expect(getUserTexts(harness)).toEqual(["replacement prompt"]);
+		expect(getAssistantTexts(harness)).toEqual(["replacement response"]);
+	});
+
+	it("discards an unbegun initial prompt during disposal", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let disposal: Promise<void> | undefined;
+		harness.session.agent.subscribe((event) => {
+			if (event.type !== "agent_start" || disposal) return;
+			disposal = harness.session.dispose();
+		});
+
+		await harness.session.prompt("canceled by disposal");
+		await disposal;
+
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+	});
+
 	it("does not start a public custom turn after its generation is aborted", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

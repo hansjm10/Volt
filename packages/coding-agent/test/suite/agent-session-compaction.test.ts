@@ -12,7 +12,7 @@ import { createHarness, type Harness } from "./harness.ts";
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
 	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
-	_shouldStopForProactiveCompaction: (context: unknown) => boolean;
+	_resolveProactiveCompactionAction: (context: unknown, action: { type: "request"; reason: "delivery" }) => unknown;
 	_handlePostAgentRun: () => Promise<boolean>;
 	_lastAssistantMessage: AssistantMessage | undefined;
 	_proactiveCompactionState: "idle" | "scheduled" | "compacting";
@@ -440,7 +440,7 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it.each(["plain response", "stopping tool batch"] as const)(
-		"stops for proactive compaction after a %s when a message is queued",
+		"pauses for proactive compaction after a %s when a message is queued",
 		async (kind) => {
 			const harness = await createHarness();
 			harnesses.push(harness);
@@ -474,18 +474,21 @@ describe("AgentSession compaction characterization", () => {
 
 			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 			expect(
-				sessionInternals._shouldStopForProactiveCompaction({
-					completedTurn: {
-						message,
-						toolResults,
-						disposition: kind === "stopping tool batch" ? "stop" : "continue",
+				sessionInternals._resolveProactiveCompactionAction(
+					{
+						completedTurn: {
+							message,
+							toolResults,
+							disposition: kind === "stopping tool batch" ? "stop" : "continue",
+						},
+						requestAuthority: "provider",
+						defaultAction: { type: "stop" },
+						context: { systemPrompt: "", messages: [message, ...toolResults], tools: [] },
+						newMessages: [],
 					},
-					requestAuthority: "provider",
-					defaultAction: { type: "stop" },
-					context: { systemPrompt: "", messages: [message, ...toolResults], tools: [] },
-					newMessages: [],
-				}),
-			).toBe(true);
+					{ type: "request", reason: "delivery" },
+				),
+			).toEqual({ type: "pause" });
 		},
 	);
 

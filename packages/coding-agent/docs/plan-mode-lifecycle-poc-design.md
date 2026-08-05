@@ -72,6 +72,16 @@ Canonical state reaches the model through append-only context:
 
 This preserves Codex WebSocket continuation and provider prefix caching during ordinary planning and execution turns. Mode, phase, or tool-policy boundaries may still cause one intentional cache miss.
 
+## User-feedback delivery
+
+Direct prompts, steering, and follow-ups use the same Agent delivery inbox. Runtime delivery IDs identify queue admission and commit independently of external `clientMessageId` values, which remain unchanged for canonical persistence and client idempotency.
+
+Ready-plan feedback uses one staged transaction for direct prompts, steering, and follow-ups. Delivery preparation captures the ready revision without mutating planning state or composing a checkpoint. Synchronous delivery begin then transfers ownership, commits one ready-to-draft transition for the admitted batch, rebuilds the Plan tool surface, and prefixes one checkpoint before the first user message. Feedback revoked before begin leaves the ready plan and transcript unchanged; feedback observed after `delivery_start` is authoritative.
+
+System-prompt ownership remains separate across that transition. `before_agent_start` may supply one logical-invocation override; tool and planning rebuilds update only the host base, then one composer reapplies the invocation override and trusted Plan policy for every provider request and automatic continuation.
+
+Preparation alone does not remove an admitted message. The shared delivery inbox keeps entries queued or leased and revocable until a synchronous begin operation atomically transfers ownership. Queue clearing returns exact revoked runtime IDs; preparation failure rolls back only unbegun leases ahead of concurrently admitted work. Abort, disposal, queue clearing, and tree-generation fences retain their durable admission semantics without repurposing external client IDs.
+
 ## Deliberately deferred
 
 This POC does not yet add:
