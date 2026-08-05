@@ -839,12 +839,22 @@ export class Agent {
 				}
 				const previousEvent = emittedEvent;
 				emittedEvent = this.decorateRuntimeAbort({ ...emittedEvent, message: replacement }, previousEvent);
+			} else {
+				// Cancellation can land while this listener is awaited. Make its
+				// provenance visible to every later listener, even without replacement.
+				emittedEvent = this.decorateRuntimeAbort(emittedEvent);
 			}
 		}
 
 		if (emittedEvent.type === "message_end") {
-			this._state.messages.push(emittedEvent.message);
-			return emittedEvent.message;
+			// An abort can be accepted while an awaited listener settles without
+			// returning a replacement. Re-canonicalize at the persistence boundary.
+			const finalizedEvent = this.decorateRuntimeAbort(emittedEvent);
+			if (finalizedEvent.type !== "message_end") {
+				throw new Error("Runtime abort decoration changed the event type");
+			}
+			this._state.messages.push(finalizedEvent.message);
+			return finalizedEvent.message;
 		}
 		if (emittedEvent.type === "agent_end" && this.activeRun) {
 			this.activeRun.phase = "settled";
@@ -868,7 +878,7 @@ export class Agent {
 					)
 				: false;
 		if (
-			(message.stopReason !== "aborted" && !previousOwnedDiagnostic) ||
+			(message.stopReason !== "aborted" && !previousOwnedDiagnostic && run?.phase !== "terminal_event_settling") ||
 			!run?.abortController.signal.aborted ||
 			run.abortSource === undefined ||
 			run.diagnosticTimestamp === undefined

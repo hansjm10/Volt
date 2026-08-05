@@ -1012,6 +1012,36 @@ export class AgentSession {
 	private _agentConversationMutationInFlight = false;
 	private _activeAgentRunId: string | undefined;
 	private _persistedTerminalAgentRunId: string | undefined;
+	private _pendingAdmittedDeliveryMessages: Array<{ deliveryId?: string; message: AgentMessage }> = [];
+
+	private _captureAdmittedDelivery(event: Extract<AgentEvent, { type: "delivery_start" }>): void {
+		for (const message of event.messages) {
+			let persistedMessage = message;
+			if (message.role === "user" && message.clientMessageId !== undefined) {
+				const queuedEntry = [...this._steeringMessages, ...this._followUpMessages].find(
+					(entry) => entry.queueEntryId === message.clientMessageId,
+				);
+				if (queuedEntry) {
+					const normalizedMessage = { ...message } as AgentMessage & { clientMessageId?: string };
+					if (queuedEntry.clientMessageId === undefined) {
+						delete normalizedMessage.clientMessageId;
+					} else {
+						normalizedMessage.clientMessageId = queuedEntry.clientMessageId;
+					}
+					persistedMessage = normalizedMessage;
+				}
+			}
+			this._pendingAdmittedDeliveryMessages.push({
+				...(event.deliveryId === undefined ? {} : { deliveryId: event.deliveryId }),
+				message: persistedMessage,
+			});
+		}
+	}
+
+	private _settleAdmittedDeliveryMessage(deliveryId: string | undefined): void {
+		const index = this._pendingAdmittedDeliveryMessages.findIndex((message) => message.deliveryId === deliveryId);
+		if (index !== -1) this._pendingAdmittedDeliveryMessages.splice(index, 1);
+	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<AgentMessage | undefined> => {
@@ -1019,6 +1049,10 @@ export class AgentSession {
 		if (event.type === "agent_start") {
 			this._activeAgentRunId = this.agent.activeRunSnapshot?.runId;
 			this._persistedTerminalAgentRunId = undefined;
+			this._pendingAdmittedDeliveryMessages = [];
+		}
+		if (event.type === "delivery_start") {
+			this._captureAdmittedDelivery(event);
 		}
 		if (event.type === "agent_end") {
 			// All message/tool persistence for this run precedes agent_end. A branch
@@ -1169,22 +1203,38 @@ export class AgentSession {
 			normalizedEvent.message.clientMessageId !== undefined
 				? { ...replacement, clientMessageId: normalizedEvent.message.clientMessageId }
 				: replacement;
-		const canonicalRuntimeAbort =
+		const runSnapshot = this.agent.activeRunSnapshot;
+		const normalizedAssistantMessage =
 			normalizedEvent.type === "message_end" && normalizedEvent.message.role === "assistant"
-				? normalizedEvent.message.diagnostics?.find((diagnostic) => diagnostic.type === "runtime_abort")
+				? normalizedEvent.message
 				: undefined;
+		const canonicalRuntimeAbort = normalizedAssistantMessage
+			? (normalizedAssistantMessage.diagnostics?.find((diagnostic) => diagnostic.type === "runtime_abort") ??
+				(normalizedAssistantMessage.stopReason !== "toolUse" &&
+				this.agent.signal?.aborted &&
+				runSnapshot?.source !== undefined &&
+				runSnapshot.diagnosticTimestamp !== undefined
+					? {
+							type: "runtime_abort" as const,
+							timestamp: runSnapshot.diagnosticTimestamp,
+							details: { source: runSnapshot.source },
+						}
+					: undefined))
+			: undefined;
+		const replacementCandidate =
+			identityPreservingReplacement ?? (canonicalRuntimeAbort ? normalizedAssistantMessage : undefined);
 		const runtimePreservingReplacement =
-			identityPreservingReplacement?.role === "assistant" && canonicalRuntimeAbort
+			replacementCandidate?.role === "assistant" && canonicalRuntimeAbort
 				? {
-						...identityPreservingReplacement,
+						...replacementCandidate,
 						diagnostics: [
-							...(identityPreservingReplacement.diagnostics ?? []).filter(
+							...(replacementCandidate.diagnostics ?? []).filter(
 								(diagnostic) => diagnostic.type !== "runtime_abort",
 							),
 							canonicalRuntimeAbort,
 						],
 					}
-				: identityPreservingReplacement;
+				: replacementCandidate;
 		const handledEvent =
 			normalizedEvent.type === "message_end" && runtimePreservingReplacement
 				? { ...normalizedEvent, message: runtimePreservingReplacement }
@@ -1196,6 +1246,8 @@ export class AgentSession {
 				? { ...handledEvent, willRetry: this._willRetryAfterAgentEnd(handledEvent) }
 				: handledEvent,
 		);
+
+		if (this._disposed) return undefined;
 
 		// Handle session persistence
 		if (handledEvent.type === "message_end") {
@@ -1223,6 +1275,7 @@ export class AgentSession {
 					this._persistedTerminalAgentRunId = this._activeAgentRunId;
 				}
 			}
+			this._settleAdmittedDeliveryMessage(handledEvent.deliveryId);
 			if (handledEvent.message.role === "user" && handledEvent.message.clientMessageId !== undefined) {
 				await this.sessionManager.flush();
 				this._completeLiveClientInput(handledEvent.message.clientMessageId, "admitted");
@@ -1509,21 +1562,14 @@ export class AgentSession {
 		const abortAcceptance = this.agent.abort(source);
 		const runAfterAbort = this.agent.activeRunSnapshot;
 		this._disposed = true;
-		this._dequeuedQueueClientMessageIds.clear();
-		const disposalError = new Error("Session disposed before client input completed");
-		for (const operation of this._liveClientInputs.values()) {
-			operation.rejectAccepted(disposalError);
-			operation.rejectCompletion(disposalError);
-		}
-		this._liveClientInputs.clear();
+		const durablyAdmittedOperations = new Set<LiveClientInputOperation>();
 
 		try {
-			// Persist terminal markers for in-flight tool calls FIRST: dispose
-			// disconnects listeners synchronously below, so the aborted tool
-			// results the agent loop synthesizes after agent.abort() are never
-			// observed or persisted. Without this, a session disposed mid-tool-call
-			// (e.g. a daemon runtime torn down for a lease handoff) leaves a
-			// dangling toolCall in the transcript.
+			// A delivery is irrevocably admitted before delivery_start is published.
+			// Persist any payload whose message_end has not committed before adding
+			// disposal markers, otherwise teardown can orphan the abort marker.
+			this._persistPendingAdmittedDeliveryMessages(durablyAdmittedOperations);
+			// Persist terminal markers for in-flight tool calls before disconnecting.
 			this._persistAbortedResultsForDanglingToolCalls();
 			this._persistDisposalAbortMarker(runBeforeAbort, runAfterAbort, abortAcceptance.accepted);
 			// Bash results completed during a turn were intentionally deferred for
@@ -1533,7 +1579,27 @@ export class AgentSession {
 		} catch {
 			// Persistence failures are reflected by the final drain promise.
 		}
+		this._dequeuedQueueClientMessageIds.clear();
+		const disposalError = new Error("Session disposed before client input completed");
+		for (const operation of this._liveClientInputs.values()) {
+			if (durablyAdmittedOperations.has(operation)) continue;
+			operation.rejectAccepted(disposalError);
+			operation.rejectCompletion(disposalError);
+		}
+		this._liveClientInputs.clear();
 		const persistenceDrain = this.sessionManager.closePersistence();
+		void persistenceDrain.then(
+			() => {
+				for (const operation of durablyAdmittedOperations) operation.resolveAccepted("admitted");
+			},
+			(error: unknown) => {
+				const persistenceError = error instanceof Error ? error : new Error(String(error));
+				for (const operation of durablyAdmittedOperations) {
+					operation.rejectAccepted(persistenceError);
+					operation.rejectCompletion(persistenceError);
+				}
+			},
+		);
 		let subagentDrain: Promise<void>;
 		let mcpDrain: Promise<void>;
 		try {
@@ -1590,6 +1656,34 @@ export class AgentSession {
 		cleanupSessionResources(this.sessionId);
 		this._disposePromise ??= this.sessionManager.flush();
 		return this._disposePromise;
+	}
+
+	private _persistPendingAdmittedDeliveryMessages(durablyAdmittedOperations: Set<LiveClientInputOperation>): void {
+		while (this._pendingAdmittedDeliveryMessages.length > 0) {
+			const pending = this._pendingAdmittedDeliveryMessages[0]!;
+			const message = pending.message;
+			if (message.role === "user" && message.clientMessageId !== undefined) {
+				const record = this.sessionManager.getClientInput(message.clientMessageId);
+				if (record?.state === "accepted") {
+					this.sessionManager.transitionClientInput(message.clientMessageId, "started");
+				}
+			}
+			if (message.role === "custom") {
+				this.sessionManager.appendCustomMessageEntry(
+					message.customType,
+					message.content,
+					message.display,
+					message.details,
+				);
+			} else if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
+				this.sessionManager.appendMessage(message);
+			}
+			if (message.role === "user" && message.clientMessageId !== undefined) {
+				const operation = this._liveClientInputs.get(message.clientMessageId);
+				if (operation) durablyAdmittedOperations.add(operation);
+			}
+			this._pendingAdmittedDeliveryMessages.shift();
+		}
 	}
 
 	private _persistDisposalAbortMarker(

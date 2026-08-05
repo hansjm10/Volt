@@ -1693,6 +1693,45 @@ describe("Agent", () => {
 		}
 	});
 
+	it("re-canonicalizes a terminal message when abort lands during an awaited listener", async () => {
+		const terminalListenerStarted = createDeferred();
+		const releaseTerminalListener = createDeferred();
+		let laterListenerMessage: AssistantMessage | undefined;
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("completed") });
+				});
+				return stream;
+			},
+		});
+		agent.subscribe(async (event) => {
+			if (event.type !== "message_end" || event.message.role !== "assistant") return;
+			terminalListenerStarted.resolve();
+			await releaseTerminalListener.promise;
+		});
+		agent.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				laterListenerMessage = event.message;
+			}
+		});
+
+		const prompting = agent.prompt("race terminal listener");
+		await terminalListenerStarted.promise;
+		expect(agent.abort("remote_request")).toMatchObject({ accepted: true, source: "remote_request" });
+		releaseTerminalListener.resolve();
+		await prompting;
+
+		const expectedTerminalMessage = {
+			role: "assistant",
+			stopReason: "stop",
+			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "remote_request" } })],
+		};
+		expect(laterListenerMessage).toMatchObject(expectedTerminalMessage);
+		expect(agent.state.messages.at(-1)).toMatchObject(expectedTerminalMessage);
+	});
+
 	it("re-canonicalizes runtime abort diagnostics across message replacements without mutating snapshots", async () => {
 		const requestStarted = createDeferred();
 		const replacementDiagnostics = [

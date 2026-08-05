@@ -61,6 +61,34 @@ describe("regression #199: abort provenance persistence", () => {
 		expect(runtimeAbortSources(harness)).toEqual(["remote_request"]);
 	});
 
+	it("persists cancellation accepted while an extension listener settles", async () => {
+		const terminalHandlerStarted = deferred();
+		const finishTerminalHandler = deferred();
+		const harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("message_end", async (event) => {
+						if (event.message.role !== "assistant") return;
+						terminalHandlerStarted.resolve();
+						await finishTerminalHandler.promise;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("provider completed")]);
+
+		const prompt = harness.session.prompt("race cancellation with terminal persistence");
+		await terminalHandlerStarted.promise;
+		const abort = harness.session.abort("remote_request");
+		finishTerminalHandler.resolve();
+		await Promise.all([prompt, abort]);
+
+		expect(persistedAssistantMessages(harness)).toHaveLength(1);
+		expect(persistedAssistantMessages(harness)[0]).toMatchObject({ stopReason: "stop" });
+		expect(runtimeAbortSources(harness)).toEqual(["remote_request"]);
+	});
+
 	it("persists the canonical runtime diagnostic after an extension replacement", async () => {
 		const responseStarted = deferred();
 		const finishResponse = deferred();
@@ -153,6 +181,35 @@ describe("regression #199: abort provenance persistence", () => {
 		await disposal;
 
 		expect(persistedAssistantMessages(harness)).toEqual([]);
+	});
+
+	it("persists an admitted delivery before its disposal marker", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("never requested")]);
+		let disposal: Promise<void> | undefined;
+		harness.session.subscribe((event) => {
+			if (event.type === "delivery_start") disposal = harness.session.dispose("disposal");
+		});
+
+		await harness.session.prompt("persist this admitted prompt", {
+			clientMessageId: "dispose-admitted-delivery",
+		});
+		await disposal;
+
+		const messages = harness.sessionManager.buildSessionContext().messages;
+		expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+		expect(messages[0]).toMatchObject({
+			role: "user",
+			clientMessageId: "dispose-admitted-delivery",
+			content: [{ type: "text", text: "persist this admitted prompt" }],
+		});
+		expect(harness.sessionManager.getClientInput("dispose-admitted-delivery")?.state).toBe("completed");
+		expect(messages[1]).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
+		});
 	});
 
 	it("deduplicates disposal against a terminal message_end still settling", async () => {
