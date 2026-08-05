@@ -1075,11 +1075,13 @@ describe("Agent", () => {
 
 		await agent.continue();
 		expect(agent.state.errorMessage).toBe("commit failed");
+		expect(agent.lastRunFailedDeliveryKind).toBe("steer");
 		expect(agent.hasQueuedMessages()).toBe(true);
 		expect(providerCalls).toBe(0);
 
 		failCommit = false;
 		await agent.continue();
+		expect(agent.lastRunFailedDeliveryKind).toBeUndefined();
 		expect(agent.state.messages.map(getUserText).filter(Boolean)).toEqual(["retry me"]);
 		expect(agent.hasQueuedMessages()).toBe(false);
 		expect(providerCalls).toBe(1);
@@ -1325,6 +1327,72 @@ describe("Agent", () => {
 		await agent.continue();
 
 		expect(providerUserTexts).toEqual(["host delivery"]);
+	});
+
+	it("prepares and commits nextAction deliveries before publishing them", async () => {
+		let attached = false;
+		let preparedKind: string | undefined;
+		let committed = false;
+		let deliveryStartObservedCommit = false;
+		let deliveryId: string | undefined;
+		let providerUserTexts: Array<string | undefined> = [];
+		const agent = new Agent({
+			prepareDelivery: (delivery) => {
+				preparedKind = delivery.kind;
+				const messages = [...delivery.messages];
+				return {
+					messages,
+					commit: () => {
+						committed = true;
+						messages.unshift({
+							role: "user",
+							content: [{ type: "text", text: "prepared host context" }],
+							timestamp: Date.now(),
+						});
+					},
+				};
+			},
+			nextAction: (context) => {
+				if (attached) return context.defaultAction;
+				attached = true;
+				return {
+					type: "request",
+					reason: "delivery",
+					deliveries: [
+						{
+							messages: [
+								{
+									role: "user",
+									content: [{ type: "text", text: "host delivery" }],
+									timestamp: Date.now(),
+								},
+							],
+						},
+					],
+				};
+			},
+			streamFn: (_model, context) => {
+				providerUserTexts = context.messages.map(getUserText).filter((text) => text !== undefined);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.state.messages = [createAssistantMessage("tail")];
+		agent.subscribe((event) => {
+			if (event.type !== "delivery_start") return;
+			deliveryStartObservedCommit = committed;
+			deliveryId = event.deliveryId;
+		});
+
+		await agent.continue();
+
+		expect(preparedKind).toBe("host");
+		expect(deliveryStartObservedCommit).toBe(true);
+		expect(deliveryId).toMatch(/^host-delivery:/);
+		expect(providerUserTexts).toEqual(["prepared host context", "host delivery"]);
 	});
 
 	it("continue() should process queued follow-up messages after an assistant turn", async () => {

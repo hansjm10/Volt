@@ -2,7 +2,7 @@ import type { AgentMessage, AgentTool } from "@hansjm10/volt-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import { createHarness, type Harness } from "../harness.ts";
+import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.ts";
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
 	let resolve = () => {};
@@ -164,7 +164,151 @@ describe("regression #199: approved plan finalization", () => {
 		);
 	});
 
-	it("does not replay a predecessor commit after a concurrent planning transition rejects ready feedback", async () => {
+	it("waits for an in-flight planning transition before admitting a direct ready-plan prompt", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await createReadyPlan(harness);
+		harness.session.setSessionName("ready plan transition wait");
+		harness.setResponses([fauxAssistantMessage("feedback admitted after transition")]);
+
+		const transitionStarted = deferred();
+		const releaseTransition = deferred();
+		const internals = harness.session as unknown as { _prepareUnrestrictedMcpForBuild(): Promise<void> };
+		const prepareUnrestrictedMcpForBuild = internals._prepareUnrestrictedMcpForBuild.bind(harness.session);
+		internals._prepareUnrestrictedMcpForBuild = async () => {
+			transitionStarted.resolve();
+			await releaseTransition.promise;
+			await prepareUnrestrictedMcpForBuild();
+		};
+		let transitionSettled = false;
+		const transition = harness.session.setAgentMode("build").finally(() => {
+			transitionSettled = true;
+		});
+		await transitionStarted.promise;
+
+		const earlyContinuation = deferred();
+		let earlyContinuationCount = 0;
+		let transitionReleased = false;
+		const releasePlanningTransition = (): void => {
+			if (transitionReleased) return;
+			transitionReleased = true;
+			releaseTransition.resolve();
+		};
+		const continueAgent = harness.session.agent.continue.bind(harness.session.agent);
+		harness.session.agent.continue = async (options) => {
+			if (!transitionSettled) {
+				earlyContinuationCount++;
+				earlyContinuation.resolve();
+				releasePlanningTransition();
+				await transition;
+			}
+			await continueAgent(options);
+		};
+
+		const prompting = harness.session.prompt("Revise the ready plan during the transition");
+		await Promise.race([
+			earlyContinuation.promise,
+			new Promise<void>((resolve) => {
+				setImmediate(resolve);
+			}),
+		]);
+		releasePlanningTransition();
+		await transition;
+		await prompting;
+
+		expect(earlyContinuationCount).toBe(0);
+		expect(
+			harness.session.messages.filter((message) => message.role === "assistant" && message.stopReason === "error"),
+		).toEqual([]);
+		expect(harness.session.planningState).toMatchObject({ mode: "plan", plan: { phase: "draft" } });
+		expect(getUserTexts(harness)).toEqual(["Revise the ready plan during the transition"]);
+	});
+
+	it("does not automatically retry a direct prompt whose ready-plan admission fails", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await createReadyPlan(harness);
+		harness.session.setSessionName("failed ready plan admission");
+		harness.setResponses([fauxAssistantMessage("must not be requested")]);
+		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
+		harness.sessionManager.appendPlanningState = (planning) => {
+			if (planning.plan?.phase === "draft") {
+				throw new Error("persistent ready-feedback failure");
+			}
+			return appendPlanningState(planning);
+		};
+
+		let automaticContinuations = 0;
+		const continueAgent = harness.session.agent.continue.bind(harness.session.agent);
+		harness.session.agent.continue = async (options) => {
+			automaticContinuations++;
+			harness.session.agent.discardPendingPrompt();
+			await continueAgent(options);
+		};
+
+		await harness.session.prompt("Feedback whose planning commit fails");
+
+		expect(automaticContinuations).toBe(0);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(
+			harness.session.messages.filter(
+				(message) =>
+					message.role === "assistant" &&
+					message.stopReason === "error" &&
+					message.errorMessage === "persistent ready-feedback failure",
+			),
+		).toHaveLength(1);
+		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	it("prepares hook-supplied user deliveries before exposing them to a ready Build plan", async () => {
+		let suppliedHostDelivery = false;
+		const requestSnapshots: Array<{ tools: string[]; systemPrompt: string }> = [];
+		const harness = await createHarness({
+			tools: [createBuildMarkerTool()],
+			initialActiveToolNames: ["build_marker"],
+			nextAction: (context) => {
+				if (suppliedHostDelivery) return context.defaultAction;
+				suppliedHostDelivery = true;
+				return {
+					type: "request",
+					reason: "delivery",
+					deliveries: [{ messages: [createUserMessage("hook-supplied ready-plan feedback")] }],
+				};
+			},
+		});
+		harnesses.push(harness);
+		await createReadyPlan(harness);
+		await harness.session.setAgentMode("build");
+		harness.session.agent.state.messages = [fauxAssistantMessage("Build tail")];
+		harness.setResponses([
+			(context) => {
+				requestSnapshots.push({
+					tools: context.tools?.map((tool) => tool.name) ?? [],
+					systemPrompt: context.systemPrompt ?? "",
+				});
+				return fauxAssistantMessage("hook feedback admitted");
+			},
+		]);
+
+		await harness.session.agent.continue();
+
+		expect(harness.session.planningState).toMatchObject({ mode: "plan", plan: { phase: "draft" } });
+		expect(requestSnapshots).toHaveLength(1);
+		expect(requestSnapshots[0]!.tools).toContain("update_plan");
+		expect(requestSnapshots[0]!.tools).not.toContain("build_marker");
+		expect(requestSnapshots[0]!.systemPrompt).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
+		const feedbackIndex = harness.session.messages.findIndex(
+			(message) => getMessageText(message) === "hook-supplied ready-plan feedback",
+		);
+		expect(harness.session.messages[feedbackIndex - 1]).toMatchObject({
+			role: "custom",
+			customType: "volt-plan-checkpoint",
+			content: expect.stringContaining("Phase: draft"),
+		});
+	});
+
+	it("waits for a concurrent planning transition without replaying a predecessor commit", async () => {
 		let predecessorCommits = 0;
 		const harness = await createHarness({
 			prepareDelivery: (delivery) => ({
@@ -192,16 +336,23 @@ describe("regression #199: approved plan finalization", () => {
 		const transition = harness.session.setAgentMode("build");
 		await transitionStarted.promise;
 
-		await harness.session.agent.continue();
-		expect(harness.session.agent.state.errorMessage).toContain("planning transition is in progress");
+		let continuationSettled = false;
+		const continuation = harness.session.agent.continue().finally(() => {
+			continuationSettled = true;
+		});
+		await new Promise<void>((resolve) => {
+			setImmediate(resolve);
+		});
+		expect(continuationSettled).toBe(false);
 		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
-		expect(predecessorCommits).toBe(1);
+		expect(predecessorCommits).toBe(0);
 
 		releaseTransition.resolve();
 		await transition;
-		await harness.session.agent.continue();
+		await continuation;
 
 		expect(predecessorCommits).toBe(1);
+		expect(harness.session.agent.state.errorMessage).toBeUndefined();
 		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
 		expect(harness.session.planningState).toMatchObject({ mode: "plan", plan: { phase: "draft" } });
 	});
@@ -353,7 +504,28 @@ describe("regression #199: approved plan finalization", () => {
 		expect(harness.session.agent.state.errorMessage).toBe("planning persistence failed before queue clear");
 		expect(predecessorCommits).toBe(1);
 
+		const promotionEventStart = harness.events.length;
 		await expect(harness.session.clearQueue()).resolves.toEqual({ steering: [], followUp: [] });
+		const promotedMessageEvents = harness.events.slice(promotionEventStart).flatMap((event) => {
+			if (event.type !== "message_start" && event.type !== "message_end") return [];
+			if (event.message.role === "custom") {
+				return [`${event.type}:custom:${event.message.customType}`];
+			}
+			if (event.message.role === "user") {
+				return [`${event.type}:user:${getMessageText(event.message)}`];
+			}
+			return [];
+		});
+		expect(promotedMessageEvents).toEqual([
+			"message_start:custom:volt-plan-checkpoint",
+			"message_end:custom:volt-plan-checkpoint",
+			"message_start:custom:committed-preparation",
+			"message_end:custom:committed-preparation",
+			"message_start:user:committed predecessor output",
+			"message_end:user:committed predecessor output",
+			"message_start:user:feedback cleared after partial commit",
+			"message_end:user:feedback cleared after partial commit",
+		]);
 
 		const messages = harness.sessionManager.buildSessionContext().messages;
 		expect(messages).toContainEqual(

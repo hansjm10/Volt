@@ -67,6 +67,7 @@ export interface HarnessOptions {
 	resourceLoader?: ResourceLoader;
 	extensionFactories?: Array<ExtensionFactory | CreateTestExtensionsResultInput>;
 	prepareDelivery?: AgentOptions["prepareDelivery"];
+	nextAction?: AgentOptions["nextAction"];
 	withConfiguredAuth?: boolean;
 	/** Inject a persisted manager when a test needs to exercise session reload behavior. */
 	sessionManager?: SessionManager;
@@ -161,6 +162,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			});
 		},
 		prepareDelivery: options.prepareDelivery,
+		nextAction: options.nextAction,
 		transformContext: async (messages: AgentMessage[]) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner) return messages;

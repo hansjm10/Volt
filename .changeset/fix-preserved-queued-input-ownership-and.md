@@ -1,4 +1,5 @@
 ---
+"@hansjm10/volt-agent-core": patch
 "@hansjm10/volt-coding-agent": patch
 ---
 

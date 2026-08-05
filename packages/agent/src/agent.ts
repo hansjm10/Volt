@@ -111,12 +111,12 @@ function createMutableAgentState(initialState?: Partial<Omit<AgentState, Runtime
 	};
 }
 
-/** Delivery class used by the Agent-owned inbox. */
-export type AgentDeliveryKind = "prompt" | "steer" | "followUp";
+/** Delivery source prepared by the Agent dispatcher. */
+export type AgentDeliveryKind = "prompt" | "steer" | "followUp" | "host";
 
-/** Stable pending delivery passed to `prepareDelivery`. */
+/** Stable delivery passed to `prepareDelivery`. */
 export interface AgentDelivery {
-	/** Runtime inbox identity; never substitutes for an ID carried by a message. */
+	/** Runtime dispatcher identity; never substitutes for an ID carried by a message. */
 	readonly deliveryId: string;
 	readonly kind: AgentDeliveryKind;
 	readonly messages: readonly AgentMessage[];
@@ -139,7 +139,7 @@ export interface AgentOptions {
 	onResponse?: SimpleStreamOptions["onResponse"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
-	/** Stage a leased inbox delivery before its irrevocable begin boundary. */
+	/** Stage an inbox or host-supplied delivery before its irrevocable begin boundary. */
 	prepareDelivery?: (
 		delivery: AgentDelivery,
 		signal?: AbortSignal,
@@ -214,6 +214,7 @@ export class Agent {
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
 	private pausedState?: Pick<DispatcherStartState, "requestAuthority" | "providerRequestPending">;
+	private _lastRunFailedDeliveryKind?: AgentDeliveryKind;
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -229,7 +230,7 @@ export class Agent {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
-	/** Stage one dispatcher-owned delivery before it enters model context. */
+	/** Stage one inbox or host-supplied delivery before it enters model context. */
 	public prepareDelivery?: (
 		delivery: AgentDelivery,
 		signal?: AbortSignal,
@@ -375,6 +376,11 @@ export class Agent {
 		}
 		run.abortController.abort();
 		return Object.freeze({ runId: run.id, accepted: true, source: run.abortSource });
+	}
+
+	/** Delivery kind whose preparation or begin boundary failed in the previous run. */
+	get lastRunFailedDeliveryKind(): AgentDeliveryKind | undefined {
+		return this._lastRunFailedDeliveryKind;
 	}
 
 	/** Settlement boundary for a synchronous delivery commit callback, if one is running. */
@@ -585,7 +591,9 @@ export class Agent {
 
 		this.pausedState = undefined;
 		const leasedDeliveries = selected.length > 0 ? await this.prepareLeasedDeliveries(selected) : [];
-		const deliveries = [...leasedDeliveries, ...(action.deliveries ?? [])];
+		const hostDeliveries =
+			action.deliveries && action.deliveries.length > 0 ? await this.prepareHostDeliveries(action.deliveries) : [];
+		const deliveries = [...leasedDeliveries, ...hostDeliveries];
 		return {
 			type: "request",
 			reason: action.reason,
@@ -598,16 +606,22 @@ export class Agent {
 		this.activeLease = lease;
 		const deliveries: AgentLoopDelivery[] = [];
 		for (const delivery of lease.deliveries) {
-			const preparation = this.prepareDelivery
-				? await this.prepareDelivery(
-						{
-							deliveryId: delivery.deliveryId,
-							kind: delivery.kind,
-							messages: delivery.messages.slice(),
-						},
-						this.signal,
-					)
-				: { messages: delivery.messages.slice() };
+			let preparation: AgentDeliveryPreparation;
+			try {
+				preparation = this.prepareDelivery
+					? await this.prepareDelivery(
+							{
+								deliveryId: delivery.deliveryId,
+								kind: delivery.kind,
+								messages: delivery.messages.slice(),
+							},
+							this.signal,
+						)
+					: { messages: delivery.messages.slice() };
+			} catch (error) {
+				this._lastRunFailedDeliveryKind = delivery.kind;
+				throw error;
+			}
 			if (
 				this.activeLease !== lease ||
 				!lease.deliveries.some((candidate) => candidate.deliveryId === delivery.deliveryId)
@@ -615,6 +629,7 @@ export class Agent {
 				continue;
 			}
 			if (preparation.messages.length === 0) {
+				this._lastRunFailedDeliveryKind = delivery.kind;
 				throw new Error("prepareDelivery must retain at least one message for an admitted delivery");
 			}
 			if (preparation.commit) {
@@ -628,10 +643,47 @@ export class Agent {
 		return deliveries;
 	}
 
+	private async prepareHostDeliveries(deliveries: AgentLoopDelivery[]): Promise<AgentLoopDelivery[]> {
+		for (const delivery of deliveries) {
+			const deliveryId = delivery.deliveryId ?? `host-delivery:${globalThis.crypto.randomUUID()}`;
+			let preparation: AgentDeliveryPreparation;
+			try {
+				preparation = this.prepareDelivery
+					? await this.prepareDelivery(
+							{
+								deliveryId,
+								kind: "host",
+								messages: delivery.messages,
+							},
+							this.signal,
+						)
+					: { messages: delivery.messages };
+			} catch (error) {
+				this._lastRunFailedDeliveryKind = "host";
+				throw error;
+			}
+			if (preparation.messages.length === 0) {
+				this._lastRunFailedDeliveryKind = "host";
+				throw new Error("prepareDelivery must retain at least one message for an admitted delivery");
+			}
+			delivery.deliveryId = deliveryId;
+			delivery.messages = preparation.messages;
+			if (preparation.commit) {
+				this.preparedDeliveryCommits.set(deliveryId, preparation.commit);
+			}
+		}
+		return deliveries;
+	}
+
 	private beginActiveDelivery(delivery: AgentLoopDelivery): boolean {
-		if (delivery.deliveryId === undefined) return true;
-		if (!this.activeLease?.owns(delivery.deliveryId)) return true;
-		const commit = this.preparedDeliveryCommits.get(delivery.deliveryId);
+		const deliveryId = delivery.deliveryId;
+		if (deliveryId === undefined) return true;
+		const ownsLeasedDelivery = this.activeLease?.owns(deliveryId) === true;
+		const deliveryKind = ownsLeasedDelivery
+			? this.activeLease?.deliveries.find((candidate) => candidate.deliveryId === deliveryId)?.kind
+			: "host";
+		const commit = this.preparedDeliveryCommits.get(deliveryId);
+		if (!ownsLeasedDelivery && commit === undefined) return true;
 		const run = this.activeRun;
 		const requestWasAccepted = run?.requestAccepted ?? false;
 		let settleDeliveryCommit = (): void => undefined;
@@ -642,13 +694,15 @@ export class Agent {
 			});
 		}
 		try {
-			if (!this.activeLease.begin(delivery.deliveryId, commit)) {
+			if (ownsLeasedDelivery && !this.activeLease?.begin(deliveryId, commit)) {
 				if (run && this.activeRun === run) run.requestAccepted = requestWasAccepted;
 				return false;
 			}
-			this.preparedDeliveryCommits.delete(delivery.deliveryId);
+			if (!ownsLeasedDelivery) commit?.();
+			this.preparedDeliveryCommits.delete(deliveryId);
 			return true;
 		} catch (error) {
+			this._lastRunFailedDeliveryKind = deliveryKind;
 			if (run && this.activeRun === run) run.requestAccepted = requestWasAccepted;
 			throw error;
 		} finally {
@@ -720,6 +774,7 @@ export class Agent {
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
 		this._state.errorMessage = undefined;
+		this._lastRunFailedDeliveryKind = undefined;
 
 		try {
 			await executor(abortController.signal);

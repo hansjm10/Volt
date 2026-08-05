@@ -761,6 +761,7 @@ export class AgentSession {
 				: prepareDelivery
 					? await prepareDelivery(delivery, signal)
 					: { messages: [...delivery.messages] };
+			await this._waitForPlanningTransitions();
 			const predecessorCommit = preparation.commit;
 			const prepared = this._prepareUserDelivery({
 				messages: preparation.messages,
@@ -2254,6 +2255,15 @@ export class AgentSession {
 		this._emit({ type: "message_end", message });
 	}
 
+	private async _waitForPlanningTransitions(): Promise<void> {
+		let pending = this._planningTransitionQueue;
+		while (true) {
+			await pending;
+			if (pending === this._planningTransitionQueue) return;
+			pending = this._planningTransitionQueue;
+		}
+	}
+
 	private _prepareUserDelivery(preparation: AgentDeliveryPreparation): AgentDeliveryPreparation {
 		const readyPlan = this._planningState.plan?.phase === "ready" ? this._planningState.plan : undefined;
 		if (!readyPlan || !preparation.messages.some((message) => message.role === "user")) {
@@ -3304,6 +3314,11 @@ export class AgentSession {
 			return shouldContinue;
 		}
 
+		if (msg.stopReason === "error" && this.agent.lastRunFailedDeliveryKind === "prompt") {
+			this._settleRetry(false, msg.errorMessage);
+			return false;
+		}
+
 		if (this._isRetryableError(msg)) {
 			const willRetry = await this._prepareRetry(msg, abortGeneration);
 			if (conversationGenerationChanged()) {
@@ -4154,6 +4169,8 @@ export class AgentSession {
 						this.sessionManager.appendMessage(message);
 					}
 					this.agent.state.messages.push(message);
+					this._emitCommittedEvent({ type: "message_start", message });
+					this._emitCommittedEvent({ type: "message_end", message });
 					messages.shift();
 				}
 				this._committedDeliveryPreparationMessages.delete(deliveryId);
