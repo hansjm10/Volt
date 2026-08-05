@@ -1411,7 +1411,7 @@ export class SubagentManager {
 		const budgetNextAction: NonNullable<typeof originalNextAction> = async (context, signal) => {
 			if (context.requestAuthority === "final_response") {
 				pendingBudgetDelivery = undefined;
-				finalResponseSatisfiedBudget = true;
+				finalResponseSatisfiedBudget = requiresFinalTurnReport;
 				return originalNextAction ? await originalNextAction(context, signal) : context.defaultAction;
 			}
 			if (pendingBudgetDelivery !== undefined) {

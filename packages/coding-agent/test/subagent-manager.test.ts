@@ -1323,6 +1323,74 @@ describe("SubagentManager", () => {
 		expect(abortSpy).toHaveBeenCalled();
 	});
 
+	it("counts plan-finalization responses below the limit against later prompts", async () => {
+		let childSession: SubagentRuntimeCreatedEvent["runtime"]["session"] | undefined;
+		let activePlan: { id: string; revision: number; steps: Array<{ id: string; status: string }> } | undefined;
+		const resourceLoader = createSubagentResourceLoader([createDefinition({ name: "researcher" })]);
+		const { manager } = await createTestManager({
+			resourceLoader,
+			noTools: false,
+			turnLimits: { maxTurns: 2 },
+			onRuntimeCreated: async (event) => {
+				childSession = event.runtime.session;
+				await childSession.setAgentMode("plan");
+				const draft = childSession.updatePlan({ steps: [{ text: "Finish the delegated implementation" }] });
+				const ready = childSession.submitPlan({
+					planId: draft.id,
+					expectedRevision: draft.revision,
+					title: "Finish delegated implementation",
+					summary: "Complete and report the delegated work.",
+				});
+				await childSession.activatePlan(ready.id, ready.revision, {
+					id: "subagent-finalization-accounting",
+					approvedRevision: ready.revision,
+					strategy: "retain_context",
+					sourceSessionId: childSession.sessionId,
+					targetSessionId: childSession.sessionId,
+				});
+				activePlan = childSession.planningState.plan as typeof activePlan;
+			},
+			responses: [
+				() => {
+					if (!activePlan) throw new Error("expected active plan");
+					return fauxAssistantMessage(
+						fauxToolCall("update_plan_progress", {
+							planId: activePlan.id,
+							expectedRevision: activePlan.revision,
+							updates: [{ id: activePlan.steps[0]!.id, status: "completed" }],
+						}),
+						{ stopReason: "toolUse" },
+					);
+				},
+				fauxAssistantMessage("Final delegated report"),
+				fauxAssistantMessage(fauxToolCall("subagent_registry", { list: true }), { stopReason: "toolUse" }),
+			],
+		});
+
+		const handle = await manager.startByName("researcher");
+		const completion = handle.waitForEnd();
+		await handle.prompt("Complete the active delegated plan");
+		await completion;
+		if (!childSession) throw new Error("expected child session");
+
+		const abortSpy = vi.spyOn(childSession, "abort");
+		const followUpEnd = new Promise<SubagentEndEvent>((resolve) => {
+			const unsubscribe = handle.onEvent((event) => {
+				if (event.type !== "agent_end") return;
+				unsubscribe();
+				resolve(event);
+			});
+		});
+		await handle.prompt("Try to use a tool after finalizing below the limit");
+		const followUpMessages = (await followUpEnd).messages;
+
+		expect(JSON.stringify(followUpMessages.find((message) => message.role === "toolResult"))).toContain(
+			"turn budget is exhausted",
+		);
+		expect(followUpMessages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+		expect(abortSpy).toHaveBeenCalled();
+	});
+
 	it("gives parallel children independent turn budgets within one shared scope", async () => {
 		const firstFinalReportStarted = createDeferred();
 		const finishFirstFinalReport = createDeferred();
