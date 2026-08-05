@@ -180,6 +180,7 @@ type PendingDelivery = InboxDelivery<AgentDeliveryKind, AgentMessage>;
 type DispatcherStartState = {
 	firstDecision: boolean;
 	requestAuthority: AgentRequestAuthority;
+	providerRequestPending: boolean;
 	drainFollowUpsFirst?: boolean;
 };
 
@@ -211,7 +212,7 @@ export class Agent {
 	private readonly preparedDeliveryCommits = new Map<string, () => void>();
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
-	private pausedState?: Pick<DispatcherStartState, "requestAuthority">;
+	private pausedState?: Pick<DispatcherStartState, "requestAuthority" | "providerRequestPending">;
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -427,10 +428,12 @@ export class Agent {
 			);
 		}
 		this.pausedState = undefined;
+		const lastMessage = this._state.messages[this._state.messages.length - 1];
 		this.enqueueDelivery("prompt", this.normalizePromptInput(input, images));
 		await this.runDispatcher({
 			firstDecision: true,
 			requestAuthority: "provider",
+			providerRequestPending: lastMessage !== undefined && lastMessage.role !== "assistant",
 		});
 	}
 
@@ -451,6 +454,8 @@ export class Agent {
 		await this.runDispatcher({
 			firstDecision: true,
 			requestAuthority: pausedState?.requestAuthority ?? "provider",
+			providerRequestPending:
+				pausedState?.providerRequestPending ?? (lastMessage !== undefined && lastMessage.role !== "assistant"),
 			drainFollowUpsFirst: options.drainFollowUps === true || lastMessage?.role === "assistant",
 		});
 	}
@@ -518,9 +523,12 @@ export class Agent {
 		startState.firstDecision = false;
 		const requestAuthority = isFirstDecision ? startState.requestAuthority : context.requestAuthority;
 		const runtimeAction = context.defaultAction;
+		const providerRequestPending = isFirstDecision
+			? startState.providerRequestPending
+			: runtimeAction.type === "request";
 
 		if (this.signal?.aborted) {
-			this.pausedState = { requestAuthority };
+			this.pausedState = { requestAuthority, providerRequestPending };
 			return { type: "pause", requestAuthority };
 		}
 
@@ -528,7 +536,7 @@ export class Agent {
 			const hookContext = { ...context, requestAuthority, defaultAction: runtimeAction };
 			const action = this.nextAction ? await this.nextAction(hookContext, this.signal) : runtimeAction;
 			if (action.type === "pause") {
-				this.pausedState = { requestAuthority };
+				this.pausedState = { requestAuthority, providerRequestPending };
 				return { ...action, requestAuthority };
 			}
 			this.pausedState = undefined;
@@ -542,7 +550,7 @@ export class Agent {
 		} else {
 			selected = this.selectPendingDeliveries("steer", this.steeringQueueMode);
 		}
-		const hasIndependentRequest = runtimeAction.type === "request";
+		const hasIndependentRequest = runtimeAction.type === "request" && providerRequestPending;
 		if (selected.length === 0 && ((isFirstDecision && startState.drainFollowUpsFirst) || !hasIndependentRequest)) {
 			selected = this.selectPendingDeliveries("followUp", this.followUpQueueMode);
 		}
@@ -553,7 +561,10 @@ export class Agent {
 		const hookContext = { ...context, requestAuthority, defaultAction: suggestedAction };
 		const action = this.nextAction ? await this.nextAction(hookContext, this.signal) : suggestedAction;
 		if (action.type === "pause") {
-			this.pausedState = { requestAuthority: action.requestAuthority ?? requestAuthority };
+			this.pausedState = {
+				requestAuthority: action.requestAuthority ?? requestAuthority,
+				providerRequestPending: hasIndependentRequest,
+			};
 			return { ...action, requestAuthority: action.requestAuthority ?? requestAuthority };
 		}
 		if (action.type === "stop") {

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import type { AgentMessage, ThinkingLevel } from "@hansjm10/volt-agent-core";
+import type { AgentAbortSource, AgentMessage, ThinkingLevel } from "@hansjm10/volt-agent-core";
 import type { AssistantMessage, Message, TextContent } from "@hansjm10/volt-ai";
 import { createInProcessRpcClient, type InProcessRpcClient } from "../../modes/rpc/in-process-rpc-client.ts";
 import type { RpcClientEvent } from "../../modes/rpc/rpc-client-base.ts";
@@ -92,7 +92,7 @@ export interface SubagentHandle {
 	 * and disposes this handle, so it cannot be retried.
 	 */
 	prompt(message: string): Promise<void>;
-	abort(): Promise<void>;
+	abort(source?: AgentAbortSource): Promise<void>;
 	getState(): Promise<RpcSessionState>;
 	getTranscript(options?: { limit?: number; beforeEntryId?: string }): Promise<RpcTranscriptResponse>;
 	getSessionStats(): Promise<SessionStats>;
@@ -527,7 +527,7 @@ class LocalSubagentHandle implements SubagentHandle {
 	readonly id: string;
 	readonly sessionId: string;
 	private readonly client: InProcessRpcClient;
-	private readonly abortRuntime: () => Promise<void>;
+	private readonly abortRuntime: (source?: AgentAbortSource) => Promise<void>;
 	private readonly removeFromManager: (id: string) => void;
 	private readonly onPromptAccepted: (message: string) => void;
 	private readonly onPromptFailed: (error: unknown) => Promise<void>;
@@ -554,7 +554,7 @@ class LocalSubagentHandle implements SubagentHandle {
 		id: string;
 		sessionId: string;
 		client: InProcessRpcClient;
-		abortRuntime: () => Promise<void>;
+		abortRuntime: (source?: AgentAbortSource) => Promise<void>;
 		removeFromManager: (id: string) => void;
 		onPromptAccepted: (message: string) => void;
 		onPromptFailed: (error: unknown) => Promise<void>;
@@ -607,13 +607,13 @@ class LocalSubagentHandle implements SubagentHandle {
 		}
 	}
 
-	async abort(): Promise<void> {
+	async abort(source?: AgentAbortSource): Promise<void> {
 		this.assertOpen();
 		this.abortRequested = true;
 		this.onAbortRequested();
 		// Abort the in-process runtime directly so cancellation is signalled before
 		// concurrent disposal can close the loopback transport.
-		await this.abortRuntime();
+		await this.abortRuntime(source);
 	}
 
 	async getState(): Promise<RpcSessionState> {
@@ -1566,7 +1566,7 @@ export class SubagentManager {
 				id,
 				sessionId: runtime.session.sessionId,
 				client,
-				abortRuntime: () => runtime.session.abort(),
+				abortRuntime: (source) => runtime.session.abort(source),
 				removeFromManager: (handleId) => {
 					this.handles.delete(handleId);
 				},

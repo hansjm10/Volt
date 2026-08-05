@@ -482,7 +482,7 @@ class RpcSubagentLifecycle implements RpcSubagentLifecycleController {
 	async abort(subagentId: string): Promise<void> {
 		const entry = this.getEntry(subagentId);
 		try {
-			await entry.handle.abort();
+			await entry.handle.abort("remote_request");
 		} finally {
 			await this.disposeEntry(subagentId, entry);
 		}

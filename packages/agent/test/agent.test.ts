@@ -817,6 +817,97 @@ describe("Agent", () => {
 		await firstPrompt;
 	});
 
+	it("keeps a fresh prompt delivery-dependent through asynchronous preparation", async () => {
+		const preparationStarted = createDeferred();
+		const releasePreparation = createDeferred();
+		const requestReasons: string[] = [];
+		const providerUserTexts: Array<string | undefined> = [];
+		let blockFirstPrompt = true;
+		const agent = new Agent({
+			prepareDelivery: async (delivery) => {
+				if (delivery.kind === "prompt" && blockFirstPrompt) {
+					blockFirstPrompt = false;
+					preparationStarted.resolve();
+					await releasePreparation.promise;
+				}
+				return { messages: [...delivery.messages] };
+			},
+			prepareRequest: (context) => {
+				requestReasons.push(context.reason);
+				return undefined;
+			},
+			streamFn: (_model, context) => {
+				providerUserTexts.push(
+					context.messages
+						.map((message) => getUserText(message as AgentMessage))
+						.filter((text) => text !== undefined)
+						.at(-1),
+				);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+
+		const revokedPrompt = agent.prompt("revoked");
+		await preparationStarted.promise;
+		expect(agent.discardPendingPrompt()).toHaveLength(1);
+		releasePreparation.resolve();
+		await revokedPrompt;
+
+		expect(requestReasons).toEqual([]);
+		expect(providerUserTexts).toEqual([]);
+		expect(agent.state.messages).toEqual([]);
+
+		await agent.prompt("replacement");
+		expect(requestReasons).toEqual(["delivery"]);
+		expect(providerUserTexts).toEqual(["replacement"]);
+	});
+
+	it("preserves a provider-ready continuation when a fresh prompt is revoked", async () => {
+		const preparationStarted = createDeferred();
+		const releasePreparation = createDeferred();
+		const requestReasons: string[] = [];
+		const providerUserTexts: Array<Array<string | undefined>> = [];
+		const existing = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "existing" }],
+			timestamp: Date.now(),
+		};
+		const agent = new Agent({
+			initialState: { messages: [existing] },
+			prepareDelivery: async (delivery) => {
+				preparationStarted.resolve();
+				await releasePreparation.promise;
+				return { messages: [...delivery.messages] };
+			},
+			prepareRequest: (context) => {
+				requestReasons.push(context.reason);
+				return undefined;
+			},
+			streamFn: (_model, context) => {
+				providerUserTexts.push(context.messages.map((message) => getUserText(message as AgentMessage)));
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+
+		const prompting = agent.prompt("revoked");
+		await preparationStarted.promise;
+		expect(agent.discardPendingPrompt()).toHaveLength(1);
+		releasePreparation.resolve();
+		await prompting;
+
+		expect(requestReasons).toEqual(["continuation"]);
+		expect(providerUserTexts).toEqual([["existing"]]);
+		expect(agent.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+	});
+
 	it("restores follow-up messages when loop preparation fails and delivers them on retry", async () => {
 		let failPreparation = true;
 		let providerCalls = 0;

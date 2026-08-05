@@ -2319,11 +2319,44 @@ describe("SubagentManager", () => {
 		expect(activity?.sessionStats?.assistantMessages).toBe(1);
 	});
 
-	it("allows abort calls through the handle", async () => {
-		const { manager } = await createTestManager();
+	it("propagates abort provenance through the handle into the child transcript", async () => {
+		const responseStarted = createDeferred();
+		const finishResponse = createDeferred();
+		let childSession: SubagentRuntimeCreatedEvent["runtime"]["session"] | undefined;
+		const { manager } = await createTestManager({
+			responses: [
+				async () => {
+					responseStarted.resolve();
+					await finishResponse.promise;
+					return fauxAssistantMessage("late response");
+				},
+			],
+			onRuntimeCreated: (event) => {
+				childSession = event.runtime.session;
+			},
+		});
+		cleanups.push(() => finishResponse.resolve());
 		const handle = await manager.start();
+		const completion = handle.waitForEnd();
+		await handle.prompt("wait for remote cancellation");
+		await responseStarted.promise;
 
-		await expect(handle.abort()).resolves.toBeUndefined();
+		const abort = handle.abort("remote_request");
+		finishResponse.resolve();
+		await abort;
+		const result = await completion;
+		if (!childSession) throw new Error("expected child session");
+
+		expect(result.event.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "remote_request" } })],
+		});
+		expect(childSession.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "remote_request" } })],
+		});
 	});
 
 	it("aborts an unaccepted retained runtime without publishing activity when its handle is disposed", async () => {

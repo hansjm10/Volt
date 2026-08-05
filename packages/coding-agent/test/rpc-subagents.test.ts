@@ -359,7 +359,7 @@ describe("local RPC subagent lifecycle commands", () => {
 					success: true,
 				}),
 			);
-			expect(child.abort).toHaveBeenCalledOnce();
+			expect(child.abort).toHaveBeenCalledWith("remote_request");
 			expect(child.dispose).toHaveBeenCalledOnce();
 
 			rpc.send({ id: "state-after-abort", type: "subagent_get_state", subagentId: "sa_abort" });
