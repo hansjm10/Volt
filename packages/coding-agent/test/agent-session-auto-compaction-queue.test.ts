@@ -427,6 +427,111 @@ describe("AgentSession auto-compaction queue resume", () => {
 		);
 	});
 
+	it.each(["throws", "returns false"] as const)(
+		"retains a one-shot next-action delivery when proactive compaction %s before admission",
+		async (failureMode) => {
+			const model = session.model!;
+			let deliveryAttached = false;
+			let hostDeliveryStarts = 0;
+			let streamCallCount = 0;
+			const hostDelivery = {
+				role: "user" as const,
+				content: [{ type: "text" as const, text: `retained after compaction ${failureMode}` }],
+				timestamp: Date.now(),
+			};
+			preexistingNextAction = (context) => {
+				if (!context.completedTurn || deliveryAttached) return context.defaultAction;
+				deliveryAttached = true;
+				return {
+					type: "request",
+					reason: "delivery",
+					deliveries: [{ messages: [hostDelivery] }],
+				};
+			};
+			session.subscribe((event) => {
+				if (
+					event.type === "delivery_start" &&
+					event.messages.some(
+						(message) =>
+							message.role === "user" &&
+							Array.isArray(message.content) &&
+							message.content.some(
+								(part) => part.type === "text" && part.text === `retained after compaction ${failureMode}`,
+							),
+					)
+				) {
+					hostDeliveryStarts++;
+				}
+			});
+			const internals = session as unknown as {
+				_proactiveCompactionState: "idle" | "scheduled" | "compacting";
+				_runAutoCompaction: (
+					reason: "overflow" | "threshold",
+					willRetry: boolean,
+					continueAfterCompaction?: boolean,
+				) => Promise<boolean>;
+			};
+			const compactionFailure = new Error("proactive compaction failed before delivery admission");
+			const compaction = vi.spyOn(internals, "_runAutoCompaction").mockImplementation(async () => {
+				// Match the real compaction epilogue so this isolates ownership of the
+				// already-resolved host action at the post-run failure boundary.
+				internals._proactiveCompactionState = "idle";
+				if (failureMode === "throws") throw compactionFailure;
+				return false;
+			});
+
+			session.agent.streamFn = () => {
+				const callNumber = ++streamCallCount;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message: AssistantMessage = {
+						role: "assistant",
+						content: [{ type: "text", text: callNumber === 1 ? "pause before delivery" : "delivery retained" }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: {
+							input: callNumber === 1 ? model.contextWindow - 20_000 : 100,
+							output: callNumber === 1 ? 10_000 : 10,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: callNumber === 1 ? model.contextWindow - 10_000 : 110,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", seq: 0, snapshot: message, toolState: [] });
+					stream.push({ type: "done", seq: 1, reason: "stop", message });
+				});
+				return stream;
+			};
+
+			const initialRun = session.prompt(`trigger compaction that ${failureMode}`);
+			if (failureMode === "throws") {
+				await expect(initialRun).rejects.toThrow(compactionFailure.message);
+			} else {
+				await expect(initialRun).resolves.toBeUndefined();
+			}
+			expect(compaction).toHaveBeenCalledWith("threshold", false, true);
+			expect(streamCallCount).toBe(1);
+			expect(hostDeliveryStarts).toBe(0);
+
+			// The hook is one-shot and has already advanced. A later dispatcher
+			// resume must use the retained action rather than asking the hook again.
+			await session.agent.continue();
+
+			expect(streamCallCount).toBe(2);
+			expect(hostDeliveryStarts).toBe(1);
+			expect(session.agent.state.messages).toContainEqual(
+				expect.objectContaining({
+					role: "user",
+					content: [{ type: "text", text: `retained after compaction ${failureMode}` }],
+				}),
+			);
+		},
+	);
+
 	it("should include newly appended tool results in proactive threshold checks", async () => {
 		const model = session.model!;
 		writeFileSync(join(tempDir, "large-result.txt"), "x".repeat(40_000));

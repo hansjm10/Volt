@@ -417,6 +417,90 @@ describe("native planning state", () => {
 		await session.dispose();
 	});
 
+	it("does not replay staged delivery commits when a prepared ready plan is activated before begin", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({ steps: [{ text: "Implement the approved change" }] });
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Approved change",
+			summary: "Implement the approved change.",
+		});
+		await session.setAgentMode("build");
+		session.agent.state.messages = [createAssistantMessage([{ type: "text", text: "Build tail" }], "stop")];
+		session.agent.steeringMode = "all";
+		await session.steer("First stale feedback delivery");
+		await session.steer("Second stale feedback delivery");
+		const queuedDeliveryIds = session.getSteeringMessages().map((entry) => entry.queueEntryId);
+		const stagedCommitCalls = new Map<string, number>();
+		let preparationCalls = 0;
+		const prepareDelivery = session.agent.prepareDelivery;
+		if (!prepareDelivery) throw new Error("Expected AgentSession delivery preparation hook");
+		session.agent.prepareDelivery = async (delivery, signal) => {
+			const preparation = await prepareDelivery(delivery, signal);
+			preparationCalls++;
+			if (preparationCalls === 2) {
+				await session.activatePlan(ready.id, ready.revision, {
+					id: "execution-during-delivery-preparation",
+					approvedRevision: ready.revision,
+					strategy: "retain_context",
+					sourceSessionId: session.sessionId,
+					targetSessionId: session.sessionId,
+				});
+			}
+			return {
+				messages: preparation.messages,
+				commit: () => {
+					stagedCommitCalls.set(delivery.deliveryId, (stagedCommitCalls.get(delivery.deliveryId) ?? 0) + 1);
+					preparation.commit?.();
+				},
+			};
+		};
+		let providerCalls = 0;
+		const providerUserTexts: string[] = [];
+		session.agent.streamFn = (_model, context) => {
+			providerCalls++;
+			providerUserTexts.push(
+				...context.messages.flatMap((message) => {
+					if (message.role !== "user" || !Array.isArray(message.content)) return [];
+					return message.content.flatMap((part) => (part.type === "text" ? [part.text] : []));
+				}),
+			);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					seq: 1,
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "Active plan remains authoritative" }], "stop"),
+				});
+			});
+			return stream;
+		};
+
+		await session.agent.continue();
+		// A failed begin restores the all-mode lease. Retrying exposes whether any
+		// staged commit ran once before the stale planning transition threw.
+		await session.agent.continue();
+
+		expect(session.planningState).toMatchObject({
+			mode: "build",
+			plan: { id: ready.id, revision: ready.revision + 1, phase: "active" },
+		});
+		expect(providerCalls).toBe(1);
+		expect(
+			providerUserTexts.filter(
+				(text) => text === "First stale feedback delivery" || text === "Second stale feedback delivery",
+			),
+		).toEqual(["First stale feedback delivery", "Second stale feedback delivery"]);
+		expect(queuedDeliveryIds.map((deliveryId) => stagedCommitCalls.get(deliveryId))).toEqual([1, 1]);
+		expect(
+			session.messages.filter((message) => message.role === "assistant" && message.stopReason === "error"),
+		).toEqual([]);
+		expect(session.getSteeringMessages()).toEqual([]);
+		await session.dispose();
+	});
+
 	it.each(["steer", "followUp"] as const)(
 		"returns queued %s feedback to draft and preserves same-generation research",
 		async (streamingBehavior) => {

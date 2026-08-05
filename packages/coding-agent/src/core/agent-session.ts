@@ -524,7 +524,7 @@ export class AgentSession {
 	private _overflowRecoveryAttempted = false;
 	/**
 	 * Coordinates the agent-loop pause with its mandatory compaction. A failed
-	 * compaction returns to idle but never resumes the interrupted run.
+	 * compaction returns to idle while retaining any already-resolved host action.
 	 */
 	private _proactiveCompactionState: "idle" | "scheduled" | "compacting" = "idle";
 	/** One request already resolved by a wrapped next-action hook before a compaction pause. */
@@ -2197,10 +2197,9 @@ export class AgentSession {
 				preparation.commit?.();
 				const currentPlan = this._planningState.plan;
 				if (
-					this._planningState.mode === "plan" &&
-					currentPlan?.id === readyPlan.id &&
-					currentPlan.revision === readyPlan.revision + 1 &&
-					currentPlan.phase === "draft"
+					currentPlan?.id !== readyPlan.id ||
+					currentPlan.revision !== readyPlan.revision ||
+					currentPlan.phase !== "ready"
 				) {
 					return;
 				}
@@ -3224,23 +3223,17 @@ export class AgentSession {
 		if (this._proactiveCompactionState === "scheduled") {
 			this._proactiveCompactionState = "compacting";
 			// The run paused mid-task at the next-action boundary, so resume it only
-			// after mandatory compaction succeeds. A failure
-			// rejects the prompt and leaves the durable transcript retryable.
-			let shouldContinue: boolean;
-			try {
-				shouldContinue = await this._runAutoCompaction("threshold", false, true);
-			} catch (error) {
-				this._proactiveCompactionResumeAction = undefined;
-				throw error;
-			}
+			// after mandatory compaction succeeds. A failure ends this continuation
+			// while retaining the already-resolved action for a later resume.
+			const shouldContinue = await this._runAutoCompaction("threshold", false, true);
 			if (conversationGenerationChanged()) {
 				return abandonStaleConversationRun();
 			}
-			if (!shouldContinue || this._disposed || abortGeneration !== this._abortGeneration) {
+			if (this._disposed || abortGeneration !== this._abortGeneration) {
 				this._proactiveCompactionResumeAction = undefined;
 				return false;
 			}
-			return true;
+			return shouldContinue;
 		}
 
 		if (this._isRetryableError(msg)) {
