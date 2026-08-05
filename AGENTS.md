@@ -19,7 +19,10 @@
 - Never remove or downgrade code to fix type errors from outdated deps; upgrade the dep instead.
 - Use only erasable TypeScript syntax (Node strip-only mode) in code checked by the root config (`packages/*/src`, `packages/*/test`, `packages/coding-agent/examples`): no parameter properties, `enum`, `namespace`/`module`, `import =`, `export =`, or other constructs needing JS emit. Use explicit fields with constructor assignments.
 - Always ask before removing functionality or code that appears intentional.
-- Volt has no users yet. Never preserve backward compatibility or add legacy paths (opt-in capability gating for old clients, deprecation shims, fallback wire formats, versioned protocol branches) unless the user explicitly asks. Change protocols, APIs, and storage formats in place. When a dependent repo (e.g. `volt-hq/volt-app`) must adapt, file an issue there instead of keeping a compat path.
+- Volt has no users yet. Do not preserve backward compatibility or retain legacy content, code paths, APIs, aliases, wire formats, storage formats, documentation, migrations, fallbacks, or versioned branches unless the user explicitly asks.
+- Replace protocols, APIs, formats, and implementations in place. Update all in-repo callers, tests, fixtures, and documentation, then remove the superseded path instead of adding compatibility gates, deprecation shims, fallback behavior, or parallel old/new flows.
+- Clearly superseded legacy compatibility code is not intentional functionality that must be preserved under the rule above. Remove it without asking; ask only when it is unclear whether the code is legacy compatibility or a distinct current requirement.
+- When a dependent repo (e.g. `volt-hq/volt-app`) must adapt, file an issue there instead of keeping a compatibility path in Volt.
 - Never hardcode key checks (e.g. `matchesKey(keyData, "ctrl+x")`). Add defaults to `DEFAULT_EDITOR_KEYBINDINGS` or `DEFAULT_APP_KEYBINDINGS` so they stay configurable.
 - Never modify `packages/ai/src/models.generated.ts` directly; update `packages/ai/scripts/generate-models.ts` instead, then regenerate. Including the resulting `models.generated.ts` diff is always OK, even if regeneration includes unrelated upstream model metadata changes.
 
