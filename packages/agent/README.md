@@ -114,21 +114,22 @@ The mode can be set globally via `toolExecution` in the agent config, or per-too
 
 The `beforeToolCall` hook runs after `tool_execution_start` and validated argument parsing. It can block execution. The `afterToolCall` hook runs after tool execution finishes and before `tool_execution_end` and final tool result message events are emitted.
 
-Tools can also return `terminate: true` to hint that the automatic follow-up LLM call should be skipped. The loop only stops early when every finalized tool result in that batch sets `terminate: true`. Mixed batches continue normally.
+Tools can return `disposition: "stop"` to end after the current batch, or `disposition: "final_response"` to authorize exactly one additional tool-free provider response. A successful `final_response` takes precedence; otherwise the batch stops only when every finalized result requests `stop`.
 
-Low-level loop callers can set `shouldStopAfterTurn` to stop gracefully after the current turn completes:
+Low-level loop callers can compose policy through `nextAction` at each dispatcher boundary:
 
 ```typescript
 const stream = agentLoop(prompts, context, {
   model,
   convertToLlm,
-  shouldStopAfterTurn: async ({ message, toolResults, context, newMessages }) => {
-    return shouldCompactBeforeNextTurn(context.messages);
+  nextAction: async (context) => {
+    if (shouldCompactBeforeNextTurn(context.context.messages)) return { type: "stop" };
+    return context.defaultAction;
   },
 });
 ```
 
-`shouldStopAfterTurn` runs after `turn_end` is emitted and after the assistant response and any tool executions have completed normally. If it returns `true`, the loop emits `agent_end` and exits before polling steering or follow-up queues, and before starting another LLM call. It does not abort the provider stream, does not cancel running tools, and does not alter the assistant message stop reason.
+Return `context.defaultAction` when the policy does not need to override the canonical dispatcher. A `stop` action ends before another provider request without aborting the provider stream, cancelling completed tools, or changing the assistant stop reason. Runtime-owned final-response authority takes precedence over stop and ordinary request overrides.
 
 When you use the `Agent` class, assistant `message_end` processing is treated as a barrier before tool preflight begins. That means `beforeToolCall` sees agent state that already includes the assistant message that requested the tool call.
 
@@ -207,15 +208,18 @@ const agent = new Agent({
   // Postprocess each tool result before final tool events are emitted.
   afterToolCall: async ({ toolCall, result, isError, context }) => {
     if (toolCall.name === "notify_done" && !isError) {
-      return { terminate: true };
+      return { disposition: "stop" };
     }
     if (!isError) {
       return { details: { ...result.details, audited: true } };
     }
   },
 
-  // Stop gracefully after a completed turn, before queue polling or another model call.
-  shouldStopAfterTurn: async ({ context }) => shouldCompactBeforeNextTurn(context.messages),
+  // Compose a stop, pause, or request decision at dispatcher boundaries.
+  nextAction: async (context) => {
+    if (shouldCompactBeforeNextTurn(context.context.messages)) return { type: "stop" };
+    return context.defaultAction;
+  },
 
   // Custom thinking budgets for token-based providers
   thinkingBudgets: {
@@ -267,11 +271,11 @@ await agent.prompt("What's in this image?", [
 // AgentMessage directly
 await agent.prompt({ role: "user", content: "Hello", timestamp: Date.now() });
 
-// Continue from current context (last message must normally be user or toolResult)
+// Continue from current context. An assistant-tail continuation drains queued
+// follow-ups first; a toolResult tail resumes its provider continuation first.
 await agent.continue();
 
-// If the transcript ends with an assistant message, explicitly drain one/all queued
-// follow-ups (according to followUpMode) as the continuation input.
+// Explicitly prioritize queued follow-ups at the first continuation boundary.
 await agent.continue({ drainFollowUps: true });
 ```
 
@@ -285,7 +289,7 @@ agent.state.tools = [myTool];
 agent.toolExecution = "sequential";
 agent.beforeToolCall = async ({ toolCall }) => undefined;
 agent.afterToolCall = async ({ toolCall, result }) => undefined;
-agent.shouldStopAfterTurn = async ({ context }) => shouldCompactBeforeNextTurn(context.messages);
+agent.nextAction = async (context) => context.defaultAction;
 agent.state.messages = newMessages; // top-level array is copied
 agent.state.messages.push(message);
 agent.reset();
@@ -413,7 +417,7 @@ const readFileTool: AgentTool = {
     // Optional: stream progress
     onUpdate?.({ content: [{ type: "text", text: "Reading..." }], details: {} });
 
-    // Optional: add `terminate: true` here to skip the automatic follow-up LLM call
+    // Optional: add `disposition: "stop"` here to skip the automatic follow-up LLM call
     // when every finalized tool result in the batch does the same.
     return {
       content: [{ type: "text", text: content }],
@@ -450,7 +454,7 @@ return {
 
 The resolved result's flag initializes the error outcome seen by `afterToolCall`, `tool_execution_end`, and the persisted tool-result message. `afterToolCall` can still override it.
 
-Return `terminate: true` from `execute()` or `afterToolCall` to hint that the agent should stop after the current tool batch. This only takes effect when every finalized tool result in the batch is terminating. The hint is runtime-only; emitted `toolResult` transcript messages remain standard LLM tool results.
+Return `disposition: "stop"` from `execute()` or `afterToolCall` to stop after the current tool batch, or `disposition: "final_response"` to request one additional response with tools disabled. A successful final-response result takes precedence; otherwise stopping requires every finalized result to request `stop`. The disposition is runtime-only; emitted `toolResult` transcript messages remain standard LLM tool results.
 
 ## Proxy Usage
 

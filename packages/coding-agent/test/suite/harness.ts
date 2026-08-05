@@ -5,7 +5,7 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentMessage, AgentTool } from "@hansjm10/volt-agent-core";
+import type { AgentMessage, AgentOptions, AgentTool } from "@hansjm10/volt-agent-core";
 import { Agent } from "@hansjm10/volt-agent-core";
 import type { FauxModelDefinition, FauxProviderRegistration, FauxResponseStep, Model } from "@hansjm10/volt-ai";
 import { registerFauxProvider } from "@hansjm10/volt-ai";
@@ -66,6 +66,7 @@ export interface HarnessOptions {
 	excludedToolNames?: string[];
 	resourceLoader?: ResourceLoader;
 	extensionFactories?: Array<ExtensionFactory | CreateTestExtensionsResultInput>;
+	prepareDelivery?: AgentOptions["prepareDelivery"];
 	withConfiguredAuth?: boolean;
 	/** Inject a persisted manager when a test needs to exercise session reload behavior. */
 	sessionManager?: SessionManager;
@@ -159,6 +160,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 				headers: response.headers,
 			});
 		},
+		prepareDelivery: options.prepareDelivery,
 		transformContext: async (messages: AgentMessage[]) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner) return messages;

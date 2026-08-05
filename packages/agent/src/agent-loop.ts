@@ -19,11 +19,12 @@ import type {
 	AgentLoopNextAction,
 	AgentLoopNextActionContext,
 	AgentMessage,
+	AgentRequestAuthority,
 	AgentTool,
 	AgentToolCall,
 	AgentToolResult,
-	PrepareNextTurnContext,
 	StreamFn,
+	ToolBatchDisposition,
 } from "./types.ts";
 
 type PassiveAgentEventSink = (event: AgentEvent) => void;
@@ -87,9 +88,6 @@ export function agentLoopContinue(
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
 	}
-	if (context.messages.at(-1)?.role === "assistant" && !usesNextActionProtocol(config)) {
-		throw new Error("Cannot continue from message role: assistant");
-	}
 
 	const stream = createAgentStream();
 
@@ -121,23 +119,6 @@ export async function runAgentLoop(
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
 ): Promise<AgentMessage[]> {
-	if (!usesNextActionProtocol(config)) {
-		const newMessages: AgentMessage[] = [...prompts];
-		const currentContext: AgentContext = {
-			...context,
-			messages: [...context.messages, ...prompts],
-		};
-		await emit({ type: "agent_start" });
-		await emit({ type: "turn_start" });
-		for (const [index, prompt] of prompts.entries()) {
-			const finalizedPrompt = await emitCompletedMessage(prompt, emit);
-			newMessages[index] = finalizedPrompt;
-			currentContext.messages[context.messages.length + index] = finalizedPrompt;
-		}
-		await runLegacyLoop(currentContext, newMessages, config, signal, emit, streamFn);
-		return newMessages;
-	}
-
 	const newMessages: AgentMessage[] = [];
 	const currentContext: AgentContext = { ...context, messages: [...context.messages] };
 	const initialAction: AgentLoopNextAction = {
@@ -161,19 +142,7 @@ export async function runAgentLoopContinue(
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
 	}
-	if (context.messages.at(-1)?.role === "assistant" && !usesNextActionProtocol(config)) {
-		throw new Error("Cannot continue from message role: assistant");
-	}
-
 	const newMessages: AgentMessage[] = [];
-	if (!usesNextActionProtocol(config)) {
-		const currentContext: AgentContext = { ...context };
-		await emit({ type: "agent_start" });
-		await emit({ type: "turn_start" });
-		await runLegacyLoop(currentContext, newMessages, config, signal, emit, streamFn);
-		return newMessages;
-	}
-
 	const currentContext: AgentContext = { ...context, messages: [...context.messages] };
 	await emit({ type: "agent_start" });
 	await runDispatchedLoop(
@@ -186,10 +155,6 @@ export async function runAgentLoopContinue(
 		streamFn,
 	);
 	return newMessages;
-}
-
-function usesNextActionProtocol(config: AgentLoopConfig): boolean {
-	return config.nextAction !== undefined || config.beginDelivery !== undefined || config.prepareRequest !== undefined;
 }
 
 function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
@@ -212,11 +177,14 @@ async function runDispatchedLoop(
 	let currentContext = initialContext;
 	let config = initialConfig;
 	let completedTurn: AgentLoopNextActionContext["completedTurn"];
-	let pendingToolContinuation = false;
+	let requestAuthority: AgentRequestAuthority = "provider";
 	let defaultAction = initialAction;
 
 	while (true) {
 		if (signal?.aborted) {
+			if (completedTurn) {
+				await emitBoundaryAbort(currentContext, newMessages, config, emit);
+			}
 			await emit({ type: "agent_end", messages: newMessages });
 			return;
 		}
@@ -225,14 +193,19 @@ async function runDispatchedLoop(
 			context: currentContext,
 			newMessages,
 			completedTurn,
-			pendingToolContinuation,
+			requestAuthority,
 			defaultAction,
 		};
-		const { action: resolvedAction, transferredDeliveries } = await resolveNextAction(config, actionContext, signal);
+		const hostAction = await resolveNextAction(config, actionContext);
+		if (signal?.aborted && completedTurn) {
+			await emitBoundaryAbort(currentContext, newMessages, config, emit);
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
 		const action =
-			resolvedAction.type === "pause" && resolvedAction.pendingToolContinuation === undefined
-				? { ...resolvedAction, pendingToolContinuation }
-				: resolvedAction;
+			requestAuthority === "final_response" && hostAction.type !== "pause"
+				? ({ type: "request", reason: "final_response" } as const)
+				: hostAction;
 
 		if (action.type !== "request") {
 			await emit({ type: "agent_end", messages: newMessages });
@@ -240,13 +213,12 @@ async function runDispatchedLoop(
 		}
 
 		const finalizedDeliveries = await emitDeliveries(
-			action.deliveries ?? [],
+			"deliveries" in action ? (action.deliveries ?? []) : [],
 			currentContext,
 			newMessages,
 			emit,
 			signal,
 			config.beginDelivery,
-			transferredDeliveries,
 		);
 		if (action.reason === "delivery" && finalizedDeliveries.length === 0) {
 			await emit({ type: "agent_end", messages: newMessages });
@@ -255,19 +227,10 @@ async function runDispatchedLoop(
 		const requestContext = {
 			...actionContext,
 			context: currentContext,
+			reason: action.reason,
 			deliveries: finalizedDeliveries,
 		};
-		const requestSnapshot = signal?.aborted
-			? undefined
-			: config.prepareRequest
-				? await config.prepareRequest(requestContext)
-				: completedTurn
-					? await config.prepareNextTurn?.({
-							...completedTurn,
-							context: currentContext,
-							newMessages,
-						})
-					: undefined;
+		const requestSnapshot = signal?.aborted ? undefined : await config.prepareRequest?.(requestContext);
 		if (requestSnapshot) {
 			currentContext = requestSnapshot.context ?? currentContext;
 			config = {
@@ -287,10 +250,18 @@ async function runDispatchedLoop(
 			await emit({ type: "turn_start" });
 			turnStarted = true;
 		}
+		const isFinalResponse = action.reason === "final_response";
+		const providerContext = isFinalResponse
+			? {
+					...currentContext,
+					tools: [],
+					systemPrompt: `${currentContext.systemPrompt}\n\n[VOLT FINAL RESPONSE — TRUSTED RUNTIME POLICY]\nProvide one final assistant response summarizing the completed work and verification. Do not call tools or begin additional implementation.`,
+				}
+			: currentContext;
 		const message = signal?.aborted
 			? undefined
 			: await streamAssistantResponse(
-					currentContext,
+					providerContext,
 					config,
 					signal,
 					emit,
@@ -327,6 +298,9 @@ async function runDispatchedLoop(
 			await emit({ type: "agent_end", messages: newMessages });
 			return;
 		}
+		if (providerContext !== currentContext) {
+			currentContext.messages = providerContext.messages;
+		}
 		newMessages.push(message);
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
 			await emit({ type: "turn_end", message, toolResults: [] });
@@ -336,205 +310,96 @@ async function runDispatchedLoop(
 
 		const toolCalls = message.content.filter((content) => content.type === "toolCall");
 		const toolResults: ToolResultMessage[] = [];
-		let toolBatchTerminated = false;
+		let disposition: ToolBatchDisposition = "continue";
 		if (toolCalls.length > 0) {
-			const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
-			toolResults.push(...executedToolBatch.messages);
-			toolBatchTerminated = executedToolBatch.terminate;
+			if (isFinalResponse) {
+				for (const toolCall of toolCalls) {
+					const result: ToolResultMessage = {
+						role: "toolResult",
+						toolCallId: toolCall.id,
+						toolName: toolCall.name,
+						content: [{ type: "text", text: "Tools are disabled for the final response." }],
+						details: {},
+						isError: true,
+						timestamp: Date.now(),
+					};
+					toolResults.push(await emitCompletedMessage(result, emit));
+				}
+			} else {
+				const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
+				toolResults.push(...executedToolBatch.messages);
+				disposition = executedToolBatch.disposition;
+			}
 			for (const result of toolResults) {
 				currentContext.messages.push(result);
 				newMessages.push(result);
 			}
 		}
 
+		const abortedBeforeTurnEnd = signal?.aborted === true;
 		await emit({ type: "turn_end", message, toolResults });
-		completedTurn = { message, toolResults, toolBatchTerminated };
-		pendingToolContinuation = toolCalls.length > 0 && !toolBatchTerminated;
-		defaultAction = pendingToolContinuation ? { type: "request", reason: "continuation" } : { type: "stop" };
+		completedTurn = { message, toolResults, disposition };
+		if (signal?.aborted) {
+			if (toolCalls.length > 0 || !abortedBeforeTurnEnd) {
+				await emitBoundaryAbort(currentContext, newMessages, config, emit);
+			}
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
+		if (isFinalResponse) {
+			requestAuthority = "provider";
+			defaultAction = { type: "stop" };
+		} else if (disposition === "final_response") {
+			requestAuthority = "final_response";
+			defaultAction = { type: "request", reason: "final_response" };
+		} else if (toolCalls.length > 0 && disposition === "continue") {
+			requestAuthority = "tool_continuation";
+			defaultAction = { type: "request", reason: "continuation" };
+		} else {
+			requestAuthority = "provider";
+			defaultAction = { type: "stop" };
+		}
 	}
 }
 
-/** Existing polling loop retained unchanged until callers migrate to the dispatcher. */
-async function runLegacyLoop(
-	initialContext: AgentContext,
+async function emitBoundaryAbort(
+	currentContext: AgentContext,
 	newMessages: AgentMessage[],
-	initialConfig: AgentLoopConfig,
-	signal: AbortSignal | undefined,
+	config: AgentLoopConfig,
 	emit: AgentEventSink,
-	streamFn?: StreamFn,
 ): Promise<void> {
-	let currentContext = initialContext;
-	let config = initialConfig;
-	let firstTurn = true;
-	let completedTurn: PrepareNextTurnContext | undefined;
-	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
-
-	while (true) {
-		let hasMoreToolCalls = true;
-
-		while (hasMoreToolCalls || pendingMessages.length > 0) {
-			if (signal?.aborted && pendingMessages.length === 0) {
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
-			if (!firstTurn) {
-				await emit({ type: "turn_start" });
-			} else {
-				firstTurn = false;
-			}
-
-			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					const finalizedMessage = await emitCompletedMessage(message, emit);
-					currentContext.messages.push(finalizedMessage);
-					newMessages.push(finalizedMessage);
-				}
-				pendingMessages = [];
-			}
-
-			if (completedTurn) {
-				const nextTurnSnapshot = await config.prepareNextTurn?.({
-					...completedTurn,
-					context: currentContext,
-				});
-				completedTurn = undefined;
-				if (nextTurnSnapshot) {
-					currentContext = nextTurnSnapshot.context ?? currentContext;
-					config = {
-						...config,
-						model: nextTurnSnapshot.model ?? config.model,
-						reasoning:
-							nextTurnSnapshot.thinkingLevel === undefined
-								? config.reasoning
-								: nextTurnSnapshot.thinkingLevel === "off"
-									? undefined
-									: nextTurnSnapshot.thinkingLevel,
-					};
-				}
-			}
-
-			const message = await streamAssistantResponse(
-				currentContext,
-				config,
-				signal,
-				emit,
-				{ cancelOnPreflightAbort: false, validateProviderTail: false },
-				streamFn,
-			);
-			if (!message) {
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
-			newMessages.push(message);
-
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				await emit({ type: "turn_end", message, toolResults: [] });
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
-
-			const toolCalls = message.content.filter((content) => content.type === "toolCall");
-			const toolResults: ToolResultMessage[] = [];
-			let toolBatchTerminated = false;
-			hasMoreToolCalls = false;
-			if (toolCalls.length > 0) {
-				const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
-				toolResults.push(...executedToolBatch.messages);
-				toolBatchTerminated = executedToolBatch.terminate;
-				hasMoreToolCalls = !toolBatchTerminated;
-
-				for (const result of toolResults) {
-					currentContext.messages.push(result);
-					newMessages.push(result);
-				}
-			}
-
-			await emit({ type: "turn_end", message, toolResults });
-			completedTurn = {
-				message,
-				toolResults,
-				toolBatchTerminated,
-				context: currentContext,
-				newMessages,
-			};
-
-			if (await config.shouldStopAfterTurn?.(completedTurn)) {
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
-
-			pendingMessages = (await config.getSteeringMessages?.()) || [];
-		}
-
-		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
-		if (followUpMessages.length > 0) {
-			pendingMessages = followUpMessages;
-			continue;
-		}
-		break;
-	}
-
-	await emit({ type: "agent_end", messages: newMessages });
-}
-
-interface ResolvedAgentLoopNextAction {
-	action: AgentLoopNextAction;
-	transferredDeliveries: AgentLoopDelivery[];
+	const marker = {
+		role: "assistant",
+		content: [{ type: "text", text: "" }],
+		api: config.model.api,
+		provider: config.model.provider,
+		model: config.model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "aborted",
+		errorMessage: "Request was aborted",
+		timestamp: Date.now(),
+	} satisfies AssistantMessage;
+	await emit({ type: "turn_start" });
+	await emit({ type: "message_start", message: marker });
+	const replacement = await emit({ type: "message_end", message: marker });
+	const finalizedMarker = resolveMessageReplacement(marker, replacement);
+	currentContext.messages.push(finalizedMarker);
+	newMessages.push(finalizedMarker);
+	await emit({ type: "turn_end", message: finalizedMarker, toolResults: [] });
 }
 
 async function resolveNextAction(
 	config: AgentLoopConfig,
 	context: AgentLoopNextActionContext,
-	signal: AbortSignal | undefined,
-): Promise<ResolvedAgentLoopNextAction> {
-	if (config.nextAction) {
-		return { action: await config.nextAction(context), transferredDeliveries: [] };
-	}
-
-	if (
-		context.completedTurn &&
-		(await config.shouldStopAfterTurn?.({
-			...context.completedTurn,
-			context: context.context,
-			newMessages: context.newMessages,
-		}))
-	) {
-		return { action: { type: "stop" }, transferredDeliveries: [] };
-	}
-
-	const defaultRequest = context.defaultAction.type === "request" ? context.defaultAction : undefined;
-	if (signal?.aborted) {
-		return {
-			action: defaultRequest?.reason === "continuation" ? defaultRequest : { type: "stop" },
-			transferredDeliveries: [],
-		};
-	}
-	const steering = (await config.getSteeringMessages?.()) ?? [];
-	if (steering.length > 0) {
-		const transferredDelivery: AgentLoopDelivery = { messages: steering };
-		return {
-			action: {
-				type: "request",
-				reason: defaultRequest?.reason === "continuation" ? "continuation" : "delivery",
-				deliveries: [...(defaultRequest?.deliveries ?? []), transferredDelivery],
-			},
-			transferredDeliveries: [transferredDelivery],
-		};
-	}
-	if (defaultRequest) return { action: defaultRequest, transferredDeliveries: [] };
-
-	if (signal?.aborted) {
-		return { action: { type: "stop" }, transferredDeliveries: [] };
-	}
-	const followUps = (await config.getFollowUpMessages?.()) ?? [];
-	if (followUps.length === 0) {
-		return { action: { type: "stop" }, transferredDeliveries: [] };
-	}
-	const transferredDelivery: AgentLoopDelivery = { messages: followUps };
-	return {
-		action: { type: "request", reason: "delivery", deliveries: [transferredDelivery] },
-		transferredDeliveries: [transferredDelivery],
-	};
+): Promise<AgentLoopNextAction> {
+	return config.nextAction ? await config.nextAction(context) : context.defaultAction;
 }
 
 async function emitDeliveries(
@@ -544,15 +409,11 @@ async function emitDeliveries(
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
 	beginDelivery: ((delivery: AgentLoopDelivery) => boolean) | undefined,
-	transferredDeliveries: AgentLoopDelivery[],
 ): Promise<AgentLoopDelivery[]> {
 	const finalizedDeliveries: AgentLoopDelivery[] = [];
 	for (const delivery of deliveries) {
-		const ownershipTransferred = transferredDeliveries.includes(delivery);
-		if (!ownershipTransferred) {
-			if (signal?.aborted) continue;
-			if (beginDelivery && !beginDelivery(delivery)) continue;
-		}
+		if (signal?.aborted) continue;
+		if (beginDelivery && !beginDelivery(delivery)) continue;
 		await emit({ type: "delivery_start", deliveryId: delivery.deliveryId, messages: delivery.messages });
 		const finalizedMessages: AgentMessage[] = [];
 		for (const message of delivery.messages) {
@@ -708,7 +569,7 @@ async function executeToolCalls(
 
 type ExecutedToolCallBatch = {
 	messages: ToolResultMessage[];
-	terminate: boolean;
+	disposition: ToolBatchDisposition;
 };
 
 async function executeToolCallsSequential(
@@ -763,7 +624,7 @@ async function executeToolCallsSequential(
 
 	return {
 		messages,
-		terminate: shouldTerminateToolBatch(finalizedCalls),
+		disposition: reduceToolBatchDisposition(finalizedCalls),
 	};
 }
 
@@ -829,7 +690,7 @@ async function executeToolCallsParallel(
 
 	return {
 		messages,
-		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		disposition: reduceToolBatchDisposition(orderedFinalizedCalls),
 	};
 }
 
@@ -859,8 +720,14 @@ type FinalizedToolCallOutcome = {
 
 type FinalizedToolCallEntry = FinalizedToolCallOutcome | (() => Promise<FinalizedToolCallOutcome>);
 
-function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
-	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);
+function reduceToolBatchDisposition(finalizedCalls: FinalizedToolCallOutcome[]): ToolBatchDisposition {
+	if (finalizedCalls.some((finalized) => !finalized.isError && finalized.result.disposition === "final_response")) {
+		return "final_response";
+	}
+	if (finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.disposition === "stop")) {
+		return "stop";
+	}
+	return "continue";
 }
 
 function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall): AgentToolCall {
@@ -1014,7 +881,7 @@ async function finalizeExecutedToolCall(
 				result = {
 					content: afterResult.content ?? result.content,
 					details: afterResult.details ?? result.details,
-					terminate: afterResult.terminate ?? result.terminate,
+					disposition: afterResult.disposition ?? result.disposition,
 				};
 				isError = afterResult.isError ?? isError;
 			}

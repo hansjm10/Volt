@@ -482,7 +482,7 @@ class RpcSubagentLifecycle implements RpcSubagentLifecycleController {
 	async abort(subagentId: string): Promise<void> {
 		const entry = this.getEntry(subagentId);
 		try {
-			await entry.handle.abort();
+			await entry.handle.abort("remote_request");
 		} finally {
 			await this.disposeEntry(subagentId, entry);
 		}
@@ -1121,7 +1121,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	): HostActionInvocationContext => ({
 		session: commandSession,
 		detachedReviews: true,
-		abortRun: () => commandSession.abort(),
+		abortRun: () => commandSession.abort("remote_request"),
 		compactContext: (customInstructions) =>
 			commandSession.compact(customInstructions, assertConversationGenerationCurrent),
 		newSession: (newSessionOptions) =>

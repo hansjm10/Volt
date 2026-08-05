@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import type { AgentMessage, ThinkingLevel } from "@hansjm10/volt-agent-core";
+import type { AgentAbortSource, AgentMessage, ThinkingLevel } from "@hansjm10/volt-agent-core";
 import type { AssistantMessage, Message, TextContent } from "@hansjm10/volt-ai";
 import { createInProcessRpcClient, type InProcessRpcClient } from "../../modes/rpc/in-process-rpc-client.ts";
 import type { RpcClientEvent } from "../../modes/rpc/rpc-client-base.ts";
@@ -92,7 +92,7 @@ export interface SubagentHandle {
 	 * and disposes this handle, so it cannot be retried.
 	 */
 	prompt(message: string): Promise<void>;
-	abort(): Promise<void>;
+	abort(source?: AgentAbortSource): Promise<void>;
 	getState(): Promise<RpcSessionState>;
 	getTranscript(options?: { limit?: number; beforeEntryId?: string }): Promise<RpcTranscriptResponse>;
 	getSessionStats(): Promise<SessionStats>;
@@ -527,7 +527,7 @@ class LocalSubagentHandle implements SubagentHandle {
 	readonly id: string;
 	readonly sessionId: string;
 	private readonly client: InProcessRpcClient;
-	private readonly abortRuntime: () => Promise<void>;
+	private readonly abortRuntime: (source?: AgentAbortSource) => Promise<void>;
 	private readonly removeFromManager: (id: string) => void;
 	private readonly onPromptAccepted: (message: string) => void;
 	private readonly onPromptFailed: (error: unknown) => Promise<void>;
@@ -554,7 +554,7 @@ class LocalSubagentHandle implements SubagentHandle {
 		id: string;
 		sessionId: string;
 		client: InProcessRpcClient;
-		abortRuntime: () => Promise<void>;
+		abortRuntime: (source?: AgentAbortSource) => Promise<void>;
 		removeFromManager: (id: string) => void;
 		onPromptAccepted: (message: string) => void;
 		onPromptFailed: (error: unknown) => Promise<void>;
@@ -607,13 +607,13 @@ class LocalSubagentHandle implements SubagentHandle {
 		}
 	}
 
-	async abort(): Promise<void> {
+	async abort(source?: AgentAbortSource): Promise<void> {
 		this.assertOpen();
 		this.abortRequested = true;
 		this.onAbortRequested();
 		// Abort the in-process runtime directly so cancellation is signalled before
 		// concurrent disposal can close the loopback transport.
-		await this.abortRuntime();
+		await this.abortRuntime(source);
 	}
 
 	async getState(): Promise<RpcSessionState> {
@@ -662,7 +662,7 @@ class LocalSubagentHandle implements SubagentHandle {
 			// promise so the manager's terminal handler records "aborted" rather
 			// than "failed".
 			this.onAbortRequested();
-			void this.abortRuntime().catch(() => undefined);
+			void this.abortRuntime("disposal").catch(() => undefined);
 		}
 		this.settleOwnership();
 		if (!this.endSettled) {
@@ -1381,6 +1381,8 @@ export class SubagentManager {
 		const turnBudget = new SubagentTurnBudget(delegation.scopeLease.scope.turnLimits);
 		let requiresFinalTurnReport = false;
 		let stopAfterTurnForBudget = false;
+		let pendingBudgetDelivery: string | undefined;
+		let finalResponseSatisfiedBudget = false;
 		const abortForTurnBudget = (): void => {
 			stopAfterTurnForBudget = true;
 			this.markActivityAbortRequested(id);
@@ -1394,7 +1396,7 @@ export class SubagentManager {
 		// spawn failure), but only while the budget wrapper is still the installed
 		// hook.
 		const originalBeforeToolCall = runtime.session.agent.beforeToolCall;
-		const originalShouldStopAfterTurn = runtime.session.agent.shouldStopAfterTurn;
+		const originalNextAction = runtime.session.agent.nextAction;
 		const budgetBeforeToolCall: NonNullable<typeof originalBeforeToolCall> = async (context, signal) => {
 			if (requiresFinalTurnReport) {
 				// This block reason is the guaranteed instruction channel for the
@@ -1406,17 +1408,38 @@ export class SubagentManager {
 			}
 			return originalBeforeToolCall?.(context, signal);
 		};
-		const budgetShouldStopAfterTurn: NonNullable<typeof originalShouldStopAfterTurn> = async (context, signal) => {
-			// A budget stop deliberately skips the original hook
-			// (AgentSession._shouldStopForProactiveCompaction): its side effects —
-			// scheduling threshold compaction with an automatic resume and draining
-			// queued follow-ups on the next continuation — only apply to runs that
-			// keep going, and a scheduled auto-resume would contradict this stop.
-			if (stopAfterTurnForBudget) return true;
-			return (await originalShouldStopAfterTurn?.(context, signal)) ?? false;
+		const budgetNextAction: NonNullable<typeof originalNextAction> = async (context, signal) => {
+			if (context.requestAuthority === "final_response") {
+				pendingBudgetDelivery = undefined;
+				finalResponseSatisfiedBudget = requiresFinalTurnReport;
+				return originalNextAction ? await originalNextAction(context, signal) : context.defaultAction;
+			}
+			if (pendingBudgetDelivery !== undefined) {
+				const content = pendingBudgetDelivery;
+				pendingBudgetDelivery = undefined;
+				return {
+					type: "request",
+					reason: "delivery",
+					deliveries: [
+						{
+							messages: [
+								{
+									role: "user",
+									content: [{ type: "text", text: content }],
+									timestamp: Date.now(),
+								},
+							],
+						},
+					],
+				};
+			}
+			// A budget stop deliberately skips proactive compaction: auto-resume
+			// would contradict the terminal budget decision.
+			if (stopAfterTurnForBudget && context.completedTurn) return { type: "stop" };
+			return originalNextAction ? await originalNextAction(context, signal) : context.defaultAction;
 		};
 		runtime.session.agent.beforeToolCall = budgetBeforeToolCall;
-		runtime.session.agent.shouldStopAfterTurn = budgetShouldStopAfterTurn;
+		runtime.session.agent.nextAction = budgetNextAction;
 		const unsubscribeSessionAccounting = runtime.session.subscribe(
 			(event) => {
 				if (event.type === "turn_end") {
@@ -1424,6 +1447,10 @@ export class SubagentManager {
 					// consume budget so a flaky child still converges on its report
 					// stage instead of retrying without bound.
 					delegation.scopeLease.scope.recordTurn();
+					if (finalResponseSatisfiedBudget) {
+						finalResponseSatisfiedBudget = false;
+						return;
+					}
 					const requestedTool =
 						event.message.role === "assistant" &&
 						event.message.content.some((content) => content.type === "toolCall");
@@ -1444,15 +1471,7 @@ export class SubagentManager {
 					}
 					if (turnBudgetEvent.stage === "warning") {
 						if (!requestedTool) return;
-						// Best-effort: steer() is async and races the loop's steering
-						// pickup after this turn, so the message may only reach the model
-						// one turn later. Enforcement never depends on it — the
-						// beforeToolCall block reason is the guaranteed channel.
-						void runtime.session
-							.steer(
-								`This subagent has used ${turnBudgetEvent.turnsUsed} of its ${turnBudgetEvent.maxTurns} allowed turns. Stop broad exploration, finish the current line of inquiry, and begin synthesizing a report.`,
-							)
-							.catch(() => undefined);
+						pendingBudgetDelivery = `This subagent has used ${turnBudgetEvent.turnsUsed} of its ${turnBudgetEvent.maxTurns} allowed turns. Stop broad exploration, finish the current line of inquiry, and begin synthesizing a report.`;
 						return;
 					}
 					if (!requestedTool) {
@@ -1464,11 +1483,7 @@ export class SubagentManager {
 						return;
 					}
 					requiresFinalTurnReport = true;
-					void runtime.session
-						.steer(
-							`This subagent has reached its ${turnBudgetEvent.maxTurns}-turn limit. Do not call any more tools. Return your best final report now, including useful findings, evidence, and any unresolved gaps.`,
-						)
-						.catch((_error: unknown) => abortForTurnBudget());
+					pendingBudgetDelivery = `This subagent has reached its ${turnBudgetEvent.maxTurns}-turn limit. Do not call any more tools. Return your best final report now, including useful findings, evidence, and any unresolved gaps.`;
 					return;
 				}
 				if (event.type !== "message_end" || event.message.role !== "assistant") return;
@@ -1488,8 +1503,8 @@ export class SubagentManager {
 			if (runtime.session.agent.beforeToolCall === budgetBeforeToolCall) {
 				runtime.session.agent.beforeToolCall = originalBeforeToolCall;
 			}
-			if (runtime.session.agent.shouldStopAfterTurn === budgetShouldStopAfterTurn) {
-				runtime.session.agent.shouldStopAfterTurn = originalShouldStopAfterTurn;
+			if (runtime.session.agent.nextAction === budgetNextAction) {
+				runtime.session.agent.nextAction = originalNextAction;
 			}
 		};
 		let client: InProcessRpcClient | undefined;
@@ -1551,7 +1566,7 @@ export class SubagentManager {
 				id,
 				sessionId: runtime.session.sessionId,
 				client,
-				abortRuntime: () => runtime.session.abort(),
+				abortRuntime: (source) => runtime.session.abort(source),
 				removeFromManager: (handleId) => {
 					this.handles.delete(handleId);
 				},

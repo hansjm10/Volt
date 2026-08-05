@@ -260,11 +260,17 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 			const prompt = harness.session.prompt("start").catch(() => {});
 			await assistantEntered;
 			await harness.session.dispose();
-			expect(harness.sessionManager.buildSessionContext().messages.map((message) => message.role)).toEqual(["user"]);
+			const disposedMessages = harness.sessionManager.buildSessionContext().messages;
+			expect(disposedMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
+			expect(disposedMessages.at(-1)).toMatchObject({
+				role: "assistant",
+				stopReason: "aborted",
+				diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
+			});
 
 			releaseAssistant();
 			await prompt;
-			expect(harness.sessionManager.buildSessionContext().messages.map((message) => message.role)).toEqual(["user"]);
+			expect(harness.sessionManager.buildSessionContext().messages).toEqual(disposedMessages);
 		} finally {
 			releaseAssistant();
 			harness.cleanup();

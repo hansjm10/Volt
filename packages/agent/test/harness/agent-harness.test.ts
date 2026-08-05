@@ -118,6 +118,60 @@ describe("AgentHarness", () => {
 		expect(steerQueueLengths).toEqual([1, 2, 1, 0]);
 	});
 
+	it("finalizes before leasing queued steering and processes it at the next boundary", async () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		const requestSnapshots: Array<{ users: string[]; tools: string[] }> = [];
+		registration.setResponses([
+			(context) => {
+				requestSnapshots.push({
+					users: textFromUserMessages(context.messages),
+					tools: context.tools?.map((tool) => tool.name) ?? [],
+				});
+				return fauxAssistantMessage(fauxToolCall("calculate", { expression: "2 + 2" }, { id: "call-1" }), {
+					stopReason: "toolUse",
+				});
+			},
+			(context) => {
+				requestSnapshots.push({
+					users: textFromUserMessages(context.messages),
+					tools: context.tools?.map((tool) => tool.name) ?? [],
+				});
+				return fauxAssistantMessage("finalized");
+			},
+			(context) => {
+				requestSnapshots.push({
+					users: textFromUserMessages(context.messages),
+					tools: context.tools?.map((tool) => tool.name) ?? [],
+				});
+				return fauxAssistantMessage("handled queued steering");
+			},
+		]);
+		const harness = new AgentHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session: new Session(new InMemorySessionStorage()),
+			model: registration.getModel(),
+			tools: [calculateTool],
+		});
+		let queued = false;
+		harness.subscribe((event) => {
+			if (event.type === "message_start" && event.message.role === "assistant" && !queued) {
+				queued = true;
+				void harness.steer("queued steering");
+			}
+		});
+		harness.on("tool_result", () => ({ disposition: "final_response" }));
+
+		const response = await harness.prompt("complete and summarize");
+
+		expect(response.content).toEqual([{ type: "text", text: "handled queued steering" }]);
+		expect(requestSnapshots).toEqual([
+			{ users: ["complete and summarize"], tools: ["calculate"] },
+			{ users: ["complete and summarize"], tools: [] },
+			{ users: ["complete and summarize", "queued steering"], tools: ["calculate"] },
+		]);
+	});
+
 	it("abort after a steering delivery begins does not report its payload as revoked", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);
@@ -823,7 +877,7 @@ describe("AgentHarness", () => {
 			return {
 				content: [{ type: "text", text: "patched result" }],
 				details: { patched: true },
-				terminate: true,
+				disposition: "stop",
 			};
 		});
 

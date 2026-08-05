@@ -349,6 +349,36 @@ describe("Agent", () => {
 		expect(agent.state.isStreaming).toBe(false);
 	});
 
+	it("rejects abort requests once agent_end settlement begins", async () => {
+		const agentEndStarted = createDeferred();
+		const releaseAgentEnd = createDeferred();
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("completed") });
+				});
+				return stream;
+			},
+		});
+		agent.subscribe(async (event) => {
+			if (event.type !== "agent_end") return;
+			agentEndStarted.resolve();
+			await releaseAgentEnd.promise;
+		});
+
+		const prompting = agent.prompt("complete normally");
+		await agentEndStarted.promise;
+		expect(agent.abort("remote_request")).toMatchObject({ accepted: false, source: undefined });
+		releaseAgentEnd.resolve();
+		await prompting;
+
+		const assistants = agent.state.messages.filter((message) => message.role === "assistant");
+		expect(assistants).toHaveLength(1);
+		expect(assistants[0]).toMatchObject({ stopReason: "stop" });
+		expect(assistants[0]?.diagnostics?.filter((diagnostic) => diagnostic.type === "runtime_abort") ?? []).toEqual([]);
+	});
+
 	it("waitForIdle should wait for async subscribers", async () => {
 		const barrier = createDeferred();
 		const agent = new Agent({
@@ -449,7 +479,7 @@ describe("Agent", () => {
 				return {
 					content: [{ type: "text", text: "ok" }],
 					details: { status: "done" },
-					terminate: true,
+					disposition: "stop",
 				};
 			},
 		};
@@ -510,7 +540,7 @@ describe("Agent", () => {
 				return {
 					content: [{ type: "text", text: "done" }],
 					details: { status: "done" },
-					terminate: true,
+					disposition: "stop",
 				};
 			},
 		};
@@ -525,7 +555,7 @@ describe("Agent", () => {
 				return {
 					content: [{ type: "text", text: "done" }],
 					details: { status: "done" },
-					terminate: true,
+					disposition: "stop",
 				};
 			},
 		};
@@ -815,6 +845,97 @@ describe("Agent", () => {
 		await expect(agent.prompt("second")).rejects.toThrow("Agent is already processing a prompt");
 		releasePreparation.resolve();
 		await firstPrompt;
+	});
+
+	it("keeps a fresh prompt delivery-dependent through asynchronous preparation", async () => {
+		const preparationStarted = createDeferred();
+		const releasePreparation = createDeferred();
+		const requestReasons: string[] = [];
+		const providerUserTexts: Array<string | undefined> = [];
+		let blockFirstPrompt = true;
+		const agent = new Agent({
+			prepareDelivery: async (delivery) => {
+				if (delivery.kind === "prompt" && blockFirstPrompt) {
+					blockFirstPrompt = false;
+					preparationStarted.resolve();
+					await releasePreparation.promise;
+				}
+				return { messages: [...delivery.messages] };
+			},
+			prepareRequest: (context) => {
+				requestReasons.push(context.reason);
+				return undefined;
+			},
+			streamFn: (_model, context) => {
+				providerUserTexts.push(
+					context.messages
+						.map((message) => getUserText(message as AgentMessage))
+						.filter((text) => text !== undefined)
+						.at(-1),
+				);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+
+		const revokedPrompt = agent.prompt("revoked");
+		await preparationStarted.promise;
+		expect(agent.discardPendingPrompt()).toHaveLength(1);
+		releasePreparation.resolve();
+		await revokedPrompt;
+
+		expect(requestReasons).toEqual([]);
+		expect(providerUserTexts).toEqual([]);
+		expect(agent.state.messages).toEqual([]);
+
+		await agent.prompt("replacement");
+		expect(requestReasons).toEqual(["delivery"]);
+		expect(providerUserTexts).toEqual(["replacement"]);
+	});
+
+	it("preserves a provider-ready continuation when a fresh prompt is revoked", async () => {
+		const preparationStarted = createDeferred();
+		const releasePreparation = createDeferred();
+		const requestReasons: string[] = [];
+		const providerUserTexts: Array<Array<string | undefined>> = [];
+		const existing = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "existing" }],
+			timestamp: Date.now(),
+		};
+		const agent = new Agent({
+			initialState: { messages: [existing] },
+			prepareDelivery: async (delivery) => {
+				preparationStarted.resolve();
+				await releasePreparation.promise;
+				return { messages: [...delivery.messages] };
+			},
+			prepareRequest: (context) => {
+				requestReasons.push(context.reason);
+				return undefined;
+			},
+			streamFn: (_model, context) => {
+				providerUserTexts.push(context.messages.map((message) => getUserText(message as AgentMessage)));
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+
+		const prompting = agent.prompt("revoked");
+		await preparationStarted.promise;
+		expect(agent.discardPendingPrompt()).toHaveLength(1);
+		releasePreparation.resolve();
+		await prompting;
+
+		expect(requestReasons).toEqual(["continuation"]);
+		expect(providerUserTexts).toEqual([["existing"]]);
+		expect(agent.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
 	});
 
 	it("restores follow-up messages when loop preparation fails and delivers them on retry", async () => {
@@ -1122,6 +1243,51 @@ describe("Agent", () => {
 		expect(observedCommitted).toBe(true);
 	});
 
+	it("continue() is a no-op for an assistant tail without queued delivery or host policy", async () => {
+		let providerCalls = 0;
+		const agent = new Agent({
+			streamFn: () => {
+				providerCalls++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("unexpected") });
+				});
+				return stream;
+			},
+		});
+		const tail = createAssistantMessage("already complete");
+		agent.state.messages = [tail];
+
+		await expect(agent.continue()).resolves.toBeUndefined();
+
+		expect(providerCalls).toBe(0);
+		expect(agent.state.messages).toEqual([tail]);
+		expect(agent.state.errorMessage).toBeUndefined();
+	});
+
+	it("treats the canonical nextAction default as a no-op at an assistant tail", async () => {
+		let providerCalls = 0;
+		const tail = createAssistantMessage("already complete");
+		const agent = new Agent({
+			initialState: { messages: [tail] },
+			nextAction: (context) => context.defaultAction,
+			streamFn: () => {
+				providerCalls++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("unexpected") });
+				});
+				return stream;
+			},
+		});
+
+		await agent.continue();
+
+		expect(providerCalls).toBe(0);
+		expect(agent.state.messages).toEqual([tail]);
+		expect(agent.state.errorMessage).toBeUndefined();
+	});
+
 	it("allows nextAction to attach the required user delivery from an assistant tail", async () => {
 		let attached = false;
 		let providerUserTexts: Array<string | undefined> = [];
@@ -1220,7 +1386,7 @@ describe("Agent", () => {
 			{
 				role: "toolResult",
 				toolCallId: "call-1",
-				toolName: "terminate",
+				toolName: "completed_operation",
 				content: [{ type: "text", text: "done" }],
 				isError: false,
 				timestamp: Date.now(),
@@ -1439,5 +1605,247 @@ describe("Agent", () => {
 		release.resolve();
 		await prompting;
 		expect(agent.state.pendingToolExecutions.size).toBe(0);
+	});
+
+	it("treats an irrevocably started delivery as an accepted request for abort settlement", async () => {
+		let deliverySnapshotAccepted = false;
+		let providerCalls = 0;
+		const agent = new Agent({
+			streamFn: () => {
+				providerCalls++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("unexpected") });
+				});
+				return stream;
+			},
+		});
+		agent.subscribe((event) => {
+			if (event.type !== "delivery_start") return;
+			deliverySnapshotAccepted = agent.activeRunSnapshot?.requestAccepted === true;
+			agent.abort("disposal");
+		});
+
+		await agent.prompt("abort after delivery admission");
+
+		expect(deliverySnapshotAccepted).toBe(true);
+		expect(providerCalls).toBe(0);
+		expect(agent.state.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
+		});
+	});
+
+	it("keeps sourced cancellation marker-free when next-action preflight fails before admission", async () => {
+		let agent!: Agent;
+		agent = new Agent({
+			nextAction: async () => {
+				agent.abort("host_action");
+				throw new Error("cancelled preflight");
+			},
+		});
+
+		await agent.prompt("never admit this delivery");
+
+		expect(agent.state.messages).toEqual([]);
+		expect(agent.hasQueuedMessages()).toBe(true);
+		expect(agent.state.errorMessage).toBeUndefined();
+	});
+
+	it("persists the first known local abort source on the terminal assistant", async () => {
+		const requestStarted = createDeferred();
+		const agent = new Agent({
+			streamFn: (_model, _context, options) => {
+				const stream = new MockAssistantStream();
+				options?.signal?.addEventListener(
+					"abort",
+					() => {
+						const message = { ...createAssistantMessage(""), stopReason: "aborted" as const };
+						stream.push({ type: "error", seq: 1, reason: "aborted", error: message });
+					},
+					{ once: true },
+				);
+				requestStarted.resolve();
+				return stream;
+			},
+		});
+
+		const prompting = agent.prompt("abort me");
+		await requestStarted.promise;
+		const first = agent.abort("host_action");
+		const second = agent.abort("disposal");
+		await prompting;
+
+		expect(first).toMatchObject({ accepted: true, source: "host_action" });
+		expect(second).toMatchObject({ accepted: true, source: "host_action", runId: first.runId });
+		const assistant = agent.state.messages.at(-1);
+		expect(assistant).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "host_action" } })],
+		});
+	});
+
+	it("allows a known abort authority to fill an earlier unattributed cancellation", async () => {
+		const requestStarted = createDeferred();
+		const releaseAbort = createDeferred();
+		const agent = new Agent({
+			streamFn: (_model, _context, options) => {
+				const stream = new MockAssistantStream();
+				options?.signal?.addEventListener(
+					"abort",
+					() => {
+						void releaseAbort.promise.then(() => {
+							const message = { ...createAssistantMessage(""), stopReason: "aborted" as const };
+							stream.push({ type: "error", seq: 1, reason: "aborted", error: message });
+						});
+					},
+					{ once: true },
+				);
+				requestStarted.resolve();
+				return stream;
+			},
+		});
+
+		const prompting = agent.prompt("abort me");
+		await requestStarted.promise;
+		expect(agent.abort()).toMatchObject({ accepted: true, source: undefined });
+		expect(agent.abort("remote_request")).toMatchObject({ accepted: true, source: "remote_request" });
+		releaseAbort.resolve();
+		await prompting;
+
+		expect(agent.state.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "remote_request" } })],
+		});
+	});
+
+	it("does not fabricate abort provenance for provider outcomes", async () => {
+		for (const stopReason of ["stop", "aborted"] as const) {
+			const agent = new Agent({
+				streamFn: () => {
+					const stream = new MockAssistantStream();
+					queueMicrotask(() => {
+						const message = { ...createAssistantMessage(stopReason), stopReason };
+						if (stopReason === "aborted") {
+							stream.push({ type: "error", seq: 1, reason: "aborted", error: message });
+						} else {
+							stream.push({ type: "done", seq: 1, reason: "stop", message });
+						}
+					});
+					return stream;
+				},
+			});
+
+			await agent.prompt("provider outcome");
+			const assistant = agent.state.messages.at(-1);
+			expect(assistant).toMatchObject({ role: "assistant", stopReason });
+			if (assistant?.role !== "assistant") throw new Error("expected assistant outcome");
+			expect(assistant.diagnostics?.filter((diagnostic) => diagnostic.type === "runtime_abort") ?? []).toEqual([]);
+		}
+	});
+
+	it("re-canonicalizes a terminal message when abort lands during an awaited listener", async () => {
+		const terminalListenerStarted = createDeferred();
+		const releaseTerminalListener = createDeferred();
+		let laterListenerMessage: AssistantMessage | undefined;
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("completed") });
+				});
+				return stream;
+			},
+		});
+		agent.subscribe(async (event) => {
+			if (event.type !== "message_end" || event.message.role !== "assistant") return;
+			terminalListenerStarted.resolve();
+			await releaseTerminalListener.promise;
+		});
+		agent.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				laterListenerMessage = event.message;
+			}
+		});
+
+		const prompting = agent.prompt("race terminal listener");
+		await terminalListenerStarted.promise;
+		expect(agent.abort("remote_request")).toMatchObject({ accepted: true, source: "remote_request" });
+		releaseTerminalListener.resolve();
+		await prompting;
+
+		const expectedTerminalMessage = {
+			role: "assistant",
+			stopReason: "stop",
+			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "remote_request" } })],
+		};
+		expect(laterListenerMessage).toMatchObject(expectedTerminalMessage);
+		expect(agent.state.messages.at(-1)).toMatchObject(expectedTerminalMessage);
+	});
+
+	it("re-canonicalizes runtime abort diagnostics across message replacements without mutating snapshots", async () => {
+		const requestStarted = createDeferred();
+		const replacementDiagnostics = [
+			{ type: "extension_one", timestamp: 1, details: { retained: true } },
+			{ type: "runtime_abort", timestamp: 2, details: { source: "disposal" } },
+		];
+		let secondListenerInput: AssistantMessage | undefined;
+		const agent = new Agent({
+			streamFn: (_model, _context, options) => {
+				const stream = new MockAssistantStream();
+				options?.signal?.addEventListener(
+					"abort",
+					() => {
+						const message = { ...createAssistantMessage(""), stopReason: "aborted" as const };
+						stream.push({ type: "error", seq: 1, reason: "aborted", error: message });
+					},
+					{ once: true },
+				);
+				requestStarted.resolve();
+				return stream;
+			},
+		});
+		agent.subscribe((event) => {
+			if (event.type !== "message_end" || event.message.role !== "assistant") return undefined;
+			return { ...event.message, diagnostics: replacementDiagnostics } as AssistantMessage;
+		});
+		agent.subscribe((event) => {
+			if (event.type !== "message_end" || event.message.role !== "assistant") return undefined;
+			secondListenerInput = event.message;
+			return {
+				...event.message,
+				diagnostics: [
+					...(event.message.diagnostics ?? []),
+					{ type: "extension_two", timestamp: 3, details: { retained: true } },
+					{ type: "runtime_abort", timestamp: 4, details: { source: "keyboard_interrupt" } },
+				],
+			} as AssistantMessage;
+		});
+
+		const prompting = agent.prompt("abort with replacements");
+		await requestStarted.promise;
+		agent.abort("session_replacement");
+		await prompting;
+
+		expect(replacementDiagnostics).toEqual([
+			{ type: "extension_one", timestamp: 1, details: { retained: true } },
+			{ type: "runtime_abort", timestamp: 2, details: { source: "disposal" } },
+		]);
+		expect(secondListenerInput?.diagnostics).toEqual([
+			{ type: "extension_one", timestamp: 1, details: { retained: true } },
+			expect.objectContaining({ type: "runtime_abort", details: { source: "session_replacement" } }),
+		]);
+		const assistant = agent.state.messages.at(-1);
+		if (assistant?.role !== "assistant") throw new Error("expected assistant outcome");
+		expect(assistant.diagnostics?.map((diagnostic) => diagnostic.type)).toEqual([
+			"extension_one",
+			"extension_two",
+			"runtime_abort",
+		]);
+		expect(assistant.diagnostics?.at(-1)).toMatchObject({
+			details: { source: "session_replacement" },
+		});
 	});
 });

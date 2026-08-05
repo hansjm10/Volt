@@ -342,7 +342,6 @@ export function createPlanningToolDefinitions(
 					content: [{ type: "text", text: stateResultText(planning) }],
 					details: planning,
 					isError: false,
-					terminate: false,
 				};
 			},
 		},
@@ -377,7 +376,7 @@ export function createPlanningToolDefinitions(
 					content: [{ type: "text", text: stateResultText(planning) }],
 					details: planning,
 					isError: false,
-					terminate: true,
+					disposition: "stop",
 				};
 			},
 		},
@@ -416,7 +415,7 @@ export function createPlanningToolDefinitions(
 					content: [{ type: "text", text: stateResultText(planning) }],
 					details: planning,
 					isError: false,
-					terminate: plan.phase === "completed",
+					disposition: plan.phase === "completed" ? "final_response" : undefined,
 				};
 			},
 		},
@@ -450,7 +449,7 @@ export function createPlanningToolDefinitions(
 					content: [{ type: "text", text: stateResultText(planning) }],
 					details: planning,
 					isError: false,
-					terminate: true,
+					disposition: "stop",
 				};
 			},
 		},

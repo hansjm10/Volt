@@ -1839,8 +1839,8 @@ volt.registerTool({
       content: [{ type: "text", text: "Done" }],  // Sent to LLM
       details: { data: result },                   // For rendering & state
       // Optional: stop after this tool batch when every finalized tool result
-      // in the batch also returns terminate: true.
-      terminate: true,
+      // in the batch also requests the stop disposition.
+      disposition: "stop",
     };
   },
 
@@ -1852,7 +1852,7 @@ volt.registerTool({
 
 **Signaling errors:** Throw from `execute` when a failure has no structured result. The agent catches the error, sets `isError: true`, and reports it to the LLM. When a protocol supplies useful failure content or details, return them with `isError: true`; the flag propagates through tool-result hooks, events, and the model-visible result.
 
-**Early termination:** Return `terminate: true` from `execute()` to hint that the automatic follow-up LLM call should be skipped after the current tool batch. This only takes effect when every finalized tool result in that batch is terminating. See [examples/extensions/structured-output.ts](../examples/extensions/structured-output.ts) for a minimal example where the agent ends on a final structured-output tool call.
+**Tool disposition:** Return `disposition: "stop"` from `execute()` to skip the automatic follow-up LLM call when every finalized result in the batch requests it. Return `disposition: "final_response"` to authorize one additional tool-free response; a successful final-response result takes precedence over other batch results. See [examples/extensions/structured-output.ts](../examples/extensions/structured-output.ts) for a minimal stop-disposition example.
 
 ```typescript
 async execute(toolCallId, params) {
@@ -2631,7 +2631,7 @@ All examples in [examples/extensions/](../examples/extensions/).
 | `questionnaire.ts` | Multi-step wizard tool | `registerTool`, `ui.custom` |
 | `todo.ts` | Stateful tool with persistence | `registerTool`, `appendEntry`, `renderResult`, session events |
 | `dynamic-tools.ts` | Register tools after startup and during commands | `registerTool`, `session_start`, `registerCommand` |
-| `structured-output.ts` | Final structured-output tool with `terminate: true` | `registerTool`, terminating tool results |
+| `structured-output.ts` | Final structured-output tool with `disposition: "stop"` | `registerTool`, tool dispositions |
 | `truncated-tool.ts` | Output truncation example | `registerTool`, `truncateHead` |
 | `tool-override.ts` | Override built-in read tool | `registerTool` (same name as built-in) |
 | **Commands** |||

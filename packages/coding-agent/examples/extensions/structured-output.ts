@@ -1,7 +1,7 @@
 /**
  * Structured Output Tool
  *
- * Demonstrates `terminate: true` so the agent can end on a tool call
+ * Demonstrates `disposition: "stop"` so the agent can end on a tool call
  * without paying for an extra follow-up LLM turn.
  */
 
@@ -39,7 +39,7 @@ const structuredOutputTool = defineTool({
 				summary: params.summary,
 				actionItems: params.actionItems,
 			} satisfies StructuredOutputDetails,
-			terminate: true,
+			disposition: "stop",
 		};
 	},
 

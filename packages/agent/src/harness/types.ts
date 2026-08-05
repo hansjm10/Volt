@@ -685,7 +685,7 @@ export interface ToolResultPatch {
 	content?: Array<TextContent | ImageContent>;
 	details?: unknown;
 	isError?: boolean;
-	terminate?: boolean;
+	disposition?: "stop" | "final_response";
 }
 
 export interface SessionBeforeCompactResult {
