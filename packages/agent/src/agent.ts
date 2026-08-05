@@ -1,4 +1,5 @@
 import {
+	type AssistantMessage,
 	type ImageContent,
 	type InferenceSpeed,
 	type Message,
@@ -14,6 +15,8 @@ import { DeliveryInbox, type DeliveryLease, type InboxDelivery } from "./deliver
 import type {
 	AfterToolCallContext,
 	AfterToolCallResult,
+	AgentAbortAcceptance,
+	AgentAbortSource,
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
@@ -21,8 +24,9 @@ import type {
 	AgentLoopNextAction,
 	AgentLoopNextActionContext,
 	AgentLoopRequestUpdate,
-	AgentLoopTurnUpdate,
 	AgentMessage,
+	AgentRequestAuthority,
+	AgentRunSnapshot,
 	AgentState,
 	AgentTool,
 	BeforeToolCallContext,
@@ -30,7 +34,6 @@ import type {
 	PendingToolExecution,
 	PrepareRequestContext,
 	QueueMode,
-	ShouldStopAfterTurnContext,
 	StreamFn,
 	ToolExecutionMode,
 } from "./types.ts";
@@ -136,18 +139,6 @@ export interface AgentOptions {
 	onResponse?: SimpleStreamOptions["onResponse"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
-	/** Temporary bridge while consumers migrate to `prepareRequest`. */
-	prepareNextTurn?: (
-		signal?: AbortSignal,
-	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
-	/** Temporary bridge while queued consumers migrate to `prepareDelivery`. */
-	prepareQueuedMessages?: (
-		messages: AgentMessage[],
-		delivery: "steer" | "followUp",
-		signal?: AbortSignal,
-	) => Promise<AgentMessage[]> | AgentMessage[];
-	/** Temporary bridge while consumers migrate to `nextAction`. */
-	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext, signal?: AbortSignal) => boolean | Promise<boolean>;
 	/** Stage a leased inbox delivery before its irrevocable begin boundary. */
 	prepareDelivery?: (
 		delivery: AgentDelivery,
@@ -188,16 +179,20 @@ type PendingDelivery = InboxDelivery<AgentDeliveryKind, AgentMessage>;
 
 type DispatcherStartState = {
 	firstDecision: boolean;
-	providerRequestPending: boolean;
-	pendingToolContinuation: boolean;
+	requestAuthority: AgentRequestAuthority;
 	drainFollowUpsFirst?: boolean;
 };
 
 type ActiveRun = {
+	id: string;
 	promise: Promise<void>;
 	resolve: () => void;
 	abortController: AbortController;
 	turnOpen: boolean;
+	abortSource?: AgentAbortSource;
+	diagnosticTimestamp?: number;
+	requestAccepted: boolean;
+	phase: "open" | "terminal_event_settling" | "settled";
 };
 
 /**
@@ -216,7 +211,7 @@ export class Agent {
 	private readonly preparedDeliveryCommits = new Map<string, () => void>();
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
-	private pausedState?: Pick<DispatcherStartState, "providerRequestPending" | "pendingToolContinuation">;
+	private pausedState?: Pick<DispatcherStartState, "requestAuthority">;
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -232,21 +227,6 @@ export class Agent {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
-	/** Temporary bridge while consumers migrate to `prepareRequest`. */
-	public prepareNextTurn?: (
-		signal?: AbortSignal,
-	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
-	/** Temporary bridge while queued consumers migrate to `prepareDelivery`. */
-	public prepareQueuedMessages?: (
-		messages: AgentMessage[],
-		delivery: "steer" | "followUp",
-		signal?: AbortSignal,
-	) => Promise<AgentMessage[]> | AgentMessage[];
-	/** Temporary bridge while consumers migrate to `nextAction`. */
-	public shouldStopAfterTurn?: (
-		context: ShouldStopAfterTurnContext,
-		signal?: AbortSignal,
-	) => boolean | Promise<boolean>;
 	/** Stage one dispatcher-owned delivery before it enters model context. */
 	public prepareDelivery?: (
 		delivery: AgentDelivery,
@@ -286,9 +266,6 @@ export class Agent {
 		this.onResponse = options.onResponse;
 		this.beforeToolCall = options.beforeToolCall;
 		this.afterToolCall = options.afterToolCall;
-		this.prepareNextTurn = options.prepareNextTurn;
-		this.prepareQueuedMessages = options.prepareQueuedMessages;
-		this.shouldStopAfterTurn = options.shouldStopAfterTurn;
 		this.prepareDelivery = options.prepareDelivery;
 		this.nextAction = options.nextAction;
 		this.prepareRequest = options.prepareRequest;
@@ -384,9 +361,32 @@ export class Agent {
 		return this.activeRun?.abortController.signal;
 	}
 
-	/** Abort the current run, if one is active. */
-	abort(): void {
-		this.activeRun?.abortController.abort();
+	/** Abort the current run, recording the first known local authority. */
+	abort(source?: AgentAbortSource): AgentAbortAcceptance {
+		const run = this.activeRun;
+		if (!run || run.phase === "settled") {
+			return Object.freeze({ runId: run?.id, accepted: false, source: run?.abortSource });
+		}
+		if (source !== undefined && run.abortSource === undefined) {
+			run.abortSource = source;
+			run.diagnosticTimestamp = Date.now();
+		}
+		run.abortController.abort();
+		return Object.freeze({ runId: run.id, accepted: true, source: run.abortSource });
+	}
+
+	/** Immutable lifecycle snapshot for structural teardown. */
+	get activeRunSnapshot(): AgentRunSnapshot | undefined {
+		const run = this.activeRun;
+		return run
+			? Object.freeze({
+					runId: run.id,
+					source: run.abortSource,
+					diagnosticTimestamp: run.diagnosticTimestamp,
+					requestAccepted: run.requestAccepted,
+					phase: run.phase,
+				})
+			: undefined;
 	}
 
 	/**
@@ -430,8 +430,7 @@ export class Agent {
 		this.enqueueDelivery("prompt", this.normalizePromptInput(input, images));
 		await this.runDispatcher({
 			firstDecision: true,
-			providerRequestPending: false,
-			pendingToolContinuation: false,
+			requestAuthority: "provider",
 		});
 	}
 
@@ -446,12 +445,13 @@ export class Agent {
 		}
 		const pausedState = this.pausedState;
 		this.pausedState = undefined;
-		const assistantTail = lastMessage?.role === "assistant";
+		if (lastMessage?.role === "assistant" && !this.hasQueuedMessages() && !this.nextAction && !pausedState) {
+			return;
+		}
 		await this.runDispatcher({
 			firstDecision: true,
-			providerRequestPending: pausedState?.providerRequestPending ?? (lastMessage !== undefined && !assistantTail),
-			pendingToolContinuation: pausedState?.pendingToolContinuation ?? false,
-			drainFollowUpsFirst: options.drainFollowUps === true,
+			requestAuthority: pausedState?.requestAuthority ?? "provider",
+			drainFollowUpsFirst: options.drainFollowUps === true || lastMessage?.role === "assistant",
 		});
 	}
 
@@ -516,9 +516,25 @@ export class Agent {
 	): Promise<AgentLoopNextAction> {
 		const isFirstDecision = startState.firstDecision;
 		startState.firstDecision = false;
-		const pendingToolContinuation = isFirstDecision
-			? startState.pendingToolContinuation
-			: context.pendingToolContinuation;
+		const requestAuthority = isFirstDecision ? startState.requestAuthority : context.requestAuthority;
+		const runtimeAction = context.defaultAction;
+
+		if (this.signal?.aborted) {
+			this.pausedState = { requestAuthority };
+			return { type: "pause", requestAuthority };
+		}
+
+		if (requestAuthority === "final_response") {
+			const hookContext = { ...context, requestAuthority, defaultAction: runtimeAction };
+			const action = this.nextAction ? await this.nextAction(hookContext, this.signal) : runtimeAction;
+			if (action.type === "pause") {
+				this.pausedState = { requestAuthority };
+				return { ...action, requestAuthority };
+			}
+			this.pausedState = undefined;
+			return { type: "request", reason: "final_response" };
+		}
+
 		let selected: PendingDelivery[] = [];
 		const immediate = this.selectPendingDeliveries("prompt", "all");
 		if (immediate.length > 0) {
@@ -526,54 +542,19 @@ export class Agent {
 		} else {
 			selected = this.selectPendingDeliveries("steer", this.steeringQueueMode);
 		}
-
-		const providerRequestPending = isFirstDecision && startState.providerRequestPending;
-		if (
-			selected.length === 0 &&
-			((isFirstDecision && startState.drainFollowUpsFirst) || (!pendingToolContinuation && !providerRequestPending))
-		) {
+		const hasIndependentRequest = runtimeAction.type === "request";
+		if (selected.length === 0 && ((isFirstDecision && startState.drainFollowUpsFirst) || !hasIndependentRequest)) {
 			selected = this.selectPendingDeliveries("followUp", this.followUpQueueMode);
 		}
-		const hasIndependentContinuation = pendingToolContinuation || providerRequestPending;
 		const suggestedAction: AgentLoopNextAction =
 			selected.length > 0
-				? { type: "request", reason: hasIndependentContinuation ? "continuation" : "delivery" }
-				: hasIndependentContinuation
-					? { type: "request", reason: "continuation" }
-					: { type: "stop" };
-
-		if (this.signal?.aborted) {
-			this.pausedState = { providerRequestPending, pendingToolContinuation };
-			return { type: "pause", pendingToolContinuation };
-		}
-		const hookContext: AgentLoopNextActionContext = {
-			...context,
-			pendingToolContinuation,
-			defaultAction: suggestedAction,
-		};
-		if (
-			context.completedTurn &&
-			(await this.shouldStopAfterTurn?.(
-				{
-					...context.completedTurn,
-					context: context.context,
-					newMessages: context.newMessages,
-				},
-				this.signal,
-			))
-		) {
-			return { type: "stop" };
-		}
+				? { type: "request", reason: hasIndependentRequest ? "continuation" : "delivery" }
+				: runtimeAction;
+		const hookContext = { ...context, requestAuthority, defaultAction: suggestedAction };
 		const action = this.nextAction ? await this.nextAction(hookContext, this.signal) : suggestedAction;
 		if (action.type === "pause") {
-			this.pausedState = {
-				providerRequestPending,
-				pendingToolContinuation: action.pendingToolContinuation ?? pendingToolContinuation,
-			};
-			return {
-				...action,
-				pendingToolContinuation: action.pendingToolContinuation ?? pendingToolContinuation,
-			};
+			this.pausedState = { requestAuthority: action.requestAuthority ?? requestAuthority };
+			return { ...action, requestAuthority: action.requestAuthority ?? requestAuthority };
 		}
 		if (action.type === "stop") {
 			this.pausedState = undefined;
@@ -595,7 +576,7 @@ export class Agent {
 		this.activeLease = lease;
 		const deliveries: AgentLoopDelivery[] = [];
 		for (const delivery of lease.deliveries) {
-			let preparation = this.prepareDelivery
+			const preparation = this.prepareDelivery
 				? await this.prepareDelivery(
 						{
 							deliveryId: delivery.deliveryId,
@@ -605,12 +586,6 @@ export class Agent {
 						this.signal,
 					)
 				: { messages: delivery.messages.slice() };
-			if (delivery.kind !== "prompt" && this.prepareQueuedMessages) {
-				preparation = {
-					...preparation,
-					messages: await this.prepareQueuedMessages(preparation.messages, delivery.kind, this.signal),
-				};
-			}
 			if (
 				this.activeLease !== lease ||
 				!lease.deliveries.some((candidate) => candidate.deliveryId === delivery.deliveryId)
@@ -663,11 +638,7 @@ export class Agent {
 			nextAction: async (context) => await this.resolveNextAction(context, startState),
 			beginDelivery: (delivery) => this.beginActiveDelivery(delivery),
 			prepareRequest: async (context) => {
-				const prepared = this.prepareRequest
-					? await this.prepareRequest(context, this.signal)
-					: context.completedTurn
-						? await this.prepareNextTurn?.(this.signal)
-						: undefined;
+				const prepared = await this.prepareRequest?.(context, this.signal);
 				return {
 					context: prepared?.context ?? {
 						...context.context,
@@ -694,7 +665,15 @@ export class Agent {
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
 		});
-		this.activeRun = { promise, resolve: resolvePromise, abortController, turnOpen: false };
+		this.activeRun = {
+			id: globalThis.crypto.randomUUID(),
+			promise,
+			resolve: resolvePromise,
+			abortController,
+			turnOpen: false,
+			requestAccepted: false,
+			phase: "open",
+		};
 
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
@@ -712,6 +691,10 @@ export class Agent {
 	}
 
 	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
+		if (aborted && !this.activeRun?.requestAccepted) {
+			await this.processEvents({ type: "agent_end", messages: [] });
+			return;
+		}
 		if (!this.activeRun?.turnOpen) {
 			await this.processEvents({ type: "turn_start" });
 		}
@@ -734,6 +717,7 @@ export class Agent {
 	}
 
 	private finishRun(): void {
+		if (this.activeRun) this.activeRun.phase = "settled";
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
@@ -751,8 +735,15 @@ export class Agent {
 	 */
 	private async processEvents(event: AgentEvent): Promise<AgentMessage | undefined> {
 		switch (event.type) {
+			case "delivery_start":
+				if (this.activeRun) this.activeRun.requestAccepted = true;
+				break;
+
 			case "turn_start":
-				if (this.activeRun) this.activeRun.turnOpen = true;
+				if (this.activeRun) {
+					this.activeRun.turnOpen = true;
+					this.activeRun.requestAccepted = true;
+				}
 				break;
 
 			case "message_start":
@@ -765,6 +756,9 @@ export class Agent {
 
 			case "message_end":
 				this._state.streamingMessage = undefined;
+				if (this.activeRun && event.message.role === "assistant" && event.message.stopReason !== "toolUse") {
+					this.activeRun.phase = "terminal_event_settling";
+				}
 				break;
 
 			case "tool_execution_start": {
@@ -806,7 +800,10 @@ export class Agent {
 			}
 
 			case "turn_end":
-				if (this.activeRun) this.activeRun.turnOpen = false;
+				if (this.activeRun) {
+					this.activeRun.turnOpen = false;
+					this.activeRun.phase = "open";
+				}
 				if (event.message.role === "assistant" && event.message.errorMessage) {
 					this._state.errorMessage = event.message.errorMessage;
 				}
@@ -814,6 +811,7 @@ export class Agent {
 
 			case "agent_end":
 				this._state.streamingMessage = undefined;
+				if (this.activeRun) this.activeRun.phase = "terminal_event_settling";
 				break;
 		}
 
@@ -821,14 +819,15 @@ export class Agent {
 		if (!signal) {
 			throw new Error("Agent listener invoked outside active run");
 		}
-		let emittedEvent = event;
+		let emittedEvent = this.decorateRuntimeAbort(event);
 		for (const listener of this.listeners) {
 			const replacement = await listener(emittedEvent, signal);
 			if (emittedEvent.type === "message_end" && replacement) {
 				if (replacement.role !== emittedEvent.message.role) {
 					throw new Error("message_end listeners must return a message with the same role");
 				}
-				emittedEvent = { ...emittedEvent, message: replacement };
+				const previousEvent = emittedEvent;
+				emittedEvent = this.decorateRuntimeAbort({ ...emittedEvent, message: replacement }, previousEvent);
 			}
 		}
 
@@ -836,5 +835,48 @@ export class Agent {
 			this._state.messages.push(emittedEvent.message);
 			return emittedEvent.message;
 		}
+		if (emittedEvent.type === "agent_end" && this.activeRun) {
+			this.activeRun.phase = "settled";
+		}
+	}
+
+	private decorateRuntimeAbort(event: AgentEvent, previousEvent?: AgentEvent): AgentEvent {
+		if (event.type !== "message_end" || event.message.role !== "assistant") return event;
+		const run = this.activeRun;
+		const message = event.message as AssistantMessage;
+		const previousOwnedDiagnostic =
+			previousEvent?.type === "message_end" && previousEvent.message.role === "assistant"
+				? previousEvent.message.diagnostics?.some(
+						(diagnostic) =>
+							diagnostic.type === "runtime_abort" &&
+							diagnostic.timestamp === run?.diagnosticTimestamp &&
+							diagnostic.details &&
+							typeof diagnostic.details === "object" &&
+							"source" in diagnostic.details &&
+							diagnostic.details.source === run?.abortSource,
+					)
+				: false;
+		if (
+			(message.stopReason !== "aborted" && !previousOwnedDiagnostic) ||
+			!run?.abortController.signal.aborted ||
+			run.abortSource === undefined ||
+			run.diagnosticTimestamp === undefined
+		) {
+			return event;
+		}
+		return {
+			...event,
+			message: {
+				...message,
+				diagnostics: [
+					...(message.diagnostics ?? []).filter((diagnostic) => diagnostic.type !== "runtime_abort"),
+					{
+						type: "runtime_abort",
+						timestamp: run.diagnosticTimestamp,
+						details: { source: run.abortSource },
+					},
+				],
+			},
+		};
 	}
 }

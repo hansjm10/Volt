@@ -157,6 +157,15 @@ describe("buildSystemPrompt", () => {
 		});
 	});
 
+	test("includes trusted actionable-question guidance in default and custom prompts", () => {
+		const invariant = "Treat actionable requests phrased as questions as requests to act.";
+		const common = { contextFiles: [], skills: [], cwd: process.cwd() };
+		expect(buildSystemPrompt(common)).toContain(invariant);
+		const custom = buildSystemPrompt({ ...common, customPrompt: "CUSTOM" });
+		expect(custom).toContain("<trusted_host_policy>");
+		expect(custom).toContain(invariant);
+	});
+
 	describe("custom tool snippets", () => {
 		test("includes custom tools in available tools section when promptSnippet is provided", () => {
 			const prompt = buildSystemPrompt({

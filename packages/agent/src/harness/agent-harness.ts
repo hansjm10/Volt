@@ -518,10 +518,16 @@ export class AgentHarness<
 					isError,
 				});
 				return patch
-					? { content: patch.content, details: patch.details, isError: patch.isError, terminate: patch.terminate }
+					? {
+							content: patch.content,
+							details: patch.details,
+							isError: patch.isError,
+							disposition: patch.disposition,
+						}
 					: undefined;
 			},
 			nextAction: async (context) => {
+				if (context.requestAuthority === "final_response") return context.defaultAction;
 				const initialDeliveries =
 					context.completedTurn === undefined && context.defaultAction.type === "request"
 						? (context.defaultAction.deliveries ?? [])

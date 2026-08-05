@@ -439,7 +439,7 @@ describe("AgentSession compaction characterization", () => {
 		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(true);
 	});
 
-	it.each(["plain response", "terminating tool batch"] as const)(
+	it.each(["plain response", "stopping tool batch"] as const)(
 		"stops for proactive compaction after a %s when a message is queued",
 		async (kind) => {
 			const harness = await createHarness();
@@ -461,7 +461,7 @@ describe("AgentSession compaction characterization", () => {
 								role: "toolResult" as const,
 								toolCallId: toolCall.id,
 								toolName: toolCall.name,
-								content: [{ type: "text" as const, text: "terminated" }],
+								content: [{ type: "text" as const, text: "stopped" }],
 								isError: false,
 								timestamp: Date.now(),
 							},
@@ -475,9 +475,13 @@ describe("AgentSession compaction characterization", () => {
 			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 			expect(
 				sessionInternals._shouldStopForProactiveCompaction({
-					message,
-					toolResults,
-					toolBatchTerminated: kind === "terminating tool batch",
+					completedTurn: {
+						message,
+						toolResults,
+						disposition: kind === "stopping tool batch" ? "stop" : "continue",
+					},
+					requestAuthority: "provider",
+					defaultAction: { type: "stop" },
 					context: { systemPrompt: "", messages: [message, ...toolResults], tools: [] },
 					newMessages: [],
 				}),

@@ -354,7 +354,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const model = session.model!;
 		writeFileSync(join(tempDir, "large-terminating-result.txt"), "x".repeat(40_000));
 		let streamCallCount = 0;
-		session.agent.afterToolCall = async () => ({ terminate: true });
+		session.agent.afterToolCall = async () => ({ disposition: "stop" });
 		session.agent.streamFn = () => {
 			streamCallCount += 1;
 			const stream = new MockAssistantStream();
@@ -638,11 +638,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 			timestamp: Date.now(),
 		};
 		const context = {
-			message,
-			toolResults: [toolResult],
-			toolBatchTerminated: false,
+			completedTurn: { message, toolResults: [toolResult], disposition: "continue" },
+			requestAuthority: "tool_continuation",
 			context: { systemPrompt: "", messages: [message, toolResult], tools: [] },
 			newMessages: [],
+			defaultAction: { type: "request", reason: "continuation" },
 		};
 
 		const hook = (

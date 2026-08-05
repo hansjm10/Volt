@@ -5,6 +5,9 @@
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
 import { formatSkillsForPrompt, type Skill } from "./skills.ts";
 
+const ACTIONABLE_REQUEST_POLICY =
+	"Treat actionable requests phrased as questions as requests to act. Briefly acknowledge and execute in the same turn unless safety, missing authority, or material ambiguity requires clarification.";
+
 export interface BuildSystemPromptOptions {
 	/** Custom system prompt (replaces default). */
 	customPrompt?: string;
@@ -51,7 +54,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const skills = providedSkills ?? [];
 
 	if (customPrompt) {
-		let prompt = customPrompt;
+		let prompt = `${customPrompt}\n\n<trusted_host_policy>\n${ACTIONABLE_REQUEST_POLICY}\n</trusted_host_policy>`;
 
 		if (appendSection) {
 			prompt += appendSection;
@@ -154,6 +157,7 @@ ${toolsList}
 In addition to the tools above, you may have access to other custom tools depending on the project. Use only tools that are actually available in this session, and use each tool according to its schema and guidance.
 
 <workflow>
+- ${ACTIONABLE_REQUEST_POLICY}
 - Understand the request and inspect relevant files before making non-trivial changes.
 - For small, obvious tasks, act directly; for larger or risky tasks, state a brief plan before editing.
 - Keep changes focused. Avoid unrelated refactors, formatting churn, dependency changes, or generated-file updates unless needed.

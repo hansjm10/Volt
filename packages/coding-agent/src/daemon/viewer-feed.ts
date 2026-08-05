@@ -16,7 +16,7 @@ export const VIEWER_BUFFER_MAX_BYTES = 4 * 1024 * 1024;
 /** Structural view of AgentSession as the feed needs it. */
 export interface ViewerFeedSession {
 	subscribe(handler: (event: unknown) => void): () => void;
-	abort(): Promise<void> | void;
+	abort(source?: "remote_request"): Promise<void> | void;
 }
 
 interface BufferedViewerEvent {
@@ -213,7 +213,7 @@ export class ViewerFeedRegistry {
 		if (!feed || feed.ended || feed.connectionId !== connectionId) {
 			return false;
 		}
-		await feed.session.abort();
+		await feed.session.abort("remote_request");
 		return true;
 	}
 

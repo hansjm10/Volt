@@ -1236,6 +1236,76 @@ describe("SubagentManager", () => {
 		]);
 	});
 
+	it("uses terminal plan finalization as the budget report turn without queuing a redundant report", async () => {
+		let childSession: SubagentRuntimeCreatedEvent["runtime"]["session"] | undefined;
+		let activePlan: { id: string; revision: number; steps: Array<{ id: string; status: string }> } | undefined;
+		let finalRequestTools: string[] | undefined;
+		const resourceLoader = createSubagentResourceLoader([createDefinition({ name: "researcher" })]);
+		const { manager } = await createTestManager({
+			resourceLoader,
+			noTools: false,
+			turnLimits: { maxTurns: 1 },
+			onRuntimeCreated: async (event) => {
+				childSession = event.runtime.session;
+				await childSession.setAgentMode("plan");
+				const draft = childSession.updatePlan({ steps: [{ text: "Finish the delegated implementation" }] });
+				const ready = childSession.submitPlan({
+					planId: draft.id,
+					expectedRevision: draft.revision,
+					title: "Finish delegated implementation",
+					summary: "Complete and report the delegated work.",
+				});
+				await childSession.activatePlan(ready.id, ready.revision, {
+					id: "subagent-finalization-budget",
+					approvedRevision: ready.revision,
+					strategy: "retain_context",
+					sourceSessionId: childSession.sessionId,
+					targetSessionId: childSession.sessionId,
+				});
+				activePlan = childSession.planningState.plan as typeof activePlan;
+			},
+			responses: [
+				() => {
+					if (!activePlan) throw new Error("expected active plan");
+					return fauxAssistantMessage(
+						fauxToolCall("update_plan_progress", {
+							planId: activePlan.id,
+							expectedRevision: activePlan.revision,
+							updates: [{ id: activePlan.steps[0]!.id, status: "completed" }],
+						}),
+						{ stopReason: "toolUse" },
+					);
+				},
+				(context) => {
+					finalRequestTools = context.tools?.map((tool) => tool.name) ?? [];
+					return fauxAssistantMessage("Final delegated report");
+				},
+			],
+		});
+
+		const handle = await manager.startByName("researcher");
+		const completion = handle.waitForEnd();
+		await handle.prompt("Complete the active delegated plan");
+		const result = await completion;
+		if (!childSession) throw new Error("expected child session");
+
+		expect(finalRequestTools).toEqual([]);
+		expect(result.event.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "Final delegated report" }],
+		});
+		expect(childSession.planningState.plan).toMatchObject({ phase: "completed" });
+		expect(childSession.pendingMessageCount).toBe(0);
+		expect(
+			childSession.messages.some(
+				(message) => message.role === "user" && JSON.stringify(message.content).includes("turn limit"),
+			),
+		).toBe(false);
+		expect(manager.listActivities()).toEqual([
+			expect.objectContaining({ id: handle.id, status: "completed", abortRequested: false }),
+		]);
+	});
+
 	it("gives parallel children independent turn budgets within one shared scope", async () => {
 		const firstFinalReportStarted = createDeferred();
 		const finishFirstFinalReport = createDeferred();
@@ -1312,7 +1382,7 @@ describe("SubagentManager", () => {
 		await completion;
 
 		expect(scope.signal.aborted).toBe(false);
-		expect(scope.snapshot()).toMatchObject({ turnsUsed: 3, activeDescendants: 0, aborted: false });
+		expect(scope.snapshot()).toMatchObject({ turnsUsed: 4, activeDescendants: 0, aborted: false });
 		expect(manager.listActivities()).toEqual([
 			expect.objectContaining({ id: handle.id, status: "aborted", abortRequested: true }),
 		]);
@@ -1373,7 +1443,9 @@ describe("SubagentManager", () => {
 		const refusalEnd = waitForNextEnd();
 		await handle.prompt("Try to use tools again");
 		const refusalMessages = (await refusalEnd).messages;
-		expect(refusalMessages.filter((message) => message.role === "assistant")).toHaveLength(1);
+		const refusalAssistants = refusalMessages.filter((message) => message.role === "assistant");
+		expect(refusalAssistants).toHaveLength(2);
+		expect(refusalAssistants.at(-1)).toMatchObject({ stopReason: "aborted" });
 		const blockedResult = refusalMessages.find((message) => message.role === "toolResult");
 		expect(JSON.stringify(blockedResult)).toContain("turn budget is exhausted");
 		expect(abortSpy).toHaveBeenCalled();
@@ -1382,20 +1454,20 @@ describe("SubagentManager", () => {
 	it("preserves an externally chained hook wrapper installed after spawn", async () => {
 		let childSession: SubagentRuntimeCreatedEvent["runtime"]["session"] | undefined;
 		let externalBeforeToolCall: unknown;
-		let externalShouldStopAfterTurn: unknown;
+		let externalNextAction: unknown;
 		const { manager } = await createTestManager({
 			onRuntimeCreated: (event) => {
 				const agent = event.runtime.session.agent;
 				const innerBeforeToolCall = agent.beforeToolCall;
-				const innerShouldStopAfterTurn = agent.shouldStopAfterTurn;
+				const innerNextAction = agent.nextAction;
 				const wrappedBeforeToolCall: typeof innerBeforeToolCall = async (context, signal) =>
 					innerBeforeToolCall?.(context, signal);
-				const wrappedShouldStopAfterTurn: typeof innerShouldStopAfterTurn = async (context, signal) =>
-					(await innerShouldStopAfterTurn?.(context, signal)) ?? false;
+				const wrappedNextAction: NonNullable<typeof innerNextAction> = async (context, signal) =>
+					innerNextAction ? await innerNextAction(context, signal) : context.defaultAction;
 				agent.beforeToolCall = wrappedBeforeToolCall;
-				agent.shouldStopAfterTurn = wrappedShouldStopAfterTurn;
+				agent.nextAction = wrappedNextAction;
 				externalBeforeToolCall = wrappedBeforeToolCall;
-				externalShouldStopAfterTurn = wrappedShouldStopAfterTurn;
+				externalNextAction = wrappedNextAction;
 				childSession = event.runtime.session;
 			},
 		});
@@ -1410,7 +1482,7 @@ describe("SubagentManager", () => {
 		// Teardown must not clobber the externally chained wrappers: the budget
 		// wrappers are no longer the installed hooks, so restore is skipped.
 		expect(childSession.agent.beforeToolCall).toBe(externalBeforeToolCall);
-		expect(childSession.agent.shouldStopAfterTurn).toBe(externalShouldStopAfterTurn);
+		expect(childSession.agent.nextAction).toBe(externalNextAction);
 	});
 
 	it("applies finite manager aggregate consumption overrides with field-specific abort errors", async () => {

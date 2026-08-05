@@ -337,7 +337,7 @@ export class AgentSessionRuntime {
 			current && !current.settled
 				? (async () => {
 						current.cancellationRequested = true;
-						await current.session.abort().catch(() => undefined);
+						await current.session.abort("session_replacement").catch(() => undefined);
 						await current.promise.catch(() => undefined);
 						if (state.cancellationRequested) {
 							throw new Error("Recovered client input processing was cancelled before dispatch");
@@ -398,7 +398,7 @@ export class AgentSessionRuntime {
 			return;
 		}
 		recovery.cancellationRequested = true;
-		await recovery.session.abort().catch(() => undefined);
+		await recovery.session.abort("session_replacement").catch(() => undefined);
 		await recovery.promise.catch(() => undefined);
 	}
 
@@ -677,7 +677,7 @@ export class AgentSessionRuntime {
 		try {
 			await this.session.getSubagentToolManager()?.dispose?.();
 		} finally {
-			await this.session.dispose();
+			await this.session.dispose("session_replacement");
 		}
 	}
 
@@ -685,7 +685,7 @@ export class AgentSessionRuntime {
 		try {
 			await session.getSubagentToolManager()?.dispose?.();
 		} finally {
-			await session.dispose();
+			await session.dispose("disposal");
 		}
 	}
 
@@ -1461,7 +1461,7 @@ export class AgentSessionRuntime {
 			const recoveredClientInputsTask = this.recoveredClientInputsTask;
 			if (recoveredClientInputsTask && !recoveredClientInputsTask.settled) {
 				recoveredClientInputsTask.cancellationRequested = true;
-				await recoveredClientInputsTask.session.abort().catch(() => undefined);
+				await recoveredClientInputsTask.session.abort("disposal").catch(() => undefined);
 				await recoveredClientInputsTask.promise.catch(() => undefined);
 			}
 			this.prepareSessionReplacement = undefined;
@@ -1483,7 +1483,7 @@ export class AgentSessionRuntime {
 				try {
 					await this.session.getSubagentToolManager()?.dispose?.();
 				} finally {
-					await this.session.dispose();
+					await this.session.dispose("disposal");
 					this.sessionInvalidated = true;
 					this.lifecycleRevision++;
 				}

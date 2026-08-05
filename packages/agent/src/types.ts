@@ -64,7 +64,7 @@ export interface BeforeToolCallResult {
  * - `content`: if provided, replaces the tool result content array in full
  * - `details`: if provided, replaces the tool result details value in full
  * - `isError`: if provided, replaces the tool result error flag
- * - `terminate`: if provided, replaces the early-termination hint
+ * - `disposition`: if provided, replaces the tool-result disposition
  *
  * Omitted fields keep the original executed tool result values.
  * There is no deep merge for `content` or `details`.
@@ -73,11 +73,7 @@ export interface AfterToolCallResult {
 	content?: (TextContent | ImageContent)[];
 	details?: unknown;
 	isError?: boolean;
-	/**
-	 * Hint that the agent should stop after the current tool batch.
-	 * Early termination only happens when every finalized tool result in the batch sets this to true.
-	 */
-	terminate?: boolean;
+	disposition?: AgentToolDisposition;
 }
 
 /** Context passed to `beforeToolCall`. */
@@ -108,14 +104,44 @@ export interface AfterToolCallContext {
 	context: AgentContext;
 }
 
+/** Known local authority that interrupted an active run. */
+export type AgentAbortSource =
+	| "keyboard_interrupt"
+	| "host_action"
+	| "remote_request"
+	| "session_replacement"
+	| "disposal";
+
+/** Immutable result of an abort request. */
+export interface AgentAbortAcceptance {
+	readonly runId?: string;
+	readonly accepted: boolean;
+	readonly source?: AgentAbortSource;
+}
+
+/** Minimum immutable lifecycle state exposed for structural teardown. */
+export interface AgentRunSnapshot {
+	readonly runId: string;
+	readonly source?: AgentAbortSource;
+	readonly diagnosticTimestamp?: number;
+	readonly requestAccepted: boolean;
+	readonly phase: "open" | "terminal_event_settling" | "settled";
+}
+
+/** Disposition requested by a finalized tool result. */
+export type AgentToolDisposition = "stop" | "final_response";
+
+/** Reduced disposition for a complete tool-call batch. */
+export type ToolBatchDisposition = "continue" | AgentToolDisposition;
+
 /** A completed successful turn available to the next-action dispatcher. */
 export interface AgentLoopCompletedTurn {
 	/** The assistant message that completed the turn. */
 	message: AssistantMessage;
 	/** Tool result messages passed to the preceding `turn_end` event. */
 	toolResults: ToolResultMessage[];
-	/** Whether every finalized tool result requested termination. */
-	toolBatchTerminated: boolean;
+	/** Canonical disposition reduced from every finalized result in the batch. */
+	disposition: ToolBatchDisposition;
 }
 
 /** One stable delivery whose messages enter context together before a request. */
@@ -127,7 +153,7 @@ export interface AgentLoopDelivery {
 }
 
 /** Authority that keeps a request valid when no attached delivery is admitted. */
-export type AgentLoopRequestReason = "delivery" | "continuation";
+export type AgentLoopRequestReason = "delivery" | "continuation" | "final_response";
 
 /** The dispatcher's explicit decision at a request boundary. */
 export type AgentLoopNextAction =
@@ -139,10 +165,13 @@ export type AgentLoopNextAction =
 	  }
 	| {
 			type: "pause";
-			/** Tool continuation intent to retain when a higher-level dispatcher resumes. */
-			pendingToolContinuation?: boolean;
+			/** Request authority retained when a higher-level dispatcher resumes. */
+			requestAuthority?: AgentRequestAuthority;
 	  }
 	| { type: "stop" };
+
+/** Authority for a provider request at the current dispatch boundary. */
+export type AgentRequestAuthority = "provider" | "tool_continuation" | "final_response";
 
 /** Context passed whenever the loop resolves its next action. */
 export interface AgentLoopNextActionContext {
@@ -152,14 +181,16 @@ export interface AgentLoopNextActionContext {
 	newMessages: AgentMessage[];
 	/** The successful turn that just ended. Undefined before the first request. */
 	completedTurn?: AgentLoopCompletedTurn;
-	/** Whether tool results require another provider request. */
-	pendingToolContinuation: boolean;
+	/** Authority currently permitting a provider request. */
+	requestAuthority: AgentRequestAuthority;
 	/** The loop's request-or-stop decision when no host dispatcher overrides it. */
 	defaultAction: AgentLoopNextAction;
 }
 
 /** Context passed immediately before a provider request. */
 export interface PrepareRequestContext extends AgentLoopNextActionContext {
+	/** Resolved reason for the imminent provider request. */
+	reason: AgentLoopRequestReason;
 	/** Deliveries already finalized, emitted, and appended to `context`. */
 	deliveries: AgentLoopDelivery[];
 }
@@ -173,18 +204,6 @@ export interface AgentLoopRequestUpdate {
 	/** Thinking level for the provider request. */
 	thinkingLevel?: ThinkingLevel;
 }
-
-/** Temporary migration context for consumers not yet moved to `nextAction`. */
-export interface ShouldStopAfterTurnContext extends AgentLoopCompletedTurn {
-	context: AgentContext;
-	newMessages: AgentMessage[];
-}
-
-/** Temporary migration alias for request-state updates. */
-export type AgentLoopTurnUpdate = AgentLoopRequestUpdate;
-
-/** Temporary migration context for `prepareNextTurn`. */
-export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
 
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
@@ -249,20 +268,6 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 
-	/** Temporary bridge while existing consumers migrate to `nextAction`. */
-	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
-
-	/** Temporary bridge while existing consumers migrate to `prepareRequest`. */
-	prepareNextTurn?: (
-		context: PrepareNextTurnContext,
-	) => AgentLoopTurnUpdate | undefined | Promise<AgentLoopTurnUpdate | undefined>;
-
-	/** Temporary bridge while existing queue consumers migrate to deliveries. */
-	getSteeringMessages?: () => Promise<AgentMessage[]>;
-
-	/** Temporary bridge while existing queue consumers migrate to deliveries. */
-	getFollowUpMessages?: () => Promise<AgentMessage[]>;
-
 	/**
 	 * Resolve the action before the first request and once after every successful `turn_end`.
 	 *
@@ -318,7 +323,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * - `content` replaces the full content array
 	 * - `details` replaces the full details payload
 	 * - `isError` replaces the error flag
-	 * - `terminate` replaces the early-termination hint
+	 * - `disposition` replaces the tool-result disposition
 	 *
 	 * Any omitted fields keep their original values. No deep merge is performed.
 	 * The hook receives the agent abort signal and is responsible for honoring it.
@@ -410,11 +415,8 @@ export interface AgentToolResult<T> {
 	details: T;
 	/** Marks a resolved final result as failed while preserving its structured content and details. */
 	isError?: boolean;
-	/**
-	 * Hint that the agent should stop after the current tool batch.
-	 * Early termination only happens when every finalized tool result in the batch sets this to true.
-	 */
-	terminate?: boolean;
+	/** Controls whether the batch stops or performs one bounded tool-free response. */
+	disposition?: AgentToolDisposition;
 }
 
 /**

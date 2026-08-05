@@ -6,7 +6,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage, ThinkingLevel } from "@hansjm10/volt-agent-core";
+import type { AgentAbortSource, AgentMessage, ThinkingLevel } from "@hansjm10/volt-agent-core";
 import {
 	type AssistantMessage,
 	getProviders,
@@ -1649,7 +1649,7 @@ export class InteractiveMode {
 			uiContext,
 			mode: "tui",
 			abortHandler: () => {
-				void this.restoreQueuedMessagesToEditor({ abort: true }).catch((error) => {
+				void this.restoreQueuedMessagesToEditor({ abortSource: "host_action" }).catch((error) => {
 					this.showError(`Failed to persist queued-message cancellation: ${String(error)}`);
 				});
 			},
@@ -2263,7 +2263,7 @@ export class InteractiveMode {
 			isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 			signal: this.session.agent.signal,
 			abort: () => {
-				void this.restoreQueuedMessagesToEditor({ abort: true }).catch((error) => {
+				void this.restoreQueuedMessagesToEditor({ abortSource: "host_action" }).catch((error) => {
 					this.showError(`Failed to persist queued-message cancellation: ${String(error)}`);
 				});
 			},
@@ -3208,7 +3208,7 @@ export class InteractiveMode {
 				return;
 			}
 			if (this.session.isStreaming) {
-				void this.restoreQueuedMessagesToEditor({ abort: true }).catch((error) => {
+				void this.restoreQueuedMessagesToEditor({ abortSource: "keyboard_interrupt" }).catch((error) => {
 					this.showError(`Failed to persist queued-message cancellation: ${String(error)}`);
 				});
 			} else if (this.session.isBashRunning) {
@@ -3280,7 +3280,7 @@ export class InteractiveMode {
 	private createHostActionContext(): HostActionInvocationContext {
 		return {
 			session: this.session,
-			abortRun: () => this.session.abort(),
+			abortRun: () => this.session.abort("host_action"),
 			compactContext: (customInstructions) => this.session.compact(customInstructions),
 			newSession: (newSessionOptions) => this.runtimeHost.newSession(newSessionOptions),
 			renameSession: (name) => {
@@ -4944,7 +4944,10 @@ export class InteractiveMode {
 		}
 	}
 
-	private async restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): Promise<number> {
+	private async restoreQueuedMessagesToEditor(options?: {
+		abortSource?: AgentAbortSource;
+		currentText?: string;
+	}): Promise<number> {
 		let queues: Awaited<ReturnType<InteractiveMode["clearAllQueues"]>>;
 		try {
 			queues = await this.clearAllQueues();
@@ -4957,8 +4960,8 @@ export class InteractiveMode {
 			}
 			throw error;
 		} finally {
-			if (options?.abort) {
-				this.agent.abort();
+			if (options?.abortSource) {
+				this.agent.abort(options.abortSource);
 			}
 		}
 		return this.putQueuedTextInEditor([...queues.steering, ...queues.followUp], options?.currentText);
@@ -7906,7 +7909,7 @@ export class InteractiveMode {
 		if (this.session.isStreaming) {
 			// Abort deliberately before the session switch so the in-flight turn is
 			// stopped and persisted, instead of relying on dispose-time teardown.
-			await this.session.abort();
+			await this.session.abort("session_replacement");
 		}
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();

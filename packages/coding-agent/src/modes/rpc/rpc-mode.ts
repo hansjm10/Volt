@@ -1121,7 +1121,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	): HostActionInvocationContext => ({
 		session: commandSession,
 		detachedReviews: true,
-		abortRun: () => commandSession.abort(),
+		abortRun: () => commandSession.abort("remote_request"),
 		compactContext: (customInstructions) =>
 			commandSession.compact(customInstructions, assertConversationGenerationCurrent),
 		newSession: (newSessionOptions) =>
