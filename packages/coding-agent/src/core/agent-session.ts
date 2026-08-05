@@ -514,6 +514,8 @@ export class AgentSession {
 	private readonly _liveClientInputs = new Map<string, LiveClientInputOperation>();
 	/** Fatal listener error swallowed into agent-core's synthetic error turn. */
 	private _agentEventFatalError: Error | undefined;
+	/** Predecessor commit output retained when later delivery composition must retry. */
+	private readonly _committedDeliveryPreparationMessages = new Map<string, AgentMessage[]>();
 	private _extensionCommandTransactions = new Set<symbol>();
 	private _activeExtensionCommandHandlers = 0;
 
@@ -603,7 +605,10 @@ export class AgentSession {
 
 	// Prompt ownership layers: rebuilt host base, one logical invocation override, trusted policy.
 	private _baseSystemPrompt = "";
-	private _invocationSystemPromptOverride?: string;
+	private _invocationSystemPromptOverride?: {
+		baseSystemPrompt: string;
+		systemPrompt: string;
+	};
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 
 	constructor(config: AgentSessionConfig) {
@@ -750,10 +755,24 @@ export class AgentSession {
 		this._agentToolHooksInstalled = true;
 		const prepareDelivery = this.agent.prepareDelivery;
 		this.agent.prepareDelivery = async (delivery, signal): Promise<AgentDeliveryPreparation> => {
-			const preparation = prepareDelivery
-				? await prepareDelivery(delivery, signal)
-				: { messages: [...delivery.messages] };
-			const prepared = this._prepareUserDelivery(preparation);
+			const committedMessages = this._committedDeliveryPreparationMessages.get(delivery.deliveryId);
+			const preparation = committedMessages
+				? { messages: committedMessages }
+				: prepareDelivery
+					? await prepareDelivery(delivery, signal)
+					: { messages: [...delivery.messages] };
+			const predecessorCommit = preparation.commit;
+			const prepared = this._prepareUserDelivery({
+				messages: preparation.messages,
+				...(predecessorCommit
+					? {
+							commit: () => {
+								predecessorCommit();
+								this._committedDeliveryPreparationMessages.set(delivery.deliveryId, preparation.messages);
+							},
+						}
+					: {}),
+			});
 			const messages = prepared.messages;
 			return {
 				messages,
@@ -767,6 +786,7 @@ export class AgentSession {
 						this._discardAdmittedDelivery(delivery.deliveryId);
 						throw error;
 					}
+					this._committedDeliveryPreparationMessages.delete(delivery.deliveryId);
 					// A successful commit may have composed additional messages.
 					this._discardAdmittedDelivery(delivery.deliveryId);
 					this._captureAdmittedDelivery({ deliveryId: delivery.deliveryId, messages });
@@ -1519,6 +1539,7 @@ export class AgentSession {
 		const runAfterAbort = this.agent.activeRunSnapshot;
 		this._disposed = true;
 		this._proactiveCompactionResumeAction = undefined;
+		this._committedDeliveryPreparationMessages.clear();
 		const durablyAdmittedOperations = new Set<LiveClientInputOperation>();
 
 		try {
@@ -2139,7 +2160,15 @@ export class AgentSession {
 	}
 
 	private _composeEffectiveSystemPrompt(): void {
-		const invocationPrompt = this._invocationSystemPromptOverride ?? this._baseSystemPrompt;
+		let invocationPrompt = this._baseSystemPrompt;
+		const override = this._invocationSystemPromptOverride;
+		if (override) {
+			const baseIndex = override.systemPrompt.indexOf(override.baseSystemPrompt);
+			invocationPrompt =
+				baseIndex === -1
+					? override.systemPrompt
+					: `${override.systemPrompt.slice(0, baseIndex)}${this._baseSystemPrompt}${override.systemPrompt.slice(baseIndex + override.baseSystemPrompt.length)}`;
+		}
 		const policy = formatPlanPolicy(this._planningState.mode, this._planningState.plan?.phase);
 		const next = policy ? [invocationPrompt, policy].filter(Boolean).join("\n\n") : invocationPrompt;
 		if (this.agent.state.systemPrompt !== next) {
@@ -2232,7 +2261,7 @@ export class AgentSession {
 		this._planningState = clonePlanningState(parsed);
 		this._syncPlanningRuntime();
 		const snapshot = clonePlanningState(this._planningState);
-		this._emit({ type: "planning_state_changed", planning: snapshot });
+		this._emitCommittedEvent({ type: "planning_state_changed", planning: snapshot });
 		return snapshot;
 	}
 
@@ -3598,7 +3627,10 @@ export class AgentSession {
 				}
 			}
 			// The extension owns one logical invocation layer; planning policy composes above it.
-			this._invocationSystemPromptOverride = result?.systemPrompt;
+			this._invocationSystemPromptOverride =
+				result?.systemPrompt === undefined
+					? undefined
+					: { baseSystemPrompt: this._baseSystemPrompt, systemPrompt: result.systemPrompt };
 			ownsInvocationSystemPrompt = true;
 			this._composeEffectiveSystemPrompt();
 
@@ -4046,6 +4078,7 @@ export class AgentSession {
 			publishedEntries.flatMap((entry) => (entry.clientMessageId === undefined ? [] : [entry.clientMessageId])),
 		);
 		const revokedIds = new Set(this.agent.clearAllQueues());
+		for (const deliveryId of revokedIds) this._committedDeliveryPreparationMessages.delete(deliveryId);
 		const revokedSteering = this._steeringMessages.filter((entry) => revokedIds.has(entry.queueEntryId));
 		const revokedFollowUp = this._followUpMessages.filter((entry) => revokedIds.has(entry.queueEntryId));
 		const steering = revokedSteering.map((entry) => entry.text);
@@ -4136,7 +4169,9 @@ export class AgentSession {
 	 */
 	abort(source?: AgentAbortSource): Promise<void> {
 		this.agent.abort(source);
-		this.agent.discardPendingPrompt();
+		for (const deliveryId of this.agent.discardPendingPrompt()) {
+			this._committedDeliveryPreparationMessages.delete(deliveryId);
+		}
 		this._proactiveCompactionResumeAction = undefined;
 		if (this._abortPromise) {
 			return this._abortPromise;

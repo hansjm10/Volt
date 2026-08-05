@@ -287,6 +287,59 @@ describe("regression #199: abort provenance persistence", () => {
 		expect(runtimeAbortSources(harness)).toEqual(["disposal"]);
 	});
 
+	it("persists ready-plan checkpoint composition when disposal starts at the user boundary", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await harness.session.setAgentMode("plan");
+		const draft = harness.session.updatePlan({ steps: [{ text: "Revise the approved work" }] });
+		const ready = harness.session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: "Approved work",
+			summary: "Revise the approved work.",
+		});
+		await harness.session.setAgentMode("build");
+		harness.setResponses([fauxAssistantMessage("never requested")]);
+		let disposal: Promise<void> | undefined;
+		harness.session.subscribe((event) => {
+			if (event.type !== "message_start" || event.message.role !== "user" || disposal) return;
+			if (
+				!Array.isArray(event.message.content) ||
+				!event.message.content.some(
+					(part) => part.type === "text" && part.text === "Revise after ready-plan approval",
+				)
+			) {
+				return;
+			}
+			disposal = harness.session.dispose("disposal");
+		});
+
+		await harness.session.prompt("Revise after ready-plan approval");
+		if (!disposal) throw new Error("Expected disposal at the canonical user boundary");
+		await disposal;
+
+		const messages = harness.sessionManager.buildSessionContext().messages;
+		expect(messages.map((message) => message.role)).toEqual(["custom", "user", "assistant"]);
+		expect(messages[0]).toMatchObject({
+			role: "custom",
+			customType: "volt-plan-checkpoint",
+			content: expect.stringContaining("Phase: draft"),
+		});
+		expect(messages[1]).toMatchObject({
+			role: "user",
+			content: [{ type: "text", text: "Revise after ready-plan approval" }],
+		});
+		expect(messages[2]).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
+		});
+		expect(harness.session.planningState).toMatchObject({
+			mode: "plan",
+			plan: { id: ready.id, revision: ready.revision + 1, phase: "draft" },
+		});
+	});
+
 	it("does not retain delivery admission when a disposing commit fails", async () => {
 		let harness: Harness;
 		let disposal: Promise<void> | undefined;

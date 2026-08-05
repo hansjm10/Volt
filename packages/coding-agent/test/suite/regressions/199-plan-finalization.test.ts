@@ -164,6 +164,145 @@ describe("regression #199: approved plan finalization", () => {
 		);
 	});
 
+	it("does not replay a predecessor commit after a concurrent planning transition rejects ready feedback", async () => {
+		let predecessorCommits = 0;
+		const harness = await createHarness({
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				commit: () => {
+					predecessorCommits++;
+				},
+			}),
+		});
+		harnesses.push(harness);
+		await createReadyPlan(harness);
+		harness.session.agent.state.messages = [fauxAssistantMessage("Plan tail")];
+		harness.session.agent.steer(createUserMessage("feedback during transition"));
+		harness.setResponses([fauxAssistantMessage("feedback admitted once")]);
+
+		const transitionStarted = deferred();
+		const releaseTransition = deferred();
+		const internals = harness.session as unknown as { _prepareUnrestrictedMcpForBuild(): Promise<void> };
+		const prepareUnrestrictedMcpForBuild = internals._prepareUnrestrictedMcpForBuild.bind(harness.session);
+		internals._prepareUnrestrictedMcpForBuild = async () => {
+			transitionStarted.resolve();
+			await releaseTransition.promise;
+			await prepareUnrestrictedMcpForBuild();
+		};
+		const transition = harness.session.setAgentMode("build");
+		await transitionStarted.promise;
+
+		await harness.session.agent.continue();
+		expect(harness.session.agent.state.errorMessage).toContain("planning transition is in progress");
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(predecessorCommits).toBe(1);
+
+		releaseTransition.resolve();
+		await transition;
+		await harness.session.agent.continue();
+
+		expect(predecessorCommits).toBe(1);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.session.planningState).toMatchObject({ mode: "plan", plan: { phase: "draft" } });
+	});
+
+	it("does not replay a predecessor commit after ready-feedback planning persistence fails", async () => {
+		let predecessorPreparations = 0;
+		let predecessorCommits = 0;
+		const harness = await createHarness({
+			prepareDelivery: (delivery) => {
+				predecessorPreparations++;
+				const messages = [...delivery.messages];
+				return {
+					messages,
+					commit: () => {
+						predecessorCommits++;
+						messages.unshift(createUserMessage("committed predecessor output"));
+					},
+				};
+			},
+		});
+		harnesses.push(harness);
+		await createReadyPlan(harness);
+		harness.session.agent.state.messages = [fauxAssistantMessage("Plan tail")];
+		harness.session.agent.steer(createUserMessage("feedback across persistence retry"));
+		harness.setResponses([fauxAssistantMessage("feedback admitted once")]);
+
+		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
+		let failDraftPersistence = true;
+		harness.sessionManager.appendPlanningState = (planning) => {
+			if (planning.plan?.phase === "draft" && failDraftPersistence) {
+				failDraftPersistence = false;
+				throw new Error("planning persistence failed");
+			}
+			return appendPlanningState(planning);
+		};
+
+		await harness.session.agent.continue();
+		expect(harness.session.agent.state.errorMessage).toBe("planning persistence failed");
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.session.planningState.plan?.phase).toBe("ready");
+		expect(predecessorPreparations).toBe(1);
+		expect(predecessorCommits).toBe(1);
+
+		await harness.session.agent.continue();
+
+		expect(predecessorPreparations).toBe(1);
+		expect(predecessorCommits).toBe(1);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.session.planningState.plan?.phase).toBe("draft");
+		expect(
+			harness.session.messages.filter(
+				(message) =>
+					message.role === "user" &&
+					Array.isArray(message.content) &&
+					message.content.some((part) => part.type === "text" && part.text === "committed predecessor output"),
+			),
+		).toHaveLength(1);
+	});
+
+	it("does not replay a predecessor commit after a ready-feedback planning observer fails", async () => {
+		let predecessorCommits = 0;
+		const harness = await createHarness({
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				commit: () => {
+					predecessorCommits++;
+				},
+			}),
+		});
+		harnesses.push(harness);
+		await createReadyPlan(harness);
+		harness.session.agent.state.messages = [fauxAssistantMessage("Plan tail")];
+		harness.session.agent.steer(createUserMessage("feedback across observer retry"));
+		harness.setResponses([fauxAssistantMessage("feedback admitted once")]);
+
+		let failDraftObserver = true;
+		harness.session.subscribe((event) => {
+			if (event.type === "planning_state_changed" && event.planning.plan?.phase === "draft" && failDraftObserver) {
+				failDraftObserver = false;
+				throw new Error("planning observer failed");
+			}
+		});
+
+		await harness.session.agent.continue();
+
+		expect(harness.session.agent.state.errorMessage).toBeUndefined();
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.session.planningState.plan?.phase).toBe("draft");
+		expect(predecessorCommits).toBe(1);
+		const feedbackIndex = harness.session.messages.findIndex(
+			(message) =>
+				message.role === "user" &&
+				Array.isArray(message.content) &&
+				message.content.some((part) => part.type === "text" && part.text === "feedback across observer retry"),
+		);
+		expect(harness.session.messages[feedbackIndex - 1]).toMatchObject({
+			role: "custom",
+			customType: "volt-plan-checkpoint",
+		});
+	});
+
 	it("admits all-mode feedback with one ready-to-draft transition and checkpoint", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

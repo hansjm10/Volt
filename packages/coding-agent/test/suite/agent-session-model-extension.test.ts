@@ -717,6 +717,10 @@ describe("AgentSession model and extension characterization", () => {
 		for (const context of requestContexts) {
 			expect(context.systemPrompt).toContain(extensionInstruction);
 			expect(context.systemPrompt).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
+			expect(context.systemPrompt).toContain("- update_plan:");
+			expect(context.systemPrompt).toContain("- submit_plan:");
+			expect(context.systemPrompt).not.toContain("- bash:");
+			expect(context.systemPrompt).not.toContain("- edit:");
 			expect(context.tools).toContain("update_plan");
 			expect(context.tools).toContain("submit_plan");
 		}
