@@ -1693,7 +1693,9 @@ export class AgentSession {
 
 		// Handle session persistence
 		if (handledEvent.type === "message_end") {
-			if (handledEvent.deliveryId !== undefined) return handledEvent.message;
+			if (handledEvent.deliveryId !== undefined || !this.sessionManager.isConversationStateAvailable()) {
+				return handledEvent.message;
+			}
 			// Check if this is a custom message from extensions
 			if (handledEvent.message.role === "custom") {
 				// Persist as CustomMessageEntry
@@ -2347,6 +2349,7 @@ export class AgentSession {
 
 	/** Full agent state */
 	get state(): AgentState {
+		this.sessionManager.assertConversationStateAvailable();
 		return this.agent.state;
 	}
 
@@ -2366,10 +2369,12 @@ export class AgentSession {
 	}
 
 	get agentMode(): AgentMode {
+		this.sessionManager.assertConversationStateAvailable();
 		return this._planningState.mode;
 	}
 
 	get planningState(): PlanningState {
+		this.sessionManager.assertConversationStateAvailable();
 		return clonePlanningState(this._planningState);
 	}
 
@@ -3032,6 +3037,7 @@ export class AgentSession {
 
 	/** All messages including custom types like BashExecutionMessage */
 	get messages(): AgentMessage[] {
+		this.sessionManager.assertConversationStateAvailable();
 		return this.agent.state.messages;
 	}
 
@@ -4573,16 +4579,19 @@ export class AgentSession {
 
 	/** Number of pending messages (includes both steering and follow-up) */
 	get pendingMessageCount(): number {
+		this.sessionManager.assertConversationStateAvailable();
 		return this._steeringMessages.length + this._followUpMessages.length;
 	}
 
 	/** Get pending steering messages (read-only) */
 	getSteeringMessages(): readonly AgentSessionQueuedMessage[] {
+		this.sessionManager.assertConversationStateAvailable();
 		return this._steeringMessages;
 	}
 
 	/** Get pending follow-up messages (read-only) */
 	getFollowUpMessages(): readonly AgentSessionQueuedMessage[] {
+		this.sessionManager.assertConversationStateAvailable();
 		return this._followUpMessages;
 	}
 

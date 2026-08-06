@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	type DurableAtomicWriteOperations,
 	type DurableAtomicWriteSyncOperations,
+	type DurableFileSyncOperations,
+	syncDurableFile,
 	writeDurableAtomicFile,
 	writeDurableAtomicFileSync,
 } from "../src/utils/durable-atomic-write.ts";
@@ -40,6 +42,23 @@ function createOperations(events: string[]): DurableAtomicWriteOperations {
 	};
 }
 
+function createFileSyncOperations(events: string[]): DurableFileSyncOperations {
+	return {
+		open: vi.fn(async (path) => {
+			const kind = path === "/state/host.json" ? "target" : "parent";
+			events.push(`open:${kind}`);
+			return {
+				sync: vi.fn(async () => {
+					events.push(`sync:${kind}`);
+				}),
+				close: vi.fn(async () => {
+					events.push(`close:${kind}`);
+				}),
+			};
+		}),
+	};
+}
+
 function createSyncOperations(events: string[]): DurableAtomicWriteSyncOperations {
 	let nextFd = 1;
 	const kinds = new Map<number, "parent" | "temp">();
@@ -73,6 +92,73 @@ function createSyncOperations(events: string[]): DurableAtomicWriteSyncOperation
 }
 
 describe("durable atomic writes", () => {
+	it("synchronizes the visible target before its parent directory", async () => {
+		const events: string[] = [];
+		await syncDurableFile("/state/host.json", { operations: createFileSyncOperations(events) });
+
+		expect(events).toEqual([
+			"open:target",
+			"sync:target",
+			"close:target",
+			...(process.platform === "win32" ? [] : ["open:parent", "sync:parent", "close:parent"]),
+		]);
+	});
+
+	it("closes the visible target and stops when its synchronization fails", async () => {
+		const events: string[] = [];
+		const operations = createFileSyncOperations(events);
+		operations.open = vi.fn(async (path) => {
+			const kind = path === "/state/host.json" ? "target" : "parent";
+			events.push(`open:${kind}`);
+			return {
+				sync: vi.fn(async () => {
+					events.push(`sync:${kind}`);
+					throw new Error("injected target fsync failure");
+				}),
+				close: vi.fn(async () => {
+					events.push(`close:${kind}`);
+				}),
+			};
+		});
+
+		await expect(syncDurableFile("/state/host.json", { operations })).rejects.toThrow(
+			"injected target fsync failure",
+		);
+		expect(events).toEqual(["open:target", "sync:target", "close:target"]);
+	});
+
+	if (process.platform !== "win32") {
+		it("closes the parent directory when its synchronization fails", async () => {
+			const events: string[] = [];
+			const operations = createFileSyncOperations(events);
+			operations.open = vi.fn(async (path) => {
+				const kind = path === "/state/host.json" ? "target" : "parent";
+				events.push(`open:${kind}`);
+				return {
+					sync: vi.fn(async () => {
+						events.push(`sync:${kind}`);
+						if (kind === "parent") throw new Error("injected parent fsync failure");
+					}),
+					close: vi.fn(async () => {
+						events.push(`close:${kind}`);
+					}),
+				};
+			});
+
+			await expect(syncDurableFile("/state/host.json", { operations })).rejects.toThrow(
+				"injected parent fsync failure",
+			);
+			expect(events).toEqual([
+				"open:target",
+				"sync:target",
+				"close:target",
+				"open:parent",
+				"sync:parent",
+				"close:parent",
+			]);
+		});
+	}
+
 	it("uses the supported durability ordering for asynchronous writes", async () => {
 		const events: string[] = [];
 		await writeDurableAtomicFile("/state/host.json", "payload", { operations: createOperations(events) });

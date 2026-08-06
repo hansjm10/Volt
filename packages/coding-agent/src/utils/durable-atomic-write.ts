@@ -13,6 +13,12 @@ export interface DurableAtomicWriteOperations {
 
 const DEFAULT_OPERATIONS: DurableAtomicWriteOperations = { mkdir, open, rename, rm };
 
+export interface DurableFileSyncOperations {
+	open(path: string, flags: "r"): Promise<Pick<FileHandle, "close" | "sync">>;
+}
+
+const DEFAULT_FILE_SYNC_OPERATIONS: DurableFileSyncOperations = { open };
+
 export interface DurableAtomicWriteSyncOperations {
 	mkdir(path: string, options: { recursive: true; mode: number }): unknown;
 	open(path: string, flags: string, mode?: number): number;
@@ -32,6 +38,32 @@ const DEFAULT_SYNC_OPERATIONS: DurableAtomicWriteSyncOperations = {
 	rename: renameSync,
 	rm: rmSync,
 };
+
+/**
+ * Make the currently visible file and its directory entry durable. The target is
+ * synchronized before its parent so callers can recheck visibility afterward.
+ */
+export async function syncDurableFile(
+	path: string,
+	options: { operations?: DurableFileSyncOperations } = {},
+): Promise<void> {
+	const operations = options.operations ?? DEFAULT_FILE_SYNC_OPERATIONS;
+	const targetHandle = await operations.open(path, "r");
+	try {
+		await targetHandle.sync();
+	} finally {
+		await targetHandle.close();
+	}
+
+	if (process.platform !== "win32") {
+		const parentHandle = await operations.open(dirname(path), "r");
+		try {
+			await parentHandle.sync();
+		} finally {
+			await parentHandle.close();
+		}
+	}
+}
 
 /**
  * Atomically replace a security-sensitive file and make the replacement durable

@@ -2,7 +2,7 @@
 
 Issue: [#206](https://github.com/volt-hq/Volt/issues/206)
 
-This document specifies the observable delivery behavior for coding-agent and its dispatcher integration. #206 established the behavioral contract, #207 added Agent's transaction participant, and #205 migrated coding-agent persistence to that participant and removed the temporary commit adapter.
+This document specifies the observable delivery behavior for coding-agent and its dispatcher integration. #206 established the behavioral contract, #207 added Agent's transaction participant, #205 migrated coding-agent persistence to that participant and removed the temporary commit adapter, and #217 defined reconciliation when an atomic replacement reports failure after its candidate may already be visible.
 
 ## Scope
 
@@ -45,6 +45,10 @@ A participant failure after the commit decision has one of two deterministic cla
 
 1. **Definitive rollback:** the participant proves no delivery-coupled durable state committed. The attempt is `retained`; this is a transaction outcome, not a late revocation.
 2. **Uncertain or irreversible failure:** the participant cannot prove safe replay. The logical delivery is `terminally_failed` and durable client input remains failed or `started`/ambiguous. It is never automatically replayed.
+
+An atomic replacement that reports failure is reconciled from exact bytes, not by attempting another replacement back to the preimage. If the unchanged preimage (including an originally missing file) is visible, the attempt is definitively rolled back. If the exact candidate is visible, SessionManager rolls forward: it fsyncs the target and supported parent directory, then re-reads the target and commits the staged indexes only if the exact candidate remains visible. Publication, direct RPC acceptance, and provider work remain behind that proof.
+
+If visibility cannot be classified exactly, candidate synchronization fails, or the post-sync bytes cannot be reverified, the persistence watermark remains rejected and the manager fail-stops. Its live conversation and client-input projections are explicitly unavailable rather than reporting either an old in-memory preimage or an unproven candidate. Stable session identity and file path remain readable so disposal can finish and a new runtime can reopen the authoritative JSONL bytes.
 
 No outcome depends on whether an observer, abort, or dispose happens between adjacent public events.
 
@@ -198,7 +202,7 @@ Abort stops provider/tool continuation, but preserves canonical delivery, comple
 |---|---|---|---|---|---|
 | Preparation fails | Delivery retained; attempt settles `retained` | Unchanged | Queued input remains `accepted`; direct invocation receives a bounded nonterminal failure | Settles once; acknowledged queue RPC is unchanged | Unchanged |
 | Definitive durability failure | Delivery retained; attempt settles `retained` | Unchanged | Remains `accepted` | Settles once; no later duplicate response | Unchanged |
-| Ambiguous durability failure | Delivery `terminally_failed`; no replay | No unproven canonical entry is projected | Durable `started` ambiguity or `failed` fence | Settles once with failure unless already acknowledged | No unproven transition is projected |
+| Ambiguous durability failure | Delivery `terminally_failed`; no replay | Live projection unavailable until reload | Live projection unavailable; reopened JSONL determines durable state | Settles once with failure unless already acknowledged | Live projection unavailable until reload |
 | External abort during durability | Commit decision deterministically wins or loses; losing pre-commit attempt is retained | No partial state; successful commit is preserved | Matches the winning transaction | Settles once | Matches canonical outcome; no divergence |
 | Reentrant abort/dispose during participant work | Records lifecycle intent without deadlock; participant outcome remains authoritative | Successful participant state precedes abort marker | Settles from participant outcome | Settles once | Successful transition is preserved |
 | Abort after commit | Delivery committed; run may abort | Preserved | `completed` | Accepted/success unchanged | Transition and checkpoint preserved |
@@ -221,6 +225,8 @@ Abort stops provider/tool continuation, but preserves canonical delivery, comple
 #207 makes the participant-level acceptance cases executable in `packages/agent/test/agent-delivery-transaction.test.ts` and `packages/agent/test/agent-next-action.test.ts`. Those tests cover retained retry with stable identity, definitive versus ambiguous settlement, deterministic preflight, lifecycle races and reentrancy, committed-observer isolation, and provider-only continuation without recommit. Lease mechanics remain covered by `packages/agent/test/delivery-inbox.test.ts`.
 
 #205 adds consumer-level fault-stage coverage in `packages/coding-agent/test/suite/regressions/205-delivery-participant-migration.test.ts`. It proves that canonical durability precedes delivery publication and that a failure after canonical append is terminally fenced rather than replayed.
+
+#217 adds disk-backed reconciliation coverage in `packages/coding-agent/test/suite/regressions/217-uncertain-atomic-append-reconciliation.test.ts`. It proves exact-preimage retention, exact-candidate roll-forward, proof-gated planning/RPC/provider publication, and unavailable live projections when durability cannot be proven while a reopened manager follows the authoritative file bytes.
 
 ## Non-goals
 

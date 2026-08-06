@@ -295,29 +295,4 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 		expect(harness.getPendingResponseCount()).toBe(1);
 		await harness.session.clearQueue();
 	});
-
-	it("terminally fails without publication when candidate rollback is uncertain", async () => {
-		const { harness, baseline } = await setup();
-		harness.setResponses([fauxAssistantMessage("must remain unused")]);
-		atomicWriteFault.stages = ["after", "before"];
-
-		await harness.session.steer("revise this ready plan");
-		await expect(harness.session.agent.continue()).rejects.toThrow(
-			"Session persistence is fail-stopped after an uncertain write",
-		);
-		expect(snapshotHarness(harness)).toEqual(baseline);
-		expect(harness.getPendingResponseCount()).toBe(1);
-
-		harnesses.pop();
-		await expect(harness.session.dispose()).rejects.toThrow("Atomic append rollback failed");
-		harness.cleanup();
-	});
-
-	it("restores the preimage when final durability fails after replacement", async () => {
-		const { harness, sessionFile, baseline } = await setup();
-		harness.setResponses([fauxAssistantMessage("must remain unused")]);
-		atomicWriteFault.stages = ["after"];
-
-		await expectRetainedFailure(harness, sessionFile, baseline, "issue-212-final-durability");
-	});
 });
