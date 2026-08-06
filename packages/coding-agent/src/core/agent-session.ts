@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -437,6 +438,11 @@ interface PreparedDeliverySnapshot {
 	error?: Error;
 }
 
+interface AgentDeliveryParticipantLease {
+	/** Revoked as soon as the upstream participant callback settles. */
+	active: boolean;
+}
+
 interface LiveClientInputOperation {
 	command: ClientInputCommand;
 	semanticDigest: string;
@@ -535,6 +541,8 @@ export class AgentSession {
 	private readonly _preparingDeliveryExtensions = new Map<string, object>();
 	/** Host cleanup started by synchronous Agent revocation callbacks. */
 	private readonly _deliveryRevocationSettlements = new Set<Promise<void>>();
+	/** Reentrant lifecycle authority scoped to the upstream participant callback. */
+	private readonly _deliveryParticipantContext = new AsyncLocalStorage<AgentDeliveryParticipantLease>();
 	private _agentDeliveryRevocationSuppressionDepth = 0;
 	private readonly _suppressedAgentDeliveryRevocations = new Map<string, AgentDelivery>();
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
@@ -1342,7 +1350,16 @@ export class AgentSession {
 				return { outcome: "terminally_failed", error: terminalError };
 			}
 			if (input.upstream) {
-				const outcome = await input.upstream.settle(input.context);
+				const lease: AgentDeliveryParticipantLease = { active: true };
+				const upstream = input.upstream;
+				let outcome: AgentDeliveryParticipantOutcome;
+				try {
+					outcome = await this._deliveryParticipantContext.run(lease, () => upstream.settle(input.context));
+				} finally {
+					// AsyncLocalStorage propagates into detached descendants. Revoking the
+					// callback-local lease prevents them from retaining participant authority.
+					lease.active = false;
+				}
 				if (outcome.outcome === "retained") {
 					return await this._settleRetainedDirectInput(input.messages, outcome.error);
 				}
@@ -2093,16 +2110,48 @@ export class AgentSession {
 	}
 
 	private _dispose(source: AgentAbortSource, acceptReconciliationRequired: boolean): Promise<void> {
-		if (this._disposePromise) {
-			return this._disposePromise;
+		if (!this._disposePromise) {
+			let resolveDisposal!: () => void;
+			let rejectDisposal!: (reason: unknown) => void;
+			const disposal = new Promise<void>((resolve, reject) => {
+				resolveDisposal = resolve;
+				rejectDisposal = reject;
+			});
+			// A participant may intentionally request disposal without joining it.
+			// Retain one observed underlying promise for all current and later callers.
+			void disposal.catch(() => undefined);
+			this._disposePromise = disposal;
+			void this._performDispose(source, acceptReconciliationRequired).then(resolveDisposal, rejectDisposal);
 		}
+
+		const disposal = this._disposePromise;
+		if (!this._deliveryParticipantContext.getStore()?.active) {
+			return disposal;
+		}
+
+		const join = (): Promise<void> => {
+			if (!this._deliveryParticipantContext.getStore()?.active) {
+				return disposal;
+			}
+			return Promise.reject(
+				new Error(
+					'Cannot await AgentSession disposal from an active delivery participant. Use context.requestAbort("disposal"), return the participant outcome, and await disposal after the Agent run settles.',
+				),
+			);
+		};
+		return {
+			// biome-ignore lint/suspicious/noThenProperty: This object intentionally implements a guarded Promise receipt.
+			then: (onfulfilled, onrejected) => join().then(onfulfilled, onrejected),
+			catch: (onrejected) => join().catch(onrejected),
+			finally: (onfinally) => join().finally(onfinally),
+			[Symbol.toStringTag]: "Promise",
+		};
+	}
+
+	private async _performDispose(source: AgentAbortSource, acceptReconciliationRequired: boolean): Promise<void> {
 		const deliverySettlement = this.agent.activeDeliverySettlement;
 		if (deliverySettlement) {
-			this._disposePromise = deliverySettlement.then(() => {
-				this._disposePromise = undefined;
-				return this._dispose(source, acceptReconciliationRequired);
-			});
-			return this._disposePromise;
+			await deliverySettlement;
 		}
 		const runBeforeAbort = this.agent.activeRunSnapshot;
 		const abortAcceptance = this.agent.abort(source);
@@ -2142,10 +2191,6 @@ export class AgentSession {
 		} catch (error) {
 			mcpDrain = Promise.reject(error);
 		}
-		this._disposePromise = Promise.allSettled([persistenceDrain, subagentDrain, mcpDrain]).then((results) => {
-			const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
-			if (rejected) throw rejected.reason;
-		});
 
 		try {
 			this.abortRetry();
@@ -2187,8 +2232,10 @@ export class AgentSession {
 		this._eventListeners = [];
 		this._conversationGenerationListeners.clear();
 		cleanupSessionResources(this.sessionId);
-		this._disposePromise ??= this.sessionManager.flush();
-		return this._disposePromise;
+
+		const results = await Promise.allSettled([persistenceDrain, subagentDrain, mcpDrain]);
+		const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+		if (rejected) throw rejected.reason;
 	}
 
 	private _persistDisposalAbortMarker(
