@@ -1301,7 +1301,7 @@ export class AgentSession {
 		readyPlan?: PlanState;
 		nextPlanningState?: PlanningState;
 	}): Promise<AgentDeliveryParticipantOutcome> {
-		let committedEffect = false;
+		let terminalOutcomeRequired = false;
 		let planningPublished = false;
 		try {
 			if (input.preparationError) {
@@ -1328,7 +1328,7 @@ export class AgentSession {
 					this._completePreparedDelivery(input.deliveryId);
 					return { outcome: "terminally_failed", error: terminalError };
 				}
-				committedEffect = true;
+				terminalOutcomeRequired = true;
 			}
 
 			if (input.readyPlan && input.nextPlanningState) {
@@ -1354,22 +1354,27 @@ export class AgentSession {
 							planningPublished = true;
 						},
 					);
-					committedEffect = true;
+					terminalOutcomeRequired = true;
 				} catch (error) {
-					if (error instanceof SessionAtomicAppendError && error.effect !== "rolled_back") {
-						committedEffect = true;
+					if (
+						error instanceof SessionAtomicAppendError &&
+						(error.authority === "reconciliation_required" ||
+							error.effect === "uncertain" ||
+							error.effect === "committed")
+					) {
+						terminalOutcomeRequired = true;
 					}
 					throw error;
 				}
 			} else {
 				const boundaryAppended = this._startCommittedClientInputs(input.messages);
 				if (boundaryAppended) {
-					committedEffect = true;
+					terminalOutcomeRequired = true;
 					await this.sessionManager.flush();
 				}
 				for (const message of input.messages) {
 					this._persistCommittedDeliveryMessage(message);
-					committedEffect = true;
+					terminalOutcomeRequired = true;
 				}
 				await this.sessionManager.flush();
 			}
@@ -1387,7 +1392,7 @@ export class AgentSession {
 			return { outcome: "committed" };
 		} catch (error) {
 			const settlementError = error instanceof Error ? error : new Error(String(error));
-			if (!committedEffect) {
+			if (!terminalOutcomeRequired) {
 				return await this._settleRetainedDirectInput(input.messages, settlementError);
 			}
 			const terminalError = await this._terminallyFailDelivery(input.messages, input.queueEntries, settlementError);

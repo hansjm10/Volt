@@ -131,10 +131,42 @@ describe("loadEntriesFromFile", () => {
 				() => {},
 			),
 		).rejects.toMatchObject({
-			effect: "rolled_back",
+			effect: "not_started",
+			authority: "reconciliation_required",
 			message: expect.stringContaining("malformed at committed line"),
 		});
 		expect(readFileSync(sessionFile).equals(exactPreimage)).toBe(true);
+		const authority = manager.getConversationAuthorityStatus();
+		expect(authority.status).toBe("reconciliation_required");
+		expect(() => manager.getEntries()).toThrow(
+			"Session conversation authority requires reconciliation because persisted state could not be proven",
+		);
+		await expect(manager.drainPersistence()).resolves.toMatchObject({
+			status: "reconciliation_required",
+		});
+	});
+
+	it("retains authority when a matching legacy schema prevents an atomic append", async () => {
+		const sessionFile = join(tempDir, "legacy-atomic.jsonl");
+		writeFileSync(
+			sessionFile,
+			'{"type":"session","version":3,"id":"legacy-atomic","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n',
+		);
+		const manager = SessionManager.open(sessionFile, tempDir);
+		const exactPreimage = readFileSync(sessionFile);
+
+		await expect(
+			manager.appendAtomically(
+				() => manager.appendPlanningState({ mode: "build", plan: null }),
+				() => {},
+			),
+		).rejects.toMatchObject({
+			effect: "not_started",
+			authority: "available",
+			message: "Atomic append requires the current session schema",
+		});
+		expect(readFileSync(sessionFile).equals(exactPreimage)).toBe(true);
+		expect(manager.getConversationAuthorityStatus()).toEqual({ status: "available" });
 	});
 
 	it("atomically appends across valid and torn unterminated tails", async () => {

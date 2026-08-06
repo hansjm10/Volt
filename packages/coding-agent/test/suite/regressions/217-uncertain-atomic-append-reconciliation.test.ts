@@ -316,6 +316,92 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 		expect(prepareReplacement).not.toHaveBeenCalled();
 	});
 
+	it("retires a stale manager before writing when another manager committed the session", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "volt-issue-217-stale-manager-"));
+		tempDirs.push(tempDir);
+		const current = SessionManager.create(tempDir, join(tempDir, "sessions"));
+		current.appendPlanningState({ mode: "build", plan: null });
+		await current.flush();
+		const sessionFile = current.getSessionFile()!;
+		const stale = SessionManager.open(sessionFile, tempDir);
+
+		current.appendPlanningState({ mode: "plan", plan: null });
+		await current.flush();
+		const authoritativeBytes = readFileSync(sessionFile);
+		let published = false;
+
+		await expect(
+			stale.appendAtomically(
+				() => stale.appendPlanningState({ mode: "build", plan: null }),
+				() => {
+					published = true;
+				},
+			),
+		).rejects.toMatchObject({
+			effect: "not_started",
+			authority: "reconciliation_required",
+			message: "Session changed before the atomic append could begin",
+		});
+
+		expect(published).toBe(false);
+		expect(readFileSync(sessionFile).equals(authoritativeBytes)).toBe(true);
+		expect(stale.getConversationAuthorityStatus().status).toBe("reconciliation_required");
+		expect(() => stale.getEntries()).toThrow(SessionConversationStateUnavailableError);
+		await expect(stale.drainPersistence()).resolves.toMatchObject({ status: "reconciliation_required" });
+		expect(SessionManager.open(sessionFile, tempDir).buildSessionContext().planning).toEqual({
+			mode: "plan",
+			plan: null,
+		});
+	});
+
+	it("terminally consumes a stale-generation delivery and recovers it from a fresh manager", async () => {
+		const { harness, sessionFile } = await setup();
+		harness.setResponses([fauxAssistantMessage("must remain unused")]);
+		const clientMessageId = "issue-217-stale-generation";
+		await harness.session.steer("recover from the authoritative preimage", undefined, clientMessageId);
+		await harness.sessionManager.flush();
+
+		const current = SessionManager.open(sessionFile);
+		current.appendSessionInfo("newer manager generation");
+		await current.flush();
+		const authoritativeBytes = readFileSync(sessionFile);
+
+		await expect(harness.session.agent.continue()).resolves.toMatchObject({
+			status: "delivery_failed",
+			failure: { outcome: "terminally_failed", phase: "settlement" },
+		});
+
+		const authority = harness.sessionManager.getConversationAuthorityStatus();
+		expect(authority.status).toBe("reconciliation_required");
+		if (authority.status !== "reconciliation_required") {
+			throw new Error("Expected reconciliation-required conversation authority");
+		}
+		expect(authority.error.cause).toMatchObject({
+			effect: "not_started",
+			authority: "reconciliation_required",
+		});
+		expect(readFileSync(sessionFile).equals(authoritativeBytes)).toBe(true);
+		expect(harness.session.agent.hasPendingPrompt()).toBe(false);
+		expect(harness.getPendingResponseCount()).toBe(1);
+
+		const reopened = SessionManager.open(sessionFile);
+		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
+		expect(reopened.getClientInputRecoveryPlan()).toMatchObject({
+			kind: "replay",
+			records: [{ clientMessageId }],
+		});
+		const replacement = await createHarness({ sessionManager: reopened });
+		harnesses.push(replacement);
+		replacement.setResponses([fauxAssistantMessage("fresh manager recovered delivery")]);
+
+		await replacement.session.resumeRecoveredClientInputs();
+
+		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
+		expect(getUserTexts(replacement)).toEqual(["recover from the authoritative preimage"]);
+		expect(getAssistantTexts(replacement)).toEqual(["fresh manager recovered delivery"]);
+		expect(replacement.getPendingResponseCount()).toBe(0);
+	});
+
 	it("retains an originally missing preimage after a proven pre-replacement failure", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "volt-issue-217-missing-"));
 		tempDirs.push(tempDir);

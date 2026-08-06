@@ -1412,6 +1412,12 @@ describe("ConversationProjectionFeed", () => {
 			success: true,
 			data: { stale: true },
 		});
+		const staleTranscriptTextControl = subscription.enqueueControl({
+			type: "response",
+			command: "get_transcript_entry_text",
+			success: true,
+			data: { text: "stale canonical text" },
+		});
 		const control = subscription.enqueueControl({ type: "response", success: false });
 		const authorityError = new Error("conversation authority requires reconciliation");
 
@@ -1426,7 +1432,7 @@ describe("ConversationProjectionFeed", () => {
 		firstSource.emit({ type: "agent_end", messages: [] });
 
 		blocked.resolve();
-		await Promise.all([subscription.ready, staleProjectionControl, control]);
+		await Promise.all([subscription.ready, staleProjectionControl, staleTranscriptTextControl, control]);
 		await subscription.flush();
 		expect(writes).toEqual([
 			expect.objectContaining({ type: "conversation_bootstrap", reason: "bootstrap" }),

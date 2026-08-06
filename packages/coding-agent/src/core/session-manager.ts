@@ -65,13 +65,23 @@ export interface SessionHeader {
 /** How a session came to exist. Absent means a user-initiated session. */
 export type SessionOrigin = "subagent";
 
-export class SessionAtomicAppendError extends Error {
-	readonly effect: "rolled_back" | "uncertain" | "committed";
+export type SessionAtomicAppendEffect = "not_started" | "rolled_back" | "uncertain" | "committed";
+export type SessionAtomicAppendAuthority = "available" | "reconciliation_required";
 
-	constructor(message: string, effect: "rolled_back" | "uncertain" | "committed", options?: ErrorOptions) {
+export class SessionAtomicAppendError extends Error {
+	readonly effect: SessionAtomicAppendEffect;
+	readonly authority: SessionAtomicAppendAuthority;
+
+	constructor(
+		message: string,
+		effect: SessionAtomicAppendEffect,
+		authority: SessionAtomicAppendAuthority,
+		options?: ErrorOptions,
+	) {
 		super(message, options);
 		this.name = "SessionAtomicAppendError";
 		this.effect = effect;
+		this.authority = authority;
 	}
 }
 
@@ -80,7 +90,7 @@ export class SessionConversationStateUnavailableError extends Error {
 
 	constructor(options?: ErrorOptions) {
 		super(
-			"Session conversation authority requires reconciliation after an unresolved atomic write; replace the runtime",
+			"Session conversation authority requires reconciliation because persisted state could not be proven; replace the runtime",
 			options,
 		);
 		this.name = "SessionConversationStateUnavailableError";
@@ -106,11 +116,18 @@ export type SessionPersistenceDrainResult =
 	  };
 
 class AtomicAppendPersistenceFailure extends Error {
-	readonly effect: "rolled_back" | "uncertain";
+	readonly effect: Exclude<SessionAtomicAppendEffect, "committed">;
+	readonly authority: SessionAtomicAppendAuthority;
 
-	constructor(message: string, effect: "rolled_back" | "uncertain", options?: ErrorOptions) {
+	constructor(
+		message: string,
+		effect: Exclude<SessionAtomicAppendEffect, "committed">,
+		authority: SessionAtomicAppendAuthority,
+		options?: ErrorOptions,
+	) {
 		super(message, options);
 		this.effect = effect;
+		this.authority = authority;
 	}
 }
 
@@ -1956,6 +1973,25 @@ export class SessionManager {
 		}
 	}
 
+	private _requireConversationReconciliation(cause: Error): SessionConversationStateUnavailableError {
+		if (this.conversationAuthorityStatus.status === "reconciliation_required") {
+			return this.conversationAuthorityStatus.error;
+		}
+		const status = {
+			status: "reconciliation_required",
+			error: new SessionConversationStateUnavailableError({ cause }),
+		} as const;
+		this.conversationAuthorityStatus = status;
+		for (const listener of this.conversationAuthorityListeners) {
+			try {
+				listener(status);
+			} catch {
+				// Authority loss is sticky. Projection cleanup cannot roll it back.
+			}
+		}
+		return status.error;
+	}
+
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 		const filePath = this.sessionFile;
@@ -2063,30 +2099,6 @@ export class SessionManager {
 			flushed: this.flushed,
 			sessionFileNeedsMigration: this.sessionFileNeedsMigration,
 		};
-		let preimage: Buffer | undefined;
-		if (snapshot.flushed && this.sessionFile) {
-			let persistedEntries: FileEntry[];
-			try {
-				preimage = readFileSync(this.sessionFile);
-				persistedEntries = parseAtomicSessionPreimage(preimage);
-			} catch (error) {
-				this.atomicAppendInFlight = false;
-				throw new SessionAtomicAppendError(
-					error instanceof Error ? error.message : "Could not read atomic append preimage",
-					"rolled_back",
-					{ cause: error },
-				);
-			}
-			const persistedHeader = persistedEntries.find((entry) => entry.type === "session");
-			if (persistedHeader?.version !== CURRENT_SESSION_VERSION) {
-				this.atomicAppendInFlight = false;
-				throw new SessionAtomicAppendError("Atomic append requires the current session schema", "rolled_back");
-			}
-			if (this._serializeFileEntries(persistedEntries) !== this._serializeFileEntries(snapshot.fileEntries)) {
-				this.atomicAppendInFlight = false;
-				throw new SessionAtomicAppendError("Session changed before the atomic append could begin", "rolled_back");
-			}
-		}
 		const restore = (): void => {
 			this.fileEntries = snapshot.fileEntries;
 			this.byId = snapshot.byId;
@@ -2140,19 +2152,74 @@ export class SessionManager {
 				const task = this.persistenceQueue.then(async () => {
 					if (this.persistenceError) throw this.persistenceError;
 					await serializeSessionFileOperation(filePath, async () => {
-						let current: Buffer | undefined;
+						let preimage: Buffer | undefined;
 						try {
-							current = existsSync(filePath) ? readFileSync(filePath) : undefined;
+							preimage = existsSync(filePath) ? readFileSync(filePath) : undefined;
 						} catch (error) {
-							throw new AtomicAppendPersistenceFailure("Could not verify atomic append preimage", "uncertain", {
-								cause: error,
-							});
-						}
-						if (!exactOptionalBytesEqual(current, preimage)) {
 							throw new AtomicAppendPersistenceFailure(
-								"Session changed before the atomic append could commit",
-								"rolled_back",
+								"Could not verify atomic append preimage",
+								"not_started",
+								"reconciliation_required",
+								{ cause: error },
 							);
+						}
+						if (snapshot.flushed !== (preimage !== undefined)) {
+							throw new AtomicAppendPersistenceFailure(
+								"Session file presence changed before the atomic append could begin",
+								"not_started",
+								"reconciliation_required",
+							);
+						}
+						if (preimage !== undefined) {
+							let persistedEntries: FileEntry[];
+							try {
+								persistedEntries = parseAtomicSessionPreimage(preimage);
+							} catch (error) {
+								throw new AtomicAppendPersistenceFailure(
+									error instanceof Error ? error.message : "Could not parse atomic append preimage",
+									"not_started",
+									"reconciliation_required",
+									{ cause: error },
+								);
+							}
+							const persistedHeader = persistedEntries.find((entry) => entry.type === "session");
+							if (persistedHeader?.version !== CURRENT_SESSION_VERSION) {
+								try {
+									migrateToCurrentVersion(persistedEntries);
+								} catch (error) {
+									throw new AtomicAppendPersistenceFailure(
+										error instanceof Error ? error.message : "Could not validate atomic append schema",
+										"not_started",
+										"reconciliation_required",
+										{ cause: error },
+									);
+								}
+								if (
+									this._serializeFileEntries(persistedEntries) !==
+									this._serializeFileEntries(snapshot.fileEntries)
+								) {
+									throw new AtomicAppendPersistenceFailure(
+										"Session changed before the atomic append could begin",
+										"not_started",
+										"reconciliation_required",
+									);
+								}
+								throw new AtomicAppendPersistenceFailure(
+									"Atomic append requires the current session schema",
+									"not_started",
+									"available",
+								);
+							}
+							if (
+								this._serializeFileEntries(persistedEntries) !==
+								this._serializeFileEntries(snapshot.fileEntries)
+							) {
+								throw new AtomicAppendPersistenceFailure(
+									"Session changed before the atomic append could begin",
+									"not_started",
+									"reconciliation_required",
+								);
+							}
 						}
 						try {
 							await writeDurableAtomicFile(filePath, content, {
@@ -2164,39 +2231,55 @@ export class SessionManager {
 							try {
 								visible = existsSync(filePath) ? readFileSync(filePath) : undefined;
 							} catch (visibilityError) {
-								throw new AtomicAppendPersistenceFailure("Atomic append visibility is uncertain", "uncertain", {
-									cause: visibilityError,
-								});
+								throw new AtomicAppendPersistenceFailure(
+									"Atomic append visibility is uncertain",
+									"uncertain",
+									"reconciliation_required",
+									{ cause: visibilityError },
+								);
 							}
 							if (exactOptionalBytesEqual(visible, preimage)) {
-								throw new AtomicAppendPersistenceFailure("Atomic append was rolled back", "rolled_back", {
-									cause: error,
-								});
+								throw new AtomicAppendPersistenceFailure(
+									"Atomic append was rolled back",
+									"rolled_back",
+									"available",
+									{ cause: error },
+								);
 							}
 							if (!exactOptionalBytesEqual(visible, content)) {
-								throw new AtomicAppendPersistenceFailure("Atomic append visibility is uncertain", "uncertain", {
-									cause: error,
-								});
+								throw new AtomicAppendPersistenceFailure(
+									"Atomic append visibility is uncertain",
+									"uncertain",
+									"reconciliation_required",
+									{ cause: error },
+								);
 							}
 							try {
 								await syncDurableFile(filePath);
 							} catch (syncError) {
-								throw new AtomicAppendPersistenceFailure("Atomic append durability is uncertain", "uncertain", {
-									cause: syncError,
-								});
+								throw new AtomicAppendPersistenceFailure(
+									"Atomic append durability is uncertain",
+									"uncertain",
+									"reconciliation_required",
+									{ cause: syncError },
+								);
 							}
 							let durableVisible: Buffer;
 							try {
 								durableVisible = readFileSync(filePath);
 							} catch (visibilityError) {
-								throw new AtomicAppendPersistenceFailure("Atomic append visibility is uncertain", "uncertain", {
-									cause: visibilityError,
-								});
+								throw new AtomicAppendPersistenceFailure(
+									"Atomic append visibility is uncertain",
+									"uncertain",
+									"reconciliation_required",
+									{ cause: visibilityError },
+								);
 							}
 							if (!durableVisible.equals(content)) {
 								throw new AtomicAppendPersistenceFailure(
 									"Atomic append visibility changed after durability proof",
 									"uncertain",
+									"reconciliation_required",
 								);
 							}
 						}
@@ -2214,28 +2297,18 @@ export class SessionManager {
 					: new AtomicAppendPersistenceFailure(
 							error instanceof Error ? error.message : String(error),
 							"uncertain",
+							"reconciliation_required",
 							{ cause: error },
 						);
 			if (failure.effect === "uncertain") {
 				this.persistenceError ??= failure;
-				if (this.conversationAuthorityStatus.status === "available") {
-					const status = {
-						status: "reconciliation_required",
-						error: new SessionConversationStateUnavailableError({ cause: failure }),
-					} as const;
-					this.conversationAuthorityStatus = status;
-					for (const listener of this.conversationAuthorityListeners) {
-						try {
-							listener(status);
-						} catch {
-							// Authority loss is sticky. Projection cleanup cannot roll it back.
-						}
-					}
-				}
 			} else {
 				this.persistenceWatermark = this.persistenceQueue;
 			}
-			throw new SessionAtomicAppendError(failure.message, failure.effect, { cause: failure });
+			if (failure.authority === "reconciliation_required") {
+				this._requireConversationReconciliation(failure);
+			}
+			throw new SessionAtomicAppendError(failure.message, failure.effect, failure.authority, { cause: failure });
 		}
 
 		this.fileEntries = staged.fileEntries;
@@ -2251,7 +2324,7 @@ export class SessionManager {
 			beforePublish();
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			throw new SessionAtomicAppendError(message, "committed", { cause: error });
+			throw new SessionAtomicAppendError(message, "committed", "available", { cause: error });
 		} finally {
 			try {
 				for (const entry of entries) this._notifyEntryListeners(entry);
@@ -2285,7 +2358,6 @@ export class SessionManager {
 		}
 		try {
 			await this.flush();
-			return { status: "closed" };
 		} catch (error) {
 			const authority = this.conversationAuthorityStatus;
 			if (authority.status === "reconciliation_required" && authority.error.cause === error) {
@@ -2293,6 +2365,10 @@ export class SessionManager {
 			}
 			throw error;
 		}
+		const authority = this.conversationAuthorityStatus;
+		return authority.status === "reconciliation_required"
+			? { status: "reconciliation_required", error: authority.error }
+			: { status: "closed" };
 	}
 
 	/** Seal a persisted manager against later writes and reject on every failed watermark. */

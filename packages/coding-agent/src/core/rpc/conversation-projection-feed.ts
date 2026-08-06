@@ -16,6 +16,7 @@ import {
 import {
 	RPC_CONVERSATION_IDENTIFIER_MAX_UTF8_BYTES,
 	type RpcAssistantStreamPosition,
+	type RpcCommandType,
 	type RpcConversationActiveAssistant,
 	type RpcConversationBootstrapEvent,
 	type RpcConversationBootstrapReason,
@@ -613,7 +614,7 @@ function assertCanonicalTranscriptEntry(entry: Record<string, unknown>): void {
 	}
 }
 
-const CONVERSATION_PROJECTION_RESPONSE_COMMANDS = new Set([
+const CONVERSATION_PROJECTION_RESPONSE_COMMANDS: ReadonlySet<string> = new Set([
 	"get_fork_messages",
 	"get_last_assistant_text",
 	"get_message_images",
@@ -621,7 +622,8 @@ const CONVERSATION_PROJECTION_RESPONSE_COMMANDS = new Set([
 	"get_session_stats",
 	"get_state",
 	"get_transcript",
-]);
+	"get_transcript_entry_text",
+] satisfies RpcCommandType[]);
 
 function isConversationProjectionControl(
 	value: object,

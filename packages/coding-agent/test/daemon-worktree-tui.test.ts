@@ -695,6 +695,7 @@ describe("new session into a worktree (§5.2.1 cwd/sessionDir overrides)", () =>
 				sessionManager,
 				extensionRunner: { hasHandlers: () => false },
 				disposeSubagentToolManager: vi.fn(),
+				disposeForSessionReplacement: vi.fn(),
 				dispose: vi.fn(),
 				subscribe: vi.fn(() => () => {}),
 				get sessionFile() {
