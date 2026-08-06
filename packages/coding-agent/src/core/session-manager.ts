@@ -9,6 +9,7 @@ import {
 	fstatSync,
 	openSync,
 	readdirSync,
+	readFileSync,
 	readSync,
 	statSync,
 } from "fs";
@@ -63,6 +64,25 @@ export interface SessionHeader {
 
 /** How a session came to exist. Absent means a user-initiated session. */
 export type SessionOrigin = "subagent";
+
+export class SessionAtomicAppendError extends Error {
+	readonly effect: "rolled_back" | "uncertain" | "committed";
+
+	constructor(message: string, effect: "rolled_back" | "uncertain" | "committed", options?: ErrorOptions) {
+		super(message, options);
+		this.name = "SessionAtomicAppendError";
+		this.effect = effect;
+	}
+}
+
+class AtomicAppendPersistenceFailure extends Error {
+	readonly effect: "rolled_back" | "uncertain";
+
+	constructor(message: string, effect: "rolled_back" | "uncertain", options?: ErrorOptions) {
+		super(message, options);
+		this.effect = effect;
+	}
+}
 
 export interface NewSessionOptions {
 	id?: string;
@@ -1601,6 +1621,10 @@ export class SessionManager {
 	private persistenceWatermark: Promise<void> = Promise.resolve();
 	private readonly entryListeners = new Set<SessionEntryListener>();
 	private readonly branchListeners = new Set<SessionBranchListener>();
+	/** Entries staged by appendAtomically before one persistence operation is accepted. */
+	private atomicAppendEntries: SessionEntry[] | undefined;
+	/** Fences unrelated writers while an atomic replacement is settling. */
+	private atomicAppendInFlight = false;
 
 	private constructor(
 		cwd: string,
@@ -1626,6 +1650,9 @@ export class SessionManager {
 
 	/** Switch to a different session file (used for resume and branching) */
 	setSessionFile(sessionFile: string): void {
+		if (this.atomicAppendInFlight) {
+			throw new Error("Cannot switch session files during an atomic append");
+		}
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			hardenPrivateRegularFileSync(this.sessionFile);
@@ -1655,6 +1682,9 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
+		if (this.atomicAppendInFlight) {
+			throw new Error("Cannot create a new session during an atomic append");
+		}
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
@@ -1759,8 +1789,8 @@ export class SessionManager {
 		void task.catch(() => {});
 	}
 
-	private _serializeFileEntries(): string {
-		return `${this.fileEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+	private _serializeFileEntries(entries: readonly FileEntry[] = this.fileEntries): string {
+		return `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
 	}
 
 	private _createFile(): void {
@@ -1847,8 +1877,11 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		if (this.atomicAppendInFlight && !this.atomicAppendEntries) {
+			throw new Error("An atomic session append is already in progress");
+		}
 		this._assertPersistenceHealthy();
-		if (this.sessionFileNeedsMigration) {
+		if (this.sessionFileNeedsMigration && !this.atomicAppendEntries) {
 			// Rewriting is a writer action. Deferring it until the first append keeps
 			// every discovery/open path content-read-only. Queueing it before the
 			// append preserves commit order without blocking the caller.
@@ -1861,17 +1894,235 @@ export class SessionManager {
 		if (!isHostOnlySessionEntry(entry)) {
 			this.leafId = entry.id;
 		}
-		this._persist(entry);
+		if (!this.atomicAppendEntries) {
+			this._persist(entry);
+		}
 		this._indexClientInputEntry(entry);
-		if (isHostOnlySessionEntry(entry)) {
+		if (this.atomicAppendEntries) {
+			this.atomicAppendEntries.push(entry);
 			return;
 		}
+		this._notifyEntryListeners(entry);
+	}
+
+	private _notifyEntryListeners(entry: SessionEntry): void {
+		if (isHostOnlySessionEntry(entry)) return;
 		for (const listener of this.entryListeners) {
 			try {
 				listener(entry);
 			} catch {
 				// Persistence is authoritative. A projection observer cannot make a
 				// successfully appended entry appear to have failed.
+			}
+		}
+	}
+
+	/**
+	 * Stage synchronous append operations and publish them only after one atomic
+	 * filesystem replacement settles. Existing append methods remain the sole
+	 * entry mapping and validation path.
+	 */
+	async appendAtomically(append: () => void, beforePublish: () => void): Promise<void> {
+		this._assertPersistenceHealthy();
+		if (this.atomicAppendEntries || this.atomicAppendInFlight) {
+			throw new Error("Nested atomic session appends are not supported");
+		}
+		this.atomicAppendInFlight = true;
+		try {
+			await this.persistenceWatermark;
+			this._assertPersistenceHealthy();
+		} catch (error) {
+			this.atomicAppendInFlight = false;
+			throw error;
+		}
+		const snapshot = {
+			fileEntries: [...this.fileEntries],
+			byId: new Map(this.byId),
+			labelsById: new Map(this.labelsById),
+			labelTimestampsById: new Map(this.labelTimestampsById),
+			clientInputsById: new Map(
+				[...this.clientInputsById].map(([id, record]) => [id, cloneClientInputRecord(record)]),
+			),
+			leafId: this.leafId,
+			nextOrdinal: this.nextOrdinal,
+			flushed: this.flushed,
+			sessionFileNeedsMigration: this.sessionFileNeedsMigration,
+		};
+		let preimage: string | undefined;
+		if (snapshot.flushed && this.sessionFile) {
+			try {
+				preimage = readFileSync(this.sessionFile, "utf8");
+			} catch (error) {
+				this.atomicAppendInFlight = false;
+				throw new SessionAtomicAppendError("Could not read atomic append preimage", "rolled_back", {
+					cause: error,
+				});
+			}
+			const persistedEntries = parseSessionEntries(preimage);
+			const persistedHeader = persistedEntries.find((entry) => entry.type === "session");
+			if (persistedHeader?.version !== CURRENT_SESSION_VERSION) {
+				this.atomicAppendInFlight = false;
+				throw new SessionAtomicAppendError("Atomic append requires the current session schema", "rolled_back");
+			}
+			if (this._serializeFileEntries(persistedEntries) !== this._serializeFileEntries(snapshot.fileEntries)) {
+				this.atomicAppendInFlight = false;
+				throw new SessionAtomicAppendError("Session changed before the atomic append could begin", "rolled_back");
+			}
+		}
+		const restore = (): void => {
+			this.fileEntries = snapshot.fileEntries;
+			this.byId = snapshot.byId;
+			this.labelsById = snapshot.labelsById;
+			this.labelTimestampsById = snapshot.labelTimestampsById;
+			this.clientInputsById = snapshot.clientInputsById;
+			this.leafId = snapshot.leafId;
+			this.nextOrdinal = snapshot.nextOrdinal;
+			this.flushed = snapshot.flushed;
+			this.sessionFileNeedsMigration = snapshot.sessionFileNeedsMigration;
+		};
+		const entries: SessionEntry[] = [];
+		this.atomicAppendEntries = entries;
+		try {
+			append();
+		} catch (error) {
+			this.atomicAppendEntries = undefined;
+			this.atomicAppendInFlight = false;
+			restore();
+			throw error;
+		}
+
+		const staged = {
+			fileEntries: this.fileEntries,
+			byId: this.byId,
+			labelsById: this.labelsById,
+			labelTimestampsById: this.labelTimestampsById,
+			clientInputsById: this.clientInputsById,
+			leafId: this.leafId,
+			nextOrdinal: this.nextOrdinal,
+		};
+		let content: string;
+		try {
+			content = this._serializeFileEntries();
+		} catch (error) {
+			this.atomicAppendEntries = undefined;
+			this.atomicAppendInFlight = false;
+			restore();
+			throw error;
+		}
+		const shouldPersist =
+			this.persist &&
+			this.sessionFile !== undefined &&
+			(snapshot.flushed || staged.fileEntries.some(isSessionFileFlushContent));
+		this.atomicAppendEntries = undefined;
+		restore();
+
+		try {
+			if (shouldPersist) {
+				const filePath = this.sessionFile!;
+				const task = this.persistenceQueue.then(async () => {
+					if (this.persistenceError) throw this.persistenceError;
+					await serializeSessionFileOperation(filePath, async () => {
+						let current: string | undefined;
+						try {
+							current = readFileSync(filePath, "utf8");
+						} catch (error) {
+							if (preimage !== undefined) {
+								throw new AtomicAppendPersistenceFailure(
+									"Could not verify atomic append preimage",
+									"uncertain",
+									{
+										cause: error,
+									},
+								);
+							}
+						}
+						if (current !== preimage) {
+							throw new AtomicAppendPersistenceFailure(
+								"Session changed before the atomic append could commit",
+								"rolled_back",
+							);
+						}
+						try {
+							await writeDurableAtomicFile(filePath, content, {
+								directoryMode: PRIVATE_DIRECTORY_MODE,
+								fileMode: PRIVATE_FILE_MODE,
+							});
+						} catch (error) {
+							let visible: string | undefined;
+							try {
+								visible = readFileSync(filePath, "utf8");
+							} catch {
+								throw new AtomicAppendPersistenceFailure("Atomic append visibility is uncertain", "uncertain", {
+									cause: error,
+								});
+							}
+							if (visible === preimage) {
+								throw new AtomicAppendPersistenceFailure("Atomic append was rolled back", "rolled_back", {
+									cause: error,
+								});
+							}
+							if (visible !== content || preimage === undefined) {
+								throw new AtomicAppendPersistenceFailure("Atomic append visibility is uncertain", "uncertain", {
+									cause: error,
+								});
+							}
+							try {
+								await writeDurableAtomicFile(filePath, preimage, {
+									directoryMode: PRIVATE_DIRECTORY_MODE,
+									fileMode: PRIVATE_FILE_MODE,
+								});
+							} catch (rollbackError) {
+								throw new AtomicAppendPersistenceFailure("Atomic append rollback failed", "uncertain", {
+									cause: rollbackError,
+								});
+							}
+							throw new AtomicAppendPersistenceFailure("Atomic append was rolled back", "rolled_back", {
+								cause: error,
+							});
+						}
+					});
+				});
+				this.persistenceQueue = task.catch(() => {});
+				this.persistenceWatermark = task;
+				await task;
+			}
+		} catch (error) {
+			this.atomicAppendInFlight = false;
+			const failure =
+				error instanceof AtomicAppendPersistenceFailure
+					? error
+					: new AtomicAppendPersistenceFailure(
+							error instanceof Error ? error.message : String(error),
+							"uncertain",
+							{ cause: error },
+						);
+			if (failure.effect === "uncertain") {
+				this.persistenceError ??= failure;
+			} else {
+				this.persistenceWatermark = this.persistenceQueue;
+			}
+			throw new SessionAtomicAppendError(failure.message, failure.effect, { cause: failure });
+		}
+
+		this.fileEntries = staged.fileEntries;
+		this.byId = staged.byId;
+		this.labelsById = staged.labelsById;
+		this.labelTimestampsById = staged.labelTimestampsById;
+		this.clientInputsById = staged.clientInputsById;
+		this.leafId = staged.leafId;
+		this.nextOrdinal = staged.nextOrdinal;
+		this.flushed = shouldPersist || snapshot.flushed;
+		this.sessionFileNeedsMigration = false;
+		try {
+			beforePublish();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new SessionAtomicAppendError(message, "committed", { cause: error });
+		} finally {
+			try {
+				for (const entry of entries) this._notifyEntryListeners(entry);
+			} finally {
+				this.atomicAppendInFlight = false;
 			}
 		}
 	}
@@ -2205,6 +2456,9 @@ export class SessionManager {
 	}
 
 	private _setBranchLeaf(nextLeafId: string | null): void {
+		if (this.atomicAppendEntries || this.atomicAppendInFlight) {
+			throw new Error("Cannot change session branches during an atomic append");
+		}
 		const previousLeafId = this.leafId;
 		this.leafId = nextLeafId;
 		if (previousLeafId === nextLeafId) {
@@ -2696,6 +2950,9 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		if (this.atomicAppendInFlight) {
+			throw new Error("Cannot create a branched session during an atomic append");
+		}
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
