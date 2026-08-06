@@ -2,9 +2,6 @@ import type { AgentMessage } from "@hansjm10/volt-agent-core";
 import { fauxAssistantMessage } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PromptPreflightResult } from "../../../src/core/agent-session.ts";
-import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.ts";
-import { handleRpcCommand, type RpcCommandDispatcherContext } from "../../../src/modes/rpc/rpc-command-dispatcher.ts";
-import type { RpcResponse } from "../../../src/modes/rpc/rpc-types.ts";
 import { createHarness, getUserTexts, type Harness } from "../harness.ts";
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -180,78 +177,6 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
-	it("settles retained direct plan feedback once and retries it only after explicit continuation", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		await createReadyPlan(harness);
-		harness.setResponses([fauxAssistantMessage("explicit direct retry committed")]);
-		const checkpointBaseline = checkpointCount(harness);
-		const planningBaseline = planningChangeCount(harness);
-		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
-		let rejectDraft = true;
-		vi.spyOn(harness.sessionManager, "appendPlanningState").mockImplementation((planning) => {
-			if (rejectDraft && planning.plan?.phase === "draft") {
-				throw new Error("injected direct planning durability failure");
-			}
-			return appendPlanningState(planning);
-		});
-		let agentEndCount = 0;
-		harness.session.subscribe((event) => {
-			if (event.type === "agent_end") agentEndCount++;
-		});
-
-		const responses: RpcResponse[] = [];
-		const admissions: Promise<void>[] = [];
-		await handleRpcCommand(
-			{
-				id: "contract-retained-direct-rpc",
-				type: "prompt",
-				clientMessageId: "contract-retained-direct-client",
-				message: "retained direct plan feedback",
-			},
-			{
-				session: harness.session,
-				runtimeHost: {
-					trackClientInputAdmission: (_session: unknown, admission: Promise<void>) => admissions.push(admission),
-				} as unknown as AgentSessionRuntime,
-				options: {
-					allowUiActionInvocation: false,
-					requireRemoteSafeUiActions: false,
-					registerPushTarget: undefined,
-				},
-				output: (response: RpcResponse) => responses.push(response),
-				assertConversationGenerationCurrent: () => undefined,
-			} as unknown as RpcCommandDispatcherContext,
-		);
-		await Promise.all(admissions);
-
-		expect(responses).toEqual([
-			expect.objectContaining({
-				id: "contract-retained-direct-rpc",
-				command: "prompt",
-				success: false,
-				error: "injected direct planning durability failure",
-			}),
-		]);
-		expect(agentEndCount).toBe(1);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
-		expect(harness.session.planningState.plan?.phase).toBe("ready");
-		expect(planningChangeCount(harness)).toBe(planningBaseline);
-		expect(checkpointCount(harness)).toBe(checkpointBaseline);
-		expect(getUserTexts(harness)).toEqual([]);
-		expect(harness.getPendingResponseCount()).toBe(1);
-
-		rejectDraft = false;
-		await harness.session.agent.continue();
-
-		expect(agentEndCount).toBe(2);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
-		expect(harness.session.planningState.plan?.phase).toBe("draft");
-		expect(checkpointCount(harness)).toBe(checkpointBaseline + 1);
-		expect(getUserTexts(harness)).toEqual(["retained direct plan feedback"]);
-		expect(harness.getPendingResponseCount()).toBe(0);
-	});
-
 	it.each(["steer", "followUp"] as const)(
 		"settles a failed %s attempt while retaining its accepted client input for explicit retry",
 		async (kind) => {
@@ -290,7 +215,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		},
 	);
 
-	it("keeps transcript and planning unchanged when participant durability rejects, then discards explicitly", async () => {
+	it("keeps transcript and planning unchanged when planning commit rejects synchronously, then discards explicitly", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		await createReadyPlan(harness);
@@ -301,7 +226,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
 		vi.spyOn(harness.sessionManager, "appendPlanningState").mockImplementation((planning) => {
 			if (planning.plan?.phase === "draft") {
-				throw new Error("injected participant durability failure");
+				throw new Error("injected planning commit failure");
 			}
 			return appendPlanningState(planning);
 		});
@@ -312,7 +237,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 
 		await expect(harness.session.agent.continue()).resolves.toBeUndefined();
 
-		expect(harness.session.agent.state.errorMessage).toBe("injected participant durability failure");
+		expect(harness.session.agent.state.errorMessage).toBe("injected planning commit failure");
 		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
 		expect(harness.session.planningState.plan?.phase).toBe("ready");
@@ -335,24 +260,6 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 				reason: "queue_cleared",
 			},
 		]);
-	});
-
-	it("leaves a ready plan unchanged when direct feedback fails deterministic preflight", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
-		harnesses.push(harness);
-		await createReadyPlan(harness);
-		const checkpointBaseline = checkpointCount(harness);
-		const planningBaseline = planningChangeCount(harness);
-
-		await expect(
-			harness.session.prompt("feedback without credentials", { clientMessageId: "contract-preflight-failure" }),
-		).rejects.toThrow("No API key found");
-
-		expect(harness.session.planningState.plan?.phase).toBe("ready");
-		expect(planningChangeCount(harness)).toBe(planningBaseline);
-		expect(checkpointCount(harness)).toBe(checkpointBaseline);
-		expect(harness.sessionManager.getClientInput("contract-preflight-failure")).toMatchObject({ state: "failed" });
-		expect(getUserTexts(harness)).toEqual([]);
 	});
 
 	it("lets an external abort win before commit without revoking retained feedback", async () => {
@@ -458,41 +365,6 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		).toHaveLength(1);
 	});
 
-	it("keeps committed transcript and planning authoritative when public observers throw", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		await createReadyPlan(harness);
-		harness.setResponses([fauxAssistantMessage("observer failure ignored")]);
-		const observedAfterFailure: string[] = [];
-		harness.session.subscribe(async (event) => {
-			if (
-				event.type === "planning_state_changed" ||
-				event.type === "delivery_start" ||
-				event.type === "message_start" ||
-				event.type === "message_end"
-			) {
-				await Promise.resolve();
-				throw new Error(`injected asynchronous observer failure at ${event.type}`);
-			}
-		});
-		harness.session.subscribe((event) => observedAfterFailure.push(event.type));
-		const clientMessageId = "contract-observer-failure";
-
-		await expect(
-			harness.session.prompt("commit despite observer failure", { clientMessageId }),
-		).resolves.toBeUndefined();
-		await new Promise<void>((resolve) => setImmediate(resolve));
-
-		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
-		expect(harness.session.planningState.plan?.phase).toBe("draft");
-		expect(checkpointCount(harness)).toBe(1);
-		expect(getUserTexts(harness)).toEqual(["commit despite observer failure"]);
-		expect(observedAfterFailure).toContain("delivery_start");
-		expect(observedAfterFailure).toContain("planning_state_changed");
-		expect(observedAfterFailure).toContain("message_end");
-		expect(harness.getPendingResponseCount()).toBe(0);
-	});
-
 	it("commits one ready-to-draft transition and checkpoint for an all-mode batch", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -514,4 +386,60 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		expect(harness.sessionManager.getClientInput("contract-batch-second")).toMatchObject({ state: "completed" });
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
+
+	it("preserves a committed all-mode prefix when a later delivery is retained", async () => {
+		let failSecondCommit = true;
+		const harness = await createHarness({
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				commit: () => {
+					if (
+						failSecondCommit &&
+						delivery.messages.some(
+							(message) =>
+								message.role === "user" && JSON.stringify(message.content).includes("second partial feedback"),
+						)
+					) {
+						throw new Error("injected second delivery commit failure");
+					}
+				},
+			}),
+		});
+		harnesses.push(harness);
+		await createReadyPlan(harness);
+		harness.session.setSteeringMode("all");
+		const planningBaseline = planningChangeCount(harness);
+		const checkpointBaseline = checkpointCount(harness);
+		harness.setResponses([fauxAssistantMessage("retained suffix committed")]);
+
+		await harness.session.steer("first partial feedback", undefined, "contract-partial-first");
+		await harness.session.steer("second partial feedback", undefined, "contract-partial-second");
+		await harness.session.agent.continue();
+
+		expect(getUserTexts(harness)).toEqual(["first partial feedback"]);
+		expect(harness.sessionManager.getClientInput("contract-partial-first")).toMatchObject({ state: "completed" });
+		expect(harness.sessionManager.getClientInput("contract-partial-second")).toMatchObject({ state: "accepted" });
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.session.planningState.plan?.phase).toBe("draft");
+		expect(planningChangeCount(harness)).toBe(planningBaseline + 1);
+		expect(checkpointCount(harness)).toBe(checkpointBaseline + 1);
+		expect(harness.getPendingResponseCount()).toBe(1);
+
+		failSecondCommit = false;
+		await harness.session.agent.continue();
+
+		expect(getUserTexts(harness)).toEqual(["first partial feedback", "second partial feedback"]);
+		expect(harness.sessionManager.getClientInput("contract-partial-second")).toMatchObject({ state: "completed" });
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(planningChangeCount(harness)).toBe(planningBaseline + 1);
+		expect(checkpointCount(harness)).toBe(checkpointBaseline + 1);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it.todo("settles a retained direct RPC attempt and retries the same client input explicitly");
+	it.todo("classifies definitive and ambiguous persistence-watermark failures");
+	it.todo("leaves ready-plan state unchanged when direct feedback fails deterministic preflight");
+	it.todo("distinguishes external dispose from reentrant abort during participant durability");
+	it.todo("isolates synchronous throws and asynchronous rejections from committed-delivery observers");
+	it.todo("continues provider work without recommitting client-input or planning state");
 });

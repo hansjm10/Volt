@@ -2,7 +2,7 @@
 
 Issue: [#206](https://github.com/volt-hq/Volt/issues/206)
 
-This document specifies observable delivery behavior shared by the current coding-agent adapter path and its replacement. It deliberately does not specify a production API, callback shape, storage primitive, or refactor. #207 may choose an internal representation; #205 must preserve this behavior when it removes the adapters.
+This document specifies the target observable delivery behavior for coding-agent and its replacement dispatcher integration. It deliberately does not specify a production API, callback shape, storage primitive, or refactor. #206 changes no production behavior: its executable tests pin the guarantees the temporary adapter already provides, while named pending conformance cases identify guarantees that require #207's transaction participant. #205 must preserve the completed suite when it removes the adapters.
 
 ## Scope
 
@@ -37,6 +37,8 @@ Preparation is revocable and side-effect-free. It may validate or compose staged
 - publish delivery or message events; or
 - perform a non-repeatable extension side effect.
 
+Composed participants must settle as one transaction. An implementation cannot perform one irreversible participant commit, fail a later participant, and classify the delivery as safely retained. If it cannot prove that every committed effect rolled back, the outcome is `terminally_failed`.
+
 The **commit decision** is the exact cutoff for external revocation. Before it, clear, abort, or dispose may prevent commitment. After it, clear cannot report the delivery as removed. Abort or dispose may stop the run, but must join the participant's settlement and preserve a successful logical commit.
 
 A participant failure after the commit decision has one of two deterministic classifications:
@@ -64,13 +66,14 @@ A retained attempt returns the logical delivery to `pending`; retention is not a
 ```text
 leased
   -> preparing
-  -> prepared
-       -> revoked
-       -> retained                 (preparation or definitive commit rollback)
-       -> committing
-            -> committed           (logical durability completed)
-            -> retained            (definitive rollback)
-            -> terminally_failed   (unsafe or ambiguous replay)
+       -> retained                 (preparation failed without side effects)
+       -> revoked                  (revocation won before preparation completed)
+       -> prepared
+            -> revoked
+            -> committing
+                 -> committed           (logical durability completed)
+                 -> retained            (definitive rollback)
+                 -> terminally_failed   (unsafe or ambiguous replay)
 ```
 
 Every selected attempt reaches exactly one terminal attempt outcome. One failed attempt cannot keep its run unsettled or trigger an unbounded automatic continuation loop.
@@ -79,7 +82,9 @@ Every selected attempt reaches exactly one terminal attempt outcome. One failed 
 
 ```text
 accepted -> started -> completed
-                    -> failed
+    |           |
+    |           -> failed
+    -> failed
 ```
 
 - `accepted` means the original input, or the exact transformed queued payload, is durably recoverable.
@@ -164,7 +169,7 @@ For an `all` batch, delivery commitment remains per-delivery rather than batch-a
 
 ### Public events
 
-`delivery_start` means Agent has crossed the revocation cutoff; it does not by itself mean disk durability or RPC acceptance. `message_start` and `message_end` are projections of transaction work. Public session subscribers are observers: throwing synchronously or returning a rejected promise cannot roll back delivery, transcript, client-input, RPC, or planning state, escape as an unhandled rejection, or prevent later observers from receiving the event.
+`delivery_start` means Agent has crossed the revocation cutoff; it does not by itself mean disk durability or RPC acceptance. For each delivery, `delivery_start` precedes its ordered `message_start`/`message_end` pairs. The planning checkpoint precedes its feedback message in provider context, the direct RPC response follows canonical durability, and the provider request follows that response boundary. Public session subscribers are observers: throwing synchronously or returning a rejected promise cannot roll back delivery, transcript, client-input, RPC, or planning state, escape as an unhandled rejection, or prevent later observers from receiving the event.
 
 Extension hooks that explicitly replace messages or perform preflight are not passive public observers; their documented validation and failure behavior remains part of preparation or participant work.
 
@@ -173,7 +178,7 @@ Extension hooks that explicitly replace messages or perform preflight are not pa
 ### Before commit decision
 
 - Abort prevents the attempt from committing and retains the logical delivery unless the caller explicitly clears it.
-- Dispose closes new admission, prevents commit, and settles the attempt deterministically as retained, revoked, or terminal according to durable recovery policy.
+- Dispose closes new admission and prevents commit. An identified queued input with a durable queued payload remains `accepted` for recovery; anonymous uncommitted work is revoked; work that crossed a non-repeatable `started` boundary without a recoverable payload is terminally fenced as failed or ambiguous.
 - Canonical transcript and planning state remain unchanged.
 
 ### During participant durability
@@ -204,20 +209,28 @@ Abort stops provider/tool continuation, but preserves canonical delivery, comple
 
 ## Conformance suite
 
-`packages/coding-agent/test/suite/regressions/206-delivery-transaction-contract.test.ts` exercises the temporary adapter path through observable session, Agent, client-input, planning, event, and provider behavior. It covers:
+`packages/coding-agent/test/suite/regressions/206-delivery-transaction-contract.test.ts` exercises the temporary adapter path through observable session, Agent, client-input, planning, event, and provider behavior. Its executable baseline covers:
 
 - durable identified direct-prompt settlement at the RPC admission seam;
 - steering and follow-up queue admission through canonical completion;
-- preparation failure, bounded direct and queued retained attempts, explicit retry, participant durability rejection, and explicit discard;
-- external abort before commit and during canonical durability;
+- preparation failure, direct and queued retained attempts, explicit retry, synchronous planning-commit rejection, and explicit discard;
+- external abort before commit and while canonical durability is pending;
 - reentrant disposal during commit;
-- ready-plan feedback across validation, preparation, commit, abort, and observer boundaries;
-- one planning transition/checkpoint for an `all` batch; and
-- observer failures after commitment.
+- successful and partial `all` batches with one planning transition/checkpoint; and
+- preservation of a committed batch prefix when a later delivery is retained.
 
-The wire-level RPC response and same-ID replay boundary remains covered by `packages/coding-agent/test/rpc-prompt-response-semantics.test.ts`. Lease/FIFO mechanics remain covered by `packages/agent/test/delivery-inbox.test.ts` and Agent dispatcher behavior by `packages/agent/test/agent-next-action.test.ts`.
+The suite also names pending semantic cases rather than implementing temporary `AgentSession` transaction state to make them pass:
 
-#205 must run the same coding-agent conformance suite after removing the temporary adapters. #207 adds the internal participant representation and Agent/AgentLoop state-machine tests; it may not weaken this contract.
+- retained direct RPC failure followed by explicit same-`clientMessageId` retry;
+- definitive versus ambiguous persistence-watermark failure;
+- direct feedback preflight leaving a ready plan unchanged;
+- external dispose versus reentrant abort during participant durability;
+- synchronous and asynchronous committed-delivery observer isolation; and
+- provider-only continuation without recommitting client-input or planning state.
+
+Those cases are acceptance criteria for #207. #207 must replace the pending cases with executable conformance tests using semantic fault stages rather than assertions on adapter callback internals. Lease/FIFO mechanics remain covered by `packages/agent/test/delivery-inbox.test.ts`; existing wire-level RPC tests do not substitute for the pending retained-direct retry case.
+
+#205 must run the completed coding-agent conformance suite after removing the temporary adapters. Its test driver may change with the adapter, but the observable assertions may not weaken.
 
 ## Non-goals
 
