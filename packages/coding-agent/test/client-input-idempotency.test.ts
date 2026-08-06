@@ -876,7 +876,90 @@ describe("durable client input idempotency", () => {
 		}
 	});
 
-	it("persists the dispatch boundary before dequeued input reaches extension hooks", async () => {
+	it("reconciles durable queue state when the public Agent revokes a delivery", async () => {
+		let releaseTool!: () => void;
+		let markToolStarted!: () => void;
+		const toolStarted = new Promise<void>((resolve) => {
+			markToolStarted = resolve;
+		});
+		const toolGate = new Promise<void>((resolve) => {
+			releaseTool = resolve;
+		});
+		const waitTool: AgentTool = {
+			name: "wait-for-public-revocation",
+			label: "Wait",
+			description: "Wait for public queue revocation",
+			parameters: Type.Object({}),
+			execute: async () => {
+				markToolStarted();
+				await toolGate;
+				return { content: [{ type: "text", text: "released" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [waitTool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait-for-public-revocation", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("current turn done"),
+		]);
+		const run = harness.session.prompt("start public revocation");
+		await toolStarted;
+		const clientMessageId = "public-agent-queue-revocation";
+		await harness.session.steer("revoke this queue", undefined, clientMessageId);
+
+		expect(harness.session.agent.clearSteeringQueue()).toHaveLength(1);
+		releaseTool();
+		await run;
+
+		await vi.waitFor(() => expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("failed"));
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		await expect(harness.session.steer("revoke this queue", undefined, clientMessageId)).rejects.toThrow(
+			"Delivery was revoked before canonical commitment",
+		);
+	});
+
+	it("surfaces terminal persistence failure from public Agent queue revocation", async () => {
+		let releaseTool!: () => void;
+		let markToolStarted!: () => void;
+		const toolStarted = new Promise<void>((resolve) => {
+			markToolStarted = resolve;
+		});
+		const toolGate = new Promise<void>((resolve) => {
+			releaseTool = resolve;
+		});
+		const waitTool: AgentTool = {
+			name: "wait-for-public-revocation-failure",
+			label: "Wait",
+			description: "Wait for public queue revocation failure",
+			parameters: Type.Object({}),
+			execute: async () => {
+				markToolStarted();
+				await toolGate;
+				return { content: [{ type: "text", text: "released" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [waitTool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait-for-public-revocation-failure", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("must reject"),
+		]);
+		const run = harness.session.prompt("start failed public revocation");
+		await toolStarted;
+		const clientMessageId = "public-agent-queue-revocation-failure";
+		await harness.session.steer("revoke with failed persistence", undefined, clientMessageId);
+		const persistenceError = new Error("injected public revocation persistence failure");
+		vi.spyOn(harness.sessionManager, "flush").mockRejectedValueOnce(persistenceError);
+
+		expect(harness.session.agent.clearSteeringQueue()).toHaveLength(1);
+		releaseTool();
+		await expect(run).rejects.toThrow(persistenceError.message);
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("publishes a dequeued input only after its canonical entry is complete", async () => {
 		let releaseTool!: () => void;
 		let markToolStarted!: () => void;
 		const toolStarted = new Promise<void>((resolve) => {
@@ -920,76 +1003,79 @@ describe("durable client input idempotency", () => {
 		releaseTool();
 		await run;
 
-		expect(stateImmediatelyAfterClear).toBe("started");
+		expect(stateImmediatelyAfterClear).toBe("completed");
 		expect(harness.sessionManager.getClientInput("client-consuming")?.state).toBe("completed");
 	});
 
 	it.each([
 		{ command: "steer" as const, clientMessageId: "steer-dispatch-flush-failure" },
 		{ command: "followUp" as const, clientMessageId: "follow-dispatch-flush-failure" },
-	])("fences a dequeued $command when its started boundary is not durable", async ({ command, clientMessageId }) => {
-		let releaseTool!: () => void;
-		let markToolStarted!: () => void;
-		const toolStarted = new Promise<void>((resolve) => {
-			markToolStarted = resolve;
-		});
-		const toolGate = new Promise<void>((resolve) => {
-			releaseTool = resolve;
-		});
-		const waitTool: AgentTool = {
-			name: "wait-for-dispatch-flush-failure",
-			label: "Wait",
-			description: "Wait for queued dispatch",
-			parameters: Type.Object({}),
-			execute: async () => {
-				markToolStarted();
-				await toolGate;
-				return { content: [{ type: "text", text: "released" }], details: {} };
-			},
-		};
-		const harness = await createHarness({ tools: [waitTool] });
-		harnesses.push(harness);
-		harness.setResponses([
-			fauxAssistantMessage(fauxToolCall("wait-for-dispatch-flush-failure", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("current turn done"),
-			fauxAssistantMessage("queued turn must not run"),
-		]);
-		const run = harness.session.prompt("start").catch(() => {});
-		await toolStarted;
-		const queuedText = `${command} must not run`;
-		await (command === "steer"
-			? harness.session.steer(queuedText, undefined, clientMessageId)
-			: harness.session.followUp(queuedText, undefined, clientMessageId));
-
-		const originalFlush = harness.sessionManager.flush.bind(harness.sessionManager);
-		const dispatchFailure = new Error(`injected ${command} dispatch flush failure`);
-		let rejectedDispatch = false;
-		vi.spyOn(harness.sessionManager, "flush").mockImplementation(() => {
-			if (!rejectedDispatch && harness.sessionManager.getClientInput(clientMessageId)?.state === "started") {
-				rejectedDispatch = true;
-				return Promise.reject(dispatchFailure);
-			}
-			return originalFlush();
-		});
-
-		releaseTool();
-		await vi.waitFor(() => expect(rejectedDispatch).toBe(true));
-		await run;
-		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(false));
-
-		expect(harness.session.getSteeringMessages()).toEqual([]);
-		expect(harness.session.getFollowUpMessages()).toEqual([]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
-		expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("started");
-		expect(getUserTexts(harness)).not.toContain(queuedText);
-		await expect(
-			command === "steer"
+	])(
+		"terminalizes a dequeued $command when its started boundary is not durable",
+		async ({ command, clientMessageId }) => {
+			let releaseTool!: () => void;
+			let markToolStarted!: () => void;
+			const toolStarted = new Promise<void>((resolve) => {
+				markToolStarted = resolve;
+			});
+			const toolGate = new Promise<void>((resolve) => {
+				releaseTool = resolve;
+			});
+			const waitTool: AgentTool = {
+				name: "wait-for-dispatch-flush-failure",
+				label: "Wait",
+				description: "Wait for queued dispatch",
+				parameters: Type.Object({}),
+				execute: async () => {
+					markToolStarted();
+					await toolGate;
+					return { content: [{ type: "text", text: "released" }], details: {} };
+				},
+			};
+			const harness = await createHarness({ tools: [waitTool] });
+			harnesses.push(harness);
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait-for-dispatch-flush-failure", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("current turn done"),
+				fauxAssistantMessage("queued turn must not run"),
+			]);
+			const run = harness.session.prompt("start").catch(() => {});
+			await toolStarted;
+			const queuedText = `${command} must not run`;
+			await (command === "steer"
 				? harness.session.steer(queuedText, undefined, clientMessageId)
-				: harness.session.followUp(queuedText, undefined, clientMessageId),
-		).rejects.toBeInstanceOf(ClientInputOutcomeAmbiguousError);
-	});
+				: harness.session.followUp(queuedText, undefined, clientMessageId));
 
-	it("does not publish a dequeued message after concurrent queue clearing", async () => {
+			const originalFlush = harness.sessionManager.flush.bind(harness.sessionManager);
+			const dispatchFailure = new Error(`injected ${command} dispatch flush failure`);
+			let rejectedDispatch = false;
+			vi.spyOn(harness.sessionManager, "flush").mockImplementation(() => {
+				if (!rejectedDispatch && harness.sessionManager.getClientInput(clientMessageId)?.state === "started") {
+					rejectedDispatch = true;
+					return Promise.reject(dispatchFailure);
+				}
+				return originalFlush();
+			});
+
+			releaseTool();
+			await vi.waitFor(() => expect(rejectedDispatch).toBe(true));
+			await run;
+			await vi.waitFor(() => expect(harness.session.isStreaming).toBe(false));
+
+			expect(harness.session.getSteeringMessages()).toEqual([]);
+			expect(harness.session.getFollowUpMessages()).toEqual([]);
+			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+			expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("failed");
+			expect(getUserTexts(harness)).not.toContain(queuedText);
+			await expect(
+				command === "steer"
+					? harness.session.steer(queuedText, undefined, clientMessageId)
+					: harness.session.followUp(queuedText, undefined, clientMessageId),
+			).rejects.toThrow(dispatchFailure.message);
+		},
+	);
+
+	it("preserves a committed dequeued message when queue clearing races durability", async () => {
 		let releaseTool!: () => void;
 		let markToolStarted!: () => void;
 		const toolStarted = new Promise<void>((resolve) => {
@@ -1060,9 +1146,9 @@ describe("durable client input idempotency", () => {
 		}
 		await run;
 
-		expect(publishedClientIds).not.toContain("clear-dequeue-race");
-		expect(harness.sessionManager.getClientInput("clear-dequeue-race")?.state).toBe("failed");
-		expect(getUserTexts(harness)).not.toContain("cancel during dequeue");
+		expect(publishedClientIds).toContain("clear-dequeue-race");
+		expect(harness.sessionManager.getClientInput("clear-dequeue-race")?.state).toBe("completed");
+		expect(getUserTexts(harness)).toContain("cancel during dequeue");
 	});
 
 	it("starts an accepted-but-not-started receipt after JSONL reload", async () => {
@@ -1231,6 +1317,44 @@ describe("durable client input idempotency", () => {
 			},
 		]);
 		expect(getUserTexts(harness)).toEqual([]);
+	});
+
+	it("resumes the same recovered prompt after one retained settlement", async () => {
+		const tempDir = createTempDir();
+		tempDirs.push(tempDir);
+		const manager = SessionManager.create(tempDir, tempDir);
+		manager.reserveClientInput("recover-retained", "steer", { message: "recover retained" });
+		manager.markClientInputQueued("recover-retained", { delivery: "steer", message: "recover retained" });
+		await manager.flush();
+		const reopened = SessionManager.open(manager.getSessionFile()!, tempDir);
+		let retain = true;
+		const harness = await createHarness({
+			sessionManager: reopened,
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				participant: {
+					settle: () =>
+						retain
+							? { outcome: "retained", error: new Error("retain recovered input") }
+							: { outcome: "committed" },
+				},
+			}),
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("recovered once")]);
+
+		await expect(harness.session.resumeRecoveredClientInputs()).rejects.toThrow("retain recovered input");
+		expect(reopened.getClientInput("recover-retained")?.state).toBe("accepted");
+		expect(harness.session.agent.hasPendingPrompt()).toBe(true);
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(harness.getPendingResponseCount()).toBe(1);
+
+		retain = false;
+		await harness.session.resumeRecoveredClientInputs();
+		expect(reopened.getClientInput("recover-retained")?.state).toBe("completed");
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(getUserTexts(harness)).toEqual(["recover retained"]);
+		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
 	it("does not let a failed recovered dispatch replay outrank its durable ambiguity fence", async () => {
@@ -1739,6 +1863,21 @@ describe("durable client input idempotency", () => {
 		).rejects.toBeInstanceOf(ClientInputOutcomeAmbiguousError);
 		expect(getUserTexts(harness)).toEqual([]);
 		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	it("reopens a retained direct input at its retryable accepted boundary", async () => {
+		const tempDir = createTempDir();
+		tempDirs.push(tempDir);
+		const manager = SessionManager.create(tempDir, tempDir);
+		manager.reserveClientInput("client-retained", "prompt", { message: "retry me" });
+		manager.transitionClientInput("client-retained", "started");
+		manager.rollbackClientInput("client-retained");
+		await manager.flush();
+		const sessionFile = manager.getSessionFile();
+		expect(sessionFile).toBeDefined();
+
+		const reopened = SessionManager.open(sessionFile!, tempDir);
+		expect(reopened.getClientInput("client-retained")).toMatchObject({ state: "accepted" });
 	});
 
 	it("infers completion from the canonical user entry when rebuilding the all-entry index", async () => {

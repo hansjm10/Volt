@@ -341,14 +341,17 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 
-	it("preserves delivery and planning state when disposal is requested reentrantly during commit", async () => {
+	it("preserves delivery and planning state when disposal is requested during participant settlement", async () => {
 		let harness!: Harness;
 		let disposal: Promise<void> | undefined;
 		harness = await createHarness({
 			prepareDelivery: (delivery) => ({
 				messages: [...delivery.messages],
-				commit: () => {
-					disposal = harness.session.dispose("disposal");
+				participant: {
+					settle: () => {
+						disposal = harness.session.dispose("disposal");
+						return { outcome: "committed" };
+					},
 				},
 			}),
 		});
@@ -398,16 +401,20 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		const harness = await createHarness({
 			prepareDelivery: (delivery) => ({
 				messages: [...delivery.messages],
-				commit: () => {
-					if (
-						failSecondCommit &&
-						delivery.messages.some(
-							(message) =>
-								message.role === "user" && JSON.stringify(message.content).includes("second partial feedback"),
-						)
-					) {
-						throw new Error("injected second delivery commit failure");
-					}
+				participant: {
+					settle: () => {
+						if (
+							failSecondCommit &&
+							delivery.messages.some(
+								(message) =>
+									message.role === "user" &&
+									JSON.stringify(message.content).includes("second partial feedback"),
+							)
+						) {
+							return { outcome: "retained", error: new Error("injected second delivery settlement failure") };
+						}
+						return { outcome: "committed" };
+					},
 				},
 			}),
 		});
@@ -442,7 +449,6 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
-	// #207 implements these participant-level acceptance cases in
-	// packages/agent/test/agent-delivery-transaction.test.ts. Coding-agent's
-	// production participant adoption remains intentionally scoped to #205.
+	// Participant-level acceptance remains covered by Agent; these cases pin
+	// coding-agent's persistence, planning, and client-input integration.
 });
