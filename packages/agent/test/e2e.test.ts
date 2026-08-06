@@ -309,7 +309,7 @@ describe("Agent.continue() with faux provider", () => {
 			};
 			agent.state.messages = [assistantMessage];
 
-			await expect(agent.continue()).resolves.toBeUndefined();
+			await expect(agent.continue()).resolves.toEqual({ status: "completed", deliveries: [] });
 			expect(agent.state.messages).toEqual([assistantMessage]);
 		});
 	});

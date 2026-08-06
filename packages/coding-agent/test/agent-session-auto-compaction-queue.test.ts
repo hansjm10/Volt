@@ -146,7 +146,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(session.pendingMessageCount).toBe(0);
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 
-		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const continueSpy = vi
+			.spyOn(session.agent, "continue")
+			.mockResolvedValue({ status: "completed", deliveries: [] });
 
 		const runAutoCompaction = (
 			session as unknown as {

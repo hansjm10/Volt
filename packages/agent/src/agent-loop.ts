@@ -16,6 +16,7 @@ import type {
 	AgentEvent,
 	AgentLoopConfig,
 	AgentLoopDelivery,
+	AgentLoopDeliveryOutcome,
 	AgentLoopNextAction,
 	AgentLoopNextActionContext,
 	AgentMessage,
@@ -39,6 +40,21 @@ export type AgentEventSink =
 	| AsyncReplacingAgentEventSink;
 
 type AgentEventSinkResult = Awaited<ReturnType<AgentEventSink>>;
+
+/** Delivery settlement that stops the current low-level loop before a provider request. */
+export class AgentDeliverySettlementError extends Error {
+	readonly outcome: "retained" | "terminally_failed";
+	readonly deliveryId?: string;
+	readonly settlementError: Error;
+
+	constructor(outcome: "retained" | "terminally_failed", deliveryId: string | undefined, settlementError: Error) {
+		super(settlementError.message);
+		this.name = "AgentDeliverySettlementError";
+		this.outcome = outcome;
+		this.deliveryId = deliveryId;
+		this.settlementError = settlementError;
+	}
+}
 
 /**
  * Start an agent loop with a new prompt message.
@@ -408,12 +424,18 @@ async function emitDeliveries(
 	newMessages: AgentMessage[],
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
-	beginDelivery: ((delivery: AgentLoopDelivery) => boolean) | undefined,
+	beginDelivery:
+		| ((delivery: AgentLoopDelivery) => AgentLoopDeliveryOutcome | Promise<AgentLoopDeliveryOutcome>)
+		| undefined,
 ): Promise<AgentLoopDelivery[]> {
 	const finalizedDeliveries: AgentLoopDelivery[] = [];
 	for (const delivery of deliveries) {
 		if (signal?.aborted) continue;
-		if (beginDelivery && !beginDelivery(delivery)) continue;
+		const settlement = beginDelivery ? await beginDelivery(delivery) : { outcome: "committed" as const };
+		if (settlement.outcome === "revoked") continue;
+		if (settlement.outcome === "retained" || settlement.outcome === "terminally_failed") {
+			throw new AgentDeliverySettlementError(settlement.outcome, delivery.deliveryId, settlement.error);
+		}
 		await emit({ type: "delivery_start", deliveryId: delivery.deliveryId, messages: delivery.messages });
 		const finalizedMessages: AgentMessage[] = [];
 		for (const message of delivery.messages) {

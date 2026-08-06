@@ -232,6 +232,7 @@ export class AgentHarness<
 	private activeToolNames: string[];
 	private readonly deliveryInbox = new DeliveryInbox<"steer" | "followUp", UserMessage>();
 	private activeDeliveryLease?: DeliveryLease<"steer" | "followUp", UserMessage>;
+	private readonly committedDeliveryIds = new Set<string>();
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
 	private nextTurnQueue: AgentMessage[] = [];
@@ -481,7 +482,11 @@ export class AgentHarness<
 
 	private beginDelivery(deliveryId: string | undefined): boolean {
 		if (deliveryId === undefined || !this.activeDeliveryLease?.owns(deliveryId)) return true;
-		return this.activeDeliveryLease.begin(deliveryId) !== undefined;
+		const delivery = this.activeDeliveryLease.begin(deliveryId);
+		if (!delivery) return false;
+		if (!this.activeDeliveryLease.settle(deliveryId, "committed")) return false;
+		this.committedDeliveryIds.add(deliveryId);
+		return true;
 	}
 
 	private createLoopConfig(
@@ -551,7 +556,9 @@ export class AgentHarness<
 					? { type: "request", reason: "delivery", deliveries: followUp }
 					: { type: "stop" };
 			},
-			beginDelivery: (delivery) => this.beginDelivery(delivery.deliveryId),
+			beginDelivery: (delivery) => ({
+				outcome: this.beginDelivery(delivery.deliveryId) ? "committed" : "revoked",
+			}),
 			prepareRequest: async ({ context }) => {
 				await this.flushPendingSessionWrites();
 				if (firstRequest) {
@@ -629,7 +636,7 @@ export class AgentHarness<
 				errors: [],
 			};
 			state.deliveries.set(event.deliveryId, deliveryState);
-			if (event.deliveryId !== undefined && this.activeDeliveryLease?.owns(event.deliveryId)) {
+			if (event.deliveryId !== undefined && this.committedDeliveryIds.delete(event.deliveryId)) {
 				try {
 					await this.emitQueueUpdate();
 				} catch (error) {
@@ -869,6 +876,7 @@ export class AgentHarness<
 			} finally {
 				this.deliveryInbox.rollbackActiveLease();
 				this.activeDeliveryLease = undefined;
+				this.committedDeliveryIds.clear();
 				this.runAbortController = undefined;
 			}
 		}

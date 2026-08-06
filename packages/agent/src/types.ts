@@ -152,6 +152,13 @@ export interface AgentLoopDelivery {
 	messages: AgentMessage[];
 }
 
+/** Explicit result of the Agent-owned commit decision for one delivery attempt. */
+export type AgentLoopDeliveryOutcome =
+	| { readonly outcome: "committed" }
+	| { readonly outcome: "retained"; readonly error: Error }
+	| { readonly outcome: "revoked" }
+	| { readonly outcome: "terminally_failed"; readonly error: Error };
+
 /** Authority that keeps a request valid when no attached delivery is admitted. */
 export type AgentLoopRequestReason = "delivery" | "continuation" | "final_response";
 
@@ -278,13 +285,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	nextAction?: (context: AgentLoopNextActionContext) => AgentLoopNextAction | Promise<AgentLoopNextAction>;
 
 	/**
-	 * Atomically begin one resolved delivery immediately before its delivery event.
+	 * Cross the Agent-owned revocation cutoff and settle one delivery attempt.
 	 *
-	 * Return false when a leased delivery was revoked after `nextAction` resolved.
-	 * This hook is synchronous so queue ownership cannot change between admission
-	 * and the delivery-level commit event.
+	 * The hook may await host durability. `committed` publishes the delivery,
+	 * `revoked` skips it, and retained or terminal failure stops the current run.
+	 * Queue ownership remains with Agent throughout settlement.
 	 */
-	beginDelivery?: (delivery: AgentLoopDelivery) => boolean;
+	beginDelivery?: (delivery: AgentLoopDelivery) => AgentLoopDeliveryOutcome | Promise<AgentLoopDeliveryOutcome>;
 
 	/**
 	 * Prepare runtime state for an imminent provider request.
