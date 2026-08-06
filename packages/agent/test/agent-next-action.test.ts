@@ -7,7 +7,12 @@ import {
 	type UserMessage,
 } from "@hansjm10/volt-ai";
 import { describe, expect, it } from "vitest";
-import { agentLoopContinue, runAgentLoop, runAgentLoopContinue } from "../src/agent-loop.ts";
+import {
+	AgentDeliverySettlementError,
+	agentLoopContinue,
+	runAgentLoop,
+	runAgentLoopContinue,
+} from "../src/agent-loop.ts";
 import type { AgentEvent, AgentLoopConfig, AgentMessage } from "../src/types.ts";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -235,7 +240,7 @@ describe("agent loop next-action protocol", () => {
 			{
 				model: createModel(),
 				convertToLlm,
-				beginDelivery: () => false,
+				beginDelivery: () => ({ outcome: "revoked" }),
 				prepareRequest: () => {
 					preparationCalls++;
 					return undefined;
@@ -254,6 +259,140 @@ describe("agent loop next-action protocol", () => {
 		expect(preparationCalls).toBe(0);
 		expect(providerCalls).toBe(0);
 		expect(events.map((event) => event.type)).toEqual(["agent_start", "agent_end"]);
+	});
+
+	it("awaits asynchronous delivery settlement before publishing or preparing a request", async () => {
+		let releaseSettlement = (): void => undefined;
+		let markSettlementStarted = (): void => undefined;
+		const settlementStarted = new Promise<void>((resolve) => {
+			markSettlementStarted = resolve;
+		});
+		const settlementRelease = new Promise<void>((resolve) => {
+			releaseSettlement = resolve;
+		});
+		const events: AgentEvent[] = [];
+		let preparationCalls = 0;
+		let providerCalls = 0;
+		const running = runAgentLoop(
+			[createUserMessage("delayed")],
+			{ systemPrompt: "", messages: [] },
+			{
+				model: createModel(),
+				convertToLlm,
+				beginDelivery: async () => {
+					markSettlementStarted();
+					await settlementRelease;
+					return { outcome: "committed" };
+				},
+				prepareRequest: () => {
+					preparationCalls++;
+					return undefined;
+				},
+			},
+			(event) => {
+				events.push(event);
+			},
+			undefined,
+			() => {
+				providerCalls++;
+				return new MockAssistantStream(createAssistantMessage("done"));
+			},
+		);
+
+		await settlementStarted;
+		expect(events.map((event) => event.type)).toEqual(["agent_start"]);
+		expect(preparationCalls).toBe(0);
+		expect(providerCalls).toBe(0);
+
+		releaseSettlement();
+		await running;
+		expect(events.map((event) => event.type)).toContain("delivery_start");
+		expect(preparationCalls).toBe(1);
+		expect(providerCalls).toBe(1);
+	});
+
+	it.each(["retained", "terminally_failed"] as const)(
+		"stops the current request after a %s delivery settlement",
+		async (outcome) => {
+			const begunDeliveryIds: Array<string | undefined> = [];
+			let providerCalls = 0;
+			const running = runAgentLoop(
+				[createUserMessage("default")],
+				{ systemPrompt: "", messages: [] },
+				{
+					model: createModel(),
+					convertToLlm,
+					nextAction: () => ({
+						type: "request",
+						reason: "delivery",
+						deliveries: [
+							{ deliveryId: "first", messages: [createUserMessage("first")] },
+							{ deliveryId: "second", messages: [createUserMessage("second")] },
+						],
+					}),
+					beginDelivery: (delivery) => {
+						begunDeliveryIds.push(delivery.deliveryId);
+						return { outcome, error: new Error(`${outcome} delivery`) };
+					},
+				},
+				() => {},
+				undefined,
+				() => {
+					providerCalls++;
+					return new MockAssistantStream(createAssistantMessage("unexpected"));
+				},
+			);
+
+			await expect(running).rejects.toMatchObject({
+				name: "AgentDeliverySettlementError",
+				outcome,
+				deliveryId: "first",
+			});
+			await expect(running).rejects.toBeInstanceOf(AgentDeliverySettlementError);
+			expect(begunDeliveryIds).toEqual(["first"]);
+			expect(providerCalls).toBe(0);
+		},
+	);
+
+	it("preserves a committed delivery prefix before a later retained settlement", async () => {
+		const events: AgentEvent[] = [];
+		let providerCalls = 0;
+		const running = runAgentLoop(
+			[createUserMessage("default")],
+			{ systemPrompt: "", messages: [] },
+			{
+				model: createModel(),
+				convertToLlm,
+				nextAction: () => ({
+					type: "request",
+					reason: "delivery",
+					deliveries: [
+						{ deliveryId: "first", messages: [createUserMessage("first")] },
+						{ deliveryId: "second", messages: [createUserMessage("second")] },
+					],
+				}),
+				beginDelivery: (delivery) =>
+					delivery.deliveryId === "first"
+						? { outcome: "committed" }
+						: { outcome: "retained", error: new Error("retain suffix") },
+			},
+			(event) => {
+				events.push(event);
+			},
+			undefined,
+			() => {
+				providerCalls++;
+				return new MockAssistantStream(createAssistantMessage("unexpected"));
+			},
+		);
+
+		await expect(running).rejects.toMatchObject({ outcome: "retained", deliveryId: "second" });
+		expect(
+			events.flatMap((event) =>
+				event.type === "message_end" && event.message.role === "user" ? [event.message.content] : [],
+			),
+		).toEqual(["first"]);
+		expect(providerCalls).toBe(0);
 	});
 
 	it("does not begin a later delivery after the run aborts", async () => {
@@ -280,7 +419,7 @@ describe("agent loop next-action protocol", () => {
 						: { type: "stop" },
 				beginDelivery: (delivery) => {
 					begunDeliveryIds.push(delivery.deliveryId);
-					return true;
+					return { outcome: "committed" };
 				},
 			},
 			(event) => {
@@ -735,7 +874,9 @@ describe("agent loop next-action protocol", () => {
 								],
 							}
 						: { type: "stop" },
-				beginDelivery: (delivery) => delivery.deliveryId !== "revoked",
+				beginDelivery: (delivery) => ({
+					outcome: delivery.deliveryId === "revoked" ? "revoked" : "committed",
+				}),
 				prepareRequest: ({ deliveries }) => {
 					preparedDeliveryIds = deliveries.map((delivery) => delivery.deliveryId);
 					return undefined;
@@ -773,7 +914,7 @@ describe("agent loop next-action protocol", () => {
 								deliveries: [{ deliveryId: "revoked", messages: [createUserMessage("ignored")] }],
 							}
 						: { type: "stop" },
-				beginDelivery: () => false,
+				beginDelivery: () => ({ outcome: "revoked" }),
 				prepareRequest: ({ deliveries }) => {
 					preparationCalls++;
 					expect(deliveries).toEqual([]);

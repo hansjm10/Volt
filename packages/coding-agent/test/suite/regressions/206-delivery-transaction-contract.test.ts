@@ -198,7 +198,10 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 
 			if (kind === "steer") await harness.session.steer(text, undefined, clientMessageId);
 			else await harness.session.followUp(text, undefined, clientMessageId);
-			await expect(harness.session.agent.continue()).resolves.toBeUndefined();
+			await expect(harness.session.agent.continue()).resolves.toMatchObject({
+				status: "delivery_failed",
+				failure: { kind, outcome: "retained", phase: "preparation" },
+			});
 
 			expect(harness.session.agent.state.errorMessage).toBe(`injected ${kind} preparation failure`);
 			expect(harness.session.agent.hasQueuedMessages()).toBe(true);
@@ -235,7 +238,10 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		});
 		await harness.session.steer("discard retained feedback", undefined, clientMessageId);
 
-		await expect(harness.session.agent.continue()).resolves.toBeUndefined();
+		await expect(harness.session.agent.continue()).resolves.toMatchObject({
+			status: "delivery_failed",
+			failure: { outcome: "retained", phase: "settlement" },
+		});
 
 		expect(harness.session.agent.state.errorMessage).toBe("injected planning commit failure");
 		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
@@ -436,10 +442,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
-	it.todo("settles a retained direct RPC attempt and retries the same client input explicitly");
-	it.todo("classifies definitive and ambiguous persistence-watermark failures");
-	it.todo("leaves ready-plan state unchanged when direct feedback fails deterministic preflight");
-	it.todo("distinguishes external dispose from reentrant abort during participant durability");
-	it.todo("isolates synchronous throws and asynchronous rejections from committed-delivery observers");
-	it.todo("continues provider work without recommitting client-input or planning state");
+	// #207 implements these participant-level acceptance cases in
+	// packages/agent/test/agent-delivery-transaction.test.ts. Coding-agent's
+	// production participant adoption remains intentionally scoped to #205.
 });

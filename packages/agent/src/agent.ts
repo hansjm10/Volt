@@ -21,6 +21,7 @@ import type {
 	AgentEvent,
 	AgentLoopConfig,
 	AgentLoopDelivery,
+	AgentLoopDeliveryOutcome,
 	AgentLoopNextAction,
 	AgentLoopNextActionContext,
 	AgentLoopRequestUpdate,
@@ -44,6 +45,14 @@ function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	return messages.filter(
 		(message) => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
 	);
+}
+
+function toError(error: unknown): Error {
+	return error instanceof Error ? error : new Error(String(error));
+}
+
+function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMessage[] {
+	return messages.map((message) => structuredClone(message));
 }
 
 const EMPTY_USAGE = {
@@ -122,11 +131,64 @@ export interface AgentDelivery {
 	readonly messages: readonly AgentMessage[];
 }
 
-/** Side-effect-free messages plus work committed only after delivery ownership transfers. */
+/** Result returned by a host participant after Agent crosses the revocation cutoff. */
+export type AgentDeliveryParticipantOutcome =
+	| { readonly outcome: "committed" }
+	| { readonly outcome: "retained"; readonly error: Error }
+	| { readonly outcome: "terminally_failed"; readonly error: Error };
+
+/** Reentrant-safe lifecycle capability available only while participant work settles. */
+export interface AgentDeliveryTransactionContext {
+	/** Record abort intent without awaiting the Agent run that invoked this participant. */
+	requestAbort(source?: AgentAbortSource): AgentAbortAcceptance;
+}
+
+/** Host durability work attached to one Agent-owned delivery attempt. */
+export interface AgentDeliveryTransactionParticipant {
+	/**
+	 * Settle Agent's commit decision exactly once.
+	 *
+	 * Throwing or rejecting is classified as `terminally_failed`; safe replay
+	 * requires an explicit `retained` result.
+	 */
+	settle(
+		context: AgentDeliveryTransactionContext,
+	): AgentDeliveryParticipantOutcome | Promise<AgentDeliveryParticipantOutcome>;
+}
+
+/** Side-effect-free messages plus work settled only after delivery ownership transfers. */
 export interface AgentDeliveryPreparation {
 	messages: AgentMessage[];
+	participant?: AgentDeliveryTransactionParticipant;
+	/** Temporary adapter used until coding-agent migrates in #205. */
 	commit?: () => void;
 }
+
+interface AgentDeliveryAttemptBase {
+	readonly deliveryId: string;
+	readonly kind: AgentDeliveryKind;
+}
+
+export type AgentDeliveryFailure = AgentDeliveryAttemptBase &
+	(
+		| { readonly outcome: "retained"; readonly phase: "preparation" | "settlement"; readonly error: Error }
+		| { readonly outcome: "terminally_failed"; readonly phase: "settlement"; readonly error: Error }
+	);
+
+/** Explicit terminal result for one Agent-owned delivery attempt. */
+export type AgentDeliveryAttemptResult =
+	| (AgentDeliveryAttemptBase & { readonly outcome: "committed" | "revoked" })
+	| (AgentDeliveryAttemptBase & { readonly outcome: "retained" })
+	| AgentDeliveryFailure;
+
+/** Explicit outcome of one bounded Agent run. */
+export type AgentRunResult =
+	| { readonly status: "completed"; readonly deliveries: readonly AgentDeliveryAttemptResult[] }
+	| {
+			readonly status: "delivery_failed";
+			readonly deliveries: readonly AgentDeliveryAttemptResult[];
+			readonly failure: AgentDeliveryFailure;
+	  };
 
 /** Options for constructing an {@link Agent}. */
 export interface AgentOptions {
@@ -190,10 +252,15 @@ type ActiveRun = {
 	resolve: () => void;
 	abortController: AbortController;
 	turnOpen: boolean;
+	messages: AgentMessage[];
 	abortSource?: AgentAbortSource;
 	diagnosticTimestamp?: number;
 	requestAccepted: boolean;
 	deliveryCommitSettled?: Promise<void>;
+	deliveryOrder: Map<string, number>;
+	deliveryOutcomes: Map<string, AgentDeliveryAttemptResult>;
+	deliveryFailure?: AgentDeliveryFailure;
+	observationalDeliveryIds: Set<string>;
 	phase: "open" | "terminal_event_settling" | "settled";
 };
 
@@ -210,6 +277,8 @@ export class Agent {
 		() => `local-queue:${globalThis.crypto.randomUUID()}`,
 	);
 	private activeLease?: DeliveryLease<AgentDeliveryKind, AgentMessage>;
+	private readonly leasedDeliveryKinds = new Map<string, AgentDeliveryKind>();
+	private readonly preparedDeliveryParticipants = new Map<string, AgentDeliveryTransactionParticipant>();
 	private readonly preparedDeliveryCommits = new Map<string, () => void>();
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
@@ -407,6 +476,9 @@ export class Agent {
 
 	/** Clear transcript state, runtime state, and queued messages. */
 	reset(): void {
+		if (this.activeRun) {
+			throw new Error("Cannot reset Agent while a run is active; abort it and wait for idle first");
+		}
 		this._state.messages = [];
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
@@ -415,14 +487,16 @@ export class Agent {
 		this._state.errorMessage = undefined;
 		this.inbox.reset();
 		this.activeLease = undefined;
+		this.leasedDeliveryKinds.clear();
+		this.preparedDeliveryParticipants.clear();
 		this.preparedDeliveryCommits.clear();
 		this.pausedState = undefined;
 	}
 
 	/** Start a new prompt through the same inbox dispatcher used by queued input. */
-	async prompt(message: AgentMessage | AgentMessage[]): Promise<void>;
-	async prompt(input: string, images?: ImageContent[]): Promise<void>;
-	async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<void> {
+	async prompt(message: AgentMessage | AgentMessage[]): Promise<AgentRunResult>;
+	async prompt(input: string, images?: ImageContent[]): Promise<AgentRunResult>;
+	async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<AgentRunResult> {
 		if (this.activeRun) {
 			throw new Error(
 				"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
@@ -436,7 +510,7 @@ export class Agent {
 		this.pausedState = undefined;
 		const lastMessage = this._state.messages[this._state.messages.length - 1];
 		this.enqueueDelivery("prompt", this.normalizePromptInput(input, images));
-		await this.runDispatcher({
+		return await this.runDispatcher({
 			firstDecision: true,
 			requestAuthority: "provider",
 			providerRequestPending: lastMessage !== undefined && lastMessage.role !== "assistant",
@@ -444,7 +518,7 @@ export class Agent {
 	}
 
 	/** Resume dispatcher state or a provider-ready transcript. */
-	async continue(options: { drainFollowUps?: boolean } = {}): Promise<void> {
+	async continue(options: { drainFollowUps?: boolean } = {}): Promise<AgentRunResult> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
@@ -455,9 +529,9 @@ export class Agent {
 		const pausedState = this.pausedState;
 		this.pausedState = undefined;
 		if (lastMessage?.role === "assistant" && !this.hasQueuedMessages() && !this.nextAction && !pausedState) {
-			return;
+			return { status: "completed", deliveries: [] };
 		}
-		await this.runDispatcher({
+		return await this.runDispatcher({
 			firstDecision: true,
 			requestAuthority: pausedState?.requestAuthority ?? "provider",
 			providerRequestPending:
@@ -485,8 +559,8 @@ export class Agent {
 		return [{ role: "user", content, timestamp: Date.now() }];
 	}
 
-	private async runDispatcher(startState: DispatcherStartState): Promise<void> {
-		await this.runWithLifecycle(async (signal) => {
+	private async runDispatcher(startState: DispatcherStartState): Promise<AgentRunResult> {
+		return await this.runWithLifecycle(async (signal) => {
 			const context = this.createContextSnapshot();
 			const config = this.createLoopConfig(startState);
 			if (context.messages.length === 0) {
@@ -506,12 +580,18 @@ export class Agent {
 	}
 
 	private enqueueDelivery(kind: AgentDeliveryKind, messages: AgentMessage[]): string {
-		return this.inbox.enqueue(kind, messages).deliveryId;
+		return this.inbox.enqueue(kind, cloneAgentMessages(messages)).deliveryId;
 	}
 
 	private clearDeliveries(kind: AgentDeliveryKind): string[] {
 		const revoked = this.inbox.revoke(kind);
 		for (const delivery of revoked) {
+			this.recordDeliveryOutcome({
+				deliveryId: delivery.deliveryId,
+				kind: delivery.kind,
+				outcome: "revoked",
+			});
+			this.preparedDeliveryParticipants.delete(delivery.deliveryId);
 			this.preparedDeliveryCommits.delete(delivery.deliveryId);
 		}
 		return revoked.map((delivery) => delivery.deliveryId);
@@ -596,70 +676,168 @@ export class Agent {
 	private async prepareLeasedDeliveries(selected: PendingDelivery[]): Promise<AgentLoopDelivery[]> {
 		const lease = this.inbox.lease(selected);
 		this.activeLease = lease;
+		for (const delivery of selected) {
+			this.leasedDeliveryKinds.set(delivery.deliveryId, delivery.kind);
+			const run = this.activeRun;
+			if (run && !run.deliveryOrder.has(delivery.deliveryId)) {
+				run.deliveryOrder.set(delivery.deliveryId, run.deliveryOrder.size);
+			}
+		}
 		const deliveries: AgentLoopDelivery[] = [];
 		for (const delivery of lease.deliveries) {
-			const preparation = this.prepareDelivery
-				? await this.prepareDelivery(
-						{
-							deliveryId: delivery.deliveryId,
-							kind: delivery.kind,
-							messages: delivery.messages.slice(),
-						},
-						this.signal,
-					)
-				: { messages: delivery.messages.slice() };
-			if (
-				this.activeLease !== lease ||
-				!lease.deliveries.some((candidate) => candidate.deliveryId === delivery.deliveryId)
-			) {
-				continue;
+			if (!lease.canPrepare(delivery.deliveryId)) continue;
+			let preparation: AgentDeliveryPreparation;
+			try {
+				preparation = this.prepareDelivery
+					? await this.prepareDelivery(
+							{
+								deliveryId: delivery.deliveryId,
+								kind: delivery.kind,
+								messages: cloneAgentMessages(delivery.messages),
+							},
+							this.signal,
+						)
+					: { messages: cloneAgentMessages(delivery.messages) };
+			} catch (error) {
+				if (!lease.canPrepare(delivery.deliveryId)) continue;
+				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
+				throw error;
 			}
+			if (this.activeLease !== lease || !lease.canPrepare(delivery.deliveryId)) continue;
 			if (preparation.messages.length === 0) {
-				throw new Error("prepareDelivery must retain at least one message for an admitted delivery");
+				const error = new Error("prepareDelivery must retain at least one message for an admitted delivery");
+				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
+				throw error;
+			}
+			if (preparation.participant && preparation.commit) {
+				const error = new Error("prepareDelivery cannot return both participant and commit");
+				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
+				throw error;
+			}
+			if (preparation.participant) {
+				this.preparedDeliveryParticipants.set(delivery.deliveryId, preparation.participant);
 			}
 			if (preparation.commit) {
 				this.preparedDeliveryCommits.set(delivery.deliveryId, preparation.commit);
 			}
 			deliveries.push({
 				deliveryId: delivery.deliveryId,
-				messages: preparation.messages,
+				// The participant contract freezes prepared messages at the cutoff.
+				// The temporary #205 adapter still composes messages in commit.
+				messages: preparation.participant ? cloneAgentMessages(preparation.messages) : preparation.messages,
 			});
 		}
 		return deliveries;
 	}
 
-	private beginActiveDelivery(delivery: AgentLoopDelivery): boolean {
-		if (delivery.deliveryId === undefined) return true;
-		if (!this.activeLease?.owns(delivery.deliveryId)) return true;
-		const commit = this.preparedDeliveryCommits.get(delivery.deliveryId);
-		const run = this.activeRun;
-		const requestWasAccepted = run?.requestAccepted ?? false;
-		let settleDeliveryCommit = (): void => undefined;
-		if (run) {
-			run.requestAccepted = true;
-			run.deliveryCommitSettled = new Promise<void>((resolve) => {
-				settleDeliveryCommit = resolve;
-			});
+	private async beginActiveDelivery(delivery: AgentLoopDelivery): Promise<AgentLoopDeliveryOutcome> {
+		if (delivery.deliveryId === undefined) return { outcome: "committed" };
+		const kind = this.leasedDeliveryKinds.get(delivery.deliveryId);
+		if (kind === undefined) return { outcome: "committed" };
+		const lease = this.activeLease;
+		if (!lease?.owns(delivery.deliveryId) || !lease.begin(delivery.deliveryId)) {
+			this.recordDeliveryOutcome({ deliveryId: delivery.deliveryId, kind, outcome: "revoked" });
+			return { outcome: "revoked" };
 		}
+
+		const run = this.activeRun;
+		if (run) run.requestAccepted = true;
+		let settleDeliveryCommit = (): void => undefined;
+		const settlement = new Promise<void>((resolve) => {
+			settleDeliveryCommit = resolve;
+		});
+		if (run) run.deliveryCommitSettled = settlement;
+
+		let outcome: AgentDeliveryParticipantOutcome;
+		const participant = this.preparedDeliveryParticipants.get(delivery.deliveryId);
+		const commit = this.preparedDeliveryCommits.get(delivery.deliveryId);
 		try {
-			if (!this.activeLease.begin(delivery.deliveryId, commit)) {
-				if (run && this.activeRun === run) run.requestAccepted = requestWasAccepted;
-				return false;
+			if (participant) {
+				try {
+					outcome = await participant.settle({ requestAbort: (source) => this.abort(source) });
+				} catch (error) {
+					outcome = { outcome: "terminally_failed", error: toError(error) };
+				}
+			} else if (commit) {
+				try {
+					commit();
+					outcome = { outcome: "committed" };
+				} catch (error) {
+					outcome = { outcome: "retained", error: toError(error) };
+				}
+			} else {
+				outcome = { outcome: "committed" };
 			}
-			this.preparedDeliveryCommits.delete(delivery.deliveryId);
-			return true;
-		} catch (error) {
-			if (run && this.activeRun === run) run.requestAccepted = requestWasAccepted;
-			throw error;
+
+			if (!lease.settle(delivery.deliveryId, outcome.outcome)) {
+				outcome = {
+					outcome: "terminally_failed",
+					error: new Error(`Delivery settlement lost Agent ownership: ${delivery.deliveryId}`),
+				};
+			}
+			const result =
+				outcome.outcome === "committed"
+					? ({ deliveryId: delivery.deliveryId, kind, outcome: "committed" } as const)
+					: ({
+							deliveryId: delivery.deliveryId,
+							kind,
+							outcome: outcome.outcome,
+							phase: "settlement",
+							error: outcome.error,
+						} satisfies AgentDeliveryFailure);
+			this.recordDeliveryOutcome(result);
+			if (outcome.outcome === "retained" && run?.messages.length === 0) {
+				run.requestAccepted = false;
+			}
+			if (!commit && outcome.outcome === "committed") {
+				run?.observationalDeliveryIds.add(delivery.deliveryId);
+			}
+			return outcome;
 		} finally {
+			this.preparedDeliveryParticipants.delete(delivery.deliveryId);
+			this.preparedDeliveryCommits.delete(delivery.deliveryId);
 			settleDeliveryCommit();
-			if (run && this.activeRun === run) run.deliveryCommitSettled = undefined;
+			if (run && this.activeRun === run && run.deliveryCommitSettled === settlement) {
+				run.deliveryCommitSettled = undefined;
+			}
+		}
+	}
+
+	private recordDeliveryFailure(
+		delivery: Pick<PendingDelivery, "deliveryId" | "kind">,
+		phase: AgentDeliveryFailure["phase"],
+		outcome: AgentDeliveryFailure["outcome"],
+		error: unknown,
+	): void {
+		this.recordDeliveryOutcome({
+			deliveryId: delivery.deliveryId,
+			kind: delivery.kind,
+			outcome,
+			phase,
+			error: toError(error),
+		} as AgentDeliveryFailure);
+	}
+
+	private recordDeliveryOutcome(outcome: AgentDeliveryAttemptResult): void {
+		const run = this.activeRun;
+		if (!run || run.deliveryOutcomes.has(outcome.deliveryId)) return;
+		run.deliveryOutcomes.set(outcome.deliveryId, Object.freeze(outcome));
+		if ("error" in outcome && run.deliveryFailure === undefined) {
+			run.deliveryFailure = outcome;
 		}
 	}
 
 	private rollbackActiveLease(): void {
-		this.inbox.rollbackActiveLease();
+		const restored = this.inbox.rollbackActiveLease();
+		for (const delivery of restored) {
+			this.recordDeliveryOutcome({
+				deliveryId: delivery.deliveryId,
+				kind: delivery.kind,
+				outcome: "retained",
+			});
+		}
 		this.activeLease = undefined;
+		this.preparedDeliveryParticipants.clear();
 		this.preparedDeliveryCommits.clear();
 	}
 
@@ -697,7 +875,7 @@ export class Agent {
 		};
 	}
 
-	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
+	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<AgentRunResult> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing.");
 		}
@@ -713,7 +891,11 @@ export class Agent {
 			resolve: resolvePromise,
 			abortController,
 			turnOpen: false,
+			messages: [],
 			requestAccepted: false,
+			deliveryOrder: new Map(),
+			deliveryOutcomes: new Map(),
+			observationalDeliveryIds: new Set(),
 			phase: "open",
 		};
 
@@ -721,6 +903,8 @@ export class Agent {
 		this._state.streamingMessage = undefined;
 		this._state.errorMessage = undefined;
 
+		let deliveries: readonly AgentDeliveryAttemptResult[] = [];
+		let deliveryFailure: AgentDeliveryFailure | undefined;
 		try {
 			await executor(abortController.signal);
 		} catch (error) {
@@ -728,18 +912,37 @@ export class Agent {
 			await this.handleRunFailure(error, abortController.signal.aborted);
 		} finally {
 			this.rollbackActiveLease();
+			const run = this.activeRun;
+			deliveries = Object.freeze(
+				[...(run?.deliveryOutcomes.values() ?? [])].sort(
+					(left, right) =>
+						(run?.deliveryOrder.get(left.deliveryId) ?? Number.MAX_SAFE_INTEGER) -
+						(run?.deliveryOrder.get(right.deliveryId) ?? Number.MAX_SAFE_INTEGER),
+				),
+			);
+			deliveryFailure = this.activeRun?.deliveryFailure;
+			this.leasedDeliveryKinds.clear();
 			this.finishRun();
 		}
+		return deliveryFailure
+			? { status: "delivery_failed", deliveries, failure: deliveryFailure }
+			: { status: "completed", deliveries };
 	}
 
 	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
-		if (aborted && !this.activeRun?.requestAccepted) {
-			await this.processEvents({ type: "agent_end", messages: [] });
+		const run = this.activeRun;
+		const hasCommittedDelivery = [...(run?.deliveryOutcomes.values() ?? [])].some(
+			(outcome) => outcome.outcome === "committed",
+		);
+		const retainedBeforeAnyCommit = run?.deliveryFailure?.outcome === "retained" && !hasCommittedDelivery;
+		if (aborted && (!run?.requestAccepted || retainedBeforeAnyCommit)) {
+			await this.processEvents({ type: "agent_end", messages: run?.messages.slice() ?? [] });
 			return;
 		}
 		if (!this.activeRun?.turnOpen) {
 			await this.processEvents({ type: "turn_start" });
 		}
+		const deliveryFailure = this.activeRun?.deliveryFailure;
 		const failureMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: "" }],
@@ -749,13 +952,33 @@ export class Agent {
 			usage: EMPTY_USAGE,
 			stopReason: aborted ? "aborted" : "error",
 			errorMessage: error instanceof Error ? error.message : String(error),
+			...(deliveryFailure
+				? {
+						diagnostics: [
+							{
+								type: "delivery_transaction_failure",
+								timestamp: Date.now(),
+								error: { name: deliveryFailure.error.name, message: deliveryFailure.error.message },
+								details: {
+									deliveryId: deliveryFailure.deliveryId,
+									kind: deliveryFailure.kind,
+									outcome: deliveryFailure.outcome,
+									phase: deliveryFailure.phase,
+								},
+							},
+						],
+					}
+				: {}),
 			timestamp: Date.now(),
 		} satisfies AgentMessage;
 		await this.processEvents({ type: "message_start", message: failureMessage });
 		const replacement = await this.processEvents({ type: "message_end", message: failureMessage });
 		const finalizedMessage = replacement?.role === "assistant" ? replacement : failureMessage;
 		await this.processEvents({ type: "turn_end", message: finalizedMessage, toolResults: [] });
-		await this.processEvents({ type: "agent_end", messages: [finalizedMessage] });
+		await this.processEvents({
+			type: "agent_end",
+			messages: this.activeRun?.messages.slice() ?? [finalizedMessage],
+		});
 	}
 
 	private finishRun(): void {
@@ -861,6 +1084,35 @@ export class Agent {
 		if (!signal) {
 			throw new Error("Agent listener invoked outside active run");
 		}
+		if (event.type === "agent_end") {
+			for (const listener of this.listeners) {
+				try {
+					await listener(structuredClone(event), signal);
+				} catch {
+					// Terminal publication is observational and cannot alter run settlement.
+				}
+			}
+			return undefined;
+		}
+		const isObservationalDeliveryProjection =
+			(event.type === "delivery_start" || event.type === "message_start" || event.type === "message_end") &&
+			event.deliveryId !== undefined &&
+			this.activeRun?.observationalDeliveryIds.has(event.deliveryId) === true;
+		if (isObservationalDeliveryProjection) {
+			for (const listener of this.listeners) {
+				try {
+					await listener(structuredClone(event), signal);
+				} catch {
+					// Committed delivery publication is observational and cannot alter settlement.
+				}
+			}
+			if (event.type === "message_end") {
+				this._state.messages.push(event.message);
+				this.activeRun?.messages.push(event.message);
+				return event.message;
+			}
+			return undefined;
+		}
 		let emittedEvent = this.decorateRuntimeAbort(event);
 		for (const listener of this.listeners) {
 			const replacement = await listener(emittedEvent, signal);
@@ -885,6 +1137,7 @@ export class Agent {
 				throw new Error("Runtime abort decoration changed the event type");
 			}
 			this._state.messages.push(finalizedEvent.message);
+			this.activeRun?.messages.push(finalizedEvent.message);
 			return finalizedEvent.message;
 		}
 		if (emittedEvent.type === "agent_end" && this.activeRun) {

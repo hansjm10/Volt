@@ -23,6 +23,7 @@ import type {
 	AgentEvent,
 	AgentLoopNextActionContext,
 	AgentMessage,
+	AgentRunResult,
 	AgentRunSnapshot,
 	AgentState,
 	AgentTool,
@@ -1379,6 +1380,9 @@ export class AgentSession {
 		for (let i = event.messages.length - 1; i >= 0; i--) {
 			const message = event.messages[i];
 			if (message.role === "assistant") {
+				if (message.diagnostics?.some((diagnostic) => diagnostic.type === "delivery_transaction_failure")) {
+					return false;
+				}
 				return this._isRetryableError(message as AssistantMessage);
 			}
 		}
@@ -3129,9 +3133,9 @@ export class AgentSession {
 		const run = (async () => {
 			this._agentConversationMutationInFlight = true;
 			try {
-				await this._runAgentOperation(() => this.agent.prompt(messages));
-				while (await this._handlePostAgentRun(abortGeneration, conversationGenerationRevision)) {
-					await this._continueAgent();
+				let result = await this._runAgentOperation(() => this.agent.prompt(messages));
+				while (await this._handlePostAgentRun(result, abortGeneration, conversationGenerationRevision)) {
+					result = await this._continueAgent();
 				}
 			} finally {
 				this._agentConversationMutationInFlight = false;
@@ -3147,14 +3151,15 @@ export class AgentSession {
 		}
 	}
 
-	private async _runAgentOperation(operation: () => Promise<void>): Promise<void> {
+	private async _runAgentOperation<T>(operation: () => Promise<T>): Promise<T> {
 		if (this._agentEventFatalError) {
 			const staleError = this._agentEventFatalError;
 			this._agentEventFatalError = undefined;
 			throw staleError;
 		}
+		let result: T;
 		try {
-			await operation();
+			result = await operation();
 		} catch (error) {
 			const fatalError = this._agentEventFatalError;
 			this._agentEventFatalError = undefined;
@@ -3165,14 +3170,15 @@ export class AgentSession {
 		if (fatalError) {
 			throw fatalError;
 		}
+		return result;
 	}
 
-	private async _continueAgent(): Promise<void> {
+	private async _continueAgent(): Promise<AgentRunResult> {
 		const drainFollowUps = this._drainFollowUpsOnNextContinuation;
 		this._drainFollowUpsOnNextContinuation = false;
 		this._agentConversationMutationInFlight = true;
 		try {
-			await this._runAgentOperation(() => this.agent.continue({ drainFollowUps }));
+			return await this._runAgentOperation(() => this.agent.continue({ drainFollowUps }));
 		} finally {
 			this._agentConversationMutationInFlight = false;
 		}
@@ -3237,9 +3243,17 @@ export class AgentSession {
 	}
 
 	private async _handlePostAgentRun(
+		result: AgentRunResult,
 		abortGeneration = this._abortGeneration,
 		conversationGenerationRevision = this._conversationGenerationRevision,
 	): Promise<boolean> {
+		// A retained or terminal delivery failure settles this run. Queue presence
+		// cannot authorize an implicit retry; only a later explicit continuation can.
+		if (result.status === "delivery_failed") {
+			this._lastAssistantMessage = undefined;
+			this._settleRetry(false, result.failure.error.message);
+			return false;
+		}
 		// Disposal stops all continuations. Abort stops automatic retry/compaction
 		// resurrection, but intentionally preserves messages queued before abort.
 		if (this._disposed) {
@@ -3586,11 +3600,13 @@ export class AgentSession {
 				}
 				try {
 					const continuationConversationGenerationRevision = this._conversationGenerationRevision;
-					await this._continueAgent();
+					let result = await this._continueAgent();
 					assertConversationGenerationCurrent();
-					while (await this._handlePostAgentRun(abortGeneration, continuationConversationGenerationRevision)) {
+					while (
+						await this._handlePostAgentRun(result, abortGeneration, continuationConversationGenerationRevision)
+					) {
 						assertConversationGenerationCurrent();
-						await this._continueAgent();
+						result = await this._continueAgent();
 						assertConversationGenerationCurrent();
 					}
 				} finally {
