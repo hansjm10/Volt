@@ -759,9 +759,7 @@ export class AgentSession {
 				: { messages: [...delivery.messages] };
 			const messages = prepared.messages;
 			const readyPlan =
-				delivery.kind !== "prompt" &&
-				messages.some((message) => message.role === "user") &&
-				this._planningState.plan?.phase === "ready"
+				messages.some((message) => message.role === "user") && this._planningState.plan?.phase === "ready"
 					? this._planningState.plan
 					: undefined;
 			return {
@@ -907,14 +905,12 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
-	/** Emit an event to all listeners */
+	/** Publish an event without allowing projection observers to roll back authoritative state. */
 	private _emit(event: AgentSessionEvent): void {
 		if (event.type === "tool_execution_end" || event.type === "agent_settled") {
 			this.gitContextProvider.scheduleRefresh();
 		}
-		for (const listener of this._eventListeners) {
-			listener(event);
-		}
+		this._emitCommittedEvent(event);
 	}
 
 	private _emitQueueUpdate(): void {
@@ -3536,12 +3532,6 @@ export class AgentSession {
 				}
 				preflightResult?.({ success: true, outcome: "admitted" });
 				return "queued";
-			}
-
-			// Ordinary feedback after submission invalidates the ready approval
-			// revision before any provider or extension can act on it.
-			if (this._planningState.plan?.phase === "ready") {
-				this.changePlan(this._planningState.plan.id, this._planningState.plan.revision);
 			}
 
 			// Flush any pending bash messages before the new prompt

@@ -369,6 +369,9 @@ describe("native planning state", () => {
 				summary: "Implement the approved change.",
 			});
 			await session.setAgentMode("build");
+			session.agent.state.messages = [
+				{ role: "user", content: "Previously approved Build work", timestamp: Date.now() },
+			];
 
 			const firstRequestStarted = createDeferred<void>();
 			const releaseFirstRequest = createDeferred<void>();
@@ -470,7 +473,7 @@ describe("native planning state", () => {
 				return stream;
 			};
 
-			const run = session.agent.prompt("Continue Build work");
+			const run = session.agent.continue();
 			await firstRequestStarted.promise;
 			await session.prompt("Add verification coverage", { streamingBehavior });
 			releaseFirstRequest.resolve();
