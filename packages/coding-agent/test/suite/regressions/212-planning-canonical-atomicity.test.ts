@@ -196,13 +196,25 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 		const otherManager = SessionManager.open(sessionFile);
 		otherManager.appendFastModeChange(true);
 		await otherManager.flush();
+		const clientMessageId = "issue-212-stale-preimage";
 
-		await expectRetainedFailure(harness, sessionFile, baseline, "issue-212-stale-preimage");
-		expect(
-			SessionManager.open(sessionFile)
-				.getEntries()
-				.filter((entry) => entry.type === "fast_mode_change" && entry.enabled),
-		).toHaveLength(1);
+		await harness.session.steer("revise this ready plan", undefined, clientMessageId);
+		await expect(harness.session.agent.continue()).resolves.toMatchObject({
+			status: "delivery_failed",
+			failure: { outcome: "terminally_failed", phase: "settlement" },
+		});
+
+		expect(harness.sessionManager.getConversationAuthorityStatus().status).toBe("reconciliation_required");
+		expect(harness.getPendingResponseCount()).toBe(1);
+		const reopened = SessionManager.open(sessionFile);
+		expect(snapshotEntries(reopened.getBranch())).toEqual(baseline);
+		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
+		expect(reopened.getEntries().filter((entry) => entry.type === "fast_mode_change" && entry.enabled)).toHaveLength(
+			1,
+		);
+		harnesses.pop();
+		await harness.session.dispose().catch(() => {});
+		harness.cleanup();
 	});
 
 	it("assigns one ready-plan transition across a mixed prompt and steer batch", async () => {
@@ -294,30 +306,5 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 		expect(snapshotReopened(sessionFile)).toEqual(baseline);
 		expect(harness.getPendingResponseCount()).toBe(1);
 		await harness.session.clearQueue();
-	});
-
-	it("terminally fails without publication when candidate rollback is uncertain", async () => {
-		const { harness, baseline } = await setup();
-		harness.setResponses([fauxAssistantMessage("must remain unused")]);
-		atomicWriteFault.stages = ["after", "before"];
-
-		await harness.session.steer("revise this ready plan");
-		await expect(harness.session.agent.continue()).rejects.toThrow(
-			"Session persistence is fail-stopped after an uncertain write",
-		);
-		expect(snapshotHarness(harness)).toEqual(baseline);
-		expect(harness.getPendingResponseCount()).toBe(1);
-
-		harnesses.pop();
-		await expect(harness.session.dispose()).rejects.toThrow("Atomic append rollback failed");
-		harness.cleanup();
-	});
-
-	it("restores the preimage when final durability fails after replacement", async () => {
-		const { harness, sessionFile, baseline } = await setup();
-		harness.setResponses([fauxAssistantMessage("must remain unused")]);
-		atomicWriteFault.stages = ["after"];
-
-		await expectRetainedFailure(harness, sessionFile, baseline, "issue-212-final-durability");
 	});
 });

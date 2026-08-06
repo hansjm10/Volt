@@ -60,6 +60,7 @@ const TEST_GIT_CONTEXT: RpcGitContext = {
 
 class TestSource implements ConversationProjectionSource {
 	private readonly listeners = new Set<(event: object) => void>();
+	private readonly authorityListeners = new Set<(error: Error) => void>();
 	private readonly branchListeners = new Set<() => void>();
 	revision = 0;
 	observationCount = 0;
@@ -76,6 +77,11 @@ class TestSource implements ConversationProjectionSource {
 		};
 	}
 
+	subscribeAuthorityLoss(listener: (error: Error) => void): () => void {
+		this.authorityListeners.add(listener);
+		return () => this.authorityListeners.delete(listener);
+	}
+
 	subscribeGenerationChanges(listener: () => void): () => void {
 		this.branchListeners.add(listener);
 		return () => this.branchListeners.delete(listener);
@@ -89,6 +95,10 @@ class TestSource implements ConversationProjectionSource {
 	rebase(): void {
 		this.revision++;
 		for (const listener of this.branchListeners) listener();
+	}
+
+	loseAuthority(error: Error): void {
+		for (const listener of this.authorityListeners) listener(error);
 	}
 }
 
@@ -1374,6 +1384,71 @@ describe("ConversationProjectionFeed", () => {
 		secondSource.emit({ type: "agent_start" });
 		await subscription.flush();
 		expect(delivery(writes.at(-1)!)).toEqual({ subscriptionId: subscription.subscriptionId, cursor: 1 });
+		feed.dispose();
+	});
+
+	it("suspends stale projection output until a fresh source generation is committed", async () => {
+		const firstSource = new TestSource();
+		const secondSource = new TestSource();
+		const blocked = deferredVoid();
+		const writes: object[] = [];
+		const feed = new ConversationProjectionFeed(firstSource, { createId: makeIds("authority-loss") });
+		let writeCount = 0;
+		const subscription = feed.attach({
+			write: (value) => {
+				writes.push(value);
+				writeCount++;
+				return writeCount === 1 ? blocked.promise : Promise.resolve();
+			},
+			buildSnapshot: (context) => snapshotBuilder(context.source as TestSource)(context),
+		});
+		const authorityChanged = vi.fn();
+		subscription.subscribeAuthorityChanges(authorityChanged);
+		firstSource.emit({ type: "agent_start" });
+		firstSource.emit({ type: "mcp_servers_changed" });
+		const staleProjectionControl = subscription.enqueueControl({
+			type: "response",
+			command: "get_state",
+			success: true,
+			data: { stale: true },
+		});
+		const staleTranscriptTextControl = subscription.enqueueControl({
+			type: "response",
+			command: "get_transcript_entry_text",
+			success: true,
+			data: { text: "stale canonical text" },
+		});
+		const control = subscription.enqueueControl({ type: "response", success: false });
+		const authorityError = new Error("conversation authority requires reconciliation");
+
+		firstSource.loseAuthority(authorityError);
+
+		expect(authorityChanged).toHaveBeenCalledOnce();
+		expect(firstSource.observationCount).toBe(0);
+		expect(() => subscription.requestCheckpoint(recoveryRequest("suspended"))).toThrow(authorityError);
+		expect(() => feed.attach({ write: () => {}, buildSnapshot: snapshotBuilder(firstSource) })).toThrow(
+			authorityError,
+		);
+		firstSource.emit({ type: "agent_end", messages: [] });
+
+		blocked.resolve();
+		await Promise.all([subscription.ready, staleProjectionControl, staleTranscriptTextControl, control]);
+		await subscription.flush();
+		expect(writes).toEqual([
+			expect.objectContaining({ type: "conversation_bootstrap", reason: "bootstrap" }),
+			{ type: "response", success: false },
+		]);
+
+		feed.beginSourceRebind(secondSource);
+		feed.commitSourceRebind();
+		await subscription.flush();
+		expect(authorityChanged).toHaveBeenCalledOnce();
+		expect(writes.at(-1)).toMatchObject({
+			type: "conversation_bootstrap",
+			reason: "session_rebind",
+			state: { revision: 0 },
+		});
+		expect(secondSource.observationCount).toBe(1);
 		feed.dispose();
 	});
 

@@ -84,14 +84,16 @@ it("uses per-runtime CLI turn defaults while leaving aggregate consumption budge
 		})}\n`,
 	);
 	let inspectedManager = false;
-	const getSubagentToolManager = AgentSession.prototype.getSubagentToolManager;
-	vi.spyOn(AgentSession.prototype, "getSubagentToolManager").mockImplementation(function (this: AgentSession) {
-		const manager = getSubagentToolManager.call(this);
+	const disposeSubagentToolManager = AgentSession.prototype.disposeSubagentToolManager;
+	vi.spyOn(AgentSession.prototype, "disposeSubagentToolManager").mockImplementation(async function (
+		this: AgentSession,
+	) {
+		const manager = this.getSubagentToolManager();
 		if (!inspectedManager && manager instanceof SubagentManager) {
 			expectDefaultPerRuntimeTurnStagesAndUnlimitedAggregateBudgets(manager);
 			inspectedManager = true;
 		}
-		return manager;
+		await disposeSubagentToolManager.call(this);
 	});
 
 	try {

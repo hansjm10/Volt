@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@hansjm10/volt-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -10,7 +10,7 @@ import {
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
-import { SessionManager } from "../../src/core/session-manager.ts";
+import { SessionConversationStateUnavailableError, SessionManager } from "../../src/core/session-manager.ts";
 import type {
 	ExtensionAPI,
 	ExtensionFactory,
@@ -281,6 +281,36 @@ describe("AgentSessionRuntime characterization", () => {
 			{ type: "session_shutdown", reason: "resume", targetSessionFile: originalSessionFile },
 			{ type: "session_start", reason: "resume", previousSessionFile: secondSessionFile },
 		]);
+	});
+
+	it("replaces a reconciliation-required runtime without invoking old-generation extension hooks", async () => {
+		let replacementHookCalls = 0;
+		const { runtime } = await createRuntimeForTest((volt: ExtensionAPI) => {
+			volt.on("session_before_switch", () => {
+				replacementHookCalls++;
+			});
+			volt.on("session_shutdown", () => {
+				replacementHookCalls++;
+			});
+		});
+		const previousSession = runtime.session;
+		const authorityError = new SessionConversationStateUnavailableError({
+			cause: new Error("injected unresolved replacement"),
+		});
+		const authorityStatus = {
+			status: "reconciliation_required" as const,
+			error: authorityError,
+		};
+		vi.spyOn(previousSession.sessionManager, "getConversationAuthorityStatus").mockReturnValue(authorityStatus);
+		vi.spyOn(previousSession.sessionManager, "assertConversationAuthorityAvailable").mockImplementation(() => {
+			throw authorityError;
+		});
+
+		await expect(runtime.newSession()).resolves.toEqual({ cancelled: false, seeded: false });
+
+		expect(runtime.session).not.toBe(previousSession);
+		expect(runtime.session.sessionManager.getConversationAuthorityStatus()).toEqual({ status: "available" });
+		expect(replacementHookCalls).toBe(0);
 	});
 
 	it("applies new-session setup before constructing the replacement session", async () => {
