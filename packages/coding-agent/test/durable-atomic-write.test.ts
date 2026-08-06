@@ -44,9 +44,9 @@ function createOperations(events: string[]): DurableAtomicWriteOperations {
 
 function createFileSyncOperations(events: string[]): DurableFileSyncOperations {
 	return {
-		open: vi.fn(async (path) => {
+		open: vi.fn(async (path, flags) => {
 			const kind = path === "/state/host.json" ? "target" : "parent";
-			events.push(`open:${kind}`);
+			events.push(`open:${kind}:${flags}`);
 			return {
 				sync: vi.fn(async () => {
 					events.push(`sync:${kind}`);
@@ -97,19 +97,19 @@ describe("durable atomic writes", () => {
 		await syncDurableFile("/state/host.json", { operations: createFileSyncOperations(events) });
 
 		expect(events).toEqual([
-			"open:target",
+			"open:target:r+",
 			"sync:target",
 			"close:target",
-			...(process.platform === "win32" ? [] : ["open:parent", "sync:parent", "close:parent"]),
+			...(process.platform === "win32" ? [] : ["open:parent:r", "sync:parent", "close:parent"]),
 		]);
 	});
 
 	it("closes the visible target and stops when its synchronization fails", async () => {
 		const events: string[] = [];
 		const operations = createFileSyncOperations(events);
-		operations.open = vi.fn(async (path) => {
+		operations.open = vi.fn(async (path, flags) => {
 			const kind = path === "/state/host.json" ? "target" : "parent";
-			events.push(`open:${kind}`);
+			events.push(`open:${kind}:${flags}`);
 			return {
 				sync: vi.fn(async () => {
 					events.push(`sync:${kind}`);
@@ -124,16 +124,16 @@ describe("durable atomic writes", () => {
 		await expect(syncDurableFile("/state/host.json", { operations })).rejects.toThrow(
 			"injected target fsync failure",
 		);
-		expect(events).toEqual(["open:target", "sync:target", "close:target"]);
+		expect(events).toEqual(["open:target:r+", "sync:target", "close:target"]);
 	});
 
 	if (process.platform !== "win32") {
 		it("closes the parent directory when its synchronization fails", async () => {
 			const events: string[] = [];
 			const operations = createFileSyncOperations(events);
-			operations.open = vi.fn(async (path) => {
+			operations.open = vi.fn(async (path, flags) => {
 				const kind = path === "/state/host.json" ? "target" : "parent";
-				events.push(`open:${kind}`);
+				events.push(`open:${kind}:${flags}`);
 				return {
 					sync: vi.fn(async () => {
 						events.push(`sync:${kind}`);
@@ -149,10 +149,10 @@ describe("durable atomic writes", () => {
 				"injected parent fsync failure",
 			);
 			expect(events).toEqual([
-				"open:target",
+				"open:target:r+",
 				"sync:target",
 				"close:target",
-				"open:parent",
+				"open:parent:r",
 				"sync:parent",
 				"close:parent",
 			]);

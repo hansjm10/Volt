@@ -14,7 +14,7 @@ export interface DurableAtomicWriteOperations {
 const DEFAULT_OPERATIONS: DurableAtomicWriteOperations = { mkdir, open, rename, rm };
 
 export interface DurableFileSyncOperations {
-	open(path: string, flags: "r"): Promise<Pick<FileHandle, "close" | "sync">>;
+	open(path: string, flags: "r" | "r+"): Promise<Pick<FileHandle, "close" | "sync">>;
 }
 
 const DEFAULT_FILE_SYNC_OPERATIONS: DurableFileSyncOperations = { open };
@@ -48,7 +48,7 @@ export async function syncDurableFile(
 	options: { operations?: DurableFileSyncOperations } = {},
 ): Promise<void> {
 	const operations = options.operations ?? DEFAULT_FILE_SYNC_OPERATIONS;
-	const targetHandle = await operations.open(path, "r");
+	const targetHandle = await operations.open(path, "r+");
 	try {
 		await targetHandle.sync();
 	} finally {

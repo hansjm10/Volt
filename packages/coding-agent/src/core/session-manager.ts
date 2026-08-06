@@ -79,10 +79,20 @@ export class SessionConversationStateUnavailableError extends Error {
 	readonly code = "session_conversation_state_unavailable";
 
 	constructor(options?: ErrorOptions) {
-		super("Session conversation state is unavailable after an unresolved atomic write; reload the session", options);
+		super(
+			"Session conversation authority requires reconciliation after an unresolved atomic write; replace the runtime",
+			options,
+		);
 		this.name = "SessionConversationStateUnavailableError";
 	}
 }
+
+export type SessionConversationAuthorityStatus =
+	| { readonly status: "available" }
+	| {
+			readonly status: "reconciliation_required";
+			readonly error: SessionConversationStateUnavailableError;
+	  };
 
 class AtomicAppendPersistenceFailure extends Error {
 	readonly effect: "rolled_back" | "uncertain";
@@ -1622,8 +1632,8 @@ export class SessionManager {
 	private sessionFileNeedsMigration = false;
 	/** First uncertain persistence failure. This manager remains fail-stopped until reloaded. */
 	private persistenceError: Error | undefined;
-	/** Fences stale conversation and client-input projections after unresolved atomic visibility. */
-	private conversationStateUnavailableError: SessionConversationStateUnavailableError | undefined;
+	/** Sticky authority state carrying the first unresolved atomic-replacement cause. */
+	private conversationAuthorityStatus: SessionConversationAuthorityStatus = { status: "available" };
 	/** Prevents a disposed persisted session from accepting work after its final drain watermark. */
 	private persistenceClosed = false;
 	/** Settled internal lane used to serialize immutable filesystem work. */
@@ -1661,6 +1671,7 @@ export class SessionManager {
 
 	/** Switch to a different session file (used for resume and branching) */
 	setSessionFile(sessionFile: string): void {
+		this.assertConversationAuthorityAvailable();
 		if (this.atomicAppendInFlight) {
 			throw new Error("Cannot switch session files during an atomic append");
 		}
@@ -1693,6 +1704,7 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
+		this.assertConversationAuthorityAvailable();
 		if (this.atomicAppendInFlight) {
 			throw new Error("Cannot create a new session during an atomic append");
 		}
@@ -1852,13 +1864,13 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
-	isConversationStateAvailable(): boolean {
-		return this.conversationStateUnavailableError === undefined;
+	getConversationAuthorityStatus(): SessionConversationAuthorityStatus {
+		return this.conversationAuthorityStatus;
 	}
 
-	assertConversationStateAvailable(): void {
-		if (this.conversationStateUnavailableError) {
-			throw this.conversationStateUnavailableError;
+	assertConversationAuthorityAvailable(): void {
+		if (this.conversationAuthorityStatus.status === "reconciliation_required") {
+			throw this.conversationAuthorityStatus.error;
 		}
 	}
 
@@ -2045,15 +2057,11 @@ export class SessionManager {
 					await serializeSessionFileOperation(filePath, async () => {
 						let current: string | undefined;
 						try {
-							current = readFileSync(filePath, "utf8");
+							current = existsSync(filePath) ? readFileSync(filePath, "utf8") : undefined;
 						} catch (error) {
-							if (preimage !== undefined || (error as NodeJS.ErrnoException).code !== "ENOENT") {
-								throw new AtomicAppendPersistenceFailure(
-									"Could not verify atomic append preimage",
-									"uncertain",
-									{ cause: error },
-								);
-							}
+							throw new AtomicAppendPersistenceFailure("Could not verify atomic append preimage", "uncertain", {
+								cause: error,
+							});
 						}
 						if (current !== preimage) {
 							throw new AtomicAppendPersistenceFailure(
@@ -2069,13 +2077,8 @@ export class SessionManager {
 						} catch (error) {
 							let visible: string | undefined;
 							try {
-								visible = readFileSync(filePath, "utf8");
+								visible = existsSync(filePath) ? readFileSync(filePath, "utf8") : undefined;
 							} catch (visibilityError) {
-								if (preimage === undefined && (visibilityError as NodeJS.ErrnoException).code === "ENOENT") {
-									throw new AtomicAppendPersistenceFailure("Atomic append was rolled back", "rolled_back", {
-										cause: error,
-									});
-								}
 								throw new AtomicAppendPersistenceFailure("Atomic append visibility is uncertain", "uncertain", {
 									cause: visibilityError,
 								});
@@ -2130,9 +2133,12 @@ export class SessionManager {
 						);
 			if (failure.effect === "uncertain") {
 				this.persistenceError ??= failure;
-				this.conversationStateUnavailableError ??= new SessionConversationStateUnavailableError({
-					cause: failure,
-				});
+				if (this.conversationAuthorityStatus.status === "available") {
+					this.conversationAuthorityStatus = {
+						status: "reconciliation_required",
+						error: new SessionConversationStateUnavailableError({ cause: failure }),
+					};
+				}
 			} else {
 				this.persistenceWatermark = this.persistenceQueue;
 			}
@@ -2163,6 +2169,7 @@ export class SessionManager {
 	}
 
 	private _assertPersistenceHealthy(): void {
+		this.assertConversationAuthorityAvailable();
 		if (this.persistenceClosed) {
 			throw new Error("Session persistence is closed");
 		}
@@ -2309,13 +2316,13 @@ export class SessionManager {
 	}
 
 	getClientInput(clientMessageId: string): ClientInputRecord | undefined {
-		this.assertConversationStateAvailable();
+		this.assertConversationAuthorityAvailable();
 		const record = this.clientInputsById.get(clientMessageId);
 		return record ? cloneClientInputRecord(record) : undefined;
 	}
 
 	getClientInputRecoveryPlan(): ClientInputRecoveryPlan {
-		this.assertConversationStateAvailable();
+		this.assertConversationAuthorityAvailable();
 		const commitOrdinal = (record: ClientInputRecord): number => {
 			const admissionEntry = record.queuedEntryId
 				? this.byId.get(record.queuedEntryId)
@@ -2474,6 +2481,7 @@ export class SessionManager {
 	 * events; callers that require disk durability must await flush().
 	 */
 	subscribeEntries(listener: SessionEntryListener): () => void {
+		this.assertConversationAuthorityAvailable();
 		this.entryListeners.add(listener);
 		return () => {
 			this.entryListeners.delete(listener);
@@ -2486,6 +2494,7 @@ export class SessionManager {
 	 * rebuilt message state must observe AgentSession's conversation generation.
 	 */
 	subscribeBranchChanges(listener: SessionBranchListener): () => void {
+		this.assertConversationAuthorityAvailable();
 		this.branchListeners.add(listener);
 		return () => {
 			this.branchListeners.delete(listener);
@@ -2493,6 +2502,7 @@ export class SessionManager {
 	}
 
 	private _setBranchLeaf(nextLeafId: string | null): void {
+		this.assertConversationAuthorityAvailable();
 		if (this.atomicAppendEntries || this.atomicAppendInFlight) {
 			throw new Error("Cannot change session branches during an atomic append");
 		}
@@ -2517,6 +2527,7 @@ export class SessionManager {
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+		this.assertConversationAuthorityAvailable();
 		if (message.role === "user" && message.clientMessageId !== undefined) {
 			requireStartedClientInputReceipt(this.clientInputsById, message.clientMessageId);
 		}
@@ -2681,17 +2692,17 @@ export class SessionManager {
 	// =========================================================================
 
 	getLeafId(): string | null {
-		this.assertConversationStateAvailable();
+		this.assertConversationAuthorityAvailable();
 		return this.leafId;
 	}
 
 	getLeafEntry(): SessionEntry | undefined {
-		this.assertConversationStateAvailable();
-		return this.leafId ? this.byId.get(this.leafId) : undefined;
+		const leafId = this.getLeafId();
+		return leafId ? this.getEntry(leafId) : undefined;
 	}
 
 	getEntry(id: string): SessionEntry | undefined {
-		this.assertConversationStateAvailable();
+		this.assertConversationAuthorityAvailable();
 		const entry = this.byId.get(id);
 		return entry && !isHostOnlySessionEntry(entry) ? entry : undefined;
 	}
@@ -2778,7 +2789,7 @@ export class SessionManager {
 
 	/** All durable spawn edges in file order, including edges recorded on other branches. */
 	getSubagentSpawnEntries(): SubagentSpawnEntry[] {
-		this.assertConversationStateAvailable();
+		this.assertConversationAuthorityAvailable();
 		return this.fileEntries.filter((entry): entry is SubagentSpawnEntry => entry.type === "subagent_spawn");
 	}
 
@@ -2790,9 +2801,8 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
-		this.assertConversationStateAvailable();
 		const path: SessionEntry[] = [];
-		const startId = fromId ?? this.leafId;
+		const startId = fromId ?? this.getLeafId();
 		let current = startId ? this.getEntry(startId) : undefined;
 		while (current) {
 			if (!isHostOnlySessionEntry(current)) {
@@ -2809,7 +2819,7 @@ export class SessionManager {
 	 * whether more history exists, then reverses only the bounded result.
 	 */
 	getBranchWindow(options: SessionBranchWindowOptions): SessionBranchWindow | undefined {
-		this.assertConversationStateAvailable();
+		this.assertConversationAuthorityAvailable();
 		if (!Number.isSafeInteger(options.maxEntries) || options.maxEntries <= 0) {
 			throw new Error("maxEntries must be a positive safe integer");
 		}
@@ -2867,7 +2877,6 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionContext(): SessionContext {
-		this.assertConversationStateAvailable();
 		return buildSessionContext(this.getEntries(), this.leafId, this.byId);
 	}
 
@@ -2875,7 +2884,7 @@ export class SessionManager {
 	 * Get session header.
 	 */
 	getHeader(): SessionHeader | null {
-		this.assertConversationStateAvailable();
+		this.assertConversationAuthorityAvailable();
 		const h = this.fileEntries.find((e) => e.type === "session");
 		return h ? (h as SessionHeader) : null;
 	}
@@ -2887,7 +2896,7 @@ export class SessionManager {
 	 * change the leaf pointer. Entries cannot be modified or deleted.
 	 */
 	getEntries(): SessionEntry[] {
-		this.assertConversationStateAvailable();
+		this.assertConversationAuthorityAvailable();
 		return this.fileEntries.filter(
 			(entry): entry is SessionEntry => entry.type !== "session" && !isHostOnlySessionEntry(entry),
 		);

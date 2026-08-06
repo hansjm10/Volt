@@ -632,6 +632,9 @@ export class AgentSessionRuntime {
 		reason: "new" | "resume",
 		targetSessionFile?: string,
 	): Promise<{ cancelled: boolean }> {
+		if (this.session.sessionManager.getConversationAuthorityStatus().status === "reconciliation_required") {
+			return { cancelled: false };
+		}
 		const runner = this.session.extensionRunner;
 		if (!runner.hasHandlers("session_before_switch")) {
 			return { cancelled: false };
@@ -649,6 +652,9 @@ export class AgentSessionRuntime {
 		entryId: string,
 		options: { position: "before" | "at" },
 	): Promise<{ cancelled: boolean }> {
+		if (this.session.sessionManager.getConversationAuthorityStatus().status === "reconciliation_required") {
+			return { cancelled: false };
+		}
 		const runner = this.session.extensionRunner;
 		if (!runner.hasHandlers("session_before_fork")) {
 			return { cancelled: false };
@@ -667,15 +673,17 @@ export class AgentSessionRuntime {
 		targetSessionFile?: string,
 		onInvalidated?: () => void,
 	): Promise<void> {
-		await emitSessionShutdownEvent(this.session.extensionRunner, {
-			type: "session_shutdown",
-			reason,
-			targetSessionFile,
-		});
+		if (this.session.sessionManager.getConversationAuthorityStatus().status === "available") {
+			await emitSessionShutdownEvent(this.session.extensionRunner, {
+				type: "session_shutdown",
+				reason,
+				targetSessionFile,
+			});
+		}
 		this.beforeSessionInvalidate?.();
 		onInvalidated?.();
 		try {
-			await this.session.getSubagentToolManager()?.dispose?.();
+			await this.session.disposeSubagentToolManager();
 		} finally {
 			await this.session.dispose("session_replacement");
 		}
@@ -683,7 +691,7 @@ export class AgentSessionRuntime {
 
 	private async disposeReplacementSession(session: AgentSession): Promise<void> {
 		try {
-			await session.getSubagentToolManager()?.dispose?.();
+			await session.disposeSubagentToolManager();
 		} finally {
 			await session.dispose("disposal");
 		}
@@ -710,12 +718,14 @@ export class AgentSessionRuntime {
 		// has either durably queued, canonically started, or failed preflight.
 		await this.waitForClientInputAdmissions(this.session);
 		this.assertStructuralOperationCurrent(options.operation);
-		const clientInputRecovery = this.session.sessionManager.getClientInputRecoveryPlan();
-		if (clientInputRecovery.kind === "blocked") {
-			throw new Error("Cannot replace the session while a durable client input outcome is ambiguous");
-		}
-		if (clientInputRecovery.kind === "replay") {
-			throw new Error("Cannot replace the session while durable client input is still queued");
+		if (this.session.sessionManager.getConversationAuthorityStatus().status === "available") {
+			const clientInputRecovery = this.session.sessionManager.getClientInputRecoveryPlan();
+			if (clientInputRecovery.kind === "blocked") {
+				throw new Error("Cannot replace the session while a durable client input outcome is ambiguous");
+			}
+			if (clientInputRecovery.kind === "replay") {
+				throw new Error("Cannot replace the session while durable client input is still queued");
+			}
 		}
 		const previousSessionId = options.previousSessionId ?? this.session.sessionId;
 		const sessionId = options.sessionManager.getSessionId();
@@ -1474,14 +1484,16 @@ export class AgentSessionRuntime {
 				return;
 			}
 			try {
-				await emitSessionShutdownEvent(this.session.extensionRunner, {
-					type: "session_shutdown",
-					reason: "quit",
-				});
+				if (this.session.sessionManager.getConversationAuthorityStatus().status === "available") {
+					await emitSessionShutdownEvent(this.session.extensionRunner, {
+						type: "session_shutdown",
+						reason: "quit",
+					});
+				}
 				this.beforeSessionInvalidate?.();
 			} finally {
 				try {
-					await this.session.getSubagentToolManager()?.dispose?.();
+					await this.session.disposeSubagentToolManager();
 				} finally {
 					await this.session.dispose("disposal");
 					this.sessionInvalidated = true;
