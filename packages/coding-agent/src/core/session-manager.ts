@@ -145,7 +145,7 @@ export interface ClientInputStateEntry extends SessionEntryBase {
 	type: "client_input_state";
 	receiptId: string;
 	clientMessageId: string;
-	state: Exclude<ClientInputState, "accepted">;
+	state: ClientInputState;
 	error?: string;
 }
 
@@ -1973,7 +1973,12 @@ export class SessionManager {
 
 		if (entry.type === "client_input_state") {
 			assertClientMessageId(entry.clientMessageId);
-			if (entry.state !== "started" && entry.state !== "completed" && entry.state !== "failed") {
+			if (
+				entry.state !== "accepted" &&
+				entry.state !== "started" &&
+				entry.state !== "completed" &&
+				entry.state !== "failed"
+			) {
 				throw new Error(`Client input state ${entry.id} has an invalid state`);
 			}
 			if (
@@ -1992,6 +1997,9 @@ export class SessionManager {
 			}
 			if (entry.state === "started" && record.state !== "accepted") {
 				throw new Error(`Client input state ${entry.id} repeats the started boundary`);
+			}
+			if (entry.state === "accepted" && record.state !== "started") {
+				throw new Error(`Client input state ${entry.id} cannot roll back from ${record.state}`);
 			}
 			record.state = entry.state;
 			record.error = entry.state === "failed" ? entry.error : undefined;
@@ -2112,6 +2120,28 @@ export class SessionManager {
 			receiptId: record.receiptId,
 			clientMessageId,
 			queuedInput,
+		};
+		this._appendEntry(entry);
+		return cloneClientInputRecord(this.clientInputsById.get(clientMessageId)!);
+	}
+
+	rollbackClientInput(clientMessageId: string): ClientInputRecord {
+		this._assertPersistenceHealthy();
+		const record = this.clientInputsById.get(clientMessageId);
+		if (!record) {
+			throw new Error(`Client input receipt not found: ${clientMessageId}`);
+		}
+		if (record.state !== "started") {
+			return cloneClientInputRecord(record);
+		}
+		const entry: ClientInputStateEntry = {
+			type: "client_input_state",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			receiptId: record.receiptId,
+			clientMessageId,
+			state: "accepted",
 		};
 		this._appendEntry(entry);
 		return cloneClientInputRecord(this.clientInputsById.get(clientMessageId)!);

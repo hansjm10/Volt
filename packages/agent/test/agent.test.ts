@@ -850,11 +850,15 @@ describe("Agent", () => {
 		const releasePreparation = createDeferred();
 		const requestReasons: string[] = [];
 		const providerUserTexts: Array<string | undefined> = [];
+		const revokedDeliveryIds: string[] = [];
+		let preparingDeliveryId: string | undefined;
 		let blockFirstPrompt = true;
 		const agent = new Agent({
+			deliveryRevoked: (delivery) => revokedDeliveryIds.push(delivery.deliveryId),
 			prepareDelivery: async (delivery) => {
 				if (delivery.kind === "prompt" && blockFirstPrompt) {
 					blockFirstPrompt = false;
+					preparingDeliveryId = delivery.deliveryId;
 					preparationStarted.resolve();
 					await releasePreparation.promise;
 				}
@@ -881,7 +885,10 @@ describe("Agent", () => {
 
 		const revokedPrompt = agent.prompt("revoked");
 		await preparationStarted.promise;
+		expect(agent.canPrepareDelivery(preparingDeliveryId!)).toBe(true);
 		expect(agent.discardPendingPrompt()).toHaveLength(1);
+		expect(revokedDeliveryIds).toEqual([preparingDeliveryId]);
+		expect(agent.canPrepareDelivery(preparingDeliveryId!)).toBe(false);
 		releasePreparation.resolve();
 		await revokedPrompt;
 
@@ -1045,14 +1052,17 @@ describe("Agent", () => {
 		expect(agent.hasQueuedMessages()).toBe(false);
 	});
 
-	it("restores a delivery when its staged commit throws", async () => {
+	it("restores a delivery when its participant explicitly retains", async () => {
 		let failCommit = true;
 		let providerCalls = 0;
 		const agent = new Agent({
 			prepareDelivery: (delivery) => ({
 				messages: [...delivery.messages],
-				commit: () => {
-					if (failCommit) throw new Error("commit failed");
+				participant: {
+					settle: () =>
+						failCommit
+							? { outcome: "retained", error: new Error("settlement failed") }
+							: { outcome: "committed" },
 				},
 			}),
 			streamFn: () => {
@@ -1072,7 +1082,7 @@ describe("Agent", () => {
 		});
 
 		await agent.continue();
-		expect(agent.state.errorMessage).toBe("commit failed");
+		expect(agent.state.errorMessage).toBe("settlement failed");
 		expect(agent.hasQueuedMessages()).toBe(true);
 		expect(providerCalls).toBe(0);
 
@@ -1198,8 +1208,11 @@ describe("Agent", () => {
 		const agent = new Agent({
 			prepareDelivery: (delivery) => ({
 				messages: [...delivery.messages],
-				commit: () => {
-					stagedCommits++;
+				participant: {
+					settle: () => {
+						stagedCommits++;
+						return { outcome: "committed" };
+					},
 				},
 			}),
 			streamFn: () => {
@@ -1230,14 +1243,17 @@ describe("Agent", () => {
 		expect(agent.hasQueuedMessages()).toBe(false);
 	});
 
-	it("runs a staged commit before publishing delivery_start", async () => {
+	it("settles a participant before publishing delivery_start", async () => {
 		let committed = false;
 		let observedCommitted = false;
 		const agent = new Agent({
 			prepareDelivery: (delivery) => ({
 				messages: [...delivery.messages],
-				commit: () => {
-					committed = true;
+				participant: {
+					settle: () => {
+						committed = true;
+						return { outcome: "committed" };
+					},
 				},
 			}),
 			streamFn: () => {

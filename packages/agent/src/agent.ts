@@ -160,8 +160,6 @@ export interface AgentDeliveryTransactionParticipant {
 export interface AgentDeliveryPreparation {
 	messages: AgentMessage[];
 	participant?: AgentDeliveryTransactionParticipant;
-	/** Temporary adapter used until coding-agent migrates in #205. */
-	commit?: () => void;
 }
 
 interface AgentDeliveryAttemptBase {
@@ -206,6 +204,8 @@ export interface AgentOptions {
 		delivery: AgentDelivery,
 		signal?: AbortSignal,
 	) => Promise<AgentDeliveryPreparation> | AgentDeliveryPreparation;
+	/** Observe revocation so host projections can release delivery-coupled state. */
+	deliveryRevoked?: (delivery: AgentDelivery) => void;
 	/** Compose host policy into the dispatcher's single action at each request boundary. */
 	nextAction?: (
 		context: AgentLoopNextActionContext,
@@ -256,7 +256,7 @@ type ActiveRun = {
 	abortSource?: AgentAbortSource;
 	diagnosticTimestamp?: number;
 	requestAccepted: boolean;
-	deliveryCommitSettled?: Promise<void>;
+	deliverySettlement?: Promise<void>;
 	deliveryOrder: Map<string, number>;
 	deliveryOutcomes: Map<string, AgentDeliveryAttemptResult>;
 	deliveryFailure?: AgentDeliveryFailure;
@@ -279,7 +279,6 @@ export class Agent {
 	private activeLease?: DeliveryLease<AgentDeliveryKind, AgentMessage>;
 	private readonly leasedDeliveryKinds = new Map<string, AgentDeliveryKind>();
 	private readonly preparedDeliveryParticipants = new Map<string, AgentDeliveryTransactionParticipant>();
-	private readonly preparedDeliveryCommits = new Map<string, () => void>();
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
 	private pausedState?: Pick<DispatcherStartState, "requestAuthority" | "providerRequestPending">;
@@ -303,6 +302,8 @@ export class Agent {
 		delivery: AgentDelivery,
 		signal?: AbortSignal,
 	) => Promise<AgentDeliveryPreparation> | AgentDeliveryPreparation;
+	/** Observe delivery revocation without changing Agent-owned state. */
+	public deliveryRevoked?: (delivery: AgentDelivery) => void;
 	/** Resolve a request, resumable pause, or terminal stop at each dispatcher boundary. */
 	public nextAction?: (
 		context: AgentLoopNextActionContext,
@@ -338,6 +339,7 @@ export class Agent {
 		this.beforeToolCall = options.beforeToolCall;
 		this.afterToolCall = options.afterToolCall;
 		this.prepareDelivery = options.prepareDelivery;
+		this.deliveryRevoked = options.deliveryRevoked;
 		this.nextAction = options.nextAction;
 		this.prepareRequest = options.prepareRequest;
 		this.steeringQueueMode = options.steeringMode ?? "one-at-a-time";
@@ -427,6 +429,16 @@ export class Agent {
 		return this.inbox.hasPending();
 	}
 
+	/** Returns true when an initial prompt is retained for explicit retry. */
+	hasPendingPrompt(): boolean {
+		return this.inbox.hasPending("prompt");
+	}
+
+	/** Returns true while a delivery being prepared remains revocable and current. */
+	canPrepareDelivery(deliveryId: string): boolean {
+		return this.activeLease?.canPrepare(deliveryId) ?? false;
+	}
+
 	/** Active abort signal for the current run, if any. */
 	get signal(): AbortSignal | undefined {
 		return this.activeRun?.abortController.signal;
@@ -446,9 +458,9 @@ export class Agent {
 		return Object.freeze({ runId: run.id, accepted: true, source: run.abortSource });
 	}
 
-	/** Settlement boundary for a synchronous delivery commit callback, if one is running. */
-	get activeDeliveryCommitSettled(): Promise<void> | undefined {
-		return this.activeRun?.deliveryCommitSettled;
+	/** Settlement boundary for the active delivery participant, if one is running. */
+	get activeDeliverySettlement(): Promise<void> | undefined {
+		return this.activeRun?.deliverySettlement;
 	}
 
 	/** Immutable lifecycle snapshot for structural teardown. */
@@ -489,7 +501,6 @@ export class Agent {
 		this.activeLease = undefined;
 		this.leasedDeliveryKinds.clear();
 		this.preparedDeliveryParticipants.clear();
-		this.preparedDeliveryCommits.clear();
 		this.pausedState = undefined;
 	}
 
@@ -592,7 +603,15 @@ export class Agent {
 				outcome: "revoked",
 			});
 			this.preparedDeliveryParticipants.delete(delivery.deliveryId);
-			this.preparedDeliveryCommits.delete(delivery.deliveryId);
+			try {
+				this.deliveryRevoked?.({
+					deliveryId: delivery.deliveryId,
+					kind: delivery.kind,
+					messages: cloneAgentMessages(delivery.messages),
+				});
+			} catch {
+				// Revocation is authoritative; observational host cleanup cannot undo it.
+			}
 		}
 		return revoked.map((delivery) => delivery.deliveryId);
 	}
@@ -709,22 +728,13 @@ export class Agent {
 				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
 				throw error;
 			}
-			if (preparation.participant && preparation.commit) {
-				const error = new Error("prepareDelivery cannot return both participant and commit");
-				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
-				throw error;
-			}
 			if (preparation.participant) {
 				this.preparedDeliveryParticipants.set(delivery.deliveryId, preparation.participant);
 			}
-			if (preparation.commit) {
-				this.preparedDeliveryCommits.set(delivery.deliveryId, preparation.commit);
-			}
 			deliveries.push({
 				deliveryId: delivery.deliveryId,
-				// The participant contract freezes prepared messages at the cutoff.
-				// The temporary #205 adapter still composes messages in commit.
-				messages: preparation.participant ? cloneAgentMessages(preparation.messages) : preparation.messages,
+				// Participant settlement cannot mutate the prepared provider payload.
+				messages: cloneAgentMessages(preparation.messages),
 			});
 		}
 		return deliveries;
@@ -742,28 +752,20 @@ export class Agent {
 
 		const run = this.activeRun;
 		if (run) run.requestAccepted = true;
-		let settleDeliveryCommit = (): void => undefined;
+		let settleDeliveryParticipant = (): void => undefined;
 		const settlement = new Promise<void>((resolve) => {
-			settleDeliveryCommit = resolve;
+			settleDeliveryParticipant = resolve;
 		});
-		if (run) run.deliveryCommitSettled = settlement;
+		if (run) run.deliverySettlement = settlement;
 
 		let outcome: AgentDeliveryParticipantOutcome;
 		const participant = this.preparedDeliveryParticipants.get(delivery.deliveryId);
-		const commit = this.preparedDeliveryCommits.get(delivery.deliveryId);
 		try {
 			if (participant) {
 				try {
 					outcome = await participant.settle({ requestAbort: (source) => this.abort(source) });
 				} catch (error) {
 					outcome = { outcome: "terminally_failed", error: toError(error) };
-				}
-			} else if (commit) {
-				try {
-					commit();
-					outcome = { outcome: "committed" };
-				} catch (error) {
-					outcome = { outcome: "retained", error: toError(error) };
 				}
 			} else {
 				outcome = { outcome: "committed" };
@@ -789,16 +791,15 @@ export class Agent {
 			if (outcome.outcome === "retained" && run?.messages.length === 0) {
 				run.requestAccepted = false;
 			}
-			if (!commit && outcome.outcome === "committed") {
+			if (outcome.outcome === "committed") {
 				run?.observationalDeliveryIds.add(delivery.deliveryId);
 			}
 			return outcome;
 		} finally {
 			this.preparedDeliveryParticipants.delete(delivery.deliveryId);
-			this.preparedDeliveryCommits.delete(delivery.deliveryId);
-			settleDeliveryCommit();
-			if (run && this.activeRun === run && run.deliveryCommitSettled === settlement) {
-				run.deliveryCommitSettled = undefined;
+			settleDeliveryParticipant();
+			if (run && this.activeRun === run && run.deliverySettlement === settlement) {
+				run.deliverySettlement = undefined;
 			}
 		}
 	}
@@ -838,7 +839,6 @@ export class Agent {
 		}
 		this.activeLease = undefined;
 		this.preparedDeliveryParticipants.clear();
-		this.preparedDeliveryCommits.clear();
 	}
 
 	private createLoopConfig(startState: DispatcherStartState): AgentLoopConfig {

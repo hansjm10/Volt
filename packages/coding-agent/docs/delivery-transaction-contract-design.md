@@ -2,7 +2,7 @@
 
 Issue: [#206](https://github.com/volt-hq/Volt/issues/206)
 
-This document specifies the target observable delivery behavior for coding-agent and its replacement dispatcher integration. It deliberately does not specify a production API, callback shape, storage primitive, or refactor. #206 changed no production behavior: its executable tests pin the guarantees the temporary adapter already provides, while named pending conformance cases identify guarantees split between #207's Agent transaction participant and #205's coding-agent migration. #205 must preserve the completed suite when it removes the adapters.
+This document specifies the observable delivery behavior for coding-agent and its dispatcher integration. #206 established the behavioral contract, #207 added Agent's transaction participant, and #205 migrated coding-agent persistence to that participant and removed the temporary commit adapter.
 
 ## Scope
 
@@ -16,7 +16,7 @@ The contract does not promise exactly-once provider calls or extension side effe
 - **Delivery attempt:** One selection, lease, preparation, and commit cycle for a logical delivery during an Agent run.
 - **Lease:** Agent's revocable, exclusive authority to prepare a delivery. Coding-agent receives the leased delivery as a capability; it does not own a second lease or shadow delivery state machine.
 - **Persistence participant:** Coding-agent work attached to an attempt for client-input state, canonical transcript entries, planning state, checkpoints, and durability. It may stage or settle host state but does not select deliveries.
-- **Commit decision:** The linearization point at which Agent closes the lease to caller revocation and accepts responsibility for settling the participant. Under the temporary adapter, this is the successful begin of the prepared delivery. A later definitive participant rollback may retain the logical delivery, but clear/revoke cannot win after this point.
+- **Commit decision:** The linearization point at which Agent closes the lease to caller revocation and accepts responsibility for settling the participant. A later definitive participant rollback may retain the logical delivery, but clear/revoke cannot win after this point.
 - **Logical commit:** Successful durable settlement of all delivery-coupled host state. After logical commit, the delivery is permanently consumed and can never be retained, revoked, or redelivered.
 - **Publication:** Delivery and message lifecycle events exposed to observers. Publication reports state; observers are not transaction participants and cannot change the outcome by throwing.
 - **Durability:** Completion of the SessionManager persistence watermark required by an outcome. In-memory append or event publication alone is not durability.
@@ -26,7 +26,7 @@ The contract does not promise exactly-once provider calls or extension side effe
 
 ## Ownership and irreversible boundary
 
-Agent is the sole delivery coordinator. It owns admission policy, per-kind FIFO ordering, leases, revocation, and retained redelivery. Coding-agent owns only its persistence participant and projections of Agent-owned queues.
+Agent is the sole delivery coordinator. It owns admission policy, per-kind FIFO ordering, leases, revocation, and retained redelivery. Coding-agent owns only its persistence participant and projections of Agent-owned queues. Agent synchronously reports successful revocation through `deliveryRevoked`; coding-agent uses that notification to invalidate prepared payloads and reconcile its durable client-input and queue projections without changing the Agent-owned outcome.
 
 Preparation is revocable and side-effect-free. It may validate or compose staged messages, but it must not:
 
@@ -132,13 +132,12 @@ The required causal order is:
 2. complete abortable input and model/auth preflight;
 3. lease and prepare without delivery-coupled side effects;
 4. make the commit decision;
-5. settle `started`, planning transition, checkpoint, and canonical user state in one ordered participant transaction;
-6. publish delivery/message projections without granting observers rollback authority;
-7. flush the required durability watermark;
-8. settle the RPC prompt response;
-9. invoke the provider or continue the run.
+5. settle and durably flush `started`, planning transition, checkpoint, and canonical user state in one ordered participant transaction;
+6. settle the RPC prompt response;
+7. publish delivery/message projections without granting observers rollback authority;
+8. invoke the provider or continue the run.
 
-The implementation may interleave publication with step 5 while persistence settles, but observer timing cannot change the transaction outcome, and RPC/provider work must remain behind the required durability fence.
+RPC acceptance, publication, and provider work all remain behind the required durability fence.
 
 ### Identified steering and follow-up
 
@@ -171,7 +170,7 @@ For an `all` batch, delivery commitment remains per-delivery rather than batch-a
 
 `delivery_start` is a post-settlement projection: the participant has already returned `committed`, so observers cannot alter the transaction outcome. The event is not a separate disk-durability or RPC-acceptance receipt. For each delivery, `delivery_start` precedes its ordered `message_start`/`message_end` pairs. The planning checkpoint precedes its feedback message in provider context, the direct RPC response follows canonical durability, and the provider request follows that response boundary. Public session subscribers are observers: throwing synchronously or returning a rejected promise cannot roll back delivery, transcript, client-input, RPC, or planning state, escape as an unhandled rejection, or prevent later observers from receiving the event.
 
-Extension hooks that explicitly replace messages or perform preflight are not passive public observers; their documented validation and failure behavior remains part of preparation or participant work.
+Extension hooks that explicitly replace delivery messages are prepared before the commit decision and cached by Agent delivery identity, so a retained retry cannot rerun the hook or drift the provider payload. Their validation failure is terminally fenced by the participant. Passive public observers remain post-commit projections.
 
 ## Abort and dispose
 
@@ -209,19 +208,19 @@ Abort stops provider/tool continuation, but preserves canonical delivery, comple
 
 ## Conformance suite
 
-`packages/coding-agent/test/suite/regressions/206-delivery-transaction-contract.test.ts` exercises the temporary adapter path through observable session, Agent, client-input, planning, event, and provider behavior. Its executable baseline covers:
+`packages/coding-agent/test/suite/regressions/206-delivery-transaction-contract.test.ts` exercises the observable session, Agent, client-input, planning, event, and provider behavior. Its executable baseline covers:
 
 - durable identified direct-prompt settlement at the RPC admission seam;
 - steering and follow-up queue admission through canonical completion;
 - preparation failure, direct and queued retained attempts, explicit retry, synchronous planning-commit rejection, and explicit discard;
 - external abort before commit and while canonical durability is pending;
-- reentrant disposal during commit;
+- reentrant disposal during participant settlement;
 - successful and partial `all` batches with one planning transition/checkpoint; and
 - preservation of a committed batch prefix when a later delivery is retained.
 
 #207 makes the participant-level acceptance cases executable in `packages/agent/test/agent-delivery-transaction.test.ts` and `packages/agent/test/agent-next-action.test.ts`. Those tests cover retained retry with stable identity, definitive versus ambiguous settlement, deterministic preflight, lifecycle races and reentrancy, committed-observer isolation, and provider-only continuation without recommit. Lease mechanics remain covered by `packages/agent/test/delivery-inbox.test.ts`.
 
-The coding-agent suite intentionally continues to exercise its temporary adapter without introducing a second transaction owner. #205 must migrate coding-agent to the participant and add consumer-level semantic fault-stage coverage for retained direct RPC retry, client-input durability, and planning state before removing that adapter. Its test driver may change with the adapter, but the observable assertions may not weaken.
+#205 adds consumer-level fault-stage coverage in `packages/coding-agent/test/suite/regressions/205-delivery-participant-migration.test.ts`. It proves that canonical durability precedes delivery publication and that a failure after canonical append is terminally fenced rather than replayed.
 
 ## Non-goals
 
