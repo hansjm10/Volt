@@ -283,7 +283,7 @@ export type AgentSessionEvent =
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| McpManagerEvent;
 
-/** Listener function for agent session events */
+/** Passive observer of agent session events. Async implementations are observed but do not delay session work. */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 
 /**
@@ -995,33 +995,28 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
-	/** Emit an event to all listeners */
+	/** Publish an isolated passive projection to every public session observer. */
 	private _emit(event: AgentSessionEvent): void {
 		if (this.sessionManager.getConversationAuthorityStatus().status !== "available") return;
 		if (event.type === "tool_execution_end" || event.type === "agent_settled") {
 			this.gitContextProvider.scheduleRefresh();
 		}
 		for (const listener of this._eventListeners) {
-			listener(event);
+			try {
+				void Promise.resolve(listener(structuredClone(event))).catch(() => {});
+			} catch {
+				// Public subscribers are passive projections. Their failure or mutation
+				// cannot alter session state or suppress a later subscriber.
+			}
 		}
 	}
 
 	private _emitQueueUpdate(): void {
-		if (this.sessionManager.getConversationAuthorityStatus().status !== "available") return;
-		const event: AgentSessionEvent = {
+		this._emit({
 			type: "queue_update",
 			steering: this._steeringMessages.map((entry) => ({ ...entry })),
 			followUp: this._followUpMessages.map((entry) => ({ ...entry })),
-		};
-		for (const listener of this._eventListeners) {
-			try {
-				listener(event);
-			} catch {
-				// Queue admission is already authoritative in the durable WAL and
-				// agent core. A projection observer cannot roll it back or turn a
-				// successful enqueue into a failed receipt.
-			}
-		}
+		});
 	}
 
 	private _emitClientInputOutcome(
@@ -1029,16 +1024,7 @@ export class AgentSession {
 		outcome: "failed",
 		reason: "queue_cleared" | "dispatch_failed",
 	): void {
-		if (this.sessionManager.getConversationAuthorityStatus().status !== "available") return;
-		const event: AgentSessionEvent = { type: "client_input_outcome", clientMessageId, outcome, reason };
-		for (const listener of this._eventListeners) {
-			try {
-				listener(event);
-			} catch {
-				// The durable receipt is already terminal. Projection delivery can
-				// recover through replay/bootstrap and must never roll that back.
-			}
-		}
+		this._emit({ type: "client_input_outcome", clientMessageId, outcome, reason });
 	}
 
 	private _recoverDurableQueuedClientInputs(): void {
@@ -4908,7 +4894,7 @@ export class AgentSession {
 	}
 
 	private _emitFastModeStateChanged(): void {
-		this._emitCommittedEvent({
+		this._emit({
 			type: "ui_action_state_changed",
 			action: "thinking.fast_mode",
 			state: {
@@ -4917,17 +4903,6 @@ export class AgentSession {
 				label: this._fastModeEnabled ? "Fast mode enabled" : "Fast mode disabled",
 			},
 		});
-	}
-
-	private _emitCommittedEvent(event: AgentSessionEvent): void {
-		if (this.sessionManager.getConversationAuthorityStatus().status !== "available") return;
-		for (const listener of this._eventListeners) {
-			try {
-				listener(event);
-			} catch {
-				// Durable state is authoritative; observers cannot roll back a committed transition.
-			}
-		}
 	}
 
 	private _clampThinkingLevel(level: ThinkingLevel, _availableLevels: ThinkingLevel[]): ThinkingLevel {
@@ -6810,10 +6785,10 @@ export class AgentSession {
 			this._planningState = clonePlanningState(sessionContext.planning);
 			this._syncPlanningRuntime();
 			if (JSON.stringify(previousPlanningState) !== JSON.stringify(this._planningState)) {
-				this._emitCommittedEvent({ type: "planning_state_changed", planning: this.planningState });
+				this._emit({ type: "planning_state_changed", planning: this.planningState });
 			}
 			if (this.thinkingLevel !== previousThinkingLevel) {
-				this._emitCommittedEvent({ type: "thinking_level_changed", level: this.thinkingLevel });
+				this._emit({ type: "thinking_level_changed", level: this.thinkingLevel });
 				void this._extensionRunner.emit({
 					type: "thinking_level_select",
 					level: this.thinkingLevel,
