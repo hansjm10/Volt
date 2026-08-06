@@ -1,14 +1,14 @@
-# Iroh Remote Protocol v1
+# Iroh Remote Protocol v2
 
 Iroh remote access tunnels Volt RPC JSONL over an Iroh QUIC bidirectional stream. The host runs on the user's machine; clients dial a ticket, send one handshake line, then exchange the same LF-delimited RPC messages documented in [RPC mode](rpc.md), subject to the remote command allowlist below.
 
-This protocol is preview-stable for external client authors. Clients must reject unsupported required values, ignore unknown fields unless this document says otherwise, and treat secrets as one-time credentials.
+This protocol is preview-stable for external client authors. V2 ticket, relay, and enrollment objects are strict: missing, extra, malformed, or unsupported values fail closed. Post-handshake objects retain their documented additive compatibility rules. Pairing and enrollment secrets are one-time credentials and must not be persisted.
 
 For user-facing setup, start the background daemon with `volt daemon start` (see [Background daemon](daemon.md)), create tickets with `volt remote pair`, inspect `volt remote status`, revoke clients with `volt remote revoke <node-id>`, and approve same-device re-pairing with `volt remote approve-repair <node-id>`. The host-side management workflow, state/audit paths, unsafe tool warnings, relay mode, and npm/source-only daemon limitation are documented in [Using Volt](usage.md#remote-access-over-iroh-preview) and [Security](security.md#remote-access-over-iroh-preview). This document defines the wire contract only.
 
 ## Version and ALPN
 
-- Ticket prefix: `volt+iroh://v1/`
+- Ticket prefix: `volt+iroh://v2/`
 - ALPN: `volt-rpc/0`
 - Handshake type: `volt_iroh_hello`
 - Handshake response type: `volt_iroh_handshake`
@@ -19,43 +19,57 @@ For user-facing setup, start the background daemon with `volt daemon start` (see
 - Host feature: `session_runtime_state.v1`
 - Host feature: `agent_options.v1`
 
-The URL prefix selects protocol v1. The `alpn` ticket field and `protocol` hello field must be exactly `volt-rpc/0`.
+The URL prefix selects pairing ticket v2. The RPC ALPN and hello protocol remain exactly `volt-rpc/0`; ticket versioning does not grant RPC compatibility by itself.
 
 ## Ticket
 
-A v1 ticket is:
+A v2 ticket is:
 
 ```text
-volt+iroh://v1/<base64url-json>
+volt+iroh://v2/<unpadded-base64url-json>
 ```
 
-The decoded JSON payload is an object with these fields:
+The decoded JSON payload has exactly these fields:
 
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `alpn` | yes | Must be `volt-rpc/0`. |
 | `irohTicket` | yes | Native Iroh endpoint ticket used to dial the running host. |
 | `workspace` | yes | Registered workspace name requested by the client. The host resolves this name from persisted state; clients must not send host paths. |
-| `secret` | no | One-time pairing secret. Present only in pairing tickets. Persisted host state stores only a hash. |
-| `expiresAt` | no | Unix epoch milliseconds after which the pairing secret is invalid. |
-| `nodeId` | no | Host node ID. Required for saved-host reconnect records and verified against the native Iroh ticket plus handshake host identity. |
-| `relayMode` | no | Host relay configuration: `disabled`, `development`, or `production`. Clients use it together with `relayUrls` to bind against the same relays as the host. |
-| `relayUrls` | no | Relay server URLs the client should use, as a non-empty array. Required when `relayMode` is `production`; a `production` payload without `relayUrls` is invalid. |
-| `relayAuthToken` | no | Bearer token for relays that require authentication. Secret-like: hosts include it only in pairing tickets whose production relays require it. Clients must store it as a credential and must never persist it in saved-host reconnect data. |
+| `secret` | pairing only | Existing 24-byte one-time Volt pairing secret, encoded canonically. |
+| `expiresAt` | pairing only | Safe integer Unix epoch milliseconds after which pairing and enrollment are invalid. |
+| `nodeId` | yes | Exactly 64 lowercase hexadecimal characters. It must match the native Iroh ticket and authenticated handshake host identity. |
+| `relay` | yes | One strict relay descriptor from the table below. |
+| `enrollment` | managed pairing only | One-time managed claim. It is removed from reconnect data. |
 
-Unknown ticket fields are reserved for compatible extension and must be ignored by v1 clients.
+Relay descriptors have exact, kind-specific shapes:
 
-Example decoded payload:
+| `relay.kind` | Other fields | Meaning |
+| --- | --- | --- |
+| `volt-managed` | `origins`: non-empty canonical sorted HTTPS origins | Official Volt relay transport. A pairing ticket also requires `enrollment`. |
+| `custom-uncredentialed` | `origins`: non-empty canonical sorted HTTPS origins | Owner-controlled relay transport. The official app sends it no App Check material or durable credential. |
+| `n0-public` | none | Public n0 relays for explicit development and simulator testing. |
+| `disabled` | none | Direct/LAN transport only. |
+
+The managed claim has exactly `version:1`, a 16-byte unpadded-base64url `claimId`, and an independent 32-byte unpadded-base64url `claimSecret`. It carries no broker URL. The app sends Firebase App Check only to its fixed Volt broker, proves possession of its endpoint key, and requires the broker's relay origins to match the ticket exactly before dialing.
+
+Example decoded managed pairing payload:
 
 ```json
 {
   "alpn": "volt-rpc/0",
+  "enrollment": {
+    "claimId": "<16-random-bytes-base64url>",
+    "claimSecret": "<32-random-bytes-base64url>",
+    "version": 1
+  },
   "expiresAt": 1790000000000,
   "irohTicket": "<iroh-endpoint-ticket>",
-  "nodeId": "<host-node-id>",
-  "relayAuthToken": "<relay-auth-token>",
-  "relayMode": "production",
-  "relayUrls": ["https://<relay-origin>"],
+  "nodeId": "<64-lowercase-hex-host-endpoint-id>",
+  "relay": {
+    "kind": "volt-managed",
+    "origins": ["https://iroh-relay-us-central.volt-cli.dev"]
+  },
   "secret": "<one-time-pairing-secret>",
   "workspace": "volt"
 }
@@ -63,7 +77,11 @@ Example decoded payload:
 
 Pairing tickets are explicit Pair Phone invitations. They are short-lived, one-time credentials for adding a new client, not durable reconnect credentials. Mobile-facing host startup does not create an active pairing ticket; `volt remote pair` creates the QR/ticket from a running host when a phone is being added. The ticket's `workspace` is the initial registered workspace for that pairing, not the client's permanent workspace boundary.
 
-Saved-host reconnect data uses the same ticket payload shape sanitized of secrets: reconnect tickets strip the one-time `secret` (with its `expiresAt`) and the `relayAuthToken`. A saved reconnect record must retain a non-empty `nodeId`, supported `relayMode`, `workspace`, and `irohTicket`, plus `relayUrls` when `relayMode` is `production`; records missing those required reconnect fields are invalid and should not be dialed. Ordinary reconnect after app restart, network loss, or host restart with the same host state uses this saved-host data and does not require another QR scan. A saved-host client may synthesize a reconnect ticket for any registered workspace name it learned from verified host metadata; the host remains authoritative and rejects unknown names with `workspace_unregistered`, removed authorizations with `workspace_authorization_removed`, registered names whose local directory no longer exists with `workspace_missing`, and registered names whose local directory is transiently unusable with `workspace_unavailable`.
+Relay enrollment and desktop authorization are independent. Managed enrollment only permits the two endpoint IDs to register with the official relay fleet; it cannot authorize a Volt handshake, workspace, RPC, or tool. Desktop control still requires the one-time pairing secret followed by the host-observed client endpoint ID and persisted client grant.
+
+Saved-host reconnect data retains only `alpn`, `irohTicket`, `nodeId`, `relay`, and `workspace`; it strips `secret`, `expiresAt`, and `enrollment` together. After the authenticated host handshake succeeds, the app transactionally stores the pair-scoped 30-day renewal grant beside the saved-host authority in Keychain. That grant never enters a QR or reconnect ticket. Records using v1 fields or any static relay token are invalid and are not dialed. Ordinary reconnect after app restart, network loss, or host restart uses this authority without another QR scan. A saved-host client may synthesize a reconnect ticket for any registered workspace name learned from verified host metadata; the host remains authoritative and rejects unknown names with `workspace_unregistered`, removed authorizations with `workspace_authorization_removed`, missing directories with `workspace_missing`, and transiently unusable directories with `workspace_unavailable`.
+
+Managed claims expire after 10 minutes. Pair grants expire after 30 days and are renewed with limited-use App Check when seven days remain. Broker, App Check, signature, or relay-origin failures deny managed relay registration but do not disable direct/LAN dialing. Forget and endpoint reset persist a signed revocation obligation before deleting local grant identity; retries continue on startup and foreground activation until acknowledged or expired. See [Iroh relay enrollment design](https://github.com/volt-hq/Volt/blob/main/packages/coding-agent/docs/iroh-relay-enrollment-design.md) for canonical signing bytes, broker routes, quotas, and relay limitations.
 
 ## Stream handshake
 
@@ -133,7 +151,7 @@ Host handshake failure outcomes:
 | `duplicate_conversation_connection` | The same authoritative client already has an active stream for the resolved workspace/session. |
 | `conversation_in_use` | The active or retained daemon runtime permits tools outside the attaching client's persisted grant, so the client cannot safely co-attach. |
 
-Client-local reconnect outcomes are not sent by the host: `host_unreachable` means no usable transport/handshake could be opened, `host_identity_mismatch` means the reached Iroh node or handshake `hostNodeId` differs from the saved host identity, and `saved_host_invalid` means the local saved record is malformed or missing required v1 fields.
+Client-local reconnect outcomes are not sent by the host: `host_unreachable` means no usable transport/handshake could be opened, `host_identity_mismatch` means the reached Iroh node or handshake `hostNodeId` differs from the saved host identity, and `saved_host_invalid` means the local saved record is malformed or missing required v2 fields.
 
 `client_revoked` remains authoritative for a revoked client node ID. A generic new pairing ticket does not let that same node silently return. The desktop host must first approve re-pair for the revoked node ID, then issue a fresh active pairing ticket; successful re-pair creates a new active client record and clears the revocation tombstone.
 
@@ -203,7 +221,7 @@ Subsequent semantic changes arrive as ordered full replacements:
 }
 ```
 
-`remoteHost.workspaces` is required whenever `remoteHost` is present and lists every registered workspace as `{name,status}`, where `status` is `available`, `missing`, or `unavailable`. `remoteHost.workspaceNames` repeats only the names whose status is `available`. Both fields contain names only, never host-local paths. `remoteHost.features` repeats the safe host feature strings advertised during handshake. `remoteHost.relayMode` and `remoteHost.relayUrls` report the host's current relay configuration so saved-host clients can refresh their relay list without re-pairing; `relayUrls` is present only in `production` relay mode. Conversation clients must validate that the response `sessionId` and `remoteHost.workspace` match the handshake-bound stream identity. Selecting another pinned agent opens another conversation stream; v1 does not switch the cwd or session of an active stream in place.
+`remoteHost.workspaces` is required whenever `remoteHost` is present and lists every registered workspace as `{name,status}`, where `status` is `available`, `missing`, or `unavailable`. `remoteHost.workspaceNames` repeats only the names whose status is `available`. Both fields contain names only, never host-local paths. `remoteHost.features` repeats the safe host feature strings advertised during handshake. `remoteHost.relayMode` and `remoteHost.relayUrls` report the host's current relay configuration so saved-host clients can refresh their relay list without re-pairing; `relayUrls` is present only in `production` relay mode. Conversation clients must validate that the response `sessionId` and `remoteHost.workspace` match the handshake-bound stream identity. Selecting another pinned agent opens another conversation stream; v2 does not switch the cwd or session of an active stream in place.
 
 ## Lifecycle: detach versus cancel
 
@@ -221,7 +239,7 @@ The successful response uses the normal RPC response shape:
 {"id":"cancel-1","type":"response","command":"abort","success":true}
 ```
 
-`abort` is the only direct remote cancellation command in v1. Command names such as `cancel`, `cancel_run`, `detach`, and `disconnect` are not forwarded by the remote command allowlist. App-level disconnect without stop should close the stream only; clients reconnect by opening a new authorized stream, then calling `get_state` and `get_transcript`.
+`abort` is the only direct remote cancellation command in v2. Command names such as `cancel`, `cancel_run`, `detach`, and `disconnect` are not forwarded by the remote command allowlist. App-level disconnect without stop should close the stream only; clients reconnect by opening a new authorized stream, then calling `get_state` and `get_transcript`.
 
 The daemon's integrated runtime treats an authorized stream as a subscriber to host-owned session state. When the only subscriber detaches during active work, the prompt continues on the host. The same authoritative Iroh node ID, workspace, and session can reconnect to the detached runtime; `get_state.isStreaming` reports an active provider run or continuation, `get_state.isBusy` additionally covers prompt preflight and standalone session operations, and `get_transcript` recovers persisted output. Idle detached runtimes are retained for 30 minutes by default, configurable with the `remote.detachedRuntimeTtlMs` setting. Distinct paired devices may co-attach to one runtime, and when a desktop TUI owns the conversation lease the daemon transparently relays the stream to it; `remote_terminal` reasons `lease_transferred` and `session_rekeyed_reconnect` signal expected closures the client should reconnect through immediately. Prompt-class commands during an ownership drain fail with the transient error code `lease_draining` (with `retryAfterMs`).
 
@@ -396,9 +414,9 @@ A conversation hello with `{"target":"new","sessionId":"agent-one","worktreeId":
 {"id":"logs-1","type":"response","command":"upload_device_logs","success":true,"data":{"path":".volt/device-logs/volt-device.log","byteCount":42}}
 ```
 
-`get_ui_capabilities`, `get_ui_actions`, `get_ui_action_completions`, and `invoke_ui_action` expose the v1 native UI action protocol for the narrow remote-safe action set. Remote `get_ui_capabilities` advertises `ui_action_invocation.v1` only when the host accepts invocation and `ui_action_completions.v1` when action argument completions are available. Descriptor responses omit prompt bodies, skill content, raw `sourceInfo`, extension source paths, prompt and skill file paths, skill base directories, host session files, provider metadata, and secrets. They still pass through the outbound path handling layer below before being written to the remote stream.
+`get_ui_capabilities`, `get_ui_actions`, `get_ui_action_completions`, and `invoke_ui_action` expose the native UI action protocol for the narrow remote-safe action set. Remote `get_ui_capabilities` advertises `ui_action_invocation.v1` only when the host accepts invocation and `ui_action_completions.v1` when action argument completions are available. Descriptor responses omit prompt bodies, skill content, raw `sourceInfo`, extension source paths, prompt and skill file paths, skill base directories, host session files, provider metadata, and secrets. They still pass through the outbound path handling layer below before being written to the remote stream.
 
-Remote `get_ui_action_completions` and `invoke_ui_action` are allowlist-based. Every `invoke_ui_action` command requires a trimmed, non-empty string correlation `id` of at most 256 UTF-8 bytes; every success or command-level failure response produced for it echoes that exact id through the filter, grant, daemon-admission, identity, and runtime-dispatch layers, although transport failure can prevent delivery. A known invocation payload with a missing, non-string, empty, whitespace-padded, or overbound id receives an uncorrelated JSONL failure with no `id` and `command:"invalid"`; no layer emits an id-less or unusably correlated response tagged `invoke_ui_action`. V1 forwards exact reviewed built-in ids `session.new`, `run.cancel`, `thinking.fast_mode`, `review.uncommitted`, `review.branch`, `review.pr`, and `review.commit`, plus projected prompt-template and skill ids. `review.branch`'s `base` argument advertises the `gitBranches` completion source; its completion responses contain workspace branch names only and pass through the same outbound redaction layer as other descriptor surfaces. Extension commands are denied by default and are discovered or invoked remotely only when their registration explicitly sets `remoteSafe: true`; the same opt-in is rechecked for direct RPC prompts containing an extension slash command. The host still resolves the current action catalog, rechecks action availability and remote safety, validates arguments, and applies streaming policy at invocation time; review descriptors advertise `requiresConfirmation` and clients confirm before invoking. Local-only built-ins such as `context.compact` and `session.rename`, deferred `review.tools`, stale action ids, malformed action ids, near-prefix action ids, and unreviewed action id prefixes receive a normal JSONL `response` with `success:false` and are not forwarded to the local Volt RPC process.
+Remote `get_ui_action_completions` and `invoke_ui_action` are allowlist-based. Every `invoke_ui_action` command requires a trimmed, non-empty string correlation `id` of at most 256 UTF-8 bytes; every success or command-level failure response produced for it echoes that exact id through the filter, grant, daemon-admission, identity, and runtime-dispatch layers, although transport failure can prevent delivery. A known invocation payload with a missing, non-string, empty, whitespace-padded, or overbound id receives an uncorrelated JSONL failure with no `id` and `command:"invalid"`; no layer emits an id-less or unusably correlated response tagged `invoke_ui_action`. V2 forwards exact reviewed built-in ids `session.new`, `run.cancel`, `thinking.fast_mode`, `review.uncommitted`, `review.branch`, `review.pr`, and `review.commit`, plus projected prompt-template and skill ids. `review.branch`'s `base` argument advertises the `gitBranches` completion source; its completion responses contain workspace branch names only and pass through the same outbound redaction layer as other descriptor surfaces. Extension commands are denied by default and are discovered or invoked remotely only when their registration explicitly sets `remoteSafe: true`; the same opt-in is rechecked for direct RPC prompts containing an extension slash command. The host still resolves the current action catalog, rechecks action availability and remote safety, validates arguments, and applies streaming policy at invocation time; review descriptors advertise `requiresConfirmation` and clients confirm before invoking. Local-only built-ins such as `context.compact` and `session.rename`, deferred `review.tools`, stale action ids, malformed action ids, near-prefix action ids, and unreviewed action id prefixes receive a normal JSONL `response` with `success:false` and are not forwarded to the local Volt RPC process.
 
 Remote clients should use `get_ui_actions` rather than `get_commands` to build native Actions pages and command palettes. `primary` descriptors are the host-curated card/button/toggle surface. `palette` descriptors are searchable compatibility actions for extension commands, prompt templates, and skills. Slash aliases in descriptors are display hints and compatibility metadata; action ids are the invocation contract.
 
@@ -420,7 +438,7 @@ Direct model and thinking RPC commands `get_available_models`, `set_model`, and 
 
 First-class extension-provided native cards, persisted chat/global Fast mode defaults, profile switching, scoped-model editing, package management, provider login/logout, and project settings mutation are deferred. They require separate host-owned policy, storage, descriptor, and allowlist work before they can be exposed over Iroh.
 
-The preview RPC surface intentionally stays narrow. It excludes local tools such as `bash`, `edit`, and `write`; those tools can only be used through the normal model/tool flow and host-side permission policy. It also excludes read-only local RPC commands such as `get_messages`, `get_commands`, and `get_last_assistant_text` for v1 preview.
+The preview RPC surface intentionally stays narrow. It excludes local tools such as `bash`, `edit`, and `write`; those tools can only be used through the normal model/tool flow and host-side permission policy. It also excludes read-only local RPC commands such as `get_messages`, `get_commands`, and `get_last_assistant_text` for the remote preview.
 
 The path-based `switch_session` command remains blocked remotely, and mobile conversation streams also reject direct `switch_session_by_id`; clients select another session by opening a new `conversation.target:"session"` stream. `get_transcript` is the remote-safe transcript read: it returns only the bound session's projected user, assistant, tool-summary, and compaction-summary items, ordered oldest-to-newest, with server-bounded page sizes. Host session file paths, raw `get_messages` payloads, thinking blocks, raw tool output, full file contents, provider payloads, and extension-private custom data are not returned. Transcript path and text fields still pass through the outbound redaction layer below.
 
@@ -448,4 +466,4 @@ Before host RPC output is sent to the remote stream, Volt normalizes remote-mean
 - Path handling applies to responses, extension UI requests, assistant content, tool-call arguments, and plain-text fallback lines.
 - Opaque model/provider data such as image base64 payloads and signature fields are preserved, while adjacent text and structured arguments are still processed as above.
 
-The remaining dedicated placeholders are part of the v1 compatibility surface. Clients must display them as opaque strings and must not assume that a redacted path can be expanded locally.
+The remaining dedicated placeholders are part of the remote RPC compatibility surface. Clients must display them as opaque strings and must not assume that a redacted path can be expanded locally.

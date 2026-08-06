@@ -31,9 +31,10 @@ function verificationTicket(): string {
 		expiresAt: 1_800_000_000_000,
 		irohTicket: "endpoint-ticket",
 		nodeId: PAIRING_HOST_NODE_ID,
-		relayMode: "production",
-		relayUrls: ["https://relay-b.example/", "https://relay-a.example:8443"],
-		relayAuthToken: "relay-auth-must-not-render",
+		relay: {
+			kind: "custom-uncredentialed",
+			origins: ["https://relay-a.example:8443", "https://relay-b.example"],
+		},
 		secret: "pairing-secret-must-not-render",
 		workspace: "volt",
 	});

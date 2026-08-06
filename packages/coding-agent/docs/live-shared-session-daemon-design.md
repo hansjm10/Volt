@@ -4,6 +4,7 @@
 - Workspaces: `Volt/packages/coding-agent` (primary), `volt-app` (iOS deltas, section 10)
 - Supersedes: the host-process model described in `docs/iroh-remote-access-design.md` (that doc gets a superseded banner; see M10)
 - Amended by: [Workspace Authority Generations and Retirement](workspace-authority-lifecycle-design.md), which makes workspace generation part of every remote ownership identity and defines the mutation retirement barrier.
+- Amended by: [Iroh relay enrollment design](iroh-relay-enrollment-design.md), which replaces v1/static relay credentials with strict v2 app-assisted endpoint enrollment while leaving desktop RPC authorization and conversation leases separate.
 - Breaking changes: allowed and taken freely (pre-alpha, zero users) EXCEPT the Pi extension API contract in `src/core/extensions/types.ts` (`ExtensionContext`, `ExtensionAPI`, `ExtensionUIContext`), which MUST remain source-compatible.
 
 All file paths in this document are relative to `Volt/packages/coding-agent/` unless prefixed with `volt-app/` or otherwise absolute. Line numbers reference the tree at design time and are anchors, not contracts; re-locate by symbol name when they drift.
@@ -906,6 +907,8 @@ The app keeps advertising BOTH `multi_streams.v1` and `conversation_streams.v1` 
 6. **Audit** (§3.10) covers lease/relay/daemon lifecycle so post-hoc "what did the phone do while I was away" review is possible (`volt daemon logs` + `audit.jsonl`).
 7. **Frame cap** (8 MiB) bounds control-plane memory; relay pipes are unframed and bounded by stream backpressure.
 8. **No new network listeners.** The daemon listens only on the unix socket and the existing Iroh endpoint.
+9. **Relay enrollment is not desktop authorization.** The managed broker grant allows only its exact phone/desktop endpoint pair to register with official relay origins. It cannot authorize a handshake, workspace, conversation lease, RPC, or tool. Tickets never carry the fixed broker URL, App Check material, a durable pair secret, or a relay infrastructure bearer.
+10. **Managed relay failure preserves local transport.** Broker, App Check, signature, Firestore, callback-authentication, and origin failures deny official relay registration while direct/LAN dialing stays available. Pair grants expire after 30 days, renew with seven days remaining, and are durably revoked on Forget/reset. Stock relay revocation takes effect on the next registration and cannot interrupt existing flows or meter endpoint bytes.
 
 ---
 

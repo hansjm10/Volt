@@ -9,6 +9,7 @@ import { decodeIrohRemoteTicketPayload } from "../src/core/remote/iroh/ticket.ts
 import type { IrohBiStreamLike } from "../src/core/rpc/iroh-transport.ts";
 import { createDaemonClient, type DaemonClient } from "../src/daemon/control-client.ts";
 import type { ControlEvent } from "../src/daemon/control-protocol.ts";
+import type { IrohEnrollmentBroker } from "../src/daemon/iroh-enrollment-broker.ts";
 import {
 	formatIrohLoadError,
 	type IrohConnectionLike,
@@ -92,6 +93,7 @@ function withStalledClose(endpoint: IrohEndpointLike): IrohEndpointLike {
 		addr: () => endpoint.addr(),
 		online: () => endpoint.online(),
 		acceptNext: () => endpoint.acceptNext(),
+		insertRelay: (config) => endpoint.insertRelay(config),
 		secretKey: () => endpoint.secretKey(),
 		async close() {
 			// Begin the real native close so live transports retire, then reproduce
@@ -115,6 +117,7 @@ function withStalledOnline(
 			await onlineGate;
 		},
 		acceptNext: () => endpoint.acceptNext(),
+		insertRelay: (config) => endpoint.insertRelay(config),
 		secretKey: () => endpoint.secretKey(),
 		close: () => endpoint.close(),
 	};
@@ -132,6 +135,7 @@ function withInjectedIncomings(endpoint: IrohEndpointLike, incomings: readonly I
 			}
 			return endpoint.acceptNext();
 		},
+		insertRelay: (config) => endpoint.insertRelay(config),
 		secretKey: () => endpoint.secretKey(),
 		close: () => endpoint.close(),
 	};
@@ -157,6 +161,7 @@ function withDeferredIncoming(
 			}
 			return endpoint.acceptNext();
 		},
+		insertRelay: (config) => endpoint.insertRelay(config),
 		secretKey: () => endpoint.secretKey(),
 		close: () => endpoint.close(),
 	};
@@ -241,6 +246,7 @@ describe("relay config resolution", () => {
 		expect(resolveIrohRelayConfig({}, {})).toEqual({
 			relayMode: "production",
 			relayUrls: VOLT_PRODUCTION_RELAY_URLS,
+			relay: { kind: "volt-managed", origins: VOLT_PRODUCTION_RELAY_URLS },
 		});
 	});
 
@@ -250,6 +256,10 @@ describe("relay config resolution", () => {
 		).toEqual({
 			relayMode: "production",
 			relayUrls: ["https://r1.example.com", "https://r2.example.com"],
+			relay: {
+				kind: "custom-uncredentialed",
+				origins: ["https://r1.example.com", "https://r2.example.com"],
+			},
 		});
 	});
 
@@ -257,10 +267,12 @@ describe("relay config resolution", () => {
 		expect(resolveIrohRelayConfig({}, { VOLT_IROH_RELAY_MODE: "development" })).toEqual({
 			relayMode: "development",
 			relayUrls: [],
+			relay: { kind: "n0-public" },
 		});
 		expect(resolveIrohRelayConfig({}, { VOLT_IROH_RELAY_MODE: "disabled" })).toEqual({
 			relayMode: "disabled",
 			relayUrls: [],
+			relay: { kind: "disabled" },
 		});
 	});
 
@@ -270,13 +282,17 @@ describe("relay config resolution", () => {
 				{ relayMode: "disabled" },
 				{ VOLT_IROH_RELAY_MODE: "development", VOLT_IROH_RELAY_URLS: "https://ignored.example.com" },
 			),
-		).toEqual({ relayMode: "disabled", relayUrls: ["https://ignored.example.com"] });
+		).toEqual({ relayMode: "disabled", relayUrls: [], relay: { kind: "disabled" } });
 		expect(
 			resolveIrohRelayConfig(
 				{ relayUrls: ["https://config.example.com"] },
 				{ VOLT_IROH_RELAY_URLS: "https://env.example.com" },
 			),
-		).toEqual({ relayMode: "production", relayUrls: ["https://config.example.com"] });
+		).toEqual({
+			relayMode: "production",
+			relayUrls: ["https://config.example.com"],
+			relay: { kind: "custom-uncredentialed", origins: ["https://config.example.com"] },
+		});
 	});
 
 	it("warns on an invalid VOLT_IROH_RELAY_MODE and falls back to the default", () => {
@@ -1019,6 +1035,224 @@ describe.skipIf(!nativeAvailable)("voltd iroh startup ownership", () => {
 					.poll(() => readFileSync(logPath, "utf8").includes("iroh service stopped"), { timeout: 5_000 })
 					.toBe(true);
 			}
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+});
+
+describe.skipIf(!nativeAvailable)("voltd managed enrollment endpoint binding", () => {
+	it("durably retries broker claim cancellation after restart", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-cancel-"));
+		const claimResult = {
+			status: "pending" as const,
+			expiresAtEpochSeconds: Math.floor(Date.now() / 1_000) + 600,
+			relayOrigins: VOLT_PRODUCTION_RELAY_URLS,
+		};
+		const failingBroker: IrohEnrollmentBroker = {
+			async createClaim() {
+				return claimResult;
+			},
+			async getClaimStatus() {
+				return { status: "pending" };
+			},
+			async cancelClaim() {
+				throw new Error("broker offline");
+			},
+		};
+		let daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			createIrohDaemonService(
+				{ relayMode: "production" },
+				{
+					createEnrollmentBroker: () => failingBroker,
+					enrollmentPollIntervalMs: 60_000,
+				},
+			),
+		]);
+		let control: DaemonClient | undefined;
+		try {
+			let status: DaemonProbeResult = await probeDaemon(agentDir);
+			for (let attempt = 0; !status.healthy && attempt < 100; attempt++) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				status = await probeDaemon(agentDir);
+			}
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			const pairStarted = await control.request({ type: "pair_request" });
+			expect(pairStarted.type).toBe("pair_started");
+			if (pairStarted.type !== "pair_started") throw new Error("pair request did not start");
+			expect(await control.request({ type: "pair_cancel", requestId: pairStarted.requestId })).toMatchObject({
+				type: "ok",
+			});
+			await control.request({ type: "shutdown" });
+			await control.close();
+			control = undefined;
+			await expect(daemon).resolves.toBe(0);
+
+			const statePath = getDaemonPaths(agentDir).statePath;
+			const persisted = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+			expect(persisted.pendingEnrollmentCancellations).toHaveLength(1);
+
+			const recoveringBroker: IrohEnrollmentBroker = {
+				...failingBroker,
+				async cancelClaim() {
+					return { status: "cancelled" };
+				},
+			};
+			daemon = runVoltDaemon({ agentDir, foreground: false }, [
+				createIrohDaemonService({ relayMode: "production" }, { createEnrollmentBroker: () => recoveringBroker }),
+			]);
+			status = await probeDaemon(agentDir);
+			for (let attempt = 0; !status.healthy && attempt < 100; attempt++) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				status = await probeDaemon(agentDir);
+			}
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			await expect
+				.poll(() => {
+					const recovered = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+					return Array.isArray(recovered.pendingEnrollmentCancellations)
+						? recovered.pendingEnrollmentCancellations.length
+						: -1;
+				})
+				.toBe(0);
+			await control.request({ type: "shutdown" });
+			await control.close();
+			control = undefined;
+			await expect(daemon).resolves.toBe(0);
+		} finally {
+			await control?.request({ type: "shutdown" }).catch(() => {});
+			await control?.close().catch(() => {});
+			await daemon.catch(() => {});
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("revokes a paired client when broker approval names another endpoint", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-binding-"));
+		const workspaceDir = join(agentDir, "ws");
+		mkdirSync(workspaceDir, { recursive: true });
+		const events: ControlEvent[] = [];
+		const mismatchedClientEndpointId = "0".repeat(64);
+		const broker: IrohEnrollmentBroker = {
+			async createClaim() {
+				return {
+					status: "pending",
+					expiresAtEpochSeconds: Math.floor(Date.now() / 1_000) + 600,
+					relayOrigins: VOLT_PRODUCTION_RELAY_URLS,
+				};
+			},
+			async getClaimStatus() {
+				return {
+					status: "approved",
+					clientEndpointId: mismatchedClientEndpointId,
+					grantExpiresAtEpochSeconds: Math.floor(Date.now() / 1_000) + 2_592_000,
+				};
+			},
+			async cancelClaim() {
+				return { status: "cancelled" };
+			},
+		};
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			createIrohDaemonService(
+				{ relayMode: "production" },
+				{
+					createEnrollmentBroker: () => broker,
+					enrollmentPollIntervalMs: 10,
+				},
+			),
+		]);
+		let control: DaemonClient | undefined;
+		let phone: PhoneEndpoint | undefined;
+		try {
+			let status: DaemonProbeResult = await probeDaemon(agentDir);
+			for (let attempt = 0; !status.healthy && attempt < 100; attempt++) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				status = await probeDaemon(agentDir);
+			}
+			expect(status.healthy).toBe(true);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+				onEvent: (event) => events.push(event),
+			});
+			expect(await control.request({ type: "workspace_register", name: "ws", path: workspaceDir })).toMatchObject({
+				type: "ok",
+			});
+			expect(await control.request({ type: "pair_request", workspaceName: "ws" })).toMatchObject({
+				type: "pair_started",
+			});
+			let ticket: string | undefined;
+			await expect
+				.poll(
+					() => {
+						const event = events.find(
+							(candidate) => candidate.type === "pairing_progress" && candidate.phase === "ticket",
+						);
+						ticket = event?.type === "pairing_progress" ? event.ticket : undefined;
+						return ticket !== undefined;
+					},
+					{ timeout: 15_000 },
+				)
+				.toBe(true);
+			const payload = decodeIrohRemoteTicketPayload(ticket as string);
+			const iroh = native.iroh;
+			if (!iroh) throw new Error("native iroh unavailable");
+			phone = await createPhoneEndpoint();
+			const endpointTicket = (
+				iroh.EndpointTicket as unknown as { fromString(value: string): { endpointAddr(): unknown } }
+			).fromString(payload.irohTicket);
+			const connection = await phone.connect(endpointTicket.endpointAddr(), ALPN);
+			const stream = await connection.openBi();
+			await writeJsonLine(stream, {
+				type: "volt_iroh_hello",
+				protocol: IROH_REMOTE_ALPN,
+				workspace: "ws",
+				secret: payload.secret,
+				clientLabel: "mismatched-phone",
+				workspaceDiscovery: { purpose: "list_sessions" },
+			});
+			await expect
+				.poll(
+					() =>
+						events.some(
+							(event) =>
+								event.type === "pairing_progress" &&
+								event.phase === "failed" &&
+								event.error?.includes("does not match") === true,
+						),
+					{ timeout: 10_000 },
+				)
+				.toBe(true);
+			expect(events.some((event) => event.type === "pairing_progress" && event.phase === "completed")).toBe(false);
+			const clients = await control.request({ type: "clients_list" });
+			expect(clients.type).toBe("clients_result");
+			if (clients.type === "clients_result") expect(clients.clients).toEqual([]);
+			const persisted = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as Record<
+				string,
+				unknown
+			>;
+			expect(persisted.pendingClientRevocations).toEqual([]);
+			connection.close(0n, Array.from(Buffer.from("done", "utf8")));
+			await connection.closed();
+			await control.request({ type: "shutdown" });
+		} finally {
+			await phone?.close().catch(() => {});
+			await control?.close().catch(() => {});
+			await daemon;
 			rmSync(agentDir, { recursive: true, force: true });
 		}
 	}, 30_000);

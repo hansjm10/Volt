@@ -21,6 +21,7 @@ import {
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
 
 const WORKSPACE = { name: "volt", path: "/workspace" };
+const HOST_NODE_ID = "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8";
 const CODING_GRANT = createIrohRemotePresetAccess("coding").rpcGrant;
 /** The default grant as persisted by daemons that predate the current default. */
 const LEGACY_SNAPSHOT = "read,bash,edit,write,web_search,grep,find,ls,subagent,subagent_registry,mcp";
@@ -243,6 +244,8 @@ describe("default grant tracking: pairing ticket mint", () => {
 		await engine.pair({
 			workspace: WORKSPACE.name,
 			irohTicket: "endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "one-time-secret",
 			expiresAt: 100,
 			...(options.allowTools === undefined ? {} : { allowTools: options.allowTools }),
@@ -404,6 +407,8 @@ describe("default grant tracking: cross-default upgrades", () => {
 		await engine.pair({
 			workspace: WORKSPACE.name,
 			irohTicket: "endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "one-time-secret",
 			expiresAt: 100,
 		});
@@ -436,6 +441,8 @@ describe("default grant tracking: cross-default upgrades", () => {
 		await engineA.pair({
 			workspace: WORKSPACE.name,
 			irohTicket: "endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "one-time-secret",
 			expiresAt: 100,
 		});

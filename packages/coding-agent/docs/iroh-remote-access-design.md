@@ -1,14 +1,22 @@
 # Iroh Remote Access Design
 
-> **Superseded.** The foreground `volt remote host` process described here has been replaced by the persistent background daemon (`voltd`) with conversation leases and live shared sessions. See [Live shared session daemon design](live-shared-session-daemon-design.md) for the current architecture and [Background daemon](daemon.md) for user-facing docs. The wire contract in [Iroh Remote Protocol v1](iroh-remote-protocol.md) is preserved by the daemon. This document is kept for historical context.
+> **Superseded.** The foreground `volt remote host` process and v1 ticket shape described below have been replaced by the persistent background daemon (`voltd`) and strict `volt+iroh://v2` pairing. See [Live shared session daemon design](live-shared-session-daemon-design.md), [Iroh relay enrollment design](iroh-relay-enrollment-design.md), [Iroh Remote Protocol v2](iroh-remote-protocol.md), and [Background daemon](daemon.md). The remainder of this document is historical context, not a supported deployment contract.
 
 ## Status
 
-The Iroh remote host is a supported preview for Node.js npm installs and source checkouts with optional `@number0/iroh` available for the platform. RPC mode has a transport abstraction, Iroh streams have a structurally typed RPC adapter, remote command filtering is available, and the Iroh remote helpers cover tickets, handshakes, host identity verification, host state, authorization, workspace selection, audit logging, redaction, reconnect/session selection, revocation, active stream registration, push notification routing, and host/client engine orchestration. `volt remote host` launches a product host entrypoint in the coding-agent package and runs Volt's runtime in-process over `runIrohRemoteRpcMode()`. Integrated hosts advertise `multi_streams.v1` and `conversation_streams.v1`, bind mobile streams during handshake to one workspace/session conversation, allow multiple sessions in the same workspace, treat stream close as client detach, keep active work running on the host, and reserve explicit cancellation for the selected stream's `abort` RPC command. The iOS app uses saved-host and workspace metadata to render pinned agent tabs across verified workspaces, opens New Agent and Resume Agent by targeted conversation stream, uses short-lived workspace discovery and management streams, and recovers selected conversations without another QR scan. The preview wire contract is documented in [Iroh Remote Protocol v1](iroh-remote-protocol.md). Unsupported areas remain explicit: standalone Node SEA builds reject remote host startup because Iroh is not bundled, host process exit is not durable recovery, `volt remote status` is persisted-state-only, hidden-agent resource controls are conservative, and cross-network relay should be validated in `production` relay mode in the target environment.
+At the time of this design, the foreground Iroh remote host was a supported preview for Node.js npm installs and source checkouts with optional `@number0/iroh`. It established the transport abstraction, handshake, host identity, authorization, workspace, audit, redaction, reconnect, revocation, push, and engine foundations later moved into `voltd`. The historical `volt remote host` entrypoint and ticket examples below must not be used by current clients.
 
 ## Summary
 
 Add optional remote access that exposes Volt's existing RPC protocol over [Iroh](https://www.iroh.computer/blog/v1). The native `@number0/iroh` dependency is optional in the coding-agent package, while Volt core provides the typed transport, handshake, state, authorization, audit, redaction, reconnect, revocation, and engine helpers needed for the integrated remote mode.
+
+## Current relay-enrollment amendment
+
+Current Volt keeps desktop control and relay infrastructure as separate authorities. A short-lived one-time pairing secret plus the authenticated, pinned Iroh endpoint identities authorize desktop RPC. Official relay access instead uses a 10-minute app-assisted broker claim and a pair-scoped 30-day endpoint grant. The QR contains the independent claim ID/secret but no broker URL, App Check token, durable relay credential, or relay infrastructure bearer.
+
+The confirmed iOS app proves possession of its stable endpoint key and consumes a limited-use Firebase App Check token at the fixed broker before dialing a managed relay. The broker transactionally authorizes the exact phone/desktop endpoint pair and returns origins that must exactly match the v2 ticket. The renewal secret enters Keychain-backed saved-host authority only after host authentication succeeds. Broker failure disables only managed relay registration; direct/LAN transport remains available. Custom relay origins are explicitly uncredentialed and receive no App Check material; public n0 relays are an explicit development mode.
+
+Forget, failed adoption, supersession, and endpoint reset persist signed pair-revocation obligations before deleting local identity. Stock iroh-relay checks endpoint access at registration only, so revocation cannot interrupt an already-open registration and does not provide per-endpoint byte metering. Those limits and server-secret rotation are normative in [Iroh relay enrollment design](iroh-relay-enrollment-design.md) and [Self-hosted iroh relay](../../../docs/self-hosted-relay.md).
 
 This turns Volt into a remotely reachable local coding agent without requiring users to open ports, configure reverse proxies, or move provider credentials to a mobile client. The iOS app uses Iroh Swift support to connect to the user's host machine and render a native UI from RPC events.
 
@@ -100,7 +108,7 @@ The client process:
 
 ### Pairing ticket shape
 
-The supported preview ticket format and compatibility rules are specified in [Iroh Remote Protocol v1](iroh-remote-protocol.md). Use an opaque URL-safe payload so the format can change:
+The following v1 ticket shape is retained only as historical context. Current clients must use the strict format in [Iroh Remote Protocol v2](iroh-remote-protocol.md):
 
 ```text
 volt+iroh://v1/<base64url-json>
@@ -126,7 +134,7 @@ Saved-host reconnect records keep only non-secret discovery and identity data fr
 
 ### Stream protocol
 
-The supported preview stream handshake, strict LF framing, command allowlist, authoritative host/client identity rules, and outbound redaction guarantees are specified in [Iroh Remote Protocol v1](iroh-remote-protocol.md). After the handshake succeeds, the stream carries the same LF-delimited JSONL described in [RPC mode](rpc.md). The current host parses command envelopes only to enforce the remote command filter, track connection-level shutdown, and preserve response completion behavior. It should preserve strict LF framing and not use generic line readers that split on Unicode separators.
+The supported stream handshake, strict LF framing, command allowlist, authoritative host/client identity rules, and outbound redaction guarantees are specified in [Iroh Remote Protocol v2](iroh-remote-protocol.md). After the handshake succeeds, the stream carries the same LF-delimited JSONL described in [RPC mode](rpc.md). The current host parses command envelopes only to enforce the remote command filter, track connection-level shutdown, and preserve response completion behavior. It should preserve strict LF framing and not use generic line readers that split on Unicode separators.
 
 Failed authorization handshakes carry a stable machine-readable `outcome` next to the diagnostic `error` text. Clients should drive reconnect UX from `outcome` and use `error` for logs or secondary detail.
 
@@ -202,7 +210,7 @@ Suggested shape:
 
 The host state file also persists `hostSecretKey`, consumed pairing secret hashes, pending pairing ticket hashes plus non-secret metadata, per-client last session IDs keyed by workspace, and push relay target metadata. It does not persist raw pairing secrets or raw FCM registration tokens, but it does persist the target-scoped relay credential needed to notify a paired phone after the Iroh stream disconnects. `volt remote status` prints a secret-free persisted-state view. Preview does not store relay mode in the persisted state; the running host owns the live relay mode and tickets include a relay hint.
 
-The current daemon (`voltd`) defaults to relay mode `"production"` so saved-host reconnects can survive daemon restarts. Set `VOLT_IROH_RELAY_MODE` to `disabled`, `development`, or `production` before daemon startup to select another mode. `volt remote pair` creates tickets with the running daemon's relay mode and does not accept a relay-mode flag.
+The current daemon defaults to `production`: fixed official origins become a `volt-managed` v2 descriptor and require app-assisted endpoint enrollment. `VOLT_IROH_RELAY_MODE=development` selects the `n0-public` descriptor; `disabled` is direct/LAN only. Custom `VOLT_IROH_RELAY_URLS` become `custom-uncredentialed` origins. `volt remote pair` creates a strict ticket from the running daemon and does not accept a relay-mode flag.
 
 ## CLI UX
 

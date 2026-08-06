@@ -18,6 +18,8 @@ import {
 	type IrohRemoteGrantedRevokedClient,
 	type IrohRemoteHostState,
 	type IrohRemotePairingSecretTombstone,
+	type IrohRemotePendingClientRevocation,
+	type IrohRemotePendingEnrollmentCancellation,
 	type IrohRemotePendingPairingTicket,
 	type IrohRemotePushTarget,
 	type IrohRemoteRevokedClient,
@@ -398,6 +400,70 @@ export class IrohRemoteHostStateManager {
 			const remaining = pending.filter((entry) => entry.secretHash !== secretHash);
 			if (remaining.length === pending.length) return false;
 			state.pendingPairingTickets = remaining;
+			await this.saveUnlocked(state);
+			return true;
+		});
+	}
+
+	async addPendingClientRevocation(revocation: IrohRemotePendingClientRevocation): Promise<void> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const pending = state.pendingClientRevocations ?? [];
+			if (pending.some((entry) => entry.nodeId === revocation.nodeId)) return;
+			if (pending.length >= 32) {
+				throw new Error("pending Iroh client revocation limit exceeded");
+			}
+			state.pendingClientRevocations = [...pending, { ...revocation }];
+			await this.saveUnlocked(state);
+		});
+	}
+
+	async listPendingClientRevocations(): Promise<IrohRemotePendingClientRevocation[]> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			return (state.pendingClientRevocations ?? []).map((revocation) => ({ ...revocation }));
+		});
+	}
+
+	async removePendingClientRevocation(nodeId: string): Promise<boolean> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const pending = state.pendingClientRevocations ?? [];
+			const remaining = pending.filter((entry) => entry.nodeId !== nodeId);
+			if (remaining.length === pending.length) return false;
+			state.pendingClientRevocations = remaining;
+			await this.saveUnlocked(state);
+			return true;
+		});
+	}
+
+	async addPendingEnrollmentCancellation(cancellation: IrohRemotePendingEnrollmentCancellation): Promise<void> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const pending = state.pendingEnrollmentCancellations ?? [];
+			if (pending.some((entry) => entry.claimId === cancellation.claimId)) return;
+			if (pending.length >= 32) {
+				throw new Error("pending Iroh enrollment cancellation limit exceeded");
+			}
+			state.pendingEnrollmentCancellations = [...pending, { ...cancellation }];
+			await this.saveUnlocked(state);
+		});
+	}
+
+	async listPendingEnrollmentCancellations(): Promise<IrohRemotePendingEnrollmentCancellation[]> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			return (state.pendingEnrollmentCancellations ?? []).map((cancellation) => ({ ...cancellation }));
+		});
+	}
+
+	async removePendingEnrollmentCancellation(claimId: string): Promise<boolean> {
+		return this.runExclusive(async () => {
+			const state = await this.loadUnlocked();
+			const pending = state.pendingEnrollmentCancellations ?? [];
+			const remaining = pending.filter((entry) => entry.claimId !== claimId);
+			if (remaining.length === pending.length) return false;
+			state.pendingEnrollmentCancellations = remaining;
 			await this.saveUnlocked(state);
 			return true;
 		});
@@ -853,6 +919,9 @@ function isAuthorizationCurrentInState(
 	state: IrohRemoteHostState,
 	authorization: IrohRemoteClientAuthorizationSuccess,
 ): boolean {
+	if ((state.pendingClientRevocations ?? []).some((entry) => entry.nodeId === authorization.client.nodeId)) {
+		return false;
+	}
 	const client = state.clients.find((entry) => entry.nodeId === authorization.client.nodeId);
 	const workspace = state.workspaces.find((entry) => entry.name === authorization.workspace.name);
 	const workspaceGeneration = (state.workspaceGenerations ?? []).find(
@@ -917,6 +986,12 @@ function cloneHostState(state: IrohRemoteHostState): IrohRemoteHostState {
 		clients: state.clients.map((client) => cloneClient(client)),
 		revokedClients: (state.revokedClients ?? []).map((client) => cloneRevokedClient(client)),
 		pendingPairingTickets: (state.pendingPairingTickets ?? []).map((ticket) => clonePendingPairingTicket(ticket)),
+		pendingEnrollmentCancellations: (state.pendingEnrollmentCancellations ?? []).map((cancellation) => ({
+			...cancellation,
+		})),
+		pendingClientRevocations: (state.pendingClientRevocations ?? []).map((revocation) => ({
+			...revocation,
+		})),
 	};
 }
 

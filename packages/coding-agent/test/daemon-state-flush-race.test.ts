@@ -54,11 +54,11 @@ describe("VoltdStateStore flush serialization", () => {
 		});
 		await store.load();
 
-		store.updateSettings({ relayAuthToken: "older-secret" });
+		store.updateSettings({ themeName: "older-theme" });
 		const olderFlush = store.flush();
 		await firstWriteStarted.promise;
 
-		store.updateSettings({ relayAuthToken: "newer-secret" });
+		store.updateSettings({ themeName: "newer-theme" });
 		const newerFlush = store.flush();
 		await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -69,6 +69,6 @@ describe("VoltdStateStore flush serialization", () => {
 
 		expect(writeCalls).toBe(2);
 		expect(maximumActiveWriters).toBe(1);
-		expect(parseVoltdState(JSON.parse(persistedContent)).settings.relayAuthToken).toBe("newer-secret");
+		expect(parseVoltdState(JSON.parse(persistedContent)).settings.themeName).toBe("newer-theme");
 	});
 });

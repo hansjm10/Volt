@@ -2,6 +2,11 @@ import { readFile } from "node:fs/promises";
 import { writeDurableAtomicFile } from "../../../utils/durable-atomic-write.ts";
 import { cloneIrohRemoteRpcGrant, type IrohRemoteRpcGrant, parseIrohRemoteRpcGrant } from "./access-grant.ts";
 import {
+	expectIrohRemoteEndpointId,
+	type IrohRemoteEnrollmentClaim,
+	parseIrohRemoteEnrollmentClaim,
+} from "./enrollment.ts";
+import {
 	canonicalizePersistedIrohRemoteAllowTools,
 	isIrohRemoteWorkingDirectory,
 	isIrohRemoteWorktreeId,
@@ -96,6 +101,17 @@ export type IrohRemoteGrantedPendingPairingTicket = IrohRemotePendingPairingTick
 	rpcGrant: IrohRemoteRpcGrant;
 };
 
+/** A broker claim whose cancellation must survive daemon restart. */
+export interface IrohRemotePendingEnrollmentCancellation extends IrohRemoteEnrollmentClaim {
+	createdAt: number;
+}
+
+/** A paired client whose revocation must survive daemon restart. */
+export interface IrohRemotePendingClientRevocation {
+	nodeId: string;
+	createdAt: number;
+}
+
 export type IrohRemotePairingSecretTombstoneOutcome = "pairing_secret_consumed" | "pairing_secret_expired";
 
 export interface IrohRemotePairingSecretTombstone {
@@ -121,6 +137,8 @@ export interface IrohRemoteHostState {
 	clients: IrohRemoteClient[];
 	revokedClients?: IrohRemoteRevokedClient[];
 	pendingPairingTickets?: IrohRemotePendingPairingTicket[];
+	pendingEnrollmentCancellations?: IrohRemotePendingEnrollmentCancellation[];
+	pendingClientRevocations?: IrohRemotePendingClientRevocation[];
 }
 
 export function createEmptyIrohRemoteHostState(): IrohRemoteHostState {
@@ -134,6 +152,8 @@ export function createEmptyIrohRemoteHostState(): IrohRemoteHostState {
 		clients: [],
 		revokedClients: [],
 		pendingPairingTickets: [],
+		pendingEnrollmentCancellations: [],
+		pendingClientRevocations: [],
 	};
 }
 
@@ -181,6 +201,8 @@ export function parseIrohRemoteHostState(value: unknown, options?: IrohRemoteSta
 		pendingPairingTickets: parseOptionalArray(state.pendingPairingTickets, "pendingPairingTickets", (entry) =>
 			parseIrohRemotePendingPairingTicket(entry, options),
 		),
+		pendingEnrollmentCancellations: parsePendingEnrollmentCancellations(state.pendingEnrollmentCancellations),
+		pendingClientRevocations: parsePendingClientRevocations(state.pendingClientRevocations),
 	};
 }
 
@@ -212,6 +234,12 @@ function serializeIrohRemoteHostState(state: IrohRemoteHostState): IrohRemoteHos
 		pendingPairingTickets: (state.pendingPairingTickets ?? []).map((ticket) => ({
 			...ticket,
 			...(ticket.rpcGrant === undefined ? {} : { rpcGrant: cloneIrohRemoteRpcGrant(ticket.rpcGrant) }),
+		})),
+		pendingEnrollmentCancellations: (state.pendingEnrollmentCancellations ?? []).map((cancellation) => ({
+			...cancellation,
+		})),
+		pendingClientRevocations: (state.pendingClientRevocations ?? []).map((revocation) => ({
+			...revocation,
 		})),
 	};
 }
@@ -421,6 +449,61 @@ export function parseIrohRemotePendingPairingTicket(
 		expiresAt: expectNumber(ticket.expiresAt, "pending pairing ticket expiresAt"),
 		createdAt: expectNumber(ticket.createdAt, "pending pairing ticket createdAt"),
 		...(labelHint === undefined ? {} : { labelHint }),
+	};
+}
+
+function parsePendingClientRevocations(value: unknown): IrohRemotePendingClientRevocation[] {
+	const revocations = parseOptionalArray(
+		value,
+		"pendingClientRevocations",
+		(entry): IrohRemotePendingClientRevocation => {
+			const revocation = expectRecord(entry, "Iroh remote pending client revocation");
+			const keys = Object.keys(revocation).sort();
+			if (keys.join(",") !== "createdAt,nodeId") {
+				throw new Error("pending client revocation contains unknown or missing fields");
+			}
+			return {
+				nodeId: expectIrohRemoteEndpointId(revocation.nodeId, "pending client revocation nodeId"),
+				createdAt: expectNumber(revocation.createdAt, "pending client revocation createdAt"),
+			};
+		},
+	);
+	if (revocations.length > 32) throw new Error("pendingClientRevocations exceeds 32 entries");
+	if (new Set(revocations.map((entry) => entry.nodeId)).size !== revocations.length) {
+		throw new Error("pendingClientRevocations contains duplicate node IDs");
+	}
+	return revocations;
+}
+
+function parsePendingEnrollmentCancellations(value: unknown): IrohRemotePendingEnrollmentCancellation[] {
+	const cancellations = parseOptionalArray(
+		value,
+		"pendingEnrollmentCancellations",
+		parseIrohRemotePendingEnrollmentCancellation,
+	);
+	if (cancellations.length > 32) {
+		throw new Error("pendingEnrollmentCancellations exceeds 32 entries");
+	}
+	if (new Set(cancellations.map((entry) => entry.claimId)).size !== cancellations.length) {
+		throw new Error("pendingEnrollmentCancellations contains duplicate claim IDs");
+	}
+	return cancellations;
+}
+
+export function parseIrohRemotePendingEnrollmentCancellation(value: unknown): IrohRemotePendingEnrollmentCancellation {
+	const cancellation = expectRecord(value, "Iroh remote pending enrollment cancellation");
+	const keys = Object.keys(cancellation).sort();
+	if (keys.join(",") !== "claimId,claimSecret,createdAt,version") {
+		throw new Error("pending enrollment cancellation contains unknown or missing fields");
+	}
+	const claim = parseIrohRemoteEnrollmentClaim({
+		version: cancellation.version,
+		claimId: cancellation.claimId,
+		claimSecret: cancellation.claimSecret,
+	});
+	return {
+		...claim,
+		createdAt: expectNumber(cancellation.createdAt, "pending enrollment cancellation createdAt"),
 	};
 }
 

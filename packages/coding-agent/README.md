@@ -581,13 +581,14 @@ Security defaults and limitations:
 
 - The default remote tool grant enables built-in `read,bash,edit,write,image_gen,web_search,web_fetch,grep,find,ls,inspect,lsp,subagent,subagent_registry,mcp` plus active tools registered by loaded extensions. The `coding` and `full` remote RPC presets use this default, so `image_gen` is enabled automatically when an OpenAI Codex model is selected. A custom `remote.allowTools` list restricts daemon-owned headless runtimes; when a desktop TUI owns the conversation, phone prompts use the TUI session's full local tool set.
 - Granting `bash`, `edit`, `write`, or `image_gen` can modify the host; `image_gen` can read and upload local reference images and write generated PNG files. Extension tools run code installed on the host and may do the same. Pair only devices you control.
-- Pairing tickets are short-lived, one-time credentials. `volt remote pair` talks to the running daemon; it does not generate offline tickets from persisted state.
+- Pairing tickets are strict `volt+iroh://v2`, short-lived, one-time credentials. Managed QR data contains separate pairing and enrollment claims but no broker URL or durable relay bearer. `volt remote pair` talks to the running daemon; it does not generate offline tickets from persisted state.
+- Official relay enrollment is endpoint-bound and separate from desktop RPC authorization. The app stores a 30-day pair grant only after the host handshake succeeds; managed broker failure leaves direct/LAN connectivity available.
 - Remote workspaces are selected by saved name, not arbitrary client-provided paths.
 - Remote sessions do not bypass project trust. Saved workspace trust is honored; otherwise project resources run untrusted.
 - Daemon files live under `~/.volt/agent/daemon/` (`state.json`, `audit.jsonl`, `voltd.log`); legacy `remote/iroh-host.json` state migrates automatically with pairings intact.
 - The daemon requires a Node.js npm package install or source checkout with optional `@number0/iroh` available for the platform. Standalone Node SEA builds reject `volt daemon` because the native Iroh adapter is intentionally not bundled.
 
-See [Background daemon](docs/daemon.md), [Iroh remote protocol v1](docs/iroh-remote-protocol.md), and [Security](docs/security.md#remote-access-over-iroh-preview).
+See [Background daemon](docs/daemon.md), [Iroh remote protocol v2](docs/iroh-remote-protocol.md), [Iroh relay enrollment design](https://github.com/volt-hq/Volt/blob/main/packages/coding-agent/docs/iroh-relay-enrollment-design.md), and [Security](docs/security.md#remote-access-over-iroh-preview).
 
 ### Print Mode Stdin
 

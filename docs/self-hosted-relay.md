@@ -1,207 +1,357 @@
 # Self-hosted iroh relay
 
-Volt uses [iroh](https://www.iroh.computer/) for the daemon ↔ phone transport.
-**Production default:** the daemon binds against the Volt relay fleet
-(`VOLT_PRODUCTION_RELAY_URLS` in `daemon/iroh-service.ts`, currently
-`iroh-relay-us-central.volt-cli.dev`) and pairing tickets carry those URLs to
-the app. The n0 public relays are development-only: opt in with
-`VOLT_IROH_RELAY_MODE=development` (the daemon logs a warning when they're in use).
+Volt uses [iroh](https://www.iroh.computer/) for daemon-to-phone transport. The
+daemon defaults to the Volt-operated relay fleet. The n0 public relays remain a
+development-only opt-in with `VOLT_IROH_RELAY_MODE=development`.
 
-This guide covers running a relay of your own — the fleet is deployed with
-`scripts/deploy-iroh-relay.sh`, which automates everything below:
+There are two distinct deployment models:
 
-```sh
-# fresh relay (DNS A record must already point at the server)
-scripts/deploy-iroh-relay.sh root@<server> relay-name.volt-cli.dev \
-  --contact you@example.com \
-  --shared-token "$(openssl rand -base64 30 | tr '+/' '-_' | tr -d '=')"
-```
+- **Volt-managed fleet:** iroh-relay asks the fixed Volt enrollment backend
+  whether an endpoint ID may register. The backend authenticates the relay with
+  a server-to-server bearer secret. Neither pairing tickets nor the App Store
+  app receive that secret.
+- **Owner-operated custom relay:** the relay is intentionally uncredentialed
+  from the app's perspective. Its owner may make it explicitly open or maintain
+  an endpoint-ID allowlist. The official app sends no App Check material or
+  durable relay credential to a custom relay.
 
-Access control is a shared bearer token (`access.shared_token`): the daemon
-presents it on its relay connections (`VOLT_IROH_RELAY_AUTH_TOKEN`, persisted
-in daemon state after first start), pairing tickets carry it to phones, and
-phones keep it in the Keychain — so new devices need **no relay-side changes**.
-An endpoint-id `--allowlist` (with `--add-allow <id>` to grow it) remains
-available as a per-device alternative; token rotation currently means
-re-pairing devices.
+`scripts/deploy-iroh-relay.sh` supports both models. Its managed mode accepts
+only Volt's exact production callback URL, preventing the relay bearer from
+being redirected to an operator-supplied origin. Use `--open` or `--allowlist`
+for a custom self-hosted relay.
 
-Multiple relays need no client-side changes beyond listing the URLs: iroh
-latency-probes every relay in the map and picks the closest as each endpoint's
-home relay, and peers on different home relays still reach each other (the
-sender dials the receiver's relay). Add a region by deploying a relay and
-appending its URL to `VOLT_PRODUCTION_RELAY_URLS` (or `VOLT_IROH_RELAY_URLS`).
+Relayed traffic is end-to-end encrypted by iroh. The relay forwards opaque
+packets between endpoint IDs; owning the relay changes infrastructure control
+and availability, not payload confidentiality.
 
-Relayed traffic is end-to-end encrypted by iroh (the relay only forwards opaque
-QUIC packets between node ids), so this is about infrastructure ownership and
-availability, not payload confidentiality.
+## Important stock-relay limitation
 
-## What you need
+In iroh-relay v1.0.3, `access.http` runs one HTTP decision when an endpoint
+registers with the relay. It is not continuous authorization:
 
-- A VPS with a public IPv4 (and ideally IPv6). 1 vCPU / 1 GB RAM is plenty for
-  development (e.g. Hetzner CX22/CAX11, a small DigitalOcean droplet, etc.).
-- A DNS name you control, e.g. `relay.example.com`.
-- Ubuntu 24.04 is assumed below; adjust for your distro.
+- revocation or grant expiry takes effect on the endpoint's next registration;
+- changing the backend decision cannot interrupt an already active relay
+  registration or its flows;
+- the callback cannot meter bytes per endpoint; and
+- a backend outage denies new registrations, but does not terminate active
+  registrations.
 
-## 1. DNS
+Active-session reauthorization and per-endpoint byte quotas require upstream
+relay support or a separately reviewed relay fork. The deployment script adds
+relay-wide process, file-descriptor, ingress, and kernel egress backstops, but
+does not claim that those are per-endpoint accounting.
 
-Create records pointing at the server, and wait for them to resolve before
-starting the relay (Let's Encrypt issuance needs them):
+## Prerequisites
 
-```
+- A dedicated Ubuntu 24.04 or current Debian VPS with public IPv4 and, ideally,
+  IPv6.
+- A DNS name such as `relay.example.com` with its A record already pointing at
+  the VPS. Add an AAAA record when IPv6 is available.
+- Root SSH access.
+- `curl`, `systemd` 247 or newer, and `nft` from the `nftables` package.
+- Provider firewall rules allowing only 80/tcp, 443/tcp, and 7824/udp in
+  addition to SSH.
+
+The deployment fails closed if it cannot install the nftables owner-based
+egress rule. It stops the relay before replacing that rule and starts the relay
+only after nftables accepts and exposes the configured counter. Do not run
+other services as the dedicated `iroh-relay` user, because the ceiling applies
+to all output owned by that UID.
+
+## DNS and ports
+
+Create the records before deployment:
+
+```text
 relay.example.com.  A     <server IPv4>
-relay.example.com.  AAAA  <server IPv6>   # if you have one
+relay.example.com.  AAAA  <server IPv6>   # optional
 ```
-
-## 2. Install iroh-relay
-
-The relay is a single static binary; n0 publishes prebuilt releases. Volt pins
-iroh 1.0, so use a 1.x relay (v1.0.2 verified against Volt's bindings):
-
-```sh
-# on the server — pick the artifact matching your arch (aarch64/x86_64, gnu/musl)
-curl -sLO https://github.com/n0-computer/iroh/releases/download/v1.0.2/iroh-relay-v1.0.2-x86_64-unknown-linux-gnu.tar.gz
-tar xzf iroh-relay-v1.0.2-x86_64-unknown-linux-gnu.tar.gz
-sudo install iroh-relay /usr/local/bin/iroh-relay
-iroh-relay --version
-```
-
-(Alternative: `cargo install iroh-relay --features server` if you prefer
-building from source.)
-
-## 3. Configure
-
-```sh
-sudo useradd --system --home /var/lib/iroh-relay --create-home iroh-relay
-sudo mkdir -p /etc/iroh-relay
-```
-
-`/etc/iroh-relay/config.toml`:
-
-```toml
-# Plain-HTTP listener: serves the ACME HTTP-01 challenge and probes.
-http_bind_addr = "[::]:80"
-
-# Lets clients learn their public address over QUIC (n0's replacement for STUN).
-enable_quic_addr_discovery = true
-
-[tls]
-https_bind_addr = "[::]:443"
-# QUIC address discovery socket (UDP). Defaults to port 7824.
-quic_bind_addr = "[::]:7824"
-hostname = "relay.example.com"
-cert_mode = "LetsEncrypt"
-contact = "you@example.com"     # Let's Encrypt account email
-prod_tls = true
-cert_dir = "/var/lib/iroh-relay/certs"
-
-# Lock the relay down to Volt clients presenting the shared bearer token.
-# NB: must be an [access] TABLE at the end of the file — a dotted
-# "access.shared_token" key after [tls] silently attaches to the tls table.
-# [access]
-# shared_token = ["<token>"]
-#
-# Alternative: per-device endpoint-id allowlist
-# (voltd logs its id as hostNodeId; anything not listed is rejected).
-# [access]
-# allowlist = ["<daemon endpoint id>", "<phone endpoint id>"]
-```
-
-Metrics are served on port 9090 by default; leave it firewalled and query it
-from the box (`curl 127.0.0.1:9090/metrics`) or set `enable_metrics = false`.
-
-## 4. systemd unit
-
-`/etc/systemd/system/iroh-relay.service`:
-
-```ini
-[Unit]
-Description=iroh relay
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=iroh-relay
-ExecStart=/usr/local/bin/iroh-relay --config-path /etc/iroh-relay/config.toml
-# Binding ports 80/443 as a non-root user:
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now iroh-relay
-journalctl -u iroh-relay -f    # watch the Let's Encrypt issuance on first start
-```
-
-## 5. Firewall
 
 Open exactly:
 
-| Port | Proto | Purpose |
-| ---- | ----- | ------- |
-| 80   | tcp   | ACME HTTP-01 challenge, HTTP probes |
-| 443  | tcp   | Relay traffic (HTTPS + websocket upgrade) |
-| 7824 | udp   | QUIC address discovery |
+| Port | Protocol | Purpose |
+| --- | --- | --- |
+| 80 | TCP | Iroh captive-portal probe service |
+| 443 | TCP | Relay HTTPS, websocket traffic, TLS, and `/healthz` |
+| 7824 | UDP | QUIC address discovery |
+
+Metrics bind only to `127.0.0.1:9090` in the generated configuration.
+
+## Install iroh-relay
+
+Volt requires iroh-relay v1.0.3 or newer for `access.http`; the deployment
+script pins v1.0.3 by default. For a manual x86-64 installation:
 
 ```sh
-sudo ufw allow 80/tcp && sudo ufw allow 443/tcp && sudo ufw allow 7824/udp
+curl -sSLO https://github.com/n0-computer/iroh/releases/download/v1.0.3/iroh-relay-v1.0.3-x86_64-unknown-linux-gnu.tar.gz
+printf '%s  %s\n' \
+  ad7de882c4825a851b38869a3f1622b674cb65f344304e432f862ddf72d6b39a \
+  iroh-relay-v1.0.3-x86_64-unknown-linux-gnu.tar.gz | sha256sum --check --strict -
+tar xzf iroh-relay-v1.0.3-x86_64-unknown-linux-gnu.tar.gz
+sudo install -m 0755 iroh-relay /usr/local/bin/iroh-relay
+iroh-relay --version
 ```
 
-## 6. Verify
+Use the matching `aarch64-unknown-linux-gnu` artifact on ARM; its reviewed
+v1.0.3 SHA-256 is
+`278010f9757e70e077ded3b1d2893b9b1f66cce6076603b7f0eebc175cd116f1`.
+The deployment script rejects versions/architectures without a pinned digest.
+
+## Volt-managed enrollment backend
+
+The enrollment backend exposes `POST /v1/relay-access`. Stock iroh-relay sends:
+
+- `Authorization: Bearer <server-to-server secret>`; and
+- `X-Iroh-NodeId: <64 lowercase-hex endpoint ID>`.
+
+Only an exact `200 text/plain` response body of `true` authorizes registration.
+Every other body, status, timeout, or network error denies it. The backend
+accepts its configured **current** or **next** relay secret using timing-safe
+comparison.
+
+Configure the backend's current secret before starting a relay. Then provision
+the same raw value as a single line in a root-owned file on each relay host. A
+safe interactive transfer that does not place the value in command arguments
+or output is:
 
 ```sh
-curl -sSf https://relay.example.com/ | head -1   # serves the relay index page
+read -rsp 'Current relay/backend secret: ' RELAY_BACKEND_SECRET; echo
+printf '%s\n' "$RELAY_BACKEND_SECRET" | ssh root@relay.example.com '
+  set -eu
+  umask 077
+  install -d -o root -g root -m 0755 /etc/iroh-relay
+  tmp=$(mktemp /etc/iroh-relay/http-bearer-token.XXXXXX)
+  trap '\''rm -f "$tmp"'\'' EXIT
+  cat > "$tmp"
+  chown root:root "$tmp"
+  chmod 0400 "$tmp"
+  mv "$tmp" /etc/iroh-relay/http-bearer-token
+'
+unset RELAY_BACKEND_SECRET
 ```
 
-A TLS error here usually means DNS hadn't propagated when the service started;
-restart the unit after DNS resolves.
+Use a 32-512 character printable, non-space secret from the same secret manager
+used to configure the backend. Do not put it in:
 
-## 7. Point Volt at it
+- `--access-http-url` or another command-line argument;
+- `/etc/iroh-relay/config.toml`;
+- an `ExecStart=` argument;
+- a pairing ticket, app configuration, or daemon environment; or
+- shell tracing, deployment logs, or monitoring labels.
 
-The Volt production relays are the default — a daemon started with no relay
-configuration binds against `VOLT_PRODUCTION_RELAY_URLS` in `production` mode. To
-use a different fleet, set the URLs explicitly (comma-separate for more than
-one):
+The script validates that the source is a non-symlink regular file owned by
+root with mode 0400 or 0600. systemd `LoadCredential=` reads it before changing
+to the `iroh-relay` user. A root-owned wrapper exports the value to the relay as
+`IROH_RELAY_HTTP_BEARER_TOKEN`, which v1.0.3 consumes. The source secret is not
+present in relay TOML or process arguments.
+
+Deploy after the backend and file are ready:
 
 ```sh
-VOLT_IROH_RELAY_URLS=https://relay.example.com \
-VOLT_IROH_RELAY_AUTH_TOKEN=<shared token> volt daemon run
+scripts/deploy-iroh-relay.sh root@relay.example.com relay.example.com \
+  --contact you@example.com \
+  --access-http-url https://us-central1-volt-3fae7.cloudfunctions.net/irohEnrollment/v1/relay-access
 ```
 
-Both values persist in daemon state after the first start, so later bare
-restarts keep the same fleet and keep authenticating (the token, at least —
-export the URLs or rely on the built-in default).
+Use `--access-http-token-file <remote-absolute-path>` only when the root-owned
+file is not at `/etc/iroh-relay/http-bearer-token`.
 
-Every pairing ticket the daemon mints carries the active relay URLs and the
-auth token, so paired apps bind against the same fleet and authenticate
-automatically; the phone stores the token in its Keychain and sanitized
-reconnect tickets never contain it. The startup log line
-`iroh endpoint online` shows `relayMode: "production"` and the URLs.
+The relevant generated TOML is:
 
-Relay-fleet changes propagate to paired phones automatically: the handshake
-metadata carries the current `relayUrls` on every connection, the app persists
-them into its saved-host record, and new relays are inserted into the live
-endpoint on the fly. Keep the old relay serving until all devices have
-reconnected at least once, then retire it (removed relays drop out of a
-phone's endpoint on its next cold start). Re-pairing is only needed for hosts
-saved before relay support existed or when the host's relay *mode* changes.
+```toml
+http_bind_addr = "[::]:80"
+enable_quic_addr_discovery = true
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9090"
+key_cache_capacity = 16384
 
-Config precedence: explicit `createIrohDaemonService({ relayMode, relayUrls })`
-beats `VOLT_IROH_RELAY_MODE` / `VOLT_IROH_RELAY_URLS`, which beat the built-in
-production default. `VOLT_IROH_RELAY_MODE=development` selects the n0 public relays
-(development only); `disabled` turns relaying off entirely.
+[limits.client.rx]
+bytes_per_second = 16777216
+max_burst_bytes = 33554432
 
-## Scope note: discovery is separate
+[tls]
+https_bind_addr = "[::]:443"
+quic_bind_addr = "[::]:7824"
+hostname = "relay.example.com"
+cert_mode = "LetsEncrypt"
+prod_tls = true
+cert_dir = "/var/lib/iroh-relay/certs"
 
-This moves *relay traffic* off public infrastructure. Endpoint **discovery**
-(publishing/resolving node addresses via n0's DNS/pkarr service) is still the
-n0 preset's; Volt keeps it enabled so reconnects survive IP changes. If you
-later want zero n0 dependencies, that's a separate step: self-host
-[iroh-dns-server](https://github.com/n0-computer/iroh/tree/main/iroh-dns-server)
-and swap the discovery preset in both endpoints.
+[access.http]
+url = "https://<fixed-enrollment-function>/v1/relay-access"
+```
+
+There is deliberately no `bearer_token` key in this file.
+
+### Rotate the backend secret with current/next overlap
+
+Rotate one fleet at a time and keep both backend slots valid throughout the
+rollout:
+
+1. Generate a new secret without printing it. Configure it as the backend's
+   **next** secret while retaining the old **current** secret. Deploy the
+   backend and verify that both values authenticate.
+2. On one relay at a time, atomically replace its root-owned token file with the
+   next value through stdin, then rerun the deployment script or restart
+   `iroh-relay`. `LoadCredential=` is reread only when the service starts.
+3. Verify `iroh-relay-healthcheck.service`, `/healthz`, and normal endpoint
+   registration after each relay. Keep enough other relays online because a
+   restart interrupts registrations on that relay even though changing the
+   backend secret alone cannot do so.
+4. After every relay uses the next value, promote that value to backend
+   **current** and clear backend **next**. Retire the old value only then.
+
+Before step 4, rollback consists of restoring the old root-owned relay file and
+restarting that relay; the backend still accepts it. Never replace current and
+next simultaneously, and never remove current before all relay processes have
+loaded next.
+
+## Custom uncredentialed relay
+
+A custom relay does not participate in Volt-managed enrollment. Choose its
+owner-controlled policy explicitly.
+
+Open custom relay:
+
+```sh
+scripts/deploy-iroh-relay.sh root@relay.example.com relay.example.com \
+  --contact you@example.com \
+  --open
+```
+
+Endpoint allowlist:
+
+```sh
+scripts/deploy-iroh-relay.sh root@relay.example.com relay.example.com \
+  --contact you@example.com \
+  --allowlist '<daemon-endpoint-id>,<phone-endpoint-id>'
+
+scripts/deploy-iroh-relay.sh root@relay.example.com \
+  --add-allow '<new-endpoint-id>'
+```
+
+The allowlist is practical only when the owner can obtain and maintain every
+endpoint ID. An open relay relies on network ownership plus the deployment's
+resource and egress ceilings; it is not appropriate for an unrestricted
+high-capacity public service.
+
+Point a daemon at an owner-operated custom relay with:
+
+```sh
+VOLT_IROH_RELAY_URLS=https://relay.example.com volt daemon run
+```
+
+The pairing ticket carries the custom relay origin, not a shared bearer token.
+The app treats the origin as custom uncredentialed transport. Do not configure
+the managed callback for an arbitrary custom origin: the official app enrolls
+only through its fixed Volt broker and validates the managed fleet origins that
+broker returns.
+
+## Resource and egress controls
+
+The generated systemd unit includes:
+
+- `LimitNOFILE=16384` as a hard file-descriptor and socket-concurrency bound;
+- `TasksMax=256`;
+- `MemoryHigh=640M` and `MemoryMax=768M`;
+- `CPUQuota=100%`;
+- `IPAccounting=true`; and
+- service sandboxing with only `CAP_NET_BIND_SERVICE` and write access to
+  `/var/lib/iroh-relay`.
+
+Stock iroh-relay has no first-class maximum-active-endpoints setting. Although
+v1.0.3 parses `accept_conn_limit` and `accept_conn_burst`, its source marks them
+unimplemented, so the generated config does not pretend they provide a bound.
+The file-descriptor ceiling is the coarse aggregate connection backstop, while
+`[limits.client.rx]` enforces per-client ingress.
+
+The separate `iroh-relay-egress.service` installs an nftables `inet` output
+rule matching the numeric `iroh-relay` UID. Defaults are an aggregate
+67,108,864 bytes/second with a 134,217,728-byte burst. Override them at deploy
+time when the VPS capacity requires a lower value:
+
+```sh
+scripts/deploy-iroh-relay.sh root@relay.example.com relay.example.com \
+  --open \
+  --egress-bytes-per-second 16777216 \
+  --egress-burst-bytes 33554432
+```
+
+This kernel rule is the enforceable relay-wide ceiling. `IPAccounting` and
+relay metrics are observability counters, not enforcement. The health monitor
+stops the relay if the nftables table/counter disappears.
+
+## Health checks, alerts, and runbook
+
+The deployment installs and enables `iroh-relay-healthcheck.timer`. Each run:
+
+1. resolves the configured relay hostname to IPv4 or IPv6 loopback and requests
+   its TLS `/healthz`;
+2. for managed relays, sends the backend bearer through curl stdin and expects
+   an authenticated 400 response to a deliberately incomplete request, proving
+   backend reachability and secret acceptance without creating an endpoint
+   record or consuming the endpoint request quota;
+3. confirms that the nftables egress guard exists; and
+4. detects increases in its dropped-byte counter.
+
+No probe places the backend secret in curl arguments or emits it in output.
+State transitions are logged with tag `iroh-relay-monitor`. If a root-owned
+executable `/etc/iroh-relay/alert-hook` exists, it receives three non-secret
+arguments:
+
+```text
+<check-name> <ok|failed|limited> <detail>
+```
+
+Copy `/etc/iroh-relay/alert-hook.example`, replace its body with the monitoring
+integration, then set owner `root:root` and mode 0755. Keep webhook credentials
+in a separate root-readable file rather than in the hook's command arguments.
+
+Useful checks:
+
+```sh
+systemctl status iroh-relay iroh-relay-egress iroh-relay-healthcheck.timer
+journalctl -u iroh-relay -u iroh-relay-healthcheck --since -30m
+curl --resolve relay.example.com:443:127.0.0.1 -sSf https://relay.example.com/healthz
+curl -sSf http://127.0.0.1:9090/metrics | head
+nft list counter inet volt_iroh_relay egress_rate_dropped
+systemctl show iroh-relay -p IPIngressBytes -p IPEgressBytes
+```
+
+Runbook:
+
+- **Relay health failed:** inspect relay logs, DNS, certificate issuance, local
+  ports, and memory/FD limits. Restart only after identifying the failure.
+- **Backend health failed:** verify the fixed URL, backend deployment, and the
+  current/next secret overlap. Do not bypass the outage with `--open`; failed
+  authorization must remain fail closed. Existing registrations may continue
+  because stock authorization is registration-time only.
+- **Egress guard missing:** the monitor stops `iroh-relay`. Restore nftables,
+  then run `systemctl restart iroh-relay-egress` followed by
+  `systemctl restart iroh-relay`.
+- **Egress pressure limited:** inspect the nftables counter,
+  `IPEgressBytes`, relay metrics, connection counts, and provider network
+  graphs. Treat unexpected growth as abuse or a capacity incident. Raise the
+  ceiling only after investigation; the relay cannot attribute or cap bytes per
+  endpoint.
+- **Repeated connection or memory pressure:** add capacity or another relay,
+  rather than removing the ceilings. Keep metrics on loopback and export them
+  through an authenticated monitoring agent.
+
+Also configure an external HTTPS probe for `https://relay.example.com/healthz`
+and alerts for timer failures, systemd restart loops, memory pressure,
+file-descriptor exhaustion, sustained egress near the configured ceiling, and
+any egress drops.
+
+## Multiple relays and discovery
+
+Iroh probes the relays in its map and selects a nearby home relay. Peers on
+different home relays can still reach one another. Add a Volt-managed region by
+deploying it with the same callback contract, returning its normalized HTTPS
+origin from the enrollment backend, and updating the managed fleet origins.
+Roll fleet and secret changes with overlap.
+
+Moving relay traffic does not replace endpoint discovery. Volt still uses the
+n0 preset's DNS/pkarr discovery so reconnects survive IP changes. Eliminating
+that dependency requires separately hosting and configuring iroh DNS discovery
+for both endpoints.

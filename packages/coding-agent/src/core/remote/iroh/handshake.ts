@@ -11,7 +11,6 @@ import {
 	type IrohRemoteRelayMode,
 	isIrohRemoteOutcome,
 	isIrohRemoteRelayMode,
-	isIrohRemoteRelayUrls,
 	isIrohRemoteWorkingDirectory,
 	isIrohRemoteWorktreeId,
 } from "./protocol.ts";
@@ -716,7 +715,11 @@ function expectRelayMode(value: unknown, label: string): IrohRemoteRelayMode {
 }
 
 function expectRelayUrls(value: unknown, label: string): string[] {
-	if (isIrohRemoteRelayUrls(value)) {
+	if (
+		Array.isArray(value) &&
+		value.length > 0 &&
+		value.every((entry) => typeof entry === "string" && entry.length > 0)
+	) {
 		return [...value];
 	}
 	throw new Error(`${label} must be a non-empty array of relay URLs`);

@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 
 export const IROH_REMOTE_ALPN = "volt-rpc/0";
-export const IROH_REMOTE_TICKET_PREFIX = "volt+iroh://v1/";
+export const IROH_REMOTE_TICKET_PREFIX = "volt+iroh://v2/";
 export const IROH_REMOTE_HELLO_TYPE = "volt_iroh_hello";
 export const IROH_REMOTE_HANDSHAKE_TYPE = "volt_iroh_handshake";
 export const IROH_REMOTE_MULTI_STREAMS_FEATURE = "multi_streams.v1";
@@ -115,10 +115,6 @@ export type IrohRemoteHostHandshakeFailureOutcome = (typeof IROH_REMOTE_HOST_HAN
 
 export function isIrohRemoteRelayMode(value: unknown): value is IrohRemoteRelayMode {
 	return value === "disabled" || value === "development" || value === "production";
-}
-
-export function isIrohRemoteRelayUrls(value: unknown): value is string[] {
-	return Array.isArray(value) && value.length > 0 && value.every((url) => typeof url === "string" && url.length > 0);
 }
 
 export function isIrohRemoteOutcome(value: unknown): value is IrohRemoteOutcome {

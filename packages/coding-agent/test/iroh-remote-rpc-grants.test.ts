@@ -24,6 +24,7 @@ import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manage
 import { isControlRequest } from "../src/daemon/control-protocol.ts";
 
 const temporaryDirectories: string[] = [];
+const HOST_NODE_ID = "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8";
 
 afterEach(() => {
 	for (const path of temporaryDirectories.splice(0)) rmSync(path, { recursive: true, force: true });
@@ -253,12 +254,16 @@ describe("Iroh remote RPC grants", () => {
 		const chat = createIrohRemotePresetAccess("chat");
 		await engine.pair({
 			irohTicket: "endpoint",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "review-secret",
 			allowTools: review.allowedTools,
 			rpcGrant: review.rpcGrant,
 		});
 		await engine.pair({
 			irohTicket: "endpoint",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "chat-secret",
 			allowTools: chat.allowedTools,
 			rpcGrant: chat.rpcGrant,
@@ -368,7 +373,13 @@ describe("Iroh remote RPC grants", () => {
 				workspace: { name: "ws", path: "/tmp/ws" },
 				now: () => 100,
 			});
-		const pairOptions = { irohTicket: "endpoint", secret: "durable-secret", ttlMs: 1000 };
+		const pairOptions = {
+			irohTicket: "endpoint",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" } as const,
+			secret: "durable-secret",
+			ttlMs: 1000,
+		};
 
 		failNextWrite = true;
 		await expect(createEngine().pair(pairOptions)).rejects.toThrow("injected flush failure");

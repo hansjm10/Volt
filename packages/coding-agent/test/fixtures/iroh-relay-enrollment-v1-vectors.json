@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "issuedAtMs": 1893456000000,
+  "hostSecretKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "hostEndpointId": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+  "clientSecretKeyHex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "clientEndpointId": "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
+  "claimId": "gIGCg4SFhoeIiYqLjI2Ojw",
+  "claimSecret": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8",
+  "claimSecretSha256": "AOmIZ37s-UwLuSMzccfA1vTbjr3N7LfF66pmbxckkic",
+  "grantId": "cEdIjD8Ez_6V6C6MtChC-0z4qKO-t24waZBFHkl1JVY",
+  "grantSecret": "wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t8",
+  "grantSecretSha256": "7AceCgE2yDfAUc7mp3E-266mk2cS0aPKN-hP7jIm5h0",
+  "operations": {
+    "create_claim": {
+      "nonce": "4OHi4-Tl5ufo6err7O3u7w",
+      "canonicalMessage": "volt-iroh-enrollment-signature-v1\noperation:create_claim\nhost_endpoint_id:03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8\nclaim_id:gIGCg4SFhoeIiYqLjI2Ojw\nclaim_secret_sha256:AOmIZ37s-UwLuSMzccfA1vTbjr3N7LfF66pmbxckkic\nissued_at_ms:1893456000000\nnonce:4OHi4-Tl5ufo6err7O3u7w\n",
+      "canonicalMessageBase64url": "dm9sdC1pcm9oLWVucm9sbG1lbnQtc2lnbmF0dXJlLXYxCm9wZXJhdGlvbjpjcmVhdGVfY2xhaW0KaG9zdF9lbmRwb2ludF9pZDowM2ExMDdiZmYzY2UxMGJlMWQ3MGRkMThlNzRiYzA5OTY3ZTRkNjMwOWJhNTBkNWYxZGRjODY2NDEyNTUzMWI4CmNsYWltX2lkOmdJR0NnNFNGaG9lSWlZcUxqSTJPancKY2xhaW1fc2VjcmV0X3NoYTI1NjpBT21JWjM3cy1Vd0x1U016Y2NmQTF2VGJqcjNON0xmRjY2cG1ieGNra2ljCmlzc3VlZF9hdF9tczoxODkzNDU2MDAwMDAwCm5vbmNlOjRPSGk0LVRsNXVmbzZlcnI3TzN1N3cK",
+      "signatureBase64url": "wdpSeYUn-DJAydiRiY32MMPBgoTpu-YxrHa7zsir5VhSKeuyv_Xh8Msg5xDHOa-FNZWUMLCl8JvETJyIxpEyBw"
+    },
+    "claim_status": {
+      "nonce": "8PHy8_T19vf4-fr7_P3-_w",
+      "canonicalMessage": "volt-iroh-enrollment-signature-v1\noperation:claim_status\nhost_endpoint_id:03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8\nclaim_id:gIGCg4SFhoeIiYqLjI2Ojw\nclaim_secret_sha256:AOmIZ37s-UwLuSMzccfA1vTbjr3N7LfF66pmbxckkic\nissued_at_ms:1893456000000\nnonce:8PHy8_T19vf4-fr7_P3-_w\n",
+      "canonicalMessageBase64url": "dm9sdC1pcm9oLWVucm9sbG1lbnQtc2lnbmF0dXJlLXYxCm9wZXJhdGlvbjpjbGFpbV9zdGF0dXMKaG9zdF9lbmRwb2ludF9pZDowM2ExMDdiZmYzY2UxMGJlMWQ3MGRkMThlNzRiYzA5OTY3ZTRkNjMwOWJhNTBkNWYxZGRjODY2NDEyNTUzMWI4CmNsYWltX2lkOmdJR0NnNFNGaG9lSWlZcUxqSTJPancKY2xhaW1fc2VjcmV0X3NoYTI1NjpBT21JWjM3cy1Vd0x1U016Y2NmQTF2VGJqcjNON0xmRjY2cG1ieGNra2ljCmlzc3VlZF9hdF9tczoxODkzNDU2MDAwMDAwCm5vbmNlOjhQSHk4X1QxOXZmNC1mcjdfUDMtX3cK",
+      "signatureBase64url": "-9vyhaRCvasCZsIYnAaobdArsBuPbp6MeEW8pylGq4W31Cm28dZE7VkP3piD1E6MN4OWUYtlU6ebKehYAgJHBw"
+    },
+    "cancel_claim": {
+      "nonce": "QEFCQ0RFRkdISUpLTE1OTw",
+      "canonicalMessage": "volt-iroh-enrollment-signature-v1\noperation:cancel_claim\nhost_endpoint_id:03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8\nclaim_id:gIGCg4SFhoeIiYqLjI2Ojw\nclaim_secret_sha256:AOmIZ37s-UwLuSMzccfA1vTbjr3N7LfF66pmbxckkic\nissued_at_ms:1893456000000\nnonce:QEFCQ0RFRkdISUpLTE1OTw\n",
+      "canonicalMessageBase64url": "dm9sdC1pcm9oLWVucm9sbG1lbnQtc2lnbmF0dXJlLXYxCm9wZXJhdGlvbjpjYW5jZWxfY2xhaW0KaG9zdF9lbmRwb2ludF9pZDowM2ExMDdiZmYzY2UxMGJlMWQ3MGRkMThlNzRiYzA5OTY3ZTRkNjMwOWJhNTBkNWYxZGRjODY2NDEyNTUzMWI4CmNsYWltX2lkOmdJR0NnNFNGaG9lSWlZcUxqSTJPancKY2xhaW1fc2VjcmV0X3NoYTI1NjpBT21JWjM3cy1Vd0x1U016Y2NmQTF2VGJqcjNON0xmRjY2cG1ieGNra2ljCmlzc3VlZF9hdF9tczoxODkzNDU2MDAwMDAwCm5vbmNlOlFFRkNRMFJGUmtkSVNVcExURTFPVHcK",
+      "signatureBase64url": "DghRbD1PhNeWt2v6Ay4B7SFXfLP9Jpw_EncsrCNKf4Sn0xUdi5ShurYcK-300_hnmIy_EN0VqcyXHawnf62NDA"
+    },
+    "approve_claim": {
+      "nonce": "EBESExQVFhcYGRobHB0eHw",
+      "canonicalMessage": "volt-iroh-enrollment-signature-v1\noperation:approve_claim\nhost_endpoint_id:03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8\nclient_endpoint_id:29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7\nclaim_id:gIGCg4SFhoeIiYqLjI2Ojw\nclaim_secret_sha256:AOmIZ37s-UwLuSMzccfA1vTbjr3N7LfF66pmbxckkic\ngrant_secret_sha256:7AceCgE2yDfAUc7mp3E-266mk2cS0aPKN-hP7jIm5h0\nissued_at_ms:1893456000000\nnonce:EBESExQVFhcYGRobHB0eHw\n",
+      "canonicalMessageBase64url": "dm9sdC1pcm9oLWVucm9sbG1lbnQtc2lnbmF0dXJlLXYxCm9wZXJhdGlvbjphcHByb3ZlX2NsYWltCmhvc3RfZW5kcG9pbnRfaWQ6MDNhMTA3YmZmM2NlMTBiZTFkNzBkZDE4ZTc0YmMwOTk2N2U0ZDYzMDliYTUwZDVmMWRkYzg2NjQxMjU1MzFiOApjbGllbnRfZW5kcG9pbnRfaWQ6MjlhY2JhZTE0MWJjY2FmMGIyMmUxYTk0ZDM0ZDBiYzczNjFlNTI2ZDBiZmUxMmM4OTc5NGJjOTMyMjk2NmRkNwpjbGFpbV9pZDpnSUdDZzRTRmhvZUlpWXFMakkyT2p3CmNsYWltX3NlY3JldF9zaGEyNTY6QU9tSVozN3MtVXdMdVNNemNjZkExdlRianIzTjdMZkY2NnBtYnhja2tpYwpncmFudF9zZWNyZXRfc2hhMjU2OjdBY2VDZ0UyeURmQVVjN21wM0UtMjY2bWsyY1MwYVBLTi1oUDdqSW01aDAKaXNzdWVkX2F0X21zOjE4OTM0NTYwMDAwMDAKbm9uY2U6RUJFU0V4UVZGaGNZR1JvYkhCMGVIdwo",
+      "signatureBase64url": "gRryMRajdlq2zplajWXpuFNfEPWlc_bwxkdlIFF8zfn4tsXEJjEfp_JYPBSc01b-iJnS-yf72IZpHdLkYfYXDw"
+    },
+    "renew_grant": {
+      "nonce": "ICEiIyQlJicoKSorLC0uLw",
+      "canonicalMessage": "volt-iroh-enrollment-signature-v1\noperation:renew_grant\nhost_endpoint_id:03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8\nclient_endpoint_id:29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7\ngrant_id:cEdIjD8Ez_6V6C6MtChC-0z4qKO-t24waZBFHkl1JVY\ngrant_secret_sha256:7AceCgE2yDfAUc7mp3E-266mk2cS0aPKN-hP7jIm5h0\nissued_at_ms:1893456000000\nnonce:ICEiIyQlJicoKSorLC0uLw\n",
+      "canonicalMessageBase64url": "dm9sdC1pcm9oLWVucm9sbG1lbnQtc2lnbmF0dXJlLXYxCm9wZXJhdGlvbjpyZW5ld19ncmFudApob3N0X2VuZHBvaW50X2lkOjAzYTEwN2JmZjNjZTEwYmUxZDcwZGQxOGU3NGJjMDk5NjdlNGQ2MzA5YmE1MGQ1ZjFkZGM4NjY0MTI1NTMxYjgKY2xpZW50X2VuZHBvaW50X2lkOjI5YWNiYWUxNDFiY2NhZjBiMjJlMWE5NGQzNGQwYmM3MzYxZTUyNmQwYmZlMTJjODk3OTRiYzkzMjI5NjZkZDcKZ3JhbnRfaWQ6Y0VkSWpEOEV6XzZWNkM2TXRDaEMtMHo0cUtPLXQyNHdhWkJGSGtsMUpWWQpncmFudF9zZWNyZXRfc2hhMjU2OjdBY2VDZ0UyeURmQVVjN21wM0UtMjY2bWsyY1MwYVBLTi1oUDdqSW01aDAKaXNzdWVkX2F0X21zOjE4OTM0NTYwMDAwMDAKbm9uY2U6SUNFaUl5UWxKaWNvS1NvckxDMHVMdwo",
+      "signatureBase64url": "p-ruLGOy5G_yi5ierwjm4lywCD3QzZ1eix7dG9eerG0_SG79QV8Lw06F-9KM0D-W59hXU9KeK40CwNBRkjs2DQ"
+    },
+    "revoke_grant": {
+      "nonce": "MDEyMzQ1Njc4OTo7PD0-Pw",
+      "canonicalMessage": "volt-iroh-enrollment-signature-v1\noperation:revoke_grant\nhost_endpoint_id:03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8\nclient_endpoint_id:29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7\ngrant_id:cEdIjD8Ez_6V6C6MtChC-0z4qKO-t24waZBFHkl1JVY\ngrant_secret_sha256:7AceCgE2yDfAUc7mp3E-266mk2cS0aPKN-hP7jIm5h0\nissued_at_ms:1893456000000\nnonce:MDEyMzQ1Njc4OTo7PD0-Pw\n",
+      "canonicalMessageBase64url": "dm9sdC1pcm9oLWVucm9sbG1lbnQtc2lnbmF0dXJlLXYxCm9wZXJhdGlvbjpyZXZva2VfZ3JhbnQKaG9zdF9lbmRwb2ludF9pZDowM2ExMDdiZmYzY2UxMGJlMWQ3MGRkMThlNzRiYzA5OTY3ZTRkNjMwOWJhNTBkNWYxZGRjODY2NDEyNTUzMWI4CmNsaWVudF9lbmRwb2ludF9pZDoyOWFjYmFlMTQxYmNjYWYwYjIyZTFhOTRkMzRkMGJjNzM2MWU1MjZkMGJmZTEyYzg5Nzk0YmM5MzIyOTY2ZGQ3CmdyYW50X2lkOmNFZElqRDhFel82VjZDNk10Q2hDLTB6NHFLTy10MjR3YVpCRkhrbDFKVlkKZ3JhbnRfc2VjcmV0X3NoYTI1Njo3QWNlQ2dFMnlEZkFVYzdtcDNFLTI2Nm1rMmNTMGFQS04taFA3akltNWgwCmlzc3VlZF9hdF9tczoxODkzNDU2MDAwMDAwCm5vbmNlOk1ERXlNelExTmpjNE9UbzdQRDAtUHcK",
+      "signatureBase64url": "1Do-YG2olSW3DBfm5PHdZQlz-t11T0lWGxE4qQWw_cRg1KYHu-pClFOEH8JgDFoSKhuWxwmTCDF37DOkBWwiBA"
+    }
+  }
+}

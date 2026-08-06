@@ -11,14 +11,20 @@ export interface IrohNodeIdLike {
 	toString(): string;
 }
 
+export interface IrohSignatureLike {
+	toBytes(): number[];
+}
+
 export interface IrohSecretKeyLike {
 	toBytes(): number[];
+	sign(message: number[]): IrohSignatureLike;
 }
 
 export interface IrohEndpointLike {
 	id(): IrohNodeIdLike;
 	addr(): unknown;
 	online(): Promise<void>;
+	insertRelay(config: IrohRelayConfigLike): Promise<void>;
 	close(): Promise<void>;
 	acceptNext(): Promise<IrohIncomingLike | null | undefined>;
 	secretKey(): IrohSecretKeyLike;
@@ -61,6 +67,7 @@ export interface IrohRelayMapLike {
 export interface IrohModuleLike {
 	Endpoint: { builder(): IrohEndpointBuilderLike };
 	EndpointTicket: { fromAddr(addr: unknown): { toString(): string } };
+	SecretKey: { generate(): IrohSecretKeyLike };
 	RelayMap: { empty(): IrohRelayMapLike };
 	RelayMode: { disabled(): unknown; custom(map: IrohRelayMapLike): unknown; customFromUrls(urls: string[]): unknown };
 	presetMinimal(builder: IrohEndpointBuilderLike): void;

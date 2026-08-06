@@ -6,6 +6,8 @@ import {
 	type IrohRemoteClient,
 	type IrohRemoteHostState,
 	type IrohRemotePairingSecretTombstone,
+	type IrohRemotePendingClientRevocation,
+	type IrohRemotePendingEnrollmentCancellation,
 	type IrohRemotePendingPairingTicket,
 	type IrohRemoteRevokedClient,
 	type IrohRemoteWorkspace,
@@ -31,6 +33,8 @@ export interface VoltdStateFileV1 {
 	workspaces: IrohRemoteWorkspace[];
 	worktrees: IrohRemoteWorkspaceWorktree[];
 	pendingPairingTickets: IrohRemotePendingPairingTicket[];
+	pendingEnrollmentCancellations: IrohRemotePendingEnrollmentCancellation[];
+	pendingClientRevocations: IrohRemotePendingClientRevocation[];
 	pairingSecretTombstones: IrohRemotePairingSecretTombstone[];
 	settings: {
 		/** Detached headless runtime retention TTL. */
@@ -43,12 +47,6 @@ export interface VoltdStateFileV1 {
 		themeTokenPush?: boolean;
 		/** Hold a keep-awake (prevent system sleep) assertion while the daemon runs; OFF by default. */
 		keepAwakeEnabled?: boolean;
-		/**
-		 * Bearer token presented to relay servers (access.shared_token). Seeded
-		 * from VOLT_IROH_RELAY_AUTH_TOKEN and persisted so bare restarts keep
-		 * authenticating; pairing tickets carry it to phones.
-		 */
-		relayAuthToken?: string;
 		/** Worktree cleanup policies (design §5.3); all opt-in except pruneOnStart. */
 		worktreeCleanup?: WorktreeCleanupSettings;
 	};
@@ -116,6 +114,8 @@ export function createEmptyVoltdState(): VoltdStateFileV1 {
 		workspaces: [],
 		worktrees: [],
 		pendingPairingTickets: [],
+		pendingEnrollmentCancellations: [],
+		pendingClientRevocations: [],
 		pairingSecretTombstones: [],
 		settings: {
 			detachedRuntimeTtlMs: DEFAULT_INTEGRATED_DETACHED_RUNTIME_TTL_MS,
@@ -134,6 +134,8 @@ export function voltdStateToHostState(state: VoltdStateFileV1): IrohRemoteHostSt
 		workspaces: state.workspaces,
 		worktrees: state.worktrees,
 		pendingPairingTickets: state.pendingPairingTickets,
+		pendingEnrollmentCancellations: state.pendingEnrollmentCancellations,
+		pendingClientRevocations: state.pendingClientRevocations,
 		pairingSecretTombstones: state.pairingSecretTombstones,
 	};
 }
@@ -152,6 +154,8 @@ export function hostStateToVoltdState(
 		workspaces: hostState.workspaces,
 		worktrees: hostState.worktrees ?? [],
 		pendingPairingTickets: hostState.pendingPairingTickets ?? [],
+		pendingEnrollmentCancellations: hostState.pendingEnrollmentCancellations ?? [],
+		pendingClientRevocations: hostState.pendingClientRevocations ?? [],
 		pairingSecretTombstones: hostState.pairingSecretTombstones ?? [],
 		settings,
 	};
@@ -183,10 +187,6 @@ export function parseVoltdState(value: unknown): VoltdStateFileV1 {
 	const themeName = typeof settingsRecord.themeName === "string" ? settingsRecord.themeName : undefined;
 	const themeTokenPush = settingsRecord.themeTokenPush === true;
 	const keepAwakeEnabled = settingsRecord.keepAwakeEnabled === true;
-	const relayAuthToken =
-		typeof settingsRecord.relayAuthToken === "string" && settingsRecord.relayAuthToken.length > 0
-			? settingsRecord.relayAuthToken
-			: undefined;
 	const worktreeCleanup = parseWorktreeCleanupSettings(settingsRecord.worktreeCleanup);
 	return hostStateToVoltdState(hostState, {
 		detachedRuntimeTtlMs,
@@ -194,7 +194,6 @@ export function parseVoltdState(value: unknown): VoltdStateFileV1 {
 		...(themeName === undefined ? {} : { themeName }),
 		...(themeTokenPush ? { themeTokenPush } : {}),
 		...(keepAwakeEnabled ? { keepAwakeEnabled } : {}),
-		...(relayAuthToken === undefined ? {} : { relayAuthToken }),
 		...(worktreeCleanup === undefined ? {} : { worktreeCleanup }),
 	});
 }
@@ -437,6 +436,19 @@ export async function regenerateInvalidVoltdState(
 	return { backupPath, preservedIdentity: regenerated?.irohSecretKey !== undefined };
 }
 
+function containsDeprecatedRelayCredential(value: unknown): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	const settings = record.settings;
+	return (
+		Object.hasOwn(record, "relayAuthToken") ||
+		(typeof settings === "object" &&
+			settings !== null &&
+			!Array.isArray(settings) &&
+			Object.hasOwn(settings, "relayAuthToken"))
+	);
+}
+
 /** Debounced, atomic (tmp + rename, 0600) persistence for VoltdStateFileV1. */
 export class VoltdStateStore {
 	private readonly statePath: string;
@@ -499,7 +511,14 @@ export class VoltdStateStore {
 		}
 		if (existsSync(this.statePath)) {
 			try {
-				this.current = parseVoltdState(JSON.parse(readFileSync(this.statePath, "utf8")));
+				const parsedJson = JSON.parse(readFileSync(this.statePath, "utf8")) as unknown;
+				this.current = parseVoltdState(parsedJson);
+				if (containsDeprecatedRelayCredential(parsedJson)) {
+					// Rewrite immediately so an obsolete fleet-wide bearer does not linger
+					// at rest merely because no other daemon setting changes this run.
+					this.markStateChanged();
+					await this.enqueueWrite();
+				}
 			} catch (error) {
 				throw invalidStateFileError(this.statePath, error);
 			}

@@ -98,6 +98,7 @@ import {
 } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
 
 const CODING_RPC_GRANT = createIrohRemotePresetAccess("coding").rpcGrant;
+const HOST_NODE_ID = "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8";
 
 class ManualRpcTransport implements RpcTransport {
 	readonly writes: object[] = [];
@@ -289,67 +290,67 @@ function makeHelloWithoutLabel(workspace: string, secret?: string): IrohRemoteHe
 }
 
 describe("Iroh remote core helpers", () => {
-	test("encodes, decodes, validates, and expires remote tickets", () => {
+	test("encodes, decodes, validates, and expires strict v2 remote tickets", () => {
 		const payload: IrohRemoteTicketPayload = {
 			alpn: IROH_REMOTE_ALPN,
 			expiresAt: 1000,
 			irohTicket: "iroh-endpoint-ticket",
-			nodeId: "host-node",
-			relayMode: "development",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "n0-public" },
 			secret: "pairing-secret",
 			workspace: "volt",
 		};
-
 		const ticket = encodeIrohRemoteTicketPayload(payload);
 
-		expect(ticket.startsWith("volt+iroh://v1/")).toBe(true);
+		expect(ticket.startsWith("volt+iroh://v2/")).toBe(true);
 		expect(decodeIrohRemoteTicketPayload(ticket)).toEqual(payload);
 		expect(() => decodeIrohRemoteTicketPayload("not-a-ticket")).toThrow("Expected ticket prefix");
-		expect(() => parseIrohRemoteTicketPayload({ ...payload, alpn: "other" })).toThrow("Unsupported ticket ALPN");
-		expect(() => parseIrohRemoteTicketPayload({ ...payload, relayMode: "relayed" })).toThrow(
-			"ticket relayMode must be disabled, development, or production",
+		expect(() => decodeIrohRemoteTicketPayload(ticket.replace("/v2/", "/v1/"))).toThrow(
+			"Expected ticket prefix volt+iroh://v2/",
 		);
+		expect(() => parseIrohRemoteTicketPayload({ ...payload, alpn: "other" })).toThrow("Unsupported ticket ALPN");
+		expect(() => parseIrohRemoteTicketPayload({ ...payload, unknown: true })).toThrow("unknown field");
 		expect(() => assertIrohRemoteTicketNotExpired(payload, 1001)).toThrow("Pairing ticket has expired");
 	});
 
-	test("round-trips production relay tickets and validates relayUrls", () => {
+	test("round-trips managed relay claims and strips all ephemeral pairing fields together", () => {
 		const payload: IrohRemoteTicketPayload = {
 			alpn: IROH_REMOTE_ALPN,
 			expiresAt: 1000,
 			irohTicket: "iroh-endpoint-ticket",
-			nodeId: "host-node",
-			relayMode: "production",
-			relayUrls: ["https://relay.example.com"],
-			relayAuthToken: "relay-shared-token",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "volt-managed", origins: ["https://relay.example.com"] },
+			enrollment: {
+				version: 1,
+				claimId: "gIGCg4SFhoeIiYqLjI2Ojw",
+				claimSecret: "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8",
+			},
 			secret: "pairing-secret",
 			workspace: "volt",
 		};
 
 		expect(decodeIrohRemoteTicketPayload(encodeIrohRemoteTicketPayload(payload))).toEqual(payload);
-		expect(() => parseIrohRemoteTicketPayload({ ...payload, relayUrls: undefined })).toThrow(
-			"ticket relayMode production requires relayUrls",
+		expect(() => parseIrohRemoteTicketPayload({ ...payload, enrollment: undefined })).toThrow(
+			"volt-managed relay requires an enrollment claim",
 		);
-		expect(() => parseIrohRemoteTicketPayload({ ...payload, relayUrls: [] })).toThrow(
-			"ticket relayUrls must be a non-empty array of relay URLs",
-		);
-		expect(() => parseIrohRemoteTicketPayload({ ...payload, relayUrls: [42] })).toThrow(
-			"ticket relayUrls must be a non-empty array of relay URLs",
-		);
-		// Sanitized reconnect tickets strip secret-like fields: the pairing
-		// secret AND the relay auth token (clients keychain the token instead).
+		expect(() =>
+			parseIrohRemoteTicketPayload({
+				...payload,
+				relay: { kind: "custom-uncredentialed", origins: ["https://relay.example.com"] },
+			}),
+		).toThrow("must not contain an enrollment claim");
 		const sanitized = createIrohRemoteSanitizedReconnectTicketPayload(payload);
 		expect(sanitized).toEqual({
 			alpn: IROH_REMOTE_ALPN,
 			irohTicket: "iroh-endpoint-ticket",
-			nodeId: "host-node",
-			relayMode: "production",
-			relayUrls: ["https://relay.example.com"],
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "volt-managed", origins: ["https://relay.example.com"] },
 			workspace: "volt",
 		});
-		expect(JSON.stringify(sanitized)).not.toContain("relay-shared-token");
-		expect(() => createIrohRemoteSanitizedReconnectTicketPayload({ ...payload, relayUrls: undefined })).toThrow(
-			"saved_host_invalid: ticket relayUrls are required for production relayMode",
-		);
+		const serialized = JSON.stringify(sanitized);
+		expect(serialized).not.toContain("pairing-secret");
+		expect(serialized).not.toContain("claimSecret");
+		expect(serialized).not.toContain("expiresAt");
 	});
 
 	test("creates sanitized reconnect tickets and verifies ticket host identity", () => {
@@ -357,8 +358,8 @@ describe("Iroh remote core helpers", () => {
 			alpn: IROH_REMOTE_ALPN,
 			expiresAt: 1000,
 			irohTicket: "iroh-endpoint-ticket",
-			nodeId: "host-node",
-			relayMode: "development",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "pairing-secret",
 			workspace: "volt",
 		};
@@ -367,39 +368,24 @@ describe("Iroh remote core helpers", () => {
 		expect(sanitizedPayload).toEqual({
 			alpn: IROH_REMOTE_ALPN,
 			irohTicket: "iroh-endpoint-ticket",
-			nodeId: "host-node",
-			relayMode: "development",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			workspace: "volt",
 		});
-		expect(JSON.stringify(sanitizedPayload)).not.toContain("pairing-secret");
 		expect(createIrohRemoteSanitizedReconnectTicket(encodeIrohRemoteTicketPayload(payload))).toBe(
 			encodeIrohRemoteTicketPayload(sanitizedPayload),
 		);
-		expect(() => assertIrohRemoteTicketPayloadHostIdentity(payload, "host-node")).not.toThrow();
-		expect(() => assertIrohRemoteTicketPayloadHostIdentity(payload, "other-host")).toThrow(
-			"host_identity_mismatch: expected other-host, got host-node",
+		expect(() => assertIrohRemoteTicketPayloadHostIdentity(payload, HOST_NODE_ID)).not.toThrow();
+		const otherHost = "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7";
+		expect(() => assertIrohRemoteTicketPayloadHostIdentity(payload, otherHost)).toThrow(
+			`host_identity_mismatch: expected ${otherHost}, got ${HOST_NODE_ID}`,
 		);
 		try {
-			assertIrohRemoteTicketPayloadHostIdentity(payload, "other-host");
+			assertIrohRemoteTicketPayloadHostIdentity(payload, otherHost);
 			throw new Error("expected host identity mismatch");
 		} catch (error) {
 			expect(error).toMatchObject({ outcome: "host_identity_mismatch" });
 		}
-		expect(() => createIrohRemoteSanitizedReconnectTicketPayload({ ...payload, nodeId: undefined })).toThrow(
-			"saved_host_invalid: ticket nodeId is required for saved-host reconnect",
-		);
-		try {
-			createIrohRemoteSanitizedReconnectTicketPayload({ ...payload, nodeId: undefined });
-			throw new Error("expected saved host invalid");
-		} catch (error) {
-			expect(error).toMatchObject({ outcome: "saved_host_invalid" });
-		}
-		expect(() => createIrohRemoteSanitizedReconnectTicketPayload({ ...payload, relayMode: undefined })).toThrow(
-			"saved_host_invalid: ticket relayMode is required for saved-host reconnect",
-		);
-		expect(() => assertIrohRemoteTicketPayloadHostIdentity({ ...payload, nodeId: undefined }, "host-node")).toThrow(
-			"saved_host_invalid: ticket nodeId is required for host identity verification",
-		);
 	});
 
 	test("places remote control sockets under a state-specific directory", () => {
@@ -769,22 +755,24 @@ describe("Iroh remote core helpers", () => {
 		).toThrow("handshake response outcome must be a known Iroh remote outcome");
 	});
 
-	test("pins protocol v1 ticket and handshake compatibility vectors", () => {
+	test("pins protocol v2 ticket and handshake compatibility vectors", () => {
 		const payload: IrohRemoteTicketPayload = {
 			alpn: IROH_REMOTE_ALPN,
 			expiresAt: 1790000000000,
 			irohTicket: "iroh-endpoint-ticket",
-			nodeId: "host-node-id",
-			relayMode: "disabled",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "one-time-secret",
 			workspace: "volt",
 		};
 		const ticket =
-			"volt+iroh://v1/eyJhbHBuIjoidm9sdC1ycGMvMCIsImV4cGlyZXNBdCI6MTc5MDAwMDAwMDAwMCwiaXJvaFRpY2tldCI6Imlyb2gtZW5kcG9pbnQtdGlja2V0Iiwibm9kZUlkIjoiaG9zdC1ub2RlLWlkIiwicmVsYXlNb2RlIjoiZGlzYWJsZWQiLCJzZWNyZXQiOiJvbmUtdGltZS1zZWNyZXQiLCJ3b3Jrc3BhY2UiOiJ2b2x0In0";
+			"volt+iroh://v2/eyJhbHBuIjoidm9sdC1ycGMvMCIsImV4cGlyZXNBdCI6MTc5MDAwMDAwMDAwMCwiaXJvaFRpY2tldCI6Imlyb2gtZW5kcG9pbnQtdGlja2V0Iiwibm9kZUlkIjoiMDNhMTA3YmZmM2NlMTBiZTFkNzBkZDE4ZTc0YmMwOTk2N2U0ZDYzMDliYTUwZDVmMWRkYzg2NjQxMjU1MzFiOCIsInJlbGF5Ijp7ImtpbmQiOiJkaXNhYmxlZCJ9LCJzZWNyZXQiOiJvbmUtdGltZS1zZWNyZXQiLCJ3b3Jrc3BhY2UiOiJ2b2x0In0";
 
 		expect(encodeIrohRemoteTicketPayload(payload)).toBe(ticket);
 		expect(decodeIrohRemoteTicketPayload(ticket)).toEqual(payload);
-		expect(parseIrohRemoteTicketPayload({ ...payload, unknownFutureField: "ignored" })).toEqual(payload);
+		expect(() => parseIrohRemoteTicketPayload({ ...payload, unknownFutureField: "rejected" })).toThrow(
+			"unknown field",
+		);
 
 		const helloLine =
 			'{"type":"volt_iroh_hello","protocol":"volt-rpc/0","workspace":"volt","secret":"one-time-secret","clientLabel":"Jordan iPhone","clientNodeId":"client-claimed-node-id","conversation":{"target":"last"}}';
@@ -1244,6 +1232,8 @@ describe("Iroh remote core helpers", () => {
 						rePairApprovedAt: 41,
 					},
 				],
+				pendingEnrollmentCancellations: [],
+				pendingClientRevocations: [],
 				pendingPairingTickets: [
 					{
 						secretHash: "sha256:pending",
@@ -1682,8 +1672,8 @@ describe("Iroh remote core helpers", () => {
 
 		const pairing = await hostEngine.pair({
 			irohTicket: "iroh-endpoint-ticket",
-			nodeId: "host-node",
-			relayMode: "disabled",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "secret",
 			ttlMs: 1000,
 		});
@@ -1692,8 +1682,8 @@ describe("Iroh remote core helpers", () => {
 			alpn: IROH_REMOTE_ALPN,
 			expiresAt: 1100,
 			irohTicket: "iroh-endpoint-ticket",
-			nodeId: "host-node",
-			relayMode: "disabled",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "secret",
 			workspace: "volt",
 		});
@@ -1846,6 +1836,8 @@ describe("Iroh remote core helpers", () => {
 		});
 		await hostEngine.pair({
 			irohTicket: "iroh-endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "secret",
 		});
 		hostEngine.setAllowTools("bash");
@@ -1889,6 +1881,8 @@ describe("Iroh remote core helpers", () => {
 		});
 		await hostEngine.pair({
 			irohTicket: "iroh-endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "secret",
 		});
 		const paired = await hostEngine.authorizeHello(makeHello("alpha", "secret"), "client-node");
@@ -2049,6 +2043,44 @@ describe("Iroh remote core helpers", () => {
 		]);
 	});
 
+	test("pending client revocations deny reconnects and invalidate active authorization", async () => {
+		const stateManager = new IrohRemoteHostStateManager({
+			initialState: {
+				...createEmptyIrohRemoteHostState(),
+				workspaces: [{ name: "alpha", path: "/alpha" }],
+				clients: [
+					{
+						nodeId: HOST_NODE_ID,
+						label: "mismatched phone",
+						allowedWorkspaces: ["alpha"],
+						allowedTools: "read",
+						rpcGrant: CODING_RPC_GRANT,
+						pairedAt: 10,
+						lastSeenAt: 20,
+					},
+				],
+			},
+		});
+		const hostEngine = new IrohRemoteHostEngine({
+			now: () => 200,
+			stateManager,
+			workspace: { name: "alpha", path: "/alpha" },
+		});
+		const authorized = await hostEngine.authorizeHello(makeHello("alpha"), HOST_NODE_ID);
+		expect(authorized.ok).toBe(true);
+		if (!authorized.ok) throw new Error(authorized.error);
+
+		await stateManager.addPendingClientRevocation({ nodeId: HOST_NODE_ID, createdAt: 201 });
+
+		await expect(stateManager.isAuthorizationCurrent(authorized)).resolves.toBe(false);
+		await expect(hostEngine.authorizeHello(makeHello("alpha"), HOST_NODE_ID)).resolves.toEqual({
+			ok: false,
+			error: "client revocation is pending",
+			outcome: "client_revoked",
+			pairingSecretExpired: false,
+		});
+	});
+
 	test("host engine restart with the same state authorizes saved reconnects and preserves host identity", async () => {
 		const stateDir = await mkdtemp(join(tmpdir(), "volt-iroh-core-host-restart-"));
 		try {
@@ -2062,8 +2094,8 @@ describe("Iroh remote core helpers", () => {
 			});
 			await firstHostEngine.pair({
 				irohTicket: "iroh-endpoint-ticket",
-				nodeId: "host-node",
-				relayMode: "disabled",
+				nodeId: HOST_NODE_ID,
+				relay: { kind: "disabled" },
 				secret: "secret",
 			});
 
@@ -2158,6 +2190,8 @@ describe("Iroh remote core helpers", () => {
 		});
 		await hostEngine.pair({
 			irohTicket: "iroh-endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			labelHint: "phone hint",
 			secret: "initial-secret",
 			ttlMs: 1000,
@@ -2199,6 +2233,8 @@ describe("Iroh remote core helpers", () => {
 		now = 160;
 		await hostEngine.pair({
 			irohTicket: "iroh-endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			labelHint: "approved phone",
 			secret: "repair-secret",
 			ttlMs: 1000,
@@ -2272,15 +2308,15 @@ describe("Iroh remote core helpers", () => {
 			allowTools: "read,bash",
 			irohTicket: "iroh-endpoint-ticket",
 			labelHint: "tablet",
-			nodeId: "host-node",
-			relayMode: "development",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "n0-public" },
 			secret: "secret",
 			ttlMs: 25,
 		});
 
 		expect(pairing.payload).toMatchObject({
 			expiresAt: 125,
-			relayMode: "development",
+			relay: { kind: "n0-public" },
 			workspace: "volt",
 		});
 		expect(await stateManager.getState()).toMatchObject({
@@ -2393,6 +2429,8 @@ describe("Iroh remote core helpers", () => {
 		const secret = "raw-pairing-secret";
 		await hostEngine.pair({
 			irohTicket: "iroh-endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret,
 			ttlMs: 50,
 		});
@@ -2652,6 +2690,8 @@ describe("Iroh remote core helpers", () => {
 					lastSessionIdByWorkspace: { volt: "revoked-session" },
 				},
 			],
+			pendingEnrollmentCancellations: [],
+			pendingClientRevocations: [],
 			pendingPairingTickets: [
 				{
 					secretHash: "sha256:pending",
@@ -2922,7 +2962,8 @@ describe("Iroh remote core helpers", () => {
 
 		const pairing = await hostEngine.pair({
 			irohTicket: "iroh-endpoint-ticket",
-			nodeId: "host-node",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "alpha-secret",
 			ttlMs: 1000,
 		});
@@ -2969,7 +3010,8 @@ describe("Iroh remote core helpers", () => {
 
 		const pairing = await hostEngine.pair({
 			irohTicket: "iroh-endpoint-ticket",
-			nodeId: "host-node",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "beta-secret",
 			ttlMs: 1000,
 			workspace: "beta",
@@ -3210,6 +3252,8 @@ describe("Iroh remote core helpers", () => {
 		await expect(
 			hostEngine.pair({
 				irohTicket: "iroh-endpoint-ticket",
+				nodeId: HOST_NODE_ID,
+				relay: { kind: "disabled" },
 				secret: "secret",
 			}),
 		).resolves.toMatchObject({ secret: "secret" });
@@ -3248,6 +3292,8 @@ describe("Iroh remote core helpers", () => {
 		});
 		await hostEngine.pair({
 			irohTicket: "iroh-endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "secret",
 		});
 		const recv = new ManualIrohRecvStream();
@@ -3289,6 +3335,8 @@ describe("Iroh remote core helpers", () => {
 
 		const pairing = await hostEngine.pair({
 			irohTicket: "iroh-endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "private-secret",
 			ttlMs: 1000,
 			workspace: "private",
@@ -3309,6 +3357,8 @@ describe("Iroh remote core helpers", () => {
 		await expect(
 			hostEngine.pair({
 				irohTicket: "iroh-endpoint-ticket",
+				nodeId: HOST_NODE_ID,
+				relay: { kind: "disabled" },
 				secret: "missing-secret",
 				workspace: "missing",
 			}),
@@ -3316,6 +3366,8 @@ describe("Iroh remote core helpers", () => {
 		await expect(
 			hostEngine.pair({
 				irohTicket: "iroh-endpoint-ticket",
+				nodeId: HOST_NODE_ID,
+				relay: { kind: "disabled" },
 				secret: "stale-secret",
 				workspace: "stale",
 			}),
@@ -3335,10 +3387,22 @@ describe("Iroh remote core helpers", () => {
 		});
 
 		await expect(
-			hostEngine.pair({ irohTicket: "iroh-endpoint-ticket", secret: "gone-secret", workspace: "gone" }),
+			hostEngine.pair({
+				irohTicket: "iroh-endpoint-ticket",
+				nodeId: HOST_NODE_ID,
+				relay: { kind: "disabled" },
+				secret: "gone-secret",
+				workspace: "gone",
+			}),
 		).rejects.toThrow("workspace_missing: workspace path is missing: gone");
 		await expect(
-			hostEngine.pair({ irohTicket: "iroh-endpoint-ticket", secret: "broken-secret", workspace: "broken" }),
+			hostEngine.pair({
+				irohTicket: "iroh-endpoint-ticket",
+				nodeId: HOST_NODE_ID,
+				relay: { kind: "disabled" },
+				secret: "broken-secret",
+				workspace: "broken",
+			}),
 		).rejects.toThrow("workspace_unavailable: workspace path is unavailable: broken");
 		expect((await stateManager.getState()).pendingPairingTickets ?? []).toHaveLength(0);
 	});
@@ -3428,6 +3492,8 @@ describe("Iroh remote core helpers", () => {
 
 		const pairing = await hostEngine.pair({
 			irohTicket: "iroh-endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "secret",
 		});
 		expect(pairing.payload.workspace).toBe("volt");
@@ -3446,6 +3512,8 @@ describe("Iroh remote core helpers", () => {
 		});
 		await hostEngine.pair({
 			irohTicket: "iroh-endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "secret",
 		});
 
@@ -3476,6 +3544,8 @@ describe("Iroh remote core helpers", () => {
 			});
 			await firstEngine.pair({
 				irohTicket: "iroh-endpoint-ticket",
+				nodeId: HOST_NODE_ID,
+				relay: { kind: "disabled" },
 				secret: "secret",
 			});
 			await expect(firstEngine.authorizeHello(makeHello("volt", "secret"), "first-client")).resolves.toMatchObject({
@@ -3750,6 +3820,8 @@ describe("Iroh remote core helpers", () => {
 			alpn: IROH_REMOTE_ALPN,
 			expiresAt: 200,
 			irohTicket: "iroh-endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "secret",
 			workspace: "volt",
 		});
@@ -3825,6 +3897,8 @@ describe("Iroh remote core helpers", () => {
 			alpn: IROH_REMOTE_ALPN,
 			expiresAt: 200,
 			irohTicket: "iroh-endpoint-ticket",
+			nodeId: HOST_NODE_ID,
+			relay: { kind: "disabled" },
 			secret: "secret",
 			workspace: "volt",
 		};

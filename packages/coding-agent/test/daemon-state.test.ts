@@ -210,6 +210,28 @@ describe("voltd state migration", () => {
 		await replacementStore.close();
 	});
 
+	it("rewrites valid state immediately to scrub deprecated relay bearer fields", async () => {
+		mkdirSync(join(agentDir, "daemon"), { recursive: true });
+		const stateWithDeprecatedBearer = {
+			...createEmptyVoltdState(),
+			irohSecretKey: SECRET_KEY_BYTES,
+			relayAuthToken: "top-level-relay-token",
+			settings: {
+				...createEmptyVoltdState().settings,
+				relayAuthToken: "persisted-relay-token",
+			},
+		};
+		writeFileSync(statePath, JSON.stringify(stateWithDeprecatedBearer));
+
+		const store = new VoltdStateStore({ agentDir, statePath, debounceMs: 1 });
+		const loaded = await store.load();
+		expect(loaded.state.settings).not.toHaveProperty("relayAuthToken");
+		const persisted = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+		expect(persisted).not.toHaveProperty("relayAuthToken");
+		expect(persisted.settings).not.toHaveProperty("relayAuthToken");
+		await store.close();
+	});
+
 	it("rejects incompatible pre-grant daemon state without dropping identity or settings", async () => {
 		mkdirSync(join(agentDir, "daemon"), { recursive: true });
 		const incompatibleState = {
@@ -236,7 +258,7 @@ describe("voltd state migration", () => {
 		expect(existsSync(backupPath)).toBe(true);
 		const regenerated = parseVoltdState(JSON.parse(readFileSync(statePath, "utf8")));
 		expect(regenerated.irohSecretKey).toEqual(SECRET_KEY_BYTES);
-		expect(regenerated.settings.relayAuthToken).toBe("persisted-relay-token");
+		expect(regenerated.settings).not.toHaveProperty("relayAuthToken");
 		expect(regenerated.workspaces).toEqual(createLegacyState().workspaces);
 		expect(regenerated.clients).toEqual([]);
 		expect(regenerated.revokedClients).toEqual([]);
@@ -250,6 +272,6 @@ describe("voltd state migration", () => {
 		expect(recovered.previousStateBackupPath).toBeDefined();
 		const restored = parseVoltdState(JSON.parse(readFileSync(statePath, "utf8")));
 		expect(restored.irohSecretKey).toEqual(SECRET_KEY_BYTES);
-		expect(restored.settings.relayAuthToken).toBe("persisted-relay-token");
+		expect(restored.settings).not.toHaveProperty("relayAuthToken");
 	});
 });

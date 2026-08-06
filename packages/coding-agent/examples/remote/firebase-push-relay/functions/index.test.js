@@ -6,6 +6,7 @@ const { getPushTargetId, hashToken } = require("./core.js");
 const appId = "1:546623825529:ios:9f5a707e3f4ef89154d6a8";
 const collectionNames = [];
 const writes = [];
+const requestFunctionOptions = [];
 const moduleStubs = new Map([
 	[
 		"firebase-admin/app-check",
@@ -34,7 +35,25 @@ const moduleStubs = new Map([
 		},
 	],
 	["firebase-admin/messaging", { getMessaging: () => ({ send: async () => "unused" }) }],
-	["firebase-functions/v2/https", { onRequest: (_options, handler) => handler }],
+	["firebase-functions/logger", { error: () => {} }],
+	[
+		"firebase-functions/params",
+		{
+			defineSecret: (name) => ({
+				name,
+				value: () => `${name.toLowerCase()}-${"s".repeat(32)}`,
+			}),
+		},
+	],
+	[
+		"firebase-functions/v2/https",
+		{
+			onRequest: (options, handler) => {
+				requestFunctionOptions.push(options);
+				return handler;
+			},
+		},
+	],
 ]);
 const originalLoad = Module._load;
 Module._load = function load(request, parent, isMain) {
@@ -42,12 +61,27 @@ Module._load = function load(request, parent, isMain) {
 		? moduleStubs.get(request)
 		: Reflect.apply(originalLoad, this, [request, parent, isMain]);
 };
+let irohEnrollment;
 let pushRelay;
 try {
-	({ pushRelay } = require("./index.js"));
+	({ irohEnrollment, pushRelay } = require("./index.js"));
 } finally {
 	Module._load = originalLoad;
 }
+
+test("exports enrollment as a separate secret-backed v2 HTTPS function", () => {
+	assert.equal(typeof irohEnrollment, "function");
+	assert.notEqual(irohEnrollment, pushRelay);
+	assert.equal(requestFunctionOptions.length, 2);
+	assert.deepEqual(
+		requestFunctionOptions[0].secrets.map((secret) => secret.name),
+		[
+			"IROH_ENROLLMENT_IP_SALT",
+			"IROH_RELAY_ACCESS_SECRET_CURRENT",
+			"IROH_RELAY_ACCESS_SECRET_NEXT",
+		],
+	);
+});
 
 test("production registration route writes through the Firestore collection adapter", async () => {
 	const fcmToken = "fcm-token-value-0001";

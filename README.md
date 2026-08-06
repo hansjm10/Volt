@@ -17,11 +17,7 @@ and remains available under the MIT License.
 
 ## Remote Access Preview
 
-`volt remote host` can expose a local Volt runtime to a paired phone over Iroh
-without moving provider credentials or repository files off the host. Pairing is
-workstation-scoped: register local workspaces by name, pair the phone once with
-`volt remote pair`, then the phone can open known workspace names without another
-QR scan.
+The background daemon (`voltd`) can expose local Volt conversations to a paired phone over Iroh without moving provider credentials or repository files off the host. Pairing is workstation-scoped: start with `volt daemon start`, register local workspaces by name, and issue a strict one-time `volt+iroh://v2` invitation with `volt remote pair`. Official relay enrollment is app-assisted and endpoint-bound; the QR contains no broker URL or durable relay bearer. After pairing, the phone can open known workspace names without another QR scan.
 
 Integrated hosts advertise `multi_streams.v1` and `conversation_streams.v1`.
 Mobile streams bind during the Iroh handshake to one workspace/session
@@ -49,8 +45,9 @@ need future resource controls.
 
 See [Using Volt](packages/coding-agent/docs/usage.md#remote-access-over-iroh-preview),
 [Security](packages/coding-agent/docs/security.md#remote-access-over-iroh-preview),
-and [Iroh Remote Protocol v1](packages/coding-agent/docs/iroh-remote-protocol.md)
-for setup commands, fallback behavior for old hosts, and the wire contract.
+[Iroh Remote Protocol v2](packages/coding-agent/docs/iroh-remote-protocol.md), and
+[Iroh relay enrollment design](packages/coding-agent/docs/iroh-relay-enrollment-design.md)
+for setup commands, transport fallback behavior, and the wire contracts.
 
 ## Permissions And Containerization
 

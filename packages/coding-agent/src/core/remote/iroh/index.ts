@@ -95,6 +95,21 @@ export {
 	type IrohRemotePairingTicket,
 } from "./engine.ts";
 export {
+	createIrohRemoteEnrollmentClaim,
+	createIrohRemoteEnrollmentHostCanonicalMessage,
+	expectIrohRemoteBase64urlBytes,
+	expectIrohRemoteEndpointId,
+	hashIrohRemoteEnrollmentSecret,
+	type IrohRemoteEnrollmentClaim,
+	type IrohRemoteEnrollmentHostOperation,
+	type IrohRemoteEnrollmentSigner,
+	isIrohRemoteEndpointId,
+	normalizeIrohRemoteRelayOrigin,
+	normalizeIrohRemoteRelayOrigins,
+	parseIrohRemoteEnrollmentClaim,
+	signIrohRemoteEnrollmentMessage,
+} from "./enrollment.ts";
+export {
 	assertIrohRemoteHandshakeHostIdentity,
 	createIrohRemoteHandshakeFailure,
 	createIrohRemoteHandshakeSuccess,
@@ -284,8 +299,10 @@ export {
 	formatIrohRemoteHostFingerprint,
 	getIrohRemotePairingVerificationDetails,
 	type IrohRemotePairingVerificationDetails,
+	type IrohRemoteRelayDescriptor,
 	type IrohRemoteSanitizedReconnectTicketPayload,
 	type IrohRemoteTicketPayload,
+	parseIrohRemoteRelayDescriptor,
 	parseIrohRemoteTicketPayload,
 } from "./ticket.ts";
 export {

@@ -23,11 +23,12 @@ import {
 } from "../core/remote/iroh/agent-options.ts";
 import type { IrohRemoteClientAuthorizationSuccess } from "../core/remote/iroh/authorization.ts";
 import { hashIrohRemotePairingSecret } from "../core/remote/iroh/authorization.ts";
+import { IrohRemoteHostEngine, type IrohRemoteHostHandshakeResult } from "../core/remote/iroh/engine.ts";
 import {
-	DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS,
-	IrohRemoteHostEngine,
-	type IrohRemoteHostHandshakeResult,
-} from "../core/remote/iroh/engine.ts";
+	createIrohRemoteEnrollmentClaim,
+	type IrohRemoteEnrollmentClaim,
+	normalizeIrohRemoteRelayOrigins,
+} from "../core/remote/iroh/enrollment.ts";
 import {
 	createIrohRemoteHandshakeFailure,
 	type IrohRemoteHandshakeResponse,
@@ -62,6 +63,7 @@ import {
 	type IrohRemoteHostStateManager,
 	isIrohRemoteWorkspaceHasWorktreesError,
 } from "../core/remote/iroh/state-manager.ts";
+import type { IrohRemoteRelayDescriptor } from "../core/remote/iroh/ticket.ts";
 import { getIrohRemoteWorkspaceAvailabilityStatus } from "../core/remote/iroh/workspace.ts";
 import type { IrohRemoteWorktreeRpcBackend } from "../core/remote/iroh/worktree-rpc.ts";
 import type { IrohBiStreamLike } from "../core/rpc/iroh-transport.ts";
@@ -116,6 +118,12 @@ import {
 } from "./integrated-runtimes.ts";
 import { IrohConnectionSupervisor } from "./iroh-connection-supervisor.ts";
 import {
+	type IrohEnrollmentBroker,
+	IrohEnrollmentBrokerClient,
+	type IrohEnrollmentBrokerClientOptions,
+	IrohEnrollmentBrokerError,
+} from "./iroh-enrollment-broker.ts";
+import {
 	formatIrohLoadError,
 	type IrohConnectionLike,
 	type IrohEndpointLike,
@@ -168,6 +176,7 @@ const RELAY_OFFER_RETRY_AFTER_MS = 1000;
 const WORKSPACE_DISCOVERY_STREAM_SESSION_ID = "$workspace-discovery";
 const WORKSPACE_MANAGEMENT_STREAM_SESSION_ID = "$workspace-management";
 const IROH_ENDPOINT_READY_TIMEOUT_MS = 15_000;
+const IROH_ENROLLMENT_POLL_INTERVAL_MS = 1_000;
 const IROH_UNAUTHENTICATED_CONNECTION_TIMEOUT_MS = 15_000;
 const SHUTDOWN_RUNTIME_IDLE_CAP_MS = 60_000;
 
@@ -260,24 +269,21 @@ export const VOLT_PRODUCTION_RELAY_URLS = ["https://iroh-relay-us-central.volt-c
 export interface IrohDaemonServiceConfig {
 	relayMode?: IrohRelayMode;
 	/**
-	 * Relay server URLs (e.g. "https://relay.example.com"). When set (or via
-	 * VOLT_IROH_RELAY_URLS, comma-separated), production mode binds against
-	 * these instead of the built-in Volt fleet, and pairing tickets carry the
-	 * URLs so clients bind against the same relays.
+	 * Owner-operated relay origins. When set (or via VOLT_IROH_RELAY_URLS),
+	 * production mode treats them as custom uncredentialed transport instead of
+	 * the built-in Volt managed fleet.
 	 */
 	relayUrls?: string[];
-	/**
-	 * Bearer token presented to relay servers configured with
-	 * access.shared_token. Falls back to VOLT_IROH_RELAY_AUTH_TOKEN, then the
-	 * token persisted in daemon state from a previous start.
-	 */
-	relayAuthToken?: string;
 	pushRelayUrl?: string;
 	pushRelayAuthToken?: string;
 	profile?: string;
 }
 
 export interface IrohDaemonServiceDependencies {
+	/** Construct the fixed-URL enrollment broker client (focused tests only). */
+	createEnrollmentBroker?(options: IrohEnrollmentBrokerClientOptions): IrohEnrollmentBroker;
+	/** Enrollment polling interval override (focused tests only). */
+	enrollmentPollIntervalMs?: number;
 	/** Decorate a freshly bound endpoint (used to exercise native lifecycle failures). */
 	decorateEndpoint?(endpoint: IrohEndpointLike): IrohEndpointLike;
 	/** Decorate an accepted raw stream before lifecycle fencing (test-only failure injection). */
@@ -292,6 +298,7 @@ export interface IrohDaemonServiceDependencies {
 export interface ResolvedIrohRelayConfig {
 	relayMode: IrohRelayMode;
 	relayUrls: string[];
+	relay: IrohRemoteRelayDescriptor;
 	warning?: string;
 }
 
@@ -317,9 +324,19 @@ export function resolveIrohRelayConfig(
 	}
 	const relayMode = config.relayMode ?? envMode ?? "production";
 	const configuredUrls = config.relayUrls ?? envUrls;
-	const relayUrls =
-		relayMode === "production" ? (configuredUrls ?? VOLT_PRODUCTION_RELAY_URLS) : (configuredUrls ?? []);
-	return { relayMode, relayUrls, ...(warning === undefined ? {} : { warning }) };
+	if (relayMode === "production") {
+		const relayUrls = normalizeIrohRemoteRelayOrigins(
+			configuredUrls ?? VOLT_PRODUCTION_RELAY_URLS,
+			"configured Iroh relay origins",
+		);
+		const relay: IrohRemoteRelayDescriptor =
+			configuredUrls === undefined
+				? { kind: "volt-managed", origins: [...relayUrls] }
+				: { kind: "custom-uncredentialed", origins: [...relayUrls] };
+		return { relayMode, relayUrls, relay, ...(warning === undefined ? {} : { warning }) };
+	}
+	const relay: IrohRemoteRelayDescriptor = relayMode === "development" ? { kind: "n0-public" } : { kind: "disabled" };
+	return { relayMode, relayUrls: [], relay, ...(warning === undefined ? {} : { warning }) };
 }
 
 function parseRelayUrlsEnv(value: string | undefined): string[] | undefined {
@@ -340,6 +357,14 @@ interface PendingPairRequest {
 	expiresAt: number;
 	timer: NodeJS.Timeout;
 	cancellation?: Promise<void>;
+	enrollment?: IrohRemoteEnrollmentClaim;
+	enrollmentApproved?: boolean;
+	enrollmentClientEndpointId?: string;
+	enrollmentPollTimer?: NodeJS.Timeout;
+	pairedClientNodeId?: string;
+	pairingConsumed?: boolean;
+	completionSent?: boolean;
+	cancelled?: boolean;
 }
 
 interface ClientConnectionRecord {
@@ -627,8 +652,9 @@ class IrohDaemonService {
 	private readonly dependencies: IrohDaemonServiceDependencies;
 	private readonly relayMode: IrohRelayMode;
 	private readonly relayUrls: string[];
-	private readonly relayAuthToken: string | undefined;
+	private readonly relay: IrohRemoteRelayDescriptor;
 	private readonly relayConfigWarning: string | undefined;
+	private readonly enrollmentPollIntervalMs: number;
 	private readonly profile: string | undefined;
 	private readonly log: ReturnType<VoltdRuntimeServices["logger"]["child"]>;
 	private readonly stateManager: IrohRemoteHostStateManager;
@@ -637,6 +663,8 @@ class IrohDaemonService {
 	private readonly physicalStreamOwners = new Map<string, IrohPhysicalStreamOwner>();
 	private readonly tuiCoordinatorRekeyReservations = new Map<string, ConversationCoordinatorRekeyReservation>();
 	private readonly clientConnections = new Map<string, Set<ClientConnectionRecord>>();
+	private readonly clientRevocationDenylist = new Set<string>();
+	private readonly unstagedClientRevocations = new Map<string, number>();
 	private readonly connectionSupervisors = new Map<string, IrohConnectionSupervisor>();
 	private readonly connectionTasks = new Set<Promise<void>>();
 	private readonly nativeLifecycleTasks = new Set<Promise<void>>();
@@ -658,6 +686,9 @@ class IrohDaemonService {
 	private readonly viewerFeeds: ViewerFeedRegistry;
 	private readonly relays = new RelayRegistry();
 	private endpoint: IrohEndpointLike | undefined;
+	private enrollmentBroker: IrohEnrollmentBroker | undefined;
+	private enrollmentCancellationRetryTimer: NodeJS.Timeout | undefined;
+	private clientRevocationRetryTimer: NodeJS.Timeout | undefined;
 	private engine: IrohRemoteHostEngine | undefined;
 	private hostNodeId: string | undefined;
 	private endpointTicket: string | undefined;
@@ -675,18 +706,10 @@ class IrohDaemonService {
 		const relayConfig = resolveIrohRelayConfig(config);
 		this.relayMode = relayConfig.relayMode;
 		this.relayUrls = relayConfig.relayUrls;
+		this.relay = relayConfig.relay;
 		this.relayConfigWarning = relayConfig.warning;
+		this.enrollmentPollIntervalMs = dependencies.enrollmentPollIntervalMs ?? IROH_ENROLLMENT_POLL_INTERVAL_MS;
 		this.profile = config.profile;
-		const envRelayAuthToken = process.env.VOLT_IROH_RELAY_AUTH_TOKEN?.trim();
-		this.relayAuthToken =
-			config.relayAuthToken ??
-			(envRelayAuthToken !== undefined && envRelayAuthToken !== "" ? envRelayAuthToken : undefined) ??
-			services.state.state.settings.relayAuthToken;
-		// Persist a newly seen token so bare restarts keep authenticating against
-		// the relay without re-exporting the env var.
-		if (this.relayAuthToken !== undefined && this.relayAuthToken !== services.state.state.settings.relayAuthToken) {
-			services.state.updateSettings({ relayAuthToken: this.relayAuthToken });
-		}
 		this.log = services.logger.child("iroh");
 		this.stateManager = services.stateManager;
 		this.trustStore = new ProjectTrustStore(services.agentDir);
@@ -1025,6 +1048,29 @@ class IrohDaemonService {
 				this.ready.reject(new Error("iroh service shut down before endpoint startup"));
 				return;
 			}
+			let secretKey = this.services.state.state.irohSecretKey;
+			if (!secretKey) {
+				const generatedKey = this.iroh.SecretKey.generate().toBytes();
+				if (
+					generatedKey.length !== 32 ||
+					generatedKey.some((byte) => !Number.isInteger(byte) || byte < 0 || byte > 0xff)
+				) {
+					throw new Error("generated Iroh endpoint secret key must contain exactly 32 bytes");
+				}
+				this.services.state.setHostState({
+					...this.services.state.getHostState(),
+					hostSecretKey: generatedKey,
+				});
+				// Persist the identity before bind can publish it to direct discovery or
+				// any relay. A crash after network publication must never strand peers on
+				// an endpoint ID that the daemon cannot reproduce.
+				await this.services.state.flush();
+				if (!startupAdmission.isCurrent()) {
+					this.ready.reject(new Error("iroh service shut down during identity persistence"));
+					return;
+				}
+				secretKey = generatedKey;
+			}
 			const builder = this.iroh.Endpoint.builder();
 			if (this.relayMode === "development") {
 				this.log(
@@ -1037,23 +1083,12 @@ class IrohDaemonService {
 					throw new Error("relayMode production requires relay URLs (config.relayUrls or VOLT_IROH_RELAY_URLS)");
 				}
 				this.iroh.presetN0DisableRelay(builder);
-				if (this.relayAuthToken !== undefined) {
-					const relayMap = this.iroh.RelayMap.empty();
-					for (const url of this.relayUrls) {
-						relayMap.insert({ url, authToken: this.relayAuthToken });
-					}
-					builder.relayMode(this.iroh.RelayMode.custom(relayMap));
-				} else {
-					builder.relayMode(this.iroh.RelayMode.customFromUrls(this.relayUrls));
-				}
+				builder.relayMode(this.iroh.RelayMode.customFromUrls(this.relayUrls));
 			} else {
 				this.iroh.presetMinimal(builder);
 				builder.relayMode(this.iroh.RelayMode.disabled());
 			}
-			const secretKey = this.services.state.state.irohSecretKey;
-			if (secretKey) {
-				builder.secretKey(secretKey);
-			}
+			builder.secretKey(secretKey);
 			builder.alpns([Array.from(Buffer.from(IROH_REMOTE_ALPN, "utf8"))]);
 			const bindTask = builder.bind();
 			endpoint = await waitUntilAdmissionCancelled(bindTask, startupAdmission.signal);
@@ -1070,44 +1105,7 @@ class IrohDaemonService {
 				this.ready.reject(new Error("iroh service shut down during endpoint startup"));
 				return;
 			}
-			if (!secretKey) {
-				const boundKey = endpoint.secretKey().toBytes();
-				this.services.state.setHostState({
-					...this.services.state.getHostState(),
-					hostSecretKey: boundKey,
-				});
-				// Persist the freshly minted identity synchronously before the accept
-				// loop starts taking pairings. A crash/SIGKILL inside the 250ms debounce
-				// window would otherwise lose the key, and every phone paired against
-				// this endpoint would be talking to a node id the daemon can never
-				// reproduce on restart.
-				await this.services.state.flush();
-				if (!startupAdmission.isCurrent()) {
-					this.retireEndpoint(endpoint, "iroh endpoint disposal after identity persistence failed");
-					endpoint = undefined;
-					this.ready.reject(new Error("iroh service shut down during identity persistence"));
-					return;
-				}
-			}
-			// Everything after this boundary is native/publication work. Quiesce may
-			// now close core state without waiting for bind/online transport tails;
-			// dispose owns and bounds those tasks instead.
-			releaseStartupAdmission();
-			if (this.relayMode !== "disabled") {
-				const onlineTask = Promise.resolve(endpoint.online());
-				this.trackNativeLifecycleTask(onlineTask);
-				const online = await waitUntilAdmissionCancelled(
-					onlineTask.then(() => true),
-					startupAdmission.signal,
-				);
-				if (online !== true) {
-					this.retireEndpoint(endpoint, "iroh endpoint disposal after cancelled online failed");
-					endpoint = undefined;
-					this.ready.reject(new Error("iroh service shut down while endpoint was coming online"));
-					return;
-				}
-			}
-			if (!this.admission.isOpen) {
+			if (!startupAdmission.isCurrent()) {
 				this.retireEndpoint(endpoint, "iroh endpoint disposal after startup cancellation failed");
 				endpoint = undefined;
 				this.ready.reject(new Error("iroh service shut down during endpoint startup"));
@@ -1126,13 +1124,28 @@ class IrohDaemonService {
 					(await getIrohRemoteWorkspaceAvailabilityStatus(workspace)) === "available",
 				workspace: { name: "voltd", path: this.services.agentDir },
 			});
+			if (this.relay.kind === "volt-managed") {
+				const brokerOptions: IrohEnrollmentBrokerClientOptions = {
+					hostEndpointId: hostNodeId,
+					signer: endpoint.secretKey(),
+					expectedRelayOrigins: this.relay.origins,
+				};
+				this.enrollmentBroker = this.dependencies.createEnrollmentBroker
+					? this.dependencies.createEnrollmentBroker(brokerOptions)
+					: new IrohEnrollmentBrokerClient(brokerOptions);
+				void this.drainPendingEnrollmentCancellations();
+			}
+			// Publish readiness immediately after bind, durable identity persistence,
+			// and engine setup. Relay authorization may still be converging; direct and
+			// LAN transport must remain usable while endpoint.online() waits or fails.
 			this.endpoint = endpoint;
 			this.startupEndpoint = undefined;
 			this.hostNodeId = hostNodeId;
 			this.endpointTicket = endpointTicket;
 			this.engine = engine;
+			void this.drainPendingClientRevocations();
 			this.ready.resolve();
-			this.log("info", `iroh endpoint online`, {
+			this.log("info", "iroh endpoint bound", {
 				hostNodeId: this.hostNodeId,
 				relayMode: this.relayMode,
 				...(this.relayMode === "production" ? { relayUrls: this.relayUrls } : {}),
@@ -1140,7 +1153,22 @@ class IrohDaemonService {
 			this.acceptLoopTask = this.acceptLoop(endpoint).catch((error) => {
 				this.log("error", `accept loop failed: ${error instanceof Error ? error.message : String(error)}`);
 			});
+			const publishedEndpoint = endpoint;
 			endpoint = undefined;
+			releaseStartupAdmission();
+			if (this.relayMode !== "disabled") {
+				const onlineTask = Promise.resolve()
+					.then(() => publishedEndpoint.online())
+					.then(
+						() => this.log("info", "iroh endpoint online", { hostNodeId, relayMode: this.relayMode }),
+						(error: unknown) =>
+							this.log("warn", "iroh endpoint did not become relay-online; direct and LAN remain available", {
+								error: error instanceof Error ? error.message : String(error),
+								hostNodeId,
+							}),
+					);
+				this.trackNativeLifecycleTask(onlineTask);
+			}
 		} catch (error) {
 			if (endpoint) {
 				this.retireEndpoint(endpoint, "iroh endpoint disposal after startup failure failed");
@@ -1520,6 +1548,10 @@ class IrohDaemonService {
 			await owner.close("host_shutdown").catch(() => {});
 			return;
 		}
+		if (this.clientRevocationDenylist.has(remoteId)) {
+			await owner.close("client_revoked").catch(() => {});
+			return;
+		}
 		const engine = this.requireEngine();
 		const handshakeAdmission = this.resourceGuard.tryAcquireHandshake(remoteId);
 		if (!handshakeAdmission.ok) {
@@ -1592,7 +1624,10 @@ class IrohDaemonService {
 			return;
 		}
 
-		this.notifyPairingConsumed(handshake, remoteId);
+		if (!(await this.notifyPairingConsumed(handshake, remoteId))) {
+			await owner.close("client_revoked").catch(() => {});
+			return;
+		}
 
 		if (handshake.authorization.paired) {
 			this.log("info", `paired client stream: ${handshake.authorization.client.label} (${remoteId}, ${streamId})`);
@@ -3481,26 +3516,181 @@ class IrohDaemonService {
 	// Pairing over the control plane
 	// ==========================================================================
 
-	private notifyPairingConsumed(
+	private async notifyPairingConsumed(
 		handshake: { ok: true; authorization: IrohRemoteClientAuthorizationSuccess },
 		remoteId: string,
-	): void {
+	): Promise<boolean> {
 		const consumed = handshake.authorization.consumedPairingTicket;
-		if (!consumed) {
-			return;
-		}
+		if (!consumed) return true;
+		let accepted = true;
 		for (const [requestId, pending] of this.pendingPairRequests) {
-			if (pending.secretHash !== consumed.secretHash) {
+			if (pending.secretHash !== consumed.secretHash) continue;
+			pending.pairingConsumed = true;
+			pending.pairedClientNodeId = remoteId;
+			if (pending.enrollmentApproved && pending.enrollmentClientEndpointId !== remoteId) {
+				accepted = false;
+				await this.failPendingPairingEndpointMismatch(requestId, pending);
 				continue;
 			}
-			clearTimeout(pending.timer);
-			this.pendingPairRequests.delete(requestId);
+			this.completePendingPairingIfReady(requestId, pending);
+		}
+		return accepted;
+	}
+
+	private completePendingPairingIfReady(requestId: string, pending: PendingPairRequest): void {
+		if (!pending.pairingConsumed || pending.pairedClientNodeId === undefined) return;
+		if (pending.enrollment !== undefined) {
+			if (!pending.enrollmentApproved || pending.enrollmentClientEndpointId !== pending.pairedClientNodeId) {
+				return;
+			}
+		}
+		if (!pending.completionSent) {
+			pending.completionSent = true;
 			this.services.controlServer.sendTo(pending.connectionId, {
 				type: "pairing_progress",
 				requestId,
 				phase: "completed",
-				clientNodeId: remoteId,
+				clientNodeId: pending.pairedClientNodeId,
 			});
+		}
+		this.finishPendingPairing(requestId, pending);
+	}
+
+	private async failPendingPairingEndpointMismatch(requestId: string, pending: PendingPairRequest): Promise<void> {
+		const pairedClientNodeId = pending.pairedClientNodeId;
+		if (pairedClientNodeId !== undefined) {
+			this.clientRevocationDenylist.add(pairedClientNodeId);
+			this.unstagedClientRevocations.set(pairedClientNodeId, Date.now());
+			// Close every already-authorized stream before durable staging. A full
+			// queue or failed state write must not leave the mismatched client live.
+			await this.closeActiveStreamsForClient(pairedClientNodeId);
+			let staged = false;
+			try {
+				// Stage cleanup before revocation so an ambiguous state write or
+				// process restart cannot preserve the mismatched RPC client.
+				await this.stateManager.addPendingClientRevocation({
+					nodeId: pairedClientNodeId,
+					createdAt: Date.now(),
+				});
+				staged = true;
+			} catch (stagingError) {
+				// Queue capacity is itself fail-closed: fall back to committing the
+				// revocation directly rather than leaving an unstaged client behind.
+				try {
+					await this.requireEngine().revokeClient(pairedClientNodeId);
+					await this.services.state.flush();
+					this.unstagedClientRevocations.delete(pairedClientNodeId);
+					this.clientRevocationDenylist.delete(pairedClientNodeId);
+				} catch (revocationError) {
+					this.log("error", "failed to stage or directly persist mismatched-client revocation", {
+						revocationError: revocationError instanceof Error ? revocationError.message : String(revocationError),
+						stagingError: stagingError instanceof Error ? stagingError.message : String(stagingError),
+					});
+					this.scheduleClientRevocationRetry();
+				}
+			}
+			if (staged) {
+				try {
+					await this.services.state.flush();
+					this.unstagedClientRevocations.delete(pairedClientNodeId);
+				} catch (error) {
+					// Keep the in-memory denylist active and let the durable drain retry
+					// both revocation and persistence without reopening authorization.
+					this.log("error", "failed to flush pending mismatched-client revocation", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+				await this.drainPendingClientRevocations();
+			}
+			pending.cancelled = true;
+		} else {
+			pending.cancelled = true;
+		}
+		this.services.controlServer.sendTo(pending.connectionId, {
+			type: "pairing_progress",
+			requestId,
+			phase: "failed",
+			error: "paired client endpoint does not match relay enrollment approval",
+		});
+		this.finishPendingPairing(requestId, pending);
+	}
+
+	private finishPendingPairing(requestId: string, pending: PendingPairRequest): void {
+		if (this.pendingPairRequests.get(requestId) !== pending) return;
+		clearTimeout(pending.timer);
+		clearTimeout(pending.enrollmentPollTimer);
+		this.pendingPairRequests.delete(requestId);
+	}
+
+	private scheduleEnrollmentPoll(requestId: string, pending: PendingPairRequest, delayMs: number): void {
+		if (
+			pending.cancelled ||
+			pending.enrollment === undefined ||
+			this.pendingPairRequests.get(requestId) !== pending
+		) {
+			return;
+		}
+		clearTimeout(pending.enrollmentPollTimer);
+		pending.enrollmentPollTimer = setTimeout(() => {
+			void this.pollEnrollmentClaim(requestId, pending);
+		}, delayMs);
+		pending.enrollmentPollTimer.unref?.();
+	}
+
+	private async pollEnrollmentClaim(requestId: string, pending: PendingPairRequest): Promise<void> {
+		const broker = this.enrollmentBroker;
+		const claim = pending.enrollment;
+		if (
+			broker === undefined ||
+			claim === undefined ||
+			pending.cancelled ||
+			this.pendingPairRequests.get(requestId) !== pending
+		) {
+			return;
+		}
+		try {
+			const status = await broker.getClaimStatus(claim);
+			if (pending.cancelled || this.pendingPairRequests.get(requestId) !== pending) return;
+			if (status.status === "approved") {
+				pending.enrollmentApproved = true;
+				pending.enrollmentClientEndpointId = status.clientEndpointId;
+				if (pending.pairingConsumed && pending.pairedClientNodeId !== status.clientEndpointId) {
+					await this.failPendingPairingEndpointMismatch(requestId, pending);
+					return;
+				}
+				const endpoint = this.endpoint;
+				if (!endpoint) return;
+				try {
+					for (const origin of this.relayUrls) {
+						await endpoint.insertRelay({ url: origin });
+					}
+					this.completePendingPairingIfReady(requestId, pending);
+					return;
+				} catch (error) {
+					this.log("warn", "failed to refresh managed Iroh relay registration after enrollment approval", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			} else if (status.status === "cancelled" || status.status === "expired") {
+				if (!pending.pairingConsumed) {
+					await this.cancelLocalPendingPairing(pending);
+					this.services.controlServer.sendTo(pending.connectionId, {
+						type: "pairing_progress",
+						requestId,
+						phase: "failed",
+						error: `relay enrollment claim ${status.status}`,
+					});
+				}
+				this.finishPendingPairing(requestId, pending);
+				return;
+			}
+		} catch (error) {
+			this.log("warn", "managed Iroh relay enrollment status check failed; direct and LAN remain available", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		if (Date.now() < pending.expiresAt) {
+			this.scheduleEnrollmentPoll(requestId, pending, this.enrollmentPollIntervalMs);
 		}
 	}
 
@@ -3525,7 +3715,7 @@ class IrohDaemonService {
 		}
 		const engine = this.requireEngine();
 		const endpoint = this.endpoint;
-		if (!endpoint || !this.endpointTicket) {
+		if (!endpoint || !this.endpointTicket || !this.hostNodeId) {
 			connection.send({ type: "error", id: request.id, code: "iroh_unavailable", message: "endpoint not ready" });
 			return;
 		}
@@ -3534,7 +3724,20 @@ class IrohDaemonService {
 				? ((request as Record<string, unknown>).workspaceName as string)
 				: undefined;
 		const requestId = randomUUID();
+		let enrollment: IrohRemoteEnrollmentClaim | undefined;
 		try {
+			let relay = this.relay;
+			let expiresAt: number | undefined;
+			if (this.relay.kind === "volt-managed") {
+				const broker = this.enrollmentBroker;
+				if (!broker) throw new Error("managed Iroh relay enrollment broker is not ready");
+				enrollment = createIrohRemoteEnrollmentClaim();
+				// The broker claim exists before any pairing ticket or local pairing
+				// secret can be published to the control client.
+				const created = await broker.createClaim(enrollment);
+				relay = { kind: "volt-managed", origins: created.relayOrigins };
+				expiresAt = created.expiresAtEpochSeconds * 1000;
+			}
 			const access =
 				request.access !== undefined
 					? createIrohRemotePresetAccess(request.access)
@@ -3549,13 +3752,26 @@ class IrohDaemonService {
 				rpcGrant: access.rpcGrant,
 				irohTicket: this.endpointTicket,
 				nodeId: this.hostNodeId,
-				relayMode: this.relayMode,
-				...(this.relayMode === "production" ? { relayUrls: this.relayUrls } : {}),
-				...(this.relayMode === "production" && this.relayAuthToken !== undefined
-					? { relayAuthToken: this.relayAuthToken }
-					: {}),
+				relay,
+				...(enrollment === undefined ? {} : { enrollment }),
+				...(expiresAt === undefined ? {} : { expiresAt }),
 				...(workspaceName === undefined ? {} : { workspace: workspaceName }),
 			});
+			const ttlMs = Math.max(0, pairing.expiresAt - Date.now());
+			let pending: PendingPairRequest;
+			const timer = setTimeout(() => {
+				void this.expirePendingPairing(requestId, pending);
+			}, ttlMs);
+			timer.unref?.();
+			pending = {
+				requestId,
+				connectionId: connection.connectionId,
+				secretHash: hashIrohRemotePairingSecret(pairing.secret),
+				expiresAt: pairing.expiresAt,
+				timer,
+				...(enrollment === undefined ? {} : { enrollment }),
+			};
+			this.pendingPairRequests.set(requestId, pending);
 			connection.send({ type: "pair_started", id: request.id, requestId });
 			connection.send({
 				type: "pairing_progress",
@@ -3564,30 +3780,11 @@ class IrohDaemonService {
 				ticket: pairing.ticket,
 			});
 			connection.send({ type: "pairing_progress", requestId, phase: "waiting" });
-			const ttlMs = Math.max(0, pairing.expiresAt - Date.now());
-			const timer = setTimeout(
-				() => {
-					if (!this.pendingPairRequests.delete(requestId)) {
-						return;
-					}
-					this.services.controlServer.sendTo(connection.connectionId, {
-						type: "pairing_progress",
-						requestId,
-						phase: "failed",
-						error: "pairing ticket expired",
-					});
-				},
-				ttlMs > 0 ? ttlMs : DEFAULT_IROH_REMOTE_PAIRING_TICKET_TTL_MS,
-			);
-			timer.unref?.();
-			this.pendingPairRequests.set(requestId, {
-				requestId,
-				connectionId: connection.connectionId,
-				secretHash: hashIrohRemotePairingSecret(pairing.secret),
-				expiresAt: pairing.expiresAt,
-				timer,
-			});
+			if (enrollment !== undefined) this.scheduleEnrollmentPoll(requestId, pending, 0);
 		} catch (error) {
+			if (enrollment !== undefined) {
+				void this.enrollmentBroker?.cancelClaim(enrollment).catch(() => {});
+			}
 			connection.send({
 				type: "error",
 				id: request.id,
@@ -4219,32 +4416,189 @@ class IrohDaemonService {
 		return { ok: true, engine: this.engine };
 	}
 
+	private async cancelLocalPendingPairing(pending: PendingPairRequest): Promise<void> {
+		if (this.engine) {
+			await this.engine.cancelPairingSecretByHash(pending.secretHash);
+		} else {
+			await this.stateManager.removePendingPairingTicket(pending.secretHash);
+		}
+		await this.services.state.flush();
+	}
+
+	private async expirePendingPairing(requestId: string, pending: PendingPairRequest): Promise<void> {
+		if (this.pendingPairRequests.get(requestId) !== pending) return;
+		try {
+			await this.cancelPendingPairing(requestId, pending);
+		} catch (error) {
+			this.log("warn", "failed to clean up expired pairing", {
+				error: error instanceof Error ? error.message : String(error),
+				requestId,
+			});
+			this.finishPendingPairing(requestId, pending);
+		}
+		if (!pending.pairingConsumed) {
+			this.services.controlServer.sendTo(pending.connectionId, {
+				type: "pairing_progress",
+				requestId,
+				phase: "failed",
+				error: "pairing ticket expired",
+			});
+		}
+	}
+
 	private cancelPendingPairing(requestId: string, pending: PendingPairRequest): Promise<void> {
-		if (this.pendingPairRequests.get(requestId) !== pending) {
-			return Promise.resolve();
-		}
-		if (pending.cancellation) {
-			return pending.cancellation;
-		}
+		if (this.pendingPairRequests.get(requestId) !== pending) return Promise.resolve();
+		if (pending.cancellation) return pending.cancellation;
+		pending.cancelled = true;
 		clearTimeout(pending.timer);
+		clearTimeout(pending.enrollmentPollTimer);
 		const cancellation = (async () => {
-			if (this.engine) {
-				await this.engine.cancelPairingSecretByHash(pending.secretHash);
-			} else {
-				await this.stateManager.removePendingPairingTicket(pending.secretHash);
+			if (pending.enrollment !== undefined && this.enrollmentBroker !== undefined) {
+				await this.stateManager.addPendingEnrollmentCancellation({
+					...pending.enrollment,
+					createdAt: Date.now(),
+				});
+				await this.services.state.flush();
 			}
-			await this.services.state.flush();
-			if (this.pendingPairRequests.get(requestId) === pending) {
-				this.pendingPairRequests.delete(requestId);
+			await this.cancelLocalPendingPairing(pending);
+			if (pending.enrollment !== undefined && this.enrollmentBroker !== undefined) {
+				await this.drainPendingEnrollmentCancellations();
 			}
+			this.finishPendingPairing(requestId, pending);
 		})();
 		pending.cancellation = cancellation;
 		void cancellation.catch(() => {
-			if (pending.cancellation === cancellation) {
-				pending.cancellation = undefined;
+			if (pending.cancellation !== cancellation) return;
+			pending.cancellation = undefined;
+			pending.cancelled = false;
+			// A failed durable local revocation must remain retryable. The original
+			// timer was cleared when cancellation began, so restore an expiry cleanup
+			// instead of leaving a live pending entry with no future owner.
+			if (this.pendingPairRequests.get(requestId) === pending) {
+				pending.timer = setTimeout(
+					() => void this.expirePendingPairing(requestId, pending),
+					Math.max(1_000, pending.expiresAt - Date.now()),
+				);
+				pending.timer.unref?.();
 			}
 		});
 		return cancellation;
+	}
+
+	private scheduleClientRevocationRetry(): void {
+		clearTimeout(this.clientRevocationRetryTimer);
+		this.clientRevocationRetryTimer = setTimeout(
+			() => void this.drainPendingClientRevocations(),
+			Math.max(1_000, this.enrollmentPollIntervalMs),
+		);
+		this.clientRevocationRetryTimer.unref?.();
+	}
+
+	private async drainPendingClientRevocations(): Promise<void> {
+		const engine = this.engine;
+		if (!engine) return;
+		const admission = this.admission.tryAcquire();
+		if (!admission) return;
+		clearTimeout(this.clientRevocationRetryTimer);
+		this.clientRevocationRetryTimer = undefined;
+		let retryNeeded = false;
+		try {
+			for (const [nodeId, createdAt] of this.unstagedClientRevocations) {
+				try {
+					await this.stateManager.addPendingClientRevocation({ nodeId, createdAt });
+					await this.services.state.flush();
+					this.unstagedClientRevocations.delete(nodeId);
+				} catch (stagingError) {
+					try {
+						await engine.revokeClient(nodeId);
+						if (!admission.isCurrent()) return;
+						await this.services.state.flush();
+						this.unstagedClientRevocations.delete(nodeId);
+						this.clientRevocationDenylist.delete(nodeId);
+						await this.closeActiveStreamsForClient(nodeId);
+					} catch (revocationError) {
+						retryNeeded = true;
+						this.log("error", "failed to retry unstaged mismatched-client revocation", {
+							revocationError:
+								revocationError instanceof Error ? revocationError.message : String(revocationError),
+							stagingError: stagingError instanceof Error ? stagingError.message : String(stagingError),
+						});
+					}
+				}
+			}
+			const revocations = await this.stateManager.listPendingClientRevocations();
+			for (const revocation of revocations) {
+				try {
+					await engine.revokeClient(revocation.nodeId);
+					if (!admission.isCurrent()) return;
+					await this.services.state.flush();
+					await this.stateManager.removePendingClientRevocation(revocation.nodeId);
+					await this.services.state.flush();
+					this.clientRevocationDenylist.delete(revocation.nodeId);
+					await this.closeActiveStreamsForClient(revocation.nodeId);
+				} catch (error) {
+					retryNeeded = true;
+					this.log("error", "failed to durably revoke mismatched pairing endpoint", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+		} finally {
+			const scheduleRetry = retryNeeded && admission.isCurrent();
+			admission.release();
+			if (scheduleRetry) this.scheduleClientRevocationRetry();
+		}
+	}
+
+	private async drainPendingEnrollmentCancellations(): Promise<void> {
+		const broker = this.enrollmentBroker;
+		if (!broker) return;
+		const admission = this.admission.tryAcquire();
+		if (!admission) return;
+		clearTimeout(this.enrollmentCancellationRetryTimer);
+		this.enrollmentCancellationRetryTimer = undefined;
+		let retryNeeded = false;
+		try {
+			const cancellations = await this.stateManager.listPendingEnrollmentCancellations();
+			for (const cancellation of cancellations) {
+				try {
+					await broker.cancelClaim(cancellation);
+					if (!admission.isCurrent()) return;
+					await this.stateManager.removePendingEnrollmentCancellation(cancellation.claimId);
+					await this.services.state.flush();
+				} catch (error) {
+					if (error instanceof IrohEnrollmentBrokerError && error.status === 409 && admission.isCurrent()) {
+						try {
+							// Approval won the race. The phone's durable grant obligation owns
+							// cleanup from here, so the claim cancellation is acknowledged.
+							await this.stateManager.removePendingEnrollmentCancellation(cancellation.claimId);
+							await this.services.state.flush();
+							continue;
+						} catch (persistenceError) {
+							retryNeeded = true;
+							this.log("warn", "managed Iroh relay cancellation acknowledgement failed", {
+								error: persistenceError instanceof Error ? persistenceError.message : String(persistenceError),
+							});
+							continue;
+						}
+					}
+					retryNeeded = true;
+					this.log("warn", "managed Iroh relay enrollment cancellation failed", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+		} finally {
+			const scheduleRetry = retryNeeded && admission.isCurrent();
+			admission.release();
+			if (scheduleRetry) {
+				this.enrollmentCancellationRetryTimer = setTimeout(
+					() => void this.drainPendingEnrollmentCancellations(),
+					Math.max(1_000, this.enrollmentPollIntervalMs),
+				);
+				this.enrollmentCancellationRetryTimer.unref?.();
+			}
+		}
 	}
 
 	onControlConnectionClosed(connection: ControlConnection): void {
@@ -4256,7 +4610,7 @@ class IrohDaemonService {
 			return;
 		}
 		const cancellations = Array.from(this.pendingPairRequests)
-			.filter(([, pending]) => pending.connectionId === connection.connectionId)
+			.filter(([, pending]) => pending.connectionId === connection.connectionId && !pending.pairingConsumed)
 			.map(async ([requestId, pending]) => {
 				try {
 					await this.cancelPendingPairing(requestId, pending);
@@ -4291,11 +4645,16 @@ class IrohDaemonService {
 		// closed against the same state.
 		this.admission.close();
 		this.worktreeRetention.dispose();
+		clearTimeout(this.enrollmentCancellationRetryTimer);
+		this.enrollmentCancellationRetryTimer = undefined;
+		clearTimeout(this.clientRevocationRetryTimer);
+		this.clientRevocationRetryTimer = undefined;
 		// Freeze expiry callbacks at the same cut. Once admission is closed, no
 		// disconnect callback may mutate durable pairing state; quiesce becomes the
 		// sole owner of every ticket still published in this map.
 		for (const pending of this.pendingPairRequests.values()) {
 			clearTimeout(pending.timer);
+			clearTimeout(pending.enrollmentPollTimer);
 		}
 		// 1. Stop accepting, then close every published conversation transport
 		//    through its coordinator. Offered and redeemed relays share this same

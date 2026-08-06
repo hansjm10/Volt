@@ -1,8 +1,6 @@
-# Iroh remote demo clients
+# Iroh remote demo client
 
-This example tunnels Volt RPC JSONL over an Iroh QUIC bidirectional stream.
-
-The supported preview host lives in Volt itself: the background daemon (`volt daemon start`, see `docs/daemon.md`) owns the Iroh endpoint. This directory keeps demo clients for local remote testing.
+This example drives Volt RPC JSONL over Iroh against the product background daemon (`voltd`). The old standalone example host has been removed; the daemon owns the persistent endpoint identity, pairing, registered workspaces, grants, and audit state.
 
 ## Install
 
@@ -12,199 +10,70 @@ From the repository root:
 npm run iroh:poc:install
 ```
 
-For direct demo-client commands from this directory after the repository root or containing package has already been installed:
+`@number0/iroh` is optional in `@hansjm10/volt-coding-agent`. Run the root install with optional dependencies enabled before starting the daemon. Standalone Node SEA builds do not bundle Iroh; use a Node.js npm install or source checkout.
 
-```bash
-npm install --ignore-scripts
-```
-
-`@number0/iroh` is an optional dependency of `@hansjm10/volt-coding-agent`. Host commands use the product package install, so run root install before `volt remote host` or `npm run iroh:poc:host`. If `volt remote host` reports that the optional native adapter is unavailable, reinstall with optional dependencies enabled for the current platform. The example package can still install the dependency locally for direct client demos. Standalone Node SEA builds reject `volt remote host` because the optional native Iroh adapter is intentionally not bundled; use a Node.js npm install or source checkout.
-
-## Root scripts
-
-From the repository root:
-
-```bash
-npm run iroh:poc:host                   # integrated source Volt host
-npm run iroh:poc:host:volt              # integrated source Volt host for this checkout
-npm run iroh:poc:client -- "<ticket>"    # one-shot client
-npm run iroh:poc:client -- "<ticket>" --interactive  # persistent prompt loop
-npm run iroh:poc:clients                # list paired clients through the example wrapper
-volt remote clients                     # list paired clients through the product CLI
-volt remote status                      # inspect persisted host state
-npm run iroh:poc:revoke -- <node-id>    # revoke a paired client through the wrapper
-volt remote revoke <node-id>            # revoke a paired client through the product CLI
-```
-
-Pass extra client flags after `--`, for example:
-
-```bash
-npm run iroh:poc:client -- "<ticket>" --message "List top-level files."
-```
-
-Use `npm run --silent ...` if you want stdout to contain only the ticket or client output.
-
-## Local integrated smoke test
+## Start, register, and pair
 
 Terminal 1:
 
 ```bash
-npm run iroh:poc:host -- --once
+volt daemon start
+volt remote workspace add /path/to/repo --name volt
+volt remote pair --workspace volt
 ```
 
-Copy the printed `volt+iroh://v1/...` ticket.
+`volt remote pair` prints a strict `volt+iroh://v2/...` invitation and waits for it to be claimed. The ticket is short-lived and one-time. A managed ticket contains separate desktop-pairing and 10-minute relay-enrollment claims, but no broker URL, App Check token, durable pair grant, or relay infrastructure bearer.
 
 Terminal 2:
 
 ```bash
-npm run iroh:poc:client -- "<ticket>" --message "hello from another device"
-```
-
-Or keep the connection open:
-
-```bash
-npm run iroh:poc:client -- "<ticket>" --interactive
-```
-
-The first successful connection persists the host key, client key, registered workspaces, and paired client allowlist in state files:
-
-```text
-~/.volt/agent/daemon/state.json
-~/.volt/agent/remote/iroh-sidecar-client.json
-```
-
-Use `--state <path>` on host or client for isolated test state.
-
-## Workspace registration, pairing, and revocation
-
-Register workspaces locally on the desktop host. The registered name is what remote clients and the iOS app see; the host-local path stays in the host state file. In a TTY, registration offers `trust` when the workspace has project-local Volt resources; use `--approve` to save workspace trust noninteractively.
-
-```bash
-volt remote host --register-workspace volt=/path/to/repo
-volt remote host --register-workspace other=/path/to/other-repo
-```
-
-The host prints a pairing ticket by default. A client that connects with that ticket is added to the host allowlist for the workstation represented by the host state file. The ticket workspace is the first selected workspace, not the only workspace the paired client may use.
-
-A running host also accepts local management requests from `volt remote pair`, which prints only the generated ticket on stdout:
-
-```bash
-# Terminal 1
-volt remote host --register-workspace volt=/path/to/repo --allow-tools read,grep,find,ls
-volt remote host --mobile --yes
-
-# Terminal 2
-volt remote pair --workspace volt
-npm run iroh:poc:client -- "<ticket>" --get-state
-
-# Unsafe grants require confirmation, or --yes for noninteractive use.
-volt remote pair --workspace volt --allow-tools read,grep,find,ls,bash --yes
-```
-
-If no host is running for the selected `--state` file, or if the workspace is missing or ambiguous, `volt remote pair` fails with diagnostics on stderr and no ticket on stdout.
-
-After a client is paired, reconnect tickets do not need a pairing secret. The same paired client can reconnect to another registered workspace name in the same host state file without scanning another QR. Registering a new workspace does not change the client's persisted built-in tool grant; the existing `allowedTools` grant applies across all registered workspaces until the client is revoked and paired again with a different grant. When that grant is the default built-in list, active extension tools in the selected workspace are also exposed.
-
-List paired clients:
-
-```bash
-npm run iroh:poc:clients
-```
-
-Inspect persisted host state, workspaces, clients, client tool grants, and state/audit paths:
-
-```bash
-volt remote status
-volt remote status
-```
-
-`volt remote status` prints persisted state only and includes that warning in its output; it does not print pairing secrets or secret hashes.
-
-Revoke a client:
-
-```bash
-npm run iroh:poc:revoke -- <client-node-id>
-```
-
-Revocation removes the client from persisted state so future connections to every registered workspace fail. If a host is currently running for the same state file, the revoke command also asks that host to close matching active connections and audits `active_connection_revoked`; if no live host is reachable, persisted revocation still succeeds and the command prints an active-live-unavailable diagnostic. To change an existing client's tool grant in preview, revoke that client and pair it again with the desired `--allow-tools`.
-
-After a client is paired, the host can run without accepting new clients:
-
-```bash
-npm run iroh:poc:host -- --no-pairing --once
-```
-
-In `--no-pairing` mode, the printed ticket contains no pairing secret. Only clients already stored in the host allowlist can connect.
-
-## Test with real Volt RPC
-
-Terminal 1, when testing this source checkout from the repository root:
-
-```bash
-npm run iroh:poc:host:volt -- --allow-tools read,grep,find,ls
-```
-
-The same integrated path is also available through the source CLI:
-
-```bash
-node scripts/run-coding-agent-source.mjs remote host --workspace volt=. --allow-tools read,grep,find,ls
-```
-
-Remote sessions follow normal project trust behavior. Saved workspace trust is honored; otherwise choose `trust` in the host prompt or add `--approve` only when the host user trusts project-local settings/resources for the exposed workspace.
-
-Terminal 1, when testing another repository path with the integrated host:
-
-```bash
-npm run iroh:poc:host -- --workspace volt=/path/to/repo --allow-tools read,grep,find,ls
-```
-
-Terminal 2, one-shot commands:
-
-```bash
 npm run iroh:poc:client -- "<ticket>" --get-state
 npm run iroh:poc:client -- "<ticket>" --message "List the top-level files."
-```
-
-Terminal 2, persistent prompt loop:
-
-```bash
 npm run iroh:poc:client -- "<ticket>" --interactive
 ```
 
-Interactive commands:
+Interactive commands are `/state`, `/abort`, and `/quit` (`/exit` is an alias). Ctrl+C aborts a running prompt and exits while idle.
 
-- `/state` prints current RPC session state.
-- `/abort` sends an abort command.
-- `/quit` or `/exit` exits the client.
-- Ctrl+C aborts a running prompt; Ctrl+C while idle exits.
+Use `npm run --silent ...` when stdout must contain only client output.
 
-The daemon's default `production` relay mode is suitable for cross-network testing; the ticket carries the relay configuration to the client.
-
-## Relay mode
-
-The daemon defaults to `production` relay mode on the Volt-operated relay fleet. Set `VOLT_IROH_RELAY_MODE` to `disabled` for LAN-only connections, `development` for the public n0 development relays, or `production` before starting the daemon. For explicit LAN-only testing:
+## Management and reconnect
 
 ```bash
-VOLT_IROH_RELAY_MODE=disabled volt daemon start
+volt daemon status
+volt remote status
+volt remote clients
+volt remote workspace list
+volt remote revoke <client-node-id>
+volt remote approve-repair <client-node-id>
 ```
 
-The ticket records the running daemon's relay configuration and the client uses the same relays. Use `production` mode for real app validation; same-machine tests do not prove relay reachability.
+After host authentication, a paired client reconnects with pinned endpoint identity and saved-host authority rather than another QR. The same phone can select any registered workspace name in the daemon state. Revocation blocks desktop RPC for that phone across all workspaces; approving re-pair and issuing a fresh ticket are both required before a revoked endpoint can return.
+
+The demo client persists its endpoint key under `~/.volt/agent/remote/iroh-sidecar-client.json`. Use its `--state <path>` option for isolated tests. Daemon state and audit data live under `~/.volt/agent/daemon/`; status output does not print secrets.
+
+## Relay descriptors
+
+The running daemon fixes the v2 ticket descriptor:
+
+- default `production` with official origins: `volt-managed`, requiring app-assisted enrollment from the official iOS app;
+- `VOLT_IROH_RELAY_MODE=development`: `n0-public`, suitable for this non-App-Check demo and simulator testing;
+- `VOLT_IROH_RELAY_MODE=disabled`: direct/LAN only; or
+- production with custom `VOLT_IROH_RELAY_URLS`: `custom-uncredentialed` owner-controlled origins.
+
+The Node demo client cannot approve a managed Firebase App Check claim. Use explicit n0-public or disabled transport for this example:
+
+```bash
+VOLT_IROH_RELAY_MODE=development volt daemon start
+```
+
+Broker failure for managed transport does not disable direct/LAN dialing. Custom relays receive no App Check material. See [Iroh relay enrollment design](https://github.com/volt-hq/Volt/blob/main/packages/coding-agent/docs/iroh-relay-enrollment-design.md).
 
 ## Security notes
 
-Remote host support is a preview feature and should be treated as remote access to the host machine.
+- Desktop-control pairing and relay enrollment are separate. A pair grant cannot authorize a Volt handshake, workspace, RPC, or tool.
+- Pair only devices you control. A paired phone can drive every registered workspace and, for a TUI-owned conversation, the TUI's full local tool set.
+- Daemon-owned runtimes enforce the persisted client tool/capability grant and configured ceilings. `bash`, `edit`, `write`, `image_gen`, and extension tools can affect host files, processes, credentials, or networks.
+- Workspace names are registered locally; clients cannot supply arbitrary host paths. Remote sessions do not bypass project trust.
+- Stock managed-relay revocation takes effect on the next endpoint registration. It cannot interrupt an already-open relay registration or meter endpoint bytes.
 
-- Remote access is opt-in; nothing listens until the host command starts.
-- Pairing tickets contain a short-lived one-time secret for adding a client to the allowlist. Persisted state stores hashes and non-secret metadata, not raw secrets.
-- Paired clients are persisted until revoked.
-- Any paired client can control the integrated runtime for registered workspace names in the same host state file.
-- Pairing is workstation-scoped in this preview. A paired client can use registered workspace names added later without another QR scan, and revocation blocks that client from every registered workspace.
-- Real Volt RPC can use only built-in tools allowed by the client's persisted `allowedTools` grant. That grant applies across all registered workspaces; when it is the default built-in list, active extension tools in the selected workspace are also exposed. The `coding` and `full` RPC presets use the default list, including Codex-only `image_gen`.
-- Use a custom read-only tool list (`read,grep,find,ls`) unless the client, workspace, and loaded extensions are trusted.
-- `--allow-tools` grants that include `bash`, `edit`, `write`, or `image_gen` can modify host files; `bash` can run shell commands, and `image_gen` can read and upload local reference images and write generated PNG files. Extension tools run code installed on the host and may do the same. TTY host and pair commands ask for confirmation on unsafe built-in grants, and noninteractive commands must pass `--yes`.
-- Workspaces are registered locally and selected by saved name, not arbitrary client-provided paths. Remote clients cannot register, edit, delete, or map workspace paths.
-- Remote sessions do not bypass project trust. Saved workspace trust is honored; otherwise choose `trust` in the host prompt or use `--approve` only when the host user trusts project-local resources.
-- Default state and audit paths are `~/.volt/agent/daemon/state.json` and `~/.volt/agent/remote/iroh-host.audit.jsonl`.
-- Do not expose sensitive workspaces or run with `bash,edit,write,image_gen` unless the client is trusted.
-
-See [Using Volt](../../../docs/usage.md#remote-access-over-iroh-preview), [Security](../../../docs/security.md#remote-access-over-iroh-preview), and [the design document](../../../docs/iroh-remote-access-design.md) for the product security model.
+See [Using Volt](../../../docs/usage.md#remote-access-over-iroh-preview), [Security](../../../docs/security.md#remote-access-over-iroh-preview), [Iroh Remote Protocol v2](../../../docs/iroh-remote-protocol.md), and [Background daemon](../../../docs/daemon.md).

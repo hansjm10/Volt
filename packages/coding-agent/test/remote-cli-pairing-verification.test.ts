@@ -11,9 +11,10 @@ describe("remote pair CLI verification output", () => {
 			expiresAt: 1_800_000_000_000,
 			irohTicket: "endpoint-ticket",
 			nodeId: hostNodeId,
-			relayMode: "production",
-			relayUrls: ["https://relay-b.example/", "https://relay-a.example:8443"],
-			relayAuthToken: "relay-auth-must-not-render",
+			relay: {
+				kind: "custom-uncredentialed",
+				origins: ["https://relay-a.example:8443", "https://relay-b.example"],
+			},
 			secret: "pairing-secret-must-not-render",
 			workspace: "volt",
 		});
@@ -27,6 +28,5 @@ describe("remote pair CLI verification output", () => {
 		expect(output).toContain("https://relay-b.example");
 		expect(output).toContain("2027-01-15T08:00:00.000Z");
 		expect(output).not.toContain("pairing-secret-must-not-render");
-		expect(output).not.toContain("relay-auth-must-not-render");
 	});
 });

@@ -1,36 +1,34 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { isIP } from "node:net";
 import {
-	IROH_REMOTE_ALPN,
-	IROH_REMOTE_TICKET_PREFIX,
-	IrohRemoteOutcomeError,
-	type IrohRemoteRelayMode,
-	isIrohRemoteRelayMode,
-	isIrohRemoteRelayUrls,
-} from "./protocol.ts";
+	expectIrohRemoteEndpointId,
+	type IrohRemoteEnrollmentClaim,
+	normalizeIrohRemoteRelayOrigins,
+	parseIrohRemoteEnrollmentClaim,
+} from "./enrollment.ts";
+import { IROH_REMOTE_ALPN, IROH_REMOTE_TICKET_PREFIX, IrohRemoteOutcomeError } from "./protocol.ts";
+
+export type IrohRemoteRelayDescriptor =
+	| { kind: "volt-managed"; origins: string[] }
+	| { kind: "custom-uncredentialed"; origins: string[] }
+	| { kind: "n0-public" }
+	| { kind: "disabled" };
 
 export interface IrohRemoteTicketPayload {
 	alpn: typeof IROH_REMOTE_ALPN;
 	expiresAt?: number;
 	irohTicket: string;
-	nodeId?: string;
-	relayMode?: IrohRemoteRelayMode;
-	/** Relay server URLs the client should use; required when relayMode is "production". */
-	relayUrls?: string[];
-	/**
-	 * Bearer token for relays behind access.shared_token. Secret-like: carried
-	 * in pairing tickets (clients keychain it) and stripped from sanitized
-	 * reconnect tickets.
-	 */
-	relayAuthToken?: string;
+	nodeId: string;
+	relay: IrohRemoteRelayDescriptor;
+	enrollment?: IrohRemoteEnrollmentClaim;
 	secret?: string;
 	workspace: string;
 }
 
 export interface IrohRemoteSanitizedReconnectTicketPayload extends IrohRemoteTicketPayload {
-	nodeId: string;
-	relayMode: IrohRemoteRelayMode;
+	expiresAt?: never;
+	enrollment?: never;
+	secret?: never;
 }
 
 /** Non-secret values a user can compare before accepting a pairing ticket. */
@@ -38,7 +36,7 @@ export interface IrohRemotePairingVerificationDetails {
 	expiresAt?: number;
 	hostFingerprint: string;
 	hostNodeId: string;
-	relayMode: IrohRemoteRelayMode;
+	relayMode: "disabled" | "development" | "production";
 	relayOrigins: string[];
 	workspace: string;
 }
@@ -66,137 +64,38 @@ export function formatIrohRemoteHostFingerprint(endpointIdBytes: ArrayLike<numbe
 /** Decode a ticket into only the values that are safe to display for comparison. */
 export function getIrohRemotePairingVerificationDetails(ticket: string): IrohRemotePairingVerificationDetails {
 	const payload = decodeIrohRemoteTicketPayload(ticket);
-	if (payload.nodeId === undefined) {
-		throw new Error("ticket nodeId is required for pairing verification");
+	if (payload.expiresAt === undefined || payload.secret === undefined) {
+		throw new Error("pairing ticket requires expiry and one-time pairing secret");
 	}
-	const hostNodeId = payload.nodeId.trim().toLowerCase();
-	if (!/^[0-9a-f]{64}$/.test(hostNodeId)) {
-		throw new Error("ticket nodeId must be a 32-byte hexadecimal Iroh endpoint identity");
+	if (payload.relay.kind === "volt-managed" && payload.enrollment === undefined) {
+		throw new Error("managed pairing ticket requires an enrollment claim");
 	}
 	const workspace = payload.workspace.trim();
 	if (workspace.length === 0) {
-		throw new Error("ticket workspace is required for pairing verification");
+		throw new Error("pairing ticket workspace must not be blank");
 	}
-	const relayMode = payload.relayMode ?? "disabled";
+	const relayMode =
+		payload.relay.kind === "n0-public"
+			? "development"
+			: payload.relay.kind === "disabled"
+				? "disabled"
+				: "production";
 	return {
 		...(payload.expiresAt === undefined ? {} : { expiresAt: payload.expiresAt }),
-		hostFingerprint: formatIrohRemoteHostFingerprint(Buffer.from(hostNodeId, "hex")),
-		hostNodeId,
+		hostFingerprint: formatIrohRemoteHostFingerprint(Buffer.from(payload.nodeId, "hex")),
+		hostNodeId: payload.nodeId,
 		relayMode,
-		relayOrigins: normalizePairingRelayOrigins(payload.relayUrls ?? [], relayMode),
+		relayOrigins:
+			payload.relay.kind === "volt-managed" || payload.relay.kind === "custom-uncredentialed"
+				? [...payload.relay.origins]
+				: [],
 		workspace,
 	};
 }
 
-function normalizePairingRelayOrigins(values: string[], relayMode: IrohRemoteRelayMode): string[] {
-	const nonEmptyValues = values.filter((value) => value.trim().length > 0);
-	if (relayMode !== "production") {
-		if (nonEmptyValues.length > 0) {
-			throw new Error("ticket relay URLs are only valid in production relay mode");
-		}
-		return [];
-	}
-	if (nonEmptyValues.length === 0) {
-		throw new Error("ticket production relay mode requires HTTPS relay origins");
-	}
-	return [...new Set(nonEmptyValues.map(normalizeHttpsRelayOrigin))].sort();
-}
-
-function normalizeHttpsRelayOrigin(value: string): string {
-	let url: URL;
-	try {
-		url = new URL(value.trim());
-	} catch {
-		throw new Error("ticket relay URL must be a valid HTTPS origin");
-	}
-	if (
-		url.protocol !== "https:" ||
-		url.username.length > 0 ||
-		url.password.length > 0 ||
-		url.search.length > 0 ||
-		url.hash.length > 0 ||
-		(url.pathname !== "" && url.pathname !== "/")
-	) {
-		throw new Error("ticket relay URL must be an HTTPS origin without credentials, path, query, or fragment");
-	}
-
-	const bracketed = url.hostname.startsWith("[") && url.hostname.endsWith("]");
-	const rawHostname = bracketed ? url.hostname.slice(1, -1) : url.hostname;
-	const hostname = rawHostname.toLowerCase().replace(/\.+$/, "");
-	if (hostname.length === 0 || isUnsafeLocalRelayHost(hostname)) {
-		throw new Error("ticket relay URL must not target a local or private host");
-	}
-	const formattedHostname = isIP(hostname) === 6 ? `[${hostname}]` : hostname;
-	return `https://${formattedHostname}${url.port.length === 0 || url.port === "443" ? "" : `:${url.port}`}`;
-}
-
-function isUnsafeLocalRelayHost(hostname: string): boolean {
-	if (
-		hostname === "localhost" ||
-		hostname.endsWith(".localhost") ||
-		hostname === "local" ||
-		hostname.endsWith(".local") ||
-		hostname.includes("%")
-	) {
-		return true;
-	}
-	if (isIP(hostname) === 4) {
-		return isUnsafeIpv4(hostname.split(".").map(Number));
-	}
-	if (isIP(hostname) !== 6) {
-		return false;
-	}
-	const bytes = parseIpv6Bytes(hostname);
-	if (bytes === undefined) return true;
-	const unspecified = bytes.every((byte) => byte === 0);
-	const loopback = bytes.slice(0, 15).every((byte) => byte === 0) && bytes[15] === 1;
-	const linkLocal = bytes[0] === 0xfe && (bytes[1]! & 0xc0) === 0x80;
-	const uniqueLocal = (bytes[0]! & 0xfe) === 0xfc;
-	const multicast = bytes[0] === 0xff;
-	if (unspecified || loopback || linkLocal || uniqueLocal || multicast) return true;
-	const ipv4Mapped = bytes.slice(0, 10).every((byte) => byte === 0) && bytes[10] === 0xff && bytes[11] === 0xff;
-	return ipv4Mapped && isUnsafeIpv4(bytes.slice(12));
-}
-
-function isUnsafeIpv4(bytes: number[]): boolean {
-	if (bytes.length !== 4 || bytes.some((byte) => !Number.isInteger(byte) || byte < 0 || byte > 0xff)) return true;
-	return (
-		bytes[0] === 0 ||
-		bytes[0] === 10 ||
-		bytes[0] === 127 ||
-		(bytes[0] === 100 && bytes[1]! >= 64 && bytes[1]! <= 127) ||
-		(bytes[0] === 169 && bytes[1] === 254) ||
-		(bytes[0] === 172 && bytes[1]! >= 16 && bytes[1]! <= 31) ||
-		(bytes[0] === 192 && bytes[1] === 168) ||
-		(bytes[0] === 198 && (bytes[1] === 18 || bytes[1] === 19)) ||
-		bytes[0]! >= 224
-	);
-}
-
-function parseIpv6Bytes(address: string): number[] | undefined {
-	const halves = address.split("::");
-	if (halves.length > 2) return undefined;
-	const parseHalf = (value: string): number[] | undefined => {
-		if (value.length === 0) return [];
-		const words: number[] = [];
-		for (const part of value.split(":")) {
-			if (!/^[0-9a-f]{1,4}$/i.test(part)) return undefined;
-			words.push(Number.parseInt(part, 16));
-		}
-		return words;
-	};
-	const head = parseHalf(halves[0]!);
-	const tail = parseHalf(halves[1] ?? "");
-	if (head === undefined || tail === undefined) return undefined;
-	const omitted = 8 - head.length - tail.length;
-	if ((halves.length === 1 && omitted !== 0) || (halves.length === 2 && omitted < 1)) return undefined;
-	const words = [...head, ...Array.from({ length: omitted }, () => 0), ...tail];
-	if (words.length !== 8) return undefined;
-	return words.flatMap((word) => [word >> 8, word & 0xff]);
-}
-
 export function encodeIrohRemoteTicketPayload(payload: IrohRemoteTicketPayload): string {
-	return `${IROH_REMOTE_TICKET_PREFIX}${Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")}`;
+	const parsed = parseIrohRemoteTicketPayload(payload);
+	return `${IROH_REMOTE_TICKET_PREFIX}${Buffer.from(JSON.stringify(parsed), "utf8").toString("base64url")}`;
 }
 
 export function decodeIrohRemoteTicketPayload(ticket: string): IrohRemoteTicketPayload {
@@ -205,9 +104,16 @@ export function decodeIrohRemoteTicketPayload(ticket: string): IrohRemoteTicketP
 	}
 
 	const encoded = ticket.slice(IROH_REMOTE_TICKET_PREFIX.length);
+	if (!/^[A-Za-z0-9_-]+$/.test(encoded)) {
+		throw new Error("Failed to decode Iroh remote ticket: payload must be unpadded base64url");
+	}
+	const bytes = Buffer.from(encoded, "base64url");
+	if (bytes.toString("base64url") !== encoded) {
+		throw new Error("Failed to decode Iroh remote ticket: payload must be canonical unpadded base64url");
+	}
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+		parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
 	} catch (error: unknown) {
 		throw new Error(`Failed to decode Iroh remote ticket: ${error instanceof Error ? error.message : String(error)}`);
 	}
@@ -216,40 +122,68 @@ export function decodeIrohRemoteTicketPayload(ticket: string): IrohRemoteTicketP
 
 export function parseIrohRemoteTicketPayload(value: unknown): IrohRemoteTicketPayload {
 	const payload = expectRecord(value, "Iroh remote ticket payload");
+	expectAllowedKeys(
+		payload,
+		["alpn", "expiresAt", "irohTicket", "nodeId", "relay", "enrollment", "secret", "workspace"],
+		["alpn", "irohTicket", "nodeId", "relay", "workspace"],
+		"Iroh remote ticket payload",
+	);
 	const alpn = expectString(payload.alpn, "ticket alpn");
 	if (alpn !== IROH_REMOTE_ALPN) {
 		throw new Error(`Unsupported ticket ALPN: ${alpn}`);
 	}
 
-	const expiresAt = expectOptionalNumber(payload.expiresAt, "ticket expiresAt");
+	const expiresAt = expectOptionalSafeInteger(payload.expiresAt, "ticket expiresAt");
 	const irohTicket = expectString(payload.irohTicket, "ticket irohTicket");
-	const nodeId = expectOptionalString(payload.nodeId, "ticket nodeId");
-	const relayModeValue = payload.relayMode;
-	if (relayModeValue !== undefined && !isIrohRemoteRelayMode(relayModeValue)) {
-		throw new Error("ticket relayMode must be disabled, development, or production");
-	}
-	const relayUrlsValue = payload.relayUrls;
-	if (relayUrlsValue !== undefined && !isIrohRemoteRelayUrls(relayUrlsValue)) {
-		throw new Error("ticket relayUrls must be a non-empty array of relay URLs");
-	}
-	if (relayModeValue === "production" && relayUrlsValue === undefined) {
-		throw new Error("ticket relayMode production requires relayUrls");
-	}
-	const relayAuthToken = expectOptionalString(payload.relayAuthToken, "ticket relayAuthToken");
+	const nodeId = expectIrohRemoteEndpointId(payload.nodeId, "ticket nodeId");
+	const relay = parseIrohRemoteRelayDescriptor(payload.relay);
+	const enrollment = payload.enrollment === undefined ? undefined : parseIrohRemoteEnrollmentClaim(payload.enrollment);
 	const secret = expectOptionalString(payload.secret, "ticket secret");
 	const workspace = expectString(payload.workspace, "ticket workspace");
 
+	if (relay.kind === "volt-managed") {
+		// A sanitized reconnect payload is the one intentionally permitted
+		// exception: all ephemeral pairing fields are absent together.
+		const sanitizedReconnect = expiresAt === undefined && secret === undefined && enrollment === undefined;
+		if (enrollment === undefined && !sanitizedReconnect) {
+			throw new Error("ticket volt-managed relay requires an enrollment claim");
+		}
+	} else if (enrollment !== undefined) {
+		throw new Error(`ticket ${relay.kind} relay must not contain an enrollment claim`);
+	}
+
 	return {
 		alpn,
-		expiresAt,
+		...(expiresAt === undefined ? {} : { expiresAt }),
 		irohTicket,
 		nodeId,
-		relayMode: relayModeValue,
-		relayUrls: relayUrlsValue,
-		relayAuthToken,
-		secret,
+		relay,
+		...(enrollment === undefined ? {} : { enrollment }),
+		...(secret === undefined ? {} : { secret }),
 		workspace,
 	};
+}
+
+export function parseIrohRemoteRelayDescriptor(value: unknown): IrohRemoteRelayDescriptor {
+	const relay = expectRecord(value, "ticket relay");
+	const kind = expectString(relay.kind, "ticket relay kind");
+	if (kind === "volt-managed" || kind === "custom-uncredentialed") {
+		expectAllowedKeys(relay, ["kind", "origins"], ["kind", "origins"], "ticket relay");
+		if (!Array.isArray(relay.origins) || relay.origins.some((origin) => typeof origin !== "string")) {
+			throw new Error("ticket relay origins must be an array of strings");
+		}
+		const origins = relay.origins as string[];
+		const normalized = normalizeIrohRemoteRelayOrigins(origins, "ticket relay origins");
+		if (origins.length !== normalized.length || origins.some((origin, index) => origin !== normalized[index])) {
+			throw new Error("ticket relay origins must be normalized, unique, and sorted");
+		}
+		return { kind, origins: [...origins] };
+	}
+	if (kind === "n0-public" || kind === "disabled") {
+		expectAllowedKeys(relay, ["kind"], ["kind"], "ticket relay");
+		return { kind };
+	}
+	throw new Error("ticket relay kind must be volt-managed, custom-uncredentialed, n0-public, or disabled");
 }
 
 export function assertIrohRemoteTicketNotExpired(payload: IrohRemoteTicketPayload, now = Date.now()): void {
@@ -261,22 +195,13 @@ export function assertIrohRemoteTicketNotExpired(payload: IrohRemoteTicketPayloa
 export function createIrohRemoteSanitizedReconnectTicketPayload(
 	payload: IrohRemoteTicketPayload,
 ): IrohRemoteSanitizedReconnectTicketPayload {
-	if (payload.nodeId === undefined) {
-		throw new IrohRemoteOutcomeError("saved_host_invalid", "ticket nodeId is required for saved-host reconnect");
-	}
-	if (payload.relayMode === undefined) {
-		throw new IrohRemoteOutcomeError("saved_host_invalid", "ticket relayMode is required for saved-host reconnect");
-	}
-	if (payload.relayMode === "production" && payload.relayUrls === undefined) {
-		throw new IrohRemoteOutcomeError("saved_host_invalid", "ticket relayUrls are required for production relayMode");
-	}
+	const parsed = parseIrohRemoteTicketPayload(payload);
 	return {
-		alpn: payload.alpn,
-		irohTicket: payload.irohTicket,
-		nodeId: payload.nodeId,
-		relayMode: payload.relayMode,
-		...(payload.relayUrls === undefined ? {} : { relayUrls: payload.relayUrls }),
-		workspace: payload.workspace,
+		alpn: parsed.alpn,
+		irohTicket: parsed.irohTicket,
+		nodeId: parsed.nodeId,
+		relay: cloneIrohRemoteRelayDescriptor(parsed.relay),
+		workspace: parsed.workspace,
 	};
 }
 
@@ -290,13 +215,8 @@ export function assertIrohRemoteTicketPayloadHostIdentity(
 	payload: IrohRemoteTicketPayload,
 	expectedHostNodeId: string,
 ): void {
-	if (payload.nodeId === undefined) {
-		throw new IrohRemoteOutcomeError(
-			"saved_host_invalid",
-			"ticket nodeId is required for host identity verification",
-		);
-	}
-	if (payload.nodeId !== expectedHostNodeId) {
+	const expected = expectIrohRemoteEndpointId(expectedHostNodeId, "expected host node id");
+	if (payload.nodeId !== expected) {
 		throw new IrohRemoteOutcomeError(
 			"host_identity_mismatch",
 			`expected ${expectedHostNodeId}, got ${payload.nodeId}`,
@@ -304,11 +224,34 @@ export function assertIrohRemoteTicketPayloadHostIdentity(
 	}
 }
 
+function cloneIrohRemoteRelayDescriptor(relay: IrohRemoteRelayDescriptor): IrohRemoteRelayDescriptor {
+	return relay.kind === "volt-managed" || relay.kind === "custom-uncredentialed"
+		? { kind: relay.kind, origins: [...relay.origins] }
+		: { kind: relay.kind };
+}
+
 function expectRecord(value: unknown, label: string): Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
 		throw new Error(`${label} must be an object`);
 	}
 	return value as Record<string, unknown>;
+}
+
+function expectAllowedKeys(
+	record: Record<string, unknown>,
+	allowedKeys: readonly string[],
+	requiredKeys: readonly string[],
+	label: string,
+): void {
+	const allowed = new Set(allowedKeys);
+	const unknown = Object.keys(record).find((key) => !allowed.has(key));
+	if (unknown !== undefined) {
+		throw new Error(`${label} contains unknown field: ${unknown}`);
+	}
+	const missing = requiredKeys.find((key) => !Object.hasOwn(record, key));
+	if (missing !== undefined) {
+		throw new Error(`${label} is missing required field: ${missing}`);
+	}
 }
 
 function expectString(value: unknown, label: string): string {
@@ -325,12 +268,12 @@ function expectOptionalString(value: unknown, label: string): string | undefined
 	return expectString(value, label);
 }
 
-function expectOptionalNumber(value: unknown, label: string): number | undefined {
+function expectOptionalSafeInteger(value: unknown, label: string): number | undefined {
 	if (value === undefined) {
 		return undefined;
 	}
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		throw new Error(`${label} must be a finite number`);
+	if (!Number.isSafeInteger(value) || (value as number) < 0) {
+		throw new Error(`${label} must be a non-negative safe integer`);
 	}
-	return value;
+	return value as number;
 }

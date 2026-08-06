@@ -3,7 +3,11 @@ const { getAppCheck } = require("firebase-admin/app-check");
 const { initializeApp, getApps } = require("firebase-admin/app");
 const { FieldValue, Timestamp, getFirestore } = require("firebase-admin/firestore");
 const { getMessaging } = require("firebase-admin/messaging");
+const { error: logFirebaseError, info: logFirebaseInfo } = require("firebase-functions/logger");
+const { defineSecret } = require("firebase-functions/params");
 const { onRequest } = require("firebase-functions/v2/https");
+const { createIrohEnrollmentHandler } = require("./enrollment-handler.js");
+const { getEnrollmentConfig } = require("./enrollment-core.js");
 const { createPushTargetRegistrationHandler } = require("./registration.js");
 const {
 	RequestError,
@@ -53,6 +57,10 @@ const maxRegistrationsPerInstancePerMinute = getBoundedPositiveInteger(
 	DEFAULT_REGISTRATIONS_PER_INSTANCE_PER_MINUTE,
 );
 const registrationWindows = new Map();
+const enrollmentConfig = getEnrollmentConfig();
+const irohEnrollmentIpSalt = defineSecret("IROH_ENROLLMENT_IP_SALT");
+const irohRelayAccessSecretCurrent = defineSecret("IROH_RELAY_ACCESS_SECRET_CURRENT");
+const irohRelayAccessSecretNext = defineSecret("IROH_RELAY_ACCESS_SECRET_NEXT");
 const registerPushTarget = createPushTargetRegistrationHandler({
 	enforceRegistrationRateLimit,
 	getPushTargetsCollection,
@@ -63,6 +71,38 @@ const registerPushTarget = createPushTargetRegistrationHandler({
 	timestampFromMillis: (value) => Timestamp.fromMillis(value),
 	verifyRegistrationAppCheck,
 });
+const handleIrohEnrollment = createIrohEnrollmentHandler({
+	config: enrollmentConfig,
+	getFirestore,
+	getIpSalt: () => irohEnrollmentIpSalt.value(),
+	getRelayAccessSecrets: () => [
+		irohRelayAccessSecretCurrent.value(),
+		irohRelayAccessSecretNext.value(),
+	],
+	logError: (entry) => logFirebaseError("iroh enrollment request failed", entry),
+	logEvent: (entry) => logFirebaseInfo("iroh enrollment request", entry),
+	now: Date.now,
+	timestampFromMillis: (value) => Timestamp.fromMillis(value),
+	verifyLimitedUseAppCheck: verifyRegistrationAppCheck,
+});
+
+exports.irohEnrollment = onRequest(
+	{
+		concurrency: 40,
+		cors: false,
+		invoker: "public",
+		maxInstances: 20,
+		memory: "256MiB",
+		region: process.env.FUNCTION_REGION || DEFAULT_REGION,
+		secrets: [
+			irohEnrollmentIpSalt,
+			irohRelayAccessSecretCurrent,
+			irohRelayAccessSecretNext,
+		],
+		timeoutSeconds: 15,
+	},
+	handleIrohEnrollment,
+);
 
 exports.pushRelay = onRequest(
 	{

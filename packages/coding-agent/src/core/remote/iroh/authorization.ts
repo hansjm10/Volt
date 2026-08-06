@@ -95,8 +95,12 @@ export function authorizeIrohRemoteClient(
 	const workspaces = getIrohRemoteWorkspaceStatuses(state, options.workspaceStatuses);
 	const workspaceNames = workspaces.filter((entry) => entry.status === "available").map((entry) => entry.name);
 	const now = options.now ?? Date.now();
+	const pendingClientRevocation = (state.pendingClientRevocations ?? []).some(
+		(entry) => entry.nodeId === remoteNodeId,
+	);
 	const revokedClient = findIrohRemoteRevokedClient(state, remoteNodeId);
-	const existingClient = revokedClient ? undefined : findIrohRemoteClient(state, remoteNodeId);
+	const existingClient =
+		revokedClient || pendingClientRevocation ? undefined : findIrohRemoteClient(state, remoteNodeId);
 	const pairingSecretHash = hello.secret ? hashIrohRemotePairingSecret(hello.secret) : undefined;
 	const expiredPairingTickets = pruneExpiredPendingPairingTickets(state, now);
 	const matchingExpiredPairingTicket = pairingSecretHash
@@ -148,6 +152,16 @@ export function authorizeIrohRemoteClient(
 			pairingSecretExpired: false,
 		};
 	}
+	if (pendingClientRevocation) {
+		return {
+			ok: false,
+			error: "client revocation is pending",
+			...(expiredResultTickets ? { expiredPairingTickets: expiredResultTickets } : {}),
+			outcome: "client_revoked",
+			pairingSecretExpired: false,
+		};
+	}
+
 	const hasActivePairingSecretForRevokedClient =
 		rePairApprovalActive &&
 		hasPairingSecret &&

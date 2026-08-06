@@ -8,8 +8,9 @@
 		"node": "22"
 	},
 	"scripts": {
-		"check": "node --check index.js && node --check registration.js",
-		"test": "node --test core.test.js index.test.js registration.test.js"
+		"check": "for file in *.js; do node --check \"$file\"; done",
+		"test": "node --test *.test.js",
+		"test:emulator": "npx --yes firebase-tools@15.26.0 emulators:exec --config ../firebase.json --project demo-volt-iroh-enrollment --only firestore \"node --test enrollment-emulator.integration.js\""
 	},
 	"dependencies": {
 		"firebase-admin": "13.10.0",

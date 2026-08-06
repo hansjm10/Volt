@@ -8,6 +8,7 @@ import {
 	type IrohRemoteClientAuthorizationResult,
 	type IrohRemoteClientAuthorizationSuccess,
 } from "./authorization.ts";
+import type { IrohRemoteEnrollmentClaim } from "./enrollment.ts";
 import {
 	assertIrohRemoteHandshakeHostIdentity,
 	createIrohRemoteHandshakeFailure,
@@ -51,6 +52,7 @@ import {
 	assertIrohRemoteTicketNotExpired,
 	decodeIrohRemoteTicketPayload,
 	encodeIrohRemoteTicketPayload,
+	type IrohRemoteRelayDescriptor,
 	type IrohRemoteTicketPayload,
 } from "./ticket.ts";
 import {
@@ -85,10 +87,9 @@ export interface IrohRemoteHostPairOptions {
 	expiresAt?: number;
 	irohTicket: string;
 	labelHint?: string;
-	nodeId?: string;
-	relayMode?: IrohRemoteRelayMode;
-	relayUrls?: string[];
-	relayAuthToken?: string;
+	nodeId: string;
+	relay: IrohRemoteRelayDescriptor;
+	enrollment?: IrohRemoteEnrollmentClaim;
 	secret?: string;
 	ttlMs?: number;
 	workspace?: string;
@@ -253,9 +254,8 @@ export class IrohRemoteHostEngine {
 				expiresAt,
 				irohTicket: options.irohTicket,
 				nodeId: options.nodeId,
-				relayMode: options.relayMode,
-				...(options.relayUrls === undefined ? {} : { relayUrls: options.relayUrls }),
-				...(options.relayAuthToken === undefined ? {} : { relayAuthToken: options.relayAuthToken }),
+				relay: options.relay,
+				...(options.enrollment === undefined ? {} : { enrollment: options.enrollment }),
 				secret,
 				workspace: workspace.name,
 			};
@@ -271,7 +271,7 @@ export class IrohRemoteHostEngine {
 					expiresAt: pendingPairingTicket.expiresAt,
 					labelHint: pendingPairingTicket.labelHint,
 					nodeId: options.nodeId,
-					relayMode: options.relayMode,
+					relay: options.relay,
 				},
 			});
 			return { expiresAt, payload, secret, ticket };
@@ -721,7 +721,7 @@ export class IrohRemoteClientEngine {
 		await this.log({
 			type: "ticket_loaded",
 			workspace: payload.workspace,
-			details: { nodeId: payload.nodeId, relayMode: payload.relayMode },
+			details: { nodeId: payload.nodeId, relay: payload.relay },
 		});
 		return { hello, payload };
 	}

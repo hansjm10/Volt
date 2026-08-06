@@ -1,6 +1,11 @@
-# Firebase Push Relay
+# Firebase push relay and Iroh enrollment broker
 
-This deploys Volt's managed FCM notification relay contract to Firebase Cloud Functions. The relay stores the raw FCM registration token in private Firestore state and gives the mobile app an opaque target id plus a target-scoped credential. A paired desktop host can notify that target without receiving the FCM token.
+This Firebase deployment contains two separate HTTPS functions:
+
+- `pushRelay` stores raw FCM registration tokens in private Firestore state and gives the mobile app an opaque target id plus a target-scoped credential; and
+- `irohEnrollment` enrolls exact phone/desktop Iroh endpoint pairs for the Volt-managed relay fleet without accounts or a client-visible infrastructure bearer.
+
+Neither service authorizes desktop RPC. Volt pairing, the authenticated Iroh transport, the host-observed client endpoint identity, and persisted RPC/tool grants remain the desktop-control boundary.
 
 ## Security contract
 
@@ -16,6 +21,18 @@ This deploys Volt's managed FCM notification relay contract to Firebase Cloud Fu
 - Explicit revocation requires the target id and target credential. Desktop unpair is locally authoritative even if remote cleanup fails; the finite target TTL bounds its lifetime.
 
 The function remains publicly invokable because an unattached iOS app must reach registration. App Check attestation is the registration authorization boundary. Notification and revoke routes use the random per-target credential.
+
+## Iroh enrollment security contract
+
+- A strict `volt+iroh://v2` QR contains a 10-minute claim ID and independent 256-bit claim secret, but no broker URL, durable pair secret, App Check token, or relay infrastructure bearer.
+- The host and phone sign canonical, versioned request bytes with their Iroh Ed25519 endpoint keys. Signed timestamps accept at most ±2 minutes of skew.
+- Claim approval is single-use and idempotent for the exact phone endpoint and phone-generated grant secret. The resulting deterministic pair grant lasts 30 days and renewal consumes another limited-use App Check token when seven days remain.
+- Firestore transactions update claims, grants, both endpoint access maps, and durable quota windows. Rules deny all direct client access. Defaults cap pending claims, active endpoint grants, new-host approvals, renewals, and endpoint-plus-salted-IP request windows.
+- The stock relay calls `POST /v1/relay-access` with `X-Iroh-NodeId` and a server-to-server bearer. Only `200 text/plain` with exact body `true` permits registration. Current/next bearer overlap supports rotation.
+- Forget/revoke uses the pair secret plus the phone endpoint signature and is idempotent, allowing the app to retry a durable local obligation without App Check. Broker, Firestore, App Check, signature, origin, or callback-authentication failures fail closed.
+- This access hook runs when an endpoint registers. Revocation cannot interrupt an already-open registration and does not meter bytes per endpoint; relay-wide ceilings are separate deployment backstops.
+
+The normative ticket, canonical signing, persistence, and lifecycle contract is [Iroh relay enrollment design](https://github.com/volt-hq/Volt/blob/main/packages/coding-agent/docs/iroh-relay-enrollment-design.md).
 
 ## Routes
 
@@ -43,12 +60,13 @@ Volt host state stores only the opaque relay target id, target-scoped credential
 ## Required Firebase setup
 
 1. Register the production iOS app and include its generated `GoogleService-Info.plist` in the app target.
-2. Enable Firebase App Check. Production builds should use App Attest with DeviceCheck fallback; simulator/debug tokens are development-only.
-3. Confirm the Firebase app id matches `ALLOWED_FIREBASE_APP_IDS`. Self-hosted deployments must override the built-in production app id.
-4. Enable replay protection for limited-use App Check tokens.
+2. Enable Firebase App Check. Production devices use App Attest with DeviceCheck fallback. Simulator/debug builds use `AppCheckDebugProvider` and succeed only after their generated debug token is explicitly registered in Firebase Console.
+3. Confirm the Firebase app id matches `ALLOWED_FIREBASE_APP_IDS`. Self-hosted and canary deployments must override the built-in production app id.
+4. Enable replay protection for limited-use App Check tokens; approval and renewal request them with `consume: true`.
 5. Configure APNs credentials in Firebase Console for ordinary FCM notifications.
-6. Deploy Firestore rules and indexes, then verify the `expiresAt` TTL policy.
-7. Keep IAM least-privilege, enable audit logs and budget alerts, and monitor App Check failures plus `429`/`5xx` responses.
+6. Create `IROH_ENROLLMENT_IP_SALT`, `IROH_RELAY_ACCESS_SECRET_CURRENT`, and `IROH_RELAY_ACCESS_SECRET_NEXT` with `firebase functions:secrets:set`. Values are 32-512 printable non-space characters; keep `NEXT` set to an independently generated standby value even before rotation.
+7. Deploy Firestore rules and indexes. Configure Firestore TTL on `expiresAt` for `voltPushTargets`, `voltIrohEnrollmentClaims`, `voltIrohEnrollmentGrants`, and `voltIrohEnrollmentQuotaWindows`; authorization never relies on asynchronous TTL deletion.
+8. Keep IAM least-privilege, enable audit logs and budget alerts, and monitor App Check failures, callback latency/denials, quota responses, active grant counts, and `5xx` responses.
 
 For an Internet-facing deployment, put the Gen 2 function behind an external Application Load Balancer with Cloud Armor (or an equivalent gateway), then restrict direct function ingress after verifying traffic through `PUSH_RELAY_URL`.
 
@@ -60,6 +78,10 @@ For an Internet-facing deployment, put the Gen 2 function behind an external App
 - `DELIVERIES_PER_TARGET_PER_MINUTE`: 1-600, default 30.
 - `REGISTRATIONS_PER_INSTANCE_PER_MINUTE`: 1-120, default 30.
 - `FUNCTION_REGION`: deployment region, default `us-central1`.
+- `IROH_RELAY_ORIGINS`: comma-separated 1-8 canonical HTTPS origins returned to both endpoints; default `https://iroh-relay-us-central.volt-cli.dev`.
+- `IROH_ENROLLMENT_REQUESTS_PER_ENDPOINT_PER_MINUTE`: durable endpoint quota, 1-600, default 60.
+- `IROH_ENROLLMENT_REQUESTS_PER_IP_PER_MINUTE`: durable salted-IP quota, 1-3000, default 300.
+- Secret Manager only (never `.env`): `IROH_ENROLLMENT_IP_SALT`, `IROH_RELAY_ACCESS_SECRET_CURRENT`, and `IROH_RELAY_ACCESS_SECRET_NEXT`.
 
 ## Deploy
 
@@ -68,7 +90,7 @@ From this directory:
 ```bash
 firebase use volt-3fae7
 firebase firestore:databases:create '(default)' --project volt-3fae7 --location nam5
-firebase deploy --project volt-3fae7 --only firestore:rules,firestore:indexes,functions:volt-push-relay:pushRelay
+firebase deploy --project volt-3fae7 --only firestore:rules,firestore:indexes,functions:volt-push-relay:pushRelay,functions:volt-push-relay:irohEnrollment
 ```
 
 Cloud Functions deployment requires the Blaze plan. Do not deploy until App Check, the app-id allowlist, APNs, TTL, monitoring, budget, and edge controls are verified.
@@ -77,9 +99,34 @@ For a self-hosted relay, point the host at the same canonical URL configured in 
 
 ```bash
 export VOLT_PUSH_RELAY_URL="https://push.example.com/"
-volt remote host --mobile --workspace volt=/path/to/Volt
+volt daemon start
+volt remote workspace add /path/to/Volt --name volt
 ```
+
+## Emulator transaction tests
+
+Install the Functions dependencies, then run the real Firestore transaction suite through the checked-in emulator configuration:
+
+```bash
+cd functions
+npm ci
+npm run test:emulator
+```
+
+The test refuses to run without `FIRESTORE_EMULATOR_HOST`, uses a `demo-*` project, and verifies real transactional create/approve/idempotency/revoke behavior plus both endpoint access maps. The normal `npm test` suite remains fast and uses isolated adapters for strict-schema, signature, App Check, quota, and failure-path coverage.
+
+## Real App Check canary
+
+Use a separate Firebase canary project/app and the checked-in `canary.env.example`; never point a canary at production Firestore. Register the canary iOS bundle and its simulator debug token in Firebase App Check, set only the canary app id in `ALLOWED_FIREBASE_APP_IDS`, deploy the Firestore schema and both functions, and configure independently generated canary secrets. Build the app with the canary `GoogleService-Info.plist` and the reviewed fixed broker URL; do not accept a broker destination from a QR, launch argument, user default, or remote response.
+
+Before promoting, verify one real limited-use token succeeds once and replay fails, managed origins match exactly, revoke removes both endpoint access entries, an invalid relay callback bearer returns false, and broker outage still permits direct/LAN pairing. Delete the simulator debug token and canary grants after the exercise.
+
+## Secret rotation and incident revocation
+
+Rotate relay callback authentication with overlap: set a new backend `NEXT`, deploy, replace and restart one relay credential at a time, verify each relay, then promote the new value to `CURRENT` and replace `NEXT` with a fresh standby. Never clear current and next together. The relay-side procedure is in [Self-hosted iroh relay](../../../../../docs/self-hosted-relay.md).
+
+For a compromised endpoint, transactionally mark its endpoint-access document blocked or revoke its pair grants, then inspect grants for the peer endpoints. This denies the next relay registration but cannot interrupt an existing stock-relay registration. For a callback-secret incident, rotate with the shortest safe overlap, restart every relay, review callback denials/egress, and never restore the retired fleet credential.
 
 ## Error behavior
 
-Invalid or expired targets return `410`, prompting host-side target disabling. Other FCM send failures return `502 { error: "fcm_send_failed", code }`. Cloud Logging receives the server error plus event id and kind, never the FCM token or target credential.
+Invalid or expired push targets return `410`, prompting host-side target disabling. Other FCM send failures return `502 { error: "fcm_send_failed", code }`. Enrollment routes return bounded stable error codes and relay access returns false on denial. Cloud Logging records only bounded route/outcome/latency or safe error names, never endpoint IDs, claim/grant secrets, FCM tokens, target credentials, or callback bearers.

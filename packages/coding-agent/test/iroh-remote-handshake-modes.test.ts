@@ -17,6 +17,8 @@ import type { IrohBytes, IrohRecvStreamLike } from "../src/core/rpc/index.ts";
 
 type QueuedIrohRead = { type: "data"; bytes: IrohBytes } | { type: "end" };
 
+const HOST_NODE_ID = "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8";
+
 class ManualIrohRecvStream implements IrohRecvStreamLike {
 	private readonly queue: QueuedIrohRead[] = [];
 
@@ -70,8 +72,8 @@ async function createPairedHostEngine(): Promise<IrohRemoteHostEngine> {
 	});
 	await hostEngine.pair({
 		irohTicket: "iroh-endpoint-ticket",
-		nodeId: "host-node",
-		relayMode: "disabled",
+		nodeId: HOST_NODE_ID,
+		relay: { kind: "disabled" },
 		secret: "secret",
 	});
 	return hostEngine;
