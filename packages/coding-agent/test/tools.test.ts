@@ -236,16 +236,18 @@ describe("Coding Agent Tools", () => {
 			});
 
 			expect(getTextOutput(result)).toContain("Successfully replaced");
-			expect(result.details).toBeDefined();
-			expect(result.details.diff).toBeDefined();
-			expect(typeof result.details.diff).toBe("string");
-			expect(result.details.diff).toContain("testing");
-			expect(result.details.patch).toContain("--- ");
-			expect(result.details.patch).toContain("+++ ");
-			expect(result.details.patch).toContain("@@");
-			expect(result.details.patch).toContain("-Hello, world!");
-			expect(result.details.patch).toContain("+Hello, testing!");
-			expect(applyPatch(originalContent, result.details.patch)).toBe("Hello, testing!");
+			const details = result.details;
+			expect(details).toBeDefined();
+			if (!details) throw new Error("Expected edit details");
+			expect(details.diff).toBeDefined();
+			expect(typeof details.diff).toBe("string");
+			expect(details.diff).toContain("testing");
+			expect(details.patch).toContain("--- ");
+			expect(details.patch).toContain("+++ ");
+			expect(details.patch).toContain("@@");
+			expect(details.patch).toContain("-Hello, world!");
+			expect(details.patch).toContain("+Hello, testing!");
+			expect(applyPatch(originalContent, details.patch)).toBe("Hello, testing!");
 		});
 
 		it("should fail if text not found", async () => {

@@ -37,6 +37,8 @@ import type {
 import type {
 	AssistantMessage,
 	ImageContent,
+	JsonObject,
+	JsonValue,
 	Model,
 	SimpleStreamOptions,
 	TextContent,
@@ -60,6 +62,7 @@ import { PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "../utils/private-file
 import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
+import { CanonicalDataError, cloneCanonicalData } from "./canonical-data.ts";
 import {
 	type CompactionResult,
 	calculateContextTokens,
@@ -96,6 +99,7 @@ import {
 	type ToolExecutionStartEvent,
 	type ToolExecutionUpdateEvent,
 	type ToolInfo,
+	type ToolResultEvent,
 	type TreePreparation,
 	type TurnEndEvent,
 	type TurnStartEvent,
@@ -157,7 +161,6 @@ import {
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
-import { assertStructuredCloneable, cloneStructuredData } from "./structured-clone.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "./subagents/tool-names.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
 import { getThemeByName, theme } from "./theme/runtime.ts";
@@ -177,7 +180,7 @@ import { canonicalizePlanSteps, createPlanningToolDefinitions, NATIVE_PLAN_TOOL_
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 
 function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMessage[] {
-	return cloneStructuredData([...messages], "Agent message delivery");
+	return cloneCanonicalData([...messages], "Agent message delivery");
 }
 
 // ============================================================================
@@ -263,7 +266,7 @@ export type AgentSessionEvent =
 			reason: "queue_cleared" | "dispatch_failed";
 	  }
 	| { type: "compaction_start"; reason: CompactionReason }
-	| { type: "session_info_changed"; name: string | undefined }
+	| { type: "session_info_changed"; name?: string }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| { type: "planning_state_changed"; planning: PlanningState }
 	| { type: "git_context_changed"; gitContext: RpcGitContext | null }
@@ -275,7 +278,7 @@ export type AgentSessionEvent =
 	| {
 			type: "compaction_end";
 			reason: CompactionReason;
-			result: CompactionResult | undefined;
+			result?: CompactionResult;
 			aborted: boolean;
 			willRetry: boolean;
 			errorMessage?: string;
@@ -317,7 +320,7 @@ export interface AgentSessionConfig {
 	/** Resource loader for skills, prompts, themes, context files, system prompt */
 	resourceLoader: ResourceLoader;
 	/** SDK custom tools registered outside extensions */
-	customTools?: ToolDefinition[];
+	customTools?: ToolDefinition<any, any>[];
 	/** Model registry for API key resolution and model discovery */
 	modelRegistry: ModelRegistry;
 	/** Initial active built-in tool names. Default: read, bash, edit, write, web_search, and subagent when a manager is supplied. */
@@ -415,7 +418,7 @@ export interface SessionStats {
 }
 
 interface ToolDefinitionEntry {
-	definition: ToolDefinition;
+	definition: ToolDefinition<any, any>;
 	sourceInfo: SourceInfo;
 }
 
@@ -589,8 +592,8 @@ export class AgentSession {
 	private _turnIndex = 0;
 
 	private _resourceLoader: ResourceLoader;
-	private _customTools: ToolDefinition[];
-	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
+	private _customTools: ToolDefinition<any, any>[];
+	private _baseToolDefinitions: Map<string, ToolDefinition<any, any>> = new Map();
 	private _cwd: string;
 	private _agentDir: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
@@ -906,7 +909,7 @@ export class AgentSession {
 						type: "tool_call",
 						toolName: toolCall.name,
 						toolCallId: toolCall.id,
-						input: args as Record<string, unknown>,
+						input: args as JsonObject,
 					});
 				} catch (err) {
 					if (err instanceof Error) {
@@ -970,20 +973,23 @@ export class AgentSession {
 				return undefined;
 			}
 
+			const details = result.details as JsonValue | undefined;
 			const hookResult = await runner.emitToolResult({
 				type: "tool_result",
 				toolName: toolCall.name,
 				toolCallId: toolCall.id,
-				input: args as Record<string, unknown>,
+				input: args as JsonObject,
 				content: result.content,
-				details: result.details,
+				...(details === undefined ? {} : { details }),
 				isError,
-			});
+			} satisfies ToolResultEvent);
 
-			return cloneStructuredData(
+			const finalDetails: JsonValue | undefined =
+				hookResult?.details !== undefined ? (hookResult.details as JsonValue) : details;
+			return cloneCanonicalData(
 				{
 					content: hookResult?.content ?? result.content,
-					details: hookResult?.details ?? result.details,
+					...(finalDetails === undefined ? {} : { details: finalDetails }),
 					isError: hookResult?.isError ?? isError,
 				},
 				`Extension tool_result output for ${toolCall.name}`,
@@ -995,6 +1001,20 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
+	private _reportEventProjectionFailure(eventType: AgentSessionEvent["type"], error: unknown): void {
+		try {
+			this._extensionRunner?.emitError({
+				extensionPath: "<runtime>",
+				event: "session_event_projection",
+				error: `Could not project AgentSession ${eventType} event: ${error instanceof Error ? error.message : String(error)}`,
+				...(error instanceof Error && error.stack ? { stack: error.stack } : {}),
+			});
+		} catch {
+			// Runtime diagnostics are passive. Their observers cannot alter an
+			// already-committed session outcome or revive an invalid projection.
+		}
+	}
+
 	/** Publish an isolated passive projection to every public session observer. */
 	private _emit(event: AgentSessionEvent): void {
 		if (this.sessionManager.getConversationAuthorityStatus().status !== "available") return;
@@ -1003,14 +1023,22 @@ export class AgentSession {
 		}
 		const listeners = [...this._eventListeners];
 		const description = `AgentSession ${event.type} event`;
-		if (listeners.length === 0) {
-			assertStructuredCloneable(event, description);
+		let canonicalEvent: AgentSessionEvent;
+		try {
+			canonicalEvent = cloneCanonicalData(event, description);
+		} catch (error) {
+			this._reportEventProjectionFailure(event.type, error);
 			return;
 		}
+
 		for (const listener of listeners) {
-			// Cloning is an internal projection invariant, not an observer operation.
-			// Keep it outside the failure boundary so invalid events cannot disappear.
-			const snapshot = cloneStructuredData(event, description);
+			let snapshot: AgentSessionEvent;
+			try {
+				snapshot = cloneCanonicalData(canonicalEvent, description);
+			} catch (error) {
+				this._reportEventProjectionFailure(event.type, error);
+				continue;
+			}
 			try {
 				void Promise.resolve(listener(snapshot)).catch(() => {});
 			} catch {
@@ -1145,12 +1173,13 @@ export class AgentSession {
 		error?: Error;
 	}> {
 		this._assertConversationAuthorityAvailable();
+		const ownedMessages = messages.map((message, index) => cloneCanonicalData(message, `Delivery message ${index}`));
 		if (!this._extensionRunner.hasHandlers("message_start") && !this._extensionRunner.hasHandlers("message_end")) {
-			return { messages: [...messages] };
+			return { messages: ownedMessages };
 		}
 		const prepared: AgentMessage[] = [];
 		try {
-			for (const message of messages) {
+			for (const message of ownedMessages) {
 				await this._emitExtensionEvent({ type: "message_start", message });
 				const replacement = await this._emitExtensionEvent({ type: "message_end", message });
 				const identityPreservingReplacement =
@@ -1161,7 +1190,7 @@ export class AgentSession {
 			}
 			return { messages: prepared };
 		} catch (error) {
-			return { messages: [...messages], error: error instanceof Error ? error : new Error(String(error)) };
+			return { messages: ownedMessages, error: error instanceof Error ? error : new Error(String(error)) };
 		}
 	}
 
@@ -1300,6 +1329,9 @@ export class AgentSession {
 		let planningPublished = false;
 		try {
 			if (input.preparationError) {
+				if (input.preparationError instanceof CanonicalDataError) {
+					return await this._settleRetainedDirectInput(input.messages, input.preparationError);
+				}
 				const terminalError = await this._terminallyFailDelivery(
 					input.messages,
 					input.queueEntries,
@@ -1893,48 +1925,61 @@ export class AgentSession {
 		} else if (event.type === "message_start") {
 			const extensionEvent: MessageStartEvent = {
 				type: "message_start",
-				message: event.message,
+				message: cloneCanonicalData(event.message, "Extension message_start input"),
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		} else if (event.type === "message_update") {
-			const extensionEvent: MessageUpdateEvent = {
-				type: "message_update",
-				message: event.message,
-				assistantMessageEvent: event.assistantMessageEvent,
-			};
+			const extensionEvent = cloneCanonicalData(
+				{
+					type: "message_update" as const,
+					message: event.message,
+					assistantMessageEvent: event.assistantMessageEvent,
+				} satisfies MessageUpdateEvent,
+				"Extension message_update input",
+			);
 			await this._extensionRunner.emit(extensionEvent);
 		} else if (event.type === "message_end") {
+			const message = cloneCanonicalData(event.message, `Agent ${event.message.role} message`);
 			const extensionEvent: MessageEndEvent = {
 				type: "message_end",
-				message: event.message,
+				message,
 			};
 			const replacement = await this._extensionRunner.emitMessageEnd(extensionEvent);
-			return replacement;
+			return replacement ?? message;
 		} else if (event.type === "tool_execution_start") {
-			const extensionEvent: ToolExecutionStartEvent = {
-				type: "tool_execution_start",
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				args: event.args,
-			};
+			const extensionEvent = cloneCanonicalData(
+				{
+					type: "tool_execution_start",
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+					args: event.args,
+				} as const,
+				"Extension tool_execution_start input",
+			) as ToolExecutionStartEvent;
 			await this._extensionRunner.emit(extensionEvent);
 		} else if (event.type === "tool_execution_update") {
-			const extensionEvent: ToolExecutionUpdateEvent = {
-				type: "tool_execution_update",
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				args: event.args,
-				partialResult: event.partialResult,
-			};
+			const extensionEvent = cloneCanonicalData(
+				{
+					type: "tool_execution_update",
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+					args: event.args,
+					partialResult: event.partialResult,
+				} as const,
+				"Extension tool_execution_update input",
+			) as ToolExecutionUpdateEvent;
 			await this._extensionRunner.emit(extensionEvent);
 		} else if (event.type === "tool_execution_end") {
-			const extensionEvent: ToolExecutionEndEvent = {
-				type: "tool_execution_end",
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				result: event.result,
-				isError: event.isError,
-			};
+			const extensionEvent = cloneCanonicalData(
+				{
+					type: "tool_execution_end",
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+					result: event.result,
+					isError: event.isError,
+				} as const,
+				"Extension tool_execution_end input",
+			) as ToolExecutionEndEvent;
 			await this._extensionRunner.emit(extensionEvent);
 		}
 		return undefined;
@@ -2525,7 +2570,7 @@ export class AgentSession {
 			}));
 	}
 
-	getToolDefinition(name: string): ToolDefinition | undefined {
+	getToolDefinition(name: string): ToolDefinition<any, any> | undefined {
 		if (!this._isToolVisibleToCurrentMode(name)) {
 			return undefined;
 		}
@@ -2573,7 +2618,7 @@ export class AgentSession {
 	}
 
 	private _setEffectiveToolsByName(toolNames: string[]): void {
-		const tools: AgentTool[] = [];
+		const tools: AgentTool<any, any>[] = [];
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
 			const tool = this._toolRegistry.get(name);
@@ -2629,7 +2674,7 @@ export class AgentSession {
 			this._baseToolDefinitions.delete(name);
 		}
 		for (const definition of directDefinitions) {
-			this._baseToolDefinitions.set(definition.name, definition as ToolDefinition);
+			this._baseToolDefinitions.set(definition.name, definition as ToolDefinition<any, any>);
 		}
 		this._directMcpToolNames = new Set(directDefinitions.map((definition) => definition.name));
 
@@ -2669,7 +2714,7 @@ export class AgentSession {
 		if (!this._planningStateNeedsCheckpoint(state)) return false;
 		const content = formatPlanCheckpoint(state);
 		if (!content) return false;
-		this.sessionManager.appendCustomMessageEntry(PLAN_CHECKPOINT_CUSTOM_TYPE, content, false, undefined);
+		this.sessionManager.appendCustomMessageEntry(PLAN_CHECKPOINT_CUSTOM_TYPE, content, false);
 		return true;
 	}
 
@@ -2682,7 +2727,6 @@ export class AgentSession {
 			customType: PLAN_CHECKPOINT_CUSTOM_TYPE,
 			content,
 			display: false,
-			details: undefined,
 			timestamp: Date.now(),
 		};
 	}
@@ -4127,13 +4171,13 @@ export class AgentSession {
 			if (result?.messages) {
 				for (const msg of result.messages) {
 					messages.push(
-						cloneStructuredData(
+						cloneCanonicalData(
 							{
 								role: "custom",
 								customType: msg.customType,
 								content: msg.content,
 								display: msg.display,
-								details: msg.details,
+								...(msg.details === undefined ? {} : { details: msg.details }),
 								timestamp: Date.now(),
 							} satisfies CustomMessage,
 							`Extension before_agent_start message ${msg.customType}`,
@@ -4488,16 +4532,17 @@ export class AgentSession {
 		if (this._hasSessionOperationBarrier) {
 			throw new Error("Cannot append a custom message while a session mutation is active");
 		}
-		const appMessage = cloneStructuredData(
+		const ownedInput = cloneCanonicalData(message, "Custom message input");
+		const appMessage = cloneCanonicalData(
 			{
 				role: "custom" as const,
-				customType: message.customType,
-				content: message.content,
-				display: message.display,
-				details: message.details,
+				customType: ownedInput.customType,
+				content: ownedInput.content,
+				display: ownedInput.display,
+				...(ownedInput.details === undefined ? {} : { details: ownedInput.details as JsonValue }),
 				timestamp: Date.now(),
-			} satisfies CustomMessage<T>,
-			`Custom message ${message.customType}`,
+			} satisfies CustomMessage,
+			`Custom message ${ownedInput.customType}`,
 		);
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
@@ -4520,10 +4565,10 @@ export class AgentSession {
 		} else {
 			this.agent.state.messages.push(appMessage);
 			this.sessionManager.appendCustomMessageEntry(
-				message.customType,
-				message.content,
-				message.display,
-				message.details,
+				appMessage.customType,
+				appMessage.content,
+				appMessage.display,
+				appMessage.details,
 			);
 			this._emit({ type: "message_start", message: appMessage });
 			this._emit({ type: "message_end", message: appMessage });
@@ -5000,7 +5045,7 @@ export class AgentSession {
 		summary: string,
 		firstKeptEntryId: string,
 		tokensBefore: number,
-		details: unknown,
+		details: JsonValue | undefined,
 		fromExtension: boolean,
 		dropTrailingErrorMessage = false,
 		assertConversationGenerationCurrent?: () => void,
@@ -5046,7 +5091,7 @@ export class AgentSession {
 			firstKeptEntryId,
 			tokensBefore,
 			estimatedTokensAfter,
-			details,
+			...(details === undefined ? {} : { details }),
 		};
 	}
 
@@ -5145,7 +5190,7 @@ export class AgentSession {
 			let summary: string;
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
-			let details: unknown;
+			let details: JsonValue | undefined;
 
 			if (extensionCompaction) {
 				// Extension provided compaction content
@@ -5180,7 +5225,13 @@ export class AgentSession {
 			}
 
 			assertConversationGenerationCurrent?.();
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension ? true : undefined,
+			);
 			await this.sessionManager.flush();
 			this._proactiveCompactionState = "idle";
 			const compactionResult = await this._finalizeCompaction(
@@ -5206,10 +5257,9 @@ export class AgentSession {
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
-				result: undefined,
 				aborted,
 				willRetry: false,
-				errorMessage: aborted ? undefined : `Compaction failed: ${message}`,
+				...(aborted ? {} : { errorMessage: `Compaction failed: ${message}` }),
 			});
 			throw error;
 		} finally {
@@ -5322,7 +5372,6 @@ export class AgentSession {
 				this._emit({
 					type: "compaction_end",
 					reason: "overflow",
-					result: undefined,
 					aborted: false,
 					willRetry: false,
 					errorMessage:
@@ -5437,7 +5486,6 @@ export class AgentSession {
 					type: "session_before_compact",
 					preparation,
 					branchEntries: pathEntries,
-					customInstructions: undefined,
 					signal: this._autoCompactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
 				assertConversationCurrent();
@@ -5455,7 +5503,7 @@ export class AgentSession {
 			let summary: string;
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
-			let details: unknown;
+			let details: JsonValue | undefined;
 
 			if (extensionCompaction) {
 				// Extension provided compaction content
@@ -5489,7 +5537,6 @@ export class AgentSession {
 				this._emit({
 					type: "compaction_end",
 					reason,
-					result: undefined,
 					aborted: true,
 					willRetry: false,
 				});
@@ -5497,7 +5544,13 @@ export class AgentSession {
 			}
 
 			assertConversationCurrent();
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension ? true : undefined,
+			);
 			await this.sessionManager.flush();
 			this._proactiveCompactionState = "idle";
 			const result = await this._finalizeCompaction(
@@ -5529,7 +5582,6 @@ export class AgentSession {
 				this._emit({
 					type: "compaction_end",
 					reason,
-					result: undefined,
 					aborted: true,
 					willRetry: false,
 				});
@@ -5545,7 +5597,6 @@ export class AgentSession {
 			this._emit({
 				type: "compaction_end",
 				reason,
-				result: undefined,
 				aborted,
 				willRetry: false,
 				...(aborted
@@ -5888,7 +5939,7 @@ export class AgentSession {
 		);
 
 		const toolRegistry = new Map(wrappedBuiltInTools.map((tool) => [tool.name, tool]));
-		for (const tool of wrappedExtensionTools as AgentTool[]) {
+		for (const tool of wrappedExtensionTools as AgentTool<any, any>[]) {
 			toolRegistry.set(tool.name, tool);
 		}
 		this._toolRegistry = toolRegistry;
@@ -5957,7 +6008,7 @@ export class AgentSession {
 					}
 				}
 			} else if (message.role === "toolResult" && message.toolName === "web_search" && !message.isError) {
-				const details: unknown = message.details;
+				const details = message.details as JsonValue | undefined;
 				if (
 					typeof details !== "object" ||
 					details === null ||
@@ -6120,15 +6171,15 @@ export class AgentSession {
 				});
 
 		this._baseToolDefinitions = new Map(
-			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
+			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition<any, any>]),
 		);
 		this._trustedHostToolNames = new Set(this._baseToolsOverride ? [] : Object.keys(baseToolDefinitions));
 		for (const definition of createPlanningToolDefinitions(this)) {
-			this._baseToolDefinitions.set(definition.name, definition as ToolDefinition);
+			this._baseToolDefinitions.set(definition.name, definition as ToolDefinition<any, any>);
 			this._trustedHostToolNames.add(definition.name);
 		}
 		for (const definition of directMcpToolDefinitions) {
-			this._baseToolDefinitions.set(definition.name, definition as ToolDefinition);
+			this._baseToolDefinitions.set(definition.name, definition as ToolDefinition<any, any>);
 		}
 
 		const extensionsResult = this._resourceLoader.getExtensions();
@@ -6409,12 +6460,12 @@ export class AgentSession {
 			role: "bashExecution",
 			command,
 			output: result.output,
-			exitCode: result.exitCode,
+			...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
 			cancelled: result.cancelled,
 			truncated: result.truncated,
-			fullOutputPath: result.fullOutputPath,
+			...(result.fullOutputPath === undefined ? {} : { fullOutputPath: result.fullOutputPath }),
 			timestamp: Date.now(),
-			excludeFromContext: options?.excludeFromContext,
+			...(options?.excludeFromContext === undefined ? {} : { excludeFromContext: options.excludeFromContext }),
 		};
 
 		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
@@ -6476,7 +6527,11 @@ export class AgentSession {
 	 */
 	setSessionName(name: string): void {
 		this.sessionManager.appendSessionInfo(name);
-		this._emit({ type: "session_info_changed", name: this.sessionManager.getSessionName() });
+		const resolvedName = this.sessionManager.getSessionName();
+		this._emit({
+			type: "session_info_changed",
+			...(resolvedName === undefined ? {} : { name: resolvedName }),
+		});
 	}
 
 	private _sessionNameGenerationInFlight = false;
@@ -6638,7 +6693,7 @@ export class AgentSession {
 		this._branchSummaryAbortController = new AbortController();
 
 		try {
-			let extensionSummary: { summary: string; details?: unknown } | undefined;
+			let extensionSummary: { summary: string; details?: JsonValue } | undefined;
 			let fromExtension = false;
 
 			// Emit session_before_tree event
@@ -6672,7 +6727,7 @@ export class AgentSession {
 
 			// Run default summarizer if needed
 			let summaryText: string | undefined;
-			let summaryDetails: unknown;
+			let summaryDetails: JsonValue | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const model = this.model!;
 				const { apiKey, headers, env } = await this._getRequiredRequestAuth(model);
@@ -6741,7 +6796,7 @@ export class AgentSession {
 					newLeafId,
 					summaryText,
 					summaryDetails,
-					fromExtension,
+					fromExtension ? true : undefined,
 				);
 				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
 
@@ -6826,7 +6881,7 @@ export class AgentSession {
 				newLeafId: this.sessionManager.getLeafId(),
 				oldLeafId,
 				summaryEntry,
-				fromExtension: summaryText ? fromExtension : undefined,
+				...(fromExtension ? { fromExtension: true } : {}),
 			});
 
 			// Emit to custom tools

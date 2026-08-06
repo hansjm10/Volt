@@ -87,7 +87,6 @@ function createNoopTool(onExecute?: () => void): AgentTool<ReturnType<typeof Typ
 			onExecute?.();
 			return {
 				content: [{ type: "text", text: "ok" }],
-				details: undefined,
 			};
 		},
 	};
@@ -138,7 +137,6 @@ describe("abort between turns", () => {
 				agent.abort("host_action");
 				return {
 					content: [{ type: "text", text: "stopped" }],
-					details: undefined,
 					disposition: "stop",
 				};
 			},

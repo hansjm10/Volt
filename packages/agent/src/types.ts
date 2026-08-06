@@ -2,6 +2,8 @@ import type {
 	AssistantMessage,
 	AssistantMessageEvent,
 	ImageContent,
+	JsonObject,
+	JsonValue,
 	Message,
 	Model,
 	SimpleStreamOptions,
@@ -71,7 +73,7 @@ export interface BeforeToolCallResult {
  */
 export interface AfterToolCallResult {
 	content?: (TextContent | ImageContent)[];
-	details?: unknown;
+	details?: JsonValue;
 	isError?: boolean;
 	disposition?: AgentToolDisposition;
 }
@@ -82,8 +84,8 @@ export interface BeforeToolCallContext {
 	assistantMessage: AssistantMessage;
 	/** The raw tool call block from `assistantMessage.content`. */
 	toolCall: AgentToolCall;
-	/** Validated tool arguments for the target tool schema. */
-	args: unknown;
+	/** Validated JSON tool arguments for the target tool schema. */
+	args: JsonObject;
 	/** Current agent context at the time the tool call is prepared. */
 	context: AgentContext;
 }
@@ -95,9 +97,9 @@ export interface AfterToolCallContext {
 	/** The raw tool call block from `assistantMessage.content`. */
 	toolCall: AgentToolCall;
 	/** Validated tool arguments for the target tool schema. */
-	args: unknown;
+	args: JsonObject;
 	/** The executed tool result before any `afterToolCall` overrides are applied. */
-	result: AgentToolResult<any>;
+	result: AgentToolResult<unknown>;
 	/** Whether the executed tool result is currently treated as an error. */
 	isError: boolean;
 	/** Current agent context at the time the tool call is finalized. */
@@ -374,9 +376,9 @@ export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessag
 export interface PendingToolExecution {
 	toolCallId: string;
 	toolName: string;
-	args: Readonly<Record<string, unknown>>;
-	/** Structured details from the newest tool_execution_update, when the tool reported any. */
-	latestDetails?: unknown;
+	args: JsonObject;
+	/** JSON details from the newest tool_execution_update, when the tool reported any. */
+	latestDetails?: JsonValue;
 }
 
 /**
@@ -393,8 +395,8 @@ export interface AgentState {
 	/** Requested reasoning level for future turns. */
 	thinkingLevel: ThinkingLevel;
 	/** Available tools. Assigning a new array copies the top-level array. */
-	set tools(tools: AgentTool<any>[]);
-	get tools(): AgentTool<any>[];
+	set tools(tools: AgentTool<any, any>[]);
+	get tools(): AgentTool<any, any>[];
 	/** Conversation transcript. Assigning a new array copies the top-level array. */
 	set messages(messages: AgentMessage[]);
 	get messages(): AgentMessage[];
@@ -415,16 +417,20 @@ export interface AgentState {
 }
 
 /** Final or partial result produced by a tool. */
-export interface AgentToolResult<T> {
+export type AgentToolResult<T = unknown> = {
 	/** Text or image content returned to the model. */
 	content: (TextContent | ImageContent)[];
-	/** Arbitrary structured details for logs or UI rendering. */
-	details: T;
 	/** Marks a resolved final result as failed while preserving its structured content and details. */
 	isError?: boolean;
 	/** Controls whether the batch stops or performs one bounded tool-free response. */
 	disposition?: AgentToolDisposition;
-}
+} & ([T] extends [never]
+	? { details?: never }
+	: [unknown] extends [T]
+		? { /** Optional details for a dynamically typed tool. */ details?: T }
+		: [undefined] extends [T]
+			? { /** Details may be omitted by this tool. */ details?: Exclude<T, undefined> }
+			: { /** Concrete details guaranteed by this tool. */ details: T });
 
 /**
  * Callback used by tools to stream partial execution updates.
@@ -432,24 +438,26 @@ export interface AgentToolResult<T> {
  * The callback is scoped to the current `execute()` invocation. Calls made after
  * the tool promise settles are ignored.
  */
-export type AgentToolUpdateCallback<T = any> = (partialResult: AgentToolResult<T>) => void;
+export type AgentToolUpdateCallback<T = unknown> = {
+	bivarianceHack(partialResult: AgentToolResult<T>): void;
+}["bivarianceHack"];
 
 /** Tool definition used by the agent runtime. */
-export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any> extends Tool<TParameters> {
+export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = unknown> extends Tool<TParameters> {
 	/** Human-readable label for UI display. */
 	label: string;
 	/**
 	 * Optional compatibility shim for raw tool-call arguments before schema validation.
 	 * Must return an object that matches `TParameters`.
 	 */
-	prepareArguments?: (args: unknown) => Static<TParameters>;
+	prepareArguments?(args: unknown): Static<TParameters>;
 	/** Execute the tool call. Throw on unstructured failure, or return `isError: true` to preserve structured failure details. */
-	execute: (
+	execute(
 		toolCallId: string,
 		params: Static<TParameters>,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TDetails>,
-	) => Promise<AgentToolResult<TDetails>>;
+	): Promise<AgentToolResult<TDetails>>;
 	/**
 	 * Per-tool execution mode override.
 	 * - "sequential": this tool must execute one at a time with other tool calls.
@@ -467,7 +475,7 @@ export interface AgentContext {
 	/** Transcript visible to the model. */
 	messages: AgentMessage[];
 	/** Tools available for this run. */
-	tools?: AgentTool<any>[];
+	tools?: AgentTool<any, any>[];
 }
 
 /**
@@ -492,6 +500,18 @@ export type AgentEvent =
 	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
 	| { type: "message_end"; message: AgentMessage; deliveryId?: string }
 	// Tool execution lifecycle
-	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
-	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
-	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };
+	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: JsonObject }
+	| {
+			type: "tool_execution_update";
+			toolCallId: string;
+			toolName: string;
+			args: JsonObject;
+			partialResult: AgentToolResult<unknown>;
+	  }
+	| {
+			type: "tool_execution_end";
+			toolCallId: string;
+			toolName: string;
+			result: AgentToolResult<unknown>;
+			isError: boolean;
+	  };

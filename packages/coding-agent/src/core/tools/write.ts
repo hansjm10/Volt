@@ -245,7 +245,7 @@ export function createWriteToolDefinition(
 						{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` },
 						...(diagnostics ? [{ type: "text" as const, text: `Diagnostics:\n${diagnostics}` }] : []),
 					],
-					details: diagnostics ? { diagnostics } : undefined,
+					...(diagnostics ? { details: { diagnostics } } : {}),
 				};
 			});
 		},
@@ -290,6 +290,9 @@ export function createWriteToolDefinition(
 	};
 }
 
-export function createWriteTool(cwd: string, options?: WriteToolOptions): AgentTool<typeof writeSchema> {
+export function createWriteTool(
+	cwd: string,
+	options?: WriteToolOptions,
+): AgentTool<typeof writeSchema, WriteToolDetails | undefined> {
 	return wrapToolDefinition(createWriteToolDefinition(cwd, options));
 }

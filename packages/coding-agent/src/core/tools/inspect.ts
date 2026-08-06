@@ -910,6 +910,9 @@ export function createInspectionToolDefinition(
 	};
 }
 
-export function createInspectionTool(cwd: string, options?: InspectionToolOptions): AgentTool<typeof inspectionSchema> {
+export function createInspectionTool(
+	cwd: string,
+	options?: InspectionToolOptions,
+): AgentTool<typeof inspectionSchema, InspectionToolDetails | undefined> {
 	return wrapToolDefinition(createInspectionToolDefinition(cwd, options));
 }

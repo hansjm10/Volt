@@ -43,14 +43,6 @@ interface CyclicDetails {
 	self?: CyclicDetails;
 }
 
-interface RichDetails {
-	map: Map<string, { count: number }>;
-	set: Set<string>;
-	date: Date;
-	bytes: Uint8Array;
-	cycle: CyclicDetails;
-}
-
 function getToolResultText(tool: Extract<AgentSessionEvent, { type: "tool_execution_end" }>): string {
 	const content = tool.result.content as Array<{ type: string; text?: string }>;
 	return content
@@ -59,11 +51,14 @@ function getToolResultText(tool: Extract<AgentSessionEvent, { type: "tool_execut
 		.join("\n");
 }
 
-function createCloneBoundaryTool(invalidPayload: "partial" | "final" | undefined): AgentTool {
+function createCloneBoundaryTool(
+	invalidPayload: "partial" | "final" | "explicit-undefined" | undefined,
+	onInvalidPartial?: (signal: AbortSignal | undefined) => void | Promise<void>,
+): AgentTool {
 	return {
 		name: "clone-boundary",
 		label: "Clone boundary",
-		description: "Exercise structured-clone validation",
+		description: "Exercise canonical JSON validation",
 		parameters: Type.Object({}),
 		execute: async (_toolCallId, _params, _signal, onUpdate) => {
 			if (invalidPayload === "partial") {
@@ -71,6 +66,7 @@ function createCloneBoundaryTool(invalidPayload: "partial" | "final" | undefined
 					content: [{ type: "text", text: "partial" }],
 					details: { callback: () => undefined },
 				});
+				await onInvalidPartial?.(_signal);
 				return { content: [{ type: "text", text: "complete" }], details: { valid: true } };
 			}
 			if (invalidPayload === "final") {
@@ -78,6 +74,9 @@ function createCloneBoundaryTool(invalidPayload: "partial" | "final" | undefined
 					content: [{ type: "text", text: "complete" }],
 					details: { callback: () => undefined },
 				};
+			}
+			if (invalidPayload === "explicit-undefined") {
+				return { content: [{ type: "text", text: "complete" }], details: undefined };
 			}
 			return { content: [{ type: "text", text: "complete" }], details: { valid: true } };
 		},
@@ -163,7 +162,7 @@ describe("regression #213: AgentSession observer isolation", () => {
 		expect(unhandledRejections).toEqual([]);
 	});
 
-	it("rejects known non-cloneable custom details in the public input type", () => {
+	it("rejects known non-JSON custom details in the public input type", () => {
 		type InvalidDetails = { callback: () => void };
 		expectTypeOf<InvalidDetails>().not.toExtend<NonNullable<CustomMessageInput<InvalidDetails>["details"]>>();
 	});
@@ -191,59 +190,46 @@ describe("regression #213: AgentSession observer isolation", () => {
 				display: true,
 				details: { callback: () => undefined },
 			}),
-		).rejects.toThrow("Custom message invalid-details must contain only structured-cloneable data");
+		).rejects.toThrow(
+			"Custom message input must contain only JSON-compatible data; invalid value at $.details.callback: functions are not permitted",
+		);
 
 		expect(customEvents).toEqual([]);
 		expect(harness.session.messages).toHaveLength(messageCount);
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toEqual([]);
 	});
 
-	it("preserves rich cyclic data while isolating each observer snapshot", async () => {
+	it.each([
+		[
+			"cyclic data",
+			() => {
+				const cycle: CyclicDetails = { label: "cycle" };
+				cycle.self = cycle;
+				return cycle;
+			},
+		],
+		["Map", () => new Map([["value", 1]])],
+		["typed data", () => new Uint8Array([1, 2, 3])],
+		["shared memory", () => new SharedArrayBuffer(1)],
+	] as const)("rejects %s custom details before observer publication", async (_name, createDetails) => {
 		harness = await createHarness();
-		const cycle: CyclicDetails = { label: "original" };
-		cycle.self = cycle;
-		const details: RichDetails = {
-			map: new Map([["value", { count: 1 }]]),
-			set: new Set(["kept"]),
-			date: new Date("2026-01-02T03:04:05.000Z"),
-			bytes: new Uint8Array([1, 2, 3]),
-			cycle,
-		};
-		const laterSnapshots: RichDetails[] = [];
+		const events: AgentSessionEvent[] = [];
+		harness.session.subscribe((event) => events.push(event));
+		const sendUnchecked = harness.session.sendCustomMessage.bind(harness.session) as (message: {
+			customType: string;
+			content: string;
+			display: boolean;
+			details: unknown;
+		}) => Promise<void>;
 
-		harness.session.subscribe((event) => {
-			if (event.type !== "message_end" || event.message.role !== "custom") return;
-			const snapshot = event.message.details as RichDetails;
-			snapshot.map.get("value")!.count = 99;
-			snapshot.set.add("mutated");
-			snapshot.date.setUTCFullYear(2000);
-			snapshot.bytes[0] = 9;
-			snapshot.cycle.label = "mutated";
-		});
-		harness.session.subscribe((event) => {
-			if (event.type !== "message_end" || event.message.role !== "custom") return;
-			laterSnapshots.push(event.message.details as RichDetails);
-		});
-
-		await harness.session.sendCustomMessage({
-			customType: "rich-details",
-			content: "rich",
-			display: true,
-			details,
-		});
-
-		expect(laterSnapshots).toHaveLength(1);
-		const later = laterSnapshots[0]!;
-		expect(later.map.get("value")?.count).toBe(1);
-		expect([...later.set]).toEqual(["kept"]);
-		expect(later.date.toISOString()).toBe("2026-01-02T03:04:05.000Z");
-		expect([...later.bytes]).toEqual([1, 2, 3]);
-		expect(later.cycle.label).toBe("original");
-		expect(later.cycle.self).toBe(later.cycle);
-		expect(details.map.get("value")?.count).toBe(1);
+		await expect(
+			sendUnchecked({ customType: "invalid", content: "invalid", display: true, details: createDetails() }),
+		).rejects.toThrow("must contain only JSON-compatible data");
+		expect(events).toEqual([]);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toEqual([]);
 	});
 
-	it.each(["partial", "final"] as const)(
+	it.each(["partial", "final", "explicit-undefined"] as const)(
 		"turns an invalid %s tool result into an explicit tool failure",
 		async (invalidPayload) => {
 			harness = await createHarness({ tools: [createCloneBoundaryTool(invalidPayload)] });
@@ -257,17 +243,89 @@ describe("regression #213: AgentSession observer isolation", () => {
 			expect(harness.getPendingResponseCount()).toBe(0);
 			const toolEnd = harness.eventsOfType("tool_execution_end")[0]!;
 			expect(toolEnd.isError).toBe(true);
+			const resultPhase = invalidPayload === "partial" ? "partial" : "final";
 			expect(getToolResultText(toolEnd)).toContain(
-				`Tool clone-boundary ${invalidPayload} result must contain only structured-cloneable data`,
+				`Tool clone-boundary ${resultPhase} result must contain only JSON-compatible data`,
 			);
 			if (invalidPayload === "partial") {
 				expect(harness.eventsOfType("tool_execution_update")).toEqual([]);
+			}
+			if (invalidPayload === "explicit-undefined") {
+				expect(getToolResultText(toolEnd)).toContain("undefined is not permitted; omit optional properties");
 			}
 			expect(harness.eventsOfType("message_end").some((event) => event.message.role === "toolResult")).toBe(true);
 		},
 	);
 
-	it("rejects clone-incompatible mutation by a tool_result extension", async () => {
+	it("aborts an invalid streaming update but waits for tool settlement", async () => {
+		let releaseTool!: () => void;
+		let markToolWaiting!: () => void;
+		const toolWaiting = new Promise<void>((resolve) => {
+			markToolWaiting = resolve;
+		});
+		const toolGate = new Promise<void>((resolve) => {
+			releaseTool = resolve;
+		});
+		let linkedSignalAborted = false;
+		let toolSettled = false;
+		harness = await createHarness({
+			tools: [
+				createCloneBoundaryTool("partial", async (signal) => {
+					linkedSignalAborted = signal?.aborted === true;
+					markToolWaiting();
+					await toolGate;
+					toolSettled = true;
+				}),
+			],
+		});
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("clone-boundary", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+
+		const prompt = harness.session.prompt("run invalid streaming update");
+		await toolWaiting;
+		expect(linkedSignalAborted).toBe(true);
+		expect(toolSettled).toBe(false);
+		expect(harness.eventsOfType("tool_execution_end")).toEqual([]);
+		releaseTool();
+		await prompt;
+
+		expect(toolSettled).toBe(true);
+		expect(harness.eventsOfType("tool_execution_update")).toEqual([]);
+		expect(harness.eventsOfType("tool_execution_end")[0]?.isError).toBe(true);
+	});
+
+	it("ignores tool update callbacks after execute settles", async () => {
+		let lateUpdate: (() => void) | undefined;
+		const tool: AgentTool = {
+			name: "late-update",
+			label: "Late update",
+			description: "Calls its update callback after settling",
+			parameters: Type.Object({}),
+			execute: async (_toolCallId, _params, _signal, onUpdate) => {
+				lateUpdate = () =>
+					onUpdate?.({
+						content: [{ type: "text", text: "late" }],
+						details: { callback: () => undefined },
+					});
+				return { content: [{ type: "text", text: "complete" }], details: { valid: true } };
+			},
+		};
+		harness = await createHarness({ tools: [tool] });
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("late-update", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+
+		await harness.session.prompt("run late update tool");
+		const updateCount = harness.eventsOfType("tool_execution_update").length;
+		expect(() => lateUpdate?.()).not.toThrow();
+		await flushUnhandledRejections();
+		expect(harness.eventsOfType("tool_execution_update")).toHaveLength(updateCount);
+	});
+
+	it("rejects non-JSON mutation by a tool_result extension", async () => {
 		harness = await createHarness({
 			tools: [createCloneBoundaryTool(undefined)],
 			extensionFactories: [
@@ -288,9 +346,136 @@ describe("regression #213: AgentSession observer isolation", () => {
 
 		const toolEnd = harness.eventsOfType("tool_execution_end")[0]!;
 		expect(toolEnd.isError).toBe(true);
-		expect(getToolResultText(toolEnd)).toContain(
-			"Extension tool_result output for clone-boundary must contain only structured-cloneable data",
-		);
+		expect(getToolResultText(toolEnd)).toContain("Extension tool_result output from");
+		expect(getToolResultText(toolEnd)).toContain("must contain only JSON-compatible data");
+	});
+
+	it("omits absent tool details before tool_result extension admission", async () => {
+		const parameters = Type.Object({});
+		const tool: AgentTool = {
+			name: "no-details",
+			label: "No details",
+			description: "Returns content without optional details",
+			parameters,
+			execute: async () => ({ content: [{ type: "text", text: "complete" }] }),
+		};
+		let hookCalls = 0;
+		harness = await createHarness({
+			tools: [tool],
+			extensionFactories: [
+				(volt) => {
+					volt.on("tool_result", (event) => {
+						if (event.toolName !== "no-details") return;
+						hookCalls++;
+						expect(Object.hasOwn(event, "details")).toBe(false);
+					});
+				},
+			],
+		});
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("no-details", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+
+		await harness.session.prompt("run no-details tool");
+
+		expect(hookCalls).toBe(1);
+		const toolEnd = harness.eventsOfType("tool_execution_end")[0]!;
+		expect(toolEnd.isError).toBe(false);
+		expect(Object.hasOwn(toolEnd.result, "details")).toBe(false);
+	});
+
+	it("snapshots the listener list before publishing each event", async () => {
+		harness = await createHarness();
+		const originalListenerEvents: number[] = [];
+		const addedListenerEvents: number[] = [];
+		let queueEvent = 0;
+		let changedListeners = false;
+		const unsubscribeOriginal = harness.session.subscribe((event) => {
+			if (event.type === "queue_update") originalListenerEvents.push(queueEvent);
+		});
+		harness.session.subscribe((event) => {
+			if (event.type !== "queue_update" || changedListeners) return;
+			changedListeners = true;
+			unsubscribeOriginal();
+			harness!.session.subscribe((laterEvent) => {
+				if (laterEvent.type === "queue_update") addedListenerEvents.push(queueEvent);
+			});
+		});
+
+		queueEvent = 1;
+		await harness.session.steer("first");
+		queueEvent = 2;
+		await harness.session.steer("second");
+
+		expect(originalListenerEvents).toEqual([1]);
+		expect(addedListenerEvents).toEqual([2]);
+	});
+
+	it("skips an invalid optional before_agent_start message", async () => {
+		let providerMessages: readonly AgentMessage[] = [];
+		harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("before_agent_start", () => ({
+						message: {
+							customType: "invalid-prestart",
+							content: "invalid",
+							display: false,
+							details: { callback: () => undefined },
+						} as never,
+					}));
+					volt.on("context", (event) => {
+						providerMessages = event.messages;
+					});
+				},
+			],
+		});
+		harness.setResponses([fauxAssistantMessage("continued")]);
+
+		await harness.session.prompt("continue after invalid prestart");
+
+		expect(providerMessages.some((message) => message.role === "custom")).toBe(false);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.some((entry) => entry.type === "custom_message" && entry.customType === "invalid-prestart"),
+		).toBe(false);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("retains delivery when message_end returns an invalid replacement", async () => {
+		harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("message_end", (event) => {
+						if (event.message.role !== "user") return;
+						return {
+							message: {
+								...event.message,
+								content: [{ type: "text", text: "invalid", callback: () => undefined }],
+							} as never,
+						};
+					});
+				},
+			],
+		});
+		harness.setResponses([fauxAssistantMessage("must not run")]);
+
+		const result = await harness.session.agent.prompt({
+			role: "user",
+			content: [{ type: "text", text: "original" }],
+			timestamp: 213,
+		});
+
+		expect(result).toMatchObject({ status: "delivery_failed", failure: { outcome: "retained" } });
+		expect(harness.session.agent.hasPendingPrompt()).toBe(true);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "message" && entry.message.role === "user"),
+		).toEqual([]);
 	});
 
 	it("applies the same isolation policy to queue and planning projections", async () => {

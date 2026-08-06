@@ -308,9 +308,7 @@ export function createGrepToolDefinition(
 								return;
 							}
 							if (matchCount === 0) {
-								settle(() =>
-									resolve({ content: [{ type: "text", text: "No matches found" }], details: undefined }),
-								);
+								settle(() => resolve({ content: [{ type: "text", text: "No matches found" }] }));
 								return;
 							}
 
@@ -358,7 +356,7 @@ export function createGrepToolDefinition(
 							settle(() =>
 								resolve({
 									content: [{ type: "text", text: output }],
-									details: Object.keys(details).length > 0 ? details : undefined,
+									...(Object.keys(details).length > 0 ? { details } : {}),
 								}),
 							);
 						});
@@ -381,6 +379,9 @@ export function createGrepToolDefinition(
 	};
 }
 
-export function createGrepTool(cwd: string, options?: GrepToolOptions): AgentTool<typeof grepSchema> {
+export function createGrepTool(
+	cwd: string,
+	options?: GrepToolOptions,
+): AgentTool<typeof grepSchema, GrepToolDetails | undefined> {
 	return wrapToolDefinition(createGrepToolDefinition(cwd, options));
 }

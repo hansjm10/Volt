@@ -21,6 +21,9 @@ import type {
 	AssistantMessageEventStream,
 	Context,
 	ImageContent,
+	JsonCompatibleInput,
+	JsonObject,
+	JsonValue,
 	Model,
 	OAuthCredentials,
 	OAuthLoginCallbacks,
@@ -474,7 +477,7 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	 */
 	executionMode?: ToolExecutionMode;
 
-	/** Execute the tool. Final details and all streamed updates must be structured-cloneable. */
+	/** Execute the tool. Final details and all streamed updates must contain only JSON-compatible data. */
 	execute(
 		toolCallId: string,
 		params: Static<TParams>,
@@ -737,7 +740,7 @@ export interface ToolExecutionStartEvent {
 	type: "tool_execution_start";
 	toolCallId: string;
 	toolName: string;
-	args: any;
+	args: JsonObject;
 }
 
 /** Fired during tool execution with partial/streaming output */
@@ -745,8 +748,8 @@ export interface ToolExecutionUpdateEvent {
 	type: "tool_execution_update";
 	toolCallId: string;
 	toolName: string;
-	args: any;
-	partialResult: any;
+	args: JsonObject;
+	partialResult: AgentToolResult<JsonValue | undefined>;
 }
 
 /** Fired when a tool finishes executing */
@@ -754,7 +757,7 @@ export interface ToolExecutionEndEvent {
 	type: "tool_execution_end";
 	toolCallId: string;
 	toolName: string;
-	result: any;
+	result: AgentToolResult<JsonValue | undefined>;
 	isError: boolean;
 }
 
@@ -876,7 +879,7 @@ export interface LsToolCallEvent extends ToolCallEventBase {
 
 export interface CustomToolCallEvent extends ToolCallEventBase {
 	toolName: string;
-	input: Record<string, unknown>;
+	input: JsonObject;
 }
 
 /**
@@ -900,59 +903,59 @@ export type ToolCallEvent =
 interface ToolResultEventBase {
 	type: "tool_result";
 	toolCallId: string;
-	input: Record<string, unknown>;
+	input: JsonObject;
 	content: (TextContent | ImageContent)[];
 	isError: boolean;
 }
 
 export interface BashToolResultEvent extends ToolResultEventBase {
 	toolName: "bash";
-	details: BashToolDetails | undefined;
+	details?: BashToolDetails;
 }
 
 export interface ReadToolResultEvent extends ToolResultEventBase {
 	toolName: "read";
-	details: ReadToolDetails | undefined;
+	details?: ReadToolDetails;
 }
 
 export interface EditToolResultEvent extends ToolResultEventBase {
 	toolName: "edit";
-	details: EditToolDetails | undefined;
+	details?: EditToolDetails;
 }
 
 export interface WriteToolResultEvent extends ToolResultEventBase {
 	toolName: "write";
-	details: WriteToolDetails | undefined;
+	details?: WriteToolDetails;
 }
 
 export interface WebSearchToolResultEvent extends ToolResultEventBase {
 	toolName: "web_search";
-	details: WebSearchToolDetails | undefined;
+	details?: WebSearchToolDetails;
 }
 
 export interface WebFetchToolResultEvent extends ToolResultEventBase {
 	toolName: "web_fetch";
-	details: WebFetchToolDetails | undefined;
+	details?: WebFetchToolDetails;
 }
 
 export interface GrepToolResultEvent extends ToolResultEventBase {
 	toolName: "grep";
-	details: GrepToolDetails | undefined;
+	details?: GrepToolDetails;
 }
 
 export interface FindToolResultEvent extends ToolResultEventBase {
 	toolName: "find";
-	details: FindToolDetails | undefined;
+	details?: FindToolDetails;
 }
 
 export interface LsToolResultEvent extends ToolResultEventBase {
 	toolName: "ls";
-	details: LsToolDetails | undefined;
+	details?: LsToolDetails;
 }
 
 export interface CustomToolResultEvent extends ToolResultEventBase {
 	toolName: string;
-	details: unknown;
+	details?: JsonValue;
 }
 
 /** Fired after a tool executes. Can modify result. */
@@ -1086,8 +1089,8 @@ export interface UserBashEventResult {
 
 export interface ToolResultEventResult {
 	content?: (TextContent | ImageContent)[];
-	/** Replacement details must contain only structured-cloneable data. */
-	details?: unknown;
+	/** Replacement details must contain only JSON-compatible data. */
+	details?: JsonValue;
 	isError?: boolean;
 }
 
@@ -1120,7 +1123,7 @@ export interface SessionBeforeTreeResult {
 	cancel?: boolean;
 	summary?: {
 		summary: string;
-		details?: unknown;
+		details?: JsonValue;
 	};
 	/** Override custom instructions for summarization */
 	customInstructions?: string;
@@ -1138,7 +1141,7 @@ export interface MessageRenderOptions {
 	expanded: boolean;
 }
 
-export type MessageRenderer<T = unknown> = (
+export type MessageRenderer<T = JsonValue> = (
 	message: CustomMessage<T>,
 	options: MessageRenderOptions,
 	theme: Theme,
@@ -1261,7 +1264,7 @@ export interface ExtensionAPI {
 	// =========================================================================
 
 	/** Register a custom renderer for CustomMessageEntry. */
-	registerMessageRenderer<T = unknown>(customType: string, renderer: MessageRenderer<T>): void;
+	registerMessageRenderer<T = JsonValue>(customType: string, renderer: MessageRenderer<T>): void;
 
 	// =========================================================================
 	// Actions
@@ -1283,7 +1286,7 @@ export interface ExtensionAPI {
 	): void;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
-	appendEntry<T = unknown>(customType: string, data?: T): void;
+	appendEntry<T>(customType: string, data?: JsonCompatibleInput<T>): void;
 
 	// =========================================================================
 	// Session Metadata
@@ -1507,7 +1510,7 @@ export type SendUserMessageHandler = (
 	options?: { deliverAs?: "steer" | "followUp" },
 ) => void;
 
-export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
+export type AppendEntryHandler = <T>(customType: string, data?: JsonCompatibleInput<T>) => void;
 
 export type SetSessionNameHandler = (name: string) => void;
 

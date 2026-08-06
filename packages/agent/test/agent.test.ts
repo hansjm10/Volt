@@ -1486,13 +1486,13 @@ describe("Agent", () => {
 
 	it("stops after the current turn when nextAction returns stop", async () => {
 		const toolSchema = Type.Object({});
-		const tool: AgentTool<typeof toolSchema, undefined> = {
+		const tool: AgentTool<typeof toolSchema, never> = {
 			name: "noop_tool",
 			label: "Noop Tool",
 			description: "Returns ok",
 			parameters: toolSchema,
 			async execute() {
-				return { content: [{ type: "text", text: "ok" }], details: undefined };
+				return { content: [{ type: "text", text: "ok" }] };
 			},
 		};
 		let llmCalls = 0;
@@ -1817,7 +1817,7 @@ describe("Agent", () => {
 
 	it("re-canonicalizes runtime abort diagnostics across message replacements without mutating snapshots", async () => {
 		const requestStarted = createDeferred();
-		const replacementDiagnostics = [
+		const replacementDiagnostics: NonNullable<AssistantMessage["diagnostics"]> = [
 			{ type: "extension_one", timestamp: 1, details: { retained: true } },
 			{ type: "runtime_abort", timestamp: 2, details: { source: "disposal" } },
 		];
@@ -1844,14 +1844,12 @@ describe("Agent", () => {
 		agent.subscribe((event) => {
 			if (event.type !== "message_end" || event.message.role !== "assistant") return undefined;
 			secondListenerInput = event.message;
-			return {
-				...event.message,
-				diagnostics: [
-					...(event.message.diagnostics ?? []),
-					{ type: "extension_two", timestamp: 3, details: { retained: true } },
-					{ type: "runtime_abort", timestamp: 4, details: { source: "keyboard_interrupt" } },
-				],
-			} as AssistantMessage;
+			const diagnostics: NonNullable<AssistantMessage["diagnostics"]> = [
+				...(event.message.diagnostics ?? []),
+				{ type: "extension_two", timestamp: 3, details: { retained: true } },
+				{ type: "runtime_abort", timestamp: 4, details: { source: "keyboard_interrupt" } },
+			];
+			return { ...event.message, diagnostics };
 		});
 
 		const prompting = agent.prompt("abort with replacements");

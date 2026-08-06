@@ -419,7 +419,14 @@ describe("AgentSession model and extension characterization", () => {
 
 		expect(getAssistantTexts(harness)).toContain("patched result");
 		expect(
-			harness.session.messages.find((message) => message.role === "toolResult" && message.details?.patched === true),
+			harness.session.messages.find(
+				(message) =>
+					message.role === "toolResult" &&
+					typeof message.details === "object" &&
+					message.details !== null &&
+					"patched" in message.details &&
+					message.details.patched === true,
+			),
 		).toBeDefined();
 	});
 

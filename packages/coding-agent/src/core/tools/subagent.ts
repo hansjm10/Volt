@@ -957,13 +957,13 @@ function createSingleDetails(task: SubagentToolTaskDetails): SubagentToolDetails
 	const childSessions = createChildSessions([task]);
 	return {
 		mode: "single",
-		subagentId: task.subagentId,
-		sessionId: task.sessionId,
+		...(task.subagentId === undefined ? {} : { subagentId: task.subagentId }),
+		...(task.sessionId === undefined ? {} : { sessionId: task.sessionId }),
 		agent: task.agent,
 		status: task.status,
-		usage: task.usage,
-		output: task.output,
-		error: task.error,
+		...(task.usage === undefined ? {} : { usage: task.usage }),
+		...(task.output === undefined ? {} : { output: task.output }),
+		...(task.error === undefined ? {} : { error: task.error }),
 		...(task.startedAt !== undefined ? { startedAt: task.startedAt } : {}),
 		...(task.durationMs !== undefined ? { durationMs: task.durationMs } : {}),
 		...(task.toolCalls !== undefined ? { toolCalls: task.toolCalls } : {}),

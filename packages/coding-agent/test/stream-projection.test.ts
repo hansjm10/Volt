@@ -4,6 +4,7 @@ import {
 	type AssistantMessageEvent,
 	type AssistantStreamFragment,
 	AssistantStreamNormalizer,
+	type JsonObject,
 	parseStreamingJson,
 	type ToolCall,
 	type Usage,
@@ -153,7 +154,7 @@ function toolEndEvent(
 	return { type: "toolcall_end", seq, contentIndex, toolCall, snapshot, toolState };
 }
 
-function toolCall(id: string, name: string, args: Record<string, unknown>): ToolCall {
+function toolCall(id: string, name: string, args: JsonObject): ToolCall {
 	return { type: "toolCall", id, name, arguments: args };
 }
 
@@ -169,7 +170,7 @@ function stateForPhase(phase: ProjectionPhase): ProjectionState {
 
 function tableToolEvent(): Extract<AssistantMessageEvent, { type: "toolcall_delta" }> {
 	const argsText = JSON.stringify({ path: `${SECRET_ROOT}/notes.md` });
-	const block = toolCall("tc-1", "read", parseStreamingJson<Record<string, unknown>>(argsText));
+	const block = toolCall("tc-1", "read", parseStreamingJson<JsonObject>(argsText));
 	return toolDeltaEvent(1, assistant([block]), 0, argsText, [{ contentIndex: 0, argsText }]);
 }
 
@@ -435,7 +436,7 @@ describe("tool-state snapshots and authoritative replacement", () => {
 		const projector = new StreamProjector();
 		const decoder = new StreamProjectionDecoder();
 		const firstArgs = '{"path":"no';
-		const firstBlock = toolCall("tc-1", "read", parseStreamingJson<Record<string, unknown>>(firstArgs));
+		const firstBlock = toolCall("tc-1", "read", parseStreamingJson<JsonObject>(firstArgs));
 		const firstEvent = toolDeltaEvent(3, assistant([firstBlock]), 0, "no", [
 			{ contentIndex: 0, argsText: firstArgs },
 		]);
@@ -447,7 +448,7 @@ describe("tool-state snapshots and authoritative replacement", () => {
 
 		const suffix = 'tes.md"}';
 		const fullArgs = firstArgs + suffix;
-		const nextBlock = toolCall("tc-1", "read", parseStreamingJson<Record<string, unknown>>(fullArgs));
+		const nextBlock = toolCall("tc-1", "read", parseStreamingJson<JsonObject>(fullArgs));
 		const nextEvent = toolDeltaEvent(4, assistant([nextBlock]), 0, suffix, [{ contentIndex: 0, argsText: fullArgs }]);
 		const nextFrame = projectUpdate(projector, nextEvent);
 		expect(nextFrame).not.toHaveProperty("message");

@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@hansjm10/volt-agent-core";
-import { type AssistantMessage, fauxAssistantMessage } from "@hansjm10/volt-ai";
+import { type AssistantMessage, type AssistantMessageDiagnostic, fauxAssistantMessage } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionHandler, MessageEndEvent, MessageEndEventResult } from "../../../src/core/extensions/types.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -105,23 +106,25 @@ describe("regression #199: abort provenance persistence", () => {
 		const harness = await createHarness({
 			extensionFactories: [
 				(volt) => {
-					volt.on("message_end", (event) => {
+					const handler: ExtensionHandler<MessageEndEvent, MessageEndEventResult> = (event) => {
 						if (event.message.role !== "assistant" || event.message.stopReason !== "aborted") return;
 						canonicalTimestamp = event.message.diagnostics?.find(
 							(diagnostic) => diagnostic.type === "runtime_abort",
 						)?.timestamp;
+						const diagnostics: AssistantMessageDiagnostic[] = [
+							{ type: "extension_before", timestamp: 1, details: { retained: true } },
+							{ type: "runtime_abort", timestamp: 2, details: { source: "disposal" } },
+							{ type: "extension_after", timestamp: 3, details: { retained: true } },
+							{ type: "runtime_abort", timestamp: 4, details: { source: "keyboard_interrupt" } },
+						];
 						return {
 							message: {
 								...event.message,
-								diagnostics: [
-									{ type: "extension_before", timestamp: 1, details: { retained: true } },
-									{ type: "runtime_abort", timestamp: 2, details: { source: "disposal" } },
-									{ type: "extension_after", timestamp: 3, details: { retained: true } },
-									{ type: "runtime_abort", timestamp: 4, details: { source: "keyboard_interrupt" } },
-								],
+								diagnostics,
 							},
-						};
-					});
+						} satisfies { message: AgentMessage };
+					};
+					volt.on("message_end", handler);
 				},
 			],
 		});

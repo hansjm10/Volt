@@ -2,6 +2,7 @@ import {
 	type AssistantMessage,
 	type ImageContent,
 	type InferenceSpeed,
+	type JsonValue,
 	type Message,
 	type Model,
 	type SimpleStreamOptions,
@@ -103,7 +104,7 @@ function createMutableAgentState(initialState?: Partial<Omit<AgentState, Runtime
 		get tools() {
 			return tools;
 		},
-		set tools(nextTools: AgentTool<any>[]) {
+		set tools(nextTools: AgentTool<any, any>[]) {
 			tools = nextTools.slice();
 		},
 		get messages() {
@@ -113,10 +114,8 @@ function createMutableAgentState(initialState?: Partial<Omit<AgentState, Runtime
 			messages = nextMessages.slice();
 		},
 		isStreaming: false,
-		streamingMessage: undefined,
 		pendingToolCalls: new Set<string>(),
 		pendingToolExecutions: new Map<string, PendingToolExecution>(),
-		errorMessage: undefined,
 	};
 }
 
@@ -1048,7 +1047,7 @@ export class Agent {
 					break;
 				}
 				const pendingToolExecutions = new Map(this._state.pendingToolExecutions);
-				pendingToolExecutions.set(event.toolCallId, { ...existing, latestDetails: details });
+				pendingToolExecutions.set(event.toolCallId, { ...existing, latestDetails: details as JsonValue });
 				this._state.pendingToolExecutions = pendingToolExecutions;
 				break;
 			}

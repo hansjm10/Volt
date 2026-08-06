@@ -234,7 +234,7 @@ describe("ToolExecutionComponent parity", () => {
 			(update) => updates.push(update as { content: Array<{ type: string; text?: string }>; details?: unknown }),
 			{} as never,
 		);
-		expect(updates).toEqual([{ content: [], details: undefined }]);
+		expect(updates).toEqual([{ content: [] }]);
 		await promise;
 	});
 
@@ -285,7 +285,7 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		component.updateResult({ content: [{ type: "text", text: "hello" }], details: undefined, isError: false }, false);
+		component.updateResult({ content: [{ type: "text", text: "hello" }], isError: false }, false);
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered.match(/\bread\b/g)?.length ?? 0).toBe(1);
 	});
@@ -305,7 +305,7 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		component.updateResult({ content: [{ type: "text", text: "hello" }], details: undefined, isError: false }, false);
+		component.updateResult({ content: [{ type: "text", text: "hello" }], isError: false }, false);
 		component.setExpanded(true);
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered).toContain("override call");
@@ -327,7 +327,7 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		component.updateResult({ content: [{ type: "text", text: "hello" }], details: undefined, isError: false }, false);
+		component.updateResult({ content: [{ type: "text", text: "hello" }], isError: false }, false);
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered).toContain("read");
 		expect(rendered).toContain("README.md");
@@ -349,7 +349,7 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		component.updateResult({ content: [{ type: "text", text: "hello" }], details: undefined, isError: false }, false);
+		component.updateResult({ content: [{ type: "text", text: "hello" }], isError: false }, false);
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered).toContain("override call");
 		expect(rendered).toContain("override result");
@@ -372,7 +372,7 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		component.updateResult({ content: [{ type: "text", text: "hello" }], details: undefined, isError: false }, false);
+		component.updateResult({ content: [{ type: "text", text: "hello" }], isError: false }, false);
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered).toContain("wrapped override call");
 		expect(rendered).toContain("wrapped override result");
@@ -1257,10 +1257,7 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		component.updateResult(
-			{ content: [{ type: "text", text: "one\ntwo\n" }], details: undefined, isError: false },
-			false,
-		);
+		component.updateResult({ content: [{ type: "text", text: "one\ntwo\n" }], isError: false }, false);
 		component.setExpanded(true);
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered).toContain("one");
@@ -1278,10 +1275,7 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		component.updateResult(
-			{ content: [{ type: "text", text: "hidden content" }], details: undefined, isError: false },
-			false,
-		);
+		component.updateResult({ content: [{ type: "text", text: "hidden content" }], isError: false }, false);
 
 		const collapsed = stripAnsi(component.render(120).join("\n"));
 		expect(collapsed).toContain("read");
@@ -1338,10 +1332,7 @@ describe("ToolExecutionComponent parity", () => {
 				createFakeTui(),
 				process.cwd(),
 			);
-			component.updateResult(
-				{ content: [{ type: "text", text: scenario.content }], details: undefined, isError: false },
-				false,
-			);
+			component.updateResult({ content: [{ type: "text", text: scenario.content }], isError: false }, false);
 
 			const collapsed = stripAnsi(component.render(120).join("\n"));
 			expect(collapsed).toContain(scenario.compact);

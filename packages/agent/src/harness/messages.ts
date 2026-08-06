@@ -1,4 +1,4 @@
-import type { ImageContent, Message, TextContent } from "@hansjm10/volt-ai";
+import type { ImageContent, JsonValue, Message, TextContent } from "@hansjm10/volt-ai";
 import type { AgentMessage } from "../types.ts";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
@@ -20,7 +20,7 @@ export interface BashExecutionMessage {
 	role: "bashExecution";
 	command: string;
 	output: string;
-	exitCode: number | undefined;
+	exitCode?: number;
 	cancelled: boolean;
 	truncated: boolean;
 	fullOutputPath?: string;
@@ -28,7 +28,7 @@ export interface BashExecutionMessage {
 	excludeFromContext?: boolean;
 }
 
-export interface CustomMessage<T = unknown> {
+export interface CustomMessage<T = JsonValue> {
 	role: "custom";
 	customType: string;
 	content: string | (TextContent | ImageContent)[];
@@ -104,7 +104,7 @@ export function createCustomMessage(
 	customType: string,
 	content: string | (TextContent | ImageContent)[],
 	display: boolean,
-	details: unknown | undefined,
+	details: JsonValue | undefined,
 	timestamp: string,
 ): CustomMessage {
 	return {
@@ -112,7 +112,7 @@ export function createCustomMessage(
 		customType,
 		content,
 		display,
-		details,
+		...(details === undefined ? {} : { details }),
 		timestamp: new Date(timestamp).getTime(),
 	};
 }

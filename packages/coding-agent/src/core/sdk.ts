@@ -283,7 +283,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	if (options.sessionStartEvent?.reason !== "new" && planningStateNeedsCheckpoint(existingSession.planning)) {
 		const checkpoint = formatPlanCheckpoint(existingSession.planning);
 		if (checkpoint && !hasCanonicalPlanningMessage(existingSession.messages, existingSession.planning, checkpoint)) {
-			sessionManager.appendCustomMessageEntry(PLAN_CHECKPOINT_CUSTOM_TYPE, checkpoint, false, undefined);
+			sessionManager.appendCustomMessageEntry(PLAN_CHECKPOINT_CUSTOM_TYPE, checkpoint, false);
 			await sessionManager.flush();
 			existingSession = sessionManager.buildSessionContext();
 		}

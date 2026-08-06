@@ -378,7 +378,12 @@ export function createEditToolDefinition(
 						},
 						...(diagnostics ? [{ type: "text" as const, text: `Diagnostics:\n${diagnostics}` }] : []),
 					],
-					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine, diagnostics },
+					details: {
+						diff: diffResult.diff,
+						patch,
+						firstChangedLine: diffResult.firstChangedLine,
+						...(diagnostics === undefined ? {} : { diagnostics }),
+					},
 				};
 			});
 		},
@@ -454,6 +459,9 @@ export function createEditToolDefinition(
 	};
 }
 
-export function createEditTool(cwd: string, options?: EditToolOptions): AgentTool<typeof editSchema> {
+export function createEditTool(
+	cwd: string,
+	options?: EditToolOptions,
+): AgentTool<typeof editSchema, EditToolDetails | undefined> {
 	return wrapToolDefinition(createEditToolDefinition(cwd, options));
 }

@@ -1,7 +1,13 @@
 // Core session management
 
+export type {
+	JsonCompatible,
+	JsonCompatibleInput,
+	JsonObject,
+	JsonPrimitive,
+	JsonValue,
+} from "@hansjm10/volt-ai";
 export { type Args, parseArgs } from "./cli/args.ts";
-
 // Config paths
 export { getAgentDir, getDocsPath, getExamplesPath, getPackageDir, getReadmePath, VERSION } from "./config.ts";
 export {
@@ -650,12 +656,6 @@ export {
 	type SkillFrontmatter,
 } from "./core/skills.ts";
 export { createSyntheticSourceInfo } from "./core/source-info.ts";
-export {
-	assertStructuredCloneable,
-	cloneStructuredData,
-	type StructuredCloneable,
-	type StructuredCloneableInput,
-} from "./core/structured-clone.ts";
 export {
 	createBuiltInSubagentDefinitions,
 	DEFAULT_SUBAGENT_DELEGATION_LIMITS,

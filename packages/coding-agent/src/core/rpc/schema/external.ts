@@ -5,6 +5,7 @@
  * shape change fails typecheck until the contract is updated consciously.
  */
 
+import type { JsonObject } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import type { RpcModel } from "../types.ts";
 import { opaque, openStringEnum, stringEnum } from "./helpers.ts";
@@ -33,7 +34,7 @@ export const RpcToolCallSchema = Type.Object(
 		type: Type.Literal("toolCall"),
 		id: Type.String(),
 		name: Type.String(),
-		arguments: Type.Record(Type.String(), Type.Unknown()),
+		arguments: Type.Unsafe<JsonObject>(Type.Record(Type.String(), Type.Unknown())),
 		thoughtSignature: Type.Optional(Type.String()),
 	},
 	{ additionalProperties: false },
@@ -107,7 +108,7 @@ export const RpcAssistantMessageDiagnosticSchema = Type.Object(
 		type: Type.String(),
 		timestamp: Type.Number(),
 		error: Type.Optional(RpcDiagnosticErrorInfoSchema),
-		details: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+		details: Type.Optional(Type.Unsafe<JsonObject>(Type.Record(Type.String(), Type.Unknown()))),
 	},
 	{ additionalProperties: false },
 );

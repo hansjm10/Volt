@@ -2,6 +2,13 @@
  * Core modules shared between all run modes.
  */
 
+export type {
+	JsonCompatible,
+	JsonCompatibleInput,
+	JsonObject,
+	JsonPrimitive,
+	JsonValue,
+} from "@hansjm10/volt-ai";
 export {
 	AgentSession,
 	type AgentSessionConfig,
@@ -132,12 +139,6 @@ export {
 	serializeJsonLine,
 } from "./rpc/index.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";
-export {
-	assertStructuredCloneable,
-	cloneStructuredData,
-	type StructuredCloneable,
-	type StructuredCloneableInput,
-} from "./structured-clone.ts";
 export {
 	createBuiltInSubagentDefinitions,
 	DEFAULT_SUBAGENT_TURN_LIMITS,

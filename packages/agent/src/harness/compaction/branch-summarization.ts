@@ -128,7 +128,7 @@ export function prepareBranchEntries(entries: SessionTreeEntry[], tokenBudget: n
 	let totalTokens = 0;
 	for (const entry of entries) {
 		if (entry.type === "branch_summary" && !entry.fromHook && entry.details) {
-			const details = entry.details as BranchSummaryDetails;
+			const details = entry.details as unknown as BranchSummaryDetails;
 			if (Array.isArray(details.readFiles)) {
 				for (const f of details.readFiles) fileOps.read.add(f);
 			}

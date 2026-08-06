@@ -3,8 +3,9 @@
  */
 
 import type { AgentMessage } from "@hansjm10/volt-agent-core";
-import type { ImageContent, Model } from "@hansjm10/volt-ai";
+import type { ImageContent, JsonValue, Model } from "@hansjm10/volt-ai";
 import type { KeyId } from "@hansjm10/volt-tui";
+import { CanonicalDataError, cloneCanonicalData } from "../canonical-data.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
@@ -579,8 +580,21 @@ export class ExtensionRunner {
 		if (this.isInert) {
 			return;
 		}
-		for (const listener of this.errorListeners) {
-			listener(error);
+		for (const listener of [...this.errorListeners]) {
+			try {
+				Promise.resolve((listener as (reportedError: ExtensionError) => unknown)(error)).catch(() => {});
+			} catch {
+				// Error reporting is observational. One listener cannot suppress later listeners
+				// or alter the operation whose failure is being reported.
+			}
+		}
+	}
+
+	private emitErrorContained(error: ExtensionError): void {
+		try {
+			this.emitError(error);
+		} catch {
+			// Error reporting is observational and cannot rewrite the hook outcome.
 		}
 	}
 
@@ -806,7 +820,10 @@ export class ExtensionRunner {
 					const handlerResult = await handler(event, ctx);
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {
-						result = handlerResult as SessionBeforeEventResult;
+						result = cloneCanonicalData(
+							handlerResult,
+							`Extension ${event.type} output from ${ext.path}`,
+						) as SessionBeforeEventResult;
 						if (result.cancel) {
 							return result as RunnerEmitResult<TEvent>;
 						}
@@ -814,12 +831,18 @@ export class ExtensionRunner {
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
-					this.emitError({
+					this.emitErrorContained({
 						extensionPath: ext.path,
 						event: event.type,
 						error: message,
-						stack,
+						...(stack === undefined ? {} : { stack }),
 					});
+					if (
+						err instanceof CanonicalDataError &&
+						(event.type === "session_before_compact" || event.type === "session_before_tree")
+					) {
+						throw err;
+					}
 				}
 			}
 		}
@@ -832,7 +855,7 @@ export class ExtensionRunner {
 			return undefined;
 		}
 		const ctx = this.createContext();
-		let currentMessage = event.message;
+		let currentMessage = cloneCanonicalData(event.message, "Extension message_end input");
 		let modified = false;
 
 		for (const ext of this.extensions) {
@@ -841,9 +864,17 @@ export class ExtensionRunner {
 
 			for (const handler of handlers) {
 				try {
-					const currentEvent: MessageEndEvent = { ...event, message: currentMessage };
-					const handlerResult = (await handler(currentEvent, ctx)) as MessageEndEventResult | undefined;
-					if (!handlerResult?.message) continue;
+					const currentEvent: MessageEndEvent = {
+						...event,
+						message: cloneCanonicalData(currentMessage, `Extension message_end input for ${ext.path}`),
+					};
+					const rawHandlerResult = (await handler(currentEvent, ctx)) as MessageEndEventResult | undefined;
+					if (rawHandlerResult === undefined) continue;
+					const handlerResult = cloneCanonicalData(
+						rawHandlerResult,
+						`Extension message_end output from ${ext.path}`,
+					);
+					if (!handlerResult.message) continue;
 
 					if (handlerResult.message.role !== currentMessage.role) {
 						const error = new ExtensionMessageRoleMismatchError(
@@ -864,20 +895,22 @@ export class ExtensionRunner {
 						throw error;
 					}
 
-					currentMessage = handlerResult.message;
+					currentMessage = cloneCanonicalData(
+						handlerResult.message,
+						`Extension message_end replacement from ${ext.path}`,
+					);
 					modified = true;
 				} catch (err) {
-					if (err instanceof ExtensionMessageRoleMismatchError) {
-						throw err;
-					}
+					if (err instanceof ExtensionMessageRoleMismatchError) throw err;
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
-					this.emitError({
+					this.emitErrorContained({
 						extensionPath: ext.path,
 						event: "message_end",
 						error: message,
-						stack,
+						...(stack === undefined ? {} : { stack }),
 					});
+					if (err instanceof CanonicalDataError) throw err;
 				}
 			}
 		}
@@ -890,7 +923,7 @@ export class ExtensionRunner {
 			return undefined;
 		}
 		const ctx = this.createContext();
-		const currentEvent: ToolResultEvent = { ...event };
+		const currentEvent = cloneCanonicalData(event, `Tool result input for ${event.toolName}`);
 		let modified = false;
 
 		for (const ext of this.extensions) {
@@ -899,30 +932,40 @@ export class ExtensionRunner {
 
 			for (const handler of handlers) {
 				try {
-					const handlerResult = (await handler(currentEvent, ctx)) as ToolResultEventResult | undefined;
-					if (!handlerResult) continue;
-
-					if (handlerResult.content !== undefined) {
-						currentEvent.content = handlerResult.content;
-						modified = true;
-					}
-					if (handlerResult.details !== undefined) {
-						currentEvent.details = handlerResult.details;
-						modified = true;
-					}
-					if (handlerResult.isError !== undefined) {
-						currentEvent.isError = handlerResult.isError;
-						modified = true;
-					}
+					const handlerEvent = cloneCanonicalData(currentEvent, `Extension tool_result input for ${ext.path}`);
+					const rawHandlerResult = (await handler(handlerEvent, ctx)) as ToolResultEventResult | undefined;
+					const description = `Extension tool_result output from ${ext.path}`;
+					const ownedEvent = cloneCanonicalData(handlerEvent, description);
+					const handlerResult =
+						rawHandlerResult === undefined ? undefined : cloneCanonicalData(rawHandlerResult, description);
+					const details: JsonValue | undefined =
+						handlerResult?.details !== undefined
+							? handlerResult.details
+							: (ownedEvent.details as JsonValue | undefined);
+					const nextEvent = cloneCanonicalData(
+						{
+							...ownedEvent,
+							content: handlerResult?.content ?? ownedEvent.content,
+							...(details === undefined ? {} : { details }),
+							isError: handlerResult?.isError ?? ownedEvent.isError,
+						},
+						description,
+					);
+					currentEvent.content = nextEvent.content;
+					if (nextEvent.details === undefined) delete currentEvent.details;
+					else currentEvent.details = nextEvent.details;
+					currentEvent.isError = nextEvent.isError;
+					modified = true;
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
-					this.emitError({
+					this.emitErrorContained({
 						extensionPath: ext.path,
 						event: "tool_result",
 						error: message,
-						stack,
+						...(stack === undefined ? {} : { stack }),
 					});
+					if (err instanceof CanonicalDataError) throw err;
 				}
 			}
 		}
@@ -931,9 +974,10 @@ export class ExtensionRunner {
 			return undefined;
 		}
 
+		const details = currentEvent.details as JsonValue | undefined;
 		return {
 			content: currentEvent.content,
-			details: currentEvent.details,
+			...(details === undefined ? {} : { details }),
 			isError: currentEvent.isError,
 		};
 	}
@@ -1105,7 +1149,10 @@ export class ExtensionRunner {
 					const handlerResult = await handler(event, ctx);
 
 					if (handlerResult) {
-						const result = handlerResult as BeforeAgentStartEventResult;
+						const result = cloneCanonicalData(
+							handlerResult as BeforeAgentStartEventResult,
+							`Extension before_agent_start output from ${ext.path}`,
+						);
 						if (result.message) {
 							messages.push(result.message);
 						}
@@ -1117,11 +1164,11 @@ export class ExtensionRunner {
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
-					this.emitError({
+					this.emitErrorContained({
 						extensionPath: ext.path,
 						event: "before_agent_start",
 						error: message,
-						stack,
+						...(stack === undefined ? {} : { stack }),
 					});
 				}
 			}
@@ -1129,8 +1176,8 @@ export class ExtensionRunner {
 
 		if (messages.length > 0 || systemPromptModified) {
 			return {
-				messages: messages.length > 0 ? messages : undefined,
-				systemPrompt: systemPromptModified ? currentSystemPrompt : undefined,
+				...(messages.length > 0 ? { messages } : {}),
+				...(systemPromptModified ? { systemPrompt: currentSystemPrompt } : {}),
 			};
 		}
 
