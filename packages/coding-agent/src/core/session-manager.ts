@@ -16,7 +16,7 @@ import {
 import { readdir, stat } from "fs/promises";
 import { basename, join, resolve } from "path";
 import { createInterface } from "readline";
-import { StringDecoder } from "string_decoder";
+import { TextDecoder } from "util";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { syncDurableFile, writeDurableAtomicFile, writeDurableAtomicFileSync } from "../utils/durable-atomic-write.ts";
 import { canonicalizePath, normalizePath, resolvePath } from "../utils/paths.ts";
@@ -89,6 +89,17 @@ export class SessionConversationStateUnavailableError extends Error {
 
 export type SessionConversationAuthorityStatus =
 	| { readonly status: "available" }
+	| {
+			readonly status: "reconciliation_required";
+			readonly error: SessionConversationStateUnavailableError;
+	  };
+
+export type SessionConversationAuthorityListener = (
+	status: Extract<SessionConversationAuthorityStatus, { status: "reconciliation_required" }>,
+) => void;
+
+export type SessionPersistenceDrainResult =
+	| { readonly status: "closed" }
 	| {
 			readonly status: "reconciliation_required";
 			readonly error: SessionConversationStateUnavailableError;
@@ -1030,6 +1041,51 @@ function parseSessionEntryLine(line: string): FileEntry | null {
 	}
 }
 
+const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+
+function parseSessionEntryBytes(bytes: Uint8Array): { entry: FileEntry | null; malformed: boolean } {
+	let line: string;
+	try {
+		line = fatalUtf8Decoder.decode(bytes);
+	} catch {
+		return { entry: null, malformed: bytes.length > 0 };
+	}
+	if (!line.trim()) return { entry: null, malformed: false };
+	const entry = parseSessionEntryLine(line);
+	return { entry, malformed: entry === null };
+}
+
+function parseAtomicSessionPreimage(content: Buffer): FileEntry[] {
+	const entries: FileEntry[] = [];
+	let lineStart = 0;
+	let lineNumber = 0;
+	for (
+		let newlineIndex = content.indexOf(0x0a);
+		newlineIndex !== -1;
+		newlineIndex = content.indexOf(0x0a, lineStart)
+	) {
+		lineNumber++;
+		const parsed = parseSessionEntryBytes(content.subarray(lineStart, newlineIndex));
+		if (parsed.malformed) {
+			throw new Error(`Current session JSONL is malformed at committed line ${lineNumber}`);
+		}
+		if (parsed.entry) entries.push(parsed.entry);
+		lineStart = newlineIndex + 1;
+	}
+	if (lineStart < content.length) {
+		// Only an unterminated malformed suffix can be a torn append. A complete
+		// final JSON record without its delimiter remains part of the preimage.
+		const parsed = parseSessionEntryBytes(content.subarray(lineStart));
+		if (parsed.entry) entries.push(parsed.entry);
+	}
+	return entries;
+}
+
+function exactOptionalBytesEqual(left: Buffer | undefined, right: Buffer | undefined): boolean {
+	if (left === undefined || right === undefined) return left === right;
+	return left.equals(right);
+}
+
 /**
  * Append at a verified JSONL boundary. A power loss can leave
  * either a complete JSON object without its line delimiter or an incomplete
@@ -1106,7 +1162,7 @@ async function appendSessionFileEntry(filePath: string, content: string, durable
 					bytesLoaded += bytesRead;
 				}
 
-				if (parseSessionEntryLine(finalRecord.toString("utf8"))) {
+				if (parseSessionEntryBytes(finalRecord).entry) {
 					const { bytesWritten } = await handle.write("\n", fileStat.size, "utf8");
 					if (bytesWritten !== 1) throw new Error(`Failed to repair session tail: ${filePath}`);
 					appendOffset = fileStat.size + 1;
@@ -1158,35 +1214,45 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	let lineNumber = 0;
 	const fd = openSync(resolvedFilePath, "r");
 	try {
-		const decoder = new StringDecoder("utf8");
 		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
-		let pending = "";
+		const pendingChunks: Buffer[] = [];
+		let pendingBytes = 0;
+		const parseLine = (tail: Buffer): void => {
+			const line = pendingBytes === 0 ? tail : Buffer.concat([...pendingChunks, tail], pendingBytes + tail.length);
+			pendingChunks.splice(0);
+			pendingBytes = 0;
+			const parsed = parseSessionEntryBytes(line);
+			if (parsed.entry) entries.push(parsed.entry);
+			else if (parsed.malformed && malformedCompleteLine === undefined) malformedCompleteLine = lineNumber;
+		};
 
 		while (true) {
 			const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
 			if (bytesRead === 0) break;
 
-			pending += decoder.write(buffer.subarray(0, bytesRead));
 			let lineStart = 0;
-			let newlineIndex = pending.indexOf("\n", lineStart);
-			while (newlineIndex !== -1) {
+			let newlineIndex = buffer.indexOf(0x0a, lineStart);
+			while (newlineIndex !== -1 && newlineIndex < bytesRead) {
 				lineNumber++;
-				const completeLine = pending.slice(lineStart, newlineIndex);
-				const entry = parseSessionEntryLine(completeLine);
-				if (entry) entries.push(entry);
-				else if (completeLine.trim() && malformedCompleteLine === undefined) malformedCompleteLine = lineNumber;
+				parseLine(buffer.subarray(lineStart, newlineIndex));
 				lineStart = newlineIndex + 1;
-				newlineIndex = pending.indexOf("\n", lineStart);
+				newlineIndex = buffer.indexOf(0x0a, lineStart);
 			}
-			pending = pending.slice(lineStart);
+			if (lineStart < bytesRead) {
+				const tail = Buffer.from(buffer.subarray(lineStart, bytesRead));
+				pendingChunks.push(tail);
+				pendingBytes += tail.length;
+			}
 		}
 
-		pending += decoder.end();
 		// A malformed unterminated final fragment may be a torn append. Every
 		// newline-terminated malformed record is a committed interior corruption
 		// candidate and is handled fail-closed below for current WAL sessions.
-		const finalEntry = parseSessionEntryLine(pending);
-		if (finalEntry) entries.push(finalEntry);
+		if (pendingBytes > 0) {
+			const finalLine = Buffer.concat(pendingChunks, pendingBytes);
+			const parsed = parseSessionEntryBytes(finalLine);
+			if (parsed.entry) entries.push(parsed.entry);
+		}
 	} finally {
 		closeSync(fd);
 	}
@@ -1642,6 +1708,7 @@ export class SessionManager {
 	private persistenceWatermark: Promise<void> = Promise.resolve();
 	private readonly entryListeners = new Set<SessionEntryListener>();
 	private readonly branchListeners = new Set<SessionBranchListener>();
+	private readonly conversationAuthorityListeners = new Set<SessionConversationAuthorityListener>();
 	/** Entries staged by appendAtomically before one persistence operation is accepted. */
 	private atomicAppendEntries: SessionEntry[] | undefined;
 	/** Fences unrelated writers while an atomic replacement is settling. */
@@ -1868,6 +1935,21 @@ export class SessionManager {
 		return this.conversationAuthorityStatus;
 	}
 
+	subscribeConversationAuthorityChanges(listener: SessionConversationAuthorityListener): () => void {
+		this.conversationAuthorityListeners.add(listener);
+		if (this.conversationAuthorityStatus.status === "reconciliation_required") {
+			try {
+				listener(this.conversationAuthorityStatus);
+			} catch {
+				// Authority loss is already committed. A projection observer cannot
+				// make this manager available again.
+			}
+		}
+		return () => {
+			this.conversationAuthorityListeners.delete(listener);
+		};
+	}
+
 	assertConversationAuthorityAvailable(): void {
 		if (this.conversationAuthorityStatus.status === "reconciliation_required") {
 			throw this.conversationAuthorityStatus.error;
@@ -1981,17 +2063,20 @@ export class SessionManager {
 			flushed: this.flushed,
 			sessionFileNeedsMigration: this.sessionFileNeedsMigration,
 		};
-		let preimage: string | undefined;
+		let preimage: Buffer | undefined;
 		if (snapshot.flushed && this.sessionFile) {
+			let persistedEntries: FileEntry[];
 			try {
-				preimage = readFileSync(this.sessionFile, "utf8");
+				preimage = readFileSync(this.sessionFile);
+				persistedEntries = parseAtomicSessionPreimage(preimage);
 			} catch (error) {
 				this.atomicAppendInFlight = false;
-				throw new SessionAtomicAppendError("Could not read atomic append preimage", "rolled_back", {
-					cause: error,
-				});
+				throw new SessionAtomicAppendError(
+					error instanceof Error ? error.message : "Could not read atomic append preimage",
+					"rolled_back",
+					{ cause: error },
+				);
 			}
-			const persistedEntries = parseSessionEntries(preimage);
 			const persistedHeader = persistedEntries.find((entry) => entry.type === "session");
 			if (persistedHeader?.version !== CURRENT_SESSION_VERSION) {
 				this.atomicAppendInFlight = false;
@@ -2033,9 +2118,9 @@ export class SessionManager {
 			leafId: this.leafId,
 			nextOrdinal: this.nextOrdinal,
 		};
-		let content: string;
+		let content: Buffer;
 		try {
-			content = this._serializeFileEntries();
+			content = Buffer.from(this._serializeFileEntries(), "utf8");
 		} catch (error) {
 			this.atomicAppendEntries = undefined;
 			this.atomicAppendInFlight = false;
@@ -2055,15 +2140,15 @@ export class SessionManager {
 				const task = this.persistenceQueue.then(async () => {
 					if (this.persistenceError) throw this.persistenceError;
 					await serializeSessionFileOperation(filePath, async () => {
-						let current: string | undefined;
+						let current: Buffer | undefined;
 						try {
-							current = existsSync(filePath) ? readFileSync(filePath, "utf8") : undefined;
+							current = existsSync(filePath) ? readFileSync(filePath) : undefined;
 						} catch (error) {
 							throw new AtomicAppendPersistenceFailure("Could not verify atomic append preimage", "uncertain", {
 								cause: error,
 							});
 						}
-						if (current !== preimage) {
+						if (!exactOptionalBytesEqual(current, preimage)) {
 							throw new AtomicAppendPersistenceFailure(
 								"Session changed before the atomic append could commit",
 								"rolled_back",
@@ -2075,20 +2160,20 @@ export class SessionManager {
 								fileMode: PRIVATE_FILE_MODE,
 							});
 						} catch (error) {
-							let visible: string | undefined;
+							let visible: Buffer | undefined;
 							try {
-								visible = existsSync(filePath) ? readFileSync(filePath, "utf8") : undefined;
+								visible = existsSync(filePath) ? readFileSync(filePath) : undefined;
 							} catch (visibilityError) {
 								throw new AtomicAppendPersistenceFailure("Atomic append visibility is uncertain", "uncertain", {
 									cause: visibilityError,
 								});
 							}
-							if (visible === preimage) {
+							if (exactOptionalBytesEqual(visible, preimage)) {
 								throw new AtomicAppendPersistenceFailure("Atomic append was rolled back", "rolled_back", {
 									cause: error,
 								});
 							}
-							if (visible !== content) {
+							if (!exactOptionalBytesEqual(visible, content)) {
 								throw new AtomicAppendPersistenceFailure("Atomic append visibility is uncertain", "uncertain", {
 									cause: error,
 								});
@@ -2100,15 +2185,15 @@ export class SessionManager {
 									cause: syncError,
 								});
 							}
-							let durableVisible: string;
+							let durableVisible: Buffer;
 							try {
-								durableVisible = readFileSync(filePath, "utf8");
+								durableVisible = readFileSync(filePath);
 							} catch (visibilityError) {
 								throw new AtomicAppendPersistenceFailure("Atomic append visibility is uncertain", "uncertain", {
 									cause: visibilityError,
 								});
 							}
-							if (durableVisible !== content) {
+							if (!durableVisible.equals(content)) {
 								throw new AtomicAppendPersistenceFailure(
 									"Atomic append visibility changed after durability proof",
 									"uncertain",
@@ -2134,10 +2219,18 @@ export class SessionManager {
 			if (failure.effect === "uncertain") {
 				this.persistenceError ??= failure;
 				if (this.conversationAuthorityStatus.status === "available") {
-					this.conversationAuthorityStatus = {
+					const status = {
 						status: "reconciliation_required",
 						error: new SessionConversationStateUnavailableError({ cause: failure }),
-					};
+					} as const;
+					this.conversationAuthorityStatus = status;
+					for (const listener of this.conversationAuthorityListeners) {
+						try {
+							listener(status);
+						} catch {
+							// Authority loss is sticky. Projection cleanup cannot roll it back.
+						}
+					}
 				}
 			} else {
 				this.persistenceWatermark = this.persistenceQueue;
@@ -2185,12 +2278,29 @@ export class SessionManager {
 		return this.persistenceWatermark;
 	}
 
-	/** Seal a persisted manager against later writes and drain its final accepted watermark. */
-	closePersistence(): Promise<void> {
+	/** Seal persistence and classify only this manager's recorded reconciliation failure. */
+	async drainPersistence(): Promise<SessionPersistenceDrainResult> {
 		if (this.persist) {
 			this.persistenceClosed = true;
 		}
-		return this.flush();
+		try {
+			await this.flush();
+			return { status: "closed" };
+		} catch (error) {
+			const authority = this.conversationAuthorityStatus;
+			if (authority.status === "reconciliation_required" && authority.error.cause === error) {
+				return { status: "reconciliation_required", error: authority.error };
+			}
+			throw error;
+		}
+	}
+
+	/** Seal a persisted manager against later writes and reject on every failed watermark. */
+	async closePersistence(): Promise<void> {
+		const result = await this.drainPersistence();
+		if (result.status === "reconciliation_required") {
+			throw result.error.cause instanceof Error ? result.error.cause : result.error;
+		}
 	}
 
 	private _indexClientInputEntry(entry: SessionEntry): void {

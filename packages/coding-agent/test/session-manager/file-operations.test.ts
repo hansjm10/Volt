@@ -40,6 +40,23 @@ describe("loadEntriesFromFile", () => {
 		expect(() => loadEntriesFromFile(file)).toThrow("Current session JSONL is malformed at committed line 1");
 	});
 
+	it("rejects invalid UTF-8 in a committed current-schema record", () => {
+		const file = join(tempDir, "invalid-utf8.jsonl");
+		const header = Buffer.from(
+			'{"type":"session","version":5,"id":"invalid-utf8","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n',
+		);
+		const invalidRecord = Buffer.concat([
+			Buffer.from(
+				'{"type":"message","id":"1","ordinal":1,"parentId":null,"timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"',
+			),
+			Buffer.from([0x80]),
+			Buffer.from('","timestamp":1}}\n'),
+		]);
+		writeFileSync(file, Buffer.concat([header, invalidRecord]));
+
+		expect(() => loadEntriesFromFile(file)).toThrow("Current session JSONL is malformed at committed line 2");
+	});
+
 	it("loads valid session file", () => {
 		const file = join(tempDir, "valid.jsonl");
 		writeFileSync(
@@ -98,6 +115,60 @@ describe("loadEntriesFromFile", () => {
 		const entries = loadEntriesFromFile(file);
 		expect(entries).toHaveLength(2);
 		expect(entries[1]?.type).toBe("message");
+	});
+
+	it("rejects malformed committed bytes before an atomic append without rewriting them", async () => {
+		const manager = SessionManager.create(tempDir, tempDir);
+		manager.appendPlanningState({ mode: "build", plan: null });
+		await manager.flush();
+		const sessionFile = manager.getSessionFile()!;
+		appendFileSync(sessionFile, "not-json\n");
+		const exactPreimage = readFileSync(sessionFile);
+
+		await expect(
+			manager.appendAtomically(
+				() => manager.appendPlanningState({ mode: "build", plan: null }),
+				() => {},
+			),
+		).rejects.toMatchObject({
+			effect: "rolled_back",
+			message: expect.stringContaining("malformed at committed line"),
+		});
+		expect(readFileSync(sessionFile).equals(exactPreimage)).toBe(true);
+	});
+
+	it("atomically appends across valid and torn unterminated tails", async () => {
+		const completeFile = join(tempDir, "atomic-complete-tail.jsonl");
+		writeFileSync(
+			completeFile,
+			'{"type":"session","version":5,"id":"atomic-complete","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}',
+		);
+		const complete = SessionManager.open(completeFile, tempDir);
+		await complete.appendAtomically(
+			() => complete.appendPlanningState({ mode: "build", plan: null }),
+			() => {},
+		);
+		expect(SessionManager.open(completeFile, tempDir).buildSessionContext().planning).toEqual({
+			mode: "build",
+			plan: null,
+		});
+
+		const tornFile = join(tempDir, "atomic-torn-tail.jsonl");
+		writeFileSync(
+			tornFile,
+			'{"type":"session","version":5,"id":"atomic-torn","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n' +
+				'{"type":"client_input_sta',
+		);
+		const torn = SessionManager.open(tornFile, tempDir);
+		await torn.appendAtomically(
+			() => torn.appendPlanningState({ mode: "build", plan: null }),
+			() => {},
+		);
+		expect(readFileSync(tornFile, "utf8")).not.toContain("client_input_sta");
+		expect(SessionManager.open(tornFile, tempDir).buildSessionContext().planning).toEqual({
+			mode: "build",
+			plan: null,
+		});
 	});
 
 	it("durably normalizes complete and torn unterminated tails before appending", async () => {

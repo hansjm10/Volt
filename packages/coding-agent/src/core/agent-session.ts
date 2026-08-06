@@ -997,6 +997,7 @@ export class AgentSession {
 
 	/** Emit an event to all listeners */
 	private _emit(event: AgentSessionEvent): void {
+		if (this.sessionManager.getConversationAuthorityStatus().status !== "available") return;
 		if (event.type === "tool_execution_end" || event.type === "agent_settled") {
 			this.gitContextProvider.scheduleRefresh();
 		}
@@ -1006,6 +1007,7 @@ export class AgentSession {
 	}
 
 	private _emitQueueUpdate(): void {
+		if (this.sessionManager.getConversationAuthorityStatus().status !== "available") return;
 		const event: AgentSessionEvent = {
 			type: "queue_update",
 			steering: this._steeringMessages.map((entry) => ({ ...entry })),
@@ -1027,6 +1029,7 @@ export class AgentSession {
 		outcome: "failed",
 		reason: "queue_cleared" | "dispatch_failed",
 	): void {
+		if (this.sessionManager.getConversationAuthorityStatus().status !== "available") return;
 		const event: AgentSessionEvent = { type: "client_input_outcome", clientMessageId, outcome, reason };
 		for (const listener of this._eventListeners) {
 			try {
@@ -2036,6 +2039,15 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(source: AgentAbortSource = "disposal"): Promise<void> {
+		return this._dispose(source, false);
+	}
+
+	/** Retire a generation whose recorded reconciliation failure is already authoritative. */
+	disposeForSessionReplacement(): Promise<void> {
+		return this._dispose("session_replacement", true);
+	}
+
+	private _dispose(source: AgentAbortSource, acceptReconciliationRequired: boolean): Promise<void> {
 		if (this._disposePromise) {
 			return this._disposePromise;
 		}
@@ -2043,7 +2055,7 @@ export class AgentSession {
 		if (deliverySettlement) {
 			this._disposePromise = deliverySettlement.then(() => {
 				this._disposePromise = undefined;
-				return this.dispose(source);
+				return this._dispose(source, acceptReconciliationRequired);
 			});
 			return this._disposePromise;
 		}
@@ -2070,7 +2082,9 @@ export class AgentSession {
 			operation.rejectCompletion(disposalError);
 		}
 		this._liveClientInputs.clear();
-		const persistenceDrain = this.sessionManager.closePersistence();
+		const persistenceDrain = acceptReconciliationRequired
+			? this.sessionManager.drainPersistence().then(() => undefined)
+			: this.sessionManager.closePersistence();
 		let subagentDrain: Promise<void>;
 		let mcpDrain: Promise<void>;
 		try {
@@ -4901,6 +4915,7 @@ export class AgentSession {
 	}
 
 	private _emitCommittedEvent(event: AgentSessionEvent): void {
+		if (this.sessionManager.getConversationAuthorityStatus().status !== "available") return;
 		for (const listener of this._eventListeners) {
 			try {
 				listener(event);

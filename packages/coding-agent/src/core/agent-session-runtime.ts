@@ -685,7 +685,7 @@ export class AgentSessionRuntime {
 		try {
 			await this.session.disposeSubagentToolManager();
 		} finally {
-			await this.session.dispose("session_replacement");
+			await this.session.disposeForSessionReplacement();
 		}
 	}
 
@@ -701,6 +701,7 @@ export class AgentSessionRuntime {
 		operation: AgentSessionStructuralOperation;
 		reason: SessionShutdownEvent["reason"];
 		previousSessionId?: string;
+		allowSameSessionIdentity?: boolean;
 		sessionManager: SessionManager;
 		create: () => Promise<CreateAgentSessionRuntimeResult>;
 		afterApply?: () => Promise<void>;
@@ -729,18 +730,30 @@ export class AgentSessionRuntime {
 		}
 		const previousSessionId = options.previousSessionId ?? this.session.sessionId;
 		const sessionId = options.sessionManager.getSessionId();
-		if (previousSessionId === sessionId) {
-			throw new Error("Cannot replace the current session with a different file using the same session ID");
+		const sameSessionIdentity = previousSessionId === sessionId;
+		if (sameSessionIdentity) {
+			const previousSessionFile = this.session.sessionFile;
+			const replacementSessionFile = options.sessionManager.getSessionFile();
+			if (
+				!options.allowSameSessionIdentity ||
+				previousSessionFile === undefined ||
+				replacementSessionFile === undefined ||
+				resolvePath(previousSessionFile) !== resolvePath(replacementSessionFile)
+			) {
+				throw new Error("Cannot replace the current session with a different file using the same session ID");
+			}
 		}
 		this.sessionReplacementInProgress = true;
 		try {
 			await this.abortAndJoinRecoveredClientInputs(this.session);
 			this.assertStructuralOperationCurrent(options.operation);
-			const transaction = await this.prepareSessionReplacement?.({
-				previousSessionId,
-				sessionId,
-				cwd: options.sessionManager.getCwd(),
-			});
+			const transaction = sameSessionIdentity
+				? undefined
+				: await this.prepareSessionReplacement?.({
+						previousSessionId,
+						sessionId,
+						cwd: options.sessionManager.getCwd(),
+					});
 			let invalidated = false;
 			let created: CreateAgentSessionRuntimeResult | undefined;
 			let applied = false;
@@ -843,6 +856,8 @@ export class AgentSessionRuntime {
 					? sessionLike.subscribe((event) => listener(event), { monitorGitContext: false })
 					: () => {},
 			retainObservation: () => session.gitContextProvider.retainObservation(),
+			subscribeAuthorityLoss: (listener) =>
+				session.sessionManager.subscribeConversationAuthorityChanges((status) => listener(status.error)),
 			subscribeGenerationChanges: (listener) =>
 				typeof sessionLike.subscribeConversationGenerationChanges === "function"
 					? sessionLike.subscribeConversationGenerationChanges(() => listener())
@@ -981,8 +996,15 @@ export class AgentSessionRuntime {
 	): Promise<AgentSessionReplacementResult> {
 		assertValidSessionId(sessionId);
 		if (sessionId === this.session.sessionId) {
-			// No replacement happens, so a requested withSession callback never runs.
-			return { cancelled: false, seeded: false };
+			if (this.session.sessionManager.getConversationAuthorityStatus().status === "available") {
+				// No replacement happens, so a requested withSession callback never runs.
+				return { cancelled: false, seeded: false };
+			}
+			const sessionFile = this.session.sessionFile;
+			if (sessionFile === undefined) {
+				throw new Error("Cannot reconcile an in-memory session without an authoritative session file");
+			}
+			return this.switchSessionWithinOperation(sessionFile, options, operation, true);
 		}
 		const target = (await this.listWorkspaceSessionInfos(true)).find((session) => session.id === sessionId);
 		this.assertStructuralOperationCurrent(operation);
@@ -1010,12 +1032,16 @@ export class AgentSessionRuntime {
 		sessionPath: string,
 		options: AgentSessionSwitchOptions | undefined,
 		operation: AgentSessionStructuralOperation,
+		refreshCurrentSession = false,
 	): Promise<AgentSessionReplacementResult> {
 		const resolvedSessionPath = resolvePath(sessionPath);
-		if (this.session.sessionFile !== undefined && resolvedSessionPath === this.session.sessionFile) {
+		const targetsCurrentFile =
+			this.session.sessionFile !== undefined && resolvedSessionPath === resolvePath(this.session.sessionFile);
+		if (targetsCurrentFile && this.session.sessionManager.getConversationAuthorityStatus().status === "available") {
 			// No replacement happens, so a requested withSession callback never runs.
 			return { cancelled: false, seeded: false };
 		}
+		if (targetsCurrentFile) refreshCurrentSession = true;
 		const beforeResult = await this.emitBeforeSwitch("resume", sessionPath);
 		this.assertStructuralOperationCurrent(operation);
 		if (beforeResult.cancelled) {
@@ -1028,6 +1054,7 @@ export class AgentSessionRuntime {
 		const replacement = await this.replaceCurrentSession({
 			operation,
 			reason: "resume",
+			allowSameSessionIdentity: refreshCurrentSession,
 			sessionManager,
 			create: () =>
 				this.createRuntime({
