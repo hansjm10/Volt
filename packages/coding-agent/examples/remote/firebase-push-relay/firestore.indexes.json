@@ -6,6 +6,44 @@
 			"fieldPath": "expiresAt",
 			"ttl": true,
 			"indexes": []
+		},
+		{
+			"collectionGroup": "voltIrohEnrollmentClaims",
+			"fieldPath": "expiresAt",
+			"ttl": true,
+			"indexes": []
+		},
+		{
+			"collectionGroup": "voltIrohEnrollmentClaims",
+			"fieldPath": "claimSecretHash",
+			"indexes": []
+		},
+		{
+			"collectionGroup": "voltIrohEnrollmentGrants",
+			"fieldPath": "expiresAt",
+			"ttl": true,
+			"indexes": []
+		},
+		{
+			"collectionGroup": "voltIrohEnrollmentGrants",
+			"fieldPath": "grantSecretHash",
+			"indexes": []
+		},
+		{
+			"collectionGroup": "voltIrohEndpointAccess",
+			"fieldPath": "activeGrants",
+			"indexes": []
+		},
+		{
+			"collectionGroup": "voltIrohEndpointAccess",
+			"fieldPath": "pendingClaims",
+			"indexes": []
+		},
+		{
+			"collectionGroup": "voltIrohEnrollmentQuotaWindows",
+			"fieldPath": "expiresAt",
+			"ttl": true,
+			"indexes": []
 		}
 	]
 }

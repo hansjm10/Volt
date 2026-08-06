@@ -33,7 +33,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep default-jre-headless
           sudo ln -sf "$(which fdfind)" /usr/local/bin/fd
 
       - name: Install dependencies
@@ -57,6 +57,12 @@ jobs:
         env:
           VOLT_TEST_REQUIRE_NATIVE_IROH: '1'
         run: npm test
+
+      - name: Test Iroh enrollment transactions in Firestore emulator
+        timeout-minutes: 10
+        run: |
+          npm --prefix packages/coding-agent/examples/remote/firebase-push-relay/functions ci --ignore-scripts
+          npm --prefix packages/coding-agent/examples/remote/firebase-push-relay/functions run test:emulator
 
   test-windows:
     runs-on: windows-latest

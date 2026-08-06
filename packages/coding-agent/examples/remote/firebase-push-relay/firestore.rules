@@ -2,6 +2,18 @@ rules_version = '2';
 
 service cloud.firestore {
 	match /databases/{database}/documents {
+		match /voltIrohEnrollmentClaims/{claimId} {
+			allow read, write: if false;
+		}
+		match /voltIrohEnrollmentGrants/{grantId} {
+			allow read, write: if false;
+		}
+		match /voltIrohEndpointAccess/{endpointId} {
+			allow read, write: if false;
+		}
+		match /voltIrohEnrollmentQuotaWindows/{windowId} {
+			allow read, write: if false;
+		}
 		match /{document=**} {
 			allow read, write: if false;
 		}
