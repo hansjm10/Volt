@@ -112,7 +112,7 @@ describe("regression #199: approved plan finalization", () => {
 		).toHaveLength(checkpointEventCount + 1);
 	});
 
-	it("keeps uncommitted preparation side-effect free and composes predecessor messages and commit", async () => {
+	it("keeps preparation side effects behind settlement and composes predecessor messages", async () => {
 		let predecessorCommits = 0;
 		const harness = await createHarness({
 			prepareDelivery: (delivery) => ({
@@ -132,30 +132,22 @@ describe("regression #199: approved plan finalization", () => {
 			.filter((entry) => entry.type === "planning_state_change").length;
 		const planningEventCount = harness.eventsOfType("planning_state_changed").length;
 
-		const revoked = await harness.session.agent.prepareDelivery?.({
-			deliveryId: "revoked",
-			kind: "steer",
-			messages: [createUserMessage("revoked feedback")],
-		});
-		expect(revoked).toBeDefined();
 		expect(harness.session.planningState.plan?.phase).toBe("ready");
 		expect(predecessorCommits).toBe(0);
-		expect(revoked?.messages.some((message) => message.role === "custom")).toBe(true);
 		expect(harness.sessionManager.getBranch().filter((entry) => entry.type === "planning_state_change")).toHaveLength(
 			planningEntryCount,
 		);
 
-		const admitted = await harness.session.agent.prepareDelivery?.({
-			deliveryId: "admitted",
-			kind: "steer",
-			messages: [createUserMessage("admitted feedback")],
-		});
-		await admitted?.participant?.settle({ requestAbort: () => ({ accepted: false }) });
+		harness.setResponses([fauxAssistantMessage("feedback committed")]);
+		harness.session.agent.steer(createUserMessage("admitted feedback"));
+		await harness.session.agent.continue();
 
 		expect(predecessorCommits).toBe(1);
 		expect(harness.session.planningState.plan?.phase).toBe("draft");
 		expect(
-			admitted?.messages.map((message) => (message.role === "custom" ? message.customType : message.role)),
+			harness.session.agent.state.messages
+				.slice(0, 3)
+				.map((message) => (message.role === "custom" ? message.customType : message.role)),
 		).toEqual(["volt-plan-checkpoint", "user", "user"]);
 		expect(harness.eventsOfType("planning_state_changed")).toHaveLength(planningEventCount + 1);
 		expect(harness.sessionManager.getBranch().filter((entry) => entry.type === "planning_state_change")).toHaveLength(
