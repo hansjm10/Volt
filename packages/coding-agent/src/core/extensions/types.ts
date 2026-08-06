@@ -46,7 +46,7 @@ import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
-import type { CustomMessage } from "../messages.ts";
+import type { CustomMessage, CustomMessageInput } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type {
 	BranchSummaryEntry,
@@ -390,8 +390,8 @@ export interface ExtensionCommandContext extends ExtensionContext {
  * This is passed to `withSession()` callbacks on `newSession()`, `fork()`, and `switchSession()`.
  */
 export interface ReplacedSessionContext extends ExtensionCommandContext {
-	sendMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+	sendMessage<T>(
+		message: CustomMessageInput<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void>;
 
@@ -474,7 +474,7 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	 */
 	executionMode?: ToolExecutionMode;
 
-	/** Execute the tool. */
+	/** Execute the tool. Final details and all streamed updates must be structured-cloneable. */
 	execute(
 		toolCallId: string,
 		params: Static<TParams>,
@@ -1086,6 +1086,7 @@ export interface UserBashEventResult {
 
 export interface ToolResultEventResult {
 	content?: (TextContent | ImageContent)[];
+	/** Replacement details must contain only structured-cloneable data. */
 	details?: unknown;
 	isError?: boolean;
 }
@@ -1267,8 +1268,8 @@ export interface ExtensionAPI {
 	// =========================================================================
 
 	/** Send a custom message to the session. */
-	sendMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+	sendMessage<T>(
+		message: CustomMessageInput<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): void;
 
@@ -1496,8 +1497,8 @@ export interface ExtensionShortcut {
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
-export type SendMessageHandler = <T = unknown>(
-	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+export type SendMessageHandler = <T>(
+	message: CustomMessageInput<T>,
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) => void;
 

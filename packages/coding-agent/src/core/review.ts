@@ -26,6 +26,7 @@ import type { AgentSessionRuntime } from "./agent-session-runtime.ts";
 import type { AuthStorage } from "./auth-storage.ts";
 import { createExtensionRuntime } from "./extensions/loader.ts";
 import type { ReplacedSessionContext, ToolDefinition } from "./extensions/types.ts";
+import type { CustomMessageInput } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
 import { findExactModelReferenceMatch } from "./model-resolver.ts";
 import { loadProjectContextFiles, type ResourceLoader } from "./resource-loader.ts";
@@ -1107,17 +1108,10 @@ export interface ReviewWorkflowSession {
 	fastModeEnabled?: boolean;
 	modelRegistry: ModelRegistry;
 	resourceLoader: ResourceLoader;
-	sendCustomMessage<T = unknown>(
-		message: Pick<ReviewCustomMessage<T>, "customType" | "content" | "display" | "details">,
+	sendCustomMessage<T>(
+		message: CustomMessageInput<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void>;
-}
-
-interface ReviewCustomMessage<T> {
-	customType: string;
-	content: string;
-	display: boolean;
-	details: T;
 }
 
 export type ReviewWorkflowEvent =

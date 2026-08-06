@@ -244,7 +244,7 @@ export {
 	type McpToolSummary,
 	searchMcpMetadata,
 } from "./core/mcp/index.ts";
-export { convertToLlm } from "./core/messages.ts";
+export { type CustomMessage, type CustomMessageInput, convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export type {
 	PackageInstallOptions,
@@ -650,6 +650,12 @@ export {
 	type SkillFrontmatter,
 } from "./core/skills.ts";
 export { createSyntheticSourceInfo } from "./core/source-info.ts";
+export {
+	assertStructuredCloneable,
+	cloneStructuredData,
+	type StructuredCloneable,
+	type StructuredCloneableInput,
+} from "./core/structured-clone.ts";
 export {
 	createBuiltInSubagentDefinitions,
 	DEFAULT_SUBAGENT_DELEGATION_LIMITS,

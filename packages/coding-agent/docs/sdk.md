@@ -83,6 +83,9 @@ interface AgentSession {
   steer(text: string): Promise<void>;
   followUp(text: string): Promise<void>;
 
+  // Send structured-cloneable custom data
+  sendCustomMessage<T>(message: CustomMessageInput<T>, options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" }): Promise<void>;
+
   // Subscribe to events (returns unsubscribe function)
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
 
@@ -392,7 +395,9 @@ Prefer `session.waitForIdle()` when coordinating application work. It includes p
 
 ### Events
 
-Subscribe to events to receive streaming output and lifecycle notifications.
+Subscribe to events to receive streaming output and lifecycle notifications. Every listener receives its own structured-cloned snapshot. Mutating an event, throwing synchronously, or returning a rejected promise cannot affect session state or suppress later listeners. Listener promises are observed only to contain rejection; they do not delay session work.
+
+Cloneability is an event-projection invariant rather than an observer failure. Public custom-message inputs and tool final/update results are validated before publication, and invalid producer data fails explicitly instead of silently dropping an event. The boundary follows the structured clone algorithm rather than JSON-only semantics, so in-process snapshots preserve supported values such as `Map`, `Set`, `Date`, typed arrays, and cycles.
 
 ```typescript
 session.subscribe((event) => {
@@ -680,6 +685,8 @@ const { session } = await createAgentSession({
 Use `defineTool()` for standalone definitions and arrays like `customTools: [myTool]`. Inline `volt.registerTool({ ... })` already infers parameter types correctly.
 
 Custom tools passed via `customTools` are combined with extension-registered tools. Extensions loaded by the ResourceLoader can also register tools via `volt.registerTool()`.
+
+Every final tool result and streamed update must contain only structured-cloneable data. Invalid payloads become explicit failed tool results and are not published as partial session events.
 
 If you pass `tools`, include each custom or extension tool name you want enabled, for example `tools: ["read", "bash", "my_tool"]`.
 
@@ -1286,6 +1293,8 @@ createEventBus
 
 // Helpers
 defineTool
+assertStructuredCloneable
+cloneStructuredData
 getAgentDir
 getPackageDir
 getReadmePath
@@ -1309,6 +1318,9 @@ type CreateAgentSessionResult
 type ExtensionFactory
 type ExtensionAPI
 type ToolDefinition
+type CustomMessageInput
+type StructuredCloneable
+type StructuredCloneableInput
 type Skill
 type PromptTemplate
 type Tool

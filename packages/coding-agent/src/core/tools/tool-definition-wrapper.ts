@@ -1,5 +1,6 @@
-import type { AgentTool } from "@hansjm10/volt-agent-core";
+import type { AgentTool, AgentToolResult } from "@hansjm10/volt-agent-core";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import { cloneStructuredData } from "../structured-clone.ts";
 
 /** Wrap a ToolDefinition into an AgentTool for the core runtime. */
 export function wrapToolDefinition<TDetails = unknown>(
@@ -13,8 +14,31 @@ export function wrapToolDefinition<TDetails = unknown>(
 		parameters: definition.parameters,
 		prepareArguments: definition.prepareArguments,
 		executionMode: definition.executionMode,
-		execute: (toolCallId, params, signal, onUpdate) =>
-			definition.execute(toolCallId, params, signal, onUpdate, ctxFactory?.() as ExtensionContext),
+		execute: async (toolCallId, params, signal, onUpdate) => {
+			let invalidUpdate: Error | undefined;
+			const wrappedOnUpdate = onUpdate
+				? (partialResult: AgentToolResult<TDetails>) => {
+						if (invalidUpdate) return;
+						let snapshot: AgentToolResult<TDetails>;
+						try {
+							snapshot = cloneStructuredData(partialResult, `Tool ${definition.name} partial result`);
+						} catch (error) {
+							invalidUpdate = error instanceof Error ? error : new Error(String(error));
+							return;
+						}
+						onUpdate(snapshot);
+					}
+				: undefined;
+			const result = await definition.execute(
+				toolCallId,
+				params,
+				signal,
+				wrappedOnUpdate,
+				ctxFactory?.() as ExtensionContext,
+			);
+			if (invalidUpdate) throw invalidUpdate;
+			return cloneStructuredData(result, `Tool ${definition.name} final result`);
+		},
 	};
 }
 

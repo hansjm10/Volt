@@ -7,6 +7,7 @@
 
 import type { AgentMessage } from "@hansjm10/volt-agent-core";
 import type { ImageContent, Message, TextContent } from "@hansjm10/volt-ai";
+import type { StructuredCloneableInput } from "./structured-clone.ts";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -48,8 +49,17 @@ export interface CustomMessage<T = unknown> {
 	customType: string;
 	content: string | (TextContent | ImageContent)[];
 	display: boolean;
+	/** Must contain only values supported by the structured clone algorithm. */
 	details?: T;
 	timestamp: number;
+}
+
+/** Input accepted by public custom-message APIs. Runtime validation is authoritative. */
+export interface CustomMessageInput<T> {
+	customType: string;
+	content: string | (TextContent | ImageContent)[];
+	display: boolean;
+	details?: StructuredCloneableInput<T>;
 }
 
 export interface BranchSummaryMessage {

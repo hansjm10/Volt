@@ -109,7 +109,7 @@ import { LspManager, type LspServerStatus } from "./lsp/manager.ts";
 import { createMcpDirectToolDefinitions } from "./mcp/direct-tools.ts";
 import type { McpManager } from "./mcp/manager.ts";
 import type { McpManagerEvent } from "./mcp/types.ts";
-import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
+import type { BashExecutionMessage, CustomMessage, CustomMessageInput } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
 import {
 	authorizeToolOperation,
@@ -157,6 +157,7 @@ import {
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
+import { assertStructuredCloneable, cloneStructuredData } from "./structured-clone.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "./subagents/tool-names.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
 import { getThemeByName, theme } from "./theme/runtime.ts";
@@ -176,7 +177,7 @@ import { canonicalizePlanSteps, createPlanningToolDefinitions, NATIVE_PLAN_TOOL_
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 
 function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMessage[] {
-	return messages.map((message) => structuredClone(message));
+	return cloneStructuredData([...messages], "Agent message delivery");
 }
 
 // ============================================================================
@@ -979,15 +980,14 @@ export class AgentSession {
 				isError,
 			});
 
-			if (!hookResult) {
-				return undefined;
-			}
-
-			return {
-				content: hookResult.content,
-				details: hookResult.details,
-				isError: hookResult.isError ?? isError,
-			};
+			return cloneStructuredData(
+				{
+					content: hookResult?.content ?? result.content,
+					details: hookResult?.details ?? result.details,
+					isError: hookResult?.isError ?? isError,
+				},
+				`Extension tool_result output for ${toolCall.name}`,
+			);
 		};
 	}
 
@@ -1001,9 +1001,18 @@ export class AgentSession {
 		if (event.type === "tool_execution_end" || event.type === "agent_settled") {
 			this.gitContextProvider.scheduleRefresh();
 		}
-		for (const listener of this._eventListeners) {
+		const listeners = [...this._eventListeners];
+		const description = `AgentSession ${event.type} event`;
+		if (listeners.length === 0) {
+			assertStructuredCloneable(event, description);
+			return;
+		}
+		for (const listener of listeners) {
+			// Cloning is an internal projection invariant, not an observer operation.
+			// Keep it outside the failure boundary so invalid events cannot disappear.
+			const snapshot = cloneStructuredData(event, description);
 			try {
-				void Promise.resolve(listener(structuredClone(event))).catch(() => {});
+				void Promise.resolve(listener(snapshot)).catch(() => {});
 			} catch {
 				// Public subscribers are passive projections. Their failure or mutation
 				// cannot alter session state or suppress a later subscriber.
@@ -4117,14 +4126,19 @@ export class AgentSession {
 			// Add all custom messages from extensions
 			if (result?.messages) {
 				for (const msg of result.messages) {
-					messages.push({
-						role: "custom",
-						customType: msg.customType,
-						content: msg.content,
-						display: msg.display,
-						details: msg.details,
-						timestamp: Date.now(),
-					});
+					messages.push(
+						cloneStructuredData(
+							{
+								role: "custom",
+								customType: msg.customType,
+								content: msg.content,
+								display: msg.display,
+								details: msg.details,
+								timestamp: Date.now(),
+							} satisfies CustomMessage,
+							`Extension before_agent_start message ${msg.customType}`,
+						),
+					);
 				}
 			}
 			// Apply the per-turn extension prompt before appending trusted planning instructions.
@@ -4458,15 +4472,15 @@ export class AgentSession {
 	 * @param options.triggerTurn If true and not streaming, triggers a new LLM turn
 	 * @param options.deliverAs Delivery mode: "steer", "followUp", or "nextTurn"
 	 */
-	async sendCustomMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+	async sendCustomMessage<T>(
+		message: CustomMessageInput<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
 		await this._sendCustomMessage(message, options, false);
 	}
 
-	private async _sendCustomMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+	private async _sendCustomMessage<T>(
+		message: CustomMessageInput<T>,
 		options: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" } | undefined,
 		allowDuringPromptTransaction: boolean,
 	): Promise<void> {
@@ -4474,14 +4488,17 @@ export class AgentSession {
 		if (this._hasSessionOperationBarrier) {
 			throw new Error("Cannot append a custom message while a session mutation is active");
 		}
-		const appMessage = {
-			role: "custom" as const,
-			customType: message.customType,
-			content: message.content,
-			display: message.display,
-			details: message.details,
-			timestamp: Date.now(),
-		} satisfies CustomMessage<T>;
+		const appMessage = cloneStructuredData(
+			{
+				role: "custom" as const,
+				customType: message.customType,
+				content: message.content,
+				display: message.display,
+				details: message.details,
+				timestamp: Date.now(),
+			} satisfies CustomMessage<T>,
+			`Custom message ${message.customType}`,
+		);
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
 		} else if (this.isStreaming) {

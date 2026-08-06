@@ -87,6 +87,7 @@ export type {
 	HostInteraction,
 } from "./host-interaction.ts";
 export * from "./mcp/index.ts";
+export type { CustomMessage, CustomMessageInput } from "./messages.ts";
 export * from "./remote/iroh/index.ts";
 export {
 	attachJsonlLineReader,
@@ -131,6 +132,12 @@ export {
 	serializeJsonLine,
 } from "./rpc/index.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";
+export {
+	assertStructuredCloneable,
+	cloneStructuredData,
+	type StructuredCloneable,
+	type StructuredCloneableInput,
+} from "./structured-clone.ts";
 export {
 	createBuiltInSubagentDefinitions,
 	DEFAULT_SUBAGENT_TURN_LIMITS,

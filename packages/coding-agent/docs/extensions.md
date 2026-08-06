@@ -774,6 +774,7 @@ In parallel tool mode, `tool_result` and `tool_execution_end` may interleave in 
 - Handlers run in extension load order
 - Each handler sees the latest result after previous handler changes
 - Handlers can return partial patches (`content`, `details`, or `isError`); omitted fields keep their current values
+- Final results, streaming updates, and replacement `details` must be structured-cloneable; invalid data becomes an explicit failed tool result instead of disappearing from session observers
 
 Use `ctx.signal` for nested async work inside the handler. This lets Esc cancel model calls, `fetch()`, and other abort-aware operations started by the extension.
 
@@ -1332,7 +1333,7 @@ volt.registerTool({
 
 ### volt.sendMessage(message, options?)
 
-Inject a custom message into the session.
+Inject a custom message into the session. `details` must contain only structured-cloneable data. Functions, promises, symbols, weak collections, and unsupported platform objects are rejected before the message is persisted or published.
 
 ```typescript
 volt.sendMessage({
@@ -1345,6 +1346,8 @@ volt.sendMessage({
   deliverAs: "steer",
 });
 ```
+
+Session files remain JSONL. Use JSON-compatible `details` when the value must survive restart; richer structured-clone values are intended for in-process projections.
 
 **Options:**
 - `deliverAs` - Delivery mode:
@@ -1851,6 +1854,8 @@ volt.registerTool({
 ```
 
 **Signaling errors:** Throw from `execute` when a failure has no structured result. The agent catches the error, sets `isError: true`, and reports it to the LLM. When a protocol supplies useful failure content or details, return them with `isError: true`; the flag propagates through tool-result hooks, events, and the model-visible result.
+
+**Projection-safe results:** Every final result and `onUpdate` payload must contain only structured-cloneable data. This keeps public session observers isolated without reducing result data to JSON. Values such as `Map`, `Set`, `Date`, typed arrays, and cyclic graphs are supported by the in-process projection boundary; functions, promises, symbols, weak collections, and unsupported platform objects turn the tool execution into an explicit error. Session files remain JSONL, so use JSON-compatible details for state that must survive restart.
 
 **Tool disposition:** Return `disposition: "stop"` from `execute()` to skip the automatic follow-up LLM call when every finalized result in the batch requests it. Return `disposition: "final_response"` to authorize one additional tool-free response; a successful final-response result takes precedence over other batch results. See [examples/extensions/structured-output.ts](../examples/extensions/structured-output.ts) for a minimal stop-disposition example.
 
