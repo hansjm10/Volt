@@ -301,7 +301,7 @@ describe("regression #199: abort provenance persistence", () => {
 		});
 		harnesses.push(harness);
 
-		await harness.session.prompt("do not admit this delivery");
+		await expect(harness.session.prompt("do not admit this delivery")).rejects.toThrow("delivery commit failed");
 		await disposal;
 
 		expect(harness.sessionManager.buildSessionContext().messages).toEqual([]);

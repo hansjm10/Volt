@@ -2,6 +2,9 @@ import type { AgentMessage } from "@hansjm10/volt-agent-core";
 import { fauxAssistantMessage } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PromptPreflightResult } from "../../../src/core/agent-session.ts";
+import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.ts";
+import { handleRpcCommand, type RpcCommandDispatcherContext } from "../../../src/modes/rpc/rpc-command-dispatcher.ts";
+import type { RpcResponse } from "../../../src/modes/rpc/rpc-types.ts";
 import { createHarness, getUserTexts, type Harness } from "../harness.ts";
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -174,6 +177,78 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 
 		expect(new Set(preparedDeliveryIds)).toHaveLength(1);
 		expect(getUserTexts(harness)).toEqual(["retain direct prompt"]);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("settles retained direct plan feedback once and retries it only after explicit continuation", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await createReadyPlan(harness);
+		harness.setResponses([fauxAssistantMessage("explicit direct retry committed")]);
+		const checkpointBaseline = checkpointCount(harness);
+		const planningBaseline = planningChangeCount(harness);
+		const appendPlanningState = harness.sessionManager.appendPlanningState.bind(harness.sessionManager);
+		let rejectDraft = true;
+		vi.spyOn(harness.sessionManager, "appendPlanningState").mockImplementation((planning) => {
+			if (rejectDraft && planning.plan?.phase === "draft") {
+				throw new Error("injected direct planning durability failure");
+			}
+			return appendPlanningState(planning);
+		});
+		let agentEndCount = 0;
+		harness.session.subscribe((event) => {
+			if (event.type === "agent_end") agentEndCount++;
+		});
+
+		const responses: RpcResponse[] = [];
+		const admissions: Promise<void>[] = [];
+		await handleRpcCommand(
+			{
+				id: "contract-retained-direct-rpc",
+				type: "prompt",
+				clientMessageId: "contract-retained-direct-client",
+				message: "retained direct plan feedback",
+			},
+			{
+				session: harness.session,
+				runtimeHost: {
+					trackClientInputAdmission: (_session: unknown, admission: Promise<void>) => admissions.push(admission),
+				} as unknown as AgentSessionRuntime,
+				options: {
+					allowUiActionInvocation: false,
+					requireRemoteSafeUiActions: false,
+					registerPushTarget: undefined,
+				},
+				output: (response: RpcResponse) => responses.push(response),
+				assertConversationGenerationCurrent: () => undefined,
+			} as unknown as RpcCommandDispatcherContext,
+		);
+		await Promise.all(admissions);
+
+		expect(responses).toEqual([
+			expect.objectContaining({
+				id: "contract-retained-direct-rpc",
+				command: "prompt",
+				success: false,
+				error: "injected direct planning durability failure",
+			}),
+		]);
+		expect(agentEndCount).toBe(1);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.session.planningState.plan?.phase).toBe("ready");
+		expect(planningChangeCount(harness)).toBe(planningBaseline);
+		expect(checkpointCount(harness)).toBe(checkpointBaseline);
+		expect(getUserTexts(harness)).toEqual([]);
+		expect(harness.getPendingResponseCount()).toBe(1);
+
+		rejectDraft = false;
+		await harness.session.agent.continue();
+
+		expect(agentEndCount).toBe(2);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.session.planningState.plan?.phase).toBe("draft");
+		expect(checkpointCount(harness)).toBe(checkpointBaseline + 1);
+		expect(getUserTexts(harness)).toEqual(["retained direct plan feedback"]);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
@@ -389,14 +464,15 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		await createReadyPlan(harness);
 		harness.setResponses([fauxAssistantMessage("observer failure ignored")]);
 		const observedAfterFailure: string[] = [];
-		harness.session.subscribe((event) => {
+		harness.session.subscribe(async (event) => {
 			if (
 				event.type === "planning_state_changed" ||
 				event.type === "delivery_start" ||
 				event.type === "message_start" ||
 				event.type === "message_end"
 			) {
-				throw new Error(`injected observer failure at ${event.type}`);
+				await Promise.resolve();
+				throw new Error(`injected asynchronous observer failure at ${event.type}`);
 			}
 		});
 		harness.session.subscribe((event) => observedAfterFailure.push(event.type));
@@ -405,6 +481,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		await expect(
 			harness.session.prompt("commit despite observer failure", { clientMessageId }),
 		).resolves.toBeUndefined();
+		await new Promise<void>((resolve) => setImmediate(resolve));
 
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
 		expect(harness.session.planningState.plan?.phase).toBe("draft");

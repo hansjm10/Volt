@@ -520,6 +520,8 @@ export class AgentSession {
 	private readonly _dequeuedQueueClientMessageIds = new Map<string, string | null>();
 	/** Fatal listener error swallowed into agent-core's synthetic error turn. */
 	private _agentEventFatalError: Error | undefined;
+	/** Failed pre-commit attempt restored by Agent; only explicit continuation may retry it. */
+	private _retainedDeliveryAttemptFailure: { kind: "prompt" | "steer" | "followUp"; error: Error } | undefined;
 	private _extensionCommandTransactions = new Set<symbol>();
 	private _activeExtensionCommandHandlers = 0;
 
@@ -753,10 +755,20 @@ export class AgentSession {
 		}
 		this._agentToolHooksInstalled = true;
 		const prepareDelivery = this.agent.prepareDelivery;
+		const recordRetainedFailure = (kind: "prompt" | "steer" | "followUp", error: unknown): void => {
+			this._retainedDeliveryAttemptFailure = {
+				kind,
+				error: error instanceof Error ? error : new Error(String(error)),
+			};
+		};
 		this.agent.prepareDelivery = async (delivery, signal): Promise<AgentDeliveryPreparation> => {
-			const prepared = prepareDelivery
-				? await prepareDelivery(delivery, signal)
-				: { messages: [...delivery.messages] };
+			let prepared: AgentDeliveryPreparation;
+			try {
+				prepared = prepareDelivery ? await prepareDelivery(delivery, signal) : { messages: [...delivery.messages] };
+			} catch (error) {
+				recordRetainedFailure(delivery.kind, error);
+				throw error;
+			}
 			const messages = prepared.messages;
 			const readyPlan =
 				messages.some((message) => message.role === "user") && this._planningState.plan?.phase === "ready"
@@ -784,6 +796,7 @@ export class AgentSession {
 						}
 					} catch (error) {
 						this._discardAdmittedDelivery(delivery.deliveryId);
+						recordRetainedFailure(delivery.kind, error);
 						throw error;
 					}
 					// A successful commit may have composed additional messages.
@@ -919,15 +932,7 @@ export class AgentSession {
 			steering: this._steeringMessages.map((entry) => ({ ...entry })),
 			followUp: this._followUpMessages.map((entry) => ({ ...entry })),
 		};
-		for (const listener of this._eventListeners) {
-			try {
-				listener(event);
-			} catch {
-				// Queue admission is already authoritative in the durable WAL and
-				// agent core. A projection observer cannot roll it back or turn a
-				// successful enqueue into a failed receipt.
-			}
-		}
+		this._emitCommittedEvent(event);
 	}
 
 	private _emitClientInputOutcome(
@@ -936,14 +941,7 @@ export class AgentSession {
 		reason: "queue_cleared" | "dispatch_failed",
 	): void {
 		const event: AgentSessionEvent = { type: "client_input_outcome", clientMessageId, outcome, reason };
-		for (const listener of this._eventListeners) {
-			try {
-				listener(event);
-			} catch {
-				// The durable receipt is already terminal. Projection delivery can
-				// recover through replay/bootstrap and must never roll that back.
-			}
-		}
+		this._emitCommittedEvent(event);
 	}
 
 	private _recoverDurableQueuedClientInputs(): void {
@@ -1070,6 +1068,7 @@ export class AgentSession {
 	private _handleAgentEvent = async (event: AgentEvent): Promise<AgentMessage | undefined> => {
 		if (this._disposed) return undefined;
 		if (event.type === "agent_start") {
+			this._retainedDeliveryAttemptFailure = undefined;
 			this._activeAgentRunId = this.agent.activeRunSnapshot?.runId;
 			this._persistedTerminalAgentRunId = undefined;
 			this._pendingAdmittedDeliveryMessages = [];
@@ -1532,10 +1531,12 @@ export class AgentSession {
 		}
 		for (const listener of this._conversationGenerationListeners) {
 			try {
-				listener(change);
+				void Promise.resolve(listener(change)).catch(() => {
+					// The branch and Agent context are already authoritative. A projection
+					// observer cannot make a committed navigation appear to have failed.
+				});
 			} catch {
-				// The branch and Agent context are already authoritative. A projection
-				// observer cannot make a committed navigation appear to have failed.
+				// Accessing or invoking a hostile observer may also fail synchronously.
 			}
 		}
 	}
@@ -3126,6 +3127,14 @@ export class AgentSession {
 			this._agentConversationMutationInFlight = true;
 			try {
 				await this._runAgentOperation(() => this.agent.prompt(messages));
+				const retainedPromptFailure = this._retainedDeliveryAttemptFailure;
+				if (retainedPromptFailure?.kind === "prompt") {
+					this._retainedDeliveryAttemptFailure = undefined;
+					this._lastAssistantMessage = undefined;
+					this._proactiveCompactionState = "idle";
+					this._settleRetry(false, retainedPromptFailure.error.message);
+					throw retainedPromptFailure.error;
+				}
 				while (await this._handlePostAgentRun(abortGeneration, conversationGenerationRevision)) {
 					await this._continueAgent();
 				}
@@ -3262,6 +3271,14 @@ export class AgentSession {
 			this._settleRetry(false, "Conversation branch changed");
 			return false;
 		};
+		const retainedFailure = this._retainedDeliveryAttemptFailure;
+		if (retainedFailure) {
+			this._retainedDeliveryAttemptFailure = undefined;
+			this._lastAssistantMessage = undefined;
+			this._proactiveCompactionState = "idle";
+			this._settleRetry(false, retainedFailure.error.message);
+			return false;
+		}
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
 		if (!msg) {
@@ -4383,9 +4400,11 @@ export class AgentSession {
 	private _emitCommittedEvent(event: AgentSessionEvent): void {
 		for (const listener of this._eventListeners) {
 			try {
-				listener(event);
+				void Promise.resolve(listener(event)).catch(() => {
+					// Durable state is authoritative; asynchronous observers cannot roll back a committed transition.
+				});
 			} catch {
-				// Durable state is authoritative; observers cannot roll back a committed transition.
+				// Durable state is authoritative; synchronous observers cannot roll back a committed transition.
 			}
 		}
 	}

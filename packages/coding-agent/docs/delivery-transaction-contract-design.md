@@ -164,7 +164,7 @@ For an `all` batch, delivery commitment remains per-delivery rather than batch-a
 
 ### Public events
 
-`delivery_start` means Agent has crossed the revocation cutoff; it does not by itself mean disk durability or RPC acceptance. `message_start` and `message_end` are projections of transaction work. Public session subscribers are observers: throwing from any observer cannot roll back delivery, transcript, client-input, RPC, or planning state and cannot prevent later observers from receiving the event.
+`delivery_start` means Agent has crossed the revocation cutoff; it does not by itself mean disk durability or RPC acceptance. `message_start` and `message_end` are projections of transaction work. Public session subscribers are observers: throwing synchronously or returning a rejected promise cannot roll back delivery, transcript, client-input, RPC, or planning state, escape as an unhandled rejection, or prevent later observers from receiving the event.
 
 Extension hooks that explicitly replace messages or perform preflight are not passive public observers; their documented validation and failure behavior remains part of preparation or participant work.
 
@@ -199,7 +199,7 @@ Abort stops provider/tool continuation, but preserves canonical delivery, comple
 | Reentrant abort/dispose during participant work | Records lifecycle intent without deadlock; participant outcome remains authoritative | Successful participant state precedes abort marker | Settles from participant outcome | Settles once | Successful transition is preserved |
 | Abort after commit | Delivery committed; run may abort | Preserved | `completed` | Accepted/success unchanged | Transition and checkpoint preserved |
 | Explicit discard of retained delivery | Delivery revoked | Unchanged | Identified queued input becomes durably `failed` | Earlier queue response unchanged; terminal outcome event may follow | Unchanged |
-| Observer throws after publication | Delivery committed | Preserved | Unchanged (`completed`) | Unchanged | Preserved; later observers still run |
+| Observer throws or rejects after publication | Delivery committed | Preserved | Unchanged (`completed`) | Unchanged | Preserved; rejection is handled and later observers still run |
 | `all` batch fails after an earlier commit | Earlier delivery committed; unbegun delivery retained/revoked in FIFO order | Contains only committed deliveries | Each input matches its own outcome | Each invocation remains independently settled | At most one committed ready-to-draft transition/checkpoint |
 
 ## Conformance suite
@@ -208,7 +208,7 @@ Abort stops provider/tool continuation, but preserves canonical delivery, comple
 
 - durable identified direct-prompt settlement at the RPC admission seam;
 - steering and follow-up queue admission through canonical completion;
-- preparation failure, retained retry, participant durability rejection, and explicit discard;
+- preparation failure, bounded direct and queued retained attempts, explicit retry, participant durability rejection, and explicit discard;
 - external abort before commit and during canonical durability;
 - reentrant disposal during commit;
 - ready-plan feedback across validation, preparation, commit, abort, and observer boundaries;
