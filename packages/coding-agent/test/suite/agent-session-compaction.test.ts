@@ -158,6 +158,31 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
 	});
 
+	it("rejects invalid extension compaction details before appending", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "invalid extension summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: { shared: new SharedArrayBuffer(1) } as never,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		const leafId = harness.sessionManager.getLeafId();
+
+		await expect(harness.session.compact()).rejects.toThrow("Extension session_before_compact output");
+		expect(harness.sessionManager.getLeafId()).toBe(leafId);
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
+	});
+
 	it("throws when compacting without a model", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

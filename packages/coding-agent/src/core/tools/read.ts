@@ -220,7 +220,7 @@ export function createReadToolDefinition(
 			_onUpdate?,
 			ctx?,
 		) {
-			return new Promise<{ content: (TextContent | ImageContent)[]; details: ReadToolDetails | undefined }>(
+			return new Promise<{ content: (TextContent | ImageContent)[]; details?: ReadToolDetails }>(
 				(resolve, reject) => {
 					if (signal?.aborted) {
 						reject(new Error("Operation aborted"));
@@ -332,7 +332,7 @@ export function createReadToolDefinition(
 
 							if (aborted) return;
 							signal?.removeEventListener("abort", onAbort);
-							resolve({ content, details });
+							resolve({ content, ...(details === undefined ? {} : { details }) });
 						} catch (error: any) {
 							signal?.removeEventListener("abort", onAbort);
 							if (!aborted) reject(error);
@@ -361,6 +361,9 @@ export function createReadToolDefinition(
 	};
 }
 
-export function createReadTool(cwd: string, options?: ReadToolOptions): AgentTool<typeof readSchema> {
+export function createReadTool(
+	cwd: string,
+	options?: ReadToolOptions,
+): AgentTool<typeof readSchema, ReadToolDetails | undefined> {
 	return wrapToolDefinition(createReadToolDefinition(cwd, options));
 }

@@ -495,6 +495,9 @@ export function createImageGenToolDefinition(
 	};
 }
 
-export function createImageGenTool(cwd: string, options: ImageGenToolOptions = {}): AgentTool<typeof imageGenSchema> {
+export function createImageGenTool(
+	cwd: string,
+	options: ImageGenToolOptions = {},
+): AgentTool<typeof imageGenSchema, ImageGenToolDetails> {
 	return wrapToolDefinition(createImageGenToolDefinition(cwd, options));
 }

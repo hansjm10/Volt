@@ -148,7 +148,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 			type: "tool_execution_end",
 			toolCallId: TOOL_CALL_ID,
 			toolName: TOOL_NAME,
-			result: { content: [{ type: "text", text: "FINAL_RESULT" }], details: undefined },
+			result: { content: [{ type: "text", text: "FINAL_RESULT" }] },
 			isError: false,
 		});
 

@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type JsonObject,
 	parseStreamingJson,
 	type ToolCall,
 	type Usage,
@@ -386,8 +387,10 @@ function generatedConversationEvents(value: GeneratedFeedConversation): object[]
 	for (const argsTextDelta of splitGeneratedValue(finalArgsText, value.toolChunkWidths)) {
 		toolArgsText += argsTextDelta;
 		toolCall = {
-			...toolCall,
-			arguments: parseStreamingJson<Record<string, unknown>>(toolArgsText),
+			type: "toolCall",
+			id: "property-tool",
+			name: "read",
+			arguments: parseStreamingJson<JsonObject>(toolArgsText),
 		};
 		pushUpdate({
 			type: "toolcall_delta",
@@ -398,7 +401,7 @@ function generatedConversationEvents(value: GeneratedFeedConversation): object[]
 			toolState: [{ contentIndex: 2, argsText: toolArgsText }],
 		});
 	}
-	toolCall = { ...toolCall, arguments: finalArguments };
+	toolCall = { type: "toolCall", id: "property-tool", name: "read", arguments: finalArguments };
 	pushUpdate({
 		type: "toolcall_end",
 		seq: ++seq,

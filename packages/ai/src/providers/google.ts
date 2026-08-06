@@ -19,6 +19,7 @@ import type {
 	Usage,
 } from "../types.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
+import type { JsonObject } from "../utils/json-value.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import type { GoogleThinkingLevel } from "./google-shared.ts";
 import {
@@ -134,7 +135,7 @@ export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions>
 							toolCallIds.add(toolCallId);
 							hasToolCalls = true;
 							const contentIndex = nextContentIndex++;
-							const args = (part.functionCall.args as Record<string, unknown> | undefined) ?? {};
+							const args = (part.functionCall.args as JsonObject | undefined) ?? {};
 							const toolCall: ToolCall = {
 								type: "toolCall",
 								id: toolCallId,

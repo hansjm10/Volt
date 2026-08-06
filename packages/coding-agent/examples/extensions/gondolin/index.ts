@@ -49,7 +49,7 @@ const DEFAULT_GREP_LIMIT = 100;
 
 type TextToolResult<TDetails> = {
 	content: Array<{ type: "text"; text: string }>;
-	details: TDetails | undefined;
+	details?: TDetails;
 };
 
 function stripAtPrefix(value: string): string {
@@ -285,7 +285,7 @@ async function executeGondolinGrep(
 		signal,
 	);
 
-	if (matchCount === 0) return { content: [{ type: "text", text: "No matches found" }], details: undefined };
+	if (matchCount === 0) return { content: [{ type: "text", text: "No matches found" }] };
 
 	const rawOutput = outputLines.join("\n");
 	const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });

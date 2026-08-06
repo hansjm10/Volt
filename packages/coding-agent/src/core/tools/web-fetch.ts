@@ -1080,6 +1080,9 @@ export function createWebFetchToolDefinition(
 	};
 }
 
-export function createWebFetchTool(cwd: string, options?: WebFetchToolOptions): AgentTool<typeof webFetchSchema> {
+export function createWebFetchTool(
+	cwd: string,
+	options?: WebFetchToolOptions,
+): AgentTool<typeof webFetchSchema, WebFetchToolDetails> {
 	return wrapToolDefinition(createWebFetchToolDefinition(cwd, options));
 }

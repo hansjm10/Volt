@@ -1,4 +1,12 @@
-import type { ImageContent, Model, SimpleStreamOptions, TextContent, Transport } from "@hansjm10/volt-ai";
+import type {
+	ImageContent,
+	JsonObject,
+	JsonValue,
+	Model,
+	SimpleStreamOptions,
+	TextContent,
+	Transport,
+} from "@hansjm10/volt-ai";
 import type { AgentEvent, AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "../index.ts";
 import type { Session } from "./session/session.ts";
 
@@ -359,7 +367,7 @@ export interface ActiveToolsChangeEntry extends SessionTreeEntryBase {
 	activeToolNames: string[];
 }
 
-export interface CompactionEntry<T = unknown> extends SessionTreeEntryBase {
+export interface CompactionEntry<T = JsonValue> extends SessionTreeEntryBase {
 	type: "compaction";
 	summary: string;
 	firstKeptEntryId: string;
@@ -368,7 +376,7 @@ export interface CompactionEntry<T = unknown> extends SessionTreeEntryBase {
 	fromHook?: boolean;
 }
 
-export interface BranchSummaryEntry<T = unknown> extends SessionTreeEntryBase {
+export interface BranchSummaryEntry<T = JsonValue> extends SessionTreeEntryBase {
 	type: "branch_summary";
 	fromId: string;
 	summary: string;
@@ -376,13 +384,13 @@ export interface BranchSummaryEntry<T = unknown> extends SessionTreeEntryBase {
 	fromHook?: boolean;
 }
 
-export interface CustomEntry<T = unknown> extends SessionTreeEntryBase {
+export interface CustomEntry<T = JsonValue> extends SessionTreeEntryBase {
 	type: "custom";
 	customType: string;
 	data?: T;
 }
 
-export interface CustomMessageEntry<T = unknown> extends SessionTreeEntryBase {
+export interface CustomMessageEntry<T = JsonValue> extends SessionTreeEntryBase {
 	type: "custom_message";
 	customType: string;
 	content: string | (TextContent | ImageContent)[];
@@ -393,7 +401,7 @@ export interface CustomMessageEntry<T = unknown> extends SessionTreeEntryBase {
 export interface LabelEntry extends SessionTreeEntryBase {
 	type: "label";
 	targetId: string;
-	label: string | undefined;
+	label?: string;
 }
 
 export interface SessionInfoEntry extends SessionTreeEntryBase {
@@ -559,16 +567,16 @@ export interface ToolCallEvent {
 	type: "tool_call";
 	toolCallId: string;
 	toolName: string;
-	input: Record<string, unknown>;
+	input: JsonObject;
 }
 
 export interface ToolResultEvent {
 	type: "tool_result";
 	toolCallId: string;
 	toolName: string;
-	input: Record<string, unknown>;
+	input: JsonObject;
 	content: Array<TextContent | ImageContent>;
-	details: unknown;
+	details?: JsonValue;
 	isError: boolean;
 }
 
@@ -683,7 +691,7 @@ export interface ToolCallResult {
 
 export interface ToolResultPatch {
 	content?: Array<TextContent | ImageContent>;
-	details?: unknown;
+	details?: JsonValue;
 	isError?: boolean;
 	disposition?: "stop" | "final_response";
 }
@@ -695,7 +703,7 @@ export interface SessionBeforeCompactResult {
 
 export interface SessionBeforeTreeResult {
 	cancel?: boolean;
-	summary?: { summary: string; details?: unknown };
+	summary?: { summary: string; details?: JsonValue };
 	customInstructions?: string;
 	replaceInstructions?: boolean;
 	label?: string;
@@ -736,7 +744,7 @@ export interface CompactResult {
 	summary: string;
 	firstKeptEntryId: string;
 	tokensBefore: number;
-	details?: unknown;
+	details?: JsonValue;
 }
 
 export interface NavigateTreeResult {

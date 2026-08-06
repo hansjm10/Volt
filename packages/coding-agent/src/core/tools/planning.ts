@@ -160,7 +160,7 @@ class PlanningToolResultComponent implements Component {
 		}
 
 		const planning = this.result.details;
-		if (!planning.plan) {
+		if (!planning?.plan) {
 			return [truncateToWidth(this.currentTheme.fg("muted", "No active plan"), width, "")];
 		}
 
@@ -415,7 +415,7 @@ export function createPlanningToolDefinitions(
 					content: [{ type: "text", text: stateResultText(planning) }],
 					details: planning,
 					isError: false,
-					disposition: plan.phase === "completed" ? "final_response" : undefined,
+					...(plan.phase === "completed" ? { disposition: "final_response" as const } : {}),
 				};
 			},
 		},

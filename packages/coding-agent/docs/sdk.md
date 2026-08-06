@@ -83,6 +83,9 @@ interface AgentSession {
   steer(text: string): Promise<void>;
   followUp(text: string): Promise<void>;
 
+  // Send lossless JSON custom data
+  sendCustomMessage<T>(message: CustomMessageInput<T>, options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" }): Promise<void>;
+
   // Subscribe to events (returns unsubscribe function)
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
 
@@ -392,7 +395,9 @@ Prefer `session.waitForIdle()` when coordinating application work. It includes p
 
 ### Events
 
-Subscribe to events to receive streaming output and lifecycle notifications.
+Subscribe to events to receive streaming output and lifecycle notifications. Volt snapshots the listener list and gives every listener its own full JSON-data snapshot. Mutating an event, throwing synchronously, or returning a rejected promise cannot affect session state or suppress later listeners. Listener promises are observed only to contain rejection; they do not delay session work.
+
+The source event is validated and owned even when there are no listeners. Public custom-message inputs, finalized messages, and tool final/update results are validated before acceptance, so invalid producer data fails explicitly instead of silently dropping an event. Accepted event and persisted values are limited to `null`, booleans, strings, finite numbers other than negative zero, dense arrays, and ordinary plain objects with enumerable string-keyed data properties. Omit absent optional properties. `undefined`, cycles, sparse/accessor/symbol-keyed objects, custom prototypes, `Map`, `Set`, `Date`, typed arrays, buffers, `ArrayBuffer`, `SharedArrayBuffer`, and other rich objects are rejected; convert them to plain JSON representations first.
 
 ```typescript
 session.subscribe((event) => {
@@ -680,6 +685,8 @@ const { session } = await createAgentSession({
 Use `defineTool()` for standalone definitions and arrays like `customTools: [myTool]`. Inline `volt.registerTool({ ... })` already infers parameter types correctly.
 
 Custom tools passed via `customTools` are combined with extension-registered tools. Extensions loaded by the ResourceLoader can also register tools via `volt.registerTool()`.
+
+Every final tool result and streamed update must satisfy the lossless JSON grammar described under [Events](#events). Invalid final results become explicit failed tool results. An invalid streamed update aborts the linked tool signal, suppresses later updates, waits for tool settlement, and then becomes the explicit failure; callbacks after settlement are ignored.
 
 If you pass `tools`, include each custom or extension tool name you want enabled, for example `tools: ["read", "bash", "my_tool"]`.
 
@@ -1309,6 +1316,12 @@ type CreateAgentSessionResult
 type ExtensionFactory
 type ExtensionAPI
 type ToolDefinition
+type CustomMessageInput
+type JsonPrimitive
+type JsonValue
+type JsonObject
+type JsonCompatible
+type JsonCompatibleInput
 type Skill
 type PromptTemplate
 type Tool

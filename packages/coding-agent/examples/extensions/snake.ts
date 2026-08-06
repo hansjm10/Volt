@@ -322,7 +322,7 @@ export default function (volt: ExtensionAPI) {
 			for (let i = entries.length - 1; i >= 0; i--) {
 				const entry = entries[i];
 				if (entry.type === "custom" && entry.customType === SNAKE_SAVE_TYPE) {
-					savedState = entry.data as GameState;
+					savedState = entry.data as unknown as GameState;
 					break;
 				}
 			}

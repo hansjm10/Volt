@@ -365,8 +365,8 @@ export function createBashToolDefinition(
 				onUpdate({
 					content: [{ type: "text", text: snapshot.content || "" }],
 					details: {
-						truncation: snapshot.truncation.truncated ? snapshot.truncation : undefined,
-						fullOutputPath: snapshot.fullOutputPath,
+						...(snapshot.truncation.truncated ? { truncation: snapshot.truncation } : {}),
+						...(snapshot.fullOutputPath === undefined ? {} : { fullOutputPath: snapshot.fullOutputPath }),
 					},
 				});
 			};
@@ -394,7 +394,7 @@ export function createBashToolDefinition(
 			};
 
 			if (onUpdate) {
-				onUpdate({ content: [], details: undefined });
+				onUpdate({ content: [] });
 			}
 
 			const stallController = new AbortController();
@@ -448,7 +448,10 @@ export function createBashToolDefinition(
 				let text = snapshot.content || emptyText;
 				let details: BashToolDetails | undefined;
 				if (truncation.truncated) {
-					details = { truncation, fullOutputPath: snapshot.fullOutputPath };
+					details = {
+						truncation,
+						...(snapshot.fullOutputPath === undefined ? {} : { fullOutputPath: snapshot.fullOutputPath }),
+					};
 					const startLine = truncation.totalLines - truncation.outputLines + 1;
 					const endLine = truncation.totalLines;
 					if (truncation.lastLinePartial) {
@@ -510,7 +513,10 @@ export function createBashToolDefinition(
 				if (exitCode !== 0 && exitCode !== null) {
 					throw new Error(appendStatus(outputText, `Command exited with code ${exitCode}`));
 				}
-				return { content: [{ type: "text", text: outputText }], details };
+				return {
+					content: [{ type: "text", text: outputText }],
+					...(details === undefined ? {} : { details }),
+				};
 			} finally {
 				clearUpdateTimer();
 				clearStallTimer();
@@ -558,6 +564,9 @@ export function createBashToolDefinition(
 	};
 }
 
-export function createBashTool(cwd: string, options?: BashToolOptions): AgentTool<typeof bashSchema> {
+export function createBashTool(
+	cwd: string,
+	options?: BashToolOptions,
+): AgentTool<typeof bashSchema, BashToolDetails | undefined> {
 	return wrapToolDefinition(createBashToolDefinition(cwd, options));
 }

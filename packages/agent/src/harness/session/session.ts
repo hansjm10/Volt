@@ -1,4 +1,4 @@
-import type { ImageContent, TextContent } from "@hansjm10/volt-ai";
+import type { ImageContent, JsonCompatibleInput, JsonValue, TextContent } from "@hansjm10/volt-ai";
 import type { AgentMessage } from "../../types.ts";
 import { createBranchSummaryMessage, createCompactionSummaryMessage, createCustomMessage } from "../messages.ts";
 import type {
@@ -170,11 +170,11 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 		} satisfies ActiveToolsChangeEntry);
 	}
 
-	async appendCompaction<T = unknown>(
+	async appendCompaction<T = JsonValue>(
 		summary: string,
 		firstKeptEntryId: string,
 		tokensBefore: number,
-		details?: T,
+		details?: JsonCompatibleInput<T>,
 		fromHook?: boolean,
 	): Promise<string> {
 		return this.appendTypedEntry({
@@ -185,27 +185,27 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 			summary,
 			firstKeptEntryId,
 			tokensBefore,
-			details,
-			fromHook,
-		} satisfies CompactionEntry<T>);
+			...(details === undefined ? {} : { details: details as JsonValue }),
+			...(fromHook === undefined ? {} : { fromHook }),
+		} satisfies CompactionEntry);
 	}
 
-	async appendCustomEntry(customType: string, data?: unknown): Promise<string> {
+	async appendCustomEntry<T = JsonValue>(customType: string, data?: JsonCompatibleInput<T>): Promise<string> {
 		return this.appendTypedEntry({
 			type: "custom",
 			id: await this.storage.createEntryId(),
 			parentId: await this.storage.getLeafId(),
 			timestamp: new Date().toISOString(),
 			customType,
-			data,
+			...(data === undefined ? {} : { data: data as JsonValue }),
 		} satisfies CustomEntry);
 	}
 
-	async appendCustomMessageEntry<T = unknown>(
+	async appendCustomMessageEntry<T = JsonValue>(
 		customType: string,
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
-		details?: T,
+		details?: JsonCompatibleInput<T>,
 	): Promise<string> {
 		return this.appendTypedEntry({
 			type: "custom_message",
@@ -215,8 +215,8 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 			customType,
 			content,
 			display,
-			details,
-		} satisfies CustomMessageEntry<T>);
+			...(details === undefined ? {} : { details: details as JsonValue }),
+		} satisfies CustomMessageEntry);
 	}
 
 	async appendLabel(targetId: string, label: string | undefined): Promise<string> {
@@ -229,7 +229,7 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 			parentId: await this.storage.getLeafId(),
 			timestamp: new Date().toISOString(),
 			targetId,
-			label,
+			...(label === undefined ? {} : { label }),
 		} satisfies LabelEntry);
 	}
 
@@ -245,7 +245,7 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 
 	async moveTo(
 		entryId: string | null,
-		summary?: { summary: string; details?: unknown; fromHook?: boolean },
+		summary?: { summary: string; details?: JsonValue; fromHook?: boolean },
 	): Promise<string | undefined> {
 		if (entryId !== null && !(await this.storage.getEntry(entryId))) {
 			throw new SessionError("not_found", `Entry ${entryId} not found`);
@@ -259,8 +259,8 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 			timestamp: new Date().toISOString(),
 			fromId: entryId ?? "root",
 			summary: summary.summary,
-			details: summary.details,
-			fromHook: summary.fromHook,
+			...(summary.details === undefined ? {} : { details: summary.details }),
+			...(summary.fromHook === undefined ? {} : { fromHook: summary.fromHook }),
 		} satisfies BranchSummaryEntry);
 	}
 }

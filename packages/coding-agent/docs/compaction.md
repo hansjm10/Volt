@@ -121,7 +121,7 @@ Never cut at tool results (they must stay with their tool call). If the retentio
 Defined in [`session-manager.ts`](../src/core/session-manager.ts):
 
 ```typescript
-interface CompactionEntry<T = unknown> {
+interface CompactionEntry {
   type: "compaction";
   id: string;
   parentId: string;
@@ -130,7 +130,7 @@ interface CompactionEntry<T = unknown> {
   firstKeptEntryId: string;
   tokensBefore: number;
   fromHook?: boolean;  // true if provided by extension (legacy field name)
-  details?: T;         // implementation-specific data
+  details?: JsonValue; // implementation-specific JSON data
 }
 
 // Default compaction uses this for details (from compaction.ts):
@@ -140,7 +140,7 @@ interface CompactionDetails {
 }
 ```
 
-Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure.
+Extensions can store data from Volt's lossless JSON grammar in `details`. Optional fields must be omitted rather than set to `undefined`; cycles, non-finite numbers, rich objects such as `Map`/`Date`/typed arrays, and shared memory are rejected. The default compaction tracks file operations, but custom extension implementations can use their own plain JSON structure.
 
 See [`prepareCompaction()`](../src/core/compaction/compaction.ts) and [`compact()`](../src/core/compaction/compaction.ts) for the implementation.
 
@@ -188,7 +188,7 @@ This means file tracking accumulates across multiple compactions or nested branc
 Defined in [`session-manager.ts`](../src/core/session-manager.ts):
 
 ```typescript
-interface BranchSummaryEntry<T = unknown> {
+interface BranchSummaryEntry {
   type: "branch_summary";
   id: string;
   parentId: string;
@@ -196,7 +196,7 @@ interface BranchSummaryEntry<T = unknown> {
   summary: string;
   fromId: string;      // Entry we navigated from
   fromHook?: boolean;  // true if provided by extension (legacy field name)
-  details?: T;         // implementation-specific data
+  details?: JsonValue; // implementation-specific JSON data
 }
 
 // Default branch summarization uses this for details (from branch-summarization.ts):
@@ -206,7 +206,7 @@ interface BranchSummaryDetails {
 }
 ```
 
-Same as compaction, extensions can store custom data in `details`.
+As with compaction, extensions can store custom lossless JSON data in `details`.
 
 See [`collectEntriesForBranchSummary()`](../src/core/compaction/branch-summarization.ts), [`prepareBranchEntries()`](../src/core/compaction/branch-summarization.ts), and [`generateBranchSummary()`](../src/core/compaction/branch-summarization.ts) for the implementation.
 
@@ -268,7 +268,7 @@ Tool results are truncated to 2000 characters during serialization. Content beyo
 
 ## Custom Summarization via Extensions
 
-Extensions can intercept and customize both compaction and branch summarization. See [`extensions/types.ts`](../src/core/extensions/types.ts) for event type definitions.
+Extensions can intercept and customize both compaction and branch summarization. See [`extensions/types.ts`](../src/core/extensions/types.ts) for event type definitions. Volt validates and owns custom summaries before appending an entry or moving the branch leaf. Invalid details fail the operation without committing a compaction or tree-navigation mutation.
 
 ### session_before_compact
 

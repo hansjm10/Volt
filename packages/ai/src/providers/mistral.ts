@@ -22,6 +22,7 @@ import type {
 } from "../types.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
+import type { JsonObject } from "../utils/json-value.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
@@ -260,7 +261,7 @@ interface MistralToolBlockState {
 	contentIndex: number;
 	id: string;
 	name: string;
-	authoritativeArguments?: Record<string, unknown>;
+	authoritativeArguments?: JsonObject;
 }
 
 interface MistralStreamState {
@@ -450,9 +451,9 @@ function finishMistralContentBlock(normalizer: AssistantStreamNormalizer, state:
 	state.currentBlock = null;
 }
 
-function toMistralToolArguments(value: unknown): Record<string, unknown> {
+function toMistralToolArguments(value: unknown): JsonObject {
 	if (value && typeof value === "object" && !Array.isArray(value)) {
-		return value as Record<string, unknown>;
+		return value as JsonObject;
 	}
 	return {};
 }

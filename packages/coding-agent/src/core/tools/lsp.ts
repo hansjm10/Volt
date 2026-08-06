@@ -229,6 +229,9 @@ export function createLspToolDefinition(
 	};
 }
 
-export function createLspTool(cwd: string, options?: LspToolOptions): AgentTool<typeof lspSchema> {
+export function createLspTool(
+	cwd: string,
+	options?: LspToolOptions,
+): AgentTool<typeof lspSchema, LspToolDetails | undefined> {
 	return wrapToolDefinition(createLspToolDefinition(cwd, options));
 }

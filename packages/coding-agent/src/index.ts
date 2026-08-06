@@ -1,7 +1,13 @@
 // Core session management
 
+export type {
+	JsonCompatible,
+	JsonCompatibleInput,
+	JsonObject,
+	JsonPrimitive,
+	JsonValue,
+} from "@hansjm10/volt-ai";
 export { type Args, parseArgs } from "./cli/args.ts";
-
 // Config paths
 export { getAgentDir, getDocsPath, getExamplesPath, getPackageDir, getReadmePath, VERSION } from "./config.ts";
 export {
@@ -244,7 +250,7 @@ export {
 	type McpToolSummary,
 	searchMcpMetadata,
 } from "./core/mcp/index.ts";
-export { convertToLlm } from "./core/messages.ts";
+export { type CustomMessage, type CustomMessageInput, convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export type {
 	PackageInstallOptions,

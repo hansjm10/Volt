@@ -2,6 +2,7 @@ import {
 	type ActiveToolCallState,
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type JsonObject,
 	parseStreamingJson,
 	type ToolCall,
 } from "@hansjm10/volt-ai";
@@ -1055,7 +1056,7 @@ function applySlimEvent(
 				...existing,
 				...(typeof event.id === "string" ? { id: event.id } : {}),
 				...(typeof event.name === "string" ? { name: event.name } : {}),
-				arguments: cloneAndFreeze(parseStreamingJson<Record<string, unknown>>(next)),
+				arguments: cloneAndFreeze(parseStreamingJson<JsonObject>(next)),
 			});
 			break;
 		}

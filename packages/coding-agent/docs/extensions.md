@@ -35,6 +35,7 @@ See [examples/extensions/](../examples/extensions/) for working implementations.
 - [Available Imports](#available-imports)
 - [Writing an Extension](#writing-an-extension)
   - [Extension Styles](#extension-styles)
+- [JSON Data Boundary](#json-data-boundary)
 - [Events](#events)
   - [Lifecycle Overview](#lifecycle-overview)
   - [Resource Events](#resource-events)
@@ -271,6 +272,14 @@ Defer background resource startup until `session_start` or the command/tool/even
 
 Run `npm install` in the extension directory, then imports from `node_modules/` work automatically.
 
+## JSON Data Boundary
+
+Persisted values and public `AgentSession` events use one lossless JSON data grammar. Accepted values are `null`, booleans, strings, finite numbers other than negative zero, dense arrays, and ordinary plain objects whose own properties are enumerable string-keyed data properties. Optional properties must be omitted when absent.
+
+Volt rejects explicit `undefined`, non-finite numbers, negative zero, bigint, symbols, functions, cycles, sparse arrays, accessors, symbol-keyed or non-enumerable properties, custom or null prototypes, and rich objects such as `Map`, `Set`, `Date`, `Error`, `RegExp`, `Buffer`, typed arrays, `ArrayBuffer`, `SharedArrayBuffer`, and platform objects. Convert rich values to plain JSON representations, such as an ISO string for a date or an array of entries for a map.
+
+Admission errors are path-specific `TypeError`s. Volt validates and owns accepted data before it mutates session state, writes JSONL, or publishes an event. The on-disk session version is unchanged because every accepted value already round-trips through JSON exactly.
+
 ## Events
 
 ### Lifecycle Overview
@@ -462,6 +471,8 @@ volt.on("session_compact", async (event, ctx) => {
 });
 ```
 
+Custom compaction and tree-summary results are validated and owned before Volt moves the branch leaf or appends an entry. Invalid JSON data fails the operation without creating a summary entry.
+
 #### session_before_tree / session_tree
 
 Fired on `/tree` navigation. See [Sessions](sessions.md) for tree navigation concepts.
@@ -528,7 +539,7 @@ volt.on("before_agent_start", async (event, ctx) => {
 
 The `systemPromptOptions` field gives extensions access to the same structured data Volt uses to build the system prompt. This lets you inspect what Volt has loaded — custom prompts, guidelines, tool snippets, context files, skills — without re-discovering resources or re-parsing flags. Use it when your extension needs to make deep, informed changes to the system prompt while respecting user-provided configuration.
 
-Inside `before_agent_start`, `event.systemPrompt` and `ctx.getSystemPrompt()` both reflect the chained system prompt as of the current handler. Later `before_agent_start` handlers can still modify it again.
+Inside `before_agent_start`, `event.systemPrompt` and `ctx.getSystemPrompt()` both reflect the chained system prompt as of the current handler. Later `before_agent_start` handlers can still modify it again. An injected message must satisfy the [JSON data boundary](#json-data-boundary); Volt diagnoses and skips only the invalid optional message while continuing the turn.
 
 #### agent_start / agent_end
 
@@ -562,7 +573,7 @@ Fired for message lifecycle updates.
 
 - `message_start` and `message_end` fire for user, assistant, and toolResult messages.
 - `message_update` fires for assistant streaming updates.
-- `message_end` handlers can return `{ message }` to replace the finalized message. The replacement must keep the same `role`.
+- `message_end` handlers can return `{ message }` to replace the finalized message. The replacement must keep the same `role` and satisfy the [JSON data boundary](#json-data-boundary). An invalid replacement fails message preparation before it commits.
 
 ```typescript
 volt.on("message_start", async (event, ctx) => {
@@ -774,6 +785,8 @@ In parallel tool mode, `tool_result` and `tool_execution_end` may interleave in 
 - Handlers run in extension load order
 - Each handler sees the latest result after previous handler changes
 - Handlers can return partial patches (`content`, `details`, or `isError`); omitted fields keep their current values
+- Final results, streaming updates, and replacement `details` must satisfy the [JSON data boundary](#json-data-boundary); invalid data becomes an explicit failed tool result instead of disappearing from session observers
+- An invalid streaming update aborts the tool through its signal, suppresses later updates, and becomes the tool failure after `execute()` settles
 
 Use `ctx.signal` for nested async work inside the handler. This lets Esc cancel model calls, `fetch()`, and other abort-aware operations started by the extension.
 
@@ -1332,7 +1345,7 @@ volt.registerTool({
 
 ### volt.sendMessage(message, options?)
 
-Inject a custom message into the session.
+Inject a custom message into the session. `details` must satisfy the [JSON data boundary](#json-data-boundary). Invalid data is rejected before the message enters agent state, persistence, or publication.
 
 ```typescript
 volt.sendMessage({
@@ -1386,7 +1399,7 @@ See [send-user-message.ts](../examples/extensions/send-user-message.ts) for a co
 Persist extension state (does NOT participate in LLM context).
 
 ```typescript
-volt.appendEntry("my-state", { count: 42 });
+volt.appendEntry("my-state", { count: 42 }); // Plain JSON data; omit absent properties
 
 // Restore on reload
 volt.on("session_start", async (_event, ctx) => {
@@ -1852,6 +1865,8 @@ volt.registerTool({
 
 **Signaling errors:** Throw from `execute` when a failure has no structured result. The agent catches the error, sets `isError: true`, and reports it to the LLM. When a protocol supplies useful failure content or details, return them with `isError: true`; the flag propagates through tool-result hooks, events, and the model-visible result.
 
+**JSON-safe results:** Every final result, `onUpdate` payload, and `tool_result` patch must satisfy the [JSON data boundary](#json-data-boundary). Invalid final results and patches become explicit tool failures. An invalid streaming update aborts the linked execution signal, suppresses later updates, waits for `execute()` to settle, and then reports the validation failure. Calls to `onUpdate` after `execute()` settles are ignored.
+
 **Tool disposition:** Return `disposition: "stop"` from `execute()` to skip the automatic follow-up LLM call when every finalized result in the batch requests it. Return `disposition: "final_response"` to authorize one additional tool-free response; a successful final-response result takes precedence over other batch results. See [examples/extensions/structured-output.ts](../examples/extensions/structured-output.ts) for a minimal stop-disposition example.
 
 ```typescript
@@ -2084,7 +2099,7 @@ volt.registerTool({
   parameters: Type.Object({}),
   renderShell: "self",
   async execute() {
-    return { content: [{ type: "text", text: "ok" }], details: undefined };
+    return { content: [{ type: "text", text: "ok" }] };
   },
   renderCall(args, theme, context) {
     return new Text(theme.fg("accent", "my custom shell"), 0, 0);
@@ -2605,6 +2620,8 @@ const highlighted = highlightCode(code, lang, theme);
 ## Error Handling
 
 - Extension errors are logged, agent continues
+- Invalid optional `before_agent_start` messages are diagnosed and skipped
+- Invalid `message_end`, compaction, and tree-summary replacements fail before their delivery or session mutation commits
 - `tool_call` errors block the tool (fail-safe)
 - Tool `execute` errors can be thrown or returned as structured results with `isError: true`; both are reported to the LLM as failures and execution continues
 

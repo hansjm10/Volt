@@ -21,6 +21,9 @@ import type {
 	AssistantMessageEventStream,
 	Context,
 	ImageContent,
+	JsonCompatibleInput,
+	JsonObject,
+	JsonValue,
 	Model,
 	OAuthCredentials,
 	OAuthLoginCallbacks,
@@ -46,7 +49,7 @@ import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
-import type { CustomMessage } from "../messages.ts";
+import type { CustomMessage, CustomMessageInput } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type {
 	BranchSummaryEntry,
@@ -390,8 +393,8 @@ export interface ExtensionCommandContext extends ExtensionContext {
  * This is passed to `withSession()` callbacks on `newSession()`, `fork()`, and `switchSession()`.
  */
 export interface ReplacedSessionContext extends ExtensionCommandContext {
-	sendMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+	sendMessage<T>(
+		message: CustomMessageInput<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void>;
 
@@ -474,7 +477,7 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	 */
 	executionMode?: ToolExecutionMode;
 
-	/** Execute the tool. */
+	/** Execute the tool. Final details and all streamed updates must contain only JSON-compatible data. */
 	execute(
 		toolCallId: string,
 		params: Static<TParams>,
@@ -737,7 +740,7 @@ export interface ToolExecutionStartEvent {
 	type: "tool_execution_start";
 	toolCallId: string;
 	toolName: string;
-	args: any;
+	args: JsonObject;
 }
 
 /** Fired during tool execution with partial/streaming output */
@@ -745,8 +748,8 @@ export interface ToolExecutionUpdateEvent {
 	type: "tool_execution_update";
 	toolCallId: string;
 	toolName: string;
-	args: any;
-	partialResult: any;
+	args: JsonObject;
+	partialResult: AgentToolResult<JsonValue | undefined>;
 }
 
 /** Fired when a tool finishes executing */
@@ -754,7 +757,7 @@ export interface ToolExecutionEndEvent {
 	type: "tool_execution_end";
 	toolCallId: string;
 	toolName: string;
-	result: any;
+	result: AgentToolResult<JsonValue | undefined>;
 	isError: boolean;
 }
 
@@ -876,7 +879,7 @@ export interface LsToolCallEvent extends ToolCallEventBase {
 
 export interface CustomToolCallEvent extends ToolCallEventBase {
 	toolName: string;
-	input: Record<string, unknown>;
+	input: JsonObject;
 }
 
 /**
@@ -900,59 +903,59 @@ export type ToolCallEvent =
 interface ToolResultEventBase {
 	type: "tool_result";
 	toolCallId: string;
-	input: Record<string, unknown>;
+	input: JsonObject;
 	content: (TextContent | ImageContent)[];
 	isError: boolean;
 }
 
 export interface BashToolResultEvent extends ToolResultEventBase {
 	toolName: "bash";
-	details: BashToolDetails | undefined;
+	details?: BashToolDetails;
 }
 
 export interface ReadToolResultEvent extends ToolResultEventBase {
 	toolName: "read";
-	details: ReadToolDetails | undefined;
+	details?: ReadToolDetails;
 }
 
 export interface EditToolResultEvent extends ToolResultEventBase {
 	toolName: "edit";
-	details: EditToolDetails | undefined;
+	details?: EditToolDetails;
 }
 
 export interface WriteToolResultEvent extends ToolResultEventBase {
 	toolName: "write";
-	details: WriteToolDetails | undefined;
+	details?: WriteToolDetails;
 }
 
 export interface WebSearchToolResultEvent extends ToolResultEventBase {
 	toolName: "web_search";
-	details: WebSearchToolDetails | undefined;
+	details?: WebSearchToolDetails;
 }
 
 export interface WebFetchToolResultEvent extends ToolResultEventBase {
 	toolName: "web_fetch";
-	details: WebFetchToolDetails | undefined;
+	details?: WebFetchToolDetails;
 }
 
 export interface GrepToolResultEvent extends ToolResultEventBase {
 	toolName: "grep";
-	details: GrepToolDetails | undefined;
+	details?: GrepToolDetails;
 }
 
 export interface FindToolResultEvent extends ToolResultEventBase {
 	toolName: "find";
-	details: FindToolDetails | undefined;
+	details?: FindToolDetails;
 }
 
 export interface LsToolResultEvent extends ToolResultEventBase {
 	toolName: "ls";
-	details: LsToolDetails | undefined;
+	details?: LsToolDetails;
 }
 
 export interface CustomToolResultEvent extends ToolResultEventBase {
 	toolName: string;
-	details: unknown;
+	details?: JsonValue;
 }
 
 /** Fired after a tool executes. Can modify result. */
@@ -1086,7 +1089,8 @@ export interface UserBashEventResult {
 
 export interface ToolResultEventResult {
 	content?: (TextContent | ImageContent)[];
-	details?: unknown;
+	/** Replacement details must contain only JSON-compatible data. */
+	details?: JsonValue;
 	isError?: boolean;
 }
 
@@ -1119,7 +1123,7 @@ export interface SessionBeforeTreeResult {
 	cancel?: boolean;
 	summary?: {
 		summary: string;
-		details?: unknown;
+		details?: JsonValue;
 	};
 	/** Override custom instructions for summarization */
 	customInstructions?: string;
@@ -1137,7 +1141,7 @@ export interface MessageRenderOptions {
 	expanded: boolean;
 }
 
-export type MessageRenderer<T = unknown> = (
+export type MessageRenderer<T = JsonValue> = (
 	message: CustomMessage<T>,
 	options: MessageRenderOptions,
 	theme: Theme,
@@ -1260,15 +1264,15 @@ export interface ExtensionAPI {
 	// =========================================================================
 
 	/** Register a custom renderer for CustomMessageEntry. */
-	registerMessageRenderer<T = unknown>(customType: string, renderer: MessageRenderer<T>): void;
+	registerMessageRenderer<T = JsonValue>(customType: string, renderer: MessageRenderer<T>): void;
 
 	// =========================================================================
 	// Actions
 	// =========================================================================
 
 	/** Send a custom message to the session. */
-	sendMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+	sendMessage<T>(
+		message: CustomMessageInput<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): void;
 
@@ -1282,7 +1286,7 @@ export interface ExtensionAPI {
 	): void;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
-	appendEntry<T = unknown>(customType: string, data?: T): void;
+	appendEntry<T>(customType: string, data?: JsonCompatibleInput<T>): void;
 
 	// =========================================================================
 	// Session Metadata
@@ -1496,8 +1500,8 @@ export interface ExtensionShortcut {
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
-export type SendMessageHandler = <T = unknown>(
-	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+export type SendMessageHandler = <T>(
+	message: CustomMessageInput<T>,
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) => void;
 
@@ -1506,7 +1510,7 @@ export type SendUserMessageHandler = (
 	options?: { deliverAs?: "steer" | "followUp" },
 ) => void;
 
-export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
+export type AppendEntryHandler = <T>(customType: string, data?: JsonCompatibleInput<T>) => void;
 
 export type SetSessionNameHandler = (name: string) => void;
 
