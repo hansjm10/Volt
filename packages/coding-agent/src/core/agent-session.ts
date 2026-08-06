@@ -174,6 +174,10 @@ import {
 import { canonicalizePlanSteps, createPlanningToolDefinitions, NATIVE_PLAN_TOOL_NAMES } from "./tools/planning.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 
+function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMessage[] {
+	return messages.map((message) => structuredClone(message));
+}
+
 // ============================================================================
 // Skill Block Parsing
 // ============================================================================
@@ -422,6 +426,12 @@ interface PreparedQueueEntry {
 	entry: AgentSessionQueuedMessage;
 }
 
+interface PreparedDeliverySnapshot {
+	messages: AgentMessage[];
+	queueEntries: PreparedQueueEntry[];
+	error?: Error;
+}
+
 interface LiveClientInputOperation {
 	command: ClientInputCommand;
 	semanticDigest: string;
@@ -512,8 +522,8 @@ export class AgentSession {
 	private _followUpMessages: AgentSessionQueuedMessage[] = [];
 	/** Correlates queue projections with Agent-owned logical delivery identities. */
 	private readonly _queueDeliveryIds = new Map<string, string>();
-	/** Reuses one extension-transformed payload across retained attempts. */
-	private readonly _preparedDeliveryExtensions = new Map<string, { messages: AgentMessage[]; error?: Error }>();
+	/** Reuses one transformed payload and queue-ownership snapshot across retained attempts. */
+	private readonly _preparedDeliveryExtensions = new Map<string, PreparedDeliverySnapshot>();
 	/** Invalidates extension preparation that finishes after Agent revokes its delivery. */
 	private readonly _preparingDeliveryExtensions = new Map<string, object>();
 	/** Host cleanup started by synchronous Agent revocation callbacks. */
@@ -791,27 +801,37 @@ export class AgentSession {
 				? await prepareDelivery(delivery, signal)
 				: { messages: [...delivery.messages] };
 			if (this._disposed) throw new Error("Session disposed during delivery preparation");
-			const normalized = this._normalizePreparedDeliveryMessages(prepared.messages);
-			let extensionPreparation = this._preparedDeliveryExtensions.get(delivery.deliveryId);
-			if (!extensionPreparation) {
+			if (!this.agent.canPrepareDelivery(delivery.deliveryId)) return prepared;
+			let deliverySnapshot = this._preparedDeliveryExtensions.get(delivery.deliveryId);
+			if (!deliverySnapshot) {
+				const normalized = this._normalizePreparedDeliveryMessages(cloneAgentMessages(prepared.messages));
 				const preparationToken = {};
 				this._preparingDeliveryExtensions.set(delivery.deliveryId, preparationToken);
-				extensionPreparation = await this._prepareDeliveryExtensionMessages(normalized.messages);
-				if (this._disposed) {
-					this._preparingDeliveryExtensions.delete(delivery.deliveryId);
-					throw new Error("Session disposed during delivery preparation");
-				}
-				if (this._preparingDeliveryExtensions.get(delivery.deliveryId) === preparationToken) {
-					this._preparingDeliveryExtensions.delete(delivery.deliveryId);
-					if (this.agent.canPrepareDelivery(delivery.deliveryId)) {
-						this._preparedDeliveryExtensions.set(delivery.deliveryId, extensionPreparation);
+				try {
+					const preparedExtension = await this._prepareDeliveryExtensionMessages(normalized.messages);
+					if (this._disposed) throw new Error("Session disposed during delivery preparation");
+					deliverySnapshot = {
+						...preparedExtension,
+						messages: cloneAgentMessages(preparedExtension.messages),
+						queueEntries: normalized.queueEntries.map(({ kind, entry }) => ({ kind, entry: { ...entry } })),
+					};
+					if (
+						this._preparingDeliveryExtensions.get(delivery.deliveryId) === preparationToken &&
+						this.agent.canPrepareDelivery(delivery.deliveryId)
+					) {
+						this._preparedDeliveryExtensions.set(delivery.deliveryId, deliverySnapshot);
+					}
+				} finally {
+					if (this._preparingDeliveryExtensions.get(delivery.deliveryId) === preparationToken) {
+						this._preparingDeliveryExtensions.delete(delivery.deliveryId);
 					}
 				}
 			}
+			const queueEntries = deliverySnapshot.queueEntries.map(({ kind, entry }) => ({ kind, entry: { ...entry } }));
 			const readyPlan =
-				extensionPreparation.messages.some((message) => message.role === "user") &&
+				deliverySnapshot.messages.some((message) => message.role === "user") &&
 				(delivery.kind !== "prompt" || this._sessionPromptOwnsInitialDelivery) &&
-				this._deliveryOwnsReadyPlanTransition(delivery.kind, normalized.queueEntries) &&
+				this._deliveryOwnsReadyPlanTransition(delivery.kind, queueEntries) &&
 				this._planningState.plan?.phase === "ready"
 					? this._planningState.plan
 					: undefined;
@@ -826,16 +846,17 @@ export class AgentSession {
 					})
 				: undefined;
 			const checkpoint = nextPlanningState ? this._createPlanningCheckpointMessage(nextPlanningState) : undefined;
-			const messages = checkpoint ? [checkpoint, ...extensionPreparation.messages] : extensionPreparation.messages;
+			const extensionMessages = cloneAgentMessages(deliverySnapshot.messages);
+			const messages = checkpoint ? [checkpoint, ...extensionMessages] : extensionMessages;
 			const participant: AgentDeliveryTransactionParticipant = {
 				settle: async (context) =>
 					await this._settleDeliveryParticipant({
 						deliveryId: delivery.deliveryId,
 						messages,
-						queueEntries: normalized.queueEntries,
+						queueEntries,
 						upstream: prepared.participant,
 						context,
-						preparationError: extensionPreparation.error,
+						preparationError: deliverySnapshot.error,
 						...(readyPlan && nextPlanningState ? { readyPlan, nextPlanningState } : {}),
 					}),
 			};
