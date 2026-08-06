@@ -151,6 +151,7 @@ import {
 	createClientInputSemanticDigest,
 	getLatestCompactionEntry,
 	RUNTIME_QUEUE_ENTRY_ID_PREFIX,
+	SessionAtomicAppendError,
 	type SessionHeader,
 } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
@@ -524,6 +525,8 @@ export class AgentSession {
 	private readonly _queueDeliveryIds = new Map<string, string>();
 	/** Reuses one transformed payload and queue-ownership snapshot across retained attempts. */
 	private readonly _preparedDeliveryExtensions = new Map<string, PreparedDeliverySnapshot>();
+	/** Assigns the current ready-plan transition to the first eligible prepared delivery. */
+	private _readyPlanTransitionDeliveryId: string | undefined;
 	/** Invalidates extension preparation that finishes after Agent revokes its delivery. */
 	private readonly _preparingDeliveryExtensions = new Map<string, object>();
 	/** Host cleanup started by synchronous Agent revocation callbacks. */
@@ -828,11 +831,16 @@ export class AgentSession {
 				}
 			}
 			const queueEntries = deliverySnapshot.queueEntries.map(({ kind, entry }) => ({ kind, entry: { ...entry } }));
-			const readyPlan =
+			const canOwnReadyPlanTransition =
 				deliverySnapshot.messages.some((message) => message.role === "user") &&
 				(delivery.kind !== "prompt" || this._sessionPromptOwnsInitialDelivery) &&
 				this._deliveryOwnsReadyPlanTransition(delivery.kind, queueEntries) &&
-				this._planningState.plan?.phase === "ready"
+				this._planningState.plan?.phase === "ready";
+			if (canOwnReadyPlanTransition && this._readyPlanTransitionDeliveryId === undefined) {
+				this._readyPlanTransitionDeliveryId = delivery.deliveryId;
+			}
+			const readyPlan =
+				canOwnReadyPlanTransition && this._readyPlanTransitionDeliveryId === delivery.deliveryId
 					? this._planningState.plan
 					: undefined;
 			const nextPlanningState = readyPlan
@@ -1149,6 +1157,7 @@ export class AgentSession {
 	private _handleAgentDeliveryRevoked(delivery: AgentDelivery): void {
 		this._preparingDeliveryExtensions.delete(delivery.deliveryId);
 		this._preparedDeliveryExtensions.delete(delivery.deliveryId);
+		this._releaseReadyPlanTransition(delivery.deliveryId);
 		const queueEntries: PreparedQueueEntry[] = [];
 		for (const entry of this._steeringMessages) {
 			if (this._queueDeliveryIds.get(entry.queueEntryId) === delivery.deliveryId) {
@@ -1232,8 +1241,20 @@ export class AgentSession {
 		for (const deliveryId of revokedDeliveryIds) {
 			this._preparingDeliveryExtensions.delete(deliveryId);
 			this._preparedDeliveryExtensions.delete(deliveryId);
+			this._releaseReadyPlanTransition(deliveryId);
 		}
 		return revokedDeliveryIds;
+	}
+
+	private _releaseReadyPlanTransition(deliveryId: string): void {
+		if (this._readyPlanTransitionDeliveryId === deliveryId) {
+			this._readyPlanTransitionDeliveryId = undefined;
+		}
+	}
+
+	private _completePreparedDelivery(deliveryId: string): void {
+		this._preparedDeliveryExtensions.delete(deliveryId);
+		this._releaseReadyPlanTransition(deliveryId);
 	}
 
 	private _hasRetainedDirectInput(clientMessageId: string): boolean {
@@ -1265,6 +1286,7 @@ export class AgentSession {
 		nextPlanningState?: PlanningState;
 	}): Promise<AgentDeliveryParticipantOutcome> {
 		let committedEffect = false;
+		let planningPublished = false;
 		try {
 			if (input.preparationError) {
 				const terminalError = await this._terminallyFailDelivery(
@@ -1272,7 +1294,7 @@ export class AgentSession {
 					input.queueEntries,
 					input.preparationError,
 				);
-				this._preparedDeliveryExtensions.delete(input.deliveryId);
+				this._completePreparedDelivery(input.deliveryId);
 				this._agentEventFatalError ??= terminalError;
 				return { outcome: "terminally_failed", error: terminalError };
 			}
@@ -1287,13 +1309,12 @@ export class AgentSession {
 						input.queueEntries,
 						outcome.error,
 					);
-					this._preparedDeliveryExtensions.delete(input.deliveryId);
+					this._completePreparedDelivery(input.deliveryId);
 					return { outcome: "terminally_failed", error: terminalError };
 				}
 				committedEffect = true;
 			}
 
-			let boundaryAppended = false;
 			if (input.readyPlan && input.nextPlanningState) {
 				const current = this._planningState.plan;
 				if (
@@ -1303,29 +1324,41 @@ export class AgentSession {
 				) {
 					throw new Error("Ready plan changed before delivery settlement");
 				}
-				this.sessionManager.appendPlanningState(input.nextPlanningState);
-				committedEffect = true;
-				boundaryAppended = true;
-			}
-
-			for (const message of input.messages) {
-				if (message.role !== "user" || message.clientMessageId === undefined) continue;
-				const record = this.sessionManager.getClientInput(message.clientMessageId);
-				if (record?.state === "accepted") {
-					this.sessionManager.transitionClientInput(message.clientMessageId, "started");
+				try {
+					await this.sessionManager.appendAtomically(
+						() => {
+							this.sessionManager.appendPlanningState(input.nextPlanningState!);
+							this._startCommittedClientInputs(input.messages);
+							for (const message of input.messages) {
+								this._persistCommittedDeliveryMessage(message);
+							}
+						},
+						() => {
+							this._publishCommittedPlanningState(input.nextPlanningState!);
+							planningPublished = true;
+						},
+					);
 					committedEffect = true;
-					boundaryAppended = true;
+				} catch (error) {
+					if (error instanceof SessionAtomicAppendError && error.effect !== "rolled_back") {
+						committedEffect = true;
+					}
+					throw error;
 				}
+			} else {
+				const boundaryAppended = this._startCommittedClientInputs(input.messages);
+				if (boundaryAppended) {
+					committedEffect = true;
+					await this.sessionManager.flush();
+				}
+				for (const message of input.messages) {
+					this._persistCommittedDeliveryMessage(message);
+					committedEffect = true;
+				}
+				await this.sessionManager.flush();
 			}
-			if (boundaryAppended) await this.sessionManager.flush();
 
-			for (const message of input.messages) {
-				this._persistCommittedDeliveryMessage(message);
-				committedEffect = true;
-			}
-			await this.sessionManager.flush();
-
-			if (input.nextPlanningState) {
+			if (input.nextPlanningState && !planningPublished) {
 				this._publishCommittedPlanningState(input.nextPlanningState);
 			}
 			this._finishCommittedQueueEntries(input.queueEntries);
@@ -1334,7 +1367,7 @@ export class AgentSession {
 					this._completeLiveClientInput(message.clientMessageId, "admitted");
 				}
 			}
-			this._preparedDeliveryExtensions.delete(input.deliveryId);
+			this._completePreparedDelivery(input.deliveryId);
 			return { outcome: "committed" };
 		} catch (error) {
 			const settlementError = error instanceof Error ? error : new Error(String(error));
@@ -1342,7 +1375,7 @@ export class AgentSession {
 				return await this._settleRetainedDirectInput(input.messages, settlementError);
 			}
 			const terminalError = await this._terminallyFailDelivery(input.messages, input.queueEntries, settlementError);
-			this._preparedDeliveryExtensions.delete(input.deliveryId);
+			this._completePreparedDelivery(input.deliveryId);
 			return { outcome: "terminally_failed", error: terminalError };
 		}
 	}
@@ -1396,6 +1429,18 @@ export class AgentSession {
 		}
 		this._finishCommittedQueueEntries(queueEntries);
 		return terminalError;
+	}
+
+	private _startCommittedClientInputs(messages: readonly AgentMessage[]): boolean {
+		let appended = false;
+		for (const message of messages) {
+			if (message.role !== "user" || message.clientMessageId === undefined) continue;
+			const record = this.sessionManager.getClientInput(message.clientMessageId);
+			if (record?.state !== "accepted") continue;
+			this.sessionManager.transitionClientInput(message.clientMessageId, "started");
+			appended = true;
+		}
+		return appended;
 	}
 
 	private _persistCommittedDeliveryMessage(message: AgentMessage): void {
@@ -2017,6 +2062,7 @@ export class AgentSession {
 			this._clearAgentQueues();
 			this._preparingDeliveryExtensions.clear();
 			this._preparedDeliveryExtensions.clear();
+			this._readyPlanTransitionDeliveryId = undefined;
 			this._lspManager?.dispose();
 			this._unsubscribeMcpManager?.();
 			this._unsubscribeMcpManager = undefined;

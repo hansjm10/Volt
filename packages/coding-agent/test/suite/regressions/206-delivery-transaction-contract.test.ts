@@ -307,18 +307,17 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		await createReadyPlan(harness);
 		harness.setResponses([fauxAssistantMessage("must remain unused")]);
 		const clientMessageId = "contract-abort-during-durability";
-		const canonicalFlushStarted = deferred();
-		const releaseCanonicalFlush = deferred();
-		const originalFlush = harness.sessionManager.flush.bind(harness.sessionManager);
-		let gatedCanonicalFlush = false;
-		vi.spyOn(harness.sessionManager, "flush").mockImplementation(() => {
-			const watermark = originalFlush();
-			if (!gatedCanonicalFlush && harness.sessionManager.getClientInput(clientMessageId)?.state === "completed") {
-				gatedCanonicalFlush = true;
-				canonicalFlushStarted.resolve();
-				return watermark.then(() => releaseCanonicalFlush.promise);
+		const canonicalCommitStarted = deferred();
+		const releaseCanonicalCommit = deferred();
+		const originalAppendAtomically = harness.sessionManager.appendAtomically.bind(harness.sessionManager);
+		let gatedCanonicalCommit = false;
+		vi.spyOn(harness.sessionManager, "appendAtomically").mockImplementation(async (append, beforePublish) => {
+			await originalAppendAtomically(append, beforePublish);
+			if (!gatedCanonicalCommit) {
+				gatedCanonicalCommit = true;
+				canonicalCommitStarted.resolve();
+				await releaseCanonicalCommit.promise;
 			}
-			return watermark;
 		});
 		const preflightResults: PromptPreflightResult[] = [];
 
@@ -327,10 +326,10 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 			source: "rpc",
 			preflightResult: (result) => preflightResults.push(result),
 		});
-		await canonicalFlushStarted.promise;
+		await canonicalCommitStarted.promise;
 		const abort = harness.session.abort("remote_request");
 		expect(preflightResults).toEqual([]);
-		releaseCanonicalFlush.resolve();
+		releaseCanonicalCommit.resolve();
 		await Promise.all([prompt, abort]);
 
 		expect(preflightResults).toEqual([{ success: true, outcome: "admitted" }]);
