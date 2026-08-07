@@ -194,6 +194,39 @@ describe("native planning state", () => {
 		session.dispose();
 	});
 
+	it("presents Plan mode as an actively refined working draft", async () => {
+		const { session } = await createPlanningSession();
+		const policy = session.state.systemPrompt;
+		const toolNames = session.state.tools.map((tool) => tool.name);
+		const updatePlanTool = session.state.tools.find((tool) => tool.name === "update_plan");
+
+		expect(policy).toContain("Research before finalizing, not before drafting.");
+		expect(policy).toContain("create an initial working draft with update_plan");
+		expect(policy).toContain("revise the draft whenever evidence materially changes");
+		expect(policy).toContain("Do not update it mechanically after every read.");
+		expect(policy).toContain("update_plan: Create or refine the working plan as research changes understanding");
+		expect(updatePlanTool?.description).toContain("current working draft");
+
+		const initial = session.updatePlan({
+			title: "Working plan",
+			summary: "Initial orientation identified the plan-mode policy and tool contract.",
+			steps: [{ text: "Revise the model-facing planning policy" }, { text: "Verify draft behavior" }],
+		});
+		const refined = session.updatePlan({
+			planId: initial.id,
+			expectedRevision: initial.revision,
+			title: initial.title,
+			summary: "Further research confirmed that draft revisions preserve the provider prompt and tool surface.",
+			steps: initial.steps.map((step) => ({ id: step.id, text: step.text })),
+		});
+
+		expect(refined.revision).toBe(initial.revision + 1);
+		expect(refined.steps.map((step) => step.id)).toEqual(initial.steps.map((step) => step.id));
+		expect(session.state.systemPrompt).toBe(policy);
+		expect(session.state.tools.map((tool) => tool.name)).toEqual(toolNames);
+		await session.dispose();
+	});
+
 	it.each(["steer", "followUp"] as const)(
 		"returns queued %s feedback to draft and preserves same-generation research",
 		async (streamingBehavior) => {

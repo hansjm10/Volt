@@ -21,7 +21,7 @@ import { getTextOutput } from "./render-utils.ts";
 const planStepInputSchema = Type.Object(
 	{
 		id: Type.Optional(Type.String({ description: "Existing canonical step id; omit for a new step" })),
-		text: Type.String({ description: "Concrete implementation step" }),
+		text: Type.String({ description: "Current candidate implementation step; refine it as research changes" }),
 	},
 	{ additionalProperties: false },
 );
@@ -30,8 +30,13 @@ const updatePlanSchema = Type.Object(
 	{
 		planId: Type.Optional(Type.String({ description: "Current canonical plan id" })),
 		expectedRevision: Type.Optional(Type.Integer({ minimum: 0 })),
-		title: Type.Optional(Type.String()),
-		summary: Type.Optional(Type.String()),
+		title: Type.Optional(Type.String({ description: "Concise working title for the current direction" })),
+		summary: Type.Optional(
+			Type.String({
+				description:
+					"Concise rolling synthesis of findings, constraints, decisions, assumptions, and unresolved questions",
+			}),
+		),
 		steps: Type.Array(planStepInputSchema, { maxItems: 64 }),
 	},
 	{ additionalProperties: false },
@@ -313,8 +318,8 @@ export function createPlanningToolDefinitions(
 			name: "update_plan",
 			label: "update plan",
 			description:
-				"Create or completely replace the ordered implementation checklist while planning. Use canonical step ids when retaining unchanged steps. Approved execution scope cannot be changed with this tool.",
-			promptSnippet: "Create or replace the draft implementation checklist",
+				"Create or replace the current working draft while planning. Start after an initial orientation, keep the summary as a concise rolling synthesis, and refine the candidate implementation steps whenever material evidence changes the approach. Use canonical step ids when retaining unchanged steps. Approved execution scope cannot be changed with this tool.",
+			promptSnippet: "Create or refine the working plan as research changes understanding",
 			parameters: updatePlanSchema,
 			renderCall(args, currentTheme, context) {
 				return renderPlanningCall(
@@ -349,7 +354,7 @@ export function createPlanningToolDefinitions(
 			name: "submit_plan",
 			label: "submit plan",
 			description:
-				"Submit a researched, decision-complete draft for user approval. Requires the exact canonical plan id and revision plus a non-empty title and summary. This ends the planning run.",
+				"Finalize and submit a researched, decision-complete working draft for user approval. Resolve discoverable facts, remove investigation-only steps, and provide the exact canonical plan id and revision plus a non-empty title and summary. This ends the planning run.",
 			promptSnippet: "Submit a researched, decision-complete plan for user approval",
 			parameters: submitPlanSchema,
 			renderCall(args, currentTheme, context) {
