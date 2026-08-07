@@ -539,6 +539,7 @@ describe("InteractiveMode plan pane integration", () => {
 					listener = next;
 					return () => undefined;
 				}),
+				isOverlayFocused: () => false,
 			},
 			planPaneInputUnsubscribe: undefined,
 			togglePlanPaneFocus,
@@ -573,6 +574,104 @@ describe("InteractiveMode plan pane integration", () => {
 			await flushTui(ui, terminal);
 			expect(togglePlanPaneFocus).toHaveBeenCalledTimes(1);
 			expect(extensionEditor.inputs).toEqual([]);
+		} finally {
+			ui.stop();
+		}
+	});
+
+	test("leaves the pane shortcut and ready autofocus with a focused overlay", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TUI(terminal);
+		const editor = new TestFocusableComponent("EDITOR");
+		const inspector = new TestFocusableComponent("PLAN_INSPECTOR");
+		const overlay = new TestFocusableComponent("CAPTURING_OVERLAY");
+		const root = new Container();
+		root.addChild(editor);
+		root.addChild(inspector);
+		ui.addChild(root);
+		ui.setFocus(editor);
+		const togglePlanPaneFocus = vi.fn();
+		const fakeThis = {
+			mainViewVisible: true,
+			keybindings: new KeybindingsManager({ "app.plan.togglePane": "alt+x" }),
+			ui,
+			planPaneInputUnsubscribe: undefined,
+			togglePlanPaneFocus,
+			mainView: { isSplit: () => true },
+			planInspector: inspector,
+			planPaneReturnFocus: undefined,
+			getConversationFocusTarget: () => editor,
+		};
+		(
+			InteractiveMode as unknown as {
+				prototype: {
+					setupPlanPaneInputRouting: (this: typeof fakeThis) => void;
+					focusPlanInspector: (this: typeof fakeThis) => void;
+				};
+			}
+		).prototype.setupPlanPaneInputRouting.call(fakeThis);
+		ui.showOverlay(overlay);
+		ui.start();
+		try {
+			terminal.sendInput("\x1bx");
+			await flushTui(ui, terminal);
+			expect(togglePlanPaneFocus).not.toHaveBeenCalled();
+			expect(overlay.inputs).toEqual(["\x1bx"]);
+
+			(
+				InteractiveMode as unknown as {
+					prototype: { focusPlanInspector: (this: typeof fakeThis) => void };
+				}
+			).prototype.focusPlanInspector.call(fakeThis);
+			expect(overlay.focused).toBe(true);
+			expect(inspector.focused).toBe(false);
+			terminal.sendInput("\r");
+			await flushTui(ui, terminal);
+			expect(overlay.inputs).toEqual(["\x1bx", "\r"]);
+			expect(inspector.inputs).toEqual([]);
+		} finally {
+			ui.stop();
+		}
+	});
+
+	test("moves focus from compact Plan Details to the inspector when the split appears", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TUI(terminal);
+		const planDetails = new TestFocusableComponent("PLAN_DETAILS");
+		const inspector = new TestFocusableComponent("PLAN_INSPECTOR");
+		const detailsContainer = new Container();
+		detailsContainer.addChild(planDetails);
+		const root = new Container();
+		root.addChild(detailsContainer);
+		root.addChild(inspector);
+		ui.addChild(root);
+		ui.setFocus(planDetails);
+		const fakeThis = {
+			ui,
+			planDetails,
+			planInspector: inspector,
+			closePlanDetails: vi.fn(() => detailsContainer.clear()),
+			focusPlanInspector: vi.fn(() => ui.setFocus(inspector)),
+			focusConversation: vi.fn(),
+			showPlanDetails: vi.fn(),
+			session: { planningState: { mode: "build", plan: { phase: "active" } } },
+		};
+		ui.start();
+		try {
+			(
+				InteractiveMode as unknown as {
+					prototype: {
+						handlePlanSplitChange: (this: typeof fakeThis, split: boolean, preserveScrollback: boolean) => void;
+					};
+				}
+			).prototype.handlePlanSplitChange.call(fakeThis, true, false);
+			terminal.sendInput("x");
+			await flushTui(ui, terminal);
+			expect(detailsContainer.children).toEqual([]);
+			expect(planDetails.focused).toBe(false);
+			expect(inspector.focused).toBe(true);
+			expect(planDetails.inputs).toEqual([]);
+			expect(inspector.inputs).toEqual(["x"]);
 		} finally {
 			ui.stop();
 		}

@@ -313,6 +313,7 @@ export class TUI extends Container {
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	public onDebug?: () => void;
 	private renderRequested = false;
+	private preserveScrollbackOnNextRender = false;
 	private renderTimer: NodeJS.Timeout | undefined;
 	private lastRenderAt = 0;
 	private static readonly MIN_RENDER_INTERVAL_MS = 16;
@@ -641,6 +642,13 @@ export class TUI extends Container {
 		return this.overlayStack.some((o) => this.isOverlayVisible(o));
 	}
 
+	/** Check whether a visible overlay currently owns keyboard focus. */
+	isOverlayFocused(): boolean {
+		return this.overlayStack.some(
+			(entry) => entry.component === this.focusedComponent && this.isOverlayVisible(entry),
+		);
+	}
+
 	/** Check if an overlay entry is currently visible */
 	private isOverlayVisible(entry: OverlayStackEntry): boolean {
 		if (entry.hidden) return false;
@@ -719,6 +727,14 @@ export class TUI extends Container {
 
 		this.terminal.showCursor();
 		this.terminal.stop();
+	}
+
+	/**
+	 * Repaint only the active viewport on the next render while preserving terminal scrollback.
+	 * The caller must request that render separately.
+	 */
+	resetViewportOnNextRender(): void {
+		this.preserveScrollbackOnNextRender = true;
 	}
 
 	requestRender(force = false): void {
@@ -1293,16 +1309,17 @@ export class TUI extends Container {
 
 		newLines = this.applyLineResets(newLines);
 
-		// Helper to clear scrollback and viewport and render all new lines
-		const fullRender = (clear: boolean): void => {
+		// Helper to clear and repaint either all logical lines or only the active viewport.
+		const fullRender = (clear: boolean, preserveScrollback = false): void => {
 			this.fullRedrawCount += 1;
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
 			if (clear) {
-				buffer += this.deleteKittyImages(this.previousKittyImageIds);
-				buffer += "\x1b[2J\x1b[H\x1b[3J"; // Clear screen, home, then clear scrollback
+				if (!preserveScrollback) buffer += this.deleteKittyImages(this.previousKittyImageIds);
+				buffer += preserveScrollback ? "\x1b[2J\x1b[H" : "\x1b[2J\x1b[H\x1b[3J";
 			}
-			for (let i = 0; i < newLines.length; i++) {
-				if (i > 0) buffer += "\r\n";
+			const renderStart = preserveScrollback ? Math.max(0, newLines.length - height) : 0;
+			for (let i = renderStart; i < newLines.length; i++) {
+				if (i > renderStart) buffer += "\r\n";
 				const line = newLines[i];
 				if (line === undefined) continue;
 				const isImage = isImageLine(line);
@@ -1346,10 +1363,19 @@ export class TUI extends Container {
 			fs.appendFileSync(logPath, msg);
 		};
 
+		const resetViewport = this.preserveScrollbackOnNextRender;
+		this.preserveScrollbackOnNextRender = false;
+
 		// First render - just output everything without clearing (assumes clean screen)
 		if (this.previousLines.length === 0 && !widthChanged && !heightChanged) {
 			logRedraw("first render");
 			fullRender(false);
+			return;
+		}
+
+		if (resetViewport && !widthChanged && !heightChanged) {
+			logRedraw("requested viewport reset preserving scrollback");
+			fullRender(true, true);
 			return;
 		}
 

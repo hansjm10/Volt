@@ -85,6 +85,15 @@ function getBufferPosition(terminal: VirtualTerminal): { baseY: number; viewport
 	};
 }
 
+function getBufferText(terminal: VirtualTerminal): string {
+	const xterm = (terminal as unknown as { xterm: XtermTerminalType }).xterm;
+	const buffer = xterm.buffer.active;
+	return Array.from(
+		{ length: buffer.length },
+		(_, index) => buffer.getLine(index)?.translateToString(true) ?? "",
+	).join("\n");
+}
+
 function scrollToLine(terminal: VirtualTerminal, line: number): void {
 	const xterm = (terminal as unknown as { xterm: XtermTerminalType }).xterm;
 	xterm.scrollToLine(line);
@@ -588,6 +597,45 @@ describe("TUI content shrinkage", () => {
 });
 
 describe("TUI differential rendering", () => {
+	it("resets the active viewport without clearing existing scrollback", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		terminal.write("SHELL_SENTINEL\r\n");
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		component.lines = Array.from({ length: 30 }, (_, index) => `Old line ${index}`);
+		tui.addChild(component);
+		tui.start();
+		await terminal.waitForRender();
+		assert.ok(getBufferText(terminal).includes("SHELL_SENTINEL"));
+		terminal.clearWrites();
+
+		component.lines = Array.from({ length: 45 }, (_, index) => `New line ${index}`);
+		tui.resetViewportOnNextRender();
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		assert.ok(terminal.getWrites().includes("\x1b[2J\x1b[H"), "viewport reset should clear the active screen");
+		assert.ok(!terminal.getWrites().includes("\x1b[3J"), "viewport reset must not clear scrollback");
+		assert.ok(getBufferText(terminal).includes("SHELL_SENTINEL"), "preexisting scrollback should remain available");
+		assert.deepStrictEqual(
+			terminal.getViewport(),
+			Array.from({ length: 10 }, (_, index) => `New line ${index + 35}`),
+		);
+
+		component.lines[44] = "Updated new line 44";
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport().at(-1), "Updated new line 44");
+
+		component.lines.push("New line 45");
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport().at(-1), "New line 45");
+		assert.ok(getBufferText(terminal).includes("SHELL_SENTINEL"));
+
+		tui.stop();
+	});
+
 	it("reports logical render work separately from terminal output", async () => {
 		const terminal = new LoggingVirtualTerminal(40, 10);
 		const tui = new TUI(terminal);

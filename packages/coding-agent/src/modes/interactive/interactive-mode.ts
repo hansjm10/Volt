@@ -644,7 +644,7 @@ export class InteractiveMode {
 			inspector: this.planInspector,
 			footer: this.footer,
 			getTerminalRows: () => this.ui.terminal.rows,
-			onSplitChange: (split) => this.handlePlanSplitChange(split),
+			onSplitChange: (split, preserveScrollback) => this.handlePlanSplitChange(split, preserveScrollback),
 		});
 
 		// Load hide thinking block setting
@@ -3305,7 +3305,11 @@ export class InteractiveMode {
 	private setupPlanPaneInputRouting(): void {
 		this.planPaneInputUnsubscribe?.();
 		this.planPaneInputUnsubscribe = this.ui.addInputListener((data) => {
-			if (!this.mainViewVisible || !this.keybindings.matches(data, "app.plan.togglePane")) {
+			if (
+				!this.mainViewVisible ||
+				this.ui.isOverlayFocused() ||
+				!this.keybindings.matches(data, "app.plan.togglePane")
+			) {
 				return undefined;
 			}
 			this.togglePlanPaneFocus();
@@ -4707,7 +4711,13 @@ export class InteractiveMode {
 	}
 
 	private focusPlanInspector(): void {
-		if (!this.mainViewVisible || !this.mainView.isSplit(this.ui.terminal.columns, this.ui.terminal.rows)) return;
+		if (
+			!this.mainViewVisible ||
+			this.ui.isOverlayFocused() ||
+			!this.mainView.isSplit(this.ui.terminal.columns, this.ui.terminal.rows)
+		) {
+			return;
+		}
 		if (!this.planInspector.focused) {
 			this.planPaneReturnFocus = this.getConversationFocusTarget();
 			this.ui.setFocus(this.planInspector);
@@ -4734,10 +4744,12 @@ export class InteractiveMode {
 		}
 	}
 
-	private handlePlanSplitChange(split: boolean): void {
+	private handlePlanSplitChange(split: boolean, preserveScrollback: boolean): void {
+		if (preserveScrollback) this.ui.resetViewportOnNextRender();
 		if (split) {
-			if (this.planDetails) this.closePlanDetails({ focusConversation: false });
-			if (this.session.planningState.plan?.phase === "ready") this.focusPlanInspector();
+			const hadPlanDetails = this.planDetails !== undefined;
+			if (hadPlanDetails) this.closePlanDetails({ focusConversation: false });
+			if (hadPlanDetails || this.session.planningState.plan?.phase === "ready") this.focusPlanInspector();
 			return;
 		}
 		if (this.planInspector.focused) this.focusConversation();

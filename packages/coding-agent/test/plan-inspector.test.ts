@@ -109,11 +109,36 @@ describe("PlanInspectorComponent", () => {
 		inspector.render(60);
 		inspector.handleInput("\r");
 		inspector.handleInput("\x1b[C");
+		inspector.render(60);
 		inspector.handleInput("\r");
 		inspector.handleInput("\x1b[C");
+		inspector.render(60);
 		inspector.handleInput("\r");
 		expect(actions).toEqual(["retain_context", "new_session", "change"]);
 		expect(state.plan?.phase).toBe("ready");
+	});
+
+	it("keeps the selected ready action visible before accepting confirmation", () => {
+		const actions: PlanDetailsAction[] = [];
+		const inspector = createInspector(planning("ready"), { actions });
+		inspector.setViewportRows(7);
+		let output = text(inspector, 48);
+		expect(output).toContain("> Execute Plan");
+		inspector.handleInput("\r");
+		expect(actions).toEqual(["retain_context"]);
+
+		inspector.handleInput("\x1b[C");
+		inspector.handleInput("\r");
+		expect(actions).toEqual(["retain_context"]);
+		output = text(inspector, 48);
+		expect(output).toContain("> Execute Plan & Clear Context");
+		inspector.handleInput("\r");
+		expect(actions).toEqual(["retain_context", "new_session"]);
+
+		inspector.setViewportRows(3);
+		text(inspector, 48);
+		inspector.handleInput("\r");
+		expect(actions).toEqual(["retain_context", "new_session"]);
 	});
 
 	it("scrolls long wrapped content and reports page position", () => {

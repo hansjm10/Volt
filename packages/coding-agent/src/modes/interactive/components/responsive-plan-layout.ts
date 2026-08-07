@@ -107,8 +107,10 @@ export class ResponsivePlanLayoutComponent extends Container {
 	private readonly compactComponents: readonly Component[];
 	private readonly inspector: PlanInspectorComponent;
 	private readonly getTerminalRows: () => number;
-	private readonly onSplitChange: (split: boolean) => void;
+	private readonly onSplitChange: (split: boolean, preserveScrollback: boolean) => void;
 	private lastSplit: boolean | undefined;
+	private lastWidth: number | undefined;
+	private lastRows: number | undefined;
 
 	constructor(options: {
 		planning: PlanningState;
@@ -118,7 +120,7 @@ export class ResponsivePlanLayoutComponent extends Container {
 		inspector: PlanInspectorComponent;
 		footer: Component;
 		getTerminalRows: () => number;
-		onSplitChange: (split: boolean) => void;
+		onSplitChange: (split: boolean, preserveScrollback: boolean) => void;
 	}) {
 		super();
 		this.planning = options.planning;
@@ -151,9 +153,11 @@ export class ResponsivePlanLayoutComponent extends Container {
 		const dimensions = getResponsivePlanDimensions(width, rows, this.planning);
 		const split = dimensions !== undefined;
 		if (this.lastSplit !== undefined && this.lastSplit !== split) {
-			this.onSplitChange(split);
+			this.onSplitChange(split, this.lastWidth === width && this.lastRows === rows);
 		}
 		this.lastSplit = split;
+		this.lastWidth = width;
+		this.lastRows = rows;
 		const footerLines = this.footer.render(width);
 		if (!dimensions) {
 			return [...renderComponents(this.compactComponents, width), ...footerLines];

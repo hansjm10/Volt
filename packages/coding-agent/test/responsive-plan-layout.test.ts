@@ -5,6 +5,7 @@ import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { PlanningState, PlanState } from "../src/core/planning.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
 import { PlanInspectorComponent } from "../src/modes/interactive/components/plan-inspector.ts";
+import type { PlanDetailsAction } from "../src/modes/interactive/components/plan-status.ts";
 import {
 	getResponsivePlanDimensions,
 	ResponsivePlanLayoutComponent,
@@ -69,6 +70,7 @@ function createLayout(options: {
 	controls?: LinesComponent[];
 	compact?: LinesComponent[];
 	footer?: Component;
+	actions?: PlanDetailsAction[];
 }) {
 	let rows = options.rows;
 	const planning = options.planning ?? { mode: "build", plan: plan() };
@@ -77,12 +79,13 @@ function createLayout(options: {
 	const compact = options.compact ?? [transcript, ...controls];
 	const inspector = new PlanInspectorComponent({
 		planning,
-		onAction: () => undefined,
+		onAction: (action) => options.actions?.push(action),
 		onReturnFocus: () => undefined,
 		onToggleFocus: () => undefined,
 		requestRender: () => undefined,
 	});
 	const splitChanges: boolean[] = [];
+	const preserveScrollbackChanges: boolean[] = [];
 	const layout = new ResponsivePlanLayoutComponent({
 		planning,
 		transcriptComponents: [transcript],
@@ -91,7 +94,10 @@ function createLayout(options: {
 		inspector,
 		footer: options.footer ?? new FullWidthFooter(),
 		getTerminalRows: () => rows,
-		onSplitChange: (split) => splitChanges.push(split),
+		onSplitChange: (split, preserveScrollback) => {
+			splitChanges.push(split);
+			preserveScrollbackChanges.push(preserveScrollback);
+		},
 	});
 	return {
 		layout,
@@ -99,6 +105,7 @@ function createLayout(options: {
 		transcript,
 		controls,
 		splitChanges,
+		preserveScrollbackChanges,
 		setRows: (next: number) => {
 			rows = next;
 		},
@@ -224,6 +231,31 @@ describe("ResponsivePlanLayoutComponent", () => {
 		expect(stripAnsi(rendered[imageIndex + 3] ?? "")).toContain("after");
 	});
 
+	it("keeps the selected ready action visible beside constrained Kitty and iTerm images", () => {
+		const blankImageRows = Array.from({ length: 15 }, () => "");
+		const kittyImage = ["\x1b_Ga=T,f=100,q=2,C=1,c=2,r=16,i=42;AAAA\x1b\\", ...blankImageRows];
+		const iTermImage = [...blankImageRows, "\x1b[15A\x1b]1337;File=inline=1:AAAA\x07"];
+		for (const imageBlock of [kittyImage, iTermImage]) {
+			const transcript = new LinesComponent(["before", ...imageBlock, "after"]);
+			const planning: PlanningState = { mode: "plan", plan: plan("ready") };
+			const controls = [new LinesComponent(["CONTROL_1", "CONTROL_2", "CONTROL_3"])];
+			const actions: PlanDetailsAction[] = [];
+			const { layout, inspector } = createLayout({
+				columns: 129,
+				rows: 24,
+				transcript,
+				planning,
+				controls,
+				actions,
+			});
+			const output = layout.render(129).map(stripAnsi).join("\n");
+			expect(output).toContain("> Execute Plan");
+			expect(output).toContain("CONTROL_3");
+			inspector.handleInput("\r");
+			expect(actions).toEqual(["retain_context"]);
+		}
+	});
+
 	it("keeps the inspector present through streaming-like transcript and plan updates", () => {
 		const transcript = new LinesComponent(["assistant chunk 1"]);
 		const planning: PlanningState = { mode: "build", plan: plan("active") };
@@ -242,13 +274,36 @@ describe("ResponsivePlanLayoutComponent", () => {
 		expect(output).toContain("Remaining work");
 	});
 
-	it("reports responsive resize transitions", () => {
-		const { layout, setRows, splitChanges } = createLayout({ columns: 129, rows: 24 });
+	it("reports resize transitions without requesting state-only scrollback preservation", () => {
+		const { layout, setRows, splitChanges, preserveScrollbackChanges } = createLayout({
+			columns: 129,
+			rows: 24,
+		});
 		layout.render(129);
 		setRows(23);
 		layout.render(129);
 		setRows(24);
 		layout.render(129);
 		expect(splitChanges).toEqual([false, true]);
+		expect(preserveScrollbackChanges).toEqual([false, false]);
+	});
+
+	it("requests scrollback preservation for state-only layout transitions", () => {
+		const initial: PlanningState = { mode: "build", plan: null };
+		const { layout, inspector, splitChanges, preserveScrollbackChanges } = createLayout({
+			columns: 160,
+			rows: 24,
+			planning: initial,
+		});
+		layout.render(160);
+		const splitPlanning: PlanningState = { mode: "plan", plan: null };
+		layout.setPlanning(splitPlanning);
+		inspector.setPlanning(splitPlanning);
+		layout.render(160);
+		layout.setPlanning(initial);
+		inspector.setPlanning(initial);
+		layout.render(160);
+		expect(splitChanges).toEqual([true, false]);
+		expect(preserveScrollbackChanges).toEqual([true, true]);
 	});
 });
