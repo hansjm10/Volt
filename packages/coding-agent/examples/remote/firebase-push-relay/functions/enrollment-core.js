@@ -16,6 +16,7 @@ const MAX_ACTIVE_GRANTS_PER_ENDPOINT = 20;
 const MAX_NEW_HOST_GRANTS_PER_CLIENT_PER_DAY = 10;
 const MAX_RENEWALS_PER_GRANT_PER_HOUR = 6;
 const REQUEST_QUOTA_WINDOW_MS = 60 * 1000;
+const DEFAULT_APP_CHECK_REQUESTS_PER_IP_PER_WINDOW = 30;
 const DEFAULT_REQUESTS_PER_ENDPOINT_PER_WINDOW = 60;
 const DEFAULT_REQUESTS_PER_IP_PER_WINDOW = 300;
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
@@ -28,6 +29,12 @@ const GRANT_GENERATION_DOMAIN = Buffer.from("volt-iroh-enrollment-grant-generati
 function getEnrollmentConfig(env = process.env) {
 	return {
 		relayOrigins: parseRelayOrigins(env.IROH_RELAY_ORIGINS),
+		appCheckRequestsPerIpPerWindow: getBoundedPositiveInteger(
+			env.IROH_ENROLLMENT_APP_CHECK_REQUESTS_PER_IP_PER_MINUTE,
+			1,
+			600,
+			DEFAULT_APP_CHECK_REQUESTS_PER_IP_PER_WINDOW,
+		),
 		requestsPerEndpointPerWindow: getBoundedPositiveInteger(
 			env.IROH_ENROLLMENT_REQUESTS_PER_ENDPOINT_PER_MINUTE,
 			1,
@@ -468,6 +475,7 @@ function isRecord(value) {
 
 module.exports = {
 	CLAIM_TTL_MS,
+	DEFAULT_APP_CHECK_REQUESTS_PER_IP_PER_WINDOW,
 	DEFAULT_RELAY_ORIGIN,
 	DEFAULT_REQUESTS_PER_ENDPOINT_PER_WINDOW,
 	DEFAULT_REQUESTS_PER_IP_PER_WINDOW,

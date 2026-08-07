@@ -13,6 +13,7 @@ const {
 	canonicalRevokeGrantMessage,
 	getGrantGenerationId,
 	getGrantId,
+	getSaltedIpId,
 	hashDecodedSecret,
 } = require("./enrollment-core.js");
 const {
@@ -165,6 +166,7 @@ function createHarness(overrides = {}) {
 	let rejectAppCheck = false;
 	const handler = createIrohEnrollmentHandler({
 		config: {
+			appCheckRequestsPerIpPerWindow: overrides.appCheckRequestsPerIpPerWindow ?? 100,
 			relayOrigins: ["https://iroh-relay-us-central.volt-cli.dev"],
 			requestsPerEndpointPerWindow: overrides.requestsPerEndpointPerWindow || 100,
 			requestsPerIpPerWindow: overrides.requestsPerIpPerWindow || 100,
@@ -242,6 +244,14 @@ async function invoke(handler, path, body, options = {}) {
 
 function endpointAccessPath(endpointId) {
 	return `${ENDPOINT_ACCESS_COLLECTION}/${endpointId}`;
+}
+
+function appCheckIpQuotaPath(ip) {
+	return `${QUOTA_WINDOWS_COLLECTION}/app-check-ip_${getSaltedIpId(ip, "i".repeat(32))}`;
+}
+
+function requestEndpointQuotaPath(endpointId) {
+	return `${QUOTA_WINDOWS_COLLECTION}/request-endpoint_${endpointId}`;
 }
 
 function privateKeyFromSeed(seedHex) {
@@ -703,6 +713,102 @@ test("only the first client and matching phone-generated grant secret can retry 
 	assert.equal(response.status, 409);
 	assert.deepEqual(response.body, { error: "claim_approval_conflict" });
 	assert.equal(harness.firestore.documents.get(`${GRANTS_COLLECTION}/${vector.grantId}`).status, "active");
+});
+
+test("approval charges rejected App Check attempts only to the salted source-IP window", async () => {
+	const harness = createHarness({ appCheckRequestsPerIpPerWindow: 1 });
+	await invoke(harness.handler, "/v1/claims", createBody());
+	const rejectedIp = "198.51.100.10";
+	const invalidSignatureIp = "198.51.100.11";
+	const allowedIp = "198.51.100.12";
+	const endpointQuotaPath = requestEndpointQuotaPath(vector.clientEndpointId);
+
+	harness.setRejectAppCheck(true);
+	let response = await invoke(harness.handler, "/v1/claims/approve", approveBody(), { ip: rejectedIp });
+	assert.equal(response.status, 401);
+	assert.deepEqual(response.body, { error: "app_check_token_replayed" });
+	assert.equal(harness.appCheckCount, 1);
+	assert.equal(harness.firestore.documents.get(appCheckIpQuotaPath(rejectedIp)).count, 1);
+	assert.equal(harness.firestore.documents.has(endpointQuotaPath), false);
+
+	response = await invoke(harness.handler, "/v1/claims/approve", approveBody(), { ip: rejectedIp });
+	assert.equal(response.status, 429);
+	assert.deepEqual(response.body, { error: "app_check_ip_rate_limited" });
+	assert.equal(harness.appCheckCount, 1);
+	assert.equal(harness.firestore.documents.has(endpointQuotaPath), false);
+
+	const invalidSignature = { ...approveBody(), signature: "A".repeat(86) };
+	response = await invoke(harness.handler, "/v1/claims/approve", invalidSignature, { ip: invalidSignatureIp });
+	assert.equal(response.status, 401);
+	assert.deepEqual(response.body, { error: "signature_invalid" });
+	assert.equal(harness.appCheckCount, 1);
+	assert.equal(harness.firestore.documents.has(appCheckIpQuotaPath(invalidSignatureIp)), false);
+	assert.equal(harness.firestore.documents.has(endpointQuotaPath), false);
+
+	harness.setRejectAppCheck(false);
+	response = await invoke(harness.handler, "/v1/claims/approve", approveBody(), { ip: allowedIp });
+	assert.equal(response.status, 200);
+	assert.equal(harness.appCheckCount, 2);
+	assert.equal(harness.firestore.documents.get(appCheckIpQuotaPath(allowedIp)).count, 1);
+	assert.equal(harness.firestore.documents.get(endpointQuotaPath).count, 1);
+	const quotaDocuments = [...harness.firestore.documents.entries()].filter(([path]) =>
+		path.startsWith(`${QUOTA_WINDOWS_COLLECTION}/`),
+	);
+	assert.equal(
+		JSON.stringify(quotaDocuments).includes(rejectedIp) ||
+			JSON.stringify(quotaDocuments).includes(invalidSignatureIp) ||
+			JSON.stringify(quotaDocuments).includes(allowedIp),
+		false,
+	);
+});
+
+test("renewal charges rejected App Check attempts only to the salted source-IP window", async () => {
+	const harness = createHarness({ appCheckRequestsPerIpPerWindow: 1 });
+	await invoke(harness.handler, "/v1/claims", createBody());
+	await invoke(harness.handler, "/v1/claims/approve", approveBody(), { ip: "198.51.100.20" });
+	const rejectedIp = "198.51.100.21";
+	const invalidSignatureIp = "198.51.100.22";
+	const allowedIp = "198.51.100.23";
+	const endpointQuotaPath = requestEndpointQuotaPath(vector.clientEndpointId);
+	assert.equal(harness.firestore.documents.get(endpointQuotaPath).count, 1);
+
+	harness.setRejectAppCheck(true);
+	let response = await invoke(harness.handler, "/v1/grants/renew", renewBody(), { ip: rejectedIp });
+	assert.equal(response.status, 401);
+	assert.deepEqual(response.body, { error: "app_check_token_replayed" });
+	assert.equal(harness.appCheckCount, 2);
+	assert.equal(harness.firestore.documents.get(appCheckIpQuotaPath(rejectedIp)).count, 1);
+	assert.equal(harness.firestore.documents.get(endpointQuotaPath).count, 1);
+
+	response = await invoke(harness.handler, "/v1/grants/renew", renewBody(), { ip: rejectedIp });
+	assert.equal(response.status, 429);
+	assert.deepEqual(response.body, { error: "app_check_ip_rate_limited" });
+	assert.equal(harness.appCheckCount, 2);
+	assert.equal(harness.firestore.documents.get(endpointQuotaPath).count, 1);
+
+	const invalidSignature = { ...renewBody(), signature: "A".repeat(86) };
+	response = await invoke(harness.handler, "/v1/grants/renew", invalidSignature, { ip: invalidSignatureIp });
+	assert.equal(response.status, 401);
+	assert.deepEqual(response.body, { error: "signature_invalid" });
+	assert.equal(harness.appCheckCount, 2);
+	assert.equal(harness.firestore.documents.has(appCheckIpQuotaPath(invalidSignatureIp)), false);
+	assert.equal(harness.firestore.documents.get(endpointQuotaPath).count, 1);
+
+	harness.setRejectAppCheck(false);
+	response = await invoke(harness.handler, "/v1/grants/renew", renewBody(), { ip: allowedIp });
+	assert.equal(response.status, 200);
+	assert.equal(harness.appCheckCount, 3);
+	assert.equal(harness.firestore.documents.get(appCheckIpQuotaPath(allowedIp)).count, 1);
+	assert.equal(harness.firestore.documents.get(endpointQuotaPath).count, 2);
+	const quotaDocuments = [...harness.firestore.documents.entries()].filter(([path]) =>
+		path.startsWith(`${QUOTA_WINDOWS_COLLECTION}/`),
+	);
+	assert.equal(
+		JSON.stringify(quotaDocuments).includes(rejectedIp) ||
+			JSON.stringify(quotaDocuments).includes(invalidSignatureIp) ||
+			JSON.stringify(quotaDocuments).includes(allowedIp),
+		false,
+	);
 });
 
 test("approve and renew consume App Check, and renewal enforces six durable attempts per hour", async () => {

@@ -213,6 +213,32 @@ accept only `POST`, `Content-Type: application/json`, bounded bodies, and exact
 keys. JSON failures use a stable `{ "error": "code" }` body without endpoint
 IDs or secrets.
 
+### Admission and quota ordering
+
+Approval and renewal have this normative order:
+
+1. Parse and bound the JSON request.
+2. Check signature freshness and verify the endpoint signature. Renewal also
+   rejects a non-deterministic `grantId` here.
+3. Reserve one fixed-window `app-check-ip_<HMAC>` slot using the source IP and
+   the deployment's secret IP salt.
+4. Consume the limited-use App Check token and check its app-id allowlist.
+5. Reserve one `request-endpoint_<clientEndpointId>` slot.
+6. Run the existing claim or grant transaction.
+
+Quota reservations are never refunded. A rejected or replayed App Check token
+keeps its source-IP slot but does not create or increment the signed endpoint's
+slot. An invalid endpoint signature consumes neither slot. A state-transaction
+failure after successful App Check keeps both slots. The dedicated source limit
+returns `429 app_check_ip_rate_limited`; the post-App-Check endpoint limit
+retains `429 endpoint_rate_limited`. Raw IP addresses are neither quota document
+IDs nor logged fields.
+
+Routes that do not require App Check retain their atomic generic
+`request-ip_<HMAC>` plus `request-endpoint_<endpointId>` reservation after
+signature validation. This keeps their existing semantics separate from the
+expensive replay-protection admission path.
+
 ### `POST /v1/claims`
 
 Host request:
@@ -313,6 +339,33 @@ relay and edge gateway enforce source-network, connection, and aggregate
 registration limits before broker work. Responses use `Cache-Control: no-store`;
 any positive in-process cache is at most 30 seconds.
 
+## Edge deployment boundary
+
+Production admission requires a global external Application Load Balancer whose
+backend service uses a serverless NEG for `irohEnrollment`. The function's
+`ALLOW_INTERNAL_AND_GCLB` ingress setting must remain in force so ordinary
+Internet clients cannot bypass the load balancer, Cloud Armor, or canonical
+broker hostname through the generated function URL.
+
+Attach a Cloud Armor throttle rule to the enrollment backend service. It keys
+on the load balancer's source IP (`IP`, not client-controlled `XFF_IP`), matches
+`POST /v1/claims/approve` and `POST /v1/grants/renew`, and initially permits 30
+requests per 60 seconds before returning 429. The handler also accepts
+`/irohEnrollment/v1/claims/approve` and `/irohEnrollment/v1/grants/renew`; the
+edge policy must either cover those prefixed paths or reject them before the
+backend. Configure the backend's custom request header as
+`x-forwarded-for:{client_ip_address},{server_ip_address}` so it replaces, rather
+than appends to, any client-supplied `X-Forwarded-For` value. Broker source-IP
+identity must come only from that provider-generated chain.
+
+Enable request logging and deploy the Cloud Armor rule in preview first. Review
+matched paths, source-key distribution, and projected 429s, run the real canary
+gate, then enable enforcement without changing the threshold. Cloud Armor is an
+approximate availability control; the Firestore window is the durable exact
+budget. This repository does not own load-balancer infrastructure, so these are
+operator-managed deployment requirements rather than partially provisioned
+example IaC.
+
 ## Persistence and lifecycle
 
 - Claims expire after 10 minutes and are Firestore-TTL eligible.
@@ -325,8 +378,10 @@ any positive in-process cache is at most 30 seconds.
   documents are TTL eligible at their latest entry expiry, and blocked documents
   remain durable without a TTL.
 - Defaults cap three pending claims per host, twenty active grants per endpoint,
-  ten new host grants per client endpoint per day, six renewals per grant per
-  hour, and durable endpoint-plus-salted-IP request windows.
+  ten new host grants per client endpoint per day, and six renewals per grant
+  per hour. One-minute request windows default to 60 per signed endpoint and
+  300 per salted source IP for generic routes. Approval and renewal additionally
+  use a strict 30-per-salted-IP App Check window before replay protection.
 - If the broker is unavailable, relay registration fails closed. Existing
   paired devices may still connect directly or on the LAN.
 - Forget writes a durable local revocation intent keyed by `grantId` and

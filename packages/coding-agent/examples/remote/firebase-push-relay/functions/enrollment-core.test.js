@@ -3,6 +3,7 @@ const { test } = require("node:test");
 const { RequestError } = require("./core.js");
 const {
 	assertFreshSignature,
+	getEnrollmentConfig,
 	getGrantGenerationId,
 	getGrantId,
 	getRelayEndpointId,
@@ -225,6 +226,28 @@ test("signature validation rejects stale timestamps, altered fields, and the wro
 		401,
 		"signature_invalid",
 	);
+});
+
+test("enrollment quota configuration defaults, overrides, and bounds stay strict", () => {
+	assert.equal(getEnrollmentConfig({}).appCheckRequestsPerIpPerWindow, 30);
+	assert.equal(
+		getEnrollmentConfig({ IROH_ENROLLMENT_APP_CHECK_REQUESTS_PER_IP_PER_MINUTE: "17" })
+			.appCheckRequestsPerIpPerWindow,
+		17,
+	);
+	for (const boundary of ["1", "600"]) {
+		assert.equal(
+			getEnrollmentConfig({ IROH_ENROLLMENT_APP_CHECK_REQUESTS_PER_IP_PER_MINUTE: boundary })
+				.appCheckRequestsPerIpPerWindow,
+			Number(boundary),
+		);
+	}
+	for (const invalid of ["0", "601", "1.5", "invalid"]) {
+		assert.throws(
+			() => getEnrollmentConfig({ IROH_ENROLLMENT_APP_CHECK_REQUESTS_PER_IP_PER_MINUTE: invalid }),
+			/configuration value must be an integer from 1 through 600/,
+		);
+	}
 });
 
 test("relay origins normalize and sort while rejecting non-origin or duplicate configuration", () => {

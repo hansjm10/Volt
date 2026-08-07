@@ -289,8 +289,9 @@ function createIrohEnrollmentHandler(options) {
 		const enrollmentRequest = parseApproveClaimRequest(request);
 		const nowMs = now();
 		assertFreshSignature(enrollmentRequest, "approve_claim", nowMs);
+		await reserveAppCheckIpQuota(request, nowMs);
 		await verifyLimitedUseAppCheck(request);
-		await reserveRequestQuota(request, enrollmentRequest.clientEndpointId, nowMs);
+		await reserveRequestEndpointQuota(enrollmentRequest.clientEndpointId, nowMs);
 		const firestore = getFirestore();
 		const grantId = getGrantId(enrollmentRequest.hostEndpointId, enrollmentRequest.clientEndpointId);
 		const claimRef = firestore.collection(CLAIMS_COLLECTION).doc(enrollmentRequest.claimId);
@@ -445,8 +446,9 @@ function createIrohEnrollmentHandler(options) {
 		const nowMs = now();
 		assertFreshSignature(enrollmentRequest, "renew_grant", nowMs);
 		assertDeterministicGrantId(enrollmentRequest);
+		await reserveAppCheckIpQuota(request, nowMs);
 		await verifyLimitedUseAppCheck(request);
-		await reserveRequestQuota(request, enrollmentRequest.clientEndpointId, nowMs);
+		await reserveRequestEndpointQuota(enrollmentRequest.clientEndpointId, nowMs);
 		const firestore = getFirestore();
 		const grantRef = firestore.collection(GRANTS_COLLECTION).doc(enrollmentRequest.grantId);
 		const hostAccessRef = firestore.collection(ENDPOINT_ACCESS_COLLECTION).doc(enrollmentRequest.hostEndpointId);
@@ -623,6 +625,47 @@ function createIrohEnrollmentHandler(options) {
 					windowStartedAt: timestampFromMillis(window.startedAtMs),
 				});
 			}
+		});
+	}
+
+	async function reserveAppCheckIpQuota(request, nowMs) {
+		const firestore = getFirestore();
+		const ipId = getSaltedIpId(getRequestIp(request), getIpSalt());
+		const quotaRef = firestore.collection(QUOTA_WINDOWS_COLLECTION).doc(`app-check-ip_${ipId}`);
+		await reserveSingleRequestQuota(
+			firestore,
+			quotaRef,
+			nowMs,
+			config.appCheckRequestsPerIpPerWindow,
+			"app_check_ip_rate_limited",
+		);
+	}
+
+	async function reserveRequestEndpointQuota(endpointId, nowMs) {
+		const firestore = getFirestore();
+		const quotaRef = firestore.collection(QUOTA_WINDOWS_COLLECTION).doc(`request-endpoint_${endpointId}`);
+		await reserveSingleRequestQuota(
+			firestore,
+			quotaRef,
+			nowMs,
+			config.requestsPerEndpointPerWindow,
+			"endpoint_rate_limited",
+		);
+	}
+
+	async function reserveSingleRequestQuota(firestore, quotaRef, nowMs, limit, limitCode) {
+		await firestore.runTransaction(async (transaction) => {
+			const snapshot = await transaction.get(quotaRef);
+			const window = readRequestWindow(snapshot, nowMs);
+			if (window.count >= limit) {
+				throw new RequestError(429, limitCode);
+			}
+			transaction.set(quotaRef, {
+				count: window.count + 1,
+				expiresAt: timestampFromMillis(window.startedAtMs + 2 * REQUEST_QUOTA_WINDOW_MS),
+				updatedAt: timestampFromMillis(nowMs),
+				windowStartedAt: timestampFromMillis(window.startedAtMs),
+			});
 		});
 	}
 }

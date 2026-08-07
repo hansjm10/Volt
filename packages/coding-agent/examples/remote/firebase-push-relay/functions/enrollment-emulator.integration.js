@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const { after, before, test } = require("node:test");
 const { initializeApp, deleteApp } = require("firebase-admin/app");
 const { Timestamp, getFirestore } = require("firebase-admin/firestore");
+const { getSaltedIpId } = require("./enrollment-core.js");
 const { createIrohEnrollmentHandler } = require("./enrollment-handler.js");
 const vector = require("../../../../test/fixtures/iroh-relay-enrollment-v1-vectors.json");
 
@@ -12,6 +13,8 @@ if (!process.env.FIRESTORE_EMULATOR_HOST) {
 const projectId = process.env.GCLOUD_PROJECT || "demo-volt-iroh-enrollment";
 const app = initializeApp({ projectId }, `iroh-enrollment-emulator-${process.pid}`);
 const firestore = getFirestore(app, "volt-iroh-enrollment");
+const ipSalt = "emulator-ip-salt-0123456789abcdef";
+const requestIp = "203.0.113.9";
 const collections = [
 	"voltIrohEnrollmentClaims",
 	"voltIrohEnrollmentGrants",
@@ -21,12 +24,13 @@ const collections = [
 
 const handler = createIrohEnrollmentHandler({
 	config: {
+		appCheckRequestsPerIpPerWindow: 100,
 		relayOrigins: ["https://iroh-relay-us-central.volt-cli.dev"],
 		requestsPerEndpointPerWindow: 100,
 		requestsPerIpPerWindow: 100,
 	},
 	getFirestore: () => firestore,
-	getIpSalt: () => "emulator-ip-salt-0123456789abcdef",
+	getIpSalt: () => ipSalt,
 	getRelayAccessSecrets: () => ["c".repeat(32), "n".repeat(32)],
 	logError: () => {},
 	logEvent: () => {},
@@ -109,7 +113,7 @@ async function invoke(path, body, headers = {}) {
 				...(body === undefined ? {} : { "content-type": "application/json" }),
 				...headers,
 			},
-			ip: "203.0.113.9",
+			ip: requestIp,
 			method: "POST",
 			path,
 		},
@@ -155,6 +159,20 @@ test("real Firestore transactions preserve generation-scoped symmetric revocatio
 		approvals.map((item) => item.body.grantGenerationId),
 		[vector.grantGenerationId, vector.grantGenerationId],
 	);
+	const appCheckIpQuota = (
+		await firestore
+			.collection("voltIrohEnrollmentQuotaWindows")
+			.doc(`app-check-ip_${getSaltedIpId(requestIp, ipSalt)}`)
+			.get()
+	).data();
+	assert.equal(appCheckIpQuota.count, 2);
+	const endpointQuota = (
+		await firestore
+			.collection("voltIrohEnrollmentQuotaWindows")
+			.doc(`request-endpoint_${vector.clientEndpointId}`)
+			.get()
+	).data();
+	assert.equal(endpointQuota.count, 2);
 
 	for (const endpointId of [vector.hostEndpointId, vector.clientEndpointId]) {
 		const access = (await firestore.collection("voltIrohEndpointAccess").doc(endpointId).get()).data();
