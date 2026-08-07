@@ -68,7 +68,13 @@ jobs:
         timeout-minutes: 10
         run: |
           npm --prefix packages/coding-agent/examples/remote/firebase-push-relay/functions ci --ignore-scripts
-          npm --prefix packages/coding-agent/examples/remote/firebase-push-relay/functions run test:emulator
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            https://github.com/firebase/firebase-tools/releases/download/v15.26.0/firebase-tools-linux \
+            --output /tmp/firebase-tools
+          echo 'd6eb340cb4f06dcf5a3015ff588d826ab3bdce75b25855a25866af182417afe7  /tmp/firebase-tools' | sha256sum --check
+          chmod +x /tmp/firebase-tools
+          cd packages/coding-agent/examples/remote/firebase-push-relay/functions
+          /tmp/firebase-tools emulators:exec --config ../firebase.json --project demo-volt-iroh-enrollment --only firestore "node --test enrollment-emulator.integration.js"
 
   test-windows:
     runs-on: windows-latest

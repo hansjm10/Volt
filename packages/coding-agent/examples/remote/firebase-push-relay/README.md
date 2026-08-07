@@ -119,7 +119,7 @@ npm ci
 npm run test:emulator
 ```
 
-The test refuses to run without `FIRESTORE_EMULATOR_HOST`, uses a `demo-*` project, and verifies real transactional create/approve/idempotency/revoke behavior plus both endpoint access maps. `firebase-tools` is an exact, lockfile-managed development dependency. The normal `npm test` suite remains fast and uses isolated adapters for strict-schema, signature, App Check, quota, and failure-path coverage.
+The test refuses to run without `FIRESTORE_EMULATOR_HOST`, uses a `demo-*` project, and verifies real transactional create/approve/idempotency/revoke behavior plus both endpoint access maps. The local script pins the Firebase CLI version and disables lifecycle scripts; CI instead verifies the published standalone CLI checksum before execution. The normal `npm test` suite remains fast and uses isolated adapters for strict-schema, signature, App Check, quota, and failure-path coverage.
 
 ## Real App Check canary
 
