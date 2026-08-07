@@ -77,17 +77,24 @@ run_fixture managed \
 managed="$tmp/managed/payloads"
 config_file=$(grep -l '^\[access\.http\]$' "$tmp/managed"/stdin.* | head -1)
 [[ -n "$config_file" ]] || fail "managed relay config was not written"
-grep -q '^url = "https://us-central1-volt-3fae7.cloudfunctions.net/irohEnrollment/v1/relay-access"$' "$config_file" || fail "access.http URL missing"
+grep -q '^url = "http://127.0.0.1:9081/v1/relay-access"$' "$config_file" || fail "loopback access.http URL missing"
+proxy_file=$(grep -l '^UPSTREAM_URL = ($' "$tmp/managed"/stdin.* | head -1)
+[[ -n "$proxy_file" ]] || fail "managed callback framing proxy was not installed"
+grep -q 'us-central1-volt-3fae7.cloudfunctions.net/' "$proxy_file" || fail "proxy fixed upstream missing"
+python3 -m py_compile "$proxy_file" || fail "managed callback framing proxy has invalid syntax"
 grep -q 'sha256sum --check --strict' "$tmp/managed"/command.* || fail "release checksum verification missing"
 grep -q 'ad7de882c4825a851b38869a3f1622b674cb65f344304e432f862ddf72d6b39a' "$tmp/managed"/command.* || fail "x86_64 release checksum missing"
 ! grep -q 'bearer_token\|shared_token' "$config_file" || fail "relay TOML contains a bearer or shared token"
 grep -q 'LoadCredential=iroh-relay-http-bearer-token:/etc/iroh-relay/backend-token' "$managed" || fail "systemd credential loading missing"
+grep -q '^Requires=iroh-relay-egress.service iroh-relay-access-proxy.service$' "$managed" || fail "relay does not require callback framing proxy"
+grep -q '^ExecStart=/usr/bin/python3 -I /usr/local/libexec/iroh-relay-access-proxy.py$' "$managed" || fail "callback framing proxy service missing"
 ! grep -q '^accept_conn_' "$config_file" || fail "unimplemented connection limits must not be configured"
 grep -q '^LimitNOFILE=16384$' "$managed" || fail "file descriptor ceiling missing"
 grep -q '^MemoryMax=768M$' "$managed" || fail "memory ceiling missing"
 grep -q 'limit rate over 67108864 bytes/second burst 134217728 bytes' "$managed" || fail "nftables egress ceiling missing"
 grep -q 'IROH_RELAY_HTTP_BEARER_TOKEN' "$managed" || fail "relay environment handoff missing"
 grep -q 'backend-health' "$managed" || fail "backend health probe missing"
+grep -q -- "--url 'http://127.0.0.1:9081/v1/relay-access'" "$managed" || fail "health check does not exercise callback framing proxy"
 grep -q 'egress-pressure' "$managed" || fail "egress alert transition missing"
 for payload in "$tmp/managed"/stdin.*; do
 	if [[ $(head -1 "$payload") == '#!/usr/bin/env bash' ]]; then
@@ -101,5 +108,6 @@ custom_config=$(grep -l '^access = "everyone"$' "$tmp/custom"/stdin.* | head -1)
 [[ -n "$custom_config" ]] || fail "explicit custom-open config was not written"
 ! grep -q '^\[access\.http\]$' "$custom_config" || fail "custom relay unexpectedly uses managed backend"
 ! grep -q '^LoadCredential=iroh-relay-http-bearer-token:' "$custom" || fail "custom relay unexpectedly loads backend credential"
+! grep -q '^ExecStart=/usr/bin/python3 -I /usr/local/libexec/iroh-relay-access-proxy.py$' "$custom" || fail "custom relay unexpectedly installs callback framing proxy"
 
 echo "deploy-iroh-relay fixtures passed"

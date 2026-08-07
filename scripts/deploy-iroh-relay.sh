@@ -4,8 +4,9 @@
 # restarts the service. See docs/self-hosted-relay.md for the operator runbook.
 #
 # Prereqs: root SSH access; DNS A record for HOSTNAME; nftables installed and
-# usable. Managed relays also require a pre-provisioned root-owned bearer-token
-# file on the server. The token is never accepted on this script's command line.
+# usable. Managed relays also require Python 3.10+ and a pre-provisioned
+# root-owned bearer-token file on the server. The token is never accepted on
+# this script's command line.
 #
 # Usage:
 #   scripts/deploy-iroh-relay.sh <ssh-target> <hostname> <access-mode> [options]
@@ -34,6 +35,9 @@
 set -euo pipefail
 
 VOLT_MANAGED_ACCESS_HTTP_URL="https://us-central1-volt-3fae7.cloudfunctions.net/irohEnrollment/v1/relay-access"
+MANAGED_ACCESS_PROXY_URL="http://127.0.0.1:9081/v1/relay-access"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ACCESS_PROXY_SOURCE="$SCRIPT_DIR/iroh_relay_access_proxy.py"
 
 usage() {
 	printf '%s\n' "usage: deploy-iroh-relay.sh <ssh-target> <hostname> (--access-http-url <url> | --allowlist <ids> | --open) [options]" >&2
@@ -257,7 +261,10 @@ if [[ -n "$ACCESS_HTTP_URL" ]]; then
 		test \"\$(awk 'END { print NR }' \"\$path\")\" -eq 1 || { echo 'backend token file must contain exactly one line' >&2; exit 1; }
 		LC_ALL=C grep -Eq '^[!-~]{32,512}$' \"\$path\" || { echo 'backend token must be 32-512 printable non-space ASCII characters' >&2; exit 1; }
 		systemd_version=\$(systemctl --version | awk 'NR == 1 { print \$2 }')
-		test \"\$systemd_version\" -ge 247 || { echo 'systemd 247 or newer is required for LoadCredential' >&2; exit 1; }"
+		test \"\$systemd_version\" -ge 247 || { echo 'systemd 247 or newer is required for LoadCredential' >&2; exit 1; }
+		command -v python3 >/dev/null || { echo 'Python 3.10 or newer is required for managed access HTTP framing' >&2; exit 1; }
+		python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' || { echo 'Python 3.10 or newer is required for managed access HTTP framing' >&2; exit 1; }"
+	test -f "$ACCESS_PROXY_SOURCE" || { echo "error: managed access proxy source is missing: $ACCESS_PROXY_SOURCE" >&2; exit 1; }
 fi
 
 # Map server arch to the release artifact. -----------------------------------
@@ -328,10 +335,11 @@ if [[ -n "$CONTACT" ]]; then
 	CONFIG+=$'\n'"contact = \"$CONTACT\""
 fi
 if [[ -n "$ACCESS_HTTP_URL" ]]; then
-	CONFIG+=$'\n\n'"# Authorize endpoint registration with the Volt enrollment backend.
-# The bearer token is supplied only through IROH_RELAY_HTTP_BEARER_TOKEN.
+	CONFIG+=$'\n\n'"# Authorize endpoint registration through the loopback framing proxy.
+# The proxy forwards only to Volt's fixed enrollment backend. The bearer token
+# is supplied only through IROH_RELAY_HTTP_BEARER_TOKEN.
 [access.http]
-url = \"$ACCESS_HTTP_URL\""
+url = \"$MANAGED_ACCESS_PROXY_URL\""
 elif [[ -n "$ALLOWLIST" ]]; then
 	CONFIG+=$'\n\n'"# Owner-maintained endpoint IDs for a custom uncredentialed relay.
 [access]
@@ -372,6 +380,14 @@ if [[ -n "$ACCESS_HTTP_URL" ]]; then
 		trap - EXIT'
 else
 	run 'rm -f /etc/iroh-relay/access-http-url'
+fi
+
+if [[ -n "$ACCESS_HTTP_URL" ]]; then
+	echo "==> installing managed access HTTP framing proxy"
+	run 'install -o root -g root -m 0755 /dev/stdin /usr/local/libexec/iroh-relay-access-proxy.py' <"$ACCESS_PROXY_SOURCE"
+else
+	run 'systemctl disable --now iroh-relay-access-proxy.service 2>/dev/null || true
+		rm -f /etc/systemd/system/iroh-relay-access-proxy.service /usr/local/libexec/iroh-relay-access-proxy.py'
 fi
 
 echo "==> installing service wrappers and health monitor"
@@ -466,7 +482,6 @@ else
 fi
 
 if [[ -f /etc/iroh-relay/access-http-url ]]; then
-	backend_url=$(</etc/iroh-relay/access-http-url)
 	credential_path=${CREDENTIALS_DIRECTORY:-}/iroh-relay-http-bearer-token
 	if [[ -r "$credential_path" ]]; then
 		token=$(<"$credential_path")
@@ -474,14 +489,15 @@ if [[ -f /etc/iroh-relay/access-http-url ]]; then
 		# omitted must reach the backend and return 400. It does not consume a
 		# request quota or create an endpoint record.
 		status=$(printf 'Authorization: Bearer %s\n' "$token" | curl --disable \
-			--silent --output /dev/null --write-out '%{http_code}' --max-time 10 \
-			--request POST --header @- --url "$backend_url" 2>/dev/null || true)
+			--noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --max-time 10 \
+			--request POST --data '' --header @- \
+			--url 'http://127.0.0.1:9081/v1/relay-access' 2>/dev/null || true)
 		unset token
 	else
 		status=missing-credential
 	fi
 	if [[ "$status" == 400 ]]; then
-		transition backend-health ok "authenticated backend probe returned expected status"
+		transition backend-health ok "authenticated callback proxy/backend probe returned expected status"
 	else
 		transition backend-health failed "authenticated backend probe failed"
 		failed=1
@@ -529,16 +545,22 @@ HOOK
 
 RELAY_CREDENTIAL_LINE=""
 HEALTH_CREDENTIAL_LINE=""
+RELAY_PROXY_AFTER=""
+RELAY_PROXY_REQUIRES=""
+HEALTH_PROXY_AFTER=""
 if [[ -n "$ACCESS_HTTP_URL" ]]; then
 	RELAY_CREDENTIAL_LINE="LoadCredential=iroh-relay-http-bearer-token:$ACCESS_HTTP_TOKEN_FILE"
 	HEALTH_CREDENTIAL_LINE="LoadCredential=iroh-relay-http-bearer-token:$ACCESS_HTTP_TOKEN_FILE"
+	RELAY_PROXY_AFTER=" iroh-relay-access-proxy.service"
+	RELAY_PROXY_REQUIRES=" iroh-relay-access-proxy.service"
+	HEALTH_PROXY_AFTER=" iroh-relay-access-proxy.service"
 fi
 
 SYSTEMD_UNIT="[Unit]
 Description=iroh relay
-After=network-online.target iroh-relay-egress.service
+After=network-online.target iroh-relay-egress.service$RELAY_PROXY_AFTER
 Wants=network-online.target
-Requires=iroh-relay-egress.service
+Requires=iroh-relay-egress.service$RELAY_PROXY_REQUIRES
 
 [Service]
 User=iroh-relay
@@ -572,6 +594,45 @@ IPAccounting=true
 WantedBy=multi-user.target"
 printf '%s\n' "$SYSTEMD_UNIT" | run 'cat > /etc/systemd/system/iroh-relay.service'
 
+if [[ -n "$ACCESS_HTTP_URL" ]]; then
+	run 'cat > /etc/systemd/system/iroh-relay-access-proxy.service' <<'PROXY_UNIT'
+[Unit]
+Description=iroh managed relay access HTTP framing proxy
+After=network-online.target
+Wants=network-online.target
+Before=iroh-relay.service
+
+[Service]
+User=iroh-relay
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/iroh-relay-access-proxy.py
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=
+Restart=always
+RestartSec=2
+UMask=0077
+LimitCORE=0
+LimitNOFILE=128
+TasksMax=32
+MemoryHigh=64M
+MemoryMax=96M
+CPUQuota=25%
+IPAccounting=true
+
+[Install]
+WantedBy=multi-user.target
+PROXY_UNIT
+fi
+
 run 'cat > /etc/systemd/system/iroh-relay-egress.service' <<'EGRESS_UNIT'
 [Unit]
 Description=iroh relay aggregate egress ceiling
@@ -590,7 +651,7 @@ EGRESS_UNIT
 
 HEALTH_UNIT="[Unit]
 Description=iroh relay and enrollment backend health check
-After=network-online.target iroh-relay.service iroh-relay-egress.service
+After=network-online.target iroh-relay.service iroh-relay-egress.service$HEALTH_PROXY_AFTER
 Wants=network-online.target
 
 [Service]
@@ -638,13 +699,24 @@ else
 fi'
 
 echo "==> applying fail-closed egress guard and starting services"
-run 'set -eu
-	systemctl daemon-reload
-	systemctl stop iroh-relay.service 2>/dev/null || true
-	systemctl enable iroh-relay-egress.service iroh-relay.service iroh-relay-healthcheck.timer >/dev/null
-	systemctl restart iroh-relay-egress.service
-	systemctl start iroh-relay.service
-	systemctl restart iroh-relay-healthcheck.timer'
+if [[ -n "$ACCESS_HTTP_URL" ]]; then
+	run 'set -eu
+		systemctl daemon-reload
+		systemctl stop iroh-relay.service 2>/dev/null || true
+		systemctl enable iroh-relay-access-proxy.service iroh-relay-egress.service iroh-relay.service iroh-relay-healthcheck.timer >/dev/null
+		systemctl restart iroh-relay-egress.service
+		systemctl restart iroh-relay-access-proxy.service
+		systemctl start iroh-relay.service
+		systemctl restart iroh-relay-healthcheck.timer'
+else
+	run 'set -eu
+		systemctl daemon-reload
+		systemctl stop iroh-relay.service 2>/dev/null || true
+		systemctl enable iroh-relay-egress.service iroh-relay.service iroh-relay-healthcheck.timer >/dev/null
+		systemctl restart iroh-relay-egress.service
+		systemctl start iroh-relay.service
+		systemctl restart iroh-relay-healthcheck.timer'
+fi
 
 echo "==> waiting for HTTPS (Let's Encrypt issuance can take a minute on first deploy)"
 for _ in $(seq 1 30); do

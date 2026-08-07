@@ -49,6 +49,7 @@ does not claim that those are per-endpoint accounting.
   the VPS. Add an AAAA record when IPv6 is available.
 - Root SSH access.
 - `curl`, `systemd` 247 or newer, and `nft` from the `nftables` package.
+- Python 3.10 or newer when deploying a Volt-managed relay.
 - Provider firewall rules allowing only 80/tcp, 443/tcp, and 7824/udp in
   addition to SSH.
 
@@ -56,7 +57,8 @@ The deployment fails closed if it cannot install the nftables owner-based
 egress rule. It stops the relay before replacing that rule and starts the relay
 only after nftables accepts and exposes the configured counter. Do not run
 other services as the dedicated `iroh-relay` user, because the ceiling applies
-to all output owned by that UID.
+to all output owned by that UID. The managed deployment's bounded callback
+framing proxy is the only expected exception.
 
 ## DNS and ports
 
@@ -108,6 +110,15 @@ Only an exact `200 text/plain` response body of `true` authorizes registration.
 Every other body, status, timeout, or network error denies it. The backend
 accepts its configured **current** or **next** relay secret using timing-safe
 comparison.
+
+Stock iroh-relay v1.0.3 omits `Content-Length` on this empty POST. Google Cloud
+Functions rejects that request with HTTP 411 before invoking the enrollment
+backend. Managed deployments therefore install a loopback-only framing proxy
+that adds `Content-Length: 0` and forwards only `Authorization` and
+`X-Iroh-NodeId` to the fixed callback above. It rejects request bodies,
+redirects, malformed endpoint IDs, duplicate headers, oversized responses, and
+all other paths. The bearer still enters only the relay process; the proxy
+receives it over loopback and has no credential file or client-facing listener.
 
 Configure the backend's current secret before starting a relay. Then provision
 the same raw value as a single line in a root-owned file on each relay host. A
@@ -178,10 +189,13 @@ prod_tls = true
 cert_dir = "/var/lib/iroh-relay/certs"
 
 [access.http]
-url = "https://<fixed-enrollment-function>/v1/relay-access"
+url = "http://127.0.0.1:9081/v1/relay-access"
 ```
 
-There is deliberately no `bearer_token` key in this file.
+There is deliberately no `bearer_token` key in this file. The generated local
+URL is fixed, and `/usr/local/libexec/iroh-relay-access-proxy.py` independently
+pins the production enrollment callback; operator input cannot redirect the
+bearer.
 
 ### Rotate the backend secret with current/next overlap
 
@@ -249,7 +263,7 @@ broker returns.
 
 ## Resource and egress controls
 
-The generated systemd unit includes:
+The generated relay systemd unit includes:
 
 - `LimitNOFILE=16384` as a hard file-descriptor and socket-concurrency bound;
 - `TasksMax=256`;
@@ -265,8 +279,11 @@ unimplemented, so the generated config does not pretend they provide a bound.
 The file-descriptor ceiling is the coarse aggregate connection backstop, while
 `[limits.client.rx]` enforces per-client ingress.
 
-The separate `iroh-relay-egress.service` installs an nftables `inet` output
-rule matching the numeric `iroh-relay` UID. Defaults are an aggregate
+Managed deployments also run `iroh-relay-access-proxy.service` with a
+loopback-only listener, a 96 MiB memory ceiling, 32-task ceiling, 25% CPU quota,
+and no Linux capabilities. The separate `iroh-relay-egress.service` installs
+an nftables `inet` output rule matching the numeric `iroh-relay` UID. Defaults
+are an aggregate
 67,108,864 bytes/second with a 134,217,728-byte burst. Override them at deploy
 time when the VPS capacity requires a lower value:
 
@@ -287,10 +304,11 @@ The deployment installs and enables `iroh-relay-healthcheck.timer`. Each run:
 
 1. resolves the configured relay hostname to IPv4 or IPv6 loopback and requests
    its TLS `/healthz`;
-2. for managed relays, sends the backend bearer through curl stdin and expects
-   an authenticated 400 response to a deliberately incomplete request, proving
-   backend reachability and secret acceptance without creating an endpoint
-   record or consuming the endpoint request quota;
+2. for managed relays, sends the backend bearer through curl stdin to the
+   loopback framing proxy and expects an authenticated 400 response to a
+   deliberately incomplete request, proving proxy health, backend reachability,
+   and secret acceptance without creating an endpoint record or consuming the
+   endpoint request quota;
 3. confirms that the nftables egress guard exists; and
 4. detects increases in its dropped-byte counter.
 
@@ -310,8 +328,8 @@ in a separate root-readable file rather than in the hook's command arguments.
 Useful checks:
 
 ```sh
-systemctl status iroh-relay iroh-relay-egress iroh-relay-healthcheck.timer
-journalctl -u iroh-relay -u iroh-relay-healthcheck --since -30m
+systemctl status iroh-relay iroh-relay-access-proxy iroh-relay-egress iroh-relay-healthcheck.timer
+journalctl -u iroh-relay -u iroh-relay-access-proxy -u iroh-relay-healthcheck --since -30m
 curl --resolve relay.example.com:443:127.0.0.1 -sSf https://relay.example.com/healthz
 curl -sSf http://127.0.0.1:9090/metrics | head
 nft list counter inet volt_iroh_relay egress_rate_dropped
@@ -322,8 +340,9 @@ Runbook:
 
 - **Relay health failed:** inspect relay logs, DNS, certificate issuance, local
   ports, and memory/FD limits. Restart only after identifying the failure.
-- **Backend health failed:** verify the fixed URL, backend deployment, and the
-  current/next secret overlap. Do not bypass the outage with `--open`; failed
+- **Backend health failed:** verify `iroh-relay-access-proxy.service`, the fixed
+  URL, backend deployment, and the current/next secret overlap. Do not bypass
+  the outage with `--open`; failed
   authorization must remain fail closed. Existing registrations may continue
   because stock authorization is registration-time only.
 - **Egress guard missing:** the monitor stops `iroh-relay`. Restore nftables,
