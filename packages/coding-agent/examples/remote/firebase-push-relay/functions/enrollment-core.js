@@ -293,8 +293,8 @@ function parseRelayAuthorization(request, currentSecret, nextSecret) {
 	const suppliedDigest = createHash("sha256").update(match[1], "utf8").digest();
 	let accepted = false;
 	for (const secret of [currentSecret, nextSecret]) {
-		const candidate = isValidServerSecret(secret) ? secret : "invalid-server-secret-placeholder";
-		const candidateDigest = createHash("sha256").update(candidate, "utf8").digest();
+		if (!isValidServerSecret(secret)) continue;
+		const candidateDigest = createHash("sha256").update(secret, "utf8").digest();
 		accepted = timingSafeEqual(suppliedDigest, candidateDigest) || accepted;
 	}
 	if (!accepted) {

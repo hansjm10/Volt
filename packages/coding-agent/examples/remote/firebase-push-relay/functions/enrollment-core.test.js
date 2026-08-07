@@ -192,6 +192,20 @@ test("relay bearer rotation uses current or next secrets and endpoint headers st
 		401,
 		"relay_unauthorized",
 	);
+	for (const invalidNext of [undefined, "", "too-short"]) {
+		assert.doesNotThrow(() =>
+			parseRelayAuthorization({ headers: { authorization: `Bearer ${current}` } }, current, invalidNext),
+		);
+		expectRequestError(
+			() => parseRelayAuthorization(
+				{ headers: { authorization: "Bearer invalid-server-secret-placeholder" } },
+				current,
+				invalidNext,
+			),
+			401,
+			"relay_unauthorized",
+		);
+	}
 	assert.equal(getRelayEndpointId({ headers: { "x-iroh-nodeid": vector.hostEndpointId } }), vector.hostEndpointId);
 	expectRequestError(
 		() => getRelayEndpointId({ headers: { "x-iroh-nodeid": vector.hostEndpointId.toUpperCase() } }),
