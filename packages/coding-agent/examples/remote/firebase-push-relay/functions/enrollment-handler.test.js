@@ -10,7 +10,8 @@ const { RequestError } = require("./core.js");
 const {
 	canonicalApproveMessage,
 	canonicalClaimMessage,
-	canonicalGrantMessage,
+	canonicalRevokeGrantMessage,
+	getGrantGenerationId,
 	getGrantId,
 	hashDecodedSecret,
 } = require("./enrollment-core.js");
@@ -127,7 +128,7 @@ function approveBody() {
 	};
 }
 
-function grantBody(operation) {
+function renewBody() {
 	return {
 		version: 1,
 		hostEndpointId: vector.hostEndpointId,
@@ -135,8 +136,23 @@ function grantBody(operation) {
 		grantId: vector.grantId,
 		grantSecret: vector.grantSecret,
 		issuedAtMs: vector.issuedAtMs,
-		nonce: vector.operations[operation].nonce,
-		signature: vector.operations[operation].signatureBase64url,
+		nonce: vector.operations.renew_grant.nonce,
+		signature: vector.operations.renew_grant.signatureBase64url,
+	};
+}
+
+function revokeBody(revoker) {
+	const fixture = vector.operations[`revoke_grant_${revoker}`];
+	return {
+		version: 1,
+		hostEndpointId: vector.hostEndpointId,
+		clientEndpointId: vector.clientEndpointId,
+		grantId: vector.grantId,
+		grantGenerationId: vector.grantGenerationId,
+		revokerEndpointId: revoker === "host" ? vector.hostEndpointId : vector.clientEndpointId,
+		issuedAtMs: vector.issuedAtMs,
+		nonce: fixture.nonce,
+		signature: fixture.signatureBase64url,
 	};
 }
 
@@ -228,13 +244,16 @@ function endpointAccessPath(endpointId) {
 	return `${ENDPOINT_ACCESS_COLLECTION}/${endpointId}`;
 }
 
-function signWithSeed(seedHex, message) {
-	const privateKey = createPrivateKey({
+function privateKeyFromSeed(seedHex) {
+	return createPrivateKey({
 		format: "der",
 		key: Buffer.concat([PKCS8_ED25519_SEED_PREFIX, Buffer.from(seedHex, "hex")]),
 		type: "pkcs8",
 	});
-	return sign(null, message, privateKey).toString("base64url");
+}
+
+function signWithSeed(seedHex, message) {
+	return sign(null, message, privateKeyFromSeed(seedHex)).toString("base64url");
 }
 
 function signedCreateBody(
@@ -281,6 +300,17 @@ function signedApproveBody(
 	return body;
 }
 
+function signedRevokeIntent(intent, privateKey, issuedAtMs) {
+	const body = {
+		version: 1,
+		...intent,
+		issuedAtMs,
+		nonce: randomBytes(16).toString("base64url"),
+	};
+	body.signature = sign(null, canonicalRevokeGrantMessage(body), privateKey).toString("base64url");
+	return body;
+}
+
 test("claim approval is idempotent, updates both endpoint maps transactionally, and relay access revokes closed", async () => {
 	const harness = createHarness();
 	let response = await invoke(harness.handler, "/v1/relay-access", undefined, {
@@ -315,13 +345,21 @@ test("claim approval is idempotent, updates both endpoint maps transactionally, 
 		{ headers: { "x-firebase-appcheck": "limited-use-token" } },
 	);
 	assert.equal(response.status, 200);
-	assert.equal(response.body.status, "approved");
-	assert.equal(response.body.grantId, vector.grantId);
+	assert.deepEqual(response.body, {
+		status: "approved",
+		grantId: vector.grantId,
+		grantGenerationId: vector.grantGenerationId,
+		expiresAtEpochSeconds: Math.floor((vector.issuedAtMs + 30 * 24 * 60 * 60 * 1000) / 1000),
+		relayOrigins: ["https://iroh-relay-us-central.volt-cli.dev"],
+	});
 	assert.equal(harness.appCheckCount, 1);
 
 	const grant = harness.firestore.documents.get(`${GRANTS_COLLECTION}/${vector.grantId}`);
+	assert.equal(grant.grantGenerationId, vector.grantGenerationId);
 	assert.equal(grant.grantSecretHash, vector.grantSecretSha256);
 	assert.equal(grant.approvedClaimId, undefined);
+	const claim = harness.firestore.documents.get(`${CLAIMS_COLLECTION}/${vector.claimId}`);
+	assert.equal(claim.grantGenerationId, vector.grantGenerationId);
 	for (const endpointId of [vector.hostEndpointId, vector.clientEndpointId]) {
 		const access = harness.firestore.documents.get(endpointAccessPath(endpointId));
 		assert.equal(access.activeGrants[vector.grantId].toMillis(), vector.issuedAtMs + 30 * 24 * 60 * 60 * 1000);
@@ -341,6 +379,7 @@ test("claim approval is idempotent, updates both endpoint maps transactionally, 
 	assert.deepEqual(response.body, {
 		clientEndpointId: vector.clientEndpointId,
 		grantExpiresAtEpochSeconds: Math.floor((vector.issuedAtMs + 30 * 24 * 60 * 60 * 1000) / 1000),
+		grantGenerationId: vector.grantGenerationId,
 		status: "approved",
 	});
 
@@ -357,17 +396,17 @@ test("claim approval is idempotent, updates both endpoint maps transactionally, 
 		assert.equal(response.headers["cache-control"], "no-store");
 	}
 
-	response = await invoke(harness.handler, "/v1/grants/revoke", grantBody("revoke_grant"));
+	response = await invoke(harness.handler, "/v1/grants/revoke", revokeBody("client"));
 	assert.equal(response.status, 200);
 	assert.deepEqual(response.body, { status: "revoked", grantId: vector.grantId });
-	response = await invoke(harness.handler, "/v1/grants/revoke", grantBody("revoke_grant"));
+	response = await invoke(harness.handler, "/v1/grants/revoke", revokeBody("client"));
 	assert.equal(response.status, 200);
 	assert.equal(harness.appCheckCount, 2);
 
 	// Firestore TTL may remove an expired/revoked grant before an offline
 	// client retries its durable revocation. Missing is idempotently closed.
 	harness.firestore.documents.delete(`${GRANTS_COLLECTION}/${vector.grantId}`);
-	response = await invoke(harness.handler, "/v1/grants/revoke", grantBody("revoke_grant"));
+	response = await invoke(harness.handler, "/v1/grants/revoke", revokeBody("client"));
 	assert.equal(response.status, 200);
 	assert.deepEqual(response.body, { status: "revoked", grantId: vector.grantId });
 
@@ -377,6 +416,149 @@ test("claim approval is idempotent, updates both endpoint maps transactionally, 
 	assert.equal(response.status, 200);
 	assert.equal(response.body, "false");
 	assert.equal(harness.logs.length, 0);
+});
+
+test("host revocation rejects third parties and re-signs durable retries after restart", async () => {
+	const harness = createHarness();
+	await invoke(harness.handler, "/v1/claims", createBody());
+	await invoke(harness.handler, "/v1/claims/approve", approveBody());
+
+	const durableIntent = {
+		hostEndpointId: vector.hostEndpointId,
+		clientEndpointId: vector.clientEndpointId,
+		grantId: vector.grantId,
+		grantGenerationId: vector.grantGenerationId,
+		revokerEndpointId: vector.hostEndpointId,
+	};
+	const { privateKey: thirdPartyPrivateKey, publicKey: thirdPartyPublicKey } = generateKeyPairSync("ed25519");
+	const thirdPartyEndpointId = thirdPartyPublicKey
+		.export({ format: "der", type: "spki" })
+		.subarray(-32)
+		.toString("hex");
+	let response = await invoke(
+		harness.handler,
+		"/v1/grants/revoke",
+		signedRevokeIntent(
+			{ ...durableIntent, revokerEndpointId: thirdPartyEndpointId },
+			thirdPartyPrivateKey,
+			vector.issuedAtMs,
+		),
+	);
+	assert.equal(response.status, 400);
+	assert.deepEqual(response.body, { error: "revoker_endpoint_id_invalid" });
+
+	response = await invoke(
+		harness.handler,
+		"/v1/grants/revoke",
+		signedRevokeIntent(durableIntent, thirdPartyPrivateKey, vector.issuedAtMs),
+	);
+	assert.equal(response.status, 401);
+	assert.deepEqual(response.body, { error: "signature_invalid" });
+
+	const hostPrivateKey = privateKeyFromSeed(vector.hostSecretKeyHex);
+	const staleRequest = signedRevokeIntent(durableIntent, hostPrivateKey, vector.issuedAtMs);
+	const restartedAtMs = vector.issuedAtMs + 2 * 60 * 1000 + 1;
+	harness.setNow(restartedAtMs);
+	response = await invoke(harness.handler, "/v1/grants/revoke", staleRequest);
+	assert.equal(response.status, 401);
+	assert.deepEqual(response.body, { error: "signature_timestamp_invalid" });
+
+	// A restarted worker loads only non-secret intent fields and creates a new
+	// nonce, timestamp, and host signature for every retry.
+	const recoveredIntent = JSON.parse(JSON.stringify(durableIntent));
+	response = await invoke(
+		harness.handler,
+		"/v1/grants/revoke",
+		signedRevokeIntent(recoveredIntent, hostPrivateKey, restartedAtMs),
+	);
+	assert.equal(response.status, 200);
+	assert.deepEqual(response.body, { status: "revoked", grantId: vector.grantId });
+	harness.setNow(restartedAtMs + 1);
+	response = await invoke(
+		harness.handler,
+		"/v1/grants/revoke",
+		signedRevokeIntent(recoveredIntent, hostPrivateKey, restartedAtMs + 1),
+	);
+	assert.equal(response.status, 200);
+	assert.equal(harness.firestore.documents.get(`${GRANTS_COLLECTION}/${vector.grantId}`).status, "revoked");
+	assert.equal(harness.firestore.documents.has(endpointAccessPath(vector.hostEndpointId)), false);
+	assert.equal(harness.firestore.documents.has(endpointAccessPath(vector.clientEndpointId)), false);
+	assert.equal(harness.appCheckCount, 1);
+});
+
+test("stale generation revocation preserves a replacement grant for the same endpoint pair", async () => {
+	const harness = createHarness();
+	await invoke(harness.handler, "/v1/claims", createBody());
+	await invoke(harness.handler, "/v1/claims/approve", approveBody());
+	await invoke(harness.handler, "/v1/grants/revoke", revokeBody("client"));
+
+	const staleIntent = {
+		hostEndpointId: vector.hostEndpointId,
+		clientEndpointId: vector.clientEndpointId,
+		grantId: vector.grantId,
+		grantGenerationId: vector.grantGenerationId,
+		revokerEndpointId: vector.hostEndpointId,
+	};
+	const replacementIssuedAtMs = vector.issuedAtMs + 60 * 1000;
+	const replacementClaimId = randomBytes(16).toString("base64url");
+	const replacementClaimSecret = randomBytes(32).toString("base64url");
+	const replacementGrantSecret = randomBytes(32).toString("base64url");
+	const replacementGenerationId = getGrantGenerationId(
+		vector.hostEndpointId,
+		vector.clientEndpointId,
+		replacementGrantSecret,
+	);
+	harness.setNow(replacementIssuedAtMs);
+	let response = await invoke(
+		harness.handler,
+		"/v1/claims",
+		signedCreateBody(
+			replacementClaimId,
+			hashDecodedSecret(replacementClaimSecret),
+			replacementIssuedAtMs,
+		),
+	);
+	assert.equal(response.status, 201);
+	response = await invoke(
+		harness.handler,
+		"/v1/claims/approve",
+		signedApproveBody(
+			replacementClaimId,
+			replacementClaimSecret,
+			replacementGrantSecret,
+			replacementIssuedAtMs,
+		),
+	);
+	assert.equal(response.status, 200);
+	assert.equal(response.body.grantGenerationId, replacementGenerationId);
+	assert.notEqual(replacementGenerationId, vector.grantGenerationId);
+
+	response = await invoke(
+		harness.handler,
+		"/v1/grants/revoke",
+		signedRevokeIntent(
+			staleIntent,
+			privateKeyFromSeed(vector.hostSecretKeyHex),
+			replacementIssuedAtMs,
+		),
+	);
+	assert.equal(response.status, 200);
+	assert.deepEqual(response.body, { status: "revoked", grantId: vector.grantId });
+	const replacementGrant = harness.firestore.documents.get(`${GRANTS_COLLECTION}/${vector.grantId}`);
+	assert.equal(replacementGrant.status, "active");
+	assert.equal(replacementGrant.grantGenerationId, replacementGenerationId);
+	for (const endpointId of [vector.hostEndpointId, vector.clientEndpointId]) {
+		const access = harness.firestore.documents.get(endpointAccessPath(endpointId));
+		assert.ok(access.activeGrants[vector.grantId]);
+	}
+	response = await invoke(harness.handler, "/v1/relay-access", undefined, {
+		headers: {
+			authorization: `Bearer ${"c".repeat(32)}`,
+			"x-iroh-nodeid": vector.hostEndpointId,
+		},
+	});
+	assert.equal(response.status, 200);
+	assert.equal(response.body, "true");
 });
 
 test("an expired claim cannot be approved or authorize either endpoint", async () => {
@@ -512,22 +694,14 @@ test("only the first client and matching phone-generated grant secret can retry 
 	assert.equal(response.status, 409);
 	assert.deepEqual(response.body, { error: "claim_approval_conflict" });
 
-	const wrongSecretRequest = {
-		...grantBody("revoke_grant"),
-		grantSecret: randomBytes(32).toString("base64url"),
-		nonce: randomBytes(16).toString("base64url"),
-	};
-	wrongSecretRequest.signature = signWithSeed(
-		vector.clientSecretKeyHex,
-		canonicalGrantMessage(
-			"revoke_grant",
-			wrongSecretRequest,
-			hashDecodedSecret(wrongSecretRequest.grantSecret),
-		),
+	const wrongGrantSecretRequest = signedApproveBody(
+		vector.claimId,
+		vector.claimSecret,
+		randomBytes(32).toString("base64url"),
 	);
-	response = await invoke(harness.handler, "/v1/grants/revoke", wrongSecretRequest);
-	assert.equal(response.status, 401);
-	assert.deepEqual(response.body, { error: "grant_unauthorized" });
+	response = await invoke(harness.handler, "/v1/claims/approve", wrongGrantSecretRequest);
+	assert.equal(response.status, 409);
+	assert.deepEqual(response.body, { error: "claim_approval_conflict" });
 	assert.equal(harness.firestore.documents.get(`${GRANTS_COLLECTION}/${vector.grantId}`).status, "active");
 });
 
@@ -543,15 +717,27 @@ test("approve and renew consume App Check, and renewal enforces six durable atte
 	harness.setRejectAppCheck(false);
 	response = await invoke(harness.handler, "/v1/claims/approve", approveBody());
 	assert.equal(response.status, 200);
+	const grantPath = `${GRANTS_COLLECTION}/${vector.grantId}`;
+	const grant = harness.firestore.documents.get(grantPath);
+	grant.grantGenerationId = randomBytes(32).toString("base64url");
+	response = await invoke(harness.handler, "/v1/grants/renew", renewBody());
+	assert.equal(response.status, 401);
+	assert.deepEqual(response.body, { error: "grant_unauthorized" });
+	grant.grantGenerationId = vector.grantGenerationId;
 	for (let attempt = 0; attempt < 6; attempt += 1) {
-		response = await invoke(harness.handler, "/v1/grants/renew", grantBody("renew_grant"));
+		response = await invoke(harness.handler, "/v1/grants/renew", renewBody());
 		assert.equal(response.status, 200, `renewal ${attempt + 1}`);
-		assert.equal(response.body.status, "active");
+		assert.deepEqual(response.body, {
+			status: "active",
+			grantId: vector.grantId,
+			expiresAtEpochSeconds: Math.floor((vector.issuedAtMs + 30 * 24 * 60 * 60 * 1000) / 1000),
+			relayOrigins: ["https://iroh-relay-us-central.volt-cli.dev"],
+		});
 	}
-	response = await invoke(harness.handler, "/v1/grants/renew", grantBody("renew_grant"));
+	response = await invoke(harness.handler, "/v1/grants/renew", renewBody());
 	assert.equal(response.status, 429);
 	assert.deepEqual(response.body, { error: "grant_renewal_rate_limited" });
-	assert.equal(harness.appCheckCount, 9);
+	assert.equal(harness.appCheckCount, 10);
 });
 
 test("claim cancellation is idempotent and removes the host pending marker", async () => {

@@ -8,6 +8,7 @@ const {
 	MAX_RENEWALS_PER_GRANT_PER_HOUR,
 	REQUEST_QUOTA_WINDOW_MS,
 	assertFreshSignature,
+	getGrantGenerationId,
 	getGrantId,
 	getRelayEndpointId,
 	getRequestIp,
@@ -18,7 +19,8 @@ const {
 	parseApproveClaimRequest,
 	parseClaimSecretRequest,
 	parseCreateClaimRequest,
-	parseGrantRequest,
+	parseRenewGrantRequest,
+	parseRevokeGrantRequest,
 	parseRelayAuthorization,
 	timingSafeBase64urlEqual,
 } = require("./enrollment-core.js");
@@ -235,6 +237,7 @@ function createIrohEnrollmentHandler(options) {
 			return {
 				clientEndpointId: claim.clientEndpointId,
 				grantExpiresAtEpochSeconds: Math.floor(grantExpiresAtMs / 1000),
+				grantGenerationId: claim.grantGenerationId,
 				status: "approved",
 			};
 		});
@@ -300,6 +303,11 @@ function createIrohEnrollmentHandler(options) {
 			.doc(`new-host-grants_${enrollmentRequest.clientEndpointId}_${dayNumber}`);
 		const claimSecretHash = hashDecodedSecret(enrollmentRequest.claimSecret);
 		const grantSecretHash = hashDecodedSecret(enrollmentRequest.grantSecret);
+		const grantGenerationId = getGrantGenerationId(
+			enrollmentRequest.hostEndpointId,
+			enrollmentRequest.clientEndpointId,
+			enrollmentRequest.grantSecret,
+		);
 		const result = await firestore.runTransaction(async (transaction) => {
 			const claimSnapshot = await transaction.get(claimRef);
 			const grantSnapshot = await transaction.get(grantRef);
@@ -323,7 +331,8 @@ function createIrohEnrollmentHandler(options) {
 			if (claim.status === "approved") {
 				if (
 					claim.clientEndpointId !== enrollmentRequest.clientEndpointId ||
-					claim.grantId !== grantId
+					claim.grantId !== grantId ||
+					claim.grantGenerationId !== grantGenerationId
 				) {
 					throw new RequestError(409, "claim_approval_conflict");
 				}
@@ -331,6 +340,7 @@ function createIrohEnrollmentHandler(options) {
 				if (
 					grant.hostEndpointId !== enrollmentRequest.hostEndpointId ||
 					grant.clientEndpointId !== enrollmentRequest.clientEndpointId ||
+					grant.grantGenerationId !== grantGenerationId ||
 					grant.status !== "active" ||
 					!timingSafeBase64urlEqual(grant.grantSecretHash, grantSecretHash)
 				) {
@@ -388,6 +398,7 @@ function createIrohEnrollmentHandler(options) {
 					? timestampFromMillis(requireTimestampMillis(existingGrant.createdAt))
 					: nowTimestamp,
 				expiresAt,
+				grantGenerationId,
 				grantId,
 				grantSecretHash,
 				hostEndpointId: enrollmentRequest.hostEndpointId,
@@ -399,6 +410,7 @@ function createIrohEnrollmentHandler(options) {
 				approvedAt: nowTimestamp,
 				clientEndpointId: enrollmentRequest.clientEndpointId,
 				grantExpiresAt: expiresAt,
+				grantGenerationId,
 				grantId,
 				status: "approved",
 				updatedAt: nowTimestamp,
@@ -422,13 +434,14 @@ function createIrohEnrollmentHandler(options) {
 		response.status(200).json({
 			status: "approved",
 			grantId,
+			grantGenerationId,
 			expiresAtEpochSeconds: Math.floor(result.expiresAtMs / 1000),
 			relayOrigins: config.relayOrigins,
 		});
 	}
 
 	async function renewGrant(request, response) {
-		const enrollmentRequest = parseGrantRequest(request, "renew_grant");
+		const enrollmentRequest = parseRenewGrantRequest(request);
 		const nowMs = now();
 		assertFreshSignature(enrollmentRequest, "renew_grant", nowMs);
 		assertDeterministicGrantId(enrollmentRequest);
@@ -442,13 +455,18 @@ function createIrohEnrollmentHandler(options) {
 			.collection(QUOTA_WINDOWS_COLLECTION)
 			.doc(`grant-renewals_${enrollmentRequest.grantId}`);
 		const grantSecretHash = hashDecodedSecret(enrollmentRequest.grantSecret);
+		const grantGenerationId = getGrantGenerationId(
+			enrollmentRequest.hostEndpointId,
+			enrollmentRequest.clientEndpointId,
+			enrollmentRequest.grantSecret,
+		);
 		const result = await firestore.runTransaction(async (transaction) => {
 			const grantSnapshot = await transaction.get(grantRef);
 			const hostAccessSnapshot = await transaction.get(hostAccessRef);
 			const clientAccessSnapshot = await transaction.get(clientAccessRef);
 			const renewalQuotaSnapshot = await transaction.get(renewalQuotaRef);
 			const grant = readGrant(grantSnapshot);
-			assertGrantCredential(grant, enrollmentRequest, grantSecretHash);
+			assertGrantCredential(grant, enrollmentRequest, grantSecretHash, grantGenerationId);
 			if (grant.status !== "active") throw new RequestError(410, "grant_revoked");
 			if (requireTimestampMillis(grant.expiresAt) <= nowMs) {
 				throw new RequestError(410, "grant_expired");
@@ -491,39 +509,46 @@ function createIrohEnrollmentHandler(options) {
 	}
 
 	async function revokeGrant(request, response) {
-		const enrollmentRequest = parseGrantRequest(request, "revoke_grant");
+		const enrollmentRequest = parseRevokeGrantRequest(request);
 		const nowMs = now();
 		assertFreshSignature(enrollmentRequest, "revoke_grant", nowMs);
 		assertDeterministicGrantId(enrollmentRequest);
-		await reserveRequestQuota(request, enrollmentRequest.clientEndpointId, nowMs);
+		await reserveRequestQuota(request, enrollmentRequest.revokerEndpointId, nowMs);
 		const firestore = getFirestore();
 		const grantRef = firestore.collection(GRANTS_COLLECTION).doc(enrollmentRequest.grantId);
 		const hostAccessRef = firestore.collection(ENDPOINT_ACCESS_COLLECTION).doc(enrollmentRequest.hostEndpointId);
 		const clientAccessRef = firestore.collection(ENDPOINT_ACCESS_COLLECTION).doc(enrollmentRequest.clientEndpointId);
-		const grantSecretHash = hashDecodedSecret(enrollmentRequest.grantSecret);
 		await firestore.runTransaction(async (transaction) => {
 			const grantSnapshot = await transaction.get(grantRef);
 			const hostAccessSnapshot = await transaction.get(hostAccessRef);
 			const clientAccessSnapshot = await transaction.get(clientAccessRef);
+			if (!grantSnapshot.exists) return;
+
+			const grant = readGrant(grantSnapshot);
+			if (
+				grant.grantId !== enrollmentRequest.grantId ||
+				grant.hostEndpointId !== enrollmentRequest.hostEndpointId ||
+				grant.clientEndpointId !== enrollmentRequest.clientEndpointId
+			) {
+				throw new RequestError(401, "grant_unauthorized");
+			}
+			if (
+				grant.status === "revoked" ||
+				grant.grantGenerationId !== enrollmentRequest.grantGenerationId
+			) {
+				return;
+			}
 			const hostAccess = readEndpointAccess(hostAccessSnapshot, nowMs);
 			const clientAccess = readEndpointAccess(clientAccessSnapshot, nowMs);
 			delete hostAccess.activeGrants[enrollmentRequest.grantId];
 			delete clientAccess.activeGrants[enrollmentRequest.grantId];
 			writeEndpointAccess(transaction, hostAccessRef, hostAccess, nowMs);
 			writeEndpointAccess(transaction, clientAccessRef, clientAccess, nowMs);
-			if (!grantSnapshot.exists) return;
-
-			const grant = readGrant(grantSnapshot);
-			assertGrantCredential(grant, enrollmentRequest, grantSecretHash);
-			if (grant.status === "active") {
-				transaction.update(grantRef, {
-					revokedAt: timestampFromMillis(nowMs),
-					status: "revoked",
-					updatedAt: timestampFromMillis(nowMs),
-				});
-			} else if (grant.status !== "revoked") {
-				throw new Error("grant document has an invalid status");
-			}
+			transaction.update(grantRef, {
+				revokedAt: timestampFromMillis(nowMs),
+				status: "revoked",
+				updatedAt: timestampFromMillis(nowMs),
+			});
 		});
 		response.status(200).json({ status: "revoked", grantId: enrollmentRequest.grantId });
 	}
@@ -611,7 +636,8 @@ function readClaim(snapshot) {
 		!isEndpointId(claim.hostEndpointId) ||
 		!isBase64urlBytes(claim.claimId, 16) ||
 		!isBase64urlBytes(claim.claimSecretHash, 32) ||
-		!CLAIM_STATUSES.has(claim.status)
+		!CLAIM_STATUSES.has(claim.status) ||
+		(claim.status === "approved" && !isBase64urlBytes(claim.grantGenerationId, 32))
 	) {
 		throw new Error("claim document is malformed");
 	}
@@ -626,6 +652,7 @@ function readGrant(snapshot) {
 		grant.version !== 1 ||
 		!isEndpointId(grant.hostEndpointId) ||
 		!isEndpointId(grant.clientEndpointId) ||
+		!isBase64urlBytes(grant.grantGenerationId, 32) ||
 		!isBase64urlBytes(grant.grantId, 32) ||
 		!isBase64urlBytes(grant.grantSecretHash, 32) ||
 		!GRANT_STATUSES.has(grant.status)
@@ -644,9 +671,10 @@ function assertClaimCredential(claim, request) {
 	}
 }
 
-function assertGrantCredential(grant, request, grantSecretHash) {
+function assertGrantCredential(grant, request, grantSecretHash, grantGenerationId) {
 	if (
 		grant.grantId !== request.grantId ||
+		grant.grantGenerationId !== grantGenerationId ||
 		grant.hostEndpointId !== request.hostEndpointId ||
 		grant.clientEndpointId !== request.clientEndpointId ||
 		!timingSafeBase64urlEqual(grant.grantSecretHash, grantSecretHash)

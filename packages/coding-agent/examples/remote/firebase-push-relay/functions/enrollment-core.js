@@ -23,6 +23,7 @@ const ENDPOINT_ID_PATTERN = /^[0-9a-f]{64}$/;
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
 const AUTHORIZATION_PATTERN = /^Bearer ([\x21-\x7e]{32,512})$/;
 const GRANT_DOMAIN = Buffer.from("volt-iroh-enrollment-grant-v1\0", "utf8");
+const GRANT_GENERATION_DOMAIN = Buffer.from("volt-iroh-enrollment-grant-generation-v1\0", "utf8");
 
 function getEnrollmentConfig(env = process.env) {
 	return {
@@ -157,7 +158,7 @@ function parseApproveClaimRequest(request) {
 	};
 }
 
-function parseGrantRequest(request, operation) {
+function parseRenewGrantRequest(request) {
 	const body = readJsonBody(request);
 	expectExactKeys(
 		body,
@@ -171,7 +172,7 @@ function parseGrantRequest(request, operation) {
 			"nonce",
 			"signature",
 		],
-		operation,
+		"renew_grant",
 	);
 	const version = expectVersion(body.version);
 	const hostEndpointId = expectEndpointId(body.hostEndpointId);
@@ -183,6 +184,44 @@ function parseGrantRequest(request, operation) {
 		clientEndpointId,
 		grantId: expectBase64url(body.grantId, 32, "grant_id"),
 		grantSecret: expectBase64url(body.grantSecret, 32, "grant_secret"),
+		issuedAtMs: expectIssuedAtMs(body.issuedAtMs),
+		nonce: expectBase64url(body.nonce, 16, "nonce"),
+		signature: expectBase64url(body.signature, 64, "signature"),
+	};
+}
+
+function parseRevokeGrantRequest(request) {
+	const body = readJsonBody(request);
+	expectExactKeys(
+		body,
+		[
+			"version",
+			"hostEndpointId",
+			"clientEndpointId",
+			"grantId",
+			"grantGenerationId",
+			"revokerEndpointId",
+			"issuedAtMs",
+			"nonce",
+			"signature",
+		],
+		"revoke_grant",
+	);
+	const version = expectVersion(body.version);
+	const hostEndpointId = expectEndpointId(body.hostEndpointId);
+	const clientEndpointId = expectEndpointId(body.clientEndpointId);
+	const revokerEndpointId = expectEndpointId(body.revokerEndpointId);
+	assertDistinctEndpointIds(hostEndpointId, clientEndpointId);
+	if (revokerEndpointId !== hostEndpointId && revokerEndpointId !== clientEndpointId) {
+		throw new RequestError(400, "revoker_endpoint_id_invalid");
+	}
+	return {
+		version,
+		hostEndpointId,
+		clientEndpointId,
+		grantId: expectBase64url(body.grantId, 32, "grant_id"),
+		grantGenerationId: expectBase64url(body.grantGenerationId, 32, "grant_generation_id"),
+		revokerEndpointId,
 		issuedAtMs: expectIssuedAtMs(body.issuedAtMs),
 		nonce: expectBase64url(body.nonce, 16, "nonce"),
 		signature: expectBase64url(body.signature, 64, "signature"),
@@ -208,9 +247,12 @@ function assertFreshSignature(request, operation, nowMs) {
 			hashDecodedSecret(request.grantSecret),
 		);
 		signerEndpointId = request.clientEndpointId;
-	} else if (operation === "renew_grant" || operation === "revoke_grant") {
-		canonicalMessage = canonicalGrantMessage(operation, request, hashDecodedSecret(request.grantSecret));
+	} else if (operation === "renew_grant") {
+		canonicalMessage = canonicalRenewGrantMessage(request, hashDecodedSecret(request.grantSecret));
 		signerEndpointId = request.clientEndpointId;
+	} else if (operation === "revoke_grant") {
+		canonicalMessage = canonicalRevokeGrantMessage(request);
+		signerEndpointId = request.revokerEndpointId;
 	} else {
 		throw new Error("unsupported enrollment signature operation");
 	}
@@ -254,15 +296,33 @@ function canonicalApproveMessage(request, claimSecretHash, grantSecretHash) {
 	);
 }
 
-function canonicalGrantMessage(operation, request, grantSecretHash) {
+function canonicalRenewGrantMessage(request, grantSecretHash) {
 	return Buffer.from(
 		[
 			"volt-iroh-enrollment-signature-v1",
-			`operation:${operation}`,
+			"operation:renew_grant",
 			`host_endpoint_id:${request.hostEndpointId}`,
 			`client_endpoint_id:${request.clientEndpointId}`,
 			`grant_id:${request.grantId}`,
 			`grant_secret_sha256:${grantSecretHash}`,
+			`issued_at_ms:${request.issuedAtMs}`,
+			`nonce:${request.nonce}`,
+			"",
+		].join("\n"),
+		"utf8",
+	);
+}
+
+function canonicalRevokeGrantMessage(request) {
+	return Buffer.from(
+		[
+			"volt-iroh-enrollment-signature-v1",
+			"operation:revoke_grant",
+			`host_endpoint_id:${request.hostEndpointId}`,
+			`client_endpoint_id:${request.clientEndpointId}`,
+			`grant_id:${request.grantId}`,
+			`grant_generation_id:${request.grantGenerationId}`,
+			`revoker_endpoint_id:${request.revokerEndpointId}`,
 			`issued_at_ms:${request.issuedAtMs}`,
 			`nonce:${request.nonce}`,
 			"",
@@ -289,6 +349,15 @@ function getGrantId(hostEndpointId, clientEndpointId) {
 		.update(GRANT_DOMAIN)
 		.update(Buffer.from(hostEndpointId, "hex"))
 		.update(Buffer.from(clientEndpointId, "hex"))
+		.digest("base64url");
+}
+
+function getGrantGenerationId(hostEndpointId, clientEndpointId, grantSecret) {
+	return createHash("sha256")
+		.update(GRANT_GENERATION_DOMAIN)
+		.update(Buffer.from(hostEndpointId, "hex"))
+		.update(Buffer.from(clientEndpointId, "hex"))
+		.update(decodeBase64url(grantSecret))
 		.digest("base64url");
 }
 
@@ -423,9 +492,11 @@ module.exports = {
 	assertFreshSignature,
 	canonicalApproveMessage,
 	canonicalClaimMessage,
-	canonicalGrantMessage,
+	canonicalRenewGrantMessage,
+	canonicalRevokeGrantMessage,
 	getEnrollmentConfig,
 	getEnrollmentServiceAccount,
+	getGrantGenerationId,
 	getGrantId,
 	getRelayEndpointId,
 	getRequestIp,
@@ -436,7 +507,8 @@ module.exports = {
 	parseApproveClaimRequest,
 	parseClaimSecretRequest,
 	parseCreateClaimRequest,
-	parseGrantRequest,
+	parseRenewGrantRequest,
+	parseRevokeGrantRequest,
 	parseRelayAuthorization,
 	parseRelayOrigins,
 	timingSafeBase64urlEqual,

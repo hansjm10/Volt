@@ -61,16 +61,18 @@ function approveBody() {
 	};
 }
 
-function revokeBody() {
+function revokeBody(revoker) {
+	const fixture = vector.operations[`revoke_grant_${revoker}`];
 	return {
 		version: 1,
 		hostEndpointId: vector.hostEndpointId,
 		clientEndpointId: vector.clientEndpointId,
 		grantId: vector.grantId,
-		grantSecret: vector.grantSecret,
+		grantGenerationId: vector.grantGenerationId,
+		revokerEndpointId: revoker === "host" ? vector.hostEndpointId : vector.clientEndpointId,
 		issuedAtMs: vector.issuedAtMs,
-		nonce: vector.operations.revoke_grant.nonce,
-		signature: vector.operations.revoke_grant.signatureBase64url,
+		nonce: fixture.nonce,
+		signature: fixture.signatureBase64url,
 	};
 }
 
@@ -132,7 +134,7 @@ after(async () => {
 	await deleteApp(app);
 });
 
-test("real Firestore transactions atomically approve, retry, authorize, and revoke an endpoint pair", async () => {
+test("real Firestore transactions preserve generation-scoped symmetric revocation", async () => {
 	let response = await invoke("/v1/claims", createBody());
 	assert.equal(response.status, 201);
 
@@ -142,15 +144,23 @@ test("real Firestore transactions atomically approve, retry, authorize, and revo
 	]);
 	assert.deepEqual(approvals.map((item) => item.status), [200, 200]);
 	assert.deepEqual(approvals.map((item) => item.body.grantId), [vector.grantId, vector.grantId]);
+	assert.deepEqual(
+		approvals.map((item) => item.body.grantGenerationId),
+		[vector.grantGenerationId, vector.grantGenerationId],
+	);
 
 	for (const endpointId of [vector.hostEndpointId, vector.clientEndpointId]) {
 		const access = (await firestore.collection("voltIrohEndpointAccess").doc(endpointId).get()).data();
 		assert.ok(access.activeGrants[vector.grantId]);
 		assert.equal(access.expiresAt.toMillis(), access.activeGrants[vector.grantId].toMillis());
 	}
-	const grant = (await firestore.collection("voltIrohEnrollmentGrants").doc(vector.grantId).get()).data();
+	const grantRef = firestore.collection("voltIrohEnrollmentGrants").doc(vector.grantId);
+	const grant = (await grantRef.get()).data();
 	assert.equal(grant.status, "active");
+	assert.equal(grant.grantGenerationId, vector.grantGenerationId);
 	assert.equal(grant.grantSecretHash, vector.grantSecretSha256);
+	const claim = (await firestore.collection("voltIrohEnrollmentClaims").doc(vector.claimId).get()).data();
+	assert.equal(claim.grantGenerationId, vector.grantGenerationId);
 
 	response = await invoke("/v1/relay-access", undefined, {
 		authorization: `Bearer ${"c".repeat(32)}`,
@@ -159,17 +169,59 @@ test("real Firestore transactions atomically approve, retry, authorize, and revo
 	assert.equal(response.status, 200);
 	assert.equal(response.body, "true");
 
-	response = await invoke("/v1/grants/revoke", revokeBody());
+	response = await invoke("/v1/grants/revoke", revokeBody("client"));
 	assert.equal(response.status, 200);
 	for (const endpointId of [vector.hostEndpointId, vector.clientEndpointId]) {
 		const access = await firestore.collection("voltIrohEndpointAccess").doc(endpointId).get();
 		assert.equal(access.exists, false);
 	}
-
 	response = await invoke("/v1/relay-access", undefined, {
 		authorization: `Bearer ${"c".repeat(32)}`,
 		"x-iroh-nodeid": vector.hostEndpointId,
 	});
 	assert.equal(response.status, 200);
 	assert.equal(response.body, "false");
+
+	const accessRefs = [vector.hostEndpointId, vector.clientEndpointId].map((endpointId) =>
+		firestore.collection("voltIrohEndpointAccess").doc(endpointId),
+	);
+	async function restoreActiveGrant(grantGenerationId) {
+		await grantRef.set({
+			...grant,
+			grantGenerationId,
+			status: "active",
+			updatedAt: Timestamp.fromMillis(vector.issuedAtMs),
+		});
+		await Promise.all(accessRefs.map((accessRef) => accessRef.set({
+			activeGrants: { [vector.grantId]: grant.expiresAt },
+			blocked: false,
+			expiresAt: grant.expiresAt,
+			pendingClaims: {},
+			updatedAt: Timestamp.fromMillis(vector.issuedAtMs),
+		})));
+	}
+
+	await restoreActiveGrant(vector.grantGenerationId);
+	response = await invoke("/v1/grants/revoke", revokeBody("host"));
+	assert.equal(response.status, 200);
+	assert.equal((await grantRef.get()).data().status, "revoked");
+	for (const accessRef of accessRefs) assert.equal((await accessRef.get()).exists, false);
+
+	const replacementGenerationId = Buffer.alloc(32, 7).toString("base64url");
+	await restoreActiveGrant(replacementGenerationId);
+	response = await invoke("/v1/grants/revoke", revokeBody("host"));
+	assert.equal(response.status, 200);
+	const replacementGrant = (await grantRef.get()).data();
+	assert.equal(replacementGrant.status, "active");
+	assert.equal(replacementGrant.grantGenerationId, replacementGenerationId);
+	for (const accessRef of accessRefs) {
+		const access = (await accessRef.get()).data();
+		assert.ok(access.activeGrants[vector.grantId]);
+	}
+	response = await invoke("/v1/relay-access", undefined, {
+		authorization: `Bearer ${"c".repeat(32)}`,
+		"x-iroh-nodeid": vector.hostEndpointId,
+	});
+	assert.equal(response.status, 200);
+	assert.equal(response.body, "true");
 });

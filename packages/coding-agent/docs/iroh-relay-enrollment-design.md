@@ -95,6 +95,22 @@ grantId = BASE64URL(SHA256(
 ))
 ```
 
+Each approval creates a generation identifier derived from the pair and its
+secret:
+
+```text
+grantGenerationId = BASE64URL(SHA256(
+  UTF8("volt-iroh-enrollment-grant-generation-v1\0") ||
+  HOST_ENDPOINT_ID_RAW ||
+  CLIENT_ENDPOINT_ID_RAW ||
+  GRANT_SECRET_RAW
+))
+```
+
+`grantGenerationId` is public, domain-separated metadata rather than an
+authorization secret. It distinguishes successive approvals for the same
+`grantId` so a delayed revocation cannot remove a replacement generation.
+
 ## Canonical signatures
 
 Every message ends in a final LF. Values may not contain control characters.
@@ -138,13 +154,13 @@ The app generates `grantSecret` before its first request and retries with the
 same value. This makes approval idempotent even if the successful response is
 lost; the broker stores only its hash.
 
-### Renew or revoke a grant
+### Renew a grant
 
-The client signs `renew_grant` or `revoke_grant`:
+The client signs:
 
 ```text
 volt-iroh-enrollment-signature-v1
-operation:<operation>
+operation:renew_grant
 host_endpoint_id:<64 lowercase hex>
 client_endpoint_id:<64 lowercase hex>
 grant_id:<base64url>
@@ -153,9 +169,31 @@ issued_at_ms:<integer>
 nonce:<base64url>
 ```
 
-Renewal additionally requires a consumed limited-use App Check token. Revoke
-requires the pair secret plus endpoint signature so it can be durably retried
-after local Forget even when App Check is temporarily unavailable.
+Renewal requires the grant secret and a consumed limited-use App Check token.
+The broker derives `grantGenerationId` from the submitted secret and requires
+it to match the current stored generation before extending access.
+
+### Revoke a grant
+
+Either endpoint signs as the explicit revoker:
+
+```text
+volt-iroh-enrollment-signature-v1
+operation:revoke_grant
+host_endpoint_id:<64 lowercase hex>
+client_endpoint_id:<64 lowercase hex>
+grant_id:<base64url>
+grant_generation_id:<base64url>
+revoker_endpoint_id:<64 lowercase hex>
+issued_at_ms:<integer>
+nonce:<base64url>
+```
+
+`revokerEndpointId` must equal the host or client endpoint ID, and the broker
+verifies the signature with that endpoint's public key. Revoke contains no
+grant secret and requires no App Check token, so either side can durably retry
+a generation-scoped intent with a fresh signature after deleting the other
+side's authority.
 
 Normative vectors, including fixed test-only private keys, canonical bytes, and
 signatures, are in
@@ -199,8 +237,9 @@ A successful response is `201` (or `200` for an idempotent retry):
 
 Host requests replace `claimSecretHash` with `claimSecret` and use their
 matching operation signature. Status returns `pending`, `approved`,
-`cancelled`, or `expired`; approved status includes only `clientEndpointId` and
-`grantExpiresAtEpochSeconds`. Cancellation is idempotent.
+`cancelled`, or `expired`; approved status includes only `clientEndpointId`,
+`grantGenerationId`, and `grantExpiresAtEpochSeconds`. Cancellation is
+idempotent.
 
 ### `POST /v1/claims/approve`
 
@@ -226,6 +265,7 @@ The transactional response is:
 {
   "status": "approved",
   "grantId": "...",
+  "grantGenerationId": "...",
   "expiresAtEpochSeconds": 0,
   "relayOrigins": ["https://iroh-relay-us-central.volt-cli.dev"]
 }
@@ -234,12 +274,21 @@ The transactional response is:
 Only the first client endpoint may consume a claim. The same client, claim, and
 grant-secret hash may retry idempotently. Any conflicting retry is denied.
 
-### `POST /v1/grants/renew` and `/v1/grants/revoke`
+### `POST /v1/grants/renew`
 
-Both requests contain `version`, both endpoint IDs, `grantId`, `grantSecret`,
-`issuedAtMs`, `nonce`, and `signature`. Renewal consumes a limited-use App Check
-token. It returns the fixed relay origins and a new 30-day expiry. Revoke is
-idempotent and removes this grant from both endpoint access maps.
+The request contains `version`, both endpoint IDs, `grantId`, `grantSecret`,
+`issuedAtMs`, `nonce`, and `signature`. It consumes a limited-use App Check
+token and returns the fixed relay origins and a new 30-day expiry.
+
+### `POST /v1/grants/revoke`
+
+The request contains `version`, both endpoint IDs, `grantId`,
+`grantGenerationId`, `revokerEndpointId`, `issuedAtMs`, `nonce`, and
+`signature`. It contains no `grantSecret` and requires no App Check token. A
+matching generation is atomically marked revoked and removed from both endpoint
+access maps. Missing grants, already-revoked generations, and superseded
+generations return idempotent success without deleting access belonging to a
+different current generation.
 
 ### Relay authorization callback
 
@@ -274,19 +323,26 @@ any positive in-process cache is at most 30 seconds.
   hour, and durable endpoint-plus-salted-IP request windows.
 - If the broker is unavailable, relay registration fails closed. Existing
   paired devices may still connect directly or on the LAN.
-- Forget writes a durable local revocation intent before deleting endpoint
-  authority. A retry worker keeps submitting the signed pair-scoped revoke,
-  including after local expiry, until the broker acknowledges it. Intent
-  deduplication includes the grant secret so one generation cannot erase
-  another generation's cleanup authority.
-- The app stages revocation authority before dispatching approval because a
-  committed response can be lost. A successfully committed saved-host grant
-  protects a matching staged obligation by stable grant authority fields,
-  independent of expiry drift.
-- The daemon durably queues broker-claim cancellation before local cleanup.
-  It also queues client revocation before rejecting any pairing whose consumed
-  RPC endpoint differs from the broker-approved endpoint; both queues drain
-  across restart before their obligations are removed.
+- Forget writes a durable local revocation intent keyed by `grantId` and
+  `grantGenerationId` before deleting peer authority. The intent stores the
+  endpoint pair, grant ID, generation ID, and revoker endpoint ID, but no grant
+  secret or reusable signature. Every attempt creates a fresh nonce, timestamp,
+  and revoker signature, including retries after local expiry or process
+  restart. The intent remains until the broker acknowledges it.
+- The app derives and stages this generation-keyed obligation before dispatching
+  approval because a committed response can be lost. A successfully committed
+  saved-host grant protects its matching staged obligation by stable generation
+  fields, independent of expiry drift.
+- The daemon durably queues broker-claim cancellation before local cleanup. If
+  claim approval names client endpoint A but the consumed RPC transport
+  authenticates endpoint B, one local transaction stages rejection of B and a
+  host-signed broker revocation intent for A before the pairing is rejected.
+  Both queues drain across restart, re-signing every request, before their
+  obligations are removed.
+- Daemon/app integration owns the full approve-A/connect-B/reject-B/revoke-A
+  across-restart test. This broker-only slice contains no daemon or app state
+  implementation and verifies the generation-scoped wire and Firestore
+  contract instead.
 - On upgrade, the daemon immediately rewrites state that contains a deprecated
   top-level or `settings.relayAuthToken`; the app deletes its legacy static
   relay Keychain credential while rejecting v1 saved-host authority. Migration

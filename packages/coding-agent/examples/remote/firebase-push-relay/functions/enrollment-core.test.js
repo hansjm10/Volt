@@ -4,13 +4,15 @@ const { RequestError } = require("./core.js");
 const {
 	assertFreshSignature,
 	getEnrollmentServiceAccount,
+	getGrantGenerationId,
 	getGrantId,
 	getRelayEndpointId,
 	getSaltedIpId,
 	parseApproveClaimRequest,
 	parseClaimSecretRequest,
 	parseCreateClaimRequest,
-	parseGrantRequest,
+	parseRenewGrantRequest,
+	parseRevokeGrantRequest,
 	parseRelayAuthorization,
 	parseRelayOrigins,
 	verifyEd25519Signature,
@@ -62,7 +64,7 @@ function approveBody() {
 	};
 }
 
-function grantBody(operation) {
+function renewBody() {
 	return {
 		version: 1,
 		hostEndpointId: vector.hostEndpointId,
@@ -70,8 +72,23 @@ function grantBody(operation) {
 		grantId: vector.grantId,
 		grantSecret: vector.grantSecret,
 		issuedAtMs: vector.issuedAtMs,
-		nonce: vector.operations[operation].nonce,
-		signature: vector.operations[operation].signatureBase64url,
+		nonce: vector.operations.renew_grant.nonce,
+		signature: vector.operations.renew_grant.signatureBase64url,
+	};
+}
+
+function revokeBody(revoker) {
+	const fixture = vector.operations[`revoke_grant_${revoker}`];
+	return {
+		version: 1,
+		hostEndpointId: vector.hostEndpointId,
+		clientEndpointId: vector.clientEndpointId,
+		grantId: vector.grantId,
+		grantGenerationId: vector.grantGenerationId,
+		revokerEndpointId: revoker === "host" ? vector.hostEndpointId : vector.clientEndpointId,
+		issuedAtMs: vector.issuedAtMs,
+		nonce: fixture.nonce,
+		signature: fixture.signatureBase64url,
 	};
 }
 
@@ -86,7 +103,7 @@ function expectRequestError(operation, status, code) {
 
 test("matches every normative Ed25519 canonical signature and deterministic grant vector", () => {
 	for (const [operation, fixture] of Object.entries(vector.operations)) {
-		const signerEndpointId = operation === "approve_claim" || operation.endsWith("_grant")
+		const signerEndpointId = operation === "approve_claim" || operation === "renew_grant" || operation === "revoke_grant_client"
 			? vector.clientEndpointId
 			: vector.hostEndpointId;
 		assert.equal(
@@ -97,6 +114,10 @@ test("matches every normative Ed25519 canonical signature and deterministic gran
 		assert.equal(Buffer.from(fixture.canonicalMessage, "utf8").toString("base64url"), fixture.canonicalMessageBase64url);
 	}
 	assert.equal(getGrantId(vector.hostEndpointId, vector.clientEndpointId), vector.grantId);
+	assert.equal(
+		getGrantGenerationId(vector.hostEndpointId, vector.clientEndpointId, vector.grantSecret),
+		vector.grantGenerationId,
+	);
 
 	assert.equal(
 		assertFreshSignature(parseCreateClaimRequest(jsonRequest(createBody())), "create_claim", vector.issuedAtMs).toString(),
@@ -116,12 +137,22 @@ test("matches every normative Ed25519 canonical signature and deterministic gran
 	);
 	assert.equal(
 		assertFreshSignature(
-			parseGrantRequest(jsonRequest(grantBody("renew_grant")), "renew_grant"),
+			parseRenewGrantRequest(jsonRequest(renewBody())),
 			"renew_grant",
 			vector.issuedAtMs,
 		).toString(),
 		vector.operations.renew_grant.canonicalMessage,
 	);
+	for (const revoker of ["client", "host"]) {
+		assert.equal(
+			assertFreshSignature(
+				parseRevokeGrantRequest(jsonRequest(revokeBody(revoker))),
+				"revoke_grant",
+				vector.issuedAtMs,
+			).toString(),
+			vector.operations[`revoke_grant_${revoker}`].canonicalMessage,
+		);
+	}
 });
 
 test("strict schemas reject unknown keys, uppercase endpoint IDs, non-canonical base64url, and oversized bodies", () => {
@@ -141,12 +172,26 @@ test("strict schemas reject unknown keys, uppercase endpoint IDs, non-canonical 
 		"endpoint_pair_invalid",
 	);
 	expectRequestError(
-		() => parseGrantRequest(
-			jsonRequest({ ...grantBody("renew_grant"), clientEndpointId: vector.hostEndpointId }),
-			"renew_grant",
+		() => parseRenewGrantRequest(
+			jsonRequest({ ...renewBody(), clientEndpointId: vector.hostEndpointId }),
 		),
 		400,
 		"endpoint_pair_invalid",
+	);
+	expectRequestError(
+		() => parseRevokeGrantRequest(jsonRequest({ ...revokeBody("client"), grantSecret: vector.grantSecret })),
+		400,
+		"revoke_grant_schema_invalid",
+	);
+	expectRequestError(
+		() => parseRevokeGrantRequest(jsonRequest({ ...revokeBody("client"), revokerEndpointId: "1".repeat(64) })),
+		400,
+		"revoker_endpoint_id_invalid",
+	);
+	expectRequestError(
+		() => parseRevokeGrantRequest(jsonRequest({ ...revokeBody("client"), grantGenerationId: vector.claimId })),
+		400,
+		"grant_generation_id_invalid",
 	);
 	expectRequestError(
 		() => parseCreateClaimRequest(jsonRequest({ ...createBody(), claimId: `${vector.claimId}=` })),

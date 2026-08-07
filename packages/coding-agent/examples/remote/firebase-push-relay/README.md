@@ -33,8 +33,23 @@ The function remains publicly invokable because an unattached iOS app must reach
 - Claim approval is single-use and idempotent for the exact phone endpoint and phone-generated grant secret. The resulting deterministic pair grant lasts 30 days and renewal consumes another limited-use App Check token when seven days remain.
 - Firestore transactions update claims, grants, both endpoint access maps, and durable quota windows. Empty unblocked endpoint documents are deleted, active endpoint documents are TTL eligible, and administrative blocks remain durable. Rules deny all direct client access. Defaults cap pending claims, active endpoint grants, new-host approvals, renewals, and endpoint-plus-salted-IP request windows.
 - A managed relay calls `POST /v1/relay-access` with `X-Iroh-NodeId` and a server-to-server bearer. Only `200 text/plain` with exact body `true` permits registration. Current/next bearer overlap supports rotation. Unknown endpoint IDs do not create attacker-keyed quota documents, and the relay must enforce source-network, connection, and aggregate registration limits before invoking the callback.
-- Forget/revoke uses the pair secret plus the phone endpoint signature and is idempotent, allowing the app to retry a durable local obligation without App Check. Broker, Firestore, App Check, signature, origin, or callback-authentication failures fail closed.
+- Approval derives and returns a public `grantGenerationId` from the endpoint pair and phone-generated grant secret. Revocation carries that generation plus an explicit host-or-phone revoker endpoint, contains no grant secret, and requires no App Check. Matching revocation is atomic; stale generations succeed without removing a replacement pair grant.
 - This access hook runs when an endpoint registers. Revocation cannot interrupt an already-open registration and does not meter bytes per endpoint; relay-wide ceilings are separate deployment backstops.
+
+The downstream daemon/app integration must persist revocation intents keyed by
+`grantId` plus `grantGenerationId`; persisted intent state contains stable
+canonical fields, not a reusable signature. Each attempt creates a fresh nonce,
+timestamp, and signature, including after restart. When claim approval names
+client endpoint A but the RPC connection authenticates endpoint B, the daemon
+must atomically stage local rejection of B together with a host-signed broker
+revocation intent for A, then drain that intent to broker acknowledgement across
+restart. App Forget uses the same generation-keyed pattern with a client
+signature.
+
+This directory intentionally has no daemon or app implementation. The full
+approve-A/connect-B/reject-B/revoke-A-across-restart scenario belongs to that
+downstream integration slice; this broker suite verifies the contract and
+transactional generation guard.
 
 The normative ticket, canonical signing, persistence, and lifecycle contract is [Iroh relay enrollment design](https://github.com/volt-hq/Volt/blob/main/packages/coding-agent/docs/iroh-relay-enrollment-design.md).
 
@@ -119,7 +134,7 @@ npm ci
 npm run test:emulator
 ```
 
-The test refuses to run without `FIRESTORE_EMULATOR_HOST`, uses a `demo-*` project, and verifies real transactional create/approve/idempotency/revoke behavior plus both endpoint access maps. The local script pins the Firebase CLI version and disables lifecycle scripts; CI instead verifies the published standalone CLI checksum before execution. The normal `npm test` suite remains fast and uses isolated adapters for strict-schema, signature, App Check, quota, and failure-path coverage.
+The test refuses to run without `FIRESTORE_EMULATOR_HOST`, uses a `demo-*` project, and verifies real transactional create/approve/idempotency behavior, both revocation signers, both endpoint access maps, and stale-generation safety. The local script pins the Firebase CLI version and disables lifecycle scripts; CI instead verifies the published standalone CLI checksum before execution. The normal `npm test` suite remains fast and uses isolated adapters for strict-schema, signature, App Check, quota, and failure-path coverage.
 
 ## Real App Check canary
 
