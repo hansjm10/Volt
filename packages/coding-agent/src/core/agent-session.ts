@@ -438,8 +438,8 @@ interface PreparedDeliverySnapshot {
 	error?: Error;
 }
 
-interface AgentDeliveryParticipantLease {
-	/** Revoked as soon as the upstream participant callback settles. */
+interface AgentDeliveryParticipantScope {
+	/** Revoked as soon as the upstream participant callback settles; carries no delivery ownership. */
 	active: boolean;
 }
 
@@ -542,7 +542,7 @@ export class AgentSession {
 	/** Host cleanup started by synchronous Agent revocation callbacks. */
 	private readonly _deliveryRevocationSettlements = new Set<Promise<void>>();
 	/** Reentrant lifecycle authority scoped to the upstream participant callback. */
-	private readonly _deliveryParticipantContext = new AsyncLocalStorage<AgentDeliveryParticipantLease>();
+	private readonly _deliveryParticipantContext = new AsyncLocalStorage<AgentDeliveryParticipantScope>();
 	private _agentDeliveryRevocationSuppressionDepth = 0;
 	private readonly _suppressedAgentDeliveryRevocations = new Map<string, AgentDelivery>();
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
@@ -1350,15 +1350,15 @@ export class AgentSession {
 				return { outcome: "terminally_failed", error: terminalError };
 			}
 			if (input.upstream) {
-				const lease: AgentDeliveryParticipantLease = { active: true };
+				const scope: AgentDeliveryParticipantScope = { active: true };
 				const upstream = input.upstream;
 				let outcome: AgentDeliveryParticipantOutcome;
 				try {
-					outcome = await this._deliveryParticipantContext.run(lease, () => upstream.settle(input.context));
+					outcome = await this._deliveryParticipantContext.run(scope, () => upstream.settle(input.context));
 				} finally {
 					// AsyncLocalStorage propagates into detached descendants. Revoking the
-					// callback-local lease prevents them from retaining participant authority.
-					lease.active = false;
+					// callback-local scope prevents them from retaining participant authority.
+					scope.active = false;
 				}
 				if (outcome.outcome === "retained") {
 					return await this._settleRetainedDirectInput(input.messages, outcome.error);
