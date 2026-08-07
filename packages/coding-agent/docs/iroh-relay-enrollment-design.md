@@ -2,6 +2,11 @@
 
 Status: normative v1 enrollment contract for the v2 Volt pairing ticket.
 
+Implementation status: the broker contract lands independently from the daemon,
+app, and managed-relay rollout. Until those dependent changes are merged and
+deployed together, current Volt clients and relays continue using the existing
+pairing and relay-authentication path.
+
 This document defines relay-infrastructure enrollment only. It does not grant a
 phone permission to use Volt RPC. Desktop authorization remains the existing
 short-lived pairing secret, the authenticated Iroh transport, the pinned host
@@ -70,7 +75,8 @@ silently upgraded.
 
 ## Encoding primitives
 
-- Endpoint IDs: 32 raw Ed25519 public-key bytes rendered as lowercase hex.
+- Endpoint IDs: 32 raw Ed25519 public-key bytes rendered as lowercase hex. A
+  grant's host and client endpoint IDs must be distinct.
 - IDs, nonces, secrets, hashes, and signatures: unpadded RFC 4648 base64url.
 - `claimId` and request `nonce`: exactly 16 decoded bytes.
 - Claim and grant secrets: exactly 32 decoded bytes.
@@ -246,8 +252,11 @@ The callback accepts the current or next rotation secret using timing-safe
 comparison. It returns `200 text/plain` with the exact body `true` only when an
 endpoint access document has at least one unexpired active grant and is not
 administratively blocked. All other results are `false` or an HTTP error, both
-of which iroh-relay denies. Responses use `Cache-Control: no-store`; any
-positive in-process cache is at most 30 seconds.
+of which iroh-relay denies. Unknown endpoint IDs do not create durable quota
+state. Known endpoint callbacks retain a durable per-endpoint quota, while the
+relay and edge gateway enforce source-network, connection, and aggregate
+registration limits before broker work. Responses use `Cache-Control: no-store`;
+any positive in-process cache is at most 30 seconds.
 
 ## Persistence and lifecycle
 
@@ -257,7 +266,9 @@ positive in-process cache is at most 30 seconds.
 - Endpoint access documents map active grant IDs to expiries. Approval,
   renewal, and revocation update both endpoint maps and the grant in one
   Firestore transaction. Expired map entries do not authorize and are cleaned
-  opportunistically.
+  opportunistically. Empty unblocked documents are deleted, non-empty unblocked
+  documents are TTL eligible at their latest entry expiry, and blocked documents
+  remain durable without a TTL.
 - Defaults cap three pending claims per host, twenty active grants per endpoint,
   ten new host grants per client endpoint per day, six renewals per grant per
   hour, and durable endpoint-plus-salted-IP request windows.

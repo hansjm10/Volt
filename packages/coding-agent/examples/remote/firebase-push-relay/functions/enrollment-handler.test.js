@@ -40,6 +40,7 @@ class FakeFirestore {
 		const mutations = [];
 		const transaction = {
 			create: (reference, value) => mutations.push({ kind: "create", reference, value }),
+			delete: (reference) => mutations.push({ kind: "delete", reference }),
 			get: async (reference) => this.snapshot(reference),
 			set: (reference, value, options) => mutations.push({ kind: "set", options, reference, value }),
 			update: (reference, value) => mutations.push({ kind: "update", reference, value }),
@@ -64,6 +65,10 @@ class FakeFirestore {
 		if (mutation.kind === "create") {
 			if (existing !== undefined) throw new Error("document already exists");
 			this.documents.set(mutation.reference.path, mutation.value);
+			return;
+		}
+		if (mutation.kind === "delete") {
+			this.documents.delete(mutation.reference.path);
 			return;
 		}
 		if (mutation.kind === "update") {
@@ -316,10 +321,11 @@ test("claim approval is idempotent, updates both endpoint maps transactionally, 
 
 	const grant = harness.firestore.documents.get(`${GRANTS_COLLECTION}/${vector.grantId}`);
 	assert.equal(grant.grantSecretHash, vector.grantSecretSha256);
-	assert.equal(grant.approvedClaimId, vector.claimId);
+	assert.equal(grant.approvedClaimId, undefined);
 	for (const endpointId of [vector.hostEndpointId, vector.clientEndpointId]) {
 		const access = harness.firestore.documents.get(endpointAccessPath(endpointId));
 		assert.equal(access.activeGrants[vector.grantId].toMillis(), vector.issuedAtMs + 30 * 24 * 60 * 60 * 1000);
+		assert.equal(access.expiresAt.toMillis(), vector.issuedAtMs + 30 * 24 * 60 * 60 * 1000);
 	}
 
 	response = await invoke(
@@ -397,11 +403,10 @@ test("an expired claim cannot be approved or authorize either endpoint", async (
 		harness.firestore.documents.has(`${GRANTS_COLLECTION}/${vector.grantId}`),
 		false,
 	);
-	const hostAccess = harness.firestore.documents.get(
-		endpointAccessPath(vector.hostEndpointId),
+	assert.equal(
+		harness.firestore.documents.has(endpointAccessPath(vector.hostEndpointId)),
+		false,
 	);
-	assert.deepEqual(Object.keys(hostAccess.activeGrants), []);
-	assert.deepEqual(Object.keys(hostAccess.pendingClaims), []);
 	assert.equal(
 		harness.firestore.documents.has(endpointAccessPath(vector.clientEndpointId)),
 		false,
@@ -461,10 +466,24 @@ test("a new claim for the same endpoint pair reuses its active grant without con
 		originalExpiry,
 	);
 	assert.equal(harness.firestore.documents.get(quotaPath).count, 1);
-	assert.equal(
-		harness.firestore.documents.get(`${GRANTS_COLLECTION}/${vector.grantId}`).approvedClaimId,
-		secondClaimId,
+
+	// Either approved claim remains independently retryable after the shared
+	// pair grant is reused by the other claim.
+	response = await invoke(harness.handler, "/v1/claims/approve", approveBody());
+	assert.equal(response.status, 200);
+	assert.equal(response.body.grantId, vector.grantId);
+	response = await invoke(
+		harness.handler,
+		"/v1/claims/approve",
+		signedApproveBody(
+			secondClaimId,
+			secondClaimSecret,
+			vector.grantSecret,
+			secondIssuedAt,
+		),
 	);
+	assert.equal(response.status, 200);
+	assert.equal(response.body.grantId, vector.grantId);
 });
 
 test("only the first client and matching phone-generated grant secret can retry approval", async () => {
@@ -544,9 +563,9 @@ test("claim cancellation is idempotent and removes the host pending marker", asy
 	response = await invoke(harness.handler, "/v1/claims/cancel", claimBody("cancel_claim"));
 	assert.equal(response.status, 200);
 	assert.deepEqual(response.body, { status: "cancelled" });
-	assert.deepEqual(
-		harness.firestore.documents.get(endpointAccessPath(vector.hostEndpointId)).pendingClaims,
-		{},
+	assert.equal(
+		harness.firestore.documents.has(endpointAccessPath(vector.hostEndpointId)),
+		false,
 	);
 
 	const ttlHarness = createHarness();
@@ -555,9 +574,9 @@ test("claim cancellation is idempotent and removes the host pending marker", asy
 	response = await invoke(ttlHarness.handler, "/v1/claims/cancel", claimBody("cancel_claim"));
 	assert.equal(response.status, 200);
 	assert.deepEqual(response.body, { status: "expired" });
-	assert.deepEqual(
-		ttlHarness.firestore.documents.get(endpointAccessPath(vector.hostEndpointId)).pendingClaims,
-		{},
+	assert.equal(
+		ttlHarness.firestore.documents.has(endpointAccessPath(vector.hostEndpointId)),
+		false,
 	);
 });
 
@@ -649,7 +668,56 @@ test("relay callback returns false on bad server auth and fails closed on malfor
 	assert.equal(JSON.stringify(harness.logs).includes(vector.hostEndpointId), false);
 });
 
-test("relay callbacks do not share an IP quota across endpoint registrations", async () => {
+test("blocked endpoint records survive expired-entry cleanup without a TTL", async () => {
+	const harness = createHarness();
+	harness.firestore.documents.set(endpointAccessPath(vector.hostEndpointId), {
+		activeGrants: { [vector.grantId]: timestampFromMillis(vector.issuedAtMs) },
+		blocked: true,
+		expiresAt: timestampFromMillis(vector.issuedAtMs),
+		pendingClaims: {},
+	});
+	const response = await invoke(harness.handler, "/v1/relay-access", undefined, {
+		headers: {
+			authorization: `Bearer ${"c".repeat(32)}`,
+			"x-iroh-nodeid": vector.hostEndpointId,
+		},
+	});
+	assert.equal(response.status, 200);
+	assert.equal(response.body, "false");
+	const access = harness.firestore.documents.get(endpointAccessPath(vector.hostEndpointId));
+	assert.deepEqual(access.activeGrants, {});
+	assert.equal(access.blocked, true);
+	assert.equal(access.expiresAt, undefined);
+});
+
+test("known relay endpoints retain a durable callback quota", async () => {
+	const harness = createHarness({ requestsPerEndpointPerWindow: 1 });
+	harness.firestore.documents.set(endpointAccessPath(vector.hostEndpointId), {
+		activeGrants: {
+			[vector.grantId]: timestampFromMillis(vector.issuedAtMs + 60_000),
+		},
+		blocked: false,
+		pendingClaims: {},
+	});
+	let response = await invoke(harness.handler, "/v1/relay-access", undefined, {
+		headers: {
+			authorization: `Bearer ${"c".repeat(32)}`,
+			"x-iroh-nodeid": vector.hostEndpointId,
+		},
+	});
+	assert.equal(response.status, 200);
+	assert.equal(response.body, "true");
+	response = await invoke(harness.handler, "/v1/relay-access", undefined, {
+		headers: {
+			authorization: `Bearer ${"c".repeat(32)}`,
+			"x-iroh-nodeid": vector.hostEndpointId,
+		},
+	});
+	assert.equal(response.status, 429);
+	assert.equal(response.body, "false");
+});
+
+test("unknown relay endpoints fail closed without creating attacker-keyed quota documents", async () => {
 	const harness = createHarness({ requestsPerIpPerWindow: 1 });
 	for (const endpointId of ["1".repeat(64), "2".repeat(64)]) {
 		const response = await invoke(
@@ -666,6 +734,10 @@ test("relay callbacks do not share an IP quota across endpoint registrations", a
 		assert.equal(response.status, 200);
 		assert.equal(response.body, "false");
 	}
+	assert.equal(
+		[...harness.firestore.documents.keys()].some((path) => path.includes("relay-endpoint_")),
+		false,
+	);
 });
 
 test("invalid endpoint signatures cannot consume another endpoint's durable quota", async () => {
@@ -680,15 +752,18 @@ test("invalid endpoint signatures cannot consume another endpoint's durable quot
 	);
 });
 
-test("request events contain bounded outcome and latency metadata without endpoint identities", async () => {
+test("request events contain bounded outcome and route metadata without endpoint identities", async () => {
 	const harness = createHarness();
 	await invoke(harness.handler, "/v1/claims", createBody());
 	await invoke(harness.handler, "/v1/relay-access", undefined, {
 		headers: { authorization: `Bearer ${"c".repeat(32)}`, "x-iroh-nodeid": vector.hostEndpointId },
 	});
-	assert.deepEqual(harness.events.map((event) => event.outcome), ["allowed", "denied"]);
+	await invoke(harness.handler, `/unknown/${vector.claimSecret}`, {});
+	assert.deepEqual(harness.events.map((event) => event.outcome), ["allowed", "denied", "not_found"]);
+	assert.deepEqual(harness.events.map((event) => event.route), ["/v1/claims", "/v1/relay-access", "unknown"]);
 	assert.equal(harness.events.every((event) => event.durationMs === 0), true);
 	assert.equal(JSON.stringify(harness.events).includes(vector.hostEndpointId), false);
+	assert.equal(JSON.stringify(harness.events).includes(vector.claimSecret), false);
 });
 
 test("wrong methods and stale signed requests use stable secret-free errors", async () => {

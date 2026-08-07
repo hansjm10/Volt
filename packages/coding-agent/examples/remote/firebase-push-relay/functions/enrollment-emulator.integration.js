@@ -146,6 +146,7 @@ test("real Firestore transactions atomically approve, retry, authorize, and revo
 	for (const endpointId of [vector.hostEndpointId, vector.clientEndpointId]) {
 		const access = (await firestore.collection("voltIrohEndpointAccess").doc(endpointId).get()).data();
 		assert.ok(access.activeGrants[vector.grantId]);
+		assert.equal(access.expiresAt.toMillis(), access.activeGrants[vector.grantId].toMillis());
 	}
 	const grant = (await firestore.collection("voltIrohEnrollmentGrants").doc(vector.grantId).get()).data();
 	assert.equal(grant.status, "active");
@@ -161,8 +162,8 @@ test("real Firestore transactions atomically approve, retry, authorize, and revo
 	response = await invoke("/v1/grants/revoke", revokeBody());
 	assert.equal(response.status, 200);
 	for (const endpointId of [vector.hostEndpointId, vector.clientEndpointId]) {
-		const access = (await firestore.collection("voltIrohEndpointAccess").doc(endpointId).get()).data();
-		assert.equal(access.activeGrants[vector.grantId], undefined);
+		const access = await firestore.collection("voltIrohEndpointAccess").doc(endpointId).get();
+		assert.equal(access.exists, false);
 	}
 
 	response = await invoke("/v1/relay-access", undefined, {

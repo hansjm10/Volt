@@ -31,6 +31,12 @@
 		},
 		{
 			"collectionGroup": "voltIrohEndpointAccess",
+			"fieldPath": "expiresAt",
+			"ttl": true,
+			"indexes": []
+		},
+		{
+			"collectionGroup": "voltIrohEndpointAccess",
 			"fieldPath": "activeGrants",
 			"indexes": []
 		},

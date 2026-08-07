@@ -7,6 +7,10 @@ This Firebase deployment contains two separate HTTPS functions:
 
 Neither service authorizes desktop RPC. Volt pairing, the authenticated Iroh transport, the host-observed client endpoint identity, and persisted RPC/tool grants remain the desktop-control boundary.
 
+## Rollout status
+
+This directory provides the broker contract and deployable backend only. It does not change the current daemon, app, or relay configuration by itself. Managed relay callbacks, v2 pairing tickets, and app enrollment must land and be deployed together before this broker becomes the production admission boundary. Until then, the existing shared-token relay path remains in effect.
+
 ## Security contract
 
 - Registration requires an `X-Firebase-AppCheck` **limited-use** token. The function consumes the token, requires its one-time `jti`, and allowlists the Firebase app id. There is no embedded or shared app secret.
@@ -27,8 +31,8 @@ The function remains publicly invokable because an unattached iOS app must reach
 - A strict `volt+iroh://v2` QR contains a 10-minute claim ID and independent 256-bit claim secret, but no broker URL, durable pair secret, App Check token, or relay infrastructure bearer.
 - The host and phone sign canonical, versioned request bytes with their Iroh Ed25519 endpoint keys. Signed timestamps accept at most ±2 minutes of skew.
 - Claim approval is single-use and idempotent for the exact phone endpoint and phone-generated grant secret. The resulting deterministic pair grant lasts 30 days and renewal consumes another limited-use App Check token when seven days remain.
-- Firestore transactions update claims, grants, both endpoint access maps, and durable quota windows. Rules deny all direct client access. Defaults cap pending claims, active endpoint grants, new-host approvals, renewals, and endpoint-plus-salted-IP request windows.
-- The stock relay calls `POST /v1/relay-access` with `X-Iroh-NodeId` and a server-to-server bearer. Only `200 text/plain` with exact body `true` permits registration. Current/next bearer overlap supports rotation.
+- Firestore transactions update claims, grants, both endpoint access maps, and durable quota windows. Empty unblocked endpoint documents are deleted, active endpoint documents are TTL eligible, and administrative blocks remain durable. Rules deny all direct client access. Defaults cap pending claims, active endpoint grants, new-host approvals, renewals, and endpoint-plus-salted-IP request windows.
+- A managed relay calls `POST /v1/relay-access` with `X-Iroh-NodeId` and a server-to-server bearer. Only `200 text/plain` with exact body `true` permits registration. Current/next bearer overlap supports rotation. Unknown endpoint IDs do not create attacker-keyed quota documents, and the relay must enforce source-network, connection, and aggregate registration limits before invoking the callback.
 - Forget/revoke uses the pair secret plus the phone endpoint signature and is idempotent, allowing the app to retry a durable local obligation without App Check. Broker, Firestore, App Check, signature, origin, or callback-authentication failures fail closed.
 - This access hook runs when an endpoint registers. Revocation cannot interrupt an already-open registration and does not meter bytes per endpoint; relay-wide ceilings are separate deployment backstops.
 
@@ -65,10 +69,11 @@ Volt host state stores only the opaque relay target id, target-scoped credential
 4. Enable replay protection for limited-use App Check tokens; approval and renewal request them with `consume: true`.
 5. Configure APNs credentials in Firebase Console for ordinary FCM notifications.
 6. Create `IROH_ENROLLMENT_IP_SALT`, `IROH_RELAY_ACCESS_SECRET_CURRENT`, and `IROH_RELAY_ACCESS_SECRET_NEXT` with `firebase functions:secrets:set`. Values are 32-512 printable non-space characters; keep `NEXT` set to an independently generated standby value even before rotation.
-7. Deploy Firestore rules and indexes. Configure Firestore TTL on `expiresAt` for `voltPushTargets`, `voltIrohEnrollmentClaims`, `voltIrohEnrollmentGrants`, and `voltIrohEnrollmentQuotaWindows`; authorization never relies on asynchronous TTL deletion.
-8. Keep IAM least-privilege, enable audit logs and budget alerts, and monitor App Check failures, callback latency/denials, quota responses, active grant counts, and `5xx` responses.
+7. Deploy Firestore rules and indexes. Configure Firestore TTL on `expiresAt` for `voltPushTargets`, `voltIrohEnrollmentClaims`, `voltIrohEnrollmentGrants`, `voltIrohEndpointAccess`, and `voltIrohEnrollmentQuotaWindows`; authorization never relies on asynchronous TTL deletion.
+8. Create a dedicated runtime service account, grant only the required App Check verification, Secret Manager access, logging, and enrollment-collection Firestore permissions, and set its email in `IROH_ENROLLMENT_SERVICE_ACCOUNT`.
+9. Keep IAM least-privilege, enable audit logs and budget alerts, and monitor App Check failures, callback latency/denials, quota responses, active grant counts, and `5xx` responses.
 
-For an Internet-facing deployment, put the Gen 2 function behind an external Application Load Balancer with Cloud Armor (or an equivalent gateway), then restrict direct function ingress after verifying traffic through `PUSH_RELAY_URL`.
+For an Internet-facing deployment, put `irohEnrollment` behind an external Application Load Balancer with Cloud Armor (or an equivalent gateway). The function is declared with `ALLOW_INTERNAL_AND_GCLB`, so its generated direct URL is not an Internet ingress path. Route app and relay enrollment traffic through a reviewed load-balanced broker URL. `PUSH_RELAY_URL` configures only the separately authorized push function and is not the enrollment broker URL. The Firebase command below does not provision the load balancer, Cloud Armor policy, service account, or IAM grants.
 
 ## Configuration
 
@@ -79,6 +84,7 @@ For an Internet-facing deployment, put the Gen 2 function behind an external App
 - `REGISTRATIONS_PER_INSTANCE_PER_MINUTE`: 1-120, default 30.
 - `FUNCTION_REGION`: deployment region, default `us-central1`.
 - `IROH_RELAY_ORIGINS`: comma-separated 1-8 canonical HTTPS origins returned to both endpoints; default `https://iroh-relay-us-central.volt-cli.dev`.
+- `IROH_ENROLLMENT_SERVICE_ACCOUNT`: required dedicated user-managed runtime service account email. Deployment fails when it is absent or malformed.
 - `IROH_ENROLLMENT_REQUESTS_PER_ENDPOINT_PER_MINUTE`: durable endpoint quota, 1-600, default 60.
 - `IROH_ENROLLMENT_REQUESTS_PER_IP_PER_MINUTE`: durable salted-IP quota, 1-3000, default 300.
 - Secret Manager only (never `.env`): `IROH_ENROLLMENT_IP_SALT`, `IROH_RELAY_ACCESS_SECRET_CURRENT`, and `IROH_RELAY_ACCESS_SECRET_NEXT`.
@@ -93,7 +99,7 @@ firebase firestore:databases:create '(default)' --project volt-3fae7 --location 
 firebase deploy --project volt-3fae7 --only firestore:rules,firestore:indexes,functions:volt-push-relay:pushRelay,functions:volt-push-relay:irohEnrollment
 ```
 
-Cloud Functions deployment requires the Blaze plan. Do not deploy until App Check, the app-id allowlist, APNs, TTL, monitoring, budget, and edge controls are verified.
+Cloud Functions deployment requires the Blaze plan. The enrollment function is not Internet-reachable until the load-balanced broker URL exists. Do not route production traffic to it until App Check, the app-id allowlist, APNs, TTL, monitoring, budgets, the dedicated runtime identity, Cloud Armor policy, and relay-side rate limits are verified.
 
 For a self-hosted relay, point the host at the same canonical URL configured in `PUSH_RELAY_URL`:
 
@@ -113,7 +119,7 @@ npm ci
 npm run test:emulator
 ```
 
-The test refuses to run without `FIRESTORE_EMULATOR_HOST`, uses a `demo-*` project, and verifies real transactional create/approve/idempotency/revoke behavior plus both endpoint access maps. The normal `npm test` suite remains fast and uses isolated adapters for strict-schema, signature, App Check, quota, and failure-path coverage.
+The test refuses to run without `FIRESTORE_EMULATOR_HOST`, uses a `demo-*` project, and verifies real transactional create/approve/idempotency/revoke behavior plus both endpoint access maps. `firebase-tools` is an exact, lockfile-managed development dependency. The normal `npm test` suite remains fast and uses isolated adapters for strict-schema, signature, App Check, quota, and failure-path coverage.
 
 ## Real App Check canary
 
@@ -123,7 +129,7 @@ Before promoting, verify one real limited-use token succeeds once and replay fai
 
 ## Secret rotation and incident revocation
 
-Rotate relay callback authentication with overlap: set a new backend `NEXT`, deploy, replace and restart one relay credential at a time, verify each relay, then promote the new value to `CURRENT` and replace `NEXT` with a fresh standby. Never clear current and next together. The relay-side procedure is in [Self-hosted iroh relay](../../../../../docs/self-hosted-relay.md).
+Rotate relay callback authentication with overlap: set a new backend `NEXT`, deploy, replace and restart one managed relay credential at a time, verify each relay, then promote the new value to `CURRENT` and replace `NEXT` with a fresh standby. Never clear current and next together. The current [self-hosted relay guide](../../../../../docs/self-hosted-relay.md) documents the pre-enrollment shared-token path; it is not a managed-callback deployment procedure.
 
 For a compromised endpoint, transactionally mark its endpoint-access document blocked or revoke its pair grants, then inspect grants for the peer endpoints. This denies the next relay registration but cannot interrupt an existing stock-relay registration. For a callback-secret incident, rotate with the shortest safe overlap, restart every relay, review callback denials/egress, and never restore the retired fleet credential.
 

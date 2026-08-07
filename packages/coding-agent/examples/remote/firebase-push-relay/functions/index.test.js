@@ -56,6 +56,8 @@ const moduleStubs = new Map([
 	],
 ]);
 const originalLoad = Module._load;
+const originalEnrollmentServiceAccount = process.env.IROH_ENROLLMENT_SERVICE_ACCOUNT;
+process.env.IROH_ENROLLMENT_SERVICE_ACCOUNT = "volt-enrollment@volt-3fae7.iam.gserviceaccount.com";
 Module._load = function load(request, parent, isMain) {
 	return moduleStubs.has(request)
 		? moduleStubs.get(request)
@@ -67,12 +69,22 @@ try {
 	({ irohEnrollment, pushRelay } = require("./index.js"));
 } finally {
 	Module._load = originalLoad;
+	if (originalEnrollmentServiceAccount === undefined) {
+		delete process.env.IROH_ENROLLMENT_SERVICE_ACCOUNT;
+	} else {
+		process.env.IROH_ENROLLMENT_SERVICE_ACCOUNT = originalEnrollmentServiceAccount;
+	}
 }
 
 test("exports enrollment as a separate secret-backed v2 HTTPS function", () => {
 	assert.equal(typeof irohEnrollment, "function");
 	assert.notEqual(irohEnrollment, pushRelay);
 	assert.equal(requestFunctionOptions.length, 2);
+	assert.equal(requestFunctionOptions[0].ingressSettings, "ALLOW_INTERNAL_AND_GCLB");
+	assert.equal(
+		requestFunctionOptions[0].serviceAccount,
+		"volt-enrollment@volt-3fae7.iam.gserviceaccount.com",
+	);
 	assert.deepEqual(
 		requestFunctionOptions[0].secrets.map((secret) => secret.name),
 		[

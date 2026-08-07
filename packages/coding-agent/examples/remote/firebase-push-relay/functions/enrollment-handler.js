@@ -31,6 +31,15 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 const CLAIM_STATUSES = new Set(["pending", "approved", "cancelled", "expired"]);
 const GRANT_STATUSES = new Set(["active", "revoked"]);
+const KNOWN_ROUTE_PATHS = new Set([
+	"/v1/claims",
+	"/v1/claims/approve",
+	"/v1/claims/cancel",
+	"/v1/claims/status",
+	"/v1/grants/renew",
+	"/v1/grants/revoke",
+	"/v1/relay-access",
+]);
 
 function createIrohEnrollmentHandler(options) {
 	const {
@@ -58,6 +67,7 @@ function createIrohEnrollmentHandler(options) {
 		response.set("cache-control", "no-store");
 		response.set("x-content-type-options", "nosniff");
 		const routePath = normalizeRoutePath(request.path || request.originalUrl || request.url || "/");
+		const loggedRoute = KNOWN_ROUTE_PATHS.has(routePath) ? routePath : "unknown";
 		const isRelayRoute = routePath === "/v1/relay-access";
 		const startedAtMs = now();
 		let outcome = "allowed";
@@ -76,7 +86,7 @@ function createIrohEnrollmentHandler(options) {
 			if (response.headersSent) return;
 			if (isRelayRoute) {
 				if (!(error instanceof RequestError)) {
-					logError({ name: getSafeErrorName(error), route: routePath });
+					logError({ name: getSafeErrorName(error), route: loggedRoute });
 				}
 				response.status(error instanceof RequestError ? error.status : 500).type("text/plain").send("false");
 				return;
@@ -85,13 +95,13 @@ function createIrohEnrollmentHandler(options) {
 				response.status(error.status).json({ error: error.publicMessage });
 				return;
 			}
-			logError({ name: getSafeErrorName(error), route: routePath });
+			logError({ name: getSafeErrorName(error), route: loggedRoute });
 			response.status(500).json({ error: "internal_error" });
 		} finally {
 			logEvent({
 				durationMs: Math.max(0, now() - startedAtMs),
 				outcome,
-				route: routePath,
+				route: loggedRoute,
 			});
 		}
 	};
@@ -319,7 +329,6 @@ function createIrohEnrollmentHandler(options) {
 				}
 				const grant = readGrant(grantSnapshot);
 				if (
-					grant.approvedClaimId !== enrollmentRequest.claimId ||
 					grant.hostEndpointId !== enrollmentRequest.hostEndpointId ||
 					grant.clientEndpointId !== enrollmentRequest.clientEndpointId ||
 					grant.status !== "active" ||
@@ -374,7 +383,6 @@ function createIrohEnrollmentHandler(options) {
 			const nowTimestamp = timestampFromMillis(nowMs);
 			const expiresAt = timestampFromMillis(expiresAtMs);
 			transaction.set(grantRef, {
-				approvedClaimId: enrollmentRequest.claimId,
 				clientEndpointId: enrollmentRequest.clientEndpointId,
 				createdAt: reusesActiveGrant
 					? timestampFromMillis(requireTimestampMillis(existingGrant.createdAt))
@@ -525,20 +533,23 @@ function createIrohEnrollmentHandler(options) {
 		parseRelayAuthorization(request, currentSecret, nextSecret);
 		const endpointId = getRelayEndpointId(request);
 		const nowMs = now();
-		await reserveRelayEndpointQuota(endpointId, nowMs);
 		const firestore = getFirestore();
 		const endpointAccessRef = firestore.collection(ENDPOINT_ACCESS_COLLECTION).doc(endpointId);
-		const allowed = await firestore.runTransaction(async (transaction) => {
+		const access = await firestore.runTransaction(async (transaction) => {
 			const endpointAccessSnapshot = await transaction.get(endpointAccessRef);
-			if (!endpointAccessSnapshot.exists) return false;
+			if (!endpointAccessSnapshot.exists) return { allowed: false, exists: false };
 			const endpointAccess = readEndpointAccess(endpointAccessSnapshot, nowMs);
 			if (endpointAccess.changed) {
 				writeEndpointAccess(transaction, endpointAccessRef, endpointAccess, nowMs);
 			}
-			return !endpointAccess.blocked && Object.keys(endpointAccess.activeGrants).length > 0;
+			return {
+				allowed: !endpointAccess.blocked && Object.keys(endpointAccess.activeGrants).length > 0,
+				exists: true,
+			};
 		});
-		response.status(200).type("text/plain").send(allowed ? "true" : "false");
-		return allowed;
+		if (access.exists) await reserveRelayEndpointQuota(endpointId, nowMs);
+		response.status(200).type("text/plain").send(access.allowed ? "true" : "false");
+		return access.allowed;
 	}
 
 	async function reserveRelayEndpointQuota(endpointId, nowMs) {
@@ -615,7 +626,6 @@ function readGrant(snapshot) {
 		grant.version !== 1 ||
 		!isEndpointId(grant.hostEndpointId) ||
 		!isEndpointId(grant.clientEndpointId) ||
-		!isBase64urlBytes(grant.approvedClaimId, 16) ||
 		!isBase64urlBytes(grant.grantId, 32) ||
 		!isBase64urlBytes(grant.grantSecretHash, 32) ||
 		!GRANT_STATUSES.has(grant.status)
@@ -686,15 +696,27 @@ function cleanTimestampMap(value, nowMs, idPattern) {
 }
 
 function writeEndpointAccessDocument(transaction, reference, endpointAccess, updatedAt) {
-	transaction.set(
-		reference,
-		{
-			activeGrants: endpointAccess.activeGrants,
-			pendingClaims: endpointAccess.pendingClaims,
-			updatedAt,
-		},
-		{ merge: true },
-	);
+	const expiries = [
+		...Object.values(endpointAccess.activeGrants),
+		...Object.values(endpointAccess.pendingClaims),
+	];
+	if (!endpointAccess.blocked && expiries.length === 0) {
+		transaction.delete(reference);
+		return;
+	}
+	let expiresAt;
+	for (const candidate of expiries) {
+		if (expiresAt === undefined || requireTimestampMillis(candidate) > requireTimestampMillis(expiresAt)) {
+			expiresAt = candidate;
+		}
+	}
+	transaction.set(reference, {
+		activeGrants: endpointAccess.activeGrants,
+		blocked: endpointAccess.blocked,
+		...(!endpointAccess.blocked && expiresAt !== undefined ? { expiresAt } : {}),
+		pendingClaims: endpointAccess.pendingClaims,
+		updatedAt,
+	});
 }
 
 function readRequestWindow(snapshot, nowMs) {

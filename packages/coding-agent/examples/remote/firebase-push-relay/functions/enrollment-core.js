@@ -42,6 +42,17 @@ function getEnrollmentConfig(env = process.env) {
 	};
 }
 
+function getEnrollmentServiceAccount(env = process.env) {
+	const value = env.IROH_ENROLLMENT_SERVICE_ACCOUNT?.trim();
+	if (
+		value === undefined ||
+		!/^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/.test(value)
+	) {
+		throw new Error("IROH_ENROLLMENT_SERVICE_ACCOUNT must be a dedicated service account email");
+	}
+	return value;
+}
+
 function parseRelayOrigins(configured) {
 	const values = (configured === undefined ? DEFAULT_RELAY_ORIGIN : configured)
 		.split(",")
@@ -129,10 +140,14 @@ function parseApproveClaimRequest(request) {
 		],
 		"approve_claim",
 	);
+	const version = expectVersion(body.version);
+	const hostEndpointId = expectEndpointId(body.hostEndpointId);
+	const clientEndpointId = expectEndpointId(body.clientEndpointId);
+	assertDistinctEndpointIds(hostEndpointId, clientEndpointId);
 	return {
-		version: expectVersion(body.version),
-		hostEndpointId: expectEndpointId(body.hostEndpointId),
-		clientEndpointId: expectEndpointId(body.clientEndpointId),
+		version,
+		hostEndpointId,
+		clientEndpointId,
 		claimId: expectBase64url(body.claimId, 16, "claim_id"),
 		claimSecret: expectBase64url(body.claimSecret, 32, "claim_secret"),
 		grantSecret: expectBase64url(body.grantSecret, 32, "grant_secret"),
@@ -158,10 +173,14 @@ function parseGrantRequest(request, operation) {
 		],
 		operation,
 	);
+	const version = expectVersion(body.version);
+	const hostEndpointId = expectEndpointId(body.hostEndpointId);
+	const clientEndpointId = expectEndpointId(body.clientEndpointId);
+	assertDistinctEndpointIds(hostEndpointId, clientEndpointId);
 	return {
-		version: expectVersion(body.version),
-		hostEndpointId: expectEndpointId(body.hostEndpointId),
-		clientEndpointId: expectEndpointId(body.clientEndpointId),
+		version,
+		hostEndpointId,
+		clientEndpointId,
 		grantId: expectBase64url(body.grantId, 32, "grant_id"),
 		grantSecret: expectBase64url(body.grantSecret, 32, "grant_secret"),
 		issuedAtMs: expectIssuedAtMs(body.issuedAtMs),
@@ -333,6 +352,12 @@ function expectEndpointId(value) {
 	return value;
 }
 
+function assertDistinctEndpointIds(hostEndpointId, clientEndpointId) {
+	if (hostEndpointId === clientEndpointId) {
+		throw new RequestError(400, "endpoint_pair_invalid");
+	}
+}
+
 function expectIssuedAtMs(value) {
 	if (!Number.isSafeInteger(value) || value < 0) {
 		throw new RequestError(400, "issued_at_ms_invalid");
@@ -400,6 +425,7 @@ module.exports = {
 	canonicalClaimMessage,
 	canonicalGrantMessage,
 	getEnrollmentConfig,
+	getEnrollmentServiceAccount,
 	getGrantId,
 	getRelayEndpointId,
 	getRequestIp,

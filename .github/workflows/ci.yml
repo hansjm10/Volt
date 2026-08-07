@@ -30,10 +30,16 @@ jobs:
           node-version: '22.23.1'
           cache: npm
 
+      - name: Setup Java
+        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep openjdk-21-jre-headless
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
           sudo ln -sf "$(which fdfind)" /usr/local/bin/fd
 
       - name: Install dependencies

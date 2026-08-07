@@ -7,7 +7,7 @@ const { error: logFirebaseError, info: logFirebaseInfo } = require("firebase-fun
 const { defineSecret } = require("firebase-functions/params");
 const { onRequest } = require("firebase-functions/v2/https");
 const { createIrohEnrollmentHandler } = require("./enrollment-handler.js");
-const { getEnrollmentConfig } = require("./enrollment-core.js");
+const { getEnrollmentConfig, getEnrollmentServiceAccount } = require("./enrollment-core.js");
 const { createPushTargetRegistrationHandler } = require("./registration.js");
 const {
 	RequestError,
@@ -58,6 +58,7 @@ const maxRegistrationsPerInstancePerMinute = getBoundedPositiveInteger(
 );
 const registrationWindows = new Map();
 const enrollmentConfig = getEnrollmentConfig();
+const irohEnrollmentServiceAccount = getEnrollmentServiceAccount();
 const irohEnrollmentIpSalt = defineSecret("IROH_ENROLLMENT_IP_SALT");
 const irohRelayAccessSecretCurrent = defineSecret("IROH_RELAY_ACCESS_SECRET_CURRENT");
 const irohRelayAccessSecretNext = defineSecret("IROH_RELAY_ACCESS_SECRET_NEXT");
@@ -90,10 +91,12 @@ exports.irohEnrollment = onRequest(
 	{
 		concurrency: 40,
 		cors: false,
+		ingressSettings: "ALLOW_INTERNAL_AND_GCLB",
 		invoker: "public",
 		maxInstances: 20,
 		memory: "256MiB",
 		region: process.env.FUNCTION_REGION || DEFAULT_REGION,
+		serviceAccount: irohEnrollmentServiceAccount,
 		secrets: [
 			irohEnrollmentIpSalt,
 			irohRelayAccessSecretCurrent,

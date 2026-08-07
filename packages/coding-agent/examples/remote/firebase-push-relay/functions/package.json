@@ -10,10 +10,13 @@
 	"scripts": {
 		"check": "for file in *.js; do node --check \"$file\"; done",
 		"test": "node --test *.test.js",
-		"test:emulator": "npx --yes firebase-tools@15.26.0 emulators:exec --config ../firebase.json --project demo-volt-iroh-enrollment --only firestore \"node --test enrollment-emulator.integration.js\""
+		"test:emulator": "firebase emulators:exec --config ../firebase.json --project demo-volt-iroh-enrollment --only firestore \"node --test enrollment-emulator.integration.js\""
 	},
 	"dependencies": {
-		"firebase-admin": "13.10.0",
-		"firebase-functions": "7.2.5"
+		"firebase-admin": "14.2.0",
+		"firebase-functions": "7.3.2"
+	},
+	"devDependencies": {
+		"firebase-tools": "15.26.0"
 	}
 }
