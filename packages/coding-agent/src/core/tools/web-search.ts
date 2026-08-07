@@ -812,6 +812,9 @@ export function createWebSearchToolDefinition(
 	};
 }
 
-export function createWebSearchTool(cwd: string, options?: WebSearchToolOptions): AgentTool<typeof webSearchSchema> {
+export function createWebSearchTool(
+	cwd: string,
+	options?: WebSearchToolOptions,
+): AgentTool<typeof webSearchSchema, WebSearchToolDetails> {
 	return wrapToolDefinition(createWebSearchToolDefinition(cwd, options));
 }

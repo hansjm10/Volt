@@ -215,12 +215,7 @@ export function createFindToolDefinition(
 								return;
 							}
 							if (results.length === 0) {
-								settle(() =>
-									resolve({
-										content: [{ type: "text", text: "No files found matching pattern" }],
-										details: undefined,
-									}),
-								);
+								settle(() => resolve({ content: [{ type: "text", text: "No files found matching pattern" }] }));
 								return;
 							}
 
@@ -249,7 +244,7 @@ export function createFindToolDefinition(
 							settle(() =>
 								resolve({
 									content: [{ type: "text", text: resultOutput }],
-									details: Object.keys(details).length > 0 ? details : undefined,
+									...(Object.keys(details).length > 0 ? { details } : {}),
 								}),
 							);
 							return;
@@ -343,12 +338,7 @@ export function createFindToolDefinition(
 							}
 
 							if (relativized.length === 0) {
-								settle(() =>
-									resolve({
-										content: [{ type: "text", text: "No files found matching pattern" }],
-										details: undefined,
-									}),
-								);
+								settle(() => resolve({ content: [{ type: "text", text: "No files found matching pattern" }] }));
 								return;
 							}
 							if (!patternUsesPath && relativized.length >= effectiveLimit) resultLimitReached = true;
@@ -373,7 +363,7 @@ export function createFindToolDefinition(
 							settle(() =>
 								resolve({
 									content: [{ type: "text", text: resultOutput }],
-									details: Object.keys(details).length > 0 ? details : undefined,
+									...(Object.keys(details).length > 0 ? { details } : {}),
 								}),
 							);
 						});
@@ -401,6 +391,9 @@ export function createFindToolDefinition(
 	};
 }
 
-export function createFindTool(cwd: string, options?: FindToolOptions): AgentTool<typeof findSchema> {
+export function createFindTool(
+	cwd: string,
+	options?: FindToolOptions,
+): AgentTool<typeof findSchema, FindToolDetails | undefined> {
 	return wrapToolDefinition(createFindToolDefinition(cwd, options));
 }

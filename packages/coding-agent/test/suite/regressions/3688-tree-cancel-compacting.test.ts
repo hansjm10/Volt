@@ -33,4 +33,31 @@ describe("issue #3688 tree cancellation compaction state", () => {
 		expect(harness.session.isCompacting).toBe(false);
 		expect(harness.sessionManager.getLeafId()).toBe(currentLeafId);
 	});
+
+	it("rejects invalid extension summaries before moving the active leaf", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("session_before_tree", () => ({
+						summary: {
+							summary: "invalid branch summary",
+							details: { shared: new SharedArrayBuffer(1) } as never,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		const targetId = harness.sessionManager.appendMessage(userMsg("first"));
+		harness.sessionManager.appendMessage(assistantMsg("reply"));
+		const currentLeafId = harness.sessionManager.appendMessage(userMsg("second"));
+
+		await expect(harness.session.navigateTree(targetId, { summarize: true })).rejects.toThrow(
+			"Extension session_before_tree output",
+		);
+		expect(harness.sessionManager.getLeafId()).toBe(currentLeafId);
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "branch_summary")).toBe(false);
+		expect(harness.session.isCompacting).toBe(false);
+	});
 });

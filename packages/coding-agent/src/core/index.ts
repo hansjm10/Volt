@@ -2,6 +2,13 @@
  * Core modules shared between all run modes.
  */
 
+export type {
+	JsonCompatible,
+	JsonCompatibleInput,
+	JsonObject,
+	JsonPrimitive,
+	JsonValue,
+} from "@hansjm10/volt-ai";
 export {
 	AgentSession,
 	type AgentSessionConfig,
@@ -87,6 +94,7 @@ export type {
 	HostInteraction,
 } from "./host-interaction.ts";
 export * from "./mcp/index.ts";
+export type { CustomMessage, CustomMessageInput } from "./messages.ts";
 export * from "./remote/iroh/index.ts";
 export {
 	attachJsonlLineReader,

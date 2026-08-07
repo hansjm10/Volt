@@ -2,6 +2,7 @@ import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
 	type ImageContent,
+	type JsonValue,
 	type Model,
 	streamSimple,
 	type UserMessage,
@@ -232,6 +233,7 @@ export class AgentHarness<
 	private activeToolNames: string[];
 	private readonly deliveryInbox = new DeliveryInbox<"steer" | "followUp", UserMessage>();
 	private activeDeliveryLease?: DeliveryLease<"steer" | "followUp", UserMessage>;
+	private readonly committedDeliveryIds = new Set<string>();
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
 	private nextTurnQueue: AgentMessage[] = [];
@@ -481,7 +483,11 @@ export class AgentHarness<
 
 	private beginDelivery(deliveryId: string | undefined): boolean {
 		if (deliveryId === undefined || !this.activeDeliveryLease?.owns(deliveryId)) return true;
-		return this.activeDeliveryLease.begin(deliveryId) !== undefined;
+		const delivery = this.activeDeliveryLease.begin(deliveryId);
+		if (!delivery) return false;
+		if (!this.activeDeliveryLease.settle(deliveryId, "committed")) return false;
+		this.committedDeliveryIds.add(deliveryId);
+		return true;
 	}
 
 	private createLoopConfig(
@@ -503,26 +509,27 @@ export class AgentHarness<
 					type: "tool_call",
 					toolCallId: toolCall.id,
 					toolName: toolCall.name,
-					input: args as Record<string, unknown>,
+					input: args,
 				});
 				return result ? { block: result.block, reason: result.reason } : undefined;
 			},
 			afterToolCall: async ({ toolCall, args, result, isError }) => {
+				const details = result.details as JsonValue | undefined;
 				const patch = await this.emitHook({
 					type: "tool_result",
 					toolCallId: toolCall.id,
 					toolName: toolCall.name,
-					input: args as Record<string, unknown>,
+					input: args,
 					content: result.content,
-					details: result.details,
+					...(details === undefined ? {} : { details }),
 					isError,
 				});
 				return patch
 					? {
-							content: patch.content,
-							details: patch.details,
-							isError: patch.isError,
-							disposition: patch.disposition,
+							...(patch.content === undefined ? {} : { content: patch.content }),
+							...(patch.details === undefined ? {} : { details: patch.details }),
+							...(patch.isError === undefined ? {} : { isError: patch.isError }),
+							...(patch.disposition === undefined ? {} : { disposition: patch.disposition }),
 						}
 					: undefined;
 			},
@@ -551,7 +558,9 @@ export class AgentHarness<
 					? { type: "request", reason: "delivery", deliveries: followUp }
 					: { type: "stop" };
 			},
-			beginDelivery: (delivery) => this.beginDelivery(delivery.deliveryId),
+			beginDelivery: (delivery) => ({
+				outcome: this.beginDelivery(delivery.deliveryId) ? "committed" : "revoked",
+			}),
 			prepareRequest: async ({ context }) => {
 				await this.flushPendingSessionWrites();
 				if (firstRequest) {
@@ -629,7 +638,7 @@ export class AgentHarness<
 				errors: [],
 			};
 			state.deliveries.set(event.deliveryId, deliveryState);
-			if (event.deliveryId !== undefined && this.activeDeliveryLease?.owns(event.deliveryId)) {
+			if (event.deliveryId !== undefined && this.committedDeliveryIds.delete(event.deliveryId)) {
 				try {
 					await this.emitQueueUpdate();
 				} catch (error) {
@@ -869,6 +878,7 @@ export class AgentHarness<
 			} finally {
 				this.deliveryInbox.rollbackActiveLease();
 				this.activeDeliveryLease = undefined;
+				this.committedDeliveryIds.clear();
 				this.runAbortController = undefined;
 			}
 		}
@@ -954,7 +964,7 @@ export class AgentHarness<
 
 	async compact(
 		customInstructions?: string,
-	): Promise<{ summary: string; firstKeptEntryId: string; tokensBefore: number; details?: unknown }> {
+	): Promise<{ summary: string; firstKeptEntryId: string; tokensBefore: number; details?: JsonValue }> {
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "compact() requires idle harness");
 		this.phase = "compaction";
 		try {
@@ -994,7 +1004,7 @@ export class AgentHarness<
 				result.firstKeptEntryId,
 				result.tokensBefore,
 				result.details,
-				provided !== undefined,
+				provided === undefined ? undefined : true,
 			);
 			const entry = await this.session.getEntry(entryId);
 			if (entry?.type === "compaction") {
@@ -1035,7 +1045,7 @@ export class AgentHarness<
 			if (hookResult?.cancel) return { cancelled: true };
 			let summaryEntry: NavigateTreeResult["summaryEntry"];
 			let summaryText: string | undefined = hookResult?.summary?.summary;
-			let summaryDetails: unknown = hookResult?.summary?.details;
+			let summaryDetails: JsonValue | undefined = hookResult?.summary?.details;
 			if (!summaryText && options?.summarize && entries.length > 0) {
 				const model = this.model;
 				if (!model) throw new AgentHarnessError("invalid_state", "No model set for branch summary");
@@ -1086,7 +1096,11 @@ export class AgentHarness<
 			const summaryId = await this.session.moveTo(
 				newLeafId,
 				summaryText
-					? { summary: summaryText, details: summaryDetails, fromHook: hookResult?.summary !== undefined }
+					? {
+							summary: summaryText,
+							...(summaryDetails === undefined ? {} : { details: summaryDetails }),
+							...(hookResult?.summary === undefined ? {} : { fromHook: true }),
+						}
 					: undefined,
 			);
 			if (summaryId) {
@@ -1098,7 +1112,7 @@ export class AgentHarness<
 				newLeafId: await this.session.getLeafId(),
 				oldLeafId,
 				summaryEntry,
-				fromHook: hookResult?.summary !== undefined,
+				...(hookResult?.summary === undefined ? {} : { fromHook: true }),
 			});
 			return { cancelled: false, editorText, summaryEntry };
 		} catch (error) {

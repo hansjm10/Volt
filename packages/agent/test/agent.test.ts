@@ -167,9 +167,16 @@ describe("Agent", () => {
 		expect(agent.state.errorMessage).toBe("provider exploded");
 	});
 
-	it("feeds finalized user-message replacements into the current model context", async () => {
+	it("feeds prepared user-message replacements into the current model context", async () => {
 		let providerUserText: string | undefined;
 		const agent = new Agent({
+			prepareDelivery: (delivery) => ({
+				messages: delivery.messages.map((message) =>
+					message.role === "user"
+						? { ...message, content: [{ type: "text", text: "rewritten user message" }] }
+						: message,
+				),
+			}),
 			streamFn: (_model, context) => {
 				const userMessage = context.messages.find((message) => message.role === "user");
 				if (userMessage?.role === "user") {
@@ -184,15 +191,6 @@ describe("Agent", () => {
 				});
 				return stream;
 			},
-		});
-		agent.subscribe((event) => {
-			if (event.type === "message_end" && event.message.role === "user") {
-				return {
-					...event.message,
-					content: [{ type: "text", text: "rewritten user message" }],
-				};
-			}
-			return undefined;
 		});
 
 		await agent.prompt("original user message");
@@ -852,11 +850,15 @@ describe("Agent", () => {
 		const releasePreparation = createDeferred();
 		const requestReasons: string[] = [];
 		const providerUserTexts: Array<string | undefined> = [];
+		const revokedDeliveryIds: string[] = [];
+		let preparingDeliveryId: string | undefined;
 		let blockFirstPrompt = true;
 		const agent = new Agent({
+			deliveryRevoked: (delivery) => revokedDeliveryIds.push(delivery.deliveryId),
 			prepareDelivery: async (delivery) => {
 				if (delivery.kind === "prompt" && blockFirstPrompt) {
 					blockFirstPrompt = false;
+					preparingDeliveryId = delivery.deliveryId;
 					preparationStarted.resolve();
 					await releasePreparation.promise;
 				}
@@ -883,7 +885,10 @@ describe("Agent", () => {
 
 		const revokedPrompt = agent.prompt("revoked");
 		await preparationStarted.promise;
+		expect(agent.canPrepareDelivery(preparingDeliveryId!)).toBe(true);
 		expect(agent.discardPendingPrompt()).toHaveLength(1);
+		expect(revokedDeliveryIds).toEqual([preparingDeliveryId]);
+		expect(agent.canPrepareDelivery(preparingDeliveryId!)).toBe(false);
 		releasePreparation.resolve();
 		await revokedPrompt;
 
@@ -1047,14 +1052,17 @@ describe("Agent", () => {
 		expect(agent.hasQueuedMessages()).toBe(false);
 	});
 
-	it("restores a delivery when its staged commit throws", async () => {
+	it("restores a delivery when its participant explicitly retains", async () => {
 		let failCommit = true;
 		let providerCalls = 0;
 		const agent = new Agent({
 			prepareDelivery: (delivery) => ({
 				messages: [...delivery.messages],
-				commit: () => {
-					if (failCommit) throw new Error("commit failed");
+				participant: {
+					settle: () =>
+						failCommit
+							? { outcome: "retained", error: new Error("settlement failed") }
+							: { outcome: "committed" },
 				},
 			}),
 			streamFn: () => {
@@ -1074,7 +1082,7 @@ describe("Agent", () => {
 		});
 
 		await agent.continue();
-		expect(agent.state.errorMessage).toBe("commit failed");
+		expect(agent.state.errorMessage).toBe("settlement failed");
 		expect(agent.hasQueuedMessages()).toBe(true);
 		expect(providerCalls).toBe(0);
 
@@ -1085,8 +1093,9 @@ describe("Agent", () => {
 		expect(providerCalls).toBe(1);
 	});
 
-	it("commits only the delivery whose message_start began when a batch listener fails", async () => {
+	it("keeps default committed batch deliveries authoritative when an observer fails", async () => {
 		const delivered: string[] = [];
+		let laterAgentEndUserTexts: string[] = [];
 		let failFirst = true;
 		const agent = new Agent({
 			steeringMode: "all",
@@ -1110,7 +1119,15 @@ describe("Agent", () => {
 			timestamp: Date.now() + 1,
 		});
 		const seenDeliveryIds: string[] = [];
-		const unsubscribe = agent.subscribe((event) => {
+		agent.subscribe((event) => {
+			if (event.type === "agent_end") {
+				const user = event.messages.find((message) => message.role === "user");
+				if (user?.role === "user" && Array.isArray(user.content)) {
+					const text = user.content.find((content) => content.type === "text");
+					if (text?.type === "text") text.text = "mutated terminal snapshot";
+				}
+				throw new Error("terminal observer failed");
+			}
 			if (event.type !== "message_start" || event.message.role !== "user") return;
 			const text = getUserText(event.message);
 			if (text) delivered.push(text);
@@ -1120,17 +1137,24 @@ describe("Agent", () => {
 				throw new Error("pre-delivery listener failed");
 			}
 		});
+		agent.subscribe((event) => {
+			if (event.type === "agent_end") {
+				laterAgentEndUserTexts = event.messages.map(getUserText).filter((text) => text !== undefined);
+			}
+		});
 
-		await agent.continue();
-		expect(agent.state.errorMessage).toBe("pre-delivery listener failed");
-		expect(agent.hasQueuedMessages()).toBe(true);
-		unsubscribe();
-		await agent.continue();
+		const result = await agent.continue();
 
-		expect(delivered).toEqual(["first"]);
-		expect(seenDeliveryIds).toEqual([firstId]);
+		expect(result).toMatchObject({
+			status: "completed",
+			deliveries: [{ outcome: "committed" }, { outcome: "committed" }],
+		});
+		expect(agent.state.errorMessage).toBeUndefined();
+		expect(delivered).toEqual(["first", "second"]);
+		expect(seenDeliveryIds).toEqual([firstId, secondId]);
 		expect(secondId).not.toBe(firstId);
-		expect(agent.state.messages.map(getUserText).filter(Boolean)).toEqual(["second"]);
+		expect(agent.state.messages.map(getUserText).filter(Boolean)).toEqual(["first", "second"]);
+		expect(laterAgentEndUserTexts).toEqual(["first", "second"]);
 		expect(agent.hasQueuedMessages()).toBe(false);
 	});
 
@@ -1184,8 +1208,11 @@ describe("Agent", () => {
 		const agent = new Agent({
 			prepareDelivery: (delivery) => ({
 				messages: [...delivery.messages],
-				commit: () => {
-					stagedCommits++;
+				participant: {
+					settle: () => {
+						stagedCommits++;
+						return { outcome: "committed" };
+					},
 				},
 			}),
 			streamFn: () => {
@@ -1216,14 +1243,17 @@ describe("Agent", () => {
 		expect(agent.hasQueuedMessages()).toBe(false);
 	});
 
-	it("runs a staged commit before publishing delivery_start", async () => {
+	it("settles a participant before publishing delivery_start", async () => {
 		let committed = false;
 		let observedCommitted = false;
 		const agent = new Agent({
 			prepareDelivery: (delivery) => ({
 				messages: [...delivery.messages],
-				commit: () => {
-					committed = true;
+				participant: {
+					settle: () => {
+						committed = true;
+						return { outcome: "committed" };
+					},
 				},
 			}),
 			streamFn: () => {
@@ -1258,7 +1288,7 @@ describe("Agent", () => {
 		const tail = createAssistantMessage("already complete");
 		agent.state.messages = [tail];
 
-		await expect(agent.continue()).resolves.toBeUndefined();
+		await expect(agent.continue()).resolves.toEqual({ status: "completed", deliveries: [] });
 
 		expect(providerCalls).toBe(0);
 		expect(agent.state.messages).toEqual([tail]);
@@ -1353,7 +1383,7 @@ describe("Agent", () => {
 			timestamp: Date.now(),
 		});
 
-		await expect(agent.continue()).resolves.toBeUndefined();
+		await expect(agent.continue()).resolves.toMatchObject({ status: "completed" });
 
 		const hasQueuedFollowUp = agent.state.messages.some((message) => {
 			if (message.role !== "user") return false;
@@ -1447,7 +1477,7 @@ describe("Agent", () => {
 			timestamp: Date.now() + 1,
 		});
 
-		await expect(agent.continue()).resolves.toBeUndefined();
+		await expect(agent.continue()).resolves.toMatchObject({ status: "completed" });
 
 		const recentMessages = agent.state.messages.slice(-4);
 		expect(recentMessages.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
@@ -1456,13 +1486,13 @@ describe("Agent", () => {
 
 	it("stops after the current turn when nextAction returns stop", async () => {
 		const toolSchema = Type.Object({});
-		const tool: AgentTool<typeof toolSchema, undefined> = {
+		const tool: AgentTool<typeof toolSchema, never> = {
 			name: "noop_tool",
 			label: "Noop Tool",
 			description: "Returns ok",
 			parameters: toolSchema,
 			async execute() {
-				return { content: [{ type: "text", text: "ok" }], details: undefined };
+				return { content: [{ type: "text", text: "ok" }] };
 			},
 		};
 		let llmCalls = 0;
@@ -1787,7 +1817,7 @@ describe("Agent", () => {
 
 	it("re-canonicalizes runtime abort diagnostics across message replacements without mutating snapshots", async () => {
 		const requestStarted = createDeferred();
-		const replacementDiagnostics = [
+		const replacementDiagnostics: NonNullable<AssistantMessage["diagnostics"]> = [
 			{ type: "extension_one", timestamp: 1, details: { retained: true } },
 			{ type: "runtime_abort", timestamp: 2, details: { source: "disposal" } },
 		];
@@ -1814,14 +1844,12 @@ describe("Agent", () => {
 		agent.subscribe((event) => {
 			if (event.type !== "message_end" || event.message.role !== "assistant") return undefined;
 			secondListenerInput = event.message;
-			return {
-				...event.message,
-				diagnostics: [
-					...(event.message.diagnostics ?? []),
-					{ type: "extension_two", timestamp: 3, details: { retained: true } },
-					{ type: "runtime_abort", timestamp: 4, details: { source: "keyboard_interrupt" } },
-				],
-			} as AssistantMessage;
+			const diagnostics: NonNullable<AssistantMessage["diagnostics"]> = [
+				...(event.message.diagnostics ?? []),
+				{ type: "extension_two", timestamp: 3, details: { retained: true } },
+				{ type: "runtime_abort", timestamp: 4, details: { source: "keyboard_interrupt" } },
+			];
+			return { ...event.message, diagnostics };
 		});
 
 		const prompting = agent.prompt("abort with replacements");

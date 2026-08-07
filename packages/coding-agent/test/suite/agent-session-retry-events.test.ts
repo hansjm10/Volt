@@ -328,7 +328,7 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.faux.state.callCount).toBe(4);
 	});
 
-	it("emits extension events before public event subscribers", async () => {
+	it("prepares delivery extension events before public projections", async () => {
 		const order: string[] = [];
 		const harness = await createHarness({
 			extensionFactories: [
@@ -354,8 +354,8 @@ describe("AgentSession retry and event characterization", () => {
 
 		expect(order).toEqual([
 			"extension:message_start:user",
-			"public:message_start:user",
 			"extension:message_end:user",
+			"public:message_start:user",
 			"public:message_end:user",
 			"extension:message_start:assistant",
 			"public:message_start:assistant",

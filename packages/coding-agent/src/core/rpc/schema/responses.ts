@@ -6,6 +6,7 @@
  */
 
 import type { AgentMessage } from "@hansjm10/volt-agent-core";
+import type { JsonValue } from "@hansjm10/volt-ai";
 import { type TLiteral, type TObject, type TOptional, type TSchema, type TString, Type } from "typebox";
 import type { RpcCommandType } from "../types.ts";
 import { RPC_STABLE_ERROR_CODES } from "../wire-limits.ts";
@@ -108,7 +109,7 @@ export const RpcCompactionResultSchema = Type.Object(
 		tokensBefore: Type.Number(),
 		/** Estimated context tokens after rebuilding from the new compaction boundary. */
 		estimatedTokensAfter: Type.Optional(Type.Number()),
-		details: Type.Optional(opaque<unknown>("extension-specific compaction data")),
+		details: Type.Optional(opaque<JsonValue>("extension-specific compaction data")),
 	},
 	{ additionalProperties: false },
 );

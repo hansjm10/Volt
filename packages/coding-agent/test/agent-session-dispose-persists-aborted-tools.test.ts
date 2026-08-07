@@ -199,7 +199,7 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 			label: "quick",
 			description: "Completes immediately",
 			parameters: hangToolSchema,
-			execute: async () => ({ content: [{ type: "text", text: "done" }], details: undefined }),
+			execute: async () => ({ content: [{ type: "text", text: "done" }] }),
 		};
 		const harness = createHarness({
 			responses: [

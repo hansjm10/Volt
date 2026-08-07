@@ -1,4 +1,4 @@
-import type { TextContent } from "@hansjm10/volt-ai";
+import type { JsonValue, TextContent } from "@hansjm10/volt-ai";
 import type { Component } from "@hansjm10/volt-tui";
 import { Container, Markdown, type MarkdownTheme, Spacer, Text } from "@hansjm10/volt-tui";
 import type { MessageRenderer } from "../../../core/extensions/types.ts";
@@ -10,7 +10,7 @@ import { getMarkdownTheme, theme } from "../../../core/theme/runtime.ts";
  * Uses distinct styling to differentiate from user messages.
  */
 export class CustomMessageComponent extends Container {
-	private message: CustomMessage<unknown>;
+	private message: CustomMessage<JsonValue>;
 	private customRenderer?: MessageRenderer;
 	private defaultContainer: Container;
 	private customComponent?: Component;
@@ -18,7 +18,7 @@ export class CustomMessageComponent extends Container {
 	private _expanded = false;
 
 	constructor(
-		message: CustomMessage<unknown>,
+		message: CustomMessage<JsonValue>,
 		customRenderer?: MessageRenderer,
 		markdownTheme: MarkdownTheme = getMarkdownTheme(),
 	) {

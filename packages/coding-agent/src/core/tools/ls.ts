@@ -173,7 +173,7 @@ export function createLsToolDefinition(
 						signal?.removeEventListener("abort", onAbort);
 
 						if (results.length === 0) {
-							resolve({ content: [{ type: "text", text: "(empty directory)" }], details: undefined });
+							resolve({ content: [{ type: "text", text: "(empty directory)" }] });
 							return;
 						}
 
@@ -198,7 +198,7 @@ export function createLsToolDefinition(
 
 						resolve({
 							content: [{ type: "text", text: output }],
-							details: Object.keys(details).length > 0 ? details : undefined,
+							...(Object.keys(details).length > 0 ? { details } : {}),
 						});
 					} catch (e: any) {
 						signal?.removeEventListener("abort", onAbort);
@@ -220,6 +220,9 @@ export function createLsToolDefinition(
 	};
 }
 
-export function createLsTool(cwd: string, options?: LsToolOptions): AgentTool<typeof lsSchema> {
+export function createLsTool(
+	cwd: string,
+	options?: LsToolOptions,
+): AgentTool<typeof lsSchema, LsToolDetails | undefined> {
 	return wrapToolDefinition(createLsToolDefinition(cwd, options));
 }

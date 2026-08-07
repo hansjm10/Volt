@@ -55,6 +55,41 @@ AgentMessage[] → transformContext() → AgentMessage[] → convertToLlm() → 
 1. **transformContext**: Prune old messages, inject external context
 2. **convertToLlm**: Filter out UI-only messages, convert custom types to LLM format
 
+### Delivery Transactions
+
+`Agent` owns delivery admission, FIFO ordering, leases, revocation, and retry retention. A host that must durably commit transcript or client state can attach one transaction participant during side-effect-free preparation:
+
+```typescript
+const agent = new Agent({
+  prepareDelivery: (delivery) => ({
+    messages: [...delivery.messages],
+    participant: {
+      settle: async ({ requestAbort }) => {
+        const result = await persistDelivery(delivery);
+        if (result === "rolled_back") {
+          return { outcome: "retained", error: new Error("Persistence rolled back") };
+        }
+        if (result === "ambiguous") {
+          return { outcome: "terminally_failed", error: new Error("Persistence outcome is ambiguous") };
+        }
+        return { outcome: "committed" };
+      },
+    },
+  }),
+});
+```
+
+Delivery messages must be structured-cloneable. Agent snapshots them at admission and gives preparation and committed-delivery observers isolated copies, so mutation cannot alter retained payload or canonical provider input. Preparation must not mutate canonical host state. Agent crosses the revocation cutoff before calling `settle()`, then awaits its explicit result:
+
+- `committed`: publish the delivery and allow the request to proceed
+- `retained`: restore the same logical delivery for explicit retry
+- `terminally_failed`: permanently consume unsafe-to-replay work
+- `revoked`: Agent reports that revocation won before settlement began
+
+A thrown or rejected participant is terminally failed because Agent cannot prove safe replay. Return `retained` only after proving that all delivery-coupled effects rolled back. Committed delivery events and terminal `agent_end` publication are observational: listener failures and returned message replacements cannot alter the transaction or block later listeners. Transform delivery messages in `prepareDelivery` instead. Participant code can use `requestAbort()` to record reentrant abort intent without awaiting the run that invoked it. External lifecycle code should call `agent.abort()` and then await `agent.waitForIdle()`.
+
+`prompt()` and `continue()` return `AgentRunResult`. A retained or terminal participant failure returns `status: "delivery_failed"`; committed, revoked, and pre-commit abort outcomes remain available in the ordered `deliveries` array.
+
 ## Event Flow
 
 The agent emits events for UI updates. Understanding the event sequence helps build responsive interfaces.
@@ -151,6 +186,7 @@ The last message in context must be `user` or `toolResult` (not `assistant`).
 | `agent_start` | Agent begins processing |
 | `agent_end` | Final event for the run. Awaited subscribers for this event still count toward settlement |
 | `turn_start` | New turn begins (one LLM call + tool executions) |
+| `delivery_start` | A delivery participant committed and Agent crossed the revocation cutoff |
 | `turn_end` | Turn completes with assistant message and tool results |
 | `message_start` | Any message begins (user, assistant, toolResult) |
 | `message_update` | **Assistant only.** Includes `assistantMessageEvent` with delta |
@@ -261,7 +297,10 @@ During streaming, `agent.state.streamingMessage` contains the current partial as
 
 ```typescript
 // Text prompt
-await agent.prompt("Hello");
+const result = await agent.prompt("Hello");
+if (result.status === "delivery_failed") {
+  console.error(result.failure.outcome, result.failure.error);
+}
 
 // With images
 await agent.prompt("What's in this image?", [
@@ -292,7 +331,7 @@ agent.afterToolCall = async ({ toolCall, result }) => undefined;
 agent.nextAction = async (context) => context.defaultAction;
 agent.state.messages = newMessages; // top-level array is copied
 agent.state.messages.push(message);
-agent.reset();
+agent.reset(); // only while no Agent run is active
 ```
 
 ### Session and Thinking Budgets

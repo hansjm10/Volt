@@ -266,8 +266,8 @@ describe("native planning state", () => {
 										arguments: {
 											planId: currentPlan.id,
 											expectedRevision: currentPlan.revision,
-											title: currentPlan.title,
-											summary: currentPlan.summary,
+											...(currentPlan.title === undefined ? {} : { title: currentPlan.title }),
+											...(currentPlan.summary === undefined ? {} : { summary: currentPlan.summary }),
 											steps: [
 												...currentPlan.steps.map((step) => ({ id: step.id, text: step.text })),
 												{ text: "Add verification coverage" },
@@ -293,8 +293,8 @@ describe("native planning state", () => {
 									arguments: {
 										planId: currentPlan.id,
 										expectedRevision: currentPlan.revision,
-										title: currentPlan.title,
-										summary: currentPlan.summary,
+										...(currentPlan.title === undefined ? {} : { title: currentPlan.title }),
+										...(currentPlan.summary === undefined ? {} : { summary: currentPlan.summary }),
 									},
 								},
 							],
@@ -425,8 +425,8 @@ describe("native planning state", () => {
 										arguments: {
 											planId: currentPlan.id,
 											expectedRevision: currentPlan.revision,
-											title: currentPlan.title,
-											summary: currentPlan.summary,
+											...(currentPlan.title === undefined ? {} : { title: currentPlan.title }),
+											...(currentPlan.summary === undefined ? {} : { summary: currentPlan.summary }),
 											steps: [
 												...currentPlan.steps.map((step) => ({ id: step.id, text: step.text })),
 												{ text: "Add verification coverage" },
@@ -452,8 +452,8 @@ describe("native planning state", () => {
 									arguments: {
 										planId: currentPlan.id,
 										expectedRevision: currentPlan.revision,
-										title: currentPlan.title,
-										summary: currentPlan.summary,
+										...(currentPlan.title === undefined ? {} : { title: currentPlan.title }),
+										...(currentPlan.summary === undefined ? {} : { summary: currentPlan.summary }),
 									},
 								},
 							],

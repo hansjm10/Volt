@@ -144,15 +144,12 @@ export function projectRemoteConversationActiveAssistant(
 		REMOTE_CONVERSATION_ACTIVE_ASSISTANT_MAX_SERIALIZED_BYTES,
 	);
 	if (originalBytes !== null) {
-		const metrics = assertConversationProjectionAssistantSnapshotWithinLimits(activeAssistant.message);
-		assertConversationProjectionAssistantToolStateWithinLimits(
-			activeAssistant.message,
-			activeAssistant.toolState ?? [],
-			metrics,
-		);
+		const message = activeAssistant.message as AssistantMessage;
+		const metrics = assertConversationProjectionAssistantSnapshotWithinLimits(message);
+		assertConversationProjectionAssistantToolStateWithinLimits(message, activeAssistant.toolState ?? [], metrics);
 		return activeAssistant;
 	}
-	const message = projectAssistantMessage(activeAssistant.message);
+	const message = projectAssistantMessage(activeAssistant.message as AssistantMessage);
 	const metrics = assertConversationProjectionAssistantSnapshotWithinLimits(message.value);
 	assertConversationProjectionAssistantToolStateWithinLimits(message.value, activeAssistant.toolState ?? [], metrics);
 	const projected: Omit<RpcConversationActiveAssistant, "projection"> = {

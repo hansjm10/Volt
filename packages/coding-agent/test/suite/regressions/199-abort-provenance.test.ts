@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@hansjm10/volt-agent-core";
-import { type AssistantMessage, fauxAssistantMessage } from "@hansjm10/volt-ai";
+import { type AssistantMessage, type AssistantMessageDiagnostic, fauxAssistantMessage } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionHandler, MessageEndEvent, MessageEndEventResult } from "../../../src/core/extensions/types.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -105,23 +106,25 @@ describe("regression #199: abort provenance persistence", () => {
 		const harness = await createHarness({
 			extensionFactories: [
 				(volt) => {
-					volt.on("message_end", (event) => {
+					const handler: ExtensionHandler<MessageEndEvent, MessageEndEventResult> = (event) => {
 						if (event.message.role !== "assistant" || event.message.stopReason !== "aborted") return;
 						canonicalTimestamp = event.message.diagnostics?.find(
 							(diagnostic) => diagnostic.type === "runtime_abort",
 						)?.timestamp;
+						const diagnostics: AssistantMessageDiagnostic[] = [
+							{ type: "extension_before", timestamp: 1, details: { retained: true } },
+							{ type: "runtime_abort", timestamp: 2, details: { source: "disposal" } },
+							{ type: "extension_after", timestamp: 3, details: { retained: true } },
+							{ type: "runtime_abort", timestamp: 4, details: { source: "keyboard_interrupt" } },
+						];
 						return {
 							message: {
 								...event.message,
-								diagnostics: [
-									{ type: "extension_before", timestamp: 1, details: { retained: true } },
-									{ type: "runtime_abort", timestamp: 2, details: { source: "disposal" } },
-									{ type: "extension_after", timestamp: 3, details: { retained: true } },
-									{ type: "runtime_abort", timestamp: 4, details: { source: "keyboard_interrupt" } },
-								],
+								diagnostics,
 							},
-						};
-					});
+						} satisfies { message: AgentMessage };
+					};
+					volt.on("message_end", handler);
 				},
 			],
 		});
@@ -221,14 +224,17 @@ describe("regression #199: abort provenance persistence", () => {
 		});
 	});
 
-	it("persists a delivery when disposal runs inside its commit callback", async () => {
+	it("persists a delivery when disposal runs inside participant settlement", async () => {
 		let harness: Harness;
 		let disposal: Promise<void> | undefined;
 		harness = await createHarness({
 			prepareDelivery: (delivery) => ({
 				messages: [...delivery.messages],
-				commit: () => {
-					disposal = harness.session.dispose("disposal");
+				participant: {
+					settle: () => {
+						disposal = harness.session.dispose("disposal");
+						return { outcome: "committed" };
+					},
 				},
 			}),
 		});
@@ -254,20 +260,23 @@ describe("regression #199: abort provenance persistence", () => {
 		});
 	});
 
-	it("persists each composed delivery message once when disposal runs during commit", async () => {
+	it("persists each prepared delivery message once when disposal runs during settlement", async () => {
 		let harness: Harness;
 		let disposal: Promise<void> | undefined;
 		harness = await createHarness({
-			prepareDelivery: (delivery) => {
-				const messages = [createUserMessage("prepared predecessor"), ...delivery.messages];
-				return {
-					messages,
-					commit: () => {
-						messages.push(createUserMessage("message composed during commit"));
+			prepareDelivery: (delivery) => ({
+				messages: [
+					createUserMessage("prepared predecessor"),
+					...delivery.messages,
+					createUserMessage("message composed during preparation"),
+				],
+				participant: {
+					settle: () => {
 						disposal = harness.session.dispose("disposal");
+						return { outcome: "committed" };
 					},
-				};
-			},
+				},
+			}),
 		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("never requested")]);
@@ -282,20 +291,22 @@ describe("regression #199: abort provenance persistence", () => {
 				if (typeof message.content === "string") return [message.content];
 				return message.content.flatMap((part) => (part.type === "text" ? [part.text] : []));
 			}),
-		).toEqual(["prepared predecessor", "original admitted prompt", "message composed during commit"]);
+		).toEqual(["prepared predecessor", "original admitted prompt", "message composed during preparation"]);
 		expect(messages.filter((message) => message.role === "assistant")).toHaveLength(1);
 		expect(runtimeAbortSources(harness)).toEqual(["disposal"]);
 	});
 
-	it("does not retain delivery admission when a disposing commit fails", async () => {
+	it("does not persist a delivery when a disposing participant retains", async () => {
 		let harness: Harness;
 		let disposal: Promise<void> | undefined;
 		harness = await createHarness({
 			prepareDelivery: (delivery) => ({
 				messages: [...delivery.messages],
-				commit: () => {
-					disposal = harness.session.dispose("disposal");
-					throw new Error("delivery commit failed");
+				participant: {
+					settle: () => {
+						disposal = harness.session.dispose("disposal");
+						return { outcome: "retained", error: new Error("delivery settlement failed") };
+					},
 				},
 			}),
 		});

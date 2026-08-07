@@ -1,3 +1,4 @@
+import type { AgentRunResult } from "@hansjm10/volt-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
@@ -13,7 +14,7 @@ type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
 	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
 	_shouldStopForProactiveCompaction: (context: unknown) => boolean;
-	_handlePostAgentRun: () => Promise<boolean>;
+	_handlePostAgentRun: (result: AgentRunResult) => Promise<boolean>;
 	_lastAssistantMessage: AssistantMessage | undefined;
 	_proactiveCompactionState: "idle" | "scheduled" | "compacting";
 };
@@ -155,6 +156,31 @@ describe("AgentSession compaction characterization", () => {
 		expect(result.summary).toBe("summary from extension");
 		expect(compactionEntries).toHaveLength(1);
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
+	});
+
+	it("rejects invalid extension compaction details before appending", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "invalid extension summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: { shared: new SharedArrayBuffer(1) } as never,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		const leafId = harness.sessionManager.getLeafId();
+
+		await expect(harness.session.compact()).rejects.toThrow("Extension session_before_compact output");
+		expect(harness.sessionManager.getLeafId()).toBe(leafId);
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
 	});
 
 	it("throws when compacting without a model", async () => {
@@ -327,7 +353,9 @@ describe("AgentSession compaction characterization", () => {
 		});
 		sessionInternals._proactiveCompactionState = "scheduled";
 
-		await expect(sessionInternals._handlePostAgentRun()).rejects.toThrow("Summarization failed after 2 attempts");
+		await expect(sessionInternals._handlePostAgentRun({ status: "completed", deliveries: [] })).rejects.toThrow(
+			"Summarization failed after 2 attempts",
+		);
 
 		expect(sessionInternals._proactiveCompactionState).toBe("idle");
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
@@ -344,7 +372,7 @@ describe("AgentSession compaction characterization", () => {
 		sessionInternals._proactiveCompactionState = "scheduled";
 		vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 
-		await expect(sessionInternals._handlePostAgentRun()).resolves.toBe(false);
+		await expect(sessionInternals._handlePostAgentRun({ status: "completed", deliveries: [] })).resolves.toBe(false);
 	});
 
 	it("excludes a stripped trailing error message from estimatedTokensAfter when retrying", async () => {

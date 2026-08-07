@@ -150,6 +150,8 @@ export function createMcpToolDefinition(
 	};
 }
 
-export function createMcpTool(options: McpGatewayToolOptions): AgentTool<typeof mcpGatewaySchema> {
+export function createMcpTool(
+	options: McpGatewayToolOptions,
+): AgentTool<typeof mcpGatewaySchema, McpGatewayToolDetails> {
 	return wrapToolDefinition(createMcpToolDefinition(options));
 }

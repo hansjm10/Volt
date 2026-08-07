@@ -6,8 +6,8 @@ describe("SessionManager entry subscriptions", () => {
 		const session = SessionManager.inMemory();
 		const observed: string[] = [];
 		const unsubscribe = session.subscribeEntries((entry) => {
-			expect(session.getEntry(entry.id)).toBe(entry);
-			expect(session.getBranch().at(-1)).toBe(entry);
+			expect(session.getEntry(entry.id)).toEqual(entry);
+			expect(session.getBranch().at(-1)).toEqual(entry);
 			observed.push(entry.id);
 		});
 

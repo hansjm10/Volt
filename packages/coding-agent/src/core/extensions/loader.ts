@@ -8,6 +8,7 @@ import { createRequire } from "node:module";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as _bundledVoltAgentCore from "@hansjm10/volt-agent-core";
+import type { JsonCompatibleInput } from "@hansjm10/volt-ai";
 import * as _bundledVoltAi from "@hansjm10/volt-ai";
 import * as _bundledVoltAiOauth from "@hansjm10/volt-ai/oauth";
 import type { KeyId } from "@hansjm10/volt-tui";
@@ -303,7 +304,7 @@ function createExtensionAPI(
 			runtime.sendUserMessage(content, options);
 		},
 
-		appendEntry(customType: string, data?: unknown): void {
+		appendEntry<T>(customType: string, data?: JsonCompatibleInput<T>): void {
 			runtime.assertActive();
 			runtime.appendEntry(customType, data);
 		},

@@ -2,6 +2,7 @@ import type { ActiveToolCallState, AssistantMessage, AssistantMessageEvent, Tool
 import type { AssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
+import type { JsonObject } from "../utils/json-value.ts";
 import type { AssistantMessageInit, AssistantMessageMetaPatch, AssistantStreamFragment } from "./fragments.ts";
 
 const EMPTY_USAGE: Usage = {
@@ -318,7 +319,7 @@ export class AssistantStreamNormalizer {
 		}
 		const argsText = (this.toolArgsText.get(contentIndex) ?? "") + argsTextDelta;
 		this.toolArgsText.set(contentIndex, argsText);
-		const argumentsValue = cloneAndFreeze(parseStreamingJson<Record<string, unknown>>(argsText));
+		const argumentsValue = cloneAndFreeze(parseStreamingJson<JsonObject>(argsText));
 		this.replaceBlock(
 			contentIndex,
 			Object.freeze({

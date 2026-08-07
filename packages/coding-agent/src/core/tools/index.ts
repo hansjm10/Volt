@@ -210,7 +210,7 @@ import { createWebFetchTool, createWebFetchToolDefinition, type WebFetchToolOpti
 import { createWebSearchTool, createWebSearchToolDefinition, type WebSearchToolOptions } from "./web-search.ts";
 import { createWriteTool, createWriteToolDefinition, type WriteToolOptions } from "./write.ts";
 
-export type Tool = AgentTool<any>;
+export type Tool = AgentTool<any, any>;
 export type ToolDef = ToolDefinition<any, any>;
 export type CoreToolName =
 	| "read"

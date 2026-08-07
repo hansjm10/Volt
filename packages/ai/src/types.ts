@@ -1,5 +1,6 @@
 import type { AssistantMessageDiagnostic } from "./utils/diagnostics.ts";
 import type { AssistantMessageEventStream } from "./utils/event-stream.ts";
+import type { JsonObject } from "./utils/json-value.ts";
 
 export type { AssistantMessageEventStream } from "./utils/event-stream.ts";
 
@@ -271,7 +272,7 @@ export interface ToolCall {
 	type: "toolCall";
 	id: string;
 	name: string;
-	arguments: Record<string, any>;
+	arguments: JsonObject;
 	thoughtSignature?: string; // Google-specific: opaque signature for reusing thought context
 }
 
@@ -322,7 +323,7 @@ export interface AssistantMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
-export interface ToolResultMessage<TDetails = any> {
+export interface ToolResultMessage<TDetails = unknown> {
 	role: "toolResult";
 	toolCallId: string;
 	toolName: string;

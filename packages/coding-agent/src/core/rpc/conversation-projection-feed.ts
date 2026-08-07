@@ -16,6 +16,7 @@ import {
 import {
 	RPC_CONVERSATION_IDENTIFIER_MAX_UTF8_BYTES,
 	type RpcAssistantStreamPosition,
+	type RpcCommandType,
 	type RpcConversationActiveAssistant,
 	type RpcConversationBootstrapEvent,
 	type RpcConversationBootstrapReason,
@@ -61,6 +62,8 @@ export interface ConversationProjectionSource {
 	subscribe(listener: (event: object) => void): () => void;
 	/** Retain expensive source observation only while at least one remote subscriber is active. */
 	retainObservation?(): () => void;
+	/** Synchronously fence projections when persisted conversation authority is lost. */
+	subscribeAuthorityLoss?(listener: (error: Error) => void): () => void;
 	/** Optional atomic source-generation hook for navigation and other rebases. */
 	subscribeGenerationChanges?(listener: () => void): () => void;
 }
@@ -165,7 +168,7 @@ export interface ConversationProjectionSubscription {
 	detach(): void;
 }
 
-type QueueItemKind = "ordinary" | "checkpoint" | "control" | "terminal";
+type QueueItemKind = "ordinary" | "checkpoint" | "control" | "source_control" | "terminal";
 
 interface Deferred<T> {
 	promise: Promise<T>;
@@ -611,10 +614,31 @@ function assertCanonicalTranscriptEntry(entry: Record<string, unknown>): void {
 	}
 }
 
+const CONVERSATION_PROJECTION_RESPONSE_COMMANDS: ReadonlySet<string> = new Set([
+	"get_fork_messages",
+	"get_last_assistant_text",
+	"get_message_images",
+	"get_messages",
+	"get_session_stats",
+	"get_state",
+	"get_transcript",
+	"get_transcript_entry_text",
+] satisfies RpcCommandType[]);
+
+function isConversationProjectionControl(
+	value: object,
+): value is object & { type: "response"; success: true; command: string; data?: unknown } {
+	return (
+		isRecord(value) &&
+		value.type === "response" &&
+		value.success === true &&
+		typeof value.command === "string" &&
+		CONVERSATION_PROJECTION_RESPONSE_COMMANDS.has(value.command)
+	);
+}
+
 function isStaleTranscriptControl(value: object, branchEpoch: string): boolean {
-	if (!isRecord(value) || value.type !== "response" || value.command !== "get_transcript" || value.success !== true) {
-		return false;
-	}
+	if (!isConversationProjectionControl(value) || value.command !== "get_transcript") return false;
 	const data = value.data;
 	return isRecord(data) && typeof data.branchEpoch === "string" && data.branchEpoch !== branchEpoch;
 }
@@ -768,6 +792,7 @@ function activeAssistantFromFrame(frame: object): RpcConversationActiveAssistant
 export class ConversationProjectionFeed {
 	private source: ConversationProjectionSource;
 	private detachSourceEvents: () => void = () => {};
+	private detachSourceAuthorityLoss: () => void = () => {};
 	private detachGenerationChanges: () => void = () => {};
 	private releaseSourceObservation: (() => void) | undefined;
 	private activeAssistantSourceEvent?: ActiveAssistantSourceEvent;
@@ -787,6 +812,7 @@ export class ConversationProjectionFeed {
 	private readonly now: () => number;
 	private disposed = false;
 	private poisonedError?: Error;
+	private sourceAuthorityError?: Error;
 	private sourceRebindPending = false;
 	private _branchEpoch: string;
 
@@ -1109,9 +1135,13 @@ export class ConversationProjectionFeed {
 		// Retire request/reply capabilities while the old authority tuple is still
 		// observable. Waiting until commit leaves a window where the source has
 		// already changed but an old correlated reply can still mutate host state.
-		this.notifyAllSubscriberAuthorityChanging();
+		// A suspended source already published this one-way authority cut.
+		if (this.sourceAuthorityError === undefined) {
+			this.notifyAllSubscriberAuthorityChanging();
+		}
 		this.stopSourceObservation();
 		this.detachSourceEvents();
+		this.detachSourceAuthorityLoss();
 		this.detachGenerationChanges();
 		this.source = source;
 		this.activeAssistantSourceEvent = undefined;
@@ -1120,6 +1150,7 @@ export class ConversationProjectionFeed {
 		this.resetTranscriptCursors();
 		this.clearPendingRebindControls();
 		this.poisonedError = undefined;
+		this.sourceAuthorityError = undefined;
 		this._branchEpoch = this.mintId("branchEpoch");
 		this.sourceRebindPending = true;
 		this.bindSourceListeners();
@@ -1185,6 +1216,7 @@ export class ConversationProjectionFeed {
 		this.disposed = true;
 		this.stopSourceObservation();
 		this.detachSourceEvents();
+		this.detachSourceAuthorityLoss();
 		this.detachGenerationChanges();
 		for (const subscriber of [...this.subscribers]) {
 			this.detachSubscriber(subscriber, new Error("Conversation projection feed disposed"));
@@ -1197,6 +1229,13 @@ export class ConversationProjectionFeed {
 
 	private bindSourceListeners(): void {
 		this.detachSourceEvents = this.source.subscribe((event) => this.handleSourceEvent(event));
+		const detachAuthorityLoss = this.source.subscribeAuthorityLoss?.((error) => this.suspendSourceAuthority(error));
+		this.detachSourceAuthorityLoss = detachAuthorityLoss ?? (() => {});
+		if (this.sourceAuthorityError !== undefined) {
+			this.detachSourceAuthorityLoss();
+			this.detachSourceAuthorityLoss = () => {};
+			return;
+		}
 		this.detachGenerationChanges =
 			this.source.subscribeGenerationChanges?.(() => this.rotateForBranchRebase()) ?? (() => {});
 	}
@@ -1212,7 +1251,7 @@ export class ConversationProjectionFeed {
 	}
 
 	private handleSourceEvent(event: object): void {
-		if (this.disposed || this.poisonedError !== undefined) return;
+		if (this.disposed || this.poisonedError !== undefined || this.sourceAuthorityError !== undefined) return;
 		if (!isRecord(event) || typeof event.type !== "string") {
 			this.poisonGeneration(new Error("Conversation projection source emitted a malformed event"));
 			return;
@@ -1228,7 +1267,7 @@ export class ConversationProjectionFeed {
 			}
 			for (const subscriber of [...this.subscribers]) {
 				if (!subscriber.active || subscriber.fenced) continue;
-				void this.enqueueControl(subscriber.subscriptionId, event);
+				void this.enqueueControl(subscriber.subscriptionId, event, undefined, "source_control");
 			}
 			return;
 		}
@@ -1283,6 +1322,31 @@ export class ConversationProjectionFeed {
 		}
 	}
 
+	private suspendSourceAuthority(error: Error): void {
+		if (this.disposed || this.sourceAuthorityError !== undefined) return;
+		this.sourceAuthorityError = error;
+		this.notifyAllSubscriberAuthorityChanging();
+		this.stopSourceObservation();
+		this.detachSourceEvents();
+		this.detachSourceAuthorityLoss();
+		this.detachGenerationChanges();
+		this.detachSourceEvents = () => {};
+		this.detachSourceAuthorityLoss = () => {};
+		this.detachGenerationChanges = () => {};
+		this.activeAssistantSourceEvent = undefined;
+		this.workflowSnapshots.clear();
+		this.canonicalWorkflowBytes = 0;
+		this.resetTranscriptCursors();
+		this.clearPendingRebindControls();
+		for (const subscriber of [...this.subscribers]) {
+			if (!subscriber.active || subscriber.fenced) continue;
+			this.dropPendingConversationItems(subscriber, error);
+			subscriber.attaching = false;
+			subscriber.pendingCheckpointRequestId = undefined;
+			subscriber.overflowRotationPending = false;
+		}
+	}
+
 	private poisonGeneration(error: Error): void {
 		this.poisonedError = error;
 		for (const subscriber of [...this.subscribers]) {
@@ -1309,7 +1373,7 @@ export class ConversationProjectionFeed {
 		for (const subscriber of [...this.subscribers]) {
 			if (!subscriber.active || subscriber.fenced) continue;
 			for (const control of controls) {
-				void this.enqueueControl(subscriber.subscriptionId, control.value);
+				void this.enqueueControl(subscriber.subscriptionId, control.value, undefined, "source_control");
 			}
 		}
 	}
@@ -1529,6 +1593,7 @@ export class ConversationProjectionFeed {
 		subscriptionId: string,
 		value: object,
 		onAdmitted?: (preparedValue: object) => void,
+		kind: "control" | "source_control" = "control",
 	): Promise<void> {
 		const subscriber = this.subscribersById.get(subscriptionId);
 		if (!subscriber?.active) {
@@ -1546,7 +1611,7 @@ export class ConversationProjectionFeed {
 		}
 		const deferred = createDeferred<void>();
 		try {
-			const item = this.createQueueItem(subscriber, value, "control", deferred);
+			const item = this.createQueueItem(subscriber, value, kind, deferred);
 			this.assertNormalCapacity(subscriber, item, "Conversation control output exceeds the normal pending lane");
 			if (subscriber.attaching) {
 				subscriber.attachingTail.push(item);
@@ -1799,11 +1864,18 @@ export class ConversationProjectionFeed {
 	private dropPendingConversationItems(subscriber: ConversationProjectionSubscriber, error: Error): void {
 		const retained: SubscriberQueueItem[] = [];
 		for (const item of [...subscriber.pending, ...subscriber.attachingTail]) {
+			if (item.kind === "source_control") {
+				item.deferred?.resolve(undefined);
+				continue;
+			}
 			if (item.kind !== "control") {
 				item.deferred?.reject(error);
 				continue;
 			}
-			if (isStaleTranscriptControl(item.value, this._branchEpoch)) {
+			if (
+				isStaleTranscriptControl(item.value, this._branchEpoch) ||
+				(this.sourceAuthorityError !== undefined && isConversationProjectionControl(item.value))
+			) {
 				item.deferred?.resolve(undefined);
 				continue;
 			}
@@ -2059,6 +2131,9 @@ export class ConversationProjectionFeed {
 
 	private assertActive(): void {
 		this.assertNotDisposed();
+		if (this.sourceAuthorityError !== undefined) {
+			throw this.sourceAuthorityError;
+		}
 		if (this.poisonedError !== undefined) {
 			throw new Error(`Conversation projection generation is poisoned: ${this.poisonedError.message}`);
 		}

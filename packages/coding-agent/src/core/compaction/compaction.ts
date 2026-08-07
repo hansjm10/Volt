@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage, StreamFn, ThinkingLevel } from "@hansjm10/volt-agent-core";
-import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@hansjm10/volt-ai";
+import type { AssistantMessage, Context, JsonValue, Model, SimpleStreamOptions, Usage } from "@hansjm10/volt-ai";
 import { completeSimple, isContextOverflow } from "@hansjm10/volt-ai";
 import { sleep } from "../../utils/sleep.ts";
 import {
@@ -34,10 +34,10 @@ import {
 // ============================================================================
 
 /** Details stored in CompactionEntry.details for file tracking */
-export interface CompactionDetails {
+export type CompactionDetails = {
 	readFiles: string[];
 	modifiedFiles: string[];
-}
+};
 
 /**
  * Extract file operations from messages and previous compaction entries.
@@ -104,7 +104,7 @@ function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | u
 }
 
 /** Result from compact() - SessionManager adds uuid/parentUuid when saving */
-export interface CompactionResult<T = unknown> {
+export interface CompactionResult<T = JsonValue> {
 	summary: string;
 	firstKeptEntryId: string;
 	tokensBefore: number;
@@ -1007,7 +1007,7 @@ export async function compact(
 	streamFn?: StreamFn,
 	env?: Record<string, string>,
 	retry?: SummarizationRetryOptions,
-): Promise<CompactionResult> {
+): Promise<CompactionResult<CompactionDetails> & { details: CompactionDetails }> {
 	const {
 		firstKeptEntryId,
 		messagesToSummarize,

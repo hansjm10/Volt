@@ -243,7 +243,7 @@ describe("AgentSession retry", () => {
 			parameters: Type.Object({ text: Type.String() }),
 			execute: async () => {
 				toolExecuted.value = true;
-				return { content: [{ type: "text", text: "echoed" }], details: undefined };
+				return { content: [{ type: "text", text: "echoed" }] };
 			},
 		};
 

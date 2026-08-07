@@ -1,4 +1,4 @@
-import type { AssistantMessage, ImageContent, Model, TextContent, Usage } from "@hansjm10/volt-ai";
+import type { AssistantMessage, ImageContent, JsonValue, Model, TextContent, Usage } from "@hansjm10/volt-ai";
 import { completeSimple } from "@hansjm10/volt-ai";
 import type { AgentMessage, ThinkingLevel } from "../../types.ts";
 import {
@@ -19,12 +19,12 @@ import {
 } from "./utils.ts";
 
 /** File-operation details stored on generated compaction entries. */
-export interface CompactionDetails {
+export type CompactionDetails = {
 	/** Files read in the compacted history. */
 	readFiles: string[];
 	/** Files modified in the compacted history. */
 	modifiedFiles: string[];
-}
+};
 function safeJsonStringify(value: unknown): string {
 	try {
 		return JSON.stringify(value) ?? "undefined";
@@ -42,7 +42,7 @@ function extractFileOperations(
 	if (prevCompactionIndex >= 0) {
 		const prevCompaction = entries[prevCompactionIndex] as CompactionEntry;
 		if (!prevCompaction.fromHook && prevCompaction.details) {
-			const details = prevCompaction.details as CompactionDetails;
+			const details = prevCompaction.details as unknown as CompactionDetails;
 			if (Array.isArray(details.readFiles)) {
 				for (const f of details.readFiles) fileOps.read.add(f);
 			}
@@ -87,7 +87,7 @@ function getMessageFromEntryForCompaction(entry: SessionTreeEntry): AgentMessage
 }
 
 /** Generated compaction data ready to be persisted as a compaction entry. */
-export interface CompactionResult<T = unknown> {
+export interface CompactionResult<T = JsonValue> {
 	/** Summary text that replaces compacted history in future context. */
 	summary: string;
 	/** Entry id where retained history starts. */
@@ -630,7 +630,7 @@ export async function compact(
 	customInstructions?: string,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
-): Promise<Result<CompactionResult, CompactionError>> {
+): Promise<Result<CompactionResult<CompactionDetails> & { details: CompactionDetails }, CompactionError>> {
 	const {
 		firstKeptEntryId,
 		messagesToSummarize,

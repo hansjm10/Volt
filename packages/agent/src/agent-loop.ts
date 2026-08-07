@@ -7,6 +7,7 @@ import {
 	type AssistantMessage,
 	type Context,
 	EventStream,
+	type JsonObject,
 	streamSimple,
 	type ToolResultMessage,
 	validateToolArguments,
@@ -16,6 +17,7 @@ import type {
 	AgentEvent,
 	AgentLoopConfig,
 	AgentLoopDelivery,
+	AgentLoopDeliveryOutcome,
 	AgentLoopNextAction,
 	AgentLoopNextActionContext,
 	AgentMessage,
@@ -39,6 +41,21 @@ export type AgentEventSink =
 	| AsyncReplacingAgentEventSink;
 
 type AgentEventSinkResult = Awaited<ReturnType<AgentEventSink>>;
+
+/** Delivery settlement that stops the current low-level loop before a provider request. */
+export class AgentDeliverySettlementError extends Error {
+	readonly outcome: "retained" | "terminally_failed";
+	readonly deliveryId?: string;
+	readonly settlementError: Error;
+
+	constructor(outcome: "retained" | "terminally_failed", deliveryId: string | undefined, settlementError: Error) {
+		super(settlementError.message);
+		this.name = "AgentDeliverySettlementError";
+		this.outcome = outcome;
+		this.deliveryId = deliveryId;
+		this.settlementError = settlementError;
+	}
+}
 
 /**
  * Start an agent loop with a new prompt message.
@@ -408,13 +425,23 @@ async function emitDeliveries(
 	newMessages: AgentMessage[],
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
-	beginDelivery: ((delivery: AgentLoopDelivery) => boolean) | undefined,
+	beginDelivery:
+		| ((delivery: AgentLoopDelivery) => AgentLoopDeliveryOutcome | Promise<AgentLoopDeliveryOutcome>)
+		| undefined,
 ): Promise<AgentLoopDelivery[]> {
 	const finalizedDeliveries: AgentLoopDelivery[] = [];
 	for (const delivery of deliveries) {
 		if (signal?.aborted) continue;
-		if (beginDelivery && !beginDelivery(delivery)) continue;
-		await emit({ type: "delivery_start", deliveryId: delivery.deliveryId, messages: delivery.messages });
+		const settlement = beginDelivery ? await beginDelivery(delivery) : { outcome: "committed" as const };
+		if (settlement.outcome === "revoked") continue;
+		if (settlement.outcome === "retained" || settlement.outcome === "terminally_failed") {
+			throw new AgentDeliverySettlementError(settlement.outcome, delivery.deliveryId, settlement.error);
+		}
+		await emit({
+			type: "delivery_start",
+			...(delivery.deliveryId === undefined ? {} : { deliveryId: delivery.deliveryId }),
+			messages: delivery.messages,
+		});
 		const finalizedMessages: AgentMessage[] = [];
 		for (const message of delivery.messages) {
 			const finalizedMessage = await emitCompletedMessage(message, emit, delivery.deliveryId);
@@ -697,8 +724,8 @@ async function executeToolCallsParallel(
 type PreparedToolCall = {
 	kind: "prepared";
 	toolCall: AgentToolCall;
-	tool: AgentTool<any>;
-	args: unknown;
+	tool: AgentTool<any, any>;
+	args: JsonObject;
 };
 
 type ImmediateToolCallOutcome = {
@@ -730,7 +757,7 @@ function reduceToolBatchDisposition(finalizedCalls: FinalizedToolCallOutcome[]):
 	return "continue";
 }
 
-function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall): AgentToolCall {
+function prepareToolCallArguments(tool: AgentTool<any, any>, toolCall: AgentToolCall): AgentToolCall {
 	if (!tool.prepareArguments) {
 		return toolCall;
 	}
@@ -740,7 +767,7 @@ function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall)
 	}
 	return {
 		...toolCall,
-		arguments: preparedArguments as Record<string, any>,
+		arguments: preparedArguments as JsonObject,
 	};
 }
 
@@ -762,7 +789,7 @@ async function prepareToolCall(
 
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
-		const validatedArgs = validateToolArguments(tool, preparedToolCall);
+		const validatedArgs = validateToolArguments(tool, preparedToolCall) as JsonObject;
 		if (config.beforeToolCall) {
 			const beforeResult = await config.beforeToolCall(
 				{
@@ -878,10 +905,12 @@ async function finalizeExecutedToolCall(
 				signal,
 			);
 			if (afterResult) {
+				const details = afterResult.details !== undefined ? afterResult.details : result.details;
+				const disposition = afterResult.disposition ?? result.disposition;
 				result = {
 					content: afterResult.content ?? result.content,
-					details: afterResult.details ?? result.details,
-					disposition: afterResult.disposition ?? result.disposition,
+					...(details === undefined ? {} : { details }),
+					...(disposition === undefined ? {} : { disposition }),
 				};
 				isError = afterResult.isError ?? isError;
 			}
@@ -921,7 +950,7 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 		toolCallId: finalized.toolCall.id,
 		toolName: finalized.toolCall.name,
 		content: finalized.result.content,
-		details: finalized.result.details,
+		...(finalized.result.details === undefined ? {} : { details: finalized.result.details }),
 		isError: finalized.isError,
 		timestamp: Date.now(),
 	};
@@ -932,8 +961,9 @@ async function emitCompletedMessage<MessageType extends AgentMessage>(
 	emit: AgentEventSink,
 	deliveryId?: string,
 ): Promise<MessageType> {
-	await emit({ type: "message_start", message, deliveryId });
-	const replacement = await emit({ type: "message_end", message, deliveryId });
+	const delivery = deliveryId === undefined ? {} : { deliveryId };
+	await emit({ type: "message_start", message, ...delivery });
+	const replacement = await emit({ type: "message_end", message, ...delivery });
 	return resolveMessageReplacement(message, replacement);
 }
 

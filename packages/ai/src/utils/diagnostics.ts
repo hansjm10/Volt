@@ -1,3 +1,5 @@
+import type { JsonObject } from "./json-value.ts";
+
 export interface DiagnosticErrorInfo {
 	name?: string;
 	message: string;
@@ -9,7 +11,7 @@ export interface AssistantMessageDiagnostic {
 	type: string;
 	timestamp: number;
 	error?: DiagnosticErrorInfo;
-	details?: Record<string, unknown>;
+	details?: JsonObject;
 }
 
 export function formatThrownValue(value: unknown): string {
@@ -22,19 +24,24 @@ export function extractDiagnosticError(error: unknown): DiagnosticErrorInfo {
 	if (!(error instanceof Error)) return { name: "ThrownValue", message: formatThrownValue(error) };
 	const code = (error as Error & { code?: unknown }).code;
 	return {
-		name: error.name || undefined,
+		...(error.name ? { name: error.name } : {}),
 		message: error.message || error.name,
-		stack: error.stack,
-		code: typeof code === "string" || typeof code === "number" ? code : undefined,
+		...(error.stack === undefined ? {} : { stack: error.stack }),
+		...(typeof code === "string" || typeof code === "number" ? { code } : {}),
 	};
 }
 
 export function createAssistantMessageDiagnostic(
 	type: string,
 	error: unknown,
-	details?: Record<string, unknown>,
+	details?: JsonObject,
 ): AssistantMessageDiagnostic {
-	return { type, timestamp: Date.now(), error: extractDiagnosticError(error), details };
+	return {
+		type,
+		timestamp: Date.now(),
+		error: extractDiagnosticError(error),
+		...(details === undefined ? {} : { details }),
+	};
 }
 
 export function appendAssistantMessageDiagnostic<T extends { diagnostics?: AssistantMessageDiagnostic[] }>(

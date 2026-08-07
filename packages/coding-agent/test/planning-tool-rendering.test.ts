@@ -170,7 +170,6 @@ describe("planning tool TUI rendering", () => {
 		component.updateResult(
 			{
 				content: [{ type: "text", text: "Plan changed; apply the latest planning state and retry" }],
-				details: undefined,
 				isError: true,
 			},
 			false,
