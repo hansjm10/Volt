@@ -74,7 +74,7 @@ jobs:
           echo 'd6eb340cb4f06dcf5a3015ff588d826ab3bdce75b25855a25866af182417afe7  /tmp/firebase-tools' | sha256sum --check
           chmod +x /tmp/firebase-tools
           cd packages/coding-agent/examples/remote/firebase-push-relay/functions
-          /tmp/firebase-tools emulators:exec --config ../firebase.json --project demo-volt-iroh-enrollment --only firestore "$(command -v node) --test enrollment-emulator.integration.js"
+          /tmp/firebase-tools emulators:exec --config ../firebase.emulator.json --project demo-volt-iroh-enrollment --only firestore "$(command -v node) --test enrollment-emulator.integration.js"
 
   test-windows:
     runs-on: windows-latest

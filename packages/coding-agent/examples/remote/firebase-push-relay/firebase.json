@@ -5,10 +5,18 @@
 			"codebase": "volt-push-relay"
 		}
 	],
-	"firestore": {
-		"rules": "firestore.rules",
-		"indexes": "firestore.indexes.json"
-	},
+	"firestore": [
+		{
+			"database": "volt-push-relay",
+			"rules": "firestore.push.rules",
+			"indexes": "firestore.push.indexes.json"
+		},
+		{
+			"database": "volt-iroh-enrollment",
+			"rules": "firestore.enrollment.rules",
+			"indexes": "firestore.enrollment.indexes.json"
+		}
+	],
 	"emulators": {
 		"firestore": {
 			"port": 8080

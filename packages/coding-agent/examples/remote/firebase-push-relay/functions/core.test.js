@@ -11,6 +11,8 @@ const {
 	getAllowedFirebaseAppIds,
 	getConfiguredRelayUrl,
 	getPushTargetId,
+	getRequiredServiceAccount,
+	getRuntimeServiceAccounts,
 	hashToken,
 	isPushTargetExpired,
 	parseNotification,
@@ -69,6 +71,42 @@ test("rejects replayed, ordinary, and wrong-app App Check tokens", () => {
 			),
 		403,
 		"app_check_app_not_allowed",
+	);
+});
+
+test("deployment requires dedicated runtime service accounts", () => {
+	for (const environmentVariable of ["PUSH_RELAY_SERVICE_ACCOUNT", "IROH_ENROLLMENT_SERVICE_ACCOUNT"]) {
+		assert.equal(
+			getRequiredServiceAccount(environmentVariable, {
+				[environmentVariable]: "volt-service@volt-3fae7.iam.gserviceaccount.com",
+			}),
+			"volt-service@volt-3fae7.iam.gserviceaccount.com",
+		);
+		assert.throws(
+			() => getRequiredServiceAccount(environmentVariable, {}),
+			new RegExp(`${environmentVariable} must be a dedicated service account email`),
+		);
+		assert.throws(
+			() => getRequiredServiceAccount(environmentVariable, { [environmentVariable]: "default" }),
+			/dedicated service account email/,
+		);
+	}
+	assert.deepEqual(
+		getRuntimeServiceAccounts({
+			IROH_ENROLLMENT_SERVICE_ACCOUNT: "volt-enrollment@volt-3fae7.iam.gserviceaccount.com",
+			PUSH_RELAY_SERVICE_ACCOUNT: "volt-push@volt-3fae7.iam.gserviceaccount.com",
+		}),
+		{
+			irohEnrollmentServiceAccount: "volt-enrollment@volt-3fae7.iam.gserviceaccount.com",
+			pushRelayServiceAccount: "volt-push@volt-3fae7.iam.gserviceaccount.com",
+		},
+	);
+	assert.throws(
+		() => getRuntimeServiceAccounts({
+			IROH_ENROLLMENT_SERVICE_ACCOUNT: "volt-runtime@volt-3fae7.iam.gserviceaccount.com",
+			PUSH_RELAY_SERVICE_ACCOUNT: "volt-runtime@volt-3fae7.iam.gserviceaccount.com",
+		}),
+		/distinct runtime service accounts/,
 	);
 });
 

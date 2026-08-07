@@ -10,7 +10,7 @@
 	"scripts": {
 		"check": "for file in *.js; do node --check \"$file\"; done",
 		"test": "node --test *.test.js",
-		"test:emulator": "npx --yes --ignore-scripts firebase-tools@15.26.0 emulators:exec --config ../firebase.json --project demo-volt-iroh-enrollment --only firestore \"node --test enrollment-emulator.integration.js\""
+		"test:emulator": "npx --yes --ignore-scripts firebase-tools@15.26.0 emulators:exec --config ../firebase.emulator.json --project demo-volt-iroh-enrollment --only firestore \"node --test enrollment-emulator.integration.js\""
 	},
 	"dependencies": {
 		"firebase-admin": "14.2.0",

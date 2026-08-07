@@ -43,17 +43,6 @@ function getEnrollmentConfig(env = process.env) {
 	};
 }
 
-function getEnrollmentServiceAccount(env = process.env) {
-	const value = env.IROH_ENROLLMENT_SERVICE_ACCOUNT?.trim();
-	if (
-		value === undefined ||
-		!/^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/.test(value)
-	) {
-		throw new Error("IROH_ENROLLMENT_SERVICE_ACCOUNT must be a dedicated service account email");
-	}
-	return value;
-}
-
 function parseRelayOrigins(configured) {
 	const values = (configured === undefined ? DEFAULT_RELAY_ORIGIN : configured)
 		.split(",")
@@ -495,7 +484,6 @@ module.exports = {
 	canonicalRenewGrantMessage,
 	canonicalRevokeGrantMessage,
 	getEnrollmentConfig,
-	getEnrollmentServiceAccount,
 	getGrantGenerationId,
 	getGrantId,
 	getRelayEndpointId,

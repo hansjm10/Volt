@@ -7,7 +7,7 @@ const { error: logFirebaseError, info: logFirebaseInfo } = require("firebase-fun
 const { defineSecret } = require("firebase-functions/params");
 const { onRequest } = require("firebase-functions/v2/https");
 const { createIrohEnrollmentHandler } = require("./enrollment-handler.js");
-const { getEnrollmentConfig, getEnrollmentServiceAccount } = require("./enrollment-core.js");
+const { getEnrollmentConfig } = require("./enrollment-core.js");
 const { createPushTargetRegistrationHandler } = require("./registration.js");
 const {
 	RequestError,
@@ -18,6 +18,7 @@ const {
 	getConfiguredRelayUrl,
 	getHeader,
 	getPushTargetTtlMs,
+	getRuntimeServiceAccounts,
 	isPushTargetExpired,
 	parseNotification,
 	parsePushTargetRevocation,
@@ -28,6 +29,8 @@ const {
 
 const DEFAULT_COLLECTION = "voltPushTargets";
 const DEFAULT_REGION = "us-central1";
+const ENROLLMENT_DATABASE_ID = "volt-iroh-enrollment";
+const PUSH_RELAY_DATABASE_ID = "volt-push-relay";
 const DELIVERY_QUOTA_WINDOW_MS = 60_000;
 const DEFAULT_DELIVERIES_PER_TARGET_PER_MINUTE = 30;
 const DEFAULT_REGISTRATIONS_PER_INSTANCE_PER_MINUTE = 30;
@@ -58,7 +61,7 @@ const maxRegistrationsPerInstancePerMinute = getBoundedPositiveInteger(
 );
 const registrationWindows = new Map();
 const enrollmentConfig = getEnrollmentConfig();
-const irohEnrollmentServiceAccount = getEnrollmentServiceAccount();
+const { irohEnrollmentServiceAccount, pushRelayServiceAccount } = getRuntimeServiceAccounts();
 const irohEnrollmentIpSalt = defineSecret("IROH_ENROLLMENT_IP_SALT");
 const irohRelayAccessSecretCurrent = defineSecret("IROH_RELAY_ACCESS_SECRET_CURRENT");
 const irohRelayAccessSecretNext = defineSecret("IROH_RELAY_ACCESS_SECRET_NEXT");
@@ -74,7 +77,7 @@ const registerPushTarget = createPushTargetRegistrationHandler({
 });
 const handleIrohEnrollment = createIrohEnrollmentHandler({
 	config: enrollmentConfig,
-	getFirestore,
+	getFirestore: getEnrollmentFirestore,
 	getIpSalt: () => irohEnrollmentIpSalt.value(),
 	getRelayAccessSecrets: () => [
 		irohRelayAccessSecretCurrent.value(),
@@ -115,6 +118,7 @@ exports.pushRelay = onRequest(
 		maxInstances: 10,
 		memory: "256MiB",
 		region: process.env.FUNCTION_REGION || DEFAULT_REGION,
+		serviceAccount: pushRelayServiceAccount,
 		timeoutSeconds: 15,
 	},
 	async (request, response) => {
@@ -160,8 +164,16 @@ async function routeRequest(request, response) {
 	throw new RequestError(404, "not_found");
 }
 
+function getPushFirestore() {
+	return getFirestore(PUSH_RELAY_DATABASE_ID);
+}
+
+function getEnrollmentFirestore() {
+	return getFirestore(ENROLLMENT_DATABASE_ID);
+}
+
 function getPushTargetsCollection() {
-	return getFirestore().collection(DEFAULT_COLLECTION);
+	return getPushFirestore().collection(DEFAULT_COLLECTION);
 }
 
 async function verifyRegistrationAppCheck(request) {
@@ -195,7 +207,7 @@ async function revokePushTarget(request, response) {
 	const revocation = parsePushTargetRevocation(readJsonBody(request));
 	const pushTargetRef = getPushTargetsCollection().doc(revocation.pushTargetId);
 	const status = await revokePushTargetTransaction(
-		getFirestore(),
+		getPushFirestore(),
 		pushTargetRef,
 		revocation.pushTargetAuthToken,
 	);
@@ -252,7 +264,7 @@ async function sendNotification(request, response) {
 
 async function reserveAuthorizedPushTarget(request) {
 	const pushTargetRef = getPushTargetsCollection().doc(request.pushTargetId);
-	return getFirestore().runTransaction(async (transaction) => {
+	return getPushFirestore().runTransaction(async (transaction) => {
 		const snapshot = await transaction.get(pushTargetRef);
 		if (!snapshot.exists) {
 			throw new RequestError(404, "push_target_not_found");

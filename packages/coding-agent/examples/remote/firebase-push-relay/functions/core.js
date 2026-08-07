@@ -266,6 +266,26 @@ function assertVerifiedAppCheck(verification, allowedAppIds) {
 	return verification.appId;
 }
 
+function getRequiredServiceAccount(environmentVariable, env = process.env) {
+	const value = env[environmentVariable]?.trim();
+	if (
+		value === undefined ||
+		!/^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/.test(value)
+	) {
+		throw new Error(`${environmentVariable} must be a dedicated service account email`);
+	}
+	return value;
+}
+
+function getRuntimeServiceAccounts(env = process.env) {
+	const irohEnrollmentServiceAccount = getRequiredServiceAccount("IROH_ENROLLMENT_SERVICE_ACCOUNT", env);
+	const pushRelayServiceAccount = getRequiredServiceAccount("PUSH_RELAY_SERVICE_ACCOUNT", env);
+	if (irohEnrollmentServiceAccount === pushRelayServiceAccount) {
+		throw new Error("push relay and Iroh enrollment require distinct runtime service accounts");
+	}
+	return { irohEnrollmentServiceAccount, pushRelayServiceAccount };
+}
+
 function getAllowedFirebaseAppIds(env = process.env) {
 	const configured = env.ALLOWED_FIREBASE_APP_IDS;
 	const values = (configured === undefined ? DEFAULT_ALLOWED_FIREBASE_APP_ID : configured)
@@ -497,6 +517,8 @@ module.exports = {
 	getConfiguredRelayUrl,
 	getHeader,
 	getPushTargetId,
+	getRequiredServiceAccount,
+	getRuntimeServiceAccounts,
 	getPushTargetTtlMs,
 	hashToken,
 	isPushTargetExpired,

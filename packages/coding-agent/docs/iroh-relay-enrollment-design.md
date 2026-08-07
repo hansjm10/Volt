@@ -24,6 +24,12 @@ endpoint ID, and the daemon's persisted client grant.
   ID to register with official relays. It cannot authenticate Volt RPC.
 - Custom relays are owner-controlled, uncredentialed transport. They never
   receive App Check material from the official app.
+- Enrollment state lives only in the fixed `volt-iroh-enrollment` named
+  Firestore database. The enrollment function uses a dedicated runtime identity
+  with database-conditioned IAM; it cannot access raw FCM token state in the
+  separate `volt-push-relay` database, and the push identity cannot access
+  enrollment admission state. Server SDK isolation relies on IAM, not Firestore
+  Security Rules.
 
 ## v2 pairing ticket
 

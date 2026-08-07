@@ -1,0 +1,13 @@
+{
+	"firestore": {
+		"database": "volt-iroh-enrollment",
+		"rules": "firestore.enrollment.rules",
+		"indexes": "firestore.enrollment.indexes.json"
+	},
+	"emulators": {
+		"firestore": {
+			"port": 8080
+		},
+		"singleProjectMode": true
+	}
+}

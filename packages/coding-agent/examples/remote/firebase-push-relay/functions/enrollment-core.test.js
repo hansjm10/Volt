@@ -3,7 +3,6 @@ const { test } = require("node:test");
 const { RequestError } = require("./core.js");
 const {
 	assertFreshSignature,
-	getEnrollmentServiceAccount,
 	getGrantGenerationId,
 	getGrantId,
 	getRelayEndpointId,
@@ -236,20 +235,6 @@ test("relay origins normalize and sort while rejecting non-origin or duplicate c
 	assert.throws(() => parseRelayOrigins("http://relay.example"), /HTTPS origins/);
 	assert.throws(() => parseRelayOrigins("https://relay.example/path"), /without paths/);
 	assert.throws(() => parseRelayOrigins("https://relay.example,https://relay.example:443"), /duplicate/);
-});
-
-test("enrollment deployment requires a dedicated service account", () => {
-	assert.equal(
-		getEnrollmentServiceAccount({
-			IROH_ENROLLMENT_SERVICE_ACCOUNT: "volt-enrollment@volt-3fae7.iam.gserviceaccount.com",
-		}),
-		"volt-enrollment@volt-3fae7.iam.gserviceaccount.com",
-	);
-	assert.throws(() => getEnrollmentServiceAccount({}), /dedicated service account email/);
-	assert.throws(
-		() => getEnrollmentServiceAccount({ IROH_ENROLLMENT_SERVICE_ACCOUNT: "default" }),
-		/dedicated service account email/,
-	);
 });
 
 test("relay bearer rotation uses current or next secrets and endpoint headers stay strict", () => {

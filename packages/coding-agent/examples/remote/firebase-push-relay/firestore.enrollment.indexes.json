@@ -2,12 +2,6 @@
 	"indexes": [],
 	"fieldOverrides": [
 		{
-			"collectionGroup": "voltPushTargets",
-			"fieldPath": "expiresAt",
-			"ttl": true,
-			"indexes": []
-		},
-		{
 			"collectionGroup": "voltIrohEnrollmentClaims",
 			"fieldPath": "expiresAt",
 			"ttl": true,

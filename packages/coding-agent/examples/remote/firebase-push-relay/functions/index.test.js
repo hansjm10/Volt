@@ -5,9 +5,18 @@ const { getPushTargetId, hashToken } = require("./core.js");
 
 const appId = "1:546623825529:ios:9f5a707e3f4ef89154d6a8";
 const collectionNames = [];
+const firestoreDatabaseIds = [];
 const writes = [];
 const requestFunctionOptions = [];
 const moduleStubs = new Map([
+	[
+		"./enrollment-handler.js",
+		{
+			createIrohEnrollmentHandler: (options) => async () => {
+				options.getFirestore();
+			},
+		},
+	],
 	[
 		"firebase-admin/app-check",
 		{
@@ -22,16 +31,19 @@ const moduleStubs = new Map([
 		{
 			FieldValue: { serverTimestamp: () => ({ serverTimestamp: true }) },
 			Timestamp: { fromMillis: (epochMillis) => ({ epochMillis }) },
-			getFirestore: () => ({
-				collection(name) {
-					collectionNames.push(name);
-					return {
-						doc: (id) => ({
-							set: async (value) => writes.push({ id, value }),
-						}),
-					};
-				},
-			}),
+			getFirestore: (databaseId) => {
+				firestoreDatabaseIds.push(databaseId);
+				return {
+					collection(name) {
+						collectionNames.push(name);
+						return {
+							doc: (id) => ({
+								set: async (value) => writes.push({ id, value }),
+							}),
+						};
+					},
+				};
+			},
 		},
 	],
 	["firebase-admin/messaging", { getMessaging: () => ({ send: async () => "unused" }) }],
@@ -57,7 +69,9 @@ const moduleStubs = new Map([
 ]);
 const originalLoad = Module._load;
 const originalEnrollmentServiceAccount = process.env.IROH_ENROLLMENT_SERVICE_ACCOUNT;
+const originalPushRelayServiceAccount = process.env.PUSH_RELAY_SERVICE_ACCOUNT;
 process.env.IROH_ENROLLMENT_SERVICE_ACCOUNT = "volt-enrollment@volt-3fae7.iam.gserviceaccount.com";
+process.env.PUSH_RELAY_SERVICE_ACCOUNT = "volt-push@volt-3fae7.iam.gserviceaccount.com";
 Module._load = function load(request, parent, isMain) {
 	return moduleStubs.has(request)
 		? moduleStubs.get(request)
@@ -74,6 +88,11 @@ try {
 	} else {
 		process.env.IROH_ENROLLMENT_SERVICE_ACCOUNT = originalEnrollmentServiceAccount;
 	}
+	if (originalPushRelayServiceAccount === undefined) {
+		delete process.env.PUSH_RELAY_SERVICE_ACCOUNT;
+	} else {
+		process.env.PUSH_RELAY_SERVICE_ACCOUNT = originalPushRelayServiceAccount;
+	}
 }
 
 test("exports enrollment as a separate secret-backed v2 HTTPS function", () => {
@@ -85,6 +104,11 @@ test("exports enrollment as a separate secret-backed v2 HTTPS function", () => {
 		requestFunctionOptions[0].serviceAccount,
 		"volt-enrollment@volt-3fae7.iam.gserviceaccount.com",
 	);
+	assert.equal(
+		requestFunctionOptions[1].serviceAccount,
+		"volt-push@volt-3fae7.iam.gserviceaccount.com",
+	);
+	assert.notEqual(requestFunctionOptions[0].serviceAccount, requestFunctionOptions[1].serviceAccount);
 	assert.deepEqual(
 		requestFunctionOptions[0].secrets.map((secret) => secret.name),
 		[
@@ -95,7 +119,14 @@ test("exports enrollment as a separate secret-backed v2 HTTPS function", () => {
 	);
 });
 
-test("production registration route writes through the Firestore collection adapter", async () => {
+test("enrollment connects only to its named Firestore database", async () => {
+	firestoreDatabaseIds.length = 0;
+	await irohEnrollment();
+	assert.deepEqual(firestoreDatabaseIds, ["volt-iroh-enrollment"]);
+});
+
+test("production registration route writes through its named Firestore database", async () => {
+	firestoreDatabaseIds.length = 0;
 	const fcmToken = "fcm-token-value-0001";
 	let responseStatus;
 	let responseBody;
@@ -127,6 +158,7 @@ test("production registration route writes through the Firestore collection adap
 	);
 
 	const pushTargetId = getPushTargetId(fcmToken);
+	assert.deepEqual(firestoreDatabaseIds, ["volt-push-relay"]);
 	assert.deepEqual(collectionNames, ["voltPushTargets"]);
 	assert.equal(writes.length, 1);
 	assert.equal(writes[0].id, pushTargetId);

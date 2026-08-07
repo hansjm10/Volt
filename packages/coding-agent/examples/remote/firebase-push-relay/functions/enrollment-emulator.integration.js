@@ -11,7 +11,7 @@ if (!process.env.FIRESTORE_EMULATOR_HOST) {
 
 const projectId = process.env.GCLOUD_PROJECT || "demo-volt-iroh-enrollment";
 const app = initializeApp({ projectId }, `iroh-enrollment-emulator-${process.pid}`);
-const firestore = getFirestore(app);
+const firestore = getFirestore(app, "volt-iroh-enrollment");
 const collections = [
 	"voltIrohEnrollmentClaims",
 	"voltIrohEnrollmentGrants",
@@ -132,6 +132,13 @@ before(clearFirestore);
 after(async () => {
 	await clearFirestore();
 	await deleteApp(app);
+});
+
+test("named enrollment database denies direct client access", async () => {
+	const response = await fetch(
+		`http://${process.env.FIRESTORE_EMULATOR_HOST}/v1/projects/${projectId}/databases/volt-iroh-enrollment/documents/voltIrohEnrollmentClaims/untrusted`,
+	);
+	assert.equal(response.status, 403);
 });
 
 test("real Firestore transactions preserve generation-scoped symmetric revocation", async () => {

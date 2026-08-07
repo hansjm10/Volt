@@ -2,8 +2,10 @@
 
 This Firebase deployment contains two separate HTTPS functions:
 
-- `pushRelay` stores raw FCM registration tokens in private Firestore state and gives the mobile app an opaque target id plus a target-scoped credential; and
-- `irohEnrollment` enrolls exact phone/desktop Iroh endpoint pairs for the Volt-managed relay fleet without accounts or a client-visible infrastructure bearer.
+- `pushRelay` stores raw FCM registration tokens in the named `volt-push-relay` Firestore database and gives the mobile app an opaque target id plus a target-scoped credential; and
+- `irohEnrollment` stores relay admission state in the named `volt-iroh-enrollment` Firestore database and enrolls exact phone/desktop Iroh endpoint pairs without accounts or a client-visible infrastructure bearer.
+
+The functions require distinct user-managed runtime service accounts. Database-conditioned IAM grants each identity access only to its own named database; Firestore Security Rules deny all mobile and web clients but are not the server-side isolation boundary.
 
 Neither service authorizes desktop RPC. Volt pairing, the authenticated Iroh transport, the host-observed client endpoint identity, and persisted RPC/tool grants remain the desktop-control boundary.
 
@@ -15,7 +17,7 @@ This directory provides the broker contract and deployable backend only. It does
 
 - Registration requires an `X-Firebase-AppCheck` **limited-use** token. The function consumes the token, requires its one-time `jti`, and allowlists the Firebase app id. There is no embedded or shared app secret.
 - One FCM token maps to one deterministic Firestore document. Re-registering rotates the target credential instead of growing an attacker-controlled collection.
-- Target credentials are stored only as SHA-256 hashes. FCM tokens remain raw because Firebase Messaging needs them, so Firestore access is denied to clients and project IAM must stay least-privilege.
+- Target credentials are stored only as SHA-256 hashes. FCM tokens remain raw because Firebase Messaging needs them, so clients are denied and only the push runtime identity can access the `volt-push-relay` database.
 - Targets expire after 30 days by default. Every delivery rejects an expired target immediately; the deployed Firestore TTL policy deletes expired documents asynchronously.
 - The app validates a cached target through the credential-authenticated status route before reuse. A host-side revoke therefore causes fresh App Check registration instead of leaving the phone stuck on a dead credential.
 - Registration, notification, and revocation bodies have a 16 KiB total cap plus explicit field, UTF-8 string, object-depth, key-count, and array-count bounds. Notification copy and metadata reject controls and path separators. FCM data is restricted to event, kind, workspace/session authority, and one navigation ID, so commands, diffs, and host paths cannot be forwarded.
@@ -31,7 +33,7 @@ The function remains publicly invokable because an unattached iOS app must reach
 - A strict `volt+iroh://v2` QR contains a 10-minute claim ID and independent 256-bit claim secret, but no broker URL, durable pair secret, App Check token, or relay infrastructure bearer.
 - The host and phone sign canonical, versioned request bytes with their Iroh Ed25519 endpoint keys. Signed timestamps accept at most ±2 minutes of skew.
 - Claim approval is single-use and idempotent for the exact phone endpoint and phone-generated grant secret. The resulting deterministic pair grant lasts 30 days and renewal consumes another limited-use App Check token when seven days remain.
-- Firestore transactions update claims, grants, both endpoint access maps, and durable quota windows. Empty unblocked endpoint documents are deleted, active endpoint documents are TTL eligible, and administrative blocks remain durable. Rules deny all direct client access. Defaults cap pending claims, active endpoint grants, new-host approvals, renewals, and endpoint-plus-salted-IP request windows.
+- Firestore transactions update claims, grants, both endpoint access maps, and durable quota windows in `volt-iroh-enrollment`. Empty unblocked endpoint documents are deleted, active endpoint documents are TTL eligible, and administrative blocks remain durable. Rules deny all direct client access, while database-conditioned IAM excludes the push runtime identity. Defaults cap pending claims, active endpoint grants, new-host approvals, renewals, and endpoint-plus-salted-IP request windows.
 - A managed relay calls `POST /v1/relay-access` with `X-Iroh-NodeId` and a server-to-server bearer. Only `200 text/plain` with exact body `true` permits registration. Current/next bearer overlap supports rotation. Unknown endpoint IDs do not create attacker-keyed quota documents, and the relay must enforce source-network, connection, and aggregate registration limits before invoking the callback.
 - Approval derives and returns a public `grantGenerationId` from the endpoint pair and phone-generated grant secret. Revocation carries that generation plus an explicit host-or-phone revoker endpoint, contains no grant secret, and requires no App Check. Matching revocation is atomic; stale generations succeed without removing a replacement pair grant.
 - This access hook runs when an endpoint registers. Revocation cannot interrupt an already-open registration and does not meter bytes per endpoint; relay-wide ceilings are separate deployment backstops.
@@ -84,9 +86,9 @@ Volt host state stores only the opaque relay target id, target-scoped credential
 4. Enable replay protection for limited-use App Check tokens; approval and renewal request them with `consume: true`.
 5. Configure APNs credentials in Firebase Console for ordinary FCM notifications.
 6. Create `IROH_ENROLLMENT_IP_SALT`, `IROH_RELAY_ACCESS_SECRET_CURRENT`, and `IROH_RELAY_ACCESS_SECRET_NEXT` with `firebase functions:secrets:set`. Values are 32-512 printable non-space characters; keep `NEXT` set to an independently generated standby value even before rotation.
-7. Deploy Firestore rules and indexes. Configure Firestore TTL on `expiresAt` for `voltPushTargets`, `voltIrohEnrollmentClaims`, `voltIrohEnrollmentGrants`, `voltIrohEndpointAccess`, and `voltIrohEnrollmentQuotaWindows`; authorization never relies on asynchronous TTL deletion.
-8. Create a dedicated runtime service account, grant only the required App Check verification, Secret Manager access, logging, and enrollment-collection Firestore permissions, and set its email in `IROH_ENROLLMENT_SERVICE_ACCOUNT`.
-9. Keep IAM least-privilege, enable audit logs and budget alerts, and monitor App Check failures, callback latency/denials, quota responses, active grant counts, and `5xx` responses.
+7. Create the `volt-push-relay` and `volt-iroh-enrollment` named Firestore databases in the same location, then deploy their separate deny-all client rules and index definitions. The checked-in field overrides enable TTL on each database's `expiresAt` fields; authorization never relies on asynchronous TTL deletion.
+8. Create distinct `volt-push-relay` and `volt-iroh-enrollment` runtime service accounts. Apply the database-conditioned and product-specific IAM grants below, then set their emails in `PUSH_RELAY_SERVICE_ACCOUNT` and `IROH_ENROLLMENT_SERVICE_ACCOUNT`. Deployment fails if either account is absent, malformed, or reused for both functions.
+9. Remove basic roles and unconditional Datastore roles from both runtime identities. Enable audit logs and budget alerts, and monitor App Check failures, callback latency/denials, quota responses, active grant counts, and `5xx` responses.
 
 For an Internet-facing deployment, put `irohEnrollment` behind an external Application Load Balancer with Cloud Armor (or an equivalent gateway). The function is declared with `ALLOW_INTERNAL_AND_GCLB`, so its generated direct URL is not an Internet ingress path. Route app and relay enrollment traffic through a reviewed load-balanced broker URL. `PUSH_RELAY_URL` configures only the separately authorized push function and is not the enrollment broker URL. The Firebase command below does not provision the load balancer, Cloud Armor policy, service account, or IAM grants.
 
@@ -98,20 +100,71 @@ For an Internet-facing deployment, put `irohEnrollment` behind an external Appli
 - `DELIVERIES_PER_TARGET_PER_MINUTE`: 1-600, default 30.
 - `REGISTRATIONS_PER_INSTANCE_PER_MINUTE`: 1-120, default 30.
 - `FUNCTION_REGION`: deployment region, default `us-central1`.
+- `PUSH_RELAY_SERVICE_ACCOUNT`: required dedicated user-managed push runtime service account email.
 - `IROH_RELAY_ORIGINS`: comma-separated 1-8 canonical HTTPS origins returned to both endpoints; default `https://iroh-relay-us-central.volt-cli.dev`.
 - `IROH_ENROLLMENT_SERVICE_ACCOUNT`: required dedicated user-managed runtime service account email. Deployment fails when it is absent or malformed.
 - `IROH_ENROLLMENT_REQUESTS_PER_ENDPOINT_PER_MINUTE`: durable endpoint quota, 1-600, default 60.
 - `IROH_ENROLLMENT_REQUESTS_PER_IP_PER_MINUTE`: durable salted-IP quota, 1-3000, default 300.
 - Secret Manager only (never `.env`): `IROH_ENROLLMENT_IP_SALT`, `IROH_RELAY_ACCESS_SECRET_CURRENT`, and `IROH_RELAY_ACCESS_SECRET_NEXT`.
 
+Database IDs are intentionally fixed in code and `firebase.json`; making them environment-configurable would let deployment drift collapse the isolation boundary.
+
+## Runtime IAM boundary
+
+Provision the runtime identities once. The deployer separately needs permission to act as both service accounts.
+
+```bash
+PROJECT_ID=volt-3fae7
+PUSH_SERVICE_ACCOUNT="volt-push-relay@${PROJECT_ID}.iam.gserviceaccount.com"
+ENROLLMENT_SERVICE_ACCOUNT="volt-iroh-enrollment@${PROJECT_ID}.iam.gserviceaccount.com"
+
+gcloud iam service-accounts create volt-push-relay --project "$PROJECT_ID"
+gcloud iam service-accounts create volt-iroh-enrollment --project "$PROJECT_ID"
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:${PUSH_SERVICE_ACCOUNT}" \
+  --role=roles/datastore.user \
+  --condition="expression=resource.name==\"projects/${PROJECT_ID}/databases/volt-push-relay\",title=push-relay-database,description=Push_runtime_database_only"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:${ENROLLMENT_SERVICE_ACCOUNT}" \
+  --role=roles/datastore.user \
+  --condition="expression=resource.name==\"projects/${PROJECT_ID}/databases/volt-iroh-enrollment\",title=iroh-enrollment-database,description=Enrollment_runtime_database_only"
+
+for SERVICE_ACCOUNT in "$PUSH_SERVICE_ACCOUNT" "$ENROLLMENT_SERVICE_ACCOUNT"; do
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:${SERVICE_ACCOUNT}" \
+    --role=roles/firebaseappcheck.tokenVerifier \
+    --condition=None
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:${SERVICE_ACCOUNT}" \
+    --role=roles/logging.logWriter \
+    --condition=None
+done
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:${PUSH_SERVICE_ACCOUNT}" \
+  --role=roles/firebasecloudmessaging.admin \
+  --condition=None
+
+for SECRET in IROH_ENROLLMENT_IP_SALT IROH_RELAY_ACCESS_SECRET_CURRENT IROH_RELAY_ACCESS_SECRET_NEXT; do
+  gcloud secrets add-iam-policy-binding "$SECRET" \
+    --project "$PROJECT_ID" \
+    --member="serviceAccount:${ENROLLMENT_SERVICE_ACCOUNT}" \
+    --role=roles/secretmanager.secretAccessor
+done
+```
+
+Do not grant either runtime identity `roles/editor`, `roles/owner`, `roles/datastore.user` without a database condition, or access to the other identity's product permissions. Firestore Admin SDK calls bypass Security Rules, so the conditional IAM bindings are the enforced server-side boundary.
+
 ## Deploy
 
-From this directory:
+From this directory, create the databases once with deletion protection, then deploy both database configurations and functions:
 
 ```bash
 firebase use volt-3fae7
-firebase firestore:databases:create '(default)' --project volt-3fae7 --location nam5
-firebase deploy --project volt-3fae7 --only firestore:rules,firestore:indexes,functions:volt-push-relay:pushRelay,functions:volt-push-relay:irohEnrollment
+firebase firestore:databases:create volt-push-relay --project volt-3fae7 --location nam5 --delete-protection ENABLED
+firebase firestore:databases:create volt-iroh-enrollment --project volt-3fae7 --location nam5 --delete-protection ENABLED
+firebase deploy --project volt-3fae7 --only firestore,functions:volt-push-relay:pushRelay,functions:volt-push-relay:irohEnrollment
 ```
 
 Cloud Functions deployment requires the Blaze plan. The enrollment function is not Internet-reachable until the load-balanced broker URL exists. Do not route production traffic to it until App Check, the app-id allowlist, APNs, TTL, monitoring, budgets, the dedicated runtime identity, Cloud Armor policy, and relay-side rate limits are verified.
@@ -134,13 +187,13 @@ npm ci
 npm run test:emulator
 ```
 
-The test refuses to run without `FIRESTORE_EMULATOR_HOST`, uses a `demo-*` project, and verifies real transactional create/approve/idempotency behavior, both revocation signers, both endpoint access maps, and stale-generation safety. The local script pins the Firebase CLI version and disables lifecycle scripts; CI instead verifies the published standalone CLI checksum before execution. The normal `npm test` suite remains fast and uses isolated adapters for strict-schema, signature, App Check, quota, and failure-path coverage.
+The test refuses to run without `FIRESTORE_EMULATOR_HOST`, uses a `demo-*` project, and targets `volt-iroh-enrollment` through the single-database `firebase.emulator.json` so the emulator loads the intended deny-all rules instead of implicitly creating an open named database. It verifies real transactional create/approve/idempotency behavior, both revocation signers, both endpoint access maps, and stale-generation safety. The local script pins the Firebase CLI version and disables lifecycle scripts; CI instead verifies the published standalone CLI checksum before execution. The normal `npm test` suite remains fast and uses isolated adapters for strict-schema, signature, App Check, quota, and failure-path coverage.
 
 ## Real App Check canary
 
-Use a separate Firebase canary project/app and the checked-in `canary.env.example`; never point a canary at production Firestore. Register the canary iOS bundle and its simulator debug token in Firebase App Check, set only the canary app id in `ALLOWED_FIREBASE_APP_IDS`, deploy the Firestore schema and both functions, and configure independently generated canary secrets. Build the app with the canary `GoogleService-Info.plist` and the reviewed fixed broker URL; do not accept a broker destination from a QR, launch argument, user default, or remote response.
+Use a separate Firebase canary project/app and the checked-in `canary.env.example`; never point a canary at production Firestore. Create both named databases and distinct canary runtime identities with the same conditional IAM boundary. Register the canary iOS bundle and its simulator debug token in Firebase App Check, set only the canary app id in `ALLOWED_FIREBASE_APP_IDS`, deploy both Firestore schemas and functions, and configure independently generated canary secrets. Build the app with the canary `GoogleService-Info.plist` and the reviewed fixed broker URL; do not accept a broker destination from a QR, launch argument, user default, or remote response.
 
-Before promoting, verify one real limited-use token succeeds once and replay fails, managed origins match exactly, revoke removes both endpoint access entries, an invalid relay callback bearer returns false, and broker outage still permits direct/LAN pairing. Delete the simulator debug token and canary grants after the exercise.
+Before promoting, verify each runtime identity can read and write only its named database and receives `PERMISSION_DENIED` from the other one. Also verify one real limited-use token succeeds once and replay fails, managed origins match exactly, revoke removes both endpoint access entries, an invalid relay callback bearer returns false, and broker outage still permits direct/LAN pairing. Delete the simulator debug token and canary grants after the exercise.
 
 ## Secret rotation and incident revocation
 
