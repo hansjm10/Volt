@@ -5,6 +5,7 @@ import { beforeAll, describe, expect, test, vi } from "vitest";
 import { type Component, Container, type Focusable, TUI } from "../../tui/src/tui.ts";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.ts";
+import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { SourceInfo } from "../src/core/source-info.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
@@ -523,6 +524,125 @@ describe("InteractiveMode.setupAutocompleteProvider", () => {
 
 		const provider = defaultEditor.setAutocompleteProvider.mock.calls[0]?.[0] as AutocompleteProvider;
 		expect(provider.triggerCharacters).toEqual(["$", "!"]);
+	});
+});
+
+describe("InteractiveMode plan pane integration", () => {
+	test("routes a customized pane key before default and extension-derived editor input", () => {
+		let listener: ((data: string) => { consume?: boolean } | undefined) | undefined;
+		const togglePlanPaneFocus = vi.fn();
+		const fakeThis = {
+			mainViewVisible: true,
+			keybindings: new KeybindingsManager({ "app.plan.togglePane": "alt+x" }),
+			ui: {
+				addInputListener: vi.fn((next: typeof listener) => {
+					listener = next;
+					return () => undefined;
+				}),
+			},
+			planPaneInputUnsubscribe: undefined,
+			togglePlanPaneFocus,
+		};
+
+		(InteractiveMode as any).prototype.setupPlanPaneInputRouting.call(fakeThis);
+
+		expect(listener?.("\x1bx")).toEqual({ consume: true });
+		expect(togglePlanPaneFocus).toHaveBeenCalledTimes(1);
+	});
+
+	test("consumes the pane shortcut before an extension-derived editor", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TUI(terminal);
+		const extensionEditor = new TestFocusableComponent("EXTENSION_EDITOR");
+		const root = new Container();
+		root.addChild(extensionEditor);
+		const togglePlanPaneFocus = vi.fn();
+		const fakeThis = {
+			mainViewVisible: true,
+			keybindings: new KeybindingsManager({ "app.plan.togglePane": "alt+x" }),
+			ui,
+			planPaneInputUnsubscribe: undefined,
+			togglePlanPaneFocus,
+		};
+		(InteractiveMode as any).prototype.setupPlanPaneInputRouting.call(fakeThis);
+		ui.addChild(root);
+		ui.setFocus(extensionEditor);
+		ui.start();
+		try {
+			terminal.sendInput("\x1bx");
+			await flushTui(ui, terminal);
+			expect(togglePlanPaneFocus).toHaveBeenCalledTimes(1);
+			expect(extensionEditor.inputs).toEqual([]);
+		} finally {
+			ui.stop();
+		}
+	});
+
+	test("recovers conversation focus when a resize removes the split", () => {
+		const focusConversation = vi.fn();
+		const fakeThis = {
+			planInspector: { focused: true },
+			planDetails: undefined,
+			session: { planningState: { mode: "build", plan: null } },
+			focusConversation,
+			showPlanDetails: vi.fn(),
+		};
+
+		(InteractiveMode as any).prototype.handlePlanSplitChange.call(fakeThis, false);
+
+		expect(focusConversation).toHaveBeenCalledTimes(1);
+	});
+
+	test("focuses the persistent inspector for /plan-details in wide layout", () => {
+		const focusPlanInspector = vi.fn();
+		const fakeThis = {
+			mainView: { isSplit: () => true },
+			ui: { terminal: { columns: 160, rows: 30 } },
+			focusPlanInspector,
+		};
+
+		(InteractiveMode as any).prototype.showPlanDetails.call(fakeThis);
+
+		expect(focusPlanInspector).toHaveBeenCalledTimes(1);
+	});
+
+	test("keeps the responsive main view atomic for full-screen selector replacement", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TUI(terminal);
+		const mainView = new TestFocusableComponent("MAIN_VIEW");
+		const editor = new TestFocusableComponent("EDITOR");
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		let closeSelector: () => void = () => undefined;
+		const fakeThis = {
+			mainView,
+			mainViewVisible: true,
+			dismissSubagentInspector: undefined,
+			ui,
+			editor,
+			editorContainer,
+			getMainViewComponents: () => [mainView],
+		};
+		ui.addChild(mainView);
+		ui.setFocus(editor);
+		ui.start();
+		try {
+			(InteractiveMode as any).prototype.showSelector.call(fakeThis, (done: () => void) => {
+				closeSelector = done;
+				const selector = new TestFocusableComponent("FULL_SCREEN_SELECTOR");
+				return { component: selector, focus: selector };
+			});
+			await flushTui(ui, terminal);
+			expect(fakeThis.mainViewVisible).toBe(false);
+			expect(ui.children).not.toContain(mainView);
+			closeSelector();
+			await flushTui(ui, terminal);
+			expect(fakeThis.mainViewVisible).toBe(true);
+			expect(ui.children).toContain(mainView);
+			expect(editor.focused).toBe(true);
+		} finally {
+			ui.stop();
+		}
 	});
 });
 

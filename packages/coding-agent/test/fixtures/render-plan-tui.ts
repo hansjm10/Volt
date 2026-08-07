@@ -1,62 +1,98 @@
-import { Editor } from "@hansjm10/volt-tui";
+import { Container, Editor, ProcessTerminal, setKeybindings, Text } from "@hansjm10/volt-tui";
 import { TUI } from "../../../tui/src/tui.ts";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
-import type { PlanningState, PlanState } from "../../src/core/planning.ts";
+import { KeybindingsManager } from "../../src/core/keybindings.ts";
+import type { PlanningState, PlanPhase, PlanState } from "../../src/core/planning.ts";
 import { getEditorTheme, initTheme, theme } from "../../src/core/theme/runtime.ts";
 import { createPlanningToolDefinitions, type PlanningToolController } from "../../src/core/tools/planning.ts";
+import { PlanInspectorComponent } from "../../src/modes/interactive/components/plan-inspector.ts";
 import { PlanDetailsComponent, PlanStatusComponent } from "../../src/modes/interactive/components/plan-status.ts";
+import { ResponsivePlanLayoutComponent } from "../../src/modes/interactive/components/responsive-plan-layout.ts";
 import { ToolExecutionComponent } from "../../src/modes/interactive/components/tool-execution.ts";
 
-const width = process.stdout.columns || 120;
+const width = process.stdout.columns || 160;
 const height = process.stdout.rows || 36;
 initTheme(process.env.VOLT_PLAN_THEME === "light" ? "light" : "dark");
+const keybindings = new KeybindingsManager();
+setKeybindings(keybindings);
 
+const requestedPhase = process.env.VOLT_PLAN_PHASE;
+const phase: PlanPhase =
+	requestedPhase === "draft" ||
+	requestedPhase === "active" ||
+	requestedPhase === "completed" ||
+	requestedPhase === "handed_off"
+		? requestedPhase
+		: "ready";
+const execution =
+	phase === "active" || phase === "completed" || phase === "handed_off"
+		? {
+				id: "fixture-execution",
+				approvedRevision: 7,
+				strategy: "retain_context" as const,
+				sourceSessionId: "fixture-source-session",
+				targetSessionId: "fixture-target-session",
+			}
+		: undefined;
 const plan: PlanState = {
 	id: "plan-native-mode",
 	revision: 7,
-	phase: "ready",
-	title: "Native Plan Mode Across Volt and Volt App With Readable Wrapped Content at Every Terminal Width",
+	phase,
+	title: "Responsive Two-Pane Plan Lifecycle TUI With Readable Wrapped Content at Every Terminal Width",
 	summary:
-		"Coordinate durable branch-local planning, exact approval, responsive clients, and end-to-end verification while keeping the complete decision summary visible instead of truncating it.",
+		"Keep canonical planning state, conversation controls, progress, lifecycle actions, and end-to-end verification visible without truncating authored content or changing approval semantics.",
 	steps: [
-		{ id: "step-1", text: "Define the shared planning state and validate its bounds", status: "completed" },
-		{ id: "step-2", text: "Persist branch-local snapshots outside compaction", status: "completed" },
-		{ id: "step-3", text: "Enforce read-only Plan tools at the execution boundary", status: "completed" },
-		{ id: "step-4", text: "Wire strict RPC bootstrap, checkpoint, and event schemas", status: "completed" },
+		{ id: "step-1", text: "Define the responsive width and height contract", status: "completed" },
+		{ id: "step-2", text: "Preserve branch-local planning state outside compaction", status: "completed" },
+		{ id: "step-3", text: "Compose ANSI-safe conversation and inspector lines", status: "completed" },
+		{ id: "step-4", text: "Keep the footer full-width below both panes", status: "completed" },
 		{
 			id: "step-5",
-			text: "Implement exact revision-fenced execution actions and keep the complete long checklist item readable across wrapped visual rows",
-			status: "in_progress",
-			note: "Verified against stale revisions and compact terminal rendering",
+			text: "Integrate focus, resize recovery, ready actions, and a complete long checklist item across wrapped visual rows",
+			status: phase === "completed" || phase === "handed_off" ? "completed" : "in_progress",
+			note: "Verified against exact responsive boundaries and compact fallback",
 		},
 		{
 			id: "step-6",
-			text: "Render the responsive terminal plan viewer without cutting off authored lines",
-			status: "pending",
+			text: "Verify streaming, selectors, extension UI, images, themes, ASCII, and scrollback",
+			status: phase === "completed" || phase === "handed_off" ? "completed" : "pending",
 		},
-		{ id: "step-7", text: "Project Plan state into the iOS composer", status: "pending" },
-		{ id: "step-8", text: "Fence delayed mobile responses by conversation authority", status: "pending" },
-		{ id: "step-9", text: "Verify reconnect and branch rebase recovery", status: "pending" },
-		{ id: "step-10", text: "Run dark and light visual review", status: "pending" },
-		{ id: "step-11", text: "Run Unicode and ASCII visual review", status: "pending" },
-		{ id: "step-12", text: "Complete coordinated release checks", status: "pending" },
+		{ id: "step-7", text: "Capture narrow and wide lifecycle states", status: "pending" },
+		{ id: "step-8", text: "Prepare focused release notes and review evidence", status: "pending" },
 	],
+	...(execution ? { execution } : {}),
 };
 
-const planning: PlanningState = { mode: "plan", plan };
-const tui = new TUI(new VirtualTerminal(width, height));
+const planning: PlanningState = { mode: phase === "draft" || phase === "ready" ? "plan" : "build", plan };
+const hold = process.env.VOLT_PLAN_HOLD === "1";
+const tui = new TUI(hold ? new ProcessTerminal() : new VirtualTerminal(width, height));
 const details = new PlanDetailsComponent({
 	plan,
-	getTerminalRows: () => height,
+	getTerminalRows: () => tui.terminal.rows,
 	onAction: () => undefined,
 	onClose: () => undefined,
 	requestRender: () => undefined,
 });
-const status = new PlanStatusComponent(planning);
 const editor = new Editor(tui, getEditorTheme(), {
-	topBorderLabel: "PLAN · AGENT READ-ONLY",
-	placeholder: "Tell Volt what to change in the plan",
+	topBorderLabel: planning.mode === "plan" ? "PLAN · AGENT READ-ONLY" : "ASK VOLT · BUILD",
+	placeholder: "Tell Volt what to change",
 });
+const actionMessage = new Text("", 1, 0);
+let inspector: PlanInspectorComponent;
+const focusEditor = () => tui.setFocus(editor);
+const toggleFocus = () => tui.setFocus(inspector.focused ? editor : inspector);
+inspector = new PlanInspectorComponent({
+	planning,
+	onAction: (action) => {
+		actionMessage.setText(theme.fg("accent", `Selected ready action: ${action}`));
+		tui.requestRender();
+	},
+	onReturnFocus: focusEditor,
+	onToggleFocus: toggleFocus,
+	requestRender: () => tui.requestRender(),
+});
+if (process.env.VOLT_PLAN_FOCUSED === "1") inspector.focused = true;
+const status = new PlanStatusComponent(planning);
 const controller: PlanningToolController = {
 	getPlanningState: () => planning,
 	flushPlanningState: async () => undefined,
@@ -81,7 +117,7 @@ const tool = new ToolExecutionComponent(
 );
 tool.updateResult(
 	{
-		content: [{ type: "text", text: JSON.stringify({ mode: "plan", planId: plan.id, steps: plan.steps }) }],
+		content: [{ type: "text", text: JSON.stringify({ mode: planning.mode, planId: plan.id, steps: plan.steps }) }],
 		details: planning,
 		isError: false,
 	},
@@ -89,16 +125,66 @@ tool.updateResult(
 );
 tool.setExpanded(process.env.VOLT_PLAN_EXPANDED === "1");
 
-const primaryLines = process.env.VOLT_PLAN_SCENARIO === "tools" ? tool.render(width) : details.render(width);
-const statusLines = status.render(width);
-const editorLines = editor.render(width);
-const footer = theme.fg("dim", "Shift+Tab build/plan  Ctrl+Shift+T thinking");
-const reservedBottomRows = statusLines.length + editorLines.length + 1;
-const availablePrimaryRows = Math.max(0, height - reservedBottomRows);
-const visiblePrimaryLines = primaryLines.slice(Math.max(0, primaryLines.length - availablePrimaryRows));
-const fixedRows = visiblePrimaryLines.length + reservedBottomRows;
-const spacer = Array.from({ length: Math.max(0, height - fixedRows) }, () => "");
-const lines = [...visiblePrimaryLines, ...spacer, ...statusLines, ...editorLines, footer];
-const output = lines.slice(0, height).map((line) => `${line}\u001b[0m`);
+const transcript = new Container();
+transcript.addChild(
+	new Text(theme.fg("muted", "Conversation transcript remains available in terminal scrollback."), 1, 0),
+);
+if (process.env.VOLT_PLAN_SCENARIO === "tools") transcript.addChild(tool);
+if (process.env.VOLT_PLAN_SCENARIO === "scrollback") {
+	transcript.addChild(
+		new Text(Array.from({ length: 40 }, (_, index) => `Conversation history row ${index + 1}`).join("\n"), 1, 0),
+	);
+}
+const streamingText = new Text("Assistant stream: chunk 1", 1, 0);
+if (process.env.VOLT_PLAN_STREAM === "1") transcript.addChild(streamingText);
+const statusContainer = new Container();
+statusContainer.addChild(status);
+const editorContainer = new Container();
+editorContainer.addChild(actionMessage);
+editorContainer.addChild(editor);
+const footer = new Text(
+	theme.fg("dim", "workspace · main") +
+		theme.fg("text", " ".repeat(Math.max(1, width - 45))) +
+		theme.fg("text", "fixture-model"),
+	0,
+	0,
+);
+const layout = new ResponsivePlanLayoutComponent({
+	planning,
+	transcriptComponents: [transcript],
+	controlComponents: [editorContainer],
+	compactComponents: [transcript, statusContainer, details, editorContainer],
+	inspector,
+	footer,
+	getTerminalRows: () => tui.terminal.rows,
+	onSplitChange: () => undefined,
+});
 
-process.stdout.write(`\u001b[2J${output.map((line, index) => `\u001b[${index + 1};1H${line}`).join("")}`);
+if (hold) {
+	tui.addChild(layout);
+	tui.addInputListener((data) => {
+		if (!keybindings.matches(data, "app.plan.togglePane")) return undefined;
+		toggleFocus();
+		return { consume: true };
+	});
+	tui.setFocus(process.env.VOLT_PLAN_FOCUSED === "1" ? inspector : editor);
+	tui.start();
+	let streamChunk = 1;
+	const streamTimer =
+		process.env.VOLT_PLAN_STREAM === "1"
+			? setInterval(() => {
+					streamChunk += 1;
+					streamingText.setText(`Assistant stream: chunk ${streamChunk}`);
+					tui.requestRender();
+				}, 1000)
+			: undefined;
+	process.on("SIGTERM", () => {
+		if (streamTimer) clearInterval(streamTimer);
+		tui.stop();
+		process.exit(0);
+	});
+} else {
+	const lines = layout.render(width);
+	const output = lines.slice(Math.max(0, lines.length - height)).map((line) => `${line}\u001b[0m`);
+	process.stdout.write(`\u001b[2J${output.map((line, index) => `\u001b[${index + 1};1H${line}`).join("")}`);
+}

@@ -198,8 +198,10 @@ import { ExtensionInputComponent } from "./components/extension-input.ts";
 import { ExtensionSelectorComponent } from "./components/extension-selector.ts";
 import { FooterComponent } from "./components/footer.ts";
 import { type HotkeySection, HotkeysComponent } from "./components/hotkeys.ts";
+import { PlanInspectorComponent } from "./components/plan-inspector.ts";
 import { type PlanDetailsAction, PlanDetailsComponent, PlanStatusComponent } from "./components/plan-status.ts";
 import { createRemoteControlBackend, RemoteControlCenterComponent } from "./components/remote-control-center.ts";
+import { ResponsivePlanLayoutComponent } from "./components/responsive-plan-layout.ts";
 import { isCoalescableAssistantUpdate, StreamingRenderCoalescer } from "./components/streaming-render-coalescer.ts";
 import { VoltAnnouncementComponent } from "./components/volt-announcement.ts";
 import {
@@ -414,6 +416,12 @@ export class InteractiveMode {
 	private planDetailsContainer: Container;
 	private planStatus: PlanStatusComponent;
 	private planDetails: PlanDetailsComponent | undefined;
+	private planInspector: PlanInspectorComponent;
+	private mainView: ResponsivePlanLayoutComponent;
+	private planPaneReturnFocus: Component | undefined;
+	private planPaneInputUnsubscribe: (() => void) | undefined;
+	private readyPlanFocusKey: string | undefined;
+	private mainViewVisible = true;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
 	private editorComponentFactory: EditorFactory | undefined;
@@ -600,9 +608,44 @@ export class InteractiveMode {
 		this.editorContainer.addChild(this.editor as Component);
 		this.planStatus = new PlanStatusComponent(this.session.planningState);
 		this.planStatusContainer.addChild(this.planStatus);
+		this.planInspector = new PlanInspectorComponent({
+			planning: this.session.planningState,
+			onAction: (action) => {
+				void this.handlePlanDetailsAction(action);
+			},
+			onReturnFocus: () => this.focusConversation(),
+			onToggleFocus: () => this.togglePlanPaneFocus(),
+			requestRender: () => this.ui.requestRender(),
+		});
 		this.footerDataProvider = new FooterDataProvider(this.session.gitContextProvider);
 		this.footer = new FooterComponent(this.session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
+		this.mainView = new ResponsivePlanLayoutComponent({
+			planning: this.session.planningState,
+			transcriptComponents: [this.headerContainer, this.chatContainer],
+			controlComponents: [
+				this.pendingMessagesContainer,
+				this.statusContainer,
+				this.widgetContainerAbove,
+				this.editorContainer,
+				this.widgetContainerBelow,
+			],
+			compactComponents: [
+				this.headerContainer,
+				this.chatContainer,
+				this.pendingMessagesContainer,
+				this.statusContainer,
+				this.widgetContainerAbove,
+				this.planStatusContainer,
+				this.planDetailsContainer,
+				this.editorContainer,
+				this.widgetContainerBelow,
+			],
+			inspector: this.planInspector,
+			footer: this.footer,
+			getTerminalRows: () => this.ui.terminal.rows,
+			onSplitChange: (split) => this.handlePlanSplitChange(split),
+		});
 
 		// Load hide thinking block setting
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -862,22 +905,13 @@ export class InteractiveMode {
 			console.log(theme.fg("dim", `Model scope: ${modelList}${cycleHint}`));
 		}
 
-		// Add header container as first child. Populate it after detectThemeIfUnset.
-		this.ui.addChild(this.headerContainer);
-
-		this.ui.addChild(this.chatContainer);
-		this.ui.addChild(this.pendingMessagesContainer);
-		this.ui.addChild(this.statusContainer);
+		// The responsive main view owns the conversation, plan pane, and full-width footer.
 		this.renderWidgets(); // Initialize with default spacer
-		this.ui.addChild(this.widgetContainerAbove);
-		this.ui.addChild(this.planStatusContainer);
-		this.ui.addChild(this.planDetailsContainer);
-		this.ui.addChild(this.editorContainer);
-		this.ui.addChild(this.widgetContainerBelow);
-		this.ui.addChild(this.footer);
+		this.ui.addChild(this.mainView);
 		this.ui.setFocus(this.editor);
 
 		this.setupKeyHandlers();
+		this.setupPlanPaneInputRouting();
 		this.setupEditorSubmitHandler();
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
@@ -898,6 +932,7 @@ export class InteractiveMode {
 				hint("app.exit", "to exit (empty)"),
 				hint("app.suspend", "to suspend"),
 				keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
+				hint("app.plan.togglePane", "to focus the plan pane"),
 				hint("app.thinking.cycle", "to cycle thinking level"),
 				rawKeyHint(`${keyText("app.model.cycleForward")}/${keyText("app.model.cycleBackward")}`, "to cycle models"),
 				hint("app.model.select", "to select model"),
@@ -2575,23 +2610,13 @@ export class InteractiveMode {
 			this.customFooter.dispose();
 		}
 
-		// Remove current footer from UI
-		if (this.customFooter) {
-			this.ui.removeChild(this.customFooter);
-		} else {
-			this.ui.removeChild(this.footer);
-		}
-
 		if (factory) {
-			// Create and add custom footer, passing the data provider
+			// Create and install a custom full-width footer.
 			this.customFooter = factory(this.ui, theme, this.footerDataProvider);
-			this.ui.addChild(this.customFooter);
 		} else {
-			// Restore built-in footer
 			this.customFooter = undefined;
-			this.ui.addChild(this.footer);
 		}
-
+		this.mainView.setFooter(this.customFooter ?? this.footer);
 		this.ui.requestRender();
 	}
 
@@ -3275,6 +3300,17 @@ export class InteractiveMode {
 		this.defaultEditor.onPasteImage = () => {
 			this.handleClipboardImagePaste();
 		};
+	}
+
+	private setupPlanPaneInputRouting(): void {
+		this.planPaneInputUnsubscribe?.();
+		this.planPaneInputUnsubscribe = this.ui.addInputListener((data) => {
+			if (!this.mainViewVisible || !this.keybindings.matches(data, "app.plan.togglePane")) {
+				return undefined;
+			}
+			this.togglePlanPaneFocus();
+			return { consume: true };
+		});
 	}
 
 	private createHostActionContext(): HostActionInvocationContext {
@@ -4603,20 +4639,40 @@ export class InteractiveMode {
 
 	private refreshPlanningUi(planning = this.session.planningState): void {
 		this.planStatus.setPlanning(planning);
+		this.planInspector.setPlanning(planning);
+		this.mainView.setPlanning(planning);
 		const plan = planning.plan;
-		if (this.planDetails && plan) {
+		const split = this.mainView.isSplit(this.ui.terminal.columns, this.ui.terminal.rows);
+		if (split && this.planDetails) {
+			this.closePlanDetails({ focusConversation: false });
+		} else if (this.planDetails && plan) {
 			this.planDetails.setPlan(plan);
 		} else if (this.planDetails && !plan) {
 			this.closePlanDetails();
 		}
+		if (!split && this.planInspector.focused) {
+			this.focusConversation();
+		}
 		this.updateEditorBorderColor();
-		if (plan?.phase === "ready" && !this.planDetails) {
-			this.showPlanDetails();
+		if (plan?.phase === "ready") {
+			const readyKey = `${plan.id}:${plan.revision}`;
+			if (split) {
+				if (this.readyPlanFocusKey !== readyKey) this.focusPlanInspector();
+			} else if (!this.planDetails) {
+				this.showPlanDetails();
+			}
+			this.readyPlanFocusKey = readyKey;
+		} else {
+			this.readyPlanFocusKey = undefined;
 		}
 		this.ui.requestRender();
 	}
 
 	private showPlanDetails(): void {
+		if (this.mainView.isSplit(this.ui.terminal.columns, this.ui.terminal.rows)) {
+			this.focusPlanInspector();
+			return;
+		}
 		const plan = this.session.planningState.plan;
 		if (!plan) {
 			this.showStatus("No structured plan yet");
@@ -4637,11 +4693,55 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private closePlanDetails(): void {
+	private closePlanDetails(options: { focusConversation?: boolean } = {}): void {
 		this.planDetailsContainer.clear();
 		this.planDetails = undefined;
-		this.ui.setFocus(this.editor);
+		if (options.focusConversation !== false) this.focusConversation();
 		this.ui.requestRender();
+	}
+
+	private getConversationFocusTarget(): Component {
+		const saved = this.planPaneReturnFocus;
+		if (saved && this.editorContainer.children.includes(saved)) return saved;
+		return this.extensionSelector ?? this.extensionInput ?? this.extensionEditor ?? (this.editor as Component);
+	}
+
+	private focusPlanInspector(): void {
+		if (!this.mainViewVisible || !this.mainView.isSplit(this.ui.terminal.columns, this.ui.terminal.rows)) return;
+		if (!this.planInspector.focused) {
+			this.planPaneReturnFocus = this.getConversationFocusTarget();
+			this.ui.setFocus(this.planInspector);
+		}
+		this.ui.requestRender();
+	}
+
+	private focusConversation(): void {
+		this.ui.setFocus(this.getConversationFocusTarget());
+		this.planPaneReturnFocus = undefined;
+		this.ui.requestRender();
+	}
+
+	private togglePlanPaneFocus(): void {
+		if (this.mainView.isSplit(this.ui.terminal.columns, this.ui.terminal.rows)) {
+			if (this.planInspector.focused) this.focusConversation();
+			else this.focusPlanInspector();
+			return;
+		}
+		if (this.planDetails) {
+			this.closePlanDetails();
+		} else if (this.session.planningState.plan) {
+			this.showPlanDetails();
+		}
+	}
+
+	private handlePlanSplitChange(split: boolean): void {
+		if (split) {
+			if (this.planDetails) this.closePlanDetails({ focusConversation: false });
+			if (this.session.planningState.plan?.phase === "ready") this.focusPlanInspector();
+			return;
+		}
+		if (this.planInspector.focused) this.focusConversation();
+		if (this.session.planningState.plan?.phase === "ready" && !this.planDetails) this.showPlanDetails();
 	}
 
 	private async handlePlanDetailsAction(action: PlanDetailsAction): Promise<void> {
@@ -5123,6 +5223,7 @@ export class InteractiveMode {
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.editor);
 			for (const mainComponent of mainComponents) this.ui.addChild(mainComponent);
+			this.mainViewVisible = true;
 			this.ui.setFocus(this.editor);
 			this.ui.requestRender(true);
 		};
@@ -5133,6 +5234,7 @@ export class InteractiveMode {
 			dispose?.();
 			return;
 		}
+		this.mainViewVisible = false;
 		for (const mainComponent of mainComponents) this.ui.removeChild(mainComponent);
 		this.ui.addChild(component);
 		this.ui.setFocus(created.focus);
@@ -5140,18 +5242,7 @@ export class InteractiveMode {
 	}
 
 	private getMainViewComponents(): Component[] {
-		return [
-			this.headerContainer,
-			this.chatContainer,
-			this.pendingMessagesContainer,
-			this.statusContainer,
-			this.widgetContainerAbove,
-			this.planStatusContainer,
-			this.planDetailsContainer,
-			this.editorContainer,
-			this.widgetContainerBelow,
-			this.customFooter ?? this.footer,
-		];
+		return [this.mainView];
 	}
 
 	private showSubagentInspector(): void {
@@ -5169,6 +5260,7 @@ export class InteractiveMode {
 			view.dispose();
 			this.ui.removeChild(view);
 			for (const component of this.getMainViewComponents()) this.ui.addChild(component);
+			this.mainViewVisible = true;
 			this.ui.setFocus(this.editor);
 			if (this.dismissSubagentInspector === close) this.dismissSubagentInspector = undefined;
 			this.ui.requestRender(true);
@@ -5182,6 +5274,7 @@ export class InteractiveMode {
 			close,
 		);
 
+		this.mainViewVisible = false;
 		for (const component of this.getMainViewComponents()) this.ui.removeChild(component);
 		this.ui.addChild(view);
 		this.ui.setFocus(view);
@@ -7796,6 +7889,7 @@ export class InteractiveMode {
 		const exit = this.getAppKeyDisplay("app.exit");
 		const suspend = this.getAppKeyDisplay("app.suspend");
 		const toggleAgentMode = this.getAppKeyDisplay("app.mode.toggle");
+		const togglePlanPane = this.getAppKeyDisplay("app.plan.togglePane");
 		const cycleThinkingLevel = this.getAppKeyDisplay("app.thinking.cycle");
 		const cycleModelForward = this.getAppKeyDisplay("app.model.cycleForward");
 		const selectModel = this.getAppKeyDisplay("app.model.select");
@@ -7819,6 +7913,7 @@ export class InteractiveMode {
 					{ key: expandTools, action: "Toggle tool output expansion" },
 					{ key: selectModel, action: "Open model selector" },
 					{ key: toggleAgentMode, action: "Toggle Build / Plan mode" },
+					{ key: togglePlanPane, action: "Switch conversation / plan pane focus" },
 					{ key: cycleThinkingLevel, action: "Cycle thinking level" },
 					{ key: openSubagents, action: "Switch to subagent conversations" },
 				],
@@ -7863,6 +7958,7 @@ export class InteractiveMode {
 					{ key: exit, action: "Exit when editor is empty" },
 					{ key: suspend, action: "Suspend to background" },
 					{ key: toggleAgentMode, action: "Toggle Build / Plan mode" },
+					{ key: togglePlanPane, action: "Switch conversation / plan pane focus" },
 					{ key: cycleThinkingLevel, action: "Cycle thinking level" },
 					{ key: `${cycleModelForward} / ${cycleModelBackward}`, action: "Cycle models" },
 					{ key: selectModel, action: "Open model selector" },
@@ -8577,6 +8673,8 @@ export class InteractiveMode {
 			this.loadingAnimation = undefined;
 		}
 		this.clearExtensionTerminalInputListeners();
+		this.planPaneInputUnsubscribe?.();
+		this.planPaneInputUnsubscribe = undefined;
 		this.dismissSubagentInspector?.();
 		this.footer.dispose();
 		this.footerDataProvider.dispose();
