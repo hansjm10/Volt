@@ -29,7 +29,7 @@ Planning exposes operations authorized by a host-owned research capability profi
 - workspace and network reads
 - vetted process inspection through the structured `inspect` tool
 - explicitly trusted MCP discovery and reads
-- `update_plan`, which completely replaces only a draft checklist
+- `update_plan`, which creates or completely replaces a working draft as research changes the current understanding
 - `submit_plan`, which moves a researched draft to `ready`
 
 Unrestricted Bash, workspace/network writes, delegation, extension/custom operations, and unresolved mixed-tool actions are not granted. Before a Plan-to-Build transition commits, Volt awaits unrestricted eager/keep-alive MCP startup, rebuilds direct MCP definitions from fresh tool metadata, and resynchronizes requested Build tools under the session's allow/exclude policy. MCP tools, resources, and prompts carry independent freshness timestamps, so a restricted resource-only refresh cannot promote stale tool metadata. Concurrent partial refresh commits merge against the latest cached categories. Build is not exposed while restoration is still running.
@@ -44,9 +44,9 @@ Approved title, summary, step IDs, text, order, and cardinality are therefore st
 
 Exact no-op draft and progress updates are rejected so repeated calls cannot consume revisions without making progress.
 
-## Exploration first
+## Exploration and working drafts
 
-The trusted Plan-mode prompt directs the model to investigate relevant code, configuration, tests, documentation, or history before drafting; resolve discoverable repository facts before asking questions; distinguish evidence from assumptions; compare meaningful alternatives; and include verification criteria.
+The trusted Plan-mode prompt directs the model to perform one targeted orientation pass through relevant code, configuration, tests, documentation, or history before creating a draft. It then creates a working draft early instead of waiting for research to finish, keeps the summary as a concise rolling synthesis, and revises the candidate implementation steps whenever evidence materially changes the scope, approach, ordering, or verification. It does not mechanically revise the plan after every read. Before submission, it resolves discoverable repository facts, distinguishes evidence from assumptions, compares meaningful alternatives, removes investigation-only steps, and includes explicit verification criteria.
 
 `submit_plan` is blocked at the model tool boundary until the current runtime has observed a successful operation that resolved to a research-evidence capability (`workspace.read`, `network.read`, or `integration.read`). That evidence remains valid when ordinary user feedback, including feedback queued during submission, returns the researched ready plan to draft in the same conversation generation, so a focused revision can be resubmitted without an unrelated read. Fresh Plan-mode entry, execution replanning, tree navigation, and a resumed draft must perform a new exploration call before submission. Direct SDK state-transition methods remain deterministic and do not synthesize tool evidence.
 
@@ -71,6 +71,8 @@ Canonical state reaches the model through append-only context:
 - restoration adds a checkpoint only when the current revision is absent from retained tool results or prior checkpoints
 
 This preserves Codex WebSocket continuation and provider prefix caching during ordinary planning and execution turns. Mode, phase, or tool-policy boundaries may still cause one intentional cache miss.
+
+Working-draft revisions compact the model's current understanding into canonical plan state, but they do not remove earlier research or prior revisions from the append-only model context. Normal context compaction remains responsible for reclaiming context tokens and appends the latest complete plan checkpoint after its new boundary.
 
 ## Deliberately deferred
 

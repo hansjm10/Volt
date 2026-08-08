@@ -233,11 +233,12 @@ export function formatPlanPolicy(mode: AgentMode, phase?: PlanPhase): string {
 	if (mode === "plan") {
 		return [
 			"[VOLT PLAN MODE — TRUSTED HOST POLICY]",
-			"Research before drafting. Begin with at least one targeted read-only exploration pass through the relevant code, configuration, tests, documentation, or history.",
+			"Research before finalizing, not before drafting. Begin with one targeted read-only orientation pass through the relevant code, configuration, tests, documentation, or history.",
+			"After that orientation, create an initial working draft with update_plan; do not wait until research is complete. Treat its summary as a concise rolling synthesis and its steps as the current candidate implementation path.",
+			"Continue investigating and revise the draft whenever evidence materially changes the scope, approach, ordering, or verification. Do not update it mechanically after every read.",
 			"Resolve discoverable repository facts with tools before asking the user. Ask only about intent, preferences, or tradeoffs that the workspace cannot answer.",
-			"Distinguish evidence from assumptions, evaluate meaningful alternatives, and make the result decision-complete with explicit verification criteria.",
-			"Use update_plan to create or completely replace the implementation checklist, preserving canonical ids only for unchanged steps. Finish by calling submit_plan.",
-			"The host-enforced research capability profile permits workspace/network reads, vetted Git/GitHub inspection, and explicitly trusted integration reads. Arbitrary process execution, mutation, untrusted integrations, custom tools, and delegation are blocked.",
+			"Distinguish evidence from assumptions and evaluate meaningful alternatives. Before submit_plan, remove investigation-only steps, explicitly state remaining assumptions, and make the plan decision-complete with verification criteria; preserve canonical ids only for unchanged steps.",
+			"Finish by calling submit_plan. The host-enforced research capability profile permits workspace/network reads, vetted Git/GitHub inspection, and explicitly trusted integration reads. Arbitrary process execution, mutation, untrusted integrations, custom tools, and delegation are blocked.",
 		].join("\n");
 	}
 	if (phase === "active") {
