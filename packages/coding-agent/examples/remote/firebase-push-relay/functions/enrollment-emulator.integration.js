@@ -3,7 +3,10 @@ const { after, before, test } = require("node:test");
 const { initializeApp, deleteApp } = require("firebase-admin/app");
 const { Timestamp, getFirestore } = require("firebase-admin/firestore");
 const { getSaltedIpId } = require("./enrollment-core.js");
-const { createIrohEnrollmentHandler } = require("./enrollment-handler.js");
+const {
+	createIrohEnrollmentApiHandler,
+	createIrohRelayAccessHandler,
+} = require("./enrollment-handler.js");
 const vector = require("../../../../test/fixtures/iroh-relay-enrollment-v1-vectors.json");
 
 if (!process.env.FIRESTORE_EMULATOR_HOST) {
@@ -22,7 +25,7 @@ const collections = [
 	"voltIrohEnrollmentQuotaWindows",
 ];
 
-const handler = createIrohEnrollmentHandler({
+const enrollmentHandler = createIrohEnrollmentApiHandler({
 	config: {
 		appCheckRequestsPerIpPerWindow: 100,
 		relayOrigins: ["https://iroh-relay-us-central.volt-cli.dev"],
@@ -31,12 +34,20 @@ const handler = createIrohEnrollmentHandler({
 	},
 	getFirestore: () => firestore,
 	getIpSalt: () => ipSalt,
-	getRelayAccessSecrets: () => ["c".repeat(32), "n".repeat(32)],
 	logError: () => {},
 	logEvent: () => {},
 	now: () => vector.issuedAtMs,
 	timestampFromMillis: (value) => Timestamp.fromMillis(value),
 	verifyLimitedUseAppCheck: async () => vector.firebaseAppId,
+});
+const relayHandler = createIrohRelayAccessHandler({
+	getFirestore: () => firestore,
+	getRelayAccessSecrets: () => ["c".repeat(32), "n".repeat(32)],
+	logError: () => {},
+	logEvent: () => {},
+	now: () => vector.issuedAtMs,
+	requestsPerEndpointPerWindow: 100,
+	timestampFromMillis: (value) => Timestamp.fromMillis(value),
 });
 
 function createBody() {
@@ -82,6 +93,7 @@ function revokeBody(revoker) {
 
 async function invoke(path, body, headers = {}) {
 	const result = {};
+	const rawBody = body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(body), "utf8");
 	const response = {
 		headersSent: false,
 		json(value) {
@@ -106,16 +118,19 @@ async function invoke(path, body, headers = {}) {
 			return this;
 		},
 	};
+	const handler = path === "/v1/relay-access" ? relayHandler : enrollmentHandler;
 	await handler(
 		{
 			body,
 			headers: {
+				"content-length": String(rawBody.byteLength),
 				...(body === undefined ? {} : { "content-type": "application/json" }),
 				...headers,
 			},
 			ip: requestIp,
 			method: "POST",
 			path,
+			rawBody,
 		},
 		response,
 	);

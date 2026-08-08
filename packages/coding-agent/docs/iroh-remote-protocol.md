@@ -292,7 +292,7 @@ Remote clients observe spawning activity through the parent conversation's `suba
     "platform": "ios",
     "pushTargetId": "<relay-target-id>",
     "pushTargetAuthToken": "<relay-target-auth-token>",
-    "relayUrl": "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay",
+    "relayUrl": "https://push-relay-us-central.volt-cli.dev",
     "tokenHash": "sha256:<fcm-token-hash>",
     "enabled": true
   }

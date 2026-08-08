@@ -285,15 +285,43 @@ describe("Iroh remote notification requests", () => {
 		if (!init) {
 			throw new Error("Expected notification fetch init");
 		}
-		const body = JSON.parse(String(init.body)) as unknown;
-		if (!isRecord(body)) {
-			throw new Error("Expected notification body object");
+		const serializedBody = String(init.body);
+		const body = JSON.parse(serializedBody) as unknown;
+		if (!isRecord(body) || !isRecord(init.headers)) {
+			throw new Error("Expected notification body object and headers");
 		}
+		expect(init.headers).toMatchObject({
+			"content-length": String(Buffer.byteLength(serializedBody, "utf8")),
+			"content-type": "application/json",
+		});
+		expect(Buffer.byteLength(serializedBody, "utf8")).toBeLessThanOrEqual(16 * 1024);
 		expect(body).toMatchObject({
 			pushTargetId: "relay-target-1",
 			pushTargetAuthToken: "relay-target-auth-token",
 			eventId: "event-1",
 		});
+	});
+
+	test("relay HTTP client uses the fixed protected push origin by default", async () => {
+		const fetcher = vi.fn(async (_input: string, _init: RequestInit): Promise<Response> => {
+			return new Response("{}", { status: 200 });
+		});
+		const client = new IrohRemotePushRelayHttpClient({ fetcher });
+
+		await client.sendNotification({
+			pushTargetId: "relay-target-1",
+			pushTargetAuthToken: "relay-target-auth-token",
+			eventId: "event-1",
+			kind: "conversation_completed",
+			title: "Volt finished",
+			body: "Your conversation is ready.",
+			data: { eventId: "event-1", kind: "conversation_completed" },
+		});
+
+		expect(fetcher).toHaveBeenCalledWith(
+			"https://push-relay-us-central.volt-cli.dev/v1/notifications",
+			expect.objectContaining({ method: "POST" }),
+		);
 	});
 
 	test("relay HTTP client surfaces the relay error body in thrown errors", async () => {

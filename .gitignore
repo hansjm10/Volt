@@ -11,6 +11,7 @@ packages/*/dist-firefox/
 
 # Environment
 .env
+packages/coding-agent/examples/remote/firebase-push-relay/functions/.env.*
 
 # Editor files
 .vscode/

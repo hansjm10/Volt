@@ -35,11 +35,16 @@ describe("Iroh push relay target revocation", () => {
 		expect(fetcher).toHaveBeenCalledTimes(1);
 		const [url, init] = fetcher.mock.calls[0] ?? [];
 		expect(url).toBe("https://push.example.test/root/v1/push-targets/revoke");
+		const serializedBody = String(init?.body);
 		expect(init).toMatchObject({
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: {
+				"content-length": String(Buffer.byteLength(serializedBody, "utf8")),
+				"content-type": "application/json",
+			},
 		});
-		expect(JSON.parse(String(init?.body))).toEqual({
+		expect(Buffer.byteLength(serializedBody, "utf8")).toBeLessThanOrEqual(16 * 1024);
+		expect(JSON.parse(serializedBody)).toEqual({
 			pushTargetId: "target-1",
 			pushTargetAuthToken: "target-secret",
 		});

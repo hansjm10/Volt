@@ -20,9 +20,15 @@ const {
 const vector = require("../../../../test/fixtures/iroh-relay-enrollment-v1-vectors.json");
 
 function jsonRequest(body, headers = {}) {
+	const rawBody = Buffer.from(JSON.stringify(body), "utf8");
 	return {
 		body,
-		headers: { "content-type": "application/json", ...headers },
+		headers: {
+			"content-length": String(rawBody.byteLength),
+			"content-type": "application/json",
+			...headers,
+		},
+		rawBody,
 	};
 }
 

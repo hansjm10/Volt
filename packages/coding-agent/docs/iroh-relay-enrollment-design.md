@@ -2,10 +2,7 @@
 
 Status: normative v1 enrollment contract for the v2 Volt pairing ticket.
 
-Implementation status: the broker contract lands independently from the daemon,
-app, and managed-relay rollout. Until those dependent changes are merged and
-deployed together, current Volt clients and relays continue using the existing
-pairing and relay-authentication path.
+Implementation status: the broker, daemon, app, managed-relay callback, and repository-owned protected edge are implemented as one dependency-ordered rollout. The legacy generated-function origins and multiplexed exports remain temporary rollback targets until the final policy and client cutover complete a monitored soak.
 
 This document defines relay-infrastructure enrollment only. It does not grant a
 phone permission to use Volt RPC. Desktop authorization remains the existing
@@ -25,11 +22,12 @@ endpoint ID, and the daemon's persisted client grant.
 - Custom relays are owner-controlled, uncredentialed transport. They never
   receive App Check material from the official app.
 - Enrollment state lives only in the fixed `volt-iroh-enrollment` named
-  Firestore database. The enrollment function uses a dedicated runtime identity
-  with database-conditioned IAM; it cannot access raw FCM token state in the
-  separate `volt-push-relay` database, and the push identity cannot access
-  enrollment admission state. Server SDK isolation relies on IAM, not Firestore
-  Security Rules.
+  Firestore database. `irohEnrollmentApi` and `irohRelayAccess` use distinct
+  runtime identities with database-conditioned IAM. Only the enrollment API
+  receives the IP-salt secret and App Check verification grant; only the
+  callback receives current/next relay secrets. Neither can access raw FCM token
+  state in `volt-push-relay`, and the push identity cannot access enrollment
+  state. Server SDK isolation relies on IAM, not Firestore Security Rules.
 
 ## v2 pairing ticket
 
@@ -208,10 +206,13 @@ never use those keys.
 
 ## Broker HTTP API
 
-The daemon and app use the fixed HTTPS `irohEnrollment` function. JSON routes
-accept only `POST`, `Content-Type: application/json`, bounded bodies, and exact
-keys. JSON failures use a stable `{ "error": "code" }` body without endpoint
-IDs or secrets.
+The daemon and app use the fixed protected origin
+`https://iroh-enrollment-us-central.volt-cli.dev`; no broker override or
+function-generated fallback exists. Before serverless buffering, JSON routes
+require `POST`, no query, exact JSON media type, no `Content-Encoding`, and a
+canonical decimal `Content-Length` from 1 through 16,384. Handler raw/parsed
+bounds and exact keys remain defense in depth. JSON failures use a stable
+`{ "error": "code" }` body without endpoint IDs or secrets.
 
 ### Admission and quota ordering
 
@@ -341,30 +342,34 @@ any positive in-process cache is at most 30 seconds.
 
 ## Edge deployment boundary
 
-Production admission requires a global external Application Load Balancer whose
-backend service uses a serverless NEG for `irohEnrollment`. The function's
-`ALLOW_INTERNAL_AND_GCLB` ingress setting must remain in force so ordinary
-Internet clients cannot bypass the load balancer, Cloud Armor, or canonical
-broker hostname through the generated function URL.
+The repository-owned Terraform under
+`examples/remote/firebase-push-relay/infra/` provisions one HTTPS-only global
+external Application Load Balancer with exact host/path routing to three
+isolated Gen2 functions: `irohEnrollmentApi`, `irohRelayAccess`, and
+`pushRelayApi`. Each has its own serverless NEG/backend and retains
+`ALLOW_INTERNAL_AND_GCLB`, so generated function URLs reject ordinary Internet
+traffic. Unknown hosts, trailing or function-prefixed paths, and all other path
+variants reach an empty backend bucket whose edge policy returns 404.
 
-Attach a Cloud Armor throttle rule to the enrollment backend service. It keys
-on the load balancer's source IP (`IP`, not client-controlled `XFF_IP`), matches
-`POST /v1/claims/approve` and `POST /v1/grants/renew`, and initially permits 30
-requests per 60 seconds before returning 429. The handler also accepts
-`/irohEnrollment/v1/claims/approve` and `/irohEnrollment/v1/grants/renew`; the
-edge policy must either cover those prefixed paths or reject them before the
-backend. Configure the backend's custom request header as
-`x-forwarded-for:{client_ip_address},{server_ip_address}` so it replaces, rather
-than appends to, any client-supplied `X-Forwarded-For` value. Broker source-IP
-identity must come only from that provider-generated chain.
+Cloud Armor is a default-deny pre-buffer framing contract. Enrollment JSON uses
+the canonical envelope above. The callback additionally requires the exact
+`/v1/relay-access` path, `Content-Length: 0`, bounded bearer/node header shapes,
+no query or encoding, and the managed relay's stable source CIDR. GCLB owns
+declared/body-length consistency. Contract denial returns 403 and rate excess
+returns 429. Initial per-IP rates are 30/60 seconds for approval and renewal,
+300/60 seconds for other enrollment JSON, and 600/60 seconds for callback
+traffic. Push registration independently uses 30/60 seconds and other push JSON
+uses 300/60 seconds.
 
-Enable request logging and deploy the Cloud Armor rule in preview first. Review
-matched paths, source-key distribution, and projected 429s, run the real canary
-gate, then enable enforcement without changing the threshold. Cloud Armor is an
-approximate availability control; the Firestore window is the durable exact
-budget. This repository does not own load-balancer infrastructure, so these are
-operator-managed deployment requirements rather than partially provisioned
-example IaC.
+Backend services replace client forwarding content with
+`X-Forwarded-For: {client_ip_address},{server_ip_address}`. Cloud Armor keys on
+its observed `IP`, never that header. Preview policies project contract and rate
+actions while an enforced operator-source allowlist/default deny limits canary
+traffic. Separate immutable final policies admit only the public contract. The
+full HTTP/1.1/HTTP/2 matrix must correlate every denial to a load-balancer log
+with no Cloud Run request/invocation before final attachment. Cloud Armor is an
+approximate compute-protection layer; Firestore windows remain the durable exact
+application budget.
 
 ## Persistence and lifecycle
 

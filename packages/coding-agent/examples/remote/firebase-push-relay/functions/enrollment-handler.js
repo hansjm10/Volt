@@ -1,4 +1,4 @@
-const { RequestError } = require("./core.js");
+const { RequestError, assertEmptyRequestEnvelope } = require("./core.js");
 const {
 	CLAIM_TTL_MS,
 	GRANT_TTL_MS,
@@ -43,12 +43,11 @@ const KNOWN_ROUTE_PATHS = new Set([
 	"/v1/relay-access",
 ]);
 
-function createIrohEnrollmentHandler(options) {
+function createIrohEnrollmentApiHandler(options) {
 	const {
 		config,
 		getFirestore,
 		getIpSalt,
-		getRelayAccessSecrets,
 		logError,
 		logEvent,
 		now,
@@ -65,12 +64,11 @@ function createIrohEnrollmentHandler(options) {
 		);
 	}
 
-	return async function irohEnrollmentHandler(request, response) {
+	return async function irohEnrollmentApiHandler(request, response) {
 		response.set("cache-control", "no-store");
 		response.set("x-content-type-options", "nosniff");
-		const routePath = normalizeRoutePath(request.path || request.originalUrl || request.url || "/");
+		const routePath = getExactRoutePath(request);
 		const loggedRoute = KNOWN_ROUTE_PATHS.has(routePath) ? routePath : "unknown";
-		const isRelayRoute = routePath === "/v1/relay-access";
 		const startedAtMs = now();
 		let outcome = "allowed";
 		try {
@@ -78,21 +76,11 @@ function createIrohEnrollmentHandler(options) {
 				response.set("allow", "POST");
 				throw new RequestError(405, "method_not_allowed");
 			}
-			if (isRelayRoute) {
-				outcome = (await handleRelayAccess(request, response)) ? "allowed" : "denied";
-				return;
-			}
+			assertNoQuery(request);
 			await routeJsonRequest(routePath, request, response);
 		} catch (error) {
 			outcome = error instanceof RequestError ? error.publicMessage : "internal_error";
 			if (response.headersSent) return;
-			if (isRelayRoute) {
-				if (!(error instanceof RequestError)) {
-					logError({ name: getSafeErrorName(error), route: loggedRoute });
-				}
-				response.status(error instanceof RequestError ? error.status : 500).type("text/plain").send("false");
-				return;
-			}
 			if (error instanceof RequestError) {
 				response.status(error.status).json({ error: error.publicMessage });
 				return;
@@ -555,48 +543,6 @@ function createIrohEnrollmentHandler(options) {
 		response.status(200).json({ status: "revoked", grantId: enrollmentRequest.grantId });
 	}
 
-	async function handleRelayAccess(request, response) {
-		const [currentSecret, nextSecret] = getRelayAccessSecrets();
-		parseRelayAuthorization(request, currentSecret, nextSecret);
-		const endpointId = getRelayEndpointId(request);
-		const nowMs = now();
-		const firestore = getFirestore();
-		const endpointAccessRef = firestore.collection(ENDPOINT_ACCESS_COLLECTION).doc(endpointId);
-		const access = await firestore.runTransaction(async (transaction) => {
-			const endpointAccessSnapshot = await transaction.get(endpointAccessRef);
-			if (!endpointAccessSnapshot.exists) return { allowed: false, exists: false };
-			const endpointAccess = readEndpointAccess(endpointAccessSnapshot, nowMs);
-			if (endpointAccess.changed) {
-				writeEndpointAccess(transaction, endpointAccessRef, endpointAccess, nowMs);
-			}
-			return {
-				allowed: !endpointAccess.blocked && Object.keys(endpointAccess.activeGrants).length > 0,
-				exists: true,
-			};
-		});
-		if (access.exists) await reserveRelayEndpointQuota(endpointId, nowMs);
-		response.status(200).type("text/plain").send(access.allowed ? "true" : "false");
-		return access.allowed;
-	}
-
-	async function reserveRelayEndpointQuota(endpointId, nowMs) {
-		const firestore = getFirestore();
-		const quotaRef = firestore.collection(QUOTA_WINDOWS_COLLECTION).doc(`relay-endpoint_${endpointId}`);
-		await firestore.runTransaction(async (transaction) => {
-			const snapshot = await transaction.get(quotaRef);
-			const window = readRequestWindow(snapshot, nowMs);
-			if (window.count >= config.requestsPerEndpointPerWindow) {
-				throw new RequestError(429, "endpoint_rate_limited");
-			}
-			transaction.set(quotaRef, {
-				count: window.count + 1,
-				expiresAt: timestampFromMillis(window.startedAtMs + 2 * REQUEST_QUOTA_WINDOW_MS),
-				updatedAt: timestampFromMillis(nowMs),
-				windowStartedAt: timestampFromMillis(window.startedAtMs),
-			});
-		});
-	}
-
 	async function reserveRequestQuota(request, endpointId, nowMs) {
 		const firestore = getFirestore();
 		const ipId = getSaltedIpId(getRequestIp(request), getIpSalt());
@@ -659,6 +605,103 @@ function createIrohEnrollmentHandler(options) {
 			const window = readRequestWindow(snapshot, nowMs);
 			if (window.count >= limit) {
 				throw new RequestError(429, limitCode);
+			}
+			transaction.set(quotaRef, {
+				count: window.count + 1,
+				expiresAt: timestampFromMillis(window.startedAtMs + 2 * REQUEST_QUOTA_WINDOW_MS),
+				updatedAt: timestampFromMillis(nowMs),
+				windowStartedAt: timestampFromMillis(window.startedAtMs),
+			});
+		});
+	}
+}
+
+function createIrohRelayAccessHandler(options) {
+	const {
+		getFirestore,
+		getRelayAccessSecrets,
+		logError,
+		logEvent,
+		now,
+		requestsPerEndpointPerWindow,
+		timestampFromMillis,
+	} = options;
+
+	function writeEndpointAccess(transaction, reference, endpointAccess, nowMs) {
+		writeEndpointAccessDocument(
+			transaction,
+			reference,
+			endpointAccess,
+			timestampFromMillis(nowMs),
+		);
+	}
+
+	return async function irohRelayAccessHandler(request, response) {
+		response.set("cache-control", "no-store");
+		response.set("x-content-type-options", "nosniff");
+		const routePath = getExactRoutePath(request);
+		const loggedRoute = routePath === "/v1/relay-access" ? routePath : "unknown";
+		const startedAtMs = now();
+		let outcome = "denied";
+		try {
+			if (request.method !== "POST") {
+				response.set("allow", "POST");
+				throw new RequestError(405, "method_not_allowed");
+			}
+			assertNoQuery(request);
+			if (routePath !== "/v1/relay-access") {
+				throw new RequestError(404, "not_found");
+			}
+			assertEmptyRequestEnvelope(request);
+			outcome = (await handleRelayAccess(request, response)) ? "allowed" : "denied";
+		} catch (error) {
+			outcome = error instanceof RequestError ? error.publicMessage : "internal_error";
+			if (response.headersSent) return;
+			if (!(error instanceof RequestError)) {
+				logError({ name: getSafeErrorName(error), route: loggedRoute });
+			}
+			response.status(error instanceof RequestError ? error.status : 500).type("text/plain").send("false");
+		} finally {
+			logEvent({
+				durationMs: Math.max(0, now() - startedAtMs),
+				outcome,
+				route: loggedRoute,
+			});
+		}
+	};
+
+	async function handleRelayAccess(request, response) {
+		const [currentSecret, nextSecret] = getRelayAccessSecrets();
+		parseRelayAuthorization(request, currentSecret, nextSecret);
+		const endpointId = getRelayEndpointId(request);
+		const nowMs = now();
+		const firestore = getFirestore();
+		const endpointAccessRef = firestore.collection(ENDPOINT_ACCESS_COLLECTION).doc(endpointId);
+		const access = await firestore.runTransaction(async (transaction) => {
+			const endpointAccessSnapshot = await transaction.get(endpointAccessRef);
+			if (!endpointAccessSnapshot.exists) return { allowed: false, exists: false };
+			const endpointAccess = readEndpointAccess(endpointAccessSnapshot, nowMs);
+			if (endpointAccess.changed) {
+				writeEndpointAccess(transaction, endpointAccessRef, endpointAccess, nowMs);
+			}
+			return {
+				allowed: !endpointAccess.blocked && Object.keys(endpointAccess.activeGrants).length > 0,
+				exists: true,
+			};
+		});
+		if (access.exists) await reserveRelayEndpointQuota(endpointId, nowMs);
+		response.status(200).type("text/plain").send(access.allowed ? "true" : "false");
+		return access.allowed;
+	}
+
+	async function reserveRelayEndpointQuota(endpointId, nowMs) {
+		const firestore = getFirestore();
+		const quotaRef = firestore.collection(QUOTA_WINDOWS_COLLECTION).doc(`relay-endpoint_${endpointId}`);
+		await firestore.runTransaction(async (transaction) => {
+			const snapshot = await transaction.get(quotaRef);
+			const window = readRequestWindow(snapshot, nowMs);
+			if (window.count >= requestsPerEndpointPerWindow) {
+				throw new RequestError(429, "endpoint_rate_limited");
 			}
 			transaction.set(quotaRef, {
 				count: window.count + 1,
@@ -829,12 +872,16 @@ function requireTimestampMillis(value) {
 	return millis;
 }
 
-function normalizeRoutePath(rawPath) {
-	let routePath = rawPath.split("?", 1)[0] || "/";
-	if (routePath.startsWith("/irohEnrollment/")) {
-		routePath = routePath.slice("/irohEnrollment".length);
+function getExactRoutePath(request) {
+	return typeof request.path === "string" && request.path.length > 0 ? request.path : "/";
+}
+
+function assertNoQuery(request) {
+	for (const target of [request.originalUrl, request.url, request.path]) {
+		if (typeof target === "string" && target.includes("?")) {
+			throw new RequestError(400, "query_not_allowed");
+		}
 	}
-	return routePath.replace(/\/+$/, "") || "/";
 }
 
 function isEndpointId(value) {
@@ -856,6 +903,6 @@ module.exports = {
 	ENDPOINT_ACCESS_COLLECTION,
 	GRANTS_COLLECTION,
 	QUOTA_WINDOWS_COLLECTION,
-	createIrohEnrollmentHandler,
-	normalizeRoutePath,
+	createIrohEnrollmentApiHandler,
+	createIrohRelayAccessHandler,
 };

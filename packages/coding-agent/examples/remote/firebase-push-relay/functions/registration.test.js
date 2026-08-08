@@ -9,7 +9,7 @@ test("registration writes the relay target and returns the complete client contr
 	const nowMs = 2_000_000_000_000;
 	const pushTargetAuthToken = "a".repeat(43);
 	const pushTargetTtlMs = 30 * 24 * 60 * 60 * 1000;
-	const publicRelayUrl = "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay";
+	const publicRelayUrl = "https://push-relay-us-central.volt-cli.dev";
 	const writes = [];
 	const rateLimitedAppIds = [];
 	let responseStatus;
@@ -30,10 +30,16 @@ test("registration writes the relay target and returns the complete client contr
 		verifyRegistrationAppCheck: async () => appId,
 	});
 
+	const requestBody = { provider: "fcm", platform: "ios", token: fcmToken, enabled: true };
+	const rawBody = Buffer.from(JSON.stringify(requestBody), "utf8");
 	await registerPushTarget(
 		{
-			body: { provider: "fcm", platform: "ios", token: fcmToken, enabled: true },
-			headers: { "content-type": "application/json" },
+			body: requestBody,
+			headers: {
+				"content-length": String(rawBody.byteLength),
+				"content-type": "application/json",
+			},
+			rawBody,
 		},
 		{
 			status(value) {

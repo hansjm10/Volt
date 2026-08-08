@@ -1,0 +1,28 @@
+# Keep cloudflare_api_token out of files:
+# export TF_VAR_cloudflare_api_token="$(security find-generic-password ...)"
+cloudflare_zone_id = "00000000000000000000000000000000"
+
+operator_source_cidrs = [
+  "203.0.113.10/32",
+]
+
+relay_source_cidrs = [
+  "198.51.100.20/32",
+]
+
+edge_policy_phases = {
+  callback   = "preview"
+  enrollment = "preview"
+  push       = "preview"
+}
+backend_log_sample_rate = 1
+
+monitoring_notification_channels = [
+  "projects/volt-3fae7/notificationChannels/replace-alert-channel",
+]
+
+billing_account_id = "000000-000000-000000"
+budget_amount_usd  = 100
+budget_notification_channels = [
+  "projects/volt-3fae7/notificationChannels/replace-budget-email-channel",
+]

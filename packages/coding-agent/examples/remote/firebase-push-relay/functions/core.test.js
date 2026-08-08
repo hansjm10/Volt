@@ -7,6 +7,8 @@ const {
 	MAX_NOTIFICATION_TITLE_UTF8_BYTES,
 	MAX_REQUEST_BYTES,
 	RequestError,
+	assertEmptyRequestEnvelope,
+	assertRequestEnvelope,
 	assertVerifiedAppCheck,
 	getAllowedFirebaseAppIds,
 	getConfiguredRelayUrl,
@@ -75,7 +77,11 @@ test("rejects replayed, ordinary, and wrong-app App Check tokens", () => {
 });
 
 test("deployment requires dedicated runtime service accounts", () => {
-	for (const environmentVariable of ["PUSH_RELAY_SERVICE_ACCOUNT", "IROH_ENROLLMENT_SERVICE_ACCOUNT"]) {
+	for (const environmentVariable of [
+		"PUSH_RELAY_SERVICE_ACCOUNT",
+		"IROH_ENROLLMENT_SERVICE_ACCOUNT",
+		"IROH_RELAY_ACCESS_SERVICE_ACCOUNT",
+	]) {
 		assert.equal(
 			getRequiredServiceAccount(environmentVariable, {
 				[environmentVariable]: "volt-service@volt-3fae7.iam.gserviceaccount.com",
@@ -94,16 +100,19 @@ test("deployment requires dedicated runtime service accounts", () => {
 	assert.deepEqual(
 		getRuntimeServiceAccounts({
 			IROH_ENROLLMENT_SERVICE_ACCOUNT: "volt-enrollment@volt-3fae7.iam.gserviceaccount.com",
+			IROH_RELAY_ACCESS_SERVICE_ACCOUNT: "volt-relay-access@volt-3fae7.iam.gserviceaccount.com",
 			PUSH_RELAY_SERVICE_ACCOUNT: "volt-push@volt-3fae7.iam.gserviceaccount.com",
 		}),
 		{
 			irohEnrollmentServiceAccount: "volt-enrollment@volt-3fae7.iam.gserviceaccount.com",
+			irohRelayAccessServiceAccount: "volt-relay-access@volt-3fae7.iam.gserviceaccount.com",
 			pushRelayServiceAccount: "volt-push@volt-3fae7.iam.gserviceaccount.com",
 		},
 	);
 	assert.throws(
 		() => getRuntimeServiceAccounts({
 			IROH_ENROLLMENT_SERVICE_ACCOUNT: "volt-runtime@volt-3fae7.iam.gserviceaccount.com",
+			IROH_RELAY_ACCESS_SERVICE_ACCOUNT: "volt-relay-access@volt-3fae7.iam.gserviceaccount.com",
 			PUSH_RELAY_SERVICE_ACCOUNT: "volt-runtime@volt-3fae7.iam.gserviceaccount.com",
 		}),
 		/distinct runtime service accounts/,
@@ -118,7 +127,7 @@ test("uses a deterministic bounded document id for each FCM token", () => {
 });
 
 test("never derives the public relay URL from request headers", () => {
-	assert.equal(getConfiguredRelayUrl({}), "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay");
+	assert.equal(getConfiguredRelayUrl({}), "https://push-relay-us-central.volt-cli.dev");
 	assert.equal(
 		getConfiguredRelayUrl({ PUSH_RELAY_URL: "https://push.volt.example/relay/" }),
 		"https://push.volt.example/relay",
@@ -128,6 +137,57 @@ test("never derives the public relay URL from request headers", () => {
 		() => getConfiguredRelayUrl({ PUSH_RELAY_URL: "https://push.volt.example/relay?redirect=evil" }),
 		/query/,
 	);
+});
+
+test("enforces exact canonical JSON and callback framing", () => {
+	for (const contentType of ["application/json", "Application/JSON"]) {
+		assert.doesNotThrow(() => assertRequestEnvelope({
+			headers: { "content-length": "16384", "content-type": contentType },
+		}));
+	}
+	assert.doesNotThrow(() => assertEmptyRequestEnvelope({
+		body: Buffer.alloc(0),
+		headers: { "content-length": "0" },
+		rawBody: Buffer.alloc(0),
+	}));
+	assert.doesNotThrow(() => assertEmptyRequestEnvelope({
+		body: {},
+		headers: { "content-length": "0" },
+		rawBody: Buffer.alloc(0),
+	}));
+	assert.doesNotThrow(() => assertEmptyRequestEnvelope({
+		body: {},
+		headers: { "content-length": "0" },
+	}));
+
+	for (const [headers, status, message] of [
+		[{ "content-length": "1", "content-type": "application/json; charset=utf-8" }, 415, "content_type_must_be_json"],
+		[{ "content-length": "1", "content-type": "application/json", "content-encoding": "gzip" }, 400, "content_encoding_not_allowed"],
+		[{ "content-type": "application/json" }, 400, "invalid_content_length"],
+		[{ "content-length": "0", "content-type": "application/json" }, 400, "invalid_content_length"],
+		[{ "content-length": "01", "content-type": "application/json" }, 400, "invalid_content_length"],
+		[{ "content-length": "one", "content-type": "application/json" }, 400, "invalid_content_length"],
+		[{ "content-length": ["1", "1"], "content-type": "application/json" }, 400, "invalid_content_length"],
+		[{ "content-length": "16385", "content-type": "application/json" }, 413, "request_body_too_large"],
+	]) {
+		expectRequestError(() => assertRequestEnvelope({ headers }), status, message);
+	}
+	for (const request of [
+		{ headers: {} },
+		{ headers: { "content-length": "1" }, rawBody: Buffer.from("x") },
+		{ body: { value: "x" }, headers: { "content-length": "0" } },
+		{ headers: { "content-length": "00" } },
+		{ headers: { "content-length": ["0", "0"] } },
+		{ headers: { "content-length": "0", "content-encoding": "gzip" } },
+	]) {
+		expectRequestError(
+			() => assertEmptyRequestEnvelope(request),
+			400,
+			request.headers["content-encoding"] === undefined
+				? "callback_body_must_be_empty"
+				: "content_encoding_not_allowed",
+		);
+	}
 });
 
 test("rejects oversized and structurally abusive JSON before route parsing", () => {
@@ -149,7 +209,7 @@ test("rejects oversized and structurally abusive JSON before route parsing", () 
 		() =>
 			readJsonBody({
 				body: { values: Array.from({ length: 33 }, () => 1) },
-				headers: { "content-type": "application/json" },
+				headers: { "content-length": "1", "content-type": "application/json" },
 			}),
 		400,
 		"request_arrays_too_large",
@@ -157,7 +217,7 @@ test("rejects oversized and structurally abusive JSON before route parsing", () 
 	let nested = { value: true };
 	for (let index = 0; index < 9; index += 1) nested = { nested };
 	expectRequestError(
-		() => readJsonBody({ body: nested, headers: { "content-type": "application/json" } }),
+		() => readJsonBody({ body: nested, headers: { "content-length": "1", "content-type": "application/json" } }),
 		400,
 		"request_body_too_deep",
 	);

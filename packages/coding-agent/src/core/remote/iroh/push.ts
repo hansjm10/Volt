@@ -13,7 +13,7 @@ import type { IrohRemoteHostStateManager } from "./state-manager.ts";
 export const DEFAULT_IROH_REMOTE_PUSH_RELAY_RETRY_ATTEMPTS = 3;
 export const DEFAULT_IROH_REMOTE_PUSH_RELAY_RETRY_DELAY_MS = 250;
 export const DEFAULT_IROH_REMOTE_PUSH_RELAY_TIMEOUT_MS = 10_000;
-export const DEFAULT_IROH_REMOTE_PUSH_RELAY_URL = "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay";
+export const DEFAULT_IROH_REMOTE_PUSH_RELAY_URL = "https://push-relay-us-central.volt-cli.dev";
 export const MAX_IROH_REMOTE_NOTIFICATION_TITLE_UTF8_BYTES = 128;
 export const MAX_IROH_REMOTE_NOTIFICATION_BODY_UTF8_BYTES = 512;
 export const MAX_IROH_REMOTE_NOTIFICATION_TARGET_UTF8_BYTES = 256;
@@ -272,6 +272,7 @@ export interface IrohRemotePushRelayHttpClientOptions {
 const MAX_SENT_EVENT_IDS_PER_CLIENT = 1000;
 export const MAX_IROH_REMOTE_PUSH_TARGET_REVOCATIONS_PER_CLIENT = 8;
 export const MAX_IROH_REMOTE_PUSH_TARGET_REVOCATION_CONCURRENCY = 4;
+const MAX_IROH_REMOTE_PUSH_RELAY_REQUEST_BYTES = 16 * 1024;
 const MAX_IROH_REMOTE_PUSH_RELAY_RESPONSE_BYTES = 1024;
 
 export class IrohRemoteInMemoryPushNotificationDeduper implements IrohRemotePushNotificationDeduper {
@@ -358,9 +359,10 @@ export class IrohRemotePushRelayHttpClient implements IrohRemotePushRelayClient 
 	}
 
 	async revokePushTarget(request: IrohRemotePushRelayRevocationRequest): Promise<IrohRemotePushRelayRevocationResult> {
+		const serializedBody = serializeRelayRequestBody(createRelayRevocationBody(request));
 		const response = await this.fetcher(new URL("v1/push-targets/revoke", this.baseUrl).toString(), {
-			body: JSON.stringify(createRelayRevocationBody(request)),
-			headers: this.createHeaders(),
+			body: serializedBody,
+			headers: this.createHeaders(serializedBody),
 			method: "POST",
 			signal: AbortSignal.timeout(this.timeoutMs),
 		});
@@ -382,11 +384,12 @@ export class IrohRemotePushRelayHttpClient implements IrohRemotePushRelayClient 
 
 	private async sendRelayRequest(
 		path: string,
-		body: IrohRemotePushRelayNotificationRequest | IrohRemotePushRelayRevocationRequest,
+		request: IrohRemotePushRelayNotificationRequest | IrohRemotePushRelayRevocationRequest,
 	): Promise<IrohRemotePushRelayNotificationResult> {
+		const body = serializeRelayRequestBody(request);
 		const response = await this.fetcher(new URL(path, this.baseUrl).toString(), {
-			body: JSON.stringify(body),
-			headers: this.createHeaders(),
+			body,
+			headers: this.createHeaders(body),
 			method: "POST",
 			signal: AbortSignal.timeout(this.timeoutMs),
 		});
@@ -406,12 +409,24 @@ export class IrohRemotePushRelayHttpClient implements IrohRemotePushRelayClient 
 		);
 	}
 
-	private createHeaders(): Record<string, string> {
+	private createHeaders(body: string): Record<string, string> {
 		return {
+			"content-length": String(Buffer.byteLength(body, "utf8")),
 			"content-type": "application/json",
 			...(this.authToken ? { authorization: `Bearer ${this.authToken}` } : {}),
 		};
 	}
+}
+
+function serializeRelayRequestBody(
+	request: IrohRemotePushRelayNotificationRequest | IrohRemotePushRelayRevocationRequest,
+): string {
+	const body = JSON.stringify(request);
+	const bodyBytes = Buffer.byteLength(body, "utf8");
+	if (bodyBytes === 0 || bodyBytes > MAX_IROH_REMOTE_PUSH_RELAY_REQUEST_BYTES) {
+		throw new Error("push relay request body exceeds maximum size");
+	}
+	return body;
 }
 
 function createRelayNotificationBody(

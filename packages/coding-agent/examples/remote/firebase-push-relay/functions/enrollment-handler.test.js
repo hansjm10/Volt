@@ -21,7 +21,8 @@ const {
 	ENDPOINT_ACCESS_COLLECTION,
 	GRANTS_COLLECTION,
 	QUOTA_WINDOWS_COLLECTION,
-	createIrohEnrollmentHandler,
+	createIrohEnrollmentApiHandler,
+	createIrohRelayAccessHandler,
 } = require("./enrollment-handler.js");
 const vector = require("../../../../test/fixtures/iroh-relay-enrollment-v1-vectors.json");
 
@@ -164,7 +165,7 @@ function createHarness(overrides = {}) {
 	let nowMs = vector.issuedAtMs;
 	let appCheckCount = 0;
 	let rejectAppCheck = false;
-	const handler = createIrohEnrollmentHandler({
+	const enrollmentHandler = createIrohEnrollmentApiHandler({
 		config: {
 			appCheckRequestsPerIpPerWindow: overrides.appCheckRequestsPerIpPerWindow ?? 100,
 			relayOrigins: ["https://iroh-relay-us-central.volt-cli.dev"],
@@ -173,7 +174,6 @@ function createHarness(overrides = {}) {
 		},
 		getFirestore: () => firestore,
 		getIpSalt: () => "i".repeat(32),
-		getRelayAccessSecrets: () => ["c".repeat(32), "n".repeat(32)],
 		logError: (entry) => logs.push(entry),
 		logEvent: (entry) => events.push(entry),
 		now: () => nowMs,
@@ -184,7 +184,20 @@ function createHarness(overrides = {}) {
 			return "production-app-id";
 		},
 	});
+	const relayHandler = createIrohRelayAccessHandler({
+		getFirestore: () => firestore,
+		getRelayAccessSecrets: () => ["c".repeat(32), "n".repeat(32)],
+		logError: (entry) => logs.push(entry),
+		logEvent: (entry) => events.push(entry),
+		now: () => nowMs,
+		requestsPerEndpointPerWindow: overrides.requestsPerEndpointPerWindow || 100,
+		timestampFromMillis,
+	});
+	const handler = (request, response) => request.path === "/v1/relay-access"
+		? relayHandler(request, response)
+		: enrollmentHandler(request, response);
 	return {
+		enrollmentHandler,
 		events,
 		firestore,
 		get appCheckCount() {
@@ -192,6 +205,7 @@ function createHarness(overrides = {}) {
 		},
 		handler,
 		logs,
+		relayHandler,
 		setNow: (value) => {
 			nowMs = value;
 		},
@@ -203,15 +217,21 @@ function createHarness(overrides = {}) {
 
 async function invoke(handler, path, body, options = {}) {
 	const result = { headers: Object.create(null) };
+	const rawBody = options.rawBody ?? (body === undefined
+		? Buffer.alloc(0)
+		: Buffer.from(JSON.stringify(body), "utf8"));
 	const request = {
 		body,
 		headers: {
+			"content-length": String(rawBody.byteLength),
 			...(body === undefined ? {} : { "content-type": "application/json" }),
 			...options.headers,
 		},
 		ip: options.ip || "203.0.113.9",
 		method: options.method || "POST",
+		originalUrl: options.originalUrl,
 		path,
+		rawBody,
 	};
 	const response = {
 		headersSent: false,

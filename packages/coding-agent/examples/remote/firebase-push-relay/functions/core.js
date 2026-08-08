@@ -1,7 +1,7 @@
 const { createHash, timingSafeEqual } = require("node:crypto");
 
 const DEFAULT_ALLOWED_FIREBASE_APP_ID = "1:546623825529:ios:9f5a707e3f4ef89154d6a8";
-const DEFAULT_PUBLIC_RELAY_URL = "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay";
+const DEFAULT_PUBLIC_RELAY_URL = "https://push-relay-us-central.volt-cli.dev";
 const DEFAULT_PUSH_TARGET_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_OBJECT_DEPTH = 8;
@@ -17,6 +17,8 @@ const MAX_NOTIFICATION_EVENT_ID_UTF8_BYTES = 512;
 const MAX_NOTIFICATION_KIND_UTF8_BYTES = 64;
 const NOTIFICATION_UNSAFE_CHARACTER = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 const NOTIFICATION_PATH_SEPARATOR = /[/\\]/u;
+const SERVICE_ACCOUNT_EMAIL_PATTERN =
+	/^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 const NOTIFICATION_KINDS = new Set([
 	"conversation_completed",
 	"plan_ready",
@@ -37,23 +39,44 @@ class RequestError extends Error {
 
 function assertRequestEnvelope(request) {
 	const contentType = getHeader(request, "content-type");
-	if (contentType === undefined || contentType.toLowerCase().split(";", 1)[0].trim() !== "application/json") {
+	if (contentType === undefined || contentType.toLowerCase() !== "application/json") {
 		throw new RequestError(415, "content_type_must_be_json");
 	}
+	if (getHeader(request, "content-encoding") !== undefined) {
+		throw new RequestError(400, "content_encoding_not_allowed");
+	}
 	const contentLength = getHeader(request, "content-length");
-	if (contentLength !== undefined) {
-		const parsedLength = Number(contentLength);
-		if (!Number.isSafeInteger(parsedLength) || parsedLength < 0) {
-			throw new RequestError(400, "invalid_content_length");
-		}
-		if (parsedLength > MAX_REQUEST_BYTES) {
-			throw new RequestError(413, "request_body_too_large");
-		}
+	if (contentLength === undefined || !/^[1-9][0-9]{0,4}$/.test(contentLength)) {
+		throw new RequestError(400, "invalid_content_length");
+	}
+	if (Number(contentLength) > MAX_REQUEST_BYTES) {
+		throw new RequestError(413, "request_body_too_large");
 	}
 	const rawBody = request.rawBody;
 	if (Buffer.isBuffer(rawBody) && rawBody.byteLength > MAX_REQUEST_BYTES) {
 		throw new RequestError(413, "request_body_too_large");
 	}
+}
+
+function assertEmptyRequestEnvelope(request) {
+	if (getHeader(request, "content-encoding") !== undefined) {
+		throw new RequestError(400, "content_encoding_not_allowed");
+	}
+	if (getHeader(request, "content-length") !== "0") {
+		throw new RequestError(400, "callback_body_must_be_empty");
+	}
+	const rawBody = request.rawBody;
+	if (Buffer.isBuffer(rawBody) || typeof rawBody === "string") {
+		if (rawBody.length !== 0) {
+			throw new RequestError(400, "callback_body_must_be_empty");
+		}
+		return;
+	}
+	const body = request.body;
+	if (body === undefined) return;
+	if ((Buffer.isBuffer(body) || typeof body === "string") && body.length === 0) return;
+	if (isRecord(body) && Object.keys(body).length === 0) return;
+	throw new RequestError(400, "callback_body_must_be_empty");
 }
 
 function readJsonBody(request) {
@@ -270,7 +293,7 @@ function getRequiredServiceAccount(environmentVariable, env = process.env) {
 	const value = env[environmentVariable]?.trim();
 	if (
 		value === undefined ||
-		!/^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/.test(value)
+		!SERVICE_ACCOUNT_EMAIL_PATTERN.test(value)
 	) {
 		throw new Error(`${environmentVariable} must be a dedicated service account email`);
 	}
@@ -279,11 +302,21 @@ function getRequiredServiceAccount(environmentVariable, env = process.env) {
 
 function getRuntimeServiceAccounts(env = process.env) {
 	const irohEnrollmentServiceAccount = getRequiredServiceAccount("IROH_ENROLLMENT_SERVICE_ACCOUNT", env);
+	const irohRelayAccessServiceAccount = getRequiredServiceAccount("IROH_RELAY_ACCESS_SERVICE_ACCOUNT", env);
 	const pushRelayServiceAccount = getRequiredServiceAccount("PUSH_RELAY_SERVICE_ACCOUNT", env);
-	if (irohEnrollmentServiceAccount === pushRelayServiceAccount) {
-		throw new Error("push relay and Iroh enrollment require distinct runtime service accounts");
+	const serviceAccounts = [
+		irohEnrollmentServiceAccount,
+		irohRelayAccessServiceAccount,
+		pushRelayServiceAccount,
+	];
+	if (new Set(serviceAccounts).size !== serviceAccounts.length) {
+		throw new Error("push relay, Iroh enrollment, and relay access require distinct runtime service accounts");
 	}
-	return { irohEnrollmentServiceAccount, pushRelayServiceAccount };
+	return {
+		irohEnrollmentServiceAccount,
+		irohRelayAccessServiceAccount,
+		pushRelayServiceAccount,
+	};
 }
 
 function getAllowedFirebaseAppIds(env = process.env) {
@@ -510,6 +543,8 @@ module.exports = {
 	MAX_NOTIFICATION_WORKSPACE_UTF8_BYTES,
 	MAX_REQUEST_BYTES,
 	RequestError,
+	SERVICE_ACCOUNT_EMAIL_PATTERN,
+	assertEmptyRequestEnvelope,
 	assertRequestEnvelope,
 	assertVerifiedAppCheck,
 	getAllowedFirebaseAppIds,

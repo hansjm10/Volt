@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 2,
+  "edgeVersion": "v1",
+  "policyVersion": "v1",
+  "callbackFinalPolicyVersion": "v2",
+  "projectId": "volt-3fae7",
+  "region": "us-central1",
+  "hosts": {
+    "enrollment": "iroh-enrollment-us-central.volt-cli.dev",
+    "push": "push-relay-us-central.volt-cli.dev"
+  },
+  "body": {
+    "jsonMaximumBytes": 16384,
+    "jsonContentType": "application/json",
+    "contentEncodingAllowed": false,
+    "canonicalContentLengthPattern": "^[1-9][0-9]{0,4}$"
+  },
+  "callback": {
+    "path": "/v1/relay-access",
+    "contentLength": 0,
+    "authorizationPattern": "^Bearer [!-~]{32,512}$",
+    "nodeIdPattern": "^[0-9a-f]{64}$"
+  },
+  "routes": {
+    "enrollment": [
+      "/v1/claims",
+      "/v1/claims/approve",
+      "/v1/claims/cancel",
+      "/v1/claims/status",
+      "/v1/grants/renew",
+      "/v1/grants/revoke"
+    ],
+    "enrollmentExpensive": [
+      "/v1/claims/approve",
+      "/v1/grants/renew"
+    ],
+    "push": [
+      "/v1/push-targets",
+      "/v1/push-targets/revoke",
+      "/v1/push-targets/status",
+      "/v1/notifications"
+    ],
+    "pushRegistration": [
+      "/v1/push-targets"
+    ]
+  },
+  "rates": {
+    "enrollmentExpensive": {
+      "count": 30,
+      "intervalSeconds": 60
+    },
+    "jsonOther": {
+      "count": 300,
+      "intervalSeconds": 60
+    },
+    "pushRegistration": {
+      "count": 30,
+      "intervalSeconds": 60
+    },
+    "callback": {
+      "count": 600,
+      "intervalSeconds": 60
+    }
+  },
+  "functions": {
+    "irohEnrollmentApi": {
+      "region": "us-central1",
+      "ingress": "ALLOW_INTERNAL_AND_GCLB",
+      "serviceAccount": "volt-iroh-enrollment@volt-3fae7.iam.gserviceaccount.com",
+      "concurrency": 40,
+      "memory": "256Mi",
+      "secrets": [
+        "IROH_ENROLLMENT_IP_SALT"
+      ]
+    },
+    "irohRelayAccess": {
+      "region": "us-central1",
+      "ingress": "ALLOW_INTERNAL_AND_GCLB",
+      "serviceAccount": "volt-iroh-relay-access@volt-3fae7.iam.gserviceaccount.com",
+      "concurrency": 1,
+      "memory": "256Mi",
+      "secrets": [
+        "IROH_RELAY_ACCESS_SECRET_CURRENT",
+        "IROH_RELAY_ACCESS_SECRET_NEXT"
+      ]
+    },
+    "pushRelayApi": {
+      "region": "us-central1",
+      "ingress": "ALLOW_INTERNAL_AND_GCLB",
+      "serviceAccount": "volt-push-relay@volt-3fae7.iam.gserviceaccount.com",
+      "concurrency": 20,
+      "memory": "256Mi",
+      "secrets": []
+    }
+  }
+}
