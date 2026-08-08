@@ -4,6 +4,7 @@ import type { Component } from "../../tui/src/tui.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { PlanningState, PlanState } from "../src/core/planning.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
+import { usesAsciiPlanMarkers } from "../src/modes/interactive/components/plan-content.ts";
 import { PlanInspectorComponent } from "../src/modes/interactive/components/plan-inspector.ts";
 import type { PlanDetailsAction } from "../src/modes/interactive/components/plan-status.ts";
 import {
@@ -182,6 +183,49 @@ describe("ResponsivePlanLayoutComponent", () => {
 		expect(viewport.join("\n")).toContain("Responsive Plan");
 		expect(viewport.at(-1)).toBe("F".repeat(160));
 		for (const line of rendered) expect(visibleWidth(line)).toBeLessThanOrEqual(160);
+	});
+
+	it("leaves rows scrolled out of the viewport undecorated so scrollback stays readable", () => {
+		const transcript = new LinesComponent(Array.from({ length: 40 }, (_, index) => `message-${index + 1}`));
+		const editor = new LinesComponent(["EDITOR_TOP", "EDITOR_BOTTOM"]);
+		const { layout } = createLayout({ columns: 160, rows: 24, transcript, controls: [editor] });
+		const rendered = layout.render(160).map(stripAnsi);
+		const historical = rendered.slice(0, rendered.length - 24);
+		const viewport = rendered.slice(-24);
+
+		const divider = usesAsciiPlanMarkers() ? "|" : "\u2502";
+		expect(historical.length).toBeGreaterThan(0);
+		// Scrolled-off rows keep only conversation text: no divider and no plan-pane padding.
+		for (const line of historical) {
+			expect(line).not.toContain(divider);
+			expect(line).toBe(line.trimEnd());
+		}
+		expect(historical).toContain("message-1");
+		// The divider still separates the two live panes inside the viewport.
+		expect(viewport.some((line) => line.includes(divider))).toBe(true);
+	});
+
+	it("keeps rows byte-identical once they scroll out of the viewport", () => {
+		const lines: string[] = [];
+		const transcript = new LinesComponent(lines);
+		const editor = new LinesComponent(["EDITOR_TOP", "EDITOR_BOTTOM"]);
+		const rows = 24;
+		const { layout } = createLayout({ columns: 160, rows, transcript, controls: [editor] });
+
+		let previous: string[] = [];
+		for (let index = 1; index <= 60; index++) {
+			lines.push(`message-${index}`);
+			const current = layout.render(160);
+			if (previous.length > 0) {
+				// Rows above the previous viewport are already committed to terminal scrollback
+				// and cannot be repainted, so they must never change between frames.
+				const frozenRows = Math.max(0, previous.length - rows);
+				for (let row = 0; row < frozenRows; row++) {
+					expect(current[row]).toBe(previous[row]);
+				}
+			}
+			previous = current;
+		}
 	});
 
 	it("renders extensions at conversation width and a custom footer at full width", () => {

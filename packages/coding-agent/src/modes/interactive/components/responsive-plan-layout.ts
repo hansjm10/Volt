@@ -186,11 +186,12 @@ export class ResponsivePlanLayoutComponent extends Container {
 			const right = inspectorLines[inspectorIndex++] ?? "";
 			return `${fitLine(line, dimensions.conversationColumns)}${PANE_SEGMENT_RESET}${divider}${fitLine(right, dimensions.planColumns)}`;
 		});
-		const protectedHistoricalRows = protectedImageRows(historicalTranscript);
-		const historicalLines = historicalTranscript.map((line, index) => {
-			if (protectedHistoricalRows.has(index)) return truncateToWidth(line, dimensions.conversationColumns, "");
-			return `${fitLine(line, dimensions.conversationColumns)}${PANE_SEGMENT_RESET}${divider}`;
-		});
+		// Rows scrolled out of the active viewport become immutable terminal scrollback. The plan
+		// pane only ever exists in the viewport, so decorating them with a divider would strand a
+		// dangling column beside empty space forever. Emit them as plain conversation text instead.
+		const historicalLines = historicalTranscript.map((line) =>
+			truncateToWidth(line, dimensions.conversationColumns, ""),
+		);
 		return [...historicalLines, ...visibleLines, ...footerLines];
 	}
 
