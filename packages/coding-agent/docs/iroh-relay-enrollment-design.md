@@ -19,6 +19,10 @@ endpoint ID, and the daemon's persisted client grant.
   ID to register with official relays. It cannot authenticate Volt RPC.
 - Custom relays are owner-controlled, uncredentialed transport. They never
   receive App Check material from the official app.
+- Enrollment state lives only in `volt-iroh-enrollment`. The enrollment API and
+  relay callback use distinct runtime identities; only the API receives the
+  IP-salt/App Check grants, and only the callback receives current/next relay
+  secrets. The push identity remains confined to `volt-push-relay`.
 
 ## v2 pairing ticket
 
@@ -158,10 +162,13 @@ never use those keys.
 
 ## Broker HTTP API
 
-The daemon and app use the fixed HTTPS `irohEnrollment` function. JSON routes
-accept only `POST`, `Content-Type: application/json`, bounded bodies, and exact
-keys. JSON failures use a stable `{ "error": "code" }` body without endpoint
-IDs or secrets.
+The daemon and app use the fixed protected origin
+`https://iroh-enrollment-us-central.volt-cli.dev`; there is no broker override,
+redirect, or function-generated fallback. Before serverless buffering, JSON
+routes require `POST`, no query, exact JSON media type, no `Content-Encoding`,
+and canonical decimal `Content-Length` from 1 through 16,384. Handler bounds and
+exact keys remain defense in depth. JSON failures use a stable
+`{ "error": "code" }` body without endpoint IDs or secrets.
 
 ### `POST /v1/claims`
 
@@ -248,6 +255,31 @@ endpoint access document has at least one unexpired active grant and is not
 administratively blocked. All other results are `false` or an HTTP error, both
 of which iroh-relay denies. Responses use `Cache-Control: no-store`; any
 positive in-process cache is at most 30 seconds.
+
+## Edge deployment boundary
+
+Repository-owned Terraform under
+`examples/remote/firebase-push-relay/infra/` provisions one HTTPS-only global
+external Application Load Balancer with exact host/path routing to isolated
+`irohEnrollmentApi`, `irohRelayAccess`, and `pushRelayApi` serverless backends.
+All three retain `ALLOW_INTERNAL_AND_GCLB`; their generated URLs reject ordinary
+Internet traffic. Unknown hosts and path variants reach an empty backend bucket
+whose edge policy returns 404.
+
+Cloud Armor is default-deny before function buffering. Enrollment JSON uses the
+canonical envelope above. The callback additionally requires the exact
+`/v1/relay-access` path, `Content-Length: 0`, bounded bearer/node headers, no
+query or encoding, and the managed relay's stable source CIDR. Contract denials
+return 403; rate excess returns 429. Backend services replace client forwarding
+content with `X-Forwarded-For: {client_ip_address},{server_ip_address}`, while
+Cloud Armor keys rates on its observed `IP`.
+
+Preview policies project contract/rate actions while an enforced
+operator-source allowlist and default deny bound canary traffic. Separate
+immutable final policies admit only the public contract. Before final
+attachment, every malformed HTTP/1.1/HTTP/2 case must correlate to a load
+balancer denial with no Cloud Run invocation. Cloud Armor remains approximate
+compute protection; Firestore windows are the durable exact application budget.
 
 ## Persistence and lifecycle
 

@@ -71,16 +71,17 @@ run_fixture() {
 }
 
 run_fixture managed \
-	--access-http-url https://us-central1-volt-3fae7.cloudfunctions.net/irohEnrollment/v1/relay-access \
+	--access-http-url https://iroh-enrollment-us-central.volt-cli.dev/v1/relay-access \
 	--access-http-token-file /etc/iroh-relay/backend-token
 
 managed="$tmp/managed/payloads"
 config_file=$(grep -l '^\[access\.http\]$' "$tmp/managed"/stdin.* | head -1)
 [[ -n "$config_file" ]] || fail "managed relay config was not written"
 grep -q '^url = "http://127.0.0.1:9081/v1/relay-access"$' "$config_file" || fail "loopback access.http URL missing"
-proxy_file=$(grep -l '^UPSTREAM_URL = ($' "$tmp/managed"/stdin.* | head -1)
+proxy_file=$(grep -l '^UPSTREAM_URL = ' "$tmp/managed"/stdin.* | head -1)
 [[ -n "$proxy_file" ]] || fail "managed callback framing proxy was not installed"
-grep -q 'us-central1-volt-3fae7.cloudfunctions.net/' "$proxy_file" || fail "proxy fixed upstream missing"
+grep -q 'https://iroh-enrollment-us-central.volt-cli.dev/v1/relay-access' "$proxy_file" || fail "proxy fixed upstream missing"
+grep -q '"Content-Length": "0"' "$proxy_file" || fail "proxy zero-byte upstream framing missing"
 python3 -m py_compile "$proxy_file" || fail "managed callback framing proxy has invalid syntax"
 grep -q 'sha256sum --check --strict' "$tmp/managed"/command.* || fail "release checksum verification missing"
 grep -q 'ad7de882c4825a851b38869a3f1622b674cb65f344304e432f862ddf72d6b39a' "$tmp/managed"/command.* || fail "x86_64 release checksum missing"
@@ -95,6 +96,8 @@ grep -q 'limit rate over 67108864 bytes/second burst 134217728 bytes' "$managed"
 grep -q 'IROH_RELAY_HTTP_BEARER_TOKEN' "$managed" || fail "relay environment handoff missing"
 grep -q 'backend-health' "$managed" || fail "backend health probe missing"
 grep -q -- "--url 'http://127.0.0.1:9081/v1/relay-access'" "$managed" || fail "health check does not exercise callback framing proxy"
+grep -q 'X-Iroh-NodeId: %064d' "$managed" || fail "health check does not send a valid-shaped ungranted endpoint"
+grep -q '\[\[ "$status" == 200 && "$body" == false \]\]' "$managed" || fail "health check does not require exact backend denial"
 grep -q 'egress-pressure' "$managed" || fail "egress alert transition missing"
 for payload in "$tmp/managed"/stdin.*; do
 	if [[ $(head -1 "$payload") == '#!/usr/bin/env bash' ]]; then

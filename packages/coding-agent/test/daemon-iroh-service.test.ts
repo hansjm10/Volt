@@ -1157,6 +1157,7 @@ describe.skipIf(!nativeAvailable)("voltd managed enrollment endpoint binding", (
 					status: "approved",
 					clientEndpointId: mismatchedClientEndpointId,
 					grantExpiresAtEpochSeconds: Math.floor(Date.now() / 1_000) + 2_592_000,
+					grantGenerationId: "A".repeat(43),
 				};
 			},
 			async cancelClaim() {

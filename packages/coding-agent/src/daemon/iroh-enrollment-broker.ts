@@ -12,7 +12,7 @@ import {
 	signIrohRemoteEnrollmentMessage,
 } from "../core/remote/iroh/enrollment.ts";
 
-export const IROH_ENROLLMENT_BROKER_URL = "https://us-central1-volt-3fae7.cloudfunctions.net/irohEnrollment";
+export const IROH_ENROLLMENT_BROKER_URL = "https://iroh-enrollment-us-central.volt-cli.dev";
 export const DEFAULT_IROH_ENROLLMENT_BROKER_TIMEOUT_MS = 5_000;
 export const DEFAULT_IROH_ENROLLMENT_BROKER_MAX_RESPONSE_BYTES = 16 * 1024;
 const MAX_IROH_ENROLLMENT_BROKER_REQUEST_BYTES = 16 * 1024;
@@ -31,6 +31,7 @@ export type IrohEnrollmentBrokerClaimStatus =
 			status: "approved";
 			clientEndpointId: string;
 			grantExpiresAtEpochSeconds: number;
+			grantGenerationId: string;
 	  };
 
 export type IrohEnrollmentBrokerCancelClaimResult = { status: "cancelled" } | { status: "expired" };
@@ -136,7 +137,7 @@ export class IrohEnrollmentBrokerClient implements IrohEnrollmentBroker {
 		if (response.status === "approved") {
 			expectExactKeys(
 				response,
-				["status", "clientEndpointId", "grantExpiresAtEpochSeconds"],
+				["status", "clientEndpointId", "grantExpiresAtEpochSeconds", "grantGenerationId"],
 				"broker status response",
 			);
 			return {
@@ -145,6 +146,11 @@ export class IrohEnrollmentBrokerClient implements IrohEnrollmentBroker {
 				grantExpiresAtEpochSeconds: expectEpochSeconds(
 					response.grantExpiresAtEpochSeconds,
 					"broker status grantExpiresAtEpochSeconds",
+				),
+				grantGenerationId: expectIrohRemoteBase64urlBytes(
+					response.grantGenerationId,
+					32,
+					"broker status grantGenerationId",
 				),
 			};
 		}
@@ -214,7 +220,8 @@ export class IrohEnrollmentBrokerClient implements IrohEnrollmentBroker {
 		acceptedStatuses: readonly number[],
 	): Promise<unknown> {
 		const serializedBody = JSON.stringify(body);
-		if (Buffer.byteLength(serializedBody, "utf8") > MAX_IROH_ENROLLMENT_BROKER_REQUEST_BYTES) {
+		const requestBodyBytes = Buffer.byteLength(serializedBody, "utf8");
+		if (requestBodyBytes === 0 || requestBodyBytes > MAX_IROH_ENROLLMENT_BROKER_REQUEST_BYTES) {
 			throw new Error("broker request body exceeds maximum size");
 		}
 		const abortController = new AbortController();
@@ -223,7 +230,10 @@ export class IrohEnrollmentBrokerClient implements IrohEnrollmentBroker {
 		const operation = (async () => {
 			const response = await this.fetchImplementation(`${IROH_ENROLLMENT_BROKER_URL}${path}`, {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: {
+					"content-length": String(requestBodyBytes),
+					"content-type": "application/json",
+				},
 				body: serializedBody,
 				redirect: "manual",
 				signal: abortController.signal,

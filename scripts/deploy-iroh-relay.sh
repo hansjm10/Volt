@@ -34,7 +34,7 @@
 #                            allowlist and restart (no other changes)
 set -euo pipefail
 
-VOLT_MANAGED_ACCESS_HTTP_URL="https://us-central1-volt-3fae7.cloudfunctions.net/irohEnrollment/v1/relay-access"
+VOLT_MANAGED_ACCESS_HTTP_URL="https://iroh-enrollment-us-central.volt-cli.dev/v1/relay-access"
 MANAGED_ACCESS_PROXY_URL="http://127.0.0.1:9081/v1/relay-access"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ACCESS_PROXY_SOURCE="$SCRIPT_DIR/iroh_relay_access_proxy.py"
@@ -485,19 +485,22 @@ if [[ -f /etc/iroh-relay/access-http-url ]]; then
 	credential_path=${CREDENTIALS_DIRECTORY:-}/iroh-relay-http-bearer-token
 	if [[ -r "$credential_path" ]]; then
 		token=$(<"$credential_path")
-		# An authenticated request with the required endpoint header deliberately
-		# omitted must reach the backend and return 400. It does not consume a
-		# request quota or create an endpoint record.
-		status=$(printf 'Authorization: Bearer %s\n' "$token" | curl --disable \
-			--noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --max-time 10 \
+		# A fixed valid-shaped, deliberately ungranted endpoint ID must reach the
+		# backend and return exact false. Unknown endpoint probes create no record.
+		response=$(mktemp)
+		status=$(printf 'Authorization: Bearer %s\nX-Iroh-NodeId: %064d\n' "$token" 0 | curl --disable \
+			--noproxy '*' --silent --output "$response" --write-out '%{http_code}' --max-time 10 \
 			--request POST --data '' --header @- \
 			--url 'http://127.0.0.1:9081/v1/relay-access' 2>/dev/null || true)
 		unset token
+		body=$(cat "$response")
+		rm -f "$response"
 	else
 		status=missing-credential
+		body=""
 	fi
-	if [[ "$status" == 400 ]]; then
-		transition backend-health ok "authenticated callback proxy/backend probe returned expected status"
+	if [[ "$status" == 200 && "$body" == false ]]; then
+		transition backend-health ok "authenticated callback proxy/backend probe returned expected denial"
 	else
 		transition backend-health failed "authenticated backend probe failed"
 		failed=1

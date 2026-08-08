@@ -80,7 +80,7 @@ test("uses a deterministic bounded document id for each FCM token", () => {
 });
 
 test("never derives the public relay URL from request headers", () => {
-	assert.equal(getConfiguredRelayUrl({}), "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay");
+	assert.equal(getConfiguredRelayUrl({}), "https://push-relay-us-central.volt-cli.dev");
 	assert.equal(
 		getConfiguredRelayUrl({ PUSH_RELAY_URL: "https://push.volt.example/relay/" }),
 		"https://push.volt.example/relay",

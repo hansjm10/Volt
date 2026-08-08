@@ -19,6 +19,7 @@ interface EnrollmentVectors {
 	claimId: string;
 	claimSecret: string;
 	claimSecretSha256: string;
+	grantGenerationId: string;
 	operations: Record<"create_claim" | "claim_status" | "cancel_claim", { nonce: string; canonicalMessage: string }>;
 }
 
@@ -71,6 +72,7 @@ describe("Iroh relay enrollment", () => {
 				status: "approved",
 				clientEndpointId: "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
 				grantExpiresAtEpochSeconds: 1_896_048_000,
+				grantGenerationId: vectors.grantGenerationId,
 			}),
 			jsonResponse({ status: "cancelled" }),
 		];
@@ -93,14 +95,26 @@ describe("Iroh relay enrollment", () => {
 			status: "pending",
 			relayOrigins: RELAY_ORIGINS,
 		});
-		await expect(client.getClaimStatus(claim)).resolves.toMatchObject({ status: "approved" });
+		await expect(client.getClaimStatus(claim)).resolves.toMatchObject({
+			status: "approved",
+			grantGenerationId: vectors.grantGenerationId,
+		});
 		await expect(client.cancelClaim(claim)).resolves.toEqual({ status: "cancelled" });
+		expect(IROH_ENROLLMENT_BROKER_URL).toBe("https://iroh-enrollment-us-central.volt-cli.dev");
 		expect(requests.map((request) => request.url)).toEqual([
-			`${IROH_ENROLLMENT_BROKER_URL}/v1/claims`,
-			`${IROH_ENROLLMENT_BROKER_URL}/v1/claims/status`,
-			`${IROH_ENROLLMENT_BROKER_URL}/v1/claims/cancel`,
+			"https://iroh-enrollment-us-central.volt-cli.dev/v1/claims",
+			"https://iroh-enrollment-us-central.volt-cli.dev/v1/claims/status",
+			"https://iroh-enrollment-us-central.volt-cli.dev/v1/claims/cancel",
 		]);
 		expect(requests.every((request) => request.init.redirect === "manual")).toBe(true);
+		for (const request of requests) {
+			const serializedBody = String(request.init.body);
+			const requestBytes = Buffer.byteLength(serializedBody, "utf8");
+			expect(new Headers(request.init.headers).get("content-length")).toBe(String(requestBytes));
+			expect(new Headers(request.init.headers).get("content-type")).toBe("application/json");
+			expect(requestBytes).toBeGreaterThanOrEqual(1);
+			expect(requestBytes).toBeLessThanOrEqual(16 * 1024);
+		}
 		expect(requests[0]!.body).not.toHaveProperty("claimSecret");
 		expect(requests[0]!.body.claimSecretHash).toBe(vectors.claimSecretSha256);
 		expect(requests[1]!.body.claimSecret).toBe(vectors.claimSecret);

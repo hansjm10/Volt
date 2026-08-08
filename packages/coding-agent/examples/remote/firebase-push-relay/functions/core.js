@@ -1,7 +1,7 @@
 const { createHash, timingSafeEqual } = require("node:crypto");
 
 const DEFAULT_ALLOWED_FIREBASE_APP_ID = "1:546623825529:ios:9f5a707e3f4ef89154d6a8";
-const DEFAULT_PUBLIC_RELAY_URL = "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay";
+const DEFAULT_PUBLIC_RELAY_URL = "https://push-relay-us-central.volt-cli.dev";
 const DEFAULT_PUSH_TARGET_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_OBJECT_DEPTH = 8;

@@ -8,10 +8,7 @@ import re
 import ssl
 import urllib.error
 import urllib.request
-UPSTREAM_URL = (
-    "https://us-central1-volt-3fae7.cloudfunctions.net/"
-    "irohEnrollment/v1/relay-access"
-)
+UPSTREAM_URL = "https://iroh-enrollment-us-central.volt-cli.dev/v1/relay-access"
 LISTEN_ADDRESS = ("127.0.0.1", 9081)
 CALLBACK_PATH = "/v1/relay-access"
 MAX_UPSTREAM_BODY_BYTES = 16 * 1024
@@ -51,7 +48,10 @@ class RelayAccessProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         assert authorization is not None
-        headers: dict[str, str] = {"Authorization": authorization}
+        headers: dict[str, str] = {
+            "Authorization": authorization,
+            "Content-Length": "0",
+        }
         if endpoint_id is not None:
             headers["X-Iroh-NodeId"] = endpoint_id
         request = urllib.request.Request(

@@ -161,7 +161,7 @@ Deploy after the backend and file are ready:
 ```sh
 scripts/deploy-iroh-relay.sh root@relay.example.com relay.example.com \
   --contact you@example.com \
-  --access-http-url https://us-central1-volt-3fae7.cloudfunctions.net/irohEnrollment/v1/relay-access
+  --access-http-url https://iroh-enrollment-us-central.volt-cli.dev/v1/relay-access
 ```
 
 Use `--access-http-token-file <remote-absolute-path>` only when the root-owned
@@ -305,10 +305,10 @@ The deployment installs and enables `iroh-relay-healthcheck.timer`. Each run:
 1. resolves the configured relay hostname to IPv4 or IPv6 loopback and requests
    its TLS `/healthz`;
 2. for managed relays, sends the backend bearer through curl stdin to the
-   loopback framing proxy and expects an authenticated 400 response to a
-   deliberately incomplete request, proving proxy health, backend reachability,
-   and secret acceptance without creating an endpoint record or consuming the
-   endpoint request quota;
+   loopback framing proxy with a fixed valid-shaped, deliberately ungranted
+   endpoint ID and expects exact `200 false`, proving proxy health, backend
+   reachability, secret acceptance, and denial without creating an endpoint
+   record;
 3. confirms that the nftables egress guard exists; and
 4. detects increases in its dropped-byte counter.
 

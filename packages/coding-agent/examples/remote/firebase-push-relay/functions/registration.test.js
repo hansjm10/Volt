@@ -9,7 +9,7 @@ test("registration writes the relay target and returns the complete client contr
 	const nowMs = 2_000_000_000_000;
 	const pushTargetAuthToken = "a".repeat(43);
 	const pushTargetTtlMs = 30 * 24 * 60 * 60 * 1000;
-	const publicRelayUrl = "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay";
+	const publicRelayUrl = "https://push-relay-us-central.volt-cli.dev";
 	const writes = [];
 	const rateLimitedAppIds = [];
 	let responseStatus;

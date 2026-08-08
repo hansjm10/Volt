@@ -124,6 +124,6 @@ test("production registration route writes through the Firestore collection adap
 	assert.equal(responseStatus, 201);
 	assert.equal(responseBody.pushTargetId, pushTargetId);
 	assert.equal(responseBody.tokenHash, hashToken(fcmToken));
-	assert.equal(responseBody.relayUrl, "https://us-central1-volt-3fae7.cloudfunctions.net/pushRelay");
+	assert.equal(responseBody.relayUrl, "https://push-relay-us-central.volt-cli.dev");
 	assert.match(responseBody.pushTargetAuthToken, /^[A-Za-z0-9_-]{43}$/);
 });
