@@ -263,6 +263,7 @@ export type {
 	ResolvedResource,
 } from "./core/package-manager.ts";
 export { DefaultPackageManager } from "./core/package-manager.ts";
+export type { Personality } from "./core/personality.ts";
 export {
 	type AuthorizeIrohRemoteClientOptions,
 	assertIrohRemoteHandshakeHostIdentity,

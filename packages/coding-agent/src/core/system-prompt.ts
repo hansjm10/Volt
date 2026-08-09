@@ -3,6 +3,7 @@
  */
 
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
+import { getPersonalityPrompt, type Personality } from "./personality.ts";
 import { formatSkillsForPrompt, type Skill } from "./skills.ts";
 
 const ACTIONABLE_REQUEST_POLICY =
@@ -19,6 +20,8 @@ const SCOPE_AND_FAILURE_CONTAINMENT_POLICY = `- Treat the active user objective 
 export interface BuildSystemPromptOptions {
 	/** Custom system prompt (replaces default). */
 	customPrompt?: string;
+	/** Personality preset for the default prompt. Ignored when customPrompt is set. Default: "default". */
+	personality?: Personality;
 	/** Tools to include in prompt. Default: [read, bash, edit, write, web_search] */
 	selectedTools?: string[];
 	/** Optional one-line tool snippets keyed by tool name. */
@@ -39,6 +42,7 @@ export interface BuildSystemPromptOptions {
 export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const {
 		customPrompt,
+		personality,
 		selectedTools,
 		toolSnippets,
 		promptGuidelines,
@@ -141,7 +145,9 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 	const guidelines = guidelinesList.map((g) => `- ${g}`).join("\n");
 
-	let prompt = `You are an expert coding assistant operating inside Volt, a coding-agent harness. You help users understand, modify, test, and maintain software using the tools available in this session.
+	let prompt = `You are Volt, an expert coding assistant operating inside a coding-agent harness. You help users understand, modify, test, and maintain software using the tools available in this session.
+
+${getPersonalityPrompt(personality)}
 
 <instruction_hierarchy>
 - Follow system, developer, tool, and project instructions in priority order.

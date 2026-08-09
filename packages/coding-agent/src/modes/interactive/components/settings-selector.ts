@@ -12,6 +12,7 @@ import {
 	Text,
 } from "@hansjm10/volt-tui";
 import { formatHttpIdleTimeoutMs, HTTP_IDLE_TIMEOUT_CHOICES } from "../../../core/http-dispatcher.ts";
+import type { Personality } from "../../../core/personality.ts";
 import type { DefaultProjectTrust, TurnDoneAlert, WarningSettings } from "../../../core/settings-manager.ts";
 import { getSelectListTheme, getSettingsListTheme, theme } from "../../../core/theme/runtime.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
@@ -46,6 +47,7 @@ const SESSION_MODEL_LABEL = "session model";
 
 export interface SettingsConfig {
 	autoCompact: boolean;
+	personality: Personality;
 	showImages: boolean;
 	imageWidthCells: number;
 	autoResizeImages: boolean;
@@ -80,6 +82,7 @@ export interface SettingsConfig {
 
 export interface SettingsCallbacks {
 	onAutoCompactChange: (enabled: boolean) => void;
+	onPersonalityChange: (personality: Personality) => void;
 	onShowImagesChange: (enabled: boolean) => void;
 	onImageWidthCellsChange: (width: number) => void;
 	onAutoResizeImagesChange: (enabled: boolean) => void;
@@ -239,6 +242,13 @@ export class SettingsSelectorComponent extends Container {
 				description: "Automatically compact context when it gets too large",
 				currentValue: config.autoCompact ? "true" : "false",
 				values: ["true", "false"],
+			},
+			{
+				id: "personality",
+				label: "Personality",
+				description: "Communication style for Volt's built-in system prompt",
+				currentValue: config.personality,
+				values: ["default", "pragmatic"],
 			},
 			{
 				id: "steering-mode",
@@ -528,6 +538,7 @@ export class SettingsSelectorComponent extends Container {
 
 		const sectionById: Record<string, string> = {
 			autocompact: "Agent",
+			personality: "Agent",
 			thinking: "Agent",
 			"review-model": "Agent",
 			"hide-thinking": "Agent",
@@ -576,6 +587,9 @@ export class SettingsSelectorComponent extends Container {
 				switch (id) {
 					case "autocompact":
 						callbacks.onAutoCompactChange(newValue === "true");
+						break;
+					case "personality":
+						callbacks.onPersonalityChange(newValue as Personality);
 						break;
 					case "show-images":
 						callbacks.onShowImagesChange(newValue === "true");
