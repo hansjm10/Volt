@@ -748,6 +748,57 @@ describe("SubagentManager", () => {
 		await expect(manager.followDelegation(handle.id)).resolves.toMatchObject({ id: handle.id, status: "aborted" });
 	});
 
+	it("records a delegation-scope-aborted retry candidate as aborted after settlement", async () => {
+		const retryStarted = createDeferred();
+		const externalAbort = new AbortController();
+		const scope = new SubagentDelegationScope({ signal: externalAbort.signal });
+		cleanups.push(() => scope.dispose());
+		const { manager } = await createTestManager({
+			responses: [fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" })],
+			settings: {
+				compaction: { enabled: false },
+				retry: { enabled: true, maxRetries: 1, baseDelayMs: 60_000 },
+			},
+			onRuntimeCreated: (event) => {
+				event.runtime.session.setSessionName("scope-aborted retry child");
+			},
+		});
+		const handle = await manager.start({ delegationScope: scope });
+		handle.onEvent((event) => {
+			if (event.type === "auto_retry_start") {
+				retryStarted.resolve();
+			}
+		});
+
+		const completion = handle.waitForEnd();
+		await handle.prompt("abort retry backoff through the delegation scope");
+		await retryStarted.promise;
+
+		externalAbort.abort(new Error("external delegation cancellation"));
+		const result = await completion;
+
+		expect(scope.signal.aborted).toBe(true);
+		expect(result).toMatchObject({ status: "aborted" });
+		expect(result.error).toBeUndefined();
+		expect(result.event.willRetry).toBe(false);
+		expect(result.event.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorMessage: "overloaded_error",
+		});
+
+		const activity = manager.listActivities().find((candidate) => candidate.id === handle.id);
+		expect(activity).toMatchObject({ id: handle.id, status: "aborted", abortRequested: true });
+		expect(activity?.error).toBeUndefined();
+
+		const registryRecord = manager.listDelegations().find((candidate) => candidate.id === handle.id);
+		expect(registryRecord).toMatchObject({ id: handle.id, status: "aborted" });
+		expect(registryRecord?.error).toBeUndefined();
+		const followed = await manager.followDelegation(handle.id);
+		expect(followed).toMatchObject({ id: handle.id, status: "aborted" });
+		expect(followed.error).toBeUndefined();
+	});
+
 	it("starts by definition name and applies the definition body as child prompt context", async () => {
 		let observedSystemPrompt: string | undefined;
 		const resourceLoader = createSubagentResourceLoader([

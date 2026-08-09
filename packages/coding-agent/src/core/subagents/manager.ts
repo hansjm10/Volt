@@ -1601,6 +1601,7 @@ export class SubagentManager {
 				},
 			});
 			delegation.reservation.commit(id, () => {
+				this.markActivityAbortRequested(id);
 				void runtime.session.abort();
 			});
 			this.handles.set(id, handle);
