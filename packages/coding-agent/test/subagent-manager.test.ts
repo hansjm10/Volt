@@ -32,6 +32,7 @@ import {
 	SubagentManager,
 	SubagentRegistry,
 	type SubagentRuntimeCreatedEvent,
+	type SubagentRuntimeRegistration,
 	type SubagentTurnLimits,
 } from "../src/core/subagents/index.ts";
 import { createTestResourceLoader } from "./utilities.ts";
@@ -56,7 +57,9 @@ interface CreateTestManagerOptions {
 	parentSessionManager?: SessionManager;
 	settings?: Partial<Settings>;
 	retainRuntimeOnDispose?: boolean;
-	onRuntimeCreated?: (event: SubagentRuntimeCreatedEvent) => void | Promise<void>;
+	onRuntimeCreated?: (
+		event: SubagentRuntimeCreatedEvent,
+	) => SubagentRuntimeRegistration | Promise<SubagentRuntimeRegistration> | Promise<void> | void;
 	onCreateRuntime?: (subagentContext: SubagentRuntimeContext | undefined) => void;
 }
 
@@ -364,6 +367,166 @@ describe("SubagentManager", () => {
 		expect(
 			transcript.items.some((item) => item.role === "assistant" && item.text.includes("child result text")),
 		).toBe(true);
+	});
+
+	it("rejects the first prompt when its delegation scope was aborted before publication", async () => {
+		let providerCalls = 0;
+		let registrationCommits = 0;
+		let registrationRollbacks = 0;
+		const scope = new SubagentDelegationScope();
+		cleanups.push(() => scope.dispose());
+		const { manager } = await createTestManager({
+			responses: [
+				() => {
+					providerCalls += 1;
+					return fauxAssistantMessage("unexpected child response");
+				},
+			],
+			onRuntimeCreated: () => ({
+				commit: () => {
+					registrationCommits += 1;
+				},
+				rollback: async () => {
+					registrationRollbacks += 1;
+				},
+			}),
+		});
+		const handle = await manager.start({ delegationScope: scope });
+
+		scope.abort(new Error("cancel before first prompt"));
+		await expect(handle.prompt("must not run")).rejects.toThrow(
+			`Subagent ${handle.id} was aborted before prompt acceptance`,
+		);
+
+		expect(providerCalls).toBe(0);
+		expect(registrationCommits).toBe(0);
+		expect(registrationRollbacks).toBe(1);
+		expect(manager.listActivities()).toEqual([]);
+		expect(manager.listDelegations()).toEqual([]);
+		expect(scope.snapshot()).toMatchObject({ aborted: true, activeDescendants: 0 });
+		await expect(handle.getState()).rejects.toThrow(`Subagent ${handle.id} is disposed`);
+	});
+
+	it("rejects the first prompt after an explicit handle abort before publication", async () => {
+		let providerCalls = 0;
+		let registrationCommits = 0;
+		let registrationRollbacks = 0;
+		const { manager } = await createTestManager({
+			responses: [
+				() => {
+					providerCalls += 1;
+					return fauxAssistantMessage("unexpected child response");
+				},
+			],
+			onRuntimeCreated: () => ({
+				commit: () => {
+					registrationCommits += 1;
+				},
+				rollback: async () => {
+					registrationRollbacks += 1;
+				},
+			}),
+		});
+		const handle = await manager.start();
+
+		await handle.abort();
+		await expect(handle.prompt("must not run")).rejects.toThrow(
+			`Subagent ${handle.id} was aborted before prompt acceptance`,
+		);
+
+		expect(providerCalls).toBe(0);
+		expect(registrationCommits).toBe(0);
+		expect(registrationRollbacks).toBe(1);
+		expect(manager.listActivities()).toEqual([]);
+		expect(manager.listDelegations()).toEqual([]);
+		await expect(handle.getState()).rejects.toThrow(`Subagent ${handle.id} is disposed`);
+	});
+
+	it("rejects the first prompt when the scope deadline expires during runtime registration", async () => {
+		const registrationStarted = createDeferred();
+		const finishRegistration = createDeferred();
+		const scopeAborted = createDeferred();
+		let providerCalls = 0;
+		let registrationCommits = 0;
+		let registrationRollbacks = 0;
+		const { manager } = await createTestManager({
+			responses: [
+				() => {
+					providerCalls += 1;
+					return fauxAssistantMessage("unexpected child response");
+				},
+			],
+			onRuntimeCreated: async () => {
+				registrationStarted.resolve();
+				await finishRegistration.promise;
+				return {
+					commit: () => {
+						registrationCommits += 1;
+					},
+					rollback: async () => {
+						registrationRollbacks += 1;
+					},
+				};
+			},
+		});
+		const scope = new SubagentDelegationScope({ limits: { maxDurationMs: 20 } });
+		cleanups.push(() => scope.dispose());
+		cleanups.push(() => finishRegistration.resolve());
+		scope.signal.addEventListener("abort", () => scopeAborted.resolve(), { once: true });
+
+		const starting = manager.start({ delegationScope: scope });
+		await registrationStarted.promise;
+		await scopeAborted.promise;
+		finishRegistration.resolve();
+		const handle = await starting;
+		await expect(handle.prompt("must not run after deadline")).rejects.toThrow(
+			`Subagent ${handle.id} was aborted before prompt acceptance`,
+		);
+
+		expect(providerCalls).toBe(0);
+		expect(registrationCommits).toBe(0);
+		expect(registrationRollbacks).toBe(1);
+		expect(manager.listActivities()).toEqual([]);
+		expect(manager.listDelegations()).toEqual([]);
+		expect(scope.snapshot()).toMatchObject({ aborted: true, activeDescendants: 0 });
+		await expect(handle.getState()).rejects.toThrow(`Subagent ${handle.id} is disposed`);
+	});
+
+	it("rejects cancellation that races queued first-prompt admission", async () => {
+		let providerCalls = 0;
+		let registrationCommits = 0;
+		let registrationRollbacks = 0;
+		const scope = new SubagentDelegationScope();
+		cleanups.push(() => scope.dispose());
+		const { manager } = await createTestManager({
+			responses: [
+				() => {
+					providerCalls += 1;
+					return fauxAssistantMessage("unexpected child response");
+				},
+			],
+			onRuntimeCreated: () => ({
+				commit: () => {
+					registrationCommits += 1;
+				},
+				rollback: async () => {
+					registrationRollbacks += 1;
+				},
+			}),
+		});
+		const handle = await manager.start({ delegationScope: scope });
+
+		const prompting = handle.prompt("must not pass queued admission");
+		scope.abort(new Error("cancel queued first prompt"));
+		await expect(prompting).rejects.toThrow();
+
+		expect(providerCalls).toBe(0);
+		expect(registrationCommits).toBe(0);
+		expect(registrationRollbacks).toBe(1);
+		expect(manager.listActivities()).toEqual([]);
+		expect(manager.listDelegations()).toEqual([]);
+		expect(scope.snapshot()).toMatchObject({ aborted: true, activeDescendants: 0 });
+		await expect(handle.getState()).rejects.toThrow(`Subagent ${handle.id} is disposed`);
 	});
 
 	it("waits through overflow compaction and returns the continuation agent_end", async () => {

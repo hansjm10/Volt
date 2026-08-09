@@ -272,6 +272,8 @@ interface SubagentResult {
 
 `status` is the authoritative terminal outcome, and `error` supplies terminal failure detail when available. Do not infer the outcome from `event` or its assistant stop reasons: the latest low-level `agent_end` retains attempt history and can contain an error from a retry that was subsequently aborted.
 
+Cancellation remains authoritative while a child is prepared but not yet published. If `handle.abort()` is called or the delegation scope aborts before the first prompt is accepted, a later `handle.prompt()` rejects, rolls back the prepared runtime registration, disposes the handle, and leaves no activity or registry record.
+
 Definition-less `start()` children join the session tree exactly like definition-backed ones — they share the session-wide registry, the delegation scope's ceilings, and depth accounting — but they are fail-closed for nested delegation: only a definition can declare an `allowedSubagents` policy, so an unnamed child cannot spawn further subagents.
 
 To expose the built-in `subagent` tool in an SDK-created parent session, pass the manager as `subagentToolManager`. It is active by default when no explicit tool allowlist is provided:

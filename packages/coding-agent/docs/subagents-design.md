@@ -215,6 +215,7 @@ Local core subagents use in-process RPC:
 Cancellation semantics:
 
 - `abort` is the semantic cancellation command.
+- Cancellation is monotonic from runtime preparation through settlement. If a handle or its delegation scope is aborted before first-prompt publication, a later prompt rejects through the unpublished rollback path and cannot admit provider work or create activity and registry records.
 - Disposing a local handle may abort if the caller requested stop; otherwise it should detach only when a retained runtime exists.
 - Parent session shutdown should abort or dispose ephemeral children.
 - Remote stream close must continue to mean detach, matching Iroh remote behavior.
