@@ -292,8 +292,10 @@ Child events wrap normal child RPC events:
 
 ```json
 {"type":"subagent_event","subagentId":"sa_123","event":{"type":"message_update", "...":"..."}}
-{"type":"subagent_end","subagentId":"sa_123","result":{"id":"sa_123","sessionId":"child-session-id","event":{"type":"agent_end","messages":[],"willRetry":false}}}
+{"type":"subagent_end","subagentId":"sa_123","result":{"id":"sa_123","sessionId":"child-session-id","status":"completed","event":{"type":"agent_end","messages":[],"willRetry":false}}}
 ```
+
+The result's required `status` (`completed`, `failed`, or `aborted`) is authoritative; optional `error` carries terminal failure detail when available. The nested `agent_end` remains low-level attempt history and must not be used to infer terminal status.
 
 `list_subagents` returns safe summaries only; it omits definition file paths, source paths, base directories, and system prompts. Active RPC-started children are scoped to the RPC connection/runtime and are disposed on RPC shutdown or parent session replacement.
 

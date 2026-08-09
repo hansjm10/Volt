@@ -252,13 +252,25 @@ try {
   await handle.prompt("Find the auth entry points");
   const result = await done;
   const transcript = await handle.getTranscript();
-  console.log(result.sessionId, transcript.items.at(-1));
+  console.log(result.status, result.error, result.sessionId, transcript.items.at(-1));
 } finally {
   await handle.dispose();
 }
 ```
 
-`waitForEnd()` resolves after the child session settles, including automatic retries, overflow compaction, and queued continuations. Its result contains the latest low-level `agent_end` event.
+`waitForEnd()` resolves after the child session settles, including automatic retries, overflow compaction, and queued continuations. Its result has this contract:
+
+```typescript
+interface SubagentResult {
+  id: string;
+  sessionId: string;
+  status: "completed" | "failed" | "aborted";
+  error?: string;
+  event: SubagentEndEvent;
+}
+```
+
+`status` is the authoritative terminal outcome, and `error` supplies terminal failure detail when available. Do not infer the outcome from `event` or its assistant stop reasons: the latest low-level `agent_end` retains attempt history and can contain an error from a retry that was subsequently aborted.
 
 Definition-less `start()` children join the session tree exactly like definition-backed ones — they share the session-wide registry, the delegation scope's ceilings, and depth accounting — but they are fail-closed for nested delegation: only a definition can declare an `allowedSubagents` policy, so an unnamed child cannot spawn further subagents.
 
