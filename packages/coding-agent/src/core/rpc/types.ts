@@ -28,6 +28,8 @@ import type {
 	RpcConversationTranscriptPageSchema,
 	RpcConversationWorkflowSnapshotSchema,
 	RpcQueueUpdateEventSchema,
+	RpcSessionTreeNodeSchema,
+	RpcSessionTreePageSchema,
 	RpcTranscriptEntryEventSchema,
 } from "./schema/conversation.ts";
 import type {
@@ -347,6 +349,8 @@ export type RpcConversationActiveAssistant = Static<typeof RpcConversationActive
 export type RpcConversationTranscriptItem = Static<typeof RpcConversationTranscriptItemSchema>;
 export type RpcConversationAssistantPart = Static<typeof RpcConversationAssistantPartSchema>;
 export type RpcConversationTranscriptPage = Static<typeof RpcConversationTranscriptPageSchema>;
+export type RpcSessionTreeNode = Static<typeof RpcSessionTreeNodeSchema>;
+export type RpcSessionTreePage = Static<typeof RpcSessionTreePageSchema>;
 export type RpcConversationWorkflowSnapshot = Static<typeof RpcConversationWorkflowSnapshotSchema>;
 export type RpcConversationBootstrapEvent = Static<typeof RpcConversationBootstrapEventSchema>;
 

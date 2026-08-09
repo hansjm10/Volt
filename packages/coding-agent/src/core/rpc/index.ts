@@ -107,6 +107,8 @@ export type {
 	RpcRegisterPushTargetResponse,
 	RpcResponse,
 	RpcSessionState,
+	RpcSessionTreeNode,
+	RpcSessionTreePage,
 	RpcSlashCommand,
 	RpcSubagentDefinition,
 	RpcSubagentDefinitionSource,

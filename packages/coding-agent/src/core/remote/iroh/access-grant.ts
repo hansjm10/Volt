@@ -148,6 +148,7 @@ const BASELINE_COMMANDS = new Set(["register_push_target"]);
 const OBSERVE_COMMANDS = new Set([
 	"get_state",
 	"get_transcript",
+	"get_session_tree",
 	"get_review_result",
 	"list_review_workflows",
 	"report_stream_discontinuity",

@@ -6,6 +6,7 @@ import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "../subagents/tool-names.ts";
 import { getRemoteVisibleCustomMessageRole } from "./custom-message-projection.ts";
 import type {
+	RpcConversationTranscriptItem,
 	RpcMessageImage,
 	RpcTranscriptItem,
 	RpcTranscriptResponse,
@@ -247,6 +248,52 @@ function projectTranscriptItems(entries: SessionEntry[]): RpcTranscriptItem[] {
 	}
 
 	return items;
+}
+
+/**
+ * Local-RPC projection in the canonical conversation-item shape used by
+ * session-tree pages. Remote callers use the stricter workspace sanitizer but
+ * retain this exact schema.
+ */
+export function projectConversationTranscriptItems(entries: SessionEntry[]): RpcConversationTranscriptItem[] {
+	const entriesById = new Map(entries.map((entry) => [entry.id, entry]));
+	return projectTranscriptItems(entries).map((item) => {
+		const entry = entriesById.get(item.id);
+		if (!entry) {
+			throw new Error(`Transcript projection references unknown session entry ${item.id}`);
+		}
+		const base = {
+			entryId: item.id,
+			ordinal: entry.ordinal ?? 0,
+			createdAt: item.timestamp,
+		};
+		if (item.role === "tool") {
+			return {
+				...base,
+				role: "tool" as const,
+				text: item.summary,
+				truncated: item.summary.endsWith("\n[truncated]"),
+				toolName: item.toolName,
+				status: item.status === "failed" ? "failed" : "completed",
+				summary: item.summary,
+				...(item.path === undefined ? {} : { path: item.path }),
+				...(item.imageCount === undefined ? {} : { imageCount: item.imageCount }),
+				...(item.args === undefined ? {} : { args: item.args }),
+				...(item.details === undefined ? {} : { details: item.details }),
+			};
+		}
+		const role = item.role === "summary" ? "system" : item.role;
+		return {
+			...base,
+			role,
+			text: item.text,
+			truncated: item.text.endsWith("\n[truncated]"),
+			...(item.role === "user" && item.clientMessageId !== undefined
+				? { clientMessageId: item.clientMessageId }
+				: {}),
+			...(item.role === "user" && item.imageCount !== undefined ? { imageCount: item.imageCount } : {}),
+		};
+	});
 }
 
 function projectCustomMessage(entry: Extract<SessionEntry, { type: "custom_message" }>): RpcTranscriptItem | undefined {

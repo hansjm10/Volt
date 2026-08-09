@@ -32,8 +32,14 @@ import {
 } from "../core/rpc/conversation-projection-limits.ts";
 import { getRpcErrorResponseTarget } from "../core/rpc/correlation.ts";
 import { getRemoteVisibleCustomMessageRole } from "../core/rpc/custom-message-projection.ts";
+import { projectSessionTreePage } from "../core/rpc/session-tree.ts";
 import { extractMessageImages, projectMessageImages } from "../core/rpc/transcript.ts";
-import type { RpcConversationAssistantPart, RpcKeepAwakeStatus } from "../core/rpc/types.ts";
+import type {
+	RpcConversationAssistantPart,
+	RpcConversationTranscriptItem,
+	RpcKeepAwakeStatus,
+	RpcSessionTreePage,
+} from "../core/rpc/types.ts";
 import { REMOTE_TRANSCRIPT_DEFAULT_MAX_SERIALIZED_BYTES } from "../core/rpc/wire-limits.ts";
 import { getDefaultSessionDir, type SessionEntry, SessionManager } from "../core/session-manager.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "../core/subagents/tool-names.ts";
@@ -136,7 +142,8 @@ export interface RemoteSessionListCursorEntry {
 export interface ConversationCommandRuntime {
 	session: {
 		sessionId: string;
-		sessionManager: Pick<SessionManager, "getBranch" | "getBranchWindow" | "getLeafEntry">;
+		sessionManager: Pick<SessionManager, "getBranch" | "getBranchWindow" | "getLeafEntry"> &
+			Partial<Pick<SessionManager, "getEntries">>;
 	};
 	listSessions(): Promise<
 		Array<{
@@ -1437,6 +1444,49 @@ export function createRemoteGetTranscriptRpcResponse(
 	return createRpcSuccessResponse(id, "get_transcript", page);
 }
 
+export function createRemoteGetSessionTreeRpcResponse(
+	command: RemoteRpcCommand,
+	authorization: IrohRemoteClientAuthorizationSuccess,
+	runtime: ConversationCommandRuntime,
+): object {
+	const id = getRpcResponseId(command);
+	if (
+		command.limit !== undefined &&
+		(typeof command.limit !== "number" || !Number.isSafeInteger(command.limit) || command.limit <= 0)
+	) {
+		return createIrohRemoteRpcErrorResponse(id, "get_session_tree", "invalid_limit");
+	}
+	if (
+		command.afterOrdinal !== undefined &&
+		(typeof command.afterOrdinal !== "number" ||
+			!Number.isSafeInteger(command.afterOrdinal) ||
+			command.afterOrdinal < 0)
+	) {
+		return createIrohRemoteRpcErrorResponse(id, "get_session_tree", "invalid_cursor");
+	}
+	const entries = runtime.session.sessionManager.getEntries?.();
+	if (!entries) {
+		return createIrohRemoteRpcErrorResponse(id, "get_session_tree", "unsupported_remote_command");
+	}
+	const activeBranch = runtime.session.sessionManager.getBranch();
+	const toolCallsById = collectRemoteToolCalls(entries);
+	const finalAssistantEntryId = findLatestAssistantMessageEntryId(activeBranch);
+	let page: RpcSessionTreePage;
+	try {
+		page = projectSessionTreePage(entries, activeBranch, {
+			workspaceName: authorization.workspace.name,
+			sessionId: runtime.session.sessionId,
+			limit: command.limit as number | undefined,
+			afterOrdinal: command.afterOrdinal as number | undefined,
+			projectTranscriptEntry: (entry): RpcConversationTranscriptItem | undefined =>
+				projectRemoteTranscriptEntry(entry, authorization, toolCallsById, entry.id === finalAssistantEntryId),
+		});
+	} catch {
+		return createIrohRemoteRpcErrorResponse(id, "get_session_tree", "session_tree_unavailable");
+	}
+	return createRpcSuccessResponse(id, "get_session_tree", page);
+}
+
 /**
  * The unbounded sanitized long-form text lane of one transcript entry — the
  * same composition the transcript projection truncates. Assistant entries
@@ -2128,6 +2178,9 @@ export async function handleIntegratedConversationRpcCommand(
 			context.isConversationTranscriptCursorValid,
 			context.registerConversationTranscriptCursor,
 		);
+	}
+	if (command.type === "get_session_tree") {
+		return createRemoteGetSessionTreeRpcResponse(command, authorization, runtime);
 	}
 	if (command.type === "get_message_images") {
 		return createRemoteGetMessageImagesRpcResponse(command, authorization, runtime);

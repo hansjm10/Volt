@@ -14,7 +14,12 @@ import { toIrohRemoteAgentOptionsCatalogModel } from "../../core/remote/iroh/age
 import { createReviewSeedMessage } from "../../core/review.ts";
 import { getRpcErrorResponseTarget, isUsableRpcConversationIdentifier } from "../../core/rpc/correlation.ts";
 import { buildRpcSessionState } from "../../core/rpc/session-state.ts";
-import { projectMessageImages, projectSessionTranscript } from "../../core/rpc/transcript.ts";
+import { projectSessionTreePage } from "../../core/rpc/session-tree.ts";
+import {
+	projectConversationTranscriptItems,
+	projectMessageImages,
+	projectSessionTranscript,
+} from "../../core/rpc/transcript.ts";
 import {
 	createUiActionInvocationPlan,
 	getUiActionCompletions,
@@ -34,6 +39,7 @@ import type {
 	RpcResponse,
 	RpcSessionListItem,
 	RpcSessionState,
+	RpcSessionTreePage,
 	RpcSlashCommand,
 	RpcSubagentStartResponse,
 	RpcTranscriptResponse,
@@ -704,6 +710,20 @@ export async function handleRpcCommand(
 				limit: command.limit,
 			});
 			return createRpcSuccessResponse(id, "get_transcript", transcript);
+		}
+
+		case "get_session_tree": {
+			const entries = session.sessionManager.getEntries();
+			const transcriptByEntryId = new Map(
+				projectConversationTranscriptItems(entries).map((item) => [item.entryId, item]),
+			);
+			const tree: RpcSessionTreePage = projectSessionTreePage(entries, session.sessionManager.getBranch(), {
+				sessionId: session.sessionManager.getSessionId(),
+				limit: command.limit,
+				afterOrdinal: command.afterOrdinal,
+				projectTranscriptEntry: (entry) => transcriptByEntryId.get(entry.id),
+			});
+			return createRpcSuccessResponse(id, "get_session_tree", tree);
 		}
 
 		case "get_message_images": {

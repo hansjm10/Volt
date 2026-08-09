@@ -53,6 +53,11 @@
 			"remotePageMaxSerializedBytes": 2097152,
 			"remoteEntryTextMaxScalars": 12000
 		},
+		"sessionTree": {
+			"pageDefaultItems": 100,
+			"pageMaxItems": 200,
+			"pageMaxSerializedBytes": 2097152
+		},
 		"messageImages": {
 			"responseEnvelopeHeadroomBytes": 65536,
 			"responseBudgetBytes": 4128767,
@@ -733,6 +738,9 @@
 					"$ref": "#/$defs/RpcCommand.get_transcript"
 				},
 				{
+					"$ref": "#/$defs/RpcCommand.get_session_tree"
+				},
+				{
 					"$ref": "#/$defs/RpcCommand.get_message_images"
 				},
 				{
@@ -992,6 +1000,9 @@
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.get_transcript"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.get_session_tree"
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.get_message_images"
@@ -1787,6 +1798,38 @@
 				},
 				"conversationAuthority": {
 					"$ref": "#/$defs/RpcConversationAuthority"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcCommand.get_session_tree": {
+			"type": "object",
+			"required": [
+				"type"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "get_session_tree"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"sessionId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"limit": {
+					"type": "integer",
+					"minimum": 1,
+					"x-volt-expected": "be a positive integer"
+				},
+				"afterOrdinal": {
+					"type": "integer",
+					"minimum": 0,
+					"x-volt-expected": "be a non-negative integer"
 				}
 			},
 			"additionalProperties": false
@@ -6230,6 +6273,9 @@
 					"$ref": "#/$defs/RpcResponse.get_transcript"
 				},
 				{
+					"$ref": "#/$defs/RpcResponse.get_session_tree"
+				},
+				{
 					"$ref": "#/$defs/RpcResponse.get_message_images"
 				},
 				{
@@ -7396,6 +7442,36 @@
 				},
 				"data": {
 					"$ref": "#/$defs/RpcSessionStats"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.get_session_tree": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "get_session_tree"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"$ref": "#/$defs/RpcSessionTreePage"
 				}
 			},
 			"additionalProperties": false
@@ -9587,6 +9663,117 @@
 						}
 					},
 					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcSessionTreeNode": {
+			"type": "object",
+			"required": [
+				"entryId",
+				"parentEntryId",
+				"ordinal",
+				"createdAt",
+				"activeBranch",
+				"transcript"
+			],
+			"properties": {
+				"entryId": {
+					"type": "string"
+				},
+				"parentEntryId": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"ordinal": {
+					"type": "integer"
+				},
+				"createdAt": {
+					"type": "string"
+				},
+				"activeBranch": {
+					"type": "boolean"
+				},
+				"transcript": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/RpcConversationTranscriptItem"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcSessionTreePage": {
+			"type": "object",
+			"required": [
+				"sessionId",
+				"nodes",
+				"hasMore",
+				"nextAfterOrdinal",
+				"projectionVersion",
+				"head"
+			],
+			"properties": {
+				"workspaceName": {
+					"type": "string"
+				},
+				"sessionId": {
+					"type": "string"
+				},
+				"nodes": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/RpcSessionTreeNode"
+					}
+				},
+				"hasMore": {
+					"type": "boolean"
+				},
+				"nextAfterOrdinal": {
+					"anyOf": [
+						{
+							"type": "integer"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"projectionVersion": {
+					"type": "number"
+				},
+				"head": {
+					"anyOf": [
+						{
+							"type": "object",
+							"required": [
+								"entryId",
+								"ordinal"
+							],
+							"properties": {
+								"entryId": {
+									"type": "string"
+								},
+								"ordinal": {
+									"type": "integer"
+								}
+							},
+							"additionalProperties": false
+						},
+						{
+							"type": "null"
+						}
+					]
 				}
 			},
 			"additionalProperties": false

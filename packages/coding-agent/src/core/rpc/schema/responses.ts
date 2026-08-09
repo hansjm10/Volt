@@ -11,6 +11,7 @@ import { type TLiteral, type TObject, type TOptional, type TSchema, type TString
 import type { RpcCommandType } from "../types.ts";
 import { RPC_STABLE_ERROR_CODES } from "../wire-limits.ts";
 import { RpcAgentOptionsSchema } from "./agent-options.ts";
+import { RpcSessionTreePageSchema } from "./conversation.ts";
 import { RpcPendingHostActionsResponseSchema } from "./events.ts";
 import { RpcModelSchema } from "./external.ts";
 import { opaque, openStringEnum } from "./helpers.ts";
@@ -385,6 +386,7 @@ export const RPC_RESPONSE_SCHEMAS = {
 	// State
 	get_state: dataResponse("get_state", RpcSessionStateSchema),
 	get_transcript: dataResponse("get_transcript", RpcTranscriptResponseSchema),
+	get_session_tree: dataResponse("get_session_tree", RpcSessionTreePageSchema),
 	get_message_images: dataResponse("get_message_images", RpcMessageImagesResponseSchema),
 	get_transcript_entry_text: dataResponse("get_transcript_entry_text", RpcTranscriptEntryTextResponseSchema),
 

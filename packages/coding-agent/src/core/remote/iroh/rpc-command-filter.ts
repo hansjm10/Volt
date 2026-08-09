@@ -217,6 +217,10 @@ export function getStaticIrohRemoteRpcFilterResult(line: string): IrohRemoteStat
 		};
 	}
 
+	if (command.type === "get_session_tree") {
+		return { allowed: true, command: command as IrohRemoteRpcCommand };
+	}
+
 	if (IROH_REMOTE_RPC_PASSTHROUGH_TYPES.has(command.type)) {
 		return { allowed: true, command: command as IrohRemoteRpcCommand };
 	}
