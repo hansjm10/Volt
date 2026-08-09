@@ -80,8 +80,8 @@ function createAbortedAssistantStream(model: Model<any>) {
 function cloneStreamOptions(streamOptions?: AgentHarnessStreamOptions): AgentHarnessStreamOptions {
 	return {
 		...streamOptions,
-		headers: streamOptions?.headers ? { ...streamOptions.headers } : undefined,
-		metadata: streamOptions?.metadata ? { ...streamOptions.metadata } : undefined,
+		...(streamOptions?.headers ? { headers: { ...streamOptions.headers } } : {}),
+		...(streamOptions?.metadata ? { metadata: { ...streamOptions.metadata } } : {}),
 	};
 }
 
@@ -113,35 +113,52 @@ function applyStreamOptionsPatch(
 	const result = cloneStreamOptions(base);
 	if (!patch) return result;
 
-	if (Object.hasOwn(patch, "transport")) result.transport = patch.transport;
-	if (Object.hasOwn(patch, "timeoutMs")) result.timeoutMs = patch.timeoutMs;
-	if (Object.hasOwn(patch, "maxRetries")) result.maxRetries = patch.maxRetries;
-	if (Object.hasOwn(patch, "maxRetryDelayMs")) result.maxRetryDelayMs = patch.maxRetryDelayMs;
-	if (Object.hasOwn(patch, "cacheRetention")) result.cacheRetention = patch.cacheRetention;
+	if (Object.hasOwn(patch, "transport")) {
+		if (patch.transport === undefined) delete result.transport;
+		else result.transport = patch.transport;
+	}
+	if (Object.hasOwn(patch, "timeoutMs")) {
+		if (patch.timeoutMs === undefined) delete result.timeoutMs;
+		else result.timeoutMs = patch.timeoutMs;
+	}
+	if (Object.hasOwn(patch, "maxRetries")) {
+		if (patch.maxRetries === undefined) delete result.maxRetries;
+		else result.maxRetries = patch.maxRetries;
+	}
+	if (Object.hasOwn(patch, "maxRetryDelayMs")) {
+		if (patch.maxRetryDelayMs === undefined) delete result.maxRetryDelayMs;
+		else result.maxRetryDelayMs = patch.maxRetryDelayMs;
+	}
+	if (Object.hasOwn(patch, "cacheRetention")) {
+		if (patch.cacheRetention === undefined) delete result.cacheRetention;
+		else result.cacheRetention = patch.cacheRetention;
+	}
 
 	if (Object.hasOwn(patch, "headers")) {
 		if (patch.headers === undefined) {
-			result.headers = undefined;
+			delete result.headers;
 		} else {
 			const headers = { ...(result.headers ?? {}) };
 			for (const [key, value] of Object.entries(patch.headers)) {
 				if (value === undefined) delete headers[key];
 				else headers[key] = value;
 			}
-			result.headers = Object.keys(headers).length > 0 ? headers : undefined;
+			if (Object.keys(headers).length > 0) result.headers = headers;
+			else delete result.headers;
 		}
 	}
 
 	if (Object.hasOwn(patch, "metadata")) {
 		if (patch.metadata === undefined) {
-			result.metadata = undefined;
+			delete result.metadata;
 		} else {
 			const metadata = { ...(result.metadata ?? {}) };
 			for (const [key, value] of Object.entries(patch.metadata)) {
 				if (value === undefined) delete metadata[key];
 				else metadata[key] = value;
 			}
-			result.metadata = Object.keys(metadata).length > 0 ? metadata : undefined;
+			if (Object.keys(metadata).length > 0) result.metadata = metadata;
+			else delete result.metadata;
 		}
 	}
 
@@ -220,8 +237,8 @@ export class AgentHarness<
 	readonly env: ExecutionEnv;
 	private session: Session;
 	private phase: AgentHarnessPhase = "idle";
-	private runAbortController?: AbortController;
-	private runPromise?: Promise<void>;
+	private runAbortController: AbortController | undefined;
+	private runPromise: Promise<void> | undefined;
 	private pendingSessionWrites: PendingSessionWrite[] = [];
 	private model: Model<any>;
 	private thinkingLevel: ThinkingLevel;
@@ -232,7 +249,7 @@ export class AgentHarness<
 	private tools = new Map<string, TTool>();
 	private activeToolNames: string[];
 	private readonly deliveryInbox = new DeliveryInbox<"steer" | "followUp", UserMessage>();
-	private activeDeliveryLease?: DeliveryLease<"steer" | "followUp", UserMessage>;
+	private activeDeliveryLease: DeliveryLease<"steer" | "followUp", UserMessage> | undefined;
 	private readonly committedDeliveryIds = new Set<string>();
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
@@ -434,9 +451,10 @@ export class AgentHarness<
 			}
 			if (signal?.aborted) return createAbortedAssistantStream(model);
 
+			const headers = mergeHeaders(turnState.streamOptions.headers, auth?.headers);
 			const snapshotOptions: AgentHarnessStreamOptions = {
 				...turnState.streamOptions,
-				headers: mergeHeaders(turnState.streamOptions.headers, auth?.headers),
+				...(headers === undefined ? {} : { headers }),
 			};
 			const requestOptions = await this.emitBeforeProviderRequest(
 				model,
@@ -447,22 +465,24 @@ export class AgentHarness<
 			if (signal?.aborted) return createAbortedAssistantStream(model);
 
 			return streamSimple(model, context, {
-				cacheRetention: requestOptions.cacheRetention,
-				headers: requestOptions.headers,
-				maxRetries: requestOptions.maxRetries,
-				maxRetryDelayMs: requestOptions.maxRetryDelayMs,
-				metadata: requestOptions.metadata,
+				...(requestOptions.cacheRetention === undefined ? {} : { cacheRetention: requestOptions.cacheRetention }),
+				...(requestOptions.headers === undefined ? {} : { headers: requestOptions.headers }),
+				...(requestOptions.maxRetries === undefined ? {} : { maxRetries: requestOptions.maxRetries }),
+				...(requestOptions.maxRetryDelayMs === undefined
+					? {}
+					: { maxRetryDelayMs: requestOptions.maxRetryDelayMs }),
+				...(requestOptions.metadata === undefined ? {} : { metadata: requestOptions.metadata }),
 				onPayload: async (payload) => await this.emitBeforeProviderPayload(model, payload),
 				onResponse: async (response) => {
 					const headers = { ...(response.headers as Record<string, string>) };
 					await this.emitOwn({ type: "after_provider_response", status: response.status, headers }, signal);
 				},
-				reasoning: streamOptions?.reasoning,
-				signal,
+				...(streamOptions?.reasoning === undefined ? {} : { reasoning: streamOptions.reasoning }),
+				...(signal === undefined ? {} : { signal }),
 				sessionId: turnState.sessionId,
-				timeoutMs: requestOptions.timeoutMs,
-				transport: requestOptions.transport,
-				apiKey: auth?.apiKey,
+				...(requestOptions.timeoutMs === undefined ? {} : { timeoutMs: requestOptions.timeoutMs }),
+				...(requestOptions.transport === undefined ? {} : { transport: requestOptions.transport }),
+				...(auth?.apiKey === undefined ? {} : { apiKey: auth.apiKey }),
 			});
 		};
 	}
@@ -498,7 +518,7 @@ export class AgentHarness<
 		let firstRequest = true;
 		return {
 			model: turnState.model,
-			reasoning: turnState.thinkingLevel === "off" ? undefined : turnState.thinkingLevel,
+			...(turnState.thinkingLevel === "off" ? {} : { reasoning: turnState.thinkingLevel }),
 			convertToLlm,
 			transformContext: async (messages) => {
 				const result = await this.emitHook({ type: "context", messages: [...messages] });
@@ -511,7 +531,12 @@ export class AgentHarness<
 					toolName: toolCall.name,
 					input: args,
 				});
-				return result ? { block: result.block, reason: result.reason } : undefined;
+				return result
+					? {
+							...(result.block === undefined ? {} : { block: result.block }),
+							...(result.reason === undefined ? {} : { reason: result.reason }),
+						}
+					: undefined;
 			},
 			afterToolCall: async ({ toolCall, args, result, isError }) => {
 				const details = result.details as JsonValue | undefined;
@@ -793,7 +818,7 @@ export class AgentHarness<
 		const beforeResult = await this.emitHook({
 			type: "before_agent_start",
 			prompt: text,
-			images: options?.images,
+			...(options?.images === undefined ? {} : { images: options.images }),
 			systemPrompt: turnState.systemPrompt,
 			resources: turnState.resources,
 		});
@@ -981,7 +1006,7 @@ export class AgentHarness<
 				type: "session_before_compact",
 				preparation,
 				branchEntries,
-				customInstructions,
+				...(customInstructions === undefined ? {} : { customInstructions }),
 				signal: new AbortController().signal,
 			});
 			if (hookResult?.cancel) throw new AgentHarnessError("compaction", "Compaction cancelled");
@@ -1036,9 +1061,9 @@ export class AgentHarness<
 				commonAncestorId,
 				entriesToSummarize: entries,
 				userWantsSummary: options?.summarize ?? false,
-				customInstructions: options?.customInstructions,
-				replaceInstructions: options?.replaceInstructions,
-				label: options?.label,
+				...(options?.customInstructions === undefined ? {} : { customInstructions: options.customInstructions }),
+				...(options?.replaceInstructions === undefined ? {} : { replaceInstructions: options.replaceInstructions }),
+				...(options?.label === undefined ? {} : { label: options.label }),
 			};
 			const signal = new AbortController().signal;
 			const hookResult = await this.emitHook({ type: "session_before_tree", preparation, signal });
@@ -1051,13 +1076,15 @@ export class AgentHarness<
 				if (!model) throw new AgentHarnessError("invalid_state", "No model set for branch summary");
 				const auth = await this.getApiKeyAndHeaders?.(model);
 				if (!auth) throw new AgentHarnessError("auth", "No auth available for branch summary");
+				const customInstructions = hookResult?.customInstructions ?? options?.customInstructions;
+				const replaceInstructions = hookResult?.replaceInstructions ?? options?.replaceInstructions;
 				const branchSummary = await generateBranchSummary(entries, {
 					model,
 					apiKey: auth.apiKey,
-					headers: auth.headers,
+					...(auth.headers === undefined ? {} : { headers: auth.headers }),
 					signal: new AbortController().signal,
-					customInstructions: hookResult?.customInstructions ?? options?.customInstructions,
-					replaceInstructions: hookResult?.replaceInstructions ?? options?.replaceInstructions,
+					...(customInstructions === undefined ? {} : { customInstructions }),
+					...(replaceInstructions === undefined ? {} : { replaceInstructions }),
 				});
 				if (!branchSummary.ok) {
 					if (branchSummary.error.code === "aborted") return { cancelled: true };
@@ -1111,10 +1138,14 @@ export class AgentHarness<
 				type: "session_tree",
 				newLeafId: await this.session.getLeafId(),
 				oldLeafId,
-				summaryEntry,
+				...(summaryEntry === undefined ? {} : { summaryEntry }),
 				...(hookResult?.summary === undefined ? {} : { fromHook: true }),
 			});
-			return { cancelled: false, editorText, summaryEntry };
+			return {
+				cancelled: false,
+				...(editorText === undefined ? {} : { editorText }),
+				...(summaryEntry === undefined ? {} : { summaryEntry }),
+			};
 		} catch (error) {
 			throw normalizeHarnessError(error, "branch_summary");
 		} finally {
@@ -1241,16 +1272,18 @@ export class AgentHarness<
 
 	getResources(): AgentHarnessResources<TSkill, TPromptTemplate> {
 		return {
-			skills: this.resources.skills?.slice(),
-			promptTemplates: this.resources.promptTemplates?.slice(),
+			...(this.resources.skills === undefined ? {} : { skills: this.resources.skills.slice() }),
+			...(this.resources.promptTemplates === undefined
+				? {}
+				: { promptTemplates: this.resources.promptTemplates.slice() }),
 		};
 	}
 
 	async setResources(resources: AgentHarnessResources<TSkill, TPromptTemplate>): Promise<void> {
 		const previousResources = this.getResources();
 		this.resources = {
-			skills: resources.skills?.slice(),
-			promptTemplates: resources.promptTemplates?.slice(),
+			...(resources.skills === undefined ? {} : { skills: resources.skills.slice() }),
+			...(resources.promptTemplates === undefined ? {} : { promptTemplates: resources.promptTemplates.slice() }),
 		};
 		await this.emitOwn({ type: "resources_update", resources: this.getResources(), previousResources });
 	}

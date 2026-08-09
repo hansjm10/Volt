@@ -72,7 +72,7 @@ export async function executeShellWithCapture(
 			const tempFile = await env.createTempFile({
 				prefix: "bash-",
 				suffix: ".log",
-				abortSignal: options?.abortSignal,
+				...(options?.abortSignal === undefined ? {} : { abortSignal: options.abortSignal }),
 			});
 			if (!tempFile.ok) return err(toExecutionError(tempFile.error));
 			fullOutputPath = tempFile.value;
@@ -124,7 +124,7 @@ export async function executeShellWithCapture(
 					exitCode: undefined,
 					cancelled: true,
 					truncated: truncationResult.truncated,
-					fullOutputPath,
+					...(fullOutputPath === undefined ? {} : { fullOutputPath }),
 				});
 			}
 			return err(result.error);
@@ -135,7 +135,7 @@ export async function executeShellWithCapture(
 			exitCode: cancelled ? undefined : result.value.exitCode,
 			cancelled,
 			truncated: truncationResult.truncated,
-			fullOutputPath,
+			...(fullOutputPath === undefined ? {} : { fullOutputPath }),
 		});
 	} catch (error) {
 		return err(toExecutionError(error));

@@ -64,23 +64,27 @@ function parseHeaderLine(line: string, filePath: string): SessionHeader {
 		throw invalidSession(filePath, "first line is not a valid session header", toError(error));
 	}
 	if (!isRecord(parsed)) throw invalidSession(filePath, "first line is not a valid session header");
-	if (parsed.type !== "session") throw invalidSession(filePath, "first line is not a valid session header");
-	if (parsed.version !== 3) throw invalidSession(filePath, "unsupported session version");
-	if (typeof parsed.id !== "string" || !parsed.id) throw invalidSession(filePath, "session header is missing id");
-	if (typeof parsed.timestamp !== "string" || !parsed.timestamp) {
+	if (parsed["type"] !== "session") throw invalidSession(filePath, "first line is not a valid session header");
+	if (parsed["version"] !== 3) throw invalidSession(filePath, "unsupported session version");
+	if (typeof parsed["id"] !== "string" || !parsed["id"]) {
+		throw invalidSession(filePath, "session header is missing id");
+	}
+	if (typeof parsed["timestamp"] !== "string" || !parsed["timestamp"]) {
 		throw invalidSession(filePath, "session header is missing timestamp");
 	}
-	if (typeof parsed.cwd !== "string" || !parsed.cwd) throw invalidSession(filePath, "session header is missing cwd");
-	if (parsed.parentSession !== undefined && typeof parsed.parentSession !== "string") {
+	if (typeof parsed["cwd"] !== "string" || !parsed["cwd"]) {
+		throw invalidSession(filePath, "session header is missing cwd");
+	}
+	if (parsed["parentSession"] !== undefined && typeof parsed["parentSession"] !== "string") {
 		throw invalidSession(filePath, "session header parentSession must be a string");
 	}
 	return {
 		type: "session",
 		version: 3,
-		id: parsed.id,
-		timestamp: parsed.timestamp,
-		cwd: parsed.cwd,
-		parentSession: parsed.parentSession,
+		id: parsed["id"],
+		timestamp: parsed["timestamp"],
+		cwd: parsed["cwd"],
+		...(parsed["parentSession"] === undefined ? {} : { parentSession: parsed["parentSession"] }),
 	};
 }
 
@@ -92,15 +96,17 @@ function parseEntryLine(line: string, filePath: string, lineNumber: number): Ses
 		throw invalidEntry(filePath, lineNumber, "is not valid JSON", toError(error));
 	}
 	if (!isRecord(parsed)) throw invalidEntry(filePath, lineNumber, "is not a valid session entry");
-	if (typeof parsed.type !== "string") throw invalidEntry(filePath, lineNumber, "is missing entry type");
-	if (typeof parsed.id !== "string" || !parsed.id) throw invalidEntry(filePath, lineNumber, "is missing entry id");
-	if (parsed.parentId !== null && typeof parsed.parentId !== "string") {
+	if (typeof parsed["type"] !== "string") throw invalidEntry(filePath, lineNumber, "is missing entry type");
+	if (typeof parsed["id"] !== "string" || !parsed["id"]) {
+		throw invalidEntry(filePath, lineNumber, "is missing entry id");
+	}
+	if (parsed["parentId"] !== null && typeof parsed["parentId"] !== "string") {
 		throw invalidEntry(filePath, lineNumber, "has invalid parentId");
 	}
-	if (typeof parsed.timestamp !== "string" || !parsed.timestamp) {
+	if (typeof parsed["timestamp"] !== "string" || !parsed["timestamp"]) {
 		throw invalidEntry(filePath, lineNumber, "is missing timestamp");
 	}
-	if (parsed.type === "leaf" && parsed.targetId !== null && typeof parsed.targetId !== "string") {
+	if (parsed["type"] === "leaf" && parsed["targetId"] !== null && typeof parsed["targetId"] !== "string") {
 		throw invalidEntry(filePath, lineNumber, "has invalid targetId");
 	}
 	return parsed as unknown as SessionTreeEntry;
@@ -116,7 +122,7 @@ function headerToSessionMetadata(header: SessionHeader, path: string): JsonlSess
 		createdAt: header.timestamp,
 		cwd: header.cwd,
 		path,
-		parentSessionPath: header.parentSession,
+		...(header.parentSession === undefined ? {} : { parentSessionPath: header.parentSession }),
 	};
 }
 
@@ -203,7 +209,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 			id: options.sessionId,
 			timestamp: new Date().toISOString(),
 			cwd: options.cwd,
-			parentSession: options.parentSessionPath,
+			...(options.parentSessionPath === undefined ? {} : { parentSession: options.parentSessionPath }),
 		};
 		getFileSystemResultOrThrow(
 			await fs.writeFile(filePath, `${JSON.stringify(header)}\n`),

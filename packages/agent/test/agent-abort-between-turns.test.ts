@@ -70,7 +70,7 @@ function runtimeAbortSources(agent: Agent): unknown[] {
 					diagnostic.details &&
 					typeof diagnostic.details === "object" &&
 					"source" in diagnostic.details
-						? [diagnostic.details.source]
+						? [diagnostic.details["source"]]
 						: [],
 				)
 			: [],

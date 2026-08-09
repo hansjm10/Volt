@@ -84,7 +84,7 @@ export class JsonlSessionRepo implements JsonlSessionRepoApi {
 		const storage = await JsonlSessionStorage.create(this.fs, filePath, {
 			cwd: options.cwd,
 			sessionId: id,
-			parentSessionPath: options.parentSessionPath,
+			...(options.parentSessionPath === undefined ? {} : { parentSessionPath: options.parentSessionPath }),
 		});
 		return toSession(storage);
 	}

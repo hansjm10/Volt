@@ -133,7 +133,7 @@ function getAssistantUsage(msg: AgentMessage): Usage | undefined {
 export function getLastAssistantUsage(entries: SessionTreeEntry[]): Usage | undefined {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
-		if (entry.type === "message") {
+		if (entry?.type === "message") {
 			const usage = getAssistantUsage(entry.message as AgentMessage);
 			if (usage) return usage;
 		}
@@ -155,7 +155,9 @@ export interface ContextUsageEstimate {
 
 function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; index: number } | undefined {
 	for (let i = messages.length - 1; i >= 0; i--) {
-		const usage = getAssistantUsage(messages[i]);
+		const message = messages[i];
+		if (!message) continue;
+		const usage = getAssistantUsage(message);
 		if (usage) return { usage, index: i };
 	}
 	return undefined;
@@ -181,7 +183,8 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 	const usageTokens = calculateContextTokens(usageInfo.usage);
 	let trailingTokens = 0;
 	for (let i = usageInfo.index + 1; i < messages.length; i++) {
-		trailingTokens += estimateTokens(messages[i]);
+		const message = messages[i];
+		if (message) trailingTokens += estimateTokens(message);
 	}
 
 	return {
@@ -254,14 +257,15 @@ export function estimateTokens(message: AgentMessage): number {
 			chars = message.summary.length;
 			return Math.ceil(chars / 4);
 		}
+		default:
+			return 0;
 	}
-
-	return 0;
 }
 function findValidCutPoints(entries: SessionTreeEntry[], startIndex: number, endIndex: number): number[] {
 	const cutPoints: number[] = [];
 	for (let i = startIndex; i < endIndex; i++) {
 		const entry = entries[i];
+		if (!entry) continue;
 		switch (entry.type) {
 			case "message": {
 				const role = entry.message.role;
@@ -302,6 +306,7 @@ function findValidCutPoints(entries: SessionTreeEntry[], startIndex: number, end
 export function findTurnStartIndex(entries: SessionTreeEntry[], entryIndex: number, startIndex: number): number {
 	for (let i = entryIndex; i >= startIndex; i--) {
 		const entry = entries[i];
+		if (!entry) continue;
 		if (entry.type === "branch_summary" || entry.type === "custom_message") {
 			return i;
 		}
@@ -338,24 +343,24 @@ export function findCutPoint(
 		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
 	}
 	let accumulatedTokens = 0;
-	let cutIndex = cutPoints[0];
+	let cutIndex = cutPoints[0] ?? startIndex;
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry.type !== "message") continue;
+		if (entry?.type !== "message") continue;
 		const messageTokens = estimateTokens(entry.message as AgentMessage);
 		accumulatedTokens += messageTokens;
 		if (accumulatedTokens >= keepRecentTokens) {
 			// Tool results are not valid cut points. If the budget lands in a trailing
 			// result batch, retain the assistant that issued it so compaction still
 			// advances while keeping the call and all of its results together.
-			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
+			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints.at(-1) ?? startIndex;
 			break;
 		}
 	}
 	while (cutIndex > startIndex) {
 		const prevEntry = entries[cutIndex - 1];
-		if (prevEntry.type === "compaction") {
+		if (!prevEntry || prevEntry.type === "compaction") {
 			break;
 		}
 		if (prevEntry.type === "message") {
@@ -364,6 +369,9 @@ export function findCutPoint(
 		cutIndex--;
 	}
 	const cutEntry = entries[cutIndex];
+	if (!cutEntry) {
+		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
+	}
 	const isUserMessage = cutEntry.type === "message" && cutEntry.message.role === "user";
 	const turnStartIndex = isUserMessage ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
 
@@ -486,10 +494,13 @@ export async function generateSummary(
 		},
 	];
 
-	const completionOptions =
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers };
+	const completionOptions = {
+		maxTokens,
+		apiKey,
+		...(signal === undefined ? {} : { signal }),
+		...(headers === undefined ? {} : { headers }),
+		...(model.reasoning && thinkingLevel && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
+	};
 
 	const response = await completeSimple(
 		model,
@@ -541,13 +552,13 @@ export function prepareCompaction(
 	pathEntries: SessionTreeEntry[],
 	settings: CompactionSettings,
 ): Result<CompactionPreparation | undefined, CompactionError> {
-	if (pathEntries.length === 0 || pathEntries[pathEntries.length - 1].type === "compaction") {
+	if (pathEntries.length === 0 || pathEntries.at(-1)?.type === "compaction") {
 		return ok(undefined);
 	}
 
 	let prevCompactionIndex = -1;
 	for (let i = pathEntries.length - 1; i >= 0; i--) {
-		if (pathEntries[i].type === "compaction") {
+		if (pathEntries[i]?.type === "compaction") {
 			prevCompactionIndex = i;
 			break;
 		}
@@ -575,13 +586,17 @@ export function prepareCompaction(
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
 	const messagesToSummarize: AgentMessage[] = [];
 	for (let i = boundaryStart; i < historyEnd; i++) {
-		const msg = getMessageFromEntryForCompaction(pathEntries[i]);
+		const entry = pathEntries[i];
+		if (!entry) continue;
+		const msg = getMessageFromEntryForCompaction(entry);
 		if (msg) messagesToSummarize.push(msg);
 	}
 	const turnPrefixMessages: AgentMessage[] = [];
 	if (cutPoint.isSplitTurn) {
 		for (let i = cutPoint.turnStartIndex; i < cutPoint.firstKeptEntryIndex; i++) {
-			const msg = getMessageFromEntryForCompaction(pathEntries[i]);
+			const entry = pathEntries[i];
+			if (!entry) continue;
+			const msg = getMessageFromEntryForCompaction(entry);
 			if (msg) turnPrefixMessages.push(msg);
 		}
 	}
@@ -598,7 +613,7 @@ export function prepareCompaction(
 		turnPrefixMessages,
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
-		previousSummary,
+		...(previousSummary === undefined ? {} : { previousSummary }),
 		fileOps,
 		settings,
 	});
@@ -729,9 +744,13 @@ async function generateTurnPrefixSummary(
 	const response = await completeSimple(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers },
+		{
+			maxTokens,
+			apiKey,
+			...(signal === undefined ? {} : { signal }),
+			...(headers === undefined ? {} : { headers }),
+			...(model.reasoning && thinkingLevel && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
+		},
 	);
 	if (response.stopReason === "aborted") {
 		return err(new CompactionError("aborted", response.errorMessage || "Turn prefix summarization aborted"));

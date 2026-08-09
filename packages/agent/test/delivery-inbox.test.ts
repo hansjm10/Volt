@@ -197,6 +197,12 @@ describe("DeliveryInbox", () => {
 			return seed % limit;
 		}
 
+		function pickRandom<T>(values: readonly T[]): T {
+			const value = values[nextRandom(values.length)];
+			if (value === undefined) throw new Error("Cannot pick from an empty collection");
+			return value;
+		}
+
 		function project(kind?: Kind, status?: Status): InboxDelivery<Kind, string>[] {
 			return model
 				.filter(
@@ -212,7 +218,7 @@ describe("DeliveryInbox", () => {
 
 		for (let step = 0; step < 400; step++) {
 			const operation = step < 2 ? 0 : nextRandom(8);
-			const kind = kinds[nextRandom(kinds.length)];
+			const kind = pickRandom(kinds);
 
 			switch (operation) {
 				case 0:
@@ -237,7 +243,7 @@ describe("DeliveryInbox", () => {
 				case 2: {
 					const leased = project(undefined, "leased");
 					if (!activeLease || leased.length === 0) break;
-					const delivery = leased[nextRandom(leased.length)];
+					const delivery = pickRandom(leased);
 					expect(activeLease.begin(delivery.deliveryId)).toBe(delivery);
 					const entry = model.find((candidate) => candidate.delivery === delivery);
 					if (entry) entry.status = "committing";
@@ -246,9 +252,9 @@ describe("DeliveryInbox", () => {
 				case 3: {
 					const committing = project(undefined, "committing");
 					if (!activeLease || committing.length === 0) break;
-					const delivery = committing[nextRandom(committing.length)];
+					const delivery = pickRandom(committing);
 					const settlement = ["committed", "retained", "terminally_failed"] as const;
-					const outcome = settlement[nextRandom(settlement.length)];
+					const outcome = pickRandom(settlement);
 					expect(activeLease.settle(delivery.deliveryId, outcome)).toBe(delivery);
 					const entry = model.find((candidate) => candidate.delivery === delivery);
 					if (entry) entry.status = outcome === "retained" ? "pending" : "terminal";

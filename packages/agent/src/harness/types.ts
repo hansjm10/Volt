@@ -104,12 +104,21 @@ export interface AgentHarnessStreamOptions {
 }
 
 /** Per-request stream option patch returned by provider hooks. */
-export interface AgentHarnessStreamOptionsPatch
-	extends Omit<Partial<AgentHarnessStreamOptions>, "headers" | "metadata"> {
+export interface AgentHarnessStreamOptionsPatch {
+	/** Preferred transport patch. Explicit `undefined` clears the configured transport. */
+	transport?: Transport | undefined;
+	/** Timeout patch. Explicit `undefined` clears the configured timeout. */
+	timeoutMs?: number | undefined;
+	/** Retry-count patch. Explicit `undefined` clears the configured retry count. */
+	maxRetries?: number | undefined;
+	/** Retry-delay patch. Explicit `undefined` clears the configured retry-delay cap. */
+	maxRetryDelayMs?: number | undefined;
+	/** Cache-retention patch. Explicit `undefined` clears the configured hint. */
+	cacheRetention?: SimpleStreamOptions["cacheRetention"] | undefined;
 	/** Header patch. `undefined` values delete keys; explicit `headers: undefined` clears all headers. */
-	headers?: Record<string, string | undefined>;
+	headers?: Record<string, string | undefined> | undefined;
 	/** Metadata patch. `undefined` values delete keys; explicit `metadata: undefined` clears all metadata. */
-	metadata?: Record<string, unknown | undefined>;
+	metadata?: Record<string, unknown | undefined> | undefined;
 }
 
 /** Kind of filesystem object as addressed by a {@link FileSystem}. Symlinks are not followed automatically. */
@@ -131,7 +140,7 @@ export class FileError extends Error {
 	/** Backend-independent error code. */
 	public code: FileErrorCode;
 	/** Absolute addressed path associated with the failure, when available. */
-	public path?: string;
+	public path: string | undefined;
 
 	constructor(code: FileErrorCode, message: string, path?: string, cause?: Error) {
 		super(message, cause === undefined ? undefined : { cause });
