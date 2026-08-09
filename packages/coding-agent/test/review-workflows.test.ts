@@ -65,6 +65,7 @@ function parsed(findingsCount = 1, completionStatus: ParsedReview["completionSta
 function completed(
 	findingsCount = 1,
 	completionStatus: ParsedReview["completionStatus"] = "complete",
+	durableRecordCommitted = false,
 ): ExecuteReviewWorkflowResult {
 	return {
 		status: "completed",
@@ -72,6 +73,7 @@ function completed(
 		parsed: parsed(findingsCount, completionStatus),
 		findingsCount,
 		completionStatus,
+		...(durableRecordCommitted ? { durableRecordCommitted: true as const } : {}),
 	};
 }
 
@@ -186,6 +188,31 @@ describe("ReviewWorkflowManager", () => {
 		await manager.waitForIdle();
 		expect(manager.get("review:cancel")?.status).toBe("cancelled");
 		expect(() => manager.cancel("review:missing")).toThrow(/No running/);
+	});
+
+	test("preserves a committed terminal result when cancellation races settlement", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const manager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const started = manager.start({
+			prepared: prepared("review:committed"),
+			execute: async () => {
+				await gate;
+				return completed(0, "incomplete", true);
+			},
+		});
+		started.launch();
+		manager.cancel("review:committed");
+		release();
+		await manager.waitForIdle();
+		expect(manager.get("review:committed")).toMatchObject({
+			status: "completed",
+			completionStatus: "incomplete",
+		});
+		expect(events.at(-1)).toMatchObject({ type: "workflow_end", status: "completed" });
 	});
 
 	test("cancelling an unlaunched workflow disposes its snapshot", async () => {

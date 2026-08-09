@@ -19,6 +19,7 @@ import {
 import type { ReviewCandidateReport, ReviewVerificationReport } from "../../src/core/review-report.ts";
 import { type ReviewSnapshot, resolveReviewSnapshot } from "../../src/core/review-snapshot.ts";
 import { getReviewRun } from "../../src/core/review-state.ts";
+import { ReviewWorkflowManager } from "../../src/core/review-workflows.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
@@ -566,7 +567,7 @@ describe("two-pass review pipeline", () => {
 		expect(currentOutcome.parsed.findings[0]?.id).not.toBe(priorFinding.id);
 	});
 
-	it("waits for a fresh origin review record to become durable before resolving", async () => {
+	it("keeps a committed incomplete review authoritative when cancellation races durability", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const snapshot = await createSnapshotRepository(harness);
@@ -595,61 +596,74 @@ describe("two-pass review pipeline", () => {
 			}),
 			fauxAssistantMessage(fauxToolCall("review_changed_files", {}), { stopReason: "toolUse" }),
 			fauxAssistantMessage(fauxToolCall("review_diff", { path: "src/value.ts" }), { stopReason: "toolUse" }),
-			fauxAssistantMessage(fauxToolCall("report_review_verification", verificationReport() as never), {
+			fauxAssistantMessage(fauxToolCall("report_review_verification", verificationReport("incomplete") as never), {
 				stopReason: "toolUse",
 			}),
 		]);
 
 		const workflowId = "review:durable-origin";
-		const execution = executeReviewWorkflow({
-			prepared: {
-				workflowId,
-				action: "review.uncommitted",
-				target: { kind: "uncommitted" },
-				controls: { scope: [], effort: "standard", includeOptional: false, scopeMode: "full" },
-				resolution: snapshot,
-				model: harness.getModel(),
-				verifierModel: harness.getModel(),
-				startedAt: 1,
-				incrementalPlan: {
-					mode: "full",
-					changedPaths: ["src/value.ts"],
-					priorOpenFindings: [],
-					suppressedDismissedFingerprints: [],
-				},
+		const prepared = {
+			workflowId,
+			action: "review.uncommitted",
+			target: { kind: "uncommitted" as const },
+			controls: { scope: [], effort: "standard" as const, includeOptional: false, scopeMode: "full" as const },
+			resolution: snapshot,
+			model: harness.getModel(),
+			verifierModel: harness.getModel(),
+			startedAt: 1,
+			incrementalPlan: {
+				mode: "full" as const,
+				changedPaths: ["src/value.ts"],
+				priorOpenFindings: [],
+				suppressedDismissedFingerprints: [],
 			},
-			cwd: harness.tempDir,
-			agentDir: harness.tempDir,
-			authStorage: harness.authStorage,
-			modelRegistry: harness.session.modelRegistry,
-			settingsManager: harness.settingsManager,
-			sessionManager: originManager,
-		});
+		};
+		const events: Array<Record<string, unknown>> = [];
+		const manager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
 		let settled = false;
-		void execution.then(
-			() => {
+		const started = manager.start({
+			prepared,
+			execute: async (hooks) => {
+				const outcome = await executeReviewWorkflow({
+					prepared,
+					cwd: harness.tempDir,
+					agentDir: harness.tempDir,
+					authStorage: harness.authStorage,
+					modelRegistry: harness.session.modelRegistry,
+					settingsManager: harness.settingsManager,
+					sessionManager: originManager,
+					signal: hooks.signal,
+					onEvent: hooks.onEvent,
+				});
 				settled = true;
+				return outcome;
 			},
-			() => {
-				settled = true;
-			},
-		);
+		});
+		started.launch();
 		await materializeStarted;
 		try {
 			expect(settled).toBe(false);
 			expect(existsSync(originFile)).toBe(false);
+			manager.cancel(workflowId);
 		} finally {
 			releaseMaterialize();
 		}
 
-		const outcome = await execution;
+		await manager.waitForIdle();
 		snapshots.splice(snapshots.indexOf(snapshot), 1);
-		expect(outcome.status).toBe("completed");
-		if (outcome.status !== "completed") throw new Error(`Review ended with ${outcome.status}`);
+		expect(manager.get(workflowId)).toMatchObject({
+			status: "completed",
+			completionStatus: "incomplete",
+		});
+		expect(events.at(-1)).toMatchObject({
+			type: "workflow_end",
+			status: "completed",
+			message: expect.stringContaining("Review incomplete"),
+		});
 		const reopened = SessionManager.open(originFile);
 		expect(getReviewRun(reopened, workflowId)).toMatchObject({
 			runId: workflowId,
-			status: outcome.completionStatus === "complete" ? "completed" : "incomplete",
+			status: "incomplete",
 		});
 	});
 

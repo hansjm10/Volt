@@ -800,6 +800,8 @@ export type ExecuteReviewWorkflowResult =
 			findingsCount: number;
 			completionStatus: ParsedReview["completionStatus"];
 			record?: ReviewRunRecord;
+			/** The terminal record crossed the SessionManager durability boundary. */
+			durableRecordCommitted?: true;
 	  };
 
 export function createReviewConfirmationMessage(resolution: ResolvedReview): string {
@@ -1328,6 +1330,7 @@ export async function executeReviewWorkflow(
 		findingsCount: result.parsed.findings.length,
 		completionStatus: result.parsed.completionStatus,
 		record,
+		...(options.sessionManager ? { durableRecordCommitted: true as const } : {}),
 	};
 }
 

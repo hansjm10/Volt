@@ -198,9 +198,13 @@ export class ReviewWorkflowManager {
 						errorMessage: error instanceof Error ? error.message : String(error),
 					};
 				}
-				// Abort races: a cancel that lands after the review finished its
-				// session run must still surface as cancelled, not completed.
-				if (entry.abortController.signal.aborted && result.status !== "failed") {
+				// Cancellation wins until the executor commits its terminal record.
+				// After that boundary, the durable outcome is authoritative.
+				if (
+					entry.abortController.signal.aborted &&
+					result.status === "completed" &&
+					result.durableRecordCommitted !== true
+				) {
 					result = { status: "cancelled" };
 				}
 				this.finish(entry, result);
