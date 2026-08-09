@@ -1,0 +1,12 @@
+{
+	"extends": "../../tsconfig.json",
+	"compilerOptions": {
+		"noEmit": true
+	},
+	"include": [
+		"./**/*.ts",
+		"../../packages/coding-agent/src/types/qrcode-terminal.d.ts",
+		"../../packages/coding-agent/src/utils/highlight-js-lib-index.d.ts"
+	],
+	"exclude": []
+}
