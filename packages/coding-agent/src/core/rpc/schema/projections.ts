@@ -108,10 +108,13 @@ export const RpcWorkflowToolEventSchema = Type.Union([
 // ============================================================================
 
 export const RpcReviewWorkflowLifecycleStatusSchema = stringEnum(["running", "completed", "cancelled", "failed"]);
+export const RpcReviewRunStatusSchema = stringEnum(["completed", "incomplete", "cancelled", "failed"]);
+export const RpcReviewCompletionStatusSchema = stringEnum(["complete", "incomplete"]);
+export const RpcReviewCorrectnessSchema = stringEnum(["correct", "incorrect"]);
+export const RpcReviewFindingStatusSchema = stringEnum(["open", "accepted", "fixed", "dismissed", "uncertain"]);
 
 const reviewWorkflowDescriptorProperties = {
 	workflowId: Type.String(),
-	/** Review host-action id, e.g. `review.branch`. */
 	action: Type.String(),
 	status: RpcReviewWorkflowLifecycleStatusSchema,
 	target: Type.Object({ description: Type.String(), diffCommand: Type.String() }, { additionalProperties: false }),
@@ -125,45 +128,149 @@ export const RpcReviewWorkflowDescriptorSchema = Type.Object(reviewWorkflowDescr
 	additionalProperties: false,
 });
 
-/** Wire projection of core/review.ts ReviewFinding (pinned in type-assertions.ts). */
-export const RpcReviewFindingSchema = Type.Object(
+export const RpcReviewLocationSchema = Type.Object(
 	{
-		title: Type.String(),
-		body: Type.String(),
-		/** 0 = must fix, 1 = should fix, 2 = worth fixing, 3 = optional. */
-		priority: Type.Optional(Type.Number()),
-		/** 0.0 - 1.0 */
-		confidence: Type.Optional(Type.Number()),
-		file: Type.Optional(Type.String()),
-		line: Type.Optional(Type.String()),
+		path: Type.String(),
+		side: stringEnum(["base", "head"]),
+		startLine: Type.Integer({ minimum: 1 }),
+		endLine: Type.Integer({ minimum: 1 }),
 	},
 	{ additionalProperties: false },
 );
 
-/** Wire projection of core/review.ts ReviewCoverage (pinned in type-assertions.ts). */
-export const RpcReviewCoverageSchema = Type.Object(
+/** Complete wire projection of core/review-report.ts ReviewFinding. */
+export const RpcReviewFindingSchema = Type.Object(
 	{
-		filesReviewed: Type.Array(Type.String()),
-		commandsRun: Type.Array(Type.String()),
-		uncheckedAreas: Type.Array(Type.String()),
+		id: Type.String(),
+		fingerprint: Type.String(),
+		status: RpcReviewFindingStatusSchema,
+		title: Type.String(),
+		body: Type.String(),
+		trigger: Type.String(),
+		impact: Type.String(),
+		category: Type.String(),
+		rootCauseKey: Type.String(),
+		priority: Type.Union([Type.Literal(0), Type.Literal(1), Type.Literal(2), Type.Literal(3)]),
+		confidence: Type.Number({ minimum: 0, maximum: 1 }),
+		changeLocation: RpcReviewLocationSchema,
+		evidenceLocations: Type.Array(RpcReviewLocationSchema),
+		verification: Type.Object(
+			{
+				outcome: Type.Literal("accepted"),
+				method: Type.String(),
+				rationale: Type.String(),
+				confidence: Type.Number({ minimum: 0, maximum: 1 }),
+			},
+			{ additionalProperties: false },
+		),
 	},
 	{ additionalProperties: false },
 );
+
+/** Host-observed review coverage; no model-authored compatibility fields. */
+export const RpcReviewCoverageSchema = Type.Object(
+	{
+		changedFileInventoryComplete: Type.Boolean(),
+		filesInspected: Type.Array(Type.String()),
+		hunksInspected: Type.Array(Type.String()),
+		commandsRun: Type.Array(Type.String()),
+		failedVerificationAttempts: Type.Array(Type.String()),
+		exclusions: Type.Array(
+			Type.Object({ path: Type.String(), reason: Type.String() }, { additionalProperties: false }),
+		),
+		uncheckedAreas: Type.Array(Type.String()),
+		residualRisk: Type.Array(Type.String()),
+		modelReportedLimitations: Type.Array(Type.String()),
+	},
+	{ additionalProperties: false },
+);
+
+export const RpcReviewOptionsSchema = Type.Object(
+	{
+		focus: Type.Optional(Type.String()),
+		scope: Type.Array(Type.String()),
+		effort: stringEnum(["low", "standard", "high"]),
+		includeOptional: Type.Boolean(),
+		scopeMode: stringEnum(["incremental", "full"]),
+	},
+	{ additionalProperties: false },
+);
+
+export const RpcReviewTargetIdentitySchema = Type.Object(
+	{
+		kind: stringEnum(["uncommitted", "branch", "pr", "commit"]),
+		baseTree: Type.String(),
+		headTree: Type.String(),
+		baseCommit: Type.Optional(Type.String()),
+		mergeBaseCommit: Type.Optional(Type.String()),
+		headCommit: Type.Optional(Type.String()),
+		pullRequest: Type.Optional(
+			Type.Object(
+				{
+					number: Type.Integer(),
+					title: Type.String(),
+					body: Type.String(),
+					url: Type.String(),
+					baseRefName: Type.String(),
+					headRefName: Type.String(),
+					baseRefOid: Type.String(),
+					headRefOid: Type.String(),
+				},
+				{ additionalProperties: false },
+			),
+		),
+	},
+	{ additionalProperties: false },
+);
+
+const reviewRunProperties = {
+	runId: Type.String(),
+	workflowAction: Type.String(),
+	status: RpcReviewRunStatusSchema,
+	startedAt: Type.Number(),
+	endedAt: Type.Number(),
+	target: Type.Object(
+		{
+			description: Type.String(),
+			diffCommand: Type.String(),
+			identity: RpcReviewTargetIdentitySchema,
+		},
+		{ additionalProperties: false },
+	),
+	options: RpcReviewOptionsSchema,
+	parentRunId: Type.Optional(Type.String()),
+	incrementalFallbackReason: Type.Optional(Type.String()),
+	errorMessage: Type.Optional(Type.String()),
+};
 
 export const RpcReviewWorkflowResultResponseSchema = Type.Object(
 	{
-		...reviewWorkflowDescriptorProperties,
+		...reviewRunProperties,
+		completionStatus: Type.Optional(RpcReviewCompletionStatusSchema),
+		summary: Type.Optional(Type.String()),
 		findings: Type.Optional(Type.Array(RpcReviewFindingSchema)),
 		coverage: Type.Optional(RpcReviewCoverageSchema),
-		overallCorrectness: Type.Optional(Type.String()),
+		overallCorrectness: Type.Optional(RpcReviewCorrectnessSchema),
 		overallExplanation: Type.Optional(Type.String()),
-		/** Bounded raw reviewer text; present only when the report had no parseable findings payload. */
-		raw: Type.Optional(Type.String()),
+		verificationChallenge: Type.Optional(Type.String()),
+	},
+	{ additionalProperties: false },
+);
+
+export const RpcReviewRunDescriptorSchema = Type.Object(
+	{
+		...reviewRunProperties,
+		completionStatus: Type.Optional(RpcReviewCompletionStatusSchema),
+		findingsCount: Type.Optional(Type.Integer({ minimum: 0 })),
 	},
 	{ additionalProperties: false },
 );
 
 export const RpcReviewWorkflowListResponseSchema = Type.Object(
-	{ workflows: Type.Array(RpcReviewWorkflowDescriptorSchema) },
+	{
+		runs: Type.Array(RpcReviewRunDescriptorSchema),
+		activeWorkflows: Type.Array(RpcReviewWorkflowDescriptorSchema),
+		nextCursor: Type.Optional(Type.String()),
+	},
 	{ additionalProperties: false },
 );

@@ -47,8 +47,26 @@ const reviewMocks = vi.hoisted(() => ({
 	executeReviewWorkflow: vi.fn(async () => ({
 		status: "completed" as const,
 		raw: "raw reviewer output",
-		parsed: { findings: [{ title: "Fix the bug", body: "The bug is real." }] },
+		parsed: {
+			completionStatus: "complete" as const,
+			summary: "One verified finding.",
+			findings: [],
+			coverage: {
+				changedFileInventoryComplete: true,
+				filesInspected: [],
+				hunksInspected: [],
+				commandsRun: [],
+				failedVerificationAttempts: [],
+				exclusions: [],
+				uncheckedAreas: [],
+				residualRisk: [],
+				modelReportedLimitations: [],
+			},
+			overallCorrectness: "correct" as const,
+			overallExplanation: "Verification completed.",
+		},
 		findingsCount: 1,
+		completionStatus: "complete" as const,
 	})),
 }));
 
@@ -137,6 +155,37 @@ const TEST_TRANSCRIPT_AUTHORIZATION = {
 
 type AssistantAgentMessage = Extract<AgentMessage, { role: "assistant" }>;
 
+function completedReview(
+	findingsCount: number,
+	completionStatus: "complete" | "incomplete" = "complete",
+): ExecuteReviewWorkflowResult {
+	return {
+		status: "completed",
+		raw: "private",
+		parsed: {
+			completionStatus,
+			summary: findingsCount === 0 ? "No findings." : `${findingsCount} findings.`,
+			findings: [],
+			coverage: {
+				changedFileInventoryComplete: true,
+				filesInspected: [],
+				hunksInspected: [],
+				commandsRun: [],
+				failedVerificationAttempts: [],
+				exclusions: [],
+				uncheckedAreas: [],
+				residualRisk: [],
+				modelReportedLimitations: [],
+			},
+			...(completionStatus === "complete" ? { overallCorrectness: "correct" as const } : {}),
+			overallExplanation:
+				completionStatus === "complete" ? "Verification completed." : "Verification was incomplete.",
+		},
+		findingsCount,
+		completionStatus,
+	};
+}
+
 function createAssistantMessage(overrides: Partial<AssistantAgentMessage> = {}): AssistantAgentMessage {
 	return {
 		role: "assistant",
@@ -191,8 +240,6 @@ function startTestReview(
 				description: "private review target",
 				workflowDescription: targetDescription,
 				diffCommand: "git diff HEAD",
-				diff: "private diff",
-				truncated: false,
 			},
 		},
 		execute: async (hooks) => {
@@ -1583,7 +1630,7 @@ describe("Iroh remote notification requests", () => {
 		await expect(modePromise).resolves.toBeUndefined();
 	});
 
-	test("formats zero, one, many, and unknown review finding counts from retained workflow records", async () => {
+	test("formats complete and incomplete review results from retained workflow records", async () => {
 		const session = createTestSession("session-one", "review-run");
 		const reviewWorkflows = new ReviewWorkflowManager();
 		const runtimeHost = {
@@ -1597,10 +1644,10 @@ describe("Iroh remote notification requests", () => {
 		} as unknown as AgentSessionRuntime;
 		const { modePromise, recv, send } = await startIrohRpcMode(runtimeHost, session);
 		const completions: Array<[string, ExecuteReviewWorkflowResult]> = [
-			["review:zero", { status: "completed", raw: "private", findingsCount: 0 }],
-			["review:one", { status: "completed", raw: "private", findingsCount: 1 }],
-			["review:many", { status: "completed", raw: "private", findingsCount: 4 }],
-			["review:unknown", { status: "completed", raw: "private" }],
+			["review:zero", completedReview(0)],
+			["review:one", completedReview(1)],
+			["review:many", completedReview(4)],
+			["review:incomplete", completedReview(0, "incomplete")],
 		];
 		for (const [index, [workflowId, result]] of completions.entries()) {
 			startTestReview(reviewWorkflows, workflowId, "PR #123").finish(result);
@@ -1611,13 +1658,13 @@ describe("Iroh remote notification requests", () => {
 			"PR #123 completed with no issues found.",
 			"PR #123 completed with 1 finding.",
 			"PR #123 completed with 4 findings.",
-			"PR #123 completed. Open Volt to see the findings.",
+			"PR #123 review is incomplete.",
 		]);
 		expect(getNotifications(send).map((notification) => notification.workflowId)).toEqual([
 			"review:zero",
 			"review:one",
 			"review:many",
-			"review:unknown",
+			"review:incomplete",
 		]);
 
 		recv.end();
@@ -1641,7 +1688,7 @@ describe("Iroh remote notification requests", () => {
 			reviewWorkflows,
 			"review:malicious",
 			`${"PR #123".repeat(100)}\n/Users/private/project\ngit diff HEAD`,
-		).finish({ status: "completed", raw: "private diff", findingsCount: 2 });
+		).finish(completedReview(2));
 		await vi.waitFor(() => expect(getNotifications(send)).toHaveLength(1));
 		expect(getNotifications(send)[0]).toMatchObject({
 			body: "Review completed with 2 findings.",
@@ -1675,7 +1722,7 @@ describe("Iroh remote notification requests", () => {
 		const review = startTestReview(reviewWorkflows, "review:reconnect", "PR #151");
 		firstMode.recv.end();
 		await expect(firstMode.modePromise).resolves.toBeUndefined();
-		review.finish({ status: "completed", raw: "private", findingsCount: 0 });
+		review.finish(completedReview(0));
 		await reviewWorkflows.waitForIdle();
 		expect(getNotifications(firstMode.send)).toEqual([]);
 

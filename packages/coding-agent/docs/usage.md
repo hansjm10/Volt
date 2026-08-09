@@ -49,7 +49,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/fork` | Create a new session from a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
 | `/compact [prompt]` | Manually compact context, optionally with custom instructions |
-| `/review [target]` | Review uncommitted changes, a branch, a PR, or a commit; findings seed a fresh session |
+| `/review [target] [options]` | Snapshot and independently verify uncommitted, branch, PR, or commit changes |
 | `/copy` | Copy last assistant message to clipboard |
 | `/export [file]` | Export session to HTML |
 | `/share` | Upload as private GitHub gist with shareable HTML link |
@@ -99,19 +99,27 @@ See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 
 ## Code Review
 
-`/review` runs a code review in an isolated in-process session with its own context window and a dedicated reviewer prompt. The reviewer has full tool access, so it reads the code around each hunk and can run tests to verify suspected bugs.
+`/review` captures the selected change as an exact Git snapshot, then runs candidate discovery and independent verification in separate isolated contexts. Host-owned paged tools read only that snapshot. Optional auxiliary tools selected with `/review tools` run in a disposable checkout; mutable workspace `read`/`grep`/`find`/`ls`/edit tools are never used by a review.
 
 ```
-/review                # open a target selector
-/review uncommitted    # review uncommitted changes (vs HEAD, plus untracked files)
-/review branch [base]  # review branch changes vs base (auto-detects main/master)
-/review pr [number]    # review a GitHub PR (requires gh; defaults to the current branch's PR)
-/review commit [sha]   # review a single commit (omit the sha to pick from recent commits)
+/review                                      # open a target selector
+/review uncommitted                          # staged, unstaged, deleted, and nonignored untracked files
+/review branch [base]                        # captured HEAD vs its merge base with base
+/review pr [number]                          # fetched GitHub base/head OIDs (requires gh)
+/review commit [sha]                         # commit vs first parent, or empty tree for a root commit
+/review branch main --focus "authorization" # add a focused question
+/review uncommitted --scope "src/**,test/**" # restrict changed paths
+/review branch main --effort high --full     # low|standard|high; incremental|full
+/review uncommitted --include-optional       # opt in to P3 suggestions
 ```
 
-When the review finishes, volt starts a **fresh session seeded only with the numbered findings**. Your next message runs with clean context, so you can say "fix 1 and 3" and the agent fixes those findings without the review transcript or your previous conversation consuming the context window.
+P0-P2 findings must have a changed-side anchor, concrete trigger and impact, and an independent verifier decision. P3 findings are disabled by default. Results are marked `incomplete` and have no correctness verdict when verification or in-scope hunk coverage is incomplete.
 
-Set the `reviewModel` setting (e.g. `"anthropic/claude-opus-4-5"`) to review with a different model than the active session; otherwise the current model is used.
+Review policy comes from user `REVIEW.md` in the Volt agent directory and hierarchical project `REVIEW.md`/`AGENTS.md` files read from the trusted base snapshot. Candidate changes cannot alter the active review policy.
+
+Completed, incomplete, failed, and cancelled runs plus explicit finding outcomes are stored as bounded host-only records on the current session branch. Opening a fix session copies the durable run and can select findings by ID; it does not consume the original result. Publishing is explicit, PR-only, and refused if the PR head moved.
+
+Set `reviewModel` to choose the discovery model. Set `reviewVerifierModel` to choose a separate verifier; it defaults to `reviewModel`, which defaults to the active session model. Example: `"anthropic/claude-opus-4-5"`.
 
 ## Subagents (MVP)
 

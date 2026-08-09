@@ -42,6 +42,7 @@ export interface ReviewWorkflowDescriptor {
 	status: ReviewWorkflowLifecycleStatus;
 	target: { description: string; diffCommand: string };
 	findingsCount?: number;
+	completionStatus?: ParsedReview["completionStatus"];
 	errorMessage?: string;
 	startedAt: number;
 	endedAt?: number;
@@ -66,7 +67,10 @@ export interface ReviewWorkflowExecuteHooks {
 }
 
 export interface ReviewWorkflowStartOptions {
-	prepared: Pick<PreparedReviewWorkflow, "workflowId" | "action" | "resolution">;
+	prepared: Pick<PreparedReviewWorkflow, "workflowId" | "action"> & {
+		resolution: Pick<PreparedReviewWorkflow["resolution"], "description" | "workflowDescription" | "diffCommand"> &
+			Partial<Pick<PreparedReviewWorkflow["resolution"], "dispose">>;
+	};
 	fastModeEnabled?: boolean;
 	execute: (hooks: ReviewWorkflowExecuteHooks) => Promise<ExecuteReviewWorkflowResult>;
 }
@@ -88,9 +92,16 @@ interface ActiveReviewWorkflow {
 	launched: boolean;
 	done: Promise<void>;
 	settle: () => void;
+	disposePending: () => Promise<void>;
 }
 
-function formatCompletedReviewSummary(findingsCount: number | undefined): string {
+function formatCompletedReviewSummary(
+	completionStatus: ParsedReview["completionStatus"],
+	findingsCount: number | undefined,
+): string {
+	if (completionStatus === "incomplete") {
+		return `Review incomplete${findingsCount ? `: ${findingsCount} verified finding${findingsCount === 1 ? "" : "s"}` : ""}.`;
+	}
 	if (findingsCount === undefined) {
 		return "Review complete.";
 	}
@@ -165,6 +176,7 @@ export class ReviewWorkflowManager {
 			launched: false,
 			done,
 			settle,
+			disposePending: () => options.prepared.resolution.dispose?.() ?? Promise.resolve(),
 		};
 		this.active.set(workflowId, entry);
 
@@ -208,18 +220,9 @@ export class ReviewWorkflowManager {
 		// the signal, so finish it here.
 		if (!entry.launched) {
 			entry.launched = true;
+			void entry.disposePending();
 			this.finish(entry, { status: "cancelled" });
 		}
-	}
-
-	/**
-	 * Drop a retained terminal result whose findings were acted on (seeded into
-	 * a session via `open_review_session`), so listings stop advertising the
-	 * review. Never touches running workflows; unknown ids (already consumed or
-	 * evicted) are a no-op.
-	 */
-	consume(workflowId: string): void {
-		this.results.delete(workflowId);
 	}
 
 	/** Terminal result record, or the live descriptor for a running workflow. */
@@ -240,6 +243,7 @@ export class ReviewWorkflowManager {
 			status: record.status,
 			target: { ...record.target },
 			...(record.findingsCount === undefined ? {} : { findingsCount: record.findingsCount }),
+			...(record.completionStatus === undefined ? {} : { completionStatus: record.completionStatus }),
 			...(record.errorMessage === undefined ? {} : { errorMessage: record.errorMessage }),
 			startedAt: record.startedAt,
 			...(record.endedAt === undefined ? {} : { endedAt: record.endedAt }),
@@ -257,6 +261,7 @@ export class ReviewWorkflowManager {
 			entry.abortController.abort();
 			if (!entry.launched) {
 				entry.launched = true;
+				void entry.disposePending();
 				this.finish(entry, { status: "cancelled" });
 			}
 		}
@@ -289,6 +294,7 @@ export class ReviewWorkflowManager {
 		let message: string;
 		if (result.status === "completed") {
 			descriptor.findingsCount = result.findingsCount;
+			descriptor.completionStatus = result.completionStatus;
 			record = {
 				...descriptor,
 				fastModeEnabled: entry.fastModeEnabled,
@@ -296,7 +302,7 @@ export class ReviewWorkflowManager {
 					? { raw: result.raw.slice(0, MAX_RETAINED_REVIEW_RAW_CHARS) }
 					: { parsed: result.parsed }),
 			};
-			message = `${formatCompletedReviewSummary(result.findingsCount)} Fetch the findings or open them in a review session.`;
+			message = `${formatCompletedReviewSummary(result.completionStatus, result.findingsCount)} Fetch the findings or open them in a review session.`;
 		} else if (result.status === "cancelled") {
 			message = "Review cancelled.";
 		} else {

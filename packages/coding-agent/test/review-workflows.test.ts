@@ -1,43 +1,99 @@
-import { describe, expect, test } from "vitest";
-import type { ExecuteReviewWorkflowResult } from "../src/core/review.ts";
+import { describe, expect, test, vi } from "vitest";
+import type { ExecuteReviewWorkflowResult, ParsedReview } from "../src/core/review.ts";
 import {
 	MAX_ACTIVE_REVIEW_WORKFLOWS,
-	MAX_RETAINED_REVIEW_RAW_CHARS,
 	MAX_RETAINED_REVIEW_RESULTS,
 	type ReviewWorkflowExecuteHooks,
 	ReviewWorkflowManager,
 } from "../src/core/review-workflows.ts";
 
-const resolution = {
-	description: "uncommitted changes",
-	diffCommand: "git diff HEAD",
-	diff: "diff",
-	truncated: false,
-};
-
-function prepared(workflowId: string) {
-	return { workflowId, action: "review.uncommitted", resolution };
+function parsed(findingsCount = 1, completionStatus: ParsedReview["completionStatus"] = "complete"): ParsedReview {
+	return {
+		completionStatus,
+		summary: findingsCount === 0 ? "No findings." : "One finding.",
+		findings:
+			findingsCount === 0
+				? []
+				: [
+						{
+							id: "finding-1",
+							fingerprint: "a".repeat(64),
+							status: "open",
+							title: "Finding",
+							body: "Body",
+							trigger: "Trigger",
+							impact: "Impact",
+							category: "correctness",
+							rootCauseKey: "root-cause",
+							priority: 2,
+							confidence: 0.9,
+							changeLocation: { path: "src/file.ts", side: "head", startLine: 1, endLine: 1 },
+							evidenceLocations: [],
+							verification: {
+								outcome: "accepted",
+								method: "Exact snapshot",
+								rationale: "Present",
+								confidence: 0.9,
+							},
+						},
+					],
+		coverage: {
+			changedFileInventoryComplete: true,
+			filesInspected: ["src/file.ts"],
+			hunksInspected: ["h1"],
+			commandsRun: [],
+			failedVerificationAttempts: [],
+			exclusions: [],
+			uncheckedAreas: [],
+			residualRisk: [],
+			modelReportedLimitations: [],
+		},
+		...(completionStatus === "complete"
+			? findingsCount === 0
+				? { overallCorrectness: "correct" as const }
+				: { overallCorrectness: "incorrect" as const }
+			: {}),
+		overallExplanation:
+			completionStatus === "incomplete"
+				? "Verification did not cover the complete change."
+				: findingsCount === 0
+					? "No verified findings."
+					: "One verified finding.",
+	};
 }
 
-function completed(overrides: Partial<Extract<ExecuteReviewWorkflowResult, { status: "completed" }>> = {}) {
+function completed(
+	findingsCount = 1,
+	completionStatus: ParsedReview["completionStatus"] = "complete",
+): ExecuteReviewWorkflowResult {
 	return {
-		status: "completed" as const,
-		raw: "raw reviewer output",
-		parsed: { findings: [{ title: "Finding", body: "Body" }] },
-		findingsCount: 1,
-		...overrides,
+		status: "completed",
+		raw: "summary",
+		parsed: parsed(findingsCount, completionStatus),
+		findingsCount,
+		completionStatus,
+	};
+}
+
+function prepared(workflowId: string, options: { workflowDescription?: string; dispose?: () => Promise<void> } = {}) {
+	return {
+		workflowId,
+		action: "review.uncommitted",
+		resolution: {
+			description: "uncommitted changes with private metadata",
+			...(options.workflowDescription ? { workflowDescription: options.workflowDescription } : {}),
+			diffCommand: "git diff exact-base..exact-head",
+			...(options.dispose ? { dispose: options.dispose } : {}),
+		},
 	};
 }
 
 describe("ReviewWorkflowManager", () => {
-	test("does not execute until launch, then reaches a terminal result with a workflow_end event", async () => {
-		const published: Array<Record<string, unknown>> = [];
-		const sunk: Array<Record<string, unknown>> = [];
-		const manager = new ReviewWorkflowManager({ publishEvent: (event) => published.push(event) });
-		manager.attachSink((event) => sunk.push(event));
-
+	test("waits for launch, then retains a bounded structured result and emits terminal events", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const manager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
 		let executed = false;
-		const { descriptor, launch } = manager.start({
+		const started = manager.start({
 			prepared: prepared("review:one"),
 			fastModeEnabled: true,
 			execute: async (hooks: ReviewWorkflowExecuteHooks) => {
@@ -48,247 +104,136 @@ describe("ReviewWorkflowManager", () => {
 					kind: "review",
 					action: "review.uncommitted",
 					title: "Review",
-					message: "Reviewing uncommitted changes.",
+					message: "Reviewing.",
 					status: "running",
 				});
 				return completed();
 			},
 		});
-		expect(descriptor).toMatchObject({ workflowId: "review:one", status: "running" });
 		expect(executed).toBe(false);
-		expect(manager.hasActiveWorkflows).toBe(true);
-
-		launch();
-		launch(); // idempotent
+		started.launch();
+		started.launch();
 		await manager.waitForIdle();
-
 		expect(executed).toBe(true);
-		expect(manager.hasActiveWorkflows).toBe(false);
-		const record = manager.get("review:one");
-		expect(record).toMatchObject({
-			workflowId: "review:one",
+		expect(manager.get("review:one")).toMatchObject({
 			status: "completed",
-			fastModeEnabled: true,
 			findingsCount: 1,
-			target: { description: "uncommitted changes", diffCommand: "git diff HEAD" },
+			parsed: { completionStatus: "complete" },
 		});
-		expect(record?.parsed?.findings).toEqual([{ title: "Finding", body: "Body" }]);
-		// Raw text is retained only when there is no parsed findings payload.
-		expect(record?.raw).toBeUndefined();
-		const end = published.at(-1);
-		expect(end).toMatchObject({ type: "workflow_end", workflowId: "review:one", status: "completed" });
-		expect(sunk.at(-1)).toEqual(end);
+		expect(events.at(-1)).toMatchObject({ type: "workflow_end", status: "completed" });
 	});
 
-	test("retains the sanitized workflow description instead of richer reviewer-only metadata", async () => {
-		const manager = new ReviewWorkflowManager();
-		const { descriptor, launch } = manager.start({
-			prepared: {
-				...prepared("review:pr"),
-				action: "review.pr",
-				resolution: {
-					...resolution,
-					description: "PR #42 (private title)",
-					workflowDescription: "PR #42",
-					diffCommand: "gh pr diff 42",
-				},
-			},
-			execute: async () => completed(),
-		});
-		expect(descriptor.target).toEqual({ description: "PR #42", diffCommand: "gh pr diff 42" });
-		launch();
-		await manager.waitForIdle();
-		expect(manager.get("review:pr")?.target.description).toBe("PR #42");
-	});
-
-	test("retains bounded raw text when the report had no parseable findings", async () => {
-		const manager = new ReviewWorkflowManager();
-		const { launch } = manager.start({
-			prepared: prepared("review:raw"),
-			execute: async () =>
-				completed({
-					parsed: undefined,
-					findingsCount: undefined,
-					raw: "x".repeat(MAX_RETAINED_REVIEW_RAW_CHARS + 100),
-				}),
-		});
-		launch();
-		await manager.waitForIdle();
-		const record = manager.get("review:raw");
-		expect(record?.parsed).toBeUndefined();
-		expect(record?.raw).toHaveLength(MAX_RETAINED_REVIEW_RAW_CHARS);
-	});
-
-	test("records failures, including executions that throw", async () => {
+	test("preserves incomplete status in detached records and terminal summaries", async () => {
 		const events: Array<Record<string, unknown>> = [];
 		const manager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
-		const { launch } = manager.start({
-			prepared: prepared("review:boom"),
-			execute: async () => {
-				throw new Error("provider exploded");
-			},
+		const started = manager.start({
+			prepared: prepared("review:incomplete"),
+			execute: async () => completed(0, "incomplete"),
 		});
-		launch();
+		started.launch();
 		await manager.waitForIdle();
-		expect(manager.get("review:boom")).toMatchObject({
-			status: "failed",
-			errorMessage: "provider exploded",
+		expect(manager.get("review:incomplete")).toMatchObject({
+			status: "completed",
+			completionStatus: "incomplete",
+			findingsCount: 0,
 		});
 		expect(events.at(-1)).toMatchObject({
 			type: "workflow_end",
-			workflowId: "review:boom",
-			status: "failed",
-			message: "Review failed: provider exploded",
+			status: "completed",
+			message: "Review incomplete. Fetch the findings or open them in a review session.",
 		});
 	});
 
-	test("cancel aborts a running execution and rejects unknown workflows", async () => {
+	test("retains only the sanitized workflow description", () => {
 		const manager = new ReviewWorkflowManager();
-		const { launch } = manager.start({
-			prepared: prepared("review:slow"),
-			execute: (hooks) =>
-				new Promise((resolve) => {
-					hooks.signal.addEventListener("abort", () => resolve({ status: "cancelled" }), { once: true });
-				}),
+		const { descriptor } = manager.start({
+			prepared: prepared("review:safe", { workflowDescription: "PR #7" }),
+			execute: async () => completed(),
 		});
-		launch();
-		manager.cancel("review:slow");
+		expect(descriptor.target.description).toBe("PR #7");
+		expect(JSON.stringify(descriptor)).not.toContain("private metadata");
+	});
+
+	test("records thrown failures", async () => {
+		const manager = new ReviewWorkflowManager();
+		const started = manager.start({
+			prepared: prepared("review:fail"),
+			execute: async () => {
+				throw new Error("provider unavailable");
+			},
+		});
+		started.launch();
 		await manager.waitForIdle();
-		expect(manager.get("review:slow")).toMatchObject({ status: "cancelled" });
-		expect(() => manager.cancel("review:slow")).toThrow("No running review workflow: review:slow");
-		expect(() => manager.cancel("review:none")).toThrow("No running review workflow: review:none");
+		expect(manager.get("review:fail")).toMatchObject({ status: "failed", errorMessage: "provider unavailable" });
 	});
 
-	test("a cancel result wins even when the execution finishes after the abort", async () => {
+	test("cancellation wins a race with a launched execution", async () => {
 		const manager = new ReviewWorkflowManager();
-		let releaseExecution: () => void = () => {};
+		let release: () => void = () => {};
 		const gate = new Promise<void>((resolve) => {
-			releaseExecution = resolve;
+			release = resolve;
 		});
-		const { launch } = manager.start({
-			prepared: prepared("review:race"),
+		const started = manager.start({
+			prepared: prepared("review:cancel"),
 			execute: async () => {
 				await gate;
 				return completed();
 			},
 		});
-		launch();
-		manager.cancel("review:race");
-		releaseExecution();
+		started.launch();
+		manager.cancel("review:cancel");
+		release();
 		await manager.waitForIdle();
-		expect(manager.get("review:race")).toMatchObject({ status: "cancelled" });
+		expect(manager.get("review:cancel")?.status).toBe("cancelled");
+		expect(() => manager.cancel("review:missing")).toThrow(/No running/);
 	});
 
-	test("consume drops a retained terminal result but never a running workflow", async () => {
+	test("cancelling an unlaunched workflow disposes its snapshot", async () => {
+		const dispose = vi.fn(async () => {});
 		const manager = new ReviewWorkflowManager();
-		const { launch } = manager.start({ prepared: prepared("review:done"), execute: async () => completed() });
-		launch();
+		manager.start({ prepared: prepared("review:pending", { dispose }), execute: async () => completed() });
+		manager.cancel("review:pending");
 		await manager.waitForIdle();
-		manager
-			.start({
-				prepared: prepared("review:running"),
-				execute: (hooks) =>
-					new Promise((resolve) => {
-						hooks.signal.addEventListener("abort", () => resolve({ status: "cancelled" }), { once: true });
-					}),
-			})
-			.launch();
-
-		manager.consume("review:done");
-		expect(manager.get("review:done")).toBeUndefined();
-		expect(manager.list().map((descriptor) => descriptor.workflowId)).toEqual(["review:running"]);
-
-		// Only the retained terminal ring is consumable: a running workflow
-		// stays active and cancellable.
-		manager.consume("review:running");
-		expect(manager.get("review:running")).toMatchObject({ status: "running" });
-		expect(manager.hasActiveWorkflows).toBe(true);
-
-		// Already-consumed and unknown ids are a no-op.
-		manager.consume("review:done");
-		manager.consume("review:none");
-
-		await manager.abortAll();
-		expect(manager.get("review:running")).toMatchObject({ status: "cancelled" });
+		expect(dispose).toHaveBeenCalledOnce();
+		expect(manager.get("review:pending")?.status).toBe("cancelled");
 	});
 
-	test("caps concurrent workflows and rejects duplicates", async () => {
+	test("caps concurrent workflows and evicts oldest transient results", async () => {
 		const manager = new ReviewWorkflowManager();
-		const launches: Array<() => void> = [];
-		for (let index = 0; index < MAX_ACTIVE_REVIEW_WORKFLOWS; index++) {
-			launches.push(
-				manager.start({
-					prepared: prepared(`review:cap-${index}`),
-					execute: (hooks) =>
-						new Promise((resolve) => {
-							hooks.signal.addEventListener("abort", () => resolve({ status: "cancelled" }), { once: true });
-						}),
-				}).launch,
-			);
-		}
+		const pending = Array.from({ length: MAX_ACTIVE_REVIEW_WORKFLOWS }, (_, index) =>
+			manager.start({ prepared: prepared(`review:active-${index}`), execute: async () => completed() }),
+		);
 		expect(() => manager.start({ prepared: prepared("review:overflow"), execute: async () => completed() })).toThrow(
-			"Too many running reviews",
+			/Too many/,
 		);
-
-		for (const launch of launches) {
-			launch();
-		}
-		await manager.abortAll();
-		expect(manager.hasActiveWorkflows).toBe(false);
-		expect(() => manager.start({ prepared: prepared("review:cap-0"), execute: async () => completed() })).toThrow(
-			"Review workflow already exists: review:cap-0",
-		);
-	});
-
-	test("evicts the oldest retained results beyond the retention bound", async () => {
-		const manager = new ReviewWorkflowManager();
-		for (let index = 0; index < MAX_RETAINED_REVIEW_RESULTS + 2; index++) {
-			const { launch } = manager.start({
-				prepared: prepared(`review:ring-${index}`),
-				execute: async () => completed(),
+		for (const workflow of pending) workflow.launch();
+		await manager.waitForIdle();
+		for (let index = 0; index <= MAX_RETAINED_REVIEW_RESULTS; index++) {
+			const workflow = manager.start({
+				prepared: prepared(`review:result-${index}`),
+				execute: async () => completed(0),
 			});
-			launch();
+			workflow.launch();
 			await manager.waitForIdle();
 		}
-		expect(manager.get("review:ring-0")).toBeUndefined();
-		expect(manager.get("review:ring-1")).toBeUndefined();
-		expect(manager.get(`review:ring-${MAX_RETAINED_REVIEW_RESULTS + 1}`)).toBeDefined();
-		expect(manager.list()).toHaveLength(MAX_RETAINED_REVIEW_RESULTS);
+		expect(manager.get("review:result-0")).toBeUndefined();
+		expect(manager.get(`review:result-${MAX_RETAINED_REVIEW_RESULTS}`)?.status).toBe("completed");
 	});
 
-	test("abortAll cancels registered-but-unlaunched workflows", async () => {
-		const events: Array<Record<string, unknown>> = [];
-		const manager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
-		manager.start({
-			prepared: prepared("review:pending"),
-			execute: async () => completed(),
-		});
-		await manager.abortAll();
-		expect(manager.get("review:pending")).toMatchObject({ status: "cancelled" });
-		expect(events.at(-1)).toMatchObject({
-			type: "workflow_end",
-			workflowId: "review:pending",
-			status: "cancelled",
-		});
-	});
-
-	test("sink and publish failures do not break the workflow or other sinks", async () => {
-		const seen: string[] = [];
+	test("observer failures do not break other sinks", async () => {
+		const received: string[] = [];
 		const manager = new ReviewWorkflowManager({
 			publishEvent: () => {
-				throw new Error("feed disposed");
+				throw new Error("closed");
 			},
 		});
 		manager.attachSink(() => {
-			throw new Error("bad observer");
+			throw new Error("disposed");
 		});
-		manager.attachSink((event) => {
-			seen.push(event.type);
-		});
-		const { launch } = manager.start({ prepared: prepared("review:sink"), execute: async () => completed() });
-		launch();
+		manager.attachSink((event) => received.push(event.type));
+		const started = manager.start({ prepared: prepared("review:sinks"), execute: async () => completed() });
+		started.launch();
 		await manager.waitForIdle();
-		expect(manager.get("review:sink")).toMatchObject({ status: "completed" });
-		expect(seen).toContain("workflow_end");
+		expect(received).toEqual(["workflow_end"]);
 	});
 });
