@@ -452,16 +452,6 @@ function summarizeStats(stats: SessionStats | undefined): SubagentToolUsageDetai
 	};
 }
 
-function getStatus(message: AssistantMessage | undefined): SubagentToolStatus {
-	if (message?.stopReason === "aborted") {
-		return "aborted";
-	}
-	if (message?.stopReason === "error") {
-		return "failed";
-	}
-	return "completed";
-}
-
 function getErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -2604,9 +2594,7 @@ export function createSubagentToolDefinition(
 							throw new Error("Operation aborted");
 						}
 						const assistantMessage = getLastAssistantMessage(result);
-						const status = getStatus(assistantMessage);
-						const errorMessage = status === "completed" ? undefined : assistantMessage?.errorMessage;
-						const rawOutput = getAssistantText(assistantMessage) || errorMessage || "(no output)";
+						const rawOutput = getAssistantText(assistantMessage) || result.error || "(no output)";
 						const output = truncateModelVisibleOutput(rawOutput, maxOutputBytes);
 						// The child already completed: an internal abort landing here must
 						// not discard its result, so stats become best-effort.
@@ -2624,12 +2612,12 @@ export function createSubagentToolDefinition(
 								definition,
 								agentName: task.agent,
 								handle,
-								status,
+								status: result.status,
 								startedAt: taskStartedAt,
 								stats,
 								output,
 								maxOutputBytes,
-								errorMessage,
+								errorMessage: result.error,
 								live,
 							}),
 						};

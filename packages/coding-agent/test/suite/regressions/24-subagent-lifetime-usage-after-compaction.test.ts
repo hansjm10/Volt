@@ -106,6 +106,7 @@ describe("issue #24", () => {
 					id: "sa_issue_24",
 					sessionId: harness.session.sessionId,
 					event: { type: "agent_end", messages: [final], willRetry: false },
+					status: "completed",
 				}),
 				dispose: async () => undefined,
 				onEvent: () => () => undefined,
