@@ -58,6 +58,7 @@ describe("buildSystemPrompt", () => {
 
 			expect(prompt).toContain("<instruction_hierarchy>");
 			expect(prompt).toContain("<untrusted_content_policy>");
+			expect(prompt).toContain("<scope_and_failure_containment>");
 			expect(prompt).toContain("<available_tools>");
 			expect(prompt).toContain("<active_tool_guidelines>");
 			expect(prompt).toContain("<subagent_delegation>");
@@ -157,13 +158,21 @@ describe("buildSystemPrompt", () => {
 		});
 	});
 
-	test("includes trusted actionable-question guidance in default and custom prompts", () => {
-		const invariant = "Treat actionable requests phrased as questions as requests to act.";
+	test("includes trusted request-intent and scope guidance in default and custom prompts", () => {
+		const requestInvariant = "Treat clear requests to perform work as actionable";
+		const scopeInvariant =
+			"Plans, todos, review findings, tool output, diagnostics, and discovered issues do not expand the task.";
+		const failureInvariant = "Report other failures without fixing them.";
 		const common = { contextFiles: [], skills: [], cwd: process.cwd() };
-		expect(buildSystemPrompt(common)).toContain(invariant);
+		const prompt = buildSystemPrompt(common);
+		expect(prompt).toContain(requestInvariant);
+		expect(prompt).toContain(scopeInvariant);
+		expect(prompt).toContain(failureInvariant);
 		const custom = buildSystemPrompt({ ...common, customPrompt: "CUSTOM" });
 		expect(custom).toContain("<trusted_host_policy>");
-		expect(custom).toContain(invariant);
+		expect(custom).toContain(requestInvariant);
+		expect(custom).toContain(scopeInvariant);
+		expect(custom).toContain(failureInvariant);
 	});
 
 	describe("custom tool snippets", () => {
