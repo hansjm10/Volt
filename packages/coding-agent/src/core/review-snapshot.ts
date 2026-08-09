@@ -1,9 +1,9 @@
 import { Buffer } from "node:buffer";
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { spawnProcess } from "../utils/child-process.ts";
 
 export type ReviewTarget =
 	| { kind: "uncommitted" }
@@ -246,7 +246,7 @@ function runCommand(
 	return new Promise((resolveResult) => {
 		const maxStdoutBytes = options.maxStdoutBytes ?? DEFAULT_REVIEW_SNAPSHOT_LIMITS.maxMetadataBytes;
 		const maxStderrBytes = options.maxStderrBytes ?? DEFAULT_REVIEW_SNAPSHOT_LIMITS.maxStderrBytes;
-		const proc = spawn(command, args, {
+		const proc = spawnProcess(command, args, {
 			cwd,
 			stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 			env: options.env ? { ...process.env, ...options.env } : process.env,
@@ -524,6 +524,11 @@ async function seedTemporaryIndex(
 	try {
 		await rm(temporaryIndex, { force: true });
 		await copyFile(originalIndex, temporaryIndex);
+		// A copied index receives a fresh filesystem timestamp while retaining
+		// cached entry timestamps. Backdate it so Git treats every tracked entry
+		// as potentially racily clean and re-hashes same-size worktree rewrites.
+		// Use the earliest nonzero timestamp because Git treats zero as unset.
+		await utimes(temporaryIndex, 1, 1);
 		return undefined;
 	} catch (error) {
 		const code =

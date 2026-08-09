@@ -18,6 +18,37 @@ function git(cwd: string, ...args: string[]): string {
 	return run(cwd, "git", ...args);
 }
 
+function installNodeCommandShim(directory: string, command: string, source: string): void {
+	const fixture = join(directory, `fake-${command}.mjs`);
+	writeFileSync(fixture, source);
+	if (process.platform === "win32") {
+		writeFileSync(
+			join(directory, `${command}.cmd`),
+			`@echo off\r\n"${process.execPath}" "${fixture}" %*\r\nexit /b %errorlevel%\r\n`,
+		);
+		return;
+	}
+	const executable = join(directory, command);
+	writeFileSync(executable, `#!/bin/sh\nexec "${process.execPath}" "${fixture}" "$@"\n`);
+	chmodSync(executable, 0o755);
+}
+
+function createSymlinkFixture(repository: string, path: string, target: string): void {
+	try {
+		symlinkSync(target, join(repository, path));
+		return;
+	} catch (error) {
+		const code =
+			typeof error === "object" && error !== null && "code" in error
+				? (error as { code?: unknown }).code
+				: undefined;
+		if (process.platform !== "win32" || code !== "EPERM") throw error;
+	}
+	writeFileSync(join(repository, path), target);
+	const oid = git(repository, "hash-object", "-w", "--", path);
+	git(repository, "update-index", "--add", "--cacheinfo", `120000,${oid},${path}`);
+}
+
 describe("review snapshots", () => {
 	const tempDirectories: string[] = [];
 	const snapshots: ReviewSnapshot[] = [];
@@ -80,7 +111,9 @@ describe("review snapshots", () => {
 		writeFileSync(join(repository, "untracked.txt"), "untracked\n");
 		writeFileSync(join(repository, "binary.dat"), Buffer.from([0, 1, 2, 3]));
 		writeFileSync(join(repository, "script.sh"), "#!/bin/sh\necho ok\n", { mode: 0o755 });
-		symlinkSync("tracked.txt", join(repository, "link.txt"));
+		git(repository, "add", "script.sh");
+		git(repository, "update-index", "--chmod=+x", "--", "script.sh");
+		createSymlinkFixture(repository, "link.txt", "tracked.txt");
 		rmSync(join(repository, "deleted.txt"));
 
 		const snapshot = await resolve({ kind: "uncommitted" }, repository);
@@ -108,8 +141,8 @@ describe("review snapshots", () => {
 		expect(snapshot.identity.headTree).toBe(originalTree);
 
 		const checkout = await snapshot.materializeHead();
-		expect(readFileSync(join(checkout, "tracked.txt"), "utf8")).toBe("after\n");
-		expect(readFileSync(join(checkout, "untracked.txt"), "utf8")).toBe("untracked\n");
+		expect(readFileSync(join(checkout, "tracked.txt"), "utf8").replaceAll("\r\n", "\n")).toBe("after\n");
+		expect(readFileSync(join(checkout, "untracked.txt"), "utf8").replaceAll("\r\n", "\n")).toBe("untracked\n");
 	});
 
 	it("preserves ignored tracked files in uncommitted snapshots", async () => {
@@ -381,12 +414,16 @@ describe("review snapshots", () => {
 
 		const bin = join(repository, "bin");
 		mkdirSync(bin);
-		const gh = join(bin, "gh");
+		const ghOutput = join(bin, "gh-output.json");
 		writeFileSync(
-			gh,
-			`#!/bin/sh\nprintf '%s\\n' '${JSON.stringify({ number: 7, title: "Snapshot", body: "Body", baseRefName: "main", headRefName: "feature", url: "https://example.test/pr/7", baseRefOid: baseOid, headRefOid: headOid })}'\n`,
+			ghOutput,
+			`${JSON.stringify({ number: 7, title: "Snapshot", body: "Body", baseRefName: "main", headRefName: "feature", url: "https://example.test/pr/7", baseRefOid: baseOid, headRefOid: headOid })}\n`,
 		);
-		chmodSync(gh, 0o755);
+		installNodeCommandShim(
+			bin,
+			"gh",
+			`import { readFileSync } from "node:fs";\nprocess.stdout.write(readFileSync(${JSON.stringify(ghOutput)}, "utf8"));\n`,
+		);
 		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
 
 		const snapshot = await resolve({ kind: "pr", number: "7" }, repository);
@@ -398,7 +435,7 @@ describe("review snapshots", () => {
 				.join("\n"),
 		).toContain("+pull request");
 
-		writeFileSync(gh, readFileSync(gh, "utf8").replace(headOid, baseOid));
+		writeFileSync(ghOutput, readFileSync(ghOutput, "utf8").replace(headOid, baseOid));
 		const moved = await resolveReviewSnapshot({ kind: "pr", number: "7" }, repository, OPTIONS);
 		expect(moved).toMatchObject({ error: "The pull request moved while Volt captured it. Retry the review." });
 	});
@@ -419,15 +456,18 @@ describe("review snapshots", () => {
 
 	it("fails closed when uncommitted state changes throughout capture", async () => {
 		const repository = createRepository();
-		const realGit = run(repository, "which", "git");
+		const realGit =
+			process.platform === "win32"
+				? run(repository, "where.exe", "git").split(/\r?\n/u)[0]
+				: run(repository, "which", "git");
+		if (!realGit) throw new Error("Unable to locate git executable");
 		const bin = join(repository, "unstable-bin");
 		mkdirSync(bin);
-		const wrapper = join(bin, "git");
-		writeFileSync(
-			wrapper,
-			`#!/bin/sh\nif [ "$1" = "status" ]; then printf 'change\\n' >> '${join(repository, "unstable.txt")}'; fi\nexec '${realGit}' "$@"\n`,
+		installNodeCommandShim(
+			bin,
+			"git",
+			`import { appendFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nif (args[0] === "status") appendFileSync(${JSON.stringify(join(repository, "unstable.txt"))}, "change\\n");\nconst result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: "inherit" });\nif (result.error) throw result.error;\nprocess.exitCode = result.status ?? 1;\n`,
 		);
-		chmodSync(wrapper, 0o755);
 		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
 
 		const result = await resolveReviewSnapshot({ kind: "uncommitted" }, repository, OPTIONS);
