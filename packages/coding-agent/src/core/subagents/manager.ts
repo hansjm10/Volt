@@ -80,6 +80,8 @@ export interface SubagentResult {
 	id: string;
 	sessionId: string;
 	event: SubagentEndEvent;
+	status: Exclude<SubagentActivityStatus, "running">;
+	error?: string;
 }
 
 export interface SubagentHandle {
@@ -349,13 +351,10 @@ function getFinalAssistantText(event: SubagentEndEvent): string | undefined {
 	return undefined;
 }
 
-function getTerminalActivityResult(
+function resolveTerminalResult(
 	event: SubagentEndEvent,
 	abortRequested: boolean,
-): {
-	status: Extract<SubagentActivityStatus, "completed" | "failed" | "aborted">;
-	error?: string;
-} {
+): Pick<SubagentResult, "status" | "error"> {
 	if (abortRequested) {
 		return { status: "aborted" };
 	}
@@ -532,6 +531,7 @@ class LocalSubagentHandle implements SubagentHandle {
 	private readonly onPromptAccepted: (message: string) => void;
 	private readonly onPromptFailed: (error: unknown) => Promise<void>;
 	private readonly onAbortRequested: () => void;
+	private readonly resolveTerminalResult: (event: SubagentEndEvent) => Pick<SubagentResult, "status" | "error">;
 	private readonly onTerminal: () => void;
 	private readonly onDispose: () => Promise<void>;
 	private waitForIdle: (() => Promise<void>) | undefined;
@@ -559,6 +559,7 @@ class LocalSubagentHandle implements SubagentHandle {
 		onPromptAccepted: (message: string) => void;
 		onPromptFailed: (error: unknown) => Promise<void>;
 		onAbortRequested: () => void;
+		resolveTerminalResult: (event: SubagentEndEvent) => Pick<SubagentResult, "status" | "error">;
 		onTerminal: () => void;
 		onDispose: () => Promise<void>;
 		waitForIdle: () => Promise<void>;
@@ -571,6 +572,7 @@ class LocalSubagentHandle implements SubagentHandle {
 		this.onPromptAccepted = options.onPromptAccepted;
 		this.onPromptFailed = options.onPromptFailed;
 		this.onAbortRequested = options.onAbortRequested;
+		this.resolveTerminalResult = options.resolveTerminalResult;
 		this.onTerminal = options.onTerminal;
 		this.onDispose = options.onDispose;
 		this.waitForIdle = options.waitForIdle;
@@ -744,7 +746,8 @@ class LocalSubagentHandle implements SubagentHandle {
 		this.endSettled = true;
 		this.settleOwnership();
 		const event = latestEndEvent.willRetry ? { ...latestEndEvent, willRetry: false } : latestEndEvent;
-		this.resolveEnd({ id: this.id, sessionId: this.sessionId, event });
+		const terminal = this.resolveTerminalResult(event);
+		this.resolveEnd({ id: this.id, sessionId: this.sessionId, event, ...terminal });
 	}
 
 	private assertOpen(): void {
@@ -1579,6 +1582,8 @@ export class SubagentManager {
 					await rollbackRuntimeRegistration();
 				},
 				onAbortRequested: () => this.markActivityAbortRequested(id),
+				resolveTerminalResult: (event) =>
+					resolveTerminalResult(event, this.activities.get(id)?.abortRequested === true),
 				// Turn-budget wiring outlives the first terminal: scope accounting on
 				// a disposed scope is a guarded no-op, while the per-runtime turn
 				// posture keeps applying to re-prompts until the runtime is disposed.
@@ -1601,15 +1606,11 @@ export class SubagentManager {
 			this.handles.set(id, handle);
 			void handle.waitForEnd().then(
 				(result) => {
-					const terminal = getTerminalActivityResult(
-						result.event,
-						this.activities.get(id)?.abortRequested === true,
-					);
-					this.finishActivity(id, terminal.status, terminal.error);
+					this.finishActivity(id, result.status, result.error);
 					const output = getFinalAssistantText(result.event);
-					this.getRegistry().complete(id, terminal.status, {
+					this.getRegistry().complete(id, result.status, {
 						...(output !== undefined ? { output } : {}),
-						...(terminal.error !== undefined ? { error: terminal.error } : {}),
+						...(result.error !== undefined ? { error: result.error } : {}),
 					});
 				},
 				(error: unknown) => {

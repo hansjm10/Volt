@@ -198,15 +198,23 @@ function createSubagentResult(options: {
 	text: string;
 	stopReason?: "error" | "aborted";
 	errorMessage?: string;
+	status?: SubagentResult["status"];
+	error?: string;
 }): SubagentResult {
 	const message = fauxAssistantMessage(options.text, {
 		...(options.stopReason ? { stopReason: options.stopReason } : {}),
 		...(options.errorMessage ? { errorMessage: options.errorMessage } : {}),
 	}) as AgentMessage;
+	const status =
+		options.status ??
+		(options.stopReason === "error" ? "failed" : options.stopReason === "aborted" ? "aborted" : "completed");
+	const error = options.error ?? (status === "failed" ? options.errorMessage : undefined);
 	return {
 		id: options.id,
 		sessionId: options.sessionId,
 		event: { type: "agent_end", messages: [message], willRetry: false },
+		status,
+		...(error !== undefined ? { error } : {}),
 	};
 }
 
@@ -950,6 +958,14 @@ describe("subagent tool", () => {
 			fits: true,
 			constraints: [],
 		});
+		expect(manager.listActivities()).toEqual([
+			expect.objectContaining({ id: result.details.subagentId, status: "completed" }),
+		]);
+		expect(manager.listActivities()[0]?.error).toBeUndefined();
+		expect(manager.listDelegations()).toEqual([
+			expect.objectContaining({ id: result.details.subagentId, status: "completed" }),
+		]);
+		expect(manager.listDelegations()[0]?.error).toBeUndefined();
 	});
 
 	it("keeps a post-admission child failure distinct from admission rejection", async () => {
@@ -976,9 +992,87 @@ describe("subagent tool", () => {
 			childSessions: [{ status: "failed" }],
 		});
 		expect(result.details.capacity?.phase).not.toBe("admission-rejected");
-		expect(manager.listDelegations()).toEqual([
-			expect.objectContaining({ id: result.details.subagentId, status: "failed" }),
+		expect(manager.listActivities()).toEqual([
+			expect.objectContaining({
+				id: result.details.subagentId,
+				status: "failed",
+				error: "provider child failed",
+			}),
 		]);
+		expect(manager.listDelegations()).toEqual([
+			expect.objectContaining({
+				id: result.details.subagentId,
+				status: "failed",
+				error: "provider child failed",
+			}),
+		]);
+	});
+
+	it("reports an externally aborted retry consistently despite a retained assistant error", async () => {
+		const retryStarted = createDeferred<void>();
+		const childAgentEnds: SubagentEndEvent[] = [];
+		let childHandle: SubagentHandle | undefined;
+		const manager = await createRealManager({
+			definitions: [createDefinition("scout", { source: "project" })],
+			responses: [fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" })],
+			settings: {
+				compaction: { enabled: false },
+				retry: { enabled: true, maxRetries: 1, baseDelayMs: 60_000 },
+			},
+			onRuntimeCreated: (event) => {
+				event.runtime.session.subscribe((sessionEvent) => {
+					if (sessionEvent.type === "auto_retry_start") {
+						retryStarted.resolve(undefined);
+					}
+				});
+			},
+		});
+		const startByName = manager.startByName.bind(manager);
+		vi.spyOn(manager, "startByName").mockImplementation(async (agentName, startOptions) => {
+			const started = await startByName(agentName, startOptions);
+			started.onEvent((event) => {
+				if (event.type === "agent_end") childAgentEnds.push(event);
+			});
+			childHandle = started;
+			return started;
+		});
+		const tool = createSubagentTool(process.cwd(), { manager, getAllowedTools: () => [] });
+		const preflight = await tool.execute("aborted-retry-preflight", {
+			agent: "scout",
+			task: "abort during retry",
+		});
+		const execution = tool.execute("aborted-retry-confirm", {
+			agent: "scout",
+			task: "abort during retry",
+			confirm: confirmationTokenFromResult(preflight),
+		});
+		await retryStarted.promise;
+		const runningHandle = childHandle;
+		if (!runningHandle) throw new Error("expected the child handle");
+
+		await runningHandle.abort("remote_request");
+		const result = await execution;
+
+		expect(textFromResult(result)).toBe("(no output)");
+		expect(result.details).toMatchObject({
+			mode: "single",
+			status: "aborted",
+			subagentId: runningHandle.id,
+			output: { text: "(no output)" },
+			childSessions: [{ status: "aborted" }],
+		});
+		expect(result.details.error).toBeUndefined();
+		const activity = manager.listActivities().find((candidate) => candidate.id === runningHandle.id);
+		expect(activity).toMatchObject({ status: "aborted", abortRequested: true });
+		expect(activity?.error).toBeUndefined();
+		expect(childAgentEnds.at(-1)?.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorMessage: "overloaded_error",
+		});
+		const registryRecord = manager.listDelegations().find((candidate) => candidate.id === runningHandle.id);
+		expect(registryRecord).toMatchObject({ status: "aborted" });
+		expect(registryRecord?.error).toBeUndefined();
 	});
 
 	it("refunds unused chain admission after an early child failure", async () => {
@@ -2783,6 +2877,8 @@ describe("subagent tool", () => {
 			id: "sa_failed",
 			sessionId: "session_failed",
 			event: { type: "agent_end", messages: [message], willRetry: false },
+			status: "failed",
+			error: "child failed",
 		} satisfies SubagentResult;
 		const handle: SubagentHandle = {
 			id: result.id,

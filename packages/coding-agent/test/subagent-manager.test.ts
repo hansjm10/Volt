@@ -729,6 +729,8 @@ describe("SubagentManager", () => {
 		await handle.abort();
 		const result = await completion;
 
+		expect(result).toMatchObject({ status: "aborted" });
+		expect(result.error).toBeUndefined();
 		expect(result.event.willRetry).toBe(false);
 		expect(result.event.messages.at(-1)).toMatchObject({
 			role: "assistant",
