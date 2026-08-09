@@ -64,6 +64,8 @@ Profiles do not isolate auth or sessions yet. `sessionDir` and reserved profile 
 |---------|------|---------|-------------|
 | `personality` | string | `"default"` | Communication style for Volt's built-in system prompt: `"default"` for a collaborative, adaptive voice or `"pragmatic"` for direct recommendations focused on simple, maintainable solutions. Ignored when a custom `SYSTEM.md` replaces the built-in prompt |
 
+In interactive mode, run `/settings` and change **Personality**. The selection applies to the next turn.
+
 ```json
 {
   "personality": "pragmatic"

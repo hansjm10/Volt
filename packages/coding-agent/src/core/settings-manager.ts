@@ -1172,6 +1172,12 @@ export class SettingsManager {
 		return this.settings.personality === "pragmatic" ? "pragmatic" : "default";
 	}
 
+	setPersonality(personality: Personality): void {
+		this.updateGlobalSettings("personality", (settings) => {
+			settings.personality = personality;
+		});
+	}
+
 	setDefaultProvider(provider: string): void {
 		this.updateGlobalSettings("defaultProvider", (settings) => {
 			settings.defaultProvider = provider;

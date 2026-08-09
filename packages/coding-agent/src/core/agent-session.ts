@@ -126,6 +126,7 @@ import {
 	resolverCanProvideResearchEvidence,
 	type ToolOperationResolver,
 } from "./operation-authorization.ts";
+import type { Personality } from "./personality.ts";
 import {
 	type AgentMode,
 	assertPlanRevision,
@@ -5033,6 +5034,14 @@ export class AgentSession {
 		this.agent.transport = this.settingsManager.getTransport();
 		this.agent.thinkingBudgets = this.settingsManager.getThinkingBudgets();
 		this.agent.maxRetryDelayMs = this.settingsManager.getProviderRetrySettings().maxRetryDelayMs;
+	}
+
+	/** Set the built-in prompt personality and apply it to future turns. */
+	setPersonality(personality: Personality): void {
+		this._assertConversationAuthorityAvailable();
+		this.settingsManager.setPersonality(personality);
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this._applyTrustedPlanningInstructionsToSystemPrompt();
 	}
 
 	/**
