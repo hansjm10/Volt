@@ -1,5 +1,5 @@
 import { MODELS } from "./models.generated.ts";
-import type { Api, KnownProvider, Model, ModelThinkingLevel, Usage } from "./types.ts";
+import type { Api, KnownProvider, Model, ModelCostRates, ModelThinkingLevel, Usage } from "./types.ts";
 
 const modelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
 
@@ -37,13 +37,23 @@ export function getModels<TProvider extends KnownProvider>(
 }
 
 export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage): Usage["cost"] {
+	const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+	let rates: ModelCostRates = model.cost;
+	let matchedThreshold = -1;
+	for (const tier of model.cost.tiers ?? []) {
+		if (inputTokens > tier.inputTokensAbove && tier.inputTokensAbove > matchedThreshold) {
+			rates = tier;
+			matchedThreshold = tier.inputTokensAbove;
+		}
+	}
+
 	// Anthropic charges 2x base input for 1h cache writes.
 	const longWrite = usage.cacheWrite1h ?? 0;
 	const shortWrite = usage.cacheWrite - longWrite;
-	usage.cost.input = (model.cost.input / 1000000) * usage.input;
-	usage.cost.output = (model.cost.output / 1000000) * usage.output;
-	usage.cost.cacheRead = (model.cost.cacheRead / 1000000) * usage.cacheRead;
-	usage.cost.cacheWrite = (model.cost.cacheWrite * shortWrite + model.cost.input * 2 * longWrite) / 1000000;
+	usage.cost.input = (rates.input / 1000000) * usage.input;
+	usage.cost.output = (rates.output / 1000000) * usage.output;
+	usage.cost.cacheRead = (rates.cacheRead / 1000000) * usage.cacheRead;
+	usage.cost.cacheWrite = (rates.cacheWrite * shortWrite + rates.input * 2 * longWrite) / 1000000;
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
 	return usage.cost;
 }

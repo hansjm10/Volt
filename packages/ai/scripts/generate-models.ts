@@ -86,6 +86,38 @@ const GPT_5_6_MODELS = [
 	},
 ] as const;
 const GPT_5_6_MODEL_IDS = new Set<string>(["gpt-5.6", ...GPT_5_6_MODELS.map((model) => model.id)]);
+const OPENAI_LONG_CONTEXT_INPUT_THRESHOLD = 272000;
+const OPENAI_SHORT_CONTEXT_CAPPED_MODEL_IDS = new Set([
+	"gpt-5.4",
+	"gpt-5.5",
+	"gpt-5.6-sol",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna",
+]);
+const OPENAI_LONG_CONTEXT_PRICING_MODEL_IDS = new Set([
+	"gpt-5.4",
+	"gpt-5.4-pro",
+	"gpt-5.5",
+	"gpt-5.5-pro",
+	"gpt-5.6-sol",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna",
+]);
+
+function withOpenAiLongContextPricing(cost: Model<Api>["cost"]): Model<Api>["cost"] {
+	return {
+		...cost,
+		tiers: [
+			{
+				inputTokensAbove: OPENAI_LONG_CONTEXT_INPUT_THRESHOLD,
+				input: cost.input * 2,
+				output: cost.output * 1.5,
+				cacheRead: cost.cacheRead * 2,
+				cacheWrite: cost.cacheWrite * 2,
+			},
+		],
+	};
+}
 
 const MOONSHOT_CN_MIRRORED_MODEL_IDS = new Set(["kimi-k2.7-code", "kimi-k2.7-code-highspeed"]);
 
@@ -280,6 +312,8 @@ function isAnthropicAdaptiveThinkingModel(modelId: string): boolean {
 		modelId.includes("opus-4.8") ||
 		modelId.includes("sonnet-4-6") ||
 		modelId.includes("sonnet-4.6") ||
+		modelId.includes("sonnet-5") ||
+		modelId.includes("sonnet.5") ||
 		modelId.includes("fable-5")
 	);
 }
@@ -350,11 +384,8 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
 	}
-	if (
-		(model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
-		model.id.includes("fable-5")
-	) {
-		mergeThinkingLevelMap(model, { off: null, xhigh: "xhigh" });
+	if (model.id.includes("fable-5")) {
+		mergeThinkingLevelMap(model, { off: null, xhigh: "xhigh", max: "max" });
 	}
 	if (model.api === "anthropic-messages" && isAnthropicAdaptiveThinkingModel(model.id)) {
 		mergeAnthropicMessagesCompat(model, { forceAdaptiveThinking: true });
@@ -379,7 +410,7 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (isGoogleThinkingApi(model) && isGemma4Model(model.id)) {
 		mergeThinkingLevelMap(model, { off: null, minimal: "MINIMAL", low: null, medium: null, high: "HIGH" });
 	}
-	if (model.provider === "groq" && model.id === "qwen/qwen3-32b") {
+	if (model.provider === "groq" && model.id === "qwen/qwen3.6-27b") {
 		mergeThinkingLevelMap(model, { minimal: null, low: null, medium: null, high: "default" });
 	}
 	if (model.provider === "openai-codex" && supportsOpenAiXhigh(model.id)) {
@@ -1161,6 +1192,8 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 				}
 
 				if (variant.provider === "opencode" && modelId === "grok-build-0.1") {
+					api = "openai-completions";
+					baseUrl = `${variant.basePath}/v1`;
 					compat = { ...(compat ?? {}), supportsReasoningEffort: false };
 				}
 
@@ -1510,9 +1543,14 @@ async function generateModels() {
 			candidate.contextWindow = 272000;
 			candidate.maxTokens = 128000;
 		}
-		if (candidate.provider === "openai" && (candidate.id === "gpt-5.4" || candidate.id === "gpt-5.5")) {
-			candidate.contextWindow = 272000;
+		// Keep direct OpenAI requests in the short-context pricing tier by default. Users can opt into the
+		// larger context through model overrides, so retain long-context cost metadata on the capped models.
+		if (candidate.provider === "openai" && OPENAI_SHORT_CONTEXT_CAPPED_MODEL_IDS.has(candidate.id)) {
+			candidate.contextWindow = OPENAI_LONG_CONTEXT_INPUT_THRESHOLD;
 			candidate.maxTokens = 128000;
+		}
+		if (candidate.provider === "openai" && OPENAI_LONG_CONTEXT_PRICING_MODEL_IDS.has(candidate.id)) {
+			candidate.cost = withOpenAiLongContextPricing(candidate.cost);
 		}
 		// models.dev reports gpt-5-pro output as 272000 (a duplicate of the input sub-limit);
 		// the actual max output is 128000. Also propagates to the derived Azure clone.
@@ -1772,12 +1810,12 @@ async function generateModels() {
 			provider: "openai",
 			reasoning: true,
 			input: ["text", "image"],
-			cost: {
+			cost: withOpenAiLongContextPricing({
 				input: 2.5,
 				output: 15,
 				cacheRead: 0.25,
 				cacheWrite: 0,
-			},
+			}),
 			contextWindow: 272000,
 			maxTokens: 128000,
 		});
@@ -1793,7 +1831,7 @@ async function generateModels() {
 				provider: "openai",
 				reasoning: true,
 				input: ["text", "image"],
-				cost: { ...model.cost },
+				cost: withOpenAiLongContextPricing({ ...model.cost }),
 				contextWindow: 272000,
 				maxTokens: 128000,
 			});
@@ -1923,9 +1961,10 @@ async function generateModels() {
 
 	// OpenAI Codex (ChatGPT OAuth) models
 	// NOTE: These are not fetched from models.dev; we keep a small, explicit list to avoid aliases.
-	// Context window is based on observed server limits (400s above ~272k), not marketing numbers.
+	// Older model limits are based on observed server behavior; GPT-5.6 follows Codex's 372k catalog limit.
 	const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 	const CODEX_CONTEXT = 272000;
+	const CODEX_GPT_56_CONTEXT = 372000;
 	const CODEX_SPARK_CONTEXT = 128000;
 	const CODEX_MAX_TOKENS = 128000;
 	const codexModels: Model<"openai-codex-responses">[] = [
@@ -1949,7 +1988,7 @@ async function generateModels() {
 			baseUrl: CODEX_BASE_URL,
 			reasoning: true,
 			input: ["text", "image"],
-			cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+			cost: withOpenAiLongContextPricing({ input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 }),
 			contextWindow: CODEX_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		},
@@ -1973,7 +2012,7 @@ async function generateModels() {
 			baseUrl: CODEX_BASE_URL,
 			reasoning: true,
 			input: ["text", "image"],
-			cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
+			cost: withOpenAiLongContextPricing({ input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 }),
 			contextWindow: CODEX_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		},
@@ -1987,8 +2026,8 @@ async function generateModels() {
 			baseUrl: CODEX_BASE_URL,
 			reasoning: true,
 			input: ["text", "image"],
-			cost: { ...model.cost },
-			contextWindow: CODEX_CONTEXT,
+			cost: withOpenAiLongContextPricing({ ...model.cost }),
+			contextWindow: CODEX_GPT_56_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		});
 	}
@@ -2088,11 +2127,14 @@ async function generateModels() {
 		});
 	}
 
-	// Azure Foundry deploys these with larger context windows than OpenAI's own API,
-	// which caps gpt-5.4/gpt-5.5 at 272k. See models-sold-directly-by-azure docs.
+	// Azure Foundry deploys these with larger context windows than OpenAI's own short-tier defaults.
+	// See models-sold-directly-by-azure docs.
 	const AZURE_CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
 		"gpt-5.4": 1050000,
 		"gpt-5.5": 1050000,
+		"gpt-5.6-luna": 1050000,
+		"gpt-5.6-sol": 1050000,
+		"gpt-5.6-terra": 1050000,
 	};
 	const azureOpenAiModels: Model<Api>[] = allModels
 		.filter((model) => model.provider === "openai" && model.api === "openai-responses")
@@ -2101,6 +2143,12 @@ async function generateModels() {
 			api: "azure-openai-responses",
 			provider: "azure-openai-responses",
 			baseUrl: "",
+			cost: {
+				input: model.cost.input,
+				output: model.cost.output,
+				cacheRead: model.cost.cacheRead,
+				cacheWrite: model.cost.cacheWrite,
+			},
 			contextWindow: AZURE_CONTEXT_WINDOW_OVERRIDES[model.id] ?? model.contextWindow,
 		}));
 	allModels.push(...azureOpenAiModels);
@@ -2165,6 +2213,9 @@ export const MODELS = {
 			output += `\t\t\t\toutput: ${model.cost.output},\n`;
 			output += `\t\t\t\tcacheRead: ${model.cost.cacheRead},\n`;
 			output += `\t\t\t\tcacheWrite: ${model.cost.cacheWrite},\n`;
+			if (model.cost.tiers) {
+				output += `\t\t\t\ttiers: ${JSON.stringify(model.cost.tiers)},\n`;
+			}
 			output += `\t\t\t},\n`;
 			output += `\t\t\tcontextWindow: ${model.contextWindow},\n`;
 			output += `\t\t\tmaxTokens: ${model.maxTokens},\n`;
