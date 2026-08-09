@@ -235,7 +235,7 @@ describe("durable review state", () => {
 
 	it("plans compatible incremental scope and reconciles durable finding ids", () => {
 		const manager = SessionManager.inMemory("/tmp/review-state");
-		appendReviewRun(manager, record("run-1", 1));
+		appendReviewRun(manager, record("run-1", 1, [finding({ status: "accepted" })]));
 		const unchanged = planIncrementalReview(manager, snapshot("blob-run-1"), {
 			scope: [],
 			effort: "standard",
@@ -245,10 +245,13 @@ describe("durable review state", () => {
 		expect(unchanged).toMatchObject({
 			mode: "incremental",
 			changedPaths: [],
-			priorOpenFindings: [{ id: "finding-1" }],
+			priorOpenFindings: [{ id: "finding-1", status: "accepted" }],
 		});
 		const rediscovered = finding({ id: "new-random-id" });
-		expect(reconcileFindingIdentities([rediscovered], unchanged)[0]?.id).toBe("finding-1");
+		expect(reconcileFindingIdentities([rediscovered], unchanged)[0]).toMatchObject({
+			id: "finding-1",
+			status: "accepted",
+		});
 
 		const changed = planIncrementalReview(manager, snapshot("new-blob", "new-hunk"), {
 			scope: [],
@@ -256,7 +259,7 @@ describe("durable review state", () => {
 			includeOptional: false,
 			scopeMode: "incremental",
 		});
-		expect(changed.changedPaths).toEqual(["src/value.ts"]);
+		expect(changed).toMatchObject({ changedPaths: ["src/value.ts"], priorOpenFindings: [] });
 
 		const boundedInventory = record("run-2", 2);
 		boundedInventory.target.files = [];
@@ -315,6 +318,57 @@ describe("durable review state", () => {
 		expect(planIncrementalReview(manager, renamed, controls, { parentRunId: "run-1" }).changedPaths).toEqual([
 			"src/value.ts",
 		]);
+	});
+
+	it("does not inherit findings across prior-to-current rename lineages", () => {
+		const manager = SessionManager.inMemory("/tmp/review-state");
+		const previous = record("renamed-run", 1, [
+			finding({ changeLocation: { path: "src/intermediate-value.ts", side: "head", startLine: 2, endLine: 2 } }),
+		]);
+		previous.target.files[0] = {
+			...previous.target.files[0]!,
+			path: "src/intermediate-value.ts",
+			previousPath: "src/value.ts",
+			status: "renamed",
+		};
+		appendReviewRun(manager, previous);
+		const controls = {
+			scope: [],
+			effort: "standard" as const,
+			includeOptional: false,
+			scopeMode: "incremental" as const,
+		};
+		const plan = (current: ReviewSnapshot) =>
+			planIncrementalReview(manager, current, controls, { parentRunId: previous.runId });
+
+		const renamedAgain = snapshot("renamed-blob", "renamed-hunk");
+		renamedAgain.changedFiles[0] = {
+			...renamedAgain.changedFiles[0]!,
+			path: "src/final-value.ts",
+			previousPath: "src/value.ts",
+			status: "renamed",
+			head: { ...renamedAgain.changedFiles[0]!.head!, path: "src/final-value.ts" },
+		};
+		expect(plan(renamedAgain)).toMatchObject({
+			changedPaths: ["src/final-value.ts"],
+			priorOpenFindings: [],
+		});
+
+		const deletedSource = snapshot("deleted-blob", "deleted-hunk");
+		deletedSource.changedFiles[0] = {
+			...deletedSource.changedFiles[0]!,
+			status: "deleted",
+			head: undefined,
+		};
+		expect(plan(deletedSource)).toMatchObject({ changedPaths: ["src/value.ts"], priorOpenFindings: [] });
+
+		const typeChangedSource = snapshot("type-changed-blob", "type-changed-hunk");
+		typeChangedSource.changedFiles[0] = {
+			...typeChangedSource.changedFiles[0]!,
+			status: "type-changed",
+			head: { ...typeChangedSource.changedFiles[0]!.head!, mode: "120000" },
+		};
+		expect(plan(typeChangedSource)).toMatchObject({ changedPaths: ["src/value.ts"], priorOpenFindings: [] });
 	});
 
 	it("falls back to full coverage for incomplete, narrower, or uncovered parents", () => {

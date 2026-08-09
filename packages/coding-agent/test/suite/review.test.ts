@@ -460,6 +460,112 @@ describe("two-pass review pipeline", () => {
 		expect(repairMessages).toContain("outside the effective review scope");
 	});
 
+	it("does not retain stale prior anchors for files re-reviewed incrementally", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionManager = harness.session.sessionManager;
+		if (!sessionManager) throw new Error("Expected the harness session to have durable state");
+		const controls = { scope: ["src/**"], effort: "standard" as const, includeOptional: false };
+		const priorSnapshot = await createSnapshotRepository(harness);
+		snapshots.push(priorSnapshot);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("review_changed_files", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("review_diff", { path: "src/value.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("report_review_candidates", candidateReport() as never), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage(fauxToolCall("review_changed_files", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("review_diff", { path: "src/value.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("report_review_verification", verificationReport() as never), {
+				stopReason: "toolUse",
+			}),
+		]);
+		const priorOutcome = await executeReviewWorkflow({
+			prepared: {
+				workflowId: "review:prior-anchor",
+				action: "review.uncommitted",
+				target: { kind: "uncommitted" },
+				controls: { ...controls, scopeMode: "full" },
+				resolution: priorSnapshot,
+				model: harness.getModel(),
+				verifierModel: harness.getModel(),
+				startedAt: 1,
+				incrementalPlan: {
+					mode: "full",
+					changedPaths: priorSnapshot.changedFiles.map((file) => file.path),
+					priorOpenFindings: [],
+					suppressedDismissedFingerprints: [],
+				},
+			},
+			cwd: harness.tempDir,
+			agentDir: harness.tempDir,
+			authStorage: harness.authStorage,
+			modelRegistry: harness.session.modelRegistry,
+			settingsManager: harness.settingsManager,
+			sessionManager,
+		});
+		snapshots.splice(snapshots.indexOf(priorSnapshot), 1);
+		expect(priorOutcome.status).toBe("completed");
+		if (priorOutcome.status !== "completed") throw new Error(`Prior review ended with ${priorOutcome.status}`);
+		const priorFinding = priorOutcome.parsed.findings[0]!;
+
+		writeFileSync(
+			join(harness.tempDir, "src", "value.ts"),
+			"export function divide(amount: number, divisor: number) {\n\t// shifted after the prior review\n\tif (divisor === 0) return amount;\n\treturn amount / divisor;\n}\n",
+		);
+		const prepared = await prepareReviewWorkflow({
+			target: { kind: "uncommitted" },
+			controls: { ...controls, scopeMode: "incremental" },
+			cwd: harness.tempDir,
+			settingsManager: harness.settingsManager,
+			modelRegistry: harness.session.modelRegistry,
+			currentModel: harness.getModel(),
+			sessionManager,
+		});
+		snapshots.push(prepared.resolution);
+		expect(prepared.incrementalPlan).toMatchObject({
+			mode: "incremental",
+			changedPaths: ["src/value.ts"],
+			priorOpenFindings: [],
+		});
+
+		const rediscovered = candidateReport();
+		rediscovered.candidates[0]!.changeLocation = { path: "src/value.ts", side: "head", startLine: 3, endLine: 3 };
+		let verificationMessages = "";
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("report_review_candidates", rediscovered as never), {
+				stopReason: "toolUse",
+			}),
+			(context) => {
+				verificationMessages = JSON.stringify(context.messages);
+				return fauxAssistantMessage(fauxToolCall("review_changed_files", {}), { stopReason: "toolUse" });
+			},
+			fauxAssistantMessage(fauxToolCall("review_diff", { path: "src/value.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("report_review_verification", verificationReport() as never), {
+				stopReason: "toolUse",
+			}),
+		]);
+		const currentOutcome = await executeReviewWorkflow({
+			prepared,
+			cwd: harness.tempDir,
+			agentDir: harness.tempDir,
+			authStorage: harness.authStorage,
+			modelRegistry: harness.session.modelRegistry,
+			settingsManager: harness.settingsManager,
+			sessionManager,
+		});
+		snapshots.splice(snapshots.indexOf(prepared.resolution), 1);
+		expect(currentOutcome.status).toBe("completed");
+		if (currentOutcome.status !== "completed") throw new Error(`Current review ended with ${currentOutcome.status}`);
+		expect(verificationMessages).toContain("<prior_open_findings>[]</prior_open_findings>");
+		expect(currentOutcome.parsed.findings).toHaveLength(1);
+		expect(currentOutcome.parsed.findings[0]).toMatchObject({
+			changeLocation: { path: "src/value.ts", startLine: 3, endLine: 3 },
+		});
+		expect(currentOutcome.parsed.findings[0]?.fingerprint).not.toBe(priorFinding.fingerprint);
+		expect(currentOutcome.parsed.findings[0]?.id).not.toBe(priorFinding.id);
+	});
+
 	it("waits for a fresh origin review record to become durable before resolving", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

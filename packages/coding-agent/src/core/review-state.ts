@@ -544,14 +544,37 @@ export function planIncrementalReview(
 		return fullReviewPlan(snapshot, "The prior changed-file inventory exceeded its persistence bound.");
 	}
 	const priorFiles = new Map(previousRun.target.files.map((file) => [file.path, file]));
+	const priorRenameAliases = new Map<string, Set<string>>();
+	for (const file of previousRun.target.files) {
+		if (file.status !== "renamed" || !file.previousPath) continue;
+		const sourceAliases = priorRenameAliases.get(file.previousPath);
+		if (sourceAliases) sourceAliases.add(file.path);
+		else priorRenameAliases.set(file.previousPath, new Set([file.path]));
+		const destinationAliases = priorRenameAliases.get(file.path);
+		if (destinationAliases) destinationAliases.add(file.previousPath);
+		else priorRenameAliases.set(file.path, new Set([file.previousPath]));
+	}
 	const changedPaths: string[] = [];
+	const changedFindingPaths = new Set<string>();
 	const inspectedFiles = new Set(previousRun.result.coverage.filesInspected);
 	const inspectedHunks = new Set(previousRun.result.coverage.hunksInspected);
 	const excludedPaths = new Set(previousRun.result.coverage.exclusions.map((entry) => entry.path));
 	const uncoveredUnchangedPaths: string[] = [];
 	for (const file of snapshot.changedFiles) {
-		if (fileIdentityChanged(priorFiles.get(file.path), file)) {
+		const priorFile = priorFiles.get(file.path);
+		if (fileIdentityChanged(priorFile, file)) {
 			changedPaths.push(file.path);
+			const pendingFindingPaths = [
+				file.path,
+				...(file.status === "renamed" && file.previousPath ? [file.previousPath] : []),
+			];
+			for (let index = 0; index < pendingFindingPaths.length; index++) {
+				const path = pendingFindingPaths[index];
+				if (!path || changedFindingPaths.has(path)) continue;
+				changedFindingPaths.add(path);
+				const aliases = priorRenameAliases.get(path);
+				if (aliases) pendingFindingPaths.push(...aliases);
+			}
 			continue;
 		}
 		if (!pathInControlScope(file.path, controls)) continue;
@@ -571,7 +594,10 @@ export function planIncrementalReview(
 		);
 	}
 	const priorOpenFindings = previousRun.result.findings.filter(
-		(finding) => finding.status !== "fixed" && finding.status !== "dismissed",
+		(finding) =>
+			finding.status !== "fixed" &&
+			finding.status !== "dismissed" &&
+			!changedFindingPaths.has(finding.changeLocation.path),
 	);
 	const suppressedDismissedFingerprints = previousRun.result.findings
 		.filter((finding) => finding.status === "dismissed")
