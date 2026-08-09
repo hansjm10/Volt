@@ -31,7 +31,14 @@ export class ReviewToolsSelectorComponent extends Container {
 
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("accent", theme.bold("Review tools")), 1, 0));
+		this.addChild(new Text(theme.fg("accent", theme.bold("Auxiliary review tools")), 1, 0));
+		this.addChild(
+			new Text(
+				theme.fg("muted", "Immutable review_changed_files/diff/file/search/tree tools are always enabled."),
+				1,
+				0,
+			),
+		);
 		this.addChild(new Spacer(1));
 
 		this.listContainer = new Container();

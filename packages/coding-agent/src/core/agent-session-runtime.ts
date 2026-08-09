@@ -616,6 +616,12 @@ export class AgentSessionRuntime {
 		}
 	}
 
+	private assertNoActiveDetachedReview(): void {
+		if (this._reviewWorkflows?.hasActiveWorkflows) {
+			throw new Error("Cannot change sessions while a detached review is active; cancel or wait for it to finish");
+		}
+	}
+
 	private getReplacementProfile(): string | undefined {
 		return this.services.settingsManager.getRequestedProfile();
 	}
@@ -747,6 +753,9 @@ export class AgentSessionRuntime {
 		try {
 			await this.abortAndJoinRecoveredClientInputs(this.session);
 			this.assertStructuralOperationCurrent(options.operation);
+			// Defense in depth for unexpected re-entrant review starts after an
+			// operation-specific pre-preparation check.
+			this.assertNoActiveDetachedReview();
 			const transaction = sameSessionIdentity
 				? undefined
 				: await this.prepareSessionReplacement?.({
@@ -1047,6 +1056,7 @@ export class AgentSessionRuntime {
 		if (beforeResult.cancelled) {
 			return { cancelled: true, seeded: false };
 		}
+		this.assertNoActiveDetachedReview();
 
 		const previousSessionFile = this.session.sessionFile;
 		const sessionManager = SessionManager.open(resolvedSessionPath, undefined, options?.cwdOverride);
@@ -1263,6 +1273,7 @@ export class AgentSessionRuntime {
 		if (beforeResult.cancelled) {
 			return { cancelled: true, seeded: false };
 		}
+		this.assertNoActiveDetachedReview();
 
 		const previousSessionFile = this.session.sessionFile;
 		const cwd = options?.cwd ?? this.cwd;
@@ -1318,6 +1329,7 @@ export class AgentSessionRuntime {
 		if (beforeResult.cancelled) {
 			return { cancelled: true, seeded: false };
 		}
+		this.assertNoActiveDetachedReview();
 		let targetLeafId: string | null;
 		let selectedText: string | undefined;
 
@@ -1444,15 +1456,15 @@ export class AgentSessionRuntime {
 		}
 
 		const sessionDir = this.session.sessionManager.getSessionDir();
-		if (!existsSync(sessionDir)) {
-			mkdirSync(sessionDir, { recursive: true });
-		}
-
 		const destinationPath = join(sessionDir, basename(resolvedPath));
 		const beforeResult = await this.emitBeforeSwitch("resume", destinationPath);
 		this.assertStructuralOperationCurrent(operation);
 		if (beforeResult.cancelled) {
 			return beforeResult;
+		}
+		this.assertNoActiveDetachedReview();
+		if (!existsSync(sessionDir)) {
+			mkdirSync(sessionDir, { recursive: true });
 		}
 
 		const previousSessionFile = this.session.sessionFile;

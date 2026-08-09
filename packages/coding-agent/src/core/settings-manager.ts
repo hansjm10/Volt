@@ -142,8 +142,9 @@ export interface Settings {
 	terminal?: TerminalSettings;
 	images?: ImageSettings;
 	enabledModels?: string[]; // Model patterns for cycling (same format as --models CLI flag)
-	reviewModel?: string; // Model for /review, e.g. "anthropic/claude-opus-4-5" (falls back to the session model)
-	reviewTools?: string[]; // Tool names allowed in /review sessions (defaults to inherited parent active tools)
+	reviewModel?: string; // Discovery model for /review (falls back to the session model)
+	reviewVerifierModel?: string; // Independent verification model for /review (falls back to reviewModel)
+	reviewTools?: string[]; // Optional auxiliary tool names; immutable review snapshot tools are always active
 	doubleEscapeAction?: "fork" | "tree" | "none"; // Action for double-escape with empty editor (default: "tree")
 	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default filter when opening /tree
 	thinkingBudgets?: ThinkingBudgetsSettings; // Custom token budgets for thinking levels
@@ -1678,6 +1679,16 @@ export class SettingsManager {
 	setReviewModel(modelReference: string | undefined): void {
 		this.updateGlobalSettings("reviewModel", (settings) => {
 			settings.reviewModel = modelReference;
+		});
+	}
+
+	getReviewVerifierModel(): string | undefined {
+		return this.settings.reviewVerifierModel;
+	}
+
+	setReviewVerifierModel(modelReference: string | undefined): void {
+		this.updateGlobalSettings("reviewVerifierModel", (settings) => {
+			settings.reviewVerifierModel = modelReference;
 		});
 	}
 
