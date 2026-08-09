@@ -10,6 +10,7 @@ import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { ensurePrivateDirectorySync, hardenPrivateRegularFileSync } from "../utils/private-files.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 import type { LspSettings } from "./lsp/config.ts";
+import type { Personality } from "./personality.ts";
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
@@ -113,6 +114,7 @@ export interface Settings {
 	profiles?: Record<string, ProfileSettings>;
 	defaultProvider?: string;
 	defaultModel?: string;
+	personality?: Personality; // default: "default"
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
@@ -1164,6 +1166,10 @@ export class SettingsManager {
 
 	getDefaultModel(): string | undefined {
 		return this.settings.defaultModel;
+	}
+
+	getPersonality(): Personality {
+		return this.settings.personality === "pragmatic" ? "pragmatic" : "default";
 	}
 
 	setDefaultProvider(provider: string): void {

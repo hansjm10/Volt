@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { SettingsManager } from "../src/core/settings-manager.ts";
 import type { Skill } from "../src/core/skills.ts";
 import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
 import { buildSystemPrompt } from "../src/core/system-prompt.ts";
@@ -60,6 +61,27 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain("<personality>");
 			expect(prompt).toContain("Match the user's tone and technical level");
 			expect(prompt).toContain("Lead with the outcome or conclusion");
+			expectBefore(prompt, "<personality>", "<instruction_hierarchy>");
+		});
+
+		test("supports a profile-aware pragmatic personality", () => {
+			const settingsManager = SettingsManager.inMemory(
+				{
+					personality: "default",
+					profiles: { delivery: { personality: "pragmatic" } },
+				},
+				{ profile: "delivery" },
+			);
+			const prompt = buildSystemPrompt({
+				personality: settingsManager.getPersonality(),
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain("you are pragmatic, direct, and solutions-oriented");
+			expect(prompt).toContain("Make clear recommendations");
+			expect(prompt).not.toContain("Write with warmth, curiosity, and confidence");
 			expectBefore(prompt, "<personality>", "<instruction_hierarchy>");
 		});
 
@@ -250,6 +272,7 @@ describe("buildSystemPrompt", () => {
 		test("custom prompts still receive appended sections in order", () => {
 			const prompt = buildSystemPrompt({
 				customPrompt: "CUSTOM PROMPT",
+				personality: "pragmatic",
 				selectedTools: ["read"],
 				appendSystemPrompt: "APPENDED SYSTEM TEXT",
 				contextFiles: [{ path: "/repo/AGENTS.md", content: "Project rule" }],
@@ -259,6 +282,7 @@ describe("buildSystemPrompt", () => {
 
 			expect(prompt.startsWith("CUSTOM PROMPT")).toBe(true);
 			expect(prompt).not.toContain("<personality>");
+			expect(prompt).not.toContain("Make clear recommendations");
 			expect(prompt).not.toContain("<instruction_hierarchy>");
 			expectBefore(prompt, "APPENDED SYSTEM TEXT", "\n\n<project_context>\n\n");
 			expectBefore(prompt, "\n\n<project_context>\n\n", "\n<available_skills>\n");

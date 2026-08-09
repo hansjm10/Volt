@@ -58,6 +58,18 @@ Profiles do not isolate auth or sessions yet. `sessionDir` and reserved profile 
 | `defaultProfile` | string | - | Profile to apply when `--profile` and `VOLT_PROFILE` are not set; updated to the active profile when interactive mode exits |
 | `profiles` | object | `{}` | Named settings overlays keyed by profile name |
 
+### Agent Behavior
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `personality` | string | `"default"` | Communication style for Volt's built-in system prompt: `"default"` for a collaborative, adaptive voice or `"pragmatic"` for direct recommendations focused on simple, maintainable solutions. Ignored when a custom `SYSTEM.md` replaces the built-in prompt |
+
+```json
+{
+  "personality": "pragmatic"
+}
+```
+
 ### Model & Thinking
 
 | Setting | Type | Default | Description |
