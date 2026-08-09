@@ -103,12 +103,13 @@ function reviewRun(headRefOid = "head-oid"): ReviewRunRecord {
 
 describe("pull request review publishing", () => {
 	const directories: string[] = [];
-	const originalPath = process.env.PATH;
+	const pathEnvironmentKey = Object.keys(process.env).find((key) => key.toUpperCase() === "PATH") ?? "PATH";
+	const originalPath = process.env[pathEnvironmentKey];
 
 	afterEach(() => {
 		for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
-		if (originalPath === undefined) delete process.env.PATH;
-		else process.env.PATH = originalPath;
+		if (originalPath === undefined) delete process.env[pathEnvironmentKey];
+		else process.env[pathEnvironmentKey] = originalPath;
 	});
 
 	function installGh(options: { headOid?: string; failApi?: boolean } = {}): {
@@ -122,12 +123,47 @@ describe("pull request review publishing", () => {
 		directories.push(cwd);
 		const payloadPath = join(cwd, "payload.json");
 		const callsPath = join(cwd, "calls.txt");
+		const fixturePath = join(bin, "fake-gh.mjs");
 		writeFileSync(
-			join(bin, "gh"),
-			`#!/bin/sh\nprintf '%s\\n' "$*" >> '${callsPath}'\ncase "$1 $2" in\n  "pr view") printf '%s\\n' '{"headRefOid":"${options.headOid ?? "head-oid"}"}' ;;\n  "repo view") printf '%s\\n' '{"nameWithOwner":"volt-hq/Volt"}' ;;\n  "api --method") ${options.failApi ? "cat >/dev/null; printf '%s\\n' 'rejected' >&2; exit 1" : `cat > '${payloadPath}'; printf '%s\\n' '{"id":99,"html_url":"https://example.test/review/99"}'`} ;;\n  *) printf '%s\\n' 'unexpected gh invocation' >&2; exit 2 ;;\nesac\n`,
+			fixturePath,
+			`import { appendFileSync, writeFileSync } from "node:fs";
+
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(callsPath)}, args.join(" ") + "\\n");
+switch (args.slice(0, 2).join(" ")) {
+	case "pr view":
+		process.stdout.write(${JSON.stringify(`${JSON.stringify({ headRefOid: options.headOid ?? "head-oid" })}\n`)});
+		break;
+	case "repo view":
+		process.stdout.write(${JSON.stringify(`${JSON.stringify({ nameWithOwner: "volt-hq/Volt" })}\n`)});
+		break;
+	case "api --method": {
+		let input = "";
+		process.stdin.setEncoding("utf8");
+		for await (const chunk of process.stdin) input += chunk;
+		if (${options.failApi === true}) {
+			process.stderr.write("rejected\\n");
+			process.exitCode = 1;
+		} else {
+			writeFileSync(${JSON.stringify(payloadPath)}, input);
+			process.stdout.write(${JSON.stringify(`${JSON.stringify({ id: 99, html_url: "https://example.test/review/99" })}\n`)});
+		}
+		break;
+	}
+	default:
+		process.stderr.write("unexpected gh invocation\\n");
+		process.exitCode = 2;
+}
+`,
 		);
-		chmodSync(join(bin, "gh"), 0o755);
-		process.env.PATH = `${bin}${delimiter}${originalPath ?? ""}`;
+		if (process.platform === "win32") {
+			writeFileSync(join(bin, "gh.cmd"), `@echo off\r\n"${process.execPath}" "${fixturePath}" %*\r\n`);
+		} else {
+			const executable = join(bin, "gh");
+			writeFileSync(executable, `#!/bin/sh\nexec "${process.execPath}" "${fixturePath}" "$@"\n`);
+			chmodSync(executable, 0o755);
+		}
+		process.env[pathEnvironmentKey] = `${bin}${delimiter}${originalPath ?? ""}`;
 		return { cwd, payloadPath, callsPath };
 	}
 
@@ -141,9 +177,11 @@ describe("pull request review publishing", () => {
 			summaryOnlyFindingIds: ["finding-summary"],
 		});
 		const payload = JSON.parse(readFileSync(fixture.payloadPath, "utf8")) as {
+			commit_id: string;
 			body: string;
 			comments: Array<{ path: string }>;
 		};
+		expect(payload.commit_id).toBe("head-oid");
 		expect(payload.comments).toEqual([expect.objectContaining({ path: "src/value.ts" })]);
 		expect(payload.body).toContain("finding-summary");
 		expect(

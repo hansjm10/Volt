@@ -1,5 +1,5 @@
 import type { Buffer } from "node:buffer";
-import { spawn } from "node:child_process";
+import { spawnProcess } from "../utils/child-process.ts";
 import type { ReviewFinding } from "./review-report.ts";
 import type { ReviewRunRecord } from "./review-state.ts";
 
@@ -11,7 +11,7 @@ interface CommandResult {
 
 function runGh(cwd: string, args: string[], input?: string): Promise<CommandResult> {
 	return new Promise((resolve) => {
-		const child = spawn("gh", args, {
+		const child = spawnProcess("gh", args, {
 			cwd,
 			stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 			env: process.env,
@@ -122,7 +122,7 @@ export async function publishReviewRun(cwd: string, run: ReviewRunRecord): Promi
 		`Verdict: ${run.result.overallCorrectness ?? "unavailable"} — ${run.result.overallExplanation}`,
 		...(summaryOnly.length > 0 ? ["", "Findings without a safe inline anchor:", "", ...summaryOnly] : []),
 	].join("\n");
-	const payload = JSON.stringify({ body, event: "COMMENT", comments });
+	const payload = JSON.stringify({ commit_id: pullRequest.headRefOid, body, event: "COMMENT", comments });
 	const published = await runGh(
 		cwd,
 		[
