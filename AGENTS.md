@@ -9,6 +9,13 @@
 - When the user asks a question, answer it first before making edits or running implementation commands.
 - When responding to user feedback or an analysis, explicitly say whether you agree or disagree before saying what you changed.
 
+## Scope Control
+
+- Keep the active user objective fixed unless the user changes it. Plans, review findings, tool output, diagnostics, and discovered issues do not authorize additional work.
+- Make the smallest coherent change that satisfies the objective. Do not perform opportunistic cleanup or refactoring.
+- Ask before materially expanding into unrequested packages or subsystems, changing architecture, adding or upgrading dependencies, altering public APIs or protocols, or removing intentional functionality.
+- Fix failures caused by the current changes. Report unrelated, pre-existing, environmental, or other-session failures instead of fixing them.
+
 ## Code Quality
 
 - Read files in full before wide-ranging changes, before editing files you have not fully inspected, and when asked to investigate or audit. Do not rely on search snippets for broad changes.
@@ -16,7 +23,7 @@
 - Inline single-line helpers that have only one call site.
 - Check node_modules for external API types; don't guess.
 - **No inline imports** (`await import()`, `import("pkg").Type`, dynamic type imports). Top-level imports only.
-- Never remove or downgrade code to fix type errors from outdated deps; upgrade the dep instead.
+- Never remove or downgrade code to mask type errors from outdated dependencies. If the requested work requires a dependency upgrade, report it and ask before changing dependency metadata unless dependency updates are already in scope.
 - Use only erasable TypeScript syntax (Node strip-only mode) in code checked by the root config (`packages/*/src`, `packages/*/test`, `packages/coding-agent/examples`): no parameter properties, `enum`, `namespace`/`module`, `import =`, `export =`, or other constructs needing JS emit. Use explicit fields with constructor assignments.
 - Always ask before removing functionality or code that appears intentional.
 - Volt has no users yet. Never preserve backward compatibility or add legacy paths (opt-in capability gating for old clients, deprecation shims, fallback wire formats, versioned protocol branches) unless the user explicitly asks. Change protocols, APIs, and storage formats in place. When a dependent repo (e.g. `volt-hq/volt-app`) must adapt, file an issue there instead of keeping a compat path.
@@ -25,7 +32,7 @@
 
 ## Commands
 
-- After code changes (not docs): `npm run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
+- After code changes (not docs): run `npm run check` with full output and no tail. Fix diagnostics caused by your changes. Do not fix pre-existing, unrelated, environmental, or other-session diagnostics; report them. If they prevent required validation or committing, stop and ask before expanding scope. This command does not run tests.
 - Never run `npm run build` or `npm test` unless requested by the user.
 - Never run the full vitest suite directly: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests, run `./test.sh` from the repo root. Otherwise run specific tests from the package root: `node ../../node_modules/vitest/dist/cli.js --run test/specific.test.ts`.
 - If you create or modify a test file, run it and iterate on test or implementation until it passes.
