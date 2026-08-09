@@ -49,6 +49,7 @@ import {
 	createReviewSeedMessage,
 	executeReviewWorkflow,
 	prepareReviewWorkflow,
+	REMOTE_REVIEW_FAILURE_MESSAGE,
 	REMOTE_REVIEW_TOOL_NAMES,
 	type ReviewWorkflowEvent,
 	type ReviewWorkflowToolEvent,
@@ -1204,6 +1205,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 								modelRegistry,
 								settingsManager,
 								sessionManager: commandSession.sessionManager,
+								sanitizeRemoteErrors: reviewOptions.remote,
 								thinkingLevel,
 								fastModeEnabled,
 								// Immutable snapshot tools are always installed by the review host;
@@ -1213,12 +1215,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 								onEvent: hooks.onEvent,
 							});
 							if (reviewOptions.remote && result.status === "failed") {
-								return { status: "failed", errorMessage: "The review could not be completed." };
+								return { status: "failed", errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE };
 							}
 							return result;
 						} catch (error) {
 							if (reviewOptions.remote) {
-								return { status: "failed", errorMessage: "The review could not be completed." };
+								return { status: "failed", errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE };
 							}
 							throw error;
 						}

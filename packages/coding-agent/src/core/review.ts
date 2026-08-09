@@ -79,6 +79,7 @@ export const REVIEW_USAGE =
 	'Usage: /review [tools | uncommitted | branch [base] | pr [number] | commit [ref]] [--focus "text"] [--scope glob[,glob...]] [--effort low|standard|high] [--include-optional] [--incremental|--full]';
 
 export const REMOTE_REVIEW_TOOL_NAMES = REVIEW_SNAPSHOT_TOOL_NAMES;
+export const REMOTE_REVIEW_FAILURE_MESSAGE = "The review could not be completed.";
 export const MAX_REVIEW_COMMIT_REF_BYTES = 1_024;
 export const MAX_GITHUB_PR_NUMBER = 2_147_483_647;
 
@@ -782,6 +783,7 @@ export interface ExecuteReviewWorkflowOptions {
 	fastModeEnabled?: boolean;
 	parentResourceLoader?: ResourceLoader;
 	tools?: readonly string[];
+	sanitizeRemoteErrors?: boolean;
 	/** Retained for source compatibility during the in-place migration; snapshots make this a no-op. */
 	skipWorkingTreeGuard?: boolean;
 	signal?: AbortSignal;
@@ -1289,7 +1291,9 @@ export async function executeReviewWorkflow(
 		return { status: "cancelled", record };
 	}
 	if (result.errorMessage || !result.parsed) {
-		const errorMessage = result.errorMessage ?? "Review produced no validated report";
+		const errorMessage = options.sanitizeRemoteErrors
+			? REMOTE_REVIEW_FAILURE_MESSAGE
+			: (result.errorMessage ?? "Review produced no validated report");
 		const record = createReviewRunRecord({
 			workflowId: prepared.workflowId,
 			workflowAction: prepared.action,

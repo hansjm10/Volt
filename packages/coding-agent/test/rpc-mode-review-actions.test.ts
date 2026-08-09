@@ -75,6 +75,7 @@ function durableRecord(runId = "review:test"): ReviewRunRecord {
 interface ExecuteOptions {
 	prepared: { workflowId: string; action: string };
 	sessionManager?: SessionManager;
+	sanitizeRemoteErrors?: boolean;
 	signal?: AbortSignal;
 	onEvent?: (event: Record<string, unknown>) => void;
 }
@@ -297,12 +298,18 @@ function makeRuntimeHost(
 async function startMode(
 	runtimeHost: AgentSessionRuntime,
 	transport: RpcTransport,
+	options: { requireRemoteSafeUiActions?: boolean } = {},
 ): Promise<{ modePromise: Promise<void> }> {
 	let readyResolve: () => void = () => {};
 	const ready = new Promise<void>((resolve) => {
 		readyResolve = resolve;
 	});
-	const modePromise = runRpcMode(runtimeHost, { transport, exitProcess: false, onReady: readyResolve });
+	const modePromise = runRpcMode(runtimeHost, {
+		transport,
+		exitProcess: false,
+		onReady: readyResolve,
+		...options,
+	});
 	await ready;
 	return { modePromise };
 }
@@ -324,7 +331,7 @@ afterEach(() => {
 });
 
 describe("RPC durable review actions", () => {
-	test("returns acceptance before detached events and projects only snapshot tool metadata", async () => {
+	test("returns acceptance before detached events, sanitizes failures, and projects only snapshot tool metadata", async () => {
 		let release: () => void = () => {};
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
@@ -353,7 +360,9 @@ describe("RPC durable review actions", () => {
 		});
 		const runtimeHost = makeRuntimeHost();
 		const collecting = createCollectingTransport();
-		const modePromise = await startMode(runtimeHost, collecting.transport);
+		const modePromise = await startMode(runtimeHost, collecting.transport, {
+			requireRemoteSafeUiActions: true,
+		});
 		collecting.getLineHandler()(
 			JSON.stringify({ id: "invoke", type: "invoke_ui_action", action: "review.uncommitted" }),
 		);
@@ -365,6 +374,9 @@ describe("RPC durable review actions", () => {
 		);
 		await vi.waitFor(() =>
 			expect(collecting.writes).toContainEqual(expect.objectContaining({ type: "workflow_start" })),
+		);
+		expect(reviewMocks.executeReviewWorkflow).toHaveBeenCalledWith(
+			expect.objectContaining({ sanitizeRemoteErrors: true }),
 		);
 		const acceptedIndex = collecting.writes.findIndex((write) => (write as Record<string, unknown>).id === "invoke");
 		const eventIndex = collecting.writes.findIndex(

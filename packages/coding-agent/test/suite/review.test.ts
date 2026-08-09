@@ -13,6 +13,7 @@ import {
 	normalizeReviewPullRequestNumber,
 	parseReviewCommandArgs,
 	prepareReviewWorkflow,
+	REMOTE_REVIEW_FAILURE_MESSAGE,
 	resolveReviewModel,
 	runReview,
 } from "../../src/core/review.ts";
@@ -308,6 +309,90 @@ describe("two-pass review pipeline", () => {
 		snapshots.splice(snapshots.indexOf(snapshot), 1);
 		expect(run.errorMessage).toMatch(/Could not load snapshot policy AGENTS\.md.*64 bytes/i);
 		expect(harness.faux.state.callCount).toBe(0);
+	});
+
+	it("sanitizes remote provider failures before returning or persisting them", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: false } } });
+		harnesses.push(harness);
+		const remoteSnapshot = await createSnapshotRepository(harness);
+		snapshots.push(remoteSnapshot);
+		const localSnapshot = await resolveReviewSnapshot({ kind: "uncommitted" }, harness.tempDir, {
+			maxCommitRefBytes: 1_024,
+			maxPullRequestNumber: MAX_GITHUB_PR_NUMBER,
+		});
+		if ("error" in localSnapshot) throw new Error(localSnapshot.error);
+		snapshots.push(localSnapshot);
+		const privateDiagnostic =
+			"Provider request to https://private-llm.internal/v1 failed while reading C:\\Users\\reviewer\\private-provider.json";
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: privateDiagnostic }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: privateDiagnostic }),
+		]);
+		const sessionManager = SessionManager.create(harness.tempDir, join(harness.tempDir, "remote-sessions"));
+		const remoteOutcome = await executeReviewWorkflow({
+			prepared: {
+				workflowId: "review:remote-provider-failure",
+				action: "review.uncommitted",
+				target: { kind: "uncommitted" },
+				controls: { scope: [], effort: "standard", includeOptional: false, scopeMode: "full" },
+				resolution: remoteSnapshot,
+				model: harness.getModel(),
+				verifierModel: harness.getModel(),
+				startedAt: 1,
+				incrementalPlan: {
+					mode: "full",
+					changedPaths: remoteSnapshot.changedFiles.map((file) => file.path),
+					priorOpenFindings: [],
+					suppressedDismissedFingerprints: [],
+				},
+			},
+			cwd: harness.tempDir,
+			agentDir: harness.tempDir,
+			authStorage: harness.authStorage,
+			modelRegistry: harness.session.modelRegistry,
+			settingsManager: harness.settingsManager,
+			sessionManager,
+			sanitizeRemoteErrors: true,
+		});
+		snapshots.splice(snapshots.indexOf(remoteSnapshot), 1);
+		expect(remoteOutcome).toMatchObject({
+			status: "failed",
+			errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE,
+			record: { errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE },
+		});
+		expect(JSON.stringify(remoteOutcome)).not.toContain(privateDiagnostic);
+		const reopened = SessionManager.open(sessionManager.getSessionFile()!);
+		expect(getReviewRun(reopened, "review:remote-provider-failure")).toMatchObject({
+			status: "failed",
+			errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE,
+		});
+		expect(JSON.stringify(getReviewRun(reopened, "review:remote-provider-failure"))).not.toContain(privateDiagnostic);
+
+		const localOutcome = await executeReviewWorkflow({
+			prepared: {
+				workflowId: "review:local-provider-failure",
+				action: "review.uncommitted",
+				target: { kind: "uncommitted" },
+				controls: { scope: [], effort: "standard", includeOptional: false, scopeMode: "full" },
+				resolution: localSnapshot,
+				model: harness.getModel(),
+				verifierModel: harness.getModel(),
+				startedAt: 1,
+				incrementalPlan: {
+					mode: "full",
+					changedPaths: localSnapshot.changedFiles.map((file) => file.path),
+					priorOpenFindings: [],
+					suppressedDismissedFingerprints: [],
+				},
+			},
+			cwd: harness.tempDir,
+			agentDir: harness.tempDir,
+			authStorage: harness.authStorage,
+			modelRegistry: harness.session.modelRegistry,
+			settingsManager: harness.settingsManager,
+		});
+		snapshots.splice(snapshots.indexOf(localSnapshot), 1);
+		expect(localOutcome).toMatchObject({ status: "failed", errorMessage: privateDiagnostic });
 	});
 
 	it("does not credit complete discovery coverage to a verifier that inspects nothing", async () => {
