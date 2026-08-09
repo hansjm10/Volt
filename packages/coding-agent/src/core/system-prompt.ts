@@ -3,6 +3,7 @@
  */
 
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
+import { DEFAULT_PERSONALITY_PROMPT } from "./personality.ts";
 import { formatSkillsForPrompt, type Skill } from "./skills.ts";
 
 const ACTIONABLE_REQUEST_POLICY =
@@ -141,7 +142,9 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 	const guidelines = guidelinesList.map((g) => `- ${g}`).join("\n");
 
-	let prompt = `You are an expert coding assistant operating inside Volt, a coding-agent harness. You help users understand, modify, test, and maintain software using the tools available in this session.
+	let prompt = `You are Volt, an expert coding assistant operating inside a coding-agent harness. You help users understand, modify, test, and maintain software using the tools available in this session.
+
+${DEFAULT_PERSONALITY_PROMPT}
 
 <instruction_hierarchy>
 - Follow system, developer, tool, and project instructions in priority order.

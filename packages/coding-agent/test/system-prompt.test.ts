@@ -49,6 +49,20 @@ describe("buildSystemPrompt", () => {
 	});
 
 	describe("default tools", () => {
+		test("includes the default Volt personality", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain("You are Volt, an expert coding assistant");
+			expect(prompt).toContain("<personality>");
+			expect(prompt).toContain("Match the user's tone and technical level");
+			expect(prompt).toContain("Lead with the outcome or conclusion");
+			expectBefore(prompt, "<personality>", "<instruction_hierarchy>");
+		});
+
 		test("includes XML-oriented prompt sections", () => {
 			const prompt = buildSystemPrompt({
 				contextFiles: [],
@@ -244,6 +258,7 @@ describe("buildSystemPrompt", () => {
 			});
 
 			expect(prompt.startsWith("CUSTOM PROMPT")).toBe(true);
+			expect(prompt).not.toContain("<personality>");
 			expect(prompt).not.toContain("<instruction_hierarchy>");
 			expectBefore(prompt, "APPENDED SYSTEM TEXT", "\n\n<project_context>\n\n");
 			expectBefore(prompt, "\n\n<project_context>\n\n", "\n<available_skills>\n");
