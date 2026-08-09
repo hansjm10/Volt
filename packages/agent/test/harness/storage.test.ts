@@ -75,7 +75,6 @@ describe("InMemorySessionStorage", () => {
 			parentId: "label-1",
 			timestamp: "2026-01-01T00:00:02.000Z",
 			targetId: "entry-1",
-			label: undefined,
 		});
 		expect(await storage.getLabel("entry-1")).toBeUndefined();
 	});
@@ -260,7 +259,6 @@ describe("JsonlSessionStorage", () => {
 			parentId: "label-1",
 			timestamp: "2026-01-01T00:00:02.000Z",
 			targetId: "entry-1",
-			label: undefined,
 		});
 		expect(await storage.getLabel("entry-1")).toBeUndefined();
 		const loaded = await JsonlSessionStorage.open(env, filePath);
@@ -293,7 +291,6 @@ describe("JsonlSessionStorage", () => {
 			createdAt: "2026-01-01T00:00:00.000Z",
 			cwd: dir,
 			path: filePath,
-			parentSessionPath: undefined,
 		});
 	});
 });

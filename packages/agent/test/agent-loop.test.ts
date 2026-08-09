@@ -115,8 +115,8 @@ describe("agentLoop with AgentMessage", () => {
 
 		// Should have user message and assistant message
 		expect(messages.length).toBe(2);
-		expect(messages[0].role).toBe("user");
-		expect(messages[1].role).toBe("assistant");
+		expect(messages[0]?.role).toBe("user");
+		expect(messages[1]?.role).toBe("assistant");
 
 		// Verify event sequence
 		const eventTypes = events.map((e) => e.type);
@@ -180,7 +180,7 @@ describe("agentLoop with AgentMessage", () => {
 
 		// The notification should have been filtered out in convertToLlm
 		expect(convertedMessages.length).toBe(1); // Only user message
-		expect(convertedMessages[0].role).toBe("user");
+		expect(convertedMessages[0]?.role).toBe("user");
 	});
 
 	it("should apply transformContext before convertToLlm", async () => {
@@ -703,8 +703,8 @@ describe("agentLoop with AgentMessage", () => {
 			(e): e is Extract<AgentEvent, { type: "tool_execution_end" }> => e.type === "tool_execution_end",
 		);
 		expect(toolEnds.length).toBe(2);
-		expect(toolEnds[0].isError).toBe(false);
-		expect(toolEnds[1].isError).toBe(false);
+		expect(toolEnds[0]?.isError).toBe(false);
+		expect(toolEnds[1]?.isError).toBe(false);
 
 		// Queued message should appear in events after both tool result messages
 		const eventSequence = events.flatMap((event) => {
@@ -998,7 +998,7 @@ describe("agentLoop with AgentMessage", () => {
 					context: {
 						systemPrompt: "second prompt",
 						messages: currentContext.messages.slice(),
-						tools: currentContext.tools,
+						...(currentContext.tools === undefined ? {} : { tools: currentContext.tools }),
 					},
 				};
 			},
@@ -1481,7 +1481,7 @@ describe("agentLoop with AgentMessage", () => {
 				return {
 					content: [{ type: "text", text: `echoed: ${params.value}` }],
 					details: { value: params.value },
-					disposition: params.value === "first" ? "stop" : undefined,
+					...(params.value === "first" ? { disposition: "stop" as const } : {}),
 				};
 			},
 		};
@@ -1634,7 +1634,7 @@ describe("agentLoopContinue with AgentMessage", () => {
 
 		// Should only return the new assistant message (not the existing user message)
 		expect(messages.length).toBe(1);
-		expect(messages[0].role).toBe("assistant");
+		expect(messages[0]?.role).toBe("assistant");
 
 		// Should NOT have user message events (that's the key difference from agentLoop)
 		const messageEndEvents = events.filter((e) => e.type === "message_end");
@@ -1700,6 +1700,6 @@ describe("agentLoopContinue with AgentMessage", () => {
 
 		const messages = await stream.result();
 		expect(messages.length).toBe(1);
-		expect(messages[0].role).toBe("assistant");
+		expect(messages[0]?.role).toBe("assistant");
 	});
 });

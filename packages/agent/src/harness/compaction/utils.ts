@@ -33,7 +33,7 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 		const args = block.arguments as Record<string, unknown> | undefined;
 		if (!args) continue;
 
-		const path = typeof args.path === "string" ? args.path : undefined;
+		const path = typeof args["path"] === "string" ? args["path"] : undefined;
 		if (!path) continue;
 
 		switch (block.name) {

@@ -11,7 +11,7 @@ function bufferTail(content: string, maxBytes: number): string {
 	const bytes = Buffer.from(content, "utf8");
 	if (bytes.length <= maxBytes) return content;
 	let start = bytes.length - maxBytes;
-	while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++;
+	while (start < bytes.length && ((bytes.at(start) ?? 0) & 0xc0) === 0x80) start++;
 	return bytes.subarray(start).toString("utf8");
 }
 
