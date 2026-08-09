@@ -215,6 +215,7 @@ Local core subagents use in-process RPC:
 Cancellation semantics:
 
 - `abort` is the semantic cancellation command.
+- Cancellation is monotonic from runtime preparation through settlement. If a handle or its delegation scope is aborted before first-prompt publication, a later prompt rejects through the unpublished rollback path and cannot admit provider work or create activity and registry records.
 - Disposing a local handle may abort if the caller requested stop; otherwise it should detach only when a retained runtime exists.
 - Parent session shutdown should abort or dispose ephemeral children.
 - Remote stream close must continue to mean detach, matching Iroh remote behavior.
@@ -292,8 +293,10 @@ Child events wrap normal child RPC events:
 
 ```json
 {"type":"subagent_event","subagentId":"sa_123","event":{"type":"message_update", "...":"..."}}
-{"type":"subagent_end","subagentId":"sa_123","result":{"id":"sa_123","sessionId":"child-session-id","event":{"type":"agent_end","messages":[],"willRetry":false}}}
+{"type":"subagent_end","subagentId":"sa_123","result":{"id":"sa_123","sessionId":"child-session-id","status":"completed","event":{"type":"agent_end","messages":[],"willRetry":false}}}
 ```
+
+The result's required `status` (`completed`, `failed`, or `aborted`) is authoritative; optional `error` carries terminal failure detail when available. The nested `agent_end` remains low-level attempt history and must not be used to infer terminal status.
 
 `list_subagents` returns safe summaries only; it omits definition file paths, source paths, base directories, and system prompts. Active RPC-started children are scoped to the RPC connection/runtime and are disposed on RPC shutdown or parent session replacement.
 

@@ -80,6 +80,8 @@ export interface SubagentResult {
 	id: string;
 	sessionId: string;
 	event: SubagentEndEvent;
+	status: Exclude<SubagentActivityStatus, "running">;
+	error?: string;
 }
 
 export interface SubagentHandle {
@@ -87,9 +89,10 @@ export interface SubagentHandle {
 	sessionId: string;
 	/**
 	 * Send a message to the child. A rejection before the start is published
-	 * (prompt preflight or the host's runtime registration commit) rolls back
-	 * the unpublished start (daemon hosts dispose the prepared child runtime)
-	 * and disposes this handle, so it cannot be retried.
+	 * (prompt preflight, cancellation, or the host's runtime registration commit)
+	 * rolls back the unpublished start (daemon hosts dispose the prepared child
+	 * runtime) and disposes this handle, so it cannot be retried. Cancellation
+	 * remains authoritative when requested before the first prompt.
 	 */
 	prompt(message: string): Promise<void>;
 	abort(source?: AgentAbortSource): Promise<void>;
@@ -349,13 +352,10 @@ function getFinalAssistantText(event: SubagentEndEvent): string | undefined {
 	return undefined;
 }
 
-function getTerminalActivityResult(
+function resolveTerminalResult(
 	event: SubagentEndEvent,
 	abortRequested: boolean,
-): {
-	status: Extract<SubagentActivityStatus, "completed" | "failed" | "aborted">;
-	error?: string;
-} {
+): Pick<SubagentResult, "status" | "error"> {
 	if (abortRequested) {
 		return { status: "aborted" };
 	}
@@ -532,6 +532,8 @@ class LocalSubagentHandle implements SubagentHandle {
 	private readonly onPromptAccepted: (message: string) => void;
 	private readonly onPromptFailed: (error: unknown) => Promise<void>;
 	private readonly onAbortRequested: () => void;
+	private readonly isAbortRequested: () => boolean;
+	private readonly resolveTerminalResult: (event: SubagentEndEvent) => Pick<SubagentResult, "status" | "error">;
 	private readonly onTerminal: () => void;
 	private readonly onDispose: () => Promise<void>;
 	private waitForIdle: (() => Promise<void>) | undefined;
@@ -546,7 +548,6 @@ class LocalSubagentHandle implements SubagentHandle {
 	private promptMessageObserved = false;
 	private endSettled = false;
 	private ownershipSettled = false;
-	private abortRequested = false;
 	private disposed = false;
 	private disposePromise: Promise<void> | undefined;
 
@@ -559,6 +560,8 @@ class LocalSubagentHandle implements SubagentHandle {
 		onPromptAccepted: (message: string) => void;
 		onPromptFailed: (error: unknown) => Promise<void>;
 		onAbortRequested: () => void;
+		isAbortRequested: () => boolean;
+		resolveTerminalResult: (event: SubagentEndEvent) => Pick<SubagentResult, "status" | "error">;
 		onTerminal: () => void;
 		onDispose: () => Promise<void>;
 		waitForIdle: () => Promise<void>;
@@ -571,6 +574,8 @@ class LocalSubagentHandle implements SubagentHandle {
 		this.onPromptAccepted = options.onPromptAccepted;
 		this.onPromptFailed = options.onPromptFailed;
 		this.onAbortRequested = options.onAbortRequested;
+		this.isAbortRequested = options.isAbortRequested;
+		this.resolveTerminalResult = options.resolveTerminalResult;
 		this.onTerminal = options.onTerminal;
 		this.onDispose = options.onDispose;
 		this.waitForIdle = options.waitForIdle;
@@ -585,7 +590,17 @@ class LocalSubagentHandle implements SubagentHandle {
 		this.assertOpen();
 		this.promptStarted = true;
 		try {
+			if (this.isAbortRequested()) {
+				throw new Error(`Subagent ${this.id} was aborted before prompt acceptance`);
+			}
 			await this.client.prompt(message, undefined, () => {
+				// Cancellation can land after the command is queued but before its
+				// preflight response reaches this handle. Abort again at that boundary
+				// so an earlier idle-session abort cannot admit provider work.
+				if (this.isAbortRequested()) {
+					void this.abortRuntime().catch(() => undefined);
+					throw new Error(`Subagent ${this.id} was aborted before prompt acceptance`);
+				}
 				// Publish before marking acceptance: publishing can itself fail
 				// (daemon hosts re-check preconditions when committing the runtime
 				// registration), and a publish failure must take the unpublished
@@ -609,7 +624,6 @@ class LocalSubagentHandle implements SubagentHandle {
 
 	async abort(source?: AgentAbortSource): Promise<void> {
 		this.assertOpen();
-		this.abortRequested = true;
 		this.onAbortRequested();
 		// Abort the in-process runtime directly so cancellation is signalled before
 		// concurrent disposal can close the loopback transport.
@@ -648,7 +662,7 @@ class LocalSubagentHandle implements SubagentHandle {
 		}
 		this.disposed = true;
 		this.waitForIdle = undefined;
-		const abortInFlightRun = !this.endSettled && !this.abortRequested;
+		const abortInFlightRun = !this.endSettled && !this.isAbortRequested();
 		if (abortInFlightRun) {
 			// Disposing a still-running child must not orphan its turn: when the
 			// runtime is retained (daemon hosts keep child runtimes attachable),
@@ -657,8 +671,8 @@ class LocalSubagentHandle implements SubagentHandle {
 			// directly — the public abort() asserts the handle is still open — and
 			// do it fire-and-forget so a slow-to-cancel child cannot wedge
 			// disposal (and with it a lease handoff). Skipped when an abort was
-			// already requested through the handle so the runtime is signalled
-			// exactly once. Mark the abort request before rejecting the end
+			// already requested through another cancellation path so the runtime is
+			// signalled exactly once. Mark the abort request before rejecting the end
 			// promise so the manager's terminal handler records "aborted" rather
 			// than "failed".
 			this.onAbortRequested();
@@ -744,7 +758,8 @@ class LocalSubagentHandle implements SubagentHandle {
 		this.endSettled = true;
 		this.settleOwnership();
 		const event = latestEndEvent.willRetry ? { ...latestEndEvent, willRetry: false } : latestEndEvent;
-		this.resolveEnd({ id: this.id, sessionId: this.sessionId, event });
+		const terminal = this.resolveTerminalResult(event);
+		this.resolveEnd({ id: this.id, sessionId: this.sessionId, event, ...terminal });
 	}
 
 	private assertOpen(): void {
@@ -1378,6 +1393,12 @@ export class SubagentManager {
 			delegation.scopeLease.scope,
 		);
 		const runtime = await this.createChildRuntime({ cwd, agentDir, sessionManager, subagentContext });
+		let abortRequested = false;
+		const markRunAbortRequested = (): void => {
+			if (abortRequested) return;
+			abortRequested = true;
+			this.markActivityAbortRequested(id);
+		};
 		const turnBudget = new SubagentTurnBudget(delegation.scopeLease.scope.turnLimits);
 		let requiresFinalTurnReport = false;
 		let stopAfterTurnForBudget = false;
@@ -1385,7 +1406,7 @@ export class SubagentManager {
 		let finalResponseSatisfiedBudget = false;
 		const abortForTurnBudget = (): void => {
 			stopAfterTurnForBudget = true;
-			this.markActivityAbortRequested(id);
+			markRunAbortRequested();
 			void runtime.session.abort().catch(() => undefined);
 		};
 		// AgentSession installs these hooks exactly once in its constructor and
@@ -1573,12 +1594,18 @@ export class SubagentManager {
 				onPromptAccepted: publish,
 				onPromptFailed: async (error) => {
 					if (published) {
-						this.finishActivity(id, "failed", errorMessage(error));
+						this.finishActivity(
+							id,
+							abortRequested ? "aborted" : "failed",
+							abortRequested ? undefined : errorMessage(error),
+						);
 						return;
 					}
 					await rollbackRuntimeRegistration();
 				},
-				onAbortRequested: () => this.markActivityAbortRequested(id),
+				onAbortRequested: markRunAbortRequested,
+				isAbortRequested: () => abortRequested,
+				resolveTerminalResult: (event) => resolveTerminalResult(event, abortRequested),
 				// Turn-budget wiring outlives the first terminal: scope accounting on
 				// a disposed scope is a guarded no-op, while the per-runtime turn
 				// posture keeps applying to re-prompts until the runtime is disposed.
@@ -1596,25 +1623,21 @@ export class SubagentManager {
 				},
 			});
 			delegation.reservation.commit(id, () => {
+				markRunAbortRequested();
 				void runtime.session.abort();
 			});
 			this.handles.set(id, handle);
 			void handle.waitForEnd().then(
 				(result) => {
-					const terminal = getTerminalActivityResult(
-						result.event,
-						this.activities.get(id)?.abortRequested === true,
-					);
-					this.finishActivity(id, terminal.status, terminal.error);
+					this.finishActivity(id, result.status, result.error);
 					const output = getFinalAssistantText(result.event);
-					this.getRegistry().complete(id, terminal.status, {
+					this.getRegistry().complete(id, result.status, {
 						...(output !== undefined ? { output } : {}),
-						...(terminal.error !== undefined ? { error: terminal.error } : {}),
+						...(result.error !== undefined ? { error: result.error } : {}),
 					});
 				},
 				(error: unknown) => {
-					const activity = this.activities.get(id);
-					const status = activity?.abortRequested ? "aborted" : "failed";
+					const status = abortRequested ? "aborted" : "failed";
 					const message = status === "failed" ? errorMessage(error) : undefined;
 					this.finishActivity(id, status, message);
 					this.getRegistry().complete(id, status, message !== undefined ? { error: message } : {});

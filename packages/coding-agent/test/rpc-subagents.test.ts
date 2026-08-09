@@ -107,6 +107,7 @@ function createResult(subagentId: string, sessionId: string): SubagentResult {
 		id: subagentId,
 		sessionId,
 		event: { type: "agent_end", messages: [], willRetry: false },
+		status: "completed",
 	};
 }
 

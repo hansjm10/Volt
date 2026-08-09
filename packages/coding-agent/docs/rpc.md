@@ -357,10 +357,10 @@ Child events are wrapped on the parent RPC stream:
 
 ```json
 {"type": "subagent_event", "subagentId": "sa_123", "event": {"type": "agent_start"}}
-{"type": "subagent_end", "subagentId": "sa_123", "result": {"id": "sa_123", "sessionId": "child-session-id", "event": {"type": "agent_end", "messages": [], "willRetry": false}}}
+{"type": "subagent_end", "subagentId": "sa_123", "result": {"id": "sa_123", "sessionId": "child-session-id", "status": "completed", "event": {"type": "agent_end", "messages": [], "willRetry": false}}}
 ```
 
-`subagent_event.event` is the child RPC event. `subagent_end.result` is emitted after the child session settles, including automatic retries, overflow compaction, and queued continuations. The result contains the latest low-level `agent_end` event; `willRetry` is normalized to `false` if a planned retry was cancelled before another run started.
+`subagent_event.event` is the child RPC event. `subagent_end.result` is emitted after the child session settles, including automatic retries, overflow compaction, and queued continuations. Its required `status` is the authoritative terminal outcome: `"completed"`, `"failed"`, or `"aborted"`. The optional `error` field supplies terminal failure detail when available. Clients must not infer the terminal outcome from the nested `event` or its assistant stop reasons: that latest low-level `agent_end` retains attempt history and can contain an error from a retry that was subsequently aborted. `event.willRetry` is normalized to `false` if a planned retry was cancelled before another run started.
 
 When the host releases a subagent — after `subagent_abort`/`subagent_dispose`, when `subagent_start` fails after accepting the child, or when a session switch disposes all active subagents — it emits a terminal frame (possibly after `subagent_end`); no further frames follow for that `subagentId`:
 
