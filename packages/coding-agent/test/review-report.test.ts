@@ -29,9 +29,10 @@ describe("structured review reports", () => {
 		for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 	});
 
-	async function setup(): Promise<ReviewSnapshot> {
+	async function setup(maxBlobBytes?: number): Promise<ReviewSnapshot> {
 		const directory = join(tmpdir(), `volt-review-report-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(join(directory, "src"), { recursive: true });
+		mkdirSync(join(directory, "docs"), { recursive: true });
 		directories.push(directory);
 		git(directory, "init", "--initial-branch=main");
 		git(directory, "config", "user.email", "review@example.com");
@@ -40,7 +41,8 @@ describe("structured review reports", () => {
 			join(directory, "src", "divide.ts"),
 			"export function divide(amount: number, divisor: number) {\n\treturn amount / divisor;\n}\n",
 		);
-		git(directory, "add", "src/divide.ts");
+		writeFileSync(join(directory, "docs", "context.txt"), "x".repeat(512));
+		git(directory, "add", ".");
 		git(directory, "commit", "-m", "initial");
 		writeFileSync(
 			join(directory, "src", "divide.ts"),
@@ -49,6 +51,7 @@ describe("structured review reports", () => {
 		const result = await resolveReviewSnapshot({ kind: "uncommitted" }, directory, {
 			maxCommitRefBytes: 1_024,
 			maxPullRequestNumber: 2_147_483_647,
+			...(maxBlobBytes === undefined ? {} : { limits: { maxBlobBytes } }),
 		});
 		if ("error" in result) throw new Error(result.error);
 		snapshots.push(result);
@@ -133,6 +136,18 @@ describe("structured review reports", () => {
 		expect(traversal.errors.join(" ")).toMatch(/relative|traverse/);
 		const optional = await validateReviewCandidates(snapshot, report({ priority: 3 }), { includeOptional: false });
 		expect(optional.errors.join(" ")).toContain("P3");
+	});
+
+	it("rejects unavailable evidence locations", async () => {
+		const snapshot = await setup(256);
+		const validation = await validateReviewCandidates(
+			snapshot,
+			report({
+				evidenceLocations: [{ path: "docs/context.txt", side: "base", startLine: 1, endLine: 1 }],
+			}),
+			{ includeOptional: false },
+		);
+		expect(validation.errors.join(" ")).toMatch(/unavailable content.*256 bytes/i);
 	});
 
 	it("rejects duplicate root-cause anchors and incomplete verifier decision sets", async () => {

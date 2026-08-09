@@ -69,12 +69,15 @@ function verificationReport(assessment: "complete" | "incomplete" = "complete"):
 	};
 }
 
-async function createSnapshotRepository(harness: Harness): Promise<ReviewSnapshot> {
+async function createSnapshotRepository(
+	harness: Harness,
+	options: { agentsPolicy?: string; maxBlobBytes?: number } = {},
+): Promise<ReviewSnapshot> {
 	mkdirSync(join(harness.tempDir, "src"), { recursive: true });
 	git(harness.tempDir, "init", "--initial-branch=main");
 	git(harness.tempDir, "config", "user.email", "review@example.com");
 	git(harness.tempDir, "config", "user.name", "Review Test");
-	writeFileSync(join(harness.tempDir, "AGENTS.md"), "BASE AGENT POLICY\n");
+	writeFileSync(join(harness.tempDir, "AGENTS.md"), options.agentsPolicy ?? "BASE AGENT POLICY\n");
 	writeFileSync(join(harness.tempDir, "REVIEW.md"), "BASE REVIEW POLICY\n");
 	writeFileSync(
 		join(harness.tempDir, "src", "value.ts"),
@@ -90,6 +93,7 @@ async function createSnapshotRepository(harness: Harness): Promise<ReviewSnapsho
 	const snapshot = await resolveReviewSnapshot({ kind: "uncommitted" }, harness.tempDir, {
 		maxCommitRefBytes: 1_024,
 		maxPullRequestNumber: MAX_GITHUB_PR_NUMBER,
+		...(options.maxBlobBytes === undefined ? {} : { limits: { maxBlobBytes: options.maxBlobBytes } }),
 	});
 	if ("error" in snapshot) throw new Error(snapshot.error);
 	return snapshot;
@@ -235,6 +239,31 @@ describe("two-pass review pipeline", () => {
 		expect(requestSnapshots[1]?.tools).not.toContain("report_review_candidates");
 		expect(requestSnapshots[1]?.messages).not.toContain("Candidate report accepted");
 		expect(harness.session.messages).toHaveLength(0);
+	});
+
+	it("fails closed before model execution when a snapshot policy file is oversized", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const snapshot = await createSnapshotRepository(harness, {
+			agentsPolicy: "policy".repeat(64),
+			maxBlobBytes: 64,
+		});
+		snapshots.push(snapshot);
+
+		const run = await runReview({
+			cwd: harness.tempDir,
+			agentDir: harness.tempDir,
+			model: harness.getModel(),
+			verifierModel: harness.getModel(),
+			authStorage: harness.authStorage,
+			modelRegistry: harness.session.modelRegistry,
+			settingsManager: harness.settingsManager,
+			resolved: snapshot,
+			controls: { scopeMode: "full" },
+		});
+		snapshots.splice(snapshots.indexOf(snapshot), 1);
+		expect(run.errorMessage).toMatch(/Could not load snapshot policy AGENTS\.md.*64 bytes/i);
+		expect(harness.faux.state.callCount).toBe(0);
 	});
 
 	it("does not credit complete discovery coverage to a verifier that inspects nothing", async () => {

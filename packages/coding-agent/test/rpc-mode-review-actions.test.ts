@@ -98,7 +98,6 @@ const reviewMocks = vi.hoisted(() => {
 		diffCommand: "git diff exact-base..exact-head",
 		identity: { kind: "uncommitted", baseTree: "base-tree", headTree: "head-tree" },
 		changedFiles: [],
-		diff: "",
 		root: "/workspace",
 		readFile: vi.fn(async () => undefined),
 		listFiles: vi.fn(async () => []),

@@ -548,6 +548,13 @@ async function loadReviewContextFiles(
 	}
 	const userReviewPolicy = await readOptionalText(join(agentDir, "REVIEW.md"));
 	if (userReviewPolicy !== undefined) files.push({ path: join(agentDir, "REVIEW.md"), content: userReviewPolicy });
+	const readSnapshotPolicy = async (path: string): Promise<string | undefined> => {
+		const file = await snapshot.readFile("base", path);
+		if (!file) return undefined;
+		if (!file.available) throw new Error(`Could not load snapshot policy ${path}: ${file.message}`);
+		if (file.binary) throw new Error(`Could not load snapshot policy ${path}: policy content is binary.`);
+		return file.content.toString("utf8");
+	};
 	const relativeCwd = relative(snapshot.root, resolve(cwd));
 	const withinRoot =
 		relativeCwd === "" ||
@@ -557,16 +564,15 @@ async function loadReviewContextFiles(
 	for (const directory of directories) {
 		for (const name of ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]) {
 			const path = directory ? `${directory}/${name}` : name;
-			const file = await snapshot.readFile("base", path);
-			if (file && !file.binary) {
-				files.push({ path: `snapshot-base:${path}`, content: file.content.toString("utf8") });
+			const content = await readSnapshotPolicy(path);
+			if (content !== undefined) {
+				files.push({ path: `snapshot-base:${path}`, content });
 				break;
 			}
 		}
 		const reviewPath = directory ? `${directory}/REVIEW.md` : "REVIEW.md";
-		const reviewFile = await snapshot.readFile("base", reviewPath);
-		if (reviewFile && !reviewFile.binary)
-			files.push({ path: `snapshot-base:${reviewPath}`, content: reviewFile.content.toString("utf8") });
+		const reviewContent = await readSnapshotPolicy(reviewPath);
+		if (reviewContent !== undefined) files.push({ path: `snapshot-base:${reviewPath}`, content: reviewContent });
 	}
 	return files;
 }

@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -21,12 +22,15 @@ describe("review snapshots", () => {
 	const tempDirectories: string[] = [];
 	const snapshots: ReviewSnapshot[] = [];
 	const initialPath = process.env.PATH;
+	const initialGitTrace = process.env.GIT_TRACE;
 
 	afterEach(async () => {
 		for (const snapshot of snapshots.splice(0)) await snapshot.dispose();
 		for (const directory of tempDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
 		if (initialPath === undefined) delete process.env.PATH;
 		else process.env.PATH = initialPath;
+		if (initialGitTrace === undefined) delete process.env.GIT_TRACE;
+		else process.env.GIT_TRACE = initialGitTrace;
 	});
 
 	function createRepository(withCommit = true): string {
@@ -48,11 +52,21 @@ describe("review snapshots", () => {
 		return directory;
 	}
 
-	async function resolve(target: Parameters<typeof resolveReviewSnapshot>[0], cwd: string): Promise<ReviewSnapshot> {
-		const result = await resolveReviewSnapshot(target, cwd, OPTIONS);
+	async function resolve(
+		target: Parameters<typeof resolveReviewSnapshot>[0],
+		cwd: string,
+		limits?: NonNullable<Parameters<typeof resolveReviewSnapshot>[2]["limits"]>,
+	): Promise<ReviewSnapshot> {
+		const result = await resolveReviewSnapshot(target, cwd, { ...OPTIONS, ...(limits ? { limits } : {}) });
 		if ("error" in result) throw new Error(result.error);
 		snapshots.push(result);
 		return result;
+	}
+
+	async function readAvailableFile(snapshot: ReviewSnapshot, revision: "base" | "head", path: string) {
+		const file = await snapshot.readFile(revision, path);
+		if (!file || !file.available) throw new Error(`Expected ${path} to be available`);
+		return file;
 	}
 
 	it("captures staged, unstaged, untracked, deleted, binary, executable, and symlink state immutably", async () => {
@@ -85,12 +99,12 @@ describe("review snapshots", () => {
 			binary: true,
 			reviewable: false,
 		});
-		expect((await snapshot.readFile("head", "untracked.txt"))?.content.toString()).toBe("untracked\n");
-		expect((await snapshot.readFile("head", "script.sh"))?.entry.mode).toBe("100755");
-		expect((await snapshot.readFile("head", "link.txt"))?.entry.mode).toBe("120000");
+		expect((await readAvailableFile(snapshot, "head", "untracked.txt")).content.toString()).toBe("untracked\n");
+		expect((await readAvailableFile(snapshot, "head", "script.sh")).entry.mode).toBe("100755");
+		expect((await readAvailableFile(snapshot, "head", "link.txt")).entry.mode).toBe("120000");
 
 		writeFileSync(join(repository, "untracked.txt"), "mutated later\n");
-		expect((await snapshot.readFile("head", "untracked.txt"))?.content.toString()).toBe("untracked\n");
+		expect((await readAvailableFile(snapshot, "head", "untracked.txt")).content.toString()).toBe("untracked\n");
 		expect(snapshot.identity.headTree).toBe(originalTree);
 
 		const checkout = await snapshot.materializeHead();
@@ -113,6 +127,142 @@ describe("review snapshots", () => {
 		});
 	});
 
+	it("classifies incompressible binary content without requesting a binary patch", async () => {
+		const repository = createRepository();
+		const binary = randomBytes(256 * 1024);
+		binary[0] = 0;
+		writeFileSync(join(repository, "binary.dat"), binary);
+		const traceDirectory = join(tmpdir(), `volt-review-git-log-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(traceDirectory);
+		tempDirectories.push(traceDirectory);
+		const log = join(traceDirectory, "commands.log");
+		process.env.GIT_TRACE = log;
+
+		const snapshot = await resolve({ kind: "uncommitted" }, repository, { maxPatchBytes: 128 });
+		expect(snapshot.changedFiles.find((file) => file.path === "binary.dat")).toMatchObject({
+			binary: true,
+			reviewable: false,
+			hunks: [],
+			unsupportedReason: "Binary content has no reviewable text hunks.",
+		});
+		const commands = readFileSync(log, "utf8");
+		expect(commands).not.toContain("--binary");
+		expect(commands).not.toMatch(/diff .* -- binary\.dat/);
+	});
+
+	it("rejects over-limit per-file patches without retaining partial hunks", async () => {
+		const repository = createRepository();
+		writeFileSync(
+			join(repository, "large.txt"),
+			Array.from({ length: 40 }, (_, index) => `old-${index}-${"a".repeat(20)}`).join("\n") + "\n",
+		);
+		git(repository, "add", "large.txt");
+		git(repository, "commit", "-m", "add large text");
+		writeFileSync(
+			join(repository, "large.txt"),
+			Array.from({ length: 40 }, (_, index) => `new-${index}-${"b".repeat(20)}`).join("\n") + "\n",
+		);
+
+		const snapshot = await resolve({ kind: "uncommitted" }, repository, { maxPatchBytes: 256 });
+		expect(snapshot.changedFiles.find((file) => file.path === "large.txt")).toMatchObject({
+			binary: false,
+			reviewable: false,
+			hunks: [],
+			unsupportedReason: "Text patch exceeds the 256 bytes per-file review limit.",
+		});
+	});
+
+	it("rejects aggregate patch exhaustion without retaining the over-budget file", async () => {
+		const repository = createRepository();
+		for (const path of ["a.txt", "b.txt"]) {
+			writeFileSync(
+				join(repository, path),
+				Array.from({ length: 10 }, (_, index) => `old-${index}-${"a".repeat(10)}`).join("\n") + "\n",
+			);
+		}
+		git(repository, "add", "a.txt", "b.txt");
+		git(repository, "commit", "-m", "add aggregate fixtures");
+		for (const path of ["a.txt", "b.txt"]) {
+			writeFileSync(
+				join(repository, path),
+				Array.from({ length: 10 }, (_, index) => `new-${index}-${"b".repeat(10)}`).join("\n") + "\n",
+			);
+		}
+
+		const snapshot = await resolve({ kind: "uncommitted" }, repository, {
+			maxPatchBytes: 2_048,
+			maxRetainedPatchBytes: 600,
+		});
+		const fixtures = snapshot.changedFiles.filter((file) => file.path === "a.txt" || file.path === "b.txt");
+		expect(fixtures.filter((file) => file.reviewable)).toHaveLength(1);
+		expect(fixtures.filter((file) => !file.reviewable)).toMatchObject([
+			{
+				hunks: [],
+				unsupportedReason: "Text patch exceeds the 600 bytes aggregate review budget.",
+			},
+		]);
+	});
+
+	it("preserves ordinary text, rename, and binary classifications with stable hunk ids", async () => {
+		const repository = createRepository();
+		const renameLines = Array.from({ length: 40 }, (_, index) => `rename line ${index}`);
+		writeFileSync(join(repository, "old-name.txt"), `${renameLines.join("\n")}\n`);
+		writeFileSync(join(repository, "existing.bin"), Buffer.from([0, 1, 2, 3]));
+		git(repository, "add", "old-name.txt", "existing.bin");
+		git(repository, "commit", "-m", "add rename and binary fixtures");
+		writeFileSync(join(repository, "tracked.txt"), "ordinary text change\n");
+		git(repository, "mv", "old-name.txt", "new-name.txt");
+		renameLines[20] = "renamed and changed";
+		writeFileSync(join(repository, "new-name.txt"), `${renameLines.join("\n")}\n`);
+		writeFileSync(join(repository, "existing.bin"), Buffer.from([0, 4, 5, 6]));
+
+		const first = await resolve({ kind: "uncommitted" }, repository);
+		const second = await resolve({ kind: "uncommitted" }, repository);
+		expect(first.changedFiles.find((file) => file.path === "tracked.txt")).toMatchObject({
+			status: "modified",
+			binary: false,
+			reviewable: true,
+		});
+		expect(first.changedFiles.find((file) => file.path === "new-name.txt")).toMatchObject({
+			status: "renamed",
+			previousPath: "old-name.txt",
+			binary: false,
+			reviewable: true,
+		});
+		expect(first.changedFiles.find((file) => file.path === "existing.bin")).toMatchObject({
+			binary: true,
+			reviewable: false,
+			unsupportedReason: "Binary content has no reviewable text hunks.",
+		});
+		expect(first.changedFiles.map((file) => [file.path, file.hunks.map((hunk) => hunk.id)])).toEqual(
+			second.changedFiles.map((file) => [file.path, file.hunks.map((hunk) => hunk.id)]),
+		);
+	});
+
+	it("rejects oversized on-demand blobs before invoking cat-file", async () => {
+		const repository = createRepository();
+		writeFileSync(join(repository, "large-context.txt"), "x".repeat(256));
+		git(repository, "add", "large-context.txt");
+		git(repository, "commit", "-m", "add large context");
+		writeFileSync(join(repository, "tracked.txt"), "after\n");
+		const traceDirectory = join(tmpdir(), `volt-review-cat-log-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(traceDirectory);
+		tempDirectories.push(traceDirectory);
+		const log = join(traceDirectory, "commands.log");
+		process.env.GIT_TRACE = log;
+
+		const snapshot = await resolve({ kind: "uncommitted" }, repository, { maxBlobBytes: 64 });
+		const file = await snapshot.readFile("head", "large-context.txt");
+		expect(file).toMatchObject({
+			available: false,
+			reason: "oversized",
+			entry: { path: "large-context.txt", size: 256 },
+			message: expect.stringContaining("64 bytes"),
+		});
+		if (!file) throw new Error("Expected an unavailable file result");
+		expect(readFileSync(log, "utf8")).not.toContain(`cat-file blob ${file.entry.oid}`);
+	});
+
 	it("uses merge-base and captured HEAD identities for branch reviews", async () => {
 		const repository = createRepository();
 		git(repository, "checkout", "-b", "feature");
@@ -128,10 +278,15 @@ describe("review snapshots", () => {
 			headCommit: expectedHead,
 			mergeBaseCommit: expectedMergeBase,
 		});
-		expect(snapshot.diff).toContain("+feature");
+		expect(
+			snapshot.changedFiles
+				.flatMap((file) => file.hunks)
+				.map((hunk) => hunk.patch)
+				.join("\n"),
+		).toContain("+feature");
 
 		git(repository, "checkout", "main");
-		expect((await snapshot.readFile("head", "tracked.txt"))?.content.toString()).toBe("feature\n");
+		expect((await readAvailableFile(snapshot, "head", "tracked.txt")).content.toString()).toBe("feature\n");
 	});
 
 	it("reviews root commits against an empty tree and merge commits against first parent", async () => {
@@ -152,7 +307,12 @@ describe("review snapshots", () => {
 		const mergeParent = git(mergeRepository, "rev-parse", "HEAD^1");
 		const mergeSnapshot = await resolve({ kind: "commit", sha: "HEAD" }, mergeRepository);
 		expect(mergeSnapshot.identity.baseCommit).toBe(mergeParent);
-		expect(mergeSnapshot.diff).toContain("+feature");
+		expect(
+			mergeSnapshot.changedFiles
+				.flatMap((file) => file.hunks)
+				.map((hunk) => hunk.patch)
+				.join("\n"),
+		).toContain("+feature");
 	});
 
 	it("verifies fetched pull request base and head OIDs and rejects moved metadata", async () => {
@@ -183,7 +343,12 @@ describe("review snapshots", () => {
 
 		const snapshot = await resolve({ kind: "pr", number: "7" }, repository);
 		expect(snapshot.identity.pullRequest).toMatchObject({ number: 7, baseRefOid: baseOid, headRefOid: headOid });
-		expect(snapshot.diff).toContain("+pull request");
+		expect(
+			snapshot.changedFiles
+				.flatMap((file) => file.hunks)
+				.map((hunk) => hunk.patch)
+				.join("\n"),
+		).toContain("+pull request");
 
 		writeFileSync(gh, readFileSync(gh, "utf8").replace(headOid, baseOid));
 		const moved = await resolveReviewSnapshot({ kind: "pr", number: "7" }, repository, OPTIONS);
@@ -221,6 +386,16 @@ describe("review snapshots", () => {
 		expect(result).toMatchObject({
 			error: "Working tree changed while Volt captured the review snapshot. Retry the review.",
 		});
+	});
+
+	it("returns a distinct error when bounded metadata output is exceeded", async () => {
+		const repository = createRepository();
+		writeFileSync(join(repository, "tracked.txt"), "after\n");
+		const result = await resolveReviewSnapshot({ kind: "uncommitted" }, repository, {
+			...OPTIONS,
+			limits: { maxMetadataBytes: 8 },
+		});
+		expect(result).toMatchObject({ error: expect.stringMatching(/stdout exceeded the 8 bytes capture limit/i) });
 	});
 
 	it("rejects unsafe repository paths", () => {

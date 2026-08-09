@@ -320,6 +320,7 @@ async function validateLocationExists(
 	}
 	const file = await snapshot.readFile(location.side, path);
 	if (!file) return [...errors, `${label} does not exist in the ${location.side} snapshot: ${path}`];
+	if (!file.available) return [...errors, `${label} points to unavailable content: ${path} (${file.message})`];
 	if (file.binary) return [...errors, `${label} points to binary content: ${path}`];
 	if (location.endLine > (file.lineCount ?? 0)) errors.push(`${label} exceeds ${path}'s ${location.side} line count`);
 	return errors;

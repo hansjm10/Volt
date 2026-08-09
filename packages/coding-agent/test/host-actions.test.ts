@@ -567,7 +567,6 @@ function createCompletedReviewResult(
 		resolution: {
 			identity: { kind: "uncommitted", baseTree: "a".repeat(40), headTree: "b".repeat(40) },
 			changedFiles: [],
-			diff: "",
 			root: "/tmp/review",
 			description: "uncommitted changes",
 			workflowDescription: "uncommitted changes",

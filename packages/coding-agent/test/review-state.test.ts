@@ -138,7 +138,6 @@ function snapshot(headOid: string, hunkId = "hunk-1"): ReviewSnapshot {
 				reviewable: true,
 			},
 		],
-		diff: "+value",
 		root: "/tmp/review",
 		readFile: async () => undefined,
 		listFiles: async () => [],

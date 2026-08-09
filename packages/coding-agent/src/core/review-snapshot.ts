@@ -74,12 +74,20 @@ export interface ReviewSnapshotIdentity {
 	pullRequest?: ReviewPullRequestIdentity;
 }
 
-export interface ReviewSnapshotFile {
-	entry: ReviewSnapshotTreeEntry;
-	content: Buffer;
-	binary: boolean;
-	lineCount?: number;
-}
+export type ReviewSnapshotFile =
+	| {
+			available: true;
+			entry: ReviewSnapshotTreeEntry;
+			content: Buffer;
+			binary: boolean;
+			lineCount?: number;
+	  }
+	| {
+			available: false;
+			entry: ReviewSnapshotTreeEntry;
+			reason: "oversized" | "output-limit" | "read-failed";
+			message: string;
+	  };
 
 export interface ReviewSnapshotPage {
 	text: string;
@@ -101,7 +109,6 @@ export interface ReviewSnapshot {
 	extraContext?: string;
 	identity: ReviewSnapshotIdentity;
 	changedFiles: ReviewChangedFile[];
-	diff: string;
 	root: string;
 	readFile(revision: ReviewSnapshotRevision, path: string): Promise<ReviewSnapshotFile | undefined>;
 	listFiles(options?: ReviewSnapshotListOptions): Promise<ReviewSnapshotTreeEntry[]>;
@@ -117,18 +124,35 @@ export interface ReviewSnapshotResolutionError {
 export interface ResolveReviewSnapshotOptions {
 	maxCommitRefBytes: number;
 	maxPullRequestNumber: number;
+	limits?: Partial<ReviewSnapshotLimits>;
+}
+
+interface ReviewSnapshotLimits {
+	maxMetadataBytes: number;
+	maxStderrBytes: number;
+	maxPatchBytes: number;
+	maxRetainedPatchBytes: number;
+	maxBlobBytes: number;
+}
+
+interface CommandOutputLimitFailure {
+	kind: "output-limit";
+	stream: "stdout" | "stderr";
+	limit: number;
 }
 
 interface CommandResult {
 	ok: boolean;
 	stdout: Buffer;
 	stderr: string;
+	failure?: CommandOutputLimitFailure;
 }
 
 interface GitSource {
 	cwd: string;
 	env?: Record<string, string>;
 	objectDirectories: string[];
+	limits: ReviewSnapshotLimits;
 }
 
 interface SnapshotInit {
@@ -140,6 +164,7 @@ interface SnapshotInit {
 	root: string;
 	source: GitSource;
 	temporaryDirectories: string[];
+	limits: ReviewSnapshotLimits;
 }
 
 interface PullRequestView {
@@ -156,103 +181,247 @@ interface PullRequestView {
 const CANONICAL_GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const DEFAULT_DIFF_CONTEXT_LINES = 3;
 const MAX_STABLE_CAPTURE_ATTEMPTS = 3;
+const DEFAULT_REVIEW_SNAPSHOT_LIMITS: ReviewSnapshotLimits = {
+	maxMetadataBytes: 32 * 1024 * 1024,
+	maxStderrBytes: 64 * 1024,
+	maxPatchBytes: 4 * 1024 * 1024,
+	maxRetainedPatchBytes: 32 * 1024 * 1024,
+	maxBlobBytes: 8 * 1024 * 1024,
+};
+
+function normalizeLimit(value: number | undefined, fallback: number, name: string): number {
+	if (value === undefined) return fallback;
+	if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive safe integer.`);
+	return value;
+}
+
+function normalizeSnapshotLimits(overrides: Partial<ReviewSnapshotLimits> | undefined): ReviewSnapshotLimits {
+	return {
+		maxMetadataBytes: normalizeLimit(
+			overrides?.maxMetadataBytes,
+			DEFAULT_REVIEW_SNAPSHOT_LIMITS.maxMetadataBytes,
+			"maxMetadataBytes",
+		),
+		maxStderrBytes: normalizeLimit(
+			overrides?.maxStderrBytes,
+			DEFAULT_REVIEW_SNAPSHOT_LIMITS.maxStderrBytes,
+			"maxStderrBytes",
+		),
+		maxPatchBytes: normalizeLimit(
+			overrides?.maxPatchBytes,
+			DEFAULT_REVIEW_SNAPSHOT_LIMITS.maxPatchBytes,
+			"maxPatchBytes",
+		),
+		maxRetainedPatchBytes: normalizeLimit(
+			overrides?.maxRetainedPatchBytes,
+			DEFAULT_REVIEW_SNAPSHOT_LIMITS.maxRetainedPatchBytes,
+			"maxRetainedPatchBytes",
+		),
+		maxBlobBytes: normalizeLimit(
+			overrides?.maxBlobBytes,
+			DEFAULT_REVIEW_SNAPSHOT_LIMITS.maxBlobBytes,
+			"maxBlobBytes",
+		),
+	};
+}
+
+function formatByteLimit(bytes: number): string {
+	if (bytes % (1024 * 1024) === 0) return `${bytes / (1024 * 1024)} MiB`;
+	if (bytes % 1024 === 0) return `${bytes / 1024} KiB`;
+	return `${bytes} bytes`;
+}
 
 function runCommand(
 	command: string,
 	args: string[],
 	cwd: string,
-	options: { env?: Record<string, string>; input?: Buffer | string; signal?: AbortSignal } = {},
+	options: {
+		env?: Record<string, string>;
+		input?: Buffer | string;
+		signal?: AbortSignal;
+		maxStdoutBytes?: number;
+		maxStderrBytes?: number;
+	} = {},
 ): Promise<CommandResult> {
 	return new Promise((resolveResult) => {
+		const maxStdoutBytes = options.maxStdoutBytes ?? DEFAULT_REVIEW_SNAPSHOT_LIMITS.maxMetadataBytes;
+		const maxStderrBytes = options.maxStderrBytes ?? DEFAULT_REVIEW_SNAPSHOT_LIMITS.maxStderrBytes;
 		const proc = spawn(command, args, {
 			cwd,
 			stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 			env: options.env ? { ...process.env, ...options.env } : process.env,
 			signal: options.signal,
 		});
-		const stdout: Buffer[] = [];
-		let stderr = "";
-		proc.stdout?.on("data", (data: Buffer) => stdout.push(data));
+		let stdout: Buffer[] = [];
+		let stdoutBytes = 0;
+		let stderr: Buffer[] = [];
+		let stderrBytes = 0;
+		let failure: CommandOutputLimitFailure | undefined;
+		let settled = false;
+		const finish = (result: CommandResult): void => {
+			if (settled) return;
+			settled = true;
+			resolveResult(result);
+		};
+		const exceed = (stream: CommandOutputLimitFailure["stream"], limit: number): void => {
+			if (failure) return;
+			failure = { kind: "output-limit", stream, limit };
+			stdout = [];
+			stderr = [];
+			proc.kill();
+		};
+		proc.stdout?.on("data", (data: Buffer) => {
+			if (failure) return;
+			stdoutBytes += data.length;
+			if (stdoutBytes > maxStdoutBytes) exceed("stdout", maxStdoutBytes);
+			else stdout.push(data);
+		});
 		proc.stderr?.on("data", (data: Buffer) => {
-			stderr += data.toString();
+			if (failure) return;
+			stderrBytes += data.length;
+			if (stderrBytes > maxStderrBytes) exceed("stderr", maxStderrBytes);
+			else stderr.push(data);
 		});
 		proc.on("error", (error) => {
-			resolveResult({ ok: false, stdout: Buffer.concat(stdout), stderr: error.message });
+			if (failure) return;
+			finish({ ok: false, stdout: Buffer.concat(stdout), stderr: error.message });
 		});
 		proc.on("close", (code) => {
-			resolveResult({ ok: code === 0, stdout: Buffer.concat(stdout), stderr });
+			if (failure) {
+				finish({ ok: false, stdout: Buffer.alloc(0), stderr: "", failure });
+				return;
+			}
+			finish({
+				ok: code === 0,
+				stdout: Buffer.concat(stdout, stdoutBytes),
+				stderr: Buffer.concat(stderr, stderrBytes).toString("utf8"),
+			});
 		});
-		if (options.input !== undefined) {
-			proc.stdin?.end(options.input);
-		}
+		if (options.input !== undefined) proc.stdin?.end(options.input);
 	});
 }
 
-function git(source: Pick<GitSource, "cwd" | "env">, args: string[], input?: Buffer | string): Promise<CommandResult> {
-	return runCommand("git", args, source.cwd, { env: source.env, input });
+function git(
+	source: Pick<GitSource, "cwd" | "env" | "limits">,
+	args: string[],
+	input?: Buffer | string,
+	maxStdoutBytes = source.limits.maxMetadataBytes,
+): Promise<CommandResult> {
+	return runCommand("git", args, source.cwd, {
+		env: source.env,
+		input,
+		maxStdoutBytes,
+		maxStderrBytes: source.limits.maxStderrBytes,
+	});
 }
 
 function text(result: CommandResult): string {
 	return result.stdout.toString("utf8");
 }
 
+function commandError(result: CommandResult): string {
+	if (result.failure) {
+		return `${result.failure.stream} exceeded the ${formatByteLimit(result.failure.limit)} capture limit`;
+	}
+	return result.stderr.trim() || "command exited unsuccessfully";
+}
+
+function throwIfOutputLimited(prefix: string, result: CommandResult): void {
+	if (result.failure) throw new Error(`${prefix}: ${commandError(result)}`);
+}
+
 function commandFailure(prefix: string, result: CommandResult): ReviewSnapshotResolutionError {
-	return { error: `${prefix}: ${result.stderr.trim()}` };
+	return { error: `${prefix}: ${commandError(result)}` };
 }
 
 async function requireCanonicalCommit(
-	source: Pick<GitSource, "cwd" | "env">,
+	source: Pick<GitSource, "cwd" | "env" | "limits">,
 	ref: string,
 ): Promise<string | undefined> {
 	const result = await git(source, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`]);
+	throwIfOutputLimited("git rev-parse failed", result);
 	const oid = text(result).trim();
 	return result.ok && CANONICAL_GIT_OBJECT_ID_PATTERN.test(oid) ? oid : undefined;
 }
 
-async function requireCanonicalTree(source: Pick<GitSource, "cwd" | "env">, ref: string): Promise<string | undefined> {
+async function requireCanonicalTree(
+	source: Pick<GitSource, "cwd" | "env" | "limits">,
+	ref: string,
+): Promise<string | undefined> {
 	const result = await git(source, ["rev-parse", "--verify", "--end-of-options", `${ref}^{tree}`]);
+	throwIfOutputLimited("git rev-parse failed", result);
 	const oid = text(result).trim();
 	return result.ok && CANONICAL_GIT_OBJECT_ID_PATTERN.test(oid) ? oid : undefined;
 }
 
-async function createEmptyTree(source: Pick<GitSource, "cwd" | "env">): Promise<string> {
+async function createEmptyTree(source: Pick<GitSource, "cwd" | "env" | "limits">): Promise<string> {
 	const result = await git(source, ["mktree"], "");
 	const oid = text(result).trim();
 	if (!result.ok || !CANONICAL_GIT_OBJECT_ID_PATTERN.test(oid)) {
-		throw new Error(`Could not create an empty review tree: ${result.stderr.trim()}`);
+		throw new Error(`Could not create an empty review tree: ${commandError(result)}`);
 	}
 	return oid;
 }
 
-async function repositoryRoot(cwd: string): Promise<string | undefined> {
-	const result = await runCommand("git", ["rev-parse", "--show-toplevel"], cwd);
+function commandOptions(limits: ReviewSnapshotLimits): { maxStdoutBytes: number; maxStderrBytes: number } {
+	return { maxStdoutBytes: limits.maxMetadataBytes, maxStderrBytes: limits.maxStderrBytes };
+}
+
+async function repositoryRoot(cwd: string, limits: ReviewSnapshotLimits): Promise<string | undefined> {
+	const result = await runCommand("git", ["rev-parse", "--show-toplevel"], cwd, commandOptions(limits));
+	throwIfOutputLimited("git rev-parse failed", result);
 	return result.ok ? text(result).trim() || undefined : undefined;
 }
 
-async function repositoryObjectDirectory(cwd: string): Promise<string | undefined> {
-	const result = await runCommand("git", ["rev-parse", "--path-format=absolute", "--git-path", "objects"], cwd);
+async function repositoryObjectDirectory(cwd: string, limits: ReviewSnapshotLimits): Promise<string | undefined> {
+	const result = await runCommand(
+		"git",
+		["rev-parse", "--path-format=absolute", "--git-path", "objects"],
+		cwd,
+		commandOptions(limits),
+	);
+	throwIfOutputLimited("git rev-parse failed", result);
 	return result.ok ? text(result).trim() || undefined : undefined;
 }
 
-async function detectBaseBranch(cwd: string): Promise<string | undefined> {
-	const originHead = await runCommand("git", ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd);
+async function detectBaseBranch(cwd: string, limits: ReviewSnapshotLimits): Promise<string | undefined> {
+	const originHead = await runCommand(
+		"git",
+		["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+		cwd,
+		commandOptions(limits),
+	);
+	throwIfOutputLimited("git symbolic-ref failed", originHead);
 	if (originHead.ok) {
 		const ref = text(originHead).trim();
 		if (ref) return ref;
 	}
 	for (const candidate of ["main", "master"]) {
-		const exists = await runCommand("git", ["rev-parse", "--verify", "--quiet", candidate], cwd);
+		const exists = await runCommand(
+			"git",
+			["rev-parse", "--verify", "--quiet", candidate],
+			cwd,
+			commandOptions(limits),
+		);
+		throwIfOutputLimited("git rev-parse failed", exists);
 		if (exists.ok) return candidate;
 	}
 	return undefined;
 }
 
-async function resolveBaseRef(base: string, cwd: string): Promise<string | undefined> {
-	const direct = await runCommand("git", ["rev-parse", "--verify", "--quiet", base], cwd);
+async function resolveBaseRef(base: string, cwd: string, limits: ReviewSnapshotLimits): Promise<string | undefined> {
+	const direct = await runCommand("git", ["rev-parse", "--verify", "--quiet", base], cwd, commandOptions(limits));
+	throwIfOutputLimited("git rev-parse failed", direct);
 	if (direct.ok) return base;
 	if (!base.startsWith("origin/")) {
 		const remote = `origin/${base}`;
-		const remoteExists = await runCommand("git", ["rev-parse", "--verify", "--quiet", remote], cwd);
+		const remoteExists = await runCommand(
+			"git",
+			["rev-parse", "--verify", "--quiet", remote],
+			cwd,
+			commandOptions(limits),
+		);
+		throwIfOutputLimited("git rev-parse failed", remoteExists);
 		if (remoteExists.ok) return remote;
 	}
 	return undefined;
@@ -304,14 +473,17 @@ function normalizePullRequestNumber(value: string | undefined, maximum: number):
 	return Number.isSafeInteger(numeric) && numeric <= maximum ? number : undefined;
 }
 
-async function createLocalSource(root: string): Promise<GitSource> {
-	const objects = await repositoryObjectDirectory(root);
+async function createLocalSource(root: string, limits: ReviewSnapshotLimits): Promise<GitSource> {
+	const objects = await repositoryObjectDirectory(root, limits);
 	if (!objects) throw new Error("Could not resolve the Git object directory.");
-	return { cwd: root, objectDirectories: [objects] };
+	return { cwd: root, objectDirectories: [objects], limits };
 }
 
-async function createUncommittedSource(root: string): Promise<{ source: GitSource; temporaryDirectory: string }> {
-	const originalObjects = await repositoryObjectDirectory(root);
+async function createUncommittedSource(
+	root: string,
+	limits: ReviewSnapshotLimits,
+): Promise<{ source: GitSource; temporaryDirectory: string }> {
+	const originalObjects = await repositoryObjectDirectory(root, limits);
 	if (!originalObjects) throw new Error("Could not resolve the Git object directory.");
 	const temporaryDirectory = await mkdtemp(join(tmpdir(), "volt-review-snapshot-"));
 	const objects = join(temporaryDirectory, "objects");
@@ -324,6 +496,7 @@ async function createUncommittedSource(root: string): Promise<{ source: GitSourc
 			GIT_ALTERNATE_OBJECT_DIRECTORIES: originalObjects,
 		},
 		objectDirectories: [objects, originalObjects],
+		limits,
 	};
 	return { source, temporaryDirectory };
 }
@@ -367,13 +540,14 @@ async function captureWorktreeTree(
 async function createPullRequestSource(
 	root: string,
 	pullRequest: PullRequestView,
+	limits: ReviewSnapshotLimits,
 ): Promise<{ source?: GitSource; temporaryDirectory?: string; error?: ReviewSnapshotResolutionError }> {
-	const originResult = await runCommand("git", ["remote", "get-url", "origin"], root);
+	const originResult = await runCommand("git", ["remote", "get-url", "origin"], root, commandOptions(limits));
 	if (!originResult.ok || !text(originResult).trim()) {
 		return { error: { error: "Could not resolve the origin remote for the pull request snapshot." } };
 	}
 	const temporaryDirectory = await mkdtemp(join(tmpdir(), "volt-review-pr-"));
-	const init = await runCommand("git", ["init", "--bare"], temporaryDirectory);
+	const init = await runCommand("git", ["init", "--bare"], temporaryDirectory, commandOptions(limits));
 	if (!init.ok) {
 		await rm(temporaryDirectory, { recursive: true, force: true });
 		return { error: commandFailure("git init failed", init) };
@@ -381,6 +555,7 @@ async function createPullRequestSource(
 	const source: GitSource = {
 		cwd: temporaryDirectory,
 		objectDirectories: [join(temporaryDirectory, "objects")],
+		limits,
 	};
 	const fetch = await git(source, [
 		"fetch",
@@ -394,7 +569,7 @@ async function createPullRequestSource(
 		await rm(temporaryDirectory, { recursive: true, force: true });
 		return {
 			error: {
-				error: `git fetch failed: ${fetch.stderr.trim()}`,
+				error: `git fetch failed: ${commandError(fetch)}`,
 				remoteError: "Could not fetch the exact pull request snapshot.",
 			},
 		};
@@ -411,20 +586,6 @@ async function createPullRequestSource(
 		};
 	}
 	return { source, temporaryDirectory };
-}
-
-async function diffTrees(source: GitSource, baseTree: string, headTree: string): Promise<CommandResult> {
-	return git(source, [
-		"diff",
-		"--binary",
-		"--no-color",
-		"--no-textconv",
-		"--no-ext-diff",
-		`--unified=${DEFAULT_DIFF_CONTEXT_LINES}`,
-		"--find-renames",
-		baseTree,
-		headTree,
-	]);
 }
 
 function statusFromGit(value: string): ReviewChangedFileStatus {
@@ -467,6 +628,20 @@ function parseNameStatus(stdout: Buffer): NameStatusEntry[] {
 		if (path) entries.push({ path, status: statusFromGit(statusToken) });
 	}
 	return entries;
+}
+
+function parseBinaryPathsFromNumstat(stdout: Buffer): Set<string> {
+	const binaryPaths = new Set<string>();
+	for (const token of stdout.toString("utf8").split("\0")) {
+		if (!token) continue;
+		const firstTab = token.indexOf("\t");
+		const secondTab = firstTab < 0 ? -1 : token.indexOf("\t", firstTab + 1);
+		if (firstTab < 0 || secondTab < 0) continue;
+		if (token.slice(0, firstTab) === "-" && token.slice(firstTab + 1, secondTab) === "-") {
+			binaryPaths.add(token.slice(secondTab + 1));
+		}
+	}
+	return binaryPaths;
 }
 
 function parseTree(stdout: Buffer): Map<string, ReviewSnapshotTreeEntry> {
@@ -569,11 +744,6 @@ function parseHunks(path: string, patch: string): ReviewSnapshotHunk[] {
 	return hunks;
 }
 
-async function readBlob(source: GitSource, oid: string): Promise<Buffer | undefined> {
-	const result = await git(source, ["cat-file", "blob", oid]);
-	return result.ok ? result.stdout : undefined;
-}
-
 function isBinary(content: Buffer): boolean {
 	return content.subarray(0, Math.min(content.length, 8_192)).includes(0);
 }
@@ -594,36 +764,65 @@ async function buildChangedFiles(
 	headEntries: Map<string, ReviewSnapshotTreeEntry>,
 ): Promise<ReviewChangedFile[]> {
 	const statusResult = await git(source, ["diff", "--name-status", "-z", "--find-renames", baseTree, headTree]);
-	if (!statusResult.ok) throw new Error(`git diff --name-status failed: ${statusResult.stderr.trim()}`);
+	if (!statusResult.ok) throw new Error(`git diff --name-status failed: ${commandError(statusResult)}`);
+	const numstatResult = await git(source, ["diff", "--numstat", "-z", "--no-renames", baseTree, headTree]);
+	if (!numstatResult.ok) throw new Error(`git diff --numstat failed: ${commandError(numstatResult)}`);
+	const binaryPaths = parseBinaryPathsFromNumstat(numstatResult.stdout);
 	const changed: ReviewChangedFile[] = [];
+	let retainedPatchBytes = 0;
 	for (const statusEntry of parseNameStatus(statusResult.stdout)) {
-		const pathspecs = statusEntry.previousPath ? [statusEntry.previousPath, statusEntry.path] : [statusEntry.path];
-		const patchResult = await git(source, [
-			"diff",
-			"--binary",
-			"--no-color",
-			"--no-textconv",
-			"--no-ext-diff",
-			`--unified=${DEFAULT_DIFF_CONTEXT_LINES}`,
-			"--find-renames",
-			baseTree,
-			headTree,
-			"--",
-			...pathspecs,
-		]);
-		if (!patchResult.ok) throw new Error(`git diff failed for ${statusEntry.path}: ${patchResult.stderr.trim()}`);
-		const base = baseEntries.get(statusEntry.previousPath ?? statusEntry.path);
+		const basePath = statusEntry.previousPath ?? statusEntry.path;
+		const base = baseEntries.get(basePath);
 		const head = headEntries.get(statusEntry.path);
-		const contentEntry = head?.type === "blob" ? head : base?.type === "blob" ? base : undefined;
-		const content = contentEntry ? await readBlob(source, contentEntry.oid) : undefined;
-		const binary = content ? isBinary(content) : false;
-		const hunks = binary ? [] : parseHunks(statusEntry.path, text(patchResult));
+		const binary = binaryPaths.has(basePath) || binaryPaths.has(statusEntry.path);
+		const oversized = [base, head].some(
+			(entry) => entry?.type === "blob" && (entry.size === undefined || entry.size > source.limits.maxBlobBytes),
+		);
+		let hunks: ReviewSnapshotHunk[] = [];
 		let unsupportedReason: string | undefined;
-		if (base?.type === "commit" || head?.type === "commit")
+		if (base?.type === "commit" || head?.type === "commit") {
 			unsupportedReason = "Submodule changes require review in the submodule repository.";
-		else if (binary) unsupportedReason = "Binary content has no reviewable text hunks.";
-		else if (hunks.length === 0)
-			unsupportedReason = "The change has no textual diff hunk (for example, a mode-only change).";
+		} else if (binary) {
+			unsupportedReason = "Binary content has no reviewable text hunks.";
+		} else if (oversized) {
+			unsupportedReason = `File content exceeds the ${formatByteLimit(source.limits.maxBlobBytes)} snapshot blob limit.`;
+		} else {
+			const pathspecs = statusEntry.previousPath ? [statusEntry.previousPath, statusEntry.path] : [statusEntry.path];
+			const patchResult = await git(
+				source,
+				[
+					"diff",
+					"--no-color",
+					"--no-textconv",
+					"--no-ext-diff",
+					`--unified=${DEFAULT_DIFF_CONTEXT_LINES}`,
+					"--find-renames",
+					baseTree,
+					headTree,
+					"--",
+					...pathspecs,
+				],
+				undefined,
+				source.limits.maxPatchBytes,
+			);
+			if (patchResult.failure?.stream === "stdout") {
+				unsupportedReason = `Text patch exceeds the ${formatByteLimit(source.limits.maxPatchBytes)} per-file review limit.`;
+			} else if (!patchResult.ok) {
+				throw new Error(`git diff failed for ${statusEntry.path}: ${commandError(patchResult)}`);
+			} else {
+				const parsedHunks = parseHunks(statusEntry.path, text(patchResult));
+				const patchBytes = parsedHunks.reduce((total, hunk) => total + Buffer.byteLength(hunk.patch, "utf8"), 0);
+				if (retainedPatchBytes + patchBytes > source.limits.maxRetainedPatchBytes) {
+					unsupportedReason = `Text patch exceeds the ${formatByteLimit(source.limits.maxRetainedPatchBytes)} aggregate review budget.`;
+				} else {
+					hunks = parsedHunks;
+					retainedPatchBytes += patchBytes;
+					if (hunks.length === 0) {
+						unsupportedReason = "The change has no textual diff hunk (for example, a mode-only change).";
+					}
+				}
+			}
+		}
 		changed.push({
 			...statusEntry,
 			...(base ? { base } : {}),
@@ -645,8 +844,8 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	readonly identity: ReviewSnapshotIdentity;
 	readonly root: string;
 	readonly changedFiles: ReviewChangedFile[];
-	readonly diff: string;
 	private readonly source: GitSource;
+	private readonly limits: ReviewSnapshotLimits;
 	private readonly temporaryDirectories: string[];
 	private readonly materializedDirectories: string[] = [];
 	private readonly treeEntries = new Map<ReviewSnapshotRevision, Map<string, ReviewSnapshotTreeEntry>>();
@@ -655,7 +854,6 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	private constructor(
 		init: SnapshotInit,
 		changedFiles: ReviewChangedFile[],
-		diff: string,
 		baseEntries: Map<string, ReviewSnapshotTreeEntry>,
 		headEntries: Map<string, ReviewSnapshotTreeEntry>,
 	) {
@@ -666,9 +864,9 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		this.identity = init.identity;
 		this.root = init.root;
 		this.source = init.source;
+		this.limits = init.limits;
 		this.temporaryDirectories = init.temporaryDirectories;
 		this.changedFiles = changedFiles;
-		this.diff = diff;
 		this.treeEntries.set("base", baseEntries);
 		this.treeEntries.set("head", headEntries);
 	}
@@ -678,13 +876,11 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		const headTreeResult = await git(init.source, ["ls-tree", "-r", "-z", "-l", init.identity.headTree]);
 		if (!baseTreeResult.ok || !headTreeResult.ok) {
 			throw new Error(
-				`Could not inventory review snapshot trees: ${(baseTreeResult.ok ? headTreeResult : baseTreeResult).stderr.trim()}`,
+				`Could not inventory review snapshot trees: ${commandError(baseTreeResult.ok ? headTreeResult : baseTreeResult)}`,
 			);
 		}
 		const baseEntries = parseTree(baseTreeResult.stdout);
 		const headEntries = parseTree(headTreeResult.stdout);
-		const diffResult = await diffTrees(init.source, init.identity.baseTree, init.identity.headTree);
-		if (!diffResult.ok) throw new Error(`git diff failed: ${diffResult.stderr.trim()}`);
 		const changedFiles = await buildChangedFiles(
 			init.source,
 			init.identity.baseTree,
@@ -692,7 +888,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			baseEntries,
 			headEntries,
 		);
-		return new GitReviewSnapshot(init, changedFiles, text(diffResult), baseEntries, headEntries);
+		return new GitReviewSnapshot(init, changedFiles, baseEntries, headEntries);
 	}
 
 	async readFile(revision: ReviewSnapshotRevision, path: string): Promise<ReviewSnapshotFile | undefined> {
@@ -700,10 +896,51 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		const normalized = normalizeReviewPath(path);
 		const entry = this.treeEntries.get(revision)?.get(normalized);
 		if (!entry || entry.type !== "blob") return undefined;
-		const content = await readBlob(this.source, entry.oid);
-		if (!content) return undefined;
+		if (entry.size === undefined) {
+			return {
+				available: false,
+				entry,
+				reason: "read-failed",
+				message: "Git did not report a blob size, so the file was not read.",
+			};
+		}
+		if (entry.size > this.limits.maxBlobBytes) {
+			return {
+				available: false,
+				entry,
+				reason: "oversized",
+				message: `Blob size ${entry.size} bytes exceeds the ${formatByteLimit(this.limits.maxBlobBytes)} snapshot read limit.`,
+			};
+		}
+		const result = await git(this.source, ["cat-file", "blob", entry.oid], undefined, this.limits.maxBlobBytes);
+		if (result.failure) {
+			return {
+				available: false,
+				entry,
+				reason: "output-limit",
+				message:
+					result.failure.stream === "stdout"
+						? `Blob output exceeded the ${formatByteLimit(result.failure.limit)} snapshot read limit.`
+						: `Blob read stderr exceeded the ${formatByteLimit(result.failure.limit)} capture limit.`,
+			};
+		}
+		if (!result.ok) {
+			return {
+				available: false,
+				entry,
+				reason: "read-failed",
+				message: `Could not read the snapshot blob: ${commandError(result)}.`,
+			};
+		}
+		const content = result.stdout;
 		const binary = isBinary(content);
-		return { entry, content, binary, ...(binary ? {} : { lineCount: countLines(content) }) };
+		return {
+			available: true,
+			entry,
+			content,
+			binary,
+			...(binary ? {} : { lineCount: countLines(content) }),
+		};
 	}
 
 	async listFiles(options: ReviewSnapshotListOptions = {}): Promise<ReviewSnapshotTreeEntry[]> {
@@ -719,8 +956,8 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		this.assertActive();
 		const directory = await mkdtemp(join(tmpdir(), "volt-review-checkout-"));
 		this.materializedDirectories.push(directory);
-		const init = await runCommand("git", ["init"], directory);
-		if (!init.ok) throw new Error(`Could not initialize review checkout: ${init.stderr.trim()}`);
+		const init = await runCommand("git", ["init"], directory, commandOptions(this.limits));
+		if (!init.ok) throw new Error(`Could not initialize review checkout: ${commandError(init)}`);
 		const alternatesPath = join(directory, ".git", "objects", "info", "alternates");
 		await mkdir(join(directory, ".git", "objects", "info"), { recursive: true });
 		await writeFile(
@@ -733,6 +970,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			["commit-tree", this.identity.headTree, "-m", "Volt review snapshot"],
 			directory,
 			{
+				...commandOptions(this.limits),
 				env: {
 					GIT_AUTHOR_NAME: "Volt Review",
 					GIT_AUTHOR_EMAIL: "review@localhost",
@@ -743,10 +981,10 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		);
 		const commitOid = text(commit).trim();
 		if (!commit.ok || !CANONICAL_GIT_OBJECT_ID_PATTERN.test(commitOid)) {
-			throw new Error(`Could not create review checkout commit: ${commit.stderr.trim()}`);
+			throw new Error(`Could not create review checkout commit: ${commandError(commit)}`);
 		}
-		const reset = await runCommand("git", ["reset", "--hard", commitOid], directory);
-		if (!reset.ok) throw new Error(`Could not materialize review checkout: ${reset.stderr.trim()}`);
+		const reset = await runCommand("git", ["reset", "--hard", commitOid], directory, commandOptions(this.limits));
+		if (!reset.ok) throw new Error(`Could not materialize review checkout: ${commandError(reset)}`);
 		return directory;
 	}
 
@@ -808,13 +1046,14 @@ export async function resolveReviewSnapshot(
 	cwd: string,
 	options: ResolveReviewSnapshotOptions,
 ): Promise<ReviewSnapshot | ReviewSnapshotResolutionError> {
-	const root = await repositoryRoot(cwd);
-	if (!root) return { error: "Not inside a git repository." };
 	let init: SnapshotInit | undefined;
 	try {
+		const limits = normalizeSnapshotLimits(options.limits);
+		const root = await repositoryRoot(cwd, limits);
+		if (!root) return { error: "Not inside a git repository." };
 		switch (target.kind) {
 			case "uncommitted": {
-				const { source, temporaryDirectory } = await createUncommittedSource(root);
+				const { source, temporaryDirectory } = await createUncommittedSource(root, limits);
 				const headCommit = await requireCanonicalCommit(source, "HEAD");
 				const baseTree = headCommit
 					? await requireCanonicalTree(source, headCommit)
@@ -847,15 +1086,16 @@ export async function resolveReviewSnapshot(
 					root,
 					source,
 					temporaryDirectories: [temporaryDirectory],
+					limits,
 				};
 				break;
 			}
 			case "branch": {
-				const requestedBase = target.base ?? (await detectBaseBranch(root));
+				const requestedBase = target.base ?? (await detectBaseBranch(root, limits));
 				if (!requestedBase) return { error: "Could not detect a base branch. Use /review branch <base>." };
-				const baseRef = await resolveBaseRef(requestedBase, root);
+				const baseRef = await resolveBaseRef(requestedBase, root, limits);
 				if (!baseRef) return { error: `Base branch "${requestedBase}" not found.` };
-				const source = await createLocalSource(root);
+				const source = await createLocalSource(root, limits);
 				const baseCommit = await requireCanonicalCommit(source, baseRef);
 				const headCommit = await requireCanonicalCommit(source, "HEAD");
 				if (!baseCommit || !headCommit) return { error: "Could not resolve the branch endpoints." };
@@ -863,7 +1103,7 @@ export async function resolveReviewSnapshot(
 				const mergeBaseCommit = text(mergeBaseResult).trim();
 				if (!mergeBaseResult.ok || !CANONICAL_GIT_OBJECT_ID_PATTERN.test(mergeBaseCommit)) {
 					return {
-						error: `git merge-base failed: ${mergeBaseResult.stderr.trim()}`,
+						error: `git merge-base failed: ${commandError(mergeBaseResult)}`,
 						remoteError: "Could not resolve the branch merge base.",
 					};
 				}
@@ -880,6 +1120,7 @@ export async function resolveReviewSnapshot(
 					root,
 					source,
 					temporaryDirectories: [],
+					limits,
 				};
 				break;
 			}
@@ -889,7 +1130,7 @@ export async function resolveReviewSnapshot(
 				if (Buffer.byteLength(ref, "utf8") > options.maxCommitRefBytes) {
 					return { error: `Commit ref exceeds ${options.maxCommitRefBytes} UTF-8 bytes.` };
 				}
-				const source = await createLocalSource(root);
+				const source = await createLocalSource(root, limits);
 				const headCommit = await requireCanonicalCommit(source, ref);
 				if (!headCommit) return { error: "Commit ref was not found or does not resolve to a commit." };
 				const headTree = await requireCanonicalTree(source, headCommit);
@@ -915,6 +1156,7 @@ export async function resolveReviewSnapshot(
 					root,
 					source,
 					temporaryDirectories: [],
+					limits,
 				};
 				break;
 			}
@@ -936,9 +1178,10 @@ export async function resolveReviewSnapshot(
 						"number,title,body,baseRefName,headRefName,url,baseRefOid,headRefOid",
 					],
 					root,
+					commandOptions(limits),
 				);
 				if (!viewResult.ok) {
-					const stderr = viewResult.stderr.trim();
+					const stderr = commandError(viewResult);
 					if (/ENOENT|not found|not recognized/i.test(stderr)) {
 						return { error: "GitHub CLI (gh) is not installed. Install it from https://cli.github.com/" };
 					}
@@ -949,7 +1192,7 @@ export async function resolveReviewSnapshot(
 				}
 				const pullRequest = parsePullRequestView(text(viewResult), options.maxPullRequestNumber);
 				if (!pullRequest) return { error: "Could not parse gh pr view output." };
-				const fetched = await createPullRequestSource(root, pullRequest);
+				const fetched = await createPullRequestSource(root, pullRequest, limits);
 				if (!fetched.source || !fetched.temporaryDirectory)
 					return fetched.error ?? { error: "Could not fetch pull request snapshot." };
 				const source = fetched.source;
@@ -998,10 +1241,12 @@ export async function resolveReviewSnapshot(
 					root,
 					source,
 					temporaryDirectories: [fetched.temporaryDirectory],
+					limits,
 				};
 				break;
 			}
 		}
+		if (!init) return { error: "Could not initialize the review snapshot." };
 		return await GitReviewSnapshot.create(init);
 	} catch (error) {
 		if (init) {
@@ -1018,7 +1263,9 @@ export async function readReviewPolicyFile(
 	path: string,
 ): Promise<string | undefined> {
 	const file = await snapshot.readFile(revision, path);
-	if (!file || file.binary) return undefined;
+	if (!file) return undefined;
+	if (!file.available) throw new Error(`Could not load snapshot policy ${path}: ${file.message}`);
+	if (file.binary) throw new Error(`Could not load snapshot policy ${path}: policy content is binary.`);
 	return file.content.toString("utf8");
 }
 

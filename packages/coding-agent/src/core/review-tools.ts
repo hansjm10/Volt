@@ -161,7 +161,7 @@ interface ChangedFileDetails {
 
 interface DiffDetails {
 	kind: "diff";
-	path?: string;
+	path: string;
 	startByte: number;
 	endByte: number;
 	totalBytes: number;
@@ -191,6 +191,7 @@ interface SearchDetails {
 	revision: ReviewSnapshotRevision;
 	matches: SearchMatch[];
 	filesScanned: number;
+	skippedPaths: Array<{ path: string; reason: string }>;
 	nextCursor?: string;
 }
 
@@ -326,27 +327,26 @@ export function createReviewSnapshotTools(snapshot: ReviewSnapshot, tracker: Rev
 			const state = params.cursor ? cursors.decode(params.cursor, "diff") : {};
 			const cursorPath = stringState(state, "path");
 			const requestedPath = params.path ? normalizeReviewPath(params.path) : cursorPath;
+			if (!requestedPath) throw new Error("A changed path is required for the first diff page.");
 			if (params.cursor && params.path && requestedPath !== cursorPath)
 				throw new Error("Diff cursor path does not match the requested path.");
 			const offset = numberState(state, "offset") ?? 0;
 			const maxBytes = clampInteger(params.maxBytes, REVIEW_TOOL_DEFAULT_PAGE_BYTES, REVIEW_TOOL_MAX_PAGE_BYTES);
-			const file = requestedPath
-				? snapshot.changedFiles.find(
-						(candidate) => candidate.path === requestedPath || candidate.previousPath === requestedPath,
-					)
-				: undefined;
-			if (requestedPath && !file) throw new Error(`Path is not changed in this review snapshot: ${requestedPath}`);
-			const content = file ? pathDiffText(file) : snapshot.diff;
+			const file = snapshot.changedFiles.find(
+				(candidate) => candidate.path === requestedPath || candidate.previousPath === requestedPath,
+			);
+			if (!file) throw new Error(`Path is not changed in this review snapshot: ${requestedPath}`);
+			const content = pathDiffText(file);
 			const page = pageUtf8(content, offset, maxBytes);
 			const nextCursor =
 				page.nextOffset === undefined
 					? undefined
-					: cursors.encode("diff", { offset: page.nextOffset, path: requestedPath ?? null });
-			const hunkIds = file?.hunks.map((hunk) => hunk.id) ?? [];
-			if (file) tracker.recordDiffPage(file.path, page.startByte, page.endByte, page.totalBytes, hunkIds);
+					: cursors.encode("diff", { offset: page.nextOffset, path: requestedPath });
+			const hunkIds = file.hunks.map((hunk) => hunk.id);
+			tracker.recordDiffPage(file.path, page.startByte, page.endByte, page.totalBytes, hunkIds);
 			const details: DiffDetails = {
 				kind: "diff",
-				...(file ? { path: file.path } : {}),
+				path: file.path,
 				startByte: page.startByte,
 				endByte: page.endByte,
 				totalBytes: page.totalBytes,
@@ -387,6 +387,8 @@ export function createReviewSnapshotTools(snapshot: ReviewSnapshot, tracker: Rev
 			const limit = clampInteger(params.limit, 400, 2_000);
 			const file = await snapshot.readFile(revision, path);
 			if (!file) throw new Error(`File does not exist in the ${revision} snapshot: ${path}`);
+			if (!file.available)
+				throw new Error(`File is unavailable in the ${revision} snapshot: ${path}. ${file.message}`);
 			if (file.binary) throw new Error(`File is binary in the ${revision} snapshot: ${path}`);
 			const selected = numberedLines(file.content.toString("utf8"), startLine, limit);
 			const complete = selected.endLine >= selected.totalLines;
@@ -448,6 +450,7 @@ export function createReviewSnapshotTools(snapshot: ReviewSnapshot, tracker: Rev
 				(entry) => entry.type === "blob",
 			);
 			const matches: SearchMatch[] = [];
+			const skippedPaths: Array<{ path: string; reason: string }> = [];
 			let nextFileIndex = fileIndex;
 			let nextLineIndex = numberState(state, "lineIndex") ?? 0;
 			let filesScanned = 0;
@@ -461,7 +464,20 @@ export function createReviewSnapshotTools(snapshot: ReviewSnapshot, tracker: Rev
 				const entry = entries[nextFileIndex];
 				filesScanned++;
 				const file = await snapshot.readFile(revision, entry.path);
-				if (!file || file.binary) {
+				if (!file) {
+					skippedPaths.push({ path: entry.path, reason: "The snapshot entry was unavailable." });
+					nextFileIndex++;
+					nextLineIndex = 0;
+					continue;
+				}
+				if (!file.available) {
+					skippedPaths.push({ path: entry.path, reason: file.message });
+					nextFileIndex++;
+					nextLineIndex = 0;
+					continue;
+				}
+				if (file.binary) {
+					skippedPaths.push({ path: entry.path, reason: "Binary content was not searched." });
 					nextFileIndex++;
 					nextLineIndex = 0;
 					continue;
@@ -497,13 +513,14 @@ export function createReviewSnapshotTools(snapshot: ReviewSnapshot, tracker: Rev
 				revision,
 				matches,
 				filesScanned,
+				skippedPaths,
 				...(nextCursor ? { nextCursor } : {}),
 			};
 			return {
 				content: [
 					{
 						type: "text",
-						text: `${matches.length === 0 ? "No matches in this page." : matches.map((match) => `${match.path}:${match.line}: ${match.text}`).join("\n")}${nextCursor ? `\n\nNext cursor: ${nextCursor}` : ""}`,
+						text: `${matches.length === 0 ? "No matches in this page." : matches.map((match) => `${match.path}:${match.line}: ${match.text}`).join("\n")}${skippedPaths.length === 0 ? "" : `\n\nSkipped paths:\n${skippedPaths.map((entry) => `${entry.path}: ${entry.reason}`).join("\n")}`}${nextCursor ? `\n\nNext cursor: ${nextCursor}` : ""}`,
 					},
 				],
 				details,

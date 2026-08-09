@@ -22,7 +22,7 @@ describe("review snapshot tools", () => {
 		for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 	});
 
-	async function setup(): Promise<{
+	async function setup(limits?: { maxBlobBytes: number }): Promise<{
 		snapshot: ReviewSnapshot;
 		tracker: ReviewCoverageTracker;
 		tools: ToolDefinition[];
@@ -35,13 +35,16 @@ describe("review snapshot tools", () => {
 		git(directory, "config", "user.name", "Review Test");
 		writeFileSync(join(directory, "src", "one.ts"), "export const one = 1;\n");
 		writeFileSync(join(directory, "src", "two.ts"), "export const two = 2;\n");
-		git(directory, "add", "src");
+		writeFileSync(join(directory, "large.txt"), "x".repeat(256));
+		writeFileSync(join(directory, "binary.dat"), Buffer.from([0, 1, 2, 3]));
+		git(directory, "add", ".");
 		git(directory, "commit", "-m", "initial");
 		writeFileSync(join(directory, "src", "one.ts"), `export const one = "${"x".repeat(200)}";\n`);
 		writeFileSync(join(directory, "src", "two.ts"), "export const two = one + 2;\nexport const three = one + 2;\n");
 		const resolved = await resolveReviewSnapshot({ kind: "uncommitted" }, directory, {
 			maxCommitRefBytes: 1_024,
 			maxPullRequestNumber: 2_147_483_647,
+			...(limits ? { limits } : {}),
 		});
 		if ("error" in resolved) throw new Error(resolved.error);
 		snapshots.push(resolved);
@@ -74,9 +77,13 @@ describe("review snapshot tools", () => {
 		expect(tracker.snapshot().changedFileInventoryComplete).toBe(true);
 
 		const diff = tool(tools, "review_diff");
+		await expect(execute(diff, {})).rejects.toThrow(/changed path is required/i);
 		let cursor: string | undefined;
 		do {
-			const page = await execute(diff, { path: "src/one.ts", ...(cursor ? { cursor } : {}), maxBytes: 64 });
+			const page = await execute(diff, {
+				...(cursor ? { cursor } : { path: "src/one.ts" }),
+				maxBytes: 64,
+			});
 			cursor = (page.details as { nextCursor?: string }).nextCursor;
 		} while (cursor);
 		const coverage = tracker.snapshot();
@@ -111,6 +118,25 @@ describe("review snapshot tools", () => {
 		} while (searchCursor);
 		expect(searchLines).toEqual([1, 2]);
 		expect(tracker.snapshot()).toMatchObject({ filesRead: ["src/one.ts"], searchesRun: 3 });
+	});
+
+	it("reports unavailable and binary reads and discloses skipped search paths", async () => {
+		const { tools } = await setup({ maxBlobBytes: 64 });
+		const read = tool(tools, "review_file");
+		await expect(execute(read, { path: "large.txt", revision: "head" })).rejects.toThrow(/unavailable.*64 bytes/i);
+		await expect(execute(read, { path: "binary.dat", revision: "head" })).rejects.toThrow(/binary/i);
+
+		const search = await execute(tool(tools, "review_search"), {
+			query: "x",
+			path: "large.txt",
+			revision: "head",
+		});
+		expect(search.details).toMatchObject({
+			matches: [],
+			filesScanned: 1,
+			skippedPaths: [{ path: "large.txt", reason: expect.stringContaining("64 bytes") }],
+		});
+		expect(resultText(search)).toContain("Skipped paths:\nlarge.txt:");
 	});
 
 	it("binds opaque cursors to a tool operation and snapshot", async () => {
