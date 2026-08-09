@@ -41,7 +41,7 @@ async function readStream(events: ProxyAssistantMessageEvent[], signal?: AbortSi
 	const stream = streamProxy(model, context, {
 		authToken: "proxy-token",
 		proxyUrl: "https://proxy.example",
-		signal,
+		...(signal === undefined ? {} : { signal }),
 	});
 	const received: AssistantMessageEvent[] = [];
 	for await (const event of stream) {

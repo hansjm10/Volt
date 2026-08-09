@@ -78,8 +78,9 @@ export async function collectEntriesForBranchSummary(
 	const targetPath = await session.getBranch(targetId);
 	let commonAncestorId: string | null = null;
 	for (let i = targetPath.length - 1; i >= 0; i--) {
-		if (oldPath.has(targetPath[i].id)) {
-			commonAncestorId = targetPath[i].id;
+		const targetEntry = targetPath[i];
+		if (targetEntry && oldPath.has(targetEntry.id)) {
+			commonAncestorId = targetEntry.id;
 			break;
 		}
 	}
@@ -141,6 +142,7 @@ export function prepareBranchEntries(entries: SessionTreeEntry[], tokenBudget: n
 	}
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
+		if (!entry) continue;
 		const message = getMessageFromEntry(entry);
 		if (!message) continue;
 		extractFileOpsFromMessage(message, fileOps);
@@ -233,7 +235,7 @@ export async function generateBranchSummary(
 	const response = await completeSimple(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		{ apiKey, headers, signal, maxTokens: 2048 },
+		{ apiKey, ...(headers === undefined ? {} : { headers }), signal, maxTokens: 2048 },
 	);
 	if (response.stopReason === "aborted") {
 		return err(new BranchSummaryError("aborted", response.errorMessage || "Branch summary aborted"));

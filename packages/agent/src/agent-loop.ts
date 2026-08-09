@@ -45,7 +45,7 @@ type AgentEventSinkResult = Awaited<ReturnType<AgentEventSink>>;
 /** Delivery settlement that stops the current low-level loop before a provider request. */
 export class AgentDeliverySettlementError extends Error {
 	readonly outcome: "retained" | "terminally_failed";
-	readonly deliveryId?: string;
+	readonly deliveryId: string | undefined;
 	readonly settlementError: Error;
 
 	constructor(outcome: "retained" | "terminally_failed", deliveryId: string | undefined, settlementError: Error) {
@@ -209,7 +209,7 @@ async function runDispatchedLoop(
 		const actionContext: AgentLoopNextActionContext = {
 			context: currentContext,
 			newMessages,
-			completedTurn,
+			...(completedTurn === undefined ? {} : { completedTurn }),
 			requestAuthority,
 			defaultAction,
 		};
@@ -253,13 +253,12 @@ async function runDispatchedLoop(
 			config = {
 				...config,
 				model: requestSnapshot.model ?? config.model,
-				reasoning:
-					requestSnapshot.thinkingLevel === undefined
-						? config.reasoning
-						: requestSnapshot.thinkingLevel === "off"
-							? undefined
-							: requestSnapshot.thinkingLevel,
 			};
+			if (requestSnapshot.thinkingLevel === "off") {
+				delete config.reasoning;
+			} else if (requestSnapshot.thinkingLevel !== undefined) {
+				config.reasoning = requestSnapshot.thinkingLevel;
+			}
 		}
 
 		let turnStarted = false;
@@ -492,7 +491,7 @@ async function streamAssistantResponse(
 	const llmContext: Context = {
 		systemPrompt: context.systemPrompt,
 		messages: llmMessages,
-		tools: context.tools,
+		...(context.tools === undefined ? {} : { tools: context.tools }),
 	};
 
 	const streamFunction = streamFn || streamSimple;
@@ -504,8 +503,8 @@ async function streamAssistantResponse(
 
 	const streamOptions = {
 		...config,
-		apiKey: resolvedApiKey,
-		signal,
+		...(resolvedApiKey === undefined ? {} : { apiKey: resolvedApiKey }),
+		...(signal === undefined ? {} : { signal }),
 	};
 	if (policy.cancelOnPreflightAbort && signal?.aborted) return undefined;
 	const response = await streamFunction(config.model, llmContext, streamOptions);

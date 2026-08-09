@@ -513,6 +513,7 @@ describe("Agent delivery transaction participant", () => {
 			if (event.type === "message_end" && event.deliveryId && event.message.role === "user") {
 				return { ...event.message, content: "observer replacement" };
 			}
+			return undefined;
 		});
 		agent.subscribe(async (event) => {
 			if (event.type === "message_start" && event.deliveryId) {

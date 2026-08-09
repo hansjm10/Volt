@@ -87,7 +87,7 @@ function replaceUnpairedSurrogates(content: string): string {
 			if (i + 1 < content.length) {
 				const next = content.charCodeAt(i + 1);
 				if (next >= 0xdc00 && next <= 0xdfff) {
-					output += content[i] + content[i + 1];
+					output += content.charAt(i) + content.charAt(i + 1);
 					i++;
 					continue;
 				}
@@ -148,7 +148,7 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
 	}
 
 	// Check if first line alone exceeds byte limit
-	const firstLineBytes = utf8ByteLength(lines[0]);
+	const firstLineBytes = utf8ByteLength(lines[0] ?? "");
 	if (firstLineBytes > maxBytes) {
 		return {
 			content: "",
@@ -172,6 +172,7 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
 
 	for (let i = 0; i < lines.length && i < maxLines; i++) {
 		const line = lines[i];
+		if (line === undefined) break;
 		const lineBytes = utf8ByteLength(line) + (i > 0 ? 1 : 0); // +1 for newline
 
 		if (outputBytesCount + lineBytes > maxBytes) {
@@ -246,6 +247,7 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 
 	for (let i = lines.length - 1; i >= 0 && outputLinesArr.length < maxLines; i--) {
 		const line = lines[i];
+		if (line === undefined) break;
 		const lineBytes = utf8ByteLength(line) + (outputLinesArr.length > 0 ? 1 : 0); // +1 for newline
 
 		if (outputBytesCount + lineBytes > maxBytes) {
