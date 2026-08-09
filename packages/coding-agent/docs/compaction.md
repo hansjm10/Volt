@@ -106,6 +106,8 @@ For split turns, volt generates two summaries and merges them:
 1. **History summary**: Previous context (if any)
 2. **Turn prefix summary**: The early part of the split turn
 
+These provider requests run sequentially so compaction works with providers that permit only one active request.
+
 ### Cut Point Rules
 
 Valid cut points are:
@@ -276,7 +278,7 @@ Fired before auto-compaction or `/compact`. Can cancel or provide custom summary
 
 ```typescript
 volt.on("session_before_compact", async (event, ctx) => {
-  const { preparation, branchEntries, customInstructions, signal } = event;
+  const { preparation, branchEntries, customInstructions, reason, willRetry, signal } = event;
 
   // preparation.messagesToSummarize - messages to summarize
   // preparation.turnPrefixMessages - split turn prefix (if isSplitTurn)
@@ -287,6 +289,8 @@ volt.on("session_before_compact", async (event, ctx) => {
   // preparation.settings - compaction settings
 
   // branchEntries - all entries on current branch (for custom state)
+  // reason - "manual", "threshold", or "overflow"
+  // willRetry - whether the interrupted turn will retry after compaction
   // signal - AbortSignal (pass to LLM calls)
 
   // Cancel:
@@ -303,6 +307,8 @@ volt.on("session_before_compact", async (event, ctx) => {
   };
 });
 ```
+
+Both `session_before_compact` and `session_compact` include `reason` and `willRetry`, so extensions can distinguish manual compaction, proactive threshold compaction, and overflow recovery.
 
 #### Converting Messages to Text
 

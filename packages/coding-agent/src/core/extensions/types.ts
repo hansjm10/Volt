@@ -595,6 +595,10 @@ export interface SessionBeforeCompactEvent {
 	preparation: CompactionPreparation;
 	branchEntries: SessionEntry[];
 	customInstructions?: string;
+	/** What triggered compaction. */
+	reason: "manual" | "threshold" | "overflow";
+	/** Whether the interrupted turn will be retried after compaction. */
+	willRetry: boolean;
 	signal: AbortSignal;
 }
 
@@ -603,6 +607,10 @@ export interface SessionCompactEvent {
 	type: "session_compact";
 	compactionEntry: CompactionEntry;
 	fromExtension: boolean;
+	/** What triggered compaction. */
+	reason: "manual" | "threshold" | "overflow";
+	/** Whether the interrupted turn will be retried after compaction. */
+	willRetry: boolean;
 }
 
 /** Fired before an extension runtime is torn down due to quit, reload, or session replacement. */

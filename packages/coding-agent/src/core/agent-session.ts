@@ -5104,6 +5104,8 @@ export class AgentSession {
 		tokensBefore: number,
 		details: JsonValue | undefined,
 		fromExtension: boolean,
+		reason: CompactionReason,
+		willRetry: boolean,
 		dropTrailingErrorMessage = false,
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<CompactionResult> {
@@ -5139,6 +5141,8 @@ export class AgentSession {
 				type: "session_compact",
 				compactionEntry: savedCompactionEntry,
 				fromExtension,
+				reason,
+				willRetry,
 			});
 			assertConversationGenerationCurrent?.();
 		}
@@ -5230,6 +5234,8 @@ export class AgentSession {
 					preparation,
 					branchEntries: pathEntries,
 					customInstructions,
+					reason: "manual",
+					willRetry: false,
 					signal: this._compactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
 				assertConversationGenerationCurrent?.();
@@ -5297,6 +5303,8 @@ export class AgentSession {
 				tokensBefore,
 				details,
 				fromExtension,
+				"manual",
+				false,
 				false,
 				assertConversationGenerationCurrent,
 			);
@@ -5543,6 +5551,8 @@ export class AgentSession {
 					type: "session_before_compact",
 					preparation,
 					branchEntries: pathEntries,
+					reason,
+					willRetry,
 					signal: this._autoCompactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
 				assertConversationCurrent();
@@ -5616,6 +5626,8 @@ export class AgentSession {
 				tokensBefore,
 				details,
 				fromExtension,
+				reason,
+				willRetry,
 				willRetry,
 				assertConversationCurrent,
 			);
