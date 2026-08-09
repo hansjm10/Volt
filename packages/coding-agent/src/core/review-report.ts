@@ -122,6 +122,7 @@ export interface ReviewReportCollector<TReport> {
 
 export interface ReviewCandidateValidationOptions {
 	includeOptional: boolean;
+	inScopeHunkIds: ReadonlySet<string>;
 	maximumAnchorLines?: number;
 }
 
@@ -392,6 +393,11 @@ export async function validateReviewCandidates(
 			errors.push(`${label}.changeLocation does not overlap a changed ${candidate.changeLocation.side} line`);
 			continue;
 		}
+		const inScopeOverlapping = overlapping.filter(({ hunkId }) => options.inScopeHunkIds.has(hunkId));
+		if (inScopeOverlapping.length === 0) {
+			errors.push(`${label}.changeLocation is outside the effective review scope`);
+			continue;
+		}
 		for (const [evidenceIndex, evidence] of candidate.evidenceLocations.entries()) {
 			errors.push(
 				...(await validateLocationExists(snapshot, evidence, `${label}.evidenceLocations[${evidenceIndex}]`)),
@@ -405,7 +411,7 @@ export async function validateReviewCandidates(
 			continue;
 		}
 		rootCauses.add(rootCauseIdentity);
-		const hunkIds = [...new Set(overlapping.map(({ hunkId }) => hunkId))];
+		const hunkIds = [...new Set(inScopeOverlapping.map(({ hunkId }) => hunkId))];
 		const fingerprint = candidateFingerprint(snapshot, candidate, file, hunkIds);
 		if (fingerprints.has(fingerprint)) {
 			errors.push(`${label} duplicates finding fingerprint ${fingerprint}`);

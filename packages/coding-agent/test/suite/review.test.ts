@@ -241,6 +241,49 @@ describe("two-pass review pipeline", () => {
 		expect(harness.session.messages).toHaveLength(0);
 	});
 
+	it("repairs candidates anchored outside the explicit path scope", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const snapshot = await createSnapshotRepository(harness);
+		snapshots.push(snapshot);
+		const excluded = candidateReport("REVIEW.md");
+		excluded.candidates[0]!.changeLocation = { path: "REVIEW.md", side: "head", startLine: 1, endLine: 1 };
+		let repairMessages = "";
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("report_review_candidates", excluded as never), {
+				stopReason: "toolUse",
+			}),
+			(context) => {
+				repairMessages = JSON.stringify(context.messages);
+				return fauxAssistantMessage(fauxToolCall("report_review_candidates", candidateReport() as never), {
+					stopReason: "toolUse",
+				});
+			},
+			fauxAssistantMessage(fauxToolCall("review_changed_files", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("review_diff", { path: "src/value.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("report_review_verification", verificationReport() as never), {
+				stopReason: "toolUse",
+			}),
+		]);
+
+		const run = await runReview({
+			cwd: harness.tempDir,
+			agentDir: harness.tempDir,
+			model: harness.getModel(),
+			verifierModel: harness.getModel(),
+			authStorage: harness.authStorage,
+			modelRegistry: harness.session.modelRegistry,
+			settingsManager: harness.settingsManager,
+			resolved: snapshot,
+			controls: { scopeMode: "full", scope: ["src/**"] },
+		});
+		snapshots.splice(snapshots.indexOf(snapshot), 1);
+		expect(run.errorMessage).toBeUndefined();
+		expect(run.parsed).toMatchObject({ completionStatus: "complete", overallCorrectness: "incorrect" });
+		expect(run.parsed?.findings).toMatchObject([{ changeLocation: { path: "src/value.ts" } }]);
+		expect(repairMessages).toContain("outside the effective review scope");
+	});
+
 	it("fails closed before model execution when a snapshot policy file is oversized", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -352,9 +395,16 @@ describe("two-pass review pipeline", () => {
 		const snapshot = await createSnapshotRepository(harness);
 		snapshots.push(snapshot);
 		let discoveryMessages = "";
+		let repairMessages = "";
 		harness.setResponses([
 			(context) => {
 				discoveryMessages = JSON.stringify(context.messages);
+				return fauxAssistantMessage(fauxToolCall("report_review_candidates", candidateReport() as never), {
+					stopReason: "toolUse",
+				});
+			},
+			(context) => {
+				repairMessages = JSON.stringify(context.messages);
 				return fauxAssistantMessage(
 					fauxToolCall("report_review_candidates", {
 						summary: "No candidates.",
@@ -364,6 +414,7 @@ describe("two-pass review pipeline", () => {
 					{ stopReason: "toolUse" },
 				);
 			},
+			fauxAssistantMessage(fauxToolCall("review_changed_files", {}), { stopReason: "toolUse" }),
 			fauxAssistantMessage(
 				fauxToolCall("report_review_verification", {
 					summary: "No omission found.",
@@ -400,8 +451,13 @@ describe("two-pass review pipeline", () => {
 			settingsManager: harness.settingsManager,
 		});
 		snapshots.splice(snapshots.indexOf(snapshot), 1);
-		expect(outcome.status).toBe("completed");
+		expect(outcome).toMatchObject({
+			status: "completed",
+			completionStatus: "complete",
+			findingsCount: 0,
+		});
 		expect(discoveryMessages).toContain('\\"inScope\\":false');
+		expect(repairMessages).toContain("outside the effective review scope");
 	});
 
 	it("waits for a fresh origin review record to become durable before resolving", async () => {

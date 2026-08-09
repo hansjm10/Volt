@@ -1075,6 +1075,11 @@ async function runReviewPass<TReport>(options: ReviewPassOptions<TReport>): Prom
 export async function runReview(options: RunReviewOptions): Promise<ReviewRunResult> {
 	const snapshot = options.resolved;
 	const controls = controlsWithDefaults(options.controls);
+	const inScopeHunkIds = new Set(
+		snapshot.changedFiles
+			.filter((file) => file.reviewable && inRunScope(file.path, controls, options.incrementalPlan))
+			.flatMap((file) => file.hunks.map((hunk) => hunk.id)),
+	);
 	const discoveryTracker = new ReviewCoverageTracker();
 	const commandRuns: string[] = [];
 	const failedVerificationAttempts: string[] = [];
@@ -1138,6 +1143,7 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 				if (!report) return ["report_review_candidates was not called with a valid payload"];
 				const validation = await validateReviewCandidates(snapshot, report, {
 					includeOptional: controls.includeOptional,
+					inScopeHunkIds,
 				});
 				validatedCandidates = validation.candidates;
 				return validation.errors;

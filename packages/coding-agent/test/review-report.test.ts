@@ -81,6 +81,13 @@ describe("structured review reports", () => {
 		};
 	}
 
+	function validationOptions(
+		snapshot: ReviewSnapshot,
+		inScopeHunkIds = new Set(snapshot.changedFiles.flatMap((file) => file.hunks.map((hunk) => hunk.id))),
+	) {
+		return { includeOptional: false, inScopeHunkIds };
+	}
+
 	it("collects reports only through terminating typed tools", async () => {
 		const candidates = createReviewCandidateReportCollector();
 		const candidateResult = await candidates.tool.execute("call", report(), undefined, undefined, {} as never);
@@ -116,25 +123,28 @@ describe("structured review reports", () => {
 
 	it("validates changed-side anchors and computes stable host fingerprints", async () => {
 		const snapshot = await setup();
-		const first = await validateReviewCandidates(snapshot, report(), { includeOptional: false });
-		const second = await validateReviewCandidates(snapshot, report(), { includeOptional: false });
+		const first = await validateReviewCandidates(snapshot, report(), validationOptions(snapshot));
+		const second = await validateReviewCandidates(snapshot, report(), validationOptions(snapshot));
 		expect(first.errors).toEqual([]);
 		expect(first.candidates[0]?.fingerprint).toMatch(/^[a-f0-9]{64}$/);
 		expect(first.candidates[0]?.fingerprint).toBe(second.candidates[0]?.fingerprint);
 
+		const outOfScope = await validateReviewCandidates(snapshot, report(), validationOptions(snapshot, new Set()));
+		expect(outOfScope.errors.join(" ")).toContain("outside the effective review scope");
+		expect(outOfScope.candidates).toEqual([]);
 		const unchangedAnchor = await validateReviewCandidates(
 			snapshot,
 			report({ changeLocation: { path: "src/divide.ts", side: "head", startLine: 1, endLine: 1 } }),
-			{ includeOptional: false },
+			validationOptions(snapshot),
 		);
 		expect(unchangedAnchor.errors.join(" ")).toContain("changed head line");
 		const traversal = await validateReviewCandidates(
 			snapshot,
 			report({ changeLocation: { path: "../secret", side: "head", startLine: 2, endLine: 2 } }),
-			{ includeOptional: false },
+			validationOptions(snapshot),
 		);
 		expect(traversal.errors.join(" ")).toMatch(/relative|traverse/);
-		const optional = await validateReviewCandidates(snapshot, report({ priority: 3 }), { includeOptional: false });
+		const optional = await validateReviewCandidates(snapshot, report({ priority: 3 }), validationOptions(snapshot));
 		expect(optional.errors.join(" ")).toContain("P3");
 	});
 
@@ -145,7 +155,7 @@ describe("structured review reports", () => {
 			report({
 				evidenceLocations: [{ path: "docs/context.txt", side: "base", startLine: 1, endLine: 1 }],
 			}),
-			{ includeOptional: false },
+			validationOptions(snapshot),
 		);
 		expect(validation.errors.join(" ")).toMatch(/unavailable content.*256 bytes/i);
 	});
@@ -158,10 +168,10 @@ describe("structured review reports", () => {
 			candidateId: "candidate-2",
 			title: "Duplicate symptom",
 		});
-		const validation = await validateReviewCandidates(snapshot, duplicated, { includeOptional: false });
+		const validation = await validateReviewCandidates(snapshot, duplicated, validationOptions(snapshot));
 		expect(validation.errors.join(" ")).toContain("duplicate root-cause anchor");
 
-		const valid = await validateReviewCandidates(snapshot, report(), { includeOptional: false });
+		const valid = await validateReviewCandidates(snapshot, report(), validationOptions(snapshot));
 		expect(
 			validateReviewVerification(valid.candidates, {
 				summary: "Missing the decision.",
@@ -177,7 +187,7 @@ describe("structured review reports", () => {
 
 	it("derives completeness, correctness, and coverage from host observations", async () => {
 		const snapshot = await setup();
-		const validated = await validateReviewCandidates(snapshot, report(), { includeOptional: false });
+		const validated = await validateReviewCandidates(snapshot, report(), validationOptions(snapshot));
 		const verification: ReviewVerificationReport = {
 			summary: "The candidate is accepted.",
 			assessment: "complete",
