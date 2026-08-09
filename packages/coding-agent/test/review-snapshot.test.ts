@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -110,6 +110,54 @@ describe("review snapshots", () => {
 		const checkout = await snapshot.materializeHead();
 		expect(readFileSync(join(checkout, "tracked.txt"), "utf8")).toBe("after\n");
 		expect(readFileSync(join(checkout, "untracked.txt"), "utf8")).toBe("untracked\n");
+	});
+
+	it("preserves ignored tracked files in uncommitted snapshots", async () => {
+		const repository = createRepository();
+		writeFileSync(join(repository, "tracked.log"), "tracked\n");
+		git(repository, "add", "tracked.log");
+		git(repository, "commit", "-m", "add tracked log");
+		writeFileSync(join(repository, ".gitignore"), "*.log\n");
+		git(repository, "add", ".gitignore");
+		git(repository, "commit", "-m", "ignore log files");
+		writeFileSync(join(repository, "visible.txt"), "visible\n");
+
+		const snapshot = await resolve({ kind: "uncommitted" }, repository);
+		expect(snapshot.changedFiles.map(({ path, status }) => ({ path, status }))).toEqual([
+			{ path: "visible.txt", status: "added" },
+		]);
+		expect((await readAvailableFile(snapshot, "head", "tracked.log")).content.toString()).toBe("tracked\n");
+	});
+
+	it("preserves sparse tracked files and staged excluded deletions", async () => {
+		const repository = createRepository();
+		mkdirSync(join(repository, "included"));
+		mkdirSync(join(repository, "excluded"));
+		writeFileSync(join(repository, "included", "kept.txt"), "kept\n");
+		writeFileSync(join(repository, "excluded", "unchanged.txt"), "unchanged\n");
+		writeFileSync(join(repository, "excluded", "staged-delete.txt"), "delete\n");
+		git(repository, "add", "included", "excluded");
+		git(repository, "commit", "-m", "add sparse fixtures");
+		rmSync(join(repository, "excluded", "staged-delete.txt"));
+		git(repository, "add", "--", "excluded/staged-delete.txt");
+		git(repository, "sparse-checkout", "init", "--cone");
+		git(repository, "sparse-checkout", "set", "included");
+		expect(existsSync(join(repository, "excluded", "unchanged.txt"))).toBe(false);
+		writeFileSync(join(repository, "included", "visible.txt"), "visible\n");
+
+		const snapshot = await resolve({ kind: "uncommitted" }, repository);
+		expect(
+			snapshot.changedFiles
+				.map(({ path, status }) => ({ path, status }))
+				.sort((left, right) => left.path.localeCompare(right.path)),
+		).toEqual([
+			{ path: "excluded/staged-delete.txt", status: "deleted" },
+			{ path: "included/visible.txt", status: "added" },
+		]);
+		expect((await readAvailableFile(snapshot, "head", "excluded/unchanged.txt")).content.toString()).toBe(
+			"unchanged\n",
+		);
+		expect(await snapshot.readFile("head", "excluded/staged-delete.txt")).toBeUndefined();
 	});
 
 	it("tracks changed source lines that resemble diff file headers", async () => {

@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -384,6 +384,17 @@ async function repositoryObjectDirectory(cwd: string, limits: ReviewSnapshotLimi
 	return result.ok ? text(result).trim() || undefined : undefined;
 }
 
+async function repositoryIndexFile(cwd: string, limits: ReviewSnapshotLimits): Promise<string | undefined> {
+	const result = await runCommand(
+		"git",
+		["rev-parse", "--path-format=absolute", "--git-path", "index"],
+		cwd,
+		commandOptions(limits),
+	);
+	throwIfOutputLimited("git rev-parse failed", result);
+	return result.ok ? text(result).trim() || undefined : undefined;
+}
+
 async function detectBaseBranch(cwd: string, limits: ReviewSnapshotLimits): Promise<string | undefined> {
 	const originHead = await runCommand(
 		"git",
@@ -482,9 +493,11 @@ async function createLocalSource(root: string, limits: ReviewSnapshotLimits): Pr
 async function createUncommittedSource(
 	root: string,
 	limits: ReviewSnapshotLimits,
-): Promise<{ source: GitSource; temporaryDirectory: string }> {
+): Promise<{ source: GitSource; temporaryDirectory: string; originalIndex: string }> {
 	const originalObjects = await repositoryObjectDirectory(root, limits);
 	if (!originalObjects) throw new Error("Could not resolve the Git object directory.");
+	const originalIndex = await repositoryIndexFile(root, limits);
+	if (!originalIndex) throw new Error("Could not resolve the Git index file.");
 	const temporaryDirectory = await mkdtemp(join(tmpdir(), "volt-review-snapshot-"));
 	const objects = join(temporaryDirectory, "objects");
 	await mkdir(objects, { recursive: true });
@@ -498,28 +511,53 @@ async function createUncommittedSource(
 		objectDirectories: [objects, originalObjects],
 		limits,
 	};
-	return { source, temporaryDirectory };
+	return { source, temporaryDirectory, originalIndex };
 }
 
-async function resetTemporaryIndex(source: GitSource): Promise<void> {
-	const indexPath = source.env?.GIT_INDEX_FILE;
-	if (indexPath) await rm(indexPath, { force: true });
+async function seedTemporaryIndex(
+	source: GitSource,
+	originalIndex: string,
+	baseTree: string,
+): Promise<ReviewSnapshotResolutionError | undefined> {
+	const temporaryIndex = source.env?.GIT_INDEX_FILE;
+	if (!temporaryIndex) return { error: "Could not resolve the temporary Git index file." };
+	try {
+		await rm(temporaryIndex, { force: true });
+		await copyFile(originalIndex, temporaryIndex);
+		return undefined;
+	} catch (error) {
+		const code =
+			typeof error === "object" && error !== null && "code" in error
+				? (error as { code?: unknown }).code
+				: undefined;
+		if (code !== "ENOENT") {
+			return {
+				error: `Could not seed the temporary Git index: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
+	const readTree = await git(source, ["read-tree", baseTree]);
+	return readTree.ok ? undefined : commandFailure("git read-tree failed", readTree);
 }
 
 async function captureWorktreeTree(
 	source: GitSource,
+	originalIndex: string,
+	baseTree: string,
 ): Promise<{ tree?: string; error?: ReviewSnapshotResolutionError }> {
 	for (let attempt = 1; attempt <= MAX_STABLE_CAPTURE_ATTEMPTS; attempt++) {
 		const before = await git(source, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
 		if (!before.ok) return { error: commandFailure("git status failed", before) };
-		await resetTemporaryIndex(source);
+		const firstSeedError = await seedTemporaryIndex(source, originalIndex, baseTree);
+		if (firstSeedError) return { error: firstSeedError };
 		const add = await git(source, ["add", "-A", "--"]);
 		if (!add.ok) return { error: commandFailure("git add failed", add) };
 		const firstTreeResult = await git(source, ["write-tree"]);
 		if (!firstTreeResult.ok) return { error: commandFailure("git write-tree failed", firstTreeResult) };
 		const after = await git(source, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
 		if (!after.ok) return { error: commandFailure("git status failed", after) };
-		await resetTemporaryIndex(source);
+		const secondSeedError = await seedTemporaryIndex(source, originalIndex, baseTree);
+		if (secondSeedError) return { error: secondSeedError };
 		const secondAdd = await git(source, ["add", "-A", "--"]);
 		if (!secondAdd.ok) return { error: commandFailure("git add failed", secondAdd) };
 		const secondTreeResult = await git(source, ["write-tree"]);
@@ -1053,7 +1091,7 @@ export async function resolveReviewSnapshot(
 		if (!root) return { error: "Not inside a git repository." };
 		switch (target.kind) {
 			case "uncommitted": {
-				const { source, temporaryDirectory } = await createUncommittedSource(root, limits);
+				const { source, temporaryDirectory, originalIndex } = await createUncommittedSource(root, limits);
 				const headCommit = await requireCanonicalCommit(source, "HEAD");
 				const baseTree = headCommit
 					? await requireCanonicalTree(source, headCommit)
@@ -1062,7 +1100,7 @@ export async function resolveReviewSnapshot(
 					await rm(temporaryDirectory, { recursive: true, force: true });
 					return { error: "Could not resolve the base tree for uncommitted changes." };
 				}
-				const captured = await captureWorktreeTree(source);
+				const captured = await captureWorktreeTree(source, originalIndex, baseTree);
 				if (!captured.tree) {
 					await rm(temporaryDirectory, { recursive: true, force: true });
 					return {
