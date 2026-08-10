@@ -33,6 +33,7 @@ import {
 	type Component,
 	Container,
 	fuzzyFilter,
+	isKeyRelease,
 	Loader,
 	type LoaderIndicatorOptions,
 	Markdown,
@@ -3306,6 +3307,7 @@ export class InteractiveMode {
 		this.planPaneInputUnsubscribe?.();
 		this.planPaneInputUnsubscribe = this.ui.addInputListener((data) => {
 			if (
+				isKeyRelease(data) ||
 				!this.mainViewVisible ||
 				this.ui.isOverlayFocused() ||
 				!this.keybindings.matches(data, "app.plan.togglePane")

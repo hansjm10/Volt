@@ -551,7 +551,7 @@ describe("InteractiveMode plan pane integration", () => {
 		expect(togglePlanPaneFocus).toHaveBeenCalledTimes(1);
 	});
 
-	test("consumes the pane shortcut before an extension-derived editor", async () => {
+	test("handles a Kitty pane shortcut without retriggering on release", async () => {
 		const terminal = new VirtualTerminal(160, 30);
 		const ui = new TUI(terminal);
 		const extensionEditor = new TestFocusableComponent("EXTENSION_EDITOR");
@@ -560,7 +560,7 @@ describe("InteractiveMode plan pane integration", () => {
 		const togglePlanPaneFocus = vi.fn();
 		const fakeThis = {
 			mainViewVisible: true,
-			keybindings: new KeybindingsManager({ "app.plan.togglePane": "alt+x" }),
+			keybindings: new KeybindingsManager(),
 			ui,
 			planPaneInputUnsubscribe: undefined,
 			togglePlanPaneFocus,
@@ -570,7 +570,12 @@ describe("InteractiveMode plan pane integration", () => {
 		ui.setFocus(extensionEditor);
 		ui.start();
 		try {
-			terminal.sendInput("\x1bx");
+			terminal.sendInput("\x1b[112;3u");
+			await flushTui(ui, terminal);
+			expect(togglePlanPaneFocus).toHaveBeenCalledTimes(1);
+			expect(extensionEditor.inputs).toEqual([]);
+
+			terminal.sendInput("\x1b[112;3:3u");
 			await flushTui(ui, terminal);
 			expect(togglePlanPaneFocus).toHaveBeenCalledTimes(1);
 			expect(extensionEditor.inputs).toEqual([]);
