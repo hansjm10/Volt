@@ -632,11 +632,15 @@ function createIrohRemoteReviewCompletionNotification(
 			? record.findingsCount
 			: undefined;
 	const body =
-		findingsCount === undefined
-			? `${target} completed. Open Volt to see the findings.`
-			: findingsCount === 0
-				? `${target} completed with no issues found.`
-				: `${target} completed with ${findingsCount} finding${findingsCount === 1 ? "" : "s"}.`;
+		record.completionStatus === "incomplete"
+			? findingsCount
+				? `${target} review is incomplete with ${findingsCount} verified finding${findingsCount === 1 ? "" : "s"}.`
+				: `${target} review is incomplete.`
+			: findingsCount === undefined
+				? `${target} completed. Open Volt to see the findings.`
+				: findingsCount === 0
+					? `${target} completed with no issues found.`
+					: `${target} completed with ${findingsCount} finding${findingsCount === 1 ? "" : "s"}.`;
 	return createBoundedIrohRemoteNotificationRequest({
 		eventId: `${workflowId}:completed`,
 		kind: "review_completed",

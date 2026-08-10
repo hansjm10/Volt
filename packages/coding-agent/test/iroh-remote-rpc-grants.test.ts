@@ -118,6 +118,53 @@ describe("Iroh remote RPC grants", () => {
 		expect(getIrohRemoteRpcCommandCapabilities({ type: "upload_device_logs" })).toEqual(["diagnostics.upload.v1"]);
 	});
 
+	it("admits review lifecycle commands as conversation controls while keeping feedback export local-only", () => {
+		const controlGrant = createIrohRemotePresetAccess("coding").rpcGrant;
+		const observeOnlyGrant = createIrohRemoteExplicitAccess([], ["conversation.observe.v1"]).rpcGrant;
+		for (const type of ["record_review_finding_outcome", "rerun_review", "publish_review"]) {
+			expect(IROH_REMOTE_RPC_PASSTHROUGH_TYPES.has(type)).toBe(true);
+			expect(getIrohRemoteRpcCommandCapabilities({ type })).toEqual(["conversation.control.v1"]);
+			expect(getIrohRemoteRpcFilterResult(JSON.stringify({ id: `${type}-allowed`, type }), controlGrant)).toEqual({
+				allowed: true,
+				command: { id: `${type}-allowed`, type },
+			});
+			expect(getIrohRemoteRpcFilterResult(JSON.stringify({ id: `${type}-denied`, type }), observeOnlyGrant)).toEqual(
+				{
+					allowed: false,
+					response: {
+						id: `${type}-denied`,
+						type: "response",
+						command: type,
+						success: false,
+						error: {
+							code: "rpc_capability_denied",
+							message: "RPC capability required: conversation.control.v1",
+							requiredCapability: "conversation.control.v1",
+						},
+					},
+				},
+			);
+		}
+
+		expect(IROH_REMOTE_RPC_PASSTHROUGH_TYPES.has("export_review_feedback")).toBe(false);
+		expect(getIrohRemoteRpcCommandCapabilities({ type: "export_review_feedback" })).toBeUndefined();
+		expect(
+			getIrohRemoteRpcFilterResult(
+				JSON.stringify({ id: "export-review-feedback", type: "export_review_feedback" }),
+				createIrohRemotePresetAccess("full").rpcGrant,
+			),
+		).toEqual({
+			allowed: false,
+			response: {
+				id: "export-review-feedback",
+				type: "response",
+				command: "export_review_feedback",
+				success: false,
+				error: "RPC command not allowed over remote host: export_review_feedback",
+			},
+		});
+	});
+
 	it("returns stable structured denials without bypassing the static ceiling", () => {
 		expect(
 			getIrohRemoteRpcFilterResult(JSON.stringify({ id: "missing-grant", type: "get_state" }), undefined as never),

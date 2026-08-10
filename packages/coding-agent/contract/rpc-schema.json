@@ -646,6 +646,18 @@
 					"$ref": "#/$defs/RpcCommand.open_review_session"
 				},
 				{
+					"$ref": "#/$defs/RpcCommand.record_review_finding_outcome"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.rerun_review"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.publish_review"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.export_review_feedback"
+				},
+				{
 					"$ref": "#/$defs/RpcCommand.register_push_target"
 				},
 				{
@@ -905,6 +917,18 @@
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.open_review_session"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.record_review_finding_outcome"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.rerun_review"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.publish_review"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.export_review_feedback"
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.register_push_target"
@@ -1404,6 +1428,25 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcCommand.export_review_feedback": {
+			"type": "object",
+			"required": [
+				"type"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "export_review_feedback"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcCommand.follow_up": {
 			"type": "object",
 			"required": [
@@ -1753,7 +1796,7 @@
 			"type": "object",
 			"required": [
 				"type",
-				"workflowId"
+				"runId"
 			],
 			"properties": {
 				"id": {
@@ -1766,7 +1809,7 @@
 				"conversationAuthority": {
 					"$ref": "#/$defs/RpcConversationAuthority"
 				},
-				"workflowId": {
+				"runId": {
 					"$ref": "#/$defs/RpcConversationIdentifier"
 				}
 			},
@@ -2127,6 +2170,14 @@
 				},
 				"conversationAuthority": {
 					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"cursor": {
+					"type": "string"
+				},
+				"limit": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 50
 				}
 			},
 			"additionalProperties": false
@@ -2228,7 +2279,7 @@
 			"type": "object",
 			"required": [
 				"type",
-				"workflowId"
+				"runId"
 			],
 			"properties": {
 				"id": {
@@ -2241,8 +2292,15 @@
 				"conversationAuthority": {
 					"$ref": "#/$defs/RpcConversationAuthority"
 				},
-				"workflowId": {
+				"runId": {
 					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"findingIds": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/RpcConversationIdentifier"
+					},
+					"maxItems": 50
 				}
 			},
 			"additionalProperties": false
@@ -2391,6 +2449,34 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcCommand.publish_review": {
+			"type": "object",
+			"required": [
+				"type",
+				"runId",
+				"confirmed"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "publish_review"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"runId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"confirmed": {
+					"type": "boolean",
+					"const": true
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcCommand.read_mcp_resource": {
 			"type": "object",
 			"required": [
@@ -2414,6 +2500,55 @@
 				},
 				"resourceUri": {
 					"type": "string"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcCommand.record_review_finding_outcome": {
+			"type": "object",
+			"required": [
+				"type",
+				"runId",
+				"findingId",
+				"status"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "record_review_finding_outcome"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"runId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"findingId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"status": {
+					"type": "string",
+					"enum": [
+						"accepted",
+						"fixed",
+						"dismissed"
+					]
+				},
+				"reason": {
+					"type": "string",
+					"enum": [
+						"false_positive",
+						"intentional",
+						"not_actionable",
+						"other"
+					]
+				},
+				"note": {
+					"type": "string",
+					"maxLength": 2000
 				}
 			},
 			"additionalProperties": false
@@ -2499,6 +2634,36 @@
 				},
 				"reason": {
 					"$ref": "#/$defs/RpcConversationDiscontinuityReason"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcCommand.rerun_review": {
+			"type": "object",
+			"required": [
+				"type",
+				"runId"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "rerun_review"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"runId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"mode": {
+					"type": "string",
+					"enum": [
+						"incremental",
+						"full"
+					]
 				}
 			},
 			"additionalProperties": false
@@ -6143,6 +6308,18 @@
 					"$ref": "#/$defs/RpcResponse.open_review_session"
 				},
 				{
+					"$ref": "#/$defs/RpcResponse.record_review_finding_outcome"
+				},
+				{
+					"$ref": "#/$defs/RpcResponse.rerun_review"
+				},
+				{
+					"$ref": "#/$defs/RpcResponse.publish_review"
+				},
+				{
+					"$ref": "#/$defs/RpcResponse.export_review_feedback"
+				},
+				{
 					"$ref": "#/$defs/RpcResponse.register_push_target"
 				},
 				{
@@ -6788,6 +6965,60 @@
 					"properties": {
 						"path": {
 							"type": "string"
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.export_review_feedback": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "export_review_feedback"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"type": "object",
+					"required": [
+						"schemaVersion",
+						"exportedAt",
+						"outcomes"
+					],
+					"properties": {
+						"schemaVersion": {
+							"type": "number",
+							"const": 1
+						},
+						"exportedAt": {
+							"type": "string"
+						},
+						"outcomes": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"patternProperties": {
+									"^.*$": {}
+								}
+							}
 						}
 					},
 					"additionalProperties": false
@@ -8160,6 +8391,61 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcResponse.publish_review": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "publish_review"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"type": "object",
+					"required": [
+						"inlineFindingIds",
+						"summaryOnlyFindingIds"
+					],
+					"properties": {
+						"reviewId": {
+							"type": "number"
+						},
+						"url": {
+							"type": "string"
+						},
+						"inlineFindingIds": {
+							"type": "array",
+							"items": {
+								"type": "string"
+							}
+						},
+						"summaryOnlyFindingIds": {
+							"type": "array",
+							"items": {
+								"type": "string"
+							}
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcResponse.read_mcp_resource": {
 			"type": "object",
 			"required": [
@@ -8186,6 +8472,63 @@
 				},
 				"data": {
 					"$ref": "#/$defs/RpcMcpResourceContentResponse"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.record_review_finding_outcome": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "record_review_finding_outcome"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"type": "object",
+					"required": [
+						"runId",
+						"findingId",
+						"status",
+						"createdAt"
+					],
+					"properties": {
+						"runId": {
+							"type": "string"
+						},
+						"findingId": {
+							"type": "string"
+						},
+						"status": {
+							"type": "string"
+						},
+						"reason": {
+							"type": "string"
+						},
+						"note": {
+							"type": "string"
+						},
+						"createdAt": {
+							"type": "number"
+						}
+					},
+					"additionalProperties": false
 				}
 			},
 			"additionalProperties": false
@@ -8291,6 +8634,50 @@
 						},
 						"checkpointCursor": {
 							"type": "integer"
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.rerun_review": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "rerun_review"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"type": "object",
+					"required": [
+						"status",
+						"workflowId"
+					],
+					"properties": {
+						"status": {
+							"type": "string",
+							"const": "accepted"
+						},
+						"workflowId": {
+							"type": "string"
 						}
 					},
 					"additionalProperties": false
@@ -9046,15 +9433,44 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcReviewCompletionStatus": {
+			"type": "string",
+			"enum": [
+				"complete",
+				"incomplete"
+			]
+		},
+		"RpcReviewCorrectness": {
+			"type": "string",
+			"enum": [
+				"correct",
+				"incorrect"
+			]
+		},
 		"RpcReviewCoverage": {
 			"type": "object",
 			"required": [
-				"filesReviewed",
+				"changedFileInventoryComplete",
+				"filesInspected",
+				"hunksInspected",
 				"commandsRun",
-				"uncheckedAreas"
+				"failedVerificationAttempts",
+				"exclusions",
+				"uncheckedAreas",
+				"residualRisk",
+				"modelReportedLimitations"
 			],
 			"properties": {
-				"filesReviewed": {
+				"changedFileInventoryComplete": {
+					"type": "boolean"
+				},
+				"filesInspected": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"hunksInspected": {
 					"type": "array",
 					"items": {
 						"type": "string"
@@ -9066,7 +9482,44 @@
 						"type": "string"
 					}
 				},
+				"failedVerificationAttempts": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"exclusions": {
+					"type": "array",
+					"items": {
+						"type": "object",
+						"required": [
+							"path",
+							"reason"
+						],
+						"properties": {
+							"path": {
+								"type": "string"
+							},
+							"reason": {
+								"type": "string"
+							}
+						},
+						"additionalProperties": false
+					}
+				},
 				"uncheckedAreas": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"residualRisk": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"modelReportedLimitations": {
 					"type": "array",
 					"items": {
 						"type": "string"
@@ -9078,27 +9531,341 @@
 		"RpcReviewFinding": {
 			"type": "object",
 			"required": [
+				"id",
+				"fingerprint",
+				"status",
 				"title",
-				"body"
+				"body",
+				"trigger",
+				"impact",
+				"category",
+				"rootCauseKey",
+				"priority",
+				"confidence",
+				"changeLocation",
+				"evidenceLocations",
+				"verification"
 			],
 			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"fingerprint": {
+					"type": "string"
+				},
+				"status": {
+					"$ref": "#/$defs/RpcReviewFindingStatus"
+				},
 				"title": {
 					"type": "string"
 				},
 				"body": {
 					"type": "string"
 				},
+				"trigger": {
+					"type": "string"
+				},
+				"impact": {
+					"type": "string"
+				},
+				"category": {
+					"type": "string"
+				},
+				"rootCauseKey": {
+					"type": "string"
+				},
 				"priority": {
-					"type": "number"
+					"anyOf": [
+						{
+							"type": "number",
+							"const": 0
+						},
+						{
+							"type": "number",
+							"const": 1
+						},
+						{
+							"type": "number",
+							"const": 2
+						},
+						{
+							"type": "number",
+							"const": 3
+						}
+					]
 				},
 				"confidence": {
+					"type": "number",
+					"minimum": 0,
+					"maximum": 1
+				},
+				"changeLocation": {
+					"$ref": "#/$defs/RpcReviewLocation"
+				},
+				"evidenceLocations": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/RpcReviewLocation"
+					}
+				},
+				"verification": {
+					"type": "object",
+					"required": [
+						"outcome",
+						"method",
+						"rationale",
+						"confidence"
+					],
+					"properties": {
+						"outcome": {
+							"type": "string",
+							"const": "accepted"
+						},
+						"method": {
+							"type": "string"
+						},
+						"rationale": {
+							"type": "string"
+						},
+						"confidence": {
+							"type": "number",
+							"minimum": 0,
+							"maximum": 1
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcReviewFindingStatus": {
+			"type": "string",
+			"enum": [
+				"open",
+				"accepted",
+				"fixed",
+				"dismissed",
+				"uncertain"
+			]
+		},
+		"RpcReviewLocation": {
+			"type": "object",
+			"required": [
+				"path",
+				"side",
+				"startLine",
+				"endLine"
+			],
+			"properties": {
+				"path": {
+					"type": "string"
+				},
+				"side": {
+					"type": "string",
+					"enum": [
+						"base",
+						"head"
+					]
+				},
+				"startLine": {
+					"type": "integer",
+					"minimum": 1
+				},
+				"endLine": {
+					"type": "integer",
+					"minimum": 1
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcReviewOptions": {
+			"type": "object",
+			"required": [
+				"scope",
+				"effort",
+				"includeOptional",
+				"scopeMode"
+			],
+			"properties": {
+				"focus": {
+					"type": "string"
+				},
+				"scope": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"effort": {
+					"type": "string",
+					"enum": [
+						"low",
+						"standard",
+						"high"
+					]
+				},
+				"includeOptional": {
+					"type": "boolean"
+				},
+				"scopeMode": {
+					"type": "string",
+					"enum": [
+						"incremental",
+						"full"
+					]
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcReviewRunDescriptor": {
+			"type": "object",
+			"required": [
+				"runId",
+				"workflowAction",
+				"status",
+				"startedAt",
+				"endedAt",
+				"target",
+				"options"
+			],
+			"properties": {
+				"runId": {
+					"type": "string"
+				},
+				"workflowAction": {
+					"type": "string"
+				},
+				"status": {
+					"$ref": "#/$defs/RpcReviewRunStatus"
+				},
+				"startedAt": {
 					"type": "number"
 				},
-				"file": {
+				"endedAt": {
+					"type": "number"
+				},
+				"target": {
+					"type": "object",
+					"required": [
+						"description",
+						"diffCommand",
+						"identity"
+					],
+					"properties": {
+						"description": {
+							"type": "string"
+						},
+						"diffCommand": {
+							"type": "string"
+						},
+						"identity": {
+							"$ref": "#/$defs/RpcReviewTargetIdentity"
+						}
+					},
+					"additionalProperties": false
+				},
+				"options": {
+					"$ref": "#/$defs/RpcReviewOptions"
+				},
+				"parentRunId": {
 					"type": "string"
 				},
-				"line": {
+				"incrementalFallbackReason": {
 					"type": "string"
+				},
+				"errorMessage": {
+					"type": "string"
+				},
+				"completionStatus": {
+					"$ref": "#/$defs/RpcReviewCompletionStatus"
+				},
+				"findingsCount": {
+					"type": "integer",
+					"minimum": 0
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcReviewRunStatus": {
+			"type": "string",
+			"enum": [
+				"completed",
+				"incomplete",
+				"cancelled",
+				"failed"
+			]
+		},
+		"RpcReviewTargetIdentity": {
+			"type": "object",
+			"required": [
+				"kind",
+				"baseTree",
+				"headTree"
+			],
+			"properties": {
+				"kind": {
+					"type": "string",
+					"enum": [
+						"uncommitted",
+						"branch",
+						"pr",
+						"commit"
+					]
+				},
+				"baseTree": {
+					"type": "string"
+				},
+				"headTree": {
+					"type": "string"
+				},
+				"baseCommit": {
+					"type": "string"
+				},
+				"mergeBaseCommit": {
+					"type": "string"
+				},
+				"headCommit": {
+					"type": "string"
+				},
+				"pullRequest": {
+					"type": "object",
+					"required": [
+						"number",
+						"title",
+						"body",
+						"url",
+						"baseRefName",
+						"headRefName",
+						"baseRefOid",
+						"headRefOid"
+					],
+					"properties": {
+						"number": {
+							"type": "integer"
+						},
+						"title": {
+							"type": "string"
+						},
+						"body": {
+							"type": "string"
+						},
+						"url": {
+							"type": "string"
+						},
+						"baseRefName": {
+							"type": "string"
+						},
+						"headRefName": {
+							"type": "string"
+						},
+						"baseRefOid": {
+							"type": "string"
+						},
+						"headRefOid": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
 				}
 			},
 			"additionalProperties": false
@@ -9165,14 +9932,24 @@
 		"RpcReviewWorkflowListResponse": {
 			"type": "object",
 			"required": [
-				"workflows"
+				"runs",
+				"activeWorkflows"
 			],
 			"properties": {
-				"workflows": {
+				"runs": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/RpcReviewRunDescriptor"
+					}
+				},
+				"activeWorkflows": {
 					"type": "array",
 					"items": {
 						"$ref": "#/$defs/RpcReviewWorkflowDescriptor"
 					}
+				},
+				"nextCursor": {
+					"type": "string"
 				}
 			},
 			"additionalProperties": false
@@ -9180,27 +9957,36 @@
 		"RpcReviewWorkflowResultResponse": {
 			"type": "object",
 			"required": [
-				"workflowId",
-				"action",
+				"runId",
+				"workflowAction",
 				"status",
+				"startedAt",
+				"endedAt",
 				"target",
-				"startedAt"
+				"options"
 			],
 			"properties": {
-				"workflowId": {
+				"runId": {
 					"type": "string"
 				},
-				"action": {
+				"workflowAction": {
 					"type": "string"
 				},
 				"status": {
-					"$ref": "#/$defs/RpcReviewWorkflowLifecycleStatus"
+					"$ref": "#/$defs/RpcReviewRunStatus"
+				},
+				"startedAt": {
+					"type": "number"
+				},
+				"endedAt": {
+					"type": "number"
 				},
 				"target": {
 					"type": "object",
 					"required": [
 						"description",
-						"diffCommand"
+						"diffCommand",
+						"identity"
 					],
 					"properties": {
 						"description": {
@@ -9208,21 +9994,30 @@
 						},
 						"diffCommand": {
 							"type": "string"
+						},
+						"identity": {
+							"$ref": "#/$defs/RpcReviewTargetIdentity"
 						}
 					},
 					"additionalProperties": false
 				},
-				"findingsCount": {
-					"type": "number"
+				"options": {
+					"$ref": "#/$defs/RpcReviewOptions"
+				},
+				"parentRunId": {
+					"type": "string"
+				},
+				"incrementalFallbackReason": {
+					"type": "string"
 				},
 				"errorMessage": {
 					"type": "string"
 				},
-				"startedAt": {
-					"type": "number"
+				"completionStatus": {
+					"$ref": "#/$defs/RpcReviewCompletionStatus"
 				},
-				"endedAt": {
-					"type": "number"
+				"summary": {
+					"type": "string"
 				},
 				"findings": {
 					"type": "array",
@@ -9234,12 +10029,12 @@
 					"$ref": "#/$defs/RpcReviewCoverage"
 				},
 				"overallCorrectness": {
-					"type": "string"
+					"$ref": "#/$defs/RpcReviewCorrectness"
 				},
 				"overallExplanation": {
 					"type": "string"
 				},
-				"raw": {
+				"verificationChallenge": {
 					"type": "string"
 				}
 			},

@@ -142,6 +142,22 @@ describe("SessionManager asynchronous persistence", () => {
 		expect(entries.map((entry) => entry.ordinal)).toEqual([1, 2, 3]);
 	});
 
+	it("explicitly materializes a custom-only virtual session", async () => {
+		const root = createTempDir();
+		const manager = SessionManager.create(root, root);
+		const filePath = manager.getSessionFile()!;
+		const customEntryId = manager.appendCustomEntry("test", { durable: true });
+
+		await manager.flush();
+		expect(existsSync(filePath)).toBe(false);
+
+		await manager.materialize();
+		expect(readJsonLines(filePath)).toMatchObject([
+			{ type: "session", id: manager.getSessionId() },
+			{ type: "custom", id: customEntryId, customType: "test", data: { durable: true } },
+		]);
+	});
+
 	it("allows another session queue to progress while one session write is blocked", async () => {
 		const root = createTempDir();
 		const first = SessionManager.create(root, root);
@@ -259,6 +275,12 @@ describe("SessionManager asynchronous persistence", () => {
 		manager.appendCustomEntry("test", { durable: false });
 		await manager.flush();
 		expect(io.events.filter((event) => event.kind === "sync" && event.path === filePath)).toEqual([]);
+		await manager.materialize();
+		const genericAppendEvents = io.events.filter((event) => event.path === filePath);
+		expect(genericAppendEvents.filter((event) => event.kind === "sync")).toHaveLength(1);
+		expect(genericAppendEvents.findIndex((event) => event.kind === "write")).toBeLessThan(
+			genericAppendEvents.findIndex((event) => event.kind === "sync"),
+		);
 
 		io.events.length = 0;
 		manager.appendModelChange("provider", "model");
