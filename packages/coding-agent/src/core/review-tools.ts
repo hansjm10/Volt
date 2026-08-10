@@ -445,57 +445,20 @@ export function createReviewSnapshotTools(snapshot: ReviewSnapshot, tracker: Rev
 			if (params.cursor && params.ignoreCase !== undefined && ignoreCase !== cursorIgnoreCase)
 				throw new Error("Search cursor case sensitivity does not match the request.");
 			const fileIndex = numberState(state, "fileIndex") ?? 0;
+			const lineIndex = numberState(state, "lineIndex") ?? 0;
 			const limit = clampInteger(params.limit, 50, REVIEW_TOOL_MAX_SEARCH_MATCHES);
-			const entries = (await snapshot.listFiles({ revision, ...(prefix ? { prefix } : {}) })).filter(
-				(entry) => entry.type === "blob",
-			);
-			const matches: SearchMatch[] = [];
-			const skippedPaths: Array<{ path: string; reason: string }> = [];
-			let nextFileIndex = fileIndex;
-			let nextLineIndex = numberState(state, "lineIndex") ?? 0;
-			let filesScanned = 0;
-			const needle = ignoreCase ? params.query.toLocaleLowerCase() : params.query;
-			while (
-				nextFileIndex < entries.length &&
-				filesScanned < REVIEW_TOOL_MAX_SEARCH_FILES_PER_PAGE &&
-				matches.length < limit
-			) {
-				throwIfAborted(signal);
-				const entry = entries[nextFileIndex];
-				filesScanned++;
-				const file = await snapshot.readFile(revision, entry.path);
-				if (!file) {
-					skippedPaths.push({ path: entry.path, reason: "The snapshot entry was unavailable." });
-					nextFileIndex++;
-					nextLineIndex = 0;
-					continue;
-				}
-				if (!file.available) {
-					skippedPaths.push({ path: entry.path, reason: file.message });
-					nextFileIndex++;
-					nextLineIndex = 0;
-					continue;
-				}
-				if (file.binary) {
-					skippedPaths.push({ path: entry.path, reason: "Binary content was not searched." });
-					nextFileIndex++;
-					nextLineIndex = 0;
-					continue;
-				}
-				const lines = file.content.toString("utf8").split("\n");
-				while (nextLineIndex < lines.length && matches.length < limit) {
-					const line = lines[nextLineIndex] ?? "";
-					const haystack = ignoreCase ? line.toLocaleLowerCase() : line;
-					if (haystack.includes(needle))
-						matches.push({ path: entry.path, line: nextLineIndex + 1, text: line.slice(0, 500) });
-					nextLineIndex++;
-				}
-				if (nextLineIndex >= lines.length) {
-					nextFileIndex++;
-					nextLineIndex = 0;
-				}
-			}
-			const complete = nextFileIndex >= entries.length;
+			const search = await snapshot.search({
+				revision,
+				query: params.query,
+				...(prefix ? { prefix } : {}),
+				ignoreCase,
+				fileIndex,
+				lineIndex,
+				limit,
+				maxFiles: REVIEW_TOOL_MAX_SEARCH_FILES_PER_PAGE,
+				...(signal ? { signal } : {}),
+			});
+			const { matches, filesScanned, skippedPaths, nextFileIndex, nextLineIndex, complete } = search;
 			const nextCursor = complete
 				? undefined
 				: cursors.encode("search", {

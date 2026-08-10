@@ -102,6 +102,33 @@ export interface ReviewSnapshotListOptions {
 	prefix?: string;
 }
 
+export interface ReviewSnapshotSearchOptions {
+	revision: ReviewSnapshotRevision;
+	query: string;
+	prefix?: string;
+	ignoreCase?: boolean;
+	fileIndex?: number;
+	lineIndex?: number;
+	limit: number;
+	maxFiles: number;
+	signal?: AbortSignal;
+}
+
+export interface ReviewSnapshotSearchMatch {
+	path: string;
+	line: number;
+	text: string;
+}
+
+export interface ReviewSnapshotSearchResult {
+	matches: ReviewSnapshotSearchMatch[];
+	filesScanned: number;
+	skippedPaths: Array<{ path: string; reason: string }>;
+	nextFileIndex: number;
+	nextLineIndex: number;
+	complete: boolean;
+}
+
 export interface ReviewSnapshot {
 	description: string;
 	workflowDescription?: string;
@@ -112,6 +139,7 @@ export interface ReviewSnapshot {
 	root: string;
 	readFile(revision: ReviewSnapshotRevision, path: string): Promise<ReviewSnapshotFile | undefined>;
 	listFiles(options?: ReviewSnapshotListOptions): Promise<ReviewSnapshotTreeEntry[]>;
+	search(options: ReviewSnapshotSearchOptions): Promise<ReviewSnapshotSearchResult>;
 	materializeHead(): Promise<string>;
 	dispose(): Promise<void>;
 }
@@ -143,6 +171,7 @@ interface CommandOutputLimitFailure {
 
 interface CommandResult {
 	ok: boolean;
+	exitCode: number | null;
 	stdout: Buffer;
 	stderr: string;
 	failure?: CommandOutputLimitFailure;
@@ -181,6 +210,18 @@ interface PullRequestView {
 const CANONICAL_GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const DEFAULT_DIFF_CONTEXT_LINES = 3;
 const MAX_STABLE_CAPTURE_ATTEMPTS = 3;
+const SEARCH_PATH_CHUNK_MAX_COUNT = 256;
+const SEARCH_PATH_CHUNK_MAX_BYTES = 24 * 1024;
+const SEARCH_MANIFEST_MAX_ENTRIES = 250_000;
+const SEARCH_MANIFEST_MAX_PATH_BYTES = 16 * 1024 * 1024;
+const SEARCH_RESULT_MAX_MATCHES = 250_000;
+const SEARCH_RESULT_MAX_BYTES = 64 * 1024 * 1024;
+const SEARCH_RESULT_CACHE_MAX_ENTRIES = 16;
+const SEARCH_RESULT_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const SEARCH_RESULT_CACHE_MAX_ENTRY_BYTES = 8 * 1024 * 1024;
+const SEARCH_READ_MAX_BYTES = 256 * 1024 * 1024;
+const SEARCH_FALLBACK_READ_MAX_BYTES = 64 * 1024 * 1024;
+const SEARCH_BATCH_MAX_OBJECTS = 2_048;
 const DEFAULT_REVIEW_SNAPSHOT_LIMITS: ReviewSnapshotLimits = {
 	maxMetadataBytes: 32 * 1024 * 1024,
 	maxStderrBytes: 64 * 1024,
@@ -257,6 +298,7 @@ function runCommand(
 		let stderr: Buffer[] = [];
 		let stderrBytes = 0;
 		let failure: CommandOutputLimitFailure | undefined;
+		let processError: string | undefined;
 		let settled = false;
 		const finish = (result: CommandResult): void => {
 			if (settled) return;
@@ -284,19 +326,25 @@ function runCommand(
 		});
 		proc.on("error", (error) => {
 			if (failure) return;
-			finish({ ok: false, stdout: Buffer.concat(stdout), stderr: error.message });
+			if (error.name === "AbortError") {
+				processError = error.message;
+				return;
+			}
+			finish({ ok: false, exitCode: null, stdout: Buffer.concat(stdout), stderr: error.message });
 		});
 		proc.on("close", (code) => {
 			if (failure) {
-				finish({ ok: false, stdout: Buffer.alloc(0), stderr: "", failure });
+				finish({ ok: false, exitCode: code, stdout: Buffer.alloc(0), stderr: "", failure });
 				return;
 			}
 			finish({
-				ok: code === 0,
+				ok: code === 0 && processError === undefined,
+				exitCode: code,
 				stdout: Buffer.concat(stdout, stdoutBytes),
-				stderr: Buffer.concat(stderr, stderrBytes).toString("utf8"),
+				stderr: processError ?? Buffer.concat(stderr, stderrBytes).toString("utf8"),
 			});
 		});
+		proc.stdin?.on("error", () => {});
 		if (options.input !== undefined) proc.stdin?.end(options.input);
 	});
 }
@@ -833,6 +881,372 @@ function countLines(content: Buffer): number {
 	return lines;
 }
 
+type SearchManifestEntryKind = "text" | "empty" | "binary" | "symlink" | "oversized" | "unavailable";
+
+interface SearchManifestEntry {
+	entry: ReviewSnapshotTreeEntry;
+	kind: SearchManifestEntryKind;
+	reason?: string;
+}
+
+interface SearchManifest {
+	tree: string;
+	entries: SearchManifestEntry[];
+}
+
+interface SearchComputationFile {
+	matches: ReviewSnapshotSearchMatch[];
+	totalLines: number;
+	skipReason?: string;
+}
+
+interface SearchComputation {
+	entries: SearchManifestEntry[];
+	files: Map<string, SearchComputationFile>;
+	retainedBytes: number;
+}
+
+interface SearchCacheEntry {
+	computation: SearchComputation;
+	bytes: number;
+}
+
+interface SearchInflight {
+	key: string;
+	controller: AbortController;
+	promise: Promise<SearchComputation>;
+	waiters: number;
+	settled: boolean;
+}
+
+interface SearchBlobRequest {
+	oid: string;
+	size: number;
+}
+
+function searchAbortError(): Error {
+	return new Error("Review snapshot search was aborted.");
+}
+
+function throwIfSearchAborted(signal: AbortSignal): void {
+	if (signal.aborted) throw searchAbortError();
+}
+
+function searchTree(identity: ReviewSnapshotIdentity, revision: ReviewSnapshotRevision): string {
+	return revision === "base" ? identity.baseTree : identity.headTree;
+}
+
+function literalSearchPathspec(path: string): string {
+	return `:(top,literal)${path}`;
+}
+
+function chunkSearchPaths(paths: string[]): string[][] {
+	const chunks: string[][] = [];
+	let chunk: string[] = [];
+	let bytes = 0;
+	for (const path of paths) {
+		const pathBytes = Buffer.byteLength(literalSearchPathspec(path), "utf8") + 1;
+		if (
+			chunk.length > 0 &&
+			(chunk.length >= SEARCH_PATH_CHUNK_MAX_COUNT || bytes + pathBytes > SEARCH_PATH_CHUNK_MAX_BYTES)
+		) {
+			chunks.push(chunk);
+			chunk = [];
+			bytes = 0;
+		}
+		chunk.push(path);
+		bytes += pathBytes;
+	}
+	if (chunk.length > 0) chunks.push(chunk);
+	return chunks;
+}
+
+function parseGitGrepPaths(stdout: Buffer, tree: string, allowedPaths: ReadonlySet<string>): string[] {
+	if (stdout.length === 0) return [];
+	if (stdout.at(-1) !== 0) throw new Error("git grep returned a non-NUL-terminated path list.");
+	const prefix = `${tree}:`;
+	const paths: string[] = [];
+	let start = 0;
+	for (let index = 0; index < stdout.length; index++) {
+		if (stdout[index] !== 0) continue;
+		const token = stdout.subarray(start, index).toString("utf8");
+		start = index + 1;
+		if (!token.startsWith(prefix)) throw new Error("git grep returned a path outside the requested snapshot tree.");
+		const path = token.slice(prefix.length);
+		if (!allowedPaths.has(path)) throw new Error(`git grep returned an unexpected snapshot path: ${path}`);
+		paths.push(path);
+	}
+	return paths;
+}
+
+async function gitGrepPaths(
+	source: GitSource,
+	tree: string,
+	paths: string[],
+	options: {
+		pattern: string;
+		ignoreCase?: boolean;
+		perl?: boolean;
+		optional?: boolean;
+		signal: AbortSignal;
+	},
+): Promise<Set<string> | undefined> {
+	const matches = new Set<string>();
+	for (const chunk of chunkSearchPaths(paths)) {
+		throwIfSearchAborted(options.signal);
+		const allowedPaths = new Set(chunk);
+		const result = await runCommand(
+			"git",
+			[
+				"grep",
+				"--full-name",
+				options.perl ? "-P" : "-F",
+				"-I",
+				"-l",
+				"-z",
+				...(options.ignoreCase ? ["-i"] : []),
+				"-e",
+				options.pattern,
+				tree,
+				"--",
+				...chunk.map(literalSearchPathspec),
+			],
+			source.cwd,
+			{
+				env: options.perl ? { ...source.env, LC_ALL: "C" } : source.env,
+				signal: options.signal,
+				maxStdoutBytes: source.limits.maxMetadataBytes,
+				maxStderrBytes: source.limits.maxStderrBytes,
+			},
+		);
+		throwIfSearchAborted(options.signal);
+		if (result.failure) {
+			if (options.optional) return undefined;
+			throw new Error(`git grep failed: ${commandError(result)}`);
+		}
+		if (result.exitCode === 1) {
+			if (result.stdout.length > 0) throw new Error("git grep returned output with a no-match exit status.");
+			continue;
+		}
+		if (result.exitCode !== 0) {
+			if (options.optional) return undefined;
+			throw new Error(`git grep failed: ${commandError(result)}`);
+		}
+		for (const path of parseGitGrepPaths(result.stdout, tree, allowedPaths)) matches.add(path);
+		if (matches.size > SEARCH_MANIFEST_MAX_ENTRIES) {
+			throw new Error(`Review snapshot search exceeded the ${SEARCH_MANIFEST_MAX_ENTRIES} path result limit.`);
+		}
+	}
+	return matches;
+}
+
+async function buildSearchManifest(
+	source: GitSource,
+	identity: ReviewSnapshotIdentity,
+	treeEntries: Map<string, ReviewSnapshotTreeEntry>,
+	revision: ReviewSnapshotRevision,
+	signal: AbortSignal,
+): Promise<SearchManifest> {
+	throwIfSearchAborted(signal);
+	const entries = [...treeEntries.values()]
+		.filter((entry) => entry.type === "blob")
+		.sort((left, right) => left.path.localeCompare(right.path));
+	if (entries.length > SEARCH_MANIFEST_MAX_ENTRIES) {
+		throw new Error(`Review snapshot search manifest exceeds the ${SEARCH_MANIFEST_MAX_ENTRIES} file limit.`);
+	}
+	const pathBytes = entries.reduce((total, entry) => total + Buffer.byteLength(entry.path, "utf8"), 0);
+	if (pathBytes > SEARCH_MANIFEST_MAX_PATH_BYTES) {
+		throw new Error(
+			`Review snapshot search manifest paths exceed the ${formatByteLimit(SEARCH_MANIFEST_MAX_PATH_BYTES)} limit.`,
+		);
+	}
+	const tree = searchTree(identity, revision);
+	const ordinaryPaths = entries
+		.filter(
+			(entry) =>
+				entry.mode !== "120000" &&
+				entry.size !== undefined &&
+				entry.size > 0 &&
+				entry.size <= source.limits.maxBlobBytes,
+		)
+		.map((entry) => entry.path);
+	const textPaths = (await gitGrepPaths(source, tree, ordinaryPaths, { pattern: "", signal })) ?? new Set<string>();
+	return {
+		tree,
+		entries: entries.map((entry): SearchManifestEntry => {
+			if (entry.size === undefined) {
+				return {
+					entry,
+					kind: "unavailable",
+					reason: "Git did not report a blob size, so the file was not read.",
+				};
+			}
+			if (entry.size > source.limits.maxBlobBytes) {
+				return {
+					entry,
+					kind: "oversized",
+					reason: `Blob size ${entry.size} bytes exceeds the ${formatByteLimit(source.limits.maxBlobBytes)} snapshot read limit.`,
+				};
+			}
+			if (entry.mode === "120000") return { entry, kind: "symlink" };
+			if (entry.size === 0) return { entry, kind: "empty" };
+			if (textPaths.has(entry.path)) return { entry, kind: "text" };
+			return { entry, kind: "binary", reason: "Binary content was not searched." };
+		}),
+	};
+}
+
+function directGitSearchQuery(query: string): boolean {
+	for (let index = 0; index < query.length; index++) {
+		const code = query.charCodeAt(index);
+		if (code === 0 || code === 10 || code > 0x7f) return false;
+	}
+	return true;
+}
+
+function searchBlobBatchBytes(request: SearchBlobRequest): number {
+	return request.oid.length + 1 + 4 + 1 + String(request.size).length + 1 + request.size + 1;
+}
+
+function parseSearchBlobBatch(stdout: Buffer, requests: SearchBlobRequest[]): Map<string, Buffer | undefined> {
+	const contents = new Map<string, Buffer | undefined>();
+	let offset = 0;
+	for (const request of requests) {
+		const newline = stdout.indexOf(10, offset);
+		if (newline < 0) throw new Error("git cat-file --batch returned a truncated object header.");
+		const header = stdout.subarray(offset, newline).toString("utf8");
+		offset = newline + 1;
+		if (header === `${request.oid} missing`) {
+			contents.set(request.oid, undefined);
+			continue;
+		}
+		if (header !== `${request.oid} blob ${request.size}`) {
+			throw new Error(`git cat-file --batch returned unexpected metadata for ${request.oid}.`);
+		}
+		const end = offset + request.size;
+		if (end >= stdout.length || stdout[end] !== 10) {
+			throw new Error(`git cat-file --batch returned truncated content for ${request.oid}.`);
+		}
+		contents.set(request.oid, stdout.subarray(offset, end));
+		offset = end + 1;
+	}
+	if (offset !== stdout.length) throw new Error("git cat-file --batch returned unexpected trailing output.");
+	return contents;
+}
+
+async function readSearchBlobs(
+	source: GitSource,
+	entries: SearchManifestEntry[],
+	fallbackOids: ReadonlySet<string>,
+	signal: AbortSignal,
+): Promise<Map<string, Buffer | undefined>> {
+	const requestsByOid = new Map<string, SearchBlobRequest>();
+	for (const { entry } of entries) {
+		if (entry.size === undefined) continue;
+		requestsByOid.set(entry.oid, { oid: entry.oid, size: entry.size });
+	}
+	const requests = [...requestsByOid.values()];
+	const totalBytes = requests.reduce((total, request) => total + request.size, 0);
+	if (!Number.isSafeInteger(totalBytes) || totalBytes > SEARCH_READ_MAX_BYTES) {
+		throw new Error(
+			`Review snapshot search blob reads exceed the ${formatByteLimit(SEARCH_READ_MAX_BYTES)} aggregate limit.`,
+		);
+	}
+	const fallbackBytes = requests
+		.filter((request) => fallbackOids.has(request.oid))
+		.reduce((total, request) => total + request.size, 0);
+	const fallbackLimit = Math.min(SEARCH_FALLBACK_READ_MAX_BYTES, source.limits.maxMetadataBytes);
+	if (!Number.isSafeInteger(fallbackBytes) || fallbackBytes > fallbackLimit) {
+		throw new Error(
+			`Review snapshot semantic fallback exceeds the ${formatByteLimit(fallbackLimit)} aggregate read limit.`,
+		);
+	}
+	const maxBatchBytes = Math.max(source.limits.maxMetadataBytes, source.limits.maxBlobBytes + 256);
+	const contents = new Map<string, Buffer | undefined>();
+	let chunk: SearchBlobRequest[] = [];
+	let chunkBytes = 0;
+	const readChunk = async (): Promise<void> => {
+		if (chunk.length === 0) return;
+		throwIfSearchAborted(signal);
+		const result = await runCommand("git", ["cat-file", "--batch"], source.cwd, {
+			env: source.env,
+			input: `${chunk.map((request) => request.oid).join("\n")}\n`,
+			signal,
+			maxStdoutBytes: maxBatchBytes,
+			maxStderrBytes: source.limits.maxStderrBytes,
+		});
+		throwIfSearchAborted(signal);
+		if (!result.ok) throw new Error(`git cat-file --batch failed: ${commandError(result)}`);
+		for (const [oid, content] of parseSearchBlobBatch(result.stdout, chunk)) contents.set(oid, content);
+		chunk = [];
+		chunkBytes = 0;
+	};
+	for (const request of requests) {
+		const requestBytes = searchBlobBatchBytes(request);
+		if (requestBytes > maxBatchBytes) {
+			throw new Error(`Snapshot blob ${request.oid} exceeds the bounded batch-read output limit.`);
+		}
+		if (chunk.length > 0 && (chunk.length >= SEARCH_BATCH_MAX_OBJECTS || chunkBytes + requestBytes > maxBatchBytes)) {
+			await readChunk();
+		}
+		chunk.push(request);
+		chunkBytes += requestBytes;
+	}
+	await readChunk();
+	return contents;
+}
+
+function pageSearchComputation(
+	computation: SearchComputation,
+	options: ReviewSnapshotSearchOptions,
+): ReviewSnapshotSearchResult {
+	let nextFileIndex = options.fileIndex ?? 0;
+	let nextLineIndex = options.lineIndex ?? 0;
+	const matches: ReviewSnapshotSearchMatch[] = [];
+	const skippedPaths: Array<{ path: string; reason: string }> = [];
+	let filesScanned = 0;
+	while (
+		nextFileIndex < computation.entries.length &&
+		filesScanned < options.maxFiles &&
+		matches.length < options.limit
+	) {
+		const manifestEntry = computation.entries[nextFileIndex];
+		filesScanned++;
+		const file = computation.files.get(manifestEntry.entry.path);
+		const skipReason = file?.skipReason ?? manifestEntry.reason;
+		if (skipReason) {
+			skippedPaths.push({ path: manifestEntry.entry.path, reason: skipReason });
+			nextFileIndex++;
+			nextLineIndex = 0;
+			continue;
+		}
+		const fileMatches = file?.matches ?? [];
+		let matchIndex = fileMatches.findIndex((match) => match.line > nextLineIndex);
+		if (matchIndex < 0) {
+			nextFileIndex++;
+			nextLineIndex = 0;
+			continue;
+		}
+		while (matchIndex < fileMatches.length && matches.length < options.limit) {
+			const match = fileMatches[matchIndex++];
+			matches.push(match);
+			nextLineIndex = match.line;
+		}
+		if (matches.length < options.limit || nextLineIndex >= (file?.totalLines ?? 0)) {
+			nextFileIndex++;
+			nextLineIndex = 0;
+		}
+	}
+	return {
+		matches,
+		filesScanned,
+		skippedPaths,
+		nextFileIndex,
+		nextLineIndex,
+		complete: nextFileIndex >= computation.entries.length,
+	};
+}
+
 async function buildChangedFiles(
 	source: GitSource,
 	baseTree: string,
@@ -926,6 +1340,12 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	private readonly temporaryDirectories: string[];
 	private readonly materializedDirectories: string[] = [];
 	private readonly treeEntries = new Map<ReviewSnapshotRevision, Map<string, ReviewSnapshotTreeEntry>>();
+	private readonly searchManifests = new Map<ReviewSnapshotRevision, Promise<SearchManifest>>();
+	private readonly searchResults = new Map<string, SearchCacheEntry>();
+	private readonly searchInflight = new Map<string, SearchInflight>();
+	private readonly activeSearchWork = new Set<Promise<unknown>>();
+	private readonly disposalController = new AbortController();
+	private searchResultCacheBytes = 0;
 	private disposed = false;
 
 	private constructor(
@@ -1029,6 +1449,295 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			.sort((left, right) => left.path.localeCompare(right.path));
 	}
 
+	async search(options: ReviewSnapshotSearchOptions): Promise<ReviewSnapshotSearchResult> {
+		this.assertActive();
+		if (!options.query) throw new Error("Review snapshot search query must not be empty.");
+		for (const [name, value, minimum] of [
+			["fileIndex", options.fileIndex ?? 0, 0],
+			["lineIndex", options.lineIndex ?? 0, 0],
+			["limit", options.limit, 1],
+			["maxFiles", options.maxFiles, 1],
+		] as const) {
+			if (!Number.isSafeInteger(value) || value < minimum) {
+				throw new Error(`Review snapshot search ${name} is outside its supported range.`);
+			}
+		}
+		if (options.signal?.aborted) throw searchAbortError();
+		const prefix = options.prefix === undefined || options.prefix === "" ? "" : normalizeReviewPath(options.prefix);
+		const normalized: ReviewSnapshotSearchOptions = {
+			...options,
+			prefix,
+			ignoreCase: options.ignoreCase ?? false,
+			fileIndex: options.fileIndex ?? 0,
+			lineIndex: options.lineIndex ?? 0,
+		};
+		const key = JSON.stringify([options.revision, prefix, options.query, normalized.ignoreCase]);
+		const cached = this.takeCachedSearchResult(key);
+		if (cached) return pageSearchComputation(cached, normalized);
+		let inflight = this.searchInflight.get(key);
+		if (inflight?.controller.signal.aborted && !inflight.settled) {
+			if (this.searchInflight.get(key) === inflight) this.searchInflight.delete(key);
+			inflight = undefined;
+		}
+		if (!inflight) inflight = this.startSearchComputation(key, normalized);
+		const computation = await this.waitForSearchComputation(inflight, options.signal);
+		return pageSearchComputation(computation, normalized);
+	}
+
+	private startSearchComputation(key: string, options: ReviewSnapshotSearchOptions): SearchInflight {
+		const controller = new AbortController();
+		const signal = AbortSignal.any([controller.signal, this.disposalController.signal]);
+		const promise = this.computeSearch(
+			options.revision,
+			options.prefix ?? "",
+			options.query,
+			options.ignoreCase === true,
+			signal,
+		);
+		const inflight: SearchInflight = { key, controller, promise, waiters: 0, settled: false };
+		this.searchInflight.set(key, inflight);
+		this.trackSearchWork(promise);
+		void promise.then(
+			(computation) => {
+				inflight.settled = true;
+				if (this.searchInflight.get(key) === inflight) this.searchInflight.delete(key);
+				if (!this.disposed && !controller.signal.aborted) this.cacheSearchResult(key, computation);
+			},
+			() => {
+				inflight.settled = true;
+				if (this.searchInflight.get(key) === inflight) this.searchInflight.delete(key);
+			},
+		);
+		return inflight;
+	}
+
+	private waitForSearchComputation(
+		inflight: SearchInflight,
+		signal: AbortSignal | undefined,
+	): Promise<SearchComputation> {
+		inflight.waiters++;
+		return new Promise((resolveResult, reject) => {
+			let settled = false;
+			const release = (aborted: boolean): void => {
+				if (settled) return;
+				settled = true;
+				signal?.removeEventListener("abort", onAbort);
+				inflight.waiters--;
+				if (aborted && inflight.waiters === 0 && !inflight.settled) {
+					if (this.searchInflight.get(inflight.key) === inflight) this.searchInflight.delete(inflight.key);
+					inflight.controller.abort();
+				}
+			};
+			const onAbort = (): void => {
+				release(true);
+				reject(searchAbortError());
+			};
+			if (signal?.aborted) {
+				onAbort();
+				return;
+			}
+			signal?.addEventListener("abort", onAbort, { once: true });
+			void inflight.promise.then(
+				(computation) => {
+					release(false);
+					resolveResult(computation);
+				},
+				(error: unknown) => {
+					release(false);
+					reject(error);
+				},
+			);
+		});
+	}
+
+	private async computeSearch(
+		revision: ReviewSnapshotRevision,
+		prefix: string,
+		query: string,
+		ignoreCase: boolean,
+		signal: AbortSignal,
+	): Promise<SearchComputation> {
+		const manifest = await this.waitForSearchPromise(this.getSearchManifest(revision), signal);
+		throwIfSearchAborted(signal);
+		const entries = manifest.entries.filter(
+			({ entry }) => !prefix || entry.path === prefix || entry.path.startsWith(`${prefix}/`),
+		);
+		const textEntries = entries.filter((entry) => entry.kind === "text");
+		const symlinkEntries = entries.filter((entry) => entry.kind === "symlink");
+		const selectedPaths = new Set<string>();
+		const fallbackPaths = new Set<string>();
+		if (directGitSearchQuery(query)) {
+			const directMatches = await gitGrepPaths(
+				this.source,
+				manifest.tree,
+				textEntries.map(({ entry }) => entry.path),
+				{ pattern: query, ignoreCase, signal },
+			);
+			if (!directMatches) throw new Error("git grep did not return a required candidate set.");
+			for (const path of directMatches) selectedPaths.add(path);
+			if (ignoreCase) {
+				const nonAsciiPaths = await gitGrepPaths(
+					this.source,
+					manifest.tree,
+					textEntries.map(({ entry }) => entry.path),
+					{ pattern: "[^\\x00-\\x7f]", perl: true, optional: true, signal },
+				);
+				for (const { entry } of nonAsciiPaths === undefined
+					? textEntries
+					: textEntries.filter(({ entry }) => nonAsciiPaths.has(entry.path))) {
+					selectedPaths.add(entry.path);
+					fallbackPaths.add(entry.path);
+				}
+			}
+		} else {
+			for (const { entry } of textEntries) {
+				selectedPaths.add(entry.path);
+				fallbackPaths.add(entry.path);
+			}
+		}
+		for (const { entry } of symlinkEntries) {
+			selectedPaths.add(entry.path);
+			fallbackPaths.add(entry.path);
+		}
+		const selectedEntries = entries.filter(({ entry }) => selectedPaths.has(entry.path));
+		const fallbackOids = new Set(
+			selectedEntries.filter(({ entry }) => fallbackPaths.has(entry.path)).map(({ entry }) => entry.oid),
+		);
+		const contents = await readSearchBlobs(this.source, selectedEntries, fallbackOids, signal);
+		throwIfSearchAborted(signal);
+		const files = new Map<string, SearchComputationFile>();
+		let matchCount = 0;
+		let retainedBytes = entries.reduce((total, { entry }) => total + Buffer.byteLength(entry.path, "utf8") + 32, 0);
+		const needle = ignoreCase ? query.toLocaleLowerCase() : query;
+		for (const { entry } of selectedEntries) {
+			throwIfSearchAborted(signal);
+			const content = contents.get(entry.oid);
+			if (content === undefined) {
+				files.set(entry.path, {
+					matches: [],
+					totalLines: 0,
+					skipReason: `Could not read the snapshot blob: object ${entry.oid} is unavailable.`,
+				});
+				continue;
+			}
+			if (isBinary(content)) {
+				files.set(entry.path, { matches: [], totalLines: 0, skipReason: "Binary content was not searched." });
+				continue;
+			}
+			const lines = content.toString("utf8").split("\n");
+			const matches: ReviewSnapshotSearchMatch[] = [];
+			for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+				const line = lines[lineIndex] ?? "";
+				const haystack = ignoreCase ? line.toLocaleLowerCase() : line;
+				if (!haystack.includes(needle)) continue;
+				const match = { path: entry.path, line: lineIndex + 1, text: line.slice(0, 500) };
+				matches.push(match);
+				matchCount++;
+				retainedBytes += Buffer.byteLength(match.path, "utf8") + Buffer.byteLength(match.text, "utf8") + 32;
+				if (matchCount > SEARCH_RESULT_MAX_MATCHES) {
+					throw new Error(`Review snapshot search exceeds the ${SEARCH_RESULT_MAX_MATCHES} retained match limit.`);
+				}
+				if (retainedBytes > SEARCH_RESULT_MAX_BYTES) {
+					throw new Error(
+						`Review snapshot search results exceed the ${formatByteLimit(SEARCH_RESULT_MAX_BYTES)} retained result limit.`,
+					);
+				}
+			}
+			files.set(entry.path, { matches, totalLines: lines.length });
+		}
+		if (retainedBytes > SEARCH_RESULT_MAX_BYTES) {
+			throw new Error(
+				`Review snapshot search results exceed the ${formatByteLimit(SEARCH_RESULT_MAX_BYTES)} retained result limit.`,
+			);
+		}
+		return { entries, files, retainedBytes };
+	}
+
+	private getSearchManifest(revision: ReviewSnapshotRevision): Promise<SearchManifest> {
+		this.assertActive();
+		const existing = this.searchManifests.get(revision);
+		if (existing) return existing;
+		const entries = this.treeEntries.get(revision);
+		if (!entries) throw new Error(`Review snapshot ${revision} tree inventory is unavailable.`);
+		const promise = buildSearchManifest(
+			this.source,
+			this.identity,
+			entries,
+			revision,
+			this.disposalController.signal,
+		);
+		this.searchManifests.set(revision, promise);
+		this.trackSearchWork(promise);
+		void promise.then(undefined, () => {
+			if (this.searchManifests.get(revision) === promise) this.searchManifests.delete(revision);
+		});
+		return promise;
+	}
+
+	private waitForSearchPromise<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+		if (signal.aborted) return Promise.reject(searchAbortError());
+		return new Promise((resolveResult, reject) => {
+			let settled = false;
+			const finish = (): boolean => {
+				if (settled) return false;
+				settled = true;
+				signal.removeEventListener("abort", onAbort);
+				return true;
+			};
+			const onAbort = (): void => {
+				if (!finish()) return;
+				reject(searchAbortError());
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			void promise.then(
+				(value) => {
+					if (finish()) resolveResult(value);
+				},
+				(error: unknown) => {
+					if (finish()) reject(error);
+				},
+			);
+		});
+	}
+
+	private trackSearchWork(promise: Promise<unknown>): void {
+		this.activeSearchWork.add(promise);
+		void promise.then(
+			() => this.activeSearchWork.delete(promise),
+			() => this.activeSearchWork.delete(promise),
+		);
+	}
+
+	private takeCachedSearchResult(key: string): SearchComputation | undefined {
+		const cached = this.searchResults.get(key);
+		if (!cached) return undefined;
+		this.searchResults.delete(key);
+		this.searchResults.set(key, cached);
+		return cached.computation;
+	}
+
+	private cacheSearchResult(key: string, computation: SearchComputation): void {
+		if (computation.retainedBytes > SEARCH_RESULT_CACHE_MAX_ENTRY_BYTES) return;
+		const existing = this.searchResults.get(key);
+		if (existing) {
+			this.searchResults.delete(key);
+			this.searchResultCacheBytes -= existing.bytes;
+		}
+		const cached = { computation, bytes: computation.retainedBytes };
+		this.searchResults.set(key, cached);
+		this.searchResultCacheBytes += cached.bytes;
+		while (
+			this.searchResults.size > SEARCH_RESULT_CACHE_MAX_ENTRIES ||
+			this.searchResultCacheBytes > SEARCH_RESULT_CACHE_MAX_BYTES
+		) {
+			const oldestKey = this.searchResults.keys().next().value;
+			if (oldestKey === undefined) break;
+			const oldest = this.searchResults.get(oldestKey);
+			this.searchResults.delete(oldestKey);
+			if (oldest) this.searchResultCacheBytes -= oldest.bytes;
+		}
+	}
+
 	async materializeHead(): Promise<string> {
 		this.assertActive();
 		const directory = await mkdtemp(join(tmpdir(), "volt-review-checkout-"));
@@ -1068,6 +1777,14 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	async dispose(): Promise<void> {
 		if (this.disposed) return;
 		this.disposed = true;
+		this.disposalController.abort();
+		while (this.activeSearchWork.size > 0) {
+			await Promise.allSettled([...this.activeSearchWork]);
+		}
+		this.searchInflight.clear();
+		this.searchManifests.clear();
+		this.searchResults.clear();
+		this.searchResultCacheBytes = 0;
 		for (const directory of [...this.materializedDirectories, ...this.temporaryDirectories].reverse()) {
 			await rm(directory, { recursive: true, force: true }).catch(() => {});
 		}
