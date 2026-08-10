@@ -1,9 +1,11 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { copyFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { spawnProcess } from "../utils/child-process.ts";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import type { Readable } from "node:stream";
+import { spawnProcess, waitForChildProcess } from "../utils/child-process.ts";
 
 export type ReviewTarget =
 	| { kind: "uncommitted" }
@@ -102,6 +104,20 @@ export interface ReviewSnapshotListOptions {
 	prefix?: string;
 }
 
+export interface ReviewSnapshotSearchEntry {
+	path: string;
+	lineCount?: number;
+	ascii?: boolean;
+	skippedReason?: string;
+}
+
+export interface ReviewSnapshotSearchMaterialization {
+	directory: string;
+	entries: ReviewSnapshotSearchEntry[];
+	materializedFiles: number;
+	materializedBytes: number;
+}
+
 export interface ReviewSnapshot {
 	description: string;
 	workflowDescription?: string;
@@ -112,6 +128,7 @@ export interface ReviewSnapshot {
 	root: string;
 	readFile(revision: ReviewSnapshotRevision, path: string): Promise<ReviewSnapshotFile | undefined>;
 	listFiles(options?: ReviewSnapshotListOptions): Promise<ReviewSnapshotTreeEntry[]>;
+	materializeSearch(revision: ReviewSnapshotRevision): Promise<ReviewSnapshotSearchMaterialization>;
 	materializeHead(): Promise<string>;
 	dispose(): Promise<void>;
 }
@@ -146,6 +163,56 @@ interface CommandResult {
 	stdout: Buffer;
 	stderr: string;
 	failure?: CommandOutputLimitFailure;
+}
+
+class BufferedStreamReader {
+	private readonly iterator: AsyncIterator<Buffer | string>;
+	private buffered: Buffer = Buffer.alloc(0);
+
+	constructor(stream: Readable) {
+		this.iterator = stream[Symbol.asyncIterator]();
+	}
+
+	async readLine(maximumBytes: number): Promise<string> {
+		const parts: Buffer[] = [];
+		let totalBytes = 0;
+		while (true) {
+			const newline = this.buffered.indexOf(10);
+			if (newline >= 0) {
+				parts.push(this.buffered.subarray(0, newline));
+				totalBytes += newline;
+				if (totalBytes > maximumBytes) throw new Error("Git batch response header exceeded its limit.");
+				this.buffered = this.buffered.subarray(newline + 1);
+				return Buffer.concat(parts, totalBytes).toString("utf8");
+			}
+			if (this.buffered.length > 0) {
+				parts.push(this.buffered);
+				totalBytes += this.buffered.length;
+				if (totalBytes > maximumBytes) throw new Error("Git batch response header exceeded its limit.");
+				this.buffered = Buffer.alloc(0);
+			}
+			this.buffered = await this.nextChunk();
+		}
+	}
+
+	async readExactly(bytes: number): Promise<Buffer> {
+		const output = Buffer.allocUnsafe(bytes);
+		let written = 0;
+		while (written < bytes) {
+			if (this.buffered.length === 0) this.buffered = await this.nextChunk();
+			const copied = Math.min(bytes - written, this.buffered.length);
+			this.buffered.copy(output, written, 0, copied);
+			this.buffered = this.buffered.subarray(copied);
+			written += copied;
+		}
+		return output;
+	}
+
+	private async nextChunk(): Promise<Buffer> {
+		const next = await this.iterator.next();
+		if (next.done) throw new Error("Git batch output ended unexpectedly.");
+		return typeof next.value === "string" ? Buffer.from(next.value) : next.value;
+	}
 }
 
 interface GitSource {
@@ -925,6 +992,10 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	private readonly limits: ReviewSnapshotLimits;
 	private readonly temporaryDirectories: string[];
 	private readonly materializedDirectories: string[] = [];
+	private readonly searchMaterializations = new Map<
+		ReviewSnapshotRevision,
+		Promise<ReviewSnapshotSearchMaterialization>
+	>();
 	private readonly treeEntries = new Map<ReviewSnapshotRevision, Map<string, ReviewSnapshotTreeEntry>>();
 	private disposed = false;
 
@@ -1029,6 +1100,20 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			.sort((left, right) => left.path.localeCompare(right.path));
 	}
 
+	async materializeSearch(revision: ReviewSnapshotRevision): Promise<ReviewSnapshotSearchMaterialization> {
+		this.assertActive();
+		const cached = this.searchMaterializations.get(revision);
+		if (cached) return cached;
+		const materialization = this.createSearchMaterialization(revision);
+		this.searchMaterializations.set(revision, materialization);
+		try {
+			return await materialization;
+		} catch (error) {
+			this.searchMaterializations.delete(revision);
+			throw error;
+		}
+	}
+
 	async materializeHead(): Promise<string> {
 		this.assertActive();
 		const directory = await mkdtemp(join(tmpdir(), "volt-review-checkout-"));
@@ -1071,6 +1156,126 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		for (const directory of [...this.materializedDirectories, ...this.temporaryDirectories].reverse()) {
 			await rm(directory, { recursive: true, force: true }).catch(() => {});
 		}
+	}
+
+	private async createSearchMaterialization(
+		revision: ReviewSnapshotRevision,
+	): Promise<ReviewSnapshotSearchMaterialization> {
+		const directory = await mkdtemp(join(tmpdir(), `volt-review-search-${revision}-`));
+		this.materializedDirectories.push(directory);
+		const entries = [...(this.treeEntries.get(revision)?.values() ?? [])]
+			.filter((entry) => entry.type === "blob")
+			.sort((left, right) => left.path.localeCompare(right.path));
+		const searchable = entries.filter((entry) => entry.size !== undefined && entry.size <= this.limits.maxBlobBytes);
+		const resultEntries: ReviewSnapshotSearchEntry[] = [];
+		let materializedFiles = 0;
+		let materializedBytes = 0;
+		if (searchable.length === 0) {
+			for (const entry of entries) resultEntries.push(this.unavailableSearchEntry(entry));
+			return { directory, entries: resultEntries, materializedFiles, materializedBytes };
+		}
+
+		const child = spawnProcess("git", ["cat-file", "--batch"], {
+			cwd: this.source.cwd,
+			stdio: ["pipe", "pipe", "pipe"],
+			env: this.source.env ? { ...process.env, ...this.source.env } : process.env,
+		});
+		if (!child.stdin || !child.stdout || !child.stderr) {
+			child.kill();
+			throw new Error("Could not open Git batch streams for review search materialization.");
+		}
+		const completion = waitForChildProcess(child);
+		const reader = new BufferedStreamReader(child.stdout);
+		let stderr = Buffer.alloc(0);
+		let stderrExceeded = false;
+		child.stderr.on("data", (chunk: Buffer) => {
+			if (stderrExceeded) return;
+			if (stderr.length + chunk.length > this.limits.maxStderrBytes) {
+				stderrExceeded = true;
+				stderr = Buffer.alloc(0);
+				child.kill();
+				return;
+			}
+			stderr = Buffer.concat([stderr, chunk]);
+		});
+
+		try {
+			const input = child.stdin;
+			for (const entry of entries) {
+				if (entry.size === undefined || entry.size > this.limits.maxBlobBytes) {
+					resultEntries.push(this.unavailableSearchEntry(entry));
+					continue;
+				}
+				if (!input.write(`${entry.oid}\n`)) await once(input, "drain");
+				const header = await reader.readLine(256);
+				const match = /^([0-9a-f]+) (blob) (\d+)$/.exec(header);
+				if (!match) throw new Error(`Unexpected Git batch response for ${entry.path}: ${header}`);
+				const [, oid, , sizeText] = match;
+				const size = Number(sizeText);
+				if (oid !== entry.oid || !Number.isSafeInteger(size) || size !== entry.size) {
+					throw new Error(`Git batch response did not match the inventoried blob for ${entry.path}.`);
+				}
+				const content = await reader.readExactly(size);
+				const separator = await reader.readExactly(1);
+				if (separator[0] !== 10) throw new Error(`Git batch response for ${entry.path} was not terminated.`);
+				if (isBinary(content)) {
+					resultEntries.push({ path: entry.path, skippedReason: "Binary content was not searched." });
+					continue;
+				}
+				const destination = join(directory, ...entry.path.split("/"));
+				if (!pathWithinRoot(directory, destination)) {
+					throw new Error(`Review snapshot path escaped the search materialization: ${entry.path}`);
+				}
+				await mkdir(dirname(destination), { recursive: true });
+				const decoded = content.toString("utf8");
+				try {
+					await writeFile(destination, decoded, { encoding: "utf8", flag: "wx" });
+				} catch (error) {
+					throw new Error(
+						`Could not safely materialize review snapshot path ${entry.path}: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+				materializedFiles++;
+				materializedBytes += Buffer.byteLength(decoded, "utf8");
+				resultEntries.push({
+					path: entry.path,
+					lineCount: decoded.split("\n").length,
+					ascii: !/[^\x00-\x7f]/u.test(decoded),
+				});
+			}
+			input.end();
+			const exitCode = await completion;
+			if (stderrExceeded) {
+				throw new Error(
+					`Git batch stderr exceeded the ${formatByteLimit(this.limits.maxStderrBytes)} capture limit.`,
+				);
+			}
+			if (exitCode !== 0) {
+				throw new Error(
+					`Git batch materialization failed: ${stderr.toString("utf8").trim() || `exit ${exitCode}`}`,
+				);
+			}
+			return { directory, entries: resultEntries, materializedFiles, materializedBytes };
+		} catch (error) {
+			child.kill();
+			child.stdin.destroy();
+			await completion.catch(() => {});
+			await rm(directory, { recursive: true, force: true }).catch(() => {});
+			throw error;
+		}
+	}
+
+	private unavailableSearchEntry(entry: ReviewSnapshotTreeEntry): ReviewSnapshotSearchEntry {
+		if (entry.size === undefined) {
+			return {
+				path: entry.path,
+				skippedReason: "Git did not report a blob size, so the file was not read.",
+			};
+		}
+		return {
+			path: entry.path,
+			skippedReason: `Blob size ${entry.size} bytes exceeds the ${formatByteLimit(this.limits.maxBlobBytes)} snapshot read limit.`,
+		};
 	}
 
 	private assertActive(): void {

@@ -1,11 +1,10 @@
 import { readFile as fsReadFile, stat as fsStat } from "node:fs/promises";
-import { createInterface } from "node:readline";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
 import { Text } from "@hansjm10/volt-tui";
 import path from "path";
 import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
-import { spawnProcess } from "../../utils/child-process.ts";
+import { runRipgrepJson } from "../../utils/ripgrep.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import type { Theme } from "../theme/runtime.ts";
@@ -219,34 +218,10 @@ export function createGrepToolDefinition(
 						if (glob) args.push("--glob", glob);
 						args.push("--", pattern, searchPath);
 
-						const child = spawnProcess(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-						const rl = createInterface({ input: child.stdout });
-						let stderr = "";
 						let matchCount = 0;
 						let matchLimitReached = false;
 						let linesTruncated = false;
-						let aborted = false;
-						let killedDueToLimit = false;
 						const outputLines: string[] = [];
-
-						const cleanup = () => {
-							rl.close();
-							signal?.removeEventListener("abort", onAbort);
-						};
-						const stopChild = (dueToLimit = false) => {
-							if (!child.killed) {
-								killedDueToLimit = dueToLimit;
-								child.kill();
-							}
-						};
-						const onAbort = () => {
-							aborted = true;
-							stopChild();
-						};
-						signal?.addEventListener("abort", onAbort, { once: true });
-						child.stderr?.on("data", (chunk) => {
-							stderr += chunk.toString();
-						});
 
 						const formatBlock = async (filePath: string, lineNumber: number): Promise<string[]> => {
 							const relativePath = formatPath(filePath);
@@ -270,96 +245,75 @@ export function createGrepToolDefinition(
 
 						// Collect matches during streaming, then format them after rg exits.
 						const matches: Array<{ filePath: string; lineNumber: number; lineText?: string }> = [];
-						rl.on("line", (line) => {
-							if (!line.trim() || matchCount >= effectiveLimit) return;
-							let event: any;
-							try {
-								event = JSON.parse(line);
-							} catch {
-								return;
-							}
-							if (event.type === "match") {
+						const rgResult = await runRipgrepJson(rgPath, args, {
+							signal,
+							onMatch(match) {
 								matchCount++;
-								const filePath = event.data?.path?.text;
-								const lineNumber = event.data?.line_number;
-								const lineText = event.data?.lines?.text;
-								if (filePath && typeof lineNumber === "number")
-									matches.push({ filePath, lineNumber, lineText });
+								matches.push({
+									filePath: match.path,
+									lineNumber: match.lineNumber,
+									...(match.lineText === undefined ? {} : { lineText: match.lineText }),
+								});
 								if (matchCount >= effectiveLimit) {
 									matchLimitReached = true;
-									stopChild(true);
+									return false;
 								}
-							}
+							},
 						});
+						if (!rgResult.stoppedEarly && rgResult.exitCode !== 0 && rgResult.exitCode !== 1) {
+							const errorMsg = rgResult.stderr.trim() || `ripgrep exited with code ${rgResult.exitCode}`;
+							settle(() => reject(new Error(errorMsg)));
+							return;
+						}
+						if (matchCount === 0) {
+							settle(() => resolve({ content: [{ type: "text", text: "No matches found" }] }));
+							return;
+						}
 
-						child.on("error", (error) => {
-							cleanup();
-							settle(() => reject(new Error(`Failed to run ripgrep: ${error.message}`)));
-						});
-						child.on("close", async (code) => {
-							cleanup();
-							if (aborted) {
-								settle(() => reject(new Error("Operation aborted")));
-								return;
+						// Format matches after streaming finishes so custom readFile() backends can be async.
+						for (const match of matches) {
+							if (contextValue === 0 && match.lineText !== undefined) {
+								const relativePath = formatPath(match.filePath);
+								const sanitized = match.lineText.replace(/\r\n/g, "\n").replace(/\r/g, "").replace(/\n$/, "");
+								const { text: truncatedText, wasTruncated } = truncateLine(sanitized);
+								if (wasTruncated) linesTruncated = true;
+								outputLines.push(`${relativePath}:${match.lineNumber}: ${truncatedText}`);
+							} else {
+								const block = await formatBlock(match.filePath, match.lineNumber);
+								outputLines.push(...block);
 							}
-							if (!killedDueToLimit && code !== 0 && code !== 1) {
-								const errorMsg = stderr.trim() || `ripgrep exited with code ${code}`;
-								settle(() => reject(new Error(errorMsg)));
-								return;
-							}
-							if (matchCount === 0) {
-								settle(() => resolve({ content: [{ type: "text", text: "No matches found" }] }));
-								return;
-							}
+						}
 
-							// Format matches after streaming finishes so custom readFile() backends can be async.
-							for (const match of matches) {
-								if (contextValue === 0 && match.lineText !== undefined) {
-									const relativePath = formatPath(match.filePath);
-									const sanitized = match.lineText
-										.replace(/\r\n/g, "\n")
-										.replace(/\r/g, "")
-										.replace(/\n$/, "");
-									const { text: truncatedText, wasTruncated } = truncateLine(sanitized);
-									if (wasTruncated) linesTruncated = true;
-									outputLines.push(`${relativePath}:${match.lineNumber}: ${truncatedText}`);
-								} else {
-									const block = await formatBlock(match.filePath, match.lineNumber);
-									outputLines.push(...block);
-								}
-							}
-
-							const rawOutput = outputLines.join("\n");
-							// Apply byte truncation. There is no line limit here because the match limit already capped rows.
-							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
-							let output = truncation.content;
-							const details: GrepToolDetails = {};
-							// Build actionable notices for truncation and match limits.
-							const notices: string[] = [];
-							if (matchLimitReached) {
-								notices.push(
-									`${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`,
-								);
-								details.matchLimitReached = effectiveLimit;
-							}
-							if (truncation.truncated) {
-								notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
-								details.truncation = truncation;
-							}
-							if (linesTruncated) {
-								notices.push(
-									`Some lines truncated to ${GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines`,
-								);
-								details.linesTruncated = true;
-							}
-							if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
-							settle(() =>
-								resolve({
-									content: [{ type: "text", text: output }],
-									...(Object.keys(details).length > 0 ? { details } : {}),
-								}),
+						const rawOutput = outputLines.join("\n");
+						// Apply byte truncation. There is no line limit here because the match limit already capped rows.
+						const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+						let output = truncation.content;
+						const details: GrepToolDetails = {};
+						// Build actionable notices for truncation and match limits.
+						const notices: string[] = [];
+						if (matchLimitReached) {
+							notices.push(
+								`${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`,
 							);
-						});
+							details.matchLimitReached = effectiveLimit;
+						}
+						if (truncation.truncated) {
+							notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+							details.truncation = truncation;
+						}
+						if (linesTruncated) {
+							notices.push(
+								`Some lines truncated to ${GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines`,
+							);
+							details.linesTruncated = true;
+						}
+						if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
+						settle(() =>
+							resolve({
+								content: [{ type: "text", text: output }],
+								...(Object.keys(details).length > 0 ? { details } : {}),
+							}),
+						);
 					} catch (err) {
 						settle(() => reject(err as Error));
 					}

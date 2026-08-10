@@ -141,6 +141,12 @@ function snapshot(headOid: string, hunkId = "hunk-1"): ReviewSnapshot {
 		root: "/tmp/review",
 		readFile: async () => undefined,
 		listFiles: async () => [],
+		materializeSearch: async () => ({
+			directory: "/tmp/review-search",
+			entries: [],
+			materializedFiles: 0,
+			materializedBytes: 0,
+		}),
 		materializeHead: async () => "/tmp/review-materialized",
 		dispose: async () => {},
 	};

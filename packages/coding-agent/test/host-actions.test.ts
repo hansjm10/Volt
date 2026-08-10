@@ -573,6 +573,12 @@ function createCompletedReviewResult(
 			diffCommand: "git diff HEAD",
 			readFile: async () => undefined,
 			listFiles: async () => [],
+			materializeSearch: async () => ({
+				directory: "/tmp/review-search",
+				entries: [],
+				materializedFiles: 0,
+				materializedBytes: 0,
+			}),
 			materializeHead: async () => "/tmp/review",
 			dispose: async () => {},
 		},
