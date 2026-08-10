@@ -107,11 +107,13 @@ export class ResponsivePlanLayoutComponent extends Container {
 	private readonly compactComponents: readonly Component[];
 	private readonly inspector: PlanInspectorComponent;
 	private readonly getTerminalRows: () => number;
+	private readonly requestViewportReset: () => void;
 	private readonly onSplitChange: (split: boolean, preserveScrollback: boolean) => void;
 	private lastSplit: boolean | undefined;
 	private lastWidth: number | undefined;
 	private lastRows: number | undefined;
 	private committedTranscriptStart: number | undefined;
+	private previousCommittedTranscript: readonly string[] | undefined;
 	private previousTranscriptRows: number | undefined;
 
 	constructor(options: {
@@ -122,6 +124,7 @@ export class ResponsivePlanLayoutComponent extends Container {
 		inspector: PlanInspectorComponent;
 		footer: Component;
 		getTerminalRows: () => number;
+		requestViewportReset: () => void;
 		onSplitChange: (split: boolean, preserveScrollback: boolean) => void;
 	}) {
 		super();
@@ -132,6 +135,7 @@ export class ResponsivePlanLayoutComponent extends Container {
 		this.inspector = options.inspector;
 		this.footer = options.footer;
 		this.getTerminalRows = options.getTerminalRows;
+		this.requestViewportReset = options.requestViewportReset;
 		this.onSplitChange = options.onSplitChange;
 		this.rebuildChildren();
 	}
@@ -164,11 +168,13 @@ export class ResponsivePlanLayoutComponent extends Container {
 		const footerLines = this.footer.render(width);
 		if (!dimensions) {
 			this.committedTranscriptStart = undefined;
+			this.previousCommittedTranscript = undefined;
 			this.previousTranscriptRows = undefined;
 			return [...renderComponents(this.compactComponents, width), ...footerLines];
 		}
 		if (resetCommittedTranscript) {
 			this.committedTranscriptStart = undefined;
+			this.previousCommittedTranscript = undefined;
 			this.previousTranscriptRows = undefined;
 		}
 
@@ -179,11 +185,21 @@ export class ResponsivePlanLayoutComponent extends Container {
 		const controlStart = safeTailStart(controls, mainRows);
 		const visibleControls = controls.slice(controlStart);
 		const transcriptRows = Math.max(0, mainRows - visibleControls.length);
-		if (this.previousTranscriptRows !== undefined && transcript.length < this.previousTranscriptRows) {
+		if (
+			this.previousTranscriptRows !== undefined &&
+			transcript.length < this.previousTranscriptRows &&
+			this.committedTranscriptStart !== undefined &&
+			this.previousCommittedTranscript !== undefined &&
+			(transcript.length < this.committedTranscriptStart ||
+				this.previousCommittedTranscript.length !== this.committedTranscriptStart ||
+				this.previousCommittedTranscript.some((line, index) => transcript[index] !== line))
+		) {
+			this.requestViewportReset();
 			this.committedTranscriptStart = undefined;
 		}
 		const transcriptStart = safeTailStart(transcript, transcriptRows, this.committedTranscriptStart);
 		this.committedTranscriptStart = transcriptStart;
+		this.previousCommittedTranscript = transcript.slice(0, transcriptStart);
 		this.previousTranscriptRows = transcript.length;
 		const historicalTranscript = transcript.slice(0, transcriptStart);
 		const visibleTranscript = transcript.slice(transcriptStart);

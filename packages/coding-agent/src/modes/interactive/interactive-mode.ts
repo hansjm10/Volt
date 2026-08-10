@@ -658,6 +658,7 @@ export class InteractiveMode {
 			inspector: this.planInspector,
 			footer: this.footer,
 			getTerminalRows: () => this.ui.terminal.rows,
+			requestViewportReset: () => this.ui.resetViewportOnNextRender(),
 			onSplitChange: (split, preserveScrollback) => this.handlePlanSplitChange(split, preserveScrollback),
 		});
 

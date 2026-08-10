@@ -90,6 +90,7 @@ function createLayout(options: {
 	compact?: LinesComponent[];
 	footer?: Component;
 	actions?: PlanDetailsAction[];
+	requestViewportReset?: () => void;
 }) {
 	let rows = options.rows;
 	const planning = options.planning ?? { mode: "build", plan: plan() };
@@ -113,6 +114,7 @@ function createLayout(options: {
 		inspector,
 		footer: options.footer ?? new FullWidthFooter(),
 		getTerminalRows: () => rows,
+		requestViewportReset: options.requestViewportReset ?? (() => undefined),
 		onSplitChange: (split, preserveScrollback) => {
 			splitChanges.push(split);
 			preserveScrollbackChanges.push(preserveScrollback);
@@ -286,20 +288,151 @@ describe("ResponsivePlanLayoutComponent", () => {
 		}
 	});
 
-	it("keeps the live transcript tail visible when rendered rows contract", () => {
+	it("preserves committed history when visible transcript rows contract", async () => {
+		const columns = 160;
+		const rows = 24;
+		const transcript = new LinesComponent(Array.from({ length: 90 }, (_, index) => `message-${index + 1}`));
+		const editor = new LinesComponent(["EDITOR"]);
+		const { layout } = createLayout({ columns, rows, transcript, controls: [editor] });
+		const initialLines = layout.render(columns);
+		const historicalRows = initialLines.length - rows;
+		const committedHistory = initialLines.slice(0, historicalRows);
+		const terminal = new LoggingVirtualTerminal(columns, rows);
+		terminal.write("SHELL_SENTINEL\r\n");
+		const tui = new TUI(terminal);
+		tui.addChild(layout);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			const initialFullRedraws = tui.fullRedraws;
+			terminal.clearWrites();
+
+			transcript.lines.splice(historicalRows + 2, 10);
+			tui.requestRender();
+			await terminal.waitForRender();
+
+			const currentLines = layout.render(columns);
+			expect(currentLines).toHaveLength(initialLines.length);
+			expect(currentLines.slice(0, historicalRows)).toEqual(committedHistory);
+			expect(tui.fullRedraws).toBe(initialFullRedraws);
+			expect(terminal.getWrites()).not.toContain("\x1b[3J");
+			expect(terminal.getScrollBuffer().join("\n")).toContain("SHELL_SENTINEL");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("rebases the viewport when contraction changes already committed transcript rows", async () => {
+		const columns = 160;
+		const rows = 24;
+		const transcript = new LinesComponent(Array.from({ length: 90 }, (_, index) => `message-${index + 1}`));
+		const editor = new LinesComponent(["EDITOR"]);
+		const terminal = new LoggingVirtualTerminal(columns, rows);
+		terminal.write("SHELL_SENTINEL\r\n");
+		const tui = new TUI(terminal);
+		let viewportResets = 0;
+		const { layout } = createLayout({
+			columns,
+			rows,
+			transcript,
+			controls: [editor],
+			requestViewportReset: () => {
+				viewportResets += 1;
+				tui.resetViewportOnNextRender();
+			},
+		});
+		tui.addChild(layout);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			terminal.clearWrites();
+
+			transcript.lines.splice(10, 10);
+			tui.requestRender();
+			await terminal.waitForRender();
+
+			const viewport = layout.render(columns).slice(-rows).map(stripAnsi);
+			expect(viewportResets).toBe(1);
+			expect(viewport.join("\n")).toContain("message-90");
+			expect(terminal.getWrites()).toContain("\x1b[2J\x1b[H");
+			expect(terminal.getWrites()).not.toContain("\x1b[3J");
+			expect(terminal.getScrollBuffer().join("\n")).toContain("SHELL_SENTINEL");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("does not rebase growing transcripts when streaming moves end markers", async () => {
+		const columns = 160;
+		const rows = 24;
+		const endMarker = "\x1b]133;D\x07";
+		const transcript = new LinesComponent([`assistant chunk${endMarker}`]);
+		const controls = [new LinesComponent(Array.from({ length: rows - 1 }, (_, index) => `CONTROL_${index + 1}`))];
+		const terminal = new LoggingVirtualTerminal(columns, rows);
+		const tui = new TUI(terminal);
+		let viewportResets = 0;
+		const { layout } = createLayout({
+			columns,
+			rows,
+			transcript,
+			controls,
+			requestViewportReset: () => {
+				viewportResets += 1;
+				tui.resetViewportOnNextRender();
+			},
+		});
+		tui.addChild(layout);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			terminal.clearWrites();
+
+			transcript.lines = ["assistant chunk", `continued${endMarker}`];
+			tui.requestRender();
+			await terminal.waitForRender();
+
+			expect(viewportResets).toBe(0);
+			expect(terminal.getScrollBuffer().map(stripAnsi).join("\n")).toContain("continued");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps the live transcript tail visible when contraction crosses committed history", async () => {
 		const columns = 160;
 		const rows = 24;
 		const transcript = new LinesComponent(Array.from({ length: 40 }, (_, index) => `message-${index + 1}`));
 		const editor = new LinesComponent(["EDITOR"]);
-		const { layout } = createLayout({ columns, rows, transcript, controls: [editor] });
-		expect(layout.render(columns).length).toBeGreaterThan(rows);
+		const terminal = new LoggingVirtualTerminal(columns, rows);
+		terminal.write("SHELL_SENTINEL\r\n");
+		const tui = new TUI(terminal);
+		const { layout } = createLayout({
+			columns,
+			rows,
+			transcript,
+			controls: [editor],
+			requestViewportReset: () => tui.resetViewportOnNextRender(),
+		});
+		tui.addChild(layout);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			terminal.clearWrites();
 
-		transcript.lines = Array.from({ length: 5 }, (_, index) => `collapsed-message-${index + 1}`);
-		const viewport = layout.render(columns).slice(-rows).map(stripAnsi);
-		const newestLine = viewport.find((line) => line.includes("collapsed-message-5"));
+			transcript.lines = Array.from({ length: 5 }, (_, index) => `collapsed-message-${index + 1}`);
+			tui.requestRender();
+			await terminal.waitForRender();
 
-		expect(newestLine).toBeDefined();
-		expect(newestLine).toContain(usesAsciiPlanMarkers() ? "|" : "\u2502");
+			const viewport = layout.render(columns).slice(-rows).map(stripAnsi);
+			const newestLine = viewport.find((line) => line.includes("collapsed-message-5"));
+			expect(newestLine).toBeDefined();
+			expect(newestLine).toContain(usesAsciiPlanMarkers() ? "|" : "\u2502");
+			expect(terminal.getWrites()).toContain("\x1b[2J\x1b[H");
+			expect(terminal.getWrites()).not.toContain("\x1b[3J");
+			expect(terminal.getScrollBuffer().join("\n")).toContain("SHELL_SENTINEL");
+		} finally {
+			tui.stop();
+		}
 	});
 
 	it("renders extensions at conversation width and a custom footer at full width", () => {
@@ -323,6 +456,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 			inspector,
 			footer,
 			getTerminalRows: () => 24,
+			requestViewportReset: () => undefined,
 			onSplitChange: () => undefined,
 		});
 		const rendered = layout.render(129).map(stripAnsi).join("\n");

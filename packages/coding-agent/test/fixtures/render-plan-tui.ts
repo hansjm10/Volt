@@ -157,6 +157,7 @@ const layout = new ResponsivePlanLayoutComponent({
 	inspector,
 	footer,
 	getTerminalRows: () => tui.terminal.rows,
+	requestViewportReset: () => undefined,
 	onSplitChange: () => undefined,
 });
 
