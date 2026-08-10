@@ -545,6 +545,28 @@ async function seedTemporaryIndex(
 	return readTree.ok ? undefined : commandFailure("git read-tree failed", readTree);
 }
 
+async function stageWorktree(
+	source: GitSource,
+	originalIndex: string,
+	baseTree: string,
+): Promise<ReviewSnapshotResolutionError | undefined> {
+	const seedError = await seedTemporaryIndex(source, originalIndex, baseTree);
+	if (seedError) return seedError;
+	let add = await git(source, ["add", "-A", "--"]);
+	if (add.ok) return undefined;
+	if (!/fatal: will not add file alias .* already exists in index/i.test(add.stderr)) {
+		return commandFailure("git add failed", add);
+	}
+
+	// A case-insensitive filesystem can check out case-only aliases from the
+	// same tree, but Git refuses to refresh them with core.ignorecase enabled.
+	// The retry only mutates Volt's temporary index, never the user's index.
+	const retrySeedError = await seedTemporaryIndex(source, originalIndex, baseTree);
+	if (retrySeedError) return retrySeedError;
+	add = await git(source, ["-c", "core.ignorecase=false", "add", "-A", "--"]);
+	return add.ok ? undefined : commandFailure("git add failed", add);
+}
+
 async function captureWorktreeTree(
 	source: GitSource,
 	originalIndex: string,
@@ -553,18 +575,14 @@ async function captureWorktreeTree(
 	for (let attempt = 1; attempt <= MAX_STABLE_CAPTURE_ATTEMPTS; attempt++) {
 		const before = await git(source, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
 		if (!before.ok) return { error: commandFailure("git status failed", before) };
-		const firstSeedError = await seedTemporaryIndex(source, originalIndex, baseTree);
-		if (firstSeedError) return { error: firstSeedError };
-		const add = await git(source, ["add", "-A", "--"]);
-		if (!add.ok) return { error: commandFailure("git add failed", add) };
+		const firstStageError = await stageWorktree(source, originalIndex, baseTree);
+		if (firstStageError) return { error: firstStageError };
 		const firstTreeResult = await git(source, ["write-tree"]);
 		if (!firstTreeResult.ok) return { error: commandFailure("git write-tree failed", firstTreeResult) };
 		const after = await git(source, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
 		if (!after.ok) return { error: commandFailure("git status failed", after) };
-		const secondSeedError = await seedTemporaryIndex(source, originalIndex, baseTree);
-		if (secondSeedError) return { error: secondSeedError };
-		const secondAdd = await git(source, ["add", "-A", "--"]);
-		if (!secondAdd.ok) return { error: commandFailure("git add failed", secondAdd) };
+		const secondStageError = await stageWorktree(source, originalIndex, baseTree);
+		if (secondStageError) return { error: secondStageError };
 		const secondTreeResult = await git(source, ["write-tree"]);
 		if (!secondTreeResult.ok) return { error: commandFailure("git write-tree failed", secondTreeResult) };
 		const firstTree = text(firstTreeResult).trim();
