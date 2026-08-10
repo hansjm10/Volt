@@ -145,6 +145,31 @@ describe("review snapshots", () => {
 		expect(readFileSync(join(checkout, "untracked.txt"), "utf8").replaceAll("\r\n", "\n")).toBe("untracked\n");
 	});
 
+	it.runIf(process.platform === "win32")(
+		"captures unrelated changes when the index contains case-only aliases",
+		async () => {
+			const repository = createRepository(false);
+			const upperPath = "HHHC_Shared/PDFVerification/BasePdfVerification.cs";
+			const lowerPath = "HHHC_Shared/PdfVerification/BasePdfVerification.cs";
+			mkdirSync(join(repository, "HHHC_Shared", "PDFVerification"), { recursive: true });
+			writeFileSync(join(repository, upperPath), "fixture\n");
+			const oid = git(repository, "hash-object", "-w", "--", upperPath);
+			git(repository, "config", "core.ignorecase", "false");
+			git(repository, "update-index", "--add", "--cacheinfo", `100644,${oid},${upperPath}`);
+			git(repository, "update-index", "--add", "--cacheinfo", `100644,${oid},${lowerPath}`);
+			git(repository, "commit", "-m", "add case aliases");
+			git(repository, "config", "core.ignorecase", "true");
+			writeFileSync(join(repository, "other.txt"), "uncommitted\n");
+
+			const snapshot = await resolve({ kind: "uncommitted" }, repository);
+			expect(snapshot.changedFiles.map(({ path, status }) => ({ path, status }))).toEqual([
+				{ path: "other.txt", status: "added" },
+			]);
+			expect((await readAvailableFile(snapshot, "head", upperPath)).content.toString()).toBe("fixture\n");
+			expect((await readAvailableFile(snapshot, "head", lowerPath)).content.toString()).toBe("fixture\n");
+		},
+	);
+
 	it("preserves ignored tracked files in uncommitted snapshots", async () => {
 		const repository = createRepository();
 		writeFileSync(join(repository, "tracked.log"), "tracked\n");
