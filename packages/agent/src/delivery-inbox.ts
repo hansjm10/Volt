@@ -146,7 +146,7 @@ class InboxDeliveryLease<TKind extends string, TMessage> implements DeliveryLeas
 /** Small in-memory FIFO with one explicit revocable lease at a time. */
 export class DeliveryInbox<TKind extends string, TMessage> {
 	private pending: Array<InboxDelivery<TKind, TMessage>> = [];
-	private activeLease?: InboxDeliveryLease<TKind, TMessage>;
+	private activeLease: InboxDeliveryLease<TKind, TMessage> | undefined;
 	private nextSequence = 0;
 	private resetGeneration = 0;
 	private readonly createId: () => string;

@@ -83,8 +83,11 @@ import {
 	BUILTIN_HOST_ACTION_REGISTRY,
 	CONTEXT_COMPACT_SLASH_ALIAS,
 	type HostActionInvocationContext,
-	REVIEW_BRANCH_ACTION_ID,
-	REVIEW_UNCOMMITTED_ACTION_ID,
+	REVIEW_EXPORT_FEEDBACK_ACTION_ID,
+	REVIEW_FEEDBACK_ACTION_ID,
+	REVIEW_FIX_ACTION_ID,
+	REVIEW_PUBLISH_ACTION_ID,
+	REVIEW_RERUN_ACTION_ID,
 	SESSION_NEW_SLASH_ALIAS,
 	SESSION_RENAME_SLASH_ALIAS,
 	THINKING_FAST_MODE_SLASH_ALIAS,
@@ -104,6 +107,7 @@ import { createIrohRemoteRpcErrorResponse } from "../../core/remote/iroh/rpc-com
 import { IrohRemoteHostStateManager } from "../../core/remote/iroh/state-manager.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import {
+	createReviewSeedMessage,
 	formatReviewWorkflowSummary,
 	listBaseBranches,
 	listRecentCommits,
@@ -111,11 +115,20 @@ import {
 	REMOTE_REVIEW_TOOL_NAMES,
 	REVIEW_USAGE,
 	type ResolvedReview,
+	type ReviewRunControls,
 	type ReviewTarget,
 	type ReviewWorkflowHooks,
 	runReviewWorkflow,
 	stripReviewEnvelopeForDisplay,
 } from "../../core/review.ts";
+import { publishReviewRun } from "../../core/review-publish.ts";
+import {
+	appendReviewFindingTransition,
+	appendReviewPublication,
+	appendReviewRun,
+	exportReviewFeedback,
+	getReviewRun,
+} from "../../core/review-state.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import { getDefaultSessionDir, type SessionContext, SessionManager } from "../../core/session-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
@@ -3341,7 +3354,10 @@ export class InteractiveMode {
 					tools: reviewOptions.remote ? REMOTE_REVIEW_TOOL_NAMES : this.getReviewToolsForRun(),
 					requireConfirmation: reviewOptions.requireConfirmation,
 					requireProjectTrust: reviewOptions.remote,
+					controls: reviewOptions.controls,
+					...(reviewOptions.parentRunId ? { parentRunId: reviewOptions.parentRunId } : {}),
 				}),
+			runReviewLifecycleAction: (action, args) => this.runInteractiveReviewLifecycleAction(action, args),
 		};
 	}
 
@@ -5325,6 +5341,7 @@ export class InteractiveMode {
 			const selector = new SettingsSelectorComponent(
 				{
 					autoCompact: this.session.autoCompactionEnabled,
+					personality: this.settingsManager.getPersonality(),
 					showImages: this.settingsManager.getShowImages(),
 					imageWidthCells: this.settingsManager.getImageWidthCells(),
 					autoResizeImages: this.settingsManager.getImageAutoResize(),
@@ -5359,6 +5376,10 @@ export class InteractiveMode {
 					onAutoCompactChange: (enabled) => {
 						this.session.setAutoCompactionEnabled(enabled);
 						this.footer.setAutoCompactEnabled(enabled);
+					},
+					onPersonalityChange: (personality) => {
+						this.session.setPersonality(personality);
+						this.showStatus(`Personality: ${personality}`);
 					},
 					onShowImagesChange: (enabled) => {
 						this.settingsManager.setShowImages(enabled);
@@ -8283,18 +8304,19 @@ export class InteractiveMode {
 	}
 
 	private getReviewToolsForRun(): string[] {
-		const availableToolNames = new Set(this.session.getAllTools().map((tool) => tool.name));
-		const configuredTools = this.settingsManager.getReviewTools();
-		const activeTools = this.session.getActiveToolNames().filter((name) => availableToolNames.has(name));
-		const selectedTools = (configuredTools ?? activeTools).filter((name) => availableToolNames.has(name));
-
-		if (selectedTools.length > 0) {
-			return [...new Set(selectedTools)];
+		const unavailableInReview = new Set(["read", "grep", "find", "ls", "edit", "write"]);
+		const availableToolNames = new Set(
+			this.session
+				.getAllTools()
+				.map((tool) => tool.name)
+				.filter((name) => !unavailableInReview.has(name)),
+		);
+		const configuredTools = this.settingsManager.getReviewTools() ?? [];
+		const selectedTools = configuredTools.filter((name) => availableToolNames.has(name));
+		if (selectedTools.length !== configuredTools.length) {
+			this.showWarning("Some configured auxiliary review tools are unavailable and were omitted.");
 		}
-		if (configuredTools) {
-			this.showWarning("Configured review tools are unavailable; using current active tools.");
-		}
-		return [...new Set(activeTools)];
+		return [...new Set(selectedTools)];
 	}
 
 	private async showReviewToolsSelector(options: ReviewToolSelectorOption[]): Promise<string[] | undefined> {
@@ -8326,15 +8348,16 @@ export class InteractiveMode {
 	}
 
 	private async configureReviewTools(): Promise<void> {
-		const tools = this.session.getAllTools();
+		const unavailableInReview = new Set(["read", "grep", "find", "ls", "edit", "write"]);
+		const tools = this.session.getAllTools().filter((tool) => !unavailableInReview.has(tool.name));
 		if (tools.length === 0) {
-			this.showError("No tools are available to configure for review.");
+			this.showError("No auxiliary tools are available to configure for review. Snapshot tools remain enabled.");
 			return;
 		}
 
 		const activeTools = new Set(this.session.getActiveToolNames());
 		const configuredTools = this.settingsManager.getReviewTools();
-		const selectedTools = new Set(configuredTools ?? this.session.getActiveToolNames());
+		const selectedTools = new Set(configuredTools ?? []);
 		const options = tools.map((tool) => ({
 			name: tool.name,
 			description: tool.description,
@@ -8348,14 +8371,12 @@ export class InteractiveMode {
 			this.showStatus("Review tool selection cancelled");
 			return;
 		}
-		if (selected.length === 0) {
-			this.settingsManager.setReviewTools(undefined);
-			this.showStatus("Review tools reset to current active tools.");
-			return;
-		}
-
 		this.settingsManager.setReviewTools(selected);
-		this.showStatus(`Review tools saved: ${selected.join(", ")}`);
+		this.showStatus(
+			selected.length > 0
+				? `Auxiliary review tools saved: ${selected.join(", ")}`
+				: "Auxiliary review tools disabled; immutable snapshot tools remain active.",
+		);
 	}
 
 	private async handleReviewCommand(argsText: string): Promise<void> {
@@ -8391,28 +8412,12 @@ export class InteractiveMode {
 			target = { kind: "commit", sha };
 		}
 
-		if (target.kind === "uncommitted") {
-			await this.invokeReviewHostAction(REVIEW_UNCOMMITTED_ACTION_ID, {});
-			return;
-		}
-		if (target.kind === "branch") {
-			await this.invokeReviewHostAction(REVIEW_BRANCH_ACTION_ID, { base: target.base });
-			return;
-		}
-
 		await this.runInteractiveReviewWorkflow(target, {
 			tools: this.getReviewToolsForRun(),
 			requireConfirmation: false,
 			requireProjectTrust: false,
+			controls: parsedArgs.controls,
 		});
-	}
-
-	private async invokeReviewHostAction(actionId: string, args: Record<string, unknown>): Promise<void> {
-		try {
-			await BUILTIN_HOST_ACTION_REGISTRY.invoke(actionId, this.createHostActionContext(), args);
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
-		}
 	}
 
 	private createReviewWorkflowHooks(resolution: ResolvedReview, model: Model<any>): ReviewWorkflowHooks {
@@ -8608,13 +8613,164 @@ export class InteractiveMode {
 		};
 	}
 
+	private async runInteractiveReviewLifecycleAction(
+		action: string,
+		args: Record<string, unknown>,
+	): Promise<Awaited<ReturnType<NonNullable<HostActionInvocationContext["runReviewLifecycleAction"]>>>> {
+		const runId = typeof args.runId === "string" ? args.runId : undefined;
+		const record = runId ? getReviewRun(this.session.sessionManager, runId) : undefined;
+		if (action !== REVIEW_EXPORT_FEEDBACK_ACTION_ID && !record)
+			throw new Error(`Unknown durable review run: ${runId ?? "missing"}`);
+		if (action === REVIEW_FIX_ACTION_ID) {
+			if (!record?.result) throw new Error(`Review run has no findings result: ${runId}`);
+			const requestedIds =
+				typeof args.findingIds === "string" && args.findingIds.trim().length > 0
+					? args.findingIds
+							.split(",")
+							.map((value) => value.trim())
+							.filter(Boolean)
+					: record.result.findings.map((finding) => finding.id);
+			const selectedIds = new Set(requestedIds);
+			const unknown = requestedIds.filter(
+				(findingId) => !record.result?.findings.some((finding) => finding.id === findingId),
+			);
+			if (unknown.length > 0) throw new Error(`Unknown finding ids: ${unknown.join(", ")}`);
+			const selectedResult = {
+				...record.result,
+				findings: record.result.findings.filter((finding) => selectedIds.has(finding.id)),
+			};
+			const seedMessage = createReviewSeedMessage(record.target, { parsed: selectedResult });
+			const opened = await this.runtimeHost.newSession({
+				setup: async (sessionManager) => appendReviewRun(sessionManager, record),
+				withSession: async (context) => context.sendMessage(seedMessage),
+			});
+			if (!opened.cancelled && !opened.seeded)
+				throw new Error("The review session opened without the selected findings.");
+			if (!opened.cancelled) this.renderCurrentSessionState();
+			return {
+				action,
+				status: opened.cancelled ? "cancelled" : "completed",
+				stateChanged: !opened.cancelled,
+				actionsChanged: !opened.cancelled,
+				message: opened.cancelled
+					? "Review fix session cancelled"
+					: `Opened ${selectedResult.findings.length} selected review finding${selectedResult.findings.length === 1 ? "" : "s"}`,
+			};
+		}
+		if (action === REVIEW_FEEDBACK_ACTION_ID) {
+			if (!record?.result) throw new Error(`Review run has no findings result: ${runId}`);
+			const findingId = typeof args.findingId === "string" ? args.findingId : "";
+			if (!record.result.findings.some((finding) => finding.id === findingId))
+				throw new Error(`Unknown finding: ${findingId}`);
+			const status = args.status;
+			if (status !== "accepted" && status !== "fixed" && status !== "dismissed")
+				throw new Error("Review outcome must be accepted, fixed, or dismissed.");
+			const reason = args.reason;
+			if (
+				status === "dismissed" &&
+				reason !== "false_positive" &&
+				reason !== "intentional" &&
+				reason !== "not_actionable" &&
+				reason !== "other"
+			)
+				throw new Error("Dismissed findings require an explicit reason.");
+			appendReviewFindingTransition(this.session.sessionManager, {
+				runId: record.runId,
+				findingId,
+				status,
+				...(reason === "false_positive" ||
+				reason === "intentional" ||
+				reason === "not_actionable" ||
+				reason === "other"
+					? { reason }
+					: {}),
+				...(typeof args.note === "string" ? { note: args.note } : {}),
+			});
+			await this.session.sessionManager.flush();
+			return {
+				action,
+				status: "completed",
+				stateChanged: true,
+				actionsChanged: true,
+				message: `Finding ${findingId} marked ${status}`,
+			};
+		}
+		if (action === REVIEW_RERUN_ACTION_ID) {
+			if (!record) throw new Error(`Unknown durable review run: ${runId}`);
+			const identity = record.target.identity;
+			const target: ReviewTarget =
+				identity.kind === "uncommitted"
+					? { kind: "uncommitted" }
+					: identity.kind === "branch"
+						? { kind: "branch", base: identity.baseCommit }
+						: identity.kind === "pr"
+							? { kind: "pr", number: identity.pullRequest ? String(identity.pullRequest.number) : undefined }
+							: { kind: "commit", sha: identity.headCommit };
+			const rerun = await this.runInteractiveReviewWorkflow(target, {
+				tools: this.getReviewToolsForRun(),
+				requireConfirmation: true,
+				requireProjectTrust: false,
+				controls: { ...record.options, scopeMode: args.scopeMode === "full" ? "full" : "incremental" },
+				parentRunId: record.runId,
+			});
+			return {
+				action,
+				status: rerun.status === "completed" ? "completed" : "cancelled",
+				stateChanged: rerun.status === "completed",
+				actionsChanged: true,
+				message: rerun.status === "completed" ? formatReviewWorkflowSummary(rerun) : "Review rerun cancelled",
+			};
+		}
+		if (action === REVIEW_PUBLISH_ACTION_ID) {
+			if (!record) throw new Error(`Unknown durable review run: ${runId}`);
+			const confirmed = await this.showExtensionConfirm(
+				"Publish pull request review",
+				`Publish complete review ${record.runId} to GitHub? The PR head will be rechecked first.`,
+			);
+			if (!confirmed) return { action, status: "cancelled", message: "Review publishing cancelled" };
+			const published = await publishReviewRun(this.sessionManager.getCwd(), record);
+			appendReviewPublication(this.session.sessionManager, { runId: record.runId, ...published });
+			await this.session.sessionManager.flush();
+			return {
+				action,
+				status: "completed",
+				message: published.url ? `Review published: ${published.url}` : "Review published",
+			};
+		}
+		if (action === REVIEW_EXPORT_FEEDBACK_ACTION_ID) {
+			const requestedPath =
+				typeof args.path === "string"
+					? args.path
+					: await this.showExtensionInput("Export review feedback", "review-feedback.json");
+			if (!requestedPath?.trim())
+				return { action, status: "cancelled", message: "Review feedback export cancelled" };
+			const outputPath = path.resolve(this.sessionManager.getCwd(), requestedPath.trim());
+			fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+			fs.writeFileSync(
+				outputPath,
+				`${JSON.stringify(exportReviewFeedback(this.session.sessionManager), null, 2)}\n`,
+				{ mode: 0o600 },
+			);
+			return { action, status: "completed", message: `Review feedback exported to ${outputPath}` };
+		}
+		throw new Error(`Unsupported review lifecycle action: ${action}`);
+	}
+
 	private async runInteractiveReviewWorkflow(
 		target: ReviewTarget,
-		options: { tools: readonly string[]; requireConfirmation: boolean; requireProjectTrust: boolean },
+		options: {
+			tools: readonly string[];
+			requireConfirmation: boolean;
+			requireProjectTrust: boolean;
+			controls?: Partial<ReviewRunControls>;
+			parentRunId?: string;
+		},
 	): Promise<Awaited<ReturnType<NonNullable<HostActionInvocationContext["runReviewAction"]>>>> {
 		try {
 			const result = await runReviewWorkflow({
 				target,
+				controls: options.controls,
+				...(options.parentRunId ? { parentRunId: options.parentRunId } : {}),
 				cwd: this.sessionManager.getCwd(),
 				agentDir: this.runtimeHost.services.agentDir,
 				session: this.session,

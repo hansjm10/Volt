@@ -21,8 +21,8 @@ function createHarness(options: ConstructorParameters<typeof AgentHarness>[0]): 
 function captureOptions(options: StreamOptions | undefined): StreamOptions {
 	return {
 		...options,
-		headers: options?.headers ? { ...options.headers } : undefined,
-		metadata: options?.metadata ? { ...options.metadata } : undefined,
+		...(options?.headers ? { headers: { ...options.headers } } : {}),
+		...(options?.metadata ? { metadata: { ...options.metadata } } : {}),
 	};
 }
 
@@ -249,10 +249,10 @@ describe("AgentHarness stream configuration", () => {
 		await harness.prompt("hello");
 
 		expect(capturedOptions).toHaveLength(2);
-		expect(capturedOptions[0].timeoutMs).toBe(1000);
-		expect(capturedOptions[0].headers).toEqual({ turn: "first" });
-		expect(capturedOptions[1].timeoutMs).toBe(2000);
-		expect(capturedOptions[1].headers).toEqual({ turn: "second" });
+		expect(capturedOptions[0]?.timeoutMs).toBe(1000);
+		expect(capturedOptions[0]?.headers).toEqual({ turn: "first" });
+		expect(capturedOptions[1]?.timeoutMs).toBe(2000);
+		expect(capturedOptions[1]?.headers).toEqual({ turn: "second" });
 	});
 
 	it("chains provider payload hooks", async () => {

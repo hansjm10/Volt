@@ -65,17 +65,17 @@ export interface ProxyStreamOptions extends ProxySerializableStreamOptions {
 
 function buildProxyRequestOptions(options: ProxyStreamOptions): ProxySerializableStreamOptions {
 	return {
-		temperature: options.temperature,
-		maxTokens: options.maxTokens,
-		reasoning: options.reasoning,
-		inferenceSpeed: options.inferenceSpeed,
-		cacheRetention: options.cacheRetention,
-		sessionId: options.sessionId,
-		headers: options.headers,
-		metadata: options.metadata,
-		transport: options.transport,
-		thinkingBudgets: options.thinkingBudgets,
-		maxRetryDelayMs: options.maxRetryDelayMs,
+		...(options.temperature === undefined ? {} : { temperature: options.temperature }),
+		...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
+		...(options.reasoning === undefined ? {} : { reasoning: options.reasoning }),
+		...(options.inferenceSpeed === undefined ? {} : { inferenceSpeed: options.inferenceSpeed }),
+		...(options.cacheRetention === undefined ? {} : { cacheRetention: options.cacheRetention }),
+		...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+		...(options.headers === undefined ? {} : { headers: options.headers }),
+		...(options.metadata === undefined ? {} : { metadata: options.metadata }),
+		...(options.transport === undefined ? {} : { transport: options.transport }),
+		...(options.thinkingBudgets === undefined ? {} : { thinkingBudgets: options.thinkingBudgets }),
+		...(options.maxRetryDelayMs === undefined ? {} : { maxRetryDelayMs: options.maxRetryDelayMs }),
 	};
 }
 
@@ -111,7 +111,7 @@ export function streamProxy<TApi extends Api>(
 					"Content-Type": "application/json",
 				},
 				body: JSON.stringify({ model, context, options: buildProxyRequestOptions(options) }),
-				signal: options.signal,
+				...(options.signal === undefined ? {} : { signal: options.signal }),
 			});
 
 			if (!response.ok) {
@@ -203,7 +203,7 @@ function processProxyEvent<TApi extends Api>(
 			return {
 				type: "text_end",
 				contentIndex: proxyEvent.contentIndex,
-				textSignature: proxyEvent.contentSignature,
+				...(proxyEvent.contentSignature === undefined ? {} : { textSignature: proxyEvent.contentSignature }),
 			};
 		case "thinking_start":
 			return { type: "thinking_start", contentIndex: proxyEvent.contentIndex };
@@ -213,7 +213,7 @@ function processProxyEvent<TApi extends Api>(
 			return {
 				type: "thinking_end",
 				contentIndex: proxyEvent.contentIndex,
-				thinkingSignature: proxyEvent.contentSignature,
+				...(proxyEvent.contentSignature === undefined ? {} : { thinkingSignature: proxyEvent.contentSignature }),
 			};
 		case "toolcall_start":
 			return {

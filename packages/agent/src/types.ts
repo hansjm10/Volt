@@ -116,16 +116,16 @@ export type AgentAbortSource =
 
 /** Immutable result of an abort request. */
 export interface AgentAbortAcceptance {
-	readonly runId?: string;
+	readonly runId: string | undefined;
 	readonly accepted: boolean;
-	readonly source?: AgentAbortSource;
+	readonly source: AgentAbortSource | undefined;
 }
 
 /** Minimum immutable lifecycle state exposed for structural teardown. */
 export interface AgentRunSnapshot {
 	readonly runId: string;
-	readonly source?: AgentAbortSource;
-	readonly diagnosticTimestamp?: number;
+	readonly source: AgentAbortSource | undefined;
+	readonly diagnosticTimestamp: number | undefined;
 	readonly requestAccepted: boolean;
 	readonly phase: "open" | "terminal_event_settling" | "settled";
 }
@@ -407,13 +407,13 @@ export interface AgentState {
 	 */
 	readonly isStreaming: boolean;
 	/** Partial assistant message for the current streamed response, if any. */
-	readonly streamingMessage?: AgentMessage;
+	readonly streamingMessage: AgentMessage | undefined;
 	/** Tool call ids currently executing. */
 	readonly pendingToolCalls: ReadonlySet<string>;
 	/** Tool calls currently executing, keyed by tool call id. */
 	readonly pendingToolExecutions: ReadonlyMap<string, PendingToolExecution>;
 	/** Error message from the most recent failed or aborted assistant turn, if any. */
-	readonly errorMessage?: string;
+	readonly errorMessage: string | undefined;
 }
 
 /** Final or partial result produced by a tool. */

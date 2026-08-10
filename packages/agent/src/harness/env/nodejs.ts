@@ -160,7 +160,7 @@ async function getShellConfig(
 	}
 	if (process.platform === "win32") {
 		const candidates: string[] = [];
-		const programFiles = process.env.ProgramFiles;
+		const programFiles = process.env["ProgramFiles"];
 		if (programFiles) candidates.push(`${programFiles}\\Git\\bin\\bash.exe`);
 		const programFilesX86 = process.env["ProgramFiles(x86)"];
 		if (programFilesX86) candidates.push(`${programFilesX86}\\Git\\bin\\bash.exe`);
@@ -221,8 +221,8 @@ function killProcessTree(pid: number): void {
 
 export class NodeExecutionEnv implements ExecutionEnv {
 	cwd: string;
-	private shellPath?: string;
-	private shellEnv?: NodeJS.ProcessEnv;
+	private shellPath: string | undefined;
+	private shellEnv: NodeJS.ProcessEnv | undefined;
 
 	constructor(options: { cwd: string; shellPath?: string; shellEnv?: NodeJS.ProcessEnv }) {
 		this.cwd = options.cwd;

@@ -194,29 +194,40 @@ describe("native planning state", () => {
 		session.dispose();
 	});
 
-	it("presents Plan mode as an actively refined working draft", async () => {
+	it("presents Plan mode as an actively refined, self-contained handoff", async () => {
 		const { session } = await createPlanningSession();
 		const policy = session.state.systemPrompt;
 		const toolNames = session.state.tools.map((tool) => tool.name);
 		const updatePlanTool = session.state.tools.find((tool) => tool.name === "update_plan");
+		const submitPlanTool = session.state.tools.find((tool) => tool.name === "submit_plan");
 
+		expect(policy).toContain("complete handoff artifact");
+		expect(policy).toContain("fresh session");
 		expect(policy).toContain("Research before finalizing, not before drafting.");
 		expect(policy).toContain("create an initial working draft with update_plan");
+		expect(policy).toContain("context-dependent references");
+		expect(policy).toContain("Write checklist steps as executable outcomes.");
 		expect(policy).toContain("revise the draft whenever evidence materially changes");
 		expect(policy).toContain("Do not update it mechanically after every read.");
-		expect(policy).toContain("update_plan: Create or refine the working plan as research changes understanding");
-		expect(updatePlanTool?.description).toContain("current working draft");
+		expect(policy).toContain("executor reading only the submitted plan");
+		expect(policy).toContain(
+			"update_plan: Create or refine the self-contained working plan as research changes understanding",
+		);
+		expect(updatePlanTool?.description).toContain("without the planning transcript");
+		expect(submitPlanTool?.description).toContain("sufficient for execution without the planning transcript");
 
 		const initial = session.updatePlan({
-			title: "Working plan",
-			summary: "Initial orientation identified the plan-mode policy and tool contract.",
+			title: "Make Plan-mode handoffs self-contained",
+			summary:
+				"Volt's Plan-mode prompt currently describes rolling drafts but must also preserve execution context across session strategies.",
 			steps: [{ text: "Revise the model-facing planning policy" }, { text: "Verify draft behavior" }],
 		});
 		const refined = session.updatePlan({
 			planId: initial.id,
 			expectedRevision: initial.revision,
 			title: initial.title,
-			summary: "Further research confirmed that draft revisions preserve the provider prompt and tool surface.",
+			summary:
+				"Research confirmed that Volt preserves canonical plan state across both execution strategies; require that state to carry the objective, findings, decisions, assumptions, and verification criteria.",
 			steps: initial.steps.map((step) => ({ id: step.id, text: step.text })),
 		});
 

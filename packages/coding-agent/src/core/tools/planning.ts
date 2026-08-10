@@ -21,7 +21,10 @@ import { getTextOutput } from "./render-utils.ts";
 const planStepInputSchema = Type.Object(
 	{
 		id: Type.Optional(Type.String({ description: "Existing canonical step id; omit for a new step" })),
-		text: Type.String({ description: "Current candidate implementation step; refine it as research changes" }),
+		text: Type.String({
+			description:
+				"Self-contained candidate implementation outcome naming the concrete behavior or interface to change and relevant subsystems, files, or symbols when useful; refine it as research changes",
+		}),
 	},
 	{ additionalProperties: false },
 );
@@ -30,11 +33,13 @@ const updatePlanSchema = Type.Object(
 	{
 		planId: Type.Optional(Type.String({ description: "Current canonical plan id" })),
 		expectedRevision: Type.Optional(Type.Integer({ minimum: 0 })),
-		title: Type.Optional(Type.String({ description: "Concise working title for the current direction" })),
+		title: Type.Optional(
+			Type.String({ description: "Concise title naming the concrete task, feature, defect, or reviewed surface" }),
+		),
 		summary: Type.Optional(
 			Type.String({
 				description:
-					"Concise rolling synthesis of findings, constraints, decisions, assumptions, and unresolved questions",
+					"Compact, self-contained handoff covering the objective and context, concrete findings or current state, constraints, decisions, assumptions, unresolved questions, and verification intent; do not rely on prior conversation",
 			}),
 		),
 		steps: Type.Array(planStepInputSchema, { maxItems: 64 }),
@@ -46,9 +51,12 @@ const submitPlanSchema = Type.Object(
 	{
 		planId: Type.String(),
 		expectedRevision: Type.Integer({ minimum: 0 }),
-		title: Type.String({ description: "Concise plan title" }),
+		title: Type.String({
+			description: "Concise title naming the concrete task, feature, defect, or reviewed surface",
+		}),
 		summary: Type.String({
-			description: "Decision-complete summary of findings, chosen approach, assumptions, and verification criteria",
+			description:
+				"Compact but complete handoff covering why the work is needed, the objective or review target, concrete findings and current state, chosen approach and constraints, remaining assumptions, and acceptance and verification criteria; it must be understandable without the planning transcript",
 		}),
 	},
 	{ additionalProperties: false },
@@ -318,8 +326,8 @@ export function createPlanningToolDefinitions(
 			name: "update_plan",
 			label: "update plan",
 			description:
-				"Create or replace the current working draft while planning. Start after an initial orientation, keep the summary as a concise rolling synthesis, and refine the candidate implementation steps whenever material evidence changes the approach. Use canonical step ids when retaining unchanged steps. Approved execution scope cannot be changed with this tool.",
-			promptSnippet: "Create or refine the working plan as research changes understanding",
+				"Create or replace the current working draft after an initial orientation. The title, summary, and checklist form a handoff artifact that may be executed in a fresh session without the planning transcript. Keep them compact but self-contained, explicitly name referenced reviews and findings, and revise them whenever material evidence changes the context, scope, approach, ordering, or verification. Preserve canonical step ids only for unchanged steps. Approved execution scope cannot be changed with this tool.",
+			promptSnippet: "Create or refine the self-contained working plan as research changes understanding",
 			parameters: updatePlanSchema,
 			renderCall(args, currentTheme, context) {
 				return renderPlanningCall(
@@ -354,8 +362,8 @@ export function createPlanningToolDefinitions(
 			name: "submit_plan",
 			label: "submit plan",
 			description:
-				"Finalize and submit a researched, decision-complete working draft for user approval. Resolve discoverable facts, remove investigation-only steps, and provide the exact canonical plan id and revision plus a non-empty title and summary. This ends the planning run.",
-			promptSnippet: "Submit a researched, decision-complete plan for user approval",
+				"Finalize and submit a researched, decision-complete, self-contained handoff artifact for user approval. Resolve discoverable facts, remove investigation-only steps and resolved questions, explicitly name the objective or review target and findings that drive the work, and record the chosen approach, remaining assumptions, acceptance criteria, and verification. The submitted title, summary, and checklist must be sufficient for execution without the planning transcript. Provide the exact canonical plan id and revision plus a non-empty title and summary. This ends the planning run.",
+			promptSnippet: "Submit a self-contained, decision-complete plan for user approval",
 			parameters: submitPlanSchema,
 			renderCall(args, currentTheme, context) {
 				const title = typeof args?.title === "string" ? args.title.trim() : "";

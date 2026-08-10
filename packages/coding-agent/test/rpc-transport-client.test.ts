@@ -16,7 +16,12 @@ import {
 	PLAN_EXECUTE_ACTION_ID,
 	REVIEW_BRANCH_ACTION_ID,
 	REVIEW_COMMIT_ACTION_ID,
+	REVIEW_EXPORT_FEEDBACK_ACTION_ID,
+	REVIEW_FEEDBACK_ACTION_ID,
+	REVIEW_FIX_ACTION_ID,
 	REVIEW_PR_ACTION_ID,
+	REVIEW_PUBLISH_ACTION_ID,
+	REVIEW_RERUN_ACTION_ID,
 	REVIEW_UNCOMMITTED_ACTION_ID,
 	RUN_CANCEL_ACTION_ID,
 	SESSION_NEW_ACTION_ID,
@@ -613,6 +618,10 @@ describe("Iroh remote RPC filter", () => {
 			REVIEW_BRANCH_ACTION_ID,
 			REVIEW_PR_ACTION_ID,
 			REVIEW_COMMIT_ACTION_ID,
+			REVIEW_FIX_ACTION_ID,
+			REVIEW_FEEDBACK_ACTION_ID,
+			REVIEW_RERUN_ACTION_ID,
+			REVIEW_PUBLISH_ACTION_ID,
 		]) {
 			const builtInInvocation = {
 				id: `${action}-1`,
@@ -624,7 +633,7 @@ describe("Iroh remote RPC filter", () => {
 				command: builtInInvocation,
 			});
 		}
-		for (const action of [CONTEXT_COMPACT_ACTION_ID, SESSION_RENAME_ACTION_ID]) {
+		for (const action of [CONTEXT_COMPACT_ACTION_ID, SESSION_RENAME_ACTION_ID, REVIEW_EXPORT_FEEDBACK_ACTION_ID]) {
 			expect(
 				getIrohRemoteRpcFilterResult(JSON.stringify({ id: `${action}-1`, type: "invoke_ui_action", action })),
 			).toEqual({
@@ -1156,8 +1165,13 @@ describe("runRpcMode", () => {
 			const reviewBranchAction = actions.find((action) => action.id === REVIEW_BRANCH_ACTION_ID);
 			const reviewPullRequestAction = actions.find((action) => action.id === REVIEW_PR_ACTION_ID);
 			const reviewCommitAction = actions.find((action) => action.id === REVIEW_COMMIT_ACTION_ID);
+			const reviewFixAction = actions.find((action) => action.id === REVIEW_FIX_ACTION_ID);
+			const reviewFeedbackAction = actions.find((action) => action.id === REVIEW_FEEDBACK_ACTION_ID);
+			const reviewRerunAction = actions.find((action) => action.id === REVIEW_RERUN_ACTION_ID);
+			const reviewPublishAction = actions.find((action) => action.id === REVIEW_PUBLISH_ACTION_ID);
 			expect(actions.find((action) => action.id === CONTEXT_COMPACT_ACTION_ID)).toBeUndefined();
 			expect(actions.find((action) => action.id === SESSION_RENAME_ACTION_ID)).toBeUndefined();
+			expect(actions.find((action) => action.id === REVIEW_EXPORT_FEEDBACK_ACTION_ID)).toBeUndefined();
 			if (!extensionAction || !promptAction || !skillAction) {
 				throw new Error("expected remote extension, prompt, and skill actions");
 			}
@@ -1168,7 +1182,11 @@ describe("runRpcMode", () => {
 				!reviewChangesAction ||
 				!reviewBranchAction ||
 				!reviewPullRequestAction ||
-				!reviewCommitAction
+				!reviewCommitAction ||
+				!reviewFixAction ||
+				!reviewFeedbackAction ||
+				!reviewRerunAction ||
+				!reviewPublishAction
 			) {
 				throw new Error("expected remote-safe built-in actions");
 			}
@@ -1199,7 +1217,6 @@ describe("runRpcMode", () => {
 					requiresConfirmation: true,
 					remoteSafe: true,
 					slash: { name: "review", example: "/review branch [base]" },
-					args: [expect.objectContaining({ name: "base", type: "string", completion: "gitBranches" })],
 				}),
 			);
 			expect(reviewPullRequestAction).toEqual(
@@ -1209,7 +1226,6 @@ describe("runRpcMode", () => {
 					presentation: expect.objectContaining({ kind: "card", group: "Review" }),
 					requiresConfirmation: true,
 					remoteSafe: true,
-					args: [expect.objectContaining({ name: "number", type: "string", required: false })],
 				}),
 			);
 			expect(reviewCommitAction).toEqual(
@@ -1219,9 +1235,53 @@ describe("runRpcMode", () => {
 					presentation: expect.objectContaining({ kind: "card", group: "Review" }),
 					requiresConfirmation: true,
 					remoteSafe: true,
-					args: [expect.objectContaining({ name: "ref", type: "string", required: true })],
 				}),
 			);
+			expect(reviewChangesAction.args?.map((argument) => argument.name)).toEqual([
+				"focus",
+				"scope",
+				"effort",
+				"includeOptional",
+				"scopeMode",
+			]);
+			expect(reviewBranchAction.args?.map((argument) => argument.name)).toEqual([
+				"base",
+				"focus",
+				"scope",
+				"effort",
+				"includeOptional",
+				"scopeMode",
+			]);
+			expect(reviewPullRequestAction.args?.map((argument) => argument.name)).toEqual([
+				"number",
+				"focus",
+				"scope",
+				"effort",
+				"includeOptional",
+				"scopeMode",
+			]);
+			expect(reviewCommitAction.args?.map((argument) => argument.name)).toEqual([
+				"ref",
+				"focus",
+				"scope",
+				"effort",
+				"includeOptional",
+				"scopeMode",
+			]);
+			for (const lifecycleAction of [
+				reviewFixAction,
+				reviewFeedbackAction,
+				reviewRerunAction,
+				reviewPublishAction,
+			]) {
+				expect(lifecycleAction).toEqual(
+					expect.objectContaining({
+						category: "review",
+						presentation: expect.objectContaining({ kind: "detail", group: "Review" }),
+						remoteSafe: true,
+					}),
+				);
+			}
 			await expect(client.getUiActionCompletions(REVIEW_BRANCH_ACTION_ID, "base", "feat")).resolves.toEqual([
 				{ value: "feature/login" },
 			]);
@@ -1504,7 +1564,6 @@ describe("createInProcessRpcClient", () => {
 					enabled: true,
 					remoteSafe: true,
 					requiresConfirmation: true,
-					args: [expect.objectContaining({ name: "number", type: "string", required: false })],
 				}),
 				expect.objectContaining({
 					id: REVIEW_COMMIT_ACTION_ID,
@@ -1515,9 +1574,62 @@ describe("createInProcessRpcClient", () => {
 					enabled: true,
 					remoteSafe: true,
 					requiresConfirmation: true,
-					args: [expect.objectContaining({ name: "ref", type: "string", required: true })],
+				}),
+				expect.objectContaining({
+					id: REVIEW_FIX_ACTION_ID,
+					label: "Fix review findings",
+					source: "builtin",
+					category: "review",
+					presentation: expect.objectContaining({ kind: "detail", group: "Review" }),
+					remoteSafe: true,
+				}),
+				expect.objectContaining({
+					id: REVIEW_FEEDBACK_ACTION_ID,
+					label: "Label review finding",
+					source: "builtin",
+					category: "review",
+					presentation: expect.objectContaining({ kind: "detail", group: "Review" }),
+					remoteSafe: true,
+				}),
+				expect.objectContaining({
+					id: REVIEW_RERUN_ACTION_ID,
+					label: "Re-run review",
+					source: "builtin",
+					category: "review",
+					presentation: expect.objectContaining({ kind: "detail", group: "Review" }),
+					remoteSafe: true,
+				}),
+				expect.objectContaining({
+					id: REVIEW_PUBLISH_ACTION_ID,
+					label: "Publish PR review",
+					source: "builtin",
+					category: "review",
+					presentation: expect.objectContaining({ kind: "detail", group: "Review" }),
+					remoteSafe: true,
+				}),
+				expect.objectContaining({
+					id: REVIEW_EXPORT_FEEDBACK_ACTION_ID,
+					label: "Export review feedback",
+					source: "builtin",
+					category: "review",
+					presentation: expect.objectContaining({ kind: "detail", group: "Review" }),
+					remoteSafe: false,
 				}),
 			]);
+			expect(
+				actions
+					.find((action) => action.id === REVIEW_UNCOMMITTED_ACTION_ID)
+					?.args?.map((argument) => argument.name),
+			).toEqual(["focus", "scope", "effort", "includeOptional", "scopeMode"]);
+			expect(
+				actions.find((action) => action.id === REVIEW_BRANCH_ACTION_ID)?.args?.map((argument) => argument.name),
+			).toEqual(["base", "focus", "scope", "effort", "includeOptional", "scopeMode"]);
+			expect(
+				actions.find((action) => action.id === REVIEW_PR_ACTION_ID)?.args?.map((argument) => argument.name),
+			).toEqual(["number", "focus", "scope", "effort", "includeOptional", "scopeMode"]);
+			expect(
+				actions.find((action) => action.id === REVIEW_COMMIT_ACTION_ID)?.args?.map((argument) => argument.name),
+			).toEqual(["ref", "focus", "scope", "effort", "includeOptional", "scopeMode"]);
 			await expect(client.getUiActions("primary")).resolves.toEqual([
 				expect.objectContaining({
 					id: THINKING_FAST_MODE_ACTION_ID,
@@ -1755,6 +1867,11 @@ describe("createInProcessRpcClient", () => {
 				REVIEW_BRANCH_ACTION_ID,
 				REVIEW_PR_ACTION_ID,
 				REVIEW_COMMIT_ACTION_ID,
+				REVIEW_FIX_ACTION_ID,
+				REVIEW_FEEDBACK_ACTION_ID,
+				REVIEW_RERUN_ACTION_ID,
+				REVIEW_PUBLISH_ACTION_ID,
+				REVIEW_EXPORT_FEEDBACK_ACTION_ID,
 			]);
 			expect(dynamicActions).toHaveLength(4);
 			expect(dynamicActions.map((action) => action.id)).toEqual([
@@ -1927,9 +2044,9 @@ describe("createInProcessRpcClient", () => {
 		try {
 			const actions = await client.getUiActions("all");
 			const reviewBranchAction = actions.find((action) => action.id === REVIEW_BRANCH_ACTION_ID);
-			expect(reviewBranchAction?.args).toEqual([
+			expect(reviewBranchAction?.args?.find((argument) => argument.name === "base")).toEqual(
 				expect.objectContaining({ name: "base", type: "string", required: false, completion: "gitBranches" }),
-			]);
+			);
 
 			await expect(client.getUiActionCompletions(REVIEW_BRANCH_ACTION_ID, "base", "")).resolves.toEqual([
 				{ value: "main" },

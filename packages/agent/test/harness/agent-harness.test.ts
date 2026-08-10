@@ -41,7 +41,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 
 function getReasoning(options: unknown): unknown {
 	if (!options || typeof options !== "object" || !("reasoning" in options)) return undefined;
-	return options.reasoning;
+	return options["reasoning"];
 }
 
 afterEach(() => {
@@ -868,7 +868,7 @@ describe("AgentHarness", () => {
 		});
 		const seenToolCalls: Array<{ id: string; name: string; expression: unknown }> = [];
 		harness.on("tool_call", (event) => {
-			seenToolCalls.push({ id: event.toolCallId, name: event.toolName, expression: event.input.expression });
+			seenToolCalls.push({ id: event.toolCallId, name: event.toolName, expression: event.input["expression"] });
 			return undefined;
 		});
 		harness.on("tool_result", (event) => {
@@ -1014,9 +1014,11 @@ describe("AgentHarness", () => {
 		const updates: Array<{ resourcesSource?: string; previousSource?: string }> = [];
 		harness.subscribe((event) => {
 			if (event.type === "resources_update") {
+				const resourcesSource = event.resources.skills?.[0]?.source;
+				const previousSource = event.previousResources.skills?.[0]?.source;
 				updates.push({
-					resourcesSource: event.resources.skills?.[0]?.source,
-					previousSource: event.previousResources.skills?.[0]?.source,
+					...(resourcesSource === undefined ? {} : { resourcesSource }),
+					...(previousSource === undefined ? {} : { previousSource }),
 				});
 			}
 		});

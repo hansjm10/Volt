@@ -233,12 +233,14 @@ export function formatPlanPolicy(mode: AgentMode, phase?: PlanPhase): string {
 	if (mode === "plan") {
 		return [
 			"[VOLT PLAN MODE — TRUSTED HOST POLICY]",
+			"Treat the canonical plan—its title, summary, and checklist—as the complete handoff artifact. It may be executed in a fresh session that receives none of the planning transcript, review output, tool results, or prior discussion.",
 			"Research before finalizing, not before drafting. Begin with one targeted read-only orientation pass through the relevant code, configuration, tests, documentation, or history.",
-			"After that orientation, create an initial working draft with update_plan; do not wait until research is complete. Treat its summary as a concise rolling synthesis and its steps as the current candidate implementation path.",
-			"Continue investigating and revise the draft whenever evidence materially changes the scope, approach, ordering, or verification. Do not update it mechanically after every read.",
+			"After that orientation, create an initial working draft with update_plan; do not wait until research is complete. Keep the draft compact but self-contained: name the objective or review target, concrete findings and current state, constraints, decisions, assumptions, unresolved questions, and verification intent. Replace context-dependent references such as `the review`, `the issues above`, or `as discussed` with the named subject and relevant details.",
+			"Write checklist steps as executable outcomes. Each step must identify the concrete behavior or interface to change and include relevant subsystems, files, or symbols when they are known and useful for locating the work.",
+			"Continue investigating and revise the draft whenever evidence materially changes the context, scope, approach, ordering, or verification. Do not update it mechanically after every read.",
 			"Resolve discoverable repository facts with tools before asking the user. Ask only about intent, preferences, or tradeoffs that the workspace cannot answer.",
-			"Distinguish evidence from assumptions and evaluate meaningful alternatives. Before submit_plan, remove investigation-only steps, explicitly state remaining assumptions, and make the plan decision-complete with verification criteria; preserve canonical ids only for unchanged steps.",
-			"Finish by calling submit_plan. The host-enforced research capability profile permits workspace/network reads, vetted Git/GitHub inspection, and explicitly trusted integration reads. Arbitrary process execution, mutation, untrusted integrations, custom tools, and delegation are blocked.",
+			"Distinguish evidence from assumptions and evaluate meaningful alternatives. Before submit_plan, remove investigation-only steps and resolved questions, record the chosen approach and remaining assumptions, and make the complete artifact decision-ready with explicit acceptance and verification criteria. An executor reading only the submitted plan must understand why the work is needed, what must change, and how completion will be verified.",
+			"Preserve canonical ids only for unchanged steps. Finish by calling submit_plan. The host-enforced research capability profile permits workspace/network reads, vetted Git/GitHub inspection, and explicitly trusted integration reads. Arbitrary process execution, mutation, untrusted integrations, custom tools, and delegation are blocked.",
 		].join("\n");
 	}
 	if (phase === "active") {

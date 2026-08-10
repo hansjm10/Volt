@@ -5,12 +5,18 @@ import {
 	CONTEXT_COMPACT_ACTION_ID,
 	CONTEXT_COMPACT_SLASH_ALIAS,
 	HostActionRegistry,
+	isRemoteSafeBuiltinHostActionId,
 	PLAN_CHANGE_ACTION_ID,
 	PLAN_DISCARD_ACTION_ID,
 	PLAN_EXECUTE_ACTION_ID,
 	REVIEW_BRANCH_ACTION_ID,
 	REVIEW_COMMIT_ACTION_ID,
+	REVIEW_EXPORT_FEEDBACK_ACTION_ID,
+	REVIEW_FEEDBACK_ACTION_ID,
+	REVIEW_FIX_ACTION_ID,
 	REVIEW_PR_ACTION_ID,
+	REVIEW_PUBLISH_ACTION_ID,
+	REVIEW_RERUN_ACTION_ID,
 	REVIEW_UNCOMMITTED_ACTION_ID,
 	RUN_CANCEL_ACTION_ID,
 	registerBuiltinHostActions,
@@ -21,6 +27,7 @@ import {
 	THINKING_FAST_MODE_ACTION_ID,
 	THINKING_FAST_MODE_SLASH_ALIAS,
 } from "../src/core/host-actions.ts";
+import type { ReviewWorkflowResult } from "../src/core/review.ts";
 
 describe("HostActionRegistry", () => {
 	test("registers descriptors, availability checks, slash aliases, and handlers", async () => {
@@ -204,6 +211,11 @@ describe("HostActionRegistry", () => {
 			REVIEW_BRANCH_ACTION_ID,
 			REVIEW_PR_ACTION_ID,
 			REVIEW_COMMIT_ACTION_ID,
+			REVIEW_FIX_ACTION_ID,
+			REVIEW_FEEDBACK_ACTION_ID,
+			REVIEW_RERUN_ACTION_ID,
+			REVIEW_PUBLISH_ACTION_ID,
+			REVIEW_EXPORT_FEEDBACK_ACTION_ID,
 		]);
 		expect(descriptors.find((descriptor) => descriptor.id === RUN_CANCEL_ACTION_ID)).toEqual(
 			expect.objectContaining({
@@ -326,17 +338,7 @@ describe("HostActionRegistry", () => {
 	});
 
 	test("registers review actions as remote-safe cards with shared handlers", async () => {
-		const runReviewAction = vi.fn(async () => ({
-			status: "completed" as const,
-			resolution: {
-				description: "uncommitted changes",
-				diffCommand: "git diff HEAD",
-				diff: "diff --git a/file.txt b/file.txt",
-				truncated: false,
-			},
-			findingsCount: 2,
-			sessionSwitchCancelled: false,
-		}));
+		const runReviewAction = vi.fn(async () => createCompletedReviewResult());
 		const registry = registerBuiltinHostActions(new HostActionRegistry());
 		const context = {
 			session: { isStreaming: false, isCompacting: false },
@@ -367,9 +369,9 @@ describe("HostActionRegistry", () => {
 				requiresConfirmation: true,
 				remoteSafe: true,
 				slash: { name: "review", example: "/review branch [base]" },
-				args: [
+				args: expect.arrayContaining([
 					expect.objectContaining({ name: "base", type: "string", required: false, completion: "gitBranches" }),
-				],
+				]),
 			}),
 		);
 		expect(descriptors.find((descriptor) => descriptor.id === REVIEW_PR_ACTION_ID)).toEqual(
@@ -381,7 +383,9 @@ describe("HostActionRegistry", () => {
 				requiresConfirmation: true,
 				remoteSafe: true,
 				slash: { name: "review", example: "/review pr [number]" },
-				args: [expect.objectContaining({ name: "number", type: "string", required: false })],
+				args: expect.arrayContaining([
+					expect.objectContaining({ name: "number", type: "string", required: false }),
+				]),
 			}),
 		);
 		expect(descriptors.find((descriptor) => descriptor.id === REVIEW_COMMIT_ACTION_ID)).toEqual(
@@ -393,7 +397,7 @@ describe("HostActionRegistry", () => {
 				requiresConfirmation: true,
 				remoteSafe: true,
 				slash: { name: "review", example: "/review commit <ref>" },
-				args: [expect.objectContaining({ name: "ref", type: "string", required: true })],
+				args: expect.arrayContaining([expect.objectContaining({ name: "ref", type: "string", required: true })]),
 			}),
 		);
 
@@ -419,23 +423,64 @@ describe("HostActionRegistry", () => {
 		await expect(
 			registry.invoke(REVIEW_COMMIT_ACTION_ID, context, { ref: "HEAD~1" }, { requireRemoteSafe: true }),
 		).resolves.toMatchObject({ action: REVIEW_COMMIT_ACTION_ID, status: "completed" });
+		runReviewAction.mockResolvedValueOnce(createCompletedReviewResult(0, "incomplete"));
+		await expect(registry.invoke(REVIEW_UNCOMMITTED_ACTION_ID, context, {})).resolves.toMatchObject({
+			message: "Review incomplete; fresh session created with findings",
+		});
 
 		expect(runReviewAction).toHaveBeenCalledWith(
 			{ kind: "uncommitted" },
-			{ remote: false, requireConfirmation: false },
+			{ remote: false, requireConfirmation: false, controls: {} },
 		);
 		expect(runReviewAction).toHaveBeenCalledWith(
 			{ kind: "branch", base: "main" },
-			{ remote: true, requireConfirmation: true },
+			{ remote: true, requireConfirmation: true, controls: {} },
 		);
 		expect(runReviewAction).toHaveBeenCalledWith(
 			{ kind: "pr", number: "42" },
-			{ remote: true, requireConfirmation: true },
+			{ remote: true, requireConfirmation: true, controls: {} },
 		);
 		expect(runReviewAction).toHaveBeenCalledWith(
 			{ kind: "commit", sha: "HEAD~1" },
-			{ remote: true, requireConfirmation: true },
+			{ remote: true, requireConfirmation: true, controls: {} },
 		);
+	});
+
+	test("keeps review feedback export local-only", async () => {
+		const runReviewLifecycleAction = vi.fn(async () => ({
+			action: REVIEW_EXPORT_FEEDBACK_ACTION_ID,
+			status: "completed" as const,
+		}));
+		const registry = registerBuiltinHostActions(new HostActionRegistry());
+		const context = {
+			session: { isStreaming: false, isCompacting: false },
+			abortRun: vi.fn(async () => {}),
+			compactContext: vi.fn(async () => createCompactionResult()),
+			newSession: vi.fn(async () => ({ cancelled: true, seeded: false })),
+			renameSession: vi.fn(() => {}),
+			runReviewLifecycleAction,
+		};
+
+		expect(registry.getDescriptor(REVIEW_EXPORT_FEEDBACK_ACTION_ID, context)).toEqual(
+			expect.objectContaining({ remoteSafe: false }),
+		);
+		expect(isRemoteSafeBuiltinHostActionId(REVIEW_EXPORT_FEEDBACK_ACTION_ID)).toBe(false);
+		await expect(
+			registry.invoke(
+				REVIEW_EXPORT_FEEDBACK_ACTION_ID,
+				context,
+				{ path: "../../package.json" },
+				{ requireRemoteSafe: true },
+			),
+		).rejects.toThrow(`UI action not available over remote host: ${REVIEW_EXPORT_FEEDBACK_ACTION_ID}`);
+		expect(runReviewLifecycleAction).not.toHaveBeenCalled();
+
+		await expect(
+			registry.invoke(REVIEW_EXPORT_FEEDBACK_ACTION_ID, context, { path: "review-feedback.json" }),
+		).resolves.toEqual({ action: REVIEW_EXPORT_FEEDBACK_ACTION_ID, status: "completed" });
+		expect(runReviewLifecycleAction).toHaveBeenCalledWith(REVIEW_EXPORT_FEEDBACK_ACTION_ID, {
+			path: "review-feedback.json",
+		});
 	});
 
 	test("rechecks built-in availability and validates arguments at invocation time", async () => {
@@ -510,6 +555,30 @@ function createCompactionResult() {
 		summary: "summary",
 		firstKeptEntryId: "entry-1",
 		tokensBefore: 100,
+	};
+}
+
+function createCompletedReviewResult(
+	findingsCount = 2,
+	completionStatus: "complete" | "incomplete" = "complete",
+): Extract<ReviewWorkflowResult, { status: "completed" }> {
+	return {
+		status: "completed",
+		resolution: {
+			identity: { kind: "uncommitted", baseTree: "a".repeat(40), headTree: "b".repeat(40) },
+			changedFiles: [],
+			root: "/tmp/review",
+			description: "uncommitted changes",
+			workflowDescription: "uncommitted changes",
+			diffCommand: "git diff HEAD",
+			readFile: async () => undefined,
+			listFiles: async () => [],
+			materializeHead: async () => "/tmp/review",
+			dispose: async () => {},
+		},
+		findingsCount,
+		completionStatus,
+		sessionSwitchCancelled: false,
 	};
 }
 

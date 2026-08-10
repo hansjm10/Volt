@@ -11,7 +11,7 @@ import {
 	type UserMessage,
 } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { Agent, type AgentEvent } from "../src/index.ts";
+import { Agent, type AgentEvent, type AgentMessage } from "../src/index.ts";
 import { calculateTool } from "./utils/calculate.ts";
 
 const registrations: FauxProviderRegistration[] = [];
@@ -27,6 +27,12 @@ function getTextContent(message: AssistantMessage | ToolResultMessage): string {
 		.filter((block) => block.type === "text")
 		.map((block) => block.text)
 		.join("\n");
+}
+
+function requireMessage(messages: readonly AgentMessage[], index: number): AgentMessage {
+	const message = messages.at(index);
+	if (!message) throw new Error(`Expected message at index ${index}`);
+	return message;
 }
 
 afterEach(() => {
@@ -49,10 +55,10 @@ async function basicPrompt(model: Model<string>) {
 
 	expect(agent.state.isStreaming).toBe(false);
 	expect(agent.state.messages.length).toBe(2);
-	expect(agent.state.messages[0].role).toBe("user");
-	expect(agent.state.messages[1].role).toBe("assistant");
+	expect(requireMessage(agent.state.messages, 0).role).toBe("user");
+	expect(requireMessage(agent.state.messages, 1).role).toBe("assistant");
 
-	const assistantMessage = agent.state.messages[1];
+	const assistantMessage = requireMessage(agent.state.messages, 1);
 	if (assistantMessage.role !== "assistant") throw new Error("Expected assistant message");
 	expect(getTextContent(assistantMessage)).toContain("4");
 }
@@ -91,7 +97,7 @@ async function toolExecution(model: Model<string>) {
 	if (toolResultMsg?.role !== "toolResult") throw new Error("Expected tool result message");
 	expect(getTextContent(toolResultMsg)).toContain("123 * 456 = 56088");
 
-	const finalMessage = agent.state.messages[agent.state.messages.length - 1];
+	const finalMessage = requireMessage(agent.state.messages, -1);
 	if (finalMessage.role !== "assistant") throw new Error("Expected final assistant message");
 	expect(getTextContent(finalMessage)).toContain("56088");
 	expect(agent.state.pendingToolCalls.size).toBe(0);
@@ -125,7 +131,7 @@ async function abortExecution(model: Model<string>) {
 	expect(agent.state.isStreaming).toBe(false);
 	expect(agent.state.messages.length).toBeGreaterThanOrEqual(2);
 
-	const lastMessage = agent.state.messages[agent.state.messages.length - 1];
+	const lastMessage = requireMessage(agent.state.messages, -1);
 	if (lastMessage.role !== "assistant") throw new Error("Expected assistant message");
 	expect(lastMessage.stopReason).toBe("aborted");
 	expect(lastMessage.errorMessage).toBeDefined();
@@ -180,7 +186,7 @@ async function multiTurnConversation(model: Model<string>) {
 	await agent.prompt("What is my name?");
 	expect(agent.state.messages.length).toBe(4);
 
-	const lastMessage = agent.state.messages[3];
+	const lastMessage = requireMessage(agent.state.messages, 3);
 	if (lastMessage.role !== "assistant") throw new Error("Expected assistant message");
 	expect(getTextContent(lastMessage).toLowerCase()).toContain("alice");
 }
@@ -338,10 +344,10 @@ describe("Agent.continue() with faux provider", () => {
 
 			expect(agent.state.isStreaming).toBe(false);
 			expect(agent.state.messages.length).toBe(2);
-			expect(agent.state.messages[0].role).toBe("user");
-			expect(agent.state.messages[1].role).toBe("assistant");
+			expect(requireMessage(agent.state.messages, 0).role).toBe("user");
+			expect(requireMessage(agent.state.messages, 1).role).toBe("assistant");
 
-			const assistantMsg = agent.state.messages[1];
+			const assistantMsg = requireMessage(agent.state.messages, 1);
 			if (assistantMsg.role !== "assistant") throw new Error("Expected assistant message");
 			expect(getTextContent(assistantMsg).toUpperCase()).toContain("HELLO WORLD");
 		});
@@ -405,7 +411,7 @@ describe("Agent.continue() with faux provider", () => {
 			expect(agent.state.isStreaming).toBe(false);
 			expect(agent.state.messages.length).toBeGreaterThanOrEqual(4);
 
-			const lastMessage = agent.state.messages[agent.state.messages.length - 1];
+			const lastMessage = requireMessage(agent.state.messages, -1);
 			expect(lastMessage.role).toBe("assistant");
 			if (lastMessage.role !== "assistant") throw new Error("Expected assistant message");
 			expect(getTextContent(lastMessage)).toContain("8");

@@ -87,10 +87,10 @@ type RuntimeStateKeys =
 
 type MutableAgentState = Omit<AgentState, RuntimeStateKeys> & {
 	isStreaming: boolean;
-	streamingMessage?: AgentMessage;
+	streamingMessage: AgentMessage | undefined;
 	pendingToolCalls: Set<string>;
 	pendingToolExecutions: Map<string, PendingToolExecution>;
-	errorMessage?: string;
+	errorMessage: string | undefined;
 };
 
 function createMutableAgentState(initialState?: Partial<Omit<AgentState, RuntimeStateKeys>>): MutableAgentState {
@@ -114,8 +114,10 @@ function createMutableAgentState(initialState?: Partial<Omit<AgentState, Runtime
 			messages = nextMessages.slice();
 		},
 		isStreaming: false,
+		streamingMessage: undefined,
 		pendingToolCalls: new Set<string>(),
 		pendingToolExecutions: new Map<string, PendingToolExecution>(),
+		errorMessage: undefined,
 	};
 }
 
@@ -255,7 +257,7 @@ type ActiveRun = {
 	abortSource?: AgentAbortSource;
 	diagnosticTimestamp?: number;
 	requestAccepted: boolean;
-	deliverySettlement?: Promise<void>;
+	deliverySettlement: Promise<void> | undefined;
 	deliveryOrder: Map<string, number>;
 	deliveryOutcomes: Map<string, AgentDeliveryAttemptResult>;
 	deliveryFailure?: AgentDeliveryFailure;
@@ -275,55 +277,59 @@ export class Agent {
 	private readonly inbox = new DeliveryInbox<AgentDeliveryKind, AgentMessage>(
 		() => `local-queue:${globalThis.crypto.randomUUID()}`,
 	);
-	private activeLease?: DeliveryLease<AgentDeliveryKind, AgentMessage>;
+	private activeLease: DeliveryLease<AgentDeliveryKind, AgentMessage> | undefined;
 	private readonly leasedDeliveryKinds = new Map<string, AgentDeliveryKind>();
 	private readonly preparedDeliveryParticipants = new Map<string, AgentDeliveryTransactionParticipant>();
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
-	private pausedState?: Pick<DispatcherStartState, "requestAuthority" | "providerRequestPending">;
+	private pausedState: Pick<DispatcherStartState, "requestAuthority" | "providerRequestPending"> | undefined;
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
-	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+	public transformContext: ((messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>) | undefined;
 	public streamFn: StreamFn;
-	public getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
-	public onPayload?: SimpleStreamOptions["onPayload"];
-	public onResponse?: SimpleStreamOptions["onResponse"];
-	public beforeToolCall?: (
-		context: BeforeToolCallContext,
-		signal?: AbortSignal,
-	) => Promise<BeforeToolCallResult | undefined>;
-	public afterToolCall?: (
-		context: AfterToolCallContext,
-		signal?: AbortSignal,
-	) => Promise<AfterToolCallResult | undefined>;
+	public getApiKey: ((provider: string) => Promise<string | undefined> | string | undefined) | undefined;
+	public onPayload: SimpleStreamOptions["onPayload"] | undefined;
+	public onResponse: SimpleStreamOptions["onResponse"] | undefined;
+	public beforeToolCall:
+		| ((context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>)
+		| undefined;
+	public afterToolCall:
+		| ((context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>)
+		| undefined;
 	/** Stage one dispatcher-owned delivery before it enters model context. */
-	public prepareDelivery?: (
-		delivery: AgentDelivery,
-		signal?: AbortSignal,
-	) => Promise<AgentDeliveryPreparation> | AgentDeliveryPreparation;
+	public prepareDelivery:
+		| ((
+				delivery: AgentDelivery,
+				signal?: AbortSignal,
+		  ) => Promise<AgentDeliveryPreparation> | AgentDeliveryPreparation)
+		| undefined;
 	/** Observe delivery revocation without changing Agent-owned state. */
-	public deliveryRevoked?: (delivery: AgentDelivery) => void;
+	public deliveryRevoked: ((delivery: AgentDelivery) => void) | undefined;
 	/** Resolve a request, resumable pause, or terminal stop at each dispatcher boundary. */
-	public nextAction?: (
-		context: AgentLoopNextActionContext,
-		signal?: AbortSignal,
-	) => AgentLoopNextAction | Promise<AgentLoopNextAction>;
+	public nextAction:
+		| ((
+				context: AgentLoopNextActionContext,
+				signal?: AbortSignal,
+		  ) => AgentLoopNextAction | Promise<AgentLoopNextAction>)
+		| undefined;
 	/** Refresh runtime state immediately before an actual provider request. */
-	public prepareRequest?: (
-		context: PrepareRequestContext,
-		signal?: AbortSignal,
-	) => Promise<AgentLoopRequestUpdate | undefined> | AgentLoopRequestUpdate | undefined;
-	private activeRun?: ActiveRun;
+	public prepareRequest:
+		| ((
+				context: PrepareRequestContext,
+				signal?: AbortSignal,
+		  ) => Promise<AgentLoopRequestUpdate | undefined> | AgentLoopRequestUpdate | undefined)
+		| undefined;
+	private activeRun: ActiveRun | undefined;
 	/** Session identifier forwarded to providers for cache-aware backends. */
-	public sessionId?: string;
+	public sessionId: string | undefined;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
-	public thinkingBudgets?: ThinkingBudgets;
+	public thinkingBudgets: ThinkingBudgets | undefined;
 	/** Preferred transport forwarded to the stream function. */
 	public transport: Transport;
 	/** Provider-neutral inference speed preference forwarded to primary model turns. */
-	public inferenceSpeed?: InferenceSpeed;
+	public inferenceSpeed: InferenceSpeed | undefined;
 	/** Optional cap for provider-requested retry delays. */
-	public maxRetryDelayMs?: number;
+	public maxRetryDelayMs: number | undefined;
 	/** Tool execution strategy for assistant messages that contain multiple tool calls. */
 	public toolExecution: ToolExecutionMode;
 
@@ -843,17 +849,17 @@ export class Agent {
 	private createLoopConfig(startState: DispatcherStartState): AgentLoopConfig {
 		return {
 			model: this._state.model,
-			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
-			sessionId: this.sessionId,
-			onPayload: this.onPayload,
-			onResponse: this.onResponse,
+			...(this._state.thinkingLevel === "off" ? {} : { reasoning: this._state.thinkingLevel }),
+			...(this.sessionId === undefined ? {} : { sessionId: this.sessionId }),
+			...(this.onPayload === undefined ? {} : { onPayload: this.onPayload }),
+			...(this.onResponse === undefined ? {} : { onResponse: this.onResponse }),
 			transport: this.transport,
-			inferenceSpeed: this.inferenceSpeed,
-			thinkingBudgets: this.thinkingBudgets,
-			maxRetryDelayMs: this.maxRetryDelayMs,
+			...(this.inferenceSpeed === undefined ? {} : { inferenceSpeed: this.inferenceSpeed }),
+			...(this.thinkingBudgets === undefined ? {} : { thinkingBudgets: this.thinkingBudgets }),
+			...(this.maxRetryDelayMs === undefined ? {} : { maxRetryDelayMs: this.maxRetryDelayMs }),
 			toolExecution: this.toolExecution,
-			beforeToolCall: this.beforeToolCall,
-			afterToolCall: this.afterToolCall,
+			...(this.beforeToolCall === undefined ? {} : { beforeToolCall: this.beforeToolCall }),
+			...(this.afterToolCall === undefined ? {} : { afterToolCall: this.afterToolCall }),
 			nextAction: async (context) => await this.resolveNextAction(context, startState),
 			beginDelivery: (delivery) => this.beginActiveDelivery(delivery),
 			prepareRequest: async (context) => {
@@ -869,8 +875,8 @@ export class Agent {
 				};
 			},
 			convertToLlm: this.convertToLlm,
-			transformContext: this.transformContext,
-			getApiKey: this.getApiKey,
+			...(this.transformContext === undefined ? {} : { transformContext: this.transformContext }),
+			...(this.getApiKey === undefined ? {} : { getApiKey: this.getApiKey }),
 		};
 	}
 
@@ -895,6 +901,7 @@ export class Agent {
 			deliveryOrder: new Map(),
 			deliveryOutcomes: new Map(),
 			observationalDeliveryIds: new Set(),
+			deliverySettlement: undefined,
 			phase: "open",
 		};
 
@@ -1142,6 +1149,7 @@ export class Agent {
 		if (emittedEvent.type === "agent_end" && this.activeRun) {
 			this.activeRun.phase = "settled";
 		}
+		return undefined;
 	}
 
 	private decorateRuntimeAbort(event: AgentEvent, previousEvent?: AgentEvent): AgentEvent {
@@ -1157,7 +1165,7 @@ export class Agent {
 							diagnostic.details &&
 							typeof diagnostic.details === "object" &&
 							"source" in diagnostic.details &&
-							diagnostic.details.source === run?.abortSource,
+							diagnostic.details["source"] === run?.abortSource,
 					)
 				: false;
 		if (

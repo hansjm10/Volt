@@ -13,6 +13,8 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as crypto from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import type { AgentSession } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
@@ -21,7 +23,14 @@ import type {
 	ExtensionWidgetOptions,
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
-import type { HostActionInvocationContext } from "../../core/host-actions.ts";
+import {
+	type HostActionInvocationContext,
+	REVIEW_EXPORT_FEEDBACK_ACTION_ID,
+	REVIEW_FEEDBACK_ACTION_ID,
+	REVIEW_FIX_ACTION_ID,
+	REVIEW_PUBLISH_ACTION_ID,
+	REVIEW_RERUN_ACTION_ID,
+} from "../../core/host-actions.ts";
 import type {
 	HostActionDecision,
 	HostActionRequest,
@@ -37,12 +46,23 @@ import {
 	writeRawStdout,
 } from "../../core/output-guard.ts";
 import {
+	createReviewSeedMessage,
 	executeReviewWorkflow,
 	prepareReviewWorkflow,
+	REMOTE_REVIEW_FAILURE_MESSAGE,
 	REMOTE_REVIEW_TOOL_NAMES,
 	type ReviewWorkflowEvent,
 	type ReviewWorkflowToolEvent,
 } from "../../core/review.ts";
+import { publishReviewRun } from "../../core/review-publish.ts";
+import {
+	appendReviewFindingTransition,
+	appendReviewPublication,
+	appendReviewRun,
+	createReviewRunRecord,
+	exportReviewFeedback,
+	getReviewRun,
+} from "../../core/review-state.ts";
 import { type ProjectionDiagnostic, StreamProjector } from "../../core/rpc/stream-projection.ts";
 import type { RpcTransport } from "../../core/rpc/transport.ts";
 import type { SubagentDefinition, SubagentHandle } from "../../core/subagents/index.ts";
@@ -1155,10 +1175,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			// requiresConfirmation); there is no server confirm round-trip.
 			const prepared = await prepareReviewWorkflow({
 				target,
+				controls: reviewOptions.controls,
+				...(reviewOptions.parentRunId ? { parentRunId: reviewOptions.parentRunId } : {}),
 				cwd: runtimeHost.cwd,
 				settingsManager: commandSession.settingsManager,
 				modelRegistry: commandSession.modelRegistry,
 				currentModel: commandSession.model,
+				sessionManager: commandSession.sessionManager,
 				requireProjectTrust: reviewOptions.remote,
 				sanitizeRemoteErrors: reviewOptions.remote,
 			});
@@ -1167,50 +1190,211 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			const authStorage = commandSession.modelRegistry.authStorage;
 			const modelRegistry = commandSession.modelRegistry;
 			const settingsManager = commandSession.settingsManager;
-			const { descriptor, launch } = runtimeHost.reviewWorkflows.start({
-				prepared,
-				fastModeEnabled,
-				execute: async (hooks) => {
-					try {
-						const result = await executeReviewWorkflow({
-							prepared,
-							cwd: runtimeHost.cwd,
-							agentDir: runtimeHost.services.agentDir,
-							authStorage,
-							modelRegistry,
-							settingsManager,
-							thinkingLevel,
-							fastModeEnabled,
-							// Read-only builtin allowlist and no inherited extension tools:
-							// the reviewer cannot modify the tree, so the working-tree guard
-							// is skipped. Restoring it could revert concurrent agent or user
-							// edits made while the detached review ran.
-							tools: REMOTE_REVIEW_TOOL_NAMES,
-							skipWorkingTreeGuard: true,
-							signal: hooks.signal,
-							onEvent: hooks.onEvent,
-						});
-						if (reviewOptions.remote && result.status === "failed") {
-							return { status: "failed", errorMessage: "The review could not be completed." };
+			let started: ReturnType<typeof runtimeHost.reviewWorkflows.start>;
+			try {
+				started = runtimeHost.reviewWorkflows.start({
+					prepared,
+					fastModeEnabled,
+					execute: async (hooks) => {
+						try {
+							const result = await executeReviewWorkflow({
+								prepared,
+								cwd: runtimeHost.cwd,
+								agentDir: runtimeHost.services.agentDir,
+								authStorage,
+								modelRegistry,
+								settingsManager,
+								sessionManager: commandSession.sessionManager,
+								sanitizeRemoteErrors: reviewOptions.remote,
+								thinkingLevel,
+								fastModeEnabled,
+								// Immutable snapshot tools are always installed by the review host;
+								// remote reviews receive no workspace or command-capable tools.
+								tools: REMOTE_REVIEW_TOOL_NAMES,
+								signal: hooks.signal,
+								onEvent: hooks.onEvent,
+							});
+							if (reviewOptions.remote && result.status === "failed") {
+								return { status: "failed", errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE };
+							}
+							return result;
+						} catch (error) {
+							if (reviewOptions.remote) {
+								return { status: "failed", errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE };
+							}
+							throw error;
 						}
-						return result;
-					} catch (error) {
-						if (reviewOptions.remote) {
-							return { status: "failed", errorMessage: "The review could not be completed." };
-						}
-						throw error;
-					}
-				},
-			});
+					},
+				});
+			} catch (error) {
+				await prepared.resolution.dispose();
+				throw error;
+			}
+			const { descriptor, launch } = started;
+			let launched = false;
 			pendingReviewWorkflows.set(descriptor.workflowId, {
-				launch,
-				cancel: () => runtimeHost.reviewWorkflows.cancel(descriptor.workflowId),
+				launch: () => {
+					launched = true;
+					launch();
+				},
+				cancel: () => {
+					if (!launched) {
+						appendReviewRun(
+							commandSession.sessionManager,
+							createReviewRunRecord({
+								workflowId: prepared.workflowId,
+								workflowAction: prepared.action,
+								startedAt: prepared.startedAt,
+								snapshot: prepared.resolution,
+								controls: prepared.controls,
+								status: "cancelled",
+								incrementalPlan: prepared.incrementalPlan,
+							}),
+						);
+					}
+					runtimeHost.reviewWorkflows.cancel(descriptor.workflowId);
+				},
 			});
 			return {
 				status: "accepted",
 				workflowId: descriptor.workflowId,
 				...(prepared.modelWarning === undefined || reviewOptions.remote ? {} : { message: prepared.modelWarning }),
 			};
+		},
+		runReviewLifecycleAction: async (action, args) => {
+			const runId = typeof args.runId === "string" ? args.runId : undefined;
+			const record = runId ? getReviewRun(commandSession.sessionManager, runId) : undefined;
+			if (action !== REVIEW_EXPORT_FEEDBACK_ACTION_ID && !record)
+				throw new Error(`Unknown durable review run: ${runId ?? "missing"}`);
+			if (action === REVIEW_FIX_ACTION_ID) {
+				if (!record?.result) throw new Error(`Review run has no findings result: ${runId}`);
+				const requestedIds =
+					typeof args.findingIds === "string" && args.findingIds.trim().length > 0
+						? args.findingIds
+								.split(",")
+								.map((value) => value.trim())
+								.filter(Boolean)
+						: record.result.findings.map((finding) => finding.id);
+				const selectedIds = new Set(requestedIds);
+				const unknown = requestedIds.filter(
+					(findingId) => !record.result?.findings.some((finding) => finding.id === findingId),
+				);
+				if (unknown.length > 0) throw new Error(`Unknown finding ids: ${unknown.join(", ")}`);
+				const selectedResult = {
+					...record.result,
+					findings: record.result.findings.filter((finding) => selectedIds.has(finding.id)),
+				};
+				const opened = await runtimeHost.newSession({
+					assertConversationGenerationCurrent,
+					setup: async (sessionManager) => appendReviewRun(sessionManager, record),
+					withSession: async (sessionContext) =>
+						sessionContext.sendMessage(createReviewSeedMessage(record.target, { parsed: selectedResult })),
+				});
+				return {
+					action,
+					status: opened.cancelled ? "cancelled" : "completed",
+					stateChanged: !opened.cancelled,
+					actionsChanged: !opened.cancelled,
+					message: opened.cancelled
+						? "Review fix session cancelled"
+						: `Opened ${selectedResult.findings.length} selected review findings`,
+				};
+			}
+			if (action === REVIEW_FEEDBACK_ACTION_ID) {
+				if (!record?.result) throw new Error(`Review run has no findings result: ${runId}`);
+				const findingId = typeof args.findingId === "string" ? args.findingId : "";
+				if (!record.result.findings.some((finding) => finding.id === findingId))
+					throw new Error(`Unknown finding: ${findingId}`);
+				const status = args.status;
+				if (status !== "accepted" && status !== "fixed" && status !== "dismissed")
+					throw new Error("Review outcome must be accepted, fixed, or dismissed.");
+				const reason = args.reason;
+				if (
+					status === "dismissed" &&
+					reason !== "false_positive" &&
+					reason !== "intentional" &&
+					reason !== "not_actionable" &&
+					reason !== "other"
+				)
+					throw new Error("Dismissed findings require an explicit reason.");
+				appendReviewFindingTransition(commandSession.sessionManager, {
+					runId: record.runId,
+					findingId,
+					status,
+					...(reason === "false_positive" ||
+					reason === "intentional" ||
+					reason === "not_actionable" ||
+					reason === "other"
+						? { reason }
+						: {}),
+					...(typeof args.note === "string" ? { note: args.note } : {}),
+				});
+				await commandSession.sessionManager.flush();
+				return {
+					action,
+					status: "completed",
+					stateChanged: true,
+					actionsChanged: true,
+					message: `Finding ${findingId} marked ${status}`,
+				};
+			}
+			if (action === REVIEW_RERUN_ACTION_ID) {
+				if (!record) throw new Error(`Unknown durable review run: ${runId}`);
+				const identity = record.target.identity;
+				const target =
+					identity.kind === "uncommitted"
+						? { kind: "uncommitted" as const }
+						: identity.kind === "branch"
+							? { kind: "branch" as const, base: identity.baseCommit }
+							: identity.kind === "pr"
+								? {
+										kind: "pr" as const,
+										number: identity.pullRequest ? String(identity.pullRequest.number) : undefined,
+									}
+								: { kind: "commit" as const, sha: identity.headCommit };
+				const rerun = await createHostActionContext(
+					commandSession,
+					assertConversationGenerationCurrent,
+				).runReviewAction?.(target, {
+					remote: true,
+					requireConfirmation: true,
+					controls: { ...record.options, scopeMode: args.scopeMode === "full" ? "full" : "incremental" },
+					parentRunId: record.runId,
+				});
+				if (rerun?.status !== "accepted")
+					return { action, status: "cancelled", message: "Review rerun was not accepted" };
+				return {
+					action,
+					status: "accepted",
+					workflowId: rerun.workflowId,
+					actionsChanged: true,
+					message: "Review rerun accepted",
+				};
+			}
+			if (action === REVIEW_PUBLISH_ACTION_ID) {
+				if (!record) throw new Error(`Unknown durable review run: ${runId}`);
+				const published = await publishReviewRun(commandSession.sessionManager.getCwd(), record);
+				appendReviewPublication(commandSession.sessionManager, { runId: record.runId, ...published });
+				await commandSession.sessionManager.flush();
+				return {
+					action,
+					status: "completed",
+					message: published.url ? `Review published: ${published.url}` : "Review published",
+				};
+			}
+			if (action === REVIEW_EXPORT_FEEDBACK_ACTION_ID) {
+				if (typeof args.path !== "string" || !args.path.trim())
+					throw new Error("RPC review feedback export requires an explicit local path.");
+				const outputPath = resolve(commandSession.sessionManager.getCwd(), args.path.trim());
+				await mkdir(dirname(outputPath), { recursive: true });
+				await writeFile(
+					outputPath,
+					`${JSON.stringify(exportReviewFeedback(commandSession.sessionManager), null, 2)}\n`,
+					{ mode: 0o600 },
+				);
+				return { action, status: "completed", message: `Review feedback exported to ${outputPath}` };
+			}
+			throw new Error(`Unsupported review lifecycle action: ${action}`);
 		},
 	});
 

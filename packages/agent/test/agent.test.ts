@@ -1392,7 +1392,7 @@ describe("Agent", () => {
 		});
 
 		expect(hasQueuedFollowUp).toBe(true);
-		expect(agent.state.messages[agent.state.messages.length - 1].role).toBe("assistant");
+		expect(agent.state.messages.at(-1)?.role).toBe("assistant");
 	});
 
 	it("continue() resumes a provider-ready tool result before draining follow-up", async () => {

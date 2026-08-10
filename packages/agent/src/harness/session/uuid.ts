@@ -18,7 +18,7 @@ export function uuidv7(): string {
 	const timestamp = Date.now();
 
 	if (timestamp > lastTimestamp) {
-		sequence = random[6] * 0x1000000 + random[7] * 0x10000 + random[8] * 0x100 + random[9];
+		sequence = new DataView(random.buffer, random.byteOffset, random.byteLength).getUint32(6);
 		lastTimestamp = timestamp;
 	} else {
 		sequence = (sequence + 1) >>> 0;
@@ -38,12 +38,13 @@ export function uuidv7(): string {
 	bytes[7] = (sequence >>> 20) & 0xff;
 	bytes[8] = 0x80 | ((sequence >>> 14) & 0x3f);
 	bytes[9] = (sequence >>> 6) & 0xff;
-	bytes[10] = ((sequence & 0x3f) << 2) | (random[10] & 0x03);
-	bytes[11] = random[11];
-	bytes[12] = random[12];
-	bytes[13] = random[13];
-	bytes[14] = random[14];
-	bytes[15] = random[15];
+	const randomView = new DataView(random.buffer, random.byteOffset, random.byteLength);
+	bytes[10] = ((sequence & 0x3f) << 2) | (randomView.getUint8(10) & 0x03);
+	bytes[11] = randomView.getUint8(11);
+	bytes[12] = randomView.getUint8(12);
+	bytes[13] = randomView.getUint8(13);
+	bytes[14] = randomView.getUint8(14);
+	bytes[15] = randomView.getUint8(15);
 
 	return formatUuid(bytes);
 }
