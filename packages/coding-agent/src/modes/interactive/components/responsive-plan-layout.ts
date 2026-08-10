@@ -202,6 +202,7 @@ export class ResponsivePlanLayoutComponent extends Container {
 		this.previousCommittedTranscript = transcript.slice(0, transcriptStart);
 		this.previousTranscriptRows = transcript.length;
 		const historicalTranscript = transcript.slice(0, transcriptStart);
+		const protectedHistoricalRows = protectedImageRows(historicalTranscript);
 		const visibleTranscript = transcript.slice(transcriptStart);
 		const padding = Array.from({ length: Math.max(0, transcriptRows - visibleTranscript.length) }, () => "");
 		const visibleConversation = [...visibleTranscript, ...padding, ...visibleControls].slice(-mainRows);
@@ -212,15 +213,15 @@ export class ResponsivePlanLayoutComponent extends Container {
 		const divider = theme.fg("border", usesAsciiPlanMarkers() ? "|" : "│");
 		let inspectorIndex = 0;
 		const visibleLines = visibleConversation.map((line, index) => {
-			if (protectedVisibleRows.has(index)) return truncateToWidth(line, dimensions.conversationColumns, "");
+			if (protectedVisibleRows.has(index)) return line;
 			const right = inspectorLines[inspectorIndex++] ?? "";
 			return `${fitLine(line, dimensions.conversationColumns)}${PANE_SEGMENT_RESET}${divider}${fitLine(right, dimensions.planColumns)}`;
 		});
 		// Rows scrolled out of the active viewport become immutable terminal scrollback. The plan
 		// pane only ever exists in the viewport, so decorating them with a divider would strand a
 		// dangling column beside empty space forever. Emit them as plain conversation text instead.
-		const historicalLines = historicalTranscript.map((line) =>
-			truncateToWidth(line, dimensions.conversationColumns, ""),
+		const historicalLines = historicalTranscript.map((line, index) =>
+			protectedHistoricalRows.has(index) ? line : truncateToWidth(line, dimensions.conversationColumns, ""),
 		);
 		return [...historicalLines, ...visibleLines, ...footerLines];
 	}

@@ -483,6 +483,20 @@ describe("ResponsivePlanLayoutComponent", () => {
 		expect(stripAnsi(rendered[imageIndex + 3] ?? "")).toContain("after");
 	});
 
+	it("preserves multi-row iTerm protocol rows in the viewport and historical scrollback", () => {
+		const image = `\x1b[2A\x1b]1337;File=inline=1;width=60;height=auto:${"iVBORw0KGgoAAAANSUhEUg".repeat(8)}\x07`;
+		const transcript = new LinesComponent(["before", "", "", image, "after"]);
+		const { layout } = createLayout({ columns: 129, rows: 24, transcript });
+
+		const visible = layout.render(129).slice(-24);
+		expect(visible.find((line) => line.includes("\x1b]1337;File="))).toBe(image);
+
+		transcript.lines.push(...Array.from({ length: 30 }, (_, index) => `later-${index + 1}`));
+		const rendered = layout.render(129);
+		const historical = rendered.slice(0, rendered.length - 24);
+		expect(historical.find((line) => line.includes("\x1b]1337;File="))).toBe(image);
+	});
+
 	it("keeps the selected ready action visible beside constrained Kitty and iTerm images", () => {
 		const blankImageRows = Array.from({ length: 15 }, () => "");
 		const kittyImage = ["\x1b_Ga=T,f=100,q=2,C=1,c=2,r=16,i=42;AAAA\x1b\\", ...blankImageRows];
