@@ -2,7 +2,7 @@
 
 ## Status
 
-Experimental repo-only PoC implemented under `.volt/pr-swarm/`. It is not included in any published package.
+Experimental repo-only PoC implemented under `.volt/pr-swarm/`. It is not included in any published package. Interactive runs render a compact terminal dashboard with current generation, review/check state, jobs, blockers, and recent lifecycle events; redirected output falls back to timestamped status lines.
 
 ## Objective
 
@@ -107,7 +107,7 @@ LGTM — Volt reviewed `abc1234`; all required checks passed.
 
 ## Recovery and Safety
 
-On restart, acquire the state lock, re-read the PR head, list managed worktrees, and reconcile jobs, durable review runs, authenticated markers, and remote heads. Verification may be rerun safely from a retained clean worktree. A prepared push is completed only when both GitHub and the fetched remote prove the intended head was published; ambiguous interrupted execution, integration, or external effects become `manual` rather than being replayed.
+On restart, acquire the state lock, re-read the PR head, list managed worktrees, and reconcile jobs, durable review runs, authenticated markers, and remote heads. Native-finding identity markers are extracted from authenticated full comment bodies before bounded prompt context is produced, preventing published findings from becoming duplicate thread jobs. Persisted duplicates and failed retry attempts are discarded only after their owned worktrees are proven clean and removed; a failed removal leaves the checked-out branch intact and blocks for operator recovery. Native PR review fetches the exact recorded base commit, so ordinary base-branch advancement does not require merging the base into the PR. Incomplete exact-head reviews retain their independently verified findings as remediation jobs and review the next pushed head; incomplete reviews without verified findings, malformed results, and wrong-head results retry in fresh deterministic sessions without creating a manual blocker. Verification may be rerun safely from a retained clean worktree. A rejected candidate persists bounded verifier status, target, explanation, and active-finding evidence as untrusted diagnostic context for the next attempt; if the retry cap is reached, the latest detailed evidence remains available for manual recovery. A prepared push is completed only when both GitHub and the fetched remote prove the intended head was published; ambiguous interrupted execution, integration, or external effects become `manual` rather than being replayed.
 
 Worktrees isolate concurrent changes but are not a security sandbox. Run the PoC only for trusted same-repository PRs and preferably inside a container or VM. Keep GitHub writes in the sidecar and give agent sessions no instruction or authority to modify GitHub.
 
@@ -153,12 +153,18 @@ Run one dry scheduling cycle against a disposable same-repository PR:
 npm run pr-swarm:poc -- <pr-number> --workspace <registered-name> --once --dry-run
 ```
 
-Run continuously in write mode with one or more operator-trusted checks:
+Run continuously in write mode with one or more operator-trusted checks. In a terminal this opens the live dashboard; press Ctrl+C to stop safely:
 
 ```sh
 npm run pr-swarm:poc -- <pr-number> --workspace <registered-name> \
   --remote origin --poll-ms 30000 \
   --check "npm run check" --check "node path/to/targeted-test.js"
+```
+
+When launching from PowerShell with nvm-windows, Git Bash may not inherit the active Node path. Pass the test check as a single-quoted PowerShell argument so `$PATH` is expanded by Bash rather than PowerShell:
+
+```powershell
+--check 'bash -lc "export PATH=/c/nvm4w/nodejs:$PATH; ./test.sh"'
 ```
 
 Options are exactly:

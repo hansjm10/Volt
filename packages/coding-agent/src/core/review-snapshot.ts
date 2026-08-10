@@ -605,7 +605,7 @@ async function createPullRequestSource(
 		"--no-tags",
 		"--force",
 		text(originResult).trim(),
-		`+refs/heads/${pullRequest.baseRefName}:refs/review/base`,
+		`+${pullRequest.baseRefOid}:refs/review/base`,
 		`+refs/pull/${pullRequest.number}/head:refs/review/head`,
 	]);
 	if (!fetch.ok) {

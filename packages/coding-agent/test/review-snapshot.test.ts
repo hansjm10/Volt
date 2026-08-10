@@ -396,7 +396,7 @@ describe("review snapshots", () => {
 		).toContain("+feature");
 	});
 
-	it("verifies fetched pull request base and head OIDs and rejects moved metadata", async () => {
+	it("fetches the recorded PR base after the base branch advances and rejects moved head metadata", async () => {
 		const repository = createRepository();
 		const remote = join(tmpdir(), `volt-review-snapshot-remote-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(remote, { recursive: true });
@@ -411,6 +411,13 @@ describe("review snapshots", () => {
 		git(repository, "push", "origin", "HEAD:refs/pull/7/head");
 		const baseOid = git(repository, "rev-parse", "main");
 		const headOid = git(repository, "rev-parse", "HEAD");
+		git(repository, "checkout", "main");
+		writeFileSync(join(repository, "base-advanced.txt"), "new base work\n");
+		git(repository, "add", "base-advanced.txt");
+		git(repository, "commit", "-m", "advance base");
+		git(repository, "push", "origin", "main");
+		expect(git(repository, "rev-parse", "main")).not.toBe(baseOid);
+		git(repository, "checkout", "feature");
 
 		const bin = join(repository, "bin");
 		mkdirSync(bin);

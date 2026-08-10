@@ -23,7 +23,7 @@ export type JobState =
 	| "failed"
 	| "manual";
 
-export type ReviewState = "none" | "running" | "complete" | "failed" | "manual";
+export type ReviewState = "none" | "running" | "partial" | "complete" | "failed" | "manual";
 export type GenerationPhase = "observing" | "integrating" | "pushed_waiting_ci" | "complete" | "manual" | "dry_run_complete";
 export type IntentKind = "publish_review" | "push" | "thread_reply" | "thread_resolve" | "lgtm";
 export type IntentStatus = "prepared" | "completed" | "suppressed" | "manual";
@@ -74,6 +74,7 @@ export interface SwarmJob {
 
 export interface SwarmReview {
 	state: ReviewState;
+	attempts?: number;
 	sessionId?: string;
 	workflowId?: string;
 	runId?: string;
@@ -225,6 +226,7 @@ export function createGeneration(sha: string, headRefName: string, baseRefName: 
 		phase: "observing",
 		review: {
 			state: "none",
+			attempts: 0,
 			findingIds: [],
 			inlineFindingIds: [],
 			complete: false,
@@ -357,6 +359,7 @@ function parseReview(value: unknown, label: string): SwarmReview {
 	const record = expectRecord(value, label);
 	expectKeys(record, label, [
 		"state",
+		"attempts",
 		"sessionId",
 		"workflowId",
 		"runId",
@@ -368,7 +371,10 @@ function parseReview(value: unknown, label: string): SwarmReview {
 		"error",
 	]);
 	return {
-		state: expectEnum(record.state, `${label}.state`, ["none", "running", "complete", "failed", "manual"]),
+		state: expectEnum(record.state, `${label}.state`, ["none", "running", "partial", "complete", "failed", "manual"]),
+		...(record.attempts === undefined
+			? {}
+			: { attempts: expectNonNegativeInteger(record.attempts, `${label}.attempts`) }),
 		...optionalString(record, "sessionId", label),
 		...optionalString(record, "workflowId", label),
 		...optionalString(record, "runId", label),
@@ -539,6 +545,7 @@ const OPTIONAL_FIELDS = new Set([
 	"integrationWorktreePath",
 	"integrationBranch",
 	"sessionId",
+	"attempts",
 	"workflowId",
 	"runId",
 	"error",

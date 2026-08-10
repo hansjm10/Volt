@@ -6,6 +6,7 @@ import { CommandGitAdapter } from "./git.ts";
 import { GhCliAdapter } from "./github.ts";
 import { FileStateStore } from "./state.ts";
 import { SwarmController } from "./swarm.ts";
+import { TerminalSwarmReporter } from "./ui.ts";
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
 	let config;
@@ -29,7 +30,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 	});
 	const git = new CommandGitAdapter(commands, config.cwd);
 	const stateStore = new FileStateStore(config.swarmDir, repository, config.prNumber);
-	const controller = new SwarmController(config, { github, git, daemon, stateStore });
+	const logger = new TerminalSwarmReporter({ dryRun: config.dryRun });
+	const controller = new SwarmController(config, { github, git, daemon, stateStore, logger });
 	const abortController = new AbortController();
 	const stop = (signal: NodeJS.Signals) => abortController.abort(new Error(`Received ${signal}`));
 	const onSigint = () => stop("SIGINT");

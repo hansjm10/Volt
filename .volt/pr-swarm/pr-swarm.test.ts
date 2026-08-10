@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 import {
 	encodeIrohRemoteTicketPayload,
@@ -9,7 +9,7 @@ import {
 	type RpcReviewWorkflowResultResponse,
 	type RpcSessionState,
 } from "@hansjm10/volt-coding-agent";
-import type { CommandAdapter, CommandOptions, CommandResult } from "./command.ts";
+import { createCommandEnvironment, type CommandAdapter, type CommandOptions, type CommandResult } from "./command.ts";
 import { parseSwarmArgs, type SwarmConfig } from "./config.ts";
 import {
 	loadSwarmPairingCredentials,
@@ -46,6 +46,7 @@ import {
 	type SwarmState,
 	type ValidationRun,
 } from "./state.ts";
+import { TerminalSwarmReporter } from "./ui.ts";
 import {
 	assertVerifierResult,
 	createRemediationPrompt,
@@ -143,7 +144,7 @@ function reviewResult(options: {
 	head?: string;
 	findings?: Array<{ id: string; fingerprint?: string; status?: string }>;
 	correctness?: "correct" | "incorrect";
-	status?: "completed" | "failed";
+	status?: RpcReviewWorkflowResultResponse["status"];
 	completionStatus?: "complete" | "incomplete";
 } = {}): RpcReviewWorkflowResultResponse {
 	const action = options.action ?? "review.pr";
@@ -280,6 +281,7 @@ interface FakeRuntimeOptions {
 			: never
 		: never;
 	blockPrompt?: Promise<void>;
+	removeWorktreeError?: Error;
 }
 
 class FakeConversation implements AgentConversation {
@@ -374,6 +376,7 @@ class FakeDaemon implements DaemonRuntimeAdapter {
 	prompts: string[] = [];
 	steers: string[] = [];
 	removedWorktrees: string[] = [];
+	forcedWorktrees: string[] = [];
 	worktrees = new Map<string, { id: string; path: string; branch: string }>();
 	fixCommit = SHA_B;
 	options: FakeRuntimeOptions;
@@ -425,8 +428,10 @@ class FakeDaemon implements DaemonRuntimeAdapter {
 		}));
 	}
 
-	async removeWorktree(_workspaceName: string, worktreeId: string): Promise<void> {
+	async removeWorktree(_workspaceName: string, worktreeId: string, force = false): Promise<void> {
+		if (this.options.removeWorktreeError) throw this.options.removeWorktreeError;
 		this.removedWorktrees.push(worktreeId);
+		if (force) this.forcedWorktrees.push(worktreeId);
 		this.worktrees.delete(worktreeId);
 	}
 
@@ -454,6 +459,7 @@ class FakeGit implements GitAdapter {
 	integrationHead = SHA_C;
 	events: string[] = [];
 	deletedRefs: string[] = [];
+	worktreePresent = true;
 	clean = true;
 
 	async assertWorkspaceRoot(): Promise<string> {
@@ -504,6 +510,10 @@ class FakeGit implements GitAdapter {
 
 	async currentHead(): Promise<string> {
 		return this.integrationHead;
+	}
+
+	async worktreeExists(): Promise<boolean> {
+		return this.worktreePresent;
 	}
 
 	async isClean(): Promise<boolean> {
@@ -582,6 +592,17 @@ function cleanReviewedState(head = SHA_A): SwarmState {
 	return state;
 }
 
+test("command environment makes the active Node installation directly executable", () => {
+	const inheritedPathKey = process.platform === "win32" ? "Path" : "PATH";
+	const environment = createCommandEnvironment({ [inheritedPathKey]: "/inherited", KEEP: "yes" });
+	assert.equal(environment.PATH, `${dirname(process.execPath)}${delimiter}/inherited`);
+	assert.equal(environment.KEEP, "yes");
+	assert.deepEqual(
+		Object.keys(environment).filter((key) => key.toLowerCase() === "path"),
+		["PATH"],
+	);
+});
+
 test("configuration enforces exact CLI and write-mode guards", () => {
 	assert.throws(() => parseSwarmArgs(["17", "--workspace", "volt"]), /requires at least one --check/);
 	const parsed = parseSwarmArgs([
@@ -626,13 +647,15 @@ test("Gh adapter pages reviews, bounds thread context, and accepts documented no
 			if (joined.startsWith("repo view")) return result({ nameWithOwner: REPOSITORY });
 			if (joined === "api user") return result({ login: "volt-bot" });
 			if (joined.startsWith("pr view")) {
+				assert.match(joined, /headRepositoryOwner/);
 				return result({
 					state: "OPEN",
 					isDraft: false,
 					isCrossRepository: false,
 					headRefName: "feature",
 					headRefOid: SHA_A,
-					headRepository: { nameWithOwner: REPOSITORY },
+					headRepository: { id: "R1", name: "Volt", nameWithOwner: "" },
+					headRepositoryOwner: { id: "O1", login: "volt-hq" },
 					baseRefName: "main",
 				});
 			}
@@ -678,10 +701,10 @@ test("Gh adapter pages reviews, bounds thread context, and accepts documented no
 												nodes: [
 													{
 														id: "C1",
-														body: "x".repeat(100_000),
+														body: `${"x".repeat(2_000)}\nVolt finding: finding-after-bound`,
 														createdAt: "2026-01-01T00:00:00Z",
 														url: "https://example.test/c1",
-														author: { login: "reviewer" },
+														author: { login: "volt-bot" },
 													},
 												],
 												pageInfo: { hasNextPage: false, endCursor: null },
@@ -707,6 +730,9 @@ test("Gh adapter pages reviews, bounds thread context, and accepts documented no
 	const value = await adapter.getSnapshot(17);
 	assert.equal(value.reviews.length, 2);
 	assert.ok(Buffer.byteLength(JSON.stringify(value.threads[0]), "utf8") <= 16 * 1024);
+	assert.equal(value.threads[0]!.originalVoltFindingId, "finding-after-bound");
+	assert.ok(Buffer.byteLength(value.threads[0]!.comments[0]!.body, "utf8") <= 1_400);
+	assert.match(value.threads[0]!.comments[0]!.body, /Volt finding: finding-after-bound$/);
 	assert.equal(value.requiredChecks.length, 0);
 });
 
@@ -801,6 +827,91 @@ test("restart resumes a caller-named session to reconcile a durable review run",
 	await controller.close();
 });
 
+test("transient PR snapshot failures recover automatically on restart", async () => {
+	const state = cleanReviewedState();
+	state.generations[SHA_A]!.review = {
+		state: "manual",
+		findingIds: [],
+		inlineFindingIds: [],
+		complete: false,
+		zeroFindings: false,
+		published: false,
+		error: "The pull request changed while Volt captured it. Retry the review.",
+	};
+	state.generations[SHA_A]!.manualBlockers = ["Native PR review failed or returned a malformed result"];
+	const daemon = new FakeDaemon({ prReview: reviewResult() });
+	const { controller } = await createController({ state, daemon });
+	await controller.tick(snapshot());
+	assert.equal(controller.getStateForTesting()!.generations[SHA_A]!.review.state, "complete");
+	assert.deepEqual(controller.getStateForTesting()!.generations[SHA_A]!.manualBlockers, []);
+	await controller.close();
+});
+
+test("restart recovers verified findings from the persisted incomplete native review", async () => {
+	const state = createInitialState(REPOSITORY, 17, { sha: SHA_A, headRefName: "feature", baseRefName: "main" }, 1);
+	state.generations[SHA_A]!.review = {
+		state: "manual",
+		sessionId: "sw-p17-review-aaaaaaaaaaaa",
+		workflowId: "incomplete-run",
+		runId: "incomplete-run",
+		findingIds: [],
+		inlineFindingIds: [],
+		complete: false,
+		zeroFindings: false,
+		published: false,
+		error: "Native review result is incomplete or targets a different PR head",
+	};
+	state.generations[SHA_A]!.manualBlockers = ["Native PR review failed or returned a malformed result"];
+	let releasePrompt = () => {};
+	const blocked = new Promise<void>((resolve) => (releasePrompt = resolve));
+	const daemon = new FakeDaemon({
+		prReview: reviewResult({
+			status: "incomplete",
+			completionStatus: "incomplete",
+			findings: [{ id: "recovered-finding" }],
+		}),
+		blockPrompt: blocked,
+	});
+	const { controller } = await createController({ state, daemon });
+	await controller.tick(snapshot());
+	const recovered = controller.getStateForTesting()!;
+	assert.equal(recovered.generations[SHA_A]!.review.state, "partial");
+	assert.equal(recovered.generations[SHA_A]!.review.attempts, 1);
+	assert.deepEqual(recovered.generations[SHA_A]!.manualBlockers, []);
+	assert.ok(Object.values(recovered.jobs).some((job) => job.sourceId === "recovered-finding"));
+	assert.ok(daemon.events.includes("open:sw-p17-review-aaaaaaaaaaaa:resume"));
+	assert.equal(daemon.events.some((event) => event.startsWith("publish:")), false);
+	releasePrompt();
+	await controller.close();
+});
+
+test("incomplete native reviews without verified findings retry in fresh sessions", async () => {
+	const daemon = new FakeDaemon({
+		prReview: reviewResult({ status: "incomplete", completionStatus: "incomplete" }),
+	});
+	const { controller, github } = await createController({ daemon });
+	await controller.tick(github.current);
+	let review = controller.getStateForTesting()!.generations[SHA_A]!.review;
+	assert.equal(review.state, "none");
+	assert.equal(review.attempts, 1);
+	assert.match(review.error ?? "", /no verified findings/);
+	assert.deepEqual(controller.getStateForTesting()!.generations[SHA_A]!.manualBlockers, []);
+
+	daemon.options.prReview = reviewResult();
+	await controller.tick(github.current);
+	review = controller.getStateForTesting()!.generations[SHA_A]!.review;
+	assert.equal(review.state, "complete");
+	assert.equal(review.attempts, 2);
+	assert.deepEqual(
+		daemon.events.filter((event) => event.startsWith("review:review.pr:")),
+		[
+			"review:review.pr:sw-p17-review-aaaaaaaaaaaa-a1",
+			"review:review.pr:sw-p17-review-aaaaaaaaaaaa-a2",
+		],
+	);
+	await controller.close();
+});
+
 test("submitted current-head reviews suppress native review", async () => {
 	const current = snapshot({
 		reviews: [{ id: "R1", state: "COMMENTED", commitOid: SHA_A, author: "reviewer", body: "review" }],
@@ -809,6 +920,17 @@ test("submitted current-head reviews suppress native review", async () => {
 	const { controller, daemon } = await createController({ snapshot: current });
 	await controller.tick(current);
 	assert.equal(daemon.events.some((event) => event.startsWith("review:review.pr")), false);
+	await controller.close();
+});
+
+test("empty current-head COMMENTED reviews from thread replies do not suppress native review", async () => {
+	const current = snapshot({
+		reviews: [{ id: "R1", state: "COMMENTED", commitOid: SHA_A, author: "reviewer", body: "" }],
+	});
+	assert.equal(hasSubmittedCurrentHeadReview(current), false);
+	const { controller, daemon } = await createController({ snapshot: current });
+	await controller.tick(current);
+	assert.equal(daemon.events.some((event) => event.startsWith("review:review.pr")), true);
 	await controller.close();
 });
 
@@ -832,6 +954,208 @@ test("native findings seed one logical job and authenticated inline markers do n
 	await controller.close();
 });
 
+test("restart suppresses persisted duplicate thread jobs for authenticated native findings", async () => {
+	const state = cleanReviewedState();
+	const canonical = newJob({
+		id: createJobId("finding", "finding-1", SHA_A),
+		sourceKind: "finding",
+		sourceId: "finding-1",
+		sourceVersion: "fingerprint-1",
+		generationSha: SHA_A,
+		concern: "finding",
+		now: 1,
+	});
+	canonical.state = "manual";
+	const duplicate = newJob({
+		id: createJobId("thread", "T1", SHA_A),
+		sourceKind: "thread",
+		sourceId: "T1",
+		sourceVersion: "COMMENT_1",
+		generationSha: SHA_A,
+		concern: "duplicate",
+		now: 1,
+		threadId: "T1",
+		lastCommentId: "COMMENT_1",
+	});
+	duplicate.worktreeId = "duplicate-worktree";
+	duplicate.worktreePath = "/fake/duplicate-worktree";
+	duplicate.worktreeBranch = "volt/swarm/duplicate";
+	state.jobs[canonical.id] = canonical;
+	state.jobs[duplicate.id] = duplicate;
+	const daemon = new FakeDaemon();
+	daemon.worktrees.set("duplicate-worktree", {
+		id: "duplicate-worktree",
+		path: "/fake/duplicate-worktree",
+		branch: "volt/swarm/duplicate",
+	});
+	const current = snapshot({ threads: [thread("T1", "COMMENT_1", { findingId: "finding-1" })] });
+	const { controller, git } = await createController({ state, snapshot: current, daemon });
+	await controller.tick(current);
+	const reconciled = controller.getStateForTesting()!;
+	assert.equal(reconciled.jobs[duplicate.id]!.state, "stale");
+	assert.match(reconciled.jobs[duplicate.id]!.manualReason ?? "", /Superseded by authenticated native finding/);
+	assert.equal(reconciled.jobs[canonical.id]!.threadId, "T1");
+	assert.deepEqual(reconciled.generations[SHA_A]!.manualBlockers, []);
+	assert.deepEqual(daemon.removedWorktrees, ["duplicate-worktree"]);
+	assert.deepEqual(daemon.forcedWorktrees, ["duplicate-worktree"]);
+	assert.deepEqual(git.deletedRefs, ["refs/heads/volt/swarm/duplicate"]);
+	await controller.close();
+});
+
+test("restart recovers clean retry worktrees previously blocked by detached runtimes", async () => {
+	const state = cleanReviewedState();
+	state.generations[SHA_B] = createGeneration(SHA_B, "older-feature", "main", 1);
+	const job = newJob({
+		id: createJobId("finding", "finding-old", SHA_B),
+		sourceKind: "finding",
+		sourceId: "finding-old",
+		sourceVersion: "fingerprint-old",
+		generationSha: SHA_B,
+		concern: "finding",
+		now: 1,
+	});
+	job.state = "manual";
+	job.manualReason = "Persisted retry worktree is dirty or could not be removed safely";
+	job.worktreeId = "retry-worktree";
+	job.worktreePath = "/fake/retry-worktree";
+	job.worktreeBranch = "volt/swarm/retry-worktree";
+	job.fixCommit = SHA_C;
+	state.jobs[job.id] = job;
+	const daemon = new FakeDaemon();
+	daemon.worktrees.set("retry-worktree", {
+		id: "retry-worktree",
+		path: "/fake/retry-worktree",
+		branch: "volt/swarm/retry-worktree",
+	});
+	const { controller, git } = await createController({ state, daemon });
+	await controller.tick(snapshot());
+	const recovered = controller.getStateForTesting()!.jobs[job.id]!;
+	assert.equal(recovered.state, "detected");
+	assert.equal(recovered.manualReason, undefined);
+	assert.equal(recovered.worktreeId, undefined);
+	assert.deepEqual(daemon.forcedWorktrees, ["retry-worktree"]);
+	assert.deepEqual(git.deletedRefs, ["refs/heads/volt/swarm/retry-worktree"]);
+	await controller.close();
+});
+
+test("restart recovers retry state after the daemon already removed the managed checkout", async () => {
+	const state = cleanReviewedState();
+	state.generations[SHA_B] = createGeneration(SHA_B, "older-feature", "main", 1);
+	const job = newJob({
+		id: createJobId("finding", "finding-removed", SHA_B),
+		sourceKind: "finding",
+		sourceId: "finding-removed",
+		sourceVersion: "fingerprint-removed",
+		generationSha: SHA_B,
+		concern: "finding",
+		now: 1,
+	});
+	job.state = "manual";
+	job.manualReason = "Persisted retry worktree is dirty or could not be removed safely";
+	job.worktreeId = "removed-worktree";
+	job.worktreePath = "/fake/removed-worktree";
+	job.worktreeBranch = "volt/swarm/removed-worktree";
+	job.fixCommit = SHA_C;
+	state.jobs[job.id] = job;
+	const daemon = new FakeDaemon();
+	const git = new FakeGit();
+	git.worktreePresent = false;
+	const { controller } = await createController({ state, daemon, git });
+	await controller.tick(snapshot());
+	const recovered = controller.getStateForTesting()!.jobs[job.id]!;
+	assert.equal(recovered.state, "detected");
+	assert.equal(recovered.worktreeId, undefined);
+	assert.deepEqual(daemon.removedWorktrees, []);
+	assert.deepEqual(git.deletedRefs, ["refs/heads/volt/swarm/removed-worktree"]);
+	await controller.close();
+});
+
+test("dirty persisted duplicate worktrees fail closed for operator recovery", async () => {
+	const state = cleanReviewedState();
+	const canonical = newJob({
+		id: createJobId("finding", "finding-1", SHA_A),
+		sourceKind: "finding",
+		sourceId: "finding-1",
+		sourceVersion: "fingerprint-1",
+		generationSha: SHA_A,
+		concern: "finding",
+		now: 1,
+	});
+	canonical.state = "manual";
+	const duplicate = newJob({
+		id: createJobId("thread", "T1", SHA_A),
+		sourceKind: "thread",
+		sourceId: "T1",
+		sourceVersion: "COMMENT_1",
+		generationSha: SHA_A,
+		concern: "duplicate",
+		now: 1,
+	});
+	duplicate.worktreeId = "dirty-duplicate";
+	duplicate.worktreePath = "/fake/dirty-duplicate";
+	state.jobs[canonical.id] = canonical;
+	state.jobs[duplicate.id] = duplicate;
+	const daemon = new FakeDaemon();
+	daemon.worktrees.set("dirty-duplicate", {
+		id: "dirty-duplicate",
+		path: "/fake/dirty-duplicate",
+		branch: "volt/swarm/dirty-duplicate",
+	});
+	const git = new FakeGit();
+	git.clean = false;
+	const current = snapshot({ threads: [thread("T1", "COMMENT_1", { findingId: "finding-1" })] });
+	const { controller } = await createController({ state, snapshot: current, daemon, git });
+	await controller.tick(current);
+	const reconciled = controller.getStateForTesting()!;
+	assert.equal(reconciled.jobs[duplicate.id]!.state, "manual");
+	assert.match(reconciled.jobs[duplicate.id]!.manualReason ?? "", /dirty or unremovable/);
+	assert.match(reconciled.generations[SHA_A]!.manualBlockers[0] ?? "", /Duplicate native-finding thread job/);
+	assert.deepEqual(daemon.removedWorktrees, []);
+	await controller.close();
+});
+
+test("failed managed worktree removal never deletes its checked-out branch", async () => {
+	const state = cleanReviewedState();
+	const canonical = newJob({
+		id: createJobId("finding", "finding-1", SHA_A),
+		sourceKind: "finding",
+		sourceId: "finding-1",
+		sourceVersion: "fingerprint-1",
+		generationSha: SHA_A,
+		concern: "finding",
+		now: 1,
+	});
+	canonical.state = "manual";
+	const duplicate = newJob({
+		id: createJobId("thread", "T1", SHA_A),
+		sourceKind: "thread",
+		sourceId: "T1",
+		sourceVersion: "COMMENT_1",
+		generationSha: SHA_A,
+		concern: "duplicate",
+		now: 1,
+	});
+	duplicate.worktreeId = "unremovable-duplicate";
+	duplicate.worktreePath = "/fake/unremovable-duplicate";
+	duplicate.worktreeBranch = "volt/swarm/unremovable-duplicate";
+	duplicate.fixCommit = SHA_B;
+	state.jobs[canonical.id] = canonical;
+	state.jobs[duplicate.id] = duplicate;
+	const daemon = new FakeDaemon({ removeWorktreeError: new Error("still attached") });
+	daemon.worktrees.set("unremovable-duplicate", {
+		id: "unremovable-duplicate",
+		path: "/fake/unremovable-duplicate",
+		branch: "volt/swarm/unremovable-duplicate",
+	});
+	const git = new FakeGit();
+	const current = snapshot({ threads: [thread("T1", "COMMENT_1", { findingId: "finding-1" })] });
+	const { controller } = await createController({ state, snapshot: current, daemon, git });
+	await controller.tick(current);
+	assert.equal(controller.getStateForTesting()!.jobs[duplicate.id]!.state, "manual");
+	assert.deepEqual(git.deletedRefs, []);
+	await controller.close();
+});
+
 test("Plan ready sequencing retains one conversation, validates, verifies, serializes integration, and normally pushes", async () => {
 	const current = snapshot({ threads: [thread()] });
 	const { controller, daemon, git } = await createController({ snapshot: current });
@@ -852,6 +1176,7 @@ test("Plan ready sequencing retains one conversation, validates, verifies, seria
 	assert.ok(git.events.includes(`cherry:${SHA_B}`));
 	assert.equal(controller.getStateForTesting()!.generations[SHA_A]!.intendedIntegrationHead, SHA_C);
 	assert.ok(daemon.removedWorktrees.length >= 2);
+	assert.ok(daemon.forcedWorktrees.some((worktreeId) => worktreeId.endsWith("-integration")));
 	await controller.close();
 });
 
@@ -1029,17 +1354,34 @@ test("malformed commits are manual and detached verifier rejection retries only 
 	);
 	const retried = Object.values(second.controller.getStateForTesting()!.jobs)[0]!;
 	assert.equal(retried.attempts, 2);
+	assert.equal(daemon.prompts.length, 2);
+	assert.match(daemon.prompts[1]!, /untrusted_prior_rejection_evidence/);
+	assert.match(daemon.prompts[1]!, /v1/);
+	assert.match(daemon.prompts[1]!, /Finding body/);
+	assert.match(retried.rejectionEvidence ?? "", /v2/);
+	assert.match(retried.rejectionEvidence ?? "", /src\/example\.ts:10-10/);
 	assert.match(retried.manualReason ?? "", /retry limit/);
+	assert.match(retried.manualReason ?? "", /v2/);
 	await second.controller.close();
 });
 
-test("verifier requires a complete correct result for the exact fix commit", () => {
+test("verifier requires a complete correct result for the exact fix commit and bounds actionable rejection evidence", () => {
 	assert.doesNotThrow(() => assertVerifierResult(reviewResult({ action: "review.commit", head: SHA_B }), SHA_B));
 	assert.throws(() => assertVerifierResult(reviewResult({ action: "review.commit", head: SHA_C }), SHA_B), /targets another/);
 	assert.throws(
 		() => assertVerifierResult(reviewResult({ action: "review.commit", head: SHA_B, findings: [{ id: "finding" }] }), SHA_B),
-		/active findings/,
+		/Finding body/,
 	);
+	const verbose = reviewResult({ action: "review.commit", head: SHA_B, findings: [{ id: "verbose-finding" }] });
+	verbose.findings![0]!.body = "x".repeat(20_000);
+	let rejection = "";
+	assert.throws(() => assertVerifierResult(verbose, SHA_B), (error: unknown) => {
+		assert.ok(error instanceof Error);
+		rejection = error.message;
+		return true;
+	});
+	assert.ok(Buffer.byteLength(rejection, "utf8") <= 8 * 1024);
+	assert.match(rejection, /verbose-finding/);
 });
 
 test("external head movement stales unfinished work and normal push fencing refuses moved remotes", async () => {
@@ -1217,6 +1559,32 @@ test("prompt, marker, and plan guards keep untrusted data bounded and force oper
 	);
 	assert.equal(planRequiresOperatorDecision({ summary: "Scoped fix", steps: [{ text: "change one condition" }] }), false);
 	assert.equal(boundUtf8("é".repeat(100), 20).endsWith("…"), true);
+});
+
+test("terminal reporter renders a compact live status screen and restores the terminal", () => {
+	const writes: string[] = [];
+	const output = {
+		isTTY: true,
+		columns: 88,
+		write(text: string) {
+			writes.push(text);
+		},
+	};
+	const reporter = new TerminalSwarmReporter({
+		output,
+		errorOutput: output,
+		now: () => new Date("2026-01-01T12:00:00.000Z"),
+	});
+	reporter.info("Starting native review");
+	reporter.update(cleanReviewedState(), snapshot());
+	reporter.close();
+	const rendered = writes.join("");
+	assert.match(rendered, /Volt PR Swarm  LIVE  PR #17/);
+	assert.match(rendered, /Review:\s+complete/);
+	assert.match(rendered, /Starting native review/);
+	assert.match(rendered, /Ctrl\+C to stop safely/);
+	assert.match(rendered, /\u001b\[\?1049h/);
+	assert.match(rendered, /\u001b\[\?1049l/);
 });
 
 function result(value: unknown): CommandResult {

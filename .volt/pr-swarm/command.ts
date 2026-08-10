@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { delimiter, dirname } from "node:path";
 
 export interface CommandResult {
 	code: number | null;
@@ -30,6 +31,19 @@ export class NodeCommandAdapter implements CommandAdapter {
 	}
 }
 
+export function createCommandEnvironment(
+	inherited: NodeJS.ProcessEnv = process.env,
+	nodeExecutable: string = process.execPath,
+): NodeJS.ProcessEnv {
+	const environment = { ...inherited };
+	const inheritedPath = Object.entries(environment).find(([key]) => key.toLowerCase() === "path")?.[1] ?? "";
+	for (const key of Object.keys(environment)) {
+		if (key.toLowerCase() === "path") delete environment[key];
+	}
+	environment.PATH = [dirname(nodeExecutable), inheritedPath].filter(Boolean).join(delimiter);
+	return environment;
+}
+
 function runProcess(
 	command: string,
 	args: readonly string[],
@@ -39,7 +53,7 @@ function runProcess(
 	return new Promise((resolve, reject) => {
 		const child = spawn(command, args, {
 			cwd: options.cwd,
-			env: process.env,
+			env: createCommandEnvironment(),
 			shell,
 			windowsHide: true,
 			stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],

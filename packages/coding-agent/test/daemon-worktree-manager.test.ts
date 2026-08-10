@@ -547,13 +547,15 @@ describe("worktree manager (fake git)", () => {
 	});
 
 	it("refuses to remove a dirty worktree without force and force-removes with --force", async () => {
-		const git = createFakeGit((args) =>
-			args.includes("status") ? { ok: true, stdout: " M file.ts\n" } : { ok: true },
-		);
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "dirty");
+		const git = createFakeGit((args) => {
+			if (args.includes("status")) return { ok: true, stdout: " M file.ts\n" };
+			if (args[0] === "worktree" && args[1] === "remove") rmSync(checkout, { recursive: true, force: true });
+			return { ok: true };
+		});
 		const manager = createManager(git.runGit);
 		const created = await manager.create(workspace, { id: "dirty" });
 		expect(created.ok).toBe(true);
-		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "dirty");
 		mkdirSync(checkout, { recursive: true });
 
 		expect(await manager.remove(workspace, "dirty")).toEqual({ ok: false, error: "worktree_dirty", detail: "dirty" });
@@ -565,6 +567,59 @@ describe("worktree manager (fake git)", () => {
 			{ args: ["worktree", "remove", "--force", checkout], cwd: realpathSync(workspaceDir) },
 		]);
 		expect(await stateManager.listWorktrees("repo")).toHaveLength(0);
+	});
+
+	it("quarantines residual files after Git partially force-removes a worktree", async () => {
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "partial-force");
+		const git = createFakeGit((args) => {
+			if (args[0] === "worktree" && args[1] === "remove") {
+				return { ok: false, stderr: `error: failed to delete '${checkout}': Invalid argument` };
+			}
+			if (args[0] === "worktree" && args[1] === "list") {
+				return { ok: true, stdout: `worktree ${workspaceDir}\nHEAD abc123\nbranch refs/heads/main\n` };
+			}
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "partial-force" });
+		mkdirSync(join(checkout, "node_modules"), { recursive: true });
+		writeFileSync(join(checkout, "node_modules", "generated.txt"), "generated\n");
+
+		await expect(manager.remove(workspace, "partial-force", { force: true })).resolves.toEqual({ ok: true });
+		expect(existsSync(checkout)).toBe(false);
+		const recoveries = await manager.listRecoveryCheckouts();
+		expect(recoveries).toHaveLength(1);
+		expect(existsSync(join(recoveries[0] ?? "", "node_modules", "generated.txt"))).toBe(true);
+		expect(await stateManager.listWorktrees("repo")).toEqual([]);
+		expect(git.calls.slice(-3).map((call) => call.args)).toEqual([
+			["worktree", "remove", "--force", checkout],
+			["worktree", "list", "--porcelain"],
+			["worktree", "prune"],
+		]);
+	});
+
+	it("fails closed when Git still registers a worktree after forced removal fails", async () => {
+		const checkout = getWorktreeCheckoutPath(agentDir, workspaceDir, "registered-force-failure");
+		const git = createFakeGit((args) => {
+			if (args[0] === "worktree" && args[1] === "remove") {
+				return { ok: false, stderr: "fatal: forced removal failed" };
+			}
+			if (args[0] === "worktree" && args[1] === "list") {
+				return { ok: true, stdout: `worktree ${checkout}\nHEAD def456\nbranch refs/heads/volt/test\n` };
+			}
+			return { ok: true };
+		});
+		const manager = createManager(git.runGit);
+		await manager.create(workspace, { id: "registered-force-failure" });
+		mkdirSync(checkout, { recursive: true });
+
+		await expect(manager.remove(workspace, "registered-force-failure", { force: true })).resolves.toMatchObject({
+			ok: false,
+			error: "git_failed",
+		});
+		expect(existsSync(checkout)).toBe(true);
+		expect(await manager.listRecoveryCheckouts()).toEqual([]);
+		expect(await stateManager.listWorktrees("repo")).toHaveLength(1);
 	});
 
 	it("preserves ignored files during non-force removal", async () => {
@@ -1161,6 +1216,57 @@ describe("worktree manager (real git integration)", () => {
 			expect(existsSync(created.worktree.path)).toBe(false);
 			expect(git(["worktree", "list", "--porcelain"])).not.toContain("feature-x");
 			expect(await stateManager.listWorktrees("repo")).toHaveLength(0);
+		} finally {
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("recovers a recorded checkout that Git already unregistered but left on disk", async () => {
+		const agentDir = realpathSync(mkdtempSync(join(tmpdir(), "volt-worktree-partial-force-")));
+		const repoDir = join(agentDir, "repo");
+		mkdirSync(repoDir, { recursive: true });
+		try {
+			const git = (args: string[], cwd: string = repoDir) =>
+				execFileSync("git", args, {
+					cwd,
+					encoding: "utf8",
+					env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+				});
+			git(["init", "--initial-branch=main"]);
+			git(["config", "core.autocrlf", "false"]);
+			git(["config", "core.eol", "lf"]);
+			git(["config", "user.email", "test@example.com"]);
+			git(["config", "user.name", "Test"]);
+			writeFileSync(join(repoDir, "readme.md"), "hello\n");
+			git(["add", "readme.md"]);
+			git(["commit", "-m", "init"]);
+
+			const stateManager = new IrohRemoteHostStateManager({
+				initialState: { workspaces: [{ name: "repo", path: repoDir }], worktrees: [], clients: [] },
+			});
+			const workspace: IrohRemoteWorkspace = { name: "repo", path: repoDir };
+			const manager = new WorktreeManager({
+				agentDir,
+				stateManager,
+				auditLogger: new IrohRemoteAuditLogger(),
+			});
+			const created = await manager.create(workspace, { id: "partial-force" });
+			expect(created.ok).toBe(true);
+			if (!created.ok) return;
+			git(["worktree", "remove", "--force", created.worktree.path]);
+			mkdirSync(join(created.worktree.path, "node_modules"), { recursive: true });
+			writeFileSync(join(created.worktree.path, "node_modules", "generated.txt"), "generated\n");
+
+			await expect(manager.remove(workspace, "partial-force", { force: true })).resolves.toEqual({ ok: true });
+			expect(existsSync(created.worktree.path)).toBe(false);
+			expect(await stateManager.listWorktrees("repo")).toEqual([]);
+			const recoveries = await manager.listRecoveryCheckouts();
+			expect(recoveries).toHaveLength(1);
+			expect(existsSync(join(recoveries[0] ?? "", "node_modules", "generated.txt"))).toBe(true);
+			await expect(manager.prune(workspace, { purgeRecovery: true })).resolves.toMatchObject({
+				purgedRecoveryCheckouts: [expect.stringContaining("partial-force-")],
+			});
+			expect(await manager.listRecoveryCheckouts()).toEqual([]);
 		} finally {
 			rmSync(agentDir, { recursive: true, force: true });
 		}

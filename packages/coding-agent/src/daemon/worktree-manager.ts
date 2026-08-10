@@ -832,7 +832,7 @@ export class WorktreeManager {
 	): Promise<WorktreeResult<Record<never, never>>> {
 		const force = options.force === true;
 		let preservedRecovery = false;
-		let cleanRecoveryPath: string | undefined;
+		let purgeableRecoveryPath: string | undefined;
 		let releaseSessionRemoval: (() => void) | undefined;
 		try {
 			const result = await this.stateManager.runWorkspaceWorktreeLifecycle<WorktreeResult<Record<never, never>>>(
@@ -877,10 +877,55 @@ export class WorktreeManager {
 						}
 						if (force) {
 							const removed = await this.runGit(["worktree", "remove", "--force", record.path], sourceRootPath);
-							if (!removed.ok) {
-								return {
-									result: this.mapGitFailure(removed.stderr, current.workspace, record.path, [sourceRootPath]),
-								};
+							if (existsSync(record.path)) {
+								const listed = await this.runGit(["worktree", "list", "--porcelain"], sourceRootPath);
+								const stillRegistered =
+									listed.ok &&
+									parseWorktreeListEntries(listed.stdout).some((entry) => isSamePath(entry.path, record.path));
+								if (!listed.ok || stillRegistered) {
+									return {
+										result: removed.ok
+											? {
+													ok: false,
+													error: "git_failed",
+													detail: listed.ok
+														? "git reported successful forced removal but the checkout remains registered"
+														: sanitizeGitDetail(listed.stderr, [
+																record.path,
+																current.workspace.path,
+																sourceRootPath,
+																getWorktreesRoot(this.agentDir),
+															]),
+												}
+											: this.mapGitFailure(removed.stderr, current.workspace, record.path, [sourceRootPath]),
+									};
+								}
+								try {
+									purgeableRecoveryPath = await this.quarantineCheckout(record.path, record.id);
+								} catch (error) {
+									const message = error instanceof Error ? error.message : String(error);
+									return {
+										result: {
+											ok: false,
+											error: "git_failed",
+											detail: sanitizeGitDetail(
+												`git unregistered the worktree but its residual checkout could not be quarantined: ${message}`,
+												[
+													record.path,
+													current.workspace.path,
+													sourceRootPath,
+													getWorktreesRoot(this.agentDir),
+												],
+											),
+										},
+									};
+								}
+							}
+							if (!removed.ok || purgeableRecoveryPath !== undefined) {
+								// A failed forced remove may already have removed Git's registration before Windows
+								// refused to delete generated files. Once the path is absent or quarantined, prune
+								// stale gitdir metadata and complete the durable record removal.
+								await this.runGit(["worktree", "prune"], sourceRootPath).catch(() => undefined);
 							}
 						} else {
 							try {
@@ -904,7 +949,7 @@ export class WorktreeManager {
 										worktree: { ...record, path: recoveryPath },
 									};
 								}
-								cleanRecoveryPath = recoveryPath;
+								purgeableRecoveryPath = recoveryPath;
 							} catch (error) {
 								return {
 									result: {
@@ -926,8 +971,8 @@ export class WorktreeManager {
 			if (result.ok || preservedRecovery) {
 				await this.flushState?.();
 			}
-			if (result.ok && cleanRecoveryPath) {
-				await this.markRecoverySafeToPurge(cleanRecoveryPath, workspace.name).catch(() => undefined);
+			if (result.ok && purgeableRecoveryPath) {
+				await this.markRecoverySafeToPurge(purgeableRecoveryPath, workspace.name).catch(() => undefined);
 			}
 			return result;
 		} catch (error) {

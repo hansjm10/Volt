@@ -4,6 +4,7 @@ const MAX_PAGES = 100;
 const PAGE_SIZE = 100;
 const MAX_THREAD_CONTEXT_BYTES = 16 * 1024;
 const MAX_THREAD_COMMENT_BODY_BYTES = 1_400;
+const MAX_VOLT_FINDING_ID_BYTES = 256;
 const MAX_ACTIONS_LOG_BYTES = 32 * 1024;
 const MAX_ANNOTATIONS = 50;
 
@@ -154,12 +155,17 @@ export class GhCliAdapter implements GitHubAdapter {
 				"--repo",
 				repository,
 				"--json",
-				"state,isDraft,isCrossRepository,headRefName,headRefOid,headRepository,baseRefName",
+				"state,isDraft,isCrossRepository,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName",
 			],
 			"gh pr view",
 		);
 		const record = expectRecord(result, "gh pr view");
 		const headRepository = expectRecord(record.headRepository, "PR headRepository");
+		const reportedNameWithOwner = headRepository.nameWithOwner;
+		const headRepositoryName =
+			typeof reportedNameWithOwner === "string" && reportedNameWithOwner.trim().length > 0
+				? reportedNameWithOwner
+				: `${expectString(expectRecord(record.headRepositoryOwner, "PR headRepositoryOwner").login, "PR headRepositoryOwner.login")}/${expectString(headRepository.name, "PR headRepository.name")}`;
 		const identity: PullRequestIdentity = {
 			number: prNumber,
 			state: expectEnum(record.state, "PR state", ["OPEN", "CLOSED", "MERGED"]),
@@ -167,7 +173,7 @@ export class GhCliAdapter implements GitHubAdapter {
 			isCrossRepository: expectBoolean(record.isCrossRepository, "PR isCrossRepository"),
 			headRefName: expectString(record.headRefName, "PR headRefName"),
 			headRefOid: expectSha(record.headRefOid, "PR headRefOid"),
-			headRepository: expectString(headRepository.nameWithOwner, "PR headRepository.nameWithOwner"),
+			headRepository: headRepositoryName,
 			baseRefName: expectString(record.baseRefName, "PR baseRefName"),
 		};
 		assertEligiblePullRequest(identity, repository);
@@ -496,7 +502,11 @@ export function assertEligiblePullRequest(pullRequest: PullRequestIdentity, repo
 
 export function hasSubmittedCurrentHeadReview(snapshot: GitHubSnapshot): boolean {
 	return snapshot.reviews.some(
-		(review) => review.commitOid === snapshot.pullRequest.headRefOid && review.state !== "DISMISSED" && review.state !== "PENDING",
+		(review) =>
+			review.commitOid === snapshot.pullRequest.headRefOid &&
+			review.state !== "DISMISSED" &&
+			review.state !== "PENDING" &&
+			(review.state !== "COMMENTED" || review.body.trim().length > 0 || review.voltRunId !== undefined),
 	);
 }
 
@@ -600,27 +610,45 @@ function parseReviewComment(value: unknown, viewerLogin: string): ReviewComment 
 		record.author === null || record.author === undefined
 			? undefined
 			: expectString(expectRecord(record.author, "comment author").login, "comment author login");
-	const body = boundUtf8(expectStringValue(record.body, "comment body"), MAX_THREAD_COMMENT_BODY_BYTES);
+	const rawBody = expectStringValue(record.body, "comment body");
+	const originalFindingId = author === viewerLogin ? parseOriginalVoltFindingId(rawBody) : undefined;
+	const marker = author === viewerLogin ? parseVoltMarker(rawBody) : undefined;
+	const body = boundReviewCommentBody(rawBody, originalFindingId);
 	return {
 		id: expectString(record.id, "comment id"),
 		...(author === undefined ? {} : { author }),
 		body,
 		createdAt: expectString(record.createdAt, "comment createdAt"),
 		url: expectString(record.url, "comment url"),
-		...(author === viewerLogin && parseVoltMarker(body) ? { marker: parseVoltMarker(body)! } : {}),
+		...(marker ? { marker } : {}),
 	};
+}
+
+function boundReviewCommentBody(body: string, originalFindingId: string | undefined): string {
+	const bounded = boundUtf8(body, MAX_THREAD_COMMENT_BODY_BYTES);
+	if (!originalFindingId || parseOriginalVoltFindingId(bounded) === originalFindingId) return bounded;
+	const suffix = `\nVolt finding: ${originalFindingId}`;
+	const prefixBytes = MAX_THREAD_COMMENT_BODY_BYTES - Buffer.byteLength(suffix, "utf8");
+	return `${boundUtf8(body, prefixBytes)}${suffix}`;
+}
+
+function parseOriginalVoltFindingId(body: string): string | undefined {
+	const match = /(?:^|\n)Volt finding:\s*([^\s]+)\s*(?:\n|$)/.exec(body);
+	const id = match?.[1];
+	if (!id || Buffer.byteLength(id, "utf8") > MAX_VOLT_FINDING_ID_BYTES) return undefined;
+	return /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(id) ? id : undefined;
 }
 
 function finalizeThread(accumulator: ThreadAccumulator): ReviewThread {
 	if (!accumulator.first) throw new Error(`Review thread ${accumulator.thread.id} has no comments`);
 	const comments = [accumulator.first, ...accumulator.latest.filter((comment) => comment.id !== accumulator.first!.id)];
 	const latest = comments[comments.length - 1]!;
-	const originalFindingMatch = /(?:^|\n)Volt finding:\s*([^\s]+)\s*(?:\n|$)/.exec(accumulator.first.body);
+	const originalFindingId = parseOriginalVoltFindingId(accumulator.first.body);
 	const result: ReviewThread = {
 		...accumulator.thread,
 		comments,
 		latestCommentId: latest.id,
-		...(originalFindingMatch ? { originalVoltFindingId: originalFindingMatch[1] } : {}),
+		...(originalFindingId ? { originalVoltFindingId: originalFindingId } : {}),
 	};
 	if (Buffer.byteLength(JSON.stringify(result), "utf8") > MAX_THREAD_CONTEXT_BYTES) {
 		throw new Error(`Bounded review thread ${result.id} exceeded ${MAX_THREAD_CONTEXT_BYTES} bytes`);

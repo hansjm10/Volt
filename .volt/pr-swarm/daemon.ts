@@ -120,7 +120,7 @@ export interface DaemonRuntimeAdapter {
 		baseRef: string;
 	}): Promise<ControlWorktreeStatus>;
 	listWorktrees(workspaceName: string): Promise<ControlWorktreeStatus[]>;
-	removeWorktree(workspaceName: string, worktreeId: string): Promise<void>;
+	removeWorktree(workspaceName: string, worktreeId: string, force?: boolean): Promise<void>;
 	steerSession(sessionId: string, message: string): Promise<boolean>;
 	getWorkspacePath(): string;
 	close(): Promise<void>;
@@ -440,8 +440,13 @@ export class VoltDaemonAdapter implements DaemonRuntimeAdapter {
 		return requireResponseType(response, "worktrees_result").worktrees;
 	}
 
-	async removeWorktree(workspaceName: string, worktreeId: string): Promise<void> {
-		const response = await this.requireDaemon().request({ type: "worktree_remove", workspaceName, worktreeId });
+	async removeWorktree(workspaceName: string, worktreeId: string, force = false): Promise<void> {
+		const response = await this.requireDaemon().request({
+			type: "worktree_remove",
+			workspaceName,
+			worktreeId,
+			...(force ? { force: true } : {}),
+		});
 		requireResponseType(response, "ok");
 	}
 

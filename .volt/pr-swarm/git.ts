@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import type { CommandAdapter } from "./command.ts";
 import { boundUtf8 } from "./github.ts";
@@ -27,6 +28,7 @@ export interface GitAdapter {
 	cherryPick(worktreePath: string, commit: string): Promise<string>;
 	abortCherryPick(worktreePath: string): Promise<void>;
 	currentHead(worktreePath: string): Promise<string>;
+	worktreeExists(worktreePath: string): Promise<boolean>;
 	isClean(worktreePath: string): Promise<boolean>;
 	pushHead(worktreePath: string, remote: string, headRefName: string): Promise<PushResult>;
 	deleteRef(ref: string, expected?: string): Promise<void>;
@@ -141,6 +143,10 @@ export class CommandGitAdapter implements GitAdapter {
 
 	currentHead(worktreePath: string): Promise<string> {
 		return this.revParse(worktreePath, "HEAD");
+	}
+
+	async worktreeExists(worktreePath: string): Promise<boolean> {
+		return existsSync(worktreePath);
 	}
 
 	async isClean(worktreePath: string): Promise<boolean> {
