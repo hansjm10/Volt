@@ -543,6 +543,37 @@
 						},
 						"cacheWrite": {
 							"type": "number"
+						},
+						"tiers": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"required": [
+									"inputTokensAbove",
+									"input",
+									"output",
+									"cacheRead",
+									"cacheWrite"
+								],
+								"properties": {
+									"inputTokensAbove": {
+										"type": "number"
+									},
+									"input": {
+										"type": "number"
+									},
+									"output": {
+										"type": "number"
+									},
+									"cacheRead": {
+										"type": "number"
+									},
+									"cacheWrite": {
+										"type": "number"
+									}
+								},
+								"additionalProperties": false
+							}
 						}
 					},
 					"additionalProperties": false
@@ -5659,6 +5690,37 @@
 						},
 						"cacheWrite": {
 							"type": "number"
+						},
+						"tiers": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"required": [
+									"inputTokensAbove",
+									"input",
+									"output",
+									"cacheRead",
+									"cacheWrite"
+								],
+								"properties": {
+									"inputTokensAbove": {
+										"type": "number"
+									},
+									"input": {
+										"type": "number"
+									},
+									"output": {
+										"type": "number"
+									},
+									"cacheRead": {
+										"type": "number"
+									},
+									"cacheWrite": {
+										"type": "number"
+									}
+								},
+								"additionalProperties": false
+							}
 						}
 					},
 					"additionalProperties": false

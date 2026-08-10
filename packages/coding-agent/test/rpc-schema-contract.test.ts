@@ -1,7 +1,8 @@
-import type { ActiveToolCallState, AssistantMessage, AssistantMessageEvent, Usage } from "@hansjm10/volt-ai";
+import type { ActiveToolCallState, AssistantMessage, AssistantMessageEvent, Model, Usage } from "@hansjm10/volt-ai";
 import type { TSchema } from "typebox";
 import { Compile } from "typebox/compile";
 import { describe, expect, test } from "vitest";
+import { toIrohRemoteAgentOptionsCatalogModel } from "../src/core/remote/iroh/agent-options.ts";
 import { RPC_COMMAND_SCHEMAS } from "../src/core/rpc/schema/commands.ts";
 import {
 	RpcConversationBootstrapEventSchema,
@@ -18,11 +19,12 @@ import {
 	RpcHostActionUpdateSchema,
 	RpcModelsChangedEventSchema,
 } from "../src/core/rpc/schema/events.ts";
-import { RpcApiSchema } from "../src/core/rpc/schema/external.ts";
+import { RpcApiSchema, RpcModelSchema } from "../src/core/rpc/schema/external.ts";
 import { RpcGitContextSchema } from "../src/core/rpc/schema/git-context.ts";
 import { RpcPlanningStateChangedEventSchema } from "../src/core/rpc/schema/planning.ts";
 import { RpcWorkflowEventSchema } from "../src/core/rpc/schema/projections.ts";
 import { RPC_RESPONSE_SCHEMAS, RpcErrorResponseSchema } from "../src/core/rpc/schema/responses.ts";
+import { RpcCatalogModelSchema } from "../src/core/rpc/schema/session.ts";
 import { UiActionCapabilityFeatureSchema, UiActionDescriptorSchema } from "../src/core/rpc/schema/ui-actions.ts";
 import { projectRpcQueueUpdate } from "../src/core/rpc/session-state.ts";
 import { StreamProjector } from "../src/core/rpc/stream-projection.ts";
@@ -90,6 +92,83 @@ describe("RPC contract schema integrity", () => {
 			expect(check(schema, "some-novel-value.v9")).toBe(true);
 			expect(check(schema, 7)).toBe(false);
 		}
+	});
+
+	test("model cost tiers validate through model-bearing RPC schemas", () => {
+		const tier = {
+			inputTokensAbove: 272_000,
+			input: 5,
+			output: 22.5,
+			cacheRead: 0.5,
+			cacheWrite: 0,
+		};
+		const tieredModel: Model<"openai-responses"> = {
+			id: "gpt-5.4",
+			name: "GPT-5.4",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: {
+				input: 2.5,
+				output: 15,
+				cacheRead: 0.25,
+				cacheWrite: 0,
+				tiers: [tier],
+			},
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+		};
+		const untieredModel: Model<"openai-responses"> = {
+			...tieredModel,
+			id: "gpt-5.4-mini",
+			name: "GPT-5.4 mini",
+			cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
+		};
+		const catalogModel = toIrohRemoteAgentOptionsCatalogModel(tieredModel);
+
+		expect(check(RpcModelSchema, tieredModel)).toBe(true);
+		expect(check(RpcModelSchema, untieredModel)).toBe(true);
+		expect(check(RpcCatalogModelSchema, catalogModel)).toBe(true);
+		expect(catalogModel.cost.tiers).toEqual([tier]);
+		expect(
+			check(RPC_RESPONSE_SCHEMAS.get_available_models, {
+				type: "response",
+				command: "get_available_models",
+				success: true,
+				data: { models: [catalogModel] },
+			}),
+		).toBe(true);
+		expect(
+			check(RPC_RESPONSE_SCHEMAS.get_agent_options, {
+				type: "response",
+				command: "get_agent_options",
+				success: true,
+				data: {
+					workspaceName: "workspace",
+					models: [catalogModel],
+					defaultConfig: {
+						model: { provider: catalogModel.provider, modelId: catalogModel.id },
+						thinkingLevel: "off",
+						fastModeEnabled: false,
+						agentMode: "build",
+					},
+				},
+			}),
+		).toBe(true);
+		expect(
+			check(RpcModelSchema, {
+				...tieredModel,
+				cost: { ...tieredModel.cost, unexpected: true },
+			}),
+		).toBe(false);
+		expect(
+			check(RpcModelSchema, {
+				...tieredModel,
+				cost: { ...tieredModel.cost, tiers: [{ ...tier, unexpected: true }] },
+			}),
+		).toBe(false);
 	});
 
 	test("requires usable correlation for every invoke_ui_action response", () => {

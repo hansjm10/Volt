@@ -152,6 +152,17 @@ const modelThinkingLevelMapSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
+const rpcModelCostTierSchema = Type.Object(
+	{
+		inputTokensAbove: Type.Number(),
+		input: Type.Number(),
+		output: Type.Number(),
+		cacheRead: Type.Number(),
+		cacheWrite: Type.Number(),
+	},
+	{ additionalProperties: false },
+);
+
 /**
  * Shared properties of the model catalog entry. `compat` is deliberately
  * opaque: ~27 provider-tuning fields that clients never interpret.
@@ -171,6 +182,7 @@ export const rpcModelProperties = {
 			output: Type.Number(),
 			cacheRead: Type.Number(),
 			cacheWrite: Type.Number(),
+			tiers: Type.Optional(Type.Array(rpcModelCostTierSchema)),
 		},
 		{ additionalProperties: false },
 	),
