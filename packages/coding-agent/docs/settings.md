@@ -79,7 +79,9 @@ In interactive mode, run `/settings` and change **Personality**. The selection a
 | `defaultProvider` | string | - | Default provider (e.g., `"anthropic"`, `"openai"`) |
 | `defaultModel` | string | - | Default model ID |
 | `defaultThinkingLevel` | string | - | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
-| `reviewModel` | string | - | Model for `/review` (e.g. `"anthropic/claude-opus-4-5"`); falls back to the session model |
+| `reviewModel` | string | - | Discovery model for `/review`; falls back to the session model |
+| `reviewVerifierModel` | string | - | Independent verifier model for `/review`; falls back to `reviewModel` |
+| `reviewTools` | string[] | `[]` | Optional auxiliary review tools; immutable snapshot tools are always enabled |
 | `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
 

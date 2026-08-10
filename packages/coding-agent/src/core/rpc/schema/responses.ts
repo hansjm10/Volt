@@ -319,6 +319,47 @@ export const RPC_RESPONSE_SCHEMAS = {
 	get_review_result: dataResponse("get_review_result", RpcReviewWorkflowResultResponseSchema),
 	list_review_workflows: dataResponse("list_review_workflows", RpcReviewWorkflowListResponseSchema),
 	open_review_session: dataResponse("open_review_session", cancelledDataSchema),
+	record_review_finding_outcome: dataResponse(
+		"record_review_finding_outcome",
+		Type.Object(
+			{
+				runId: Type.String(),
+				findingId: Type.String(),
+				status: Type.String(),
+				reason: Type.Optional(Type.String()),
+				note: Type.Optional(Type.String()),
+				createdAt: Type.Number(),
+			},
+			{ additionalProperties: false },
+		),
+	),
+	rerun_review: dataResponse(
+		"rerun_review",
+		Type.Object({ status: Type.Literal("accepted"), workflowId: Type.String() }, { additionalProperties: false }),
+	),
+	publish_review: dataResponse(
+		"publish_review",
+		Type.Object(
+			{
+				reviewId: Type.Optional(Type.Number()),
+				url: Type.Optional(Type.String()),
+				inlineFindingIds: Type.Array(Type.String()),
+				summaryOnlyFindingIds: Type.Array(Type.String()),
+			},
+			{ additionalProperties: false },
+		),
+	),
+	export_review_feedback: dataResponse(
+		"export_review_feedback",
+		Type.Object(
+			{
+				schemaVersion: Type.Literal(1),
+				exportedAt: Type.String(),
+				outcomes: Type.Array(Type.Record(Type.String(), Type.Unknown())),
+			},
+			{ additionalProperties: false },
+		),
+	),
 
 	// Push notifications
 	register_push_target: dataResponse("register_push_target", RpcRegisterPushTargetResponseSchema),

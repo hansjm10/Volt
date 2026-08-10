@@ -250,13 +250,29 @@ function validateConversationIdentifierResourceBound(
 	command: Record<string, unknown>,
 	field: string,
 ): string | undefined {
-	const value = command[field];
+	return validateConversationIdentifierValueResourceBound(command[field], field);
+}
+
+function validateConversationIdentifierValueResourceBound(value: unknown, field: string): string | undefined {
 	if (typeof value !== "string") return undefined;
 	if (value !== value.trim()) {
 		return `${ERROR_PREFIX}: "${field}" must not contain surrounding whitespace`;
 	}
 	if (Buffer.byteLength(value, "utf8") <= RPC_CONVERSATION_IDENTIFIER_MAX_UTF8_BYTES) return undefined;
 	return `${ERROR_PREFIX}: "${field}" exceeds the ${RPC_CONVERSATION_IDENTIFIER_MAX_UTF8_BYTES}-byte UTF-8 limit`;
+}
+
+function validateConversationIdentifierArrayResourceBounds(
+	command: Record<string, unknown>,
+	field: string,
+): string | undefined {
+	const values = command[field];
+	if (!Array.isArray(values)) return undefined;
+	for (let index = 0; index < values.length; index++) {
+		const error = validateConversationIdentifierValueResourceBound(values[index], `${field}[${index}]`);
+		if (error) return error;
+	}
+	return undefined;
 }
 
 const RPC_CONVERSATION_AUTHORITY_FIELDS = ["sessionId", "subscriptionId", "branchEpoch"] as const;
@@ -309,9 +325,21 @@ function validateLayeredResourceBounds(type: RpcCommandSchemaKey, command: Recor
 		case "invoke_ui_action":
 			return validateConversationIdentifierResourceBound(command, "id");
 		case "cancel_workflow":
-		case "get_review_result":
-		case "open_review_session":
 			return validateConversationIdentifierResourceBound(command, "workflowId");
+		case "get_review_result":
+		case "rerun_review":
+		case "publish_review":
+			return validateConversationIdentifierResourceBound(command, "runId");
+		case "open_review_session":
+			return (
+				validateConversationIdentifierResourceBound(command, "runId") ??
+				validateConversationIdentifierArrayResourceBounds(command, "findingIds")
+			);
+		case "record_review_finding_outcome":
+			return (
+				validateConversationIdentifierResourceBound(command, "runId") ??
+				validateConversationIdentifierResourceBound(command, "findingId")
+			);
 		case "get_transcript":
 			return validateConversationIdentifierResourceBound(command, "branchEpoch");
 		default:

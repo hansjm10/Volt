@@ -2349,6 +2349,24 @@ export class SessionManager {
 		);
 	}
 
+	/** Explicitly materialize the current canonical session and wait for its durability boundary. */
+	async materialize(): Promise<void> {
+		this._assertPersistenceHealthy();
+		if (this.atomicAppendEntries || this.atomicAppendInFlight) {
+			throw new Error("Cannot materialize a session during an atomic append");
+		}
+		if (!this.persist || !this.sessionFile) return;
+
+		const filePath = this.sessionFile;
+		if (!this.flushed) {
+			this._createFile();
+			this.flushed = true;
+		} else {
+			this._enqueuePersistence(() => serializeSessionFileOperation(filePath, () => syncDurableFile(filePath)));
+		}
+		await this.persistenceWatermark;
+	}
+
 	/** Wait for every filesystem operation accepted before this call. */
 	flush(): Promise<void> {
 		return this.persistenceWatermark;

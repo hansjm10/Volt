@@ -141,19 +141,34 @@ const invalidPayloadCases: Array<{ name: string; payload: unknown; error: string
 		error: 'Invalid RPC command payload: "args" must be an object',
 	},
 	{
-		name: "rejects review workflow commands without a workflowId",
+		name: "rejects cancellation commands without a workflowId",
 		payload: { type: "cancel_workflow" },
 		error: 'Invalid RPC command payload: "workflowId" is required',
 	},
 	{
-		name: "rejects review workflow commands with an empty workflowId",
-		payload: { type: "get_review_result", workflowId: "   " },
-		error: 'Invalid RPC command payload: "workflowId" must be a non-empty string',
+		name: "rejects review workflow commands with an empty runId",
+		payload: { type: "get_review_result", runId: "   " },
+		error: 'Invalid RPC command payload: "runId" must be a non-empty string',
 	},
 	{
-		name: "rejects review workflow ids beyond the identifier byte bound",
-		payload: { type: "open_review_session", workflowId: "w".repeat(300) },
-		error: 'Invalid RPC command payload: "workflowId" exceeds the 256-byte UTF-8 limit',
+		name: "rejects review run ids beyond the identifier byte bound",
+		payload: { type: "open_review_session", runId: "r".repeat(300) },
+		error: 'Invalid RPC command payload: "runId" exceeds the 256-byte UTF-8 limit',
+	},
+	{
+		name: "rejects review finding id arrays beyond the identifier byte bound",
+		payload: { type: "open_review_session", runId: "review:one", findingIds: ["f".repeat(300)] },
+		error: 'Invalid RPC command payload: "findingIds[0]" exceeds the 256-byte UTF-8 limit',
+	},
+	{
+		name: "rejects review finding ids beyond the identifier byte bound",
+		payload: {
+			type: "record_review_finding_outcome",
+			runId: "review:one",
+			findingId: "f".repeat(300),
+			status: "accepted",
+		},
+		error: 'Invalid RPC command payload: "findingId" exceeds the 256-byte UTF-8 limit',
 	},
 	{
 		name: "rejects incomplete push target registrations",
@@ -304,8 +319,23 @@ describe("RPC command payload validation", () => {
 		expect(validateRpcCommandPayload({ type: "future_command", message: 1 })).toBeUndefined();
 		expect(validateRpcCommandPayload({ type: "set_thinking_level", level: "max" })).toBeUndefined();
 		expect(validateRpcCommandPayload({ type: "cancel_workflow", workflowId: "review:one" })).toBeUndefined();
-		expect(validateRpcCommandPayload({ type: "get_review_result", workflowId: "review:one" })).toBeUndefined();
-		expect(validateRpcCommandPayload({ type: "open_review_session", workflowId: "review:one" })).toBeUndefined();
+		expect(validateRpcCommandPayload({ type: "get_review_result", runId: "review:one" })).toBeUndefined();
+		expect(
+			validateRpcCommandPayload({ type: "open_review_session", runId: "review:one", findingIds: ["finding:one"] }),
+		).toBeUndefined();
+		expect(
+			validateRpcCommandPayload({
+				type: "record_review_finding_outcome",
+				runId: "review:one",
+				findingId: "finding:one",
+				status: "accepted",
+			}),
+		).toBeUndefined();
+		expect(validateRpcCommandPayload({ type: "rerun_review", runId: "review:one" })).toBeUndefined();
+		expect(
+			validateRpcCommandPayload({ type: "publish_review", runId: "review:one", confirmed: true }),
+		).toBeUndefined();
+		expect(validateRpcCommandPayload({ type: "export_review_feedback" })).toBeUndefined();
 		expect(validateRpcCommandPayload({ type: "list_review_workflows" })).toBeUndefined();
 		expect(
 			validateRpcCommandPayload({

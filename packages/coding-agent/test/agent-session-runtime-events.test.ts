@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@hansjm10/volt-ai";
@@ -12,6 +12,7 @@ import {
 	createAgentSessionServices,
 } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import { appendReviewRun, getReviewRun, type ReviewRunRecord } from "../src/core/review-state.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import type { BashOperations } from "../src/core/tools/bash.ts";
 import type {
@@ -219,6 +220,105 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		expect(rebind).not.toHaveBeenCalled();
 		expect(replaced).not.toHaveBeenCalled();
 		detach();
+	});
+
+	it("rejects replacement until originating review persistence is released", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => {});
+		await runtimeHost.session.prompt("materialize review origin");
+		const originatingSession = runtimeHost.session;
+		const originatingManager = originatingSession.sessionManager;
+		const originatingFile = originatingSession.sessionFile;
+		expect(originatingFile).toBeDefined();
+		await originatingManager.flush();
+		const originatingEntries = originatingManager.getEntries();
+		const originatingLeaf = originatingManager.getLeafId();
+		const originatingSessionFiles = readdirSync(originatingManager.getSessionDir()).sort();
+		const forkEntry = originatingEntries.find(
+			(entry) => entry.type === "message" && entry.message.role === "assistant",
+		);
+		expect(forkEntry).toBeDefined();
+		const disposeForReplacement = vi.spyOn(originatingSession, "disposeForSessionReplacement");
+		const record: ReviewRunRecord = {
+			schemaVersion: 1,
+			runId: "review:replacement-persistence",
+			workflowAction: "review.uncommitted",
+			status: "completed",
+			startedAt: 1,
+			endedAt: 2,
+			target: {
+				description: "uncommitted changes",
+				diffCommand: "git diff exact-base..exact-head",
+				identity: { kind: "uncommitted", baseTree: "base-tree", headTree: "head-tree" },
+				files: [],
+			},
+			options: { scope: [], effort: "standard", includeOptional: false, scopeMode: "incremental" },
+			result: {
+				completionStatus: "complete",
+				summary: "No verified findings.",
+				findings: [],
+				coverage: {
+					changedFileInventoryComplete: true,
+					filesInspected: [],
+					hunksInspected: [],
+					commandsRun: [],
+					failedVerificationAttempts: [],
+					exclusions: [],
+					uncheckedAreas: [],
+					residualRisk: [],
+					modelReportedLimitations: [],
+				},
+				overallCorrectness: "correct",
+				overallExplanation: "The detached review completed against its immutable snapshot.",
+			},
+		};
+		let releaseReview = (): void => {};
+		const reviewGate = new Promise<void>((resolve) => {
+			releaseReview = resolve;
+		});
+		const workflow = runtimeHost.reviewWorkflows.start({
+			prepared: {
+				workflowId: record.runId,
+				action: record.workflowAction,
+				resolution: {
+					description: record.target.description,
+					diffCommand: record.target.diffCommand,
+				},
+			},
+			execute: async () => {
+				await reviewGate;
+				appendReviewRun(originatingManager, record);
+				await originatingManager.flush();
+				return {
+					status: "completed",
+					raw: record.result!.summary,
+					parsed: record.result!,
+					findingsCount: record.result!.findings.length,
+					completionStatus: record.result!.completionStatus,
+					record,
+				};
+			},
+		});
+		workflow.launch();
+
+		await expect(runtimeHost.switchSession(originatingFile!)).resolves.toEqual({
+			cancelled: false,
+			seeded: false,
+		});
+		const activeReviewError =
+			"Cannot change sessions while a detached review is active; cancel or wait for it to finish";
+		await expect(runtimeHost.fork(forkEntry!.id, { position: "at" })).rejects.toThrow(activeReviewError);
+		await expect(runtimeHost.newSession()).rejects.toThrow(activeReviewError);
+		expect(runtimeHost.session).toBe(originatingSession);
+		expect(disposeForReplacement).not.toHaveBeenCalled();
+		expect(originatingManager.getEntries()).toEqual(originatingEntries);
+		expect(originatingManager.getLeafId()).toBe(originatingLeaf);
+		expect(readdirSync(originatingManager.getSessionDir()).sort()).toEqual(originatingSessionFiles);
+
+		releaseReview();
+		await runtimeHost.reviewWorkflows.waitForIdle();
+		await expect(runtimeHost.newSession()).resolves.toEqual({ cancelled: false, seeded: false });
+		expect(disposeForReplacement).toHaveBeenCalledOnce();
+		expect(getReviewRun(SessionManager.open(originatingFile!), record.runId)).toEqual(record);
 	});
 
 	it("rejects session replacement and fork commands while an agent run owns the persistence leaf", async () => {
