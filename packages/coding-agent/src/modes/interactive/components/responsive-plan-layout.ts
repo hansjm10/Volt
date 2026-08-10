@@ -160,7 +160,7 @@ export class ResponsivePlanLayoutComponent extends Container {
 		const split = dimensions !== undefined;
 		const resetCommittedTranscript = this.lastSplit !== true || this.lastWidth !== width || this.lastRows !== rows;
 		if (this.lastSplit !== undefined && this.lastSplit !== split) {
-			this.onSplitChange(split, this.lastWidth === width && this.lastRows === rows);
+			this.onSplitChange(split, this.lastWidth === width);
 		}
 		this.lastSplit = split;
 		this.lastWidth = width;

@@ -1373,7 +1373,7 @@ export class TUI extends Container {
 			return;
 		}
 
-		if (resetViewport && !widthChanged && !heightChanged) {
+		if (resetViewport && !widthChanged && (!heightChanged || isTermuxSession())) {
 			logRedraw("requested viewport reset preserving scrollback");
 			fullRender(true, true);
 			return;

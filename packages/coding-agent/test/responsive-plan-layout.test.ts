@@ -55,6 +55,23 @@ class LoggingVirtualTerminal extends VirtualTerminal {
 	}
 }
 
+async function withEnv<T>(updates: Record<string, string | undefined>, run: () => Promise<T>): Promise<T> {
+	const previousValues = new Map<string, string | undefined>();
+	for (const [key, value] of Object.entries(updates)) {
+		previousValues.set(key, process.env[key]);
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	try {
+		return await run();
+	} finally {
+		for (const [key, value] of previousValues) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+}
+
 function plan(phase: PlanState["phase"] = "active"): PlanState {
 	const execution =
 		phase === "active" || phase === "completed" || phase === "handed_off"
@@ -91,6 +108,7 @@ function createLayout(options: {
 	footer?: Component;
 	actions?: PlanDetailsAction[];
 	requestViewportReset?: () => void;
+	onSplitChange?: (split: boolean, preserveScrollback: boolean) => void;
 }) {
 	let rows = options.rows;
 	const planning = options.planning ?? { mode: "build", plan: plan() };
@@ -118,6 +136,7 @@ function createLayout(options: {
 		onSplitChange: (split, preserveScrollback) => {
 			splitChanges.push(split);
 			preserveScrollbackChanges.push(preserveScrollback);
+			options.onSplitChange?.(split, preserveScrollback);
 		},
 	});
 	return {
@@ -540,7 +559,50 @@ describe("ResponsivePlanLayoutComponent", () => {
 		expect(output).toContain("Remaining work");
 	});
 
-	it("reports resize transitions without requesting state-only scrollback preservation", () => {
+	it("preserves Termux scrollback when a row resize crosses the split breakpoint", async () => {
+		await withEnv({ TERMUX_VERSION: "1" }, async () => {
+			const columns = 129;
+			const transcript = new LinesComponent(Array.from({ length: 40 }, (_, index) => `message-${index + 1}`));
+			const compactStatus = new LinesComponent(["COMPACT_PLAN_STATUS"]);
+			const editor = new LinesComponent(["EDITOR"]);
+			const terminal = new LoggingVirtualTerminal(columns, 24);
+			terminal.write("SHELL_SENTINEL\r\n");
+			const tui = new TUI(terminal);
+			const { layout, setRows } = createLayout({
+				columns,
+				rows: 24,
+				transcript,
+				controls: [editor],
+				compact: [transcript, compactStatus, editor],
+				onSplitChange: (_split, preserveScrollback) => {
+					if (preserveScrollback) tui.resetViewportOnNextRender();
+				},
+			});
+			tui.addChild(layout);
+			tui.start();
+			try {
+				await terminal.waitForRender();
+				expect(terminal.getViewport().map(stripAnsi).join("\n")).not.toContain("COMPACT_PLAN_STATUS");
+				terminal.clearWrites();
+
+				setRows(23);
+				terminal.resize(columns, 23);
+				await terminal.waitForRender();
+
+				const writes = terminal.getWrites();
+				const viewport = terminal.getViewport().map(stripAnsi).join("\n");
+				expect(writes).toContain("\x1b[2J\x1b[H");
+				expect(writes).not.toContain("\x1b[3J");
+				expect(viewport).toContain("COMPACT_PLAN_STATUS");
+				expect(viewport).toContain("message-40");
+				expect(terminal.getScrollBuffer().map(stripAnsi).join("\n")).toContain("SHELL_SENTINEL");
+			} finally {
+				tui.stop();
+			}
+		});
+	});
+
+	it("requests scrollback preservation for row-only layout transitions", () => {
 		const { layout, setRows, splitChanges, preserveScrollbackChanges } = createLayout({
 			columns: 129,
 			rows: 24,
@@ -549,6 +611,15 @@ describe("ResponsivePlanLayoutComponent", () => {
 		setRows(23);
 		layout.render(129);
 		setRows(24);
+		layout.render(129);
+		expect(splitChanges).toEqual([false, true]);
+		expect(preserveScrollbackChanges).toEqual([true, true]);
+	});
+
+	it("does not request scrollback preservation for width-triggered layout transitions", () => {
+		const { layout, splitChanges, preserveScrollbackChanges } = createLayout({ columns: 129, rows: 24 });
+		layout.render(129);
+		layout.render(128);
 		layout.render(129);
 		expect(splitChanges).toEqual([false, true]);
 		expect(preserveScrollbackChanges).toEqual([false, false]);
