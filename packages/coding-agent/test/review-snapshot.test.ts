@@ -146,6 +146,22 @@ describe("review snapshots", () => {
 	});
 
 	it.runIf(process.platform === "win32")(
+		"ignores untracked NUL device paths while capturing unrelated changes",
+		async () => {
+			const repository = createRepository();
+			writeFileSync(join(repository, "NUL"), "discarded shell output\n");
+			writeFileSync(join(repository, "other.txt"), "uncommitted\n");
+
+			const snapshot = await resolve({ kind: "uncommitted" }, repository);
+			expect(snapshot.changedFiles.map(({ path, status }) => ({ path, status }))).toEqual([
+				{ path: "other.txt", status: "added" },
+			]);
+			expect((await readAvailableFile(snapshot, "head", "other.txt")).content.toString()).toBe("uncommitted\n");
+			expect(readFileSync(join(repository, "NUL"), "utf8")).toBe("discarded shell output\n");
+		},
+	);
+
+	it.runIf(process.platform === "win32")(
 		"captures unrelated changes when the index contains case-only aliases",
 		async () => {
 			const repository = createRepository(false);
