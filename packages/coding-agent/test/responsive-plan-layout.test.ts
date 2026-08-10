@@ -1,6 +1,7 @@
 import { setKeybindings, visibleWidth } from "@hansjm10/volt-tui";
 import { beforeAll, describe, expect, it } from "vitest";
-import type { Component } from "../../tui/src/tui.ts";
+import { type Component, TUI } from "../../tui/src/tui.ts";
+import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { PlanningState, PlanState } from "../src/core/planning.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
@@ -35,6 +36,23 @@ class FullWidthFooter implements Component {
 	}
 
 	invalidate(): void {}
+}
+
+class LoggingVirtualTerminal extends VirtualTerminal {
+	private writes: string[] = [];
+
+	override write(data: string): void {
+		this.writes.push(data);
+		super.write(data);
+	}
+
+	getWrites(): string {
+		return this.writes.join("");
+	}
+
+	clearWrites(): void {
+		this.writes = [];
+	}
 }
 
 function plan(phase: PlanState["phase"] = "active"): PlanState {
@@ -226,6 +244,62 @@ describe("ResponsivePlanLayoutComponent", () => {
 			}
 			previous = current;
 		}
+	});
+
+	it("preserves committed history when the working loader disappears", async () => {
+		const columns = 160;
+		const rows = 24;
+		const transcript = new LinesComponent(Array.from({ length: 40 }, (_, index) => `message-${index + 1}`));
+		const workingLoader = new LinesComponent(["WORKING"]);
+		const editor = new LinesComponent(["EDITOR"]);
+		const { layout } = createLayout({
+			columns,
+			rows,
+			transcript,
+			controls: [workingLoader, editor],
+		});
+		const initialLines = layout.render(columns);
+		const historicalRows = initialLines.length - rows;
+		const committedHistory = initialLines.slice(0, historicalRows);
+		const terminal = new LoggingVirtualTerminal(columns, rows);
+		terminal.write("SHELL_SENTINEL\r\n");
+		const tui = new TUI(terminal);
+		tui.addChild(layout);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			const initialFullRedraws = tui.fullRedraws;
+			terminal.clearWrites();
+
+			workingLoader.lines = [];
+			tui.requestRender();
+			await terminal.waitForRender();
+
+			const currentLines = layout.render(columns);
+			expect(currentLines).toHaveLength(initialLines.length);
+			expect(currentLines.slice(0, historicalRows)).toEqual(committedHistory);
+			expect(tui.fullRedraws).toBe(initialFullRedraws);
+			expect(terminal.getWrites()).not.toContain("\x1b[3J");
+			expect(terminal.getScrollBuffer().join("\n")).toContain("SHELL_SENTINEL");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps the live transcript tail visible when rendered rows contract", () => {
+		const columns = 160;
+		const rows = 24;
+		const transcript = new LinesComponent(Array.from({ length: 40 }, (_, index) => `message-${index + 1}`));
+		const editor = new LinesComponent(["EDITOR"]);
+		const { layout } = createLayout({ columns, rows, transcript, controls: [editor] });
+		expect(layout.render(columns).length).toBeGreaterThan(rows);
+
+		transcript.lines = Array.from({ length: 5 }, (_, index) => `collapsed-message-${index + 1}`);
+		const viewport = layout.render(columns).slice(-rows).map(stripAnsi);
+		const newestLine = viewport.find((line) => line.includes("collapsed-message-5"));
+
+		expect(newestLine).toBeDefined();
+		expect(newestLine).toContain(usesAsciiPlanMarkers() ? "|" : "\u2502");
 	});
 
 	it("renders extensions at conversation width and a custom footer at full width", () => {

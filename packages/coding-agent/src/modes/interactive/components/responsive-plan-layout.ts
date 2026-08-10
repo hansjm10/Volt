@@ -75,8 +75,8 @@ function protectedImageRows(lines: readonly string[]): Set<number> {
 	return rows;
 }
 
-function safeTailStart(lines: readonly string[], maximumRows: number): number {
-	let start = Math.max(0, lines.length - Math.max(0, maximumRows));
+function safeTailStart(lines: readonly string[], maximumRows: number, minimumStart = 0): number {
+	let start = Math.min(lines.length, Math.max(minimumStart, lines.length - Math.max(0, maximumRows)));
 	for (const block of getImageBlocks(lines)) {
 		if (start > block.start && start <= block.end) {
 			start = block.end + 1;
@@ -111,6 +111,8 @@ export class ResponsivePlanLayoutComponent extends Container {
 	private lastSplit: boolean | undefined;
 	private lastWidth: number | undefined;
 	private lastRows: number | undefined;
+	private committedTranscriptStart: number | undefined;
+	private previousTranscriptRows: number | undefined;
 
 	constructor(options: {
 		planning: PlanningState;
@@ -152,6 +154,7 @@ export class ResponsivePlanLayoutComponent extends Container {
 		const rows = this.getTerminalRows();
 		const dimensions = getResponsivePlanDimensions(width, rows, this.planning);
 		const split = dimensions !== undefined;
+		const resetCommittedTranscript = this.lastSplit !== true || this.lastWidth !== width || this.lastRows !== rows;
 		if (this.lastSplit !== undefined && this.lastSplit !== split) {
 			this.onSplitChange(split, this.lastWidth === width && this.lastRows === rows);
 		}
@@ -160,7 +163,13 @@ export class ResponsivePlanLayoutComponent extends Container {
 		this.lastRows = rows;
 		const footerLines = this.footer.render(width);
 		if (!dimensions) {
+			this.committedTranscriptStart = undefined;
+			this.previousTranscriptRows = undefined;
 			return [...renderComponents(this.compactComponents, width), ...footerLines];
+		}
+		if (resetCommittedTranscript) {
+			this.committedTranscriptStart = undefined;
+			this.previousTranscriptRows = undefined;
 		}
 
 		const mainRows = Math.max(0, rows - footerLines.length);
@@ -170,7 +179,12 @@ export class ResponsivePlanLayoutComponent extends Container {
 		const controlStart = safeTailStart(controls, mainRows);
 		const visibleControls = controls.slice(controlStart);
 		const transcriptRows = Math.max(0, mainRows - visibleControls.length);
-		const transcriptStart = safeTailStart(transcript, transcriptRows);
+		if (this.previousTranscriptRows !== undefined && transcript.length < this.previousTranscriptRows) {
+			this.committedTranscriptStart = undefined;
+		}
+		const transcriptStart = safeTailStart(transcript, transcriptRows, this.committedTranscriptStart);
+		this.committedTranscriptStart = transcriptStart;
+		this.previousTranscriptRows = transcript.length;
 		const historicalTranscript = transcript.slice(0, transcriptStart);
 		const visibleTranscript = transcript.slice(transcriptStart);
 		const padding = Array.from({ length: Math.max(0, transcriptRows - visibleTranscript.length) }, () => "");
