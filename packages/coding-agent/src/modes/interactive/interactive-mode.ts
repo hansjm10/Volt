@@ -4709,7 +4709,13 @@ export class InteractiveMode {
 	private getConversationFocusTarget(): Component {
 		const saved = this.planPaneReturnFocus;
 		if (saved && this.editorContainer.children.includes(saved)) return saved;
-		return this.extensionSelector ?? this.extensionInput ?? this.extensionEditor ?? (this.editor as Component);
+		return (
+			this.extensionSelector ??
+			this.extensionInput ??
+			this.extensionEditor ??
+			this.editorContainer.children[0] ??
+			(this.editor as Component)
+		);
 	}
 
 	private focusPlanInspector(): void {
