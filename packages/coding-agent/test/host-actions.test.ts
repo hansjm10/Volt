@@ -573,6 +573,8 @@ function createCompletedReviewResult(
 			diffCommand: "git diff HEAD",
 			readFile: async () => undefined,
 			listFiles: async () => [],
+			inspectSearch: async () => ({ entries: [] }),
+			gitGrep: async () => [],
 			materializeSearch: async () => ({
 				directory: "/tmp/review-search",
 				entries: [],

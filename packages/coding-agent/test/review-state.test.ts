@@ -141,6 +141,8 @@ function snapshot(headOid: string, hunkId = "hunk-1"): ReviewSnapshot {
 		root: "/tmp/review",
 		readFile: async () => undefined,
 		listFiles: async () => [],
+		inspectSearch: async () => ({ entries: [] }),
+		gitGrep: async () => [],
 		materializeSearch: async () => ({
 			directory: "/tmp/review-search",
 			entries: [],

@@ -106,6 +106,7 @@ export interface ReviewSnapshotListOptions {
 
 export interface ReviewSnapshotSearchEntry {
 	path: string;
+	mode?: string;
 	lineCount?: number;
 	ascii?: boolean;
 	skippedReason?: string;
@@ -118,6 +119,24 @@ export interface ReviewSnapshotSearchMaterialization {
 	materializedBytes: number;
 }
 
+export interface ReviewSnapshotSearchManifest {
+	entries: ReviewSnapshotSearchEntry[];
+}
+
+export interface ReviewSnapshotGitGrepMatch {
+	path: string;
+	line: number;
+	text: string;
+}
+
+export interface ReviewSnapshotGitGrepOptions {
+	revision: ReviewSnapshotRevision;
+	query: string;
+	prefix?: string;
+	ignoreCase?: boolean;
+	signal?: AbortSignal;
+}
+
 export interface ReviewSnapshot {
 	description: string;
 	workflowDescription?: string;
@@ -128,6 +147,8 @@ export interface ReviewSnapshot {
 	root: string;
 	readFile(revision: ReviewSnapshotRevision, path: string): Promise<ReviewSnapshotFile | undefined>;
 	listFiles(options?: ReviewSnapshotListOptions): Promise<ReviewSnapshotTreeEntry[]>;
+	inspectSearch(revision: ReviewSnapshotRevision): Promise<ReviewSnapshotSearchManifest>;
+	gitGrep(options: ReviewSnapshotGitGrepOptions): Promise<ReviewSnapshotGitGrepMatch[]>;
 	materializeSearch(revision: ReviewSnapshotRevision): Promise<ReviewSnapshotSearchMaterialization>;
 	materializeHead(): Promise<string>;
 	dispose(): Promise<void>;
@@ -162,6 +183,7 @@ interface CommandResult {
 	ok: boolean;
 	stdout: Buffer;
 	stderr: string;
+	exitCode?: number | null;
 	failure?: CommandOutputLimitFailure;
 }
 
@@ -355,13 +377,14 @@ function runCommand(
 		});
 		proc.on("close", (code) => {
 			if (failure) {
-				finish({ ok: false, stdout: Buffer.alloc(0), stderr: "", failure });
+				finish({ ok: false, stdout: Buffer.alloc(0), stderr: "", exitCode: code, failure });
 				return;
 			}
 			finish({
 				ok: code === 0,
 				stdout: Buffer.concat(stdout, stdoutBytes),
 				stderr: Buffer.concat(stderr, stderrBytes).toString("utf8"),
+				exitCode: code,
 			});
 		});
 		if (options.input !== undefined) proc.stdin?.end(options.input);
@@ -817,6 +840,46 @@ function parseTree(stdout: Buffer): Map<string, ReviewSnapshotTreeEntry> {
 	return entries;
 }
 
+function parseGitGrepPath(value: string, tree: string): string {
+	const prefix = `${tree}:`;
+	if (!value.startsWith(prefix)) throw new Error(`Unexpected git grep path outside tree ${tree}.`);
+	return value.slice(prefix.length);
+}
+
+function parseGitGrepPaths(stdout: Buffer, tree: string): Set<string> {
+	return new Set(
+		stdout
+			.toString("utf8")
+			.split("\0")
+			.filter(Boolean)
+			.map((path) => parseGitGrepPath(path, tree)),
+	);
+}
+
+function parseGitGrepMatches(stdout: Buffer, tree: string): ReviewSnapshotGitGrepMatch[] {
+	const matches: ReviewSnapshotGitGrepMatch[] = [];
+	let offset = 0;
+	while (offset < stdout.length) {
+		const pathEnd = stdout.indexOf(0, offset);
+		const lineEnd = pathEnd < 0 ? -1 : stdout.indexOf(0, pathEnd + 1);
+		const textEnd = lineEnd < 0 ? -1 : stdout.indexOf(10, lineEnd + 1);
+		if (pathEnd < 0 || lineEnd < 0 || textEnd < 0) throw new Error("Could not parse git grep output.");
+		const path = parseGitGrepPath(stdout.subarray(offset, pathEnd).toString("utf8"), tree);
+		const line = Number(stdout.subarray(pathEnd + 1, lineEnd).toString("ascii"));
+		if (!Number.isSafeInteger(line) || line < 1) throw new Error("Could not parse git grep line number.");
+		matches.push({
+			path,
+			line,
+			text: stdout
+				.subarray(lineEnd + 1, textEnd)
+				.toString("utf8")
+				.slice(0, 500),
+		});
+		offset = textEnd + 1;
+	}
+	return matches;
+}
+
 function collectLineRanges(lines: number[]): ReviewSnapshotLineRange[] {
 	const ranges: ReviewSnapshotLineRange[] = [];
 	for (const line of lines) {
@@ -992,6 +1055,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	private readonly limits: ReviewSnapshotLimits;
 	private readonly temporaryDirectories: string[];
 	private readonly materializedDirectories: string[] = [];
+	private readonly searchManifests = new Map<ReviewSnapshotRevision, Promise<ReviewSnapshotSearchManifest>>();
 	private readonly searchMaterializations = new Map<
 		ReviewSnapshotRevision,
 		Promise<ReviewSnapshotSearchMaterialization>
@@ -1100,6 +1164,68 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			.sort((left, right) => left.path.localeCompare(right.path));
 	}
 
+	async inspectSearch(revision: ReviewSnapshotRevision): Promise<ReviewSnapshotSearchManifest> {
+		this.assertActive();
+		const cached = this.searchManifests.get(revision);
+		if (cached) return cached;
+		const manifest = this.createSearchManifest(revision);
+		this.searchManifests.set(revision, manifest);
+		try {
+			return await manifest;
+		} catch (error) {
+			this.searchManifests.delete(revision);
+			throw error;
+		}
+	}
+
+	async gitGrep(options: ReviewSnapshotGitGrepOptions): Promise<ReviewSnapshotGitGrepMatch[]> {
+		this.assertActive();
+		const prefix = options.prefix ? normalizeReviewPath(options.prefix) : undefined;
+		const tree = options.revision === "base" ? this.identity.baseTree : this.identity.headTree;
+		const entries = [...(this.treeEntries.get(options.revision)?.values() ?? [])].filter(
+			(entry) => entry.type === "blob" && (!prefix || entry.path === prefix || entry.path.startsWith(`${prefix}/`)),
+		);
+		const pathspecs = [
+			...(prefix ? [`:(top,literal)${prefix}`] : []),
+			...entries
+				.filter((entry) => entry.size === undefined || entry.size > this.limits.maxBlobBytes)
+				.map((entry) => `:(top,exclude,literal)${entry.path}`),
+		];
+		const result = await runCommand(
+			"git",
+			[
+				"grep",
+				"-F",
+				"-I",
+				"-n",
+				"--no-color",
+				"--no-textconv",
+				"--no-recurse-submodules",
+				"--no-column",
+				"--no-heading",
+				"--no-break",
+				"--full-name",
+				"-z",
+				...(options.ignoreCase ? ["-i"] : []),
+				"-e",
+				options.query,
+				tree,
+				...(pathspecs.length > 0 ? ["--", ...pathspecs] : []),
+			],
+			this.source.cwd,
+			{
+				env: this.source.env,
+				signal: options.signal,
+				maxStdoutBytes: this.limits.maxMetadataBytes,
+				maxStderrBytes: this.limits.maxStderrBytes,
+			},
+		);
+		if (result.exitCode !== 0 && result.exitCode !== 1) {
+			throw new Error(`git grep failed: ${commandError(result)}`);
+		}
+		return parseGitGrepMatches(result.stdout, tree);
+	}
+
 	async materializeSearch(revision: ReviewSnapshotRevision): Promise<ReviewSnapshotSearchMaterialization> {
 		this.assertActive();
 		const cached = this.searchMaterializations.get(revision);
@@ -1156,6 +1282,81 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		for (const directory of [...this.materializedDirectories, ...this.temporaryDirectories].reverse()) {
 			await rm(directory, { recursive: true, force: true }).catch(() => {});
 		}
+	}
+
+	private async createSearchManifest(revision: ReviewSnapshotRevision): Promise<ReviewSnapshotSearchManifest> {
+		const tree = revision === "base" ? this.identity.baseTree : this.identity.headTree;
+		const entries = [...(this.treeEntries.get(revision)?.values() ?? [])]
+			.filter((entry) => entry.type === "blob")
+			.sort((left, right) => left.path.localeCompare(right.path));
+		const oversized = entries.filter((entry) => entry.size === undefined || entry.size > this.limits.maxBlobBytes);
+		const candidates = entries.filter(
+			(entry) => entry.size !== undefined && entry.size > 0 && entry.size <= this.limits.maxBlobBytes,
+		);
+		let textPaths = new Set<string>();
+		let nonAsciiPaths: Set<string> | undefined;
+		if (candidates.length > 0) {
+			const result = await git(this.source, [
+				"grep",
+				"-F",
+				"-I",
+				"-l",
+				"--no-color",
+				"--no-textconv",
+				"--no-recurse-submodules",
+				"--no-column",
+				"--no-heading",
+				"--no-break",
+				"--full-name",
+				"-z",
+				"-e",
+				"",
+				tree,
+				...(oversized.length > 0 ? ["--", ...oversized.map((entry) => `:(top,exclude,literal)${entry.path}`)] : []),
+			]);
+			if (result.exitCode !== 0 && result.exitCode !== 1) {
+				throw new Error(`Could not classify review search blobs: ${commandError(result)}`);
+			}
+			textPaths = parseGitGrepPaths(result.stdout, tree);
+			const nonAsciiResult = await git(this.source, [
+				"grep",
+				"-I",
+				"-l",
+				"-P",
+				"--no-color",
+				"--no-textconv",
+				"--no-recurse-submodules",
+				"--no-column",
+				"--no-heading",
+				"--no-break",
+				"--full-name",
+				"-z",
+				"-e",
+				"[^\\x00-\\x7F]",
+				tree,
+				...(oversized.length > 0 ? ["--", ...oversized.map((entry) => `:(top,exclude,literal)${entry.path}`)] : []),
+			]);
+			if (nonAsciiResult.exitCode === 0 || nonAsciiResult.exitCode === 1) {
+				nonAsciiPaths = parseGitGrepPaths(nonAsciiResult.stdout, tree);
+			}
+		}
+		return {
+			entries: entries.map((entry) => {
+				if (entry.size === undefined || entry.size > this.limits.maxBlobBytes) {
+					return { ...this.unavailableSearchEntry(entry), mode: entry.mode };
+				}
+				if (entry.mode === "120000") return { path: entry.path, mode: entry.mode };
+				if (entry.size === 0) return { path: entry.path, mode: entry.mode, ascii: true };
+				if (textPaths.has(entry.path)) {
+					return {
+						path: entry.path,
+						mode: entry.mode,
+						...(nonAsciiPaths ? { ascii: !nonAsciiPaths.has(entry.path) } : {}),
+					};
+				}
+				return { path: entry.path, mode: entry.mode, skippedReason: "Binary content was not searched." };
+			}),
+		};
 	}
 
 	private async createSearchMaterialization(

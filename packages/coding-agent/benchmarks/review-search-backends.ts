@@ -1,5 +1,6 @@
 import { performance } from "node:perf_hooks";
 import type { ToolDefinition } from "../src/core/extensions/types.ts";
+import { GitGrepReviewSearch } from "../src/core/review-search-git-grep.ts";
 import {
 	RipgrepReviewSearch,
 	type RipgrepReviewSearchMatch,
@@ -70,6 +71,27 @@ async function currentSearch(snapshot: ReviewSnapshot, request: BenchmarkCase["r
 	return { matches, skippedPaths, pages, filesScanned };
 }
 
+async function gitGrepSearch(search: GitGrepReviewSearch, request: BenchmarkCase["request"]): Promise<SearchSummary> {
+	const matches: RipgrepReviewSearchMatch[] = [];
+	const skippedPaths: Array<{ path: string; reason: string }> = [];
+	let filesScanned = 0;
+	let pages = 0;
+	let fileIndex = 0;
+	let lineIndex = 0;
+	let complete = false;
+	while (!complete) {
+		const page = await search.page({ ...request, fileIndex, lineIndex, limit: 100 });
+		matches.push(...page.matches);
+		skippedPaths.push(...page.skippedPaths);
+		filesScanned += page.filesScanned;
+		pages++;
+		complete = page.complete;
+		fileIndex = page.nextFileIndex;
+		lineIndex = page.nextLineIndex;
+	}
+	return { matches, skippedPaths, pages, filesScanned };
+}
+
 async function ripgrepSearch(search: RipgrepReviewSearch, request: BenchmarkCase["request"]): Promise<SearchSummary> {
 	const matches: RipgrepReviewSearchMatch[] = [];
 	const skippedPaths: Array<{ path: string; reason: string }> = [];
@@ -131,13 +153,15 @@ const resolved = await resolveReviewSnapshot({ kind: "commit", sha: "HEAD" }, pr
 });
 if ("error" in resolved) throw new Error(resolved.error);
 const snapshot = resolved;
+const gitGrep = new GitGrepReviewSearch(snapshot);
 const ripgrep = new RipgrepReviewSearch(snapshot, rgPath);
 const benchmarkPrefix = process.argv[2] ?? "packages/coding-agent/src/core/tools";
+const absentQuery = ["volt-review-search-absent", String(process.pid), String(performance.timeOrigin)].join("-");
 const cases: BenchmarkCase[] = [
 	{
 		name: "head-no-match-cold-full-tree",
 		request: {
-			query: "volt-review-search-ripgrep-definitely-absent-7cb7db38",
+			query: absentQuery,
 			revision: "head",
 			ignoreCase: false,
 		},
@@ -151,6 +175,16 @@ const cases: BenchmarkCase[] = [
 	{
 		name: "head-dense-warm-tree",
 		request: { query: "import", revision: "head", prefix: benchmarkPrefix, ignoreCase: false },
+		cacheState: "warm-tree",
+	},
+	{
+		name: "head-ignore-case-warm-tree",
+		request: {
+			query: "snapshot",
+			revision: "head",
+			prefix: benchmarkPrefix,
+			ignoreCase: true,
+		},
 		cacheState: "warm-tree",
 	},
 	{
@@ -170,14 +204,18 @@ try {
 	for (const benchmarkCase of cases) {
 		console.error(`Running ${benchmarkCase.name}...`);
 		const current = await measure(() => currentSearch(snapshot, benchmarkCase.request));
+		const git = await measure(() => gitGrepSearch(gitGrep, benchmarkCase.request));
 		const rg = await measure(() => ripgrepSearch(ripgrep, benchmarkCase.request));
-		assertEquivalent(benchmarkCase.name, current.result, rg.result);
+		assertEquivalent(`${benchmarkCase.name} git grep`, current.result, git.result);
+		assertEquivalent(`${benchmarkCase.name} ripgrep`, current.result, rg.result);
 		results.push({
 			name: benchmarkCase.name,
 			cacheState: benchmarkCase.cacheState,
 			current: { ...current, result: resultCounts(current.result) },
+			gitGrep: { ...git, result: resultCounts(git.result) },
 			ripgrep: { ...rg, result: resultCounts(rg.result) },
-			speedup: Number((current.wallMs / rg.wallMs).toFixed(2)),
+			gitGrepSpeedup: Number((current.wallMs / git.wallMs).toFixed(2)),
+			ripgrepSpeedup: Number((current.wallMs / rg.wallMs).toFixed(2)),
 		});
 	}
 	const [base, head] = await Promise.all([snapshot.materializeSearch("base"), snapshot.materializeSearch("head")]);
@@ -191,6 +229,7 @@ try {
 					base: { files: base.materializedFiles, bytes: base.materializedBytes },
 					head: { files: head.materializedFiles, bytes: head.materializedBytes },
 				},
+				gitGrepStats: gitGrep.stats(),
 				ripgrepStats: ripgrep.stats(),
 				results,
 			},
