@@ -770,14 +770,25 @@ function parseBinaryPathsFromNumstat(stdout: Buffer): Set<string> {
 	return binaryPaths;
 }
 
-function parseTree(stdout: Buffer): Map<string, ReviewSnapshotTreeEntry> {
+interface ParsedReviewSnapshotTree {
+	entries: Map<string, ReviewSnapshotTreeEntry>;
+	pathspecUnsafeEntries: Set<ReviewSnapshotTreeEntry>;
+}
+
+function parseTree(stdout: Buffer): ParsedReviewSnapshotTree {
 	const entries = new Map<string, ReviewSnapshotTreeEntry>();
-	for (const token of stdout.toString("utf8").split("\0")) {
-		if (!token) continue;
-		const tab = token.indexOf("\t");
+	const pathspecUnsafeEntries = new Set<ReviewSnapshotTreeEntry>();
+	let start = 0;
+	while (start < stdout.length) {
+		const nul = stdout.indexOf(0, start);
+		const token = stdout.subarray(start, nul < 0 ? stdout.length : nul);
+		start = nul < 0 ? stdout.length : nul + 1;
+		if (token.length === 0) continue;
+		const tab = token.indexOf(9);
 		if (tab < 0) continue;
-		const metadata = token.slice(0, tab).split(/\s+/);
-		const path = token.slice(tab + 1);
+		const metadata = token.subarray(0, tab).toString("utf8").split(/\s+/);
+		const pathBytes = token.subarray(tab + 1);
+		const path = pathBytes.toString("utf8");
 		const [mode, type, oid, sizeText] = metadata;
 		if (
 			!mode ||
@@ -788,15 +799,17 @@ function parseTree(stdout: Buffer): Map<string, ReviewSnapshotTreeEntry> {
 			continue;
 		}
 		const size = sizeText && sizeText !== "-" ? Number(sizeText) : undefined;
-		entries.set(path, {
+		const entry: ReviewSnapshotTreeEntry = {
 			path,
 			mode,
 			type,
 			oid,
 			...(Number.isSafeInteger(size) && size !== undefined && size >= 0 ? { size } : {}),
-		});
+		};
+		entries.set(path, entry);
+		if (!Buffer.from(path, "utf8").equals(pathBytes)) pathspecUnsafeEntries.add(entry);
 	}
-	return entries;
+	return { entries, pathspecUnsafeEntries };
 }
 
 function collectLineRanges(lines: number[]): ReviewSnapshotLineRange[] {
@@ -887,6 +900,7 @@ type SearchManifestEntryKind = "text" | "empty" | "binary" | "symlink" | "oversi
 interface SearchManifestEntry {
 	entry: ReviewSnapshotTreeEntry;
 	kind: SearchManifestEntryKind;
+	pathspecSafe: boolean;
 	reason?: string;
 }
 
@@ -1056,6 +1070,7 @@ async function buildSearchManifest(
 	source: GitSource,
 	identity: ReviewSnapshotIdentity,
 	treeEntries: Map<string, ReviewSnapshotTreeEntry>,
+	pathspecUnsafeEntries: ReadonlySet<ReviewSnapshotTreeEntry>,
 	revision: ReviewSnapshotRevision,
 	prefix: string,
 	signal: AbortSignal,
@@ -1086,13 +1101,14 @@ async function buildSearchManifest(
 	const classification = await gitGrepPaths(
 		source,
 		tree,
-		ordinaryEntries.map((entry) => entry.path),
+		ordinaryEntries.filter((entry) => !pathspecUnsafeEntries.has(entry)).map((entry) => entry.path),
 		{ pattern: "", binaryMode: "exclude", signal },
 	);
 	if (!classification) throw new Error("git grep did not return a required classification set.");
 	const textPaths = classification.matches;
 	const omittedEntries = ordinaryEntries.filter(
-		(entry) => classification.fallbackPaths.has(entry.path) || !textPaths.has(entry.path),
+		(entry) =>
+			pathspecUnsafeEntries.has(entry) || classification.fallbackPaths.has(entry.path) || !textPaths.has(entry.path),
 	);
 	const omittedContents = await readSearchBlobs(
 		source,
@@ -1109,10 +1125,12 @@ async function buildSearchManifest(
 	return {
 		tree,
 		entries: entries.map((entry): SearchManifestEntry => {
+			const pathspecSafe = !pathspecUnsafeEntries.has(entry);
 			if (entry.size === undefined) {
 				return {
 					entry,
 					kind: "unavailable",
+					pathspecSafe,
 					reason: "Git did not report a blob size, so the file was not read.",
 				};
 			}
@@ -1120,20 +1138,22 @@ async function buildSearchManifest(
 				return {
 					entry,
 					kind: "oversized",
+					pathspecSafe,
 					reason: `Blob size ${entry.size} bytes exceeds the ${formatByteLimit(source.limits.maxBlobBytes)} snapshot read limit.`,
 				};
 			}
-			if (entry.mode === "120000") return { entry, kind: "symlink" };
-			if (entry.size === 0) return { entry, kind: "empty" };
+			if (entry.mode === "120000") return { entry, kind: "symlink", pathspecSafe };
+			if (entry.size === 0) return { entry, kind: "empty", pathspecSafe };
 			if (unavailablePaths.has(entry.path)) {
 				return {
 					entry,
 					kind: "unavailable",
+					pathspecSafe,
 					reason: `Could not read the snapshot blob: object ${entry.oid} is unavailable.`,
 				};
 			}
-			if (textPaths.has(entry.path)) return { entry, kind: "text" };
-			return { entry, kind: "binary", reason: "Binary content was not searched." };
+			if (textPaths.has(entry.path)) return { entry, kind: "text", pathspecSafe };
+			return { entry, kind: "binary", pathspecSafe, reason: "Binary content was not searched." };
 		}),
 	};
 }
@@ -1347,6 +1367,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	private readonly temporaryDirectories: string[];
 	private readonly materializedDirectories: string[] = [];
 	private readonly treeEntries = new Map<ReviewSnapshotRevision, Map<string, ReviewSnapshotTreeEntry>>();
+	private readonly pathspecUnsafeEntries = new Map<ReviewSnapshotRevision, ReadonlySet<ReviewSnapshotTreeEntry>>();
 	private readonly searchManifests = new Map<string, Promise<SearchManifest>>();
 	private readonly searchResults = new Map<string, SearchCacheEntry>();
 	private readonly searchInflight = new Map<string, SearchInflight>();
@@ -1358,8 +1379,8 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	private constructor(
 		init: SnapshotInit,
 		changedFiles: ReviewChangedFile[],
-		baseEntries: Map<string, ReviewSnapshotTreeEntry>,
-		headEntries: Map<string, ReviewSnapshotTreeEntry>,
+		baseInventory: ParsedReviewSnapshotTree,
+		headInventory: ParsedReviewSnapshotTree,
 	) {
 		this.description = init.description;
 		this.workflowDescription = init.workflowDescription;
@@ -1371,8 +1392,10 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		this.limits = init.limits;
 		this.temporaryDirectories = init.temporaryDirectories;
 		this.changedFiles = changedFiles;
-		this.treeEntries.set("base", baseEntries);
-		this.treeEntries.set("head", headEntries);
+		this.treeEntries.set("base", baseInventory.entries);
+		this.treeEntries.set("head", headInventory.entries);
+		this.pathspecUnsafeEntries.set("base", baseInventory.pathspecUnsafeEntries);
+		this.pathspecUnsafeEntries.set("head", headInventory.pathspecUnsafeEntries);
 	}
 
 	static async create(init: SnapshotInit): Promise<GitReviewSnapshot> {
@@ -1383,16 +1406,16 @@ class GitReviewSnapshot implements ReviewSnapshot {
 				`Could not inventory review snapshot trees: ${commandError(baseTreeResult.ok ? headTreeResult : baseTreeResult)}`,
 			);
 		}
-		const baseEntries = parseTree(baseTreeResult.stdout);
-		const headEntries = parseTree(headTreeResult.stdout);
+		const baseInventory = parseTree(baseTreeResult.stdout);
+		const headInventory = parseTree(headTreeResult.stdout);
 		const changedFiles = await buildChangedFiles(
 			init.source,
 			init.identity.baseTree,
 			init.identity.headTree,
-			baseEntries,
-			headEntries,
+			baseInventory.entries,
+			headInventory.entries,
 		);
-		return new GitReviewSnapshot(init, changedFiles, baseEntries, headEntries);
+		return new GitReviewSnapshot(init, changedFiles, baseInventory, headInventory);
 	}
 
 	async readFile(revision: ReviewSnapshotRevision, path: string): Promise<ReviewSnapshotFile | undefined> {
@@ -1575,10 +1598,16 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		const fallbackPaths = new Set<string>();
 		const ignoreCase = options.ignoreCase === true;
 		if (directGitSearchQuery(options.query)) {
+			const pathspecTextEntries = textEntries.filter((entry) => entry.pathspecSafe);
+			for (const { entry, pathspecSafe } of textEntries) {
+				if (pathspecSafe) continue;
+				selectedPaths.add(entry.path);
+				fallbackPaths.add(entry.path);
+			}
 			const directMatches = await gitGrepPaths(
 				this.source,
 				manifest.tree,
-				textEntries.map(({ entry }) => entry.path),
+				pathspecTextEntries.map(({ entry }) => entry.path),
 				{ pattern: options.query, binaryMode: "text", ignoreCase, signal },
 			);
 			if (!directMatches) throw new Error("git grep did not return a required candidate set.");
@@ -1591,12 +1620,12 @@ class GitReviewSnapshot implements ReviewSnapshot {
 				const nonAsciiPaths = await gitGrepPaths(
 					this.source,
 					manifest.tree,
-					textEntries.map(({ entry }) => entry.path),
+					pathspecTextEntries.map(({ entry }) => entry.path),
 					{ pattern: "[^\\x00-\\x7f]", binaryMode: "text", perl: true, optional: true, signal },
 				);
 				for (const { entry } of nonAsciiPaths === undefined
-					? textEntries
-					: textEntries.filter(
+					? pathspecTextEntries
+					: pathspecTextEntries.filter(
 							({ entry }) =>
 								nonAsciiPaths.matches.has(entry.path) || nonAsciiPaths.fallbackPaths.has(entry.path),
 						)) {
@@ -1708,11 +1737,15 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			return existing;
 		}
 		const entries = this.treeEntries.get(revision);
-		if (!entries) throw new Error(`Review snapshot ${revision} tree inventory is unavailable.`);
+		const pathspecUnsafeEntries = this.pathspecUnsafeEntries.get(revision);
+		if (!entries || !pathspecUnsafeEntries) {
+			throw new Error(`Review snapshot ${revision} tree inventory is unavailable.`);
+		}
 		const promise = buildSearchManifest(
 			this.source,
 			this.identity,
 			entries,
+			pathspecUnsafeEntries,
 			revision,
 			prefix,
 			this.disposalController.signal,

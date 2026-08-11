@@ -560,6 +560,34 @@ describe("direct-tree review snapshot search", () => {
 		expect(classificationGreps.some((args) => args.includes(":(top,literal)outside/binary.dat"))).toBe(false);
 	});
 
+	it("searches non-UTF-8 tree paths through their blob OIDs", async () => {
+		const repository = createRepository();
+		const invalidPathOid = gitWithInput(repository, "invalid pathname needle\n", "hash-object", "-w", "--stdin");
+		const baseOrdinaryOid = gitWithInput(repository, "ordinary before\n", "hash-object", "-w", "--stdin");
+		const headOrdinaryOid = gitWithInput(repository, "ordinary after\n", "hash-object", "-w", "--stdin");
+		const treeInput = (ordinaryOid: string) =>
+			Buffer.concat([
+				Buffer.from(`100644 blob ${invalidPathOid}\tinvalid-`, "utf8"),
+				Buffer.from([0xff]),
+				Buffer.from(`.txt\0` + `100644 blob ${ordinaryOid}\tordinary.txt\0`, "utf8"),
+			]);
+		const baseTree = gitWithInput(repository, treeInput(baseOrdinaryOid), "mktree", "-z");
+		const baseCommit = git(repository, "commit-tree", baseTree, "-m", "invalid path base");
+		const headTree = gitWithInput(repository, treeInput(headOrdinaryOid), "mktree", "-z");
+		const headCommit = git(repository, "commit-tree", headTree, "-p", baseCommit, "-m", "ordinary change");
+		const snapshot = await resolveSnapshot(repository, undefined, { kind: "commit", sha: headCommit });
+		snapshots.push(snapshot);
+
+		const result = await snapshot.search({
+			revision: "head",
+			query: "pathname needle",
+			limit: 100,
+			maxFiles: 200,
+		});
+		expect(result.matches).toEqual([{ path: "invalid-�.txt", line: 1, text: "invalid pathname needle" }]);
+		expect(result.skippedPaths).toEqual([]);
+	});
+
 	it("searches over-budget tree paths by blob OID without passing them in Git argv", async () => {
 		const repository = createRepository();
 		const overBudgetPath = `${"p".repeat(24 * 1024)}.txt`;
