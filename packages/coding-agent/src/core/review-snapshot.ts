@@ -1048,7 +1048,14 @@ async function gitGrepPaths(
 			],
 			source.cwd,
 			{
-				env: options.perl ? { ...source.env, LC_ALL: "C" } : source.env,
+				env: {
+					...source.env,
+					GIT_LITERAL_PATHSPECS: "0",
+					GIT_GLOB_PATHSPECS: "0",
+					GIT_NOGLOB_PATHSPECS: "0",
+					GIT_ICASE_PATHSPECS: "0",
+					...(options.perl ? { LC_ALL: "C" } : {}),
+				},
 				signal: options.signal,
 				maxStdoutBytes: source.limits.maxMetadataBytes,
 				maxStderrBytes: source.limits.maxStderrBytes,

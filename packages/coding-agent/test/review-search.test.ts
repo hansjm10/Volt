@@ -281,6 +281,7 @@ describe("direct-tree review snapshot search", () => {
 	const snapshots: ReviewSnapshot[] = [];
 	const initialPath = process.env.PATH;
 	const initialGitTrace = process.env.GIT_TRACE;
+	const initialGitLiteralPathspecs = process.env.GIT_LITERAL_PATHSPECS;
 	const initialTmpdir = process.env.TMPDIR;
 	const initialTemp = process.env.TEMP;
 	const initialTmp = process.env.TMP;
@@ -292,6 +293,8 @@ describe("direct-tree review snapshot search", () => {
 		else process.env.PATH = initialPath;
 		if (initialGitTrace === undefined) delete process.env.GIT_TRACE;
 		else process.env.GIT_TRACE = initialGitTrace;
+		if (initialGitLiteralPathspecs === undefined) delete process.env.GIT_LITERAL_PATHSPECS;
+		else process.env.GIT_LITERAL_PATHSPECS = initialGitLiteralPathspecs;
 		if (initialTmpdir === undefined) delete process.env.TMPDIR;
 		else process.env.TMPDIR = initialTmpdir;
 		if (initialTemp === undefined) delete process.env.TEMP;
@@ -607,6 +610,28 @@ describe("direct-tree review snapshot search", () => {
 		await expect(
 			snapshot.search({ revision: "head", query: "color-safe", limit: 100, maxFiles: 200 }),
 		).resolves.toMatchObject({ matches: [{ path: "tracked.txt", line: 1 }] });
+	});
+
+	it("neutralizes inherited literal pathspec mode for generated Git grep pathspecs", async () => {
+		const repository = createRepository();
+		writeFixture(repository, "tracked.txt", "before\n");
+		git(repository, "add", "tracked.txt");
+		git(repository, "commit", "-m", "initial");
+		writeFixture(repository, "tracked.txt", "after pathspec-safe needle\n");
+		process.env.GIT_LITERAL_PATHSPECS = "1";
+		const snapshot = await resolveSnapshot(repository);
+		snapshots.push(snapshot);
+
+		await expect(
+			snapshot.search({ revision: "head", query: "pathspec-safe", limit: 100, maxFiles: 200 }),
+		).resolves.toEqual({
+			matches: [{ path: "tracked.txt", line: 1, text: "after pathspec-safe needle" }],
+			filesScanned: 1,
+			skippedPaths: [],
+			nextFileIndex: 1,
+			nextLineIndex: 0,
+			complete: true,
+		});
 	});
 
 	it("uses blob bytes instead of diff attributes to classify searchable text", async () => {
