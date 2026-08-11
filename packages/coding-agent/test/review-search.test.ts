@@ -429,6 +429,50 @@ describe("direct-tree review snapshot search", () => {
 		);
 	});
 
+	it("returns bounded pages without retaining every repository match", async () => {
+		const repository = createRepository();
+		writeFixture(repository, "dense.txt", "before\n");
+		git(repository, "add", "dense.txt");
+		git(repository, "commit", "-m", "dense search base");
+		writeFixture(repository, "dense.txt", "x\n".repeat(250_001));
+		const snapshot = await resolveSnapshot(repository);
+		snapshots.push(snapshot);
+
+		const firstPage = await snapshot.search({
+			revision: "head",
+			query: "x",
+			limit: 100,
+			maxFiles: 200,
+		});
+		expect(firstPage).toMatchObject({
+			filesScanned: 1,
+			nextFileIndex: 0,
+			nextLineIndex: 100,
+			complete: false,
+		});
+		expect(firstPage.matches).toEqual(
+			Array.from({ length: 100 }, (_, index) => ({ path: "dense.txt", line: index + 1, text: "x" })),
+		);
+
+		const secondPage = await snapshot.search({
+			revision: "head",
+			query: "x",
+			fileIndex: firstPage.nextFileIndex,
+			lineIndex: firstPage.nextLineIndex,
+			limit: 100,
+			maxFiles: 200,
+		});
+		expect(secondPage).toMatchObject({
+			filesScanned: 1,
+			nextFileIndex: 0,
+			nextLineIndex: 200,
+			complete: false,
+		});
+		expect(secondPage.matches).toEqual(
+			Array.from({ length: 100 }, (_, index) => ({ path: "dense.txt", line: index + 101, text: "x" })),
+		);
+	});
+
 	it("disables configured color in machine-parsed Git grep output", async () => {
 		const repository = createRepository();
 		writeFixture(repository, "tracked.txt", "before\n");

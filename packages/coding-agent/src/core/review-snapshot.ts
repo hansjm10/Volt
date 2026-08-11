@@ -895,15 +895,8 @@ interface SearchManifest {
 	entries: SearchManifestEntry[];
 }
 
-interface SearchComputationFile {
-	matches: ReviewSnapshotSearchMatch[];
-	totalLines: number;
-	skipReason?: string;
-}
-
 interface SearchComputation {
-	entries: SearchManifestEntry[];
-	files: Map<string, SearchComputationFile>;
+	result: ReviewSnapshotSearchResult;
 	retainedBytes: number;
 }
 
@@ -1245,55 +1238,20 @@ async function readSearchBlobs(
 	return contents;
 }
 
-function pageSearchComputation(
-	computation: SearchComputation,
-	options: ReviewSnapshotSearchOptions,
-): ReviewSnapshotSearchResult {
-	let nextFileIndex = options.fileIndex ?? 0;
-	let nextLineIndex = options.lineIndex ?? 0;
-	const matches: ReviewSnapshotSearchMatch[] = [];
-	const skippedPaths: Array<{ path: string; reason: string }> = [];
-	let filesScanned = 0;
-	while (
-		nextFileIndex < computation.entries.length &&
-		filesScanned < options.maxFiles &&
-		matches.length < options.limit
-	) {
-		const manifestEntry = computation.entries[nextFileIndex];
-		filesScanned++;
-		const file = computation.files.get(manifestEntry.entry.path);
-		const skipReason = file?.skipReason ?? manifestEntry.reason;
-		if (skipReason) {
-			skippedPaths.push({ path: manifestEntry.entry.path, reason: skipReason });
-			nextFileIndex++;
-			nextLineIndex = 0;
-			continue;
-		}
-		const fileMatches = file?.matches ?? [];
-		let matchIndex = fileMatches.findIndex((match) => match.line > nextLineIndex);
-		if (matchIndex < 0) {
-			nextFileIndex++;
-			nextLineIndex = 0;
-			continue;
-		}
-		while (matchIndex < fileMatches.length && matches.length < options.limit) {
-			const match = fileMatches[matchIndex++];
-			matches.push(match);
-			nextLineIndex = match.line;
-		}
-		if (matches.length < options.limit || nextLineIndex >= (file?.totalLines ?? 0)) {
-			nextFileIndex++;
-			nextLineIndex = 0;
-		}
-	}
+function searchComputationResult(computation: SearchComputation): ReviewSnapshotSearchResult {
 	return {
-		matches,
-		filesScanned,
-		skippedPaths,
-		nextFileIndex,
-		nextLineIndex,
-		complete: nextFileIndex >= computation.entries.length,
+		...computation.result,
+		matches: computation.result.matches.map((match) => ({ ...match })),
+		skippedPaths: computation.result.skippedPaths.map((skipped) => ({ ...skipped })),
 	};
+}
+
+function assertSearchResultBytes(retainedBytes: number): void {
+	if (retainedBytes > SEARCH_RESULT_MAX_BYTES) {
+		throw new Error(
+			`Review snapshot search results exceed the ${formatByteLimit(SEARCH_RESULT_MAX_BYTES)} retained result limit.`,
+		);
+	}
 }
 
 async function buildChangedFiles(
@@ -1520,9 +1478,18 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			fileIndex: options.fileIndex ?? 0,
 			lineIndex: options.lineIndex ?? 0,
 		};
-		const key = JSON.stringify([options.revision, prefix, options.query, normalized.ignoreCase]);
+		const key = JSON.stringify([
+			options.revision,
+			prefix,
+			options.query,
+			normalized.ignoreCase,
+			normalized.fileIndex,
+			normalized.lineIndex,
+			normalized.limit,
+			normalized.maxFiles,
+		]);
 		const cached = this.takeCachedSearchResult(key);
-		if (cached) return pageSearchComputation(cached, normalized);
+		if (cached) return searchComputationResult(cached);
 		let inflight = this.searchInflight.get(key);
 		if (inflight?.controller.signal.aborted && !inflight.settled) {
 			if (this.searchInflight.get(key) === inflight) this.searchInflight.delete(key);
@@ -1530,19 +1497,13 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		}
 		if (!inflight) inflight = this.startSearchComputation(key, normalized);
 		const computation = await this.waitForSearchComputation(inflight, options.signal);
-		return pageSearchComputation(computation, normalized);
+		return searchComputationResult(computation);
 	}
 
 	private startSearchComputation(key: string, options: ReviewSnapshotSearchOptions): SearchInflight {
 		const controller = new AbortController();
 		const signal = AbortSignal.any([controller.signal, this.disposalController.signal]);
-		const promise = this.computeSearch(
-			options.revision,
-			options.prefix ?? "",
-			options.query,
-			options.ignoreCase === true,
-			signal,
-		);
+		const promise = this.computeSearch(options, signal);
 		const inflight: SearchInflight = { key, controller, promise, waiters: 0, settled: false };
 		this.searchInflight.set(key, inflight);
 		this.trackSearchWork(promise);
@@ -1599,26 +1560,26 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		});
 	}
 
-	private async computeSearch(
-		revision: ReviewSnapshotRevision,
-		prefix: string,
-		query: string,
-		ignoreCase: boolean,
-		signal: AbortSignal,
-	): Promise<SearchComputation> {
-		const manifest = await this.waitForSearchPromise(this.getSearchManifest(revision, prefix), signal);
+	private async computeSearch(options: ReviewSnapshotSearchOptions, signal: AbortSignal): Promise<SearchComputation> {
+		const manifest = await this.waitForSearchPromise(
+			this.getSearchManifest(options.revision, options.prefix ?? ""),
+			signal,
+		);
 		throwIfSearchAborted(signal);
 		const entries = manifest.entries;
-		const textEntries = entries.filter((entry) => entry.kind === "text");
-		const symlinkEntries = entries.filter((entry) => entry.kind === "symlink");
+		const firstFileIndex = options.fileIndex ?? 0;
+		const pageEntries = entries.slice(firstFileIndex, firstFileIndex + options.maxFiles);
+		const textEntries = pageEntries.filter((entry) => entry.kind === "text");
+		const symlinkEntries = pageEntries.filter((entry) => entry.kind === "symlink");
 		const selectedPaths = new Set<string>();
 		const fallbackPaths = new Set<string>();
-		if (directGitSearchQuery(query)) {
+		const ignoreCase = options.ignoreCase === true;
+		if (directGitSearchQuery(options.query)) {
 			const directMatches = await gitGrepPaths(
 				this.source,
 				manifest.tree,
 				textEntries.map(({ entry }) => entry.path),
-				{ pattern: query, binaryMode: "text", ignoreCase, signal },
+				{ pattern: options.query, binaryMode: "text", ignoreCase, signal },
 			);
 			if (!directMatches) throw new Error("git grep did not return a required candidate set.");
 			for (const path of directMatches.matches) selectedPaths.add(path);
@@ -1653,58 +1614,88 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			selectedPaths.add(entry.path);
 			fallbackPaths.add(entry.path);
 		}
-		const selectedEntries = entries.filter(({ entry }) => selectedPaths.has(entry.path));
+		const selectedEntries = pageEntries.filter(({ entry }) => selectedPaths.has(entry.path));
 		const fallbackOids = new Set(
 			selectedEntries.filter(({ entry }) => fallbackPaths.has(entry.path)).map(({ entry }) => entry.oid),
 		);
 		const contents = await readSearchBlobs(this.source, selectedEntries, fallbackOids, signal);
 		throwIfSearchAborted(signal);
-		const files = new Map<string, SearchComputationFile>();
-		let matchCount = 0;
-		let retainedBytes = entries.reduce((total, { entry }) => total + Buffer.byteLength(entry.path, "utf8") + 32, 0);
-		const needle = ignoreCase ? query.toLocaleLowerCase() : query;
-		for (const { entry } of selectedEntries) {
+
+		const matches: ReviewSnapshotSearchMatch[] = [];
+		const skippedPaths: Array<{ path: string; reason: string }> = [];
+		let nextFileIndex = firstFileIndex;
+		let nextLineIndex = options.lineIndex ?? 0;
+		let filesScanned = 0;
+		let retainedBytes = 0;
+		const needle = ignoreCase ? options.query.toLocaleLowerCase() : options.query;
+		while (nextFileIndex < entries.length && filesScanned < options.maxFiles && matches.length < options.limit) {
 			throwIfSearchAborted(signal);
+			const manifestEntry = entries[nextFileIndex];
+			const { entry } = manifestEntry;
+			filesScanned++;
+			if (manifestEntry.reason) {
+				skippedPaths.push({ path: entry.path, reason: manifestEntry.reason });
+				retainedBytes +=
+					Buffer.byteLength(entry.path, "utf8") + Buffer.byteLength(manifestEntry.reason, "utf8") + 32;
+				assertSearchResultBytes(retainedBytes);
+				nextFileIndex++;
+				nextLineIndex = 0;
+				continue;
+			}
+			if (!selectedPaths.has(entry.path)) {
+				nextFileIndex++;
+				nextLineIndex = 0;
+				continue;
+			}
 			const content = contents.get(entry.oid);
+			let skipReason: string | undefined;
 			if (content === undefined) {
-				files.set(entry.path, {
-					matches: [],
-					totalLines: 0,
-					skipReason: `Could not read the snapshot blob: object ${entry.oid} is unavailable.`,
-				});
+				skipReason = `Could not read the snapshot blob: object ${entry.oid} is unavailable.`;
+			} else if (isBinary(content)) {
+				skipReason = "Binary content was not searched.";
+			}
+			if (skipReason) {
+				skippedPaths.push({ path: entry.path, reason: skipReason });
+				retainedBytes += Buffer.byteLength(entry.path, "utf8") + Buffer.byteLength(skipReason, "utf8") + 32;
+				assertSearchResultBytes(retainedBytes);
+				nextFileIndex++;
+				nextLineIndex = 0;
 				continue;
 			}
-			if (isBinary(content)) {
-				files.set(entry.path, { matches: [], totalLines: 0, skipReason: "Binary content was not searched." });
-				continue;
-			}
+			if (content === undefined) throw new Error("Review snapshot search content was unexpectedly unavailable.");
 			const lines = content.toString("utf8").split("\n");
-			const matches: ReviewSnapshotSearchMatch[] = [];
-			for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-				const line = lines[lineIndex] ?? "";
+			while (nextLineIndex < lines.length && matches.length < options.limit) {
+				const line = lines[nextLineIndex] ?? "";
 				const haystack = ignoreCase ? line.toLocaleLowerCase() : line;
-				if (!haystack.includes(needle)) continue;
-				const match = { path: entry.path, line: lineIndex + 1, text: line.slice(0, 500) };
-				matches.push(match);
-				matchCount++;
-				retainedBytes += Buffer.byteLength(match.path, "utf8") + Buffer.byteLength(match.text, "utf8") + 32;
-				if (matchCount > SEARCH_RESULT_MAX_MATCHES) {
-					throw new Error(`Review snapshot search exceeds the ${SEARCH_RESULT_MAX_MATCHES} retained match limit.`);
+				if (haystack.includes(needle)) {
+					const match = { path: entry.path, line: nextLineIndex + 1, text: line.slice(0, 500) };
+					matches.push(match);
+					retainedBytes += Buffer.byteLength(match.path, "utf8") + Buffer.byteLength(match.text, "utf8") + 32;
+					assertSearchResultBytes(retainedBytes);
+					if (matches.length > SEARCH_RESULT_MAX_MATCHES) {
+						throw new Error(
+							`Review snapshot search exceeds the ${SEARCH_RESULT_MAX_MATCHES} retained match limit.`,
+						);
+					}
 				}
-				if (retainedBytes > SEARCH_RESULT_MAX_BYTES) {
-					throw new Error(
-						`Review snapshot search results exceed the ${formatByteLimit(SEARCH_RESULT_MAX_BYTES)} retained result limit.`,
-					);
-				}
+				nextLineIndex++;
 			}
-			files.set(entry.path, { matches, totalLines: lines.length });
+			if (nextLineIndex >= lines.length) {
+				nextFileIndex++;
+				nextLineIndex = 0;
+			}
 		}
-		if (retainedBytes > SEARCH_RESULT_MAX_BYTES) {
-			throw new Error(
-				`Review snapshot search results exceed the ${formatByteLimit(SEARCH_RESULT_MAX_BYTES)} retained result limit.`,
-			);
-		}
-		return { entries, files, retainedBytes };
+		return {
+			result: {
+				matches,
+				filesScanned,
+				skippedPaths,
+				nextFileIndex,
+				nextLineIndex,
+				complete: nextFileIndex >= entries.length,
+			},
+			retainedBytes,
+		};
 	}
 
 	private getSearchManifest(revision: ReviewSnapshotRevision, prefix: string): Promise<SearchManifest> {
