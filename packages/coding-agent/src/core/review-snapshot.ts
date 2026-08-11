@@ -985,6 +985,7 @@ async function gitGrepPaths(
 	paths: string[],
 	options: {
 		pattern: string;
+		binaryMode: "exclude" | "text";
 		ignoreCase?: boolean;
 		perl?: boolean;
 		optional?: boolean;
@@ -999,9 +1000,10 @@ async function gitGrepPaths(
 			"git",
 			[
 				"grep",
+				"--no-color",
 				"--full-name",
 				options.perl ? "-P" : "-F",
-				"-I",
+				options.binaryMode === "text" ? "--text" : "-I",
 				"-l",
 				"-z",
 				...(options.ignoreCase ? ["-i"] : []),
@@ -1061,16 +1063,33 @@ async function buildSearchManifest(
 		);
 	}
 	const tree = searchTree(identity, revision);
-	const ordinaryPaths = entries
-		.filter(
-			(entry) =>
-				entry.mode !== "120000" &&
-				entry.size !== undefined &&
-				entry.size > 0 &&
-				entry.size <= source.limits.maxBlobBytes,
-		)
-		.map((entry) => entry.path);
-	const textPaths = (await gitGrepPaths(source, tree, ordinaryPaths, { pattern: "", signal })) ?? new Set<string>();
+	const ordinaryEntries = entries.filter(
+		(entry) =>
+			entry.mode !== "120000" &&
+			entry.size !== undefined &&
+			entry.size > 0 &&
+			entry.size <= source.limits.maxBlobBytes,
+	);
+	const textPaths =
+		(await gitGrepPaths(
+			source,
+			tree,
+			ordinaryEntries.map((entry) => entry.path),
+			{ pattern: "", binaryMode: "exclude", signal },
+		)) ?? new Set<string>();
+	const omittedEntries = ordinaryEntries.filter((entry) => !textPaths.has(entry.path));
+	const omittedContents = await readSearchBlobs(
+		source,
+		omittedEntries.map((entry) => ({ entry })),
+		new Set<string>(),
+		signal,
+	);
+	const unavailablePaths = new Set<string>();
+	for (const entry of omittedEntries) {
+		const content = omittedContents.get(entry.oid);
+		if (content === undefined) unavailablePaths.add(entry.path);
+		else if (!isBinary(content)) textPaths.add(entry.path);
+	}
 	return {
 		tree,
 		entries: entries.map((entry): SearchManifestEntry => {
@@ -1090,6 +1109,13 @@ async function buildSearchManifest(
 			}
 			if (entry.mode === "120000") return { entry, kind: "symlink" };
 			if (entry.size === 0) return { entry, kind: "empty" };
+			if (unavailablePaths.has(entry.path)) {
+				return {
+					entry,
+					kind: "unavailable",
+					reason: `Could not read the snapshot blob: object ${entry.oid} is unavailable.`,
+				};
+			}
 			if (textPaths.has(entry.path)) return { entry, kind: "text" };
 			return { entry, kind: "binary", reason: "Binary content was not searched." };
 		}),
@@ -1136,7 +1162,7 @@ function parseSearchBlobBatch(stdout: Buffer, requests: SearchBlobRequest[]): Ma
 
 async function readSearchBlobs(
 	source: GitSource,
-	entries: SearchManifestEntry[],
+	entries: ReadonlyArray<{ entry: ReviewSnapshotTreeEntry }>,
 	fallbackOids: ReadonlySet<string>,
 	signal: AbortSignal,
 ): Promise<Map<string, Buffer | undefined>> {
@@ -1571,7 +1597,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 				this.source,
 				manifest.tree,
 				textEntries.map(({ entry }) => entry.path),
-				{ pattern: query, ignoreCase, signal },
+				{ pattern: query, binaryMode: "text", ignoreCase, signal },
 			);
 			if (!directMatches) throw new Error("git grep did not return a required candidate set.");
 			for (const path of directMatches) selectedPaths.add(path);
@@ -1580,7 +1606,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 					this.source,
 					manifest.tree,
 					textEntries.map(({ entry }) => entry.path),
-					{ pattern: "[^\\x00-\\x7f]", perl: true, optional: true, signal },
+					{ pattern: "[^\\x00-\\x7f]", binaryMode: "text", perl: true, optional: true, signal },
 				);
 				for (const { entry } of nonAsciiPaths === undefined
 					? textEntries

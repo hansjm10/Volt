@@ -3,6 +3,7 @@ import {
 	chmodSync,
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	rmSync,
@@ -238,19 +239,14 @@ function grepPattern(args: string[]): string | undefined {
 	return patternIndex < 0 ? undefined : args[patternIndex + 1];
 }
 
-function reviewTemporaryDirectories(): Set<string> {
-	return new Set(
-		readdirSync(tmpdir())
-			.filter((entry) => entry.startsWith("volt-review-snapshot-"))
-			.map((entry) => join(tmpdir(), entry)),
-	);
-}
-
 describe("direct-tree review snapshot search", () => {
 	const directories: string[] = [];
 	const snapshots: ReviewSnapshot[] = [];
 	const initialPath = process.env.PATH;
 	const initialGitTrace = process.env.GIT_TRACE;
+	const initialTmpdir = process.env.TMPDIR;
+	const initialTemp = process.env.TEMP;
+	const initialTmp = process.env.TMP;
 
 	afterEach(async () => {
 		for (const snapshot of snapshots.splice(0)) await snapshot.dispose();
@@ -259,6 +255,12 @@ describe("direct-tree review snapshot search", () => {
 		else process.env.PATH = initialPath;
 		if (initialGitTrace === undefined) delete process.env.GIT_TRACE;
 		else process.env.GIT_TRACE = initialGitTrace;
+		if (initialTmpdir === undefined) delete process.env.TMPDIR;
+		else process.env.TMPDIR = initialTmpdir;
+		if (initialTemp === undefined) delete process.env.TEMP;
+		else process.env.TEMP = initialTemp;
+		if (initialTmp === undefined) delete process.env.TMP;
+		else process.env.TMP = initialTmp;
 	});
 
 	function createRepository(): string {
@@ -274,6 +276,7 @@ describe("direct-tree review snapshot search", () => {
 
 	it("matches the legacy observable result across semantic fallbacks and every cursor page", async () => {
 		const repository = createRepository();
+		const supportsNewlinePaths = process.platform !== "win32";
 		writeFixture(repository, ".gitignore", "*.ignored\n");
 		writeFixture(repository, ".hidden.txt", "hidden needle\n");
 		writeFixture(repository, ".kept.ignored", "ignored base-only needle\n");
@@ -294,7 +297,7 @@ describe("direct-tree review snapshot search", () => {
 			"late-nul.txt",
 			Buffer.concat([Buffer.from("x".repeat(8_192)), Buffer.from("\0needle\nafter")]),
 		);
-		writeFixture(repository, "line\nbreak.txt", "newline path needle\n");
+		if (supportsNewlinePaths) writeFixture(repository, "line\nbreak.txt", "newline path needle\n");
 		writeFixture(repository, "long.txt", `${"needle ".padEnd(600, "x")}\n`);
 		writeFixture(repository, "multiline.txt", "alpha\nbeta\n");
 		writeFixture(repository, "no-final.txt", "no-final needle");
@@ -389,7 +392,7 @@ describe("direct-tree review snapshot search", () => {
 				"crlf.txt",
 				"duplicate-a.txt",
 				"duplicate-b.txt",
-				"line\nbreak.txt",
+				...(supportsNewlinePaths ? ["line\nbreak.txt"] : []),
 				"no-final.txt",
 				"symlink.txt",
 				"unicode-路径.txt",
@@ -408,6 +411,47 @@ describe("direct-tree review snapshot search", () => {
 				{ path: "oversized.txt", reason: expect.stringContaining("12 KiB") },
 			]),
 		);
+	});
+
+	it("disables configured color in machine-parsed Git grep output", async () => {
+		const repository = createRepository();
+		writeFixture(repository, "tracked.txt", "before\n");
+		git(repository, "add", "tracked.txt");
+		git(repository, "commit", "-m", "initial");
+		writeFixture(repository, "tracked.txt", "after color-safe needle\n");
+		git(repository, "config", "color.grep", "always");
+		const snapshot = await resolveSnapshot(repository);
+		snapshots.push(snapshot);
+
+		await expect(
+			snapshot.search({ revision: "head", query: "color-safe", limit: 100, maxFiles: 200 }),
+		).resolves.toMatchObject({ matches: [{ path: "tracked.txt", line: 1 }] });
+	});
+
+	it("uses blob bytes instead of diff attributes to classify searchable text", async () => {
+		const repository = createRepository();
+		writeFixture(repository, ".gitattributes", "*.generated -diff\n*.forced binary\n");
+		writeFixture(repository, "binary.generated", Buffer.from([0, 1, 2, 3]));
+		writeFixture(repository, "text.generated", "generated attribute needle\n");
+		writeFixture(repository, "text.forced", "forced attribute needle\n");
+		writeFixture(repository, "tracked.txt", "before\n");
+		git(repository, "add", "-A", "--", ".");
+		git(repository, "commit", "-m", "attribute fixtures");
+		writeFixture(repository, "tracked.txt", "after\n");
+		const snapshot = await resolveSnapshot(repository);
+		snapshots.push(snapshot);
+
+		const pages = await compareEveryPage(snapshot, {
+			revision: "head",
+			query: "attribute needle",
+			limit: 1,
+			maxFiles: 2,
+		});
+		expect(allMatches(pages).map((match) => match.path)).toEqual(["text.forced", "text.generated"]);
+		expect(allSkipped(pages)).toContainEqual({
+			path: "binary.generated",
+			reason: "Binary content was not searched.",
+		});
 	});
 
 	it("reuses manifests and completed results without per-file cold no-match processes", async () => {
@@ -522,13 +566,19 @@ describe("direct-tree review snapshot search", () => {
 		git(repository, "add", "tracked.txt");
 		git(repository, "commit", "-m", "initial");
 		writeFixture(repository, "tracked.txt", "after needle\n");
-		const beforeTemporaryDirectories = reviewTemporaryDirectories();
+		const snapshotTemporaryRoot = mkdtempSync(join(tmpdir(), "volt-review-search-owned-"));
+		directories.push(snapshotTemporaryRoot);
+		process.env.TMPDIR = snapshotTemporaryRoot;
+		process.env.TEMP = snapshotTemporaryRoot;
+		process.env.TMP = snapshotTemporaryRoot;
 		const snapshot = await resolveSnapshot(repository);
 		snapshots.push(snapshot);
-		const createdTemporaryDirectories = [...reviewTemporaryDirectories()].filter(
-			(directory) => !beforeTemporaryDirectories.has(directory),
-		);
-		expect(createdTemporaryDirectories).not.toHaveLength(0);
+		const snapshotTemporaryDirectories = readdirSync(snapshotTemporaryRoot)
+			.filter((entry) => entry.startsWith("volt-review-snapshot-"))
+			.map((entry) => join(snapshotTemporaryRoot, entry));
+		expect(snapshotTemporaryDirectories).toHaveLength(1);
+		const snapshotTemporaryDirectory = snapshotTemporaryDirectories[0];
+		if (!snapshotTemporaryDirectory) throw new Error("Expected one owned review snapshot directory.");
 		const realGit =
 			process.platform === "win32"
 				? run(repository, "where.exe", "git").split(/\r?\n/u)[0]
@@ -588,7 +638,7 @@ describe("direct-tree review snapshot search", () => {
 		const disposal = snapshot.dispose();
 		await expect(activeSearch).rejects.toThrow(/aborted/i);
 		await disposal;
-		expect(readFileSync(log, "utf8")).toContain("term-done\n");
-		for (const directory of createdTemporaryDirectories) expect(existsSync(directory)).toBe(false);
+		if (process.platform !== "win32") expect(readFileSync(log, "utf8")).toContain("term-done\n");
+		expect(existsSync(snapshotTemporaryDirectory)).toBe(false);
 	});
 });
