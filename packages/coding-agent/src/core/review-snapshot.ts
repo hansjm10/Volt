@@ -214,6 +214,7 @@ const SEARCH_PATH_CHUNK_MAX_COUNT = 256;
 const SEARCH_PATH_CHUNK_MAX_BYTES = 24 * 1024;
 const SEARCH_MANIFEST_MAX_ENTRIES = 250_000;
 const SEARCH_MANIFEST_MAX_PATH_BYTES = 16 * 1024 * 1024;
+const SEARCH_MANIFEST_CACHE_MAX_ENTRIES = 2;
 const SEARCH_RESULT_MAX_MATCHES = 250_000;
 const SEARCH_RESULT_MAX_BYTES = 64 * 1024 * 1024;
 const SEARCH_RESULT_CACHE_MAX_ENTRIES = 16;
@@ -1063,11 +1064,14 @@ async function buildSearchManifest(
 	identity: ReviewSnapshotIdentity,
 	treeEntries: Map<string, ReviewSnapshotTreeEntry>,
 	revision: ReviewSnapshotRevision,
+	prefix: string,
 	signal: AbortSignal,
 ): Promise<SearchManifest> {
 	throwIfSearchAborted(signal);
 	const entries = [...treeEntries.values()]
-		.filter((entry) => entry.type === "blob")
+		.filter(
+			(entry) => entry.type === "blob" && (!prefix || entry.path === prefix || entry.path.startsWith(`${prefix}/`)),
+		)
 		.sort((left, right) => left.path.localeCompare(right.path));
 	if (entries.length > SEARCH_MANIFEST_MAX_ENTRIES) {
 		throw new Error(`Review snapshot search manifest exceeds the ${SEARCH_MANIFEST_MAX_ENTRIES} file limit.`);
@@ -1385,7 +1389,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	private readonly temporaryDirectories: string[];
 	private readonly materializedDirectories: string[] = [];
 	private readonly treeEntries = new Map<ReviewSnapshotRevision, Map<string, ReviewSnapshotTreeEntry>>();
-	private readonly searchManifests = new Map<ReviewSnapshotRevision, Promise<SearchManifest>>();
+	private readonly searchManifests = new Map<string, Promise<SearchManifest>>();
 	private readonly searchResults = new Map<string, SearchCacheEntry>();
 	private readonly searchInflight = new Map<string, SearchInflight>();
 	private readonly activeSearchWork = new Set<Promise<unknown>>();
@@ -1602,11 +1606,9 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		ignoreCase: boolean,
 		signal: AbortSignal,
 	): Promise<SearchComputation> {
-		const manifest = await this.waitForSearchPromise(this.getSearchManifest(revision), signal);
+		const manifest = await this.waitForSearchPromise(this.getSearchManifest(revision, prefix), signal);
 		throwIfSearchAborted(signal);
-		const entries = manifest.entries.filter(
-			({ entry }) => !prefix || entry.path === prefix || entry.path.startsWith(`${prefix}/`),
-		);
+		const entries = manifest.entries;
 		const textEntries = entries.filter((entry) => entry.kind === "text");
 		const symlinkEntries = entries.filter((entry) => entry.kind === "symlink");
 		const selectedPaths = new Set<string>();
@@ -1705,10 +1707,15 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		return { entries, files, retainedBytes };
 	}
 
-	private getSearchManifest(revision: ReviewSnapshotRevision): Promise<SearchManifest> {
+	private getSearchManifest(revision: ReviewSnapshotRevision, prefix: string): Promise<SearchManifest> {
 		this.assertActive();
-		const existing = this.searchManifests.get(revision);
-		if (existing) return existing;
+		const key = JSON.stringify([revision, prefix]);
+		const existing = this.searchManifests.get(key);
+		if (existing) {
+			this.searchManifests.delete(key);
+			this.searchManifests.set(key, existing);
+			return existing;
+		}
 		const entries = this.treeEntries.get(revision);
 		if (!entries) throw new Error(`Review snapshot ${revision} tree inventory is unavailable.`);
 		const promise = buildSearchManifest(
@@ -1716,12 +1723,18 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			this.identity,
 			entries,
 			revision,
+			prefix,
 			this.disposalController.signal,
 		);
-		this.searchManifests.set(revision, promise);
+		this.searchManifests.set(key, promise);
+		while (this.searchManifests.size > SEARCH_MANIFEST_CACHE_MAX_ENTRIES) {
+			const oldestKey = this.searchManifests.keys().next().value;
+			if (oldestKey === undefined) break;
+			this.searchManifests.delete(oldestKey);
+		}
 		this.trackSearchWork(promise);
 		void promise.then(undefined, () => {
-			if (this.searchManifests.get(revision) === promise) this.searchManifests.delete(revision);
+			if (this.searchManifests.get(key) === promise) this.searchManifests.delete(key);
 		});
 		return promise;
 	}

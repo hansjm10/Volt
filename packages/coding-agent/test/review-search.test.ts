@@ -192,6 +192,10 @@ if (args[0] === "grep" && existsSync(${JSON.stringify(modeFile)})) {
 		process.stderr.write("injected grep failure\\n");
 		process.exit(2);
 	}
+	if (mode === "reject-out-of-scope" && args.includes(":(top,literal)outside/binary.dat")) {
+		process.stderr.write("injected out-of-scope classification failure\\n");
+		process.exit(2);
+	}
 	if (mode === "reject-over-budget-pathspec" && args.some((arg) => Buffer.byteLength(arg, "utf8") > 24 * 1024)) {
 		process.stderr.write("injected over-budget argv failure\\n");
 		process.exit(2);
@@ -464,6 +468,52 @@ describe("direct-tree review snapshot search", () => {
 			path: "binary.generated",
 			reason: "Binary content was not searched.",
 		});
+	});
+
+	it("scopes manifests before classifying snapshot blobs", async () => {
+		const repository = createRepository();
+		writeFixture(repository, "outside/binary.dat", Buffer.from([0, 1, 2, 3]));
+		writeFixture(repository, "scope/exact.txt", "scoped needle exact\n");
+		writeFixture(repository, "scope/nested/child.txt", "scoped needle child\n");
+		writeFixture(repository, "tracked.txt", "before\n");
+		git(repository, "add", "-A", "--", ".");
+		git(repository, "commit", "-m", "scoped search fixtures");
+		writeFixture(repository, "tracked.txt", "after\n");
+		const snapshot = await resolveSnapshot(repository);
+		snapshots.push(snapshot);
+		const realGit =
+			process.platform === "win32"
+				? run(repository, "where.exe", "git").split(/\r?\n/u)[0]
+				: run(repository, "which", "git");
+		if (!realGit) throw new Error("Could not locate Git.");
+		const bin = join(repository, "shim-bin");
+		mkdirSync(bin);
+		const mode = join(repository, "shim-mode");
+		const log = join(repository, "shim.log");
+		installGitShim(bin, realGit, mode, log);
+		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
+		writeFileSync(mode, "reject-out-of-scope");
+
+		const exact = await snapshot.search({
+			revision: "head",
+			prefix: "scope/exact.txt",
+			query: "scoped needle",
+			limit: 100,
+			maxFiles: 200,
+		});
+		expect(exact.matches.map((match) => match.path)).toEqual(["scope/exact.txt"]);
+
+		const directory = await snapshot.search({
+			revision: "head",
+			prefix: "scope",
+			query: "scoped needle",
+			limit: 100,
+			maxFiles: 200,
+		});
+		expect(directory.matches.map((match) => match.path)).toEqual(["scope/exact.txt", "scope/nested/child.txt"]);
+		const classificationGreps = readShimArgs(log).filter((args) => grepPattern(args) === "");
+		expect(classificationGreps).toHaveLength(2);
+		expect(classificationGreps.some((args) => args.includes(":(top,literal)outside/binary.dat"))).toBe(false);
 	});
 
 	it("searches over-budget tree paths by blob OID without passing them in Git argv", async () => {
