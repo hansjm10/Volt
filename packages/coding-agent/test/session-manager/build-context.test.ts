@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	type BranchSummaryEntry,
 	buildSessionContext,
@@ -298,6 +298,26 @@ describe("buildSessionContext", () => {
 	});
 
 	describe("edge cases", () => {
+		it("walks deep branches without front insertion", () => {
+			const entries: SessionEntry[] = [];
+			for (let index = 0; index < 10_000; index++) {
+				entries.push(thinkingLevel(String(index), index === 0 ? null : String(index - 1), `level-${index}`));
+			}
+
+			const result = (() => {
+				const unshift = vi.spyOn(Array.prototype, "unshift");
+				try {
+					const context = buildSessionContext(entries);
+					return { context, frontInsertions: unshift.mock.calls.length };
+				} finally {
+					unshift.mockRestore();
+				}
+			})();
+
+			expect(result.frontInsertions).toBe(0);
+			expect(result.context.thinkingLevel).toBe("level-9999");
+		});
+
 		it("uses last entry when leafId not found", () => {
 			const entries: SessionEntry[] = [msg("1", null, "user", "hello"), msg("2", "1", "assistant", "hi")];
 			const ctx = buildSessionContext(entries, "nonexistent");
