@@ -924,6 +924,16 @@ interface SearchBlobRequest {
 	size: number;
 }
 
+interface SearchPathChunks {
+	chunks: string[][];
+	fallbackPaths: Set<string>;
+}
+
+interface GitGrepPathResult {
+	matches: Set<string>;
+	fallbackPaths: Set<string>;
+}
+
 function searchAbortError(): Error {
 	return new Error("Review snapshot search was aborted.");
 }
@@ -940,12 +950,17 @@ function literalSearchPathspec(path: string): string {
 	return `:(top,literal)${path}`;
 }
 
-function chunkSearchPaths(paths: string[]): string[][] {
+function chunkSearchPaths(paths: string[]): SearchPathChunks {
 	const chunks: string[][] = [];
+	const fallbackPaths = new Set<string>();
 	let chunk: string[] = [];
 	let bytes = 0;
 	for (const path of paths) {
 		const pathBytes = Buffer.byteLength(literalSearchPathspec(path), "utf8") + 1;
+		if (pathBytes > SEARCH_PATH_CHUNK_MAX_BYTES) {
+			fallbackPaths.add(path);
+			continue;
+		}
 		if (
 			chunk.length > 0 &&
 			(chunk.length >= SEARCH_PATH_CHUNK_MAX_COUNT || bytes + pathBytes > SEARCH_PATH_CHUNK_MAX_BYTES)
@@ -958,7 +973,7 @@ function chunkSearchPaths(paths: string[]): string[][] {
 		bytes += pathBytes;
 	}
 	if (chunk.length > 0) chunks.push(chunk);
-	return chunks;
+	return { chunks, fallbackPaths };
 }
 
 function parseGitGrepPaths(stdout: Buffer, tree: string, allowedPaths: ReadonlySet<string>): string[] {
@@ -991,9 +1006,10 @@ async function gitGrepPaths(
 		optional?: boolean;
 		signal: AbortSignal;
 	},
-): Promise<Set<string> | undefined> {
+): Promise<GitGrepPathResult | undefined> {
 	const matches = new Set<string>();
-	for (const chunk of chunkSearchPaths(paths)) {
+	const { chunks, fallbackPaths } = chunkSearchPaths(paths);
+	for (const chunk of chunks) {
 		throwIfSearchAborted(options.signal);
 		const allowedPaths = new Set(chunk);
 		const result = await runCommand(
@@ -1039,7 +1055,7 @@ async function gitGrepPaths(
 			throw new Error(`Review snapshot search exceeded the ${SEARCH_MANIFEST_MAX_ENTRIES} path result limit.`);
 		}
 	}
-	return matches;
+	return { matches, fallbackPaths };
 }
 
 async function buildSearchManifest(
@@ -1070,14 +1086,17 @@ async function buildSearchManifest(
 			entry.size > 0 &&
 			entry.size <= source.limits.maxBlobBytes,
 	);
-	const textPaths =
-		(await gitGrepPaths(
-			source,
-			tree,
-			ordinaryEntries.map((entry) => entry.path),
-			{ pattern: "", binaryMode: "exclude", signal },
-		)) ?? new Set<string>();
-	const omittedEntries = ordinaryEntries.filter((entry) => !textPaths.has(entry.path));
+	const classification = await gitGrepPaths(
+		source,
+		tree,
+		ordinaryEntries.map((entry) => entry.path),
+		{ pattern: "", binaryMode: "exclude", signal },
+	);
+	if (!classification) throw new Error("git grep did not return a required classification set.");
+	const textPaths = classification.matches;
+	const omittedEntries = ordinaryEntries.filter(
+		(entry) => classification.fallbackPaths.has(entry.path) || !textPaths.has(entry.path),
+	);
 	const omittedContents = await readSearchBlobs(
 		source,
 		omittedEntries.map((entry) => ({ entry })),
@@ -1600,7 +1619,11 @@ class GitReviewSnapshot implements ReviewSnapshot {
 				{ pattern: query, binaryMode: "text", ignoreCase, signal },
 			);
 			if (!directMatches) throw new Error("git grep did not return a required candidate set.");
-			for (const path of directMatches) selectedPaths.add(path);
+			for (const path of directMatches.matches) selectedPaths.add(path);
+			for (const path of directMatches.fallbackPaths) {
+				selectedPaths.add(path);
+				fallbackPaths.add(path);
+			}
 			if (ignoreCase) {
 				const nonAsciiPaths = await gitGrepPaths(
 					this.source,
@@ -1610,7 +1633,10 @@ class GitReviewSnapshot implements ReviewSnapshot {
 				);
 				for (const { entry } of nonAsciiPaths === undefined
 					? textEntries
-					: textEntries.filter(({ entry }) => nonAsciiPaths.has(entry.path))) {
+					: textEntries.filter(
+							({ entry }) =>
+								nonAsciiPaths.matches.has(entry.path) || nonAsciiPaths.fallbackPaths.has(entry.path),
+						)) {
 					selectedPaths.add(entry.path);
 					fallbackPaths.add(entry.path);
 				}

@@ -33,6 +33,17 @@ function git(cwd: string, ...args: string[]): string {
 	return run(cwd, "git", ...args);
 }
 
+function gitWithInput(cwd: string, input: string | Buffer, ...args: string[]): string {
+	const result = spawnSync("git", args, {
+		cwd,
+		encoding: "utf8",
+		input,
+		maxBuffer: 32 * 1024 * 1024,
+	});
+	if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+	return result.stdout.trim();
+}
+
 function writeFixture(repository: string, path: string, content: string | Buffer): void {
 	mkdirSync(dirname(join(repository, path)), { recursive: true });
 	writeFileSync(join(repository, path), content);
@@ -57,12 +68,9 @@ function createSymlinkFixture(repository: string, path: string, target: string):
 async function resolveSnapshot(
 	repository: string,
 	limits?: NonNullable<Parameters<typeof resolveReviewSnapshot>[2]["limits"]>,
+	target: Parameters<typeof resolveReviewSnapshot>[0] = { kind: "uncommitted" },
 ): Promise<ReviewSnapshot> {
-	const result = await resolveReviewSnapshot(
-		{ kind: "uncommitted" },
-		repository,
-		limits ? { ...OPTIONS, limits } : OPTIONS,
-	);
+	const result = await resolveReviewSnapshot(target, repository, limits ? { ...OPTIONS, limits } : OPTIONS);
 	if ("error" in result) throw new Error(result.error);
 	return result;
 }
@@ -182,6 +190,10 @@ if (args[0] === "grep" && existsSync(${JSON.stringify(modeFile)})) {
 	if (mode === "fail-once") {
 		rmSync(${JSON.stringify(modeFile)}, { force: true });
 		process.stderr.write("injected grep failure\\n");
+		process.exit(2);
+	}
+	if (mode === "reject-over-budget-pathspec" && args.some((arg) => Buffer.byteLength(arg, "utf8") > 24 * 1024)) {
+		process.stderr.write("injected over-budget argv failure\\n");
 		process.exit(2);
 	}
 	if (mode === "fail-pcre" && args.includes("-P")) {
@@ -452,6 +464,60 @@ describe("direct-tree review snapshot search", () => {
 			path: "binary.generated",
 			reason: "Binary content was not searched.",
 		});
+	});
+
+	it("searches over-budget tree paths by blob OID without passing them in Git argv", async () => {
+		const repository = createRepository();
+		const overBudgetPath = `${"p".repeat(24 * 1024)}.txt`;
+		const overBudgetOid = gitWithInput(repository, "oversized-name needle\n", "hash-object", "-w", "--stdin");
+		const baseOrdinaryOid = gitWithInput(repository, "ordinary before needle\n", "hash-object", "-w", "--stdin");
+		const headOrdinaryOid = gitWithInput(repository, "ordinary after needle\n", "hash-object", "-w", "--stdin");
+		const treeInput = (ordinaryOid: string) =>
+			Buffer.from(
+				`100644 blob ${ordinaryOid}\tordinary.txt\0` + `100644 blob ${overBudgetOid}\t${overBudgetPath}\0`,
+				"utf8",
+			);
+		const baseTree = gitWithInput(repository, treeInput(baseOrdinaryOid), "mktree", "-z");
+		const baseCommit = git(repository, "commit-tree", baseTree, "-m", "oversized path base");
+		const headTree = gitWithInput(repository, treeInput(headOrdinaryOid), "mktree", "-z");
+		const headCommit = git(repository, "commit-tree", headTree, "-p", baseCommit, "-m", "ordinary change");
+		const snapshot = await resolveSnapshot(repository, undefined, { kind: "commit", sha: headCommit });
+		snapshots.push(snapshot);
+		const realGit =
+			process.platform === "win32"
+				? run(repository, "where.exe", "git").split(/\r?\n/u)[0]
+				: run(repository, "which", "git");
+		if (!realGit) throw new Error("Could not locate Git.");
+		const bin = join(repository, "shim-bin");
+		mkdirSync(bin);
+		const mode = join(repository, "shim-mode");
+		const log = join(repository, "shim.log");
+		installGitShim(bin, realGit, mode, log);
+		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
+		writeFileSync(mode, "reject-over-budget-pathspec");
+
+		const result = await snapshot.search({
+			revision: "head",
+			query: "needle",
+			limit: 100,
+			maxFiles: 200,
+		});
+		expect(result.matches.map((match) => match.path)).toEqual(["ordinary.txt", overBudgetPath]);
+		const grepArgs = readShimArgs(log).filter((args) => args[0] === "grep");
+		expect(grepArgs.length).toBeGreaterThan(0);
+		expect(grepArgs.some((args) => args.some((arg) => Buffer.byteLength(arg, "utf8") > 24 * 1024))).toBe(false);
+
+		const grepCount = grepArgs.length;
+		await expect(
+			snapshot.search({
+				revision: "head",
+				prefix: overBudgetPath,
+				query: "needle",
+				limit: 100,
+				maxFiles: 200,
+			}),
+		).resolves.toMatchObject({ matches: [{ path: overBudgetPath, line: 1 }] });
+		expect(readShimArgs(log).filter((args) => args[0] === "grep")).toHaveLength(grepCount);
 	});
 
 	it("reuses manifests and completed results without per-file cold no-match processes", async () => {
