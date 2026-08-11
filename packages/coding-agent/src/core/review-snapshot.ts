@@ -223,6 +223,8 @@ const SEARCH_RESULT_CACHE_MAX_ENTRY_BYTES = 8 * 1024 * 1024;
 const SEARCH_READ_MAX_BYTES = 256 * 1024 * 1024;
 const SEARCH_FALLBACK_READ_MAX_BYTES = 64 * 1024 * 1024;
 const SEARCH_BATCH_MAX_OBJECTS = 2_048;
+const GIT_BINARY_PROBE_BYTES = 8_000;
+const REVIEW_BINARY_PROBE_BYTES = 8_192;
 const DEFAULT_REVIEW_SNAPSHOT_LIMITS: ReviewSnapshotLimits = {
 	maxMetadataBytes: 32 * 1024 * 1024,
 	maxStderrBytes: 64 * 1024,
@@ -884,7 +886,7 @@ function parseHunks(path: string, patch: string): ReviewSnapshotHunk[] {
 }
 
 function isBinary(content: Buffer): boolean {
-	return content.subarray(0, Math.min(content.length, 8_192)).includes(0);
+	return content.subarray(0, Math.min(content.length, REVIEW_BINARY_PROBE_BYTES)).includes(0);
 }
 
 function countLines(content: Buffer): number {
@@ -895,7 +897,7 @@ function countLines(content: Buffer): number {
 	return lines;
 }
 
-type SearchManifestEntryKind = "text" | "empty" | "binary" | "symlink" | "oversized" | "unavailable";
+type SearchManifestEntryKind = "text" | "unclassified" | "empty" | "binary" | "symlink" | "oversized" | "unavailable";
 
 interface SearchManifestEntry {
 	entry: ReviewSnapshotTreeEntry;
@@ -930,6 +932,13 @@ interface SearchInflight {
 interface SearchBlobRequest {
 	oid: string;
 	size: number;
+}
+
+interface SearchBlobReadState {
+	contents: Map<string, Buffer | undefined>;
+	readBytes: number;
+	fallbackOids: Set<string>;
+	fallbackBytes: number;
 }
 
 interface SearchPathChunks {
@@ -1098,29 +1107,41 @@ async function buildSearchManifest(
 			entry.size > 0 &&
 			entry.size <= source.limits.maxBlobBytes,
 	);
+	const pathspecEntries = ordinaryEntries.filter((entry) => !pathspecUnsafeEntries.has(entry));
 	const classification = await gitGrepPaths(
 		source,
 		tree,
-		ordinaryEntries.filter((entry) => !pathspecUnsafeEntries.has(entry)).map((entry) => entry.path),
+		pathspecEntries.map((entry) => entry.path),
 		{ pattern: "", binaryMode: "exclude", signal },
 	);
 	if (!classification) throw new Error("git grep did not return a required classification set.");
-	const textPaths = classification.matches;
-	const omittedEntries = ordinaryEntries.filter(
+	const ambiguousEntries = pathspecEntries.filter(
 		(entry) =>
-			pathspecUnsafeEntries.has(entry) || classification.fallbackPaths.has(entry.path) || !textPaths.has(entry.path),
+			classification.fallbackPaths.has(entry.path) ||
+			!classification.matches.has(entry.path) ||
+			(entry.size ?? 0) > GIT_BINARY_PROBE_BYTES,
 	);
-	const omittedContents = await readSearchBlobs(
+	const nulPaths = await gitGrepPaths(
 		source,
-		omittedEntries.map((entry) => ({ entry })),
-		new Set<string>(),
-		signal,
+		tree,
+		ambiguousEntries.map((entry) => entry.path),
+		{ pattern: "\\x00", binaryMode: "text", perl: true, optional: true, signal },
 	);
-	const unavailablePaths = new Set<string>();
-	for (const entry of omittedEntries) {
-		const content = omittedContents.get(entry.oid);
-		if (content === undefined) unavailablePaths.add(entry.path);
-		else if (!isBinary(content)) textPaths.add(entry.path);
+	const ambiguousPaths = new Set<string>();
+	const binaryPaths = new Set<string>();
+	for (const entry of ordinaryEntries) {
+		if (pathspecUnsafeEntries.has(entry) || classification.fallbackPaths.has(entry.path)) {
+			ambiguousPaths.add(entry.path);
+			continue;
+		}
+		if (classification.matches.has(entry.path) && (entry.size ?? 0) <= GIT_BINARY_PROBE_BYTES) continue;
+		if (nulPaths === undefined || nulPaths.fallbackPaths.has(entry.path)) {
+			ambiguousPaths.add(entry.path);
+			continue;
+		}
+		if (!nulPaths.matches.has(entry.path)) continue;
+		if ((entry.size ?? 0) <= REVIEW_BINARY_PROBE_BYTES) binaryPaths.add(entry.path);
+		else ambiguousPaths.add(entry.path);
 	}
 	return {
 		tree,
@@ -1144,16 +1165,11 @@ async function buildSearchManifest(
 			}
 			if (entry.mode === "120000") return { entry, kind: "symlink", pathspecSafe };
 			if (entry.size === 0) return { entry, kind: "empty", pathspecSafe };
-			if (unavailablePaths.has(entry.path)) {
-				return {
-					entry,
-					kind: "unavailable",
-					pathspecSafe,
-					reason: `Could not read the snapshot blob: object ${entry.oid} is unavailable.`,
-				};
+			if (binaryPaths.has(entry.path)) {
+				return { entry, kind: "binary", pathspecSafe, reason: "Binary content was not searched." };
 			}
-			if (textPaths.has(entry.path)) return { entry, kind: "text", pathspecSafe };
-			return { entry, kind: "binary", pathspecSafe, reason: "Binary content was not searched." };
+			if (ambiguousPaths.has(entry.path)) return { entry, kind: "unclassified", pathspecSafe };
+			return { entry, kind: "text", pathspecSafe };
 		}),
 	};
 }
@@ -1199,32 +1215,23 @@ function parseSearchBlobBatch(stdout: Buffer, requests: SearchBlobRequest[]): Ma
 async function readSearchBlobs(
 	source: GitSource,
 	entries: ReadonlyArray<{ entry: ReviewSnapshotTreeEntry }>,
-	fallbackOids: ReadonlySet<string>,
+	state: SearchBlobReadState,
 	signal: AbortSignal,
-): Promise<Map<string, Buffer | undefined>> {
+): Promise<void> {
 	const requestsByOid = new Map<string, SearchBlobRequest>();
 	for (const { entry } of entries) {
-		if (entry.size === undefined) continue;
+		if (entry.size === undefined || state.contents.has(entry.oid)) continue;
 		requestsByOid.set(entry.oid, { oid: entry.oid, size: entry.size });
 	}
 	const requests = [...requestsByOid.values()];
-	const totalBytes = requests.reduce((total, request) => total + request.size, 0);
+	const requestBytes = requests.reduce((total, request) => total + request.size, 0);
+	const totalBytes = state.readBytes + requestBytes;
 	if (!Number.isSafeInteger(totalBytes) || totalBytes > SEARCH_READ_MAX_BYTES) {
 		throw new Error(
 			`Review snapshot search blob reads exceed the ${formatByteLimit(SEARCH_READ_MAX_BYTES)} aggregate limit.`,
 		);
 	}
-	const fallbackBytes = requests
-		.filter((request) => fallbackOids.has(request.oid))
-		.reduce((total, request) => total + request.size, 0);
-	const fallbackLimit = Math.min(SEARCH_FALLBACK_READ_MAX_BYTES, source.limits.maxMetadataBytes);
-	if (!Number.isSafeInteger(fallbackBytes) || fallbackBytes > fallbackLimit) {
-		throw new Error(
-			`Review snapshot semantic fallback exceeds the ${formatByteLimit(fallbackLimit)} aggregate read limit.`,
-		);
-	}
 	const maxBatchBytes = Math.max(source.limits.maxMetadataBytes, source.limits.maxBlobBytes + 256);
-	const contents = new Map<string, Buffer | undefined>();
 	let chunk: SearchBlobRequest[] = [];
 	let chunkBytes = 0;
 	const readChunk = async (): Promise<void> => {
@@ -1239,23 +1246,77 @@ async function readSearchBlobs(
 		});
 		throwIfSearchAborted(signal);
 		if (!result.ok) throw new Error(`git cat-file --batch failed: ${commandError(result)}`);
-		for (const [oid, content] of parseSearchBlobBatch(result.stdout, chunk)) contents.set(oid, content);
+		for (const [oid, content] of parseSearchBlobBatch(result.stdout, chunk)) state.contents.set(oid, content);
+		state.readBytes += chunk.reduce((total, request) => total + request.size, 0);
 		chunk = [];
 		chunkBytes = 0;
 	};
 	for (const request of requests) {
-		const requestBytes = searchBlobBatchBytes(request);
-		if (requestBytes > maxBatchBytes) {
+		const batchBytes = searchBlobBatchBytes(request);
+		if (batchBytes > maxBatchBytes) {
 			throw new Error(`Snapshot blob ${request.oid} exceeds the bounded batch-read output limit.`);
 		}
-		if (chunk.length > 0 && (chunk.length >= SEARCH_BATCH_MAX_OBJECTS || chunkBytes + requestBytes > maxBatchBytes)) {
+		if (chunk.length > 0 && (chunk.length >= SEARCH_BATCH_MAX_OBJECTS || chunkBytes + batchBytes > maxBatchBytes)) {
 			await readChunk();
 		}
 		chunk.push(request);
-		chunkBytes += requestBytes;
+		chunkBytes += batchBytes;
 	}
 	await readChunk();
-	return contents;
+}
+
+function collectSearchBlobChunk(
+	source: GitSource,
+	entries: SearchManifestEntry[],
+	startIndex: number,
+	endIndex: number,
+	selectedPaths: ReadonlySet<string>,
+	state: SearchBlobReadState,
+): SearchManifestEntry[] {
+	const chunk: SearchManifestEntry[] = [];
+	const chunkOids = new Set<string>();
+	const maxBatchBytes = Math.max(source.limits.maxMetadataBytes, source.limits.maxBlobBytes + 256);
+	let batchBytes = 0;
+	let contentBytes = 0;
+	for (let index = startIndex; index < endIndex; index++) {
+		const manifestEntry = entries[index];
+		const { entry } = manifestEntry;
+		if (
+			(manifestEntry.kind !== "unclassified" && !selectedPaths.has(entry.path)) ||
+			entry.size === undefined ||
+			state.contents.has(entry.oid) ||
+			chunkOids.has(entry.oid)
+		) {
+			continue;
+		}
+		const request = { oid: entry.oid, size: entry.size };
+		const requestBatchBytes = searchBlobBatchBytes(request);
+		const exceedsChunk =
+			chunk.length > 0 &&
+			(chunk.length >= SEARCH_BATCH_MAX_OBJECTS ||
+				batchBytes + requestBatchBytes > maxBatchBytes ||
+				state.readBytes + contentBytes + entry.size > SEARCH_READ_MAX_BYTES);
+		if (exceedsChunk) break;
+		chunk.push(manifestEntry);
+		chunkOids.add(entry.oid);
+		batchBytes += requestBatchBytes;
+		contentBytes += entry.size;
+		if (state.readBytes + contentBytes > SEARCH_READ_MAX_BYTES) break;
+	}
+	return chunk;
+}
+
+function recordSearchFallbackRead(source: GitSource, entry: ReviewSnapshotTreeEntry, state: SearchBlobReadState): void {
+	if (entry.size === undefined || state.fallbackOids.has(entry.oid)) return;
+	const fallbackBytes = state.fallbackBytes + entry.size;
+	const fallbackLimit = Math.min(SEARCH_FALLBACK_READ_MAX_BYTES, source.limits.maxMetadataBytes);
+	if (!Number.isSafeInteger(fallbackBytes) || fallbackBytes > fallbackLimit) {
+		throw new Error(
+			`Review snapshot semantic fallback exceeds the ${formatByteLimit(fallbackLimit)} aggregate read limit.`,
+		);
+	}
+	state.fallbackOids.add(entry.oid);
+	state.fallbackBytes = fallbackBytes;
 }
 
 function searchComputationResult(computation: SearchComputation): ReviewSnapshotSearchResult {
@@ -1593,7 +1654,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		const firstFileIndex = options.fileIndex ?? 0;
 		const pageEntries = entries.slice(firstFileIndex, firstFileIndex + options.maxFiles);
 		const textEntries = pageEntries.filter((entry) => entry.kind === "text");
-		const symlinkEntries = pageEntries.filter((entry) => entry.kind === "symlink");
+		const fallbackEntries = pageEntries.filter((entry) => entry.kind === "unclassified" || entry.kind === "symlink");
 		const selectedPaths = new Set<string>();
 		const fallbackPaths = new Set<string>();
 		const ignoreCase = options.ignoreCase === true;
@@ -1639,16 +1700,17 @@ class GitReviewSnapshot implements ReviewSnapshot {
 				fallbackPaths.add(entry.path);
 			}
 		}
-		for (const { entry } of symlinkEntries) {
+		for (const { entry } of fallbackEntries) {
 			selectedPaths.add(entry.path);
 			fallbackPaths.add(entry.path);
 		}
-		const selectedEntries = pageEntries.filter(({ entry }) => selectedPaths.has(entry.path));
-		const fallbackOids = new Set(
-			selectedEntries.filter(({ entry }) => fallbackPaths.has(entry.path)).map(({ entry }) => entry.oid),
-		);
-		const contents = await readSearchBlobs(this.source, selectedEntries, fallbackOids, signal);
-		throwIfSearchAborted(signal);
+		const readState: SearchBlobReadState = {
+			contents: new Map<string, Buffer | undefined>(),
+			readBytes: 0,
+			fallbackOids: new Set<string>(),
+			fallbackBytes: 0,
+		};
+		const pageEndIndex = firstFileIndex + pageEntries.length;
 
 		const matches: ReviewSnapshotSearchMatch[] = [];
 		const skippedPaths: Array<{ path: string; reason: string }> = [];
@@ -1676,7 +1738,20 @@ class GitReviewSnapshot implements ReviewSnapshot {
 				nextLineIndex = 0;
 				continue;
 			}
-			const content = contents.get(entry.oid);
+			if (!readState.contents.has(entry.oid)) {
+				const chunk = collectSearchBlobChunk(
+					this.source,
+					entries,
+					nextFileIndex,
+					pageEndIndex,
+					selectedPaths,
+					readState,
+				);
+				if (chunk.length === 0) throw new Error("Review snapshot search could not schedule a selected blob read.");
+				await readSearchBlobs(this.source, chunk, readState, signal);
+				throwIfSearchAborted(signal);
+			}
+			const content = readState.contents.get(entry.oid);
 			let skipReason: string | undefined;
 			if (content === undefined) {
 				skipReason = `Could not read the snapshot blob: object ${entry.oid} is unavailable.`;
@@ -1692,6 +1767,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 				continue;
 			}
 			if (content === undefined) throw new Error("Review snapshot search content was unexpectedly unavailable.");
+			if (fallbackPaths.has(entry.path)) recordSearchFallbackRead(this.source, entry, readState);
 			const lines = content.toString("utf8").split("\n");
 			while (nextLineIndex < lines.length && matches.length < options.limit) {
 				const line = lines[nextLineIndex] ?? "";

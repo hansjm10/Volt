@@ -22,6 +22,7 @@ import {
 } from "../src/core/review-snapshot.ts";
 
 const OPTIONS = { maxCommitRefBytes: 1_024, maxPullRequestNumber: 2_147_483_647 };
+const MAX_SEARCH_BLOB_BYTES = 8 * 1024 * 1024;
 
 function run(cwd: string, command: string, ...args: string[]): string {
 	const result = spawnSync(command, args, { cwd, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
@@ -47,6 +48,26 @@ function gitWithInput(cwd: string, input: string | Buffer, ...args: string[]): s
 function writeFixture(repository: string, path: string, content: string | Buffer): void {
 	mkdirSync(dirname(join(repository, path)), { recursive: true });
 	writeFileSync(join(repository, path), content);
+}
+
+function createBlobTree(repository: string, entries: Array<{ path: string; oid: string }>): string {
+	const input = Buffer.from(
+		`${[...entries]
+			.sort((left, right) => left.path.localeCompare(right.path))
+			.map(({ path, oid }) => `100644 blob ${oid}\t${path}`)
+			.join("\0")}\0`,
+		"utf8",
+	);
+	return gitWithInput(repository, input, "mktree", "-z");
+}
+
+function createContextCommit(repository: string, entries: Array<{ path: string; oid: string }>): string {
+	const baseMarkerOid = gitWithInput(repository, "before\n", "hash-object", "-w", "--stdin");
+	const headMarkerOid = gitWithInput(repository, "after\n", "hash-object", "-w", "--stdin");
+	const baseTree = createBlobTree(repository, [...entries, { path: "tracked.txt", oid: baseMarkerOid }]);
+	const baseCommit = git(repository, "commit-tree", baseTree, "-m", "search context base");
+	const headTree = createBlobTree(repository, [...entries, { path: "tracked.txt", oid: headMarkerOid }]);
+	return git(repository, "commit-tree", headTree, "-p", baseCommit, "-m", "search context head");
 }
 
 function createSymlinkFixture(repository: string, path: string, target: string): void {
@@ -471,6 +492,106 @@ describe("direct-tree review snapshot search", () => {
 		expect(secondPage.matches).toEqual(
 			Array.from({ length: 100 }, (_, index) => ({ path: "dense.txt", line: index + 101, text: "x" })),
 		);
+	});
+
+	it("stops candidate blob reads after an early bounded page is full", async () => {
+		const repository = createRepository();
+		const content = Buffer.alloc(MAX_SEARCH_BLOB_BYTES, 0x78);
+		const entries: Array<{ path: string; oid: string }> = [];
+		for (let index = 0; index < 33; index++) {
+			content.fill(0x78);
+			content.write(index === 0 ? "needle\n".repeat(50) : "needle\n", 0, "utf8");
+			content.write(String(index).padStart(2, "0"), content.length - 2, "utf8");
+			entries.push({
+				path: `candidate-${String(index).padStart(2, "0")}.txt`,
+				oid: gitWithInput(repository, content, "hash-object", "-w", "--stdin"),
+			});
+		}
+		const headCommit = createContextCommit(repository, entries);
+		const snapshot = await resolveSnapshot(repository, undefined, { kind: "commit", sha: headCommit });
+		snapshots.push(snapshot);
+
+		const result = await snapshot.search({
+			revision: "head",
+			query: "needle",
+			limit: 50,
+			maxFiles: 200,
+		});
+		expect(result).toMatchObject({
+			filesScanned: 1,
+			nextFileIndex: 0,
+			nextLineIndex: 50,
+			complete: false,
+		});
+		expect(result.matches).toEqual(
+			Array.from({ length: 50 }, (_, index) => ({
+				path: "candidate-00.txt",
+				line: index + 1,
+				text: "needle",
+			})),
+		);
+	});
+
+	it("reports binaries whose first NUL falls after Git's binary probe", async () => {
+		const repository = createRepository();
+		writeFixture(
+			repository,
+			"probe-gap.bin",
+			Buffer.concat([Buffer.alloc(8_000, 0x78), Buffer.from([0]), Buffer.from("tail")]),
+		);
+		writeFixture(repository, "tracked.txt", "before\n");
+		git(repository, "add", "-A", "--", ".");
+		git(repository, "commit", "-m", "binary probe fixture");
+		writeFixture(repository, "tracked.txt", "after\n");
+		const snapshot = await resolveSnapshot(repository);
+		snapshots.push(snapshot);
+
+		await expect(
+			snapshot.search({
+				revision: "head",
+				prefix: "probe-gap.bin",
+				query: "absent",
+				limit: 50,
+				maxFiles: 200,
+			}),
+		).resolves.toMatchObject({
+			matches: [],
+			filesScanned: 1,
+			skippedPaths: [{ path: "probe-gap.bin", reason: "Binary content was not searched." }],
+			complete: true,
+		});
+	});
+
+	it("returns an early bounded page before later manifest classification blobs are read", async () => {
+		const repository = createRepository();
+		const entries: Array<{ path: string; oid: string }> = [
+			{
+				path: "a-early.txt",
+				oid: gitWithInput(repository, "needle\n", "hash-object", "-w", "--stdin"),
+			},
+		];
+		const content = Buffer.alloc(MAX_SEARCH_BLOB_BYTES, 0x78);
+		content[0] = 0;
+		for (let index = 0; index < 33; index++) {
+			content.write(String(index).padStart(2, "0"), content.length - 2, "utf8");
+			entries.push({
+				path: `binary-${String(index).padStart(2, "0")}.dat`,
+				oid: gitWithInput(repository, content, "hash-object", "-w", "--stdin"),
+			});
+		}
+		const headCommit = createContextCommit(repository, entries);
+		const snapshot = await resolveSnapshot(repository, undefined, { kind: "commit", sha: headCommit });
+		snapshots.push(snapshot);
+
+		await expect(
+			snapshot.search({ revision: "head", query: "needle", limit: 1, maxFiles: 200 }),
+		).resolves.toMatchObject({
+			matches: [{ path: "a-early.txt", line: 1, text: "needle" }],
+			filesScanned: 1,
+			nextFileIndex: 0,
+			nextLineIndex: 1,
+			complete: false,
+		});
 	});
 
 	it("disables configured color in machine-parsed Git grep output", async () => {
