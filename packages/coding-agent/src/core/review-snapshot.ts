@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -102,6 +103,33 @@ export interface ReviewSnapshotListOptions {
 	prefix?: string;
 }
 
+export interface ReviewSnapshotSearchOptions {
+	revision: ReviewSnapshotRevision;
+	query: string;
+	prefix?: string;
+	ignoreCase?: boolean;
+	fileIndex?: number;
+	lineIndex?: number;
+	limit: number;
+	maxFiles: number;
+	signal?: AbortSignal;
+}
+
+export interface ReviewSnapshotSearchMatch {
+	path: string;
+	line: number;
+	text: string;
+}
+
+export interface ReviewSnapshotSearchResult {
+	matches: ReviewSnapshotSearchMatch[];
+	filesScanned: number;
+	skippedPaths: Array<{ path: string; reason: string }>;
+	nextFileIndex: number;
+	nextLineIndex: number;
+	complete: boolean;
+}
+
 export interface ReviewSnapshot {
 	description: string;
 	workflowDescription?: string;
@@ -112,6 +140,7 @@ export interface ReviewSnapshot {
 	root: string;
 	readFile(revision: ReviewSnapshotRevision, path: string): Promise<ReviewSnapshotFile | undefined>;
 	listFiles(options?: ReviewSnapshotListOptions): Promise<ReviewSnapshotTreeEntry[]>;
+	search(options: ReviewSnapshotSearchOptions): Promise<ReviewSnapshotSearchResult>;
 	materializeHead(): Promise<string>;
 	dispose(): Promise<void>;
 }
@@ -143,6 +172,7 @@ interface CommandOutputLimitFailure {
 
 interface CommandResult {
 	ok: boolean;
+	exitCode: number | null;
 	stdout: Buffer;
 	stderr: string;
 	failure?: CommandOutputLimitFailure;
@@ -181,6 +211,20 @@ interface PullRequestView {
 const CANONICAL_GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const DEFAULT_DIFF_CONTEXT_LINES = 3;
 const MAX_STABLE_CAPTURE_ATTEMPTS = 3;
+const SEARCH_PATH_CHUNK_MAX_COUNT = 256;
+const SEARCH_PATH_CHUNK_MAX_BYTES = 24 * 1024;
+const SEARCH_MANIFEST_MAX_ENTRIES = 250_000;
+const SEARCH_MANIFEST_MAX_PATH_BYTES = 16 * 1024 * 1024;
+const SEARCH_MANIFEST_CACHE_MAX_ENTRIES = 2;
+const SEARCH_RESULT_MAX_MATCHES = 250_000;
+const SEARCH_RESULT_MAX_BYTES = 64 * 1024 * 1024;
+const SEARCH_RESULT_CACHE_MAX_ENTRIES = 16;
+const SEARCH_RESULT_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const SEARCH_RESULT_CACHE_MAX_ENTRY_BYTES = 8 * 1024 * 1024;
+const SEARCH_READ_MAX_BYTES = 256 * 1024 * 1024;
+const SEARCH_FALLBACK_READ_MAX_BYTES = 64 * 1024 * 1024;
+const GIT_BINARY_PROBE_BYTES = 8_000;
+const REVIEW_BINARY_PROBE_BYTES = 8_192;
 const DEFAULT_REVIEW_SNAPSHOT_LIMITS: ReviewSnapshotLimits = {
 	maxMetadataBytes: 32 * 1024 * 1024,
 	maxStderrBytes: 64 * 1024,
@@ -257,6 +301,7 @@ function runCommand(
 		let stderr: Buffer[] = [];
 		let stderrBytes = 0;
 		let failure: CommandOutputLimitFailure | undefined;
+		let processError: string | undefined;
 		let settled = false;
 		const finish = (result: CommandResult): void => {
 			if (settled) return;
@@ -284,19 +329,25 @@ function runCommand(
 		});
 		proc.on("error", (error) => {
 			if (failure) return;
-			finish({ ok: false, stdout: Buffer.concat(stdout), stderr: error.message });
+			if (error.name === "AbortError") {
+				processError = error.message;
+				return;
+			}
+			finish({ ok: false, exitCode: null, stdout: Buffer.concat(stdout), stderr: error.message });
 		});
 		proc.on("close", (code) => {
 			if (failure) {
-				finish({ ok: false, stdout: Buffer.alloc(0), stderr: "", failure });
+				finish({ ok: false, exitCode: code, stdout: Buffer.alloc(0), stderr: "", failure });
 				return;
 			}
 			finish({
-				ok: code === 0,
+				ok: code === 0 && processError === undefined,
+				exitCode: code,
 				stdout: Buffer.concat(stdout, stdoutBytes),
-				stderr: Buffer.concat(stderr, stderrBytes).toString("utf8"),
+				stderr: processError ?? Buffer.concat(stderr, stderrBytes).toString("utf8"),
 			});
 		});
+		proc.stdin?.on("error", () => {});
 		if (options.input !== undefined) proc.stdin?.end(options.input);
 	});
 }
@@ -721,14 +772,25 @@ function parseBinaryPathsFromNumstat(stdout: Buffer): Set<string> {
 	return binaryPaths;
 }
 
-function parseTree(stdout: Buffer): Map<string, ReviewSnapshotTreeEntry> {
+interface ParsedReviewSnapshotTree {
+	entries: Map<string, ReviewSnapshotTreeEntry>;
+	pathspecUnsafeEntries: Set<ReviewSnapshotTreeEntry>;
+}
+
+function parseTree(stdout: Buffer): ParsedReviewSnapshotTree {
 	const entries = new Map<string, ReviewSnapshotTreeEntry>();
-	for (const token of stdout.toString("utf8").split("\0")) {
-		if (!token) continue;
-		const tab = token.indexOf("\t");
+	const pathspecUnsafeEntries = new Set<ReviewSnapshotTreeEntry>();
+	let start = 0;
+	while (start < stdout.length) {
+		const nul = stdout.indexOf(0, start);
+		const token = stdout.subarray(start, nul < 0 ? stdout.length : nul);
+		start = nul < 0 ? stdout.length : nul + 1;
+		if (token.length === 0) continue;
+		const tab = token.indexOf(9);
 		if (tab < 0) continue;
-		const metadata = token.slice(0, tab).split(/\s+/);
-		const path = token.slice(tab + 1);
+		const metadata = token.subarray(0, tab).toString("utf8").split(/\s+/);
+		const pathBytes = token.subarray(tab + 1);
+		const path = pathBytes.toString("utf8");
 		const [mode, type, oid, sizeText] = metadata;
 		if (
 			!mode ||
@@ -739,15 +801,17 @@ function parseTree(stdout: Buffer): Map<string, ReviewSnapshotTreeEntry> {
 			continue;
 		}
 		const size = sizeText && sizeText !== "-" ? Number(sizeText) : undefined;
-		entries.set(path, {
+		const entry: ReviewSnapshotTreeEntry = {
 			path,
 			mode,
 			type,
 			oid,
 			...(Number.isSafeInteger(size) && size !== undefined && size >= 0 ? { size } : {}),
-		});
+		};
+		entries.set(path, entry);
+		if (!Buffer.from(path, "utf8").equals(pathBytes)) pathspecUnsafeEntries.add(entry);
 	}
-	return entries;
+	return { entries, pathspecUnsafeEntries };
 }
 
 function collectLineRanges(lines: number[]): ReviewSnapshotLineRange[] {
@@ -822,7 +886,7 @@ function parseHunks(path: string, patch: string): ReviewSnapshotHunk[] {
 }
 
 function isBinary(content: Buffer): boolean {
-	return content.subarray(0, Math.min(content.length, 8_192)).includes(0);
+	return content.subarray(0, Math.min(content.length, REVIEW_BINARY_PROBE_BYTES)).includes(0);
 }
 
 function countLines(content: Buffer): number {
@@ -831,6 +895,628 @@ function countLines(content: Buffer): number {
 	for (const byte of content) if (byte === 10) lines++;
 	if (content.at(-1) === 10) lines--;
 	return lines;
+}
+
+type SearchManifestEntryKind = "text" | "unclassified" | "empty" | "binary" | "symlink" | "oversized" | "unavailable";
+
+interface SearchManifestEntry {
+	entry: ReviewSnapshotTreeEntry;
+	kind: SearchManifestEntryKind;
+	pathspecSafe: boolean;
+	reason?: string;
+}
+
+interface SearchManifest {
+	tree: string;
+	entries: SearchManifestEntry[];
+}
+
+interface SearchComputation {
+	result: ReviewSnapshotSearchResult;
+	retainedBytes: number;
+}
+
+interface SearchCacheEntry {
+	computation: SearchComputation;
+	bytes: number;
+}
+
+interface SearchInflight {
+	key: string;
+	controller: AbortController;
+	promise: Promise<SearchComputation>;
+	waiters: number;
+	settled: boolean;
+}
+
+interface SearchBlobRequest {
+	oid: string;
+	size: number;
+}
+
+interface SearchBlobReadState {
+	contents: Map<string, Buffer | undefined>;
+	readBytes: number;
+	fallbackOids: Set<string>;
+	fallbackBytes: number;
+}
+
+interface SearchPathChunks {
+	chunks: string[][];
+	fallbackPaths: Set<string>;
+}
+
+interface GitGrepPathResult {
+	matches: Set<string>;
+	fallbackPaths: Set<string>;
+}
+
+function searchAbortError(): Error {
+	return new Error("Review snapshot search was aborted.");
+}
+
+function throwIfSearchAborted(signal: AbortSignal): void {
+	if (signal.aborted) throw searchAbortError();
+}
+
+function searchTree(identity: ReviewSnapshotIdentity, revision: ReviewSnapshotRevision): string {
+	return revision === "base" ? identity.baseTree : identity.headTree;
+}
+
+function literalSearchPathspec(path: string): string {
+	return `:(top,literal)${path}`;
+}
+
+function chunkSearchPaths(paths: string[]): SearchPathChunks {
+	const chunks: string[][] = [];
+	const fallbackPaths = new Set<string>();
+	let chunk: string[] = [];
+	let bytes = 0;
+	for (const path of paths) {
+		const pathBytes = Buffer.byteLength(literalSearchPathspec(path), "utf8") + 1;
+		if (pathBytes > SEARCH_PATH_CHUNK_MAX_BYTES) {
+			fallbackPaths.add(path);
+			continue;
+		}
+		if (
+			chunk.length > 0 &&
+			(chunk.length >= SEARCH_PATH_CHUNK_MAX_COUNT || bytes + pathBytes > SEARCH_PATH_CHUNK_MAX_BYTES)
+		) {
+			chunks.push(chunk);
+			chunk = [];
+			bytes = 0;
+		}
+		chunk.push(path);
+		bytes += pathBytes;
+	}
+	if (chunk.length > 0) chunks.push(chunk);
+	return { chunks, fallbackPaths };
+}
+
+function parseGitGrepPaths(stdout: Buffer, tree: string, allowedPaths: ReadonlySet<string>): string[] {
+	if (stdout.length === 0) return [];
+	if (stdout.at(-1) !== 0) throw new Error("git grep returned a non-NUL-terminated path list.");
+	const prefix = `${tree}:`;
+	const paths: string[] = [];
+	let start = 0;
+	for (let index = 0; index < stdout.length; index++) {
+		if (stdout[index] !== 0) continue;
+		const token = stdout.subarray(start, index).toString("utf8");
+		start = index + 1;
+		if (!token.startsWith(prefix)) throw new Error("git grep returned a path outside the requested snapshot tree.");
+		const path = token.slice(prefix.length);
+		if (!allowedPaths.has(path)) throw new Error(`git grep returned an unexpected snapshot path: ${path}`);
+		paths.push(path);
+	}
+	return paths;
+}
+
+async function gitGrepPaths(
+	source: GitSource,
+	tree: string,
+	paths: string[],
+	options: {
+		pattern: string;
+		binaryMode: "exclude" | "text";
+		ignoreCase?: boolean;
+		perl?: boolean;
+		optional?: boolean;
+		signal: AbortSignal;
+	},
+): Promise<GitGrepPathResult | undefined> {
+	const matches = new Set<string>();
+	const { chunks, fallbackPaths } = chunkSearchPaths(paths);
+	for (const chunk of chunks) {
+		throwIfSearchAborted(options.signal);
+		const allowedPaths = new Set(chunk);
+		const result = await runCommand(
+			"git",
+			[
+				"grep",
+				"--no-color",
+				"--full-name",
+				options.perl ? "-P" : "-F",
+				options.binaryMode === "text" ? "--text" : "-I",
+				"-l",
+				"-z",
+				...(options.ignoreCase ? ["-i"] : []),
+				"-e",
+				options.pattern,
+				tree,
+				"--",
+				...chunk.map(literalSearchPathspec),
+			],
+			source.cwd,
+			{
+				env: {
+					...source.env,
+					GIT_LITERAL_PATHSPECS: "0",
+					GIT_GLOB_PATHSPECS: "0",
+					GIT_NOGLOB_PATHSPECS: "0",
+					GIT_ICASE_PATHSPECS: "0",
+					...(options.perl ? { LC_ALL: "C" } : {}),
+				},
+				signal: options.signal,
+				maxStdoutBytes: source.limits.maxMetadataBytes,
+				maxStderrBytes: source.limits.maxStderrBytes,
+			},
+		);
+		throwIfSearchAborted(options.signal);
+		if (result.failure) {
+			if (options.optional) return undefined;
+			throw new Error(`git grep failed: ${commandError(result)}`);
+		}
+		if (result.exitCode === 1) {
+			if (result.stdout.length > 0) throw new Error("git grep returned output with a no-match exit status.");
+			continue;
+		}
+		if (result.exitCode !== 0) {
+			if (options.optional) return undefined;
+			throw new Error(`git grep failed: ${commandError(result)}`);
+		}
+		for (const path of parseGitGrepPaths(result.stdout, tree, allowedPaths)) matches.add(path);
+		if (matches.size > SEARCH_MANIFEST_MAX_ENTRIES) {
+			throw new Error(`Review snapshot search exceeded the ${SEARCH_MANIFEST_MAX_ENTRIES} path result limit.`);
+		}
+	}
+	return { matches, fallbackPaths };
+}
+
+async function buildSearchManifest(
+	source: GitSource,
+	identity: ReviewSnapshotIdentity,
+	treeEntries: Map<string, ReviewSnapshotTreeEntry>,
+	pathspecUnsafeEntries: ReadonlySet<ReviewSnapshotTreeEntry>,
+	revision: ReviewSnapshotRevision,
+	prefix: string,
+	signal: AbortSignal,
+): Promise<SearchManifest> {
+	throwIfSearchAborted(signal);
+	const entries = [...treeEntries.values()]
+		.filter(
+			(entry) => entry.type === "blob" && (!prefix || entry.path === prefix || entry.path.startsWith(`${prefix}/`)),
+		)
+		.sort((left, right) => left.path.localeCompare(right.path));
+	if (entries.length > SEARCH_MANIFEST_MAX_ENTRIES) {
+		throw new Error(`Review snapshot search manifest exceeds the ${SEARCH_MANIFEST_MAX_ENTRIES} file limit.`);
+	}
+	const pathBytes = entries.reduce((total, entry) => total + Buffer.byteLength(entry.path, "utf8"), 0);
+	if (pathBytes > SEARCH_MANIFEST_MAX_PATH_BYTES) {
+		throw new Error(
+			`Review snapshot search manifest paths exceed the ${formatByteLimit(SEARCH_MANIFEST_MAX_PATH_BYTES)} limit.`,
+		);
+	}
+	const tree = searchTree(identity, revision);
+	const ordinaryEntries = entries.filter(
+		(entry) =>
+			entry.mode !== "120000" &&
+			entry.size !== undefined &&
+			entry.size > 0 &&
+			entry.size <= source.limits.maxBlobBytes,
+	);
+	const pathspecEntries = ordinaryEntries.filter((entry) => !pathspecUnsafeEntries.has(entry));
+	const classification = await gitGrepPaths(
+		source,
+		tree,
+		pathspecEntries.map((entry) => entry.path),
+		{ pattern: "", binaryMode: "exclude", signal },
+	);
+	if (!classification) throw new Error("git grep did not return a required classification set.");
+	const ambiguousEntries = pathspecEntries.filter(
+		(entry) =>
+			classification.fallbackPaths.has(entry.path) ||
+			!classification.matches.has(entry.path) ||
+			(entry.size ?? 0) > GIT_BINARY_PROBE_BYTES,
+	);
+	const nulPaths = await gitGrepPaths(
+		source,
+		tree,
+		ambiguousEntries.map((entry) => entry.path),
+		{ pattern: "\\x00", binaryMode: "text", perl: true, optional: true, signal },
+	);
+	const ambiguousPaths = new Set<string>();
+	const binaryPaths = new Set<string>();
+	for (const entry of ordinaryEntries) {
+		if (pathspecUnsafeEntries.has(entry) || classification.fallbackPaths.has(entry.path)) {
+			ambiguousPaths.add(entry.path);
+			continue;
+		}
+		if (classification.matches.has(entry.path) && (entry.size ?? 0) <= GIT_BINARY_PROBE_BYTES) continue;
+		if (nulPaths === undefined || nulPaths.fallbackPaths.has(entry.path)) {
+			ambiguousPaths.add(entry.path);
+			continue;
+		}
+		if (!nulPaths.matches.has(entry.path)) continue;
+		if ((entry.size ?? 0) <= REVIEW_BINARY_PROBE_BYTES) binaryPaths.add(entry.path);
+		else ambiguousPaths.add(entry.path);
+	}
+	return {
+		tree,
+		entries: entries.map((entry): SearchManifestEntry => {
+			const pathspecSafe = !pathspecUnsafeEntries.has(entry);
+			if (entry.size === undefined) {
+				return {
+					entry,
+					kind: "unavailable",
+					pathspecSafe,
+					reason: "Git did not report a blob size, so the file was not read.",
+				};
+			}
+			if (entry.size > source.limits.maxBlobBytes) {
+				return {
+					entry,
+					kind: "oversized",
+					pathspecSafe,
+					reason: `Blob size ${entry.size} bytes exceeds the ${formatByteLimit(source.limits.maxBlobBytes)} snapshot read limit.`,
+				};
+			}
+			if (entry.mode === "120000") return { entry, kind: "symlink", pathspecSafe };
+			if (entry.size === 0) return { entry, kind: "empty", pathspecSafe };
+			if (binaryPaths.has(entry.path)) {
+				return { entry, kind: "binary", pathspecSafe, reason: "Binary content was not searched." };
+			}
+			if (ambiguousPaths.has(entry.path)) return { entry, kind: "unclassified", pathspecSafe };
+			return { entry, kind: "text", pathspecSafe };
+		}),
+	};
+}
+
+function directGitSearchQuery(query: string): boolean {
+	for (let index = 0; index < query.length; index++) {
+		const code = query.charCodeAt(index);
+		if (code === 0 || code === 10 || code > 0x7f) return false;
+	}
+	return true;
+}
+
+function searchBlobBatchBytes(request: SearchBlobRequest): number {
+	return request.oid.length + 1 + 4 + 1 + String(request.size).length + 1 + request.size + 1;
+}
+
+interface SearchBlobProcessResult {
+	exitCode: number | null;
+}
+
+class SearchBlobReader {
+	private process: ChildProcess | undefined;
+	private processResult: Promise<SearchBlobProcessResult> | undefined;
+	private processError: Error | undefined;
+	private inputError: Error | undefined;
+	private outputError: Error | undefined;
+	private outputEnded = false;
+	private outputChunks: Buffer[] = [];
+	private outputBytes = 0;
+	private outputLimit = 0;
+	private outputWaiter: (() => void) | undefined;
+	private stderrChunks: Buffer[] = [];
+	private stderrBytes = 0;
+	private stderrLimited = false;
+	private closing = false;
+
+	private readonly source: GitSource;
+	private readonly state: SearchBlobReadState;
+	private readonly fallbackOids: ReadonlySet<string>;
+	private readonly signal: AbortSignal;
+
+	constructor(source: GitSource, state: SearchBlobReadState, fallbackOids: ReadonlySet<string>, signal: AbortSignal) {
+		this.source = source;
+		this.state = state;
+		this.fallbackOids = fallbackOids;
+		this.signal = signal;
+	}
+
+	async read(entry: ReviewSnapshotTreeEntry): Promise<Buffer | undefined> {
+		if (this.state.contents.has(entry.oid)) return this.state.contents.get(entry.oid);
+		if (entry.size === undefined) {
+			throw new Error("Review snapshot search could not schedule a selected blob read.");
+		}
+		const request = { oid: entry.oid, size: entry.size };
+		const maxBatchBytes = Math.max(this.source.limits.maxMetadataBytes, this.source.limits.maxBlobBytes + 256);
+		if (searchBlobBatchBytes(request) > maxBatchBytes) {
+			throw new Error(`Snapshot blob ${request.oid} exceeds the bounded batch-read output limit.`);
+		}
+		this.reserve(request);
+		throwIfSearchAborted(this.signal);
+		this.outputLimit = maxBatchBytes;
+		const process = this.start();
+		try {
+			await new Promise<void>((resolveWrite, reject) => {
+				try {
+					process.stdin?.write(`${request.oid}\n`, (error) => {
+						if (error) reject(error);
+						else resolveWrite();
+					});
+				} catch (error) {
+					reject(error);
+				}
+			});
+			throwIfSearchAborted(this.signal);
+			const content = await this.readResponse(request);
+			throwIfSearchAborted(this.signal);
+			this.state.contents.set(request.oid, content);
+			this.outputLimit = 0;
+			return content;
+		} catch (error) {
+			process.kill();
+			throw error;
+		}
+	}
+
+	async close(): Promise<void> {
+		if (this.closing) return;
+		this.closing = true;
+		if (!this.process || !this.processResult) return;
+		throwIfSearchAborted(this.signal);
+		this.process.stdin?.end();
+		const result = await this.processResult;
+		throwIfSearchAborted(this.signal);
+		this.throwOutputError();
+		if (this.outputBytes > 0) throw new Error("git cat-file --batch returned unexpected trailing output.");
+		this.throwProcessFailure(result);
+	}
+
+	async dispose(): Promise<void> {
+		this.closing = true;
+		if (!this.process || !this.processResult) return;
+		this.process.stdin?.destroy();
+		this.process.kill();
+		await this.processResult;
+	}
+
+	private reserve(request: SearchBlobRequest): void {
+		const readBytes = this.state.readBytes + request.size;
+		if (!Number.isSafeInteger(readBytes) || readBytes > SEARCH_READ_MAX_BYTES) {
+			throw new Error(
+				`Review snapshot search blob reads exceed the ${formatByteLimit(SEARCH_READ_MAX_BYTES)} aggregate limit.`,
+			);
+		}
+		let fallbackBytes = this.state.fallbackBytes;
+		const reserveFallback = this.fallbackOids.has(request.oid) && !this.state.fallbackOids.has(request.oid);
+		if (reserveFallback) {
+			const fallbackLimit = Math.min(SEARCH_FALLBACK_READ_MAX_BYTES, this.source.limits.maxMetadataBytes);
+			fallbackBytes += request.size;
+			if (!Number.isSafeInteger(fallbackBytes) || fallbackBytes > fallbackLimit) {
+				throw new Error(
+					`Review snapshot semantic fallback exceeds the ${formatByteLimit(fallbackLimit)} aggregate read limit.`,
+				);
+			}
+		}
+		this.state.readBytes = readBytes;
+		if (reserveFallback) {
+			this.state.fallbackOids.add(request.oid);
+			this.state.fallbackBytes = fallbackBytes;
+		}
+	}
+
+	private start(): ChildProcess {
+		if (this.process) return this.process;
+		const child = spawnProcess("git", ["cat-file", "--batch"], {
+			cwd: this.source.cwd,
+			env: this.source.env ? { ...process.env, ...this.source.env } : process.env,
+			stdio: ["pipe", "pipe", "pipe"],
+			signal: this.signal,
+		});
+		if (!child.stdin || !child.stdout || !child.stderr) {
+			child.kill();
+			throw new Error("git cat-file --batch did not provide the required pipes.");
+		}
+		this.process = child;
+		child.stdin.on("error", (error) => {
+			this.inputError = error;
+			this.wakeOutput();
+		});
+		child.stdout.on("data", (data: Buffer) => {
+			if (this.outputError) return;
+			if (this.outputLimit === 0) {
+				this.outputError = new Error("git cat-file --batch returned unexpected trailing output.");
+				child.kill();
+				this.wakeOutput();
+				return;
+			}
+			const nextBytes = this.outputBytes + data.length;
+			if (!Number.isSafeInteger(nextBytes) || nextBytes > this.outputLimit) {
+				this.outputError = new Error(
+					`git cat-file --batch failed: stdout exceeded the ${formatByteLimit(this.outputLimit)} capture limit`,
+				);
+				child.kill();
+				this.wakeOutput();
+				return;
+			}
+			this.outputChunks.push(data);
+			this.outputBytes = nextBytes;
+			this.wakeOutput();
+		});
+		const finishOutput = (): void => {
+			this.outputEnded = true;
+			this.wakeOutput();
+		};
+		child.stdout.once("end", finishOutput);
+		child.stdout.once("close", finishOutput);
+		child.stdout.once("error", (error) => {
+			this.outputError = error;
+			finishOutput();
+		});
+		child.stderr.on("data", (data: Buffer) => {
+			if (this.stderrLimited) return;
+			this.stderrBytes += data.length;
+			if (this.stderrBytes > this.source.limits.maxStderrBytes) {
+				this.stderrLimited = true;
+				this.stderrChunks = [];
+				child.kill();
+				return;
+			}
+			this.stderrChunks.push(data);
+		});
+		this.processResult = new Promise((resolveResult) => {
+			child.once("error", (error) => {
+				this.processError = error;
+				this.wakeOutput();
+			});
+			child.once("close", (exitCode) => {
+				finishOutput();
+				resolveResult({ exitCode });
+			});
+		});
+		return child;
+	}
+
+	private async readResponse(request: SearchBlobRequest): Promise<Buffer | undefined> {
+		const expectedHeader = `${request.oid} blob ${request.size}`;
+		const missingHeader = `${request.oid} missing`;
+		const header = await this.readHeader(Math.max(expectedHeader.length, missingHeader.length));
+		if (header === missingHeader) {
+			if (this.outputBytes > 0) throw new Error("git cat-file --batch returned unexpected trailing output.");
+			return undefined;
+		}
+		if (header !== expectedHeader) {
+			throw new Error(`git cat-file --batch returned unexpected metadata for ${request.oid}.`);
+		}
+		const response = await this.readBytesExactly(request.size + 1, request.oid);
+		if (response.at(-1) !== 10) {
+			throw new Error(`git cat-file --batch returned truncated content for ${request.oid}.`);
+		}
+		if (this.outputBytes > 0) throw new Error("git cat-file --batch returned unexpected trailing output.");
+		return response.subarray(0, request.size);
+	}
+
+	private async readHeader(maxBytes: number): Promise<string> {
+		while (true) {
+			this.throwOutputError();
+			const newline = this.findOutputByte(10);
+			if (newline >= 0) {
+				if (newline > maxBytes) throw new Error("git cat-file --batch returned unexpected object metadata.");
+				const header = this.takeOutputBytes(newline).toString("utf8");
+				this.takeOutputBytes(1);
+				return header;
+			}
+			if (this.outputBytes > maxBytes) {
+				throw new Error("git cat-file --batch returned unexpected object metadata.");
+			}
+			if (this.outputEnded || this.processError) {
+				await this.throwUnexpectedEnd("git cat-file --batch returned a truncated object header.");
+			}
+			await this.waitForOutputChange(this.outputBytes);
+		}
+	}
+
+	private async readBytesExactly(bytes: number, oid: string): Promise<Buffer> {
+		while (this.outputBytes < bytes) {
+			this.throwOutputError();
+			if (this.outputEnded || this.processError) {
+				await this.throwUnexpectedEnd(`git cat-file --batch returned truncated content for ${oid}.`);
+			}
+			await this.waitForOutputChange(this.outputBytes);
+		}
+		return this.takeOutputBytes(bytes);
+	}
+
+	private async waitForOutputChange(previousBytes: number): Promise<void> {
+		while (this.outputBytes === previousBytes && !this.outputEnded && !this.outputError && !this.processError) {
+			await new Promise<void>((resolveWait) => {
+				this.outputWaiter = resolveWait;
+			});
+		}
+		this.throwOutputError();
+	}
+
+	private async throwUnexpectedEnd(message: string): Promise<never> {
+		throwIfSearchAborted(this.signal);
+		if (!this.processResult) throw new Error(message);
+		const result = await this.processResult;
+		throwIfSearchAborted(this.signal);
+		this.throwProcessFailure(result);
+		throw new Error(message);
+	}
+
+	private throwOutputError(): void {
+		if (this.outputError) throw this.outputError;
+	}
+
+	private throwProcessFailure(result: SearchBlobProcessResult): void {
+		if (this.stderrLimited) {
+			throw new Error(
+				`git cat-file --batch failed: stderr exceeded the ${formatByteLimit(this.source.limits.maxStderrBytes)} capture limit`,
+			);
+		}
+		const processError = this.processError ?? this.inputError;
+		if (processError) throw new Error(`git cat-file --batch failed: ${processError.message}`);
+		if (result.exitCode !== 0) {
+			const stderr = Buffer.concat(this.stderrChunks, this.stderrBytes).toString("utf8").trim();
+			throw new Error(`git cat-file --batch failed: ${stderr || "command exited unsuccessfully"}`);
+		}
+	}
+
+	private findOutputByte(byte: number): number {
+		let offset = 0;
+		for (const chunk of this.outputChunks) {
+			const index = chunk.indexOf(byte);
+			if (index >= 0) return offset + index;
+			offset += chunk.length;
+		}
+		return -1;
+	}
+
+	private takeOutputBytes(bytes: number): Buffer {
+		const parts: Buffer[] = [];
+		let remaining = bytes;
+		while (remaining > 0) {
+			const chunk = this.outputChunks[0];
+			if (!chunk) throw new Error("git cat-file --batch output accounting failed.");
+			if (chunk.length <= remaining) {
+				parts.push(chunk);
+				this.outputChunks.shift();
+				remaining -= chunk.length;
+			} else {
+				parts.push(chunk.subarray(0, remaining));
+				this.outputChunks[0] = chunk.subarray(remaining);
+				remaining = 0;
+			}
+		}
+		this.outputBytes -= bytes;
+		return parts.length === 1 ? (parts[0] ?? Buffer.alloc(0)) : Buffer.concat(parts, bytes);
+	}
+
+	private wakeOutput(): void {
+		const waiter = this.outputWaiter;
+		this.outputWaiter = undefined;
+		waiter?.();
+	}
+}
+
+function searchComputationResult(computation: SearchComputation): ReviewSnapshotSearchResult {
+	return {
+		...computation.result,
+		matches: computation.result.matches.map((match) => ({ ...match })),
+		skippedPaths: computation.result.skippedPaths.map((skipped) => ({ ...skipped })),
+	};
+}
+
+function assertSearchResultBytes(retainedBytes: number): void {
+	if (retainedBytes > SEARCH_RESULT_MAX_BYTES) {
+		throw new Error(
+			`Review snapshot search results exceed the ${formatByteLimit(SEARCH_RESULT_MAX_BYTES)} retained result limit.`,
+		);
+	}
 }
 
 async function buildChangedFiles(
@@ -926,13 +1612,20 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	private readonly temporaryDirectories: string[];
 	private readonly materializedDirectories: string[] = [];
 	private readonly treeEntries = new Map<ReviewSnapshotRevision, Map<string, ReviewSnapshotTreeEntry>>();
+	private readonly pathspecUnsafeEntries = new Map<ReviewSnapshotRevision, ReadonlySet<ReviewSnapshotTreeEntry>>();
+	private readonly searchManifests = new Map<string, Promise<SearchManifest>>();
+	private readonly searchResults = new Map<string, SearchCacheEntry>();
+	private readonly searchInflight = new Map<string, SearchInflight>();
+	private readonly activeSearchWork = new Set<Promise<unknown>>();
+	private readonly disposalController = new AbortController();
+	private searchResultCacheBytes = 0;
 	private disposed = false;
 
 	private constructor(
 		init: SnapshotInit,
 		changedFiles: ReviewChangedFile[],
-		baseEntries: Map<string, ReviewSnapshotTreeEntry>,
-		headEntries: Map<string, ReviewSnapshotTreeEntry>,
+		baseInventory: ParsedReviewSnapshotTree,
+		headInventory: ParsedReviewSnapshotTree,
 	) {
 		this.description = init.description;
 		this.workflowDescription = init.workflowDescription;
@@ -944,8 +1637,10 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		this.limits = init.limits;
 		this.temporaryDirectories = init.temporaryDirectories;
 		this.changedFiles = changedFiles;
-		this.treeEntries.set("base", baseEntries);
-		this.treeEntries.set("head", headEntries);
+		this.treeEntries.set("base", baseInventory.entries);
+		this.treeEntries.set("head", headInventory.entries);
+		this.pathspecUnsafeEntries.set("base", baseInventory.pathspecUnsafeEntries);
+		this.pathspecUnsafeEntries.set("head", headInventory.pathspecUnsafeEntries);
 	}
 
 	static async create(init: SnapshotInit): Promise<GitReviewSnapshot> {
@@ -956,16 +1651,16 @@ class GitReviewSnapshot implements ReviewSnapshot {
 				`Could not inventory review snapshot trees: ${commandError(baseTreeResult.ok ? headTreeResult : baseTreeResult)}`,
 			);
 		}
-		const baseEntries = parseTree(baseTreeResult.stdout);
-		const headEntries = parseTree(headTreeResult.stdout);
+		const baseInventory = parseTree(baseTreeResult.stdout);
+		const headInventory = parseTree(headTreeResult.stdout);
 		const changedFiles = await buildChangedFiles(
 			init.source,
 			init.identity.baseTree,
 			init.identity.headTree,
-			baseEntries,
-			headEntries,
+			baseInventory.entries,
+			headInventory.entries,
 		);
-		return new GitReviewSnapshot(init, changedFiles, baseEntries, headEntries);
+		return new GitReviewSnapshot(init, changedFiles, baseInventory, headInventory);
 	}
 
 	async readFile(revision: ReviewSnapshotRevision, path: string): Promise<ReviewSnapshotFile | undefined> {
@@ -1029,6 +1724,369 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			.sort((left, right) => left.path.localeCompare(right.path));
 	}
 
+	async search(options: ReviewSnapshotSearchOptions): Promise<ReviewSnapshotSearchResult> {
+		this.assertActive();
+		if (!options.query) throw new Error("Review snapshot search query must not be empty.");
+		for (const [name, value, minimum] of [
+			["fileIndex", options.fileIndex ?? 0, 0],
+			["lineIndex", options.lineIndex ?? 0, 0],
+			["limit", options.limit, 1],
+			["maxFiles", options.maxFiles, 1],
+		] as const) {
+			if (!Number.isSafeInteger(value) || value < minimum) {
+				throw new Error(`Review snapshot search ${name} is outside its supported range.`);
+			}
+		}
+		if (options.signal?.aborted) throw searchAbortError();
+		const prefix = options.prefix === undefined || options.prefix === "" ? "" : normalizeReviewPath(options.prefix);
+		const normalized: ReviewSnapshotSearchOptions = {
+			...options,
+			prefix,
+			ignoreCase: options.ignoreCase ?? false,
+			fileIndex: options.fileIndex ?? 0,
+			lineIndex: options.lineIndex ?? 0,
+		};
+		const key = JSON.stringify([
+			options.revision,
+			prefix,
+			options.query,
+			normalized.ignoreCase,
+			normalized.fileIndex,
+			normalized.lineIndex,
+			normalized.limit,
+			normalized.maxFiles,
+		]);
+		const cached = this.takeCachedSearchResult(key);
+		if (cached) return searchComputationResult(cached);
+		let inflight = this.searchInflight.get(key);
+		if (inflight?.controller.signal.aborted && !inflight.settled) {
+			if (this.searchInflight.get(key) === inflight) this.searchInflight.delete(key);
+			inflight = undefined;
+		}
+		if (!inflight) inflight = this.startSearchComputation(key, normalized);
+		const computation = await this.waitForSearchComputation(inflight, options.signal);
+		return searchComputationResult(computation);
+	}
+
+	private startSearchComputation(key: string, options: ReviewSnapshotSearchOptions): SearchInflight {
+		const controller = new AbortController();
+		const signal = AbortSignal.any([controller.signal, this.disposalController.signal]);
+		const promise = this.computeSearch(options, signal);
+		const inflight: SearchInflight = { key, controller, promise, waiters: 0, settled: false };
+		this.searchInflight.set(key, inflight);
+		this.trackSearchWork(promise);
+		void promise.then(
+			(computation) => {
+				inflight.settled = true;
+				if (this.searchInflight.get(key) === inflight) this.searchInflight.delete(key);
+				if (!this.disposed && !controller.signal.aborted) this.cacheSearchResult(key, computation);
+			},
+			() => {
+				inflight.settled = true;
+				if (this.searchInflight.get(key) === inflight) this.searchInflight.delete(key);
+			},
+		);
+		return inflight;
+	}
+
+	private waitForSearchComputation(
+		inflight: SearchInflight,
+		signal: AbortSignal | undefined,
+	): Promise<SearchComputation> {
+		inflight.waiters++;
+		return new Promise((resolveResult, reject) => {
+			let settled = false;
+			const release = (aborted: boolean): void => {
+				if (settled) return;
+				settled = true;
+				signal?.removeEventListener("abort", onAbort);
+				inflight.waiters--;
+				if (aborted && inflight.waiters === 0 && !inflight.settled) {
+					if (this.searchInflight.get(inflight.key) === inflight) this.searchInflight.delete(inflight.key);
+					inflight.controller.abort();
+				}
+			};
+			const onAbort = (): void => {
+				release(true);
+				reject(searchAbortError());
+			};
+			if (signal?.aborted) {
+				onAbort();
+				return;
+			}
+			signal?.addEventListener("abort", onAbort, { once: true });
+			void inflight.promise.then(
+				(computation) => {
+					release(false);
+					resolveResult(computation);
+				},
+				(error: unknown) => {
+					release(false);
+					reject(error);
+				},
+			);
+		});
+	}
+
+	private async computeSearch(options: ReviewSnapshotSearchOptions, signal: AbortSignal): Promise<SearchComputation> {
+		const manifest = await this.waitForSearchPromise(
+			this.getSearchManifest(options.revision, options.prefix ?? ""),
+			signal,
+		);
+		throwIfSearchAborted(signal);
+		const entries = manifest.entries;
+		const firstFileIndex = options.fileIndex ?? 0;
+		const pageEntries = entries.slice(firstFileIndex, firstFileIndex + options.maxFiles);
+		const textEntries = pageEntries.filter((entry) => entry.kind === "text");
+		const fallbackEntries = pageEntries.filter((entry) => entry.kind === "unclassified" || entry.kind === "symlink");
+		const selectedPaths = new Set<string>();
+		const fallbackPaths = new Set<string>();
+		const ignoreCase = options.ignoreCase === true;
+		if (directGitSearchQuery(options.query)) {
+			const pathspecTextEntries = textEntries.filter((entry) => entry.pathspecSafe);
+			for (const { entry, pathspecSafe } of textEntries) {
+				if (pathspecSafe) continue;
+				selectedPaths.add(entry.path);
+				fallbackPaths.add(entry.path);
+			}
+			const directMatches = await gitGrepPaths(
+				this.source,
+				manifest.tree,
+				pathspecTextEntries.map(({ entry }) => entry.path),
+				{ pattern: options.query, binaryMode: "text", ignoreCase, signal },
+			);
+			if (!directMatches) throw new Error("git grep did not return a required candidate set.");
+			for (const path of directMatches.matches) selectedPaths.add(path);
+			for (const path of directMatches.fallbackPaths) {
+				selectedPaths.add(path);
+				fallbackPaths.add(path);
+			}
+			if (ignoreCase) {
+				const nonAsciiPaths = await gitGrepPaths(
+					this.source,
+					manifest.tree,
+					pathspecTextEntries.map(({ entry }) => entry.path),
+					{ pattern: "[^\\x00-\\x7f]", binaryMode: "text", perl: true, optional: true, signal },
+				);
+				for (const { entry } of nonAsciiPaths === undefined
+					? pathspecTextEntries
+					: pathspecTextEntries.filter(
+							({ entry }) =>
+								nonAsciiPaths.matches.has(entry.path) || nonAsciiPaths.fallbackPaths.has(entry.path),
+						)) {
+					selectedPaths.add(entry.path);
+					fallbackPaths.add(entry.path);
+				}
+			}
+		} else {
+			for (const { entry } of textEntries) {
+				selectedPaths.add(entry.path);
+				fallbackPaths.add(entry.path);
+			}
+		}
+		for (const { entry } of fallbackEntries) {
+			selectedPaths.add(entry.path);
+			fallbackPaths.add(entry.path);
+		}
+		const fallbackOids = new Set(
+			pageEntries.filter(({ entry }) => fallbackPaths.has(entry.path)).map(({ entry }) => entry.oid),
+		);
+		const readState: SearchBlobReadState = {
+			contents: new Map<string, Buffer | undefined>(),
+			readBytes: 0,
+			fallbackOids: new Set<string>(),
+			fallbackBytes: 0,
+		};
+		const blobReader = new SearchBlobReader(this.source, readState, fallbackOids, signal);
+
+		const matches: ReviewSnapshotSearchMatch[] = [];
+		const skippedPaths: Array<{ path: string; reason: string }> = [];
+		let nextFileIndex = firstFileIndex;
+		let nextLineIndex = options.lineIndex ?? 0;
+		let filesScanned = 0;
+		let retainedBytes = 0;
+		const needle = ignoreCase ? options.query.toLocaleLowerCase() : options.query;
+		try {
+			while (nextFileIndex < entries.length && filesScanned < options.maxFiles && matches.length < options.limit) {
+				throwIfSearchAborted(signal);
+				const manifestEntry = entries[nextFileIndex];
+				const { entry } = manifestEntry;
+				filesScanned++;
+				if (manifestEntry.reason) {
+					skippedPaths.push({ path: entry.path, reason: manifestEntry.reason });
+					retainedBytes +=
+						Buffer.byteLength(entry.path, "utf8") + Buffer.byteLength(manifestEntry.reason, "utf8") + 32;
+					assertSearchResultBytes(retainedBytes);
+					nextFileIndex++;
+					nextLineIndex = 0;
+					continue;
+				}
+				if (!selectedPaths.has(entry.path)) {
+					nextFileIndex++;
+					nextLineIndex = 0;
+					continue;
+				}
+				if (!readState.contents.has(entry.oid)) {
+					await blobReader.read(entry);
+					throwIfSearchAborted(signal);
+				}
+				const content = readState.contents.get(entry.oid);
+				let skipReason: string | undefined;
+				if (content === undefined) {
+					skipReason = `Could not read the snapshot blob: object ${entry.oid} is unavailable.`;
+				} else if (isBinary(content)) {
+					skipReason = "Binary content was not searched.";
+				}
+				if (skipReason) {
+					skippedPaths.push({ path: entry.path, reason: skipReason });
+					retainedBytes += Buffer.byteLength(entry.path, "utf8") + Buffer.byteLength(skipReason, "utf8") + 32;
+					assertSearchResultBytes(retainedBytes);
+					nextFileIndex++;
+					nextLineIndex = 0;
+					continue;
+				}
+				if (content === undefined) throw new Error("Review snapshot search content was unexpectedly unavailable.");
+				const lines = content.toString("utf8").split("\n");
+				while (nextLineIndex < lines.length && matches.length < options.limit) {
+					const line = lines[nextLineIndex] ?? "";
+					const haystack = ignoreCase ? line.toLocaleLowerCase() : line;
+					if (haystack.includes(needle)) {
+						const match = { path: entry.path, line: nextLineIndex + 1, text: line.slice(0, 500) };
+						matches.push(match);
+						retainedBytes += Buffer.byteLength(match.path, "utf8") + Buffer.byteLength(match.text, "utf8") + 32;
+						assertSearchResultBytes(retainedBytes);
+						if (matches.length > SEARCH_RESULT_MAX_MATCHES) {
+							throw new Error(
+								`Review snapshot search exceeds the ${SEARCH_RESULT_MAX_MATCHES} retained match limit.`,
+							);
+						}
+					}
+					nextLineIndex++;
+				}
+				if (nextLineIndex >= lines.length) {
+					nextFileIndex++;
+					nextLineIndex = 0;
+				}
+			}
+			const computation = {
+				result: {
+					matches,
+					filesScanned,
+					skippedPaths,
+					nextFileIndex,
+					nextLineIndex,
+					complete: nextFileIndex >= entries.length,
+				},
+				retainedBytes,
+			};
+			await blobReader.close();
+			return computation;
+		} catch (error) {
+			await blobReader.dispose();
+			throw error;
+		}
+	}
+
+	private getSearchManifest(revision: ReviewSnapshotRevision, prefix: string): Promise<SearchManifest> {
+		this.assertActive();
+		const key = JSON.stringify([revision, prefix]);
+		const existing = this.searchManifests.get(key);
+		if (existing) {
+			this.searchManifests.delete(key);
+			this.searchManifests.set(key, existing);
+			return existing;
+		}
+		const entries = this.treeEntries.get(revision);
+		const pathspecUnsafeEntries = this.pathspecUnsafeEntries.get(revision);
+		if (!entries || !pathspecUnsafeEntries) {
+			throw new Error(`Review snapshot ${revision} tree inventory is unavailable.`);
+		}
+		const promise = buildSearchManifest(
+			this.source,
+			this.identity,
+			entries,
+			pathspecUnsafeEntries,
+			revision,
+			prefix,
+			this.disposalController.signal,
+		);
+		this.searchManifests.set(key, promise);
+		while (this.searchManifests.size > SEARCH_MANIFEST_CACHE_MAX_ENTRIES) {
+			const oldestKey = this.searchManifests.keys().next().value;
+			if (oldestKey === undefined) break;
+			this.searchManifests.delete(oldestKey);
+		}
+		this.trackSearchWork(promise);
+		void promise.then(undefined, () => {
+			if (this.searchManifests.get(key) === promise) this.searchManifests.delete(key);
+		});
+		return promise;
+	}
+
+	private waitForSearchPromise<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+		if (signal.aborted) return Promise.reject(searchAbortError());
+		return new Promise((resolveResult, reject) => {
+			let settled = false;
+			const finish = (): boolean => {
+				if (settled) return false;
+				settled = true;
+				signal.removeEventListener("abort", onAbort);
+				return true;
+			};
+			const onAbort = (): void => {
+				if (!finish()) return;
+				reject(searchAbortError());
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			void promise.then(
+				(value) => {
+					if (finish()) resolveResult(value);
+				},
+				(error: unknown) => {
+					if (finish()) reject(error);
+				},
+			);
+		});
+	}
+
+	private trackSearchWork(promise: Promise<unknown>): void {
+		this.activeSearchWork.add(promise);
+		void promise.then(
+			() => this.activeSearchWork.delete(promise),
+			() => this.activeSearchWork.delete(promise),
+		);
+	}
+
+	private takeCachedSearchResult(key: string): SearchComputation | undefined {
+		const cached = this.searchResults.get(key);
+		if (!cached) return undefined;
+		this.searchResults.delete(key);
+		this.searchResults.set(key, cached);
+		return cached.computation;
+	}
+
+	private cacheSearchResult(key: string, computation: SearchComputation): void {
+		if (computation.retainedBytes > SEARCH_RESULT_CACHE_MAX_ENTRY_BYTES) return;
+		const existing = this.searchResults.get(key);
+		if (existing) {
+			this.searchResults.delete(key);
+			this.searchResultCacheBytes -= existing.bytes;
+		}
+		const cached = { computation, bytes: computation.retainedBytes };
+		this.searchResults.set(key, cached);
+		this.searchResultCacheBytes += cached.bytes;
+		while (
+			this.searchResults.size > SEARCH_RESULT_CACHE_MAX_ENTRIES ||
+			this.searchResultCacheBytes > SEARCH_RESULT_CACHE_MAX_BYTES
+		) {
+			const oldestKey = this.searchResults.keys().next().value;
+			if (oldestKey === undefined) break;
+			const oldest = this.searchResults.get(oldestKey);
+			this.searchResults.delete(oldestKey);
+			if (oldest) this.searchResultCacheBytes -= oldest.bytes;
+		}
+	}
+
 	async materializeHead(): Promise<string> {
 		this.assertActive();
 		const directory = await mkdtemp(join(tmpdir(), "volt-review-checkout-"));
@@ -1068,6 +2126,14 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	async dispose(): Promise<void> {
 		if (this.disposed) return;
 		this.disposed = true;
+		this.disposalController.abort();
+		while (this.activeSearchWork.size > 0) {
+			await Promise.allSettled([...this.activeSearchWork]);
+		}
+		this.searchInflight.clear();
+		this.searchManifests.clear();
+		this.searchResults.clear();
+		this.searchResultCacheBytes = 0;
 		for (const directory of [...this.materializedDirectories, ...this.temporaryDirectories].reverse()) {
 			await rm(directory, { recursive: true, force: true }).catch(() => {});
 		}
