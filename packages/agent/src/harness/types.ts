@@ -753,6 +753,8 @@ export interface CompactResult {
 	summary: string;
 	firstKeptEntryId: string;
 	tokensBefore: number;
+	/** Fresh estimate for the rebuilt messages and active tool definitions. */
+	estimatedTokensAfter?: number;
 	details?: JsonValue;
 }
 

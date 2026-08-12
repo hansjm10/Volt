@@ -1,10 +1,13 @@
 import {
 	type AssistantMessage,
+	estimateToolDefinitionTokens,
 	type FauxProviderRegistration,
 	fauxAssistantMessage,
 	type Message,
 	type Model,
 	registerFauxProvider,
+	type Tool,
+	Type,
 	type Usage,
 } from "@hansjm10/volt-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -14,6 +17,7 @@ import {
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
+	estimateMessagesTokens,
 	estimateTokens,
 	findCutPoint,
 	findTurnStartIndex,
@@ -186,6 +190,42 @@ describe("harness compaction", () => {
 		expect(entries[result.firstKeptEntryIndex]?.type).toBe("message");
 	});
 
+	it("excludes the first independently cuttable context entry that would exceed the budget", () => {
+		const first = createMessageEntry(createUserMessage("a".repeat(2400)));
+		const second = createMessageEntry(createUserMessage("b".repeat(2400)), first.id);
+
+		const result = findCutPoint([first, second], 0, 2, 1000);
+
+		expect(result.firstKeptEntryIndex).toBe(1);
+		expect(estimateMessagesTokens([second.message])).toBe(600);
+	});
+
+	it("counts persisted custom and branch-summary context against the budget", () => {
+		const branchSummary: BranchSummaryEntry = {
+			type: "branch_summary",
+			id: createId(),
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			fromId: "branch",
+			summary: "a".repeat(2400),
+		};
+		const customMessage: CustomMessageEntry = {
+			type: "custom_message",
+			id: createId(),
+			parentId: branchSummary.id,
+			timestamp: new Date().toISOString(),
+			customType: "note",
+			content: "b".repeat(2400),
+			display: true,
+		};
+		const user = createMessageEntry(createUserMessage("c".repeat(2400)), customMessage.id);
+
+		const result = findCutPoint([branchSummary, customMessage, user], 0, 3, 1000);
+
+		expect(result.firstKeptEntryIndex).toBe(2);
+		expect([branchSummary, customMessage, user][result.firstKeptEntryIndex]?.id).toBe(user.id);
+	});
+
 	it("keeps a trailing tool call and its results together when they exceed the retention budget", () => {
 		const user = createMessageEntry(createUserMessage("inspect a large file"));
 		const assistant = createMessageEntry(
@@ -244,7 +284,7 @@ describe("harness compaction", () => {
 		expect(findTurnStartIndex([thinking, modelChange], 1, 0)).toBe(-1);
 
 		const result = findCutPoint([thinking, branchSummary, customMessage], 0, 3, 1);
-		expect(result.firstKeptEntryIndex).toBe(0);
+		expect(result.firstKeptEntryIndex).toBe(2);
 
 		const toolResult = createMessageEntry({
 			role: "toolResult",
@@ -361,6 +401,45 @@ describe("harness compaction", () => {
 		const loaded = buildSessionContext([user, modelChange, assistant, thinkingChange]);
 		expect(loaded.model).toEqual({ provider: "anthropic", modelId: "claude-sonnet-4-5" });
 		expect(loaded.thinkingLevel).toBe("high");
+	});
+
+	it("reduces retained messages and counts active tools when provider usage is unavailable", () => {
+		const entries: SessionTreeEntry[] = [];
+		let parentId: string | null = null;
+		for (let index = 0; index < 5; index++) {
+			const entry = createMessageEntry(createUserMessage(String(index).repeat(4000)), parentId);
+			entries.push(entry);
+			parentId = entry.id;
+		}
+		const settings: CompactionSettings = {
+			...DEFAULT_COMPACTION_SETTINGS,
+			reserveTokens: 1000,
+			keepRecentTokens: 4000,
+		};
+		const largeTool: Tool = {
+			name: "large_tool",
+			description: "x".repeat(16_000),
+			parameters: Type.Object({}),
+		};
+		const contextWindow = 8000;
+
+		const withoutTools = getOrThrow(prepareCompaction(entries, settings));
+		const withTools = getOrThrow(prepareCompaction(entries, settings, { tools: [largeTool], contextWindow }));
+
+		expect(withoutTools).toBeDefined();
+		expect(withTools).toBeDefined();
+		const withoutToolsStart = entries.findIndex((entry) => entry.id === withoutTools!.firstKeptEntryId);
+		const withToolsStart = entries.findIndex((entry) => entry.id === withTools!.firstKeptEntryId);
+		expect(withToolsStart).toBeGreaterThan(withoutToolsStart);
+		const retainedMessages = entries
+			.slice(withToolsStart)
+			.flatMap((entry) => (entry.type === "message" ? [entry.message as AgentMessage] : []));
+		const retainedMessageBudget = Math.min(
+			settings.keepRecentTokens,
+			contextWindow - settings.reserveTokens - estimateToolDefinitionTokens([largeTool]),
+		);
+		expect(estimateMessagesTokens(retainedMessages)).toBeLessThanOrEqual(retainedMessageBudget);
+		expect(withTools!.tokensBefore - withoutTools!.tokensBefore).toBe(estimateToolDefinitionTokens([largeTool]));
 	});
 
 	it("prepares compaction using the latest compaction summary as previousSummary", () => {

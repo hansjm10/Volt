@@ -1,6 +1,7 @@
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
+	estimateToolDefinitionTokens,
 	type ImageContent,
 	type JsonValue,
 	type Model,
@@ -20,7 +21,12 @@ import type {
 	ThinkingLevel,
 } from "../types.ts";
 import { collectEntriesForBranchSummary, generateBranchSummary } from "./compaction/branch-summarization.ts";
-import { compact, DEFAULT_COMPACTION_SETTINGS, prepareCompaction } from "./compaction/compaction.ts";
+import {
+	compact,
+	DEFAULT_COMPACTION_SETTINGS,
+	estimateMessagesTokens,
+	prepareCompaction,
+} from "./compaction/compaction.ts";
 import { convertToLlm } from "./messages.ts";
 import { formatPromptTemplateInvocation } from "./prompt-templates.ts";
 import { formatSkillInvocation } from "./skills.ts";
@@ -987,9 +993,13 @@ export class AgentHarness<
 		}
 	}
 
-	async compact(
-		customInstructions?: string,
-	): Promise<{ summary: string; firstKeptEntryId: string; tokensBefore: number; details?: JsonValue }> {
+	async compact(customInstructions?: string): Promise<{
+		summary: string;
+		firstKeptEntryId: string;
+		tokensBefore: number;
+		estimatedTokensAfter: number;
+		details?: JsonValue;
+	}> {
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "compact() requires idle harness");
 		this.phase = "compaction";
 		try {
@@ -998,7 +1008,11 @@ export class AgentHarness<
 			const auth = await this.getApiKeyAndHeaders?.(model);
 			if (!auth) throw new AgentHarnessError("auth", "No auth available for compaction");
 			const branchEntries = await this.session.getBranch();
-			const preparationResult = prepareCompaction(branchEntries, DEFAULT_COMPACTION_SETTINGS);
+			const activeTools = this.getActiveTools();
+			const preparationResult = prepareCompaction(branchEntries, DEFAULT_COMPACTION_SETTINGS, {
+				tools: activeTools,
+				contextWindow: model.contextWindow,
+			});
 			if (!preparationResult.ok) throw preparationResult.error;
 			const preparation = preparationResult.value;
 			if (!preparation) throw new AgentHarnessError("compaction", "Nothing to compact");
@@ -1035,7 +1049,10 @@ export class AgentHarness<
 			if (entry?.type === "compaction") {
 				await this.emitOwn({ type: "session_compact", compactionEntry: entry, fromHook: provided !== undefined });
 			}
-			return result;
+			const rebuiltContext = await this.session.buildContext();
+			const estimatedTokensAfter =
+				estimateMessagesTokens(rebuiltContext.messages) + estimateToolDefinitionTokens(activeTools);
+			return { ...result, estimatedTokensAfter };
 		} catch (error) {
 			throw normalizeHarnessError(error, "compaction");
 		} finally {

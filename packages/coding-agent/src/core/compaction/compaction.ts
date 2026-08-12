@@ -6,8 +6,8 @@
  */
 
 import type { AgentMessage, StreamFn, ThinkingLevel } from "@hansjm10/volt-agent-core";
-import type { AssistantMessage, Context, JsonValue, Model, SimpleStreamOptions, Usage } from "@hansjm10/volt-ai";
-import { completeSimple, isContextOverflow } from "@hansjm10/volt-ai";
+import type { AssistantMessage, Context, JsonValue, Model, SimpleStreamOptions, Tool, Usage } from "@hansjm10/volt-ai";
+import { completeSimple, estimateToolDefinitionTokens, isContextOverflow } from "@hansjm10/volt-ai";
 import { sleep } from "../../utils/sleep.ts";
 import {
 	convertToLlm,
@@ -207,12 +207,14 @@ export function estimateMessagesTokens(messages: AgentMessage[]): number {
 /**
  * Estimate context tokens from messages, using the last assistant usage when available.
  * If there are messages after the last usage, estimate their tokens with estimateTokens.
+ * Provider usage already includes the request's tool definitions, so active tools are
+ * added only when no valid provider usage exists.
  */
-export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+export function estimateContextTokens(messages: AgentMessage[], tools?: readonly Tool[]): ContextUsageEstimate {
 	const usageInfo = getLastAssistantUsageInfo(messages);
 
 	if (!usageInfo) {
-		const estimated = estimateMessagesTokens(messages);
+		const estimated = estimateMessagesTokens(messages) + estimateToolDefinitionTokens(tools);
 		return {
 			tokens: estimated,
 			usageTokens: 0,
@@ -391,13 +393,14 @@ export interface CutPointResult {
 }
 
 /**
- * Find the cut point in session entries that keeps approximately `keepRecentTokens`.
+ * Find the cut point in session entries that keeps at most `keepRecentTokens`.
  *
- * Algorithm: Walk backwards from newest, accumulating estimated message sizes.
- * Stop when we've accumulated >= keepRecentTokens. Cut at that point.
+ * Algorithm: Walk backwards from newest, accumulating estimated context entry sizes.
+ * Stop before retaining an entry that would exceed keepRecentTokens.
  *
- * Can cut at user OR assistant messages (never tool results). When cutting at an
- * assistant message with tool calls, its tool results come after and will be kept.
+ * Can cut at user, assistant, custom message, or branch summary entries (never tool
+ * results). When cutting at an assistant message with tool calls, its tool results
+ * come after and will be kept.
  *
  * Returns CutPointResult with:
  * - firstKeptEntryIndex: the entry index to start keeping from
@@ -418,40 +421,34 @@ export function findCutPoint(
 		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
 	}
 
-	// Walk backwards from newest, accumulating estimated message sizes
+	// Walk backwards from newest, accumulating estimated context message sizes.
 	let accumulatedTokens = 0;
-	let cutIndex = cutPoints[0]; // Default: keep from first message (not header)
+	let cutIndex = cutPoints[0]; // Default: keep from first context entry.
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
-		const entry = entries[i];
-		if (entry.type !== "message") continue;
+		const message = getMessageFromEntryForCompaction(entries[i]);
+		if (!message) continue;
 
-		// Estimate this message's size
-		const messageTokens = estimateTokens(entry.message);
-		accumulatedTokens += messageTokens;
-
-		// Check if we've exceeded the budget
-		if (accumulatedTokens >= keepRecentTokens) {
-			// Tool results are not valid cut points. If the budget lands in a trailing
-			// result batch, retain the assistant that issued it so compaction still
-			// advances while keeping the call and all of its results together.
-			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
+		const messageTokens = estimateTokens(message);
+		if (accumulatedTokens + messageTokens > keepRecentTokens) {
+			// Exclude the crossing message by cutting at the next valid boundary. If
+			// there is no later boundary, retain the newest valid suffix so compaction
+			// still advances without separating tool results from their assistant call.
+			cutIndex = cutPoints.find((candidate) => candidate > i) ?? cutPoints[cutPoints.length - 1];
 			break;
 		}
+		accumulatedTokens += messageTokens;
 	}
 
-	// Scan backwards from cutIndex to include any non-message entries (bash, settings, etc.)
+	// Scan backwards from cutIndex to include preceding non-context entries.
 	while (cutIndex > startIndex) {
 		const prevEntry = entries[cutIndex - 1];
-		// Stop at session header or compaction boundaries
 		if (prevEntry.type === "compaction") {
 			break;
 		}
-		if (prevEntry.type === "message") {
-			// Stop if we hit any message
+		if (getMessageFromEntryForCompaction(prevEntry)) {
 			break;
 		}
-		// Include this non-message entry (bash, settings change, etc.)
 		cutIndex--;
 	}
 
@@ -759,6 +756,11 @@ export async function generateSummary(
 // Compaction Preparation (for extensions)
 // ============================================================================
 
+export interface CompactionContextBudget {
+	tools?: readonly Tool[];
+	contextWindow?: number;
+}
+
 export interface CompactionPreparation {
 	/** UUID of first entry to keep */
 	firstKeptEntryId: string;
@@ -780,6 +782,7 @@ export interface CompactionPreparation {
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
+	context: CompactionContextBudget = {},
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -802,10 +805,14 @@ export function prepareCompaction(
 		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
 	}
 	const boundaryEnd = pathEntries.length;
+	const toolTokens = estimateToolDefinitionTokens(context.tools);
+	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages, context.tools).tokens;
+	const retainedMessageTokens =
+		context.contextWindow !== undefined && context.contextWindow > 0
+			? Math.min(settings.keepRecentTokens, Math.max(0, context.contextWindow - settings.reserveTokens - toolTokens))
+			: settings.keepRecentTokens;
 
-	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
-
-	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, retainedMessageTokens);
 
 	// Get UUID of first kept entry
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
