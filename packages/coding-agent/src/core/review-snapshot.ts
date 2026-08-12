@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -222,7 +223,6 @@ const SEARCH_RESULT_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const SEARCH_RESULT_CACHE_MAX_ENTRY_BYTES = 8 * 1024 * 1024;
 const SEARCH_READ_MAX_BYTES = 256 * 1024 * 1024;
 const SEARCH_FALLBACK_READ_MAX_BYTES = 64 * 1024 * 1024;
-const SEARCH_BATCH_MAX_OBJECTS = 2_048;
 const GIT_BINARY_PROBE_BYTES = 8_000;
 const REVIEW_BINARY_PROBE_BYTES = 8_192;
 const DEFAULT_REVIEW_SNAPSHOT_LIMITS: ReviewSnapshotLimits = {
@@ -1193,154 +1193,314 @@ function searchBlobBatchBytes(request: SearchBlobRequest): number {
 	return request.oid.length + 1 + 4 + 1 + String(request.size).length + 1 + request.size + 1;
 }
 
-function parseSearchBlobBatch(stdout: Buffer, requests: SearchBlobRequest[]): Map<string, Buffer | undefined> {
-	const contents = new Map<string, Buffer | undefined>();
-	let offset = 0;
-	for (const request of requests) {
-		const newline = stdout.indexOf(10, offset);
-		if (newline < 0) throw new Error("git cat-file --batch returned a truncated object header.");
-		const header = stdout.subarray(offset, newline).toString("utf8");
-		offset = newline + 1;
-		if (header === `${request.oid} missing`) {
-			contents.set(request.oid, undefined);
-			continue;
-		}
-		if (header !== `${request.oid} blob ${request.size}`) {
-			throw new Error(`git cat-file --batch returned unexpected metadata for ${request.oid}.`);
-		}
-		const end = offset + request.size;
-		if (end >= stdout.length || stdout[end] !== 10) {
-			throw new Error(`git cat-file --batch returned truncated content for ${request.oid}.`);
-		}
-		contents.set(request.oid, stdout.subarray(offset, end));
-		offset = end + 1;
-	}
-	if (offset !== stdout.length) throw new Error("git cat-file --batch returned unexpected trailing output.");
-	return contents;
+interface SearchBlobProcessResult {
+	exitCode: number | null;
 }
 
-async function readSearchBlobs(
-	source: GitSource,
-	entries: ReadonlyArray<{ entry: ReviewSnapshotTreeEntry }>,
-	state: SearchBlobReadState,
-	signal: AbortSignal,
-): Promise<void> {
-	const requestsByOid = new Map<string, SearchBlobRequest>();
-	for (const { entry } of entries) {
-		if (entry.size === undefined || state.contents.has(entry.oid)) continue;
-		requestsByOid.set(entry.oid, { oid: entry.oid, size: entry.size });
-	}
-	const requests = [...requestsByOid.values()];
-	const requestBytes = requests.reduce((total, request) => total + request.size, 0);
-	const totalBytes = state.readBytes + requestBytes;
-	if (!Number.isSafeInteger(totalBytes) || totalBytes > SEARCH_READ_MAX_BYTES) {
-		throw new Error(
-			`Review snapshot search blob reads exceed the ${formatByteLimit(SEARCH_READ_MAX_BYTES)} aggregate limit.`,
-		);
-	}
-	const maxBatchBytes = Math.max(source.limits.maxMetadataBytes, source.limits.maxBlobBytes + 256);
-	let chunk: SearchBlobRequest[] = [];
-	let chunkBytes = 0;
-	const readChunk = async (): Promise<void> => {
-		if (chunk.length === 0) return;
-		throwIfSearchAborted(signal);
-		const result = await runCommand("git", ["cat-file", "--batch"], source.cwd, {
-			env: source.env,
-			input: `${chunk.map((request) => request.oid).join("\n")}\n`,
-			signal,
-			maxStdoutBytes: maxBatchBytes,
-			maxStderrBytes: source.limits.maxStderrBytes,
-		});
-		throwIfSearchAborted(signal);
-		if (!result.ok) throw new Error(`git cat-file --batch failed: ${commandError(result)}`);
-		for (const [oid, content] of parseSearchBlobBatch(result.stdout, chunk)) state.contents.set(oid, content);
-		state.readBytes += chunk.reduce((total, request) => total + request.size, 0);
-		chunk = [];
-		chunkBytes = 0;
-	};
-	for (const request of requests) {
-		const batchBytes = searchBlobBatchBytes(request);
-		if (batchBytes > maxBatchBytes) {
-			throw new Error(`Snapshot blob ${request.oid} exceeds the bounded batch-read output limit.`);
-		}
-		if (chunk.length > 0 && (chunk.length >= SEARCH_BATCH_MAX_OBJECTS || chunkBytes + batchBytes > maxBatchBytes)) {
-			await readChunk();
-		}
-		chunk.push(request);
-		chunkBytes += batchBytes;
-	}
-	await readChunk();
-}
+class SearchBlobReader {
+	private process: ChildProcess | undefined;
+	private processResult: Promise<SearchBlobProcessResult> | undefined;
+	private processError: Error | undefined;
+	private inputError: Error | undefined;
+	private outputError: Error | undefined;
+	private outputEnded = false;
+	private outputChunks: Buffer[] = [];
+	private outputBytes = 0;
+	private outputLimit = 0;
+	private outputWaiter: (() => void) | undefined;
+	private stderrChunks: Buffer[] = [];
+	private stderrBytes = 0;
+	private stderrLimited = false;
+	private closing = false;
 
-function collectSearchBlobChunk(
-	source: GitSource,
-	entries: SearchManifestEntry[],
-	startIndex: number,
-	endIndex: number,
-	selectedPaths: ReadonlySet<string>,
-	state: SearchBlobReadState,
-): SearchManifestEntry[] {
-	const chunk: SearchManifestEntry[] = [];
-	const chunkOids = new Set<string>();
-	const maxBatchBytes = Math.max(source.limits.maxMetadataBytes, source.limits.maxBlobBytes + 256);
-	let batchBytes = 0;
-	let contentBytes = 0;
-	for (let index = startIndex; index < endIndex; index++) {
-		const manifestEntry = entries[index];
-		const { entry } = manifestEntry;
-		if (
-			(manifestEntry.kind !== "unclassified" && !selectedPaths.has(entry.path)) ||
-			entry.size === undefined ||
-			state.contents.has(entry.oid) ||
-			chunkOids.has(entry.oid)
-		) {
-			continue;
+	private readonly source: GitSource;
+	private readonly state: SearchBlobReadState;
+	private readonly fallbackOids: ReadonlySet<string>;
+	private readonly signal: AbortSignal;
+
+	constructor(source: GitSource, state: SearchBlobReadState, fallbackOids: ReadonlySet<string>, signal: AbortSignal) {
+		this.source = source;
+		this.state = state;
+		this.fallbackOids = fallbackOids;
+		this.signal = signal;
+	}
+
+	async read(entry: ReviewSnapshotTreeEntry): Promise<Buffer | undefined> {
+		if (this.state.contents.has(entry.oid)) return this.state.contents.get(entry.oid);
+		if (entry.size === undefined) {
+			throw new Error("Review snapshot search could not schedule a selected blob read.");
 		}
 		const request = { oid: entry.oid, size: entry.size };
-		const requestBatchBytes = searchBlobBatchBytes(request);
-		const exceedsChunk =
-			chunk.length > 0 &&
-			(chunk.length >= SEARCH_BATCH_MAX_OBJECTS ||
-				batchBytes + requestBatchBytes > maxBatchBytes ||
-				state.readBytes + contentBytes + entry.size > SEARCH_READ_MAX_BYTES);
-		if (exceedsChunk) break;
-		chunk.push(manifestEntry);
-		chunkOids.add(entry.oid);
-		batchBytes += requestBatchBytes;
-		contentBytes += entry.size;
-		if (state.readBytes + contentBytes > SEARCH_READ_MAX_BYTES) break;
-	}
-	return chunk;
-}
-
-function reserveSearchFallbackReads(
-	source: GitSource,
-	entries: ReadonlyArray<{ entry: ReviewSnapshotTreeEntry }>,
-	fallbackOids: ReadonlySet<string>,
-	state: SearchBlobReadState,
-): void {
-	const reservedOids = new Set<string>();
-	let fallbackBytes = state.fallbackBytes;
-	const fallbackLimit = Math.min(SEARCH_FALLBACK_READ_MAX_BYTES, source.limits.maxMetadataBytes);
-	for (const { entry } of entries) {
-		if (
-			entry.size === undefined ||
-			!fallbackOids.has(entry.oid) ||
-			state.fallbackOids.has(entry.oid) ||
-			reservedOids.has(entry.oid)
-		) {
-			continue;
+		const maxBatchBytes = Math.max(this.source.limits.maxMetadataBytes, this.source.limits.maxBlobBytes + 256);
+		if (searchBlobBatchBytes(request) > maxBatchBytes) {
+			throw new Error(`Snapshot blob ${request.oid} exceeds the bounded batch-read output limit.`);
 		}
-		fallbackBytes += entry.size;
-		if (!Number.isSafeInteger(fallbackBytes) || fallbackBytes > fallbackLimit) {
+		this.reserve(request);
+		throwIfSearchAborted(this.signal);
+		this.outputLimit = maxBatchBytes;
+		const process = this.start();
+		try {
+			await new Promise<void>((resolveWrite, reject) => {
+				try {
+					process.stdin?.write(`${request.oid}\n`, (error) => {
+						if (error) reject(error);
+						else resolveWrite();
+					});
+				} catch (error) {
+					reject(error);
+				}
+			});
+			throwIfSearchAborted(this.signal);
+			const content = await this.readResponse(request);
+			throwIfSearchAborted(this.signal);
+			this.state.contents.set(request.oid, content);
+			this.outputLimit = 0;
+			return content;
+		} catch (error) {
+			process.kill();
+			throw error;
+		}
+	}
+
+	async close(): Promise<void> {
+		if (this.closing) return;
+		this.closing = true;
+		if (!this.process || !this.processResult) return;
+		throwIfSearchAborted(this.signal);
+		this.process.stdin?.end();
+		const result = await this.processResult;
+		throwIfSearchAborted(this.signal);
+		this.throwOutputError();
+		if (this.outputBytes > 0) throw new Error("git cat-file --batch returned unexpected trailing output.");
+		this.throwProcessFailure(result);
+	}
+
+	async dispose(): Promise<void> {
+		this.closing = true;
+		if (!this.process || !this.processResult) return;
+		this.process.stdin?.destroy();
+		this.process.kill();
+		await this.processResult;
+	}
+
+	private reserve(request: SearchBlobRequest): void {
+		const readBytes = this.state.readBytes + request.size;
+		if (!Number.isSafeInteger(readBytes) || readBytes > SEARCH_READ_MAX_BYTES) {
 			throw new Error(
-				`Review snapshot semantic fallback exceeds the ${formatByteLimit(fallbackLimit)} aggregate read limit.`,
+				`Review snapshot search blob reads exceed the ${formatByteLimit(SEARCH_READ_MAX_BYTES)} aggregate limit.`,
 			);
 		}
-		reservedOids.add(entry.oid);
+		let fallbackBytes = this.state.fallbackBytes;
+		const reserveFallback = this.fallbackOids.has(request.oid) && !this.state.fallbackOids.has(request.oid);
+		if (reserveFallback) {
+			const fallbackLimit = Math.min(SEARCH_FALLBACK_READ_MAX_BYTES, this.source.limits.maxMetadataBytes);
+			fallbackBytes += request.size;
+			if (!Number.isSafeInteger(fallbackBytes) || fallbackBytes > fallbackLimit) {
+				throw new Error(
+					`Review snapshot semantic fallback exceeds the ${formatByteLimit(fallbackLimit)} aggregate read limit.`,
+				);
+			}
+		}
+		this.state.readBytes = readBytes;
+		if (reserveFallback) {
+			this.state.fallbackOids.add(request.oid);
+			this.state.fallbackBytes = fallbackBytes;
+		}
 	}
-	for (const oid of reservedOids) state.fallbackOids.add(oid);
-	state.fallbackBytes = fallbackBytes;
+
+	private start(): ChildProcess {
+		if (this.process) return this.process;
+		const child = spawnProcess("git", ["cat-file", "--batch"], {
+			cwd: this.source.cwd,
+			env: this.source.env ? { ...process.env, ...this.source.env } : process.env,
+			stdio: ["pipe", "pipe", "pipe"],
+			signal: this.signal,
+		});
+		if (!child.stdin || !child.stdout || !child.stderr) {
+			child.kill();
+			throw new Error("git cat-file --batch did not provide the required pipes.");
+		}
+		this.process = child;
+		child.stdin.on("error", (error) => {
+			this.inputError = error;
+			this.wakeOutput();
+		});
+		child.stdout.on("data", (data: Buffer) => {
+			if (this.outputError) return;
+			if (this.outputLimit === 0) {
+				this.outputError = new Error("git cat-file --batch returned unexpected trailing output.");
+				child.kill();
+				this.wakeOutput();
+				return;
+			}
+			const nextBytes = this.outputBytes + data.length;
+			if (!Number.isSafeInteger(nextBytes) || nextBytes > this.outputLimit) {
+				this.outputError = new Error(
+					`git cat-file --batch failed: stdout exceeded the ${formatByteLimit(this.outputLimit)} capture limit`,
+				);
+				child.kill();
+				this.wakeOutput();
+				return;
+			}
+			this.outputChunks.push(data);
+			this.outputBytes = nextBytes;
+			this.wakeOutput();
+		});
+		const finishOutput = (): void => {
+			this.outputEnded = true;
+			this.wakeOutput();
+		};
+		child.stdout.once("end", finishOutput);
+		child.stdout.once("close", finishOutput);
+		child.stdout.once("error", (error) => {
+			this.outputError = error;
+			finishOutput();
+		});
+		child.stderr.on("data", (data: Buffer) => {
+			if (this.stderrLimited) return;
+			this.stderrBytes += data.length;
+			if (this.stderrBytes > this.source.limits.maxStderrBytes) {
+				this.stderrLimited = true;
+				this.stderrChunks = [];
+				child.kill();
+				return;
+			}
+			this.stderrChunks.push(data);
+		});
+		this.processResult = new Promise((resolveResult) => {
+			child.once("error", (error) => {
+				this.processError = error;
+				this.wakeOutput();
+			});
+			child.once("close", (exitCode) => {
+				finishOutput();
+				resolveResult({ exitCode });
+			});
+		});
+		return child;
+	}
+
+	private async readResponse(request: SearchBlobRequest): Promise<Buffer | undefined> {
+		const expectedHeader = `${request.oid} blob ${request.size}`;
+		const missingHeader = `${request.oid} missing`;
+		const header = await this.readHeader(Math.max(expectedHeader.length, missingHeader.length));
+		if (header === missingHeader) {
+			if (this.outputBytes > 0) throw new Error("git cat-file --batch returned unexpected trailing output.");
+			return undefined;
+		}
+		if (header !== expectedHeader) {
+			throw new Error(`git cat-file --batch returned unexpected metadata for ${request.oid}.`);
+		}
+		const response = await this.readBytesExactly(request.size + 1, request.oid);
+		if (response.at(-1) !== 10) {
+			throw new Error(`git cat-file --batch returned truncated content for ${request.oid}.`);
+		}
+		if (this.outputBytes > 0) throw new Error("git cat-file --batch returned unexpected trailing output.");
+		return response.subarray(0, request.size);
+	}
+
+	private async readHeader(maxBytes: number): Promise<string> {
+		while (true) {
+			this.throwOutputError();
+			const newline = this.findOutputByte(10);
+			if (newline >= 0) {
+				if (newline > maxBytes) throw new Error("git cat-file --batch returned unexpected object metadata.");
+				const header = this.takeOutputBytes(newline).toString("utf8");
+				this.takeOutputBytes(1);
+				return header;
+			}
+			if (this.outputBytes > maxBytes) {
+				throw new Error("git cat-file --batch returned unexpected object metadata.");
+			}
+			if (this.outputEnded || this.processError) {
+				await this.throwUnexpectedEnd("git cat-file --batch returned a truncated object header.");
+			}
+			await this.waitForOutputChange(this.outputBytes);
+		}
+	}
+
+	private async readBytesExactly(bytes: number, oid: string): Promise<Buffer> {
+		while (this.outputBytes < bytes) {
+			this.throwOutputError();
+			if (this.outputEnded || this.processError) {
+				await this.throwUnexpectedEnd(`git cat-file --batch returned truncated content for ${oid}.`);
+			}
+			await this.waitForOutputChange(this.outputBytes);
+		}
+		return this.takeOutputBytes(bytes);
+	}
+
+	private async waitForOutputChange(previousBytes: number): Promise<void> {
+		while (this.outputBytes === previousBytes && !this.outputEnded && !this.outputError && !this.processError) {
+			await new Promise<void>((resolveWait) => {
+				this.outputWaiter = resolveWait;
+			});
+		}
+		this.throwOutputError();
+	}
+
+	private async throwUnexpectedEnd(message: string): Promise<never> {
+		throwIfSearchAborted(this.signal);
+		if (!this.processResult) throw new Error(message);
+		const result = await this.processResult;
+		throwIfSearchAborted(this.signal);
+		this.throwProcessFailure(result);
+		throw new Error(message);
+	}
+
+	private throwOutputError(): void {
+		if (this.outputError) throw this.outputError;
+	}
+
+	private throwProcessFailure(result: SearchBlobProcessResult): void {
+		if (this.stderrLimited) {
+			throw new Error(
+				`git cat-file --batch failed: stderr exceeded the ${formatByteLimit(this.source.limits.maxStderrBytes)} capture limit`,
+			);
+		}
+		const processError = this.processError ?? this.inputError;
+		if (processError) throw new Error(`git cat-file --batch failed: ${processError.message}`);
+		if (result.exitCode !== 0) {
+			const stderr = Buffer.concat(this.stderrChunks, this.stderrBytes).toString("utf8").trim();
+			throw new Error(`git cat-file --batch failed: ${stderr || "command exited unsuccessfully"}`);
+		}
+	}
+
+	private findOutputByte(byte: number): number {
+		let offset = 0;
+		for (const chunk of this.outputChunks) {
+			const index = chunk.indexOf(byte);
+			if (index >= 0) return offset + index;
+			offset += chunk.length;
+		}
+		return -1;
+	}
+
+	private takeOutputBytes(bytes: number): Buffer {
+		const parts: Buffer[] = [];
+		let remaining = bytes;
+		while (remaining > 0) {
+			const chunk = this.outputChunks[0];
+			if (!chunk) throw new Error("git cat-file --batch output accounting failed.");
+			if (chunk.length <= remaining) {
+				parts.push(chunk);
+				this.outputChunks.shift();
+				remaining -= chunk.length;
+			} else {
+				parts.push(chunk.subarray(0, remaining));
+				this.outputChunks[0] = chunk.subarray(remaining);
+				remaining = 0;
+			}
+		}
+		this.outputBytes -= bytes;
+		return parts.length === 1 ? (parts[0] ?? Buffer.alloc(0)) : Buffer.concat(parts, bytes);
+	}
+
+	private wakeOutput(): void {
+		const waiter = this.outputWaiter;
+		this.outputWaiter = undefined;
+		waiter?.();
+	}
 }
 
 function searchComputationResult(computation: SearchComputation): ReviewSnapshotSearchResult {
@@ -1737,7 +1897,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			fallbackOids: new Set<string>(),
 			fallbackBytes: 0,
 		};
-		const pageEndIndex = firstFileIndex + pageEntries.length;
+		const blobReader = new SearchBlobReader(this.source, readState, fallbackOids, signal);
 
 		const matches: ReviewSnapshotSearchMatch[] = [];
 		const skippedPaths: Array<{ path: string; reason: string }> = [];
@@ -1746,88 +1906,85 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		let filesScanned = 0;
 		let retainedBytes = 0;
 		const needle = ignoreCase ? options.query.toLocaleLowerCase() : options.query;
-		while (nextFileIndex < entries.length && filesScanned < options.maxFiles && matches.length < options.limit) {
-			throwIfSearchAborted(signal);
-			const manifestEntry = entries[nextFileIndex];
-			const { entry } = manifestEntry;
-			filesScanned++;
-			if (manifestEntry.reason) {
-				skippedPaths.push({ path: entry.path, reason: manifestEntry.reason });
-				retainedBytes +=
-					Buffer.byteLength(entry.path, "utf8") + Buffer.byteLength(manifestEntry.reason, "utf8") + 32;
-				assertSearchResultBytes(retainedBytes);
-				nextFileIndex++;
-				nextLineIndex = 0;
-				continue;
-			}
-			if (!selectedPaths.has(entry.path)) {
-				nextFileIndex++;
-				nextLineIndex = 0;
-				continue;
-			}
-			if (!readState.contents.has(entry.oid)) {
-				const chunk = collectSearchBlobChunk(
-					this.source,
-					entries,
-					nextFileIndex,
-					pageEndIndex,
-					selectedPaths,
-					readState,
-				);
-				if (chunk.length === 0) throw new Error("Review snapshot search could not schedule a selected blob read.");
-				reserveSearchFallbackReads(this.source, chunk, fallbackOids, readState);
-				await readSearchBlobs(this.source, chunk, readState, signal);
+		try {
+			while (nextFileIndex < entries.length && filesScanned < options.maxFiles && matches.length < options.limit) {
 				throwIfSearchAborted(signal);
-			}
-			const content = readState.contents.get(entry.oid);
-			let skipReason: string | undefined;
-			if (content === undefined) {
-				skipReason = `Could not read the snapshot blob: object ${entry.oid} is unavailable.`;
-			} else if (isBinary(content)) {
-				skipReason = "Binary content was not searched.";
-			}
-			if (skipReason) {
-				skippedPaths.push({ path: entry.path, reason: skipReason });
-				retainedBytes += Buffer.byteLength(entry.path, "utf8") + Buffer.byteLength(skipReason, "utf8") + 32;
-				assertSearchResultBytes(retainedBytes);
-				nextFileIndex++;
-				nextLineIndex = 0;
-				continue;
-			}
-			if (content === undefined) throw new Error("Review snapshot search content was unexpectedly unavailable.");
-			const lines = content.toString("utf8").split("\n");
-			while (nextLineIndex < lines.length && matches.length < options.limit) {
-				const line = lines[nextLineIndex] ?? "";
-				const haystack = ignoreCase ? line.toLocaleLowerCase() : line;
-				if (haystack.includes(needle)) {
-					const match = { path: entry.path, line: nextLineIndex + 1, text: line.slice(0, 500) };
-					matches.push(match);
-					retainedBytes += Buffer.byteLength(match.path, "utf8") + Buffer.byteLength(match.text, "utf8") + 32;
+				const manifestEntry = entries[nextFileIndex];
+				const { entry } = manifestEntry;
+				filesScanned++;
+				if (manifestEntry.reason) {
+					skippedPaths.push({ path: entry.path, reason: manifestEntry.reason });
+					retainedBytes +=
+						Buffer.byteLength(entry.path, "utf8") + Buffer.byteLength(manifestEntry.reason, "utf8") + 32;
 					assertSearchResultBytes(retainedBytes);
-					if (matches.length > SEARCH_RESULT_MAX_MATCHES) {
-						throw new Error(
-							`Review snapshot search exceeds the ${SEARCH_RESULT_MAX_MATCHES} retained match limit.`,
-						);
-					}
+					nextFileIndex++;
+					nextLineIndex = 0;
+					continue;
 				}
-				nextLineIndex++;
+				if (!selectedPaths.has(entry.path)) {
+					nextFileIndex++;
+					nextLineIndex = 0;
+					continue;
+				}
+				if (!readState.contents.has(entry.oid)) {
+					await blobReader.read(entry);
+					throwIfSearchAborted(signal);
+				}
+				const content = readState.contents.get(entry.oid);
+				let skipReason: string | undefined;
+				if (content === undefined) {
+					skipReason = `Could not read the snapshot blob: object ${entry.oid} is unavailable.`;
+				} else if (isBinary(content)) {
+					skipReason = "Binary content was not searched.";
+				}
+				if (skipReason) {
+					skippedPaths.push({ path: entry.path, reason: skipReason });
+					retainedBytes += Buffer.byteLength(entry.path, "utf8") + Buffer.byteLength(skipReason, "utf8") + 32;
+					assertSearchResultBytes(retainedBytes);
+					nextFileIndex++;
+					nextLineIndex = 0;
+					continue;
+				}
+				if (content === undefined) throw new Error("Review snapshot search content was unexpectedly unavailable.");
+				const lines = content.toString("utf8").split("\n");
+				while (nextLineIndex < lines.length && matches.length < options.limit) {
+					const line = lines[nextLineIndex] ?? "";
+					const haystack = ignoreCase ? line.toLocaleLowerCase() : line;
+					if (haystack.includes(needle)) {
+						const match = { path: entry.path, line: nextLineIndex + 1, text: line.slice(0, 500) };
+						matches.push(match);
+						retainedBytes += Buffer.byteLength(match.path, "utf8") + Buffer.byteLength(match.text, "utf8") + 32;
+						assertSearchResultBytes(retainedBytes);
+						if (matches.length > SEARCH_RESULT_MAX_MATCHES) {
+							throw new Error(
+								`Review snapshot search exceeds the ${SEARCH_RESULT_MAX_MATCHES} retained match limit.`,
+							);
+						}
+					}
+					nextLineIndex++;
+				}
+				if (nextLineIndex >= lines.length) {
+					nextFileIndex++;
+					nextLineIndex = 0;
+				}
 			}
-			if (nextLineIndex >= lines.length) {
-				nextFileIndex++;
-				nextLineIndex = 0;
-			}
+			const computation = {
+				result: {
+					matches,
+					filesScanned,
+					skippedPaths,
+					nextFileIndex,
+					nextLineIndex,
+					complete: nextFileIndex >= entries.length,
+				},
+				retainedBytes,
+			};
+			await blobReader.close();
+			return computation;
+		} catch (error) {
+			await blobReader.dispose();
+			throw error;
 		}
-		return {
-			result: {
-				matches,
-				filesScanned,
-				skippedPaths,
-				nextFileIndex,
-				nextLineIndex,
-				complete: nextFileIndex >= entries.length,
-			},
-			retainedBytes,
-		};
 	}
 
 	private getSearchManifest(revision: ReviewSnapshotRevision, prefix: string): Promise<SearchManifest> {

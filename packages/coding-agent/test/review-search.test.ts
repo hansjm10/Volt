@@ -196,6 +196,7 @@ import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(logFile)}, "args " + JSON.stringify(args) + "\\n");
+const mode = existsSync(${JSON.stringify(modeFile)}) ? readFileSync(${JSON.stringify(modeFile)}, "utf8").trim() : "";
 let terminating = false;
 process.on("SIGTERM", () => {
 	if (terminating) return;
@@ -206,8 +207,7 @@ process.on("SIGTERM", () => {
 		process.exit(143);
 	}, 100);
 });
-if (args[0] === "grep" && existsSync(${JSON.stringify(modeFile)})) {
-	const mode = readFileSync(${JSON.stringify(modeFile)}, "utf8").trim();
+if (args[0] === "grep" && mode) {
 	if (mode === "fail-once") {
 		rmSync(${JSON.stringify(modeFile)}, { force: true });
 		process.stderr.write("injected grep failure\\n");
@@ -231,7 +231,29 @@ if (args[0] === "grep" && existsSync(${JSON.stringify(modeFile)})) {
 	}
 	if (mode === "delay") await delay(500);
 }
-if (!terminating) {
+if (args[0] === "cat-file" && args[1] === "--batch" && !terminating) {
+	const child = spawn(${JSON.stringify(realGit)}, args, { stdio: ["pipe", "inherit", "inherit"] });
+	child.stdin.on("error", () => {});
+	child.once("error", (error) => {
+		process.stderr.write(error.message + "\\n");
+		process.exit(1);
+	});
+	child.once("exit", (code) => process.exit(code ?? 1));
+	process.stdin.setEncoding("utf8");
+	let input = "";
+	for await (const chunk of process.stdin) {
+		input += chunk;
+		let newline;
+		while ((newline = input.indexOf("\\n")) >= 0) {
+			const oid = input.slice(0, newline);
+			input = input.slice(newline + 1);
+			appendFileSync(${JSON.stringify(logFile)}, "batch " + process.pid + " " + JSON.stringify(oid) + "\\n");
+			if (mode === "delay-batch") await delay(500);
+			if (!terminating) child.stdin.write(oid + "\\n");
+		}
+	}
+	if (!terminating) child.stdin.end(input);
+} else if (!terminating) {
 	const child = spawn(${JSON.stringify(realGit)}, args, { stdio: "inherit" });
 	child.once("error", (error) => {
 		process.stderr.write(error.message + "\\n");
@@ -262,12 +284,38 @@ function readShimArgs(logFile: string): string[][] {
 		.filter((value): value is string[] => Array.isArray(value) && value.every((entry) => typeof entry === "string"));
 }
 
+interface ShimBatchRequest {
+	processId: number;
+	oid: string;
+}
+
+function readShimBatchRequests(logFile: string): ShimBatchRequest[] {
+	if (!existsSync(logFile)) return [];
+	const requests: ShimBatchRequest[] = [];
+	for (const line of readFileSync(logFile, "utf8").split("\n")) {
+		const match = /^batch (\d+) (.+)$/u.exec(line);
+		if (!match) continue;
+		const processId = Number(match[1]);
+		const oid = JSON.parse(match[2] ?? "") as unknown;
+		if (Number.isSafeInteger(processId) && typeof oid === "string") requests.push({ processId, oid });
+	}
+	return requests;
+}
+
 async function waitForShimArgs(logFile: string, predicate: (args: string[]) => boolean): Promise<void> {
 	for (let attempt = 0; attempt < 200; attempt++) {
 		if (readShimArgs(logFile).some(predicate)) return;
 		await delay(10);
 	}
 	throw new Error("Timed out waiting for the Git shim command.");
+}
+
+async function waitForShimBatchRequests(logFile: string, count: number): Promise<void> {
+	for (let attempt = 0; attempt < 200; attempt++) {
+		if (readShimBatchRequests(logFile).length >= count) return;
+		await delay(10);
+	}
+	throw new Error("Timed out waiting for the Git shim batch request.");
 }
 
 function grepPattern(args: string[]): string | undefined {
@@ -503,7 +551,11 @@ describe("direct-tree review snapshot search", () => {
 		const entries: Array<{ path: string; oid: string }> = [];
 		for (let index = 0; index < 33; index++) {
 			content.fill(0x78);
-			content.write(index === 0 ? "needle\n".repeat(50) : "needle\n", 0, "utf8");
+			content.write(
+				index === 0 ? "needle\n".repeat(50) : index === 1 ? "needle\nsecond-only-é\n" : "needle\n",
+				0,
+				"utf8",
+			);
 			content.write(String(index).padStart(2, "0"), content.length - 2, "utf8");
 			entries.push({
 				path: `candidate-${String(index).padStart(2, "0")}.txt`,
@@ -513,6 +565,20 @@ describe("direct-tree review snapshot search", () => {
 		const headCommit = createContextCommit(repository, entries);
 		const snapshot = await resolveSnapshot(repository, undefined, { kind: "commit", sha: headCommit });
 		snapshots.push(snapshot);
+		const firstOid = entries[0]?.oid;
+		const secondOid = entries[1]?.oid;
+		if (!firstOid || !secondOid) throw new Error("Expected two candidate blob OIDs.");
+		const realGit =
+			process.platform === "win32"
+				? run(repository, "where.exe", "git").split(/\r?\n/u)[0]
+				: run(repository, "which", "git");
+		if (!realGit) throw new Error("Could not locate Git.");
+		const bin = join(repository, "shim-bin");
+		mkdirSync(bin);
+		const mode = join(repository, "shim-mode");
+		const log = join(repository, "shim.log");
+		installGitShim(bin, realGit, mode, log);
+		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
 
 		const result = await snapshot.search({
 			revision: "head",
@@ -533,6 +599,28 @@ describe("direct-tree review snapshot search", () => {
 				text: "needle",
 			})),
 		);
+		const firstPageBatches = readShimArgs(log).filter((args) => args[0] === "cat-file" && args[1] === "--batch");
+		expect(firstPageBatches).toHaveLength(1);
+		expect(readShimBatchRequests(log)).toEqual([{ processId: expect.any(Number), oid: firstOid }]);
+
+		const secondCandidatePage = await snapshot.search({
+			revision: "head",
+			query: "second-only-é",
+			limit: 1,
+			maxFiles: 200,
+		});
+		expect(secondCandidatePage).toMatchObject({
+			matches: [{ path: "candidate-01.txt", line: 2, text: "second-only-é" }],
+			filesScanned: 2,
+			nextFileIndex: 1,
+			nextLineIndex: 2,
+			complete: false,
+		});
+		const allBatchRequests = readShimBatchRequests(log);
+		const secondPageRequests = allBatchRequests.slice(1);
+		expect(readShimArgs(log).filter((args) => args[0] === "cat-file" && args[1] === "--batch")).toHaveLength(2);
+		expect(secondPageRequests.map(({ oid }) => oid)).toEqual([firstOid, secondOid]);
+		expect(new Set(secondPageRequests.map(({ processId }) => processId)).size).toBe(1);
 	});
 
 	it("reports binaries whose first NUL falls after Git's binary probe", async () => {
@@ -968,19 +1056,42 @@ describe("direct-tree review snapshot search", () => {
 			snapshot.search({ revision: "head", query: "cancelled-query", limit: 100, maxFiles: 200 }),
 		).resolves.toMatchObject({ matches: [] });
 		expect(readShimArgs(log).filter((args) => grepPattern(args) === "cancelled-query")).toHaveLength(2);
+		const terminationsBeforeBlobReads = readFileSync(log, "utf8").split("term-done\n").length - 1;
 
-		writeFileSync(mode, "delay");
+		writeFileSync(mode, "delay-batch");
+		const batchRequestCount = readShimBatchRequests(log).length;
+		const blobController = new AbortController();
+		const cancelledBlobRead = snapshot.search({
+			revision: "head",
+			query: "cancelled-é",
+			limit: 100,
+			maxFiles: 200,
+			signal: blobController.signal,
+		});
+		await waitForShimBatchRequests(log, batchRequestCount + 1);
+		blobController.abort();
+		await expect(cancelledBlobRead).rejects.toThrow(/aborted/i);
+		rmSync(mode, { force: true });
+		await expect(
+			snapshot.search({ revision: "head", query: "cancelled-é", limit: 100, maxFiles: 200 }),
+		).resolves.toMatchObject({ matches: [] });
+
+		writeFileSync(mode, "delay-batch");
+		const disposalBatchCount = readShimBatchRequests(log).length;
 		const activeSearch = snapshot.search({
 			revision: "head",
-			query: "dispose-query",
+			query: "dispose-é",
 			limit: 100,
 			maxFiles: 200,
 		});
-		await waitForShimArgs(log, (args) => grepPattern(args) === "dispose-query");
+		await waitForShimBatchRequests(log, disposalBatchCount + 1);
 		const disposal = snapshot.dispose();
 		await expect(activeSearch).rejects.toThrow(/aborted/i);
 		await disposal;
-		if (process.platform !== "win32") expect(readFileSync(log, "utf8")).toContain("term-done\n");
+		if (process.platform !== "win32") {
+			const terminationsAfterBlobReads = readFileSync(log, "utf8").split("term-done\n").length - 1;
+			expect(terminationsAfterBlobReads - terminationsBeforeBlobReads).toBeGreaterThanOrEqual(2);
+		}
 		expect(existsSync(snapshotTemporaryDirectory)).toBe(false);
 	});
 });
