@@ -50,6 +50,7 @@ import {
 	clampThinkingLevel,
 	cleanupSessionResources,
 	completeSimple,
+	estimateToolDefinitionTokens,
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	modelsAreEqual,
@@ -5126,7 +5127,8 @@ export class AgentSession {
 			}
 		}
 		this.agent.state.messages = messages;
-		const estimatedTokensAfter = estimateMessagesTokens(messages);
+		const estimatedTokensAfter =
+			estimateMessagesTokens(messages) + estimateToolDefinitionTokens(this.agent.state.tools);
 
 		// Get the saved compaction entry for the extension event
 		const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
@@ -5210,7 +5212,10 @@ export class AgentSession {
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
 
-			const preparation = prepareCompaction(pathEntries, settings);
+			const preparation = prepareCompaction(pathEntries, settings, {
+				tools: this.agent.state.tools,
+				contextWindow: this.model.contextWindow,
+			});
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -5373,7 +5378,7 @@ export class AgentSession {
 			// Provider usage predates this turn's tool execution. Estimate from the
 			// live context so newly appended tool results are included before the
 			// loop starts another provider request.
-			const contextTokens = estimateContextTokens(context.context.messages).tokens;
+			const contextTokens = estimateContextTokens(context.context.messages, context.context.tools).tokens;
 			if (!shouldCompact(contextTokens, model.contextWindow ?? 0, settings)) return false;
 			this._proactiveCompactionState = "scheduled";
 			return true;
@@ -5451,7 +5456,7 @@ export class AgentSession {
 		// context so tool results and other messages appended after provider usage
 		// are included. For error messages, require a prior successful usage source.
 		const messages = this.agent.state.messages;
-		const estimate = estimateContextTokens(messages);
+		const estimate = estimateContextTokens(messages, this.agent.state.tools);
 		let contextTokens: number;
 		if (assistantMessage.stopReason === "error") {
 			if (estimate.lastUsageIndex === null) return false; // No usage data at all
@@ -5529,7 +5534,10 @@ export class AgentSession {
 
 			const pathEntries = this.sessionManager.getBranch();
 
-			const preparation = prepareCompaction(pathEntries, settings);
+			const preparation = prepareCompaction(pathEntries, settings, {
+				tools: this.agent.state.tools,
+				contextWindow: this.model.contextWindow,
+			});
 			if (!preparation) {
 				throw new Error("Auto-compaction could not find a safe compaction boundary");
 			}
@@ -7067,7 +7075,7 @@ export class AgentSession {
 			}
 		}
 
-		const estimate = estimateContextTokens(this.messages);
+		const estimate = estimateContextTokens(this.messages, this.agent.state.tools);
 		const percent = (estimate.tokens / contextWindow) * 100;
 
 		return {

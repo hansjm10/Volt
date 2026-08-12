@@ -1,5 +1,5 @@
-import type { AssistantMessage, ImageContent, JsonValue, Model, TextContent, Usage } from "@hansjm10/volt-ai";
-import { completeSimple } from "@hansjm10/volt-ai";
+import type { AssistantMessage, ImageContent, JsonValue, Model, TextContent, Tool, Usage } from "@hansjm10/volt-ai";
+import { completeSimple, estimateToolDefinitionTokens } from "@hansjm10/volt-ai";
 import type { AgentMessage, ThinkingLevel } from "../../types.ts";
 import {
 	convertToLlm,
@@ -163,12 +163,25 @@ function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; in
 	return undefined;
 }
 
-/** Estimate context tokens for messages using provider usage when available. */
-export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+/** Sum per-message token estimates, ignoring any stale provider usage. */
+export function estimateMessagesTokens(messages: AgentMessage[]): number {
+	let tokens = 0;
+	for (const message of messages) {
+		tokens += estimateTokens(message);
+	}
+	return tokens;
+}
+
+/**
+ * Estimate context tokens using provider usage when available. Provider usage
+ * already includes the request's tool definitions, so active tools are added
+ * only when no valid provider usage exists.
+ */
+export function estimateContextTokens(messages: AgentMessage[], tools?: readonly Tool[]): ContextUsageEstimate {
 	const usageInfo = getLastAssistantUsageInfo(messages);
 
 	if (!usageInfo) {
-		let estimated = 0;
+		let estimated = estimateToolDefinitionTokens(tools);
 		for (const message of messages) {
 			estimated += estimateTokens(message);
 		}
@@ -330,7 +343,7 @@ export interface CutPointResult {
 	isSplitTurn: boolean;
 }
 
-/** Find the compaction cut point that keeps approximately the requested recent-token budget. */
+/** Find the compaction cut point that keeps at most the requested recent-token budget. */
 export function findCutPoint(
 	entries: SessionTreeEntry[],
 	startIndex: number,
@@ -347,23 +360,25 @@ export function findCutPoint(
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry?.type !== "message") continue;
-		const messageTokens = estimateTokens(entry.message as AgentMessage);
-		accumulatedTokens += messageTokens;
-		if (accumulatedTokens >= keepRecentTokens) {
-			// Tool results are not valid cut points. If the budget lands in a trailing
-			// result batch, retain the assistant that issued it so compaction still
-			// advances while keeping the call and all of its results together.
-			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints.at(-1) ?? startIndex;
+		if (!entry) continue;
+		const message = getMessageFromEntryForCompaction(entry);
+		if (!message) continue;
+		const messageTokens = estimateTokens(message);
+		if (accumulatedTokens + messageTokens > keepRecentTokens) {
+			// Exclude the crossing message by cutting at the next valid boundary. If
+			// there is no later boundary, retain the newest valid suffix so compaction
+			// still advances without separating tool results from their assistant call.
+			cutIndex = cutPoints.find((candidate) => candidate > i) ?? cutPoints.at(-1) ?? startIndex;
 			break;
 		}
+		accumulatedTokens += messageTokens;
 	}
 	while (cutIndex > startIndex) {
 		const prevEntry = entries[cutIndex - 1];
 		if (!prevEntry || prevEntry.type === "compaction") {
 			break;
 		}
-		if (prevEntry.type === "message") {
+		if (getMessageFromEntryForCompaction(prevEntry)) {
 			break;
 		}
 		cutIndex--;
@@ -527,6 +542,12 @@ export async function generateSummary(
 	return ok(textContent);
 }
 
+/** Live request state used to keep retained context within the selected model's budget. */
+export interface CompactionContextBudget {
+	tools?: readonly Tool[];
+	contextWindow?: number;
+}
+
 /** Prepared inputs for a compaction run. */
 export interface CompactionPreparation {
 	/** Entry id where retained history starts. */
@@ -551,6 +572,7 @@ export interface CompactionPreparation {
 export function prepareCompaction(
 	pathEntries: SessionTreeEntry[],
 	settings: CompactionSettings,
+	context: CompactionContextBudget = {},
 ): Result<CompactionPreparation | undefined, CompactionError> {
 	if (pathEntries.length === 0 || pathEntries.at(-1)?.type === "compaction") {
 		return ok(undefined);
@@ -573,10 +595,14 @@ export function prepareCompaction(
 		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
 	}
 	const boundaryEnd = pathEntries.length;
+	const toolTokens = estimateToolDefinitionTokens(context.tools);
+	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages, context.tools).tokens;
+	const retainedMessageTokens =
+		context.contextWindow !== undefined && context.contextWindow > 0
+			? Math.min(settings.keepRecentTokens, Math.max(0, context.contextWindow - settings.reserveTokens - toolTokens))
+			: settings.keepRecentTokens;
 
-	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
-
-	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, retainedMessageTokens);
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
 	if (!firstKeptEntry?.id) {
 		return err(new CompactionError("invalid_session", "First kept entry has no UUID - session may need migration"));

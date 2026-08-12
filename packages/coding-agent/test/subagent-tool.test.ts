@@ -1209,7 +1209,7 @@ describe("subagent tool", () => {
 			}
 			const compactions = childSessionManager.getEntries().filter((entry) => entry.type === "compaction");
 			expect(compactions).toHaveLength(1);
-			expect(compactions[0]).toMatchObject({ summary: "compacted child context" });
+			expect(compactions[0]?.summary).toContain("compacted child context");
 			expect(executionSettled).toBe(false);
 			expect(childDisposeCount).toBe(0);
 		} finally {

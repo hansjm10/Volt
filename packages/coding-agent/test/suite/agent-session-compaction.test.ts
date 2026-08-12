@@ -2,6 +2,7 @@ import type { AgentRunResult } from "@hansjm10/volt-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
+	estimateToolDefinitionTokens,
 	fauxAssistantMessage,
 	fauxToolCall,
 	type Model,
@@ -138,7 +139,7 @@ describe("AgentSession compaction characterization", () => {
 						compaction: {
 							summary: "summary from extension",
 							firstKeptEntryId: event.preparation.firstKeptEntryId,
-							tokensBefore: event.preparation.tokensBefore,
+							tokensBefore: 999,
 							details: { source: "extension" },
 						},
 					}));
@@ -154,6 +155,11 @@ describe("AgentSession compaction characterization", () => {
 		const compactionEntries = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
 
 		expect(result.summary).toBe("summary from extension");
+		expect(result.tokensBefore).toBe(999);
+		expect(result.estimatedTokensAfter).toBe(
+			estimateMessagesTokens(harness.session.messages) +
+				estimateToolDefinitionTokens(harness.session.agent.state.tools),
+		);
 		expect(compactionEntries).toHaveLength(1);
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
 	});
@@ -405,7 +411,9 @@ describe("AgentSession compaction characterization", () => {
 				(message) => message.role === "assistant" && (message as AssistantMessage).stopReason === "error",
 			),
 		).toBe(false);
-		expect(estimates.at(-1)).toBe(estimateMessagesTokens(retained));
+		expect(estimates.at(-1)).toBe(
+			estimateMessagesTokens(retained) + estimateToolDefinitionTokens(harness.session.agent.state.tools),
+		);
 	});
 
 	it("cancels in-progress manual compaction when abortCompaction is called", async () => {

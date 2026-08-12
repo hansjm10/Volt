@@ -1,6 +1,13 @@
-import { fauxAssistantMessage, fauxToolCall, getModel, registerFauxProvider } from "@hansjm10/volt-ai";
+import {
+	estimateToolDefinitionTokens,
+	fauxAssistantMessage,
+	fauxToolCall,
+	getModel,
+	registerFauxProvider,
+} from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentHarness } from "../../src/harness/agent-harness.ts";
+import { estimateMessagesTokens } from "../../src/harness/compaction/compaction.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import { InMemorySessionStorage } from "../../src/harness/session/memory-storage.ts";
 import { Session } from "../../src/harness/session/session.ts";
@@ -966,6 +973,50 @@ describe("AgentHarness", () => {
 		expect(harness.getTools().map((tool) => tool.source)).toEqual(["extension"]);
 		expect(harness.getActiveTools().map((tool) => tool.name)).toEqual(["search"]);
 		expect((await session.buildContext()).activeToolNames).toEqual(["search"]);
+	});
+
+	it("includes active definitions in manual compaction preparation and rebuilt estimates", async () => {
+		const registration = registerFauxProvider({
+			models: [{ id: "compact", contextWindow: 6000, maxTokens: 1000 }],
+		});
+		registrations.push(registration);
+		registration.setSimpleResponses([fauxAssistantMessage("summary")]);
+		const session = new Session(new InMemorySessionStorage());
+		for (let index = 0; index < 5; index++) {
+			await session.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: String(index).repeat(4000) }],
+				timestamp: Date.now() + index,
+			});
+		}
+		const largeTool: AgentTool = {
+			...calculateTool,
+			name: "large_tool",
+			description: "x".repeat(16_000),
+		};
+		const messagesBefore = (await session.buildContext()).messages as AgentMessage[];
+		let preparationTokens = 0;
+		const harness = new AgentHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: registration.getModel(),
+			tools: [largeTool],
+			getApiKeyAndHeaders: async () => ({ apiKey: "test-key" }),
+		});
+		harness.on("session_before_compact", (event) => {
+			preparationTokens = event.preparation.tokensBefore;
+			return undefined;
+		});
+
+		const result = await harness.compact();
+		const rebuiltMessages = (await session.buildContext()).messages as AgentMessage[];
+
+		expect(preparationTokens).toBe(
+			estimateMessagesTokens(messagesBefore) + estimateToolDefinitionTokens([largeTool]),
+		);
+		expect(result.estimatedTokensAfter).toBe(
+			estimateMessagesTokens(rebuiltMessages) + estimateToolDefinitionTokens([largeTool]),
+		);
 	});
 
 	it("validates constructor tool names", () => {
