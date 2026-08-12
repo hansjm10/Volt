@@ -1313,16 +1313,33 @@ function collectSearchBlobChunk(
 	return chunk;
 }
 
-function recordSearchFallbackRead(source: GitSource, entry: ReviewSnapshotTreeEntry, state: SearchBlobReadState): void {
-	if (entry.size === undefined || state.fallbackOids.has(entry.oid)) return;
-	const fallbackBytes = state.fallbackBytes + entry.size;
+function reserveSearchFallbackReads(
+	source: GitSource,
+	entries: ReadonlyArray<{ entry: ReviewSnapshotTreeEntry }>,
+	fallbackOids: ReadonlySet<string>,
+	state: SearchBlobReadState,
+): void {
+	const reservedOids = new Set<string>();
+	let fallbackBytes = state.fallbackBytes;
 	const fallbackLimit = Math.min(SEARCH_FALLBACK_READ_MAX_BYTES, source.limits.maxMetadataBytes);
-	if (!Number.isSafeInteger(fallbackBytes) || fallbackBytes > fallbackLimit) {
-		throw new Error(
-			`Review snapshot semantic fallback exceeds the ${formatByteLimit(fallbackLimit)} aggregate read limit.`,
-		);
+	for (const { entry } of entries) {
+		if (
+			entry.size === undefined ||
+			!fallbackOids.has(entry.oid) ||
+			state.fallbackOids.has(entry.oid) ||
+			reservedOids.has(entry.oid)
+		) {
+			continue;
+		}
+		fallbackBytes += entry.size;
+		if (!Number.isSafeInteger(fallbackBytes) || fallbackBytes > fallbackLimit) {
+			throw new Error(
+				`Review snapshot semantic fallback exceeds the ${formatByteLimit(fallbackLimit)} aggregate read limit.`,
+			);
+		}
+		reservedOids.add(entry.oid);
 	}
-	state.fallbackOids.add(entry.oid);
+	for (const oid of reservedOids) state.fallbackOids.add(oid);
 	state.fallbackBytes = fallbackBytes;
 }
 
@@ -1711,6 +1728,9 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			selectedPaths.add(entry.path);
 			fallbackPaths.add(entry.path);
 		}
+		const fallbackOids = new Set(
+			pageEntries.filter(({ entry }) => fallbackPaths.has(entry.path)).map(({ entry }) => entry.oid),
+		);
 		const readState: SearchBlobReadState = {
 			contents: new Map<string, Buffer | undefined>(),
 			readBytes: 0,
@@ -1755,6 +1775,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 					readState,
 				);
 				if (chunk.length === 0) throw new Error("Review snapshot search could not schedule a selected blob read.");
+				reserveSearchFallbackReads(this.source, chunk, fallbackOids, readState);
 				await readSearchBlobs(this.source, chunk, readState, signal);
 				throwIfSearchAborted(signal);
 			}
@@ -1774,7 +1795,6 @@ class GitReviewSnapshot implements ReviewSnapshot {
 				continue;
 			}
 			if (content === undefined) throw new Error("Review snapshot search content was unexpectedly unavailable.");
-			if (fallbackPaths.has(entry.path)) recordSearchFallbackRead(this.source, entry, readState);
 			const lines = content.toString("utf8").split("\n");
 			while (nextLineIndex < lines.length && matches.length < options.limit) {
 				const line = lines[nextLineIndex] ?? "";

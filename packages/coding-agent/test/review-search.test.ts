@@ -880,7 +880,9 @@ describe("direct-tree review snapshot search", () => {
 
 	it("bounds aggregate semantic fallback reads", async () => {
 		const repository = createRepository();
-		writeFixture(repository, "a.txt", `${"a".repeat(699)}1`);
+		const firstFallbackContent = `${"a".repeat(699)}1`;
+		writeFixture(repository, "a-duplicate.txt", firstFallbackContent);
+		writeFixture(repository, "a.txt", firstFallbackContent);
 		writeFixture(repository, "b.txt", `${"b".repeat(699)}2`);
 		writeFixture(repository, "tracked.txt", "before\n");
 		git(repository, "add", "-A", "--", ".");
@@ -888,10 +890,16 @@ describe("direct-tree review snapshot search", () => {
 		writeFixture(repository, "tracked.txt", "after\n");
 		const snapshot = await resolveSnapshot(repository, { maxMetadataBytes: 1_024, maxBlobBytes: 1_024 });
 		snapshots.push(snapshot);
+		const trace = join(repository, "git-trace.log");
+		process.env.GIT_TRACE = trace;
 
 		await expect(snapshot.search({ revision: "head", query: "é", limit: 100, maxFiles: 200 })).rejects.toThrow(
 			/semantic fallback exceeds the 1 KiB aggregate read limit/i,
 		);
+		const catFileBatches = readFileSync(trace, "utf8")
+			.split("\n")
+			.filter((line) => line.includes("built-in: git cat-file --batch"));
+		expect(catFileBatches).toHaveLength(1);
 	});
 
 	it("isolates caller cancellation, retries cancelled work, and drains searches before disposal", async () => {
