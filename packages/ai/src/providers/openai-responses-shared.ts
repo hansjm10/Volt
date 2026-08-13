@@ -7,10 +7,12 @@ import type {
 	ResponseInput,
 	ResponseInputContent,
 	ResponseInputImage,
+	ResponseInputItem,
 	ResponseInputText,
 	ResponseOutputMessage,
 	ResponseReasoningItem,
 	ResponseStreamEvent,
+	ResponseToolSearchOutputItemParam,
 } from "openai/resources/responses/responses.js";
 import { calculateCost } from "../models.ts";
 import type { AssistantStreamNormalizer } from "../stream/normalizer.ts";
@@ -19,6 +21,7 @@ import type {
 	AssistantMessage,
 	Context,
 	ImageContent,
+	Message,
 	Model,
 	ServiceTier,
 	StopReason,
@@ -77,11 +80,17 @@ export interface OpenAIResponsesStreamOptions {
 
 export interface ConvertResponsesMessagesOptions {
 	includeSystemPrompt?: boolean;
+	transformedMessages?: Message[];
+	deferredToolAnchors?: ReadonlyMap<number, Tool[]>;
+	deferredToolStrict?: boolean | null;
 }
 
 export interface ConvertResponsesToolsOptions {
 	strict?: boolean | null;
+	deferLoading?: boolean;
 }
+
+type OpenAIFunctionTool = Extract<OpenAITool, { type: "function" }>;
 
 export interface ProcessResponsesStreamResult {
 	stopReason: StopReason;
@@ -93,14 +102,11 @@ export interface ProcessResponsesStreamResult {
 // Message conversion
 // =============================================================================
 
-export function convertResponsesMessages<TApi extends Api>(
+export function transformResponsesMessages<TApi extends Api>(
 	model: Model<TApi>,
-	context: Context,
+	messages: Message[],
 	allowedToolCallProviders: ReadonlySet<string>,
-	options?: ConvertResponsesMessagesOptions,
-): ResponseInput {
-	const messages: ResponseInput = [];
-
+): Message[] {
 	const normalizeIdPart = (part: string): string => {
 		const sanitized = part.replace(/[^a-zA-Z0-9_-]/g, "_");
 		const normalized = sanitized.length > 64 ? sanitized.slice(0, 64) : sanitized;
@@ -112,7 +118,7 @@ export function convertResponsesMessages<TApi extends Api>(
 		return normalized.length > 64 ? normalized.slice(0, 64) : normalized;
 	};
 
-	const normalizeToolCallId = (id: string, _targetModel: Model<TApi>, source: AssistantMessage): string => {
+	return transformMessages(messages, model, (id, _targetModel, source) => {
 		if (!allowedToolCallProviders.has(model.provider)) return normalizeIdPart(id);
 		if (!id.includes("|")) return normalizeIdPart(id);
 		const [callId, itemId] = id.split("|");
@@ -124,9 +130,18 @@ export function convertResponsesMessages<TApi extends Api>(
 			normalizedItemId = normalizeIdPart(`fc_${normalizedItemId}`);
 		}
 		return `${normalizedCallId}|${normalizedItemId}`;
-	};
+	});
+}
 
-	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
+export function convertResponsesMessages<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	allowedToolCallProviders: ReadonlySet<string>,
+	options?: ConvertResponsesMessagesOptions,
+): ResponseInput {
+	const messages: ResponseInput = [];
+	const transformedMessages =
+		options?.transformedMessages ?? transformResponsesMessages(model, context.messages, allowedToolCallProviders);
 
 	const includeSystemPrompt = options?.includeSystemPrompt ?? true;
 	if (includeSystemPrompt && context.systemPrompt) {
@@ -139,7 +154,7 @@ export function convertResponsesMessages<TApi extends Api>(
 	}
 
 	let msgIndex = 0;
-	for (const msg of transformedMessages) {
+	for (const [sourceMessageIndex, msg] of transformedMessages.entries()) {
 		if (msg.role === "user") {
 			if (typeof msg.content === "string") {
 				messages.push({
@@ -265,6 +280,29 @@ export function convertResponsesMessages<TApi extends Api>(
 				call_id: callId,
 				output,
 			});
+
+			const deferredTools = options?.deferredToolAnchors?.get(sourceMessageIndex) ?? [];
+			if (deferredTools.length > 0) {
+				const names = deferredTools.map((tool) => tool.name);
+				const searchCallId = `volt_tool_load_${shortHash(`${msg.toolCallId}:${names.join(",")}`)}`;
+				messages.push({
+					type: "tool_search_call",
+					call_id: searchCallId,
+					execution: "client",
+					status: "completed",
+					arguments: { query: names.join(" "), limit: names.length },
+				} satisfies ResponseInputItem);
+				messages.push({
+					type: "tool_search_output",
+					call_id: searchCallId,
+					execution: "client",
+					status: "completed",
+					tools: convertResponsesTools(deferredTools, {
+						strict: options?.deferredToolStrict,
+						deferLoading: true,
+					}),
+				} satisfies ResponseToolSearchOutputItemParam);
+			}
 		}
 		msgIndex++;
 	}
@@ -276,15 +314,18 @@ export function convertResponsesMessages<TApi extends Api>(
 // Tool conversion
 // =============================================================================
 
-export function convertResponsesTools(tools: Tool[], options?: ConvertResponsesToolsOptions): OpenAITool[] {
+export function convertResponsesTools(tools: readonly Tool[], options?: ConvertResponsesToolsOptions): OpenAITool[] {
 	const strict = options?.strict === undefined ? false : options.strict;
-	return tools.map((tool) => ({
-		type: "function",
-		name: tool.name,
-		description: tool.description,
-		parameters: tool.parameters as any, // TypeBox already generates JSON Schema
-		strict,
-	}));
+	return tools.map(
+		(tool): OpenAIFunctionTool => ({
+			type: "function",
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.parameters as Record<string, unknown>,
+			strict,
+			...(options?.deferLoading ? { defer_loading: true } : {}),
+		}),
+	);
 }
 
 // =============================================================================

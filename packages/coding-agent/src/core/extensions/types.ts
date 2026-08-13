@@ -10,6 +10,7 @@
 
 import type {
 	AgentMessage,
+	AgentTool,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ThinkingLevel,
@@ -1573,6 +1574,7 @@ export interface ExtensionActions {
 	getSessionName: GetSessionNameHandler;
 	setLabel: SetLabelHandler;
 	getActiveTools: GetActiveToolsHandler;
+	getActiveToolDefinitions: () => AgentTool<any, any>[];
 	getAllTools: GetAllToolsHandler;
 	setActiveTools: SetActiveToolsHandler;
 	refreshTools: RefreshToolsHandler;

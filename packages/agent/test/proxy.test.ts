@@ -90,6 +90,24 @@ describe("proxy stream normalization", () => {
 		expect(events.every((event) => Object.isFrozen(event))).toBe(true);
 	});
 
+	it("invalidates local request-tool snapshot inference", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => createSseResponse([{ type: "start" }, { type: "done", reason: "stop", usage }])),
+		);
+		const reported: unknown[] = [];
+		const stream = streamProxy(model, context, {
+			authToken: "proxy-token",
+			proxyUrl: "https://proxy.example",
+			reportToolSetSnapshot: (snapshot) => reported.push(snapshot),
+		});
+		for await (const _event of stream) {
+			// Drain the stream.
+		}
+
+		expect(reported).toEqual([{ kind: "unknown" }]);
+	});
+
 	it("synthesizes a terminal error when the proxy source ends mid-message", async () => {
 		const { events, message } = await readStream([
 			{ type: "start" },

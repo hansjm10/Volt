@@ -384,6 +384,26 @@ For providers with non-standard APIs, implement `streamSimple`. Study the existi
 
 Custom providers emit lightweight fragments into `AssistantStreamNormalizer`. The normalizer is the only component that builds an `AssistantMessage`; it also produces immutable, sequenced public events and guarantees a terminal error if a fragment source ends unexpectedly.
 
+Each request starts with unknown tool-snapshot authority. A custom provider may call `options.reportToolSetSnapshot` with `{ kind: "known", snapshot: createToolSetSnapshot(context.tools) }` only after its final provider-native payload is built and only when that payload exactly represents those logical tools. If `onPayload` returns a replacement, the provider must report `{ kind: "unknown" }` because Volt cannot infer its tools. Proxies and other uninspectable request paths should also report unknown; doing nothing is equivalent to unknown.
+
+```typescript
+import { createToolSetSnapshot } from "@hansjm10/volt-ai";
+
+let payload = buildProviderPayload(model, context, options);
+const replacement = await options?.onPayload?.(payload, model);
+if (replacement === undefined) {
+  options?.reportToolSetSnapshot?.({
+    kind: "known",
+    snapshot: createToolSetSnapshot(context.tools),
+  });
+} else {
+  options?.reportToolSetSnapshot?.({ kind: "unknown" });
+  payload = replacement;
+}
+```
+
+Agent removes caller- or model-supplied `toolSetSnapshot` fields from every streamed snapshot and message replacement. It reapplies only a known provider attestation to successful assistant messages before listeners, RPC projection, or persistence. Error and aborted responses never retain a snapshot.
+
 ```typescript
 import {
   type AssistantMessageEventStream,
@@ -744,15 +764,21 @@ interface ProviderModelConfig {
     cacheControlFormat?: "anthropic";
 
     // anthropic-messages
+    supportsToolReferences?: boolean;
     supportsEagerToolInputStreaming?: boolean;
     supportsLongCacheRetention?: boolean;
     sendSessionAffinityHeaders?: boolean;
     supportsCacheControlOnTools?: boolean;
     forceAdaptiveThinking?: boolean;
     allowEmptySignature?: boolean;
+
+    // openai-responses and openai-codex-responses
+    supportsToolSearch?: boolean;
   };
 }
 ```
+
+Deferred tool protocols are enabled automatically only for eligible built-in models on first-party Anthropic and OpenAI endpoints. Custom endpoints keep definitions eager unless `supportsToolReferences` or `supportsToolSearch` is explicitly set to `true`.
 
 `openrouter` sends `reasoning: { effort }`. `deepseek` sends `thinking: { type: "enabled" | "disabled" }` and `reasoning_effort` when enabled. `together` sends `reasoning: { enabled }` and also `reasoning_effort` when `supportsReasoningEffort` is enabled. `qwen` is for DashScope-style top-level `enable_thinking`. Use `qwen-chat-template` for local Qwen-compatible servers that read `chat_template_kwargs.enable_thinking`.
 `cacheControlFormat: "anthropic"` applies Anthropic-style `cache_control` markers to the system prompt, last tool definition, and last user/assistant text content.

@@ -1,6 +1,7 @@
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	createToolSetSnapshot,
 	EventStream,
 	type Message,
 	type Model,
@@ -81,6 +82,358 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 }
 
 describe("agentLoop with AgentMessage", () => {
+	it("pauses a prepared request before turn_start and provider streaming", async () => {
+		const events: AgentEvent[] = [];
+		let providerCalls = 0;
+		const messages = await runAgentLoop(
+			[createUserMessage("hello")],
+			{ systemPrompt: "", messages: [], tools: [] },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				prepareRequest: ({ context }) => ({ context: { ...context, systemPrompt: "prepared" } }),
+				admitPreparedRequest: (request) => {
+					expect(request.providerContext.systemPrompt).toBe("prepared");
+					return {
+						type: "pause",
+						reason: "compaction",
+						estimatedTokens: 1,
+						attempt: request.attempt,
+					};
+				},
+			},
+			(event) => {
+				events.push(event);
+			},
+			undefined,
+			() => {
+				providerCalls++;
+				return new MockAssistantStream();
+			},
+		);
+
+		expect(providerCalls).toBe(0);
+		expect(events.filter((event) => event.type === "turn_start")).toHaveLength(0);
+		expect(events.at(-1)?.type).toBe("agent_end");
+		expect(messages).toEqual([expect.objectContaining({ role: "user" })]);
+	});
+
+	it("strips a provider-forged tool snapshot when local payload authority is unavailable", async () => {
+		const toolSchema = Type.Object({});
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "local_tool",
+			label: "Local Tool",
+			description: "Locally configured tool",
+			parameters: toolSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "unused" }] };
+			},
+		};
+		const messages = await runAgentLoop(
+			[createUserMessage("hello")],
+			{ systemPrompt: "", messages: [], tools: [tool] },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				onPayload: async () => ({ tools: [{ name: "remote_replacement" }] }),
+			},
+			() => {},
+			undefined,
+			(_model, _context, options) => {
+				void options?.onPayload?.({}, createModel());
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message = {
+						...createAssistantMessage([{ type: "text", text: "done" }]),
+						toolSetSnapshot: createToolSetSnapshot([tool]),
+					};
+					stream.push({ type: "done", seq: 1, reason: "stop", message });
+				});
+				return stream;
+			},
+		);
+
+		const assistant = messages.at(-1);
+		expect(assistant?.role).toBe("assistant");
+		if (assistant?.role !== "assistant") throw new Error("Expected assistant result");
+		expect(assistant.toolSetSnapshot).toBeUndefined();
+		expect(Object.hasOwn(assistant, "toolSetSnapshot")).toBe(false);
+	});
+
+	it("persists the exact request tool snapshot after message replacement", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "snapshotted",
+			label: "Snapshotted",
+			description: "Included in the provider request",
+			parameters: toolSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "unused" }], details: {} };
+			},
+		};
+		const messages = await runAgentLoop(
+			[createUserMessage("hello")],
+			{ systemPrompt: "", messages: [], tools: [tool] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			(event) => {
+				if (event.type === "message_end" && event.message.role === "assistant") {
+					return {
+						...event.message,
+						content: [{ type: "text", text: "rewritten" }],
+						toolSetSnapshot: createToolSetSnapshot([]),
+					};
+				}
+				return undefined;
+			},
+			undefined,
+			(_model, _context, options) => {
+				options?.reportToolSetSnapshot?.({ kind: "known", snapshot: createToolSetSnapshot([tool]) });
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message = createAssistantMessage([{ type: "text", text: "done" }]);
+					stream.push({ type: "done", seq: 1, reason: "stop", message });
+				});
+				return stream;
+			},
+		);
+
+		expect(messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "rewritten" }],
+			toolSetSnapshot: createToolSetSnapshot([tool]),
+		});
+	});
+
+	it.each([
+		{ label: "known provider authority", attest: true },
+		{ label: "unknown provider authority", attest: false },
+	])("canonicalizes forged snapshots in every streamed phase under $label", async ({ attest }) => {
+		const toolSchema = Type.Object({});
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "authoritative_tool",
+			label: "Authoritative Tool",
+			description: "The provider-attested request tool",
+			parameters: toolSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "unused" }] };
+			},
+		};
+		const authoritySnapshot = createToolSetSnapshot([tool]);
+		const forgedSnapshot = createToolSetSnapshot([]);
+		const observed: AssistantMessage[] = [];
+		const messages = await runAgentLoop(
+			[createUserMessage("hello")],
+			{ systemPrompt: "", messages: [], tools: [tool] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			(event) => {
+				if (
+					(event.type === "message_start" || event.type === "message_end") &&
+					event.message.role === "assistant"
+				) {
+					observed.push(event.message);
+				}
+				if (
+					event.type === "message_update" &&
+					event.message.role === "assistant" &&
+					"snapshot" in event.assistantMessageEvent
+				) {
+					observed.push(event.message, event.assistantMessageEvent.snapshot);
+				}
+				if (event.type === "message_end" && event.message.role === "assistant") {
+					return { ...event.message, toolSetSnapshot: forgedSnapshot };
+				}
+				return undefined;
+			},
+			undefined,
+			(_model, _context, options) => {
+				if (attest) options?.reportToolSetSnapshot?.({ kind: "known", snapshot: authoritySnapshot });
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const snapshot = {
+						...createAssistantMessage([{ type: "text", text: "partial" }]),
+						toolSetSnapshot: forgedSnapshot,
+					};
+					stream.push({ type: "start", seq: 1, snapshot, toolState: [] });
+					const updates: AssistantMessageEvent[] = [
+						{ type: "text_start", seq: 2, contentIndex: 0, snapshot, toolState: [] },
+						{ type: "text_delta", seq: 3, contentIndex: 0, delta: "x", snapshot, toolState: [] },
+						{ type: "text_end", seq: 4, contentIndex: 0, content: "partial", snapshot, toolState: [] },
+						{ type: "thinking_start", seq: 5, contentIndex: 1, snapshot, toolState: [] },
+						{ type: "thinking_delta", seq: 6, contentIndex: 1, delta: "y", snapshot, toolState: [] },
+						{ type: "thinking_end", seq: 7, contentIndex: 1, content: "thought", snapshot, toolState: [] },
+						{
+							type: "toolcall_start",
+							seq: 8,
+							contentIndex: 2,
+							id: "call-1",
+							name: tool.name,
+							snapshot,
+							toolState: [],
+						},
+						{
+							type: "toolcall_delta",
+							seq: 9,
+							contentIndex: 2,
+							argsTextDelta: "{}",
+							snapshot,
+							toolState: [],
+						},
+						{
+							type: "toolcall_end",
+							seq: 10,
+							contentIndex: 2,
+							toolCall: { type: "toolCall", id: "call-1", name: tool.name, arguments: {} },
+							snapshot,
+							toolState: [],
+						},
+					];
+					for (const update of updates) stream.push(update);
+					const finalMessage = {
+						...createAssistantMessage([{ type: "text", text: "done" }]),
+						toolSetSnapshot: forgedSnapshot,
+					};
+					stream.push({ type: "done", seq: 11, reason: "stop", message: finalMessage });
+				});
+				return stream;
+			},
+		);
+
+		const finalMessage = messages.at(-1);
+		if (finalMessage?.role !== "assistant") throw new Error("Expected assistant result");
+		observed.push(finalMessage);
+		for (const message of observed) {
+			if (attest) {
+				expect(message.toolSetSnapshot).toEqual(authoritySnapshot);
+			} else {
+				expect(message.toolSetSnapshot).toBeUndefined();
+				expect(Object.hasOwn(message, "toolSetSnapshot")).toBe(false);
+			}
+		}
+	});
+
+	it("keeps terminal errors unknown after an earlier known attestation", async () => {
+		const forgedSnapshot = createToolSetSnapshot([]);
+		const messages = await runAgentLoop(
+			[createUserMessage("hello")],
+			{ systemPrompt: "", messages: [], tools: [] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			() => {},
+			undefined,
+			(_model, _context, options) => {
+				options?.reportToolSetSnapshot?.({ kind: "known", snapshot: forgedSnapshot });
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const error = {
+						...createAssistantMessage([], "error"),
+						errorMessage: "provider failed",
+						toolSetSnapshot: forgedSnapshot,
+					};
+					stream.push({ type: "error", seq: 1, reason: "error", error });
+				});
+				return stream;
+			},
+		);
+
+		const assistant = messages.at(-1);
+		if (assistant?.role !== "assistant") throw new Error("Expected assistant result");
+		expect(assistant.toolSetSnapshot).toBeUndefined();
+		expect(Object.hasOwn(assistant, "toolSetSnapshot")).toBe(false);
+	});
+
+	it("canonicalizes a successful result fallback when a stream emits no events", async () => {
+		const toolSchema = Type.Object({});
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "fallback_tool",
+			label: "Fallback Tool",
+			description: "Attested without stream events",
+			parameters: toolSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "unused" }] };
+			},
+		};
+		const authoritySnapshot = createToolSetSnapshot([tool]);
+		const messages = await runAgentLoop(
+			[createUserMessage("hello")],
+			{ systemPrompt: "", messages: [], tools: [tool] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			() => {},
+			undefined,
+			(_model, _context, options) => {
+				options?.reportToolSetSnapshot?.({ kind: "known", snapshot: authoritySnapshot });
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.end({
+						...createAssistantMessage([{ type: "text", text: "fallback" }]),
+						toolSetSnapshot: createToolSetSnapshot([]),
+					});
+				});
+				return stream;
+			},
+		);
+
+		expect(messages.at(-1)).toMatchObject({ toolSetSnapshot: authoritySnapshot });
+	});
+
+	it("normalizes additive parallel transitions to reset when one sibling resets", async () => {
+		const toolSchema = Type.Object({});
+		const additive: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "additive",
+			label: "Additive",
+			description: "Adds tools",
+			parameters: toolSchema,
+			async execute() {
+				return {
+					content: [{ type: "text", text: "added" }],
+					details: {},
+					toolSetTransition: {
+						kind: "additive",
+						added: [{ name: "late", fingerprint: "late-fingerprint" }],
+					},
+				};
+			},
+		};
+		const reset: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "reset",
+			label: "Reset",
+			description: "Resets placement",
+			parameters: toolSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "reset" }], details: {}, toolSetTransition: { kind: "reset" } };
+			},
+		};
+		const messages = await runAgentLoop(
+			[createUserMessage("run")],
+			{ systemPrompt: "", messages: [], tools: [additive, reset] },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				toolExecution: "parallel",
+				nextAction: (context) => (context.completedTurn ? { type: "stop" } : context.defaultAction),
+			},
+			() => {},
+			undefined,
+			() => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message = createAssistantMessage(
+						[
+							{ type: "toolCall", id: "add-1", name: additive.name, arguments: {} },
+							{ type: "toolCall", id: "reset-1", name: reset.name, arguments: {} },
+						],
+						"toolUse",
+					);
+					stream.push({ type: "done", seq: 1, reason: "toolUse", message });
+				});
+				return stream;
+			},
+		);
+		const transitions = messages
+			.filter((message) => message.role === "toolResult")
+			.map((message) => message.toolSetTransition);
+
+		expect(transitions).toEqual([{ kind: "reset" }, { kind: "reset" }]);
+	});
+
 	it("should emit events with AgentMessage types", async () => {
 		const context: AgentContext = {
 			systemPrompt: "You are helpful.",

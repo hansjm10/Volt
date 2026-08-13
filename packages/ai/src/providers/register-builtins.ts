@@ -164,6 +164,7 @@ function createLazyStream<TApi extends Api, TOptions extends StreamOptions, TSim
 				forwardStream(outer, inner);
 			})
 			.catch((error) => {
+				options?.reportToolSetSnapshot?.({ kind: "unknown" });
 				forwardStream(outer, createLazyLoadErrorStream(model, error));
 			});
 
@@ -185,6 +186,7 @@ function createLazySimpleStream<
 				forwardStream(outer, inner);
 			})
 			.catch((error) => {
+				options?.reportToolSetSnapshot?.({ kind: "unknown" });
 				forwardStream(outer, createLazyLoadErrorStream(model, error));
 			});
 

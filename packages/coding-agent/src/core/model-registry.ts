@@ -129,9 +129,11 @@ const OpenAIResponsesCompatSchema = Type.Object({
 	supportsDeveloperRole: Type.Optional(Type.Boolean()),
 	sendSessionIdHeader: Type.Optional(Type.Boolean()),
 	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
+	supportsToolSearch: Type.Optional(Type.Boolean()),
 });
 
 const AnthropicMessagesCompatSchema = Type.Object({
+	supportsToolReferences: Type.Optional(Type.Boolean()),
 	supportsEagerToolInputStreaming: Type.Optional(Type.Boolean()),
 	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
 	sendSessionAffinityHeaders: Type.Optional(Type.Boolean()),

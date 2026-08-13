@@ -117,6 +117,7 @@ function createToolResultMessage(text: string): ToolResultMessage {
 function createSessionContext(messages: AgentMessage[]): SessionContext {
 	return {
 		messages,
+		toolSelection: { kind: "inherit" },
 		thinkingLevel: "off",
 		model: null,
 		fastMode: { enabled: false },

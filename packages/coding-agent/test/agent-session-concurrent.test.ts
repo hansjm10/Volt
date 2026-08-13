@@ -9,6 +9,7 @@ import { Agent } from "@hansjm10/volt-agent-core";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	createToolSetSnapshot,
 	EventStream,
 	getModel,
 	type ImageContent,
@@ -19,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession, type AgentSessionQueuedMessage } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
+import { createProjectionState, project } from "../src/core/rpc/stream-projection.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import type { BuildSystemPromptOptions } from "../src/core/system-prompt.ts";
@@ -592,6 +594,137 @@ describe("AgentSession concurrent prompt guard", () => {
 			["user", "assistant"],
 			["user", "assistant"],
 		]);
+	});
+
+	it("publishes, projects, and persists only canonical assistant request metadata", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		let providerCallCount = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: "Test", tools: [] },
+			streamFn: (_model, _context, options) => {
+				providerCallCount++;
+				if (providerCallCount === 1) {
+					options?.reportToolSetSnapshot?.({
+						kind: "known",
+						snapshot: {
+							definitions: [{ name: "original-tool", fingerprint: "original-fingerprint" }],
+							estimatedTokens: 42,
+						},
+					});
+				}
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("original") });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory();
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = ModelRegistry.create(authStorage, tempDir);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRegistry,
+			resourceLoader: createTestResourceLoader(),
+		});
+		const forgedSnapshot = createToolSetSnapshot([]);
+		const sessionWithRunner = session as unknown as {
+			_extensionRunner?: {
+				hasHandlers: (eventType: string) => boolean;
+				emit: (event: { type: string }) => Promise<void>;
+				emitMessageEnd: (event: {
+					type: string;
+					message: AssistantMessage;
+				}) => Promise<AssistantMessage | undefined>;
+				emitInput: (
+					text: string,
+					images: unknown,
+					source: "interactive" | "rpc" | "extension",
+					streamingBehavior?: "steer" | "followUp",
+				) => Promise<{ action: "continue" }>;
+				emitBeforeAgentStart: (
+					prompt: string,
+					images: unknown,
+					systemPrompt: string,
+					systemPromptOptions: BuildSystemPromptOptions,
+				) => Promise<undefined>;
+				invalidate: (message?: string) => void;
+			};
+		};
+		sessionWithRunner._extensionRunner = {
+			hasHandlers: () => false,
+			emit: async () => {},
+			emitMessageEnd: async (event) =>
+				event.message.role === "assistant"
+					? {
+							...event.message,
+							content: [{ type: "text", text: "extension replacement" }],
+							toolSetSnapshot: forgedSnapshot,
+						}
+					: undefined,
+			emitInput: async () => ({ action: "continue" }),
+			emitBeforeAgentStart: async () => undefined,
+			invalidate: () => {},
+		};
+		const published: AssistantMessage[] = [];
+		session.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "assistant") published.push(event.message);
+		});
+
+		await session.prompt("known authority");
+		await session.prompt("unknown authority");
+		await session.agent.waitForIdle();
+
+		const expectedSnapshot = {
+			definitions: [{ name: "original-tool", fingerprint: "original-fingerprint" }],
+			estimatedTokens: 42,
+		};
+		expect(published).toHaveLength(2);
+		expect(published[0]).toMatchObject({
+			content: [{ type: "text", text: "extension replacement" }],
+			toolSetSnapshot: expectedSnapshot,
+		});
+		expect(published[1]?.toolSetSnapshot).toBeUndefined();
+		expect(Object.hasOwn(published[1]!, "toolSetSnapshot")).toBe(false);
+		const persistedAssistants = sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "message" && entry.message.role === "assistant");
+		expect(persistedAssistants[0]).toMatchObject({
+			type: "message",
+			message: {
+				content: [{ type: "text", text: "extension replacement" }],
+				toolSetSnapshot: expectedSnapshot,
+			},
+		});
+		if (persistedAssistants[1]?.type !== "message" || persistedAssistants[1].message.role !== "assistant") {
+			throw new Error("Expected a second persisted assistant message");
+		}
+		expect(persistedAssistants[1].message.toolSetSnapshot).toBeUndefined();
+		expect(Object.hasOwn(persistedAssistants[1].message, "toolSetSnapshot")).toBe(false);
+		const knownProjection = project(createProjectionState("idle"), {
+			kind: "message_end",
+			message: published[0]!,
+		}).frames[0];
+		const unknownProjection = project(createProjectionState("idle"), {
+			kind: "message_end",
+			message: published[1]!,
+		}).frames[0];
+		expect(knownProjection).toMatchObject({ message: { toolSetSnapshot: expectedSnapshot } });
+		expect(unknownProjection).toMatchObject({ message: { content: [{ text: "extension replacement" }] } });
+		if (!unknownProjection || !("message" in unknownProjection) || unknownProjection.message === undefined) {
+			throw new Error("Expected an RPC message projection");
+		}
+		expect(Object.hasOwn(unknownProjection.message, "toolSetSnapshot")).toBe(false);
+		const stateAssistant = session.agent.state.messages.at(-1);
+		if (stateAssistant?.role !== "assistant") throw new Error("Expected assistant Agent state");
+		expect(stateAssistant.toolSetSnapshot).toBeUndefined();
+		expect(Object.hasOwn(stateAssistant, "toolSetSnapshot")).toBe(false);
 	});
 
 	it("should persist message_end events in order with slow extension handlers", async () => {

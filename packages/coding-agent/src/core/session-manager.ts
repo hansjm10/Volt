@@ -1,4 +1,4 @@
-import { type AgentMessage, uuidv7 } from "@hansjm10/volt-agent-core";
+import { type AgentMessage, reduceToolSelection, type ToolSelection, uuidv7 } from "@hansjm10/volt-agent-core";
 import type { ImageContent, JsonCompatibleInput, JsonValue, Message, TextContent } from "@hansjm10/volt-ai";
 import { createHash, randomUUID } from "crypto";
 import {
@@ -262,6 +262,12 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	modelId: string;
 }
 
+/** Complete branch-local requested tool set. */
+export interface ActiveToolsChangeEntry extends SessionEntryBase {
+	type: "active_tools_change";
+	toolNames: string[];
+}
+
 /** Complete branch-local Plan mode snapshot. */
 export interface PlanningStateChangeEntry extends SessionEntryBase {
 	type: "planning_state_change";
@@ -372,6 +378,7 @@ export type SessionEntry =
 	| ThinkingLevelChangeEntry
 	| FastModeChangeEntry
 	| ModelChangeEntry
+	| ActiveToolsChangeEntry
 	| PlanningStateChangeEntry
 	| CompactionEntry
 	| BranchSummaryEntry
@@ -675,6 +682,8 @@ export interface SessionContext {
 	thinkingLevel: string;
 	model: { provider: string; modelId: string } | null;
 	fastMode: { enabled: boolean };
+	/** Inherited runtime baseline or latest explicit branch-local requested tools. */
+	toolSelection: ToolSelection;
 	planning: PlanningState;
 }
 
@@ -908,6 +917,7 @@ export function buildSessionContext(
 			thinkingLevel: "off",
 			model: null,
 			fastMode: { enabled: false },
+			toolSelection: { kind: "inherit" },
 			planning: clonePlanningState(DEFAULT_PLANNING_STATE),
 		};
 	}
@@ -925,6 +935,7 @@ export function buildSessionContext(
 			thinkingLevel: "off",
 			model: null,
 			fastMode: { enabled: false },
+			toolSelection: { kind: "inherit" },
 			planning: clonePlanningState(DEFAULT_PLANNING_STATE),
 		};
 	}
@@ -942,6 +953,7 @@ export function buildSessionContext(
 	let thinkingLevel = "off";
 	let model: { provider: string; modelId: string } | null = null;
 	let fastMode = { enabled: false };
+	let activeToolNames: string[] | null = null;
 	let planning = clonePlanningState(DEFAULT_PLANNING_STATE);
 	let compaction: CompactionEntry | null = null;
 
@@ -952,6 +964,8 @@ export function buildSessionContext(
 			fastMode = { enabled: entry.enabled };
 		} else if (entry.type === "model_change") {
 			model = { provider: entry.provider, modelId: entry.modelId };
+		} else if (entry.type === "active_tools_change") {
+			activeToolNames = [...entry.toolNames];
 		} else if (entry.type === "planning_state_change") {
 			planning = clonePlanningState(entry.planning);
 		} else if (entry.type === "message" && entry.message.role === "assistant") {
@@ -1011,7 +1025,14 @@ export function buildSessionContext(
 		}
 	}
 
-	return { messages, thinkingLevel, model, fastMode, planning };
+	return {
+		messages,
+		thinkingLevel,
+		model,
+		fastMode,
+		toolSelection: reduceToolSelection(activeToolNames),
+		planning,
+	};
 }
 
 /** Encode a cwd into the safe `--…--` session-directory name. */
@@ -1428,6 +1449,7 @@ function isSessionFileFlushContent(entry: FileEntry): boolean {
 	return (
 		entry.type === "client_input_receipt" ||
 		entry.type === "planning_state_change" ||
+		entry.type === "active_tools_change" ||
 		(entry.type === "message" && entry.message.role === "assistant") ||
 		(entry.type === "custom_message" && entry.display)
 	);
@@ -1439,6 +1461,7 @@ function isSessionDurabilityBoundary(entry: SessionEntry): boolean {
 		entry.type === "planning_state_change" ||
 		entry.type === "thinking_level_change" ||
 		entry.type === "model_change" ||
+		entry.type === "active_tools_change" ||
 		isClientInputWalEntry(entry) ||
 		// A spawn edge that only reaches the page cache when the process dies
 		// cannot recover its child; it gets the same fsync treatment as the
@@ -1845,6 +1868,14 @@ export class SessionManager {
 				seenEntryIds.add(entry.id);
 				if (entry.type === "fast_mode_change" && typeof entry.enabled !== "boolean") {
 					throw new Error(`Fast mode entry ${entry.id} has an invalid enabled state`);
+				}
+				if (
+					entry.type === "active_tools_change" &&
+					(!Array.isArray(entry.toolNames) ||
+						entry.toolNames.some((name) => typeof name !== "string" || name.length === 0) ||
+						new Set(entry.toolNames).size !== entry.toolNames.length)
+				) {
+					throw new Error(`Active tools entry ${entry.id} has invalid tool names`);
 				}
 				if (isClientInputWalEntry(entry)) {
 					if (!Number.isSafeInteger(entry.ordinal) || (entry.ordinal ?? 0) <= lastWalOrdinal) {
@@ -2784,6 +2815,23 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			provider,
 			modelId,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append one complete branch-local requested tool set. */
+	appendActiveToolsChange(toolNames: readonly string[]): string {
+		const normalized = [...new Set(toolNames)];
+		if (normalized.some((name) => name.length === 0)) {
+			throw new Error("Active tool names must be non-empty strings");
+		}
+		const entry: ActiveToolsChangeEntry = {
+			type: "active_tools_change",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			toolNames: normalized,
 		};
 		this._appendEntry(entry);
 		return entry.id;

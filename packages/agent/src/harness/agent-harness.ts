@@ -10,6 +10,12 @@ import {
 } from "@hansjm10/volt-ai";
 import { runAgentLoop } from "../agent-loop.ts";
 import { DeliveryInbox, type DeliveryLease } from "../delivery-inbox.ts";
+import {
+	createExplicitToolSelection,
+	deriveToolSelection,
+	type ToolSelection,
+	toolSelectionsEqual,
+} from "../tool-selection.ts";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -253,7 +259,9 @@ export class AgentHarness<
 	private getApiKeyAndHeaders?: AgentHarnessOptions["getApiKeyAndHeaders"];
 	private resources: AgentHarnessResources<TSkill, TPromptTemplate>;
 	private tools = new Map<string, TTool>();
-	private activeToolNames: string[];
+	private baselineToolNames: string[];
+	private toolSelection: ToolSelection = { kind: "inherit" };
+	private effectiveToolNames: string[];
 	private readonly deliveryInbox = new DeliveryInbox<"steer" | "followUp", UserMessage>();
 	private activeDeliveryLease: DeliveryLease<"steer" | "followUp", UserMessage> | undefined;
 	private readonly committedDeliveryIds = new Set<string>();
@@ -278,11 +286,13 @@ export class AgentHarness<
 		}
 		this.model = options.model;
 		this.thinkingLevel = options.thinkingLevel ?? "off";
-		this.activeToolNames = options.activeToolNames
+		const configuredActiveToolNames = options.activeToolNames
 			? [...options.activeToolNames]
 			: (options.tools ?? []).map((tool) => tool.name);
-		this.validateUniqueNames(this.activeToolNames, "Duplicate active tool name(s)");
-		this.validateToolNames(this.activeToolNames);
+		this.validateUniqueNames(configuredActiveToolNames, "Duplicate active tool name(s)");
+		this.validateToolNames(configuredActiveToolNames);
+		this.baselineToolNames = [...configuredActiveToolNames];
+		this.effectiveToolNames = [...configuredActiveToolNames];
 		this.steeringQueueMode = options.steeringMode ?? "one-at-a-time";
 		this.followUpQueueMode = options.followUpMode ?? "one-at-a-time";
 	}
@@ -360,21 +370,23 @@ export class AgentHarness<
 		return current;
 	}
 
-	private async emitBeforeProviderPayload(model: Model<any>, payload: unknown): Promise<unknown> {
+	private async emitBeforeProviderPayload(model: Model<any>, payload: unknown): Promise<unknown | undefined> {
 		const handlers = this.getHandlers("before_provider_payload");
 		let current = payload;
-		if (!handlers || handlers.size === 0) return current;
+		let modified = false;
+		if (!handlers || handlers.size === 0) return undefined;
 		for (const handler of handlers) {
 			try {
 				const result = await handler({ type: "before_provider_payload", model, payload: current });
 				if (result !== undefined) {
 					current = result.payload;
+					modified = true;
 				}
 			} catch (error) {
 				throw normalizeHookError(error);
 			}
 		}
-		return current;
+		return modified ? current : undefined;
 	}
 
 	private async emitQueueUpdate(): Promise<void> {
@@ -399,12 +411,11 @@ export class AgentHarness<
 
 	private async createTurnState(): Promise<AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>> {
 		const context = await this.session.buildContext();
+		await this.restoreToolSelection(context.toolSelection);
 		const resources = this.getResources();
 		const sessionMetadata = await this.session.getMetadata();
 		const tools = [...this.tools.values()];
-		const activeTools = this.activeToolNames
-			.map((name) => this.tools.get(name))
-			.filter((tool): tool is TTool => tool !== undefined);
+		const activeTools = this.getActiveTools();
 		let systemPrompt = "You are a helpful assistant.";
 		if (typeof this.systemPrompt === "string") {
 			systemPrompt = this.systemPrompt;
@@ -484,6 +495,9 @@ export class AgentHarness<
 					await this.emitOwn({ type: "after_provider_response", status: response.status, headers }, signal);
 				},
 				...(streamOptions?.reasoning === undefined ? {} : { reasoning: streamOptions.reasoning }),
+				...(streamOptions?.reportToolSetSnapshot === undefined
+					? {}
+					: { reportToolSetSnapshot: streamOptions.reportToolSetSnapshot }),
 				...(signal === undefined ? {} : { signal }),
 				sessionId: turnState.sessionId,
 				...(requestOptions.timeoutMs === undefined ? {} : { timeoutMs: requestOptions.timeoutMs }),
@@ -623,6 +637,27 @@ export class AgentHarness<
 		this.validateUniqueNames(toolNames, "Duplicate active tool name(s)");
 		const missing = toolNames.filter((name) => !tools.has(name));
 		if (missing.length > 0) throw new AgentHarnessError("invalid_argument", `Unknown tool(s): ${missing.join(", ")}`);
+	}
+
+	private async restoreToolSelection(selection: ToolSelection): Promise<void> {
+		const derived = deriveToolSelection(this.tools, this.baselineToolNames, selection);
+		const selectionChanged = !toolSelectionsEqual(selection, this.toolSelection);
+		const effectiveChanged =
+			derived.effectiveNames.length !== this.effectiveToolNames.length ||
+			derived.effectiveNames.some((name, index) => name !== this.effectiveToolNames[index]);
+		this.toolSelection = selection;
+		if (!selectionChanged && !effectiveChanged) return;
+		const previousToolNames = [...this.tools.keys()];
+		const previousActiveToolNames = [...this.effectiveToolNames];
+		this.effectiveToolNames = derived.effectiveNames;
+		await this.emitOwn({
+			type: "tools_update",
+			toolNames: previousToolNames,
+			previousToolNames,
+			activeToolNames: [...this.effectiveToolNames],
+			previousActiveToolNames,
+			source: "restore",
+		});
 	}
 
 	private async flushPendingSessionWrites(): Promise<void> {
@@ -1151,6 +1186,7 @@ export class AgentHarness<
 				const entry = await this.session.getEntry(summaryId);
 				if (entry?.type === "branch_summary") summaryEntry = entry;
 			}
+			await this.restoreToolSelection((await this.session.buildContext()).toolSelection);
 			await this.emitOwn({
 				type: "session_tree",
 				newLeafId: await this.session.getLeafId(),
@@ -1219,22 +1255,32 @@ export class AgentHarness<
 				"Duplicate tool name(s)",
 			);
 			const nextTools = new Map(tools.map((tool) => [tool.name, tool]));
-			const nextActiveToolNames = activeToolNames ? [...activeToolNames] : this.activeToolNames;
-			this.validateToolNames(nextActiveToolNames, nextTools);
+			if (activeToolNames !== undefined) this.validateToolNames(activeToolNames, nextTools);
+			const nextSelection =
+				activeToolNames === undefined ? this.toolSelection : createExplicitToolSelection(activeToolNames);
+			const nextBaselineToolNames = tools.map((tool) => tool.name);
+			const derived = deriveToolSelection(nextTools, nextBaselineToolNames, nextSelection);
 			const previousToolNames = [...this.tools.keys()];
-			const previousActiveToolNames = [...this.activeToolNames];
-			if (this.phase === "idle") {
-				await this.session.appendActiveToolsChange(nextActiveToolNames);
-			} else {
-				this.pendingSessionWrites.push({ type: "active_tools_change", activeToolNames: [...nextActiveToolNames] });
+			const previousActiveToolNames = [...this.effectiveToolNames];
+			if (activeToolNames !== undefined) {
+				if (this.phase === "idle") {
+					await this.session.appendActiveToolsChange(derived.requestedNames);
+				} else {
+					this.pendingSessionWrites.push({
+						type: "active_tools_change",
+						activeToolNames: [...derived.requestedNames],
+					});
+				}
 			}
 			this.tools = nextTools;
-			this.activeToolNames = [...nextActiveToolNames];
+			this.baselineToolNames = nextBaselineToolNames;
+			this.toolSelection = nextSelection;
+			this.effectiveToolNames = derived.effectiveNames;
 			await this.emitOwn({
 				type: "tools_update",
 				toolNames: [...this.tools.keys()],
 				previousToolNames,
-				activeToolNames: [...this.activeToolNames],
+				activeToolNames: [...this.effectiveToolNames],
 				previousActiveToolNames,
 				source: "set",
 			});
@@ -1244,25 +1290,31 @@ export class AgentHarness<
 	}
 
 	getActiveTools(): TTool[] {
-		return this.activeToolNames.map((name) => this.tools.get(name)!);
+		return this.effectiveToolNames.map((name) => this.tools.get(name)!);
 	}
 
 	async setActiveTools(toolNames: string[]): Promise<void> {
 		try {
 			this.validateToolNames(toolNames);
+			const nextSelection = createExplicitToolSelection(toolNames);
+			const derived = deriveToolSelection(this.tools, this.baselineToolNames, nextSelection);
 			const previousToolNames = [...this.tools.keys()];
-			const previousActiveToolNames = [...this.activeToolNames];
+			const previousActiveToolNames = [...this.effectiveToolNames];
 			if (this.phase === "idle") {
-				await this.session.appendActiveToolsChange(toolNames);
+				await this.session.appendActiveToolsChange(derived.requestedNames);
 			} else {
-				this.pendingSessionWrites.push({ type: "active_tools_change", activeToolNames: [...toolNames] });
+				this.pendingSessionWrites.push({
+					type: "active_tools_change",
+					activeToolNames: [...derived.requestedNames],
+				});
 			}
-			this.activeToolNames = [...toolNames];
+			this.toolSelection = nextSelection;
+			this.effectiveToolNames = derived.effectiveNames;
 			await this.emitOwn({
 				type: "tools_update",
 				toolNames: [...this.tools.keys()],
 				previousToolNames,
-				activeToolNames: [...this.activeToolNames],
+				activeToolNames: [...this.effectiveToolNames],
 				previousActiveToolNames,
 				source: "set",
 			});

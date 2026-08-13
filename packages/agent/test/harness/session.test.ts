@@ -32,6 +32,23 @@ async function runSessionSuite(
 			expect(context.model).toEqual({ provider: "openai", modelId: "gpt-4.1" });
 		});
 
+		it("restores inherited and explicit branch tool selections", async () => {
+			const session = new Session(await createStorage());
+			const root = await session.appendMessage(createUserMessage("root"));
+			expect((await session.buildContext()).toolSelection).toEqual({ kind: "inherit" });
+			await session.appendActiveToolsChange(["read", "late"]);
+			expect((await session.buildContext()).toolSelection).toEqual({
+				kind: "explicit",
+				requestedNames: ["read", "late"],
+			});
+			await session.moveTo(root);
+			await session.appendActiveToolsChange([]);
+			expect((await session.buildContext()).toolSelection).toEqual({
+				kind: "explicit",
+				requestedNames: [],
+			});
+		});
+
 		it("supports branching by moving the leaf and appending a new branch", async () => {
 			const session = new Session(await createStorage());
 			const user1 = await session.appendMessage(createUserMessage("one"));

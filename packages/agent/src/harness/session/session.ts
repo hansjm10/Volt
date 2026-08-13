@@ -1,4 +1,5 @@
 import type { ImageContent, JsonCompatibleInput, JsonValue, TextContent } from "@hansjm10/volt-ai";
+import { reduceToolSelection } from "../../tool-selection.ts";
 import type { AgentMessage } from "../../types.ts";
 import { createBranchSummaryMessage, createCompactionSummaryMessage, createCustomMessage } from "../messages.ts";
 import type {
@@ -76,7 +77,7 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
 		}
 	}
 
-	return { messages, thinkingLevel, model, activeToolNames };
+	return { messages, thinkingLevel, model, toolSelection: reduceToolSelection(activeToolNames) };
 }
 
 export class Session<TMetadata extends SessionMetadata = SessionMetadata> {

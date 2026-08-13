@@ -90,6 +90,32 @@ function createDeferred(): { promise: Promise<void>; resolve(): void } {
 	return { promise, resolve };
 }
 
+function createAssistantMessage(
+	session: AgentSession,
+	content: AssistantMessage["content"],
+	stopReason: AssistantMessage["stopReason"],
+	inputTokens: number,
+): AssistantMessage {
+	const model = session.model!;
+	return {
+		role: "assistant",
+		content,
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: inputTokens,
+			output: 10,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: inputTokens + 10,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason,
+		timestamp: Date.now(),
+	};
+}
+
 describe("AgentSession auto-compaction queue resume", () => {
 	let session: AgentSession;
 	let sessionManager: SessionManager;
@@ -218,6 +244,84 @@ describe("AgentSession auto-compaction queue resume", () => {
 		await session.prompt("trigger length continuation");
 
 		expect(streamCallCount).toBe(2);
+	});
+
+	it.each(["steering", "follow-up"] as const)(
+		"stops a finalized %s delivery before its over-threshold request",
+		async (deliveryKind) => {
+			const model = session.model!;
+			const firstRequestStarted = createDeferred();
+			const finishFirstRequest = createDeferred();
+			let streamCallCount = 0;
+			let streamCallsAtCompactionStart = -1;
+			session.subscribe((event) => {
+				if (event.type === "compaction_start") streamCallsAtCompactionStart = streamCallCount;
+			});
+
+			session.agent.streamFn = () => {
+				const callNumber = ++streamCallCount;
+				const stream = new MockAssistantStream();
+				void (async () => {
+					if (callNumber === 1) {
+						firstRequestStarted.resolve();
+						await finishFirstRequest.promise;
+					}
+					const message = createAssistantMessage(
+						session,
+						[{ type: "text", text: callNumber === 1 ? "plain response" : "after compaction" }],
+						"stop",
+						callNumber === 1 ? model.contextWindow - 10_000 : 100,
+					);
+					stream.push({ type: "start", seq: 0, snapshot: message, toolState: [] });
+					stream.push({ type: "done", seq: 1, reason: "stop", message });
+				})();
+				return stream;
+			};
+
+			const prompt = session.prompt("trigger queued delivery compaction");
+			await firstRequestStarted.promise;
+			if (deliveryKind === "steering") await session.steer("queued delivery");
+			else await session.followUp("queued delivery");
+			finishFirstRequest.resolve();
+			await prompt;
+
+			expect(streamCallsAtCompactionStart).toBe(1);
+			expect(streamCallCount).toBe(2);
+		},
+	);
+
+	it("retains initial and final-response request admission behavior", () => {
+		const model = session.model!;
+		const message = createAssistantMessage(
+			session,
+			[{ type: "text", text: "over threshold" }],
+			"stop",
+			model.contextWindow - 10_000,
+		);
+		const hook = (
+			session as unknown as {
+				_admitPreparedContinuation: (context: unknown) => { type: "admit" } | { type: "pause"; reason: string };
+			}
+		)._admitPreparedContinuation.bind(session);
+		const delivery = {
+			deliveryId: "delivery-1",
+			messages: [{ role: "user" as const, content: "next", timestamp: Date.now() }],
+		};
+		const baseContext = {
+			context: { systemPrompt: "", messages: [message, ...delivery.messages], tools: [] },
+			model,
+			thinkingLevel: "off" as const,
+			deliveries: [delivery],
+		};
+
+		expect(hook({ ...baseContext, reason: "delivery" })).toEqual({ type: "admit" });
+		expect(
+			hook({
+				...baseContext,
+				reason: "final_response",
+				completedTurn: { message, toolResults: [], disposition: "final_response" },
+			}),
+		).toEqual({ type: "admit" });
 	});
 
 	it("should compact mid-run when a turn with tool calls crosses the threshold", async () => {
@@ -641,22 +745,22 @@ describe("AgentSession auto-compaction queue resume", () => {
 		};
 		const context = {
 			completedTurn: { message, toolResults: [toolResult], disposition: "continue" },
-			requestAuthority: "tool_continuation",
+			reason: "continuation",
 			context: { systemPrompt: "", messages: [message, toolResult], tools: [] },
-			newMessages: [],
-			defaultAction: { type: "request", reason: "continuation" },
+			model,
+			thinkingLevel: "off" as const,
 		};
 
 		const hook = (
 			session as unknown as {
-				_shouldStopForProactiveCompaction: (context: unknown) => boolean;
+				_admitPreparedContinuation: (context: unknown) => { type: "admit" } | { type: "pause"; reason: string };
 			}
-		)._shouldStopForProactiveCompaction.bind(session);
+		)._admitPreparedContinuation.bind(session);
 
-		expect(hook(context)).toBe(true);
-		// A second threshold crossing before any successful compaction must not
-		// interrupt the run again (prevents stop/fail/continue churn every turn).
-		expect(hook(context)).toBe(false);
+		expect(hook(context)).toEqual({ type: "pause", reason: "compaction" });
+		// A repeated hook call while the same compaction remains scheduled does not
+		// start a second interruption.
+		expect(hook(context)).toEqual({ type: "admit" });
 	});
 
 	it("should not compact repeatedly after overflow recovery already attempted", async () => {

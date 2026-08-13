@@ -5,6 +5,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AssistantMessage } from "@hansjm10/volt-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createExtensionRuntime, discoverAndLoadExtensions, loadExtensions } from "../src/core/extensions/loader.ts";
@@ -68,6 +69,7 @@ describe("ExtensionRunner", () => {
 		getSessionName: () => undefined,
 		setLabel: () => {},
 		getActiveTools: () => [],
+		getActiveToolDefinitions: () => [],
 		getAllTools: () => [],
 		setActiveTools: () => {},
 		refreshTools: () => {},
@@ -533,6 +535,69 @@ describe("ExtensionRunner", () => {
 			const ctx = runner.createContext();
 			expect(ctx.mode).toBe("tui");
 			expect(ctx.hasUI).toBe(true);
+		});
+	});
+
+	describe("message replacements", () => {
+		it("preserves assistant request metadata across chained extension replacements", async () => {
+			const extCode = `
+				export default function(volt) {
+					volt.on("message_end", (event) => {
+						if (event.message.role !== "assistant") return;
+						return {
+							message: {
+								...event.message,
+								content: [{ type: "text", text: "first replacement" }],
+								toolSetSnapshot: { definitions: [], estimatedTokens: 0 },
+							},
+						};
+					});
+					volt.on("message_end", (event) => {
+						if (event.message.role !== "assistant") return;
+						const toolName = event.message.toolSetSnapshot?.definitions[0]?.name ?? "missing";
+						return {
+							message: {
+								...event.message,
+								content: [{ type: "text", text: "saw:" + toolName }],
+							},
+						};
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "message-replacement.ts"), extCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const snapshot = {
+				definitions: [{ name: "original-tool", fingerprint: "original-fingerprint" }],
+				estimatedTokens: 42,
+			};
+			const original: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "original" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "test-model",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				toolSetSnapshot: snapshot,
+				timestamp: Date.now(),
+			};
+
+			const replacement = await runner.emitMessageEnd({ type: "message_end", message: original });
+
+			expect(replacement).toMatchObject({
+				role: "assistant",
+				content: [{ type: "text", text: "saw:original-tool" }],
+				toolSetSnapshot: snapshot,
+			});
 		});
 	});
 

@@ -49,6 +49,10 @@ Harness config is the latest runtime configuration set by the application or ext
 
 Getters return harness config. They do not return the snapshot used by an in-flight provider request.
 
+Tool config keeps four values separate: the registered definitions, the current inherited baseline names, the branch's durable inherited/explicit selection, and the effective registered tools. A branch with no `active_tools_change` inherits the current baseline. Every persisted entry is explicit, including an ordered empty list or names whose definitions are temporarily unavailable. Unavailable explicit names stay requested and become effective again if `setTools()` restores their definitions.
+
+`setTools(tools)` updates the registry and inherited baseline without persisting branch intent. `setTools(tools, names)` and `setActiveTools(names)` validate caller-supplied names against the current registry and persist an explicit selection. Registry refreshes never filter or rewrite an existing explicit selection.
+
 Setters update harness config immediately, including while a turn is in flight. Changes affect the next turn snapshot, not the currently running provider request.
 
 `setResources()` accepts concrete resources and emits `resources_update` on every call with shallow-copied current and previous resources. Applications own loading/reloading resources from disk or other sources and should call `setResources()` with new values.
@@ -273,7 +277,9 @@ Done:
 - Added live `getSteeringMode()` / `setSteeringMode()` and `getFollowUpMode()` / `setFollowUpMode()`.
 - Added `getTools()` and `getActiveTools()`.
 - Added `tools_update` observability events, including active-tool-only updates.
-- Active tool changes are persisted as branch-scoped `active_tools_change` entries.
+- Active tool changes are persisted as branch-scoped explicit `active_tools_change` entries; an absent entry inherits the current runtime baseline.
+- Restored unavailable names remain requested and reactivate when their definitions return.
+- Registry-only `setTools(tools)` updates the inherited baseline without persisting or filtering branch intent.
 - Duplicate tool names and duplicate active tool names reject.
 
 Remaining:

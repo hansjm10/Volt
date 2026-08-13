@@ -173,7 +173,7 @@ describe("AgentSession dispose inertness", () => {
 		// which in production is the live RPC transport to a remote client.
 		const payload = { value: 2 };
 		const result = await runner.emitBeforeProviderRequest(payload);
-		expect(result).toBe(payload);
+		expect(result).toBeUndefined();
 		expect(handlerCalls).toEqual(["before_provider_request"]);
 		expect(extensionErrors).toEqual([]);
 		expect(runner.hasHandlers("before_provider_request")).toBe(false);

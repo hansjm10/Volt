@@ -1,4 +1,10 @@
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@hansjm10/volt-ai";
+import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	createToolSetSnapshot,
+	EventStream,
+	getModel,
+} from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import {
@@ -7,6 +13,7 @@ import {
 	type AgentMessage,
 	type AgentTool,
 	type AgentToolUpdateCallback,
+	type PreparedProviderRequest,
 } from "../src/index.ts";
 
 // Mock stream that mimics AssistantMessageEventStream
@@ -142,8 +149,19 @@ describe("Agent", () => {
 			},
 		});
 		const events: string[] = [];
+		const forgedSnapshot = createToolSetSnapshot([]);
+		let laterListenerSnapshot: AssistantMessage["toolSetSnapshot"];
 		agent.subscribe((event) => {
 			events.push(event.type);
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				return { ...event.message, toolSetSnapshot: forgedSnapshot };
+			}
+			return undefined;
+		});
+		agent.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				laterListenerSnapshot = event.message.toolSetSnapshot;
+			}
 		});
 
 		await agent.prompt("hello");
@@ -164,6 +182,8 @@ describe("Agent", () => {
 		if (lastMessage?.role !== "assistant") throw new Error("Expected assistant message");
 		expect(lastMessage.stopReason).toBe("error");
 		expect(lastMessage.errorMessage).toBe("provider exploded");
+		expect(lastMessage.toolSetSnapshot).toBeUndefined();
+		expect(laterListenerSnapshot).toBeUndefined();
 		expect(agent.state.errorMessage).toBe("provider exploded");
 	});
 
@@ -206,13 +226,21 @@ describe("Agent", () => {
 
 	it("feeds finalized tool-result replacements into the next model context", async () => {
 		const toolSchema = Type.Object({});
+		const protectedTransition = {
+			kind: "additive" as const,
+			added: [{ name: "late_tool", fingerprint: "late-fingerprint" }],
+		};
 		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
 			name: "replaceable_tool",
 			label: "Replaceable Tool",
 			description: "Returns content that a listener replaces",
 			parameters: toolSchema,
 			async execute() {
-				return { content: [{ type: "text", text: "original tool result" }], details: {} };
+				return {
+					content: [{ type: "text", text: "original tool result" }],
+					details: {},
+					toolSetTransition: protectedTransition,
+				};
 			},
 		};
 		let providerToolText: string | undefined;
@@ -248,10 +276,12 @@ describe("Agent", () => {
 		});
 		agent.subscribe((event) => {
 			if (event.type === "message_end" && event.message.role === "toolResult") {
-				return {
+				const replacement = {
 					...event.message,
 					content: [{ type: "text", text: "rewritten tool result" }],
 				};
+				delete replacement.toolSetTransition;
+				return replacement;
 			}
 			return undefined;
 		});
@@ -263,6 +293,414 @@ describe("Agent", () => {
 		expect(storedToolResult?.role).toBe("toolResult");
 		if (storedToolResult?.role !== "toolResult") throw new Error("Expected tool result");
 		expect(storedToolResult.content[0]).toEqual({ type: "text", text: "rewritten tool result" });
+		expect(storedToolResult.toolSetTransition).toEqual(protectedTransition);
+	});
+
+	it.each([
+		{ label: "an unchanged payload hook", replacePayload: false },
+		{ label: "a provider tool replacement", replacePayload: true },
+	])("records request tool state after $label", async ({ replacePayload }) => {
+		const toolSchema = Type.Object({});
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "request_tool",
+			label: "Request Tool",
+			description: "Tool represented by the Agent request",
+			parameters: toolSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "unused" }] };
+			},
+		};
+		const agent = new Agent({
+			initialState: { tools: [tool] },
+			onPayload: async () => (replacePayload ? { tools: [{ name: "replacement_tool" }] } : undefined),
+			streamFn: async (model, _context, options) => {
+				const replacement = await options?.onPayload?.({ tools: [{ name: tool.name }] }, model);
+				options?.reportToolSetSnapshot?.(
+					replacement === undefined
+						? { kind: "known", snapshot: createToolSetSnapshot([tool]) }
+						: { kind: "unknown" },
+				);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("ok") });
+				});
+				return stream;
+			},
+		});
+		let laterListenerSnapshot: AssistantMessage["toolSetSnapshot"];
+		agent.subscribe((event) => {
+			if (event.type !== "message_end" || event.message.role !== "assistant") return undefined;
+			return {
+				...event.message,
+				content: [{ type: "text", text: "first replacement" }],
+				toolSetSnapshot: createToolSetSnapshot(replacePayload ? [tool] : []),
+			};
+		});
+		agent.subscribe((event) => {
+			if (event.type !== "message_end" || event.message.role !== "assistant") return undefined;
+			laterListenerSnapshot = event.message.toolSetSnapshot;
+			return { ...event.message, content: [{ type: "text", text: "second replacement" }] };
+		});
+
+		await agent.prompt("hello");
+
+		const assistant = agent.state.messages.at(-1);
+		if (assistant?.role !== "assistant") throw new Error("Expected assistant message");
+		expect(assistant.content).toEqual([{ type: "text", text: "second replacement" }]);
+		if (replacePayload) {
+			expect(laterListenerSnapshot).toBeUndefined();
+			expect(assistant.toolSetSnapshot).toBeUndefined();
+			expect(Object.hasOwn(assistant, "toolSetSnapshot")).toBe(false);
+		} else {
+			expect(laterListenerSnapshot).toEqual(createToolSetSnapshot([tool]));
+			expect(assistant.toolSetSnapshot).toEqual(createToolSetSnapshot([tool]));
+		}
+	});
+
+	it("strips caller-authored assistant snapshots before delivery observation and persistence", async () => {
+		const forgedSnapshot = createToolSetSnapshot([]);
+		const forgedAssistant = { ...createAssistantMessage("historical"), toolSetSnapshot: forgedSnapshot };
+		const observedSnapshots: Array<AssistantMessage["toolSetSnapshot"]> = [];
+		let providerSnapshot: AssistantMessage["toolSetSnapshot"];
+		const agent = new Agent({
+			streamFn: (_model, context) => {
+				const historical = context.messages.find((message) => message.role === "assistant");
+				providerSnapshot = historical?.role === "assistant" ? historical.toolSetSnapshot : undefined;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
+			},
+		});
+		agent.subscribe((event) => {
+			if (event.type === "delivery_start") {
+				for (const message of event.messages) {
+					if (message.role === "assistant") observedSnapshots.push(message.toolSetSnapshot);
+				}
+			}
+			if (
+				(event.type === "message_start" || event.type === "message_end") &&
+				event.deliveryId !== undefined &&
+				event.message.role === "assistant"
+			) {
+				observedSnapshots.push(event.message.toolSetSnapshot);
+			}
+		});
+
+		await agent.prompt([
+			forgedAssistant,
+			{ role: "user", content: [{ type: "text", text: "continue" }], timestamp: Date.now() },
+		]);
+
+		expect(observedSnapshots).toEqual([undefined, undefined, undefined]);
+		expect(providerSnapshot).toBeUndefined();
+		const storedHistorical = agent.state.messages.find(
+			(message) =>
+				message.role === "assistant" &&
+				message.content.some((part) => part.type === "text" && part.text === "historical"),
+		);
+		if (storedHistorical?.role !== "assistant") throw new Error("Expected stored historical assistant");
+		expect(storedHistorical.toolSetSnapshot).toBeUndefined();
+		expect(Object.hasOwn(storedHistorical, "toolSetSnapshot")).toBe(false);
+	});
+
+	it("resumes a paused prepared request before draining another one-at-a-time delivery", async () => {
+		const requests: string[][] = [];
+		let pauseOnce = true;
+		const agent = new Agent({
+			nextAction: (context) => (context.completedTurn ? { type: "stop" } : context.defaultAction),
+			admitPreparedRequest: (request) => {
+				if (pauseOnce && request.deliveries.length > 0) {
+					pauseOnce = false;
+					return {
+						type: "pause",
+						reason: "compaction",
+						estimatedTokens: 1,
+						attempt: request.attempt,
+					};
+				}
+				return { type: "admit" };
+			},
+			streamFn: (_model, context) => {
+				requests.push(
+					context.messages.flatMap((message) =>
+						message.role === "user" && typeof message.content === "string" ? [message.content] : [],
+					),
+				);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
+			},
+		});
+		agent.followUp({ role: "user", content: "first", timestamp: 1 });
+		agent.followUp({ role: "user", content: "second", timestamp: 2 });
+
+		const paused = await agent.continue();
+		expect(requests).toEqual([]);
+		if (paused.status !== "paused") throw new Error("Expected a paused provider request");
+		await agent.replacePreparedRequestMessages(paused.pause.checkpointId, agent.state.messages);
+		await agent.continue();
+		expect(requests).toEqual([["first"]]);
+		expect(agent.hasQueuedMessages()).toBe(true);
+	});
+
+	it("clears a paused prepared request when replacement conversion fails", async () => {
+		let conversionCount = 0;
+		const requests: string[][] = [];
+		const agent = new Agent({
+			convertToLlm: (messages) => {
+				conversionCount++;
+				if (conversionCount === 2) throw new Error("replacement conversion failed");
+				return messages.filter(
+					(message) => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+				);
+			},
+			admitPreparedRequest: (request) => ({
+				type: "pause",
+				reason: "compaction",
+				estimatedTokens: 1,
+				attempt: request.attempt,
+			}),
+			streamFn: (_model, context) => {
+				requests.push(
+					context.messages.flatMap((message) =>
+						message.role === "user" && typeof message.content === "string" ? [message.content] : [],
+					),
+				);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
+			},
+		});
+
+		const paused = await agent.prompt("first");
+		if (paused.status !== "paused") throw new Error("Expected a paused provider request");
+		await expect(
+			agent.replacePreparedRequestMessages(paused.pause.checkpointId, agent.state.messages),
+		).rejects.toThrow("replacement conversion failed");
+		agent.convertToLlm = (messages) =>
+			messages.filter(
+				(message) => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+			);
+		agent.admitPreparedRequest = () => ({ type: "admit" });
+		await agent.prompt("second");
+
+		expect(requests).toHaveLength(1);
+		expect(
+			agent.state.messages.some(
+				(message) =>
+					message.role === "user" &&
+					Array.isArray(message.content) &&
+					message.content.some((part) => part.type === "text" && part.text === "second"),
+			),
+		).toBe(true);
+	});
+
+	it("owns one immutable prepared request and derives one exact compaction successor", async () => {
+		let deliveryPreparations = 0;
+		let requestPreparations = 0;
+		let transformations = 0;
+		let conversions = 0;
+		let apiKeyResolutions = 0;
+		let providerCalls = 0;
+		const admissions: PreparedProviderRequest[] = [];
+		const authority = {};
+		const agent = new Agent({
+			getRequestAuthority: () => authority,
+			getApiKey: () => {
+				apiKeyResolutions++;
+				return "prepared-key";
+			},
+			prepareDelivery: (delivery) => {
+				deliveryPreparations++;
+				return { messages: [...delivery.messages] };
+			},
+			prepareRequest: ({ context }) => {
+				requestPreparations++;
+				return { context: { ...context, systemPrompt: "prepared system" } };
+			},
+			transformContext: async (messages) => {
+				transformations++;
+				return messages.map((message) =>
+					message.role === "user" ? { ...message, content: `transformed-${transformations}` } : message,
+				);
+			},
+			convertToLlm: (messages) => {
+				conversions++;
+				return messages
+					.filter(
+						(message) => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+					)
+					.map((message) =>
+						message.role === "user" ? { ...message, content: `converted-${conversions}` } : message,
+					);
+			},
+			admitPreparedRequest: (request) => {
+				admissions.push(request);
+				return request.attempt === 0
+					? {
+							type: "pause",
+							reason: "compaction",
+							estimatedTokens: 10,
+							attempt: request.attempt,
+						}
+					: { type: "admit" };
+			},
+			nextAction: (context) => (context.completedTurn ? { type: "stop" } : context.defaultAction),
+			streamFn: (_model, context, options) => {
+				providerCalls++;
+				expect(context).toEqual(admissions[1]?.providerContext);
+				expect(options?.apiKey).toBe("prepared-key");
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
+			},
+		});
+
+		const paused = await agent.prompt("original");
+		if (paused.status !== "paused") throw new Error("Expected a paused provider request");
+		agent.followUp({ role: "user", content: "queued", timestamp: Date.now() });
+		await expect(agent.continue()).resolves.toEqual({ status: "paused", deliveries: [], pause: paused.pause });
+		expect({ deliveryPreparations, requestPreparations, transformations, conversions, apiKeyResolutions }).toEqual({
+			deliveryPreparations: 1,
+			requestPreparations: 1,
+			transformations: 1,
+			conversions: 1,
+			apiKeyResolutions: 1,
+		});
+		expect(providerCalls).toBe(0);
+		const original = agent.getPreparedRequest(paused.pause.checkpointId);
+		expect(original).toBe(admissions[0]);
+		expect(Object.isFrozen(original)).toBe(true);
+		expect(Object.isFrozen(original?.providerContext)).toBe(true);
+		expect(original?.providerContext).toMatchObject({
+			systemPrompt: "prepared system",
+			messages: [expect.objectContaining({ role: "user", content: "converted-1" })],
+		});
+
+		const compactedMessages: AgentMessage[] = [
+			{ role: "user", content: "compacted transcript", timestamp: Date.now() },
+		];
+		const replacement = await agent.replacePreparedRequestMessages(paused.pause.checkpointId, compactedMessages);
+		expect(replacement.type).toBe("admit");
+		const successor = replacement.checkpoint;
+		expect(successor.requestId).toBe(original?.requestId);
+		expect(successor.checkpointId).not.toBe(original?.checkpointId);
+		expect(successor.runId).toBe(original?.runId);
+		expect(successor.attempt).toBe(1);
+		expect(successor.deliveries).toEqual(original?.deliveries);
+		expect(successor.streamOptions).toEqual(original?.streamOptions);
+		expect(successor.providerContext.messages).toEqual([
+			expect.objectContaining({ role: "user", content: "converted-2" }),
+		]);
+		expect({ deliveryPreparations, requestPreparations, transformations, conversions, apiKeyResolutions }).toEqual({
+			deliveryPreparations: 1,
+			requestPreparations: 1,
+			transformations: 2,
+			conversions: 2,
+			apiKeyResolutions: 1,
+		});
+		await expect(agent.replacePreparedRequestMessages(paused.pause.checkpointId, compactedMessages)).rejects.toThrow(
+			"unavailable or no longer paused",
+		);
+		expect(agent.hasQueuedMessages()).toBe(true);
+
+		await expect(agent.continue()).resolves.toMatchObject({ status: "completed" });
+		expect(providerCalls).toBe(1);
+		expect(agent.hasQueuedMessages()).toBe(true);
+		expect(agent.getPreparedRequest()).toBeUndefined();
+	});
+
+	it.each(["abort", "reset", "new prompt", "discard"] as const)(
+		"invalidates a paused checkpoint on %s",
+		async (action) => {
+			let pause = true;
+			const agent = new Agent({
+				admitPreparedRequest: (request) =>
+					pause
+						? {
+								type: "pause",
+								reason: "compaction",
+								estimatedTokens: 1,
+								attempt: request.attempt,
+							}
+						: { type: "admit" },
+				streamFn: () => {
+					const stream = new MockAssistantStream();
+					queueMicrotask(() => {
+						stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("done") });
+					});
+					return stream;
+				},
+			});
+			const result = await agent.prompt("first");
+			if (result.status !== "paused") throw new Error("Expected a paused provider request");
+			if (action === "abort") agent.abort();
+			if (action === "reset") agent.reset();
+			if (action === "discard") agent.discardPendingPrompt();
+			if (action === "new prompt") {
+				pause = false;
+				await agent.prompt("second");
+			}
+			expect(agent.getPreparedRequest(result.pause.checkpointId)).toBeUndefined();
+			await expect(
+				agent.replacePreparedRequestMessages(result.pause.checkpointId, agent.state.messages),
+			).rejects.toThrow("unavailable or no longer paused");
+		},
+	);
+
+	it("rejects fresh preparation when host authority changes before materialization", async () => {
+		let authority: object = {};
+		let providerCalls = 0;
+		const agent = new Agent({
+			getRequestAuthority: () => authority,
+			prepareRequest: async () => {
+				authority = {};
+				return undefined;
+			},
+			streamFn: () => {
+				providerCalls++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("first");
+
+		expect(providerCalls).toBe(0);
+		expect(agent.state.errorMessage).toBe("Prepared provider request host authority is stale");
+		expect(agent.getPreparedRequest()).toBeUndefined();
+	});
+
+	it("rejects a paused checkpoint after host authority changes", async () => {
+		let authority: object = {};
+		const agent = new Agent({
+			getRequestAuthority: () => authority,
+			admitPreparedRequest: (request) => ({
+				type: "pause",
+				reason: "compaction",
+				estimatedTokens: 1,
+				attempt: request.attempt,
+			}),
+		});
+		const result = await agent.prompt("first");
+		if (result.status !== "paused") throw new Error("Expected a paused provider request");
+		authority = {};
+
+		await expect(
+			agent.replacePreparedRequestMessages(result.pause.checkpointId, agent.state.messages),
+		).rejects.toThrow("host authority is stale");
+		expect(agent.getPreparedRequest()).toBeUndefined();
 	});
 
 	it("uses a finalized replacement throughout thrown-run failure lifecycle events", async () => {
@@ -1486,7 +1924,7 @@ describe("Agent", () => {
 
 	it("stops after the current turn when nextAction returns stop", async () => {
 		const toolSchema = Type.Object({});
-		const tool: AgentTool<typeof toolSchema, never> = {
+		const tool: AgentTool<typeof toolSchema> = {
 			name: "noop_tool",
 			label: "Noop Tool",
 			description: "Returns ok",

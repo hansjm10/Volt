@@ -113,6 +113,22 @@ export const RpcAssistantMessageDiagnosticSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
+export const RpcToolDefinitionFingerprintSchema = Type.Object(
+	{
+		name: Type.String(),
+		fingerprint: Type.String(),
+	},
+	{ additionalProperties: false },
+);
+
+export const RpcToolSetSnapshotSchema = Type.Object(
+	{
+		definitions: Type.Array(RpcToolDefinitionFingerprintSchema),
+		estimatedTokens: Type.Number(),
+	},
+	{ additionalProperties: false },
+);
+
 export const RpcAssistantMessageSchema = Type.Object(
 	{
 		role: Type.Literal("assistant"),
@@ -126,6 +142,7 @@ export const RpcAssistantMessageSchema = Type.Object(
 		usage: RpcUsageSchema,
 		stopReason: RpcStopReasonSchema,
 		errorMessage: Type.Optional(Type.String()),
+		toolSetSnapshot: Type.Optional(RpcToolSetSnapshotSchema),
 		timestamp: Type.Number(),
 	},
 	{ additionalProperties: false },

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+	type ActiveToolsChangeEntry,
 	type BranchSummaryEntry,
 	buildSessionContext,
 	type CompactionEntry,
@@ -59,6 +60,10 @@ function thinkingLevel(id: string, parentId: string | null, level: string): Thin
 
 function modelChange(id: string, parentId: string | null, provider: string, modelId: string): ModelChangeEntry {
 	return { type: "model_change", id, parentId, timestamp: "2025-01-01T00:00:00Z", provider, modelId };
+}
+
+function activeTools(id: string, parentId: string | null, toolNames: string[]): ActiveToolsChangeEntry {
+	return { type: "active_tools_change", id, parentId, timestamp: "2025-01-01T00:00:00Z", toolNames };
 }
 
 function planning(
@@ -122,6 +127,29 @@ describe("buildSessionContext", () => {
 			const ctx = buildSessionContext(entries);
 			expect(ctx.thinkingLevel).toBe("high");
 			expect(ctx.messages).toHaveLength(2);
+		});
+
+		it("restores branch-local requested tools", () => {
+			const entries: SessionEntry[] = [
+				activeTools("1", null, ["read", "bash"]),
+				msg("2", "1", "user", "branch point"),
+				activeTools("3", "2", ["read"]),
+				activeTools("4", "2", ["web_search"]),
+				activeTools("5", "2", []),
+			];
+			expect(buildSessionContext(entries, "3").toolSelection).toEqual({
+				kind: "explicit",
+				requestedNames: ["read"],
+			});
+			expect(buildSessionContext(entries, "4").toolSelection).toEqual({
+				kind: "explicit",
+				requestedNames: ["web_search"],
+			});
+			expect(buildSessionContext(entries, "5").toolSelection).toEqual({
+				kind: "explicit",
+				requestedNames: [],
+			});
+			expect(buildSessionContext([], null).toolSelection).toEqual({ kind: "inherit" });
 		});
 
 		it("restores the newest complete planning snapshot", () => {

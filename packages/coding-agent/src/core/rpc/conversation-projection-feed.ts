@@ -564,6 +564,15 @@ function assertCanonicalTranscriptEntry(entry: Record<string, unknown>): void {
 				throw new Error("Conversation transcript model commit is malformed");
 			}
 			return;
+		case "active_tools_change":
+			if (
+				!Array.isArray(entry.toolNames) ||
+				entry.toolNames.some((name) => !isCanonicalExternalIdentifier(name)) ||
+				new Set(entry.toolNames).size !== entry.toolNames.length
+			) {
+				throw new Error("Conversation transcript active-tools commit is malformed");
+			}
+			return;
 		case "compaction":
 			if (
 				typeof entry.summary !== "string" ||

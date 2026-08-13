@@ -2,8 +2,19 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
-import type { AgentMessage } from "@hansjm10/volt-agent-core";
-import type { ImageContent, JsonValue, Model } from "@hansjm10/volt-ai";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+	type AgentMessage,
+	canonicalizeMessageReplacement,
+	getCanonicalToolSetSnapshotAuthority,
+} from "@hansjm10/volt-agent-core";
+import {
+	classifyToolSetTransition,
+	type ImageContent,
+	type JsonValue,
+	type Model,
+	type ToolDefinitionFingerprint,
+} from "@hansjm10/volt-ai";
 import type { KeyId } from "@hansjm10/volt-tui";
 import { CanonicalDataError, cloneCanonicalData } from "../canonical-data.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
@@ -284,6 +295,11 @@ const noOpUIContext: ExtensionUIContext = {
 };
 
 export class ExtensionRunner {
+	private readonly toolExecutionContext = new AsyncLocalStorage<{
+		active: boolean;
+		added: ToolDefinitionFingerprint[];
+		tainted: boolean;
+	}>();
 	private extensions: Extension[];
 	private runtime: ExtensionRuntime;
 	private uiContext: ExtensionUIContext;
@@ -345,8 +361,20 @@ export class ExtensionRunner {
 		this.runtime.setLabel = actions.setLabel;
 		this.runtime.getActiveTools = actions.getActiveTools;
 		this.runtime.getAllTools = actions.getAllTools;
-		this.runtime.setActiveTools = actions.setActiveTools;
-		this.runtime.refreshTools = actions.refreshTools;
+		const trackMutation = (mutate: () => void): void => {
+			const execution = this.toolExecutionContext.getStore();
+			const before = execution?.active ? actions.getActiveToolDefinitions() : undefined;
+			mutate();
+			if (!execution?.active || !before) return;
+			const transition = classifyToolSetTransition(before, actions.getActiveToolDefinitions());
+			if (transition?.kind === "reset") {
+				execution.tainted = true;
+			} else if (transition?.kind === "additive") {
+				execution.added.push(...transition.added);
+			}
+		};
+		this.runtime.setActiveTools = (toolNames) => trackMutation(() => actions.setActiveTools(toolNames));
+		this.runtime.refreshTools = () => trackMutation(actions.refreshTools);
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
@@ -555,9 +583,9 @@ export class ExtensionRunner {
 
 	/**
 	 * Whether this runner belongs to a dead generation (disposed session or
-	 * pre-reload runner). Inert runners must produce no side effects: emits
-	 * pass values through unchanged, handlers never run, and errors never
-	 * reach listeners (which may be wired to a live transport).
+	 * pre-reload runner). Inert runners must produce no side effects: replacement
+	 * hooks report no replacement, pass-through transforms retain their input,
+	 * handlers never run, and errors never reach live transport listeners.
 	 */
 	private get isInert(): boolean {
 		return this.staleMessage !== undefined;
@@ -679,6 +707,30 @@ export class ExtensionRunner {
 			return;
 		}
 		this.shutdownHandler();
+	}
+
+	async trackToolExecution<T>(
+		execute: () => Promise<T>,
+	): Promise<{ result: T; toolSetTransition: ReturnType<typeof classifyToolSetTransition> }> {
+		this.assertActive();
+		const execution: {
+			active: boolean;
+			added: ToolDefinitionFingerprint[];
+			tainted: boolean;
+		} = { active: true, added: [], tainted: false };
+		try {
+			const result = await this.toolExecutionContext.run(execution, execute);
+			return {
+				result,
+				toolSetTransition: execution.tainted
+					? { kind: "reset" }
+					: execution.added.length > 0
+						? { kind: "additive", added: execution.added }
+						: undefined,
+			};
+		} finally {
+			execution.active = false;
+		}
 	}
 
 	/**
@@ -895,9 +947,14 @@ export class ExtensionRunner {
 						throw error;
 					}
 
-					currentMessage = cloneCanonicalData(
+					const replacement = cloneCanonicalData(
 						handlerResult.message,
 						`Extension message_end replacement from ${ext.path}`,
+					);
+					currentMessage = canonicalizeMessageReplacement(
+						currentMessage,
+						replacement,
+						getCanonicalToolSetSnapshotAuthority(currentMessage),
 					);
 					modified = true;
 				} catch (err) {
@@ -1075,12 +1132,13 @@ export class ExtensionRunner {
 		return currentMessages;
 	}
 
-	async emitBeforeProviderRequest(payload: unknown): Promise<unknown> {
+	async emitBeforeProviderRequest(payload: unknown): Promise<unknown | undefined> {
 		if (this.isInert) {
-			return payload;
+			return undefined;
 		}
 		const ctx = this.createContext();
 		let currentPayload = payload;
+		let modified = false;
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("before_provider_request");
@@ -1095,6 +1153,7 @@ export class ExtensionRunner {
 					const handlerResult = await handler(event, ctx);
 					if (handlerResult !== undefined) {
 						currentPayload = handlerResult;
+						modified = true;
 					}
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
@@ -1109,7 +1168,7 @@ export class ExtensionRunner {
 			}
 		}
 
-		return currentPayload;
+		return modified ? currentPayload : undefined;
 	}
 
 	async emitBeforeAgentStart(

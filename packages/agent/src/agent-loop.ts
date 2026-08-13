@@ -5,13 +5,17 @@
 
 import {
 	type AssistantMessage,
+	type AssistantMessageEvent,
 	type Context,
 	EventStream,
 	type JsonObject,
 	streamSimple,
+	type Tool,
 	type ToolResultMessage,
+	type ToolSetSnapshotAuthority,
 	validateToolArguments,
 } from "@hansjm10/volt-ai";
+import { canonicalizeMessageReplacement, UNKNOWN_TOOL_SET_SNAPSHOT_AUTHORITY } from "./message-replacement.ts";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -21,10 +25,14 @@ import type {
 	AgentLoopNextAction,
 	AgentLoopNextActionContext,
 	AgentMessage,
+	AgentPreparedRequestDecision,
 	AgentRequestAuthority,
 	AgentTool,
 	AgentToolCall,
 	AgentToolResult,
+	PreparedProviderRequest,
+	PreparedProviderStreamOptions,
+	PrepareRequestContext,
 	StreamFn,
 	ToolBatchDisposition,
 } from "./types.ts";
@@ -196,6 +204,7 @@ async function runDispatchedLoop(
 	let completedTurn: AgentLoopNextActionContext["completedTurn"];
 	let requestAuthority: AgentRequestAuthority = "provider";
 	let defaultAction = initialAction;
+	let admittedPreparedRequest = initialConfig.preparedRequest;
 
 	while (true) {
 		if (signal?.aborted) {
@@ -206,92 +215,139 @@ async function runDispatchedLoop(
 			return;
 		}
 
-		const actionContext: AgentLoopNextActionContext = {
-			context: currentContext,
-			newMessages,
-			...(completedTurn === undefined ? {} : { completedTurn }),
-			requestAuthority,
-			defaultAction,
-		};
-		const hostAction = await resolveNextAction(config, actionContext);
-		if (signal?.aborted && completedTurn) {
-			await emitBoundaryAbort(currentContext, newMessages, config, emit);
-			await emit({ type: "agent_end", messages: newMessages });
-			return;
-		}
-		const action =
-			requestAuthority === "final_response" && hostAction.type !== "pause"
-				? ({ type: "request", reason: "final_response" } as const)
-				: hostAction;
-
-		if (action.type !== "request") {
-			await emit({ type: "agent_end", messages: newMessages });
-			return;
-		}
-
-		const finalizedDeliveries = await emitDeliveries(
-			"deliveries" in action ? (action.deliveries ?? []) : [],
-			currentContext,
-			newMessages,
-			emit,
-			signal,
-			config.beginDelivery,
-		);
-		if (action.reason === "delivery" && finalizedDeliveries.length === 0) {
-			await emit({ type: "agent_end", messages: newMessages });
-			return;
-		}
-		const requestContext = {
-			...actionContext,
-			context: currentContext,
-			reason: action.reason,
-			deliveries: finalizedDeliveries,
-		};
-		const requestSnapshot = signal?.aborted ? undefined : await config.prepareRequest?.(requestContext);
-		if (requestSnapshot) {
-			currentContext = requestSnapshot.context ?? currentContext;
-			config = {
-				...config,
-				model: requestSnapshot.model ?? config.model,
+		let requestContext: PrepareRequestContext;
+		let preparedRequest: PreparedProviderRequest | undefined;
+		if (admittedPreparedRequest) {
+			preparedRequest = admittedPreparedRequest;
+			admittedPreparedRequest = undefined;
+			completedTurn = preparedRequest.completedTurn;
+			requestAuthority = preparedRequest.requestAuthority;
+			defaultAction = preparedRequest.defaultAction;
+			requestContext = {
+				context: currentContext,
+				newMessages,
+				...(completedTurn === undefined ? {} : { completedTurn }),
+				requestAuthority,
+				defaultAction,
+				reason: preparedRequest.reason,
+				deliveries: preparedRequest.deliveries.map(clonePreparedDelivery),
 			};
-			if (requestSnapshot.thinkingLevel === "off") {
-				delete config.reasoning;
-			} else if (requestSnapshot.thinkingLevel !== undefined) {
-				config.reasoning = requestSnapshot.thinkingLevel;
+			currentContext = {
+				...currentContext,
+				systemPrompt: preparedRequest.providerContext.systemPrompt ?? "",
+				messages: currentContext.messages,
+			};
+			config = { ...config, model: preparedRequest.model };
+		} else {
+			const actionContext: AgentLoopNextActionContext = {
+				context: currentContext,
+				newMessages,
+				...(completedTurn === undefined ? {} : { completedTurn }),
+				requestAuthority,
+				defaultAction,
+			};
+			const hostAction = await resolveNextAction(config, actionContext);
+			if (signal?.aborted && completedTurn) {
+				await emitBoundaryAbort(currentContext, newMessages, config, emit);
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+			const action =
+				requestAuthority === "final_response" && hostAction.type !== "pause"
+					? ({ type: "request", reason: "final_response" } as const)
+					: hostAction;
+
+			if (action.type !== "request") {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
+			const finalizedDeliveries = await emitDeliveries(
+				"deliveries" in action ? (action.deliveries ?? []) : [],
+				currentContext,
+				newMessages,
+				emit,
+				signal,
+				config.beginDelivery,
+			);
+			if (action.reason === "delivery" && finalizedDeliveries.length === 0) {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+			requestContext = {
+				...actionContext,
+				context: currentContext,
+				reason: action.reason,
+				deliveries: finalizedDeliveries,
+			};
+
+			const hostAuthority = config.getRequestAuthority?.();
+			const requestSnapshot = signal?.aborted ? undefined : await config.prepareRequest?.(requestContext);
+			if (requestSnapshot) {
+				currentContext = requestSnapshot.context ?? currentContext;
+				config = {
+					...config,
+					model: requestSnapshot.model ?? config.model,
+				};
+				if (requestSnapshot.thinkingLevel === "off") {
+					delete config.reasoning;
+				} else if (requestSnapshot.thinkingLevel !== undefined) {
+					config.reasoning = requestSnapshot.thinkingLevel;
+				}
+			}
+
+			const providerAgentContext =
+				requestContext.reason === "final_response"
+					? {
+							...currentContext,
+							tools: [],
+							systemPrompt: `${currentContext.systemPrompt}\n\n[VOLT FINAL RESPONSE — TRUSTED RUNTIME POLICY]\nProvide one final assistant response summarizing the completed work and verification. Do not call tools or begin additional implementation.`,
+						}
+					: currentContext;
+			preparedRequest = signal?.aborted
+				? undefined
+				: await materializePreparedProviderRequest(
+						providerAgentContext,
+						requestContext,
+						config,
+						hostAuthority,
+						signal,
+					);
+			if (preparedRequest) {
+				const admission: AgentPreparedRequestDecision = (await config.admitPreparedRequest?.(preparedRequest)) ?? {
+					type: "admit",
+				};
+				if (admission.type === "pause") {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
 			}
 		}
 
+		const isFinalResponse = requestContext.reason === "final_response";
+
 		let turnStarted = false;
-		if (!signal?.aborted) {
+		if (preparedRequest && !signal?.aborted) {
+			if (!Object.is(config.getRequestAuthority?.(), preparedRequest.hostAuthority)) {
+				throw new Error("Prepared provider request host authority is stale");
+			}
+			config.consumePreparedRequest?.(preparedRequest.checkpointId);
 			await emit({ type: "turn_start" });
 			turnStarted = true;
 		}
-		const isFinalResponse = action.reason === "final_response";
-		const providerContext = isFinalResponse
-			? {
-					...currentContext,
-					tools: [],
-					systemPrompt: `${currentContext.systemPrompt}\n\n[VOLT FINAL RESPONSE — TRUSTED RUNTIME POLICY]\nProvide one final assistant response summarizing the completed work and verification. Do not call tools or begin additional implementation.`,
-				}
-			: currentContext;
-		const message = signal?.aborted
-			? undefined
-			: await streamAssistantResponse(
-					providerContext,
-					config,
-					signal,
-					emit,
-					{ cancelOnPreflightAbort: true, validateProviderTail: true },
-					streamFn,
-				);
+		const message =
+			preparedRequest === undefined || signal?.aborted
+				? undefined
+				: await streamPreparedAssistantResponse(currentContext, preparedRequest, signal, emit, streamFn);
 		if (!message) {
 			if (!turnStarted) await emit({ type: "turn_start" });
+			const requestModel = preparedRequest?.model ?? config.model;
 			const preflightAbortedMessage = {
 				role: "assistant",
 				content: [{ type: "text", text: "" }],
-				api: config.model.api,
-				provider: config.model.provider,
-				model: config.model.id,
+				api: requestModel.api,
+				provider: requestModel.provider,
+				model: requestModel.id,
 				usage: {
 					input: 0,
 					output: 0,
@@ -313,9 +369,6 @@ async function runDispatchedLoop(
 			await emit({ type: "turn_end", message: abortedMessage, toolResults: [] });
 			await emit({ type: "agent_end", messages: newMessages });
 			return;
-		}
-		if (providerContext !== currentContext) {
-			currentContext.messages = providerContext.messages;
 		}
 		newMessages.push(message);
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -436,13 +489,16 @@ async function emitDeliveries(
 		if (settlement.outcome === "retained" || settlement.outcome === "terminally_failed") {
 			throw new AgentDeliverySettlementError(settlement.outcome, delivery.deliveryId, settlement.error);
 		}
+		const canonicalDeliveryMessages = delivery.messages.map((message) =>
+			canonicalizeMessageReplacement(message, undefined, UNKNOWN_TOOL_SET_SNAPSHOT_AUTHORITY),
+		);
 		await emit({
 			type: "delivery_start",
 			...(delivery.deliveryId === undefined ? {} : { deliveryId: delivery.deliveryId }),
-			messages: delivery.messages,
+			messages: canonicalDeliveryMessages,
 		});
 		const finalizedMessages: AgentMessage[] = [];
-		for (const message of delivery.messages) {
+		for (const message of canonicalDeliveryMessages) {
 			const finalizedMessage = await emitCompletedMessage(message, emit, delivery.deliveryId);
 			context.messages.push(finalizedMessage);
 			newMessages.push(finalizedMessage);
@@ -456,66 +512,216 @@ async function emitDeliveries(
 	return finalizedDeliveries;
 }
 
-interface StreamAssistantResponsePolicy {
-	cancelOnPreflightAbort: boolean;
-	validateProviderTail: boolean;
+function clonePreparedDelivery(delivery: AgentLoopDelivery): AgentLoopDelivery {
+	return {
+		...(delivery.deliveryId === undefined ? {} : { deliveryId: delivery.deliveryId }),
+		messages: structuredClone(delivery.messages),
+	};
 }
 
-/**
- * Stream an assistant response from the LLM.
- * This is where AgentMessage[] gets transformed to Message[] for the LLM.
- */
-async function streamAssistantResponse(
-	context: AgentContext,
+function clonePreparedStreamOptions(
 	config: AgentLoopConfig,
-	signal: AbortSignal | undefined,
-	emit: AgentEventSink,
-	policy: StreamAssistantResponsePolicy,
-	streamFn?: StreamFn,
-): Promise<AssistantMessage | undefined> {
-	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
-	let messages = context.messages;
-	if (config.transformContext) {
-		messages = await config.transformContext(messages, signal);
-	}
-	if (policy.cancelOnPreflightAbort && signal?.aborted) return undefined;
+	resolvedApiKey: string | undefined,
+): PreparedProviderStreamOptions {
+	return {
+		...(config.temperature === undefined ? {} : { temperature: config.temperature }),
+		...(config.maxTokens === undefined ? {} : { maxTokens: config.maxTokens }),
+		...(resolvedApiKey === undefined ? {} : { apiKey: resolvedApiKey }),
+		...(config.transport === undefined ? {} : { transport: config.transport }),
+		...(config.cacheRetention === undefined ? {} : { cacheRetention: config.cacheRetention }),
+		...(config.sessionId === undefined ? {} : { sessionId: config.sessionId }),
+		...(config.onPayload === undefined ? {} : { onPayload: config.onPayload }),
+		...(config.onResponse === undefined ? {} : { onResponse: config.onResponse }),
+		...(config.headers === undefined ? {} : { headers: { ...config.headers } }),
+		...(config.timeoutMs === undefined ? {} : { timeoutMs: config.timeoutMs }),
+		...(config.websocketConnectTimeoutMs === undefined
+			? {}
+			: { websocketConnectTimeoutMs: config.websocketConnectTimeoutMs }),
+		...(config.maxRetries === undefined ? {} : { maxRetries: config.maxRetries }),
+		...(config.maxRetryDelayMs === undefined ? {} : { maxRetryDelayMs: config.maxRetryDelayMs }),
+		...(config.metadata === undefined ? {} : { metadata: structuredClone(config.metadata) }),
+		...(config.env === undefined ? {} : { env: { ...config.env } }),
+		...(config.reasoning === undefined ? {} : { reasoning: config.reasoning }),
+		...(config.inferenceSpeed === undefined ? {} : { inferenceSpeed: config.inferenceSpeed }),
+		...(config.thinkingBudgets === undefined ? {} : { thinkingBudgets: { ...config.thinkingBudgets } }),
+	};
+}
 
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
-	if (policy.cancelOnPreflightAbort && signal?.aborted) return undefined;
-	if (policy.validateProviderTail && llmMessages.at(-1)?.role === "assistant") {
+async function materializeProviderContext(
+	context: Pick<AgentContext, "systemPrompt" | "tools">,
+	messages: readonly AgentMessage[],
+	transformContext: AgentLoopConfig["transformContext"],
+	convertToLlm: AgentLoopConfig["convertToLlm"],
+	signal?: AbortSignal,
+): Promise<Context | undefined> {
+	let transformedMessages = [...messages];
+	if (transformContext) transformedMessages = await transformContext(transformedMessages, signal);
+	if (signal?.aborted) return undefined;
+	const providerMessages = await convertToLlm(transformedMessages);
+	if (signal?.aborted) return undefined;
+	if (providerMessages.at(-1)?.role === "assistant") {
 		throw new Error("Cannot request with an assistant message at the provider transcript tail");
 	}
-
-	// Build LLM context
-	const llmContext: Context = {
-		systemPrompt: context.systemPrompt,
-		messages: llmMessages,
-		...(context.tools === undefined ? {} : { tools: context.tools }),
+	return {
+		...(context.systemPrompt === undefined ? {} : { systemPrompt: context.systemPrompt }),
+		messages: providerMessages,
+		...(context.tools === undefined
+			? {}
+			: {
+					tools: context.tools.map(
+						(tool): Tool => ({
+							name: tool.name,
+							description: tool.description,
+							parameters: structuredClone(tool.parameters),
+						}),
+					),
+				}),
 	};
+}
 
-	const streamFunction = streamFn || streamSimple;
+function deepFreezeCanonical<T>(value: T, visited = new WeakSet<object>()): T {
+	if (value === null || (typeof value !== "object" && typeof value !== "function")) return value;
+	if (typeof value === "function" || visited.has(value)) return value;
+	visited.add(value);
+	for (const nested of Object.values(value)) deepFreezeCanonical(nested, visited);
+	return Object.freeze(value);
+}
 
-	// Resolve API key (important for expiring tokens)
+function freezePreparedProviderRequest(input: PreparedProviderRequest): PreparedProviderRequest {
+	const providerContext = deepFreezeCanonical(structuredClone(input.providerContext)) as Readonly<Context>;
+	const model = deepFreezeCanonical(structuredClone(input.model));
+	const streamOptions = deepFreezeCanonical({ ...input.streamOptions });
+	const completedTurn =
+		input.completedTurn === undefined ? undefined : deepFreezeCanonical(structuredClone(input.completedTurn));
+	const defaultAction = deepFreezeCanonical(structuredClone(input.defaultAction));
+	const deliveries = deepFreezeCanonical(input.deliveries.map(clonePreparedDelivery));
+	return Object.freeze({
+		...input,
+		providerContext,
+		model,
+		streamOptions,
+		...(completedTurn === undefined ? {} : { completedTurn }),
+		defaultAction,
+		deliveries,
+	});
+}
+
+async function materializePreparedProviderRequest(
+	context: AgentContext,
+	requestContext: PrepareRequestContext,
+	config: AgentLoopConfig,
+	hostAuthority: unknown,
+	signal?: AbortSignal,
+): Promise<PreparedProviderRequest | undefined> {
+	const providerContext = await materializeProviderContext(
+		context,
+		context.messages,
+		config.transformContext,
+		config.convertToLlm,
+		signal,
+	);
+	if (!providerContext || signal?.aborted) return undefined;
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
-	if (policy.cancelOnPreflightAbort && signal?.aborted) return undefined;
+	if (signal?.aborted) return undefined;
+	if (!Object.is(config.getRequestAuthority?.(), hostAuthority)) {
+		throw new Error("Prepared provider request host authority is stale");
+	}
+	return freezePreparedProviderRequest({
+		checkpointId: globalThis.crypto.randomUUID(),
+		requestId: globalThis.crypto.randomUUID(),
+		attempt: 0,
+		runId: config.runId ?? globalThis.crypto.randomUUID(),
+		hostAuthority,
+		providerContext,
+		model: config.model,
+		streamOptions: clonePreparedStreamOptions(config, resolvedApiKey),
+		...(requestContext.completedTurn === undefined ? {} : { completedTurn: requestContext.completedTurn }),
+		defaultAction: requestContext.defaultAction,
+		requestAuthority: requestContext.requestAuthority,
+		reason: requestContext.reason,
+		deliveries: requestContext.deliveries,
+	});
+}
 
-	const streamOptions = {
-		...config,
-		...(resolvedApiKey === undefined ? {} : { apiKey: resolvedApiKey }),
+/** Derive one compaction successor without repeating delivery, preparation, or option resolution. */
+export async function rematerializePreparedProviderRequest(
+	request: PreparedProviderRequest,
+	messages: readonly AgentMessage[],
+	options: {
+		transformContext?: AgentLoopConfig["transformContext"];
+		convertToLlm: AgentLoopConfig["convertToLlm"];
+	},
+): Promise<PreparedProviderRequest> {
+	const providerContext = await materializeProviderContext(
+		{
+			systemPrompt: request.providerContext.systemPrompt ?? "",
+			...(request.providerContext.tools === undefined
+				? {}
+				: { tools: [...request.providerContext.tools] as AgentTool<any, any>[] }),
+		},
+		messages,
+		options.transformContext,
+		options.convertToLlm,
+	);
+	if (!providerContext) throw new Error("Prepared provider request replacement was aborted");
+	return freezePreparedProviderRequest({
+		...request,
+		checkpointId: globalThis.crypto.randomUUID(),
+		attempt: request.attempt + 1,
+		providerContext,
+	});
+}
+
+/** Take immutable ownership of one provider-reported attestation. */
+function ownToolSetSnapshotAuthority(authority: ToolSetSnapshotAuthority): ToolSetSnapshotAuthority {
+	if (authority.kind === "unknown") return UNKNOWN_TOOL_SET_SNAPSHOT_AUTHORITY;
+	return Object.freeze({
+		kind: "known",
+		snapshot: deepFreezeCanonical(structuredClone(authority.snapshot)),
+	});
+}
+
+/** Stream an already materialized provider request. */
+async function streamPreparedAssistantResponse(
+	context: AgentContext,
+	request: PreparedProviderRequest,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFn?: StreamFn,
+): Promise<AssistantMessage> {
+	const streamFunction = streamFn || streamSimple;
+	const llmContext = structuredClone(request.providerContext) as Context;
+	let toolSetSnapshotAuthority: ToolSetSnapshotAuthority = UNKNOWN_TOOL_SET_SNAPSHOT_AUTHORITY;
+	const response = await streamFunction(request.model, llmContext, {
+		...request.streamOptions,
 		...(signal === undefined ? {} : { signal }),
-	};
-	if (policy.cancelOnPreflightAbort && signal?.aborted) return undefined;
-	const response = await streamFunction(config.model, llmContext, streamOptions);
+		reportToolSetSnapshot: (authority) => {
+			toolSetSnapshotAuthority = ownToolSetSnapshotAuthority(authority);
+		},
+	});
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
 
+	const finalizeMessage = async (rawMessage: AssistantMessage): Promise<AssistantMessage> => {
+		const finalMessage = canonicalizeMessageReplacement(rawMessage, undefined, toolSetSnapshotAuthority);
+		if (addedPartial) {
+			context.messages[context.messages.length - 1] = finalMessage;
+		} else {
+			context.messages.push(finalMessage);
+			await emit({ type: "message_start", message: finalMessage });
+		}
+		const replacement = await emit({ type: "message_end", message: finalMessage });
+		const emittedMessage = resolveAssistantMessageReplacement(finalMessage, replacement, toolSetSnapshotAuthority);
+		context.messages[context.messages.length - 1] = emittedMessage;
+		return emittedMessage;
+	};
+
 	for await (const event of response) {
 		switch (event.type) {
 			case "start":
-				partialMessage = event.snapshot;
+				partialMessage = canonicalizeMessageReplacement(event.snapshot, undefined, toolSetSnapshotAuthority);
 				context.messages.push(partialMessage);
 				addedPartial = true;
 				await emit({ type: "message_start", message: partialMessage });
@@ -531,46 +737,24 @@ async function streamAssistantResponse(
 			case "toolcall_delta":
 			case "toolcall_end":
 				if (partialMessage) {
-					partialMessage = event.snapshot;
+					partialMessage = canonicalizeMessageReplacement(event.snapshot, undefined, toolSetSnapshotAuthority);
 					context.messages[context.messages.length - 1] = partialMessage;
+					const canonicalEvent = { ...event, snapshot: partialMessage } as AssistantMessageEvent;
 					await emit({
 						type: "message_update",
-						assistantMessageEvent: event,
+						assistantMessageEvent: canonicalEvent,
 						message: partialMessage,
 					});
 				}
 				break;
 
 			case "done":
-			case "error": {
-				const finalMessage = await response.result();
-				if (addedPartial) {
-					context.messages[context.messages.length - 1] = finalMessage;
-				} else {
-					context.messages.push(finalMessage);
-				}
-				if (!addedPartial) {
-					await emit({ type: "message_start", message: finalMessage });
-				}
-				const replacement = await emit({ type: "message_end", message: finalMessage });
-				const emittedMessage = resolveMessageReplacement(finalMessage, replacement);
-				context.messages[context.messages.length - 1] = emittedMessage;
-				return emittedMessage;
-			}
+			case "error":
+				return await finalizeMessage(await response.result());
 		}
 	}
 
-	const finalMessage = await response.result();
-	if (addedPartial) {
-		context.messages[context.messages.length - 1] = finalMessage;
-	} else {
-		context.messages.push(finalMessage);
-		await emit({ type: "message_start", message: finalMessage });
-	}
-	const replacement = await emit({ type: "message_end", message: finalMessage });
-	const emittedMessage = resolveMessageReplacement(finalMessage, replacement);
-	context.messages[context.messages.length - 1] = emittedMessage;
-	return emittedMessage;
+	return await finalizeMessage(await response.result());
 }
 
 /**
@@ -708,9 +892,16 @@ async function executeToolCallsParallel(
 	const orderedFinalizedCalls = await Promise.all(
 		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
 	);
+	const hasResetTransition = orderedFinalizedCalls.some(
+		(finalized) => finalized.result.toolSetTransition?.kind === "reset",
+	);
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
-		const toolResultMessage = createToolResultMessage(finalized);
+		const toolResultMessage = createToolResultMessage(
+			hasResetTransition && finalized.result.toolSetTransition?.kind === "additive"
+				? { ...finalized, result: { ...finalized.result, toolSetTransition: { kind: "reset" } } }
+				: finalized,
+		);
 		messages.push(await emitCompletedMessage(toolResultMessage, emit));
 	}
 
@@ -909,6 +1100,7 @@ async function finalizeExecutedToolCall(
 				result = {
 					content: afterResult.content ?? result.content,
 					...(details === undefined ? {} : { details }),
+					...(result.toolSetTransition === undefined ? {} : { toolSetTransition: result.toolSetTransition }),
 					...(disposition === undefined ? {} : { disposition }),
 				};
 				isError = afterResult.isError ?? isError;
@@ -950,6 +1142,9 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 		toolName: finalized.toolCall.name,
 		content: finalized.result.content,
 		...(finalized.result.details === undefined ? {} : { details: finalized.result.details }),
+		...(finalized.result.toolSetTransition === undefined
+			? {}
+			: { toolSetTransition: finalized.result.toolSetTransition }),
 		isError: finalized.isError,
 		timestamp: Date.now(),
 	};
@@ -961,20 +1156,23 @@ async function emitCompletedMessage<MessageType extends AgentMessage>(
 	deliveryId?: string,
 ): Promise<MessageType> {
 	const delivery = deliveryId === undefined ? {} : { deliveryId };
-	await emit({ type: "message_start", message, ...delivery });
-	const replacement = await emit({ type: "message_end", message, ...delivery });
-	return resolveMessageReplacement(message, replacement);
+	const canonicalMessage = canonicalizeMessageReplacement(message, undefined, UNKNOWN_TOOL_SET_SNAPSHOT_AUTHORITY);
+	await emit({ type: "message_start", message: canonicalMessage, ...delivery });
+	const replacement = await emit({ type: "message_end", message: canonicalMessage, ...delivery });
+	return resolveMessageReplacement(canonicalMessage, replacement);
+}
+
+function resolveAssistantMessageReplacement(
+	message: AssistantMessage,
+	replacement: AgentEventSinkResult,
+	authority: ToolSetSnapshotAuthority,
+): AssistantMessage {
+	return canonicalizeMessageReplacement(message, replacement ?? undefined, authority);
 }
 
 function resolveMessageReplacement<MessageType extends AgentMessage>(
 	message: MessageType,
 	replacement: AgentEventSinkResult,
 ): MessageType {
-	if (replacement === undefined) {
-		return message;
-	}
-	if (replacement.role !== message.role) {
-		throw new Error("message_end listeners must return a message with the same role");
-	}
-	return replacement as MessageType;
+	return canonicalizeMessageReplacement(message, replacement ?? undefined, UNKNOWN_TOOL_SET_SNAPSHOT_AUTHORITY);
 }

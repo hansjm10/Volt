@@ -1,4 +1,10 @@
-import { fauxAssistantMessage, fauxToolCall, registerFauxProvider, type StreamOptions } from "@hansjm10/volt-ai";
+import {
+	createToolSetSnapshot,
+	fauxAssistantMessage,
+	fauxToolCall,
+	registerFauxProvider,
+	type StreamOptions,
+} from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentHarness } from "../../src/harness/agent-harness.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
@@ -253,6 +259,43 @@ describe("AgentHarness stream configuration", () => {
 		expect(capturedOptions[0]?.headers).toEqual({ turn: "first" });
 		expect(capturedOptions[1]?.timeoutMs).toBe(2000);
 		expect(capturedOptions[1]?.headers).toEqual({ turn: "second" });
+	});
+
+	it.each([
+		{ label: "an unchanged payload hook", replacePayload: false },
+		{ label: "a provider tool replacement", replacePayload: true },
+	])("records harness request tool state after $label", async ({ replacePayload }) => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		registration.setResponses([
+			async (_context, options, _state, model) => {
+				const replacement = await options?.onPayload?.({ tools: [{ name: calculateTool.name }] }, model);
+				options?.reportToolSetSnapshot?.(
+					replacement === undefined
+						? { kind: "known", snapshot: createToolSetSnapshot([calculateTool]) }
+						: { kind: "unknown" },
+				);
+				return fauxAssistantMessage("ok");
+			},
+		]);
+		const harness = createHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session: new Session(new InMemorySessionStorage()),
+			model: registration.getModel(),
+			tools: [calculateTool],
+		});
+		harness.on("before_provider_payload", () =>
+			replacePayload ? { payload: { tools: [{ name: "replacement_tool" }] } } : undefined,
+		);
+
+		const assistant = await harness.prompt("hello");
+
+		if (replacePayload) {
+			expect(assistant.toolSetSnapshot).toBeUndefined();
+			expect(Object.hasOwn(assistant, "toolSetSnapshot")).toBe(false);
+		} else {
+			expect(assistant.toolSetSnapshot).toEqual(createToolSetSnapshot([calculateTool]));
+		}
 	});
 
 	it("chains provider payload hooks", async () => {

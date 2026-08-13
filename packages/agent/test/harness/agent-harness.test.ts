@@ -949,10 +949,12 @@ describe("AgentHarness", () => {
 		await harness.setTools([searchTool], ["search"]);
 		await expect(harness.setActiveTools(["missing"])).rejects.toMatchObject({ code: "invalid_argument" });
 		await expect(harness.setActiveTools(["search", "search"])).rejects.toMatchObject({ code: "invalid_argument" });
-		await expect(harness.setTools([inspectTool])).rejects.toMatchObject({ code: "invalid_argument" });
+		await harness.setTools([inspectTool]);
+		expect(harness.getActiveTools()).toEqual([]);
 		await expect(harness.setTools([inspectTool, inspectTool], ["inspect"])).rejects.toMatchObject({
 			code: "invalid_argument",
 		});
+		await harness.setTools([inspectTool, searchTool]);
 
 		expect(updates).toEqual([
 			{
@@ -969,10 +971,133 @@ describe("AgentHarness", () => {
 				previousActiveToolNames: ["search"],
 				source: "set",
 			},
+			{
+				toolNames: ["inspect"],
+				previousToolNames: ["search"],
+				activeToolNames: [],
+				previousActiveToolNames: ["search"],
+				source: "set",
+			},
+			{
+				toolNames: ["inspect", "search"],
+				previousToolNames: ["inspect"],
+				activeToolNames: ["search"],
+				previousActiveToolNames: [],
+				source: "set",
+			},
 		]);
-		expect(harness.getTools().map((tool) => tool.source)).toEqual(["extension"]);
+		expect(harness.getTools().map((tool) => tool.source)).toEqual(["builtin", "extension"]);
 		expect(harness.getActiveTools().map((tool) => tool.name)).toEqual(["search"]);
-		expect((await session.buildContext()).activeToolNames).toEqual(["search"]);
+		expect((await session.buildContext()).toolSelection).toEqual({
+			kind: "explicit",
+			requestedNames: ["search"],
+		});
+	});
+
+	it("restores persisted active tools before the next prompt", async () => {
+		const registration = registerFauxProvider({ models: [{ id: "restore", contextWindow: 6000, maxTokens: 1000 }] });
+		registrations.push(registration);
+		const requestToolNames: string[][] = [];
+		registration.setResponses([
+			(context) => {
+				requestToolNames.push(context.tools?.map((tool) => tool.name) ?? []);
+				return fauxAssistantMessage("restored");
+			},
+		]);
+		const session = new Session(new InMemorySessionStorage());
+		await session.appendActiveToolsChange(["search", "missing", "search"]);
+		const inspectTool: AgentTool = { ...calculateTool, name: "inspect" };
+		const searchTool: AgentTool = { ...calculateTool, name: "search" };
+		const harness = new AgentHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: registration.getModel(),
+			tools: [inspectTool, searchTool],
+			activeToolNames: ["inspect"],
+		});
+		const updates: Array<{ activeToolNames: string[]; source: string }> = [];
+		harness.subscribe((event) => {
+			if (event.type === "tools_update") {
+				updates.push({ activeToolNames: event.activeToolNames, source: event.source });
+			}
+		});
+
+		await harness.prompt("continue");
+
+		expect(harness.getActiveTools().map((tool) => tool.name)).toEqual(["search"]);
+		expect(updates).toEqual([{ activeToolNames: ["search"], source: "restore" }]);
+		expect(requestToolNames).toEqual([["search"]]);
+	});
+
+	it("restores branch-local active tools after tree navigation", async () => {
+		const session = new Session(new InMemorySessionStorage());
+		const rootId = await session.appendMessage({ role: "user", content: "root", timestamp: 1 });
+		await session.appendActiveToolsChange(["search"]);
+		const searchLeafId = await session.appendMessage(fauxAssistantMessage("search branch", { timestamp: 2 }));
+		await session.moveTo(rootId);
+		await session.appendActiveToolsChange(["inspect"]);
+		const inspectLeafId = await session.appendMessage(fauxAssistantMessage("inspect branch", { timestamp: 3 }));
+		const inspectTool: AgentTool = { ...calculateTool, name: "inspect" };
+		const searchTool: AgentTool = { ...calculateTool, name: "search" };
+		const harness = new AgentHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: getModel("anthropic", "claude-sonnet-4-5"),
+			tools: [inspectTool, searchTool],
+			activeToolNames: ["inspect"],
+		});
+		const updates: Array<{ activeToolNames: string[]; source: string }> = [];
+		harness.subscribe((event) => {
+			if (event.type === "tools_update") {
+				updates.push({ activeToolNames: event.activeToolNames, source: event.source });
+			}
+		});
+
+		await harness.navigateTree(searchLeafId);
+		expect(harness.getActiveTools().map((tool) => tool.name)).toEqual(["search"]);
+		await harness.navigateTree(inspectLeafId);
+		expect(harness.getActiveTools().map((tool) => tool.name)).toEqual(["inspect"]);
+		expect(updates).toEqual([
+			{ activeToolNames: ["search"], source: "restore" },
+			{ activeToolNames: ["inspect"], source: "restore" },
+		]);
+	});
+
+	it("restores constructor active tools when navigating to a branch without an override", async () => {
+		const session = new Session(new InMemorySessionStorage());
+		const rootId = await session.appendMessage({ role: "user", content: "root", timestamp: 1 });
+		const defaultLeafId = await session.appendMessage(fauxAssistantMessage("default branch", { timestamp: 2 }));
+		await session.moveTo(rootId);
+		await session.appendActiveToolsChange(["search"]);
+		const searchLeafId = await session.appendMessage(fauxAssistantMessage("search branch", { timestamp: 3 }));
+		await session.moveTo(defaultLeafId);
+		const inspectTool: AgentTool = { ...calculateTool, name: "inspect" };
+		const searchTool: AgentTool = { ...calculateTool, name: "search" };
+		const harness = new AgentHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: getModel("anthropic", "claude-sonnet-4-5"),
+			tools: [inspectTool, searchTool],
+			activeToolNames: ["inspect"],
+		});
+		const updates: Array<{ activeToolNames: string[]; source: string }> = [];
+		harness.subscribe((event) => {
+			if (event.type === "tools_update") {
+				updates.push({ activeToolNames: event.activeToolNames, source: event.source });
+			}
+		});
+
+		await harness.navigateTree(searchLeafId);
+		expect(harness.getActiveTools().map((tool) => tool.name)).toEqual(["search"]);
+		await harness.setTools([searchTool]);
+		await harness.navigateTree(defaultLeafId);
+
+		expect(harness.getActiveTools().map((tool) => tool.name)).toEqual(["search"]);
+		expect(updates).toEqual([
+			{ activeToolNames: ["search"], source: "restore" },
+			{ activeToolNames: ["search"], source: "set" },
+			{ activeToolNames: ["search"], source: "restore" },
+		]);
 	});
 
 	it("includes active definitions in manual compaction preparation and rebuilt estimates", async () => {

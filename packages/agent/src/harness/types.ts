@@ -8,6 +8,7 @@ import type {
 	Transport,
 } from "@hansjm10/volt-ai";
 import type { AgentEvent, AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "../index.ts";
+import type { ToolSelection } from "../tool-selection.ts";
 import type { Session } from "./session/session.ts";
 
 /** Result of a fallible operation. Expected failures are returned as `ok: false` instead of thrown. */
@@ -440,7 +441,7 @@ export interface SessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
 	model: { provider: string; modelId: string } | null;
-	activeToolNames: string[] | null;
+	toolSelection: ToolSelection;
 }
 
 export interface SessionMetadata {

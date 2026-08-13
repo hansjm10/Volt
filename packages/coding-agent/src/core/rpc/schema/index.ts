@@ -107,6 +107,8 @@ import {
 	RpcTextContentSchema,
 	RpcThinkingContentSchema,
 	RpcToolCallSchema,
+	RpcToolDefinitionFingerprintSchema,
+	RpcToolSetSnapshotSchema,
 	RpcUsageSchema,
 } from "./external.ts";
 import {
@@ -360,6 +362,8 @@ const SHARED_SCHEMAS: Record<string, TSchema> = {
 	RpcApi: RpcApiSchema,
 	RpcDiagnosticErrorInfo: RpcDiagnosticErrorInfoSchema,
 	RpcAssistantMessageDiagnostic: RpcAssistantMessageDiagnosticSchema,
+	RpcToolDefinitionFingerprint: RpcToolDefinitionFingerprintSchema,
+	RpcToolSetSnapshot: RpcToolSetSnapshotSchema,
 	RpcAssistantMessage: RpcAssistantMessageSchema,
 	RpcActiveToolCallState: RpcActiveToolCallStateSchema,
 	RpcModel: RpcModelSchema,

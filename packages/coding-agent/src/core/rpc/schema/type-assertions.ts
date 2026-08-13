@@ -22,6 +22,8 @@ import type {
 	TextContent,
 	ThinkingContent,
 	ToolCall,
+	ToolDefinitionFingerprint,
+	ToolSetSnapshot,
 	Usage,
 } from "@hansjm10/volt-ai";
 import type { Static } from "typebox";
@@ -67,6 +69,8 @@ import type {
 	RpcTextContentSchema,
 	RpcThinkingContentSchema,
 	RpcToolCallSchema,
+	RpcToolDefinitionFingerprintSchema,
+	RpcToolSetSnapshotSchema,
 	RpcUsageSchema,
 } from "./external.ts";
 import type { Assert, JsonWireShape, MutualExtends } from "./helpers.ts";
@@ -92,6 +96,10 @@ type _imageContent = Assert<MutualExtends<Static<typeof RpcImageContentSchema>, 
 type _textContent = Assert<MutualExtends<Static<typeof RpcTextContentSchema>, TextContent>>;
 type _thinkingContent = Assert<MutualExtends<Static<typeof RpcThinkingContentSchema>, ThinkingContent>>;
 type _toolCall = Assert<MutualExtends<Static<typeof RpcToolCallSchema>, ToolCall>>;
+type _toolDefinitionFingerprint = Assert<
+	MutualExtends<Static<typeof RpcToolDefinitionFingerprintSchema>, ToolDefinitionFingerprint>
+>;
+type _toolSetSnapshot = Assert<MutualExtends<Static<typeof RpcToolSetSnapshotSchema>, ToolSetSnapshot>>;
 type _usage = Assert<MutualExtends<Static<typeof RpcUsageSchema>, Usage>>;
 type _stopReason = Assert<MutualExtends<Static<typeof RpcStopReasonSchema>, StopReason>>;
 type _assistantDiagnostics = Assert<

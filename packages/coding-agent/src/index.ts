@@ -610,6 +610,7 @@ export {
 	type SubagentRuntimeContext,
 } from "./core/sdk.ts";
 export {
+	type ActiveToolsChangeEntry,
 	type BranchSummaryEntry,
 	buildSessionContext,
 	type CompactionEntry,

@@ -328,6 +328,9 @@
 				"errorMessage": {
 					"type": "string"
 				},
+				"toolSetSnapshot": {
+					"$ref": "#/$defs/RpcToolSetSnapshot"
+				},
 				"timestamp": {
 					"type": "number"
 				}
@@ -10907,6 +10910,41 @@
 				},
 				"thoughtSignature": {
 					"type": "string"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcToolDefinitionFingerprint": {
+			"type": "object",
+			"required": [
+				"name",
+				"fingerprint"
+			],
+			"properties": {
+				"name": {
+					"type": "string"
+				},
+				"fingerprint": {
+					"type": "string"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcToolSetSnapshot": {
+			"type": "object",
+			"required": [
+				"definitions",
+				"estimatedTokens"
+			],
+			"properties": {
+				"definitions": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/RpcToolDefinitionFingerprint"
+					}
+				},
+				"estimatedTokens": {
+					"type": "number"
 				}
 			},
 			"additionalProperties": false

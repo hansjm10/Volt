@@ -66,18 +66,20 @@ const harness = await AgentHarness.builder()
   .model(defaultModel)
   .tools(runtimeTools)
   .defaultActiveTools(["read", "edit"])
-  .restore({ missingActiveTools: "fail" });
+  .restore();
 ```
 
 `restore()` should read the active branch, reduce durable harness configuration, apply defaults for missing entries, validate against app-supplied runtime dependencies, construct the harness, and optionally emit `source: "restore"` update events after construction.
 
 For active tools:
 
-- `active_tools_change` entries are branch-scoped durable config.
-- If no `active_tools_change` exists on the branch, restore uses builder defaults, or all registered tools if no default active names were supplied.
-- Active tool names must be unique.
-- Tool registry names must be unique.
-- Missing restored active tool names should fail restore by default; permissive drop/disable policies can be added explicitly later.
+- `active_tools_change` entries are branch-scoped explicit durable intent.
+- If no `active_tools_change` exists on the branch, the branch inherits the freshly rebuilt runtime baseline (builder defaults, or all registered tools when no narrower baseline was supplied).
+- Every entry remains explicit, including an ordered empty list and names that are temporarily unavailable.
+- Restore does not fail, drop, or rewrite unavailable requested names. They stay dormant until the host provides matching definitions, then reactivate in their original order.
+- Public caller-authored selection changes still validate names against the current registry.
+- Registry and baseline refreshes change only effective availability; they do not append entries or mutate explicit branch intent.
+- Active tool names and tool registry names must be unique.
 - Concrete tools are never restored from session; the host app must provide compatible tools.
 
 ## What harness should persist
@@ -128,8 +130,8 @@ On startup:
    - queues
    - pending writes
    - active operation/turn/tool state
-4. Harness validates required runtime dependencies, including restored active tool names against the app-provided tool registry.
-5. Harness reconciles unfinished operation state.
+4. Harness derives effective tools from the fresh registry and branch selection while retaining unavailable explicit names as dormant intent.
+5. Harness validates the other required runtime dependencies and reconciles unfinished operation state.
 
 Provider streams are not resumable. Recovery can only retry from a durable boundary or mark the operation interrupted.
 

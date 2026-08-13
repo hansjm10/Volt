@@ -67,6 +67,7 @@ export interface HarnessOptions {
 	resourceLoader?: ResourceLoader;
 	extensionFactories?: Array<ExtensionFactory | CreateTestExtensionsResultInput>;
 	prepareDelivery?: AgentOptions["prepareDelivery"];
+	prepareRequest?: AgentOptions["prepareRequest"];
 	withConfiguredAuth?: boolean;
 	/** Inject a persisted manager when a test needs to exercise session reload behavior. */
 	sessionManager?: SessionManager;
@@ -145,7 +146,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		onPayload: async (payload) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("before_provider_request")) {
-				return payload;
+				return undefined;
 			}
 			return runner.emitBeforeProviderRequest(payload);
 		},
@@ -161,6 +162,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			});
 		},
 		prepareDelivery: options.prepareDelivery,
+		prepareRequest: options.prepareRequest,
 		transformContext: async (messages: AgentMessage[]) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner) return messages;

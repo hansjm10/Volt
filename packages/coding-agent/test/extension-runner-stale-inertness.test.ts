@@ -1,6 +1,7 @@
 /**
  * Tests that an invalidated ExtensionRunner is fully inert: no emit path runs
- * handlers, values pass through unchanged, and errors never reach listeners.
+ * handlers, replacement hooks report no replacement, pass-through transforms
+ * retain their input, and errors never reach listeners.
  *
  * Background: after session replacement (dispose) or reload, a dead runner
  * generation could still execute extension handlers whose stale ctx throws;
@@ -96,7 +97,7 @@ describe("ExtensionRunner stale-generation inertness", () => {
 
 		const payload = { value: 1 };
 		const result = await runner.emitBeforeProviderRequest(payload);
-		expect(result).toBe(payload);
+		expect(result).toBeUndefined();
 
 		const messages = [{ role: "user" as const, content: "hi", timestamp: Date.now() }];
 		const contextResult = await runner.emitContext(messages);
@@ -147,7 +148,7 @@ describe("ExtensionRunner stale-generation inertness", () => {
 
 		const payload = { value: 1 };
 		const result = await runner.emitBeforeProviderRequest(payload);
-		expect(result).toBe(payload);
+		expect(result).toBeUndefined();
 		expect(handlerCalls).toEqual([]);
 		expect(() => runner.createContext().cwd).toThrow(/stale after session replacement or reload/);
 	});

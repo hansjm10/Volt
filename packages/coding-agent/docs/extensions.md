@@ -48,6 +48,7 @@ See [examples/extensions/](../examples/extensions/) for working implementations.
 - [ExtensionAPI Methods](#extensionapi-methods)
 - [State Management](#state-management)
 - [Custom Tools](#custom-tools)
+  - [Dynamic Tool Loading](#dynamic-tool-loading)
 - [Custom UI](#custom-ui)
 - [Error Handling](#error-handling)
 - [Mode Behavior](#mode-behavior)
@@ -655,6 +656,8 @@ volt.on("before_provider_request", (event, ctx) => {
 ```
 
 This is mainly useful for debugging provider serialization and cache behavior.
+
+Returning a replacement operates on provider-native data, so Volt cannot reliably recover a provider-neutral tool-set snapshot from it. The response remains valid, but Volt omits durable tool-state metadata for that request and sends current tool definitions eagerly on the next request. Extensions that need durable dynamic-tool tracking should change tools with `volt.setActiveTools()` or the Agent/Harness tool APIs instead of rewriting raw payload tool fields.
 
 #### after_provider_response
 
@@ -1296,9 +1299,9 @@ Subscribe to events. See [Events](#events) for event types and return values.
 
 Register a custom tool callable by the LLM. See [Custom Tools](#custom-tools) for full details.
 
-`volt.registerTool()` works both during extension load and after startup. You can call it inside `session_start`, command handlers, or other event handlers. New tools are refreshed immediately in the same session, so they appear in `volt.getAllTools()` and are callable by the LLM without `/reload`.
+`volt.registerTool()` works both during extension load and after startup. You can call it inside `session_start`, command handlers, or other event handlers. New tools are refreshed immediately in the same session, so they appear in `volt.getAllTools()` without `/reload`. They become callable immediately when the branch inherits them or already has their name in explicit restored intent.
 
-Use `volt.setActiveTools()` to enable or disable tools (including dynamically added tools) at runtime.
+Use `volt.setActiveTools()` to persist an explicit enabled set (including dynamically added tools) at runtime.
 
 Use `promptSnippet` to opt a custom tool into a one-line entry in `Available tools`, and `promptGuidelines` to append tool-specific bullets to the default `Guidelines` section when the tool is active.
 
@@ -1606,6 +1609,8 @@ volt.setActiveTools(["read", "bash"]); // Switch to read-only
 
 `volt.getAllTools()` returns `name`, `description`, `parameters`, `promptGuidelines`, and `sourceInfo`.
 
+Tool registration and branch selection are separate. A branch with no `active_tools_change` inherits the freshly rebuilt runtime baseline. Calling `volt.setActiveTools()` persists an explicit ordered selection, including an empty list. Caller-supplied names must currently be registered, but names restored from an older branch remain requested when their definitions are temporarily unavailable. Registering such a tool later makes it active immediately without appending another selection entry. Registering, reloading, or refreshing tools never filters or rewrites explicit branch intent.
+
 Typical `sourceInfo.source` values:
 - `builtin` for built-in tools
 - `sdk` for tools passed via `createAgentSession({ customTools })`
@@ -1803,6 +1808,26 @@ async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
   });
 }
 ```
+
+### Dynamic Tool Loading
+
+An extension can keep rarely used tools inactive, then activate them from a loader tool. Preserve every currently active tool when adding the new names:
+
+```typescript
+async execute() {
+  volt.setActiveTools([...new Set([...volt.getActiveTools(), "specialized_tool"])]);
+  return {
+    content: [{ type: "text", text: "specialized_tool is ready" }],
+    details: {},
+  };
+}
+```
+
+Volt records a purely additive transition on that tool result. Supported first-party Anthropic and OpenAI Responses models can then anchor the new definition at the result instead of moving it into the request prefix, preserving more of the provider prompt cache.
+
+Only unique, definition-equivalent additions that preserve the prior tool order are additive. Removing, reordering, or replacing a tool definition records a reset, as does any tool execution containing an intermediate reset. Reset state sends the current tool set eagerly on the next request. Providers and models without native deferred-tool support also receive all active definitions eagerly.
+
+Activating a tool with `promptSnippet` or `promptGuidelines` still changes the system prompt. Keep dynamically loaded tools out of those prefix-level prompt sections when prompt-cache stability matters.
 
 ### Tool Definition
 

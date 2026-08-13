@@ -11,8 +11,13 @@ import {
 	type ThinkingBudgets,
 	type Transport,
 } from "@hansjm10/volt-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { rematerializePreparedProviderRequest, runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { DeliveryInbox, type DeliveryLease, type InboxDelivery } from "./delivery-inbox.ts";
+import {
+	canonicalizeMessageReplacement,
+	getCanonicalToolSetSnapshotAuthority,
+	UNKNOWN_TOOL_SET_SNAPSHOT_AUTHORITY,
+} from "./message-replacement.ts";
 import type {
 	AfterToolCallContext,
 	AfterToolCallResult,
@@ -27,6 +32,8 @@ import type {
 	AgentLoopNextActionContext,
 	AgentLoopRequestUpdate,
 	AgentMessage,
+	AgentPreparedRequestDecision,
+	AgentPreparedRequestPause,
 	AgentRequestAuthority,
 	AgentRunSnapshot,
 	AgentState,
@@ -34,6 +41,8 @@ import type {
 	BeforeToolCallContext,
 	BeforeToolCallResult,
 	PendingToolExecution,
+	PreparedProviderRequest,
+	PreparedRequestReplacementResult,
 	PrepareRequestContext,
 	QueueMode,
 	StreamFn,
@@ -184,6 +193,11 @@ export type AgentDeliveryAttemptResult =
 export type AgentRunResult =
 	| { readonly status: "completed"; readonly deliveries: readonly AgentDeliveryAttemptResult[] }
 	| {
+			readonly status: "paused";
+			readonly deliveries: readonly AgentDeliveryAttemptResult[];
+			readonly pause: AgentPreparedRequestPause;
+	  }
+	| {
 			readonly status: "delivery_failed";
 			readonly deliveries: readonly AgentDeliveryAttemptResult[];
 			readonly failure: AgentDeliveryFailure;
@@ -217,6 +231,13 @@ export interface AgentOptions {
 		context: PrepareRequestContext,
 		signal?: AbortSignal,
 	) => Promise<AgentLoopRequestUpdate | undefined> | AgentLoopRequestUpdate | undefined;
+	/** Opaque host generation used to reject stale prepared requests. */
+	getRequestAuthority?: () => unknown;
+	/** Admit or resumably pause an exact prepared request before turn_start and streaming. */
+	admitPreparedRequest?: (
+		request: PreparedProviderRequest,
+		signal?: AbortSignal,
+	) => Promise<AgentPreparedRequestDecision | undefined> | AgentPreparedRequestDecision | undefined;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
 	sessionId?: string;
@@ -247,6 +268,14 @@ type DispatcherStartState = {
 	drainFollowUpsFirst?: boolean;
 };
 
+type PreparedRequestState = {
+	checkpoint: PreparedProviderRequest;
+	phase: "paused" | "replacing" | "admitted";
+	pause?: AgentPreparedRequestPause;
+	transformContext: AgentLoopConfig["transformContext"];
+	convertToLlm: AgentLoopConfig["convertToLlm"];
+};
+
 type ActiveRun = {
 	id: string;
 	promise: Promise<void>;
@@ -262,6 +291,7 @@ type ActiveRun = {
 	deliveryOutcomes: Map<string, AgentDeliveryAttemptResult>;
 	deliveryFailure?: AgentDeliveryFailure;
 	observationalDeliveryIds: Set<string>;
+	preparedRequestPause?: AgentPreparedRequestPause;
 	phase: "open" | "terminal_event_settling" | "settled";
 };
 
@@ -283,11 +313,13 @@ export class Agent {
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
 	private pausedState: Pick<DispatcherStartState, "requestAuthority" | "providerRequestPending"> | undefined;
+	private preparedRequestState: PreparedRequestState | undefined;
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext: ((messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>) | undefined;
 	public streamFn: StreamFn;
 	public getApiKey: ((provider: string) => Promise<string | undefined> | string | undefined) | undefined;
+	public getRequestAuthority: (() => unknown) | undefined;
 	public onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	public onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	public beforeToolCall:
@@ -319,6 +351,12 @@ export class Agent {
 				signal?: AbortSignal,
 		  ) => Promise<AgentLoopRequestUpdate | undefined> | AgentLoopRequestUpdate | undefined)
 		| undefined;
+	public admitPreparedRequest:
+		| ((
+				request: PreparedProviderRequest,
+				signal?: AbortSignal,
+		  ) => Promise<AgentPreparedRequestDecision | undefined> | AgentPreparedRequestDecision | undefined)
+		| undefined;
 	private activeRun: ActiveRun | undefined;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId: string | undefined;
@@ -339,6 +377,7 @@ export class Agent {
 		this.transformContext = options.transformContext;
 		this.streamFn = options.streamFn ?? streamSimple;
 		this.getApiKey = options.getApiKey;
+		this.getRequestAuthority = options.getRequestAuthority;
 		this.onPayload = options.onPayload;
 		this.onResponse = options.onResponse;
 		this.beforeToolCall = options.beforeToolCall;
@@ -347,6 +386,7 @@ export class Agent {
 		this.deliveryRevoked = options.deliveryRevoked;
 		this.nextAction = options.nextAction;
 		this.prepareRequest = options.prepareRequest;
+		this.admitPreparedRequest = options.admitPreparedRequest;
 		this.steeringQueueMode = options.steeringMode ?? "one-at-a-time";
 		this.followUpQueueMode = options.followUpMode ?? "one-at-a-time";
 		this.sessionId = options.sessionId;
@@ -426,6 +466,7 @@ export class Agent {
 
 	/** Discard an initial prompt whose delivery has not committed. */
 	discardPendingPrompt(): string[] {
+		this.invalidatePreparedRequest();
 		return this.clearDeliveries("prompt");
 	}
 
@@ -451,6 +492,7 @@ export class Agent {
 
 	/** Abort the current run, recording the first known local authority. */
 	abort(source?: AgentAbortSource): AgentAbortAcceptance {
+		this.invalidatePreparedRequest();
 		const run = this.activeRun;
 		if (!run || run.phase === "settled") {
 			return Object.freeze({ runId: run?.id, accepted: false, source: run?.abortSource });
@@ -482,6 +524,72 @@ export class Agent {
 			: undefined;
 	}
 
+	/** Return the current paused or admitted checkpoint when its authority is still current. */
+	getPreparedRequest(checkpointId?: string): PreparedProviderRequest | undefined {
+		const state = this.preparedRequestState;
+		if (!state || (checkpointId !== undefined && state.checkpoint.checkpointId !== checkpointId)) return undefined;
+		if (!Object.is(this.getRequestAuthority?.(), state.checkpoint.hostAuthority)) {
+			this.preparedRequestState = undefined;
+			return undefined;
+		}
+		return state.checkpoint;
+	}
+
+	/** Invalidate the current checkpoint, optionally only when its concrete identity matches. */
+	invalidatePreparedRequest(checkpointId?: string): boolean {
+		const state = this.preparedRequestState;
+		if (!state || (checkpointId !== undefined && state.checkpoint.checkpointId !== checkpointId)) return false;
+		this.preparedRequestState = undefined;
+		return true;
+	}
+
+	/** Commit replacement transcript messages into one newly materialized and re-admitted successor. */
+	async replacePreparedRequestMessages(
+		checkpointId: string,
+		messages: readonly AgentMessage[],
+	): Promise<PreparedRequestReplacementResult> {
+		const state = this.preparedRequestState;
+		if (!state || state.checkpoint.checkpointId !== checkpointId || state.phase !== "paused") {
+			throw new Error("Prepared provider request checkpoint is unavailable or no longer paused");
+		}
+		if (!Object.is(this.getRequestAuthority?.(), state.checkpoint.hostAuthority)) {
+			this.preparedRequestState = undefined;
+			throw new Error("Prepared provider request host authority is stale");
+		}
+		state.phase = "replacing";
+		try {
+			const successor = await rematerializePreparedProviderRequest(state.checkpoint, cloneAgentMessages(messages), {
+				transformContext: state.transformContext,
+				convertToLlm: state.convertToLlm,
+			});
+			if (this.preparedRequestState !== state) {
+				throw new Error("Prepared provider request was invalidated during replacement");
+			}
+			if (!Object.is(this.getRequestAuthority?.(), successor.hostAuthority)) {
+				throw new Error("Prepared provider request host authority is stale");
+			}
+			const decision = await this.evaluatePreparedRequestAdmission(successor, undefined);
+			if (this.preparedRequestState !== state) {
+				throw new Error("Prepared provider request was invalidated during admission");
+			}
+			if (decision.type === "pause") {
+				const pause = this.createPreparedRequestPause(successor, decision);
+				this.preparedRequestState = { ...state, checkpoint: successor, phase: "paused", pause };
+				return { type: "pause", checkpoint: successor, pause };
+			}
+			this.preparedRequestState = {
+				checkpoint: successor,
+				phase: "admitted",
+				transformContext: state.transformContext,
+				convertToLlm: state.convertToLlm,
+			};
+			return { type: "admit", checkpoint: successor };
+		} catch (error) {
+			if (this.preparedRequestState === state) this.preparedRequestState = undefined;
+			throw error;
+		}
+	}
+
 	/**
 	 * Resolve when the current run and all awaited event listeners have finished.
 	 *
@@ -507,6 +615,7 @@ export class Agent {
 		this.leasedDeliveryKinds.clear();
 		this.preparedDeliveryParticipants.clear();
 		this.pausedState = undefined;
+		this.preparedRequestState = undefined;
 	}
 
 	/** Start a new prompt through the same inbox dispatcher used by queued input. */
@@ -524,6 +633,7 @@ export class Agent {
 			);
 		}
 		this.pausedState = undefined;
+		this.invalidatePreparedRequest();
 		const lastMessage = this._state.messages[this._state.messages.length - 1];
 		this.enqueueDelivery("prompt", this.normalizePromptInput(input, images));
 		return await this.runDispatcher({
@@ -533,10 +643,33 @@ export class Agent {
 		});
 	}
 
-	/** Resume dispatcher state or a provider-ready transcript. */
+	/** Resume dispatcher state or stream one already-admitted provider checkpoint. */
 	async continue(options: { drainFollowUps?: boolean } = {}): Promise<AgentRunResult> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
+		}
+		const preparedState = this.preparedRequestState;
+		if (preparedState) {
+			if (!Object.is(this.getRequestAuthority?.(), preparedState.checkpoint.hostAuthority)) {
+				this.preparedRequestState = undefined;
+				throw new Error("Prepared provider request host authority is stale");
+			}
+			if (preparedState.phase === "paused") {
+				if (!preparedState.pause) throw new Error("Paused provider checkpoint is missing pause metadata");
+				return { status: "paused", deliveries: [], pause: preparedState.pause };
+			}
+			if (preparedState.phase !== "admitted") {
+				throw new Error("Prepared provider request replacement is still in progress");
+			}
+			return await this.runDispatcher(
+				{
+					firstDecision: true,
+					requestAuthority: preparedState.checkpoint.requestAuthority,
+					providerRequestPending: true,
+					drainFollowUpsFirst: options.drainFollowUps === true,
+				},
+				preparedState.checkpoint,
+			);
 		}
 		const lastMessage = this._state.messages[this._state.messages.length - 1];
 		if (!lastMessage && !this.hasQueuedMessages()) {
@@ -575,10 +708,13 @@ export class Agent {
 		return [{ role: "user", content, timestamp: Date.now() }];
 	}
 
-	private async runDispatcher(startState: DispatcherStartState): Promise<AgentRunResult> {
+	private async runDispatcher(
+		startState: DispatcherStartState,
+		preparedRequest?: PreparedProviderRequest,
+	): Promise<AgentRunResult> {
 		return await this.runWithLifecycle(async (signal) => {
 			const context = this.createContextSnapshot();
-			const config = this.createLoopConfig(startState);
+			const config = this.createLoopConfig(startState, preparedRequest);
 			if (context.messages.length === 0) {
 				await runAgentLoop([], context, config, (event) => this.processEvents(event), signal, this.streamFn);
 				return;
@@ -846,9 +982,82 @@ export class Agent {
 		this.preparedDeliveryParticipants.clear();
 	}
 
-	private createLoopConfig(startState: DispatcherStartState): AgentLoopConfig {
+	private createPreparedRequestPause(
+		request: PreparedProviderRequest,
+		decision: Extract<AgentPreparedRequestDecision, { type: "pause" }>,
+	): AgentPreparedRequestPause {
+		if (decision.attempt !== request.attempt) {
+			throw new Error("Prepared provider request pause attempt does not match its checkpoint");
+		}
+		if (!Number.isFinite(decision.estimatedTokens) || decision.estimatedTokens < 0) {
+			throw new Error("Prepared provider request pause requires a non-negative token estimate");
+		}
+		return Object.freeze({
+			...decision,
+			checkpointId: request.checkpointId,
+			requestId: request.requestId,
+		});
+	}
+
+	private async evaluatePreparedRequestAdmission(
+		request: PreparedProviderRequest,
+		signal: AbortSignal | undefined,
+	): Promise<AgentPreparedRequestDecision> {
+		if (!Object.is(this.getRequestAuthority?.(), request.hostAuthority)) {
+			throw new Error("Prepared provider request host authority is stale");
+		}
+		const decision = (await this.admitPreparedRequest?.(request, signal)) ?? { type: "admit" };
+		if (!Object.is(this.getRequestAuthority?.(), request.hostAuthority)) {
+			throw new Error("Prepared provider request host authority is stale");
+		}
+		if (decision.type === "pause") this.createPreparedRequestPause(request, decision);
+		return decision;
+	}
+
+	private async admitFreshPreparedRequest(
+		request: PreparedProviderRequest,
+		signal: AbortSignal | undefined,
+	): Promise<AgentPreparedRequestDecision> {
+		const decision = await this.evaluatePreparedRequestAdmission(request, signal);
+		const sharedState = {
+			checkpoint: request,
+			transformContext: this.transformContext,
+			convertToLlm: this.convertToLlm,
+		};
+		if (decision.type === "pause") {
+			const pause = this.createPreparedRequestPause(request, decision);
+			this.preparedRequestState = { ...sharedState, phase: "paused", pause };
+			if (this.activeRun) this.activeRun.preparedRequestPause = pause;
+		} else {
+			this.preparedRequestState = { ...sharedState, phase: "admitted" };
+		}
+		return decision;
+	}
+
+	private consumePreparedRequest(checkpointId: string): void {
+		const state = this.preparedRequestState;
+		if (
+			!state ||
+			state.phase !== "admitted" ||
+			state.checkpoint.checkpointId !== checkpointId ||
+			!Object.is(this.getRequestAuthority?.(), state.checkpoint.hostAuthority)
+		) {
+			this.preparedRequestState = undefined;
+			throw new Error("Prepared provider request checkpoint is stale or was not admitted");
+		}
+		this.preparedRequestState = undefined;
+	}
+
+	private createLoopConfig(
+		startState: DispatcherStartState,
+		preparedRequest?: PreparedProviderRequest,
+	): AgentLoopConfig {
 		return {
 			model: this._state.model,
+			...(this.activeRun === undefined ? {} : { runId: this.activeRun.id }),
+			getRequestAuthority: () => this.getRequestAuthority?.(),
+			...(preparedRequest === undefined ? {} : { preparedRequest }),
+			consumePreparedRequest: (checkpointId) => this.consumePreparedRequest(checkpointId),
 			...(this._state.thinkingLevel === "off" ? {} : { reasoning: this._state.thinkingLevel }),
 			...(this.sessionId === undefined ? {} : { sessionId: this.sessionId }),
 			...(this.onPayload === undefined ? {} : { onPayload: this.onPayload }),
@@ -874,6 +1083,7 @@ export class Agent {
 					thinkingLevel: prepared?.thinkingLevel ?? this._state.thinkingLevel,
 				};
 			},
+			admitPreparedRequest: async (request) => await this.admitFreshPreparedRequest(request, this.signal),
 			convertToLlm: this.convertToLlm,
 			...(this.transformContext === undefined ? {} : { transformContext: this.transformContext }),
 			...(this.getApiKey === undefined ? {} : { getApiKey: this.getApiKey }),
@@ -911,9 +1121,11 @@ export class Agent {
 
 		let deliveries: readonly AgentDeliveryAttemptResult[] = [];
 		let deliveryFailure: AgentDeliveryFailure | undefined;
+		let preparedRequestPause: AgentPreparedRequestPause | undefined;
 		try {
 			await executor(abortController.signal);
 		} catch (error) {
+			this.invalidatePreparedRequest();
 			this.rollbackActiveLease();
 			await this.handleRunFailure(error, abortController.signal.aborted);
 		} finally {
@@ -927,12 +1139,15 @@ export class Agent {
 				),
 			);
 			deliveryFailure = this.activeRun?.deliveryFailure;
+			preparedRequestPause = this.activeRun?.preparedRequestPause;
 			this.leasedDeliveryKinds.clear();
 			this.finishRun();
 		}
 		return deliveryFailure
 			? { status: "delivery_failed", deliveries, failure: deliveryFailure }
-			: { status: "completed", deliveries };
+			: preparedRequestPause
+				? { status: "paused", deliveries, pause: preparedRequestPause }
+				: { status: "completed", deliveries };
 	}
 
 	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
@@ -979,7 +1194,11 @@ export class Agent {
 		} satisfies AgentMessage;
 		await this.processEvents({ type: "message_start", message: failureMessage });
 		const replacement = await this.processEvents({ type: "message_end", message: failureMessage });
-		const finalizedMessage = replacement?.role === "assistant" ? replacement : failureMessage;
+		const finalizedMessage = canonicalizeMessageReplacement(
+			failureMessage,
+			replacement,
+			UNKNOWN_TOOL_SET_SNAPSHOT_AUTHORITY,
+		);
 		await this.processEvents({ type: "turn_end", message: finalizedMessage, toolResults: [] });
 		await this.processEvents({
 			type: "agent_end",
@@ -1121,13 +1340,15 @@ export class Agent {
 		}
 		let emittedEvent = this.decorateRuntimeAbort(event);
 		for (const listener of this.listeners) {
-			const replacement = await listener(emittedEvent, signal);
-			if (emittedEvent.type === "message_end" && replacement) {
-				if (replacement.role !== emittedEvent.message.role) {
-					throw new Error("message_end listeners must return a message with the same role");
-				}
-				const previousEvent = emittedEvent;
-				emittedEvent = this.decorateRuntimeAbort({ ...emittedEvent, message: replacement }, previousEvent);
+			const previousEvent = emittedEvent;
+			const replacement = await listener(structuredClone(emittedEvent), signal);
+			if (emittedEvent.type === "message_end") {
+				const canonicalReplacement = canonicalizeMessageReplacement(
+					emittedEvent.message,
+					replacement ?? undefined,
+					getCanonicalToolSetSnapshotAuthority(emittedEvent.message),
+				);
+				emittedEvent = this.decorateRuntimeAbort({ ...emittedEvent, message: canonicalReplacement }, previousEvent);
 			} else {
 				// Cancellation can land while this listener is awaited. Make its
 				// provenance visible to every later listener, even without replacement.
@@ -1136,9 +1357,12 @@ export class Agent {
 		}
 
 		if (emittedEvent.type === "message_end") {
-			// An abort can be accepted while an awaited listener settles without
-			// returning a replacement. Re-canonicalize at the persistence boundary.
-			const finalizedEvent = this.decorateRuntimeAbort(emittedEvent);
+			const canonicalMessage = canonicalizeMessageReplacement(
+				emittedEvent.message,
+				undefined,
+				getCanonicalToolSetSnapshotAuthority(emittedEvent.message),
+			);
+			const finalizedEvent = this.decorateRuntimeAbort({ ...emittedEvent, message: canonicalMessage }, emittedEvent);
 			if (finalizedEvent.type !== "message_end") {
 				throw new Error("Runtime abort decoration changed the event type");
 			}

@@ -4,6 +4,7 @@ import { Compile } from "typebox/compile";
 import { describe, expect, test } from "vitest";
 import { RPC_COMMAND_SCHEMAS } from "../src/core/rpc/schema/commands.ts";
 import {
+	RpcConversationActiveAssistantSchema,
 	RpcConversationBootstrapEventSchema,
 	RpcMessageEndFrameSchema,
 	RpcMessageStartFrameSchema,
@@ -167,13 +168,17 @@ describe("RPC contract schema integrity", () => {
 });
 
 describe("RPC contract emission conformance", () => {
-	test("StreamProjector frames validate against the stream frame schemas", () => {
+	test("StreamProjector frames and active assistant snapshots accept protected request metadata", () => {
 		const projector = new StreamProjector();
 		const startValidator = Compile(RpcMessageStartFrameSchema);
 		const updateValidator = Compile(RpcMessageUpdateFrameSchema);
 		const endValidator = Compile(RpcMessageEndFrameSchema);
 
-		const snapshot = assistant([{ type: "text", text: "" }]);
+		const toolSetSnapshot = {
+			definitions: [{ name: "search", fingerprint: "search-fingerprint" }],
+			estimatedTokens: 37,
+		};
+		const snapshot = assistant([{ type: "text", text: "" }], { toolSetSnapshot });
 		const toolState: readonly ActiveToolCallState[] = [];
 		const update = (assistantMessageEvent: AssistantMessageEvent) => ({
 			type: "message_update",
@@ -190,10 +195,13 @@ describe("RPC contract emission conformance", () => {
 				seq: 3,
 				contentIndex: 0,
 				content: "hello",
-				snapshot: assistant([{ type: "text", text: "hello" }]),
+				snapshot: assistant([{ type: "text", text: "hello" }], { toolSetSnapshot }),
 				toolState,
 			}),
-			{ type: "message_end", message: assistant([{ type: "text", text: "hello" }]) },
+			{
+				type: "message_end",
+				message: assistant([{ type: "text", text: "hello" }], { toolSetSnapshot }),
+			},
 		];
 
 		const frames = events.flatMap((event) => projector.push(event).frames) as Array<{ type?: string }>;
@@ -207,6 +215,25 @@ describe("RPC contract emission conformance", () => {
 						: endValidator;
 			expect(validator.Errors(frame)).toEqual([]);
 		}
+		const startFrame = frames.find((frame) => frame.type === "message_start");
+		const updateFrame = frames.find((frame) => frame.type === "message_update" && "message" in frame);
+		const endFrame = frames.find((frame) => frame.type === "message_end");
+		for (const frame of [startFrame, updateFrame, endFrame]) {
+			expect(frame).toMatchObject({ message: { toolSetSnapshot } });
+		}
+		expect(
+			check(RpcConversationActiveAssistantSchema, {
+				stream: { epoch: 1, seq: 0 },
+				message: snapshot,
+			}),
+		).toBe(true);
+		expect(check(RpcMessageEndFrameSchema, { ...endFrame, extra: true })).toBe(false);
+		expect(
+			check(RpcMessageEndFrameSchema, {
+				...endFrame,
+				message: { ...snapshot, toolSetSnapshot: { ...toolSetSnapshot, extra: true } },
+			}),
+		).toBe(false);
 	});
 
 	test("projectRpcQueueUpdate output validates against the queue_update schema", () => {

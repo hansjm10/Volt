@@ -328,6 +328,8 @@ Behavior notes:
 
 For providers or proxies using `api: "anthropic-messages"`, use `compat` to control Anthropic-specific request compatibility.
 
+Message-anchored deferred tools (`defer_loading` definitions and transcript `tool_reference` blocks) are enabled automatically only for eligible built-in models on `https://api.anthropic.com`. Custom endpoints keep tool definitions eager by default. Set `supportsToolReferences` to `true` only when a custom endpoint supports the native protocol, or to `false` to disable it explicitly.
+
 By default volt sends per-tool `eager_input_streaming: true`. If a proxy or Anthropic-compatible backend rejects that field, set `supportsEagerToolInputStreaming` to `false`. Volt will omit `tools[].eager_input_streaming` and send the legacy `fine-grained-tool-streaming-2025-05-14` beta header for tool-enabled requests instead.
 
 Some Anthropic models require adaptive thinking (`thinking.type: "adaptive"` plus `output_config.effort`) instead of the legacy budget-based thinking payload. Built-in models set this automatically. For custom providers or aliases that route to those models, set `forceAdaptiveThinking` to `true`.
@@ -361,6 +363,7 @@ Some Anthropic-compatible providers emit thinking blocks with empty signatures a
 
 | Field | Description |
 |-------|-------------|
+| `supportsToolReferences` | Whether the provider supports deferred tool definitions and transcript `tool_reference` blocks. Defaults to eligible built-in models on the first-party Anthropic endpoint only. |
 | `supportsEagerToolInputStreaming` | Whether the provider accepts per-tool `eager_input_streaming`. Default: `true`. Set to `false` to omit that field and use the legacy fine-grained tool streaming beta header on tool-enabled requests. |
 | `supportsLongCacheRetention` | Whether the provider accepts Anthropic long cache retention (`cache_control.ttl: "1h"`) when cache retention is `long`. Default: `true`. |
 | `sendSessionAffinityHeaders` | Whether to send `x-session-affinity` from the session id when caching is enabled. Default: auto-detected for known providers. |
@@ -374,6 +377,8 @@ For providers with partial OpenAI compatibility, use the `compat` field.
 
 - Provider-level `compat` applies defaults to all models under that provider.
 - Model-level `compat` overrides provider-level values for that model.
+
+Client-executed tool search is enabled automatically only for eligible built-in models on `https://api.openai.com/v1` and `https://chatgpt.com/backend-api`. Custom OpenAI Responses endpoints keep tool definitions eager by default. Set `supportsToolSearch` to `true` only when a custom endpoint supports the native protocol, or to `false` to disable it explicitly.
 
 ```json
 {
@@ -405,6 +410,7 @@ For providers with partial OpenAI compatibility, use the `compat` field.
 | `thinkingFormat` | Use `reasoning_effort`, `openrouter`, `deepseek`, `together`, `zai`, `qwen`, or `qwen-chat-template` thinking parameters |
 | `cacheControlFormat` | Use Anthropic-style `cache_control` markers on the system prompt, last tool definition, and last user/assistant text content. Currently only `anthropic` is supported. |
 | `supportsStrictMode` | Include the `strict` field in tool definitions |
+| `supportsToolSearch` | Whether OpenAI Responses supports deferred function loading through client-executed tool search. Defaults to eligible built-in models on first-party OpenAI endpoints only. |
 | `supportsLongCacheRetention` | Whether the provider accepts long cache retention when cache retention is `long`: `prompt_cache_retention: "24h"` for OpenAI prompt caching, or `cache_control.ttl: "1h"` when `cacheControlFormat` is `anthropic`. Default: `true`. |
 | `openRouterRouting` | OpenRouter provider routing preferences. This object is sent as-is in the `provider` field of the [OpenRouter API request](https://openrouter.ai/docs/guides/routing/provider-selection). |
 | `vercelGatewayRouting` | Vercel AI Gateway routing config for provider selection (`only`, `order`) |

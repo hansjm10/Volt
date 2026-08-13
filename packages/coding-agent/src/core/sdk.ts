@@ -486,7 +486,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		onPayload: async (payload, _model) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("before_provider_request")) {
-				return payload;
+				return undefined;
 			}
 			return runner.emitBeforeProviderRequest(payload);
 		},
@@ -542,6 +542,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		customTools: options.customTools,
 		modelRegistry,
 		initialActiveToolNames,
+		includeDefaultBuiltinTools: options.tools === undefined && options.noTools === undefined,
 		allowedToolNames,
 		allowUnlistedExtensionTools: options.allowUnlistedExtensionTools,
 		excludedToolNames,

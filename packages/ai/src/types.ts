@@ -90,6 +90,11 @@ export interface ProviderResponse {
 	headers: Record<string, string>;
 }
 
+/** Provider attestation for the logical tool set represented by its final request payload. */
+export type ToolSetSnapshotAuthority =
+	| { readonly kind: "known"; readonly snapshot: ToolSetSnapshot }
+	| { readonly kind: "unknown" };
+
 export interface StreamOptions {
 	temperature?: number;
 	maxTokens?: number;
@@ -165,6 +170,8 @@ export interface StreamOptions {
 	 * proxy variables.
 	 */
 	env?: ProviderEnv;
+	/** Report whether the final provider payload attests an exact logical tool set. */
+	reportToolSetSnapshot?: (authority: ToolSetSnapshotAuthority) => void;
 }
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
@@ -308,6 +315,20 @@ export interface UserMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+export interface ToolDefinitionFingerprint {
+	name: string;
+	fingerprint: string;
+}
+
+/** Ordered provider-request tool state persisted without full definitions. */
+export interface ToolSetSnapshot {
+	definitions: ToolDefinitionFingerprint[];
+	estimatedTokens: number;
+}
+
+/** Tool-state mutation attributable to one completed tool result. */
+export type ToolSetTransition = { kind: "additive"; added: ToolDefinitionFingerprint[] } | { kind: "reset" };
+
 export interface AssistantMessage {
 	role: "assistant";
 	content: (TextContent | ThinkingContent | ToolCall)[];
@@ -320,6 +341,8 @@ export interface AssistantMessage {
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;
+	/** Exact ordered tool state sent with a successful provider request. */
+	toolSetSnapshot?: ToolSetSnapshot;
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
@@ -328,6 +351,8 @@ export interface ToolResultMessage<TDetails = unknown> {
 	toolCallId: string;
 	toolName: string;
 	content: (TextContent | ImageContent)[]; // Supports text and images
+	/** Additive activation or eager-placement reset produced by this tool call. */
+	toolSetTransition?: ToolSetTransition;
 	details?: TDetails;
 	isError: boolean;
 	timestamp: number; // Unix timestamp in milliseconds
@@ -537,10 +562,14 @@ export interface OpenAIResponsesCompat {
 	sendSessionIdHeader?: boolean;
 	/** Whether the provider supports `prompt_cache_retention: "24h"`. Default: true. */
 	supportsLongCacheRetention?: boolean;
+	/** Whether the provider supports deferred function loading through client-executed tool search. Defaults to eligible models on first-party OpenAI endpoints only; set explicitly for custom endpoints. */
+	supportsToolSearch?: boolean;
 }
 
 /** Compatibility settings for Anthropic Messages-compatible APIs. */
 export interface AnthropicMessagesCompat {
+	/** Whether the provider supports deferred tools and transcript `tool_reference` blocks. Defaults to eligible models on the first-party Anthropic endpoint only; set explicitly for custom endpoints. */
+	supportsToolReferences?: boolean;
 	/**
 	 * Whether the provider accepts per-tool `eager_input_streaming`.
 	 * When false, the Anthropic provider omits `tools[].eager_input_streaming`
@@ -700,7 +729,7 @@ export interface Model<TApi extends Api> {
 	/** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */
 	compat?: TApi extends "openai-completions"
 		? OpenAICompletionsCompat
-		: TApi extends "openai-responses"
+		: TApi extends "openai-responses" | "openai-codex-responses"
 			? OpenAIResponsesCompat
 			: TApi extends "anthropic-messages"
 				? AnthropicMessagesCompat

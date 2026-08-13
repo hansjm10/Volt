@@ -55,6 +55,8 @@ type ProxySerializableStreamOptions = Pick<
 >;
 
 export interface ProxyStreamOptions extends ProxySerializableStreamOptions {
+	/** Report that this proxy protocol cannot attest the server's final tool payload. */
+	reportToolSetSnapshot?: SimpleStreamOptions["reportToolSetSnapshot"];
 	/** Local abort signal for the proxy request. */
 	signal?: AbortSignal;
 	/** Auth token for the proxy server. */
@@ -90,6 +92,7 @@ export function streamProxy<TApi extends Api>(
 	options: ProxyStreamOptions,
 ): AssistantMessageEventStream {
 	const normalizer = new AssistantStreamNormalizer();
+	options.reportToolSetSnapshot?.({ kind: "unknown" });
 
 	void (async () => {
 		let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;

@@ -245,6 +245,14 @@ Emitted when the user changes the branch-local inference-speed policy. This is i
 {"type":"fast_mode_change","id":"f5g6h7i8","parentId":"e5f6g7h8","timestamp":"2024-12-03T14:07:00.000Z","enabled":true}
 ```
 
+### ActiveToolsChangeEntry
+
+Persists the complete explicit requested tool set for the current branch. An ordered empty list explicitly disables all selectable tools. Tool names that are unavailable when a session is restored remain requested but are omitted from the effective runtime until their definitions are available again. Tool registry, MCP, extension, and reload refreshes do not rewrite this entry.
+
+```json
+{"type":"active_tools_change","id":"g6h7i8j9","parentId":"f5g6h7i8","timestamp":"2024-12-03T14:08:00.000Z","toolNames":["read","bash","web_search"]}
+```
+
 ### CompactionEntry
 
 Created when context is compacted. Stores a summary of earlier messages.
@@ -331,7 +339,7 @@ Entries form a tree:
 `buildSessionContext()` walks from the current leaf to the root, producing the message list for the LLM:
 
 1. Collects all entries on the path
-2. Extracts current model, thinking level, and Fast mode settings
+2. Extracts current model, thinking level, Fast mode, and tool selection. No `active_tools_change` means inherit from the fresh runtime baseline; any entry means explicit branch-local intent, including empty or currently unavailable names.
 3. If a `CompactionEntry` is on the path:
    - Emits the summary first
    - Then messages from `firstKeptEntryId` to compaction

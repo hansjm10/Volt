@@ -78,6 +78,14 @@ What the LLM sees:
 
 On repeated compactions, the summarized span starts at the previous compaction's kept boundary (`firstKeptEntryId`), not at the compaction entry itself, falling back to the entry after the previous compaction if that kept entry cannot be found in the path. This preserves messages that survived the earlier compaction by including them in the next summarization pass as well. Volt also recalculates `tokensBefore` from the rebuilt session context and active tool definitions before writing the new `CompactionEntry`, so the token count reflects the actual pre-compaction context being replaced.
 
+### Prepared Continuation Checkpoints
+
+Before a tool continuation or queued delivery crosses the compaction threshold, Agent prepares the exact provider-bound logical request. The checkpoint contains the post-`context`-hook, post-conversion messages, selected model, exact provider tool definitions, finalized deliveries, and resolved stream options. Admission and token budgeting therefore inspect what would actually be sent rather than reconstructing it from mutable session state.
+
+Proactive compaction retains that checkpoint without calling the provider or redelivering queued input. After the compaction entry commits and the live transcript reloads, Agent derives at most one successor for the same logical request: the request identity, model, options, and finalized deliveries stay fixed; the concrete checkpoint identity changes; the attempt increments; and only context transformation, conversion, and provider-tail validation rerun against the compacted transcript. The admitted successor streams before Volt considers another queued delivery.
+
+Volt invalidates the retained checkpoint on abort, reset, disposal, explicit replacement prompts, failed or non-progressing compaction, or conversation-generation changes such as navigation. A replacement that remains over threshold fails instead of recursively compacting or replaying the original request.
+
 ### Split Turns
 
 A "turn" starts with a user message and includes all assistant responses and tool calls until the next user message. Normally, compaction cuts at turn boundaries.

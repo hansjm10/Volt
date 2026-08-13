@@ -1,6 +1,7 @@
-import type { AgentRunResult } from "@hansjm10/volt-agent-core";
+import type { AgentPreparedRequestDecision, AgentRunResult, PreparedProviderRequest } from "@hansjm10/volt-agent-core";
 import {
 	type AssistantMessage,
+	type Context,
 	createAssistantMessageEventStream,
 	estimateToolDefinitionTokens,
 	fauxAssistantMessage,
@@ -11,13 +12,23 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateMessagesTokens } from "../../src/core/compaction/index.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
+type ProactiveCompactionState =
+	| { phase: "idle" }
+	| { phase: "scheduled"; checkpointId: string }
+	| { phase: "compacting"; checkpointId: string };
+
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
 	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
-	_shouldStopForProactiveCompaction: (context: unknown) => boolean;
-	_handlePostAgentRun: (result: AgentRunResult) => Promise<boolean>;
+	_admitPreparedContinuation: (request: PreparedProviderRequest) => AgentPreparedRequestDecision;
+	_handlePostAgentRun: (
+		result: AgentRunResult,
+		abortGeneration?: number,
+		conversationGenerationRevision?: number,
+	) => Promise<boolean>;
 	_lastAssistantMessage: AssistantMessage | undefined;
-	_proactiveCompactionState: "idle" | "scheduled" | "compacting";
+	_proactiveCompactionState: ProactiveCompactionState;
+	_conversationGenerationRevision: number;
 };
 
 function createUsage(totalTokens: number) {
@@ -51,6 +62,56 @@ function createAssistant(
 		provider: model.provider,
 		model: model.id,
 		usage: createUsage(options.totalTokens ?? 0),
+	};
+}
+
+function createPreparedRequest(
+	harness: Harness,
+	options: Partial<
+		Pick<
+			PreparedProviderRequest,
+			| "checkpointId"
+			| "requestId"
+			| "attempt"
+			| "model"
+			| "providerContext"
+			| "completedTurn"
+			| "defaultAction"
+			| "requestAuthority"
+			| "reason"
+			| "deliveries"
+		>
+	> = {},
+): PreparedProviderRequest {
+	return {
+		checkpointId: options.checkpointId ?? "checkpoint-0",
+		requestId: options.requestId ?? "request-0",
+		attempt: options.attempt ?? 0,
+		runId: "run-0",
+		hostAuthority: harness.session.agent.getRequestAuthority?.(),
+		providerContext: options.providerContext ?? { systemPrompt: "", messages: [], tools: [] },
+		model: options.model ?? harness.getModel(),
+		streamOptions: {},
+		...(options.completedTurn === undefined ? {} : { completedTurn: options.completedTurn }),
+		defaultAction: options.defaultAction ?? { type: "request", reason: "continuation" },
+		requestAuthority: options.requestAuthority ?? "tool_continuation",
+		reason: options.reason ?? "continuation",
+		deliveries: options.deliveries ?? [],
+	};
+}
+
+function createPausedRunResult(request: PreparedProviderRequest, estimatedTokens = 1): AgentRunResult {
+	return {
+		status: "paused",
+		deliveries: [],
+		pause: {
+			type: "pause",
+			reason: "compaction",
+			estimatedTokens,
+			attempt: request.attempt,
+			checkpointId: request.checkpointId,
+			requestId: request.requestId,
+		},
 	};
 }
 
@@ -353,32 +414,246 @@ describe("AgentSession compaction characterization", () => {
 			}),
 		]);
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
-		sessionInternals._lastAssistantMessage = createAssistant(harness, {
-			stopReason: "toolUse",
-			totalTokens: harness.getModel().contextWindow,
+		const request = createPreparedRequest(harness, {
+			providerContext: {
+				systemPrompt: "",
+				messages: [],
+				tools: [],
+			},
 		});
-		sessionInternals._proactiveCompactionState = "scheduled";
+		vi.spyOn(harness.session.agent, "getPreparedRequest").mockReturnValue(request);
+		sessionInternals._proactiveCompactionState = {
+			phase: "scheduled",
+			checkpointId: request.checkpointId,
+		};
 
-		await expect(sessionInternals._handlePostAgentRun({ status: "completed", deliveries: [] })).rejects.toThrow(
+		await expect(sessionInternals._handlePostAgentRun(createPausedRunResult(request))).rejects.toThrow(
 			"Summarization failed after 2 attempts",
 		);
 
-		expect(sessionInternals._proactiveCompactionState).toBe("idle");
+		expect(sessionInternals._proactiveCompactionState).toEqual({ phase: "idle" });
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
+	});
+
+	it("admits the exact extension-transformed and converted provider context", async () => {
+		const harness = await createHarness({
+			prepareRequest: ({ context }) => ({
+				context: { ...context, systemPrompt: "prepared system prompt" },
+			}),
+			extensionFactories: [
+				(volt) => {
+					volt.on("context", (event) => ({
+						messages: [
+							...event.messages,
+							{
+								role: "custom",
+								customType: "admission-marker",
+								content: "extension transformed marker",
+								display: false,
+								timestamp: 123,
+							},
+						],
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		let admittedRequest: PreparedProviderRequest | undefined;
+		let streamedContext: Context | undefined;
+		const admitPreparedRequest = harness.session.agent.admitPreparedRequest;
+		harness.session.agent.admitPreparedRequest = async (request, signal) => {
+			admittedRequest = request;
+			return admitPreparedRequest ? await admitPreparedRequest(request, signal) : undefined;
+		};
+		harness.setResponses([
+			(context) => {
+				streamedContext = structuredClone(context);
+				return fauxAssistantMessage("done");
+			},
+		]);
+
+		await harness.session.prompt("original prompt");
+
+		expect(admittedRequest?.providerContext).toEqual(streamedContext);
+		expect(admittedRequest?.providerContext.systemPrompt).toBe("prepared system prompt");
+		expect(admittedRequest?.providerContext.messages).toContainEqual({
+			role: "user",
+			content: [{ type: "text", text: "extension transformed marker" }],
+			timestamp: 123,
+		});
+	});
+
+	it("rejects a paused checkpoint after the conversation generation changes", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.session.agent.admitPreparedRequest = (request) => ({
+			type: "pause",
+			reason: "compaction",
+			estimatedTokens: 1,
+			attempt: request.attempt,
+		});
+		const paused = await harness.session.agent.prompt("pause before navigation");
+		if (paused.status !== "paused") throw new Error("Expected a paused provider request");
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		sessionInternals._conversationGenerationRevision++;
+
+		await expect(
+			harness.session.agent.replacePreparedRequestMessages(
+				paused.pause.checkpointId,
+				harness.session.agent.state.messages,
+			),
+		).rejects.toThrow("Prepared provider request host authority is stale");
+		expect(harness.session.agent.getPreparedRequest()).toBeUndefined();
+	});
+
+	it("uses the captured prepared model and tool budget for proactive compaction", async () => {
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			models: [
+				{ id: "prepared-model", contextWindow: 40_000, reasoning: true },
+				{ id: "live-model", contextWindow: 200_000, reasoning: false },
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const preparedModel = harness.getModel("prepared-model")!;
+		const liveModel = harness.getModel("live-model")!;
+		harness.session.agent.state.model = liveModel;
+		let summarizationModelId: string | undefined;
+		harness.session.agent.streamFn = (model) => {
+			summarizationModelId = model.id;
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					seq: 1,
+					reason: "stop",
+					message: {
+						...fauxAssistantMessage("captured summary"),
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+					},
+				});
+			});
+			return stream;
+		};
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const capturedTools = [
+			{
+				name: "captured_tool",
+				description: "x".repeat(20_000),
+				parameters: { type: "object", properties: {} },
+			},
+		];
+		const request = createPreparedRequest(harness, {
+			model: preparedModel,
+			providerContext: { systemPrompt: "", messages: [], tools: capturedTools },
+		});
+		const successor = createPreparedRequest(harness, {
+			...request,
+			checkpointId: "checkpoint-1",
+			attempt: 1,
+		});
+		vi.spyOn(harness.session.agent, "getPreparedRequest").mockReturnValue(request);
+		vi.spyOn(harness.session.agent, "replacePreparedRequestMessages").mockResolvedValue({
+			type: "admit",
+			checkpoint: successor,
+		});
+		sessionInternals._proactiveCompactionState = {
+			phase: "compacting",
+			checkpointId: request.checkpointId,
+		};
+
+		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(true);
+		expect(summarizationModelId).toBe("prepared-model");
+		expect(harness.sessionManager.getBranch().find((entry) => entry.type === "compaction")).toMatchObject({
+			tokensBefore: estimateToolDefinitionTokens(capturedTools),
+		});
 	});
 
 	it("does not resume a proactively interrupted run after compaction cancellation", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
-		sessionInternals._lastAssistantMessage = createAssistant(harness, {
-			stopReason: "toolUse",
-			totalTokens: harness.getModel().contextWindow,
-		});
-		sessionInternals._proactiveCompactionState = "scheduled";
+		const request = createPreparedRequest(harness);
+		sessionInternals._proactiveCompactionState = {
+			phase: "scheduled",
+			checkpointId: request.checkpointId,
+		};
 		vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 
-		await expect(sessionInternals._handlePostAgentRun({ status: "completed", deliveries: [] })).resolves.toBe(false);
+		await expect(sessionInternals._handlePostAgentRun(createPausedRunResult(request))).resolves.toBe(false);
+	});
+
+	it("clears a proactive ticket when auto-compaction aborts", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("session_before_compact", async (event) => {
+						return await new Promise<{ cancel: true }>((resolve) => {
+							event.signal.addEventListener("abort", () => resolve({ cancel: true }), { once: true });
+						});
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const request = createPreparedRequest(harness);
+		vi.spyOn(harness.session.agent, "getPreparedRequest").mockReturnValue(request);
+		sessionInternals._proactiveCompactionState = {
+			phase: "compacting",
+			checkpointId: request.checkpointId,
+		};
+
+		const compactPromise = sessionInternals._runAutoCompaction("threshold", false);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		harness.session.abortCompaction();
+
+		await expect(compactPromise).resolves.toBe(false);
+		expect(sessionInternals._proactiveCompactionState).toEqual({ phase: "idle" });
+	});
+
+	it("does not reuse abandoned proactive accounting for a later compaction", async () => {
+		const abandonedTokensBefore = 123_456;
+		let extensionTokensBefore: number | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("session_before_compact", async (event) => {
+						extensionTokensBefore = event.preparation.tokensBefore;
+						return {
+							compaction: {
+								summary: "summary after abandoned proactive compaction",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+							},
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		sessionInternals._proactiveCompactionState = {
+			phase: "scheduled",
+			checkpointId: "abandoned-checkpoint",
+		};
+
+		await expect(
+			sessionInternals._handlePostAgentRun({ status: "completed", deliveries: [] }, undefined, -1),
+		).resolves.toBe(false);
+		expect(sessionInternals._proactiveCompactionState).toEqual({ phase: "idle" });
+
+		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(false);
+
+		const compactionEntry = harness.sessionManager.getEntries().find((entry) => entry.type === "compaction");
+		expect(extensionTokensBefore).toBeDefined();
+		expect(extensionTokensBefore).not.toBe(abandonedTokensBefore);
+		expect(compactionEntry).toMatchObject({ type: "compaction", tokensBefore: extensionTokensBefore });
 	});
 
 	it("excludes a stripped trailing error message from estimatedTokensAfter when retrying", async () => {
@@ -502,28 +777,115 @@ describe("AgentSession compaction characterization", () => {
 								timestamp: Date.now(),
 							},
 						];
-			harness.session.agent.followUp({
-				role: "user",
-				content: [{ type: "text", text: "queued follow-up" }],
+			const deliveredMessage = {
+				role: "user" as const,
+				content: [{ type: "text" as const, text: "queued follow-up" }],
 				timestamp: Date.now(),
-			});
+			};
+			const delivery = { deliveryId: "follow-up-1", messages: [deliveredMessage] };
 
 			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
-			expect(
-				sessionInternals._shouldStopForProactiveCompaction({
-					completedTurn: {
-						message,
-						toolResults,
-						disposition: kind === "stopping tool batch" ? "stop" : "continue",
-					},
-					requestAuthority: "provider",
-					defaultAction: { type: "stop" },
-					context: { systemPrompt: "", messages: [message, ...toolResults], tools: [] },
-					newMessages: [],
-				}),
-			).toBe(true);
+			const request = createPreparedRequest(harness, {
+				completedTurn: {
+					message,
+					toolResults,
+					disposition: kind === "stopping tool batch" ? "stop" : "continue",
+				},
+				requestAuthority: "provider",
+				defaultAction: { type: "stop" },
+				reason: "delivery",
+				deliveries: [delivery],
+				providerContext: {
+					systemPrompt: "",
+					messages: [message, ...toolResults, deliveredMessage],
+					tools: [],
+				},
+				model,
+			});
+			expect(sessionInternals._admitPreparedContinuation(request)).toMatchObject({
+				type: "pause",
+				reason: "compaction",
+				attempt: 0,
+			});
 		},
 	);
+
+	it("uses rebuilt context size when retained assistant usage predates proactive compaction", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const model = harness.getModel();
+		const toolCall = fauxToolCall("read", { path: "large.txt" });
+		const message: AssistantMessage = {
+			...createAssistant(harness, { stopReason: "toolUse", totalTokens: model.contextWindow }),
+			content: [toolCall],
+		};
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "inspect the large file" }],
+			timestamp: message.timestamp - 1,
+		});
+		harness.sessionManager.appendMessage(message);
+		const firstKeptEntryId = harness.sessionManager.getLeafId()!;
+		harness.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: "retained result" }],
+			isError: false,
+			timestamp: message.timestamp + 1,
+		});
+		harness.sessionManager.appendCompaction("summary", firstKeptEntryId, model.contextWindow, undefined, false);
+		const compactedMessages = harness.sessionManager.buildSessionContext().messages;
+		const providerMessages = await harness.session.agent.convertToLlm(compactedMessages);
+		harness.session.agent.state.messages = compactedMessages;
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		sessionInternals._proactiveCompactionState = {
+			phase: "compacting",
+			checkpointId: "checkpoint-before-compaction",
+		};
+		const request = createPreparedRequest(harness, {
+			checkpointId: "checkpoint-after-compaction",
+			attempt: 1,
+			completedTurn: { message, toolResults: [], disposition: "continue" },
+			providerContext: { systemPrompt: "", messages: providerMessages, tools: [] },
+			model,
+		});
+
+		expect(sessionInternals._admitPreparedContinuation(request)).toEqual({ type: "admit" });
+		expect(sessionInternals._proactiveCompactionState).toEqual({ phase: "idle" });
+	});
+
+	it("fails a still-oversized resumed request after one no-progress compaction", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const model = harness.getModel();
+		const message = createAssistant(harness, { stopReason: "toolUse", totalTokens: model.contextWindow });
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const previous = createPreparedRequest(harness, {
+			checkpointId: "checkpoint-before-compaction",
+			completedTurn: { message, toolResults: [], disposition: "continue" },
+			providerContext: { systemPrompt: "", messages: [message], tools: [] },
+			model,
+		});
+		const successor = createPreparedRequest(harness, {
+			checkpointId: "checkpoint-after-compaction",
+			requestId: previous.requestId,
+			attempt: 1,
+			completedTurn: previous.completedTurn,
+			providerContext: { systemPrompt: "", messages: [message], tools: [] },
+			model,
+		});
+		vi.spyOn(harness.session.agent, "getPreparedRequest").mockReturnValue(previous);
+		sessionInternals._proactiveCompactionState = {
+			phase: "compacting",
+			checkpointId: previous.checkpointId,
+		};
+
+		expect(() => sessionInternals._admitPreparedContinuation(successor)).toThrow(
+			"Proactive compaction made no progress toward an admissible provider request",
+		);
+		expect(sessionInternals._proactiveCompactionState).toEqual({ phase: "idle" });
+	});
 
 	it("does not retry overflow recovery more than once", async () => {
 		const harness = await createHarness();

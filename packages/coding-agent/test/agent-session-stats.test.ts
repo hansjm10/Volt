@@ -1,5 +1,5 @@
 import { Agent } from "@hansjm10/volt-agent-core";
-import { type AssistantMessage, getModel, type Usage } from "@hansjm10/volt-ai";
+import { type AssistantMessage, estimateToolDefinitionTokens, getModel, type Usage } from "@hansjm10/volt-ai";
 import { describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
@@ -102,10 +102,11 @@ describe("AgentSession.getSessionStats", () => {
 			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
+			const expectedTokens = 200 + estimateToolDefinitionTokens(session.agent.state.tools);
 			expect(stats.contextUsage).toEqual(session.getContextUsage());
-			expect(stats.contextUsage?.tokens).toBe(200);
+			expect(stats.contextUsage?.tokens).toBe(expectedTokens);
 			expect(stats.contextUsage?.contextWindow).toBe(model.contextWindow);
-			expect(stats.contextUsage?.percent).toBe((200 / model.contextWindow) * 100);
+			expect(stats.contextUsage?.percent).toBe((expectedTokens / model.contextWindow) * 100);
 		} finally {
 			session.dispose();
 		}
@@ -164,9 +165,10 @@ describe("AgentSession.getSessionStats", () => {
 				tokens: { input: 400_000, total: 400_000 },
 			});
 			expect(stats.cost).toBeCloseTo(0.4);
+			const expectedTokens = 25_000 + estimateToolDefinitionTokens(session.agent.state.tools);
 			expect(stats.contextUsage).toBeDefined();
-			expect(stats.contextUsage?.tokens).toBe(25_000);
-			expect(stats.contextUsage?.percent).toBe((25_000 / model.contextWindow) * 100);
+			expect(stats.contextUsage?.tokens).toBe(expectedTokens);
+			expect(stats.contextUsage?.percent).toBe((expectedTokens / model.contextWindow) * 100);
 		} finally {
 			session.dispose();
 		}

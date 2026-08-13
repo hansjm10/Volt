@@ -1,6 +1,7 @@
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
+	Context,
 	ImageContent,
 	JsonObject,
 	JsonValue,
@@ -11,6 +12,7 @@ import type {
 	TextContent,
 	Tool,
 	ToolResultMessage,
+	ToolSetTransition,
 } from "@hansjm10/volt-ai";
 import type { Static, TSchema } from "typebox";
 
@@ -23,8 +25,12 @@ import type { Static, TSchema } from "typebox";
  * - Failures must be encoded in the returned stream via protocol events and a
  *   final AssistantMessage with stopReason "error" or "aborted" and errorMessage.
  */
+export type AgentStreamOptions = SimpleStreamOptions;
+
 export type StreamFn = (
-	...args: Parameters<typeof streamSimple>
+	model: Model<any>,
+	context: Context,
+	options?: AgentStreamOptions,
 ) => ReturnType<typeof streamSimple> | Promise<ReturnType<typeof streamSimple>>;
 
 /**
@@ -204,6 +210,61 @@ export interface PrepareRequestContext extends AgentLoopNextActionContext {
 	deliveries: AgentLoopDelivery[];
 }
 
+/** Provider options frozen into a logical request before admission. */
+export type PreparedProviderStreamOptions = Omit<AgentStreamOptions, "signal" | "reportToolSetSnapshot">;
+
+/** Immutable, provider-bound request materialized before admission. */
+export interface PreparedProviderRequest {
+	/** Identity of this concrete materialization. */
+	readonly checkpointId: string;
+	/** Stable identity shared by every compaction successor. */
+	readonly requestId: string;
+	/** Zero-based materialization attempt. */
+	readonly attempt: number;
+	/** Agent run that originated the logical request. */
+	readonly runId: string;
+	/** Opaque host generation captured at materialization. */
+	readonly hostAuthority: unknown;
+	/** Exact post-transform and post-conversion context bound for the provider. */
+	readonly providerContext: Readonly<Context>;
+	/** Exact model bound for the provider request. */
+	readonly model: Model<any>;
+	/** Complete primary provider options, excluding the per-run abort signal and attestation sink. */
+	readonly streamOptions: Readonly<PreparedProviderStreamOptions>;
+	readonly completedTurn?: AgentLoopCompletedTurn;
+	readonly defaultAction: AgentLoopNextAction;
+	readonly requestAuthority: AgentRequestAuthority;
+	readonly reason: AgentLoopRequestReason;
+	/** Deliveries already finalized for this logical request. */
+	readonly deliveries: readonly AgentLoopDelivery[];
+}
+
+/** Typed host pause supported by prepared-request admission. */
+export interface AgentPreparedRequestPauseDecision {
+	readonly type: "pause";
+	readonly reason: "compaction";
+	readonly estimatedTokens: number;
+	readonly attempt: number;
+}
+
+/** Explicit admission result for an exact prepared provider request. */
+export type AgentPreparedRequestDecision = { readonly type: "admit" } | AgentPreparedRequestPauseDecision;
+
+/** Host-visible pause identity returned by an Agent run. */
+export interface AgentPreparedRequestPause extends AgentPreparedRequestPauseDecision {
+	readonly checkpointId: string;
+	readonly requestId: string;
+}
+
+/** Result of deriving and re-admitting a replacement transcript. */
+export type PreparedRequestReplacementResult =
+	| { readonly type: "admit"; readonly checkpoint: PreparedProviderRequest }
+	| {
+			readonly type: "pause";
+			readonly checkpoint: PreparedProviderRequest;
+			readonly pause: AgentPreparedRequestPause;
+	  };
+
 /** Replacement runtime state for an imminent provider request. */
 export interface AgentLoopRequestUpdate {
 	/** Context for the provider request. */
@@ -216,6 +277,14 @@ export interface AgentLoopRequestUpdate {
 
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
+	/** Stable identity of the Agent run materializing fresh requests. */
+	runId?: string;
+	/** Opaque host generation sampled for every materialization and consumption. */
+	getRequestAuthority?: () => unknown;
+	/** Already-admitted provider request streamed before dispatcher queue selection. */
+	preparedRequest?: PreparedProviderRequest;
+	/** Consume an admitted checkpoint immediately before provider streaming starts. */
+	consumePreparedRequest?: (checkpointId: string) => void;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
@@ -305,6 +374,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	prepareRequest?: (
 		context: PrepareRequestContext,
 	) => AgentLoopRequestUpdate | undefined | Promise<AgentLoopRequestUpdate | undefined>;
+
+	/** Admit or resumably pause the exact prepared request before turn_start. */
+	admitPreparedRequest?: (
+		request: PreparedProviderRequest,
+	) => AgentPreparedRequestDecision | undefined | Promise<AgentPreparedRequestDecision | undefined>;
 
 	/**
 	 * Tool execution mode.
@@ -420,6 +494,8 @@ export interface AgentState {
 export type AgentToolResult<T = unknown> = {
 	/** Text or image content returned to the model. */
 	content: (TextContent | ImageContent)[];
+	/** Tool-state mutation attributable to this completed result. */
+	toolSetTransition?: ToolSetTransition;
 	/** Marks a resolved final result as failed while preserving its structured content and details. */
 	isError?: boolean;
 	/** Controls whether the batch stops or performs one bounded tool-free response. */

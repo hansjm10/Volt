@@ -169,6 +169,7 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 		case "thinking_level_change":
 		case "fast_mode_change":
 		case "model_change":
+		case "active_tools_change":
 		case "custom":
 		case "label":
 		case "session_info":

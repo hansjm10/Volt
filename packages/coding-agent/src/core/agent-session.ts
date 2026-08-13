@@ -17,23 +17,31 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import type {
-	Agent,
-	AgentAbortSource,
-	AgentDelivery,
-	AgentDeliveryKind,
-	AgentDeliveryParticipantOutcome,
-	AgentDeliveryPreparation,
-	AgentDeliveryTransactionContext,
-	AgentDeliveryTransactionParticipant,
-	AgentEvent,
-	AgentLoopNextActionContext,
-	AgentMessage,
-	AgentRunResult,
-	AgentRunSnapshot,
-	AgentState,
-	AgentTool,
-	ThinkingLevel,
+import {
+	type Agent,
+	type AgentAbortSource,
+	type AgentDelivery,
+	type AgentDeliveryKind,
+	type AgentDeliveryParticipantOutcome,
+	type AgentDeliveryPreparation,
+	type AgentDeliveryTransactionContext,
+	type AgentDeliveryTransactionParticipant,
+	type AgentEvent,
+	type AgentMessage,
+	type AgentPreparedRequestDecision,
+	type AgentRunResult,
+	type AgentRunSnapshot,
+	type AgentState,
+	type AgentTool,
+	canonicalizeMessageReplacement,
+	createExplicitToolSelection,
+	deriveToolSelection,
+	getCanonicalToolSetSnapshotAuthority,
+	type PreparedProviderRequest,
+	type ThinkingLevel,
+	type ToolSelection,
+	toolSelectionsEqual,
+	UNKNOWN_TOOL_SET_SNAPSHOT_AUTHORITY,
 } from "@hansjm10/volt-agent-core";
 import type {
 	AssistantMessage,
@@ -43,6 +51,7 @@ import type {
 	Model,
 	SimpleStreamOptions,
 	TextContent,
+	Tool,
 	ToolCall,
 	ToolResultMessage,
 } from "@hansjm10/volt-ai";
@@ -205,6 +214,11 @@ export interface ActiveCompaction {
 	startedAt: number;
 }
 
+type ProactiveCompactionState =
+	| { phase: "idle" }
+	| { phase: "scheduled"; checkpointId: string }
+	| { phase: "compacting"; checkpointId: string };
+
 /**
  * One user message waiting in an agent queue.
  *
@@ -326,8 +340,10 @@ export interface AgentSessionConfig {
 	customTools?: ToolDefinition<any, any>[];
 	/** Model registry for API key resolution and model discovery */
 	modelRegistry: ModelRegistry;
-	/** Initial active built-in tool names. Default: read, bash, edit, write, web_search, and subagent when a manager is supplied. */
+	/** Initial configured baseline names when the default built-in baseline is disabled. */
 	initialActiveToolNames?: string[];
+	/** Rebuild the built-in portion of the baseline from current runtime capabilities. */
+	includeDefaultBuiltinTools?: boolean;
 	/** Optional allowlist of tool names. When provided, only these tool names are exposed. */
 	allowedToolNames?: string[];
 	/** Allow extension and SDK custom tools even when they are absent from allowedToolNames. */
@@ -580,7 +596,7 @@ export class AgentSession {
 	 * Coordinates the agent-loop stop with its mandatory compaction. A failed
 	 * compaction returns to idle but never resumes the interrupted run.
 	 */
-	private _proactiveCompactionState: "idle" | "scheduled" | "compacting" = "idle";
+	private _proactiveCompactionState: ProactiveCompactionState = { phase: "idle" };
 	private _drainFollowUpsOnNextContinuation = false;
 
 	// Branch summarization state
@@ -608,6 +624,9 @@ export class AgentSession {
 	private _agentDir: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
+	private _includeDefaultBuiltinTools: boolean;
+	private _runtimeBaselineToolNames: string[] = [];
+	private _toolSelection: ToolSelection = { kind: "inherit" };
 	private _allowedToolNames?: Set<string>;
 	private _allowUnlistedExtensionTools: boolean;
 	private _excludedToolNames?: Set<string>;
@@ -629,7 +648,6 @@ export class AgentSession {
 	private _planningState: PlanningState;
 	private _planningTransitionQueue: Promise<void> = Promise.resolve();
 	private _planningTransitionInFlight = false;
-	private _requestedBuildToolNames: string[] = [];
 	private _planningRuntimeInitialized = false;
 	/** Conversation generation whose successful read currently satisfies the Plan research gate. */
 	private _planResearchGeneration: number | undefined;
@@ -675,6 +693,8 @@ export class AgentSession {
 		this._planningState = clonePlanningState(restoredContext.planning);
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
+		this._includeDefaultBuiltinTools =
+			config.includeDefaultBuiltinTools ?? config.initialActiveToolNames === undefined;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
 		this._allowUnlistedExtensionTools = config.allowUnlistedExtensionTools ?? false;
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
@@ -698,11 +718,11 @@ export class AgentSession {
 		this._installAgentToolHooks();
 
 		this._buildRuntime({
-			activeToolNames: this._initialActiveToolNames,
+			baselineToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
 		this._planningRuntimeInitialized = true;
-		this._syncPlanningRuntime();
+		this._applyToolSelection(restoredContext.toolSelection);
 		this._recoverDurableQueuedClientInputs();
 	}
 
@@ -893,11 +913,28 @@ export class AgentSession {
 			};
 			return { messages, participant };
 		};
-		const nextAction = this.agent.nextAction;
-		this.agent.nextAction = async (context, signal) => {
+		const getRequestAuthority = this.agent.getRequestAuthority;
+		let upstreamAuthority = getRequestAuthority?.();
+		let conversationRevision = this._conversationGenerationRevision;
+		let combinedAuthority = {};
+		this.agent.getRequestAuthority = () => {
+			const nextUpstreamAuthority = getRequestAuthority?.();
+			if (
+				conversationRevision !== this._conversationGenerationRevision ||
+				!Object.is(upstreamAuthority, nextUpstreamAuthority)
+			) {
+				upstreamAuthority = nextUpstreamAuthority;
+				conversationRevision = this._conversationGenerationRevision;
+				combinedAuthority = {};
+			}
+			return combinedAuthority;
+		};
+		const admitPreparedRequest = this.agent.admitPreparedRequest;
+		this.agent.admitPreparedRequest = async (request, signal) => {
 			this._assertConversationAuthorityAvailable();
-			if (this._shouldStopForProactiveCompaction(context)) return { type: "stop" };
-			return nextAction ? await nextAction(context, signal) : context.defaultAction;
+			const decision = this._admitPreparedContinuation(request);
+			if (decision.type === "pause") return decision;
+			return (admitPreparedRequest ? await admitPreparedRequest(request, signal) : undefined) ?? decision;
 		};
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
 			this._assertConversationAuthorityAvailable();
@@ -1183,7 +1220,13 @@ export class AgentSession {
 		error?: Error;
 	}> {
 		this._assertConversationAuthorityAvailable();
-		const ownedMessages = messages.map((message, index) => cloneCanonicalData(message, `Delivery message ${index}`));
+		const ownedMessages = messages.map((message, index) =>
+			canonicalizeMessageReplacement(
+				cloneCanonicalData(message, `Delivery message ${index}`),
+				undefined,
+				UNKNOWN_TOOL_SET_SNAPSHOT_AUTHORITY,
+			),
+		);
 		if (!this._extensionRunner.hasHandlers("message_start") && !this._extensionRunner.hasHandlers("message_end")) {
 			return { messages: ownedMessages };
 		}
@@ -1196,7 +1239,13 @@ export class AgentSession {
 					message.role === "user" && replacement?.role === "user" && message.clientMessageId !== undefined
 						? { ...replacement, clientMessageId: message.clientMessageId }
 						: replacement;
-				prepared.push(identityPreservingReplacement ?? message);
+				prepared.push(
+					canonicalizeMessageReplacement(
+						message,
+						identityPreservingReplacement,
+						UNKNOWN_TOOL_SET_SNAPSHOT_AUTHORITY,
+					),
+				);
 			}
 			return { messages: prepared };
 		} catch (error) {
@@ -1579,7 +1628,7 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user" && event.deliveryId === undefined) {
 			this._overflowRecoveryAttempted = false;
-			this._proactiveCompactionState = "idle";
+			this._proactiveCompactionState = { phase: "idle" };
 			const queueEntryId = event.message.clientMessageId;
 			if (queueEntryId !== undefined) {
 				// Check steering queue first. Queue identity, never display text,
@@ -1752,7 +1801,14 @@ export class AgentSession {
 				: replacementCandidate;
 		const handledEvent =
 			normalizedEvent.type === "message_end" && runtimePreservingReplacement
-				? { ...normalizedEvent, message: runtimePreservingReplacement }
+				? {
+						...normalizedEvent,
+						message: canonicalizeMessageReplacement(
+							normalizedEvent.message,
+							runtimePreservingReplacement,
+							getCanonicalToolSetSnapshotAuthority(normalizedEvent.message),
+						),
+					}
 				: normalizedEvent;
 
 		if (!this._isConversationAuthorityAvailable()) {
@@ -2159,6 +2215,7 @@ export class AgentSession {
 		const abortAcceptance = this.agent.abort(source);
 		const runAfterAbort = this.agent.activeRunSnapshot;
 		this._disposed = true;
+		this._proactiveCompactionState = { phase: "idle" };
 
 		try {
 			// Persist terminal markers for in-flight tool calls before disconnecting.
@@ -2651,22 +2708,48 @@ export class AgentSession {
 	}
 
 	/**
-	 * Set active tools by name.
-	 * Only tools in the registry can be enabled. Unknown tool names are ignored.
-	 * Also rebuilds the system prompt to reflect the new tool set.
-	 * Changes take effect on the next agent turn.
+	 * Persist an explicit branch-local tool selection.
+	 * Every requested name must exist in the current registry. Registry refreshes
+	 * never rewrite this durable intent.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
 		this._assertConversationAuthorityAvailable();
+		const unknown = [...new Set(toolNames)].filter((name) => !this._toolRegistry.has(name));
+		if (unknown.length > 0) {
+			throw new Error(`Unknown tool(s): ${unknown.join(", ")}`);
+		}
+		const selection = createExplicitToolSelection(toolNames.filter((name) => !NATIVE_PLAN_TOOL_NAMES.has(name)));
+		if (!toolSelectionsEqual(this.sessionManager.buildSessionContext().toolSelection, selection)) {
+			this.sessionManager.appendActiveToolsChange(selection.requestedNames);
+		}
+		this._applyToolSelection(selection);
+	}
+
+	private _applyToolSelection(selection: ToolSelection): void {
+		this._toolSelection =
+			selection.kind === "inherit" ? selection : createExplicitToolSelection(selection.requestedNames);
 		if (this._planningRuntimeInitialized) {
-			this._requestedBuildToolNames = [...new Set(toolNames.filter((name) => !NATIVE_PLAN_TOOL_NAMES.has(name)))];
 			this._syncPlanningRuntime();
 			return;
 		}
-		this._setEffectiveToolsByName(toolNames);
+		const derived = deriveToolSelection(
+			this._toolRegistry,
+			this._runtimeBaselineToolNames,
+			this._toolSelection,
+			(tool) => this._isToolAvailableToCurrentModel(tool.name),
+		);
+		this._setEffectiveToolsByName(derived.effectiveNames);
 	}
 
-	private _setEffectiveToolsByName(toolNames: string[]): void {
+	private _getRequestedBuildToolNames(): string[] {
+		return deriveToolSelection(
+			this._toolRegistry,
+			this._runtimeBaselineToolNames,
+			this._toolSelection,
+		).requestedNames.filter((name) => !NATIVE_PLAN_TOOL_NAMES.has(name));
+	}
+
+	private _setEffectiveToolsByName(toolNames: readonly string[]): void {
 		const tools: AgentTool<any, any>[] = [];
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
@@ -2687,6 +2770,7 @@ export class AgentSession {
 		if (!this._planningRuntimeInitialized) {
 			return;
 		}
+		const requestedBuildToolNames = this._getRequestedBuildToolNames();
 		const effective = [
 			...new Set(
 				this._planningState.mode === "plan"
@@ -2694,17 +2778,19 @@ export class AgentSession {
 							isToolVisibleUnderGrant(this._getTrustedOperationResolver(name), RESEARCH_OPERATION_GRANT_PROFILE),
 						)
 					: this._planningState.plan?.phase === "active"
-						? [...this._requestedBuildToolNames, "update_plan_progress", "request_replan"]
-						: [...this._requestedBuildToolNames],
+						? [...requestedBuildToolNames, "update_plan_progress", "request_replan"]
+						: requestedBuildToolNames,
 			),
 		];
 		const availableEffective = effective.filter(
 			(name) => this._toolRegistry.has(name) && this._isToolAvailableToCurrentModel(name),
 		);
-		const active = this.getActiveToolNames();
+		const activeTools = this.agent.state.tools;
 		if (
-			active.length !== availableEffective.length ||
-			active.some((name, index) => name !== availableEffective[index])
+			activeTools.length !== availableEffective.length ||
+			activeTools.some(
+				(tool, index) => tool.name !== availableEffective[index] || this._toolRegistry.get(tool.name) !== tool,
+			)
 		) {
 			this._setEffectiveToolsByName(effective);
 		}
@@ -2727,24 +2813,7 @@ export class AgentSession {
 		}
 		this._directMcpToolNames = new Set(directDefinitions.map((definition) => definition.name));
 
-		const previouslyRequestedDirectTools = new Set(
-			this._requestedBuildToolNames.filter((name) => previousDirectToolNames.has(name)),
-		);
-		const requestedBuildTools = this._requestedBuildToolNames.filter((name) => !previousDirectToolNames.has(name));
-		for (const definition of directDefinitions) {
-			const wasPreviouslyAvailable = previousDirectToolNames.has(definition.name);
-			if (
-				wasPreviouslyAvailable
-					? previouslyRequestedDirectTools.has(definition.name)
-					: (this._allowedToolNames === undefined || this._allowedToolNames.has(definition.name)) &&
-						!this._excludedToolNames?.has(definition.name)
-			) {
-				requestedBuildTools.push(definition.name);
-			}
-		}
-		const requestedBuildToolNames = [...new Set(requestedBuildTools)];
-		this._refreshToolRegistry({ activeToolNames: requestedBuildToolNames });
-		this.setActiveToolsByName(requestedBuildToolNames.filter((name) => this._toolRegistry.has(name)));
+		this._refreshToolRegistry();
 	}
 
 	private _applyTrustedPlanningInstructionsToSystemPrompt(systemPrompt = this._baseSystemPrompt): void {
@@ -3669,7 +3738,7 @@ export class AgentSession {
 		) {
 			return;
 		}
-		this._proactiveCompactionState = "idle";
+		this._proactiveCompactionState = { phase: "idle" };
 		this._drainFollowUpsOnNextContinuation = false;
 		const run = (async () => {
 			this._agentConversationMutationInFlight = true;
@@ -3812,16 +3881,19 @@ export class AgentSession {
 		// cannot authorize an implicit retry; only a later explicit continuation can.
 		if (result.status === "delivery_failed") {
 			this._lastAssistantMessage = undefined;
+			this._proactiveCompactionState = { phase: "idle" };
 			this._settleRetry(false, result.failure.error.message);
 			return false;
 		}
 		// Disposal stops all continuations. Abort stops automatic retry/compaction
 		// resurrection, but intentionally preserves messages queued before abort.
 		if (this._disposed) {
+			this._proactiveCompactionState = { phase: "idle" };
 			return false;
 		}
 		if (abortGeneration !== this._abortGeneration) {
 			this._lastAssistantMessage = undefined;
+			this._proactiveCompactionState = { phase: "idle" };
 			this._settleRetry(false, "Retry cancelled");
 			return false;
 		}
@@ -3830,37 +3902,41 @@ export class AgentSession {
 			// persisted messages remain historical truth, but it cannot compact,
 			// retry, or continue against the newly selected branch.
 			this._lastAssistantMessage = undefined;
-			this._proactiveCompactionState = "idle";
+			this._proactiveCompactionState = { phase: "idle" };
 			this._settleRetry(false, "Conversation branch changed");
 			return false;
 		}
 		const conversationGenerationChanged = (): boolean =>
 			conversationGenerationRevision !== this._conversationGenerationRevision;
 		const abandonStaleConversationRun = (): false => {
-			this._proactiveCompactionState = "idle";
+			this._proactiveCompactionState = { phase: "idle" };
 			this._settleRetry(false, "Conversation branch changed");
 			return false;
 		};
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
-		if (!msg) {
-			return false;
-		}
-
-		if (this._proactiveCompactionState === "scheduled") {
-			this._proactiveCompactionState = "compacting";
-			// The run was interrupted mid-task by _shouldStopForProactiveCompaction,
-			// so resume it only after mandatory compaction succeeds. A failure
-			// rejects the prompt and leaves the durable transcript retryable.
+		if (result.status === "paused") {
+			if (
+				result.pause.reason !== "compaction" ||
+				this._proactiveCompactionState.phase !== "scheduled" ||
+				this._proactiveCompactionState.checkpointId !== result.pause.checkpointId
+			) {
+				this.agent.invalidatePreparedRequest(result.pause.checkpointId);
+				this._proactiveCompactionState = { phase: "idle" };
+				throw new Error("Prepared request pause did not match the scheduled compaction checkpoint");
+			}
+			this._proactiveCompactionState = {
+				phase: "compacting",
+				checkpointId: result.pause.checkpointId,
+			};
 			const shouldContinue = await this._runAutoCompaction("threshold", false, true);
 			if (conversationGenerationChanged()) {
+				this.agent.invalidatePreparedRequest();
 				return abandonStaleConversationRun();
 			}
-			if (!shouldContinue) {
-				return false;
-			}
-			return !this._disposed && abortGeneration === this._abortGeneration;
+			return shouldContinue && !this._disposed && abortGeneration === this._abortGeneration;
 		}
+		if (!msg) return false;
 
 		if (this._isRetryableError(msg)) {
 			const willRetry = await this._prepareRetry(msg, abortGeneration);
@@ -4788,6 +4864,7 @@ export class AgentSession {
 			return this._abortPromise;
 		}
 		this._abortGeneration += 1;
+		this._proactiveCompactionState = { phase: "idle" };
 		this.abortRetry();
 		this.abortCompaction();
 		const idlePromise = this.waitForIdle();
@@ -5081,12 +5158,12 @@ export class AgentSession {
 		};
 	}
 
-	private _getSummarizationThinkingLevel(): ThinkingLevel | undefined {
-		if (!this.model?.reasoning) {
+	private _getSummarizationThinkingLevel(model = this.model): ThinkingLevel | undefined {
+		if (!model?.reasoning) {
 			return undefined;
 		}
 
-		const level = clampThinkingLevel(this.model, "minimal");
+		const level = clampThinkingLevel(model, "minimal");
 		return level === "off" ? undefined : level;
 	}
 
@@ -5127,6 +5204,7 @@ export class AgentSession {
 			}
 		}
 		this.agent.state.messages = messages;
+		this._applyToolSelection(sessionContext.toolSelection);
 		const estimatedTokensAfter =
 			estimateMessagesTokens(messages) + estimateToolDefinitionTokens(this.agent.state.tools);
 
@@ -5295,7 +5373,7 @@ export class AgentSession {
 				fromExtension ? true : undefined,
 			);
 			await this.sessionManager.flush();
-			this._proactiveCompactionState = "idle";
+			this._proactiveCompactionState = { phase: "idle" };
 			const compactionResult = await this._finalizeCompaction(
 				summary,
 				firstKeptEntryId,
@@ -5346,45 +5424,56 @@ export class AgentSession {
 		this._branchSummaryAbortController?.abort();
 	}
 
-	/**
-	 * Agent-loop hook: stop the run after the current turn when live context
-	 * usage crosses the compaction threshold, so threshold compaction runs
-	 * mid-task instead of only after the full agent/tool loop finishes.
-	 * _handlePostAgentRun always resumes an interrupted run.
-	 *
-	 * Contract: must not throw.
-	 */
-	private _shouldStopForProactiveCompaction(context: AgentLoopNextActionContext): boolean {
-		try {
-			if (this._disposed) return false;
-			if (context.requestAuthority === "final_response") return false;
-			const hasQueuedMessages = this.agent.hasQueuedMessages();
-			if (context.completedTurn?.disposition === "stop" && hasQueuedMessages) {
-				this._drainFollowUpsOnNextContinuation = true;
-			}
-			if (this._proactiveCompactionState !== "idle" || !context.completedTurn) return false;
-			// Only interrupt turns that would otherwise continue with another LLM
-			// call. Queued steering/follow-up messages also force a continuation,
-			// including after a plain response or a terminating tool batch.
-			const willContinueForTools =
-				context.completedTurn.toolResults.length > 0 && context.completedTurn.disposition === "continue";
-			if (!willContinueForTools && !hasQueuedMessages) return false;
-			const message = context.completedTurn.message;
-			if (message.stopReason === "aborted" || message.stopReason === "error") return false;
-			const settings = this.settingsManager.getCompactionSettings();
-			if (!settings.enabled) return false;
-			const model = this.model;
-			if (!model || message.provider !== model.provider || message.model !== model.id) return false;
-			// Provider usage predates this turn's tool execution. Estimate from the
-			// live context so newly appended tool results are included before the
-			// loop starts another provider request.
-			const contextTokens = estimateContextTokens(context.context.messages, context.context.tools).tokens;
-			if (!shouldCompact(contextTokens, model.contextWindow ?? 0, settings)) return false;
-			this._proactiveCompactionState = "scheduled";
-			return true;
-		} catch {
-			return false;
+	/** Admit or pause the exact provider-bound continuation at the compaction threshold. */
+	private _admitPreparedContinuation(request: PreparedProviderRequest): AgentPreparedRequestDecision {
+		if (this._disposed || request.reason === "final_response") return { type: "admit" };
+		const isContinuation =
+			request.reason === "continuation" ||
+			(request.reason === "delivery" && request.completedTurn !== undefined && request.deliveries.length > 0);
+		if (request.completedTurn?.disposition === "stop" && request.deliveries.length > 0) {
+			this._drainFollowUpsOnNextContinuation = true;
 		}
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!settings.enabled || !request.completedTurn || !isContinuation) return { type: "admit" };
+		const message = request.completedTurn.message;
+		if (message.stopReason === "aborted" || message.stopReason === "error") return { type: "admit" };
+		if (message.provider !== request.model.provider || message.model !== request.model.id) return { type: "admit" };
+
+		const contextTokens = this._estimateContextWithImpendingTools(
+			request.providerContext.messages,
+			request.providerContext.tools,
+		).tokens;
+		if (!shouldCompact(contextTokens, request.model.contextWindow ?? 0, settings)) {
+			if (this._proactiveCompactionState.phase === "compacting") {
+				this._proactiveCompactionState = { phase: "idle" };
+			}
+			return { type: "admit" };
+		}
+		if (request.attempt > 0) {
+			const previousCheckpointId =
+				this._proactiveCompactionState.phase === "compacting"
+					? this._proactiveCompactionState.checkpointId
+					: undefined;
+			const previous = previousCheckpointId ? this.agent.getPreparedRequest(previousCheckpointId) : undefined;
+			const previousTokens = previous
+				? this._estimateContextWithImpendingTools(previous.providerContext.messages, previous.providerContext.tools)
+						.tokens
+				: undefined;
+			this._proactiveCompactionState = { phase: "idle" };
+			throw new Error(
+				previousTokens !== undefined && contextTokens >= previousTokens
+					? "Proactive compaction made no progress toward an admissible provider request"
+					: "Proactive compaction replacement remains above the admissible request threshold",
+			);
+		}
+		if (this._proactiveCompactionState.phase !== "idle") return { type: "admit" };
+		this._proactiveCompactionState = { phase: "scheduled", checkpointId: request.checkpointId };
+		return {
+			type: "pause",
+			reason: "compaction",
+			estimatedTokens: contextTokens,
+			attempt: request.attempt,
+		};
 	}
 
 	/**
@@ -5398,6 +5487,58 @@ export class AgentSession {
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 */
+	private _estimateContextWithImpendingTools(messages: AgentMessage[], tools: readonly Tool[] | undefined) {
+		let estimate = estimateContextTokens(messages);
+		if (estimate.lastUsageIndex !== null) {
+			const branchEntries = this.sessionManager.getBranch();
+			const latestCompaction = getLatestCompactionEntry(branchEntries);
+			if (latestCompaction) {
+				const compactionIndex = branchEntries.lastIndexOf(latestCompaction);
+				const hasPostCompactionUsage = branchEntries.slice(compactionIndex + 1).some((entry) => {
+					if (entry.type !== "message" || entry.message.role !== "assistant") return false;
+					const assistant = entry.message;
+					return (
+						assistant.stopReason !== "aborted" &&
+						assistant.stopReason !== "error" &&
+						calculateContextTokens(assistant.usage) > 0
+					);
+				});
+				if (!hasPostCompactionUsage) {
+					const tokens = estimateMessagesTokens(messages);
+					estimate = {
+						tokens,
+						usageTokens: 0,
+						trailingTokens: tokens,
+						lastUsageIndex: null,
+					};
+				}
+			}
+		}
+		if (estimate.lastUsageIndex === null) {
+			const toolTokens = estimateToolDefinitionTokens(tools);
+			return {
+				...estimate,
+				tokens: estimate.tokens + toolTokens,
+				trailingTokens: estimate.trailingTokens + toolTokens,
+			};
+		}
+
+		let baselineTokens = 0;
+		for (let index = estimate.lastUsageIndex; index >= 0; index--) {
+			const candidate = messages[index];
+			if (candidate.role === "assistant" && candidate.stopReason !== "error" && candidate.stopReason !== "aborted") {
+				baselineTokens = candidate.toolSetSnapshot?.estimatedTokens ?? 0;
+				break;
+			}
+		}
+		const definitionGrowth = Math.max(0, estimateToolDefinitionTokens(tools) - baselineTokens);
+		return {
+			...estimate,
+			tokens: estimate.tokens + definitionGrowth,
+			trailingTokens: estimate.trailingTokens + definitionGrowth,
+		};
+	}
+
 	private async _checkCompaction(
 		assistantMessage: AssistantMessage,
 		skipAbortedCheck = true,
@@ -5456,7 +5597,7 @@ export class AgentSession {
 		// context so tool results and other messages appended after provider usage
 		// are included. For error messages, require a prior successful usage source.
 		const messages = this.agent.state.messages;
-		const estimate = estimateContextTokens(messages, this.agent.state.tools);
+		const estimate = this._estimateContextWithImpendingTools(messages, this.agent.state.tools);
 		let contextTokens: number;
 		if (assistantMessage.stopReason === "error") {
 			if (estimate.lastUsageIndex === null) return false; // No usage data at all
@@ -5525,19 +5666,39 @@ export class AgentSession {
 		try {
 			this._emit({ type: "compaction_start", reason });
 			assertConversationCurrent();
-			if (!this.model) {
+			const proactiveCheckpointId =
+				this._proactiveCompactionState.phase === "compacting"
+					? this._proactiveCompactionState.checkpointId
+					: undefined;
+			const proactiveRequest = proactiveCheckpointId
+				? this.agent.getPreparedRequest(proactiveCheckpointId)
+				: undefined;
+			if (proactiveCheckpointId && !proactiveRequest) {
+				throw new Error("Proactive compaction checkpoint is stale");
+			}
+			const compactionModel = proactiveRequest?.model ?? this.model;
+			if (!compactionModel) {
 				throw new Error("Auto-compaction requires a selected model");
 			}
 
-			const { apiKey, headers, env } = await this._getCompactionRequestAuth(this.model);
+			const { apiKey, headers, env } = await this._getCompactionRequestAuth(compactionModel);
 			assertConversationCurrent();
 
 			const pathEntries = this.sessionManager.getBranch();
-
-			const preparation = prepareCompaction(pathEntries, settings, {
-				tools: this.agent.state.tools,
-				contextWindow: this.model.contextWindow,
+			const compactionTools = proactiveRequest?.providerContext.tools ?? this.agent.state.tools;
+			let preparation = prepareCompaction(pathEntries, settings, {
+				tools: compactionTools,
+				contextWindow: compactionModel.contextWindow,
 			});
+			if (preparation && proactiveRequest) {
+				preparation = {
+					...preparation,
+					tokensBefore: this._estimateContextWithImpendingTools(
+						proactiveRequest.providerContext.messages,
+						proactiveRequest.providerContext.tools,
+					).tokens,
+				};
+			}
 			if (!preparation) {
 				throw new Error("Auto-compaction could not find a safe compaction boundary");
 			}
@@ -5581,12 +5742,12 @@ export class AgentSession {
 				assertConversationCurrent();
 				const compactResult = await compact(
 					preparation,
-					this.model,
+					compactionModel,
 					apiKey,
 					headers,
 					undefined,
 					this._autoCompactionAbortController.signal,
-					this._getSummarizationThinkingLevel(),
+					this._getSummarizationThinkingLevel(compactionModel),
 					this.agent.streamFn,
 					env,
 					this._getSummarizationRetryOptions(),
@@ -5599,6 +5760,7 @@ export class AgentSession {
 			}
 
 			if (this._autoCompactionAbortController.signal.aborted) {
+				this._proactiveCompactionState = { phase: "idle" };
 				this._emit({
 					type: "compaction_end",
 					reason,
@@ -5617,7 +5779,6 @@ export class AgentSession {
 				fromExtension ? true : undefined,
 			);
 			await this.sessionManager.flush();
-			this._proactiveCompactionState = "idle";
 			const result = await this._finalizeCompaction(
 				summary,
 				firstKeptEntryId,
@@ -5627,15 +5788,28 @@ export class AgentSession {
 				willRetry,
 				assertConversationCurrent,
 			);
+			let preparedSuccessorAdmitted = false;
+			if (proactiveCheckpointId) {
+				const replacement = await this.agent.replacePreparedRequestMessages(
+					proactiveCheckpointId,
+					this.agent.state.messages,
+				);
+				if (replacement.type !== "admit") {
+					this.agent.invalidatePreparedRequest(replacement.checkpoint.checkpointId);
+					throw new Error("Proactive compaction produced a second paused provider checkpoint");
+				}
+				preparedSuccessorAdmitted = true;
+			}
+			this._proactiveCompactionState = { phase: "idle" };
 			this._emit({
 				type: "compaction_end",
 				reason,
 				result,
 				aborted: false,
-				willRetry: canContinue() && (willRetry || continueAfterCompaction),
+				willRetry: canContinue() && (preparedSuccessorAdmitted || willRetry || continueAfterCompaction),
 			});
 
-			if (willRetry || continueAfterCompaction) {
+			if (preparedSuccessorAdmitted || willRetry || continueAfterCompaction) {
 				return true;
 			}
 
@@ -5643,6 +5817,10 @@ export class AgentSession {
 			// Continue once so queued messages are delivered.
 			return this.agent.hasQueuedMessages();
 		} catch (error) {
+			if (this._proactiveCompactionState.phase !== "idle") {
+				this.agent.invalidatePreparedRequest(this._proactiveCompactionState.checkpointId);
+			}
+			this._proactiveCompactionState = { phase: "idle" };
 			if (conversationGenerationAssertionFailed) {
 				this._emit({
 					type: "compaction_end",
@@ -5678,7 +5856,6 @@ export class AgentSession {
 			}
 			throw error;
 		} finally {
-			this._proactiveCompactionState = "idle";
 			this._activeCompaction = undefined;
 			this._autoCompactionAbortController = undefined;
 		}
@@ -5876,6 +6053,7 @@ export class AgentSession {
 					this.sessionManager.appendLabelChange(entryId, label);
 				},
 				getActiveTools: () => this.getActiveToolNames(),
+				getActiveToolDefinitions: () => [...this.agent.state.tools],
 				getAllTools: () => this.getAllTools(),
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
 				refreshTools: () => this._refreshToolRegistry(),
@@ -5932,11 +6110,12 @@ export class AgentSession {
 		);
 	}
 
-	private _refreshToolRegistry(options?: { activeToolNames?: string[]; includeAllExtensionTools?: boolean }): void {
+	private _refreshToolRegistry(options?: {
+		baselineToolNames?: readonly string[];
+		includeAllExtensionTools?: boolean;
+	}): void {
 		const previousRegistryNames = new Set(this._toolRegistry.keys());
-		const previousActiveToolNames = this._planningRuntimeInitialized
-			? [...this._requestedBuildToolNames]
-			: this.getActiveToolNames();
+		const previousBaselineToolNames = [...this._runtimeBaselineToolNames];
 		const allowedToolNames = this._allowedToolNames;
 		const allowUnlistedExtensionTools = this._allowUnlistedExtensionTools;
 		const excludedToolNames = this._excludedToolNames;
@@ -6009,38 +6188,40 @@ export class AgentSession {
 		}
 		this._toolRegistry = toolRegistry;
 
-		const nextActiveToolNames = (
-			options?.activeToolNames ? [...options.activeToolNames] : [...previousActiveToolNames]
-		).filter((name) => this._toolRegistry.has(name));
+		const nextBaselineToolNames = [...new Set(options?.baselineToolNames ?? previousBaselineToolNames)].filter(
+			(name) => this._toolRegistry.has(name),
+		);
 
 		if (allowedToolNames) {
 			for (const toolName of this._toolRegistry.keys()) {
-				if (allowedToolNames.has(toolName)) {
-					nextActiveToolNames.push(toolName);
-				}
+				if (allowedToolNames.has(toolName)) nextBaselineToolNames.push(toolName);
 			}
 			if (allowUnlistedExtensionTools) {
-				for (const tool of wrappedExtensionTools) {
-					nextActiveToolNames.push(tool.name);
-				}
+				for (const tool of wrappedExtensionTools) nextBaselineToolNames.push(tool.name);
 			}
-		} else if (options?.includeAllExtensionTools) {
+		} else {
 			for (const tool of wrappedExtensionTools) {
-				nextActiveToolNames.push(tool.name);
-			}
-		} else if (!options?.activeToolNames) {
-			for (const toolName of this._toolRegistry.keys()) {
-				if (!previousRegistryNames.has(toolName)) {
-					nextActiveToolNames.push(toolName);
+				if (options?.includeAllExtensionTools || !previousRegistryNames.has(tool.name)) {
+					nextBaselineToolNames.push(tool.name);
 				}
+			}
+			if (nextBaselineToolNames.includes("mcp")) {
+				for (const name of this._directMcpToolNames) nextBaselineToolNames.push(name);
 			}
 		}
 
-		const resolvedRequestedToolNames = [...new Set(nextActiveToolNames)];
-		if (!this._planningRuntimeInitialized) {
-			this._requestedBuildToolNames = resolvedRequestedToolNames.filter((name) => !NATIVE_PLAN_TOOL_NAMES.has(name));
+		this._runtimeBaselineToolNames = [...new Set(nextBaselineToolNames)];
+		if (this._planningRuntimeInitialized) {
+			this._syncPlanningRuntime();
+		} else {
+			const derived = deriveToolSelection(
+				this._toolRegistry,
+				this._runtimeBaselineToolNames,
+				this._toolSelection,
+				(tool) => this._isToolAvailableToCurrentModel(tool.name),
+			);
+			this._setEffectiveToolsByName(derived.effectiveNames);
 		}
-		this.setActiveToolsByName(resolvedRequestedToolNames);
 	}
 
 	/**
@@ -6093,7 +6274,7 @@ export class AgentSession {
 	}
 
 	private _buildRuntime(options: {
-		activeToolNames?: string[];
+		baselineToolNames?: readonly string[];
 		flagValues?: Map<string, boolean | string>;
 		includeAllExtensionTools?: boolean;
 	}): void {
@@ -6282,9 +6463,11 @@ export class AgentSession {
 					...directMcpToolDefinitions.map((definition) => definition.name),
 					...(this._lspManager ? ["lsp"] : []),
 				];
-		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
+		const baseBaselineToolNames = this._includeDefaultBuiltinTools
+			? defaultActiveToolNames
+			: (options.baselineToolNames ?? this._initialActiveToolNames ?? []);
 		this._refreshToolRegistry({
-			activeToolNames: baseActiveToolNames,
+			baselineToolNames: baseBaselineToolNames,
 			includeAllExtensionTools: options.includeAllExtensionTools,
 		});
 	}
@@ -6306,27 +6489,12 @@ export class AgentSession {
 			this._modelRegistry.clearRegisteredProviders();
 			await this._resourceLoader.reload();
 			await this._reloadMcpManager();
-			const activeToolNames = this._planningRuntimeInitialized
-				? [...this._requestedBuildToolNames]
-				: this.getActiveToolNames();
-			if (this._mcpManager?.isEnabled() && !this._allowedToolNames && !this._excludedToolNames?.has("mcp")) {
-				if (!activeToolNames.includes("mcp")) {
-					activeToolNames.push("mcp");
-				}
-				for (const candidate of this._mcpManager.getDirectToolCandidates()) {
-					if (
-						!this._excludedToolNames?.has(candidate.directToolName) &&
-						!activeToolNames.includes(candidate.directToolName)
-					) {
-						activeToolNames.push(candidate.directToolName);
-					}
-				}
-			}
 			this._buildRuntime({
-				activeToolNames,
+				baselineToolNames: this._initialActiveToolNames,
 				flagValues: previousFlagValues,
 				includeAllExtensionTools: true,
 			});
+			this._applyToolSelection(this.sessionManager.buildSessionContext().toolSelection);
 			this._refreshCurrentModelFromRegistry();
 
 			const hasBindings =
@@ -6920,7 +7088,7 @@ export class AgentSession {
 				: this._clampThinkingLevel(restoredThinkingLevel, availableThinkingLevels);
 			this._restoreFastModePolicy(sessionContext.fastMode);
 			this._planningState = clonePlanningState(sessionContext.planning);
-			this._syncPlanningRuntime();
+			this._applyToolSelection(sessionContext.toolSelection);
 			if (JSON.stringify(previousPlanningState) !== JSON.stringify(this._planningState)) {
 				this._emit({ type: "planning_state_changed", planning: this.planningState });
 			}
@@ -7075,7 +7243,7 @@ export class AgentSession {
 			}
 		}
 
-		const estimate = estimateContextTokens(this.messages, this.agent.state.tools);
+		const estimate = this._estimateContextWithImpendingTools(this.messages, this.agent.state.tools);
 		const percent = (estimate.tokens / contextWindow) * 100;
 
 		return {

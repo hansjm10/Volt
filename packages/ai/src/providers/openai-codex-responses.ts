@@ -33,10 +33,12 @@ import type {
 	Usage,
 } from "../types.ts";
 import { combineAbortSignals } from "../utils/abort-signals.ts";
+import { splitDeferredTools, supportsOpenAIToolSearch } from "../utils/deferred-tools.ts";
 import type { AssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { createAssistantMessageDiagnostic, formatThrownValue } from "../utils/diagnostics.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
+import { createToolSetSnapshot } from "../utils/tool-state.ts";
 import { getFastInferenceServiceTier } from "./openai-fast-inference.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import {
@@ -44,6 +46,7 @@ import {
 	convertResponsesTools,
 	type ProcessResponsesStreamResult,
 	processResponsesStream,
+	transformResponsesMessages,
 } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
@@ -239,7 +242,10 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			const accountId = extractAccountId(apiKey);
 			let body = buildRequestBody(model, context, options);
 			const nextBody = await options?.onPayload?.(body, model);
-			if (nextBody !== undefined) {
+			if (nextBody === undefined) {
+				options?.reportToolSetSnapshot?.({ kind: "known", snapshot: createToolSetSnapshot(context.tools) });
+			} else {
+				options?.reportToolSetSnapshot?.({ kind: "unknown" });
 				body = nextBody as RequestBody;
 			}
 			const websocketRequestId = options?.sessionId || createCodexRequestId();
@@ -446,8 +452,16 @@ function buildRequestBody(
 	context: Context,
 	options?: OpenAICodexResponsesOptions,
 ): RequestBody {
+	const transformedMessages = transformResponsesMessages(model, context.messages, CODEX_TOOL_CALL_PROVIDERS);
+	const toolPlacement = splitDeferredTools(
+		{ ...context, messages: transformedMessages },
+		supportsOpenAIToolSearch(model),
+	);
 	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
 		includeSystemPrompt: false,
+		transformedMessages,
+		deferredToolAnchors: toolPlacement.anchors,
+		deferredToolStrict: null,
 	});
 
 	const body: RequestBody = {
@@ -471,8 +485,8 @@ function buildRequestBody(
 		body.service_tier = options.serviceTier;
 	}
 
-	if (context.tools && context.tools.length > 0) {
-		body.tools = convertResponsesTools(context.tools, { strict: null });
+	if (toolPlacement.immediate.length > 0) {
+		body.tools = convertResponsesTools(toolPlacement.immediate, { strict: null });
 	}
 
 	if (options?.reasoningEffort !== undefined) {

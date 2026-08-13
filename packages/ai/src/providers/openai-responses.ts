@@ -13,13 +13,20 @@ import type {
 	StreamOptions,
 	Usage,
 } from "../types.ts";
+import { splitDeferredTools, supportsOpenAIToolSearch } from "../utils/deferred-tools.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { createToolSetSnapshot } from "../utils/tool-state.ts";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { applyOpenAIPriorityPricing, getFastInferenceServiceTier } from "./openai-fast-inference.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import {
+	convertResponsesMessages,
+	convertResponsesTools,
+	processResponsesStream,
+	transformResponsesMessages,
+} from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -43,6 +50,7 @@ function getCompat(model: Model<"openai-responses">): Required<OpenAIResponsesCo
 		supportsDeveloperRole: model.compat?.supportsDeveloperRole ?? true,
 		sendSessionIdHeader: model.compat?.sendSessionIdHeader ?? true,
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
+		supportsToolSearch: supportsOpenAIToolSearch(model),
 	};
 }
 
@@ -114,7 +122,10 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId, options?.env);
 			let params = buildParams(model, context, options);
 			const nextParams = await options?.onPayload?.(params, model);
-			if (nextParams !== undefined) {
+			if (nextParams === undefined) {
+				options?.reportToolSetSnapshot?.({ kind: "known", snapshot: createToolSetSnapshot(context.tools) });
+			} else {
+				options?.reportToolSetSnapshot?.({ kind: "unknown" });
 				params = nextParams as ResponseCreateParamsStreaming;
 			}
 			const requestOptions = {
@@ -225,10 +236,15 @@ function createClient(
 }
 
 function buildParams(model: Model<"openai-responses">, context: Context, options?: OpenAIResponsesOptions) {
-	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS);
+	const compat = getCompat(model);
+	const transformedMessages = transformResponsesMessages(model, context.messages, OPENAI_TOOL_CALL_PROVIDERS);
+	const toolPlacement = splitDeferredTools({ ...context, messages: transformedMessages }, compat.supportsToolSearch);
+	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
+		transformedMessages,
+		deferredToolAnchors: toolPlacement.anchors,
+	});
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
-	const compat = getCompat(model);
 	const params: ResponseCreateParamsStreaming = {
 		model: model.id,
 		input: messages,
@@ -250,8 +266,8 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		params.service_tier = options.serviceTier;
 	}
 
-	if (context.tools && context.tools.length > 0) {
-		params.tools = convertResponsesTools(context.tools);
+	if (toolPlacement.immediate.length > 0) {
+		params.tools = convertResponsesTools(toolPlacement.immediate);
 	}
 
 	if (model.reasoning) {

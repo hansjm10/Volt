@@ -344,6 +344,7 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 			case "thinking_level_change":
 			case "fast_mode_change":
 			case "model_change":
+			case "active_tools_change":
 			case "compaction":
 			case "branch_summary":
 			case "custom":
