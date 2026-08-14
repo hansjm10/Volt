@@ -227,6 +227,60 @@ describe("AgentSessionRuntime characterization", () => {
 		});
 	});
 
+	it("fails the run when an extension replacement crosses a tool-result role boundary", async () => {
+		const { runtime, faux } = await createRuntimeForTest((volt: ExtensionAPI) => {
+			volt.on("message_end", (event) => {
+				if (event.message.role !== "toolResult") return;
+				return {
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "invalid replacement" }],
+						timestamp: Date.now(),
+					},
+				};
+			});
+		});
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("missing_tool", {}, { id: "tool-result-mismatch" }), {
+				stopReason: "toolUse",
+			}),
+		]);
+
+		await expect(runtime.session.prompt("hello")).rejects.toMatchObject({
+			code: "extension_message_role_mismatch",
+			expectedRole: "toolResult",
+			receivedRole: "user",
+		});
+		expect(faux.state.callCount).toBe(1);
+	});
+
+	it("fails the run when an extension replacement crosses a custom-message role boundary", async () => {
+		const { runtime, faux } = await createRuntimeForTest((volt: ExtensionAPI) => {
+			volt.on("message_end", (event) => {
+				if (event.message.role !== "custom") return;
+				return {
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "invalid replacement" }],
+						timestamp: Date.now(),
+					},
+				};
+			});
+		});
+
+		await expect(
+			runtime.session.sendCustomMessage(
+				{ customType: "role-mismatch", content: "custom turn", display: true },
+				{ triggerTurn: true },
+			),
+		).rejects.toMatchObject({
+			code: "extension_message_role_mismatch",
+			expectedRole: "custom",
+			receivedRole: "user",
+		});
+		expect(faux.state.callCount).toBe(0);
+	});
+
 	it("uses a functional message_end replacement for retry classification", async () => {
 		let replaced = false;
 		const { runtime, faux } = await createRuntimeForTest((volt: ExtensionAPI) => {

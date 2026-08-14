@@ -522,12 +522,12 @@ describe("native planning state", () => {
 			await run;
 
 			expect(request).toBe(4);
-			expect(requestContexts[0]!.tools).toContain("mutate_everything");
-			expect(requestContexts[0]!.tools).not.toContain("update_plan");
-			expect(requestContexts[1]!.systemPrompt).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
-			expect(requestContexts[1]!.tools).toContain("update_plan");
-			expect(requestContexts[1]!.tools).toContain("submit_plan");
-			expect(requestContexts[1]!.tools).not.toContain("mutate_everything");
+			for (const requestContext of requestContexts) {
+				expect(requestContext.systemPrompt).toContain("[VOLT PLAN MODE — TRUSTED HOST POLICY]");
+				expect(requestContext.tools).toContain("update_plan");
+				expect(requestContext.tools).toContain("submit_plan");
+				expect(requestContext.tools).not.toContain("mutate_everything");
+			}
 			expect(session.planningState).toMatchObject({
 				mode: "plan",
 				plan: {
