@@ -1615,11 +1615,11 @@ export class AgentHarness<
 	}
 
 	async abort(source?: AgentAbortSource): Promise<AbortResult> {
+		this.requestAbort(source);
 		const clearedSteer = cloneAgentMessages(this.revokeDeliveries("steer").flatMap((delivery) => delivery.messages));
 		const clearedFollowUp = cloneAgentMessages(
 			this.revokeDeliveries("followUp").flatMap((delivery) => delivery.messages),
 		);
-		this.requestAbort(source);
 		const errors: Error[] = [];
 		try {
 			await this.emitQueueUpdate();

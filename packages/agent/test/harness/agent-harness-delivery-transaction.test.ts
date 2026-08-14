@@ -380,6 +380,57 @@ describe("AgentHarness delivery transactions", () => {
 		expect(getUserTexts((await session.buildContext()).messages as AgentMessage[])).toEqual(["commit reentrantly"]);
 	});
 
+	it("records the outer abort source before revocation callbacks can abort reentrantly", async () => {
+		const settlementStarted = deferred();
+		const releaseSettlement = deferred();
+		const revocationObserved = deferred();
+		let acceptance: { runId: string | undefined; accepted: boolean; source: string | undefined } | undefined;
+		let reentrantAbort: ReturnType<AgentHarness["abort"]> | undefined;
+		let harness: AgentHarness;
+		const created = createHarness({
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				participant: {
+					settle: async (context) => {
+						settlementStarted.resolve();
+						await releaseSettlement.promise;
+						acceptance = context.requestAbort("host_action");
+						return { outcome: "committed" };
+					},
+				},
+			}),
+			deliveryRevoked: () => {
+				reentrantAbort = harness.abort("disposal");
+				revocationObserved.resolve();
+			},
+		});
+		harness = created.harness;
+		created.registration.setResponses([() => fauxAssistantMessage("unexpected")]);
+		let queued = false;
+		harness.subscribe(async (event) => {
+			if (event.type === "agent_start" && !queued) {
+				queued = true;
+				await harness.followUp("revoke during abort");
+			}
+		});
+
+		const prompting = harness.runPrompt("commit while aborting");
+		await settlementStarted.promise;
+		const outerAbort = harness.abort("remote_request");
+		await revocationObserved.promise;
+		releaseSettlement.resolve();
+
+		const result = await prompting;
+		await Promise.all([outerAbort, reentrantAbort]);
+		expect(acceptance).toMatchObject({ accepted: true, source: "remote_request" });
+		expect(result).toMatchObject({
+			deliveries: [{ outcome: "committed" }, { kind: "followUp", outcome: "revoked" }],
+			response: { stopReason: "aborted" },
+		});
+		expect(created.registration.state.callCount).toBe(0);
+		expect(harness.hasQueuedMessages()).toBe(false);
+	});
+
 	it("preserves a committed FIFO prefix when a later participant retains", async () => {
 		let retainSecond = true;
 		let settlementCalls = 0;
