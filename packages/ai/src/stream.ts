@@ -64,6 +64,12 @@ export function streamSimple<TApi extends Api>(
 	return provider.streamSimple(model, context, withEnvApiKey(model, options));
 }
 
+/**
+ * Return the final message from the globally registered provider's simple stream.
+ *
+ * This does not apply a caller-owned or injected stream policy. Runtimes that own a stream function should invoke it
+ * and await the stream's result instead.
+ */
 export async function completeSimple<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,

@@ -332,6 +332,7 @@ interface AgentHarnessTurnState<
 /**
  * Coordinates runtime policy, provider dispatch, queues, lifecycle, and persistence around the stateless agent loop.
  * Session owns canonical history, while structural helpers own summarization mechanics behind Harness-wrapped streams.
+ * All model requests, including structural work, use the Harness policy stream rather than direct completion helpers.
  * Assistant-tail no-op continuations return before model-backed turn snapshots are created.
  */
 export class AgentHarness<
