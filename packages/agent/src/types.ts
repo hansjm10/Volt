@@ -130,6 +130,74 @@ export interface AgentRunSnapshot {
 	readonly phase: "open" | "terminal_event_settling" | "settled";
 }
 
+/** Delivery class used by the Agent-owned inbox. */
+export type AgentDeliveryKind = "prompt" | "steer" | "followUp";
+
+/** Stable pending delivery passed to `prepareDelivery`. */
+export interface AgentDelivery {
+	/** Runtime inbox identity; never substitutes for an ID carried by a message. */
+	readonly deliveryId: string;
+	readonly kind: AgentDeliveryKind;
+	readonly messages: readonly AgentMessage[];
+}
+
+/** Result returned by a host participant after Agent crosses the revocation cutoff. */
+export type AgentDeliveryParticipantOutcome =
+	| { readonly outcome: "committed" }
+	| { readonly outcome: "retained"; readonly error: Error }
+	| { readonly outcome: "terminally_failed"; readonly error: Error };
+
+/** Reentrant-safe lifecycle capability available only while participant work settles. */
+export interface AgentDeliveryTransactionContext {
+	/** Record abort intent without awaiting the Agent run that invoked this participant. */
+	requestAbort(source?: AgentAbortSource): AgentAbortAcceptance;
+}
+
+/** Host durability work attached to one Agent-owned delivery attempt. */
+export interface AgentDeliveryTransactionParticipant {
+	/**
+	 * Settle Agent's commit decision exactly once.
+	 *
+	 * Throwing or rejecting is classified as `terminally_failed`; safe replay
+	 * requires an explicit `retained` result.
+	 */
+	settle(
+		context: AgentDeliveryTransactionContext,
+	): AgentDeliveryParticipantOutcome | Promise<AgentDeliveryParticipantOutcome>;
+}
+
+/** Side-effect-free messages plus work settled only after delivery ownership transfers. */
+export interface AgentDeliveryPreparation {
+	messages: AgentMessage[];
+	participant?: AgentDeliveryTransactionParticipant;
+}
+
+interface AgentDeliveryAttemptBase {
+	readonly deliveryId: string;
+	readonly kind: AgentDeliveryKind;
+}
+
+export type AgentDeliveryFailure = AgentDeliveryAttemptBase &
+	(
+		| { readonly outcome: "retained"; readonly phase: "preparation" | "settlement"; readonly error: Error }
+		| { readonly outcome: "terminally_failed"; readonly phase: "settlement"; readonly error: Error }
+	);
+
+/** Explicit terminal result for one Agent-owned delivery attempt. */
+export type AgentDeliveryAttemptResult =
+	| (AgentDeliveryAttemptBase & { readonly outcome: "committed" | "revoked" })
+	| (AgentDeliveryAttemptBase & { readonly outcome: "retained" })
+	| AgentDeliveryFailure;
+
+/** Explicit outcome of one bounded Agent run. */
+export type AgentRunResult =
+	| { readonly status: "completed"; readonly deliveries: readonly AgentDeliveryAttemptResult[] }
+	| {
+			readonly status: "delivery_failed";
+			readonly deliveries: readonly AgentDeliveryAttemptResult[];
+			readonly failure: AgentDeliveryFailure;
+	  };
+
 /** Disposition requested by a finalized tool result. */
 export type AgentToolDisposition = "stop" | "final_response";
 

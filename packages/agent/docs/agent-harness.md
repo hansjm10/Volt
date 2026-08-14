@@ -4,6 +4,22 @@
 
 This document describes the current direction and implemented behavior. Some extension/session-facade details are planned and called out explicitly.
 
+## Target ownership boundary
+
+The intended runtime ownership model is:
+
+- `agent-loop.ts` is the stateless execution kernel.
+- `AgentHarness` is the sole reusable stateful orchestrator above that kernel.
+- Coding Agent's `AgentSession` owns Volt-specific policy and runs through `AgentHarness` rather than the legacy `Agent` wrapper.
+
+`Agent` remains a supported transitional API. It can be retired only after all of these gates are met:
+
+1. Coding Agent runs through `AgentHarness`.
+2. `AgentHarness` has parity for transactional delivery and the current lifecycle and abort semantics.
+3. No production code constructs or exposes `Agent`.
+
+After those gates are met, remove `agent.ts`, its package-root export, wrapper-only tests, and its public documentation together. Until then, keep the current README and public API unchanged.
+
 ## Ultimate lifecycle goal
 
 Harness listeners and hooks should be able to close over the `AgentHarness` instance and call public harness APIs from any event where those APIs are documented as allowed. Those calls must not corrupt in-flight turn snapshots, reorder persisted transcript entries, lose pending writes, deadlock settlement, or leave the harness in the wrong phase.
