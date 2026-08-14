@@ -330,7 +330,7 @@ describe("regression #199: abort provenance persistence", () => {
 				return fauxAssistantMessage("late response");
 			},
 		]);
-		const abortSpy = vi.spyOn(harness.session.agent, "abort");
+		const abortSpy = vi.spyOn(harness.session, "abort");
 
 		const prompt = harness.session.prompt("compact this active run");
 		await responseStarted.promise;
@@ -355,7 +355,7 @@ describe("regression #199: abort provenance persistence", () => {
 				return fauxAssistantMessage("late response");
 			},
 		]);
-		const abortSpy = vi.spyOn(harness.session.agent, "abort");
+		const abortSpy = vi.spyOn(harness.session, "abort");
 
 		const prompt = harness.session.prompt("compact this RPC run");
 		await responseStarted.promise;

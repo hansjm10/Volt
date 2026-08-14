@@ -230,7 +230,8 @@ function makeSession(sessionId: string, sessionManager = SessionManager.inMemory
 	return {
 		bindExtensions: vi.fn(async () => {}),
 		subscribe: vi.fn(() => vi.fn()),
-		agent: { subscribe: vi.fn(() => vi.fn()), state: { pendingToolExecutions: new Map() } },
+		activeToolExecutions: new Map(),
+		subscribeRuntimeEvents: vi.fn(() => vi.fn()),
 		isStreaming: false,
 		isCompacting: false,
 		thinkingLevel: "off",

@@ -47,7 +47,7 @@ describe("issue #25 trailing tool-result compaction", () => {
 			isError: false,
 			timestamp: Date.now(),
 		});
-		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		harness.session.state.messages = harness.sessionManager.buildSessionContext().messages;
 
 		const result = await harness.session.compact();
 

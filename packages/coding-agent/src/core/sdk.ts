@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { Agent, type AgentMessage, type ThinkingLevel } from "@hansjm10/volt-agent-core";
+import type { AgentHarnessStreamOptions, AgentMessage, StreamFn, ThinkingLevel } from "@hansjm10/volt-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@hansjm10/volt-ai";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -291,7 +291,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const existingBranch = sessionManager.getBranch();
 	const hasExistingSessionState = existingBranch.length > 0;
 	const isNewSession = !hasExistingSessionState || options.sessionStartEvent?.reason === "new";
-	const hasExistingMessages = existingSession.messages.length > 0;
 	const hasThinkingEntry = existingBranch.some((entry) => entry.type === "thinking_level_change");
 
 	let model = options.model;
@@ -403,8 +402,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		options.tools ? [...options.tools] : options.noTools ? [] : defaultActiveToolNames
 	).filter((name) => !excludedToolNameSet?.has(name));
 
-	let agent: Agent;
-
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
 		const converted = convertToLlm(messages);
@@ -444,80 +441,44 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	agent = new Agent({
-		initialState: {
-			systemPrompt: "",
-			model,
-			thinkingLevel,
-			tools: [],
-		},
-		convertToLlm: convertToLlmWithBlockImages,
-		streamFn: async (model, context, options) => {
-			const auth = await modelRegistry.getApiKeyAndHeaders(model);
-			if (!auth.ok) {
-				throw new Error(auth.error);
-			}
-			const env = auth.env || options?.env ? { ...(auth.env ?? {}), ...(options?.env ?? {}) } : undefined;
-			const providerRetrySettings = settingsManager.getProviderRetrySettings();
-			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
-			// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
-			// Use max int32 to effectively disable the timeout.
-			const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
-			const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
-			const websocketConnectTimeoutMs =
-				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
-			return streamSimple(model, context, {
-				...options,
-				apiKey: auth.apiKey,
-				env,
-				timeoutMs,
-				websocketConnectTimeoutMs,
-				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
-				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-				headers: mergeProviderAttributionHeaders(
-					model,
-					settingsManager,
-					options?.sessionId,
-					auth.headers,
-					options?.headers,
-				),
-			});
-		},
-		onPayload: async (payload, _model) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner?.hasHandlers("before_provider_request")) {
-				return payload;
-			}
-			return runner.emitBeforeProviderRequest(payload);
-		},
-		onResponse: async (response, _model) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner?.hasHandlers("after_provider_response")) {
-				return;
-			}
-			await runner.emit({
-				type: "after_provider_response",
-				status: response.status,
-				headers: response.headers,
-			});
-		},
-		sessionId: sessionManager.getSessionId(),
+	const streamFn: StreamFn = async (model, context, options) => {
+		const auth = await modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok) {
+			throw new Error(auth.error);
+		}
+		const env = auth.env || options?.env ? { ...(auth.env ?? {}), ...(options?.env ?? {}) } : undefined;
+		const providerRetrySettings = settingsManager.getProviderRetrySettings();
+		const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
+		// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
+		// Use max int32 to effectively disable the timeout.
+		const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
+		const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
+		const websocketConnectTimeoutMs =
+			options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
+		return streamSimple(model, context, {
+			...options,
+			apiKey: auth.apiKey,
+			env,
+			timeoutMs,
+			websocketConnectTimeoutMs,
+			maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
+			maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+			headers: mergeProviderAttributionHeaders(
+				model,
+				settingsManager,
+				options?.sessionId,
+				auth.headers,
+				options?.headers,
+			),
+		});
+	};
+	const transport = settingsManager.getTransport();
+	const streamOptions: AgentHarnessStreamOptions = {
 		inferenceSpeed: existingSession.fastMode.enabled ? "fast" : "standard",
-		transformContext: async (messages) => {
-			const runner = extensionRunnerRef.current;
-			return runner ? runner.emitContext(messages) : messages;
-		},
-		steeringMode: settingsManager.getSteeringMode(),
-		followUpMode: settingsManager.getFollowUpMode(),
-		transport: settingsManager.getTransport(),
+		...(transport === undefined ? {} : { transport }),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
-	});
-
-	// Restore messages independently from branch-local model/thinking/Fast policy.
-	if (hasExistingMessages) {
-		agent.state.messages = existingSession.messages;
-	}
+	};
 	// Persist explicit startup overrides and fill any policy dimensions that were
 	// absent from setup-only sessions (for example a pre-seeded Fast policy).
 	if (model && (options.model !== undefined || existingSession.model === null)) {
@@ -531,8 +492,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const gitContextProvider = options.gitContextProvider ?? new GitContextProvider(cwd);
 	if (!options.gitContextProvider) void gitContextProvider.refresh();
 	const session = new AgentSession({
-		agent,
 		sessionManager,
+		...(model === undefined ? {} : { model }),
+		thinkingLevel,
+		streamFn,
+		convertToLlm: convertToLlmWithBlockImages,
+		streamOptions,
+		steeringMode: settingsManager.getSteeringMode(),
+		followUpMode: settingsManager.getFollowUpMode(),
 		settingsManager,
 		gitContextProvider,
 		cwd,

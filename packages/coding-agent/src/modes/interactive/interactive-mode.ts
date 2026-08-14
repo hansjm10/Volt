@@ -566,9 +566,6 @@ export class InteractiveMode {
 	private get session(): AgentSession {
 		return this.runtimeHost.session;
 	}
-	private get agent() {
-		return this.session.agent;
-	}
 	private get sessionManager() {
 		return this.session.sessionManager;
 	}
@@ -2274,7 +2271,7 @@ export class InteractiveMode {
 			model: this.session.model,
 			isIdle: () => !this.session.isBusy,
 			isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
-			signal: this.session.agent.signal,
+			signal: this.session.signal,
 			abort: () => {
 				void this.restoreQueuedMessagesToEditor({ abortSource: "host_action" }).catch((error) => {
 					this.showError(`Failed to persist queued-message cancellation: ${String(error)}`);
@@ -4977,7 +4974,9 @@ export class InteractiveMode {
 			throw error;
 		} finally {
 			if (options?.abortSource) {
-				this.agent.abort(options.abortSource);
+				void this.session.abort(options.abortSource).catch((error: unknown) => {
+					this.showError(`Failed to abort the active run: ${String(error)}`);
+				});
 			}
 		}
 		return this.putQueuedTextInEditor([...queues.steering, ...queues.followUp], options?.currentText);
@@ -5302,7 +5301,7 @@ export class InteractiveMode {
 					},
 					onTransportChange: (transport) => {
 						this.settingsManager.setTransport(transport);
-						this.session.agent.transport = transport;
+						this.session.setTransport(transport);
 					},
 					onHttpIdleTimeoutMsChange: (timeoutMs) => {
 						this.settingsManager.setHttpIdleTimeoutMs(timeoutMs);
@@ -7263,7 +7262,7 @@ export class InteractiveMode {
 		try {
 			await this.session.reload();
 			configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
-			this.session.agent.transport = this.settingsManager.getTransport();
+			this.session.setTransport(this.settingsManager.getTransport());
 			this.keybindings.reload();
 			const activeHeader = this.customHeader ?? this.builtInHeader;
 			if (isExpandable(activeHeader)) {

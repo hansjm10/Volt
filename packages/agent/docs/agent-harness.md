@@ -1,515 +1,257 @@
-# AgentHarness lifecycle
+# AgentHarness architecture and lifecycle
 
-`AgentHarness` is the orchestration layer above the low-level agent loop. It owns session persistence, runtime configuration, resource resolution, operation locking, and extension-facing mutation semantics.
+`AgentHarness` is the sole reusable stateful orchestrator in `@hansjm10/volt-agent-core`. It owns transactional delivery, runtime configuration, session coordination, hook settlement, provider request policy, and the lifecycle around the low-level loop.
 
-This document describes the current direction and implemented behavior. Some extension/session-facade details are planned and called out explicitly.
+## Ownership boundary
 
-## Target ownership boundary
+- `agent-loop.ts` is the stateless execution kernel. It executes one dispatched run against an explicit context and callback configuration.
+- `AgentHarness` owns reusable state: session access, delivery queues, active-run cancellation, runtime configuration, resources, hooks, provider settings, and persistence ordering.
+- Applications own product policy. For example, Coding Agent's `AgentSession` privately hosts an `AgentHarness` while retaining planning, durable client-input admission, retries, compaction policy, extensions, RPC, and UI projections.
 
-The intended runtime ownership model is:
-
-- `agent-loop.ts` is the stateless execution kernel.
-- `AgentHarness` is the sole reusable stateful orchestrator above that kernel.
-- Coding Agent's `AgentSession` owns Volt-specific policy and runs through `AgentHarness` rather than the legacy `Agent` wrapper.
-
-`Agent` remains a supported transitional API. It can be retired only after all of these gates are met:
-
-1. Coding Agent runs through `AgentHarness`.
-2. `AgentHarness` has parity for transactional delivery and the current lifecycle and abort semantics.
-3. No production code constructs or exposes `Agent`.
-
-After those gates are met, remove `agent.ts`, its package-root export, wrapper-only tests, and its public documentation together. Until then, keep the current README and public API unchanged.
-
-## Ultimate lifecycle goal
-
-Harness listeners and hooks should be able to close over the `AgentHarness` instance and call public harness APIs from any event where those APIs are documented as allowed. Those calls must not corrupt in-flight turn snapshots, reorder persisted transcript entries, lose pending writes, deadlock settlement, or leave the harness in the wrong phase.
-
-The intended rule is:
-
-- structural operations remain rejected while busy
-- queue operations are accepted at documented turn-safe points
-- runtime config setters update future snapshots without mutating the current provider request
-- session writes made while busy are durably queued and flushed in deterministic order
-- getters return latest harness config, not in-flight snapshots
-- listeners/hooks currently receive no facade; if they close over the raw harness and call settlement APIs such as `waitForIdle()` during the active run, they can deadlock. A future facade should expose `runWhenIdle()` instead.
-
-`AssistantMessageStream` already decouples provider transport streaming, such as SSE or websocket reads, from downstream event consumption. The harness can therefore await listeners, extension hooks, persistence, and save-point work without blocking the provider transport reader or reintroducing ad hoc event queues. Lifecycle code should prefer explicit awaited sequencing at harness boundaries over fire-and-forget hook/event settlement.
-
-A final lifecycle hardening pass should prove these guarantees with a broad listener/hook reentrancy test suite.
-
-## Error handling
-
-The current split is:
-
-- low-level capabilities and helpers use `Result<TValue, TError>` where expected failures are contained and must not throw, such as `ExecutionEnv`, filesystem/shell operations, shell-output capture, resource loading, and compaction helpers
-- high-level mutation/orchestration APIs such as `Session` and `AgentHarness` reject/throw instead of returning bare results that can be ignored
-- public `AgentHarness` failures are normalized to `AgentHarnessError` where practical; subsystem errors are preserved as `cause`
-
-Harness events observe committed state. Public mutators validate required input and persistence before committing when practical, then await notifications. If a hook or subscriber fails after commit, the state change is not rolled back and the public method rejects with `AgentHarnessError` code `"hook"`.
+There is no second stateful core runtime. Hosts should use `AgentHarness` or intentionally own the complete low-level loop contract themselves.
 
 ## State model
 
-The harness separates state into four categories.
+Harness state is split into four categories.
 
-### Harness config
+### Runtime configuration
 
-Harness config is the latest runtime configuration set by the application or extensions:
+The latest application configuration includes:
 
-- model
+- optional model
 - thinking level
-- tools
-- active tool names
+- all tools and active tool names
 - resources
-- stream options
-- system prompt or system prompt provider
+- system prompt or system-prompt provider
+- stream options and provider auth resolver
+- steering and follow-up modes
 
-Getters return harness config. They do not return the snapshot used by an in-flight provider request.
+Getters return current configuration. Setters affect future turn snapshots and do not mutate an in-flight provider request.
 
-Setters update harness config immediately, including while a turn is in flight. Changes affect the next turn snapshot, not the currently running provider request.
-
-`setResources()` accepts concrete resources and emits `resources_update` on every call with shallow-copied current and previous resources. Applications own loading/reloading resources from disk or other sources and should call `setResources()` with new values.
-
-`getResources()` returns shallow-copied current resources. It is a live config read, not the last turn snapshot.
+A model may be unset during construction. Prompt and continuation preflight reject if provider work requires a model before one is selected.
 
 ### Turn snapshot
 
-A turn snapshot is the concrete state used for one LLM turn. It is created by `createTurnState()` and contains:
+`createTurnState()` resolves one concrete request snapshot:
 
-- persisted session messages
-- resolved resources
-- resolved system prompt
-- model
-- thinking level
-- all tools
-- active tools
+- persisted session context or an explicit run context override
+- resources
+- system prompt
+- model and thinking level
+- all tools and the active subset
 - stream options
-- derived session id
+- session ID
 
-Static option values are used directly. System-prompt provider callbacks are invoked once per `createTurnState()` call. All logic for that turn uses the same snapshot.
-
-Resource arrays are shallow-copied when a snapshot is created. Individual skill and prompt-template objects are not deep-copied.
-
-Stream options are shallow-copied when a snapshot is created. `headers` and `metadata` maps are shallow-copied; their values are not deep-copied. Credentials from `getApiKeyAndHeaders()` are resolved per provider request so expiring tokens can refresh, but the configured stream options and derived session id come from the current turn snapshot.
+A provider request uses one snapshot. Save-point configuration changes are reflected when the next request snapshot is created.
 
 ### Session
 
-The session contains persisted entries only. Session reads return persisted state and do not include queued writes.
+The supplied `Session` is the persisted conversation authority. Harness session writes never rely on a second transcript cache.
 
-Session storage implementations must persist leaf changes as `leaf` entries. `setLeafId()` is not an in-memory-only cursor update; it appends a durable entry whose `targetId` is the active tree leaf or `null` for root. Reopening storage must reconstruct the current leaf from the latest persisted leaf-affecting entry.
+Storage implementations must preserve:
 
-### Pending session writes
+- canonical entry IDs returned from append
+- parent relationships
+- durable leaf changes
+- append order
+- metadata
 
-Session writes requested while an operation is active are queued as pending session writes. Pending writes are based on session-entry shapes without generated fields (`id`, `parentId`, `timestamp`).
+A host adapter may filter application-only entries when projecting the generic Harness session view, but the host's canonical store remains authoritative.
 
-Pending session writes are always persisted. They are flushed at save points, at operation settlement, and in failure cleanup.
+### Delivery inbox and active run
 
-A public pending-writes/session-facade API is planned but not implemented yet.
+Prompt, steering, and follow-up deliveries share one inbox with stable IDs. The active run owns:
 
-## Operation phases
+- run ID and phase
+- abort controller and first accepted abort source
+- current delivery lease and settlement barrier
+- ordered delivery outcomes
+- terminal event settlement
 
-The harness has an explicit phase:
+`activeRunSnapshot` is immutable. `activeDeliverySettlement` exposes the current durability barrier without exposing mutable run internals.
 
-```ts
-type AgentHarnessPhase = "idle" | "turn" | "compaction" | "branch_summary" | "retry";
-```
+## Transactional delivery
 
-Structural operations require `phase === "idle"` and synchronously set the phase before the first `await`:
+Delivery follows a prepare/begin/settle protocol.
 
-- `prompt`
-- `skill`
-- `promptFromTemplate`
-- `compact`
-- `navigateTree`
+1. Admission snapshots the structured `AgentMessage` payload and assigns a stable ID.
+2. Selection leases a FIFO prefix without consuming it.
+3. `prepareDelivery` receives an isolated copy and performs side-effect-free transformation or validation.
+4. Harness crosses the synchronous revocation cutoff.
+5. If preparation supplied a participant, Harness invokes `settle()` exactly once and awaits it.
+6. A committed delivery is published before request preparation or provider work.
+7. Retained, revoked, and terminal outcomes are recorded in delivery order.
 
-Starting another structural operation while the harness is not idle rejects with `AgentHarnessError` code `"busy"`.
+Participant outcomes:
 
-The following operations are allowed during a turn where appropriate:
+- `committed`: the delivery is canonical and provider work may proceed.
+- `retained`: all coupled effects were definitively rolled back; restore the same delivery for explicit retry.
+- `terminally_failed`: replay safety cannot be proven; consume the delivery and stop.
+- thrown/rejected settlement: normalized to `terminally_failed`.
+- `revoked`: explicit revocation won before settlement began.
 
-- `steer`
-- `followUp`
-- `nextTurn`
-- `abort`
-- runtime config setters
+A participant owns canonical persistence for its prepared delivery. Harness must not append those prepared messages a second time. Without a participant, Harness persists committed delivery messages through its session.
 
-Phase/settlement semantics are still provisional and need a full lifecycle pass.
+Preparation, participant, committed-delivery, and subscriber payloads are cloned. Mutation of one projection cannot alter retained inbox data, canonical persistence, or provider input.
 
-## Turn execution
+## Bounded runs
 
-`prompt`, `skill`, and `promptFromTemplate` follow the same flow:
+`run()` accepts one structured message or an ordered message array. `runPrompt()` is the text convenience form. Both return `AgentRunResult`:
 
-1. Assert idle and set phase to `"turn"`.
-2. Create a turn snapshot with `createTurnState()`.
-3. Derive invocation text from that snapshot.
-4. Execute the turn with `executeTurn()`.
+- `completed`: the run settled without a retained or terminal delivery failure.
+- `delivery_failed`: includes the first failure and all ordered delivery outcomes observed in the bounded run.
 
-`skill` and `promptFromTemplate` resolve their resource from the same snapshot that is passed to the turn. They do not resolve resources separately.
+Committed and revoked prefixes remain visible even if a later delivery retains or fails terminally.
 
-`steer`, `followUp`, and `nextTurn` accept text plus optional images and create user messages internally. `nextTurn` messages are inserted before the new user message on the next user-initiated turn.
+`prompt()` returns the required assistant response and is convenient when the caller does not need the delivery outcome surface.
 
-Queue modes are live, not turn-snapshotted:
+A retained prompt remains pending until `continue()` retries it or `discardPendingPrompt()` revokes it. Continuations may supply an explicit context override, allowing hosts to keep canonical error messages persisted while omitting them from the next provider request.
 
-- `getSteeringMode()` / `setSteeringMode()`
-- `getFollowUpMode()` / `setFollowUpMode()`
+## Abort and teardown
 
-Changing a queue mode during a run affects the next delivery lease. Selection happens only while the harness owns the low-level `nextAction` decision. Steering is selected before a pending tool continuation; follow-ups are selected only when neither steering nor a tool continuation remains.
+`abort(source?)` is synchronous intent. It returns `AgentAbortAcceptance` immediately and signals the active run without waiting for settlement.
 
-### Dispatcher actions and request preparation
+Rules:
 
-The harness implements the low-level action protocol rather than polling queues through separate callbacks:
+- the first accepted source wins
+- repeated abort calls do not replace provenance
+- queued steer/follow-up work is not implicitly cleared
+- explicit revocation remains separate
+- runtime-abort diagnostics are applied after message replacement so hooks cannot erase provenance
+- `waitForIdle()` covers terminal listener settlement and failure cleanup
 
-- `request` supplies initial, steering, follow-up, or tool-continuation work
-- `stop` ends the harness run when no work remains
-- the low-level `pause` action is available to higher orchestration layers that must preserve continuation intent without issuing another provider request
+Structural teardown should:
 
-The low-level loop asks for one action before its first request and once after every successful `turn_end`. Queue-backed requests lease selected entries without removing them. Synchronous begin transfers ownership, then `delivery_start` triggers the authoritative queue update before delivery message persistence. The request-preparation hook subsequently flushes pending writes and, after the first request, creates and applies the next turn snapshot. A request whose every delivery was revoked does not prepare a snapshot or call the provider; a terminal action likewise creates no snapshot.
+1. inspect `activeDeliverySettlement` when durability must settle first
+2. call `abort(source)`
+3. await `waitForIdle()`
+4. explicitly revoke queues if the host is retiring them
 
-Once `delivery_start` occurs, notification failure cannot restore or revoke that begun delivery. Error and abort outcomes are terminal, return only entries still revocable from the shared inbox, and do not poll the queues again.
+Queue APIs include awaited `clearSteeringQueue()`, `clearFollowUpQueue()`, `clearAllQueues()`, and `discardPendingPrompt()`. `revokeAllQueues()` exists for hosts that must synchronously revoke runtime ownership before awaiting their own durability barrier; its queue projection is passive.
 
-## Save points
+## Dispatcher and continuation authority
 
-A save point occurs after an assistant turn and its tool-result messages have completed.
+Harness implements the low-level next-action protocol:
 
-At a save point the harness:
+- `request` authorizes a provider request and may carry deliveries
+- `stop` terminates the bounded run
+- `pause` preserves continuation intent for a higher orchestrator
 
-1. awaits the completed `turn_end` observers
-2. flushes pending session writes after the agent-emitted messages for that turn
-3. emits the harness `save_point` event before the dispatcher chooses the next action
-4. if that action is `request`, creates and applies a fresh context/model/thinking-level/stream-options/session-id snapshot immediately before the provider call
+Queue selection happens before delivery leasing:
 
-This lets model, thinking level, tool, resource, stream option, and system prompt changes made during a turn affect the next turn in the same run, while never mutating an in-flight provider request. A terminal turn still completes save-point synchronization before `agent_end`, but does not run request preparation. Selected queue messages enter persisted session context before the fresh system-prompt callback and snapshot are evaluated. Because provider transport reading is already decoupled by `AssistantMessageStream`, save-point work and hook settlement can be awaited directly to keep transcript/session ordering deterministic. The loop callbacks are not recreated at save points.
+1. prompt and steering selection
+2. independent provider/tool continuation when already authorized
+3. follow-up selection when no independent request remains, or when explicitly prioritized
 
-The low-level loop converts harness `ThinkingLevel` to provider `reasoning` at the provider boundary:
+Scoped next-action policies reduce an evolving suggested action in registration order. Policy-generated deliveries are combined with leased inbox deliveries. Runtime-owned `final_response` authority remains tool-free across retry or compaction continuations when the host passes that authority back to `continue()`.
 
-- `"off"` -> `undefined`
-- all other thinking levels pass through
+## Persistence and save points
 
-No state refresh is needed on `agent_end` except flushing leftover pending session writes and clearing the operation phase. The exact `settled` event timing is still under review.
+Harness persists ordinary finalized messages exactly once. For a participant-owned delivery, the participant's canonical transaction is the only delivery append.
 
-If the system-prompt callback throws while starting `prompt`, `skill`, or `promptFromTemplate`, the operation rejects with `AgentHarnessError` and the harness returns to idle. If it throws from a later request snapshot created by `prepareRequest`, the low-level agent run records an assistant error message.
+Before each provider request Harness:
 
-## Hooks and events
+1. finalizes selected deliveries
+2. flushes pending session writes
+3. resolves the current request snapshot
+4. applies ordered context and provider-request hooks
+5. converts messages for the provider
+6. invokes the configured `StreamFn`
 
-The target hook system is described in [hooks.md](./hooks.md).
+After a successful turn, message and tool-result persistence completes before the next action is leased. Save-point refresh lets changes to model, thinking level, tools, resources, system prompt, and stream options affect a later request in the same run.
 
-Summary:
+## Hooks and finalized observation
 
-- `AgentHarness` emits typed hook events and consumes typed results.
-- A single hooks implementation owns registration, cleanup, provenance, and result reducers.
-- Observational and mutation hooks use one event-specific `on()` API; the event result type determines whether a handler may return a result.
-- Result-producing events are reduced by typed reducer tables; app-specific hooks add reducers only for app-specific result-producing events.
-- Hook registration provenance is sidecar metadata on the registration. Resource and tool provenance belongs on app-specific concrete value types.
-- Hook context should be a plain object of facades, not raw internals or late-bound getter mazes.
+`on(eventType, handler)` registers ordered mutation policy. Event-specific reducers define how results compose:
 
-Event payloads describe what is happening. Harness getters describe latest config for future snapshots. Hook and listener settlement should be awaited in lifecycle order where possible; transport backpressure is handled below the harness by `AssistantMessageStream`, so the harness does not need a separate async event queue merely to keep SSE or websocket reads flowing.
+- context and message hooks replace the current value
+- tool-call hooks reduce block/reason decisions
+- tool-result hooks reduce content, details, error state, and disposition
+- provider-request and provider-payload hooks transform the evolving request
+- next-action policies reduce the evolving suggested action
 
-## Planned session facade
+Handlers receive cloned input and run in registration order. Hook failures are normalized to Harness errors and settle through the run's failure path.
 
-Extensions should eventually interact with a harness-scoped `HarnessSession` facade rather than the raw session. The facade should wrap the internal session and enforce harness pending-write ordering semantics. Once this exists, hooks and event listeners can receive a context that exposes the full `AgentHarness` plus the session facade without giving direct access to unordered raw session writes.
+`message_end` hooks run before persistence. Replacements must preserve message role. Runtime-abort decoration is applied after replacement.
 
-Planned read semantics:
+`subscribe(listener)` observes finalized cloned events. Subscribers are passive for committed delivery and terminal projections: failure, rejection, mutation, or a returned value cannot alter canonical outcomes or suppress later subscribers.
 
-- reads delegate to persisted session state
-- reads do not include queued pending writes
+Provider transport streaming remains decoupled from downstream event settlement by `AssistantMessageStream`, so lifecycle ordering can be awaited without blocking the network reader.
 
-Planned write semantics:
+## Provider seams
 
-- idle: persist immediately
-- busy: enqueue as pending session writes
+Harness accepts a configurable `StreamFn`, message converter, auth resolver, and stream options. Request snapshots preserve:
 
-A planned diagnostics API may expose pending writes explicitly:
+- transport
+- timeout and WebSocket connect timeout
+- inference speed
+- retry count and maximum retry delay
+- thinking budgets
+- cache retention
+- environment
+- headers
+- metadata
 
-```ts
-getPendingWrites(): readonly PendingSessionWrite[]
-```
+Auth headers/environment are resolved per provider request and merged with snapshotted options. Ordered provider hooks run before request, payload, and response use.
 
-Agent-emitted messages are persisted on `message_end` to preserve transcript ordering. Pending extension/session writes flush after those messages at save points.
+## Tools
 
-## Abort
+Harness stores all tool definitions separately from the active subset. Tool changes are validated for unique names and known active names.
 
-Abort is allowed during a turn. It aborts the low-level run and clears steering/follow-up entries whose begin boundary has not crossed. Its result reports the exact messages actually revoked; begun deliveries remain authoritative.
+Tool execution uses the low-level loop:
 
-Abort does not clear `nextTurn` messages. Messages queued with `nextTurn()` survive abort and are inserted before the user message on the next user-initiated turn.
+- tool calls are validated before execution
+- `tool_call` policy may block
+- sequential and parallel batches preserve source-order transcript artifacts
+- `tool_result` policy runs before final tool events and persistence
+- successful `final_response` disposition requests one bounded tool-free response
+- `stop` disposition ends when the batch reducer selects it
 
-Abort does not discard pending session writes. Pending writes flush at the next save point if reached, at `agent_end`, or in operation failure cleanup.
+Active tool executions are exposed through finalized runtime events; application layers may maintain read-only UI/RPC projections without mutating Harness internals.
 
-Abort barrier semantics still need an audit.
+## Structural operations
 
-## Compaction and tree navigation
+Compaction and tree navigation require an idle Harness and operate on persisted session state. They restore phase in `finally` and normalize subsystem failures.
 
-Compaction and tree navigation are structural session mutations.
+Applications may layer auto-compaction and retry policy around bounded runs. Explicit continuation context is the supported seam when canonical persisted history differs from the next provider request.
 
-They are allowed only while idle and are not queued. They operate on persisted session state. The next prompt creates a fresh turn snapshot.
+## Low-level loop contract
 
-Branch summary generation is part of the tree navigation operation.
+`agentLoop()` and `agentLoopContinue()` are appropriate only when a host owns all orchestration responsibilities. The low-level loop provides:
 
-Auto-compaction and retry decision points are not implemented in `AgentHarness` yet.
+- ordered lifecycle events
+- request preparation
+- explicit next actions and request authority
+- delivery begin outcomes
+- context conversion
+- tool execution and disposition reduction
+- provider streaming
 
-## Test organization
+It does not provide Harness inboxes, session persistence, lifecycle snapshots, abort provenance retention, hook reducers, or passive subscriber isolation.
 
-Harness tests should stay focused by area instead of growing one large catch-all file.
+## Tests
 
-Current structure:
+Use the `volt-ai` faux provider for deterministic Harness and provider tests.
 
-- `packages/agent/test/harness/agent-harness.test.ts`: core lifecycle and public API behavior.
-- `packages/agent/test/harness/agent-harness-stream.test.ts`: stream options and provider hook semantics.
+Focused suites are organized under `packages/agent/test/harness/`:
 
-Preferred future structure:
+- `agent-harness-delivery-transaction.test.ts`
+- `agent-harness-lifecycle.test.ts`
+- `agent-harness-policy.test.ts`
+- `agent-harness-stream.test.ts`
+- `agent-harness.test.ts`
 
-- `agent-harness-resources.test.ts`: resource snapshot/loading semantics.
-- `agent-harness-tools.test.ts`: tool registry getters, active-tool semantics, and update events.
-- `agent-harness-lifecycle.test.ts`: phase/save-point/settled/reentrancy behavior.
-
-Use the `volt-ai` faux provider (`registerFauxProvider`, `fauxAssistantMessage`) for deterministic harness/provider tests. Faux response factories can inspect `StreamOptions`, invoke `options.onPayload`, and return scripted assistant messages without real provider APIs or network access.
-
-Harness coverage is configured separately from the default package test run:
+Commands:
 
 ```bash
 npm run test:harness
 npm run coverage:harness
 ```
 
-`coverage:harness` runs `test/harness/**/*.test.ts` and reports coverage for `src/harness/**/*.ts` plus the non-harness runtime files it directly exercises (`src/agent.ts` and `src/agent-loop.ts`) into `coverage/harness`. Type-only dependencies such as `src/types.ts` are not included because they have no meaningful runtime coverage.
+Harness coverage includes `src/harness/**/*.ts` and `src/agent-loop.ts`. Type-only contracts are excluded from runtime coverage.
 
-## Implementation todo
+Related design references:
 
-This list tracks the remaining work before treating `AgentHarness` as migration-ready. Active/planned items are ordered from easiest to hardest. Completed items are archived at the bottom.
-
-### 1. Add explicit tool registry read/update semantics
-
-Status: In progress
-
-Done:
-
-- Added `setTools(tools, activeToolNames?)`.
-- Added `setActiveTools(toolNames)`.
-- Invalid active tool names reject with `AgentHarnessError`.
-- Added generic app tool shape via `AgentHarness<TSkill, TPromptTemplate, TTool>`.
-- Exported `QueueMode` from core types.
-- Added `AgentHarnessOptions.steeringMode` and `followUpMode`.
-- Added live `getSteeringMode()` / `setSteeringMode()` and `getFollowUpMode()` / `setFollowUpMode()`.
-- Added `getTools()` and `getActiveTools()`.
-- Added `tools_update` observability events, including active-tool-only updates.
-- Active tool changes are persisted as branch-scoped `active_tools_change` entries.
-- Duplicate tool names and duplicate active tool names reject.
-
-Remaining:
-
-- None.
-
-Notes:
-
-- Observability design: [observability.md](./observability.md)
-
-### 2. Design per-`AgentHarness` model registry
-
-Status: Planned
-
-Done:
-
-- Current `setModel()` behavior is preserved.
-
-Remaining:
-
-- Decide how applications supply the model registry.
-- Decide whether the harness stores concrete `Model` objects, model references, or both.
-- Validate model selection against the registry.
-- Define model change semantics during active turns and save points.
-
-### 3. Full `AgentHarness` lifecycle/state pass
-
-Status: In progress
-
-Done:
-
-- Removed constructor `void syncFromTree()`, `syncFromTree()`, `liveOperationId`, and `shell()`.
-- Added `createTurnState()`, `applyTurnState()`, and `executeTurn()`.
-- Added explicit `phase` in place of boolean idle state.
-- Save points refresh context, model, thinking level, stream options, and session snapshot state.
-- Pending session writes use session-entry shapes without generated fields.
-- Pending session writes flush at save points, settlement, and failure cleanup.
-- `steer`, `followUp`, and `nextTurn` create user messages from text plus optional images.
-- `nextTurn` messages are inserted before the new user prompt.
-- Structural compaction/tree operations restore phase with `finally`.
-- Public harness failures normalize subsystem causes to `AgentHarnessError`.
-- Pending session writes flush one-by-one and are not dropped on failure.
-- Queue updates occur after synchronous delivery begin; begun deliveries never roll back.
-- `message_end` persistence happens before subscriber notification.
-- `abort()` signals cancellation before notifications and still waits for idle through notification errors.
-- Idle model/thinking/tool updates validate and persist before committing in-memory state.
-- `setLeafId()` persists durable `leaf` entries so tree navigation survives storage reopen.
-
-Remaining:
-
-- Finalize phase/idle semantics.
-- Audit whether `settled` can fire too early.
-- Make session writes inside `settled` callbacks deterministic.
-- Audit follow-up behavior around `agent_end`.
-- Implement auto-compaction decision point.
-- Implement retry handling.
-- Verify `before_agent_start` hook semantics against coding-agent.
-- Decide whether `before_agent_start` needs more turn info such as tools/tool snippets.
-- Document or change runtime config event timing while busy.
-- Audit `abort()` barrier semantics.
-
-### 4. Implement generic hook/event extension mechanism
-
-Status: Designed in [hooks.md](./hooks.md), not implemented
-
-Done:
-
-- Removed `AgentHarnessContext`.
-- Hooks receive only event payloads.
-- `emitHook(event)` derives the hook type from `event.type`.
-- Provider request/payload hooks have ordered transform semantics.
-
-Remaining:
-
-- Add `HookEvent`, `ResultOf`, registration options with generic source metadata, and the single `AgentHarnessHooks` implementation.
-- Move result chaining out of `AgentHarness` into reducer functions.
-- Type-check base harness reducers so every result-producing `AgentHarnessEvent` has reducer semantics.
-- Make `AgentHarness` accept and expose the concrete hooks instance with constructor inference for app-specific hooks.
-- Define the initial harness/context facades exposed through hook context.
-- Preserve current provider hook behavior, including stream option patch deletion semantics.
-- Add parity tests for reducer semantics: transform chaining, patch chaining, early block/cancel, cleanup, source metadata, and typed app-specific reducer coverage.
-
-Notes:
-
-- Hook design: [hooks.md](./hooks.md)
-
-### 5. Spike semi-durable harness/session recovery
-
-Status: Planned
-
-Done:
-
-- Wrote durability design: [durable-harness.md](./durable-harness.md)
-
-Remaining:
-
-- Decide whether session owns all durable harness state or whether any sidecars are needed for large blobs.
-- Define durable entries for queues, pending writes, operations, turns, provider requests, and tool calls.
-- Define resume requirements for app-provided tools, models, extensions, resources, hooks, and auth providers.
-- Define conservative recovery policy for unfinished agent turns, provider requests, tool calls, compaction, and tree navigation.
-- Prototype reducer-based recovery from session entries.
-- Decide whether interrupted operations append user-visible messages or only internal operation entries.
-
-Notes:
-
-- Provider streams are not resumable; recovery should restart from durable boundaries or mark operations interrupted.
-- Unfinished tool calls are unsafe to retry unless tools declare idempotent/retry-safe behavior.
-
-### 6. Final lifecycle hardening suite
-
-Status: Planned
-
-Done:
-
-- None.
-
-Remaining:
-
-- Add broad listener/hook reentrancy tests across relevant events.
-- Test runtime config setters from low-level lifecycle events and harness events.
-- Test runtime config observability for model, thinking, resources, tools, active tools, and stream options.
-- Test resource/tool/model/thinking/stream-option updates during active turns and save points.
-- Test session writes from listeners and hooks, including `settled` writes.
-- Test queue operations from turn events, tool events, and provider hooks.
-- Test rejected structural operations while busy.
-- Test abort from listeners/hooks.
-- Test getter behavior during active operations.
-- Test deterministic ordering of agent-emitted messages and pending listener writes.
-- Test no deadlocks when async listeners call harness APIs and await them.
-- Test phase cleanup through success, provider error, hook error, abort, compaction, and tree navigation.
-
-### 7. Later coding-agent migration plan
-
-Status: Planned
-
-Done:
-
-- None.
-
-Remaining:
-
-- Map coding-agent resources to sourced loaders.
-- Keep app-level resource dedupe/provenance outside the harness.
-- Adapt extension loading to the future hook/session facade.
-- Preserve UI/session behavior outside core.
-- Move coding-agent stream/auth/retry/header behavior onto harness stream configuration and provider hooks.
-
----
-
-## Completed implementation todo
-
-### 8. Remove `Agent` dependency from `AgentHarness`
-
-Status: Done
-
-Done:
-
-- `AgentHarness` calls `runAgentLoop()` directly.
-- Harness owns run lifecycle, abort controller, leased delivery selection, request-only provider snapshot preparation, provider stream config, event reduction, session persistence, pending write flushing, and save-point synchronization.
-- Harness tests cover prompt construction, delivery leasing, abort behavior, save-point refresh, pending write ordering, awaited listener settlement, tool hooks, and provider stream wrapping.
-
-Remaining:
-
-- None.
-
-Notes:
-
-- Broader listener/hook reentrancy coverage is tracked in item 6.
-
-### 9. Finish curated provider/stream configuration
-
-Status: Done
-
-Done:
-
-- Added curated `AgentHarnessOptions.streamOptions`, `getStreamOptions()`, and `setStreamOptions()`.
-- Stream options, headers, metadata, and derived session id are snapshotted per turn.
-- Harness-owned stream wrapper calls `streamSimple()` and keeps lifecycle-owned `signal` and `reasoning` from the low-level loop.
-- `getApiKeyAndHeaders()` resolves credentials per provider request.
-- `before_provider_request`, `before_provider_payload`, and `after_provider_response` hooks are implemented.
-- Stream option patching supports explicit field deletion and ordered hook chaining.
-- `agent-harness-stream.test.ts` covers forwarding, auth merge, hook patching/deletion/chaining, payload hooks, and busy/save-point snapshot behavior.
-
-Remaining:
-
-- None.
-
-### 10. Complete low-level `Result` cleanup
-
-Status: Done
-
-Done:
-
-- Added generic `Result<TValue, TError>` plus helpers.
-- Updated `ExecutionEnv` and `NodeExecutionEnv` to return typed results for filesystem/process operations.
-- Split filesystem and shell capabilities.
-- Moved JSONL session storage/repo onto filesystem picks instead of direct Node imports.
-- Added `ExecutionEnv.appendFile()` for streaming append use cases.
-- Updated skill and prompt-template loaders to consume `ExecutionEnv` results.
-- Updated shell output capture to return a result and use `ExecutionEnv`, including full-output spill via `appendFile()`.
-- Removed `NodeExecutionEnv` from browser-safe root exports.
-- Replaced `Buffer` usage in generic truncation utilities with runtime-neutral UTF-8 handling.
-- Converted compaction and branch-summary helpers to typed result returns.
-- Added `readTextLines()` so JSONL metadata loading reads only the header line.
-- Removed no-op abort handling from Node filesystem methods where cancellation is not meaningful.
-- Mapped filesystem errors crossing the session boundary to typed `SessionError`.
-- Added typed branch-summary errors and cause-aware public harness error normalization.
-- Resource loaders report structured diagnostics for non-`not_found` filesystem failures.
-- Expanded `NodeExecutionEnv` tests for file operations, exec errors, aborts, callbacks, timeouts, and shell-output spill.
-
-Remaining:
-
-- None.
-
-Notes:
-
-- Keep low-level capability/helper APIs non-throwing where they return `Result`.
-- Keep session storage/repo/session APIs throwing typed `SessionError`.
-- Keep public structural harness failures normalized to `AgentHarnessError`.
-- Keep Node-specific APIs isolated under `src/harness/env/nodejs.ts`, Node-backed storage/session implementations, or explicit Node-only entry points.
-- Audit generic harness utilities for Node globals as APIs are added.
-- Audit package exports so browser/generic imports do not pull Node-only modules.
-- Keep expanding `ExecutionEnv` and shell-output contract tests as APIs evolve.
+- [Hook design](./hooks.md)
+- [Observability](./observability.md)
+- [Durable Harness recovery](./durable-harness.md)

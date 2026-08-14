@@ -56,7 +56,7 @@ describe("regression #211: delivery payload isolation", () => {
 		harness = undefined;
 	});
 
-	it("keeps canonical, Agent, delivery-event, and provider payloads identical when an upstream participant mutates", async () => {
+	it("keeps canonical, finalized-event, delivery-event, and provider payloads identical when an upstream participant mutates", async () => {
 		let providerUser: Extract<AgentMessage, { role: "user" }> | undefined;
 		let deliveryUser: Extract<AgentMessage, { role: "user" }> | undefined;
 		harness = await createHarness({
@@ -90,10 +90,10 @@ describe("regression #211: delivery payload isolation", () => {
 		harness.setResponses([fauxAssistantMessage("committed")]);
 		const expected = createNestedUserMessage("immutable original", "b3JpZ2luYWw=", 123);
 
-		await harness.session.agent.prompt(expected);
+		await harness.control.run(expected);
 
 		const canonicalUser = findUser(harness.sessionManager.buildSessionContext().messages);
-		const agentUser = findUser(harness.session.agent.state.messages);
+		const agentUser = findUser(harness.session.state.messages);
 		expect(canonicalUser).toEqual(expected);
 		expect(agentUser).toEqual(expected);
 		expect(deliveryUser).toEqual(expected);
@@ -153,15 +153,15 @@ describe("regression #211: delivery payload isolation", () => {
 		const original = createNestedUserMessage("original", "b3JpZ2luYWw=", 456);
 		const expected = createNestedUserMessage("transformed once", "dHJhbnNmb3JtZWQ=", 456);
 
-		await expect(harness.session.agent.prompt(original)).resolves.toMatchObject({
+		await expect(harness.control.run(original)).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: { outcome: "retained" },
 		});
 		retain = false;
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		const canonicalUser = findUser(harness.sessionManager.buildSessionContext().messages);
-		const agentUser = findUser(harness.session.agent.state.messages);
+		const agentUser = findUser(harness.session.state.messages);
 		expect(extensionRuns).toBe(1);
 		expect(canonicalUser).toEqual(expected);
 		expect(agentUser).toEqual(expected);
@@ -191,13 +191,13 @@ describe("regression #211: delivery payload isolation", () => {
 		const prompting = harness.session.prompt("revoke before extensions", { clientMessageId, source: "rpc" });
 
 		await preparationStarted.promise;
-		expect(harness.session.agent.discardPendingPrompt()).toHaveLength(1);
+		expect(await harness.control.discardPendingPrompt()).toHaveLength(1);
 		releasePreparation.resolve();
 		await expect(prompting).rejects.toThrow("Delivery was revoked before canonical commitment");
 
 		expect(extensionRuns).toBe(0);
 		expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("accepted");
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 	});
 
 	it("reuses queue ownership with the cached payload when retained upstream messages lose their runtime identity", async () => {
@@ -255,10 +255,10 @@ describe("regression #211: delivery payload isolation", () => {
 
 		releaseTool();
 		await activeRun;
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(harness.session.getSteeringMessages()).toHaveLength(1);
 
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		const canonicalUser = harness.sessionManager
 			.buildSessionContext()
@@ -269,7 +269,7 @@ describe("regression #211: delivery payload isolation", () => {
 		expect(canonicalUser?.content).toEqual([{ type: "text", text: "queued immutable payload" }]);
 		expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("completed");
 		expect(harness.session.getSteeringMessages()).toEqual([]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 });

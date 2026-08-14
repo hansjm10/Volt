@@ -1752,24 +1752,17 @@ describe("SubagentManager", () => {
 		expect(abortSpy).toHaveBeenCalled();
 	});
 
-	it("preserves an externally chained hook wrapper installed after spawn", async () => {
-		let childSession: SubagentRuntimeCreatedEvent["runtime"]["session"] | undefined;
-		let externalBeforeToolCall: unknown;
-		let externalNextAction: unknown;
+	it("composes an independently scoped turn policy with the budget policy", async () => {
+		let externalNextActionCalls = 0;
+		let unregisterExternalPolicy: (() => void) | undefined;
 		const { manager } = await createTestManager({
 			onRuntimeCreated: (event) => {
-				const agent = event.runtime.session.agent;
-				const innerBeforeToolCall = agent.beforeToolCall;
-				const innerNextAction = agent.nextAction;
-				const wrappedBeforeToolCall: typeof innerBeforeToolCall = async (context, signal) =>
-					innerBeforeToolCall?.(context, signal);
-				const wrappedNextAction: NonNullable<typeof innerNextAction> = async (context, signal) =>
-					innerNextAction ? await innerNextAction(context, signal) : context.defaultAction;
-				agent.beforeToolCall = wrappedBeforeToolCall;
-				agent.nextAction = wrappedNextAction;
-				externalBeforeToolCall = wrappedBeforeToolCall;
-				externalNextAction = wrappedNextAction;
-				childSession = event.runtime.session;
+				unregisterExternalPolicy = event.runtime.session.registerTurnPolicy({
+					nextAction: (context) => {
+						externalNextActionCalls++;
+						return context.defaultAction;
+					},
+				});
 			},
 		});
 
@@ -1777,13 +1770,10 @@ describe("SubagentManager", () => {
 		const completion = handle.waitForEnd();
 		await handle.prompt("finish quickly");
 		await completion;
+		expect(externalNextActionCalls).toBeGreaterThan(0);
+		unregisterExternalPolicy?.();
+		unregisterExternalPolicy?.();
 		await handle.dispose();
-
-		if (!childSession) throw new Error("expected the child session");
-		// Teardown must not clobber the externally chained wrappers: the budget
-		// wrappers are no longer the installed hooks, so restore is skipped.
-		expect(childSession.agent.beforeToolCall).toBe(externalBeforeToolCall);
-		expect(childSession.agent.nextAction).toBe(externalNextAction);
 	});
 
 	it("applies finite manager aggregate consumption overrides with field-specific abort errors", async () => {

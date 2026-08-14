@@ -34,16 +34,16 @@ describe("regression #207: delivery run outcomes", () => {
 		await expect(harness.session.prompt("bounded retained prompt")).resolves.toBeUndefined();
 
 		expect(preparationAttempts).toBe(1);
-		expect(harness.session.agent.state.errorMessage).toBe("injected retained attempt");
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.session.state.errorMessage).toBe("injected retained attempt");
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(getUserTexts(harness)).toEqual([]);
 		expect(harness.getPendingResponseCount()).toBe(1);
 
 		failPreparation = false;
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		expect(preparationAttempts).toBe(2);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(getUserTexts(harness)).toEqual(["bounded retained prompt"]);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
@@ -81,14 +81,14 @@ describe("regression #207: delivery run outcomes", () => {
 
 		expect(retryEnds).toEqual([{ success: false, finalError: "retained during provider retry" }]);
 		expect(retryDecisions).toEqual([true, false]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(harness.getPendingResponseCount()).toBe(1);
 
 		failDelivery = false;
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		expect(retryEnds).toEqual([{ success: false, finalError: "retained during provider retry" }]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 });

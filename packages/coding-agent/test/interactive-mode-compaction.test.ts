@@ -4,9 +4,7 @@ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 describe("InteractiveMode extension settlement", () => {
 	test("binds extension waitForIdle to the session settlement boundary", async () => {
 		const sessionWaitForIdle = vi.fn(async () => undefined);
-		const agentWaitForIdle = vi.fn(async () => undefined);
 		const session = {
-			agent: { waitForIdle: agentWaitForIdle },
 			isBusy: true,
 			bindExtensions: vi.fn(
 				async (_options: { commandContextActions: { waitForIdle(): Promise<void> } }) => undefined,
@@ -37,7 +35,6 @@ describe("InteractiveMode extension settlement", () => {
 		await options.commandContextActions.waitForIdle();
 
 		expect(sessionWaitForIdle).toHaveBeenCalledOnce();
-		expect(agentWaitForIdle).not.toHaveBeenCalled();
 
 		options.shutdownHandler();
 		expect(fakeThis.shutdownRequested).toBe(true);

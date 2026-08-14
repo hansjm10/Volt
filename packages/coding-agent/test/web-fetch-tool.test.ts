@@ -663,7 +663,7 @@ describe("web_fetch session integration", () => {
 			timestamp: Date.now(),
 		});
 
-		const tool = session.agent.state.tools.find((candidate) => candidate.name === "web_fetch");
+		const tool = session.state.tools.find((candidate) => candidate.name === "web_fetch");
 		expect(tool).toBeDefined();
 		const blocked = "web_fetch can only read URLs that already appeared in this conversation";
 
@@ -708,7 +708,7 @@ describe("web_fetch session integration", () => {
 			timestamp: Date.now(),
 		});
 
-		const tool = session.agent.state.tools.find((candidate) => candidate.name === "web_fetch");
+		const tool = session.state.tools.find((candidate) => candidate.name === "web_fetch");
 		expect(tool).toBeDefined();
 		const blocked = "web_fetch can only read URLs that already appeared in this conversation";
 
@@ -749,9 +749,9 @@ describe("web_fetch session integration", () => {
 			timestamp: Date.now(),
 		});
 		session.sessionManager.appendCompaction("The earlier user message was summarized.", firstKeptEntryId, 1_000);
-		session.agent.state.messages = session.sessionManager.buildSessionContext().messages;
+		session.state.messages = session.sessionManager.buildSessionContext().messages;
 		expect(
-			session.agent.state.messages.some(
+			session.state.messages.some(
 				(message) =>
 					message.role === "user" &&
 					(typeof message.content === "string"
@@ -760,7 +760,7 @@ describe("web_fetch session integration", () => {
 			),
 		).toBe(false);
 
-		const tool = session.agent.state.tools.find((candidate) => candidate.name === "web_fetch");
+		const tool = session.state.tools.find((candidate) => candidate.name === "web_fetch");
 		const blocked = "web_fetch can only read URLs that already appeared in this conversation";
 		const error = await tool!.execute("session-compacted", { url: USER_URL }).then(
 			() => undefined,

@@ -2402,12 +2402,8 @@ function createRuntimeHost(
 				sessionListeners.add(listener);
 				return () => sessionListeners.delete(listener);
 			}),
-			agent: {
-				state: {
-					pendingToolExecutions: new Map(),
-				},
-				subscribe: vi.fn(() => () => {}),
-			},
+			activeToolExecutions: new Map(),
+			subscribeRuntimeEvents: vi.fn(() => () => {}),
 			get activeCompaction() {
 				return resources.activeCompaction;
 			},

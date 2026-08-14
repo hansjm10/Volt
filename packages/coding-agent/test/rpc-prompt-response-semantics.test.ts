@@ -1,7 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@hansjm10/volt-agent-core";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
@@ -17,7 +16,7 @@ import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
-import { createTestResourceLoader } from "./utilities.ts";
+import { createTestAgentSessionRuntimeConfig, createTestResourceLoader } from "./utilities.ts";
 
 const rpcIo = vi.hoisted(() => ({
 	outputLines: [] as string[],
@@ -127,13 +126,8 @@ function createRuntimeHost(options: {
 	}
 
 	let streamCallCount = 0;
-	const agent = new Agent({
-		getApiKey: () => "test-key",
-		initialState: {
-			model,
-			systemPrompt: "Test",
-			tools: [],
-		},
+	const runtimeConfig = createTestAgentSessionRuntimeConfig({
+		model,
 		streamFn: (_model, _context, _options) => {
 			streamCallCount++;
 			const stream = new MockAssistantStream();
@@ -156,7 +150,7 @@ function createRuntimeHost(options: {
 	}
 
 	const session = new AgentSession({
-		agent,
+		...runtimeConfig,
 		sessionManager,
 		settingsManager,
 		cwd: tempDir,

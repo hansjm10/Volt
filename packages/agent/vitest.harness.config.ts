@@ -14,7 +14,7 @@ export default defineConfig({
 		coverage: {
 			provider: "v8",
 			all: true,
-			include: ["src/harness/**/*.ts", "src/agent.ts", "src/agent-loop.ts"],
+			include: ["src/harness/**/*.ts", "src/agent-loop.ts"],
 			exclude: ["src/**/*.d.ts"],
 			reporter: ["text", "html", "lcov"],
 			reportsDirectory: "coverage/harness",

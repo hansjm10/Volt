@@ -1,4 +1,3 @@
-import { Agent } from "@hansjm10/volt-agent-core";
 import { type AssistantMessage, getModel, type Usage } from "@hansjm10/volt-ai";
 import { describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
@@ -6,7 +5,7 @@ import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
-import { createTestResourceLoader } from "./utilities.ts";
+import { createTestAgentSessionRuntimeConfig, createTestResourceLoader } from "./utilities.ts";
 
 const model = getModel("anthropic", "claude-sonnet-4-5")!;
 
@@ -69,15 +68,7 @@ function createSession() {
 	const authStorage = AuthStorage.inMemory();
 	authStorage.setRuntimeApiKey("anthropic", "test-key");
 	const session = new AgentSession({
-		agent: new Agent({
-			getApiKey: () => "test-key",
-			initialState: {
-				model,
-				systemPrompt: "You are a helpful assistant.",
-				tools: [],
-				thinkingLevel: "high",
-			},
-		}),
+		...createTestAgentSessionRuntimeConfig({ model, thinkingLevel: "high" }),
 		sessionManager,
 		settingsManager,
 		cwd: process.cwd(),
@@ -89,7 +80,7 @@ function createSession() {
 }
 
 function syncAgentMessages(session: AgentSession, sessionManager: SessionManager): void {
-	session.agent.state.messages = sessionManager.buildSessionContext().messages;
+	session.state.messages = sessionManager.buildSessionContext().messages;
 }
 
 describe("AgentSession.getSessionStats", () => {

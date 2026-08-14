@@ -2,7 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
-import { fauxAssistantMessage, fauxToolCall, type Model } from "@hansjm10/volt-ai";
+import { fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import type { InputEvent } from "../../src/core/extensions/index.ts";
@@ -382,7 +382,7 @@ describe("AgentSession prompt characterization", () => {
 	it("throws when prompting without a model", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.session.agent.state.model = undefined as unknown as Model<any>;
+		await harness.control.setModel(undefined);
 
 		await expect(harness.session.prompt("hi")).rejects.toThrow("No model selected.");
 	});

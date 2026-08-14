@@ -1,7 +1,14 @@
-import { fauxAssistantMessage, fauxToolCall, registerFauxProvider, type StreamOptions } from "@hansjm10/volt-ai";
+import {
+	fauxAssistantMessage,
+	fauxToolCall,
+	registerFauxProvider,
+	type SimpleStreamOptions as StreamOptions,
+	streamSimple,
+} from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentHarness } from "../../src/harness/agent-harness.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
+import { convertToLlm } from "../../src/harness/messages.ts";
 import { InMemorySessionStorage } from "../../src/harness/session/memory-storage.ts";
 import { Session } from "../../src/harness/session/session.ts";
 import { calculateTool } from "../utils/calculate.ts";
@@ -23,6 +30,7 @@ function captureOptions(options: StreamOptions | undefined): StreamOptions {
 		...options,
 		...(options?.headers ? { headers: { ...options.headers } } : {}),
 		...(options?.metadata ? { metadata: { ...options.metadata } } : {}),
+		...(options?.env ? { env: { ...options.env } } : {}),
 	};
 }
 
@@ -35,6 +43,32 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe("AgentHarness stream configuration", () => {
+	it("uses configurable base stream and message converter functions", async () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		registration.setResponses([() => fauxAssistantMessage("ok")]);
+		let streamCalls = 0;
+		let converterCalls = 0;
+		const harness = createHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session: new Session(new InMemorySessionStorage()),
+			model: registration.getModel(),
+			streamFn: async (model, context, options) => {
+				streamCalls++;
+				return streamSimple(model, context, options);
+			},
+			convertToLlm: async (messages) => {
+				converterCalls++;
+				return convertToLlm(messages);
+			},
+		});
+
+		await harness.prompt("hello");
+
+		expect(streamCalls).toBe(1);
+		expect(converterCalls).toBe(1);
+	});
+
 	it("snapshots stream options and merges auth headers before provider request hooks", async () => {
 		let capturedOptions: StreamOptions | undefined;
 		const registration = registerFauxProvider();
@@ -53,15 +87,25 @@ describe("AgentHarness stream configuration", () => {
 			model: registration.getModel(),
 			streamOptions: {
 				timeoutMs: 1000,
+				websocketConnectTimeoutMs: 1500,
 				maxRetries: 2,
 				maxRetryDelayMs: 3000,
 				headers: { "x-base": "base" },
 				metadata: { base: true },
+				env: { BASE_ENV: "base", SHARED_ENV: "base" },
+				inferenceSpeed: "fast",
+				thinkingBudgets: { low: 128 },
+				transport: "websocket",
 				cacheRetention: "none",
 			},
-			getApiKeyAndHeaders: async () => ({ apiKey: "secret", headers: { "x-auth": "auth" } }),
+			getApiKeyAndHeaders: async () => ({
+				apiKey: "secret",
+				headers: { "x-auth": "auth" },
+				env: { AUTH_ENV: "auth", SHARED_ENV: "auth" },
+			}),
 		});
 
+		let responseHookCalls = 0;
 		harness.on("before_provider_request", (event) => {
 			expect(event.sessionId).toBe("session-1");
 			expect(event.streamOptions.headers).toEqual({ "x-base": "base", "x-auth": "auth" });
@@ -72,19 +116,30 @@ describe("AgentHarness stream configuration", () => {
 				},
 			};
 		});
+		harness.on("after_provider_response", (event) => {
+			responseHookCalls++;
+			expect(event.status).toBe(200);
+			return undefined;
+		});
 
 		await harness.prompt("hello");
 
+		expect(responseHookCalls).toBe(1);
 		expect(capturedOptions).toMatchObject({
 			apiKey: "secret",
 			timeoutMs: 1000,
+			websocketConnectTimeoutMs: 1500,
 			maxRetries: 2,
 			maxRetryDelayMs: 3000,
 			sessionId: "session-1",
+			inferenceSpeed: "fast",
+			thinkingBudgets: { low: 128 },
+			transport: "websocket",
 			cacheRetention: "none",
 		});
 		expect(capturedOptions?.headers).toEqual({ "x-base": "base", "x-auth": "auth", "x-hook": "hook" });
 		expect(capturedOptions?.metadata).toEqual({ base: true, hook: true });
+		expect(capturedOptions?.env).toEqual({ BASE_ENV: "base", AUTH_ENV: "auth", SHARED_ENV: "auth" });
 	});
 
 	it("stops before provider hooks when aborted during credential resolution", async () => {

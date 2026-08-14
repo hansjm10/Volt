@@ -68,7 +68,7 @@ describe("regression #199: approved plan finalization", () => {
 		});
 		harnesses.push(harness);
 		await createReadyPlan(harness);
-		harness.session.agent.state.messages = [createUserMessage("existing context")];
+		harness.session.state.messages = [createUserMessage("existing context")];
 		harness.setResponses([
 			fauxAssistantMessage("revoked delivery omitted"),
 			fauxAssistantMessage("feedback admitted"),
@@ -82,11 +82,11 @@ describe("regression #199: approved plan finalization", () => {
 			.filter(
 				(event) => event.message.role === "custom" && event.message.customType === "volt-plan-checkpoint",
 			).length;
-		harness.session.agent.steer(createUserMessage("revoked feedback"));
+		harness.control.queueSteer(createUserMessage("revoked feedback"));
 
-		const firstRun = harness.session.agent.continue();
+		const firstRun = harness.control.continue();
 		await preparationStarted.promise;
-		expect(harness.session.agent.clearSteeringQueue()).toHaveLength(1);
+		expect(await harness.control.clearSteeringQueue()).toHaveLength(1);
 		releasePreparation.resolve();
 		await firstRun;
 
@@ -101,8 +101,8 @@ describe("regression #199: approved plan finalization", () => {
 			planningEntryCount,
 		);
 
-		harness.session.agent.steer(createUserMessage("admitted feedback"));
-		await harness.session.agent.continue();
+		harness.control.queueSteer(createUserMessage("admitted feedback"));
+		await harness.control.continue();
 		expect(harness.session.planningState.plan?.phase).toBe("draft");
 		expect(harness.eventsOfType("planning_state_changed")).toHaveLength(planningEventCount + 1);
 		expect(
@@ -139,13 +139,13 @@ describe("regression #199: approved plan finalization", () => {
 		);
 
 		harness.setResponses([fauxAssistantMessage("feedback committed")]);
-		harness.session.agent.steer(createUserMessage("admitted feedback"));
-		await harness.session.agent.continue();
+		harness.control.queueSteer(createUserMessage("admitted feedback"));
+		await harness.control.continue();
 
 		expect(predecessorCommits).toBe(1);
 		expect(harness.session.planningState.plan?.phase).toBe("draft");
 		expect(
-			harness.session.agent.state.messages
+			harness.session.state.messages
 				.slice(0, 3)
 				.map((message) => (message.role === "custom" ? message.customType : message.role)),
 		).toEqual(["volt-plan-checkpoint", "user", "user"]);
@@ -159,7 +159,7 @@ describe("regression #199: approved plan finalization", () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		await createReadyPlan(harness);
-		harness.session.agent.steeringMode = "all";
+		harness.session.setSteeringMode("all");
 		const planningEntryCount = harness.sessionManager
 			.getBranch()
 			.filter((entry) => entry.type === "planning_state_change").length;
@@ -170,10 +170,10 @@ describe("regression #199: approved plan finalization", () => {
 				(event) => event.message.role === "custom" && event.message.customType === "volt-plan-checkpoint",
 			).length;
 		harness.setResponses([fauxAssistantMessage("feedback admitted")]);
-		harness.session.agent.steer(createUserMessage("first feedback"));
-		harness.session.agent.steer(createUserMessage("second feedback"));
+		harness.control.queueSteer(createUserMessage("first feedback"));
+		harness.control.queueSteer(createUserMessage("second feedback"));
 
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		expect(harness.session.planningState.plan?.phase).toBe("draft");
 		expect(
@@ -316,10 +316,10 @@ describe("regression #199: approved plan finalization", () => {
 					tools: context.tools?.map((tool) => tool.name) ?? [],
 					systemPrompt: context.systemPrompt ?? "",
 				});
-				harness.session.agent.followUp(createUserMessage("queued during final-response retry"));
+				harness.control.queueFollowUp(createUserMessage("queued during final-response retry"));
 				return fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" });
 			},
-			(context) => {
+			async (context) => {
 				requestSnapshots.push({
 					tools: context.tools?.map((tool) => tool.name) ?? [],
 					systemPrompt: context.systemPrompt ?? "",
@@ -327,7 +327,7 @@ describe("regression #199: approved plan finalization", () => {
 				retriedRequestContainedQueuedInput = JSON.stringify(context.messages).includes(
 					"queued during final-response retry",
 				);
-				clearedQueuedDeliveries = harness.session.agent.clearFollowUpQueue().length;
+				clearedQueuedDeliveries = (await harness.control.clearFollowUpQueue()).length;
 				return fauxAssistantMessage("Final response after retry");
 			},
 			(context) => {
@@ -370,7 +370,7 @@ describe("regression #199: approved plan finalization", () => {
 		const olderAssistant = fauxAssistantMessage("older completed response");
 		harness.sessionManager.appendMessage(olderUser);
 		harness.sessionManager.appendMessage(olderAssistant);
-		harness.session.agent.state.messages = [olderUser, olderAssistant];
+		harness.session.state.messages = [olderUser, olderAssistant];
 		await harness.session.setAgentMode("plan");
 		const draft = harness.session.updatePlan({ steps: [{ text: "Finish compacted implementation" }] });
 		const ready = harness.session.submitPlan({
@@ -408,10 +408,10 @@ describe("regression #199: approved plan finalization", () => {
 					tools: context.tools?.map((tool) => tool.name) ?? [],
 					systemPrompt: context.systemPrompt ?? "",
 				});
-				harness.session.agent.followUp(createUserMessage("queued during final-response compaction"));
+				harness.control.queueFollowUp(createUserMessage("queued during final-response compaction"));
 				return fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long" });
 			},
-			(context) => {
+			async (context) => {
 				requestSnapshots.push({
 					tools: context.tools?.map((tool) => tool.name) ?? [],
 					systemPrompt: context.systemPrompt ?? "",
@@ -419,7 +419,7 @@ describe("regression #199: approved plan finalization", () => {
 				compactedRequestContainedQueuedInput = JSON.stringify(context.messages).includes(
 					"queued during final-response compaction",
 				);
-				clearedQueuedDeliveries = harness.session.agent.clearFollowUpQueue().length;
+				clearedQueuedDeliveries = (await harness.control.clearFollowUpQueue()).length;
 				return fauxAssistantMessage("Final response after compaction");
 			},
 		]);

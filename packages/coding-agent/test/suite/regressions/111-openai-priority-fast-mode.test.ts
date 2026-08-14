@@ -17,19 +17,19 @@ describe("issue #111 OpenAI Priority fast mode", () => {
 		harness.setResponses([fauxAssistantMessage("fast"), fauxAssistantMessage("standard")]);
 
 		const observed: Array<SimpleStreamOptions["inferenceSpeed"]> = [];
-		const originalStreamFn = harness.session.agent.streamFn;
-		harness.session.agent.streamFn = (model, context, options) => {
+		const originalStreamFn = harness.control.getStreamFn();
+		harness.control.setStreamFn((model, context, options) => {
 			observed.push(options?.inferenceSpeed);
 			return originalStreamFn(model, context, options);
-		};
+		});
 		const thinkingLevel = harness.session.thinkingLevel;
 
 		await harness.session.setFastModeEnabled(true);
-		expect(harness.session.agent.inferenceSpeed).toBe("fast");
+		expect(harness.control.getInferenceSpeed()).toBe("fast");
 		await harness.session.prompt("use priority processing");
 
 		await harness.session.setFastModeEnabled(false);
-		expect(harness.session.agent.inferenceSpeed).toBe("standard");
+		expect(harness.control.getInferenceSpeed()).toBe("standard");
 		await harness.session.prompt("use standard processing");
 
 		expect(observed).toEqual(["fast", "standard"]);

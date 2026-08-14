@@ -161,13 +161,13 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 		});
 
 		await preparationStarted.promise;
-		expect(harness.session.agent.discardPendingPrompt()).toHaveLength(1);
+		expect(await harness.control.discardPendingPrompt()).toHaveLength(1);
 		releasePreparation.resolve();
 		await expect(prompting).rejects.toThrow("Delivery was revoked before canonical commitment");
 
 		expect(preflight).toEqual([{ success: false }]);
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
-		expect(harness.session.agent.hasPendingPrompt()).toBe(false);
+		expect(harness.control.hasPendingPrompt()).toBe(false);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
@@ -194,15 +194,15 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 		});
 		await preparationStarted.promise;
 		await harness.session.steer("clear while preparing");
-		const sessionRevocation = harness.session.agent.deliveryRevoked;
+		const sessionRevocation = harness.control.getDeliveryRevoked();
 		let discardedPrompt = false;
-		harness.session.agent.deliveryRevoked = (delivery) => {
+		harness.control.setDeliveryRevoked((delivery) => {
 			if (delivery.kind === "steer" && !discardedPrompt) {
 				discardedPrompt = true;
-				harness!.session.agent.discardPendingPrompt();
+				void harness!.control.discardPendingPrompt();
 			}
 			sessionRevocation?.(delivery);
-		};
+		});
 
 		await harness.session.clearQueue();
 		releasePreparation.resolve();
@@ -210,7 +210,7 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 
 		expect(preflight).toEqual([{ success: false }]);
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
@@ -234,13 +234,13 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 		).rejects.toThrow(appendFailure.message);
 		expect(firstPreflight).toEqual([{ success: false }]);
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
-		expect(harness.session.agent.hasPendingPrompt()).toBe(true);
+		expect(harness.control.hasPendingPrompt()).toBe(true);
 		expect(harness.getPendingResponseCount()).toBe(1);
 
 		appendSpy.mockImplementation(appendMessage);
 		await harness.session.prompt("append retry", { clientMessageId, source: "rpc" });
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
-		expect(harness.session.agent.hasPendingPrompt()).toBe(false);
+		expect(harness.control.hasPendingPrompt()).toBe(false);
 		expect(getUserTexts(harness)).toEqual(["append retry"]);
 	});
 
@@ -272,12 +272,12 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 		});
 		harness.setResponses([fauxAssistantMessage("committed")]);
 
-		await expect(harness.session.agent.prompt(createUserMessage("original"))).resolves.toMatchObject({
+		await expect(harness.control.run(createUserMessage("original"))).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: { outcome: "retained" },
 		});
 		retain = false;
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		expect(extensionRuns).toBe(1);
 		expect(getUserTexts(harness)).toEqual(["transformed once (1)"]);
@@ -288,9 +288,7 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 		harness.setResponses([fauxAssistantMessage("must not run")]);
 		vi.spyOn(harness.sessionManager, "flush").mockRejectedValueOnce(new Error("injected durability failure"));
 
-		await expect(
-			harness.session.agent.prompt(createUserMessage("uncertain canonical append")),
-		).resolves.toMatchObject({
+		await expect(harness.control.run(createUserMessage("uncertain canonical append"))).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: {
 				kind: "prompt",
@@ -300,7 +298,7 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 			},
 		});
 
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 });

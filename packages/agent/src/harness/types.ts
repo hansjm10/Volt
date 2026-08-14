@@ -1,13 +1,28 @@
 import type {
 	ImageContent,
+	InferenceSpeed,
 	JsonObject,
 	JsonValue,
+	Message,
 	Model,
+	ProviderEnv,
 	SimpleStreamOptions,
 	TextContent,
+	ThinkingBudgets,
 	Transport,
 } from "@hansjm10/volt-ai";
-import type { AgentEvent, AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "../index.ts";
+import type {
+	AgentDelivery,
+	AgentDeliveryPreparation,
+	AgentEvent,
+	AgentLoopNextAction,
+	AgentLoopNextActionContext,
+	AgentMessage,
+	AgentTool,
+	QueueMode,
+	StreamFn,
+	ThinkingLevel,
+} from "../index.ts";
 import type { Session } from "./session/session.ts";
 
 /** Result of a fallible operation. Expected failures are returned as `ok: false` instead of thrown. */
@@ -91,10 +106,18 @@ export interface AgentHarnessStreamOptions {
 	transport?: Transport;
 	/** Provider request timeout in milliseconds. */
 	timeoutMs?: number;
+	/** WebSocket connection/open timeout in milliseconds. */
+	websocketConnectTimeoutMs?: number;
 	/** Maximum provider retry attempts. */
 	maxRetries?: number;
 	/** Optional cap for provider-requested retry delays. */
 	maxRetryDelayMs?: number;
+	/** Provider-neutral inference speed preference. */
+	inferenceSpeed?: InferenceSpeed;
+	/** Per-level thinking token budgets. */
+	thinkingBudgets?: ThinkingBudgets;
+	/** Provider-scoped environment overrides. */
+	env?: ProviderEnv;
 	/** Additional request headers merged with auth and lifecycle headers. */
 	headers?: Record<string, string>;
 	/** Provider metadata forwarded with requests. */
@@ -109,10 +132,18 @@ export interface AgentHarnessStreamOptionsPatch {
 	transport?: Transport | undefined;
 	/** Timeout patch. Explicit `undefined` clears the configured timeout. */
 	timeoutMs?: number | undefined;
+	/** WebSocket connection timeout patch. */
+	websocketConnectTimeoutMs?: number | undefined;
 	/** Retry-count patch. Explicit `undefined` clears the configured retry count. */
 	maxRetries?: number | undefined;
 	/** Retry-delay patch. Explicit `undefined` clears the configured retry-delay cap. */
 	maxRetryDelayMs?: number | undefined;
+	/** Inference-speed patch. */
+	inferenceSpeed?: InferenceSpeed | undefined;
+	/** Thinking-budget replacement. */
+	thinkingBudgets?: ThinkingBudgets | undefined;
+	/** Provider environment patch. `undefined` values delete keys. */
+	env?: Record<string, string | undefined> | undefined;
 	/** Cache-retention patch. Explicit `undefined` clears the configured hint. */
 	cacheRetention?: SimpleStreamOptions["cacheRetention"] | undefined;
 	/** Header patch. `undefined` values delete keys; explicit `headers: undefined` clears all headers. */
@@ -227,6 +258,7 @@ export type AgentHarnessErrorCode =
 	| "invalid_argument"
 	| "session"
 	| "hook"
+	| "delivery"
 	| "auth"
 	| "compaction"
 	| "branch_summary"
@@ -460,7 +492,8 @@ export interface SessionStorage<TMetadata extends SessionMetadata = SessionMetad
 	/** Persist a leaf entry that records the active session-tree leaf. */
 	setLeafId(leafId: string | null): Promise<void>;
 	createEntryId(): Promise<string>;
-	appendEntry(entry: SessionTreeEntry): Promise<void>;
+	/** Append an entry and return its canonical persisted identity. */
+	appendEntry(entry: SessionTreeEntry): Promise<string>;
 	getEntry(id: string): Promise<SessionTreeEntry | undefined>;
 	findEntries<TType extends SessionTreeEntry["type"]>(
 		type: TType,
@@ -526,12 +559,6 @@ export interface SavePointEvent {
 	hadPendingMutations: boolean;
 }
 
-export interface AbortEvent {
-	type: "abort";
-	clearedSteer: AgentMessage[];
-	clearedFollowUp: AgentMessage[];
-}
-
 export interface SettledEvent {
 	type: "settled";
 	nextTurnCount: number;
@@ -551,6 +578,11 @@ export interface BeforeAgentStartEvent<
 export interface ContextEvent {
 	type: "context";
 	messages: AgentMessage[];
+}
+
+export interface NextActionEvent extends AgentLoopNextActionContext {
+	type: "next_action";
+	signal: AbortSignal;
 }
 
 export interface BeforeProviderRequestEvent {
@@ -577,6 +609,10 @@ export interface ToolCallEvent {
 	toolCallId: string;
 	toolName: string;
 	input: JsonObject;
+	/** Current block decision from earlier reducers. */
+	block?: boolean;
+	/** Current block reason from earlier reducers. */
+	reason?: string;
 }
 
 export interface ToolResultEvent {
@@ -619,7 +655,7 @@ export interface SessionTreeEvent {
 
 export interface ModelUpdateEvent {
 	type: "model_update";
-	model: Model<any>;
+	model: Model<any> | undefined;
 	previousModel: Model<any> | undefined;
 	source: "set" | "restore";
 }
@@ -654,10 +690,10 @@ export type AgentHarnessOwnEvent<
 > =
 	| QueueUpdateEvent
 	| SavePointEvent
-	| AbortEvent
 	| SettledEvent
 	| BeforeAgentStartEvent<TSkill, TPromptTemplate>
 	| ContextEvent
+	| NextActionEvent
 	| BeforeProviderRequestEvent
 	| BeforeProviderPayloadEvent
 	| AfterProviderResponseEvent
@@ -683,6 +719,10 @@ export interface BeforeAgentStartResult {
 
 export interface ContextResult {
 	messages: AgentMessage[];
+}
+
+export interface MessageEndResult {
+	message: AgentMessage;
 }
 
 export interface BeforeProviderRequestResult {
@@ -721,6 +761,8 @@ export interface SessionBeforeTreeResult {
 export type AgentHarnessEventResultMap = {
 	before_agent_start: BeforeAgentStartResult | undefined;
 	context: ContextResult | undefined;
+	message_end: MessageEndResult | undefined;
+	next_action: AgentLoopNextAction | undefined;
 	before_provider_request: BeforeProviderRequestResult | undefined;
 	before_provider_payload: BeforeProviderPayloadResult | undefined;
 	after_provider_response: undefined;
@@ -736,18 +778,24 @@ export type AgentHarnessEventResultMap = {
 	tools_update: undefined;
 	queue_update: undefined;
 	save_point: undefined;
-	abort: undefined;
 	settled: undefined;
 };
 
-export interface AgentHarnessPromptOptions {
+export interface AgentHarnessRunOptions {
+	/** Override the configured system prompt for this bounded run. */
+	systemPrompt?: string;
+	/** Override provider context for this run without changing canonical session history. */
+	context?: readonly AgentMessage[];
+}
+
+export interface AgentHarnessPromptOptions extends AgentHarnessRunOptions {
 	images?: ImageContent[];
 }
 
-export interface AbortResult {
-	clearedSteer: AgentMessage[];
-	clearedFollowUp: AgentMessage[];
-}
+export type AgentHarnessNextActionPolicy = (
+	context: AgentLoopNextActionContext,
+	signal: AbortSignal,
+) => AgentLoopNextAction | undefined | Promise<AgentLoopNextAction | undefined>;
 
 export interface CompactResult {
 	summary: string;
@@ -839,11 +887,25 @@ export interface AgentHarnessOptions<
 		  }) => string | Promise<string>);
 	getApiKeyAndHeaders?: (
 		model: Model<any>,
-	) => Promise<{ apiKey: string; headers?: Record<string, string> } | undefined>;
+	) => Promise<{ apiKey: string; headers?: Record<string, string>; env?: ProviderEnv } | undefined>;
+	/** Base provider stream implementation wrapped by Harness lifecycle policy. */
+	streamFn?: StreamFn;
+	/** Convert application messages into provider-compatible messages. */
+	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** Curated stream/provider request options. Snapshotted at turn start. */
 	streamOptions?: AgentHarnessStreamOptions;
-	model: Model<any>;
+	/** Stage a leased inbox delivery before its irrevocable begin boundary. */
+	prepareDelivery?: (
+		delivery: AgentDelivery,
+		signal: AbortSignal,
+	) => Promise<AgentDeliveryPreparation> | AgentDeliveryPreparation;
+	/** Observe revocation so host projections can release delivery-coupled state. */
+	deliveryRevoked?: (delivery: AgentDelivery) => void;
+	/** May be omitted at construction, but must be set before a model-backed operation starts. */
+	model?: Model<any>;
 	thinkingLevel?: ThinkingLevel;
+	/** Persist active-tool projections through the session. Disable when the host owns that policy outside session context. */
+	persistActiveToolChanges?: boolean;
 	activeToolNames?: string[];
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;

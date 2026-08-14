@@ -89,11 +89,12 @@ export class InMemorySessionStorage<TMetadata extends SessionMetadata = SessionM
 		return generateEntryId(this.byId);
 	}
 
-	async appendEntry(entry: SessionTreeEntry): Promise<void> {
+	async appendEntry(entry: SessionTreeEntry): Promise<string> {
 		this.entries.push(entry);
 		this.byId.set(entry.id, entry);
 		updateLabelCache(this.labelsById, entry);
 		this.leafId = leafIdAfterEntry(entry);
+		return entry.id;
 	}
 
 	async getEntry(id: string): Promise<SessionTreeEntry | undefined> {

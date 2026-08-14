@@ -130,7 +130,7 @@ export interface AgentRunSnapshot {
 	readonly phase: "open" | "terminal_event_settling" | "settled";
 }
 
-/** Delivery class used by the Agent-owned inbox. */
+/** Delivery class used by the stateful orchestrator's inbox. */
 export type AgentDeliveryKind = "prompt" | "steer" | "followUp";
 
 /** Stable pending delivery passed to `prepareDelivery`. */
@@ -141,7 +141,7 @@ export interface AgentDelivery {
 	readonly messages: readonly AgentMessage[];
 }
 
-/** Result returned by a host participant after Agent crosses the revocation cutoff. */
+/** Result returned by a host participant after the orchestrator crosses the revocation cutoff. */
 export type AgentDeliveryParticipantOutcome =
 	| { readonly outcome: "committed" }
 	| { readonly outcome: "retained"; readonly error: Error }
@@ -149,14 +149,14 @@ export type AgentDeliveryParticipantOutcome =
 
 /** Reentrant-safe lifecycle capability available only while participant work settles. */
 export interface AgentDeliveryTransactionContext {
-	/** Record abort intent without awaiting the Agent run that invoked this participant. */
+	/** Record abort intent without awaiting the orchestrator run that invoked this participant. */
 	requestAbort(source?: AgentAbortSource): AgentAbortAcceptance;
 }
 
-/** Host durability work attached to one Agent-owned delivery attempt. */
+/** Host durability work attached to one orchestrator-owned delivery attempt. */
 export interface AgentDeliveryTransactionParticipant {
 	/**
-	 * Settle Agent's commit decision exactly once.
+	 * Settle the orchestrator's commit decision exactly once.
 	 *
 	 * Throwing or rejecting is classified as `terminally_failed`; safe replay
 	 * requires an explicit `retained` result.
@@ -183,13 +183,13 @@ export type AgentDeliveryFailure = AgentDeliveryAttemptBase &
 		| { readonly outcome: "terminally_failed"; readonly phase: "settlement"; readonly error: Error }
 	);
 
-/** Explicit terminal result for one Agent-owned delivery attempt. */
+/** Explicit terminal result for one orchestrator-owned delivery attempt. */
 export type AgentDeliveryAttemptResult =
 	| (AgentDeliveryAttemptBase & { readonly outcome: "committed" | "revoked" })
 	| (AgentDeliveryAttemptBase & { readonly outcome: "retained" })
 	| AgentDeliveryFailure;
 
-/** Explicit outcome of one bounded Agent run. */
+/** Explicit outcome of one bounded orchestrator run. */
 export type AgentRunResult =
 	| { readonly status: "completed"; readonly deliveries: readonly AgentDeliveryAttemptResult[] }
 	| {
@@ -222,7 +222,7 @@ export interface AgentLoopDelivery {
 	messages: AgentMessage[];
 }
 
-/** Explicit result of the Agent-owned commit decision for one delivery attempt. */
+/** Explicit result of the orchestrator-owned commit decision for one delivery attempt. */
 export type AgentLoopDeliveryOutcome =
 	| { readonly outcome: "committed" }
 	| { readonly outcome: "retained"; readonly error: Error }
@@ -355,11 +355,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	nextAction?: (context: AgentLoopNextActionContext) => AgentLoopNextAction | Promise<AgentLoopNextAction>;
 
 	/**
-	 * Cross the Agent-owned revocation cutoff and settle one delivery attempt.
+	 * Cross the orchestrator-owned revocation cutoff and settle one delivery attempt.
 	 *
 	 * The hook may await host durability. `committed` publishes the delivery,
 	 * `revoked` skips it, and retained or terminal failure stops the current run.
-	 * Queue ownership remains with Agent throughout settlement.
+	 * Queue ownership remains with the orchestrator throughout settlement.
 	 */
 	beginDelivery?: (delivery: AgentLoopDelivery) => AgentLoopDeliveryOutcome | Promise<AgentLoopDeliveryOutcome>;
 
@@ -440,7 +440,7 @@ export interface CustomAgentMessages {
  */
 export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];
 
-/** Tool call currently being executed by the agent. */
+/** Tool call currently being executed by the runtime. */
 export interface PendingToolExecution {
 	toolCallId: string;
 	toolName: string;
@@ -450,7 +450,7 @@ export interface PendingToolExecution {
 }
 
 /**
- * Public agent state.
+ * Public state projection shared by stateful agent runtimes.
  *
  * `tools` and `messages` use accessor properties so implementations can copy
  * assigned arrays before storing them.
@@ -469,7 +469,7 @@ export interface AgentState {
 	set messages(messages: AgentMessage[]);
 	get messages(): AgentMessage[];
 	/**
-	 * True while the agent is processing a prompt or continuation.
+	 * True while the runtime is processing a prompt or continuation.
 	 *
 	 * This remains true until awaited `agent_end` listeners settle.
 	 */
@@ -510,7 +510,7 @@ export type AgentToolUpdateCallback<T = unknown> = {
 	bivarianceHack(partialResult: AgentToolResult<T>): void;
 }["bivarianceHack"];
 
-/** Tool definition used by the agent runtime. */
+/** Tool definition used by an agent runtime. */
 export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = unknown> extends Tool<TParameters> {
 	/** Human-readable label for UI display. */
 	label: string;
@@ -547,11 +547,10 @@ export interface AgentContext {
 }
 
 /**
- * Events emitted by the Agent for UI updates.
+ * Events emitted by the low-level loop and stateful orchestrators for UI updates.
  *
- * `agent_end` is the last event emitted for a run, but awaited `Agent.subscribe()`
- * listeners for that event are still part of run settlement. The agent becomes
- * idle only after those listeners finish.
+ * `agent_end` is the last low-level event emitted for a run. Stateful
+ * orchestrators may include awaited terminal listeners in their idle barrier.
  */
 export type AgentEvent =
 	// Agent lifecycle

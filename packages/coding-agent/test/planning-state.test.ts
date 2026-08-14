@@ -25,6 +25,7 @@ import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createAgentSessionTestControl } from "./agent-session-test-control.ts";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
@@ -132,7 +133,7 @@ describe("native planning state", () => {
 	it("keeps Plan tools read-only and restores the exact requested Build set", async () => {
 		const { session } = await createPlanningSession();
 		const planTools = session.getActiveToolNames();
-		expect(await session.agent.transformContext?.([])).toEqual([]);
+		expect(await createAgentSessionTestControl(session).transformContext([])).toEqual([]);
 		expect(planTools).toEqual([
 			"read",
 			"web_search",
@@ -148,7 +149,7 @@ describe("native planning state", () => {
 		expect(planTools).not.toContain("bash");
 		expect(planTools).not.toContain("mutate_everything");
 
-		const submitBeforeResearch = await session.agent.beforeToolCall?.({
+		const submitBeforeResearch = await createAgentSessionTestControl(session).evaluateToolCallRequest({
 			toolCall: { type: "toolCall", id: "submit-early", name: "submit_plan", arguments: {} },
 			args: {},
 		} as never);
@@ -160,24 +161,24 @@ describe("native planning state", () => {
 			name: "lsp",
 			arguments: { action: "diagnostics" },
 		};
-		const readOnlyLsp = await session.agent.beforeToolCall?.({
+		const readOnlyLsp = await createAgentSessionTestControl(session).evaluateToolCallRequest({
 			toolCall: readOnlyLspCall,
 			args: { action: "diagnostics" },
 		} as never);
 		expect(readOnlyLsp).toBeUndefined();
-		await session.agent.afterToolCall?.({
+		await createAgentSessionTestControl(session).evaluateToolResultRequest({
 			toolCall: readOnlyLspCall,
 			args: { action: "diagnostics" },
 			result: { content: [{ type: "text", text: "No diagnostics" }] },
 			isError: false,
 		} as never);
-		const submitAfterResearch = await session.agent.beforeToolCall?.({
+		const submitAfterResearch = await createAgentSessionTestControl(session).evaluateToolCallRequest({
 			toolCall: { type: "toolCall", id: "submit-after-read", name: "submit_plan", arguments: {} },
 			args: {},
 		} as never);
 		expect(submitAfterResearch).toBeUndefined();
 
-		const mutatingLsp = await session.agent.beforeToolCall?.({
+		const mutatingLsp = await createAgentSessionTestControl(session).evaluateToolCallRequest({
 			toolCall: { type: "toolCall", id: "lsp-fix", name: "lsp", arguments: { action: "fix" } },
 			args: { action: "fix" },
 		} as never);
@@ -251,12 +252,12 @@ describe("native planning state", () => {
 				arguments: { action: "diagnostics" },
 			};
 			expect(
-				await session.agent.beforeToolCall?.({
+				await createAgentSessionTestControl(session).evaluateToolCallRequest({
 					toolCall: researchCall,
 					args: { action: "diagnostics" },
 				} as never),
 			).toBeUndefined();
-			await session.agent.afterToolCall?.({
+			await createAgentSessionTestControl(session).evaluateToolResultRequest({
 				toolCall: researchCall,
 				args: { action: "diagnostics" },
 				result: { content: [{ type: "text", text: "No diagnostics" }] },
@@ -266,7 +267,7 @@ describe("native planning state", () => {
 			const firstRequestStarted = createDeferred<void>();
 			const releaseFirstRequest = createDeferred<void>();
 			let request = 0;
-			session.agent.streamFn = () => {
+			createAgentSessionTestControl(session).setStreamFn(() => {
 				const current = request++;
 				const stream = new MockAssistantStream();
 				const respond = (): void => {
@@ -353,7 +354,7 @@ describe("native planning state", () => {
 					queueMicrotask(respond);
 				}
 				return stream;
-			};
+			});
 
 			const run = session.prompt("Submit the researched plan");
 			await firstRequestStarted.promise;
@@ -395,12 +396,12 @@ describe("native planning state", () => {
 				arguments: { path: "." },
 			};
 			expect(
-				await session.agent.beforeToolCall?.({
+				await createAgentSessionTestControl(session).evaluateToolCallRequest({
 					toolCall: initialResearchCall,
 					args: initialResearchCall.arguments,
 				} as never),
 			).toBeUndefined();
-			await session.agent.afterToolCall?.({
+			await createAgentSessionTestControl(session).evaluateToolResultRequest({
 				toolCall: initialResearchCall,
 				args: initialResearchCall.arguments,
 				result: { content: [{ type: "text", text: "agent/" }] },
@@ -418,7 +419,7 @@ describe("native planning state", () => {
 			const releaseFirstRequest = createDeferred<void>();
 			const requestContexts: Array<{ systemPrompt: string; tools: string[] }> = [];
 			let request = 0;
-			session.agent.streamFn = (_model, context) => {
+			createAgentSessionTestControl(session).setStreamFn((_model, context) => {
 				const current = request++;
 				requestContexts.push({
 					systemPrompt: context.systemPrompt ?? "",
@@ -512,9 +513,9 @@ describe("native planning state", () => {
 					queueMicrotask(respond);
 				}
 				return stream;
-			};
+			});
 
-			const run = session.agent.prompt("Continue Build work");
+			const run = session.prompt("Continue Build work");
 			await firstRequestStarted.promise;
 			await session.prompt("Add verification coverage", { streamingBehavior });
 			releaseFirstRequest.resolve();
@@ -546,7 +547,7 @@ describe("native planning state", () => {
 		const branchPointId = session.sessionManager.appendMessage(
 			createAssistantMessage([{ type: "text", text: "I will research it." }], "stop"),
 		);
-		session.agent.state.messages = session.sessionManager.buildSessionContext().messages;
+		session.state.messages = session.sessionManager.buildSessionContext().messages;
 		const researchCall = {
 			type: "toolCall" as const,
 			id: "research-before-navigation",
@@ -554,12 +555,12 @@ describe("native planning state", () => {
 			arguments: { action: "diagnostics" },
 		};
 		expect(
-			await session.agent.beforeToolCall?.({
+			await createAgentSessionTestControl(session).evaluateToolCallRequest({
 				toolCall: researchCall,
 				args: { action: "diagnostics" },
 			} as never),
 		).toBeUndefined();
-		await session.agent.afterToolCall?.({
+		await createAgentSessionTestControl(session).evaluateToolResultRequest({
 			toolCall: researchCall,
 			args: { action: "diagnostics" },
 			result: { content: [{ type: "text", text: "No diagnostics" }] },
@@ -589,7 +590,7 @@ describe("native planning state", () => {
 			},
 		};
 		expect(
-			await session.agent.beforeToolCall?.({
+			await createAgentSessionTestControl(session).evaluateToolCallRequest({
 				toolCall: submitCall,
 				args: submitCall.arguments,
 			} as never),
@@ -597,19 +598,19 @@ describe("native planning state", () => {
 
 		const freshResearchCall = { ...researchCall, id: "research-after-navigation" };
 		expect(
-			await session.agent.beforeToolCall?.({
+			await createAgentSessionTestControl(session).evaluateToolCallRequest({
 				toolCall: freshResearchCall,
 				args: { action: "diagnostics" },
 			} as never),
 		).toBeUndefined();
-		await session.agent.afterToolCall?.({
+		await createAgentSessionTestControl(session).evaluateToolResultRequest({
 			toolCall: freshResearchCall,
 			args: { action: "diagnostics" },
 			result: { content: [{ type: "text", text: "No diagnostics" }] },
 			isError: false,
 		} as never);
 		expect(
-			await session.agent.beforeToolCall?.({
+			await createAgentSessionTestControl(session).evaluateToolCallRequest({
 				toolCall: submitCall,
 				args: submitCall.arguments,
 			} as never),
@@ -677,7 +678,7 @@ describe("native planning state", () => {
 			}
 		});
 		let request = 0;
-		session.agent.streamFn = () => {
+		createAgentSessionTestControl(session).setStreamFn(() => {
 			const current = request;
 			request += 1;
 			const stream = new MockAssistantStream();
@@ -721,7 +722,7 @@ describe("native planning state", () => {
 				stream.push({ type: "done", seq: 1, reason: "stop", message });
 			});
 			return stream;
-		};
+		});
 
 		await session.prompt("Research before submitting the plan");
 		unsubscribe();
@@ -731,7 +732,6 @@ describe("native planning state", () => {
 				toolName: "mcp",
 				isError: true,
 				result: expect.objectContaining({
-					isError: true,
 					details: {
 						result: expect.objectContaining({ action: "call", status: "failed", content: "read failed" }),
 					},

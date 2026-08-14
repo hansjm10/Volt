@@ -253,7 +253,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		return generateEntryId(this.byId);
 	}
 
-	async appendEntry(entry: SessionTreeEntry): Promise<void> {
+	async appendEntry(entry: SessionTreeEntry): Promise<string> {
 		getFileSystemResultOrThrow(
 			await this.fs.appendFile(this.filePath, `${JSON.stringify(entry)}\n`),
 			`Failed to append session entry ${entry.id}`,
@@ -262,6 +262,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		this.byId.set(entry.id, entry);
 		updateLabelCache(this.labelsById, entry);
 		this.currentLeafId = leafIdAfterEntry(entry);
+		return entry.id;
 	}
 
 	async getEntry(id: string): Promise<SessionTreeEntry | undefined> {

@@ -189,10 +189,8 @@ export function createTestSession(sessionId: string, leafId: string | null) {
 		fastModeEnabled: false,
 		getPlanningState: () => ({ mode: "build" as const, plan: null }),
 		waitForIdle: vi.fn(async () => {}),
-		agent: {
-			subscribe: vi.fn((_handler: () => Promise<void> | void) => () => {}),
-			waitForIdle: vi.fn(async () => {}),
-		},
+		activeToolExecutions: new Map(),
+		subscribeRuntimeEvents: vi.fn((_handler: () => Promise<void> | void) => () => {}),
 	};
 	return session;
 }

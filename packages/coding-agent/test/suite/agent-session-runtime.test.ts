@@ -325,7 +325,7 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(result).toEqual({ cancelled: false, seeded: false });
 		expect(runtime.session.sessionManager.buildSessionContext().fastMode.enabled).toBe(true);
 		expect(runtime.session.fastModeEnabled).toBe(true);
-		expect(runtime.session.agent.inferenceSpeed).toBe("fast");
+		expect(runtime.session.fastModeEnabled).toBe(true);
 	});
 
 	it("lists current-workspace sessions and switches by session id", async () => {

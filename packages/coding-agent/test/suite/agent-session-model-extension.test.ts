@@ -132,14 +132,15 @@ describe("AgentSession model and extension characterization", () => {
 			isError: false,
 			timestamp: Date.now(),
 		};
-		harness.session.agent.state.messages.push(priorGeneratedResult);
-		harness.session.agent.state.messages.push({
+		harness.sessionManager.appendMessage(priorGeneratedResult);
+		harness.sessionManager.appendMessage({
 			role: "custom",
 			customType: "reference_image",
 			content: [{ type: "image", mimeType: "image/png", data: customImageData }],
 			display: false,
 			timestamp: Date.now(),
 		});
+		await harness.sessionManager.flush();
 		await harness.session.prompt("Edit these attached references", {
 			images: [{ type: "image", mimeType: "image/png", data: rpcImageData }],
 			clientMessageId: "rpc-image-edit",
@@ -184,7 +185,7 @@ describe("AgentSession model and extension characterization", () => {
 		});
 		vi.stubGlobal("fetch", fetcher);
 
-		const imageGen = harness.session.agent.state.tools.find((tool) => tool.name === "image_gen");
+		const imageGen = harness.session.state.tools.find((tool) => tool.name === "image_gen");
 		expect(imageGen).toBeDefined();
 		const result = await imageGen!.execute("call/rpc edit", {
 			prompt: "Combine the references",
@@ -365,12 +366,14 @@ describe("AgentSession model and extension characterization", () => {
 		await harness.session.setAgentMode("plan");
 		const args = { action: "diagnostics" };
 
-		const decision = await harness.session.agent.beforeToolCall?.({
-			toolCall: { type: "toolCall", id: "mutated-lsp", name: "lsp", arguments: args },
-			args,
-		} as never);
+		const decision = await harness.control.evaluateToolCall({
+			type: "tool_call",
+			toolCallId: "mutated-lsp",
+			toolName: "lsp",
+			input: args,
+		});
 
-		expect(args.action).toBe("fix");
+		expect(args.action).toBe("diagnostics");
 		expect(decision).toMatchObject({
 			block: true,
 			reason: expect.stringContaining("workspace.write"),

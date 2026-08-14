@@ -125,8 +125,7 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 	}
 
 	private async appendTypedEntry<TEntry extends SessionTreeEntry>(entry: TEntry): Promise<string> {
-		await this.storage.appendEntry(entry);
-		return entry.id;
+		return await this.storage.appendEntry(entry);
 	}
 
 	async appendMessage(message: AgentMessage): Promise<string> {

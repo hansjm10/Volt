@@ -132,7 +132,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 			});
 			expect(getUserTexts(harness)).toEqual([]);
 
-			await harness.session.agent.continue();
+			await harness.control.continue();
 
 			expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
 			expect(getUserTexts(harness)).toEqual([text]);
@@ -162,15 +162,15 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("explicit retry committed")]);
 
-		await harness.session.agent.prompt(createUserMessage("retain direct prompt"));
+		await harness.control.run(createUserMessage("retain direct prompt"));
 
-		expect(harness.session.agent.state.errorMessage).toBe("injected preparation failure");
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.session.state.errorMessage).toBe("injected preparation failure");
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(getUserTexts(harness)).toEqual([]);
 		expect(harness.getPendingResponseCount()).toBe(1);
 
 		failPreparation = false;
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		expect(new Set(preparedDeliveryIds)).toHaveLength(1);
 		expect(getUserTexts(harness)).toEqual(["retain direct prompt"]);
@@ -198,19 +198,19 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 
 			if (kind === "steer") await harness.session.steer(text, undefined, clientMessageId);
 			else await harness.session.followUp(text, undefined, clientMessageId);
-			await expect(harness.session.agent.continue()).resolves.toMatchObject({
+			await expect(harness.control.continue()).resolves.toMatchObject({
 				status: "delivery_failed",
 				failure: { kind, outcome: "retained", phase: "preparation" },
 			});
 
-			expect(harness.session.agent.state.errorMessage).toBe(`injected ${kind} preparation failure`);
-			expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+			expect(harness.session.state.errorMessage).toBe(`injected ${kind} preparation failure`);
+			expect(harness.control.hasQueuedMessages()).toBe(true);
 			expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
 			expect(getUserTexts(harness)).toEqual([]);
 			expect(harness.getPendingResponseCount()).toBe(1);
 
 			failPreparation = false;
-			await harness.session.agent.continue();
+			await harness.control.continue();
 
 			expect(new Set(preparedDeliveryIds)).toHaveLength(1);
 			expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
@@ -238,13 +238,13 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		});
 		await harness.session.steer("discard retained feedback", undefined, clientMessageId);
 
-		await expect(harness.session.agent.continue()).resolves.toMatchObject({
+		await expect(harness.control.continue()).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: { outcome: "retained", phase: "settlement" },
 		});
 
-		expect(harness.session.agent.state.errorMessage).toBe("injected planning commit failure");
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.session.state.errorMessage).toBe("injected planning commit failure");
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
 		expect(harness.session.planningState.plan?.phase).toBe("ready");
 		expect(planningChangeCount(harness)).toBe(planningBaseline);
@@ -256,7 +256,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 			steering: ["discard retained feedback"],
 			followUp: [],
 		});
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "failed" });
 		expect(outcomes).toEqual([
 			{
@@ -286,13 +286,13 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		const checkpointBaseline = checkpointCount(harness);
 		await harness.session.steer("retain after external abort", undefined, clientMessageId);
 
-		const attempt = harness.session.agent.continue();
+		const attempt = harness.control.continue();
 		await preparationStarted.promise;
 		const abort = harness.session.abort("remote_request");
 		releasePreparation.resolve();
 		await Promise.all([attempt, abort]);
 
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
 		expect(harness.session.planningState.plan?.phase).toBe("ready");
 		expect(checkpointCount(harness)).toBe(checkpointBaseline);
@@ -384,7 +384,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 
 		await harness.session.steer("first batch feedback", undefined, "contract-batch-first");
 		await harness.session.steer("second batch feedback", undefined, "contract-batch-second");
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		expect(harness.session.planningState.plan?.phase).toBe("draft");
 		expect(planningChangeCount(harness)).toBe(planningBaseline + 1);
@@ -426,23 +426,23 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 
 		await harness.session.steer("first partial feedback", undefined, "contract-partial-first");
 		await harness.session.steer("second partial feedback", undefined, "contract-partial-second");
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		expect(getUserTexts(harness)).toEqual(["first partial feedback"]);
 		expect(harness.sessionManager.getClientInput("contract-partial-first")).toMatchObject({ state: "completed" });
 		expect(harness.sessionManager.getClientInput("contract-partial-second")).toMatchObject({ state: "accepted" });
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(harness.session.planningState.plan?.phase).toBe("draft");
 		expect(planningChangeCount(harness)).toBe(planningBaseline + 1);
 		expect(checkpointCount(harness)).toBe(checkpointBaseline + 1);
 		expect(harness.getPendingResponseCount()).toBe(1);
 
 		failSecondCommit = false;
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		expect(getUserTexts(harness)).toEqual(["first partial feedback", "second partial feedback"]);
 		expect(harness.sessionManager.getClientInput("contract-partial-second")).toMatchObject({ state: "completed" });
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(planningChangeCount(harness)).toBe(planningBaseline + 1);
 		expect(checkpointCount(harness)).toBe(checkpointBaseline + 1);
 		expect(harness.getPendingResponseCount()).toBe(0);

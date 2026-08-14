@@ -550,7 +550,7 @@ describe("durable client input idempotency", () => {
 		try {
 			expect(harness.session.getSteeringMessages()).toEqual([]);
 			expect(harness.session.getFollowUpMessages()).toEqual([]);
-			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+			expect(harness.control.hasQueuedMessages()).toBe(false);
 			expect(harness.sessionManager.getClientInput("clear-before-flush")?.state).toBe("failed");
 		} finally {
 			releaseFlush();
@@ -607,7 +607,7 @@ describe("durable client input idempotency", () => {
 			});
 			expect(harness.session.getSteeringMessages()).toEqual([]);
 			expect(harness.session.getFollowUpMessages()).toEqual([]);
-			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+			expect(harness.control.hasQueuedMessages()).toBe(false);
 		},
 	);
 
@@ -631,7 +631,7 @@ describe("durable client input idempotency", () => {
 		}
 		expect(harness.session.getSteeringMessages()).toEqual([]);
 		expect(harness.session.getFollowUpMessages()).toEqual([]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 	});
 
 	it("carries the cleared queue text on the error when cancellation cannot be persisted", async () => {
@@ -660,7 +660,7 @@ describe("durable client input idempotency", () => {
 		expect(persistenceError.cause).toBe(flushFailure);
 		expect(harness.session.getSteeringMessages()).toEqual([]);
 		expect(harness.session.getFollowUpMessages()).toEqual([]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 	});
 
 	it("revokes identified queues when terminal persistence rejects synchronously", async () => {
@@ -687,7 +687,7 @@ describe("durable client input idempotency", () => {
 		expect(persistenceError.followUp).toEqual(["restore follow-up"]);
 		expect(harness.session.getSteeringMessages()).toEqual([]);
 		expect(harness.session.getFollowUpMessages()).toEqual([]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		await expect(harness.session.steer("restore steer", undefined, "clear-closed-steer")).rejects.toThrow(
 			"Session persistence is closed",
 		);
@@ -709,7 +709,7 @@ describe("durable client input idempotency", () => {
 			"Client input id must match",
 		);
 		expect(harness.session.getSteeringMessages().map((entry) => entry.text)).toEqual(["local queued input"]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 	});
 
 	it.each([
@@ -727,9 +727,7 @@ describe("durable client input idempotency", () => {
 			harness.session.subscribe((event) => {
 				if (event.type === "queue_update") queueUpdates.push(event);
 			});
-			vi.spyOn(harness.session.agent, command).mockImplementation(() => {
-				throw new Error(`injected ${command} enqueue failure`);
-			});
+			harness.control.failNextQueue(command, new Error(`injected ${command} enqueue failure`));
 
 			await expect(
 				command === "steer"
@@ -741,7 +739,7 @@ describe("durable client input idempotency", () => {
 			await manager.flush();
 			expect(harness.session.getSteeringMessages()).toEqual([]);
 			expect(harness.session.getFollowUpMessages()).toEqual([]);
-			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+			expect(harness.control.hasQueuedMessages()).toBe(false);
 			expect(queueUpdates).toEqual([]);
 			expect(
 				readFileSync(manager.getSessionFile()!, "utf8")
@@ -774,7 +772,7 @@ describe("durable client input idempotency", () => {
 				text: "survives observer",
 			},
 		]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 	});
 
 	it("commits pass-through and transformed input-hook queues back to exact recoverable payloads", async () => {
@@ -907,13 +905,13 @@ describe("durable client input idempotency", () => {
 		const clientMessageId = "public-agent-queue-revocation";
 		await harness.session.steer("revoke this queue", undefined, clientMessageId);
 
-		expect(harness.session.agent.clearSteeringQueue()).toHaveLength(1);
+		expect(await harness.control.clearSteeringQueue()).toHaveLength(1);
 		releaseTool();
 		await run;
 
 		await vi.waitFor(() => expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("failed"));
 		expect(harness.session.getSteeringMessages()).toEqual([]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		await expect(harness.session.steer("revoke this queue", undefined, clientMessageId)).rejects.toThrow(
 			"Delivery was revoked before canonical commitment",
 		);
@@ -952,11 +950,11 @@ describe("durable client input idempotency", () => {
 		const persistenceError = new Error("injected public revocation persistence failure");
 		vi.spyOn(harness.sessionManager, "flush").mockRejectedValueOnce(persistenceError);
 
-		expect(harness.session.agent.clearSteeringQueue()).toHaveLength(1);
+		expect(await harness.control.clearSteeringQueue()).toHaveLength(1);
 		releaseTool();
 		await expect(run).rejects.toThrow(persistenceError.message);
 		expect(harness.session.getSteeringMessages()).toEqual([]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 	});
 
 	it("publishes a dequeued input only after its canonical entry is complete", async () => {
@@ -1064,7 +1062,7 @@ describe("durable client input idempotency", () => {
 
 			expect(harness.session.getSteeringMessages()).toEqual([]);
 			expect(harness.session.getFollowUpMessages()).toEqual([]);
-			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+			expect(harness.control.hasQueuedMessages()).toBe(false);
 			expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("failed");
 			expect(getUserTexts(harness)).not.toContain(queuedText);
 			await expect(
@@ -1345,14 +1343,14 @@ describe("durable client input idempotency", () => {
 
 		await expect(harness.session.resumeRecoveredClientInputs()).rejects.toThrow("retain recovered input");
 		expect(reopened.getClientInput("recover-retained")?.state).toBe("accepted");
-		expect(harness.session.agent.hasPendingPrompt()).toBe(true);
+		expect(harness.control.hasPendingPrompt()).toBe(true);
 		expect(harness.session.getSteeringMessages()).toEqual([]);
 		expect(harness.getPendingResponseCount()).toBe(1);
 
 		retain = false;
 		await harness.session.resumeRecoveredClientInputs();
 		expect(reopened.getClientInput("recover-retained")?.state).toBe("completed");
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(getUserTexts(harness)).toEqual(["recover retained"]);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
@@ -1423,29 +1421,16 @@ describe("durable client input idempotency", () => {
 		const reopened = SessionManager.open(manager.getSessionFile()!, tempDir);
 		const harness = await createHarness({ sessionManager: reopened });
 		harnesses.push(harness);
-		const internals = harness.session as unknown as {
-			_handleAgentEvent(event: object): Promise<unknown>;
-			_runAgentPrompt(): Promise<void>;
-		};
+		const internals = harness.session as unknown as { _runAgentPrompt(): Promise<void> };
 		internals._runAgentPrompt = async () => {
-			await internals._handleAgentEvent({
-				type: "message_start",
-				message: {
-					role: "user",
-					content: [{ type: "text", text: "expanded" }],
-					clientMessageId: "recover-committed",
-					timestamp: Date.now(),
-				},
+			reopened.transitionClientInput("recover-committed", "started");
+			reopened.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: "expanded" }],
+				clientMessageId: "recover-committed",
+				timestamp: Date.now(),
 			});
-			await internals._handleAgentEvent({
-				type: "message_end",
-				message: {
-					role: "user",
-					content: [{ type: "text", text: "expanded" }],
-					clientMessageId: "recover-committed",
-					timestamp: Date.now(),
-				},
-			});
+			await reopened.flush();
 			throw new Error("injected failure after canonical append");
 		};
 
