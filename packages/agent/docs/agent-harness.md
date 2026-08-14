@@ -20,6 +20,8 @@ The intended runtime ownership model is:
 
 After those gates are met, remove `agent.ts`, its package-root export, wrapper-only tests, and its public documentation together. Until then, keep the current README and public API unchanged.
 
+The transactional delivery portion of gate 2 is complete. The remaining part of that gate is lifecycle/abort hardening, including final phase, settlement, facade, and abort-barrier semantics.
+
 ## Ultimate lifecycle goal
 
 Harness listeners and hooks should be able to close over the `AgentHarness` instance and call public harness APIs from any event where those APIs are documented as allowed. Those calls must not corrupt in-flight turn snapshots, reorder persisted transcript entries, lose pending writes, deadlock settlement, or leave the harness in the wrong phase.
@@ -45,7 +47,7 @@ The current split is:
 - high-level mutation/orchestration APIs such as `Session` and `AgentHarness` reject/throw instead of returning bare results that can be ignored
 - public `AgentHarness` failures are normalized to `AgentHarnessError` where practical; subsystem errors are preserved as `cause`
 
-Harness events observe committed state. Public mutators validate required input and persistence before committing when practical, then await notifications. If a hook or subscriber fails after commit, the state change is not rolled back and the public method rejects with `AgentHarnessError` code `"hook"`.
+Harness events observe committed state. Public mutators validate required input and persistence before committing when practical, then await notifications. Committed `queue_update`, `delivery_start`, and delivery-bound `message_start`/`message_end` projections are cloned, passive, and failure-isolated because transaction settlement is already authoritative. Other hook or subscriber failures after a committed mutation do not roll state back and may reject the public method with `AgentHarnessError` code `"hook"`.
 
 ## State model
 
@@ -115,9 +117,11 @@ type AgentHarnessPhase = "idle" | "turn" | "compaction" | "branch_summary" | "re
 
 Structural operations require `phase === "idle"` and synchronously set the phase before the first `await`:
 
+- `runPrompt`
 - `prompt`
 - `skill`
 - `promptFromTemplate`
+- `continue`
 - `compact`
 - `navigateTree`
 
@@ -128,6 +132,7 @@ The following operations are allowed during a turn where appropriate:
 - `steer`
 - `followUp`
 - `nextTurn`
+- `clearSteeringQueue`, `clearFollowUpQueue`, `clearAllQueues`, and `discardPendingPrompt`
 - `abort`
 - runtime config setters
 
@@ -135,16 +140,34 @@ Phase/settlement semantics are still provisional and need a full lifecycle pass.
 
 ## Turn execution
 
-`prompt`, `skill`, and `promptFromTemplate` follow the same flow:
+`runPrompt`, `prompt`, `skill`, and `promptFromTemplate` follow the same flow:
 
 1. Assert idle and set phase to `"turn"`.
 2. Create a turn snapshot with `createTurnState()`.
 3. Derive invocation text from that snapshot.
-4. Execute the turn with `executeTurn()`.
+4. Bind the invocation and any `nextTurn`/`before_agent_start` additions into one prompt delivery.
+5. Execute the turn with `executeTurn()`.
+
+`runPrompt()` returns `AgentHarnessRunResult`, including ordered delivery outcomes and the final assistant response when one was produced. `prompt()`, `skill()`, and `promptFromTemplate()` preserve their `AssistantMessage` return type by requiring that response; they reject with `AgentHarnessError` code `"delivery"` when a bounded run intentionally finishes without one.
 
 `skill` and `promptFromTemplate` resolve their resource from the same snapshot that is passed to the turn. They do not resolve resources separately.
 
-`steer`, `followUp`, and `nextTurn` accept text plus optional images and create user messages internally. `nextTurn` messages are inserted before the new user message on the next user-initiated turn.
+`steer`, `followUp`, and `nextTurn` accept text plus optional images and create cloned user messages internally. `steer` and `followUp` resolve to stable delivery IDs. `nextTurn` messages are inserted before the new user message and share that prompt's delivery ID on the next user-initiated turn.
+
+### Transactional delivery
+
+Prompt, steering, and follow-up input is admitted to one `DeliveryInbox<AgentDeliveryKind, AgentMessage>`. Every delivery has stable FIFO identity. Inbox payloads, `prepareDelivery` callback input, prepared provider payloads, revocation notifications, and committed delivery event projections are cloned so host or observer mutation cannot change authoritative input.
+
+The constructor-owned `prepareDelivery(delivery, signal)` policy runs only while a selected delivery remains revocable. It returns provider messages and may attach a transaction participant. The harness then crosses `DeliveryLease.begin()` synchronously before awaiting participant settlement. Participant results have these meanings:
+
+- `committed`: publish and persist the prepared messages, then allow the provider request.
+- `retained`: stop the bounded run and restore the same delivery ID for explicit continuation.
+- `terminally_failed`: stop the bounded run and fence the delivery from replay.
+- a thrown/rejected participant is classified as `terminally_failed`; a thrown preparation is classified as retained.
+
+`AgentHarnessRunResult.deliveries` records attempted outcomes in admission order. A later failure does not undo a committed batch prefix. Retained work is never retried implicitly and uncommitted input never enters session persistence or provider context. `continue({ drainFollowUps? })` is the explicit retry/resume boundary and does not recommit input during an ordinary tool continuation.
+
+Queue clear methods and `discardPendingPrompt()` revoke only work whose begin boundary has not crossed. `deliveryRevoked` observes cloned revoked payloads and cannot undo revocation. `hasQueuedMessages()`, `hasPendingPrompt()`, and `canPrepareDelivery(id)` expose current inbox state.
 
 Queue modes are live, not turn-snapshotted:
 
@@ -161,9 +184,9 @@ The harness implements the low-level action protocol rather than polling queues 
 - `stop` ends the harness run when no work remains
 - the low-level `pause` action is available to higher orchestration layers that must preserve continuation intent without issuing another provider request
 
-The low-level loop asks for one action before its first request and once after every successful `turn_end`. Queue-backed requests lease selected entries without removing them. Synchronous begin transfers ownership, then `delivery_start` triggers the authoritative queue update before delivery message persistence. The request-preparation hook subsequently flushes pending writes and, after the first request, creates and applies the next turn snapshot. A request whose every delivery was revoked does not prepare a snapshot or call the provider; a terminal action likewise creates no snapshot.
+The low-level loop asks for one action before its first request and once after every successful `turn_end`. Queue-backed requests lease selected entries without removing them. Preparation remains revocable; synchronous begin transfers ownership; participant settlement is awaited; and only a committed result emits `delivery_start`, updates the queue projection, and persists delivery messages. The request-preparation hook subsequently flushes pending writes and, after the first request, creates and applies the next turn snapshot. A request whose every delivery was revoked does not prepare a snapshot or call the provider; a terminal action likewise creates no snapshot.
 
-Once `delivery_start` occurs, notification failure cannot restore or revoke that begun delivery. Error and abort outcomes are terminal, return only entries still revocable from the shared inbox, and do not poll the queues again.
+Once begin occurs, revocation cannot reclaim that delivery. Committed queue and delivery notifications are passive and cannot restore, replace, or fail the authoritative payload. Error and abort outcomes return only entries still revocable from the shared inbox and do not poll the queues again. A retained-before-any-commit run emits no synthetic assistant failure, preserving an input-free transcript until explicit continuation.
 
 ## Save points
 
@@ -226,13 +249,15 @@ Agent-emitted messages are persisted on `message_end` to preserve transcript ord
 
 ## Abort
 
-Abort is allowed during a turn. It aborts the low-level run and clears steering/follow-up entries whose begin boundary has not crossed. Its result reports the exact messages actually revoked; begun deliveries remain authoritative.
+Abort is allowed during a turn. It aborts the low-level run and clears steering/follow-up entries whose begin boundary has not crossed. Its result reports cloned messages from the exact deliveries actually revoked; begun deliveries remain authoritative. A prompt that is still revocable is retained for explicit `continue()` or `discardPendingPrompt()`.
+
+The async `abort(source?)` API and participant `requestAbort(source)` capability share one synchronous acceptance path. The active run ID is stable, and the first supplied abort source remains authoritative. Participant code uses `requestAbort()` rather than awaiting `abort()`, avoiding reentrant settlement deadlock.
 
 Abort does not clear `nextTurn` messages. Messages queued with `nextTurn()` survive abort and are inserted before the user message on the next user-initiated turn.
 
 Abort does not discard pending session writes. Pending writes flush at the next save point if reached, at `agent_end`, or in operation failure cleanup.
 
-Abort barrier semantics still need an audit.
+Transactional abort races are covered. Broader abort barrier and lifecycle/facade semantics still need the final lifecycle hardening pass.
 
 ## Compaction and tree navigation
 
@@ -332,9 +357,12 @@ Done:
 - Structural compaction/tree operations restore phase with `finally`.
 - Public harness failures normalize subsystem causes to `AgentHarnessError`.
 - Pending session writes flush one-by-one and are not dropped on failure.
-- Queue updates occur after synchronous delivery begin; begun deliveries never roll back.
-- `message_end` persistence happens before subscriber notification.
-- `abort()` signals cancellation before notifications and still waits for idle through notification errors.
+- Prompt, steering, and follow-up input uses one transactional inbox with stable IDs and explicit bounded outcomes.
+- Preparation remains revocable; participant settlement is awaited only after synchronous delivery begin.
+- Retained work preserves identity for explicit continuation, terminal failures are fenced, and committed prefixes remain authoritative.
+- Committed queue and delivery projections are cloned, passive, and observer-failure-isolated.
+- `message_end` persistence happens before committed delivery notification.
+- `abort()` and participant `requestAbort()` share synchronous first-source acceptance; async abort still waits for idle through notification errors.
 - Idle model/thinking/tool updates validate and persist before committing in-memory state.
 - `setLeafId()` persists durable `leaf` entries so tree navigation survives storage reopen.
 
@@ -349,7 +377,8 @@ Remaining:
 - Verify `before_agent_start` hook semantics against coding-agent.
 - Decide whether `before_agent_start` needs more turn info such as tools/tool snippets.
 - Document or change runtime config event timing while busy.
-- Audit `abort()` barrier semantics.
+- Audit `abort()` barrier semantics beyond transactional delivery races.
+- Complete the remaining lifecycle/abort migration gate before replacing legacy `Agent`.
 
 ### 4. Implement generic hook/event extension mechanism
 

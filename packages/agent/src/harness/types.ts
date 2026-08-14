@@ -1,4 +1,5 @@
 import type {
+	AssistantMessage,
 	ImageContent,
 	JsonObject,
 	JsonValue,
@@ -7,7 +8,16 @@ import type {
 	TextContent,
 	Transport,
 } from "@hansjm10/volt-ai";
-import type { AgentEvent, AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "../index.ts";
+import type {
+	AgentDelivery,
+	AgentDeliveryPreparation,
+	AgentEvent,
+	AgentMessage,
+	AgentRunResult,
+	AgentTool,
+	QueueMode,
+	ThinkingLevel,
+} from "../index.ts";
 import type { Session } from "./session/session.ts";
 
 /** Result of a fallible operation. Expected failures are returned as `ok: false` instead of thrown. */
@@ -227,6 +237,7 @@ export type AgentHarnessErrorCode =
 	| "invalid_argument"
 	| "session"
 	| "hook"
+	| "delivery"
 	| "auth"
 	| "compaction"
 	| "branch_summary"
@@ -744,6 +755,11 @@ export interface AgentHarnessPromptOptions {
 	images?: ImageContent[];
 }
 
+/** Bounded transactional run outcome plus the last assistant response produced by that run. */
+export type AgentHarnessRunResult = AgentRunResult & {
+	readonly response: AssistantMessage | undefined;
+};
+
 export interface AbortResult {
 	clearedSteer: AgentMessage[];
 	clearedFollowUp: AgentMessage[];
@@ -842,6 +858,13 @@ export interface AgentHarnessOptions<
 	) => Promise<{ apiKey: string; headers?: Record<string, string> } | undefined>;
 	/** Curated stream/provider request options. Snapshotted at turn start. */
 	streamOptions?: AgentHarnessStreamOptions;
+	/** Stage a leased inbox delivery before its irrevocable begin boundary. */
+	prepareDelivery?: (
+		delivery: AgentDelivery,
+		signal: AbortSignal,
+	) => Promise<AgentDeliveryPreparation> | AgentDeliveryPreparation;
+	/** Observe revocation so host projections can release delivery-coupled state. */
+	deliveryRevoked?: (delivery: AgentDelivery) => void;
 	model: Model<any>;
 	thinkingLevel?: ThinkingLevel;
 	activeToolNames?: string[];

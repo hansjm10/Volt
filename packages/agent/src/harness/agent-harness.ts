@@ -9,12 +9,25 @@ import {
 	type UserMessage,
 } from "@hansjm10/volt-ai";
 import { runAgentLoop } from "../agent-loop.ts";
-import { DeliveryInbox, type DeliveryLease } from "../delivery-inbox.ts";
+import { DeliveryInbox, type DeliveryLease, type InboxDelivery } from "../delivery-inbox.ts";
 import type {
+	AgentAbortAcceptance,
+	AgentAbortSource,
 	AgentContext,
+	AgentDeliveryAttemptResult,
+	AgentDeliveryFailure,
+	AgentDeliveryKind,
+	AgentDeliveryParticipantOutcome,
+	AgentDeliveryPreparation,
+	AgentDeliveryTransactionParticipant,
 	AgentEvent,
 	AgentLoopConfig,
+	AgentLoopDelivery,
+	AgentLoopDeliveryOutcome,
+	AgentLoopNextAction,
+	AgentLoopNextActionContext,
 	AgentMessage,
+	AgentRequestAuthority,
 	AgentTool,
 	QueueMode,
 	StreamFn,
@@ -37,7 +50,9 @@ import type {
 	AgentHarnessOptions,
 	AgentHarnessOwnEvent,
 	AgentHarnessPhase,
+	AgentHarnessPromptOptions,
 	AgentHarnessResources,
+	AgentHarnessRunResult,
 	AgentHarnessStreamOptions,
 	AgentHarnessStreamOptionsPatch,
 	ExecutionEnv,
@@ -53,6 +68,10 @@ function createUserMessage(text: string, images?: ImageContent[]): UserMessage {
 	const content: Array<{ type: "text"; text: string } | ImageContent> = [{ type: "text", text }];
 	if (images) content.push(...images);
 	return { role: "user", content, timestamp: Date.now() };
+}
+
+function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMessage[] {
+	return messages.map((message) => structuredClone(message));
 }
 
 function createFailureMessage(model: Model<any>, error: unknown, aborted: boolean): AssistantMessage {
@@ -202,10 +221,18 @@ function createFailureSettlementError(runError: unknown, settlementError: unknow
 
 interface AgentHarnessDeliveryEventState {
 	remainingMessages: Set<AgentMessage>;
-	errors: Error[];
 }
 
 interface AgentHarnessRunEventState {
+	id: string;
+	abortController: AbortController;
+	abortSource?: AgentAbortSource;
+	requestAccepted: boolean;
+	deliverySettlement: Promise<void> | undefined;
+	deliveryOrder: Map<string, number>;
+	deliveryOutcomes: Map<string, AgentDeliveryAttemptResult>;
+	deliveryFailure?: AgentDeliveryFailure;
+	observationalDeliveryIds: Set<string>;
 	admittedMessages: AgentMessage[];
 	admittedMessageSet: Set<AgentMessage>;
 	messageDeliveryIds: Map<AgentMessage, string | undefined>;
@@ -218,6 +245,15 @@ interface AgentHarnessRunEventState {
 	settlementStarted: boolean;
 	terminalEmitted: boolean;
 }
+
+type PendingDelivery = InboxDelivery<AgentDeliveryKind, AgentMessage>;
+
+type DispatcherStartState = {
+	firstDecision: boolean;
+	requestAuthority: AgentRequestAuthority;
+	providerRequestPending: boolean;
+	drainFollowUpsFirst?: boolean;
+};
 
 interface AgentHarnessTurnState<
 	TSkill extends Skill = Skill,
@@ -243,7 +279,7 @@ export class AgentHarness<
 	readonly env: ExecutionEnv;
 	private session: Session;
 	private phase: AgentHarnessPhase = "idle";
-	private runAbortController: AbortController | undefined;
+	private activeRun: AgentHarnessRunEventState | undefined;
 	private runPromise: Promise<void> | undefined;
 	private pendingSessionWrites: PendingSessionWrite[] = [];
 	private model: Model<any>;
@@ -254,9 +290,14 @@ export class AgentHarness<
 	private resources: AgentHarnessResources<TSkill, TPromptTemplate>;
 	private tools = new Map<string, TTool>();
 	private activeToolNames: string[];
-	private readonly deliveryInbox = new DeliveryInbox<"steer" | "followUp", UserMessage>();
-	private activeDeliveryLease: DeliveryLease<"steer" | "followUp", UserMessage> | undefined;
-	private readonly committedDeliveryIds = new Set<string>();
+	private readonly deliveryInbox = new DeliveryInbox<AgentDeliveryKind, AgentMessage>(
+		() => `harness-delivery:${globalThis.crypto.randomUUID()}`,
+	);
+	private activeDeliveryLease: DeliveryLease<AgentDeliveryKind, AgentMessage> | undefined;
+	private readonly leasedDeliveryKinds = new Map<string, AgentDeliveryKind>();
+	private readonly preparedDeliveryParticipants = new Map<string, AgentDeliveryTransactionParticipant>();
+	private readonly prepareDelivery: AgentHarnessOptions["prepareDelivery"];
+	private readonly deliveryRevoked: AgentHarnessOptions["deliveryRevoked"];
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
 	private nextTurnQueue: AgentMessage[] = [];
@@ -269,6 +310,8 @@ export class AgentHarness<
 		this.streamOptions = cloneStreamOptions(options.streamOptions);
 		this.systemPrompt = options.systemPrompt;
 		this.getApiKeyAndHeaders = options.getApiKeyAndHeaders;
+		this.prepareDelivery = options.prepareDelivery;
+		this.deliveryRevoked = options.deliveryRevoked;
 		this.validateUniqueNames(
 			(options.tools ?? []).map((tool) => tool.name),
 			"Duplicate tool name(s)",
@@ -307,6 +350,16 @@ export class AgentHarness<
 				await listener(event, signal);
 			} catch (error) {
 				throw normalizeHookError(error);
+			}
+		}
+	}
+
+	private async emitPassive(event: AgentHarnessEvent<TSkill, TPromptTemplate>, signal?: AbortSignal): Promise<void> {
+		for (const listener of this.getHandlers(SUBSCRIBER_EVENT_TYPE) ?? []) {
+			try {
+				await listener(structuredClone(event), signal);
+			} catch {
+				// Committed delivery projections are observational and cannot alter settlement.
 			}
 		}
 	}
@@ -377,13 +430,15 @@ export class AgentHarness<
 		return current;
 	}
 
-	private async emitQueueUpdate(): Promise<void> {
-		await this.emitOwn({
-			type: "queue_update",
-			steer: this.deliveryInbox.list("steer").flatMap((delivery) => [...delivery.messages]),
-			followUp: this.deliveryInbox.list("followUp").flatMap((delivery) => [...delivery.messages]),
-			nextTurn: [...this.nextTurnQueue],
-		});
+	private async emitQueueUpdate(passive = false): Promise<void> {
+		const event = {
+			type: "queue_update" as const,
+			steer: cloneAgentMessages(this.deliveryInbox.list("steer").flatMap((delivery) => delivery.messages)),
+			followUp: cloneAgentMessages(this.deliveryInbox.list("followUp").flatMap((delivery) => delivery.messages)),
+			nextTurn: cloneAgentMessages(this.nextTurnQueue),
+		};
+		if (passive) await this.emitPassive(event, this.activeRun?.abortController.signal);
+		else await this.emitOwn(event, this.activeRun?.abortController.signal);
 	}
 
 	private startRunPromise(): () => void {
@@ -493,32 +548,197 @@ export class AgentHarness<
 		};
 	}
 
-	private leaseQueuedDeliveries(
-		kind: "steer" | "followUp",
-		mode: QueueMode,
-	): Array<{ deliveryId: string; messages: AgentMessage[] }> {
-		const selected = this.deliveryInbox.select(kind, mode);
-		if (selected.length === 0) return [];
-		const lease = this.deliveryInbox.lease(selected);
-		this.activeDeliveryLease = lease;
-		return lease.deliveries.map((delivery) => ({
-			deliveryId: delivery.deliveryId,
-			messages: [...delivery.messages],
-		}));
+	private selectPendingDeliveries(kind: AgentDeliveryKind, mode: QueueMode): PendingDelivery[] {
+		return [...this.deliveryInbox.select(kind, mode)];
 	}
 
-	private beginDelivery(deliveryId: string | undefined): boolean {
-		if (deliveryId === undefined || !this.activeDeliveryLease?.owns(deliveryId)) return true;
-		const delivery = this.activeDeliveryLease.begin(deliveryId);
-		if (!delivery) return false;
-		if (!this.activeDeliveryLease.settle(deliveryId, "committed")) return false;
-		this.committedDeliveryIds.add(deliveryId);
-		return true;
+	private async resolveNextAction(
+		context: AgentLoopNextActionContext,
+		startState: DispatcherStartState,
+	): Promise<AgentLoopNextAction> {
+		const isFirstDecision = startState.firstDecision;
+		startState.firstDecision = false;
+		const requestAuthority = isFirstDecision ? startState.requestAuthority : context.requestAuthority;
+		const runtimeAction = context.defaultAction;
+		const providerRequestPending = isFirstDecision
+			? startState.providerRequestPending
+			: runtimeAction.type === "request";
+
+		if (requestAuthority === "final_response") return runtimeAction;
+		if (this.activeRun?.abortController.signal.aborted) return { type: "stop" };
+
+		let selected: PendingDelivery[] = [];
+		const prompts = this.selectPendingDeliveries("prompt", "all");
+		if (prompts.length > 0) {
+			selected = [...prompts, ...this.selectPendingDeliveries("steer", this.steeringQueueMode)];
+		} else {
+			selected = this.selectPendingDeliveries("steer", this.steeringQueueMode);
+		}
+		const hasIndependentRequest = runtimeAction.type === "request" && providerRequestPending;
+		if (selected.length === 0 && ((isFirstDecision && startState.drainFollowUpsFirst) || !hasIndependentRequest)) {
+			selected = this.selectPendingDeliveries("followUp", this.followUpQueueMode);
+		}
+		if (selected.length === 0) return hasIndependentRequest ? runtimeAction : { type: "stop" };
+
+		const deliveries = await this.prepareLeasedDeliveries(selected);
+		return {
+			type: "request",
+			reason: hasIndependentRequest ? "continuation" : "delivery",
+			...(deliveries.length > 0 ? { deliveries } : {}),
+		};
+	}
+
+	private async prepareLeasedDeliveries(selected: PendingDelivery[]): Promise<AgentLoopDelivery[]> {
+		const lease = this.deliveryInbox.lease(selected);
+		this.activeDeliveryLease = lease;
+		for (const delivery of lease.deliveries) {
+			this.leasedDeliveryKinds.set(delivery.deliveryId, delivery.kind);
+			const run = this.activeRun;
+			if (run && !run.deliveryOrder.has(delivery.deliveryId)) {
+				run.deliveryOrder.set(delivery.deliveryId, run.deliveryOrder.size);
+			}
+		}
+
+		const signal = this.activeRun?.abortController.signal;
+		if (!signal) throw new AgentHarnessError("invalid_state", "Delivery preparation requires an active run");
+		const deliveries: AgentLoopDelivery[] = [];
+		for (const delivery of lease.deliveries) {
+			if (!lease.canPrepare(delivery.deliveryId)) continue;
+			let preparation: AgentDeliveryPreparation;
+			try {
+				preparation = this.prepareDelivery
+					? await this.prepareDelivery(
+							{
+								deliveryId: delivery.deliveryId,
+								kind: delivery.kind,
+								messages: cloneAgentMessages(delivery.messages),
+							},
+							signal,
+						)
+					: { messages: cloneAgentMessages(delivery.messages) };
+			} catch (error) {
+				if (!lease.canPrepare(delivery.deliveryId)) continue;
+				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
+				throw error;
+			}
+			if (this.activeDeliveryLease !== lease || !lease.canPrepare(delivery.deliveryId)) continue;
+			if (preparation.messages.length === 0) {
+				const error = new Error("prepareDelivery must retain at least one message for an admitted delivery");
+				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
+				throw error;
+			}
+			if (preparation.participant) {
+				this.preparedDeliveryParticipants.set(delivery.deliveryId, preparation.participant);
+			}
+			deliveries.push({
+				deliveryId: delivery.deliveryId,
+				messages: cloneAgentMessages(preparation.messages),
+			});
+		}
+		return deliveries;
+	}
+
+	private async beginActiveDelivery(delivery: AgentLoopDelivery): Promise<AgentLoopDeliveryOutcome> {
+		if (delivery.deliveryId === undefined) return { outcome: "committed" };
+		const kind = this.leasedDeliveryKinds.get(delivery.deliveryId);
+		if (kind === undefined) return { outcome: "committed" };
+		const lease = this.activeDeliveryLease;
+		if (!lease?.owns(delivery.deliveryId) || !lease.begin(delivery.deliveryId)) {
+			this.recordDeliveryOutcome({ deliveryId: delivery.deliveryId, kind, outcome: "revoked" });
+			return { outcome: "revoked" };
+		}
+
+		const run = this.activeRun;
+		if (run) run.requestAccepted = true;
+		let finishSettlement = (): void => undefined;
+		const settlement = new Promise<void>((resolve) => {
+			finishSettlement = resolve;
+		});
+		if (run) run.deliverySettlement = settlement;
+
+		let outcome: AgentDeliveryParticipantOutcome;
+		const participant = this.preparedDeliveryParticipants.get(delivery.deliveryId);
+		try {
+			if (participant) {
+				try {
+					outcome = await participant.settle({ requestAbort: (source) => this.requestAbort(source) });
+				} catch (error) {
+					outcome = { outcome: "terminally_failed", error: toError(error) };
+				}
+			} else {
+				outcome = { outcome: "committed" };
+			}
+
+			if (!lease.settle(delivery.deliveryId, outcome.outcome)) {
+				outcome = {
+					outcome: "terminally_failed",
+					error: new Error(`Delivery settlement lost AgentHarness ownership: ${delivery.deliveryId}`),
+				};
+			}
+			const result =
+				outcome.outcome === "committed"
+					? ({ deliveryId: delivery.deliveryId, kind, outcome: "committed" } as const)
+					: ({
+							deliveryId: delivery.deliveryId,
+							kind,
+							outcome: outcome.outcome,
+							phase: "settlement",
+							error: outcome.error,
+						} satisfies AgentDeliveryFailure);
+			this.recordDeliveryOutcome(result);
+			if (outcome.outcome === "retained" && run?.persistedMessages.length === 0) {
+				run.requestAccepted = false;
+			}
+			if (outcome.outcome === "committed") run?.observationalDeliveryIds.add(delivery.deliveryId);
+			return outcome;
+		} finally {
+			this.preparedDeliveryParticipants.delete(delivery.deliveryId);
+			finishSettlement();
+			if (run && this.activeRun === run && run.deliverySettlement === settlement) {
+				run.deliverySettlement = undefined;
+			}
+		}
+	}
+
+	private recordDeliveryFailure(
+		delivery: Pick<PendingDelivery, "deliveryId" | "kind">,
+		phase: AgentDeliveryFailure["phase"],
+		outcome: AgentDeliveryFailure["outcome"],
+		error: unknown,
+	): void {
+		this.recordDeliveryOutcome({
+			deliveryId: delivery.deliveryId,
+			kind: delivery.kind,
+			outcome,
+			phase,
+			error: toError(error),
+		} as AgentDeliveryFailure);
+	}
+
+	private recordDeliveryOutcome(outcome: AgentDeliveryAttemptResult): void {
+		const run = this.activeRun;
+		if (!run || run.deliveryOutcomes.has(outcome.deliveryId)) return;
+		run.deliveryOutcomes.set(outcome.deliveryId, Object.freeze(outcome));
+		if ("error" in outcome && run.deliveryFailure === undefined) run.deliveryFailure = outcome;
+	}
+
+	private rollbackActiveLease(): void {
+		const restored = this.deliveryInbox.rollbackActiveLease();
+		for (const delivery of restored) {
+			this.recordDeliveryOutcome({
+				deliveryId: delivery.deliveryId,
+				kind: delivery.kind,
+				outcome: "retained",
+			});
+		}
+		this.activeDeliveryLease = undefined;
+		this.preparedDeliveryParticipants.clear();
 	}
 
 	private createLoopConfig(
 		getTurnState: () => AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
 		setTurnState: (turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>) => void,
+		startState: DispatcherStartState,
 	): AgentLoopConfig {
 		const turnState = getTurnState();
 		let firstRequest = true;
@@ -564,34 +784,8 @@ export class AgentHarness<
 						}
 					: undefined;
 			},
-			nextAction: async (context) => {
-				if (context.requestAuthority === "final_response") return context.defaultAction;
-				const initialDeliveries =
-					context.completedTurn === undefined && context.defaultAction.type === "request"
-						? (context.defaultAction.deliveries ?? [])
-						: [];
-				const steering = this.leaseQueuedDeliveries("steer", this.steeringQueueMode);
-				if (initialDeliveries.length > 0 || steering.length > 0) {
-					return {
-						type: "request",
-						reason:
-							context.defaultAction.type === "request" && context.defaultAction.reason === "continuation"
-								? "continuation"
-								: "delivery",
-						deliveries: [...initialDeliveries, ...steering],
-					};
-				}
-				if (context.defaultAction.type === "request") {
-					return context.defaultAction;
-				}
-				const followUp = this.leaseQueuedDeliveries("followUp", this.followUpQueueMode);
-				return followUp.length > 0
-					? { type: "request", reason: "delivery", deliveries: followUp }
-					: { type: "stop" };
-			},
-			beginDelivery: (delivery) => ({
-				outcome: this.beginDelivery(delivery.deliveryId) ? "committed" : "revoked",
-			}),
+			nextAction: async (context) => await this.resolveNextAction(context, startState),
+			beginDelivery: async (delivery) => await this.beginActiveDelivery(delivery),
 			prepareRequest: async ({ context }) => {
 				await this.flushPendingSessionWrites();
 				if (firstRequest) {
@@ -657,6 +851,7 @@ export class AgentHarness<
 		signal?: AbortSignal,
 	): Promise<void> {
 		if (event.type === "delivery_start") {
+			state.requestAccepted = true;
 			for (const message of event.messages) {
 				if (!state.admittedMessageSet.has(message)) {
 					state.admittedMessageSet.add(message);
@@ -664,40 +859,23 @@ export class AgentHarness<
 				}
 				state.messageDeliveryIds.set(message, event.deliveryId);
 			}
-			const deliveryState: AgentHarnessDeliveryEventState = {
-				remainingMessages: new Set(event.messages),
-				errors: [],
-			};
-			state.deliveries.set(event.deliveryId, deliveryState);
-			if (event.deliveryId !== undefined && this.committedDeliveryIds.delete(event.deliveryId)) {
-				try {
-					await this.emitQueueUpdate();
-				} catch (error) {
-					deliveryState.errors.push(toError(error));
+			state.deliveries.set(event.deliveryId, { remainingMessages: new Set(event.messages) });
+			const observational = event.deliveryId !== undefined && state.observationalDeliveryIds.has(event.deliveryId);
+			if (observational) {
+				if (event.deliveryId !== undefined && this.leasedDeliveryKinds.get(event.deliveryId) !== "prompt") {
+					await this.emitQueueUpdate(true);
 				}
-			}
-			try {
+				await this.emitPassive(event, signal);
+			} else {
 				await this.emitAny(event, signal);
-			} catch (error) {
-				deliveryState.errors.push(toError(error));
-			}
-			if (deliveryState.remainingMessages.size === 0) {
-				state.deliveries.delete(event.deliveryId);
-				if (deliveryState.errors.length > 0) {
-					throw combineEventErrors(deliveryState.errors, "Delivery notifications failed");
-				}
 			}
 			return;
 		}
 		if (event.type === "message_start") {
 			state.startedMessages.add(event.message);
-			try {
-				await this.emitAny(event, signal);
-			} catch (error) {
-				const deliveryState = state.deliveries.get(event.deliveryId);
-				if (!deliveryState?.remainingMessages.has(event.message)) throw error;
-				deliveryState.errors.push(toError(error));
-			}
+			const observational = event.deliveryId !== undefined && state.observationalDeliveryIds.has(event.deliveryId);
+			if (observational) await this.emitPassive(event, signal);
+			else await this.emitAny(event, signal);
 			return;
 		}
 		if (event.type === "message_end") {
@@ -706,29 +884,19 @@ export class AgentHarness<
 				state.persistedMessageSet.add(event.message);
 				state.persistedMessages.push(event.message);
 			}
-			let eventError: unknown;
-			try {
-				await this.emitAny(event, signal);
-			} catch (error) {
-				eventError = error;
-			}
 			const deliveryState = state.deliveries.get(event.deliveryId);
-			if (deliveryState?.remainingMessages.delete(event.message)) {
-				if (eventError) deliveryState.errors.push(toError(eventError));
-				if (deliveryState.remainingMessages.size === 0) {
-					state.deliveries.delete(event.deliveryId);
-					if (deliveryState.errors.length > 0) {
-						throw combineEventErrors(deliveryState.errors, "Delivery notifications failed");
-					}
-				}
-				return;
+			if (deliveryState?.remainingMessages.delete(event.message) && deliveryState.remainingMessages.size === 0) {
+				state.deliveries.delete(event.deliveryId);
 			}
-			if (eventError) throw eventError;
+			const observational = event.deliveryId !== undefined && state.observationalDeliveryIds.has(event.deliveryId);
+			if (observational) await this.emitPassive(event, signal);
+			else await this.emitAny(event, signal);
 			return;
 		}
 		if (event.type === "turn_start") {
 			state.hasTurnStarted = true;
 			state.turnOpen = true;
+			state.requestAccepted = true;
 			await this.emitAny(event, signal);
 			return;
 		}
@@ -789,12 +957,17 @@ export class AgentHarness<
 			}
 		}
 
-		if (!state.turnOpen) await attempt({ type: "turn_start" });
-		const failureError = aborted ? new Error("Request was aborted") : error;
-		const failureMessage = createFailureMessage(model, failureError, aborted);
-		await attempt({ type: "message_start", message: failureMessage });
-		await attempt({ type: "message_end", message: failureMessage });
-		await attempt({ type: "turn_end", message: failureMessage, toolResults: [] });
+		const outcomes = [...state.deliveryOutcomes.values()];
+		const hasCommittedDelivery = outcomes.some((outcome) => outcome.outcome === "committed");
+		const retainedBeforeAnyCommit = state.deliveryFailure?.outcome === "retained" && !hasCommittedDelivery;
+		if (!retainedBeforeAnyCommit && !(aborted && !state.requestAccepted)) {
+			if (!state.turnOpen) await attempt({ type: "turn_start" });
+			const failureError = aborted ? new Error("Request was aborted") : error;
+			const failureMessage = createFailureMessage(model, failureError, aborted);
+			await attempt({ type: "message_start", message: failureMessage });
+			await attempt({ type: "message_end", message: failureMessage });
+			await attempt({ type: "turn_end", message: failureMessage, toolResults: [] });
+		}
 		const terminalMessages = [...state.persistedMessages];
 		await attempt({ type: "agent_end", messages: terminalMessages });
 
@@ -804,41 +977,57 @@ export class AgentHarness<
 		return terminalMessages;
 	}
 
-	private async executeTurn(
+	private enqueueDelivery(kind: AgentDeliveryKind, messages: readonly AgentMessage[]): string {
+		return this.deliveryInbox.enqueue(kind, cloneAgentMessages(messages)).deliveryId;
+	}
+
+	private async enqueuePromptDelivery(
 		turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
 		text: string,
-		options?: { images?: ImageContent[] },
-	): Promise<AssistantMessage> {
-		let activeTurnState = turnState;
-		let messages: AgentMessage[] = [createUserMessage(text, options?.images)];
-		if (this.nextTurnQueue.length > 0) {
-			const queuedMessages = this.nextTurnQueue.splice(0);
-			try {
-				await this.emitQueueUpdate();
-			} catch (error) {
-				this.nextTurnQueue.unshift(...queuedMessages);
-				throw normalizeHookError(error);
-			}
-			messages = [...queuedMessages, messages[0]!];
-		}
+		options?: AgentHarnessPromptOptions,
+	): Promise<string | undefined> {
+		const nextTurnCount = this.nextTurnQueue.length;
+		const nextTurnMessages = cloneAgentMessages(this.nextTurnQueue.slice(0, nextTurnCount));
 		const beforeResult = await this.emitHook({
 			type: "before_agent_start",
 			prompt: text,
-			...(options?.images === undefined ? {} : { images: options.images }),
+			...(options?.images === undefined ? {} : { images: structuredClone(options.images) }),
 			systemPrompt: turnState.systemPrompt,
 			resources: turnState.resources,
 		});
-		if (beforeResult?.messages) messages = [...messages, ...beforeResult.messages];
+		this.enqueueDelivery("prompt", [
+			...nextTurnMessages,
+			createUserMessage(text, options?.images),
+			...(beforeResult?.messages ?? []),
+		]);
+		if (nextTurnCount > 0) {
+			this.nextTurnQueue.splice(0, nextTurnCount);
+			await this.emitQueueUpdate(true);
+		}
+		return beforeResult?.systemPrompt;
+	}
 
-		const abortController = new AbortController();
+	private async executeTurn(
+		turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
+		startState: DispatcherStartState,
+		systemPrompt?: string,
+	): Promise<AgentHarnessRunResult> {
+		let activeTurnState = turnState;
 		const getTurnState = () => activeTurnState;
 		const setTurnState = (nextTurnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>) => {
 			activeTurnState = nextTurnState;
 		};
-		this.runAbortController = abortController;
+		const abortController = new AbortController();
 		const runEventState: AgentHarnessRunEventState = {
-			admittedMessages: [...messages],
-			admittedMessageSet: new Set(messages),
+			id: `harness-run:${globalThis.crypto.randomUUID()}`,
+			abortController,
+			requestAccepted: false,
+			deliverySettlement: undefined,
+			deliveryOrder: new Map(),
+			deliveryOutcomes: new Map(),
+			observationalDeliveryIds: new Set(),
+			admittedMessages: [],
+			admittedMessageSet: new Set(),
 			messageDeliveryIds: new Map(),
 			startedMessages: new Set(),
 			persistedMessages: [],
@@ -849,35 +1038,24 @@ export class AgentHarness<
 			settlementStarted: false,
 			terminalEmitted: false,
 		};
+		this.activeRun = runEventState;
+
+		let loopMessages: AgentMessage[] = [];
 		let terminalMessages: AgentMessage[] | undefined;
-		const runResultPromise = (async () => {
+		let deliveries: readonly AgentDeliveryAttemptResult[] = [];
+		let deliveryFailure: AgentDeliveryFailure | undefined;
+		try {
 			try {
-				return await runAgentLoop(
-					messages,
-					this.createContext(turnState, beforeResult?.systemPrompt),
-					this.createLoopConfig(getTurnState, setTurnState),
-					async (event) => {
-						if (event.type === "agent_end" && abortController.signal.aborted && !runEventState.hasTurnStarted) {
-							const abortError = new Error("Request was aborted");
-							try {
-								terminalMessages = await this.settleRunFailure(
-									runEventState,
-									activeTurnState.model,
-									abortError,
-									true,
-									abortController.signal,
-								);
-							} catch (settlementError) {
-								throw createFailureSettlementError(abortError, settlementError);
-							}
-							return;
-						}
-						await this.handleAgentEvent(event, runEventState, abortController.signal);
-					},
+				loopMessages = await runAgentLoop(
+					[],
+					this.createContext(turnState, systemPrompt),
+					this.createLoopConfig(getTurnState, setTurnState, startState),
+					async (event) => await this.handleAgentEvent(event, runEventState, abortController.signal),
 					abortController.signal,
 					this.createStreamFn(getTurnState),
 				);
 			} catch (error) {
+				this.rollbackActiveLease();
 				if (runEventState.settlementStarted || runEventState.terminalEmitted) throw error;
 				try {
 					terminalMessages = await this.settleRunFailure(
@@ -887,75 +1065,130 @@ export class AgentHarness<
 						abortController.signal.aborted,
 						abortController.signal,
 					);
-					return terminalMessages;
 				} catch (settlementError) {
 					throw createFailureSettlementError(error, settlementError);
 				}
 			}
-		})();
-		try {
-			const loopMessages = await runResultPromise;
-			const newMessages = terminalMessages ?? loopMessages;
-			for (let i = newMessages.length - 1; i >= 0; i--) {
-				const message = newMessages[i]!;
-				if (message.role === "assistant") {
-					return message;
-				}
-			}
-			throw new AgentHarnessError("invalid_state", "AgentHarness prompt completed without an assistant message");
 		} finally {
 			try {
 				await this.flushPendingSessionWrites();
 			} finally {
-				this.deliveryInbox.rollbackActiveLease();
-				this.activeDeliveryLease = undefined;
-				this.committedDeliveryIds.clear();
-				this.runAbortController = undefined;
+				this.rollbackActiveLease();
+				deliveries = Object.freeze(
+					[...runEventState.deliveryOutcomes.values()].sort(
+						(left, right) =>
+							(runEventState.deliveryOrder.get(left.deliveryId) ?? Number.MAX_SAFE_INTEGER) -
+							(runEventState.deliveryOrder.get(right.deliveryId) ?? Number.MAX_SAFE_INTEGER),
+					),
+				);
+				deliveryFailure = runEventState.deliveryFailure;
+				this.leasedDeliveryKinds.clear();
+				this.activeRun = undefined;
 			}
 		}
+
+		const newMessages = terminalMessages ?? loopMessages;
+		let response: AssistantMessage | undefined;
+		for (let index = newMessages.length - 1; index >= 0; index--) {
+			const message = newMessages[index]!;
+			if (message.role === "assistant") {
+				response = message;
+				break;
+			}
+		}
+		return deliveryFailure
+			? { status: "delivery_failed", deliveries, failure: deliveryFailure, response }
+			: { status: "completed", deliveries, response };
 	}
 
-	async prompt(text: string, options?: { images?: ImageContent[] }): Promise<AssistantMessage> {
+	private async startPromptRun(
+		resolveInvocation: (turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>) => {
+			text: string;
+			options?: AgentHarnessPromptOptions;
+		},
+	): Promise<AgentHarnessRunResult> {
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
+		if (this.hasPendingPrompt()) {
+			throw new AgentHarnessError(
+				"invalid_state",
+				"AgentHarness has a retained prompt; call continue() or discardPendingPrompt() before starting another",
+			);
+		}
 		this.phase = "turn";
 		const finishRunPromise = this.startRunPromise();
 		try {
 			const turnState = await this.createTurnState();
-			return await this.executeTurn(turnState, text, options);
+			const invocation = resolveInvocation(turnState);
+			const systemPrompt = await this.enqueuePromptDelivery(turnState, invocation.text, invocation.options);
+			const lastMessage = turnState.messages.at(-1);
+			return await this.executeTurn(
+				turnState,
+				{
+					firstDecision: true,
+					requestAuthority: "provider",
+					providerRequestPending: lastMessage !== undefined && lastMessage.role !== "assistant",
+				},
+				systemPrompt,
+			);
 		} catch (error) {
 			this.phase = "idle";
 			throw normalizeHarnessError(error, "unknown");
 		} finally {
 			finishRunPromise();
 		}
+	}
+
+	private requireResponse(result: AgentHarnessRunResult, operation: string): AssistantMessage {
+		if (result.response) return result.response;
+		throw new AgentHarnessError("delivery", `${operation} completed without an assistant response`);
+	}
+
+	async runPrompt(text: string, options?: AgentHarnessPromptOptions): Promise<AgentHarnessRunResult> {
+		return await this.startPromptRun(() => ({ text, ...(options === undefined ? {} : { options }) }));
+	}
+
+	async prompt(text: string, options?: AgentHarnessPromptOptions): Promise<AssistantMessage> {
+		return this.requireResponse(await this.runPrompt(text, options), "prompt()");
 	}
 
 	async skill(name: string, additionalInstructions?: string): Promise<AssistantMessage> {
-		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
-		this.phase = "turn";
-		const finishRunPromise = this.startRunPromise();
-		try {
-			const turnState = await this.createTurnState();
+		const result = await this.startPromptRun((turnState) => {
 			const skill = (turnState.resources.skills ?? []).find((candidate) => candidate.name === name);
 			if (!skill) throw new AgentHarnessError("invalid_argument", `Unknown skill: ${name}`);
-			return await this.executeTurn(turnState, formatSkillInvocation(skill, additionalInstructions));
-		} catch (error) {
-			this.phase = "idle";
-			throw normalizeHarnessError(error, "unknown");
-		} finally {
-			finishRunPromise();
-		}
+			return { text: formatSkillInvocation(skill, additionalInstructions) };
+		});
+		return this.requireResponse(result, "skill()");
 	}
 
 	async promptFromTemplate(name: string, args: string[] = []): Promise<AssistantMessage> {
+		const result = await this.startPromptRun((turnState) => {
+			const template = (turnState.resources.promptTemplates ?? []).find((candidate) => candidate.name === name);
+			if (!template) throw new AgentHarnessError("invalid_argument", `Unknown prompt template: ${name}`);
+			return { text: formatPromptTemplateInvocation(template, args) };
+		});
+		return this.requireResponse(result, "promptFromTemplate()");
+	}
+
+	async continue(options: { drainFollowUps?: boolean } = {}): Promise<AgentHarnessRunResult> {
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
 		this.phase = "turn";
 		const finishRunPromise = this.startRunPromise();
 		try {
 			const turnState = await this.createTurnState();
-			const template = (turnState.resources.promptTemplates ?? []).find((candidate) => candidate.name === name);
-			if (!template) throw new AgentHarnessError("invalid_argument", `Unknown prompt template: ${name}`);
-			return await this.executeTurn(turnState, formatPromptTemplateInvocation(template, args));
+			const lastMessage = turnState.messages.at(-1);
+			if (!lastMessage && !this.hasQueuedMessages()) {
+				throw new AgentHarnessError("invalid_state", "No messages to continue from");
+			}
+			if (lastMessage?.role === "assistant" && !this.hasQueuedMessages()) {
+				this.phase = "idle";
+				return { status: "completed", deliveries: [], response: undefined };
+			}
+			return await this.executeTurn(turnState, {
+				firstDecision: true,
+				requestAuthority: "provider",
+				providerRequestPending: lastMessage !== undefined && lastMessage.role !== "assistant",
+				drainFollowUpsFirst: options.drainFollowUps === true || lastMessage?.role === "assistant",
+			});
 		} catch (error) {
 			this.phase = "idle";
 			throw normalizeHarnessError(error, "unknown");
@@ -964,21 +1197,79 @@ export class AgentHarness<
 		}
 	}
 
-	async steer(text: string, options?: { images?: ImageContent[] }): Promise<void> {
+	async steer(text: string, options?: AgentHarnessPromptOptions): Promise<string> {
 		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot steer while idle");
-		this.deliveryInbox.enqueue("steer", [createUserMessage(text, options?.images)]);
+		const deliveryId = this.enqueueDelivery("steer", [createUserMessage(text, options?.images)]);
 		await this.emitQueueUpdate();
+		return deliveryId;
 	}
 
-	async followUp(text: string, options?: { images?: ImageContent[] }): Promise<void> {
+	async followUp(text: string, options?: AgentHarnessPromptOptions): Promise<string> {
 		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot follow up while idle");
-		this.deliveryInbox.enqueue("followUp", [createUserMessage(text, options?.images)]);
+		const deliveryId = this.enqueueDelivery("followUp", [createUserMessage(text, options?.images)]);
+		await this.emitQueueUpdate();
+		return deliveryId;
+	}
+
+	async nextTurn(text: string, options?: AgentHarnessPromptOptions): Promise<void> {
+		this.nextTurnQueue.push(...cloneAgentMessages([createUserMessage(text, options?.images)]));
 		await this.emitQueueUpdate();
 	}
 
-	async nextTurn(text: string, options?: { images?: ImageContent[] }): Promise<void> {
-		this.nextTurnQueue.push(createUserMessage(text, options?.images));
-		await this.emitQueueUpdate();
+	hasQueuedMessages(): boolean {
+		return this.deliveryInbox.hasPending();
+	}
+
+	hasPendingPrompt(): boolean {
+		return this.deliveryInbox.hasPending("prompt");
+	}
+
+	canPrepareDelivery(deliveryId: string): boolean {
+		return this.activeDeliveryLease?.canPrepare(deliveryId) ?? false;
+	}
+
+	private revokeDeliveries(kind: AgentDeliveryKind): readonly PendingDelivery[] {
+		const revoked = this.deliveryInbox.revoke(kind);
+		for (const delivery of revoked) {
+			this.recordDeliveryOutcome({
+				deliveryId: delivery.deliveryId,
+				kind: delivery.kind,
+				outcome: "revoked",
+			});
+			this.preparedDeliveryParticipants.delete(delivery.deliveryId);
+			try {
+				this.deliveryRevoked?.({
+					deliveryId: delivery.deliveryId,
+					kind: delivery.kind,
+					messages: cloneAgentMessages(delivery.messages),
+				});
+			} catch {
+				// Revocation is authoritative; observational host cleanup cannot undo it.
+			}
+		}
+		return revoked;
+	}
+
+	private async clearDeliveryKinds(kinds: readonly AgentDeliveryKind[]): Promise<string[]> {
+		const revoked = kinds.flatMap((kind) => this.revokeDeliveries(kind));
+		if (revoked.length > 0) await this.emitQueueUpdate();
+		return revoked.map((delivery) => delivery.deliveryId);
+	}
+
+	async clearSteeringQueue(): Promise<string[]> {
+		return await this.clearDeliveryKinds(["steer"]);
+	}
+
+	async clearFollowUpQueue(): Promise<string[]> {
+		return await this.clearDeliveryKinds(["followUp"]);
+	}
+
+	async clearAllQueues(): Promise<string[]> {
+		return await this.clearDeliveryKinds(["steer", "followUp"]);
+	}
+
+	async discardPendingPrompt(): Promise<string[]> {
+		return await this.clearDeliveryKinds(["prompt"]);
 	}
 
 	async appendMessage(message: AgentMessage): Promise<void> {
@@ -1313,10 +1604,22 @@ export class AgentHarness<
 		this.streamOptions = cloneStreamOptions(streamOptions);
 	}
 
-	async abort(): Promise<AbortResult> {
-		const clearedSteer = this.deliveryInbox.revoke("steer").flatMap((delivery) => [...delivery.messages]);
-		const clearedFollowUp = this.deliveryInbox.revoke("followUp").flatMap((delivery) => [...delivery.messages]);
-		this.runAbortController?.abort();
+	private requestAbort(source?: AgentAbortSource): AgentAbortAcceptance {
+		const run = this.activeRun;
+		if (!run || run.terminalEmitted) {
+			return Object.freeze({ runId: run?.id, accepted: false, source: run?.abortSource });
+		}
+		if (source !== undefined && run.abortSource === undefined) run.abortSource = source;
+		run.abortController.abort();
+		return Object.freeze({ runId: run.id, accepted: true, source: run.abortSource });
+	}
+
+	async abort(source?: AgentAbortSource): Promise<AbortResult> {
+		const clearedSteer = cloneAgentMessages(this.revokeDeliveries("steer").flatMap((delivery) => delivery.messages));
+		const clearedFollowUp = cloneAgentMessages(
+			this.revokeDeliveries("followUp").flatMap((delivery) => delivery.messages),
+		);
+		this.requestAbort(source);
 		const errors: Error[] = [];
 		try {
 			await this.emitQueueUpdate();
@@ -1329,7 +1632,11 @@ export class AgentHarness<
 			errors.push(toError(error));
 		}
 		try {
-			await this.emitOwn({ type: "abort", clearedSteer, clearedFollowUp });
+			await this.emitOwn({
+				type: "abort",
+				clearedSteer: cloneAgentMessages(clearedSteer),
+				clearedFollowUp: cloneAgentMessages(clearedFollowUp),
+			});
 		} catch (error) {
 			errors.push(toError(error));
 		}

@@ -220,74 +220,71 @@ describe("AgentHarness", () => {
 	it.each([
 		["queue_update", "queue update exploded"],
 		["delivery_start", "delivery start exploded"],
-	] as const)(
-		"persists a begun delivery before settling a rejecting %s observer",
-		async (rejectedEvent, errorMessage) => {
-			const registration = registerFauxProvider();
-			registrations.push(registration);
-			registration.setResponses([() => fauxAssistantMessage("should not be used")]);
-			const session = new Session(new InMemorySessionStorage());
-			const harness = new AgentHarness({
-				env: new NodeExecutionEnv({ cwd: process.cwd() }),
-				session,
-				model: registration.getModel(),
-			});
-			const lifecycleEvents: string[] = [];
-			const steerQueueSnapshots: string[][] = [];
-			let queued = false;
-			let sawDeliveryStart = false;
-			let terminalMessages: AgentMessage[] = [];
-			const unsubscribe = harness.subscribe(async (event) => {
-				if (
-					event.type === "agent_start" ||
-					event.type === "turn_start" ||
-					event.type === "turn_end" ||
-					event.type === "message_start" ||
-					event.type === "message_end" ||
-					event.type === "agent_end"
-				) {
-					lifecycleEvents.push(event.type);
+	] as const)("isolates a committed delivery from a rejecting %s observer", async (rejectedEvent, errorMessage) => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		registration.setResponses([() => fauxAssistantMessage("observer failures ignored")]);
+		const session = new Session(new InMemorySessionStorage());
+		const harness = new AgentHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: registration.getModel(),
+		});
+		const lifecycleEvents: string[] = [];
+		const steerQueueSnapshots: string[][] = [];
+		let queued = false;
+		let sawDeliveryStart = false;
+		let terminalMessages: AgentMessage[] = [];
+		const unsubscribe = harness.subscribe(async (event) => {
+			if (
+				event.type === "agent_start" ||
+				event.type === "turn_start" ||
+				event.type === "turn_end" ||
+				event.type === "message_start" ||
+				event.type === "message_end" ||
+				event.type === "agent_end"
+			) {
+				lifecycleEvents.push(event.type);
+			}
+			if (event.type === "agent_start" && !queued) {
+				queued = true;
+				await harness.steer("committed delivery");
+			}
+			if (event.type === "queue_update") {
+				steerQueueSnapshots.push(textFromUserMessages(event.steer));
+				if (rejectedEvent === "queue_update" && queued && event.steer.length === 0) {
+					throw new Error(errorMessage);
 				}
-				if (event.type === "agent_start" && !queued) {
-					queued = true;
-					await harness.steer("committed delivery");
-				}
-				if (event.type === "queue_update") {
-					steerQueueSnapshots.push(textFromUserMessages(event.steer));
-					if (rejectedEvent === "queue_update" && queued && event.steer.length === 0) {
-						throw new Error(errorMessage);
-					}
-				}
-				if (event.type === "delivery_start" && event.deliveryId !== undefined) {
-					sawDeliveryStart = true;
-					if (rejectedEvent === "delivery_start") throw new Error(errorMessage);
-				}
-				if (event.type === "agent_end") terminalMessages = event.messages;
-			});
+			}
+			if (event.type === "delivery_start" && event.deliveryId !== undefined) {
+				sawDeliveryStart = true;
+				if (rejectedEvent === "delivery_start") throw new Error(errorMessage);
+			}
+			if (event.type === "agent_end") terminalMessages = event.messages;
+		});
 
-			const response = await harness.prompt("initial prompt");
-			const persistedMessages = (await session.buildContext()).messages as AgentMessage[];
-			unsubscribe();
-			const abortResult = await harness.abort();
+		const response = await harness.prompt("initial prompt");
+		const persistedMessages = (await session.buildContext()).messages as AgentMessage[];
+		unsubscribe();
+		const abortResult = await harness.abort();
 
-			expect(registration.state.callCount).toBe(0);
-			expect(registration.getPendingResponseCount()).toBe(1);
-			expect(response).toMatchObject({ role: "assistant", stopReason: "error", errorMessage });
-			expect(textFromUserMessages(persistedMessages)).toEqual(["initial prompt", "committed delivery"]);
-			expect(persistedMessages.map((message) => message.role)).toEqual(["user", "user", "assistant"]);
-			expect(terminalMessages).toEqual(persistedMessages);
-			expect(steerQueueSnapshots).toEqual([["committed delivery"], []]);
-			expect(sawDeliveryStart).toBe(true);
-			expect(abortResult).toEqual({ clearedSteer: [], clearedFollowUp: [] });
-			expect(lifecycleEvents.filter((event) => event === "turn_start" || event === "turn_end")).toEqual([
-				"turn_start",
-				"turn_end",
-			]);
-			expect(lifecycleEvents.at(-1)).toBe("agent_end");
-		},
-	);
+		expect(registration.state.callCount).toBe(1);
+		expect(registration.getPendingResponseCount()).toBe(0);
+		expect(response.content).toEqual([{ type: "text", text: "observer failures ignored" }]);
+		expect(textFromUserMessages(persistedMessages)).toEqual(["initial prompt", "committed delivery"]);
+		expect(persistedMessages.map((message) => message.role)).toEqual(["user", "user", "assistant"]);
+		expect(terminalMessages).toEqual(persistedMessages);
+		expect(steerQueueSnapshots).toEqual([["committed delivery"], []]);
+		expect(sawDeliveryStart).toBe(true);
+		expect(abortResult).toEqual({ clearedSteer: [], clearedFollowUp: [] });
+		expect(lifecycleEvents.filter((event) => event === "turn_start" || event === "turn_end")).toEqual([
+			"turn_start",
+			"turn_end",
+		]);
+		expect(lifecycleEvents.at(-1)).toBe("agent_end");
+	});
 
-	it("settles an agent_start abort with the initial prompt and an aborted assistant", async () => {
+	it("retains an initial prompt when agent_start abort wins before delivery begin", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);
 		registration.setResponses([() => fauxAssistantMessage("should not be used")]);
@@ -311,41 +308,29 @@ describe("AgentHarness", () => {
 			) {
 				lifecycleEvents.push(event.type);
 			}
-			if (event.type === "agent_start") {
-				abortPromise = harness.abort();
-			}
-			if (event.type === "agent_end") {
-				terminalMessages = event.messages;
-			}
+			if (event.type === "agent_start") abortPromise = harness.abort();
+			if (event.type === "agent_end") terminalMessages = event.messages;
 		});
 		harness.subscribe((event) => {
 			if (event.type === "agent_start") throw new Error("later agent_start exploded");
 		});
 
-		const response = await harness.prompt("preserve this prompt");
+		const result = await harness.runPrompt("preserve this prompt");
 		const abortResult = await abortPromise;
 		const persistedMessages = (await session.buildContext()).messages as AgentMessage[];
 
 		expect(abortResult).toEqual({ clearedSteer: [], clearedFollowUp: [] });
 		expect(registration.state.callCount).toBe(0);
 		expect(registration.getPendingResponseCount()).toBe(1);
-		expect(response).toMatchObject({ role: "assistant", stopReason: "aborted", errorMessage: "Request was aborted" });
-		expect(textFromUserMessages(persistedMessages)).toEqual(["preserve this prompt"]);
-		expect(persistedMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
-		expect(terminalMessages).toEqual(persistedMessages);
-		expect(lifecycleEvents).toEqual([
-			"agent_start",
-			"message_start",
-			"message_end",
-			"turn_start",
-			"message_start",
-			"message_end",
-			"turn_end",
-			"agent_end",
-		]);
+		expect(result).toEqual({ status: "completed", deliveries: [], response: undefined });
+		expect(harness.hasPendingPrompt()).toBe(true);
+		expect(persistedMessages).toEqual([]);
+		expect(terminalMessages).toEqual([]);
+		expect(lifecycleEvents).toEqual(["agent_start", "agent_end"]);
+		expect(await harness.discardPendingPrompt()).toHaveLength(1);
 	});
 
-	it("does not retry agent_start abort settlement when synthetic message_end rejects", async () => {
+	it("does not synthesize or retry settlement when agent_start abort retains the prompt", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);
 		registration.setResponses([() => fauxAssistantMessage("should not be used")]);
@@ -358,7 +343,6 @@ describe("AgentHarness", () => {
 		const lifecycleEvents: string[] = [];
 		const terminalEvents: AgentMessage[][] = [];
 		let assistantMessageEnds = 0;
-		let rejectedSyntheticMessageEnd = false;
 		let abortPromise: ReturnType<typeof harness.abort> | undefined;
 		harness.subscribe((event) => {
 			if (
@@ -372,70 +356,31 @@ describe("AgentHarness", () => {
 			) {
 				lifecycleEvents.push(event.type);
 			}
-			if (event.type === "agent_start") {
-				abortPromise = harness.abort();
-			}
-			if (event.type === "message_end" && event.message.role === "assistant") {
-				assistantMessageEnds++;
-				if (!rejectedSyntheticMessageEnd) {
-					rejectedSyntheticMessageEnd = true;
-					throw new Error("synthetic assistant message_end exploded");
-				}
-			}
-			if (event.type === "agent_end") {
-				terminalEvents.push(event.messages);
-			}
+			if (event.type === "agent_start") abortPromise = harness.abort();
+			if (event.type === "message_end" && event.message.role === "assistant") assistantMessageEnds++;
+			if (event.type === "agent_end") terminalEvents.push(event.messages);
 		});
 
-		let promptError: unknown;
-		try {
-			await harness.prompt("preserve this prompt once");
-		} catch (error) {
-			promptError = error;
-		}
+		const result = await harness.runPrompt("preserve this prompt once");
 		const abortResult = await abortPromise;
 		const persistedMessages = (await session.buildContext()).messages as AgentMessage[];
 
 		expect(abortResult).toEqual({ clearedSteer: [], clearedFollowUp: [] });
 		expect(registration.state.callCount).toBe(0);
 		expect(registration.getPendingResponseCount()).toBe(1);
-		expect(promptError).toMatchObject({
-			name: "AgentHarnessError",
-			code: "unknown",
-			message: "Agent run failed and failure reporting failed",
-		});
-		expect(promptError).toBeInstanceOf(Error);
-		if (!(promptError instanceof Error)) throw new Error("Expected prompt to reject with an Error");
-		expect(promptError.cause).toBeInstanceOf(AggregateError);
-		expect((promptError.cause as AggregateError).errors).toEqual([
-			expect.objectContaining({ message: "Request was aborted" }),
-			expect.objectContaining({ message: "synthetic assistant message_end exploded" }),
-		]);
-		expect(textFromUserMessages(persistedMessages)).toEqual(["preserve this prompt once"]);
-		expect(persistedMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
-		expect(persistedMessages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
-		expect(assistantMessageEnds).toBe(1);
-		expect(terminalEvents).toHaveLength(1);
-		expect(terminalEvents[0]).toEqual(persistedMessages);
-		expect(lifecycleEvents).toEqual([
-			"agent_start",
-			"message_start",
-			"message_end",
-			"turn_start",
-			"message_start",
-			"message_end",
-			"turn_end",
-			"agent_end",
-			"settled",
-		]);
+		expect(result.response).toBeUndefined();
+		expect(persistedMessages).toEqual([]);
+		expect(assistantMessageEnds).toBe(0);
+		expect(terminalEvents).toEqual([[]]);
+		expect(lifecycleEvents).toEqual(["agent_start", "agent_end", "settled"]);
 	});
 
 	it.each(["message_start", "message_end"] as const)(
-		"settles an initial delivery %s rejection without duplicating its message",
+		"isolates an initial delivery %s observer rejection behind one stable ID",
 		async (rejectedEvent) => {
 			const registration = registerFauxProvider();
 			registrations.push(registration);
-			registration.setResponses([() => fauxAssistantMessage("should not be used")]);
+			registration.setResponses([() => fauxAssistantMessage("provider response")]);
 			const session = new Session(new InMemorySessionStorage());
 			const harness = new AgentHarness({
 				env: new NodeExecutionEnv({ cwd: process.cwd() }),
@@ -443,6 +388,7 @@ describe("AgentHarness", () => {
 				model: registration.getModel(),
 			});
 			const lifecycleEvents: string[] = [];
+			const deliveryIds: string[] = [];
 			let terminalMessages: AgentMessage[] = [];
 			harness.subscribe((event) => {
 				if (
@@ -455,8 +401,14 @@ describe("AgentHarness", () => {
 				) {
 					lifecycleEvents.push(event.type);
 				}
-				if (event.type === rejectedEvent && event.message.role === "user") {
-					throw new Error("initial delivery exploded");
+				if (event.type === "delivery_start" && event.deliveryId) deliveryIds.push(event.deliveryId);
+				if (
+					(event.type === "message_start" || event.type === "message_end") &&
+					event.deliveryId &&
+					event.message.role === "user"
+				) {
+					deliveryIds.push(event.deliveryId);
+					if (event.type === rejectedEvent) throw new Error("initial delivery exploded");
 				}
 				if (event.type === "agent_end") terminalMessages = event.messages;
 			});
@@ -464,13 +416,11 @@ describe("AgentHarness", () => {
 			const response = await harness.prompt("preserve this initial delivery");
 			const persistedMessages = (await session.buildContext()).messages as AgentMessage[];
 
-			expect(registration.state.callCount).toBe(0);
-			expect(registration.getPendingResponseCount()).toBe(1);
-			expect(response).toMatchObject({
-				role: "assistant",
-				stopReason: "error",
-				errorMessage: "initial delivery exploded",
-			});
+			expect(registration.state.callCount).toBe(1);
+			expect(registration.getPendingResponseCount()).toBe(0);
+			expect(response.content).toEqual([{ type: "text", text: "provider response" }]);
+			expect(new Set(deliveryIds)).toHaveLength(1);
+			expect(deliveryIds).toHaveLength(3);
 			expect(textFromUserMessages(persistedMessages)).toEqual(["preserve this initial delivery"]);
 			expect(persistedMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
 			expect(terminalMessages).toEqual(persistedMessages);
