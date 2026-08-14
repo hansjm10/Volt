@@ -3775,6 +3775,7 @@ export class AgentSession {
 		}
 		this._proactiveCompactionState = "idle";
 		this._drainFollowUpsOnNextContinuation = false;
+		this._nextRunContextOverride = undefined;
 		this._continueWithFinalResponseAuthority = false;
 		const run = (async () => {
 			this._agentConversationMutationInFlight = true;
@@ -6563,13 +6564,18 @@ export class AgentSession {
 			await sleep(delayMs, this._retryAbortController.signal);
 		} catch {
 			// Aborted during sleep - emit end event so UI can clean up
+			this._nextRunContextOverride = undefined;
 			this._settleRetry(false, "Retry cancelled");
 			return false;
 		} finally {
 			this._retryAbortController = undefined;
 		}
 
-		return !this._disposed && abortGeneration === this._abortGeneration;
+		if (this._disposed || abortGeneration !== this._abortGeneration) {
+			this._nextRunContextOverride = undefined;
+			return false;
+		}
+		return true;
 	}
 
 	/**

@@ -183,6 +183,48 @@ describe("AgentHarness host policy", () => {
 		expect(JSON.stringify(continuationMessages)).toContain("final result");
 	});
 
+	it("allows scoped policy to deliver work from an assistant-tail continuation", async () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		let continuationMessages: AgentMessage[] = [];
+		registration.setResponses([
+			() => fauxAssistantMessage("one"),
+			(context) => {
+				continuationMessages = context.messages as AgentMessage[];
+				return fauxAssistantMessage("two");
+			},
+		]);
+		const harness = createHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session: new Session(new InMemorySessionStorage()),
+			model: registration.getModel(),
+		});
+		await harness.prompt("first");
+
+		const decisions: string[] = [];
+		let delivered = false;
+		const policyMessage: AgentMessage = {
+			role: "user",
+			content: "policy delivery",
+			timestamp: Date.now(),
+		};
+		const unregister = harness.registerNextActionPolicy((context) => {
+			decisions.push(context.defaultAction.type);
+			if (delivered) return undefined;
+			delivered = true;
+			return { type: "request", reason: "delivery", deliveries: [{ messages: [policyMessage] }] };
+		});
+
+		await expect(harness.continue()).resolves.toMatchObject({ status: "completed" });
+		unregister();
+
+		expect(decisions).toEqual(["stop", "stop"]);
+		expect(continuationMessages.map(textOf)).toEqual(["first", "one", "policy delivery"]);
+		expect(registration.state.callCount).toBe(2);
+		await expect(harness.continue()).resolves.toEqual({ status: "completed", deliveries: [] });
+		expect(registration.state.callCount).toBe(2);
+	});
+
 	it("orders event and scoped next-action policy and unregisters scoped policy", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);

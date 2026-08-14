@@ -1464,7 +1464,9 @@ export class AgentHarness<
 			if (!lastMessage && !this.hasQueuedMessages()) {
 				throw new AgentHarnessError("invalid_state", "No messages to continue from");
 			}
-			if (lastMessage?.role === "assistant" && !this.hasQueuedMessages()) {
+			const hasNextActionReducers =
+				(this.getHandlers("next_action")?.size ?? 0) > 0 || this.nextActionPolicies.size > 0;
+			if (lastMessage?.role === "assistant" && !this.hasQueuedMessages() && !hasNextActionReducers) {
 				this.phase = "idle";
 				return { status: "completed", deliveries: [] };
 			}

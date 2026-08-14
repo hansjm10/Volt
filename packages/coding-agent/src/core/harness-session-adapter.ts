@@ -112,11 +112,35 @@ export class SessionManagerHarnessStorage implements SessionStorage {
 		return null;
 	}
 
+	private getVisibleFirstKeptEntryId(entry: Extract<SessionEntry, { type: "compaction" }>): string {
+		const firstKeptEntry = this.sessionManager.getEntry(entry.firstKeptEntryId);
+		if (!firstKeptEntry || isHarnessEntry(firstKeptEntry)) return entry.firstKeptEntryId;
+
+		let currentId = entry.parentId;
+		let firstVisibleDescendantId: string | undefined;
+		while (currentId !== null) {
+			const current = this.sessionManager.getEntry(currentId);
+			if (!current) return entry.firstKeptEntryId;
+			if (isHarnessEntry(current)) firstVisibleDescendantId = current.id;
+			if (current.id === entry.firstKeptEntryId) {
+				return firstVisibleDescendantId ?? entry.firstKeptEntryId;
+			}
+			currentId = current.parentId;
+		}
+		return entry.firstKeptEntryId;
+	}
+
+	private projectEntry(entry: SessionEntry, parentId: string | null): HarnessSessionTreeEntry | undefined {
+		const projected = toHarnessEntry(entry, parentId);
+		if (!projected || projected.type !== "compaction" || entry.type !== "compaction") return projected;
+		return { ...projected, firstKeptEntryId: this.getVisibleFirstKeptEntryId(entry) };
+	}
+
 	private mapPath(entries: readonly SessionEntry[]): HarnessSessionTreeEntry[] {
 		const mapped: HarnessSessionTreeEntry[] = [];
 		let parentId: string | null = null;
 		for (const entry of entries) {
-			const projected = toHarnessEntry(entry, parentId);
+			const projected = this.projectEntry(entry, parentId);
 			if (!projected) continue;
 			mapped.push(projected);
 			parentId = projected.id;
@@ -206,7 +230,7 @@ export class SessionManagerHarnessStorage implements SessionStorage {
 	async getEntry(id: string): Promise<HarnessSessionTreeEntry | undefined> {
 		const entry = this.sessionManager.getEntry(id);
 		return entry && isHarnessEntry(entry)
-			? toHarnessEntry(entry, this.getVisibleParentId(entry.parentId))
+			? this.projectEntry(entry, this.getVisibleParentId(entry.parentId))
 			: undefined;
 	}
 
@@ -232,7 +256,7 @@ export class SessionManagerHarnessStorage implements SessionStorage {
 
 	async getEntries(): Promise<HarnessSessionTreeEntry[]> {
 		return this.sessionManager.getEntries().flatMap((entry) => {
-			const projected = toHarnessEntry(entry, this.getVisibleParentId(entry.parentId));
+			const projected = this.projectEntry(entry, this.getVisibleParentId(entry.parentId));
 			return projected ? [projected] : [];
 		});
 	}

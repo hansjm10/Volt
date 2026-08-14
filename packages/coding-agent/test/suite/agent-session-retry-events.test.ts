@@ -2,7 +2,7 @@ import type { AgentMessage, AgentTool } from "@hansjm10/volt-agent-core";
 import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createHarness, type Harness } from "./harness.ts";
+import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 function normalizeEventOrder(events: Harness["events"]): string[] {
 	const normalized: string[] = [];
@@ -165,6 +165,54 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.session.isRetrying).toBe(false);
 		expect(harness.eventsOfType("auto_retry_end").map((event) => event.finalError)).toContain("Retry cancelled");
 		expect(harness.faux.state.callCount).toBe(1);
+	});
+
+	it("does not reuse canceled retry context for a fresh turn continuation", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 60_000 } },
+		});
+		harnesses.push(harness);
+		let continuationTexts: string[] = [];
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("fresh response"),
+			(context) => {
+				continuationTexts = context.messages.map(getMessageText).filter(Boolean);
+				return fauxAssistantMessage("follow-up response");
+			},
+		]);
+
+		const sawRetryStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+		const failedPrompt = harness.session.prompt("failed prompt");
+		await sawRetryStart;
+		harness.session.abortRetry();
+		await failedPrompt;
+
+		let queuedFollowUp = false;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type !== "agent_end" || queuedFollowUp) return;
+			queuedFollowUp = true;
+			harness.control.queueFollowUp({
+				role: "user",
+				content: "queued follow-up",
+				timestamp: Date.now(),
+			});
+		});
+		try {
+			await harness.session.prompt("fresh prompt");
+		} finally {
+			unsubscribe();
+		}
+
+		expect(harness.faux.state.callCount).toBe(3);
+		expect(continuationTexts).toEqual(["failed prompt", "fresh prompt", "fresh response", "queued follow-up"]);
 	});
 
 	it("reports cancellation when aborting an active retry response", async () => {

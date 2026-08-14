@@ -76,6 +76,40 @@ describe("SessionManager Harness adapter", () => {
 		]);
 	});
 
+	it("remaps filtered compaction boundaries to the first visible retained entry", async () => {
+		const manager = SessionManager.inMemory("/workspace");
+		manager.appendMessage({ role: "user", content: "summarized", timestamp: 1 });
+		const canonicalBoundaryId = manager.appendFastModeChange(true);
+		manager.appendPlanningState(DEFAULT_PLANNING_STATE);
+		const retainedId = manager.appendMessage({ role: "user", content: "retained", timestamp: 2 });
+		const compactionId = manager.appendCompaction("summary", canonicalBoundaryId, 100);
+		const storage = new SessionManagerHarnessStorage(manager);
+		const session = createSessionManagerHarnessSession(manager);
+
+		expect(manager.getEntry(compactionId)).toMatchObject({
+			type: "compaction",
+			firstKeptEntryId: canonicalBoundaryId,
+		});
+		for (const projected of [
+			await storage.getEntry(compactionId),
+			(await storage.getEntries()).find((entry) => entry.id === compactionId),
+			(await storage.getPathToRoot(compactionId)).at(-1),
+		]) {
+			expect(projected).toMatchObject({
+				type: "compaction",
+				firstKeptEntryId: retainedId,
+			});
+		}
+
+		const canonicalContext = manager.buildSessionContext();
+		const projectedContext = await session.buildContext();
+		expect(projectedContext.messages).toHaveLength(canonicalContext.messages.length);
+		expect(projectedContext.messages).toEqual([
+			expect.objectContaining({ role: "compactionSummary", summary: "summary" }),
+			expect.objectContaining({ role: "user", content: "retained" }),
+		]);
+	});
+
 	it("maps generic leaf movement and summaries onto SessionManager branching", async () => {
 		const manager = SessionManager.inMemory("/workspace");
 		const session = createSessionManagerHarnessSession(manager);
