@@ -195,4 +195,27 @@ describe("AgentHarness continuation state", () => {
 		expect(finalRequests.map((request) => request.tools)).toEqual([[], []]);
 		expect(finalRequests[1]?.texts).not.toContain("failed final");
 	});
+
+	it("completes assistant-tail no-ops without model-backed turn construction", async () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		let systemPromptCalls = 0;
+		for (const model of [undefined, registration.getModel()]) {
+			const session = new Session(new InMemorySessionStorage());
+			await session.appendMessage(fauxAssistantMessage("already complete"));
+			const harness = new AgentHarness({
+				env: new NodeExecutionEnv({ cwd: process.cwd() }),
+				session,
+				...(model === undefined ? {} : { model }),
+				systemPrompt: () => {
+					systemPromptCalls++;
+					throw new Error("system prompt should not be evaluated");
+				},
+			});
+
+			await expect(harness.continue()).resolves.toEqual({ status: "completed", deliveries: [] });
+		}
+		expect(systemPromptCalls).toBe(0);
+		expect(registration.state.callCount).toBe(0);
+	});
 });

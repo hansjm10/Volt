@@ -433,12 +433,20 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	}
 
 	const tempDir = createTempDir();
-	return createHarnessWithResourceLoader(options, options.resourceLoader ?? createTestResourceLoader(), tempDir);
+	const resourceLoader =
+		options.resourceLoader ??
+		createTestResourceLoader({ systemPrompt: options.systemPrompt ?? "You are a test assistant." });
+	return createHarnessWithResourceLoader(options, resourceLoader, tempDir);
 }
 
 export async function createHarnessWithExtensions(options: HarnessOptions = {}): Promise<Harness> {
 	const tempDir = createTempDir();
 	const extensionsResult = await createTestExtensionsResult(options.extensionFactories ?? [], tempDir);
-	const resourceLoader = options.resourceLoader ?? createTestResourceLoader({ extensionsResult });
+	const resourceLoader =
+		options.resourceLoader ??
+		createTestResourceLoader({
+			extensionsResult,
+			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
+		});
 	return createHarnessWithResourceLoader(options, resourceLoader, tempDir);
 }

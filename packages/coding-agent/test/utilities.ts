@@ -233,6 +233,7 @@ export async function createTestExtensionsResult(
 
 export interface CreateTestResourceLoaderOptions {
 	extensionsResult?: LoadExtensionsResult;
+	systemPrompt?: string;
 }
 
 export function createTestResourceLoader(options: CreateTestResourceLoaderOptions = {}): ResourceLoader {
@@ -249,7 +250,7 @@ export function createTestResourceLoader(options: CreateTestResourceLoaderOption
 		getThemes: () => ({ themes: [], diagnostics: [] }),
 		getSubagents: () => ({ definitions: [], diagnostics: [] }),
 		getAgentsFiles: () => ({ agentsFiles: [] }),
-		getSystemPrompt: () => undefined,
+		getSystemPrompt: () => options.systemPrompt,
 		getAppendSystemPrompt: () => [],
 		extendResources: () => {},
 		reload: async () => {},
@@ -289,7 +290,9 @@ export function createTestSession(options: TestSessionOptions = {}): TestSession
 		settingsManager,
 		cwd: tempDir,
 		modelRegistry,
-		resourceLoader: createTestResourceLoader(),
+		resourceLoader: createTestResourceLoader({
+			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
+		}),
 		baseToolsOverride: Object.fromEntries(createCodingTools(process.cwd()).map((tool) => [tool.name, tool])),
 	});
 

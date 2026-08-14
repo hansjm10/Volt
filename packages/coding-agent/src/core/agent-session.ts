@@ -3307,7 +3307,7 @@ export class AgentSession {
 	/** All messages including custom types like BashExecutionMessage */
 	get messages(): AgentMessage[] {
 		this._assertConversationAuthorityAvailable();
-		return this.sessionManager.buildSessionContext().messages;
+		return cloneAgentMessages(this.sessionManager.buildSessionContext().messages);
 	}
 
 	/** Current steering mode */

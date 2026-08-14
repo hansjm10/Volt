@@ -139,7 +139,11 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		? await createTestExtensionsResult(options.extensionFactories, tempDir)
 		: undefined;
 	const resourceLoader =
-		options.resourceLoader ?? createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined);
+		options.resourceLoader ??
+		createTestResourceLoader({
+			...(extensionsResult === undefined ? {} : { extensionsResult }),
+			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
+		});
 
 	const session = new AgentSession({
 		sessionManager,

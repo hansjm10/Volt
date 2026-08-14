@@ -11,6 +11,7 @@ import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import { convertToLlm } from "../../src/harness/messages.ts";
 import { InMemorySessionStorage } from "../../src/harness/session/memory-storage.ts";
 import { Session } from "../../src/harness/session/session.ts";
+import type { StreamFn } from "../../src/types.ts";
 import { calculateTool } from "../utils/calculate.ts";
 
 const registrations: Array<{ unregister(): void }> = [];
@@ -341,5 +342,107 @@ describe("AgentHarness stream configuration", () => {
 
 		expect(seenPayloads).toEqual([{ steps: ["provider"] }, { steps: ["provider", "first"] }]);
 		expect(finalPayload).toEqual({ steps: ["provider", "first", "second"] });
+	});
+
+	it("routes compaction through a custom stream without requiring separate auth", async () => {
+		const registration = registerFauxProvider({
+			models: [{ id: "compact", contextWindow: 6000, maxTokens: 1000 }],
+		});
+		registrations.push(registration);
+		registration.setSimpleResponses([fauxAssistantMessage("summary")]);
+		const session = new Session(new InMemorySessionStorage());
+		for (let index = 0; index < 5; index++) {
+			await session.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: String(index).repeat(4000) }],
+				timestamp: Date.now() + index,
+			});
+		}
+		let streamCalls = 0;
+		const streamFn: StreamFn = async (model, context, options) => {
+			streamCalls++;
+			expect(options?.apiKey).toBeUndefined();
+			return streamSimple(model, context, options);
+		};
+		const harness = createHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: registration.getModel(),
+			streamFn,
+		});
+
+		const result = await harness.compact();
+
+		expect(result.summary).toBe("summary");
+		expect(streamCalls).toBeGreaterThan(0);
+	});
+
+	it("routes tree summaries through snapshotted provider policy and lifecycle hooks", async () => {
+		const registration = registerFauxProvider({
+			models: [{ id: "branch-summary", contextWindow: 6000, maxTokens: 1000 }],
+		});
+		registrations.push(registration);
+		registration.setSimpleResponses([fauxAssistantMessage("branch summary")]);
+		const session = new Session(new InMemorySessionStorage({ metadata: { id: "branch-session", createdAt: "now" } }));
+		const targetId = await session.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+		await session.appendMessage(fauxAssistantMessage("first response"));
+		await session.appendMessage({ role: "user", content: "second", timestamp: Date.now() + 1 });
+		await session.appendMessage(fauxAssistantMessage("second response"));
+		let capturedOptions: StreamOptions | undefined;
+		let payloadHookCalls = 0;
+		let responseHookCalls = 0;
+		const streamFn: StreamFn = async (model, context, options) => {
+			capturedOptions = captureOptions(options);
+			await options?.onPayload?.({ structural: true }, model);
+			return streamSimple(model, context, options);
+		};
+		const harness = createHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: registration.getModel(),
+			streamFn,
+			streamOptions: {
+				env: { BASE_ENV: "base" },
+				headers: { "x-base": "base" },
+				metadata: { base: true },
+			},
+			getApiKeyAndHeaders: async () => ({
+				apiKey: "secret",
+				env: { AUTH_ENV: "auth" },
+				headers: { "x-auth": "auth" },
+			}),
+		});
+		harness.on("before_provider_request", (event) => {
+			expect(event.sessionId).toBe("branch-session");
+			return {
+				streamOptions: {
+					env: { HOOK_ENV: "hook" },
+					headers: { "x-hook": "hook" },
+					metadata: { hook: true },
+				},
+			};
+		});
+		harness.on("before_provider_payload", () => {
+			payloadHookCalls++;
+			return undefined;
+		});
+		harness.on("after_provider_response", () => {
+			responseHookCalls++;
+			return undefined;
+		});
+
+		const result = await harness.navigateTree(targetId, { summarize: true });
+
+		expect(result.summaryEntry).toBeDefined();
+		expect(capturedOptions).toMatchObject({
+			apiKey: "secret",
+			maxTokens: 2048,
+			sessionId: "branch-session",
+		});
+		expect(capturedOptions?.env).toEqual({ BASE_ENV: "base", AUTH_ENV: "auth", HOOK_ENV: "hook" });
+		expect(capturedOptions?.headers).toEqual({ "x-base": "base", "x-auth": "auth", "x-hook": "hook" });
+		expect(capturedOptions?.metadata).toEqual({ base: true, hook: true });
+		expect(payloadHookCalls).toBe(1);
+		expect(responseHookCalls).toBe(1);
 	});
 });

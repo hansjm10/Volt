@@ -310,15 +310,18 @@ interface AgentHarnessExecutionResult {
 	response: AssistantMessage | undefined;
 }
 
+interface AgentHarnessProviderRequestState {
+	streamOptions: AgentHarnessStreamOptions;
+	sessionId: string;
+}
+
 interface AgentHarnessTurnState<
 	TSkill extends Skill = Skill,
 	TPromptTemplate extends PromptTemplate = PromptTemplate,
 	TTool extends AgentTool = AgentTool,
-> {
+> extends AgentHarnessProviderRequestState {
 	messages: AgentMessage[];
 	resources: AgentHarnessResources<TSkill, TPromptTemplate>;
-	streamOptions: AgentHarnessStreamOptions;
-	sessionId: string;
 	systemPrompt: string;
 	model: Model<any>;
 	thinkingLevel: ThinkingLevel;
@@ -326,6 +329,11 @@ interface AgentHarnessTurnState<
 	activeTools: TTool[];
 }
 
+/**
+ * Coordinates runtime policy, provider dispatch, queues, lifecycle, and persistence around the stateless agent loop.
+ * Session owns canonical history, while structural helpers own summarization mechanics behind Harness-wrapped streams.
+ * Model-backed turn snapshots are created only when provider work is required.
+ */
 export class AgentHarness<
 	TSkill extends Skill = Skill,
 	TPromptTemplate extends PromptTemplate = PromptTemplate,
@@ -718,12 +726,12 @@ export class AgentHarness<
 		};
 	}
 
-	private createStreamFn(getTurnState: () => AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>): StreamFn {
+	private createPolicyStreamFn(getRequestState: () => AgentHarnessProviderRequestState): StreamFn {
 		return async (model, context, streamOptions) => {
 			const signal = streamOptions?.signal;
 			if (signal?.aborted) return createAbortedAssistantStream(model);
 
-			const turnState = getTurnState();
+			const requestState = getRequestState();
 			let auth: { apiKey: string; headers?: Record<string, string>; env?: Record<string, string> } | undefined;
 			try {
 				auth = await this.getApiKeyAndHeaders?.(model);
@@ -733,16 +741,16 @@ export class AgentHarness<
 			}
 			if (signal?.aborted) return createAbortedAssistantStream(model);
 
-			const headers = mergeHeaders(turnState.streamOptions.headers, auth?.headers);
-			const env = mergeHeaders(turnState.streamOptions.env, auth?.env);
+			const headers = mergeHeaders(requestState.streamOptions.headers, auth?.headers);
+			const env = mergeHeaders(requestState.streamOptions.env, auth?.env);
 			const snapshotOptions: AgentHarnessStreamOptions = {
-				...turnState.streamOptions,
+				...requestState.streamOptions,
 				...(headers === undefined ? {} : { headers }),
 				...(env === undefined ? {} : { env }),
 			};
 			const requestOptions = await this.emitBeforeProviderRequest(
 				model,
-				turnState.sessionId,
+				requestState.sessionId,
 				snapshotOptions,
 				signal,
 			);
@@ -766,9 +774,11 @@ export class AgentHarness<
 					const headers = { ...(response.headers as Record<string, string>) };
 					await this.emitOwn({ type: "after_provider_response", status: response.status, headers }, signal);
 				},
+				...(streamOptions?.maxTokens === undefined ? {} : { maxTokens: streamOptions.maxTokens }),
 				...(streamOptions?.reasoning === undefined ? {} : { reasoning: streamOptions.reasoning }),
 				...(signal === undefined ? {} : { signal }),
-				sessionId: turnState.sessionId,
+				sessionId: requestState.sessionId,
+				...(streamOptions?.temperature === undefined ? {} : { temperature: streamOptions.temperature }),
 				...(requestOptions.timeoutMs === undefined ? {} : { timeoutMs: requestOptions.timeoutMs }),
 				...(requestOptions.transport === undefined ? {} : { transport: requestOptions.transport }),
 				...(requestOptions.websocketConnectTimeoutMs === undefined
@@ -777,6 +787,15 @@ export class AgentHarness<
 				...(auth?.apiKey === undefined ? {} : { apiKey: auth.apiKey }),
 			});
 		};
+	}
+
+	private async createStructuralStreamFn(): Promise<StreamFn> {
+		const sessionMetadata = await this.session.getMetadata();
+		const requestState: AgentHarnessProviderRequestState = {
+			streamOptions: cloneStreamOptions(this.streamOptions),
+			sessionId: sessionMetadata.id,
+		};
+		return this.createPolicyStreamFn(() => requestState);
 	}
 
 	private selectPendingDeliveries(kind: AgentDeliveryKind, mode: QueueMode): PendingDelivery[] {
@@ -1392,7 +1411,7 @@ export class AgentHarness<
 					this.createLoopConfig(runEventState, getTurnState, setTurnState, startState, systemPrompt),
 					async (event) => await this.handleAgentEvent(event, runEventState, abortController.signal),
 					abortController.signal,
-					this.createStreamFn(getTurnState),
+					this.createPolicyStreamFn(getTurnState),
 				);
 			} catch (error) {
 				this.rollbackActiveLease();
@@ -1566,11 +1585,9 @@ export class AgentHarness<
 				};
 				this.continuationState = continuationState;
 			}
-			const turnState = await this.createTurnState(
-				run.state.abortController.signal,
-				options.context ?? continuationState?.context,
-			);
-			const lastMessage = turnState.messages.at(-1);
+			const contextMessages =
+				options.context ?? continuationState?.context ?? (await this.session.buildContext()).messages;
+			const lastMessage = contextMessages.at(-1);
 			if (!lastMessage && !this.hasQueuedMessages()) {
 				throw new AgentHarnessError("invalid_state", "No messages to continue from");
 			}
@@ -1584,6 +1601,7 @@ export class AgentHarness<
 			) {
 				return { status: "completed", deliveries: [] };
 			}
+			const turnState = await this.createTurnState(run.state.abortController.signal, contextMessages);
 			return (
 				await this.executeTurn(
 					run.state,
@@ -1720,8 +1738,6 @@ export class AgentHarness<
 		try {
 			const model = this.model;
 			if (!model) throw new AgentHarnessError("invalid_state", "No model set for compaction");
-			const auth = await this.getApiKeyAndHeaders?.(model);
-			if (!auth) throw new AgentHarnessError("auth", "No auth available for compaction");
 			const branchEntries = await this.session.getBranch();
 			const activeTools = this.getActiveTools();
 			const preparationResult = prepareCompaction(branchEntries, DEFAULT_COMPACTION_SETTINGS, {
@@ -1731,12 +1747,13 @@ export class AgentHarness<
 			if (!preparationResult.ok) throw preparationResult.error;
 			const preparation = preparationResult.value;
 			if (!preparation) throw new AgentHarnessError("compaction", "Nothing to compact");
+			const signal = new AbortController().signal;
 			const hookResult = await this.emitHook({
 				type: "session_before_compact",
 				preparation,
 				branchEntries,
 				...(customInstructions === undefined ? {} : { customInstructions }),
-				signal: new AbortController().signal,
+				signal,
 			});
 			if (hookResult?.cancel) throw new AgentHarnessError("compaction", "Compaction cancelled");
 			const provided = hookResult?.compaction;
@@ -1745,11 +1762,12 @@ export class AgentHarness<
 				: await compact(
 						preparation,
 						model,
-						auth.apiKey,
-						auth.headers,
-						customInstructions,
 						undefined,
+						undefined,
+						customInstructions,
+						signal,
 						this.thinkingLevel,
+						await this.createStructuralStreamFn(),
 					);
 			if (!compactResult.ok) throw compactResult.error;
 			const result = compactResult.value;
@@ -1812,15 +1830,12 @@ export class AgentHarness<
 			if (!summaryText && options?.summarize && entries.length > 0) {
 				const model = this.model;
 				if (!model) throw new AgentHarnessError("invalid_state", "No model set for branch summary");
-				const auth = await this.getApiKeyAndHeaders?.(model);
-				if (!auth) throw new AgentHarnessError("auth", "No auth available for branch summary");
 				const customInstructions = hookResult?.customInstructions ?? options?.customInstructions;
 				const replaceInstructions = hookResult?.replaceInstructions ?? options?.replaceInstructions;
 				const branchSummary = await generateBranchSummary(entries, {
 					model,
-					apiKey: auth.apiKey,
-					...(auth.headers === undefined ? {} : { headers: auth.headers }),
-					signal: new AbortController().signal,
+					signal,
+					streamFn: await this.createStructuralStreamFn(),
 					...(customInstructions === undefined ? {} : { customInstructions }),
 					...(replaceInstructions === undefined ? {} : { replaceInstructions }),
 				});

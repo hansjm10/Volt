@@ -251,8 +251,8 @@ Provider hooks are `before_provider_request`, `before_provider_payload`, and `af
 Scoped next-action policy is available for bounded host policy such as subagent budgets:
 
 ```typescript
-const unregister = harness.registerNextActionPolicy((context, suggested) => {
-  return budgetExceeded(context) ? { type: "stop" } : suggested;
+const unregister = harness.registerNextActionPolicy((context, _signal) => {
+  return budgetExceeded(context) ? { type: "stop" } : context.defaultAction;
 });
 ```
 
