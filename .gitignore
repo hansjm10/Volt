@@ -8,6 +8,8 @@ packages/*/dist/
 packages/*/dist-chrome/
 packages/*/dist-firefox/
 *.cpuprofile
+.venv-swebench/
+swebench-output/
 
 # Environment
 .env
