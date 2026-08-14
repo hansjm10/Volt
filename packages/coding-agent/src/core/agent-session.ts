@@ -6459,6 +6459,7 @@ export class AgentSession {
 			: [
 					...DEFAULT_ACTIVE_TOOL_NAMES,
 					...(subagentToolManager ? ["subagent"] : []),
+					...(subagentRegistryManager ? [SUBAGENT_REGISTRY_TOOL_NAME] : []),
 					...(this._mcpManager ? ["mcp"] : []),
 					...directMcpToolDefinitions.map((definition) => definition.name),
 					...(this._lspManager ? ["lsp"] : []),

@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@hansjm10/volt-agent-core";
+import { Agent, type AgentPreparedRequestDecision, type PreparedProviderRequest } from "@hansjm10/volt-agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@hansjm10/volt-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
@@ -300,24 +300,34 @@ describe("AgentSession auto-compaction queue resume", () => {
 		);
 		const hook = (
 			session as unknown as {
-				_admitPreparedContinuation: (context: unknown) => { type: "admit" } | { type: "pause"; reason: string };
+				_admitPreparedContinuation: (request: PreparedProviderRequest) => AgentPreparedRequestDecision;
 			}
 		)._admitPreparedContinuation.bind(session);
 		const delivery = {
 			deliveryId: "delivery-1",
 			messages: [{ role: "user" as const, content: "next", timestamp: Date.now() }],
 		};
-		const baseContext = {
-			context: { systemPrompt: "", messages: [message, ...delivery.messages], tools: [] },
+		const baseRequest = {
+			checkpointId: "checkpoint-1",
+			requestId: "request-1",
+			attempt: 0,
+			runId: "run-1",
+			hostAuthority: {},
+			providerContext: { systemPrompt: "", messages: [message, ...delivery.messages], tools: [] },
 			model,
-			thinkingLevel: "off" as const,
+			streamOptions: {},
+			defaultAction: { type: "request" as const, reason: "delivery" as const },
+			requestAuthority: "provider" as const,
+			reason: "delivery" as const,
 			deliveries: [delivery],
-		};
+		} satisfies PreparedProviderRequest;
 
-		expect(hook({ ...baseContext, reason: "delivery" })).toEqual({ type: "admit" });
+		expect(hook(baseRequest)).toEqual({ type: "admit" });
 		expect(
 			hook({
-				...baseContext,
+				...baseRequest,
+				defaultAction: { type: "request", reason: "final_response" },
+				requestAuthority: "final_response",
 				reason: "final_response",
 				completedTurn: { message, toolResults: [], disposition: "final_response" },
 			}),
@@ -743,24 +753,32 @@ describe("AgentSession auto-compaction queue resume", () => {
 			isError: true,
 			timestamp: Date.now(),
 		};
-		const context = {
-			completedTurn: { message, toolResults: [toolResult], disposition: "continue" },
-			reason: "continuation",
-			context: { systemPrompt: "", messages: [message, toolResult], tools: [] },
+		const request = {
+			checkpointId: "checkpoint-1",
+			requestId: "request-1",
+			attempt: 0,
+			runId: "run-1",
+			hostAuthority: {},
+			providerContext: { systemPrompt: "", messages: [message, toolResult], tools: [] },
 			model,
-			thinkingLevel: "off" as const,
-		};
+			streamOptions: {},
+			completedTurn: { message, toolResults: [toolResult], disposition: "continue" },
+			defaultAction: { type: "request", reason: "continuation" },
+			requestAuthority: "tool_continuation",
+			reason: "continuation",
+			deliveries: [],
+		} satisfies PreparedProviderRequest;
 
 		const hook = (
 			session as unknown as {
-				_admitPreparedContinuation: (context: unknown) => { type: "admit" } | { type: "pause"; reason: string };
+				_admitPreparedContinuation: (request: PreparedProviderRequest) => AgentPreparedRequestDecision;
 			}
 		)._admitPreparedContinuation.bind(session);
 
-		expect(hook(context)).toEqual({ type: "pause", reason: "compaction" });
+		expect(hook(request)).toMatchObject({ type: "pause", reason: "compaction" });
 		// A repeated hook call while the same compaction remains scheduled does not
 		// start a second interruption.
-		expect(hook(context)).toEqual({ type: "admit" });
+		expect(hook(request)).toEqual({ type: "admit" });
 	});
 
 	it("should not compact repeatedly after overflow recovery already attempted", async () => {
