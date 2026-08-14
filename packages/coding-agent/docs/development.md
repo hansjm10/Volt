@@ -109,6 +109,39 @@ Process-tree RSS is best effort. Linux and macOS use one `ps` snapshot whose RSS
 
 Every run uses isolated HOME, agent, session, and workspace directories; forces offline/version-check-disabled execution; removes inherited provider credentials; disables external Iroh relays; and cleans the process tree and temporary files on success, failure, or handled termination signals. The benchmark is observational: it is not run in CI, has no committed absolute baseline, and enforces no pass/fail memory threshold.
 
+## SWE-bench Verified smoke benchmark
+
+The repository-only SWE-bench runner exercises one Verified instance sequentially with an extracted Linux x64 Volt standalone distribution. It requires Linux x64, Docker, Python, at least 16 GB RAM, and roughly 120 GB of free disk for official task images and evaluator artifacts.
+
+Create the ignored Python environment and install the official harness at the commit pinned in `scripts/requirements-swebench.txt`:
+
+```bash
+python3 -m venv .venv-swebench
+. .venv-swebench/bin/activate
+python -m pip install -r scripts/requirements-swebench.txt
+```
+
+Build the native standalone distribution on Linux x64, or extract an existing Linux x64 standalone archive:
+
+```bash
+npm --prefix packages/coding-agent run build:binary
+```
+
+Log in to the `openai-codex` provider with Volt before running the benchmark. The runner reads `~/.volt/agent/auth.json` by default, copies only its `openai-codex` OAuth entry into a private temporary writable agent directory, and deletes that directory after generation. It never updates the source credential. The temporary credential is readable by code in the disposable task container, network egress is not restricted, and v1 must not be run concurrently with the same credential.
+
+From the repository root, run the default `sympy__sympy-20590` smoke task with an exact Codex model:
+
+```bash
+npm run benchmark:swebench -- \
+  --volt-dir packages/coding-agent/binaries/linux-x64 \
+  --model openai-codex/gpt-5.6-sol \
+  --thinking high
+```
+
+Use `--instance`, `--thinking`, `--timeout-seconds`, `--auth-file`, `--python`, or `--output-dir` to override defaults. Volt receives only the task's `problem_statement`; the runner does not include gold patches, test patches, or evaluation test names in the prompt. It records the clean initial image HEAD, stages tracked and non-ignored untracked changes after Volt exits, and captures a binary diff from that initial HEAD so model-created commits are included.
+
+Artifacts are written under ignored `swebench-output/<run-id>/`: the prompt, `patch.diff`, redacted Volt stdout/stderr, one official `predictions.jsonl` record, evaluator stdout/stderr, and the official report directory. The official evaluator runs one worker for only the selected instance. Both resolved and unresolved reports are valid benchmark outcomes; infrastructure, authentication, timeout, malformed-output, missing-report, and cleanup failures exit nonzero.
+
 ## Project Structure
 
 ```
