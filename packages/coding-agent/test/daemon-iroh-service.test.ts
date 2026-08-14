@@ -705,6 +705,23 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 		const faux = registerFauxProvider();
 		const model = faux.getModel();
 		writeFileSync(
+			join(agentDir, "models.json"),
+			`${JSON.stringify(
+				{
+					providers: {
+						[model.provider]: {
+							api: model.api,
+							apiKey: "faux-key",
+							baseUrl: model.baseUrl,
+							models: [{ id: model.id }],
+						},
+					},
+				},
+				null,
+				2,
+			)}\n`,
+		);
+		writeFileSync(
 			join(agentDir, "settings.json"),
 			`${JSON.stringify({ defaultProvider: model.provider, defaultModel: model.id }, null, 2)}\n`,
 		);
