@@ -400,7 +400,7 @@ describe("AgentHarness", () => {
 
 		await harness.prompt("hello");
 
-		expect(requestPrompts).toEqual(["users:", "users:hello|steer"]);
+		expect(requestPrompts).toEqual(["users:hello", "users:hello|steer"]);
 	});
 
 	it("appends before_agent_start messages and persists them", async () => {

@@ -3,4 +3,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(agent): Fixed continuations dropping recent context after compaction or canceled retries and skipping host-generated follow-ups.
+fix(agent): Fixed retries, compaction, and paused continuations losing current context or final-response authority.

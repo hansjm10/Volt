@@ -48,6 +48,32 @@ describe("regression #207: delivery run outcomes", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
+	it("does not classify an ambiguous delivery failure as a transient provider retry", async () => {
+		const retryDecisions: boolean[] = [];
+		harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				participant: {
+					settle: () => ({ outcome: "terminally_failed", error: new Error("overloaded_error") }),
+				},
+			}),
+		});
+		harness.setResponses([fauxAssistantMessage("unexpected provider retry")]);
+		harness.session.subscribe((event) => {
+			if (event.type === "agent_end") retryDecisions.push(event.willRetry);
+		});
+
+		await expect(harness.session.prompt("ambiguous delivery")).resolves.toBeUndefined();
+
+		expect(retryDecisions).toEqual([false]);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			diagnostics: [{ type: "delivery_transaction_failure" }],
+		});
+	});
+
 	it("settles an active provider retry when a queued delivery is retained", async () => {
 		let failDelivery = true;
 		const retryStarted = deferred();

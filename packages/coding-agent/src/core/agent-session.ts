@@ -32,7 +32,6 @@ import type {
 	AgentMessage,
 	AgentRunResult,
 	AgentRunSnapshot,
-	AgentState,
 	AgentTool,
 	PendingToolExecution,
 	StreamFn,
@@ -391,6 +390,20 @@ export interface AgentSessionConfig {
 	mcpManagerFactory?: () => Promise<McpManager | undefined> | McpManager | undefined;
 }
 
+/** AgentSession runtime projection. A model is optional until one is selected. */
+export interface AgentSessionState {
+	systemPrompt: string;
+	model: Model<any> | undefined;
+	thinkingLevel: ThinkingLevel;
+	tools: AgentTool[];
+	messages: AgentMessage[];
+	readonly isStreaming: boolean;
+	readonly streamingMessage: AgentMessage | undefined;
+	readonly pendingToolCalls: ReadonlySet<string>;
+	readonly pendingToolExecutions: ReadonlyMap<string, PendingToolExecution>;
+	readonly errorMessage: string | undefined;
+}
+
 export interface ExtensionBindings {
 	uiContext?: ExtensionUIContext;
 	mode?: ExtensionMode;
@@ -633,7 +646,6 @@ export class AgentSession {
 	private _proactiveCompactionState: "idle" | "scheduled" | "compacting" = "idle";
 	private _drainFollowUpsOnNextContinuation = false;
 	private _nextRunContextOverride: AgentMessage[] | undefined;
-	private _continueWithFinalResponseAuthority = false;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -999,19 +1011,17 @@ export class AgentSession {
 				replacement = await this._emitExtensionEvent(event);
 			} catch (error) {
 				let fatalError = error instanceof Error ? error : new Error(String(error));
-				if (
-					error instanceof ExtensionMessageRoleMismatchError &&
-					event.message.role === "user" &&
-					event.message.clientMessageId !== undefined
-				) {
-					const clientMessageId = event.message.clientMessageId;
-					const operation = this._liveClientInputs.get(clientMessageId);
-					if (operation) {
-						try {
-							await this._failLiveClientInput(clientMessageId, operation, fatalError);
-						} catch (transitionError) {
-							fatalError =
-								transitionError instanceof Error ? transitionError : new Error(String(transitionError));
+				if (error instanceof ExtensionMessageRoleMismatchError) {
+					if (event.message.role === "user" && event.message.clientMessageId !== undefined) {
+						const clientMessageId = event.message.clientMessageId;
+						const operation = this._liveClientInputs.get(clientMessageId);
+						if (operation) {
+							try {
+								await this._failLiveClientInput(clientMessageId, operation, fatalError);
+							} catch (transitionError) {
+								fatalError =
+									transitionError instanceof Error ? transitionError : new Error(String(transitionError));
+							}
 						}
 					}
 					this._agentEventFatalError ??= fatalError;
@@ -1671,6 +1681,10 @@ export class AgentSession {
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<AgentMessage | undefined> => {
 		if (this._disposed) return undefined;
+		if (event.type === "turn_start" && this._proactiveCompactionState === "scheduled") {
+			// A new request proves a later policy overrode the compaction stop.
+			this._proactiveCompactionState = "idle";
+		}
 		if (event.type === "agent_start") {
 			this._activeAgentRunId = this._harness.activeRunSnapshot?.runId;
 			this._persistedTerminalAgentRunId = undefined;
@@ -1827,9 +1841,6 @@ export class AgentSession {
 			}
 		} else if (handledEvent.type === "tool_execution_end") {
 			this._pendingToolExecutions.delete(handledEvent.toolCallId);
-			if (!handledEvent.isError && handledEvent.result.disposition === "final_response") {
-				this._continueWithFinalResponseAuthority = true;
-			}
 		} else if (handledEvent.type === "turn_end") {
 			if (handledEvent.message.role === "assistant" && handledEvent.message.errorMessage) {
 				this._runtimeErrorMessage = handledEvent.message.errorMessage;
@@ -2546,11 +2557,11 @@ export class AgentSession {
 	// =========================================================================
 
 	/** Read-only runtime state snapshot. */
-	get state(): AgentState {
+	get state(): AgentSessionState {
 		this._assertConversationAuthorityAvailable();
 		return {
 			systemPrompt: this.systemPrompt,
-			model: this.model as unknown as Model<any>,
+			model: this.model,
 			thinkingLevel: this.thinkingLevel,
 			tools: this._harness.getActiveTools(),
 			messages: this.messages,
@@ -3776,7 +3787,6 @@ export class AgentSession {
 		this._proactiveCompactionState = "idle";
 		this._drainFollowUpsOnNextContinuation = false;
 		this._nextRunContextOverride = undefined;
-		this._continueWithFinalResponseAuthority = false;
 		const run = (async () => {
 			this._agentConversationMutationInFlight = true;
 			try {
@@ -3843,7 +3853,6 @@ export class AgentSession {
 				this._harness.continue({
 					drainFollowUps,
 					...(context === undefined ? {} : { context }),
-					...(this._continueWithFinalResponseAuthority ? { requestAuthority: "final_response" as const } : {}),
 				}),
 			);
 		} finally {
@@ -4008,7 +4017,6 @@ export class AgentSession {
 			return true;
 		}
 
-		this._continueWithFinalResponseAuthority = false;
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
 		return this._harness.hasQueuedMessages();
@@ -5226,8 +5234,9 @@ export class AgentSession {
 	 * context from the new boundary, update agent state, notify extensions,
 	 * and assemble the CompactionResult.
 	 *
-	 * When `dropTrailingErrorMessage` is set (auto-compaction retry), a
-	 * trailing assistant error message is removed before the retry so it is
+	 * When continuation context is requested, auto-compaction supplies the rebuilt
+	 * projection to Harness. Overflow recovery also removes its trailing assistant
+	 * error message before the retry so it is
 	 * excluded from both the retained context and estimatedTokensAfter.
 	 */
 	private async _finalizeCompaction(
@@ -5236,7 +5245,7 @@ export class AgentSession {
 		tokensBefore: number,
 		details: JsonValue | undefined,
 		fromExtension: boolean,
-		dropTrailingErrorMessage = false,
+		continuation?: { dropTrailingErrorMessage: boolean },
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<CompactionResult> {
 		assertConversationGenerationCurrent?.();
@@ -5246,7 +5255,7 @@ export class AgentSession {
 		const newEntries = this.sessionManager.getEntries();
 		const sessionContext = this.sessionManager.buildSessionContext();
 		let messages = sessionContext.messages;
-		if (dropTrailingErrorMessage) {
+		if (continuation?.dropTrailingErrorMessage) {
 			const lastIndex =
 				messages.at(-1)?.role === "custom" &&
 				(messages.at(-1) as CustomMessage).customType === PLAN_CHECKPOINT_CUSTOM_TYPE
@@ -5257,7 +5266,7 @@ export class AgentSession {
 				messages = [...messages.slice(0, lastIndex), ...messages.slice(lastIndex + 1)];
 			}
 		}
-		if (dropTrailingErrorMessage) this._nextRunContextOverride = messages;
+		if (continuation) this._nextRunContextOverride = messages;
 		const estimatedTokensAfter =
 			estimateMessagesTokens(messages) + estimateToolDefinitionTokens(this._harness.getActiveTools());
 
@@ -5433,7 +5442,7 @@ export class AgentSession {
 				tokensBefore,
 				details,
 				fromExtension,
-				false,
+				undefined,
 				assertConversationGenerationCurrent,
 			);
 			this._emit({
@@ -5749,7 +5758,7 @@ export class AgentSession {
 				tokensBefore,
 				details,
 				fromExtension,
-				willRetry,
+				willRetry || continueAfterCompaction ? { dropTrailingErrorMessage: willRetry } : undefined,
 				assertConversationCurrent,
 			);
 			this._emit({

@@ -244,7 +244,18 @@ describe("AgentHarness delivery transactions", () => {
 		});
 		expect(harness.hasQueuedMessages()).toBe(false);
 		expect(registration.state.callCount).toBe(0);
-		expect(getUserTexts((await session.buildContext()).messages as AgentMessage[])).toEqual([]);
+		const messages = (await session.buildContext()).messages as AgentMessage[];
+		expect(getUserTexts(messages)).toEqual([]);
+		const failureMessage = messages.find((message) => message.role === "assistant");
+		expect(failureMessage).toMatchObject({
+			role: "assistant",
+			diagnostics: [
+				{
+					type: "delivery_transaction_failure",
+					details: { outcome: "terminally_failed", phase: "settlement", kind: "prompt" },
+				},
+			],
+		});
 	});
 
 	it("preserves a committed FIFO prefix when a later participant retains", async () => {

@@ -1,5 +1,7 @@
 import {
 	type AssistantMessage,
+	type AssistantMessageDiagnostic,
+	createAssistantMessageDiagnostic,
 	createAssistantMessageEventStream,
 	estimateToolDefinitionTokens,
 	type ImageContent,
@@ -263,6 +265,7 @@ interface AgentHarnessRunEventState {
 	deliveryOrder: Map<string, number>;
 	deliveryOutcomes: Map<string, AgentDeliveryAttemptResult>;
 	deliveryFailure?: AgentDeliveryFailure;
+	deliveryFailureDiagnostic?: AssistantMessageDiagnostic;
 	observationalDeliveryIds: Set<string>;
 	participantOwnedDeliveryIds: Set<string>;
 	admittedMessages: AgentMessage[];
@@ -287,6 +290,13 @@ type DispatcherStartState = {
 	providerRequestPending: boolean;
 	drainFollowUpsFirst?: boolean;
 };
+
+interface AgentHarnessContinuationState {
+	context: AgentMessage[];
+	requestAuthority: AgentRequestAuthority;
+	providerRequestPending: boolean;
+	systemPrompt?: string;
+}
 
 interface AgentHarnessExecutionResult {
 	result: AgentRunResult;
@@ -344,6 +354,7 @@ export class AgentHarness<
 	private nextTurnQueue: AgentMessage[] = [];
 	private handlers = new Map<string, Set<AgentHarnessHandler>>();
 	private nextActionPolicies = new Set<{ policy: AgentHarnessNextActionPolicy }>();
+	private continuationState: AgentHarnessContinuationState | undefined;
 
 	constructor(options: AgentHarnessOptions<TSkill, TPromptTemplate, TTool>) {
 		this.env = options.env;
@@ -500,9 +511,9 @@ export class AgentHarness<
 		event: Extract<AgentEvent, { type: "message_end" }>,
 		state: AgentHarnessRunEventState,
 	): Promise<Extract<AgentEvent, { type: "message_end" }>> {
-		let current = this.decorateRuntimeAbort(event, state);
+		let current = this.decorateRuntimeDiagnostics(event, state);
 		if (current.type !== "message_end") {
-			throw new AgentHarnessError("invalid_state", "Runtime abort decoration changed the event type");
+			throw new AgentHarnessError("invalid_state", "Runtime diagnostic decoration changed the event type");
 		}
 		for (const handler of this.getHandlers("message_end") ?? []) {
 			try {
@@ -513,9 +524,9 @@ export class AgentHarness<
 					}
 					current = { ...current, message: structuredClone(result.message) };
 				}
-				const decorated = this.decorateRuntimeAbort(current, state);
+				const decorated = this.decorateRuntimeDiagnostics(current, state);
 				if (decorated.type !== "message_end") {
-					throw new AgentHarnessError("invalid_state", "Runtime abort decoration changed the event type");
+					throw new AgentHarnessError("invalid_state", "Runtime diagnostic decoration changed the event type");
 				}
 				current = decorated;
 			} catch (error) {
@@ -737,6 +748,7 @@ export class AgentHarness<
 	private async resolveNextAction(
 		context: AgentLoopNextActionContext,
 		startState: DispatcherStartState,
+		systemPrompt?: string,
 	): Promise<AgentLoopNextAction> {
 		const isFirstDecision = startState.firstDecision;
 		startState.firstDecision = false;
@@ -746,12 +758,30 @@ export class AgentHarness<
 			? startState.providerRequestPending
 			: runtimeAction.type === "request";
 
+		if (this.activeRun?.abortController.signal.aborted) {
+			this.continuationState = {
+				context: cloneAgentMessages(context.context.messages),
+				requestAuthority,
+				providerRequestPending,
+				...(systemPrompt === undefined ? {} : { systemPrompt }),
+			};
+			return { type: "pause", requestAuthority };
+		}
+
 		if (requestAuthority === "final_response") {
 			const finalResponseAction: AgentLoopNextAction =
 				runtimeAction.type === "request" ? { type: "request", reason: "final_response" } : runtimeAction;
-			return await this.reduceNextAction({ ...context, requestAuthority }, finalResponseAction);
+			const action = await this.reduceNextAction({ ...context, requestAuthority }, finalResponseAction);
+			this.continuationState = {
+				context: cloneAgentMessages(context.context.messages),
+				requestAuthority,
+				providerRequestPending: action.type === "pause" ? providerRequestPending : true,
+				...(systemPrompt === undefined ? {} : { systemPrompt }),
+			};
+			return action.type === "pause"
+				? { ...action, requestAuthority }
+				: { type: "request", reason: "final_response" };
 		}
-		if (this.activeRun?.abortController.signal.aborted) return { type: "stop" };
 
 		let selected: PendingDelivery[] = [];
 		const prompts = this.selectPendingDeliveries("prompt", "all");
@@ -774,9 +804,22 @@ export class AgentHarness<
 			{ ...context, requestAuthority, defaultAction: suggestedAction },
 			suggestedAction,
 		);
-		if (action.type !== "request") return action;
+		if (action.type === "pause") {
+			this.continuationState = {
+				context: cloneAgentMessages(context.context.messages),
+				requestAuthority: action.requestAuthority ?? requestAuthority,
+				providerRequestPending: hasIndependentRequest,
+				...(systemPrompt === undefined ? {} : { systemPrompt }),
+			};
+			return { ...action, requestAuthority: action.requestAuthority ?? requestAuthority };
+		}
+		if (action.type === "stop") {
+			this.continuationState = undefined;
+			return action;
+		}
 		const leasedDeliveries = selected.length > 0 ? await this.prepareLeasedDeliveries(selected) : [];
 		const deliveries = [...leasedDeliveries, ...(action.deliveries ?? [])];
+		this.continuationState = undefined;
 		return {
 			type: "request",
 			reason: action.reason,
@@ -918,7 +961,19 @@ export class AgentHarness<
 		const run = this.activeRun;
 		if (!run || run.deliveryOutcomes.has(outcome.deliveryId)) return;
 		run.deliveryOutcomes.set(outcome.deliveryId, Object.freeze(outcome));
-		if ("error" in outcome && run.deliveryFailure === undefined) run.deliveryFailure = outcome;
+		if ("error" in outcome && run.deliveryFailure === undefined) {
+			run.deliveryFailure = outcome;
+			run.deliveryFailureDiagnostic = createAssistantMessageDiagnostic(
+				"delivery_transaction_failure",
+				outcome.error,
+				{
+					deliveryId: outcome.deliveryId,
+					kind: outcome.kind,
+					outcome: outcome.outcome,
+					phase: outcome.phase,
+				},
+			);
+		}
 	}
 
 	private rollbackActiveLease(): void {
@@ -941,7 +996,6 @@ export class AgentHarness<
 		systemPromptOverride?: string,
 	): AgentLoopConfig {
 		const turnState = getTurnState();
-		let firstRequest = true;
 		return {
 			model: turnState.model,
 			...(turnState.thinkingLevel === "off" ? {} : { reasoning: turnState.thinkingLevel }),
@@ -966,19 +1020,11 @@ export class AgentHarness<
 					isError,
 				});
 			},
-			nextAction: async (context) => await this.resolveNextAction(context, startState),
+			nextAction: async (context) => await this.resolveNextAction(context, startState, systemPromptOverride),
 			beginDelivery: async (delivery) => await this.beginActiveDelivery(delivery),
 			prepareRequest: async ({ context }) => {
 				await this.flushPendingSessionWrites();
-				if (firstRequest) {
-					firstRequest = false;
-					return {
-						context,
-						model: getTurnState().model,
-						thinkingLevel: getTurnState().thinkingLevel,
-					};
-				}
-				const nextTurnState = await this.createTurnState();
+				const nextTurnState = await this.createTurnState(context.messages);
 				setTurnState(nextTurnState);
 				return {
 					context: this.createContext(nextTurnState, systemPromptOverride),
@@ -1027,20 +1073,16 @@ export class AgentHarness<
 		}
 	}
 
-	private decorateRuntimeAbort(event: AgentEvent, state: AgentHarnessRunEventState): AgentEvent {
+	private decorateRuntimeDiagnostics(event: AgentEvent, state: AgentHarnessRunEventState): AgentEvent {
 		if (event.type !== "message_end" || event.message.role !== "assistant") return event;
-		const message = event.message;
+		let message = event.message;
 		if (
-			(message.stopReason !== "aborted" && state.phase !== "terminal_event_settling") ||
-			!state.abortController.signal.aborted ||
-			state.abortSource === undefined ||
-			state.diagnosticTimestamp === undefined
+			(message.stopReason === "aborted" || state.phase === "terminal_event_settling") &&
+			state.abortController.signal.aborted &&
+			state.abortSource !== undefined &&
+			state.diagnosticTimestamp !== undefined
 		) {
-			return event;
-		}
-		return {
-			...event,
-			message: {
+			message = {
 				...message,
 				diagnostics: [
 					...(message.diagnostics ?? []).filter((diagnostic) => diagnostic.type !== "runtime_abort"),
@@ -1050,7 +1092,22 @@ export class AgentHarness<
 						details: { source: state.abortSource },
 					},
 				],
-			},
+			};
+		}
+		if (state.settlementStarted && state.deliveryFailureDiagnostic) {
+			message = {
+				...message,
+				diagnostics: [
+					...(message.diagnostics ?? []).filter(
+						(diagnostic) => diagnostic.type !== "delivery_transaction_failure",
+					),
+					state.deliveryFailureDiagnostic,
+				],
+			};
+		}
+		return {
+			...event,
+			message,
 		};
 	}
 
@@ -1093,10 +1150,10 @@ export class AgentHarness<
 			}
 			const observational = event.deliveryId !== undefined && state.observationalDeliveryIds.has(event.deliveryId);
 			const finalizedEvent = observational
-				? this.decorateRuntimeAbort(event, state)
+				? this.decorateRuntimeDiagnostics(event, state)
 				: await this.emitMessageEnd(event, state);
 			if (finalizedEvent.type !== "message_end") {
-				throw new AgentHarnessError("invalid_state", "Runtime abort decoration changed the event type");
+				throw new AgentHarnessError("invalid_state", "Runtime diagnostic decoration changed the event type");
 			}
 			const participantOwnsPersistence =
 				finalizedEvent.deliveryId !== undefined && state.participantOwnedDeliveryIds.has(finalizedEvent.deliveryId);
@@ -1136,7 +1193,6 @@ export class AgentHarness<
 		}
 		if (event.type === "agent_end") {
 			await this.flushPendingSessionWrites();
-			this.phase = "idle";
 			state.terminalEmitted = true;
 			state.phase = "settled";
 			await this.emitPassive(event, signal);
@@ -1353,6 +1409,7 @@ export class AgentHarness<
 				"AgentHarness has a retained prompt; call continue() or discardPendingPrompt() before starting another",
 			);
 		}
+		this.continuationState = undefined;
 		this.phase = "turn";
 		const finishRunPromise = this.startRunPromise();
 		try {
@@ -1377,9 +1434,9 @@ export class AgentHarness<
 				systemPrompt,
 			);
 		} catch (error) {
-			this.phase = "idle";
 			throw normalizeHarnessError(error, "unknown");
 		} finally {
+			this.phase = "idle";
 			finishRunPromise();
 		}
 	}
@@ -1449,39 +1506,53 @@ export class AgentHarness<
 	}
 
 	async continue(
-		options: {
-			drainFollowUps?: boolean;
-			context?: readonly AgentMessage[];
-			requestAuthority?: AgentRequestAuthority;
-		} = {},
+		options: { drainFollowUps?: boolean; context?: readonly AgentMessage[] } = {},
 	): Promise<AgentRunResult> {
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
 		this.phase = "turn";
 		const finishRunPromise = this.startRunPromise();
 		try {
-			const turnState = await this.createTurnState(options.context);
+			let continuationState = this.continuationState;
+			if (continuationState && options.context !== undefined) {
+				continuationState = {
+					...continuationState,
+					context: cloneAgentMessages(options.context),
+				};
+				this.continuationState = continuationState;
+			}
+			const turnState = await this.createTurnState(options.context ?? continuationState?.context);
 			const lastMessage = turnState.messages.at(-1);
 			if (!lastMessage && !this.hasQueuedMessages()) {
 				throw new AgentHarnessError("invalid_state", "No messages to continue from");
 			}
 			const hasNextActionReducers =
 				(this.getHandlers("next_action")?.size ?? 0) > 0 || this.nextActionPolicies.size > 0;
-			if (lastMessage?.role === "assistant" && !this.hasQueuedMessages() && !hasNextActionReducers) {
-				this.phase = "idle";
+			if (
+				lastMessage?.role === "assistant" &&
+				!this.hasQueuedMessages() &&
+				!hasNextActionReducers &&
+				continuationState === undefined
+			) {
 				return { status: "completed", deliveries: [] };
 			}
 			return (
-				await this.executeTurn(turnState, {
-					firstDecision: true,
-					requestAuthority: options.requestAuthority ?? "provider",
-					providerRequestPending: lastMessage !== undefined && lastMessage.role !== "assistant",
-					drainFollowUpsFirst: options.drainFollowUps === true || lastMessage?.role === "assistant",
-				})
+				await this.executeTurn(
+					turnState,
+					{
+						firstDecision: true,
+						requestAuthority: continuationState?.requestAuthority ?? "provider",
+						providerRequestPending:
+							continuationState?.providerRequestPending ??
+							(lastMessage !== undefined && lastMessage.role !== "assistant"),
+						drainFollowUpsFirst: options.drainFollowUps === true || lastMessage?.role === "assistant",
+					},
+					continuationState?.systemPrompt,
+				)
 			).result;
 		} catch (error) {
-			this.phase = "idle";
 			throw normalizeHarnessError(error, "unknown");
 		} finally {
+			this.phase = "idle";
 			finishRunPromise();
 		}
 	}
@@ -1645,6 +1716,12 @@ export class AgentHarness<
 				await this.emitOwn({ type: "session_compact", compactionEntry: entry, fromHook: provided !== undefined });
 			}
 			const rebuiltContext = await this.session.buildContext();
+			if (this.continuationState) {
+				this.continuationState = {
+					...this.continuationState,
+					context: cloneAgentMessages(rebuiltContext.messages),
+				};
+			}
 			const estimatedTokensAfter =
 				estimateMessagesTokens(rebuiltContext.messages) + estimateToolDefinitionTokens(activeTools);
 			return { ...result, estimatedTokensAfter };
@@ -1742,6 +1819,7 @@ export class AgentHarness<
 						}
 					: undefined,
 			);
+			this.continuationState = undefined;
 			if (summaryId) {
 				const entry = await this.session.getEntry(summaryId);
 				if (entry?.type === "branch_summary") summaryEntry = entry;

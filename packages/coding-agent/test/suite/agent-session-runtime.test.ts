@@ -206,6 +206,27 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(replacedMessage).toBeDefined();
 	});
 
+	it("fails the run when an extension replacement crosses an assistant role boundary", async () => {
+		const { runtime } = await createRuntimeForTest((volt: ExtensionAPI) => {
+			volt.on("message_end", (event) => {
+				if (event.message.role !== "assistant") return;
+				return {
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "invalid replacement" }],
+						timestamp: Date.now(),
+					},
+				};
+			});
+		});
+
+		await expect(runtime.session.prompt("hello")).rejects.toMatchObject({
+			code: "extension_message_role_mismatch",
+			expectedRole: "assistant",
+			receivedRole: "user",
+		});
+	});
+
 	it("uses a functional message_end replacement for retry classification", async () => {
 		let replaced = false;
 		const { runtime, faux } = await createRuntimeForTest((volt: ExtensionAPI) => {

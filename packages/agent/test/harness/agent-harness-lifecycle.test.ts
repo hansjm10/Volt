@@ -238,9 +238,10 @@ describe("AgentHarness lifecycle and abort", () => {
 
 		const running = harness.runPrompt("settle listeners");
 		await terminalStarted.promise;
-		expect(harness.getPhase()).toBe("idle");
+		expect(harness.getPhase()).toBe("turn");
 		expect(harness.activeRunSnapshot).toMatchObject({ phase: "settled" });
 		expect(harness.abort("remote_request")).toMatchObject({ accepted: false });
+		await expect(harness.runPrompt("overlap terminal settlement")).rejects.toMatchObject({ code: "busy" });
 		let idle = false;
 		const waiting = harness.waitForIdle().then(() => {
 			idle = true;
@@ -251,6 +252,7 @@ describe("AgentHarness lifecycle and abort", () => {
 		releaseTerminal.resolve();
 		await Promise.all([running, waiting]);
 		expect(idle).toBe(true);
+		expect(harness.getPhase()).toBe("idle");
 		expect(laterTerminalCount).toBe(1);
 	});
 

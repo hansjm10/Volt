@@ -12,7 +12,7 @@ There is no second stateful core runtime. Hosts should use `AgentHarness` or int
 
 ## State model
 
-Harness state is split into four categories.
+Harness state is split into five categories.
 
 ### Runtime configuration
 
@@ -69,6 +69,10 @@ Prompt, steering, and follow-up deliveries share one inbox with stable IDs. The 
 - terminal event settlement
 
 `activeRunSnapshot` is immutable. `activeDeliverySettlement` exposes the current durability barrier without exposing mutable run internals.
+
+### Continuation
+
+Harness privately retains the context projection, request authority, provider-pending state, and per-run system prompt needed to resume a paused or failed bounded run. Callers use bare `continue()` to resume that state. An explicit context override rebases the retained projection without transferring authority ownership to the caller.
 
 ## Transactional delivery
 
@@ -143,7 +147,7 @@ Queue selection happens before delivery leasing:
 2. independent provider/tool continuation when already authorized
 3. follow-up selection when no independent request remains, or when explicitly prioritized
 
-Scoped next-action policies reduce an evolving suggested action in registration order. Policy-generated deliveries are combined with leased inbox deliveries. Runtime-owned `final_response` authority remains tool-free across retry or compaction continuations when the host passes that authority back to `continue()`.
+Scoped next-action policies reduce an evolving suggested action in registration order. Policy-generated deliveries are combined with leased inbox deliveries. Runtime-owned `final_response` authority remains tool-free across pause, retry, and compaction continuations. Policy may pause that request but cannot weaken it to an ordinary request or stop.
 
 ## Persistence and save points
 
@@ -172,7 +176,7 @@ After a successful turn, message and tool-result persistence completes before th
 
 Handlers receive cloned input and run in registration order. Hook failures are normalized to Harness errors and settle through the run's failure path.
 
-`message_end` hooks run before persistence. Replacements must preserve message role. Runtime-abort decoration is applied after replacement.
+`message_end` hooks run before persistence. Replacements must preserve message role. Runtime-abort and delivery-transaction diagnostics are applied after replacement.
 
 `subscribe(listener)` observes finalized cloned events. Subscribers are passive for committed delivery and terminal projections: failure, rejection, mutation, or a returned value cannot alter canonical outcomes or suppress later subscribers.
 
@@ -213,7 +217,7 @@ Active tool executions are exposed through finalized runtime events; application
 
 Compaction and tree navigation require an idle Harness and operate on persisted session state. They restore phase in `finally` and normalize subsystem failures.
 
-Applications may layer auto-compaction and retry policy around bounded runs. Explicit continuation context is the supported seam when canonical persisted history differs from the next provider request.
+Applications may layer auto-compaction and retry policy around bounded runs. Explicit continuation context is the supported seam when canonical persisted history differs from the next provider request. Successful compaction rebases retained continuation context; tree navigation clears it because the active branch changed.
 
 ## Low-level loop contract
 

@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentRunResult } from "@hansjm10/volt-agent-core";
+import type { AgentEvent, AgentMessage, AgentRunResult } from "@hansjm10/volt-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
@@ -16,6 +16,7 @@ type SessionWithCompactionInternals = {
 	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
 	_shouldStopForProactiveCompaction: (context: unknown) => boolean;
 	_handlePostAgentRun: (result: AgentRunResult) => Promise<boolean>;
+	_handleAgentEvent: (event: AgentEvent) => Promise<AgentMessage | undefined>;
 	_lastAssistantMessage: AssistantMessage | undefined;
 	_proactiveCompactionState: "idle" | "scheduled" | "compacting";
 	_nextRunContextOverride: AgentMessage[] | undefined;
@@ -385,6 +386,17 @@ describe("AgentSession compaction characterization", () => {
 		vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 
 		await expect(sessionInternals._handlePostAgentRun({ status: "completed", deliveries: [] })).resolves.toBe(false);
+	});
+
+	it("clears scheduled proactive compaction when a later policy starts a request", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		sessionInternals._proactiveCompactionState = "scheduled";
+
+		await sessionInternals._handleAgentEvent({ type: "turn_start" });
+
+		expect(sessionInternals._proactiveCompactionState).toBe("idle");
 	});
 
 	it("excludes a stripped trailing error message from estimatedTokensAfter when retrying", async () => {
