@@ -573,6 +573,8 @@ export interface BeforeAgentStartEvent<
 	images?: ImageContent[];
 	systemPrompt: string;
 	resources: AgentHarnessResources<TSkill, TPromptTemplate>;
+	/** Signal for the active bounded run, installed before preflight begins. */
+	signal: AbortSignal;
 }
 
 export interface ContextEvent {
@@ -884,6 +886,7 @@ export interface AgentHarnessOptions<
 				thinkingLevel: ThinkingLevel;
 				activeTools: TTool[];
 				resources: AgentHarnessResources<TSkill, TPromptTemplate>;
+				signal: AbortSignal;
 		  }) => string | Promise<string>);
 	getApiKeyAndHeaders?: (
 		model: Model<any>,

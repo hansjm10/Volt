@@ -42,6 +42,14 @@ function createHarness(
 	};
 }
 
+function getUserTexts(messages: readonly AgentMessage[]): string[] {
+	return messages.flatMap((message) => {
+		if (message.role !== "user") return [];
+		if (typeof message.content === "string") return [message.content];
+		return message.content.flatMap((content) => (content.type === "text" ? [content.text] : []));
+	});
+}
+
 function runtimeAbortSources(messages: readonly AgentMessage[]): unknown[] {
 	return messages.flatMap((message) =>
 		message.role === "assistant"
@@ -96,6 +104,112 @@ describe("AgentHarness lifecycle and abort", () => {
 		expect(harness.signal).toBeUndefined();
 		expect(harness.activeRunSnapshot).toBeUndefined();
 		expect(harness.abort("remote_request")).toEqual({ accepted: false, runId: undefined, source: undefined });
+	});
+
+	it("owns async system-prompt preflight and retains canceled input for explicit continuation", async () => {
+		const callbackStarted = deferred();
+		const releaseCallback = deferred();
+		let callbackSignal: AbortSignal | undefined;
+		let systemPromptCalls = 0;
+		let providerSystemPrompt = "";
+		const { harness, registration } = createHarness({
+			systemPrompt: async ({ signal }) => {
+				systemPromptCalls++;
+				if (systemPromptCalls === 1) {
+					callbackSignal = signal;
+					callbackStarted.resolve();
+					await releaseCallback.promise;
+					return "retained system prompt";
+				}
+				return "fresh default prompt";
+			},
+		});
+		registration.setResponses([
+			(context) => {
+				providerSystemPrompt = context.systemPrompt ?? "";
+				return fauxAssistantMessage("resumed");
+			},
+		]);
+
+		const running = harness.runPrompt("cancel system preflight");
+		await callbackStarted.promise;
+		expect(callbackSignal).toBe(harness.signal);
+		expect(harness.getPhase()).toBe("turn");
+		expect(harness.activeRunSnapshot).toMatchObject({ requestAccepted: false, phase: "open" });
+		let idleSettled = false;
+		const waiting = harness.waitForIdle().then(() => {
+			idleSettled = true;
+		});
+		const first = harness.abort("host_action");
+		expect(first).toMatchObject({ accepted: true, source: "host_action", runId: expect.any(String) });
+		expect(harness.abort("disposal")).toEqual(first);
+		expect(callbackSignal?.aborted).toBe(true);
+		expect(harness.activeRunSnapshot).toMatchObject({ runId: first.runId, source: "host_action" });
+		await Promise.resolve();
+		expect(idleSettled).toBe(false);
+
+		releaseCallback.resolve();
+		await Promise.all([running, waiting]);
+		expect(registration.state.callCount).toBe(0);
+		expect(harness.hasPendingPrompt()).toBe(true);
+		expect(harness.activeRunSnapshot).toBeUndefined();
+
+		await harness.continue();
+		expect(registration.state.callCount).toBe(1);
+		expect(systemPromptCalls).toBeGreaterThan(1);
+		expect(providerSystemPrompt).toBe("retained system prompt");
+		expect(harness.hasPendingPrompt()).toBe(false);
+	});
+
+	it("passes the active signal through before_agent_start and retains its completed payload on cancel", async () => {
+		const hookStarted = deferred();
+		const releaseHook = deferred();
+		let hookSignal: AbortSignal | undefined;
+		let providerTexts: string[] = [];
+		let providerSystemPrompt = "";
+		const { harness, registration } = createHarness();
+		harness.on("before_agent_start", async (event) => {
+			hookSignal = event.signal;
+			hookStarted.resolve();
+			await releaseHook.promise;
+			return {
+				messages: [{ role: "user", content: "hook payload", timestamp: Date.now() }],
+				systemPrompt: "hook system prompt",
+			};
+		});
+		registration.setResponses([
+			(context) => {
+				providerTexts = getUserTexts(context.messages as AgentMessage[]);
+				providerSystemPrompt = context.systemPrompt ?? "";
+				return fauxAssistantMessage("resumed");
+			},
+		]);
+
+		const running = harness.runPrompt("cancel hook preflight");
+		await hookStarted.promise;
+		expect(hookSignal).toBe(harness.signal);
+		expect(harness.activeRunSnapshot).toMatchObject({ requestAccepted: false, phase: "open" });
+		let idleSettled = false;
+		const waiting = harness.waitForIdle().then(() => {
+			idleSettled = true;
+		});
+		const first = harness.abort("remote_request");
+		expect(first).toMatchObject({ accepted: true, source: "remote_request", runId: expect.any(String) });
+		expect(harness.abort("disposal")).toEqual(first);
+		expect(hookSignal?.aborted).toBe(true);
+		await Promise.resolve();
+		expect(idleSettled).toBe(false);
+
+		releaseHook.resolve();
+		await Promise.all([running, waiting]);
+		expect(registration.state.callCount).toBe(0);
+		expect(harness.hasPendingPrompt()).toBe(true);
+
+		await harness.continue();
+		expect(registration.state.callCount).toBe(1);
+		expect(providerTexts).toEqual(["cancel hook preflight", "hook payload"]);
+		expect(providerSystemPrompt).toBe("hook system prompt");
+		expect(harness.hasPendingPrompt()).toBe(false);
 	});
 
 	it("re-canonicalizes the first abort source across awaited message replacements", async () => {

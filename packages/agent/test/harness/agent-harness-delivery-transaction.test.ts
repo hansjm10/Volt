@@ -258,26 +258,41 @@ describe("AgentHarness delivery transactions", () => {
 		});
 	});
 
-	it("preserves a committed FIFO prefix when a later participant retains", async () => {
+	it("preserves the explicit projection and committed FIFO prefix when a later participant retains", async () => {
 		let retainSecond = true;
 		const session = new Session(new InMemorySessionStorage());
+		await session.appendMessage({ role: "user", content: "canonical baseline", timestamp: Date.now() });
+		const explicitContext = { role: "user", content: "explicit baseline", timestamp: Date.now() } as const;
+		const secondDeliveryIds: string[] = [];
+		let providerTexts: string[] = [];
+		let providerSystemPrompt = "";
 		const { harness, registration } = createHarness({
 			session,
 			steeringMode: "all",
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				participant: {
-					settle: async () => {
-						if (getUserTexts(delivery.messages).includes("second") && retainSecond) {
-							return { outcome: "retained", error: new Error("retain second") };
-						}
-						for (const message of delivery.messages) await session.appendMessage(structuredClone(message));
-						return { outcome: "committed" };
+			prepareDelivery: (delivery) => {
+				const texts = getUserTexts(delivery.messages);
+				if (texts.includes("second")) secondDeliveryIds.push(delivery.deliveryId);
+				return {
+					messages: [...delivery.messages],
+					participant: {
+						settle: async () => {
+							if (texts.includes("second") && retainSecond) {
+								return { outcome: "retained", error: new Error("retain second") };
+							}
+							for (const message of delivery.messages) await session.appendMessage(structuredClone(message));
+							return { outcome: "committed" };
+						},
 					},
-				},
-			}),
+				};
+			},
 		});
-		registration.setResponses([() => fauxAssistantMessage("retried")]);
+		registration.setResponses([
+			(context) => {
+				providerTexts = getUserTexts(context.messages as AgentMessage[]);
+				providerSystemPrompt = context.systemPrompt ?? "";
+				return fauxAssistantMessage("retried");
+			},
+		]);
 		let queued = false;
 		harness.subscribe(async (event) => {
 			if (event.type === "agent_start" && !queued) {
@@ -287,20 +302,32 @@ describe("AgentHarness delivery transactions", () => {
 			}
 		});
 
-		const failed = await harness.runPrompt("prompt");
+		const failed = await harness.runPrompt("prompt", {
+			context: [explicitContext],
+			systemPrompt: "explicit system prompt",
+		});
 		expect(failed).toMatchObject({
 			status: "delivery_failed",
 			deliveries: [{ outcome: "committed" }, { outcome: "committed" }, { outcome: "retained" }],
 		});
 		expect(registration.state.callCount).toBe(0);
-		expect(getUserTexts((await session.buildContext()).messages as AgentMessage[])).toEqual(["prompt", "first"]);
+		expect(getUserTexts((await session.buildContext()).messages as AgentMessage[])).toEqual([
+			"canonical baseline",
+			"prompt",
+			"first",
+		]);
 		expect(harness.hasQueuedMessages()).toBe(true);
 
 		retainSecond = false;
 		const retried = await harness.continue();
 		expect(retried).toMatchObject({ status: "completed", deliveries: [{ outcome: "committed" }] });
 		expect(registration.state.callCount).toBe(1);
+		expect(new Set(secondDeliveryIds)).toHaveLength(1);
+		expect(secondDeliveryIds).toHaveLength(2);
+		expect(providerTexts).toEqual(["explicit baseline", "prompt", "first", "second"]);
+		expect(providerSystemPrompt).toBe("explicit system prompt");
 		expect(getUserTexts((await session.buildContext()).messages as AgentMessage[])).toEqual([
+			"canonical baseline",
 			"prompt",
 			"first",
 			"second",

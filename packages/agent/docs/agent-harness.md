@@ -42,7 +42,7 @@ A model may be unset during construction. Prompt and continuation preflight reje
 - stream options
 - session ID
 
-A provider request uses one snapshot. Save-point configuration changes are reflected when the next request snapshot is created.
+A provider request uses one snapshot. Save-point configuration changes are reflected when the next request snapshot is created. Harness admits the bounded run before snapshot construction or any system-prompt preflight, so cancellation and idle ownership already cover those awaits.
 
 ### Session
 
@@ -68,11 +68,11 @@ Prompt, steering, and follow-up deliveries share one inbox with stable IDs. The 
 - ordered delivery outcomes
 - terminal event settlement
 
-`activeRunSnapshot` is immutable. `activeDeliverySettlement` exposes the current durability barrier without exposing mutable run internals.
+Run ownership starts synchronously before turn snapshot construction, the configured `systemPrompt` callback, and `before_agent_start` preflight. Both callbacks receive the active run's `AbortSignal`. `activeRunSnapshot` is immutable, and `activeDeliverySettlement` exposes the current durability barrier without exposing mutable run internals.
 
 ### Continuation
 
-Harness privately retains the context projection, request authority, provider-pending state, and per-run system prompt needed to resume a paused or failed bounded run. Callers use bare `continue()` to resume that state. An explicit context override rebases the retained projection without transferring authority ownership to the caller.
+Harness keeps a run-local continuation candidate separate from cross-run continuation state. At dispatcher boundaries it tracks the effective context, request authority, provider-pending state, and system prompt, then extends that projection with each committed delivery prefix. Canceled preflight, preparation or settlement failure, and abort rollback promote the candidate when they leave queued work; pause and final-response paths preserve authority under the existing dispatcher rules. Callers use bare `continue()` to resume that projection and retry the same retained delivery identity. An explicit context override rebases the retained projection without transferring authority ownership to the caller.
 
 ## Transactional delivery
 
@@ -109,7 +109,7 @@ Committed and revoked prefixes remain visible even if a later delivery retains o
 
 `prompt()` returns the required assistant response and is convenient when the caller does not need the delivery outcome surface.
 
-A retained prompt remains pending until `continue()` retries it or `discardPendingPrompt()` revokes it. Continuations may supply an explicit context override, allowing hosts to keep canonical error messages persisted while omitting them from the next provider request.
+A canceled-preflight or retained prompt remains pending until `continue()` retries it or `discardPendingPrompt()` revokes it. Its effective context and system-prompt projection, including any committed delivery prefix, carry into bare `continue()` so retry does not fall back to canonical/default state. Continuations may also supply an explicit context override, allowing hosts to keep canonical error messages persisted while omitting them from the next provider request.
 
 ## Abort and teardown
 
@@ -122,7 +122,8 @@ Rules:
 - queued steer/follow-up work is not implicitly cleared
 - explicit revocation remains separate
 - runtime-abort diagnostics are applied after message replacement so hooks cannot erase provenance
-- `waitForIdle()` covers terminal listener settlement and failure cleanup
+- system-prompt and `before_agent_start` preflight receive the active signal
+- `waitForIdle()` covers preflight callbacks, terminal listener settlement, and failure cleanup
 
 Structural teardown should:
 

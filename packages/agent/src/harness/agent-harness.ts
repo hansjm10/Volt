@@ -255,6 +255,13 @@ interface AgentHarnessDeliveryEventState {
 	remainingMessages: Set<AgentMessage>;
 }
 
+interface AgentHarnessContinuationState {
+	context: AgentMessage[];
+	requestAuthority: AgentRequestAuthority;
+	providerRequestPending: boolean;
+	systemPrompt?: string;
+}
+
 interface AgentHarnessRunEventState {
 	id: string;
 	abortController: AbortController;
@@ -280,6 +287,13 @@ interface AgentHarnessRunEventState {
 	settlementStarted: boolean;
 	terminalEmitted: boolean;
 	phase: "open" | "terminal_event_settling" | "settled";
+	continuationCandidate?: AgentHarnessContinuationState;
+}
+
+interface AgentHarnessBoundedRun {
+	state: AgentHarnessRunEventState;
+	idlePromise: Promise<void>;
+	finishIdle(): void;
 }
 
 type PendingDelivery = InboxDelivery<AgentDeliveryKind, AgentMessage>;
@@ -290,13 +304,6 @@ type DispatcherStartState = {
 	providerRequestPending: boolean;
 	drainFollowUpsFirst?: boolean;
 };
-
-interface AgentHarnessContinuationState {
-	context: AgentMessage[];
-	requestAuthority: AgentRequestAuthority;
-	providerRequestPending: boolean;
-	systemPrompt?: string;
-}
 
 interface AgentHarnessExecutionResult {
 	result: AgentRunResult;
@@ -620,18 +627,48 @@ export class AgentHarness<
 		else await this.emitOwn(event, this.activeRun?.abortController.signal);
 	}
 
-	private startRunPromise(): () => void {
-		let finish = () => {};
-		this.runPromise = new Promise<void>((resolve) => {
-			finish = resolve;
-		});
-		return () => {
-			this.runPromise = undefined;
-			finish();
+	private admitBoundedRun(): AgentHarnessBoundedRun {
+		const state: AgentHarnessRunEventState = {
+			id: `harness-run:${globalThis.crypto.randomUUID()}`,
+			abortController: new AbortController(),
+			requestAccepted: false,
+			deliverySettlement: undefined,
+			deliveryOrder: new Map(),
+			deliveryOutcomes: new Map(),
+			observationalDeliveryIds: new Set(),
+			participantOwnedDeliveryIds: new Set(),
+			admittedMessages: [],
+			admittedMessageSet: new Set(),
+			messageDeliveryIds: new Map(),
+			startedMessages: new Set(),
+			persistedMessages: [],
+			persistedMessageSet: new Set(),
+			deliveries: new Map(),
+			hasTurnStarted: false,
+			turnOpen: false,
+			settlementStarted: false,
+			terminalEmitted: false,
+			phase: "open",
 		};
+		let finishIdle = (): void => undefined;
+		const idlePromise = new Promise<void>((resolve) => {
+			finishIdle = resolve;
+		});
+		this.phase = "turn";
+		this.activeRun = state;
+		this.runPromise = idlePromise;
+		return { state, idlePromise, finishIdle };
+	}
+
+	private finishBoundedRun(run: AgentHarnessBoundedRun): void {
+		this.activeRun = undefined;
+		this.runPromise = undefined;
+		this.phase = "idle";
+		run.finishIdle();
 	}
 
 	private async createTurnState(
+		signal: AbortSignal,
 		contextOverride?: readonly AgentMessage[],
 	): Promise<AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>> {
 		const context = contextOverride === undefined ? await this.session.buildContext() : { messages: contextOverride };
@@ -654,6 +691,7 @@ export class AgentHarness<
 				thinkingLevel: this.thinkingLevel,
 				activeTools,
 				resources,
+				signal,
 			});
 		}
 		return {
@@ -745,10 +783,19 @@ export class AgentHarness<
 		return [...this.deliveryInbox.select(kind, mode)];
 	}
 
+	private promoteContinuationCandidate(run: AgentHarnessRunEventState): void {
+		const candidate = run.continuationCandidate;
+		if (!candidate) return;
+		this.continuationState = {
+			...candidate,
+			context: cloneAgentMessages(candidate.context),
+		};
+	}
+
 	private async resolveNextAction(
 		context: AgentLoopNextActionContext,
 		startState: DispatcherStartState,
-		systemPrompt?: string,
+		systemPrompt: string,
 	): Promise<AgentLoopNextAction> {
 		const isFirstDecision = startState.firstDecision;
 		startState.firstDecision = false;
@@ -757,14 +804,17 @@ export class AgentHarness<
 		const providerRequestPending = isFirstDecision
 			? startState.providerRequestPending
 			: runtimeAction.type === "request";
+		const run = this.activeRun;
+		if (!run) throw new AgentHarnessError("invalid_state", "Next-action dispatch requires an active run");
+		run.continuationCandidate = {
+			context: cloneAgentMessages(context.context.messages),
+			requestAuthority,
+			providerRequestPending,
+			systemPrompt,
+		};
 
-		if (this.activeRun?.abortController.signal.aborted) {
-			this.continuationState = {
-				context: cloneAgentMessages(context.context.messages),
-				requestAuthority,
-				providerRequestPending,
-				...(systemPrompt === undefined ? {} : { systemPrompt }),
-			};
+		if (run.abortController.signal.aborted) {
+			this.promoteContinuationCandidate(run);
 			return { type: "pause", requestAuthority };
 		}
 
@@ -776,7 +826,7 @@ export class AgentHarness<
 				context: cloneAgentMessages(context.context.messages),
 				requestAuthority,
 				providerRequestPending: action.type === "pause" ? providerRequestPending : true,
-				...(systemPrompt === undefined ? {} : { systemPrompt }),
+				systemPrompt,
 			};
 			return action.type === "pause"
 				? { ...action, requestAuthority }
@@ -809,7 +859,7 @@ export class AgentHarness<
 				context: cloneAgentMessages(context.context.messages),
 				requestAuthority: action.requestAuthority ?? requestAuthority,
 				providerRequestPending: hasIndependentRequest,
-				...(systemPrompt === undefined ? {} : { systemPrompt }),
+				systemPrompt,
 			};
 			return { ...action, requestAuthority: action.requestAuthority ?? requestAuthority };
 		}
@@ -974,6 +1024,7 @@ export class AgentHarness<
 				},
 			);
 		}
+		if (outcome.outcome === "retained") this.promoteContinuationCandidate(run);
 	}
 
 	private rollbackActiveLease(): void {
@@ -990,6 +1041,7 @@ export class AgentHarness<
 	}
 
 	private createLoopConfig(
+		run: AgentHarnessRunEventState,
 		getTurnState: () => AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
 		setTurnState: (turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>) => void,
 		startState: DispatcherStartState,
@@ -1020,11 +1072,12 @@ export class AgentHarness<
 					isError,
 				});
 			},
-			nextAction: async (context) => await this.resolveNextAction(context, startState, systemPromptOverride),
+			nextAction: async (context) =>
+				await this.resolveNextAction(context, startState, systemPromptOverride ?? getTurnState().systemPrompt),
 			beginDelivery: async (delivery) => await this.beginActiveDelivery(delivery),
 			prepareRequest: async ({ context }) => {
 				await this.flushPendingSessionWrites();
-				const nextTurnState = await this.createTurnState(context.messages);
+				const nextTurnState = await this.createTurnState(run.abortController.signal, context.messages);
 				setTurnState(nextTurnState);
 				return {
 					context: this.createContext(nextTurnState, systemPromptOverride),
@@ -1161,6 +1214,12 @@ export class AgentHarness<
 			if (!state.persistedMessageSet.has(event.message)) {
 				state.persistedMessageSet.add(event.message);
 				state.persistedMessages.push(finalizedEvent.message);
+				if (
+					finalizedEvent.deliveryId !== undefined &&
+					state.deliveryOutcomes.get(finalizedEvent.deliveryId)?.outcome === "committed"
+				) {
+					state.continuationCandidate?.context.push(structuredClone(finalizedEvent.message));
+				}
 			}
 			const deliveryState = state.deliveries.get(finalizedEvent.deliveryId);
 			if (deliveryState?.remainingMessages.delete(event.message) && deliveryState.remainingMessages.size === 0) {
@@ -1262,6 +1321,7 @@ export class AgentHarness<
 	}
 
 	private async enqueuePromptDelivery(
+		signal: AbortSignal,
 		turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
 		messages: readonly AgentMessage[],
 		beforeStart?: { text: string; options?: AgentHarnessPromptOptions },
@@ -1285,6 +1345,7 @@ export class AgentHarness<
 					: { images: structuredClone(beforeStart.options.images) }),
 				systemPrompt: systemPrompt ?? turnState.systemPrompt,
 				resources: turnState.resources,
+				signal,
 			});
 			promptMessages.push(...cloneAgentMessages(beforeResult?.messages ?? []));
 			systemPrompt = beforeResult?.systemPrompt ?? systemPrompt;
@@ -1298,6 +1359,7 @@ export class AgentHarness<
 	}
 
 	private async executeTurn(
+		runEventState: AgentHarnessRunEventState,
 		turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
 		startState: DispatcherStartState,
 		systemPrompt?: string,
@@ -1307,30 +1369,16 @@ export class AgentHarness<
 		const setTurnState = (nextTurnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>) => {
 			activeTurnState = nextTurnState;
 		};
-		const abortController = new AbortController();
-		const runEventState: AgentHarnessRunEventState = {
-			id: `harness-run:${globalThis.crypto.randomUUID()}`,
-			abortController,
-			requestAccepted: false,
-			deliverySettlement: undefined,
-			deliveryOrder: new Map(),
-			deliveryOutcomes: new Map(),
-			observationalDeliveryIds: new Set(),
-			participantOwnedDeliveryIds: new Set(),
-			admittedMessages: [],
-			admittedMessageSet: new Set(),
-			messageDeliveryIds: new Map(),
-			startedMessages: new Set(),
-			persistedMessages: [],
-			persistedMessageSet: new Set(),
-			deliveries: new Map(),
-			hasTurnStarted: false,
-			turnOpen: false,
-			settlementStarted: false,
-			terminalEmitted: false,
-			phase: "open",
+		const abortController = runEventState.abortController;
+		runEventState.continuationCandidate = {
+			context: cloneAgentMessages(turnState.messages),
+			requestAuthority: startState.requestAuthority,
+			providerRequestPending: startState.providerRequestPending,
+			systemPrompt: systemPrompt ?? turnState.systemPrompt,
 		};
-		this.activeRun = runEventState;
+		if (abortController.signal.aborted && this.hasQueuedMessages()) {
+			this.promoteContinuationCandidate(runEventState);
+		}
 
 		let loopMessages: AgentMessage[] = [];
 		let terminalMessages: AgentMessage[] | undefined;
@@ -1341,7 +1389,7 @@ export class AgentHarness<
 				loopMessages = await runAgentLoop(
 					[],
 					this.createContext(turnState, systemPrompt),
-					this.createLoopConfig(getTurnState, setTurnState, startState, systemPrompt),
+					this.createLoopConfig(runEventState, getTurnState, setTurnState, startState, systemPrompt),
 					async (event) => await this.handleAgentEvent(event, runEventState, abortController.signal),
 					abortController.signal,
 					this.createStreamFn(getTurnState),
@@ -1375,7 +1423,6 @@ export class AgentHarness<
 				);
 				deliveryFailure = runEventState.deliveryFailure;
 				this.leasedDeliveryKinds.clear();
-				this.activeRun = undefined;
 			}
 		}
 
@@ -1410,14 +1457,14 @@ export class AgentHarness<
 			);
 		}
 		this.continuationState = undefined;
-		this.phase = "turn";
-		const finishRunPromise = this.startRunPromise();
+		const run = this.admitBoundedRun();
 		try {
-			const baseTurnState = await this.createTurnState();
+			const baseTurnState = await this.createTurnState(run.state.abortController.signal);
 			const invocation = resolveInvocation(baseTurnState);
 			const turnState =
 				invocation.context === undefined ? baseTurnState : { ...baseTurnState, messages: [...invocation.context] };
 			const systemPrompt = await this.enqueuePromptDelivery(
+				run.state.abortController.signal,
 				turnState,
 				invocation.messages,
 				invocation.beforeStart,
@@ -1425,6 +1472,7 @@ export class AgentHarness<
 			);
 			const lastMessage = turnState.messages.at(-1);
 			return await this.executeTurn(
+				run.state,
 				turnState,
 				{
 					firstDecision: true,
@@ -1436,8 +1484,7 @@ export class AgentHarness<
 		} catch (error) {
 			throw normalizeHarnessError(error, "unknown");
 		} finally {
-			this.phase = "idle";
-			finishRunPromise();
+			this.finishBoundedRun(run);
 		}
 	}
 
@@ -1509,8 +1556,7 @@ export class AgentHarness<
 		options: { drainFollowUps?: boolean; context?: readonly AgentMessage[] } = {},
 	): Promise<AgentRunResult> {
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
-		this.phase = "turn";
-		const finishRunPromise = this.startRunPromise();
+		const run = this.admitBoundedRun();
 		try {
 			let continuationState = this.continuationState;
 			if (continuationState && options.context !== undefined) {
@@ -1520,7 +1566,10 @@ export class AgentHarness<
 				};
 				this.continuationState = continuationState;
 			}
-			const turnState = await this.createTurnState(options.context ?? continuationState?.context);
+			const turnState = await this.createTurnState(
+				run.state.abortController.signal,
+				options.context ?? continuationState?.context,
+			);
 			const lastMessage = turnState.messages.at(-1);
 			if (!lastMessage && !this.hasQueuedMessages()) {
 				throw new AgentHarnessError("invalid_state", "No messages to continue from");
@@ -1537,6 +1586,7 @@ export class AgentHarness<
 			}
 			return (
 				await this.executeTurn(
+					run.state,
 					turnState,
 					{
 						firstDecision: true,
@@ -1552,8 +1602,7 @@ export class AgentHarness<
 		} catch (error) {
 			throw normalizeHarnessError(error, "unknown");
 		} finally {
-			this.phase = "idle";
-			finishRunPromise();
+			this.finishBoundedRun(run);
 		}
 	}
 
