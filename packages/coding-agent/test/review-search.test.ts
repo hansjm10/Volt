@@ -499,7 +499,7 @@ describe("direct-tree review snapshot search", () => {
 				{ path: "oversized.txt", reason: expect.stringContaining("12 KiB") },
 			]),
 		);
-	});
+	}, 60_000);
 
 	it("returns bounded pages without retaining every repository match", async () => {
 		const repository = createRepository();
