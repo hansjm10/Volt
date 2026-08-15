@@ -178,6 +178,63 @@ describe("AgentHarness continuation state", () => {
 		expect(registration.state.callCount).toBe(1);
 	});
 
+	it("reconciles metadata appended during a provider request before tool continuation", async () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		const session = new Session(new InMemorySessionStorage());
+		const requestRoles: string[][] = [];
+		registration.setResponses([
+			async (context) => {
+				requestRoles.push((context.messages as AgentMessage[]).map((message) => message.role));
+				await session.appendSessionName("Generated while provider active");
+				return fauxAssistantMessage(fauxToolCall("calculate", { expression: "2 + 2" }, { id: "call-1" }), {
+					stopReason: "toolUse",
+				});
+			},
+			(context) => {
+				requestRoles.push((context.messages as AgentMessage[]).map((message) => message.role));
+				return fauxAssistantMessage("done");
+			},
+		]);
+		const { harness } = createHarness(registration, { session, tools: [calculateTool] });
+
+		await expect(harness.runPrompt("continue after naming")).resolves.toMatchObject({ status: "completed" });
+
+		expect(registration.state.callCount).toBe(2);
+		expect(requestRoles).toEqual([["user"], ["user", "assistant", "toolResult"]]);
+		expect((await session.getBranch()).map((entry) => entry.type)).toEqual([
+			"message",
+			"session_info",
+			"message",
+			"message",
+			"message",
+		]);
+	});
+
+	it("fails closed when a context-bearing entry intervenes before an owned message", async () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		const session = new Session(new InMemorySessionStorage());
+		registration.setResponses([
+			async () => {
+				await session.appendMessage({ role: "user", content: "external write", timestamp: Date.now() });
+				return fauxAssistantMessage(fauxToolCall("calculate", { expression: "2 + 2" }, { id: "call-1" }), {
+					stopReason: "toolUse",
+				});
+			},
+			fauxAssistantMessage("must not run"),
+		]);
+		const { harness } = createHarness(registration, { session, tools: [calculateTool] });
+
+		const response = await harness.prompt("reject external context");
+
+		expect(response).toMatchObject({
+			stopReason: "error",
+			errorMessage: expect.stringContaining("projection anchor"),
+		});
+		expect(registration.state.callCount).toBe(1);
+	});
+
 	it("owns explicit continuation context before blocked canonical context resolution", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);

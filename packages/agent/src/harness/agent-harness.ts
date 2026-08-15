@@ -1015,14 +1015,14 @@ export class AgentHarness<
 	}
 
 	private async advanceContextProjection(entryId: string, messages: readonly AgentMessage[] = []): Promise<void> {
-		const projection = this.contextProjection;
-		if (!projection || projection.invalidError) return;
+		const initialProjection = this.contextProjection;
+		if (!initialProjection || initialProjection.invalidError) return;
 		let appendedMessages: AgentMessage[];
 		try {
 			appendedMessages = cloneAgentMessages(messages);
 		} catch (error) {
 			this.recordContextProjectionInvalid(
-				projection,
+				initialProjection,
 				new AgentHarnessError(
 					"invalid_state",
 					"Continuation context projection could not own persisted messages",
@@ -1031,25 +1031,48 @@ export class AgentHarness<
 			);
 			return;
 		}
-		let entry: SessionTreeEntry | undefined;
-		try {
-			entry = await this.session.getEntry(entryId);
-		} catch (error) {
-			if (this.contextProjection === projection) {
+		const token = initialProjection.token;
+		for (;;) {
+			const projection = this.contextProjection;
+			if (!projection || projection.token !== token || projection.invalidError) return;
+			if (projection.anchorLeafId === entryId) return;
+			let branch: SessionTreeEntry[];
+			try {
+				branch = await this.session.getBranch(entryId);
+			} catch (error) {
+				const currentProjection = this.contextProjection;
+				if (currentProjection !== projection) {
+					if (currentProjection?.token === token && !currentProjection.invalidError) continue;
+					return;
+				}
 				this.recordContextProjectionInvalid(projection, normalizeHarnessError(error, "session"));
+				return;
 			}
+			const currentProjection = this.contextProjection;
+			if (currentProjection !== projection) {
+				if (currentProjection?.token === token && !currentProjection.invalidError) continue;
+				return;
+			}
+			const anchorIndex =
+				projection.anchorLeafId === null ? -1 : branch.findIndex((entry) => entry.id === projection.anchorLeafId);
+			const appendedEntries = branch.slice(anchorIndex + 1);
+			const interveningEntries = appendedEntries.slice(0, -1);
+			if (
+				(projection.anchorLeafId === null && branch[0]?.parentId !== null) ||
+				(projection.anchorLeafId !== null && anchorIndex === -1) ||
+				appendedEntries.at(-1)?.id !== entryId ||
+				interveningEntries.some((entry) => entry.type !== "label" && entry.type !== "session_info")
+			) {
+				this.recordContextProjectionInvalid(projection, this.staleContextProjectionError());
+				return;
+			}
+			this.contextProjection = {
+				...projection,
+				anchorLeafId: entryId,
+				messages: [...projection.messages, ...appendedMessages],
+			};
 			return;
 		}
-		if (this.contextProjection !== projection) return;
-		if (!entry || entry.parentId !== projection.anchorLeafId) {
-			this.recordContextProjectionInvalid(projection, this.staleContextProjectionError());
-			return;
-		}
-		this.contextProjection = {
-			...projection,
-			anchorLeafId: entryId,
-			messages: [...projection.messages, ...appendedMessages],
-		};
 	}
 
 	private async advanceContextProjectionToLeaf(
