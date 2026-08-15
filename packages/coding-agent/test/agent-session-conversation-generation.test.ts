@@ -801,8 +801,9 @@ describe("AgentSession conversation generation commits", () => {
 			);
 			await boundaryStarted;
 
-			await runtime.session.navigateTree(firstAssistantId, { summarize: false });
+			const navigation = runtime.session.navigateTree(firstAssistantId, { summarize: false });
 			releaseBoundary();
+			await navigation;
 			await runtime.session.waitForIdle();
 
 			await vi.waitFor(() => {

@@ -178,12 +178,13 @@ describe("AgentHarness host policy", () => {
 
 		await harness.prompt("calculate", { systemPrompt: "per-run" });
 
-		expect(order).toEqual(["tool-call-first", "tool-call-second", "tool-result-first", "first result"]);
+		expect(order).toEqual(["tool-call-first", "tool-call-second"]);
 		expect(providerSystemPrompts).toEqual(["per-run", "per-run"]);
-		expect(JSON.stringify(continuationMessages)).toContain("final result");
+		expect(JSON.stringify(continuationMessages)).toContain("second");
+		expect(JSON.stringify(continuationMessages)).not.toContain("final result");
 	});
 
-	it("keeps successful non-cloneable tool details inert when no tool-result handlers exist", async () => {
+	it("fails the run when canonical storage cannot own non-cloneable tool details", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);
 		registration.setResponses([
@@ -219,17 +220,8 @@ describe("AgentHarness host policy", () => {
 		);
 
 		expect(registration.state.callCount).toBe(1);
-		expect(response.stopReason).toBe("toolUse");
-		expect(persistedToolResult?.type === "message" ? persistedToolResult.message : undefined).toMatchObject({
-			role: "toolResult",
-			isError: false,
-			content: [{ type: "text", text: "successful result" }],
-		});
-		expect(
-			persistedToolResult?.type === "message" && persistedToolResult.message.role === "toolResult"
-				? (persistedToolResult.message.details as { callback?: unknown } | undefined)?.callback
-				: undefined,
-		).toBe(detailCallback);
+		expect(response.stopReason).toBe("error");
+		expect(persistedToolResult).toBeUndefined();
 	});
 
 	it("allows scoped policy to deliver work from an assistant-tail continuation", async () => {

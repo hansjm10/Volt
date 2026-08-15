@@ -104,31 +104,7 @@ describe("AgentHarness continuation state", () => {
 		expect(harness.clearContinuationContext(invalidated)).toBe(false);
 	});
 
-	it("rejects a stale projection before continuation without consuming retained delivery", async () => {
-		const registration = registerFauxProvider();
-		registrations.push(registration);
-		registration.setResponses([fauxAssistantMessage("must not run")]);
-		const session = new Session(new InMemorySessionStorage());
-		const { harness } = createHarness(registration, {
-			session,
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				participant: {
-					settle: () => ({ outcome: "retained", error: new Error("retain prompt") }),
-				},
-			}),
-		});
-
-		await expect(harness.runPrompt("retained prompt")).resolves.toMatchObject({ status: "delivery_failed" });
-		expect(harness.hasPendingPrompt()).toBe(true);
-		await session.appendMessage({ role: "user", content: "external branch write", timestamp: Date.now() });
-
-		await expect(harness.continue()).rejects.toThrow("projection anchor");
-		expect(registration.state.callCount).toBe(0);
-		expect(harness.hasPendingPrompt()).toBe(true);
-	});
-
-	it("records projection clone failures instead of falling back to canonical context", async () => {
+	it("rejects non-cloneable canonical mutations before changing projection", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);
 		registration.setResponses([fauxAssistantMessage("must not run")]);
@@ -137,20 +113,21 @@ describe("AgentHarness continuation state", () => {
 		const { harness } = createHarness(registration, { session });
 		await harness.rebaseContinuationContext({ source: "explicit" });
 
-		await harness.appendMessage({
-			role: "custom",
-			customType: "uncloneable",
-			content: "persisted canonically",
-			display: false,
-			details: { callback: () => undefined } as never,
-			timestamp: Date.now(),
-		});
-
-		await expect(harness.continue()).rejects.toThrow("could not own persisted messages");
+		await expect(
+			harness.appendMessage({
+				role: "custom",
+				customType: "uncloneable",
+				content: "persisted canonically",
+				display: false,
+				details: { callback: () => undefined } as never,
+				timestamp: Date.now(),
+			}),
+		).rejects.toThrow("Failed to materialize canonical mutation batch");
+		expect((await session.buildContext()).messages.map(messageText)).toEqual(["canonical"]);
 		expect(registration.state.callCount).toBe(0);
 	});
 
-	it("detects a stale projection between provider requests", async () => {
+	it("lets canonical mode consume a branch rewrite between provider requests", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);
 		registration.setResponses([
@@ -166,16 +143,13 @@ describe("AgentHarness continuation state", () => {
 		harness.subscribe(async (event) => {
 			if (event.type !== "tool_execution_end" || movedBranch) return;
 			movedBranch = true;
-			await storage.setLeafId(null);
+			await session.moveTo(null);
 		});
 
 		const response = await harness.prompt("change branches between requests");
 
-		expect(response).toMatchObject({
-			stopReason: "error",
-			errorMessage: expect.stringContaining("projection anchor"),
-		});
-		expect(registration.state.callCount).toBe(1);
+		expect(response).toMatchObject({ stopReason: "stop" });
+		expect(registration.state.callCount).toBe(2);
 	});
 
 	it("reconciles metadata appended during a provider request before tool continuation", async () => {
@@ -211,7 +185,7 @@ describe("AgentHarness continuation state", () => {
 		]);
 	});
 
-	it("fails closed when a context-bearing entry intervenes before an owned message", async () => {
+	it("tails a legitimate canonical append before the next provider request", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);
 		const session = new Session(new InMemorySessionStorage());
@@ -228,11 +202,8 @@ describe("AgentHarness continuation state", () => {
 
 		const response = await harness.prompt("reject external context");
 
-		expect(response).toMatchObject({
-			stopReason: "error",
-			errorMessage: expect.stringContaining("projection anchor"),
-		});
-		expect(registration.state.callCount).toBe(1);
+		expect(response).toMatchObject({ stopReason: "stop" });
+		expect(registration.state.callCount).toBe(2);
 	});
 
 	it("owns explicit continuation context before blocked canonical context resolution", async () => {
@@ -241,11 +212,11 @@ describe("AgentHarness continuation state", () => {
 		const session = new Session(new InMemorySessionStorage());
 		const contextStarted = deferred();
 		const releaseContext = deferred();
-		const buildContext = session.buildContext.bind(session);
-		vi.spyOn(session, "buildContext").mockImplementation(async () => {
+		const getBranchSnapshot = session.getBranchSnapshot.bind(session);
+		vi.spyOn(session, "getBranchSnapshot").mockImplementation(async (cursor) => {
 			contextStarted.resolve();
 			await releaseContext.promise;
-			return await buildContext();
+			return await getBranchSnapshot(cursor);
 		});
 		let providerTexts: string[] = [];
 		registration.setResponses([
@@ -336,18 +307,30 @@ describe("AgentHarness continuation state", () => {
 		harness = createHarness(registration, {
 			session,
 			thinkingLevel: "off",
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				participant: {
-					settle: async () => {
-						await harness.setModel(secondModel, { persist: false });
-						await harness.setThinkingLevel("high", { persist: false });
-						await harness.setTools([calculateTool], [calculateTool.name]);
-						for (const message of delivery.messages) await session.appendMessage(structuredClone(message));
-						return { outcome: "committed" };
-					},
+			deliveryOwner: {
+				prepareLogical: (context) => ({ outcome: "prepared", messages: context.sourceMessages }),
+				commitAttempt: async (context) => {
+					await harness.setModel(secondModel, { persist: false });
+					await harness.setThinkingLevel("high", { persist: false });
+					await harness.setTools([calculateTool], [calculateTool.name]);
+					const snapshot = await session.getBranchSnapshot();
+					const result = await session.commitBatch({
+						guard: { kind: "exact", cursor: snapshot.cursor },
+						mutations: context.preparedMessages.map((message) => ({
+							kind: "append" as const,
+							entry: { type: "message" as const, message },
+						})),
+						deliveryAttribution: {
+							deliveryId: context.deliveryId,
+							epoch: context.epoch,
+							attemptId: context.attemptId,
+						},
+					});
+					if (result.outcome !== "committed") return { outcome: "terminally_failed", error: result.error };
+					return { outcome: "committed", receipt: result.receipt };
 				},
-			}),
+				finish: () => undefined,
+			},
 		}).harness;
 
 		await harness.runPrompt("use current configuration");

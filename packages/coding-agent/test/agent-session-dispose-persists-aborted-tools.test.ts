@@ -67,8 +67,10 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 				expect(hasPersistedToolCall).toBe(true);
 			});
 
-			const disposal = harness.session.dispose();
-			expect(harness.session.dispose()).toBe(disposal);
+			harness.session.dispose();
+			const disposal = harness.session.waitForClosed();
+			harness.session.dispose();
+			expect(harness.session.waitForClosed()).toBe(disposal);
 			await Promise.all([disposal, promptPromise]);
 
 			const context = harness.sessionManager.buildSessionContext();
@@ -79,9 +81,7 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 				toolName: "hang",
 				isError: true,
 			});
-			expect(toolResults[0]?.content).toEqual([
-				{ type: "text", text: "Operation aborted: the session closed before this tool call completed." },
-			]);
+			expect(toolResults[0]?.content).toEqual([{ type: "text", text: "Operation aborted" }]);
 		} finally {
 			harness.cleanup();
 		}
@@ -142,7 +142,8 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 				requestKey: "rk-1",
 			});
 
-			await Promise.all([harness.session.dispose(), promptPromise]);
+			harness.session.dispose();
+			await Promise.all([harness.session.waitForClosed(), promptPromise]);
 
 			const context = harness.sessionManager.buildSessionContext();
 			const toolResults = context.messages.filter((message) => message.role === "toolResult");
@@ -182,7 +183,8 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 		try {
 			await harness.session.prompt("hello");
 			const before = harness.sessionManager.buildSessionContext().messages.length;
-			await harness.session.dispose();
+			harness.session.dispose();
+			await harness.session.waitForClosed();
 			const after = harness.sessionManager.buildSessionContext().messages.length;
 			expect(after).toBe(before);
 		} finally {
@@ -220,7 +222,8 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 				expect(hangStarted).toBe(true);
 			});
 
-			await Promise.all([harness.session.dispose(), promptPromise]);
+			harness.session.dispose();
+			await Promise.all([harness.session.waitForClosed(), promptPromise]);
 
 			const context = harness.sessionManager.buildSessionContext();
 			const toolResults = context.messages.filter((message) => message.role === "toolResult");
@@ -235,7 +238,7 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 		}
 	});
 
-	it("fences an in-flight extension handler from appending after disposal drains", async () => {
+	it("joins an in-flight extension handler before disposal drains", async () => {
 		let releaseAssistant!: () => void;
 		let markAssistantEntered!: () => void;
 		const assistantEntered = new Promise<void>((resolve) => {
@@ -259,17 +262,23 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 		try {
 			const prompt = harness.session.prompt("start").catch(() => {});
 			await assistantEntered;
-			await harness.session.dispose();
+			harness.session.dispose();
+			let closed = false;
+			const disposal = harness.session.waitForClosed().then(() => {
+				closed = true;
+			});
+			await Promise.resolve();
+			expect(closed).toBe(false);
+
+			releaseAssistant();
+			await Promise.all([disposal, prompt]);
 			const disposedMessages = harness.sessionManager.buildSessionContext().messages;
 			expect(disposedMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
 			expect(disposedMessages.at(-1)).toMatchObject({
 				role: "assistant",
-				stopReason: "aborted",
+				stopReason: "stop",
 				diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
 			});
-
-			releaseAssistant();
-			await prompt;
 			expect(harness.sessionManager.buildSessionContext().messages).toEqual(disposedMessages);
 		} finally {
 			releaseAssistant();
@@ -294,7 +303,7 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 					volt.on("message_end", async (event) => {
 						if (event.message.role !== "assistant") return;
 						markAssistantEntered();
-						await harness.session.dispose();
+						harness.session.dispose();
 						markCallbackCompleted();
 					});
 				},
@@ -305,12 +314,13 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 			await assistantEntered;
 			await callbackCompleted;
 			await prompt;
+			await harness.session.waitForClosed();
 
 			const messages = harness.sessionManager.buildSessionContext().messages;
 			expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
 			expect(messages.at(-1)).toMatchObject({
 				role: "assistant",
-				stopReason: "aborted",
+				stopReason: "stop",
 				diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
 			});
 		} finally {
@@ -329,8 +339,9 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 			const prompt = harness.session.prompt("admission race", { clientMessageId: "dispose-admission-race" });
 			await vi.waitFor(() => expect(flush).toHaveBeenCalledOnce());
 
-			const disposal = harness.session.dispose();
-			expect(flush).toHaveBeenCalledTimes(2);
+			harness.session.dispose();
+			const disposal = harness.session.waitForClosed();
+			expect(flush).toHaveBeenCalledOnce();
 			releaseFlush();
 			await disposal;
 			await expect(prompt).rejects.toThrow("disposed");
@@ -350,8 +361,10 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 		vi.spyOn(harness.sessionManager, "flush").mockReturnValue(flushGate);
 		try {
 			let settled = false;
-			const rawDisposal = harness.session.dispose();
-			expect(harness.session.dispose()).toBe(rawDisposal);
+			harness.session.dispose();
+			const rawDisposal = harness.session.waitForClosed();
+			harness.session.dispose();
+			expect(harness.session.waitForClosed()).toBe(rawDisposal);
 			const disposal = rawDisposal.then(() => {
 				settled = true;
 			});

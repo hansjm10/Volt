@@ -3,8 +3,8 @@
 "@hansjm10/volt-coding-agent": minor
 ---
 
-breaking(delivery): Delivery participants now receive the stable delivery identity, kind, and isolated reduced messages in their transaction context.
+breaking(delivery): Replaced delivery participants with stable owners, attempt-bound store receipts, and fence-first closure. ([#205](https://github.com/volt-hq/Volt/issues/205), [#207](https://github.com/volt-hq/Volt/issues/207), [#214](https://github.com/volt-hq/Volt/issues/214))
 
-Migrate `AgentDeliveryTransactionParticipant.settle()` implementations to persist `context.messages` instead of messages captured during `prepareDelivery`. `AgentDeliveryPreparation` fields and its message array are now readonly. Create a fresh participant on every preparation attempt with the same prepared payload; a changed replay payload is terminally fenced instead of retried.
+Replace `prepareDelivery` and transaction participants with an `AgentDeliveryOwner` installed before admission. Implement side-effect-free `prepareLogical()`, atomic `commitAttempt()`, and passive `finish()`; committed and retained outcomes require store-verifiable receipts bound to delivery ID, inbox epoch, attempt ID, and exact canonical projection delta.
 
-Prompt deliveries are now admitted before abortable preflight, completed system-prompt and message transformations survive retained retries, passive delivery lifecycle events publish only after canonical commitment, and disposal terminally fences the Harness while revoking all retained delivery and continuation state without joining an active callback.
+`AgentHarness.dispose()` is now a synchronous fence-only alias for `requestClose()`. Call `waitForClosed()` externally to join active operations, delivery settlement, notifications, and persistence. Owner callbacks may request abort or close but must not join closure from inside themselves.

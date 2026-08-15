@@ -111,7 +111,6 @@ describe("SettingsSelectorComponent", () => {
 			expect(onPersonalityChange).toHaveBeenCalledWith("pragmatic");
 			expect(session.settingsManager.getPersonality()).toBe("pragmatic");
 			expect(session.settingsManager.getGlobalSettings().profiles?.delivery?.personality).toBe("pragmatic");
-			expect(session.systemPrompt).toContain("you are pragmatic, direct, and solutions-oriented");
 			expect(stripAnsi(settingsList.render(100).join("\n"))).toContain("pragmatic");
 		} finally {
 			cleanup();

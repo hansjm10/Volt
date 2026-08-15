@@ -169,7 +169,8 @@ describe("AgentSession dispose inertness", () => {
 		expect(handlerCalls).toEqual(["before_provider_request"]);
 		expect(extensionErrors).toEqual([]);
 
-		const disposal = session.dispose();
+		session.dispose();
+		const disposal = session.waitForClosed();
 
 		// The disposed generation is inert: the handler must not run (its stale
 		// ctx would throw), and no extension_error may reach the listener,
@@ -200,7 +201,8 @@ describe("AgentSession dispose inertness", () => {
 		control.queueSteer({ role: "user", content: [{ type: "text", text: "steer me" }], timestamp: Date.now() });
 		expect(control.hasQueuedMessages()).toBe(true);
 
-		const disposal = session.dispose();
+		session.dispose();
+		const disposal = session.waitForClosed();
 
 		expect(ref.current).toBeUndefined();
 		expect(control.hasQueuedMessages()).toBe(false);

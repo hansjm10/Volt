@@ -85,8 +85,9 @@ describe("regression #199: approved plan finalization", () => {
 
 		const firstRun = harness.control.continue();
 		await preparationStarted.promise;
-		expect(await harness.control.clearSteeringQueue()).toHaveLength(1);
+		const clearing = harness.control.clearSteeringQueue();
 		releasePreparation.resolve();
+		expect(await clearing).toHaveLength(1);
 		await firstRun;
 
 		expect(harness.session.planningState.plan?.phase).toBe("ready");

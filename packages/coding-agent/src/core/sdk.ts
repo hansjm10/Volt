@@ -324,6 +324,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 		}
 	}
+	if (model) {
+		model = modelRegistry.find(model.provider, model.id) ?? model;
+	}
 
 	let thinkingLevel = options.thinkingLevel;
 
@@ -519,6 +522,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		mcpManager,
 		mcpManagerFactory: options.disableMcp || options.mcpManager ? undefined : createDefaultMcpManager,
 	});
+	const registeredModel = model ? modelRegistry.find(model.provider, model.id) : undefined;
+	if (registeredModel && registeredModel !== session.model) {
+		await session.setModel(registeredModel, { persistDefault: false });
+	}
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {

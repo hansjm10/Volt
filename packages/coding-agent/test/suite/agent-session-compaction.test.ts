@@ -287,11 +287,11 @@ describe("AgentSession compaction characterization", () => {
 		await expect(harness.session.compact()).rejects.toThrow("No model selected");
 	});
 
-	it("throws when compacting without configured auth", async () => {
+	it("rejects a too-small compaction before Harness provider admission", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 
-		await expect(harness.session.compact()).rejects.toThrow(`No API key found for ${harness.getModel().provider}.`);
+		await expect(harness.session.compact()).rejects.toThrow("Nothing to compact (session too small)");
 	});
 
 	it("manually compacts with a custom streamFn when registry auth is absent", async () => {

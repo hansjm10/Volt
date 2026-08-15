@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@hansjm10/volt-agent-core";
 import { type AssistantMessage, type AssistantMessageDiagnostic, fauxAssistantMessage } from "@hansjm10/volt-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { ExtensionHandler, MessageEndEvent, MessageEndEventResult } from "../../../src/core/extensions/types.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
@@ -172,9 +172,10 @@ describe("regression #199: abort provenance persistence", () => {
 
 		const prompt = harness.session.prompt("replace this session");
 		await responseStarted.promise;
-		await harness.session.dispose("session_replacement");
+		harness.session.dispose("session_replacement");
+		const disposal = harness.session.waitForClosed();
 		finishResponse.resolve();
-		await prompt;
+		await Promise.all([prompt, disposal]);
 
 		expect(persistedAssistantMessages(harness)).toHaveLength(1);
 		expect(persistedAssistantMessages(harness)[0]).toMatchObject({ stopReason: "aborted" });
@@ -186,7 +187,10 @@ describe("regression #199: abort provenance persistence", () => {
 		harnesses.push(harness);
 		let disposal: Promise<void> | undefined;
 		harness.session.subscribe((event) => {
-			if (event.type === "agent_start") disposal = harness.session.dispose("disposal");
+			if (event.type === "agent_start") {
+				harness.session.dispose("disposal");
+				disposal = harness.session.waitForClosed();
+			}
 		});
 
 		await harness.session.prompt("never admitted");
@@ -201,7 +205,10 @@ describe("regression #199: abort provenance persistence", () => {
 		harness.setResponses([fauxAssistantMessage("never requested")]);
 		let disposal: Promise<void> | undefined;
 		harness.session.subscribe((event) => {
-			if (event.type === "delivery_start") disposal = harness.session.dispose("disposal");
+			if (event.type === "delivery_start") {
+				harness.session.dispose("disposal");
+				disposal = harness.session.waitForClosed();
+			}
 		});
 
 		await harness.session.prompt("persist this admitted prompt", {
@@ -232,7 +239,8 @@ describe("regression #199: abort provenance persistence", () => {
 				messages: [...delivery.messages],
 				participant: {
 					settle: () => {
-						disposal = harness.session.dispose("disposal");
+						harness.session.dispose("disposal");
+						disposal = harness.session.waitForClosed();
 						return { outcome: "committed" };
 					},
 				},
@@ -272,7 +280,8 @@ describe("regression #199: abort provenance persistence", () => {
 				],
 				participant: {
 					settle: () => {
-						disposal = harness.session.dispose("disposal");
+						harness.session.dispose("disposal");
+						disposal = harness.session.waitForClosed();
 						return { outcome: "committed" };
 					},
 				},
@@ -304,7 +313,8 @@ describe("regression #199: abort provenance persistence", () => {
 				messages: [...delivery.messages],
 				participant: {
 					settle: () => {
-						disposal = harness.session.dispose("disposal");
+						harness.session.dispose("disposal");
+						disposal = harness.session.waitForClosed();
 						return { outcome: "retained", error: new Error("delivery settlement failed") };
 					},
 				},
@@ -312,7 +322,9 @@ describe("regression #199: abort provenance persistence", () => {
 		});
 		harnesses.push(harness);
 
-		await harness.session.prompt("do not admit this delivery");
+		// Retention is a settled, retryable delivery result rather than a thrown
+		// runtime failure. Disposal still drains that settlement before closing.
+		await expect(harness.session.prompt("do not admit this delivery")).resolves.toBeUndefined();
 		await disposal;
 
 		expect(harness.sessionManager.buildSessionContext().messages).toEqual([]);
@@ -330,8 +342,6 @@ describe("regression #199: abort provenance persistence", () => {
 				return fauxAssistantMessage("late response");
 			},
 		]);
-		const abortSpy = vi.spyOn(harness.session, "abort");
-
 		const prompt = harness.session.prompt("compact this active run");
 		await responseStarted.promise;
 		const compaction = harness.session.compact();
@@ -339,7 +349,7 @@ describe("regression #199: abort provenance persistence", () => {
 		await prompt;
 		await compaction.catch(() => undefined);
 
-		expect(abortSpy).toHaveBeenCalledWith("host_action");
+		expect(runtimeAbortSources(harness)).toEqual(["host_action"]);
 	});
 
 	it("attributes RPC compaction cancellation to a remote request", async () => {
@@ -355,8 +365,6 @@ describe("regression #199: abort provenance persistence", () => {
 				return fauxAssistantMessage("late response");
 			},
 		]);
-		const abortSpy = vi.spyOn(harness.session, "abort");
-
 		const prompt = harness.session.prompt("compact this RPC run");
 		await responseStarted.promise;
 		const compaction = harness.session.compact();
@@ -364,7 +372,7 @@ describe("regression #199: abort provenance persistence", () => {
 		await prompt;
 		await compaction.catch(() => undefined);
 
-		expect(abortSpy).toHaveBeenCalledWith("remote_request");
+		expect(runtimeAbortSources(harness)).toEqual(["remote_request"]);
 	});
 
 	it("deduplicates disposal against a terminal message_end still settling", async () => {
@@ -386,12 +394,13 @@ describe("regression #199: abort provenance persistence", () => {
 
 		const prompt = harness.session.prompt("race terminal persistence");
 		await terminalHandlerStarted.promise;
-		await harness.session.dispose("disposal");
+		harness.session.dispose("disposal");
+		const disposal = harness.session.waitForClosed();
 		finishTerminalHandler.resolve();
-		await prompt;
+		await Promise.all([prompt, disposal]);
 
 		expect(persistedAssistantMessages(harness)).toHaveLength(1);
-		expect(persistedAssistantMessages(harness)[0]).toMatchObject({ stopReason: "aborted" });
+		expect(persistedAssistantMessages(harness)[0]).toMatchObject({ stopReason: "stop" });
 		expect(runtimeAbortSources(harness)).toEqual(["disposal"]);
 	});
 
@@ -401,7 +410,8 @@ describe("regression #199: abort provenance persistence", () => {
 		harness.setResponses([fauxAssistantMessage("normal completion")]);
 
 		await harness.session.prompt("complete normally");
-		await harness.session.dispose("disposal");
+		harness.session.dispose("disposal");
+		await harness.session.waitForClosed();
 
 		expect(persistedAssistantMessages(harness)).toHaveLength(1);
 		expect(persistedAssistantMessages(harness)[0]).toMatchObject({

@@ -685,6 +685,7 @@ describe("web_fetch session integration", () => {
 		}
 
 		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("does not trust a parent-model task URL in a delegated child session", async () => {
@@ -721,6 +722,7 @@ describe("web_fetch session integration", () => {
 		expect(searchError).toBeInstanceOf(Error);
 		expect(searchError?.message).not.toContain(blocked);
 		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("preserves trusted URL provenance after compaction removes the source message from model context", async () => {
@@ -769,6 +771,7 @@ describe("web_fetch session integration", () => {
 		expect(error).toBeInstanceOf(Error);
 		expect(error?.message).not.toContain(blocked);
 		session.dispose();
+		await session.waitForClosed();
 	});
 });
 

@@ -17,11 +17,11 @@ import type {
 	AgentAbortSource,
 	AgentContext,
 	AgentDeliveryAttemptResult,
+	AgentDeliveryCommitOutcome,
 	AgentDeliveryFailure,
 	AgentDeliveryKind,
-	AgentDeliveryParticipantOutcome,
-	AgentDeliveryPreparation,
-	AgentDeliveryTransactionParticipant,
+	AgentDeliveryOwner,
+	AgentDeliveryPreparationOutcome,
 	AgentEvent,
 	AgentLoopConfig,
 	AgentLoopDelivery,
@@ -37,7 +37,6 @@ import type {
 	StreamFn,
 	ThinkingLevel,
 } from "../types.ts";
-import { AgentDeliveryPreparationReplayMismatchError } from "../types.ts";
 import { collectEntriesForBranchSummary, generateBranchSummary } from "./compaction/branch-summarization.ts";
 import {
 	compact,
@@ -46,6 +45,7 @@ import {
 	prepareCompaction,
 } from "./compaction/compaction.ts";
 import { createCustomMessage, convertToLlm as defaultConvertToLlm } from "./messages.ts";
+import { HarnessOperationCoordinator, type HarnessOperationLease } from "./operation-coordinator.ts";
 import { formatPromptTemplateInvocation } from "./prompt-templates.ts";
 import { formatSkillInvocation } from "./skills.ts";
 import type {
@@ -62,12 +62,16 @@ import type {
 	AgentHarnessRunOptions,
 	AgentHarnessStreamOptions,
 	AgentHarnessStreamOptionsPatch,
+	CanonicalCommitResult,
 	ExecutionEnv,
 	NavigateTreeResult,
 	PendingSessionWrite,
+	ProjectionAdvance,
+	ProjectionCursor,
 	PromptTemplate,
 	Session,
-	SessionTreeEntry,
+	SessionMutationBatch,
+	SessionMutationReceipt,
 	Skill,
 } from "./types.ts";
 import { AgentHarnessError, BranchSummaryError, CompactionError, SessionError, toError } from "./types.ts";
@@ -82,10 +86,43 @@ function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMessage[] {
 	return messages.map((message) => structuredClone(message));
 }
 
+function areStructurallyEqual(left: unknown, right: unknown): boolean {
+	if (Object.is(left, right)) return true;
+	if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) return false;
+	if (Array.isArray(left) || Array.isArray(right)) {
+		return (
+			Array.isArray(left) &&
+			Array.isArray(right) &&
+			left.length === right.length &&
+			left.every((value, index) => areStructurallyEqual(value, right[index]))
+		);
+	}
+	const leftKeys = Object.keys(left);
+	const rightKeys = Object.keys(right);
+	if (leftKeys.length !== rightKeys.length) return false;
+	return leftKeys.every(
+		(key) =>
+			Object.hasOwn(right, key) &&
+			areStructurallyEqual((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]),
+	);
+}
+
+function isSameModel(left: Model<any> | undefined, right: Model<any> | undefined): boolean {
+	return (
+		left === right ||
+		(left !== undefined &&
+			right !== undefined &&
+			left.provider === right.provider &&
+			left.id === right.id &&
+			left.api === right.api)
+	);
+}
+
 function cloneRunOptions(options: AgentHarnessRunOptions): AgentHarnessRunOptions {
 	return {
 		...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
 		...(options.context === undefined ? {} : { context: cloneAgentMessages(options.context) }),
+		...(options.deliveryOwner === undefined ? {} : { deliveryOwner: options.deliveryOwner }),
 	};
 }
 
@@ -142,38 +179,6 @@ function cloneNextActionContext(
 		requestAuthority: context.requestAuthority,
 		defaultAction: cloneNextAction(defaultAction),
 	};
-}
-
-function areStructurallyEqual(
-	left: unknown,
-	right: unknown,
-	leftSeen = new WeakMap<object, object>(),
-	rightSeen = new WeakMap<object, object>(),
-): boolean {
-	if (Object.is(left, right)) return true;
-	if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) return false;
-	if (Object.getPrototypeOf(left) !== Object.getPrototypeOf(right)) return false;
-	const priorRight = leftSeen.get(left);
-	const priorLeft = rightSeen.get(right);
-	if (priorRight !== undefined || priorLeft !== undefined) return priorRight === right && priorLeft === left;
-	leftSeen.set(left, right);
-	rightSeen.set(right, left);
-	if (left instanceof Date && right instanceof Date) return left.getTime() === right.getTime();
-	if (Array.isArray(left) || Array.isArray(right)) {
-		if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
-		return left.every((value, index) => areStructurallyEqual(value, right[index], leftSeen, rightSeen));
-	}
-	const prototype = Object.getPrototypeOf(left);
-	if (prototype !== Object.prototype && prototype !== null) return false;
-	const leftKeys = Object.keys(left);
-	const rightKeys = Object.keys(right);
-	if (leftKeys.length !== rightKeys.length) return false;
-	const rightRecord = right as Record<string, unknown>;
-	return leftKeys.every(
-		(key) =>
-			Object.hasOwn(right, key) &&
-			areStructurallyEqual((left as Record<string, unknown>)[key], rightRecord[key], leftSeen, rightSeen),
-	);
 }
 
 function createFailureMessage(model: Model<any>, error: unknown, aborted: boolean): AssistantMessage {
@@ -361,8 +366,10 @@ interface AgentHarnessContinuationState {
 
 interface AgentHarnessContextProjection {
 	token: AgentHarnessContextProjectionToken;
-	anchorLeafId: string | null;
-	messages: AgentMessage[];
+	basisCursor: ProjectionCursor;
+	ownedOverlayMessages: AgentMessage[];
+	overlayEpoch: number;
+	mode: "tail_append" | "replacement";
 	invalidError?: AgentHarnessError;
 }
 
@@ -378,15 +385,14 @@ interface AgentHarnessDeliveryPreparationState {
 
 interface AgentHarnessRunEventState {
 	id: string;
-	abortController: AbortController;
-	abortSource?: AgentAbortSource;
-	diagnosticTimestamp?: number;
+	operation: HarnessOperationLease;
 	requestAccepted: boolean;
 	deliverySettlement: Promise<void> | undefined;
 	deliveryOrder: Map<string, number>;
 	deliveryOutcomes: Map<string, AgentDeliveryAttemptResult>;
 	deliveryFailure?: AgentDeliveryFailure;
 	deliveryFailureDiagnostic?: AssistantMessageDiagnostic;
+	canonicalAuthorityRetired?: boolean;
 	observationalDeliveryIds: Set<string>;
 	admittedMessages: AgentMessage[];
 	admittedMessageSet: Set<AgentMessage>;
@@ -405,8 +411,17 @@ interface AgentHarnessRunEventState {
 
 interface AgentHarnessBoundedRun {
 	state: AgentHarnessRunEventState;
-	idlePromise: Promise<void>;
-	finishIdle(): void;
+	operation: HarnessOperationLease;
+}
+
+export interface AgentHarnessRunReservation {
+	readonly reservationId: string;
+}
+
+export interface AgentHarnessStructuralOperationContext {
+	readonly signal: AbortSignal;
+	readonly streamFn: StreamFn;
+	sealAndCommit(batch: SessionMutationBatch): Promise<CanonicalCommitResult>;
 }
 
 type PendingDelivery = InboxDelivery<AgentDeliveryKind, AgentMessage>;
@@ -442,6 +457,12 @@ interface AgentHarnessTurnState<
 	activeTools: TTool[];
 }
 
+function isTurnProviderRequestState(
+	state: AgentHarnessProviderRequestState,
+): state is AgentHarnessTurnState<Skill, PromptTemplate, AgentTool> {
+	return "messages" in state;
+}
+
 /**
  * Coordinates runtime policy, provider dispatch, queues, lifecycle, and persistence around the stateless agent loop.
  * Session owns canonical history, while structural helpers own summarization mechanics behind Harness-wrapped streams.
@@ -455,14 +476,21 @@ export class AgentHarness<
 > {
 	readonly env: ExecutionEnv;
 	private session: Session;
-	private phase: AgentHarnessPhase = "idle";
-	private disposed = false;
-	private disposePromise: Promise<void> | undefined;
+	private readonly operations = new HarnessOperationCoordinator();
+	private readonly closeDrains = new Set<Promise<void>>();
+	private readonly closeDrainErrors: Error[] = [];
+	private closePromise: Promise<void> | undefined;
+	private readonly runReservations = new Map<string, HarnessOperationLease>();
 	private activeRun: AgentHarnessRunEventState | undefined;
-	private runPromise: Promise<void> | undefined;
 	private pendingSessionWrites: PendingSessionWrite[] = [];
 	private model: Model<any> | undefined;
 	private thinkingLevel: ThinkingLevel;
+	private runtimeConfigurationEpoch = 0;
+	private runtimeConfigurationBarrier: Promise<void> = Promise.resolve();
+	private providerAdmissionBarrier: Promise<void> = Promise.resolve();
+	private releaseProviderAdmission: (() => void) | undefined;
+	private providerHookConfigurationAttempt = false;
+	private providerHookPendingWrites: PendingSessionWrite[] | undefined;
 	private readonly persistActiveToolChanges: boolean;
 	private readonly streamFn: StreamFn;
 	private readonly convertMessages: NonNullable<AgentHarnessOptions["convertToLlm"]>;
@@ -476,11 +504,16 @@ export class AgentHarness<
 		() => `harness-delivery:${globalThis.crypto.randomUUID()}`,
 	);
 	private activeDeliveryLease: DeliveryLease<AgentDeliveryKind, AgentMessage> | undefined;
+	private readonly leasedDeliveries = new Map<string, PendingDelivery>();
 	private readonly leasedDeliveryKinds = new Map<string, AgentDeliveryKind>();
-	private readonly deliveryAttemptParticipants = new Map<string, AgentDeliveryTransactionParticipant>();
+	private readonly leasedDeliveryEpochs = new Map<string, number>();
+	private readonly deliveryOwners = new Map<string, AgentDeliveryOwner>();
+	private readonly deliveryAttemptIds = new Map<string, string>();
+	private readonly deliveryPreparationSettlements = new Map<string, Promise<void>>();
+	private readonly deliveryOwnerFinalizationBarriers = new Map<string, Promise<void>>();
+	private readonly deliveryRevocationFinalizers = new Map<string, Promise<void>>();
 	private readonly deliveryPreparationStates = new Map<string, AgentHarnessDeliveryPreparationState>();
-	private readonly prepareDelivery: AgentHarnessOptions["prepareDelivery"];
-	private readonly deliveryRevoked: AgentHarnessOptions["deliveryRevoked"];
+	private readonly defaultDeliveryOwner: AgentDeliveryOwner;
 	private steeringQueueMode: QueueMode;
 	private followUpQueueMode: QueueMode;
 	private nextTurnQueue: AgentMessage[] = [];
@@ -498,8 +531,7 @@ export class AgentHarness<
 		this.getApiKeyAndHeaders = options.getApiKeyAndHeaders;
 		this.streamFn = options.streamFn ?? streamSimple;
 		this.convertMessages = options.convertToLlm ?? defaultConvertToLlm;
-		this.prepareDelivery = options.prepareDelivery;
-		this.deliveryRevoked = options.deliveryRevoked;
+		this.defaultDeliveryOwner = options.deliveryOwner ?? this.createDefaultDeliveryOwner();
 		this.validateUniqueNames(
 			(options.tools ?? []).map((tool) => tool.name),
 			"Duplicate tool name(s)",
@@ -519,8 +551,109 @@ export class AgentHarness<
 		this.followUpQueueMode = options.followUpMode ?? "one-at-a-time";
 	}
 
+	private createDefaultDeliveryOwner(): AgentDeliveryOwner {
+		return {
+			prepareLogical: (context) => ({
+				outcome: "prepared",
+				messages: cloneAgentMessages(context.sourceMessages),
+			}),
+			commitAttempt: async (context) => {
+				try {
+					const snapshot = await this.session.getBranchSnapshot();
+					const attribution = {
+						deliveryId: context.deliveryId,
+						epoch: context.epoch,
+						attemptId: context.attemptId,
+					};
+					const commit = await this.session.commitBatch({
+						guard: { kind: "exact", cursor: snapshot.cursor },
+						mutations: context.preparedMessages.map((message) => ({
+							kind: "append" as const,
+							entry: { type: "message" as const, message: structuredClone(message) },
+						})),
+						deliveryAttribution: attribution,
+					});
+					if (commit.outcome === "committed") return { outcome: "committed", receipt: commit.receipt };
+					if (commit.outcome === "uncertain") {
+						return { outcome: "terminally_failed", error: commit.error, authority: "retired" };
+					}
+					const current = await this.session.getBranchSnapshot();
+					const noEffect = await this.session.commitBatch({
+						guard: { kind: "descendant", cursor: current.cursor },
+						mutations: [],
+						deliveryAttribution: attribution,
+					});
+					if (noEffect.outcome === "committed") {
+						return { outcome: "retained", error: commit.error, noEffectReceipt: noEffect.receipt };
+					}
+					return {
+						outcome: "terminally_failed",
+						error: noEffect.error,
+						...(noEffect.outcome === "uncertain" ? { authority: "retired" as const } : {}),
+					};
+				} catch (error) {
+					return { outcome: "terminally_failed", error: toError(error) };
+				}
+			},
+			finish: () => undefined,
+		};
+	}
+
 	private assertNotDisposed(): void {
-		if (this.disposed) throw new AgentHarnessError("invalid_state", "AgentHarness is disposed");
+		if (!this.operations.isOpen) throw new AgentHarnessError("invalid_state", "AgentHarness is disposed");
+	}
+
+	private async waitForProviderAdmission(): Promise<void> {
+		await this.providerAdmissionBarrier;
+	}
+
+	private beginProviderAdmission(): void {
+		if (this.releaseProviderAdmission) {
+			throw new AgentHarnessError("invalid_state", "Provider admission is already active");
+		}
+		this.providerAdmissionBarrier = new Promise<void>((resolve) => {
+			this.releaseProviderAdmission = resolve;
+		});
+	}
+
+	private endProviderAdmission(): void {
+		const release = this.releaseProviderAdmission;
+		this.releaseProviderAdmission = undefined;
+		release?.();
+	}
+
+	private orderRuntimeConfigurationWrite(write: () => Promise<void>): Promise<void> {
+		const ordered = this.runtimeConfigurationBarrier.catch(() => {}).then(write);
+		this.runtimeConfigurationBarrier = ordered;
+		return ordered;
+	}
+
+	private trackCloseDrain(drain: Promise<void>): void {
+		this.closeDrains.add(drain);
+		void drain.then(
+			() => this.closeDrains.delete(drain),
+			(error) => {
+				this.closeDrains.delete(drain);
+				if (this.operations.isClosing) this.closeDrainErrors.push(toError(error));
+			},
+		);
+	}
+
+	private trackAdmittedMutation<TResult>(mutation: Promise<TResult>): Promise<TResult> {
+		this.trackCloseDrain(mutation.then(() => undefined));
+		return mutation;
+	}
+
+	private async drainClose(): Promise<void> {
+		await this.operations.waitForIdle();
+		for (;;) {
+			const drains = [...this.closeDrains];
+			if (drains.length === 0) break;
+			await Promise.allSettled(drains);
+		}
+		if (this.closeDrainErrors.length > 0) {
+			throw new AggregateError(this.closeDrainErrors, "AgentHarness close drains failed");
+		}
 	}
 
 	private getHandlers(type: string): Set<AgentHarnessHandler> | undefined {
@@ -598,7 +731,7 @@ export class AgentHarness<
 		for (const handler of handlers) {
 			try {
 				const result = await handler(structuredClone({ ...event, ...current }));
-				if (result?.block !== undefined) current.block = result.block;
+				if (result?.block === true) current.block = true;
 				if (result?.reason !== undefined) current.reason = result.reason;
 			} catch (error) {
 				throw normalizeHookError(error);
@@ -660,7 +793,7 @@ export class AgentHarness<
 		}
 		for (const handler of this.getHandlers("message_end") ?? []) {
 			try {
-				const result = await handler(structuredClone(current), state.abortController.signal);
+				const result = await handler(structuredClone(current), state.operation.abortGate.signal);
 				if (result?.message) {
 					if (result.message.role !== current.message.role) {
 						throw new AgentHarnessError("hook", "message_end hooks must preserve the message role");
@@ -683,7 +816,7 @@ export class AgentHarness<
 		context: AgentLoopNextActionContext,
 		initialAction: AgentLoopNextAction,
 	): Promise<AgentLoopNextAction> {
-		const signal = this.activeRun?.abortController.signal;
+		const signal = this.activeRun?.operation.abortGate.signal;
 		if (!signal) return cloneNextAction(initialAction);
 		let current = cloneNextAction(initialAction);
 		for (const handler of this.getHandlers("next_action") ?? []) {
@@ -716,10 +849,14 @@ export class AgentHarness<
 		sessionId: string,
 		streamOptions: AgentHarnessStreamOptions,
 		signal?: AbortSignal,
-	): Promise<AgentHarnessStreamOptions> {
+	): Promise<{
+		options: AgentHarnessStreamOptions;
+		patches: readonly AgentHarnessStreamOptionsPatch[];
+	}> {
 		const handlers = this.getHandlers("before_provider_request");
 		let current = cloneStreamOptions(streamOptions);
-		if (!handlers || handlers.size === 0) return current;
+		const patches: AgentHarnessStreamOptionsPatch[] = [];
+		if (!handlers || handlers.size === 0) return { options: current, patches };
 		for (const handler of handlers) {
 			if (signal?.aborted) break;
 			try {
@@ -730,7 +867,9 @@ export class AgentHarness<
 					streamOptions: cloneStreamOptions(current),
 				});
 				if (result?.streamOptions) {
-					current = applyStreamOptionsPatch(current, result.streamOptions);
+					const patch = structuredClone(result.streamOptions);
+					patches.push(patch);
+					current = applyStreamOptionsPatch(current, patch);
 				}
 				if (signal?.aborted) break;
 			} catch (error) {
@@ -738,7 +877,7 @@ export class AgentHarness<
 				throw normalizeHookError(error);
 			}
 		}
-		return current;
+		return { options: current, patches };
 	}
 
 	private async emitBeforeProviderPayload(model: Model<any>, payload: unknown): Promise<unknown> {
@@ -765,14 +904,17 @@ export class AgentHarness<
 			followUp: cloneAgentMessages(this.deliveryInbox.list("followUp").flatMap((delivery) => delivery.messages)),
 			nextTurn: cloneAgentMessages(this.nextTurnQueue),
 		};
-		if (passive) await this.emitPassive(event, this.activeRun?.abortController.signal);
-		else await this.emitOwn(event, this.activeRun?.abortController.signal);
+		if (passive) await this.emitPassive(event, this.activeRun?.operation.abortGate.signal);
+		else await this.emitOwn(event, this.activeRun?.operation.abortGate.signal);
 	}
 
-	private admitBoundedRun(): AgentHarnessBoundedRun {
+	private admitBoundedRun(operation?: HarnessOperationLease): AgentHarnessBoundedRun {
+		const admitted = operation ?? this.operations.reserve("turn");
+		if (!admitted) throw new AgentHarnessError("busy", "AgentHarness is busy");
+		this.operations.start(admitted);
 		const state: AgentHarnessRunEventState = {
-			id: `harness-run:${globalThis.crypto.randomUUID()}`,
-			abortController: new AbortController(),
+			id: admitted.id,
+			operation: admitted,
 			requestAccepted: false,
 			deliverySettlement: undefined,
 			deliveryOrder: new Map(),
@@ -791,21 +933,13 @@ export class AgentHarness<
 			terminalEmitted: false,
 			phase: "open",
 		};
-		let finishIdle = (): void => undefined;
-		const idlePromise = new Promise<void>((resolve) => {
-			finishIdle = resolve;
-		});
-		this.phase = "turn";
 		this.activeRun = state;
-		this.runPromise = idlePromise;
-		return { state, idlePromise, finishIdle };
+		return { state, operation: admitted };
 	}
 
 	private finishBoundedRun(run: AgentHarnessBoundedRun): void {
-		this.activeRun = undefined;
-		this.runPromise = undefined;
-		this.phase = "idle";
-		run.finishIdle();
+		if (this.activeRun === run.state) this.activeRun = undefined;
+		this.operations.finish(run.operation);
 	}
 
 	private async createTurnState(
@@ -875,63 +1009,194 @@ export class AgentHarness<
 	private createPolicyStreamFn(getRequestState: () => AgentHarnessProviderRequestState): StreamFn {
 		return async (model, context, streamOptions) => {
 			const signal = streamOptions?.signal;
-			if (signal?.aborted) return createAbortedAssistantStream(model);
+			if (signal?.aborted) {
+				return createAbortedAssistantStream(model);
+			}
 
 			const requestState = getRequestState();
-			let auth: { apiKey: string; headers?: Record<string, string>; env?: Record<string, string> } | undefined;
-			try {
-				auth = await this.getApiKeyAndHeaders?.(model);
-			} catch (error) {
+			let logicalHookWrites: PendingSessionWrite[] | undefined;
+			for (;;) {
+				const configurationBarrier = this.runtimeConfigurationBarrier;
+				await configurationBarrier;
 				if (signal?.aborted) return createAbortedAssistantStream(model);
-				throw error;
+				if (configurationBarrier !== this.runtimeConfigurationBarrier) continue;
+				const configurationEpoch = this.runtimeConfigurationEpoch;
+				const admittedModel = this.model ?? model;
+				let admittedContext = context;
+				let admittedReasoning = isTurnProviderRequestState(requestState)
+					? this.thinkingLevel === "off"
+						? undefined
+						: this.thinkingLevel
+					: streamOptions?.reasoning;
+				let admittedAuth:
+					| { apiKey: string; headers?: Record<string, string>; env?: Record<string, string> }
+					| undefined;
+				try {
+					admittedAuth = await this.getApiKeyAndHeaders?.(admittedModel);
+				} catch (error) {
+					if (signal?.aborted) return createAbortedAssistantStream(admittedModel);
+					throw error;
+				}
+				if (signal?.aborted) return createAbortedAssistantStream(admittedModel);
+				const headers = mergeHeaders(this.streamOptions.headers, admittedAuth?.headers);
+				const env = mergeHeaders(this.streamOptions.env, admittedAuth?.env);
+				const hookOptions: AgentHarnessStreamOptions = {
+					...this.streamOptions,
+					...(headers === undefined ? {} : { headers }),
+					...(env === undefined ? {} : { env }),
+				};
+				let hookResult: { patches: readonly AgentHarnessStreamOptionsPatch[] };
+				let hookWrites: PendingSessionWrite[] = [];
+				this.providerHookConfigurationAttempt = true;
+				this.providerHookPendingWrites = [];
+				try {
+					hookResult = await this.emitBeforeProviderRequest(
+						admittedModel,
+						requestState.sessionId,
+						hookOptions,
+						signal,
+					);
+				} finally {
+					hookWrites = this.providerHookPendingWrites ?? [];
+					this.providerHookPendingWrites = undefined;
+					this.providerHookConfigurationAttempt = false;
+				}
+				if (logicalHookWrites === undefined) {
+					logicalHookWrites = structuredClone(hookWrites);
+				} else if (!areStructurallyEqual(logicalHookWrites, hookWrites)) {
+					const error = new AgentHarnessError(
+						"invalid_state",
+						"before_provider_request produced different Harness mutations during configuration retry",
+					);
+					if (this.activeRun) this.activeRun.canonicalAuthorityRetired = true;
+					this.requestClose("session_replacement");
+					throw error;
+				}
+				if (signal?.aborted) return createAbortedAssistantStream(admittedModel);
+				if (
+					configurationEpoch !== this.runtimeConfigurationEpoch ||
+					configurationBarrier !== this.runtimeConfigurationBarrier
+				) {
+					continue;
+				}
+				let requestOptions = hookOptions;
+				for (const patch of hookResult.patches) {
+					requestOptions = applyStreamOptionsPatch(requestOptions, patch);
+				}
+				let hookCommitBasis: ProjectionCursor | undefined;
+				if (isTurnProviderRequestState(requestState)) {
+					await this.flushPendingSessionWrites();
+					const canonicalSnapshot = await this.session.getBranchSnapshot();
+					hookCommitBasis = canonicalSnapshot.cursor;
+					const projection = await this.requireValidContextProjection();
+					const baseMessages = projection ? projection.ownedOverlayMessages : canonicalSnapshot.context.messages;
+					const hookMessages = logicalHookWrites.flatMap((write) =>
+						write.type === "message" ? [write.message] : [],
+					);
+					const freshMessages = [...baseMessages, ...hookMessages];
+					const retainsPreparedPrefix =
+						requestState.messages.length <= freshMessages.length &&
+						requestState.messages.every((message, index) => areStructurallyEqual(message, freshMessages[index]));
+					const appendedMessages = freshMessages.slice(requestState.messages.length);
+					const llmMessages = retainsPreparedPrefix
+						? [
+								...context.messages,
+								...(appendedMessages.length === 0
+									? []
+									: await this.convertMessages(cloneAgentMessages(appendedMessages))),
+							]
+						: await this.convertMessages(cloneAgentMessages(freshMessages));
+					const activeTools = this.activeToolNames
+						.map((name) => this.tools.get(name))
+						.filter((tool): tool is TTool => tool !== undefined);
+					const preparedTools = context.tools ?? [];
+					const preparedToolsMatch =
+						preparedTools.length === requestState.activeTools.length &&
+						preparedTools.every((tool, index) => tool === requestState.activeTools[index]);
+					admittedContext = {
+						systemPrompt:
+							context.systemPrompt === requestState.systemPrompt
+								? requestState.systemPrompt
+								: (context.systemPrompt ?? requestState.systemPrompt),
+						messages: llmMessages,
+						tools: preparedToolsMatch ? activeTools : preparedTools,
+					};
+					admittedReasoning = this.thinkingLevel === "off" ? undefined : this.thinkingLevel;
+				} else if (logicalHookWrites.length > 0) {
+					hookCommitBasis = (await this.session.getBranchSnapshot()).cursor;
+				}
+				if (
+					configurationEpoch !== this.runtimeConfigurationEpoch ||
+					configurationBarrier !== this.runtimeConfigurationBarrier
+				) {
+					continue;
+				}
+				this.beginProviderAdmission();
+				if (configurationEpoch !== this.runtimeConfigurationEpoch) {
+					this.endProviderAdmission();
+					continue;
+				}
+				try {
+					if (logicalHookWrites.length > 0) {
+						if (!hookCommitBasis) {
+							throw new AgentHarnessError("invalid_state", "Provider hook mutation basis is unavailable");
+						}
+						const commit = await this.session.commitBatch({
+							guard: { kind: "exact", cursor: hookCommitBasis },
+							mutations: logicalHookWrites.map((entry) => ({ kind: "append" as const, entry })),
+						});
+						if (commit.outcome === "rolled_back") {
+							this.endProviderAdmission();
+							continue;
+						}
+						if (commit.outcome === "uncertain") {
+							if (this.activeRun) this.activeRun.canonicalAuthorityRetired = true;
+							this.requestClose("session_replacement");
+							throw commit.error;
+						}
+						this.applyVerifiedProjectionAdvance(commit.advance);
+					}
+					if (signal?.aborted) return createAbortedAssistantStream(admittedModel);
+					const response = this.streamFn(admittedModel, admittedContext, {
+						...(requestOptions.cacheRetention === undefined
+							? {}
+							: { cacheRetention: requestOptions.cacheRetention }),
+						...(requestOptions.env === undefined ? {} : { env: requestOptions.env }),
+						...(requestOptions.headers === undefined ? {} : { headers: requestOptions.headers }),
+						...(requestOptions.inferenceSpeed === undefined
+							? {}
+							: { inferenceSpeed: requestOptions.inferenceSpeed }),
+						...(requestOptions.maxRetries === undefined ? {} : { maxRetries: requestOptions.maxRetries }),
+						...(requestOptions.maxRetryDelayMs === undefined
+							? {}
+							: { maxRetryDelayMs: requestOptions.maxRetryDelayMs }),
+						...(requestOptions.metadata === undefined ? {} : { metadata: requestOptions.metadata }),
+						...(requestOptions.thinkingBudgets === undefined
+							? {}
+							: { thinkingBudgets: requestOptions.thinkingBudgets }),
+						onPayload: async (payload) => await this.emitBeforeProviderPayload(admittedModel, payload),
+						onResponse: async (response) => {
+							const headers = { ...(response.headers as Record<string, string>) };
+							await this.emitOwn({ type: "after_provider_response", status: response.status, headers }, signal);
+						},
+						...(streamOptions?.maxTokens === undefined ? {} : { maxTokens: streamOptions.maxTokens }),
+						...(admittedReasoning === undefined ? {} : { reasoning: admittedReasoning }),
+						...(signal === undefined ? {} : { signal }),
+						sessionId: requestState.sessionId,
+						...(streamOptions?.temperature === undefined ? {} : { temperature: streamOptions.temperature }),
+						...(requestOptions.timeoutMs === undefined ? {} : { timeoutMs: requestOptions.timeoutMs }),
+						...(requestOptions.transport === undefined ? {} : { transport: requestOptions.transport }),
+						...(requestOptions.websocketConnectTimeoutMs === undefined
+							? {}
+							: { websocketConnectTimeoutMs: requestOptions.websocketConnectTimeoutMs }),
+						...(admittedAuth?.apiKey === undefined ? {} : { apiKey: admittedAuth.apiKey }),
+					});
+					this.endProviderAdmission();
+					return response;
+				} finally {
+					if (this.releaseProviderAdmission) this.endProviderAdmission();
+				}
 			}
-			if (signal?.aborted) return createAbortedAssistantStream(model);
-
-			const headers = mergeHeaders(requestState.streamOptions.headers, auth?.headers);
-			const env = mergeHeaders(requestState.streamOptions.env, auth?.env);
-			const snapshotOptions: AgentHarnessStreamOptions = {
-				...requestState.streamOptions,
-				...(headers === undefined ? {} : { headers }),
-				...(env === undefined ? {} : { env }),
-			};
-			const requestOptions = await this.emitBeforeProviderRequest(
-				model,
-				requestState.sessionId,
-				snapshotOptions,
-				signal,
-			);
-			if (signal?.aborted) return createAbortedAssistantStream(model);
-
-			return await this.streamFn(model, context, {
-				...(requestOptions.cacheRetention === undefined ? {} : { cacheRetention: requestOptions.cacheRetention }),
-				...(requestOptions.env === undefined ? {} : { env: requestOptions.env }),
-				...(requestOptions.headers === undefined ? {} : { headers: requestOptions.headers }),
-				...(requestOptions.inferenceSpeed === undefined ? {} : { inferenceSpeed: requestOptions.inferenceSpeed }),
-				...(requestOptions.maxRetries === undefined ? {} : { maxRetries: requestOptions.maxRetries }),
-				...(requestOptions.maxRetryDelayMs === undefined
-					? {}
-					: { maxRetryDelayMs: requestOptions.maxRetryDelayMs }),
-				...(requestOptions.metadata === undefined ? {} : { metadata: requestOptions.metadata }),
-				...(requestOptions.thinkingBudgets === undefined
-					? {}
-					: { thinkingBudgets: requestOptions.thinkingBudgets }),
-				onPayload: async (payload) => await this.emitBeforeProviderPayload(model, payload),
-				onResponse: async (response) => {
-					const headers = { ...(response.headers as Record<string, string>) };
-					await this.emitOwn({ type: "after_provider_response", status: response.status, headers }, signal);
-				},
-				...(streamOptions?.maxTokens === undefined ? {} : { maxTokens: streamOptions.maxTokens }),
-				...(streamOptions?.reasoning === undefined ? {} : { reasoning: streamOptions.reasoning }),
-				...(signal === undefined ? {} : { signal }),
-				sessionId: requestState.sessionId,
-				...(streamOptions?.temperature === undefined ? {} : { temperature: streamOptions.temperature }),
-				...(requestOptions.timeoutMs === undefined ? {} : { timeoutMs: requestOptions.timeoutMs }),
-				...(requestOptions.transport === undefined ? {} : { transport: requestOptions.transport }),
-				...(requestOptions.websocketConnectTimeoutMs === undefined
-					? {}
-					: { websocketConnectTimeoutMs: requestOptions.websocketConnectTimeoutMs }),
-				...(auth?.apiKey === undefined ? {} : { apiKey: auth.apiKey }),
-			});
 		};
 	}
 
@@ -976,177 +1241,66 @@ export class AgentHarness<
 			const projection = this.contextProjection;
 			if (!projection) return undefined;
 			if (projection.invalidError) throw projection.invalidError;
-			let currentLeafId: string | null;
+			let advance: ProjectionAdvance;
 			try {
-				currentLeafId = await this.session.getLeafId();
+				advance = await this.session.advanceProjection(projection.basisCursor);
 			} catch (error) {
 				if (this.contextProjection !== projection) continue;
 				throw this.recordContextProjectionInvalid(projection, normalizeHarnessError(error, "session"));
 			}
 			if (this.contextProjection !== projection) continue;
-			if (currentLeafId !== projection.anchorLeafId) {
-				let branch: SessionTreeEntry[];
-				try {
-					branch = currentLeafId === null ? [] : await this.session.getBranch(currentLeafId);
-				} catch (error) {
-					if (this.contextProjection !== projection) continue;
-					throw this.recordContextProjectionInvalid(projection, normalizeHarnessError(error, "session"));
-				}
-				if (this.contextProjection !== projection) continue;
-				const anchorIndex =
-					projection.anchorLeafId === null
-						? -1
-						: branch.findIndex((entry) => entry.id === projection.anchorLeafId);
-				const appendedEntries = branch.slice(anchorIndex + 1);
-				if (
-					(projection.anchorLeafId !== null && anchorIndex === -1) ||
-					appendedEntries.some((entry) => entry.type !== "label" && entry.type !== "session_info")
-				) {
-					throw this.recordContextProjectionInvalid(projection, this.staleContextProjectionError());
-				}
-				// Labels and session metadata extend canonical history without changing
-				// provider context. Advance only the validation watermark; all other
-				// external writes remain fail-closed.
-				this.contextProjection = { ...projection, anchorLeafId: currentLeafId };
-				continue;
+			if (advance.branchRelation === "diverged" || advance.messages.kind === "rewrite") {
+				throw this.recordContextProjectionInvalid(projection, this.staleContextProjectionError());
 			}
-			return projection;
-		}
-	}
-
-	private async advanceContextProjection(entryId: string, messages: readonly AgentMessage[] = []): Promise<void> {
-		const initialProjection = this.contextProjection;
-		if (!initialProjection || initialProjection.invalidError) return;
-		let appendedMessages: AgentMessage[];
-		try {
-			appendedMessages = cloneAgentMessages(messages);
-		} catch (error) {
-			this.recordContextProjectionInvalid(
-				initialProjection,
-				new AgentHarnessError(
-					"invalid_state",
-					"Continuation context projection could not own persisted messages",
-					toError(error),
-				),
-			);
-			return;
-		}
-		const token = initialProjection.token;
-		for (;;) {
-			const projection = this.contextProjection;
-			if (!projection || projection.token !== token || projection.invalidError) return;
-			if (projection.anchorLeafId === entryId) return;
-			let branch: SessionTreeEntry[];
-			try {
-				branch = await this.session.getBranch(entryId);
-			} catch (error) {
-				const currentProjection = this.contextProjection;
-				if (currentProjection !== projection) {
-					if (currentProjection?.token === token && !currentProjection.invalidError) continue;
-					return;
-				}
-				this.recordContextProjectionInvalid(projection, normalizeHarnessError(error, "session"));
-				return;
-			}
-			const currentProjection = this.contextProjection;
-			if (currentProjection !== projection) {
-				if (currentProjection?.token === token && !currentProjection.invalidError) continue;
-				return;
-			}
-			const anchorIndex =
-				projection.anchorLeafId === null ? -1 : branch.findIndex((entry) => entry.id === projection.anchorLeafId);
-			const appendedEntries = branch.slice(anchorIndex + 1);
-			const interveningEntries = appendedEntries.slice(0, -1);
-			if (
-				(projection.anchorLeafId === null && branch[0]?.parentId !== null) ||
-				(projection.anchorLeafId !== null && anchorIndex === -1) ||
-				appendedEntries.at(-1)?.id !== entryId ||
-				interveningEntries.some((entry) => entry.type !== "label" && entry.type !== "session_info")
-			) {
-				this.recordContextProjectionInvalid(projection, this.staleContextProjectionError());
-				return;
-			}
-			this.contextProjection = {
+			const updated: AgentHarnessContextProjection = {
 				...projection,
-				anchorLeafId: entryId,
-				messages: [...projection.messages, ...appendedMessages],
+				basisCursor: advance.cursor,
+				ownedOverlayMessages:
+					advance.messages.kind === "append"
+						? [...projection.ownedOverlayMessages, ...cloneAgentMessages(advance.messages.values)]
+						: projection.ownedOverlayMessages,
+				overlayEpoch: projection.overlayEpoch + 1,
 			};
-			return;
+			this.contextProjection = updated;
+			return updated;
 		}
 	}
 
-	private async advanceContextProjectionToLeaf(
-		anchorLeafId: string | null,
-		messages: readonly AgentMessage[],
-	): Promise<void> {
-		const projection = this.contextProjection;
-		if (!projection || projection.invalidError) return;
-		let appendedMessages: AgentMessage[];
-		try {
-			appendedMessages = cloneAgentMessages(messages);
-		} catch (error) {
-			this.recordContextProjectionInvalid(
-				projection,
-				new AgentHarnessError(
-					"invalid_state",
-					"Continuation context projection could not own persisted messages",
-					toError(error),
-				),
-			);
-			return;
-		}
-		let branch: SessionTreeEntry[];
-		try {
-			branch = anchorLeafId === null ? [] : await this.session.getBranch(anchorLeafId);
-		} catch (error) {
-			if (this.contextProjection === projection) {
-				this.recordContextProjectionInvalid(projection, normalizeHarnessError(error, "session"));
-			}
-			return;
-		}
-		if (this.contextProjection !== projection) return;
-		const extendsProjection =
-			projection.anchorLeafId === null
-				? branch.length === 0 || branch[0]?.parentId === null
-				: branch.some((entry) => entry.id === projection.anchorLeafId);
-		if (!extendsProjection) {
-			this.recordContextProjectionInvalid(projection, this.staleContextProjectionError());
-			return;
-		}
-		this.contextProjection = {
-			...projection,
-			anchorLeafId,
-			messages: [...projection.messages, ...appendedMessages],
-		};
+	private async advanceContextProjection(_entryId?: string, _messages?: readonly AgentMessage[]): Promise<void> {
+		if (!this.contextProjection) return;
+		await this.requireValidContextProjection();
 	}
 
 	async rebaseContinuationContext(
 		options: AgentHarnessContextRebaseOptions,
 	): Promise<AgentHarnessContextProjectionToken> {
 		this.assertNotDisposed();
-		try {
-			const canonicalContext = await this.session.buildContext();
-			const canonicalMessages = Object.freeze(cloneAgentMessages(canonicalContext.messages));
-			const projectedMessages = options.project ? options.project(canonicalMessages) : canonicalMessages;
-			const ownedMessages = cloneAgentMessages(projectedMessages);
-			const currentLeafId = await this.session.getLeafId();
-			if (currentLeafId !== canonicalContext.anchorLeafId) {
-				throw new AgentHarnessError("invalid_state", "Session branch changed while rebasing continuation context");
+		const source = options.source;
+		const project = options.project;
+		const mutation = (async () => {
+			try {
+				const snapshot = await this.session.getBranchSnapshot();
+				const canonicalMessages = Object.freeze(cloneAgentMessages(snapshot.context.messages));
+				const projectedMessages = project ? project(canonicalMessages) : canonicalMessages;
+				const ownedMessages = cloneAgentMessages(projectedMessages);
+				const token = Object.freeze({
+					projectionId: `harness-context:${globalThis.crypto.randomUUID()}`,
+					source,
+					anchorLeafId: snapshot.cursor.branchIdentity,
+				});
+				this.contextProjection = {
+					token,
+					basisCursor: snapshot.cursor,
+					ownedOverlayMessages: ownedMessages,
+					overlayEpoch: (this.contextProjection?.overlayEpoch ?? 0) + 1,
+					mode: source === "compaction" ? "replacement" : "tail_append",
+				};
+				return token;
+			} catch (error) {
+				throw normalizeHarnessError(error, "session");
 			}
-			const token = Object.freeze({
-				projectionId: `harness-context:${globalThis.crypto.randomUUID()}`,
-				source: options.source,
-				anchorLeafId: canonicalContext.anchorLeafId,
-			});
-			this.contextProjection = {
-				token,
-				anchorLeafId: canonicalContext.anchorLeafId,
-				messages: ownedMessages,
-			};
-			return token;
-		} catch (error) {
-			throw normalizeHarnessError(error, "session");
-		}
+		})();
+		return await this.trackAdmittedMutation(mutation);
 	}
 
 	clearContinuationContext(token: AgentHarnessContextProjectionToken): boolean {
@@ -1179,7 +1333,7 @@ export class AgentHarness<
 			systemPrompt,
 		};
 
-		if (run.abortController.signal.aborted) {
+		if (run.operation.abortGate.signal.aborted) {
 			this.promoteContinuationCandidate(run);
 			return { type: "pause", requestAuthority };
 		}
@@ -1241,36 +1395,13 @@ export class AgentHarness<
 		};
 	}
 
-	private terminallyFailPreparationReplay(
-		lease: DeliveryLease<AgentDeliveryKind, AgentMessage>,
-		delivery: PendingDelivery,
-		error: AgentDeliveryPreparationReplayMismatchError,
-	): void {
-		if (this.activeDeliveryLease !== lease || !lease.canPrepare(delivery.deliveryId)) {
-			throw new AgentHarnessError(
-				"invalid_state",
-				`Delivery preparation replay lost AgentHarness ownership: ${delivery.deliveryId}`,
-			);
-		}
-		if (!lease.begin(delivery.deliveryId) || !lease.settle(delivery.deliveryId, "terminally_failed")) {
-			throw new AgentHarnessError(
-				"invalid_state",
-				`Delivery preparation replay could not be terminally fenced: ${delivery.deliveryId}`,
-			);
-		}
-		this.deliveryAttemptParticipants.delete(delivery.deliveryId);
-		this.deliveryPreparationStates.delete(delivery.deliveryId);
-		this.continuationState = undefined;
-		if (this.activeRun) delete this.activeRun.continuationCandidate;
-		this.invalidateContinuationContext();
-		this.recordDeliveryFailure(delivery, "preparation", "terminally_failed", error);
-	}
-
 	private async prepareLeasedDeliveries(selected: PendingDelivery[]): Promise<AgentLoopDelivery[]> {
 		const lease = this.deliveryInbox.lease(selected);
 		this.activeDeliveryLease = lease;
 		for (const delivery of lease.deliveries) {
+			this.leasedDeliveries.set(delivery.deliveryId, delivery);
 			this.leasedDeliveryKinds.set(delivery.deliveryId, delivery.kind);
+			this.leasedDeliveryEpochs.set(delivery.deliveryId, delivery.epoch);
 			const run = this.activeRun;
 			if (run && !run.deliveryOrder.has(delivery.deliveryId)) {
 				run.deliveryOrder.set(delivery.deliveryId, run.deliveryOrder.size);
@@ -1279,58 +1410,75 @@ export class AgentHarness<
 
 		const run = this.activeRun;
 		if (!run) throw new AgentHarnessError("invalid_state", "Delivery preparation requires an active run");
-		const signal = run.abortController.signal;
+		const signal = run.operation.abortGate.signal;
 		const deliveries: AgentLoopDelivery[] = [];
 		for (const delivery of lease.deliveries) {
-			if (!lease.canPrepare(delivery.deliveryId)) continue;
+			const attempt = lease.prepare(delivery.deliveryId);
+			if (!attempt) continue;
+			this.deliveryAttemptIds.set(delivery.deliveryId, attempt.attemptId);
+			const owner = this.deliveryOwners.get(delivery.deliveryId);
+			if (!owner) {
+				throw new AgentHarnessError("delivery", `Delivery ${delivery.deliveryId} has no owner`);
+			}
 			const preparationState = this.deliveryPreparationStates.get(delivery.deliveryId) ?? {};
 			if (!this.deliveryPreparationStates.has(delivery.deliveryId)) {
 				this.deliveryPreparationStates.set(delivery.deliveryId, preparationState);
 			}
 			const sourceMessages = preparationState.preflight?.messages ?? delivery.messages;
-			let preparation: AgentDeliveryPreparation;
-			try {
-				preparation = this.prepareDelivery
-					? await this.prepareDelivery(
-							{
-								deliveryId: delivery.deliveryId,
-								kind: delivery.kind,
-								messages: cloneAgentMessages(sourceMessages),
-							},
+			if (preparationState.preparedMessages === undefined) {
+				let preparation: AgentDeliveryPreparationOutcome;
+				let resolvePreparationSettlement = (): void => undefined;
+				const preparationSettlement = new Promise<void>((resolve) => {
+					resolvePreparationSettlement = resolve;
+				});
+				this.deliveryPreparationSettlements.set(delivery.deliveryId, preparationSettlement);
+				try {
+					preparation = await owner.prepareLogical(
+						Object.freeze({
+							deliveryId: delivery.deliveryId,
+							kind: delivery.kind,
+							epoch: delivery.epoch,
+							attemptId: attempt.attemptId,
+							sourceMessages: Object.freeze(cloneAgentMessages(sourceMessages)),
 							signal,
-						)
-					: { messages: cloneAgentMessages(sourceMessages) };
-			} catch (error) {
-				if (!lease.canPrepare(delivery.deliveryId)) continue;
-				if (error instanceof AgentDeliveryPreparationReplayMismatchError) {
-					this.terminallyFailPreparationReplay(lease, delivery, error);
-					throw error;
+							requestAbort: (source?: AgentAbortSource) => this.abort(source),
+							requestClose: (source?: AgentAbortSource) => this.requestClose(source),
+						}),
+					);
+				} catch (error) {
+					preparation = { outcome: "terminally_failed" as const, error: toError(error) };
 				}
-				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
-				throw error;
+				resolvePreparationSettlement();
+				if (this.deliveryPreparationSettlements.get(delivery.deliveryId) === preparationSettlement) {
+					this.deliveryPreparationSettlements.delete(delivery.deliveryId);
+				}
+				if (!lease.owns(delivery.deliveryId)) continue;
+				if (preparation.outcome !== "prepared") {
+					await this.settlePreparationFailure(
+						lease,
+						delivery,
+						attempt.attemptId,
+						preparation.outcome,
+						preparation.error,
+					);
+					return deliveries;
+				}
+				let ownedMessages: AgentMessage[];
+				try {
+					ownedMessages = cloneAgentMessages(preparation.messages);
+				} catch (error) {
+					const failure = toError(error);
+					await this.settlePreparationFailure(lease, delivery, attempt.attemptId, "terminally_failed", failure);
+					return deliveries;
+				}
+				if (ownedMessages.length === 0) {
+					const error = new Error("Delivery preparation must retain at least one message");
+					await this.settlePreparationFailure(lease, delivery, attempt.attemptId, "terminally_failed", error);
+					return deliveries;
+				}
+				preparationState.preparedMessages = ownedMessages;
 			}
-			if (this.activeDeliveryLease !== lease || !lease.canPrepare(delivery.deliveryId)) continue;
-			let preparedMessages: AgentMessage[];
-			try {
-				preparedMessages = cloneAgentMessages(preparation.messages);
-			} catch (error) {
-				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
-				throw error;
-			}
-			if (preparedMessages.length === 0) {
-				const error = new Error("prepareDelivery must retain at least one message for an admitted delivery");
-				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
-				throw error;
-			}
-			if (
-				preparationState.preparedMessages !== undefined &&
-				!areStructurallyEqual(preparationState.preparedMessages, preparedMessages)
-			) {
-				const error = new AgentDeliveryPreparationReplayMismatchError(delivery.deliveryId);
-				this.terminallyFailPreparationReplay(lease, delivery, error);
-				throw error;
-			}
-			preparationState.preparedMessages ??= cloneAgentMessages(preparedMessages);
+			const preparedMessages = preparationState.preparedMessages;
 			if (preparationState.reducedMessages === undefined) {
 				try {
 					const reducedMessages: AgentMessage[] = [];
@@ -1341,17 +1489,15 @@ export class AgentHarness<
 						);
 						reducedMessages.push(structuredClone(reduced.message));
 					}
-					if (this.activeDeliveryLease !== lease || !lease.canPrepare(delivery.deliveryId)) continue;
+					if (this.activeDeliveryLease !== lease || !lease.owns(delivery.deliveryId)) continue;
 					preparationState.reducedMessages = cloneAgentMessages(reducedMessages);
 				} catch (error) {
-					if (!lease.canPrepare(delivery.deliveryId)) continue;
-					this.recordDeliveryFailure(delivery, "preparation", "retained", error);
-					throw error;
+					if (!lease.owns(delivery.deliveryId)) continue;
+					await this.settlePreparationFailure(lease, delivery, attempt.attemptId, "terminally_failed", error);
+					return deliveries;
 				}
 			}
-			if (preparation.participant) {
-				this.deliveryAttemptParticipants.set(delivery.deliveryId, preparation.participant);
-			}
+			if (!lease.completePreparation(delivery.deliveryId, attempt.attemptId, "prepared")) continue;
 			deliveries.push({
 				deliveryId: delivery.deliveryId,
 				messages: cloneAgentMessages(preparationState.reducedMessages),
@@ -1361,12 +1507,20 @@ export class AgentHarness<
 	}
 
 	private async beginActiveDelivery(delivery: AgentLoopDelivery): Promise<AgentLoopDeliveryOutcome> {
-		if (this.disposed) return { outcome: "revoked" };
+		if (!this.operations.isOpen) return { outcome: "revoked" };
 		if (delivery.deliveryId === undefined) return { outcome: "committed" };
 		const kind = this.leasedDeliveryKinds.get(delivery.deliveryId);
 		if (kind === undefined) return { outcome: "committed" };
 		const lease = this.activeDeliveryLease;
-		if (!lease?.owns(delivery.deliveryId) || !lease.begin(delivery.deliveryId)) {
+		const attemptId = this.deliveryAttemptIds.get(delivery.deliveryId);
+		const owner = this.deliveryOwners.get(delivery.deliveryId);
+		if (!lease?.owns(delivery.deliveryId) || !attemptId || !owner) {
+			this.recordDeliveryOutcome({ deliveryId: delivery.deliveryId, kind, outcome: "revoked" });
+			return { outcome: "revoked" };
+		}
+		// All fallible projection validation happens before the irrevocable cutoff.
+		await this.requireValidContextProjection();
+		if (!lease.beginCommit(delivery.deliveryId, attemptId)) {
 			this.recordDeliveryOutcome({ deliveryId: delivery.deliveryId, kind, outcome: "revoked" });
 			return { outcome: "revoked" };
 		}
@@ -1379,36 +1533,58 @@ export class AgentHarness<
 		});
 		if (run) run.deliverySettlement = settlement;
 
-		let outcome: AgentDeliveryParticipantOutcome;
-		const participant = this.deliveryAttemptParticipants.get(delivery.deliveryId);
+		let outcome: AgentDeliveryCommitOutcome;
 		try {
-			await this.requireValidContextProjection();
-			if (participant) {
-				try {
-					outcome = await participant.settle(
-						Object.freeze({
-							deliveryId: delivery.deliveryId,
-							kind,
-							messages: Object.freeze(cloneAgentMessages(delivery.messages)),
-							requestAbort: (source?: AgentAbortSource) => this.abort(source),
-						}),
-					);
-				} catch (error) {
-					outcome = { outcome: "terminally_failed", error: toError(error) };
-				}
-			} else {
-				try {
-					for (const message of delivery.messages) {
-						const entryId = await this.session.appendMessage(message);
-						await this.advanceContextProjection(entryId, [message]);
-					}
-					outcome = { outcome: "committed" };
-				} catch (error) {
-					outcome = { outcome: "terminally_failed", error: toError(error) };
+			try {
+				outcome = await owner.commitAttempt(
+					Object.freeze({
+						deliveryId: delivery.deliveryId,
+						kind,
+						epoch: this.leasedDeliveryEpochs.get(delivery.deliveryId) ?? 0,
+						attemptId,
+						preparedMessages: Object.freeze(cloneAgentMessages(delivery.messages)),
+						signal: run?.operation.abortGate.signal ?? new AbortController().signal,
+						requestAbort: (source?: AgentAbortSource) => this.abort(source),
+						requestClose: (source?: AgentAbortSource) => this.requestClose(source),
+					}),
+				);
+			} catch (error) {
+				outcome = { outcome: "terminally_failed", error: toError(error) };
+			}
+			if (outcome.outcome === "terminally_failed" && outcome.authority === "retired") {
+				if (run) run.canonicalAuthorityRetired = true;
+				this.requestClose("session_replacement");
+			}
+			const verified = this.verifyDeliveryOutcome(
+				delivery.deliveryId,
+				kind,
+				this.leasedDeliveryEpochs.get(delivery.deliveryId) ?? 0,
+				attemptId,
+				delivery.messages,
+				outcome,
+			);
+			outcome = verified.outcome;
+			const ownedDelivery = this.leasedDeliveries.get(delivery.deliveryId);
+			const finishError = ownedDelivery
+				? await this.finishDeliveryOwner(ownedDelivery, attemptId, outcome)
+				: undefined;
+			if (finishError) {
+				if (outcome.outcome === "committed") {
+					this.invalidateContinuationContext();
+					this.closeDrainErrors.push(finishError);
+					this.requestClose("session_replacement");
+				} else {
+					outcome = {
+						outcome: "terminally_failed",
+						error: new AggregateError(
+							["error" in outcome ? outcome.error : new Error("Delivery failed"), finishError],
+							"Delivery outcome and owner finalization failed",
+						),
+					};
 				}
 			}
 
-			if (!lease.settle(delivery.deliveryId, outcome.outcome)) {
+			if (!lease.settleCommit(delivery.deliveryId, attemptId, outcome.outcome)) {
 				outcome = {
 					outcome: "terminally_failed",
 					error: new Error(`Delivery settlement lost AgentHarness ownership: ${delivery.deliveryId}`),
@@ -1430,29 +1606,158 @@ export class AgentHarness<
 			}
 			if (outcome.outcome === "committed") {
 				run?.observationalDeliveryIds.add(delivery.deliveryId);
-				if (participant) {
-					let committedLeafId: string | null | undefined;
-					try {
-						committedLeafId = await this.session.getLeafId();
-					} catch (error) {
-						const projection = this.contextProjection;
-						if (projection) {
-							this.recordContextProjectionInvalid(projection, normalizeHarnessError(error, "session"));
-						}
-					}
-					if (committedLeafId !== undefined) {
-						await this.advanceContextProjectionToLeaf(committedLeafId, delivery.messages);
-					}
-				}
+				if (verified.advance) this.applyVerifiedProjectionAdvance(verified.advance);
 			}
 			return outcome;
 		} finally {
-			this.deliveryAttemptParticipants.delete(delivery.deliveryId);
+			this.deliveryAttemptIds.delete(delivery.deliveryId);
 			finishSettlement();
 			if (run && this.activeRun === run && run.deliverySettlement === settlement) {
 				run.deliverySettlement = undefined;
 			}
 		}
+	}
+
+	private verifyDeliveryOutcome(
+		deliveryId: string,
+		_kind: AgentDeliveryKind,
+		epoch: number,
+		attemptId: string,
+		messages: readonly AgentMessage[],
+		outcome: AgentDeliveryCommitOutcome,
+	): { outcome: AgentDeliveryCommitOutcome; advance?: ProjectionAdvance } {
+		if (outcome.outcome === "terminally_failed") return { outcome };
+		const rawReceipt = outcome.outcome === "committed" ? outcome.receipt : outcome.noEffectReceipt;
+		const resolved = this.session.resolveMutationReceipt(rawReceipt as SessionMutationReceipt);
+		const attribution = resolved?.deliveryAttribution;
+		const attributed =
+			attribution?.deliveryId === deliveryId && attribution.epoch === epoch && attribution.attemptId === attemptId;
+		const expectedMessages = outcome.outcome === "committed" ? "append" : "unchanged";
+		const exactMessages =
+			resolved?.advance.messages.kind === "unchanged"
+				? expectedMessages === "unchanged"
+				: resolved?.advance.messages.kind === "append"
+					? expectedMessages === "append" && areStructurallyEqual(resolved.advance.messages.values, messages)
+					: false;
+		const exactRetainedEffect =
+			outcome.outcome !== "retained" ||
+			(resolved?.advance.branchRelation === "same" && resolved.appendedEntryIds.length === 0);
+		if (
+			resolved &&
+			attributed &&
+			exactMessages &&
+			exactRetainedEffect &&
+			!resolved.advance.persistedPolicyChanged &&
+			resolved.advance.branchRelation !== "diverged"
+		) {
+			return { outcome, advance: resolved.advance };
+		}
+		const error = new AgentHarnessError(
+			"delivery",
+			`Delivery owner returned an invalid canonical receipt for ${deliveryId} (${[
+				resolved ? undefined : "unknown receipt",
+				attributed ? undefined : "attribution mismatch",
+				exactMessages ? undefined : "message effect mismatch",
+				exactRetainedEffect ? undefined : "retained receipt changed canonical state",
+				resolved?.advance.persistedPolicyChanged ? "persisted policy changed" : undefined,
+				resolved?.advance.branchRelation === "diverged" ? "branch diverged" : undefined,
+			]
+				.filter((reason) => reason !== undefined)
+				.join(", ")})`,
+		);
+		this.requestClose("session_replacement");
+		return { outcome: { outcome: "terminally_failed", error } };
+	}
+
+	private applyVerifiedProjectionAdvance(advance: ProjectionAdvance): void {
+		const projection = this.contextProjection;
+		if (!projection || projection.invalidError) return;
+		if (advance.branchRelation === "diverged" || advance.messages.kind === "rewrite") {
+			this.recordContextProjectionInvalid(projection, this.staleContextProjectionError());
+			return;
+		}
+		this.contextProjection = {
+			...projection,
+			basisCursor: advance.cursor,
+			ownedOverlayMessages:
+				advance.messages.kind === "append"
+					? [...projection.ownedOverlayMessages, ...cloneAgentMessages(advance.messages.values)]
+					: projection.ownedOverlayMessages,
+			overlayEpoch: projection.overlayEpoch + 1,
+		};
+	}
+
+	private async finishDeliveryOwner(
+		delivery: Pick<PendingDelivery, "deliveryId" | "kind" | "epoch">,
+		attemptId: string | undefined,
+		result:
+			| { outcome: "committed"; receipt: unknown }
+			| { outcome: "retained"; error: Error; noEffectReceipt?: unknown }
+			| { outcome: "terminally_failed"; error: Error; failureReceipt?: unknown }
+			| { outcome: "revoked" },
+	): Promise<Error | undefined> {
+		const owner = this.deliveryOwners.get(delivery.deliveryId);
+		if (!owner) return undefined;
+		const receipt =
+			result.outcome === "committed"
+				? result.receipt
+				: result.outcome === "retained"
+					? result.noEffectReceipt
+					: result.outcome === "terminally_failed"
+						? result.failureReceipt
+						: undefined;
+		const previous = this.deliveryOwnerFinalizationBarriers.get(delivery.deliveryId);
+		const execute = async (): Promise<Error | undefined> => {
+			try {
+				await owner.finish(
+					Object.freeze({
+						deliveryId: delivery.deliveryId,
+						kind: delivery.kind,
+						epoch: delivery.epoch,
+						attemptId,
+						outcome: result.outcome,
+						...(receipt === undefined ? {} : { receipt }),
+						...("error" in result ? { error: result.error } : {}),
+					}),
+				);
+			} catch (error) {
+				return toError(error);
+			}
+			return undefined;
+		};
+		const finalization = previous ? previous.catch(() => {}).then(execute) : execute();
+		const barrier = finalization.then(() => undefined);
+		this.deliveryOwnerFinalizationBarriers.set(delivery.deliveryId, barrier);
+		const error = await finalization;
+		if (this.deliveryOwnerFinalizationBarriers.get(delivery.deliveryId) === barrier) {
+			this.deliveryOwnerFinalizationBarriers.delete(delivery.deliveryId);
+		}
+		if (result.outcome !== "retained") this.deliveryOwners.delete(delivery.deliveryId);
+		return error;
+	}
+
+	private async settlePreparationFailure(
+		lease: DeliveryLease<AgentDeliveryKind, AgentMessage>,
+		delivery: PendingDelivery,
+		attemptId: string,
+		outcome: "retained" | "terminally_failed",
+		error: unknown,
+	): Promise<void> {
+		const failure = toError(error);
+		const finishError = await this.finishDeliveryOwner(delivery, attemptId, { outcome, error: failure });
+		const finalOutcome = finishError ? "terminally_failed" : outcome;
+		const finalError = finishError
+			? new AggregateError([failure, finishError], "Delivery preparation and owner finalization failed")
+			: failure;
+		if (finishError) this.deliveryOwners.delete(delivery.deliveryId);
+		const completed = lease.completePreparation(delivery.deliveryId, attemptId, finalOutcome);
+		if (finishError) {
+			this.activeRun?.deliveryOutcomes.delete(delivery.deliveryId);
+			this.recordDeliveryFailure(delivery, "preparation", finalOutcome, finalError);
+		} else if (completed) {
+			this.recordDeliveryFailure(delivery, "preparation", finalOutcome, finalError);
+		}
+		if (finishError) this.requestClose("session_replacement");
 	}
 
 	private recordDeliveryFailure(
@@ -1493,17 +1798,38 @@ export class AgentHarness<
 		if (outcome.outcome === "retained") this.promoteContinuationCandidate(run);
 	}
 
-	private rollbackActiveLease(): void {
+	private async rollbackActiveLease(): Promise<void> {
+		const lease = this.activeDeliveryLease;
 		const restored = this.deliveryInbox.rollbackActiveLease();
+		const finalizerErrors: Error[] = [];
 		for (const delivery of restored) {
-			this.recordDeliveryOutcome({
-				deliveryId: delivery.deliveryId,
-				kind: delivery.kind,
+			const attemptId = this.deliveryAttemptIds.get(delivery.deliveryId);
+			this.deliveryAttemptIds.delete(delivery.deliveryId);
+			const finishError = await this.finishDeliveryOwner(delivery, attemptId, {
 				outcome: "retained",
+				error: new Error("Delivery attempt ended before commit"),
 			});
+			if (finishError) {
+				lease?.settleRollback(delivery.deliveryId, "terminally_failed");
+				finalizerErrors.push(finishError);
+				this.deliveryOwners.delete(delivery.deliveryId);
+				this.recordDeliveryFailure(delivery, "settlement", "terminally_failed", finishError);
+			} else {
+				lease?.settleRollback(delivery.deliveryId, "retained");
+				this.recordDeliveryOutcome({
+					deliveryId: delivery.deliveryId,
+					kind: delivery.kind,
+					outcome: "retained",
+				});
+			}
 		}
 		this.activeDeliveryLease = undefined;
-		this.deliveryAttemptParticipants.clear();
+		if (finalizerErrors.length > 0) {
+			const error = new AggregateError(finalizerErrors, "Delivery rollback owner finalization failed");
+			this.closeDrainErrors.push(error);
+			this.requestClose("session_replacement");
+			throw error;
+		}
 	}
 
 	private createLoopConfig(
@@ -1541,21 +1867,18 @@ export class AgentHarness<
 			nextAction: async (context) =>
 				await this.resolveNextAction(context, startState, systemPromptOverride ?? getTurnState().systemPrompt),
 			beginDelivery: async (delivery) => await this.beginActiveDelivery(delivery),
-			prepareRequest: async ({ context }) => {
-				const flushedMessages = await this.flushPendingSessionWrites();
+			prepareRequest: async () => {
+				await this.flushPendingSessionWrites();
+				await this.runtimeConfigurationBarrier;
 				const projection = await this.requireValidContextProjection();
-				const contextMessages = projection ? projection.messages : [...context.messages, ...flushedMessages];
+				const contextMessages = projection
+					? projection.ownedOverlayMessages
+					: (await this.session.getBranchSnapshot()).context.messages;
 				const nextTurnState = await this.createTurnState(
-					run.abortController.signal,
+					run.operation.abortGate.signal,
 					contextMessages,
 					systemPromptOverride,
 				);
-				if ((await this.requireValidContextProjection()) !== projection) {
-					throw new AgentHarnessError(
-						"invalid_state",
-						"Continuation context projection changed during request preparation",
-					);
-				}
 				setTurnState(nextTurnState);
 				return {
 					context: this.createContext(nextTurnState, systemPromptOverride),
@@ -1579,10 +1902,6 @@ export class AgentHarness<
 	}
 
 	private async flushPendingSessionWrites(): Promise<AgentMessage[]> {
-		if (this.disposed) {
-			this.pendingSessionWrites = [];
-			return [];
-		}
 		const providerVisibleMessages: AgentMessage[] = [];
 		while (this.pendingSessionWrites.length > 0) {
 			const write = this.pendingSessionWrites[0]!;
@@ -1616,9 +1935,6 @@ export class AgentHarness<
 				entryId = await this.session.appendLabel(write.targetId, write.label);
 			} else if (write.type === "session_info") {
 				entryId = await this.session.appendSessionName(write.name ?? "");
-			} else if (write.type === "leaf") {
-				await this.session.getStorage().setLeafId(write.targetId);
-				this.invalidateContinuationContext();
 			}
 			this.pendingSessionWrites.shift();
 			if (entryId !== undefined) {
@@ -1634,9 +1950,9 @@ export class AgentHarness<
 		let message = event.message;
 		if (
 			(message.stopReason === "aborted" || state.phase === "terminal_event_settling") &&
-			state.abortController.signal.aborted &&
-			state.abortSource !== undefined &&
-			state.diagnosticTimestamp !== undefined
+			state.operation.abortGate.signal.aborted &&
+			state.operation.abortSource !== undefined &&
+			state.operation.diagnosticTimestamp !== undefined
 		) {
 			message = {
 				...message,
@@ -1644,8 +1960,8 @@ export class AgentHarness<
 					...(message.diagnostics ?? []).filter((diagnostic) => diagnostic.type !== "runtime_abort"),
 					{
 						type: "runtime_abort",
-						timestamp: state.diagnosticTimestamp,
-						details: { source: state.abortSource },
+						timestamp: state.operation.diagnosticTimestamp,
+						details: { source: state.operation.abortSource },
 					},
 				],
 			};
@@ -1672,17 +1988,6 @@ export class AgentHarness<
 		state: AgentHarnessRunEventState,
 		signal?: AbortSignal,
 	): Promise<AgentMessage | undefined> {
-		if (this.disposed) {
-			if (event.type === "turn_start") state.turnOpen = true;
-			else if (event.type === "turn_end") state.turnOpen = false;
-			else if (event.type === "agent_end") {
-				state.terminalEmitted = true;
-				state.phase = "settled";
-			} else if (event.type === "message_end") {
-				return event.message;
-			}
-			return undefined;
-		}
 		if (event.type === "delivery_start") {
 			state.requestAccepted = true;
 			for (const message of event.messages) {
@@ -1712,7 +2017,9 @@ export class AgentHarness<
 			return undefined;
 		}
 		if (event.type === "message_end") {
-			if (event.message.role === "assistant" && event.message.stopReason !== "toolUse") {
+			const isTerminalAssistant = event.message.role === "assistant" && event.message.stopReason !== "toolUse";
+			const sealsOperation = isTerminalAssistant && !this.hasQueuedMessages();
+			if (sealsOperation) {
 				state.phase = "terminal_event_settling";
 			}
 			const observational = event.deliveryId !== undefined && state.observationalDeliveryIds.has(event.deliveryId);
@@ -1722,7 +2029,8 @@ export class AgentHarness<
 			if (finalizedEvent.type !== "message_end") {
 				throw new AgentHarnessError("invalid_state", "Runtime diagnostic decoration changed the event type");
 			}
-			if (!observational && !this.disposed) {
+			if (sealsOperation) this.operations.sealTerminal(state.operation);
+			if (!observational) {
 				const entryId = await this.session.appendMessage(finalizedEvent.message);
 				await this.advanceContextProjection(entryId, [finalizedEvent.message]);
 			}
@@ -1763,6 +2071,7 @@ export class AgentHarness<
 			await this.flushPendingSessionWrites();
 			state.terminalEmitted = true;
 			state.phase = "settled";
+			this.operations.beginNotifications(state.operation);
 			await this.emitPassive(event, signal);
 			await this.emitPassive({ type: "settled", nextTurnCount: this.nextTurnQueue.length }, signal);
 			return undefined;
@@ -1782,6 +2091,14 @@ export class AgentHarness<
 			throw new AgentHarnessError("invalid_state", "Harness failure settlement already started");
 		}
 		state.settlementStarted = true;
+		if (state.canonicalAuthorityRetired) {
+			state.terminalEmitted = true;
+			state.phase = "settled";
+			this.operations.beginNotifications(state.operation);
+			await this.emitPassive({ type: "agent_end", messages: [] }, signal);
+			await this.emitPassive({ type: "settled", nextTurnCount: 0 }, signal);
+			return [];
+		}
 		const settlementErrors: Error[] = [];
 		const attempt = async (event: AgentEvent): Promise<AgentMessage | undefined> => {
 			try {
@@ -1825,16 +2142,33 @@ export class AgentHarness<
 		return terminalMessages;
 	}
 
-	private enqueueDelivery(kind: AgentDeliveryKind, messages: readonly AgentMessage[]): string {
-		return this.deliveryInbox.enqueue(kind, cloneAgentMessages(messages)).deliveryId;
+	private enqueueDelivery(
+		kind: AgentDeliveryKind,
+		messages: readonly AgentMessage[],
+		owner: AgentDeliveryOwner = this.defaultDeliveryOwner,
+	): string {
+		const delivery = this.deliveryInbox.enqueue(kind, cloneAgentMessages(messages));
+		this.deliveryOwners.set(delivery.deliveryId, owner);
+		return delivery.deliveryId;
+	}
+
+	/** Admit a stable owner before a low-level delivery becomes visible to dispatch. */
+	admitDelivery(kind: AgentDeliveryKind, messages: readonly AgentMessage[], owner: AgentDeliveryOwner): string {
+		this.assertNotDisposed();
+		if (messages.length === 0) {
+			throw new AgentHarnessError("invalid_argument", "A delivery must contain at least one message");
+		}
+		return this.enqueueDelivery(kind, messages, owner);
 	}
 
 	private enqueuePublishedDelivery(
 		kind: "steer" | "followUp",
 		messages: readonly AgentMessage[],
+		owner?: AgentDeliveryOwner,
 	): { deliveryId: string; publication: Promise<void> } {
-		const deliveryId = this.enqueueDelivery(kind, messages);
+		const deliveryId = this.enqueueDelivery(kind, messages, owner);
 		const publication = this.emitQueueUpdate(true);
+		this.trackCloseDrain(publication);
 		void publication.catch(() => {});
 		return { deliveryId, publication };
 	}
@@ -1843,6 +2177,7 @@ export class AgentHarness<
 		messages: readonly AgentMessage[],
 		beforeStart?: { text: string; options?: AgentHarnessPromptOptions },
 		systemPromptOverride?: string,
+		owner?: AgentDeliveryOwner,
 	): Promise<string> {
 		if (messages.length === 0) {
 			throw new AgentHarnessError("invalid_argument", "A prompt delivery must contain at least one message");
@@ -1852,7 +2187,7 @@ export class AgentHarness<
 			...cloneAgentMessages(this.nextTurnQueue.slice(0, nextTurnCount)),
 			...cloneAgentMessages(messages),
 		];
-		const deliveryId = this.enqueueDelivery("prompt", admittedMessages);
+		const deliveryId = this.enqueueDelivery("prompt", admittedMessages, owner);
 		this.deliveryPreparationStates.set(deliveryId, {
 			admittedMessages: cloneAgentMessages(admittedMessages),
 			...(beforeStart === undefined
@@ -1860,7 +2195,9 @@ export class AgentHarness<
 				: {
 						beforeStart: {
 							text: beforeStart.text,
-							...(beforeStart.options === undefined ? {} : { options: structuredClone(beforeStart.options) }),
+							...(beforeStart.options === undefined
+								? {}
+								: { options: clonePromptOptions(beforeStart.options)! }),
 						},
 					}),
 			...(systemPromptOverride === undefined ? {} : { systemPromptOverride }),
@@ -1942,18 +2279,16 @@ export class AgentHarness<
 		const setTurnState = (nextTurnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>) => {
 			activeTurnState = nextTurnState;
 		};
-		const abortController = runEventState.abortController;
+		const abortGate = runEventState.operation.abortGate;
 		if (this.contextProjection) {
 			await this.requireValidContextProjection();
-		} else {
-			await this.rebaseContinuationContext({ source: "explicit" });
 		}
 		runEventState.continuationCandidate = {
 			requestAuthority: startState.requestAuthority,
 			providerRequestPending: startState.providerRequestPending,
 			systemPrompt: systemPrompt ?? turnState.systemPrompt,
 		};
-		if (abortController.signal.aborted && this.hasQueuedMessages()) {
+		if (abortGate.signal.aborted && this.hasQueuedMessages()) {
 			this.promoteContinuationCandidate(runEventState);
 		}
 
@@ -1967,30 +2302,35 @@ export class AgentHarness<
 					[],
 					this.createContext(turnState, systemPrompt),
 					this.createLoopConfig(runEventState, getTurnState, setTurnState, startState, systemPrompt),
-					async (event) => await this.handleAgentEvent(event, runEventState, abortController.signal),
-					abortController.signal,
+					async (event) => await this.handleAgentEvent(event, runEventState, abortGate.signal),
+					abortGate.signal,
 					this.createPolicyStreamFn(getTurnState),
 				);
 			} catch (error) {
-				this.rollbackActiveLease();
+				try {
+					await this.rollbackActiveLease();
+				} catch (rollbackError) {
+					throw createFailureSettlementError(error, rollbackError);
+				}
 				if (runEventState.settlementStarted || runEventState.terminalEmitted) throw error;
 				try {
 					terminalMessages = await this.settleRunFailure(
 						runEventState,
 						activeTurnState.model,
 						error,
-						abortController.signal.aborted,
-						abortController.signal,
+						abortGate.signal.aborted,
+						abortGate.signal,
 					);
 				} catch (settlementError) {
 					throw createFailureSettlementError(error, settlementError);
 				}
 			}
 		} finally {
+			this.endProviderAdmission();
 			try {
 				await this.flushPendingSessionWrites();
 			} finally {
-				this.rollbackActiveLease();
+				await this.rollbackActiveLease();
 				deliveries = Object.freeze(
 					[...runEventState.deliveryOutcomes.values()].sort(
 						(left, right) =>
@@ -2000,6 +2340,8 @@ export class AgentHarness<
 				);
 				deliveryFailure = runEventState.deliveryFailure;
 				this.leasedDeliveryKinds.clear();
+				this.leasedDeliveryEpochs.clear();
+				this.leasedDeliveries.clear();
 			}
 		}
 
@@ -2024,10 +2366,14 @@ export class AgentHarness<
 			beforeStart?: { text: string; options?: AgentHarnessPromptOptions };
 			systemPrompt?: string;
 			context?: readonly AgentMessage[];
+			deliveryOwner?: AgentDeliveryOwner;
 		},
+		operation?: HarnessOperationLease,
 	): Promise<AgentHarnessExecutionResult> {
 		this.assertNotDisposed();
-		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
+		if (this.operations.current && this.operations.current !== operation) {
+			throw new AgentHarnessError("busy", "AgentHarness is busy");
+		}
 		if (this.hasPendingPrompt()) {
 			throw new AgentHarnessError(
 				"invalid_state",
@@ -2036,9 +2382,14 @@ export class AgentHarness<
 		}
 		this.continuationState = undefined;
 		this.invalidateContinuationContext();
-		const run = this.admitBoundedRun();
+		const run = this.admitBoundedRun(operation);
 		try {
-			const baseTurnState = await this.createTurnState(run.state.abortController.signal, undefined, undefined, true);
+			const baseTurnState = await this.createTurnState(
+				run.state.operation.abortGate.signal,
+				undefined,
+				undefined,
+				true,
+			);
 			const invocation = resolveInvocation(baseTurnState);
 			if (invocation.context !== undefined) {
 				await this.rebaseContinuationContext({
@@ -2050,13 +2401,14 @@ export class AgentHarness<
 				invocation.messages,
 				invocation.beforeStart,
 				invocation.systemPrompt,
+				invocation.deliveryOwner,
 			);
 			const baseContextMessages =
 				invocation.context === undefined ? baseTurnState.messages : cloneAgentMessages(invocation.context);
 			const preflight = await this.preparePromptPreflight(
 				deliveryId,
 				{ ...baseTurnState, messages: baseContextMessages },
-				run.state.abortController.signal,
+				run.state.operation.abortGate.signal,
 			);
 			const turnState = {
 				...baseTurnState,
@@ -2097,7 +2449,83 @@ export class AgentHarness<
 				messages,
 				...(ownedOptions.systemPrompt === undefined ? {} : { systemPrompt: ownedOptions.systemPrompt }),
 				...(ownedOptions.context === undefined ? {} : { context: ownedOptions.context }),
+				...(ownedOptions.deliveryOwner === undefined ? {} : { deliveryOwner: ownedOptions.deliveryOwner }),
 			}))
+		).result;
+	}
+
+	/** Synchronously reserve exclusive run ownership before host preflight awaits. */
+	reserveRun(): AgentHarnessRunReservation {
+		this.assertNotDisposed();
+		const operation = this.operations.reserve("turn");
+		if (!operation) throw new AgentHarnessError("busy", "AgentHarness is busy");
+		const reservation = Object.freeze({ reservationId: operation.id });
+		this.runReservations.set(reservation.reservationId, operation);
+		return reservation;
+	}
+
+	cancelReservedRun(reservation: AgentHarnessRunReservation): boolean {
+		const operation = this.runReservations.get(reservation.reservationId);
+		if (!operation || this.operations.current !== operation || operation.phase !== "admitted") return false;
+		this.runReservations.delete(reservation.reservationId);
+		this.operations.finish(operation);
+		return true;
+	}
+
+	/** Atomically replace a reserved turn with compaction and a fresh turn successor. */
+	async runCompactionBeforeReserved<TResult>(
+		reservation: AgentHarnessRunReservation,
+		strategy: (context: AgentHarnessStructuralOperationContext) => Promise<TResult> | TResult,
+	): Promise<{ result: TResult; reservation: AgentHarnessRunReservation }> {
+		const operation = this.runReservations.get(reservation.reservationId);
+		if (!operation || this.operations.current !== operation || operation.phase !== "admitted") {
+			throw new AgentHarnessError("invalid_state", "Harness run reservation is not active");
+		}
+		this.runReservations.delete(reservation.reservationId);
+		if (!this.operations.reclassify(operation, "compaction")) {
+			throw new AgentHarnessError("invalid_state", "Harness reservation could not enter compaction");
+		}
+		const successor = this.operations.reserveSuccessor("turn");
+		if (!successor) throw new AgentHarnessError("busy", "A successor operation is already reserved");
+		let result: TResult;
+		try {
+			result = await this.executeStructuralOperation(operation, strategy);
+		} catch (error) {
+			await successor.ready;
+			if (this.operations.current === successor.lease) this.operations.finish(successor.lease);
+			throw error;
+		}
+		await successor.ready;
+		if (this.operations.current !== successor.lease) {
+			throw new AgentHarnessError("invalid_state", "Reserved turn successor was cancelled");
+		}
+		const next = Object.freeze({ reservationId: successor.lease.id });
+		this.runReservations.set(next.reservationId, successor.lease);
+		return { result, reservation: next };
+	}
+
+	async runReserved(
+		reservation: AgentHarnessRunReservation,
+		input: AgentMessage | readonly AgentMessage[],
+		options: AgentHarnessRunOptions = {},
+	): Promise<AgentRunResult> {
+		const operation = this.runReservations.get(reservation.reservationId);
+		if (!operation || this.operations.current !== operation || operation.phase !== "admitted") {
+			throw new AgentHarnessError("invalid_state", "Harness run reservation is not active");
+		}
+		this.runReservations.delete(reservation.reservationId);
+		const messages = cloneAgentMessages(Array.isArray(input) ? input : [input]);
+		const ownedOptions = cloneRunOptions(options);
+		return (
+			await this.startPromptRun(
+				() => ({
+					messages,
+					...(ownedOptions.systemPrompt === undefined ? {} : { systemPrompt: ownedOptions.systemPrompt }),
+					...(ownedOptions.context === undefined ? {} : { context: ownedOptions.context }),
+					...(ownedOptions.deliveryOwner === undefined ? {} : { deliveryOwner: ownedOptions.deliveryOwner }),
+				}),
+				operation,
+			)
 		).result;
 	}
 
@@ -2111,6 +2539,7 @@ export class AgentHarness<
 				beforeStart,
 				...(ownedOptions?.systemPrompt === undefined ? {} : { systemPrompt: ownedOptions.systemPrompt }),
 				...(ownedOptions?.context === undefined ? {} : { context: ownedOptions.context }),
+				...(ownedOptions?.deliveryOwner === undefined ? {} : { deliveryOwner: ownedOptions.deliveryOwner }),
 			}))
 		).result;
 	}
@@ -2125,6 +2554,7 @@ export class AgentHarness<
 				beforeStart,
 				...(ownedOptions?.systemPrompt === undefined ? {} : { systemPrompt: ownedOptions.systemPrompt }),
 				...(ownedOptions?.context === undefined ? {} : { context: ownedOptions.context }),
+				...(ownedOptions?.deliveryOwner === undefined ? {} : { deliveryOwner: ownedOptions.deliveryOwner }),
 			})),
 			"prompt()",
 		);
@@ -2154,10 +2584,34 @@ export class AgentHarness<
 	async continue(
 		options: { drainFollowUps?: boolean; context?: readonly AgentMessage[] } = {},
 	): Promise<AgentRunResult> {
+		return await this.continueWithOperation(options);
+	}
+
+	async continueReserved(
+		reservation: AgentHarnessRunReservation,
+		options: { drainFollowUps?: boolean; context?: readonly AgentMessage[] } = {},
+	): Promise<AgentRunResult> {
+		const operation = this.runReservations.get(reservation.reservationId);
+		if (!operation || this.operations.current !== operation || operation.phase !== "admitted") {
+			throw new AgentHarnessError("invalid_state", "Harness run reservation is not active");
+		}
+		this.runReservations.delete(reservation.reservationId);
+		return await this.continueWithOperation(options, operation);
+	}
+
+	private async continueWithOperation(
+		options: { drainFollowUps?: boolean; context?: readonly AgentMessage[] } = {},
+		reservedOperation?: HarnessOperationLease,
+	): Promise<AgentRunResult> {
 		const ownedContext = options.context === undefined ? undefined : cloneAgentMessages(options.context);
 		const drainFollowUps = options.drainFollowUps === true;
 		this.assertNotDisposed();
-		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
+		if (this.operations.current && this.operations.current !== reservedOperation) {
+			throw new AgentHarnessError("busy", "AgentHarness is busy");
+		}
+		const reservation = reservedOperation ?? this.operations.reserve("turn");
+		if (!reservation) throw new AgentHarnessError("busy", "AgentHarness is busy");
+		let boundedRun: AgentHarnessBoundedRun | undefined;
 		try {
 			if (ownedContext !== undefined) {
 				await this.rebaseContinuationContext({
@@ -2168,9 +2622,9 @@ export class AgentHarness<
 			const continuationState = this.continuationState;
 			const hasNextActionReducers =
 				(this.getHandlers("next_action")?.size ?? 0) > 0 || this.nextActionPolicies.size > 0;
-			let projection = await this.requireValidContextProjection();
-			let contextMessages = projection?.messages ?? (await this.session.buildContext()).messages;
-			let lastMessage = contextMessages.at(-1);
+			const projection = await this.requireValidContextProjection();
+			const contextMessages = projection?.ownedOverlayMessages ?? (await this.session.buildContext()).messages;
+			const lastMessage = contextMessages.at(-1);
 			if (!lastMessage && !this.hasQueuedMessages()) {
 				throw new AgentHarnessError("invalid_state", "No messages to continue from");
 			}
@@ -2182,27 +2636,8 @@ export class AgentHarness<
 			) {
 				return { status: "completed", deliveries: [] };
 			}
-			if (!projection) {
-				await this.rebaseContinuationContext({ source: "explicit" });
-				projection = await this.requireValidContextProjection();
-				if (!projection)
-					throw new AgentHarnessError("invalid_state", "Continuation context rebase was not installed");
-				contextMessages = projection.messages;
-				lastMessage = contextMessages.at(-1);
-				if (!lastMessage && !this.hasQueuedMessages()) {
-					throw new AgentHarnessError("invalid_state", "No messages to continue from");
-				}
-				if (
-					lastMessage?.role === "assistant" &&
-					!this.hasQueuedMessages() &&
-					!hasNextActionReducers &&
-					continuationState === undefined
-				) {
-					this.invalidateContinuationContext();
-					return { status: "completed", deliveries: [] };
-				}
-			}
-			const run = this.admitBoundedRun();
+			const run = this.admitBoundedRun(reservation);
+			boundedRun = run;
 			try {
 				const pendingPrompt = this.deliveryInbox.list("prompt")[0];
 				const promptPreparation =
@@ -2213,7 +2648,7 @@ export class AgentHarness<
 					promptPreparation?.preflight?.systemPrompt ??
 					promptPreparation?.resolvedSystemPrompt;
 				let turnState = await this.createTurnState(
-					run.state.abortController.signal,
+					run.state.operation.abortGate.signal,
 					contextMessages,
 					resolvedSystemPrompt,
 					pendingPrompt !== undefined,
@@ -2222,7 +2657,7 @@ export class AgentHarness<
 					const preflight = await this.preparePromptPreflight(
 						pendingPrompt.deliveryId,
 						turnState,
-						run.state.abortController.signal,
+						run.state.operation.abortGate.signal,
 					);
 					systemPromptOverride ??= preflight.systemPromptOverride;
 					turnState = { ...turnState, systemPrompt: preflight.systemPrompt };
@@ -2247,31 +2682,41 @@ export class AgentHarness<
 			}
 		} catch (error) {
 			throw normalizeHarnessError(error, "unknown");
+		} finally {
+			if (!boundedRun) this.operations.finish(reservation);
 		}
 	}
 
-	queueSteer(message: AgentMessage): string {
+	queueSteer(message: AgentMessage, owner?: AgentDeliveryOwner): string {
 		this.assertNotDisposed();
-		return this.enqueuePublishedDelivery("steer", [message]).deliveryId;
+		return this.enqueuePublishedDelivery("steer", [message], owner).deliveryId;
 	}
 
-	queueFollowUp(message: AgentMessage): string {
+	queueFollowUp(message: AgentMessage, owner?: AgentDeliveryOwner): string {
 		this.assertNotDisposed();
-		return this.enqueuePublishedDelivery("followUp", [message]).deliveryId;
+		return this.enqueuePublishedDelivery("followUp", [message], owner).deliveryId;
 	}
 
 	async steer(text: string, options?: AgentHarnessPromptOptions): Promise<string> {
 		this.assertNotDisposed();
-		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot steer while idle");
-		const enqueued = this.enqueuePublishedDelivery("steer", [createUserMessage(text, options?.images)]);
+		if (!this.operations.current) throw new AgentHarnessError("invalid_state", "Cannot steer while idle");
+		const enqueued = this.enqueuePublishedDelivery(
+			"steer",
+			[createUserMessage(text, options?.images)],
+			options?.deliveryOwner,
+		);
 		await enqueued.publication;
 		return enqueued.deliveryId;
 	}
 
 	async followUp(text: string, options?: AgentHarnessPromptOptions): Promise<string> {
 		this.assertNotDisposed();
-		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot follow up while idle");
-		const enqueued = this.enqueuePublishedDelivery("followUp", [createUserMessage(text, options?.images)]);
+		if (!this.operations.current) throw new AgentHarnessError("invalid_state", "Cannot follow up while idle");
+		const enqueued = this.enqueuePublishedDelivery(
+			"followUp",
+			[createUserMessage(text, options?.images)],
+			options?.deliveryOwner,
+		);
 		await enqueued.publication;
 		return enqueued.deliveryId;
 	}
@@ -2279,7 +2724,7 @@ export class AgentHarness<
 	async nextTurn(text: string, options?: AgentHarnessPromptOptions): Promise<void> {
 		this.assertNotDisposed();
 		this.nextTurnQueue.push(...cloneAgentMessages([createUserMessage(text, options?.images)]));
-		await this.emitQueueUpdate();
+		await this.trackAdmittedMutation(this.emitQueueUpdate());
 	}
 
 	hasQueuedMessages(): boolean {
@@ -2290,10 +2735,6 @@ export class AgentHarness<
 		return this.deliveryInbox.hasPending("prompt");
 	}
 
-	canPrepareDelivery(deliveryId: string): boolean {
-		return this.activeDeliveryLease?.canPrepare(deliveryId) ?? false;
-	}
-
 	private revokeDeliveries(kind: AgentDeliveryKind): readonly PendingDelivery[] {
 		const revoked = this.deliveryInbox.revoke(kind);
 		for (const delivery of revoked) {
@@ -2302,26 +2743,51 @@ export class AgentHarness<
 				kind: delivery.kind,
 				outcome: "revoked",
 			});
-			this.deliveryAttemptParticipants.delete(delivery.deliveryId);
 			this.deliveryPreparationStates.delete(delivery.deliveryId);
-			try {
-				this.deliveryRevoked?.({
-					deliveryId: delivery.deliveryId,
-					kind: delivery.kind,
-					messages: cloneAgentMessages(delivery.messages),
-				});
-			} catch {
-				// Revocation is authoritative; observational host cleanup cannot undo it.
-			}
+			const attemptId = this.deliveryAttemptIds.get(delivery.deliveryId);
+			this.deliveryAttemptIds.delete(delivery.deliveryId);
+			const preparationSettlement = this.deliveryPreparationSettlements.get(delivery.deliveryId);
+			const finalizer = (async () => {
+				await preparationSettlement;
+				return await this.finishDeliveryOwner(delivery, attemptId, { outcome: "revoked" });
+			})().then((error) => {
+				if (error) {
+					this.requestClose("session_replacement");
+					throw error;
+				}
+			});
+			this.deliveryRevocationFinalizers.set(delivery.deliveryId, finalizer);
+			void finalizer.then(
+				() => {
+					if (this.deliveryRevocationFinalizers.get(delivery.deliveryId) === finalizer) {
+						this.deliveryRevocationFinalizers.delete(delivery.deliveryId);
+					}
+				},
+				() => {
+					if (this.deliveryRevocationFinalizers.get(delivery.deliveryId) === finalizer) {
+						this.deliveryRevocationFinalizers.delete(delivery.deliveryId);
+					}
+				},
+			);
+			this.trackCloseDrain(finalizer);
+			void finalizer.catch(() => {});
 		}
 		return revoked;
 	}
 
-	private async clearDeliveryKinds(kinds: readonly AgentDeliveryKind[]): Promise<string[]> {
+	private clearDeliveryKinds(kinds: readonly AgentDeliveryKind[]): Promise<string[]> {
 		this.assertNotDisposed();
 		const revoked = kinds.flatMap((kind) => this.revokeDeliveries(kind));
-		if (revoked.length > 0) await this.emitQueueUpdate();
-		return revoked.map((delivery) => delivery.deliveryId);
+		const finalizers = revoked.flatMap((delivery) => {
+			const finalizer = this.deliveryRevocationFinalizers.get(delivery.deliveryId);
+			return finalizer ? [finalizer] : [];
+		});
+		const mutation = (async () => {
+			if (revoked.length > 0) await this.emitQueueUpdate();
+			await Promise.all(finalizers);
+			return revoked.map((delivery) => delivery.deliveryId);
+		})();
+		return this.trackAdmittedMutation(mutation);
 	}
 
 	async clearSteeringQueue(): Promise<string[]> {
@@ -2340,7 +2806,11 @@ export class AgentHarness<
 	revokeAllQueues(): string[] {
 		this.assertNotDisposed();
 		const revoked = (["steer", "followUp"] as const).flatMap((kind) => this.revokeDeliveries(kind));
-		if (revoked.length > 0) void this.emitQueueUpdate(true).catch(() => {});
+		if (revoked.length > 0) {
+			const publication = this.emitQueueUpdate(true);
+			this.trackCloseDrain(publication);
+			void publication.catch(() => {});
+		}
 		return revoked.map((delivery) => delivery.deliveryId);
 	}
 
@@ -2348,44 +2818,170 @@ export class AgentHarness<
 		return await this.clearDeliveryKinds(["prompt"]);
 	}
 
-	/** Terminally fence the Harness without joining an in-flight callback or run. */
-	dispose(source: AgentAbortSource = "disposal"): Promise<void> {
-		if (this.disposePromise) return this.disposePromise;
-		this.disposed = true;
-		this.disposePromise = Promise.resolve();
-		this.abort(source);
+	/** Terminally fence the Harness without joining an in-flight callback or operation. */
+	requestClose(source: AgentAbortSource = "disposal"): void {
+		if (!this.operations.requestClose(source)) return;
+		for (const [reservationId, reservation] of this.runReservations) {
+			this.runReservations.delete(reservationId);
+			if (this.operations.current === reservation && reservation.phase === "admitted") {
+				this.operations.finish(reservation);
+			}
+		}
+		this.closePromise = this.drainClose();
+		void this.closePromise.catch(() => {});
+		this.endProviderAdmission();
 		const revoked = (["prompt", "steer", "followUp"] as const).flatMap((kind) => this.revokeDeliveries(kind));
 		const hadNextTurnMessages = this.nextTurnQueue.length > 0;
 		this.nextTurnQueue = [];
 		this.pendingSessionWrites = [];
-		this.deliveryInbox.reset();
-		this.activeDeliveryLease = undefined;
-		this.leasedDeliveryKinds.clear();
-		this.deliveryAttemptParticipants.clear();
-		this.deliveryPreparationStates.clear();
+		// A delivery that crossed its commit boundary remains owned by the active
+		// operation. The operation's finalizer releases its lease and preparation.
 		this.continuationState = undefined;
 		if (this.activeRun) delete this.activeRun.continuationCandidate;
 		this.invalidateContinuationContext();
 		if (revoked.length > 0 || hadNextTurnMessages) {
-			void this.emitQueueUpdate(true).catch(() => {
-				// Revocation is authoritative; passive disposal projection cannot undo it.
-			});
+			this.trackCloseDrain(this.emitQueueUpdate(true));
 		}
-		return this.disposePromise;
+	}
+
+	/** Fence-only alias retained as the conventional resource lifecycle method. */
+	dispose(source: AgentAbortSource = "disposal"): void {
+		this.requestClose(source);
+	}
+
+	waitForClosed(): Promise<void> {
+		return this.closePromise ?? this.operations.waitForClosed();
 	}
 
 	async appendMessage(message: AgentMessage): Promise<void> {
 		this.assertNotDisposed();
+		let ownedMessage: AgentMessage;
 		try {
-			if (this.phase === "idle") {
-				const entryId = await this.session.appendMessage(message);
-				await this.advanceContextProjection(entryId, [message]);
-			} else {
-				this.pendingSessionWrites.push({ type: "message", message });
-			}
+			ownedMessage = structuredClone(message);
 		} catch (error) {
-			throw normalizeHarnessError(error, "session");
+			throw normalizeHarnessError(
+				new SessionError("invalid_entry", "Failed to materialize canonical mutation batch", toError(error)),
+				"session",
+			);
 		}
+		const mutation = (async () => {
+			try {
+				if (!this.operations.current) {
+					const entryId = await this.session.appendMessage(ownedMessage);
+					await this.advanceContextProjection(entryId, [ownedMessage]);
+				} else {
+					const write = { type: "message" as const, message: ownedMessage };
+					if (this.providerHookPendingWrites) this.providerHookPendingWrites.push(write);
+					else this.pendingSessionWrites.push(write);
+				}
+			} catch (error) {
+				throw normalizeHarnessError(error, "session");
+			}
+		})();
+		await this.trackAdmittedMutation(mutation);
+	}
+
+	private async executeStructuralOperation<TResult>(
+		operation: HarnessOperationLease,
+		strategy: (context: AgentHarnessStructuralOperationContext) => Promise<TResult> | TResult,
+	): Promise<TResult> {
+		this.operations.start(operation);
+		try {
+			let committed = false;
+			const streamFn = await this.createStructuralStreamFn();
+			const context: AgentHarnessStructuralOperationContext = Object.freeze({
+				signal: operation.abortGate.signal,
+				streamFn,
+				sealAndCommit: async (batch: SessionMutationBatch) => {
+					if (committed)
+						throw new AgentHarnessError("invalid_state", "Structural commit capability was already used");
+					if (operation.abortGate.signal.aborted || this.operations.current !== operation) {
+						throw new AgentHarnessError("invalid_state", "Structural operation lost ownership before commit");
+					}
+					this.operations.sealTerminal(operation);
+					committed = true;
+					return await this.session.commitBatch(batch);
+				},
+			});
+			return await strategy(context);
+		} finally {
+			this.operations.finish(operation);
+		}
+	}
+
+	async runCompactionOperation<TResult>(
+		strategy: (context: AgentHarnessStructuralOperationContext) => Promise<TResult> | TResult,
+	): Promise<TResult> {
+		this.assertNotDisposed();
+		const operation = this.operations.reserve("compaction");
+		if (!operation) throw new AgentHarnessError("busy", "Compaction requires idle harness");
+		return await this.executeStructuralOperation(operation, strategy);
+	}
+
+	async runTreeOperation<TResult>(
+		strategy: (context: AgentHarnessStructuralOperationContext) => Promise<TResult> | TResult,
+	): Promise<TResult> {
+		this.assertNotDisposed();
+		const operation = this.operations.reserve("branch_summary");
+		if (!operation) throw new AgentHarnessError("busy", "Tree navigation requires idle harness");
+		return await this.executeStructuralOperation(operation, strategy);
+	}
+
+	/**
+	 * Reserve tree navigation as the successor to pre-provider work and fence that
+	 * work before changing the canonical branch. Accepted provider requests remain
+	 * non-preemptible and must settle before navigation can be retried.
+	 */
+	async requestTreeOperation<TResult>(
+		strategy: (context: AgentHarnessStructuralOperationContext) => Promise<TResult> | TResult,
+	): Promise<TResult> {
+		this.assertNotDisposed();
+		const current = this.operations.current;
+		if (!current) return await this.runTreeOperation(strategy);
+		if (current.kind === "branch_summary" || (current.kind === "turn" && this.activeRun?.requestAccepted === true)) {
+			throw new AgentHarnessError("busy", "Tree navigation cannot preempt the active operation");
+		}
+
+		const successor =
+			current.kind === "compaction"
+				? (this.operations.reserveSuccessorReplacing("turn", "branch_summary") ??
+					this.operations.reserveSuccessor("branch_summary"))
+				: this.operations.reserveSuccessor("branch_summary");
+		if (!successor) throw new AgentHarnessError("busy", "A successor operation is already reserved");
+		this.abort("host_action");
+
+		// Prompt preflight owns an admitted reservation but has not crossed into
+		// canonical/provider work. Revoke it synchronously so navigation can commit
+		// the new generation; its eventual runReserved call then fails closed.
+		if (current.kind === "turn" && current.phase === "admitted") {
+			for (const [reservationId, operation] of this.runReservations) {
+				if (operation === current) this.runReservations.delete(reservationId);
+			}
+			this.operations.finish(current);
+		}
+
+		await successor.ready;
+		if (this.operations.current !== successor.lease || !this.operations.isOpen) {
+			throw new AgentHarnessError("invalid_state", "Tree navigation reservation was cancelled");
+		}
+		return await this.executeStructuralOperation(successor.lease, strategy);
+	}
+
+	/** Reserve compaction behind the active operation before requesting its abort. */
+	async requestCompaction<TResult>(
+		strategy: (context: AgentHarnessStructuralOperationContext) => Promise<TResult> | TResult,
+		abortSource: AgentAbortSource = "host_action",
+	): Promise<TResult> {
+		this.assertNotDisposed();
+		if (!this.operations.current) return await this.runCompactionOperation(strategy);
+		const successor = this.operations.reserveSuccessor("compaction");
+		if (!successor) throw new AgentHarnessError("busy", "A successor operation is already reserved");
+		this.abort(abortSource);
+		await successor.ready;
+		if (this.operations.current !== successor.lease || !this.operations.isOpen) {
+			throw new AgentHarnessError("invalid_state", "Compaction reservation was cancelled");
+		}
+		return await this.executeStructuralOperation(successor.lease, strategy);
 	}
 
 	async compact(customInstructions?: string): Promise<{
@@ -2396,12 +2992,14 @@ export class AgentHarness<
 		details?: JsonValue;
 	}> {
 		this.assertNotDisposed();
-		if (this.phase !== "idle") throw new AgentHarnessError("busy", "compact() requires idle harness");
-		this.phase = "compaction";
+		const operation = this.operations.reserve("compaction");
+		if (!operation) throw new AgentHarnessError("busy", "compact() requires idle harness");
+		this.operations.start(operation);
 		try {
 			const model = this.model;
 			if (!model) throw new AgentHarnessError("invalid_state", "No model set for compaction");
-			const branchEntries = await this.session.getBranch();
+			const basis = await this.session.getBranchSnapshot();
+			const branchEntries = [...basis.entries];
 			const activeTools = this.getActiveTools();
 			const preparationResult = prepareCompaction(branchEntries, DEFAULT_COMPACTION_SETTINGS, {
 				tools: activeTools,
@@ -2410,7 +3008,7 @@ export class AgentHarness<
 			if (!preparationResult.ok) throw preparationResult.error;
 			const preparation = preparationResult.value;
 			if (!preparation) throw new AgentHarnessError("compaction", "Nothing to compact");
-			const signal = new AbortController().signal;
+			const signal = operation.abortGate.signal;
 			const hookResult = await this.emitHook({
 				type: "session_before_compact",
 				preparation,
@@ -2434,13 +3032,28 @@ export class AgentHarness<
 					);
 			if (!compactResult.ok) throw compactResult.error;
 			const result = compactResult.value;
-			const entryId = await this.session.appendCompaction(
-				result.summary,
-				result.firstKeptEntryId,
-				result.tokensBefore,
-				result.details,
-				provided === undefined ? undefined : true,
-			);
+			if (signal.aborted || this.operations.current !== operation) {
+				throw new AgentHarnessError("compaction", "Compaction aborted before commit");
+			}
+			this.operations.sealTerminal(operation);
+			const commit = await this.session.commitBatch({
+				guard: { kind: "exact", cursor: basis.cursor },
+				mutations: [
+					{
+						kind: "append",
+						entry: {
+							type: "compaction",
+							summary: result.summary,
+							firstKeptEntryId: result.firstKeptEntryId,
+							tokensBefore: result.tokensBefore,
+							...(result.details === undefined ? {} : { details: result.details }),
+							...(provided === undefined ? {} : { fromHook: true }),
+						},
+					},
+				],
+			});
+			if (commit.outcome !== "committed") throw commit.error;
+			const entryId = commit.appendedEntryIds[0]!;
 			const entry = await this.session.getEntry(entryId);
 			if (entry?.type === "compaction") {
 				await this.emitOwn({ type: "session_compact", compactionEntry: entry, fromHook: provided !== undefined });
@@ -2457,7 +3070,7 @@ export class AgentHarness<
 		} catch (error) {
 			throw normalizeHarnessError(error, "compaction");
 		} finally {
-			this.phase = "idle";
+			this.operations.finish(operation);
 		}
 	}
 
@@ -2466,10 +3079,12 @@ export class AgentHarness<
 		options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
 	): Promise<NavigateTreeResult> {
 		this.assertNotDisposed();
-		if (this.phase !== "idle") throw new AgentHarnessError("busy", "navigateTree() requires idle harness");
-		this.phase = "branch_summary";
+		const operation = this.operations.reserve("branch_summary");
+		if (!operation) throw new AgentHarnessError("busy", "navigateTree() requires idle harness");
+		this.operations.start(operation);
 		try {
-			const oldLeafId = await this.session.getLeafId();
+			const basis = await this.session.getBranchSnapshot();
+			const oldLeafId = basis.cursor.branchIdentity;
 			if (oldLeafId === targetId) return { cancelled: false };
 			const targetEntry = await this.session.getEntry(targetId);
 			if (!targetEntry) throw new AgentHarnessError("invalid_argument", `Entry ${targetId} not found`);
@@ -2484,7 +3099,7 @@ export class AgentHarness<
 				...(options?.replaceInstructions === undefined ? {} : { replaceInstructions: options.replaceInstructions }),
 				...(options?.label === undefined ? {} : { label: options.label }),
 			};
-			const signal = new AbortController().signal;
+			const signal = operation.abortGate.signal;
 			const hookResult = await this.emitHook({ type: "session_before_tree", preparation, signal });
 			if (hookResult?.cancel) return { cancelled: true };
 			let summaryEntry: NavigateTreeResult["summaryEntry"];
@@ -2536,20 +3151,46 @@ export class AgentHarness<
 			} else {
 				newLeafId = targetId;
 			}
-			const summaryId = await this.session.moveTo(
-				newLeafId,
-				summaryText
-					? {
-							summary: summaryText,
-							...(summaryDetails === undefined ? {} : { details: summaryDetails }),
-							...(hookResult?.summary === undefined ? {} : { fromHook: true }),
-						}
-					: undefined,
-			);
+			if (signal.aborted || this.operations.current !== operation) return { cancelled: true };
+			this.operations.sealTerminal(operation);
+			const summaryLabel = hookResult?.label ?? options?.label;
+			const commit = await this.session.commitBatch({
+				guard: { kind: "exact", cursor: basis.cursor },
+				mutations: [
+					{
+						kind: "move_with_summary",
+						leafId: newLeafId,
+						...(summaryText === undefined
+							? {}
+							: {
+									summary: {
+										summary: summaryText,
+										...(summaryDetails === undefined ? {} : { details: summaryDetails }),
+										...(hookResult?.summary === undefined ? {} : { fromHook: true }),
+										...(summaryLabel === undefined ? {} : { label: summaryLabel }),
+									},
+								}),
+					},
+					...(summaryText !== undefined || summaryLabel === undefined || newLeafId === null
+						? []
+						: [
+								{
+									kind: "append" as const,
+									entry: { type: "label" as const, targetId: newLeafId, label: summaryLabel },
+								},
+							]),
+				],
+			});
+			if (commit.outcome !== "committed") throw commit.error;
 			this.invalidateContinuationContext();
-			if (summaryId) {
-				const entry = await this.session.getEntry(summaryId);
-				if (entry?.type === "branch_summary") summaryEntry = entry;
+			if (summaryText) {
+				for (const entryId of commit.appendedEntryIds) {
+					const entry = await this.session.getEntry(entryId);
+					if (entry?.type === "branch_summary") {
+						summaryEntry = entry;
+						break;
+					}
+				}
 			}
 			await this.emitOwn({
 				type: "session_tree",
@@ -2566,7 +3207,7 @@ export class AgentHarness<
 		} catch (error) {
 			throw normalizeHarnessError(error, "branch_summary");
 		} finally {
-			this.phase = "idle";
+			this.operations.finish(operation);
 		}
 	}
 
@@ -2574,28 +3215,93 @@ export class AgentHarness<
 		return this.model;
 	}
 
-	async setModel(model: Model<any> | undefined, options: { persist?: boolean } = {}): Promise<void> {
+	async setModelAndThinkingLevel(
+		model: Model<any> | undefined,
+		level: ThinkingLevel,
+		options: { persist?: boolean } = {},
+	): Promise<void> {
 		this.assertNotDisposed();
-		try {
-			const previousModel = this.model;
-			if (options.persist !== false && model) {
-				if (this.phase === "idle") {
-					const entryId = await this.session.appendModelChange(model.provider, model.id);
-					await this.advanceContextProjection(entryId);
-				} else {
-					this.pendingSessionWrites.push({ type: "model_change", provider: model.provider, modelId: model.id });
-				}
+		if (this.providerHookConfigurationAttempt && isSameModel(this.model, model) && this.thinkingLevel === level) {
+			return;
+		}
+		const previousModel = this.model;
+		const previousLevel = this.thinkingLevel;
+		++this.runtimeConfigurationEpoch;
+		const transaction = this.orderRuntimeConfigurationWrite(async () => {
+			await this.waitForProviderAdmission();
+			if (options.persist !== false) {
+				const basis = await this.session.getBranchSnapshot();
+				const commit = await this.session.commitBatch({
+					guard: { kind: "descendant", cursor: basis.cursor },
+					mutations: [
+						...(model === undefined
+							? []
+							: [
+									{
+										kind: "append" as const,
+										entry: {
+											type: "model_change" as const,
+											provider: model.provider,
+											modelId: model.id,
+										},
+									},
+								]),
+						{
+							kind: "append",
+							entry: { type: "thinking_level_change", thinkingLevel: level },
+						},
+					],
+				});
+				if (commit.outcome !== "committed") throw commit.error;
+				this.applyVerifiedProjectionAdvance(commit.advance);
 			}
 			this.model = model;
+			this.thinkingLevel = level;
+		});
+		const mutation = (async () => {
+			try {
+				await transaction;
+			} catch (error) {
+				throw normalizeHarnessError(error, "session");
+			}
 			await this.emitOwn({
 				type: "model_update",
 				model,
 				previousModel,
 				source: options.persist === false ? "restore" : "set",
 			});
-		} catch (error) {
-			throw normalizeHarnessError(error, "session");
-		}
+			await this.emitOwn({ type: "thinking_level_update", level, previousLevel });
+		})();
+		await this.trackAdmittedMutation(mutation);
+	}
+
+	async setModel(model: Model<any> | undefined, options: { persist?: boolean } = {}): Promise<void> {
+		this.assertNotDisposed();
+		if (this.providerHookConfigurationAttempt && isSameModel(this.model, model)) return;
+		const previousModel = this.model;
+		++this.runtimeConfigurationEpoch;
+		const transaction = this.orderRuntimeConfigurationWrite(async () => {
+			await this.waitForProviderAdmission();
+			if (options.persist !== false && model) {
+				const entryId = await this.session.appendModelChange(model.provider, model.id);
+				await this.advanceContextProjection(entryId);
+			}
+			this.model = model;
+		});
+		const mutation = (async () => {
+			try {
+				await transaction;
+				await this.emitOwn({
+					type: "model_update",
+					model,
+					previousModel,
+					source: options.persist === false ? "restore" : "set",
+				});
+			} catch (error) {
+				throw normalizeHarnessError(error, "session");
+			}
+		})();
+		await this.trackAdmittedMutation(mutation);
 	}
 
 	getThinkingLevel(): ThinkingLevel {
@@ -2604,21 +3310,26 @@ export class AgentHarness<
 
 	async setThinkingLevel(level: ThinkingLevel, options: { persist?: boolean } = {}): Promise<void> {
 		this.assertNotDisposed();
-		try {
-			const previousLevel = this.thinkingLevel;
+		if (this.providerHookConfigurationAttempt && this.thinkingLevel === level) return;
+		const previousLevel = this.thinkingLevel;
+		++this.runtimeConfigurationEpoch;
+		const transaction = this.orderRuntimeConfigurationWrite(async () => {
+			await this.waitForProviderAdmission();
 			if (options.persist !== false) {
-				if (this.phase === "idle") {
-					const entryId = await this.session.appendThinkingLevelChange(level);
-					await this.advanceContextProjection(entryId);
-				} else {
-					this.pendingSessionWrites.push({ type: "thinking_level_change", thinkingLevel: level });
-				}
+				const entryId = await this.session.appendThinkingLevelChange(level);
+				await this.advanceContextProjection(entryId);
 			}
 			this.thinkingLevel = level;
-			await this.emitOwn({ type: "thinking_level_update", level, previousLevel });
-		} catch (error) {
-			throw normalizeHarnessError(error, "session");
-		}
+		});
+		const mutation = (async () => {
+			try {
+				await transaction;
+				await this.emitOwn({ type: "thinking_level_update", level, previousLevel });
+			} catch (error) {
+				throw normalizeHarnessError(error, "session");
+			}
+		})();
+		await this.trackAdmittedMutation(mutation);
 	}
 
 	getTools(): TTool[] {
@@ -2627,37 +3338,51 @@ export class AgentHarness<
 
 	async setTools(tools: TTool[], activeToolNames?: string[]): Promise<void> {
 		this.assertNotDisposed();
+		const replayActiveToolNames = activeToolNames ?? this.activeToolNames;
+		if (
+			this.providerHookConfigurationAttempt &&
+			tools.length === this.tools.size &&
+			tools.every((tool) => this.tools.get(tool.name) === tool) &&
+			replayActiveToolNames.length === this.activeToolNames.length &&
+			replayActiveToolNames.every((name, index) => name === this.activeToolNames[index])
+		) {
+			return;
+		}
 		try {
 			this.validateUniqueNames(
 				tools.map((tool) => tool.name),
 				"Duplicate tool name(s)",
 			);
 			const nextTools = new Map(tools.map((tool) => [tool.name, tool]));
-			const nextActiveToolNames = activeToolNames ? [...activeToolNames] : this.activeToolNames;
-			this.validateToolNames(nextActiveToolNames, nextTools);
-			const previousToolNames = [...this.tools.keys()];
-			const previousActiveToolNames = [...this.activeToolNames];
-			if (this.persistActiveToolChanges) {
-				if (this.phase === "idle") {
+			let nextActiveToolNames: string[] = [];
+			let previousToolNames: string[] = [];
+			let previousActiveToolNames: string[] = [];
+			++this.runtimeConfigurationEpoch;
+			const transaction = this.orderRuntimeConfigurationWrite(async () => {
+				await this.waitForProviderAdmission();
+				nextActiveToolNames = activeToolNames ? [...activeToolNames] : [...this.activeToolNames];
+				this.validateToolNames(nextActiveToolNames, nextTools);
+				previousToolNames = [...this.tools.keys()];
+				previousActiveToolNames = [...this.activeToolNames];
+				if (this.persistActiveToolChanges) {
 					const entryId = await this.session.appendActiveToolsChange(nextActiveToolNames);
 					await this.advanceContextProjection(entryId);
-				} else {
-					this.pendingSessionWrites.push({
-						type: "active_tools_change",
-						activeToolNames: [...nextActiveToolNames],
-					});
 				}
-			}
-			this.tools = nextTools;
-			this.activeToolNames = [...nextActiveToolNames];
-			await this.emitOwn({
-				type: "tools_update",
-				toolNames: [...this.tools.keys()],
-				previousToolNames,
-				activeToolNames: [...this.activeToolNames],
-				previousActiveToolNames,
-				source: "set",
+				this.tools = nextTools;
+				this.activeToolNames = [...nextActiveToolNames];
 			});
+			const mutation = (async () => {
+				await transaction;
+				await this.emitOwn({
+					type: "tools_update",
+					toolNames: [...this.tools.keys()],
+					previousToolNames,
+					activeToolNames: [...this.activeToolNames],
+					previousActiveToolNames,
+					source: "set",
+				});
+			})();
+			await this.trackAdmittedMutation(mutation);
 		} catch (error) {
 			throw normalizeHarnessError(error, "invalid_argument");
 		}
@@ -2669,27 +3394,41 @@ export class AgentHarness<
 
 	async setActiveTools(toolNames: string[]): Promise<void> {
 		this.assertNotDisposed();
+		if (
+			this.providerHookConfigurationAttempt &&
+			toolNames.length === this.activeToolNames.length &&
+			toolNames.every((name, index) => name === this.activeToolNames[index])
+		) {
+			return;
+		}
 		try {
-			this.validateToolNames(toolNames);
-			const previousToolNames = [...this.tools.keys()];
-			const previousActiveToolNames = [...this.activeToolNames];
-			if (this.persistActiveToolChanges) {
-				if (this.phase === "idle") {
-					const entryId = await this.session.appendActiveToolsChange(toolNames);
+			const nextToolNames = [...toolNames];
+			let previousToolNames: string[] = [];
+			let previousActiveToolNames: string[] = [];
+			++this.runtimeConfigurationEpoch;
+			const transaction = this.orderRuntimeConfigurationWrite(async () => {
+				await this.waitForProviderAdmission();
+				this.validateToolNames(nextToolNames);
+				previousToolNames = [...this.tools.keys()];
+				previousActiveToolNames = [...this.activeToolNames];
+				if (this.persistActiveToolChanges) {
+					const entryId = await this.session.appendActiveToolsChange(nextToolNames);
 					await this.advanceContextProjection(entryId);
-				} else {
-					this.pendingSessionWrites.push({ type: "active_tools_change", activeToolNames: [...toolNames] });
 				}
-			}
-			this.activeToolNames = [...toolNames];
-			await this.emitOwn({
-				type: "tools_update",
-				toolNames: [...this.tools.keys()],
-				previousToolNames,
-				activeToolNames: [...this.activeToolNames],
-				previousActiveToolNames,
-				source: "set",
+				this.activeToolNames = [...nextToolNames];
 			});
+			const mutation = (async () => {
+				await transaction;
+				await this.emitOwn({
+					type: "tools_update",
+					toolNames: [...this.tools.keys()],
+					previousToolNames,
+					activeToolNames: [...this.activeToolNames],
+					previousActiveToolNames,
+					source: "set",
+				});
+			})();
+			await this.trackAdmittedMutation(mutation);
 		} catch (error) {
 			throw normalizeHarnessError(error, "invalid_argument");
 		}
@@ -2741,7 +3480,9 @@ export class AgentHarness<
 			...(resources.skills === undefined ? {} : { skills: resources.skills.slice() }),
 			...(resources.promptTemplates === undefined ? {} : { promptTemplates: resources.promptTemplates.slice() }),
 		};
-		await this.emitOwn({ type: "resources_update", resources: this.getResources(), previousResources });
+		await this.trackAdmittedMutation(
+			this.emitOwn({ type: "resources_update", resources: this.getResources(), previousResources }),
+		);
 	}
 
 	getStreamOptions(): AgentHarnessStreamOptions {
@@ -2750,19 +3491,28 @@ export class AgentHarness<
 
 	async setStreamOptions(streamOptions: AgentHarnessStreamOptions): Promise<void> {
 		this.assertNotDisposed();
-		this.streamOptions = cloneStreamOptions(streamOptions);
+		const next = cloneStreamOptions(streamOptions);
+		if (this.providerHookConfigurationAttempt && areStructurallyEqual(this.streamOptions, next)) return;
+		++this.runtimeConfigurationEpoch;
+		const transaction = this.orderRuntimeConfigurationWrite(async () => {
+			await this.waitForProviderAdmission();
+			this.streamOptions = cloneStreamOptions(next);
+		});
+		await this.trackAdmittedMutation(transaction);
 	}
 
 	getPhase(): AgentHarnessPhase {
-		return this.phase;
+		const operation = this.operations.current;
+		if (!operation) return "idle";
+		return operation.kind === "turn" ? "turn" : operation.kind;
+	}
+
+	isReservedOrRunning(): boolean {
+		return this.operations.current !== undefined;
 	}
 
 	get signal(): AbortSignal | undefined {
-		return this.activeRun?.abortController.signal;
-	}
-
-	get activeDeliverySettlement(): Promise<void> | undefined {
-		return this.activeRun?.deliverySettlement;
+		return this.operations.current?.abortGate.signal;
 	}
 
 	get activeRunSnapshot(): AgentRunSnapshot | undefined {
@@ -2770,8 +3520,8 @@ export class AgentHarness<
 		return run
 			? Object.freeze({
 					runId: run.id,
-					source: run.abortSource,
-					diagnosticTimestamp: run.diagnosticTimestamp,
+					source: run.operation.abortSource,
+					diagnosticTimestamp: run.operation.diagnosticTimestamp,
 					requestAccepted: run.requestAccepted,
 					phase: run.phase,
 				})
@@ -2779,20 +3529,22 @@ export class AgentHarness<
 	}
 
 	abort(source?: AgentAbortSource): AgentAbortAcceptance {
-		const run = this.activeRun;
-		if (!run || run.phase === "settled") {
-			return Object.freeze({ runId: run?.id, accepted: false, source: run?.abortSource });
+		const operation = this.operations.current;
+		const acceptance = this.operations.requestAbort(source);
+		if (operation?.kind === "turn" && operation.phase === "admitted") {
+			let cancelledReservation = false;
+			for (const [reservationId, reservation] of this.runReservations) {
+				if (reservation !== operation) continue;
+				this.runReservations.delete(reservationId);
+				cancelledReservation = true;
+			}
+			if (cancelledReservation) this.operations.finish(operation);
 		}
-		if (source !== undefined && run.abortSource === undefined) {
-			run.abortSource = source;
-			run.diagnosticTimestamp = Date.now();
-		}
-		run.abortController.abort();
-		return Object.freeze({ runId: run.id, accepted: true, source: run.abortSource });
+		return acceptance;
 	}
 
 	waitForIdle(): Promise<void> {
-		return this.runPromise ?? Promise.resolve();
+		return this.operations.waitForIdle();
 	}
 
 	subscribe(

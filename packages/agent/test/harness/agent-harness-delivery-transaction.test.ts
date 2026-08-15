@@ -1,16 +1,15 @@
-import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@hansjm10/volt-ai";
+import { fauxAssistantMessage, registerFauxProvider } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
 import { AgentHarness } from "../../src/harness/agent-harness.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import { InMemorySessionStorage } from "../../src/harness/session/memory-storage.ts";
 import { Session } from "../../src/harness/session/session.ts";
 import type {
-	AgentDelivery,
-	AgentDeliveryPreparation,
-	AgentDeliveryTransactionParticipant,
+	AgentDeliveryCommitContext,
+	AgentDeliveryOwner,
+	AgentDeliveryPreparationOutcome,
 	AgentMessage,
 } from "../../src/types.ts";
-import { calculateTool } from "../utils/calculate.ts";
 
 const registrations: Array<{ unregister(): void }> = [];
 
@@ -34,619 +33,459 @@ function getUserTexts(messages: readonly AgentMessage[]): string[] {
 	});
 }
 
-function createHarness(
-	options: Omit<ConstructorParameters<typeof AgentHarness>[0], "env" | "session" | "model"> & {
-		session?: Session;
-		registration?: ReturnType<typeof registerFauxProvider>;
-	} = {},
-): { harness: AgentHarness; registration: ReturnType<typeof registerFauxProvider>; session: Session } {
-	const registration = options.registration ?? registerFauxProvider();
+function createHarness(options: { session?: Session; deliveryOwner?: AgentDeliveryOwner } = {}) {
+	const registration = registerFauxProvider();
 	registrations.push(registration);
 	const session = options.session ?? new Session(new InMemorySessionStorage());
-	const { registration: _registration, session: _session, ...harnessOptions } = options;
 	return {
 		harness: new AgentHarness({
 			env: new NodeExecutionEnv({ cwd: process.cwd() }),
 			session,
 			model: registration.getModel(),
-			...harnessOptions,
+			...(options.deliveryOwner === undefined ? {} : { deliveryOwner: options.deliveryOwner }),
 		}),
 		registration,
 		session,
 	};
 }
 
-describe("AgentHarness delivery transactions", () => {
-	it("exposes readonly delivery preparation output", () => {
-		const assertReadonlyPreparation = (preparation: AgentDeliveryPreparation): void => {
-			// @ts-expect-error Delivery preparation messages are a readonly property.
+function createPersistingOwner(session: Session, overrides: Partial<AgentDeliveryOwner> = {}): AgentDeliveryOwner {
+	return {
+		prepareLogical: (context) => ({ outcome: "prepared", messages: structuredClone(context.sourceMessages) }),
+		commitAttempt: async (context) => {
+			return { outcome: "committed", receipt: await commitMessages(session, context) };
+		},
+		finish: () => undefined,
+		...overrides,
+	};
+}
+
+async function commitMessages(session: Session, context: AgentDeliveryCommitContext): Promise<unknown> {
+	const snapshot = await session.getBranchSnapshot();
+	const result = await session.commitBatch({
+		guard: { kind: "exact", cursor: snapshot.cursor },
+		mutations: context.preparedMessages.map((message) => ({
+			kind: "append" as const,
+			entry: { type: "message" as const, message: structuredClone(message) },
+		})),
+		deliveryAttribution: {
+			deliveryId: context.deliveryId,
+			epoch: context.epoch,
+			attemptId: context.attemptId,
+		},
+	});
+	if (result.outcome !== "committed") throw result.error;
+	return result.receipt;
+}
+
+async function attestNoEffect(session: Session, context: AgentDeliveryCommitContext): Promise<unknown> {
+	const snapshot = await session.getBranchSnapshot();
+	const result = await session.commitBatch({
+		guard: { kind: "exact", cursor: snapshot.cursor },
+		mutations: [],
+		deliveryAttribution: {
+			deliveryId: context.deliveryId,
+			epoch: context.epoch,
+			attemptId: context.attemptId,
+		},
+	});
+	if (result.outcome !== "committed") throw result.error;
+	return result.receipt;
+}
+
+describe("AgentHarness delivery ownership", () => {
+	it("exposes immutable preparation outcomes", () => {
+		const assertReadonly = (preparation: AgentDeliveryPreparationOutcome): void => {
+			if (preparation.outcome !== "prepared") return;
+			// @ts-expect-error Prepared messages are readonly.
 			preparation.messages = [];
-			// @ts-expect-error Delivery preparation messages are a readonly array.
+			// @ts-expect-error Prepared message arrays are readonly.
 			preparation.messages.push({ role: "user", content: "invalid", timestamp: 0 });
-			// @ts-expect-error Delivery preparation participants are a readonly property.
-			preparation.participant = {} as AgentDeliveryTransactionParticipant;
 		};
-		expectTypeOf(assertReadonlyPreparation).toBeFunction();
+		expectTypeOf(assertReadonly).toBeFunction();
 	});
 
-	it("awaits side-effect-free preparation and participant durability before publication or provider work", async () => {
+	it("awaits preparation and commit before publication or provider work", async () => {
 		const preparationStarted = deferred();
 		const releasePreparation = deferred();
-		const settlementStarted = deferred();
-		const releaseSettlement = deferred();
-		const events: string[] = [];
-		let deliveryId = "";
+		const commitStarted = deferred();
+		const releaseCommit = deferred();
 		const session = new Session(new InMemorySessionStorage());
-		const { harness, registration } = createHarness({
-			session,
-			prepareDelivery: async (delivery, signal) => {
-				deliveryId = delivery.deliveryId;
-				expect(signal.aborted).toBe(false);
+		let deliveryId = "";
+		const owner = createPersistingOwner(session, {
+			prepareLogical: async (context) => {
+				deliveryId = context.deliveryId;
 				preparationStarted.resolve();
 				await releasePreparation.promise;
-				return {
-					messages: [...delivery.messages],
-					participant: {
-						settle: async () => {
-							settlementStarted.resolve();
-							await releaseSettlement.promise;
-							for (const message of delivery.messages) await session.appendMessage(structuredClone(message));
-							return { outcome: "committed" };
-						},
-					},
-				};
+				return { outcome: "prepared", messages: context.sourceMessages };
+			},
+			commitAttempt: async (context) => {
+				commitStarted.resolve();
+				await releaseCommit.promise;
+				return { outcome: "committed", receipt: await commitMessages(session, context) };
 			},
 		});
+		const { harness, registration } = createHarness({ session, deliveryOwner: owner });
 		registration.setResponses([() => fauxAssistantMessage("done")]);
-		harness.subscribe((event) => {
-			events.push(event.type);
-		});
 
 		const running = harness.runPrompt("transactional prompt");
 		await preparationStarted.promise;
-		expect(harness.canPrepareDelivery(deliveryId)).toBe(true);
-		expect(events).toEqual(["agent_start"]);
 		expect(registration.state.callCount).toBe(0);
 		expect((await session.buildContext()).messages).toEqual([]);
 		releasePreparation.resolve();
-
-		await settlementStarted.promise;
-		expect(harness.canPrepareDelivery(deliveryId)).toBe(false);
+		await commitStarted.promise;
 		expect(await harness.discardPendingPrompt()).toEqual([]);
-		expect(events).toEqual(["agent_start"]);
 		expect(registration.state.callCount).toBe(0);
-		releaseSettlement.resolve();
+		releaseCommit.resolve();
 
-		expect(await running).toEqual({
+		await expect(running).resolves.toEqual({
 			status: "completed",
 			deliveries: [{ deliveryId, kind: "prompt", outcome: "committed" }],
 		});
-		expect(events).toContain("delivery_start");
 		expect(registration.state.callCount).toBe(1);
 	});
 
-	it("allows passive delivery publication to append provider-inert session metadata", async () => {
+	it("caches logical preparation once and creates a fresh retained attempt", async () => {
 		const session = new Session(new InMemorySessionStorage());
-		const { harness, registration } = createHarness({
-			session,
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				participant: {
-					settle: async (context) => {
-						for (const message of context.messages) await session.appendMessage(structuredClone(message));
-						return { outcome: "committed" };
-					},
-				},
-			}),
-		});
-		let providerTexts: string[] = [];
-		registration.setResponses([
-			(context) => {
-				providerTexts = getUserTexts(context.messages as AgentMessage[]);
-				return fauxAssistantMessage("done");
+		let prepareCalls = 0;
+		let commitCalls = 0;
+		const attempts: string[] = [];
+		const owner = createPersistingOwner(session, {
+			prepareLogical: (context) => {
+				prepareCalls++;
+				return { outcome: "prepared", messages: context.sourceMessages };
 			},
-		]);
-		let metadataAppended = false;
-		harness.subscribe(async (event) => {
-			if (metadataAppended || event.type !== "delivery_start" || event.deliveryId === undefined) return;
-			metadataAppended = true;
-			await session.appendSessionName("Generated title");
-		});
-
-		const result = await harness.runPrompt("continue after metadata");
-
-		expect(result).toMatchObject({ status: "completed", deliveries: [{ outcome: "committed" }] });
-		expect(metadataAppended).toBe(true);
-		expect(registration.state.callCount).toBe(1);
-		expect(providerTexts).toEqual(["continue after metadata"]);
-	});
-
-	it("admits structured messages through the same stable prompt delivery", async () => {
-		const prepared: AgentDelivery[] = [];
-		const requestTexts: string[] = [];
-		const { harness, registration } = createHarness({
-			prepareDelivery: (delivery) => {
-				prepared.push(delivery);
-				return { messages: [...delivery.messages] };
-			},
-		});
-		registration.setResponses([
-			(context) => {
-				requestTexts.push(...getUserTexts(context.messages as AgentMessage[]));
-				return fauxAssistantMessage("done");
-			},
-		]);
-		const message = { role: "user", content: "structured input", timestamp: Date.now() } as const;
-
-		const result = await harness.run(message);
-
-		expect(result).toMatchObject({ status: "completed", deliveries: [{ kind: "prompt", outcome: "committed" }] });
-		expect(prepared).toHaveLength(1);
-		expect(getUserTexts(prepared[0]!.messages)).toEqual(["structured input"]);
-		expect(requestTexts).toEqual(["structured input"]);
-	});
-
-	it("retains an immutable attempt for explicit retry with the same delivery identity", async () => {
-		const deliveryIds: string[] = [];
-		const attemptedTexts: string[][] = [];
-		let settlementCalls = 0;
-		const session = new Session(new InMemorySessionStorage());
-		const { harness, registration } = createHarness({
-			session,
-			prepareDelivery: (delivery) => {
-				deliveryIds.push(delivery.deliveryId);
-				attemptedTexts.push(getUserTexts(delivery.messages));
-				const preparedMessages = delivery.messages.map((message) => structuredClone(message));
-				const user = delivery.messages.find((message) => message.role === "user");
-				if (settlementCalls === 0 && user?.role === "user" && Array.isArray(user.content)) {
-					const text = user.content.find((content) => content.type === "text");
-					if (text?.type === "text") text.text = "mutated attempt copy";
+			commitAttempt: async (context) => {
+				attempts.push(context.attemptId);
+				commitCalls++;
+				if (commitCalls === 1) {
+					return {
+						outcome: "retained",
+						error: new Error("safe retry"),
+						noEffectReceipt: await attestNoEffect(session, context),
+					};
 				}
-				return {
-					messages: preparedMessages,
-					participant: {
-						settle: async (context) => {
-							settlementCalls++;
-							expect(context.deliveryId).toBe(delivery.deliveryId);
-							expect(context.kind).toBe("prompt");
-							if (settlementCalls === 1) {
-								return { outcome: "retained", error: new Error("definitive rollback") };
-							}
-							for (const message of context.messages) await session.appendMessage(structuredClone(message));
-							return { outcome: "committed" };
-						},
-					},
-				};
+				return { outcome: "committed", receipt: await commitMessages(session, context) };
 			},
 		});
+		const { harness, registration } = createHarness({ session, deliveryOwner: owner });
 		registration.setResponses([() => fauxAssistantMessage("retried")]);
 
-		const failed = await harness.runPrompt("immutable input");
-		expect(failed).toMatchObject({
-			status: "delivery_failed",
-			failure: { outcome: "retained", phase: "settlement", error: { message: "definitive rollback" } },
-		});
-		expect(registration.state.callCount).toBe(0);
-		expect(harness.hasPendingPrompt()).toBe(true);
-		expect((await session.buildContext()).messages).toEqual([]);
-
-		const retried = await harness.continue();
-		expect(retried).toMatchObject({ status: "completed", deliveries: [{ outcome: "committed" }] });
-		expect(new Set(deliveryIds)).toHaveLength(1);
-		expect(attemptedTexts).toEqual([["immutable input"], ["immutable input"]]);
-		expect(settlementCalls).toBe(2);
-		expect(registration.state.callCount).toBe(1);
-	});
-
-	it("reduces retained delivery messages once and gives each attempt a fresh participant context", async () => {
-		let preparationCalls = 0;
-		let reducerCalls = 0;
-		let settlementCalls = 0;
-		let canonicalAtPublication: string[] = [];
-		const participantMessageArrays: Array<readonly AgentMessage[]> = [];
-		const lifecycle: string[] = [];
-		const providerTexts: string[][] = [];
-		const session = new Session(new InMemorySessionStorage());
-		const { harness, registration } = createHarness({
-			session,
-			prepareDelivery: (delivery) => {
-				preparationCalls++;
-				return {
-					messages: delivery.messages.map((message) => structuredClone(message)),
-					participant: {
-						settle: async (context) => {
-							settlementCalls++;
-							participantMessageArrays.push(context.messages);
-							expect(context.kind).toBe("prompt");
-							expect(context.deliveryId).toMatch(/^harness-delivery:/);
-							expect(getUserTexts(context.messages)).toEqual(["reduced once"]);
-							if (settlementCalls === 1) {
-								return { outcome: "retained", error: new Error("retry reduced delivery") };
-							}
-							for (const message of context.messages) await session.appendMessage(structuredClone(message));
-							return { outcome: "committed" };
-						},
-					},
-				};
-			},
-		});
-		harness.on("message_end", (event) => {
-			if (event.deliveryId === undefined || event.message.role !== "user") return undefined;
-			reducerCalls++;
-			return {
-				message: {
-					...event.message,
-					content: [{ type: "text", text: "reduced once" }],
-				},
-			};
-		});
-		harness.subscribe(async (event) => {
-			if (!("deliveryId" in event) || event.deliveryId === undefined) return;
-			if (event.type === "delivery_start") {
-				canonicalAtPublication = getUserTexts((await session.buildContext()).messages);
-			}
-			if (event.type === "delivery_start" || event.type === "message_start" || event.type === "message_end") {
-				lifecycle.push(event.type);
-			}
-		});
-		registration.setResponses([
-			(context) => {
-				providerTexts.push(getUserTexts(context.messages as AgentMessage[]));
-				return fauxAssistantMessage("committed");
-			},
-		]);
-
-		await expect(harness.runPrompt("original")).resolves.toMatchObject({
+		await expect(harness.runPrompt("retry me")).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: { outcome: "retained" },
 		});
-		expect(lifecycle).toEqual([]);
 		await expect(harness.continue()).resolves.toMatchObject({ status: "completed" });
 
-		expect(preparationCalls).toBe(2);
-		expect(reducerCalls).toBe(1);
-		expect(settlementCalls).toBe(2);
-		expect(participantMessageArrays[0]).not.toBe(participantMessageArrays[1]);
-		expect(canonicalAtPublication).toEqual(["reduced once"]);
-		expect(lifecycle).toEqual(["delivery_start", "message_start", "message_end"]);
-		expect(providerTexts).toEqual([["reduced once"]]);
+		expect(prepareCalls).toBe(1);
+		expect(commitCalls).toBe(2);
+		expect(new Set(attempts)).toHaveLength(2);
+		expect(registration.state.callCount).toBe(1);
 	});
 
-	it("fails closed when fresh preparation changes a retained delivery payload", async () => {
-		let preparationCalls = 0;
-		let reducerCalls = 0;
-		let settlementCalls = 0;
-		const { harness, registration } = createHarness({
-			prepareDelivery: (delivery) => {
-				preparationCalls++;
-				return {
-					messages:
-						preparationCalls === 1
-							? delivery.messages.map((message) => structuredClone(message))
-							: [{ role: "user", content: "changed preparation", timestamp: Date.now() }],
-					participant: {
-						settle: () => {
-							settlementCalls++;
-							return { outcome: "retained", error: new Error("retain first attempt") };
-						},
-					},
-				};
+	it("keeps a retained rollback unavailable until owner finalization settles", async () => {
+		const preparationStarted = deferred();
+		const releasePreparation = deferred();
+		const finishStarted = deferred();
+		const releaseFinish = deferred();
+		const session = new Session(new InMemorySessionStorage());
+		let prepareCalls = 0;
+		const owner = createPersistingOwner(session, {
+			prepareLogical: async (context) => {
+				prepareCalls++;
+				if (prepareCalls === 1) {
+					preparationStarted.resolve();
+					await releasePreparation.promise;
+				}
+				return { outcome: "prepared", messages: context.sourceMessages };
+			},
+			finish: async (context) => {
+				if (context.outcome !== "retained") return;
+				finishStarted.resolve();
+				await releaseFinish.promise;
 			},
 		});
-		harness.on("message_end", (event) => {
-			if (event.deliveryId !== undefined) reducerCalls++;
-			return undefined;
-		});
-		registration.setResponses([() => fauxAssistantMessage("must remain unused")]);
+		const { harness, registration } = createHarness({ session, deliveryOwner: owner });
+		registration.setResponses([() => fauxAssistantMessage("resumed")]);
 
-		await expect(harness.runPrompt("stable preparation")).resolves.toMatchObject({
-			status: "delivery_failed",
-			failure: { outcome: "retained", phase: "settlement" },
+		const running = harness.runPrompt("rollback me");
+		await preparationStarted.promise;
+		harness.abort("remote_request");
+		releasePreparation.resolve();
+		await finishStarted.promise;
+		await expect(harness.continue()).rejects.toMatchObject({ code: "busy" });
+		expect(registration.state.callCount).toBe(0);
+
+		releaseFinish.resolve();
+		await expect(running).resolves.toMatchObject({ deliveries: [{ outcome: "retained" }] });
+		await expect(harness.continue()).resolves.toMatchObject({ status: "completed" });
+		expect(prepareCalls).toBe(1);
+		expect(registration.state.callCount).toBe(1);
+	});
+
+	it("serializes discard behind an in-flight retained rollback finalizer", async () => {
+		const preparationStarted = deferred();
+		const releasePreparation = deferred();
+		const retainedFinishStarted = deferred();
+		const releaseRetainedFinish = deferred();
+		const revokedFinishCompleted = deferred();
+		const finishCalls: Array<{ attemptId: string | undefined; outcome: string }> = [];
+		const session = new Session(new InMemorySessionStorage());
+		const owner = createPersistingOwner(session, {
+			prepareLogical: async (context) => {
+				preparationStarted.resolve();
+				await releasePreparation.promise;
+				return { outcome: "prepared", messages: context.sourceMessages };
+			},
+			finish: async (context) => {
+				finishCalls.push({ attemptId: context.attemptId, outcome: context.outcome });
+				if (context.outcome === "retained") {
+					retainedFinishStarted.resolve();
+					await releaseRetainedFinish.promise;
+				} else if (context.outcome === "revoked") {
+					revokedFinishCompleted.resolve();
+				}
+			},
 		});
-		await expect(harness.continue()).resolves.toMatchObject({
+		const { harness } = createHarness({ session, deliveryOwner: owner });
+
+		const running = harness.runPrompt("discard rollback");
+		await preparationStarted.promise;
+		harness.abort("remote_request");
+		releasePreparation.resolve();
+		await retainedFinishStarted.promise;
+
+		const discarding = harness.discardPendingPrompt();
+		await Promise.resolve();
+		expect(finishCalls).toEqual([{ attemptId: expect.any(String), outcome: "retained" }]);
+		releaseRetainedFinish.resolve();
+		await expect(discarding).resolves.toHaveLength(1);
+		await revokedFinishCompleted.promise;
+		await running;
+
+		expect(finishCalls).toEqual([
+			{ attemptId: expect.any(String), outcome: "retained" },
+			{ attemptId: undefined, outcome: "revoked" },
+		]);
+		expect(harness.hasPendingPrompt()).toBe(false);
+	});
+
+	it("coerces retained preparation to terminal when owner finalization fails", async () => {
+		const owner: AgentDeliveryOwner = {
+			prepareLogical: () => ({ outcome: "retained", error: new Error("retry requested") }),
+			commitAttempt: () => {
+				throw new Error("commit must not run");
+			},
+			finish: () => {
+				throw new Error("owner cleanup failed");
+			},
+		};
+		const { harness, registration } = createHarness({ deliveryOwner: owner });
+		registration.setResponses([() => fauxAssistantMessage("unexpected")]);
+
+		await expect(harness.runPrompt("cannot retain")).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: {
 				outcome: "terminally_failed",
 				phase: "preparation",
-				error: {
-					name: "AgentDeliveryPreparationReplayMismatchError",
-					message: expect.stringContaining("changed the prepared messages"),
-				},
+				error: expect.objectContaining({ message: "Delivery preparation and owner finalization failed" }),
 			},
 		});
+		await harness.waitForClosed();
 
-		expect(preparationCalls).toBe(2);
-		expect(reducerCalls).toBe(1);
-		expect(settlementCalls).toBe(1);
-		expect(registration.state.callCount).toBe(0);
 		expect(harness.hasPendingPrompt()).toBe(false);
-		const internals = harness as unknown as {
-			deliveryPreparationStates: Map<string, unknown>;
-			deliveryAttemptParticipants: Map<string, unknown>;
-			continuationState: unknown;
-		};
-		expect(internals.deliveryPreparationStates.size).toBe(0);
-		expect(internals.deliveryAttemptParticipants.size).toBe(0);
-		expect(internals.continuationState).toBeUndefined();
-		await expect(harness.continue()).resolves.toEqual({ status: "completed", deliveries: [] });
-		expect(preparationCalls).toBe(2);
+		expect(registration.state.callCount).toBe(0);
+		await expect(harness.continue()).rejects.toThrow("AgentHarness is disposed");
 	});
 
-	it("revokes a leased delivery while preparation is pending without settling its participant", async () => {
-		const preparationStarted = deferred();
-		const releasePreparation = deferred();
-		let deliveryId = "";
-		let participantCalls = 0;
-		const revoked: AgentDelivery[] = [];
-		const { harness, session } = createHarness({
-			prepareDelivery: async (delivery) => {
-				deliveryId = delivery.deliveryId;
-				preparationStarted.resolve();
-				await releasePreparation.promise;
-				return {
-					messages: [...delivery.messages],
-					participant: {
-						settle: () => {
-							participantCalls++;
-							return { outcome: "committed" };
-						},
-					},
-				};
+	it("classifies preparation rejection as terminal without provider work", async () => {
+		let finishOutcome = "";
+		const owner: AgentDeliveryOwner = {
+			prepareLogical: () => Promise.reject(new Error("preparation crashed")),
+			commitAttempt: () => {
+				throw new Error("commit must not run");
 			},
-			deliveryRevoked: (delivery) => revoked.push(delivery),
-		});
-
-		const running = harness.runPrompt("revoke me");
-		await preparationStarted.promise;
-		expect(await harness.discardPendingPrompt()).toEqual([deliveryId]);
-		releasePreparation.resolve();
-
-		expect(await running).toEqual({
-			status: "completed",
-			deliveries: [{ deliveryId, kind: "prompt", outcome: "revoked" }],
-		});
-		expect(participantCalls).toBe(0);
-		expect(revoked).toHaveLength(1);
-		expect(getUserTexts(revoked[0]!.messages)).toEqual(["revoke me"]);
-		expect((await session.buildContext()).messages).toEqual([]);
-	});
-
-	it.each([
-		{
-			name: "an explicit terminal outcome",
-			settle: () => ({ outcome: "terminally_failed" as const, error: new Error("durability ambiguous") }),
-		},
-		{
-			name: "a rejected participant",
-			settle: () => Promise.reject(new Error("participant crashed")),
-		},
-	])("terminally fences $name", async ({ settle }) => {
-		const { harness, registration, session } = createHarness({
-			prepareDelivery: (delivery) => ({ messages: [...delivery.messages], participant: { settle } }),
-		});
+			finish: (context) => {
+				finishOutcome = context.outcome;
+			},
+		};
+		const { harness, registration } = createHarness({ deliveryOwner: owner });
 		registration.setResponses([() => fauxAssistantMessage("unexpected")]);
 
-		const result = await harness.runPrompt("unsafe retry");
+		await expect(harness.runPrompt("unsafe")).resolves.toMatchObject({
+			status: "delivery_failed",
+			failure: { outcome: "terminally_failed", phase: "preparation" },
+		});
+		expect(finishOutcome).toBe("terminally_failed");
+		expect(registration.state.callCount).toBe(0);
+		expect(harness.hasPendingPrompt()).toBe(false);
+	});
 
-		expect(result).toMatchObject({
+	it("fences retired canonical authority without producing failure messages", async () => {
+		const owner: AgentDeliveryOwner = {
+			prepareLogical: (context) => ({ outcome: "prepared", messages: context.sourceMessages }),
+			commitAttempt: () => ({
+				outcome: "terminally_failed",
+				error: new Error("commit authority is uncertain"),
+				authority: "retired",
+			}),
+			finish: () => undefined,
+		};
+		const { harness, registration, session } = createHarness({ deliveryOwner: owner });
+		registration.setResponses([() => fauxAssistantMessage("unexpected")]);
+
+		await expect(harness.runPrompt("uncertain")).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: { outcome: "terminally_failed", phase: "settlement" },
 		});
-		expect(harness.hasQueuedMessages()).toBe(false);
+		await harness.waitForClosed();
+
 		expect(registration.state.callCount).toBe(0);
-		const messages = (await session.buildContext()).messages as AgentMessage[];
-		expect(getUserTexts(messages)).toEqual([]);
-		const failureMessage = messages.find((message) => message.role === "assistant");
-		expect(failureMessage).toMatchObject({
-			role: "assistant",
-			diagnostics: [
-				{
-					type: "delivery_transaction_failure",
-					details: { outcome: "terminally_failed", phase: "settlement", kind: "prompt" },
-				},
-			],
-		});
+		expect((await session.buildContext()).messages).toEqual([]);
+		await expect(harness.runPrompt("late")).rejects.toThrow("AgentHarness is disposed");
 	});
 
-	it("preserves the explicit projection and committed FIFO prefix when a later participant retains", async () => {
-		let retainSecond = true;
+	it("fault-closes after committed durability when owner finalization fails", async () => {
 		const session = new Session(new InMemorySessionStorage());
-		await session.appendMessage({ role: "user", content: "canonical baseline", timestamp: Date.now() });
-		const explicitContext = { role: "user", content: "explicit baseline", timestamp: Date.now() } as const;
-		const secondDeliveryIds: string[] = [];
-		let providerTexts: string[] = [];
-		let providerSystemPrompt = "";
-		const { harness, registration } = createHarness({
-			session,
-			steeringMode: "all",
-			prepareDelivery: (delivery) => {
-				const texts = getUserTexts(delivery.messages);
-				if (texts.includes("second")) secondDeliveryIds.push(delivery.deliveryId);
-				return {
-					messages: [...delivery.messages],
-					participant: {
-						settle: async () => {
-							if (texts.includes("second") && retainSecond) {
-								return { outcome: "retained", error: new Error("retain second") };
-							}
-							for (const message of delivery.messages) await session.appendMessage(structuredClone(message));
-							return { outcome: "committed" };
+		const owner = createPersistingOwner(session, {
+			finish: (context) => {
+				if (context.outcome === "committed") throw new Error("committed cleanup failed");
+			},
+		});
+		const { harness, registration } = createHarness({ session, deliveryOwner: owner });
+		registration.setResponses([() => fauxAssistantMessage("must not run")]);
+
+		await expect(harness.runPrompt("durable input")).resolves.toMatchObject({
+			deliveries: [{ outcome: "committed" }],
+		});
+		await expect(harness.waitForClosed()).rejects.toThrow("AgentHarness close drains failed");
+
+		expect(getUserTexts((await session.buildContext()).messages)).toEqual(["durable input"]);
+		expect(registration.state.callCount).toBe(0);
+		await expect(harness.continue()).rejects.toThrow("AgentHarness is disposed");
+	});
+
+	it("rejects an attributed retained receipt with a canonical label effect", async () => {
+		const session = new Session(new InMemorySessionStorage());
+		const targetId = await session.appendMessage({ role: "user", content: "basis", timestamp: 1 });
+		const owner = createPersistingOwner(session, {
+			commitAttempt: async (context) => {
+				const snapshot = await session.getBranchSnapshot();
+				const result = await session.commitBatch({
+					guard: { kind: "exact", cursor: snapshot.cursor },
+					mutations: [
+						{
+							kind: "append",
+							entry: { type: "label", targetId, label: "not a no-effect" },
 						},
+					],
+					deliveryAttribution: {
+						deliveryId: context.deliveryId,
+						epoch: context.epoch,
+						attemptId: context.attemptId,
 					},
+				});
+				if (result.outcome !== "committed") throw result.error;
+				return {
+					outcome: "retained",
+					error: new Error("pretend retry"),
+					noEffectReceipt: result.receipt,
 				};
 			},
 		});
-		registration.setResponses([
-			(context) => {
-				providerTexts = getUserTexts(context.messages as AgentMessage[]);
-				providerSystemPrompt = context.systemPrompt ?? "";
-				return fauxAssistantMessage("retried");
-			},
-		]);
-		let queued = false;
-		harness.subscribe(async (event) => {
-			if (event.type === "agent_start" && !queued) {
-				queued = true;
-				await harness.steer("first");
-				await harness.steer("second");
-			}
-		});
+		const { harness, registration } = createHarness({ session, deliveryOwner: owner });
+		registration.setResponses([() => fauxAssistantMessage("must not run")]);
 
-		const failed = await harness.runPrompt("prompt", {
-			context: [explicitContext],
-			systemPrompt: "explicit system prompt",
-		});
-		expect(failed).toMatchObject({
+		await expect(harness.runPrompt("malicious receipt")).resolves.toMatchObject({
 			status: "delivery_failed",
-			deliveries: [{ outcome: "committed" }, { outcome: "committed" }, { outcome: "retained" }],
+			failure: { outcome: "terminally_failed", phase: "settlement" },
 		});
+		await harness.waitForClosed();
 		expect(registration.state.callCount).toBe(0);
-		expect(getUserTexts((await session.buildContext()).messages as AgentMessage[])).toEqual([
-			"canonical baseline",
-			"prompt",
-			"first",
-		]);
-		expect(harness.hasQueuedMessages()).toBe(true);
-
-		retainSecond = false;
-		const retried = await harness.continue();
-		expect(retried).toMatchObject({ status: "completed", deliveries: [{ outcome: "committed" }] });
-		expect(registration.state.callCount).toBe(1);
-		expect(new Set(secondDeliveryIds)).toHaveLength(1);
-		expect(secondDeliveryIds).toHaveLength(2);
-		expect(providerTexts).toEqual(["explicit baseline", "prompt", "first", "second"]);
-		expect(providerSystemPrompt).toBe("explicit system prompt");
-		expect(getUserTexts((await session.buildContext()).messages as AgentMessage[])).toEqual([
-			"canonical baseline",
-			"prompt",
-			"first",
-			"second",
-		]);
 	});
 
-	it("treats committed delivery publication as cloned passive observation", async () => {
-		const laterEvents: Array<{ type: string; texts: string[] }> = [];
-		const session = new Session(new InMemorySessionStorage());
-		const { harness, registration } = createHarness({
-			session,
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				participant: {
-					settle: async () => {
-						for (const message of delivery.messages) await session.appendMessage(structuredClone(message));
-						return { outcome: "committed" };
-					},
-				},
-			}),
-		});
-		let providerTexts: string[] = [];
-		registration.setResponses([
-			(context) => {
-				providerTexts = getUserTexts(context.messages as AgentMessage[]);
-				return fauxAssistantMessage("done");
+	it("revokes pending preparation and ignores its late completion", async () => {
+		const preparationStarted = deferred();
+		const releasePreparation = deferred();
+		let commitCalls = 0;
+		let finishOutcome = "";
+		const owner: AgentDeliveryOwner = {
+			prepareLogical: async (context) => {
+				preparationStarted.resolve();
+				await releasePreparation.promise;
+				return { outcome: "prepared", messages: context.sourceMessages };
 			},
-		]);
-		harness.subscribe((event) => {
-			if (
-				(event.type === "delivery_start" || event.type === "message_start" || event.type === "message_end") &&
-				"deliveryId" in event &&
-				event.deliveryId
-			) {
-				const messages = event.type === "delivery_start" ? event.messages : [event.message];
-				const user = messages.find((message) => message.role === "user");
-				if (user?.role === "user" && Array.isArray(user.content)) {
-					const text = user.content.find((content) => content.type === "text");
-					if (text?.type === "text") text.text = "mutated observer snapshot";
-				}
-				throw new Error("delivery observer failed");
-			}
-		});
-		harness.subscribe((event) => {
-			if (
-				(event.type === "delivery_start" || event.type === "message_start" || event.type === "message_end") &&
-				"deliveryId" in event &&
-				event.deliveryId
-			) {
-				laterEvents.push({
-					type: event.type,
-					texts: getUserTexts(event.type === "delivery_start" ? event.messages : [event.message]),
-				});
-			}
-		});
+			commitAttempt: () => {
+				commitCalls++;
+				return { outcome: "committed", receipt: {} };
+			},
+			finish: (context) => {
+				finishOutcome = context.outcome;
+			},
+		};
+		const { harness, registration } = createHarness({ deliveryOwner: owner });
+		registration.setResponses([() => fauxAssistantMessage("unexpected")]);
 
-		const result = await harness.runPrompt("authoritative input");
-
-		expect(result).toMatchObject({ status: "completed", deliveries: [{ outcome: "committed" }] });
-		expect(providerTexts).toEqual(["authoritative input"]);
-		expect(getUserTexts((await session.buildContext()).messages as AgentMessage[])).toEqual(["authoritative input"]);
-		expect(laterEvents).toEqual([
-			{ type: "delivery_start", texts: ["authoritative input"] },
-			{ type: "message_start", texts: ["authoritative input"] },
-			{ type: "message_end", texts: ["authoritative input"] },
-		]);
+		const running = harness.runPrompt("revoke me");
+		await preparationStarted.promise;
+		const discarding = harness.discardPendingPrompt();
+		await Promise.resolve();
+		expect(finishOutcome).toBe("");
+		releasePreparation.resolve();
+		await expect(discarding).resolves.toHaveLength(1);
+		await expect(running).resolves.toMatchObject({ deliveries: [{ outcome: "revoked" }] });
+		expect(finishOutcome).toBe("revoked");
+		expect(commitCalls).toBe(0);
+		expect(registration.state.callCount).toBe(0);
 	});
 
-	it("persists participant-owned and Harness-owned deliveries exactly once", async () => {
-		const participantSession = new Session(new InMemorySessionStorage());
-		const participant = createHarness({
-			session: participantSession,
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				participant: {
-					settle: async () => {
-						for (const message of delivery.messages) {
-							await participantSession.appendMessage(structuredClone(message));
-						}
-						return { outcome: "committed" };
-					},
-				},
-			}),
-		});
-		participant.registration.setResponses([() => fauxAssistantMessage("done")]);
-		await participant.harness.runPrompt("participant-owned");
+	it("fault-closes when detached revocation finalization fails", async () => {
+		const owner: AgentDeliveryOwner = {
+			prepareLogical: (context) => ({ outcome: "prepared", messages: context.sourceMessages }),
+			commitAttempt: () => {
+				throw new Error("commit must not run");
+			},
+			finish: () => {
+				throw new Error("revocation cleanup failed");
+			},
+		};
+		const { harness } = createHarness();
+		harness.queueSteer({ role: "user", content: "revoke", timestamp: 1 }, owner);
 
-		const harnessOwned = createHarness();
-		harnessOwned.registration.setResponses([() => fauxAssistantMessage("done")]);
-		await harnessOwned.harness.runPrompt("harness-owned");
+		await expect(harness.clearSteeringQueue()).rejects.toThrow("revocation cleanup failed");
 
-		expect(getUserTexts((await participantSession.buildContext()).messages as AgentMessage[])).toEqual([
-			"participant-owned",
-		]);
-		expect(getUserTexts((await harnessOwned.session.buildContext()).messages as AgentMessage[])).toEqual([
-			"harness-owned",
-		]);
+		await expect(harness.waitForClosed()).rejects.toThrow("AgentHarness close drains failed");
+		await expect(harness.runPrompt("late")).rejects.toThrow("AgentHarness is disposed");
 	});
 
-	it("continues provider and tool work without recommitting participant-owned input", async () => {
-		let settlementCalls = 0;
+	it("preserves a committed FIFO prefix when the next delivery retains", async () => {
 		const session = new Session(new InMemorySessionStorage());
-		const { harness, registration } = createHarness({
-			session,
-			tools: [calculateTool],
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				participant: {
-					settle: async () => {
-						settlementCalls++;
-						for (const message of delivery.messages) await session.appendMessage(structuredClone(message));
-						return { outcome: "committed" };
-					},
-				},
-			}),
+		let retained = true;
+		const owner = createPersistingOwner(session, {
+			commitAttempt: async (context) => {
+				const text = getUserTexts(context.preparedMessages)[0];
+				if (text === "second" && retained) {
+					return {
+						outcome: "retained",
+						error: new Error("retain second"),
+						noEffectReceipt: await attestNoEffect(session, context),
+					};
+				}
+				return { outcome: "committed", receipt: await commitMessages(session, context) };
+			},
 		});
-		registration.setResponses([
-			() =>
-				fauxAssistantMessage(fauxToolCall("calculate", { expression: "2 + 2" }, { id: "call-1" }), {
-					stopReason: "toolUse",
-				}),
-			() => fauxAssistantMessage("done"),
-		]);
+		const { harness, registration } = createHarness({ session, deliveryOwner: owner });
+		registration.setResponses([() => fauxAssistantMessage("done")]);
+		harness.queueSteer({ role: "user", content: "first", timestamp: 1 }, owner);
+		harness.queueSteer({ role: "user", content: "second", timestamp: 2 }, owner);
 
-		const result = await harness.runPrompt("use a tool");
-
-		expect(result).toMatchObject({ status: "completed", deliveries: [{ outcome: "committed" }] });
-		expect(registration.state.callCount).toBe(2);
-		expect(settlementCalls).toBe(1);
-		expect(getUserTexts((await session.buildContext()).messages as AgentMessage[])).toEqual(["use a tool"]);
+		await expect(harness.continue()).resolves.toMatchObject({
+			status: "delivery_failed",
+			deliveries: [{ outcome: "committed" }, { outcome: "retained" }],
+		});
+		expect(getUserTexts((await session.buildContext()).messages)).toEqual(["first"]);
+		retained = false;
+		await expect(harness.continue()).resolves.toMatchObject({ status: "completed" });
+		expect(getUserTexts((await session.buildContext()).messages)).toEqual(["first", "second"]);
 	});
 });

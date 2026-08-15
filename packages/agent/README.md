@@ -50,7 +50,7 @@ The package has two execution layers:
 - `AgentHarness` is the reusable stateful orchestrator. It owns runtime configuration, queues, transactional delivery, persistence coordination, lifecycle state, hooks, and turn execution.
 - `agent-loop.ts` is the stateless execution kernel. Use it only when the host needs to own all state, persistence, event settlement, and request policy itself.
 
-The supplied `Session` is the persisted conversation authority. Harness queues and active-run state are runtime state; committed messages are written to the session.
+The supplied `Session` is the persisted conversation authority. Store-issued projection cursors identify one branch revision, and guarded declarative batches are the only canonical mutation seam. Harness queues, operation leases, and overlays are runtime state; committed messages are written to the session.
 
 ## Messages and context
 
@@ -88,47 +88,59 @@ A turn snapshot fixes the model, thinking level, active tools, resources, system
 
 ## Transactional delivery
 
-Harness admits prompt, steering, and follow-up messages into one stable inbox. A host that owns canonical persistence can attach a participant during side-effect-free preparation:
+Harness admits prompt, steering, and follow-up messages into one stable inbox. A host that owns canonical persistence installs an `AgentDeliveryOwner` before the delivery becomes visible:
 
 ```typescript
-const harness = new AgentHarness({
-  env,
-  session,
-  model,
-  prepareDelivery: (delivery) => ({
-    messages: [...delivery.messages],
-    participant: {
-      settle: async ({ deliveryId, kind, messages, requestAbort }) => {
-        const result = await persistDeliveryAtomically({ deliveryId, kind, messages });
-        if (result === "rolled_back") {
-          return { outcome: "retained", error: new Error("Persistence rolled back") };
-        }
-        if (result === "ambiguous") {
-          requestAbort("disposal");
-          return {
-            outcome: "terminally_failed",
-            error: new Error("Persistence outcome is ambiguous"),
-          };
-        }
-        return { outcome: "committed" };
-      },
-    },
+const deliveryOwner = {
+  prepareLogical: ({ sourceMessages }) => ({
+    outcome: "prepared",
+    messages: sourceMessages,
   }),
-});
+  async commitAttempt({ deliveryId, epoch, attemptId, preparedMessages }) {
+    const basis = await session.getBranchSnapshot();
+    const result = await session.commitBatch({
+      guard: { kind: "exact", cursor: basis.cursor },
+      deliveryAttribution: { deliveryId, epoch, attemptId },
+      mutations: preparedMessages.map((message) => ({
+        kind: "append",
+        entry: { type: "message", message },
+      })),
+    });
+    if (result.outcome === "committed") {
+      return { outcome: "committed", receipt: result.receipt };
+    }
+    if (result.outcome === "rolled_back") {
+      const current = await session.getBranchSnapshot();
+      const noEffect = await session.commitBatch({
+        guard: { kind: "exact", cursor: current.cursor },
+        deliveryAttribution: { deliveryId, epoch, attemptId },
+        mutations: [],
+      });
+      if (noEffect.outcome === "committed") {
+        return { outcome: "retained", error: result.error, noEffectReceipt: noEffect.receipt };
+      }
+      return { outcome: "terminally_failed", error: noEffect.error };
+    }
+    return { outcome: "terminally_failed", error: result.error, authority: "retired" };
+  },
+  finish: ({ outcome }) => updateHostProjection(outcome),
+} satisfies AgentDeliveryOwner;
+
+const harness = new AgentHarness({ env, session, model, deliveryOwner });
 ```
 
-Preparation must not mutate canonical host state. Its returned fields and message array are readonly. Harness invokes `prepareDelivery` for every attempt, so each call must return a fresh participant and the same logical messages for a retained delivery. Completed message reductions may be cached across retained attempts, but participant instances are never reused. A changed replay payload is terminally fenced; ordinary preparation errors remain retryable.
+`prepareLogical()` is side-effect-free. One successful immutable preparation is cached for the logical delivery; a retained retry receives a fresh attempt ID without rerunning it. Preparation failure is retained only when the owner explicitly returns `retained`; thrown failures and unsafe effects are terminal.
 
-Harness snapshots delivery payloads at admission and gives hooks, participants, and observers isolated copies. Participants must persist the reduced `messages` from their transaction context, not messages captured by the preparation closure. Passive `delivery_start`, `message_start`, and `message_end` publication occurs only after commitment and before provider work.
+`commitAttempt()` receives the frozen prepared messages and must return a store-verifiable committed or no-effect receipt bound to the delivery ID, inbox epoch, and attempt ID. Harness rejects forged, stale, cross-session, or same-delta receipts. An uncertain write retires the session authority and suppresses provider work. `finish()` is passive projection cleanup and cannot perform canonical writes.
 
-Participant outcomes are:
+Delivery outcomes are:
 
 - `committed`: publish the delivery and permit provider work.
 - `retained`: restore the same logical delivery and stable ID for explicit retry.
 - `terminally_failed`: consume unsafe-to-replay work and stop the run.
 - `revoked`: reported by Harness when explicit revocation wins before settlement begins.
 
-A supplied participant owns canonical persistence for that delivery. Harness does not append the prepared delivery messages again. Without a participant, Harness persists committed delivery messages through the supplied session.
+A supplied owner owns canonical persistence for that delivery. Harness does not append the prepared delivery messages again. Without a custom owner, Harness uses its built-in owner and the supplied session's guarded batch API.
 
 ```typescript
 const result = await harness.runPrompt("Apply the change");
@@ -153,7 +165,6 @@ Useful lifecycle projections include:
 - `getPhase()`
 - `signal`
 - `activeRunSnapshot`
-- `activeDeliverySettlement`
 - `waitForIdle()`
 
 Queue revocation is explicit:
@@ -165,7 +176,7 @@ await harness.clearAllQueues();
 await harness.discardPendingPrompt();
 ```
 
-`dispose()` is terminal and idempotent. It synchronously aborts the active run, fences later persistence, and revokes retained delivery, queue, and continuation state without waiting for an active callback to return. Its receipt therefore may resolve before `waitForIdle()` would. Subsequent prompting, continuation, queue mutation, append, compaction, navigation, and configuration operations reject.
+`requestClose()` is the terminal synchronous fence. It rejects new admission and mutations, aborts an open operation, revokes work that has not crossed its commit boundary, and makes late callbacks inert. `dispose()` is its fence-only conventional alias and returns `void`; use `waitForClosed()` from external lifecycle code to join the active operation, delivery settlement, notifications, and persistence drain. Owner callbacks may request close but must not join closure from inside themselves.
 
 ## Prompting and queues
 
@@ -271,7 +282,7 @@ const repo = new InMemorySessionRepo();
 const session = await repo.create({ id: "session-1" });
 ```
 
-A custom `SessionStorage` must preserve canonical entry IDs, parent links, leaf changes, metadata, and append ordering.
+A custom `SessionStorage` must provide atomic branch snapshots and guarded declarative `commitBatch()` operations. Runtime storage exposes no imperative append or leaf setter; append, move, summary, and label effects all cross the guarded batch seam. The store issues opaque `ProjectionCursor` and `SessionMutationReceipt` capabilities, verifies receipt ownership, preserves parent/leaf ordering, and classifies every batch as `committed`, `rolled_back`, or `uncertain`. Exact guards are compare-and-swap; descendant guards may tail-append only while the cursor branch remains an ancestor. An uncertain authority must reject later canonical work until reopened or reconciled.
 
 ## Low-level loop
 

@@ -909,6 +909,7 @@ describe("subagent tool", () => {
 		const session = await createSession({ manager });
 
 		session.dispose();
+		await session.waitForClosed();
 
 		expect(dispose).toHaveBeenCalledOnce();
 	});

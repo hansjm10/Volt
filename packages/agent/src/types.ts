@@ -133,63 +133,68 @@ export interface AgentRunSnapshot {
 /** Delivery class used by the stateful orchestrator's inbox. */
 export type AgentDeliveryKind = "prompt" | "steer" | "followUp";
 
-/** Stable pending delivery passed to `prepareDelivery`. */
+/** Stable pending delivery owned by one Harness inbox epoch. */
 export interface AgentDelivery {
 	/** Runtime inbox identity; never substitutes for an ID carried by a message. */
 	readonly deliveryId: string;
 	readonly kind: AgentDeliveryKind;
 	readonly messages: readonly AgentMessage[];
+	readonly epoch: number;
 }
 
-/** Result returned by a host participant after the orchestrator crosses the revocation cutoff. */
-export type AgentDeliveryParticipantOutcome =
-	| { readonly outcome: "committed" }
+interface AgentDeliveryOwnerContext {
+	readonly deliveryId: string;
+	readonly kind: AgentDeliveryKind;
+	readonly epoch: number;
+	readonly attemptId: string;
+	readonly signal: AbortSignal;
+	requestAbort(source?: AgentAbortSource): AgentAbortAcceptance;
+	requestClose(source?: AgentAbortSource): void;
+}
+
+/** Side-effect-free preparation context. Canonical writes are forbidden in this phase. */
+export interface AgentDeliveryPreparationContext extends AgentDeliveryOwnerContext {
+	readonly sourceMessages: readonly AgentMessage[];
+}
+
+export type AgentDeliveryPreparationOutcome =
+	| { readonly outcome: "prepared"; readonly messages: readonly AgentMessage[] }
 	| { readonly outcome: "retained"; readonly error: Error }
 	| { readonly outcome: "terminally_failed"; readonly error: Error };
 
-/** Reentrant-safe lifecycle capability available only while participant work settles. */
-export interface AgentDeliveryTransactionContext {
-	/** Stable identity of the delivery being settled. */
+/** Attempt-scoped commit context. A retained retry receives a fresh attempt ID. */
+export interface AgentDeliveryCommitContext extends AgentDeliveryOwnerContext {
+	readonly preparedMessages: readonly AgentMessage[];
+}
+
+export type AgentDeliveryCommitOutcome =
+	| { readonly outcome: "committed"; readonly receipt: unknown }
+	| { readonly outcome: "retained"; readonly error: Error; readonly noEffectReceipt: unknown }
+	| {
+			readonly outcome: "terminally_failed";
+			readonly error: Error;
+			readonly failureReceipt?: unknown;
+			readonly authority?: "retired";
+	  };
+
+export interface AgentDeliveryFinishContext {
 	readonly deliveryId: string;
-	/** Inbox class of the delivery being settled. */
 	readonly kind: AgentDeliveryKind;
-	/** Isolated, reduced messages that must be committed for this delivery. */
-	readonly messages: readonly AgentMessage[];
-	/** Record abort intent without awaiting the orchestrator run that invoked this participant. */
-	requestAbort(source?: AgentAbortSource): AgentAbortAcceptance;
+	readonly epoch: number;
+	readonly attemptId: string | undefined;
+	readonly outcome: "committed" | "retained" | "terminally_failed" | "revoked";
+	readonly receipt?: unknown;
+	readonly error?: Error;
 }
 
-/** Host durability work attached to one orchestrator-owned delivery attempt. */
-export interface AgentDeliveryTransactionParticipant {
-	/**
-	 * Settle the orchestrator's commit decision exactly once.
-	 *
-	 * Throwing or rejecting is classified as `terminally_failed`; safe replay
-	 * requires an explicit `retained` result.
-	 */
-	settle(
-		context: AgentDeliveryTransactionContext,
-	): AgentDeliveryParticipantOutcome | Promise<AgentDeliveryParticipantOutcome>;
-}
-
-/**
- * Side-effect-free messages plus attempt-scoped work settled only after delivery ownership transfers.
- * `prepareDelivery` must create a fresh participant for every attempt; participants are never reused.
- */
-export interface AgentDeliveryPreparation {
-	readonly messages: readonly AgentMessage[];
-	readonly participant?: AgentDeliveryTransactionParticipant;
-}
-
-/** @internal Signals that replay preparation changed an already-cached delivery payload. */
-export class AgentDeliveryPreparationReplayMismatchError extends Error {
-	readonly deliveryId: string;
-
-	constructor(deliveryId: string) {
-		super(`prepareDelivery changed the prepared messages for retained delivery ${deliveryId}`);
-		this.name = "AgentDeliveryPreparationReplayMismatchError";
-		this.deliveryId = deliveryId;
-	}
+/** Stable owner installed before a delivery is admitted into the Harness inbox. */
+export interface AgentDeliveryOwner {
+	prepareLogical(
+		context: AgentDeliveryPreparationContext,
+	): AgentDeliveryPreparationOutcome | Promise<AgentDeliveryPreparationOutcome>;
+	commitAttempt(context: AgentDeliveryCommitContext): AgentDeliveryCommitOutcome | Promise<AgentDeliveryCommitOutcome>;
+	/** Passive projection cleanup only. Canonical writes are forbidden. */
+	finish(context: AgentDeliveryFinishContext): void | Promise<void>;
 }
 
 interface AgentDeliveryAttemptBase {

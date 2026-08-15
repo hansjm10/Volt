@@ -91,7 +91,9 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 
 	afterEach(async () => {
 		while (harnesses.length > 0) {
-			await harnesses.pop()!.session.dispose();
+			const session = harnesses.pop()!.session;
+			session.dispose();
+			await session.waitForClosed();
 		}
 		while (tempDirs.length > 0) {
 			rmSync(tempDirs.pop()!, { recursive: true, force: true });
@@ -171,7 +173,8 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 	it("atomically commits a resumed session missing its final newline", async () => {
 		const { harness, sessionFile, baseline } = await setup();
 		harnesses.pop();
-		await harness.session.dispose();
+		harness.session.dispose();
+		await harness.session.waitForClosed();
 		harness.cleanup();
 		const persisted = readFileSync(sessionFile, "utf8");
 		writeFileSync(sessionFile, persisted.trimEnd(), "utf8");
@@ -213,7 +216,8 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 			1,
 		);
 		harnesses.pop();
-		await harness.session.dispose().catch(() => {});
+		harness.session.dispose();
+		await harness.session.waitForClosed().catch(() => {});
 		harness.cleanup();
 	});
 

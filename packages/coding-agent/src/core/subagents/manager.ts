@@ -546,6 +546,7 @@ class LocalSubagentHandle implements SubagentHandle {
 	private promptStarted = false;
 	private promptAccepted = false;
 	private promptMessageObserved = false;
+	private promptSettlementObserved = false;
 	private endSettled = false;
 	private ownershipSettled = false;
 	private disposed = false;
@@ -608,6 +609,10 @@ class LocalSubagentHandle implements SubagentHandle {
 				this.onPromptAccepted(message);
 				this.promptAccepted = true;
 			});
+			// Handler-owned prompts may settle before their success response reaches
+			// this client. Join that buffered settlement only after this prompt's RPC
+			// admission is authoritative.
+			if (this.promptSettlementObserved) this.startSettlementWatcher();
 		} catch (error) {
 			await this.onPromptFailed(error).catch(() => undefined);
 			this.settleOwnership();
@@ -712,6 +717,9 @@ class LocalSubagentHandle implements SubagentHandle {
 		if (event.type === "agent_end" && this.promptMessageObserved) {
 			this.latestEndEvent = event;
 		}
+		if (event.type === "agent_settled" && this.promptStarted) {
+			this.promptSettlementObserved = true;
+		}
 		for (const listener of this.eventListeners) {
 			try {
 				listener(event);
@@ -719,13 +727,17 @@ class LocalSubagentHandle implements SubagentHandle {
 				// Listener failures should not break the child RPC event stream.
 			}
 		}
-		const shouldWatchSettlement =
-			(event.type === "agent_end" && this.promptMessageObserved) ||
-			(event.type === "agent_settled" && this.promptAccepted);
-		if (shouldWatchSettlement && !this.settlementWatcherStarted && !this.disposed && !this.endSettled) {
-			this.settlementWatcherStarted = true;
-			void this.settleAfterIdle();
-		}
+		// agent_end is a turn projection, not the prompt transaction's terminal
+		// boundary: retry and compaction continuations emit intermediate agent_end
+		// events. AgentSession publishes agent_settled only after all continuations
+		// have finished, so select the latest result at that authoritative boundary.
+		if (event.type === "agent_settled" && this.promptAccepted) this.startSettlementWatcher();
+	}
+
+	private startSettlementWatcher(): void {
+		if (this.settlementWatcherStarted || this.disposed || this.endSettled || !this.promptAccepted) return;
+		this.settlementWatcherStarted = true;
+		void this.settleAfterIdle();
 	}
 
 	private async settleAfterIdle(): Promise<void> {

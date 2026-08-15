@@ -6021,14 +6021,14 @@ export class InteractiveMode {
 		}
 	}
 
-	private applyProfileDefaultThinkingLevel(thinkingLevelOverride?: ThinkingLevel): boolean {
+	private async applyProfileDefaultThinkingLevel(thinkingLevelOverride?: ThinkingLevel): Promise<boolean> {
 		const defaultThinkingLevel = thinkingLevelOverride ?? this.settingsManager.getDefaultThinkingLevel();
 		if (defaultThinkingLevel === undefined) {
 			return false;
 		}
 
 		const previousThinkingLevel = this.session.thinkingLevel;
-		this.session.setThinkingLevel(defaultThinkingLevel, { persistDefault: false });
+		await this.session.setThinkingLevel(defaultThinkingLevel, { persistDefault: false });
 		return this.session.thinkingLevel !== previousThinkingLevel;
 	}
 
@@ -6049,7 +6049,7 @@ export class InteractiveMode {
 				}
 				try {
 					await this.session.setModel(selectedScopedModel.model, { persistDefault: false });
-					this.applyProfileDefaultThinkingLevel(selectedScopedModel.thinkingLevel);
+					await this.applyProfileDefaultThinkingLevel(selectedScopedModel.thinkingLevel);
 					this.footer.invalidate();
 					this.updateEditorBorderColor();
 					void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedScopedModel.model);
@@ -6061,7 +6061,7 @@ export class InteractiveMode {
 				}
 				return;
 			}
-			if (this.applyProfileDefaultThinkingLevel(selectedScopedModel?.thinkingLevel)) {
+			if (await this.applyProfileDefaultThinkingLevel(selectedScopedModel?.thinkingLevel)) {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 			}
@@ -6086,7 +6086,7 @@ export class InteractiveMode {
 		const selectedThinkingLevel = selectedScopedModel?.thinkingLevel;
 
 		if (modelsAreEqual(this.session.model, selectedModel)) {
-			if (this.applyProfileDefaultThinkingLevel(selectedThinkingLevel)) {
+			if (await this.applyProfileDefaultThinkingLevel(selectedThinkingLevel)) {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 			}
@@ -6101,7 +6101,7 @@ export class InteractiveMode {
 
 		try {
 			await this.session.setModel(selectedModel, { persistDefault: false });
-			this.applyProfileDefaultThinkingLevel(selectedThinkingLevel);
+			await this.applyProfileDefaultThinkingLevel(selectedThinkingLevel);
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
 			void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel);

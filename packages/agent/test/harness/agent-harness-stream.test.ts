@@ -157,6 +157,81 @@ describe("AgentHarness stream configuration", () => {
 		expect(capturedOptions?.env).toEqual({ BASE_ENV: "base", AUTH_ENV: "auth", SHARED_ENV: "auth" });
 	});
 
+	it("rebuilds canonical context and atomic runtime configuration after provider request hooks", async () => {
+		const registration = registerFauxProvider({
+			models: [
+				{ id: "first", reasoning: true },
+				{ id: "second", reasoning: true },
+			],
+		});
+		registrations.push(registration);
+		const secondModel = registration.getModel("second");
+		if (!secondModel) throw new Error("missing second faux model");
+		let captured:
+			| { hookModel: string | undefined; modelId: string; reasoning: unknown; userTexts: string[] }
+			| undefined;
+		const hookModels: string[] = [];
+		const conversionStarted = deferred();
+		const releaseConversion = deferred();
+		let blockedConversion = false;
+		registration.setResponses([
+			(context, options, _state, model) => {
+				captured = {
+					hookModel: options?.headers?.["x-hook-model"],
+					modelId: model.id,
+					reasoning: options && "reasoning" in options ? options.reasoning : undefined,
+					userTexts: context.messages.flatMap((message) =>
+						message.role === "user"
+							? [
+									typeof message.content === "string"
+										? message.content
+										: message.content
+												.filter((content) => content.type === "text")
+												.map((content) => content.text)
+												.join(""),
+								]
+							: [],
+					),
+				};
+				return fauxAssistantMessage("ok");
+			},
+		]);
+		const harness = createHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session: new Session(new InMemorySessionStorage()),
+			model: registration.getModel(),
+			thinkingLevel: "off",
+			convertToLlm: async (messages) => {
+				if (!blockedConversion && JSON.stringify(messages).includes("hook append")) {
+					blockedConversion = true;
+					conversionStarted.resolve();
+					await releaseConversion.promise;
+				}
+				return convertToLlm(messages);
+			},
+		});
+		harness.on("before_provider_request", async (event) => {
+			hookModels.push(event.model.id);
+			await harness.appendMessage({ role: "user", content: "hook append", timestamp: 2 });
+			await harness.setModelAndThinkingLevel(secondModel, "high");
+			return { streamOptions: { headers: { "x-hook-model": event.model.id } } };
+		});
+
+		const running = harness.prompt("initial");
+		await conversionStarted.promise;
+		await harness.setThinkingLevel("medium");
+		releaseConversion.resolve();
+		await running;
+
+		expect(captured).toEqual({
+			hookModel: "second",
+			modelId: "second",
+			reasoning: "high",
+			userTexts: ["initial", "hook append"],
+		});
+		expect(hookModels).toEqual(["first", "second", "second", "second"]);
+	});
+
 	it("stops before provider hooks when aborted during credential resolution", async () => {
 		const credentialsStarted = deferred();
 		const releaseCredentials = deferred();
@@ -458,5 +533,35 @@ describe("AgentHarness stream configuration", () => {
 		expect(capturedOptions?.metadata).toEqual({ base: true, hook: true });
 		expect(payloadHookCalls).toBe(1);
 		expect(responseHookCalls).toBe(1);
+	});
+
+	it("preserves operation-requested reasoning for structural provider work", async () => {
+		const registration = registerFauxProvider({ models: [{ id: "reasoning", reasoning: true }] });
+		registrations.push(registration);
+		registration.setResponses([() => fauxAssistantMessage("summary")]);
+		let capturedReasoning: unknown;
+		const harness = createHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session: new Session(new InMemorySessionStorage()),
+			model: registration.getModel(),
+			thinkingLevel: "xhigh",
+			streamFn: (model, context, options) => {
+				capturedReasoning = options?.reasoning;
+				return streamSimple(model, context, options);
+			},
+		});
+
+		await harness.runTreeOperation(async (operation) => {
+			const stream = await operation.streamFn(
+				registration.getModel(),
+				{ messages: [{ role: "user", content: "summarize", timestamp: 1 }] },
+				{ reasoning: "low" },
+			);
+			for await (const _event of stream) {
+				// Drain the policy-wrapped stream.
+			}
+		});
+
+		expect(capturedReasoning).toBe("low");
 	});
 });

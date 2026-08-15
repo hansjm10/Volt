@@ -2,20 +2,20 @@ import type { ImageContent, JsonCompatibleInput, JsonValue, TextContent } from "
 import type { AgentMessage } from "../../types.ts";
 import { createBranchSummaryMessage, createCompactionSummaryMessage, createCustomMessage } from "../messages.ts";
 import type {
-	ActiveToolsChangeEntry,
-	BranchSummaryEntry,
+	CanonicalCommitResult,
 	CompactionEntry,
-	CustomEntry,
-	CustomMessageEntry,
-	LabelEntry,
-	MessageEntry,
-	ModelChangeEntry,
+	PendingSessionWrite,
+	ProjectionAdvance,
+	ProjectionCursor,
+	ResolvedSessionMutationReceipt,
+	SessionBranchSnapshot,
 	SessionContext,
-	SessionInfoEntry,
 	SessionMetadata,
+	SessionMutationBatch,
+	SessionMutationReceipt,
 	SessionStorage,
+	SessionStorageBranchSnapshot,
 	SessionTreeEntry,
-	ThinkingLevelChangeEntry,
 } from "../types.ts";
 import { SessionError } from "../types.ts";
 
@@ -85,6 +85,79 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
 	};
 }
 
+function sameStringArray(left: readonly string[] | null, right: readonly string[] | null): boolean {
+	if (left === null || right === null) return left === right;
+	return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function samePersistedPolicy(left: SessionContext, right: SessionContext): boolean {
+	return (
+		left.thinkingLevel === right.thinkingLevel &&
+		left.model?.provider === right.model?.provider &&
+		left.model?.modelId === right.model?.modelId &&
+		sameStringArray(left.activeToolNames, right.activeToolNames)
+	);
+}
+
+function toBranchSnapshot(snapshot: SessionStorageBranchSnapshot): SessionBranchSnapshot {
+	return {
+		...snapshot,
+		context: buildSessionContext([...snapshot.entries]),
+	};
+}
+
+function buildProjectionAdvance(
+	basisStorageSnapshot: SessionStorageBranchSnapshot,
+	targetStorageSnapshot: SessionStorageBranchSnapshot,
+): ProjectionAdvance {
+	const basis = toBranchSnapshot(basisStorageSnapshot);
+	const target = toBranchSnapshot(targetStorageSnapshot);
+	let branchRelation: ProjectionAdvance["branchRelation"];
+	if (basis.cursor.branchIdentity === target.cursor.branchIdentity) {
+		branchRelation = "same";
+	} else if (
+		basis.cursor.branchIdentity === null ||
+		target.entries.some((entry) => entry.id === basis.cursor.branchIdentity)
+	) {
+		branchRelation = "descendant";
+	} else {
+		branchRelation = "diverged";
+	}
+
+	let messages: ProjectionAdvance["messages"];
+	if (branchRelation === "same") {
+		messages = { kind: "unchanged" };
+	} else if (branchRelation === "diverged") {
+		messages = { kind: "rewrite", values: target.context.messages.map((message) => structuredClone(message)) };
+	} else {
+		const suffixStart =
+			basis.cursor.branchIdentity === null
+				? 0
+				: target.entries.findIndex((entry) => entry.id === basis.cursor.branchIdentity) + 1;
+		const suffix = target.entries.slice(suffixStart);
+		if (suffix.some((entry) => entry.type === "compaction")) {
+			messages = { kind: "rewrite", values: target.context.messages.map((message) => structuredClone(message)) };
+		} else {
+			const appended = target.context.messages
+				.slice(basis.context.messages.length)
+				.map((message) => structuredClone(message));
+			messages = appended.length === 0 ? { kind: "unchanged" } : { kind: "append", values: appended };
+		}
+	}
+
+	return {
+		cursor: target.cursor,
+		branchRelation,
+		messages,
+		persistedPolicy: {
+			model: target.context.model === null ? null : { ...target.context.model },
+			thinkingLevel: target.context.thinkingLevel,
+			activeToolNames: target.context.activeToolNames === null ? null : [...target.context.activeToolNames],
+		},
+		persistedPolicyChanged: !samePersistedPolicy(basis.context, target.context),
+	};
+}
+
 export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 	private storage: SessionStorage<TMetadata>;
 
@@ -98,6 +171,39 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 
 	getStorage(): SessionStorage<TMetadata> {
 		return this.storage;
+	}
+
+	async getBranchSnapshot(cursor?: ProjectionCursor): Promise<SessionBranchSnapshot> {
+		return toBranchSnapshot(await this.storage.getBranchSnapshot(cursor));
+	}
+
+	async advanceProjection(cursor: ProjectionCursor): Promise<ProjectionAdvance> {
+		const basis = await this.storage.getBranchSnapshot(cursor);
+		const target = await this.storage.getBranchSnapshot();
+		return buildProjectionAdvance(basis, target);
+	}
+
+	async commitBatch(batch: SessionMutationBatch): Promise<CanonicalCommitResult> {
+		const result = await this.storage.commitBatch(batch);
+		if (result.outcome !== "committed") return result;
+		return {
+			outcome: "committed",
+			advance: buildProjectionAdvance(result.record.before, result.record.after),
+			receipt: result.receipt,
+			appendedEntryIds: result.record.appendedEntryIds,
+		};
+	}
+
+	resolveMutationReceipt(receipt: SessionMutationReceipt): ResolvedSessionMutationReceipt | undefined {
+		const record = this.storage.resolveMutationReceipt(receipt);
+		if (!record) return undefined;
+		return {
+			advance: buildProjectionAdvance(record.before, record.after),
+			appendedEntryIds: [...record.appendedEntryIds],
+			...(record.deliveryAttribution === undefined
+				? {}
+				: { deliveryAttribution: { ...record.deliveryAttribution } }),
+		};
 	}
 
 	getLeafId(): Promise<string | null> {
@@ -118,7 +224,7 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 	}
 
 	async buildContext(): Promise<SessionContext> {
-		return buildSessionContext(await this.getBranch());
+		return (await this.getBranchSnapshot()).context;
 	}
 
 	getLabel(id: string): Promise<string | undefined> {
@@ -130,49 +236,43 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 		return entries[entries.length - 1]?.name?.trim() || undefined;
 	}
 
-	private async appendTypedEntry<TEntry extends SessionTreeEntry>(entry: TEntry): Promise<string> {
-		return await this.storage.appendEntry(entry);
+	private async appendTypedEntry(entry: PendingSessionWrite): Promise<string> {
+		const snapshot = await this.getBranchSnapshot();
+		const result = await this.commitBatch({
+			guard: { kind: "descendant", cursor: snapshot.cursor },
+			mutations: [{ kind: "append", entry }],
+		});
+		if (result.outcome !== "committed") throw result.error;
+		return result.appendedEntryIds[0]!;
 	}
 
 	async appendMessage(message: AgentMessage): Promise<string> {
 		return this.appendTypedEntry({
 			type: "message",
-			id: await this.storage.createEntryId(),
-			parentId: await this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
 			message,
-		} satisfies MessageEntry);
+		});
 	}
 
 	async appendThinkingLevelChange(thinkingLevel: string): Promise<string> {
 		return this.appendTypedEntry({
 			type: "thinking_level_change",
-			id: await this.storage.createEntryId(),
-			parentId: await this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
 			thinkingLevel,
-		} satisfies ThinkingLevelChangeEntry);
+		});
 	}
 
 	async appendModelChange(provider: string, modelId: string): Promise<string> {
 		return this.appendTypedEntry({
 			type: "model_change",
-			id: await this.storage.createEntryId(),
-			parentId: await this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
 			provider,
 			modelId,
-		} satisfies ModelChangeEntry);
+		});
 	}
 
 	async appendActiveToolsChange(activeToolNames: string[]): Promise<string> {
 		return this.appendTypedEntry({
 			type: "active_tools_change",
-			id: await this.storage.createEntryId(),
-			parentId: await this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
 			activeToolNames: [...activeToolNames],
-		} satisfies ActiveToolsChangeEntry);
+		});
 	}
 
 	async appendCompaction<T = JsonValue>(
@@ -184,26 +284,20 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 	): Promise<string> {
 		return this.appendTypedEntry({
 			type: "compaction",
-			id: await this.storage.createEntryId(),
-			parentId: await this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
 			summary,
 			firstKeptEntryId,
 			tokensBefore,
 			...(details === undefined ? {} : { details: details as JsonValue }),
 			...(fromHook === undefined ? {} : { fromHook }),
-		} satisfies CompactionEntry);
+		});
 	}
 
 	async appendCustomEntry<T = JsonValue>(customType: string, data?: JsonCompatibleInput<T>): Promise<string> {
 		return this.appendTypedEntry({
 			type: "custom",
-			id: await this.storage.createEntryId(),
-			parentId: await this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
 			customType,
 			...(data === undefined ? {} : { data: data as JsonValue }),
-		} satisfies CustomEntry);
+		});
 	}
 
 	async appendCustomMessageEntry<T = JsonValue>(
@@ -214,14 +308,11 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 	): Promise<string> {
 		return this.appendTypedEntry({
 			type: "custom_message",
-			id: await this.storage.createEntryId(),
-			parentId: await this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
 			customType,
 			content,
 			display,
 			...(details === undefined ? {} : { details: details as JsonValue }),
-		} satisfies CustomMessageEntry);
+		});
 	}
 
 	async appendLabel(targetId: string, label: string | undefined): Promise<string> {
@@ -230,22 +321,16 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 		}
 		return this.appendTypedEntry({
 			type: "label",
-			id: await this.storage.createEntryId(),
-			parentId: await this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
 			targetId,
 			...(label === undefined ? {} : { label }),
-		} satisfies LabelEntry);
+		});
 	}
 
 	async appendSessionName(name: string): Promise<string> {
 		return this.appendTypedEntry({
 			type: "session_info",
-			id: await this.storage.createEntryId(),
-			parentId: await this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
 			name: name.trim(),
-		} satisfies SessionInfoEntry);
+		});
 	}
 
 	async moveTo(
@@ -255,17 +340,26 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 		if (entryId !== null && !(await this.storage.getEntry(entryId))) {
 			throw new SessionError("not_found", `Entry ${entryId} not found`);
 		}
-		await this.storage.setLeafId(entryId);
-		if (!summary) return undefined;
-		return this.appendTypedEntry({
-			type: "branch_summary",
-			id: await this.storage.createEntryId(),
-			parentId: entryId,
-			timestamp: new Date().toISOString(),
-			fromId: entryId ?? "root",
-			summary: summary.summary,
-			...(summary.details === undefined ? {} : { details: summary.details }),
-			...(summary.fromHook === undefined ? {} : { fromHook: summary.fromHook }),
-		} satisfies BranchSummaryEntry);
+		const snapshot = await this.getBranchSnapshot();
+		const mutations: SessionMutationBatch["mutations"] = [
+			{ kind: "move", leafId: entryId },
+			...(summary
+				? [
+						{
+							kind: "append" as const,
+							entry: {
+								type: "branch_summary" as const,
+								fromId: entryId ?? "root",
+								summary: summary.summary,
+								...(summary.details === undefined ? {} : { details: summary.details }),
+								...(summary.fromHook === undefined ? {} : { fromHook: summary.fromHook }),
+							},
+						},
+					]
+				: []),
+		];
+		const result = await this.commitBatch({ guard: { kind: "exact", cursor: snapshot.cursor }, mutations });
+		if (result.outcome !== "committed") throw result.error;
+		return summary ? result.appendedEntryIds.at(-1) : undefined;
 	}
 }

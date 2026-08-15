@@ -87,7 +87,8 @@ describe("regression #213: AgentSession observer isolation", () => {
 	let harness: Harness | undefined;
 
 	afterEach(async () => {
-		await harness?.session.dispose();
+		harness?.session.dispose();
+		if (harness) await harness.session.waitForClosed();
 		harness?.cleanup();
 		harness = undefined;
 	});

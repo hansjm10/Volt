@@ -1039,7 +1039,8 @@ async function runReviewPass<TReport>(options: ReviewPassOptions<TReport>): Prom
 		disableMcp: true,
 	});
 	if (options.signal?.aborted) {
-		await session.dispose();
+		session.dispose();
+		await session.waitForClosed();
 		throw new Error("Review aborted");
 	}
 	const onAbort = (): void => {
@@ -1072,7 +1073,8 @@ async function runReviewPass<TReport>(options: ReviewPassOptions<TReport>): Prom
 	} finally {
 		unsubscribe();
 		options.signal?.removeEventListener("abort", onAbort);
-		await session.dispose();
+		session.dispose();
+		await session.waitForClosed();
 	}
 }
 

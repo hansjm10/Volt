@@ -5,7 +5,7 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentHarnessOptions, AgentTool } from "@hansjm10/volt-agent-core";
+import type { AgentTool } from "@hansjm10/volt-agent-core";
 import type { FauxModelDefinition, FauxProviderRegistration, FauxResponseStep, Model } from "@hansjm10/volt-ai";
 import { registerFauxProvider, streamSimple } from "@hansjm10/volt-ai";
 import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-session.ts";
@@ -17,7 +17,7 @@ import { SessionManager } from "../../src/core/session-manager.ts";
 import type { Settings } from "../../src/core/settings-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
 import type { ExtensionFactory, ResourceLoader } from "../../src/index.ts";
-import { createAgentSessionTestControl } from "../agent-session-test-control.ts";
+import { createAgentSessionTestControl, type LegacyPrepareDelivery } from "../agent-session-test-control.ts";
 import {
 	type CreateTestExtensionsResultInput,
 	createTestExtensionsResult,
@@ -66,7 +66,7 @@ export interface HarnessOptions {
 	excludedToolNames?: string[];
 	resourceLoader?: ResourceLoader;
 	extensionFactories?: Array<ExtensionFactory | CreateTestExtensionsResultInput>;
-	prepareDelivery?: AgentHarnessOptions["prepareDelivery"];
+	prepareDelivery?: LegacyPrepareDelivery;
 	withConfiguredAuth?: boolean;
 	/** Inject a persisted manager when a test needs to exercise session reload behavior. */
 	sessionManager?: SessionManager;
@@ -151,7 +151,6 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		thinkingLevel: "off",
 		streamFn: streamSimple,
 		convertToLlm,
-		...(options.prepareDelivery === undefined ? {} : { prepareDelivery: options.prepareDelivery }),
 		settingsManager,
 		cwd: tempDir,
 		agentDir: options.agentDir ?? tempDir,
@@ -163,6 +162,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		excludedToolNames: options.excludedToolNames,
 		extensionRunnerRef,
 	});
+	const control = createAgentSessionTestControl(session);
+	if (options.prepareDelivery) control.setPrepareDelivery(options.prepareDelivery);
 
 	const events: AgentSessionEvent[] = [];
 	session.subscribe((event) => {
@@ -171,7 +172,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 
 	return {
 		session,
-		control: createAgentSessionTestControl(session),
+		control,
 		sessionManager,
 		settingsManager,
 		authStorage,

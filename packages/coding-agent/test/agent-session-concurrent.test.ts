@@ -74,7 +74,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		delete (globalThis as typeof globalThis & { testExtensionApi?: unknown }).testExtensionApi;
 		delete (globalThis as typeof globalThis & { testCommandRuns?: unknown }).testCommandRuns;
 		if (session) {
-			await session.dispose();
+			session.dispose();
+			await session.waitForClosed();
 		}
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });

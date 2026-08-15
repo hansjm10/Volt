@@ -459,24 +459,17 @@ describe("AgentSession auto-compaction queue resume", () => {
 	});
 
 	it("reports no continuation when session abort cancels proactive compaction", async () => {
-		const authStarted = createDeferred();
-		const finishAuth = createDeferred();
-		control.setStreamFn(() => {
-			throw new Error("not used");
-		});
-		vi.spyOn(
-			session as unknown as {
-				_getCompactionRequestAuth: () => Promise<{
-					apiKey?: string;
-					headers?: Record<string, string>;
-					env?: Record<string, string>;
-				}>;
-			},
-			"_getCompactionRequestAuth",
-		).mockImplementation(async () => {
-			authStarted.resolve();
-			await finishAuth.promise;
-			return { apiKey: "test-key" };
+		const compactionStarted = createDeferred();
+		const finishCompaction = createDeferred();
+		vi.spyOn(session.extensionRunner, "hasHandlers").mockImplementation(
+			(eventType) => eventType === "session_before_compact",
+		);
+		vi.spyOn(session.extensionRunner, "emit").mockImplementation(async (event) => {
+			if (event.type === "session_before_compact") {
+				compactionStarted.resolve();
+				await finishCompaction.promise;
+			}
+			return undefined;
 		});
 		const compactionEnds: Array<{ aborted: boolean; willRetry: boolean }> = [];
 		session.subscribe((event) => {
@@ -493,10 +486,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 				): Promise<boolean>;
 			}
 		)._runAutoCompaction("threshold", false, true);
-		await authStarted.promise;
+		await compactionStarted.promise;
 
-		await session.abort();
-		finishAuth.resolve();
+		const abort = session.abort();
+		finishCompaction.resolve();
+		await abort;
 		await runAutoCompaction;
 
 		expect(compactionEnds).toEqual([{ aborted: true, willRetry: false }]);

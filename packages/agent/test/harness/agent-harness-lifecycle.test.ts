@@ -7,6 +7,27 @@ import { InMemorySessionStorage } from "../../src/harness/session/memory-storage
 import { Session } from "../../src/harness/session/session.ts";
 import type { AgentMessage, AgentTool } from "../../src/types.ts";
 
+type TestDelivery = {
+	readonly deliveryId: string;
+	readonly kind: "prompt" | "steer" | "followUp";
+	readonly messages: readonly AgentMessage[];
+};
+type TestCommitOutcome =
+	| { outcome: "committed" }
+	| { outcome: "retained"; error: Error }
+	| { outcome: "terminally_failed"; error: Error };
+type TestPreparation = {
+	messages: readonly AgentMessage[];
+	commit?: {
+		execute(context: {
+			readonly deliveryId: string;
+			readonly kind: TestDelivery["kind"];
+			readonly messages: readonly AgentMessage[];
+			requestAbort(source?: "disposal"): unknown;
+		}): TestCommitOutcome | Promise<TestCommitOutcome>;
+	};
+};
+
 const registrations: Array<{ unregister(): void }> = [];
 
 afterEach(() => {
@@ -24,19 +45,77 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
 function createHarness(
 	options: Omit<ConstructorParameters<typeof AgentHarness>[0], "env" | "session" | "model"> & {
 		session?: Session;
+		prepareLogicalDelivery?: (delivery: TestDelivery) => TestPreparation | Promise<TestPreparation>;
 	} = {},
 ): { harness: AgentHarness; registration: ReturnType<typeof registerFauxProvider>; session: Session } {
 	const registration = registerFauxProvider();
 	registrations.push(registration);
 	const session = options.session ?? new Session(new InMemorySessionStorage());
-	const { session: _session, ...harnessOptions } = options;
+	const { session: _session, prepareLogicalDelivery, ...harnessOptions } = options;
+	let harness!: AgentHarness;
+	const commits = new Map<string, TestPreparation["commit"]>();
+	const deliveryOwner = prepareLogicalDelivery
+		? {
+				prepareLogical: async (
+					context: Parameters<NonNullable<typeof harnessOptions.deliveryOwner>["prepareLogical"]>[0],
+				) => {
+					const prepared = await prepareLogicalDelivery({
+						deliveryId: context.deliveryId,
+						kind: context.kind,
+						messages: context.sourceMessages,
+					});
+					commits.set(context.deliveryId, prepared.commit);
+					return { outcome: "prepared" as const, messages: prepared.messages };
+				},
+				commitAttempt: async (
+					context: Parameters<NonNullable<typeof harnessOptions.deliveryOwner>["commitAttempt"]>[0],
+				) => {
+					const basis = await session.getBranchSnapshot();
+					const commit = commits.get(context.deliveryId);
+					const outcome = commit
+						? await commit.execute({
+								deliveryId: context.deliveryId,
+								kind: context.kind,
+								messages: context.preparedMessages,
+								requestAbort: (source) => harness.abort(source),
+							})
+						: ({ outcome: "committed" } as const);
+					const mutations =
+						outcome.outcome === "committed"
+							? context.preparedMessages.map((message) => ({
+									kind: "append" as const,
+									entry: { type: "message" as const, message },
+								}))
+							: [];
+					const receipt = await session.commitBatch({
+						guard: { kind: "descendant", cursor: basis.cursor },
+						mutations,
+						deliveryAttribution: {
+							deliveryId: context.deliveryId,
+							epoch: context.epoch,
+							attemptId: context.attemptId,
+						},
+					});
+					if (receipt.outcome !== "committed")
+						return { outcome: "terminally_failed" as const, error: receipt.error };
+					return outcome.outcome === "committed"
+						? { outcome: "committed" as const, receipt: receipt.receipt }
+						: outcome.outcome === "retained"
+							? { ...outcome, noEffectReceipt: receipt.receipt }
+							: outcome;
+				},
+				finish: () => undefined,
+			}
+		: undefined;
+	harness = new AgentHarness({
+		env: new NodeExecutionEnv({ cwd: process.cwd() }),
+		session,
+		model: registration.getModel(),
+		...harnessOptions,
+		...(deliveryOwner === undefined ? {} : { deliveryOwner }),
+	});
 	return {
-		harness: new AgentHarness({
-			env: new NodeExecutionEnv({ cwd: process.cwd() }),
-			session,
-			model: registration.getModel(),
-			...harnessOptions,
-		}),
+		harness,
 		registration,
 		session,
 	};
@@ -68,9 +147,9 @@ function runtimeAbortSources(messages: readonly AgentMessage[]): unknown[] {
 describe("AgentHarness lifecycle and abort", () => {
 	it("makes disposal terminal and idempotent without admitting later work", async () => {
 		const { harness } = createHarness();
-		const disposal = harness.dispose();
-		expect(harness.dispose()).toBe(disposal);
-		await disposal;
+		expect(harness.dispose()).toBeUndefined();
+		expect(harness.dispose()).toBeUndefined();
+		await harness.waitForClosed();
 
 		const message: AgentMessage = { role: "user", content: "late", timestamp: Date.now() };
 		expect(() => harness.queueSteer(message)).toThrow("AgentHarness is disposed");
@@ -82,6 +161,67 @@ describe("AgentHarness lifecycle and abort", () => {
 		await expect(harness.continue()).rejects.toThrow("AgentHarness is disposed");
 		await expect(harness.appendMessage(message)).rejects.toThrow("AgentHarness is disposed");
 		await expect(harness.compact()).rejects.toThrow("AgentHarness is disposed");
+	});
+
+	it("joins passive publications that began before close", async () => {
+		const publicationGate = deferred();
+		const publicationStarted = deferred();
+		const { harness } = createHarness();
+		harness.subscribe(async (event) => {
+			if (event.type !== "queue_update") return;
+			publicationStarted.resolve();
+			await publicationGate.promise;
+		});
+		harness.queueSteer({ role: "user", content: "queued", timestamp: 1 });
+		await publicationStarted.promise;
+
+		harness.requestClose();
+		let closed = false;
+		const closing = harness.waitForClosed().then(() => {
+			closed = true;
+		});
+		await Promise.resolve();
+		expect(closed).toBe(false);
+
+		publicationGate.resolve();
+		await closing;
+		expect(closed).toBe(true);
+	});
+
+	it("joins idle canonical and configuration mutations admitted before close", async () => {
+		const appendStarted = deferred();
+		const releaseAppend = deferred();
+		const configStarted = deferred();
+		const releaseConfig = deferred();
+		const { harness, session } = createHarness();
+		const appendMessage = session.appendMessage.bind(session);
+		vi.spyOn(session, "appendMessage").mockImplementation(async (message) => {
+			appendStarted.resolve();
+			await releaseAppend.promise;
+			return await appendMessage(message);
+		});
+		const appendThinkingLevelChange = session.appendThinkingLevelChange.bind(session);
+		vi.spyOn(session, "appendThinkingLevelChange").mockImplementation(async (level) => {
+			configStarted.resolve();
+			await releaseConfig.promise;
+			return await appendThinkingLevelChange(level);
+		});
+
+		const appending = harness.appendMessage({ role: "user", content: "admitted", timestamp: 1 });
+		const configuring = harness.setThinkingLevel("high");
+		await Promise.all([appendStarted.promise, configStarted.promise]);
+		harness.requestClose();
+		let closed = false;
+		const closing = harness.waitForClosed().then(() => {
+			closed = true;
+		});
+		await Promise.resolve();
+		expect(closed).toBe(false);
+
+		releaseAppend.resolve();
+		releaseConfig.resolve();
+		await Promise.all([appending, configuring, closing]);
+		expect(closed).toBe(true);
 	});
 
 	it("keeps synchronous queue admission separate from passive publication completion", async () => {
@@ -165,7 +305,7 @@ describe("AgentHarness lifecycle and abort", () => {
 		const first = harness.abort("host_action");
 		const second = harness.abort("disposal");
 		expect(first).toMatchObject({ accepted: true, source: "host_action" });
-		expect(second).toEqual(first);
+		expect(second).toMatchObject({ accepted: false, source: "host_action", runId: first.runId });
 		expect(Object.isFrozen(first)).toBe(true);
 		expect(harness.signal?.aborted).toBe(true);
 		expect(harness.activeRunSnapshot).toMatchObject({
@@ -190,10 +330,10 @@ describe("AgentHarness lifecycle and abort", () => {
 		let providerMessages: AgentMessage[] = [];
 		let providerSystemPrompt = "";
 		const { harness, registration, session } = createHarness({
-			prepareDelivery: (delivery) => ({
+			prepareLogicalDelivery: (delivery) => ({
 				messages: [...delivery.messages],
-				participant: {
-					settle: () => {
+				commit: {
+					execute: () => {
 						settlementCalls++;
 						return settlementCalls === 1
 							? { outcome: "retained", error: new Error("retry owned input") }
@@ -348,7 +488,7 @@ describe("AgentHarness lifecycle and abort", () => {
 		});
 		const first = harness.abort("host_action");
 		expect(first).toMatchObject({ accepted: true, source: "host_action", runId: expect.any(String) });
-		expect(harness.abort("disposal")).toEqual(first);
+		expect(harness.abort("disposal")).toMatchObject({ accepted: false, source: "host_action", runId: first.runId });
 		expect(callbackSignal?.aborted).toBe(true);
 		expect(harness.activeRunSnapshot).toMatchObject({ runId: first.runId, source: "host_action" });
 		await Promise.resolve();
@@ -403,7 +543,11 @@ describe("AgentHarness lifecycle and abort", () => {
 		});
 		const first = harness.abort("remote_request");
 		expect(first).toMatchObject({ accepted: true, source: "remote_request", runId: expect.any(String) });
-		expect(harness.abort("disposal")).toEqual(first);
+		expect(harness.abort("disposal")).toMatchObject({
+			accepted: false,
+			source: "remote_request",
+			runId: first.runId,
+		});
 		expect(hookSignal?.aborted).toBe(true);
 		await Promise.resolve();
 		expect(idleSettled).toBe(false);
@@ -431,12 +575,12 @@ describe("AgentHarness lifecycle and abort", () => {
 				systemPromptCalls++;
 				return "cached system prompt";
 			},
-			prepareDelivery: (delivery) => {
+			prepareLogicalDelivery: (delivery) => {
 				deliveryIds.push(delivery.deliveryId);
 				return {
 					messages: [...delivery.messages],
-					participant: {
-						settle: () => {
+					commit: {
+						execute: () => {
 							settlementCalls++;
 							return settlementCalls === 1
 								? { outcome: "retained", error: new Error("retry settlement") }
@@ -497,7 +641,7 @@ describe("AgentHarness lifecycle and abort", () => {
 		const running = harness.prompt("race replacement");
 		await terminalHookStarted.promise;
 		expect(harness.abort("host_action")).toMatchObject({ accepted: true, source: "host_action" });
-		expect(harness.abort("disposal")).toMatchObject({ accepted: true, source: "host_action" });
+		expect(harness.abort("disposal")).toMatchObject({ accepted: false, source: "host_action" });
 		releaseTerminalHook.resolve();
 		const response = await running;
 		const persisted = (await session.buildContext()).messages;
@@ -538,7 +682,7 @@ describe("AgentHarness lifecycle and abort", () => {
 		const releasePreparation = deferred();
 		let preparationCalls = 0;
 		const { harness, registration } = createHarness({
-			prepareDelivery: async (delivery) => {
+			prepareLogicalDelivery: async (delivery) => {
 				preparationCalls++;
 				if (preparationCalls === 1) {
 					preparationStarted.resolve();
@@ -560,36 +704,6 @@ describe("AgentHarness lifecycle and abort", () => {
 		await harness.continue();
 		expect(registration.state.callCount).toBe(1);
 		expect(harness.hasPendingPrompt()).toBe(false);
-	});
-
-	it("exposes participant settlement and permits reentrant abort without deadlock", async () => {
-		const session = new Session(new InMemorySessionStorage());
-		let settlementSnapshot: Promise<void> | undefined;
-		const acceptances: unknown[] = [];
-		const { harness, registration } = createHarness({
-			session,
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				participant: {
-					settle: async (context) => {
-						settlementSnapshot = harness.activeDeliverySettlement;
-						acceptances.push(context.requestAbort("disposal"));
-						for (const message of delivery.messages) await session.appendMessage(structuredClone(message));
-						return { outcome: "committed" };
-					},
-				},
-			}),
-		});
-		registration.setResponses([() => fauxAssistantMessage("unexpected")]);
-
-		await harness.runPrompt("commit reentrantly");
-
-		expect(settlementSnapshot).toBeInstanceOf(Promise);
-		await expect(settlementSnapshot).resolves.toBeUndefined();
-		expect(acceptances).toEqual([
-			expect.objectContaining({ accepted: true, source: "disposal", runId: expect.any(String) }),
-		]);
-		expect(registration.state.callCount).toBe(0);
 	});
 
 	it("keeps terminal listeners inside waitForIdle while rejecting late abort intent", async () => {
@@ -660,10 +774,10 @@ describe("AgentHarness lifecycle and abort", () => {
 		expect(harness.hasQueuedMessages()).toBe(false);
 	});
 
-	it("retains an ordinary preparation rejection for explicit retry", async () => {
+	it("terminally fences an ordinary preparation rejection", async () => {
 		let preparationCalls = 0;
 		const { harness, registration } = createHarness({
-			prepareDelivery: (delivery) => {
+			prepareLogicalDelivery: (delivery) => {
 				preparationCalls++;
 				if (preparationCalls === 1) throw new Error("preparation failed");
 				return { messages: [...delivery.messages] };
@@ -673,18 +787,18 @@ describe("AgentHarness lifecycle and abort", () => {
 
 		await expect(harness.runPrompt("fail preparation")).resolves.toMatchObject({
 			status: "delivery_failed",
-			failure: { outcome: "retained", phase: "preparation" },
+			failure: { outcome: "terminally_failed", phase: "preparation" },
 		});
 		expect(harness.getPhase()).toBe("idle");
 		expect(harness.signal).toBeUndefined();
 		expect(harness.activeRunSnapshot).toBeUndefined();
 		await expect(harness.waitForIdle()).resolves.toBeUndefined();
-		expect(harness.hasPendingPrompt()).toBe(true);
+		expect(harness.hasPendingPrompt()).toBe(false);
 		expect(registration.state.callCount).toBe(0);
 
-		await expect(harness.continue()).resolves.toMatchObject({ status: "completed" });
-		expect(preparationCalls).toBe(2);
+		await expect(harness.continue()).rejects.toThrow("No messages to continue from");
+		expect(preparationCalls).toBe(1);
 		expect(harness.hasPendingPrompt()).toBe(false);
-		expect(registration.state.callCount).toBe(1);
+		expect(registration.state.callCount).toBe(0);
 	});
 });

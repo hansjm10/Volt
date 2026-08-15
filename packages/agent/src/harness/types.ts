@@ -12,8 +12,7 @@ import type {
 	Transport,
 } from "@hansjm10/volt-ai";
 import type {
-	AgentDelivery,
-	AgentDeliveryPreparation,
+	AgentDeliveryOwner,
 	AgentEvent,
 	AgentLoopNextAction,
 	AgentLoopNextActionContext,
@@ -237,6 +236,8 @@ export type SessionErrorCode =
 	| "invalid_session"
 	| "invalid_entry"
 	| "invalid_fork_target"
+	| "conflict"
+	| "authority_retired"
 	| "storage"
 	| "unknown";
 
@@ -482,6 +483,127 @@ export interface SessionMetadata {
 	createdAt: string;
 }
 
+declare const projectionCursorBrand: unique symbol;
+
+/** Store-issued identity for one revision of one canonical session branch. */
+export interface ProjectionCursor {
+	readonly authorityGeneration: string;
+	readonly revision: number;
+	readonly branchIdentity: string | null;
+	readonly [projectionCursorBrand]: never;
+}
+
+/** One atomic canonical branch read. Entries are ordered from root to the cursor leaf. */
+export interface SessionStorageBranchSnapshot {
+	readonly cursor: ProjectionCursor;
+	readonly entries: readonly SessionTreeEntry[];
+}
+
+/** A guard for an atomic session mutation. */
+export type ProjectionGuard =
+	| { readonly kind: "exact"; readonly cursor: ProjectionCursor }
+	| { readonly kind: "descendant"; readonly cursor: ProjectionCursor };
+
+/** Declarative canonical mutation. Storage implementations materialize identity, parent, and timestamp. */
+export type SessionMutation =
+	| { readonly kind: "append"; readonly entry: PendingSessionWrite }
+	| { readonly kind: "move"; readonly leafId: string | null }
+	| {
+			readonly kind: "move_with_summary";
+			readonly leafId: string | null;
+			readonly summary?: {
+				readonly summary: string;
+				readonly details?: JsonValue;
+				readonly fromHook?: boolean;
+				/** Label materialized against the store-generated branch-summary identity. */
+				readonly label?: string;
+			};
+	  };
+
+/** Stable delivery-attempt identity bound into a canonical mutation receipt. */
+export interface SessionDeliveryAttribution {
+	readonly deliveryId: string;
+	readonly epoch: number;
+	readonly attemptId: string;
+}
+
+export interface SessionMutationBatch {
+	readonly guard: ProjectionGuard;
+	readonly mutations: readonly SessionMutation[];
+	readonly deliveryAttribution?: SessionDeliveryAttribution;
+}
+
+declare const sessionMutationReceiptBrand: unique symbol;
+
+/** Opaque capability issued only after a canonical batch is durably committed. */
+export interface SessionMutationReceipt {
+	readonly [sessionMutationReceiptBrand]: never;
+}
+
+/** Store-authenticated details for one committed mutation receipt. */
+export interface SessionMutationReceiptRecord {
+	readonly basis: SessionStorageBranchSnapshot;
+	readonly before: SessionStorageBranchSnapshot;
+	readonly after: SessionStorageBranchSnapshot;
+	readonly appendedEntryIds: readonly string[];
+	readonly deliveryAttribution?: SessionDeliveryAttribution;
+}
+
+export type SessionStorageCommitResult =
+	| {
+			readonly outcome: "committed";
+			readonly receipt: SessionMutationReceipt;
+			readonly record: SessionMutationReceiptRecord;
+	  }
+	| {
+			readonly outcome: "rolled_back";
+			readonly cursor: ProjectionCursor;
+			readonly error: SessionError;
+	  }
+	| { readonly outcome: "uncertain"; readonly error: SessionError };
+
+/** Canonical branch snapshot reduced into provider-visible context. */
+export interface SessionBranchSnapshot extends SessionStorageBranchSnapshot {
+	readonly context: SessionContext;
+}
+
+/** Exact provider projection change between two store-issued cursors. */
+export interface ProjectionAdvance {
+	readonly cursor: ProjectionCursor;
+	readonly branchRelation: "same" | "descendant" | "diverged";
+	readonly messages:
+		| { readonly kind: "unchanged" }
+		| { readonly kind: "append"; readonly values: readonly AgentMessage[] }
+		| { readonly kind: "rewrite"; readonly values: readonly AgentMessage[] };
+	readonly persistedPolicy: {
+		readonly model: SessionContext["model"];
+		readonly thinkingLevel: string;
+		readonly activeToolNames: readonly string[] | null;
+	};
+	readonly persistedPolicyChanged: boolean;
+}
+
+export type CanonicalCommitResult =
+	| {
+			readonly outcome: "committed";
+			readonly advance: ProjectionAdvance;
+			readonly receipt: SessionMutationReceipt;
+			readonly appendedEntryIds: readonly string[];
+	  }
+	| {
+			readonly outcome: "rolled_back";
+			readonly cursor: ProjectionCursor;
+			readonly error: SessionError;
+	  }
+	| { readonly outcome: "uncertain"; readonly error: SessionError };
+
+/** Store-verified canonical result recovered from an opaque commit receipt. */
+export interface ResolvedSessionMutationReceipt {
+	readonly advance: ProjectionAdvance;
+	readonly appendedEntryIds: readonly string[];
+	readonly deliveryAttribution?: SessionDeliveryAttribution;
+}
+
 export interface JsonlSessionMetadata extends SessionMetadata {
 	cwd: string;
 	path: string;
@@ -490,12 +612,13 @@ export interface JsonlSessionMetadata extends SessionMetadata {
 
 export interface SessionStorage<TMetadata extends SessionMetadata = SessionMetadata> {
 	getMetadata(): Promise<TMetadata>;
+	/** Atomically snapshot the current branch, or re-read a previously issued cursor. */
+	getBranchSnapshot(cursor?: ProjectionCursor): Promise<SessionStorageBranchSnapshot>;
+	/** Apply a short declarative batch under one canonical mutation lane. */
+	commitBatch(batch: SessionMutationBatch): Promise<SessionStorageCommitResult>;
+	/** Resolve a receipt only when it was issued by this storage authority. */
+	resolveMutationReceipt(receipt: SessionMutationReceipt): SessionMutationReceiptRecord | undefined;
 	getLeafId(): Promise<string | null>;
-	/** Persist a leaf entry that records the active session-tree leaf. */
-	setLeafId(leafId: string | null): Promise<void>;
-	createEntryId(): Promise<string>;
-	/** Append an entry and return its canonical persisted identity. */
-	appendEntry(entry: SessionTreeEntry): Promise<string>;
 	getEntry(id: string): Promise<SessionTreeEntry | undefined>;
 	findEntries<TType extends SessionTreeEntry["type"]>(
 		type: TType,
@@ -543,8 +666,8 @@ export interface JsonlSessionRepoApi
 
 export type AgentHarnessPhase = "idle" | "turn" | "compaction" | "branch_summary" | "retry";
 
-export type PendingSessionWrite = SessionTreeEntry extends infer TEntry
-	? TEntry extends SessionTreeEntry
+export type PendingSessionWrite = Exclude<SessionTreeEntry, LeafEntry> extends infer TEntry
+	? TEntry extends Exclude<SessionTreeEntry, LeafEntry>
 		? Omit<TEntry, "id" | "parentId" | "timestamp">
 		: never
 	: never;
@@ -808,6 +931,8 @@ export interface AgentHarnessRunOptions {
 	systemPrompt?: string;
 	/** Override provider context for this run without changing canonical session history. */
 	context?: readonly AgentMessage[];
+	/** Owner installed before the prompt becomes visible in the delivery inbox. */
+	deliveryOwner?: AgentDeliveryOwner;
 }
 
 export interface AgentHarnessPromptOptions extends AgentHarnessRunOptions {
@@ -907,17 +1032,8 @@ export interface AgentHarnessOptions<
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** Curated stream/provider request options. Snapshotted at turn start. */
 	streamOptions?: AgentHarnessStreamOptions;
-	/**
-	 * Stage one leased-delivery attempt before its irrevocable begin boundary.
-	 * Every retry invokes this callback again and requires a fresh participant with
-	 * the same prepared messages; Harness caches completed message reduction only.
-	 */
-	prepareDelivery?: (
-		delivery: AgentDelivery,
-		signal: AbortSignal,
-	) => Promise<AgentDeliveryPreparation> | AgentDeliveryPreparation;
-	/** Observe revocation so host projections can release delivery-coupled state. */
-	deliveryRevoked?: (delivery: AgentDelivery) => void;
+	/** Default owner installed before every high-level delivery admission. */
+	deliveryOwner?: AgentDeliveryOwner;
 	/** May be omitted at construction, but must be set before a model-backed operation starts. */
 	model?: Model<any>;
 	thinkingLevel?: ThinkingLevel;

@@ -236,7 +236,8 @@ describe("native planning state", () => {
 		expect(refined.steps.map((step) => step.id)).toEqual(initial.steps.map((step) => step.id));
 		expect(session.state.systemPrompt).toBe(policy);
 		expect(session.state.tools.map((tool) => tool.name)).toEqual(toolNames);
-		await session.dispose();
+		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it.each(["steer", "followUp"] as const)(
@@ -380,7 +381,8 @@ describe("native planning state", () => {
 				customType: "volt-plan-checkpoint",
 				content: expect.stringContaining("Phase: draft"),
 			});
-			await session.dispose();
+			session.dispose();
+			await session.waitForClosed();
 		},
 	);
 
@@ -536,7 +538,8 @@ describe("native planning state", () => {
 					steps: [{ text: "Implement the approved change" }, { text: "Add verification coverage" }],
 				},
 			});
-			await session.dispose();
+			session.dispose();
+			await session.waitForClosed();
 		},
 	);
 
@@ -614,7 +617,8 @@ describe("native planning state", () => {
 				args: submitCall.arguments,
 			} as never),
 		).toBeUndefined();
-		await session.dispose();
+		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("does not count a protocol-level MCP failure as successful Plan research", async () => {
@@ -757,7 +761,8 @@ describe("native planning state", () => {
 			},
 		});
 		expect(session.planningState.plan).toMatchObject({ id: draft.id, phase: "draft" });
-		await session.dispose();
+		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("restores skipped eager MCP direct tools before retained-context execution enters Build", async () => {
@@ -842,7 +847,8 @@ describe("native planning state", () => {
 		await session.setAgentMode("plan");
 		await session.setAgentMode("build");
 		expect(session.getActiveToolNames()).not.toContain(directToolName);
-		await session.dispose();
+		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("serializes concurrent toggles so each derives its target from committed state", async () => {
@@ -907,7 +913,8 @@ describe("native planning state", () => {
 		expect(session.agentMode).toBe("plan");
 		expect(committedModes).toEqual(["build", "plan"]);
 		unsubscribe();
-		await session.dispose();
+		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("preserves allowlist and exclusion policy across Plan and Build profiles", async () => {
@@ -1084,7 +1091,8 @@ describe("native planning state", () => {
 		expect(completed.phase).toBe("completed");
 		expect(session.getActiveToolNames()).not.toContain("update_plan_progress");
 		expect(session.getActiveToolNames()).not.toContain("request_replan");
-		await session.dispose();
+		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("rejects id-less duplicate drafts and non-ready handoffs", async () => {
@@ -1125,7 +1133,8 @@ describe("native planning state", () => {
 			approvedRevision: ready.revision,
 		});
 		expect(handedOff).toMatchObject({ mode: "build", plan: { phase: "handed_off" } });
-		await session.dispose();
+		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("refuses synchronous plan mutations while a queued transition is suspended", async () => {
@@ -1157,7 +1166,8 @@ describe("native planning state", () => {
 		release();
 		await transition;
 		expect(session.planningState).toMatchObject({ mode: "build", plan: { id: draft.id, revision: draft.revision } });
-		await session.dispose();
+		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("turns manual Plan-mode re-entry during execution into a valid draft", async () => {
@@ -1192,7 +1202,8 @@ describe("native planning state", () => {
 		});
 		expect(session.getActiveToolNames()).toContain("update_plan");
 		expect(session.getActiveToolNames()).not.toContain("update_plan_progress");
-		await session.dispose();
+		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("restores a missing canonical plan checkpoint once", async () => {
@@ -1243,7 +1254,8 @@ describe("native planning state", () => {
 			content: expect.stringContaining("[>] Finish the implementation — Started"),
 		});
 		expect(session.state.systemPrompt).not.toContain("restored-plan");
-		await session.dispose();
+		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("rejects too many steps and oversized semantic state", () => {

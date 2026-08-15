@@ -605,10 +605,11 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 		const compaction = originalSession.compact();
 		await compactionStarted;
-		const disposal = originalSession.dispose();
+		originalSession.dispose();
+		const disposal = originalSession.waitForClosed();
 		releaseCompaction();
 
-		await expect(compaction).rejects.toThrow("Compaction cancelled");
+		await expect(compaction).rejects.toThrow("AgentSession is disposed");
 		await disposal;
 		expect(originalSession.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
 	});

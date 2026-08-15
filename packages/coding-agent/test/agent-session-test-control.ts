@@ -1,9 +1,12 @@
 import type {
 	AgentDelivery,
-	AgentDeliveryPreparation,
+	AgentDeliveryCommitContext,
+	AgentDeliveryOwner,
+	AgentDeliveryPreparationContext,
 	AgentHarness,
 	AgentHarnessNextActionPolicy,
 	AgentMessage,
+	AgentTool,
 	StreamFn,
 	ToolCallEvent,
 	ToolCallResult,
@@ -12,6 +15,31 @@ import type {
 } from "@hansjm10/volt-agent-core";
 import type { ImageContent, JsonObject, JsonValue, Model, TextContent } from "@hansjm10/volt-ai";
 import type { AgentSession } from "../src/core/agent-session.ts";
+import type { SessionManagerHarnessStorage } from "../src/core/harness-session-adapter.ts";
+
+export type LegacyDeliveryParticipantOutcome =
+	| { outcome: "committed" }
+	| { outcome: "retained"; error: Error }
+	| { outcome: "terminally_failed"; error: Error };
+
+export interface LegacyDeliveryPreparation {
+	messages: readonly AgentMessage[];
+	participant?: {
+		settle(context: {
+			messages: readonly AgentMessage[];
+			systemPrompt: string;
+			tools: readonly AgentTool[];
+			signal: AbortSignal;
+			requestAbort: AgentDeliveryCommitContext["requestAbort"];
+			requestClose: AgentDeliveryCommitContext["requestClose"];
+		}): LegacyDeliveryParticipantOutcome | Promise<LegacyDeliveryParticipantOutcome>;
+	};
+}
+
+export type LegacyPrepareDelivery = (
+	delivery: AgentDelivery,
+	signal: AbortSignal,
+) => LegacyDeliveryPreparation | Promise<LegacyDeliveryPreparation>;
 
 type HarnessTestInternals = {
 	streamFn: StreamFn;
@@ -27,11 +55,10 @@ type HarnessTestInternals = {
 
 type SessionTestInternals = {
 	_streamFn: StreamFn;
-	_upstreamPrepareDelivery: (
-		delivery: AgentDelivery,
-		signal: AbortSignal,
-	) => Promise<AgentDeliveryPreparation> | AgentDeliveryPreparation;
-	_upstreamDeliveryRevoked: ((delivery: AgentDelivery) => void) | undefined;
+	_streamOptions: ReturnType<AgentHarness["getStreamOptions"]>;
+	_deliveryOwner: AgentDeliveryOwner;
+	_harnessSessionStorage: SessionManagerHarnessStorage;
+	_legacyDeliveryRevoked?: (delivery: AgentDelivery) => void;
 };
 
 function getHarness(session: AgentSession): AgentHarness {
@@ -51,6 +78,62 @@ export function createAgentSessionTestControl(session: AgentSession) {
 	const harness = getHarness(session);
 	const harnessInternals = getHarnessInternals(session);
 	const sessionInternals = getSessionInternals(session);
+	const baseOwner = sessionInternals._deliveryOwner;
+	const basePrepare = baseOwner.prepareLogical.bind(baseOwner);
+	const baseCommit = baseOwner.commitAttempt.bind(baseOwner);
+	const baseFinish = baseOwner.finish.bind(baseOwner);
+	const legacyPreparations = new Map<string, LegacyDeliveryPreparation>();
+	const deliveries = new Map<string, AgentDelivery>();
+	let prepareDelivery: LegacyPrepareDelivery | undefined;
+	baseOwner.prepareLogical = async (context: AgentDeliveryPreparationContext) => {
+		const delivery: AgentDelivery = {
+			deliveryId: context.deliveryId,
+			kind: context.kind,
+			messages: structuredClone(context.sourceMessages),
+			epoch: context.epoch,
+		};
+		deliveries.set(context.deliveryId, delivery);
+		if (!prepareDelivery) return await basePrepare(context);
+		const legacy = await prepareDelivery(delivery, context.signal);
+		legacyPreparations.set(context.deliveryId, {
+			...legacy,
+			messages: structuredClone(legacy.messages),
+		});
+		return await basePrepare({ ...context, sourceMessages: structuredClone(legacy.messages) });
+	};
+	baseOwner.commitAttempt = async (context) => {
+		const legacy = legacyPreparations.get(context.deliveryId);
+		const outcome = await legacy?.participant?.settle({
+			messages: structuredClone(context.preparedMessages),
+			systemPrompt: session.systemPrompt,
+			tools: session.state.tools,
+			signal: context.signal,
+			requestAbort: context.requestAbort,
+			requestClose: context.requestClose,
+		});
+		if (outcome?.outcome === "retained") {
+			return {
+				...outcome,
+				noEffectReceipt: await sessionInternals._harnessSessionStorage.retainOwnedDelivery(
+					context,
+					context.preparedMessages,
+				),
+			};
+		}
+		if (outcome?.outcome === "terminally_failed") return outcome;
+		return await baseCommit(context);
+	};
+	baseOwner.finish = async (context) => {
+		await baseFinish(context);
+		if (context.outcome === "revoked") {
+			const delivery = deliveries.get(context.deliveryId);
+			if (delivery) sessionInternals._legacyDeliveryRevoked?.(delivery);
+		}
+		if (context.outcome !== "retained") {
+			legacyPreparations.delete(context.deliveryId);
+			deliveries.delete(context.deliveryId);
+		}
+	};
 	return {
 		run: (input: AgentMessage | readonly AgentMessage[]) => harness.run(input),
 		continue: (options?: { drainFollowUps?: boolean; context?: readonly AgentMessage[] }) =>
@@ -82,17 +165,12 @@ export function createAgentSessionTestControl(session: AgentSession) {
 			sessionInternals._streamFn = streamFn;
 			harnessInternals.streamFn = streamFn;
 		},
-		setPrepareDelivery: (
-			prepareDelivery: (
-				delivery: AgentDelivery,
-				signal: AbortSignal,
-			) => Promise<AgentDeliveryPreparation> | AgentDeliveryPreparation,
-		) => {
-			sessionInternals._upstreamPrepareDelivery = prepareDelivery;
+		setPrepareDelivery: (nextPrepareDelivery: LegacyPrepareDelivery) => {
+			prepareDelivery = nextPrepareDelivery;
 		},
-		getDeliveryRevoked: () => sessionInternals._upstreamDeliveryRevoked,
+		getDeliveryRevoked: () => sessionInternals._legacyDeliveryRevoked,
 		setDeliveryRevoked: (deliveryRevoked: ((delivery: AgentDelivery) => void) | undefined) => {
-			sessionInternals._upstreamDeliveryRevoked = deliveryRevoked;
+			sessionInternals._legacyDeliveryRevoked = deliveryRevoked;
 		},
 		onToolCall: (
 			handler: (event: ToolCallEvent) => Promise<ToolCallResult | undefined> | ToolCallResult | undefined,
@@ -135,8 +213,8 @@ export function createAgentSessionTestControl(session: AgentSession) {
 		setModel: (model: Model<any> | undefined) => harness.setModel(model, { persist: false }),
 		setThinkingLevel: (level: Parameters<AgentHarness["setThinkingLevel"]>[0]) =>
 			harness.setThinkingLevel(level, { persist: false }),
-		getStreamOptions: () => harness.getStreamOptions(),
-		getInferenceSpeed: () => harness.getStreamOptions().inferenceSpeed,
+		getStreamOptions: () => structuredClone(sessionInternals._streamOptions),
+		getInferenceSpeed: () => sessionInternals._streamOptions.inferenceSpeed,
 		getActiveTools: () => harness.getActiveTools(),
 	};
 }

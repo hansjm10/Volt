@@ -24,7 +24,8 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 	let harness: Harness | undefined;
 
 	afterEach(async () => {
-		await harness?.session.dispose();
+		harness?.session.dispose();
+		if (harness) await harness.session.waitForClosed();
 		harness?.cleanup();
 		harness = undefined;
 	});
@@ -35,16 +36,11 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 		const clientMessageId = "participant-durability-publication";
 		const durabilityStarted = deferred();
 		const releaseDurability = deferred();
-		const originalFlush = harness.sessionManager.flush.bind(harness.sessionManager);
-		let gated = false;
-		vi.spyOn(harness.sessionManager, "flush").mockImplementation(() => {
-			const watermark = originalFlush();
-			if (!gated && harness?.sessionManager.getClientInput(clientMessageId)?.state === "completed") {
-				gated = true;
-				durabilityStarted.resolve();
-				return watermark.then(() => releaseDurability.promise);
-			}
-			return watermark;
+		const commitDelivery = harness.sessionManager.commitDelivery.bind(harness.sessionManager);
+		vi.spyOn(harness.sessionManager, "commitDelivery").mockImplementationOnce(async (input) => {
+			durabilityStarted.resolve();
+			await releaseDurability.promise;
+			return await commitDelivery(input);
 		});
 		const projections: string[] = [];
 		const preflightResults: PromptPreflightResult[] = [];
@@ -169,93 +165,16 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 		const prompting = harness.session.prompt("dispose during upstream preparation").catch(() => {});
 
 		await preparationStarted.promise;
-		const disposal = harness.session.dispose("disposal");
+		harness.session.dispose("disposal");
+		const disposal = harness.session.waitForClosed();
 		releasePreparation.resolve();
 		await Promise.all([prompting, disposal]);
 
 		const preparationState = harness.session as unknown as {
 			_preparedDeliveryExtensions: Map<string, unknown>;
-			_preparingDeliveryExtensions: Map<string, unknown>;
 		};
 		expect(preparationState._preparedDeliveryExtensions.size).toBe(0);
-		expect(preparationState._preparingDeliveryExtensions.size).toBe(0);
 		expect(harness.getPendingResponseCount()).toBe(1);
-	});
-
-	it("settles a direct RPC attempt revoked through the public Agent during preparation", async () => {
-		const preparationStarted = deferred();
-		const releasePreparation = deferred();
-		harness = await createHarness({
-			extensionFactories: [
-				(volt) => {
-					volt.on("message_start", async (event) => {
-						if (event.message.role !== "user") return;
-						preparationStarted.resolve();
-						await releasePreparation.promise;
-					});
-				},
-			],
-		});
-		const clientMessageId = "participant-public-revocation";
-		const preflight: PromptPreflightResult[] = [];
-		const prompting = harness.session.prompt("revoke during preparation", {
-			clientMessageId,
-			source: "rpc",
-			preflightResult: (result) => preflight.push(result),
-		});
-
-		await preparationStarted.promise;
-		expect(await harness.control.discardPendingPrompt()).toHaveLength(1);
-		releasePreparation.resolve();
-		await expect(prompting).rejects.toThrow("Delivery was revoked before canonical commitment");
-
-		expect(preflight).toEqual([{ success: false }]);
-		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
-		expect(harness.control.hasPendingPrompt()).toBe(false);
-		expect(harness.getPendingResponseCount()).toBe(0);
-	});
-
-	it("reconciles a prompt revoked reentrantly during AgentSession queue clearing", async () => {
-		const preparationStarted = deferred();
-		const releasePreparation = deferred();
-		harness = await createHarness({
-			extensionFactories: [
-				(volt) => {
-					volt.on("message_start", async (event) => {
-						if (event.message.role !== "user") return;
-						preparationStarted.resolve();
-						await releasePreparation.promise;
-					});
-				},
-			],
-		});
-		const clientMessageId = "participant-reentrant-prompt-revocation";
-		const preflight: PromptPreflightResult[] = [];
-		const prompting = harness.session.prompt("revoke prompt reentrantly", {
-			clientMessageId,
-			source: "rpc",
-			preflightResult: (result) => preflight.push(result),
-		});
-		await preparationStarted.promise;
-		await harness.session.steer("clear while preparing");
-		const sessionRevocation = harness.control.getDeliveryRevoked();
-		let discardedPrompt = false;
-		harness.control.setDeliveryRevoked((delivery) => {
-			if (delivery.kind === "steer" && !discardedPrompt) {
-				discardedPrompt = true;
-				void harness!.control.discardPendingPrompt();
-			}
-			sessionRevocation?.(delivery);
-		});
-
-		await harness.session.clearQueue();
-		releasePreparation.resolve();
-		await expect(prompting).rejects.toThrow("Delivery was revoked before canonical commitment");
-
-		expect(preflight).toEqual([{ success: false }]);
-		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
-		expect(harness.control.hasQueuedMessages()).toBe(false);
-		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
 	it("rolls back a direct RPC attempt when canonical append rejects synchronously", async () => {
@@ -327,7 +246,7 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 		expect(getUserTexts(harness)).toEqual(["transformed once (1)"]);
 	});
 
-	it("retains a completed extension transformation when abort wins before settlement", async () => {
+	it("restarts extension preparation when abort wins before settlement", async () => {
 		const extensionStarted = deferred();
 		const releaseExtension = deferred();
 		let extensionRuns = 0;
@@ -361,16 +280,17 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 		expect(harness.control.hasPendingPrompt()).toBe(true);
 		await harness.control.continue();
 
-		expect(extensionRuns).toBe(1);
+		expect(extensionRuns).toBe(2);
 		expect(harness.control.hasPendingPrompt()).toBe(false);
 		expect(getUserTexts(harness)).toEqual(["cached after abort"]);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
-	it("fails closed when upstream preparation changes after an AgentSession retained attempt", async () => {
+	it("reuses logical preparation across retained AgentSession attempts", async () => {
 		let preparationCalls = 0;
 		let extensionRuns = 0;
 		let settlementCalls = 0;
+		let retain = true;
 		harness = await createHarness({
 			prepareDelivery: (delivery) => {
 				preparationCalls++;
@@ -382,7 +302,9 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 					participant: {
 						settle: () => {
 							settlementCalls++;
-							return { outcome: "retained", error: new Error("retain first upstream attempt") };
+							return retain
+								? { outcome: "retained", error: new Error("retain upstream attempt") }
+								: { outcome: "committed" };
 						},
 					},
 				};
@@ -403,23 +325,19 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 		});
 		await expect(harness.control.continue()).resolves.toMatchObject({
 			status: "delivery_failed",
-			failure: {
-				outcome: "terminally_failed",
-				phase: "preparation",
-				error: {
-					name: "AgentDeliveryPreparationReplayMismatchError",
-					message: expect.stringContaining("changed the prepared messages"),
-				},
-			},
+			failure: { outcome: "retained", phase: "settlement" },
 		});
 
-		expect(preparationCalls).toBe(2);
+		expect(preparationCalls).toBe(1);
 		expect(extensionRuns).toBe(1);
-		expect(settlementCalls).toBe(1);
-		expect(harness.control.hasPendingPrompt()).toBe(false);
+		expect(settlementCalls).toBe(2);
+		expect(harness.control.hasPendingPrompt()).toBe(true);
 		expect(harness.getPendingResponseCount()).toBe(1);
-		await expect(harness.control.continue()).resolves.toEqual({ status: "completed", deliveries: [] });
-		expect(preparationCalls).toBe(2);
+		retain = false;
+		await expect(harness.control.continue()).resolves.toMatchObject({ status: "completed" });
+		expect(preparationCalls).toBe(1);
+		expect(settlementCalls).toBe(3);
+		expect(harness.control.hasPendingPrompt()).toBe(false);
 	});
 
 	it("disposal revokes a retained prompt and clears all replay authority", async () => {
@@ -443,35 +361,34 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 		const internals = harness.session as unknown as {
 			_harness: {
 				deliveryPreparationStates: Map<string, unknown>;
-				deliveryAttemptParticipants: Map<string, unknown>;
 				continuationState: unknown;
 				contextProjection: unknown;
 			};
-			_preparingDeliveryExtensions: Map<string, unknown>;
 			_preparedDeliveryExtensions: Map<string, unknown>;
 		};
 		expect(internals._harness.deliveryPreparationStates.size).toBe(1);
 		expect(internals._preparedDeliveryExtensions.size).toBe(1);
 
-		await harness.session.dispose("disposal");
+		harness.session.dispose("disposal");
+		await harness.session.waitForClosed();
 
 		expect(revokedDeliveryIds).toHaveLength(1);
 		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(harness.control.hasPendingPrompt()).toBe(false);
 		expect(internals._harness.deliveryPreparationStates.size).toBe(0);
-		expect(internals._harness.deliveryAttemptParticipants.size).toBe(0);
 		expect(internals._harness.continuationState).toBeUndefined();
 		expect(internals._harness.contextProjection).toBeUndefined();
-		expect(internals._preparingDeliveryExtensions.size).toBe(0);
 		expect(internals._preparedDeliveryExtensions.size).toBe(0);
 		await expect(harness.control.continue()).rejects.toThrow("AgentHarness is disposed");
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 
-	it("terminally fences an uncertain durability failure after canonical append", async () => {
+	it("terminally fences a canonical delivery commit failure", async () => {
 		harness = await createHarness();
 		harness.setResponses([fauxAssistantMessage("must not run")]);
-		vi.spyOn(harness.sessionManager, "flush").mockRejectedValueOnce(new Error("injected durability failure"));
+		vi.spyOn(harness.sessionManager, "commitDelivery").mockRejectedValueOnce(
+			new Error("injected durability failure"),
+		);
 
 		await expect(harness.control.run(createUserMessage("uncertain canonical append"))).resolves.toMatchObject({
 			status: "delivery_failed",
