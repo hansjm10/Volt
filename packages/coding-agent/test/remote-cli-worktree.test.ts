@@ -212,7 +212,7 @@ describe("remote CLI worktree commands (daemon control client)", () => {
 		await main(["remote", "worktree", "list", "--workspace", "repo", "--json"]);
 		const listed = JSON.parse(loggedLines(logSpy)) as Array<{ id: string; path: string; available?: boolean }>;
 		const adopted = listed.find((entry) => entry.id === "manual-existing");
-		expect(adopted).toMatchObject({ id: "manual-existing", path: realpathSync(manualPath), available: true });
+		expect(adopted).toMatchObject({ id: "manual-existing", path: realpathSync.native(manualPath), available: true });
 
 		process.exitCode = undefined;
 		await main(["remote", "worktree", "remove", "manual-existing", "--workspace", "repo"]);

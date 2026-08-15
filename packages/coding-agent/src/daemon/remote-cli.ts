@@ -1,4 +1,5 @@
-import { basename, resolve } from "node:path";
+import { realpath } from "node:fs/promises";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { getAgentDir, VERSION } from "../config.ts";
 import { type IrohRemoteAccessPresetName, isIrohRemoteAccessPresetName } from "../core/remote/iroh/access-grant.ts";
 import { formatIrohRemoteTicketQrCode } from "../core/remote/iroh/qr.ts";
@@ -113,6 +114,26 @@ function reportControlError(response: ControlResponse, context: string): boolean
 	return false;
 }
 
+async function getCanonicalCwd(): Promise<string> {
+	try {
+		return await realpath(process.cwd());
+	} catch {
+		return resolve(process.cwd());
+	}
+}
+
+function findWorkspaceForPath<T extends { path: string }>(workspaces: readonly T[], path: string): T | undefined {
+	return workspaces
+		.filter((workspace) => {
+			const relativePath = relative(resolve(workspace.path), path);
+			return (
+				relativePath.length === 0 ||
+				(relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath))
+			);
+		})
+		.sort((left, right) => right.path.length - left.path.length)[0];
+}
+
 /** Render only the non-secret ticket fields a user should compare in Volt. */
 export function formatRemotePairingVerificationLines(ticket: string): string[] {
 	const details = getIrohRemotePairingVerificationDetails(ticket);
@@ -169,10 +190,8 @@ async function handlePairCommand(args: string[]): Promise<void> {
 				reportControlError(status, "status");
 				return;
 			}
-			const cwd = resolve(process.cwd());
-			const match = status.workspaces
-				.filter((workspace) => cwd === workspace.path || cwd.startsWith(`${workspace.path}/`))
-				.sort((left, right) => right.path.length - left.path.length)[0];
+			const cwd = await getCanonicalCwd();
+			const match = findWorkspaceForPath(status.workspaces, cwd);
 			if (match) {
 				workspaceName = match.name;
 			} else {
@@ -521,10 +540,8 @@ async function resolveWorkspaceNameForCwd(session: RemoteControlSession): Promis
 		reportControlError(status, "status");
 		return undefined;
 	}
-	const cwd = resolve(process.cwd());
-	const match = status.workspaces
-		.filter((workspace) => cwd === workspace.path || cwd.startsWith(`${workspace.path}/`))
-		.sort((left, right) => right.path.length - left.path.length)[0];
+	const cwd = await getCanonicalCwd();
+	const match = findWorkspaceForPath(status.workspaces, cwd);
 	if (!match) {
 		console.error("Error: no registered workspace matches the current directory; pass --workspace <name>");
 		process.exitCode = 1;

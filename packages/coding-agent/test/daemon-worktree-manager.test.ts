@@ -3,8 +3,8 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	realpathSync as nodeRealpathSync,
 	readdirSync,
-	realpathSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -26,6 +26,8 @@ import {
 	WorktreeManager,
 	WorktreeRetentionSweeper,
 } from "../src/daemon/worktree-manager.ts";
+
+const realpathSync = nodeRealpathSync.native;
 
 interface RecordedGitCall {
 	args: string[];

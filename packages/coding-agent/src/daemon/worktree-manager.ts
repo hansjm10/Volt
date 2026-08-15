@@ -1,5 +1,5 @@
 import { createHash, randomInt } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, readdir, realpath, rename, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import type { IrohRemoteAuditLogger } from "../core/remote/iroh/audit.ts";
@@ -20,7 +20,13 @@ import { resolveWorkspaceDirectory, type WorkspaceDirectoryResolution } from "./
 
 /** join(agentDir, "worktrees") — sibling of sessions/, daemon/, trust.json. */
 export function getWorktreesRoot(agentDir: string): string {
-	return join(resolve(agentDir), "worktrees");
+	let resolvedAgentDir = resolve(agentDir);
+	try {
+		resolvedAgentDir = realpathSync.native(resolvedAgentDir);
+	} catch {
+		// The agent directory may not exist yet during first-run path derivation.
+	}
+	return join(resolvedAgentDir, "worktrees");
 }
 
 export const WORKTREE_ID_PATTERN = IROH_REMOTE_WORKTREE_ID_PATTERN;
