@@ -111,6 +111,7 @@ export {
 	type OverlayMargin,
 	type OverlayOptions,
 	type OverlayUnfocusOptions,
+	type RenderSuspensionLease,
 	type SizeValue,
 	TUI,
 	type TuiRenderMetrics,

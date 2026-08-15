@@ -63,6 +63,10 @@ export interface TuiRenderMetrics {
 	terminalBytes: number;
 }
 
+export interface RenderSuspensionLease {
+	release(): void;
+}
+
 export interface Component {
 	/**
 	 * Render the component to lines for the given viewport width
@@ -313,7 +317,9 @@ export class TUI extends Container {
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	public onDebug?: () => void;
 	private renderRequested = false;
+	private forceRenderRequested = false;
 	private renderTimer: NodeJS.Timeout | undefined;
+	private renderSuspensions = new Set<symbol>();
 	private lastRenderAt = 0;
 	private static readonly MIN_RENDER_INTERVAL_MS = 16;
 	private cursorRow = 0; // Logical cursor row (end of rendered content)
@@ -721,8 +727,67 @@ export class TUI extends Container {
 		this.terminal.stop();
 	}
 
+	suspendRendering(): RenderSuspensionLease {
+		const token = Symbol("render-suspension");
+		this.renderSuspensions.add(token);
+		if (this.renderTimer) {
+			clearTimeout(this.renderTimer);
+			this.renderTimer = undefined;
+		}
+
+		let released = false;
+		return {
+			release: () => {
+				if (released) return;
+				released = true;
+				this.renderSuspensions.delete(token);
+				if (this.renderSuspensions.size === 0) {
+					this.scheduleRequestedRender();
+				}
+			},
+		};
+	}
+
 	requestRender(force = false): void {
+		const alreadyRequested = this.renderRequested;
+		this.renderRequested = true;
 		if (force) {
+			this.forceRenderRequested = true;
+			if (this.renderTimer) {
+				clearTimeout(this.renderTimer);
+				this.renderTimer = undefined;
+			}
+		}
+		if (this.renderSuspensions.size > 0) return;
+		if (force) {
+			this.scheduleForcedRender();
+			return;
+		}
+		if (alreadyRequested) return;
+		process.nextTick(() => this.scheduleRender());
+	}
+
+	private scheduleRequestedRender(): void {
+		if (this.stopped || this.renderSuspensions.size > 0 || !this.renderRequested) return;
+		if (this.forceRenderRequested) {
+			this.scheduleForcedRender();
+			return;
+		}
+		process.nextTick(() => this.scheduleRender());
+	}
+
+	private scheduleForcedRender(): void {
+		if (this.stopped || this.renderSuspensions.size > 0 || !this.renderRequested || !this.forceRenderRequested) {
+			return;
+		}
+		if (this.renderTimer) {
+			clearTimeout(this.renderTimer);
+			this.renderTimer = undefined;
+		}
+		process.nextTick(() => {
+			if (this.stopped || this.renderSuspensions.size > 0 || !this.renderRequested || !this.forceRenderRequested) {
+				return;
+			}
 			this.previousLines = [];
 			this.previousWidth = -1; // -1 triggers widthChanged, forcing a full clear
 			this.previousHeight = -1; // -1 triggers heightChanged, forcing a full clear
@@ -730,42 +795,40 @@ export class TUI extends Container {
 			this.hardwareCursorRow = 0;
 			this.maxLinesRendered = 0;
 			this.previousViewportTop = 0;
-			if (this.renderTimer) {
-				clearTimeout(this.renderTimer);
-				this.renderTimer = undefined;
+			this.renderRequested = false;
+			this.forceRenderRequested = false;
+			this.lastRenderAt = performance.now();
+			this.doRender();
+			if (this.renderRequested) {
+				this.scheduleRequestedRender();
 			}
-			this.renderRequested = true;
-			process.nextTick(() => {
-				if (this.stopped || !this.renderRequested) {
-					return;
-				}
-				this.renderRequested = false;
-				this.lastRenderAt = performance.now();
-				this.doRender();
-			});
-			return;
-		}
-		if (this.renderRequested) return;
-		this.renderRequested = true;
-		process.nextTick(() => this.scheduleRender());
+		});
 	}
 
 	private scheduleRender(): void {
-		if (this.stopped || this.renderTimer || !this.renderRequested) {
+		if (this.forceRenderRequested) {
+			this.scheduleForcedRender();
+			return;
+		}
+		if (this.stopped || this.renderSuspensions.size > 0 || this.renderTimer || !this.renderRequested) {
 			return;
 		}
 		const elapsed = performance.now() - this.lastRenderAt;
 		const delay = Math.max(0, TUI.MIN_RENDER_INTERVAL_MS - elapsed);
 		this.renderTimer = setTimeout(() => {
 			this.renderTimer = undefined;
-			if (this.stopped || !this.renderRequested) {
+			if (this.stopped || this.renderSuspensions.size > 0 || !this.renderRequested) {
+				return;
+			}
+			if (this.forceRenderRequested) {
+				this.scheduleForcedRender();
 				return;
 			}
 			this.renderRequested = false;
 			this.lastRenderAt = performance.now();
 			this.doRender();
 			if (this.renderRequested) {
-				this.scheduleRender();
+				this.scheduleRequestedRender();
 			}
 		}, delay);
 	}
@@ -1264,6 +1327,10 @@ export class TUI extends Container {
 
 	private doRender(): void {
 		if (this.stopped) return;
+		if (this.renderSuspensions.size > 0) {
+			this.renderRequested = true;
+			return;
+		}
 		this.renderFrameCount++;
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
