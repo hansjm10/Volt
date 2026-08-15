@@ -60,18 +60,15 @@ describe("regression #211: delivery payload isolation", () => {
 		let providerUser: Extract<AgentMessage, { role: "user" }> | undefined;
 		let deliveryUser: Extract<AgentMessage, { role: "user" }> | undefined;
 		harness = await createHarness({
-			prepareDelivery: (delivery) => {
-				const messages = [...delivery.messages];
-				return {
-					messages,
-					participant: {
-						settle: () => {
-							mutateRetainedMessages(messages);
-							return { outcome: "committed" };
-						},
+			prepareDelivery: (delivery) => ({
+				messages: delivery.messages.map((message) => structuredClone(message)),
+				participant: {
+					settle: (context) => {
+						mutateRetainedMessages(context.messages as AgentMessage[]);
+						return { outcome: "committed" };
 					},
-				};
-			},
+				},
+			}),
 			extensionFactories: [
 				(volt) => {
 					volt.on("context", (event) => {
@@ -107,21 +104,18 @@ describe("regression #211: delivery payload isolation", () => {
 		let providerUser: Extract<AgentMessage, { role: "user" }> | undefined;
 		let deliveryUser: Extract<AgentMessage, { role: "user" }> | undefined;
 		harness = await createHarness({
-			prepareDelivery: (delivery) => {
-				const messages = [...delivery.messages];
-				return {
-					messages,
-					participant: {
-						settle: () => {
-							mutateRetainedMessages(messages);
-							if (extensionReference) mutateRetainedMessages([extensionReference]);
-							return retain
-								? { outcome: "retained", error: new Error("retry isolated payload") }
-								: { outcome: "committed" };
-						},
+			prepareDelivery: (delivery) => ({
+				messages: delivery.messages.map((message) => structuredClone(message)),
+				participant: {
+					settle: (context) => {
+						mutateRetainedMessages(context.messages as AgentMessage[]);
+						if (extensionReference) mutateRetainedMessages([extensionReference]);
+						return retain
+							? { outcome: "retained", error: new Error("retry isolated payload") }
+							: { outcome: "committed" };
 					},
-				};
-			},
+				},
+			}),
 			extensionFactories: [
 				(volt) => {
 					volt.on("message_end", (event) => {
@@ -220,20 +214,19 @@ describe("regression #211: delivery payload isolation", () => {
 				return { content: [{ type: "text", text: "released" }], details: {} };
 			},
 		};
-		let retainedMessages: AgentMessage[] | undefined;
 		let retain = true;
 		harness = await createHarness({
 			tools: [waitTool],
 			prepareDelivery: (delivery) => {
 				if (delivery.kind !== "steer") return { messages: [...delivery.messages] };
-				retainedMessages ??= [...delivery.messages];
 				return {
-					messages: retainedMessages,
+					messages: delivery.messages.map((message) => structuredClone(message)),
 					participant: {
-						settle: () => {
+						settle: (context) => {
 							if (retain) {
-								mutateRetainedMessages(retainedMessages!);
-								const user = findUser(retainedMessages!);
+								const participantMessages = context.messages as AgentMessage[];
+								mutateRetainedMessages(participantMessages);
+								const user = findUser(participantMessages);
 								if (user) user.clientMessageId = "substituted-runtime-identity";
 								retain = false;
 								return { outcome: "retained", error: new Error("retry retained queue") };

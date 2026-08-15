@@ -79,10 +79,6 @@ function createSession() {
 	return { session, sessionManager };
 }
 
-function syncAgentMessages(session: AgentSession, sessionManager: SessionManager): void {
-	session.state.messages = sessionManager.buildSessionContext().messages;
-}
-
 describe("AgentSession.getSessionStats", () => {
 	it("exposes the current context usage alongside token totals", () => {
 		const { session, sessionManager } = createSession();
@@ -90,7 +86,6 @@ describe("AgentSession.getSessionStats", () => {
 		try {
 			sessionManager.appendMessage(createUserMessage("hello", 1));
 			sessionManager.appendMessage(createAssistantMessage("hi", 200, 2));
-			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
 			expect(stats.contextUsage).toEqual(session.getContextUsage());
@@ -112,7 +107,6 @@ describe("AgentSession.getSessionStats", () => {
 			sessionManager.appendMessage(createAssistantMessage("response2", 195_000, 4, 1));
 			sessionManager.appendCompaction("summary", keptUserId, 195_000);
 			sessionManager.appendMessage(createUserMessage("third", 5));
-			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
 			expect(stats).toMatchObject({
@@ -143,7 +137,6 @@ describe("AgentSession.getSessionStats", () => {
 			sessionManager.appendCompaction("summary", keptUserId, 195_000);
 			sessionManager.appendMessage(createUserMessage("third", 5));
 			sessionManager.appendMessage(createAssistantMessage("response3", 25_000, 6, 1));
-			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
 			expect(stats).toMatchObject({

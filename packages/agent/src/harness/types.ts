@@ -473,6 +473,8 @@ export interface SessionContext {
 	thinkingLevel: string;
 	model: { provider: string; modelId: string } | null;
 	activeToolNames: string[] | null;
+	/** Canonical branch leaf used only to validate an ephemeral context projection. */
+	anchorLeafId: string | null;
 }
 
 export interface SessionMetadata {
@@ -783,6 +785,24 @@ export type AgentHarnessEventResultMap = {
 	settled: undefined;
 };
 
+export type AgentHarnessContextProjectionSource = "explicit" | "retry" | "compaction";
+
+/** Identity and canonical origin of one installed ephemeral context projection. */
+export interface AgentHarnessContextProjectionToken {
+	readonly projectionId: string;
+	readonly source: AgentHarnessContextProjectionSource;
+	readonly anchorLeafId: string | null;
+}
+
+export interface AgentHarnessContextRebaseOptions {
+	readonly source: AgentHarnessContextProjectionSource;
+	/**
+	 * Synchronously derive projected messages from an isolated readonly clone of
+	 * one canonical branch snapshot.
+	 */
+	readonly project?: (messages: readonly AgentMessage[]) => readonly AgentMessage[];
+}
+
 export interface AgentHarnessRunOptions {
 	/** Override the configured system prompt for this bounded run. */
 	systemPrompt?: string;
@@ -848,16 +868,6 @@ export interface TreePreparation {
 	label?: string;
 }
 
-export interface GenerateBranchSummaryOptions {
-	model: Model<any>;
-	apiKey: string;
-	headers?: Record<string, string>;
-	signal: AbortSignal;
-	customInstructions?: string;
-	replaceInstructions?: boolean;
-	reserveTokens?: number;
-}
-
 export interface BranchSummaryResult {
 	summary: string;
 	readFiles: string[];
@@ -897,7 +907,11 @@ export interface AgentHarnessOptions<
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** Curated stream/provider request options. Snapshotted at turn start. */
 	streamOptions?: AgentHarnessStreamOptions;
-	/** Stage a leased inbox delivery before its irrevocable begin boundary. */
+	/**
+	 * Stage one leased-delivery attempt before its irrevocable begin boundary.
+	 * Every retry invokes this callback again and requires a fresh participant with
+	 * the same prepared messages; Harness caches completed message reduction only.
+	 */
 	prepareDelivery?: (
 		delivery: AgentDelivery,
 		signal: AbortSignal,

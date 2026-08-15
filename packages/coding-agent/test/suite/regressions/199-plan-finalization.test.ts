@@ -68,7 +68,6 @@ describe("regression #199: approved plan finalization", () => {
 		});
 		harnesses.push(harness);
 		await createReadyPlan(harness);
-		harness.session.state.messages = [createUserMessage("existing context")];
 		harness.setResponses([
 			fauxAssistantMessage("revoked delivery omitted"),
 			fauxAssistantMessage("feedback admitted"),
@@ -370,7 +369,6 @@ describe("regression #199: approved plan finalization", () => {
 		const olderAssistant = fauxAssistantMessage("older completed response");
 		harness.sessionManager.appendMessage(olderUser);
 		harness.sessionManager.appendMessage(olderAssistant);
-		harness.session.state.messages = [olderUser, olderAssistant];
 		await harness.session.setAgentMode("plan");
 		const draft = harness.session.updatePlan({ steps: [{ text: "Finish compacted implementation" }] });
 		const ready = harness.session.submitPlan({

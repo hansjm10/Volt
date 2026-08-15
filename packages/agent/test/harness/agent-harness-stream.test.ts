@@ -11,6 +11,7 @@ import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import { convertToLlm } from "../../src/harness/messages.ts";
 import { InMemorySessionStorage } from "../../src/harness/session/memory-storage.ts";
 import { Session } from "../../src/harness/session/session.ts";
+import type { GenerateBranchSummaryOptions } from "../../src/index.ts";
 import type { StreamFn } from "../../src/types.ts";
 import { calculateTool } from "../utils/calculate.ts";
 
@@ -44,6 +45,19 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe("AgentHarness stream configuration", () => {
+	it("exports branch-summary options with streamFn and optional apiKey", () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		const options = {
+			model: registration.getModel(),
+			signal: new AbortController().signal,
+			streamFn: streamSimple,
+		} satisfies GenerateBranchSummaryOptions;
+
+		expect(options.streamFn).toBe(streamSimple);
+		expect(options).not.toHaveProperty("apiKey");
+	});
+
 	it("uses configurable base stream and message converter functions", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);

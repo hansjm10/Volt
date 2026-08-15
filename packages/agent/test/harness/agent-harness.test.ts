@@ -5,7 +5,7 @@ import {
 	getModel,
 	registerFauxProvider,
 } from "@hansjm10/volt-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentHarness } from "../../src/harness/agent-harness.ts";
 import { estimateMessagesTokens } from "../../src/harness/compaction/compaction.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
@@ -36,6 +36,12 @@ function textFromUserMessages(messages: readonly AgentMessage[]): string[] {
 			return "text" in part && typeof part.text === "string" ? [part.text] : [];
 		});
 	});
+}
+
+function messageText(message: AgentMessage): string {
+	if (!("content" in message)) return "";
+	if (typeof message.content === "string") return message.content;
+	return message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("");
 }
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -704,6 +710,47 @@ describe("AgentHarness", () => {
 		expect(roles).toEqual(["user", "assistant", "custom"]);
 	});
 
+	it("includes a flushed Harness append in the next provider request exactly once", async () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		const requestTexts: string[][] = [];
+		registration.setResponses([
+			(context) => {
+				requestTexts.push((context.messages as AgentMessage[]).map(messageText));
+				return fauxAssistantMessage(fauxToolCall("calculate", { expression: "2 + 2" }, { id: "call-1" }), {
+					stopReason: "toolUse",
+				});
+			},
+			(context) => {
+				requestTexts.push((context.messages as AgentMessage[]).map(messageText));
+				return fauxAssistantMessage("done");
+			},
+		]);
+		const harness = new AgentHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session: new Session(new InMemorySessionStorage()),
+			model: registration.getModel(),
+			tools: [calculateTool],
+		});
+		let appended = false;
+		harness.subscribe(async (event) => {
+			if (event.type !== "tool_execution_end" || appended) return;
+			appended = true;
+			await harness.appendMessage({
+				role: "custom",
+				customType: "host_append",
+				content: "host append",
+				display: false,
+				timestamp: Date.now(),
+			});
+		});
+
+		await harness.prompt("start");
+
+		expect(requestTexts).toHaveLength(2);
+		expect(requestTexts[1]?.filter((text) => text === "host append")).toHaveLength(1);
+	});
+
 	it("waitForIdle waits for external run settlement and awaited listeners", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);
@@ -898,6 +945,41 @@ describe("AgentHarness", () => {
 		);
 	});
 
+	it("does not install a dormant projection after compaction without continuation work", async () => {
+		const registration = registerFauxProvider({
+			models: [{ id: "compact", contextWindow: 6000, maxTokens: 1000 }],
+		});
+		registrations.push(registration);
+		registration.setSimpleResponses([fauxAssistantMessage("summary")]);
+		const session = new Session(new InMemorySessionStorage());
+		for (let index = 0; index < 5; index++) {
+			await session.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: String(index).repeat(4000) }],
+				timestamp: Date.now() + index,
+			});
+		}
+		const harness = new AgentHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: registration.getModel(),
+			getApiKeyAndHeaders: async () => ({ apiKey: "test-key" }),
+		});
+
+		await harness.compact();
+		await session.appendMessage({ role: "user", content: "after compaction", timestamp: Date.now() });
+		let requestTexts: string[] = [];
+		registration.setResponses([
+			(context) => {
+				requestTexts = (context.messages as AgentMessage[]).map(messageText);
+				return fauxAssistantMessage("continued");
+			},
+		]);
+
+		await expect(harness.continue()).resolves.toMatchObject({ status: "completed" });
+		expect(requestTexts).toContain("after compaction");
+	});
+
 	it("validates constructor tool names", () => {
 		const session = new Session(new InMemorySessionStorage());
 		const env = new NodeExecutionEnv({ cwd: process.cwd() });
@@ -925,6 +1007,45 @@ describe("AgentHarness", () => {
 					activeToolNames: [calculateTool.name, calculateTool.name],
 				}),
 		).toThrow(/Duplicate active tool/);
+	});
+
+	it("owns prompt-template arguments before blocked canonical context resolution", async () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		const session = new Session(new InMemorySessionStorage());
+		const contextStarted = deferred();
+		const releaseContext = deferred();
+		const buildContext = session.buildContext.bind(session);
+		vi.spyOn(session, "buildContext").mockImplementation(async () => {
+			contextStarted.resolve();
+			await releaseContext.promise;
+			return await buildContext();
+		});
+		let providerTexts: string[] = [];
+		registration.setResponses([
+			(context) => {
+				providerTexts = textFromUserMessages(context.messages as AgentMessage[]);
+				return fauxAssistantMessage("done");
+			},
+		]);
+		const template: PromptTemplate = { name: "review", content: "Review $1 with $2" };
+		const harness = new AgentHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: registration.getModel(),
+			resources: { promptTemplates: [template] },
+		});
+		const args = ["original.ts", "original guidance"];
+
+		const invocation = harness.promptFromTemplate("review", args);
+		await contextStarted.promise;
+		args[0] = "mutated.ts";
+		args[1] = "mutated guidance";
+		args.push("late argument");
+		releaseContext.resolve();
+
+		await invocation;
+		expect(providerTexts).toEqual(["Review original.ts with original guidance"]);
 	});
 
 	it("preserves app resource types for getters and update events", async () => {

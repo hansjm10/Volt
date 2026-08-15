@@ -9,7 +9,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateMessagesTokens } from "../../src/core/compaction/index.ts";
 import type { SessionManager } from "../../src/core/session-manager.ts";
-import { createHarness, type Harness } from "./harness.ts";
+import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
@@ -19,7 +19,6 @@ type SessionWithCompactionInternals = {
 	_handleAgentEvent: (event: AgentEvent) => Promise<AgentMessage | undefined>;
 	_lastAssistantMessage: AssistantMessage | undefined;
 	_proactiveCompactionState: "idle" | "scheduled" | "compacting";
-	_nextRunContextOverride: AgentMessage[] | undefined;
 };
 
 function createUsage(totalTokens: number) {
@@ -169,6 +168,90 @@ describe("AgentSession compaction characterization", () => {
 		);
 		expect(compactionEntries).toHaveLength(1);
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
+	});
+
+	it("does not install a dormant projection after manual compaction without continuation work", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "idle compaction summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+
+		await harness.session.compact();
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "after idle compaction" }],
+			timestamp: Date.now(),
+		});
+		await harness.sessionManager.flush();
+		let requestTexts: string[] = [];
+		harness.setResponses([
+			(context) => {
+				requestTexts = (context.messages as AgentMessage[]).map(getMessageText);
+				return fauxAssistantMessage("continued from canonical context");
+			},
+		]);
+
+		await expect(harness.control.continue()).resolves.toMatchObject({ status: "completed" });
+		expect(requestTexts).toContain("after idle compaction");
+	});
+
+	it("rebases a retained direct prompt immediately after manual compaction", async () => {
+		let retain = true;
+		const harness = await createHarness({
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				participant: {
+					settle: () =>
+						retain ? { outcome: "retained", error: new Error("compact before retry") } : { outcome: "committed" },
+				},
+			}),
+			extensionFactories: [
+				(volt) => {
+					volt.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "manual retained summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const clientMessageId = "retained-manual-compaction";
+
+		await expect(
+			harness.session.prompt("retained after compaction", { clientMessageId, source: "rpc" }),
+		).rejects.toThrow("compact before retry");
+		expect(harness.control.hasPendingPrompt()).toBe(true);
+		await harness.session.compact();
+		expect(harness.control.hasPendingPrompt()).toBe(true);
+
+		const providerTexts: string[][] = [];
+		harness.setResponses([
+			(context) => {
+				providerTexts.push((context.messages as AgentMessage[]).map(getMessageText));
+				return fauxAssistantMessage("committed after compaction");
+			},
+		]);
+		retain = false;
+		await harness.session.prompt("retained after compaction", { clientMessageId, source: "rpc" });
+
+		expect(providerTexts.flat().some((text) => text.includes("manual retained summary"))).toBe(true);
+		expect(providerTexts.flat().filter((text) => text === "retained after compaction")).toHaveLength(1);
+		expect(harness.control.hasPendingPrompt()).toBe(false);
 	});
 
 	it("rejects invalid extension compaction details before appending", async () => {
@@ -428,14 +511,37 @@ describe("AgentSession compaction characterization", () => {
 				(message) => message.role === "assistant" && (message as AssistantMessage).stopReason === "error",
 			),
 		).toBe(true);
-		const retained = sessionInternals._nextRunContextOverride!;
+		let retained: AgentMessage[] = [];
+		harness.control.setStreamFn((model, context) => {
+			retained = context.messages as AgentMessage[];
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					seq: 1,
+					reason: "stop",
+					message: {
+						...fauxAssistantMessage("continued after compaction"),
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+					},
+				});
+			});
+			return stream;
+		});
+		await harness.control.continue();
 		expect(
 			retained.some(
 				(message) => message.role === "assistant" && (message as AssistantMessage).stopReason === "error",
 			),
 		).toBe(false);
+		const expectedRetained = [...canonical];
+		const trailingErrorIndex =
+			expectedRetained.at(-1)?.role === "custom" ? expectedRetained.length - 2 : expectedRetained.length - 1;
+		expectedRetained.splice(trailingErrorIndex, 1);
 		expect(estimates.at(-1)).toBe(
-			estimateMessagesTokens(retained) + estimateToolDefinitionTokens(harness.session.state.tools),
+			estimateMessagesTokens(expectedRetained) + estimateToolDefinitionTokens(harness.session.state.tools),
 		);
 	});
 

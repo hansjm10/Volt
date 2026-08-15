@@ -267,7 +267,6 @@ describe("issue #110: durable Fast mode state", () => {
 	it("restores branch-local Fast and thinking states before publishing navigation", async () => {
 		const runtime = await createRuntime({ provider: "openai", explicitThinking: "high" });
 		const branchPoint = runtime.manager.appendMessage({ role: "user", content: "branch point", timestamp: 1 });
-		runtime.session.state.messages = runtime.manager.buildSessionContext().messages;
 		runtime.session.setFastModeEnabled(true);
 		const enabledLeaf = runtime.manager.getLeafId()!;
 

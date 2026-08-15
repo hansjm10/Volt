@@ -94,7 +94,6 @@ describe("AgentSession conversation generation commits", () => {
 		const firstAssistantId = manager.appendMessage(fauxAssistantMessage("first assistant"));
 		manager.appendMessage({ role: "user", content: "second user", timestamp: 2 });
 		const oldLeafId = manager.appendMessage(fauxAssistantMessage("second assistant"));
-		runtime.session.state.messages = manager.buildSessionContext().messages;
 
 		const transcriptItems = (): RpcConversationTranscriptItem[] => {
 			const items: RpcConversationTranscriptItem[] = [];
@@ -255,7 +254,6 @@ describe("AgentSession conversation generation commits", () => {
 		const firstAssistantId = manager.appendMessage(fauxAssistantMessage("first assistant", { timestamp: 2 }));
 		manager.appendMessage({ role: "user", content: "second user", timestamp: 3 });
 		manager.appendMessage(fauxAssistantMessage("second assistant", { timestamp: 4 }));
-		runtime.session.state.messages = manager.buildSessionContext().messages;
 		const targetManager = SessionManager.create(tempDir, tempDir);
 		targetManager.appendMessage({ role: "user", content: "target user", timestamp: 5 });
 		targetManager.appendMessage(fauxAssistantMessage("target assistant", { timestamp: 6 }));
@@ -368,7 +366,6 @@ describe("AgentSession conversation generation commits", () => {
 		const firstAssistantId = manager.appendMessage(fauxAssistantMessage("first assistant", { timestamp: 2 }));
 		manager.appendMessage({ role: "user", content: "abandoned user", timestamp: 3 });
 		manager.appendMessage(fauxAssistantMessage("abandoned assistant", { timestamp: 4 }));
-		runtime.session.state.messages = manager.buildSessionContext().messages;
 
 		let releasePreflight = () => {};
 		const preflightRelease = new Promise<void>((resolve) => {
@@ -459,7 +456,6 @@ describe("AgentSession conversation generation commits", () => {
 			const firstAssistantId = manager.appendMessage(fauxAssistantMessage("first assistant"));
 			manager.appendMessage({ role: "user", content: "second user", timestamp: 2 });
 			manager.appendMessage(fauxAssistantMessage("second assistant"));
-			runtime.session.state.messages = manager.buildSessionContext().messages;
 
 			let releaseBoundary = () => {};
 			const boundaryRelease = new Promise<void>((resolve) => {
@@ -607,7 +603,6 @@ describe("AgentSession conversation generation commits", () => {
 		const firstAssistantId = activeManager.appendMessage(fauxAssistantMessage("first assistant"));
 		activeManager.appendMessage({ role: "user", content: "second user", timestamp: 2 });
 		activeManager.appendMessage(fauxAssistantMessage("second assistant"));
-		runtime.session.state.messages = activeManager.buildSessionContext().messages;
 		const originalSession = runtime.session;
 		const originalSessionId = originalSession.sessionId;
 
@@ -749,7 +744,6 @@ describe("AgentSession conversation generation commits", () => {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			};
 			manager.appendMessage(secondAssistant);
-			runtime.session.state.messages = manager.buildSessionContext().messages;
 			if (phase !== "pre-admission") {
 				faux.setResponses([fauxAssistantMessage("fresh assistant")]);
 			}

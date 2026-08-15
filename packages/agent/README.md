@@ -98,8 +98,8 @@ const harness = new AgentHarness({
   prepareDelivery: (delivery) => ({
     messages: [...delivery.messages],
     participant: {
-      settle: async ({ requestAbort }) => {
-        const result = await persistDeliveryAtomically(delivery);
+      settle: async ({ deliveryId, kind, messages, requestAbort }) => {
+        const result = await persistDeliveryAtomically({ deliveryId, kind, messages });
         if (result === "rolled_back") {
           return { outcome: "retained", error: new Error("Persistence rolled back") };
         }
@@ -117,7 +117,9 @@ const harness = new AgentHarness({
 });
 ```
 
-Preparation must not mutate canonical host state. Harness snapshots delivery payloads at admission and gives hooks and observers isolated copies.
+Preparation must not mutate canonical host state. Its returned fields and message array are readonly. Harness invokes `prepareDelivery` for every attempt, so each call must return a fresh participant and the same logical messages for a retained delivery. Completed message reductions may be cached across retained attempts, but participant instances are never reused. A changed replay payload is terminally fenced; ordinary preparation errors remain retryable.
+
+Harness snapshots delivery payloads at admission and gives hooks, participants, and observers isolated copies. Participants must persist the reduced `messages` from their transaction context, not messages captured by the preparation closure. Passive `delivery_start`, `message_start`, and `message_end` publication occurs only after commitment and before provider work.
 
 Participant outcomes are:
 
@@ -163,6 +165,8 @@ await harness.clearAllQueues();
 await harness.discardPendingPrompt();
 ```
 
+`dispose()` is terminal and idempotent. It synchronously aborts the active run, fences later persistence, and revokes retained delivery, queue, and continuation state without waiting for an active callback to return. Its receipt therefore may resolve before `waitForIdle()` would. Subsequent prompting, continuation, queue mutation, append, compaction, navigation, and configuration operations reject.
+
 ## Prompting and queues
 
 ```typescript
@@ -182,7 +186,9 @@ const followUpId = harness.queueFollowUp(otherUserMessage);
 await harness.continue();
 ```
 
-Steering and follow-up modes are `"one-at-a-time"` or `"all"` and can be changed with their corresponding getters and setters.
+Harness owns deep snapshots of `run()`, `runPrompt()`, and `prompt()` messages, explicit context, images, and options before any asynchronous preflight. `continue()` similarly owns explicit context and dispatch options, and `promptFromTemplate()` owns its argument array before resolving runtime context. Later caller mutation cannot change admission, retries, or provider context.
+
+`queueSteer()` and `queueFollowUp()` synchronously return after admission. Their async text counterparts, `steer()` and `followUp()`, wait for passive `queue_update` publication before resolving. Steering and follow-up modes are `"one-at-a-time"` or `"all"` and can be changed with their corresponding getters and setters.
 
 ## Tools
 
@@ -235,7 +241,7 @@ const unsubscribe = harness.subscribe(async (event) => {
 });
 ```
 
-Mutation hooks run in registration order before persistence or provider use, as appropriate for the event. Finalized subscribers receive cloned, passive projections. Subscriber mutation or failure cannot change committed delivery or terminal outcomes.
+Mutation hooks run in registration order before persistence or provider use, as appropriate for the event. Every `next_action` hook and scoped policy receives a fresh deep projection of messages, completed-turn results, and delivery payloads; tool arrays are copied while tool objects retain their callable identity. Only an explicitly returned action advances reducer state. Finalized subscribers receive cloned, passive projections. Subscriber mutation or failure cannot change committed delivery or terminal outcomes.
 
 Important loop events include:
 

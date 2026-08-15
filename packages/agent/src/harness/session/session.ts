@@ -76,7 +76,13 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
 		}
 	}
 
-	return { messages, thinkingLevel, model, activeToolNames };
+	return {
+		messages,
+		thinkingLevel,
+		model,
+		activeToolNames,
+		anchorLeafId: pathEntries.at(-1)?.id ?? null,
+	};
 }
 
 export class Session<TMetadata extends SessionMetadata = SessionMetadata> {

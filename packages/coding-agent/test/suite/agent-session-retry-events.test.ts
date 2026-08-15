@@ -530,7 +530,6 @@ describe("AgentSession retry and event characterization", () => {
 		});
 		harness.sessionManager.appendMessage(previousUser);
 		harness.sessionManager.appendMessage(overflow);
-		harness.session.state.messages = [previousUser, overflow];
 		harness.faux.setSimpleResponses([fauxAssistantMessage("compacted context")]);
 		harness.setResponses([fauxAssistantMessage("recovered previous turn")]);
 

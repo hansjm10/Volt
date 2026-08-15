@@ -2,7 +2,7 @@ import type { AgentMessage } from "@hansjm10/volt-agent-core";
 import { fauxAssistantMessage } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PromptPreflightResult } from "../../../src/core/agent-session.ts";
-import { createHarness, getUserTexts, type Harness } from "../harness.ts";
+import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.ts";
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
 	let resolve = (): void => undefined;
@@ -109,6 +109,50 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
 		expect(getUserTexts(harness)).toEqual(["retryable direct input"]);
 		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("rebases a retained direct prompt onto the branch selected by tree navigation", async () => {
+		let retain = true;
+		harness = await createHarness({
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				participant: {
+					settle: () =>
+						retain
+							? { outcome: "retained", error: new Error("navigate before retry") }
+							: { outcome: "committed" },
+				},
+			}),
+		});
+		const rootId = harness.sessionManager.appendMessage(createUserMessage("abandoned branch root"));
+		harness.sessionManager.appendMessage(fauxAssistantMessage("abandoned branch assistant"));
+		const providerTexts: string[][] = [];
+		harness.setResponses([
+			(context) => {
+				providerTexts.push((context.messages as AgentMessage[]).map(getMessageText));
+				return fauxAssistantMessage("committed on selected branch");
+			},
+		]);
+		const clientMessageId = "retained-navigation-rebase";
+
+		await expect(
+			harness.session.prompt("retained branch prompt", { clientMessageId, source: "rpc" }),
+		).rejects.toThrow("navigate before retry");
+		expect(harness.control.hasPendingPrompt()).toBe(true);
+
+		await expect(harness.session.navigateTree(rootId)).resolves.toMatchObject({
+			cancelled: false,
+			editorText: "abandoned branch root",
+		});
+		expect(harness.sessionManager.getLeafId()).toBeNull();
+		expect(harness.control.hasPendingPrompt()).toBe(true);
+
+		retain = false;
+		await harness.session.prompt("retained branch prompt", { clientMessageId, source: "rpc" });
+
+		expect(providerTexts).toEqual([["retained branch prompt"]]);
+		expect(getUserTexts(harness)).toEqual(["retained branch prompt"]);
+		expect(harness.control.hasPendingPrompt()).toBe(false);
 	});
 
 	it("does not install prepared payload state after disposal interrupts upstream preparation", async () => {
@@ -281,6 +325,147 @@ describe("regression #205: coding-agent delivery participant migration", () => {
 
 		expect(extensionRuns).toBe(1);
 		expect(getUserTexts(harness)).toEqual(["transformed once (1)"]);
+	});
+
+	it("retains a completed extension transformation when abort wins before settlement", async () => {
+		const extensionStarted = deferred();
+		const releaseExtension = deferred();
+		let extensionRuns = 0;
+		harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("message_end", async (event) => {
+						if (event.message.role !== "user") return;
+						extensionRuns++;
+						extensionStarted.resolve();
+						await releaseExtension.promise;
+						return {
+							message: {
+								...event.message,
+								content: [{ type: "text", text: "cached after abort" }],
+							},
+						};
+					});
+				},
+			],
+		});
+		harness.setResponses([fauxAssistantMessage("committed after abort")]);
+
+		const firstAttempt = harness.control.run(createUserMessage("original"));
+		await extensionStarted.promise;
+		const aborting = harness.session.abort("host_action");
+		releaseExtension.resolve();
+		await Promise.all([firstAttempt, aborting]);
+
+		expect(extensionRuns).toBe(1);
+		expect(harness.control.hasPendingPrompt()).toBe(true);
+		await harness.control.continue();
+
+		expect(extensionRuns).toBe(1);
+		expect(harness.control.hasPendingPrompt()).toBe(false);
+		expect(getUserTexts(harness)).toEqual(["cached after abort"]);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("fails closed when upstream preparation changes after an AgentSession retained attempt", async () => {
+		let preparationCalls = 0;
+		let extensionRuns = 0;
+		let settlementCalls = 0;
+		harness = await createHarness({
+			prepareDelivery: (delivery) => {
+				preparationCalls++;
+				return {
+					messages:
+						preparationCalls === 1
+							? delivery.messages.map((message) => structuredClone(message))
+							: [createUserMessage("changed upstream preparation")],
+					participant: {
+						settle: () => {
+							settlementCalls++;
+							return { outcome: "retained", error: new Error("retain first upstream attempt") };
+						},
+					},
+				};
+			},
+			extensionFactories: [
+				(volt) => {
+					volt.on("message_start", (event) => {
+						if (event.message.role === "user") extensionRuns++;
+					});
+				},
+			],
+		});
+		harness.setResponses([fauxAssistantMessage("must remain unused")]);
+
+		await expect(harness.control.run(createUserMessage("stable upstream preparation"))).resolves.toMatchObject({
+			status: "delivery_failed",
+			failure: { outcome: "retained", phase: "settlement" },
+		});
+		await expect(harness.control.continue()).resolves.toMatchObject({
+			status: "delivery_failed",
+			failure: {
+				outcome: "terminally_failed",
+				phase: "preparation",
+				error: {
+					name: "AgentDeliveryPreparationReplayMismatchError",
+					message: expect.stringContaining("changed the prepared messages"),
+				},
+			},
+		});
+
+		expect(preparationCalls).toBe(2);
+		expect(extensionRuns).toBe(1);
+		expect(settlementCalls).toBe(1);
+		expect(harness.control.hasPendingPrompt()).toBe(false);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		await expect(harness.control.continue()).resolves.toEqual({ status: "completed", deliveries: [] });
+		expect(preparationCalls).toBe(2);
+	});
+
+	it("disposal revokes a retained prompt and clears all replay authority", async () => {
+		const revokedDeliveryIds: string[] = [];
+		harness = await createHarness({
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				participant: {
+					settle: () => ({ outcome: "retained", error: new Error("retain until disposal") }),
+				},
+			}),
+		});
+		harness.control.setDeliveryRevoked((delivery) => revokedDeliveryIds.push(delivery.deliveryId));
+		harness.setResponses([fauxAssistantMessage("must remain unused")]);
+
+		await expect(harness.control.run(createUserMessage("dispose retained prompt"))).resolves.toMatchObject({
+			status: "delivery_failed",
+			failure: { outcome: "retained", phase: "settlement" },
+		});
+		expect(harness.control.hasPendingPrompt()).toBe(true);
+		const internals = harness.session as unknown as {
+			_harness: {
+				deliveryPreparationStates: Map<string, unknown>;
+				deliveryAttemptParticipants: Map<string, unknown>;
+				continuationState: unknown;
+				contextProjection: unknown;
+			};
+			_preparingDeliveryExtensions: Map<string, unknown>;
+			_preparedDeliveryExtensions: Map<string, unknown>;
+		};
+		expect(internals._harness.deliveryPreparationStates.size).toBe(1);
+		expect(internals._preparedDeliveryExtensions.size).toBe(1);
+
+		await harness.session.dispose("disposal");
+
+		expect(revokedDeliveryIds).toHaveLength(1);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasPendingPrompt()).toBe(false);
+		expect(internals._harness.deliveryPreparationStates.size).toBe(0);
+		expect(internals._harness.deliveryAttemptParticipants.size).toBe(0);
+		expect(internals._harness.continuationState).toBeUndefined();
+		expect(internals._harness.contextProjection).toBeUndefined();
+		expect(internals._preparingDeliveryExtensions.size).toBe(0);
+		expect(internals._preparedDeliveryExtensions.size).toBe(0);
+		await expect(harness.control.continue()).rejects.toThrow("AgentHarness is disposed");
+		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 
 	it("terminally fences an uncertain durability failure after canonical append", async () => {

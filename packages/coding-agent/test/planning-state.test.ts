@@ -547,7 +547,6 @@ describe("native planning state", () => {
 		const branchPointId = session.sessionManager.appendMessage(
 			createAssistantMessage([{ type: "text", text: "I will research it." }], "stop"),
 		);
-		session.state.messages = session.sessionManager.buildSessionContext().messages;
 		const researchCall = {
 			type: "toolCall" as const,
 			id: "research-before-navigation",

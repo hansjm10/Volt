@@ -37,6 +37,7 @@ import type {
 	StreamFn,
 	ThinkingLevel,
 } from "../types.ts";
+import { AgentDeliveryPreparationReplayMismatchError } from "../types.ts";
 import { collectEntriesForBranchSummary, generateBranchSummary } from "./compaction/branch-summarization.ts";
 import {
 	compact,
@@ -44,10 +45,12 @@ import {
 	estimateMessagesTokens,
 	prepareCompaction,
 } from "./compaction/compaction.ts";
-import { convertToLlm as defaultConvertToLlm } from "./messages.ts";
+import { createCustomMessage, convertToLlm as defaultConvertToLlm } from "./messages.ts";
 import { formatPromptTemplateInvocation } from "./prompt-templates.ts";
 import { formatSkillInvocation } from "./skills.ts";
 import type {
+	AgentHarnessContextProjectionToken,
+	AgentHarnessContextRebaseOptions,
 	AgentHarnessEvent,
 	AgentHarnessEventResultMap,
 	AgentHarnessNextActionPolicy,
@@ -64,6 +67,7 @@ import type {
 	PendingSessionWrite,
 	PromptTemplate,
 	Session,
+	SessionTreeEntry,
 	Skill,
 } from "./types.ts";
 import { AgentHarnessError, BranchSummaryError, CompactionError, SessionError, toError } from "./types.ts";
@@ -76,6 +80,100 @@ function createUserMessage(text: string, images?: ImageContent[]): UserMessage {
 
 function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMessage[] {
 	return messages.map((message) => structuredClone(message));
+}
+
+function cloneRunOptions(options: AgentHarnessRunOptions): AgentHarnessRunOptions {
+	return {
+		...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
+		...(options.context === undefined ? {} : { context: cloneAgentMessages(options.context) }),
+	};
+}
+
+function clonePromptOptions(options: AgentHarnessPromptOptions | undefined): AgentHarnessPromptOptions | undefined {
+	if (options === undefined) return undefined;
+	return {
+		...cloneRunOptions(options),
+		...(options.images === undefined ? {} : { images: structuredClone(options.images) }),
+	};
+}
+
+function cloneNextAction(action: AgentLoopNextAction): AgentLoopNextAction {
+	if (action.type === "stop") return { type: "stop" };
+	if (action.type === "pause") {
+		return {
+			type: "pause",
+			...(action.requestAuthority === undefined ? {} : { requestAuthority: action.requestAuthority }),
+		};
+	}
+	return {
+		type: "request",
+		reason: action.reason,
+		...(action.deliveries === undefined
+			? {}
+			: {
+					deliveries: action.deliveries.map((delivery) => ({
+						...(delivery.deliveryId === undefined ? {} : { deliveryId: delivery.deliveryId }),
+						messages: cloneAgentMessages(delivery.messages),
+					})),
+				}),
+	};
+}
+
+function cloneNextActionContext(
+	context: AgentLoopNextActionContext,
+	defaultAction: AgentLoopNextAction,
+): AgentLoopNextActionContext {
+	return {
+		context: {
+			systemPrompt: context.context.systemPrompt,
+			messages: cloneAgentMessages(context.context.messages),
+			...(context.context.tools === undefined ? {} : { tools: [...context.context.tools] }),
+		},
+		newMessages: cloneAgentMessages(context.newMessages),
+		...(context.completedTurn === undefined
+			? {}
+			: {
+					completedTurn: {
+						message: structuredClone(context.completedTurn.message),
+						toolResults: context.completedTurn.toolResults.map((message) => structuredClone(message)),
+						disposition: context.completedTurn.disposition,
+					},
+				}),
+		requestAuthority: context.requestAuthority,
+		defaultAction: cloneNextAction(defaultAction),
+	};
+}
+
+function areStructurallyEqual(
+	left: unknown,
+	right: unknown,
+	leftSeen = new WeakMap<object, object>(),
+	rightSeen = new WeakMap<object, object>(),
+): boolean {
+	if (Object.is(left, right)) return true;
+	if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) return false;
+	if (Object.getPrototypeOf(left) !== Object.getPrototypeOf(right)) return false;
+	const priorRight = leftSeen.get(left);
+	const priorLeft = rightSeen.get(right);
+	if (priorRight !== undefined || priorLeft !== undefined) return priorRight === right && priorLeft === left;
+	leftSeen.set(left, right);
+	rightSeen.set(right, left);
+	if (left instanceof Date && right instanceof Date) return left.getTime() === right.getTime();
+	if (Array.isArray(left) || Array.isArray(right)) {
+		if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+		return left.every((value, index) => areStructurallyEqual(value, right[index], leftSeen, rightSeen));
+	}
+	const prototype = Object.getPrototypeOf(left);
+	if (prototype !== Object.prototype && prototype !== null) return false;
+	const leftKeys = Object.keys(left);
+	const rightKeys = Object.keys(right);
+	if (leftKeys.length !== rightKeys.length) return false;
+	const rightRecord = right as Record<string, unknown>;
+	return leftKeys.every(
+		(key) =>
+			Object.hasOwn(right, key) &&
+			areStructurallyEqual((left as Record<string, unknown>)[key], rightRecord[key], leftSeen, rightSeen),
+	);
 }
 
 function createFailureMessage(model: Model<any>, error: unknown, aborted: boolean): AssistantMessage {
@@ -256,10 +354,26 @@ interface AgentHarnessDeliveryEventState {
 }
 
 interface AgentHarnessContinuationState {
-	context: AgentMessage[];
 	requestAuthority: AgentRequestAuthority;
 	providerRequestPending: boolean;
 	systemPrompt?: string;
+}
+
+interface AgentHarnessContextProjection {
+	token: AgentHarnessContextProjectionToken;
+	anchorLeafId: string | null;
+	messages: AgentMessage[];
+	invalidError?: AgentHarnessError;
+}
+
+interface AgentHarnessDeliveryPreparationState {
+	admittedMessages?: AgentMessage[];
+	beforeStart?: { text: string; options?: AgentHarnessPromptOptions };
+	systemPromptOverride?: string;
+	resolvedSystemPrompt?: string;
+	preflight?: { messages: AgentMessage[]; systemPrompt: string; systemPromptOverride?: string };
+	preparedMessages?: AgentMessage[];
+	reducedMessages?: AgentMessage[];
 }
 
 interface AgentHarnessRunEventState {
@@ -274,7 +388,6 @@ interface AgentHarnessRunEventState {
 	deliveryFailure?: AgentDeliveryFailure;
 	deliveryFailureDiagnostic?: AssistantMessageDiagnostic;
 	observationalDeliveryIds: Set<string>;
-	participantOwnedDeliveryIds: Set<string>;
 	admittedMessages: AgentMessage[];
 	admittedMessageSet: Set<AgentMessage>;
 	messageDeliveryIds: Map<AgentMessage, string | undefined>;
@@ -343,6 +456,8 @@ export class AgentHarness<
 	readonly env: ExecutionEnv;
 	private session: Session;
 	private phase: AgentHarnessPhase = "idle";
+	private disposed = false;
+	private disposePromise: Promise<void> | undefined;
 	private activeRun: AgentHarnessRunEventState | undefined;
 	private runPromise: Promise<void> | undefined;
 	private pendingSessionWrites: PendingSessionWrite[] = [];
@@ -362,7 +477,8 @@ export class AgentHarness<
 	);
 	private activeDeliveryLease: DeliveryLease<AgentDeliveryKind, AgentMessage> | undefined;
 	private readonly leasedDeliveryKinds = new Map<string, AgentDeliveryKind>();
-	private readonly preparedDeliveryParticipants = new Map<string, AgentDeliveryTransactionParticipant>();
+	private readonly deliveryAttemptParticipants = new Map<string, AgentDeliveryTransactionParticipant>();
+	private readonly deliveryPreparationStates = new Map<string, AgentHarnessDeliveryPreparationState>();
 	private readonly prepareDelivery: AgentHarnessOptions["prepareDelivery"];
 	private readonly deliveryRevoked: AgentHarnessOptions["deliveryRevoked"];
 	private steeringQueueMode: QueueMode;
@@ -371,6 +487,7 @@ export class AgentHarness<
 	private handlers = new Map<string, Set<AgentHarnessHandler>>();
 	private nextActionPolicies = new Set<{ policy: AgentHarnessNextActionPolicy }>();
 	private continuationState: AgentHarnessContinuationState | undefined;
+	private contextProjection: AgentHarnessContextProjection | undefined;
 
 	constructor(options: AgentHarnessOptions<TSkill, TPromptTemplate, TTool>) {
 		this.env = options.env;
@@ -400,6 +517,10 @@ export class AgentHarness<
 		this.validateToolNames(this.activeToolNames);
 		this.steeringQueueMode = options.steeringMode ?? "one-at-a-time";
 		this.followUpQueueMode = options.followUpMode ?? "one-at-a-time";
+	}
+
+	private assertNotDisposed(): void {
+		if (this.disposed) throw new AgentHarnessError("invalid_state", "AgentHarness is disposed");
 	}
 
 	private getHandlers(type: string): Set<AgentHarnessHandler> | undefined {
@@ -493,6 +614,13 @@ export class AgentHarness<
 		disposition?: "stop" | "final_response";
 	}> {
 		const handlers = this.getHandlers("tool_result");
+		if (!handlers || handlers.size === 0) {
+			return {
+				content: event.content,
+				...(event.details === undefined ? {} : { details: event.details }),
+				isError: event.isError,
+			};
+		}
 		const current = {
 			content: structuredClone(event.content),
 			...(event.details === undefined ? {} : { details: structuredClone(event.details) }),
@@ -503,7 +631,6 @@ export class AgentHarness<
 			isError: boolean;
 			disposition?: "stop" | "final_response";
 		};
-		if (!handlers || handlers.size === 0) return current;
 		for (const handler of handlers) {
 			try {
 				const result = await handler({
@@ -557,20 +684,26 @@ export class AgentHarness<
 		initialAction: AgentLoopNextAction,
 	): Promise<AgentLoopNextAction> {
 		const signal = this.activeRun?.abortController.signal;
-		if (!signal) return initialAction;
-		let current = initialAction;
+		if (!signal) return cloneNextAction(initialAction);
+		let current = cloneNextAction(initialAction);
 		for (const handler of this.getHandlers("next_action") ?? []) {
 			try {
-				const result = await handler({ ...context, type: "next_action", defaultAction: current, signal });
-				if (result !== undefined) current = result;
+				const pendingResult = handler({
+					...cloneNextActionContext(context, current),
+					type: "next_action",
+					signal,
+				});
+				const result = pendingResult instanceof Promise ? await pendingResult : pendingResult;
+				if (result !== undefined) current = cloneNextAction(result);
 			} catch (error) {
 				throw normalizeHookError(error);
 			}
 		}
 		for (const registration of this.nextActionPolicies) {
 			try {
-				const result = await registration.policy({ ...context, defaultAction: current }, signal);
-				if (result !== undefined) current = result;
+				const pendingResult = registration.policy(cloneNextActionContext(context, current), signal);
+				const result = pendingResult instanceof Promise ? await pendingResult : pendingResult;
+				if (result !== undefined) current = cloneNextAction(result);
 			} catch (error) {
 				throw normalizeHookError(error);
 			}
@@ -645,7 +778,6 @@ export class AgentHarness<
 			deliveryOrder: new Map(),
 			deliveryOutcomes: new Map(),
 			observationalDeliveryIds: new Set(),
-			participantOwnedDeliveryIds: new Set(),
 			admittedMessages: [],
 			admittedMessageSet: new Set(),
 			messageDeliveryIds: new Map(),
@@ -679,6 +811,8 @@ export class AgentHarness<
 	private async createTurnState(
 		signal: AbortSignal,
 		contextOverride?: readonly AgentMessage[],
+		systemPromptOverride?: string,
+		deferSystemPrompt = false,
 	): Promise<AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>> {
 		const context = contextOverride === undefined ? await this.session.buildContext() : { messages: contextOverride };
 		const resources = this.getResources();
@@ -689,31 +823,42 @@ export class AgentHarness<
 		const activeTools = this.activeToolNames
 			.map((name) => this.tools.get(name))
 			.filter((tool): tool is TTool => tool !== undefined);
-		let systemPrompt = "You are a helpful assistant.";
-		if (typeof this.systemPrompt === "string") {
-			systemPrompt = this.systemPrompt;
-		} else if (this.systemPrompt) {
-			systemPrompt = await this.systemPrompt({
-				env: this.env,
-				session: this.session,
-				model,
-				thinkingLevel: this.thinkingLevel,
-				activeTools,
-				resources,
-				signal,
-			});
-		}
-		return {
+		const baseState = {
 			messages: [...context.messages],
 			resources,
 			streamOptions: cloneStreamOptions(this.streamOptions),
 			sessionId: sessionMetadata.id,
-			systemPrompt,
+			systemPrompt: "You are a helpful assistant.",
 			model,
 			thinkingLevel: this.thinkingLevel,
 			tools,
 			activeTools,
 		};
+		const systemPrompt =
+			systemPromptOverride ??
+			(deferSystemPrompt
+				? typeof this.systemPrompt === "string"
+					? this.systemPrompt
+					: baseState.systemPrompt
+				: await this.resolveConfiguredSystemPrompt(baseState, signal));
+		return { ...baseState, systemPrompt };
+	}
+
+	private async resolveConfiguredSystemPrompt(
+		turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
+		signal: AbortSignal,
+	): Promise<string> {
+		if (typeof this.systemPrompt === "string") return this.systemPrompt;
+		if (!this.systemPrompt) return "You are a helpful assistant.";
+		return await this.systemPrompt({
+			env: this.env,
+			session: this.session,
+			model: turnState.model,
+			thinkingLevel: turnState.thinkingLevel,
+			activeTools: turnState.activeTools,
+			resources: turnState.resources,
+			signal,
+		});
 	}
 
 	private createContext(
@@ -806,10 +951,189 @@ export class AgentHarness<
 	private promoteContinuationCandidate(run: AgentHarnessRunEventState): void {
 		const candidate = run.continuationCandidate;
 		if (!candidate) return;
-		this.continuationState = {
-			...candidate,
-			context: cloneAgentMessages(candidate.context),
+		this.continuationState = { ...candidate };
+	}
+
+	private recordContextProjectionInvalid(
+		projection: AgentHarnessContextProjection,
+		error: AgentHarnessError,
+	): AgentHarnessError {
+		if (this.contextProjection !== projection) return error;
+		if (projection.invalidError) return projection.invalidError;
+		this.contextProjection = { ...projection, invalidError: error };
+		return error;
+	}
+
+	private staleContextProjectionError(): AgentHarnessError {
+		return new AgentHarnessError(
+			"invalid_state",
+			"Continuation context projection anchor no longer matches the canonical session branch",
+		);
+	}
+
+	private async requireValidContextProjection(): Promise<AgentHarnessContextProjection | undefined> {
+		for (;;) {
+			const projection = this.contextProjection;
+			if (!projection) return undefined;
+			if (projection.invalidError) throw projection.invalidError;
+			let currentLeafId: string | null;
+			try {
+				currentLeafId = await this.session.getLeafId();
+			} catch (error) {
+				if (this.contextProjection !== projection) continue;
+				throw this.recordContextProjectionInvalid(projection, normalizeHarnessError(error, "session"));
+			}
+			if (this.contextProjection !== projection) continue;
+			if (currentLeafId !== projection.anchorLeafId) {
+				let branch: SessionTreeEntry[];
+				try {
+					branch = currentLeafId === null ? [] : await this.session.getBranch(currentLeafId);
+				} catch (error) {
+					if (this.contextProjection !== projection) continue;
+					throw this.recordContextProjectionInvalid(projection, normalizeHarnessError(error, "session"));
+				}
+				if (this.contextProjection !== projection) continue;
+				const anchorIndex =
+					projection.anchorLeafId === null
+						? -1
+						: branch.findIndex((entry) => entry.id === projection.anchorLeafId);
+				const appendedEntries = branch.slice(anchorIndex + 1);
+				if (
+					(projection.anchorLeafId !== null && anchorIndex === -1) ||
+					appendedEntries.some((entry) => entry.type !== "label" && entry.type !== "session_info")
+				) {
+					throw this.recordContextProjectionInvalid(projection, this.staleContextProjectionError());
+				}
+				// Labels and session metadata extend canonical history without changing
+				// provider context. Advance only the validation watermark; all other
+				// external writes remain fail-closed.
+				this.contextProjection = { ...projection, anchorLeafId: currentLeafId };
+				continue;
+			}
+			return projection;
+		}
+	}
+
+	private async advanceContextProjection(entryId: string, messages: readonly AgentMessage[] = []): Promise<void> {
+		const projection = this.contextProjection;
+		if (!projection || projection.invalidError) return;
+		let appendedMessages: AgentMessage[];
+		try {
+			appendedMessages = cloneAgentMessages(messages);
+		} catch (error) {
+			this.recordContextProjectionInvalid(
+				projection,
+				new AgentHarnessError(
+					"invalid_state",
+					"Continuation context projection could not own persisted messages",
+					toError(error),
+				),
+			);
+			return;
+		}
+		let entry: SessionTreeEntry | undefined;
+		try {
+			entry = await this.session.getEntry(entryId);
+		} catch (error) {
+			if (this.contextProjection === projection) {
+				this.recordContextProjectionInvalid(projection, normalizeHarnessError(error, "session"));
+			}
+			return;
+		}
+		if (this.contextProjection !== projection) return;
+		if (!entry || entry.parentId !== projection.anchorLeafId) {
+			this.recordContextProjectionInvalid(projection, this.staleContextProjectionError());
+			return;
+		}
+		this.contextProjection = {
+			...projection,
+			anchorLeafId: entryId,
+			messages: [...projection.messages, ...appendedMessages],
 		};
+	}
+
+	private async advanceContextProjectionToLeaf(
+		anchorLeafId: string | null,
+		messages: readonly AgentMessage[],
+	): Promise<void> {
+		const projection = this.contextProjection;
+		if (!projection || projection.invalidError) return;
+		let appendedMessages: AgentMessage[];
+		try {
+			appendedMessages = cloneAgentMessages(messages);
+		} catch (error) {
+			this.recordContextProjectionInvalid(
+				projection,
+				new AgentHarnessError(
+					"invalid_state",
+					"Continuation context projection could not own persisted messages",
+					toError(error),
+				),
+			);
+			return;
+		}
+		let branch: SessionTreeEntry[];
+		try {
+			branch = anchorLeafId === null ? [] : await this.session.getBranch(anchorLeafId);
+		} catch (error) {
+			if (this.contextProjection === projection) {
+				this.recordContextProjectionInvalid(projection, normalizeHarnessError(error, "session"));
+			}
+			return;
+		}
+		if (this.contextProjection !== projection) return;
+		const extendsProjection =
+			projection.anchorLeafId === null
+				? branch.length === 0 || branch[0]?.parentId === null
+				: branch.some((entry) => entry.id === projection.anchorLeafId);
+		if (!extendsProjection) {
+			this.recordContextProjectionInvalid(projection, this.staleContextProjectionError());
+			return;
+		}
+		this.contextProjection = {
+			...projection,
+			anchorLeafId,
+			messages: [...projection.messages, ...appendedMessages],
+		};
+	}
+
+	async rebaseContinuationContext(
+		options: AgentHarnessContextRebaseOptions,
+	): Promise<AgentHarnessContextProjectionToken> {
+		this.assertNotDisposed();
+		try {
+			const canonicalContext = await this.session.buildContext();
+			const canonicalMessages = Object.freeze(cloneAgentMessages(canonicalContext.messages));
+			const projectedMessages = options.project ? options.project(canonicalMessages) : canonicalMessages;
+			const ownedMessages = cloneAgentMessages(projectedMessages);
+			const currentLeafId = await this.session.getLeafId();
+			if (currentLeafId !== canonicalContext.anchorLeafId) {
+				throw new AgentHarnessError("invalid_state", "Session branch changed while rebasing continuation context");
+			}
+			const token = Object.freeze({
+				projectionId: `harness-context:${globalThis.crypto.randomUUID()}`,
+				source: options.source,
+				anchorLeafId: canonicalContext.anchorLeafId,
+			});
+			this.contextProjection = {
+				token,
+				anchorLeafId: canonicalContext.anchorLeafId,
+				messages: ownedMessages,
+			};
+			return token;
+		} catch (error) {
+			throw normalizeHarnessError(error, "session");
+		}
+	}
+
+	clearContinuationContext(token: AgentHarnessContextProjectionToken): boolean {
+		if (this.contextProjection?.token !== token) return false;
+		this.contextProjection = undefined;
+		return true;
+	}
+
+	invalidateContinuationContext(): void {
+		this.contextProjection = undefined;
 	}
 
 	private async resolveNextAction(
@@ -827,7 +1151,6 @@ export class AgentHarness<
 		const run = this.activeRun;
 		if (!run) throw new AgentHarnessError("invalid_state", "Next-action dispatch requires an active run");
 		run.continuationCandidate = {
-			context: cloneAgentMessages(context.context.messages),
 			requestAuthority,
 			providerRequestPending,
 			systemPrompt,
@@ -843,7 +1166,6 @@ export class AgentHarness<
 				runtimeAction.type === "request" ? { type: "request", reason: "final_response" } : runtimeAction;
 			const action = await this.reduceNextAction({ ...context, requestAuthority }, finalResponseAction);
 			this.continuationState = {
-				context: cloneAgentMessages(context.context.messages),
 				requestAuthority,
 				providerRequestPending: action.type === "pause" ? providerRequestPending : true,
 				systemPrompt,
@@ -876,7 +1198,6 @@ export class AgentHarness<
 		);
 		if (action.type === "pause") {
 			this.continuationState = {
-				context: cloneAgentMessages(context.context.messages),
 				requestAuthority: action.requestAuthority ?? requestAuthority,
 				providerRequestPending: hasIndependentRequest,
 				systemPrompt,
@@ -897,6 +1218,31 @@ export class AgentHarness<
 		};
 	}
 
+	private terminallyFailPreparationReplay(
+		lease: DeliveryLease<AgentDeliveryKind, AgentMessage>,
+		delivery: PendingDelivery,
+		error: AgentDeliveryPreparationReplayMismatchError,
+	): void {
+		if (this.activeDeliveryLease !== lease || !lease.canPrepare(delivery.deliveryId)) {
+			throw new AgentHarnessError(
+				"invalid_state",
+				`Delivery preparation replay lost AgentHarness ownership: ${delivery.deliveryId}`,
+			);
+		}
+		if (!lease.begin(delivery.deliveryId) || !lease.settle(delivery.deliveryId, "terminally_failed")) {
+			throw new AgentHarnessError(
+				"invalid_state",
+				`Delivery preparation replay could not be terminally fenced: ${delivery.deliveryId}`,
+			);
+		}
+		this.deliveryAttemptParticipants.delete(delivery.deliveryId);
+		this.deliveryPreparationStates.delete(delivery.deliveryId);
+		this.continuationState = undefined;
+		if (this.activeRun) delete this.activeRun.continuationCandidate;
+		this.invalidateContinuationContext();
+		this.recordDeliveryFailure(delivery, "preparation", "terminally_failed", error);
+	}
+
 	private async prepareLeasedDeliveries(selected: PendingDelivery[]): Promise<AgentLoopDelivery[]> {
 		const lease = this.deliveryInbox.lease(selected);
 		this.activeDeliveryLease = lease;
@@ -908,11 +1254,17 @@ export class AgentHarness<
 			}
 		}
 
-		const signal = this.activeRun?.abortController.signal;
-		if (!signal) throw new AgentHarnessError("invalid_state", "Delivery preparation requires an active run");
+		const run = this.activeRun;
+		if (!run) throw new AgentHarnessError("invalid_state", "Delivery preparation requires an active run");
+		const signal = run.abortController.signal;
 		const deliveries: AgentLoopDelivery[] = [];
 		for (const delivery of lease.deliveries) {
 			if (!lease.canPrepare(delivery.deliveryId)) continue;
+			const preparationState = this.deliveryPreparationStates.get(delivery.deliveryId) ?? {};
+			if (!this.deliveryPreparationStates.has(delivery.deliveryId)) {
+				this.deliveryPreparationStates.set(delivery.deliveryId, preparationState);
+			}
+			const sourceMessages = preparationState.preflight?.messages ?? delivery.messages;
 			let preparation: AgentDeliveryPreparation;
 			try {
 				preparation = this.prepareDelivery
@@ -920,34 +1272,73 @@ export class AgentHarness<
 							{
 								deliveryId: delivery.deliveryId,
 								kind: delivery.kind,
-								messages: cloneAgentMessages(delivery.messages),
+								messages: cloneAgentMessages(sourceMessages),
 							},
 							signal,
 						)
-					: { messages: cloneAgentMessages(delivery.messages) };
+					: { messages: cloneAgentMessages(sourceMessages) };
 			} catch (error) {
 				if (!lease.canPrepare(delivery.deliveryId)) continue;
+				if (error instanceof AgentDeliveryPreparationReplayMismatchError) {
+					this.terminallyFailPreparationReplay(lease, delivery, error);
+					throw error;
+				}
 				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
 				throw error;
 			}
 			if (this.activeDeliveryLease !== lease || !lease.canPrepare(delivery.deliveryId)) continue;
-			if (preparation.messages.length === 0) {
+			let preparedMessages: AgentMessage[];
+			try {
+				preparedMessages = cloneAgentMessages(preparation.messages);
+			} catch (error) {
+				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
+				throw error;
+			}
+			if (preparedMessages.length === 0) {
 				const error = new Error("prepareDelivery must retain at least one message for an admitted delivery");
 				this.recordDeliveryFailure(delivery, "preparation", "retained", error);
 				throw error;
 			}
+			if (
+				preparationState.preparedMessages !== undefined &&
+				!areStructurallyEqual(preparationState.preparedMessages, preparedMessages)
+			) {
+				const error = new AgentDeliveryPreparationReplayMismatchError(delivery.deliveryId);
+				this.terminallyFailPreparationReplay(lease, delivery, error);
+				throw error;
+			}
+			preparationState.preparedMessages ??= cloneAgentMessages(preparedMessages);
+			if (preparationState.reducedMessages === undefined) {
+				try {
+					const reducedMessages: AgentMessage[] = [];
+					for (const message of preparedMessages) {
+						const reduced = await this.emitMessageEnd(
+							{ type: "message_end", deliveryId: delivery.deliveryId, message: structuredClone(message) },
+							run,
+						);
+						reducedMessages.push(structuredClone(reduced.message));
+					}
+					if (this.activeDeliveryLease !== lease || !lease.canPrepare(delivery.deliveryId)) continue;
+					preparationState.reducedMessages = cloneAgentMessages(reducedMessages);
+				} catch (error) {
+					if (!lease.canPrepare(delivery.deliveryId)) continue;
+					this.recordDeliveryFailure(delivery, "preparation", "retained", error);
+					throw error;
+				}
+			}
 			if (preparation.participant) {
-				this.preparedDeliveryParticipants.set(delivery.deliveryId, preparation.participant);
+				this.deliveryAttemptParticipants.set(delivery.deliveryId, preparation.participant);
 			}
 			deliveries.push({
 				deliveryId: delivery.deliveryId,
-				messages: cloneAgentMessages(preparation.messages),
+				messages: cloneAgentMessages(preparationState.reducedMessages),
 			});
 		}
 		return deliveries;
 	}
 
 	private async beginActiveDelivery(delivery: AgentLoopDelivery): Promise<AgentLoopDeliveryOutcome> {
+		if (this.disposed) return { outcome: "revoked" };
 		if (delivery.deliveryId === undefined) return { outcome: "committed" };
 		const kind = this.leasedDeliveryKinds.get(delivery.deliveryId);
 		if (kind === undefined) return { outcome: "committed" };
@@ -966,16 +1357,32 @@ export class AgentHarness<
 		if (run) run.deliverySettlement = settlement;
 
 		let outcome: AgentDeliveryParticipantOutcome;
-		const participant = this.preparedDeliveryParticipants.get(delivery.deliveryId);
+		const participant = this.deliveryAttemptParticipants.get(delivery.deliveryId);
 		try {
+			await this.requireValidContextProjection();
 			if (participant) {
 				try {
-					outcome = await participant.settle({ requestAbort: (source) => this.abort(source) });
+					outcome = await participant.settle(
+						Object.freeze({
+							deliveryId: delivery.deliveryId,
+							kind,
+							messages: Object.freeze(cloneAgentMessages(delivery.messages)),
+							requestAbort: (source?: AgentAbortSource) => this.abort(source),
+						}),
+					);
 				} catch (error) {
 					outcome = { outcome: "terminally_failed", error: toError(error) };
 				}
 			} else {
-				outcome = { outcome: "committed" };
+				try {
+					for (const message of delivery.messages) {
+						const entryId = await this.session.appendMessage(message);
+						await this.advanceContextProjection(entryId, [message]);
+					}
+					outcome = { outcome: "committed" };
+				} catch (error) {
+					outcome = { outcome: "terminally_failed", error: toError(error) };
+				}
 			}
 
 			if (!lease.settle(delivery.deliveryId, outcome.outcome)) {
@@ -1000,11 +1407,24 @@ export class AgentHarness<
 			}
 			if (outcome.outcome === "committed") {
 				run?.observationalDeliveryIds.add(delivery.deliveryId);
-				if (participant) run?.participantOwnedDeliveryIds.add(delivery.deliveryId);
+				if (participant) {
+					let committedLeafId: string | null | undefined;
+					try {
+						committedLeafId = await this.session.getLeafId();
+					} catch (error) {
+						const projection = this.contextProjection;
+						if (projection) {
+							this.recordContextProjectionInvalid(projection, normalizeHarnessError(error, "session"));
+						}
+					}
+					if (committedLeafId !== undefined) {
+						await this.advanceContextProjectionToLeaf(committedLeafId, delivery.messages);
+					}
+				}
 			}
 			return outcome;
 		} finally {
-			this.preparedDeliveryParticipants.delete(delivery.deliveryId);
+			this.deliveryAttemptParticipants.delete(delivery.deliveryId);
 			finishSettlement();
 			if (run && this.activeRun === run && run.deliverySettlement === settlement) {
 				run.deliverySettlement = undefined;
@@ -1028,6 +1448,9 @@ export class AgentHarness<
 	}
 
 	private recordDeliveryOutcome(outcome: AgentDeliveryAttemptResult): void {
+		if (outcome.outcome === "committed" || outcome.outcome === "terminally_failed" || outcome.outcome === "revoked") {
+			this.deliveryPreparationStates.delete(outcome.deliveryId);
+		}
 		const run = this.activeRun;
 		if (!run || run.deliveryOutcomes.has(outcome.deliveryId)) return;
 		run.deliveryOutcomes.set(outcome.deliveryId, Object.freeze(outcome));
@@ -1057,7 +1480,7 @@ export class AgentHarness<
 			});
 		}
 		this.activeDeliveryLease = undefined;
-		this.preparedDeliveryParticipants.clear();
+		this.deliveryAttemptParticipants.clear();
 	}
 
 	private createLoopConfig(
@@ -1096,8 +1519,20 @@ export class AgentHarness<
 				await this.resolveNextAction(context, startState, systemPromptOverride ?? getTurnState().systemPrompt),
 			beginDelivery: async (delivery) => await this.beginActiveDelivery(delivery),
 			prepareRequest: async ({ context }) => {
-				await this.flushPendingSessionWrites();
-				const nextTurnState = await this.createTurnState(run.abortController.signal, context.messages);
+				const flushedMessages = await this.flushPendingSessionWrites();
+				const projection = await this.requireValidContextProjection();
+				const contextMessages = projection ? projection.messages : [...context.messages, ...flushedMessages];
+				const nextTurnState = await this.createTurnState(
+					run.abortController.signal,
+					contextMessages,
+					systemPromptOverride,
+				);
+				if ((await this.requireValidContextProjection()) !== projection) {
+					throw new AgentHarnessError(
+						"invalid_state",
+						"Continuation context projection changed during request preparation",
+					);
+				}
 				setTurnState(nextTurnState);
 				return {
 					context: this.createContext(nextTurnState, systemPromptOverride),
@@ -1120,30 +1555,55 @@ export class AgentHarness<
 		if (missing.length > 0) throw new AgentHarnessError("invalid_argument", `Unknown tool(s): ${missing.join(", ")}`);
 	}
 
-	private async flushPendingSessionWrites(): Promise<void> {
+	private async flushPendingSessionWrites(): Promise<AgentMessage[]> {
+		if (this.disposed) {
+			this.pendingSessionWrites = [];
+			return [];
+		}
+		const providerVisibleMessages: AgentMessage[] = [];
 		while (this.pendingSessionWrites.length > 0) {
 			const write = this.pendingSessionWrites[0]!;
+			let entryId: string | undefined;
+			let projectedMessages: AgentMessage[] = [];
 			if (write.type === "message") {
-				await this.session.appendMessage(write.message);
+				entryId = await this.session.appendMessage(write.message);
+				projectedMessages = [write.message];
 			} else if (write.type === "model_change") {
-				await this.session.appendModelChange(write.provider, write.modelId);
+				entryId = await this.session.appendModelChange(write.provider, write.modelId);
 			} else if (write.type === "thinking_level_change") {
-				await this.session.appendThinkingLevelChange(write.thinkingLevel);
+				entryId = await this.session.appendThinkingLevelChange(write.thinkingLevel);
 			} else if (write.type === "active_tools_change") {
-				await this.session.appendActiveToolsChange(write.activeToolNames);
+				entryId = await this.session.appendActiveToolsChange(write.activeToolNames);
 			} else if (write.type === "custom") {
-				await this.session.appendCustomEntry(write.customType, write.data);
+				entryId = await this.session.appendCustomEntry(write.customType, write.data);
 			} else if (write.type === "custom_message") {
-				await this.session.appendCustomMessageEntry(write.customType, write.content, write.display, write.details);
+				entryId = await this.session.appendCustomMessageEntry(
+					write.customType,
+					write.content,
+					write.display,
+					write.details,
+				);
+				const entry = await this.session.getEntry(entryId);
+				if (entry?.type === "custom_message") {
+					projectedMessages = [
+						createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
+					];
+				}
 			} else if (write.type === "label") {
-				await this.session.appendLabel(write.targetId, write.label);
+				entryId = await this.session.appendLabel(write.targetId, write.label);
 			} else if (write.type === "session_info") {
-				await this.session.appendSessionName(write.name ?? "");
+				entryId = await this.session.appendSessionName(write.name ?? "");
 			} else if (write.type === "leaf") {
 				await this.session.getStorage().setLeafId(write.targetId);
+				this.invalidateContinuationContext();
 			}
 			this.pendingSessionWrites.shift();
+			if (entryId !== undefined) {
+				await this.advanceContextProjection(entryId, projectedMessages);
+				providerVisibleMessages.push(...cloneAgentMessages(projectedMessages));
+			}
 		}
+		return providerVisibleMessages;
 	}
 
 	private decorateRuntimeDiagnostics(event: AgentEvent, state: AgentHarnessRunEventState): AgentEvent {
@@ -1189,6 +1649,17 @@ export class AgentHarness<
 		state: AgentHarnessRunEventState,
 		signal?: AbortSignal,
 	): Promise<AgentMessage | undefined> {
+		if (this.disposed) {
+			if (event.type === "turn_start") state.turnOpen = true;
+			else if (event.type === "turn_end") state.turnOpen = false;
+			else if (event.type === "agent_end") {
+				state.terminalEmitted = true;
+				state.phase = "settled";
+			} else if (event.type === "message_end") {
+				return event.message;
+			}
+			return undefined;
+		}
 		if (event.type === "delivery_start") {
 			state.requestAccepted = true;
 			for (const message of event.messages) {
@@ -1228,18 +1699,13 @@ export class AgentHarness<
 			if (finalizedEvent.type !== "message_end") {
 				throw new AgentHarnessError("invalid_state", "Runtime diagnostic decoration changed the event type");
 			}
-			const participantOwnsPersistence =
-				finalizedEvent.deliveryId !== undefined && state.participantOwnedDeliveryIds.has(finalizedEvent.deliveryId);
-			if (!participantOwnsPersistence) await this.session.appendMessage(finalizedEvent.message);
+			if (!observational && !this.disposed) {
+				const entryId = await this.session.appendMessage(finalizedEvent.message);
+				await this.advanceContextProjection(entryId, [finalizedEvent.message]);
+			}
 			if (!state.persistedMessageSet.has(event.message)) {
 				state.persistedMessageSet.add(event.message);
 				state.persistedMessages.push(finalizedEvent.message);
-				if (
-					finalizedEvent.deliveryId !== undefined &&
-					state.deliveryOutcomes.get(finalizedEvent.deliveryId)?.outcome === "committed"
-				) {
-					state.continuationCandidate?.context.push(structuredClone(finalizedEvent.message));
-				}
 			}
 			const deliveryState = state.deliveries.get(finalizedEvent.deliveryId);
 			if (deliveryState?.remainingMessages.delete(event.message) && deliveryState.remainingMessages.size === 0) {
@@ -1340,42 +1806,106 @@ export class AgentHarness<
 		return this.deliveryInbox.enqueue(kind, cloneAgentMessages(messages)).deliveryId;
 	}
 
-	private async enqueuePromptDelivery(
-		signal: AbortSignal,
-		turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
+	private enqueuePublishedDelivery(
+		kind: "steer" | "followUp",
+		messages: readonly AgentMessage[],
+	): { deliveryId: string; publication: Promise<void> } {
+		const deliveryId = this.enqueueDelivery(kind, messages);
+		const publication = this.emitQueueUpdate(true);
+		void publication.catch(() => {});
+		return { deliveryId, publication };
+	}
+
+	private async admitPromptDelivery(
 		messages: readonly AgentMessage[],
 		beforeStart?: { text: string; options?: AgentHarnessPromptOptions },
 		systemPromptOverride?: string,
-	): Promise<string | undefined> {
+	): Promise<string> {
 		if (messages.length === 0) {
 			throw new AgentHarnessError("invalid_argument", "A prompt delivery must contain at least one message");
 		}
 		const nextTurnCount = this.nextTurnQueue.length;
-		const promptMessages = [
+		const admittedMessages = [
 			...cloneAgentMessages(this.nextTurnQueue.slice(0, nextTurnCount)),
 			...cloneAgentMessages(messages),
 		];
-		let systemPrompt = systemPromptOverride;
-		if (beforeStart) {
-			const beforeResult = await this.emitHook({
-				type: "before_agent_start",
-				prompt: beforeStart.text,
-				...(beforeStart.options?.images === undefined
-					? {}
-					: { images: structuredClone(beforeStart.options.images) }),
-				systemPrompt: systemPrompt ?? turnState.systemPrompt,
-				resources: turnState.resources,
-				signal,
-			});
-			promptMessages.push(...cloneAgentMessages(beforeResult?.messages ?? []));
-			systemPrompt = beforeResult?.systemPrompt ?? systemPrompt;
-		}
-		this.enqueueDelivery("prompt", promptMessages);
+		const deliveryId = this.enqueueDelivery("prompt", admittedMessages);
+		this.deliveryPreparationStates.set(deliveryId, {
+			admittedMessages: cloneAgentMessages(admittedMessages),
+			...(beforeStart === undefined
+				? {}
+				: {
+						beforeStart: {
+							text: beforeStart.text,
+							...(beforeStart.options === undefined ? {} : { options: structuredClone(beforeStart.options) }),
+						},
+					}),
+			...(systemPromptOverride === undefined ? {} : { systemPromptOverride }),
+		});
 		if (nextTurnCount > 0) {
 			this.nextTurnQueue.splice(0, nextTurnCount);
 			await this.emitQueueUpdate(true);
 		}
-		return systemPrompt;
+		return deliveryId;
+	}
+
+	private async preparePromptPreflight(
+		deliveryId: string,
+		turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
+		signal: AbortSignal,
+	): Promise<{ messages: AgentMessage[]; systemPrompt: string; systemPromptOverride?: string }> {
+		const state = this.deliveryPreparationStates.get(deliveryId);
+		if (!state?.admittedMessages) {
+			throw new AgentHarnessError(
+				"invalid_state",
+				`Prompt delivery ${deliveryId} has no admitted preparation state`,
+			);
+		}
+		if (state.preflight) {
+			return {
+				messages: cloneAgentMessages(state.preflight.messages),
+				systemPrompt: state.preflight.systemPrompt,
+				...(state.preflight.systemPromptOverride === undefined
+					? {}
+					: { systemPromptOverride: state.preflight.systemPromptOverride }),
+			};
+		}
+		if (state.resolvedSystemPrompt === undefined) {
+			state.resolvedSystemPrompt =
+				state.systemPromptOverride ?? (await this.resolveConfiguredSystemPrompt(turnState, signal));
+		}
+		if (this.deliveryPreparationStates.get(deliveryId) !== state) {
+			throw new AgentHarnessError("delivery", `Prompt delivery ${deliveryId} was revoked during preflight`);
+		}
+		let messages = cloneAgentMessages(state.admittedMessages);
+		let systemPrompt = state.resolvedSystemPrompt;
+		let systemPromptOverride = state.systemPromptOverride;
+		if (state.beforeStart) {
+			const beforeResult = await this.emitHook({
+				type: "before_agent_start",
+				prompt: state.beforeStart.text,
+				...(state.beforeStart.options?.images === undefined
+					? {}
+					: { images: structuredClone(state.beforeStart.options.images) }),
+				systemPrompt,
+				resources: turnState.resources,
+				signal,
+			});
+			messages = [...messages, ...cloneAgentMessages(beforeResult?.messages ?? [])];
+			if (beforeResult?.systemPrompt !== undefined) {
+				systemPrompt = beforeResult.systemPrompt;
+				systemPromptOverride = beforeResult.systemPrompt;
+			}
+		}
+		if (this.deliveryPreparationStates.get(deliveryId) !== state) {
+			throw new AgentHarnessError("delivery", `Prompt delivery ${deliveryId} was revoked during preflight`);
+		}
+		state.preflight = {
+			messages: cloneAgentMessages(messages),
+			systemPrompt,
+			...(systemPromptOverride === undefined ? {} : { systemPromptOverride }),
+		};
+		return { messages, systemPrompt, ...(systemPromptOverride === undefined ? {} : { systemPromptOverride }) };
 	}
 
 	private async executeTurn(
@@ -1390,8 +1920,12 @@ export class AgentHarness<
 			activeTurnState = nextTurnState;
 		};
 		const abortController = runEventState.abortController;
+		if (this.contextProjection) {
+			await this.requireValidContextProjection();
+		} else {
+			await this.rebaseContinuationContext({ source: "explicit" });
+		}
 		runEventState.continuationCandidate = {
-			context: cloneAgentMessages(turnState.messages),
 			requestAuthority: startState.requestAuthority,
 			providerRequestPending: startState.providerRequestPending,
 			systemPrompt: systemPrompt ?? turnState.systemPrompt,
@@ -1469,6 +2003,7 @@ export class AgentHarness<
 			context?: readonly AgentMessage[];
 		},
 	): Promise<AgentHarnessExecutionResult> {
+		this.assertNotDisposed();
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
 		if (this.hasPendingPrompt()) {
 			throw new AgentHarnessError(
@@ -1477,19 +2012,34 @@ export class AgentHarness<
 			);
 		}
 		this.continuationState = undefined;
+		this.invalidateContinuationContext();
 		const run = this.admitBoundedRun();
 		try {
-			const baseTurnState = await this.createTurnState(run.state.abortController.signal);
+			const baseTurnState = await this.createTurnState(run.state.abortController.signal, undefined, undefined, true);
 			const invocation = resolveInvocation(baseTurnState);
-			const turnState =
-				invocation.context === undefined ? baseTurnState : { ...baseTurnState, messages: [...invocation.context] };
-			const systemPrompt = await this.enqueuePromptDelivery(
-				run.state.abortController.signal,
-				turnState,
+			if (invocation.context !== undefined) {
+				await this.rebaseContinuationContext({
+					source: "explicit",
+					project: () => invocation.context!,
+				});
+			}
+			const deliveryId = await this.admitPromptDelivery(
 				invocation.messages,
 				invocation.beforeStart,
 				invocation.systemPrompt,
 			);
+			const baseContextMessages =
+				invocation.context === undefined ? baseTurnState.messages : cloneAgentMessages(invocation.context);
+			const preflight = await this.preparePromptPreflight(
+				deliveryId,
+				{ ...baseTurnState, messages: baseContextMessages },
+				run.state.abortController.signal,
+			);
+			const turnState = {
+				...baseTurnState,
+				messages: baseContextMessages,
+				systemPrompt: preflight.systemPrompt,
+			};
 			const lastMessage = turnState.messages.at(-1);
 			return await this.executeTurn(
 				run.state,
@@ -1499,7 +2049,7 @@ export class AgentHarness<
 					requestAuthority: "provider",
 					providerRequestPending: lastMessage !== undefined && lastMessage.role !== "assistant",
 				},
-				systemPrompt,
+				preflight.systemPromptOverride,
 			);
 		} catch (error) {
 			throw normalizeHarnessError(error, "unknown");
@@ -1517,36 +2067,41 @@ export class AgentHarness<
 		input: AgentMessage | readonly AgentMessage[],
 		options: AgentHarnessRunOptions = {},
 	): Promise<AgentRunResult> {
-		const messages = Array.isArray(input) ? input : [input];
+		const messages = cloneAgentMessages(Array.isArray(input) ? input : [input]);
+		const ownedOptions = cloneRunOptions(options);
 		return (
 			await this.startPromptRun(() => ({
 				messages,
-				...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
-				...(options.context === undefined ? {} : { context: options.context }),
+				...(ownedOptions.systemPrompt === undefined ? {} : { systemPrompt: ownedOptions.systemPrompt }),
+				...(ownedOptions.context === undefined ? {} : { context: ownedOptions.context }),
 			}))
 		).result;
 	}
 
 	async runPrompt(text: string, options?: AgentHarnessPromptOptions): Promise<AgentRunResult> {
-		const beforeStart = { text, ...(options === undefined ? {} : { options }) };
+		const ownedOptions = clonePromptOptions(options);
+		const messages = [createUserMessage(text, ownedOptions?.images)];
+		const beforeStart = { text, ...(ownedOptions === undefined ? {} : { options: ownedOptions }) };
 		return (
 			await this.startPromptRun(() => ({
-				messages: [createUserMessage(text, options?.images)],
+				messages,
 				beforeStart,
-				...(options?.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
-				...(options?.context === undefined ? {} : { context: options.context }),
+				...(ownedOptions?.systemPrompt === undefined ? {} : { systemPrompt: ownedOptions.systemPrompt }),
+				...(ownedOptions?.context === undefined ? {} : { context: ownedOptions.context }),
 			}))
 		).result;
 	}
 
 	async prompt(text: string, options?: AgentHarnessPromptOptions): Promise<AssistantMessage> {
-		const beforeStart = { text, ...(options === undefined ? {} : { options }) };
+		const ownedOptions = clonePromptOptions(options);
+		const messages = [createUserMessage(text, ownedOptions?.images)];
+		const beforeStart = { text, ...(ownedOptions === undefined ? {} : { options: ownedOptions }) };
 		return this.requireResponse(
 			await this.startPromptRun(() => ({
-				messages: [createUserMessage(text, options?.images)],
+				messages,
 				beforeStart,
-				...(options?.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
-				...(options?.context === undefined ? {} : { context: options.context }),
+				...(ownedOptions?.systemPrompt === undefined ? {} : { systemPrompt: ownedOptions.systemPrompt }),
+				...(ownedOptions?.context === undefined ? {} : { context: ownedOptions.context }),
 			})),
 			"prompt()",
 		);
@@ -1563,10 +2118,11 @@ export class AgentHarness<
 	}
 
 	async promptFromTemplate(name: string, args: string[] = []): Promise<AssistantMessage> {
+		const ownedArgs = [...args];
 		const execution = await this.startPromptRun((turnState) => {
 			const template = (turnState.resources.promptTemplates ?? []).find((candidate) => candidate.name === name);
 			if (!template) throw new AgentHarnessError("invalid_argument", `Unknown prompt template: ${name}`);
-			const text = formatPromptTemplateInvocation(template, args);
+			const text = formatPromptTemplateInvocation(template, ownedArgs);
 			return { messages: [createUserMessage(text)], beforeStart: { text } };
 		});
 		return this.requireResponse(execution, "promptFromTemplate()");
@@ -1575,25 +2131,26 @@ export class AgentHarness<
 	async continue(
 		options: { drainFollowUps?: boolean; context?: readonly AgentMessage[] } = {},
 	): Promise<AgentRunResult> {
+		const ownedContext = options.context === undefined ? undefined : cloneAgentMessages(options.context);
+		const drainFollowUps = options.drainFollowUps === true;
+		this.assertNotDisposed();
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
-		const run = this.admitBoundedRun();
 		try {
-			let continuationState = this.continuationState;
-			if (continuationState && options.context !== undefined) {
-				continuationState = {
-					...continuationState,
-					context: cloneAgentMessages(options.context),
-				};
-				this.continuationState = continuationState;
+			if (ownedContext !== undefined) {
+				await this.rebaseContinuationContext({
+					source: "explicit",
+					project: () => ownedContext,
+				});
 			}
-			const contextMessages =
-				options.context ?? continuationState?.context ?? (await this.session.buildContext()).messages;
-			const lastMessage = contextMessages.at(-1);
+			const continuationState = this.continuationState;
+			const hasNextActionReducers =
+				(this.getHandlers("next_action")?.size ?? 0) > 0 || this.nextActionPolicies.size > 0;
+			let projection = await this.requireValidContextProjection();
+			let contextMessages = projection?.messages ?? (await this.session.buildContext()).messages;
+			let lastMessage = contextMessages.at(-1);
 			if (!lastMessage && !this.hasQueuedMessages()) {
 				throw new AgentHarnessError("invalid_state", "No messages to continue from");
 			}
-			const hasNextActionReducers =
-				(this.getHandlers("next_action")?.size ?? 0) > 0 || this.nextActionPolicies.size > 0;
 			if (
 				lastMessage?.role === "assistant" &&
 				!this.hasQueuedMessages() &&
@@ -1602,52 +2159,102 @@ export class AgentHarness<
 			) {
 				return { status: "completed", deliveries: [] };
 			}
-			const turnState = await this.createTurnState(run.state.abortController.signal, contextMessages);
-			return (
-				await this.executeTurn(
-					run.state,
-					turnState,
-					{
-						firstDecision: true,
-						requestAuthority: continuationState?.requestAuthority ?? "provider",
-						providerRequestPending:
-							continuationState?.providerRequestPending ??
-							(lastMessage !== undefined && lastMessage.role !== "assistant"),
-						drainFollowUpsFirst: options.drainFollowUps === true || lastMessage?.role === "assistant",
-					},
-					continuationState?.systemPrompt,
-				)
-			).result;
+			if (!projection) {
+				await this.rebaseContinuationContext({ source: "explicit" });
+				projection = await this.requireValidContextProjection();
+				if (!projection)
+					throw new AgentHarnessError("invalid_state", "Continuation context rebase was not installed");
+				contextMessages = projection.messages;
+				lastMessage = contextMessages.at(-1);
+				if (!lastMessage && !this.hasQueuedMessages()) {
+					throw new AgentHarnessError("invalid_state", "No messages to continue from");
+				}
+				if (
+					lastMessage?.role === "assistant" &&
+					!this.hasQueuedMessages() &&
+					!hasNextActionReducers &&
+					continuationState === undefined
+				) {
+					this.invalidateContinuationContext();
+					return { status: "completed", deliveries: [] };
+				}
+			}
+			const run = this.admitBoundedRun();
+			try {
+				const pendingPrompt = this.deliveryInbox.list("prompt")[0];
+				const promptPreparation =
+					pendingPrompt === undefined ? undefined : this.deliveryPreparationStates.get(pendingPrompt.deliveryId);
+				let systemPromptOverride = continuationState?.systemPrompt;
+				const resolvedSystemPrompt =
+					systemPromptOverride ??
+					promptPreparation?.preflight?.systemPrompt ??
+					promptPreparation?.resolvedSystemPrompt;
+				let turnState = await this.createTurnState(
+					run.state.abortController.signal,
+					contextMessages,
+					resolvedSystemPrompt,
+					pendingPrompt !== undefined,
+				);
+				if (pendingPrompt !== undefined) {
+					const preflight = await this.preparePromptPreflight(
+						pendingPrompt.deliveryId,
+						turnState,
+						run.state.abortController.signal,
+					);
+					systemPromptOverride ??= preflight.systemPromptOverride;
+					turnState = { ...turnState, systemPrompt: preflight.systemPrompt };
+				}
+				return (
+					await this.executeTurn(
+						run.state,
+						turnState,
+						{
+							firstDecision: true,
+							requestAuthority: continuationState?.requestAuthority ?? "provider",
+							providerRequestPending:
+								continuationState?.providerRequestPending ??
+								(lastMessage !== undefined && lastMessage.role !== "assistant"),
+							drainFollowUpsFirst: drainFollowUps || lastMessage?.role === "assistant",
+						},
+						systemPromptOverride,
+					)
+				).result;
+			} finally {
+				this.finishBoundedRun(run);
+			}
 		} catch (error) {
 			throw normalizeHarnessError(error, "unknown");
-		} finally {
-			this.finishBoundedRun(run);
 		}
 	}
 
 	queueSteer(message: AgentMessage): string {
-		const deliveryId = this.enqueueDelivery("steer", [message]);
-		void this.emitQueueUpdate(true).catch(() => {});
-		return deliveryId;
+		this.assertNotDisposed();
+		return this.enqueuePublishedDelivery("steer", [message]).deliveryId;
 	}
 
 	queueFollowUp(message: AgentMessage): string {
-		const deliveryId = this.enqueueDelivery("followUp", [message]);
-		void this.emitQueueUpdate(true).catch(() => {});
-		return deliveryId;
+		this.assertNotDisposed();
+		return this.enqueuePublishedDelivery("followUp", [message]).deliveryId;
 	}
 
 	async steer(text: string, options?: AgentHarnessPromptOptions): Promise<string> {
+		this.assertNotDisposed();
 		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot steer while idle");
-		return this.queueSteer(createUserMessage(text, options?.images));
+		const enqueued = this.enqueuePublishedDelivery("steer", [createUserMessage(text, options?.images)]);
+		await enqueued.publication;
+		return enqueued.deliveryId;
 	}
 
 	async followUp(text: string, options?: AgentHarnessPromptOptions): Promise<string> {
+		this.assertNotDisposed();
 		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot follow up while idle");
-		return this.queueFollowUp(createUserMessage(text, options?.images));
+		const enqueued = this.enqueuePublishedDelivery("followUp", [createUserMessage(text, options?.images)]);
+		await enqueued.publication;
+		return enqueued.deliveryId;
 	}
 
 	async nextTurn(text: string, options?: AgentHarnessPromptOptions): Promise<void> {
+		this.assertNotDisposed();
 		this.nextTurnQueue.push(...cloneAgentMessages([createUserMessage(text, options?.images)]));
 		await this.emitQueueUpdate();
 	}
@@ -1672,7 +2279,8 @@ export class AgentHarness<
 				kind: delivery.kind,
 				outcome: "revoked",
 			});
-			this.preparedDeliveryParticipants.delete(delivery.deliveryId);
+			this.deliveryAttemptParticipants.delete(delivery.deliveryId);
+			this.deliveryPreparationStates.delete(delivery.deliveryId);
 			try {
 				this.deliveryRevoked?.({
 					deliveryId: delivery.deliveryId,
@@ -1687,6 +2295,7 @@ export class AgentHarness<
 	}
 
 	private async clearDeliveryKinds(kinds: readonly AgentDeliveryKind[]): Promise<string[]> {
+		this.assertNotDisposed();
 		const revoked = kinds.flatMap((kind) => this.revokeDeliveries(kind));
 		if (revoked.length > 0) await this.emitQueueUpdate();
 		return revoked.map((delivery) => delivery.deliveryId);
@@ -1706,6 +2315,7 @@ export class AgentHarness<
 
 	/** Revoke queued steer/follow-up ownership synchronously and publish the projection passively. */
 	revokeAllQueues(): string[] {
+		this.assertNotDisposed();
 		const revoked = (["steer", "followUp"] as const).flatMap((kind) => this.revokeDeliveries(kind));
 		if (revoked.length > 0) void this.emitQueueUpdate(true).catch(() => {});
 		return revoked.map((delivery) => delivery.deliveryId);
@@ -1715,10 +2325,38 @@ export class AgentHarness<
 		return await this.clearDeliveryKinds(["prompt"]);
 	}
 
+	/** Terminally fence the Harness without joining an in-flight callback or run. */
+	dispose(source: AgentAbortSource = "disposal"): Promise<void> {
+		if (this.disposePromise) return this.disposePromise;
+		this.disposed = true;
+		this.disposePromise = Promise.resolve();
+		this.abort(source);
+		const revoked = (["prompt", "steer", "followUp"] as const).flatMap((kind) => this.revokeDeliveries(kind));
+		const hadNextTurnMessages = this.nextTurnQueue.length > 0;
+		this.nextTurnQueue = [];
+		this.pendingSessionWrites = [];
+		this.deliveryInbox.reset();
+		this.activeDeliveryLease = undefined;
+		this.leasedDeliveryKinds.clear();
+		this.deliveryAttemptParticipants.clear();
+		this.deliveryPreparationStates.clear();
+		this.continuationState = undefined;
+		if (this.activeRun) delete this.activeRun.continuationCandidate;
+		this.invalidateContinuationContext();
+		if (revoked.length > 0 || hadNextTurnMessages) {
+			void this.emitQueueUpdate(true).catch(() => {
+				// Revocation is authoritative; passive disposal projection cannot undo it.
+			});
+		}
+		return this.disposePromise;
+	}
+
 	async appendMessage(message: AgentMessage): Promise<void> {
+		this.assertNotDisposed();
 		try {
 			if (this.phase === "idle") {
-				await this.session.appendMessage(message);
+				const entryId = await this.session.appendMessage(message);
+				await this.advanceContextProjection(entryId, [message]);
 			} else {
 				this.pendingSessionWrites.push({ type: "message", message });
 			}
@@ -1734,6 +2372,7 @@ export class AgentHarness<
 		estimatedTokensAfter: number;
 		details?: JsonValue;
 	}> {
+		this.assertNotDisposed();
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "compact() requires idle harness");
 		this.phase = "compaction";
 		try {
@@ -1784,11 +2423,10 @@ export class AgentHarness<
 				await this.emitOwn({ type: "session_compact", compactionEntry: entry, fromHook: provided !== undefined });
 			}
 			const rebuiltContext = await this.session.buildContext();
-			if (this.continuationState) {
-				this.continuationState = {
-					...this.continuationState,
-					context: cloneAgentMessages(rebuiltContext.messages),
-				};
+			if (this.hasQueuedMessages() || this.continuationState) {
+				await this.rebaseContinuationContext({ source: "compaction" });
+			} else {
+				this.invalidateContinuationContext();
 			}
 			const estimatedTokensAfter =
 				estimateMessagesTokens(rebuiltContext.messages) + estimateToolDefinitionTokens(activeTools);
@@ -1804,6 +2442,7 @@ export class AgentHarness<
 		targetId: string,
 		options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
 	): Promise<NavigateTreeResult> {
+		this.assertNotDisposed();
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "navigateTree() requires idle harness");
 		this.phase = "branch_summary";
 		try {
@@ -1884,7 +2523,7 @@ export class AgentHarness<
 						}
 					: undefined,
 			);
-			this.continuationState = undefined;
+			this.invalidateContinuationContext();
 			if (summaryId) {
 				const entry = await this.session.getEntry(summaryId);
 				if (entry?.type === "branch_summary") summaryEntry = entry;
@@ -1913,11 +2552,13 @@ export class AgentHarness<
 	}
 
 	async setModel(model: Model<any> | undefined, options: { persist?: boolean } = {}): Promise<void> {
+		this.assertNotDisposed();
 		try {
 			const previousModel = this.model;
 			if (options.persist !== false && model) {
 				if (this.phase === "idle") {
-					await this.session.appendModelChange(model.provider, model.id);
+					const entryId = await this.session.appendModelChange(model.provider, model.id);
+					await this.advanceContextProjection(entryId);
 				} else {
 					this.pendingSessionWrites.push({ type: "model_change", provider: model.provider, modelId: model.id });
 				}
@@ -1939,11 +2580,13 @@ export class AgentHarness<
 	}
 
 	async setThinkingLevel(level: ThinkingLevel, options: { persist?: boolean } = {}): Promise<void> {
+		this.assertNotDisposed();
 		try {
 			const previousLevel = this.thinkingLevel;
 			if (options.persist !== false) {
 				if (this.phase === "idle") {
-					await this.session.appendThinkingLevelChange(level);
+					const entryId = await this.session.appendThinkingLevelChange(level);
+					await this.advanceContextProjection(entryId);
 				} else {
 					this.pendingSessionWrites.push({ type: "thinking_level_change", thinkingLevel: level });
 				}
@@ -1960,6 +2603,7 @@ export class AgentHarness<
 	}
 
 	async setTools(tools: TTool[], activeToolNames?: string[]): Promise<void> {
+		this.assertNotDisposed();
 		try {
 			this.validateUniqueNames(
 				tools.map((tool) => tool.name),
@@ -1972,7 +2616,8 @@ export class AgentHarness<
 			const previousActiveToolNames = [...this.activeToolNames];
 			if (this.persistActiveToolChanges) {
 				if (this.phase === "idle") {
-					await this.session.appendActiveToolsChange(nextActiveToolNames);
+					const entryId = await this.session.appendActiveToolsChange(nextActiveToolNames);
+					await this.advanceContextProjection(entryId);
 				} else {
 					this.pendingSessionWrites.push({
 						type: "active_tools_change",
@@ -2000,13 +2645,15 @@ export class AgentHarness<
 	}
 
 	async setActiveTools(toolNames: string[]): Promise<void> {
+		this.assertNotDisposed();
 		try {
 			this.validateToolNames(toolNames);
 			const previousToolNames = [...this.tools.keys()];
 			const previousActiveToolNames = [...this.activeToolNames];
 			if (this.persistActiveToolChanges) {
 				if (this.phase === "idle") {
-					await this.session.appendActiveToolsChange(toolNames);
+					const entryId = await this.session.appendActiveToolsChange(toolNames);
+					await this.advanceContextProjection(entryId);
 				} else {
 					this.pendingSessionWrites.push({ type: "active_tools_change", activeToolNames: [...toolNames] });
 				}
@@ -2026,6 +2673,7 @@ export class AgentHarness<
 	}
 
 	registerNextActionPolicy(policy: AgentHarnessNextActionPolicy): () => void {
+		this.assertNotDisposed();
 		const registration = { policy };
 		this.nextActionPolicies.add(registration);
 		let registered = true;
@@ -2041,6 +2689,7 @@ export class AgentHarness<
 	}
 
 	async setSteeringMode(mode: QueueMode): Promise<void> {
+		this.assertNotDisposed();
 		this.steeringQueueMode = mode;
 	}
 
@@ -2049,6 +2698,7 @@ export class AgentHarness<
 	}
 
 	async setFollowUpMode(mode: QueueMode): Promise<void> {
+		this.assertNotDisposed();
 		this.followUpQueueMode = mode;
 	}
 
@@ -2062,6 +2712,7 @@ export class AgentHarness<
 	}
 
 	async setResources(resources: AgentHarnessResources<TSkill, TPromptTemplate>): Promise<void> {
+		this.assertNotDisposed();
 		const previousResources = this.getResources();
 		this.resources = {
 			...(resources.skills === undefined ? {} : { skills: resources.skills.slice() }),
@@ -2075,6 +2726,7 @@ export class AgentHarness<
 	}
 
 	async setStreamOptions(streamOptions: AgentHarnessStreamOptions): Promise<void> {
+		this.assertNotDisposed();
 		this.streamOptions = cloneStreamOptions(streamOptions);
 	}
 

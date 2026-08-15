@@ -749,7 +749,6 @@ describe("web_fetch session integration", () => {
 			timestamp: Date.now(),
 		});
 		session.sessionManager.appendCompaction("The earlier user message was summarized.", firstKeptEntryId, 1_000);
-		session.state.messages = session.sessionManager.buildSessionContext().messages;
 		expect(
 			session.state.messages.some(
 				(message) =>

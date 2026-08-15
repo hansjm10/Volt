@@ -4,7 +4,7 @@ import { AgentHarness } from "../../src/harness/agent-harness.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import { InMemorySessionStorage } from "../../src/harness/session/memory-storage.ts";
 import { Session } from "../../src/harness/session/session.ts";
-import type { AgentMessage } from "../../src/types.ts";
+import type { AgentMessage, AgentTool } from "../../src/types.ts";
 import { calculateTool } from "../utils/calculate.ts";
 
 const registrations: Array<{ unregister(): void }> = [];
@@ -183,6 +183,55 @@ describe("AgentHarness host policy", () => {
 		expect(JSON.stringify(continuationMessages)).toContain("final result");
 	});
 
+	it("keeps successful non-cloneable tool details inert when no tool-result handlers exist", async () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		registration.setResponses([
+			() =>
+				fauxAssistantMessage(fauxToolCall("non_cloneable_details", { expression: "1 + 1" }, { id: "call-1" }), {
+					stopReason: "toolUse",
+				}),
+			() => fauxAssistantMessage("must not continue"),
+		]);
+		const detailCallback = () => "still callable";
+		const tool: AgentTool = {
+			name: "non_cloneable_details",
+			label: "Non-cloneable details",
+			description: "Returns successful details containing a function",
+			parameters: calculateTool.parameters,
+			execute: async () => ({
+				content: [{ type: "text", text: "successful result" }],
+				details: { callback: detailCallback },
+				disposition: "stop",
+			}),
+		};
+		const session = new Session(new InMemorySessionStorage());
+		const harness = createHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session,
+			model: registration.getModel(),
+			tools: [tool],
+		});
+
+		const response = await harness.prompt("run the tool");
+		const persistedToolResult = (await session.getEntries()).find(
+			(entry) => entry.type === "message" && entry.message.role === "toolResult",
+		);
+
+		expect(registration.state.callCount).toBe(1);
+		expect(response.stopReason).toBe("toolUse");
+		expect(persistedToolResult?.type === "message" ? persistedToolResult.message : undefined).toMatchObject({
+			role: "toolResult",
+			isError: false,
+			content: [{ type: "text", text: "successful result" }],
+		});
+		expect(
+			persistedToolResult?.type === "message" && persistedToolResult.message.role === "toolResult"
+				? (persistedToolResult.message.details as { callback?: unknown } | undefined)?.callback
+				: undefined,
+		).toBe(detailCallback);
+	});
+
 	it("allows scoped policy to deliver work from an assistant-tail continuation", async () => {
 		const registration = registerFauxProvider();
 		registrations.push(registration);
@@ -223,6 +272,107 @@ describe("AgentHarness host policy", () => {
 		expect(registration.state.callCount).toBe(2);
 		await expect(harness.continue()).resolves.toEqual({ status: "completed", deliveries: [] });
 		expect(registration.state.callCount).toBe(2);
+	});
+
+	it("isolates every next-action handler and policy projection and owns returned actions", async () => {
+		const registration = registerFauxProvider();
+		registrations.push(registration);
+		let continuationMessages: AgentMessage[] = [];
+		registration.setResponses([
+			() =>
+				fauxAssistantMessage(fauxToolCall("calculate", { expression: "1 + 1" }, { id: "isolated-call" }), {
+					stopReason: "toolUse",
+				}),
+			(context) => {
+				continuationMessages = context.messages as AgentMessage[];
+				return fauxAssistantMessage("done");
+			},
+		]);
+		const harness = createHarness({
+			env: new NodeExecutionEnv({ cwd: process.cwd() }),
+			session: new Session(new InMemorySessionStorage()),
+			model: registration.getModel(),
+			tools: [calculateTool],
+		});
+		let mutatingHandlerCalls = 0;
+		let observingHandlerCalls = 0;
+		let observingPolicyCalls = 0;
+
+		harness.on("next_action", (event) => {
+			if (!event.completedTurn || event.completedTurn.toolResults.length === 0) return undefined;
+			mutatingHandlerCalls++;
+			event.context.messages[0] = { role: "user", content: "mutated context", timestamp: 10 };
+			event.context.tools?.splice(0, event.context.tools.length);
+			event.newMessages[0] = { role: "user", content: "mutated new messages", timestamp: 11 };
+			event.completedTurn.message.content = [{ type: "text", text: "mutated completed message" }];
+			event.completedTurn.toolResults[0]!.content = [{ type: "text", text: "mutated tool result" }];
+			if (event.defaultAction.type === "request") event.defaultAction.reason = "final_response";
+			return undefined;
+		});
+		harness.on("next_action", (event) => {
+			if (!event.completedTurn || event.completedTurn.toolResults.length === 0) return undefined;
+			observingHandlerCalls++;
+			expect(event.context.tools).toEqual([calculateTool]);
+			expect(event.context.messages.map(textOf)).not.toContain("mutated context");
+			expect(event.newMessages.map(textOf)).not.toContain("mutated new messages");
+			expect(JSON.stringify(event.completedTurn)).not.toContain("mutated");
+			expect(event.defaultAction).toMatchObject({ type: "request", reason: "continuation" });
+			const returnedMessage: AgentMessage = { role: "user", content: "owned reducer delivery", timestamp: 12 };
+			const returnedAction = {
+				type: "request" as const,
+				reason: "delivery" as const,
+				deliveries: [{ messages: [returnedMessage] }],
+			};
+			queueMicrotask(() => {
+				returnedMessage.content = "late returned-action mutation";
+				returnedAction.deliveries[0]!.messages.push({
+					role: "user",
+					content: "late returned delivery",
+					timestamp: 13,
+				});
+			});
+			return returnedAction;
+		});
+		harness.on("next_action", (event) => {
+			if (
+				event.defaultAction.type !== "request" ||
+				event.defaultAction.reason !== "delivery" ||
+				event.defaultAction.deliveries === undefined
+			)
+				return undefined;
+			expect(event.defaultAction.deliveries.flatMap((delivery) => delivery.messages).map(textOf)).toEqual([
+				"owned reducer delivery",
+			]);
+			const firstDelivery = event.defaultAction.deliveries?.[0];
+			if (firstDelivery) {
+				firstDelivery.messages[0] = { role: "user", content: "mutated handler delivery", timestamp: 14 };
+				firstDelivery.messages.push({ role: "user", content: "extra handler delivery", timestamp: 15 });
+			}
+			return undefined;
+		});
+		harness.registerNextActionPolicy((context) => {
+			if (
+				context.defaultAction.type !== "request" ||
+				context.defaultAction.reason !== "delivery" ||
+				context.defaultAction.deliveries === undefined
+			)
+				return undefined;
+			observingPolicyCalls++;
+			expect(context.context.tools).toEqual([calculateTool]);
+			expect(context.defaultAction.deliveries?.flatMap((delivery) => delivery.messages).map(textOf)).toEqual([
+				"owned reducer delivery",
+			]);
+			return undefined;
+		});
+
+		await harness.prompt("calculate");
+
+		expect(mutatingHandlerCalls).toBe(1);
+		expect(observingHandlerCalls).toBe(1);
+		expect(observingPolicyCalls).toBe(1);
+		expect(continuationMessages.map(textOf)).toContain("owned reducer delivery");
+		expect(continuationMessages.map(textOf)).not.toContain("mutated handler delivery");
+		expect(continuationMessages.map(textOf)).not.toContain("late returned-action mutation");
 	});
 
 	it("orders event and scoped next-action policy and unregisters scoped policy", async () => {

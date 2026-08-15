@@ -6,6 +6,7 @@ export {
 	type BranchSummaryDetails,
 	type CollectEntriesResult,
 	collectEntriesForBranchSummary,
+	type GenerateBranchSummaryOptions,
 	generateBranchSummary,
 	prepareBranchEntries,
 } from "./harness/compaction/branch-summarization.ts";

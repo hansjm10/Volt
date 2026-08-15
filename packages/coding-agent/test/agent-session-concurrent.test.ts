@@ -208,7 +208,6 @@ describe("AgentSession concurrent prompt guard", () => {
 		const firstAssistantId = sessionManager.appendMessage(createAssistantMessage("first assistant"));
 		sessionManager.appendMessage({ role: "user", content: "abandoned user", timestamp: 2 });
 		sessionManager.appendMessage(createAssistantMessage("abandoned assistant"));
-		session.state.messages = sessionManager.buildSessionContext().messages;
 
 		const prompt = session.prompt("active user");
 		await streamStarted;

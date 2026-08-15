@@ -277,6 +277,47 @@ describe("AgentSession dispose with in-flight tool calls", () => {
 		}
 	});
 
+	it("allows an active extension callback to await disposal without self-joining the Harness run", async () => {
+		let harness!: Awaited<ReturnType<typeof createHarnessWithExtensions>>;
+		let markAssistantEntered!: () => void;
+		let markCallbackCompleted!: () => void;
+		const assistantEntered = new Promise<void>((resolve) => {
+			markAssistantEntered = resolve;
+		});
+		const callbackCompleted = new Promise<void>((resolve) => {
+			markCallbackCompleted = resolve;
+		});
+		harness = await createHarnessWithExtensions({
+			responses: ["late assistant"],
+			extensionFactories: [
+				(volt) => {
+					volt.on("message_end", async (event) => {
+						if (event.message.role !== "assistant") return;
+						markAssistantEntered();
+						await harness.session.dispose();
+						markCallbackCompleted();
+					});
+				},
+			],
+		});
+		try {
+			const prompt = harness.session.prompt("start").catch(() => {});
+			await assistantEntered;
+			await callbackCompleted;
+			await prompt;
+
+			const messages = harness.sessionManager.buildSessionContext().messages;
+			expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+			expect(messages.at(-1)).toMatchObject({
+				role: "assistant",
+				stopReason: "aborted",
+				diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
+			});
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("prevents client-input WAL transitions after the final disposal watermark", async () => {
 		const harness = createHarness({ responses: ["ok"] });
 		let releaseFlush!: () => void;

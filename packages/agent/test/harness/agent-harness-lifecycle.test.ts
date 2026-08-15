@@ -1,6 +1,6 @@
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentHarness } from "../../src/harness/agent-harness.ts";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import { InMemorySessionStorage } from "../../src/harness/session/memory-storage.ts";
@@ -66,6 +66,83 @@ function runtimeAbortSources(messages: readonly AgentMessage[]): unknown[] {
 }
 
 describe("AgentHarness lifecycle and abort", () => {
+	it("makes disposal terminal and idempotent without admitting later work", async () => {
+		const { harness } = createHarness();
+		const disposal = harness.dispose();
+		expect(harness.dispose()).toBe(disposal);
+		await disposal;
+
+		const message: AgentMessage = { role: "user", content: "late", timestamp: Date.now() };
+		expect(() => harness.queueSteer(message)).toThrow("AgentHarness is disposed");
+		await expect(harness.nextTurn("late")).rejects.toThrow("AgentHarness is disposed");
+		await expect(harness.clearAllQueues()).rejects.toThrow("AgentHarness is disposed");
+		await expect(harness.run(message)).rejects.toThrow("AgentHarness is disposed");
+		await expect(harness.runPrompt("late")).rejects.toThrow("AgentHarness is disposed");
+		await expect(harness.prompt("late")).rejects.toThrow("AgentHarness is disposed");
+		await expect(harness.continue()).rejects.toThrow("AgentHarness is disposed");
+		await expect(harness.appendMessage(message)).rejects.toThrow("AgentHarness is disposed");
+		await expect(harness.compact()).rejects.toThrow("AgentHarness is disposed");
+	});
+
+	it("keeps synchronous queue admission separate from passive publication completion", async () => {
+		const publicationGate = deferred();
+		let publicationCalls = 0;
+		const { harness } = createHarness();
+		harness.subscribe(async (event) => {
+			if (event.type !== "queue_update") return;
+			publicationCalls++;
+			await publicationGate.promise;
+		});
+
+		const steerId = harness.queueSteer({ role: "user", content: "steer", timestamp: 1 });
+		const followUpId = harness.queueFollowUp({ role: "user", content: "follow", timestamp: 2 });
+		expect(steerId).toEqual(expect.any(String));
+		expect(followUpId).toEqual(expect.any(String));
+		expect(publicationCalls).toBe(2);
+		publicationGate.resolve();
+		await harness.clearAllQueues();
+	});
+
+	it.each(["steer", "followUp"] as const)("awaits %s queue publication before resolving", async (operation) => {
+		const requestStarted = deferred();
+		const releaseRequest = deferred();
+		const publicationStarted = deferred();
+		const releasePublication = deferred();
+		const { harness, registration } = createHarness();
+		registration.setResponses([
+			async () => {
+				requestStarted.resolve();
+				await releaseRequest.promise;
+				return fauxAssistantMessage("late");
+			},
+			() => fauxAssistantMessage("done"),
+		]);
+		harness.subscribe(async (event) => {
+			if (event.type !== "queue_update") return;
+			publicationStarted.resolve();
+			await releasePublication.promise;
+		});
+
+		const running = harness.runPrompt("start");
+		await requestStarted.promise;
+		let settled = false;
+		const queued = harness[operation]("queued").then((deliveryId) => {
+			settled = true;
+			return deliveryId;
+		});
+		await publicationStarted.promise;
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		releasePublication.resolve();
+		await expect(queued).resolves.toEqual(expect.any(String));
+		expect(settled).toBe(true);
+		harness.abort("host_action");
+		releaseRequest.resolve();
+		await running;
+		await harness.clearAllQueues();
+	});
+
 	it("accepts abort synchronously, preserves the first source, and exposes immutable run state", async () => {
 		const requestStarted = deferred();
 		const releaseRequest = deferred();
@@ -105,6 +182,135 @@ describe("AgentHarness lifecycle and abort", () => {
 		expect(harness.activeRunSnapshot).toBeUndefined();
 		expect(harness.abort("remote_request")).toEqual({ accepted: false, runId: undefined, source: undefined });
 	});
+
+	it("owns caller input and explicit context before blocked preflight and across a retained retry", async () => {
+		const callbackStarted = deferred();
+		const releaseCallback = deferred();
+		let settlementCalls = 0;
+		let providerMessages: AgentMessage[] = [];
+		let providerSystemPrompt = "";
+		const { harness, registration, session } = createHarness({
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				participant: {
+					settle: () => {
+						settlementCalls++;
+						return settlementCalls === 1
+							? { outcome: "retained", error: new Error("retry owned input") }
+							: { outcome: "committed" };
+					},
+				},
+			}),
+		});
+		const buildContext = session.buildContext.bind(session);
+		vi.spyOn(session, "buildContext").mockImplementation(async () => {
+			callbackStarted.resolve();
+			await releaseCallback.promise;
+			return await buildContext();
+		});
+		registration.setResponses([
+			(context) => {
+				providerMessages = context.messages as AgentMessage[];
+				providerSystemPrompt = context.systemPrompt ?? "";
+				return fauxAssistantMessage("owned");
+			},
+		]);
+		const inputMessage: AgentMessage = {
+			role: "user",
+			content: [
+				{ type: "text", text: "owned input" },
+				{ type: "image", mimeType: "image/png", data: "owned-image" },
+			],
+			timestamp: 1,
+		};
+		const contextMessage: AgentMessage = { role: "user", content: "owned context", timestamp: 2 };
+		const input = [inputMessage];
+		const context = [contextMessage];
+		const options = { systemPrompt: "owned system", context };
+
+		const running = harness.run(input, options);
+		await callbackStarted.promise;
+		if (inputMessage.role !== "user" || typeof inputMessage.content === "string") {
+			throw new Error("Expected structured user input");
+		}
+		inputMessage.content[0] = { type: "text", text: "mutated input" };
+		inputMessage.content[1] = { type: "image", mimeType: "image/png", data: "mutated-image" };
+		input.push({ role: "user", content: "late input", timestamp: 3 });
+		contextMessage.content = "mutated context";
+		context.push({ role: "user", content: "late context", timestamp: 4 });
+		options.systemPrompt = "mutated system";
+		options.context = [{ role: "user", content: "replacement context", timestamp: 5 }];
+		releaseCallback.resolve();
+
+		await expect(running).resolves.toMatchObject({
+			status: "delivery_failed",
+			failure: { outcome: "retained" },
+		});
+		inputMessage.content[0] = { type: "text", text: "mutated again" };
+		contextMessage.content = "mutated again";
+		await expect(harness.continue()).resolves.toMatchObject({ status: "completed" });
+
+		expect(getUserTexts(providerMessages)).toEqual(["owned context", "owned input"]);
+		expect(providerSystemPrompt).toBe("owned system");
+		const providerInput = providerMessages.find(
+			(message) => message.role === "user" && getUserTexts([message]).includes("owned input"),
+		);
+		expect(
+			providerInput?.role === "user" && typeof providerInput.content !== "string" ? providerInput.content[1] : null,
+		).toEqual({
+			type: "image",
+			mimeType: "image/png",
+			data: "owned-image",
+		});
+	});
+
+	it.each(["runPrompt", "prompt"] as const)(
+		"owns %s images and structured options before its first await",
+		async (operation) => {
+			const callbackStarted = deferred();
+			const releaseCallback = deferred();
+			let providerMessages: AgentMessage[] = [];
+			let providerSystemPrompt = "";
+			const { harness, registration, session } = createHarness();
+			const buildContext = session.buildContext.bind(session);
+			vi.spyOn(session, "buildContext").mockImplementation(async () => {
+				callbackStarted.resolve();
+				await releaseCallback.promise;
+				return await buildContext();
+			});
+			registration.setResponses([
+				(context) => {
+					providerMessages = context.messages as AgentMessage[];
+					providerSystemPrompt = context.systemPrompt ?? "";
+					return fauxAssistantMessage("owned");
+				},
+			]);
+			const image = { type: "image" as const, mimeType: "image/png", data: "owned-image" };
+			const explicitContext: AgentMessage[] = [{ role: "user", content: "owned context", timestamp: 1 }];
+			const options = { images: [image], context: explicitContext, systemPrompt: "owned system" };
+
+			const running = harness[operation]("owned prompt", options);
+			await callbackStarted.promise;
+			image.data = "mutated-image";
+			options.images.push({ type: "image", mimeType: "image/png", data: "late-image" });
+			explicitContext[0] = { role: "user", content: "mutated context", timestamp: 2 };
+			options.context = [{ role: "user", content: "replacement context", timestamp: 3 }];
+			options.systemPrompt = "mutated system";
+			releaseCallback.resolve();
+			await running;
+
+			expect(getUserTexts(providerMessages)).toEqual(["owned context", "owned prompt"]);
+			expect(providerSystemPrompt).toBe("owned system");
+			const promptMessage = providerMessages.find(
+				(message) => message.role === "user" && getUserTexts([message]).includes("owned prompt"),
+			);
+			expect(
+				promptMessage?.role === "user" && typeof promptMessage.content !== "string"
+					? promptMessage.content.filter((part) => part.type === "image")
+					: [],
+			).toEqual([{ type: "image", mimeType: "image/png", data: "owned-image" }]);
+		},
+	);
 
 	it("owns async system-prompt preflight and retains canceled input for explicit continuation", async () => {
 		const callbackStarted = deferred();
@@ -156,7 +362,7 @@ describe("AgentHarness lifecycle and abort", () => {
 
 		await harness.continue();
 		expect(registration.state.callCount).toBe(1);
-		expect(systemPromptCalls).toBeGreaterThan(1);
+		expect(systemPromptCalls).toBe(1);
 		expect(providerSystemPrompt).toBe("retained system prompt");
 		expect(harness.hasPendingPrompt()).toBe(false);
 	});
@@ -165,10 +371,12 @@ describe("AgentHarness lifecycle and abort", () => {
 		const hookStarted = deferred();
 		const releaseHook = deferred();
 		let hookSignal: AbortSignal | undefined;
+		let hookCalls = 0;
 		let providerTexts: string[] = [];
 		let providerSystemPrompt = "";
 		const { harness, registration } = createHarness();
 		harness.on("before_agent_start", async (event) => {
+			hookCalls++;
 			hookSignal = event.signal;
 			hookStarted.resolve();
 			await releaseHook.promise;
@@ -207,9 +415,59 @@ describe("AgentHarness lifecycle and abort", () => {
 
 		await harness.continue();
 		expect(registration.state.callCount).toBe(1);
+		expect(hookCalls).toBe(1);
 		expect(providerTexts).toEqual(["cancel hook preflight", "hook payload"]);
 		expect(providerSystemPrompt).toBe("hook system prompt");
 		expect(harness.hasPendingPrompt()).toBe(false);
+	});
+
+	it("retains one prompt identity when before_agent_start rejects after system-prompt preparation", async () => {
+		let systemPromptCalls = 0;
+		let beforeStartCalls = 0;
+		let settlementCalls = 0;
+		const deliveryIds: string[] = [];
+		const { harness, registration } = createHarness({
+			systemPrompt: async () => {
+				systemPromptCalls++;
+				return "cached system prompt";
+			},
+			prepareDelivery: (delivery) => {
+				deliveryIds.push(delivery.deliveryId);
+				return {
+					messages: [...delivery.messages],
+					participant: {
+						settle: () => {
+							settlementCalls++;
+							return settlementCalls === 1
+								? { outcome: "retained", error: new Error("retry settlement") }
+								: { outcome: "committed" };
+						},
+					},
+				};
+			},
+		});
+		harness.on("before_agent_start", () => {
+			beforeStartCalls++;
+			if (beforeStartCalls === 1) throw new Error("preflight rejected");
+			return {
+				messages: [{ role: "user", content: "prepared after rejection", timestamp: Date.now() }],
+			};
+		});
+		registration.setResponses([() => fauxAssistantMessage("resumed")]);
+
+		await expect(harness.runPrompt("retained before preflight")).rejects.toThrow("preflight rejected");
+		expect(harness.hasPendingPrompt()).toBe(true);
+		await expect(harness.continue()).resolves.toMatchObject({
+			status: "delivery_failed",
+			failure: { outcome: "retained" },
+		});
+		await expect(harness.continue()).resolves.toMatchObject({ status: "completed" });
+
+		expect(systemPromptCalls).toBe(1);
+		expect(beforeStartCalls).toBe(2);
+		expect(new Set(deliveryIds)).toHaveLength(1);
+		expect(settlementCalls).toBe(2);
+		expect(registration.state.callCount).toBe(1);
 	});
 
 	it("re-canonicalizes the first abort source across awaited message replacements", async () => {
@@ -402,13 +660,16 @@ describe("AgentHarness lifecycle and abort", () => {
 		expect(harness.hasQueuedMessages()).toBe(false);
 	});
 
-	it("cleans up lifecycle state after a retained preparation failure", async () => {
+	it("retains an ordinary preparation rejection for explicit retry", async () => {
+		let preparationCalls = 0;
 		const { harness, registration } = createHarness({
-			prepareDelivery: () => {
-				throw new Error("preparation failed");
+			prepareDelivery: (delivery) => {
+				preparationCalls++;
+				if (preparationCalls === 1) throw new Error("preparation failed");
+				return { messages: [...delivery.messages] };
 			},
 		});
-		registration.setResponses([() => fauxAssistantMessage("unexpected")]);
+		registration.setResponses([() => fauxAssistantMessage("retried")]);
 
 		await expect(harness.runPrompt("fail preparation")).resolves.toMatchObject({
 			status: "delivery_failed",
@@ -420,5 +681,10 @@ describe("AgentHarness lifecycle and abort", () => {
 		await expect(harness.waitForIdle()).resolves.toBeUndefined();
 		expect(harness.hasPendingPrompt()).toBe(true);
 		expect(registration.state.callCount).toBe(0);
+
+		await expect(harness.continue()).resolves.toMatchObject({ status: "completed" });
+		expect(preparationCalls).toBe(2);
+		expect(harness.hasPendingPrompt()).toBe(false);
+		expect(registration.state.callCount).toBe(1);
 	});
 });

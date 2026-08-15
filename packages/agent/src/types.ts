@@ -149,6 +149,12 @@ export type AgentDeliveryParticipantOutcome =
 
 /** Reentrant-safe lifecycle capability available only while participant work settles. */
 export interface AgentDeliveryTransactionContext {
+	/** Stable identity of the delivery being settled. */
+	readonly deliveryId: string;
+	/** Inbox class of the delivery being settled. */
+	readonly kind: AgentDeliveryKind;
+	/** Isolated, reduced messages that must be committed for this delivery. */
+	readonly messages: readonly AgentMessage[];
 	/** Record abort intent without awaiting the orchestrator run that invoked this participant. */
 	requestAbort(source?: AgentAbortSource): AgentAbortAcceptance;
 }
@@ -166,10 +172,24 @@ export interface AgentDeliveryTransactionParticipant {
 	): AgentDeliveryParticipantOutcome | Promise<AgentDeliveryParticipantOutcome>;
 }
 
-/** Side-effect-free messages plus work settled only after delivery ownership transfers. */
+/**
+ * Side-effect-free messages plus attempt-scoped work settled only after delivery ownership transfers.
+ * `prepareDelivery` must create a fresh participant for every attempt; participants are never reused.
+ */
 export interface AgentDeliveryPreparation {
-	messages: AgentMessage[];
-	participant?: AgentDeliveryTransactionParticipant;
+	readonly messages: readonly AgentMessage[];
+	readonly participant?: AgentDeliveryTransactionParticipant;
+}
+
+/** @internal Signals that replay preparation changed an already-cached delivery payload. */
+export class AgentDeliveryPreparationReplayMismatchError extends Error {
+	readonly deliveryId: string;
+
+	constructor(deliveryId: string) {
+		super(`prepareDelivery changed the prepared messages for retained delivery ${deliveryId}`);
+		this.name = "AgentDeliveryPreparationReplayMismatchError";
+		this.deliveryId = deliveryId;
+	}
 }
 
 interface AgentDeliveryAttemptBase {
@@ -180,7 +200,11 @@ interface AgentDeliveryAttemptBase {
 export type AgentDeliveryFailure = AgentDeliveryAttemptBase &
 	(
 		| { readonly outcome: "retained"; readonly phase: "preparation" | "settlement"; readonly error: Error }
-		| { readonly outcome: "terminally_failed"; readonly phase: "settlement"; readonly error: Error }
+		| {
+				readonly outcome: "terminally_failed";
+				readonly phase: "preparation" | "settlement";
+				readonly error: Error;
+		  }
 	);
 
 /** Explicit terminal result for one orchestrator-owned delivery attempt. */

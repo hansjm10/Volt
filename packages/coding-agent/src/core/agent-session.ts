@@ -17,6 +17,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type {
 	AgentAbortSource,
 	AgentDelivery,
@@ -26,6 +27,7 @@ import type {
 	AgentDeliveryTransactionContext,
 	AgentDeliveryTransactionParticipant,
 	AgentEvent,
+	AgentHarnessContextProjectionToken,
 	AgentHarnessNextActionPolicy,
 	AgentHarnessStreamOptions,
 	AgentLoopNextActionContext,
@@ -39,7 +41,7 @@ import type {
 	ToolCallEvent,
 	ToolCallResult,
 } from "@hansjm10/volt-agent-core";
-import { AgentHarness } from "@hansjm10/volt-agent-core";
+import { AgentDeliveryPreparationReplayMismatchError, AgentHarness } from "@hansjm10/volt-agent-core";
 import { NodeExecutionEnv } from "@hansjm10/volt-agent-core/node";
 import type {
 	AssistantMessage,
@@ -392,11 +394,11 @@ export interface AgentSessionConfig {
 
 /** AgentSession runtime projection. A model is optional until one is selected. */
 export interface AgentSessionState {
-	systemPrompt: string;
-	model: Model<any> | undefined;
-	thinkingLevel: ThinkingLevel;
-	tools: AgentTool[];
-	messages: AgentMessage[];
+	readonly systemPrompt: string;
+	readonly model: Model<any> | undefined;
+	readonly thinkingLevel: ThinkingLevel;
+	readonly tools: readonly AgentTool[];
+	readonly messages: readonly AgentMessage[];
 	readonly isStreaming: boolean;
 	readonly streamingMessage: AgentMessage | undefined;
 	readonly pendingToolCalls: ReadonlySet<string>;
@@ -492,6 +494,7 @@ interface PreparedQueueEntry {
 }
 
 interface PreparedDeliverySnapshot {
+	sourceMessages: AgentMessage[];
 	messages: AgentMessage[];
 	queueEntries: PreparedQueueEntry[];
 	error?: Error;
@@ -645,7 +648,6 @@ export class AgentSession {
 	 */
 	private _proactiveCompactionState: "idle" | "scheduled" | "compacting" = "idle";
 	private _drainFollowUpsOnNextContinuation = false;
-	private _nextRunContextOverride: AgentMessage[] | undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -915,16 +917,29 @@ export class AgentSession {
 		}
 		if (this._disposed) throw new Error("Session disposed during delivery preparation");
 		if (!this._harness.canPrepareDelivery(delivery.deliveryId)) return prepared;
+		const normalized = this._normalizePreparedDeliveryMessages(cloneAgentMessages(prepared.messages));
 		let deliverySnapshot = this._preparedDeliveryExtensions.get(delivery.deliveryId);
+		if (
+			deliverySnapshot &&
+			(!isDeepStrictEqual(deliverySnapshot.sourceMessages, normalized.messages) ||
+				!isDeepStrictEqual(deliverySnapshot.queueEntries, normalized.queueEntries))
+		) {
+			const error = new AgentDeliveryPreparationReplayMismatchError(delivery.deliveryId);
+			this._runtimeErrorMessage = error.message;
+			this._preparingDeliveryExtensions.delete(delivery.deliveryId);
+			this._preparedDeliveryExtensions.delete(delivery.deliveryId);
+			this._releaseReadyPlanTransition(delivery.deliveryId);
+			throw error;
+		}
 		if (!deliverySnapshot) {
-			const normalized = this._normalizePreparedDeliveryMessages(cloneAgentMessages(prepared.messages));
 			const preparationToken = {};
 			this._preparingDeliveryExtensions.set(delivery.deliveryId, preparationToken);
 			try {
 				const preparedExtension = await this._prepareDeliveryExtensionMessages(normalized.messages);
-				if (signal.aborted || this._disposed) throw new Error("Session disposed during delivery preparation");
+				if (this._disposed) throw new Error("Session disposed during delivery preparation");
 				deliverySnapshot = {
 					...preparedExtension,
+					sourceMessages: cloneAgentMessages(normalized.messages),
 					messages: cloneAgentMessages(preparedExtension.messages),
 					queueEntries: normalized.queueEntries.map(({ kind, entry }) => ({ kind, entry: { ...entry } })),
 				};
@@ -933,6 +948,8 @@ export class AgentSession {
 					this._harness.canPrepareDelivery(delivery.deliveryId)
 				) {
 					this._preparedDeliveryExtensions.set(delivery.deliveryId, deliverySnapshot);
+				} else {
+					deliverySnapshot = undefined;
 				}
 			} finally {
 				if (this._preparingDeliveryExtensions.get(delivery.deliveryId) === preparationToken) {
@@ -969,10 +986,13 @@ export class AgentSession {
 				settle: async (context) =>
 					await this._settleDeliveryParticipant({
 						deliveryId: delivery.deliveryId,
-						messages,
+						messages: cloneAgentMessages(context.messages),
 						queueEntries,
 						upstream: prepared.participant,
-						context,
+						context: Object.freeze({
+							...context,
+							messages: Object.freeze(cloneAgentMessages(context.messages)),
+						}),
 						preparationError: deliverySnapshot.error,
 						...(readyPlan && nextPlanningState ? { readyPlan, nextPlanningState } : {}),
 					}),
@@ -1005,6 +1025,7 @@ export class AgentSession {
 			return undefined;
 		});
 		this._harness.on("message_end", async (event) => {
+			if (event.deliveryId !== undefined) return undefined;
 			if (this._disposed || !this._isConversationAuthorityAvailable()) return undefined;
 			let replacement: AgentMessage | undefined;
 			try {
@@ -2243,9 +2264,6 @@ export class AgentSession {
 			operation.rejectCompletion(disposalError);
 		}
 		this._liveClientInputs.clear();
-		const persistenceDrain = acceptReconciliationRequired
-			? this.sessionManager.drainPersistence().then(() => undefined)
-			: this.sessionManager.closePersistence();
 		let subagentDrain: Promise<void>;
 		let mcpDrain: Promise<void>;
 		try {
@@ -2264,19 +2282,25 @@ export class AgentSession {
 			this.abortCompaction();
 			this.abortBranchSummary();
 			this.abortBash();
-			// Drain queued steering/follow-up messages so a run that settles after
-			// dispose cannot restart via the queued-message continuation path.
-			await this._clearAgentQueues();
-			this._preparingDeliveryExtensions.clear();
-			this._preparedDeliveryExtensions.clear();
-			this._readyPlanTransitionDeliveryId = undefined;
+			// Revoke retained prompt and queued ownership through Harness so every
+			// delivery-coupled projection observes the same terminal cleanup path.
+			// Harness disposal fences synchronously and must not join this run: an
+			// active extension callback may itself be awaiting this disposal receipt.
+			void this._harness.dispose(source);
+			if (this._deliveryRevocationSettlements.size > 0) await this._drainDeliveryRevocations();
 			this._lspManager?.dispose();
 			this._unsubscribeMcpManager?.();
 			this._unsubscribeMcpManager = undefined;
 		} catch {
 			// Dispose must continue even if an abort hook throws.
 		}
+		this._preparingDeliveryExtensions.clear();
+		this._preparedDeliveryExtensions.clear();
+		this._readyPlanTransitionDeliveryId = undefined;
 
+		const persistenceDrain = acceptReconciliationRequired
+			? this.sessionManager.drainPersistence().then(() => undefined)
+			: this.sessionManager.closePersistence();
 		this._fenceExtensionGeneration();
 		this._disconnectFromAgent();
 		this._unsubscribeGitContext?.();
@@ -2566,9 +2590,13 @@ export class AgentSession {
 			tools: this._harness.getActiveTools(),
 			messages: this.messages,
 			isStreaming: this.isStreaming,
-			streamingMessage: this._streamingMessage,
+			streamingMessage: this._streamingMessage === undefined ? undefined : structuredClone(this._streamingMessage),
 			pendingToolCalls: new Set(this._pendingToolExecutions.keys()),
-			pendingToolExecutions: new Map(this._pendingToolExecutions),
+			pendingToolExecutions: new Map(
+				[...this._pendingToolExecutions].map(
+					([toolCallId, execution]) => [toolCallId, structuredClone(execution)] as const,
+				),
+			),
 			errorMessage: this._runtimeErrorMessage,
 		};
 	}
@@ -3786,7 +3814,7 @@ export class AgentSession {
 		}
 		this._proactiveCompactionState = "idle";
 		this._drainFollowUpsOnNextContinuation = false;
-		this._nextRunContextOverride = undefined;
+		if (!resumeRetainedPrompt) this._harness.invalidateContinuationContext();
 		const run = (async () => {
 			this._agentConversationMutationInFlight = true;
 			try {
@@ -3844,17 +3872,10 @@ export class AgentSession {
 	private async _continueAgent(): Promise<AgentRunResult> {
 		this._assertConversationAuthorityAvailable();
 		const drainFollowUps = this._drainFollowUpsOnNextContinuation;
-		const context = this._nextRunContextOverride;
 		this._drainFollowUpsOnNextContinuation = false;
-		this._nextRunContextOverride = undefined;
 		this._agentConversationMutationInFlight = true;
 		try {
-			return await this._runAgentOperation(() =>
-				this._harness.continue({
-					drainFollowUps,
-					...(context === undefined ? {} : { context }),
-				}),
-			);
+			return await this._runAgentOperation(() => this._harness.continue({ drainFollowUps }));
 		} finally {
 			this._agentConversationMutationInFlight = false;
 		}
@@ -5254,19 +5275,28 @@ export class AgentSession {
 		}
 		const newEntries = this.sessionManager.getEntries();
 		const sessionContext = this.sessionManager.buildSessionContext();
-		let messages = sessionContext.messages;
-		if (continuation?.dropTrailingErrorMessage) {
+		const projectMessages = (source: readonly AgentMessage[]): AgentMessage[] => {
+			const messages = [...source];
+			if (!continuation?.dropTrailingErrorMessage) return messages;
 			const lastIndex =
 				messages.at(-1)?.role === "custom" &&
 				(messages.at(-1) as CustomMessage).customType === PLAN_CHECKPOINT_CUSTOM_TYPE
 					? messages.length - 2
 					: messages.length - 1;
 			const candidate = messages[lastIndex];
-			if (candidate?.role === "assistant" && (candidate as AssistantMessage).stopReason === "error") {
-				messages = [...messages.slice(0, lastIndex), ...messages.slice(lastIndex + 1)];
-			}
+			return candidate?.role === "assistant" && (candidate as AssistantMessage).stopReason === "error"
+				? [...messages.slice(0, lastIndex), ...messages.slice(lastIndex + 1)]
+				: messages;
+		};
+		const messages = projectMessages(sessionContext.messages);
+		if (continuation || this._harness.hasQueuedMessages()) {
+			await this._harness.rebaseContinuationContext({
+				source: "compaction",
+				project: projectMessages,
+			});
+		} else {
+			this._harness.invalidateContinuationContext();
 		}
-		if (continuation) this._nextRunContextOverride = messages;
 		const estimatedTokensAfter =
 			estimateMessagesTokens(messages) + estimateToolDefinitionTokens(this._harness.getActiveTools());
 
@@ -6542,49 +6572,54 @@ export class AgentSession {
 
 		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
 
-		this._emit({
-			type: "auto_retry_start",
-			attempt: this._retryAttempt,
-			maxAttempts: settings.maxRetries,
-			delayMs,
-			errorMessage: message.errorMessage || "Unknown error",
-		});
-
-		if (this._disposed || abortGeneration !== this._abortGeneration) {
-			this._settleRetry(false, "Retry cancelled");
-			return false;
-		}
-
-		// Keep the persisted error in history while excluding it from the retry request.
-		const messages = this.messages;
-		let retryContextEnd = messages.length;
-		while (retryContextEnd > 0) {
-			const candidate = messages[retryContextEnd - 1];
-			if (candidate?.role !== "assistant" || candidate.stopReason !== "error") break;
-			retryContextEnd--;
-		}
-		if (retryContextEnd < messages.length) {
-			this._nextRunContextOverride = messages.slice(0, retryContextEnd);
-		}
-
-		// Wait with exponential backoff (abortable)
-		this._retryAbortController = new AbortController();
+		const retryAbortController = new AbortController();
+		this._retryAbortController = retryAbortController;
+		let retryProjectionToken: AgentHarnessContextProjectionToken | undefined;
 		try {
-			await sleep(delayMs, this._retryAbortController.signal);
-		} catch {
-			// Aborted during sleep - emit end event so UI can clean up
-			this._nextRunContextOverride = undefined;
+			this._emit({
+				type: "auto_retry_start",
+				attempt: this._retryAttempt,
+				maxAttempts: settings.maxRetries,
+				delayMs,
+				errorMessage: message.errorMessage || "Unknown error",
+			});
+
+			if (this._disposed || abortGeneration !== this._abortGeneration) {
+				this._settleRetry(false, "Retry cancelled");
+				return false;
+			}
+
+			// Keep the persisted error in history while excluding it from the retry request.
+			retryProjectionToken = await this._harness.rebaseContinuationContext({
+				source: "retry",
+				project: (messages) => {
+					let retryContextEnd = messages.length;
+					while (retryContextEnd > 0) {
+						const candidate = messages[retryContextEnd - 1];
+						if (candidate?.role !== "assistant" || candidate.stopReason !== "error") break;
+						retryContextEnd--;
+					}
+					return messages.slice(0, retryContextEnd);
+				},
+			});
+
+			await sleep(delayMs, retryAbortController.signal);
+			if (retryAbortController.signal.aborted) throw new Error("Retry cancelled");
+			if (this._disposed || abortGeneration !== this._abortGeneration) {
+				this._harness.clearContinuationContext(retryProjectionToken);
+				return false;
+			}
+			return true;
+		} catch (error) {
+			if (!retryAbortController.signal.aborted) throw error;
+			if (retryProjectionToken) this._harness.clearContinuationContext(retryProjectionToken);
 			this._settleRetry(false, "Retry cancelled");
 			return false;
 		} finally {
-			this._retryAbortController = undefined;
+			if (this._retryAbortController === retryAbortController) {
+				this._retryAbortController = undefined;
+			}
 		}
-
-		if (this._disposed || abortGeneration !== this._abortGeneration) {
-			this._nextRunContextOverride = undefined;
-			return false;
-		}
-		return true;
 	}
 
 	/**
@@ -7019,6 +7054,7 @@ export class AgentSession {
 			if (label && !summaryText) {
 				this.sessionManager.appendLabelChange(targetId, label);
 			}
+			this._harness.invalidateContinuationContext();
 
 			const conversationGenerationChange = {
 				previousLeafId: oldLeafId,
