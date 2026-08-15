@@ -26,9 +26,8 @@ function createRestoreReceiver(options: {
 		clearAllQueues: Reflect.get(InteractiveMode.prototype, "clearAllQueues"),
 		drainCompactionQueue: Reflect.get(InteractiveMode.prototype, "drainCompactionQueue"),
 		putQueuedTextInEditor: Reflect.get(InteractiveMode.prototype, "putQueuedTextInEditor"),
-		session: { clearQueue: vi.fn(options.clearQueue) },
+		session: { clearQueue: vi.fn(options.clearQueue), abort: vi.fn(() => Promise.resolve()) },
 		compactionQueuedMessages: options.compactionQueuedMessages ?? [],
-		agent: { abort: vi.fn() },
 		editor: { getText: vi.fn(() => options.editorText ?? ""), setText: vi.fn() },
 		updatePendingMessagesDisplay: vi.fn(),
 	};
@@ -58,7 +57,7 @@ describe("InteractiveMode queued message restoration", () => {
 			"steered draft\n\nqueued for after compaction\n\nfollow-up draft\n\nin-progress draft",
 		);
 		expect(receiver.compactionQueuedMessages).toEqual([]);
-		expect(receiver.agent.abort).toHaveBeenCalledWith("keyboard_interrupt");
+		expect(receiver.session.abort).toHaveBeenCalledWith("keyboard_interrupt");
 	});
 
 	test("leaves the compaction queue intact when clearing fails before the queues are revoked", async () => {
@@ -77,7 +76,7 @@ describe("InteractiveMode queued message restoration", () => {
 		// Nothing was revoked, so nothing needs recovering and the queue stays put.
 		expect(receiver.editor.setText).not.toHaveBeenCalled();
 		expect(receiver.compactionQueuedMessages).toEqual(compactionQueuedMessages);
-		expect(receiver.agent.abort).toHaveBeenCalledWith("host_action");
+		expect(receiver.session.abort).toHaveBeenCalledWith("host_action");
 	});
 
 	test("restores both queues to the editor on the success path", async () => {
@@ -93,7 +92,7 @@ describe("InteractiveMode queued message restoration", () => {
 			"steered draft\n\nfollow-up draft\n\nqueued for after compaction\n\nin-progress draft",
 		);
 		expect(receiver.compactionQueuedMessages).toEqual([]);
-		expect(receiver.agent.abort).not.toHaveBeenCalled();
+		expect(receiver.session.abort).not.toHaveBeenCalled();
 	});
 
 	test("reports the cancellation failure from the dequeue key after restoring the text", async () => {

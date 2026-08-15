@@ -573,7 +573,6 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		await runtimeHost.session.prompt("first branch turn");
 		await runtimeHost.session.prompt("second branch turn");
 		const originalSession = runtimeHost.session;
-		const subscribe = vi.spyOn(originalSession.agent, "subscribe");
 
 		let notifyCompactionStarted!: () => void;
 		const compactionStarted = new Promise<void>((resolve) => {
@@ -606,12 +605,12 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 		const compaction = originalSession.compact();
 		await compactionStarted;
-		const disposal = originalSession.dispose();
+		originalSession.dispose();
+		const disposal = originalSession.waitForClosed();
 		releaseCompaction();
 
-		await expect(compaction).rejects.toThrow("Compaction cancelled");
+		await expect(compaction).rejects.toThrow("AgentSession is disposed");
 		await disposal;
-		expect(subscribe).not.toHaveBeenCalled();
 		expect(originalSession.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
 	});
 
@@ -1359,7 +1358,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 					followUpMode: "one-at-a-time",
 					sessionId: runtimeHost.session.sessionId,
 					autoCompactionEnabled: true,
-					messageCount: runtimeHost.session.agent.state.messages.length,
+					messageCount: runtimeHost.session.state.messages.length,
 					pendingMessageCount: 0,
 					steeringQueue: [],
 					followUpQueue: [],

@@ -16,6 +16,7 @@ export {
 	type AgentSessionConfig,
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
+	type AgentSessionState,
 	type CompactionReason,
 	type ModelCycleResult,
 	type ParsedSkillBlock,

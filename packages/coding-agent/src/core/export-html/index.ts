@@ -1,4 +1,4 @@
-import type { AgentState } from "@hansjm10/volt-agent-core";
+import type { AgentTool } from "@hansjm10/volt-agent-core";
 import { existsSync, readFileSync } from "fs";
 import { basename, join } from "path";
 import { APP_NAME, getExportTemplateDir } from "../../config.ts";
@@ -232,12 +232,12 @@ function preRenderCustomTools(
 }
 
 /**
- * Export session to HTML using SessionManager and AgentState.
+ * Export session to HTML using SessionManager and the runtime fields needed for rendering.
  * Used by TUI's /export command.
  */
 export async function exportSessionToHtml(
 	sm: SessionManager,
-	state?: AgentState,
+	state?: { readonly systemPrompt: string; readonly tools: readonly AgentTool[] },
 	options?: ExportOptions | string,
 ): Promise<string> {
 	const opts: ExportOptions = typeof options === "string" ? { outputPath: options } : options || {};

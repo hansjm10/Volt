@@ -14,19 +14,30 @@ describe("regression #207: delivery run outcomes", () => {
 	let harness: Harness | undefined;
 
 	afterEach(async () => {
-		await harness?.session.dispose();
+		harness?.session.dispose();
+		if (harness) await harness.session.waitForClosed();
 		harness?.cleanup();
 		harness = undefined;
 	});
 
 	it("does not automatically retry a retained delivery after the run settles", async () => {
-		let failPreparation = true;
+		let retainSettlement = true;
 		let preparationAttempts = 0;
+		let settlementAttempts = 0;
 		harness = await createHarness({
 			prepareDelivery: (delivery) => {
 				preparationAttempts++;
-				if (failPreparation) throw new Error("injected retained attempt");
-				return { messages: [...delivery.messages] };
+				return {
+					messages: [...delivery.messages],
+					participant: {
+						settle: () => {
+							settlementAttempts++;
+							return retainSettlement
+								? { outcome: "retained", error: new Error("injected retained attempt") }
+								: { outcome: "committed" };
+						},
+					},
+				};
 			},
 		});
 		harness.setResponses([fauxAssistantMessage("explicit retry completed")]);
@@ -34,18 +45,46 @@ describe("regression #207: delivery run outcomes", () => {
 		await expect(harness.session.prompt("bounded retained prompt")).resolves.toBeUndefined();
 
 		expect(preparationAttempts).toBe(1);
-		expect(harness.session.agent.state.errorMessage).toBe("injected retained attempt");
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(settlementAttempts).toBe(1);
+		expect(harness.session.state.errorMessage).toBe("injected retained attempt");
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(getUserTexts(harness)).toEqual([]);
 		expect(harness.getPendingResponseCount()).toBe(1);
 
-		failPreparation = false;
-		await harness.session.agent.continue();
+		retainSettlement = false;
+		await harness.control.continue();
 
-		expect(preparationAttempts).toBe(2);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(preparationAttempts).toBe(1);
+		expect(settlementAttempts).toBe(2);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(getUserTexts(harness)).toEqual(["bounded retained prompt"]);
 		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("does not classify an ambiguous delivery failure as a transient provider retry", async () => {
+		const retryDecisions: boolean[] = [];
+		harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				participant: {
+					settle: () => ({ outcome: "terminally_failed", error: new Error("overloaded_error") }),
+				},
+			}),
+		});
+		harness.setResponses([fauxAssistantMessage("unexpected provider retry")]);
+		harness.session.subscribe((event) => {
+			if (event.type === "agent_end") retryDecisions.push(event.willRetry);
+		});
+
+		await expect(harness.session.prompt("ambiguous delivery")).resolves.toBeUndefined();
+
+		expect(retryDecisions).toEqual([false]);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			diagnostics: [{ type: "delivery_transaction_failure" }],
+		});
 	});
 
 	it("settles an active provider retry when a queued delivery is retained", async () => {
@@ -55,12 +94,15 @@ describe("regression #207: delivery run outcomes", () => {
 		const retryDecisions: boolean[] = [];
 		harness = await createHarness({
 			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 50 } },
-			prepareDelivery: (delivery) => {
-				if (failDelivery && delivery.kind === "steer") {
-					throw new Error("retained during provider retry");
-				}
-				return { messages: [...delivery.messages] };
-			},
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				participant: {
+					settle: () =>
+						failDelivery && delivery.kind === "steer"
+							? { outcome: "retained", error: new Error("retained during provider retry") }
+							: { outcome: "committed" },
+				},
+			}),
 		});
 		harness.setResponses([
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
@@ -81,14 +123,14 @@ describe("regression #207: delivery run outcomes", () => {
 
 		expect(retryEnds).toEqual([{ success: false, finalError: "retained during provider retry" }]);
 		expect(retryDecisions).toEqual([true, false]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(harness.getPendingResponseCount()).toBe(1);
 
 		failDelivery = false;
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		expect(retryEnds).toEqual([{ success: false, finalError: "retained during provider retry" }]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 });

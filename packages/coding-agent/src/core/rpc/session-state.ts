@@ -586,10 +586,8 @@ function projectOptionalStateString(value: string | undefined): {
  */
 export function buildRpcSessionState(session: AgentSession): RpcSessionState {
 	const activeCompaction = session.activeCompaction;
-	const activeTools = projectRpcActiveTools(
-		session.agent.state.pendingToolExecutions.values(),
-		session.agent.state.pendingToolExecutions.size,
-	);
+	const activeToolExecutions = session.activeToolExecutions;
+	const activeTools = projectRpcActiveTools(activeToolExecutions.values(), activeToolExecutions.size);
 	const steeringQueue = projectRpcQueuedMessages(
 		typeof session.getSteeringMessages === "function" ? session.getSteeringMessages() : [],
 	);

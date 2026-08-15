@@ -1,4 +1,4 @@
-import { Agent, type ThinkingLevel } from "@hansjm10/volt-agent-core";
+import type { ThinkingLevel } from "@hansjm10/volt-agent-core";
 import { type Model, registerFauxProvider } from "@hansjm10/volt-ai";
 import { describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
@@ -7,7 +7,7 @@ import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
-import { createTestResourceLoader } from "./utilities.ts";
+import { createTestAgentSessionRuntimeConfig, createTestResourceLoader } from "./utilities.ts";
 
 type ProfileSelectorContext = {
 	settingsManager: {
@@ -395,15 +395,7 @@ describe("InteractiveMode profile selector", () => {
 			{ profile: "previous" },
 		);
 		const session = new AgentSession({
-			agent: new Agent({
-				getApiKey: () => "test-key",
-				initialState: {
-					model: previousModel,
-					systemPrompt: "You are a helpful assistant.",
-					tools: [],
-					thinkingLevel: "off",
-				},
-			}),
+			...createTestAgentSessionRuntimeConfig({ model: previousModel }),
 			sessionManager: SessionManager.inMemory(),
 			settingsManager,
 			cwd: process.cwd(),
@@ -507,15 +499,7 @@ describe("InteractiveMode profile selector", () => {
 			{ profile: "fast" },
 		);
 		const session = new AgentSession({
-			agent: new Agent({
-				getApiKey: () => "test-key",
-				initialState: {
-					model: reasoningModel,
-					systemPrompt: "You are a helpful assistant.",
-					tools: [],
-					thinkingLevel: "low",
-				},
-			}),
+			...createTestAgentSessionRuntimeConfig({ model: reasoningModel, thinkingLevel: "low" }),
 			sessionManager: SessionManager.inMemory(),
 			settingsManager,
 			cwd: process.cwd(),

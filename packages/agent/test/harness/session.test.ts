@@ -14,6 +14,150 @@ async function runSessionSuite(
 	inspect?: () => void,
 ) {
 	describe(name, () => {
+		it("commits guarded batches and resolves only store-issued receipts", async () => {
+			const session = new Session(await createStorage());
+			const basis = await session.getBranchSnapshot();
+			const result = await session.commitBatch({
+				guard: { kind: "exact", cursor: basis.cursor },
+				deliveryAttribution: { deliveryId: "delivery-1", epoch: 2, attemptId: "attempt-3" },
+				mutations: [
+					{ kind: "append", entry: { type: "message", message: createUserMessage("one") } },
+					{ kind: "append", entry: { type: "custom", customType: "host-only", data: { ok: true } } },
+				],
+			});
+			expect(result.outcome).toBe("committed");
+			if (result.outcome !== "committed") return;
+			expect(result.appendedEntryIds).toHaveLength(2);
+			expect(result.advance).toMatchObject({
+				branchRelation: "descendant",
+				messages: { kind: "append", values: [{ role: "user" }] },
+			});
+			expect(session.resolveMutationReceipt(result.receipt)).toEqual({
+				advance: result.advance,
+				appendedEntryIds: result.appendedEntryIds,
+				deliveryAttribution: { deliveryId: "delivery-1", epoch: 2, attemptId: "attempt-3" },
+			});
+			const otherSession = new Session(await createStorage());
+			expect(otherSession.resolveMutationReceipt(result.receipt)).toBeUndefined();
+		});
+
+		it("rolls back stale exact guards and receipts isolate descendant batch effects", async () => {
+			const session = new Session(await createStorage());
+			const basis = await session.getBranchSnapshot();
+			await session.appendMessage(createUserMessage("one"));
+			const exact = await session.commitBatch({
+				guard: { kind: "exact", cursor: basis.cursor },
+				mutations: [{ kind: "append", entry: { type: "custom", customType: "exact" } }],
+			});
+			expect(exact).toMatchObject({ outcome: "rolled_back", error: { code: "conflict" } });
+			const descendant = await session.commitBatch({
+				guard: { kind: "descendant", cursor: basis.cursor },
+				mutations: [{ kind: "append", entry: { type: "custom", customType: "tail" } }],
+			});
+			expect(descendant).toMatchObject({
+				outcome: "committed",
+				advance: { branchRelation: "descendant", messages: { kind: "unchanged" } },
+			});
+			if (descendant.outcome !== "committed") return;
+			expect(session.resolveMutationReceipt(descendant.receipt)?.advance).toMatchObject({
+				branchRelation: "descendant",
+				messages: { kind: "unchanged" },
+			});
+			expect(await session.advanceProjection(basis.cursor)).toMatchObject({
+				branchRelation: "descendant",
+				messages: { kind: "append", values: [{ role: "user" }] },
+			});
+		});
+
+		it("atomically moves, summarizes, and labels the generated summary", async () => {
+			const session = new Session(await createStorage());
+			const root = await session.appendMessage(createUserMessage("root"));
+			await session.appendMessage(createAssistantMessage("old branch"));
+			const basis = await session.getBranchSnapshot();
+			const result = await session.commitBatch({
+				guard: { kind: "exact", cursor: basis.cursor },
+				mutations: [
+					{
+						kind: "move_with_summary",
+						leafId: root,
+						summary: { summary: "abandoned work", label: "checkpoint" },
+					},
+				],
+			});
+			expect(result.outcome).toBe("committed");
+			if (result.outcome !== "committed") return;
+			const committedEntries = await Promise.all(result.appendedEntryIds.map((id) => session.getEntry(id)));
+			const summary = committedEntries.find((entry) => entry?.type === "branch_summary");
+			expect(summary).toMatchObject({ type: "branch_summary", parentId: root, summary: "abandoned work" });
+			expect(await session.getLabel(summary!.id)).toBe("checkpoint");
+			expect((await session.buildContext()).messages.map((message) => message.role)).toEqual([
+				"user",
+				"branchSummary",
+			]);
+		});
+
+		it("issues attributed no-effect receipts without appending entries", async () => {
+			const session = new Session(await createStorage());
+			const basis = await session.getBranchSnapshot();
+			const result = await session.commitBatch({
+				guard: { kind: "exact", cursor: basis.cursor },
+				deliveryAttribution: { deliveryId: "delivery-1", epoch: 1, attemptId: "attempt-1" },
+				mutations: [],
+			});
+			expect(result).toMatchObject({
+				outcome: "committed",
+				advance: { branchRelation: "same", messages: { kind: "unchanged" } },
+				appendedEntryIds: [],
+			});
+			if (result.outcome !== "committed") return;
+			expect(session.resolveMutationReceipt(result.receipt)?.deliveryAttribution).toEqual({
+				deliveryId: "delivery-1",
+				epoch: 1,
+				attemptId: "attempt-1",
+			});
+			expect(await session.getEntries()).toEqual([]);
+		});
+
+		it("classifies provider-inert policy advances without object identity checks", async () => {
+			const session = new Session(await createStorage());
+			await session.appendMessage(createUserMessage("one"));
+			const basis = await session.getBranchSnapshot();
+			await session.appendCustomEntry("host-only", { ok: true });
+			let advance = await session.advanceProjection(basis.cursor);
+			expect(advance).toMatchObject({
+				branchRelation: "descendant",
+				messages: { kind: "unchanged" },
+				persistedPolicyChanged: false,
+			});
+			await session.appendModelChange("openai", "gpt-4.1");
+			advance = await session.advanceProjection(basis.cursor);
+			expect(advance).toMatchObject({
+				messages: { kind: "unchanged" },
+				persistedPolicy: { model: { provider: "openai", modelId: "gpt-4.1" } },
+				persistedPolicyChanged: true,
+			});
+		});
+
+		it("classifies branch divergence and compaction as rewrites", async () => {
+			const session = new Session(await createStorage());
+			const root = await session.appendMessage(createUserMessage("root"));
+			await session.appendMessage(createAssistantMessage("old"));
+			const oldBranch = await session.getBranchSnapshot();
+			await session.moveTo(root);
+			await session.appendMessage(createAssistantMessage("new"));
+			expect(await session.advanceProjection(oldBranch.cursor)).toMatchObject({
+				branchRelation: "diverged",
+				messages: { kind: "rewrite", values: [{ role: "user" }, { role: "assistant" }] },
+			});
+
+			const beforeCompaction = await session.getBranchSnapshot();
+			await session.appendCompaction("summary", root, 100);
+			expect(await session.advanceProjection(beforeCompaction.cursor)).toMatchObject({
+				branchRelation: "descendant",
+				messages: { kind: "rewrite" },
+			});
+		});
+
 		it("appends messages and builds context in order", async () => {
 			const session = new Session(await createStorage());
 			await session.appendMessage(createUserMessage("one"));

@@ -1,21 +1,22 @@
-import type { AgentRunResult } from "@hansjm10/volt-agent-core";
+import type { AgentEvent, AgentMessage, AgentRunResult } from "@hansjm10/volt-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
 	estimateToolDefinitionTokens,
 	fauxAssistantMessage,
 	fauxToolCall,
-	type Model,
 } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateMessagesTokens } from "../../src/core/compaction/index.ts";
-import { createHarness, type Harness } from "./harness.ts";
+import type { SessionManager } from "../../src/core/session-manager.ts";
+import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
 	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
 	_shouldStopForProactiveCompaction: (context: unknown) => boolean;
 	_handlePostAgentRun: (result: AgentRunResult) => Promise<boolean>;
+	_handleAgentEvent: (event: AgentEvent) => Promise<AgentMessage | undefined>;
 	_lastAssistantMessage: AssistantMessage | undefined;
 	_proactiveCompactionState: "idle" | "scheduled" | "compacting";
 };
@@ -56,7 +57,7 @@ function createAssistant(
 
 function useSummaryStreamFn(harness: Harness, summary: string): () => number {
 	let callCount = 0;
-	harness.session.agent.streamFn = (model) => {
+	harness.control.setStreamFn((model) => {
 		callCount++;
 		const stream = createAssistantMessageEventStream();
 		queueMicrotask(() => {
@@ -70,7 +71,7 @@ function useSummaryStreamFn(harness: Harness, summary: string): () => number {
 			stream.push({ type: "done", seq: 1, reason: "stop", message });
 		});
 		return stream;
-	};
+	});
 	return () => callCount;
 }
 
@@ -80,7 +81,7 @@ function useSummaryResponses(
 	onOptions?: (options: { reasoning?: string } | undefined) => void,
 ): () => number {
 	let callCount = 0;
-	harness.session.agent.streamFn = (model, _context, options) => {
+	harness.control.setStreamFn((model, _context, options) => {
 		const response = responses[Math.min(callCount, responses.length - 1)];
 		callCount += 1;
 		onOptions?.(options);
@@ -99,7 +100,7 @@ function useSummaryResponses(
 			});
 		});
 		return stream;
-	};
+	});
 	return () => callCount;
 }
 
@@ -117,7 +118,13 @@ function seedCompactableSession(harness: Harness): void {
 			timestamp: now - 500,
 		}),
 	);
-	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+}
+
+function appendMessages(
+	harness: Harness,
+	messages: ReadonlyArray<Parameters<SessionManager["appendMessage"]>[0]>,
+): void {
+	for (const message of messages) harness.sessionManager.appendMessage(message);
 }
 
 describe("AgentSession compaction characterization", () => {
@@ -157,11 +164,94 @@ describe("AgentSession compaction characterization", () => {
 		expect(result.summary).toBe("summary from extension");
 		expect(result.tokensBefore).toBe(999);
 		expect(result.estimatedTokensAfter).toBe(
-			estimateMessagesTokens(harness.session.messages) +
-				estimateToolDefinitionTokens(harness.session.agent.state.tools),
+			estimateMessagesTokens(harness.session.messages) + estimateToolDefinitionTokens(harness.session.state.tools),
 		);
 		expect(compactionEntries).toHaveLength(1);
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
+	});
+
+	it("does not install a dormant projection after manual compaction without continuation work", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(volt) => {
+					volt.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "idle compaction summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+
+		await harness.session.compact();
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "after idle compaction" }],
+			timestamp: Date.now(),
+		});
+		await harness.sessionManager.flush();
+		let requestTexts: string[] = [];
+		harness.setResponses([
+			(context) => {
+				requestTexts = (context.messages as AgentMessage[]).map(getMessageText);
+				return fauxAssistantMessage("continued from canonical context");
+			},
+		]);
+
+		await expect(harness.control.continue()).resolves.toMatchObject({ status: "completed" });
+		expect(requestTexts).toContain("after idle compaction");
+	});
+
+	it("rebases a retained direct prompt immediately after manual compaction", async () => {
+		let retain = true;
+		const harness = await createHarness({
+			prepareDelivery: (delivery) => ({
+				messages: [...delivery.messages],
+				participant: {
+					settle: () =>
+						retain ? { outcome: "retained", error: new Error("compact before retry") } : { outcome: "committed" },
+				},
+			}),
+			extensionFactories: [
+				(volt) => {
+					volt.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "manual retained summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const clientMessageId = "retained-manual-compaction";
+
+		await expect(
+			harness.session.prompt("retained after compaction", { clientMessageId, source: "rpc" }),
+		).rejects.toThrow("compact before retry");
+		expect(harness.control.hasPendingPrompt()).toBe(true);
+		await harness.session.compact();
+		expect(harness.control.hasPendingPrompt()).toBe(true);
+
+		const providerTexts: string[][] = [];
+		harness.setResponses([
+			(context) => {
+				providerTexts.push((context.messages as AgentMessage[]).map(getMessageText));
+				return fauxAssistantMessage("committed after compaction");
+			},
+		]);
+		retain = false;
+		await harness.session.prompt("retained after compaction", { clientMessageId, source: "rpc" });
+
+		expect(providerTexts.flat().some((text) => text.includes("manual retained summary"))).toBe(true);
+		expect(providerTexts.flat().filter((text) => text === "retained after compaction")).toHaveLength(1);
+		expect(harness.control.hasPendingPrompt()).toBe(false);
 	});
 
 	it("rejects invalid extension compaction details before appending", async () => {
@@ -192,16 +282,16 @@ describe("AgentSession compaction characterization", () => {
 	it("throws when compacting without a model", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.session.agent.state.model = undefined as unknown as Model<any>;
+		await harness.control.setModel(undefined);
 
 		await expect(harness.session.compact()).rejects.toThrow("No model selected");
 	});
 
-	it("throws when compacting without configured auth", async () => {
+	it("rejects a too-small compaction before Harness provider admission", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 
-		await expect(harness.session.compact()).rejects.toThrow(`No API key found for ${harness.getModel().provider}.`);
+		await expect(harness.session.compact()).rejects.toThrow("Nothing to compact (session too small)");
 	});
 
 	it("manually compacts with a custom streamFn when registry auth is absent", async () => {
@@ -275,11 +365,11 @@ describe("AgentSession compaction characterization", () => {
 		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
-		harness.session.agent.state.model = {
-			...harness.session.agent.state.model,
+		await harness.control.setModel({
+			...harness.getModel(),
 			thinkingLevelMap: { off: "none", minimal: null, xhigh: "xhigh", max: "max" },
-		};
-		harness.session.agent.state.thinkingLevel = "xhigh";
+		});
+		await harness.control.setThinkingLevel("xhigh");
 		const reasoningLevels: Array<string | undefined> = [];
 		useSummaryResponses(harness, [fauxAssistantMessage("minimal summary")], (options) => {
 			reasoningLevels.push(options?.reasoning);
@@ -381,6 +471,17 @@ describe("AgentSession compaction characterization", () => {
 		await expect(sessionInternals._handlePostAgentRun({ status: "completed", deliveries: [] })).resolves.toBe(false);
 	});
 
+	it("clears scheduled proactive compaction when a later policy starts a request", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		sessionInternals._proactiveCompactionState = "scheduled";
+
+		await sessionInternals._handleAgentEvent({ type: "turn_start" });
+
+		expect(sessionInternals._proactiveCompactionState).toBe("idle");
+	});
+
 	it("excludes a stripped trailing error message from estimatedTokensAfter when retrying", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
@@ -393,7 +494,6 @@ describe("AgentSession compaction characterization", () => {
 			}),
 			content: [{ type: "text", text: "partial output ".repeat(50) }],
 		});
-		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 		useSummaryStreamFn(harness, "overflow summary");
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 		const estimates: (number | undefined)[] = [];
@@ -405,14 +505,43 @@ describe("AgentSession compaction characterization", () => {
 
 		await expect(sessionInternals._runAutoCompaction("overflow", true)).resolves.toBe(true);
 
-		const retained = harness.session.agent.state.messages;
+		const canonical = harness.session.state.messages;
+		expect(
+			canonical.some(
+				(message) => message.role === "assistant" && (message as AssistantMessage).stopReason === "error",
+			),
+		).toBe(true);
+		let retained: AgentMessage[] = [];
+		harness.control.setStreamFn((model, context) => {
+			retained = context.messages as AgentMessage[];
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					seq: 1,
+					reason: "stop",
+					message: {
+						...fauxAssistantMessage("continued after compaction"),
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+					},
+				});
+			});
+			return stream;
+		});
+		await harness.control.continue();
 		expect(
 			retained.some(
 				(message) => message.role === "assistant" && (message as AssistantMessage).stopReason === "error",
 			),
 		).toBe(false);
+		const expectedRetained = [...canonical];
+		const trailingErrorIndex =
+			expectedRetained.at(-1)?.role === "custom" ? expectedRetained.length - 2 : expectedRetained.length - 1;
+		expectedRetained.splice(trailingErrorIndex, 1);
 		expect(estimates.at(-1)).toBe(
-			estimateMessagesTokens(retained) + estimateToolDefinitionTokens(harness.session.agent.state.tools),
+			estimateMessagesTokens(expectedRetained) + estimateToolDefinitionTokens(harness.session.state.tools),
 		);
 	});
 
@@ -462,7 +591,7 @@ describe("AgentSession compaction characterization", () => {
 		await harness.session.prompt("first");
 		await harness.session.prompt("second");
 
-		harness.session.agent.followUp({
+		harness.control.queueFollowUp({
 			role: "custom",
 			customType: "test",
 			content: [{ type: "text", text: "queued custom" }],
@@ -502,7 +631,7 @@ describe("AgentSession compaction characterization", () => {
 								timestamp: Date.now(),
 							},
 						];
-			harness.session.agent.followUp({
+			harness.control.queueFollowUp({
 				role: "user",
 				content: [{ type: "text", text: "queued follow-up" }],
 				timestamp: Date.now(),
@@ -603,12 +732,12 @@ describe("AgentSession compaction characterization", () => {
 			errorMessage: "529 overloaded",
 			timestamp: Date.now() + 1000,
 		});
-		harness.session.agent.state.messages = [
+		appendMessages(harness, [
 			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
 			successfulAssistant,
 			{ role: "user", content: [{ type: "text", text: "retry" }], timestamp: Date.now() + 500 },
 			errorAssistant,
-		];
+		]);
 
 		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 
@@ -626,10 +755,10 @@ describe("AgentSession compaction characterization", () => {
 			errorMessage: "529 overloaded",
 			timestamp: Date.now(),
 		});
-		harness.session.agent.state.messages = [
+		appendMessages(harness, [
 			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
 			errorAssistant,
-		];
+		]);
 
 		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 
@@ -669,12 +798,10 @@ describe("AgentSession compaction characterization", () => {
 			errorMessage: "529 overloaded",
 			timestamp: Date.now(),
 		});
-		harness.session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "kept user" }], timestamp: preCompactionTimestamp - 1000 },
-			keptAssistant,
+		appendMessages(harness, [
 			{ role: "user", content: [{ type: "text", text: "new prompt" }], timestamp: Date.now() - 500 },
 			errorAssistant,
-		];
+		]);
 
 		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 

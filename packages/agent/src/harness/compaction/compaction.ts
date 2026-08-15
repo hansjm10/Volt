@@ -1,6 +1,6 @@
 import type { AssistantMessage, ImageContent, JsonValue, Model, TextContent, Tool, Usage } from "@hansjm10/volt-ai";
-import { completeSimple, estimateToolDefinitionTokens } from "@hansjm10/volt-ai";
-import type { AgentMessage, ThinkingLevel } from "../../types.ts";
+import { estimateToolDefinitionTokens, streamSimple } from "@hansjm10/volt-ai";
+import type { AgentMessage, StreamFn, ThinkingLevel } from "../../types.ts";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -478,12 +478,13 @@ export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
 	reserveTokens: number,
-	apiKey: string,
+	apiKey?: string,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	customInstructions?: string,
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
+	streamFn: StreamFn = streamSimple,
 ): Promise<Result<string, CompactionError>> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
@@ -511,17 +512,18 @@ export async function generateSummary(
 
 	const completionOptions = {
 		maxTokens,
-		apiKey,
+		...(apiKey === undefined ? {} : { apiKey }),
 		...(signal === undefined ? {} : { signal }),
 		...(headers === undefined ? {} : { headers }),
 		...(model.reasoning && thinkingLevel && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
 	};
 
-	const response = await completeSimple(
+	const stream = await streamFn(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		completionOptions,
 	);
+	const response = await stream.result();
 	if (response.stopReason === "aborted") {
 		return err(new CompactionError("aborted", response.errorMessage || "Summarization aborted"));
 	}
@@ -666,11 +668,12 @@ export { serializeConversation } from "./utils.ts";
 export async function compact(
 	preparation: CompactionPreparation,
 	model: Model<any>,
-	apiKey: string,
+	apiKey?: string,
 	headers?: Record<string, string>,
 	customInstructions?: string,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	streamFn: StreamFn = streamSimple,
 ): Promise<Result<CompactionResult<CompactionDetails> & { details: CompactionDetails }, CompactionError>> {
 	const {
 		firstKeptEntryId,
@@ -702,6 +705,7 @@ export async function compact(
 						customInstructions,
 						previousSummary,
 						thinkingLevel,
+						streamFn,
 					)
 				: Promise.resolve(ok<string, CompactionError>("No prior history.")),
 			generateTurnPrefixSummary(
@@ -712,6 +716,7 @@ export async function compact(
 				headers,
 				signal,
 				thinkingLevel,
+				streamFn,
 			),
 		]);
 		if (!historyResult.ok) return err(historyResult.error);
@@ -728,6 +733,7 @@ export async function compact(
 			customInstructions,
 			previousSummary,
 			thinkingLevel,
+			streamFn,
 		);
 		if (!summaryResult.ok) return err(summaryResult.error);
 		summary = summaryResult.value;
@@ -747,10 +753,11 @@ async function generateTurnPrefixSummary(
 	messages: AgentMessage[],
 	model: Model<any>,
 	reserveTokens: number,
-	apiKey: string,
-	headers?: Record<string, string>,
-	signal?: AbortSignal,
-	thinkingLevel?: ThinkingLevel,
+	apiKey: string | undefined,
+	headers: Record<string, string> | undefined,
+	signal: AbortSignal | undefined,
+	thinkingLevel: ThinkingLevel | undefined,
+	streamFn: StreamFn,
 ): Promise<Result<string, CompactionError>> {
 	const maxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
@@ -767,17 +774,18 @@ async function generateTurnPrefixSummary(
 		},
 	];
 
-	const response = await completeSimple(
+	const stream = await streamFn(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		{
 			maxTokens,
-			apiKey,
+			...(apiKey === undefined ? {} : { apiKey }),
 			...(signal === undefined ? {} : { signal }),
 			...(headers === undefined ? {} : { headers }),
 			...(model.reasoning && thinkingLevel && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
 		},
 	);
+	const response = await stream.result();
 	if (response.stopReason === "aborted") {
 		return err(new CompactionError("aborted", response.errorMessage || "Turn prefix summarization aborted"));
 	}

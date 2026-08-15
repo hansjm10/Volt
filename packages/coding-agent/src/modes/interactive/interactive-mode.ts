@@ -566,9 +566,6 @@ export class InteractiveMode {
 	private get session(): AgentSession {
 		return this.runtimeHost.session;
 	}
-	private get agent() {
-		return this.session.agent;
-	}
 	private get sessionManager() {
 		return this.session.sessionManager;
 	}
@@ -2274,7 +2271,7 @@ export class InteractiveMode {
 			model: this.session.model,
 			isIdle: () => !this.session.isBusy,
 			isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
-			signal: this.session.agent.signal,
+			signal: this.session.signal,
 			abort: () => {
 				void this.restoreQueuedMessagesToEditor({ abortSource: "host_action" }).catch((error) => {
 					this.showError(`Failed to persist queued-message cancellation: ${String(error)}`);
@@ -4977,7 +4974,9 @@ export class InteractiveMode {
 			throw error;
 		} finally {
 			if (options?.abortSource) {
-				this.agent.abort(options.abortSource);
+				void this.session.abort(options.abortSource).catch((error: unknown) => {
+					this.showError(`Failed to abort the active run: ${String(error)}`);
+				});
 			}
 		}
 		return this.putQueuedTextInEditor([...queues.steering, ...queues.followUp], options?.currentText);
@@ -5302,7 +5301,7 @@ export class InteractiveMode {
 					},
 					onTransportChange: (transport) => {
 						this.settingsManager.setTransport(transport);
-						this.session.agent.transport = transport;
+						this.session.setTransport(transport);
 					},
 					onHttpIdleTimeoutMsChange: (timeoutMs) => {
 						this.settingsManager.setHttpIdleTimeoutMs(timeoutMs);
@@ -6022,14 +6021,14 @@ export class InteractiveMode {
 		}
 	}
 
-	private applyProfileDefaultThinkingLevel(thinkingLevelOverride?: ThinkingLevel): boolean {
+	private async applyProfileDefaultThinkingLevel(thinkingLevelOverride?: ThinkingLevel): Promise<boolean> {
 		const defaultThinkingLevel = thinkingLevelOverride ?? this.settingsManager.getDefaultThinkingLevel();
 		if (defaultThinkingLevel === undefined) {
 			return false;
 		}
 
 		const previousThinkingLevel = this.session.thinkingLevel;
-		this.session.setThinkingLevel(defaultThinkingLevel, { persistDefault: false });
+		await this.session.setThinkingLevel(defaultThinkingLevel, { persistDefault: false });
 		return this.session.thinkingLevel !== previousThinkingLevel;
 	}
 
@@ -6050,7 +6049,7 @@ export class InteractiveMode {
 				}
 				try {
 					await this.session.setModel(selectedScopedModel.model, { persistDefault: false });
-					this.applyProfileDefaultThinkingLevel(selectedScopedModel.thinkingLevel);
+					await this.applyProfileDefaultThinkingLevel(selectedScopedModel.thinkingLevel);
 					this.footer.invalidate();
 					this.updateEditorBorderColor();
 					void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedScopedModel.model);
@@ -6062,7 +6061,7 @@ export class InteractiveMode {
 				}
 				return;
 			}
-			if (this.applyProfileDefaultThinkingLevel(selectedScopedModel?.thinkingLevel)) {
+			if (await this.applyProfileDefaultThinkingLevel(selectedScopedModel?.thinkingLevel)) {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 			}
@@ -6087,7 +6086,7 @@ export class InteractiveMode {
 		const selectedThinkingLevel = selectedScopedModel?.thinkingLevel;
 
 		if (modelsAreEqual(this.session.model, selectedModel)) {
-			if (this.applyProfileDefaultThinkingLevel(selectedThinkingLevel)) {
+			if (await this.applyProfileDefaultThinkingLevel(selectedThinkingLevel)) {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 			}
@@ -6102,7 +6101,7 @@ export class InteractiveMode {
 
 		try {
 			await this.session.setModel(selectedModel, { persistDefault: false });
-			this.applyProfileDefaultThinkingLevel(selectedThinkingLevel);
+			await this.applyProfileDefaultThinkingLevel(selectedThinkingLevel);
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
 			void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel);
@@ -7263,7 +7262,7 @@ export class InteractiveMode {
 		try {
 			await this.session.reload();
 			configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
-			this.session.agent.transport = this.settingsManager.getTransport();
+			this.session.setTransport(this.settingsManager.getTransport());
 			this.keybindings.reload();
 			const activeHeader = this.customHeader ?? this.builtInHeader;
 			if (isExpandable(activeHeader)) {

@@ -31,9 +31,9 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 
 		// Build conversation: u1 -> a1 -> u2 -> a2
 		await session.prompt("First message");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 		await session.prompt("Second message");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Get tree entries
 		const tree = session.sessionManager.getTree();
@@ -58,7 +58,7 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 
 		// Build conversation
 		await session.prompt("Hello");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Get the assistant message
 		const entries = sessionManager.getEntries();
@@ -80,9 +80,9 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 
 		// Build conversation: u1 -> a1 -> u2 -> a2
 		await session.prompt("What is 2+2?");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 		await session.prompt("What is 3+3?");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Get tree and find first user message
 		const tree = sessionManager.getTree();
@@ -110,11 +110,11 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 
 		// Build conversation: u1 -> a1 -> u2 -> a2 -> u3 -> a3
 		await session.prompt("Message one");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 		await session.prompt("Message two");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 		await session.prompt("Message three");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Get the second user message (u2)
 		const entries = sessionManager.getEntries();
@@ -149,9 +149,9 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 
 		// Build conversation: u1 -> a1 -> u2 -> a2
 		await session.prompt("Hello");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 		await session.prompt("Goodbye");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Get the first assistant message (a1)
 		const entries = sessionManager.getEntries();
@@ -177,9 +177,9 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 
 		// Build conversation
 		await session.prompt("Tell me about something");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 		await session.prompt("Continue");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		const entriesBefore = sessionManager.getEntries();
 		const leafBefore = sessionManager.getLeafId();
@@ -216,9 +216,9 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 
 		// Build conversation
 		await session.prompt("First");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 		await session.prompt("Second");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		const entriesBefore = sessionManager.getEntries().length;
 
@@ -240,7 +240,7 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 
 		// Build conversation
 		await session.prompt("Hello");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		const leafBefore = sessionManager.getLeafId();
 		expect(leafBefore).toBeTruthy();
@@ -259,7 +259,7 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 
 		// Build conversation
 		await session.prompt("What is TypeScript?");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Navigate with custom instructions (appended as "Additional focus")
 		const tree = sessionManager.getTree();
@@ -294,9 +294,9 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation - branch scenarios", () 
 
 		// Build main path: u1 -> a1 -> u2 -> a2
 		await session.prompt("Main branch start");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 		await session.prompt("Main branch continue");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Get a1 id for branching
 		const entries = sessionManager.getEntries();
@@ -305,7 +305,7 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation - branch scenarios", () 
 		// Create a branch from a1: a1 -> u3 -> a3
 		sessionManager.branch(a1!.id);
 		await session.prompt("Branch path");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Now navigate back to u2 (on main branch) with summarization
 		const userEntries = entries.filter((e) => e.type === "message" && e.message.role === "user");

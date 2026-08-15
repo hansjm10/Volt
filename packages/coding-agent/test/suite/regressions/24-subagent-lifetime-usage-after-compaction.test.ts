@@ -77,7 +77,6 @@ describe("issue #24", () => {
 			harness.sessionManager.appendMessage(third);
 			harness.sessionManager.appendMessage(createToolResult("read-4", 11));
 			harness.sessionManager.appendMessage(final);
-			harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 
 			const definition: SubagentDefinition = {
 				name: "researcher",

@@ -1,13 +1,27 @@
 import type {
 	ImageContent,
+	InferenceSpeed,
 	JsonObject,
 	JsonValue,
+	Message,
 	Model,
+	ProviderEnv,
 	SimpleStreamOptions,
 	TextContent,
+	ThinkingBudgets,
 	Transport,
 } from "@hansjm10/volt-ai";
-import type { AgentEvent, AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "../index.ts";
+import type {
+	AgentDeliveryOwner,
+	AgentEvent,
+	AgentLoopNextAction,
+	AgentLoopNextActionContext,
+	AgentMessage,
+	AgentTool,
+	QueueMode,
+	StreamFn,
+	ThinkingLevel,
+} from "../index.ts";
 import type { Session } from "./session/session.ts";
 
 /** Result of a fallible operation. Expected failures are returned as `ok: false` instead of thrown. */
@@ -91,10 +105,18 @@ export interface AgentHarnessStreamOptions {
 	transport?: Transport;
 	/** Provider request timeout in milliseconds. */
 	timeoutMs?: number;
+	/** WebSocket connection/open timeout in milliseconds. */
+	websocketConnectTimeoutMs?: number;
 	/** Maximum provider retry attempts. */
 	maxRetries?: number;
 	/** Optional cap for provider-requested retry delays. */
 	maxRetryDelayMs?: number;
+	/** Provider-neutral inference speed preference. */
+	inferenceSpeed?: InferenceSpeed;
+	/** Per-level thinking token budgets. */
+	thinkingBudgets?: ThinkingBudgets;
+	/** Provider-scoped environment overrides. */
+	env?: ProviderEnv;
 	/** Additional request headers merged with auth and lifecycle headers. */
 	headers?: Record<string, string>;
 	/** Provider metadata forwarded with requests. */
@@ -109,10 +131,18 @@ export interface AgentHarnessStreamOptionsPatch {
 	transport?: Transport | undefined;
 	/** Timeout patch. Explicit `undefined` clears the configured timeout. */
 	timeoutMs?: number | undefined;
+	/** WebSocket connection timeout patch. */
+	websocketConnectTimeoutMs?: number | undefined;
 	/** Retry-count patch. Explicit `undefined` clears the configured retry count. */
 	maxRetries?: number | undefined;
 	/** Retry-delay patch. Explicit `undefined` clears the configured retry-delay cap. */
 	maxRetryDelayMs?: number | undefined;
+	/** Inference-speed patch. */
+	inferenceSpeed?: InferenceSpeed | undefined;
+	/** Thinking-budget replacement. */
+	thinkingBudgets?: ThinkingBudgets | undefined;
+	/** Provider environment patch. `undefined` values delete keys. */
+	env?: Record<string, string | undefined> | undefined;
 	/** Cache-retention patch. Explicit `undefined` clears the configured hint. */
 	cacheRetention?: SimpleStreamOptions["cacheRetention"] | undefined;
 	/** Header patch. `undefined` values delete keys; explicit `headers: undefined` clears all headers. */
@@ -206,6 +236,8 @@ export type SessionErrorCode =
 	| "invalid_session"
 	| "invalid_entry"
 	| "invalid_fork_target"
+	| "conflict"
+	| "authority_retired"
 	| "storage"
 	| "unknown";
 
@@ -227,6 +259,7 @@ export type AgentHarnessErrorCode =
 	| "invalid_argument"
 	| "session"
 	| "hook"
+	| "delivery"
 	| "auth"
 	| "compaction"
 	| "branch_summary"
@@ -441,11 +474,134 @@ export interface SessionContext {
 	thinkingLevel: string;
 	model: { provider: string; modelId: string } | null;
 	activeToolNames: string[] | null;
+	/** Canonical branch leaf used only to validate an ephemeral context projection. */
+	anchorLeafId: string | null;
 }
 
 export interface SessionMetadata {
 	id: string;
 	createdAt: string;
+}
+
+declare const projectionCursorBrand: unique symbol;
+
+/** Store-issued identity for one revision of one canonical session branch. */
+export interface ProjectionCursor {
+	readonly authorityGeneration: string;
+	readonly revision: number;
+	readonly branchIdentity: string | null;
+	readonly [projectionCursorBrand]: never;
+}
+
+/** One atomic canonical branch read. Entries are ordered from root to the cursor leaf. */
+export interface SessionStorageBranchSnapshot {
+	readonly cursor: ProjectionCursor;
+	readonly entries: readonly SessionTreeEntry[];
+}
+
+/** A guard for an atomic session mutation. */
+export type ProjectionGuard =
+	| { readonly kind: "exact"; readonly cursor: ProjectionCursor }
+	| { readonly kind: "descendant"; readonly cursor: ProjectionCursor };
+
+/** Declarative canonical mutation. Storage implementations materialize identity, parent, and timestamp. */
+export type SessionMutation =
+	| { readonly kind: "append"; readonly entry: PendingSessionWrite }
+	| { readonly kind: "move"; readonly leafId: string | null }
+	| {
+			readonly kind: "move_with_summary";
+			readonly leafId: string | null;
+			readonly summary?: {
+				readonly summary: string;
+				readonly details?: JsonValue;
+				readonly fromHook?: boolean;
+				/** Label materialized against the store-generated branch-summary identity. */
+				readonly label?: string;
+			};
+	  };
+
+/** Stable delivery-attempt identity bound into a canonical mutation receipt. */
+export interface SessionDeliveryAttribution {
+	readonly deliveryId: string;
+	readonly epoch: number;
+	readonly attemptId: string;
+}
+
+export interface SessionMutationBatch {
+	readonly guard: ProjectionGuard;
+	readonly mutations: readonly SessionMutation[];
+	readonly deliveryAttribution?: SessionDeliveryAttribution;
+}
+
+declare const sessionMutationReceiptBrand: unique symbol;
+
+/** Opaque capability issued only after a canonical batch is durably committed. */
+export interface SessionMutationReceipt {
+	readonly [sessionMutationReceiptBrand]: never;
+}
+
+/** Store-authenticated details for one committed mutation receipt. */
+export interface SessionMutationReceiptRecord {
+	readonly basis: SessionStorageBranchSnapshot;
+	readonly before: SessionStorageBranchSnapshot;
+	readonly after: SessionStorageBranchSnapshot;
+	readonly appendedEntryIds: readonly string[];
+	readonly deliveryAttribution?: SessionDeliveryAttribution;
+}
+
+export type SessionStorageCommitResult =
+	| {
+			readonly outcome: "committed";
+			readonly receipt: SessionMutationReceipt;
+			readonly record: SessionMutationReceiptRecord;
+	  }
+	| {
+			readonly outcome: "rolled_back";
+			readonly cursor: ProjectionCursor;
+			readonly error: SessionError;
+	  }
+	| { readonly outcome: "uncertain"; readonly error: SessionError };
+
+/** Canonical branch snapshot reduced into provider-visible context. */
+export interface SessionBranchSnapshot extends SessionStorageBranchSnapshot {
+	readonly context: SessionContext;
+}
+
+/** Exact provider projection change between two store-issued cursors. */
+export interface ProjectionAdvance {
+	readonly cursor: ProjectionCursor;
+	readonly branchRelation: "same" | "descendant" | "diverged";
+	readonly messages:
+		| { readonly kind: "unchanged" }
+		| { readonly kind: "append"; readonly values: readonly AgentMessage[] }
+		| { readonly kind: "rewrite"; readonly values: readonly AgentMessage[] };
+	readonly persistedPolicy: {
+		readonly model: SessionContext["model"];
+		readonly thinkingLevel: string;
+		readonly activeToolNames: readonly string[] | null;
+	};
+	readonly persistedPolicyChanged: boolean;
+}
+
+export type CanonicalCommitResult =
+	| {
+			readonly outcome: "committed";
+			readonly advance: ProjectionAdvance;
+			readonly receipt: SessionMutationReceipt;
+			readonly appendedEntryIds: readonly string[];
+	  }
+	| {
+			readonly outcome: "rolled_back";
+			readonly cursor: ProjectionCursor;
+			readonly error: SessionError;
+	  }
+	| { readonly outcome: "uncertain"; readonly error: SessionError };
+
+/** Store-verified canonical result recovered from an opaque commit receipt. */
+export interface ResolvedSessionMutationReceipt {
+	readonly advance: ProjectionAdvance;
+	readonly appendedEntryIds: readonly string[];
+	readonly deliveryAttribution?: SessionDeliveryAttribution;
 }
 
 export interface JsonlSessionMetadata extends SessionMetadata {
@@ -456,11 +612,13 @@ export interface JsonlSessionMetadata extends SessionMetadata {
 
 export interface SessionStorage<TMetadata extends SessionMetadata = SessionMetadata> {
 	getMetadata(): Promise<TMetadata>;
+	/** Atomically snapshot the current branch, or re-read a previously issued cursor. */
+	getBranchSnapshot(cursor?: ProjectionCursor): Promise<SessionStorageBranchSnapshot>;
+	/** Apply a short declarative batch under one canonical mutation lane. */
+	commitBatch(batch: SessionMutationBatch): Promise<SessionStorageCommitResult>;
+	/** Resolve a receipt only when it was issued by this storage authority. */
+	resolveMutationReceipt(receipt: SessionMutationReceipt): SessionMutationReceiptRecord | undefined;
 	getLeafId(): Promise<string | null>;
-	/** Persist a leaf entry that records the active session-tree leaf. */
-	setLeafId(leafId: string | null): Promise<void>;
-	createEntryId(): Promise<string>;
-	appendEntry(entry: SessionTreeEntry): Promise<void>;
 	getEntry(id: string): Promise<SessionTreeEntry | undefined>;
 	findEntries<TType extends SessionTreeEntry["type"]>(
 		type: TType,
@@ -508,8 +666,8 @@ export interface JsonlSessionRepoApi
 
 export type AgentHarnessPhase = "idle" | "turn" | "compaction" | "branch_summary" | "retry";
 
-export type PendingSessionWrite = SessionTreeEntry extends infer TEntry
-	? TEntry extends SessionTreeEntry
+export type PendingSessionWrite = Exclude<SessionTreeEntry, LeafEntry> extends infer TEntry
+	? TEntry extends Exclude<SessionTreeEntry, LeafEntry>
 		? Omit<TEntry, "id" | "parentId" | "timestamp">
 		: never
 	: never;
@@ -526,12 +684,6 @@ export interface SavePointEvent {
 	hadPendingMutations: boolean;
 }
 
-export interface AbortEvent {
-	type: "abort";
-	clearedSteer: AgentMessage[];
-	clearedFollowUp: AgentMessage[];
-}
-
 export interface SettledEvent {
 	type: "settled";
 	nextTurnCount: number;
@@ -546,11 +698,18 @@ export interface BeforeAgentStartEvent<
 	images?: ImageContent[];
 	systemPrompt: string;
 	resources: AgentHarnessResources<TSkill, TPromptTemplate>;
+	/** Signal for the active bounded run, installed before preflight begins. */
+	signal: AbortSignal;
 }
 
 export interface ContextEvent {
 	type: "context";
 	messages: AgentMessage[];
+}
+
+export interface NextActionEvent extends AgentLoopNextActionContext {
+	type: "next_action";
+	signal: AbortSignal;
 }
 
 export interface BeforeProviderRequestEvent {
@@ -577,6 +736,10 @@ export interface ToolCallEvent {
 	toolCallId: string;
 	toolName: string;
 	input: JsonObject;
+	/** Current block decision from earlier reducers. */
+	block?: boolean;
+	/** Current block reason from earlier reducers. */
+	reason?: string;
 }
 
 export interface ToolResultEvent {
@@ -619,7 +782,7 @@ export interface SessionTreeEvent {
 
 export interface ModelUpdateEvent {
 	type: "model_update";
-	model: Model<any>;
+	model: Model<any> | undefined;
 	previousModel: Model<any> | undefined;
 	source: "set" | "restore";
 }
@@ -654,10 +817,10 @@ export type AgentHarnessOwnEvent<
 > =
 	| QueueUpdateEvent
 	| SavePointEvent
-	| AbortEvent
 	| SettledEvent
 	| BeforeAgentStartEvent<TSkill, TPromptTemplate>
 	| ContextEvent
+	| NextActionEvent
 	| BeforeProviderRequestEvent
 	| BeforeProviderPayloadEvent
 	| AfterProviderResponseEvent
@@ -683,6 +846,10 @@ export interface BeforeAgentStartResult {
 
 export interface ContextResult {
 	messages: AgentMessage[];
+}
+
+export interface MessageEndResult {
+	message: AgentMessage;
 }
 
 export interface BeforeProviderRequestResult {
@@ -721,6 +888,8 @@ export interface SessionBeforeTreeResult {
 export type AgentHarnessEventResultMap = {
 	before_agent_start: BeforeAgentStartResult | undefined;
 	context: ContextResult | undefined;
+	message_end: MessageEndResult | undefined;
+	next_action: AgentLoopNextAction | undefined;
 	before_provider_request: BeforeProviderRequestResult | undefined;
 	before_provider_payload: BeforeProviderPayloadResult | undefined;
 	after_provider_response: undefined;
@@ -736,18 +905,44 @@ export type AgentHarnessEventResultMap = {
 	tools_update: undefined;
 	queue_update: undefined;
 	save_point: undefined;
-	abort: undefined;
 	settled: undefined;
 };
 
-export interface AgentHarnessPromptOptions {
+export type AgentHarnessContextProjectionSource = "explicit" | "retry" | "compaction";
+
+/** Identity and canonical origin of one installed ephemeral context projection. */
+export interface AgentHarnessContextProjectionToken {
+	readonly projectionId: string;
+	readonly source: AgentHarnessContextProjectionSource;
+	readonly anchorLeafId: string | null;
+}
+
+export interface AgentHarnessContextRebaseOptions {
+	readonly source: AgentHarnessContextProjectionSource;
+	/**
+	 * Synchronously derive projected messages from an isolated readonly clone of
+	 * one canonical branch snapshot.
+	 */
+	readonly project?: (messages: readonly AgentMessage[]) => readonly AgentMessage[];
+}
+
+export interface AgentHarnessRunOptions {
+	/** Override the configured system prompt for this bounded run. */
+	systemPrompt?: string;
+	/** Override provider context for this run without changing canonical session history. */
+	context?: readonly AgentMessage[];
+	/** Owner installed before the prompt becomes visible in the delivery inbox. */
+	deliveryOwner?: AgentDeliveryOwner;
+}
+
+export interface AgentHarnessPromptOptions extends AgentHarnessRunOptions {
 	images?: ImageContent[];
 }
 
-export interface AbortResult {
-	clearedSteer: AgentMessage[];
-	clearedFollowUp: AgentMessage[];
-}
+export type AgentHarnessNextActionPolicy = (
+	context: AgentLoopNextActionContext,
+	signal: AbortSignal,
+) => AgentLoopNextAction | undefined | Promise<AgentLoopNextAction | undefined>;
 
 export interface CompactResult {
 	summary: string;
@@ -798,16 +993,6 @@ export interface TreePreparation {
 	label?: string;
 }
 
-export interface GenerateBranchSummaryOptions {
-	model: Model<any>;
-	apiKey: string;
-	headers?: Record<string, string>;
-	signal: AbortSignal;
-	customInstructions?: string;
-	replaceInstructions?: boolean;
-	reserveTokens?: number;
-}
-
 export interface BranchSummaryResult {
 	summary: string;
 	readFiles: string[];
@@ -836,14 +1021,24 @@ export interface AgentHarnessOptions<
 				thinkingLevel: ThinkingLevel;
 				activeTools: TTool[];
 				resources: AgentHarnessResources<TSkill, TPromptTemplate>;
+				signal: AbortSignal;
 		  }) => string | Promise<string>);
 	getApiKeyAndHeaders?: (
 		model: Model<any>,
-	) => Promise<{ apiKey: string; headers?: Record<string, string> } | undefined>;
+	) => Promise<{ apiKey: string; headers?: Record<string, string>; env?: ProviderEnv } | undefined>;
+	/** Base provider stream implementation wrapped by Harness lifecycle policy. */
+	streamFn?: StreamFn;
+	/** Convert application messages into provider-compatible messages. */
+	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** Curated stream/provider request options. Snapshotted at turn start. */
 	streamOptions?: AgentHarnessStreamOptions;
-	model: Model<any>;
+	/** Default owner installed before every high-level delivery admission. */
+	deliveryOwner?: AgentDeliveryOwner;
+	/** May be omitted at construction, but must be set before a model-backed operation starts. */
+	model?: Model<any>;
 	thinkingLevel?: ThinkingLevel;
+	/** Persist active-tool projections through the session. Disable when the host owns that policy outside session context. */
+	persistActiveToolChanges?: boolean;
 	activeToolNames?: string[];
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;

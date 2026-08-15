@@ -391,6 +391,7 @@ describe("harness compaction", () => {
 		const loaded = buildSessionContext([u1, a1, u2, a2, compaction, u3, a3]);
 		expect(loaded.messages).toHaveLength(5);
 		expect(loaded.messages[0]?.role).toBe("compactionSummary");
+		expect(loaded.anchorLeafId).toBe(a3.id);
 	});
 
 	it("tracks model and thinking level changes in built context", () => {

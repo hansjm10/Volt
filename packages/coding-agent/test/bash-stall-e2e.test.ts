@@ -152,7 +152,7 @@ describe.runIf(isPosix && hasPerl)("bash stall detection end to end", () => {
 
 		try {
 			await session.prompt("run the command");
-			await session.agent.waitForIdle();
+			await session.waitForIdle();
 		} finally {
 			clearInterval(watcher);
 		}

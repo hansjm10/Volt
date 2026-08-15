@@ -605,14 +605,14 @@ export class AgentSessionRuntime {
 		) {
 			throw new Error("Stale agent session structural operation");
 		}
+		if (this.session.hasActiveSessionMutation) {
+			throw new Error("Cannot change sessions while a session mutation is active; wait for it to finish");
+		}
 		if (this.session.isStreaming) {
 			throw new Error("Cannot change sessions while an agent run is active; abort or wait for it to finish");
 		}
 		if (this.session.isBashRunning) {
 			throw new Error("Cannot change sessions while a bash run is active; abort or wait for it to finish");
-		}
-		if (this.session.hasActiveSessionMutation) {
-			throw new Error("Cannot change sessions while a session mutation is active; wait for it to finish");
 		}
 	}
 
@@ -699,7 +699,8 @@ export class AgentSessionRuntime {
 		try {
 			await session.disposeSubagentToolManager();
 		} finally {
-			await session.dispose("disposal");
+			session.dispose("disposal");
+			await session.waitForClosed();
 		}
 	}
 
@@ -1534,7 +1535,8 @@ export class AgentSessionRuntime {
 				try {
 					await this.session.disposeSubagentToolManager();
 				} finally {
-					await this.session.dispose("disposal");
+					this.session.dispose("disposal");
+					await this.session.waitForClosed();
 					this.sessionInvalidated = true;
 					this.lifecycleRevision++;
 				}
