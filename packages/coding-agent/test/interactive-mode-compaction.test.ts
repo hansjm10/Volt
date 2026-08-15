@@ -25,9 +25,10 @@ describe("InteractiveMode extension settlement", () => {
 		};
 		const bindCurrentSessionExtensions = Reflect.get(InteractiveMode.prototype, "bindCurrentSessionExtensions") as (
 			this: typeof fakeThis,
+			currentSession: typeof session,
 		) => Promise<void>;
 
-		await bindCurrentSessionExtensions.call(fakeThis);
+		await bindCurrentSessionExtensions.call(fakeThis, session);
 		const options = session.bindExtensions.mock.calls[0]?.[0] as {
 			commandContextActions: { waitForIdle(): Promise<void> };
 			shutdownHandler(): void;

@@ -26,6 +26,7 @@ import type {
 	MarkdownTheme,
 	OverlayHandle,
 	OverlayOptions,
+	RenderSuspensionLease,
 	SlashCommand,
 } from "@hansjm10/volt-tui";
 import {
@@ -420,6 +421,7 @@ export interface InteractiveModeOptions {
 export class InteractiveMode {
 	private runtimeHost: AgentSessionRuntime;
 	private ui: TUI;
+	private sessionRenderSuspension: RenderSuspensionLease | undefined;
 	private chatContainer: Container;
 	private pendingMessagesContainer: Container;
 	private statusContainer: Container;
@@ -578,11 +580,10 @@ export class InteractiveMode {
 		this.options = options;
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
-			this.dismissSubagentInspector?.();
-			this.resetExtensionUI();
+			this.beginSessionReplacementUi();
 		});
-		this.runtimeHost.setRebindSession(async () => {
-			await this.rebindCurrentSession();
+		this.runtimeHost.setRebindSession(async (session) => {
+			await this.rebindReplacementSession(session);
 		});
 		this.version = VERSION;
 		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
@@ -959,7 +960,7 @@ export class InteractiveMode {
 		this.ui.requestRender();
 
 		// Initialize extensions first so resources are shown before messages
-		await this.rebindCurrentSession();
+		await this.rebindCurrentSession(this.session);
 
 		// Render initial messages AFTER showing loaded resources
 		this.renderInitialMessages();
@@ -1653,9 +1654,9 @@ export class InteractiveMode {
 	/**
 	 * Initialize the extension system with TUI-based UI context.
 	 */
-	private async bindCurrentSessionExtensions(): Promise<void> {
+	private async bindCurrentSessionExtensions(session: AgentSession): Promise<void> {
 		const uiContext = this.createExtensionUIContext();
-		await this.session.bindExtensions({
+		await session.bindExtensions({
 			uiContext,
 			mode: "tui",
 			abortHandler: () => {
@@ -1733,10 +1734,10 @@ export class InteractiveMode {
 			},
 		});
 
-		setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
+		setRegisteredThemes(session.resourceLoader.getThemes().themes);
 		this.setupAutocompleteProvider();
 
-		const extensionRunner = this.session.extensionRunner;
+		const extensionRunner = session.extensionRunner;
 		this.setupExtensionShortcuts(extensionRunner);
 		this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		this.showStartupNoticesIfNeeded();
@@ -2161,16 +2162,17 @@ export class InteractiveMode {
 		}
 	}
 
-	private applyRuntimeSettings(): void {
-		configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
-		this.footer.setSession(this.session);
-		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
-		this.footerDataProvider.setGitContextProvider(this.session.gitContextProvider);
-		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
-		this.ui.setShowHardwareCursor(this.settingsManager.getShowHardwareCursor());
-		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
-		const editorPaddingX = this.settingsManager.getEditorPaddingX();
-		const autocompleteMaxVisible = this.settingsManager.getAutocompleteMaxVisible();
+	private applyRuntimeSettings(session: AgentSession): void {
+		const settingsManager = session.settingsManager;
+		configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
+		this.footer.setSession(session);
+		this.footer.setAutoCompactEnabled(session.autoCompactionEnabled);
+		this.footerDataProvider.setGitContextProvider(session.gitContextProvider);
+		this.hideThinkingBlock = settingsManager.getHideThinkingBlock();
+		this.ui.setShowHardwareCursor(settingsManager.getShowHardwareCursor());
+		this.ui.setClearOnShrink(settingsManager.getClearOnShrink());
+		const editorPaddingX = settingsManager.getEditorPaddingX();
+		const autocompleteMaxVisible = settingsManager.getAutocompleteMaxVisible();
 		this.defaultEditor.setPaddingX(editorPaddingX);
 		this.defaultEditor.setAutocompleteMaxVisible(autocompleteMaxVisible);
 		if (this.editor !== this.defaultEditor) {
@@ -2179,13 +2181,33 @@ export class InteractiveMode {
 		}
 	}
 
-	private async rebindCurrentSession(): Promise<void> {
+	private beginSessionReplacementUi(): void {
+		this.sessionRenderSuspension ??= this.ui.suspendRendering();
+		this.dismissSubagentInspector?.();
+		this.resetExtensionUI();
+	}
+
+	private async rebindReplacementSession(session: AgentSession): Promise<void> {
+		await this.rebindCurrentSession(session);
+		this.ui.requestRender(true);
+		const suspension = this.sessionRenderSuspension;
+		this.sessionRenderSuspension = undefined;
+		suspension?.release();
+	}
+
+	private async rebindCurrentSession(session: AgentSession): Promise<void> {
+		if (this.session !== session) {
+			throw new Error("Agent session changed before interactive rebind");
+		}
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
-		this.applyRuntimeSettings();
-		this.session.setHostInteraction(this.createHostInteraction());
-		await this.bindCurrentSessionExtensions();
-		this.subscribeToAgent();
+		this.applyRuntimeSettings(session);
+		session.setHostInteraction(this.createHostInteraction());
+		await this.bindCurrentSessionExtensions(session);
+		if (this.session !== session) {
+			throw new Error("Agent session changed during interactive rebind");
+		}
+		this.subscribeToAgent(session);
 		await this.updateAvailableProviderCount();
 		this.closePlanDetails();
 		this.refreshPlanningUi();
@@ -3652,8 +3674,8 @@ export class InteractiveMode {
 		};
 	}
 
-	private subscribeToAgent(): void {
-		this.unsubscribe = this.session.subscribe(async (event) => {
+	private subscribeToAgent(session: AgentSession): void {
+		this.unsubscribe = session.subscribe(async (event) => {
 			await this.handleEvent(event);
 		});
 	}
