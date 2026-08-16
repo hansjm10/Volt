@@ -142,9 +142,9 @@ export class SessionManagerHarnessStorage implements SessionStorage {
 	private revision = 0;
 	private currentFingerprint: string | undefined;
 	private currentSnapshot: SessionStorageBranchSnapshot | undefined;
-	private readonly snapshots = new Map<ProjectionCursor, SessionStorageBranchSnapshot>();
-	private readonly canonicalTokens = new Map<ProjectionCursor, SessionCanonicalProjectionToken>();
-	private readonly canonicalRevisions = new Map<ProjectionCursor, number>();
+	private readonly snapshots = new WeakMap<ProjectionCursor, SessionStorageBranchSnapshot>();
+	private readonly canonicalTokens = new WeakMap<ProjectionCursor, SessionCanonicalProjectionToken>();
+	private readonly canonicalRevisions = new WeakMap<ProjectionCursor, number>();
 	private readonly mutationReceipts = new WeakMap<SessionMutationReceipt, SessionMutationReceiptRecord>();
 
 	constructor(sessionManager: SessionManager, isRetired: () => boolean = () => false) {
