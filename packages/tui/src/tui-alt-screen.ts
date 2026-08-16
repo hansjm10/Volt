@@ -318,26 +318,61 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	protected override afterTerminalStop(options: TuiStopOptions): void {
 		if (!this.altScreenActive) return;
 		this.altScreenActive = false;
-		if (options.preserveScreen) {
-			this.terminal.write(`${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}\x1b[?25h${END_SYNCHRONIZED_OUTPUT}`);
-		} else {
-			const width = Math.max(1, this.terminal.columns);
-			const documentLines = this.render(width).map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
-			this.lastDocument = this.applyLineResets(documentLines.map((line) => line.replaceAll(CURSOR_MARKER, ""))).map(
-				(line) => (isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true)),
-			);
-			let buffer = `${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}${DISABLE_AUTOWRAP}`;
-			for (let row = 0; row < this.lastDocument.length; row++) {
-				if (row > 0) buffer += "\r\n";
-				buffer += `\r\x1b[2K${this.lastDocument[row] ?? ""}`;
+
+		let documentLines: string[] | undefined;
+		let transcriptError: unknown;
+		let transcriptFailed = false;
+		if (!options.preserveScreen) {
+			try {
+				const width = Math.max(1, this.terminal.columns);
+				const renderedLines = this.render(width).map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
+				this.lastDocument = this.applyLineResets(
+					renderedLines.map((line) => line.replaceAll(CURSOR_MARKER, "")),
+				).map((line) =>
+					isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true),
+				);
+				documentLines = this.lastDocument;
+			} catch (error) {
+				transcriptError = error;
+				transcriptFailed = true;
 			}
-			buffer += `\x1b[0m${ENABLE_AUTOWRAP}\r\n\x1b[?25h${END_SYNCHRONIZED_OUTPUT}`;
+		}
+
+		let outputError: unknown;
+		let outputFailed = false;
+		try {
+			let buffer = `${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}`;
+			if (documentLines) {
+				buffer += DISABLE_AUTOWRAP;
+				for (let row = 0; row < documentLines.length; row++) {
+					if (row > 0) buffer += "\r\n";
+					buffer += `\r\x1b[2K${documentLines[row] ?? ""}`;
+				}
+				buffer += `\x1b[0m${ENABLE_AUTOWRAP}\r\n`;
+			}
+			buffer += `\x1b[?25h${END_SYNCHRONIZED_OUTPUT}`;
 			this.terminal.write(buffer);
+		} catch (error) {
+			outputError = error;
+			outputFailed = true;
 		}
+
+		let capabilityError: unknown;
+		let capabilityRestoreFailed = false;
 		if (this.savedCapabilities) {
-			setCapabilities(this.savedCapabilities);
+			const savedCapabilities = this.savedCapabilities;
 			this.savedCapabilities = undefined;
+			try {
+				setCapabilities(savedCapabilities);
+			} catch (error) {
+				capabilityError = error;
+				capabilityRestoreFailed = true;
+			}
 		}
+
+		if (transcriptFailed) throw transcriptError;
+		if (outputFailed) throw outputError;
+		if (capabilityRestoreFailed) throw capabilityError;
 	}
 
 	private deleteKittyImages(): string {
