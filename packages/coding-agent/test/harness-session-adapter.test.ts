@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { AgentHarness, type SessionMutationReceipt } from "@hansjm10/volt-agent-core";
 import { NodeExecutionEnv } from "@hansjm10/volt-agent-core/node";
 import { fauxAssistantMessage, registerFauxProvider } from "@hansjm10/volt-ai";
@@ -10,6 +12,8 @@ import { DEFAULT_PLANNING_STATE } from "../src/core/planning.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 
 const registrations: Array<{ unregister(): void }> = [];
+const codingAgentRoot = fileURLToPath(new URL("..", import.meta.url));
+const gcFixturePath = fileURLToPath(new URL("./fixtures/harness-session-adapter-gc.ts", import.meta.url));
 
 afterEach(() => {
 	for (const registration of registrations.splice(0)) registration.unregister();
@@ -173,6 +177,24 @@ describe("SessionManager Harness adapter", () => {
 		});
 		expect(stale).toMatchObject({ outcome: "rolled_back", error: { code: "conflict" } });
 	});
+
+	it("releases stale projection cursors while caller-retained cursors remain valid", () => {
+		const result = spawnSync(
+			process.execPath,
+			["--expose-gc", "--experimental-strip-types", "--conditions", "volt-source", gcFixturePath],
+			{
+				cwd: codingAgentRoot,
+				encoding: "utf8",
+				timeout: 30_000,
+				maxBuffer: 1024 * 1024,
+			},
+		);
+		if (result.error) throw result.error;
+		if (result.status !== 0) {
+			throw new Error(`GC fixture failed with status ${result.status}: ${result.stderr.trim()}`);
+		}
+		expect(result.stdout.trim()).toBe('{"collected":48,"heldEntries":0,"descendant":"committed"}');
+	}, 30_000);
 
 	it("bridges delivery attempts into Session mutation receipts", async () => {
 		const manager = SessionManager.inMemory("/workspace");
