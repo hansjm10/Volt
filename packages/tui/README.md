@@ -131,7 +131,7 @@ Stack entries support `basis`, `grow`, `shrink`, `minSize`, `maxSize`, and respo
 
 The primary scroll view can jump between OSC 133 semantic prompt markers. Press `Ctrl+Shift+F` to search its rendered content, `Enter`/`Ctrl+G` and `Shift+Enter`/`Ctrl+Shift+G` to move between matches, and `Escape` to close search. `TuiAltScreenOptions.searchMatchStyle` and `searchCurrentMatchStyle` customize match highlighting.
 
-Layout geometry is rebuilt for each requested frame. Stateful components are retained, and their existing rendered-line caches remain effective. Calling `render(width)` directly on layout components produces an unbounded document, which is also used when alternate-screen mode restores the main screen.
+Layout geometry is rebuilt for each requested frame. Stateful components are retained, and their existing rendered-line caches remain effective. Before painting, alternate-screen layout conditionally repeats with a fresh cache until render-visible `ScrollView` geometry such as `viewportHeight`, `scrollTop`, follow state, and scrollbar visibility is current. Components may render from that state, but their output must converge within eight layout passes; non-convergent geometry throws a developer error instead of painting a contradictory frame. Calling `render(width)` directly on layout components produces an unbounded document without viewport stabilization, which is also used when alternate-screen mode restores the main screen.
 
 ### Overlays
 

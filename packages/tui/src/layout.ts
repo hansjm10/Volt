@@ -6,6 +6,7 @@ import { type Component, CURSOR_MARKER, compositeTuiLine } from "./tui.ts";
 import { extractAnsiCode, getGraphemeCellRange, sliceByColumn, visibleWidth } from "./utils.ts";
 
 const OSC133_ZONE_PREFIX = /^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+/;
+const MAX_LAYOUT_PASSES = 8;
 
 export interface LayoutRect {
 	x: number;
@@ -49,6 +50,7 @@ interface LayoutContext {
 	renderCache: Map<Component, Map<number, string[]>>;
 	requestRender: () => void;
 	primaryScrollView: ScrollView | undefined;
+	geometryChanged: boolean;
 }
 
 function intersect(a: LayoutRect, b: LayoutRect): LayoutRect {
@@ -141,7 +143,9 @@ function layoutComponent(
 		);
 		const contentHeight = childBox.rect.height;
 		const viewportHeight = height === undefined ? contentHeight : Math.max(0, Math.floor(height));
-		node.state.updateLayout(contentHeight, viewportHeight, context.requestRender);
+		if (node.state.updateLayout(contentHeight, viewportHeight, context.requestRender)) {
+			context.geometryChanged = true;
+		}
 		translateBox(childBox, previousScrollTop - node.state.scrollTop);
 		const scrollView = node.state as ScrollView;
 		if (node.state.primary || !context.primaryScrollView) context.primaryScrollView = scrollView;
@@ -360,27 +364,37 @@ export function renderLayoutFrame(
 ): LayoutFrame {
 	const safeWidth = Math.max(1, Math.floor(width));
 	const safeHeight = Math.max(1, Math.floor(height));
-	const context: LayoutContext = {
-		viewport: { width: safeWidth, height: safeHeight },
-		renderCache: new Map(),
-		requestRender,
-		primaryScrollView: undefined,
-	};
-	const rootBox = layoutComponent(context, root, 0, 0, safeWidth, safeHeight, {
-		x: 0,
-		y: 0,
-		width: safeWidth,
-		height: safeHeight,
-	});
-	const lines = Array.from({ length: safeHeight }, () => "");
-	paintBox(rootBox, lines, safeWidth);
-	return {
-		root: rootBox,
-		width: safeWidth,
-		height: safeHeight,
-		lines,
-		...(context.primaryScrollView === undefined ? {} : { primaryScrollView: context.primaryScrollView }),
-	};
+	for (let pass = 1; pass <= MAX_LAYOUT_PASSES; pass++) {
+		const context: LayoutContext = {
+			viewport: { width: safeWidth, height: safeHeight },
+			renderCache: new Map(),
+			requestRender,
+			primaryScrollView: undefined,
+			geometryChanged: false,
+		};
+		const rootBox = layoutComponent(context, root, 0, 0, safeWidth, safeHeight, {
+			x: 0,
+			y: 0,
+			width: safeWidth,
+			height: safeHeight,
+		});
+		if (context.geometryChanged) {
+			if (pass === MAX_LAYOUT_PASSES) {
+				throw new Error(`Viewport layout did not stabilize after ${MAX_LAYOUT_PASSES} passes`);
+			}
+			continue;
+		}
+		const lines = Array.from({ length: safeHeight }, () => "");
+		paintBox(rootBox, lines, safeWidth);
+		return {
+			root: rootBox,
+			width: safeWidth,
+			height: safeHeight,
+			lines,
+			...(context.primaryScrollView === undefined ? {} : { primaryScrollView: context.primaryScrollView }),
+		};
+	}
+	throw new Error("Viewport layout failed to produce a frame");
 }
 
 function containsPoint(rect: LayoutRect, x: number, y: number): boolean {

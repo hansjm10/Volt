@@ -95,7 +95,80 @@ describe("viewport layout", () => {
 			{ component: new Text("dock", 0, 0), basis: "auto" },
 		]);
 		renderLayoutFrame(root, 10, 3, () => {});
-		assert.strictEqual(renderCount, 1);
+		assert.strictEqual(renderCount, 2);
+
+		renderLayoutFrame(root, 10, 3, () => {});
+		assert.strictEqual(renderCount, 3);
+	});
+
+	it("settles current scroll geometry before returning a frame", () => {
+		let metadataRenderCount = 0;
+		let requestedRenders = 0;
+		const scrollView = new ScrollView(new Text("1\n2\n3\n4\n5\n6", 0, 0));
+		const metadata = {
+			render: () => {
+				metadataRenderCount += 1;
+				return [`viewport ${scrollView.viewportHeight}`];
+			},
+			invalidate: () => {},
+		};
+		const root = new VStack([metadata, { component: scrollView, basis: 0, grow: 1 }]);
+		const requestRender = () => {
+			requestedRenders += 1;
+		};
+
+		const first = renderLayoutFrame(root, 12, 4, requestRender);
+		assert.deepStrictEqual(visibleLines(first.lines), ["viewport 3", "1", "2", "3"]);
+		assert.strictEqual(metadataRenderCount, 2);
+		assert.strictEqual(requestedRenders, 0);
+
+		metadataRenderCount = 0;
+		renderLayoutFrame(root, 12, 4, requestRender);
+		assert.strictEqual(metadataRenderCount, 1);
+
+		metadataRenderCount = 0;
+		const resized = renderLayoutFrame(root, 12, 6, requestRender);
+		assert.deepStrictEqual(visibleLines(resized.lines), ["viewport 5", "1", "2", "3", "4", "5"]);
+		assert.strictEqual(metadataRenderCount, 2);
+		assert.strictEqual(requestedRenders, 0);
+	});
+
+	it("settles follow-end position after content changes", () => {
+		const content = new Text("1\n2\n3\n4", 0, 0);
+		const scrollView = new ScrollView(content, { follow: "end" });
+		const metadata = {
+			render: () => [`top ${scrollView.scrollTop}`],
+			invalidate: () => {},
+		};
+		const root = new VStack([metadata, { component: scrollView, basis: 0, grow: 1 }]);
+
+		assert.deepStrictEqual(visibleLines(renderLayoutFrame(root, 10, 3, () => {}).lines), ["top 2", "3", "4"]);
+		content.setText("1\n2\n3\n4\n5");
+		assert.deepStrictEqual(visibleLines(renderLayoutFrame(root, 10, 3, () => {}).lines), ["top 3", "4", "5"]);
+	});
+
+	it("fails boundedly when scroll geometry does not converge", () => {
+		let renderCount = 0;
+		let requestedRenders = 0;
+		let scrollView: ScrollView;
+		const content = {
+			render: () => {
+				renderCount += 1;
+				return scrollView.scrollTop === 0 ? ["one", "two"] : ["one"];
+			},
+			invalidate: () => {},
+		};
+		scrollView = new ScrollView(content, { follow: "end" });
+
+		assert.throws(
+			() =>
+				renderLayoutFrame(scrollView, 10, 1, () => {
+					requestedRenders += 1;
+				}),
+			/Viewport layout did not stabilize after 8 passes/,
+		);
+		assert.strictEqual(renderCount, 8);
+		assert.strictEqual(requestedRenders, 0);
 	});
 
 	it("paints only clipped rows from very large scroll content", () => {

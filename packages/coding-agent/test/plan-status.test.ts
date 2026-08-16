@@ -137,31 +137,43 @@ describe("Plan TUI components", () => {
 		expect(after).toContain("Plan step 6");
 	});
 
-	it("keeps fullscreen plan headers and actions fixed while its body scrolls", async () => {
+	it("settles fullscreen plan metadata before display, resize, and body scrolling", async () => {
 		initTheme("dark");
-		const terminal = new VirtualTerminal(80, 16);
-		const details = createDetails(readyPlan(40), 16);
-		details.setFullscreenActive(true);
-		const tui = new TuiAltScreen(terminal, false, "/tmp", { mouse: false });
-		tui.addChild(details);
-		tui.setLayoutRoot(details.getFullscreenLayout());
-		tui.setFocus(details);
-		tui.start();
-		try {
-			await terminal.waitForRender();
-			const before = plain(terminal.getViewport());
-			expect(before).toContain("Native Plan Mode");
-			expect(before).toContain("Execute Plan");
-			expect(before).toContain("Plan step 1");
+		for (const seedRegularGeometry of [false, true]) {
+			const terminal = new VirtualTerminal(80, 16);
+			const details = createDetails(readyPlan(40), 16);
+			if (seedRegularGeometry) details.render(80);
+			details.setFullscreenActive(true);
+			const tui = new TuiAltScreen(terminal, false, "/tmp", { mouse: false });
+			tui.addChild(details);
+			tui.setLayoutRoot(details.getFullscreenLayout());
+			tui.setFocus(details);
+			tui.start();
+			try {
+				await terminal.waitForRender();
+				const before = plain(terminal.getViewport());
+				expect(before).toContain("Native Plan Mode");
+				expect(before).toContain("rows 1–7/42");
+				expect(before).toContain("Execute Plan");
+				expect(before).toContain("Plan step 1");
 
-			terminal.sendInput("\u001b[6~");
-			await terminal.waitForRender();
-			const after = plain(terminal.getViewport());
-			expect(after).toContain("Native Plan Mode");
-			expect(after).toContain("Execute Plan");
-			expect(after).not.toContain("Plan step 1");
-		} finally {
-			tui.stop({ preserveScreen: true });
+				terminal.resize(80, 20);
+				await terminal.waitForRender();
+				const resized = plain(terminal.getViewport());
+				expect(resized).toContain("rows 1–11/42");
+				expect(resized).toContain("Native Plan Mode");
+				expect(resized).toContain("Execute Plan");
+
+				terminal.sendInput("\u001b[6~");
+				await terminal.waitForRender();
+				const after = plain(terminal.getViewport());
+				expect(after).toContain("rows 8–18/42");
+				expect(after).toContain("Native Plan Mode");
+				expect(after).toContain("Execute Plan");
+				expect(after).not.toMatch(/Plan step 1\s*$/m);
+			} finally {
+				tui.stop({ preserveScreen: true });
+			}
 		}
 	});
 
