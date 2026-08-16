@@ -5306,6 +5306,7 @@ export class InteractiveMode {
 		if (this.renderer.mode === "fullscreen" && fullscreenExitOutput === "transcript") {
 			while (this.renderer.hasOverlayEntries) this.renderer.hideOverlay();
 			this.switchTuiMode("regular", false, false);
+			this.activateView(this.conversationView, null, false);
 			const suspension = this.sessionRenderSuspension;
 			this.sessionRenderSuspension = undefined;
 			suspension?.release();

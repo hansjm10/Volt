@@ -217,7 +217,7 @@ describe("createInteractiveTui", () => {
 		}
 	});
 
-	it("prints the regular transcript when fullscreen exit output requests it", async () => {
+	it("prints the conversation transcript instead of a temporary active view on fullscreen exit", async () => {
 		const terminal = new RecordingTerminal(40, 8);
 		const renderer = createInteractiveTui({
 			tuiMode: "fullscreen",
@@ -225,13 +225,15 @@ describe("createInteractiveTui", () => {
 			logDirectory: "/tmp",
 			terminal,
 		});
-		const component = { render: () => ["FINAL TRANSCRIPT"], invalidate: () => {} } satisfies Component;
-		const view = { regularComponents: [component], fullscreenRoot: component };
+		const transcript = { render: () => ["FINAL TRANSCRIPT"], invalidate: () => {} } satisfies Component;
+		const temporary = { render: () => ["TEMP SETTINGS"], invalidate: () => {} } satisfies Component;
+		const conversationView = { regularComponents: [transcript], fullscreenRoot: transcript };
+		const temporaryView = { regularComponents: [temporary], fullscreenRoot: temporary };
 		const context = Object.assign(Object.create(InteractiveMode.prototype), {
 			renderer,
 			ui: undefined as unknown as TUI,
-			activeView: view,
-			conversationView: view,
+			activeView: temporaryView,
+			conversationView,
 			planDetails: undefined,
 			mainScreenRenderState: undefined,
 			sessionRenderSuspension: undefined,
@@ -241,9 +243,9 @@ describe("createInteractiveTui", () => {
 		});
 		const stableUi = createInteractiveTuiReference(() => context.renderer);
 		context.ui = stableUi;
-		renderer.addChild(component);
+		renderer.addChild(temporary);
 		if (!isViewportTUI(renderer)) throw new Error("expected fullscreen renderer");
-		renderer.setLayoutRoot(component);
+		renderer.setLayoutRoot(temporary);
 		renderer.start();
 		await terminal.waitForRender();
 
@@ -254,7 +256,9 @@ describe("createInteractiveTui", () => {
 		await terminal.flush();
 
 		expect(context.renderer.mode).toBe("regular");
-		expect(terminal.getScrollBuffer().join("\n")).toContain("FINAL TRANSCRIPT");
+		const exitOutput = terminal.getScrollBuffer().join("\n");
+		expect(exitOutput).toContain("FINAL TRANSCRIPT");
+		expect(exitOutput).not.toContain("TEMP SETTINGS");
 		expect([terminal.startCount, terminal.stopCount]).toEqual([1, 2]);
 	});
 });
