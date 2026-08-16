@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it, mock } from "node:test";
 import { setKittyProtocolActive } from "../src/keys.ts";
+import { hasNativeModifierSupport } from "../src/native-modifiers.ts";
 import {
 	normalizeAppleTerminalInput,
 	normalizeNativeShiftEnterInput,
@@ -30,6 +31,16 @@ describe("resolveEscapeTimeoutMs", () => {
 	it("defaults to 10ms otherwise", () => {
 		assert.equal(resolveEscapeTimeoutMs({}), 10);
 	});
+});
+
+describe("native modifier support", () => {
+	it(
+		"loads the native modifier helper on supported Windows architectures",
+		{ skip: process.platform !== "win32" || (process.arch !== "x64" && process.arch !== "arm64") },
+		() => {
+			assert.equal(hasNativeModifierSupport(), true);
+		},
+	);
 });
 
 describe("normalizeNativeShiftEnterInput", () => {
