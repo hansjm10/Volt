@@ -1331,6 +1331,35 @@ describe("TuiAltScreen", () => {
 		}
 	});
 
+	it("prints the complete grow-region document when leaving alt mode", async () => {
+		const terminal = new RecordingTerminal(20, 3);
+		const tui = new TuiAltScreen(terminal);
+		const transcriptLines = Array.from({ length: 6 }, (_, index) => `transcript ${index + 1}`);
+		const transcript = new ScrollView(new Text(transcriptLines.join("\n"), 0, 0), {
+			follow: "end",
+			primary: true,
+		});
+		tui.setLayoutRoot(
+			new VStack([
+				{ component: transcript, basis: 0, grow: 1, minSize: 1 },
+				{ component: new Text("dock", 0, 0), basis: "auto", minSize: 1 },
+			]),
+		);
+		tui.start();
+		await terminal.waitForRender();
+		tui.stop();
+
+		const restoreEvent = terminal.events.find(
+			(event) => event.type === "write" && event.data.includes("\x1b[?1049l"),
+		);
+		assert.strictEqual(restoreEvent?.type, "write");
+		if (restoreEvent?.type === "write") {
+			for (const line of [...transcriptLines, "dock"]) {
+				assert.ok(restoreEvent.data.includes(line), `expected restored document to include ${line}`);
+			}
+		}
+	});
+
 	it("gives wheel and viewport keys to a focused overlay", async () => {
 		const terminal = new VirtualTerminal(20, 6);
 		const tui = new TuiAltScreen(terminal);

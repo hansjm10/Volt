@@ -138,12 +138,12 @@ export function allocateStackSizes(
 	availableSize: number | undefined,
 	gap: number,
 ): number[] {
-	const sizes = entries.map((entry, index) =>
-		clampSize(
-			entry.basis === undefined || entry.basis === "auto" ? (intrinsicSizes[index] ?? 0) : entry.basis,
-			entry,
-		),
-	);
+	const sizes = entries.map((entry, index) => {
+		const intrinsicSize = intrinsicSizes[index] ?? 0;
+		if (entry.basis === undefined || entry.basis === "auto") return clampSize(intrinsicSize, entry);
+		if (availableSize === undefined && (entry.grow ?? 0) > 0) return clampSize(intrinsicSize, entry);
+		return clampSize(entry.basis, entry);
+	});
 	if (availableSize === undefined) return sizes;
 
 	const contentSize = Math.max(0, Math.floor(availableSize) - Math.max(0, entries.length - 1) * gap);

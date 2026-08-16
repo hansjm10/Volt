@@ -165,7 +165,9 @@ function layoutComponent(
 	const gapTotal = Math.max(0, entries.length - 1) * node.gap;
 	if (node.type === "vstack") {
 		const intrinsicHeights = entries.map((entry) =>
-			typeof entry.basis === "number" ? entry.basis : measureHeight(context, entry.component, safeWidth),
+			typeof entry.basis === "number" && (height !== undefined || (entry.grow ?? 0) === 0)
+				? entry.basis
+				: measureHeight(context, entry.component, safeWidth),
 		);
 		const sizes = allocateStackSizes(entries, intrinsicHeights, height, node.gap);
 		const naturalHeight = sizes.reduce((sum, size) => sum + size, 0) + gapTotal;
