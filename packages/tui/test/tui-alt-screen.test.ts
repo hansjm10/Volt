@@ -7,6 +7,7 @@ import { ScrollView } from "../src/components/scroll-view.ts";
 import { Text } from "../src/components/text.ts";
 import { VStack } from "../src/components/v-stack.ts";
 import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keybindings.ts";
+import { ProcessTerminal } from "../src/terminal.ts";
 import {
 	encodeKitty,
 	hyperlink,
@@ -50,6 +51,73 @@ class RecordingTerminal extends VirtualTerminal {
 	override stop(): void {
 		this.events.push({ type: "stop" });
 		super.stop();
+	}
+}
+
+interface ProcessTerminalTestInternals {
+	inputHandler: ((data: string) => void) | undefined;
+	resizeHandler: (() => void) | undefined;
+	stdinBuffer: { destroy(): void } | undefined;
+	stdinDataHandler: ((data: string) => void) | undefined;
+	setupStdinBuffer(): void;
+}
+
+class RecordingProcessTerminal extends ProcessTerminal {
+	readonly writes: string[] = [];
+	private readonly testColumns: number;
+	private readonly testRows: number;
+
+	constructor(columns = 80, rows = 24) {
+		super();
+		this.testColumns = columns;
+		this.testRows = rows;
+	}
+
+	override start(onInput: (data: string) => void, onResize: () => void): void {
+		const internals = this as unknown as ProcessTerminalTestInternals;
+		internals.inputHandler = onInput;
+		internals.resizeHandler = onResize;
+		internals.setupStdinBuffer();
+	}
+
+	override stop(): void {
+		const internals = this as unknown as ProcessTerminalTestInternals;
+		internals.stdinBuffer?.destroy();
+		internals.stdinBuffer = undefined;
+		internals.stdinDataHandler = undefined;
+		internals.inputHandler = undefined;
+		internals.resizeHandler = undefined;
+	}
+
+	override write(data: string): void {
+		this.writes.push(data);
+	}
+
+	override get columns(): number {
+		return this.testColumns;
+	}
+
+	override get rows(): number {
+		return this.testRows;
+	}
+
+	override hideCursor(): void {
+		this.write("\x1b[?25l");
+	}
+
+	override showCursor(): void {
+		this.write("\x1b[?25h");
+	}
+
+	sendInput(data: string): void {
+		const handler = (this as unknown as ProcessTerminalTestInternals).stdinDataHandler;
+		assert.ok(handler, "ProcessTerminal input must be initialized");
+		handler(data);
+	}
+
+	async waitForRender(): Promise<void> {
+		await new Promise<void>((resolve) => process.nextTick(resolve));
+		await new Promise<void>((resolve) => setTimeout(resolve, 20));
 	}
 }
 
@@ -1084,6 +1152,168 @@ describe("TuiAltScreen", () => {
 		assert.ok(terminal.events.some((event) => event.type === "write" && event.data.includes(line)));
 
 		tui.stop();
+	});
+
+	it("cleans up active selection through ProcessTerminal semantic focus loss", async () => {
+		const terminal = new RecordingProcessTerminal(20, 4);
+		const existingFocusChanges: boolean[] = [];
+		const existingFocusCallback = (focused: boolean) => existingFocusChanges.push(focused);
+		terminal.onFocusChange = existingFocusCallback;
+		const tui = new TuiAltScreen(terminal);
+		tui.addChild(new Text("alpha\nbeta\ngamma\ndelta", 0, 0));
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<32;4;2M");
+		await terminal.waitForRender();
+		const focusLossWriteCount = terminal.writes.length;
+
+		terminal.sendInput("\x1b[O");
+		await terminal.waitForRender();
+		const focusLossWrites = terminal.writes.slice(focusLossWriteCount).join("");
+		terminal.sendInput("\x1b[<32;4;2M");
+		terminal.sendInput("\x1b[<0;4;2m");
+		await terminal.waitForRender();
+		const copiedAfterFocusLoss = terminal.writes.some((write) => write.includes("\x1b]52;c;"));
+
+		tui.stop();
+		assert.deepStrictEqual(existingFocusChanges, [false]);
+		assert.strictEqual(terminal.onFocusChange, existingFocusCallback);
+		assert.ok(focusLossWrites.includes("alpha"));
+		assert.ok(focusLossWrites.includes("beta"));
+		assert.ok(!focusLossWrites.includes("\x1b[7m"));
+		assert.strictEqual(copiedAfterFocusLoss, false);
+	});
+
+	it("stops selection auto-scroll through ProcessTerminal semantic focus loss", async () => {
+		const terminal = new RecordingProcessTerminal(20, 4);
+		const tui = new TuiAltScreen(terminal);
+		tui.addChild(new Text(Array.from({ length: 10 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0));
+		tui.start();
+		await terminal.waitForRender();
+		assert.strictEqual(tui.viewportTop, 6);
+
+		terminal.sendInput("\x1b[<0;1;3M");
+		terminal.sendInput("\x1b[<32;1;1M");
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		const viewportTopAtFocusLoss = tui.viewportTop;
+		terminal.sendInput("\x1b[O");
+		await new Promise((resolve) => setTimeout(resolve, 130));
+		const viewportTopAfterFocusLoss = tui.viewportTop;
+
+		tui.stop();
+		assert.ok(viewportTopAtFocusLoss < 6);
+		assert.strictEqual(viewportTopAfterFocusLoss, viewportTopAtFocusLoss);
+	});
+
+	it("stops scrollbar dragging through ProcessTerminal semantic focus loss", async () => {
+		const terminal = new RecordingProcessTerminal(10, 5);
+		const tui = new TuiAltScreen(terminal);
+		const scrollView = new ScrollView(
+			new Text(Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0),
+			{ primary: true, scrollbar: "auto" },
+		);
+		tui.setLayoutRoot(scrollView);
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<65;10;1M");
+		await terminal.waitForRender();
+		assert.strictEqual(scrollView.scrollTop, 1);
+		terminal.sendInput("\x1b[<0;10;1M");
+		terminal.sendInput("\x1b[O");
+		terminal.sendInput("\x1b[<32;10;4M");
+		await terminal.waitForRender();
+		const scrollTopAfterOrphanedDrag = scrollView.scrollTop;
+		terminal.sendInput("\x1b[<0;10;4m");
+
+		tui.stop();
+		assert.strictEqual(scrollTopAfterOrphanedDrag, 1);
+	});
+
+	it("clears scrollbar hover through ProcessTerminal semantic focus loss", async () => {
+		const terminal = new RecordingProcessTerminal(10, 5);
+		const tui = new TuiAltScreen(terminal);
+		const scrollView = new ScrollView(
+			new Text(Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0),
+			{ primary: true, scrollbar: "auto", scrollbarHideDelayMs: 50 },
+		);
+		tui.setLayoutRoot(scrollView);
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<65;10;1M");
+		await terminal.waitForRender();
+		assert.strictEqual(scrollView.isScrollbarVisible, true);
+		terminal.sendInput("\x1b[O");
+		await new Promise((resolve) => setTimeout(resolve, 70));
+		const visibleAfterFocusLoss = scrollView.isScrollbarVisible;
+
+		tui.stop();
+		assert.strictEqual(visibleAfterFocusLoss, false);
+	});
+
+	it("cancels pressed hyperlinks through ProcessTerminal semantic focus loss", async () => {
+		const terminal = new RecordingProcessTerminal(20, 1);
+		const openedUrls: string[] = [];
+		const tui = new TuiAltScreen(terminal, undefined, undefined, {
+			openUrl: (url) => openedUrls.push(url),
+		});
+		tui.addChild(new Text(hyperlink("link", "https://example.com"), 0, 0));
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;2;1M");
+		terminal.sendInput("\x1b[O");
+		terminal.sendInput("\x1b[<0;2;1m");
+		await terminal.waitForRender();
+
+		tui.stop();
+		assert.deepStrictEqual(openedUrls, []);
+	});
+
+	it("resets click counting through ProcessTerminal semantic focus loss", async () => {
+		const terminal = new RecordingProcessTerminal(20, 1);
+		const tui = new TuiAltScreen(terminal);
+		tui.addChild(new Text("alpha beta", 0, 0));
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;2;1M");
+		terminal.sendInput("\x1b[<0;2;1m");
+		terminal.sendInput("\x1b[O");
+		terminal.sendInput("\x1b[<0;2;1M");
+		terminal.sendInput("\x1b[<0;2;1m");
+		await terminal.waitForRender();
+		const copiedAfterFocusLoss = terminal.writes.some((write) => write.includes("\x1b]52;c;"));
+
+		tui.stop();
+		assert.strictEqual(copiedAfterFocusLoss, false);
+	});
+
+	it("preserves a ProcessTerminal focus callback across TUI restarts", () => {
+		const terminal = new RecordingProcessTerminal();
+		const focusChanges: boolean[] = [];
+		const callbackReceivers: unknown[] = [];
+		function existingFocusCallback(this: unknown, focused: boolean): void {
+			callbackReceivers.push(this);
+			focusChanges.push(focused);
+		}
+		terminal.onFocusChange = existingFocusCallback;
+		const tui = new TuiAltScreen(terminal);
+
+		tui.start();
+		terminal.sendInput("\x1b[O");
+		tui.stop();
+		assert.strictEqual(terminal.onFocusChange, existingFocusCallback);
+
+		tui.start();
+		terminal.sendInput("\x1b[I");
+		tui.stop();
+		assert.strictEqual(terminal.onFocusChange, existingFocusCallback);
+		assert.deepStrictEqual(focusChanges, [false, true]);
+		assert.ok(callbackReceivers.every((receiver) => receiver === terminal));
 	});
 
 	it("does not repaint idle or zero-width selections on focus loss", async () => {

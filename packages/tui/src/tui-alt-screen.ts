@@ -55,8 +55,6 @@ const ENABLE_AUTOWRAP = "\x1b[?7h";
 const ENABLE_BUTTON_MOTION_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h";
 const ENABLE_ALL_MOTION_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h";
 const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
-const FOCUS_IN = "\x1b[I";
-const FOCUS_OUT = "\x1b[O";
 const BEGIN_SYNCHRONIZED_OUTPUT = "\x1b[?2026h";
 const END_SYNCHRONIZED_OUTPUT = "\x1b[?2026l";
 const OSC133_ZONE_PREFIX = /^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+/;
@@ -198,6 +196,11 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private readonly openUrl: ((url: string) => void) | undefined;
 	private readonly onRightClickPaste: (() => void) | undefined;
 	private readonly copySelection: ((text: string) => Promise<boolean>) | undefined;
+	private previousTerminalFocusChange: ((focused: boolean) => void) | undefined;
+	private readonly terminalFocusChangeHandler = (focused: boolean): void => {
+		if (!focused) this.cancelPointerInteraction();
+		this.previousTerminalFocusChange?.call(this.terminal, focused);
+	};
 
 	constructor(
 		terminal: Terminal,
@@ -252,6 +255,8 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	}
 
 	protected override beforeTerminalStart(): void {
+		this.previousTerminalFocusChange = this.terminal.onFocusChange;
+		this.terminal.onFocusChange = this.terminalFocusChangeHandler;
 		this.stopSelectionAutoScroll();
 		this.selectionPressActive = false;
 		this.stopScrollbarHover();
@@ -293,11 +298,16 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	protected override beforeTerminalStop(_options: TuiStopOptions): void {
 		this.closeSearch();
-		this.stopSelectionAutoScroll();
-		this.selectionPressActive = false;
-		this.stopScrollbarHover();
-		this.stopScrollbarDrag();
+		this.cancelPointerInteraction();
 		this.flashes.dispose();
+		if (this.terminal.onFocusChange === this.terminalFocusChangeHandler) {
+			if (this.previousTerminalFocusChange) {
+				this.terminal.onFocusChange = this.previousTerminalFocusChange;
+			} else {
+				delete this.terminal.onFocusChange;
+			}
+		}
+		this.previousTerminalFocusChange = undefined;
 		if (!this.altScreenActive) return;
 		this.terminal.write(
 			`${BEGIN_SYNCHRONIZED_OUTPUT}${this.deleteKittyImages()}${this.mouseEnabled ? DISABLE_MOUSE : ""}${ENABLE_AUTOWRAP}${END_SYNCHRONIZED_OUTPUT}`,
@@ -538,28 +548,26 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return this.isOverlayFocused() && this.activeSearch?.overlay?.isFocused() !== true;
 	}
 
-	private handleViewportInput(data: string): { consume?: boolean } | undefined {
-		if (data === FOCUS_OUT) {
-			const hadActiveSelection = this.selectionPressActive;
-			const hadNonEmptyActiveSelection = hadActiveSelection && this.getSelectionBounds() !== undefined;
-			this.selectionPressActive = false;
-			this.stopSelectionAutoScroll();
-			this.stopScrollbarHover();
-			this.stopScrollbarDrag();
-			this.pressedUrl = undefined;
-			this.selectionDragged = false;
-			if (hadActiveSelection) {
-				this.selectionAnchor = undefined;
-				this.selectionFocus = undefined;
-				this.selectionGranularity = "character";
-				this.selectionInitialRange = undefined;
-				if (hadNonEmptyActiveSelection) this.requestRender();
-			}
-			this.lastClick = undefined;
-			return { consume: true };
+	private cancelPointerInteraction(): void {
+		const hadActiveSelection = this.selectionPressActive;
+		const hadNonEmptyActiveSelection = hadActiveSelection && this.getSelectionBounds() !== undefined;
+		this.selectionPressActive = false;
+		this.stopSelectionAutoScroll();
+		this.stopScrollbarHover();
+		this.stopScrollbarDrag();
+		this.pressedUrl = undefined;
+		this.selectionDragged = false;
+		if (hadActiveSelection) {
+			this.selectionAnchor = undefined;
+			this.selectionFocus = undefined;
+			this.selectionGranularity = "character";
+			this.selectionInitialRange = undefined;
+			if (hadNonEmptyActiveSelection) this.requestRender();
 		}
-		if (data === FOCUS_IN) return { consume: true };
+		this.lastClick = undefined;
+	}
 
+	private handleViewportInput(data: string): { consume?: boolean } | undefined {
 		const wheelEvent = this.parseWheelEvent(data);
 		if (wheelEvent) {
 			if (this.shouldDeferViewportInputToOverlay()) return undefined;
