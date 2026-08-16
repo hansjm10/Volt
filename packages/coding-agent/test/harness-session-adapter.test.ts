@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { AgentHarness, type SessionMutationReceipt } from "@hansjm10/volt-agent-core";
 import { NodeExecutionEnv } from "@hansjm10/volt-agent-core/node";
@@ -14,6 +15,9 @@ import { SessionManager } from "../src/core/session-manager.ts";
 const registrations: Array<{ unregister(): void }> = [];
 const codingAgentRoot = fileURLToPath(new URL("..", import.meta.url));
 const gcFixturePath = fileURLToPath(new URL("./fixtures/harness-session-adapter-gc.ts", import.meta.url));
+const vitestConfigPath = fileURLToPath(new URL("../vitest.config.ts", import.meta.url));
+const testRequire = createRequire(import.meta.url);
+const viteNodePath = createRequire(testRequire.resolve("vitest/package.json")).resolve("vite-node/vite-node.mjs");
 
 afterEach(() => {
 	for (const registration of registrations.splice(0)) registration.unregister();
@@ -181,7 +185,7 @@ describe("SessionManager Harness adapter", () => {
 	it("releases stale projection cursors while caller-retained cursors remain valid", () => {
 		const result = spawnSync(
 			process.execPath,
-			["--expose-gc", "--experimental-strip-types", "--conditions", "volt-source", gcFixturePath],
+			["--expose-gc", viteNodePath, "--script", "--config", vitestConfigPath, gcFixturePath],
 			{
 				cwd: codingAgentRoot,
 				encoding: "utf8",
