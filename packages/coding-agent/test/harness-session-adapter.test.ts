@@ -185,7 +185,7 @@ describe("SessionManager Harness adapter", () => {
 	it("releases stale projection cursors while caller-retained cursors remain valid", () => {
 		const result = spawnSync(
 			process.execPath,
-			["--expose-gc", viteNodePath, "--script", "--config", vitestConfigPath, gcFixturePath],
+			["--expose-gc", viteNodePath, "--config", vitestConfigPath, gcFixturePath],
 			{
 				cwd: codingAgentRoot,
 				encoding: "utf8",
