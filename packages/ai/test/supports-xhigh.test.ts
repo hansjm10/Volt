@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { getModel, getSupportedThinkingLevels } from "../src/models.ts";
+import { getModel, getModels, getProviders, getSupportedThinkingLevels } from "../src/models.ts";
+import type { Api, Model } from "../src/types.ts";
+
+function getAllModels(): Model<Api>[] {
+	return getProviders().flatMap((provider) => getModels(provider) as Model<Api>[]);
+}
 
 describe("getSupportedThinkingLevels", () => {
 	it("includes xhigh for Anthropic Opus 4.6 on anthropic-messages API", () => {
@@ -20,11 +25,15 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
 	});
 
-	it("includes xhigh but not off for Anthropic Claude Fable 5 on anthropic-messages API", () => {
-		const model = getModel("anthropic", "claude-fable-5");
-		expect(model).toBeDefined();
-		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
-		expect(getSupportedThinkingLevels(model!)).not.toContain("off");
+	it("includes xhigh and max but not off for every built-in Fable 5 alias", () => {
+		const models = getAllModels().filter((model) => model.id.includes("fable-5"));
+		expect(models.length).toBeGreaterThan(0);
+
+		for (const model of models) {
+			expect(getSupportedThinkingLevels(model), `${model.provider}/${model.id}`).toContain("xhigh");
+			expect(getSupportedThinkingLevels(model), `${model.provider}/${model.id}`).toContain("max");
+			expect(getSupportedThinkingLevels(model), `${model.provider}/${model.id}`).not.toContain("off");
+		}
 	});
 
 	it("does not include extended levels without explicit metadata", () => {
@@ -128,12 +137,5 @@ describe("getSupportedThinkingLevels", () => {
 		const model = getModel("openrouter", "anthropic/claude-opus-4.6");
 		expect(model).toBeDefined();
 		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
-	});
-
-	it("includes xhigh but not off for Bedrock Claude Fable 5", () => {
-		const model = getModel("amazon-bedrock", "global.anthropic.claude-fable-5");
-		expect(model).toBeDefined();
-		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
-		expect(getSupportedThinkingLevels(model!)).not.toContain("off");
 	});
 });

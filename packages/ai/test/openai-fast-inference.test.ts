@@ -164,8 +164,8 @@ describe("OpenAI Codex fast inference", () => {
 
 		expect(payload?.service_tier).toBe("priority");
 		expect(result.usage.serviceTier).toEqual({ requested: "priority", effective: "default" });
-		expect(result.usage.cost.input).toBe(model.cost.input * 2);
-		expect(result.usage.cost.output).toBe(model.cost.output * 2);
-		expect(result.usage.cost.cacheRead).toBe(model.cost.cacheRead * 2);
+		expect(result.usage.cost.input).toBe(10);
+		expect(result.usage.cost.output).toBe(45);
+		expect(result.usage.cost.cacheRead).toBe(1);
 	});
 });

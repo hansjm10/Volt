@@ -257,9 +257,9 @@ describe("openai-responses provider defaults", () => {
 					status: "completed",
 					service_tier: serviceTier,
 					usage: {
-						input_tokens: 1000000,
-						output_tokens: 1000000,
-						total_tokens: 2000000,
+						input_tokens: 100000,
+						output_tokens: 100000,
+						total_tokens: 200000,
 						input_tokens_details: { cached_tokens: 0 },
 					},
 				},
@@ -284,8 +284,8 @@ describe("openai-responses provider defaults", () => {
 
 		const result = await stream.result();
 
-		expect(result.usage.cost.input).toBe(model.cost.input * multiplier);
-		expect(result.usage.cost.output).toBe(model.cost.output * multiplier);
-		expect(result.usage.cost.total).toBe((model.cost.input + model.cost.output) * multiplier);
+		expect(result.usage.cost.input).toBe((model.cost.input * multiplier) / 10);
+		expect(result.usage.cost.output).toBe((model.cost.output * multiplier) / 10);
+		expect(result.usage.cost.total).toBe(((model.cost.input + model.cost.output) * multiplier) / 10);
 	});
 });
