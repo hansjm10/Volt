@@ -16,7 +16,7 @@ under the MIT License.
 - **Component-based**: Simple Component interface with render() method
 - **Theme Support**: Components accept theme interfaces for customizable styling
 - **Built-in Components**: Text, TruncatedText, Input, Editor, Markdown, Loader, SelectList, SettingsList, Spacer, Image, Box, Container, VStack, HStack, ScrollView
-- **Inline Images**: Renders images in terminals that support Kitty or iTerm2 graphics protocols
+- **Inline Images**: Renders images through Kitty, iTerm2, or negotiated Sixel graphics protocols
 - **Autocomplete Support**: File paths and slash commands
 
 ## Quick Start
@@ -576,7 +576,7 @@ const spacer = new Spacer(2); // 2 empty lines (default: 1)
 
 ### Image
 
-Renders images inline for terminals that support the Kitty graphics protocol (Kitty, Ghostty, WezTerm) or iTerm2 inline images. Falls back to a text placeholder on unsupported terminals.
+Renders images inline for terminals that support the Kitty graphics protocol (Kitty, Ghostty, WezTerm), iTerm2 inline images, or Sixel (Windows Terminal 1.22+). Sixel is enabled only after Windows Terminal reports DA1 attribute `4`; an environment variable alone is not treated as support. Unsupported terminals fall back to a text placeholder.
 
 ```typescript
 interface ImageTheme {
@@ -598,11 +598,13 @@ const image = new Image(
 tui.addChild(image);
 ```
 
-Supported formats: PNG, JPEG, GIF, WebP. Dimensions are parsed from the image headers automatically.
+Supported formats for Kitty and iTerm2 are PNG, JPEG, GIF, and WebP. Sixel rendering requires PNG input so it can decode pixels synchronously; applications should convert other formats before creating the component. Sixel output uses a deterministic adaptive palette of up to 256 colors without dithering. Dimensions are parsed from image headers automatically.
 
 #### Alternate-screen image compatibility
 
-`TuiAltScreen` supports inline images and partial viewport cropping in terminals that implement the Kitty graphics protocol, including Kitty and Ghostty. iTerm2's inline-image protocol cannot delete an existing placement or crop its source while scrolling. To prevent stale images from remaining over repainted content, `TuiAltScreen` renders image components as text placeholders in iTerm2. `TuiMainScreen` continues to render iTerm2 inline images normally.
+`TuiAltScreen` supports inline images and partial viewport cropping with Kitty and Sixel. Kitty placements can be updated independently. Sixel has no placement IDs or deletion command, so a changed, removed, scrolled, or resized Sixel image causes the terminal-height viewport to be cleared and repainted; text-only frames keep differential rendering. iTerm2's inline-image protocol cannot delete an existing placement or crop its source while scrolling, so `TuiAltScreen` renders image components as text placeholders there. `TuiMainScreen` continues to render iTerm2 inline images normally.
+
+Sixel is disabled inside tmux and GNU screen because these sessions do not reliably forward the required graphics and capability negotiation. Run the application directly in Windows Terminal to use Sixel.
 
 ## Autocomplete
 
@@ -665,7 +667,7 @@ if (matchesKey(data, Key.enter)) {
 2. **Width Changed or Change Above Viewport**: Clear the screen and fully re-render
 3. **Normal Update**: Move the cursor to the first changed line, clear to the end, and render changed lines
 
-`TuiAltScreen` owns a terminal-height viewport. Without an explicit layout root it preserves single-document scrolling behavior. With `setLayoutRoot()`, `VStack`, `HStack`, and nested `ScrollView` components can reserve fixed regions and independently scroll constrained regions. It follows streaming output while at the bottom and preserves a manually selected scroll position while content grows. Mouse-wheel and configurable keyboard navigation scroll without modifying terminal scrollback, including jumps between OSC 133 semantic prompt markers. Clicking an OSC 8 hyperlink invokes the configured URL handler. Dragging with the primary mouse button selects text and copies it through the configured callback or OSC 52; holding the drag at a scroll view's top or bottom edge auto-scrolls into off-screen content. Kitty images support vertical viewport cropping; iTerm2 inline images fall back to text because the protocol cannot delete or crop placements during viewport repainting.
+`TuiAltScreen` owns a terminal-height viewport. Without an explicit layout root it preserves single-document scrolling behavior. With `setLayoutRoot()`, `VStack`, `HStack`, and nested `ScrollView` components can reserve fixed regions and independently scroll constrained regions. It follows streaming output while at the bottom and preserves a manually selected scroll position while content grows. Mouse-wheel and configurable keyboard navigation scroll without modifying terminal scrollback, including jumps between OSC 133 semantic prompt markers. Clicking an OSC 8 hyperlink invokes the configured URL handler. Dragging with the primary mouse button selects text and copies it through the configured callback or OSC 52; holding the drag at a scroll view's top or bottom edge auto-scrolls into off-screen content. Kitty and Sixel images support vertical viewport cropping; Sixel image changes repaint the full viewport, while iTerm2 inline images fall back to text because the protocol cannot delete or crop placements during viewport repainting.
 
 Both renderers wrap updates in **synchronized output** (`\x1b[?2026h` ... `\x1b[?2026l`) for atomic, flicker-free rendering.
 

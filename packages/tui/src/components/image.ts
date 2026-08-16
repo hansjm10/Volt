@@ -5,6 +5,7 @@ import {
 	getImageDimensions,
 	type ImageDimensions,
 	imageFallback,
+	releaseSixelImage,
 	renderImage,
 } from "../terminal-image.ts";
 import type { Component } from "../tui.ts";
@@ -57,6 +58,13 @@ export class Image implements Component {
 		this.cachedWidth = undefined;
 	}
 
+	/** Release terminal-side preparation retained for this image. Safe to call repeatedly. */
+	dispose(): void {
+		if (this.imageId !== undefined) releaseSixelImage(this.imageId);
+		this.cachedLines = undefined;
+		this.cachedWidth = undefined;
+	}
+
 	render(width: number): string[] {
 		if (this.cachedLines && this.cachedWidth === width) {
 			return this.cachedLines;
@@ -71,7 +79,7 @@ export class Image implements Component {
 		let lines: string[];
 
 		if (caps.images) {
-			if (caps.images === "kitty" && this.imageId === undefined) {
+			if ((caps.images === "kitty" || caps.images === "sixel") && this.imageId === undefined) {
 				this.imageId = allocateImageId();
 			}
 			const result = renderImage(this.base64Data, this.dimensions, {
@@ -87,9 +95,8 @@ export class Image implements Component {
 					this.imageId = result.imageId;
 				}
 
-				if (caps.images === "kitty") {
-					// For Kitty: C=1 prevents cursor movement.
-					// Don't need the cursor movement.
+				if (caps.images === "kitty" || caps.images === "sixel") {
+					// Kitty suppresses cursor movement and Sixel saves/restores the cursor.
 					lines = [result.sequence];
 
 					// Return `rows` lines so TUI accounts for image height.

@@ -7,6 +7,7 @@ import {
 	normalizeNativeShiftEnterInput,
 	ProcessTerminal,
 	parseFocusEvent,
+	parseKeyboardProtocolNegotiationSequence,
 	resolveEscapeTimeoutMs,
 } from "../src/terminal.ts";
 
@@ -78,6 +79,19 @@ describe("normalizeAppleTerminalInput", () => {
 	it("leaves non-Return input unchanged", () => {
 		assert.equal(normalizeAppleTerminalInput("\x1b[13;2u", true, true), "\x1b[13;2u");
 		assert.equal(normalizeAppleTerminalInput("a", true, true), "a");
+	});
+});
+
+describe("parseKeyboardProtocolNegotiationSequence", () => {
+	it("preserves primary device attributes for capability negotiation", () => {
+		assert.deepStrictEqual(parseKeyboardProtocolNegotiationSequence("\x1b[?62;4;52c"), {
+			type: "device-attributes",
+			attributes: [62, 4, 52],
+		});
+		assert.deepStrictEqual(parseKeyboardProtocolNegotiationSequence("\x1b[?c"), {
+			type: "device-attributes",
+			attributes: [],
+		});
 	});
 });
 
@@ -186,12 +200,17 @@ describe("ProcessTerminal Kitty keyboard protocol negotiation", () => {
 		}
 	});
 
-	it("falls back to modifyOtherKeys for device attributes without Kitty flags", () => {
+	it("reports device attributes before falling back to modifyOtherKeys", () => {
 		const harness = setupNegotiation();
+		let attributes: readonly number[] | undefined;
+		harness.terminal.onDeviceAttributes = (reported) => {
+			attributes = reported;
+		};
 		try {
 			harness.send("\x1b[?62;4;52c");
 
 			assert.equal(harness.getInput(), undefined);
+			assert.deepStrictEqual(attributes, [62, 4, 52]);
 			assert.equal(harness.terminal.kittyProtocolActive, false);
 			assert.equal(harness.writes.filter((write) => write === "\x1b[>4;2m").length, 1);
 		} finally {

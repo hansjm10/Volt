@@ -265,7 +265,7 @@ md.setText("Updated markdown");
 
 ### Image
 
-Renders images in supported terminals (Kitty, iTerm2, Ghostty, WezTerm).
+Renders images through Kitty (Kitty, Ghostty, WezTerm), iTerm2, or negotiated Sixel in Windows Terminal 1.22+. Windows Terminal must report Sixel support through DA1; unsupported sessions render a text placeholder.
 
 ```typescript
 const image = new Image(
@@ -275,6 +275,8 @@ const image = new Image(
   { maxWidthCells: 80, maxHeightCells: 24 }
 );
 ```
+
+Sixel rendering requires PNG input and uses a deterministic adaptive palette of up to 256 colors without dithering. Volt's tool-result renderer converts supported JPEG, GIF, and BMP results to PNG before creating the component. In fullscreen mode, Kitty and Sixel images support vertical viewport cropping. Sixel does not have placement deletion, so changing or moving a Sixel image clears and repaints the viewport; text-only updates remain differential. iTerm2 images use placeholders in fullscreen but continue to render in regular mode. Sixel is disabled under tmux and GNU screen.
 
 ## Keyboard Input
 

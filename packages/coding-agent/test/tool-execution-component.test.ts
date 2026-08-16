@@ -1,5 +1,13 @@
 import { join } from "node:path";
-import { Text, type TUI, visibleWidth } from "@hansjm10/volt-tui";
+import {
+	Image,
+	resetCapabilitiesCache,
+	setCapabilities,
+	setCellDimensions,
+	Text,
+	type TUI,
+	visibleWidth,
+} from "@hansjm10/volt-tui";
 import { Type } from "typebox";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import { getReadmePath } from "../src/config.ts";
@@ -11,6 +19,7 @@ import { createSubagentToolDefinition, type SubagentToolDetails } from "../src/c
 import { createWriteToolDefinition } from "../src/core/tools/write.ts";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
+import * as imageConvert from "../src/utils/image-convert.ts";
 
 function createBaseToolDefinition(name = "custom_tool"): ToolDefinition {
 	return {
@@ -29,6 +38,17 @@ function createFakeTui(): TUI {
 	return {
 		requestRender: () => {},
 	} as unknown as TUI;
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+	let resolvePromise: ((value: T) => void) | undefined;
+	const promise = new Promise<T>((resolve) => {
+		resolvePromise = resolve;
+	});
+	return {
+		promise,
+		resolve: (value) => resolvePromise?.(value),
+	};
 }
 
 function createSubagentRenderDefinition() {
@@ -101,6 +121,186 @@ describe("ToolExecutionComponent parity", () => {
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered).toContain("custom call");
 		expect(rendered).toContain("custom result");
+	});
+
+	test("converts non-PNG tool images before Sixel rendering", async () => {
+		setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		try {
+			let renderRequests = 0;
+			const tui = { requestRender: () => renderRequests++ } as unknown as TUI;
+			const component = new ToolExecutionComponent(
+				"custom_tool",
+				"tool-sixel-gif",
+				{},
+				{},
+				createBaseToolDefinition(),
+				tui,
+				process.cwd(),
+			);
+			component.updateResult(
+				{
+					content: [
+						{
+							type: "image",
+							mimeType: "image/gif",
+							data: "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
+						},
+					],
+					details: {},
+					isError: false,
+				},
+				false,
+			);
+			expect(component.render(120).join("\n")).not.toContain("\x1bP0;1;0q");
+
+			await vi.waitFor(() => expect(renderRequests).toBeGreaterThan(0));
+			const rendered = component.render(120).join("\n");
+			expect(rendered).toContain("\x1bP0;1;0q");
+			expect(rendered).not.toContain("[image/gif]");
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	test("ignores a stale non-PNG conversion that completes after a newer image", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		const oldConversion = deferred<{ data: string; mimeType: string } | null>();
+		const newConversion = deferred<{ data: string; mimeType: string } | null>();
+		vi.spyOn(imageConvert, "convertToPng").mockImplementation((data) =>
+			data === "old-source" ? oldConversion.promise : newConversion.promise,
+		);
+		try {
+			const component = new ToolExecutionComponent(
+				"custom_tool",
+				"tool-conversion-race",
+				{},
+				{},
+				createBaseToolDefinition(),
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult(
+				{ content: [{ type: "image", mimeType: "image/gif", data: "old-source" }], isError: false },
+				true,
+			);
+			component.updateResult(
+				{ content: [{ type: "image", mimeType: "image/webp", data: "new-source" }], isError: false },
+				false,
+			);
+			newConversion.resolve({ data: "new-png", mimeType: "image/png" });
+			await newConversion.promise;
+			await Promise.resolve();
+			expect(component.render(80).join("\n")).toContain("new-png");
+
+			oldConversion.resolve({ data: "old-png", mimeType: "image/png" });
+			await oldConversion.promise;
+			await Promise.resolve();
+			const rendered = component.render(80).join("\n");
+			expect(rendered).toContain("new-png");
+			expect(rendered).not.toContain("old-png");
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	test("deduplicates concurrent conversions of an identical image source", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		const conversion = deferred<{ data: string; mimeType: string } | null>();
+		const convert = vi.spyOn(imageConvert, "convertToPng").mockReturnValue(conversion.promise);
+		try {
+			const component = new ToolExecutionComponent(
+				"custom_tool",
+				"tool-conversion-dedup",
+				{},
+				{},
+				createBaseToolDefinition(),
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult(
+				{
+					content: [
+						{ type: "image", mimeType: "image/gif", data: "duplicate-source" },
+						{ type: "image", mimeType: "image/gif", data: "duplicate-source" },
+					],
+					isError: false,
+				},
+				false,
+			);
+			expect(convert).toHaveBeenCalledTimes(1);
+			conversion.resolve({ data: "dedup-png", mimeType: "image/png" });
+			await conversion.promise;
+			await Promise.resolve();
+			expect(
+				component
+					.render(80)
+					.join("\n")
+					.match(/dedup-png/g),
+			).toHaveLength(2);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	test("does not apply or render-request a conversion after disposal", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		const conversion = deferred<{ data: string; mimeType: string } | null>();
+		vi.spyOn(imageConvert, "convertToPng").mockReturnValue(conversion.promise);
+		let renderRequests = 0;
+		try {
+			const component = new ToolExecutionComponent(
+				"custom_tool",
+				"tool-conversion-dispose",
+				{},
+				{},
+				createBaseToolDefinition(),
+				{ requestRender: () => renderRequests++ } as unknown as TUI,
+				process.cwd(),
+			);
+			component.updateResult(
+				{ content: [{ type: "image", mimeType: "image/gif", data: "disposed-source" }], isError: false },
+				false,
+			);
+			component.dispose();
+			conversion.resolve({ data: "disposed-png", mimeType: "image/png" });
+			await conversion.promise;
+			await Promise.resolve();
+			expect(renderRequests).toBe(0);
+			expect(component.render(80).join("\n")).not.toContain("disposed-png");
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	test("disposes image components when results replace them and when the tool is disposed", () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		const dispose = vi.spyOn(Image.prototype, "dispose");
+		try {
+			const component = new ToolExecutionComponent(
+				"custom_tool",
+				"tool-image-lifecycle",
+				{},
+				{},
+				createBaseToolDefinition(),
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult(
+				{ content: [{ type: "image", mimeType: "image/png", data: "first-png" }], isError: false },
+				true,
+			);
+			component.updateResult(
+				{ content: [{ type: "image", mimeType: "image/png", data: "second-png" }], isError: false },
+				false,
+			);
+			expect(dispose).toHaveBeenCalledTimes(1);
+			component.dispose();
+			expect(dispose).toHaveBeenCalledTimes(2);
+		} finally {
+			resetCapabilitiesCache();
+		}
 	});
 
 	test("self-rendered empty tool rows take no layout space", () => {

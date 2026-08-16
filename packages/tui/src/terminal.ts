@@ -120,7 +120,7 @@ const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_F
 
 export type KeyboardProtocolNegotiationSequence =
 	| { type: "kitty-flags"; flags: number }
-	| { type: "device-attributes" };
+	| { type: "device-attributes"; attributes: number[] };
 
 export function parseKeyboardProtocolNegotiationSequence(
 	sequence: string,
@@ -129,8 +129,13 @@ export function parseKeyboardProtocolNegotiationSequence(
 	if (kittyFlags) {
 		return { type: "kitty-flags", flags: Number.parseInt(kittyFlags[1]!, 10) };
 	}
-	if (/^\x1b\[\?[\d;]*c$/.test(sequence)) {
-		return { type: "device-attributes" };
+	const deviceAttributes = sequence.match(/^\x1b\[\?([\d;]*)c$/);
+	if (deviceAttributes) {
+		const attributes = (deviceAttributes[1] ?? "")
+			.split(";")
+			.filter((value) => value.length > 0)
+			.map((value) => Number.parseInt(value, 10));
+		return { type: "device-attributes", attributes };
 	}
 	return undefined;
 }
@@ -226,6 +231,9 @@ export interface Terminal {
 
 	// Optional callback invoked when the terminal reports a focus change
 	onFocusChange?: (focused: boolean) => void;
+
+	// Optional callback invoked for a primary device attributes (DA1) response
+	onDeviceAttributes?: (attributes: readonly number[]) => void;
 }
 
 /**
@@ -239,6 +247,7 @@ export class ProcessTerminal implements Terminal {
 	private _modifyOtherKeysActive = false;
 	private _focusState: TerminalFocusState = "unknown";
 	public onFocusChange?: (focused: boolean) => void;
+	public onDeviceAttributes?: (attributes: readonly number[]) => void;
 	private keyboardProtocolPushed = false;
 	private keyboardProtocolNegotiationBuffer = "";
 	private keyboardProtocolBufferFlushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -388,6 +397,7 @@ export class ProcessTerminal implements Terminal {
 			return true;
 		}
 
+		this.onDeviceAttributes?.(negotiationSequence.attributes);
 		if (!this._kittyProtocolActive) {
 			this.enableModifyOtherKeys();
 		}

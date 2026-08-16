@@ -1,5 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
+import { encode } from "fast-png";
 import { findAltScreenSearchMatches } from "../src/alt-screen-search.ts";
 import { HStack } from "../src/components/h-stack.ts";
 import { Image } from "../src/components/image.ts";
@@ -10,15 +11,24 @@ import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } f
 import { ProcessTerminal } from "../src/terminal.ts";
 import {
 	encodeKitty,
+	getSixelRegistryStats,
 	hyperlink,
 	registerKittyImageMetadata,
+	renderImage,
 	resetCapabilitiesCache,
 	setCapabilities,
+	setCellDimensions,
 } from "../src/terminal-image.ts";
 import { TuiAltScreen } from "../src/tui-alt-screen.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
+
+function solidPngBase64(width: number, height: number, rgba: readonly [number, number, number, number]): string {
+	const data = new Uint8Array(width * height * 4);
+	for (let pixel = 0; pixel < width * height; pixel++) data.set(rgba, pixel * 4);
+	return Buffer.from(encode({ width, height, channels: 4, depth: 8, data })).toString("base64");
+}
 
 class InputOverlay {
 	focused = false;
@@ -758,6 +768,139 @@ describe("TuiAltScreen", () => {
 			tui.stop();
 		} finally {
 			resetCapabilitiesCache();
+		}
+	});
+
+	it("clears stale Sixel raster content while retaining text-only differential renders", async () => {
+		setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 1, heightPx: 1 });
+		try {
+			const image = renderImage(
+				solidPngBase64(2, 3, [255, 0, 0, 255]),
+				{ widthPx: 2, heightPx: 3 },
+				{ maxWidthCells: 2 },
+			);
+			assert.ok(image);
+			assert.strictEqual(image.rows, 3);
+			const terminal = new RecordingTerminal(20, 3);
+			const tui = new TuiAltScreen(terminal);
+			let lines = [image.sequence, "", ""];
+			tui.addChild({
+				render: () => lines,
+				invalidate: () => {},
+			});
+			tui.start();
+			await terminal.waitForRender();
+			const initialRender = terminal.events
+				.filter((event): event is { type: "write"; data: string } => event.type === "write")
+				.map((event) => event.data)
+				.join("");
+			assert.ok(initialRender.lastIndexOf("\x1b[2K") < initialRender.indexOf("\x1bP0;1;0q"));
+
+			let eventCount = terminal.events.length;
+			lines = ["gone", "middle", "end"];
+			tui.requestRender();
+			await terminal.waitForRender();
+			const imageRemoval = terminal.events
+				.slice(eventCount)
+				.filter((event): event is { type: "write"; data: string } => event.type === "write")
+				.map((event) => event.data)
+				.join("");
+			assert.ok(imageRemoval.includes("\x1b[2J"));
+			assert.ok(imageRemoval.includes("gone"));
+			assert.ok(imageRemoval.includes("middle"));
+			assert.ok(imageRemoval.includes("end"));
+
+			eventCount = terminal.events.length;
+			lines = ["gone", "changed", "end"];
+			tui.requestRender();
+			await terminal.waitForRender();
+			const textChange = terminal.events
+				.slice(eventCount)
+				.filter((event): event is { type: "write"; data: string } => event.type === "write")
+				.map((event) => event.data)
+				.join("");
+			assert.ok(!textChange.includes("\x1b[2J"));
+			assert.ok(textChange.includes("changed"));
+			assert.strictEqual(getSixelRegistryStats().images, 1);
+			tui.stop();
+			assert.strictEqual(getSixelRegistryStats().images, 0);
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	it("repaints a Sixel image when a working-status update clears one of its reserved rows", async () => {
+		setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 1, heightPx: 1 });
+		try {
+			const image = renderImage(
+				solidPngBase64(2, 3, [255, 0, 0, 255]),
+				{ widthPx: 2, heightPx: 3 },
+				{ maxWidthCells: 2 },
+			);
+			assert.ok(image);
+			const terminal = new RecordingTerminal(20, 3);
+			const tui = new TuiAltScreen(terminal);
+			let lines = [image.sequence, "", ""];
+			tui.addChild({
+				render: () => lines,
+				invalidate: () => {},
+			});
+			tui.start();
+			await terminal.waitForRender();
+
+			const eventCount = terminal.events.length;
+			lines = [image.sequence, "Working...", ""];
+			tui.requestRender();
+			await terminal.waitForRender();
+			const redraw = terminal.events
+				.slice(eventCount)
+				.filter((event): event is { type: "write"; data: string } => event.type === "write")
+				.map((event) => event.data)
+				.join("");
+			assert.ok(redraw.includes("\x1b[2J"));
+			assert.ok(redraw.includes("Working..."));
+			assert.ok(redraw.lastIndexOf("\x1bP0;1;0q") > redraw.indexOf("Working..."));
+			tui.stop();
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	it("crops a Sixel image whose first line is above the viewport", async () => {
+		setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 1, heightPx: 4 });
+		try {
+			const terminal = new RecordingTerminal(20, 3);
+			const tui = new TuiAltScreen(terminal);
+			const image = renderImage(
+				solidPngBase64(2, 12, [0, 0, 255, 255]),
+				{ widthPx: 2, heightPx: 12 },
+				{ maxWidthCells: 2 },
+			);
+			assert.ok(image);
+			assert.strictEqual(image.rows, 3);
+			tui.addChild({
+				render: () => ["before", image.sequence, "", "", "after", "end"],
+				invalidate: () => {},
+			});
+			tui.start();
+			await terminal.waitForRender();
+
+			assert.strictEqual(tui.viewportTop, 3);
+			const writes = terminal.events
+				.filter((event): event is { type: "write"; data: string } => event.type === "write")
+				.map((event) => event.data)
+				.join("");
+			assert.ok(writes.includes(`s=${image.imageId},c=2,r=1,y=8,h=4`));
+			assert.ok(writes.includes('"1;1;2;4'));
+			tui.stop();
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
 		}
 	});
 

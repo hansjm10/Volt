@@ -1,15 +1,30 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
+import { encode } from "fast-png";
 import { HStack } from "../src/components/h-stack.ts";
 import { ScrollView } from "../src/components/scroll-view.ts";
 import { Text } from "../src/components/text.ts";
 import { VStack } from "../src/components/v-stack.ts";
 import { getScrollViewsAt, renderLayoutFrame } from "../src/layout.ts";
-import { encodeKitty, registerKittyImageMetadata } from "../src/terminal-image.ts";
+import {
+	encodeKitty,
+	getImageMetadata,
+	registerKittyImageMetadata,
+	renderImage,
+	resetCapabilitiesCache,
+	setCapabilities,
+	setCellDimensions,
+} from "../src/terminal-image.ts";
 import { stripTerminalSequences } from "../src/utils.ts";
 
 function visibleLines(lines: string[]): string[] {
 	return lines.map((line) => stripTerminalSequences(line).trimEnd());
+}
+
+function solidPngBase64(width: number, height: number): string {
+	const data = new Uint8Array(width * height * 4);
+	for (let pixel = 0; pixel < width * height; pixel++) data.set([0, 0, 255, 255], pixel * 4);
+	return Buffer.from(encode({ width, height, channels: 4, depth: 8, data })).toString("base64");
 }
 
 describe("viewport layout", () => {
@@ -143,6 +158,38 @@ describe("viewport layout", () => {
 		);
 
 		assert.ok(frame.lines[2]?.includes("y=0,h=34,r=1"));
+	});
+
+	it("re-encodes Sixel images at a scroll view's lower boundary", () => {
+		setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 1, heightPx: 6 });
+		try {
+			const image = renderImage(solidPngBase64(2, 18), { widthPx: 2, heightPx: 18 }, { maxWidthCells: 2 });
+			assert.ok(image);
+			assert.strictEqual(image.rows, 3);
+			const transcript = new ScrollView({
+				render: () => ["one", "two", image.sequence, "", ""],
+				invalidate: () => {},
+			});
+			const frame = renderLayoutFrame(
+				new VStack([{ component: transcript, basis: 0, grow: 1 }, new Text("dock", 0, 0)]),
+				20,
+				4,
+				() => {},
+			);
+
+			assert.deepStrictEqual(getImageMetadata(frame.lines[2] ?? ""), {
+				imageId: image.imageId,
+				columns: 2,
+				rows: 1,
+				sourceY: 0,
+				sourceHeight: 6,
+			});
+			assert.ok(frame.lines[2]?.includes('"1;1;2;6'));
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
 	});
 
 	it("composes horizontal children at allocated widths", () => {

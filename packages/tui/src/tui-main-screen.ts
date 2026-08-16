@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
+import { deleteKittyImage, getImageMetadata, isImageLine } from "./terminal-image.ts";
 import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import { visibleWidth } from "./utils.ts";
 
@@ -33,10 +33,6 @@ function parseKittyImageHeader(line: string): KittyImageHeader | undefined {
 
 function extractKittyImageIds(line: string): number[] {
 	return parseKittyImageHeader(line)?.ids ?? [];
-}
-
-function extractKittyImageRows(line: string): number {
-	return parseKittyImageHeader(line)?.rows ?? 1;
 }
 
 function isTermuxSession(): boolean {
@@ -125,8 +121,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		return buffer;
 	}
 
-	private getKittyImageReservedRows(lines: string[], index: number, maxIndex = lines.length - 1): number {
-		const rows = extractKittyImageRows(lines[index] ?? "");
+	private getImageReservedRows(lines: string[], index: number, maxIndex = lines.length - 1): number {
+		const rows = getImageMetadata(lines[index] ?? "")?.rows ?? 1;
 		if (rows <= 1) return 1;
 
 		const maxRows = Math.min(rows, maxIndex - index + 1, lines.length - index);
@@ -139,7 +135,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		return reservedRows;
 	}
 
-	private expandChangedRangeForKittyImages(
+	private expandChangedRangeForImages(
 		firstChanged: number,
 		lastChanged: number,
 		newLines: string[],
@@ -148,8 +144,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		let expandedLastChanged = lastChanged;
 		const expandForLines = (lines: string[]): void => {
 			for (const [i, line] of lines.entries()) {
-				if (extractKittyImageIds(line).length === 0) continue;
-				const blockEnd = i + this.getKittyImageReservedRows(lines, i) - 1;
+				if (!getImageMetadata(line)) continue;
+				const blockEnd = i + this.getImageReservedRows(lines, i) - 1;
 				if (i >= firstChanged || (i <= lastChanged && blockEnd >= firstChanged)) {
 					expandedFirstChanged = Math.min(expandedFirstChanged, i);
 					expandedLastChanged = Math.max(expandedLastChanged, blockEnd);
@@ -219,7 +215,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				const line = newLines[i];
 				if (line === undefined) continue;
 				const isImage = isImageLine(line);
-				const imageReservedRows = isImage ? this.getKittyImageReservedRows(newLines, i) : 1;
+				const imageReservedRows = isImage ? this.getImageReservedRows(newLines, i) : 1;
 				if (imageReservedRows > 1 && imageReservedRows <= height) {
 					for (let row = 1; row < imageReservedRows; row++) {
 						buffer += "\r\n";
@@ -315,7 +311,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			lastChanged = newLines.length - 1;
 		}
 		if (firstChanged !== -1) {
-			const expandedRange = this.expandChangedRangeForKittyImages(firstChanged, lastChanged, newLines);
+			const expandedRange = this.expandChangedRangeForImages(firstChanged, lastChanged, newLines);
 			firstChanged = expandedRange.firstChanged;
 			lastChanged = expandedRange.lastChanged;
 		}
@@ -447,13 +443,11 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			const line = newLines[i];
 			if (line === undefined) continue;
 			const isImage = isImageLine(line);
-			const imageReservedRows = isImage ? this.getKittyImageReservedRows(newLines, i, renderEnd) : 1;
+			const imageReservedRows = isImage ? this.getImageReservedRows(newLines, i, renderEnd) : 1;
 			if (imageReservedRows > 1) {
 				const imageStartScreenRow = i - viewportTop;
 				if (imageStartScreenRow < 0 || imageStartScreenRow + imageReservedRows > height) {
-					logRedraw(
-						`kitty image pre-clear would scroll (${imageStartScreenRow} + ${imageReservedRows} > ${height})`,
-					);
+					logRedraw(`image pre-clear would scroll (${imageStartScreenRow} + ${imageReservedRows} > ${height})`);
 					fullRender(true);
 					return;
 				}

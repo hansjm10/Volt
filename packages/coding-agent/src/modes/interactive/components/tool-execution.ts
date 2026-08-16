@@ -110,7 +110,12 @@ export class ToolExecutionComponent extends Container {
 		isError: boolean;
 		details?: any;
 	};
-	private convertedImages: Map<number, { data: string; mimeType: string }> = new Map();
+	private convertedImages = new Map<
+		number,
+		{ sourceData: string; sourceMimeType: string; data: string; mimeType: string }
+	>();
+	private pendingImageConversions = new Map<string, Map<string, Promise<{ data: string; mimeType: string } | null>>>();
+	private disposed = false;
 	private hideComponent = false;
 	private subagentCreationObserved = false;
 
@@ -267,6 +272,7 @@ export class ToolExecutionComponent extends Container {
 		},
 		isPartial = false,
 	): void {
+		if (this.disposed) return;
 		if (this.toolName === "subagent" && hasCreatedSubagent(result.details)) {
 			this.subagentCreationObserved = true;
 		}
@@ -275,30 +281,65 @@ export class ToolExecutionComponent extends Container {
 		}
 		this.result = result;
 		this.isPartial = isPartial;
+		const imageBlocks = result.content.filter((content) => content.type === "image");
+		for (const [index, converted] of this.convertedImages) {
+			const source = imageBlocks[index];
+			if (source?.data !== converted.sourceData || source.mimeType !== converted.sourceMimeType) {
+				this.convertedImages.delete(index);
+			}
+		}
 		this.updateDisplay();
-		this.maybeConvertImagesForKitty();
+		this.maybeConvertImagesForTerminal();
 	}
 
-	private maybeConvertImagesForKitty(): void {
+	private maybeConvertImagesForTerminal(): void {
 		const caps = getCapabilities();
-		if (caps.images !== "kitty") return;
+		if (caps.images !== "kitty" && caps.images !== "sixel") return;
 		if (!this.result) return;
 
-		const imageBlocks = this.result.content.filter((c) => c.type === "image");
-		for (let i = 0; i < imageBlocks.length; i++) {
-			const img = imageBlocks[i];
-			if (!img.data || !img.mimeType) continue;
-			if (img.mimeType === "image/png") continue;
-			if (this.convertedImages.has(i)) continue;
+		const imageBlocks = this.result.content.filter((content) => content.type === "image");
+		for (let index = 0; index < imageBlocks.length; index++) {
+			const img = imageBlocks[index];
+			if (!img?.data || !img.mimeType || img.mimeType === "image/png") continue;
+			const existing = [...this.convertedImages.values()].find(
+				(converted) => converted.sourceData === img.data && converted.sourceMimeType === img.mimeType,
+			);
+			if (existing) {
+				this.convertedImages.set(index, existing);
+				continue;
+			}
+			let conversionsForMime = this.pendingImageConversions.get(img.mimeType);
+			if (!conversionsForMime) {
+				conversionsForMime = new Map();
+				this.pendingImageConversions.set(img.mimeType, conversionsForMime);
+			}
+			if (conversionsForMime.has(img.data)) continue;
 
-			const index = i;
-			convertToPng(img.data, img.mimeType).then((converted) => {
-				if (converted) {
-					this.convertedImages.set(index, converted);
+			const sourceData = img.data;
+			const sourceMimeType = img.mimeType;
+			const conversion = convertToPng(sourceData, sourceMimeType);
+			conversionsForMime.set(sourceData, conversion);
+			conversion
+				.then((converted) => {
+					if (!converted || this.disposed || !this.result) return;
+					let changed = false;
+					const currentImages = this.result.content.filter((content) => content.type === "image");
+					for (let index = 0; index < currentImages.length; index++) {
+						const current = currentImages[index];
+						if (current?.data !== sourceData || current.mimeType !== sourceMimeType) continue;
+						this.convertedImages.set(index, { sourceData, sourceMimeType, ...converted });
+						changed = true;
+					}
+					if (!changed) return;
 					this.updateDisplay();
 					this.ui.requestRender();
-				}
-			});
+				})
+				.catch(() => {})
+				.finally(() => {
+					if (this.disposed) return;
+					if (conversionsForMime?.get(sourceData) === conversion) conversionsForMime.delete(sourceData);
+					if (conversionsForMime?.size === 0) this.pendingImageConversions.delete(sourceMimeType);
+				});
 		}
 	}
 
@@ -307,6 +348,11 @@ export class ToolExecutionComponent extends Container {
 	 * host discards this row before a terminal render. Safe to call repeatedly.
 	 */
 	dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		this.releaseImageComponents();
+		this.convertedImages.clear();
+		this.pendingImageConversions.clear();
 		this.toolDefinition?.disposeRenderState?.(this.rendererState);
 		if (this.builtInToolDefinition !== this.toolDefinition) {
 			this.builtInToolDefinition?.disposeRenderState?.(this.rendererState);
@@ -428,14 +474,7 @@ export class ToolExecutionComponent extends Container {
 			hasContent = true;
 		}
 
-		for (const img of this.imageComponents) {
-			this.removeChild(img);
-		}
-		this.imageComponents = [];
-		for (const spacer of this.imageSpacers) {
-			this.removeChild(spacer);
-		}
-		this.imageSpacers = [];
+		this.releaseImageComponents();
 
 		if (this.result) {
 			const imageBlocks = this.result.content.filter((c) => c.type === "image");
@@ -446,7 +485,7 @@ export class ToolExecutionComponent extends Container {
 					const converted = this.convertedImages.get(i);
 					const imageData = converted?.data ?? img.data;
 					const imageMimeType = converted?.mimeType ?? img.mimeType;
-					if (caps.images === "kitty" && imageMimeType !== "image/png") continue;
+					if ((caps.images === "kitty" || caps.images === "sixel") && imageMimeType !== "image/png") continue;
 
 					const spacer = new Spacer(1);
 					this.addChild(spacer);
@@ -476,6 +515,16 @@ export class ToolExecutionComponent extends Container {
 	 * preflights: explicit registry queries, terminal errors, and settled spawn
 	 * executions (e.g. every child failed to start) must render normally.
 	 */
+	private releaseImageComponents(): void {
+		for (const image of this.imageComponents) {
+			image.dispose();
+			this.removeChild(image);
+		}
+		this.imageComponents = [];
+		for (const spacer of this.imageSpacers) this.removeChild(spacer);
+		this.imageSpacers = [];
+	}
+
 	private shouldPresentWithoutCreation(): boolean {
 		const args = this.args as Record<string, unknown> | null | undefined;
 		if (args && typeof args === "object" && (args.list !== undefined || args.follow !== undefined)) {

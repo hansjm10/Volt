@@ -128,6 +128,10 @@ See [tmux setup](tmux.md) for modified-key forwarding. Fullscreen scrolling is a
 
 ## Windows Terminal
 
+Windows Terminal 1.22 and newer can render inline images through [Sixel](https://devblogs.microsoft.com/commandline/windows-terminal-preview-1-22-release/). Volt queries the terminal at startup and enables Sixel only when the DA1 response includes attribute `4`; `WT_SESSION` by itself is not enough. Older or unsupported sessions keep the text image placeholder. Tool images in supported JPEG, GIF, and BMP formats are converted to PNG before Sixel rendering.
+
+Sixel works in regular and fullscreen modes when Volt runs directly in Windows Terminal. Fullscreen scrolling and clipping re-encode the visible image region. Since Sixel cannot delete an individual placement, moving, changing, or resizing an image clears and repaints the viewport to avoid stale pixels; text-only updates remain differential. Sixel is disabled under tmux and GNU screen, so run Volt directly in Windows Terminal for inline images.
+
 Add to `settings.json` (Ctrl+Shift+, or Settings → Open JSON file) to forward the modified Enter keys volt uses:
 
 ```json

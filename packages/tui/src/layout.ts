@@ -1,7 +1,7 @@
 import type { ScrollView } from "./components/scroll-view.ts";
 import { allocateStackSizes, visibleStackEntries } from "./components/stack.ts";
 import { getLayoutNode } from "./layout-node.ts";
-import { cropKittyImageLine, getKittyImageMetadata, isImageLine } from "./terminal-image.ts";
+import { cropImageLine, getImageMetadata, isImageLine } from "./terminal-image.ts";
 import { type Component, CURSOR_MARKER, compositeTuiLine } from "./tui.ts";
 import { extractAnsiCode, getGraphemeCellRange, sliceByColumn, visibleWidth } from "./utils.ts";
 
@@ -312,11 +312,11 @@ function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
 			const sourceLine = box.lines[offset + row - box.rect.y];
 			if (sourceLine === undefined) continue;
 			let line = sourceLine.replace(OSC133_ZONE_PREFIX, "");
-			const imageMetadata = getKittyImageMetadata(line);
+			const imageMetadata = getImageMetadata(line);
 			if (imageMetadata) {
 				const clipBottom = Math.min(screen.length, box.clip.y + box.clip.height);
 				const visibleRows = Math.min(imageMetadata.rows, clipBottom - row);
-				if (visibleRows < imageMetadata.rows) line = cropKittyImageLine(line, 0, visibleRows);
+				if (visibleRows < imageMetadata.rows) line = cropImageLine(line, 0, visibleRows);
 			}
 			// Fast path: a full-width box painting onto an untouched row can use the
 			// source line reference directly. Compositing here would rebuild the row
@@ -335,12 +335,12 @@ function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
 	if (box.scrollView && box.scrollContentLines && box.scrollView.scrollTop > 0 && box.rect.height > 0) {
 		for (let imageRow = box.scrollView.scrollTop - 1; imageRow >= 0; imageRow--) {
 			const imageLine = box.scrollContentLines[imageRow] ?? "";
-			const metadata = getKittyImageMetadata(imageLine);
+			const metadata = getImageMetadata(imageLine);
 			if (metadata) {
 				const hiddenRows = box.scrollView.scrollTop - imageRow;
 				if (hiddenRows < metadata.rows) {
 					const visibleRows = Math.min(box.rect.height, metadata.rows - hiddenRows);
-					const cropped = cropKittyImageLine(imageLine, hiddenRows, visibleRows);
+					const cropped = cropImageLine(imageLine, hiddenRows, visibleRows);
 					if (box.rect.x === 0 && box.rect.width >= totalWidth) screen[box.rect.y] = cropped;
 				}
 				break;

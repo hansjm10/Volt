@@ -23,6 +23,7 @@ import {
 	deleteKittyImage,
 	getCapabilities,
 	getKittyImagePlacement,
+	getSixelImageMetadata,
 	type ImageProtocol,
 	isImageLine,
 	setCapabilities,
@@ -373,6 +374,11 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		if (transcriptFailed) throw transcriptError;
 		if (outputFailed) throw outputError;
 		if (capabilityRestoreFailed) throw capabilityError;
+	}
+
+	protected override onTerminalCapabilitiesChanged(): void {
+		this.imageProtocol = getCapabilities().images;
+		this.uploadedKittyImages.clear();
 	}
 
 	private deleteKittyImages(): string {
@@ -1297,6 +1303,18 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return result;
 	}
 
+	private changedRowsIntersectSixelImage(screen: readonly string[], otherScreen: readonly string[]): boolean {
+		for (let anchorRow = 0; anchorRow < screen.length; anchorRow++) {
+			const metadata = getSixelImageMetadata(screen[anchorRow] ?? "");
+			if (!metadata) continue;
+			const endRow = Math.min(screen.length, anchorRow + metadata.rows);
+			for (let row = anchorRow; row < endRow; row++) {
+				if (screen[row] !== otherScreen[row]) return true;
+			}
+		}
+		return false;
+	}
+
 	protected override doRender(): void {
 		if (this.stopped || !this.altScreenActive) return;
 		const width = Math.max(1, this.terminal.columns);
@@ -1322,10 +1340,15 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 		const fullRedraw =
 			this.previousScreen.length === 0 || this.previousScreenWidth !== width || this.previousScreenHeight !== height;
-		const imagesNeedRedraw = screen.some(
+		const imageAnchorsNeedRedraw = screen.some(
 			(line, row) =>
 				line !== this.previousScreen[row] && (isImageLine(line) || isImageLine(this.previousScreen[row] ?? "")),
 		);
+		const sixelRasterRowsNeedRedraw =
+			this.imageProtocol === "sixel" &&
+			(this.changedRowsIntersectSixelImage(screen, this.previousScreen) ||
+				this.changedRowsIntersectSixelImage(this.previousScreen, screen));
+		const imagesNeedRedraw = imageAnchorsNeedRedraw || sixelRasterRowsNeedRedraw;
 		const redrawImages = fullRedraw || imagesNeedRedraw;
 		const hadUploadedKittyImages = this.uploadedKittyImages.size > 0;
 		const preparedKittyScreen =
@@ -1342,14 +1365,24 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 					: this.deleteKittyImages();
 			buffer += `${clearImages}\x1b[2J`;
 		} else if (imagesNeedRedraw) {
-			if (this.imageProtocol === "iterm2") buffer += "\x1b[2J";
+			if (this.imageProtocol === "iterm2" || this.imageProtocol === "sixel") buffer += "\x1b[2J";
 			else if (this.imageProtocol === "kitty") buffer += deleteAllKittyPlacements();
 		}
 		buffer += preparedKittyScreen.evictedImageDeletion;
 
+		const deferSixelImages = redrawImages && this.imageProtocol === "sixel";
 		for (let row = 0; row < height; row++) {
 			if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
-			buffer += `\x1b[${row + 1};1H\x1b[2K${preparedKittyScreen.lines[row] ?? ""}`;
+			const line = preparedKittyScreen.lines[row] ?? "";
+			buffer += `\x1b[${row + 1};1H\x1b[2K`;
+			if (!deferSixelImages || !getSixelImageMetadata(line)) buffer += line;
+		}
+		if (deferSixelImages) {
+			for (let row = 0; row < height; row++) {
+				const line = preparedKittyScreen.lines[row] ?? "";
+				if (!getSixelImageMetadata(line)) continue;
+				buffer += `\x1b[${row + 1};1H${line}`;
+			}
 		}
 
 		if (cursorPos) {

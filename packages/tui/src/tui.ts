@@ -14,7 +14,13 @@ import {
 	type RgbColor,
 	type TerminalColorScheme,
 } from "./terminal-colors.ts";
-import { getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.ts";
+import {
+	applyDeviceAttributes,
+	clearSixelImages,
+	getCapabilities,
+	isImageLine,
+	setCellDimensions,
+} from "./terminal-image.ts";
 import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.ts";
 
 /**
@@ -372,6 +378,16 @@ export abstract class TuiBase extends Container implements TUI {
 	private pendingOsc11BackgroundQueries: PendingOsc11BackgroundQuery[] = [];
 	private terminalColorSchemeListeners = new Set<(scheme: TerminalColorScheme) => void>();
 	private terminalColorSchemeNotificationsEnabled = false;
+	private previousTerminalDeviceAttributes: ((attributes: readonly number[]) => void) | undefined;
+	private readonly terminalDeviceAttributesHandler = (attributes: readonly number[]): void => {
+		const capabilitiesChanged = applyDeviceAttributes(attributes);
+		this.previousTerminalDeviceAttributes?.call(this.terminal, attributes);
+		if (!capabilitiesChanged) return;
+		this.onTerminalCapabilitiesChanged();
+		this.queryCellSize();
+		this.invalidate();
+		this.requestRender(true);
+	};
 	protected readonly logDirectory: string;
 
 	// Overlay stack for modal components rendered on top of base content
@@ -404,6 +420,8 @@ export abstract class TuiBase extends Container implements TUI {
 	protected beforeTerminalStop(_options: TuiStopOptions): void {}
 
 	protected afterTerminalStop(_options: TuiStopOptions): void {}
+
+	protected onTerminalCapabilitiesChanged(): void {}
 
 	get fullRedraws(): number {
 		return this.fullRedrawCount;
@@ -749,6 +767,8 @@ export abstract class TuiBase extends Container implements TUI {
 
 	start(): void {
 		this.stopped = false;
+		this.previousTerminalDeviceAttributes = this.terminal.onDeviceAttributes;
+		this.terminal.onDeviceAttributes = this.terminalDeviceAttributesHandler;
 		this.beforeTerminalStart();
 		this.terminal.start(
 			(data) => this.handleTerminalInput(data),
@@ -811,13 +831,25 @@ export abstract class TuiBase extends Container implements TUI {
 			this.settleOsc11BackgroundQuery(query, undefined);
 		}
 		this.timedOutOsc11BackgroundReplies = 0;
-		if (this.terminalColorSchemeNotificationsEnabled) {
-			this.terminal.write("\x1b[?2031l");
+		try {
+			if (this.terminalColorSchemeNotificationsEnabled) {
+				this.terminal.write("\x1b[?2031l");
+			}
+			this.beforeTerminalStop(options);
+			this.terminal.showCursor();
+			this.terminal.stop();
+			if (this.terminal.onDeviceAttributes === this.terminalDeviceAttributesHandler) {
+				if (this.previousTerminalDeviceAttributes) {
+					this.terminal.onDeviceAttributes = this.previousTerminalDeviceAttributes;
+				} else {
+					delete this.terminal.onDeviceAttributes;
+				}
+			}
+			this.previousTerminalDeviceAttributes = undefined;
+			this.afterTerminalStop(options);
+		} finally {
+			clearSixelImages();
 		}
-		this.beforeTerminalStop(options);
-		this.terminal.showCursor();
-		this.terminal.stop();
-		this.afterTerminalStop(options);
 	}
 
 	renderNow(force = false): void {

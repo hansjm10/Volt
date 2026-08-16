@@ -2,8 +2,16 @@ import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+	decodePngRaster,
+	encodePreparedSixelRange,
+	type IndexedSixelRaster,
+	isSixelTargetSizeAllowed,
+	prepareSixelRaster,
+	resizeRgbaRaster,
+} from "./sixel.ts";
 
-export type ImageProtocol = "kitty" | "iterm2" | null;
+export type ImageProtocol = "kitty" | "iterm2" | "sixel" | null;
 
 export interface TerminalCapabilities {
 	images: ImageProtocol;
@@ -143,24 +151,46 @@ export function getCapabilities(): TerminalCapabilities {
 }
 
 export function resetCapabilitiesCache(): void {
+	if (cachedCapabilities?.images === "sixel") clearSixelImages();
 	cachedCapabilities = null;
 }
 
 /** Override the cached capabilities. Useful in tests to exercise both code paths. */
 export function setCapabilities(caps: TerminalCapabilities): void {
+	if (cachedCapabilities?.images === "sixel" && caps.images !== "sixel") clearSixelImages();
 	cachedCapabilities = caps;
+}
+
+/** Enable negotiated Sixel support when Windows Terminal reports DA1 attribute 4. */
+export function applyDeviceAttributes(attributes: readonly number[], env: NodeJS.ProcessEnv = process.env): boolean {
+	const term = env["TERM"]?.toLowerCase() ?? "";
+	if (
+		!env["WT_SESSION"] ||
+		env["TMUX"] ||
+		term.startsWith("tmux") ||
+		term.startsWith("screen") ||
+		!attributes.includes(4)
+	) {
+		return false;
+	}
+
+	const capabilities = getCapabilities();
+	if (capabilities.images !== null) return false;
+	setCapabilities({ ...capabilities, images: "sixel" });
+	return true;
 }
 
 const KITTY_PREFIX = "\x1b_G";
 const ITERM2_PREFIX = "\x1b]1337;File=";
+const SIXEL_PREFIX = "\x1bP0;1;0q";
 
 export function isImageLine(line: string): boolean {
 	// Fast path: sequence at line start (single-row images)
-	if (line.startsWith(KITTY_PREFIX) || line.startsWith(ITERM2_PREFIX)) {
+	if (line.startsWith(KITTY_PREFIX) || line.startsWith(ITERM2_PREFIX) || line.startsWith(SIXEL_PREFIX)) {
 		return true;
 	}
-	// Slow path: sequence elsewhere (multi-row images have cursor-up prefix)
-	return line.includes(KITTY_PREFIX) || line.includes(ITERM2_PREFIX);
+	// Slow path: sequence elsewhere (multi-row images and Sixel cursor saves have prefixes)
+	return line.includes(KITTY_PREFIX) || line.includes(ITERM2_PREFIX) || line.includes(SIXEL_PREFIX);
 }
 
 /**
@@ -279,6 +309,113 @@ export interface KittyImageMetadata extends ImageCellSize {
 	heightPx: number;
 }
 
+export interface SixelImageMetadata extends ImageCellSize {
+	imageId: number;
+	sourceY: number;
+	sourceHeight: number;
+}
+
+export type TerminalImageMetadata = KittyImageMetadata | SixelImageMetadata;
+
+interface RegisteredSixelImage {
+	prepared: IndexedSixelRaster;
+	preparedBytes: number;
+	cropStreams: Map<string, string>;
+}
+
+const sixelImageMetadata = new Map<number, RegisteredSixelImage>();
+let registeredSixelBytes = 0;
+let cachedSixelCropBytes = 0;
+let cachedSixelCropCount = 0;
+const MAX_REGISTERED_SIXEL_IMAGES = 64;
+const MAX_REGISTERED_SIXEL_BYTES = 64 * 1024 * 1024;
+const MAX_CACHED_SIXEL_CROPS = 128;
+const MAX_CACHED_SIXEL_CROP_BYTES = 8 * 1024 * 1024;
+
+function removeRegisteredSixelImage(imageId: number): void {
+	const existing = sixelImageMetadata.get(imageId);
+	if (!existing) return;
+	registeredSixelBytes -= existing.preparedBytes;
+	for (const stream of existing.cropStreams.values()) {
+		cachedSixelCropBytes -= Buffer.byteLength(stream);
+		cachedSixelCropCount--;
+	}
+	sixelImageMetadata.delete(imageId);
+}
+
+export function releaseSixelImage(imageId: number): void {
+	removeRegisteredSixelImage(imageId);
+}
+
+export function clearSixelImages(): void {
+	sixelImageMetadata.clear();
+	registeredSixelBytes = 0;
+	cachedSixelCropBytes = 0;
+	cachedSixelCropCount = 0;
+}
+
+export function getSixelRegistryStats(): {
+	images: number;
+	preparedBytes: number;
+	cropStreams: number;
+	cropStreamBytes: number;
+} {
+	return {
+		images: sixelImageMetadata.size,
+		preparedBytes: registeredSixelBytes,
+		cropStreams: cachedSixelCropCount,
+		cropStreamBytes: cachedSixelCropBytes,
+	};
+}
+
+function registerSixelImage(imageId: number, prepared: IndexedSixelRaster): void {
+	removeRegisteredSixelImage(imageId);
+	const preparedBytes = prepared.indexes.byteLength + prepared.colors.length * 3;
+	sixelImageMetadata.set(imageId, { prepared, preparedBytes, cropStreams: new Map() });
+	registeredSixelBytes += preparedBytes;
+	while (sixelImageMetadata.size > MAX_REGISTERED_SIXEL_IMAGES || registeredSixelBytes > MAX_REGISTERED_SIXEL_BYTES) {
+		const oldestImageId = sixelImageMetadata.keys().next().value;
+		if (oldestImageId === undefined) break;
+		removeRegisteredSixelImage(oldestImageId);
+	}
+}
+
+function cacheSixelCrop(imageId: number, key: string, stream: string): void {
+	const registered = sixelImageMetadata.get(imageId);
+	if (!registered || Buffer.byteLength(stream) > MAX_CACHED_SIXEL_CROP_BYTES) return;
+	registered.cropStreams.set(key, stream);
+	cachedSixelCropCount++;
+	cachedSixelCropBytes += Buffer.byteLength(stream);
+	while (cachedSixelCropCount > MAX_CACHED_SIXEL_CROPS || cachedSixelCropBytes > MAX_CACHED_SIXEL_CROP_BYTES) {
+		let removed = false;
+		for (const entry of sixelImageMetadata.values()) {
+			const oldestKey = entry.cropStreams.keys().next().value;
+			if (oldestKey === undefined) continue;
+			const oldestStream = entry.cropStreams.get(oldestKey);
+			entry.cropStreams.delete(oldestKey);
+			if (oldestStream !== undefined) cachedSixelCropBytes -= Buffer.byteLength(oldestStream);
+			cachedSixelCropCount--;
+			removed = true;
+			break;
+		}
+		if (!removed) break;
+	}
+}
+
+function sixelMarker(metadata: SixelImageMetadata): string {
+	return `\x1b_pi:s=${metadata.imageId},c=${metadata.columns},r=${metadata.rows},y=${metadata.sourceY},h=${metadata.sourceHeight}\x07`;
+}
+
+export function getSixelImageMetadata(line: string): SixelImageMetadata | undefined {
+	const match = /\x1b_pi:s=(\d+),c=(\d+),r=(\d+),y=(\d+),h=(\d+)\x07/.exec(line);
+	if (!match) return undefined;
+	const values = match.slice(1).map((value) => Number.parseInt(value ?? "", 10));
+	if (values.some((value) => !Number.isInteger(value) || value < 0)) return undefined;
+	const [imageId, columns, rows, sourceY, sourceHeight] = values;
+	if (!imageId || !columns || !rows || sourceY === undefined || !sourceHeight) return undefined;
+	return { imageId, columns, rows, sourceY, sourceHeight };
+}
+
 interface RegisteredKittyImageMetadata extends KittyImageMetadata {
 	transmissionGeneration: number;
 }
@@ -395,6 +532,66 @@ export function cropKittyImageLine(line: string, hiddenRows: number, visibleRows
 	const controls = imageControls.split(",").filter((control) => !/^[yhr]=/.test(control));
 	controls.push(`y=${sourceY}`, `h=${sourceHeight}`, `r=${croppedRows}`);
 	return `${line.slice(0, match.index)}\x1b_G${controls.join(",")};${line.slice(match.index + match[0].length)}`;
+}
+
+export function getImageMetadata(line: string): TerminalImageMetadata | undefined {
+	return getKittyImageMetadata(line) ?? getSixelImageMetadata(line);
+}
+
+function removeSixelImage(line: string, markerIndex: number): string {
+	const sequenceEnd = line.indexOf("\x1b8", markerIndex);
+	return sequenceEnd === -1 ? line.slice(0, markerIndex) : line.slice(0, markerIndex) + line.slice(sequenceEnd + 2);
+}
+
+export function cropSixelImageLine(line: string, hiddenRows: number, visibleRows: number): string {
+	const metadata = getSixelImageMetadata(line);
+	const markerIndex = line.indexOf("\x1b_pi:s=");
+	if (!metadata || markerIndex === -1 || hiddenRows < 0 || hiddenRows >= metadata.rows || visibleRows <= 0) {
+		return line;
+	}
+	const croppedRows = Math.min(visibleRows, metadata.rows - hiddenRows);
+	if (hiddenRows === 0 && croppedRows === metadata.rows) return line;
+	const registered = sixelImageMetadata.get(metadata.imageId);
+	if (!registered) return removeSixelImage(line, markerIndex);
+	// Refresh registry recency so actively cropped transcript images are not evicted.
+	sixelImageMetadata.delete(metadata.imageId);
+	sixelImageMetadata.set(metadata.imageId, registered);
+
+	const sourceY = metadata.sourceY + Math.floor((metadata.sourceHeight * hiddenRows) / metadata.rows);
+	const sourceEnd = metadata.sourceY + Math.ceil((metadata.sourceHeight * (hiddenRows + croppedRows)) / metadata.rows);
+	const sourceHeight = Math.max(1, sourceEnd - sourceY);
+	if (sourceY < 0 || sourceY + sourceHeight > registered.prepared.height) {
+		return removeSixelImage(line, markerIndex);
+	}
+	const nextMetadata: SixelImageMetadata = {
+		imageId: metadata.imageId,
+		columns: metadata.columns,
+		rows: croppedRows,
+		sourceY,
+		sourceHeight,
+	};
+	const cacheKey = `${sourceY}:${sourceHeight}`;
+	let stream = registered.cropStreams.get(cacheKey);
+	if (stream) {
+		registered.cropStreams.delete(cacheKey);
+		registered.cropStreams.set(cacheKey, stream);
+	} else {
+		try {
+			stream = encodePreparedSixelRange(registered.prepared, sourceY, sourceHeight);
+		} catch {
+			return removeSixelImage(line, markerIndex);
+		}
+		cacheSixelCrop(metadata.imageId, cacheKey, stream);
+	}
+	const sequenceEnd = line.indexOf("\x1b8", markerIndex);
+	const suffix = sequenceEnd === -1 ? "" : line.slice(sequenceEnd + 2);
+	return `${line.slice(0, markerIndex)}${sixelMarker(nextMetadata)}${stream}${suffix}`;
+}
+
+export function cropImageLine(line: string, hiddenRows: number, visibleRows: number): string {
+	if (getKittyImageMetadata(line)) return cropKittyImageLine(line, hiddenRows, visibleRows);
+	if (getSixelImageMetadata(line)) return cropSixelImageLine(line, hiddenRows, visibleRows);
+	return line;
 }
 
 export function calculateImageCellSize(
@@ -618,6 +815,47 @@ export function renderImage(
 			preserveAspectRatio: options.preserveAspectRatio ?? true,
 		});
 		return { sequence, columns: size.columns, rows: size.rows };
+	}
+
+	if (caps.images === "sixel") {
+		try {
+			const source = decodePngRaster(base64Data);
+			if (!source) return null;
+			const cells = calculateImageCellSize(
+				{ widthPx: source.width, heightPx: source.height },
+				maxWidth,
+				options.maxHeightCells,
+				getCellDimensions(),
+			);
+			const cellSize = getCellDimensions();
+			const scale = Math.min(
+				(cells.columns * cellSize.widthPx) / source.width,
+				(cells.rows * cellSize.heightPx) / source.height,
+			);
+			const widthPx = Math.max(1, Math.min(cells.columns * cellSize.widthPx, Math.round(source.width * scale)));
+			const heightPx = Math.max(1, Math.min(cells.rows * cellSize.heightPx, Math.round(source.height * scale)));
+			if (!isSixelTargetSizeAllowed(widthPx, heightPx)) return null;
+			const raster = resizeRgbaRaster(source, widthPx, heightPx);
+			const prepared = prepareSixelRaster(raster);
+			const sequence = encodePreparedSixelRange(prepared);
+			const imageId = options.imageId ?? allocateImageId();
+			const metadata: SixelImageMetadata = {
+				imageId,
+				columns: Math.max(1, Math.ceil(widthPx / cellSize.widthPx)),
+				rows: Math.max(1, Math.ceil(heightPx / cellSize.heightPx)),
+				sourceY: 0,
+				sourceHeight: heightPx,
+			};
+			registerSixelImage(imageId, prepared);
+			return {
+				sequence: `${sixelMarker(metadata)}${sequence}`,
+				columns: metadata.columns,
+				rows: metadata.rows,
+				imageId,
+			};
+		} catch {
+			return null;
+		}
 	}
 
 	return null;
