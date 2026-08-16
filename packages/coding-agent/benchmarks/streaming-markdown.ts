@@ -1,5 +1,5 @@
 import type { AssistantMessage } from "@hansjm10/volt-ai";
-import { Container, type Component, type Terminal, TUI } from "@hansjm10/volt-tui";
+import { Container, type Component, type Terminal, type TUI, TuiMainScreen } from "@hansjm10/volt-tui";
 import { initTheme } from "../src/core/theme/runtime.ts";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
 import {
@@ -143,7 +143,7 @@ async function createHarness(historyLines: number): Promise<{
 	tui: TUI;
 	component: AssistantMessageComponent;
 }> {
-	const tui = new TUI(new BenchmarkTerminal());
+	const tui = new TuiMainScreen(new BenchmarkTerminal());
 	const root = new Container();
 	const component = new AssistantMessageComponent();
 	root.addChild(new StaticHistory(historyLines));

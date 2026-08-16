@@ -10,6 +10,7 @@ export type ThemeColor =
 	| "dim"
 	| "text"
 	| "thinkingText"
+	| "searchMatchText"
 	| "userMessageText"
 	| "customMessageText"
 	| "customMessageLabel"
@@ -47,6 +48,8 @@ export type ThemeColor =
 
 export type ThemeBg =
 	| "selectedBg"
+	| "scrollbarThumb"
+	| "searchMatchBg"
 	| "userMessageBg"
 	| "customMessageBg"
 	| "toolPendingBg"

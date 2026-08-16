@@ -6,6 +6,14 @@ Extensions and custom tools can render custom TUI components for interactive use
 
 **Source:** [`@hansjm10/volt-tui`](../../tui)
 
+## Renderer and Layout Context
+
+Volt uses the main terminal buffer by default. This `regular` mode preserves terminal-owned native scrollback. Optional `fullscreen` mode uses the alternate terminal buffer, keeps the editor/status/footer dock fixed, and gives the transcript an application-owned scroll viewport. Extensions use the same `Component` and renderer-neutral `TUI` interfaces in both modes.
+
+`VStack`, `HStack`, and `ScrollView` expose constrained layout semantics only when mounted as the layout root of `TuiAltScreen`. In regular mode, components render as an ordinary unbounded document. In fullscreen mode, mouse-wheel input targets the deepest `ScrollView` under the pointer and can chain unused movement outward; keyboard viewport actions always target the `ScrollView` marked `primary`, independent of component keyboard focus.
+
+Library consumers must construct a concrete renderer: use `new TuiMainScreen(...)` for native scrollback or `new TuiAltScreen(...)` for an alternate-screen viewport. `TUI` is an interface and is not constructible. See the [`@hansjm10/volt-tui` README](../../tui/README.md) for renderer and constrained-layout examples.
+
 ## Component Interface
 
 All components implement:
@@ -416,7 +424,7 @@ renderResult(result, options, theme, context) {
 
 | Category | Colors |
 |----------|--------|
-| General | `text`, `accent`, `muted`, `dim` |
+| General | `text`, `accent`, `muted`, `dim`, `searchMatchText` |
 | Status | `success`, `error`, `warning` |
 | Borders | `border`, `borderAccent`, `borderMuted` |
 | Messages | `userMessageText`, `customMessageText`, `customMessageLabel` |
@@ -429,7 +437,7 @@ renderResult(result, options, theme, context) {
 
 **Background colors** (`theme.bg(color, text)`):
 
-`selectedBg`, `userMessageBg`, `customMessageBg`, `toolPendingBg`, `toolSuccessBg`, `toolErrorBg`
+`selectedBg`, `searchMatchBg`, `scrollbarThumb`, `userMessageBg`, `customMessageBg`, `toolPendingBg`, `toolSuccessBg`, `toolErrorBg`
 
 **For Markdown**, use `getMarkdownTheme()`:
 

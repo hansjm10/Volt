@@ -111,7 +111,9 @@ export function buildNotificationSequence(title: string, body: string, env: Node
 			return TERMINAL_ALERT_SEQUENCE;
 	}
 }
-const APPLE_TERMINAL_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
+const NATIVE_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
+const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
+const DEFAULT_SSH_ESCAPE_TIMEOUT_MS = 100;
 const DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7;
 const KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT_MS = 150;
 const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1b[?u\x1b[c`;
@@ -142,9 +144,25 @@ export function isAppleTerminalSession(): boolean {
 	return process.platform === "darwin" && TERM_PROGRAM === "Apple_Terminal";
 }
 
-export function normalizeAppleTerminalInput(data: string, isAppleTerminal: boolean, isShiftPressed: boolean): string {
-	if (isAppleTerminal && data === "\r" && isShiftPressed) return APPLE_TERMINAL_SHIFT_ENTER_SEQUENCE;
+export function normalizeNativeShiftEnterInput(
+	data: string,
+	shouldDetectNativeShiftEnter: boolean,
+	isShiftPressed: boolean,
+): string {
+	if (shouldDetectNativeShiftEnter && data === "\r" && isShiftPressed) return NATIVE_SHIFT_ENTER_SEQUENCE;
 	return data;
+}
+
+export function normalizeAppleTerminalInput(data: string, isAppleTerminal: boolean, isShiftPressed: boolean): string {
+	return normalizeNativeShiftEnterInput(data, isAppleTerminal, isShiftPressed);
+}
+
+/** Resolve the lone-Escape reassembly timeout without shortening fragmented CSI/mouse sequences. */
+export function resolveEscapeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+	const configured = Number(env["VOLT_TUI_ESC_TIMEOUT"]);
+	if (Number.isFinite(configured) && configured > 0) return configured;
+	if (env["SSH_CONNECTION"] || env["SSH_TTY"]) return DEFAULT_SSH_ESCAPE_TIMEOUT_MS;
+	return DEFAULT_ESCAPE_TIMEOUT_MS;
 }
 
 /**
@@ -302,7 +320,7 @@ export class ProcessTerminal implements Terminal {
 	 * to handle the case where the response arrives split across multiple events.
 	 */
 	private setupStdinBuffer(): void {
-		this.stdinBuffer = new StdinBuffer({ timeout: 10 });
+		this.stdinBuffer = new StdinBuffer({ escapeTimeout: resolveEscapeTimeoutMs() });
 
 		// Forward individual sequences to the input handler
 		this.stdinBuffer.on("data", (sequence) => {
@@ -440,11 +458,12 @@ export class ProcessTerminal implements Terminal {
 			return;
 		}
 		if (!this.inputHandler) return;
-		const isAppleTerminal = sequence === "\r" && isAppleTerminalSession();
-		const input = normalizeAppleTerminalInput(
+		const shouldDetectNativeShiftEnter =
+			sequence === "\r" && (isAppleTerminalSession() || process.platform === "win32");
+		const input = normalizeNativeShiftEnterInput(
 			sequence,
-			isAppleTerminal,
-			isAppleTerminal && isNativeModifierPressed("shift"),
+			shouldDetectNativeShiftEnter,
+			shouldDetectNativeShiftEnter && isNativeModifierPressed("shift"),
 		);
 		this.inputHandler(input);
 	}

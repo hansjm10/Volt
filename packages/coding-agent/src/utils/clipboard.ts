@@ -1,4 +1,4 @@
-import { execSync, spawn } from "child_process";
+import { execFileSync, execSync, spawn } from "child_process";
 import { platform } from "os";
 import { isWaylandSession } from "./clipboard-image.ts";
 
@@ -17,6 +17,45 @@ function copyToX11Clipboard(options: NativeClipboardExecOptions): void {
 }
 
 const MAX_OSC52_ENCODED_LENGTH = 100_000;
+const READ_CLIPBOARD_OPTIONS = {
+	encoding: "utf8" as const,
+	maxBuffer: 50 * 1024 * 1024,
+	timeout: 5000,
+};
+
+function readClipboardCommand(command: string, args: string[]): string | null {
+	try {
+		return execFileSync(command, args, READ_CLIPBOARD_OPTIONS) || null;
+	} catch {
+		return null;
+	}
+}
+
+/** Read plain text from the system clipboard without invoking a shell. */
+export async function readClipboardText(): Promise<string | null> {
+	const currentPlatform = platform();
+	if (currentPlatform === "darwin") return readClipboardCommand("pbpaste", []);
+	if (currentPlatform === "win32") {
+		return readClipboardCommand("powershell.exe", [
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			"Get-Clipboard -Raw",
+		]);
+	}
+	if (process.env.TERMUX_VERSION) {
+		const text = readClipboardCommand("termux-clipboard-get", []);
+		if (text !== null) return text;
+	}
+	if (isWaylandSession() && process.env.WAYLAND_DISPLAY) {
+		const text = readClipboardCommand("wl-paste", ["--no-newline", "--type", "text"]);
+		if (text !== null) return text;
+	}
+	return (
+		readClipboardCommand("xclip", ["-selection", "clipboard", "-o"]) ??
+		readClipboardCommand("xsel", ["--clipboard", "--output"])
+	);
+}
 
 function isRemoteSession(env: NodeJS.ProcessEnv = process.env): boolean {
 	return Boolean(env.SSH_CONNECTION || env.SSH_CLIENT || env.MOSH_CONNECTION);

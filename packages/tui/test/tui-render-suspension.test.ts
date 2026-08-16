@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { type Component, TUI } from "../src/tui.ts";
+import { type Component, TuiMainScreen } from "../src/index.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class CountingComponent implements Component {
@@ -17,7 +17,7 @@ class CountingComponent implements Component {
 describe("TUI render suspension", () => {
 	it("defers a pending normal render until the suspension is released", async () => {
 		const terminal = new VirtualTerminal();
-		const tui = new TUI(terminal);
+		const tui = new TuiMainScreen(terminal);
 		const component = new CountingComponent();
 		tui.addChild(component);
 
@@ -36,7 +36,7 @@ describe("TUI render suspension", () => {
 
 	it("coalesces a pending forced render across nested suspensions", async () => {
 		const terminal = new VirtualTerminal();
-		const tui = new TUI(terminal);
+		const tui = new TuiMainScreen(terminal);
 		const component = new CountingComponent();
 		tui.addChild(component);
 		tui.requestRender();

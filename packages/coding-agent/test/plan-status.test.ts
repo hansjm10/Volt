@@ -1,5 +1,6 @@
-import { visibleWidth } from "@hansjm10/volt-tui";
+import { TuiAltScreen, visibleWidth } from "@hansjm10/volt-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import type { PlanState } from "../src/core/planning.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
 import {
@@ -134,6 +135,34 @@ describe("Plan TUI components", () => {
 		expect(after).toContain("rows 9–16/");
 		expect(after).not.toContain("A summary that occupies");
 		expect(after).toContain("Plan step 6");
+	});
+
+	it("keeps fullscreen plan headers and actions fixed while its body scrolls", async () => {
+		initTheme("dark");
+		const terminal = new VirtualTerminal(80, 16);
+		const details = createDetails(readyPlan(40), 16);
+		details.setFullscreenActive(true);
+		const tui = new TuiAltScreen(terminal, false, "/tmp", { mouse: false });
+		tui.addChild(details);
+		tui.setLayoutRoot(details.getFullscreenLayout());
+		tui.setFocus(details);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			const before = plain(terminal.getViewport());
+			expect(before).toContain("Native Plan Mode");
+			expect(before).toContain("Execute Plan");
+			expect(before).toContain("Plan step 1");
+
+			terminal.sendInput("\u001b[6~");
+			await terminal.waitForRender();
+			const after = plain(terminal.getViewport());
+			expect(after).toContain("Native Plan Mode");
+			expect(after).toContain("Execute Plan");
+			expect(after).not.toContain("Plan step 1");
+		} finally {
+			tui.stop({ preserveScreen: true });
+		}
 	});
 
 	it("moves through ready actions and confirms the exact selected strategy", () => {

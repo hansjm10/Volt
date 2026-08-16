@@ -114,6 +114,9 @@ In interactive mode, run `/settings` and change **Personality**. The selection a
 | `editorPaddingX` | number | `0` | Horizontal padding for input editor (0-3) |
 | `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown (3-20) |
 | `showHardwareCursor` | boolean | `false` | Show the terminal cursor while TUI positions it for IME support |
+| `tuiMode` | string | `"regular"` | Interactive TUI mode: `"regular"` uses terminal-owned native scrollback; `"fullscreen"` uses an application-owned alternate-screen viewport. Changes from `/settings` apply immediately; `--tui-mode` overrides this setting only for the current run |
+| `fullscreenExitOutput` | string | `"transcript"` | Fullscreen shutdown output: `"transcript"` prints the final transcript before the normal resume hint, while `"resume-hint"` restores the previous screen without printing the transcript. Has no effect in regular mode |
+| `fullscreenScrollbar` | string | `"auto"` | Fullscreen transcript scrollbar: `"auto"` shows it temporarily while scrolling, `"always"` reserves the rightmost column and keeps it visible, and `"hidden"` hides it. Has no effect in regular mode |
 
 ### Telemetry and update checks
 
