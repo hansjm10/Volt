@@ -18,6 +18,7 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 
 type ShutdownThis = {
 	isShuttingDown: boolean;
+	flushStdout: () => Promise<void>;
 	unregisterSignalHandlers: () => void;
 	runtimeHost: { dispose: () => Promise<void> };
 	ui: { terminal: { drainInput: (ms: number) => Promise<void> } };
@@ -30,6 +31,7 @@ type ShutdownThis = {
 };
 
 type InteractiveModePrototypeWithShutdown = {
+	flushStdout(this: ShutdownThis): Promise<void>;
 	shutdown(this: ShutdownThis, options?: { fromSignal?: boolean }): Promise<void>;
 };
 
@@ -72,6 +74,7 @@ function restoreStdoutIsTTY(): void {
 function createContext(order: string[], sessionManager = createSessionManager()): ShutdownThis {
 	return {
 		isShuttingDown: false,
+		flushStdout: (interactiveModePrototype as InteractiveModePrototypeWithShutdown).flushStdout,
 		unregisterSignalHandlers: vi.fn(),
 		runtimeHost: {
 			dispose: vi.fn(async () => {
@@ -107,6 +110,19 @@ async function callShutdown(context: ShutdownThis, options?: { fromSignal?: bool
 	}
 }
 
+function getStdoutWriteCallback(args: readonly unknown[]): ((error?: Error | null) => void) | undefined {
+	for (let index = args.length - 1; index >= 0; index--) {
+		const value = args[index];
+		if (typeof value === "function") return value as (error?: Error | null) => void;
+	}
+	return undefined;
+}
+
+function completeStdoutWrite(...args: unknown[]): boolean {
+	getStdoutWriteCallback(args)?.();
+	return true;
+}
+
 describe("InteractiveMode.shutdown ordering (#5080)", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -129,6 +145,31 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		expect(context.isShuttingDown).toBe(true);
 	});
 
+	test("signal-triggered shutdown waits for stdout to flush before force-exiting", async () => {
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+			throw new ProcessExitError();
+		}) as typeof process.exit);
+		let completeFlush: (() => void) | undefined;
+		vi.spyOn(process.stdout, "write").mockImplementation(((...args: unknown[]) => {
+			const callback = getStdoutWriteCallback(args);
+			if (args[0] === "") {
+				completeFlush = () => callback?.();
+				return false;
+			}
+			callback?.();
+			return true;
+		}) as typeof process.stdout.write);
+		const context = createContext([]);
+
+		const shutdown = callShutdown(context, { fromSignal: true });
+		await vi.waitFor(() => expect(completeFlush).toBeTypeOf("function"));
+		expect(exit).not.toHaveBeenCalled();
+
+		completeFlush?.();
+		await shutdown;
+		expect(exit).toHaveBeenCalledWith(0);
+	});
+
 	test("interactive quit stops the TUI before emitting session_shutdown", async () => {
 		vi.spyOn(process, "exit").mockImplementation((() => {
 			throw new ProcessExitError();
@@ -147,7 +188,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		}) as typeof process.exit);
 		const stdoutWrite = vi
 			.spyOn(process.stdout, "write")
-			.mockImplementation((() => true) as typeof process.stdout.write);
+			.mockImplementation(completeStdoutWrite as typeof process.stdout.write);
 		setStdoutIsTTY(true);
 		const order: string[] = [];
 		const context = createContext(order, createSessionManager({ sessionFile: createTempFile() }));
@@ -166,7 +207,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		}) as typeof process.exit);
 		const stdoutWrite = vi
 			.spyOn(process.stdout, "write")
-			.mockImplementation((() => true) as typeof process.stdout.write);
+			.mockImplementation(completeStdoutWrite as typeof process.stdout.write);
 		setStdoutIsTTY(true);
 		const order: string[] = [];
 		const context = createContext(order, createSessionManager({ sessionFile: createTempFile() }));

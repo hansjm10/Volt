@@ -164,6 +164,51 @@ describe("ToolExecutionComponent parity", () => {
 		}
 	});
 
+	test("converts an existing non-PNG tool image after delayed Sixel detection", async () => {
+		setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		try {
+			let renderRequests = 0;
+			const tui = { requestRender: () => renderRequests++ } as unknown as TUI;
+			const component = new ToolExecutionComponent(
+				"custom_tool",
+				"tool-delayed-sixel-gif",
+				{},
+				{},
+				createBaseToolDefinition(),
+				tui,
+				process.cwd(),
+			);
+			component.updateResult(
+				{
+					content: [
+						{
+							type: "image",
+							mimeType: "image/gif",
+							data: "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
+						},
+					],
+					details: {},
+					isError: false,
+				},
+				false,
+			);
+			expect(component.render(120).join("\n")).not.toContain("\x1bP0;1;0q");
+			expect(renderRequests).toBe(0);
+
+			setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+			component.invalidate();
+
+			await vi.waitFor(() => expect(renderRequests).toBeGreaterThan(0));
+			const rendered = component.render(120).join("\n");
+			expect(rendered).toContain("\x1bP0;1;0q");
+			expect(rendered).not.toContain("[image/gif]");
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
 	test("ignores a stale non-PNG conversion that completes after a newer image", async () => {
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
 		const oldConversion = deferred<{ data: string; mimeType: string } | null>();

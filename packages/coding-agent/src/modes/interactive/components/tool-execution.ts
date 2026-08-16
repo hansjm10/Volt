@@ -377,6 +377,7 @@ export class ToolExecutionComponent extends Container {
 	override invalidate(): void {
 		super.invalidate();
 		this.updateDisplay();
+		this.maybeConvertImagesForTerminal();
 	}
 
 	override render(width: number): string[] {

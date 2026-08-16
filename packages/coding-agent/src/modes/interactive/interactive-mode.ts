@@ -4509,6 +4509,24 @@ export class InteractiveMode {
 	 */
 	private isShuttingDown = false;
 
+	private async flushStdout(): Promise<void> {
+		await new Promise<void>((resolve) => {
+			let settled = false;
+			const settle = () => {
+				if (settled) return;
+				settled = true;
+				process.stdout.off("error", settle);
+				resolve();
+			};
+			process.stdout.once("error", settle);
+			try {
+				process.stdout.write("", settle);
+			} catch {
+				settle();
+			}
+		});
+	}
+
 	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
 		if (this.isShuttingDown) return;
 		this.isShuttingDown = true;
@@ -4538,6 +4556,7 @@ export class InteractiveMode {
 			await rememberActiveProfile();
 			await this.ui.terminal.drainInput(1000);
 			this.stop();
+			await this.flushStdout();
 			process.exit(0);
 		}
 
@@ -4560,6 +4579,7 @@ export class InteractiveMode {
 			process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
 		}
 
+		await this.flushStdout();
 		process.exit(0);
 	}
 
