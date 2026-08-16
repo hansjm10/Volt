@@ -1,10 +1,11 @@
-import { execSync, spawn } from "child_process";
+import { execFileSync, execSync, spawn } from "child_process";
 import { platform } from "os";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { copyToClipboard } from "../src/utils/clipboard.ts";
+import { copyToClipboard, readClipboardText } from "../src/utils/clipboard.ts";
 
 const mocks = vi.hoisted(() => {
 	return {
+		execFileSync: vi.fn(),
 		execSync: vi.fn(),
 		spawn: vi.fn(),
 		platform: vi.fn<() => NodeJS.Platform>(),
@@ -14,6 +15,7 @@ const mocks = vi.hoisted(() => {
 
 vi.mock("child_process", () => {
 	return {
+		execFileSync: mocks.execFileSync,
 		execSync: mocks.execSync,
 		spawn: mocks.spawn,
 	};
@@ -31,6 +33,7 @@ vi.mock("../src/utils/clipboard-image.js", () => {
 	};
 });
 
+const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedExecSync = vi.mocked(execSync);
 const mockedSpawn = vi.mocked(spawn);
 const mockedPlatform = vi.mocked(platform);
@@ -48,6 +51,7 @@ beforeEach(() => {
 	vi.stubEnv("SSH_CLIENT", "");
 	vi.stubEnv("MOSH_CONNECTION", "");
 	stdoutWrites = [];
+	mocks.execFileSync.mockReset();
 	mocks.execSync.mockReset();
 	mocks.spawn.mockReset();
 	mocks.platform.mockReset();
@@ -68,6 +72,24 @@ beforeEach(() => {
 afterEach(() => {
 	process.stdout.write = originalWrite;
 	vi.unstubAllEnvs();
+});
+
+describe("readClipboardText", () => {
+	test("reads Windows text without a PowerShell formatting newline", async () => {
+		mockedPlatform.mockReturnValue("win32");
+		mockedExecFileSync.mockReturnValue("abc");
+
+		await expect(readClipboardText()).resolves.toBe("abc");
+		expect(mockedExecFileSync).toHaveBeenCalledWith(
+			"powershell.exe",
+			["-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write((Get-Clipboard -Raw))"],
+			{
+				encoding: "utf8",
+				maxBuffer: 50 * 1024 * 1024,
+				timeout: 5000,
+			},
+		);
+	});
 });
 
 describe("copyToClipboard", () => {

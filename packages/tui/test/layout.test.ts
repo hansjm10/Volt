@@ -46,6 +46,41 @@ describe("viewport layout", () => {
 		assert.deepStrictEqual(visibleLines(frame.lines), ["top", "body", "", ""]);
 	});
 
+	it("distributes equal grow weights evenly", () => {
+		const frame = renderLayoutFrame(
+			new VStack([
+				{ component: new Text("first", 0, 0), basis: 0, grow: 1 },
+				{ component: new Text("second", 0, 0), basis: 0, grow: 1 },
+			]),
+			10,
+			10,
+			() => {},
+		);
+
+		assert.deepStrictEqual(
+			frame.root.children.map((child) => child.rect.height),
+			[5, 5],
+		);
+	});
+
+	it("distributes equal shrink weights evenly", () => {
+		const content = Array.from({ length: 10 }, (_, index) => `line ${index}`).join("\n");
+		const frame = renderLayoutFrame(
+			new VStack([
+				{ component: new Text(content, 0, 0), shrink: 1 },
+				{ component: new Text(content, 0, 0), shrink: 1 },
+			]),
+			10,
+			10,
+			() => {},
+		);
+
+		assert.deepStrictEqual(
+			frame.root.children.map((child) => child.rect.height),
+			[5, 5],
+		);
+	});
+
 	it("does not render fixed-basis scroll content during stack measurement", () => {
 		let renderCount = 0;
 		const transcript = new ScrollView({

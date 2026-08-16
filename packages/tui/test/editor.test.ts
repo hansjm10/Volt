@@ -4,6 +4,7 @@ import { stripVTControlCharacters } from "node:util";
 import { type AutocompleteProvider, CombinedAutocompleteProvider } from "../src/autocomplete.ts";
 import { Editor, wordWrapLine } from "../src/components/editor.ts";
 import { type TUI, TuiMainScreen } from "../src/index.ts";
+import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keybindings.ts";
 import { visibleWidth } from "../src/utils.ts";
 import { defaultEditorTheme } from "./test-themes.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
@@ -51,6 +52,31 @@ describe("Editor component", () => {
 			editor.handleInput("\x1b[A"); // Up arrow
 
 			assert.strictEqual(editor.getText(), "");
+		});
+
+		it("dispatches independently configured history actions", () => {
+			const originalKeybindings = getKeybindings();
+			setKeybindings(
+				new KeybindingsManager(TUI_KEYBINDINGS, {
+					"tui.editor.cursorUp": [],
+					"tui.editor.cursorDown": [],
+					"tui.editor.historyPrevious": "up",
+					"tui.editor.historyNext": "down",
+				}),
+			);
+			try {
+				const editor = new Editor(createTestTUI(), defaultEditorTheme);
+				editor.addToHistory("first prompt");
+				editor.addToHistory("second prompt");
+
+				editor.handleInput("\x1b[A");
+				assert.strictEqual(editor.getText(), "second prompt");
+
+				editor.handleInput("\x1b[B");
+				assert.strictEqual(editor.getText(), "");
+			} finally {
+				setKeybindings(originalKeybindings);
+			}
 		});
 
 		it("shows most recent history entry on Up arrow when editor is empty", () => {

@@ -40,7 +40,7 @@ export async function readClipboardText(): Promise<string | null> {
 			"-NoProfile",
 			"-NonInteractive",
 			"-Command",
-			"Get-Clipboard -Raw",
+			"[Console]::Out.Write((Get-Clipboard -Raw))",
 		]);
 	}
 	if (process.env.TERMUX_VERSION) {

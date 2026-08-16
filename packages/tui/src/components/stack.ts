@@ -110,25 +110,38 @@ function distribute(
 			});
 		if (candidates.length === 0) return;
 
-		const totalWeight = candidates.reduce((sum, { entry, index }) => {
-			return sum + (mode === "grow" ? (entry.grow ?? 0) : (entry.shrink ?? 1) * Math.max(1, sizes[index]!));
-		}, 0);
-		let distributed = 0;
-		for (const { entry, index } of candidates) {
-			if (remaining <= 0) break;
-			const weight = mode === "grow" ? (entry.grow ?? 0) : (entry.shrink ?? 1) * Math.max(1, sizes[index]!);
-			const proposed = Math.max(1, Math.floor((remaining * weight) / totalWeight));
+		const weightedCandidates = candidates.map(({ entry, index }) => ({
+			entry,
+			index,
+			weight: mode === "grow" ? (entry.grow ?? 0) : (entry.shrink ?? 1) * Math.max(1, sizes[index]!),
+		}));
+		const totalWeight = weightedCandidates.reduce((sum, candidate) => sum + candidate.weight, 0);
+		const roundAmount = remaining;
+		const shares = weightedCandidates.map(({ entry, index, weight }) => {
+			const exactShare = (roundAmount * weight) / totalWeight;
 			const capacity =
 				mode === "grow"
 					? (entry.maxSize ?? Number.MAX_SAFE_INTEGER) - sizes[index]!
 					: sizes[index]! - (entry.minSize ?? 0);
-			const delta = Math.min(remaining, proposed, capacity);
-			if (delta <= 0) continue;
-			sizes[index] = sizes[index]! + (mode === "grow" ? delta : -delta);
-			remaining -= delta;
-			distributed += delta;
+			return {
+				index,
+				capacity,
+				delta: Math.min(capacity, Math.floor(exactShare)),
+				remainder: exactShare - Math.floor(exactShare),
+			};
+		});
+		let distributed = shares.reduce((sum, share) => sum + share.delta, 0);
+		for (const share of [...shares].sort((a, b) => b.remainder - a.remainder || a.index - b.index)) {
+			if (distributed >= roundAmount) break;
+			if (share.delta >= share.capacity) continue;
+			share.delta += 1;
+			distributed += 1;
 		}
 		if (distributed === 0) return;
+		for (const { index, delta } of shares) {
+			sizes[index] = sizes[index]! + (mode === "grow" ? delta : -delta);
+		}
+		remaining -= distributed;
 	}
 }
 
