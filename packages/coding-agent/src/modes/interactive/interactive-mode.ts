@@ -5317,7 +5317,7 @@ export class InteractiveMode {
 	private switchTuiMode(mode: TuiMode, restoreProgress = true, startRenderer = true): boolean {
 		const previousUi = this.renderer;
 		if (mode === previousUi.mode) return true;
-		if (previousUi.hasOverlay()) return false;
+		if (previousUi.hasOverlayEntries) return false;
 
 		const focus = previousUi.getFocusedComponent();
 		const terminal = previousUi.terminal;

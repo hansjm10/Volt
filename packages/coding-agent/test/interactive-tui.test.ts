@@ -131,6 +131,92 @@ describe("createInteractiveTui", () => {
 		expect([terminal.startCount, terminal.stopCount]).toEqual([2, 2]);
 	});
 
+	it.each([
+		{
+			name: "visible",
+			initiallyVisible: true,
+			prepare: (ui: TUI, overlay: Component) => {
+				ui.showOverlay(overlay);
+				return () => {};
+			},
+		},
+		{
+			name: "temporarily hidden",
+			initiallyVisible: false,
+			prepare: (ui: TUI, overlay: Component) => {
+				const handle = ui.showOverlay(overlay);
+				handle.setHidden(true);
+				return () => handle.setHidden(false);
+			},
+		},
+		{
+			name: "responsively invisible",
+			initiallyVisible: false,
+			prepare: (ui: TUI, overlay: Component) => {
+				let visible = false;
+				ui.showOverlay(overlay, { visible: () => visible });
+				return () => {
+					visible = true;
+				};
+			},
+		},
+	] satisfies Array<{
+		name: string;
+		initiallyVisible: boolean;
+		prepare: (ui: TUI, overlay: Component) => () => void;
+	}>)("blocks renderer replacement while it owns a $name overlay entry", async ({ initiallyVisible, prepare }) => {
+		const terminal = new RecordingTerminal(40, 8);
+		const previousRenderer = createInteractiveTui({
+			tuiMode: "regular",
+			showHardwareCursor: false,
+			logDirectory: "/tmp",
+			terminal,
+		});
+		const component = { render: () => ["content"], invalidate: () => {} } satisfies Component;
+		const overlay = { render: () => ["overlay"], invalidate: () => {} } satisfies Component;
+		const view = { regularComponents: [component], fullscreenRoot: component };
+		previousRenderer.addChild(component);
+
+		const context = Object.assign(Object.create(InteractiveMode.prototype), {
+			renderer: previousRenderer,
+			ui: undefined as unknown as TUI,
+			activeView: view,
+			conversationView: view,
+			planDetails: undefined,
+			mainScreenRenderState: undefined,
+			sessionRenderSuspension: undefined as RenderSuspensionLease | undefined,
+			options: { tuiMode: "regular" as TuiMode },
+			onRightClickPaste: () => undefined,
+			extensionTerminalInputSubscriptions: new Set(),
+		});
+		context.ui = createInteractiveTuiReference(() => context.renderer);
+		const prototype = InteractiveMode.prototype as unknown as {
+			switchTuiMode(this: typeof context, mode: TuiMode, restoreProgress?: boolean): boolean;
+		};
+
+		previousRenderer.start();
+		try {
+			await terminal.waitForRender();
+			const makeVisible = prepare(context.ui, overlay);
+			expect(previousRenderer.hasOverlay()).toBe(initiallyVisible);
+			expect(previousRenderer.hasOverlayEntries).toBe(true);
+
+			const switched = prototype.switchTuiMode.call(context, "fullscreen", false);
+			await terminal.waitForRender();
+			makeVisible();
+
+			expect.soft(switched).toBe(false);
+			expect.soft(context.renderer === previousRenderer).toBe(true);
+			expect.soft(previousRenderer.hasOverlayEntries).toBe(true);
+			expect.soft(previousRenderer.hasOverlay()).toBe(true);
+			expect.soft(context.renderer.hasOverlayEntries).toBe(true);
+			expect.soft(context.renderer.hasOverlay()).toBe(true);
+		} finally {
+			context.renderer.stop({ preserveScreen: true });
+			previousRenderer.stop({ preserveScreen: true });
+		}
+	});
+
 	it("prints the regular transcript when fullscreen exit output requests it", async () => {
 		const terminal = new RecordingTerminal(40, 8);
 		const renderer = createInteractiveTui({
