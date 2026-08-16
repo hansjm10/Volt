@@ -140,9 +140,9 @@ describe("TuiAltScreen", () => {
 		await terminal.waitForRender();
 		assert.deepStrictEqual(
 			terminal.getViewport().map((line) => line.trimEnd()),
-			["line 6", "line 7", "line 8", "line 9"],
+			["line 4", "line 5", "line 6", "line 7"],
 		);
-		assert.strictEqual(tui.viewportTop, 5);
+		assert.strictEqual(tui.viewportTop, 3);
 		assert.strictEqual(tui.isFollowingOutput, false);
 
 		text.setText(Array.from({ length: 12 }, (_, index) => `line ${index + 1}`).join("\n"));
@@ -150,7 +150,7 @@ describe("TuiAltScreen", () => {
 		await terminal.waitForRender();
 		assert.deepStrictEqual(
 			terminal.getViewport().map((line) => line.trimEnd()),
-			["line 6", "line 7", "line 8", "line 9"],
+			["line 4", "line 5", "line 6", "line 7"],
 		);
 
 		tui.stop();
@@ -181,7 +181,7 @@ describe("TuiAltScreen", () => {
 		await terminal.waitForRender();
 		assert.deepStrictEqual(
 			terminal.getViewport().map((line) => line.trimEnd()),
-			["line 4", "line 5", "line 6", "line 7", "editor", "footer"],
+			["line 2", "line 3", "line 4", "line 5", "editor", "footer"],
 		);
 		assert.strictEqual(transcript.isFollowingEnd, false);
 
@@ -190,7 +190,7 @@ describe("TuiAltScreen", () => {
 		await terminal.waitForRender();
 		assert.deepStrictEqual(
 			terminal.getViewport().map((line) => line.trimEnd()),
-			["line 4", "line 5", "line 6", "line 7", "editor", "footer"],
+			["line 2", "line 3", "line 4", "line 5", "editor", "footer"],
 		);
 
 		tui.scrollToBottom();
@@ -238,10 +238,10 @@ describe("TuiAltScreen", () => {
 		terminal.sendInput("\x1b[<64;15;1M");
 		await terminal.waitForRender();
 		assert.strictEqual(left.scrollTop, 3);
-		assert.strictEqual(right.scrollTop, 2);
+		assert.strictEqual(right.scrollTop, 0);
 		assert.deepStrictEqual(
 			terminal.getViewport().map((line) => line.trimEnd()),
-			["a4        b3", "a5        b4", "a6        b5", "a7        b6"],
+			["a4        b1", "a5        b2", "a6        b3", "a7        b4"],
 		);
 		tui.stop();
 	});
@@ -337,10 +337,10 @@ describe("TuiAltScreen", () => {
 
 		terminal.sendInput("\x1b[<65;10;1M");
 		await terminal.waitForRender();
-		assert.strictEqual(scrollView.scrollTop, 1);
+		assert.strictEqual(scrollView.scrollTop, 3);
 		assert.strictEqual(scrollView.isScrollbarVisible, true);
 
-		terminal.sendInput("\x1b[<0;10;1M");
+		terminal.sendInput("\x1b[<0;10;2M");
 		await terminal.waitForRender();
 		await new Promise((resolve) => setTimeout(resolve, 70));
 		assert.strictEqual(scrollView.isScrollbarVisible, true);
@@ -362,9 +362,9 @@ describe("TuiAltScreen", () => {
 		await new Promise((resolve) => setTimeout(resolve, 70));
 		assert.strictEqual(scrollView.isScrollbarVisible, false);
 
-		terminal.sendInput("\x1b[<64;10;5M");
+		terminal.sendInput("\x1b[<64;10;4M");
 		await terminal.waitForRender();
-		assert.strictEqual(scrollView.scrollTop, 14);
+		assert.strictEqual(scrollView.scrollTop, 12);
 		await new Promise((resolve) => setTimeout(resolve, 70));
 		assert.strictEqual(scrollView.isScrollbarVisible, true);
 		terminal.sendInput("\x1b[<35;9;5M");
@@ -1220,8 +1220,8 @@ describe("TuiAltScreen", () => {
 
 		terminal.sendInput("\x1b[<65;10;1M");
 		await terminal.waitForRender();
-		assert.strictEqual(scrollView.scrollTop, 1);
-		terminal.sendInput("\x1b[<0;10;1M");
+		assert.strictEqual(scrollView.scrollTop, 3);
+		terminal.sendInput("\x1b[<0;10;2M");
 		terminal.sendInput("\x1b[O");
 		terminal.sendInput("\x1b[<32;10;4M");
 		await terminal.waitForRender();
@@ -1229,7 +1229,7 @@ describe("TuiAltScreen", () => {
 		terminal.sendInput("\x1b[<0;10;4m");
 
 		tui.stop();
-		assert.strictEqual(scrollTopAfterOrphanedDrag, 1);
+		assert.strictEqual(scrollTopAfterOrphanedDrag, 3);
 	});
 
 	it("clears scrollbar hover through ProcessTerminal semantic focus loss", async () => {

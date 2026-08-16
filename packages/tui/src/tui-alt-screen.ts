@@ -139,7 +139,7 @@ interface SearchHighlightRange {
 }
 
 export interface TuiAltScreenOptions {
-	/** Number of logical lines moved for each mouse-wheel event. */
+	/** Number of logical lines moved for each mouse-wheel event. Defaults to 3. */
 	wheelScrollLines?: number;
 	/** Capture mouse events for viewport scrolling and application-owned text selection. */
 	mouse?: boolean;
@@ -217,7 +217,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		};
 		this.implicitScrollView = new ScrollView(this.implicitDocument, { follow: "end", primary: true });
 		this.flashes = new AltScreenFlashContainer(() => this.requestRender());
-		this.wheelScrollLines = Math.max(1, Math.floor(options.wheelScrollLines ?? 1));
+		this.wheelScrollLines = Math.max(1, Math.floor(options.wheelScrollLines ?? 3));
 		this.mouseEnabled = options.mouse ?? true;
 		this.searchMatchStyle = options.searchMatchStyle ?? ((text) => `\x1b[4m${text}\x1b[24m`);
 		this.searchCurrentMatchStyle = options.searchCurrentMatchStyle ?? ((text) => `\x1b[1;7m${text}\x1b[22;27m`);
