@@ -3,6 +3,7 @@ import { type Component, truncateToWidth, visibleWidth } from "@hansjm10/volt-tu
 import type { AgentSession } from "../../../core/agent-session.ts";
 import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
+import type { SessionUsageProjection } from "../../../core/session-usage.ts";
 import { theme } from "../../../core/theme/runtime.ts";
 
 /**
@@ -61,6 +62,7 @@ export class FooterComponent implements Component {
 	private session: AgentSession;
 	private footerData: ReadonlyFooterDataProvider;
 	private snapshot?: FooterSnapshot;
+	private transientUsage?: SessionUsageProjection;
 
 	constructor(session: AgentSession, footerData: ReadonlyFooterDataProvider) {
 		this.session = session;
@@ -70,10 +72,15 @@ export class FooterComponent implements Component {
 	setSession(session: AgentSession): void {
 		this.session = session;
 		this.snapshot = undefined;
+		this.transientUsage = undefined;
 	}
 
 	setAutoCompactEnabled(enabled: boolean): void {
 		this.autoCompactEnabled = enabled;
+	}
+
+	setTransientUsage(usage: SessionUsageProjection | undefined): void {
+		this.transientUsage = usage;
 	}
 
 	/** Clear session-derived aggregates. Git branch caching is handled by the provider. */
@@ -126,8 +133,18 @@ export class FooterComponent implements Component {
 	render(width: number): string[] {
 		if (width <= 0) return [];
 		const state = this.session.state;
-		const { totalInput, totalOutput, totalCacheRead, totalCacheWrite, totalCost, latestCacheHitRate, contextUsage } =
-			this.getSnapshot();
+		const snapshot = this.getSnapshot();
+		const transientUsage = this.transientUsage;
+		const totalInput = transientUsage?.totals.input ?? snapshot.totalInput;
+		const totalOutput = transientUsage?.totals.output ?? snapshot.totalOutput;
+		const totalCacheRead = transientUsage?.totals.cacheRead ?? snapshot.totalCacheRead;
+		const totalCacheWrite = transientUsage?.totals.cacheWrite ?? snapshot.totalCacheWrite;
+		const totalCost = transientUsage?.totals.cost ?? snapshot.totalCost;
+		const latestCacheHitRate = transientUsage ? transientUsage.latestCacheHitRate : snapshot.latestCacheHitRate;
+		const contextUsage = transientUsage ? transientUsage.contextUsage : snapshot.contextUsage;
+		const activeModel = transientUsage?.model ?? state.model;
+		const activeThinkingLevel = transientUsage ? transientUsage.thinkingLevel : state.thinkingLevel;
+		const fastModeEnabled = transientUsage ? transientUsage.fastModeEnabled : this.session.fastModeEnabled;
 
 		const cwd = this.session.sessionManager.getCwd();
 		const workspace =
@@ -143,21 +160,21 @@ export class FooterComponent implements Component {
 		const workspaceSide =
 			theme.fg("text", workspaceParts[0]!) +
 			(workspaceParts.length > 1 ? theme.fg("dim", ` · ${workspaceParts.slice(1).join(" · ")}`) : "");
-		const modelName = state.model?.id || "no-model";
+		const modelName = activeModel?.id || "no-model";
 		const provider =
-			width >= 100 && this.footerData.getAvailableProviderCount() > 1 && state.model
-				? theme.fg("dim", `(${state.model.provider}) `)
+			width >= 100 && this.footerData.getAvailableProviderCount() > 1 && activeModel
+				? theme.fg("dim", `(${activeModel.provider}) `)
 				: "";
-		const thinking = state.model?.reasoning ? theme.fg("dim", ` · ${state.thinkingLevel || "off"}`) : "";
+		const thinking = activeModel?.reasoning ? theme.fg("dim", ` · ${activeThinkingLevel || "off"}`) : "";
 		const model = theme.fg("text", modelName);
 		const fastLabel = theme.bold(theme.fg("warning", "fast"));
-		const fast = this.session.fastModeEnabled ? `${theme.fg("dim", " · ")}${fastLabel}` : "";
+		const fast = fastModeEnabled ? `${theme.fg("dim", " · ")}${fastLabel}` : "";
 		let modelSide = `${provider}${model}${fast}${thinking}`;
 		if (visibleWidth(modelSide) >= width) {
 			const modelWithoutProvider = `${model}${fast}${thinking}`;
 			if (visibleWidth(modelWithoutProvider) < width) {
 				modelSide = modelWithoutProvider;
-			} else if (this.session.fastModeEnabled) {
+			} else if (fastModeEnabled) {
 				const fastAndThinking = `${fastLabel}${thinking}`;
 				if (visibleWidth(fastAndThinking) > width) {
 					modelSide = truncateToWidth(fastLabel, width, "");
@@ -182,7 +199,7 @@ export class FooterComponent implements Component {
 		const workspacePadding = " ".repeat(Math.max(0, width - workspaceWidth - modelWidth));
 		const workspaceLine = `${fittedWorkspace}${workspacePadding}${modelSide}`;
 
-		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
+		const contextWindow = contextUsage?.contextWindow ?? activeModel?.contextWindow ?? 0;
 		const contextPercentValue = contextUsage?.percent ?? 0;
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
 		const autoIndicator = this.autoCompactEnabled ? " auto" : "";
@@ -202,7 +219,7 @@ export class FooterComponent implements Component {
 					: theme.fg("muted", contextDisplay);
 
 		const detailParts = [`${theme.fg("dim", "context")} ${contextValue}`];
-		const usingSubscription = state.model ? this.session.modelRegistry.isUsingOAuth(state.model) : false;
+		const usingSubscription = activeModel ? this.session.modelRegistry.isUsingOAuth(activeModel) : false;
 		if (usingSubscription) detailParts.push(theme.fg("dim", "subscription"));
 		if (totalCost) detailParts.push(theme.fg("dim", `$${totalCost.toFixed(3)}`));
 		if (totalInput) detailParts.push(theme.fg("dim", `↑${formatTokens(totalInput)}`));

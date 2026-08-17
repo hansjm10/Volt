@@ -286,6 +286,44 @@ describe("FooterComponent width handling", () => {
 		expect(statsLine).toContain("CH25.0%");
 	});
 
+	it("shows transient isolated-workflow usage without changing the workspace session", () => {
+		const session = createSession({
+			sessionName: "parent-session",
+			modelId: "parent-model",
+			reasoning: true,
+			thinkingLevel: "low",
+			usage: {
+				input: 100,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.1 },
+			},
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+		footer.setTransientUsage({
+			model: { ...session.state.model!, id: "review-model", contextWindow: 100_000 },
+			thinkingLevel: "high",
+			fastModeEnabled: true,
+			contextUsage: { tokens: 75_000, contextWindow: 100_000, percent: 75 },
+			totals: { input: 300, output: 30, cacheRead: 150, cacheWrite: 0, cost: 0.3 },
+			latestCacheHitRate: 50,
+		});
+
+		const workflowLines = footer.render(120).map(stripAnsi);
+		expect(workflowLines[0]).toContain("project · main · parent-session");
+		expect(workflowLines[0]).toContain("review-model · fast · high");
+		expect(workflowLines[1]).toContain("context 75.0%/100k auto");
+		expect(workflowLines[1]).toContain("$0.300");
+		expect(workflowLines[1]).toContain("CH50.0%");
+
+		footer.setTransientUsage(undefined);
+		const restoredLines = footer.render(120).map(stripAnsi);
+		expect(restoredLines[0]).toContain("parent-model · low");
+		expect(restoredLines[1]).toContain("context 12.3%/200k auto");
+		expect(restoredLines[1]).toContain("$0.100");
+	});
+
 	it("warns at the configured absolute context threshold", () => {
 		const warningFooter = new FooterComponent(
 			createSession({
