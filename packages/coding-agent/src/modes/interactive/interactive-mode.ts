@@ -8605,6 +8605,7 @@ export class InteractiveMode {
 		};
 
 		const cleanup = () => {
+			this.footer.setTransientUsage(undefined);
 			reviewRenderer.dispose();
 			loader.dispose();
 			this.editorContainer.clear();
@@ -8620,6 +8621,10 @@ export class InteractiveMode {
 				this.ui.requestRender();
 			},
 			onSessionEvent: reviewRenderer.onSessionEvent,
+			onUsage: (usage) => {
+				this.footer.setTransientUsage(usage);
+				this.ui.requestRender();
+			},
 			cleanup,
 		};
 	}
