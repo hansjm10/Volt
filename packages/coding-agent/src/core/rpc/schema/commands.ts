@@ -270,6 +270,11 @@ export const RPC_COMMAND_SCHEMAS = {
 		beforeEntryId: Type.Optional(Type.String()),
 		branchEpoch: Type.Optional(RpcConversationIdentifierSchema),
 	}),
+	get_session_tree: commandSchema("get_session_tree", {
+		sessionId: Type.Optional(RpcConversationIdentifierSchema),
+		limit: Type.Optional(Type.Integer({ minimum: 1, "x-volt-expected": "be a positive integer" })),
+		afterOrdinal: Type.Optional(Type.Integer({ minimum: 0, "x-volt-expected": "be a non-negative integer" })),
+	}),
 	get_message_images: commandSchema("get_message_images", {
 		sessionId: Type.Optional(RpcConversationIdentifierSchema),
 		entryId: Type.String(),

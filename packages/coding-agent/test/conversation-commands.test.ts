@@ -818,6 +818,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 		const storedBranch = Array.from({ length: 9_998 }, (_, index) => ({
 			type: "message",
 			id: `user-${index}`,
+			parentId: index === 0 ? null : `user-${index - 1}`,
 			timestamp: new Date(index + 1).toISOString(),
 			message: { role: "user", content: [{ type: "text", text: "filler" }] },
 		})) as unknown as SessionEntry[];
@@ -825,6 +826,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 			{
 				type: "message",
 				id: "tool-call",
+				parentId: "user-9997",
 				timestamp: new Date(9_999).toISOString(),
 				message: {
 					role: "assistant",
@@ -834,6 +836,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 			{
 				type: "message",
 				id: "tool-result",
+				parentId: "tool-call",
 				timestamp: new Date(10_000).toISOString(),
 				message: {
 					role: "toolResult",
@@ -868,6 +871,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 			{
 				type: "message",
 				id: "e-registry-call",
+				parentId: null,
 				timestamp: "2026-07-06T00:00:00.000Z",
 				message: {
 					role: "assistant",
@@ -884,6 +888,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 			{
 				type: "message",
 				id: "e-registry-result",
+				parentId: "e-registry-call",
 				timestamp: "2026-07-06T00:00:01.000Z",
 				message: {
 					role: "toolResult",

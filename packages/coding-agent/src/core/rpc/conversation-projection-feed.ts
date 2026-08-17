@@ -620,6 +620,7 @@ const CONVERSATION_PROJECTION_RESPONSE_COMMANDS: ReadonlySet<string> = new Set([
 	"get_message_images",
 	"get_messages",
 	"get_session_stats",
+	"get_session_tree",
 	"get_state",
 	"get_transcript",
 	"get_transcript_entry_text",
