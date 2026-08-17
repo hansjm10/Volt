@@ -168,6 +168,33 @@ test("get_session_tree pages sanitized branch topology without raw session entri
 	}
 });
 
+test("local session tree projects transcript content only for admitted nodes", async () => {
+	const harness = await createHarness();
+	try {
+		const firstId = harness.sessionManager.appendMessage({ role: "user", content: "first", timestamp: 1 });
+		const offPageMessage = { role: "user" as const, content: "off-page", timestamp: 2 };
+		harness.sessionManager.appendMessage(offPageMessage);
+		let offPageContentReads = 0;
+		Object.defineProperty(offPageMessage, "content", {
+			configurable: true,
+			get: () => {
+				offPageContentReads++;
+				return "off-page";
+			},
+		});
+
+		const tree = getSuccessfulTree(
+			await dispatchLocalRpcCommand({ id: "local-tree", type: "get_session_tree", limit: 1 }, harness),
+		);
+		expect(tree.nodes).toHaveLength(1);
+		expect(tree.nodes[0]).toMatchObject({ entryId: firstId, transcript: { text: "first" } });
+		expect(tree.hasMore).toBe(true);
+		expect(offPageContentReads).toBe(0);
+	} finally {
+		harness.cleanup();
+	}
+});
+
 test("session tree resolves reused tool-call ids within each branch", async () => {
 	const harness = await createHarness();
 	try {
@@ -194,7 +221,7 @@ test("session tree resolves reused tool-call ids within each branch", async () =
 		appendReadCall("branch-a-later.txt", 4);
 		const branchALaterResultId = appendReadResult(5);
 		harness.sessionManager.branch(rootId);
-		appendReadCall("branch-b.txt", 6);
+		const branchBCallId = appendReadCall("branch-b.txt", 6);
 		const branchBResultId = appendReadResult(7);
 
 		const runtime: ConversationCommandRuntime = {
@@ -241,6 +268,32 @@ test("session tree resolves reused tool-call ids within each branch", async () =
 				},
 			});
 		}
+
+		const branchBCallOrdinal = harness.sessionManager.getEntry(branchBCallId)?.ordinal;
+		if (branchBCallOrdinal === undefined) {
+			throw new Error(`Expected ordinal for tool-call entry ${branchBCallId}`);
+		}
+		const localResultPage = getSuccessfulTree(
+			await dispatchLocalRpcCommand(
+				{
+					id: "local-result-page",
+					type: "get_session_tree",
+					afterOrdinal: branchBCallOrdinal,
+					limit: 1,
+				},
+				harness,
+			),
+		);
+		expect(localResultPage.nodes).toEqual([
+			expect.objectContaining({
+				entryId: branchBResultId,
+				transcript: expect.objectContaining({
+					path: "branch-b.txt",
+					args: { path: "branch-b.txt" },
+					summary: "Read branch-b.txt (completed)",
+				}),
+			}),
+		]);
 	} finally {
 		harness.cleanup();
 	}

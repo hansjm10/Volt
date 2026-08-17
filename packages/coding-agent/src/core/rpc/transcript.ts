@@ -194,94 +194,140 @@ function normalizeLimit(limit: number | undefined): number {
 	return Math.min(MAX_TRANSCRIPT_LIMIT, Math.floor(limit));
 }
 
+function projectTranscriptEntry(
+	entry: SessionEntry,
+	toolCall: ResolvedSessionToolCall | undefined,
+): ProjectedTranscriptItem | undefined {
+	if (entry.type === "compaction") {
+		const text = boundTextWithMetadata(entry.summary, SUMMARY_TEXT_LIMIT);
+		return {
+			item: {
+				id: entry.id,
+				role: "summary",
+				timestamp: normalizeTimestamp(entry.timestamp),
+				title: "Conversation compacted",
+				text: text.text,
+			},
+			truncated: text.truncated,
+		};
+	}
+
+	if (entry.type === "custom_message") {
+		return projectCustomMessage(entry);
+	}
+
+	if (entry.type !== "message") {
+		return undefined;
+	}
+
+	const message = entry.message;
+	if (message.role === "user") {
+		const text = boundTextWithMetadata(extractVisibleTextContent(message.content), MESSAGE_TEXT_LIMIT);
+		const imageCount = extractMessageImages(message.content).length;
+		if (!text.text && imageCount === 0) {
+			return undefined;
+		}
+		return {
+			item: {
+				id: entry.id,
+				role: "user",
+				text: text.text,
+				timestamp: normalizeTimestamp(entry.timestamp),
+				...(message.clientMessageId === undefined ? {} : { clientMessageId: message.clientMessageId }),
+				...(imageCount > 0 ? { imageCount } : {}),
+			},
+			truncated: text.truncated,
+		};
+	}
+
+	if (message.role === "assistant") {
+		const text = boundTextWithMetadata(extractVisibleTextContent(message.content), MESSAGE_TEXT_LIMIT);
+		if (!text.text) {
+			return undefined;
+		}
+		return {
+			item: {
+				id: entry.id,
+				role: "assistant",
+				text: text.text,
+				timestamp: normalizeTimestamp(entry.timestamp),
+			},
+			truncated: text.truncated,
+		};
+	}
+
+	if (message.role === "toolResult") {
+		return projectToolResult(entry.id, entry.timestamp, message, toolCall);
+	}
+
+	if (message.role === "bashExecution") {
+		return projectBashExecution(entry.id, entry.timestamp, message);
+	}
+
+	return undefined;
+}
+
 function projectTranscriptItems(entries: SessionEntry[]): ProjectedTranscriptItems {
 	const toolCallsByResultEntryId = resolveSessionToolCallsByResultEntryId(entries);
 	const items: RpcTranscriptItem[] = [];
 	const truncatedEntryIds = new Set<string>();
-	const pushProjectedItem = (projected: ProjectedTranscriptItem): void => {
+	for (const entry of entries) {
+		const projected = projectTranscriptEntry(entry, toolCallsByResultEntryId.get(entry.id));
+		if (!projected) continue;
 		items.push(projected.item);
 		if (projected.truncated) {
 			truncatedEntryIds.add(projected.item.id);
 		}
-	};
-
-	for (const entry of entries) {
-		if (entry.type === "compaction") {
-			const text = boundTextWithMetadata(entry.summary, SUMMARY_TEXT_LIMIT);
-			pushProjectedItem({
-				item: {
-					id: entry.id,
-					role: "summary",
-					timestamp: normalizeTimestamp(entry.timestamp),
-					title: "Conversation compacted",
-					text: text.text,
-				},
-				truncated: text.truncated,
-			});
-			continue;
-		}
-
-		if (entry.type === "custom_message") {
-			const customItem = projectCustomMessage(entry);
-			if (customItem) {
-				pushProjectedItem(customItem);
-			}
-			continue;
-		}
-
-		if (entry.type !== "message") {
-			continue;
-		}
-
-		const message = entry.message;
-		if (message.role === "user") {
-			const text = boundTextWithMetadata(extractVisibleTextContent(message.content), MESSAGE_TEXT_LIMIT);
-			const imageCount = extractMessageImages(message.content).length;
-			if (text.text || imageCount > 0) {
-				pushProjectedItem({
-					item: {
-						id: entry.id,
-						role: "user",
-						text: text.text,
-						timestamp: normalizeTimestamp(entry.timestamp),
-						...(message.clientMessageId === undefined ? {} : { clientMessageId: message.clientMessageId }),
-						...(imageCount > 0 ? { imageCount } : {}),
-					},
-					truncated: text.truncated,
-				});
-			}
-			continue;
-		}
-
-		if (message.role === "assistant") {
-			const text = boundTextWithMetadata(extractVisibleTextContent(message.content), MESSAGE_TEXT_LIMIT);
-			if (text.text) {
-				pushProjectedItem({
-					item: {
-						id: entry.id,
-						role: "assistant",
-						text: text.text,
-						timestamp: normalizeTimestamp(entry.timestamp),
-					},
-					truncated: text.truncated,
-				});
-			}
-			continue;
-		}
-
-		if (message.role === "toolResult") {
-			pushProjectedItem(
-				projectToolResult(entry.id, entry.timestamp, message, toolCallsByResultEntryId.get(entry.id)),
-			);
-			continue;
-		}
-
-		if (message.role === "bashExecution") {
-			pushProjectedItem(projectBashExecution(entry.id, entry.timestamp, message));
-		}
 	}
-
 	return { items, truncatedEntryIds };
+}
+
+function toConversationTranscriptItem(
+	entry: SessionEntry,
+	projected: ProjectedTranscriptItem,
+): RpcConversationTranscriptItem {
+	const item = projected.item;
+	if (item.id !== entry.id) {
+		throw new Error(`Transcript projection identity mismatch for session entry ${entry.id}`);
+	}
+	const base = {
+		entryId: item.id,
+		ordinal: entry.ordinal ?? 0,
+		createdAt: item.timestamp,
+	};
+	if (item.role === "tool") {
+		return {
+			...base,
+			role: "tool",
+			text: item.summary,
+			truncated: projected.truncated,
+			toolName: item.toolName,
+			status: item.status === "failed" ? "failed" : "completed",
+			summary: item.summary,
+			...(item.path === undefined ? {} : { path: item.path }),
+			...(item.imageCount === undefined ? {} : { imageCount: item.imageCount }),
+			...(item.args === undefined ? {} : { args: item.args }),
+			...(item.details === undefined ? {} : { details: item.details }),
+		};
+	}
+	const role = item.role === "summary" ? "system" : item.role;
+	return {
+		...base,
+		role,
+		text: item.text,
+		truncated: projected.truncated,
+		...(item.role === "user" && item.clientMessageId !== undefined ? { clientMessageId: item.clientMessageId } : {}),
+		...(item.role === "user" && item.imageCount !== undefined ? { imageCount: item.imageCount } : {}),
+	};
+}
+
+/** Local-RPC projection for one session-tree entry. */
+export function projectConversationTranscriptEntry(
+	entry: SessionEntry,
+	toolCall: ResolvedSessionToolCall | undefined,
+): RpcConversationTranscriptItem | undefined {
+	const projected = projectTranscriptEntry(entry, toolCall);
+	return projected ? toConversationTranscriptItem(entry, projected) : undefined;
 }
 
 /**
@@ -290,45 +336,13 @@ function projectTranscriptItems(entries: SessionEntry[]): ProjectedTranscriptIte
  * retain this exact schema.
  */
 export function projectConversationTranscriptItems(entries: SessionEntry[]): RpcConversationTranscriptItem[] {
-	const entriesById = new Map(entries.map((entry) => [entry.id, entry]));
-	const projected = projectTranscriptItems(entries);
-	return projected.items.map((item) => {
-		const entry = entriesById.get(item.id);
-		if (!entry) {
-			throw new Error(`Transcript projection references unknown session entry ${item.id}`);
-		}
-		const base = {
-			entryId: item.id,
-			ordinal: entry.ordinal ?? 0,
-			createdAt: item.timestamp,
-		};
-		if (item.role === "tool") {
-			return {
-				...base,
-				role: "tool" as const,
-				text: item.summary,
-				truncated: projected.truncatedEntryIds.has(item.id),
-				toolName: item.toolName,
-				status: item.status === "failed" ? "failed" : "completed",
-				summary: item.summary,
-				...(item.path === undefined ? {} : { path: item.path }),
-				...(item.imageCount === undefined ? {} : { imageCount: item.imageCount }),
-				...(item.args === undefined ? {} : { args: item.args }),
-				...(item.details === undefined ? {} : { details: item.details }),
-			};
-		}
-		const role = item.role === "summary" ? "system" : item.role;
-		return {
-			...base,
-			role,
-			text: item.text,
-			truncated: projected.truncatedEntryIds.has(item.id),
-			...(item.role === "user" && item.clientMessageId !== undefined
-				? { clientMessageId: item.clientMessageId }
-				: {}),
-			...(item.role === "user" && item.imageCount !== undefined ? { imageCount: item.imageCount } : {}),
-		};
-	});
+	const toolCallsByResultEntryId = resolveSessionToolCallsByResultEntryId(entries);
+	const items: RpcConversationTranscriptItem[] = [];
+	for (const entry of entries) {
+		const item = projectConversationTranscriptEntry(entry, toolCallsByResultEntryId.get(entry.id));
+		if (item) items.push(item);
+	}
+	return items;
 }
 
 function projectCustomMessage(

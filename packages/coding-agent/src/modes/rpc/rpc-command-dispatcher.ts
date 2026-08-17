@@ -26,8 +26,9 @@ import {
 import { getRpcErrorResponseTarget, isUsableRpcConversationIdentifier } from "../../core/rpc/correlation.ts";
 import { buildRpcSessionState } from "../../core/rpc/session-state.ts";
 import { projectSessionTreePage } from "../../core/rpc/session-tree.ts";
+import { resolveSessionToolCallsByResultEntryId } from "../../core/rpc/tool-call-resolution.ts";
 import {
-	projectConversationTranscriptItems,
+	projectConversationTranscriptEntry,
 	projectMessageImages,
 	projectSessionTranscript,
 } from "../../core/rpc/transcript.ts";
@@ -801,14 +802,13 @@ export async function handleRpcCommand(
 
 		case "get_session_tree": {
 			const entries = session.sessionManager.getEntries();
-			const transcriptByEntryId = new Map(
-				projectConversationTranscriptItems(entries).map((item) => [item.entryId, item]),
-			);
+			const toolCallsByResultEntryId = resolveSessionToolCallsByResultEntryId(entries);
 			const tree: RpcSessionTreePage = projectSessionTreePage(entries, session.sessionManager.getBranch(), {
 				sessionId: session.sessionManager.getSessionId(),
 				limit: command.limit,
 				afterOrdinal: command.afterOrdinal,
-				projectTranscriptEntry: (entry) => transcriptByEntryId.get(entry.id),
+				projectTranscriptEntry: (entry) =>
+					projectConversationTranscriptEntry(entry, toolCallsByResultEntryId.get(entry.id)),
 			});
 			return createRpcSuccessResponse(id, "get_session_tree", tree);
 		}
