@@ -141,11 +141,15 @@ Set `VOLT_SKIP_VERSION_CHECK=1` to disable the Volt version update check. Use `-
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `warnings.anthropicExtraUsage` | boolean | `true` | Show a warning when Anthropic subscription auth may use paid extra usage |
+| `warnings.contextTokens` | number | `350000` | Turn footer context usage to the warning color at this absolute token count, in addition to percentage-based warnings. Set to `0` to disable the absolute threshold |
+
+Both options are available under **Warnings** in `/settings`.
 
 ```json
 {
   "warnings": {
-    "anthropicExtraUsage": false
+    "anthropicExtraUsage": false,
+    "contextTokens": 350000
   }
 }
 ```
@@ -362,7 +366,8 @@ See [packages.md](packages.md) for package management details.
   },
   "enabledModels": ["claude-*", "gpt-4o"],
   "warnings": {
-    "anthropicExtraUsage": true
+    "anthropicExtraUsage": true,
+    "contextTokens": 350000
   },
   "packages": ["volt-skills"]
 }

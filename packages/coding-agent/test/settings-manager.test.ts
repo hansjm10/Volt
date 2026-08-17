@@ -957,4 +957,21 @@ describe("SettingsManager", () => {
 			expect(manager.getTurnDoneAlert()).toBe("bell");
 		});
 	});
+
+	describe("contextWarningTokens", () => {
+		it("should default to 350k tokens", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getContextWarningTokens()).toBe(350_000);
+		});
+
+		it("should use a configured threshold and allow zero to disable it", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ warnings: { contextTokens: 425_500 } }));
+			const configured = SettingsManager.create(projectDir, agentDir);
+			expect(configured.getContextWarningTokens()).toBe(425_500);
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ warnings: { contextTokens: 0 } }));
+			const disabled = SettingsManager.create(projectDir, agentDir);
+			expect(disabled.getContextWarningTokens()).toBe(0);
+		});
+	});
 });

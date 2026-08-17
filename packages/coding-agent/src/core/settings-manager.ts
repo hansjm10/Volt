@@ -13,6 +13,8 @@ import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dis
 import type { LspSettings } from "./lsp/config.ts";
 import type { Personality } from "./personality.ts";
 
+const DEFAULT_CONTEXT_WARNING_TOKENS = 350_000;
+
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
@@ -67,6 +69,7 @@ export interface MarkdownSettings {
 
 export interface WarningSettings {
 	anthropicExtraUsage?: boolean; // default: true
+	contextTokens?: number; // default: 350000; 0 disables the absolute context warning
 }
 
 export type DefaultProjectTrust = "ask" | "always" | "never";
@@ -1625,6 +1628,14 @@ export class SettingsManager {
 	getTurnDoneAlert(): TurnDoneAlert {
 		const mode = this.settings.terminal?.turnDoneAlert;
 		return mode === "bell" || mode === "notify" ? mode : "off";
+	}
+
+	getContextWarningTokens(): number {
+		const threshold = this.settings.warnings?.contextTokens;
+		if (typeof threshold !== "number" || !Number.isFinite(threshold) || threshold < 0) {
+			return DEFAULT_CONTEXT_WARNING_TOKENS;
+		}
+		return Math.floor(threshold);
 	}
 
 	setTurnDoneAlert(mode: TurnDoneAlert): void {
