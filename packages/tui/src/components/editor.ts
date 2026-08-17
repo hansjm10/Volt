@@ -836,6 +836,16 @@ export class Editor implements Component, Focusable {
 			return;
 		}
 
+		// Explicit prompt history actions
+		if (kb.matches(data, "tui.editor.historyPrevious")) {
+			this.navigateHistory(-1);
+			return;
+		}
+		if (kb.matches(data, "tui.editor.historyNext")) {
+			this.navigateHistory(1);
+			return;
+		}
+
 		// Arrow key navigation (with history support)
 		if (kb.matches(data, "tui.editor.cursorUp")) {
 			if (

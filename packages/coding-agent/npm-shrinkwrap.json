@@ -558,6 +558,7 @@
 			"resolved": "https://registry.npmjs.org/@hansjm10/volt-tui/-/volt-tui-0.1.0.tgz",
 			"license": "MIT",
 			"dependencies": {
+				"fast-png": "8.0.0",
 				"get-east-asian-width": "1.6.0",
 				"marked": "18.0.5"
 			},
@@ -750,7 +751,8 @@
 			},
 			"engines": {
 				"node": ">=18"
-			}
+			},
+			"peer": true
 		},
 		"node_modules/@nodable/entities": {
 			"version": "2.1.0",
@@ -1792,7 +1794,8 @@
 			"funding": {
 				"type": "opencollective",
 				"url": "https://opencollective.com/express"
-			}
+			},
+			"peer": true
 		},
 		"node_modules/express-rate-limit": {
 			"version": "8.5.2",
@@ -1823,6 +1826,16 @@
 			"resolved": "https://registry.npmjs.org/fast-deep-equal/-/fast-deep-equal-3.1.3.tgz",
 			"integrity": "sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q==",
 			"license": "MIT"
+		},
+		"node_modules/fast-png": {
+			"version": "8.0.0",
+			"resolved": "https://registry.npmjs.org/fast-png/-/fast-png-8.0.0.tgz",
+			"integrity": "sha512-gCysNasJ8KEMgfdYIKd/wTDo6ENK1PWT0RJO7O+0pgmuHPw2O6tA1WvdxFRJoLf9V8yFYpG0FA1YgI8X97OhJA==",
+			"license": "MIT",
+			"dependencies": {
+				"fflate": "^0.8.2",
+				"iobuffer": "^6.0.1"
+			}
 		},
 		"node_modules/fast-uri": {
 			"version": "3.1.3",
@@ -1899,6 +1912,12 @@
 					"url": "https://paypal.me/jimmywarting"
 				}
 			]
+		},
+		"node_modules/fflate": {
+			"version": "0.8.3",
+			"resolved": "https://registry.npmjs.org/fflate/-/fflate-0.8.3.tgz",
+			"integrity": "sha512-tbZNuJrLwGUp3zshBtdy4W+ORxZuIh8a5ilyIEQDC5rY1f3U20JMry0Ll3WBzU58EZKsEuJFXhb5gwv8CsPvgA==",
+			"license": "MIT"
 		},
 		"node_modules/file-type": {
 			"version": "21.3.4",
@@ -2166,7 +2185,8 @@
 			"license": "MIT",
 			"engines": {
 				"node": ">=16.9.0"
-			}
+			},
+			"peer": true
 		},
 		"node_modules/hosted-git-info": {
 			"version": "9.0.3",
@@ -2335,6 +2355,12 @@
 			"integrity": "sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==",
 			"license": "ISC"
 		},
+		"node_modules/iobuffer": {
+			"version": "6.0.1",
+			"resolved": "https://registry.npmjs.org/iobuffer/-/iobuffer-6.0.1.tgz",
+			"integrity": "sha512-SZWYkWNfjIXIBYSDpXDYIgshqtbOPsi4lviawAEceR1Kqk+sHDlcQjWrzNQsii80AyBY0q5c8HCTNjqo74ul+Q==",
+			"license": "MIT"
+		},
 		"node_modules/ip-address": {
 			"version": "10.2.0",
 			"resolved": "https://registry.npmjs.org/ip-address/-/ip-address-10.2.0.tgz",
@@ -2372,7 +2398,8 @@
 			"license": "MIT",
 			"bin": {
 				"jiti": "lib/jiti-cli.mjs"
-			}
+			},
+			"peer": true
 		},
 		"node_modules/jose": {
 			"version": "6.2.3",
@@ -3541,7 +3568,8 @@
 			"license": "MIT",
 			"funding": {
 				"url": "https://github.com/sponsors/colinhacks"
-			}
+			},
+			"peer": true
 		},
 		"node_modules/zod-to-json-schema": {
 			"version": "3.25.2",

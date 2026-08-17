@@ -837,6 +837,47 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("TUI mode", () => {
+		it("defaults to regular and persists fullscreen mode", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getTuiMode()).toBe("regular");
+
+			manager.setTuiMode("fullscreen");
+			await manager.flush();
+
+			expect(manager.getTuiMode()).toBe("fullscreen");
+			const savedSettings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
+			expect(savedSettings.tuiMode).toBe("fullscreen");
+		});
+
+		it("falls back to regular for unsupported values", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ tuiMode: "other" }));
+			expect(SettingsManager.create(projectDir, agentDir).getTuiMode()).toBe("regular");
+		});
+	});
+
+	it("validates and persists fullscreen settings", async () => {
+		const manager = SettingsManager.create(projectDir, agentDir);
+		expect(manager.getFullscreenExitOutput()).toBe("transcript");
+		expect(manager.getFullscreenScrollbar()).toBe("auto");
+
+		manager.setFullscreenExitOutput("resume-hint");
+		manager.setFullscreenScrollbar("hidden");
+		await manager.flush();
+		const savedSettings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
+		expect(savedSettings.fullscreenExitOutput).toBe("resume-hint");
+		expect(savedSettings.fullscreenScrollbar).toBe("hidden");
+
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify({ fullscreenExitOutput: "nothing", fullscreenScrollbar: "sometimes" }),
+		);
+		const reloadedManager = SettingsManager.create(projectDir, agentDir);
+		expect(reloadedManager.getFullscreenExitOutput()).toBe("transcript");
+		expect(reloadedManager.getFullscreenScrollbar()).toBe("auto");
+	});
+
 	describe("shellCommandPrefix", () => {
 		it("should load shellCommandPrefix from settings", () => {
 			const settingsPath = join(agentDir, "settings.json");
@@ -914,6 +955,23 @@ describe("SettingsManager", () => {
 			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
 			expect(savedSettings.terminal).toEqual({ showImages: false, turnDoneAlert: "bell" });
 			expect(manager.getTurnDoneAlert()).toBe("bell");
+		});
+	});
+
+	describe("contextWarningTokens", () => {
+		it("should default to 350k tokens", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getContextWarningTokens()).toBe(350_000);
+		});
+
+		it("should use a configured threshold and allow zero to disable it", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ warnings: { contextTokens: 425_500 } }));
+			const configured = SettingsManager.create(projectDir, agentDir);
+			expect(configured.getContextWarningTokens()).toBe(425_500);
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ warnings: { contextTokens: 0 } }));
+			const disabled = SettingsManager.create(projectDir, agentDir);
+			expect(disabled.getContextWarningTokens()).toBe(0);
 		});
 	});
 });

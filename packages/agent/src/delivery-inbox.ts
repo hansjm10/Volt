@@ -5,23 +5,54 @@ export interface InboxDelivery<TKind extends string, TMessage> {
 	readonly kind: TKind;
 	readonly messages: readonly TMessage[];
 	readonly sequence: number;
+	readonly epoch: number;
 }
 
 export type DeliveryLeaseSettlement = "committed" | "retained" | "terminally_failed";
 
 type LeaseEntry<TKind extends string, TMessage> = {
 	delivery: InboxDelivery<TKind, TMessage>;
-	status: "leased" | "committing" | "committed" | "restored" | "revoked" | "terminally_failed";
+	status:
+		| "leased"
+		| "preparing"
+		| "ready"
+		| "committing"
+		| "committed"
+		| "rolling_back"
+		| "rollback_revoked"
+		| "restored"
+		| "revoked"
+		| "terminally_failed";
+	attemptId?: string;
 };
+
+export interface DeliveryAttempt<TKind extends string, TMessage> {
+	readonly delivery: InboxDelivery<TKind, TMessage>;
+	readonly attemptId: string;
+}
 
 /** Opaque capability for one FIFO selection owned by a dispatcher decision. */
 export interface DeliveryLease<TKind extends string, TMessage> {
 	readonly deliveries: readonly InboxDelivery<TKind, TMessage>[];
 	owns(deliveryId: string): boolean;
 	canPrepare(deliveryId: string): boolean;
-	begin(deliveryId: string): InboxDelivery<TKind, TMessage> | undefined;
-	settle(deliveryId: string, outcome: DeliveryLeaseSettlement): InboxDelivery<TKind, TMessage> | undefined;
+	prepare(deliveryId: string): DeliveryAttempt<TKind, TMessage> | undefined;
+	completePreparation(
+		deliveryId: string,
+		attemptId: string,
+		outcome: "prepared" | "retained" | "terminally_failed",
+	): InboxDelivery<TKind, TMessage> | undefined;
+	beginCommit(deliveryId: string, attemptId: string): InboxDelivery<TKind, TMessage> | undefined;
+	settleCommit(
+		deliveryId: string,
+		attemptId: string,
+		outcome: DeliveryLeaseSettlement,
+	): InboxDelivery<TKind, TMessage> | undefined;
 	rollback(): readonly InboxDelivery<TKind, TMessage>[];
+	settleRollback(
+		deliveryId: string,
+		outcome: "retained" | "terminally_failed",
+	): InboxDelivery<TKind, TMessage> | undefined;
 }
 
 class InboxDeliveryLease<TKind extends string, TMessage> implements DeliveryLease<TKind, TMessage> {
@@ -50,7 +81,10 @@ class InboxDeliveryLease<TKind extends string, TMessage> implements DeliveryLeas
 
 	owns(deliveryId: string): boolean {
 		const entry = this.entries.find((candidate) => candidate.delivery.deliveryId === deliveryId);
-		return entry?.status === "committing" || (this.active && entry?.status === "leased");
+		return (
+			entry?.status === "committing" ||
+			(this.active && (entry?.status === "leased" || entry?.status === "preparing" || entry?.status === "ready"))
+		);
 	}
 
 	canPrepare(deliveryId: string): boolean {
@@ -60,19 +94,52 @@ class InboxDeliveryLease<TKind extends string, TMessage> implements DeliveryLeas
 		);
 	}
 
-	/** Cross the revocation cutoff without deciding the participant outcome. */
-	begin(deliveryId: string): InboxDelivery<TKind, TMessage> | undefined {
+	prepare(deliveryId: string): DeliveryAttempt<TKind, TMessage> | undefined {
 		if (!this.active) return undefined;
 		const entry = this.entries.find((candidate) => candidate.delivery.deliveryId === deliveryId);
 		if (entry?.status !== "leased") return undefined;
+		entry.status = "preparing";
+		entry.attemptId = `delivery-attempt:${globalThis.crypto.randomUUID()}`;
+		return { delivery: entry.delivery, attemptId: entry.attemptId };
+	}
+
+	completePreparation(
+		deliveryId: string,
+		attemptId: string,
+		outcome: "prepared" | "retained" | "terminally_failed",
+	): InboxDelivery<TKind, TMessage> | undefined {
+		const entry = this.entries.find((candidate) => candidate.delivery.deliveryId === deliveryId);
+		if (!this.active || entry?.status !== "preparing" || entry.attemptId !== attemptId) return undefined;
+		if (outcome === "prepared") {
+			entry.status = "ready";
+			return entry.delivery;
+		}
+		if (outcome === "retained") {
+			entry.status = "restored";
+			this.restoreSettlement(entry.delivery);
+		} else {
+			entry.status = "terminally_failed";
+		}
+		this.finishIfExhausted();
+		return entry.delivery;
+	}
+
+	/** Cross the revocation cutoff only after all fallible preparation and validation. */
+	beginCommit(deliveryId: string, attemptId: string): InboxDelivery<TKind, TMessage> | undefined {
+		if (!this.active) return undefined;
+		const entry = this.entries.find((candidate) => candidate.delivery.deliveryId === deliveryId);
+		if (entry?.status !== "ready" || entry.attemptId !== attemptId) return undefined;
 		entry.status = "committing";
 		return entry.delivery;
 	}
 
-	/** Settle exactly one delivery whose revocation cutoff was crossed. */
-	settle(deliveryId: string, outcome: DeliveryLeaseSettlement): InboxDelivery<TKind, TMessage> | undefined {
+	settleCommit(
+		deliveryId: string,
+		attemptId: string,
+		outcome: DeliveryLeaseSettlement,
+	): InboxDelivery<TKind, TMessage> | undefined {
 		const entry = this.entries.find((candidate) => candidate.delivery.deliveryId === deliveryId);
-		if (entry?.status !== "committing") return undefined;
+		if (entry?.status !== "committing" || entry.attemptId !== attemptId) return undefined;
 		if (outcome === "retained") {
 			entry.status = "restored";
 			this.restoreSettlement(entry.delivery);
@@ -83,29 +150,43 @@ class InboxDeliveryLease<TKind extends string, TMessage> implements DeliveryLeas
 		return entry.delivery;
 	}
 
-	/** Restore only deliveries whose commit boundary was never crossed. */
+	/** Mark pre-commit deliveries unavailable until their retained finalizers settle. */
 	rollback(): readonly InboxDelivery<TKind, TMessage>[] {
 		if (!this.active) return [];
-		const restored: InboxDelivery<TKind, TMessage>[] = [];
+		const rollingBack: InboxDelivery<TKind, TMessage>[] = [];
 		for (const entry of this.entries) {
-			if (entry.status === "leased") {
-				entry.status = "restored";
-				restored.push(entry.delivery);
-				this.restoreSettlement(entry.delivery);
+			if (entry.status === "leased" || entry.status === "preparing" || entry.status === "ready") {
+				entry.status = "rolling_back";
+				rollingBack.push(entry.delivery);
 			}
 		}
-		if (!this.entries.some((entry) => entry.status === "committing")) {
-			this.active = false;
-			this.finish(this, []);
+		this.finishIfExhausted();
+		return rollingBack;
+	}
+
+	settleRollback(
+		deliveryId: string,
+		outcome: "retained" | "terminally_failed",
+	): InboxDelivery<TKind, TMessage> | undefined {
+		const entry = this.entries.find((candidate) => candidate.delivery.deliveryId === deliveryId);
+		if (entry?.status !== "rolling_back" && entry?.status !== "rollback_revoked") return undefined;
+		if (entry.status === "rollback_revoked") {
+			entry.status = "revoked";
+		} else if (outcome === "retained") {
+			entry.status = "restored";
+			this.restoreSettlement(entry.delivery);
+		} else {
+			entry.status = "terminally_failed";
 		}
-		return restored;
+		this.finishIfExhausted();
+		return entry.delivery;
 	}
 
 	discard(): void {
 		if (!this.active) return;
 		this.active = false;
 		for (const entry of this.entries) {
-			if (entry.status === "leased") entry.status = "revoked";
+			if (entry.status !== "committing" && entry.status !== "committed") entry.status = "revoked";
 		}
 		this.finish(this, []);
 	}
@@ -114,8 +195,12 @@ class InboxDeliveryLease<TKind extends string, TMessage> implements DeliveryLeas
 		if (!this.active) return [];
 		const revoked: InboxDelivery<TKind, TMessage>[] = [];
 		for (const entry of this.entries) {
-			if (entry.status === "leased" && entry.delivery.kind === kind) {
+			if (entry.delivery.kind !== kind) continue;
+			if (entry.status === "leased" || entry.status === "preparing" || entry.status === "ready") {
 				entry.status = "revoked";
+				revoked.push(entry.delivery);
+			} else if (entry.status === "rolling_back") {
+				entry.status = "rollback_revoked";
 				revoked.push(entry.delivery);
 			}
 		}
@@ -130,12 +215,26 @@ class InboxDeliveryLease<TKind extends string, TMessage> implements DeliveryLeas
 	listRevocable(kind?: TKind): readonly InboxDelivery<TKind, TMessage>[] {
 		if (!this.active) return [];
 		return this.entries.flatMap((entry) =>
-			entry.status === "leased" && (kind === undefined || entry.delivery.kind === kind) ? [entry.delivery] : [],
+			(entry.status === "leased" || entry.status === "preparing" || entry.status === "ready") &&
+			(kind === undefined || entry.delivery.kind === kind)
+				? [entry.delivery]
+				: [],
 		);
 	}
 
 	private finishIfExhausted(): void {
-		if (!this.active || this.entries.some((entry) => entry.status === "leased" || entry.status === "committing")) {
+		if (
+			!this.active ||
+			this.entries.some(
+				(entry) =>
+					entry.status === "leased" ||
+					entry.status === "preparing" ||
+					entry.status === "ready" ||
+					entry.status === "committing" ||
+					entry.status === "rolling_back" ||
+					entry.status === "rollback_revoked",
+			)
+		) {
 			return;
 		}
 		this.active = false;
@@ -167,6 +266,7 @@ export class DeliveryInbox<TKind extends string, TMessage> {
 			kind,
 			messages: messages.slice(),
 			sequence: this.nextSequence++,
+			epoch: this.resetGeneration,
 		};
 		this.pending.push(delivery);
 		return delivery;

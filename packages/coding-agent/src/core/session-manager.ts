@@ -50,6 +50,14 @@ import {
 	RPC_SESSION_QUEUE_MAX_ITEMS,
 } from "./rpc/wire-limits.ts";
 
+function deepFreezeCanonicalData<T>(value: T): T {
+	if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+		for (const nested of Object.values(value as Record<string, unknown>)) deepFreezeCanonicalData(nested);
+		Object.freeze(value);
+	}
+	return value;
+}
+
 export const CURRENT_SESSION_VERSION = 5;
 
 export interface SessionHeader {
@@ -115,6 +123,129 @@ export type SessionPersistenceDrainResult =
 			readonly status: "reconciliation_required";
 			readonly error: SessionConversationStateUnavailableError;
 	  };
+
+/**
+ * Identity-only proof of one locally atomic client-input delivery commit.
+ *
+ * Callers must pass this object back to the originating SessionManager for
+ * verification. Its visible fields are diagnostic only and are never trusted
+ * as proof of persistence.
+ */
+export interface SessionDeliveryCommitReceipt {
+	readonly receiptId: string;
+}
+
+export interface SessionDeliveryAttemptIdentity {
+	readonly deliveryId: string;
+	readonly epoch: number;
+	readonly attemptId: string;
+}
+
+export interface SessionDeliveryCommitInput extends SessionDeliveryAttemptIdentity {
+	readonly messages: readonly AgentMessage[];
+	readonly planning?: PlanningState;
+}
+
+/** Identity-only canonical projection guard issued by one live SessionManager. */
+export interface SessionCanonicalProjectionToken {
+	readonly tokenId: string;
+}
+
+export interface SessionCanonicalProjection {
+	readonly token: SessionCanonicalProjectionToken;
+	readonly leafId: string | null;
+	readonly revision: number;
+	readonly entries: readonly SessionEntry[];
+}
+
+export type SessionCanonicalAppend =
+	| { readonly type: "message"; readonly message: AgentMessage }
+	| { readonly type: "thinking_level_change"; readonly thinkingLevel: string }
+	| { readonly type: "model_change"; readonly provider: string; readonly modelId: string }
+	| { readonly type: "planning_state_change"; readonly planning: PlanningState }
+	| {
+			readonly type: "compaction";
+			readonly summary: string;
+			readonly firstKeptEntryId: string;
+			readonly tokensBefore: number;
+			readonly details?: JsonValue;
+			readonly fromHook?: boolean;
+	  }
+	| {
+			readonly type: "branch_summary";
+			readonly fromId: string | null;
+			readonly summary: string;
+			readonly details?: JsonValue;
+			readonly fromHook?: boolean;
+	  }
+	| { readonly type: "custom"; readonly customType: string; readonly data?: JsonValue }
+	| {
+			readonly type: "custom_message";
+			readonly customType: string;
+			readonly content: string | readonly (TextContent | ImageContent)[];
+			readonly display: boolean;
+			readonly details?: JsonValue;
+	  }
+	| { readonly type: "label"; readonly targetId: string; readonly label?: string }
+	| { readonly type: "session_info"; readonly name?: string };
+
+export type SessionCanonicalMutation =
+	| { readonly kind: "move"; readonly leafId: string | null }
+	| {
+			readonly kind: "move_with_summary";
+			readonly leafId: string | null;
+			readonly summary?: {
+				readonly summary: string;
+				readonly details?: JsonValue;
+				readonly fromHook?: boolean;
+				readonly label?: string;
+			};
+	  }
+	| { readonly kind: "append"; readonly entry: SessionCanonicalAppend };
+
+export interface SessionCanonicalCommand {
+	readonly guard: {
+		readonly kind: "exact" | "descendant";
+		readonly token: SessionCanonicalProjectionToken;
+	};
+	readonly mutations: readonly SessionCanonicalMutation[];
+}
+
+export interface SessionCanonicalCommitEvidence {
+	readonly before: SessionCanonicalProjection;
+	readonly after: SessionCanonicalProjection;
+	readonly appendedEntryIds: readonly string[];
+}
+
+export class SessionCanonicalConflictError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SessionCanonicalConflictError";
+	}
+}
+
+interface VerifiedSessionDeliveryBase extends SessionDeliveryAttemptIdentity {
+	readonly sessionId: string;
+	readonly beforeLeafId: string | null;
+	readonly afterLeafId: string | null;
+	readonly revision: number;
+	readonly beforeProjection: SessionCanonicalProjection;
+	readonly afterProjection: SessionCanonicalProjection;
+}
+
+export interface VerifiedSessionDeliveryCommit extends VerifiedSessionDeliveryBase {
+	readonly outcome: "committed";
+	readonly entryIds: readonly string[];
+	readonly messages: readonly AgentMessage[];
+	readonly clientMessageIds: readonly string[];
+	readonly planning?: PlanningState;
+}
+
+export interface VerifiedSessionDeliveryNoEffect extends VerifiedSessionDeliveryBase {
+	readonly outcome: "no_effect";
+}
+
+export type VerifiedSessionDeliveryReceipt = VerifiedSessionDeliveryCommit | VerifiedSessionDeliveryNoEffect;
 
 class AtomicAppendPersistenceFailure extends Error {
 	readonly effect: Exclude<SessionAtomicAppendEffect, "committed">;
@@ -318,6 +449,12 @@ export interface SessionInfoEntry extends SessionEntryBase {
 	name?: string;
 }
 
+/** Durable host-only active-branch pointer. Never projected into conversation history. */
+export interface LeafEntry extends SessionEntryBase {
+	type: "leaf";
+	targetId: string | null;
+}
+
 /**
  * Custom message entry for extensions to inject messages into LLM context.
  * Use customType to identify your extension's entries.
@@ -379,6 +516,7 @@ export type SessionEntry =
 	| CustomMessageEntry
 	| LabelEntry
 	| SessionInfoEntry
+	| LeafEntry
 	| SubagentSpawnEntry;
 
 /** Host-only input admission WAL records. These never participate in the conversation branch or projection. */
@@ -398,7 +536,7 @@ export function isClientInputWalEntry(
  * and never copy into forks.
  */
 export function isHostOnlySessionEntry(entry: FileEntry): boolean {
-	return isClientInputWalEntry(entry) || entry.type === "subagent_spawn";
+	return isClientInputWalEntry(entry) || entry.type === "subagent_spawn" || entry.type === "leaf";
 }
 
 const CLIENT_INPUT_ID_MAX_CHARACTERS = RPC_CLIENT_MESSAGE_ID_MAX_CHARS;
@@ -933,9 +1071,10 @@ export function buildSessionContext(
 	const path: SessionEntry[] = [];
 	let current: SessionEntry | undefined = leaf;
 	while (current) {
-		path.unshift(current);
+		path.push(current);
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
+	path.reverse();
 
 	// Extract settings and find compaction
 	let thinkingLevel = "off";
@@ -1426,6 +1565,7 @@ function isDisplayedCustomMessage(entry: SessionEntry): entry is CustomMessageEn
 function isSessionFileFlushContent(entry: FileEntry): boolean {
 	return (
 		entry.type === "client_input_receipt" ||
+		entry.type === "leaf" ||
 		entry.type === "planning_state_change" ||
 		(entry.type === "message" && entry.message.role === "assistant") ||
 		(entry.type === "custom_message" && entry.display)
@@ -1438,6 +1578,7 @@ function isSessionDurabilityBoundary(entry: SessionEntry): boolean {
 		entry.type === "planning_state_change" ||
 		entry.type === "thinking_level_change" ||
 		entry.type === "model_change" ||
+		entry.type === "leaf" ||
 		isClientInputWalEntry(entry) ||
 		// A spawn edge that only reaches the page cache when the process dies
 		// cannot recover its child; it gets the same fsync treatment as the
@@ -1712,6 +1853,8 @@ export class SessionManager {
 	private clientInputsById: Map<string, ClientInputRecord> = new Map();
 	private leafId: string | null = null;
 	private nextOrdinal = 1;
+	/** Monotonic revision of provider-visible entries and durable leaf movement. */
+	private canonicalRevision = 0;
 	/** Legacy migration is projected in memory on open and written only by the next actual writer. */
 	private sessionFileNeedsMigration = false;
 	/** First uncertain persistence failure. This manager remains fail-stopped until reloaded. */
@@ -1731,6 +1874,16 @@ export class SessionManager {
 	private atomicAppendEntries: SessionEntry[] | undefined;
 	/** Fences unrelated writers while an atomic replacement is settling. */
 	private atomicAppendInFlight = false;
+	/** Unforgeable in-process delivery commit capabilities issued by this manager. */
+	private readonly deliveryCommitReceipts = new WeakMap<
+		SessionDeliveryCommitReceipt,
+		VerifiedSessionDeliveryReceipt
+	>();
+	/** Unforgeable raw projection guards issued by this manager generation. */
+	private readonly canonicalProjectionTokens = new WeakMap<
+		SessionCanonicalProjectionToken,
+		SessionCanonicalProjection
+	>();
 
 	private constructor(
 		cwd: string,
@@ -1813,6 +1966,7 @@ export class SessionManager {
 		this.clientInputsById.clear();
 		this.leafId = null;
 		this.nextOrdinal = 1;
+		this.canonicalRevision = 0;
 		this.sessionFileNeedsMigration = false;
 		this.flushed = false;
 
@@ -1830,6 +1984,7 @@ export class SessionManager {
 		this.clientInputsById.clear();
 		this.leafId = null;
 		this.nextOrdinal = 1;
+		this.canonicalRevision = 0;
 		const currentVersion =
 			(this.fileEntries.find((entry) => entry.type === "session") as SessionHeader | undefined)?.version ===
 			CURRENT_SESSION_VERSION;
@@ -1862,6 +2017,16 @@ export class SessionManager {
 			if (Number.isSafeInteger(entry.ordinal) && (entry.ordinal ?? 0) > 0) {
 				this.nextOrdinal = Math.max(this.nextOrdinal, (entry.ordinal ?? 0) + 1);
 			}
+			if (entry.type === "leaf") {
+				if (
+					entry.targetId !== null &&
+					(!this.byId.has(entry.targetId) || isHostOnlySessionEntry(this.byId.get(entry.targetId)!))
+				) {
+					throw new Error(`Leaf entry ${entry.id} targets an invalid conversation entry`);
+				}
+				this.leafId = entry.targetId;
+			}
+			if (entry.type === "leaf" || !isHostOnlySessionEntry(entry)) this.canonicalRevision++;
 			this.byId.set(entry.id, entry);
 			if (!isHostOnlySessionEntry(entry)) {
 				this.leafId = entry.id;
@@ -1974,6 +2139,11 @@ export class SessionManager {
 		}
 	}
 
+	/** Fail-stop this manager when a committed canonical result cannot be interpreted safely. */
+	retireConversationAuthority(cause: Error): SessionConversationStateUnavailableError {
+		return this._requireConversationReconciliation(cause);
+	}
+
 	private _requireConversationReconciliation(cause: Error): SessionConversationStateUnavailableError {
 		if (this.conversationAuthorityStatus.status === "reconciliation_required") {
 			return this.conversationAuthorityStatus.error;
@@ -2044,7 +2214,10 @@ export class SessionManager {
 		canonicalEntry.ordinal = this.nextOrdinal++;
 		this.fileEntries.push(canonicalEntry);
 		this.byId.set(canonicalEntry.id, canonicalEntry);
-		if (!isHostOnlySessionEntry(canonicalEntry)) {
+		if (canonicalEntry.type === "leaf" || !isHostOnlySessionEntry(canonicalEntry)) this.canonicalRevision++;
+		if (canonicalEntry.type === "leaf") {
+			this.leafId = canonicalEntry.targetId;
+		} else if (!isHostOnlySessionEntry(canonicalEntry)) {
 			this.leafId = canonicalEntry.id;
 		}
 		if (!this.atomicAppendEntries) {
@@ -2070,12 +2243,154 @@ export class SessionManager {
 		}
 	}
 
+	private _captureCanonicalProjection(): SessionCanonicalProjection {
+		const token = Object.freeze({ tokenId: randomUUID() });
+		const entries = deepFreezeCanonicalData(cloneCanonicalData(this.getBranch(), "Session canonical projection"));
+		const projection = Object.freeze({
+			token,
+			leafId: this.leafId,
+			revision: this.canonicalRevision,
+			entries,
+		});
+		this.canonicalProjectionTokens.set(token, projection);
+		return projection;
+	}
+
+	private _cloneCanonicalProjection(projection: SessionCanonicalProjection): SessionCanonicalProjection {
+		return Object.freeze({
+			token: projection.token,
+			leafId: projection.leafId,
+			revision: projection.revision,
+			entries: deepFreezeCanonicalData(
+				cloneCanonicalData([...projection.entries], "Detached session canonical projection"),
+			),
+		});
+	}
+
+	/** Issue an identity-authenticated raw projection guard for a later canonical command. */
+	issueCanonicalProjection(): SessionCanonicalProjection {
+		this.assertConversationAuthorityAvailable();
+		if (this.atomicAppendInFlight) {
+			throw new Error("Cannot issue a canonical projection while an atomic operation is in progress");
+		}
+		return this._cloneCanonicalProjection(this._captureCanonicalProjection());
+	}
+
+	private _appendCanonicalEntry(entry: SessionCanonicalAppend): string {
+		switch (entry.type) {
+			case "message":
+				if (entry.message.role === "branchSummary" || entry.message.role === "compactionSummary") {
+					throw new Error(`${entry.message.role} messages require their canonical session entry type`);
+				}
+				return this.appendMessage(entry.message);
+			case "thinking_level_change":
+				return this.appendThinkingLevelChange(entry.thinkingLevel);
+			case "model_change":
+				return this.appendModelChange(entry.provider, entry.modelId);
+			case "planning_state_change":
+				return this.appendPlanningState(entry.planning);
+			case "compaction":
+				return this.appendCompaction(
+					entry.summary,
+					entry.firstKeptEntryId,
+					entry.tokensBefore,
+					entry.details,
+					entry.fromHook,
+				);
+			case "branch_summary":
+				return this.branchWithSummary(entry.fromId, entry.summary, entry.details, entry.fromHook);
+			case "custom":
+				return this.appendCustomEntry(entry.customType, entry.data);
+			case "custom_message":
+				return this.appendCustomMessageEntry(
+					entry.customType,
+					typeof entry.content === "string" ? entry.content : [...entry.content],
+					entry.display,
+					entry.details,
+				);
+			case "label":
+				return this.appendLabelChange(entry.targetId, entry.label);
+			case "session_info":
+				return this.appendSessionInfo(entry.name ?? "");
+		}
+	}
+
+	/**
+	 * Validate a manager-issued guard, apply normalized mutations, and capture
+	 * immutable evidence entirely inside the manager's serialized append lane.
+	 */
+	async commitCanonicalCommand(command: SessionCanonicalCommand): Promise<SessionCanonicalCommitEvidence> {
+		this._assertPersistenceHealthy();
+		const basis = this.canonicalProjectionTokens.get(command.guard.token);
+		if (!basis)
+			throw new SessionCanonicalConflictError("Canonical projection guard was not issued by this SessionManager");
+		const mutations = cloneCanonicalData([...command.mutations], "Session canonical mutations");
+		let before: SessionCanonicalProjection | undefined;
+		let after: SessionCanonicalProjection | undefined;
+		let appendedEntryIds: readonly string[] = [];
+		await this.appendAtomically(
+			() => {
+				const firstAppendedIndex = this.fileEntries.length;
+				for (const mutation of mutations) {
+					if (mutation.kind === "move") {
+						if (mutation.leafId === null) this.resetLeaf();
+						else this.branch(mutation.leafId);
+					} else if (mutation.kind === "move_with_summary") {
+						if (mutation.summary === undefined) {
+							if (mutation.leafId === null) this.resetLeaf();
+							else this.branch(mutation.leafId);
+						} else {
+							const summaryId = this.branchWithSummary(
+								mutation.leafId,
+								mutation.summary.summary,
+								mutation.summary.details,
+								mutation.summary.fromHook,
+							);
+							if (mutation.summary.label !== undefined) {
+								this.appendLabelChange(summaryId, mutation.summary.label);
+							}
+						}
+					} else {
+						this._appendCanonicalEntry(mutation.entry);
+					}
+				}
+				appendedEntryIds = Object.freeze(this.fileEntries.slice(firstAppendedIndex).map((entry) => entry.id));
+				after = this._captureCanonicalProjection();
+			},
+			() => {},
+			() => {
+				before = this._captureCanonicalProjection();
+				const exactMatch =
+					basis.revision === before.revision &&
+					basis.leafId === before.leafId &&
+					basis.entries.length === before.entries.length &&
+					basis.entries.every((entry, index) => entry.id === before!.entries[index]?.id);
+				const guardMatches =
+					command.guard.kind === "exact"
+						? exactMatch
+						: basis.leafId === null || before.entries.some((entry) => entry.id === basis.leafId);
+				if (!guardMatches)
+					throw new SessionCanonicalConflictError("Canonical branch changed before mutation commit");
+			},
+		);
+		if (!before || !after) throw new Error("Canonical command did not capture commit evidence");
+		return Object.freeze({
+			before: this._cloneCanonicalProjection(before),
+			after: this._cloneCanonicalProjection(after),
+			appendedEntryIds,
+		});
+	}
+
 	/**
 	 * Stage synchronous append operations and publish them only after one atomic
 	 * filesystem replacement settles. Existing append methods remain the sole
 	 * entry mapping and validation path.
 	 */
-	async appendAtomically(append: () => void, beforePublish: () => void): Promise<void> {
+	private async appendAtomically(
+		append: () => void,
+		beforePublish: () => void,
+		beforeStage: () => void = () => {},
+	): Promise<void> {
 		this._assertPersistenceHealthy();
 		if (this.atomicAppendEntries || this.atomicAppendInFlight) {
 			throw new Error("Nested atomic session appends are not supported");
@@ -2098,6 +2413,7 @@ export class SessionManager {
 			),
 			leafId: this.leafId,
 			nextOrdinal: this.nextOrdinal,
+			canonicalRevision: this.canonicalRevision,
 			flushed: this.flushed,
 			sessionFileNeedsMigration: this.sessionFileNeedsMigration,
 		};
@@ -2109,9 +2425,24 @@ export class SessionManager {
 			this.clientInputsById = snapshot.clientInputsById;
 			this.leafId = snapshot.leafId;
 			this.nextOrdinal = snapshot.nextOrdinal;
+			this.canonicalRevision = snapshot.canonicalRevision;
 			this.flushed = snapshot.flushed;
 			this.sessionFileNeedsMigration = snapshot.sessionFileNeedsMigration;
 		};
+		try {
+			beforeStage();
+		} catch (error) {
+			this.atomicAppendInFlight = false;
+			if (error instanceof SessionCanonicalConflictError || error instanceof SessionAtomicAppendError) {
+				throw error;
+			}
+			throw new SessionAtomicAppendError(
+				error instanceof Error ? error.message : String(error),
+				"not_started",
+				"available",
+				{ cause: error },
+			);
+		}
 		const entries: SessionEntry[] = [];
 		this.atomicAppendEntries = entries;
 		try {
@@ -2120,7 +2451,12 @@ export class SessionManager {
 			this.atomicAppendEntries = undefined;
 			this.atomicAppendInFlight = false;
 			restore();
-			throw error;
+			throw new SessionAtomicAppendError(
+				error instanceof Error ? error.message : String(error),
+				"rolled_back",
+				"available",
+				{ cause: error },
+			);
 		}
 
 		const staged = {
@@ -2131,6 +2467,7 @@ export class SessionManager {
 			clientInputsById: this.clientInputsById,
 			leafId: this.leafId,
 			nextOrdinal: this.nextOrdinal,
+			canonicalRevision: this.canonicalRevision,
 		};
 		let content: Buffer;
 		try {
@@ -2142,6 +2479,7 @@ export class SessionManager {
 			throw error;
 		}
 		const shouldPersist =
+			entries.length > 0 &&
 			this.persist &&
 			this.sessionFile !== undefined &&
 			(snapshot.flushed || staged.fileEntries.some(isSessionFileFlushContent));
@@ -2320,20 +2658,240 @@ export class SessionManager {
 		this.clientInputsById = staged.clientInputsById;
 		this.leafId = staged.leafId;
 		this.nextOrdinal = staged.nextOrdinal;
+		this.canonicalRevision = staged.canonicalRevision;
 		this.flushed = shouldPersist || snapshot.flushed;
 		this.sessionFileNeedsMigration = false;
 		try {
 			beforePublish();
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			throw new SessionAtomicAppendError(message, "committed", "available", { cause: error });
+			const committedFailure = new SessionAtomicAppendError(message, "committed", "reconciliation_required", {
+				cause: error,
+			});
+			this._requireConversationReconciliation(committedFailure);
+			throw committedFailure;
 		} finally {
 			try {
 				for (const entry of entries) this._notifyEntryListeners(entry);
+				if (snapshot.leafId !== staged.leafId) {
+					this._notifyBranchListeners(snapshot.leafId, staged.leafId);
+				}
 			} finally {
 				this.atomicAppendInFlight = false;
 			}
 		}
+	}
+
+	/**
+	 * Commit a provider-visible delivery and its host-only receipt transitions in
+	 * one local transaction. Volatile queue/UI publication deliberately happens
+	 * after this method returns.
+	 */
+	async commitDelivery(input: SessionDeliveryCommitInput): Promise<SessionDeliveryCommitReceipt> {
+		this._assertPersistenceHealthy();
+		const messages = cloneCanonicalData([...input.messages], "Session delivery messages");
+		const planning = input.planning === undefined ? undefined : parsePlanningState(input.planning);
+		let beforeProjection: SessionCanonicalProjection | undefined;
+		let afterProjection: SessionCanonicalProjection | undefined;
+		const entryIds: string[] = [];
+		const clientMessageIds: string[] = [];
+
+		await this.appendAtomically(
+			() => {
+				for (const message of messages) {
+					if (message.role !== "user" || message.clientMessageId === undefined) continue;
+					const record = this.clientInputsById.get(message.clientMessageId);
+					if (record?.state === "accepted") {
+						this.transitionClientInput(message.clientMessageId, "started");
+						const stateEntry = this.fileEntries.at(-1);
+						if (!stateEntry || stateEntry.type !== "client_input_state") {
+							throw new Error("Client input start transition was not staged");
+						}
+						entryIds.push(stateEntry.id);
+					}
+					clientMessageIds.push(message.clientMessageId);
+				}
+				if (planning !== undefined) {
+					entryIds.push(this.appendPlanningState(planning));
+				}
+				for (const message of messages) {
+					if (message.role === "custom") {
+						entryIds.push(
+							this.appendCustomMessageEntry(
+								message.customType,
+								message.content,
+								message.display,
+								message.details,
+								message.timestamp,
+							),
+						);
+					} else if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
+						entryIds.push(this.appendMessage(message));
+					} else {
+						throw new Error(`Unsupported delivery message role: ${String(message.role)}`);
+					}
+				}
+				afterProjection = this._captureCanonicalProjection();
+			},
+			() => {},
+			() => {
+				beforeProjection = this._captureCanonicalProjection();
+			},
+		);
+		if (!beforeProjection || !afterProjection) throw new Error("Atomic delivery commit did not capture evidence");
+		const receipt = Object.freeze({ receiptId: randomUUID() });
+		this.deliveryCommitReceipts.set(
+			receipt,
+			Object.freeze({
+				outcome: "committed" as const,
+				deliveryId: input.deliveryId,
+				epoch: input.epoch,
+				attemptId: input.attemptId,
+				sessionId: this.sessionId,
+				beforeLeafId: beforeProjection.leafId,
+				afterLeafId: afterProjection.leafId,
+				revision: afterProjection.revision,
+				beforeProjection,
+				afterProjection,
+				entryIds: Object.freeze([...entryIds]),
+				messages: Object.freeze(cloneCanonicalData(messages, "Committed session delivery messages")),
+				clientMessageIds: Object.freeze([...new Set(clientMessageIds)]),
+				...(planning === undefined ? {} : { planning: clonePlanningState(planning) }),
+			}),
+		);
+		return receipt;
+	}
+
+	/** Attest no effect at a serialized authority point without rewriting persistence. */
+	async attestDeliveryNoEffect(identity: SessionDeliveryAttemptIdentity): Promise<SessionDeliveryCommitReceipt> {
+		this._assertPersistenceHealthy();
+		if (this.atomicAppendInFlight) throw new Error("Another atomic session operation is already in progress");
+		this.atomicAppendInFlight = true;
+		try {
+			await this.persistenceWatermark;
+			this._assertPersistenceHealthy();
+		} catch (error) {
+			this.atomicAppendInFlight = false;
+			throw error;
+		}
+		try {
+			const projection = this._captureCanonicalProjection();
+			const receipt = Object.freeze({ receiptId: randomUUID() });
+			this.deliveryCommitReceipts.set(
+				receipt,
+				Object.freeze({
+					outcome: "no_effect",
+					...identity,
+					sessionId: this.sessionId,
+					beforeLeafId: projection.leafId,
+					afterLeafId: projection.leafId,
+					revision: projection.revision,
+					beforeProjection: projection,
+					afterProjection: projection,
+				}),
+			);
+			return receipt;
+		} finally {
+			this.atomicAppendInFlight = false;
+		}
+	}
+
+	/** Roll delivery WAL state back while proving provider-visible context did not change. */
+	async retainDelivery(
+		identity: SessionDeliveryAttemptIdentity,
+		messages: readonly AgentMessage[],
+	): Promise<SessionDeliveryCommitReceipt> {
+		const canonicalMessages = cloneCanonicalData([...messages], "Retained delivery messages");
+		let beforeProjection: SessionCanonicalProjection | undefined;
+		let afterProjection: SessionCanonicalProjection | undefined;
+		await this.appendAtomically(
+			() => {
+				for (const message of canonicalMessages) {
+					if (message.role !== "user" || message.clientMessageId === undefined) continue;
+					if (this.getClientInput(message.clientMessageId)?.state === "started") {
+						this.rollbackClientInput(message.clientMessageId);
+					}
+				}
+				afterProjection = this._captureCanonicalProjection();
+			},
+			() => {},
+			() => {
+				beforeProjection = this._captureCanonicalProjection();
+			},
+		);
+		if (!beforeProjection || !afterProjection) throw new Error("Retained delivery did not capture evidence");
+		const beforeIds = beforeProjection.entries.map((entry) => entry.id);
+		const afterIds = afterProjection.entries.map((entry) => entry.id);
+		if (
+			beforeProjection.leafId !== afterProjection.leafId ||
+			beforeIds.length !== afterIds.length ||
+			beforeIds.some((id, index) => id !== afterIds[index])
+		) {
+			throw new Error("Retaining delivery changed provider-visible context");
+		}
+		const receipt = Object.freeze({ receiptId: randomUUID() });
+		this.deliveryCommitReceipts.set(
+			receipt,
+			Object.freeze({
+				outcome: "no_effect",
+				...identity,
+				sessionId: this.sessionId,
+				beforeLeafId: beforeProjection.leafId,
+				afterLeafId: afterProjection.leafId,
+				revision: afterProjection.revision,
+				beforeProjection,
+				afterProjection,
+			}),
+		);
+		return receipt;
+	}
+
+	/**
+	 * Consume client-input WAL ownership after a delivery failure whose provider
+	 * effect cannot be replayed safely. This command is deliberately independent
+	 * of volatile owner finalization so a restart cannot recover terminal work.
+	 */
+	async terminalizeDelivery(messages: readonly AgentMessage[], error: Error): Promise<void> {
+		const canonicalMessages = cloneCanonicalData([...messages], "Terminal delivery messages");
+		await this.appendAtomically(
+			() => {
+				const clientMessageIds = new Set(
+					canonicalMessages.flatMap((message) =>
+						message.role === "user" && message.clientMessageId !== undefined ? [message.clientMessageId] : [],
+					),
+				);
+				for (const clientMessageId of clientMessageIds) {
+					const record = this.getClientInput(clientMessageId);
+					if (record?.state === "accepted" || record?.state === "started") {
+						this.transitionClientInput(clientMessageId, "failed", error.message);
+					}
+				}
+			},
+			() => {},
+		);
+	}
+
+	/** Verify that a delivery receipt was issued by this live manager instance. */
+	verifyDeliveryReceipt(receipt: unknown): VerifiedSessionDeliveryReceipt | undefined {
+		if (typeof receipt !== "object" || receipt === null) return undefined;
+		const verified = this.deliveryCommitReceipts.get(receipt as SessionDeliveryCommitReceipt);
+		if (!verified) return undefined;
+		if (verified.outcome === "no_effect") {
+			return {
+				...verified,
+				beforeProjection: this._cloneCanonicalProjection(verified.beforeProjection),
+				afterProjection: this._cloneCanonicalProjection(verified.afterProjection),
+			};
+		}
+		return {
+			...verified,
+			beforeProjection: this._cloneCanonicalProjection(verified.beforeProjection),
+			afterProjection: this._cloneCanonicalProjection(verified.afterProjection),
+			entryIds: [...verified.entryIds],
+			messages: cloneCanonicalData([...verified.messages], "Verified session delivery messages"),
+			clientMessageIds: [...verified.clientMessageIds],
+			...(verified.planning === undefined ? {} : { planning: clonePlanningState(verified.planning) }),
+		};
 	}
 
 	private _assertPersistenceHealthy(): void {
@@ -2346,6 +2904,24 @@ export class SessionManager {
 			"Session persistence is fail-stopped after an uncertain write; reload the session before retrying",
 			{ cause: this.persistenceError },
 		);
+	}
+
+	/** Explicitly materialize the current canonical session and wait for its durability boundary. */
+	async materialize(): Promise<void> {
+		this._assertPersistenceHealthy();
+		if (this.atomicAppendEntries || this.atomicAppendInFlight) {
+			throw new Error("Cannot materialize a session during an atomic append");
+		}
+		if (!this.persist || !this.sessionFile) return;
+
+		const filePath = this.sessionFile;
+		if (!this.flushed) {
+			this._createFile();
+			this.flushed = true;
+		} else {
+			this._enqueuePersistence(() => serializeSessionFileOperation(filePath, () => syncDurableFile(filePath)));
+		}
+		await this.persistenceWatermark;
 	}
 
 	/** Wait for every filesystem operation accepted before this call. */
@@ -2691,14 +3267,23 @@ export class SessionManager {
 
 	private _setBranchLeaf(nextLeafId: string | null): void {
 		this.assertConversationAuthorityAvailable();
-		if (this.atomicAppendEntries || this.atomicAppendInFlight) {
+		if (this.atomicAppendInFlight && !this.atomicAppendEntries) {
 			throw new Error("Cannot change session branches during an atomic append");
 		}
 		const previousLeafId = this.leafId;
-		this.leafId = nextLeafId;
-		if (previousLeafId === nextLeafId) {
-			return;
-		}
+		if (previousLeafId === nextLeafId) return;
+		this._appendEntry({
+			type: "leaf",
+			id: generateId(this.byId),
+			parentId: previousLeafId,
+			timestamp: new Date().toISOString(),
+			targetId: nextLeafId,
+		});
+		if (this.atomicAppendEntries) return;
+		this._notifyBranchListeners(previousLeafId, nextLeafId);
+	}
+
+	private _notifyBranchListeners(previousLeafId: string | null, nextLeafId: string | null): void {
 		for (const listener of this.branchListeners) {
 			try {
 				listener({ previousLeafId, nextLeafId });
@@ -2860,6 +3445,7 @@ export class SessionManager {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: JsonCompatibleInput<T>,
+		timestamp?: number,
 	): string {
 		const entry: CustomMessageEntry = {
 			type: "custom_message",
@@ -2869,7 +3455,7 @@ export class SessionManager {
 			...(details === undefined ? {} : { details: details as JsonValue }),
 			id: generateId(this.byId),
 			parentId: this.leafId,
-			timestamp: new Date().toISOString(),
+			timestamp: timestamp === undefined ? new Date().toISOString() : new Date(timestamp).toISOString(),
 		};
 		this._appendEntry(entry);
 		return entry.id;

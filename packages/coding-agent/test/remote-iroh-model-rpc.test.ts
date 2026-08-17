@@ -90,11 +90,8 @@ describe("Iroh remote model RPC", () => {
 			getAvailableThinkingLevels: vi.fn(() => ["off", "minimal", "low", "medium", "high"]),
 			setModel,
 			setThinkingLevel,
-			agent: {
-				state: { pendingToolExecutions: new Map() },
-				subscribe: vi.fn(() => () => {}),
-				waitForIdle: vi.fn(async () => {}),
-			},
+			activeToolExecutions: new Map(),
+			subscribeRuntimeEvents: vi.fn(() => () => {}),
 		};
 		const runtimeHost = {
 			...createStableSessionRunner(() => session),

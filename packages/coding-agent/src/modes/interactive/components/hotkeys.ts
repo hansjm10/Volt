@@ -84,7 +84,13 @@ export class HotkeysComponent implements Component {
 		lines.push("");
 		lines.push(
 			truncateToWidth(
-				` ${rawKeyHint(`${keyText("tui.select.up")}/${keyText("tui.select.down")}`, "scroll")}  ${rawKeyHint(`${keyText("tui.editor.pageUp")}/${keyText("tui.editor.pageDown")}`, "page")}  ${keyHint("tui.select.cancel", "close")}`,
+				` ${keyHint("tui.select.cancel", "close")}  ${rawKeyHint(`${keyText("tui.select.up")}/${keyText("tui.select.down")}`, "scroll")}`,
+				width,
+			),
+		);
+		lines.push(
+			truncateToWidth(
+				` ${rawKeyHint(`${keyText("tui.editor.pageUp")}/${keyText("tui.editor.pageDown")}`, "page")}`,
 				width,
 			),
 		);

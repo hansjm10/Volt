@@ -2,7 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
-import { fauxAssistantMessage, fauxToolCall, type Model } from "@hansjm10/volt-ai";
+import { fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import type { InputEvent } from "../../src/core/extensions/index.ts";
@@ -75,6 +75,69 @@ describe("AgentSession prompt characterization", () => {
 		]);
 		expect(harness.session.messages[2]?.role).toBe("toolResult");
 		expect(harness.session.messages[3]?.role).toBe("assistant");
+	});
+
+	it("continues a tool turn when automatic naming completes during the first provider request", async () => {
+		let resolveProviderStarted = (): void => undefined;
+		const providerStarted = new Promise<void>((resolve) => {
+			resolveProviderStarted = resolve;
+		});
+		let releaseProvider = (): void => undefined;
+		const providerRelease = new Promise<void>((resolve) => {
+			releaseProvider = resolve;
+		});
+		const echoTool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo text back",
+			parameters: Type.Object({ text: Type.String() }),
+			execute: async (_toolCallId, params) => {
+				const text = typeof params === "object" && params !== null && "text" in params ? String(params.text) : "";
+				return {
+					content: [{ type: "text", text }],
+					details: {},
+				};
+			},
+		};
+		const harness = await createHarness({ tools: [echoTool] });
+		harnesses.push(harness);
+		const generatedName = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "session_info_changed" || event.name !== "Generated Tool Session") return;
+				unsubscribe();
+				resolve();
+			});
+		});
+		harness.faux.setSimpleResponses([
+			async () => {
+				await providerStarted;
+				return fauxAssistantMessage("Generated Tool Session");
+			},
+		]);
+		harness.setResponses([
+			async () => {
+				resolveProviderStarted();
+				await providerRelease;
+				return fauxAssistantMessage(fauxToolCall("echo", { text: "hello" }), { stopReason: "toolUse" });
+			},
+			fauxAssistantMessage("done"),
+		]);
+
+		const prompt = harness.session.prompt("name this tool session");
+		await generatedName;
+		releaseProvider();
+		await prompt;
+
+		expect(harness.faux.state.simpleCallCount).toBe(1);
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.session.sessionName).toBe("Generated Tool Session");
+		expect(harness.session.messages.map((message) => message.role)).toEqual([
+			"user",
+			"assistant",
+			"toolResult",
+			"assistant",
+		]);
+		expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 	});
 
 	it("executes multiple tool calls from one response and continues with a single follow-up response", async () => {
@@ -382,7 +445,7 @@ describe("AgentSession prompt characterization", () => {
 	it("throws when prompting without a model", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.session.agent.state.model = undefined as unknown as Model<any>;
+		await harness.control.setModel(undefined);
 
 		await expect(harness.session.prompt("hi")).rejects.toThrow("No model selected.");
 	});

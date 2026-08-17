@@ -121,7 +121,8 @@ afterEach(async () => {
 	const fauxProviders = new Set<FauxProviderRegistration>();
 	while (runtimes.length > 0) {
 		const runtime = runtimes.pop()!;
-		await runtime.session.dispose();
+		runtime.session.dispose();
+		await runtime.session.waitForClosed();
 		tempDirs.add(runtime.tempDir);
 		fauxProviders.add(runtime.faux);
 	}
@@ -142,7 +143,8 @@ describe("issue #110: durable Fast mode state", () => {
 			expect(first.manager.buildSessionContext().fastMode).toEqual({ enabled: true });
 			expect(buildRpcSessionState(first.session).fastModeEnabled).toBe(true);
 			const sessionFile = first.manager.getSessionFile()!;
-			await first.session.dispose();
+			first.session.dispose();
+			await first.session.waitForClosed();
 
 			const resumed = await createRuntime({
 				provider,
@@ -175,7 +177,8 @@ describe("issue #110: durable Fast mode state", () => {
 		first.session.setFastModeEnabled(true);
 		const sessionFile = first.manager.getSessionFile()!;
 		const secondModel = first.modelRegistry.find("openai", "second")!;
-		await first.session.dispose();
+		first.session.dispose();
+		await first.session.waitForClosed();
 
 		const resumed = await createRuntime({
 			provider: "openai",
@@ -204,7 +207,9 @@ describe("issue #110: durable Fast mode state", () => {
 		first.session.setFastModeEnabled(true);
 		const firstFile = first.manager.getSessionFile()!;
 		const secondFile = second.manager.getSessionFile()!;
-		await Promise.all([first.session.dispose(), second.session.dispose()]);
+		first.session.dispose();
+		second.session.dispose();
+		await Promise.all([first.session.waitForClosed(), second.session.waitForClosed()]);
 
 		const reopenedFirst = await createRuntime({
 			provider: "openai",
@@ -246,7 +251,7 @@ describe("issue #110: durable Fast mode state", () => {
 		});
 
 		runtime.session.setFastModeEnabled(true);
-		runtime.session.setThinkingLevel("medium", { persistDefault: false });
+		await runtime.session.setThinkingLevel("medium", { persistDefault: false });
 		expect(runtime.session.fastModeEnabled).toBe(true);
 		expect(runtime.session.thinkingLevel).toBe("medium");
 
@@ -267,7 +272,6 @@ describe("issue #110: durable Fast mode state", () => {
 	it("restores branch-local Fast and thinking states before publishing navigation", async () => {
 		const runtime = await createRuntime({ provider: "openai", explicitThinking: "high" });
 		const branchPoint = runtime.manager.appendMessage({ role: "user", content: "branch point", timestamp: 1 });
-		runtime.session.agent.state.messages = runtime.manager.buildSessionContext().messages;
 		runtime.session.setFastModeEnabled(true);
 		const enabledLeaf = runtime.manager.getLeafId()!;
 

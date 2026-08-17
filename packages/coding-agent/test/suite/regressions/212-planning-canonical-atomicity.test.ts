@@ -91,7 +91,9 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 
 	afterEach(async () => {
 		while (harnesses.length > 0) {
-			await harnesses.pop()!.session.dispose();
+			const session = harnesses.pop()!.session;
+			session.dispose();
+			await session.waitForClosed();
 		}
 		while (tempDirs.length > 0) {
 			rmSync(tempDirs.pop()!, { recursive: true, force: true });
@@ -119,7 +121,7 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 		clientMessageId: string,
 	): Promise<void> {
 		await harness.session.steer("revise this ready plan", undefined, clientMessageId);
-		await expect(harness.session.agent.continue()).resolves.toMatchObject({
+		await expect(harness.control.continue()).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: { outcome: "retained", phase: "settlement" },
 		});
@@ -171,7 +173,8 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 	it("atomically commits a resumed session missing its final newline", async () => {
 		const { harness, sessionFile, baseline } = await setup();
 		harnesses.pop();
-		await harness.session.dispose();
+		harness.session.dispose();
+		await harness.session.waitForClosed();
 		harness.cleanup();
 		const persisted = readFileSync(sessionFile, "utf8");
 		writeFileSync(sessionFile, persisted.trimEnd(), "utf8");
@@ -199,7 +202,7 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 		const clientMessageId = "issue-212-stale-preimage";
 
 		await harness.session.steer("revise this ready plan", undefined, clientMessageId);
-		await expect(harness.session.agent.continue()).resolves.toMatchObject({
+		await expect(harness.control.continue()).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: { outcome: "terminally_failed", phase: "settlement" },
 		});
@@ -213,7 +216,8 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 			1,
 		);
 		harnesses.pop();
-		await harness.session.dispose().catch(() => {});
+		harness.session.dispose();
+		await harness.session.waitForClosed().catch(() => {});
 		harness.cleanup();
 	});
 
@@ -233,7 +237,7 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 			userTexts: ["queued steer", "pending prompt"],
 		});
 		expect(snapshotReopened(sessionFile)).toEqual(live);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
@@ -246,7 +250,7 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 		atomicWriteFault.pause = { started: started.resolve, release: release.promise };
 
 		await harness.session.steer("revise this ready plan", undefined, "issue-212-session-replacement");
-		const attempt = harness.session.agent.continue();
+		const attempt = harness.control.continue();
 		await started.promise;
 		expect(() => harness.sessionManager.setSessionFile(sessionFile)).toThrow(
 			"Cannot switch session files during an atomic append",
@@ -280,7 +284,7 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 		});
 
 		await harness.session.steer("revise this ready plan", undefined, "issue-212-observer-order");
-		await harness.session.agent.continue();
+		await harness.control.continue();
 		unsubscribe();
 
 		expect(observedPhases).toEqual(["draft", "draft"]);
@@ -301,7 +305,7 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 			}),
 		).rejects.toThrow("Atomic append was rolled back");
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(snapshotHarness(harness)).toEqual(baseline);
 		expect(snapshotReopened(sessionFile)).toEqual(baseline);
 		expect(harness.getPendingResponseCount()).toBe(1);

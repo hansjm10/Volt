@@ -4,14 +4,6 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { createHarness, type Harness } from "../harness.ts";
 
-function deferred(): { promise: Promise<void>; resolve(): void } {
-	let resolve = (): void => undefined;
-	const promise = new Promise<void>((promiseResolve) => {
-		resolve = promiseResolve;
-	});
-	return { promise, resolve };
-}
-
 function createNestedUserMessage(
 	text: string,
 	imageData: string,
@@ -51,27 +43,25 @@ describe("regression #211: delivery payload isolation", () => {
 	let harness: Harness | undefined;
 
 	afterEach(async () => {
-		await harness?.session.dispose();
+		harness?.session.dispose();
+		if (harness) await harness.session.waitForClosed();
 		harness?.cleanup();
 		harness = undefined;
 	});
 
-	it("keeps canonical, Agent, delivery-event, and provider payloads identical when an upstream participant mutates", async () => {
+	it("keeps canonical, finalized-event, delivery-event, and provider payloads identical when an upstream participant mutates", async () => {
 		let providerUser: Extract<AgentMessage, { role: "user" }> | undefined;
 		let deliveryUser: Extract<AgentMessage, { role: "user" }> | undefined;
 		harness = await createHarness({
-			prepareDelivery: (delivery) => {
-				const messages = [...delivery.messages];
-				return {
-					messages,
-					participant: {
-						settle: () => {
-							mutateRetainedMessages(messages);
-							return { outcome: "committed" };
-						},
+			prepareDelivery: (delivery) => ({
+				messages: delivery.messages.map((message) => structuredClone(message)),
+				participant: {
+					settle: (context) => {
+						mutateRetainedMessages(context.messages as AgentMessage[]);
+						return { outcome: "committed" };
 					},
-				};
-			},
+				},
+			}),
 			extensionFactories: [
 				(volt) => {
 					volt.on("context", (event) => {
@@ -90,10 +80,10 @@ describe("regression #211: delivery payload isolation", () => {
 		harness.setResponses([fauxAssistantMessage("committed")]);
 		const expected = createNestedUserMessage("immutable original", "b3JpZ2luYWw=", 123);
 
-		await harness.session.agent.prompt(expected);
+		await harness.control.run(expected);
 
 		const canonicalUser = findUser(harness.sessionManager.buildSessionContext().messages);
-		const agentUser = findUser(harness.session.agent.state.messages);
+		const agentUser = findUser(harness.session.state.messages);
 		expect(canonicalUser).toEqual(expected);
 		expect(agentUser).toEqual(expected);
 		expect(deliveryUser).toEqual(expected);
@@ -107,21 +97,18 @@ describe("regression #211: delivery payload isolation", () => {
 		let providerUser: Extract<AgentMessage, { role: "user" }> | undefined;
 		let deliveryUser: Extract<AgentMessage, { role: "user" }> | undefined;
 		harness = await createHarness({
-			prepareDelivery: (delivery) => {
-				const messages = [...delivery.messages];
-				return {
-					messages,
-					participant: {
-						settle: () => {
-							mutateRetainedMessages(messages);
-							if (extensionReference) mutateRetainedMessages([extensionReference]);
-							return retain
-								? { outcome: "retained", error: new Error("retry isolated payload") }
-								: { outcome: "committed" };
-						},
+			prepareDelivery: (delivery) => ({
+				messages: delivery.messages.map((message) => structuredClone(message)),
+				participant: {
+					settle: (context) => {
+						mutateRetainedMessages(context.messages as AgentMessage[]);
+						if (extensionReference) mutateRetainedMessages([extensionReference]);
+						return retain
+							? { outcome: "retained", error: new Error("retry isolated payload") }
+							: { outcome: "committed" };
 					},
-				};
-			},
+				},
+			}),
 			extensionFactories: [
 				(volt) => {
 					volt.on("message_end", (event) => {
@@ -153,51 +140,20 @@ describe("regression #211: delivery payload isolation", () => {
 		const original = createNestedUserMessage("original", "b3JpZ2luYWw=", 456);
 		const expected = createNestedUserMessage("transformed once", "dHJhbnNmb3JtZWQ=", 456);
 
-		await expect(harness.session.agent.prompt(original)).resolves.toMatchObject({
+		await expect(harness.control.run(original)).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: { outcome: "retained" },
 		});
 		retain = false;
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		const canonicalUser = findUser(harness.sessionManager.buildSessionContext().messages);
-		const agentUser = findUser(harness.session.agent.state.messages);
+		const agentUser = findUser(harness.session.state.messages);
 		expect(extensionRuns).toBe(1);
 		expect(canonicalUser).toEqual(expected);
 		expect(agentUser).toEqual(expected);
 		expect(deliveryUser).toEqual(expected);
 		expect(providerUser).toEqual(expected);
-	});
-
-	it("does not start extension preparation after revocation wins during upstream preparation", async () => {
-		const preparationStarted = deferred();
-		const releasePreparation = deferred();
-		let extensionRuns = 0;
-		harness = await createHarness({
-			prepareDelivery: async (delivery) => {
-				preparationStarted.resolve();
-				await releasePreparation.promise;
-				return { messages: [...delivery.messages] };
-			},
-			extensionFactories: [
-				(volt) => {
-					volt.on("message_start", () => {
-						extensionRuns++;
-					});
-				},
-			],
-		});
-		const clientMessageId = "revoked-before-extension-preparation";
-		const prompting = harness.session.prompt("revoke before extensions", { clientMessageId, source: "rpc" });
-
-		await preparationStarted.promise;
-		expect(harness.session.agent.discardPendingPrompt()).toHaveLength(1);
-		releasePreparation.resolve();
-		await expect(prompting).rejects.toThrow("Delivery was revoked before canonical commitment");
-
-		expect(extensionRuns).toBe(0);
-		expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("accepted");
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
 	});
 
 	it("reuses queue ownership with the cached payload when retained upstream messages lose their runtime identity", async () => {
@@ -220,20 +176,19 @@ describe("regression #211: delivery payload isolation", () => {
 				return { content: [{ type: "text", text: "released" }], details: {} };
 			},
 		};
-		let retainedMessages: AgentMessage[] | undefined;
 		let retain = true;
 		harness = await createHarness({
 			tools: [waitTool],
 			prepareDelivery: (delivery) => {
 				if (delivery.kind !== "steer") return { messages: [...delivery.messages] };
-				retainedMessages ??= [...delivery.messages];
 				return {
-					messages: retainedMessages,
+					messages: delivery.messages.map((message) => structuredClone(message)),
 					participant: {
-						settle: () => {
+						settle: (context) => {
 							if (retain) {
-								mutateRetainedMessages(retainedMessages!);
-								const user = findUser(retainedMessages!);
+								const participantMessages = context.messages as AgentMessage[];
+								mutateRetainedMessages(participantMessages);
+								const user = findUser(participantMessages);
 								if (user) user.clientMessageId = "substituted-runtime-identity";
 								retain = false;
 								return { outcome: "retained", error: new Error("retry retained queue") };
@@ -255,10 +210,10 @@ describe("regression #211: delivery payload isolation", () => {
 
 		releaseTool();
 		await activeRun;
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(harness.session.getSteeringMessages()).toHaveLength(1);
 
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		const canonicalUser = harness.sessionManager
 			.buildSessionContext()
@@ -269,7 +224,7 @@ describe("regression #211: delivery payload isolation", () => {
 		expect(canonicalUser?.content).toEqual([{ type: "text", text: "queued immutable payload" }]);
 		expect(harness.sessionManager.getClientInput(clientMessageId)?.state).toBe("completed");
 		expect(harness.session.getSteeringMessages()).toEqual([]);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 });

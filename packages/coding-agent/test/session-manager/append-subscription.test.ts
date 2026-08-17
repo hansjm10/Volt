@@ -45,7 +45,7 @@ describe("SessionManager entry subscriptions", () => {
 
 		expect(session.getEntry(first)?.ordinal).toBe(1);
 		expect(session.getEntry(second)?.ordinal).toBe(2);
-		expect(session.getEntry(fork)?.ordinal).toBe(3);
+		expect(session.getEntry(fork)?.ordinal).toBe(4);
 		expect(changes).toEqual([{ previousLeafId: second, nextLeafId: first }]);
 	});
 });

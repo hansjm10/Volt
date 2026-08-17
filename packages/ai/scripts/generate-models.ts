@@ -1923,9 +1923,10 @@ async function generateModels() {
 
 	// OpenAI Codex (ChatGPT OAuth) models
 	// NOTE: These are not fetched from models.dev; we keep a small, explicit list to avoid aliases.
-	// Context window is based on observed server limits (400s above ~272k), not marketing numbers.
+	// Keep the 272k observed server limit by default; GPT-5.6 Sol officially supports 1M.
 	const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 	const CODEX_CONTEXT = 272000;
+	const CODEX_GPT_5_6_SOL_CONTEXT = 1000000;
 	const CODEX_SPARK_CONTEXT = 128000;
 	const CODEX_MAX_TOKENS = 128000;
 	const codexModels: Model<"openai-codex-responses">[] = [
@@ -1988,7 +1989,7 @@ async function generateModels() {
 			reasoning: true,
 			input: ["text", "image"],
 			cost: { ...model.cost },
-			contextWindow: CODEX_CONTEXT,
+			contextWindow: model.id === "gpt-5.6-sol" ? CODEX_GPT_5_6_SOL_CONTEXT : CODEX_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		});
 	}

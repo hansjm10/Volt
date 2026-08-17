@@ -91,7 +91,7 @@ describe.skipIf(!API_KEY)("AgentSession forking", () => {
 		await createSession();
 
 		await session.prompt("Say hello");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		const userMessages = session.getUserMessagesForForking();
 		expect(userMessages.length).toBe(1);
@@ -113,7 +113,7 @@ describe.skipIf(!API_KEY)("AgentSession forking", () => {
 		expect(session.sessionFile).toBeUndefined();
 
 		await session.prompt("Say hi");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		const userMessages = session.getUserMessagesForForking();
 		expect(userMessages.length).toBe(1);
@@ -132,13 +132,13 @@ describe.skipIf(!API_KEY)("AgentSession forking", () => {
 		await createSession();
 
 		await session.prompt("Say one");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		await session.prompt("Say two");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		await session.prompt("Say three");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		const userMessages = session.getUserMessagesForForking();
 		expect(userMessages.length).toBe(3);

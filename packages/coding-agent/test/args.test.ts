@@ -346,6 +346,32 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--tui-mode flag", () => {
+		test.each(["regular", "fullscreen"] as const)("parses %s mode", (mode) => {
+			const result = parseArgs(["--tui-mode", mode]);
+			expect(result.tuiMode).toBe(mode);
+		});
+
+		test("rejects invalid modes", () => {
+			const result = parseArgs(["--tui-mode", "other"]);
+			expect(result.diagnostics).toEqual([
+				{ type: "error", message: 'Invalid TUI mode "other". Valid values: regular, fullscreen' },
+			]);
+		});
+
+		test("requires a mode", () => {
+			const result = parseArgs(["--tui-mode"]);
+			expect(result.diagnostics).toEqual([{ type: "error", message: "--tui-mode requires regular or fullscreen" }]);
+		});
+
+		test("does not consume a following flag as the mode", () => {
+			const result = parseArgs(["--tui-mode", "--verbose"]);
+			expect(result.tuiMode).toBeUndefined();
+			expect(result.verbose).toBe(true);
+			expect(result.diagnostics).toEqual([{ type: "error", message: "--tui-mode requires regular or fullscreen" }]);
+		});
+	});
+
 	describe("tool flags", () => {
 		test("parses --no-tools flag", () => {
 			const result = parseArgs(["--no-tools"]);

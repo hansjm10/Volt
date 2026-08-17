@@ -2,7 +2,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { RgbColor } from "@hansjm10/volt-tui";
 import { getCustomThemesDir, getThemesDir } from "../../config.ts";
-import { createThemeFromJson, parseThemeJsonContent, type Theme, type ThemeJson } from "./theme.ts";
+import {
+	createThemeFromJson,
+	parseThemeJsonContent,
+	type Theme,
+	type ThemeJson,
+	withThemeColorFallbacks,
+} from "./theme.ts";
 import { ansi256ToHex, hexToRgb, resolveVarRefs } from "./tokens.ts";
 import type { ColorMode, TerminalTheme, TerminalThemeDetection, ThemeColorValue, ThemeInfo } from "./types.ts";
 
@@ -247,7 +253,7 @@ export function getResolvedThemeColors(
 	const isLight = name === "light";
 	const themeJson = loadThemeJson(name, registeredThemes, dirs);
 	const resolved: Record<string, string | number> = {};
-	for (const [key, value] of Object.entries(themeJson.colors)) {
+	for (const [key, value] of Object.entries(withThemeColorFallbacks(themeJson.colors))) {
 		resolved[key] = resolveVarRefs(value, themeJson.vars ?? {});
 	}
 

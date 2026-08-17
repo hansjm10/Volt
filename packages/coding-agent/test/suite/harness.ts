@@ -5,10 +5,9 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentMessage, AgentOptions, AgentTool } from "@hansjm10/volt-agent-core";
-import { Agent } from "@hansjm10/volt-agent-core";
+import type { AgentTool } from "@hansjm10/volt-agent-core";
 import type { FauxModelDefinition, FauxProviderRegistration, FauxResponseStep, Model } from "@hansjm10/volt-ai";
-import { registerFauxProvider } from "@hansjm10/volt-ai";
+import { registerFauxProvider, streamSimple } from "@hansjm10/volt-ai";
 import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-session.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
 import type { ExtensionRunner } from "../../src/core/extensions/index.ts";
@@ -18,6 +17,7 @@ import { SessionManager } from "../../src/core/session-manager.ts";
 import type { Settings } from "../../src/core/settings-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
 import type { ExtensionFactory, ResourceLoader } from "../../src/index.ts";
+import { createAgentSessionTestControl, type LegacyPrepareDelivery } from "../agent-session-test-control.ts";
 import {
 	type CreateTestExtensionsResultInput,
 	createTestExtensionsResult,
@@ -66,7 +66,7 @@ export interface HarnessOptions {
 	excludedToolNames?: string[];
 	resourceLoader?: ResourceLoader;
 	extensionFactories?: Array<ExtensionFactory | CreateTestExtensionsResultInput>;
-	prepareDelivery?: AgentOptions["prepareDelivery"];
+	prepareDelivery?: LegacyPrepareDelivery;
 	withConfiguredAuth?: boolean;
 	/** Inject a persisted manager when a test needs to exercise session reload behavior. */
 	sessionManager?: SessionManager;
@@ -74,6 +74,7 @@ export interface HarnessOptions {
 
 export interface Harness {
 	session: AgentSession;
+	control: ReturnType<typeof createAgentSessionTestControl>;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
 	authStorage: AuthStorage;
@@ -134,48 +135,22 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		});
 	}
 
-	const agent = new Agent({
-		getApiKey: () => (withConfiguredAuth ? "faux-key" : undefined),
-		initialState: {
-			model,
-			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
-			tools: [],
-		},
-		convertToLlm,
-		onPayload: async (payload) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner?.hasHandlers("before_provider_request")) {
-				return payload;
-			}
-			return runner.emitBeforeProviderRequest(payload);
-		},
-		onResponse: async (response) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner?.hasHandlers("after_provider_response")) {
-				return;
-			}
-			await runner.emit({
-				type: "after_provider_response",
-				status: response.status,
-				headers: response.headers,
-			});
-		},
-		prepareDelivery: options.prepareDelivery,
-		transformContext: async (messages: AgentMessage[]) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner) return messages;
-			return runner.emitContext(messages);
-		},
-	});
 	const extensionsResult = options.extensionFactories
 		? await createTestExtensionsResult(options.extensionFactories, tempDir)
 		: undefined;
 	const resourceLoader =
-		options.resourceLoader ?? createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined);
+		options.resourceLoader ??
+		createTestResourceLoader({
+			...(extensionsResult === undefined ? {} : { extensionsResult }),
+			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
+		});
 
 	const session = new AgentSession({
-		agent,
 		sessionManager,
+		model,
+		thinkingLevel: "off",
+		streamFn: streamSimple,
+		convertToLlm,
 		settingsManager,
 		cwd: tempDir,
 		agentDir: options.agentDir ?? tempDir,
@@ -187,6 +162,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		excludedToolNames: options.excludedToolNames,
 		extensionRunnerRef,
 	});
+	const control = createAgentSessionTestControl(session);
+	if (options.prepareDelivery) control.setPrepareDelivery(options.prepareDelivery);
 
 	const events: AgentSessionEvent[] = [];
 	session.subscribe((event) => {
@@ -195,6 +172,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 
 	return {
 		session,
+		control,
 		sessionManager,
 		settingsManager,
 		authStorage,

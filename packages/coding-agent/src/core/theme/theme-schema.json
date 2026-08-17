@@ -33,7 +33,7 @@
 		},
 		"colors": {
 			"type": "object",
-			"description": "Theme color definitions (all required)",
+			"description": "Theme color definitions (fullscreen scrollbar and search colors are optional with compatible fallbacks)",
 			"required": [
 				"accent",
 				"border",
@@ -135,6 +135,18 @@
 				"selectedBg": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Selected item background"
+				},
+				"scrollbarThumb": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Fullscreen scrollbar thumb background (falls back to selectedBg when omitted)"
+				},
+				"searchMatchBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Transcript search match background (falls back to selectedBg when omitted)"
+				},
+				"searchMatchText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Transcript search match text (falls back to text when omitted)"
 				},
 				"userMessageBg": {
 					"$ref": "#/$defs/colorValue",

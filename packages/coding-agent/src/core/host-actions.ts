@@ -2,7 +2,7 @@ import type { ThinkingLevel } from "@hansjm10/volt-agent-core";
 import { type Api, type Model, supportsFastInference } from "@hansjm10/volt-ai";
 import type { AgentSessionRuntime } from "./agent-session-runtime.ts";
 import type { AgentMode, PlanExecutionStrategy, PlanningState } from "./planning.ts";
-import type { ReviewTarget, ReviewWorkflowResult } from "./review.ts";
+import type { ReviewRunControls, ReviewTarget, ReviewWorkflowResult } from "./review.ts";
 import type {
 	UiActionArgumentDescriptor,
 	UiActionDescriptor,
@@ -56,6 +56,7 @@ export interface HostActionInvocationContext extends HostActionDescriptorContext
 	changePlan?(planId: string, expectedRevision: number): PlanningState;
 	discardPlan?(planId: string, expectedRevision: number): PlanningState;
 	runReviewAction?(target: ReviewTarget, options: HostActionReviewOptions): Promise<ReviewWorkflowResult>;
+	runReviewLifecycleAction?(action: string, args: Record<string, unknown>): Promise<UiActionInvocationResponse>;
 }
 
 export type HostActionAvailability =
@@ -105,6 +106,11 @@ export const REVIEW_BRANCH_ACTION_ID = "review.branch";
 export const REVIEW_COMMIT_ACTION_ID = "review.commit";
 export const REVIEW_PR_ACTION_ID = "review.pr";
 export const REVIEW_UNCOMMITTED_ACTION_ID = "review.uncommitted";
+export const REVIEW_FIX_ACTION_ID = "review.fix";
+export const REVIEW_FEEDBACK_ACTION_ID = "review.feedback";
+export const REVIEW_RERUN_ACTION_ID = "review.rerun";
+export const REVIEW_PUBLISH_ACTION_ID = "review.publish";
+export const REVIEW_EXPORT_FEEDBACK_ACTION_ID = "review.export_feedback";
 export const RUN_CANCEL_ACTION_ID = "run.cancel";
 export const SESSION_NEW_ACTION_ID = "session.new";
 export const SESSION_NEW_SLASH_ALIAS = "clear";
@@ -120,7 +126,49 @@ export const PLAN_DISCARD_ACTION_ID = "plan.discard";
 export interface HostActionReviewOptions {
 	remote: boolean;
 	requireConfirmation: boolean;
+	controls?: Partial<ReviewRunControls>;
+	parentRunId?: string;
 }
+
+const REVIEW_OPTION_ARGUMENTS: ReadonlyArray<UiActionArgumentDescriptor> = [
+	{
+		name: "focus",
+		label: "Review focus",
+		type: "string",
+		required: false,
+		placeholder: "Security and authorization",
+	},
+	{
+		name: "scope",
+		label: "Path scope",
+		type: "string",
+		required: false,
+		placeholder: "src/**/*.ts,test/**/*.ts",
+		description: "Comma-separated repository-relative globs.",
+	},
+	{
+		name: "effort",
+		label: "Effort",
+		type: "enum",
+		required: false,
+		options: [
+			{ value: "low", label: "Low" },
+			{ value: "standard", label: "Standard" },
+			{ value: "high", label: "High" },
+		],
+	},
+	{ name: "includeOptional", label: "Include optional P3 findings", type: "boolean", required: false },
+	{
+		name: "scopeMode",
+		label: "Review mode",
+		type: "enum",
+		required: false,
+		options: [
+			{ value: "incremental", label: "Incremental" },
+			{ value: "full", label: "Full" },
+		],
+	},
+];
 
 const REMOTE_SAFE_BUILTIN_HOST_ACTION_IDS = new Set<string>([
 	SESSION_NEW_ACTION_ID,
@@ -134,6 +182,10 @@ const REMOTE_SAFE_BUILTIN_HOST_ACTION_IDS = new Set<string>([
 	REVIEW_BRANCH_ACTION_ID,
 	REVIEW_PR_ACTION_ID,
 	REVIEW_COMMIT_ACTION_ID,
+	REVIEW_FIX_ACTION_ID,
+	REVIEW_FEEDBACK_ACTION_ID,
+	REVIEW_RERUN_ACTION_ID,
+	REVIEW_PUBLISH_ACTION_ID,
 ]);
 
 export class HostActionRegistry {
@@ -509,7 +561,7 @@ export function registerBuiltinHostActions(registry: HostActionRegistry): HostAc
 		description: "Review uncommitted workspace changes.",
 		category: "review",
 		presentation: { kind: "card", group: "Review", priority: 100, icon: "magnifyingglass" },
-		args: [],
+		args: [...REVIEW_OPTION_ARGUMENTS],
 		destructive: false,
 		requiresConfirmation: true,
 		streamingBehavior: "disabled",
@@ -541,6 +593,7 @@ export function registerBuiltinHostActions(registry: HostActionRegistry): HostAc
 				placeholder: "main",
 				completion: "gitBranches",
 			},
+			...REVIEW_OPTION_ARGUMENTS,
 		],
 		destructive: false,
 		requiresConfirmation: true,
@@ -569,6 +622,7 @@ export function registerBuiltinHostActions(registry: HostActionRegistry): HostAc
 				placeholder: "Current branch",
 				description: "Leave empty to review the pull request for the current branch.",
 			},
+			...REVIEW_OPTION_ARGUMENTS,
 		],
 		destructive: false,
 		requiresConfirmation: true,
@@ -596,6 +650,7 @@ export function registerBuiltinHostActions(registry: HostActionRegistry): HostAc
 				placeholder: "HEAD",
 				description: "A commit SHA, tag, or revision such as HEAD~1.",
 			},
+			...REVIEW_OPTION_ARGUMENTS,
 		],
 		destructive: false,
 		requiresConfirmation: true,
@@ -607,6 +662,109 @@ export function registerBuiltinHostActions(registry: HostActionRegistry): HostAc
 		},
 		availability: reviewAvailability,
 		handler: invokeReviewCommitAction,
+	});
+	registry.register({
+		id: REVIEW_FIX_ACTION_ID,
+		label: "Fix review findings",
+		description: "Open a fresh session seeded with selected durable review findings.",
+		category: "review",
+		presentation: { kind: "detail", group: "Review", priority: 60 },
+		args: [
+			{ name: "runId", label: "Review run ID", type: "string", required: true },
+			{
+				name: "findingIds",
+				label: "Finding IDs",
+				type: "string",
+				required: false,
+				description: "Comma-separated durable finding IDs; empty selects all.",
+			},
+		],
+		requiresConfirmation: false,
+		remoteSafe: true,
+		handler: (context, args) => invokeReviewLifecycleAction(context, REVIEW_FIX_ACTION_ID, args),
+	});
+	registry.register({
+		id: REVIEW_FEEDBACK_ACTION_ID,
+		label: "Label review finding",
+		description: "Record an explicit local outcome for a durable review finding.",
+		category: "review",
+		presentation: { kind: "detail", group: "Review", priority: 50 },
+		args: [
+			{ name: "runId", label: "Review run ID", type: "string", required: true },
+			{ name: "findingId", label: "Finding ID", type: "string", required: true },
+			{
+				name: "status",
+				label: "Outcome",
+				type: "enum",
+				required: true,
+				options: [
+					{ value: "accepted", label: "Accepted" },
+					{ value: "fixed", label: "Fixed" },
+					{ value: "dismissed", label: "Dismissed" },
+				],
+			},
+			{
+				name: "reason",
+				label: "Dismissal reason",
+				type: "enum",
+				required: false,
+				options: [
+					{ value: "false_positive", label: "False positive" },
+					{ value: "intentional", label: "Intentional" },
+					{ value: "not_actionable", label: "Not actionable" },
+					{ value: "other", label: "Other" },
+				],
+			},
+			{ name: "note", label: "Note", type: "string", required: false },
+		],
+		requiresConfirmation: false,
+		remoteSafe: true,
+		handler: (context, args) => invokeReviewLifecycleAction(context, REVIEW_FEEDBACK_ACTION_ID, args),
+	});
+	registry.register({
+		id: REVIEW_RERUN_ACTION_ID,
+		label: "Re-run review",
+		description: "Run an incremental or full review from a durable prior run.",
+		category: "review",
+		presentation: { kind: "detail", group: "Review", priority: 40 },
+		args: [
+			{ name: "runId", label: "Review run ID", type: "string", required: true },
+			{
+				name: "scopeMode",
+				label: "Mode",
+				type: "enum",
+				required: false,
+				options: [
+					{ value: "incremental", label: "Incremental" },
+					{ value: "full", label: "Full" },
+				],
+			},
+		],
+		requiresConfirmation: true,
+		remoteSafe: true,
+		handler: (context, args) => invokeReviewLifecycleAction(context, REVIEW_RERUN_ACTION_ID, args),
+	});
+	registry.register({
+		id: REVIEW_PUBLISH_ACTION_ID,
+		label: "Publish PR review",
+		description: "Atomically publish a complete, non-stale pull request review.",
+		category: "review",
+		presentation: { kind: "detail", group: "Review", priority: 30 },
+		args: [{ name: "runId", label: "Review run ID", type: "string", required: true }],
+		requiresConfirmation: true,
+		remoteSafe: true,
+		handler: (context, args) => invokeReviewLifecycleAction(context, REVIEW_PUBLISH_ACTION_ID, args),
+	});
+	registry.register({
+		id: REVIEW_EXPORT_FEEDBACK_ACTION_ID,
+		label: "Export review feedback",
+		description: "Explicitly export locally recorded review outcomes for evaluation.",
+		category: "review",
+		presentation: { kind: "detail", group: "Review", priority: 20 },
+		args: [{ name: "path", label: "Output path", type: "string", required: false }],
+		requiresConfirmation: false,
+		remoteSafe: false,
+		handler: (context, args) => invokeReviewLifecycleAction(context, REVIEW_EXPORT_FEEDBACK_ACTION_ID, args),
 	});
 	return registry;
 }
@@ -809,15 +967,23 @@ export function runThinkingFastModeHostAction(
 	};
 }
 
+async function invokeReviewLifecycleAction(
+	context: HostActionInvocationContext,
+	action: string,
+	args: unknown,
+): Promise<UiActionInvocationResponse> {
+	if (!context.runReviewLifecycleAction) throw new Error("Review lifecycle actions are not available in this host");
+	return context.runReviewLifecycleAction(action, getArgsRecord(args));
+}
+
 async function invokeReviewUncommittedAction(
 	context: HostActionInvocationContext,
 	args: unknown,
 	options: HostActionInvokeOptions,
 ): Promise<UiActionInvocationResponse> {
-	assertNoActionArgs(args);
 	return createReviewInvocationResponse(
 		REVIEW_UNCOMMITTED_ACTION_ID,
-		await runReviewHostAction(context, { kind: "uncommitted" }, createReviewOptions(options)),
+		await runReviewHostAction(context, { kind: "uncommitted" }, createReviewOptions(options, args)),
 	);
 }
 
@@ -826,10 +992,11 @@ async function invokeReviewBranchAction(
 	args: unknown,
 	options: HostActionInvokeOptions,
 ): Promise<UiActionInvocationResponse> {
-	const base = getOptionalStringArg(args, "base")?.trim() || undefined;
+	const record = getArgsRecord(args);
+	const base = typeof record.base === "string" ? record.base.trim() || undefined : undefined;
 	return createReviewInvocationResponse(
 		REVIEW_BRANCH_ACTION_ID,
-		await runReviewHostAction(context, { kind: "branch", base }, createReviewOptions(options)),
+		await runReviewHostAction(context, { kind: "branch", base }, createReviewOptions(options, args)),
 	);
 }
 
@@ -838,10 +1005,11 @@ async function invokeReviewPullRequestAction(
 	args: unknown,
 	options: HostActionInvokeOptions,
 ): Promise<UiActionInvocationResponse> {
-	const number = getOptionalStringArg(args, "number")?.trim() || undefined;
+	const record = getArgsRecord(args);
+	const number = typeof record.number === "string" ? record.number.trim() || undefined : undefined;
 	return createReviewInvocationResponse(
 		REVIEW_PR_ACTION_ID,
-		await runReviewHostAction(context, { kind: "pr", number }, createReviewOptions(options)),
+		await runReviewHostAction(context, { kind: "pr", number }, createReviewOptions(options, args)),
 	);
 }
 
@@ -850,10 +1018,12 @@ async function invokeReviewCommitAction(
 	args: unknown,
 	options: HostActionInvokeOptions,
 ): Promise<UiActionInvocationResponse> {
-	const ref = getRequiredStringArg(args, "ref");
+	const record = getArgsRecord(args);
+	const ref = typeof record.ref === "string" ? record.ref : "";
+	if (!ref) throw new Error('UI action argument "ref" must be a non-empty string');
 	return createReviewInvocationResponse(
 		REVIEW_COMMIT_ACTION_ID,
-		await runReviewHostAction(context, { kind: "commit", sha: ref }, createReviewOptions(options)),
+		await runReviewHostAction(context, { kind: "commit", sha: ref }, createReviewOptions(options, args)),
 	);
 }
 
@@ -898,10 +1068,29 @@ function thinkingFastModeAvailability(context: HostActionDescriptorContext, args
 	return { enabled: true };
 }
 
-function createReviewOptions(options: HostActionInvokeOptions): HostActionReviewOptions {
+function createReviewOptions(options: HostActionInvokeOptions, args: unknown): HostActionReviewOptions {
+	const record = getArgsRecord(args);
+	const focus = typeof record.focus === "string" ? record.focus : undefined;
+	const scope = typeof record.scope === "string" ? record.scope : undefined;
+	const effort = record.effort;
+	const scopeMode = record.scopeMode;
 	return {
 		remote: options.requireRemoteSafe === true,
 		requireConfirmation: options.requireRemoteSafe === true,
+		controls: {
+			...(focus ? { focus } : {}),
+			...(scope
+				? {
+						scope: scope
+							.split(",")
+							.map((entry) => entry.trim())
+							.filter(Boolean),
+					}
+				: {}),
+			...(effort === "low" || effort === "standard" || effort === "high" ? { effort } : {}),
+			...(typeof record.includeOptional === "boolean" ? { includeOptional: record.includeOptional } : {}),
+			...(scopeMode === "incremental" || scopeMode === "full" ? { scopeMode } : {}),
+		},
 	};
 }
 
@@ -925,11 +1114,13 @@ function createReviewInvocationResponse(action: string, result: ReviewWorkflowRe
 	}
 	const findingCount = result.findingsCount;
 	const summary =
-		findingCount === undefined
-			? "Review complete"
-			: findingCount === 0
-				? "Review complete: no issues found"
-				: `Review complete: ${findingCount} finding${findingCount === 1 ? "" : "s"}`;
+		result.completionStatus === "incomplete"
+			? `Review incomplete${findingCount ? `: ${findingCount} verified finding${findingCount === 1 ? "" : "s"}` : ""}`
+			: findingCount === undefined
+				? "Review complete"
+				: findingCount === 0
+					? "Review complete: no issues found"
+					: `Review complete: ${findingCount} finding${findingCount === 1 ? "" : "s"}`;
 	return {
 		action,
 		status: "completed",

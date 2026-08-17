@@ -127,9 +127,7 @@ function createPromptRuntime(
 				sessionEventHandler = handler;
 				return detachSession;
 			}),
-			agent: {
-				subscribe: vi.fn(() => detachBackpressure),
-			},
+			subscribeRuntimeEvents: vi.fn(() => detachBackpressure),
 			sessionId: sessionManager.getSessionId(),
 			sessionManager,
 			prompt: vi.fn(

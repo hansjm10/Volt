@@ -1,6 +1,6 @@
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import xterm from "@xterm/headless";
-import type { Terminal, TerminalFocusState } from "../src/terminal.ts";
+import { parseFocusEvent, type Terminal, type TerminalFocusState } from "../src/terminal.ts";
 
 // Extract Terminal class from the module
 const XtermTerminal = xterm.Terminal;
@@ -45,6 +45,7 @@ export class VirtualTerminal implements Terminal {
 	stop(): void {
 		// Disable bracketed paste mode
 		this.xterm.write("\x1b[?2004l");
+		this._focusState = "unknown";
 		this.inputHandler = undefined;
 		this.resizeHandler = undefined;
 	}
@@ -123,7 +124,9 @@ export class VirtualTerminal implements Terminal {
 	 * Simulate a terminal focus change (focus reporting, DECSET 1004)
 	 */
 	setFocus(focused: boolean): void {
-		this._focusState = focused ? "focused" : "unfocused";
+		const next: TerminalFocusState = focused ? "focused" : "unfocused";
+		if (this._focusState === next) return;
+		this._focusState = next;
 		this.onFocusChange?.(focused);
 	}
 
@@ -131,6 +134,11 @@ export class VirtualTerminal implements Terminal {
 	 * Simulate keyboard input
 	 */
 	sendInput(data: string): void {
+		const focusEvent = parseFocusEvent(data);
+		if (focusEvent) {
+			this.setFocus(focusEvent === "in");
+			return;
+		}
 		if (this.inputHandler) {
 			this.inputHandler(data);
 		}

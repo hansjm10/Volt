@@ -605,14 +605,20 @@ export class AgentSessionRuntime {
 		) {
 			throw new Error("Stale agent session structural operation");
 		}
+		if (this.session.hasActiveSessionMutation) {
+			throw new Error("Cannot change sessions while a session mutation is active; wait for it to finish");
+		}
 		if (this.session.isStreaming) {
 			throw new Error("Cannot change sessions while an agent run is active; abort or wait for it to finish");
 		}
 		if (this.session.isBashRunning) {
 			throw new Error("Cannot change sessions while a bash run is active; abort or wait for it to finish");
 		}
-		if (this.session.hasActiveSessionMutation) {
-			throw new Error("Cannot change sessions while a session mutation is active; wait for it to finish");
+	}
+
+	private assertNoActiveDetachedReview(): void {
+		if (this._reviewWorkflows?.hasActiveWorkflows) {
+			throw new Error("Cannot change sessions while a detached review is active; cancel or wait for it to finish");
 		}
 	}
 
@@ -693,7 +699,8 @@ export class AgentSessionRuntime {
 		try {
 			await session.disposeSubagentToolManager();
 		} finally {
-			await session.dispose("disposal");
+			session.dispose("disposal");
+			await session.waitForClosed();
 		}
 	}
 
@@ -747,6 +754,9 @@ export class AgentSessionRuntime {
 		try {
 			await this.abortAndJoinRecoveredClientInputs(this.session);
 			this.assertStructuralOperationCurrent(options.operation);
+			// Defense in depth for unexpected re-entrant review starts after an
+			// operation-specific pre-preparation check.
+			this.assertNoActiveDetachedReview();
 			const transaction = sameSessionIdentity
 				? undefined
 				: await this.prepareSessionReplacement?.({
@@ -1047,6 +1057,7 @@ export class AgentSessionRuntime {
 		if (beforeResult.cancelled) {
 			return { cancelled: true, seeded: false };
 		}
+		this.assertNoActiveDetachedReview();
 
 		const previousSessionFile = this.session.sessionFile;
 		const sessionManager = SessionManager.open(resolvedSessionPath, undefined, options?.cwdOverride);
@@ -1263,6 +1274,7 @@ export class AgentSessionRuntime {
 		if (beforeResult.cancelled) {
 			return { cancelled: true, seeded: false };
 		}
+		this.assertNoActiveDetachedReview();
 
 		const previousSessionFile = this.session.sessionFile;
 		const cwd = options?.cwd ?? this.cwd;
@@ -1318,6 +1330,7 @@ export class AgentSessionRuntime {
 		if (beforeResult.cancelled) {
 			return { cancelled: true, seeded: false };
 		}
+		this.assertNoActiveDetachedReview();
 		let targetLeafId: string | null;
 		let selectedText: string | undefined;
 
@@ -1444,15 +1457,15 @@ export class AgentSessionRuntime {
 		}
 
 		const sessionDir = this.session.sessionManager.getSessionDir();
-		if (!existsSync(sessionDir)) {
-			mkdirSync(sessionDir, { recursive: true });
-		}
-
 		const destinationPath = join(sessionDir, basename(resolvedPath));
 		const beforeResult = await this.emitBeforeSwitch("resume", destinationPath);
 		this.assertStructuralOperationCurrent(operation);
 		if (beforeResult.cancelled) {
 			return beforeResult;
+		}
+		this.assertNoActiveDetachedReview();
+		if (!existsSync(sessionDir)) {
+			mkdirSync(sessionDir, { recursive: true });
 		}
 
 		const previousSessionFile = this.session.sessionFile;
@@ -1522,7 +1535,8 @@ export class AgentSessionRuntime {
 				try {
 					await this.session.disposeSubagentToolManager();
 				} finally {
-					await this.session.dispose("disposal");
+					this.session.dispose("disposal");
+					await this.session.waitForClosed();
 					this.sessionInvalidated = true;
 					this.lifecycleRevision++;
 				}

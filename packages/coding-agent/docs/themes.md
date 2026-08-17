@@ -71,6 +71,9 @@ vim ~/.volt/agent/themes/my-theme.json
     "text": "",
     "thinkingText": "secondary",
     "selectedBg": "#2d2d30",
+    "scrollbarThumb": "#555566",
+    "searchMatchBg": "#2d2d30",
+    "searchMatchText": "",
     "userMessageBg": "#2d2d30",
     "userMessageText": "",
     "customMessageBg": "#2d2d30",
@@ -139,13 +142,13 @@ vim ~/.volt/agent/themes/my-theme.json
 
 - `name` is required and must be unique.
 - `vars` is optional. Define reusable colors here, then reference them in `colors`.
-- `colors` must define all 51 required tokens.
+- `colors` must define all 51 required tokens. `scrollbarThumb`, `searchMatchBg`, and `searchMatchText` are optional and use the fallbacks below.
 
 The `$schema` field enables editor auto-completion and validation.
 
 ## Color Tokens
 
-Every theme must define all 51 color tokens. There are no optional colors.
+Every theme must define all 51 required color tokens. Fullscreen's optional `scrollbarThumb` and `searchMatchBg` tokens fall back to `selectedBg`; optional `searchMatchText` falls back to `text`. Existing custom themes therefore remain valid. Transcript search renders ordinary matches as underlined `searchMatchText` on `searchMatchBg`, and renders the current match as bold text with that foreground/background pair reversed.
 
 ### Core UI (11 colors)
 
@@ -163,11 +166,14 @@ Every theme must define all 51 color tokens. There are no optional colors.
 | `text` | Default text (usually `""`) |
 | `thinkingText` | Thinking block text |
 
-### Backgrounds & Content (11 colors)
+### Backgrounds & Content (11 required, 3 optional)
 
 | Token | Purpose |
 |-------|---------|
 | `selectedBg` | Selected line background |
+| `scrollbarThumb` | Fullscreen scrollbar thumb background; optional, falls back to `selectedBg` |
+| `searchMatchBg` | Transcript search match background and current-match text; optional, falls back to `selectedBg` |
+| `searchMatchText` | Transcript search match text and current-match background; optional, falls back to `text` |
 | `userMessageBg` | User message background |
 | `userMessageText` | User message text |
 | `customMessageBg` | Extension message background |

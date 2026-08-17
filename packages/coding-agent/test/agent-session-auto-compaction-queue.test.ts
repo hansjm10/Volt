@@ -1,14 +1,21 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@hansjm10/volt-agent-core";
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@hansjm10/volt-ai";
+import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	EventStream,
+	getModel,
+	streamSimple,
+} from "@hansjm10/volt-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import { convertToLlm } from "../src/core/messages.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createAgentSessionTestControl } from "./agent-session-test-control.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
 vi.mock("../src/core/compaction/index.js", () => ({
@@ -92,6 +99,7 @@ function createDeferred(): { promise: Promise<void>; resolve(): void } {
 
 describe("AgentSession auto-compaction queue resume", () => {
 	let session: AgentSession;
+	let control: ReturnType<typeof createAgentSessionTestControl>;
 	let sessionManager: SessionManager;
 	let tempDir: string;
 
@@ -101,13 +109,6 @@ describe("AgentSession auto-compaction queue resume", () => {
 		vi.useFakeTimers();
 
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
-		const agent = new Agent({
-			initialState: {
-				model,
-				systemPrompt: "Test",
-				tools: [],
-			},
-		});
 
 		sessionManager = SessionManager.inMemory();
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
@@ -116,13 +117,18 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const modelRegistry = ModelRegistry.create(authStorage, tempDir);
 
 		session = new AgentSession({
-			agent,
 			sessionManager,
+			model,
+			thinkingLevel: "off",
+			streamFn: (requestModel, context, options) =>
+				streamSimple(requestModel, context, { ...options, apiKey: "test-key" }),
+			convertToLlm,
 			settingsManager,
 			cwd: tempDir,
 			modelRegistry,
 			resourceLoader: createTestResourceLoader(),
 		});
+		control = createAgentSessionTestControl(session);
 	});
 
 	afterEach(() => {
@@ -135,7 +141,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 	});
 
 	it("should resume after threshold compaction when only agent-level queued messages exist", async () => {
-		session.agent.followUp({
+		control.queueFollowUp({
 			role: "custom",
 			customType: "test",
 			content: [{ type: "text", text: "Queued custom" }],
@@ -144,11 +150,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		});
 
 		expect(session.pendingMessageCount).toBe(0);
-		expect(session.agent.hasQueuedMessages()).toBe(true);
-
-		const continueSpy = vi
-			.spyOn(session.agent, "continue")
-			.mockResolvedValue({ status: "completed", deliveries: [] });
+		expect(control.hasQueuedMessages()).toBe(true);
 
 		const runAutoCompaction = (
 			session as unknown as {
@@ -158,14 +160,14 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		await expect(runAutoCompaction("threshold", false)).resolves.toBe(true);
 
-		expect(continueSpy).not.toHaveBeenCalled();
+		expect(control.hasQueuedMessages()).toBe(true);
 	});
 
 	it("should continue after threshold compaction when a length stop has no visible response", async () => {
 		const model = session.model!;
 		let streamCallCount = 0;
 
-		session.agent.streamFn = () => {
+		control.setStreamFn(() => {
 			const callNumber = ++streamCallCount;
 			const stream = new MockAssistantStream();
 			queueMicrotask(() => {
@@ -213,7 +215,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 				stream.push({ type: "done", seq: 1, reason: "stop", message });
 			});
 			return stream;
-		};
+		});
 
 		await session.prompt("trigger length continuation");
 
@@ -238,7 +240,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			}
 		});
 
-		session.agent.streamFn = () => {
+		control.setStreamFn(() => {
 			const callNumber = ++streamCallCount;
 			const stream = new MockAssistantStream();
 			queueMicrotask(() => {
@@ -287,7 +289,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 				stream.push({ type: "done", seq: 1, reason: "stop", message });
 			});
 			return stream;
-		};
+		});
 
 		await session.prompt("trigger proactive mid-run compaction");
 
@@ -311,7 +313,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			}
 		});
 
-		session.agent.streamFn = () => {
+		control.setStreamFn(() => {
 			const callNumber = ++streamCallCount;
 			const stream = new MockAssistantStream();
 			queueMicrotask(() => {
@@ -344,7 +346,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 				});
 			});
 			return stream;
-		};
+		});
 
 		await session.prompt("trigger compaction from a large tool result");
 
@@ -356,8 +358,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const model = session.model!;
 		writeFileSync(join(tempDir, "large-terminating-result.txt"), "x".repeat(40_000));
 		let streamCallCount = 0;
-		session.agent.afterToolCall = async () => ({ disposition: "stop" });
-		session.agent.streamFn = () => {
+		control.onToolResult(async () => ({ disposition: "stop" }));
+		control.setStreamFn(() => {
 			streamCallCount += 1;
 			const stream = new MockAssistantStream();
 			queueMicrotask(() => {
@@ -389,7 +391,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 				stream.push({ type: "done", seq: 1, reason: "toolUse", message });
 			});
 			return stream;
-		};
+		});
 
 		await session.prompt("run terminating tool");
 
@@ -399,7 +401,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 	it("keeps session busy and waitForIdle pending during manual compaction", async () => {
 		const model = session.model!;
-		session.agent.streamFn = () => {
+		control.setStreamFn(() => {
 			const stream = new MockAssistantStream();
 			queueMicrotask(() => {
 				const message: AssistantMessage = {
@@ -423,7 +425,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 				stream.push({ type: "done", seq: 1, reason: "stop", message });
 			});
 			return stream;
-		};
+		});
 		await session.prompt("seed compaction history");
 
 		const beforeCompactStarted = createDeferred();
@@ -457,24 +459,17 @@ describe("AgentSession auto-compaction queue resume", () => {
 	});
 
 	it("reports no continuation when session abort cancels proactive compaction", async () => {
-		const authStarted = createDeferred();
-		const finishAuth = createDeferred();
-		session.agent.streamFn = () => {
-			throw new Error("not used");
-		};
-		vi.spyOn(
-			session as unknown as {
-				_getCompactionRequestAuth: () => Promise<{
-					apiKey?: string;
-					headers?: Record<string, string>;
-					env?: Record<string, string>;
-				}>;
-			},
-			"_getCompactionRequestAuth",
-		).mockImplementation(async () => {
-			authStarted.resolve();
-			await finishAuth.promise;
-			return { apiKey: "test-key" };
+		const compactionStarted = createDeferred();
+		const finishCompaction = createDeferred();
+		vi.spyOn(session.extensionRunner, "hasHandlers").mockImplementation(
+			(eventType) => eventType === "session_before_compact",
+		);
+		vi.spyOn(session.extensionRunner, "emit").mockImplementation(async (event) => {
+			if (event.type === "session_before_compact") {
+				compactionStarted.resolve();
+				await finishCompaction.promise;
+			}
+			return undefined;
 		});
 		const compactionEnds: Array<{ aborted: boolean; willRetry: boolean }> = [];
 		session.subscribe((event) => {
@@ -491,10 +486,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 				): Promise<boolean>;
 			}
 		)._runAutoCompaction("threshold", false, true);
-		await authStarted.promise;
+		await compactionStarted.promise;
 
-		await session.abort();
-		finishAuth.resolve();
+		const abort = session.abort();
+		finishCompaction.resolve();
+		await abort;
 		await runAutoCompaction;
 
 		expect(compactionEnds).toEqual([{ aborted: true, willRetry: false }]);
@@ -540,7 +536,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			internals._conversationGenerationRevision,
 		);
 		await compactionStarted.promise;
-		session.agent.steer({
+		control.queueSteer({
 			role: "custom",
 			customType: "test",
 			content: [{ type: "text", text: "retained" }],
@@ -551,7 +547,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		finishCompaction.resolve();
 
 		await expect(continuation).resolves.toBe(false);
-		expect(session.agent.hasQueuedMessages()).toBe(true);
+		expect(control.hasQueuedMessages()).toBe(true);
 	});
 
 	it("should not continue after disposal during proactive compaction", async () => {
@@ -559,7 +555,6 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const compactionStarted = createDeferred();
 		const finishCompaction = createDeferred();
 		let streamCallCount = 0;
-		const continueSpy = vi.spyOn(session.agent, "continue");
 		vi.spyOn(
 			session as unknown as {
 				_runAutoCompaction: (
@@ -575,7 +570,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			return false;
 		});
 
-		session.agent.streamFn = () => {
+		control.setStreamFn(() => {
 			streamCallCount += 1;
 			const stream = new MockAssistantStream();
 			queueMicrotask(() => {
@@ -600,7 +595,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 				stream.push({ type: "done", seq: 1, reason: "toolUse", message });
 			});
 			return stream;
-		};
+		});
 
 		const promptPromise = session.prompt("trigger proactive compaction");
 		await compactionStarted.promise;
@@ -608,7 +603,6 @@ describe("AgentSession auto-compaction queue resume", () => {
 		finishCompaction.resolve();
 		await promptPromise;
 
-		expect(continueSpy).not.toHaveBeenCalled();
 		expect(streamCallCount).toBe(1);
 	});
 
@@ -813,13 +807,19 @@ describe("AgentSession auto-compaction queue resume", () => {
 			timestamp: Date.now() + 1000,
 		};
 
-		// Put both messages into agent state so estimateContextTokens can find the successful one
-		session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+		// Persist both messages so canonical context estimation can find the successful one.
+		for (const message of [
+			{ role: "user" as const, content: [{ type: "text" as const, text: "hello" }], timestamp: Date.now() - 1000 },
 			successfulAssistant,
-			{ role: "user", content: [{ type: "text", text: "another prompt" }], timestamp: Date.now() + 500 },
+			{
+				role: "user" as const,
+				content: [{ type: "text" as const, text: "another prompt" }],
+				timestamp: Date.now() + 500,
+			},
 			errorAssistant,
-		];
+		]) {
+			sessionManager.appendMessage(message);
+		}
 
 		const runAutoCompactionSpy = vi
 			.spyOn(
@@ -864,10 +864,12 @@ describe("AgentSession auto-compaction queue resume", () => {
 			timestamp: Date.now(),
 		};
 
-		session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
-			errorAssistant,
-		];
+		sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "hello" }],
+			timestamp: Date.now() - 1000,
+		});
+		sessionManager.appendMessage(errorAssistant);
 
 		const runAutoCompactionSpy = vi
 			.spyOn(
@@ -942,13 +944,13 @@ describe("AgentSession auto-compaction queue resume", () => {
 			timestamp: Date.now(),
 		};
 
-		// Agent state has the kept assistant (pre-compaction) and the error (post-compaction)
-		session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "kept user msg" }], timestamp: preCompactionTimestamp - 1000 },
-			keptAssistant,
-			{ role: "user", content: [{ type: "text", text: "new prompt" }], timestamp: Date.now() - 500 },
-			errorAssistant,
-		];
+		// Canonical context has only new post-compaction work after the summary.
+		sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "new prompt" }],
+			timestamp: Date.now() - 500,
+		});
+		sessionManager.appendMessage(errorAssistant);
 
 		const runAutoCompactionSpy = vi
 			.spyOn(

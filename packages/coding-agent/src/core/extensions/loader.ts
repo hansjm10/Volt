@@ -123,12 +123,18 @@ function getAliases(): Record<string, string> {
 		"agent/src/index.ts",
 		"@hansjm10/volt-agent-core",
 	);
+	const voltAgentCoreNodeEntry = resolveWorkspaceOrImport(
+		"agent/dist/node.js",
+		"agent/src/node.ts",
+		"@hansjm10/volt-agent-core/node",
+	);
 	const voltTuiEntry = resolveWorkspaceOrImport("tui/dist/index.js", "tui/src/index.ts", "@hansjm10/volt-tui");
 	const voltAiEntry = resolveWorkspaceOrImport("ai/dist/index.js", "ai/src/index.ts", "@hansjm10/volt-ai");
 	const voltAiOauthEntry = resolveWorkspaceOrImport("ai/dist/oauth.js", "ai/src/oauth.ts", "@hansjm10/volt-ai/oauth");
 
 	_aliases = {
 		"@hansjm10/volt-coding-agent": voltCodingAgentEntry,
+		"@hansjm10/volt-agent-core/node": voltAgentCoreNodeEntry,
 		"@hansjm10/volt-agent-core": voltAgentCoreEntry,
 		"@hansjm10/volt-tui": voltTuiEntry,
 		"@hansjm10/volt-ai": voltAiEntry,

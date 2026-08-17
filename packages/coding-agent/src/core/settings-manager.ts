@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import type { Transport } from "@hansjm10/volt-ai";
+import type { TuiMode as RendererTuiMode, ScrollViewScrollbar } from "@hansjm10/volt-tui";
 import { randomUUID } from "crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync } from "fs";
 import { dirname, join } from "path";
@@ -11,6 +12,8 @@ import { ensurePrivateDirectorySync, hardenPrivateRegularFileSync } from "../uti
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 import type { LspSettings } from "./lsp/config.ts";
 import type { Personality } from "./personality.ts";
+
+const DEFAULT_CONTEXT_WARNING_TOKENS = 350_000;
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
@@ -37,6 +40,8 @@ export interface RetrySettings {
 }
 
 export type TurnDoneAlert = "off" | "bell" | "notify";
+export type TuiMode = RendererTuiMode;
+export type FullscreenExitOutput = "transcript" | "resume-hint";
 
 export interface TerminalSettings {
 	showImages?: boolean; // default: true (only relevant if terminal supports images)
@@ -64,6 +69,7 @@ export interface MarkdownSettings {
 
 export interface WarningSettings {
 	anthropicExtraUsage?: boolean; // default: true
+	contextTokens?: number; // default: 350000; 0 disables the absolute context warning
 }
 
 export type DefaultProjectTrust = "ask" | "always" | "never";
@@ -142,8 +148,9 @@ export interface Settings {
 	terminal?: TerminalSettings;
 	images?: ImageSettings;
 	enabledModels?: string[]; // Model patterns for cycling (same format as --models CLI flag)
-	reviewModel?: string; // Model for /review, e.g. "anthropic/claude-opus-4-5" (falls back to the session model)
-	reviewTools?: string[]; // Tool names allowed in /review sessions (defaults to inherited parent active tools)
+	reviewModel?: string; // Discovery model for /review (falls back to the session model)
+	reviewVerifierModel?: string; // Independent verification model for /review (falls back to reviewModel)
+	reviewTools?: string[]; // Optional auxiliary tool names; immutable review snapshot tools are always active
 	doubleEscapeAction?: "fork" | "tree" | "none"; // Action for double-escape with empty editor (default: "tree")
 	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default filter when opening /tree
 	thinkingBudgets?: ThinkingBudgetsSettings; // Custom token budgets for thinking levels
@@ -158,6 +165,9 @@ export interface Settings {
 	websocketConnectTimeoutMs?: number; // WebSocket connect/open handshake timeout in milliseconds; 0 disables it
 	lsp?: LspSettings; // LSP diagnostics after edit/write (see docs/lsp.md)
 	remote?: RemoteSettings; // voltd daemon / remote access (see docs/daemon.md)
+	tuiMode?: TuiMode; // default: "regular"
+	fullscreenExitOutput?: FullscreenExitOutput; // default: "transcript"; no effect in regular mode
+	fullscreenScrollbar?: ScrollViewScrollbar; // default: "auto"; no effect in regular mode
 }
 
 export interface RemoteSettings {
@@ -1620,6 +1630,14 @@ export class SettingsManager {
 		return mode === "bell" || mode === "notify" ? mode : "off";
 	}
 
+	getContextWarningTokens(): number {
+		const threshold = this.settings.warnings?.contextTokens;
+		if (typeof threshold !== "number" || !Number.isFinite(threshold) || threshold < 0) {
+			return DEFAULT_CONTEXT_WARNING_TOKENS;
+		}
+		return Math.floor(threshold);
+	}
+
 	setTurnDoneAlert(mode: TurnDoneAlert): void {
 		this.updateGlobalSettings(
 			"terminal",
@@ -1631,6 +1649,37 @@ export class SettingsManager {
 			},
 			"turnDoneAlert",
 		);
+	}
+
+	getTuiMode(): TuiMode {
+		return this.settings.tuiMode === "fullscreen" ? "fullscreen" : "regular";
+	}
+
+	setTuiMode(mode: TuiMode): void {
+		this.updateGlobalSettings("tuiMode", (settings) => {
+			settings.tuiMode = mode;
+		});
+	}
+
+	getFullscreenExitOutput(): FullscreenExitOutput {
+		return this.settings.fullscreenExitOutput === "resume-hint" ? "resume-hint" : "transcript";
+	}
+
+	setFullscreenExitOutput(output: FullscreenExitOutput): void {
+		this.updateGlobalSettings("fullscreenExitOutput", (settings) => {
+			settings.fullscreenExitOutput = output;
+		});
+	}
+
+	getFullscreenScrollbar(): ScrollViewScrollbar {
+		const mode = this.settings.fullscreenScrollbar;
+		return mode === "always" || mode === "hidden" ? mode : "auto";
+	}
+
+	setFullscreenScrollbar(mode: ScrollViewScrollbar): void {
+		this.updateGlobalSettings("fullscreenScrollbar", (settings) => {
+			settings.fullscreenScrollbar = mode;
+		});
 	}
 
 	getImageAutoResize(): boolean {
@@ -1678,6 +1727,16 @@ export class SettingsManager {
 	setReviewModel(modelReference: string | undefined): void {
 		this.updateGlobalSettings("reviewModel", (settings) => {
 			settings.reviewModel = modelReference;
+		});
+	}
+
+	getReviewVerifierModel(): string | undefined {
+		return this.settings.reviewVerifierModel;
+	}
+
+	setReviewVerifierModel(modelReference: string | undefined): void {
+		this.updateGlobalSettings("reviewVerifierModel", (settings) => {
+			settings.reviewVerifierModel = modelReference;
 		});
 	}
 

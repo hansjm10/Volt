@@ -229,7 +229,7 @@ describe("model catalog watcher", () => {
 		const session = {
 			bindExtensions: vi.fn(async () => {}),
 			subscribe: vi.fn(() => () => {}),
-			agent: { subscribe: vi.fn(() => () => {}) },
+			subscribeRuntimeEvents: vi.fn(() => () => {}),
 			modelRegistry: registry,
 			sessionId: "session-1",
 		};

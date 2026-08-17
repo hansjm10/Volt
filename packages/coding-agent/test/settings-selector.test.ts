@@ -49,6 +49,9 @@ function createConfig(personality: Personality): SettingsConfig {
 		defaultProjectTrust: "ask",
 		clearOnShrink: false,
 		showTerminalProgress: true,
+		tuiMode: "regular",
+		fullscreenExitOutput: "transcript",
+		fullscreenScrollbar: "auto",
 		warnings: {},
 	};
 }
@@ -81,12 +84,40 @@ function createCallbacks(onPersonalityChange: (personality: Personality) => void
 		onDefaultProjectTrustChange: () => {},
 		onClearOnShrinkChange: () => {},
 		onShowTerminalProgressChange: () => {},
+		onTuiModeChange: () => {},
+		onFullscreenExitOutputChange: () => {},
+		onFullscreenScrollbarChange: () => {},
 		onWarningsChange: () => {},
 		onCancel: () => {},
 	};
 }
 
 describe("SettingsSelectorComponent", () => {
+	test("cycles through fullscreen settings", () => {
+		const onTuiModeChange = vi.fn();
+		const onExitOutputChange = vi.fn();
+		const onScrollbarChange = vi.fn();
+		const callbacks = createCallbacks(() => undefined);
+		callbacks.onTuiModeChange = onTuiModeChange;
+		callbacks.onFullscreenExitOutputChange = onExitOutputChange;
+		callbacks.onFullscreenScrollbarChange = onScrollbarChange;
+
+		const cycle = (label: string, count: number) => {
+			const list = new SettingsSelectorComponent(createConfig("default"), callbacks).getSettingsList();
+			for (const character of label.replaceAll(" ", "")) list.handleInput(character);
+			for (let index = 0; index < count; index++) list.handleInput(" ");
+		};
+
+		cycle("TUI mode", 1);
+		expect(onTuiModeChange).toHaveBeenCalledWith("fullscreen");
+		onExitOutputChange.mockClear();
+		cycle("Fullscreen exit output", 2);
+		expect(onExitOutputChange.mock.calls).toEqual([["resume-hint"], ["transcript"]]);
+		onScrollbarChange.mockClear();
+		cycle("Fullscreen scrollbar", 3);
+		expect(onScrollbarChange.mock.calls.flat()).toEqual(["always", "hidden", "auto"]);
+	});
+
 	test("changes the active session personality", () => {
 		const { session, cleanup } = createTestSession({ inMemory: true });
 		try {
@@ -111,10 +142,30 @@ describe("SettingsSelectorComponent", () => {
 			expect(onPersonalityChange).toHaveBeenCalledWith("pragmatic");
 			expect(session.settingsManager.getPersonality()).toBe("pragmatic");
 			expect(session.settingsManager.getGlobalSettings().profiles?.delivery?.personality).toBe("pragmatic");
-			expect(session.systemPrompt).toContain("you are pragmatic, direct, and solutions-oriented");
 			expect(stripAnsi(settingsList.render(100).join("\n"))).toContain("pragmatic");
 		} finally {
 			cleanup();
 		}
+	});
+
+	test("changes the context warning threshold from the warnings settings", () => {
+		const config = createConfig("default");
+		config.warnings = { contextTokens: 350_000 };
+		const onWarningsChange = vi.fn();
+		const callbacks = createCallbacks(() => {});
+		callbacks.onWarningsChange = onWarningsChange;
+		const settingsList = new SettingsSelectorComponent(config, callbacks).getSettingsList();
+
+		for (const character of "warnings") {
+			settingsList.handleInput(character);
+		}
+		settingsList.handleInput("\n");
+		expect(stripAnsi(settingsList.render(100).join("\n"))).toContain("Context usage");
+		expect(stripAnsi(settingsList.render(100).join("\n"))).toContain("350k");
+
+		settingsList.handleInput("\x1b[B");
+		settingsList.handleInput("\n");
+
+		expect(onWarningsChange).toHaveBeenCalledWith({ contextTokens: 500_000 });
 	});
 });

@@ -18,7 +18,6 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@hansjm10/volt-agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@hansjm10/volt-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
@@ -28,7 +27,12 @@ import type { ExtensionError } from "../src/core/extensions/types.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
-import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
+import { createAgentSessionTestControl } from "./agent-session-test-control.ts";
+import {
+	createTestAgentSessionRuntimeConfig,
+	createTestExtensionsResult,
+	createTestResourceLoader,
+} from "./utilities.ts";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
@@ -73,7 +77,7 @@ describe("AgentSession dispose inertness", () => {
 	});
 
 	afterEach(async () => {
-		session?.dispose();
+		await session?.dispose();
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });
 		}
@@ -84,9 +88,8 @@ describe("AgentSession dispose inertness", () => {
 		let streamCalls = 0;
 
 		// Stream hangs until aborted, mimicking an in-flight provider request.
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			initialState: { model, systemPrompt: "Test", tools: [] },
+		const runtimeConfig = createTestAgentSessionRuntimeConfig({
+			model,
 			streamFn: (_model, _context, streamOptions) => {
 				streamCalls++;
 				const signal = streamOptions?.signal;
@@ -133,7 +136,7 @@ describe("AgentSession dispose inertness", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
 		session = new AgentSession({
-			agent,
+			...runtimeConfig,
 			sessionManager,
 			settingsManager,
 			cwd: tempDir,
@@ -150,7 +153,7 @@ describe("AgentSession dispose inertness", () => {
 		});
 
 		return {
-			agent,
+			control: createAgentSessionTestControl(session),
 			handlerCalls,
 			extensionErrors,
 			getStreamCalls: () => streamCalls,
@@ -167,6 +170,7 @@ describe("AgentSession dispose inertness", () => {
 		expect(extensionErrors).toEqual([]);
 
 		session.dispose();
+		const disposal = session.waitForClosed();
 
 		// The disposed generation is inert: the handler must not run (its stale
 		// ctx would throw), and no extension_error may reach the listener,
@@ -177,11 +181,12 @@ describe("AgentSession dispose inertness", () => {
 		expect(handlerCalls).toEqual(["before_provider_request"]);
 		expect(extensionErrors).toEqual([]);
 		expect(runner.hasHandlers("before_provider_request")).toBe(false);
+		await disposal;
 	});
 
 	it("clears the shared runner ref, drains queues, and never continues after dispose", async () => {
 		const ref: { current?: ExtensionRunner } = {};
-		const { agent, getStreamCalls } = await createSession({ extensionRunnerRef: ref });
+		const { control, getStreamCalls } = await createSession({ extensionRunnerRef: ref });
 
 		expect(ref.current).toBe(session.extensionRunner);
 
@@ -193,18 +198,20 @@ describe("AgentSession dispose inertness", () => {
 		// Queue a steering message; without dispose() draining queues, the
 		// post-run continuation would call agent.continue() and issue a fresh
 		// provider request from a dead session.
-		agent.steer({ role: "user", content: [{ type: "text", text: "steer me" }], timestamp: Date.now() });
-		expect(agent.hasQueuedMessages()).toBe(true);
+		control.queueSteer({ role: "user", content: [{ type: "text", text: "steer me" }], timestamp: Date.now() });
+		expect(control.hasQueuedMessages()).toBe(true);
 
 		session.dispose();
+		const disposal = session.waitForClosed();
 
 		expect(ref.current).toBeUndefined();
-		expect(agent.hasQueuedMessages()).toBe(false);
+		expect(control.hasQueuedMessages()).toBe(false);
 
 		await promptPromise;
 		// Give any (buggy) continuation a chance to fire before asserting.
 		await new Promise((resolve) => setTimeout(resolve, 25));
 		expect(getStreamCalls()).toBe(1);
+		await disposal;
 
 		// dispose() is idempotent.
 		expect(() => session.dispose()).not.toThrow();

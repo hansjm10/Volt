@@ -218,21 +218,23 @@ export abstract class RpcClientBase {
 		await this.send({ type: "cancel_workflow", workflowId });
 	}
 
-	/** List active and recently finished detached review workflows. */
-	async listReviewWorkflows(): Promise<RpcReviewWorkflowListResponse> {
-		const response = await this.send({ type: "list_review_workflows" });
+	/** List active workflows and durable review runs. */
+	async listReviewWorkflows(
+		options: { cursor?: string; limit?: number } = {},
+	): Promise<RpcReviewWorkflowListResponse> {
+		const response = await this.send({ type: "list_review_workflows", ...options });
 		return this.getData(response);
 	}
 
-	/** Get the status and findings of a detached review workflow. */
-	async getReviewResult(workflowId: string): Promise<RpcReviewWorkflowResultResponse> {
-		const response = await this.send({ type: "get_review_result", workflowId });
+	/** Get a durable structured review result. */
+	async getReviewResult(runId: string): Promise<RpcReviewWorkflowResultResponse> {
+		const response = await this.send({ type: "get_review_result", runId });
 		return this.getData(response);
 	}
 
-	/** Open a fresh session seeded with a completed review's findings. */
-	async openReviewSession(workflowId: string): Promise<{ cancelled: boolean }> {
-		const response = await this.send({ type: "open_review_session", workflowId });
+	/** Open a fresh session seeded with all or selected findings from a durable review run. */
+	async openReviewSession(runId: string, findingIds?: string[]): Promise<{ cancelled: boolean }> {
+		const response = await this.send({ type: "open_review_session", runId, findingIds });
 		return this.getData(response);
 	}
 
