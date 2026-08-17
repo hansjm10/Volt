@@ -187,10 +187,17 @@ export class FooterComponent implements Component {
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
 		const autoIndicator = this.autoCompactEnabled ? " auto" : "";
 		const contextDisplay = `${contextPercent}%/${formatTokens(contextWindow)}${autoIndicator}`.replace("?%", "?");
+		const contextWarningTokens = this.session.settingsManager.getContextWarningTokens();
+		const contextTokens = contextUsage?.tokens;
+		const reachedTokenWarning =
+			contextWarningTokens > 0 &&
+			contextTokens !== undefined &&
+			contextTokens !== null &&
+			contextTokens >= contextWarningTokens;
 		const contextValue =
 			contextPercentValue > 90
 				? theme.fg("error", contextDisplay)
-				: contextPercentValue > 70
+				: contextPercentValue > 70 || reachedTokenWarning
 					? theme.fg("warning", contextDisplay)
 					: theme.fg("muted", contextDisplay);
 
