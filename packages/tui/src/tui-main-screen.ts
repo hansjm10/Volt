@@ -122,7 +122,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	private getImageReservedRows(lines: string[], index: number, maxIndex = lines.length - 1): number {
-		const rows = getImageMetadata(lines[index] ?? "")?.rows ?? 1;
+		const line = lines[index] ?? "";
+		const rows = getImageMetadata(line)?.rows ?? parseKittyImageHeader(line)?.rows ?? 1;
 		if (rows <= 1) return 1;
 
 		const maxRows = Math.min(rows, maxIndex - index + 1, lines.length - index);
@@ -144,7 +145,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		let expandedLastChanged = lastChanged;
 		const expandForLines = (lines: string[]): void => {
 			for (const [i, line] of lines.entries()) {
-				if (!getImageMetadata(line)) continue;
+				if (!getImageMetadata(line) && extractKittyImageIds(line).length === 0) continue;
 				const blockEnd = i + this.getImageReservedRows(lines, i) - 1;
 				if (i >= firstChanged || (i <= lastChanged && blockEnd >= firstChanged)) {
 					expandedFirstChanged = Math.min(expandedFirstChanged, i);
