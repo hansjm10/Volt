@@ -45,6 +45,21 @@ interface SubagentProjectionBudget {
 	remainingNodes: number;
 }
 
+interface BoundedTextProjection {
+	text: string;
+	truncated: boolean;
+}
+
+interface ProjectedTranscriptItem<T extends RpcTranscriptItem = RpcTranscriptItem> {
+	item: T;
+	truncated: boolean;
+}
+
+interface ProjectedTranscriptItems {
+	items: RpcTranscriptItem[];
+	truncatedEntryIds: ReadonlySet<string>;
+}
+
 export interface ProjectSessionTranscriptOptions {
 	beforeEntryId?: string;
 	limit?: number;
@@ -54,7 +69,7 @@ export function projectSessionTranscript(
 	sessionManager: ReadonlySessionManager,
 	options: ProjectSessionTranscriptOptions = {},
 ): RpcTranscriptResponse {
-	const allItems = projectTranscriptItems(sessionManager.getBranch());
+	const allItems = projectTranscriptItems(sessionManager.getBranch()).items;
 	const beforeIndex = options.beforeEntryId
 		? allItems.findIndex((item) => item.id === options.beforeEntryId)
 		: allItems.length;
@@ -179,18 +194,29 @@ function normalizeLimit(limit: number | undefined): number {
 	return Math.min(MAX_TRANSCRIPT_LIMIT, Math.floor(limit));
 }
 
-function projectTranscriptItems(entries: SessionEntry[]): RpcTranscriptItem[] {
+function projectTranscriptItems(entries: SessionEntry[]): ProjectedTranscriptItems {
 	const toolCallsByResultEntryId = resolveSessionToolCallsByResultEntryId(entries);
 	const items: RpcTranscriptItem[] = [];
+	const truncatedEntryIds = new Set<string>();
+	const pushProjectedItem = (projected: ProjectedTranscriptItem): void => {
+		items.push(projected.item);
+		if (projected.truncated) {
+			truncatedEntryIds.add(projected.item.id);
+		}
+	};
 
 	for (const entry of entries) {
 		if (entry.type === "compaction") {
-			items.push({
-				id: entry.id,
-				role: "summary",
-				timestamp: normalizeTimestamp(entry.timestamp),
-				title: "Conversation compacted",
-				text: boundText(entry.summary, SUMMARY_TEXT_LIMIT),
+			const text = boundTextWithMetadata(entry.summary, SUMMARY_TEXT_LIMIT);
+			pushProjectedItem({
+				item: {
+					id: entry.id,
+					role: "summary",
+					timestamp: normalizeTimestamp(entry.timestamp),
+					title: "Conversation compacted",
+					text: text.text,
+				},
+				truncated: text.truncated,
 			});
 			continue;
 		}
@@ -198,7 +224,7 @@ function projectTranscriptItems(entries: SessionEntry[]): RpcTranscriptItem[] {
 		if (entry.type === "custom_message") {
 			const customItem = projectCustomMessage(entry);
 			if (customItem) {
-				items.push(customItem);
+				pushProjectedItem(customItem);
 			}
 			continue;
 		}
@@ -209,40 +235,53 @@ function projectTranscriptItems(entries: SessionEntry[]): RpcTranscriptItem[] {
 
 		const message = entry.message;
 		if (message.role === "user") {
-			const text = boundText(extractVisibleTextContent(message.content), MESSAGE_TEXT_LIMIT);
+			const text = boundTextWithMetadata(extractVisibleTextContent(message.content), MESSAGE_TEXT_LIMIT);
 			const imageCount = extractMessageImages(message.content).length;
-			if (text || imageCount > 0) {
-				items.push({
-					id: entry.id,
-					role: "user",
-					text,
-					timestamp: normalizeTimestamp(entry.timestamp),
-					...(message.clientMessageId === undefined ? {} : { clientMessageId: message.clientMessageId }),
-					...(imageCount > 0 ? { imageCount } : {}),
+			if (text.text || imageCount > 0) {
+				pushProjectedItem({
+					item: {
+						id: entry.id,
+						role: "user",
+						text: text.text,
+						timestamp: normalizeTimestamp(entry.timestamp),
+						...(message.clientMessageId === undefined ? {} : { clientMessageId: message.clientMessageId }),
+						...(imageCount > 0 ? { imageCount } : {}),
+					},
+					truncated: text.truncated,
 				});
 			}
 			continue;
 		}
 
 		if (message.role === "assistant") {
-			const text = boundText(extractVisibleTextContent(message.content), MESSAGE_TEXT_LIMIT);
-			if (text) {
-				items.push({ id: entry.id, role: "assistant", text, timestamp: normalizeTimestamp(entry.timestamp) });
+			const text = boundTextWithMetadata(extractVisibleTextContent(message.content), MESSAGE_TEXT_LIMIT);
+			if (text.text) {
+				pushProjectedItem({
+					item: {
+						id: entry.id,
+						role: "assistant",
+						text: text.text,
+						timestamp: normalizeTimestamp(entry.timestamp),
+					},
+					truncated: text.truncated,
+				});
 			}
 			continue;
 		}
 
 		if (message.role === "toolResult") {
-			items.push(projectToolResult(entry.id, entry.timestamp, message, toolCallsByResultEntryId.get(entry.id)));
+			pushProjectedItem(
+				projectToolResult(entry.id, entry.timestamp, message, toolCallsByResultEntryId.get(entry.id)),
+			);
 			continue;
 		}
 
 		if (message.role === "bashExecution") {
-			items.push(projectBashExecution(entry.id, entry.timestamp, message));
+			pushProjectedItem(projectBashExecution(entry.id, entry.timestamp, message));
 		}
 	}
 
-	return items;
+	return { items, truncatedEntryIds };
 }
 
 /**
@@ -252,7 +291,8 @@ function projectTranscriptItems(entries: SessionEntry[]): RpcTranscriptItem[] {
  */
 export function projectConversationTranscriptItems(entries: SessionEntry[]): RpcConversationTranscriptItem[] {
 	const entriesById = new Map(entries.map((entry) => [entry.id, entry]));
-	return projectTranscriptItems(entries).map((item) => {
+	const projected = projectTranscriptItems(entries);
+	return projected.items.map((item) => {
 		const entry = entriesById.get(item.id);
 		if (!entry) {
 			throw new Error(`Transcript projection references unknown session entry ${item.id}`);
@@ -267,7 +307,7 @@ export function projectConversationTranscriptItems(entries: SessionEntry[]): Rpc
 				...base,
 				role: "tool" as const,
 				text: item.summary,
-				truncated: item.summary.endsWith("\n[truncated]"),
+				truncated: projected.truncatedEntryIds.has(item.id),
 				toolName: item.toolName,
 				status: item.status === "failed" ? "failed" : "completed",
 				summary: item.summary,
@@ -282,7 +322,7 @@ export function projectConversationTranscriptItems(entries: SessionEntry[]): Rpc
 			...base,
 			role,
 			text: item.text,
-			truncated: item.text.endsWith("\n[truncated]"),
+			truncated: projected.truncatedEntryIds.has(item.id),
 			...(item.role === "user" && item.clientMessageId !== undefined
 				? { clientMessageId: item.clientMessageId }
 				: {}),
@@ -291,16 +331,21 @@ export function projectConversationTranscriptItems(entries: SessionEntry[]): Rpc
 	});
 }
 
-function projectCustomMessage(entry: Extract<SessionEntry, { type: "custom_message" }>): RpcTranscriptItem | undefined {
+function projectCustomMessage(
+	entry: Extract<SessionEntry, { type: "custom_message" }>,
+): ProjectedTranscriptItem | undefined {
 	const role = getRemoteVisibleCustomMessageRole(entry.customType, entry.display);
 	if (role === undefined) {
 		return undefined;
 	}
-	const text = boundText(extractVisibleTextContent(entry.content), MESSAGE_TEXT_LIMIT);
-	if (!text) {
+	const text = boundTextWithMetadata(extractVisibleTextContent(entry.content), MESSAGE_TEXT_LIMIT);
+	if (!text.text) {
 		return undefined;
 	}
-	return { id: entry.id, role, text, timestamp: normalizeTimestamp(entry.timestamp) };
+	return {
+		item: { id: entry.id, role, text: text.text, timestamp: normalizeTimestamp(entry.timestamp) },
+		truncated: text.truncated,
+	};
 }
 
 function projectToolResult(
@@ -308,17 +353,18 @@ function projectToolResult(
 	timestamp: string,
 	message: Extract<AgentMessage, { role: "toolResult" }>,
 	toolCall: ResolvedSessionToolCall | undefined,
-): RpcTranscriptToolItem {
+): ProjectedTranscriptItem<RpcTranscriptToolItem> {
 	const args = toolCall?.arguments;
 	const status: RpcTranscriptToolStatus = message.isError ? "failed" : "completed";
 	const path = getToolPath(message.toolName, args);
 	const details = isRecord(message.details) ? message.details : undefined;
+	const summary = summarizeToolResult(message.toolName, status, args, path);
 	const item: RpcTranscriptToolItem = {
 		id: entryId,
 		role: "tool",
 		toolName: message.toolName,
 		status,
-		summary: summarizeToolResult(message.toolName, status, args, path),
+		summary: summary.text,
 		timestamp: normalizeTimestamp(timestamp),
 	};
 	if (path) {
@@ -346,7 +392,7 @@ function projectToolResult(
 			item.details = subagentDetails;
 		}
 	}
-	return item;
+	return { item, truncated: summary.truncated };
 }
 
 function projectToolArgs(
@@ -727,10 +773,11 @@ function projectBashExecution(
 	entryId: string,
 	timestamp: string,
 	message: BashExecutionMessage,
-): RpcTranscriptToolItem {
+): ProjectedTranscriptItem<RpcTranscriptToolItem> {
 	const failed = message.cancelled || (message.exitCode !== undefined && message.exitCode !== 0);
 	const status: RpcTranscriptToolStatus = failed ? "failed" : "completed";
-	const summaryParts = [`Ran command: ${boundSummary(message.command, TOOL_COMMAND_LIMIT)}`];
+	const command = boundSummaryWithMetadata(message.command, TOOL_COMMAND_LIMIT);
+	const summaryParts = [`Ran command: ${command.text}`];
 	if (message.truncated) {
 		summaryParts.push("output truncated");
 	}
@@ -739,18 +786,19 @@ function projectBashExecution(
 	} else if (message.exitCode !== undefined) {
 		summaryParts.push(`exit ${message.exitCode}`);
 	}
+	const summary = boundSummaryWithMetadata(summaryParts.join("; "), TOOL_SUMMARY_LIMIT);
 	const item: RpcTranscriptToolItem = {
 		id: entryId,
 		role: "tool",
 		toolName: "bash",
 		status,
-		summary: boundSummary(summaryParts.join("; "), TOOL_SUMMARY_LIMIT),
+		summary: summary.text,
 		timestamp: normalizeTimestamp(timestamp),
 	};
 	if (message.command.trim().length > 0) {
 		item.args = { command: boundText(message.command, TOOL_COMMAND_LIMIT) };
 	}
-	return item;
+	return { item, truncated: command.truncated || summary.truncated };
 }
 
 function summarizeToolResult(
@@ -758,64 +806,69 @@ function summarizeToolResult(
 	status: RpcTranscriptToolStatus,
 	args: Record<string, unknown> | undefined,
 	path: string | undefined,
-): string {
+): BoundedTextProjection {
 	const statusText = status === "failed" ? "failed" : "completed";
 	const target = path ? ` ${path}` : "";
 	if (toolName === "read") {
-		return boundSummary(`Read${target || " file"} (${statusText})`, TOOL_SUMMARY_LIMIT);
+		return boundSummaryWithMetadata(`Read${target || " file"} (${statusText})`, TOOL_SUMMARY_LIMIT);
 	}
 	if (toolName === "edit") {
-		return boundSummary(`Edited${target || " file"} (${statusText})`, TOOL_SUMMARY_LIMIT);
+		return boundSummaryWithMetadata(`Edited${target || " file"} (${statusText})`, TOOL_SUMMARY_LIMIT);
 	}
 	if (toolName === "write") {
-		return boundSummary(`Wrote${target || " file"} (${statusText})`, TOOL_SUMMARY_LIMIT);
+		return boundSummaryWithMetadata(`Wrote${target || " file"} (${statusText})`, TOOL_SUMMARY_LIMIT);
 	}
 	if (toolName === "bash") {
 		const command = getStringArg(args, "command");
-		return boundSummary(
-			command
-				? `Ran command: ${boundSummary(command, TOOL_COMMAND_LIMIT)} (${statusText})`
-				: `Ran command (${statusText})`,
+		const boundedCommand = command ? boundSummaryWithMetadata(command, TOOL_COMMAND_LIMIT) : undefined;
+		const summary = boundSummaryWithMetadata(
+			boundedCommand ? `Ran command: ${boundedCommand.text} (${statusText})` : `Ran command (${statusText})`,
 			TOOL_SUMMARY_LIMIT,
 		);
+		return { text: summary.text, truncated: summary.truncated || boundedCommand?.truncated === true };
 	}
 	if (toolName === "web_search") {
 		const query = getStringArg(args, "query");
-		return boundSummary(
-			query
-				? `Searched web for ${boundSummary(query, TOOL_COMMAND_LIMIT)} (${statusText})`
-				: `Searched web (${statusText})`,
+		const boundedQuery = query ? boundSummaryWithMetadata(query, TOOL_COMMAND_LIMIT) : undefined;
+		const summary = boundSummaryWithMetadata(
+			boundedQuery ? `Searched web for ${boundedQuery.text} (${statusText})` : `Searched web (${statusText})`,
 			TOOL_SUMMARY_LIMIT,
 		);
+		return { text: summary.text, truncated: summary.truncated || boundedQuery?.truncated === true };
 	}
 	if (toolName === "web_fetch") {
 		const url = getStringArg(args, "url");
-		return boundSummary(
-			url ? `Fetched ${boundSummary(url, TOOL_COMMAND_LIMIT)} (${statusText})` : `Fetched URL (${statusText})`,
+		const boundedUrl = url ? boundSummaryWithMetadata(url, TOOL_COMMAND_LIMIT) : undefined;
+		const summary = boundSummaryWithMetadata(
+			boundedUrl ? `Fetched ${boundedUrl.text} (${statusText})` : `Fetched URL (${statusText})`,
 			TOOL_SUMMARY_LIMIT,
 		);
+		return { text: summary.text, truncated: summary.truncated || boundedUrl?.truncated === true };
 	}
 	if (toolName === "grep") {
 		const pattern = getStringArg(args, "pattern");
 		const patternText = pattern ? ` for ${pattern}` : "";
-		return boundSummary(`Searched${target || " workspace"}${patternText} (${statusText})`, TOOL_SUMMARY_LIMIT);
+		return boundSummaryWithMetadata(
+			`Searched${target || " workspace"}${patternText} (${statusText})`,
+			TOOL_SUMMARY_LIMIT,
+		);
 	}
 	if (toolName === "find") {
 		const query = getStringArg(args, "query") ?? getStringArg(args, "pattern");
 		const queryText = query ? ` for ${query}` : "";
-		return boundSummary(`Found files${target}${queryText} (${statusText})`, TOOL_SUMMARY_LIMIT);
+		return boundSummaryWithMetadata(`Found files${target}${queryText} (${statusText})`, TOOL_SUMMARY_LIMIT);
 	}
 	if (toolName === "ls") {
-		return boundSummary(`Listed${target || " directory"} (${statusText})`, TOOL_SUMMARY_LIMIT);
+		return boundSummaryWithMetadata(`Listed${target || " directory"} (${statusText})`, TOOL_SUMMARY_LIMIT);
 	}
 	if (toolName === "lsp") {
 		const action = getStringArg(args, "action");
-		return boundSummary(
+		return boundSummaryWithMetadata(
 			action ? `Ran lsp ${action}${target} (${statusText})` : `Ran lsp${target} (${statusText})`,
 			TOOL_SUMMARY_LIMIT,
 		);
 	}
-	return boundSummary(`${toolName} ${statusText}`, TOOL_SUMMARY_LIMIT);
+	return boundSummaryWithMetadata(`${toolName} ${statusText}`, TOOL_SUMMARY_LIMIT);
 }
 
 function getToolPath(toolName: string, args: Record<string, unknown> | undefined): string | undefined {
@@ -832,15 +885,26 @@ function getBoundedString(record: Record<string, unknown> | undefined, key: stri
 	return typeof value === "string" && value.length > 0 ? boundText(value, limit) : undefined;
 }
 
+function boundSummaryWithMetadata(text: string, limit: number): BoundedTextProjection {
+	return boundTextWithMetadata(text.replace(/\s+/g, " ").trim(), limit);
+}
+
 function boundSummary(text: string, limit: number): string {
-	return boundText(text.replace(/\s+/g, " ").trim(), limit);
+	return boundSummaryWithMetadata(text, limit).text;
+}
+
+function boundTextWithMetadata(text: string, limit: number): BoundedTextProjection {
+	if (text.length <= limit) {
+		return { text, truncated: false };
+	}
+	return {
+		text: `${text.slice(0, Math.max(0, limit - 16)).trimEnd()}\n[truncated]`,
+		truncated: true,
+	};
 }
 
 function boundText(text: string, limit: number): string {
-	if (text.length <= limit) {
-		return text;
-	}
-	return `${text.slice(0, Math.max(0, limit - 16)).trimEnd()}\n[truncated]`;
+	return boundTextWithMetadata(text, limit).text;
 }
 
 function normalizeTimestamp(timestamp: string): string {

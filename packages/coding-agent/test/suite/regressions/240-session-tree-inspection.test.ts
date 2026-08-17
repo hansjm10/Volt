@@ -246,6 +246,58 @@ test("session tree resolves reused tool-call ids within each branch", async () =
 	}
 });
 
+test("local session tree tracks truncation without parsing projected text", async () => {
+	const harness = await createHarness();
+	try {
+		const literalSuffix = "complete\n[truncated]";
+		const literalUserId = harness.sessionManager.appendMessage({
+			role: "user",
+			content: literalSuffix,
+			timestamp: 1,
+		});
+		const literalAssistantId = harness.sessionManager.appendMessage(assistantMessage(literalSuffix, 2));
+		const longUserId = harness.sessionManager.appendMessage({
+			role: "user",
+			content: "x".repeat(16_001),
+			timestamp: 3,
+		});
+		const toolCallId = "long-summary";
+		harness.sessionManager.appendMessage({
+			...assistantMessage("", 4),
+			content: [
+				{
+					type: "toolCall",
+					id: toolCallId,
+					name: "read",
+					arguments: { path: "p".repeat(1_200) },
+				},
+			],
+			stopReason: "toolUse",
+		});
+		const longToolSummaryId = harness.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId,
+			toolName: "read",
+			content: [{ type: "text", text: "ok" }],
+			isError: false,
+			timestamp: 5,
+		});
+
+		const tree = getSuccessfulTree(
+			await dispatchLocalRpcCommand({ id: "local-tree", type: "get_session_tree" }, harness),
+		);
+		const transcripts = new Map(tree.nodes.map((node) => [node.entryId, node.transcript]));
+
+		expect(transcripts.get(literalUserId)).toMatchObject({ text: literalSuffix, truncated: false });
+		expect(transcripts.get(literalAssistantId)).toMatchObject({ text: literalSuffix, truncated: false });
+		expect(transcripts.get(longUserId)).toMatchObject({ truncated: true });
+		expect(transcripts.get(longUserId)?.text.endsWith("\n[truncated]")).toBe(true);
+		expect(transcripts.get(longToolSummaryId)).toMatchObject({ role: "tool", truncated: true });
+	} finally {
+		harness.cleanup();
+	}
+});
+
 test("inactive tree-node continuation metadata remains recoverable", async () => {
 	const harness = await createHarness();
 	try {
