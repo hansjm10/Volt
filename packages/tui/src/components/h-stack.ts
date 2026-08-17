@@ -1,4 +1,4 @@
-import { compositeTuiLine } from "../tui.ts";
+import { compositeLayoutLine } from "../line-compositor.ts";
 import { visibleWidth } from "../utils.ts";
 import { allocateStackSizes, Stack, type StackChild, type StackOptions, visibleStackEntries } from "./stack.ts";
 
@@ -35,7 +35,7 @@ export class HStack extends Stack {
 			for (let row = 0; row < lines.length; row++) {
 				const target = row + offset;
 				if (target < 0 || target >= result.length) continue;
-				result[target] = compositeTuiLine(result[target]!, lines[row]!, x, childWidth, safeWidth);
+				result[target] = compositeLayoutLine(result[target]!, lines[row]!, x, childWidth, safeWidth);
 			}
 			x += childWidth + this.gap;
 		}

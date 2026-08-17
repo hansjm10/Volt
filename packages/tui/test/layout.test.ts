@@ -27,6 +27,42 @@ function solidPngBase64(width: number, height: number): string {
 	return Buffer.from(encode({ width, height, channels: 4, depth: 8, data })).toString("base64");
 }
 
+function imageComponent(imageLine: string) {
+	return {
+		render: () => [imageLine],
+		invalidate: () => {},
+	};
+}
+
+function assertImageWithRightSibling(imageLine: string): void {
+	const stack = new HStack([
+		{ component: imageComponent(imageLine), basis: 6, shrink: 0 },
+		{ component: new Text("right", 0, 0), basis: 6, shrink: 0 },
+	]);
+	const directLine = stack.render(12)[0] ?? "";
+	const constrainedLine = renderLayoutFrame(stack, 12, 1, () => {}).lines[0] ?? "";
+
+	for (const line of [directLine, constrainedLine]) {
+		assert.ok(getImageMetadata(line));
+		assert.strictEqual(stripTerminalSequences(line).trimEnd(), "      right");
+	}
+}
+
+function renderInsetTopCrop(imageLine: string): string {
+	const scrollView = new ScrollView({
+		render: () => [imageLine, "", "", "tail"],
+		invalidate: () => {},
+	});
+	const root = new HStack([
+		{ component: new Text("L\nL", 0, 0), basis: 3, shrink: 0 },
+		{ component: scrollView, basis: 6, shrink: 0 },
+		{ component: new Text("R\nR", 0, 0), basis: 3, shrink: 0 },
+	]);
+	renderLayoutFrame(root, 12, 2, () => {});
+	scrollView.scrollTo(1);
+	return renderLayoutFrame(root, 12, 2, () => {}).lines[0] ?? "";
+}
+
 describe("viewport layout", () => {
 	it("allocates vertical grow space deterministically", () => {
 		const frame = renderLayoutFrame(
@@ -294,6 +330,63 @@ describe("viewport layout", () => {
 				sourceHeight: 6,
 			});
 			assert.ok(frame.lines[2]?.includes('"1;1;2;6'));
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	it("preserves HStack text beside a Kitty image", () => {
+		const imageId = 125;
+		const imageLine = encodeKitty("AAAA", { columns: 2, rows: 1, imageId, moveCursor: false });
+		registerKittyImageMetadata({ imageId, columns: 2, rows: 1, widthPx: 100, heightPx: 50 });
+
+		assertImageWithRightSibling(imageLine);
+	});
+
+	it("preserves HStack text beside a Sixel image", () => {
+		setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 1, heightPx: 1 });
+		try {
+			const image = renderImage(solidPngBase64(2, 1), { widthPx: 2, heightPx: 1 }, { maxWidthCells: 2 });
+			assert.ok(image);
+			assert.strictEqual(image.rows, 1);
+			assertImageWithRightSibling(image.sequence);
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	it("renders a top-cropped Kitty image inside an inset ScrollView", () => {
+		const imageId = 126;
+		const imageLine = encodeKitty("AAAA", { columns: 2, rows: 3, imageId, moveCursor: false });
+		registerKittyImageMetadata({ imageId, columns: 2, rows: 3, widthPx: 100, heightPx: 100 });
+
+		const croppedLine = renderInsetTopCrop(imageLine);
+		assert.ok(croppedLine.includes("i=126"));
+		assert.ok(croppedLine.includes("y=33,h=67,r=2"));
+		assert.strictEqual(stripTerminalSequences(croppedLine).trimEnd(), "L        R");
+	});
+
+	it("renders a top-cropped Sixel image inside an inset ScrollView", () => {
+		setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 1, heightPx: 4 });
+		try {
+			const image = renderImage(solidPngBase64(2, 12), { widthPx: 2, heightPx: 12 }, { maxWidthCells: 2 });
+			assert.ok(image);
+			assert.strictEqual(image.rows, 3);
+
+			const croppedLine = renderInsetTopCrop(image.sequence);
+			assert.deepStrictEqual(getImageMetadata(croppedLine), {
+				imageId: image.imageId,
+				columns: 2,
+				rows: 2,
+				sourceY: 4,
+				sourceHeight: 8,
+			});
+			assert.ok(croppedLine.includes('"1;1;2;8'));
+			assert.strictEqual(stripTerminalSequences(croppedLine).trimEnd(), "L        R");
 		} finally {
 			resetCapabilitiesCache();
 			setCellDimensions({ widthPx: 9, heightPx: 18 });

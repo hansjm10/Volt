@@ -1,8 +1,9 @@
 import type { ScrollView } from "./components/scroll-view.ts";
 import { allocateStackSizes, visibleStackEntries } from "./components/stack.ts";
 import { getLayoutNode } from "./layout-node.ts";
+import { compositeLayoutLine } from "./line-compositor.ts";
 import { cropImageLine, getImageMetadata, isImageLine } from "./terminal-image.ts";
-import { type Component, CURSOR_MARKER, compositeTuiLine } from "./tui.ts";
+import { type Component, CURSOR_MARKER } from "./tui.ts";
 import { extractAnsiCode, getGraphemeCellRange, sliceByColumn, visibleWidth } from "./utils.ts";
 
 const OSC133_ZONE_PREFIX = /^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+/;
@@ -330,7 +331,7 @@ function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
 			if (box.rect.x === 0 && box.rect.width >= totalWidth && (isImageLine(line) || !screen[row])) {
 				screen[row] = line;
 			} else {
-				screen[row] = compositeTuiLine(screen[row] ?? "", line, box.rect.x, box.rect.width, totalWidth);
+				screen[row] = compositeLayoutLine(screen[row] ?? "", line, box.rect.x, box.rect.width, totalWidth);
 			}
 		}
 	}
@@ -345,7 +346,13 @@ function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
 				if (hiddenRows < metadata.rows) {
 					const visibleRows = Math.min(box.rect.height, metadata.rows - hiddenRows);
 					const cropped = cropImageLine(imageLine, hiddenRows, visibleRows);
-					if (box.rect.x === 0 && box.rect.width >= totalWidth) screen[box.rect.y] = cropped;
+					screen[box.rect.y] = compositeLayoutLine(
+						screen[box.rect.y] ?? "",
+						cropped,
+						box.rect.x,
+						box.rect.width,
+						totalWidth,
+					);
 				}
 				break;
 			}

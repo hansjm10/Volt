@@ -416,6 +416,20 @@ export function extractAnsiCode(str: string, pos: number): { code: string; lengt
 		return null;
 	}
 
+	// DCS sequence: ESC P ... ST (ESC \)
+	// Used by Sixel image streams.
+	if (next === "P") {
+		let j = pos + 2;
+		while (j < str.length) {
+			if (str[j] === "\x1b" && str[j + 1] === "\\") return { code: str.substring(pos, j + 2), length: j + 2 - pos };
+			j++;
+		}
+		return null;
+	}
+
+	// DECSC/DECRC: save or restore the cursor around a Sixel stream.
+	if (next === "7" || next === "8") return { code: str.substring(pos, pos + 2), length: 2 };
+
 	// OSC sequence: ESC ] ... BEL or ESC ] ... ST (ESC \)
 	// Used for hyperlinks (OSC 8), window titles, etc.
 	if (next === "]") {
