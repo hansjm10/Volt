@@ -1,33 +1,101 @@
-import { execFileSync, execSync, spawn } from "child_process";
+import { execFile, spawn } from "child_process";
 import { platform } from "os";
 import { isWaylandSession } from "./clipboard-image.ts";
 
-type NativeClipboardExecOptions = {
-	input: string;
-	timeout: number;
-	stdio: ["pipe", "ignore", "ignore"];
-};
-
-function copyToX11Clipboard(options: NativeClipboardExecOptions): void {
-	try {
-		execSync("xclip -selection clipboard", options);
-	} catch {
-		execSync("xsel --clipboard --input", options);
-	}
-}
-
+const CLIPBOARD_COMMAND_TIMEOUT_MS = 5000;
 const MAX_OSC52_ENCODED_LENGTH = 100_000;
 const READ_CLIPBOARD_OPTIONS = {
 	encoding: "utf8" as const,
 	maxBuffer: 50 * 1024 * 1024,
-	timeout: 5000,
+	timeout: CLIPBOARD_COMMAND_TIMEOUT_MS,
 };
 
-function readClipboardCommand(command: string, args: string[]): string | null {
+function execClipboardCommand(command: string, args: string[]): Promise<string> {
+	return new Promise((resolve, reject) => {
+		try {
+			execFile(command, args, READ_CLIPBOARD_OPTIONS, (error, stdout) => {
+				if (error) {
+					reject(error);
+					return;
+				}
+				resolve(stdout);
+			});
+		} catch (error) {
+			reject(error);
+		}
+	});
+}
+
+async function readClipboardCommand(command: string, args: string[]): Promise<string | null> {
 	try {
-		return execFileSync(command, args, READ_CLIPBOARD_OPTIONS) || null;
+		return (await execClipboardCommand(command, args)) || null;
 	} catch {
 		return null;
+	}
+}
+
+function writeClipboardCommand(command: string, args: string[], text: string): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(command, args, {
+			stdio: ["pipe", "ignore", "ignore"],
+			timeout: CLIPBOARD_COMMAND_TIMEOUT_MS,
+		});
+		let settled = false;
+
+		const cleanup = () => {
+			child.removeListener("error", onError);
+			child.removeListener("close", onClose);
+			child.stdin.removeListener("error", onStdinError);
+		};
+		const finish = (error?: Error) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			if (error) {
+				child.stdin.destroy();
+				reject(error);
+			} else {
+				resolve();
+			}
+		};
+		const onError = (error: Error) => finish(error);
+		const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
+			if (code === 0) {
+				finish();
+			} else {
+				finish(new Error(`Clipboard command exited with code ${code ?? "null"} and signal ${signal ?? "none"}`));
+			}
+		};
+		const onStdinError = (error: Error) => {
+			try {
+				child.kill();
+			} catch {
+				// The process may already have exited.
+			}
+			finish(error);
+		};
+
+		child.once("error", onError);
+		child.once("close", onClose);
+		child.stdin.once("error", onStdinError);
+		try {
+			child.stdin.end(text);
+		} catch (error) {
+			try {
+				child.kill();
+			} catch {
+				// The process may already have exited.
+			}
+			finish(error instanceof Error ? error : new Error(String(error)));
+		}
+	});
+}
+
+async function copyToX11Clipboard(text: string): Promise<void> {
+	try {
+		await writeClipboardCommand("xclip", ["-selection", "clipboard"], text);
+	} catch {
+		await writeClipboardCommand("xsel", ["--clipboard", "--input"], text);
 	}
 }
 
@@ -44,17 +112,16 @@ export async function readClipboardText(): Promise<string | null> {
 		]);
 	}
 	if (process.env.TERMUX_VERSION) {
-		const text = readClipboardCommand("termux-clipboard-get", []);
+		const text = await readClipboardCommand("termux-clipboard-get", []);
 		if (text !== null) return text;
 	}
 	if (isWaylandSession() && process.env.WAYLAND_DISPLAY) {
-		const text = readClipboardCommand("wl-paste", ["--no-newline", "--type", "text"]);
+		const text = await readClipboardCommand("wl-paste", ["--no-newline", "--type", "text"]);
 		if (text !== null) return text;
 	}
-	return (
-		readClipboardCommand("xclip", ["-selection", "clipboard", "-o"]) ??
-		readClipboardCommand("xsel", ["--clipboard", "--output"])
-	);
+	const xclipText = await readClipboardCommand("xclip", ["-selection", "clipboard", "-o"]);
+	if (xclipText !== null) return xclipText;
+	return readClipboardCommand("xsel", ["--clipboard", "--output"]);
 }
 
 function isRemoteSession(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -77,21 +144,19 @@ export async function copyToClipboard(text: string): Promise<void> {
 
 	const remote = isRemoteSession();
 
-	const options: NativeClipboardExecOptions = { input: text, timeout: 5000, stdio: ["pipe", "ignore", "ignore"] };
-
 	if (!copied) {
 		try {
 			if (p === "darwin") {
-				execSync("pbcopy", options);
+				await writeClipboardCommand("pbcopy", [], text);
 				copied = true;
 			} else if (p === "win32") {
-				execSync("clip", options);
+				await writeClipboardCommand("clip", [], text);
 				copied = true;
 			} else {
 				// Linux. Try Termux, Wayland, or X11 clipboard tools.
 				if (process.env.TERMUX_VERSION) {
 					try {
-						execSync("termux-clipboard-set", options);
+						await writeClipboardCommand("termux-clipboard-set", [], text);
 						copied = true;
 					} catch {
 						// Fall back to Wayland or X11 tools.
@@ -104,25 +169,17 @@ export async function copyToClipboard(text: string): Promise<void> {
 					const isWayland = isWaylandSession();
 					if (isWayland && hasWaylandDisplay) {
 						try {
-							// Verify wl-copy exists (spawn errors are async and won't be caught)
-							execSync("which wl-copy", { stdio: "ignore" });
-							// wl-copy with execSync hangs due to fork behavior; use spawn instead
-							const proc = spawn("wl-copy", [], { stdio: ["pipe", "ignore", "ignore"] });
-							proc.stdin.on("error", () => {
-								// Ignore EPIPE errors if wl-copy exits early
-							});
-							proc.stdin.write(text);
-							proc.stdin.end();
-							proc.unref();
+							await execClipboardCommand("which", ["wl-copy"]);
+							await writeClipboardCommand("wl-copy", [], text);
 							copied = true;
 						} catch {
 							if (hasX11Display) {
-								copyToX11Clipboard(options);
+								await copyToX11Clipboard(text);
 								copied = true;
 							}
 						}
 					} else if (hasX11Display) {
-						copyToX11Clipboard(options);
+						await copyToX11Clipboard(text);
 						copied = true;
 					}
 				}

@@ -125,6 +125,7 @@ function completeStdoutWrite(...args: unknown[]): boolean {
 
 describe("InteractiveMode.shutdown ordering (#5080)", () => {
 	afterEach(() => {
+		vi.useRealTimers();
 		vi.restoreAllMocks();
 		restoreStdoutIsTTY();
 		for (const dir of tempDirs.splice(0)) {
@@ -149,6 +150,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		const exit = vi.spyOn(process, "exit").mockImplementation((() => {
 			throw new ProcessExitError();
 		}) as typeof process.exit);
+		const initialErrorListenerCount = process.stdout.listenerCount("error");
 		let completeFlush: (() => void) | undefined;
 		vi.spyOn(process.stdout, "write").mockImplementation(((...args: unknown[]) => {
 			const callback = getStdoutWriteCallback(args);
@@ -168,6 +170,43 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		completeFlush?.();
 		await shutdown;
 		expect(exit).toHaveBeenCalledWith(0);
+		expect(process.stdout.listenerCount("error")).toBe(initialErrorListenerCount);
+	});
+
+	test("signal-triggered shutdown bounds a stalled stdout flush", async () => {
+		vi.useFakeTimers();
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+			throw new ProcessExitError();
+		}) as typeof process.exit);
+		const initialErrorListenerCount = process.stdout.listenerCount("error");
+		const initialTimerCount = vi.getTimerCount();
+		let flushStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			flushStarted = resolve;
+		});
+		vi.spyOn(process.stdout, "write").mockImplementation(((...args: unknown[]) => {
+			if (args[0] === "") {
+				flushStarted?.();
+				return false;
+			}
+			getStdoutWriteCallback(args)?.();
+			return true;
+		}) as typeof process.stdout.write);
+		const context = createContext([]);
+
+		const shutdown = callShutdown(context, { fromSignal: true });
+		await started;
+		expect(exit).not.toHaveBeenCalled();
+		expect(process.stdout.listenerCount("error")).toBe(initialErrorListenerCount + 1);
+
+		await vi.advanceTimersByTimeAsync(999);
+		expect(exit).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+		await shutdown;
+
+		expect(exit).toHaveBeenCalledWith(0);
+		expect(process.stdout.listenerCount("error")).toBe(initialErrorListenerCount);
+		expect(vi.getTimerCount()).toBe(initialTimerCount);
 	});
 
 	test("interactive quit stops the TUI before emitting session_shutdown", async () => {

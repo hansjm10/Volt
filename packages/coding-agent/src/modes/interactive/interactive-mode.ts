@@ -347,6 +347,7 @@ function isDeadTerminalError(error: unknown): boolean {
 const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING =
 	"Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage.";
 const TURN_DONE_ALERT_BUSY_RETRY_MS = 250;
+const STDOUT_FLUSH_TIMEOUT_MS = 1000;
 
 /** Format an elapsed duration for the working indicator, e.g. "42s", "3m 12s", "1h 4m". */
 function formatElapsedDuration(ms: number): string {
@@ -4512,12 +4513,14 @@ export class InteractiveMode {
 	private async flushStdout(): Promise<void> {
 		await new Promise<void>((resolve) => {
 			let settled = false;
-			const settle = () => {
+			const timeout = setTimeout(settle, STDOUT_FLUSH_TIMEOUT_MS);
+			function settle() {
 				if (settled) return;
 				settled = true;
+				clearTimeout(timeout);
 				process.stdout.off("error", settle);
 				resolve();
-			};
+			}
 			process.stdout.once("error", settle);
 			try {
 				process.stdout.write("", settle);
