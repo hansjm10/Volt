@@ -1,7 +1,6 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@hansjm10/volt-agent-core";
 import { registerFauxProvider } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
@@ -15,7 +14,12 @@ import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { type Settings, SettingsManager } from "../src/core/settings-manager.ts";
-import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
+import { createAgentSessionTestControl } from "./agent-session-test-control.ts";
+import {
+	createTestAgentSessionRuntimeConfig,
+	createTestExtensionsResult,
+	createTestResourceLoader,
+} from "./utilities.ts";
 
 function getRuntimeProfile(options: Parameters<CreateAgentSessionRuntimeFactory>[0]): string | undefined {
 	if (!("profile" in options)) {
@@ -142,19 +146,13 @@ describe("AgentSessionRuntime profile propagation", () => {
 				},
 			},
 		} satisfies Partial<Settings>);
-		const agent = new Agent({
-			initialState: {
-				model: faux.getModel(),
-				systemPrompt: "You are a helpful assistant.",
-				tools: [],
-				thinkingLevel: "low",
-			},
-			transport: settingsManager.getTransport(),
-			thinkingBudgets: settingsManager.getThinkingBudgets(),
-			maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
-		});
 		const session = new AgentSession({
-			agent,
+			...createTestAgentSessionRuntimeConfig({ model: faux.getModel(), thinkingLevel: "low" }),
+			streamOptions: {
+				transport: settingsManager.getTransport(),
+				thinkingBudgets: settingsManager.getThinkingBudgets(),
+				maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+			},
 			sessionManager: SessionManager.inMemory(),
 			settingsManager,
 			cwd: process.cwd(),
@@ -167,16 +165,18 @@ describe("AgentSessionRuntime profile propagation", () => {
 			faux.unregister();
 		});
 
-		expect(agent.transport).toBe("sse");
-		expect(agent.thinkingBudgets).toEqual({ low: 1000, high: 4000 });
-		expect(agent.maxRetryDelayMs).toBe(1000);
+		let streamOptions = createAgentSessionTestControl(session).getStreamOptions();
+		expect(streamOptions.transport).toBe("sse");
+		expect(streamOptions.thinkingBudgets).toEqual({ low: 1000, high: 4000 });
+		expect(streamOptions.maxRetryDelayMs).toBe(1000);
 
 		settingsManager.setActiveProfile("switched");
 		await session.reload();
 
-		expect(agent.transport).toBe("websocket");
-		expect(agent.thinkingBudgets).toEqual({ low: 2000, high: 8000 });
-		expect(agent.maxRetryDelayMs).toBe(250);
+		streamOptions = createAgentSessionTestControl(session).getStreamOptions();
+		expect(streamOptions.transport).toBe("websocket");
+		expect(streamOptions.thinkingBudgets).toEqual({ low: 2000, high: 8000 });
+		expect(streamOptions.maxRetryDelayMs).toBe(250);
 	});
 
 	it("drops providers registered by extensions that disappear after a profile reload", async () => {
@@ -221,14 +221,7 @@ describe("AgentSessionRuntime profile propagation", () => {
 		);
 		const modelRegistry = ModelRegistry.inMemory(AuthStorage.inMemory());
 		const session = new AgentSession({
-			agent: new Agent({
-				initialState: {
-					model: faux.getModel(),
-					systemPrompt: "You are a helpful assistant.",
-					tools: [],
-					thinkingLevel: "off",
-				},
-			}),
+			...createTestAgentSessionRuntimeConfig({ model: faux.getModel() }),
 			sessionManager: SessionManager.inMemory(),
 			settingsManager,
 			cwd: process.cwd(),
@@ -306,14 +299,7 @@ describe("AgentSessionRuntime profile propagation", () => {
 			throw new Error("No initial model was registered");
 		}
 		const session = new AgentSession({
-			agent: new Agent({
-				initialState: {
-					model: initialModel,
-					systemPrompt: "You are a helpful assistant.",
-					tools: [],
-					thinkingLevel: "off",
-				},
-			}),
+			...createTestAgentSessionRuntimeConfig({ model: initialModel }),
 			sessionManager: SessionManager.inMemory(),
 			settingsManager,
 			cwd: process.cwd(),

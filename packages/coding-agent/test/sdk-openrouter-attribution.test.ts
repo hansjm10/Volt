@@ -14,6 +14,7 @@ import { ModelRegistry } from "../src/core/model-registry.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createAgentSessionTestControl } from "./agent-session-test-control.ts";
 
 describe("createAgentSession provider attribution headers", () => {
 	let tempDir: string;
@@ -129,7 +130,7 @@ describe("createAgentSession provider attribution headers", () => {
 		});
 
 		try {
-			await session.agent.streamFn(
+			await createAgentSessionTestControl(session).getStreamFn()(
 				model,
 				{ messages: [] },
 				{

@@ -38,11 +38,11 @@ You can also trigger manually with `/compact [instructions]`, where optional ins
 
 ### How It Works
 
-1. **Find cut point**: Walk backwards from newest message, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.volt/agent/settings.json` or `<project-dir>/.volt/settings.json`) is reached
+1. **Find cut point**: Walk backwards from the newest message, accumulating token estimates up to `keepRecentTokens` (default 20k). When active tool definitions would consume too much of the selected model's context, Volt lowers this message budget to leave the configured reserve and tool definitions room.
 2. **Extract messages**: Collect messages from the previous kept boundary (or session start) up to the cut point
 3. **Generate summary**: Call LLM to summarize with structured format, passing the previous summary as iterative context when present
 4. **Append entry**: Save `CompactionEntry` with summary and `firstKeptEntryId`
-5. **Reload**: Session reloads, using summary + messages from `firstKeptEntryId` onwards; the completion result reports a fresh token estimate for the rebuilt context
+5. **Reload**: Session reloads, using summary + messages from `firstKeptEntryId` onwards; the completion result reports a fresh token estimate for the rebuilt messages and active tool definitions
 
 ```
 Before compaction:
@@ -76,7 +76,7 @@ What the LLM sees:
     prompt   from cmp          messages from firstKeptEntryId
 ```
 
-On repeated compactions, the summarized span starts at the previous compaction's kept boundary (`firstKeptEntryId`), not at the compaction entry itself, falling back to the entry after the previous compaction if that kept entry cannot be found in the path. This preserves messages that survived the earlier compaction by including them in the next summarization pass as well. Volt also recalculates `tokensBefore` from the rebuilt session context before writing the new `CompactionEntry`, so the token count reflects the actual pre-compaction context being replaced.
+On repeated compactions, the summarized span starts at the previous compaction's kept boundary (`firstKeptEntryId`), not at the compaction entry itself, falling back to the entry after the previous compaction if that kept entry cannot be found in the path. This preserves messages that survived the earlier compaction by including them in the next summarization pass as well. Volt also recalculates `tokensBefore` from the rebuilt session context and active tool definitions before writing the new `CompactionEntry`, so the token count reflects the actual pre-compaction context being replaced.
 
 ### Split Turns
 
@@ -116,7 +116,7 @@ Valid cut points are:
 - BashExecution messages
 - Custom messages (custom_message, branch_summary)
 
-Never cut at tool results (they must stay with their tool call). If the retention budget is reached inside a trailing tool-result batch, the cut point backs up to the assistant message that issued the batch so compaction advances without separating calls from results.
+Volt excludes a candidate context entry when retaining it would exceed the effective message allowance. It always retains the newest indivisible context suffix when no later retained anchor exists, even if that suffix alone exceeds the allowance. In particular, Volt never cuts at tool results: an assistant tool call and its trailing results stay together so compaction advances with a valid continuation.
 
 ### CompactionEntry Structure
 
@@ -395,6 +395,6 @@ Configure compaction in `~/.volt/agent/settings.json` or `<project-dir>/.volt/se
 |---------|---------|-------------|
 | `enabled` | `true` | Enable auto-compaction |
 | `reserveTokens` | `16384` | Tokens to reserve for LLM response |
-| `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
+| `keepRecentTokens` | `20000` | Maximum recent message tokens to keep; active tool definitions can lower the effective budget |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.

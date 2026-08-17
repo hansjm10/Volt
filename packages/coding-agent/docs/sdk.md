@@ -95,7 +95,7 @@ interface AgentSession {
 
   // Model control
   setModel(model: Model): Promise<void>;
-  setThinkingLevel(level: ThinkingLevel): void;
+  setThinkingLevel(level: ThinkingLevel): Promise<void>;
   cycleModel(): Promise<ModelCycleResult | undefined>;
   cycleThinkingLevel(): ThinkingLevel | undefined;
 
@@ -106,7 +106,7 @@ interface AgentSession {
   discardPlan(planId: string, expectedRevision: number): PlanningState;
 
   // State access
-  agent: Agent;
+  state: AgentSessionState;
   model: Model | undefined;
   thinkingLevel: ThinkingLevel;
   messages: AgentMessage[];
@@ -125,6 +125,7 @@ interface AgentSession {
 
   // Cleanup
   dispose(): void;
+  waitForClosed(): Promise<void>;
 }
 ```
 
@@ -379,13 +380,13 @@ await session.followUp("After you're done, also do this");
 
 Both `steer()` and `followUp()` expand file-based prompt templates but error on extension commands (extension commands cannot be queued).
 
-### Agent and AgentState
+### Session state
 
-The `Agent` class (from `@hansjm10/volt-agent-core`) handles the core LLM interaction. Access it via `session.agent`.
+`AgentSession` exposes an owned, read-only runtime snapshot through `session.state`. Mutate the session through its explicit methods so persistence and the provider context remain synchronized.
 
 ```typescript
 // Access current state
-const state = session.agent.state;
+const state = session.state;
 
 // state.messages: AgentMessage[] - conversation history
 // state.model: Model - current model
@@ -395,17 +396,18 @@ const state = session.agent.state;
 // state.streamingMessage?: AgentMessage - current partial assistant message
 // state.errorMessage?: string - latest assistant error
 
-// Replace messages (useful for branching or restoration)
-session.agent.state.messages = messages; // copies the top-level array
+// Change persisted runtime policy
+await session.setModel(model);
+await session.setThinkingLevel("high");
 
-// Replace tools
-session.agent.state.tools = tools; // copies the top-level array
+// Change the active tool projection
+session.setActiveToolsByName(["read", "bash"]);
 
 // Wait for the full session prompt transaction to settle
 await session.waitForIdle();
 ```
 
-Prefer `session.waitForIdle()` when coordinating application work. It includes prompt preflight, retries, compaction, and queued continuations. `session.agent.waitForIdle()` only observes the core agent loop and can resolve while session-level prompt work is still pending.
+`session.waitForIdle()` includes prompt preflight, retries, compaction, and queued continuations. `session.dispose()` installs the close fence synchronously; call `await session.waitForClosed()` outside callbacks when teardown must fully drain.
 
 ### Events
 

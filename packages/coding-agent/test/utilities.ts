@@ -5,14 +5,15 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { Agent } from "@hansjm10/volt-agent-core";
-import { getModel, type OAuthCredentials, type OAuthProvider } from "@hansjm10/volt-ai";
+import type { AgentMessage, AgentTool, StreamFn, ThinkingLevel } from "@hansjm10/volt-agent-core";
+import { getModel, type Model, type OAuthCredentials, type OAuthProvider, streamSimple } from "@hansjm10/volt-ai";
 import { getOAuthApiKey } from "@hansjm10/volt-ai/oauth";
-import { AgentSession } from "../src/core/agent-session.ts";
+import { AgentSession, type AgentSessionConfig } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createEventBus } from "../src/core/event-bus.ts";
 import type { Extension, ExtensionFactory, LoadExtensionsResult } from "../src/core/extensions/index.ts";
 import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.ts";
+import { convertToLlm } from "../src/core/messages.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import type { ResourceLoader } from "../src/core/resource-loader.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -24,6 +25,33 @@ import { createCodingTools } from "../src/index.ts";
  * describe.skipIf(!API_KEY)
  */
 export const API_KEY = process.env.ANTHROPIC_OAUTH_TOKEN || process.env.ANTHROPIC_API_KEY;
+
+export function createTestAgentSessionRuntimeConfig(options: {
+	model?: Model<any>;
+	thinkingLevel?: ThinkingLevel;
+	streamFn?: StreamFn;
+	apiKey?: string;
+	tools?: AgentTool[];
+}): Pick<
+	AgentSessionConfig,
+	"model" | "thinkingLevel" | "streamFn" | "convertToLlm" | "baseToolsOverride" | "initialActiveToolNames"
+> {
+	const apiKey = options.apiKey ?? "test-key";
+	return {
+		...(options.model === undefined ? {} : { model: options.model }),
+		thinkingLevel: options.thinkingLevel ?? "off",
+		streamFn:
+			options.streamFn ??
+			((model, context, streamOptions) => streamSimple(model, context, { ...streamOptions, apiKey })),
+		convertToLlm: (messages: AgentMessage[]) => convertToLlm(messages),
+		...(options.tools === undefined
+			? {}
+			: {
+					baseToolsOverride: Object.fromEntries(options.tools.map((tool) => [tool.name, tool])),
+					initialActiveToolNames: options.tools.map((tool) => tool.name),
+				}),
+	};
+}
 
 // ============================================================================
 // OAuth API key resolution from ~/.volt/agent/auth.json
@@ -205,6 +233,7 @@ export async function createTestExtensionsResult(
 
 export interface CreateTestResourceLoaderOptions {
 	extensionsResult?: LoadExtensionsResult;
+	systemPrompt?: string;
 }
 
 export function createTestResourceLoader(options: CreateTestResourceLoaderOptions = {}): ResourceLoader {
@@ -221,7 +250,7 @@ export function createTestResourceLoader(options: CreateTestResourceLoaderOption
 		getThemes: () => ({ themes: [], diagnostics: [] }),
 		getSubagents: () => ({ definitions: [], diagnostics: [] }),
 		getAgentsFiles: () => ({ agentsFiles: [] }),
-		getSystemPrompt: () => undefined,
+		getSystemPrompt: () => options.systemPrompt,
 		getAppendSystemPrompt: () => [],
 		extendResources: () => {},
 		reload: async () => {},
@@ -237,14 +266,6 @@ export function createTestSession(options: TestSessionOptions = {}): TestSession
 	mkdirSync(tempDir, { recursive: true });
 
 	const model = getModel("anthropic", "claude-sonnet-4-5")!;
-	const agent = new Agent({
-		getApiKey: () => API_KEY,
-		initialState: {
-			model,
-			systemPrompt: options.systemPrompt ?? "You are a helpful assistant. Be extremely concise.",
-			tools: createCodingTools(process.cwd()),
-		},
-	});
 
 	const sessionManager = options.inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir);
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
@@ -257,12 +278,22 @@ export function createTestSession(options: TestSessionOptions = {}): TestSession
 	const modelRegistry = ModelRegistry.create(authStorage, tempDir);
 
 	const session = new AgentSession({
-		agent,
 		sessionManager,
+		model,
+		thinkingLevel: "off",
+		streamFn: (requestModel, context, streamOptions) =>
+			streamSimple(requestModel, context, {
+				...streamOptions,
+				...(API_KEY === undefined ? {} : { apiKey: API_KEY }),
+			}),
+		convertToLlm,
 		settingsManager,
 		cwd: tempDir,
 		modelRegistry,
-		resourceLoader: createTestResourceLoader(),
+		resourceLoader: createTestResourceLoader({
+			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
+		}),
+		baseToolsOverride: Object.fromEntries(createCodingTools(process.cwd()).map((tool) => [tool.name, tool])),
 	});
 
 	// Must subscribe to enable session persistence

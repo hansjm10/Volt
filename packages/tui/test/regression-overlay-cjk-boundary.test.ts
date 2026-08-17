@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { TUI } from "../src/tui.ts";
+import { TuiMainScreen } from "../src/index.ts";
 import { extractSegments, sliceByColumn, visibleWidth } from "../src/utils.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
@@ -21,7 +21,7 @@ function compositeLineAt(
 	overlayWidth: number,
 	totalWidth: number,
 ): string {
-	const tui = new TUI(new VirtualTerminal(totalWidth, 10)) as unknown as TuiComposite;
+	const tui = new TuiMainScreen(new VirtualTerminal(totalWidth, 10)) as unknown as TuiComposite;
 	return tui.compositeLineAt(baseLine, overlayLine, startCol, overlayWidth, totalWidth);
 }
 

@@ -610,7 +610,7 @@ describe("AgentSession queue characterization", () => {
 		harness.setResponses([fauxAssistantMessage("reply"), fauxAssistantMessage("follow-up reply")]);
 
 		await harness.session.prompt("hello");
-		await harness.session.agent.waitForIdle();
+		await harness.session.waitForIdle();
 
 		expect(getUserTexts(harness)).toEqual(["hello", "conflict report"]);
 	});

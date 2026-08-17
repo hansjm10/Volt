@@ -3,6 +3,7 @@ import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import {
 	BUILTIN_HOST_ACTION_REGISTRY,
 	type HostActionInvocationContext,
+	REVIEW_RERUN_ACTION_ID,
 	runCancelHostAction,
 	runContextCompactHostAction,
 	runSessionNewHostAction,
@@ -12,9 +13,25 @@ import { getMcpRpcCapabilities, listMcpRpcServers } from "../../core/mcp/rpc.ts"
 import type { McpGatewayExecutionContext } from "../../core/mcp/types.ts";
 import { toIrohRemoteAgentOptionsCatalogModel } from "../../core/remote/iroh/agent-options.ts";
 import { createReviewSeedMessage } from "../../core/review.ts";
+import { publishReviewRun } from "../../core/review-publish.ts";
+import {
+	appendReviewFindingTransition,
+	appendReviewPublication,
+	appendReviewRun,
+	exportReviewFeedback,
+	getReviewRun,
+	listReviewRuns,
+	type ReviewRunRecord,
+} from "../../core/review-state.ts";
 import { getRpcErrorResponseTarget, isUsableRpcConversationIdentifier } from "../../core/rpc/correlation.ts";
 import { buildRpcSessionState } from "../../core/rpc/session-state.ts";
-import { projectMessageImages, projectSessionTranscript } from "../../core/rpc/transcript.ts";
+import { projectSessionTreePage } from "../../core/rpc/session-tree.ts";
+import { resolveSessionToolCallsByResultEntryId } from "../../core/rpc/tool-call-resolution.ts";
+import {
+	projectConversationTranscriptEntry,
+	projectMessageImages,
+	projectSessionTranscript,
+} from "../../core/rpc/transcript.ts";
 import {
 	createUiActionInvocationPlan,
 	getUiActionCompletions,
@@ -34,6 +51,7 @@ import type {
 	RpcResponse,
 	RpcSessionListItem,
 	RpcSessionState,
+	RpcSessionTreePage,
 	RpcSlashCommand,
 	RpcSubagentStartResponse,
 	RpcTranscriptResponse,
@@ -159,6 +177,39 @@ export function createRpcErrorResponse(
 }
 
 export { getRpcErrorResponseTarget };
+
+function projectReviewRun(record: ReviewRunRecord, includeResult: boolean): Record<string, unknown> {
+	const result = record.result;
+	return {
+		runId: record.runId,
+		workflowAction: record.workflowAction,
+		status: record.status,
+		startedAt: record.startedAt,
+		endedAt: record.endedAt,
+		target: {
+			description: record.target.description,
+			diffCommand: record.target.diffCommand,
+			identity: record.target.identity,
+		},
+		options: record.options,
+		...(record.parentRunId ? { parentRunId: record.parentRunId } : {}),
+		...(record.incrementalFallbackReason ? { incrementalFallbackReason: record.incrementalFallbackReason } : {}),
+		...(record.errorMessage ? { errorMessage: record.errorMessage } : {}),
+		...(result
+			? includeResult
+				? {
+						completionStatus: result.completionStatus,
+						summary: result.summary,
+						findings: result.findings,
+						coverage: result.coverage,
+						...(result.overallCorrectness ? { overallCorrectness: result.overallCorrectness } : {}),
+						overallExplanation: result.overallExplanation,
+						...(result.verificationChallenge ? { verificationChallenge: result.verificationChallenge } : {}),
+					}
+				: { completionStatus: result.completionStatus, findingsCount: result.findings.length }
+			: {}),
+	};
+}
 
 export async function handleRpcCommand(
 	command: RpcCommand,
@@ -415,82 +466,125 @@ export async function handleRpcCommand(
 		}
 
 		case "list_review_workflows": {
+			const page = listReviewRuns(session.sessionManager, { cursor: command.cursor, limit: command.limit });
 			return createRpcSuccessResponse(id, "list_review_workflows", {
-				workflows: runtimeHost.reviewWorkflows.list(),
+				runs: page.runs.map((run) => projectReviewRun(run, false)),
+				activeWorkflows: runtimeHost.reviewWorkflows.list().filter((workflow) => workflow.status === "running"),
+				...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
 			});
 		}
 
 		case "get_review_result": {
-			const record = runtimeHost.reviewWorkflows.get(command.workflowId);
-			if (!record) {
-				return createRpcErrorResponse(id, "get_review_result", `Unknown review workflow: ${command.workflowId}`);
-			}
-			const { parsed, fastModeEnabled: _fastModeEnabled, ...descriptor } = record;
-			return createRpcSuccessResponse(id, "get_review_result", {
-				...descriptor,
-				...(parsed === undefined
-					? {}
-					: {
-							findings: parsed.findings,
-							...(parsed.coverage === undefined ? {} : { coverage: parsed.coverage }),
-							...(parsed.overallCorrectness === undefined
-								? {}
-								: { overallCorrectness: parsed.overallCorrectness }),
-							...(parsed.overallExplanation === undefined
-								? {}
-								: { overallExplanation: parsed.overallExplanation }),
-						}),
-			});
+			const record = getReviewRun(session.sessionManager, command.runId);
+			if (!record)
+				return createRpcErrorResponse(id, "get_review_result", `Unknown durable review run: ${command.runId}`);
+			return createRpcSuccessResponse(id, "get_review_result", projectReviewRun(record, true));
 		}
 
 		case "open_review_session": {
-			const record = runtimeHost.reviewWorkflows.get(command.workflowId);
-			if (!record) {
-				return createRpcErrorResponse(id, "open_review_session", `Unknown review workflow: ${command.workflowId}`);
-			}
-			if (record.status !== "completed") {
+			const record = getReviewRun(session.sessionManager, command.runId);
+			if (!record?.result)
 				return createRpcErrorResponse(
 					id,
 					"open_review_session",
-					`Review workflow is not completed: ${command.workflowId} (${record.status})`,
+					`Review run has no findings result: ${command.runId}`,
 				);
-			}
-			const seedMessage = createReviewSeedMessage(record.target, {
-				raw: record.raw ?? "",
-				parsed: record.parsed,
-			});
-			const fastModeEnabled = record.fastModeEnabled === true;
+			const selectedIds = new Set(command.findingIds ?? record.result.findings.map((finding) => finding.id));
+			const unknownIds = [...selectedIds].filter(
+				(findingId) => !record.result?.findings.some((finding) => finding.id === findingId),
+			);
+			if (unknownIds.length > 0)
+				return createRpcErrorResponse(id, "open_review_session", `Unknown finding ids: ${unknownIds.join(", ")}`);
+			const selectedResult = {
+				...record.result,
+				findings: record.result.findings.filter((finding) => selectedIds.has(finding.id)),
+			};
+			const seedMessage = createReviewSeedMessage(record.target, { parsed: selectedResult });
 			const result = await runSessionNewHostAction(context.createHostActionContext(), {
 				setup: async (sessionManager) => {
-					if (fastModeEnabled) {
-						sessionManager.appendFastModeChange(true);
-					}
+					appendReviewRun(sessionManager, record);
 				},
 				withSession: async (sessionContext) => {
 					await sessionContext.sendMessage(seedMessage);
 				},
 			});
 			if (!result.cancelled && !result.seeded) {
-				// The replacement session was applied but the recovered-client-input
-				// gate skipped the seed callback, so the findings were never seeded.
-				// Fail the open and keep the record retained so clients can retry.
 				return createRpcErrorResponse(
 					id,
 					"open_review_session",
-					`Review session was opened without findings: recovered client input failed to replay, so the seed was skipped. The review remains available: ${command.workflowId}`,
+					`Review session was opened without findings; the durable run remains available: ${command.runId}`,
 				);
-			}
-			// The findings now live in the seeded session, so consume the retained
-			// terminal record: list_review_workflows must stop advertising a review
-			// that was already acted on, or every reconciling client re-surfaces an
-			// "open findings" affordance that would seed a duplicate session. A
-			// declined open keeps the review available; a failed or skipped seed
-			// errors above and also keeps it.
-			if (result.seeded) {
-				runtimeHost.reviewWorkflows.consume(command.workflowId);
 			}
 			return createRpcSuccessResponse(id, "open_review_session", { cancelled: result.cancelled });
 		}
+
+		case "record_review_finding_outcome": {
+			const record = getReviewRun(session.sessionManager, command.runId);
+			if (!record?.result?.findings.some((finding) => finding.id === command.findingId)) {
+				return createRpcErrorResponse(
+					id,
+					"record_review_finding_outcome",
+					`Unknown finding ${command.findingId} in review run ${command.runId}`,
+				);
+			}
+			if (command.status === "dismissed" && !command.reason) {
+				return createRpcErrorResponse(
+					id,
+					"record_review_finding_outcome",
+					"Dismissed findings require an explicit reason.",
+				);
+			}
+			const transition = appendReviewFindingTransition(session.sessionManager, {
+				runId: command.runId,
+				findingId: command.findingId,
+				status: command.status,
+				...(command.reason ? { reason: command.reason } : {}),
+				...(command.note ? { note: command.note } : {}),
+			});
+			await session.sessionManager.flush();
+			return createRpcSuccessResponse(id, "record_review_finding_outcome", transition);
+		}
+
+		case "rerun_review": {
+			const record = getReviewRun(session.sessionManager, command.runId);
+			if (!record) return createRpcErrorResponse(id, "rerun_review", `Unknown review run: ${command.runId}`);
+			const response = await BUILTIN_HOST_ACTION_REGISTRY.invoke(
+				REVIEW_RERUN_ACTION_ID,
+				context.createHostActionContext(),
+				{ runId: record.runId, scopeMode: command.mode ?? "incremental" },
+				{ requireRemoteSafe: options.requireRemoteSafeUiActions },
+			);
+			if (response.status !== "accepted" || !response.workflowId) {
+				return createRpcErrorResponse(id, "rerun_review", response.message ?? "The review rerun was not accepted.");
+			}
+			const pending = context.takePendingReviewWorkflow?.(response.workflowId);
+			if (!pending)
+				return createRpcErrorResponse(id, "rerun_review", "The accepted review rerun was not registered.");
+			try {
+				await session.sessionManager.flush();
+				context.output(
+					createRpcSuccessResponse(id, "rerun_review", { status: "accepted", workflowId: response.workflowId }),
+				);
+			} catch (error) {
+				pending.cancel();
+				throw error;
+			} finally {
+				pending.launch();
+			}
+			return undefined;
+		}
+
+		case "publish_review": {
+			const record = getReviewRun(session.sessionManager, command.runId);
+			if (!record) return createRpcErrorResponse(id, "publish_review", `Unknown review run: ${command.runId}`);
+			const published = await publishReviewRun(session.sessionManager.getCwd(), record);
+			appendReviewPublication(session.sessionManager, { runId: record.runId, ...published });
+			await session.sessionManager.flush();
+			return createRpcSuccessResponse(id, "publish_review", published);
+		}
+
+		case "export_review_feedback":
+			return createRpcSuccessResponse(id, "export_review_feedback", exportReviewFeedback(session.sessionManager));
 
 		// =================================================================
 		// Push notifications
@@ -706,9 +800,22 @@ export async function handleRpcCommand(
 			return createRpcSuccessResponse(id, "get_transcript", transcript);
 		}
 
+		case "get_session_tree": {
+			const entries = session.sessionManager.getEntries();
+			const toolCallsByResultEntryId = resolveSessionToolCallsByResultEntryId(entries);
+			const tree: RpcSessionTreePage = projectSessionTreePage(entries, session.sessionManager.getBranch(), {
+				sessionId: session.sessionManager.getSessionId(),
+				limit: command.limit,
+				afterOrdinal: command.afterOrdinal,
+				projectTranscriptEntry: (entry) =>
+					projectConversationTranscriptEntry(entry, toolCallsByResultEntryId.get(entry.id)),
+			});
+			return createRpcSuccessResponse(id, "get_session_tree", tree);
+		}
+
 		case "get_message_images": {
 			const result = projectMessageImages(
-				session.sessionManager.getBranch(),
+				session.sessionManager.getEntries(),
 				command.entryId,
 				command.startImageIndex,
 			);

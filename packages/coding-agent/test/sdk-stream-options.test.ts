@@ -14,6 +14,7 @@ import { ModelRegistry } from "../src/core/model-registry.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createAgentSessionTestControl } from "./agent-session-test-control.ts";
 
 describe("createAgentSession stream options", () => {
 	let tempDir: string;
@@ -105,7 +106,7 @@ describe("createAgentSession stream options", () => {
 		});
 
 		try {
-			await session.agent.streamFn(model, { messages: [] }, requestOptions);
+			await createAgentSessionTestControl(session).getStreamFn()(model, { messages: [] }, requestOptions);
 			return capturedOptions;
 		} finally {
 			session.dispose();

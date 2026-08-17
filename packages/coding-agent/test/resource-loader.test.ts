@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ExtensionRunner } from "../src/core/extensions/runner.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
-import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
+import { DefaultResourceLoader, loadProjectContextFiles } from "../src/core/resource-loader.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import type { Skill } from "../src/core/skills.ts";
@@ -383,6 +383,24 @@ Content`,
 
 			const { agentsFiles } = loader.getAgentsFiles();
 			expect(agentsFiles.some((f) => f.path.includes("AGENTS.md"))).toBe(true);
+		});
+
+		it("should stop context discovery at the filesystem root and preserve root-to-leaf order", () => {
+			const projectRoot = join(tempDir, "workspace");
+			const nestedCwd = join(projectRoot, "packages", "app");
+			mkdirSync(nestedCwd, { recursive: true });
+			writeFileSync(join(agentDir, "AGENTS.md"), "context-global");
+			writeFileSync(join(tempDir, "AGENTS.md"), "context-ancestor");
+			writeFileSync(join(projectRoot, "CLAUDE.md"), "context-project");
+			writeFileSync(join(nestedCwd, "AGENTS.md"), "context-leaf");
+
+			const contextFiles = loadProjectContextFiles({ cwd: nestedCwd, agentDir });
+			expect(contextFiles.map((file) => file.content).filter((content) => content.startsWith("context-"))).toEqual([
+				"context-global",
+				"context-ancestor",
+				"context-project",
+				"context-leaf",
+			]);
 		});
 
 		it("should skip AGENTS.md and CLAUDE.md discovery when noContextFiles is true", async () => {

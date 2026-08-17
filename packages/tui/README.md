@@ -8,25 +8,27 @@ under the MIT License.
 
 ## Features
 
-- **Differential Rendering**: Three-strategy rendering system that only updates what changed
+- **Interchangeable Renderers**: Shared `TUI` interface with main-screen and alternate-screen implementations
+- **Differential Rendering**: Updates only changed lines or viewport rows
+- **Application-owned Scrolling**: Alternate-screen viewport supports mouse, trackpad, and keyboard navigation
 - **Synchronized Output**: Uses CSI 2026 for atomic screen updates (no flicker)
 - **Bracketed Paste Mode**: Handles large pastes correctly with markers for >10 line pastes
 - **Component-based**: Simple Component interface with render() method
 - **Theme Support**: Components accept theme interfaces for customizable styling
-- **Built-in Components**: Text, TruncatedText, Input, Editor, Markdown, Loader, SelectList, SettingsList, Spacer, Image, Box, Container
-- **Inline Images**: Renders images in terminals that support Kitty or iTerm2 graphics protocols
+- **Built-in Components**: Text, TruncatedText, Input, Editor, Markdown, Loader, SelectList, SettingsList, Spacer, Image, Box, Container, VStack, HStack, ScrollView
+- **Inline Images**: Renders images through Kitty, iTerm2, or negotiated Sixel graphics protocols
 - **Autocomplete Support**: File paths and slash commands
 
 ## Quick Start
 
 ```typescript
-import { TUI, Text, Editor, ProcessTerminal, matchesKey } from "@hansjm10/volt-tui";
+import { type TUI, Text, Editor, ProcessTerminal, TuiMainScreen, matchesKey } from "@hansjm10/volt-tui";
 
 // Create terminal
 const terminal = new ProcessTerminal();
 
-// Create TUI
-const tui = new TUI(terminal);
+// Create the default main-screen renderer through the shared TUI interface
+const tui: TUI = new TuiMainScreen(terminal);
 
 // Add components
 tui.addChild(new Text("Welcome to my app!"));
@@ -56,12 +58,22 @@ tui.start();
 
 ## Core API
 
-### TUI
+### TUI interface and renderers
 
-Main container that manages components and rendering.
+`TUI` is the shared interface for component management, focus, overlays, input, lifecycle, terminal queries, and rendering. Choose a concrete renderer only when constructing the application:
+
+- `TuiMainScreen` renders into the main terminal buffer and preserves terminal-owned native scrollback.
+- `TuiAltScreen` renders a fixed-height viewport in the alternate terminal buffer with application-owned scrolling. By default, stopping it restores the main buffer and prints the complete final document; pass `{ preserveScreen: true }` to restore the previous main-buffer contents instead.
+
+`TUI` is no longer constructible. Migrate `new TUI(terminal)` to `new TuiMainScreen(terminal)` and keep `TUI` only as the renderer-neutral type.
 
 ```typescript
-const tui = new TUI(terminal);
+import { type TUI, TuiAltScreen, TuiMainScreen } from "@hansjm10/volt-tui";
+
+const tui: TUI = new TuiMainScreen(terminal);
+// To use an application-owned viewport in the alternate terminal buffer instead:
+// const tui: TUI = new TuiAltScreen(terminal);
+
 tui.addChild(component);
 tui.removeChild(component);
 tui.start();
@@ -71,6 +83,55 @@ tui.requestRender(); // Request a re-render
 // Global debug key handler (Shift+Ctrl+D)
 tui.onDebug = () => console.log("Debug triggered");
 ```
+
+### Alternate-screen viewport layouts
+
+`TuiAltScreen` can render an explicit terminal-height layout. `VStack` and `HStack` allocate constrained regions, while `ScrollView` owns scrolling for one region. These constrained semantics apply only when a layout root is mounted on `TuiAltScreen`; `TuiMainScreen` renders the ordinary unbounded component document and leaves scrolling to the terminal.
+
+```typescript
+import {
+  Container,
+  isViewportTUI,
+  ScrollView,
+  Text,
+  VStack,
+} from "@hansjm10/volt-tui";
+
+const transcript = new Container();
+transcript.addChild(new Text("History"));
+
+const editorAndFooter = new VStack([
+  editor,
+  new Text("status"),
+]);
+
+if (isViewportTUI(tui)) {
+  tui.setLayoutRoot(new VStack([
+    {
+      component: new ScrollView(transcript, {
+        follow: "end",
+        primary: true,
+        overscroll: "chain",
+      }),
+      basis: 0,
+      grow: 1,
+      minSize: 1,
+    },
+    {
+      component: editorAndFooter,
+      basis: "auto",
+      shrink: 1,
+      minSize: 1,
+    },
+  ]));
+}
+```
+
+Stack entries support `basis`, `grow`, `shrink`, `minSize`, `maxSize`, and responsive `visible` callbacks. Mouse-wheel input targets the deepest scroll view under the pointer, and unused delta chains to outer scroll views by default; set `overscroll: "contain"` to stop that chaining. The scroll view marked `primary: true` receives alternate-screen keyboard navigation and wheel input over non-scrollable regions, so pointer routing does not change keyboard focus.
+
+The primary scroll view can jump between OSC 133 semantic prompt markers. Press `Ctrl+Shift+F` to search its rendered content, `Enter`/`Ctrl+G` and `Shift+Enter`/`Ctrl+Shift+G` to move between matches, and `Escape` to close search. `TuiAltScreenOptions.searchMatchStyle` and `searchCurrentMatchStyle` customize match highlighting.
+
+Layout geometry is rebuilt for each requested frame. Stateful components are retained, and their existing rendered-line caches remain effective. Before painting, alternate-screen layout conditionally repeats with a fresh cache until render-visible `ScrollView` geometry such as `viewportHeight`, `scrollTop`, follow state, and scrollbar visibility is current. Components may render from that state, but their output must converge within eight layout passes; non-convergent geometry throws a developer error instead of painting a contradictory frame. Calling `render(width)` directly on layout components produces an unbounded document without viewport stabilization, which is also used when alternate-screen mode restores the main screen.
 
 ### Overlays
 
@@ -164,7 +225,7 @@ interface Component {
 
 | Method | Description |
 |--------|-------------|
-| `render(width)` | Returns an array of strings, one per line. Each line **must not exceed `width`** or the TUI will error. Use `truncateToWidth()` or manual wrapping to ensure this. |
+| `render(width)` | Returns an array of strings, one per line. Each line **must not exceed `width`** or the TUI renderer will error. Use `truncateToWidth()` or manual wrapping to ensure this. |
 | `handleInput?(data)` | Called when the component has focus and receives keyboard input. The `data` string contains raw terminal input (may include ANSI escape sequences). |
 | `invalidate?()` | Called to clear any cached render state. Components should re-render from scratch on the next `render()` call. |
 
@@ -194,7 +255,7 @@ When a `Focusable` component has focus, TUI:
 3. Positions the hardware terminal cursor at that location
 4. Shows the hardware cursor only when `showHardwareCursor` is enabled
 
-The cursor remains hidden by default. This keeps the fake cursor rendering, while still positioning the hardware cursor for terminals that track IME candidate windows with hidden cursors. Some terminals require a visible hardware cursor for IME positioning; enable it with the `TUI` constructor option, `setShowHardwareCursor(true)`, or `VOLT_HARDWARE_CURSOR=1`. The `Editor` and `Input` built-in components already implement this interface.
+The cursor remains hidden by default. This keeps the fake cursor rendering, while still positioning the hardware cursor for terminals that track IME candidate windows with hidden cursors. Some terminals require a visible hardware cursor for IME positioning; enable it with the renderer constructor option, `setShowHardwareCursor(true)`, or `VOLT_HARDWARE_CURSOR=1`. The `Editor` and `Input` built-in components already implement this interface.
 
 **Container components with embedded inputs:** When a container component (dialog, selector, etc.) contains an `Input` or `Editor` child, the container must implement `Focusable` and propagate the focus state to the child:
 
@@ -515,7 +576,7 @@ const spacer = new Spacer(2); // 2 empty lines (default: 1)
 
 ### Image
 
-Renders images inline for terminals that support the Kitty graphics protocol (Kitty, Ghostty, WezTerm) or iTerm2 inline images. Falls back to a text placeholder on unsupported terminals.
+Renders images inline for terminals that support the Kitty graphics protocol (Kitty, Ghostty, WezTerm), iTerm2 inline images, or Sixel (Windows Terminal 1.22+). Sixel is enabled only after Windows Terminal reports DA1 attribute `4`; an environment variable alone is not treated as support. Unsupported terminals fall back to a text placeholder.
 
 ```typescript
 interface ImageTheme {
@@ -537,7 +598,13 @@ const image = new Image(
 tui.addChild(image);
 ```
 
-Supported formats: PNG, JPEG, GIF, WebP. Dimensions are parsed from the image headers automatically.
+Supported formats for Kitty and iTerm2 are PNG, JPEG, GIF, and WebP. Sixel rendering requires PNG input so it can decode pixels synchronously; applications should convert other formats before creating the component. Sixel output uses a deterministic adaptive palette of up to 256 colors without dithering. Dimensions are parsed from image headers automatically.
+
+#### Alternate-screen image compatibility
+
+`TuiAltScreen` supports inline images and partial viewport cropping with Kitty and Sixel. Kitty placements can be updated independently. Sixel has no placement IDs or deletion command, so a changed, removed, scrolled, or resized Sixel image causes the terminal-height viewport to be cleared and repainted; text-only frames keep differential rendering. iTerm2's inline-image protocol cannot delete an existing placement or crop its source while scrolling, so `TuiAltScreen` renders image components as text placeholders there. `TuiMainScreen` continues to render iTerm2 inline images normally.
+
+Sixel is disabled inside tmux and GNU screen because these sessions do not reliably forward the required graphics and capability negotiation. Run the application directly in Windows Terminal to use Sixel.
 
 ## Autocomplete
 
@@ -592,15 +659,17 @@ if (matchesKey(data, Key.enter)) {
 - With modifiers: `Key.ctrl("c")`, `Key.shift("tab")`, `Key.alt("left")`, `Key.ctrlShift("p")`
 - String format also works: `"enter"`, `"ctrl+c"`, `"shift+tab"`, `"ctrl+shift+p"`
 
-## Differential Rendering
+## Rendering modes
 
-The TUI uses three rendering strategies:
+`TuiMainScreen` uses three rendering strategies:
 
 1. **First Render**: Output all lines without clearing scrollback
-2. **Width Changed or Change Above Viewport**: Clear screen and full re-render
-3. **Normal Update**: Move cursor to first changed line, clear to end, render changed lines
+2. **Width Changed or Change Above Viewport**: Clear the screen and fully re-render
+3. **Normal Update**: Move the cursor to the first changed line, clear to the end, and render changed lines
 
-All updates are wrapped in **synchronized output** (`\x1b[?2026h` ... `\x1b[?2026l`) for atomic, flicker-free rendering.
+`TuiAltScreen` owns a terminal-height viewport. Without an explicit layout root it preserves single-document scrolling behavior. With `setLayoutRoot()`, `VStack`, `HStack`, and nested `ScrollView` components can reserve fixed regions and independently scroll constrained regions. It follows streaming output while at the bottom and preserves a manually selected scroll position while content grows. Mouse-wheel and configurable keyboard navigation scroll without modifying terminal scrollback, including jumps between OSC 133 semantic prompt markers. Clicking an OSC 8 hyperlink invokes the configured URL handler. Dragging with the primary mouse button selects text and copies it through the configured callback or OSC 52; holding the drag at a scroll view's top or bottom edge auto-scrolls into off-screen content. Kitty and Sixel images support vertical viewport cropping; Sixel image changes repaint the full viewport, while iTerm2 inline images fall back to text because the protocol cannot delete or crop placements during viewport repainting.
+
+Both renderers wrap updates in **synchronized output** (`\x1b[?2026h` ... `\x1b[?2026l`) for atomic, flicker-free rendering.
 
 ## Terminal Interface
 
@@ -647,7 +716,7 @@ const lines = wrapTextWithAnsi("This is a long line that needs wrapping", 20);
 
 ## Creating Custom Components
 
-When creating custom components, **each line returned by `render()` must not exceed the `width` parameter**. The TUI will error if any line is wider than the terminal.
+When creating custom components, **each line returned by `render()` must not exceed the `width` parameter**. The TUI renderer will error if any line is wider than the terminal.
 
 ### Handling Input
 

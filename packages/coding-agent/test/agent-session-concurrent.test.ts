@@ -5,7 +5,6 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@hansjm10/volt-agent-core";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
@@ -22,7 +21,11 @@ import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import type { BuildSystemPromptOptions } from "../src/core/system-prompt.ts";
-import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
+import {
+	createTestAgentSessionRuntimeConfig,
+	createTestExtensionsResult,
+	createTestResourceLoader,
+} from "./utilities.ts";
 
 // Mock stream that mimics AssistantMessageEventStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -71,7 +74,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		delete (globalThis as typeof globalThis & { testExtensionApi?: unknown }).testExtensionApi;
 		delete (globalThis as typeof globalThis & { testCommandRuns?: unknown }).testCommandRuns;
 		if (session) {
-			await session.dispose();
+			session.dispose();
+			await session.waitForClosed();
 		}
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });
@@ -83,13 +87,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		let abortSignal: AbortSignal | undefined;
 
 		// Use a stream function that responds to abort
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			initialState: {
-				model,
-				systemPrompt: "Test",
-				tools: [],
-			},
+		const runtimeConfig = createTestAgentSessionRuntimeConfig({
+			model,
+			tools: [],
 			streamFn: (_model, _context, options) => {
 				abortSignal = options?.signal;
 				const stream = new MockAssistantStream();
@@ -121,7 +121,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
 		session = new AgentSession({
-			agent,
+			...runtimeConfig,
 			sessionManager,
 			settingsManager,
 			cwd: tempDir,
@@ -161,13 +161,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		const streamStarted = new Promise<void>((resolve) => {
 			notifyStreamStarted = resolve;
 		});
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			initialState: {
-				model,
-				systemPrompt: "Test",
-				tools: [],
-			},
+		const runtimeConfig = createTestAgentSessionRuntimeConfig({
+			model,
+			tools: [],
 			streamFn: () => {
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
@@ -201,7 +197,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		const modelRegistry = ModelRegistry.create(authStorage, tempDir);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		session = new AgentSession({
-			agent,
+			...runtimeConfig,
 			sessionManager,
 			settingsManager,
 			cwd: tempDir,
@@ -213,7 +209,6 @@ describe("AgentSession concurrent prompt guard", () => {
 		const firstAssistantId = sessionManager.appendMessage(createAssistantMessage("first assistant"));
 		sessionManager.appendMessage({ role: "user", content: "abandoned user", timestamp: 2 });
 		sessionManager.appendMessage(createAssistantMessage("abandoned assistant"));
-		session.agent.state.messages = sessionManager.buildSessionContext().messages;
 
 		const prompt = session.prompt("active user");
 		await streamStarted;
@@ -292,13 +287,9 @@ describe("AgentSession concurrent prompt guard", () => {
 			followUp: readonly AgentSessionQueuedMessage[];
 		}> = [];
 
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			initialState: {
-				model,
-				systemPrompt: "Test",
-				tools: [],
-			},
+		const runtimeConfig = createTestAgentSessionRuntimeConfig({
+			model,
+			tools: [],
 			streamFn: (_model, context, options) => {
 				abortSignal = options?.signal;
 				const stream = new MockAssistantStream();
@@ -360,7 +351,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		]);
 
 		session = new AgentSession({
-			agent,
+			...runtimeConfig,
 			sessionManager,
 			settingsManager,
 			cwd: tempDir,
@@ -406,13 +397,9 @@ describe("AgentSession concurrent prompt guard", () => {
 	it("should allow prompt() after previous completes", async () => {
 		// Create session with a stream that completes immediately
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			initialState: {
-				model,
-				systemPrompt: "Test",
-				tools: [],
-			},
+		const runtimeConfig = createTestAgentSessionRuntimeConfig({
+			model,
+			tools: [],
 			streamFn: () => {
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
@@ -430,7 +417,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
 		session = new AgentSession({
-			agent,
+			...runtimeConfig,
 			sessionManager,
 			settingsManager,
 			cwd: tempDir,
@@ -467,13 +454,9 @@ describe("AgentSession concurrent prompt guard", () => {
 			},
 		};
 
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			initialState: {
-				model,
-				systemPrompt: "Test",
-				tools: [tool],
-			},
+		const runtimeConfig = createTestAgentSessionRuntimeConfig({
+			model,
+			tools: [tool],
 			streamFn: async (_model, context) => {
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
@@ -536,7 +519,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
 		session = new AgentSession({
-			agent,
+			...runtimeConfig,
 			sessionManager,
 			settingsManager,
 			cwd: tempDir,
@@ -551,6 +534,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				hasHandlers: (eventType: string) => boolean;
 				emit: (event: { type: string; message?: { role?: string } }) => Promise<void>;
 				emitMessageEnd: (event: { type: string; message?: { role?: string } }) => Promise<undefined>;
+				emitContext: (messages: unknown[]) => Promise<undefined>;
 				emitToolCall: (event: { type: string; toolCallId: string }) => Promise<undefined>;
 				emitInput: (
 					text: string,
@@ -571,6 +555,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			hasHandlers: (eventType) => eventType === "tool_call",
 			emit: async () => {},
 			emitMessageEnd: async () => undefined,
+			emitContext: async () => undefined,
 			emitToolCall: async () => {
 				snapshots.push(
 					sessionManager
@@ -586,8 +571,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		};
 
 		await session.prompt("hi");
-		await session.agent.waitForIdle();
-
+		await session.waitForIdle();
 		expect(snapshots).toEqual([
 			["user", "assistant"],
 			["user", "assistant"],
@@ -613,13 +597,9 @@ describe("AgentSession concurrent prompt guard", () => {
 			},
 		};
 
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			initialState: {
-				model,
-				systemPrompt: "Test",
-				tools: [tool],
-			},
+		const runtimeConfig = createTestAgentSessionRuntimeConfig({
+			model,
+			tools: [tool],
 			streamFn: async (_model, context) => {
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
@@ -683,7 +663,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
 		session = new AgentSession({
-			agent,
+			...runtimeConfig,
 			sessionManager,
 			settingsManager,
 			cwd: tempDir,
@@ -697,6 +677,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				hasHandlers: (eventType: string) => boolean;
 				emit: (event: { type: string; message?: { role?: string } }) => Promise<void>;
 				emitMessageEnd: (event: { type: string; message?: { role?: string } }) => Promise<undefined>;
+				emitContext: (messages: unknown[]) => Promise<undefined>;
 				emitInput: (
 					text: string,
 					images: unknown,
@@ -721,13 +702,14 @@ describe("AgentSession concurrent prompt guard", () => {
 				}
 				return undefined;
 			},
+			emitContext: async () => undefined,
 			emitInput: async () => ({ action: "continue" }),
 			emitBeforeAgentStart: async () => undefined,
 			invalidate: () => {},
 		};
 
 		await session.prompt("hi");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 		await new Promise((resolve) => setTimeout(resolve, 100));
 
 		const messageEntries = sessionManager.getEntries().filter((entry) => entry.type === "message");

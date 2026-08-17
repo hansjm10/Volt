@@ -54,6 +54,9 @@ export const IROH_REMOTE_RPC_PASSTHROUGH_TYPES = new Set([
 	"get_review_result",
 	"list_review_workflows",
 	"open_review_session",
+	"record_review_finding_outcome",
+	"rerun_review",
+	"publish_review",
 	"list_sessions",
 	"switch_session_by_id",
 	"register_push_target",
@@ -215,6 +218,10 @@ export function getStaticIrohRemoteRpcFilterResult(line: string): IrohRemoteStat
 			allowed: false,
 			response: createIrohRemoteRpcErrorResponse(responseId, command.type, "unsupported_remote_command"),
 		};
+	}
+
+	if (command.type === "get_session_tree") {
+		return { allowed: true, command: command as IrohRemoteRpcCommand };
 	}
 
 	if (IROH_REMOTE_RPC_PASSTHROUGH_TYPES.has(command.type)) {

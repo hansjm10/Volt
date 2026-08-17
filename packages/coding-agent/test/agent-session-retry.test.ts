@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent, type AgentEvent, type AgentTool } from "@hansjm10/volt-agent-core";
+import type { AgentEvent, AgentTool } from "@hansjm10/volt-agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -10,7 +10,7 @@ import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
-import { createTestResourceLoader } from "./utilities.ts";
+import { createTestAgentSessionRuntimeConfig, createTestResourceLoader } from "./utilities.ts";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
@@ -75,9 +75,8 @@ describe("AgentSession retry", () => {
 		let callCount = 0;
 
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			initialState: { model, systemPrompt: "Test", tools: [] },
+		const runtimeConfig = createTestAgentSessionRuntimeConfig({
+			model,
 			streamFn: () => {
 				callCount++;
 				const stream = new MockAssistantStream();
@@ -107,7 +106,7 @@ describe("AgentSession retry", () => {
 		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries, baseDelayMs: 1 } });
 
 		session = new AgentSession({
-			agent,
+			...runtimeConfig,
 			sessionManager,
 			settingsManager,
 			cwd: tempDir,
@@ -196,11 +195,7 @@ describe("AgentSession retry", () => {
 		created.session.dispose();
 
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			initialState: { model, systemPrompt: "Test", tools: [] },
-			streamFn,
-		});
+		const runtimeConfig = createTestAgentSessionRuntimeConfig({ model, streamFn });
 		const sessionManager = SessionManager.inMemory();
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
@@ -208,7 +203,7 @@ describe("AgentSession retry", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
 		session = new AgentSession({
-			agent,
+			...runtimeConfig,
 			sessionManager,
 			settingsManager,
 			cwd: tempDir,
@@ -248,9 +243,8 @@ describe("AgentSession retry", () => {
 		};
 
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			initialState: { model, systemPrompt: "Test", tools: [] },
+		const runtimeConfig = createTestAgentSessionRuntimeConfig({
+			model,
 			streamFn: () => {
 				callCount++;
 				const stream = new MockAssistantStream();
@@ -294,7 +288,7 @@ describe("AgentSession retry", () => {
 		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
 
 		session = new AgentSession({
-			agent,
+			...runtimeConfig,
 			sessionManager,
 			settingsManager,
 			cwd: tempDir,

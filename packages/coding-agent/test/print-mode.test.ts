@@ -16,7 +16,6 @@ type BindExtensionOptions = {
 
 type FakeSession = {
 	sessionManager: { getHeader: () => object | undefined };
-	agent: { waitForIdle: ReturnType<typeof vi.fn<() => Promise<void>>> };
 	waitForIdle: ReturnType<typeof vi.fn<() => Promise<void>>>;
 	state: { messages: AssistantMessage[] };
 	extensionRunner: FakeExtensionRunner;
@@ -70,7 +69,6 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 
 	const session: FakeSession = {
 		sessionManager: { getHeader: () => undefined },
-		agent: { waitForIdle: vi.fn(async () => undefined) },
 		waitForIdle: vi.fn(async () => undefined),
 		state,
 		extensionRunner,
@@ -113,7 +111,6 @@ describe("runPrintMode", () => {
 		const bindOptions = session.bindExtensions.mock.calls[0]?.[0];
 		await bindOptions.commandContextActions.waitForIdle();
 		expect(session.waitForIdle).toHaveBeenCalledOnce();
-		expect(session.agent.waitForIdle).not.toHaveBeenCalled();
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});

@@ -5,7 +5,9 @@ import { type BashExecutionMessage, extractVisibleTextContent } from "../message
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "../subagents/tool-names.ts";
 import { getRemoteVisibleCustomMessageRole } from "./custom-message-projection.ts";
+import { type ResolvedSessionToolCall, resolveSessionToolCallsByResultEntryId } from "./tool-call-resolution.ts";
 import type {
+	RpcConversationTranscriptItem,
 	RpcMessageImage,
 	RpcTranscriptItem,
 	RpcTranscriptResponse,
@@ -43,10 +45,19 @@ interface SubagentProjectionBudget {
 	remainingNodes: number;
 }
 
-interface StoredToolCall {
-	id: string;
-	name: string;
-	arguments: Record<string, unknown>;
+interface BoundedTextProjection {
+	text: string;
+	truncated: boolean;
+}
+
+interface ProjectedTranscriptItem<T extends RpcTranscriptItem = RpcTranscriptItem> {
+	item: T;
+	truncated: boolean;
+}
+
+interface ProjectedTranscriptItems {
+	items: RpcTranscriptItem[];
+	truncatedEntryIds: ReadonlySet<string>;
 }
 
 export interface ProjectSessionTranscriptOptions {
@@ -58,7 +69,7 @@ export function projectSessionTranscript(
 	sessionManager: ReadonlySessionManager,
 	options: ProjectSessionTranscriptOptions = {},
 ): RpcTranscriptResponse {
-	const allItems = projectTranscriptItems(sessionManager.getBranch());
+	const allItems = projectTranscriptItems(sessionManager.getBranch()).items;
 	const beforeIndex = options.beforeEntryId
 		? allItems.findIndex((item) => item.id === options.beforeEntryId)
 		: allItems.length;
@@ -183,115 +194,191 @@ function normalizeLimit(limit: number | undefined): number {
 	return Math.min(MAX_TRANSCRIPT_LIMIT, Math.floor(limit));
 }
 
-function projectTranscriptItems(entries: SessionEntry[]): RpcTranscriptItem[] {
-	const toolCallsById = collectToolCalls(entries);
-	const items: RpcTranscriptItem[] = [];
-
-	for (const entry of entries) {
-		if (entry.type === "compaction") {
-			items.push({
+function projectTranscriptEntry(
+	entry: SessionEntry,
+	toolCall: ResolvedSessionToolCall | undefined,
+): ProjectedTranscriptItem | undefined {
+	if (entry.type === "compaction") {
+		const text = boundTextWithMetadata(entry.summary, SUMMARY_TEXT_LIMIT);
+		return {
+			item: {
 				id: entry.id,
 				role: "summary",
 				timestamp: normalizeTimestamp(entry.timestamp),
 				title: "Conversation compacted",
-				text: boundText(entry.summary, SUMMARY_TEXT_LIMIT),
-			});
-			continue;
-		}
-
-		if (entry.type === "custom_message") {
-			const customItem = projectCustomMessage(entry);
-			if (customItem) {
-				items.push(customItem);
-			}
-			continue;
-		}
-
-		if (entry.type !== "message") {
-			continue;
-		}
-
-		const message = entry.message;
-		if (message.role === "user") {
-			const text = boundText(extractVisibleTextContent(message.content), MESSAGE_TEXT_LIMIT);
-			const imageCount = extractMessageImages(message.content).length;
-			if (text || imageCount > 0) {
-				items.push({
-					id: entry.id,
-					role: "user",
-					text,
-					timestamp: normalizeTimestamp(entry.timestamp),
-					...(message.clientMessageId === undefined ? {} : { clientMessageId: message.clientMessageId }),
-					...(imageCount > 0 ? { imageCount } : {}),
-				});
-			}
-			continue;
-		}
-
-		if (message.role === "assistant") {
-			const text = boundText(extractVisibleTextContent(message.content), MESSAGE_TEXT_LIMIT);
-			if (text) {
-				items.push({ id: entry.id, role: "assistant", text, timestamp: normalizeTimestamp(entry.timestamp) });
-			}
-			continue;
-		}
-
-		if (message.role === "toolResult") {
-			items.push(projectToolResult(entry.id, entry.timestamp, message, toolCallsById.get(message.toolCallId)));
-			continue;
-		}
-
-		if (message.role === "bashExecution") {
-			items.push(projectBashExecution(entry.id, entry.timestamp, message));
-		}
+				text: text.text,
+			},
+			truncated: text.truncated,
+		};
 	}
 
+	if (entry.type === "custom_message") {
+		return projectCustomMessage(entry);
+	}
+
+	if (entry.type !== "message") {
+		return undefined;
+	}
+
+	const message = entry.message;
+	if (message.role === "user") {
+		const text = boundTextWithMetadata(extractVisibleTextContent(message.content), MESSAGE_TEXT_LIMIT);
+		const imageCount = extractMessageImages(message.content).length;
+		if (!text.text && imageCount === 0) {
+			return undefined;
+		}
+		return {
+			item: {
+				id: entry.id,
+				role: "user",
+				text: text.text,
+				timestamp: normalizeTimestamp(entry.timestamp),
+				...(message.clientMessageId === undefined ? {} : { clientMessageId: message.clientMessageId }),
+				...(imageCount > 0 ? { imageCount } : {}),
+			},
+			truncated: text.truncated,
+		};
+	}
+
+	if (message.role === "assistant") {
+		const text = boundTextWithMetadata(extractVisibleTextContent(message.content), MESSAGE_TEXT_LIMIT);
+		if (!text.text) {
+			return undefined;
+		}
+		return {
+			item: {
+				id: entry.id,
+				role: "assistant",
+				text: text.text,
+				timestamp: normalizeTimestamp(entry.timestamp),
+			},
+			truncated: text.truncated,
+		};
+	}
+
+	if (message.role === "toolResult") {
+		return projectToolResult(entry.id, entry.timestamp, message, toolCall);
+	}
+
+	if (message.role === "bashExecution") {
+		return projectBashExecution(entry.id, entry.timestamp, message);
+	}
+
+	return undefined;
+}
+
+function projectTranscriptItems(entries: SessionEntry[]): ProjectedTranscriptItems {
+	const toolCallsByResultEntryId = resolveSessionToolCallsByResultEntryId(entries);
+	const items: RpcTranscriptItem[] = [];
+	const truncatedEntryIds = new Set<string>();
+	for (const entry of entries) {
+		const projected = projectTranscriptEntry(entry, toolCallsByResultEntryId.get(entry.id));
+		if (!projected) continue;
+		items.push(projected.item);
+		if (projected.truncated) {
+			truncatedEntryIds.add(projected.item.id);
+		}
+	}
+	return { items, truncatedEntryIds };
+}
+
+function toConversationTranscriptItem(
+	entry: SessionEntry,
+	projected: ProjectedTranscriptItem,
+): RpcConversationTranscriptItem {
+	const item = projected.item;
+	if (item.id !== entry.id) {
+		throw new Error(`Transcript projection identity mismatch for session entry ${entry.id}`);
+	}
+	const base = {
+		entryId: item.id,
+		ordinal: entry.ordinal ?? 0,
+		createdAt: item.timestamp,
+	};
+	if (item.role === "tool") {
+		return {
+			...base,
+			role: "tool",
+			text: item.summary,
+			truncated: projected.truncated,
+			toolName: item.toolName,
+			status: item.status === "failed" ? "failed" : "completed",
+			summary: item.summary,
+			...(item.path === undefined ? {} : { path: item.path }),
+			...(item.imageCount === undefined ? {} : { imageCount: item.imageCount }),
+			...(item.args === undefined ? {} : { args: item.args }),
+			...(item.details === undefined ? {} : { details: item.details }),
+		};
+	}
+	const role = item.role === "summary" ? "system" : item.role;
+	return {
+		...base,
+		role,
+		text: item.text,
+		truncated: projected.truncated,
+		...(item.role === "user" && item.clientMessageId !== undefined ? { clientMessageId: item.clientMessageId } : {}),
+		...(item.role === "user" && item.imageCount !== undefined ? { imageCount: item.imageCount } : {}),
+	};
+}
+
+/** Local-RPC projection for one session-tree entry. */
+export function projectConversationTranscriptEntry(
+	entry: SessionEntry,
+	toolCall: ResolvedSessionToolCall | undefined,
+): RpcConversationTranscriptItem | undefined {
+	const projected = projectTranscriptEntry(entry, toolCall);
+	return projected ? toConversationTranscriptItem(entry, projected) : undefined;
+}
+
+/**
+ * Local-RPC projection in the canonical conversation-item shape used by
+ * session-tree pages. Remote callers use the stricter workspace sanitizer but
+ * retain this exact schema.
+ */
+export function projectConversationTranscriptItems(entries: SessionEntry[]): RpcConversationTranscriptItem[] {
+	const toolCallsByResultEntryId = resolveSessionToolCallsByResultEntryId(entries);
+	const items: RpcConversationTranscriptItem[] = [];
+	for (const entry of entries) {
+		const item = projectConversationTranscriptEntry(entry, toolCallsByResultEntryId.get(entry.id));
+		if (item) items.push(item);
+	}
 	return items;
 }
 
-function projectCustomMessage(entry: Extract<SessionEntry, { type: "custom_message" }>): RpcTranscriptItem | undefined {
+function projectCustomMessage(
+	entry: Extract<SessionEntry, { type: "custom_message" }>,
+): ProjectedTranscriptItem | undefined {
 	const role = getRemoteVisibleCustomMessageRole(entry.customType, entry.display);
 	if (role === undefined) {
 		return undefined;
 	}
-	const text = boundText(extractVisibleTextContent(entry.content), MESSAGE_TEXT_LIMIT);
-	if (!text) {
+	const text = boundTextWithMetadata(extractVisibleTextContent(entry.content), MESSAGE_TEXT_LIMIT);
+	if (!text.text) {
 		return undefined;
 	}
-	return { id: entry.id, role, text, timestamp: normalizeTimestamp(entry.timestamp) };
-}
-
-function collectToolCalls(entries: SessionEntry[]): Map<string, StoredToolCall> {
-	const toolCalls = new Map<string, StoredToolCall>();
-	for (const entry of entries) {
-		if (entry.type !== "message" || entry.message.role !== "assistant") {
-			continue;
-		}
-		for (const block of entry.message.content) {
-			if (isStoredToolCall(block)) {
-				toolCalls.set(block.id, block);
-			}
-		}
-	}
-	return toolCalls;
+	return {
+		item: { id: entry.id, role, text: text.text, timestamp: normalizeTimestamp(entry.timestamp) },
+		truncated: text.truncated,
+	};
 }
 
 function projectToolResult(
 	entryId: string,
 	timestamp: string,
 	message: Extract<AgentMessage, { role: "toolResult" }>,
-	toolCall: StoredToolCall | undefined,
-): RpcTranscriptToolItem {
+	toolCall: ResolvedSessionToolCall | undefined,
+): ProjectedTranscriptItem<RpcTranscriptToolItem> {
 	const args = toolCall?.arguments;
 	const status: RpcTranscriptToolStatus = message.isError ? "failed" : "completed";
 	const path = getToolPath(message.toolName, args);
 	const details = isRecord(message.details) ? message.details : undefined;
+	const summary = summarizeToolResult(message.toolName, status, args, path);
 	const item: RpcTranscriptToolItem = {
 		id: entryId,
 		role: "tool",
 		toolName: message.toolName,
 		status,
-		summary: summarizeToolResult(message.toolName, status, args, path),
+		summary: summary.text,
 		timestamp: normalizeTimestamp(timestamp),
 	};
 	if (path) {
@@ -319,7 +406,7 @@ function projectToolResult(
 			item.details = subagentDetails;
 		}
 	}
-	return item;
+	return { item, truncated: summary.truncated };
 }
 
 function projectToolArgs(
@@ -700,10 +787,11 @@ function projectBashExecution(
 	entryId: string,
 	timestamp: string,
 	message: BashExecutionMessage,
-): RpcTranscriptToolItem {
+): ProjectedTranscriptItem<RpcTranscriptToolItem> {
 	const failed = message.cancelled || (message.exitCode !== undefined && message.exitCode !== 0);
 	const status: RpcTranscriptToolStatus = failed ? "failed" : "completed";
-	const summaryParts = [`Ran command: ${boundSummary(message.command, TOOL_COMMAND_LIMIT)}`];
+	const command = boundSummaryWithMetadata(message.command, TOOL_COMMAND_LIMIT);
+	const summaryParts = [`Ran command: ${command.text}`];
 	if (message.truncated) {
 		summaryParts.push("output truncated");
 	}
@@ -712,18 +800,19 @@ function projectBashExecution(
 	} else if (message.exitCode !== undefined) {
 		summaryParts.push(`exit ${message.exitCode}`);
 	}
+	const summary = boundSummaryWithMetadata(summaryParts.join("; "), TOOL_SUMMARY_LIMIT);
 	const item: RpcTranscriptToolItem = {
 		id: entryId,
 		role: "tool",
 		toolName: "bash",
 		status,
-		summary: boundSummary(summaryParts.join("; "), TOOL_SUMMARY_LIMIT),
+		summary: summary.text,
 		timestamp: normalizeTimestamp(timestamp),
 	};
 	if (message.command.trim().length > 0) {
 		item.args = { command: boundText(message.command, TOOL_COMMAND_LIMIT) };
 	}
-	return item;
+	return { item, truncated: command.truncated || summary.truncated };
 }
 
 function summarizeToolResult(
@@ -731,64 +820,69 @@ function summarizeToolResult(
 	status: RpcTranscriptToolStatus,
 	args: Record<string, unknown> | undefined,
 	path: string | undefined,
-): string {
+): BoundedTextProjection {
 	const statusText = status === "failed" ? "failed" : "completed";
 	const target = path ? ` ${path}` : "";
 	if (toolName === "read") {
-		return boundSummary(`Read${target || " file"} (${statusText})`, TOOL_SUMMARY_LIMIT);
+		return boundSummaryWithMetadata(`Read${target || " file"} (${statusText})`, TOOL_SUMMARY_LIMIT);
 	}
 	if (toolName === "edit") {
-		return boundSummary(`Edited${target || " file"} (${statusText})`, TOOL_SUMMARY_LIMIT);
+		return boundSummaryWithMetadata(`Edited${target || " file"} (${statusText})`, TOOL_SUMMARY_LIMIT);
 	}
 	if (toolName === "write") {
-		return boundSummary(`Wrote${target || " file"} (${statusText})`, TOOL_SUMMARY_LIMIT);
+		return boundSummaryWithMetadata(`Wrote${target || " file"} (${statusText})`, TOOL_SUMMARY_LIMIT);
 	}
 	if (toolName === "bash") {
 		const command = getStringArg(args, "command");
-		return boundSummary(
-			command
-				? `Ran command: ${boundSummary(command, TOOL_COMMAND_LIMIT)} (${statusText})`
-				: `Ran command (${statusText})`,
+		const boundedCommand = command ? boundSummaryWithMetadata(command, TOOL_COMMAND_LIMIT) : undefined;
+		const summary = boundSummaryWithMetadata(
+			boundedCommand ? `Ran command: ${boundedCommand.text} (${statusText})` : `Ran command (${statusText})`,
 			TOOL_SUMMARY_LIMIT,
 		);
+		return { text: summary.text, truncated: summary.truncated || boundedCommand?.truncated === true };
 	}
 	if (toolName === "web_search") {
 		const query = getStringArg(args, "query");
-		return boundSummary(
-			query
-				? `Searched web for ${boundSummary(query, TOOL_COMMAND_LIMIT)} (${statusText})`
-				: `Searched web (${statusText})`,
+		const boundedQuery = query ? boundSummaryWithMetadata(query, TOOL_COMMAND_LIMIT) : undefined;
+		const summary = boundSummaryWithMetadata(
+			boundedQuery ? `Searched web for ${boundedQuery.text} (${statusText})` : `Searched web (${statusText})`,
 			TOOL_SUMMARY_LIMIT,
 		);
+		return { text: summary.text, truncated: summary.truncated || boundedQuery?.truncated === true };
 	}
 	if (toolName === "web_fetch") {
 		const url = getStringArg(args, "url");
-		return boundSummary(
-			url ? `Fetched ${boundSummary(url, TOOL_COMMAND_LIMIT)} (${statusText})` : `Fetched URL (${statusText})`,
+		const boundedUrl = url ? boundSummaryWithMetadata(url, TOOL_COMMAND_LIMIT) : undefined;
+		const summary = boundSummaryWithMetadata(
+			boundedUrl ? `Fetched ${boundedUrl.text} (${statusText})` : `Fetched URL (${statusText})`,
 			TOOL_SUMMARY_LIMIT,
 		);
+		return { text: summary.text, truncated: summary.truncated || boundedUrl?.truncated === true };
 	}
 	if (toolName === "grep") {
 		const pattern = getStringArg(args, "pattern");
 		const patternText = pattern ? ` for ${pattern}` : "";
-		return boundSummary(`Searched${target || " workspace"}${patternText} (${statusText})`, TOOL_SUMMARY_LIMIT);
+		return boundSummaryWithMetadata(
+			`Searched${target || " workspace"}${patternText} (${statusText})`,
+			TOOL_SUMMARY_LIMIT,
+		);
 	}
 	if (toolName === "find") {
 		const query = getStringArg(args, "query") ?? getStringArg(args, "pattern");
 		const queryText = query ? ` for ${query}` : "";
-		return boundSummary(`Found files${target}${queryText} (${statusText})`, TOOL_SUMMARY_LIMIT);
+		return boundSummaryWithMetadata(`Found files${target}${queryText} (${statusText})`, TOOL_SUMMARY_LIMIT);
 	}
 	if (toolName === "ls") {
-		return boundSummary(`Listed${target || " directory"} (${statusText})`, TOOL_SUMMARY_LIMIT);
+		return boundSummaryWithMetadata(`Listed${target || " directory"} (${statusText})`, TOOL_SUMMARY_LIMIT);
 	}
 	if (toolName === "lsp") {
 		const action = getStringArg(args, "action");
-		return boundSummary(
+		return boundSummaryWithMetadata(
 			action ? `Ran lsp ${action}${target} (${statusText})` : `Ran lsp${target} (${statusText})`,
 			TOOL_SUMMARY_LIMIT,
 		);
 	}
-	return boundSummary(`${toolName} ${statusText}`, TOOL_SUMMARY_LIMIT);
+	return boundSummaryWithMetadata(`${toolName} ${statusText}`, TOOL_SUMMARY_LIMIT);
 }
 
 function getToolPath(toolName: string, args: Record<string, unknown> | undefined): string | undefined {
@@ -805,30 +899,31 @@ function getBoundedString(record: Record<string, unknown> | undefined, key: stri
 	return typeof value === "string" && value.length > 0 ? boundText(value, limit) : undefined;
 }
 
+function boundSummaryWithMetadata(text: string, limit: number): BoundedTextProjection {
+	return boundTextWithMetadata(text.replace(/\s+/g, " ").trim(), limit);
+}
+
 function boundSummary(text: string, limit: number): string {
-	return boundText(text.replace(/\s+/g, " ").trim(), limit);
+	return boundSummaryWithMetadata(text, limit).text;
+}
+
+function boundTextWithMetadata(text: string, limit: number): BoundedTextProjection {
+	if (text.length <= limit) {
+		return { text, truncated: false };
+	}
+	return {
+		text: `${text.slice(0, Math.max(0, limit - 16)).trimEnd()}\n[truncated]`,
+		truncated: true,
+	};
 }
 
 function boundText(text: string, limit: number): string {
-	if (text.length <= limit) {
-		return text;
-	}
-	return `${text.slice(0, Math.max(0, limit - 16)).trimEnd()}\n[truncated]`;
+	return boundTextWithMetadata(text, limit).text;
 }
 
 function normalizeTimestamp(timestamp: string): string {
 	const date = new Date(timestamp);
 	return Number.isNaN(date.getTime()) ? timestamp : date.toISOString();
-}
-
-function isStoredToolCall(value: unknown): value is StoredToolCall {
-	return (
-		isRecord(value) &&
-		value.type === "toolCall" &&
-		typeof value.id === "string" &&
-		typeof value.name === "string" &&
-		isRecord(value.arguments)
-	);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

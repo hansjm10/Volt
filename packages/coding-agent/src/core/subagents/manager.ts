@@ -546,6 +546,7 @@ class LocalSubagentHandle implements SubagentHandle {
 	private promptStarted = false;
 	private promptAccepted = false;
 	private promptMessageObserved = false;
+	private promptSettlementObserved = false;
 	private endSettled = false;
 	private ownershipSettled = false;
 	private disposed = false;
@@ -608,6 +609,10 @@ class LocalSubagentHandle implements SubagentHandle {
 				this.onPromptAccepted(message);
 				this.promptAccepted = true;
 			});
+			// Handler-owned prompts may settle before their success response reaches
+			// this client. Join that buffered settlement only after this prompt's RPC
+			// admission is authoritative.
+			if (this.promptSettlementObserved) this.startSettlementWatcher();
 		} catch (error) {
 			await this.onPromptFailed(error).catch(() => undefined);
 			this.settleOwnership();
@@ -712,6 +717,9 @@ class LocalSubagentHandle implements SubagentHandle {
 		if (event.type === "agent_end" && this.promptMessageObserved) {
 			this.latestEndEvent = event;
 		}
+		if (event.type === "agent_settled" && this.promptStarted) {
+			this.promptSettlementObserved = true;
+		}
 		for (const listener of this.eventListeners) {
 			try {
 				listener(event);
@@ -719,13 +727,17 @@ class LocalSubagentHandle implements SubagentHandle {
 				// Listener failures should not break the child RPC event stream.
 			}
 		}
-		const shouldWatchSettlement =
-			(event.type === "agent_end" && this.promptMessageObserved) ||
-			(event.type === "agent_settled" && this.promptAccepted);
-		if (shouldWatchSettlement && !this.settlementWatcherStarted && !this.disposed && !this.endSettled) {
-			this.settlementWatcherStarted = true;
-			void this.settleAfterIdle();
-		}
+		// agent_end is a turn projection, not the prompt transaction's terminal
+		// boundary: retry and compaction continuations emit intermediate agent_end
+		// events. AgentSession publishes agent_settled only after all continuations
+		// have finished, so select the latest result at that authoritative boundary.
+		if (event.type === "agent_settled" && this.promptAccepted) this.startSettlementWatcher();
+	}
+
+	private startSettlementWatcher(): void {
+		if (this.settlementWatcherStarted || this.disposed || this.endSettled || !this.promptAccepted) return;
+		this.settlementWatcherStarted = true;
+		void this.settleAfterIdle();
 	}
 
 	private async settleAfterIdle(): Promise<void> {
@@ -1409,58 +1421,43 @@ export class SubagentManager {
 			markRunAbortRequested();
 			void runtime.session.abort().catch(() => undefined);
 		};
-		// AgentSession installs these hooks exactly once in its constructor and
-		// throws on any reinstall (see AgentSession._installAgentToolHooks), so the
-		// budget wrappers chained here cannot be silently dropped. The wiring
-		// persists for the runtime's whole lifetime — re-prompted children keep
-		// their report-only posture — and the originals are restored on dispose (or
-		// spawn failure), but only while the budget wrapper is still the installed
-		// hook.
-		const originalBeforeToolCall = runtime.session.agent.beforeToolCall;
-		const originalNextAction = runtime.session.agent.nextAction;
-		const budgetBeforeToolCall: NonNullable<typeof originalBeforeToolCall> = async (context, signal) => {
-			if (requiresFinalTurnReport) {
-				// This block reason is the guaranteed instruction channel for the
-				// report stage; the steer message below is only best-effort.
+		const unregisterBudgetPolicy = runtime.session.registerTurnPolicy({
+			beforeToolCall: async () => {
+				if (!requiresFinalTurnReport) return undefined;
 				return {
 					block: true,
 					reason: "This subagent's turn budget is exhausted. Do not use tools; return your best final report now.",
 				};
-			}
-			return originalBeforeToolCall?.(context, signal);
-		};
-		const budgetNextAction: NonNullable<typeof originalNextAction> = async (context, signal) => {
-			if (context.requestAuthority === "final_response") {
-				pendingBudgetDelivery = undefined;
-				finalResponseSatisfiedBudget = requiresFinalTurnReport;
-				return originalNextAction ? await originalNextAction(context, signal) : context.defaultAction;
-			}
-			if (pendingBudgetDelivery !== undefined) {
-				const content = pendingBudgetDelivery;
-				pendingBudgetDelivery = undefined;
-				return {
-					type: "request",
-					reason: "delivery",
-					deliveries: [
-						{
-							messages: [
-								{
-									role: "user",
-									content: [{ type: "text", text: content }],
-									timestamp: Date.now(),
-								},
-							],
-						},
-					],
-				};
-			}
-			// A budget stop deliberately skips proactive compaction: auto-resume
-			// would contradict the terminal budget decision.
-			if (stopAfterTurnForBudget && context.completedTurn) return { type: "stop" };
-			return originalNextAction ? await originalNextAction(context, signal) : context.defaultAction;
-		};
-		runtime.session.agent.beforeToolCall = budgetBeforeToolCall;
-		runtime.session.agent.nextAction = budgetNextAction;
+			},
+			nextAction: async (context) => {
+				if (context.requestAuthority === "final_response") {
+					pendingBudgetDelivery = undefined;
+					finalResponseSatisfiedBudget = requiresFinalTurnReport;
+					return context.defaultAction;
+				}
+				if (pendingBudgetDelivery !== undefined) {
+					const content = pendingBudgetDelivery;
+					pendingBudgetDelivery = undefined;
+					return {
+						type: "request",
+						reason: "delivery",
+						deliveries: [
+							{
+								messages: [
+									{
+										role: "user",
+										content: [{ type: "text", text: content }],
+										timestamp: Date.now(),
+									},
+								],
+							},
+						],
+					};
+				}
+				if (stopAfterTurnForBudget && context.completedTurn) return { type: "stop" };
+				return context.defaultAction;
+			},
+		});
 		const unsubscribeSessionAccounting = runtime.session.subscribe(
 			(event) => {
 				if (event.type === "turn_end") {
@@ -1518,15 +1515,7 @@ export class SubagentManager {
 		);
 		const teardownBudgetWiring = (): void => {
 			unsubscribeSessionAccounting();
-			// Restore each hook only while the budget wrapper is still installed;
-			// if another wrapper chained over it after spawn, reassigning the
-			// original here would silently discard that wrapper's chain.
-			if (runtime.session.agent.beforeToolCall === budgetBeforeToolCall) {
-				runtime.session.agent.beforeToolCall = originalBeforeToolCall;
-			}
-			if (runtime.session.agent.nextAction === budgetNextAction) {
-				runtime.session.agent.nextAction = originalNextAction;
-			}
+			unregisterBudgetPolicy();
 		};
 		let client: InProcessRpcClient | undefined;
 		let runtimeRegistration: SubagentRuntimeRegistration | undefined;

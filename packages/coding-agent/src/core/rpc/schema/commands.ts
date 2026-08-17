@@ -162,9 +162,31 @@ export const RPC_COMMAND_SCHEMAS = {
 
 	// Detached review workflows
 	cancel_workflow: commandSchema("cancel_workflow", { workflowId: RpcConversationIdentifierSchema }),
-	get_review_result: commandSchema("get_review_result", { workflowId: RpcConversationIdentifierSchema }),
-	list_review_workflows: commandSchema("list_review_workflows", {}),
-	open_review_session: commandSchema("open_review_session", { workflowId: RpcConversationIdentifierSchema }),
+	get_review_result: commandSchema("get_review_result", { runId: RpcConversationIdentifierSchema }),
+	list_review_workflows: commandSchema("list_review_workflows", {
+		cursor: Type.Optional(Type.String()),
+		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+	}),
+	open_review_session: commandSchema("open_review_session", {
+		runId: RpcConversationIdentifierSchema,
+		findingIds: Type.Optional(Type.Array(RpcConversationIdentifierSchema, { maxItems: 50 })),
+	}),
+	record_review_finding_outcome: commandSchema("record_review_finding_outcome", {
+		runId: RpcConversationIdentifierSchema,
+		findingId: RpcConversationIdentifierSchema,
+		status: stringEnum(["accepted", "fixed", "dismissed"]),
+		reason: Type.Optional(stringEnum(["false_positive", "intentional", "not_actionable", "other"])),
+		note: Type.Optional(Type.String({ maxLength: 2_000 })),
+	}),
+	rerun_review: commandSchema("rerun_review", {
+		runId: RpcConversationIdentifierSchema,
+		mode: Type.Optional(stringEnum(["incremental", "full"])),
+	}),
+	publish_review: commandSchema("publish_review", {
+		runId: RpcConversationIdentifierSchema,
+		confirmed: Type.Literal(true),
+	}),
+	export_review_feedback: commandSchema("export_review_feedback", {}),
 
 	// Push notifications
 	register_push_target: commandSchema("register_push_target", {
@@ -247,6 +269,11 @@ export const RPC_COMMAND_SCHEMAS = {
 		limit: Type.Optional(Type.Number()),
 		beforeEntryId: Type.Optional(Type.String()),
 		branchEpoch: Type.Optional(RpcConversationIdentifierSchema),
+	}),
+	get_session_tree: commandSchema("get_session_tree", {
+		sessionId: Type.Optional(RpcConversationIdentifierSchema),
+		limit: Type.Optional(Type.Integer({ minimum: 1, "x-volt-expected": "be a positive integer" })),
+		afterOrdinal: Type.Optional(Type.Integer({ minimum: 0, "x-volt-expected": "be a non-negative integer" })),
 	}),
 	get_message_images: commandSchema("get_message_images", {
 		sessionId: Type.Optional(RpcConversationIdentifierSchema),

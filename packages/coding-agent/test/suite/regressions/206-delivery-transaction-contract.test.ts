@@ -51,7 +51,8 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 	afterEach(async () => {
 		while (harnesses.length > 0) {
 			const harness = harnesses.pop()!;
-			await harness.session.dispose();
+			harness.session.dispose();
+			await harness.session.waitForClosed();
 			harness.cleanup();
 		}
 	});
@@ -61,18 +62,18 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("durably admitted")]);
 		const clientMessageId = "contract-direct-rpc";
-		const canonicalFlushStarted = deferred();
-		const releaseCanonicalFlush = deferred();
-		const originalFlush = harness.sessionManager.flush.bind(harness.sessionManager);
-		let gatedCanonicalFlush = false;
-		vi.spyOn(harness.sessionManager, "flush").mockImplementation(() => {
-			const watermark = originalFlush();
-			if (!gatedCanonicalFlush && harness.sessionManager.getClientInput(clientMessageId)?.state === "completed") {
-				gatedCanonicalFlush = true;
-				canonicalFlushStarted.resolve();
-				return watermark.then(() => releaseCanonicalFlush.promise);
+		const canonicalReceiptStarted = deferred();
+		const releaseCanonicalReceipt = deferred();
+		const originalCommitDelivery = harness.sessionManager.commitDelivery.bind(harness.sessionManager);
+		let gatedCanonicalReceipt = false;
+		vi.spyOn(harness.sessionManager, "commitDelivery").mockImplementation(async (input) => {
+			const receipt = await originalCommitDelivery(input);
+			if (!gatedCanonicalReceipt) {
+				gatedCanonicalReceipt = true;
+				canonicalReceiptStarted.resolve();
+				await releaseCanonicalReceipt.promise;
 			}
-			return watermark;
+			return receipt;
 		});
 		const preflightResults: PromptPreflightResult[] = [];
 
@@ -81,7 +82,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 			source: "rpc",
 			preflightResult: (result) => preflightResults.push(result),
 		});
-		await canonicalFlushStarted.promise;
+		await canonicalReceiptStarted.promise;
 
 		expect(preflightResults).toEqual([]);
 		expect(harness.getPendingResponseCount()).toBe(1);
@@ -97,7 +98,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 				),
 		).toHaveLength(1);
 
-		releaseCanonicalFlush.resolve();
+		releaseCanonicalReceipt.resolve();
 		await prompt;
 
 		expect(preflightResults).toEqual([{ success: true, outcome: "admitted" }]);
@@ -132,7 +133,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 			});
 			expect(getUserTexts(harness)).toEqual([]);
 
-			await harness.session.agent.continue();
+			await harness.control.continue();
 
 			expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
 			expect(getUserTexts(harness)).toEqual([text]);
@@ -149,28 +150,35 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		},
 	);
 
-	it("retains a direct delivery after preparation failure and commits it on explicit retry", async () => {
-		let failPreparation = true;
+	it("retains a direct delivery after an explicit no-effect settlement and commits it on retry", async () => {
+		let retainSettlement = true;
 		const preparedDeliveryIds: string[] = [];
 		const harness = await createHarness({
 			prepareDelivery: (delivery) => {
 				preparedDeliveryIds.push(delivery.deliveryId);
-				if (failPreparation) throw new Error("injected preparation failure");
-				return { messages: [...delivery.messages] };
+				return {
+					messages: [...delivery.messages],
+					participant: {
+						settle: () =>
+							retainSettlement
+								? { outcome: "retained", error: new Error("injected no-effect settlement") }
+								: { outcome: "committed" },
+					},
+				};
 			},
 		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("explicit retry committed")]);
 
-		await harness.session.agent.prompt(createUserMessage("retain direct prompt"));
+		await harness.control.run(createUserMessage("retain direct prompt"));
 
-		expect(harness.session.agent.state.errorMessage).toBe("injected preparation failure");
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.session.state.errorMessage).toBe("injected no-effect settlement");
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(getUserTexts(harness)).toEqual([]);
 		expect(harness.getPendingResponseCount()).toBe(1);
 
-		failPreparation = false;
-		await harness.session.agent.continue();
+		retainSettlement = false;
+		await harness.control.continue();
 
 		expect(new Set(preparedDeliveryIds)).toHaveLength(1);
 		expect(getUserTexts(harness)).toEqual(["retain direct prompt"]);
@@ -178,17 +186,22 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 	});
 
 	it.each(["steer", "followUp"] as const)(
-		"settles a failed %s attempt while retaining its accepted client input for explicit retry",
+		"settles an explicitly retained %s attempt while preserving its accepted client input for retry",
 		async (kind) => {
-			let failPreparation = true;
+			let retainSettlement = true;
 			const preparedDeliveryIds: string[] = [];
 			const harness = await createHarness({
 				prepareDelivery: (delivery) => {
 					preparedDeliveryIds.push(delivery.deliveryId);
-					if (failPreparation && delivery.kind === kind) {
-						throw new Error(`injected ${kind} preparation failure`);
-					}
-					return { messages: [...delivery.messages] };
+					return {
+						messages: [...delivery.messages],
+						participant: {
+							settle: () =>
+								retainSettlement && delivery.kind === kind
+									? { outcome: "retained", error: new Error(`injected ${kind} no-effect settlement`) }
+									: { outcome: "committed" },
+						},
+					};
 				},
 			});
 			harnesses.push(harness);
@@ -198,19 +211,19 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 
 			if (kind === "steer") await harness.session.steer(text, undefined, clientMessageId);
 			else await harness.session.followUp(text, undefined, clientMessageId);
-			await expect(harness.session.agent.continue()).resolves.toMatchObject({
+			await expect(harness.control.continue()).resolves.toMatchObject({
 				status: "delivery_failed",
-				failure: { kind, outcome: "retained", phase: "preparation" },
+				failure: { kind, outcome: "retained", phase: "settlement" },
 			});
 
-			expect(harness.session.agent.state.errorMessage).toBe(`injected ${kind} preparation failure`);
-			expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+			expect(harness.session.state.errorMessage).toBe(`injected ${kind} no-effect settlement`);
+			expect(harness.control.hasQueuedMessages()).toBe(true);
 			expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
 			expect(getUserTexts(harness)).toEqual([]);
 			expect(harness.getPendingResponseCount()).toBe(1);
 
-			failPreparation = false;
-			await harness.session.agent.continue();
+			retainSettlement = false;
+			await harness.control.continue();
 
 			expect(new Set(preparedDeliveryIds)).toHaveLength(1);
 			expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
@@ -238,13 +251,13 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		});
 		await harness.session.steer("discard retained feedback", undefined, clientMessageId);
 
-		await expect(harness.session.agent.continue()).resolves.toMatchObject({
+		await expect(harness.control.continue()).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: { outcome: "retained", phase: "settlement" },
 		});
 
-		expect(harness.session.agent.state.errorMessage).toBe("injected planning commit failure");
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.session.state.errorMessage).toBe("injected planning commit failure");
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
 		expect(harness.session.planningState.plan?.phase).toBe("ready");
 		expect(planningChangeCount(harness)).toBe(planningBaseline);
@@ -256,7 +269,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 			steering: ["discard retained feedback"],
 			followUp: [],
 		});
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "failed" });
 		expect(outcomes).toEqual([
 			{
@@ -266,6 +279,29 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 				reason: "queue_cleared",
 			},
 		]);
+	});
+
+	it("terminalizes durable client-input ownership when commit failure has no authenticated rollback", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const clientMessageId = "contract-terminal-commit";
+		vi.spyOn(harness.sessionManager, "commitDelivery").mockRejectedValueOnce(
+			new Error("injected unauthenticated commit rejection"),
+		);
+		await harness.session.steer("terminal delivery", undefined, clientMessageId);
+
+		await expect(harness.control.continue()).resolves.toMatchObject({
+			status: "delivery_failed",
+			failure: { outcome: "terminally_failed", phase: "settlement" },
+		});
+
+		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({
+			state: "failed",
+			error: "injected unauthenticated commit rejection",
+		});
+		expect(harness.sessionManager.getRecoverableQueuedClientInputs()).toEqual([]);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
+		expect(getUserTexts(harness)).toEqual([]);
 	});
 
 	it("lets an external abort win before commit without revoking retained feedback", async () => {
@@ -286,13 +322,13 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		const checkpointBaseline = checkpointCount(harness);
 		await harness.session.steer("retain after external abort", undefined, clientMessageId);
 
-		const attempt = harness.session.agent.continue();
+		const attempt = harness.control.continue();
 		await preparationStarted.promise;
 		const abort = harness.session.abort("remote_request");
 		releasePreparation.resolve();
 		await Promise.all([attempt, abort]);
 
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
 		expect(harness.session.planningState.plan?.phase).toBe("ready");
 		expect(checkpointCount(harness)).toBe(checkpointBaseline);
@@ -309,15 +345,16 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		const clientMessageId = "contract-abort-during-durability";
 		const canonicalCommitStarted = deferred();
 		const releaseCanonicalCommit = deferred();
-		const originalAppendAtomically = harness.sessionManager.appendAtomically.bind(harness.sessionManager);
+		const originalCommitDelivery = harness.sessionManager.commitDelivery.bind(harness.sessionManager);
 		let gatedCanonicalCommit = false;
-		vi.spyOn(harness.sessionManager, "appendAtomically").mockImplementation(async (append, beforePublish) => {
-			await originalAppendAtomically(append, beforePublish);
+		vi.spyOn(harness.sessionManager, "commitDelivery").mockImplementation(async (input) => {
+			const receipt = await originalCommitDelivery(input);
 			if (!gatedCanonicalCommit) {
 				gatedCanonicalCommit = true;
 				canonicalCommitStarted.resolve();
 				await releaseCanonicalCommit.promise;
 			}
+			return receipt;
 		});
 		const preflightResults: PromptPreflightResult[] = [];
 
@@ -348,7 +385,8 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 				messages: [...delivery.messages],
 				participant: {
 					settle: () => {
-						disposal = harness.session.dispose("disposal");
+						harness.session.dispose("disposal");
+						disposal = harness.session.waitForClosed();
 						return { outcome: "committed" };
 					},
 				},
@@ -363,9 +401,24 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 		await disposal;
 
 		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
-		expect(harness.session.planningState.plan?.phase).toBe("draft");
+		expect(
+			harness.sessionManager
+				.getBranch()
+				.filter((entry) => entry.type === "planning_state_change")
+				.at(-1)?.planning.plan?.phase,
+		).toBe("draft");
 		expect(checkpointCount(harness)).toBe(1);
-		expect(getUserTexts(harness)).toEqual(["commit before reentrant disposal"]);
+		expect(
+			harness.sessionManager
+				.buildSessionContext()
+				.messages.flatMap((message) =>
+					message.role === "user"
+						? typeof message.content === "string"
+							? [message.content]
+							: message.content.flatMap((content) => (content.type === "text" ? [content.text] : []))
+						: [],
+				),
+		).toEqual(["commit before reentrant disposal"]);
 		expect(
 			harness.sessionManager
 				.buildSessionContext()
@@ -384,7 +437,7 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 
 		await harness.session.steer("first batch feedback", undefined, "contract-batch-first");
 		await harness.session.steer("second batch feedback", undefined, "contract-batch-second");
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		expect(harness.session.planningState.plan?.phase).toBe("draft");
 		expect(planningChangeCount(harness)).toBe(planningBaseline + 1);
@@ -426,23 +479,23 @@ describe("regression #206: coding-agent delivery transaction contract", () => {
 
 		await harness.session.steer("first partial feedback", undefined, "contract-partial-first");
 		await harness.session.steer("second partial feedback", undefined, "contract-partial-second");
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		expect(getUserTexts(harness)).toEqual(["first partial feedback"]);
 		expect(harness.sessionManager.getClientInput("contract-partial-first")).toMatchObject({ state: "completed" });
 		expect(harness.sessionManager.getClientInput("contract-partial-second")).toMatchObject({ state: "accepted" });
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.control.hasQueuedMessages()).toBe(true);
 		expect(harness.session.planningState.plan?.phase).toBe("draft");
 		expect(planningChangeCount(harness)).toBe(planningBaseline + 1);
 		expect(checkpointCount(harness)).toBe(checkpointBaseline + 1);
 		expect(harness.getPendingResponseCount()).toBe(1);
 
 		failSecondCommit = false;
-		await harness.session.agent.continue();
+		await harness.control.continue();
 
 		expect(getUserTexts(harness)).toEqual(["first partial feedback", "second partial feedback"]);
 		expect(harness.sessionManager.getClientInput("contract-partial-second")).toMatchObject({ state: "completed" });
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.control.hasQueuedMessages()).toBe(false);
 		expect(planningChangeCount(harness)).toBe(planningBaseline + 1);
 		expect(checkpointCount(harness)).toBe(checkpointBaseline + 1);
 		expect(harness.getPendingResponseCount()).toBe(0);

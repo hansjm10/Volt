@@ -2,7 +2,7 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import { Editor } from "../src/components/editor.ts";
-import { TUI } from "../src/tui.ts";
+import { TuiMainScreen } from "../src/index.ts";
 import { visibleWidth } from "../src/utils.ts";
 import { defaultEditorTheme } from "./test-themes.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
@@ -10,7 +10,7 @@ import { VirtualTerminal } from "./virtual-terminal.ts";
 describe("Editor frame", () => {
 	it("renders a responsive top-border label without changing the frame width", () => {
 		const width = 40;
-		const editor = new Editor(new TUI(new VirtualTerminal(width, 24)), defaultEditorTheme, {
+		const editor = new Editor(new TuiMainScreen(new VirtualTerminal(width, 24)), defaultEditorTheme, {
 			topBorderLabel: "ASK VOLT",
 		});
 
@@ -24,7 +24,7 @@ describe("Editor frame", () => {
 
 	it("updates and removes the top-border label", () => {
 		const width = 24;
-		const editor = new Editor(new TUI(new VirtualTerminal(width, 24)), defaultEditorTheme);
+		const editor = new Editor(new TuiMainScreen(new VirtualTerminal(width, 24)), defaultEditorTheme);
 
 		editor.setTopBorderLabel("SHELL");
 		assert.ok(stripVTControlCharacters(editor.render(width)[0]!).startsWith("╭─ SHELL "));
@@ -35,7 +35,7 @@ describe("Editor frame", () => {
 
 	it("shows the placeholder only while the editor is empty", () => {
 		const width = 40;
-		const editor = new Editor(new TUI(new VirtualTerminal(width, 24)), defaultEditorTheme, {
+		const editor = new Editor(new TuiMainScreen(new VirtualTerminal(width, 24)), defaultEditorTheme, {
 			placeholder: "Type a request or / for commands",
 		});
 

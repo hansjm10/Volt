@@ -153,7 +153,7 @@ export class JsonlSessionRepo implements JsonlSessionRepoApi {
 			},
 		);
 		for (const entry of forkedEntries) {
-			await storage.appendEntry(entry);
+			await storage.appendImportedEntry(entry);
 		}
 		return toSession(storage);
 	}

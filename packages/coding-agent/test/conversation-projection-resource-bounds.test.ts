@@ -93,7 +93,7 @@ function createRuntime(largePayload: string): AgentSessionRuntime {
 	return {
 		session: {
 			activeCompaction: undefined,
-			agent: { state: { pendingToolExecutions } },
+			activeToolExecutions: pendingToolExecutions,
 			getSteeringMessages: () =>
 				Array.from({ length: 3 }, (_, index) => ({
 					queueEntryId: `steering-${index}`,
@@ -401,11 +401,11 @@ describe("conversation projection resource bounds", () => {
 			tools.set(`tool-${index}`, { toolCallId: `tool-${index}`, toolName: "read", args: {} });
 		}
 		const session = runtime.session as unknown as {
-			agent: { state: { pendingToolExecutions: typeof tools } };
+			activeToolExecutions: typeof tools;
 			getSteeringMessages: () => typeof queue;
 			getFollowUpMessages: () => typeof queue;
 		};
-		session.agent.state.pendingToolExecutions = tools;
+		Object.defineProperty(session, "activeToolExecutions", { value: tools });
 		session.getSteeringMessages = () => queue;
 		session.getFollowUpMessages = () => queue;
 

@@ -87,7 +87,8 @@ describe("regression #213: AgentSession observer isolation", () => {
 	let harness: Harness | undefined;
 
 	afterEach(async () => {
-		await harness?.session.dispose();
+		harness?.session.dispose();
+		if (harness) await harness.session.waitForClosed();
 		harness?.cleanup();
 		harness = undefined;
 	});
@@ -136,7 +137,7 @@ describe("regression #213: AgentSession observer isolation", () => {
 		process.on("unhandledRejection", onUnhandledRejection);
 		const result = await (async () => {
 			try {
-				const runResult = await harness!.session.agent.prompt({
+				const runResult = await harness!.control.run({
 					role: "user",
 					content: [{ type: "text", text: "authoritative observer input" }],
 					timestamp: 213,
@@ -154,10 +155,10 @@ describe("regression #213: AgentSession observer isolation", () => {
 		expect(laterSubscriberEvents).toEqual(["delivery_start", "agent_end"]);
 		expect(laterSubscriberUserTexts).toEqual(["authoritative observer input", "authoritative observer input"]);
 		expect(getUserText(harness.sessionManager.buildSessionContext().messages)).toBe("authoritative observer input");
-		expect(getUserText(harness.session.agent.state.messages)).toBe("authoritative observer input");
+		expect(getUserText(harness.session.state.messages)).toBe("authoritative observer input");
 		expect(providerUserText).toBe("authoritative observer input");
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
-		expect(harness.session.agent.state.errorMessage).toBeUndefined();
+		expect(harness.control.hasQueuedMessages()).toBe(false);
+		expect(harness.session.state.errorMessage).toBeUndefined();
 		expect(harness.getPendingResponseCount()).toBe(0);
 		expect(unhandledRejections).toEqual([]);
 	});
@@ -462,14 +463,14 @@ describe("regression #213: AgentSession observer isolation", () => {
 		});
 		harness.setResponses([fauxAssistantMessage("must not run")]);
 
-		const result = await harness.session.agent.prompt({
+		const result = await harness.control.run({
 			role: "user",
 			content: [{ type: "text", text: "original" }],
 			timestamp: 213,
 		});
 
 		expect(result).toMatchObject({ status: "delivery_failed", failure: { outcome: "retained" } });
-		expect(harness.session.agent.hasPendingPrompt()).toBe(true);
+		expect(harness.control.hasPendingPrompt()).toBe(true);
 		expect(harness.getPendingResponseCount()).toBe(1);
 		expect(
 			harness.sessionManager

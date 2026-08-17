@@ -22,12 +22,19 @@ function isNativeModifiersHelper(value: unknown): value is NativeModifiersHelper
 function loadNativeModifiersHelper(): NativeModifiersHelper | undefined {
 	if (nativeModifiersHelper !== undefined) return nativeModifiersHelper ?? undefined;
 	nativeModifiersHelper = null;
-	if (process.platform !== "darwin") return undefined;
 	const arch = process.arch;
 	if (arch !== "x64" && arch !== "arm64") return undefined;
 
+	let nativePath: string;
+	if (process.platform === "darwin") {
+		nativePath = path.join("native", "darwin", "prebuilds", `darwin-${arch}`, "darwin-modifiers.node");
+	} else if (process.platform === "win32") {
+		nativePath = path.join("native", "win32", "prebuilds", `win32-${arch}`, "win32-console-mode.node");
+	} else {
+		return undefined;
+	}
+
 	const moduleDir = moduleUrl ? path.dirname(fileURLToPath(moduleUrl)) : path.dirname(process.execPath);
-	const nativePath = path.join("native", "darwin", "prebuilds", `darwin-${arch}`, "darwin-modifiers.node");
 	const candidates = [
 		path.join(moduleDir, "..", nativePath),
 		path.join(moduleDir, nativePath),
@@ -47,6 +54,10 @@ function loadNativeModifiersHelper(): NativeModifiersHelper | undefined {
 	}
 
 	return undefined;
+}
+
+export function hasNativeModifierSupport(): boolean {
+	return loadNativeModifiersHelper() !== undefined;
 }
 
 export function isNativeModifierPressed(key: ModifierKey): boolean {

@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@hansjm10/volt-agent-core";
-import type { AssistantMessage, Usage } from "@hansjm10/volt-ai";
-import { getModel } from "@hansjm10/volt-ai";
+import type { AssistantMessage, Tool, Usage } from "@hansjm10/volt-ai";
+import { estimateToolDefinitionTokens, fauxToolCall, getModel, Type } from "@hansjm10/volt-ai";
 import { readFileSync } from "fs";
 import { join } from "path";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -10,6 +10,7 @@ import {
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
+	estimateMessagesTokens,
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
@@ -286,6 +287,74 @@ describe("findCutPoint", () => {
 		expect(result.firstKeptEntryIndex).toBe(0);
 	});
 
+	it("excludes an independently cuttable message that would exceed the budget", () => {
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("a".repeat(2400))),
+			createMessageEntry(createUserMessage("b".repeat(2400))),
+		];
+
+		const result = findCutPoint(entries, 0, entries.length, 1000);
+
+		expect(result.firstKeptEntryIndex).toBe(1);
+		expect(estimateMessagesTokens([(entries[1] as SessionMessageEntry).message])).toBe(600);
+	});
+
+	it("counts and excludes crossing persisted custom and branch-summary context", () => {
+		const branchSummary: SessionEntry = {
+			type: "branch_summary",
+			id: "branch-summary-id",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			fromId: "source-branch-id",
+			summary: "a".repeat(2400),
+		};
+		const customMessage: SessionEntry = {
+			type: "custom_message",
+			id: "custom-message-id",
+			parentId: branchSummary.id,
+			timestamp: new Date().toISOString(),
+			customType: "budget-test",
+			content: "b".repeat(2400),
+			display: false,
+		};
+		const user = { ...createMessageEntry(createUserMessage("c".repeat(2400))), parentId: customMessage.id };
+		const entries = [branchSummary, customMessage, user];
+
+		const result = findCutPoint(entries, 0, entries.length, 1000);
+
+		expect(result.firstKeptEntryIndex).toBe(2);
+		expect(entries[result.firstKeptEntryIndex].id).toBe(user.id);
+	});
+
+	it("keeps an oversized newest assistant and tool-result batch atomic", () => {
+		const toolCall = fauxToolCall("read", { path: "large.txt" });
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("older context")),
+			createMessageEntry({
+				...createAssistantMessage(""),
+				content: [toolCall],
+				stopReason: "toolUse",
+			}),
+			createMessageEntry({
+				role: "toolResult",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				content: [{ type: "text", text: "x".repeat(2400) }],
+				isError: false,
+				timestamp: Date.now(),
+			}),
+		];
+
+		const result = findCutPoint(entries, 0, entries.length, 500);
+		const retainedMessages = entries
+			.slice(result.firstKeptEntryIndex)
+			.map((entry) => (entry as SessionMessageEntry).message);
+
+		expect(result.firstKeptEntryIndex).toBe(1);
+		expect(retainedMessages.map((message) => message.role)).toEqual(["assistant", "toolResult"]);
+		expect(estimateMessagesTokens(retainedMessages)).toBeGreaterThan(500);
+	});
+
 	it("should indicate split turn when cutting at assistant message", () => {
 		// Create a scenario where we cut at an assistant message mid-turn
 		const entries: SessionEntry[] = [
@@ -392,6 +461,66 @@ describe("buildSessionContext", () => {
 		// model_change is later overwritten by assistant message's model info
 		expect(loaded.model).toEqual({ provider: "anthropic", modelId: "claude-sonnet-4-5" });
 		expect(loaded.thinkingLevel).toBe("high");
+	});
+});
+
+describe("prepareCompaction context budget", () => {
+	it("splits an over-budget request from its trailing overflow error", () => {
+		const request = createMessageEntry(createUserMessage("recover from overflow"));
+		const overflow = createMessageEntry({
+			...createAssistantMessage("", createMockUsage(0, 0)),
+			stopReason: "error",
+			errorMessage: "prompt is too long",
+		});
+		const settings: CompactionSettings = {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1,
+		};
+
+		const preparation = prepareCompaction([request, overflow], settings);
+
+		expect(preparation).toMatchObject({
+			firstKeptEntryId: overflow.id,
+			isSplitTurn: true,
+			messagesToSummarize: [],
+		});
+		expect(preparation?.turnPrefixMessages).toEqual([request.message]);
+	});
+
+	it("reduces retained messages and counts active tools when provider usage is unavailable", () => {
+		const entries = Array.from({ length: 5 }, (_, index) =>
+			createMessageEntry(createUserMessage(String(index).repeat(4000))),
+		);
+		const settings: CompactionSettings = {
+			...DEFAULT_COMPACTION_SETTINGS,
+			reserveTokens: 1000,
+			keepRecentTokens: 4000,
+		};
+		const largeTool: Tool = {
+			name: "large_tool",
+			description: "x".repeat(16_000),
+			parameters: Type.Object({}),
+		};
+		const contextWindow = 8000;
+
+		const withoutTools = prepareCompaction(entries, settings);
+		const withTools = prepareCompaction(entries, settings, { tools: [largeTool], contextWindow });
+
+		expect(withoutTools).toBeDefined();
+		expect(withTools).toBeDefined();
+		const withoutToolsStart = entries.findIndex((entry) => entry.id === withoutTools!.firstKeptEntryId);
+		const withToolsStart = entries.findIndex((entry) => entry.id === withTools!.firstKeptEntryId);
+		expect(withToolsStart).toBeGreaterThan(withoutToolsStart);
+		const retainedMessages = entries.slice(withToolsStart).map((entry) => entry.message);
+		const retainedMessageBudget = Math.min(
+			settings.keepRecentTokens,
+			contextWindow - settings.reserveTokens - estimateToolDefinitionTokens([largeTool]),
+		);
+		expect(estimateMessagesTokens(retainedMessages)).toBeLessThanOrEqual(retainedMessageBudget);
+		expect(withTools!.tokensBefore).toBe(
+			estimateContextTokens(buildSessionContext(entries).messages, [largeTool]).tokens,
+		);
+		expect(withTools!.tokensBefore - withoutTools!.tokensBefore).toBe(estimateToolDefinitionTokens([largeTool]));
 	});
 });
 

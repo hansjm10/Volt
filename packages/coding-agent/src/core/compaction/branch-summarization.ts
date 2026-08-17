@@ -68,7 +68,7 @@ export interface GenerateBranchSummaryOptions {
 	/** Model to use for summarization */
 	model: Model<any>;
 	/** API key for the model */
-	apiKey: string;
+	apiKey?: string;
 	/** Request headers for the model */
 	headers?: Record<string, string>;
 	/** Provider-scoped environment values for the model */
@@ -353,7 +353,13 @@ export async function generateBranchSummary(
 	// request behavior (timeouts, retries, attribution headers) stays consistent
 	// without running through agent state/events.
 	const context = { systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages };
-	const requestOptions: SimpleStreamOptions = { apiKey, headers, env, signal, maxTokens: maxOutputTokens };
+	const requestOptions: SimpleStreamOptions = {
+		...(apiKey === undefined ? {} : { apiKey }),
+		...(headers === undefined ? {} : { headers }),
+		...(env === undefined ? {} : { env }),
+		signal,
+		maxTokens: maxOutputTokens,
+	};
 	const response = streamFn
 		? await (await streamFn(model, context, requestOptions)).result()
 		: await completeSimple(model, context, requestOptions);

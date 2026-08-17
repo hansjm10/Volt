@@ -9,6 +9,7 @@ import type { ExtensionFactory } from "../src/core/sdk.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createAgentSessionTestControl } from "./agent-session-test-control.ts";
 
 describe("AgentSession dynamic provider registration", () => {
 	let tempDir: string;
@@ -56,10 +57,10 @@ describe("AgentSession dynamic provider registration", () => {
 		session: Awaited<ReturnType<typeof createSession>>,
 	): Promise<string | undefined> {
 		let baseUrl: string | undefined;
-		session.agent.streamFn = async (model) => {
+		createAgentSessionTestControl(session).setStreamFn(async (model) => {
 			baseUrl = model.baseUrl;
 			throw new Error("stop");
-		};
+		});
 		await session.prompt("hello");
 		return baseUrl;
 	}

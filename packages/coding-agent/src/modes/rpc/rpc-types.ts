@@ -60,6 +60,8 @@ export type {
 	RpcReviewWorkflowResultResponse,
 	RpcSessionListItem,
 	RpcSessionState,
+	RpcSessionTreeNode,
+	RpcSessionTreePage,
 	RpcSlashCommand,
 	RpcSubagentDefinition,
 	RpcSubagentDefinitionSource,

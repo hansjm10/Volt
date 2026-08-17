@@ -2,7 +2,7 @@
  * TUI config selector for `volt config` command
  */
 
-import { ProcessTerminal, TUI } from "@hansjm10/volt-tui";
+import { ProcessTerminal, TuiMainScreen } from "@hansjm10/volt-tui";
 import type { ResolvedPaths } from "../core/package-manager.ts";
 import type { SettingsManager } from "../core/settings-manager.ts";
 import { initTheme, stopThemeWatcher } from "../core/theme/runtime.ts";
@@ -21,7 +21,7 @@ export async function selectConfig(options: ConfigSelectorOptions): Promise<void
 	initTheme(options.settingsManager.getTheme(), true);
 
 	return new Promise((resolve) => {
-		const ui = new TUI(new ProcessTerminal());
+		const ui = new TuiMainScreen(new ProcessTerminal());
 		let resolved = false;
 
 		const selector = new ConfigSelectorComponent(

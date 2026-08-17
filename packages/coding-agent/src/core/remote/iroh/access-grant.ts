@@ -148,6 +148,7 @@ const BASELINE_COMMANDS = new Set(["register_push_target"]);
 const OBSERVE_COMMANDS = new Set([
 	"get_state",
 	"get_transcript",
+	"get_session_tree",
 	"get_review_result",
 	"list_review_workflows",
 	"report_stream_discontinuity",
@@ -175,6 +176,9 @@ const CONTROL_COMMANDS = new Set([
 	"invoke_ui_action",
 	"cancel_workflow",
 	"open_review_session",
+	"record_review_finding_outcome",
+	"rerun_review",
+	"publish_review",
 	"extension_ui_response",
 ]);
 const MCP_COMMANDS = new Set([

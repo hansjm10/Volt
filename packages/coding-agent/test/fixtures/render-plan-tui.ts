@@ -1,5 +1,4 @@
-import { Editor } from "@hansjm10/volt-tui";
-import { TUI } from "../../../tui/src/tui.ts";
+import { Editor, TuiMainScreen } from "@hansjm10/volt-tui";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
 import type { PlanningState, PlanState } from "../../src/core/planning.ts";
 import { getEditorTheme, initTheme, theme } from "../../src/core/theme/runtime.ts";
@@ -44,7 +43,7 @@ const plan: PlanState = {
 };
 
 const planning: PlanningState = { mode: "plan", plan };
-const tui = new TUI(new VirtualTerminal(width, height));
+const tui = new TuiMainScreen(new VirtualTerminal(width, height));
 const details = new PlanDetailsComponent({
 	plan,
 	getTerminalRows: () => height,

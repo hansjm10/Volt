@@ -14,6 +14,7 @@ type ShutdownThis = {
 	runtimeHost: { dispose: () => Promise<void> };
 	ui: { terminal: { drainInput: (ms: number) => Promise<void> } };
 	stop: () => void;
+	flushStdout: () => Promise<void>;
 	settingsManager: { rememberActiveProfile: () => void; flush: () => Promise<void> };
 	releaseDaemonLeaseOnQuit: () => Promise<void>;
 	closeLspTrace: () => Promise<void>;
@@ -80,6 +81,7 @@ describe("InteractiveMode SIGTERM shutdown with signal-exit (#5724)", () => {
 			stop: vi.fn(() => {
 				order.push("stop");
 			}),
+			flushStdout: vi.fn(async () => {}),
 			settingsManager: {
 				rememberActiveProfile: vi.fn(),
 				flush: vi.fn(async () => {}),

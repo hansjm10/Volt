@@ -15,9 +15,10 @@ describe("GPT-5.6 thinking level metadata", () => {
 		expect(clampThinkingLevel(model, "minimal")).toBe("low");
 	});
 
-	it("keeps the Codex GPT-5.6 Sol minimal-to-low provider mapping", () => {
+	it("keeps the Codex GPT-5.6 Sol metadata", () => {
 		const model = getModel("openai-codex", "gpt-5.6-sol");
 
+		expect(model.contextWindow).toBe(1_000_000);
 		expect(model.thinkingLevelMap?.minimal).toBe("low");
 		expect(clampThinkingLevel(model, "minimal")).toBe("minimal");
 	});

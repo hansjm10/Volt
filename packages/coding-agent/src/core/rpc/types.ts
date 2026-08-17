@@ -28,6 +28,8 @@ import type {
 	RpcConversationTranscriptPageSchema,
 	RpcConversationWorkflowSnapshotSchema,
 	RpcQueueUpdateEventSchema,
+	RpcSessionTreeNodeSchema,
+	RpcSessionTreePageSchema,
 	RpcTranscriptEntryEventSchema,
 } from "./schema/conversation.ts";
 import type {
@@ -75,6 +77,10 @@ import type {
 } from "./schema/primitives.ts";
 import type {
 	RpcProjectionCollectionTruncationSchema,
+	RpcReviewCompletionStatusSchema,
+	RpcReviewCorrectnessSchema,
+	RpcReviewFindingStatusSchema,
+	RpcReviewRunStatusSchema,
 	RpcReviewWorkflowDescriptorSchema,
 	RpcReviewWorkflowLifecycleStatusSchema,
 	RpcReviewWorkflowListResponseSchema,
@@ -242,6 +248,10 @@ export type RpcWorkflowToolEvent = Static<typeof RpcWorkflowToolEventSchema>;
 // ============================================================================
 
 export type RpcReviewWorkflowLifecycleStatus = Static<typeof RpcReviewWorkflowLifecycleStatusSchema>;
+export type RpcReviewRunStatus = Static<typeof RpcReviewRunStatusSchema>;
+export type RpcReviewCompletionStatus = Static<typeof RpcReviewCompletionStatusSchema>;
+export type RpcReviewCorrectness = Static<typeof RpcReviewCorrectnessSchema>;
+export type RpcReviewFindingStatus = Static<typeof RpcReviewFindingStatusSchema>;
 export type RpcReviewWorkflowDescriptor = Static<typeof RpcReviewWorkflowDescriptorSchema>;
 export type RpcReviewWorkflowResultResponse = Static<typeof RpcReviewWorkflowResultResponseSchema>;
 export type RpcReviewWorkflowListResponse = Static<typeof RpcReviewWorkflowListResponseSchema>;
@@ -347,6 +357,8 @@ export type RpcConversationActiveAssistant = Static<typeof RpcConversationActive
 export type RpcConversationTranscriptItem = Static<typeof RpcConversationTranscriptItemSchema>;
 export type RpcConversationAssistantPart = Static<typeof RpcConversationAssistantPartSchema>;
 export type RpcConversationTranscriptPage = Static<typeof RpcConversationTranscriptPageSchema>;
+export type RpcSessionTreeNode = Static<typeof RpcSessionTreeNodeSchema>;
+export type RpcSessionTreePage = Static<typeof RpcSessionTreePageSchema>;
 export type RpcConversationWorkflowSnapshot = Static<typeof RpcConversationWorkflowSnapshotSchema>;
 export type RpcConversationBootstrapEvent = Static<typeof RpcConversationBootstrapEventSchema>;
 

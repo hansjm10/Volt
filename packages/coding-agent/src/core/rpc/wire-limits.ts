@@ -111,6 +111,15 @@ export const REMOTE_TRANSCRIPT_DEFAULT_MAX_SERIALIZED_BYTES = 2 * 1024 * 1024;
 export const IROH_REMOTE_TRANSCRIPT_TEXT_MAX_SCALARS = 12_000;
 
 // ============================================================================
+// Session-tree paging
+// ============================================================================
+
+export const RPC_SESSION_TREE_PAGE_DEFAULT_ITEMS = 100;
+export const RPC_SESSION_TREE_PAGE_MAX_ITEMS = 200;
+/** Serialized budget for one local or remote session-tree page. */
+export const RPC_SESSION_TREE_MAX_SERIALIZED_BYTES = 2 * 1024 * 1024;
+
+// ============================================================================
 // Message-image recovery paging (get_message_images)
 // ============================================================================
 

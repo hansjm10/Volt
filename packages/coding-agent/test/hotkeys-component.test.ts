@@ -32,6 +32,8 @@ describe("HotkeysComponent", () => {
 		expect(text).toContain("1–12/13");
 		expect(text).toContain("NAVIGATION");
 		expect(text).toContain("close");
+		expect(text).toContain("scroll");
+		expect(text).toContain("page");
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(80);
 		}
