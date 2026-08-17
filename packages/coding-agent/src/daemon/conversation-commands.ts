@@ -1487,6 +1487,10 @@ export function createRemoteGetSessionTreeRpcResponse(
 	return createRpcSuccessResponse(id, "get_session_tree", page);
 }
 
+function getRemoteRecoverableEntries(runtime: ConversationCommandRuntime): SessionEntry[] {
+	return runtime.session.sessionManager.getEntries?.() ?? runtime.session.sessionManager.getBranch();
+}
+
 /**
  * The unbounded sanitized long-form text lane of one transcript entry — the
  * same composition the transcript projection truncates. Assistant entries
@@ -1562,7 +1566,7 @@ export function createRemoteGetTranscriptEntryTextRpcResponse(
 		}
 		offset = command.offset;
 	}
-	const entry = runtime.session.sessionManager.getBranch().find((candidate) => candidate.id === command.entryId);
+	const entry = getRemoteRecoverableEntries(runtime).find((candidate) => candidate.id === command.entryId);
 	const canonicalText = entry === undefined ? undefined : getRemoteTranscriptEntryCanonicalText(entry, authorization);
 	if (canonicalText === undefined) {
 		return createIrohRemoteRpcErrorResponse(id, "get_transcript_entry_text", "unknown_entry");
@@ -1605,7 +1609,7 @@ export function createRemoteGetMessageImagesRpcResponse(
 		}
 		startImageIndex = command.startImageIndex;
 	}
-	const result = projectMessageImages(runtime.session.sessionManager.getBranch(), command.entryId, startImageIndex);
+	const result = projectMessageImages(getRemoteRecoverableEntries(runtime), command.entryId, startImageIndex);
 	if (!result.ok) {
 		return createIrohRemoteRpcErrorResponse(id, "get_message_images", result.error);
 	}

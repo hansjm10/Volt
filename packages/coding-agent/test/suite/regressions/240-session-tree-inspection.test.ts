@@ -7,12 +7,15 @@ import {
 } from "../../../src/core/remote/iroh/access-grant.ts";
 import type { IrohRemoteClientAuthorizationSuccess } from "../../../src/core/remote/iroh/authorization.ts";
 import { getStaticIrohRemoteRpcFilterResult } from "../../../src/core/remote/iroh/rpc-command-filter.ts";
+import { IROH_REMOTE_TRANSCRIPT_TEXT_MAX_SCALARS } from "../../../src/core/remote/iroh/transcript-text.ts";
 import { projectSessionTreePage } from "../../../src/core/rpc/session-tree.ts";
 import { projectConversationTranscriptItems } from "../../../src/core/rpc/transcript.ts";
 import type { RpcSessionTreePage } from "../../../src/core/rpc/types.ts";
 import {
 	type ConversationCommandRuntime,
+	createRemoteGetMessageImagesRpcResponse,
 	createRemoteGetSessionTreeRpcResponse,
+	createRemoteGetTranscriptEntryTextRpcResponse,
 } from "../../../src/daemon/conversation-commands.ts";
 import { createHarness } from "../harness.ts";
 
@@ -136,6 +139,87 @@ test("get_session_tree pages sanitized branch topology without raw session entri
 				.sort(),
 		);
 		expect(Object.keys(local.nodes[0]!).sort()).toEqual(Object.keys(first.nodes[0]!).sort());
+	} finally {
+		harness.cleanup();
+	}
+});
+
+test("inactive tree-node continuation metadata remains recoverable", async () => {
+	const harness = await createHarness();
+	try {
+		const rootId = harness.sessionManager.appendMessage({ role: "user", content: "root", timestamp: 1 });
+		const longText = `${"x".repeat(IROH_REMOTE_TRANSCRIPT_TEXT_MAX_SCALARS)}END`;
+		const inactiveId = harness.sessionManager.appendMessage({
+			role: "user",
+			content: [
+				{ type: "text", text: longText },
+				{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+			],
+			timestamp: 2,
+		});
+		harness.sessionManager.branch(rootId);
+		harness.sessionManager.appendMessage(assistantMessage("active branch", 3));
+
+		const runtime: ConversationCommandRuntime = {
+			session: {
+				sessionId: harness.sessionManager.getSessionId(),
+				sessionManager: harness.sessionManager,
+			},
+			listSessions: async () => [],
+		};
+		const authorization = createAuthorization(harness.tempDir);
+		const tree = getSuccessfulTree(
+			createRemoteGetSessionTreeRpcResponse({ id: "tree", type: "get_session_tree" }, authorization, runtime),
+		);
+		expect(tree.nodes.find((node) => node.entryId === inactiveId)).toMatchObject({
+			activeBranch: false,
+			transcript: { entryId: inactiveId, truncated: true, imageCount: 1 },
+		});
+
+		const firstText = createRemoteGetTranscriptEntryTextRpcResponse(
+			{ id: "text-1", type: "get_transcript_entry_text", entryId: inactiveId },
+			authorization,
+			runtime,
+		) as {
+			success: boolean;
+			data: { entryId: string; text: string; truncated: boolean; nextOffset: number | null };
+		};
+		expect(firstText.success).toBe(true);
+		expect(firstText.data).toMatchObject({
+			entryId: inactiveId,
+			text: "x".repeat(IROH_REMOTE_TRANSCRIPT_TEXT_MAX_SCALARS),
+			truncated: true,
+			nextOffset: IROH_REMOTE_TRANSCRIPT_TEXT_MAX_SCALARS,
+		});
+		const remainingText = createRemoteGetTranscriptEntryTextRpcResponse(
+			{
+				id: "text-2",
+				type: "get_transcript_entry_text",
+				entryId: inactiveId,
+				offset: firstText.data.nextOffset,
+			},
+			authorization,
+			runtime,
+		) as { success: boolean; data: { text: string; truncated: boolean; nextOffset: number | null } };
+		expect(remainingText).toMatchObject({
+			success: true,
+			data: { text: "END", truncated: false, nextOffset: null },
+		});
+
+		const images = createRemoteGetMessageImagesRpcResponse(
+			{ id: "images", type: "get_message_images", entryId: inactiveId },
+			authorization,
+			runtime,
+		);
+		expect(images).toMatchObject({
+			success: true,
+			data: {
+				entryId: inactiveId,
+				totalImages: 1,
+				images: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png", index: 0 }],
+				nextImageIndex: null,
+			},
+		});
 	} finally {
 		harness.cleanup();
 	}
