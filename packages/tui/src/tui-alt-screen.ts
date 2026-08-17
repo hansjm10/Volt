@@ -16,6 +16,7 @@ import {
 	renderLayoutFrame,
 	type ScrollbarGeometry,
 } from "./layout.ts";
+import { getImagePlacements, preserveImagePlacements, sliceRenderLines } from "./render-frame.ts";
 import type { Terminal } from "./terminal.ts";
 import {
 	deleteAllKittyImages,
@@ -1222,7 +1223,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			}
 			result[row] = line;
 		}
-		return result;
+		return preserveImagePlacements(screen, result);
 	}
 
 	private applySelectionHighlight(text: string): string {
@@ -1271,7 +1272,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 				},
 			};
 		}
-		return screen.map((line, row) => {
+		const result = screen.map((line, row) => {
 			if (
 				row < minRow ||
 				row > maxRow ||
@@ -1289,6 +1290,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			const after = sliceByColumn(line, columns.end, Math.max(0, lineWidth - columns.end), true);
 			return `${before}${this.applySelectionHighlight(selected)}${after}`;
 		});
+		return preserveImagePlacements(screen, result);
 	}
 
 	private isMouseSequence(data: string): boolean {
@@ -1306,15 +1308,14 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			if (flashWidth === 0) continue;
 			result[row] = compositeTuiLine(result[row] ?? "", line, width - flashWidth, flashWidth, width);
 		}
-		return result;
+		return preserveImagePlacements(screen, result);
 	}
 
-	private changedRowsIntersectSixelImage(screen: readonly string[], otherScreen: readonly string[]): boolean {
-		for (let anchorRow = 0; anchorRow < screen.length; anchorRow++) {
-			const metadata = getSixelImageMetadata(screen[anchorRow] ?? "");
-			if (!metadata) continue;
-			const endRow = Math.min(screen.length, anchorRow + metadata.rows);
-			for (let row = anchorRow; row < endRow; row++) {
+	private changedRowsIntersectSixelImage(screen: string[], otherScreen: readonly string[]): boolean {
+		for (const image of getImagePlacements(screen)) {
+			if (image.protocol !== "sixel") continue;
+			const endRow = Math.min(screen.length, image.top + image.rows);
+			for (let row = image.top; row < endRow; row++) {
 				if (screen[row] !== otherScreen[row]) return true;
 			}
 		}
@@ -1330,19 +1331,26 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		if (this.refreshSearch(nextLayout)) {
 			nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender());
 		}
-		let screen = nextLayout.lines.map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
+		let screen = preserveImagePlacements(
+			nextLayout.lines,
+			nextLayout.lines.map((line) => line.replace(OSC133_ZONE_PREFIX, "")),
+		);
 		screen = this.applySearchHighlights(screen, nextLayout);
 		screen = this.compositeOverlays(screen, width, height);
-		if (screen.length > height) screen = screen.slice(screen.length - height);
+		if (screen.length > height) screen = sliceRenderLines(screen, screen.length - height);
 		screen = this.applySelection(screen, nextLayout);
 		screen = this.compositeFlashes(screen, width, height);
 		this.recordGeneratedLines(screen.length);
 
 		const cursorPos = this.extractCursorPosition(screen, height);
-		screen = this.applyLineResets(screen).map((line) => {
-			if (isImageLine(line) || visibleWidth(line) <= width) return line;
-			return sliceByColumn(line, 0, width, true);
-		});
+		const resetScreen = this.applyLineResets(screen);
+		screen = preserveImagePlacements(
+			resetScreen,
+			resetScreen.map((line) => {
+				if (isImageLine(line) || visibleWidth(line) <= width) return line;
+				return sliceByColumn(line, 0, width, true);
+			}),
+		);
 
 		const fullRedraw =
 			this.previousScreen.length === 0 || this.previousScreenWidth !== width || this.previousScreenHeight !== height;

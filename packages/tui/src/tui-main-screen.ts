@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { getImagePlacements, type ImagePlacement } from "./render-frame.ts";
 import { deleteKittyImage, getImageMetadata, isImageLine } from "./terminal-image.ts";
 import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import { visibleWidth } from "./utils.ts";
@@ -53,6 +54,7 @@ export interface TuiMainScreenRenderState {
 export class TuiMainScreen extends TuiBase implements TUI {
 	readonly mode = "regular" as const;
 	private previousLines: string[] = [];
+	private previousImages: ImagePlacement[] = [];
 	private previousKittyImageIds = new Set<number>();
 	private previousWidth = 0;
 	private previousHeight = 0;
@@ -75,6 +77,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 	restoreRenderState(state: TuiMainScreenRenderState): void {
 		this.previousLines = state.previousLines.map((line) => (isImageLine(line) ? "" : line));
+		this.previousImages = [];
 		this.previousKittyImageIds = new Set();
 		this.previousWidth = state.previousWidth;
 		this.previousHeight = state.previousHeight;
@@ -86,6 +89,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 	protected override resetRenderState(): void {
 		this.previousLines = [];
+		this.previousImages = [];
 		this.previousWidth = -1;
 		this.previousHeight = -1;
 		this.cursorRow = 0;
@@ -139,23 +143,22 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private expandChangedRangeForImages(
 		firstChanged: number,
 		lastChanged: number,
-		newLines: string[],
+		newImages: readonly ImagePlacement[],
+		maxLine: number,
 	): { firstChanged: number; lastChanged: number } {
 		let expandedFirstChanged = firstChanged;
 		let expandedLastChanged = lastChanged;
-		const expandForLines = (lines: string[]): void => {
-			for (const [i, line] of lines.entries()) {
-				if (!getImageMetadata(line) && extractKittyImageIds(line).length === 0) continue;
-				const blockEnd = i + this.getImageReservedRows(lines, i) - 1;
-				if (i >= firstChanged || (i <= lastChanged && blockEnd >= firstChanged)) {
-					expandedFirstChanged = Math.min(expandedFirstChanged, i);
-					expandedLastChanged = Math.max(expandedLastChanged, blockEnd);
-				}
+		const expandForImages = (images: readonly ImagePlacement[]): void => {
+			for (const image of images) {
+				const blockEnd = Math.min(maxLine, image.top + image.rows - 1);
+				if (blockEnd < firstChanged) continue;
+				expandedFirstChanged = Math.min(expandedFirstChanged, image.top);
+				expandedLastChanged = Math.max(expandedLastChanged, blockEnd);
 			}
 		};
 
-		expandForLines(this.previousLines);
-		expandForLines(newLines);
+		expandForImages(this.previousImages);
+		expandForImages(newImages);
 		return { firstChanged: expandedFirstChanged, lastChanged: expandedLastChanged };
 	}
 
@@ -196,6 +199,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (this.hasOverlayEntries) {
 			newLines = this.compositeOverlays(newLines, width, height);
 		}
+		const newImages = getImagePlacements(newLines);
 		this.recordGeneratedLines(newLines.length);
 
 		// Extract cursor position before applying line resets (marker must be found first)
@@ -243,6 +247,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			this.previousViewportTop = Math.max(0, bufferLength - height);
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
+			this.previousImages = newImages;
 			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
@@ -312,7 +317,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			lastChanged = newLines.length - 1;
 		}
 		if (firstChanged !== -1) {
-			const expandedRange = this.expandChangedRangeForImages(firstChanged, lastChanged, newLines);
+			const expandedRange = this.expandChangedRangeForImages(firstChanged, lastChanged, newImages, maxLines - 1);
 			firstChanged = expandedRange.firstChanged;
 			lastChanged = expandedRange.lastChanged;
 		}
@@ -368,6 +373,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			}
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
+			this.previousImages = newImages;
 			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
@@ -380,25 +386,27 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// active portion. Keep skipped rows at their last painted values so they remain dirty
 		// if a later resize brings them back into the active viewport.
 		let nextPreviousLines = newLines;
+		let nextPreviousImages = newImages;
 		if (firstChanged < prevViewportTop) {
-			let changedRangeContainsKittyImage = false;
-			for (let i = firstChanged; i <= lastChanged; i++) {
-				if (isImageLine(this.previousLines[i] ?? "") || isImageLine(newLines[i] ?? "")) {
-					changedRangeContainsKittyImage = true;
-					break;
-				}
-			}
-			if (newLines.length !== this.previousLines.length || changedRangeContainsKittyImage) {
+			const changedRangeContainsImage = [...this.previousImages, ...newImages].some(
+				(image) => image.top <= lastChanged && image.top + image.rows - 1 >= firstChanged,
+			);
+			if (newLines.length !== this.previousLines.length || changedRangeContainsImage) {
 				logRedraw(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
 				fullRender(true);
 				return;
 			}
 
 			nextPreviousLines = [...this.previousLines.slice(0, prevViewportTop), ...newLines.slice(prevViewportTop)];
+			nextPreviousImages = [
+				...this.previousImages.filter((image) => image.top < prevViewportTop),
+				...newImages.filter((image) => image.top >= prevViewportTop),
+			];
 			firstChanged = prevViewportTop;
 			if (firstChanged > lastChanged) {
 				this.positionHardwareCursor(cursorPos, newLines.length);
 				this.previousLines = nextPreviousLines;
+				this.previousImages = nextPreviousImages;
 				this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 				this.previousWidth = width;
 				this.previousHeight = height;
@@ -562,6 +570,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.positionHardwareCursor(cursorPos, newLines.length);
 
 		this.previousLines = nextPreviousLines;
+		this.previousImages = nextPreviousImages;
 		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 		this.previousWidth = width;
 		this.previousHeight = height;

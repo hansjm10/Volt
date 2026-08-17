@@ -2,6 +2,7 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import { encode } from "fast-png";
 import { HStack } from "../src/components/h-stack.ts";
+import { Image } from "../src/components/image.ts";
 import { ScrollView } from "../src/components/scroll-view.ts";
 import { Text } from "../src/components/text.ts";
 import { VStack } from "../src/components/v-stack.ts";
@@ -46,6 +47,17 @@ function assertImageWithRightSibling(imageLine: string): void {
 		assert.ok(getImageMetadata(line));
 		assert.strictEqual(stripTerminalSequences(line).trimEnd(), "      right");
 	}
+}
+
+function renderHStackTopCrop(image: Image): string {
+	const row = new HStack([
+		{ component: image, basis: 6, shrink: 0 },
+		{ component: new Text("one\ntwo\nthree\nfour", 0, 0), basis: 6, shrink: 0 },
+	]);
+	const scrollView = new ScrollView(row);
+	renderLayoutFrame(scrollView, 12, 2, () => {});
+	scrollView.scrollTo(2);
+	return renderLayoutFrame(scrollView, 12, 2, () => {}).lines[0] ?? "";
 }
 
 function renderInsetTopCrop(imageLine: string): string {
@@ -387,6 +399,57 @@ describe("viewport layout", () => {
 			});
 			assert.ok(croppedLine.includes('"1;1;2;8'));
 			assert.strictEqual(stripTerminalSequences(croppedLine).trimEnd(), "L        R");
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	it("keeps a top-cropped Kitty image beside multiline HStack text", () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 1, heightPx: 1 });
+		try {
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ maxWidthCells: 2, maxHeightCells: 4 },
+				{ widthPx: 2, heightPx: 4 },
+			);
+			const croppedLine = renderHStackTopCrop(image);
+			assert.ok(getImageMetadata(croppedLine));
+			assert.ok(croppedLine.includes("y=2,h=2,r=2"));
+			assert.strictEqual(stripTerminalSequences(croppedLine).trimEnd(), "      three");
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	it("keeps a top-cropped Sixel image beside multiline HStack text", () => {
+		setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 1, heightPx: 1 });
+		try {
+			const image = new Image(
+				solidPngBase64(2, 4),
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ maxWidthCells: 2, maxHeightCells: 4 },
+				{ widthPx: 2, heightPx: 4 },
+			);
+			const croppedLine = renderHStackTopCrop(image);
+			const metadata = getImageMetadata(croppedLine);
+			assert.ok(metadata && "sourceY" in metadata);
+			assert.deepStrictEqual(
+				{
+					columns: metadata.columns,
+					rows: metadata.rows,
+					sourceY: metadata.sourceY,
+					sourceHeight: metadata.sourceHeight,
+				},
+				{ columns: 2, rows: 2, sourceY: 2, sourceHeight: 2 },
+			);
+			assert.strictEqual(stripTerminalSequences(croppedLine).trimEnd(), "      three");
 		} finally {
 			resetCapabilitiesCache();
 			setCellDimensions({ widthPx: 9, heightPx: 18 });

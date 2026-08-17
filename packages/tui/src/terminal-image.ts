@@ -40,16 +40,23 @@ export interface ImageRenderOptions {
 }
 
 let cachedCapabilities: TerminalCapabilities | null = null;
+let imageRenderGeneration = 0;
 
 // Default cell dimensions - updated by TUI when terminal responds to query
 let cellDimensions: CellDimensions = { widthPx: 9, heightPx: 18 };
+
+export function getImageRenderGeneration(): number {
+	return imageRenderGeneration;
+}
 
 export function getCellDimensions(): CellDimensions {
 	return cellDimensions;
 }
 
 export function setCellDimensions(dims: CellDimensions): void {
+	if (cellDimensions.widthPx === dims.widthPx && cellDimensions.heightPx === dims.heightPx) return;
 	cellDimensions = dims;
+	imageRenderGeneration++;
 }
 
 /**
@@ -153,12 +160,21 @@ export function getCapabilities(): TerminalCapabilities {
 export function resetCapabilitiesCache(): void {
 	if (cachedCapabilities?.images === "sixel") clearSixelImages();
 	cachedCapabilities = null;
+	imageRenderGeneration++;
 }
 
 /** Override the cached capabilities. Useful in tests to exercise both code paths. */
 export function setCapabilities(caps: TerminalCapabilities): void {
 	if (cachedCapabilities?.images === "sixel" && caps.images !== "sixel") clearSixelImages();
+	if (
+		cachedCapabilities?.images === caps.images &&
+		cachedCapabilities.trueColor === caps.trueColor &&
+		cachedCapabilities.hyperlinks === caps.hyperlinks
+	) {
+		return;
+	}
 	cachedCapabilities = caps;
+	imageRenderGeneration++;
 }
 
 /** Enable negotiated Sixel support when Windows Terminal reports DA1 attribute 4. */
@@ -352,6 +368,7 @@ export function clearSixelImages(): void {
 	registeredSixelBytes = 0;
 	cachedSixelCropBytes = 0;
 	cachedSixelCropCount = 0;
+	imageRenderGeneration++;
 }
 
 export function getSixelRegistryStats(): {

@@ -1,8 +1,10 @@
+import { type ImagePlacement, setImagePlacements } from "../render-frame.ts";
 import {
 	allocateImageId,
 	getCapabilities,
 	getCellDimensions,
 	getImageDimensions,
+	getImageRenderGeneration,
 	type ImageDimensions,
 	imageFallback,
 	releaseSixelImage,
@@ -32,6 +34,7 @@ export class Image implements Component {
 
 	private cachedLines: string[] | undefined;
 	private cachedWidth: number | undefined;
+	private cachedGeneration: number | undefined;
 
 	constructor(
 		base64Data: string,
@@ -56,6 +59,7 @@ export class Image implements Component {
 	invalidate(): void {
 		this.cachedLines = undefined;
 		this.cachedWidth = undefined;
+		this.cachedGeneration = undefined;
 	}
 
 	/** Release terminal-side preparation retained for this image. Safe to call repeatedly. */
@@ -63,10 +67,12 @@ export class Image implements Component {
 		if (this.imageId !== undefined) releaseSixelImage(this.imageId);
 		this.cachedLines = undefined;
 		this.cachedWidth = undefined;
+		this.cachedGeneration = undefined;
 	}
 
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) {
+		const generation = getImageRenderGeneration();
+		if (this.cachedLines && this.cachedWidth === width && this.cachedGeneration === generation) {
 			return this.cachedLines;
 		}
 
@@ -77,6 +83,7 @@ export class Image implements Component {
 
 		const caps = getCapabilities();
 		let lines: string[];
+		let imagePlacement: ImagePlacement | undefined;
 
 		if (caps.images) {
 			if ((caps.images === "kitty" || caps.images === "sixel") && this.imageId === undefined) {
@@ -98,6 +105,17 @@ export class Image implements Component {
 				if (caps.images === "kitty" || caps.images === "sixel") {
 					// Kitty suppresses cursor movement and Sixel saves/restores the cursor.
 					lines = [result.sequence];
+					imagePlacement = {
+						top: 0,
+						anchor: 0,
+						left: 0,
+						columns: result.columns,
+						rows: result.rows,
+						protocol: caps.images,
+						...(result.imageId === undefined ? {} : { imageId: result.imageId }),
+						sequence: result.sequence,
+						exactSequence: true,
+					};
 
 					// Return `rows` lines so TUI accounts for image height.
 					for (let i = 0; i < result.rows - 1; i++) {
@@ -114,7 +132,18 @@ export class Image implements Component {
 					}
 					const rowOffset = result.rows - 1;
 					const moveUp = rowOffset > 0 ? `\x1b[${rowOffset}A` : "";
-					lines.push(moveUp + result.sequence);
+					const sequence = moveUp + result.sequence;
+					lines.push(sequence);
+					imagePlacement = {
+						top: 0,
+						anchor: rowOffset,
+						left: 0,
+						columns: result.columns,
+						rows: result.rows,
+						protocol: "iterm2",
+						sequence,
+						exactSequence: true,
+					};
 				}
 			} else {
 				const fallback = imageFallback(this.mimeType, this.dimensions, this.options.filename);
@@ -125,8 +154,10 @@ export class Image implements Component {
 			lines = [this.theme.fallbackColor(fallback)];
 		}
 
+		setImagePlacements(lines, imagePlacement ? [imagePlacement] : []);
 		this.cachedLines = lines;
 		this.cachedWidth = width;
+		this.cachedGeneration = generation;
 
 		return lines;
 	}

@@ -2,6 +2,13 @@ import type { ScrollView } from "./components/scroll-view.ts";
 import { allocateStackSizes, visibleStackEntries } from "./components/stack.ts";
 import { getLayoutNode } from "./layout-node.ts";
 import { compositeLayoutLine } from "./line-compositor.ts";
+import {
+	getImagePlacements,
+	type ImagePlacement,
+	type RenderFrame,
+	renderComponentFrame,
+	setImagePlacements,
+} from "./render-frame.ts";
 import { cropImageLine, getImageMetadata, isImageLine } from "./terminal-image.ts";
 import { type Component, CURSOR_MARKER } from "./tui.ts";
 import { extractAnsiCode, getGraphemeCellRange, sliceByColumn, visibleWidth } from "./utils.ts";
@@ -23,9 +30,11 @@ export interface LayoutBox {
 	children: LayoutBox[];
 	parent?: LayoutBox;
 	lines?: readonly string[];
+	images?: readonly ImagePlacement[];
 	lineOffset?: number;
 	scrollView?: ScrollView;
 	scrollContentLines?: readonly string[];
+	scrollContentImages?: readonly ImagePlacement[];
 	layer: number;
 }
 
@@ -34,6 +43,7 @@ export interface LayoutFrame {
 	width: number;
 	height: number;
 	lines: string[];
+	images: ImagePlacement[];
 	primaryScrollView?: ScrollView;
 }
 
@@ -48,7 +58,7 @@ export interface ScrollbarGeometry {
 
 interface LayoutContext {
 	viewport: { width: number; height: number };
-	renderCache: Map<Component, Map<number, string[]>>;
+	renderCache: Map<Component, Map<number, RenderFrame>>;
 	requestRender: () => void;
 	primaryScrollView: ScrollView | undefined;
 	geometryChanged: boolean;
@@ -62,27 +72,27 @@ function intersect(a: LayoutRect, b: LayoutRect): LayoutRect {
 	return { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) };
 }
 
-function renderCached(context: LayoutContext, component: Component, width: number): string[] {
+function renderCached(context: LayoutContext, component: Component, width: number): RenderFrame {
 	const safeWidth = Math.max(1, Math.floor(width));
 	let widths = context.renderCache.get(component);
 	if (!widths) {
-		widths = new Map<number, string[]>();
+		widths = new Map<number, RenderFrame>();
 		context.renderCache.set(component, widths);
 	}
-	let lines = widths.get(safeWidth);
-	if (!lines) {
-		lines = component.render(safeWidth);
-		widths.set(safeWidth, lines);
+	let frame = widths.get(safeWidth);
+	if (!frame) {
+		frame = renderComponentFrame(component, safeWidth);
+		widths.set(safeWidth, frame);
 	}
-	return lines;
+	return frame;
 }
 
 function measureHeight(context: LayoutContext, component: Component, width: number): number {
-	return renderCached(context, component, width).length;
+	return renderCached(context, component, width).lines.length;
 }
 
 function measureWidth(context: LayoutContext, component: Component, width: number): number {
-	return renderCached(context, component, width).reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
+	return renderCached(context, component, width).lines.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
 }
 
 function withParent(box: LayoutBox, parent: LayoutBox): LayoutBox {
@@ -112,11 +122,11 @@ function layoutComponent(
 	const safeWidth = Math.max(1, Math.floor(width));
 	const node = getLayoutNode(component);
 	if (!node) {
-		const lines = renderCached(context, component, safeWidth);
-		const allocatedHeight = height === undefined ? lines.length : Math.max(0, Math.floor(height));
+		const frame = renderCached(context, component, safeWidth);
+		const allocatedHeight = height === undefined ? frame.lines.length : Math.max(0, Math.floor(height));
 		let lineOffset = 0;
-		if (lines.length > allocatedHeight && allocatedHeight > 0) {
-			const cursorLine = lines.findIndex((line) => line.includes(CURSOR_MARKER));
+		if (frame.lines.length > allocatedHeight && allocatedHeight > 0) {
+			const cursorLine = frame.lines.findIndex((line) => line.includes(CURSOR_MARKER));
 			if (cursorLine >= allocatedHeight) lineOffset = cursorLine - allocatedHeight + 1;
 		}
 		return {
@@ -124,7 +134,8 @@ function layoutComponent(
 			rect: { x, y, width: safeWidth, height: allocatedHeight },
 			clip: intersect(clip, { x, y, width: safeWidth, height: allocatedHeight }),
 			children: [],
-			lines,
+			lines: frame.lines,
+			images: frame.images,
 			lineOffset,
 			layer: 0,
 		};
@@ -158,7 +169,8 @@ function layoutComponent(
 			clip: childClip,
 			children: [childBox],
 			scrollView,
-			scrollContentLines: renderCached(context, node.component, contentWidth),
+			scrollContentLines: renderCached(context, node.component, contentWidth).lines,
+			scrollContentImages: renderCached(context, node.component, contentWidth).images,
 			layer: 0,
 		};
 		childBox.parent = box;
@@ -308,51 +320,106 @@ function paintScrollbar(box: LayoutBox, screen: string[], totalWidth: number): v
 	}
 }
 
-function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
+function paintBox(box: LayoutBox, screen: string[], totalWidth: number, screenImages: ImagePlacement[]): void {
 	if (box.lines) {
 		const offset = box.lineOffset ?? 0;
 		const firstRow = Math.max(box.rect.y, box.clip.y, 0);
 		const lastRow = Math.min(box.rect.y + box.rect.height, box.clip.y + box.clip.height, screen.length);
 		for (let row = firstRow; row < lastRow; row++) {
-			const sourceLine = box.lines[offset + row - box.rect.y];
+			const sourceRow = offset + row - box.rect.y;
+			const sourceLine = box.lines[sourceRow];
 			if (sourceLine === undefined) continue;
 			let line = sourceLine.replace(OSC133_ZONE_PREFIX, "");
-			const imageMetadata = getImageMetadata(line);
-			if (imageMetadata) {
-				const clipBottom = Math.min(screen.length, box.clip.y + box.clip.height);
-				const visibleRows = Math.min(imageMetadata.rows, clipBottom - row);
-				if (visibleRows < imageMetadata.rows) line = cropImageLine(line, 0, visibleRows);
+			let hasExactImageAnchor = false;
+			for (const image of box.images ?? []) {
+				if (!image.exactSequence || image.anchor !== sourceRow) continue;
+				hasExactImageAnchor = true;
+				line = line.replace(image.sequence, "");
+			}
+			if (!hasExactImageAnchor) {
+				const metadata = getImageMetadata(line);
+				if (metadata) {
+					const clipBottom = Math.min(screen.length, box.clip.y + box.clip.height);
+					const visibleRows = Math.min(metadata.rows, clipBottom - row);
+					if (visibleRows < metadata.rows) line = cropImageLine(line, 0, visibleRows);
+				}
 			}
 			// Fast path: a full-width box painting onto an untouched row can use the
 			// source line reference directly. Compositing here would rebuild the row
-			// string through ANSI/grapheme segmentation every frame; padding is
-			// unnecessary because rows are written with erase-line and the final
-			// width clamp still truncates over-wide lines.
-			if (box.rect.x === 0 && box.rect.width >= totalWidth && (isImageLine(line) || !screen[row])) {
+			// string through ANSI/grapheme segmentation every frame.
+			if (box.rect.x === 0 && box.rect.width >= totalWidth && !screen[row]) {
 				screen[row] = line;
 			} else {
 				screen[row] = compositeLayoutLine(screen[row] ?? "", line, box.rect.x, box.rect.width, totalWidth);
 			}
 		}
+
+		for (const image of box.images ?? []) {
+			const imageTop = box.rect.y + image.top - offset;
+			const imageBottom = imageTop + image.rows;
+			const visibleTop = Math.max(imageTop, box.clip.y, 0);
+			const visibleBottom = Math.min(imageBottom, box.clip.y + box.clip.height, screen.length);
+			if (visibleBottom <= visibleTop) continue;
+
+			const hiddenRows = visibleTop - imageTop;
+			const visibleRows = visibleBottom - visibleTop;
+			const anchorRow = box.rect.y + image.anchor - offset;
+			const drawRow = hiddenRows > 0 ? visibleTop : anchorRow;
+			if (drawRow < visibleTop || drawRow >= visibleBottom) continue;
+			const sequence =
+				hiddenRows > 0 || visibleRows < image.rows
+					? cropImageLine(image.sequence, hiddenRows, visibleRows)
+					: image.sequence;
+			const left = box.rect.x + image.left;
+			if (image.exactSequence) {
+				screen[drawRow] = compositeLayoutLine(
+					screen[drawRow] ?? "",
+					sequence,
+					left,
+					Math.min(image.columns, Math.max(0, totalWidth - left)),
+					totalWidth,
+				);
+			}
+			screenImages.push({
+				...image,
+				top: visibleTop,
+				anchor: drawRow,
+				left,
+				rows: visibleRows,
+				sequence,
+			});
+		}
 	}
-	for (const child of box.children) paintBox(child, screen, totalWidth);
+	for (const child of box.children) paintBox(child, screen, totalWidth, screenImages);
 
 	if (box.scrollView && box.scrollContentLines && box.scrollView.scrollTop > 0 && box.rect.height > 0) {
+		const structuredTopCropAnchors = new Set(
+			(box.scrollContentImages ?? [])
+				.filter(
+					(image) =>
+						image.exactSequence &&
+						image.top < box.scrollView!.scrollTop &&
+						image.top + image.rows > box.scrollView!.scrollTop,
+				)
+				.map((image) => image.anchor),
+		);
 		for (let imageRow = box.scrollView.scrollTop - 1; imageRow >= 0; imageRow--) {
 			const imageLine = box.scrollContentLines[imageRow] ?? "";
 			const metadata = getImageMetadata(imageLine);
 			if (metadata) {
-				const hiddenRows = box.scrollView.scrollTop - imageRow;
-				if (hiddenRows < metadata.rows) {
-					const visibleRows = Math.min(box.rect.height, metadata.rows - hiddenRows);
-					const cropped = cropImageLine(imageLine, hiddenRows, visibleRows);
-					screen[box.rect.y] = compositeLayoutLine(
-						screen[box.rect.y] ?? "",
-						cropped,
-						box.rect.x,
-						box.rect.width,
-						totalWidth,
-					);
+				if (!structuredTopCropAnchors.has(imageRow)) {
+					const hiddenRows = box.scrollView.scrollTop - imageRow;
+					if (hiddenRows < metadata.rows) {
+						const visibleRows = Math.min(box.rect.height, metadata.rows - hiddenRows);
+						const cropped = cropImageLine(imageLine, hiddenRows, visibleRows);
+						screen[box.rect.y] = compositeLayoutLine(
+							screen[box.rect.y] ?? "",
+							cropped,
+							box.rect.x,
+							box.rect.width,
+							totalWidth,
+						);
+					}
 				}
 				break;
 			}
@@ -392,12 +459,24 @@ export function renderLayoutFrame(
 			continue;
 		}
 		const lines = Array.from({ length: safeHeight }, () => "");
-		paintBox(rootBox, lines, safeWidth);
+		const images: ImagePlacement[] = [];
+		paintBox(rootBox, lines, safeWidth, images);
+		for (const inferred of getImagePlacements(lines)) {
+			const represented = images.some(
+				(image) =>
+					image.protocol === inferred.protocol &&
+					image.imageId === inferred.imageId &&
+					image.anchor === inferred.anchor,
+			);
+			if (!represented) images.push(inferred);
+		}
+		setImagePlacements(lines, images);
 		return {
 			root: rootBox,
 			width: safeWidth,
 			height: safeHeight,
 			lines,
+			images,
 			...(context.primaryScrollView === undefined ? {} : { primaryScrollView: context.primaryScrollView }),
 		};
 	}

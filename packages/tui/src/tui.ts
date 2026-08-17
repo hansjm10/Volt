@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { isKeyRelease, matchesKey } from "./keys.ts";
+import { getImagePlacements, type ImagePlacement, renderComponentFrame, setImagePlacements } from "./render-frame.ts";
 import type { Terminal } from "./terminal.ts";
 import {
 	isOsc11BackgroundColorResponse,
@@ -253,13 +254,14 @@ export class Container implements Component {
 
 	render(width: number): string[] {
 		const lines: string[] = [];
+		const images: ImagePlacement[] = [];
 		for (const child of this.children) {
-			const childLines = child.render(width);
-			for (const line of childLines) {
-				lines.push(line);
-			}
+			const frame = renderComponentFrame(child, width);
+			const top = lines.length;
+			lines.push(...frame.lines);
+			for (const image of frame.images) images.push({ ...image, top: image.top + top, anchor: image.anchor + top });
 		}
-		return lines;
+		return setImagePlacements(lines, images);
 	}
 }
 
@@ -1236,9 +1238,16 @@ export abstract class TuiBase extends Container implements TUI {
 	protected compositeOverlays(lines: string[], termWidth: number, termHeight: number): string[] {
 		if (this.overlayStack.length === 0) return lines;
 		const result = [...lines];
+		const images = getImagePlacements(lines).map((image) => ({ ...image }));
 
 		// Pre-render all visible overlays and calculate positions
-		const rendered: { overlayLines: string[]; row: number; col: number; w: number }[] = [];
+		const rendered: {
+			overlayLines: string[];
+			overlayImages: ImagePlacement[];
+			row: number;
+			col: number;
+			w: number;
+		}[] = [];
 		let minLinesNeeded = result.length;
 
 		const visibleEntries = this.overlayStack.filter((e) => this.isOverlayVisible(e));
@@ -1251,17 +1260,20 @@ export abstract class TuiBase extends Container implements TUI {
 			const { width, maxHeight } = this.resolveOverlayLayout(options, 0, termWidth, termHeight);
 
 			// Render component at calculated width
-			let overlayLines = component.render(width);
+			const overlayFrame = renderComponentFrame(component, width);
+			let overlayLines = overlayFrame.lines;
+			let overlayImages = overlayFrame.images;
 
 			// Apply maxHeight if specified
 			if (maxHeight !== undefined && overlayLines.length > maxHeight) {
 				overlayLines = overlayLines.slice(0, maxHeight);
+				overlayImages = overlayImages.filter((image) => image.anchor < maxHeight && image.top < maxHeight);
 			}
 
 			// Get final row/col with actual overlay height
 			const { row, col } = this.resolveOverlayLayout(options, overlayLines.length, termWidth, termHeight);
 
-			rendered.push({ overlayLines, row, col, w: width });
+			rendered.push({ overlayLines, overlayImages, row, col, w: width });
 			minLinesNeeded = Math.max(minLinesNeeded, row + overlayLines.length);
 		}
 
@@ -1278,7 +1290,7 @@ export abstract class TuiBase extends Container implements TUI {
 		const viewportStart = Math.max(0, workingHeight - termHeight);
 
 		// Composite each overlay
-		for (const { overlayLines, row, col, w } of rendered) {
+		for (const { overlayLines, overlayImages, row, col, w } of rendered) {
 			for (const [i, overlayLine] of overlayLines.entries()) {
 				const idx = viewportStart + row + i;
 				const baseLine = result[idx];
@@ -1290,9 +1302,17 @@ export abstract class TuiBase extends Container implements TUI {
 					result[idx] = this.compositeLineAt(baseLine, truncatedOverlayLine, col, w, termWidth);
 				}
 			}
+			for (const image of overlayImages) {
+				images.push({
+					...image,
+					top: image.top + viewportStart + row,
+					anchor: image.anchor + viewportStart + row,
+					left: image.left + col,
+				});
+			}
 		}
 
-		return result;
+		return setImagePlacements(result, images);
 	}
 
 	protected applyLineResets(lines: string[]): string[] {

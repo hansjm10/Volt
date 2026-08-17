@@ -1,5 +1,5 @@
 import type { Component, RenderSuspensionLease, Terminal, TUI, TuiMode } from "@hansjm10/volt-tui";
-import { Container, isViewportTUI, VStack } from "@hansjm10/volt-tui";
+import { Container, Image, isViewportTUI, resetCapabilitiesCache, setCapabilities, VStack } from "@hansjm10/volt-tui";
 import { describe, expect, it, vi } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import {
@@ -103,6 +103,7 @@ describe("createInteractiveTui", () => {
 
 		renderer.start();
 		await terminal.waitForRender();
+		invalidatedModes.length = 0;
 		const terminalInput = vi.fn((_data: string) => ({ consume: true }));
 		context.extensionTerminalInputSubscriptions.add({
 			handler: terminalInput,
@@ -116,7 +117,8 @@ describe("createInteractiveTui", () => {
 		expect(context.renderer.children).toEqual([component]);
 		expect(context.renderer.getFocusedComponent()).toBe(component);
 		expect(component.focused).toBe(true);
-		expect(invalidatedModes).toEqual(["fullscreen"]);
+		expect(invalidatedModes.length).toBeGreaterThan(0);
+		expect(new Set(invalidatedModes)).toEqual(new Set(["fullscreen"]));
 		expect([terminal.startCount, terminal.stopCount]).toEqual([2, 1]);
 		expect(context.renderer.getRenderMetrics().frames).toBe(0);
 		context.sessionRenderSuspension?.release();
@@ -129,6 +131,86 @@ describe("createInteractiveTui", () => {
 
 		prototype.stopInteractiveTui.call(context, "resume-hint");
 		expect([terminal.startCount, terminal.stopCount]).toEqual([2, 2]);
+	});
+
+	it("re-renders a hidden conversation image for each renderer protocol", async () => {
+		setCapabilities({ images: "iterm2", trueColor: true, hyperlinks: true });
+		const terminal = new RecordingTerminal(40, 8);
+		const renderer = createInteractiveTui({
+			tuiMode: "regular",
+			showHardwareCursor: false,
+			logDirectory: "/tmp",
+			terminal,
+		});
+		const image = new Image(
+			"AAAA",
+			"image/png",
+			{ fallbackColor: (value) => value },
+			{ maxWidthCells: 2 },
+			{ widthPx: 20, heightPx: 20 },
+		);
+		const temporary = { render: () => ["settings"], invalidate: () => {} } satisfies Component;
+		const conversationView: { regularComponents: Component[]; fullscreenRoot: Component } = {
+			regularComponents: [image],
+			fullscreenRoot: image,
+		};
+		const temporaryView: { regularComponents: Component[]; fullscreenRoot: Component } = {
+			regularComponents: [temporary],
+			fullscreenRoot: temporary,
+		};
+		const context = Object.assign(Object.create(InteractiveMode.prototype), {
+			renderer,
+			ui: undefined as unknown as TUI,
+			activeView: conversationView,
+			conversationView,
+			planDetails: undefined,
+			mainScreenRenderState: undefined,
+			sessionRenderSuspension: undefined as RenderSuspensionLease | undefined,
+			options: { tuiMode: "regular" as TuiMode },
+			onRightClickPaste: () => undefined,
+			extensionTerminalInputSubscriptions: new Set(),
+		});
+		context.ui = createInteractiveTuiReference(() => context.renderer);
+		const prototype = InteractiveMode.prototype as unknown as {
+			activateView(
+				this: typeof context,
+				view: typeof conversationView,
+				focus: Component | null,
+				forceRender?: boolean,
+			): void;
+			switchTuiMode(this: typeof context, mode: TuiMode, restoreProgress?: boolean): boolean;
+		};
+
+		renderer.addChild(image);
+		renderer.start();
+		try {
+			await terminal.waitForRender();
+			prototype.activateView.call(context, temporaryView, null);
+			await terminal.waitForRender();
+			expect(prototype.switchTuiMode.call(context, "fullscreen", false)).toBe(true);
+			await terminal.waitForRender();
+
+			let writeStart = terminal.writes.length;
+			prototype.activateView.call(context, conversationView, null);
+			await terminal.waitForRender();
+			const fullscreenWrites = terminal.writes.slice(writeStart).join("");
+			expect(fullscreenWrites).toContain("[Image:");
+			expect(fullscreenWrites).not.toContain("\x1b]1337;File=");
+
+			prototype.activateView.call(context, temporaryView, null);
+			await terminal.waitForRender();
+			expect(prototype.switchTuiMode.call(context, "regular", false)).toBe(true);
+			await terminal.waitForRender();
+
+			writeStart = terminal.writes.length;
+			prototype.activateView.call(context, conversationView, null);
+			await terminal.waitForRender();
+			const regularWrites = terminal.writes.slice(writeStart).join("");
+			expect(regularWrites).toContain("\x1b]1337;File=");
+		} finally {
+			context.renderer.stop({ preserveScreen: true });
+			resetCapabilitiesCache();
+		}
 	});
 
 	it.each([

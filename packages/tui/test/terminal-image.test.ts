@@ -15,6 +15,7 @@ import {
 } from "../src/sixel.ts";
 import {
 	applyDeviceAttributes,
+	clearSixelImages,
 	cropImageLine,
 	deleteAllKittyImages,
 	deleteKittyImage,
@@ -183,6 +184,32 @@ describe("Sixel support", () => {
 			assert.ok(lineAt(lines, 0).includes("\x1bP0;1;0q"));
 			assert.strictEqual(lineAt(lines, 1), "");
 			assert.strictEqual(image.render(10), lines, "same-width renders should reuse the cached control stream");
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	it("rebuilds same-width Image output after Sixel preparation is cleared", () => {
+		setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 1, heightPx: 1 });
+		try {
+			const image = new Image(
+				pngBase64(2, 4, solidRgba(2, 4, [0, 0, 255, 255])),
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ maxWidthCells: 2, maxHeightCells: 4 },
+				{ widthPx: 2, heightPx: 4 },
+			);
+			const first = image.render(10);
+			assert.strictEqual(getSixelRegistryStats().images, 1);
+			clearSixelImages();
+			assert.strictEqual(getSixelRegistryStats().images, 0);
+
+			const second = image.render(10);
+			assert.notStrictEqual(second, first, "cleared preparation must invalidate the cached lines");
+			assert.strictEqual(getSixelRegistryStats().images, 1);
+			assert.ok(lineAt(second, 0).includes("\x1bP0;1;0q"));
 		} finally {
 			resetCapabilitiesCache();
 			setCellDimensions({ widthPx: 9, heightPx: 18 });

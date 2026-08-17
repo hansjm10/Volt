@@ -1,7 +1,10 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
+import { encode } from "fast-png";
+import { HStack } from "../src/components/h-stack.ts";
 import { Image } from "../src/components/image.ts";
+import { Text } from "../src/components/text.ts";
 import { type Component, TuiMainScreen } from "../src/index.ts";
 import {
 	deleteKittyImage,
@@ -35,6 +38,12 @@ class LoggingVirtualTerminal extends VirtualTerminal {
 	clearWrites(): void {
 		this.writes = [];
 	}
+}
+
+function solidPngBase64(width: number, height: number): string {
+	const data = new Uint8Array(width * height * 4);
+	for (let pixel = 0; pixel < width * height; pixel++) data.set([0, 0, 255, 255], pixel * 4);
+	return Buffer.from(encode({ width, height, channels: 4, depth: 8, data })).toString("base64");
 }
 
 function lineAt(lines: string[], index: number): string {
@@ -317,6 +326,46 @@ describe("TUI Kitty image cleanup", () => {
 		assert.ok(!writes.includes("\x1b[2J"), "reserved row changes should not force a full redraw");
 
 		tui.stop();
+	});
+
+	it("re-emits a Sixel image when a lower HStack sibling row changes", async () => {
+		setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 1, heightPx: 1 });
+		try {
+			const terminal = new LoggingVirtualTerminal(20, 8);
+			const tui = new TuiMainScreen(terminal);
+			const image = new Image(
+				solidPngBase64(2, 4),
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ maxWidthCells: 2, maxHeightCells: 4 },
+				{ widthPx: 2, heightPx: 4 },
+			);
+			const sibling = new Text("one\ntwo\nthree\nfour", 0, 0);
+			tui.addChild(
+				new HStack([
+					{ component: image, basis: 6, shrink: 0 },
+					{ component: sibling, basis: 14, shrink: 0 },
+				]),
+			);
+			tui.start();
+			await terminal.waitForRender();
+			terminal.clearWrites();
+
+			sibling.setText("one\ntwo\nCHANGED\nfour");
+			tui.requestRender();
+			await terminal.waitForRender();
+
+			const writes = terminal.getWrites();
+			assert.ok(writes.includes("\x1b_pi:s="), "the Sixel anchor should be re-emitted");
+			assert.ok(writes.includes("\x1bP0;1;0q"), "the Sixel raster should be repainted");
+			assert.ok(writes.includes("CHANGED"), "the changed sibling row should be repainted");
+			assert.ok(!writes.includes("\x1b[2J"), "the repaint should remain differential");
+			tui.stop({ preserveScreen: true });
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
 	});
 
 	it("deletes previously rendered image ids during full redraws", async () => {

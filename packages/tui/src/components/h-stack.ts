@@ -1,4 +1,5 @@
 import { compositeLayoutLine } from "../line-compositor.ts";
+import { type ImagePlacement, renderComponentFrame, setImagePlacements } from "../render-frame.ts";
 import { visibleWidth } from "../utils.ts";
 import { allocateStackSizes, Stack, type StackChild, type StackOptions, visibleStackEntries } from "./stack.ts";
 
@@ -16,29 +17,38 @@ export class HStack extends Stack {
 		if (entries.length === 0) return [];
 
 		const intrinsicWidths = entries.map((entry) => {
-			const lines = entry.component.render(safeWidth);
-			return lines.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
+			const frame = renderComponentFrame(entry.component, safeWidth);
+			return frame.lines.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
 		});
 		const widths = allocateStackSizes(entries, intrinsicWidths, safeWidth, this.gap);
 		const rendered = entries.map((entry, index) =>
-			widths[index] === 0 ? [] : entry.component.render(widths[index]!),
+			widths[index] === 0 ? { lines: [], images: [] } : renderComponentFrame(entry.component, widths[index]!),
 		);
-		const height = rendered.reduce((max, lines) => Math.max(max, lines.length), 0);
+		const height = rendered.reduce((max, frame) => Math.max(max, frame.lines.length), 0);
 		const result = Array.from({ length: height }, () => "");
+		const images: ImagePlacement[] = [];
 		let x = 0;
 		for (let index = 0; index < rendered.length; index++) {
-			const lines = rendered[index]!;
+			const frame = rendered[index]!;
 			const childWidth = widths[index]!;
 			let offset = 0;
-			if (this.align === "center") offset = Math.floor((height - lines.length) / 2);
-			else if (this.align === "end") offset = height - lines.length;
-			for (let row = 0; row < lines.length; row++) {
+			if (this.align === "center") offset = Math.floor((height - frame.lines.length) / 2);
+			else if (this.align === "end") offset = height - frame.lines.length;
+			for (let row = 0; row < frame.lines.length; row++) {
 				const target = row + offset;
 				if (target < 0 || target >= result.length) continue;
-				result[target] = compositeLayoutLine(result[target]!, lines[row]!, x, childWidth, safeWidth);
+				result[target] = compositeLayoutLine(result[target]!, frame.lines[row]!, x, childWidth, safeWidth);
+			}
+			for (const image of frame.images) {
+				images.push({
+					...image,
+					top: image.top + offset,
+					anchor: image.anchor + offset,
+					left: image.left + x,
+				});
 			}
 			x += childWidth + this.gap;
 		}
-		return result;
+		return setImagePlacements(result, images);
 	}
 }
