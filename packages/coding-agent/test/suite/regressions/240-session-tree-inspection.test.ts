@@ -10,14 +10,20 @@ import { getStaticIrohRemoteRpcFilterResult } from "../../../src/core/remote/iro
 import { IROH_REMOTE_TRANSCRIPT_TEXT_MAX_SCALARS } from "../../../src/core/remote/iroh/transcript-text.ts";
 import { projectSessionTreePage } from "../../../src/core/rpc/session-tree.ts";
 import { projectConversationTranscriptItems } from "../../../src/core/rpc/transcript.ts";
-import type { RpcSessionTreePage } from "../../../src/core/rpc/types.ts";
+import type {
+	RpcCommand,
+	RpcMessageImagesResponse,
+	RpcResponse,
+	RpcSessionTreePage,
+} from "../../../src/core/rpc/types.ts";
 import {
 	type ConversationCommandRuntime,
 	createRemoteGetMessageImagesRpcResponse,
 	createRemoteGetSessionTreeRpcResponse,
 	createRemoteGetTranscriptEntryTextRpcResponse,
 } from "../../../src/daemon/conversation-commands.ts";
-import { createHarness } from "../harness.ts";
+import { handleRpcCommand, type RpcCommandDispatcherContext } from "../../../src/modes/rpc/rpc-command-dispatcher.ts";
+import { createHarness, type Harness } from "../harness.ts";
 
 function createAuthorization(workspacePath: string): IrohRemoteClientAuthorizationSuccess {
 	return {
@@ -46,6 +52,24 @@ function getSuccessfulTree(response: object): RpcSessionTreePage {
 		throw new Error(`Expected successful session tree response: ${JSON.stringify(response)}`);
 	}
 	return value.data;
+}
+
+function getSuccessfulImages(response: object): RpcMessageImagesResponse {
+	const value = response as { success?: boolean; data?: RpcMessageImagesResponse };
+	if (value.success !== true || value.data === undefined) {
+		throw new Error(`Expected successful message images response: ${JSON.stringify(response)}`);
+	}
+	return value.data;
+}
+
+async function dispatchLocalRpcCommand(command: RpcCommand, harness: Harness): Promise<RpcResponse> {
+	const response = await handleRpcCommand(command, {
+		session: harness.session,
+	} as unknown as RpcCommandDispatcherContext);
+	if (response === undefined) {
+		throw new Error(`Expected immediate local RPC response for ${command.type}`);
+	}
+	return response;
 }
 
 function assistantMessage(text: string, timestamp: number): AssistantMessage {
@@ -157,8 +181,36 @@ test("inactive tree-node continuation metadata remains recoverable", async () =>
 			],
 			timestamp: 2,
 		});
+		const inactiveToolCallId = "inactive-image-call";
+		harness.sessionManager.appendMessage({
+			...assistantMessage("", 3),
+			content: [
+				{
+					type: "toolCall",
+					id: inactiveToolCallId,
+					name: "read",
+					arguments: { path: "inactive.png" },
+				},
+			],
+		});
+		const inactiveToolId = harness.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: inactiveToolCallId,
+			toolName: "read",
+			content: [
+				{ type: "text", text: "Read image file [image/png]" },
+				{ type: "image", data: "dG9vbA==", mimeType: "image/png" },
+			],
+			isError: false,
+			timestamp: 4,
+		});
 		harness.sessionManager.branch(rootId);
-		harness.sessionManager.appendMessage(assistantMessage("active branch", 3));
+		const activeImageId = harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "image", data: "YWN0aXZl", mimeType: "image/jpeg" }],
+			timestamp: 5,
+		});
+		harness.sessionManager.appendMessage(assistantMessage("active branch", 6));
 
 		const runtime: ConversationCommandRuntime = {
 			session: {
@@ -206,20 +258,75 @@ test("inactive tree-node continuation metadata remains recoverable", async () =>
 			data: { text: "END", truncated: false, nextOffset: null },
 		});
 
-		const images = createRemoteGetMessageImagesRpcResponse(
-			{ id: "images", type: "get_message_images", entryId: inactiveId },
-			authorization,
-			runtime,
+		const expectedImages = new Map([
+			[inactiveId, { data: "aW1hZ2U=", mimeType: "image/png", activeBranch: false }],
+			[inactiveToolId, { data: "dG9vbA==", mimeType: "image/png", activeBranch: false }],
+			[activeImageId, { data: "YWN0aXZl", mimeType: "image/jpeg", activeBranch: true }],
+		]);
+		expect(
+			tree.nodes.flatMap((node) => {
+				const imageCount = node.transcript?.imageCount;
+				return imageCount === undefined
+					? []
+					: [{ entryId: node.entryId, imageCount, activeBranch: node.activeBranch }];
+			}),
+		).toEqual(
+			[...expectedImages].map(([entryId, image]) => ({
+				entryId,
+				imageCount: 1,
+				activeBranch: image.activeBranch,
+			})),
 		);
-		expect(images).toMatchObject({
-			success: true,
-			data: {
-				entryId: inactiveId,
+
+		for (const [entryId, image] of expectedImages) {
+			expect(
+				getSuccessfulImages(
+					createRemoteGetMessageImagesRpcResponse(
+						{ id: `remote-images-${entryId}`, type: "get_message_images", entryId },
+						authorization,
+						runtime,
+					),
+				),
+			).toMatchObject({
+				entryId,
 				totalImages: 1,
-				images: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png", index: 0 }],
+				images: [{ type: "image", data: image.data, mimeType: image.mimeType, index: 0 }],
 				nextImageIndex: null,
-			},
-		});
+			});
+		}
+
+		const localTree = getSuccessfulTree(
+			await dispatchLocalRpcCommand({ id: "local-tree", type: "get_session_tree" }, harness),
+		);
+		expect(
+			localTree.nodes.flatMap((node) => {
+				const imageCount = node.transcript?.imageCount;
+				return imageCount === undefined
+					? []
+					: [{ entryId: node.entryId, imageCount, activeBranch: node.activeBranch }];
+			}),
+		).toEqual(
+			[...expectedImages].map(([entryId, image]) => ({
+				entryId,
+				imageCount: 1,
+				activeBranch: image.activeBranch,
+			})),
+		);
+		for (const [entryId, image] of expectedImages) {
+			expect(
+				getSuccessfulImages(
+					await dispatchLocalRpcCommand(
+						{ id: `local-images-${entryId}`, type: "get_message_images", entryId },
+						harness,
+					),
+				),
+			).toMatchObject({
+				entryId,
+				totalImages: 1,
+				images: [{ type: "image", data: image.data, mimeType: image.mimeType, index: 0 }],
+				nextImageIndex: null,
+			});
+		}
 	} finally {
 		harness.cleanup();
 	}

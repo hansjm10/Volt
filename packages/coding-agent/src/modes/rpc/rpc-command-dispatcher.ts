@@ -815,7 +815,7 @@ export async function handleRpcCommand(
 
 		case "get_message_images": {
 			const result = projectMessageImages(
-				session.sessionManager.getBranch(),
+				session.sessionManager.getEntries(),
 				command.entryId,
 				command.startImageIndex,
 			);
