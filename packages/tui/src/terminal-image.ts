@@ -165,7 +165,7 @@ export function setCapabilities(caps: TerminalCapabilities): void {
 export function applyDeviceAttributes(attributes: readonly number[], env: NodeJS.ProcessEnv = process.env): boolean {
 	const term = env["TERM"]?.toLowerCase() ?? "";
 	if (
-		!env["WT_SESSION"] ||
+		(!env["WT_SESSION"] && process.platform !== "win32") ||
 		env["TMUX"] ||
 		term.startsWith("tmux") ||
 		term.startsWith("screen") ||

@@ -433,6 +433,30 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
+	it("contains unused wheel delta inside a nested scroll view", async () => {
+		const terminal = new VirtualTerminal(20, 4);
+		const tui = new TuiAltScreen(terminal, undefined, undefined, { wheelScrollLines: 3 });
+		const inner = new ScrollView(new Text("i1\ni2\ni3\ni4\ni5\ni6", 0, 0), { overscroll: "contain" });
+		const outer = new ScrollView(
+			new VStack([{ component: inner, basis: 2 }, new Text("tail1\ntail2\ntail3\ntail4\ntail5", 0, 0)]),
+			{ primary: true },
+		);
+		tui.setLayoutRoot(outer);
+		tui.start();
+		await terminal.waitForRender();
+
+		inner.scrollToEnd();
+		await terminal.waitForRender();
+		assert.strictEqual(inner.scrollTop, 4);
+		assert.strictEqual(outer.scrollTop, 0);
+
+		terminal.sendInput("\x1b[<65;1;1M");
+		await terminal.waitForRender();
+		assert.strictEqual(inner.scrollTop, 4);
+		assert.strictEqual(outer.scrollTop, 0);
+		tui.stop();
+	});
+
 	it("supports configurable keyboard viewport navigation with four rows of page overlap", async () => {
 		const terminal = new VirtualTerminal(20, 8);
 		const tui = new TuiAltScreen(terminal);

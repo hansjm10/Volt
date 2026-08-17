@@ -94,6 +94,23 @@ describe("Sixel support", () => {
 		});
 	});
 
+	it("enables Sixel on Windows consoles without WT_SESSION after DA1 confirmation", () => {
+		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		assert.ok(platformDescriptor);
+		withEnv({ TERM: "xterm-256color" }, () => {
+			try {
+				Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+				resetCapabilitiesCache();
+				assert.strictEqual(getCapabilities().images, null);
+				assert.strictEqual(applyDeviceAttributes([62, 4, 52]), true);
+				assert.strictEqual(getCapabilities().images, "sixel");
+			} finally {
+				resetCapabilitiesCache();
+				Object.defineProperty(process, "platform", platformDescriptor);
+			}
+		});
+	});
+
 	it("keeps Sixel disabled inside terminal multiplexers", () => {
 		withEnv({ WT_SESSION: "session", TMUX: "session", TERM: "tmux-256color" }, () => {
 			resetCapabilitiesCache();
