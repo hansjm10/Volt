@@ -168,6 +168,84 @@ test("get_session_tree pages sanitized branch topology without raw session entri
 	}
 });
 
+test("session tree resolves reused tool-call ids within each branch", async () => {
+	const harness = await createHarness();
+	try {
+		const toolCallId = "call_1";
+		const appendReadCall = (path: string, timestamp: number): string =>
+			harness.sessionManager.appendMessage({
+				...assistantMessage("", timestamp),
+				content: [{ type: "toolCall", id: toolCallId, name: "read", arguments: { path } }],
+				stopReason: "toolUse",
+			});
+		const appendReadResult = (timestamp: number): string =>
+			harness.sessionManager.appendMessage({
+				role: "toolResult",
+				toolCallId,
+				toolName: "read",
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				timestamp,
+			});
+
+		const rootId = harness.sessionManager.appendMessage({ role: "user", content: "root", timestamp: 1 });
+		appendReadCall("branch-a.txt", 2);
+		const branchAResultId = appendReadResult(3);
+		appendReadCall("branch-a-later.txt", 4);
+		const branchALaterResultId = appendReadResult(5);
+		harness.sessionManager.branch(rootId);
+		appendReadCall("branch-b.txt", 6);
+		const branchBResultId = appendReadResult(7);
+
+		const runtime: ConversationCommandRuntime = {
+			session: {
+				sessionId: harness.sessionManager.getSessionId(),
+				sessionManager: harness.sessionManager,
+			},
+			listSessions: async () => [],
+		};
+		const remote = getSuccessfulTree(
+			createRemoteGetSessionTreeRpcResponse(
+				{ id: "remote-tree", type: "get_session_tree" },
+				createAuthorization(harness.tempDir),
+				runtime,
+			),
+		);
+		const local = getSuccessfulTree(
+			await dispatchLocalRpcCommand({ id: "local-tree", type: "get_session_tree" }, harness),
+		);
+
+		for (const tree of [remote, local]) {
+			expect(tree.nodes.find((node) => node.entryId === branchAResultId)).toMatchObject({
+				activeBranch: false,
+				transcript: {
+					path: "branch-a.txt",
+					args: { path: "branch-a.txt" },
+					summary: "Read branch-a.txt (completed)",
+				},
+			});
+			expect(tree.nodes.find((node) => node.entryId === branchALaterResultId)).toMatchObject({
+				activeBranch: false,
+				transcript: {
+					path: "branch-a-later.txt",
+					args: { path: "branch-a-later.txt" },
+					summary: "Read branch-a-later.txt (completed)",
+				},
+			});
+			expect(tree.nodes.find((node) => node.entryId === branchBResultId)).toMatchObject({
+				activeBranch: true,
+				transcript: {
+					path: "branch-b.txt",
+					args: { path: "branch-b.txt" },
+					summary: "Read branch-b.txt (completed)",
+				},
+			});
+		}
+	} finally {
+		harness.cleanup();
+	}
+});
+
 test("inactive tree-node continuation metadata remains recoverable", async () => {
 	const harness = await createHarness();
 	try {

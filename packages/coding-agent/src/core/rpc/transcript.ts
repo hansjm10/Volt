@@ -5,6 +5,7 @@ import { type BashExecutionMessage, extractVisibleTextContent } from "../message
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "../subagents/tool-names.ts";
 import { getRemoteVisibleCustomMessageRole } from "./custom-message-projection.ts";
+import { type ResolvedSessionToolCall, resolveSessionToolCallsByResultEntryId } from "./tool-call-resolution.ts";
 import type {
 	RpcConversationTranscriptItem,
 	RpcMessageImage,
@@ -42,12 +43,6 @@ const SUBAGENT_NUMERIC_DETAIL_KEYS = ["startedAt", "durationMs", "toolCalls", "t
 
 interface SubagentProjectionBudget {
 	remainingNodes: number;
-}
-
-interface StoredToolCall {
-	id: string;
-	name: string;
-	arguments: Record<string, unknown>;
 }
 
 export interface ProjectSessionTranscriptOptions {
@@ -185,7 +180,7 @@ function normalizeLimit(limit: number | undefined): number {
 }
 
 function projectTranscriptItems(entries: SessionEntry[]): RpcTranscriptItem[] {
-	const toolCallsById = collectToolCalls(entries);
+	const toolCallsByResultEntryId = resolveSessionToolCallsByResultEntryId(entries);
 	const items: RpcTranscriptItem[] = [];
 
 	for (const entry of entries) {
@@ -238,7 +233,7 @@ function projectTranscriptItems(entries: SessionEntry[]): RpcTranscriptItem[] {
 		}
 
 		if (message.role === "toolResult") {
-			items.push(projectToolResult(entry.id, entry.timestamp, message, toolCallsById.get(message.toolCallId)));
+			items.push(projectToolResult(entry.id, entry.timestamp, message, toolCallsByResultEntryId.get(entry.id)));
 			continue;
 		}
 
@@ -308,26 +303,11 @@ function projectCustomMessage(entry: Extract<SessionEntry, { type: "custom_messa
 	return { id: entry.id, role, text, timestamp: normalizeTimestamp(entry.timestamp) };
 }
 
-function collectToolCalls(entries: SessionEntry[]): Map<string, StoredToolCall> {
-	const toolCalls = new Map<string, StoredToolCall>();
-	for (const entry of entries) {
-		if (entry.type !== "message" || entry.message.role !== "assistant") {
-			continue;
-		}
-		for (const block of entry.message.content) {
-			if (isStoredToolCall(block)) {
-				toolCalls.set(block.id, block);
-			}
-		}
-	}
-	return toolCalls;
-}
-
 function projectToolResult(
 	entryId: string,
 	timestamp: string,
 	message: Extract<AgentMessage, { role: "toolResult" }>,
-	toolCall: StoredToolCall | undefined,
+	toolCall: ResolvedSessionToolCall | undefined,
 ): RpcTranscriptToolItem {
 	const args = toolCall?.arguments;
 	const status: RpcTranscriptToolStatus = message.isError ? "failed" : "completed";
@@ -866,16 +846,6 @@ function boundText(text: string, limit: number): string {
 function normalizeTimestamp(timestamp: string): string {
 	const date = new Date(timestamp);
 	return Number.isNaN(date.getTime()) ? timestamp : date.toISOString();
-}
-
-function isStoredToolCall(value: unknown): value is StoredToolCall {
-	return (
-		isRecord(value) &&
-		value.type === "toolCall" &&
-		typeof value.id === "string" &&
-		typeof value.name === "string" &&
-		isRecord(value.arguments)
-	);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
