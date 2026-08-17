@@ -12,6 +12,8 @@ import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dis
 import type { LspSettings } from "./lsp/config.ts";
 import type { Personality } from "./personality.ts";
 
+const DEFAULT_CONTEXT_WARNING_TOKENS = 350_000;
+
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
@@ -44,6 +46,7 @@ export interface TerminalSettings {
 	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
 	showTerminalProgress?: boolean; // default: false (OSC 9;4 terminal progress indicators)
 	turnDoneAlert?: TurnDoneAlert; // default: "off" (bell or desktop notification when a turn finishes while the terminal is unfocused)
+	contextWarningTokens?: number; // default: 350000; 0 disables the absolute context warning
 }
 
 export interface ImageSettings {
@@ -1619,6 +1622,14 @@ export class SettingsManager {
 	getTurnDoneAlert(): TurnDoneAlert {
 		const mode = this.settings.terminal?.turnDoneAlert;
 		return mode === "bell" || mode === "notify" ? mode : "off";
+	}
+
+	getContextWarningTokens(): number {
+		const threshold = this.settings.terminal?.contextWarningTokens;
+		if (typeof threshold !== "number" || !Number.isFinite(threshold) || threshold < 0) {
+			return DEFAULT_CONTEXT_WARNING_TOKENS;
+		}
+		return Math.floor(threshold);
 	}
 
 	setTurnDoneAlert(mode: TurnDoneAlert): void {

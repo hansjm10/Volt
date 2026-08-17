@@ -2,7 +2,7 @@ import { visibleWidth } from "@hansjm10/volt-tui";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.ts";
-import { initTheme } from "../src/core/theme/runtime.ts";
+import { initTheme, theme } from "../src/core/theme/runtime.ts";
 import { FooterComponent, formatCwdForFooter } from "../src/modes/interactive/components/footer.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
@@ -23,6 +23,10 @@ function createSession(options: {
 	fastModeEnabled?: boolean;
 	usage?: AssistantUsage;
 	usingSubscription?: boolean;
+	contextTokens?: number | null;
+	contextWindow?: number;
+	contextPercent?: number | null;
+	contextWarningTokens?: number;
 }): AgentSession {
 	const usage = options.usage;
 	const entries =
@@ -38,13 +42,15 @@ function createSession(options: {
 					},
 				];
 
+	const contextWindow = options.contextWindow ?? 200_000;
+	const contextTokens = options.contextTokens === undefined ? 24_600 : options.contextTokens;
 	const session = {
 		fastModeEnabled: options.fastModeEnabled ?? false,
 		state: {
 			model: {
 				id: options.modelId ?? "test-model",
 				provider: options.provider ?? "test",
-				contextWindow: 200_000,
+				contextWindow,
 				reasoning: options.reasoning ?? false,
 			},
 			thinkingLevel: options.thinkingLevel ?? "off",
@@ -54,9 +60,16 @@ function createSession(options: {
 			getSessionName: () => options.sessionName,
 			getCwd: () => "/tmp/project",
 		},
-		getContextUsage: () => ({ contextWindow: 200_000, percent: 12.3 }),
+		getContextUsage: () => ({
+			tokens: contextTokens,
+			contextWindow,
+			percent: options.contextPercent === undefined ? 12.3 : options.contextPercent,
+		}),
 		modelRegistry: {
 			isUsingOAuth: () => options.usingSubscription ?? false,
+		},
+		settingsManager: {
+			getContextWarningTokens: () => options.contextWarningTokens ?? 350_000,
 		},
 	};
 
@@ -271,5 +284,31 @@ describe("FooterComponent width handling", () => {
 
 		const statsLine = stripAnsi(footer.render(120)[1]);
 		expect(statsLine).toContain("CH25.0%");
+	});
+
+	it("warns at the configured absolute context threshold", () => {
+		const warningFooter = new FooterComponent(
+			createSession({
+				sessionName: "",
+				contextTokens: 350_000,
+				contextWindow: 1_000_000,
+				contextPercent: 35,
+				contextWarningTokens: 350_000,
+			}),
+			createFooterData(1),
+		);
+		const mutedFooter = new FooterComponent(
+			createSession({
+				sessionName: "",
+				contextTokens: 350_000,
+				contextWindow: 1_000_000,
+				contextPercent: 35,
+				contextWarningTokens: 400_000,
+			}),
+			createFooterData(1),
+		);
+
+		expect(warningFooter.render(120)[1]).toContain(theme.fg("warning", "35.0%/1.0M auto"));
+		expect(mutedFooter.render(120)[1]).toContain(theme.fg("muted", "35.0%/1.0M auto"));
 	});
 });

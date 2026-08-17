@@ -223,6 +223,7 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explic
 | `terminal.clearOnShrink` | boolean | `false` | Clear empty rows when content shrinks (can cause flicker) |
 | `terminal.showTerminalProgress` | boolean | `false` | Show OSC 9;4 indeterminate progress in supporting terminal tab bars |
 | `terminal.turnDoneAlert` | string | `"off"` | Alert when Volt finishes a response: `"off"`, `"bell"`, or `"notify"`. `"bell"` writes the terminal BEL sequence, which most terminals and tmux handle as an audible/visual alert according to terminal settings. `"notify"` posts a desktop notification on terminals that support one (kitty via OSC 99; WezTerm, Ghostty, foot, and urxvt via OSC 777; iTerm2 and ConEmu via OSC 9) and falls back to the BEL sequence everywhere else (Windows Terminal, Apple Terminal, VS Code, tmux/screen, unknown terminals). On terminals that support focus reporting (DECSET 1004), the alert is suppressed while the terminal window is focused; terminals without focus reporting always alert |
+| `terminal.contextWarningTokens` | number | `350000` | Turn context usage to the warning color at this absolute token count, in addition to percentage-based warnings. Set to `0` to disable the absolute threshold |
 | `images.autoResize` | boolean | `true` | Resize images to 2000x2000 max |
 | `images.blockImages` | boolean | `false` | Block all images from being sent to LLM |
 
