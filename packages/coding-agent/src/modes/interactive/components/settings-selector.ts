@@ -44,6 +44,19 @@ const DEFAULT_PROJECT_TRUST_BY_LABEL = new Map(
 );
 
 const SESSION_MODEL_LABEL = "session model";
+const CONTEXT_WARNING_TOKEN_PRESETS = [0, 250_000, 350_000, 500_000, 750_000] as const;
+
+function formatContextWarningTokens(tokens: number): string {
+	if (tokens === 0) return "off";
+	if (tokens % 1000 === 0) return `${tokens / 1000}k`;
+	return String(tokens);
+}
+
+function parseContextWarningTokens(value: string): number {
+	if (value === "off") return 0;
+	if (value.endsWith("k")) return Math.floor(Number(value.slice(0, -1)) * 1000);
+	return Math.floor(Number(value));
+}
 
 export interface SettingsConfig {
 	autoCompact: boolean;
@@ -124,6 +137,10 @@ class WarningSettingsSubmenu extends Container {
 		super();
 
 		this.state = { ...warnings };
+		const contextWarningTokens = this.state.contextTokens ?? 350_000;
+		const contextWarningChoices = [...new Set([...CONTEXT_WARNING_TOKEN_PRESETS, contextWarningTokens])]
+			.sort((a, b) => a - b)
+			.map(formatContextWarningTokens);
 
 		const items: SettingItem[] = [
 			{
@@ -132,6 +149,13 @@ class WarningSettingsSubmenu extends Container {
 				description: "Warn when Anthropic subscription auth may use paid extra usage",
 				currentValue: (this.state.anthropicExtraUsage ?? true) ? "true" : "false",
 				values: ["true", "false"],
+			},
+			{
+				id: "context-tokens",
+				label: "Context usage",
+				description: "Warn in the footer at this context token count. The default is 350k.",
+				currentValue: formatContextWarningTokens(contextWarningTokens),
+				values: contextWarningChoices,
 			},
 		];
 
@@ -143,6 +167,10 @@ class WarningSettingsSubmenu extends Container {
 				switch (id) {
 					case "anthropic-extra-usage":
 						this.state = { ...this.state, anthropicExtraUsage: newValue === "true" };
+						onChange({ ...this.state });
+						break;
+					case "context-tokens":
+						this.state = { ...this.state, contextTokens: parseContextWarningTokens(newValue) };
 						onChange({ ...this.state });
 						break;
 				}

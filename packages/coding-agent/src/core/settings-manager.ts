@@ -46,7 +46,6 @@ export interface TerminalSettings {
 	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
 	showTerminalProgress?: boolean; // default: false (OSC 9;4 terminal progress indicators)
 	turnDoneAlert?: TurnDoneAlert; // default: "off" (bell or desktop notification when a turn finishes while the terminal is unfocused)
-	contextWarningTokens?: number; // default: 350000; 0 disables the absolute context warning
 }
 
 export interface ImageSettings {
@@ -67,6 +66,7 @@ export interface MarkdownSettings {
 
 export interface WarningSettings {
 	anthropicExtraUsage?: boolean; // default: true
+	contextTokens?: number; // default: 350000; 0 disables the absolute context warning
 }
 
 export type DefaultProjectTrust = "ask" | "always" | "never";
@@ -1625,7 +1625,7 @@ export class SettingsManager {
 	}
 
 	getContextWarningTokens(): number {
-		const threshold = this.settings.terminal?.contextWarningTokens;
+		const threshold = this.settings.warnings?.contextTokens;
 		if (typeof threshold !== "number" || !Number.isFinite(threshold) || threshold < 0) {
 			return DEFAULT_CONTEXT_WARNING_TOKENS;
 		}

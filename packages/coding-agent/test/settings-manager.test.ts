@@ -924,14 +924,11 @@ describe("SettingsManager", () => {
 		});
 
 		it("should use a configured threshold and allow zero to disable it", () => {
-			writeFileSync(
-				join(agentDir, "settings.json"),
-				JSON.stringify({ terminal: { contextWarningTokens: 425_500 } }),
-			);
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ warnings: { contextTokens: 425_500 } }));
 			const configured = SettingsManager.create(projectDir, agentDir);
 			expect(configured.getContextWarningTokens()).toBe(425_500);
 
-			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ terminal: { contextWarningTokens: 0 } }));
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ warnings: { contextTokens: 0 } }));
 			const disabled = SettingsManager.create(projectDir, agentDir);
 			expect(disabled.getContextWarningTokens()).toBe(0);
 		});

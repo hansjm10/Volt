@@ -116,4 +116,25 @@ describe("SettingsSelectorComponent", () => {
 			cleanup();
 		}
 	});
+
+	test("changes the context warning threshold from the warnings settings", () => {
+		const config = createConfig("default");
+		config.warnings = { contextTokens: 350_000 };
+		const onWarningsChange = vi.fn();
+		const callbacks = createCallbacks(() => {});
+		callbacks.onWarningsChange = onWarningsChange;
+		const settingsList = new SettingsSelectorComponent(config, callbacks).getSettingsList();
+
+		for (const character of "warnings") {
+			settingsList.handleInput(character);
+		}
+		settingsList.handleInput("\n");
+		expect(stripAnsi(settingsList.render(100).join("\n"))).toContain("Context usage");
+		expect(stripAnsi(settingsList.render(100).join("\n"))).toContain("350k");
+
+		settingsList.handleInput("\x1b[B");
+		settingsList.handleInput("\n");
+
+		expect(onWarningsChange).toHaveBeenCalledWith({ contextTokens: 500_000 });
+	});
 });
