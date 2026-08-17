@@ -4,7 +4,7 @@ import { type Static, Type } from "typebox";
 import { Compile } from "typebox/compile";
 import type { SourceInfo } from "../source-info.ts";
 import { bgAnsi, fgAnsi, resolveThemeColors } from "./tokens.ts";
-import type { ColorMode, ThemeBg, ThemeColor } from "./types.ts";
+import type { ColorMode, ThemeBg, ThemeColor, ThemeColorValue } from "./types.ts";
 
 const ColorValueSchema = Type.Union([
 	Type.String(), // hex "#ff0000", var ref "primary", or empty ""
@@ -28,8 +28,11 @@ export const ThemeJsonSchema = Type.Object({
 		dim: ColorValueSchema,
 		text: ColorValueSchema,
 		thinkingText: ColorValueSchema,
-		// Backgrounds & Content Text (11 colors)
+		// Backgrounds & Content Text (11 required, 3 optional)
 		selectedBg: ColorValueSchema,
+		scrollbarThumb: Type.Optional(ColorValueSchema),
+		searchMatchBg: Type.Optional(ColorValueSchema),
+		searchMatchText: Type.Optional(ColorValueSchema),
 		userMessageBg: ColorValueSchema,
 		userMessageText: ColorValueSchema,
 		customMessageBg: ColorValueSchema,
@@ -90,12 +93,34 @@ const validateThemeJson = Compile(ThemeJsonSchema);
 
 export const THEME_BG_COLOR_KEYS: ReadonlySet<string> = new Set([
 	"selectedBg",
+	"scrollbarThumb",
+	"searchMatchBg",
 	"userMessageBg",
 	"customMessageBg",
 	"toolPendingBg",
 	"toolSuccessBg",
 	"toolErrorBg",
 ]);
+
+type OptionalThemeColor = "searchMatchText";
+type OptionalThemeBg = "scrollbarThumb" | "searchMatchBg";
+type ThemeForegrounds = Record<Exclude<ThemeColor, OptionalThemeColor>, ThemeColorValue> &
+	Partial<Record<OptionalThemeColor, ThemeColorValue>>;
+type ThemeBackgrounds = Record<Exclude<ThemeBg, OptionalThemeBg>, ThemeColorValue> &
+	Partial<Record<OptionalThemeBg, ThemeColorValue>>;
+
+export function withThemeColorFallbacks(colors: ThemeJson["colors"]): ThemeJson["colors"] & {
+	scrollbarThumb: ThemeColorValue;
+	searchMatchBg: ThemeColorValue;
+	searchMatchText: ThemeColorValue;
+} {
+	return {
+		...colors,
+		scrollbarThumb: colors.scrollbarThumb ?? colors.selectedBg,
+		searchMatchBg: colors.searchMatchBg ?? colors.selectedBg,
+		searchMatchText: colors.searchMatchText ?? colors.text,
+	};
+}
 
 export class Theme {
 	readonly name?: string;
@@ -108,8 +133,8 @@ export class Theme {
 	private mode: ColorMode;
 
 	constructor(
-		fgColors: Record<ThemeColor, string | number>,
-		bgColors: Record<ThemeBg, string | number>,
+		fgColors: ThemeForegrounds,
+		bgColors: ThemeBackgrounds,
 		mode: ColorMode,
 		options: { name?: string; sourcePath?: string; sourceInfo?: SourceInfo } = {},
 	) {
@@ -117,13 +142,22 @@ export class Theme {
 		this.sourcePath = options.sourcePath;
 		this.sourceInfo = options.sourceInfo;
 		this.mode = mode;
-		this.resolvedColors = { ...fgColors, ...bgColors };
+		const foregrounds: Record<ThemeColor, ThemeColorValue> = {
+			...fgColors,
+			searchMatchText: fgColors.searchMatchText ?? fgColors.text,
+		};
+		const backgrounds: Record<ThemeBg, ThemeColorValue> = {
+			...bgColors,
+			scrollbarThumb: bgColors.scrollbarThumb ?? bgColors.selectedBg,
+			searchMatchBg: bgColors.searchMatchBg ?? bgColors.selectedBg,
+		};
+		this.resolvedColors = { ...foregrounds, ...backgrounds };
 		this.fgColors = new Map();
-		for (const [key, value] of Object.entries(fgColors) as [ThemeColor, string | number][]) {
+		for (const [key, value] of Object.entries(foregrounds) as [ThemeColor, ThemeColorValue][]) {
 			this.fgColors.set(key, fgAnsi(value, mode));
 		}
 		this.bgColors = new Map();
-		for (const [key, value] of Object.entries(bgColors) as [ThemeBg, string | number][]) {
+		for (const [key, value] of Object.entries(backgrounds) as [ThemeBg, ThemeColorValue][]) {
 			this.bgColors.set(key, bgAnsi(value, mode));
 		}
 	}
@@ -259,7 +293,7 @@ export function getDefaultColorMode(): ColorMode {
 
 export function createThemeFromJson(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string): Theme {
 	const colorMode = mode ?? getDefaultColorMode();
-	const resolvedColors = resolveThemeColors(themeJson.colors, themeJson.vars);
+	const resolvedColors = resolveThemeColors(withThemeColorFallbacks(themeJson.colors), themeJson.vars);
 	const fgColors: Record<ThemeColor, string | number> = {} as Record<ThemeColor, string | number>;
 	const bgColors: Record<ThemeBg, string | number> = {} as Record<ThemeBg, string | number>;
 	for (const [key, value] of Object.entries(resolvedColors)) {

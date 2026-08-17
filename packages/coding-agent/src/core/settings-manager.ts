@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import type { Transport } from "@hansjm10/volt-ai";
+import type { TuiMode as RendererTuiMode, ScrollViewScrollbar } from "@hansjm10/volt-tui";
 import { randomUUID } from "crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync } from "fs";
 import { dirname, join } from "path";
@@ -39,6 +40,8 @@ export interface RetrySettings {
 }
 
 export type TurnDoneAlert = "off" | "bell" | "notify";
+export type TuiMode = RendererTuiMode;
+export type FullscreenExitOutput = "transcript" | "resume-hint";
 
 export interface TerminalSettings {
 	showImages?: boolean; // default: true (only relevant if terminal supports images)
@@ -162,6 +165,9 @@ export interface Settings {
 	websocketConnectTimeoutMs?: number; // WebSocket connect/open handshake timeout in milliseconds; 0 disables it
 	lsp?: LspSettings; // LSP diagnostics after edit/write (see docs/lsp.md)
 	remote?: RemoteSettings; // voltd daemon / remote access (see docs/daemon.md)
+	tuiMode?: TuiMode; // default: "regular"
+	fullscreenExitOutput?: FullscreenExitOutput; // default: "transcript"; no effect in regular mode
+	fullscreenScrollbar?: ScrollViewScrollbar; // default: "auto"; no effect in regular mode
 }
 
 export interface RemoteSettings {
@@ -1643,6 +1649,37 @@ export class SettingsManager {
 			},
 			"turnDoneAlert",
 		);
+	}
+
+	getTuiMode(): TuiMode {
+		return this.settings.tuiMode === "fullscreen" ? "fullscreen" : "regular";
+	}
+
+	setTuiMode(mode: TuiMode): void {
+		this.updateGlobalSettings("tuiMode", (settings) => {
+			settings.tuiMode = mode;
+		});
+	}
+
+	getFullscreenExitOutput(): FullscreenExitOutput {
+		return this.settings.fullscreenExitOutput === "resume-hint" ? "resume-hint" : "transcript";
+	}
+
+	setFullscreenExitOutput(output: FullscreenExitOutput): void {
+		this.updateGlobalSettings("fullscreenExitOutput", (settings) => {
+			settings.fullscreenExitOutput = output;
+		});
+	}
+
+	getFullscreenScrollbar(): ScrollViewScrollbar {
+		const mode = this.settings.fullscreenScrollbar;
+		return mode === "always" || mode === "hidden" ? mode : "auto";
+	}
+
+	setFullscreenScrollbar(mode: ScrollViewScrollbar): void {
+		this.updateGlobalSettings("fullscreenScrollbar", (settings) => {
+			settings.fullscreenScrollbar = mode;
+		});
 	}
 
 	getImageAutoResize(): boolean {

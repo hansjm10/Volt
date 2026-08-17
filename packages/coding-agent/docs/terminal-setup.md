@@ -2,9 +2,28 @@
 
 Volt uses the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) for reliable modifier key detection. Most modern terminals support this protocol, but some require configuration.
 
-## Kitty, iTerm2
+## Kitty
 
-Work out of the box.
+Works out of the box.
+
+## iTerm2
+
+### Regular TUI mode
+
+Works out of the box with terminal-owned native scrollback and inline images.
+
+### Fullscreen TUI mode
+
+Volt owns the viewport, so iTerm2 sends mouse-wheel reports instead of scrolling native scrollback. With iTerm2's default fast-trackpad behavior, those reports can lose most of an accelerated wheel delta, making fullscreen scrolling much slower than regular scrolling.
+
+If fast mouse-wheel gestures move only about one line at a time:
+
+1. Open **iTerm2 → Settings → Advanced**.
+2. Search for **Trackpad scrolls fast?** and set it to **No**.
+
+This is an iTerm2-wide workaround and may also change native trackpad scrolling. The underlying behavior is tracked in [iTerm2 issue 9619](https://gitlab.com/gnachman/iterm2/-/work_items/9619).
+
+Fullscreen images render as text placeholders in iTerm2. Its inline-image protocol cannot delete or crop placements safely during application-owned scrolling. Regular mode continues to render iTerm2 inline images.
 
 ## Apple Terminal
 
@@ -26,17 +45,15 @@ Older Claude Code versions may have added this Ghostty mapping:
 keybind = shift+enter=text:\n
 ```
 
-That mapping sends a raw linefeed byte. Inside volt, that is indistinguishable from `Ctrl+J`, so tmux and volt no longer see a real `shift+enter` key event.
+That mapping sends a raw linefeed byte. Inside Volt, that is indistinguishable from `Ctrl+J`, so tmux and Volt no longer see a real `shift+enter` key event.
 
 If Claude Code 2.x or newer is the only reason you added that mapping, you can remove it, unless you want to use Claude Code in tmux, where it still requires that Ghostty mapping.
 
-If you want `Shift+Enter` to keep working in tmux via that remap, add `ctrl+j` to your volt `newLine` keybinding in `~/.volt/agent/keybindings.json`:
+Volt binds `Ctrl+J` as a default newline alias, so `Shift+Enter` keeps working in tmux via that remap without extra Volt configuration.
 
-```json
-{
-  "newLine": ["shift+enter", "ctrl+j"]
-}
-```
+### Fullscreen TUI mode
+
+OSC 8 links remain clickable through Volt, but Ghostty does not show its hover underline or lower-left URL preview while Volt captures mouse input. Hold `Shift+Command` on macOS or `Shift+Ctrl` on Linux to use Ghostty's native link handling instead. Plain URLs that are not emitted as OSC 8 links still depend on the terminal's native link handling.
 
 ## WezTerm
 
@@ -103,7 +120,17 @@ Add to `keybindings.json`:
 }
 ```
 
+## tmux, GNU screen, and Zellij
+
+Fullscreen mode captures mouse input for scrolling, links, selection, and scrollbar dragging. Under tmux, GNU screen, and Zellij, Volt deliberately requests button-motion tracking instead of all-motion tracking to avoid forwarding every passive pointer movement through the multiplexer. Clicks, wheel events, drag selection, and scrollbar dragging still work; passive hover feedback may not update until the next tracked event.
+
+See [tmux setup](tmux.md) for modified-key forwarding. Fullscreen scrolling is application-owned and does not add rows to tmux or screen's native scrollback.
+
 ## Windows Terminal
+
+Windows Terminal 1.22 and newer can render inline images through [Sixel](https://devblogs.microsoft.com/commandline/windows-terminal-preview-1-22-release/). Volt queries the terminal at startup and enables Sixel only when the DA1 response includes attribute `4`; `WT_SESSION` by itself is not enough. Older or unsupported sessions keep the text image placeholder. Tool images in supported JPEG, GIF, and BMP formats are converted to PNG before Sixel rendering.
+
+Sixel works in regular and fullscreen modes when Volt runs directly in Windows Terminal. Fullscreen scrolling and clipping re-encode the visible image region. Since Sixel cannot delete an individual placement, moving, changing, or resizing an image clears and repaints the viewport to avoid stale pixels; text-only updates remain differential. Sixel is disabled under tmux and GNU screen, so run Volt directly in Windows Terminal for inline images.
 
 Add to `settings.json` (Ctrl+Shift+, or Settings → Open JSON file) to forward the modified Enter keys volt uses:
 
@@ -128,6 +155,8 @@ Add to `settings.json` (Ctrl+Shift+, or Settings → Open JSON file) to forward 
 
 If you already have an `actions` array, add the objects to it. If the old fullscreen behavior persists, fully close and reopen Windows Terminal.
 
+In fullscreen mode on native Windows, a right-click reads plaintext from the system clipboard and sends it as bracketed paste to the currently focused input. This avoids relying on terminal-owned paste handling while Volt captures mouse input. Image paste continues to use the configured `app.clipboard.pasteImage` binding.
+
 ## xfce4-terminal, terminator
 
 These terminals have limited escape sequence support. Modified Enter keys like `Ctrl+Enter` and `Shift+Enter` cannot be distinguished from plain `Enter`, preventing custom keybindings such as `submit: ["ctrl+enter"]` from working.
@@ -138,6 +167,10 @@ For the best experience, use a terminal that supports the Kitty keyboard protoco
 - [WezTerm](https://wezfurlong.org/wezterm/)
 - [iTerm2](https://iterm2.com/)
 - [Alacritty](https://github.com/alacritty/alacritty) (requires compilation with Kitty protocol support)
+
+## Escape latency over SSH
+
+Volt waits briefly after a lone Escape byte so it can distinguish the Escape key from a fragmented terminal sequence. The default is 10 ms locally and 100 ms when SSH environment variables are present. Set `VOLT_TUI_ESC_TIMEOUT` to a positive number of milliseconds if a high-latency connection needs a different lone-Escape window. Fragmented CSI and mouse sequences use separate input buffering and are not controlled by this setting.
 
 ## IntelliJ IDEA (Integrated Terminal)
 

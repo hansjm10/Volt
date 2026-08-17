@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import * as path from "node:path";
 import { type AutocompleteProvider, CombinedAutocompleteProvider } from "@hansjm10/volt-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
-import { type Component, Container, type Focusable, TUI } from "../../tui/src/tui.ts";
+import { type Component, Container, type Focusable, type TUI, TuiMainScreen } from "../../tui/src/index.ts";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.ts";
 import type { SourceInfo } from "../src/core/source-info.ts";
@@ -362,7 +362,7 @@ describe("InteractiveMode.showExtensionCustom", () => {
 
 	test("overlay custom UI reclaims input after non-overlay custom UI closes", async () => {
 		const terminal = new VirtualTerminal(80, 24);
-		const ui = new TUI(terminal);
+		const ui = new TuiMainScreen(terminal);
 		const editorContainer = new Container();
 		const editor = new TestFocusableComponent("EDITOR");
 		const palette = new TestFocusableComponent("PALETTE");
@@ -374,12 +374,23 @@ describe("InteractiveMode.showExtensionCustom", () => {
 		let closeReplacement: (value: string) => void = () => {
 			throw new Error("closeReplacement was not initialized");
 		};
-		const fakeThis = {
+		const previousView = {
+			regularComponents: [editorContainer, palette],
+			fullscreenRoot: editorContainer,
+		};
+		const fakeThis: any = {
 			editor,
 			editorContainer,
 			keybindings: {},
 			ui,
+			activeView: previousView,
+			conversationView: previousView,
+			planDetails: undefined,
 		};
+		fakeThis.createDedicatedView = (component: Component) =>
+			(InteractiveMode as any).prototype.createDedicatedView.call(fakeThis, component);
+		fakeThis.activateView = (view: unknown, focus: Component | null, forceRender?: boolean) =>
+			(InteractiveMode as any).prototype.activateView.call(fakeThis, view, focus, forceRender);
 		const showExtensionCustom = <T>(
 			factory: (tui: TUI, theme: unknown, keybindings: unknown, done: (result: T) => void) => Component,
 			options?: { overlay?: boolean },

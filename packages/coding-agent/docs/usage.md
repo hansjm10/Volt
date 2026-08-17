@@ -443,11 +443,18 @@ volt --no-extensions -e ./my-extension.ts
 |--------|-------------|
 | `--system-prompt <text>` | Replace default prompt; context files and skills are still appended |
 | `--append-system-prompt <text>` | Append to system prompt |
+| `--tui-mode <mode>` | Interactive TUI mode: `regular` (default) or `fullscreen` |
 | `--verbose` | Force verbose startup |
 | `-a`, `--approve` | Trust project-local files for this run |
 | `-na`, `--no-approve` | Ignore project-local files for this run |
 | `-h`, `--help` | Show help |
 | `-v`, `--version` | Show version |
+
+In `regular` mode, Volt renders in the main terminal buffer and leaves scrolling to native terminal scrollback. In `fullscreen` mode, the transcript scrolls inside the terminal viewport while queued messages, working status, extension widgets, Plan status, editor, and footer remain fixed at the bottom. Mouse and trackpad input scroll the region under the pointer; keyboard viewport actions target the transcript.
+
+Inline images work in fullscreen terminals that support Kitty, including Kitty and Ghostty, and in Windows Terminal 1.22+ through negotiated Sixel. Volt enables Sixel only when Windows Terminal reports support, converts supported non-PNG tool images before rendering, and re-encodes visible image regions while scrolling. Because Sixel cannot delete individual placements, image changes and movement repaint the full viewport; text-only updates remain differential. Sixel is disabled under tmux and GNU screen. In iTerm2, fullscreen images render as text placeholders because its protocol cannot delete or crop placements during application-owned scrolling; regular mode continues to render them normally. See [Terminal setup](terminal-setup.md) for terminal-specific behavior.
+
+Set **TUI mode** in `/settings` to switch immediately and choose the default for future sessions. `--tui-mode` overrides that setting only for the current run. **Fullscreen scrollbar** controls transcript scrollbar visibility. **Fullscreen exit output** controls shutdown while fullscreen: `transcript` prints the final transcript before Volt's normal resume hint, while `resume-hint` restores the previous main-buffer screen without printing the transcript and leaves only the normal resume hint when one is available.
 
 ### File Arguments
 
@@ -507,6 +514,7 @@ volt --exclude-tools ask_question
 | `VOLT_SHARE_VIEWER_URL` | Base URL for `/share` command viewer links |
 | `VOLT_TELEMETRY` | Override install/update telemetry and provider attribution headers: `1`/`true`/`yes` or `0`/`false`/`no`. This does not disable update checks |
 | `VOLT_CACHE_RETENTION` | Set to `long` for extended prompt cache where supported |
+| `VOLT_TUI_ESC_TIMEOUT` | Milliseconds to wait for bytes following a lone Escape key; defaults to 10 locally and 100 over SSH |
 | `VISUAL`, `EDITOR` | External editor for Ctrl+G |
 
 ## Design Principles
