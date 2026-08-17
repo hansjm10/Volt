@@ -646,6 +646,8 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			}
 		}
 		if (this.shouldDeferViewportInputToOverlay()) return undefined;
+		// An explicit layout without a primary scroll view owns its paging and navigation keys.
+		if (this.layoutRoot !== undefined && this.currentLayout?.primaryScrollView === undefined) return undefined;
 		if (keybindings.matches(data, "tui.altScreen.pageUp")) {
 			if (!isRelease) {
 				this.scrollBy(-Math.max(1, this.getPrimaryScrollView().viewportHeight - PAGE_SCROLL_OVERLAP));

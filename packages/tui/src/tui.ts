@@ -767,6 +767,8 @@ export abstract class TuiBase extends Container implements TUI {
 
 	start(): void {
 		this.stopped = false;
+		// Cached image lines can depend on terminal-side preparation cleared by stop().
+		this.invalidate();
 		this.previousTerminalDeviceAttributes = this.terminal.onDeviceAttributes;
 		this.terminal.onDeviceAttributes = this.terminalDeviceAttributesHandler;
 		this.beforeTerminalStart();

@@ -473,6 +473,23 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
+	it("routes paging keys to focused dedicated layouts without a primary scroll view", async () => {
+		const terminal = new VirtualTerminal(20, 6);
+		const tui = new TuiAltScreen(terminal);
+		const selector = new InputOverlay();
+		tui.setLayoutRoot(new VStack([{ component: selector, grow: 1, shrink: 1, minSize: 0 }]));
+		tui.setFocus(selector);
+		tui.start();
+		await terminal.waitForRender();
+
+		const keys = ["\x1b[5~", "\x1b[6~"];
+		for (const key of keys) terminal.sendInput(key);
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(selector.inputs, keys);
+		tui.stop();
+	});
+
 	it("searches normalized rendered transcript text across rows", () => {
 		assert.deepStrictEqual(findAltScreenSearchMatches(["alpha QUICK", "brown fox"], "quick brown"), [
 			{
@@ -898,6 +915,45 @@ describe("TuiAltScreen", () => {
 			assert.ok(writes.includes(`s=${image.imageId},c=2,r=1,y=8,h=4`));
 			assert.ok(writes.includes('"1;1;2;4'));
 			tui.stop();
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	it("rebuilds clipped Sixel images after stop and restart", async () => {
+		setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 1, heightPx: 1 });
+		try {
+			const terminal = new RecordingTerminal(20, 2);
+			const tui = new TuiAltScreen(terminal);
+			const image = new Image(
+				solidPngBase64(2, 3, [0, 0, 255, 255]),
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ maxWidthCells: 2, maxHeightCells: 3 },
+				{ widthPx: 2, heightPx: 3 },
+			);
+			tui.setLayoutRoot(image);
+			tui.start();
+			await terminal.waitForRender();
+			assert.strictEqual(getSixelRegistryStats().images, 1);
+
+			tui.stop({ preserveScreen: true });
+			assert.strictEqual(getSixelRegistryStats().images, 0);
+			const eventCount = terminal.events.length;
+
+			tui.start();
+			await terminal.waitForRender();
+			const restartWrites = terminal.events
+				.slice(eventCount)
+				.filter((event): event is { type: "write"; data: string } => event.type === "write")
+				.map((event) => event.data)
+				.join("");
+			assert.strictEqual(getSixelRegistryStats().images, 1);
+			assert.match(restartWrites, /\x1b_pi:s=\d+,c=2,r=2,y=0,h=2\x07/);
+			assert.ok(restartWrites.includes("\x1bP0;1;0q"));
+			tui.stop({ preserveScreen: true });
 		} finally {
 			resetCapabilitiesCache();
 			setCellDimensions({ widthPx: 9, heightPx: 18 });
