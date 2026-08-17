@@ -14,6 +14,7 @@ import {
 	parseReviewCommandArgs,
 	prepareReviewWorkflow,
 	REMOTE_REVIEW_FAILURE_MESSAGE,
+	type ReviewUsageSnapshot,
 	resolveReviewModel,
 	runReview,
 } from "../../src/core/review.ts";
@@ -241,6 +242,73 @@ describe("two-pass review pipeline", () => {
 		expect(requestSnapshots[1]?.tools).not.toContain("report_review_candidates");
 		expect(requestSnapshots[1]?.messages).not.toContain("Candidate report accepted");
 		expect(harness.session.messages).toHaveLength(0);
+	});
+
+	it("projects active-pass context and cumulative usage across both isolated sessions", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "review-discovery", contextWindow: 100_000 },
+				{ id: "review-verification", contextWindow: 200_000 },
+			],
+		});
+		harnesses.push(harness);
+		const discoveryModel = harness.getModel("review-discovery");
+		const verificationModel = harness.getModel("review-verification");
+		if (!discoveryModel || !verificationModel) throw new Error("Expected both review models");
+		const snapshot = await createSnapshotRepository(harness);
+		snapshots.push(snapshot);
+		harness.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall("report_review_candidates", {
+					summary: "No candidates.",
+					candidates: [],
+					limitations: [],
+				}),
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage(
+				fauxToolCall("report_review_verification", {
+					summary: "No omission found.",
+					assessment: "complete",
+					decisions: [],
+					priorFindingDecisions: [],
+					limitations: [],
+				}),
+				{ stopReason: "toolUse" },
+			),
+		]);
+		const usageSnapshots: ReviewUsageSnapshot[] = [];
+
+		const run = await runReview({
+			cwd: harness.tempDir,
+			agentDir: harness.tempDir,
+			model: discoveryModel,
+			verifierModel: verificationModel,
+			authStorage: harness.authStorage,
+			modelRegistry: harness.session.modelRegistry,
+			settingsManager: harness.settingsManager,
+			resolved: snapshot,
+			controls: { scopeMode: "full" },
+			onUsage: (usage) => usageSnapshots.push(usage),
+		});
+		snapshots.splice(snapshots.indexOf(snapshot), 1);
+		expect(run.errorMessage).toBeUndefined();
+
+		const discoveryFinal = usageSnapshots.filter((usage) => usage.pass === "discovery").at(-1);
+		const verificationSnapshots = usageSnapshots.filter((usage) => usage.pass === "verification");
+		expect(discoveryFinal).toMatchObject({
+			model: { id: "review-discovery" },
+			contextUsage: { contextWindow: 100_000 },
+		});
+		expect(discoveryFinal?.totals.input).toBeGreaterThan(0);
+		expect(verificationSnapshots[0]?.totals).toEqual(discoveryFinal?.totals);
+		const verificationFinal = verificationSnapshots.at(-1);
+		expect(verificationFinal?.totals.input).toBeGreaterThan(discoveryFinal?.totals.input ?? Number.MAX_VALUE);
+		expect(verificationFinal).toMatchObject({
+			pass: "verification",
+			model: { id: "review-verification" },
+			contextUsage: { contextWindow: 200_000 },
+		});
 	});
 
 	it("repairs candidates anchored outside the explicit path scope", async () => {

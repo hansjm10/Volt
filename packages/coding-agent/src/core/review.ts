@@ -6,7 +6,7 @@ import { join, relative, resolve, sep } from "node:path";
 import type { ThinkingLevel } from "@hansjm10/volt-agent-core";
 import type { Api, Model } from "@hansjm10/volt-ai";
 import { minimatch } from "minimatch";
-import type { AgentSessionEvent } from "./agent-session.ts";
+import type { AgentSession, AgentSessionEvent } from "./agent-session.ts";
 import type { AgentSessionRuntime } from "./agent-session-runtime.ts";
 import type { AuthStorage } from "./auth-storage.ts";
 import { createExtensionRuntime } from "./extensions/loader.ts";
@@ -52,6 +52,7 @@ import {
 } from "./review-tools.ts";
 import { createAgentSession } from "./sdk.ts";
 import { SessionManager } from "./session-manager.ts";
+import type { SessionUsageProjection, SessionUsageTotals } from "./session-usage.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 
 export type { ParsedReview, ReviewCoverage, ReviewFinding, ReviewTarget };
@@ -608,6 +609,12 @@ function collectParentExtensionTools(parentResourceLoader: ResourceLoader | unde
 	return Array.from(toolsByName.values());
 }
 
+export type ReviewPass = "discovery" | "verification";
+
+export interface ReviewUsageSnapshot extends SessionUsageProjection {
+	pass: ReviewPass;
+}
+
 export interface RunReviewOptions {
 	cwd: string;
 	agentDir: string;
@@ -627,6 +634,7 @@ export interface RunReviewOptions {
 	onProgress?: (message: string) => void;
 	onEvent?: (event: ReviewWorkflowToolEvent) => void;
 	onSessionEvent?: (event: AgentSessionEvent) => void;
+	onUsage?: (usage: ReviewUsageSnapshot) => void;
 	workflowId?: string;
 	workflowAction?: string;
 }
@@ -708,6 +716,7 @@ export interface ReviewWorkflowHooks {
 	onProgress?: (message: string) => void;
 	onEvent?: (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent) => void;
 	onSessionEvent?: (event: AgentSessionEvent) => void;
+	onUsage?: (usage: ReviewUsageSnapshot) => void;
 	cleanup?: () => void;
 }
 
@@ -790,6 +799,7 @@ export interface ExecuteReviewWorkflowOptions {
 	onProgress?: (message: string) => void;
 	onEvent?: (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent) => void;
 	onSessionEvent?: (event: AgentSessionEvent) => void;
+	onUsage?: (usage: ReviewUsageSnapshot) => void;
 }
 
 export type ExecuteReviewWorkflowResult =
@@ -1001,8 +1011,55 @@ function effortThinkingLevel(level: ThinkingLevel | undefined, effort: ReviewEff
 	return THINKING_ORDER[Math.max(index, THINKING_ORDER.indexOf("high"))];
 }
 
+const EMPTY_SESSION_USAGE: SessionUsageTotals = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	cost: 0,
+};
+
+function addSessionUsage(left: SessionUsageTotals, right: SessionUsageTotals): SessionUsageTotals {
+	return {
+		input: left.input + right.input,
+		output: left.output + right.output,
+		cacheRead: left.cacheRead + right.cacheRead,
+		cacheWrite: left.cacheWrite + right.cacheWrite,
+		cost: left.cost + right.cost,
+	};
+}
+
+function collectSessionUsage(session: AgentSession): {
+	totals: SessionUsageTotals;
+	contextUsage: ReturnType<AgentSession["getContextUsage"]>;
+	latestCacheHitRate: number | undefined;
+} {
+	const stats = session.getSessionStats();
+	let latestCacheHitRate: number | undefined;
+	const entries = session.sessionManager.getEntries();
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		const usage = entry.message.usage;
+		const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+		latestCacheHitRate = promptTokens > 0 ? (usage.cacheRead / promptTokens) * 100 : undefined;
+		break;
+	}
+	return {
+		totals: {
+			input: stats.tokens.input,
+			output: stats.tokens.output,
+			cacheRead: stats.tokens.cacheRead,
+			cacheWrite: stats.tokens.cacheWrite,
+			cost: stats.cost,
+		},
+		contextUsage: stats.contextUsage,
+		latestCacheHitRate,
+	};
+}
+
 interface ReviewPassOptions<TReport> {
-	name: "discovery" | "verification";
+	name: ReviewPass;
 	cwd: string;
 	agentDir: string;
 	model: Model<Api>;
@@ -1017,11 +1074,18 @@ interface ReviewPassOptions<TReport> {
 	collector: ReviewReportCollector<TReport>;
 	prompt: string;
 	repair: (report: TReport | undefined) => Promise<string[]> | string[];
+	priorUsage: SessionUsageTotals;
 	signal?: AbortSignal;
 	onEvent: (event: AgentSessionEvent) => void;
+	onUsage?: (usage: ReviewUsageSnapshot) => void;
 }
 
-async function runReviewPass<TReport>(options: ReviewPassOptions<TReport>): Promise<TReport> {
+interface ReviewPassResult<TReport> {
+	report: TReport;
+	usage: SessionUsageTotals;
+}
+
+async function runReviewPass<TReport>(options: ReviewPassOptions<TReport>): Promise<ReviewPassResult<TReport>> {
 	const sessionManager = SessionManager.inMemory(options.cwd);
 	if (options.fastModeEnabled) sessionManager.appendFastModeChange(true);
 	const { session } = await createAgentSession({
@@ -1043,11 +1107,38 @@ async function runReviewPass<TReport>(options: ReviewPassOptions<TReport>): Prom
 		await session.waitForClosed();
 		throw new Error("Review aborted");
 	}
+	const publishUsage = (): SessionUsageTotals => {
+		const usage = collectSessionUsage(session);
+		try {
+			options.onUsage?.({
+				pass: options.name,
+				model: options.model,
+				thinkingLevel: session.thinkingLevel,
+				fastModeEnabled: session.fastModeEnabled,
+				contextUsage: usage.contextUsage,
+				totals: addSessionUsage(options.priorUsage, usage.totals),
+				...(usage.latestCacheHitRate === undefined ? {} : { latestCacheHitRate: usage.latestCacheHitRate }),
+			});
+		} catch {
+			// Usage observers are passive and cannot fail an isolated review pass.
+		}
+		return usage.totals;
+	};
 	const onAbort = (): void => {
 		void session.abort();
 	};
 	options.signal?.addEventListener("abort", onAbort, { once: true });
-	const unsubscribe = session.subscribe(options.onEvent, { monitorGitContext: false });
+	const unsubscribe = session.subscribe(
+		(event) => {
+			try {
+				options.onEvent(event);
+			} finally {
+				if (event.type === "message_end" || event.type === "tool_execution_end") publishUsage();
+			}
+		},
+		{ monitorGitContext: false },
+	);
+	publishUsage();
 	try {
 		let previousErrors: string[] = [];
 		for (let attempt = 0; attempt < 2; attempt++) {
@@ -1065,7 +1156,7 @@ async function runReviewPass<TReport>(options: ReviewPassOptions<TReport>): Prom
 			}
 			const report = options.collector.getReport();
 			const errors = await options.repair(report);
-			if (report && errors.length === 0) return report;
+			if (report && errors.length === 0) return { report, usage: publishUsage() };
 			previousErrors = errors.length > 0 ? errors : ["The terminating report tool was not called."];
 			if (attempt === 1) throw new Error(`${options.name} report validation failed: ${previousErrors.join("; ")}`);
 		}
@@ -1130,7 +1221,7 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 		};
 		const candidateCollector = createReviewCandidateReportCollector();
 		let validatedCandidates: ValidatedReviewCandidate[] = [];
-		const candidateReport = await runReviewPass({
+		const candidatePass = await runReviewPass({
 			name: "discovery",
 			cwd: reviewCwd,
 			agentDir: options.agentDir,
@@ -1154,13 +1245,16 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 				validatedCandidates = validation.candidates;
 				return validation.errors;
 			},
+			priorUsage: EMPTY_SESSION_USAGE,
 			signal: options.signal,
 			onEvent: onSessionEvent,
+			onUsage: options.onUsage,
 		});
+		const candidateReport = candidatePass.report;
 		const verificationTracker = new ReviewCoverageTracker();
 		const verificationSnapshotTools = createReviewSnapshotTools(snapshot, verificationTracker);
 		const verificationCollector = createReviewVerificationReportCollector();
-		const verificationReport = await runReviewPass({
+		const verificationPass = await runReviewPass({
 			name: "verification",
 			cwd: reviewCwd,
 			agentDir: options.agentDir,
@@ -1187,9 +1281,12 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 				report
 					? validateReviewVerification(validatedCandidates, report, options.incrementalPlan?.priorOpenFindings)
 					: ["report_review_verification was not called with a valid payload"],
+			priorUsage: candidatePass.usage,
 			signal: options.signal,
 			onEvent: onSessionEvent,
+			onUsage: options.onUsage,
 		});
+		const verificationReport = verificationPass.report;
 		const parsed = buildParsedReview({
 			snapshot,
 			candidateReport,
@@ -1275,6 +1372,7 @@ export async function executeReviewWorkflow(
 		onProgress: options.onProgress,
 		onEvent: options.onEvent,
 		onSessionEvent: options.onSessionEvent,
+		onUsage: options.onUsage,
 		workflowId: prepared.workflowId,
 		workflowAction: prepared.action,
 		incrementalPlan: prepared.incrementalPlan,
@@ -1439,6 +1537,7 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 				signal: hooks?.signal,
 				onProgress: hooks?.onProgress,
 				onSessionEvent: hooks?.onSessionEvent,
+				onUsage: hooks?.onUsage,
 				onEvent: emit,
 			});
 		} finally {
