@@ -34,7 +34,7 @@ describe("TrustSelectorComponent", () => {
 			onCancel: () => {},
 		});
 
-		const output = stripAnsi(selector.render(120).join("\n"));
+		const output = stripAnsi(selector.render(120).lines.join("\n"));
 
 		expect(output).toContain(`Saved decision: trusted (${trustPath})`);
 		expect(output).toContain("Current session: trusted");
@@ -70,7 +70,7 @@ describe("TrustSelectorComponent", () => {
 			onCancel: () => {},
 		});
 
-		const output = stripAnsi(selector.render(120).join("\n"));
+		const output = stripAnsi(selector.render(120).lines.join("\n"));
 
 		expect(output).toContain("Saved decision: trusted (inherited from /parent)");
 	});
@@ -88,7 +88,7 @@ describe("TrustSelectorComponent", () => {
 			onCancel: () => {},
 		});
 
-		const output = stripAnsi(selector.render(120).join("\n"));
+		const output = stripAnsi(selector.render(120).lines.join("\n"));
 		expect(output).toContain(`Saved decision: trusted (inherited from ${parentPath})`);
 		expect(output).toContain(`Trust parent folder (${parentPath}) ✓`);
 

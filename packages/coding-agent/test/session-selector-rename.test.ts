@@ -52,7 +52,7 @@ describe("session selector rename", () => {
 		);
 		await flushPromises();
 
-		const output = selector.render(120).join("\n");
+		const output = selector.render(120).lines.join("\n");
 		expect(output).toContain("ctrl+r");
 		expect(output).toContain("rename");
 	});
@@ -71,7 +71,7 @@ describe("session selector rename", () => {
 		);
 		await flushPromises();
 
-		const output = selector.render(120).join("\n");
+		const output = selector.render(120).lines.join("\n");
 		expect(output).not.toContain("ctrl+r");
 		expect(output).not.toContain("rename");
 	});
@@ -96,7 +96,7 @@ describe("session selector rename", () => {
 		await flushPromises();
 
 		// Rename mode layout
-		const output = selector.render(120).join("\n");
+		const output = selector.render(120).lines.join("\n");
 		expect(output).toContain("Rename Session");
 		expect(output).not.toContain("Resume Session");
 

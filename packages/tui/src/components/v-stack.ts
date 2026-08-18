@@ -1,4 +1,4 @@
-import { type ImagePlacement, renderComponentFrame, setImagePlacements } from "../render-frame.ts";
+import { createRenderFrame, type ImagePlacement, type RenderFrame } from "../render-frame.ts";
 import { allocateStackSizes, Stack, type StackChild, type StackOptions, visibleStackEntries } from "./stack.ts";
 
 export class VStack extends Stack {
@@ -8,10 +8,10 @@ export class VStack extends Stack {
 		super(children, options);
 	}
 
-	override render(width: number): string[] {
+	override render(width: number): RenderFrame {
 		const viewport = { width: Math.max(1, width), height: Number.MAX_SAFE_INTEGER };
 		const entries = visibleStackEntries(this.entries, viewport);
-		const rendered = entries.map((entry) => renderComponentFrame(entry.component, viewport.width));
+		const rendered = entries.map((entry) => entry.component.render(viewport.width));
 		const sizes = allocateStackSizes(
 			entries,
 			rendered.map((frame) => frame.lines.length),
@@ -39,7 +39,7 @@ export class VStack extends Stack {
 			}
 			for (let padding = childLines.length; padding < childSize; padding++) lines.push("");
 		}
-		return setImagePlacements(lines, images);
+		return createRenderFrame(lines, images);
 	}
 }
 

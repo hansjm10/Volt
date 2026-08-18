@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Overlay QA Tests - comprehensive overlay positioning and edge case tests
  *
@@ -353,20 +354,22 @@ class AnchorTestComponent extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
-		return this.box(
-			[
-				"",
-				` Current: ${th.fg("accent", this.anchor)}`,
-				"",
-				` ${th.fg("dim", "Space/→ = next anchor")}`,
-				` ${th.fg("dim", "Enter = confirm")}`,
-				` ${th.fg("dim", "Esc = cancel")}`,
-				"",
-			],
-			width,
-			"Anchor Test",
+		return createRenderFrame(
+			this.box(
+				[
+					"",
+					` Current: ${th.fg("accent", this.anchor)}`,
+					"",
+					` ${th.fg("dim", "Space/→ = next anchor")}`,
+					` ${th.fg("dim", "Enter = confirm")}`,
+					` ${th.fg("dim", "Esc = cancel")}`,
+					"",
+				],
+				width,
+				"Anchor Test",
+			),
 		);
 	}
 }
@@ -394,19 +397,21 @@ class MarginTestComponent extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
-		return this.box(
-			[
-				"",
-				` ${th.fg("accent", this.config.name)}`,
-				"",
-				` ${th.fg("dim", "Space/→ = next config")}`,
-				` ${th.fg("dim", "Esc = close")}`,
-				"",
-			],
-			width,
-			"Margin Test",
+		return createRenderFrame(
+			this.box(
+				[
+					"",
+					` ${th.fg("accent", this.config.name)}`,
+					"",
+					` ${th.fg("dim", "Space/→ = next config")}`,
+					` ${th.fg("dim", "Esc = close")}`,
+					"",
+				],
+				width,
+				"Margin Test",
+			),
 		);
 	}
 }
@@ -430,7 +435,7 @@ class StackOverlayComponent extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
 		// Use different colors for each overlay to show stacking
 		const colors = ["error", "success", "accent"] as const;
@@ -452,7 +457,7 @@ class StackOverlayComponent extends BaseOverlay {
 		lines.push(border("│") + padLine(th.fg("dim", " Press Enter/Esc to close")) + border("│"));
 		lines.push(border(`╰${"─".repeat(innerW)}╯`));
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 }
 
@@ -545,7 +550,7 @@ class StreamingOverflowComponent extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
 		const innerW = Math.max(1, width - 2);
 		const padLine = (s: string) => truncateToWidth(s, innerW, "...", true);
@@ -580,7 +585,7 @@ class StreamingOverflowComponent extends BaseOverlay {
 		result.push(border("│") + padLine(` ${status} ${th.fg("dim", "| ↑↓ scroll | Esc close")}`) + border("│"));
 		result.push(border(`╰${"─".repeat(innerW)}╯`));
 
-		return result;
+		return createRenderFrame(result);
 	}
 
 	dispose(): void {
@@ -604,22 +609,24 @@ class EdgeTestComponent extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
-		return this.box(
-			[
-				"",
-				" This overlay is at the",
-				" right edge of terminal.",
-				"",
-				` ${th.fg("dim", "Verify right border")}`,
-				` ${th.fg("dim", "aligns with edge.")}`,
-				"",
-				` ${th.fg("dim", "Press Esc to close")}`,
-				"",
-			],
-			width,
-			"Edge Test",
+		return createRenderFrame(
+			this.box(
+				[
+					"",
+					" This overlay is at the",
+					" right edge of terminal.",
+					"",
+					` ${th.fg("dim", "Verify right border")}`,
+					` ${th.fg("dim", "aligns with edge.")}`,
+					"",
+					` ${th.fg("dim", "Press Esc to close")}`,
+					"",
+				],
+				width,
+				"Edge Test",
+			),
 		);
 	}
 }
@@ -647,19 +654,21 @@ class PercentTestComponent extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
-		return this.box(
-			[
-				"",
-				` ${th.fg("accent", this.config.name)}`,
-				"",
-				` ${th.fg("dim", "Space/→ = next")}`,
-				` ${th.fg("dim", "Esc = close")}`,
-				"",
-			],
-			width,
-			"Percent Test",
+		return createRenderFrame(
+			this.box(
+				[
+					"",
+					` ${th.fg("accent", this.config.name)}`,
+					"",
+					` ${th.fg("dim", "Space/→ = next")}`,
+					` ${th.fg("dim", "Esc = close")}`,
+					"",
+				],
+				width,
+				"Percent Test",
+			),
 		);
 	}
 }
@@ -679,7 +688,7 @@ class MaxHeightTestComponent extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
 		// Intentionally render 21 lines - maxHeight: 10 will truncate to first 10
 		// You should see header + lines 1-6, with bottom border cut off
@@ -695,7 +704,7 @@ class MaxHeightTestComponent extends BaseOverlay {
 
 		contentLines.push("", th.fg("dim", " Press Esc to close"));
 
-		return this.box(contentLines, width, "MaxHeight Test");
+		return createRenderFrame(this.box(contentLines, width, "MaxHeight Test"));
 	}
 }
 
@@ -727,7 +736,7 @@ class SidepanelComponent extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
 		const innerW = Math.max(1, width - 2);
 		const padLine = (s: string) => truncateToWidth(s, innerW, "...", true);
@@ -756,7 +765,7 @@ class SidepanelComponent extends BaseOverlay {
 		lines.push(border("│") + padLine(th.fg("dim", " ↑↓ navigate | Esc close")) + border("│"));
 		lines.push(border(`╰${"─".repeat(innerW)}╯`));
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 }
 
@@ -802,7 +811,7 @@ class AnimationDemoComponent extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
 		const innerW = Math.max(1, width - 2);
 		const padLine = (s: string) => truncateToWidth(s, innerW, "...", true);
@@ -841,7 +850,7 @@ class AnimationDemoComponent extends BaseOverlay {
 		lines.push(border("│") + padLine(th.fg("dim", " Press Esc to close")) + border("│"));
 		lines.push(border(`╰${"─".repeat(innerW)}╯`));
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	dispose(): void {
@@ -909,29 +918,31 @@ class ToggleDemoComponent extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
-		return this.box(
-			[
-				"",
-				th.fg("accent", " Toggle Demo"),
-				"",
-				" This overlay demonstrates the",
-				" onHandle callback API.",
-				"",
-				` Toggle count: ${th.fg("accent", String(this.toggleCount))}`,
-				"",
-				th.fg("dim", " Press 't' to hide for 1 second"),
-				th.fg("dim", " (demonstrates setHidden API)"),
-				"",
-				th.fg("dim", " In real usage, a global keybinding"),
-				th.fg("dim", " would toggle visibility externally."),
-				"",
-				th.fg("dim", " Press Esc to close"),
-				"",
-			],
-			width,
-			"Toggle Demo",
+		return createRenderFrame(
+			this.box(
+				[
+					"",
+					th.fg("accent", " Toggle Demo"),
+					"",
+					" This overlay demonstrates the",
+					" onHandle callback API.",
+					"",
+					` Toggle count: ${th.fg("accent", String(this.toggleCount))}`,
+					"",
+					th.fg("dim", " Press 't' to hide for 1 second"),
+					th.fg("dim", " (demonstrates setHidden API)"),
+					"",
+					th.fg("dim", " In real usage, a global keybinding"),
+					th.fg("dim", " would toggle visibility externally."),
+					"",
+					th.fg("dim", " Press Esc to close"),
+					"",
+				],
+				width,
+				"Toggle Demo",
+			),
 		);
 	}
 }
@@ -979,23 +990,25 @@ class PassiveDemoController extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
 		const display = this.typed.length > 0 ? this.typed : th.fg("dim", "(type here)");
-		return this.box(
-			[
-				"",
-				` ${th.fg("dim", `focused=${this.focused} inputs=${this.inputCount}`)}`,
-				` ${th.fg("dim", `last: ${this.lastInputDebug || "none"}`)}`,
-				"",
-				` > ${display}`,
-				"",
-				th.fg("dim", " Type to prove input goes here."),
-				th.fg("dim", " Press Esc to close both."),
-				"",
-			],
-			width,
-			"Non-Capturing Demo",
+		return createRenderFrame(
+			this.box(
+				[
+					"",
+					` ${th.fg("dim", `focused=${this.focused} inputs=${this.inputCount}`)}`,
+					` ${th.fg("dim", `last: ${this.lastInputDebug || "none"}`)}`,
+					"",
+					` > ${display}`,
+					"",
+					th.fg("dim", " Type to prove input goes here."),
+					th.fg("dim", " Press Esc to close both."),
+					"",
+				],
+				width,
+				"Non-Capturing Demo",
+			),
 		);
 	}
 
@@ -1020,12 +1033,14 @@ class TimerPanel extends BaseOverlay {
 		this.seconds++;
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
 		const mins = Math.floor(this.seconds / 60);
 		const secs = this.seconds % 60;
 		const time = `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-		return this.box([` ${th.fg("accent", time)}`, th.fg("dim", " nonCapturing: true")], width, "Timer");
+		return createRenderFrame(
+			this.box([` ${th.fg("accent", time)}`, th.fg("dim", " nonCapturing: true")], width, "Timer"),
+		);
 	}
 }
 
@@ -1102,28 +1117,30 @@ class FocusDemoController extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
 		const focused = this.entries.find((entry) => entry.handle.isFocused())?.panel.label ?? "Controller";
-		return this.box(
-			[
-				"",
-				` Current focus: ${th.fg("accent", focused)}`,
-				"",
-				" Three overlapping panels above are",
-				` ${th.fg("accent", "nonCapturing")} overlays controlled with`,
-				" raw OverlayHandle.focus()/hide().",
-				"",
-				" Type in the focused panel's input.",
-				" Focused panel renders on top.",
-				"",
-				th.fg("dim", " Tab/Shift+Tab = cycle panels"),
-				th.fg("dim", " Esc/Ctrl+D = dismiss panel"),
-				th.fg("dim", " Ctrl+C = close all"),
-				"",
-			],
-			width,
-			"Focus + Input Demo",
+		return createRenderFrame(
+			this.box(
+				[
+					"",
+					` Current focus: ${th.fg("accent", focused)}`,
+					"",
+					" Three overlapping panels above are",
+					` ${th.fg("accent", "nonCapturing")} overlays controlled with`,
+					" raw OverlayHandle.focus()/hide().",
+					"",
+					" Type in the focused panel's input.",
+					" Focused panel renders on top.",
+					"",
+					th.fg("dim", " Tab/Shift+Tab = cycle panels"),
+					th.fg("dim", " Esc/Ctrl+D = dismiss panel"),
+					th.fg("dim", " Ctrl+C = close all"),
+					"",
+				],
+				width,
+				"Focus + Input Demo",
+			),
 		);
 	}
 
@@ -1217,7 +1234,7 @@ class FocusPanel extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
 		const innerW = Math.max(1, width - 2);
 		const border = (c: string) => th.fg(this.focused ? this.color : "dim", c);
@@ -1226,7 +1243,7 @@ class FocusPanel extends BaseOverlay {
 		const lines: string[] = [];
 
 		this.input.focused = this.focused;
-		const [inputLine = ""] = this.input.render(Math.max(1, innerW - 8));
+		const [inputLine = ""] = this.input.render(Math.max(1, innerW - 8)).lines;
 		lines.push(border(`╭${"─".repeat(innerW)}╮`));
 		lines.push(
 			border("│") +
@@ -1242,7 +1259,7 @@ class FocusPanel extends BaseOverlay {
 		lines.push(border("│") + padLine(th.fg("dim", " Esc/Ctrl+D dismiss")) + border("│"));
 		lines.push(border(`╰${"─".repeat(innerW)}╯`));
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 }
 
@@ -1339,7 +1356,7 @@ class StreamingInputController extends BaseOverlay {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
 		const focusedLabel =
 			this.focusIndex === -1
@@ -1371,7 +1388,7 @@ class StreamingInputController extends BaseOverlay {
 		lines.push(th.fg("dim", " Tab = cycle focus | Esc = close all"));
 		lines.push("");
 
-		return this.box(lines, width, "Streaming + Input Test");
+		return createRenderFrame(this.box(lines, width, "Streaming + Input Test"));
 	}
 
 	override dispose(): void {
@@ -1414,7 +1431,7 @@ class StreamingInputPanel implements Component {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const th = this.theme;
 		const focused = this.handle?.isFocused() ?? false;
 		const innerW = Math.max(1, width - 2);
@@ -1443,7 +1460,7 @@ class StreamingInputPanel implements Component {
 		lines.push(border("│") + padLine(th.fg("dim", " Tab | Esc")) + border("│"));
 		lines.push(border(`╰${"─".repeat(innerW)}╯`));
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	invalidate(): void {}

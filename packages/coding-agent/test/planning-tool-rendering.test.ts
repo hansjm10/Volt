@@ -42,7 +42,7 @@ function createFakeTui(): TUI {
 }
 
 function plain(component: ToolExecutionComponent, width = 120): string {
-	return stripAnsi(component.render(width).join("\n"));
+	return stripAnsi(component.render(width).lines.join("\n"));
 }
 
 function normalized(component: ToolExecutionComponent, width = 120): string {
@@ -94,7 +94,7 @@ describe("planning tool TUI rendering", () => {
 		expect(collapsed).not.toContain("EXPANDED_STEP_TAIL");
 
 		component.setExpanded(true);
-		const expandedLines = component.render(80);
+		const expandedLines = component.render(80).lines;
 		const expandedPlainLines = expandedLines.map(stripAnsi);
 		const expanded = expandedPlainLines.join("\n").replace(/\s+/g, " ");
 		expect(expanded).toContain("update plan · 3 steps [success]");

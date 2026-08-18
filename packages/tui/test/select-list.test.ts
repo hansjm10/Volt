@@ -17,7 +17,7 @@ const visibleIndexOf = (line: string, text: string): number => {
 	return visibleWidth(line.slice(0, index));
 };
 
-const lineAt = (lines: string[], index: number): string => {
+const lineAt = (lines: readonly string[], index: number): string => {
 	const line = lines[index];
 	assert.ok(line, `Expected rendered line at index ${index}`);
 	return line;
@@ -34,7 +34,7 @@ describe("SelectList", () => {
 		];
 
 		const list = new SelectList(items, 5, testTheme);
-		const rendered = list.render(100);
+		const rendered = list.render(100).lines;
 
 		assert.ok(rendered.length > 0);
 		const firstLine = lineAt(rendered, 0);
@@ -53,7 +53,7 @@ describe("SelectList", () => {
 		];
 
 		const list = new SelectList(items, 5, testTheme);
-		const rendered = list.render(80);
+		const rendered = list.render(80).lines;
 
 		assert.equal(
 			visibleIndexOf(lineAt(rendered, 0), "short description"),
@@ -71,7 +71,7 @@ describe("SelectList", () => {
 			minPrimaryColumnWidth: 12,
 			maxPrimaryColumnWidth: 20,
 		});
-		const rendered = list.render(80);
+		const rendered = list.render(80).lines;
 
 		assert.equal(lineAt(rendered, 0).indexOf("first"), 14);
 		assert.equal(lineAt(rendered, 1).indexOf("second"), 14);
@@ -91,7 +91,7 @@ describe("SelectList", () => {
 			minPrimaryColumnWidth: 12,
 			maxPrimaryColumnWidth: 20,
 		});
-		const rendered = list.render(80);
+		const rendered = list.render(80).lines;
 
 		assert.equal(visibleIndexOf(lineAt(rendered, 0), "first"), 22);
 		assert.equal(visibleIndexOf(lineAt(rendered, 1), "second"), 22);
@@ -118,7 +118,7 @@ describe("SelectList", () => {
 				return `${text.slice(0, Math.max(0, maxWidth - 1))}…`;
 			},
 		});
-		const rendered = list.render(80);
+		const rendered = list.render(80).lines;
 
 		assert.ok(lineAt(rendered, 0).includes("…"));
 		assert.equal(visibleIndexOf(lineAt(rendered, 0), "first"), visibleIndexOf(lineAt(rendered, 1), "second"));

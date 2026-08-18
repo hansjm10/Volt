@@ -351,7 +351,7 @@ function printSelfUpdateNote(note: string): void {
 		const width = Math.max(20, process.stdout.columns ?? 80);
 		const renderedLines = new Markdown(trimmedNote, 0, 0, SELF_UPDATE_NOTE_MARKDOWN_THEME)
 			.render(width)
-			.map((line) => line.trimEnd());
+			.lines.map((line) => line.trimEnd());
 		console.log(renderedLines.join("\n"));
 	} catch {
 		console.log(trimmedNote);

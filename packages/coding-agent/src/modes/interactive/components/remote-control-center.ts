@@ -1,5 +1,13 @@
 import { isAbsolute, relative, resolve } from "node:path";
-import { type Component, getKeybindings, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@hansjm10/volt-tui";
+import {
+	type Component,
+	createRenderFrame,
+	getKeybindings,
+	type RenderFrame,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@hansjm10/volt-tui";
 import { getAgentDir, VERSION } from "../../../config.ts";
 import {
 	IROH_REMOTE_ACCESS_PRESET_NAMES,
@@ -411,8 +419,8 @@ export class RemoteControlCenterComponent implements Component {
 		void this.backend.close();
 	}
 
-	render(width: number): string[] {
-		if (width <= 0) return [];
+	render(width: number): RenderFrame {
+		if (width <= 0) return createRenderFrame([]);
 		const height = Math.max(6, this.options.getTerminalRows() || 24);
 		const header = this.renderHeader(width);
 		const footer = this.renderFooter(width);
@@ -430,7 +438,7 @@ export class RemoteControlCenterComponent implements Component {
 		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxOffset));
 		const body = rows.slice(this.scrollOffset, this.scrollOffset + pageSize).map((row) => this.renderRow(row, width));
 		while (body.length < pageSize) body.push("");
-		return [...header, ...body, ...footer];
+		return createRenderFrame([...header, ...body, ...footer]);
 	}
 
 	handleInput(data: string): void {
@@ -934,7 +942,7 @@ export class RemoteControlCenterComponent implements Component {
 		const title = theme.bold(theme.fg("accent", "Remote Access"));
 		const right = theme.fg(this.view.kind === "offline" ? "warning" : "muted", state);
 		const gap = " ".repeat(Math.max(1, width - visibleWidth(title) - visibleWidth(right) - 2));
-		return [new DynamicBorder().render(width)[0]!, truncateToWidth(` ${title}${gap}${right} `, width, ""), ""];
+		return [new DynamicBorder().render(width).lines[0]!, truncateToWidth(` ${title}${gap}${right} `, width, ""), ""];
 	}
 
 	private renderFooter(width: number): string[] {
@@ -943,7 +951,7 @@ export class RemoteControlCenterComponent implements Component {
 		hints.push(
 			keyHint("tui.select.cancel", this.view.kind === "overview" || this.view.kind === "offline" ? "close" : "back"),
 		);
-		return [truncateToWidth(` ${hints.join("  ")}`, width, ""), new DynamicBorder().render(width)[0]!];
+		return [truncateToWidth(` ${hints.join("  ")}`, width, ""), new DynamicBorder().render(width).lines[0]!];
 	}
 
 	private buildRows(width: number, pageSize: number): DisplayRow[] {

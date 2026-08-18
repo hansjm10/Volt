@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * POWERED BY DAXNUTS - Easter egg for OpenCode + Kimi K2.5
  *
@@ -92,9 +93,9 @@ export class DaxnutsComponent implements Component {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		if (width === this.cachedWidth && this.cachedTick === this.tick) {
-			return this.cachedLines;
+			return createRenderFrame(this.cachedLines);
 		}
 
 		const t = theme;
@@ -155,7 +156,7 @@ export class DaxnutsComponent implements Component {
 		this.cachedLines = lines;
 		this.cachedWidth = width;
 		this.cachedTick = this.tick;
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	dispose(): void {

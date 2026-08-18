@@ -737,7 +737,7 @@ describe("Editor component", () => {
 
 			// ✅ is 2 columns wide, so "Hello ✅ World" is 14 columns
 			editor.setText("Hello ✅ World");
-			const lines = editor.render(width);
+			const lines = editor.render(width).lines;
 
 			// All content lines (between borders) should fit within width
 			for (let i = 1; i < lines.length - 1; i++) {
@@ -753,7 +753,7 @@ describe("Editor component", () => {
 			// Each ✅ is 2 columns. "✅✅✅✅✅" = 10 columns, fits exactly
 			// "✅✅✅✅✅✅" = 12 columns, needs wrap
 			editor.setText("✅✅✅✅✅✅");
-			const lines = editor.render(width);
+			const lines = editor.render(width).lines;
 
 			// Should have 2 content lines (plus 2 border lines)
 			// First line: 5 emojis (10 cols), second line: 1 emoji (2 cols) + padding
@@ -769,7 +769,7 @@ describe("Editor component", () => {
 				const width = 8;
 				editor.setText(text);
 
-				for (const line of editor.render(width)) {
+				for (const line of editor.render(width).lines) {
 					assert.strictEqual(visibleWidth(line), width, `line width drift for ${JSON.stringify(text)}: ${line}`);
 				}
 			}
@@ -781,7 +781,7 @@ describe("Editor component", () => {
 
 			// Each CJK char is 2 columns. "日本語テスト" = 6 chars = 12 columns
 			editor.setText("日本語テスト");
-			const lines = editor.render(width);
+			const lines = editor.render(width).lines;
 
 			for (let i = 1; i < lines.length - 1; i++) {
 				const lineWidth = visibleWidth(lines[i]!);
@@ -801,7 +801,7 @@ describe("Editor component", () => {
 
 			// "Test ✅ OK 日本" = 4 + 1 + 2 + 1 + 2 + 1 + 4 = 15 columns (fits in width-1=15)
 			editor.setText("Test ✅ OK 日本");
-			const lines = editor.render(width);
+			const lines = editor.render(width).lines;
 
 			// Should fit in one content line
 			const contentLines = lines.slice(1, -1);
@@ -817,7 +817,7 @@ describe("Editor component", () => {
 
 			editor.setText("A✅B");
 			// Cursor should be at end (after B)
-			const lines = editor.render(width);
+			const lines = editor.render(width).lines;
 
 			// The cursor (reverse video space) should be visible
 			const contentLine = lines[1]!;
@@ -834,7 +834,7 @@ describe("Editor component", () => {
 			// "0123456789✅" = 10 ASCII + 2-wide emoji = 12 columns
 			// Should wrap before the emoji since it would exceed width
 			editor.setText("0123456789✅");
-			const lines = editor.render(width);
+			const lines = editor.render(width).lines;
 
 			for (let i = 1; i < lines.length - 1; i++) {
 				const lineWidth = visibleWidth(lines[i]!);
@@ -849,7 +849,7 @@ describe("Editor component", () => {
 
 				// Type 9 chars → fills layoutWidth exactly, cursor at end on same line
 				for (const ch of "aaaaaaaaa") editor.handleInput(ch);
-				let lines = editor.render(width + paddingX + 2);
+				let lines = editor.render(width + paddingX + 2).lines;
 				let contentLines = lines.slice(1, -1);
 				assert.strictEqual(contentLines.length, 1, "Should be 1 content line before wrap");
 				// Cursor should be the last visible glyph before the right border
@@ -861,7 +861,7 @@ describe("Editor component", () => {
 
 				// Type 1 more → text wraps to second line
 				editor.handleInput("a");
-				lines = editor.render(width + paddingX + 2);
+				lines = editor.render(width + paddingX + 2).lines;
 				contentLines = lines.slice(1, -1);
 				assert.strictEqual(contentLines.length, 2, "Should wrap to 2 content lines");
 			}
@@ -874,7 +874,7 @@ describe("Editor component", () => {
 			const width = 40;
 
 			editor.setText("Hello world this is a test of word wrapping functionality");
-			const lines = editor.render(width);
+			const lines = editor.render(width).lines;
 
 			// Get content lines (between borders)
 			const contentLines = lines.slice(1, -1).map((l) => stripSideBorders(l).trim());
@@ -896,7 +896,7 @@ describe("Editor component", () => {
 			const width = 20;
 
 			editor.setText("Word1 Word2 Word3 Word4 Word5 Word6");
-			const lines = editor.render(width);
+			const lines = editor.render(width).lines;
 
 			// Get content lines (between borders)
 			const contentLines = lines.slice(1, -1);
@@ -917,7 +917,7 @@ describe("Editor component", () => {
 			const width = 30;
 
 			editor.setText("Check https://example.com/very/long/path/that/exceeds/width here");
-			const lines = editor.render(width);
+			const lines = editor.render(width).lines;
 
 			// All lines should fit within width
 			for (let i = 1; i < lines.length - 1; i++) {
@@ -931,7 +931,7 @@ describe("Editor component", () => {
 			const width = 50;
 
 			editor.setText("Word1   Word2    Word3");
-			const lines = editor.render(width);
+			const lines = editor.render(width).lines;
 
 			const contentLine = stripVTControlCharacters(lines[1]!).trim();
 			// Multiple spaces should be preserved
@@ -943,7 +943,7 @@ describe("Editor component", () => {
 			const width = 40;
 
 			editor.setText("");
-			const lines = editor.render(width);
+			const lines = editor.render(width).lines;
 
 			// Should have border + empty content + border
 			assert.strictEqual(lines.length, 3);
@@ -954,7 +954,7 @@ describe("Editor component", () => {
 			const width = 10 + 1 + 2; // +1 col reserved for cursor, +2 for side borders
 
 			editor.setText("1234567890");
-			const lines = editor.render(width);
+			const lines = editor.render(width).lines;
 
 			// Should have exactly 3 lines (top border, content, bottom border)
 			assert.strictEqual(lines.length, 3);
@@ -2337,7 +2337,7 @@ describe("Editor component", () => {
 			assert.strictEqual(editor.isShowingAutocomplete(), true);
 			const atArg = editor
 				.render(80)
-				.map((l) => stripVTControlCharacters(l))
+				.lines.map((l) => stripVTControlCharacters(l))
 				.join("\n");
 			assert.ok(atArg.includes("repo"), "argument menu should be visible at `/cmd `");
 
@@ -2349,7 +2349,7 @@ describe("Editor component", () => {
 			// (replaced by the command-name suggestion, or the picker closed).
 			const afterMove = editor
 				.render(80)
-				.map((l) => stripVTControlCharacters(l))
+				.lines.map((l) => stripVTControlCharacters(l))
 				.join("\n");
 			assert.ok(!afterMove.includes("repo"), "stale argument menu must not survive the cursor move");
 			assert.ok(!afterMove.includes("message"), "stale argument menu must not survive the cursor move");
@@ -3398,7 +3398,7 @@ describe("Editor component", () => {
 			// Line 0: short
 			// Line 1: 30 chars = wraps to 3 visual lines at width 10 (after padding)
 			editor.setText("short\n123456789012345678901234567890");
-			editor.render(15); // This gives 12 layout width (2 cols for borders, 1 for cursor)
+			editor.render(15).lines; // This gives 12 layout width (2 cols for borders, 1 for cursor)
 
 			// Position at end of line 1 (col 30)
 			assert.deepStrictEqual(editor.getCursor(), { line: 1, col: 30 });
@@ -3481,7 +3481,7 @@ describe("Editor component", () => {
 			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 15 });
 
 			// Render with narrower width to simulate resize
-			editor.render(14); // Width 14 (layoutWidth = 11 after borders)
+			editor.render(14).lines; // Width 14 (layoutWidth = 11 after borders)
 
 			// Move down - sticky should be clamped to new width
 			editor.handleInput("\x1b[B"); // Down - line 1
@@ -3508,7 +3508,7 @@ describe("Editor component", () => {
 			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 5 });
 
 			// Narrow the editor
-			editor.render(12);
+			editor.render(12).lines;
 
 			// Move down - preferredVisualCol was 15, but layoutWidth is 9
 			// Should land on line 1, clamped to width (visual col 9, which is logical col 9)
@@ -3520,7 +3520,7 @@ describe("Editor component", () => {
 			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 5 }); // Line 0 only has 5 chars
 
 			// Restore the original width
-			editor.render(80);
+			editor.render(80).lines;
 
 			// Move down - preferredVisualCol was kept at 15
 			editor.handleInput("\x1b[B"); // Down to line 1
@@ -3537,14 +3537,14 @@ describe("Editor component", () => {
 
 			// Narrow to width 12 (layoutWidth = 9 after borders).
 			// Line 0 last segment has visual col max 9, line 1 first segment max 8
-			editor.render(12);
+			editor.render(12).lines;
 
 			// Move down: cursor clamps to 8
 			editor.handleInput("\x1b[B");
 			assert.deepStrictEqual(editor.getCursor(), { line: 1, col: 8 });
 
 			// Widen back. Move up, the current visual col wins
-			editor.render(80);
+			editor.render(80).lines;
 			editor.handleInput("\x1b[A");
 			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 8 });
 
@@ -3562,12 +3562,12 @@ describe("Editor component", () => {
 			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 18 });
 
 			// Narrow to width 12 (layoutWidth = 9 after borders). Moving down clamps to col 8
-			editor.render(12);
+			editor.render(12).lines;
 			editor.handleInput("\x1b[B");
 			assert.deepStrictEqual(editor.getCursor(), { line: 1, col: 8 });
 
 			// Widen the editor
-			editor.render(80);
+			editor.render(80).lines;
 
 			// Move down to short line "ab".
 			// preferredVisualCol is replaced with current visual col (8), cursor clamps to 2
@@ -3783,7 +3783,7 @@ describe("Editor component", () => {
 			assert.ok(visibleWidth(marker[0]) > 8, "marker should be wider than render width");
 
 			// Render at very narrow width - should not throw
-			const lines = editor.render(8);
+			const lines = editor.render(8).lines;
 			// Every rendered line must fit within the width (marker is split)
 			for (const line of lines) {
 				assert.ok(
@@ -3819,7 +3819,7 @@ describe("Editor component", () => {
 
 			// Render at width 54 - should not throw
 			const renderWidth = 54;
-			const lines = editor.render(renderWidth);
+			const lines = editor.render(renderWidth).lines;
 			for (const line of lines) {
 				assert.ok(
 					visibleWidth(line) <= renderWidth,
@@ -3848,7 +3848,7 @@ describe("Editor component", () => {
 
 			// Render at width 54 (contentWidth=54, layoutWidth=53 with paddingX=0)
 			const renderWidth = 54;
-			const lines = editor.render(renderWidth);
+			const lines = editor.render(renderWidth).lines;
 			for (const line of lines) {
 				assert.ok(
 					visibleWidth(line) <= renderWidth,
@@ -3888,7 +3888,7 @@ describe("Editor component", () => {
 			// Create a large paste to get a marker
 			const bigContent = "x".repeat(2000);
 			editor.handleInput(`\x1b[200~${bigContent}\x1b[201~`);
-			editor.render(80);
+			editor.render(80).lines;
 
 			const text = editor.getText();
 			assert.match(text, /\[paste #\d+ \d+ chars\]/);
@@ -3931,7 +3931,7 @@ describe("Editor component", () => {
 			editor.handleInput("\n");
 			editor.handleInput("\n");
 			for (const ch of "abcdefghijklmnop") editor.handleInput(ch);
-			editor.render(30);
+			editor.render(30).lines;
 
 			// Navigate to line 0, col 10
 			for (let i = 0; i < 4; i++) editor.handleInput("\x1b[A"); // Up to line 0
@@ -3980,7 +3980,7 @@ describe("Editor component", () => {
 			for (const ch of "ijklmnopqr") editor.handleInput(ch);
 			editor.handleInput("\n");
 			for (const ch of "123456789012345678") editor.handleInput(ch);
-			editor.render(22); // layoutWidth = 19 after borders
+			editor.render(22).lines; // layoutWidth = 19 after borders
 
 			const text = editor.getText();
 			const markerMatch = text.match(/\[paste #\d+ \+\d+ lines]/);
@@ -4035,7 +4035,7 @@ describe("Editor component", () => {
 			for (const ch of "ijklmnopqr") editor.handleInput(ch);
 			editor.handleInput("\n");
 			for (const ch of "123456789012345678") editor.handleInput(ch);
-			editor.render(22); // layoutWidth = 19 after borders
+			editor.render(22).lines; // layoutWidth = 19 after borders
 
 			// Navigate to line 0, col 3 (on "d")
 			editor.handleInput("\x1b[A"); // Up to line 0

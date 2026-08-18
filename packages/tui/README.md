@@ -129,7 +129,7 @@ if (isViewportTUI(tui)) {
 
 Stack entries support `basis`, `grow`, `shrink`, `minSize`, `maxSize`, and responsive `visible` callbacks. Mouse-wheel input targets the deepest scroll view under the pointer, and unused delta chains to outer scroll views by default; set `overscroll: "contain"` to stop that chaining. The scroll view marked `primary: true` receives alternate-screen keyboard navigation and wheel input over non-scrollable regions, so pointer routing does not change keyboard focus.
 
-The primary scroll view can jump between OSC 133 semantic prompt markers. Press `Ctrl+Shift+F` to search its rendered content, `Enter`/`Ctrl+G` and `Shift+Enter`/`Ctrl+Shift+G` to move between matches, and `Escape` to close search. `TuiAltScreenOptions.searchMatchStyle` and `searchCurrentMatchStyle` customize match highlighting.
+The primary scroll view can jump between OSC 133 semantic prompt markers. Call `scrollView.setPrimary(true)` when focus changes between independently scrollable panes. Press `Ctrl+Shift+F` to search the primary view's rendered content, `Enter`/`Ctrl+G` and `Shift+Enter`/`Ctrl+Shift+G` to move between matches, and `Escape` to close search. `TuiAltScreenOptions.searchMatchStyle` and `searchCurrentMatchStyle` customize match highlighting.
 
 Layout geometry is rebuilt for each requested frame. Stateful components are retained, and their existing rendered-line caches remain effective. Before painting, alternate-screen layout conditionally repeats with a fresh cache until render-visible `ScrollView` geometry such as `viewportHeight`, `scrollTop`, follow state, and scrollbar visibility is current. Components may render from that state, but their output must converge within eight layout passes; non-convergent geometry throws a developer error instead of painting a contradictory frame. Calling `render(width)` directly on layout components produces an unbounded document without viewport stabilization, which is also used when alternate-screen mode restores the main screen.
 
@@ -216,8 +216,13 @@ tui.hasOverlay();
 All components implement:
 
 ```typescript
+interface RenderFrame {
+  readonly lines: readonly string[];
+  readonly images: readonly ImagePlacement[];
+}
+
 interface Component {
-  render(width: number): string[];
+  render(width: number): RenderFrame;
   handleInput?(data: string): void;
   invalidate?(): void;
 }
@@ -225,9 +230,11 @@ interface Component {
 
 | Method | Description |
 |--------|-------------|
-| `render(width)` | Returns an array of strings, one per line. Each line **must not exceed `width`** or the TUI renderer will error. Use `truncateToWidth()` or manual wrapping to ensure this. |
+| `render(width)` | Returns all rendered lines and explicit image placements. Each line **must not exceed `width`** or the TUI renderer will error. Use `truncateToWidth()` or manual wrapping to ensure this. |
 | `handleInput?(data)` | Called when the component has focus and receives keyboard input. The `data` string contains raw terminal input (may include ANSI escape sequences). |
 | `invalidate?()` | Called to clear any cached render state. Components should re-render from scratch on the next `render()` call. |
+
+Text-only components return `createRenderFrame(lines)`. Components that combine children must use frame helpers such as `concatRenderFrames()`, `sliceRenderFrame()`, `spliceRenderFrameRows()`, `prefixRenderFrame()`, and `mapRenderFrameLines()` so image placements are translated or clipped with the lines. Reading `child.render(width).lines` is appropriate only at a true text-only boundary such as HTML export, not while composing another component.
 
 The TUI appends a full SGR reset and OSC 8 reset at the end of each rendered line. Styles do not carry across lines. If you emit multi-line text with styling, reapply styles per line or use `wrapTextWithAnsi()` so styles are preserved for each wrapped line.
 
@@ -236,15 +243,21 @@ The TUI appends a full SGR reset and OSC 8 reset at the end of each rendered lin
 Components that display a text cursor and need IME (Input Method Editor) support should implement the `Focusable` interface:
 
 ```typescript
-import { CURSOR_MARKER, type Component, type Focusable } from "@hansjm10/volt-tui";
+import {
+  createRenderFrame,
+  CURSOR_MARKER,
+  type Component,
+  type Focusable,
+  type RenderFrame,
+} from "@hansjm10/volt-tui";
 
 class MyInput implements Component, Focusable {
   focused: boolean = false;  // Set by TUI when focus changes
   
-  render(width: number): string[] {
+  render(width: number): RenderFrame {
     const marker = this.focused ? CURSOR_MARKER : "";
     // Emit marker right before the fake cursor
-    return [`> ${beforeCursor}${marker}\x1b[7m${atCursor}\x1b[27m${afterCursor}`];
+    return createRenderFrame([`> ${beforeCursor}${marker}\x1b[7m${atCursor}\x1b[27m${afterCursor}`]);
   }
 }
 ```
@@ -716,15 +729,21 @@ const lines = wrapTextWithAnsi("This is a long line that needs wrapping", 20);
 
 ## Creating Custom Components
 
-When creating custom components, **each line returned by `render()` must not exceed the `width` parameter**. The TUI renderer will error if any line is wider than the terminal.
+When creating custom components, **each line in the returned frame must not exceed the `width` parameter**. The TUI renderer will error if any line is wider than the terminal.
 
 ### Handling Input
 
 Use `matchesKey()` with the `Key` helper for keyboard input:
 
 ```typescript
-import { matchesKey, Key, truncateToWidth } from "@hansjm10/volt-tui";
-import type { Component } from "@hansjm10/volt-tui";
+import {
+  createRenderFrame,
+  matchesKey,
+  Key,
+  truncateToWidth,
+  type Component,
+  type RenderFrame,
+} from "@hansjm10/volt-tui";
 
 class MyInteractiveComponent implements Component {
   private selectedIndex = 0;
@@ -745,11 +764,11 @@ class MyInteractiveComponent implements Component {
     }
   }
 
-  render(width: number): string[] {
-    return this.items.map((item, i) => {
+  render(width: number): RenderFrame {
+    return createRenderFrame(this.items.map((item, i) => {
       const prefix = i === this.selectedIndex ? "> " : "  ";
       return truncateToWidth(prefix + item, width);
-    });
+    }));
   }
 }
 ```
@@ -759,8 +778,13 @@ class MyInteractiveComponent implements Component {
 Use the provided utilities to ensure lines fit:
 
 ```typescript
-import { visibleWidth, truncateToWidth } from "@hansjm10/volt-tui";
-import type { Component } from "@hansjm10/volt-tui";
+import {
+  createRenderFrame,
+  visibleWidth,
+  truncateToWidth,
+  type Component,
+  type RenderFrame,
+} from "@hansjm10/volt-tui";
 
 class MyComponent implements Component {
   private text: string;
@@ -769,18 +793,18 @@ class MyComponent implements Component {
     this.text = text;
   }
 
-  render(width: number): string[] {
+  render(width: number): RenderFrame {
     // Option 1: Truncate long lines
-    return [truncateToWidth(this.text, width)];
+    return createRenderFrame([truncateToWidth(this.text, width)]);
 
     // Option 2: Check and pad to exact width
     const line = this.text;
     const visible = visibleWidth(line);
     if (visible > width) {
-      return [truncateToWidth(line, width)];
+      return createRenderFrame([truncateToWidth(line, width)]);
     }
     // Pad to exact width (optional, for backgrounds)
-    return [line + " ".repeat(width - visible)];
+    return createRenderFrame([line + " ".repeat(width - visible)]);
   }
 }
 ```
@@ -808,23 +832,23 @@ For performance, components should cache their rendered output and only re-rende
 class CachedComponent implements Component {
   private text: string;
   private cachedWidth?: number;
-  private cachedLines?: string[];
+  private cachedFrame?: RenderFrame;
 
-  render(width: number): string[] {
-    if (this.cachedLines && this.cachedWidth === width) {
-      return this.cachedLines;
+  render(width: number): RenderFrame {
+    if (this.cachedFrame && this.cachedWidth === width) {
+      return this.cachedFrame;
     }
 
-    const lines = [truncateToWidth(this.text, width)];
+    const frame = createRenderFrame([truncateToWidth(this.text, width)]);
 
     this.cachedWidth = width;
-    this.cachedLines = lines;
-    return lines;
+    this.cachedFrame = frame;
+    return frame;
   }
 
   invalidate(): void {
     this.cachedWidth = undefined;
-    this.cachedLines = undefined;
+    this.cachedFrame = undefined;
   }
 }
 ```

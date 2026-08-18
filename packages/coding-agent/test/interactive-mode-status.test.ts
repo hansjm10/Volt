@@ -1,10 +1,25 @@
 import { homedir } from "node:os";
 import * as path from "node:path";
-import { type AutocompleteProvider, CombinedAutocompleteProvider } from "@hansjm10/volt-tui";
+import {
+	type AutocompleteProvider,
+	CombinedAutocompleteProvider,
+	createRenderFrame,
+	type RenderFrame,
+	setKeybindings,
+} from "@hansjm10/volt-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
-import { type Component, Container, type Focusable, type TUI, TuiMainScreen } from "../../tui/src/index.ts";
+import {
+	type Component,
+	Container,
+	type Focusable,
+	type TUI,
+	TuiAltScreen,
+	TuiMainScreen,
+	VStack,
+} from "../../tui/src/index.ts";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.ts";
+import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { SourceInfo } from "../src/core/source-info.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
@@ -12,15 +27,17 @@ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 function renderLastLine(container: Container, width = 120): string {
 	const last = container.children[container.children.length - 1];
 	if (!last) return "";
-	return last.render(width).join("\n");
+	return last.render(width).lines.join("\n");
 }
 
 function renderAll(container: Container, width = 120): string {
-	return container.children.flatMap((child) => child.render(width)).join("\n");
+	return container.children.flatMap((child) => child.render(width).lines).join("\n");
 }
 
 class TestFocusableComponent implements Component, Focusable {
 	focused = false;
+	fullscreenActive = false;
+	selected = false;
 	inputs: string[] = [];
 	private readonly label: string;
 	private text = "";
@@ -41,8 +58,18 @@ class TestFocusableComponent implements Component, Focusable {
 		this.text = text;
 	}
 
-	render(): string[] {
-		return [this.label];
+	setFullscreenActive(active: boolean): void {
+		this.fullscreenActive = active;
+	}
+
+	setSelected(selected: boolean): void {
+		this.selected = selected;
+	}
+
+	setPlanning(): void {}
+
+	render(): RenderFrame {
+		return createRenderFrame([this.label]);
 	}
 
 	invalidate(): void {}
@@ -106,7 +133,7 @@ describe("InteractiveMode.showStatus", () => {
 		expect(fakeThis.chatContainer.children).toHaveLength(2);
 
 		// Something else gets added to the chat in between status updates
-		fakeThis.chatContainer.addChild({ render: () => ["OTHER"], invalidate: () => {} });
+		fakeThis.chatContainer.addChild({ render: () => createRenderFrame(["OTHER"]), invalidate: () => {} });
 		expect(fakeThis.chatContainer.children).toHaveLength(3);
 
 		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "STATUS_TWO");
@@ -534,6 +561,610 @@ describe("InteractiveMode.setupAutocompleteProvider", () => {
 
 		const provider = defaultEditor.setAutocompleteProvider.mock.calls[0]?.[0] as AutocompleteProvider;
 		expect(provider.triggerCharacters).toEqual(["$", "!"]);
+	});
+});
+
+describe("InteractiveMode plan pane integration", () => {
+	beforeAll(() => {
+		setKeybindings(new KeybindingsManager());
+	});
+
+	test("routes a customized pane key before default and extension-derived editor input", () => {
+		let listener: ((data: string) => { consume?: boolean } | undefined) | undefined;
+		const togglePlanPaneFocus = vi.fn();
+		const editor = new TestFocusableComponent("EDITOR");
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		const conversationView = {};
+		const fakeThis = {
+			activeView: conversationView,
+			conversationView,
+			keybindings: new KeybindingsManager({ "app.plan.togglePane": "alt+x" }),
+			ui: {
+				addInputListener: vi.fn((next: typeof listener) => {
+					listener = next;
+					return () => undefined;
+				}),
+				getFocusedComponent: () => editor,
+			},
+			editorContainer,
+			planDetails: undefined,
+			planInspector: new TestFocusableComponent("PLAN_INSPECTOR"),
+			planPaneInputUnsubscribe: undefined,
+			togglePlanPaneFocus,
+		};
+
+		(InteractiveMode as any).prototype.setupPlanPaneInputRouting.call(fakeThis);
+
+		expect(listener?.("\x1bx")).toEqual({ consume: true });
+		expect(togglePlanPaneFocus).toHaveBeenCalledTimes(1);
+	});
+
+	test("handles a Kitty pane shortcut without retriggering on release", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TuiMainScreen(terminal);
+		const extensionEditor = new TestFocusableComponent("EXTENSION_EDITOR");
+		const root = new Container();
+		root.addChild(extensionEditor);
+		const togglePlanPaneFocus = vi.fn();
+		const conversationView = {};
+		const fakeThis = {
+			activeView: conversationView,
+			conversationView,
+			keybindings: new KeybindingsManager(),
+			ui,
+			editorContainer: root,
+			planDetails: undefined,
+			planInspector: new TestFocusableComponent("PLAN_INSPECTOR"),
+			planPaneInputUnsubscribe: undefined,
+			togglePlanPaneFocus,
+		};
+		(InteractiveMode as any).prototype.setupPlanPaneInputRouting.call(fakeThis);
+		ui.addChild(root);
+		ui.setFocus(extensionEditor);
+		ui.start();
+		try {
+			terminal.sendInput("\x1b[112;3u");
+			await flushTui(ui, terminal);
+			expect(togglePlanPaneFocus).toHaveBeenCalledTimes(1);
+			expect(extensionEditor.inputs).toEqual([]);
+
+			terminal.sendInput("\x1b[112;3:3u");
+			await flushTui(ui, terminal);
+			expect(togglePlanPaneFocus).toHaveBeenCalledTimes(1);
+			expect(extensionEditor.inputs).toEqual([]);
+		} finally {
+			ui.stop();
+		}
+	});
+
+	test("leaves the pane shortcut and ready autofocus with a focused overlay", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TuiMainScreen(terminal);
+		const editor = new TestFocusableComponent("EDITOR");
+		const inspector = new TestFocusableComponent("PLAN_INSPECTOR");
+		const overlay = new TestFocusableComponent("CAPTURING_OVERLAY");
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		const root = new Container();
+		root.addChild(editorContainer);
+		root.addChild(inspector);
+		ui.addChild(root);
+		ui.setFocus(editor);
+		const togglePlanPaneFocus = vi.fn();
+		const conversationView = {};
+		const fakeThis = {
+			activeView: conversationView,
+			conversationView,
+			keybindings: new KeybindingsManager({ "app.plan.togglePane": "alt+x" }),
+			ui,
+			editorContainer,
+			fullscreenTranscript: { setPrimary: vi.fn() },
+			planDetails: undefined,
+			planPaneInputUnsubscribe: undefined,
+			togglePlanPaneFocus,
+			mainView: { isTerminalSplit: () => true },
+			planInspector: inspector,
+			planPaneReturnFocus: undefined,
+			getConversationFocusTarget: () => editor,
+		};
+		(
+			InteractiveMode as unknown as {
+				prototype: {
+					setupPlanPaneInputRouting: (this: typeof fakeThis) => void;
+					focusPlanInspector: (this: typeof fakeThis) => void;
+				};
+			}
+		).prototype.setupPlanPaneInputRouting.call(fakeThis);
+		ui.showOverlay(overlay);
+		ui.start();
+		try {
+			terminal.sendInput("\x1bx");
+			await flushTui(ui, terminal);
+			expect(togglePlanPaneFocus).not.toHaveBeenCalled();
+			expect(overlay.inputs).toEqual(["\x1bx"]);
+
+			(
+				InteractiveMode as unknown as {
+					prototype: { focusPlanInspector: (this: typeof fakeThis) => void };
+				}
+			).prototype.focusPlanInspector.call(fakeThis);
+			expect(overlay.focused).toBe(true);
+			expect(inspector.focused).toBe(false);
+			terminal.sendInput("\r");
+			await flushTui(ui, terminal);
+			expect(overlay.inputs).toEqual(["\x1bx", "\r"]);
+			expect(inspector.inputs).toEqual([]);
+		} finally {
+			ui.stop();
+		}
+	});
+
+	test("does not steal focus from a dedicated custom UI", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TuiMainScreen(terminal);
+		const editor = new TestFocusableComponent("EDITOR");
+		const custom = new TestFocusableComponent("CUSTOM");
+		const inspector = new TestFocusableComponent("PLAN_INSPECTOR");
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		ui.addChild(custom);
+		ui.setFocus(custom);
+		const conversationView = {};
+		const fakeThis = {
+			activeView: {},
+			conversationView,
+			editor,
+			editorContainer,
+			fullscreenTranscript: { setPrimary: vi.fn() },
+			mainView: { isTerminalSplit: () => true },
+			planDetails: undefined,
+			planInspector: inspector,
+			planPaneReturnFocus: undefined,
+			session: { planningState: { plan: { phase: "active" } } },
+			ui,
+		};
+		ui.start();
+		try {
+			await flushTui(ui, terminal);
+			(InteractiveMode as any).prototype.focusPlanInspector.call(fakeThis);
+			expect(custom.focused).toBe(true);
+			expect(inspector.focused).toBe(false);
+		} finally {
+			ui.stop();
+		}
+	});
+
+	test("moves focus from compact Plan Details to the inspector when the split appears", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TuiMainScreen(terminal);
+		const planDetails = new TestFocusableComponent("PLAN_DETAILS");
+		const inspector = new TestFocusableComponent("PLAN_INSPECTOR");
+		const detailsContainer = new Container();
+		detailsContainer.addChild(planDetails);
+		const root = new Container();
+		root.addChild(detailsContainer);
+		root.addChild(inspector);
+		ui.addChild(root);
+		ui.setFocus(planDetails);
+		const fakeThis = {
+			ui,
+			planDetails,
+			planInspector: inspector,
+			closePlanDetails: vi.fn(() => detailsContainer.clear()),
+			focusPlanInspector: vi.fn(() => ui.setFocus(inspector)),
+			focusConversation: vi.fn(),
+			showPlanDetails: vi.fn(),
+			session: { planningState: { mode: "build", plan: { phase: "active" } } },
+		};
+		ui.start();
+		try {
+			(
+				InteractiveMode as unknown as {
+					prototype: {
+						handlePlanSplitChange: (this: typeof fakeThis, split: boolean, preserveScrollback: boolean) => void;
+					};
+				}
+			).prototype.handlePlanSplitChange.call(fakeThis, true, false);
+			terminal.sendInput("x");
+			await flushTui(ui, terminal);
+			expect(detailsContainer.children).toEqual([]);
+			expect(planDetails.focused).toBe(false);
+			expect(inspector.focused).toBe(true);
+			expect(planDetails.inputs).toEqual([]);
+			expect(inspector.inputs).toEqual(["x"]);
+		} finally {
+			ui.stop();
+		}
+	});
+
+	test("restores conversation focus before replacing compact details with the split", () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TuiMainScreen(terminal);
+		const editor = new TestFocusableComponent("EDITOR");
+		const details = new TestFocusableComponent("PLAN_DETAILS");
+		const transcript = Object.assign(new TestFocusableComponent("TRANSCRIPT"), { setPrimary: vi.fn() });
+		const detailsContainer = new Container();
+		detailsContainer.addChild(details);
+		const flexibleSlot = new VStack([details]);
+		const conversationView = {};
+		const fakeThis = {
+			activeView: conversationView,
+			conversationView,
+			editor,
+			fullscreenFlexibleSlot: flexibleSlot,
+			fullscreenTranscript: transcript,
+			getConversationFocusTarget: () => editor,
+			planDetails: details,
+			planDetailsContainer: detailsContainer,
+			ui,
+		};
+		ui.addChild(detailsContainer);
+		ui.setFocus(details);
+
+		(InteractiveMode as any).prototype.closePlanDetails.call(fakeThis, { focusConversation: false });
+
+		expect(ui.getFocusedComponent()).toBe(editor);
+		expect(fakeThis.planDetails).toBeUndefined();
+		expect(flexibleSlot.children).toEqual([transcript]);
+	});
+
+	test("recovers conversation focus when a resize removes the split", () => {
+		const focusConversation = vi.fn();
+		const fakeThis = {
+			ui: { mode: "regular" },
+			fullscreenTranscript: { setPrimary: vi.fn() },
+			planInspector: { focused: true, setFullscreenActive: vi.fn() },
+			planDetails: undefined,
+			session: { planningState: { mode: "build", plan: null } },
+			focusConversation,
+			showPlanDetails: vi.fn(),
+		};
+
+		(InteractiveMode as any).prototype.handlePlanSplitChange.call(fakeThis, false);
+
+		expect(focusConversation).toHaveBeenCalledTimes(1);
+	});
+
+	test("restores search focus to the inspector when a resize replaces compact Plan Details", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TuiAltScreen(terminal, false, "/tmp", { mouse: false });
+		const editor = new TestFocusableComponent("EDITOR");
+		const planDetails = new TestFocusableComponent("PLAN_DETAILS");
+		const inspector = new TestFocusableComponent("PLAN_INSPECTOR");
+		const transcript = Object.assign(new TestFocusableComponent("TRANSCRIPT"), { setPrimary: vi.fn() });
+		const editorContainer = new Container();
+		const detailsContainer = new Container();
+		const root = new Container();
+		editorContainer.addChild(editor);
+		detailsContainer.addChild(planDetails);
+		root.addChild(transcript);
+		root.addChild(detailsContainer);
+		root.addChild(inspector);
+		root.addChild(editorContainer);
+		ui.addChild(root);
+		ui.setLayoutRoot(root);
+		ui.setFocus(planDetails);
+		const conversationView = {};
+		const fakeThis: any = {
+			activeView: conversationView,
+			conversationView,
+			editor,
+			editorContainer,
+			fullscreenFlexibleSlot: new VStack([planDetails]),
+			fullscreenTranscript: transcript,
+			mainView: { isTerminalSplit: () => true },
+			planDetails,
+			planDetailsContainer: detailsContainer,
+			planInspector: inspector,
+			planPaneReturnFocus: undefined,
+			renderer: ui,
+			session: { planningState: { mode: "build", plan: { phase: "active" } } },
+			ui,
+		};
+		fakeThis.getConversationFocusTarget = () =>
+			(InteractiveMode as any).prototype.getConversationFocusTarget.call(fakeThis);
+		fakeThis.focusPlanInspector = () => (InteractiveMode as any).prototype.focusPlanInspector.call(fakeThis);
+		fakeThis.focusConversation = (onlyFromPlanInspector?: boolean) =>
+			(InteractiveMode as any).prototype.focusConversation.call(fakeThis, onlyFromPlanInspector);
+		fakeThis.closePlanDetails = (options?: { focusConversation?: boolean }) =>
+			(InteractiveMode as any).prototype.closePlanDetails.call(fakeThis, options);
+
+		ui.start();
+		try {
+			await terminal.waitForRender();
+			terminal.sendInput("\x1b[102;6u");
+			await terminal.waitForRender();
+			expect(planDetails.focused).toBe(false);
+
+			(InteractiveMode as any).prototype.handlePlanSplitChange.call(fakeThis, true, false);
+			await flushTui(ui, terminal);
+			expect(detailsContainer.children).toEqual([]);
+			expect(inspector.focused).toBe(false);
+			expect(inspector.selected).toBe(true);
+
+			terminal.sendInput("\x1b");
+			await terminal.waitForRender();
+			terminal.sendInput("x");
+			await terminal.waitForRender();
+			expect(inspector.focused).toBe(true);
+			expect(inspector.inputs).toEqual(["x"]);
+			expect(planDetails.inputs).toEqual([]);
+			expect(editor.inputs).toEqual([]);
+		} finally {
+			ui.stop({ preserveScreen: true });
+		}
+	});
+
+	test("retargets overlay restoration when planning state replaces compact Plan Details", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TuiMainScreen(terminal);
+		const editor = new TestFocusableComponent("EDITOR");
+		const planDetails = new TestFocusableComponent("PLAN_DETAILS");
+		const inspector = new TestFocusableComponent("PLAN_INSPECTOR");
+		const overlay = new TestFocusableComponent("OVERLAY");
+		const transcript = Object.assign(new TestFocusableComponent("TRANSCRIPT"), { setPrimary: vi.fn() });
+		const editorContainer = new Container();
+		const detailsContainer = new Container();
+		const root = new Container();
+		editorContainer.addChild(editor);
+		detailsContainer.addChild(planDetails);
+		root.addChild(transcript);
+		root.addChild(detailsContainer);
+		root.addChild(inspector);
+		root.addChild(editorContainer);
+		ui.addChild(root);
+		ui.setFocus(planDetails);
+		const overlayHandle = ui.showOverlay(overlay);
+		const conversationView = {};
+		const planning = { mode: "build", plan: { phase: "active" } };
+		const fakeThis: any = {
+			activeView: conversationView,
+			conversationView,
+			editor,
+			editorContainer,
+			fullscreenFlexibleSlot: new VStack([planDetails]),
+			fullscreenTranscript: transcript,
+			mainView: { isTerminalSplit: () => true, setPlanning: vi.fn() },
+			planDetails,
+			planDetailsContainer: detailsContainer,
+			planInspector: inspector,
+			planPaneReturnFocus: undefined,
+			planStatus: { setPlanning: vi.fn() },
+			readyPlanFocusKey: undefined,
+			renderer: ui,
+			session: { planningState: planning },
+			ui,
+			updateEditorBorderColor: vi.fn(),
+		};
+		fakeThis.getConversationFocusTarget = () =>
+			(InteractiveMode as any).prototype.getConversationFocusTarget.call(fakeThis);
+		fakeThis.focusPlanInspector = () => (InteractiveMode as any).prototype.focusPlanInspector.call(fakeThis);
+		fakeThis.focusConversation = (onlyFromPlanInspector?: boolean) =>
+			(InteractiveMode as any).prototype.focusConversation.call(fakeThis, onlyFromPlanInspector);
+		fakeThis.closePlanDetails = (options?: { focusConversation?: boolean }) =>
+			(InteractiveMode as any).prototype.closePlanDetails.call(fakeThis, options);
+
+		ui.start();
+		try {
+			await terminal.waitForRender();
+			(InteractiveMode as any).prototype.refreshPlanningUi.call(fakeThis, planning);
+			await flushTui(ui, terminal);
+			expect(detailsContainer.children).toEqual([]);
+			expect(overlay.focused).toBe(true);
+			expect(inspector.selected).toBe(true);
+
+			overlayHandle.hide();
+			terminal.sendInput("x");
+			await flushTui(ui, terminal);
+			expect(inspector.focused).toBe(true);
+			expect(inspector.inputs).toEqual(["x"]);
+			expect(planDetails.inputs).toEqual([]);
+		} finally {
+			ui.stop();
+		}
+	});
+
+	test("restores search focus to the editor when a resize hides the selected inspector", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TuiAltScreen(terminal, false, "/tmp", { mouse: false });
+		const editor = new TestFocusableComponent("EDITOR");
+		const inspector = new TestFocusableComponent("PLAN_INSPECTOR");
+		const transcript = Object.assign(new TestFocusableComponent("TRANSCRIPT"), { setPrimary: vi.fn() });
+		const editorContainer = new Container();
+		const root = new Container();
+		editorContainer.addChild(editor);
+		root.addChild(transcript);
+		root.addChild(inspector);
+		root.addChild(editorContainer);
+		ui.addChild(root);
+		ui.setLayoutRoot(root);
+		inspector.setSelected(true);
+		ui.setFocus(inspector);
+		const conversationView = {};
+		const showPlanDetails = vi.fn();
+		const fakeThis: any = {
+			activeView: conversationView,
+			conversationView,
+			editor,
+			editorContainer,
+			fullscreenTranscript: transcript,
+			mainView: { isTerminalSplit: () => false },
+			planDetails: undefined,
+			planInspector: inspector,
+			planPaneReturnFocus: editor,
+			renderer: ui,
+			session: { planningState: { mode: "build", plan: { phase: "active" } } },
+			showPlanDetails,
+			ui,
+		};
+		fakeThis.getConversationFocusTarget = () =>
+			(InteractiveMode as any).prototype.getConversationFocusTarget.call(fakeThis);
+		fakeThis.focusConversation = (onlyFromPlanInspector?: boolean) =>
+			(InteractiveMode as any).prototype.focusConversation.call(fakeThis, onlyFromPlanInspector);
+
+		ui.start();
+		try {
+			await terminal.waitForRender();
+			terminal.sendInput("\x1b[102;6u");
+			await terminal.waitForRender();
+			expect(inspector.focused).toBe(false);
+
+			(InteractiveMode as any).prototype.handlePlanSplitChange.call(fakeThis, false, false);
+			await flushTui(ui, terminal);
+			expect(inspector.selected).toBe(false);
+			expect(showPlanDetails).not.toHaveBeenCalled();
+
+			terminal.sendInput("\x1b");
+			await terminal.waitForRender();
+			terminal.sendInput("x");
+			await terminal.waitForRender();
+			expect(editor.focused).toBe(true);
+			expect(editor.inputs).toEqual(["x"]);
+			expect(inspector.inputs).toEqual([]);
+		} finally {
+			ui.stop({ preserveScreen: true });
+		}
+	});
+
+	test("keeps search active while a compact ready plan replaces the inspector", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TuiAltScreen(terminal, false, "/tmp", { mouse: false });
+		const editor = new TestFocusableComponent("EDITOR");
+		const inspector = new TestFocusableComponent("PLAN_INSPECTOR");
+		const transcript = Object.assign(new TestFocusableComponent("TRANSCRIPT"), { setPrimary: vi.fn() });
+		const editorContainer = new Container();
+		const detailsContainer = new Container();
+		const root = new Container();
+		editorContainer.addChild(editor);
+		root.addChild(transcript);
+		root.addChild(inspector);
+		root.addChild(detailsContainer);
+		root.addChild(editorContainer);
+		ui.addChild(root);
+		ui.setLayoutRoot(root);
+		inspector.setSelected(true);
+		ui.setFocus(inspector);
+		const conversationView = {};
+		const fakeThis: any = {
+			activeView: conversationView,
+			conversationView,
+			editor,
+			editorContainer,
+			fullscreenFlexibleSlot: new VStack([transcript]),
+			fullscreenTranscript: transcript,
+			handlePlanDetailsAction: vi.fn(),
+			mainView: { isTerminalSplit: () => false },
+			planDetails: undefined,
+			planDetailsContainer: detailsContainer,
+			planInspector: inspector,
+			planPaneReturnFocus: editor,
+			renderer: ui,
+			session: {
+				planningState: {
+					mode: "plan",
+					plan: {
+						id: "plan-1",
+						revision: 1,
+						phase: "ready",
+						title: "Ready plan",
+						summary: "Ready for execution",
+						steps: [],
+					},
+				},
+			},
+			settingsManager: { getFullscreenScrollbar: () => "auto" },
+			ui,
+		};
+		fakeThis.getConversationFocusTarget = () =>
+			(InteractiveMode as any).prototype.getConversationFocusTarget.call(fakeThis);
+		fakeThis.focusConversation = (onlyFromPlanInspector?: boolean) =>
+			(InteractiveMode as any).prototype.focusConversation.call(fakeThis, onlyFromPlanInspector);
+		fakeThis.closePlanDetails = (options?: { focusConversation?: boolean }) =>
+			(InteractiveMode as any).prototype.closePlanDetails.call(fakeThis, options);
+		fakeThis.showPlanDetails = () => (InteractiveMode as any).prototype.showPlanDetails.call(fakeThis);
+
+		ui.start();
+		try {
+			await terminal.waitForRender();
+			terminal.sendInput("\x1b[102;6u");
+			await terminal.waitForRender();
+
+			(InteractiveMode as any).prototype.handlePlanSplitChange.call(fakeThis, false, false);
+			await flushTui(ui, terminal);
+			expect(fakeThis.planDetails).toBeDefined();
+			expect(ui.getFocusedComponent()).not.toBe(fakeThis.planDetails);
+
+			terminal.sendInput("find");
+			await terminal.waitForRender();
+			expect(terminal.getViewport().some((line) => line.includes("Find transcript"))).toBe(true);
+			terminal.sendInput("\x1b");
+			await terminal.waitForRender();
+			expect(ui.getFocusedComponent()).toBe(fakeThis.planDetails);
+			expect(editor.focused).toBe(false);
+			expect(inspector.focused).toBe(false);
+		} finally {
+			ui.stop({ preserveScreen: true });
+		}
+	});
+
+	test("focuses the persistent inspector for /plan-details in wide layout", () => {
+		const focusPlanInspector = vi.fn();
+		const fakeThis = {
+			mainView: { isTerminalSplit: () => true },
+			ui: { terminal: { columns: 160, rows: 30 } },
+			focusPlanInspector,
+		};
+
+		(InteractiveMode as any).prototype.showPlanDetails.call(fakeThis);
+
+		expect(focusPlanInspector).toHaveBeenCalledTimes(1);
+	});
+
+	test("keeps the responsive main view atomic for full-screen selector replacement", async () => {
+		const terminal = new VirtualTerminal(160, 30);
+		const ui = new TuiMainScreen(terminal);
+		const mainView = new TestFocusableComponent("MAIN_VIEW");
+		const editor = new TestFocusableComponent("EDITOR");
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		const conversationView = { regularComponents: [mainView], fullscreenRoot: mainView };
+		let closeSelector: () => void = () => undefined;
+		const fakeThis: any = {
+			activeView: conversationView,
+			conversationView,
+			createDedicatedView: (component: Component) =>
+				(InteractiveMode as any).prototype.createDedicatedView.call(fakeThis, component),
+			activateView: (view: unknown, focus: Component | null, forceRender?: boolean) =>
+				(InteractiveMode as any).prototype.activateView.call(fakeThis, view, focus, forceRender),
+			dismissSubagentInspector: undefined,
+			editor,
+			editorContainer,
+			fullscreenTranscript: { setPrimary: vi.fn() },
+			mainView: { isTerminalSplit: () => false },
+			planDetails: undefined,
+			planInspector: new TestFocusableComponent("PLAN_INSPECTOR"),
+			ui,
+		};
+		fakeThis.activateView(conversationView, editor);
+		ui.start();
+		try {
+			(InteractiveMode as any).prototype.showSelector.call(fakeThis, (done: () => void) => {
+				closeSelector = done;
+				const selector = new TestFocusableComponent("FULL_SCREEN_SELECTOR");
+				return { component: selector, focus: selector };
+			});
+			await flushTui(ui, terminal);
+			expect(fakeThis.activeView).not.toBe(conversationView);
+			expect(ui.children).not.toContain(mainView);
+			closeSelector();
+			await flushTui(ui, terminal);
+			expect(fakeThis.activeView).toBe(conversationView);
+			expect(ui.children).toContain(mainView);
+			expect(editor.focused).toBe(true);
+		} finally {
+			ui.stop();
+		}
 	});
 });
 

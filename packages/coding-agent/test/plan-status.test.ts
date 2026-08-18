@@ -47,11 +47,11 @@ function longPlan(): PlanState {
 	};
 }
 
-function plain(lines: string[]): string {
+function plain(lines: readonly string[]): string {
 	return lines.join("\n").replace(/\u001b\[[0-9;]*m/g, "");
 }
 
-function normalized(lines: string[]): string {
+function normalized(lines: readonly string[]): string {
 	return plain(lines).replace(/\s+/g, " ");
 }
 
@@ -76,9 +76,9 @@ afterEach(() => {
 describe("Plan TUI components", () => {
 	it("hides an empty Build status and bounds the strip at narrow widths", () => {
 		initTheme("dark");
-		expect(new PlanStatusComponent({ mode: "build", plan: null }).render(80)).toEqual([]);
+		expect(new PlanStatusComponent({ mode: "build", plan: null }).render(80).lines).toEqual([]);
 
-		const rendered = new PlanStatusComponent({ mode: "plan", plan: readyPlan() }).render(80);
+		const rendered = new PlanStatusComponent({ mode: "plan", plan: readyPlan() }).render(80).lines;
 		expect(rendered).toHaveLength(1);
 		expect(plain(rendered)).toContain("PLAN READY");
 		expect(plain(rendered)).toContain("4/12 · 33%");
@@ -88,7 +88,7 @@ describe("Plan TUI components", () => {
 		initTheme("dark");
 		for (const width of [80, 120]) {
 			const details = createDetails(longPlan(), 60);
-			const rendered = details.render(width);
+			const rendered = details.render(width).lines;
 			const text = normalized(rendered);
 			expect(text).toContain("SUMMARY_TAIL");
 			expect(text).toContain("STEP_TAIL");
@@ -103,7 +103,7 @@ describe("Plan TUI components", () => {
 	it("uses terminal height for the rendered-row viewport and reports its position", () => {
 		initTheme("light");
 		const details = createDetails(readyPlan(40), 36);
-		const rendered = plain(details.render(120));
+		const rendered = plain(details.render(120).lines);
 		expect(rendered).toContain("rows 1–22/42");
 		expect(rendered).toContain("Plan step 20");
 		expect(rendered).not.toContain("Plan step 21");
@@ -125,12 +125,12 @@ describe("Plan TUI components", () => {
 				renders += 1;
 			},
 		});
-		const before = plain(details.render(80));
+		const before = plain(details.render(80).lines);
 		expect(before).toContain("rows 1–8/");
 		expect(before).toContain("first checklist item");
 
 		details.handleInput("\u001b[6~");
-		const after = plain(details.render(80));
+		const after = plain(details.render(80).lines);
 		expect(renders).toBe(1);
 		expect(after).toContain("rows 9–16/");
 		expect(after).not.toContain("A summary that occupies");
@@ -142,7 +142,7 @@ describe("Plan TUI components", () => {
 		for (const seedRegularGeometry of [false, true]) {
 			const terminal = new VirtualTerminal(80, 16);
 			const details = createDetails(readyPlan(40), 16);
-			if (seedRegularGeometry) details.render(80);
+			if (seedRegularGeometry) details.render(80).lines;
 			details.setFullscreenActive(true);
 			const tui = new TuiAltScreen(terminal, false, "/tmp", { mouse: false });
 			tui.addChild(details);
@@ -205,13 +205,13 @@ describe("Plan TUI components", () => {
 		vi.stubEnv("TERM", "xterm-256color");
 		vi.stubEnv("TERM_PROGRAM", "iTerm.app");
 		vi.stubEnv("VOLT_ASCII", "0");
-		const unicode = plain(createDetails(longPlan(), 60).render(120));
+		const unicode = plain(createDetails(longPlan(), 60).render(120).lines);
 		expect(unicode).toContain("✓");
 		expect(unicode).toContain("→");
 		expect(unicode).toContain("○");
 
 		vi.stubEnv("VOLT_ASCII", "1");
-		const ascii = plain(createDetails(longPlan(), 60).render(120));
+		const ascii = plain(createDetails(longPlan(), 60).render(120).lines);
 		expect(ascii).toContain("[x]");
 		expect(ascii).toContain("[>]");
 		expect(ascii).toContain("[ ]");

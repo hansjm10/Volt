@@ -1,4 +1,5 @@
 import { getKeybindings } from "../keybindings.ts";
+import { createRenderFrame, type RenderFrame } from "../render-frame.ts";
 import type { Component } from "../tui.ts";
 import { truncateToWidth, visibleWidth } from "../utils.ts";
 
@@ -71,13 +72,13 @@ export class SelectList implements Component {
 		// No cached state to invalidate currently
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const lines: string[] = [];
 
 		// If no items match filter, show message
 		if (this.filteredItems.length === 0) {
 			lines.push(this.theme.noMatch("  No matching commands"));
-			return lines;
+			return createRenderFrame(lines);
 		}
 
 		const primaryColumnWidth = this.getPrimaryColumnWidth();
@@ -106,7 +107,7 @@ export class SelectList implements Component {
 			lines.push(this.theme.scrollInfo(truncateToWidth(scrollText, width - 2, "")));
 		}
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	handleInput(keyData: string): void {

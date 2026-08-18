@@ -120,7 +120,8 @@ The interface from top to bottom:
 - **Startup header** - Shows shortcuts (`/hotkeys` for all), loaded AGENTS.md files, prompt templates, skills, and extensions
 - **Messages** - Your messages, assistant responses, tool calls and results, notifications, errors, and extension UI
 - **Editor** - Where you type; border color indicates thinking level
-- **Footer** - Working directory, session name, total token/cache usage (`↑` input, `↓` output, `R` cache read, `W` cache write, `CH` latest cache hit rate), cost, context usage, current model, active Fast mode
+- **Plan inspector** - At 129x24 and larger, Plan mode or any structured plan opens a persistent 48–72-column right pane while keeping at least 80 columns for the conversation
+- **Footer** - Full-width working directory, session name, total token/cache usage (`↑` input, `↓` output, `R` cache read, `W` cache write, `CH` latest cache hit rate), cost, context usage, current model, active Fast mode
 
 The editor can be temporarily replaced by other UI, like built-in `/settings` or custom UI from extensions (e.g., a Q&A tool that lets the user answer model questions in a structured format). [Extensions](#extensions) can also replace the editor, add widgets above/below it, a status line, custom footer, or overlays.
 
@@ -150,7 +151,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/settings` | Thinking level, theme, message delivery, transport |
 | `/plan` | Enter read-only Plan mode |
 | `/build` | Return to Build mode without activating a ready plan |
-| `/plan-details` | Open the current structured checklist |
+| `/plan-details` | Focus the wide plan inspector, or open the compact checklist viewer |
 | `/resume` | Pick from previous sessions |
 | `/clear` | Start a new session |
 | `/name <name>` | Set session display name |
@@ -187,6 +188,7 @@ See `/hotkeys` for the full list. Customize via `~/.volt/agent/keybindings.json`
 | Ctrl+L | Open model selector |
 | Ctrl+P / Shift+Ctrl+P | Cycle scoped models forward/backward |
 | Shift+Tab | Toggle Build / Plan mode |
+| Alt+P | Switch focus between the conversation and wide plan inspector |
 | Ctrl+Shift+T | Cycle thinking level |
 | Ctrl+O | Collapse/expand tool output |
 | Ctrl+T | Collapse/expand thinking blocks |
@@ -210,6 +212,8 @@ Configure delivery in [settings](docs/settings.md): `steeringMode` and `followUp
 ## Plan Mode
 
 Plan mode makes the agent research the workspace with authorized read operations before it can submit a structured implementation checklist. After an initial orientation pass, the agent creates a working draft early and maintains it as a compact, self-contained handoff artifact, explicitly naming the objective or review target, concrete findings, decisions, assumptions, and verification intent while refining the candidate implementation path whenever material evidence changes its understanding. Submitted titles, summaries, and checklist steps must be sufficient for an executor that receives none of the planning transcript or prior discussion. Its research surface includes file and web inspection, non-mutating LSP queries, structured Git/GitHub inspection, and explicitly trusted MCP reads. LSP rename/fix actions, unrestricted Bash, extension/custom tools, and unresolved operations remain blocked. Start it with `volt --plan`, `/plan`, or Shift+Tab. Drafts and ready plans are stored on the active session branch and survive compaction, reconnects, and branch switching. When user feedback returns a researched ready plan to draft in the same conversation generation, including feedback queued during submission, the agent can revise and resubmit it without a redundant read; fresh Plan-mode entry, execution replanning, tree navigation, and restored drafts still require new research evidence.
+
+At 129 columns by 24 rows and larger, Volt splits both regular and fullscreen interactive views into an 80-column-or-wider conversation pane, a themed divider, and a 48–72-column plan inspector capped at 40% of terminal width. The full-width footer remains below both panes. The inspector stays visible whenever Plan mode is active or canonical plan state exists, including active/completed Build execution and handoff, and shows only modeled lifecycle state: title, summary, progress, steps, notes, ready actions, and handoff target. Use Alt+P to switch focus; fullscreen paging and search follow the focused pane, and resize recovery returns focus safely. Smaller terminals retain the compact status and `/plan-details` viewer.
 
 Repository inspection uses the native `inspect` tool, which executes fixed read operations directly without a shell. Supported operations cover `git status`, log/show/diff/blame, branches/tags/refs, plus `gh issue`, `gh pr`, and `gh search` reads. For example, the model can request `git.log` with literal arguments such as `["--oneline", "-20"]` or `gh.pr.view` with `["123", "--comments"]`. Each Git operation has a positive option grammar; unknown, negated, mutating, helper-enabling, pager, and output-file flags fail closed, while repository-configured fsmonitor, diff/textconv, hook, pager, and signature helpers are disabled. GitHub operations require the `gh` CLI and its normal host authentication, such as `gh auth login` performed by the user outside the agent tool call.
 

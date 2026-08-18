@@ -1,40 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getImagePlacements, type ImagePlacement } from "./render-frame.ts";
-import { deleteKittyImage, getImageMetadata, isImageLine } from "./terminal-image.ts";
+import { createRenderFrame, type ImagePlacement } from "./render-frame.ts";
+import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
 import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import { visibleWidth } from "./utils.ts";
-
-const KITTY_SEQUENCE_PREFIX = "\x1b_G";
-
-interface KittyImageHeader {
-	ids: number[];
-	rows: number;
-}
-
-function parseKittyImageHeader(line: string): KittyImageHeader | undefined {
-	const sequenceStart = line.indexOf(KITTY_SEQUENCE_PREFIX);
-	if (sequenceStart === -1) return undefined;
-	const paramsStart = sequenceStart + KITTY_SEQUENCE_PREFIX.length;
-	const paramsEnd = line.indexOf(";", paramsStart);
-	if (paramsEnd === -1) return undefined;
-
-	const ids: number[] = [];
-	let rows = 1;
-	for (const param of line.slice(paramsStart, paramsEnd).split(",")) {
-		const [key, value] = param.split("=", 2);
-		if (value === undefined) continue;
-		const numberValue = Number(value);
-		if (!Number.isInteger(numberValue) || numberValue <= 0 || numberValue > 0xffffffff) continue;
-		if (key === "i") ids.push(numberValue);
-		else if (key === "r") rows = numberValue;
-	}
-	return { ids, rows };
-}
-
-function extractKittyImageIds(line: string): number[] {
-	return parseKittyImageHeader(line)?.ids ?? [];
-}
 
 function isTermuxSession(): boolean {
 	return Boolean(process.env["TERMUX_VERSION"]);
@@ -62,6 +31,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private hardwareCursorRow = 0;
 	private maxLinesRendered = 0;
 	private previousViewportTop = 0;
+	private preserveScrollbackOnNextRender = false;
 
 	captureRenderState(): TuiMainScreenRenderState {
 		return {
@@ -87,6 +57,11 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.previousViewportTop = state.previousViewportTop;
 	}
 
+	/** Repaint only the active viewport on the next render without clearing terminal scrollback. */
+	resetViewportOnNextRender(): void {
+		this.preserveScrollbackOnNextRender = true;
+	}
+
 	protected override resetRenderState(): void {
 		this.previousLines = [];
 		this.previousImages = [];
@@ -96,6 +71,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.hardwareCursorRow = 0;
 		this.maxLinesRendered = 0;
 		this.previousViewportTop = 0;
+		this.preserveScrollbackOnNextRender = false;
 	}
 
 	protected override beforeTerminalStop(options: TuiStopOptions): void {
@@ -107,14 +83,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.terminal.write("\r\n");
 	}
 
-	private collectKittyImageIds(lines: string[]): Set<number> {
-		const ids = new Set<number>();
-		for (const line of lines) {
-			for (const id of extractKittyImageIds(line)) {
-				ids.add(id);
-			}
-		}
-		return ids;
+	private collectKittyImageIds(images: readonly ImagePlacement[]): Set<number> {
+		return new Set(
+			images
+				.filter((image) => image.protocol === "kitty" && image.imageId !== undefined)
+				.map((image) => image.imageId!),
+		);
 	}
 
 	private deleteKittyImages(ids: Iterable<number>): string {
@@ -125,9 +99,15 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		return buffer;
 	}
 
-	private getImageReservedRows(lines: string[], index: number, maxIndex = lines.length - 1): number {
-		const line = lines[index] ?? "";
-		const rows = getImageMetadata(line)?.rows ?? parseKittyImageHeader(line)?.rows ?? 1;
+	private getImageReservedRows(
+		lines: readonly string[],
+		images: readonly ImagePlacement[],
+		index: number,
+		maxIndex = lines.length - 1,
+	): number {
+		const rows = images
+			.filter((image) => image.top === index && image.anchor === index)
+			.reduce((maximum, image) => Math.max(maximum, image.rows), 1);
 		if (rows <= 1) return 1;
 
 		const maxRows = Math.min(rows, maxIndex - index + 1, lines.length - index);
@@ -138,6 +118,19 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			reservedRows++;
 		}
 		return reservedRows;
+	}
+
+	private getSafeTailStart(lineCount: number, maximumRows: number, images: readonly ImagePlacement[]): number {
+		let start = Math.max(0, lineCount - Math.max(0, maximumRows));
+		while (true) {
+			let nextStart = start;
+			for (const image of images) {
+				const imageEnd = Math.min(lineCount, image.top + image.rows);
+				if (image.top < start && start < imageEnd) nextStart = Math.max(nextStart, imageEnd);
+			}
+			if (nextStart === start) return start;
+			start = nextStart;
+		}
 	}
 
 	private expandChangedRangeForImages(
@@ -165,14 +158,15 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private deleteChangedKittyImages(firstChanged: number, lastChanged: number): string {
 		if (firstChanged < 0 || lastChanged < firstChanged) return "";
 
-		const ids = new Set<number>();
-		const maxLine = Math.min(lastChanged, this.previousLines.length - 1);
-		for (let i = firstChanged; i <= maxLine; i++) {
-			for (const id of extractKittyImageIds(this.previousLines[i] ?? "")) {
-				ids.add(id);
-			}
-		}
-
+		const ids = this.previousImages
+			.filter(
+				(image) =>
+					image.protocol === "kitty" &&
+					image.imageId !== undefined &&
+					image.top <= lastChanged &&
+					image.top + image.rows - 1 >= firstChanged,
+			)
+			.map((image) => image.imageId!);
 		return this.deleteKittyImages(ids);
 	}
 
@@ -192,35 +186,63 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			return targetScreenRow - currentScreenRow;
 		};
 
-		// Render all components to get new lines
-		let newLines = this.render(width);
-
-		// Composite overlays into the rendered lines (before differential compare)
-		if (this.hasOverlayEntries) {
-			newLines = this.compositeOverlays(newLines, width, height);
-		}
-		const newImages = getImagePlacements(newLines);
+		// Render all components and overlays into an explicit frame.
+		let newFrame = this.render(width);
+		if (this.hasOverlayEntries) newFrame = this.compositeOverlays(newFrame, width, height);
+		const newImages = newFrame.images.map((image) => ({ ...image }));
+		let newLines = [...newFrame.lines];
 		this.recordGeneratedLines(newLines.length);
 
-		// Extract cursor position before applying line resets (marker must be found first)
+		// Extract cursor position before applying line resets (marker must be found first).
 		const cursorPos = this.extractCursorPosition(newLines, height);
+		newLines = [...this.applyLineResets(createRenderFrame(newLines, newImages)).lines];
 
-		newLines = this.applyLineResets(newLines);
-
-		// Helper to clear scrollback and viewport and render all new lines
-		const fullRender = (clear: boolean): void => {
+		// Helper to clear and repaint either all logical lines or only the active viewport.
+		const fullRender = (clear: boolean, preserveScrollback = false): void => {
 			this.fullRedrawCount += 1;
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
 			if (clear) {
-				buffer += this.deleteKittyImages(this.previousKittyImageIds);
-				buffer += "\x1b[2J\x1b[H\x1b[3J"; // Clear screen, home, then clear scrollback
+				if (preserveScrollback) {
+					const nextKittyImageIds = this.collectKittyImageIds(newImages);
+					const removedKittyImageIds = [...this.previousKittyImageIds].filter(
+						(imageId) => !nextKittyImageIds.has(imageId),
+					);
+					buffer += this.deleteKittyImages(removedKittyImageIds);
+					const previousViewportBottom = prevViewportTop + height - 1;
+					const retainedVisibleKittyImageIds = new Set(
+						this.previousImages
+							.filter(
+								(image) =>
+									image.protocol === "kitty" &&
+									image.imageId !== undefined &&
+									nextKittyImageIds.has(image.imageId) &&
+									image.top <= previousViewportBottom &&
+									image.top + image.rows - 1 >= prevViewportTop,
+							)
+							.map((image) => image.imageId!),
+					);
+					for (const imageId of retainedVisibleKittyImageIds) {
+						buffer += `\x1b_Ga=d,d=i,i=${imageId},q=2\x1b\\`;
+					}
+				} else {
+					buffer += this.deleteKittyImages(this.previousKittyImageIds);
+				}
+				buffer += preserveScrollback ? "\x1b[2J\x1b[H" : "\x1b[2J\x1b[H\x1b[3J";
 			}
-			for (let i = 0; i < newLines.length; i++) {
-				if (i > 0) buffer += "\r\n";
+			const viewportStart = preserveScrollback ? Math.max(0, newLines.length - height) : 0;
+			const renderStart = preserveScrollback
+				? this.getSafeTailStart(newLines.length, height, newImages)
+				: viewportStart;
+			if (renderStart > viewportStart) {
+				const skippedRows = Math.min(renderStart - viewportStart, Math.max(0, height - 1));
+				buffer += "\r\n".repeat(skippedRows);
+			}
+			for (let i = renderStart; i < newLines.length; i++) {
+				if (i > renderStart) buffer += "\r\n";
 				const line = newLines[i];
 				if (line === undefined) continue;
 				const isImage = isImageLine(line);
-				const imageReservedRows = isImage ? this.getImageReservedRows(newLines, i) : 1;
+				const imageReservedRows = isImage ? this.getImageReservedRows(newLines, newImages, i) : 1;
 				if (imageReservedRows > 1 && imageReservedRows <= height) {
 					for (let row = 1; row < imageReservedRows; row++) {
 						buffer += "\r\n";
@@ -246,9 +268,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			const bufferLength = Math.max(height, newLines.length);
 			this.previousViewportTop = Math.max(0, bufferLength - height);
 			this.positionHardwareCursor(cursorPos, newLines.length);
-			this.previousLines = newLines;
-			this.previousImages = newImages;
-			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			this.previousLines = [...newLines];
+			this.previousImages = newImages.map((image) => ({ ...image }));
+			this.previousKittyImageIds = this.collectKittyImageIds(newImages);
 			this.previousWidth = width;
 			this.previousHeight = height;
 		};
@@ -262,10 +284,19 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			fs.appendFileSync(logPath, msg);
 		};
 
+		const resetViewport = this.preserveScrollbackOnNextRender;
+		this.preserveScrollbackOnNextRender = false;
+
 		// First render - just output everything without clearing (assumes clean screen)
 		if (this.previousLines.length === 0 && !widthChanged && !heightChanged) {
 			logRedraw("first render");
 			fullRender(false);
+			return;
+		}
+
+		if (resetViewport && !widthChanged && (!heightChanged || isTermuxSession())) {
+			logRedraw("requested viewport reset preserving scrollback");
+			fullRender(true, true);
 			return;
 		}
 
@@ -372,9 +403,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				this.hardwareCursorRow = targetRow;
 			}
 			this.positionHardwareCursor(cursorPos, newLines.length);
-			this.previousLines = newLines;
-			this.previousImages = newImages;
-			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			this.previousLines = [...newLines];
+			this.previousImages = newImages.map((image) => ({ ...image }));
+			this.previousKittyImageIds = this.collectKittyImageIds(newImages);
 			this.previousWidth = width;
 			this.previousHeight = height;
 			this.previousViewportTop = prevViewportTop;
@@ -407,7 +438,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				this.positionHardwareCursor(cursorPos, newLines.length);
 				this.previousLines = nextPreviousLines;
 				this.previousImages = nextPreviousImages;
-				this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+				this.previousKittyImageIds = this.collectKittyImageIds(newImages);
 				this.previousWidth = width;
 				this.previousHeight = height;
 				this.previousViewportTop = prevViewportTop;
@@ -452,7 +483,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			const line = newLines[i];
 			if (line === undefined) continue;
 			const isImage = isImageLine(line);
-			const imageReservedRows = isImage ? this.getImageReservedRows(newLines, i, renderEnd) : 1;
+			const imageReservedRows = isImage ? this.getImageReservedRows(newLines, newImages, i, renderEnd) : 1;
 			if (imageReservedRows > 1) {
 				const imageStartScreenRow = i - viewportTop;
 				if (imageStartScreenRow < 0 || imageStartScreenRow + imageReservedRows > height) {
@@ -571,7 +602,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 		this.previousLines = nextPreviousLines;
 		this.previousImages = nextPreviousImages;
-		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+		this.previousKittyImageIds = this.collectKittyImageIds(newImages);
 		this.previousWidth = width;
 		this.previousHeight = height;
 	}

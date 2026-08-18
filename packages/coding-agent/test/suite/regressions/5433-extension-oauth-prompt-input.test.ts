@@ -19,7 +19,7 @@ function createDialog(): LoginDialogComponent {
 }
 
 function renderDialog(dialog: LoginDialogComponent): string[] {
-	return stripAnsi(dialog.render(120).join("\n"))
+	return stripAnsi(dialog.render(120).lines.join("\n"))
 		.split("\n")
 		.map((line) => line.trimEnd());
 }

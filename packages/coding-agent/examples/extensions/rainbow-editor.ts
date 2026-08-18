@@ -1,3 +1,4 @@
+import { mapRenderFrameLines, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Rainbow Editor - highlights "ultrathink" with animated shine effect
  *
@@ -73,11 +74,13 @@ class RainbowEditor extends CustomEditor {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		// Cycle: 10 shine positions + 10 pause frames
 		const cycle = this.frame % 20;
 		const shinePos = cycle < 10 ? cycle : -1; // -1 means no shine (pause)
-		return super.render(width).map((line) => line.replace(/ultrathink/gi, (m) => colorize(m, shinePos)));
+		return mapRenderFrameLines(super.render(width), (line) =>
+			line.replace(/ultrathink/gi, (match) => colorize(match, shinePos)),
+		);
 	}
 }
 

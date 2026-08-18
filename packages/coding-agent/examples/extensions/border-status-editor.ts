@@ -5,7 +5,13 @@ import {
 	type KeybindingsManager,
 } from "@hansjm10/volt-coding-agent";
 import type { Component, EditorTheme, TUI } from "@hansjm10/volt-tui";
-import { truncateToWidth, visibleWidth } from "@hansjm10/volt-tui";
+import {
+	createRenderFrame,
+	mapRenderFrameLines,
+	type RenderFrame,
+	truncateToWidth,
+	visibleWidth,
+} from "@hansjm10/volt-tui";
 
 function fitBorder(
 	left: string,
@@ -61,8 +67,8 @@ function formatThinking(level: string): string {
 }
 
 class EmptyFooter implements Component {
-	render(): string[] {
-		return [];
+	render(): RenderFrame {
+		return createRenderFrame([]);
 	}
 
 	invalidate(): void {}
@@ -123,9 +129,9 @@ export default function (volt: ExtensionAPI) {
 				activeTui = tui;
 			}
 
-			render(width: number): string[] {
-				const lines = super.render(width);
-				if (lines.length < 2) return lines;
+			render(width: number): RenderFrame {
+				const frame = super.render(width);
+				if (frame.lines.length < 2) return frame;
 
 				const thm = ctx.ui.theme;
 				const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "no model";
@@ -139,9 +145,13 @@ export default function (volt: ExtensionAPI) {
 				);
 				const borderColor = (text: string) => this.borderColor(text);
 
-				lines[0] = fitBorder(topLeft, topRight, width, borderColor);
-				lines[lines.length - 1] = fitBorder(bottomLeft, bottomRight, width, borderColor);
-				return lines;
+				return mapRenderFrameLines(frame, (line, row) => {
+					if (row === 0) return fitBorder(topLeft, topRight, width, borderColor);
+					if (row === frame.lines.length - 1) {
+						return fitBorder(bottomLeft, bottomRight, width, borderColor);
+					}
+					return line;
+				});
 			}
 		}
 

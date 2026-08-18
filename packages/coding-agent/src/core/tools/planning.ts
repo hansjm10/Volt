@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { type Component, truncateToWidth, visibleWidth } from "@hansjm10/volt-tui";
+import { type Component, createRenderFrame, type RenderFrame, truncateToWidth, visibleWidth } from "@hansjm10/volt-tui";
 import { type Static, Type } from "typebox";
 import { keyText } from "../../modes/interactive/components/keybinding-hints.ts";
 import {
@@ -163,18 +163,18 @@ class PlanningToolResultComponent implements Component {
 		this.includePlanContext = includePlanContext;
 	}
 
-	render(width: number): string[] {
-		if (width <= 0) return [];
+	render(width: number): RenderFrame {
+		if (width <= 0) return createRenderFrame([]);
 		if (this.isError) {
 			const output = getTextOutput(this.result, this.showImages) || "Planning tool failed";
 			const lines: string[] = [];
 			appendWrappedPlanLine(lines, "", this.currentTheme.fg("error", output), width);
-			return lines;
+			return createRenderFrame(lines);
 		}
 
 		const planning = this.result.details;
 		if (!planning?.plan) {
-			return [truncateToWidth(this.currentTheme.fg("muted", "No active plan"), width, "")];
+			return createRenderFrame([truncateToWidth(this.currentTheme.fg("muted", "No active plan"), width, "")]);
 		}
 
 		const plan = planning.plan;
@@ -207,7 +207,7 @@ class PlanningToolResultComponent implements Component {
 				}),
 			);
 		}
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	invalidate(): void {
@@ -259,17 +259,17 @@ class PlanningToolCallComponent implements Component {
 		this.currentTheme = currentTheme;
 	}
 
-	render(width: number): string[] {
-		if (width <= 0) return [];
+	render(width: number): RenderFrame {
+		if (width <= 0) return createRenderFrame([]);
 		const label = this.currentTheme.fg("toolTitle", this.currentTheme.bold(this.label));
-		if (!this.detail) return [truncateToWidth(label, width, "")];
+		if (!this.detail) return createRenderFrame([truncateToWidth(label, width, "")]);
 		const inline = `${label}${this.currentTheme.fg("muted", ` · ${this.detail}`)}`;
 		if (!this.expanded || visibleWidth(inline) + " [success]".length <= width) {
-			return [truncateToWidth(inline, width)];
+			return createRenderFrame([truncateToWidth(inline, width)]);
 		}
 		const lines = [truncateToWidth(label, width, "")];
 		appendWrappedPlanLine(lines, "  ", this.currentTheme.fg("muted", this.detail), width);
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	invalidate(): void {

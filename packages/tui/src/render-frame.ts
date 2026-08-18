@@ -1,123 +1,171 @@
-import { getImageMetadata } from "./terminal-image.ts";
-import type { Component } from "./tui.ts";
+import { cropImageLine } from "./terminal-image.ts";
+import { visibleWidth } from "./utils.ts";
 
 export interface ImagePlacement {
 	/** First row occupied by the image, relative to the rendered lines. */
-	top: number;
+	readonly top: number;
 	/** Row containing the terminal image sequence, relative to the rendered lines. */
-	anchor: number;
+	readonly anchor: number;
 	/** First occupied terminal column. */
-	left: number;
-	columns: number;
-	rows: number;
-	protocol: "kitty" | "iterm2" | "sixel";
-	imageId?: number;
+	readonly left: number;
+	readonly columns: number;
+	readonly rows: number;
+	readonly protocol: "kitty" | "iterm2" | "sixel";
+	readonly imageId?: number;
 	/** Image-only terminal sequence used when layout must relocate or crop the placement. */
-	sequence: string;
+	readonly sequence: string;
 	/** Whether sequence is an exact substring of the anchor line. */
-	exactSequence: boolean;
+	readonly exactSequence: boolean;
 }
 
+/** Complete component render output. Image placements are always explicit. */
 export interface RenderFrame {
-	lines: string[];
-	images: ImagePlacement[];
+	readonly lines: readonly string[];
+	readonly images: readonly ImagePlacement[];
 }
 
-const imagePlacements = new WeakMap<string[], ImagePlacement[]>();
-
-function inferImagePlacements(lines: string[]): ImagePlacement[] {
-	const images: ImagePlacement[] = [];
-	const visit = (row: number): void => {
-		const line = lines[row] ?? "";
-		if (!line.includes("\x1b_G") && !line.includes("\x1b_pi:s=")) return;
-		const metadata = getImageMetadata(line);
-		if (metadata && "sourceY" in metadata) {
-			images.push({
-				top: row,
-				anchor: row,
-				left: 0,
-				columns: metadata.columns,
-				rows: metadata.rows,
-				protocol: "sixel",
-				imageId: metadata.imageId,
-				sequence: line,
-				exactSequence: false,
-			});
-			return;
-		}
-
-		const kittyControls = /\x1b_G([^;]*);/.exec(line)?.[1];
-		if (!kittyControls) return;
-		const values = new Map(
-			kittyControls.split(",").map((control) => {
-				const [key = "", value = ""] = control.split("=", 2);
-				return [key, Number.parseInt(value, 10)] as const;
-			}),
-		);
-		const imageId = values.get("i") ?? metadata?.imageId;
-		const columns = values.get("c") ?? metadata?.columns ?? 1;
-		const rows = values.get("r") ?? metadata?.rows ?? 1;
-		if (!imageId || columns <= 0 || rows <= 0) return;
-		images.push({
-			top: row,
-			anchor: row,
-			left: 0,
-			columns,
-			rows,
-			protocol: "kitty",
-			imageId,
-			sequence: line,
-			exactSequence: false,
-		});
-	};
-
-	if (lines.length > 1_000_000) {
-		for (const key of Object.keys(lines)) {
-			const row = Number.parseInt(key, 10);
-			if (Number.isInteger(row) && row >= 0 && row < lines.length) visit(row);
-		}
-	} else {
-		for (let row = 0; row < lines.length; row++) visit(row);
-	}
-	return images;
+export function createRenderFrame(lines: readonly string[], images: readonly ImagePlacement[] = []): RenderFrame {
+	return { lines, images };
 }
 
-export function setImagePlacements(lines: string[], images: readonly ImagePlacement[]): string[] {
-	imagePlacements.set(
-		lines,
-		images.map((image) => ({ ...image })),
+export function translateRenderFrame(frame: RenderFrame, rows: number, columns: number): RenderFrame {
+	if (rows === 0 && columns === 0) return frame;
+	return createRenderFrame(
+		frame.lines,
+		frame.images.map((image) => ({
+			...image,
+			top: image.top + rows,
+			anchor: image.anchor + rows,
+			left: image.left + columns,
+		})),
 	);
-	return lines;
 }
 
-export function getImagePlacements(lines: string[]): ImagePlacement[] {
-	return imagePlacements.get(lines) ?? inferImagePlacements(lines);
+/** Concatenate frames vertically and translate every image by its output row. */
+export function concatRenderFrames(frames: readonly RenderFrame[], gap = 0): RenderFrame {
+	const safeGap = Math.max(0, Math.floor(gap));
+	const lines: string[] = [];
+	const images: ImagePlacement[] = [];
+	for (const [index, frame] of frames.entries()) {
+		if (index > 0) {
+			for (let row = 0; row < safeGap; row++) lines.push("");
+		}
+		const top = lines.length;
+		lines.push(...frame.lines);
+		for (const image of frame.images) {
+			images.push({ ...image, top: image.top + top, anchor: image.anchor + top });
+		}
+	}
+	return createRenderFrame(lines, images);
 }
 
-export function renderComponentFrame(component: Component, width: number): RenderFrame {
-	const lines = component.render(width);
-	return { lines, images: getImagePlacements(lines) };
-}
+/**
+ * Slice frame rows and retain placements whose anchor and occupied rows remain visible.
+ * Callers that can cut through an image should first choose an image-safe boundary.
+ */
+export function sliceRenderFrame(frame: RenderFrame, start: number, end = frame.lines.length): RenderFrame {
+	const safeStart = Math.max(0, Math.min(frame.lines.length, Math.floor(start)));
+	const safeEnd = Math.max(safeStart, Math.min(frame.lines.length, Math.floor(end)));
+	const lines = frame.lines.slice(safeStart, safeEnd);
+	const images: ImagePlacement[] = [];
+	for (const image of frame.images) {
+		const visibleTop = Math.max(safeStart, image.top);
+		const visibleBottom = Math.min(safeEnd, image.top + image.rows);
+		if (visibleBottom <= visibleTop || image.anchor < safeStart || image.anchor >= safeEnd) continue;
 
-export function preserveImagePlacements(source: string[], target: string[]): string[] {
-	return setImagePlacements(target, getImagePlacements(source));
-}
+		const hiddenRows = visibleTop - image.top;
+		const visibleRows = visibleBottom - visibleTop;
+		const partial = hiddenRows > 0 || visibleRows < image.rows;
+		const anchor = image.anchor - safeStart;
+		if (partial && image.protocol === "iterm2") {
+			if (image.exactSequence) lines[anchor] = lines[anchor]?.replace(image.sequence, "") ?? "";
+			continue;
+		}
 
-export function sliceRenderLines(source: string[], start: number, end = source.length): string[] {
-	const target = source.slice(start, end);
-	const images = getImagePlacements(source)
-		.filter(
-			(image) => image.anchor >= start && image.anchor < end && image.top < end && image.top + image.rows > start,
-		)
-		.map((image) => {
-			const visibleTop = Math.max(start, image.top);
-			const visibleBottom = Math.min(end, image.top + image.rows);
-			return {
-				...image,
-				top: visibleTop - start,
-				anchor: image.anchor - start,
-				rows: visibleBottom - visibleTop,
-			};
+		const sequence = partial ? cropImageLine(image.sequence, hiddenRows, visibleRows) : image.sequence;
+		if (image.exactSequence && sequence !== image.sequence) {
+			lines[anchor] = lines[anchor]?.replace(image.sequence, sequence) ?? sequence;
+		}
+		images.push({
+			...image,
+			top: visibleTop - safeStart,
+			anchor,
+			rows: visibleRows,
+			sequence,
 		});
-	return setImagePlacements(target, images);
+	}
+	return createRenderFrame(lines, images);
+}
+
+/** Insert or replace complete rows while translating placements below an image-safe edit boundary. */
+export function spliceRenderFrameRows(
+	frame: RenderFrame,
+	start: number,
+	deleteCount: number,
+	insert: RenderFrame = createRenderFrame([]),
+): RenderFrame {
+	const safeStart = Math.max(0, Math.min(frame.lines.length, Math.floor(start)));
+	const safeDeleteCount = Math.max(0, Math.min(frame.lines.length - safeStart, Math.floor(deleteCount)));
+	const deleteEnd = safeStart + safeDeleteCount;
+	const delta = insert.lines.length - safeDeleteCount;
+	const images: ImagePlacement[] = insert.images.map((image) => ({
+		...image,
+		top: image.top + safeStart,
+		anchor: image.anchor + safeStart,
+	}));
+
+	for (const image of frame.images) {
+		const imageEnd = image.top + image.rows;
+		if (safeDeleteCount === 0 && safeStart > image.top && safeStart < imageEnd) {
+			throw new Error(`Render-frame row insertion splits an image at row ${safeStart}`);
+		}
+		const intersectsDeletion = safeDeleteCount > 0 && image.top < deleteEnd && imageEnd > safeStart;
+		if (intersectsDeletion) {
+			if (safeStart <= image.top && deleteEnd >= imageEnd) continue;
+			throw new Error(`Render-frame row deletion splits an image at rows ${safeStart}-${deleteEnd}`);
+		}
+		images.push(
+			image.top >= deleteEnd ? { ...image, top: image.top + delta, anchor: image.anchor + delta } : { ...image },
+		);
+	}
+
+	images.sort((left, right) => left.top - right.top || left.anchor - right.anchor || left.left - right.left);
+	return createRenderFrame(
+		[...frame.lines.slice(0, safeStart), ...insert.lines, ...frame.lines.slice(deleteEnd)],
+		images,
+	);
+}
+
+/** Replace line text without changing row count or image positions. */
+export function mapRenderFrameLines(frame: RenderFrame, mapLine: (line: string, row: number) => string): RenderFrame {
+	const lines = frame.lines.map(mapLine);
+	for (const image of frame.images) {
+		if (image.exactSequence && !lines[image.anchor]?.includes(image.sequence)) {
+			throw new Error(`Render-frame line transform removed an image sequence at row ${image.anchor}`);
+		}
+	}
+	return createRenderFrame(
+		lines,
+		frame.images.map((image) => ({ ...image })),
+	);
+}
+
+/** Prefix every row and translate image columns by the prefix's visible width. */
+export function prefixRenderFrame(frame: RenderFrame, prefix: string): RenderFrame {
+	if (!prefix) return frame;
+	return createRenderFrame(
+		frame.lines.map((line) => `${prefix}${line}`),
+		frame.images.map((image) => ({ ...image, left: image.left + visibleWidth(prefix) })),
+	);
+}
+
+/** Add blank rows around a frame and translate placements by the top padding. */
+export function padRenderFrameRows(frame: RenderFrame, top: number, bottom: number): RenderFrame {
+	const safeTop = Math.max(0, Math.floor(top));
+	const safeBottom = Math.max(0, Math.floor(bottom));
+	return concatRenderFrames([
+		createRenderFrame(Array.from({ length: safeTop }, () => "")),
+		frame,
+		createRenderFrame(Array.from({ length: safeBottom }, () => "")),
+	]);
 }

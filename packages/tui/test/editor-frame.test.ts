@@ -14,7 +14,7 @@ describe("Editor frame", () => {
 			topBorderLabel: "ASK VOLT",
 		});
 
-		const topBorder = editor.render(width)[0]!;
+		const topBorder = editor.render(width).lines[0]!;
 		const plainBorder = stripVTControlCharacters(topBorder);
 
 		assert.ok(plainBorder.startsWith("╭─ ASK VOLT "));
@@ -27,10 +27,10 @@ describe("Editor frame", () => {
 		const editor = new Editor(new TuiMainScreen(new VirtualTerminal(width, 24)), defaultEditorTheme);
 
 		editor.setTopBorderLabel("SHELL");
-		assert.ok(stripVTControlCharacters(editor.render(width)[0]!).startsWith("╭─ SHELL "));
+		assert.ok(stripVTControlCharacters(editor.render(width).lines[0]!).startsWith("╭─ SHELL "));
 
 		editor.setTopBorderLabel(undefined);
-		assert.strictEqual(stripVTControlCharacters(editor.render(width)[0]!), `╭${"─".repeat(width - 2)}╮`);
+		assert.strictEqual(stripVTControlCharacters(editor.render(width).lines[0]!), `╭${"─".repeat(width - 2)}╮`);
 	});
 
 	it("shows the placeholder only while the editor is empty", () => {
@@ -39,9 +39,9 @@ describe("Editor frame", () => {
 			placeholder: "Type a request or / for commands",
 		});
 
-		assert.ok(stripVTControlCharacters(editor.render(width)[1]!).includes("Type a request"));
+		assert.ok(stripVTControlCharacters(editor.render(width).lines[1]!).includes("Type a request"));
 
 		editor.setText("hello");
-		assert.ok(!stripVTControlCharacters(editor.render(width)[1]!).includes("Type a request"));
+		assert.ok(!stripVTControlCharacters(editor.render(width).lines[1]!).includes("Type a request"));
 	});
 });

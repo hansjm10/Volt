@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "../render-frame.ts";
 import type { Component } from "../tui.ts";
 import { truncateToWidth, visibleWidth } from "../utils.ts";
 
@@ -19,7 +20,7 @@ export class TruncatedText implements Component {
 		// No cached state to invalidate currently
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const result: string[] = [];
 
 		// Empty line padded to width
@@ -60,6 +61,6 @@ export class TruncatedText implements Component {
 			result.push(emptyLine);
 		}
 
-		return result;
+		return createRenderFrame(result);
 	}
 }

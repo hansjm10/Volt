@@ -2,6 +2,7 @@ import type { AutocompleteProvider, AutocompleteSuggestions } from "../autocompl
 import { getKeybindings } from "../keybindings.ts";
 import { decodePrintableKey, matchesKey } from "../keys.ts";
 import { KillRing } from "../kill-ring.ts";
+import { createRenderFrame, type RenderFrame } from "../render-frame.ts";
 import { type Component, CURSOR_MARKER, type Focusable, type TUI } from "../tui.ts";
 import { UndoStack } from "../undo-stack.ts";
 import {
@@ -476,7 +477,7 @@ export class Editor implements Component, Focusable {
 		// No cached state to invalidate currently
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		// Reserve 2 columns for the left/right box borders
 		const innerWidth = Math.max(1, width - 2);
 		const maxPadding = Math.max(0, Math.floor((innerWidth - 1) / 2));
@@ -608,7 +609,7 @@ export class Editor implements Component, Focusable {
 		// Add autocomplete list if active
 		if (this.autocompleteState && this.autocompleteList) {
 			const autocompleteResult = this.autocompleteList.render(contentWidth);
-			for (const line of autocompleteResult) {
+			for (const line of autocompleteResult.lines) {
 				const lineWidth = visibleWidth(line);
 				const linePadding = " ".repeat(Math.max(0, contentWidth - lineWidth));
 				// Indent by 1 to align with the box interior
@@ -616,7 +617,7 @@ export class Editor implements Component, Focusable {
 			}
 		}
 
-		return result;
+		return createRenderFrame(result);
 	}
 
 	handleInput(data: string): void {

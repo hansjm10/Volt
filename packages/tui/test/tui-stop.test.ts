@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { type Component, Editor } from "../src/index.ts";
+import { createRenderFrame } from "../src/render-frame.ts";
 import { getCapabilities, resetCapabilitiesCache, setCapabilities } from "../src/terminal-image.ts";
 import { TuiAltScreen } from "../src/tui-alt-screen.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
@@ -20,7 +21,7 @@ describe("TUI stop cleanup", () => {
 			const component: Component = {
 				render: () => {
 					if (throwOnRender) throw new Error("stop render failed");
-					return ["fullscreen content"];
+					return createRenderFrame(["fullscreen content"]);
 				},
 				invalidate: () => {},
 			};

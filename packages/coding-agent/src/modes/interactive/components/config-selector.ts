@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * TUI component for managing package resources (enable/disable)
  */
@@ -180,7 +181,7 @@ type FlatEntry =
 class ConfigSelectorHeader implements Component {
 	invalidate(): void {}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const title = theme.bold("Resource Configuration");
 		const sep = theme.fg("muted", " · ");
 		const hint = rawKeyHint("space", "toggle") + sep + rawKeyHint("esc", "close");
@@ -188,10 +189,10 @@ class ConfigSelectorHeader implements Component {
 		const titleWidth = visibleWidth(title);
 		const spacing = Math.max(1, width - titleWidth - hintWidth);
 
-		return [
+		return createRenderFrame([
 			truncateToWidth(`${title}${" ".repeat(spacing)}${hint}`, width, ""),
 			theme.fg("muted", "Type to filter resources"),
-		];
+		]);
 	}
 }
 
@@ -337,16 +338,16 @@ class ResourceList implements Component, Focusable {
 
 	invalidate(): void {}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const lines: string[] = [];
 
 		// Search input
-		lines.push(...this.searchInput.render(width));
+		lines.push(...this.searchInput.render(width).lines);
 		lines.push("");
 
 		if (this.filteredItems.length === 0) {
 			lines.push(theme.fg("muted", "  No resources found"));
-			return lines;
+			return createRenderFrame(lines);
 		}
 
 		// Calculate visible range
@@ -386,7 +387,7 @@ class ResourceList implements Component, Focusable {
 			lines.push(theme.fg("dim", `  (${currentItemIndex}/${itemCount})`));
 		}
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	handleInput(data: string): void {

@@ -1,3 +1,4 @@
+import { concatRenderFrames, createRenderFrame, type RenderFrame } from "../render-frame.ts";
 import type { TUI } from "../tui.ts";
 import { Text } from "./text.ts";
 
@@ -40,8 +41,8 @@ export class Loader extends Text {
 		this.setIndicator(indicator);
 	}
 
-	override render(width: number): string[] {
-		return ["", ...super.render(width)];
+	override render(width: number): RenderFrame {
+		return concatRenderFrames([createRenderFrame([""]), super.render(width)]);
 	}
 
 	start(): void {

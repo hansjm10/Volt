@@ -1,5 +1,5 @@
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
-import { type Component, truncateToWidth, visibleWidth } from "@hansjm10/volt-tui";
+import { type Component, createRenderFrame, type RenderFrame, truncateToWidth, visibleWidth } from "@hansjm10/volt-tui";
 import type { AgentSession } from "../../../core/agent-session.ts";
 import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
@@ -130,8 +130,8 @@ export class FooterComponent implements Component {
 		return this.snapshot;
 	}
 
-	render(width: number): string[] {
-		if (width <= 0) return [];
+	render(width: number): RenderFrame {
+		if (width <= 0) return createRenderFrame([]);
 		const state = this.session.state;
 		const snapshot = this.getSnapshot();
 		const transientUsage = this.transientUsage;
@@ -243,6 +243,6 @@ export class FooterComponent implements Component {
 			lines.push(truncateToWidth(sortedStatuses.join(" "), width, theme.fg("dim", "…")));
 		}
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 }

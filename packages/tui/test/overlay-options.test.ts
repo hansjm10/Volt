@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { type TUI, TuiMainScreen } from "../src/index.ts";
+import { createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 import type { Component } from "../src/tui.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
@@ -13,18 +14,18 @@ class StaticOverlay implements Component {
 		this.requestedWidth = requestedWidth;
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		// Store the width we were asked to render at for verification
 		this.requestedWidth = width;
-		return this.lines;
+		return createRenderFrame(this.lines);
 	}
 
 	invalidate(): void {}
 }
 
 class EmptyContent implements Component {
-	render(): string[] {
-		return [];
+	render(): RenderFrame {
+		return createRenderFrame([]);
 	}
 	invalidate(): void {}
 }
@@ -85,9 +86,9 @@ describe("TUI overlay options", () => {
 
 			// Base content with styling
 			class StyledContent implements Component {
-				render(width: number): string[] {
+				render(width: number): RenderFrame {
 					const styledLine = `\x1b[1m\x1b[38;2;255;0;0m${"X".repeat(width)}\x1b[0m`;
-					return [styledLine, styledLine, styledLine];
+					return createRenderFrame([styledLine, styledLine, styledLine]);
 				}
 				invalidate(): void {}
 			}
@@ -148,10 +149,10 @@ describe("TUI overlay options", () => {
 
 			// Base content with OSC 8 hyperlinks (like file paths in agent output)
 			class HyperlinkContent implements Component {
-				render(width: number): string[] {
+				render(width: number): RenderFrame {
 					const link = `\x1b]8;;file:///path/to/file.ts\x07file.ts\x1b]8;;\x07`;
 					const line = `See ${link} for details ${"X".repeat(width - 30)}`;
-					return [line, line, line];
+					return createRenderFrame([line, line, line]);
 				}
 				invalidate(): void {}
 			}
