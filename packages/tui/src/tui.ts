@@ -322,6 +322,8 @@ export interface TUI extends Component {
 	setClearOnShrink(enabled: boolean): void;
 	getFocusedComponent(): Component | null;
 	setFocus(component: Component | null): void;
+	/** Replace current focus or an active overlay's eventual restore target. */
+	retargetFocus(from: Component, to: Component | null): boolean;
 	showOverlay(component: Component, options?: OverlayOptions): OverlayHandle;
 	hideOverlay(): void;
 	hasOverlay(): boolean;
@@ -487,6 +489,44 @@ export abstract class TuiBase extends Container implements TUI {
 
 	setFocus(component: Component | null): void {
 		this.setFocusInternal({ component, overlayFocusRestore: "clear" });
+	}
+
+	/**
+	 * Replace focus without interrupting a capturing overlay. Returns true when
+	 * the current focus or its active overlay restore chain referenced `from`.
+	 */
+	retargetFocus(from: Component, to: Component | null): boolean {
+		if (this.focusedComponent === from) {
+			this.setFocus(to);
+			return true;
+		}
+
+		const retargetOverlayChain = (start: Component | null): boolean => {
+			const visited = new Set<Component>();
+			let current = start;
+			while (current && !visited.has(current)) {
+				visited.add(current);
+				const overlay = this.overlayStack.find((entry) => entry.component === current);
+				if (!overlay) return false;
+				if (overlay.preFocus === from) {
+					overlay.preFocus = to;
+					return true;
+				}
+				current = overlay.preFocus;
+			}
+			return false;
+		};
+
+		if (retargetOverlayChain(this.focusedComponent)) return true;
+		const restoreState = this.getVisibleOverlayFocusRestore();
+		if (restoreState.status === "inactive") return false;
+		if (restoreState.status === "blocked" && restoreState.resume.status === "focus-target") {
+			if (restoreState.resume.target === from) {
+				restoreState.resume.target = to;
+				return true;
+			}
+		}
+		return retargetOverlayChain(restoreState.overlay.component);
 	}
 
 	private setFocusInternal({

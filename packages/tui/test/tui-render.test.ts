@@ -49,6 +49,10 @@ function kittyFrame(lines: readonly string[], anchor: number, rows: number, imag
 	]);
 }
 
+function deleteKittyPlacements(imageId: number): string {
+	return `\x1b_Ga=d,d=i,i=${imageId},q=2\x1b\\`;
+}
+
 class LoggingVirtualTerminal extends VirtualTerminal {
 	private writes: string[] = [];
 
@@ -440,6 +444,121 @@ describe("TUI Kitty image cleanup", () => {
 		assert.ok(deleteIndex >= 0, "previous image should be deleted during full redraw");
 		assert.ok(clearIndex >= 0, "full redraw should clear the screen");
 		assert.ok(deleteIndex < clearIndex, "old image should be deleted before the screen is cleared");
+
+		tui.stop();
+	});
+
+	it("replaces retained visible Kitty placements during viewport-only redraws", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 5);
+		terminal.write("SHELL_SENTINEL\r\n");
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 101, moveCursor: false });
+		component.setFrame(
+			kittyFrame(["line 0", "line 1", "line 2", "line 3", image, "", "line 6", "line 7"], 4, 2, 101),
+		);
+		tui.addChild(component);
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		tui.resetViewportOnNextRender();
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		const placementDeleteIndex = writes.indexOf(deleteKittyPlacements(101));
+		const clearIndex = writes.indexOf("\x1b[2J\x1b[H");
+		const drawIndex = writes.indexOf(image, clearIndex);
+		assert.ok(placementDeleteIndex >= 0, "visible placement should be removed before repainting");
+		assert.ok(clearIndex > placementDeleteIndex, "placement deletion should precede the viewport clear");
+		assert.ok(drawIndex > clearIndex, "retained image should be redrawn after the viewport clear");
+		assert.ok(!writes.includes(deleteKittyImage(101)), "retained image data should not be freed");
+		assert.ok(!writes.includes("\x1b[3J"), "viewport redraw must preserve scrollback");
+		assert.ok(getBufferText(terminal).includes("SHELL_SENTINEL"), "existing scrollback should remain available");
+
+		tui.stop();
+	});
+
+	it("frees removed Kitty images during viewport-only redraws", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 5);
+		terminal.write("SHELL_SENTINEL\r\n");
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 102, moveCursor: false });
+		component.setFrame(
+			kittyFrame(["line 0", "line 1", "line 2", "line 3", image, "", "line 6", "line 7"], 4, 2, 102),
+		);
+		tui.addChild(component);
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		component.setFrame(createRenderFrame(Array.from({ length: 8 }, (_, index) => `replacement ${index}`)));
+		tui.resetViewportOnNextRender();
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		const imageDeleteIndex = writes.indexOf(deleteKittyImage(102));
+		const clearIndex = writes.indexOf("\x1b[2J\x1b[H");
+		assert.ok(imageDeleteIndex >= 0, "removed image data should be freed");
+		assert.ok(clearIndex > imageDeleteIndex, "image deletion should precede the viewport clear");
+		assert.ok(!writes.includes(image), "removed image should not be redrawn");
+		assert.ok(!writes.includes("\x1b[3J"), "viewport redraw must preserve scrollback");
+		assert.ok(getBufferText(terminal).includes("SHELL_SENTINEL"), "existing scrollback should remain available");
+
+		tui.stop();
+	});
+
+	it("leaves retained offscreen Kitty placements intact during viewport-only redraws", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 5);
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		const historicalImage = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 103, moveCursor: false });
+		const visibleImage = encodeKitty("BBBB", { columns: 2, rows: 2, imageId: 104, moveCursor: false });
+		const lines = ["line 0", historicalImage, "", "line 3", "line 4", "line 5", visibleImage, "", "line 8", "line 9"];
+		component.setFrame(
+			createRenderFrame(lines, [
+				{
+					top: 1,
+					anchor: 1,
+					left: 0,
+					columns: 2,
+					rows: 2,
+					protocol: "kitty",
+					imageId: 103,
+					sequence: historicalImage,
+					exactSequence: true,
+				},
+				{
+					top: 6,
+					anchor: 6,
+					left: 0,
+					columns: 2,
+					rows: 2,
+					protocol: "kitty",
+					imageId: 104,
+					sequence: visibleImage,
+					exactSequence: true,
+				},
+			]),
+		);
+		tui.addChild(component);
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		tui.resetViewportOnNextRender();
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		assert.ok(!writes.includes(deleteKittyPlacements(103)), "historical placement should remain in scrollback");
+		assert.ok(!writes.includes(deleteKittyImage(103)), "historical image data should remain retained");
+		assert.ok(writes.includes(deleteKittyPlacements(104)), "visible placement should be removed before repainting");
+		assert.ok(writes.includes(visibleImage), "visible placement should be redrawn");
+		assert.ok(!writes.includes(historicalImage), "historical image should not be replayed into the viewport");
 
 		tui.stop();
 	});

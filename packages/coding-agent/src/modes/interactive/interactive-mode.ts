@@ -4894,13 +4894,14 @@ export class InteractiveMode {
 		const plan = planning.plan;
 		const split = this.mainView.isTerminalSplit();
 		if (split && this.planDetails) {
+			this.focusPlanInspector();
 			this.closePlanDetails({ focusConversation: false });
 		} else if (this.planDetails && plan) {
 			this.planDetails.setPlan(plan);
 		} else if (this.planDetails && !plan) {
 			this.closePlanDetails();
 		}
-		if (!split && this.planInspector.focused) this.focusConversation();
+		if (!split) this.focusConversation(true);
 		this.updateEditorBorderColor();
 		if (plan?.phase === "ready") {
 			const readyKey = `${plan.id}:${plan.revision}`;
@@ -4946,7 +4947,9 @@ export class InteractiveMode {
 		});
 		this.planDetails.setFullscreenActive(this.ui.mode === "fullscreen");
 		this.fullscreenTranscript.setPrimary(false);
-		this.ui.setFocus(this.planDetails);
+		if (!this.ui.retargetFocus(this.getConversationFocusTarget(), this.planDetails)) {
+			this.ui.setFocus(this.planDetails);
+		}
 		this.ui.requestRender();
 	}
 
@@ -4978,30 +4981,50 @@ export class InteractiveMode {
 			return false;
 		}
 		const focused = this.ui.getFocusedComponent();
-		if (
-			focused !== this.planInspector &&
-			focused !== this.planDetails &&
-			(focused === null || !this.editorContainer.children.includes(focused))
-		) {
-			return false;
+		let focusSource: Component | undefined;
+		let retargeted = false;
+		if (focused !== this.planInspector) {
+			if (focused === this.planDetails || (focused !== null && this.editorContainer.children.includes(focused))) {
+				focusSource = focused;
+			} else {
+				const focusSources: Component[] = [...this.editorContainer.children];
+				if (this.planDetails) focusSources.unshift(this.planDetails);
+				for (const source of focusSources) {
+					if (!this.ui.retargetFocus(source, this.planInspector)) continue;
+					focusSource = source;
+					retargeted = true;
+					break;
+				}
+				if (!retargeted) return false;
+			}
 		}
 		if (!this.planInspector.focused) {
-			this.planPaneReturnFocus = this.getConversationFocusTarget();
+			this.planPaneReturnFocus =
+				focusSource && this.editorContainer.children.includes(focusSource)
+					? focusSource
+					: this.getConversationFocusTarget();
 			this.fullscreenTranscript.setPrimary(false);
 			this.planInspector.setFullscreenActive(this.ui.mode === "fullscreen");
 			this.planInspector.setSelected(true);
-			this.ui.setFocus(this.planInspector);
+			if (!retargeted) this.ui.setFocus(this.planInspector);
 		}
 		this.ui.requestRender();
 		return true;
 	}
 
-	private focusConversation(): void {
+	private focusConversation(onlyFromPlanInspector = false): boolean {
+		const target = this.getConversationFocusTarget();
+		const wasInspectorFocused = this.planInspector.focused;
+		const retargeted = this.ui.retargetFocus(this.planInspector, target);
+		if (!retargeted) {
+			if (onlyFromPlanInspector && !wasInspectorFocused) return false;
+			this.ui.setFocus(target);
+		}
 		this.planInspector.setSelected(false);
 		this.fullscreenTranscript.setPrimary(true);
-		this.ui.setFocus(this.getConversationFocusTarget());
 		this.planPaneReturnFocus = undefined;
 		this.ui.requestRender();
+		return true;
 	}
 
 	private togglePlanPaneFocus(): void {
@@ -5021,12 +5044,12 @@ export class InteractiveMode {
 		this.planInspector.setFullscreenActive(split && this.ui.mode === "fullscreen");
 		if (split) {
 			const hadPlanDetails = this.planDetails !== undefined;
-			if (hadPlanDetails) this.closePlanDetails({ focusConversation: false });
 			if (hadPlanDetails || this.session.planningState.plan?.phase === "ready") this.focusPlanInspector();
+			if (hadPlanDetails) this.closePlanDetails({ focusConversation: false });
 			return;
 		}
 		this.fullscreenTranscript.setPrimary(true);
-		if (this.planInspector.focused) this.focusConversation();
+		this.focusConversation(true);
 		if (
 			this.session.planningState.plan?.phase === "ready" &&
 			!this.planDetails &&

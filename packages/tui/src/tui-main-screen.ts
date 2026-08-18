@@ -202,7 +202,31 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			this.fullRedrawCount += 1;
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
 			if (clear) {
-				if (!preserveScrollback) buffer += this.deleteKittyImages(this.previousKittyImageIds);
+				if (preserveScrollback) {
+					const nextKittyImageIds = this.collectKittyImageIds(newImages);
+					const removedKittyImageIds = [...this.previousKittyImageIds].filter(
+						(imageId) => !nextKittyImageIds.has(imageId),
+					);
+					buffer += this.deleteKittyImages(removedKittyImageIds);
+					const previousViewportBottom = prevViewportTop + height - 1;
+					const retainedVisibleKittyImageIds = new Set(
+						this.previousImages
+							.filter(
+								(image) =>
+									image.protocol === "kitty" &&
+									image.imageId !== undefined &&
+									nextKittyImageIds.has(image.imageId) &&
+									image.top <= previousViewportBottom &&
+									image.top + image.rows - 1 >= prevViewportTop,
+							)
+							.map((image) => image.imageId!),
+					);
+					for (const imageId of retainedVisibleKittyImageIds) {
+						buffer += `\x1b_Ga=d,d=i,i=${imageId},q=2\x1b\\`;
+					}
+				} else {
+					buffer += this.deleteKittyImages(this.previousKittyImageIds);
+				}
 				buffer += preserveScrollback ? "\x1b[2J\x1b[H" : "\x1b[2J\x1b[H\x1b[3J";
 			}
 			const viewportStart = preserveScrollback ? Math.max(0, newLines.length - height) : 0;
