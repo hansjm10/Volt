@@ -1,4 +1,5 @@
 import type { Component } from "@hansjm10/volt-tui";
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 import { theme } from "../../../core/theme/runtime.ts";
 
 /**
@@ -19,7 +20,7 @@ export class DynamicBorder implements Component {
 		// No cached state to invalidate currently
 	}
 
-	render(width: number): string[] {
-		return [this.color("─".repeat(Math.max(1, width)))];
+	render(width: number): RenderFrame {
+		return createRenderFrame([this.color("─".repeat(Math.max(1, width)))]);
 	}
 }

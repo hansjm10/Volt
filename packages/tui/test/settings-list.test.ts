@@ -27,7 +27,7 @@ describe("SettingsList", () => {
 			() => {},
 		);
 
-		const lines = list.render(width);
+		const lines = list.render(width).lines;
 		assert.ok(lines.some((line) => line.includes("AGENT")));
 		assert.ok(lines.some((line) => line.includes("INTERFACE")));
 		for (const line of lines) {

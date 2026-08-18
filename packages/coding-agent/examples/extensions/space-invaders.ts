@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Space Invaders game extension - play with /invaders command
  * Uses Kitty keyboard protocol for smooth movement (press/release detection)
@@ -379,9 +380,9 @@ class SpaceInvadersComponent {
 		this.cachedWidth = 0;
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		if (width === this.cachedWidth && this.cachedVersion === this.version) {
-			return this.cachedLines;
+			return createRenderFrame(this.cachedLines);
 		}
 
 		const lines: string[] = [];
@@ -505,7 +506,7 @@ class SpaceInvadersComponent {
 		this.cachedWidth = width;
 		this.cachedVersion = this.version;
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	private padLine(line: string, width: number): string {

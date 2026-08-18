@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Questionnaire Tool - Unified tool for asking single or multiple questions
  *
@@ -255,8 +256,8 @@ export default function questionnaire(volt: ExtensionAPI) {
 					}
 				}
 
-				function render(width: number): string[] {
-					if (cachedLines) return cachedLines;
+				function render(width: number): RenderFrame {
+					if (cachedLines) return createRenderFrame(cachedLines);
 
 					const lines: string[] = [];
 					const renderWidth = Math.max(1, width);
@@ -331,7 +332,7 @@ export default function questionnaire(volt: ExtensionAPI) {
 						renderOptions();
 						lines.push("");
 						addWrappedWithPrefix(" ", theme.fg("muted", "Your answer:"));
-						for (const line of editor.render(Math.max(1, renderWidth - 2))) {
+						for (const line of editor.render(Math.max(1, renderWidth - 2)).lines) {
 							lines.push(` ${line}`);
 						}
 						lines.push("");
@@ -373,7 +374,7 @@ export default function questionnaire(volt: ExtensionAPI) {
 					lines.push(theme.fg("accent", "─".repeat(renderWidth)));
 
 					cachedLines = lines;
-					return lines;
+					return createRenderFrame(lines);
 				}
 
 				return {

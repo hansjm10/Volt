@@ -45,7 +45,7 @@ describe("P9: truncated latch must not swallow agent_end loader update", () => {
 		const viewer = makeViewer();
 		viewers.push(viewer);
 
-		const initial = stripAnsi(viewer.render(80).join("\n"));
+		const initial = stripAnsi(viewer.render(80).lines.join("\n"));
 		// Sanity: the initial attaching label is present.
 		expect(initial).toContain("finishing remote turn");
 
@@ -56,7 +56,7 @@ describe("P9: truncated latch must not swallow agent_end loader update", () => {
 		// message to advance to the "finished / taking over" label.
 		viewer.handleViewerEvent({ type: "agent_end" });
 
-		const rendered = stripAnsi(viewer.render(80).join("\n"));
+		const rendered = stripAnsi(viewer.render(80).lines.join("\n"));
 		// EXPECTED (bug absent): agent_end updated the loader message.
 		expect(rendered).toContain("Remote turn finished");
 	});

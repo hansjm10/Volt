@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { Container, type TUI, TuiMainScreen } from "../src/index.ts";
+import { createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 import type { Component, Focusable } from "../src/tui.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
@@ -11,16 +12,16 @@ class StaticOverlay implements Component {
 		this.lines = lines;
 	}
 
-	render(): string[] {
-		return this.lines;
+	render(): RenderFrame {
+		return createRenderFrame(this.lines);
 	}
 
 	invalidate(): void {}
 }
 
 class EmptyContent implements Component {
-	render(): string[] {
-		return [];
+	render(): RenderFrame {
+		return createRenderFrame([]);
 	}
 	invalidate(): void {}
 }
@@ -38,8 +39,8 @@ class FocusableOverlay implements Component, Focusable {
 		this.inputs.push(data);
 	}
 
-	render(): string[] {
-		return this.lines;
+	render(): RenderFrame {
+		return createRenderFrame(this.lines);
 	}
 
 	invalidate(): void {}

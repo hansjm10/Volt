@@ -32,7 +32,7 @@ import {
 	setCellDimensions,
 } from "../src/terminal-image.ts";
 
-function lineAt(lines: string[], index: number): string {
+function lineAt(lines: readonly string[], index: number): string {
 	const line = lines[index];
 	assert.notStrictEqual(line, undefined, `Expected rendered line at index ${index}`);
 	return line ?? "";
@@ -179,11 +179,11 @@ describe("Sixel support", () => {
 				{ maxWidthCells: 4, maxHeightCells: 2 },
 				{ widthPx: 2, heightPx: 2 },
 			);
-			const lines = image.render(10);
+			const lines = image.render(10).lines;
 			assert.strictEqual(lines.length, 2);
 			assert.ok(lineAt(lines, 0).includes("\x1bP0;1;0q"));
 			assert.strictEqual(lineAt(lines, 1), "");
-			assert.strictEqual(image.render(10), lines, "same-width renders should reuse the cached control stream");
+			assert.strictEqual(image.render(10).lines, lines, "same-width renders should reuse the cached control stream");
 		} finally {
 			resetCapabilitiesCache();
 			setCellDimensions({ widthPx: 9, heightPx: 18 });
@@ -201,12 +201,12 @@ describe("Sixel support", () => {
 				{ maxWidthCells: 2, maxHeightCells: 4 },
 				{ widthPx: 2, heightPx: 4 },
 			);
-			const first = image.render(10);
+			const first = image.render(10).lines;
 			assert.strictEqual(getSixelRegistryStats().images, 1);
 			clearSixelImages();
 			assert.strictEqual(getSixelRegistryStats().images, 0);
 
-			const second = image.render(10);
+			const second = image.render(10).lines;
 			assert.notStrictEqual(second, first, "cleared preparation must invalidate the cached lines");
 			assert.strictEqual(getSixelRegistryStats().images, 1);
 			assert.ok(lineAt(second, 0).includes("\x1bP0;1;0q"));
@@ -305,7 +305,7 @@ describe("Sixel support", () => {
 				{ maxWidthCells: 1 },
 				{ widthPx: 1, heightPx: 2 },
 			);
-			image.render(3);
+			image.render(3).lines;
 			assert.strictEqual(getSixelRegistryStats().images, 1);
 			image.dispose();
 			assert.strictEqual(getSixelRegistryStats().images, 0);
@@ -355,7 +355,7 @@ describe("Sixel support", () => {
 				{ filename: "broken.png" },
 				{ widthPx: 10, heightPx: 10 },
 			);
-			assert.deepStrictEqual(image.render(20), ["fallback:[Image: broken.png [image/png] 10x10]"]);
+			assert.deepStrictEqual(image.render(20).lines, ["fallback:[Image: broken.png [image/png] 10x10]"]);
 		} finally {
 			resetCapabilitiesCache();
 		}
@@ -702,7 +702,7 @@ describe("Kitty image cursor movement", () => {
 				{ maxWidthCells: 10 },
 				{ widthPx: 10, heightPx: 100 },
 			);
-			const lines = image.render(12);
+			const lines = image.render(12).lines;
 			assert.strictEqual(lines.length, 5);
 			assert.ok(lineAt(lines, 0).includes(",c=1,r=5"));
 		} finally {
@@ -722,7 +722,7 @@ describe("Kitty image cursor movement", () => {
 				{ maxWidthCells: 2 },
 				{ widthPx: 20, heightPx: 20 },
 			);
-			const lines = image.render(4);
+			const lines = image.render(4).lines;
 			const imageId = image.getImageId();
 			assert.strictEqual(typeof imageId, "number");
 			const imageLine = lineAt(lines, 0);

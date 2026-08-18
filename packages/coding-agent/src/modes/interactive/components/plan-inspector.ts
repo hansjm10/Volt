@@ -1,7 +1,9 @@
 import {
 	type Component,
+	createRenderFrame,
 	type Focusable,
 	getKeybindings,
+	type RenderFrame,
 	ScrollView,
 	type ScrollViewScrollbar,
 	truncateToWidth,
@@ -51,8 +53,8 @@ class PlanInspectorSection implements Component {
 		// Theme styling is resolved during render.
 	}
 
-	render(width: number): string[] {
-		return this.renderSection(width);
+	render(width: number): RenderFrame {
+		return createRenderFrame(this.renderSection(width));
 	}
 }
 
@@ -66,6 +68,7 @@ export class PlanInspectorComponent implements Component, Focusable {
 	private readonly bodyScroll: ScrollView;
 	private readonly fullscreenLayout: VStack;
 	private _focused = false;
+	private selected = false;
 	private actionIndex = 0;
 	private regularViewportRows = 1;
 	private regularPageSize = 1;
@@ -108,7 +111,11 @@ export class PlanInspectorComponent implements Component, Focusable {
 
 	set focused(focused: boolean) {
 		this._focused = focused;
-		this.bodyScroll.setPrimary(this.fullscreenActive && focused);
+	}
+
+	setSelected(selected: boolean): void {
+		this.selected = selected;
+		this.bodyScroll.setPrimary(this.fullscreenActive && selected);
 	}
 
 	setPlanning(planning: PlanningState): void {
@@ -128,7 +135,7 @@ export class PlanInspectorComponent implements Component, Focusable {
 
 	setFullscreenActive(active: boolean): void {
 		this.fullscreenActive = active;
-		this.bodyScroll.setPrimary(active && this.focused);
+		this.bodyScroll.setPrimary(active && this.selected);
 	}
 
 	setFullscreenScrollbar(scrollbar: ScrollViewScrollbar): void {
@@ -143,10 +150,10 @@ export class PlanInspectorComponent implements Component, Focusable {
 		this.fullscreenLayout.invalidate();
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		if (width <= 0 || this.regularViewportRows <= 0) {
 			this.selectedActionVisible = false;
-			return [];
+			return createRenderFrame([]);
 		}
 
 		const body = this.renderBody(width);
@@ -166,7 +173,9 @@ export class PlanInspectorComponent implements Component, Focusable {
 			{ length: Math.max(0, this.regularViewportRows - header.length - page.length - visibleFooter.length) },
 			() => "",
 		);
-		return [...header, ...page, ...padding, ...visibleFooter].map((line) => truncateToWidth(line, width, ""));
+		return createRenderFrame(
+			[...header, ...page, ...padding, ...visibleFooter].map((line) => truncateToWidth(line, width, "")),
+		);
 	}
 
 	handleInput(data: string): void {

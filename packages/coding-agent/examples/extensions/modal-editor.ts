@@ -1,3 +1,4 @@
+import { mapRenderFrameLines, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Modal Editor - vim-like modal editing example
  *
@@ -64,17 +65,18 @@ class ModalEditor extends CustomEditor {
 		super.handleInput(data);
 	}
 
-	render(width: number): string[] {
-		const lines = super.render(width);
-		if (lines.length === 0) return lines;
+	render(width: number): RenderFrame {
+		const frame = super.render(width);
+		if (frame.lines.length === 0) return frame;
 
 		// Add mode indicator to bottom border
 		const label = this.mode === "normal" ? " NORMAL " : " INSERT ";
-		const last = lines.length - 1;
-		if (visibleWidth(lines[last]!) >= label.length) {
-			lines[last] = truncateToWidth(lines[last]!, width - label.length, "") + label;
-		}
-		return lines;
+		const last = frame.lines.length - 1;
+		return mapRenderFrameLines(frame, (line, row) =>
+			row === last && visibleWidth(line) >= label.length
+				? truncateToWidth(line, width - label.length, "") + label
+				: line,
+		);
 	}
 }
 

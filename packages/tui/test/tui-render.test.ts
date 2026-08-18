@@ -6,6 +6,7 @@ import { HStack } from "../src/components/h-stack.ts";
 import { Image } from "../src/components/image.ts";
 import { Text } from "../src/components/text.ts";
 import { type Component, TuiMainScreen } from "../src/index.ts";
+import { concatRenderFrames, createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 import {
 	deleteKittyImage,
 	encodeKitty,
@@ -17,10 +18,35 @@ import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class TestComponent implements Component {
 	lines: string[] = [];
-	render(_width: number): string[] {
-		return this.lines;
+	private images: RenderFrame["images"] = [];
+
+	setFrame(frame: RenderFrame): void {
+		this.lines = [...frame.lines];
+		this.images = frame.images.map((image) => ({ ...image }));
 	}
+
+	render(_width: number): RenderFrame {
+		return createRenderFrame(this.lines, this.images);
+	}
+
 	invalidate(): void {}
+}
+
+function kittyFrame(lines: readonly string[], anchor: number, rows: number, imageId: number): RenderFrame {
+	const sequence = lines[anchor] ?? "";
+	return createRenderFrame(lines, [
+		{
+			top: anchor,
+			anchor,
+			left: 0,
+			columns: 2,
+			rows,
+			protocol: "kitty",
+			imageId,
+			sequence,
+			exactSequence: true,
+		},
+	]);
 }
 
 class LoggingVirtualTerminal extends VirtualTerminal {
@@ -46,7 +72,7 @@ function solidPngBase64(width: number, height: number): string {
 	return Buffer.from(encode({ width, height, channels: 4, depth: 8, data })).toString("base64");
 }
 
-function lineAt(lines: string[], index: number): string {
+function lineAt(lines: readonly string[], index: number): string {
 	const line = lines[index];
 	assert.notStrictEqual(line, undefined, `Expected rendered line at index ${index}`);
 	return line ?? "";
@@ -135,9 +161,12 @@ describe("TUI Kitty image cleanup", () => {
 				{ maxWidthCells: 2 },
 				{ widthPx: 20, heightPx: 20 },
 			);
-			const imageLines = image.render(40);
+			const imageFrame = image.render(40);
+			const imageLines = imageFrame.lines;
 			const imageSequence = lineAt(imageLines, 0);
-			component.lines = ["before", ...imageLines, "after"];
+			component.setFrame(
+				concatRenderFrames([createRenderFrame(["before"]), imageFrame, createRenderFrame(["after"])]),
+			);
 			tui.requestRender();
 			await terminal.waitForRender();
 
@@ -180,7 +209,9 @@ describe("TUI Kitty image cleanup", () => {
 				{ maxWidthCells: 3 },
 				{ widthPx: 30, heightPx: 30 },
 			);
-			component.lines = ["before", ...image.render(40), "after"];
+			component.setFrame(
+				concatRenderFrames([createRenderFrame(["before"]), image.render(40), createRenderFrame(["after"])]),
+			);
 			tui.requestRender();
 			await terminal.waitForRender();
 
@@ -216,9 +247,16 @@ describe("TUI Kitty image cleanup", () => {
 				{ maxWidthCells: 3 },
 				{ widthPx: 30, heightPx: 30 },
 			);
-			const imageLines = image.render(40);
+			const imageFrame = image.render(40);
+			const imageLines = imageFrame.lines;
 			const imageSequence = lineAt(imageLines, 0);
-			component.lines = ["l0", "l1", "l2", "l3", "l4", ...imageLines, "after"];
+			component.setFrame(
+				concatRenderFrames([
+					createRenderFrame(["l0", "l1", "l2", "l3", "l4"]),
+					imageFrame,
+					createRenderFrame(["after"]),
+				]),
+			);
 			tui.requestRender();
 			await terminal.waitForRender();
 
@@ -261,11 +299,14 @@ describe("TUI Kitty image cleanup", () => {
 				{ maxWidthCells: 6 },
 				{ widthPx: 60, heightPx: 60 },
 			);
-			const imageLines = image.render(40);
+			const imageFrame = image.render(40);
+			const imageLines = imageFrame.lines;
 			const imageSequence = lineAt(imageLines, 0);
 			assert.ok(imageLines.length > terminal.rows, "test image should exceed the viewport height");
 
-			component.lines = ["before", ...imageLines, "after"];
+			component.setFrame(
+				concatRenderFrames([createRenderFrame(["before"]), imageFrame, createRenderFrame(["after"])]),
+			);
 			tui.requestRender(true);
 			await terminal.waitForRender();
 
@@ -290,13 +331,13 @@ describe("TUI Kitty image cleanup", () => {
 		tui.addChild(component);
 
 		const oldImage = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 42, moveCursor: false });
-		component.lines = ["top", oldImage];
+		component.setFrame(kittyFrame(["top", oldImage], 1, 2, 42));
 		tui.start();
 		await terminal.waitForRender();
 		terminal.clearWrites();
 
 		const newImage = encodeKitty("BBBB", { columns: 2, rows: 1, imageId: 42, moveCursor: false });
-		component.lines = [newImage, ""];
+		component.setFrame(kittyFrame([newImage, ""], 0, 1, 42));
 		tui.requestRender();
 		await terminal.waitForRender();
 
@@ -317,12 +358,12 @@ describe("TUI Kitty image cleanup", () => {
 		tui.addChild(component);
 
 		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 88, moveCursor: false });
-		component.lines = ["", image];
+		component.setFrame(kittyFrame(["", image], 1, 2, 88));
 		tui.start();
 		await terminal.waitForRender();
 		terminal.clearWrites();
 
-		component.lines = ["covered", image];
+		component.setFrame(kittyFrame(["covered", image], 1, 2, 88));
 		tui.requestRender();
 		await terminal.waitForRender();
 
@@ -383,12 +424,13 @@ describe("TUI Kitty image cleanup", () => {
 		const component = new TestComponent();
 		tui.addChild(component);
 
-		component.lines = [encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 77, moveCursor: false })];
+		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 77, moveCursor: false });
+		component.setFrame(kittyFrame([image], 0, 2, 77));
 		tui.start();
 		await terminal.waitForRender();
 		terminal.clearWrites();
 
-		component.lines = ["plain text"];
+		component.setFrame(createRenderFrame(["plain text"]));
 		tui.requestRender(true);
 		await terminal.waitForRender();
 
@@ -702,7 +744,7 @@ describe("TUI differential rendering", () => {
 					{ maxWidthCells: 2, maxHeightCells: 3 },
 					{ widthPx: 2, heightPx: 3 },
 				);
-				const imageLines = image.render(20);
+				const imageLines = image.render(20).lines;
 				assert.strictEqual(imageLines.length, 3, "test image should reserve three rows");
 				const after = new TestComponent();
 				after.lines = ["after 0", "after 1", "after 2"];

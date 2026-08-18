@@ -4989,6 +4989,7 @@ export class InteractiveMode {
 			this.planPaneReturnFocus = this.getConversationFocusTarget();
 			this.fullscreenTranscript.setPrimary(false);
 			this.planInspector.setFullscreenActive(this.ui.mode === "fullscreen");
+			this.planInspector.setSelected(true);
 			this.ui.setFocus(this.planInspector);
 		}
 		this.ui.requestRender();
@@ -4996,6 +4997,7 @@ export class InteractiveMode {
 	}
 
 	private focusConversation(): void {
+		this.planInspector.setSelected(false);
 		this.fullscreenTranscript.setPrimary(true);
 		this.ui.setFocus(this.getConversationFocusTarget());
 		this.planPaneReturnFocus = undefined;
@@ -8403,7 +8405,7 @@ export class InteractiveMode {
 	private handleDebugCommand(): void {
 		const width = this.ui.terminal.columns;
 		const height = this.ui.terminal.rows;
-		const allLines = this.ui.render(width);
+		const allLines = this.ui.render(width).lines;
 
 		const debugLogPath = getDebugLogPath();
 		const debugData = [

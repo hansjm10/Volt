@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Overlay Test - validates overlay compositing with inline text inputs
  *
@@ -84,7 +85,7 @@ class OverlayTestComponent implements Focusable {
 		}
 	}
 
-	render(_width: number): string[] {
+	render(_width: number): RenderFrame {
 		const w = this.width;
 		const th = this.theme;
 		const innerW = w - 2;
@@ -145,7 +146,7 @@ class OverlayTestComponent implements Focusable {
 		lines.push(row(` ${th.fg("dim", "↑↓ navigate • type to input • Enter select • Esc cancel")}`));
 		lines.push(th.fg("border", `╰${"─".repeat(innerW)}╯`));
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	invalidate(): void {}

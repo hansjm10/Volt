@@ -8,6 +8,7 @@ import { ScrollView } from "../src/components/scroll-view.ts";
 import { Text } from "../src/components/text.ts";
 import { VStack } from "../src/components/v-stack.ts";
 import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keybindings.ts";
+import { createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 import { ProcessTerminal } from "../src/terminal.ts";
 import {
 	encodeKitty,
@@ -30,6 +31,27 @@ function solidPngBase64(width: number, height: number, rgba: readonly [number, n
 	return Buffer.from(encode({ width, height, channels: 4, depth: 8, data })).toString("base64");
 }
 
+function sixelFrame(
+	lines: readonly string[],
+	image: { sequence: string; columns: number; rows: number; imageId?: number },
+): RenderFrame {
+	const anchor = lines.indexOf(image.sequence);
+	if (anchor === -1) return createRenderFrame(lines);
+	return createRenderFrame(lines, [
+		{
+			top: anchor,
+			anchor,
+			left: 0,
+			columns: image.columns,
+			rows: image.rows,
+			protocol: "sixel",
+			...(image.imageId === undefined ? {} : { imageId: image.imageId }),
+			sequence: image.sequence,
+			exactSequence: true,
+		},
+	]);
+}
+
 class InputOverlay {
 	focused = false;
 	inputs: string[] = [];
@@ -38,8 +60,8 @@ class InputOverlay {
 		this.inputs.push(data);
 	}
 
-	render(): string[] {
-		return ["overlay"];
+	render(): RenderFrame {
+		return createRenderFrame(["overlay"]);
 	}
 
 	invalidate(): void {}
@@ -564,7 +586,7 @@ describe("TuiAltScreen", () => {
 		const editorInputs: string[] = [];
 		const editor = {
 			focused: false,
-			render: () => ["editor"],
+			render: () => createRenderFrame(["editor"]),
 			invalidate: () => {},
 			handleInput: (data: string) => editorInputs.push(data),
 		};
@@ -681,7 +703,7 @@ describe("TuiAltScreen", () => {
 		const editorInputs: string[] = [];
 		const editor = {
 			focused: false,
-			render: () => ["editor"],
+			render: () => createRenderFrame(["editor"]),
 			invalidate: () => {},
 			handleInput: (data: string) => editorInputs.push(data),
 		};
@@ -761,7 +783,7 @@ describe("TuiAltScreen", () => {
 			const terminal = new RecordingTerminal(20, 3);
 			const tui = new TuiAltScreen(terminal);
 			tui.addChild({
-				render: () => ["\x1b]133;B\x07\x1b]133;C\x07\x1b]133;A\x07content"],
+				render: () => createRenderFrame(["\x1b]133;B\x07\x1b]133;C\x07\x1b]133;A\x07content"]),
 				invalidate: () => {},
 			});
 			tui.addChild(
@@ -792,7 +814,7 @@ describe("TuiAltScreen", () => {
 			const tui = new TuiAltScreen(terminal);
 			const imageLine = "\x1b]1337;File=inline=1;width=2;height=auto:AAAA\x07";
 			tui.addChild({
-				render: () => [imageLine, "", "", "after", "more", "end"],
+				render: () => createRenderFrame([imageLine, "", "", "after", "more", "end"]),
 				invalidate: () => {},
 			});
 			tui.start();
@@ -827,7 +849,7 @@ describe("TuiAltScreen", () => {
 			const tui = new TuiAltScreen(terminal);
 			let lines = [image.sequence, "", ""];
 			tui.addChild({
-				render: () => lines,
+				render: () => sixelFrame(lines, image),
 				invalidate: () => {},
 			});
 			tui.start();
@@ -886,7 +908,7 @@ describe("TuiAltScreen", () => {
 			const tui = new TuiAltScreen(terminal);
 			let lines = [image.sequence, "", ""];
 			tui.addChild({
-				render: () => lines,
+				render: () => sixelFrame(lines, image),
 				invalidate: () => {},
 			});
 			tui.start();
@@ -925,7 +947,7 @@ describe("TuiAltScreen", () => {
 			assert.ok(image);
 			assert.strictEqual(image.rows, 3);
 			tui.addChild({
-				render: () => ["before", image.sequence, "", "", "after", "end"],
+				render: () => createRenderFrame(["before", image.sequence, "", "", "after", "end"]),
 				invalidate: () => {},
 			});
 			tui.start();
@@ -991,7 +1013,7 @@ describe("TuiAltScreen", () => {
 		const imageLine = encodeKitty("AAAA", { columns: 2, rows: 3, imageId, moveCursor: false });
 		registerKittyImageMetadata({ imageId, columns: 2, rows: 3, widthPx: 100, heightPx: 100 });
 		tui.addChild({
-			render: () => ["before", imageLine, "", "", "after", "end"],
+			render: () => createRenderFrame(["before", imageLine, "", "", "after", "end"]),
 			invalidate: () => {},
 		});
 		tui.start();
@@ -1068,7 +1090,7 @@ describe("TuiAltScreen", () => {
 			tui.setLayoutRoot(
 				new ScrollView(
 					{
-						render: () => [imageLine, "after"],
+						render: () => createRenderFrame([imageLine, "after"]),
 						invalidate: () => {},
 					},
 					{ primary: true },
@@ -1111,7 +1133,7 @@ describe("TuiAltScreen", () => {
 			tui.setLayoutRoot(
 				new ScrollView(
 					{
-						render: () => imageLines,
+						render: () => createRenderFrame(imageLines),
 						invalidate: () => {},
 					},
 					{ primary: true },
@@ -1158,7 +1180,7 @@ describe("TuiAltScreen", () => {
 			tui.setLayoutRoot(
 				new ScrollView(
 					{
-						render: () => imageLines,
+						render: () => createRenderFrame(imageLines),
 						invalidate: () => {},
 					},
 					{ primary: true },

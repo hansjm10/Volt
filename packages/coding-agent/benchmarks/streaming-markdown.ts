@@ -1,5 +1,13 @@
 import type { AssistantMessage } from "@hansjm10/volt-ai";
-import { Container, type Component, type Terminal, type TUI, TuiMainScreen } from "@hansjm10/volt-tui";
+import {
+	Container,
+	createRenderFrame,
+	type Component,
+	type RenderFrame,
+	type Terminal,
+	type TUI,
+	TuiMainScreen,
+} from "@hansjm10/volt-tui";
 import { initTheme } from "../src/core/theme/runtime.ts";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
 import {
@@ -65,8 +73,8 @@ class StaticHistory implements Component {
 		this.lines = Array.from({ length: lineCount }, (_, index) => `history ${String(index).padStart(5, "0")}`);
 	}
 
-	render(_width: number): string[] {
-		return this.lines;
+	render(_width: number): RenderFrame {
+		return createRenderFrame(this.lines);
 	}
 
 	invalidate(): void {}

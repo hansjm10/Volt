@@ -7,6 +7,7 @@ import { ScrollView } from "../src/components/scroll-view.ts";
 import { Text } from "../src/components/text.ts";
 import { VStack } from "../src/components/v-stack.ts";
 import { getScrollViewsAt, renderLayoutFrame } from "../src/layout.ts";
+import { createRenderFrame } from "../src/render-frame.ts";
 import {
 	encodeKitty,
 	getImageMetadata,
@@ -30,7 +31,7 @@ function solidPngBase64(width: number, height: number): string {
 
 function imageComponent(imageLine: string) {
 	return {
-		render: () => [imageLine],
+		render: () => createRenderFrame([imageLine]),
 		invalidate: () => {},
 	};
 }
@@ -40,7 +41,7 @@ function assertImageWithRightSibling(imageLine: string): void {
 		{ component: imageComponent(imageLine), basis: 6, shrink: 0 },
 		{ component: new Text("right", 0, 0), basis: 6, shrink: 0 },
 	]);
-	const directLine = stack.render(12)[0] ?? "";
+	const directLine = stack.render(12).lines[0] ?? "";
 	const constrainedLine = renderLayoutFrame(stack, 12, 1, () => {}).lines[0] ?? "";
 
 	for (const line of [directLine, constrainedLine]) {
@@ -62,7 +63,7 @@ function renderHStackTopCrop(image: Image): string {
 
 function renderInsetTopCrop(imageLine: string): string {
 	const scrollView = new ScrollView({
-		render: () => [imageLine, "", "", "tail"],
+		render: () => createRenderFrame([imageLine, "", "", "tail"]),
 		invalidate: () => {},
 	});
 	const root = new HStack([
@@ -134,7 +135,7 @@ describe("viewport layout", () => {
 		const transcript = new ScrollView({
 			render: () => {
 				renderCount += 1;
-				return ["one", "two", "three"];
+				return createRenderFrame(["one", "two", "three"]);
 			},
 			invalidate: () => {},
 		});
@@ -156,7 +157,7 @@ describe("viewport layout", () => {
 		const metadata = {
 			render: () => {
 				metadataRenderCount += 1;
-				return [`viewport ${scrollView.viewportHeight}`];
+				return createRenderFrame([`viewport ${scrollView.viewportHeight}`]);
 			},
 			invalidate: () => {},
 		};
@@ -185,7 +186,7 @@ describe("viewport layout", () => {
 		const content = new Text("1\n2\n3\n4", 0, 0);
 		const scrollView = new ScrollView(content, { follow: "end" });
 		const metadata = {
-			render: () => [`top ${scrollView.scrollTop}`],
+			render: () => createRenderFrame([`top ${scrollView.scrollTop}`]),
 			invalidate: () => {},
 		};
 		const root = new VStack([metadata, { component: scrollView, basis: 0, grow: 1 }]);
@@ -202,7 +203,7 @@ describe("viewport layout", () => {
 		const content = {
 			render: () => {
 				renderCount += 1;
-				return scrollView.scrollTop === 0 ? ["one", "two"] : ["one"];
+				return createRenderFrame(scrollView.scrollTop === 0 ? ["one", "two"] : ["one"]);
 			},
 			invalidate: () => {},
 		};
@@ -229,7 +230,7 @@ describe("viewport layout", () => {
 		lines[lineCount - 1] = "visible 3";
 		const transcript = new ScrollView(
 			{
-				render: () => lines,
+				render: () => createRenderFrame(lines),
 				invalidate: () => {},
 			},
 			{ follow: "end" },
@@ -293,7 +294,7 @@ describe("viewport layout", () => {
 			{ gap: 1 },
 		);
 		assert.deepStrictEqual(
-			stack.render(10).map((line) => line.trimEnd()),
+			stack.render(10).lines.map((line) => line.trimEnd()),
 			["one", "", "two"],
 		);
 	});
@@ -303,7 +304,7 @@ describe("viewport layout", () => {
 		const imageLine = encodeKitty("AAAA", { columns: 2, rows: 3, imageId, moveCursor: false });
 		registerKittyImageMetadata({ imageId, columns: 2, rows: 3, widthPx: 100, heightPx: 100 });
 		const transcript = new ScrollView({
-			render: () => ["one", "two", imageLine, "", ""],
+			render: () => createRenderFrame(["one", "two", imageLine, "", ""]),
 			invalidate: () => {},
 		});
 		const frame = renderLayoutFrame(
@@ -324,7 +325,7 @@ describe("viewport layout", () => {
 			assert.ok(image);
 			assert.strictEqual(image.rows, 3);
 			const transcript = new ScrollView({
-				render: () => ["one", "two", image.sequence, "", ""],
+				render: () => createRenderFrame(["one", "two", image.sequence, "", ""]),
 				invalidate: () => {},
 			});
 			const frame = renderLayoutFrame(
@@ -642,7 +643,7 @@ describe("viewport layout", () => {
 
 	it("clips leaf content around the cursor marker", () => {
 		const cursorLeaf = {
-			render: () => ["one", "two", "three", `four\x1b_pi:c\x07`],
+			render: () => createRenderFrame(["one", "two", "three", `four\x1b_pi:c\x07`]),
 			invalidate: () => {},
 		};
 		const frame = renderLayoutFrame(new VStack([{ component: cursorLeaf, basis: 2 }]), 10, 2, () => {});

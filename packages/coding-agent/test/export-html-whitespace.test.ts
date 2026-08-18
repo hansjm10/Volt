@@ -1,4 +1,5 @@
 import type { Component } from "@hansjm10/volt-tui";
+import { createRenderFrame } from "@hansjm10/volt-tui";
 import { readFileSync } from "fs";
 import { describe, expect, it } from "vitest";
 import { ansiLinesToHtml } from "../src/core/export-html/ansi-to-html.ts";
@@ -22,7 +23,10 @@ describe("export HTML tool output whitespace", () => {
 	});
 
 	it("trims TUI spacing lines from custom tool result HTML", () => {
-		const component: Component = { render: () => ["", "\u001b[31mone\u001b[0m", "two", ""], invalidate: () => {} };
+		const component: Component = {
+			render: () => createRenderFrame(["", "\u001b[31mone\u001b[0m", "two", ""]),
+			invalidate: () => {},
+		};
 		const tool = {
 			name: "custom",
 			label: "custom",

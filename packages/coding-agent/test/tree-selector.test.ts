@@ -261,7 +261,7 @@ describe("TreeSelectorComponent", () => {
 				() => {},
 			);
 
-			const plainLines = selector.render(30).map(stripVTControlCharacters);
+			const plainLines = selector.render(30).lines.map(stripVTControlCharacters);
 			const plain = plainLines.join("\n");
 			expect(plain).toContain("branch");
 			expect(plain).toContain("filters");
@@ -289,14 +289,14 @@ describe("TreeSelectorComponent", () => {
 			);
 
 			const list = selector.getTreeList();
-			let render = list.render(200).join("\n");
+			let render = list.render(200).lines.join("\n");
 			expect(render).toContain("[checkpoint]");
 			expect(render).not.toContain("3/28 14:32");
 			expect(render).not.toContain("[+label time]");
 
 			selector.handleInput("T");
 
-			render = list.render(200).join("\n");
+			render = list.render(200).lines.join("\n");
 			expect(render).toContain("3/28 14:32");
 			expect(render).toContain("[+label time]");
 		});

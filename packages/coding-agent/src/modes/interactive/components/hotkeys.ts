@@ -1,4 +1,11 @@
-import { type Component, getKeybindings, truncateToWidth, visibleWidth } from "@hansjm10/volt-tui";
+import {
+	type Component,
+	createRenderFrame,
+	getKeybindings,
+	type RenderFrame,
+	truncateToWidth,
+	visibleWidth,
+} from "@hansjm10/volt-tui";
 import { theme } from "../../../core/theme/runtime.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint, keyText, rawKeyHint } from "./keybinding-hints.ts";
@@ -42,8 +49,8 @@ export class HotkeysComponent implements Component {
 		// Styling is resolved during render so theme changes apply immediately.
 	}
 
-	render(width: number): string[] {
-		if (width <= 0) return [];
+	render(width: number): RenderFrame {
+		if (width <= 0) return createRenderFrame([]);
 		const visibleRows = this.getVisibleRowCount();
 		const maxOffset = Math.max(0, this.rows.length - visibleRows);
 		this.scrollOffset = Math.min(this.scrollOffset, maxOffset);
@@ -58,7 +65,7 @@ export class HotkeysComponent implements Component {
 		const positionText = theme.fg("dim", position);
 		const titlePadding = " ".repeat(Math.max(1, width - visibleWidth(title) - visibleWidth(positionText) - 2));
 		const lines = [
-			new DynamicBorder().render(width)[0]!,
+			new DynamicBorder().render(width).lines[0]!,
 			"",
 			truncateToWidth(` ${title}${titlePadding}${positionText} `, width),
 			"",
@@ -94,8 +101,8 @@ export class HotkeysComponent implements Component {
 				width,
 			),
 		);
-		lines.push(new DynamicBorder().render(width)[0]!);
-		return lines;
+		lines.push(new DynamicBorder().render(width).lines[0]!);
+		return createRenderFrame(lines);
 	}
 
 	handleInput(data: string): void {

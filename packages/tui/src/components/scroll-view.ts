@@ -1,5 +1,5 @@
 import { LAYOUT_NODE, type ScrollLayoutNode } from "../layout-node.ts";
-import { renderComponentFrame, setImagePlacements } from "../render-frame.ts";
+import { mapRenderFrameLines, type RenderFrame } from "../render-frame.ts";
 import { type Component, Container } from "../tui.ts";
 
 export type ScrollViewScrollbar = "hidden" | "auto" | "always";
@@ -225,14 +225,10 @@ export class ScrollView extends Container {
 		throw new Error("ScrollView child cannot be cleared");
 	}
 
-	override render(width: number): string[] {
+	override render(width: number): RenderFrame {
 		const contentWidth = this.getContentWidth(width);
-		const frame = renderComponentFrame(this.child, contentWidth);
-		if (contentWidth === width) return setImagePlacements(frame.lines, frame.images);
-		return setImagePlacements(
-			frame.lines.map((line) => `${line} `),
-			frame.images,
-		);
+		const frame = this.child.render(contentWidth);
+		return contentWidth === width ? frame : mapRenderFrameLines(frame, (line) => `${line} `);
 	}
 
 	[LAYOUT_NODE](): ScrollLayoutNode {

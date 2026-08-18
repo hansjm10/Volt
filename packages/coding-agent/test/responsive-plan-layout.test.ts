@@ -1,5 +1,18 @@
-import { type Component, setKeybindings, TuiAltScreen, TuiMainScreen, VStack, visibleWidth } from "@hansjm10/volt-tui";
+import {
+	type Component,
+	concatRenderFrames,
+	createRenderFrame,
+	Image,
+	type RenderFrame,
+	ScrollView,
+	setKeybindings,
+	TuiAltScreen,
+	TuiMainScreen,
+	VStack,
+	visibleWidth,
+} from "@hansjm10/volt-tui";
 import { beforeAll, describe, expect, it } from "vitest";
+import { resetCapabilitiesCache, setCapabilities, setCellDimensions } from "../../tui/src/terminal-image.ts";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { PlanningState, PlanState } from "../src/core/planning.ts";
@@ -15,23 +28,25 @@ import { stripAnsi } from "../src/utils/ansi.ts";
 
 class LinesComponent implements Component {
 	lines: string[];
+	images: RenderFrame["images"] = [];
 	widths: number[] = [];
 
-	constructor(lines: string[]) {
+	constructor(lines: string[], images: RenderFrame["images"] = []) {
 		this.lines = lines;
+		this.images = images;
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		this.widths.push(width);
-		return this.lines;
+		return createRenderFrame(this.lines, this.images);
 	}
 
 	invalidate(): void {}
 }
 
 class FullWidthFooter implements Component {
-	render(width: number): string[] {
-		return ["F".repeat(width)];
+	render(width: number): RenderFrame {
+		return createRenderFrame(["F".repeat(width)]);
 	}
 
 	invalidate(): void {}
@@ -204,7 +219,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 			[129, 23],
 		] as const) {
 			const { layout } = createLayout({ columns, rows, compact: [compactOnly] });
-			const rendered = layout.render(columns).map(stripAnsi);
+			const rendered = layout.render(columns).lines.map(stripAnsi);
 			expect(rendered).toContain("COMPACT_PLAN_STATUS");
 			expect(rendered.at(-1)).toBe("F".repeat(columns));
 		}
@@ -214,7 +229,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 		const transcript = new LinesComponent(Array.from({ length: 40 }, (_, index) => `message-${index + 1}`));
 		const editor = new LinesComponent(["EDITOR_TOP", "EDITOR_BOTTOM"]);
 		const { layout } = createLayout({ columns: 160, rows: 24, transcript, controls: [editor] });
-		const rendered = layout.render(160).map(stripAnsi);
+		const rendered = layout.render(160).lines.map(stripAnsi);
 		const viewport = rendered.slice(-24);
 		const output = rendered.join("\n");
 		expect(rendered.length).toBeGreaterThan(24);
@@ -275,6 +290,46 @@ describe("ResponsivePlanLayoutComponent", () => {
 		}
 	});
 
+	it("keeps the selected plan pane searchable while the search overlay owns focus", async () => {
+		const columns = 160;
+		const rows = 30;
+		const planning: PlanningState = { mode: "build", plan: plan("active") };
+		const conversation = new ScrollView(new LinesComponent(["CONVERSATION ONLY"]));
+		const terminal = new VirtualTerminal(columns, rows);
+		const { layout, inspector } = createLayout({
+			columns,
+			rows,
+			planning,
+			fullscreenConversation: conversation,
+		});
+		const tui = new TuiAltScreen(terminal, false, "/tmp", { mouse: false });
+		tui.addChild(layout);
+		tui.setLayoutRoot(layout.getFullscreenLayout());
+		inspector.setFullscreenActive(true);
+		inspector.setSelected(true);
+		tui.setFocus(inspector);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			expect(inspector.focused).toBe(true);
+
+			terminal.sendInput("\x1b[102;6u");
+			terminal.sendInput("Current work");
+			await terminal.waitForRender();
+
+			expect(inspector.focused).toBe(false);
+			expect(terminal.getViewport().some((line) => line.includes("Find transcript") && line.includes("1/1"))).toBe(
+				true,
+			);
+
+			terminal.sendInput("\x1b");
+			await terminal.waitForRender();
+			expect(inspector.focused).toBe(true);
+		} finally {
+			tui.stop({ preserveScreen: true });
+		}
+	});
+
 	it("keeps the fullscreen conversation dock aligned with the inspector footer", async () => {
 		const columns = 191;
 		const rows = 40;
@@ -325,7 +380,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 		const transcript = new LinesComponent(Array.from({ length: 40 }, (_, index) => `message-${index + 1}`));
 		const editor = new LinesComponent(["EDITOR_TOP", "EDITOR_BOTTOM"]);
 		const { layout } = createLayout({ columns: 160, rows: 24, transcript, controls: [editor] });
-		const rendered = layout.render(160).map(stripAnsi);
+		const rendered = layout.render(160).lines.map(stripAnsi);
 		const historical = rendered.slice(0, rendered.length - 24);
 		const viewport = rendered.slice(-24);
 
@@ -348,10 +403,10 @@ describe("ResponsivePlanLayoutComponent", () => {
 		const rows = 24;
 		const { layout } = createLayout({ columns: 160, rows, transcript, controls: [editor] });
 
-		let previous: string[] = [];
+		let previous: readonly string[] = [];
 		for (let index = 1; index <= 60; index++) {
 			lines.push(`message-${index}`);
-			const current = layout.render(160);
+			const current = layout.render(160).lines;
 			if (previous.length > 0) {
 				// Rows above the previous viewport are already committed to terminal scrollback
 				// and cannot be repainted, so they must never change between frames.
@@ -376,7 +431,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 			transcript,
 			controls: [workingLoader, editor],
 		});
-		const initialLines = layout.render(columns);
+		const initialLines = layout.render(columns).lines;
 		const historicalRows = initialLines.length - rows;
 		const committedHistory = initialLines.slice(0, historicalRows);
 		const terminal = new LoggingVirtualTerminal(columns, rows);
@@ -393,7 +448,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 			tui.requestRender();
 			await terminal.waitForRender();
 
-			const currentLines = layout.render(columns);
+			const currentLines = layout.render(columns).lines;
 			expect(currentLines).toHaveLength(initialLines.length);
 			expect(currentLines.slice(0, historicalRows)).toEqual(committedHistory);
 			expect(tui.fullRedraws).toBe(initialFullRedraws);
@@ -410,7 +465,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 		const transcript = new LinesComponent(Array.from({ length: 90 }, (_, index) => `message-${index + 1}`));
 		const editor = new LinesComponent(["EDITOR"]);
 		const { layout } = createLayout({ columns, rows, transcript, controls: [editor] });
-		const initialLines = layout.render(columns);
+		const initialLines = layout.render(columns).lines;
 		const historicalRows = initialLines.length - rows;
 		const committedHistory = initialLines.slice(0, historicalRows);
 		const terminal = new LoggingVirtualTerminal(columns, rows);
@@ -427,7 +482,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 			tui.requestRender();
 			await terminal.waitForRender();
 
-			const currentLines = layout.render(columns);
+			const currentLines = layout.render(columns).lines;
 			expect(currentLines).toHaveLength(initialLines.length);
 			expect(currentLines.slice(0, historicalRows)).toEqual(committedHistory);
 			expect(tui.fullRedraws).toBe(initialFullRedraws);
@@ -467,7 +522,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 			tui.requestRender();
 			await terminal.waitForRender();
 
-			const viewport = layout.render(columns).slice(-rows).map(stripAnsi);
+			const viewport = layout.render(columns).lines.slice(-rows).map(stripAnsi);
 			expect(viewportResets).toBe(1);
 			expect(viewport.join("\n")).toContain("message-90");
 			expect(terminal.getWrites()).toContain("\x1b[2J\x1b[H");
@@ -539,7 +594,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 			tui.requestRender();
 			await terminal.waitForRender();
 
-			const viewport = layout.render(columns).slice(-rows).map(stripAnsi);
+			const viewport = layout.render(columns).lines.slice(-rows).map(stripAnsi);
 			const newestLine = viewport.find((line) => line.includes("collapsed-message-5"));
 			expect(newestLine).toBeDefined();
 			expect(newestLine).toContain(usesAsciiPlanMarkers() ? "|" : "\u2502");
@@ -577,7 +632,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 			requestViewportReset: () => undefined,
 			onSplitChange: () => undefined,
 		});
-		const rendered = layout.render(129).map(stripAnsi).join("\n");
+		const rendered = layout.render(129).lines.map(stripAnsi).join("\n");
 		expect(rendered).toContain("EXTENSION_HEADER");
 		expect(rendered).toContain("EXTENSION_WIDGET");
 		expect(rendered).toContain("EXTENSION_EDITOR");
@@ -590,9 +645,24 @@ describe("ResponsivePlanLayoutComponent", () => {
 
 	it("preserves Kitty image placement and reserved rows without composing pane text over them", () => {
 		const image = "\x1b_Ga=T,f=100,q=2,C=1,c=2,r=3,i=42;AAAA\x1b\\";
-		const transcript = new LinesComponent(["before", image, "", "", "after"]);
+		const transcript = new LinesComponent(
+			["before", image, "", "", "after"],
+			[
+				{
+					top: 1,
+					anchor: 1,
+					left: 0,
+					columns: 2,
+					rows: 3,
+					protocol: "kitty",
+					imageId: 42,
+					sequence: image,
+					exactSequence: true,
+				},
+			],
+		);
 		const { layout } = createLayout({ columns: 129, rows: 24, transcript });
-		const rendered = layout.render(129);
+		const rendered = layout.render(129).lines;
 		const imageIndex = rendered.findIndex((line) => line.includes("i=42"));
 		expect(imageIndex).toBeGreaterThanOrEqual(0);
 		expect(rendered[imageIndex]).toBe(image);
@@ -603,14 +673,28 @@ describe("ResponsivePlanLayoutComponent", () => {
 
 	it("preserves multi-row iTerm protocol rows in the viewport and historical scrollback", () => {
 		const image = `\x1b[2A\x1b]1337;File=inline=1;width=60;height=auto:${"iVBORw0KGgoAAAANSUhEUg".repeat(8)}\x07`;
-		const transcript = new LinesComponent(["before", "", "", image, "after"]);
+		const transcript = new LinesComponent(
+			["before", "", "", image, "after"],
+			[
+				{
+					top: 1,
+					anchor: 3,
+					left: 0,
+					columns: 60,
+					rows: 3,
+					protocol: "iterm2",
+					sequence: image,
+					exactSequence: true,
+				},
+			],
+		);
 		const { layout } = createLayout({ columns: 129, rows: 24, transcript });
 
-		const visible = layout.render(129).slice(-24);
+		const visible = layout.render(129).lines.slice(-24);
 		expect(visible.find((line) => line.includes("\x1b]1337;File="))).toBe(image);
 
 		transcript.lines.push(...Array.from({ length: 30 }, (_, index) => `later-${index + 1}`));
-		const rendered = layout.render(129);
+		const rendered = layout.render(129).lines;
 		const historical = rendered.slice(0, rendered.length - 24);
 		expect(historical.find((line) => line.includes("\x1b]1337;File="))).toBe(image);
 	});
@@ -632,7 +716,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 				controls,
 				actions,
 			});
-			const output = layout.render(129).map(stripAnsi).join("\n");
+			const output = layout.render(129).lines.map(stripAnsi).join("\n");
 			expect(output).toContain("> Execute Plan");
 			expect(output).toContain("CONTROL_3");
 			inspector.handleInput("\r");
@@ -644,7 +728,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 		const transcript = new LinesComponent(["assistant chunk 1"]);
 		const planning: PlanningState = { mode: "build", plan: plan("active") };
 		const { layout, inspector } = createLayout({ columns: 160, rows: 24, planning, transcript });
-		expect(layout.render(160).map(stripAnsi).join("\n")).toContain("Current work");
+		expect(layout.render(160).lines.map(stripAnsi).join("\n")).toContain("Current work");
 		transcript.lines.push("assistant chunk 2");
 		const updated = plan("active");
 		updated.steps[1] = { ...updated.steps[1]!, status: "completed", note: "Stream-safe update" };
@@ -652,10 +736,66 @@ describe("ResponsivePlanLayoutComponent", () => {
 		const nextPlanning = { mode: "build" as const, plan: updated };
 		inspector.setPlanning(nextPlanning);
 		layout.setPlanning(nextPlanning);
-		const output = layout.render(160).map(stripAnsi).join("\n");
+		const output = layout.render(160).lines.map(stripAnsi).join("\n");
 		expect(output).toContain("assistant chunk 2");
 		expect(output).toContain("Stream-safe update");
 		expect(output).toContain("Remaining work");
+	});
+
+	it("does not replay a partial iTerm2 block during a row-triggered viewport reset", async () => {
+		await withEnv({ TERMUX_VERSION: "1" }, async () => {
+			setCapabilities({ images: "iterm2", trueColor: true, hyperlinks: true });
+			setCellDimensions({ widthPx: 10, heightPx: 10 });
+			try {
+				const columns = 129;
+				const image = new Image(
+					"AAAA",
+					"image/png",
+					{ fallbackColor: (value) => value },
+					{ maxWidthCells: 2, maxHeightCells: 3 },
+					{ widthPx: 20, heightPx: 30 },
+				);
+				const transcriptFrame = concatRenderFrames([
+					createRenderFrame(["before-image"]),
+					image.render(80),
+					createRenderFrame(Array.from({ length: 19 }, (_, index) => `later-${index + 1}`)),
+				]);
+				const transcript = new LinesComponent([...transcriptFrame.lines], transcriptFrame.images);
+				const terminal = new LoggingVirtualTerminal(columns, 24);
+				terminal.write("SHELL_SENTINEL\r\n");
+				const tui = new TuiMainScreen(terminal);
+				const { layout, setRows } = createLayout({
+					columns,
+					rows: 24,
+					transcript,
+					onSplitChange: (_split, preserveScrollback) => {
+						if (preserveScrollback) tui.resetViewportOnNextRender();
+					},
+				});
+				tui.addChild(layout);
+				tui.start();
+				try {
+					await terminal.waitForRender();
+					expect(terminal.getWrites()).toContain("\x1b]1337;File=");
+					terminal.clearWrites();
+
+					setRows(23);
+					terminal.resize(columns, 23);
+					await terminal.waitForRender();
+
+					const writes = terminal.getWrites();
+					expect(writes).toContain("\x1b[2J\x1b[H");
+					expect(writes).not.toContain("\x1b]1337;File=");
+					expect(terminal.getViewport().map(stripAnsi).join("\n")).toContain("later-19");
+					expect(terminal.getScrollBuffer().join("\n")).toContain("SHELL_SENTINEL");
+				} finally {
+					tui.stop();
+				}
+			} finally {
+				resetCapabilitiesCache();
+				setCellDimensions({ widthPx: 9, heightPx: 18 });
+			}
+		});
 	});
 
 	it("preserves Termux scrollback when a row resize crosses the split breakpoint", async () => {
@@ -706,20 +846,20 @@ describe("ResponsivePlanLayoutComponent", () => {
 			columns: 129,
 			rows: 24,
 		});
-		layout.render(129);
+		layout.render(129).lines;
 		setRows(23);
-		layout.render(129);
+		layout.render(129).lines;
 		setRows(24);
-		layout.render(129);
+		layout.render(129).lines;
 		expect(splitChanges).toEqual([false, true]);
 		expect(preserveScrollbackChanges).toEqual([true, true]);
 	});
 
 	it("does not request scrollback preservation for width-triggered layout transitions", () => {
 		const { layout, splitChanges, preserveScrollbackChanges } = createLayout({ columns: 129, rows: 24 });
-		layout.render(129);
-		layout.render(128);
-		layout.render(129);
+		layout.render(129).lines;
+		layout.render(128).lines;
+		layout.render(129).lines;
 		expect(splitChanges).toEqual([false, true]);
 		expect(preserveScrollbackChanges).toEqual([false, false]);
 	});
@@ -731,14 +871,14 @@ describe("ResponsivePlanLayoutComponent", () => {
 			rows: 24,
 			planning: initial,
 		});
-		layout.render(160);
+		layout.render(160).lines;
 		const splitPlanning: PlanningState = { mode: "plan", plan: null };
 		layout.setPlanning(splitPlanning);
 		inspector.setPlanning(splitPlanning);
-		layout.render(160);
+		layout.render(160).lines;
 		layout.setPlanning(initial);
 		inspector.setPlanning(initial);
-		layout.render(160);
+		layout.render(160).lines;
 		expect(splitChanges).toEqual([true, false]);
 		expect(preserveScrollbackChanges).toEqual([true, true]);
 	});

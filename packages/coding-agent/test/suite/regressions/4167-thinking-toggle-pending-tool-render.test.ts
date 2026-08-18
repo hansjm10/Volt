@@ -125,7 +125,7 @@ function createSessionContext(messages: AgentMessage[]): SessionContext {
 }
 
 function renderChat(container: Container): string {
-	return stripAnsi(container.render(120).join("\n"));
+	return stripAnsi(container.render(120).lines.join("\n"));
 }
 
 describe("InteractiveMode.renderSessionContext", () => {

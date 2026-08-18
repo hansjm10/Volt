@@ -61,7 +61,7 @@ describe("Input component", () => {
 					input.focused = true;
 					move(input);
 
-					const [line] = input.render(width);
+					const [line] = input.render(width).lines;
 					assert.ok(line);
 					assert.ok(visibleWidth(line) <= width, `rendered line overflowed for ${text} at ${label}`);
 				}
@@ -77,7 +77,7 @@ describe("Input component", () => {
 			input.handleInput("\x01");
 			for (let i = 0; i < 5; i++) input.handleInput("\x1b[C");
 
-			const [line] = input.render(width);
+			const [line] = input.render(width).lines;
 			assert.ok(line);
 			assert.ok(visibleWidth(line) <= width);
 		});

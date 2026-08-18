@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Custom Header Extension
  *
@@ -49,11 +50,11 @@ export default function (volt: ExtensionAPI) {
 		if (ctx.mode === "tui") {
 			ctx.ui.setHeader((_tui, theme) => {
 				return {
-					render(_width: number): string[] {
+					render(_width: number): RenderFrame {
 						const mascotLines = getVoltMascot(theme);
 						// Add a subtitle with hint
 						const subtitle = `${theme.fg("muted", "   shitty coding agent")}${theme.fg("dim", ` v${VERSION}`)}`;
-						return [...mascotLines, subtitle];
+						return createRenderFrame([...mascotLines, subtitle]);
 					},
 					invalidate() {},
 				};

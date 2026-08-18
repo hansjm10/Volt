@@ -19,8 +19,13 @@ Library consumers must construct a concrete renderer: use `new TuiMainScreen(...
 All components implement:
 
 ```typescript
+interface RenderFrame {
+  readonly lines: readonly string[];
+  readonly images: readonly ImagePlacement[];
+}
+
 interface Component {
-  render(width: number): string[];
+  render(width: number): RenderFrame;
   handleInput?(data: string): void;
   wantsKeyRelease?: boolean;
   invalidate(): void;
@@ -29,10 +34,12 @@ interface Component {
 
 | Method | Description |
 |--------|-------------|
-| `render(width)` | Return array of strings (one per line). Each line **must not exceed `width`**. |
+| `render(width)` | Return rendered lines and explicit image placements. Each line **must not exceed `width`**. |
 | `handleInput?(data)` | Receive keyboard input when component has focus. |
 | `wantsKeyRelease?` | If true, component receives key release events (Kitty protocol). Default: false. |
 | `invalidate()` | Clear cached render state. Called on theme changes. |
+
+Use `createRenderFrame(lines)` for text-only components. When composing child components, use `concatRenderFrames()`, `sliceRenderFrame()`, `spliceRenderFrameRows()`, `prefixRenderFrame()`, or `mapRenderFrameLines()` so image placements move with the corresponding rows and columns. Access `child.render(width).lines` only at a true text-only boundary such as HTML export.
 
 The TUI appends a full SGR reset and OSC 8 reset at the end of each rendered line. Styles do not carry across lines. If you emit multi-line text with styling, reapply styles per line or use `wrapTextWithAnsi()` so styles are preserved for each wrapped line.
 
@@ -41,15 +48,21 @@ The TUI appends a full SGR reset and OSC 8 reset at the end of each rendered lin
 Components that display a text cursor and need IME (Input Method Editor) support should implement the `Focusable` interface:
 
 ```typescript
-import { CURSOR_MARKER, type Component, type Focusable } from "@hansjm10/volt-tui";
+import {
+  createRenderFrame,
+  CURSOR_MARKER,
+  type Component,
+  type Focusable,
+  type RenderFrame,
+} from "@hansjm10/volt-tui";
 
 class MyInput implements Component, Focusable {
   focused: boolean = false;  // Set by TUI when focus changes
   
-  render(width: number): string[] {
+  render(width: number): RenderFrame {
     const marker = this.focused ? CURSOR_MARKER : "";
     // Emit marker right before the fake cursor
-    return [`> ${beforeCursor}${marker}\x1b[7m${atCursor}\x1b[27m${afterCursor}`];
+    return createRenderFrame([`> ${beforeCursor}${marker}\x1b[7m${atCursor}\x1b[27m${afterCursor}`]);
   }
 }
 ```
@@ -306,14 +319,14 @@ handleInput(data: string) {
 
 ## Line Width
 
-**Critical:** Each line from `render()` must not exceed the `width` parameter.
+**Critical:** Each line in the frame returned by `render()` must not exceed the `width` parameter.
 
 ```typescript
-import { visibleWidth, truncateToWidth } from "@hansjm10/volt-tui";
+import { createRenderFrame, truncateToWidth, type RenderFrame, visibleWidth } from "@hansjm10/volt-tui";
 
-render(width: number): string[] {
+render(width: number): RenderFrame {
   // Truncate long lines
-  return [truncateToWidth(this.text, width)];
+  return createRenderFrame([truncateToWidth(this.text, width)]);
 }
 ```
 
@@ -328,15 +341,19 @@ Example: Interactive selector
 
 ```typescript
 import {
-  matchesKey, Key,
-  truncateToWidth, visibleWidth
+  createRenderFrame,
+  matchesKey,
+  Key,
+  truncateToWidth,
+  type RenderFrame,
+  visibleWidth,
 } from "@hansjm10/volt-tui";
 
 class MySelector {
   private items: string[];
   private selected = 0;
   private cachedWidth?: number;
-  private cachedLines?: string[];
+  private cachedFrame?: RenderFrame;
   
   public onSelect?: (item: string) => void;
   public onCancel?: () => void;
@@ -359,22 +376,22 @@ class MySelector {
     }
   }
 
-  render(width: number): string[] {
-    if (this.cachedLines && this.cachedWidth === width) {
-      return this.cachedLines;
+  render(width: number): RenderFrame {
+    if (this.cachedFrame && this.cachedWidth === width) {
+      return this.cachedFrame;
     }
 
-    this.cachedLines = this.items.map((item, i) => {
+    this.cachedFrame = createRenderFrame(this.items.map((item, i) => {
       const prefix = i === this.selected ? "> " : "  ";
       return truncateToWidth(prefix + item, width);
-    });
+    }));
     this.cachedWidth = width;
-    return this.cachedLines;
+    return this.cachedFrame;
   }
 
   invalidate(): void {
     this.cachedWidth = undefined;
-    this.cachedLines = undefined;
+    this.cachedFrame = undefined;
   }
 }
 ```
@@ -477,21 +494,21 @@ Cache rendered output when possible:
 ```typescript
 class CachedComponent {
   private cachedWidth?: number;
-  private cachedLines?: string[];
+  private cachedFrame?: RenderFrame;
 
-  render(width: number): string[] {
-    if (this.cachedLines && this.cachedWidth === width) {
-      return this.cachedLines;
+  render(width: number): RenderFrame {
+    if (this.cachedFrame && this.cachedWidth === width) {
+      return this.cachedFrame;
     }
     // ... compute lines ...
     this.cachedWidth = width;
-    this.cachedLines = lines;
-    return lines;
+    this.cachedFrame = createRenderFrame(lines);
+    return this.cachedFrame;
   }
 
   invalidate(): void {
     this.cachedWidth = undefined;
-    this.cachedLines = undefined;
+    this.cachedFrame = undefined;
   }
 }
 ```
@@ -811,6 +828,8 @@ This only affects the normal streaming working indicator. Compaction and retry l
 Show persistent content above or below the input editor. Good for todo lists, progress.
 
 ```typescript
+import { createRenderFrame } from "@hansjm10/volt-tui";
+
 // Simple string array (above editor by default)
 ctx.ui.setWidget("my-widget", ["Line 1", "Line 2"]);
 
@@ -825,7 +844,7 @@ ctx.ui.setWidget("my-widget", (_tui, theme) => {
       : theme.fg("dim", "○ ") + item.text
   );
   return {
-    render: () => lines,
+    render: () => createRenderFrame(lines),
     invalidate: () => {},
   };
 });
@@ -841,12 +860,14 @@ ctx.ui.setWidget("my-widget", undefined);
 Replace the footer. `footerData` exposes data not otherwise accessible to extensions.
 
 ```typescript
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
+
 ctx.ui.setFooter((tui, theme, footerData) => ({
   invalidate() {},
-  render(width: number): string[] {
+  render(width: number): RenderFrame {
     // footerData.getGitBranch(): string | null
     // footerData.getExtensionStatuses(): ReadonlyMap<string, string>
-    return [`${ctx.model?.id} (${footerData.getGitBranch() || "no git"})`];
+    return createRenderFrame([`${ctx.model?.id} (${footerData.getGitBranch() || "no git"})`]);
   },
   dispose: footerData.onBranchChange(() => tui.requestRender()), // reactive
 }));
@@ -864,7 +885,7 @@ Replace the main input editor with a custom implementation. Useful for modal edi
 
 ```typescript
 import { CustomEditor, type ExtensionAPI } from "@hansjm10/volt-coding-agent";
-import { matchesKey, truncateToWidth } from "@hansjm10/volt-tui";
+import { mapRenderFrameLines, matchesKey, truncateToWidth, type RenderFrame } from "@hansjm10/volt-tui";
 
 type Mode = "normal" | "insert";
 
@@ -902,16 +923,15 @@ class VimEditor extends CustomEditor {
     super.handleInput(data);
   }
 
-  render(width: number): string[] {
-    const lines = super.render(width);
-    // Add mode indicator to bottom border (use truncateToWidth for ANSI-safe truncation)
-    if (lines.length > 0) {
-      const label = this.mode === "normal" ? " NORMAL " : " INSERT ";
-      const lastLine = lines[lines.length - 1]!;
-      // Pass "" as ellipsis to avoid adding "..." when truncating
-      lines[lines.length - 1] = truncateToWidth(lastLine, width - label.length, "") + label;
-    }
-    return lines;
+  render(width: number): RenderFrame {
+    const frame = super.render(width);
+    if (frame.lines.length === 0) return frame;
+    const label = this.mode === "normal" ? " NORMAL " : " INSERT ";
+    return mapRenderFrameLines(frame, (line, row) =>
+      row === frame.lines.length - 1
+        ? truncateToWidth(line, width - label.length, "") + label
+        : line
+    );
   }
 }
 

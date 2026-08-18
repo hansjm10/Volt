@@ -16,7 +16,7 @@ import {
 	renderLayoutFrame,
 	type ScrollbarGeometry,
 } from "./layout.ts";
-import { getImagePlacements, preserveImagePlacements, sliceRenderLines } from "./render-frame.ts";
+import { createRenderFrame, mapRenderFrameLines, type RenderFrame, sliceRenderFrame } from "./render-frame.ts";
 import type { Terminal } from "./terminal.ts";
 import {
 	deleteAllKittyImages,
@@ -165,6 +165,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	readonly mode = "fullscreen" as const;
 	readonly [VIEWPORT_TUI] = true as const;
 	private previousScreen: string[] = [];
+	private previousImages: RenderFrame["images"] = [];
 	private lastDocument: string[] = [];
 	private previousScreenWidth = 0;
 	private previousScreenHeight = 0;
@@ -244,7 +245,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.requestRender();
 	}
 
-	override render(width: number): string[] {
+	override render(width: number): RenderFrame {
 		return this.layoutRoot?.render(width) ?? super.render(width);
 	}
 
@@ -327,10 +328,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		if (!options.preserveScreen) {
 			try {
 				const width = Math.max(1, this.terminal.columns);
-				const renderedLines = this.render(width).map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
-				this.lastDocument = this.applyLineResets(
-					renderedLines.map((line) => line.replaceAll(CURSOR_MARKER, "")),
-				).map((line) =>
+				const renderedFrame = mapRenderFrameLines(this.render(width), (line) =>
+					line.replace(OSC133_ZONE_PREFIX, "").replaceAll(CURSOR_MARKER, ""),
+				);
+				this.lastDocument = this.applyLineResets(renderedFrame).lines.map((line) =>
 					isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true),
 				);
 				documentLines = this.lastDocument;
@@ -438,6 +439,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	protected override resetRenderState(): void {
 		this.previousScreen = [];
+		this.previousImages = [];
 		this.previousScreenWidth = 0;
 		this.previousScreenHeight = 0;
 		this.currentLayout = undefined;
@@ -1176,12 +1178,13 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return result;
 	}
 
-	private applySearchHighlights(screen: string[], layout: LayoutFrame): string[] {
+	private applySearchHighlights(frame: RenderFrame, layout: LayoutFrame): RenderFrame {
 		const search = this.activeSearch;
-		if (!search || search.selectedIndex < 0 || search.matches.length === 0) return screen;
+		if (!search || search.selectedIndex < 0 || search.matches.length === 0) return frame;
+		const screen = frame.lines;
 		const scrollView = layout.primaryScrollView ?? this.implicitScrollView;
 		const box = getScrollViewBox(layout, scrollView);
-		if (!box) return screen;
+		if (!box) return frame;
 
 		const rangesByRow = new Map<number, SearchHighlightRange[]>();
 		const scrollbarColumn = getScrollbarGeometry(box)?.column;
@@ -1223,7 +1226,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			}
 			result[row] = line;
 		}
-		return preserveImagePlacements(screen, result);
+		return createRenderFrame(
+			result,
+			frame.images.map((image) => ({ ...image })),
+		);
 	}
 
 	private applySelectionHighlight(text: string): string {
@@ -1243,18 +1249,19 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return `${result}\x1b[27m`;
 	}
 
-	private applySelection(screen: string[], layout = this.currentLayout): string[] {
+	private applySelection(frame: RenderFrame, layout = this.currentLayout): RenderFrame {
 		const selection = this.getSelectionBounds();
-		if (!selection) return screen;
+		if (!selection) return frame;
+		const screen = frame.lines;
 		let screenSelection = selection;
 		let minRow = 0;
 		let maxRow = screen.length - 1;
 		let minColumn = 0;
 		let maxColumn = this.terminal.columns;
 		if (selection.start.scrollView) {
-			if (!layout) return screen;
+			if (!layout) return frame;
 			const box = getScrollViewBox(layout, selection.start.scrollView);
-			if (!box) return screen;
+			if (!box) return frame;
 			minRow = Math.max(0, box.rect.y, box.clip.y);
 			maxRow = Math.min(screen.length - 1, box.rect.y + box.rect.height - 1, box.clip.y + box.clip.height - 1);
 			minColumn = Math.max(0, box.rect.x, box.clip.x);
@@ -1290,33 +1297,40 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			const after = sliceByColumn(line, columns.end, Math.max(0, lineWidth - columns.end), true);
 			return `${before}${this.applySelectionHighlight(selected)}${after}`;
 		});
-		return preserveImagePlacements(screen, result);
+		return createRenderFrame(
+			result,
+			frame.images.map((image) => ({ ...image })),
+		);
 	}
 
 	private isMouseSequence(data: string): boolean {
 		return /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data) || (data.length === 6 && data.startsWith("\x1b[M"));
 	}
 
-	private compositeFlashes(screen: string[], width: number, height: number): string[] {
-		const flashLines = this.flashes.render(width).slice(-height);
-		if (flashLines.length === 0) return screen;
-		const result = [...screen];
+	private compositeFlashes(frame: RenderFrame, width: number, height: number): RenderFrame {
+		const renderedFlashes = this.flashes.render(width);
+		const flashFrame = sliceRenderFrame(renderedFlashes, Math.max(0, renderedFlashes.lines.length - height));
+		if (flashFrame.lines.length === 0) return frame;
+		const result = [...frame.lines];
 		while (result.length < height) result.push("");
-		for (let row = 0; row < flashLines.length; row++) {
-			const line = flashLines[row]!;
+		for (let row = 0; row < flashFrame.lines.length; row++) {
+			const line = flashFrame.lines[row]!;
 			const flashWidth = visibleWidth(line);
 			if (flashWidth === 0) continue;
 			result[row] = compositeTuiLine(result[row] ?? "", line, width - flashWidth, flashWidth, width);
 		}
-		return preserveImagePlacements(screen, result);
+		return createRenderFrame(
+			result,
+			frame.images.map((image) => ({ ...image })),
+		);
 	}
 
-	private changedRowsIntersectSixelImage(screen: string[], otherScreen: readonly string[]): boolean {
-		for (const image of getImagePlacements(screen)) {
+	private changedRowsIntersectSixelImage(frame: RenderFrame, otherScreen: readonly string[]): boolean {
+		for (const image of frame.images) {
 			if (image.protocol !== "sixel") continue;
-			const endRow = Math.min(screen.length, image.top + image.rows);
+			const endRow = Math.min(frame.lines.length, image.top + image.rows);
 			for (let row = image.top; row < endRow; row++) {
-				if (screen[row] !== otherScreen[row]) return true;
+				if (frame.lines[row] !== otherScreen[row]) return true;
 			}
 		}
 		return false;
@@ -1331,26 +1345,26 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		if (this.refreshSearch(nextLayout)) {
 			nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender());
 		}
-		let screen = preserveImagePlacements(
-			nextLayout.lines,
-			nextLayout.lines.map((line) => line.replace(OSC133_ZONE_PREFIX, "")),
+		let screenFrame = mapRenderFrameLines(createRenderFrame(nextLayout.lines, nextLayout.images), (line) =>
+			line.replace(OSC133_ZONE_PREFIX, ""),
 		);
-		screen = this.applySearchHighlights(screen, nextLayout);
-		screen = this.compositeOverlays(screen, width, height);
-		if (screen.length > height) screen = sliceRenderLines(screen, screen.length - height);
-		screen = this.applySelection(screen, nextLayout);
-		screen = this.compositeFlashes(screen, width, height);
-		this.recordGeneratedLines(screen.length);
+		screenFrame = this.applySearchHighlights(screenFrame, nextLayout);
+		screenFrame = this.compositeOverlays(screenFrame, width, height);
+		if (screenFrame.lines.length > height) {
+			screenFrame = sliceRenderFrame(screenFrame, screenFrame.lines.length - height);
+		}
+		screenFrame = this.applySelection(screenFrame, nextLayout);
+		screenFrame = this.compositeFlashes(screenFrame, width, height);
+		this.recordGeneratedLines(screenFrame.lines.length);
 
-		const cursorPos = this.extractCursorPosition(screen, height);
-		const resetScreen = this.applyLineResets(screen);
-		screen = preserveImagePlacements(
-			resetScreen,
-			resetScreen.map((line) => {
-				if (isImageLine(line) || visibleWidth(line) <= width) return line;
-				return sliceByColumn(line, 0, width, true);
-			}),
-		);
+		const cursorLines = [...screenFrame.lines];
+		const cursorPos = this.extractCursorPosition(cursorLines, height);
+		screenFrame = this.applyLineResets(createRenderFrame(cursorLines, screenFrame.images));
+		screenFrame = mapRenderFrameLines(screenFrame, (line) => {
+			if (isImageLine(line) || visibleWidth(line) <= width) return line;
+			return sliceByColumn(line, 0, width, true);
+		});
+		const screen = [...screenFrame.lines];
 
 		const fullRedraw =
 			this.previousScreen.length === 0 || this.previousScreenWidth !== width || this.previousScreenHeight !== height;
@@ -1358,10 +1372,11 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			(line, row) =>
 				line !== this.previousScreen[row] && (isImageLine(line) || isImageLine(this.previousScreen[row] ?? "")),
 		);
+		const previousFrame = createRenderFrame(this.previousScreen, this.previousImages);
 		const sixelRasterRowsNeedRedraw =
 			this.imageProtocol === "sixel" &&
-			(this.changedRowsIntersectSixelImage(screen, this.previousScreen) ||
-				this.changedRowsIntersectSixelImage(this.previousScreen, screen));
+			(this.changedRowsIntersectSixelImage(screenFrame, this.previousScreen) ||
+				this.changedRowsIntersectSixelImage(previousFrame, screen));
 		const imagesNeedRedraw = imageAnchorsNeedRedraw || sixelRasterRowsNeedRedraw;
 		const redrawImages = fullRedraw || imagesNeedRedraw;
 		const hadUploadedKittyImages = this.uploadedKittyImages.size > 0;
@@ -1409,6 +1424,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.writeRenderBuffer(buffer);
 
 		this.previousScreen = screen;
+		this.previousImages = screenFrame.images.map((image) => ({ ...image }));
 		this.previousScreenWidth = width;
 		this.previousScreenHeight = height;
 		this.currentLayout = nextLayout;

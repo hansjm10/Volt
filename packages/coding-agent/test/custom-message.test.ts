@@ -14,7 +14,7 @@ describe("CustomMessageComponent", () => {
 			timestamp: 0,
 		});
 
-		const lines = component.render(40).map(stripAnsi);
+		const lines = component.render(40).lines.map(stripAnsi);
 		expect(lines).toHaveLength(3);
 		expect(lines[1]).toContain("session");
 		expect(lines[2]).toContain("Context compacted");

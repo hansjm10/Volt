@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Custom Footer Extension - demonstrates ctx.ui.setFooter()
  *
@@ -27,7 +28,7 @@ export default function (volt: ExtensionAPI) {
 					return {
 						dispose: unsub,
 						invalidate() {},
-						render(width: number): string[] {
+						render(width: number): RenderFrame {
 							// Compute tokens from ctx (already accessible to extensions)
 							let input = 0,
 								output = 0,
@@ -50,7 +51,7 @@ export default function (volt: ExtensionAPI) {
 							const right = theme.fg("dim", `${ctx.model?.id || "no-model"}${branchStr}`);
 
 							const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-							return [truncateToWidth(left + pad + right, width)];
+							return createRenderFrame([truncateToWidth(left + pad + right, width)]);
 						},
 					};
 				});

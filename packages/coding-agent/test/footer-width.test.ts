@@ -111,7 +111,7 @@ describe("FooterComponent width handling", () => {
 		const session = createSession({ sessionName: "한글".repeat(30) });
 		const footer = new FooterComponent(session, createFooterData(1));
 
-		const lines = footer.render(width);
+		const lines = footer.render(width).lines;
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
@@ -135,7 +135,7 @@ describe("FooterComponent width handling", () => {
 		});
 		const footer = new FooterComponent(session, createFooterData(2));
 
-		const lines = footer.render(width);
+		const lines = footer.render(width).lines;
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
@@ -154,7 +154,7 @@ describe("FooterComponent width handling", () => {
 			createFooterData(2),
 		);
 
-		const workspaceLine = stripAnsi(footer.render(width)[0]);
+		const workspaceLine = stripAnsi(footer.render(width).lines[0]);
 		expect(workspaceLine).toContain("fast · high");
 		expect(visibleWidth(workspaceLine)).toBeLessThanOrEqual(width);
 	});
@@ -172,7 +172,7 @@ describe("FooterComponent width handling", () => {
 			createFooterData(2),
 		);
 
-		const workspaceLine = stripAnsi(footer.render(width)[0]);
+		const workspaceLine = stripAnsi(footer.render(width).lines[0]);
 		expect(workspaceLine).toContain("fast · high");
 		expect(visibleWidth(workspaceLine)).toBeLessThanOrEqual(width);
 	});
@@ -189,7 +189,7 @@ describe("FooterComponent width handling", () => {
 			createFooterData(1),
 		);
 
-		const workspaceLine = stripAnsi(footer.render(width)[0]);
+		const workspaceLine = stripAnsi(footer.render(width).lines[0]);
 		expect(workspaceLine).toContain("fast · high");
 		expect(visibleWidth(workspaceLine)).toBeLessThanOrEqual(width);
 	});
@@ -204,7 +204,7 @@ describe("FooterComponent width handling", () => {
 			createFooterData(1),
 		);
 
-		expect(stripAnsi(footer.render(120)[0])).not.toContain("fast");
+		expect(stripAnsi(footer.render(120).lines[0])).not.toContain("fast");
 	});
 
 	it.each(["off", "low", "high"])("keeps the Fast marker independent of thinking level %s", (thinkingLevel) => {
@@ -218,7 +218,7 @@ describe("FooterComponent width handling", () => {
 			createFooterData(1),
 		);
 
-		const workspaceLine = stripAnsi(footer.render(120)[0]);
+		const workspaceLine = stripAnsi(footer.render(120).lines[0]);
 		expect(workspaceLine).toContain(`fast · ${thinkingLevel}`);
 	});
 
@@ -247,13 +247,13 @@ describe("FooterComponent width handling", () => {
 		};
 		const footer = new FooterComponent(session, createFooterData(1));
 
-		footer.render(120);
-		footer.render(100);
+		footer.render(120).lines;
+		footer.render(100).lines;
 		expect(entryReads).toBe(1);
 		expect(contextReads).toBe(1);
 
 		footer.invalidate();
-		footer.render(120);
+		footer.render(120).lines;
 		expect(entryReads).toBe(2);
 		expect(contextReads).toBe(2);
 	});
@@ -264,7 +264,7 @@ describe("FooterComponent width handling", () => {
 			createFooterData(1),
 		);
 
-		const statsLine = stripAnsi(footer.render(120)[1]);
+		const statsLine = stripAnsi(footer.render(120).lines[1]);
 		expect(statsLine).toContain("subscription");
 		expect(statsLine).not.toContain("$0.000");
 	});
@@ -282,7 +282,7 @@ describe("FooterComponent width handling", () => {
 		});
 		const footer = new FooterComponent(session, createFooterData(1));
 
-		const statsLine = stripAnsi(footer.render(120)[1]);
+		const statsLine = stripAnsi(footer.render(120).lines[1]);
 		expect(statsLine).toContain("CH25.0%");
 	});
 
@@ -310,7 +310,7 @@ describe("FooterComponent width handling", () => {
 			latestCacheHitRate: 50,
 		});
 
-		const workflowLines = footer.render(120).map(stripAnsi);
+		const workflowLines = footer.render(120).lines.map(stripAnsi);
 		expect(workflowLines[0]).toContain("project · main · parent-session");
 		expect(workflowLines[0]).toContain("review-model · fast · high");
 		expect(workflowLines[1]).toContain("context 75.0%/100k auto");
@@ -318,7 +318,7 @@ describe("FooterComponent width handling", () => {
 		expect(workflowLines[1]).toContain("CH50.0%");
 
 		footer.setTransientUsage(undefined);
-		const restoredLines = footer.render(120).map(stripAnsi);
+		const restoredLines = footer.render(120).lines.map(stripAnsi);
 		expect(restoredLines[0]).toContain("parent-model · low");
 		expect(restoredLines[1]).toContain("context 12.3%/200k auto");
 		expect(restoredLines[1]).toContain("$0.100");
@@ -346,7 +346,7 @@ describe("FooterComponent width handling", () => {
 			createFooterData(1),
 		);
 
-		expect(warningFooter.render(120)[1]).toContain(theme.fg("warning", "35.0%/1.0M auto"));
-		expect(mutedFooter.render(120)[1]).toContain(theme.fg("muted", "35.0%/1.0M auto"));
+		expect(warningFooter.render(120).lines[1]).toContain(theme.fg("warning", "35.0%/1.0M auto"));
+		expect(mutedFooter.render(120).lines[1]).toContain(theme.fg("muted", "35.0%/1.0M auto"));
 	});
 });

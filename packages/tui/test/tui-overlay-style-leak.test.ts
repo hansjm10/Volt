@@ -2,6 +2,7 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { type Component, type TUI, TuiMainScreen } from "../src/index.ts";
+import { createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class StaticLines implements Component {
@@ -11,8 +12,8 @@ class StaticLines implements Component {
 		this.lines = lines;
 	}
 
-	render(): string[] {
-		return this.lines;
+	render(): RenderFrame {
+		return createRenderFrame(this.lines);
 	}
 
 	invalidate(): void {}
@@ -25,8 +26,8 @@ class StaticOverlay implements Component {
 		this.line = line;
 	}
 
-	render(): string[] {
-		return [this.line];
+	render(): RenderFrame {
+		return createRenderFrame([this.line]);
 	}
 
 	invalidate(): void {}

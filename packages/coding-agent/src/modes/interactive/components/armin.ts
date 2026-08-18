@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Armin says hi! A fun easter egg with animated XBM art.
  */
@@ -83,9 +84,9 @@ export class ArminComponent implements Component {
 		this.cachedWidth = 0;
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		if (width === this.cachedWidth && this.cachedVersion === this.gridVersion) {
-			return this.cachedLines;
+			return createRenderFrame(this.cachedLines);
 		}
 
 		const padding = 1;
@@ -106,7 +107,7 @@ export class ArminComponent implements Component {
 		this.cachedWidth = width;
 		this.cachedVersion = this.gridVersion;
 
-		return this.cachedLines;
+		return createRenderFrame(this.cachedLines);
 	}
 
 	private createEmptyGrid(): string[][] {

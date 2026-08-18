@@ -1,9 +1,11 @@
 import {
 	type Component,
 	Container,
+	createRenderFrame,
 	Editor,
 	isViewportTUI,
 	ProcessTerminal,
+	type RenderFrame,
 	ScrollView,
 	setKeybindings,
 	Text,
@@ -27,12 +29,12 @@ class FixtureFooter implements Component {
 		// Theme styling is resolved during render.
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const left = "workspace · main";
 		const right = "fixture-model";
-		return [
+		return createRenderFrame([
 			theme.fg("dim", left) + " ".repeat(Math.max(1, width - left.length - right.length)) + theme.fg("text", right),
-		];
+		]);
 	}
 }
 

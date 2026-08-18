@@ -56,7 +56,7 @@ function createInspector(
 }
 
 function text(inspector: PlanInspectorComponent, width = 60): string {
-	return inspector.render(width).map(stripAnsi).join("\n");
+	return inspector.render(width).lines.map(stripAnsi).join("\n");
 }
 
 beforeAll(() => {
@@ -95,7 +95,7 @@ describe("PlanInspectorComponent", () => {
 	it("shows progress and focused state while bounding every line", () => {
 		const inspector = createInspector(planning("active"));
 		inspector.focused = true;
-		const lines = inspector.render(48);
+		const lines = inspector.render(48).lines;
 		const output = lines.map(stripAnsi).join("\n");
 		expect(output).toContain("FOCUSED");
 		expect(output).toContain("1/3 complete · 33%");
@@ -106,13 +106,13 @@ describe("PlanInspectorComponent", () => {
 		const actions: PlanDetailsAction[] = [];
 		const state = planning("ready");
 		const inspector = createInspector(state, { actions });
-		inspector.render(60);
+		inspector.render(60).lines;
 		inspector.handleInput("\r");
 		inspector.handleInput("\x1b[C");
-		inspector.render(60);
+		inspector.render(60).lines;
 		inspector.handleInput("\r");
 		inspector.handleInput("\x1b[C");
-		inspector.render(60);
+		inspector.render(60).lines;
 		inspector.handleInput("\r");
 		expect(actions).toEqual(["retain_context", "new_session", "change"]);
 		expect(state.plan?.phase).toBe("ready");

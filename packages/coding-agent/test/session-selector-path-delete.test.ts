@@ -212,7 +212,7 @@ describe("session selector path/delete interactions", () => {
 		await flushPromises();
 
 		expect(allLoadCalls).toBe(1);
-		const output = selector.render(120).join("\n");
+		const output = selector.render(120).lines.join("\n");
 		expect(output).toContain("Resume Session (Current Folder)");
 		expect(output).not.toContain("Resume Session (All)");
 	});
@@ -278,7 +278,7 @@ describe("session selector path/delete interactions", () => {
 		);
 		await flushPromises();
 
-		const output = stripAnsi(selector.render(120).join("\n"));
+		const output = stripAnsi(selector.render(120).lines.join("\n"));
 		expect(output).toContain("Parent");
 		expect(output).toContain("└─ Child");
 	});

@@ -1,4 +1,16 @@
-import { type Component, Container, HStack, truncateToWidth, VStack, visibleWidth } from "@hansjm10/volt-tui";
+import {
+	type Component,
+	Container,
+	concatRenderFrames,
+	createRenderFrame,
+	HStack,
+	mapRenderFrameLines,
+	type RenderFrame,
+	sliceRenderFrame,
+	truncateToWidth,
+	VStack,
+	visibleWidth,
+} from "@hansjm10/volt-tui";
 import type { PlanningState } from "../../../core/planning.ts";
 import { theme } from "../../../core/theme/runtime.ts";
 import { usesAsciiPlanMarkers } from "./plan-content.ts";
@@ -42,57 +54,30 @@ export function getResponsivePlanDimensions(
 	};
 }
 
-type ImageBlock = { start: number; end: number };
-
-function getImageBlocks(lines: readonly string[]): ImageBlock[] {
-	const blocks: ImageBlock[] = [];
-	for (const [index, line] of lines.entries()) {
-		const kittyStart = line.indexOf("\x1b_G");
-		if (kittyStart !== -1) {
-			const paramsEnd = line.indexOf(";", kittyStart + 3);
-			const params = paramsEnd === -1 ? "" : line.slice(kittyStart + 3, paramsEnd);
-			const rowParam = params.split(",").find((param) => param.startsWith("r="));
-			const rows = rowParam ? Number(rowParam.slice(2)) : 1;
-			const safeRows = Number.isSafeInteger(rows) && rows > 0 ? rows : 1;
-			blocks.push({ start: index, end: Math.min(lines.length - 1, index + safeRows - 1) });
-			continue;
-		}
-		const sixelRows = /\x1b_pi:s=\d+,c=\d+,r=(\d+),/.exec(line)?.[1];
-		if (sixelRows !== undefined) {
-			const rows = Number(sixelRows);
-			const safeRows = Number.isSafeInteger(rows) && rows > 0 ? rows : 1;
-			blocks.push({ start: index, end: Math.min(lines.length - 1, index + safeRows - 1) });
-			continue;
-		}
-		if (line.includes("\x1b]1337;File=")) {
-			const prefix = line.slice(0, line.indexOf("\x1b]1337;File="));
-			const cursorUpMatches = [...prefix.matchAll(/\x1b\[(\d+)A/g)];
-			const lastCursorUp = cursorUpMatches[cursorUpMatches.length - 1]?.[1];
-			const rowsBefore = lastCursorUp === undefined ? 0 : Number(lastCursorUp);
-			blocks.push({ start: Math.max(0, index - rowsBefore), end: index });
-		}
-	}
-	return blocks;
-}
-
-function protectedImageRows(lines: readonly string[]): Set<number> {
+function protectedImageRows(frame: RenderFrame): Set<number> {
 	const rows = new Set<number>();
-	for (const block of getImageBlocks(lines)) {
-		for (let index = block.start; index <= block.end; index++) rows.add(index);
+	for (const image of frame.images) {
+		const end = Math.min(frame.lines.length, image.top + image.rows);
+		for (let row = Math.max(0, image.top); row < end; row++) rows.add(row);
 	}
 	return rows;
 }
 
-function safeTailStart(lines: readonly string[], maximumRows: number, minimumStart = 0): number {
-	let start = Math.min(lines.length, Math.max(minimumStart, lines.length - Math.max(0, maximumRows)));
-	for (const block of getImageBlocks(lines)) {
-		if (start > block.start && start <= block.end) start = block.end + 1;
+function safeTailStart(frame: RenderFrame, maximumRows: number, minimumStart = 0): number {
+	let start = Math.min(frame.lines.length, Math.max(minimumStart, frame.lines.length - Math.max(0, maximumRows)));
+	while (true) {
+		let nextStart = start;
+		for (const image of frame.images) {
+			const end = Math.min(frame.lines.length, image.top + image.rows);
+			if (image.top < start && start < end) nextStart = Math.max(nextStart, end);
+		}
+		if (nextStart === start) return start;
+		start = nextStart;
 	}
-	return start;
 }
 
-function renderComponents(components: readonly Component[], width: number): string[] {
-	return components.flatMap((component) => component.render(width));
+function renderComponents(components: readonly Component[], width: number): RenderFrame {
+	return concatRenderFrames(components.map((component) => component.render(width)));
 }
 
 function fitLine(line: string, width: number): string {
@@ -111,10 +96,10 @@ class PlanPaneDivider implements Component {
 		// Theme styling is resolved during render.
 	}
 
-	render(width: number): string[] {
-		if (width <= 0) return [];
+	render(width: number): RenderFrame {
+		if (width <= 0) return createRenderFrame([]);
 		const divider = theme.fg("border", usesAsciiPlanMarkers() ? "|" : "│");
-		return Array.from({ length: Math.max(1, this.getTerminalRows()) }, () => divider);
+		return createRenderFrame(Array.from({ length: Math.max(1, this.getTerminalRows()) }, () => divider));
 	}
 }
 
@@ -232,8 +217,8 @@ export class ResponsivePlanLayoutComponent extends Container {
 		return this.fullscreenRoot;
 	}
 
-	override render(width: number): string[] {
-		if (width <= 0) return [];
+	override render(width: number): RenderFrame {
+		if (width <= 0) return createRenderFrame([]);
 		const rows = this.getTerminalRows();
 		const dimensions = getResponsivePlanDimensions(width, rows, this.planning);
 		const split = dimensions !== undefined;
@@ -241,12 +226,12 @@ export class ResponsivePlanLayoutComponent extends Container {
 		this.syncSplit(split, this.lastWidth === width);
 		this.lastWidth = width;
 		this.lastRows = rows;
-		const footerLines = this.footer.render(width);
+		const footerFrame = this.footer.render(width);
 		if (!dimensions) {
 			this.committedTranscriptStart = undefined;
 			this.previousCommittedTranscript = undefined;
 			this.previousTranscriptRows = undefined;
-			return [...renderComponents(this.compactComponents, width), ...footerLines];
+			return concatRenderFrames([renderComponents(this.compactComponents, width), footerFrame]);
 		}
 		if (resetCommittedTranscript) {
 			this.committedTranscriptStart = undefined;
@@ -254,49 +239,51 @@ export class ResponsivePlanLayoutComponent extends Container {
 			this.previousTranscriptRows = undefined;
 		}
 
-		const mainRows = Math.max(0, rows - footerLines.length);
-		if (mainRows === 0) return footerLines;
+		const mainRows = Math.max(0, rows - footerFrame.lines.length);
+		if (mainRows === 0) return footerFrame;
 		const transcript = renderComponents(this.transcriptComponents, dimensions.conversationColumns);
 		const controls = renderComponents(this.controlComponents, dimensions.conversationColumns);
 		const controlStart = safeTailStart(controls, mainRows);
-		const visibleControls = controls.slice(controlStart);
-		const transcriptRows = Math.max(0, mainRows - visibleControls.length);
+		const visibleControls = sliceRenderFrame(controls, controlStart);
+		const transcriptRows = Math.max(0, mainRows - visibleControls.lines.length);
 		if (
 			this.previousTranscriptRows !== undefined &&
-			transcript.length < this.previousTranscriptRows &&
+			transcript.lines.length < this.previousTranscriptRows &&
 			this.committedTranscriptStart !== undefined &&
 			this.previousCommittedTranscript !== undefined &&
-			(transcript.length < this.committedTranscriptStart ||
+			(transcript.lines.length < this.committedTranscriptStart ||
 				this.previousCommittedTranscript.length !== this.committedTranscriptStart ||
-				this.previousCommittedTranscript.some((line, index) => transcript[index] !== line))
+				this.previousCommittedTranscript.some((line, index) => transcript.lines[index] !== line))
 		) {
 			this.requestViewportReset();
 			this.committedTranscriptStart = undefined;
 		}
 		const transcriptStart = safeTailStart(transcript, transcriptRows, this.committedTranscriptStart);
 		this.committedTranscriptStart = transcriptStart;
-		this.previousCommittedTranscript = transcript.slice(0, transcriptStart);
-		this.previousTranscriptRows = transcript.length;
-		const historicalTranscript = transcript.slice(0, transcriptStart);
+		this.previousCommittedTranscript = transcript.lines.slice(0, transcriptStart);
+		this.previousTranscriptRows = transcript.lines.length;
+		const historicalTranscript = sliceRenderFrame(transcript, 0, transcriptStart);
 		const protectedHistoricalRows = protectedImageRows(historicalTranscript);
-		const visibleTranscript = transcript.slice(transcriptStart);
-		const padding = Array.from({ length: Math.max(0, transcriptRows - visibleTranscript.length) }, () => "");
-		const visibleConversation = [...visibleTranscript, ...padding, ...visibleControls].slice(-mainRows);
+		const visibleTranscript = sliceRenderFrame(transcript, transcriptStart);
+		const padding = createRenderFrame(
+			Array.from({ length: Math.max(0, transcriptRows - visibleTranscript.lines.length) }, () => ""),
+		);
+		const visibleConversation = concatRenderFrames([visibleTranscript, padding, visibleControls]);
 		const protectedVisibleRows = protectedImageRows(visibleConversation);
 		const availableInspectorRows = Math.max(0, mainRows - protectedVisibleRows.size);
 		this.inspector.setViewportRows(availableInspectorRows);
-		const inspectorLines = this.inspector.render(dimensions.planColumns);
+		const inspectorFrame = this.inspector.render(dimensions.planColumns);
 		const divider = theme.fg("border", usesAsciiPlanMarkers() ? "|" : "│");
 		let inspectorIndex = 0;
-		const visibleLines = visibleConversation.map((line, index) => {
-			if (protectedVisibleRows.has(index)) return line;
-			const right = inspectorLines[inspectorIndex++] ?? "";
+		const visibleFrame = mapRenderFrameLines(visibleConversation, (line, row) => {
+			if (protectedVisibleRows.has(row)) return line;
+			const right = inspectorFrame.lines[inspectorIndex++] ?? "";
 			return `${fitLine(line, dimensions.conversationColumns)}${PANE_SEGMENT_RESET}${divider}${fitLine(right, dimensions.planColumns)}`;
 		});
-		const historicalLines = historicalTranscript.map((line, index) =>
-			protectedHistoricalRows.has(index) ? line : truncateToWidth(line, dimensions.conversationColumns, ""),
+		const historicalFrame = mapRenderFrameLines(historicalTranscript, (line, row) =>
+			protectedHistoricalRows.has(row) ? line : truncateToWidth(line, dimensions.conversationColumns, ""),
 		);
-		return [...historicalLines, ...visibleLines, ...footerLines];
+		return concatRenderFrames([historicalFrame, visibleFrame, footerFrame]);
 	}
 
 	private resolveFullscreenSplit(width: number, rows: number): boolean {

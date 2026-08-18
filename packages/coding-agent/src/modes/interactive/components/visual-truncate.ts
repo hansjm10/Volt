@@ -36,10 +36,10 @@ export function truncateToVisualLines(
 
 	// Create a temporary Text component to render and get visual lines
 	const tempText = new Text(text, paddingX, 0);
-	const allVisualLines = tempText.render(width);
+	const allVisualLines = tempText.render(width).lines;
 
 	if (allVisualLines.length <= maxVisualLines) {
-		return { visualLines: allVisualLines, skippedCount: 0 };
+		return { visualLines: [...allVisualLines], skippedCount: 0 };
 	}
 
 	// Take the last N visual lines

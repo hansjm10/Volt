@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { access as fsAccess } from "node:fs/promises";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
-import { Container, Text, truncateToWidth } from "@hansjm10/volt-tui";
+import { Container, createRenderFrame, Text, truncateToWidth } from "@hansjm10/volt-tui";
 import { spawn } from "child_process";
 import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
@@ -290,9 +290,9 @@ function rebuildBashResultRenderComponent(
 						const hint =
 							theme.fg("muted", `... (${state.cachedSkipped} earlier lines,`) +
 							` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
-						return ["", truncateToWidth(hint, width, "..."), ...(state.cachedLines ?? [])];
+						return createRenderFrame(["", truncateToWidth(hint, width, "..."), ...(state.cachedLines ?? [])]);
 					}
-					return ["", ...(state.cachedLines ?? [])];
+					return createRenderFrame(["", ...(state.cachedLines ?? [])]);
 				},
 				invalidate: () => {
 					state.cachedWidth = undefined;

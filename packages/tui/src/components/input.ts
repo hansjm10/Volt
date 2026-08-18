@@ -1,6 +1,7 @@
 import { getKeybindings } from "../keybindings.ts";
 import { decodeKittyPrintable } from "../keys.ts";
 import { KillRing } from "../kill-ring.ts";
+import { createRenderFrame, type RenderFrame } from "../render-frame.ts";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui.ts";
 import { UndoStack } from "../undo-stack.ts";
 import { getGraphemeSegmenter, isWhitespaceChar, sliceByColumn, visibleWidth } from "../utils.ts";
@@ -375,13 +376,13 @@ export class Input implements Component, Focusable {
 		// No cached state to invalidate currently
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		// Calculate visible window
 		const prompt = "> ";
 		const availableWidth = width - prompt.length;
 
 		if (availableWidth <= 0) {
-			return [prompt];
+			return createRenderFrame([prompt]);
 		}
 
 		let visibleText = "";
@@ -442,6 +443,6 @@ export class Input implements Component, Focusable {
 		const padding = " ".repeat(Math.max(0, availableWidth - visualLength));
 		const line = prompt + textWithCursor + padding;
 
-		return [line];
+		return createRenderFrame([line]);
 	}
 }

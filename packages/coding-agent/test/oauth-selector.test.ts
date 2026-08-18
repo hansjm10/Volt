@@ -57,7 +57,7 @@ describe("OAuthSelectorComponent", () => {
 			() => {},
 		);
 
-		const output = stripAnsi(selector.render(120).join("\n"));
+		const output = stripAnsi(selector.render(120).lines.join("\n"));
 
 		expect(output).toContain("Anthropic");
 		expect(output).toContain("subscription configured");
@@ -74,7 +74,7 @@ describe("OAuthSelectorComponent", () => {
 			() => {},
 		);
 
-		const output = stripAnsi(selector.render(120).join("\n"));
+		const output = stripAnsi(selector.render(120).lines.join("\n"));
 
 		expect(output).toContain("OpenAI");
 		expect(output).toContain("✓ env: OPENAI_API_KEY");
@@ -92,7 +92,7 @@ describe("OAuthSelectorComponent", () => {
 			() => ({ configured: true, source: "environment", label: "OLLAMA_API_KEY" }),
 		);
 
-		const output = stripAnsi(selector.render(120).join("\n"));
+		const output = stripAnsi(selector.render(120).lines.join("\n"));
 
 		expect(output).toContain("ollama");
 		expect(output).toContain("✓ env: OLLAMA_API_KEY");
@@ -110,7 +110,7 @@ describe("OAuthSelectorComponent", () => {
 			() => ({ configured: true, source: "models_json_key" }),
 		);
 
-		const output = stripAnsi(selector.render(120).join("\n"));
+		const output = stripAnsi(selector.render(120).lines.join("\n"));
 
 		expect(output).toContain("local-proxy");
 		expect(output).toContain("✓ key in models.json");
@@ -128,7 +128,7 @@ describe("OAuthSelectorComponent", () => {
 			() => ({ configured: true, source: "models_json_command" }),
 		);
 
-		const output = stripAnsi(selector.render(120).join("\n"));
+		const output = stripAnsi(selector.render(120).lines.join("\n"));
 
 		expect(output).toContain("op-proxy");
 		expect(output).toContain("✓ command in models.json");

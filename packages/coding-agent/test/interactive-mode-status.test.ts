@@ -1,6 +1,11 @@
 import { homedir } from "node:os";
 import * as path from "node:path";
-import { type AutocompleteProvider, CombinedAutocompleteProvider } from "@hansjm10/volt-tui";
+import {
+	type AutocompleteProvider,
+	CombinedAutocompleteProvider,
+	createRenderFrame,
+	type RenderFrame,
+} from "@hansjm10/volt-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import { type Component, Container, type Focusable, type TUI, TuiMainScreen, VStack } from "../../tui/src/index.ts";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
@@ -13,11 +18,11 @@ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 function renderLastLine(container: Container, width = 120): string {
 	const last = container.children[container.children.length - 1];
 	if (!last) return "";
-	return last.render(width).join("\n");
+	return last.render(width).lines.join("\n");
 }
 
 function renderAll(container: Container, width = 120): string {
-	return container.children.flatMap((child) => child.render(width)).join("\n");
+	return container.children.flatMap((child) => child.render(width).lines).join("\n");
 }
 
 class TestFocusableComponent implements Component, Focusable {
@@ -47,8 +52,8 @@ class TestFocusableComponent implements Component, Focusable {
 		this.fullscreenActive = active;
 	}
 
-	render(): string[] {
-		return [this.label];
+	render(): RenderFrame {
+		return createRenderFrame([this.label]);
 	}
 
 	invalidate(): void {}
@@ -112,7 +117,7 @@ describe("InteractiveMode.showStatus", () => {
 		expect(fakeThis.chatContainer.children).toHaveLength(2);
 
 		// Something else gets added to the chat in between status updates
-		fakeThis.chatContainer.addChild({ render: () => ["OTHER"], invalidate: () => {} });
+		fakeThis.chatContainer.addChild({ render: () => createRenderFrame(["OTHER"]), invalidate: () => {} });
 		expect(fakeThis.chatContainer.children).toHaveLength(3);
 
 		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "STATUS_TWO");
