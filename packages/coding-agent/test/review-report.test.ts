@@ -234,7 +234,19 @@ describe("structured review reports", () => {
 		expect(JSON.stringify(parsed)).not.toContain(privateMarker);
 		expect(parsed).toMatchObject({
 			summary: "Review completed with 1 verified finding.",
-			findings: [{ title: "Zero divisor returns the numerator", confidence: 0.96 }],
+			findings: [
+				{
+					title: "Zero divisor returns the numerator",
+					confidence: 0.96,
+					verification: {
+						outcome: "accepted",
+						method:
+							"Independent verification accepted this finding; a separate context-blind pass rendered the code-based rationale.",
+						rationale: "The changed branch directly returns amount.",
+						confidence: 0.96,
+					},
+				},
+			],
 			coverage: {
 				commandsRun: ["1 bash command(s) completed during review."],
 				failedVerificationAttempts: ["1 verification tool attempt(s) failed."],
@@ -363,6 +375,15 @@ describe("structured review reports", () => {
 			filesInspected: ["src/divide.ts"],
 			commandsRun: ["npm run focused-check"],
 			failedVerificationAttempts: ["bash: npm run missing"],
+		});
+		expect(complete.findings[0]).toMatchObject({
+			confidence: 0.95,
+			verification: {
+				outcome: "accepted",
+				method: "Compared exact blobs.",
+				rationale: "The trigger is present.",
+				confidence: 0.98,
+			},
 		});
 		expect(complete.findings[0]).not.toHaveProperty("file");
 

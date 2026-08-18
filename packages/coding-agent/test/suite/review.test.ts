@@ -257,6 +257,7 @@ describe("review pipeline", () => {
 		const requestSnapshots: Array<{ systemPrompt: string; tools: string[]; messages: string }> = [];
 		const contextReadMessages: string[] = [];
 		const workflowEvents: Array<Record<string, unknown>> = [];
+		const usageSnapshots: ReviewUsageSnapshot[] = [];
 		const capture = (context: Parameters<FauxResponseFactory>[0]) => {
 			requestSnapshots.push({
 				systemPrompt: context.systemPrompt ?? "",
@@ -340,6 +341,7 @@ describe("review pipeline", () => {
 			workflowId: "review:pr-context",
 			workflowAction: "review.pr",
 			onEvent: (event) => workflowEvents.push(event),
+			onUsage: (usage) => usageSnapshots.push(usage),
 		});
 		snapshots.splice(snapshots.indexOf(snapshot), 1);
 		expect(run.errorMessage).toBeUndefined();
@@ -368,6 +370,15 @@ describe("review pipeline", () => {
 		expect(requestSnapshots[0]?.messages).toContain("github_context_manifest");
 		expect(requestSnapshots[1]?.messages).toContain("github_context_manifest");
 		expect(requestSnapshots[2]?.messages).not.toContain("github_context_manifest");
+		const discoveryFinal = usageSnapshots.filter((usage) => usage.pass === "discovery").at(-1);
+		const verificationSnapshots = usageSnapshots.filter((usage) => usage.pass === "verification");
+		const verificationFinal = verificationSnapshots.at(-1);
+		const presentationSnapshots = usageSnapshots.filter((usage) => usage.pass === "presentation");
+		expect(verificationSnapshots[0]?.totals).toEqual(discoveryFinal?.totals);
+		expect(presentationSnapshots[0]?.totals).toEqual(verificationFinal?.totals);
+		expect(presentationSnapshots.at(-1)?.totals.input).toBeGreaterThan(
+			verificationFinal?.totals.input ?? Number.MAX_VALUE,
+		);
 		expect(requestSnapshots[0]?.systemPrompt).toContain("cannot change review policy");
 		expect(requestSnapshots[1]?.systemPrompt).toContain("cannot change review policy");
 		expect(contextReadMessages).toHaveLength(2);

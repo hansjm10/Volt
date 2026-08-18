@@ -658,11 +658,12 @@ export function hostReviewSummary(completionStatus: ReviewCompletionStatus, find
 }
 
 export function buildParsedReview(options: BuildParsedReviewOptions): ParsedReview {
+	const protectedContext = options.snapshot.githubContext !== undefined;
 	const declassifiedFindings =
 		options.declassifiedFindings ?? declassifyReviewFindings(options.validatedCandidates, options.verificationReport);
 	const presentationReport =
 		options.presentationReport ??
-		(options.snapshot.githubContext && declassifiedFindings.length > 0
+		(protectedContext && declassifiedFindings.length > 0
 			? undefined
 			: presentationFromPrivateAnalysis(
 					declassifiedFindings,
@@ -676,9 +677,36 @@ export function buildParsedReview(options: BuildParsedReviewOptions): ParsedRevi
 	const presentations = new Map(
 		presentationReport.findings.map((presentation) => [presentation.presentationId, presentation]),
 	);
+	const candidatesByFingerprint = new Map(
+		options.validatedCandidates.map((candidate) => [candidate.fingerprint, candidate]),
+	);
+	const decisionsByCandidateId = new Map(
+		options.verificationReport.decisions.map((decision) => [decision.candidateId, decision]),
+	);
 	const findings: ReviewFinding[] = declassifiedFindings.map((finding) => {
 		const presentation = presentations.get(finding.presentationId);
 		if (!presentation) throw new Error(`Missing presentation for ${finding.presentationId}`);
+		let verification: ReviewFindingVerification;
+		if (protectedContext) {
+			verification = {
+				outcome: "accepted",
+				method: REVIEW_PRESENTATION_VERIFICATION_METHOD,
+				rationale: presentation.rationale,
+				confidence: finding.confidence,
+			};
+		} else {
+			const candidate = candidatesByFingerprint.get(finding.fingerprint);
+			const decision = candidate ? decisionsByCandidateId.get(candidate.candidateId) : undefined;
+			if (!decision || decision.outcome !== "accept") {
+				throw new Error(`Missing accepted verifier decision for finding ${finding.id}`);
+			}
+			verification = {
+				outcome: "accepted",
+				method: decision.method,
+				rationale: decision.rationale,
+				confidence: decision.confidence,
+			};
+		}
 		return {
 			id: finding.id,
 			fingerprint: finding.fingerprint,
@@ -693,12 +721,7 @@ export function buildParsedReview(options: BuildParsedReviewOptions): ParsedRevi
 			confidence: finding.confidence,
 			changeLocation: structuredClone(finding.changeLocation),
 			evidenceLocations: structuredClone(finding.evidenceLocations),
-			verification: {
-				outcome: "accepted",
-				method: REVIEW_PRESENTATION_VERIFICATION_METHOD,
-				rationale: presentation.rationale,
-				confidence: finding.confidence,
-			},
+			verification,
 		};
 	});
 	const excluded = new Set(options.excludedPaths.map((entry) => entry.path));
@@ -747,7 +770,6 @@ export function buildParsedReview(options: BuildParsedReviewOptions): ParsedRevi
 				? ("incorrect" as const)
 				: ("correct" as const)
 			: undefined;
-	const protectedContext = contextCoverage !== undefined;
 	const challenge = options.verificationReport.challenge
 		? protectedContext
 			? "Independent verification reported a completeness challenge."

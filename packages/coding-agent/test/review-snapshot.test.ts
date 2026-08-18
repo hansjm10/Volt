@@ -625,14 +625,34 @@ describe("review snapshots", () => {
 					originalStartLine: 3,
 					diffSide: "RIGHT",
 					comments: {
-						nodes: [{ ...comment("thread-comment-1", "Inline root"), diffHunk: "@@ -1 +1 @@", replyTo: null }],
+						nodes: [
+							{
+								...comment("thread-comment-pending-root", "Pending inline root"),
+								state: "PENDING",
+								diffHunk: "@@ -1 +1 @@",
+								replyTo: null,
+							},
+							{
+								...comment("thread-comment-1", "Inline root"),
+								state: "SUBMITTED",
+								diffHunk: "@@ -1 +1 @@",
+								replyTo: null,
+							},
+						],
 						pageInfo: { hasNextPage: true, endCursor: "thread-replies" },
 					},
 				},
 			]),
 			[graphqlKey("VoltReviewThreadComments", "thread-1", "thread-replies")]: graphqlConnection("comments", [
 				{
+					...comment("thread-comment-pending-reply", "Pending inline reply"),
+					state: "PENDING",
+					diffHunk: "@@ -1 +1 @@",
+					replyTo: { id: "thread-comment-1" },
+				},
+				{
 					...comment("thread-comment-2", "Inline reply"),
+					state: "SUBMITTED",
 					diffHunk: "@@ -1 +1 @@",
 					replyTo: { id: "thread-comment-1" },
 				},
@@ -685,6 +705,15 @@ describe("review snapshots", () => {
 		expect(captured.context.rendered).toContain("Manual linked issue");
 		expect(captured.context.rendered).toContain("Inline reply");
 		expect(captured.context.rendered).toContain("Linked issue discussion");
+		expect(captured.context.rendered).not.toContain("Pending inline root");
+		expect(captured.context.rendered).not.toContain("Pending inline reply");
+		expect(
+			captured.context.discussionEntries.filter((entry) => entry.kind === "review-thread-comment"),
+		).toMatchObject([
+			{ id: "thread-comment-1", state: "SUBMITTED" },
+			{ id: "thread-comment-2", state: "SUBMITTED" },
+		]);
+		expect(captured.context.manifest.limitations).toEqual([]);
 		const requests = readFileSync(logPath, "utf8");
 		expect(requests).toContain('"cursor":"issues-page-2"');
 		expect(requests).toContain('"cursor":"pr-comments-page-2"');
@@ -728,6 +757,10 @@ describe("review snapshots", () => {
 				nextCursor,
 			);
 		}
+		graphql[graphqlKey("VoltReviewPullRequestComments", "PR_node_limits", "discussion-10")] = graphqlConnection(
+			"comments",
+			[{ id: "comment-overflow", body: "overflow" }],
+		);
 		installGitHubShim(repository, {
 			view: {
 				id: "PR_node_limits",
@@ -763,6 +796,67 @@ describe("review snapshots", () => {
 		expect(Buffer.byteLength(captured.context.discussionEntries[0]?.body ?? "", "utf8")).toBeLessThanOrEqual(
 			32 * 1024,
 		);
+	});
+
+	it("distinguishes an exact discussion cap from later-source overflow", async () => {
+		const repository = createRepository();
+		const oid = "d".repeat(40);
+		const view = {
+			id: "PR_discussion_boundary",
+			number: 9,
+			title: "Discussion boundary",
+			body: "Body",
+			baseRefName: "main",
+			headRefName: "feature",
+			url: "https://example.test/pr/9",
+			baseRefOid: oid,
+			headRefOid: oid,
+		};
+		const comments = Array.from({ length: 200 }, (_, index) => ({
+			id: `comment-${index}`,
+			body: `comment ${index}`,
+		}));
+		const graphql: Record<string, unknown> = {
+			[graphqlKey("VoltReviewPullRequestComments", view.id, null)]: graphqlConnection("comments", comments),
+		};
+		const configPath = join(repository, "bin", "gh-config.json");
+		installGitHubShim(repository, { view, graphql });
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+
+		const capture = async () => {
+			const captured = await captureReviewGitHubContext({
+				cwd: repository,
+				number: "9",
+				maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
+			});
+			expect(captured.ok).toBe(true);
+			if (!captured.ok) throw new Error(captured.error);
+			return captured.context;
+		};
+		const exact = await capture();
+		expect(exact.manifest).toMatchObject({
+			status: "complete",
+			discussionEntryCount: 200,
+			limitations: [],
+		});
+
+		graphql[graphqlKey("VoltReviewPullRequestReviews", view.id, null)] = graphqlConnection("reviews", [
+			{
+				id: "review-overflow",
+				body: "Later submitted review",
+				state: "COMMENTED",
+				submittedAt: "2026-01-04T00:00:00Z",
+				commit: { oid },
+			},
+		]);
+		writeFileSync(configPath, JSON.stringify({ view, graphql }));
+		const overflow = await capture();
+		expect(overflow.manifest).toMatchObject({
+			status: "incomplete",
+			discussionEntryCount: 200,
+		});
+		expect(overflow.manifest.limitations.map((limitation) => limitation.code)).toContain("discussion-limit");
+		expect(overflow.discussionEntries.some((entry) => entry.id === "review-overflow")).toBe(false);
 	});
 
 	it("fails closed when manifest byte convergence crosses the aggregate boundary", async () => {

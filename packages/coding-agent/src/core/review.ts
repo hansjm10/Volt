@@ -1249,6 +1249,7 @@ async function runReviewPass<TReport>(options: ReviewPassOptions<TReport>): Prom
 	}
 	const publishUsage = (): SessionUsageTotals => {
 		const usage = collectSessionUsage(session);
+		const totals = addSessionUsage(options.priorUsage, usage.totals);
 		try {
 			options.onUsage?.({
 				pass: options.name,
@@ -1256,13 +1257,13 @@ async function runReviewPass<TReport>(options: ReviewPassOptions<TReport>): Prom
 				thinkingLevel: session.thinkingLevel,
 				fastModeEnabled: session.fastModeEnabled,
 				contextUsage: usage.contextUsage,
-				totals: addSessionUsage(options.priorUsage, usage.totals),
+				totals,
 				...(usage.latestCacheHitRate === undefined ? {} : { latestCacheHitRate: usage.latestCacheHitRate }),
 			});
 		} catch {
 			// Usage observers are passive and cannot fail an isolated review pass.
 		}
-		return usage.totals;
+		return totals;
 	};
 	const onAbort = (): void => {
 		void session.abort();

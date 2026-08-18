@@ -213,6 +213,7 @@ const REVIEW_THREADS_QUERY = `query VoltReviewThreads($id: ID!, $cursor: String)
             nodes {
               id
               body
+              state
               url
               createdAt
               updatedAt
@@ -239,6 +240,7 @@ const REVIEW_THREAD_COMMENTS_QUERY = `query VoltReviewThreadComments($id: ID!, $
         nodes {
           id
           body
+          state
           url
           createdAt
           updatedAt
@@ -582,10 +584,6 @@ function appendDiscussion(
 		return false;
 	}
 	state.discussionEntries.push(entry);
-	if (state.discussionEntries.length >= REVIEW_GITHUB_DISCUSSION_LIMIT) {
-		addLimitation(state.limitations, "discussion-limit", "github-discussion");
-		return false;
-	}
 	return true;
 }
 
@@ -628,18 +626,24 @@ function parseThreadComment(
 ): ReviewGitHubDiscussionEntry | undefined {
 	if (!isObject(value) || !thread) return undefined;
 	const id = boundedStructuralString(value.id, 500);
-	if (!id || typeof value.body !== "string") return undefined;
+	const state = boundedStructuralString(value.state, 100);
+	if (!id || state !== "SUBMITTED" || typeof value.body !== "string") return undefined;
 	const replyToId = isObject(value.replyTo) ? boundedStructuralString(value.replyTo.id, 500) : undefined;
 	return {
 		id,
 		kind: "review-thread-comment",
 		...commonDiscussionFields(value, "review-thread-comment-body", limitations),
+		state,
 		thread,
 		...(typeof value.diffHunk === "string"
 			? { diffHunk: boundedText(value.diffHunk, "review-thread-diff-hunk", limitations) }
 			: {}),
 		...(replyToId ? { replyToId } : {}),
 	};
+}
+
+function isPendingReviewComment(value: unknown): boolean {
+	return isObject(value) && value.state === "PENDING";
 }
 
 function parseIssueComment(
@@ -668,7 +672,7 @@ async function captureSimpleDiscussionConnection(options: {
 	parse: (value: unknown, limitations: ReviewGitHubContextLimitation[]) => ReviewGitHubDiscussionEntry | undefined;
 }): Promise<boolean> {
 	let cursor: string | undefined;
-	while (options.state.discussionEntries.length < REVIEW_GITHUB_DISCUSSION_LIMIT) {
+	while (true) {
 		const connection = await loadConnection({
 			cwd: options.cwd,
 			query: options.query,
@@ -686,8 +690,6 @@ async function captureSimpleDiscussionConnection(options: {
 		if (!connection.hasNextPage) return true;
 		cursor = connection.endCursor;
 	}
-	addLimitation(options.state.limitations, "discussion-limit", "github-discussion");
-	return false;
 }
 
 function parseThread(value: unknown): ReviewGitHubDiscussionEntry["thread"] | undefined {
@@ -722,9 +724,9 @@ async function captureThreadCommentPages(
 	let connection: GraphqlConnection | undefined = initialConnection;
 	while (connection) {
 		for (const node of connection.nodes) {
-			if (!appendDiscussion(state, parseThreadComment(node, thread, state.limitations), "review-thread-comments")) {
-				return false;
-			}
+			const entry = parseThreadComment(node, thread, state.limitations);
+			if (!entry && isPendingReviewComment(node)) continue;
+			if (!appendDiscussion(state, entry, "review-thread-comments")) return false;
 		}
 		if (!connection.hasNextPage) return true;
 		connection = await loadConnection({
@@ -741,7 +743,7 @@ async function captureThreadCommentPages(
 
 async function captureReviewThreads(cwd: string, pullRequestId: string, state: CaptureState): Promise<boolean> {
 	let cursor: string | undefined;
-	while (state.discussionEntries.length < REVIEW_GITHUB_DISCUSSION_LIMIT) {
+	while (true) {
 		const connection = await loadConnection({
 			cwd,
 			query: REVIEW_THREADS_QUERY,
@@ -763,8 +765,6 @@ async function captureReviewThreads(cwd: string, pullRequestId: string, state: C
 		if (!connection.hasNextPage) return true;
 		cursor = connection.endCursor;
 	}
-	addLimitation(state.limitations, "discussion-limit", "github-discussion");
-	return false;
 }
 
 async function captureIssueComments(
@@ -774,7 +774,7 @@ async function captureIssueComments(
 ): Promise<void> {
 	for (const issue of issues) {
 		let cursor: string | undefined;
-		while (state.discussionEntries.length < REVIEW_GITHUB_DISCUSSION_LIMIT) {
+		while (true) {
 			const connection = await loadConnection({
 				cwd,
 				query: ISSUE_COMMENTS_QUERY,
@@ -791,10 +791,6 @@ async function captureIssueComments(
 			}
 			if (!connection.hasNextPage) break;
 			cursor = connection.endCursor;
-		}
-		if (state.discussionEntries.length >= REVIEW_GITHUB_DISCUSSION_LIMIT) {
-			addLimitation(state.limitations, "discussion-limit", "github-discussion");
-			return;
 		}
 	}
 }
