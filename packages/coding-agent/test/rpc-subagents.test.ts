@@ -159,10 +159,8 @@ function createSession(options: {
 	return {
 		bindExtensions: vi.fn(async () => undefined),
 		subscribe: vi.fn(() => () => undefined),
-		agent: {
-			state: { pendingToolExecutions: new Map() },
-			subscribe: vi.fn(() => () => undefined),
-		},
+		activeToolExecutions: new Map(),
+		subscribeRuntimeEvents: vi.fn(() => () => undefined),
 		resourceLoader: {
 			getSubagents: () => ({ definitions: options.definitions, diagnostics: [] }),
 		},

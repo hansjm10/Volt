@@ -1,5 +1,17 @@
-import { Container, Editor, ProcessTerminal, setKeybindings, Text } from "@hansjm10/volt-tui";
-import { TUI } from "../../../tui/src/tui.ts";
+import {
+	type Component,
+	Container,
+	Editor,
+	isViewportTUI,
+	ProcessTerminal,
+	ScrollView,
+	setKeybindings,
+	Text,
+	type TUI,
+	TuiAltScreen,
+	TuiMainScreen,
+	VStack,
+} from "@hansjm10/volt-tui";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal.ts";
 import { KeybindingsManager } from "../../src/core/keybindings.ts";
 import type { PlanningState, PlanPhase, PlanState } from "../../src/core/planning.ts";
@@ -10,8 +22,24 @@ import { PlanDetailsComponent, PlanStatusComponent } from "../../src/modes/inter
 import { ResponsivePlanLayoutComponent } from "../../src/modes/interactive/components/responsive-plan-layout.ts";
 import { ToolExecutionComponent } from "../../src/modes/interactive/components/tool-execution.ts";
 
+class FixtureFooter implements Component {
+	invalidate(): void {
+		// Theme styling is resolved during render.
+	}
+
+	render(width: number): string[] {
+		const left = "workspace · main";
+		const right = "fixture-model";
+		return [
+			theme.fg("dim", left) + " ".repeat(Math.max(1, width - left.length - right.length)) + theme.fg("text", right),
+		];
+	}
+}
+
 const width = process.stdout.columns || 160;
 const height = process.stdout.rows || 36;
+const hold = process.env.VOLT_PLAN_HOLD === "1";
+const fullscreen = process.env.VOLT_TUI_MODE === "fullscreen";
 initTheme(process.env.VOLT_PLAN_THEME === "light" ? "light" : "dark");
 const keybindings = new KeybindingsManager();
 setKeybindings(keybindings);
@@ -64,14 +92,14 @@ const plan: PlanState = {
 };
 
 const planning: PlanningState = { mode: phase === "draft" || phase === "ready" ? "plan" : "build", plan };
-const hold = process.env.VOLT_PLAN_HOLD === "1";
-const tui = new TUI(hold ? new ProcessTerminal() : new VirtualTerminal(width, height));
+const terminal = hold ? new ProcessTerminal() : new VirtualTerminal(width, height);
+const tui: TUI = fullscreen ? new TuiAltScreen(terminal) : new TuiMainScreen(terminal);
 const details = new PlanDetailsComponent({
 	plan,
 	getTerminalRows: () => tui.terminal.rows,
 	onAction: () => undefined,
 	onClose: () => undefined,
-	requestRender: () => undefined,
+	requestRender: () => tui.requestRender(),
 });
 const editor = new Editor(tui, getEditorTheme(), {
 	topBorderLabel: planning.mode === "plan" ? "PLAN · AGENT READ-ONLY" : "ASK VOLT · BUILD",
@@ -79,8 +107,19 @@ const editor = new Editor(tui, getEditorTheme(), {
 });
 const actionMessage = new Text("", 1, 0);
 let inspector: PlanInspectorComponent;
-const focusEditor = () => tui.setFocus(editor);
-const toggleFocus = () => tui.setFocus(inspector.focused ? editor : inspector);
+const focusEditor = () => {
+	transcriptScroll.setPrimary(true);
+	tui.setFocus(editor);
+};
+const toggleFocus = () => {
+	if (inspector.focused) focusEditor();
+	else {
+		transcriptScroll.setPrimary(false);
+		inspector.setFullscreenActive(fullscreen);
+		tui.setFocus(inspector);
+	}
+	tui.requestRender();
+};
 inspector = new PlanInspectorComponent({
 	planning,
 	onAction: (action) => {
@@ -91,7 +130,6 @@ inspector = new PlanInspectorComponent({
 	onToggleFocus: toggleFocus,
 	requestRender: () => tui.requestRender(),
 });
-if (process.env.VOLT_PLAN_FOCUSED === "1") inspector.focused = true;
 const status = new PlanStatusComponent(planning);
 const controller: PlanningToolController = {
 	getPlanningState: () => planning,
@@ -127,7 +165,7 @@ tool.setExpanded(process.env.VOLT_PLAN_EXPANDED === "1");
 
 const transcript = new Container();
 transcript.addChild(
-	new Text(theme.fg("muted", "Conversation transcript remains available in terminal scrollback."), 1, 0),
+	new Text(theme.fg("muted", "Conversation transcript remains available while the plan stays visible."), 1, 0),
 );
 if (process.env.VOLT_PLAN_SCENARIO === "tools") transcript.addChild(tool);
 if (process.env.VOLT_PLAN_SCENARIO === "scrollback") {
@@ -142,34 +180,51 @@ statusContainer.addChild(status);
 const editorContainer = new Container();
 editorContainer.addChild(actionMessage);
 editorContainer.addChild(editor);
-const footer = new Text(
-	theme.fg("dim", "workspace · main") +
-		theme.fg("text", " ".repeat(Math.max(1, width - 45))) +
-		theme.fg("text", "fixture-model"),
-	0,
-	0,
-);
-const layout = new ResponsivePlanLayoutComponent({
+const footer = new FixtureFooter();
+const transcriptScroll = new ScrollView(transcript, { follow: "end", primary: true });
+let layout: ResponsivePlanLayoutComponent;
+const fullscreenConversation = new VStack([
+	{ component: transcriptScroll, basis: 0, grow: 1, shrink: 1, minSize: 0 },
+	{
+		component: statusContainer,
+		shrink: 2,
+		minSize: 0,
+		visible: (viewport) => !layout.isSplit(viewport.width, viewport.height),
+	},
+	{ component: editorContainer, shrink: 1, minSize: 1 },
+]);
+layout = new ResponsivePlanLayoutComponent({
 	planning,
 	transcriptComponents: [transcript],
 	controlComponents: [editorContainer],
 	compactComponents: [transcript, statusContainer, details, editorContainer],
+	fullscreenConversation,
 	inspector,
 	footer,
 	getTerminalRows: () => tui.terminal.rows,
-	requestViewportReset: () => undefined,
+	requestViewportReset: () => {
+		if (tui instanceof TuiMainScreen) tui.resetViewportOnNextRender();
+	},
 	onSplitChange: () => undefined,
 });
 
+tui.addChild(layout);
+if (isViewportTUI(tui)) tui.setLayoutRoot(layout.getFullscreenLayout());
+if (process.env.VOLT_PLAN_FOCUSED === "1") {
+	transcriptScroll.setPrimary(false);
+	inspector.setFullscreenActive(fullscreen);
+	tui.setFocus(inspector);
+} else {
+	tui.setFocus(editor);
+}
+tui.addInputListener((data) => {
+	if (!keybindings.matches(data, "app.plan.togglePane")) return undefined;
+	toggleFocus();
+	return { consume: true };
+});
+
+tui.start();
 if (hold) {
-	tui.addChild(layout);
-	tui.addInputListener((data) => {
-		if (!keybindings.matches(data, "app.plan.togglePane")) return undefined;
-		toggleFocus();
-		return { consume: true };
-	});
-	tui.setFocus(process.env.VOLT_PLAN_FOCUSED === "1" ? inspector : editor);
-	tui.start();
 	let streamChunk = 1;
 	const streamTimer =
 		process.env.VOLT_PLAN_STREAM === "1"
@@ -181,11 +236,13 @@ if (hold) {
 			: undefined;
 	process.on("SIGTERM", () => {
 		if (streamTimer) clearInterval(streamTimer);
-		tui.stop();
+		tui.stop({ preserveScreen: true });
 		process.exit(0);
 	});
 } else {
-	const lines = layout.render(width);
-	const output = lines.slice(Math.max(0, lines.length - height)).map((line) => `${line}\u001b[0m`);
+	if (!(terminal instanceof VirtualTerminal)) throw new Error("Expected virtual terminal");
+	await terminal.waitForRender();
+	const output = terminal.getViewport().map((line) => `${line}\u001b[0m`);
+	tui.stop({ preserveScreen: true });
 	process.stdout.write(`\u001b[2J${output.map((line, index) => `\u001b[${index + 1};1H${line}`).join("")}`);
 }

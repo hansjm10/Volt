@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getThemesDir } from "../src/config.ts";
 import { getResolvedThemeColors, loadThemeJson } from "../src/core/theme/discovery.ts";
 import { getResolvedThemeColors as legacyGetResolvedThemeColors } from "../src/core/theme/runtime.ts";
-import { Theme } from "../src/core/theme/theme.ts";
+import { createThemeFromJson, parseThemeJson, THEME_BG_COLOR_KEYS, Theme } from "../src/core/theme/theme.ts";
 import { createThemeService, type ThemeService } from "../src/core/theme/theme-service.ts";
 
 const HEX_PATTERN = /^#[0-9a-f]{6}$/i;
@@ -30,6 +30,38 @@ describe("theme token resolution", () => {
 		const service = createThemeService({ initialTheme: "dark", colorMode: "truecolor" });
 		expect(service.resolveTokens()).toEqual(getResolvedThemeColors("dark"));
 		service.dispose();
+	});
+
+	it("loads legacy JSON themes with fullscreen token fallbacks", () => {
+		const legacyThemeJson = structuredClone(loadThemeJson("dark"));
+		delete legacyThemeJson.colors.scrollbarThumb;
+		delete legacyThemeJson.colors.searchMatchBg;
+		delete legacyThemeJson.colors.searchMatchText;
+
+		expect(() => parseThemeJson("legacy", legacyThemeJson)).not.toThrow();
+		const loaded = createThemeFromJson(legacyThemeJson, "truecolor");
+		expect(loaded.getBgAnsi("scrollbarThumb")).toBe(loaded.getBgAnsi("selectedBg"));
+		expect(loaded.getBgAnsi("searchMatchBg")).toBe(loaded.getBgAnsi("selectedBg"));
+		expect(loaded.getFgAnsi("searchMatchText")).toBe(loaded.getFgAnsi("text"));
+	});
+
+	it("applies fullscreen token fallbacks to directly constructed themes", () => {
+		const source = createThemeFromJson(loadThemeJson("dark"), "truecolor");
+		const foregrounds = Object.fromEntries(
+			Object.entries(source.resolvedColors).filter(
+				([key]) => !THEME_BG_COLOR_KEYS.has(key) && key !== "searchMatchText",
+			),
+		) as ConstructorParameters<typeof Theme>[0];
+		const backgrounds = Object.fromEntries(
+			Object.entries(source.resolvedColors).filter(
+				([key]) => THEME_BG_COLOR_KEYS.has(key) && key !== "scrollbarThumb" && key !== "searchMatchBg",
+			),
+		) as ConstructorParameters<typeof Theme>[1];
+		const direct = new Theme(foregrounds, backgrounds, "truecolor");
+
+		expect(direct.getBgAnsi("scrollbarThumb")).toBe(direct.getBgAnsi("selectedBg"));
+		expect(direct.getBgAnsi("searchMatchBg")).toBe(direct.getBgAnsi("selectedBg"));
+		expect(direct.getFgAnsi("searchMatchText")).toBe(direct.getFgAnsi("text"));
 	});
 });
 

@@ -1,4 +1,3 @@
-import { Agent } from "@hansjm10/volt-agent-core";
 import { type AssistantMessage, getModel, type Usage } from "@hansjm10/volt-ai";
 import { describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
@@ -6,7 +5,7 @@ import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
-import { createTestResourceLoader } from "./utilities.ts";
+import { createTestAgentSessionRuntimeConfig, createTestResourceLoader } from "./utilities.ts";
 
 const model = getModel("anthropic", "claude-sonnet-4-5")!;
 
@@ -69,15 +68,7 @@ function createSession() {
 	const authStorage = AuthStorage.inMemory();
 	authStorage.setRuntimeApiKey("anthropic", "test-key");
 	const session = new AgentSession({
-		agent: new Agent({
-			getApiKey: () => "test-key",
-			initialState: {
-				model,
-				systemPrompt: "You are a helpful assistant.",
-				tools: [],
-				thinkingLevel: "high",
-			},
-		}),
+		...createTestAgentSessionRuntimeConfig({ model, thinkingLevel: "high" }),
 		sessionManager,
 		settingsManager,
 		cwd: process.cwd(),
@@ -88,10 +79,6 @@ function createSession() {
 	return { session, sessionManager };
 }
 
-function syncAgentMessages(session: AgentSession, sessionManager: SessionManager): void {
-	session.agent.state.messages = sessionManager.buildSessionContext().messages;
-}
-
 describe("AgentSession.getSessionStats", () => {
 	it("exposes the current context usage alongside token totals", () => {
 		const { session, sessionManager } = createSession();
@@ -99,7 +86,6 @@ describe("AgentSession.getSessionStats", () => {
 		try {
 			sessionManager.appendMessage(createUserMessage("hello", 1));
 			sessionManager.appendMessage(createAssistantMessage("hi", 200, 2));
-			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
 			expect(stats.contextUsage).toEqual(session.getContextUsage());
@@ -121,7 +107,6 @@ describe("AgentSession.getSessionStats", () => {
 			sessionManager.appendMessage(createAssistantMessage("response2", 195_000, 4, 1));
 			sessionManager.appendCompaction("summary", keptUserId, 195_000);
 			sessionManager.appendMessage(createUserMessage("third", 5));
-			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
 			expect(stats).toMatchObject({
@@ -152,7 +137,6 @@ describe("AgentSession.getSessionStats", () => {
 			sessionManager.appendCompaction("summary", keptUserId, 195_000);
 			sessionManager.appendMessage(createUserMessage("third", 5));
 			sessionManager.appendMessage(createAssistantMessage("response3", 25_000, 6, 1));
-			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
 			expect(stats).toMatchObject({

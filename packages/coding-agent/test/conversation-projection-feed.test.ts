@@ -22,6 +22,7 @@ import {
 } from "../src/core/rpc/conversation-projection-feed.ts";
 import { type ProjectionSanitizer, StreamProjectionDecoder } from "../src/core/rpc/stream-projection.ts";
 import type {
+	RpcCommandType,
 	RpcConversationAssistantPart,
 	RpcConversationBootstrapEvent,
 	RpcConversationTranscriptItem,
@@ -39,6 +40,18 @@ const EMPTY_USAGE: Usage = {
 	totalTokens: 0,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
+
+const AUTHORITY_SCOPED_RESPONSE_COMMANDS = [
+	"get_fork_messages",
+	"get_last_assistant_text",
+	"get_message_images",
+	"get_messages",
+	"get_session_stats",
+	"get_session_tree",
+	"get_state",
+	"get_transcript",
+	"get_transcript_entry_text",
+] as const satisfies readonly RpcCommandType[];
 
 const TEST_GIT_CONTEXT: RpcGitContext = {
 	repository: "workspace",
@@ -1409,19 +1422,26 @@ describe("ConversationProjectionFeed", () => {
 		subscription.subscribeAuthorityChanges(authorityChanged);
 		firstSource.emit({ type: "agent_start" });
 		firstSource.emit({ type: "mcp_servers_changed" });
-		const staleProjectionControl = subscription.enqueueControl({
+		const staleProjectionControls = AUTHORITY_SCOPED_RESPONSE_COMMANDS.map((command) =>
+			subscription.enqueueControl({
+				type: "response",
+				command,
+				success: true,
+				data: { stale: command },
+			}),
+		);
+		const failedProjectionControl = subscription.enqueueControl({
 			type: "response",
-			command: "get_state",
-			success: true,
-			data: { stale: true },
+			command: "get_session_tree",
+			success: false,
+			error: "tree request failed before the authority cut",
 		});
-		const staleTranscriptTextControl = subscription.enqueueControl({
+		const unrelatedControl = subscription.enqueueControl({
 			type: "response",
-			command: "get_transcript_entry_text",
+			command: "list_sessions",
 			success: true,
-			data: { text: "stale canonical text" },
+			data: { sessions: [] },
 		});
-		const control = subscription.enqueueControl({ type: "response", success: false });
 		const authorityError = new Error("conversation authority requires reconciliation");
 
 		firstSource.loseAuthority(authorityError);
@@ -1435,11 +1455,22 @@ describe("ConversationProjectionFeed", () => {
 		firstSource.emit({ type: "agent_end", messages: [] });
 
 		blocked.resolve();
-		await Promise.all([subscription.ready, staleProjectionControl, staleTranscriptTextControl, control]);
+		await Promise.all([subscription.ready, ...staleProjectionControls, failedProjectionControl, unrelatedControl]);
 		await subscription.flush();
 		expect(writes).toEqual([
 			expect.objectContaining({ type: "conversation_bootstrap", reason: "bootstrap" }),
-			{ type: "response", success: false },
+			{
+				type: "response",
+				command: "get_session_tree",
+				success: false,
+				error: "tree request failed before the authority cut",
+			},
+			{
+				type: "response",
+				command: "list_sessions",
+				success: true,
+				data: { sessions: [] },
+			},
 		]);
 
 		feed.beginSourceRebind(secondSource);

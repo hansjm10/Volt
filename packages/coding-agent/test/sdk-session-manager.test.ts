@@ -124,7 +124,7 @@ describe("createAgentSession session manager defaults", () => {
 			),
 		);
 
-		const imageGen = session.agent.state.tools.find((tool) => tool.name === "image_gen");
+		const imageGen = session.state.tools.find((tool) => tool.name === "image_gen");
 		expect(imageGen).toBeDefined();
 		const result = await imageGen!.execute("sdk/output", { prompt: "A fox" });
 		const expectedPath = join(agentDir, "generated_images", sessionManager.getSessionId(), "sdk_output.png");
@@ -281,7 +281,7 @@ describe("createAgentSession session manager defaults", () => {
 		expect(session.sessionManager).toBe(sessionManager);
 		expect(session.systemPrompt).toContain(`Current working directory: ${toDisplayPath(sessionCwd)}`);
 
-		const bashTool = session.agent.state.tools.find((tool) => tool.name === "bash");
+		const bashTool = session.state.tools.find((tool) => tool.name === "bash");
 		expect(bashTool).toBeTruthy();
 		const result = await bashTool!.execute("test", { command: process.platform === "win32" ? "pwd -W" : "pwd" });
 		const output = result.content

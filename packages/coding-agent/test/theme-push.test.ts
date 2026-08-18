@@ -44,7 +44,8 @@ describe("host theme token push (§9.5)", () => {
 		const session = {
 			bindExtensions: vi.fn(async () => undefined),
 			subscribe: vi.fn(() => () => undefined),
-			agent: { state: { pendingToolExecutions: new Map() }, subscribe: vi.fn(() => () => undefined) },
+			activeToolExecutions: new Map(),
+			subscribeRuntimeEvents: vi.fn(() => () => undefined),
 			resourceLoader: {
 				getSubagents: () => ({ definitions: [], diagnostics: [] }),
 				getThemes: () => ({ themes: [] }),

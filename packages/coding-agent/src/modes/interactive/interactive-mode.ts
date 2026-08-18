@@ -26,7 +26,11 @@ import type {
 	MarkdownTheme,
 	OverlayHandle,
 	OverlayOptions,
+	RenderSuspensionLease,
 	SlashCommand,
+	Terminal,
+	TuiMainScreenRenderState,
+	TuiMode,
 } from "@hansjm10/volt-tui";
 import {
 	CombinedAutocompleteProvider,
@@ -34,16 +38,21 @@ import {
 	Container,
 	fuzzyFilter,
 	isKeyRelease,
+	isViewportTUI,
 	Loader,
 	type LoaderIndicatorOptions,
 	Markdown,
 	matchesKey,
 	ProcessTerminal,
+	ScrollView,
 	Spacer,
 	setKeybindings,
 	Text,
 	TruncatedText,
-	TUI,
+	type TUI,
+	TuiAltScreen,
+	TuiMainScreen,
+	VStack,
 	visibleWidth,
 } from "@hansjm10/volt-tui";
 import chalk from "chalk";
@@ -112,6 +121,7 @@ import {
 	listBaseBranches,
 	listRecentCommits,
 	parseReviewCommandArgs,
+	probeCurrentBranchPullRequest,
 	REMOTE_REVIEW_TOOL_NAMES,
 	REVIEW_USAGE,
 	type ResolvedReview,
@@ -179,10 +189,11 @@ import {
 	storeTargetMatchesUpdateSource,
 } from "../../store/targets.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
-import { copyToClipboard } from "../../utils/clipboard.ts";
+import { copyToClipboard, readClipboardText } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
 import { writeDurableAtomicFileSync } from "../../utils/durable-atomic-write.ts";
 import { parseGitUrl } from "../../utils/git.ts";
+import { openBrowser } from "../../utils/open-browser.ts";
 import { resolvePath } from "../../utils/paths.ts";
 import {
 	createPrivateTempDirectorySync,
@@ -322,6 +333,11 @@ interface InlineSessionRenderer {
 	dispose: () => void;
 }
 
+interface ActiveViewDescriptor {
+	regularComponents: readonly Component[];
+	fullscreenRoot: Component;
+}
+
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 
 function isDeadTerminalError(error: unknown): boolean {
@@ -335,6 +351,7 @@ function isDeadTerminalError(error: unknown): boolean {
 const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING =
 	"Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage.";
 const TURN_DONE_ALERT_BUSY_RETRY_MS = 250;
+const STDOUT_FLUSH_TIMEOUT_MS = 1000;
 
 /** Format an elapsed duration for the working indicator, e.g. "42s", "3m 12s", "1h 4m". */
 function formatElapsedDuration(ms: number): string {
@@ -418,16 +435,90 @@ export interface InteractiveModeOptions {
 	initialMessages?: string[];
 	/** Force verbose startup (overrides quietStartup setting) */
 	verbose?: boolean;
+	/** TUI layout mode for this invocation. */
+	tuiMode?: TuiMode;
+}
+
+interface InteractiveTuiOptions {
+	tuiMode: TuiMode;
+	showHardwareCursor: boolean;
+	logDirectory: string;
+	terminal?: Terminal;
+	onRightClickPaste?: () => void;
+}
+
+/** Construct the requested interactive renderer over a shared terminal. */
+export function createInteractiveTui(options: InteractiveTuiOptions): TuiMainScreen | TuiAltScreen {
+	const terminal = options.terminal ?? new ProcessTerminal();
+	if (options.tuiMode === "fullscreen") {
+		const styleSearchMatch = (text: string) => theme.bg("searchMatchBg", theme.fg("searchMatchText", text));
+		return new TuiAltScreen(terminal, options.showHardwareCursor, options.logDirectory, {
+			searchMatchStyle: (text) => theme.underline(styleSearchMatch(text)),
+			searchCurrentMatchStyle: (text) => theme.bold(theme.inverse(styleSearchMatch(text))),
+			openUrl: openBrowser,
+			onRightClickPaste: options.onRightClickPaste,
+			copySelection: async (text) => {
+				try {
+					await copyToClipboard(text);
+					return true;
+				} catch {
+					return false;
+				}
+			},
+		});
+	}
+	return new TuiMainScreen(terminal, options.showHardwareCursor, options.logDirectory);
+}
+
+/** Stable TUI reference used by components while the concrete renderer changes. */
+export function createInteractiveTuiReference(getTui: () => TUI): TUI {
+	return new Proxy({} as TUI, {
+		get: (_target, property) => {
+			const tui = getTui();
+			const value = Reflect.get(tui, property, tui);
+			if (typeof value !== "function") return value;
+			let methodTui = tui;
+			let method = value;
+			return (...args: unknown[]) => {
+				const currentTui = getTui();
+				if (currentTui !== methodTui) {
+					const currentMethod = Reflect.get(currentTui, property, currentTui);
+					if (typeof currentMethod !== "function") {
+						throw new TypeError(`TUI property ${String(property)} is not callable`);
+					}
+					methodTui = currentTui;
+					method = currentMethod;
+				}
+				return Reflect.apply(method, methodTui, args);
+			};
+		},
+		set: (_target, property, value) => {
+			const tui = getTui();
+			return Reflect.set(tui, property, value, tui);
+		},
+		has: (_target, property) => Reflect.has(getTui(), property),
+		getPrototypeOf: () => Reflect.getPrototypeOf(getTui()),
+	});
 }
 
 export class InteractiveMode {
 	private runtimeHost: AgentSessionRuntime;
+	private renderer: TuiMainScreen | TuiAltScreen;
 	private ui: TUI;
+	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
+	private sessionRenderSuspension: RenderSuspensionLease | undefined;
 	private chatContainer: Container;
 	private pendingMessagesContainer: Container;
 	private statusContainer: Container;
 	private planStatusContainer: Container;
 	private planDetailsContainer: Container;
+	private documentContainer: Container;
+	private footerContainer: Container;
+	private fullscreenTranscript: ScrollView;
+	private fullscreenFlexibleSlot: VStack;
+	private fullscreenConversationRoot: VStack;
+	private conversationView: ActiveViewDescriptor;
+	private activeView: ActiveViewDescriptor;
 	private planStatus: PlanStatusComponent;
 	private planDetails: PlanDetailsComponent | undefined;
 	private planInspector: PlanInspectorComponent;
@@ -435,7 +526,6 @@ export class InteractiveMode {
 	private planPaneReturnFocus: Component | undefined;
 	private planPaneInputUnsubscribe: (() => void) | undefined;
 	private readyPlanFocusKey: string | undefined;
-	private mainViewVisible = true;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
 	private editorComponentFactory: EditorFactory | undefined;
@@ -546,9 +636,15 @@ export class InteractiveMode {
 
 	// Extension UI state
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
+	private extensionSelectorRestore: { view: ActiveViewDescriptor; focus: Component | null } | undefined;
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
+	private extensionInputRestore: { view: ActiveViewDescriptor; focus: Component | null } | undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
-	private extensionTerminalInputUnsubscribers = new Set<() => void>();
+	private extensionEditorRestore: { view: ActiveViewDescriptor; focus: Component | null } | undefined;
+	private extensionTerminalInputSubscriptions = new Set<{
+		handler: (data: string) => { consume?: boolean; data?: string } | undefined;
+		unsubscribe: () => void;
+	}>();
 
 	// Extension widgets (components rendered above/below the editor)
 	private extensionWidgetsAbove = new Map<string, Component & { dispose?(): void }>();
@@ -569,14 +665,14 @@ export class InteractiveMode {
 	private customHeader: (Component & { dispose?(): void }) | undefined = undefined;
 
 	private options: InteractiveModeOptions;
+	private readonly onRightClickPaste = (): void => {
+		void this.handleRightClickPaste();
+	};
 	private autoTrustOnReloadCwd: string | undefined;
 
 	// Convenience accessors
 	private get session(): AgentSession {
 		return this.runtimeHost.session;
-	}
-	private get agent() {
-		return this.session.agent;
 	}
 	private get sessionManager() {
 		return this.session.sessionManager;
@@ -587,17 +683,23 @@ export class InteractiveMode {
 
 	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {}) {
 		this.runtimeHost = runtimeHost;
-		this.options = options;
+		const tuiMode = options.tuiMode ?? this.settingsManager.getTuiMode();
+		this.options = { ...options, tuiMode };
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
-			this.dismissSubagentInspector?.();
-			this.resetExtensionUI();
+			this.beginSessionReplacementUi();
 		});
-		this.runtimeHost.setRebindSession(async () => {
-			await this.rebindCurrentSession();
+		this.runtimeHost.setRebindSession(async (session) => {
+			await this.rebindReplacementSession(session);
 		});
 		this.version = VERSION;
-		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
+		this.renderer = createInteractiveTui({
+			tuiMode,
+			showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
+			logDirectory: getAgentDir(),
+			onRightClickPaste: this.onRightClickPaste,
+		});
+		this.ui = createInteractiveTuiReference(() => this.renderer);
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.headerContainer = new Container();
 		this.chatContainer = new Container();
@@ -607,6 +709,10 @@ export class InteractiveMode {
 		this.planDetailsContainer = new Container();
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
+		this.documentContainer = new Container();
+		this.documentContainer.addChild(this.headerContainer);
+		this.documentContainer.addChild(this.chatContainer);
+		this.footerContainer = new Container();
 		this.keybindings = KeybindingsManager.create();
 		setKeybindings(this.keybindings);
 		const editorPaddingX = this.settingsManager.getEditorPaddingX();
@@ -624,6 +730,7 @@ export class InteractiveMode {
 		this.planStatusContainer.addChild(this.planStatus);
 		this.planInspector = new PlanInspectorComponent({
 			planning: this.session.planningState,
+			fullscreenScrollbar: this.settingsManager.getFullscreenScrollbar(),
 			onAction: (action) => {
 				void this.handlePlanDetailsAction(action);
 			},
@@ -634,6 +741,33 @@ export class InteractiveMode {
 		this.footerDataProvider = new FooterDataProvider(this.session.gitContextProvider);
 		this.footer = new FooterComponent(this.session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
+		this.footerContainer.addChild(this.footer);
+		this.fullscreenTranscript = new ScrollView(this.documentContainer, {
+			follow: "end",
+			primary: true,
+			scrollbar: this.settingsManager.getFullscreenScrollbar(),
+			scrollbarStyle: (text) => theme.bg("scrollbarThumb", text),
+		});
+		this.fullscreenFlexibleSlot = new VStack([
+			{ component: this.fullscreenTranscript, grow: 1, shrink: 1, minSize: 0 },
+		]);
+		const fullscreenDock = new VStack([
+			{ component: this.pendingMessagesContainer, shrink: 4, minSize: 0 },
+			{ component: this.statusContainer, shrink: 4, minSize: 0 },
+			{ component: this.widgetContainerAbove, shrink: 3, minSize: 0 },
+			{
+				component: this.planStatusContainer,
+				shrink: 2,
+				minSize: 0,
+				visible: (viewport) => !this.mainView.isSplit(viewport.width, viewport.height),
+			},
+			{ component: this.editorContainer, shrink: 1, minSize: 1 },
+			{ component: this.widgetContainerBelow, shrink: 3, minSize: 0 },
+		]);
+		this.fullscreenConversationRoot = new VStack([
+			{ component: this.fullscreenFlexibleSlot, basis: 0, grow: 1, shrink: 1, minSize: 0 },
+			{ component: fullscreenDock, shrink: 1, minSize: 0 },
+		]);
 		this.mainView = new ResponsivePlanLayoutComponent({
 			planning: this.session.planningState,
 			transcriptComponents: [this.headerContainer, this.chatContainer],
@@ -655,12 +789,20 @@ export class InteractiveMode {
 				this.editorContainer,
 				this.widgetContainerBelow,
 			],
+			fullscreenConversation: this.fullscreenConversationRoot,
 			inspector: this.planInspector,
-			footer: this.footer,
+			footer: this.footerContainer,
 			getTerminalRows: () => this.ui.terminal.rows,
-			requestViewportReset: () => this.ui.resetViewportOnNextRender(),
+			requestViewportReset: () => {
+				if (this.renderer instanceof TuiMainScreen) this.renderer.resetViewportOnNextRender();
+			},
 			onSplitChange: (split, preserveScrollback) => this.handlePlanSplitChange(split, preserveScrollback),
 		});
+		this.conversationView = {
+			regularComponents: [this.mainView],
+			fullscreenRoot: this.mainView.getFullscreenLayout(),
+		};
+		this.activeView = this.conversationView;
 
 		// Load hide thinking block setting
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -920,14 +1062,14 @@ export class InteractiveMode {
 			console.log(theme.fg("dim", `Model scope: ${modelList}${cycleHint}`));
 		}
 
-		// The responsive main view owns the conversation, plan pane, and full-width footer.
+		// Mount the conversation through the renderer-aware view descriptor.
 		this.renderWidgets(); // Initialize with default spacer
-		this.ui.addChild(this.mainView);
-		this.ui.setFocus(this.editor);
+		this.activateView(this.conversationView, this.editor, false);
 
 		this.setupKeyHandlers();
 		this.setupPlanPaneInputRouting();
 		this.setupEditorSubmitHandler();
+		this.refreshPlanningUi();
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
@@ -999,7 +1141,7 @@ export class InteractiveMode {
 		this.ui.requestRender();
 
 		// Initialize extensions first so resources are shown before messages
-		await this.rebindCurrentSession();
+		await this.rebindCurrentSession(this.session);
 
 		// Render initial messages AFTER showing loaded resources
 		this.renderInitialMessages();
@@ -1693,9 +1835,9 @@ export class InteractiveMode {
 	/**
 	 * Initialize the extension system with TUI-based UI context.
 	 */
-	private async bindCurrentSessionExtensions(): Promise<void> {
+	private async bindCurrentSessionExtensions(session: AgentSession): Promise<void> {
 		const uiContext = this.createExtensionUIContext();
-		await this.session.bindExtensions({
+		await session.bindExtensions({
 			uiContext,
 			mode: "tui",
 			abortHandler: () => {
@@ -1773,10 +1915,10 @@ export class InteractiveMode {
 			},
 		});
 
-		setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
+		setRegisteredThemes(session.resourceLoader.getThemes().themes);
 		this.setupAutocompleteProvider();
 
-		const extensionRunner = this.session.extensionRunner;
+		const extensionRunner = session.extensionRunner;
 		this.setupExtensionShortcuts(extensionRunner);
 		this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		this.showStartupNoticesIfNeeded();
@@ -2201,16 +2343,24 @@ export class InteractiveMode {
 		}
 	}
 
-	private applyRuntimeSettings(): void {
-		configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
-		this.footer.setSession(this.session);
-		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
-		this.footerDataProvider.setGitContextProvider(this.session.gitContextProvider);
-		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
-		this.ui.setShowHardwareCursor(this.settingsManager.getShowHardwareCursor());
-		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
-		const editorPaddingX = this.settingsManager.getEditorPaddingX();
-		const autocompleteMaxVisible = this.settingsManager.getAutocompleteMaxVisible();
+	private applyFullscreenScrollbarSetting(mode = this.settingsManager.getFullscreenScrollbar()): void {
+		this.fullscreenTranscript.setScrollbar(mode);
+		this.planInspector.setFullscreenScrollbar(mode);
+		this.planDetails?.setFullscreenScrollbar(mode);
+	}
+
+	private applyRuntimeSettings(session: AgentSession): void {
+		const settingsManager = session.settingsManager;
+		configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
+		this.applyFullscreenScrollbarSetting(settingsManager.getFullscreenScrollbar());
+		this.footer.setSession(session);
+		this.footer.setAutoCompactEnabled(session.autoCompactionEnabled);
+		this.footerDataProvider.setGitContextProvider(session.gitContextProvider);
+		this.hideThinkingBlock = settingsManager.getHideThinkingBlock();
+		this.ui.setShowHardwareCursor(settingsManager.getShowHardwareCursor());
+		this.ui.setClearOnShrink(settingsManager.getClearOnShrink());
+		const editorPaddingX = settingsManager.getEditorPaddingX();
+		const autocompleteMaxVisible = settingsManager.getAutocompleteMaxVisible();
 		this.defaultEditor.setPaddingX(editorPaddingX);
 		this.defaultEditor.setAutocompleteMaxVisible(autocompleteMaxVisible);
 		if (this.editor !== this.defaultEditor) {
@@ -2219,13 +2369,33 @@ export class InteractiveMode {
 		}
 	}
 
-	private async rebindCurrentSession(): Promise<void> {
+	private beginSessionReplacementUi(): void {
+		this.sessionRenderSuspension ??= this.ui.suspendRendering();
+		this.dismissSubagentInspector?.();
+		this.resetExtensionUI();
+	}
+
+	private async rebindReplacementSession(session: AgentSession): Promise<void> {
+		await this.rebindCurrentSession(session);
+		this.ui.requestRender(true);
+		const suspension = this.sessionRenderSuspension;
+		this.sessionRenderSuspension = undefined;
+		suspension?.release();
+	}
+
+	private async rebindCurrentSession(session: AgentSession): Promise<void> {
+		if (this.session !== session) {
+			throw new Error("Agent session changed before interactive rebind");
+		}
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
-		this.applyRuntimeSettings();
-		this.session.setHostInteraction(this.createHostInteraction());
-		await this.bindCurrentSessionExtensions();
-		this.subscribeToAgent();
+		this.applyRuntimeSettings(session);
+		session.setHostInteraction(this.createHostInteraction());
+		await this.bindCurrentSessionExtensions(session);
+		if (this.session !== session) {
+			throw new Error("Agent session changed during interactive rebind");
+		}
+		this.subscribeToAgent(session);
 		await this.updateAvailableProviderCount();
 		this.closePlanDetails();
 		this.refreshPlanningUi();
@@ -2311,7 +2481,7 @@ export class InteractiveMode {
 			model: this.session.model,
 			isIdle: () => !this.session.isBusy,
 			isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
-			signal: this.session.agent.signal,
+			signal: this.session.signal,
 			abort: () => {
 				void this.restoreQueuedMessagesToEditor({ abortSource: "host_action" }).catch((error) => {
 					this.showError(`Failed to persist queued-message cancellation: ${String(error)}`);
@@ -2625,13 +2795,17 @@ export class InteractiveMode {
 			this.customFooter.dispose();
 		}
 
+		this.footerContainer.clear();
 		if (factory) {
-			// Create and install a custom full-width footer.
+			// Create and mount a custom footer inside the stable footer container.
 			this.customFooter = factory(this.ui, theme, this.footerDataProvider);
+			this.footerContainer.addChild(this.customFooter);
 		} else {
+			// Restore the built-in footer without changing top-level composition.
 			this.customFooter = undefined;
+			this.footerContainer.addChild(this.footer);
 		}
-		this.mainView.setFooter(this.customFooter ?? this.footer);
+
 		this.ui.requestRender();
 	}
 
@@ -2682,19 +2856,24 @@ export class InteractiveMode {
 	private addExtensionTerminalInputListener(
 		handler: (data: string) => { consume?: boolean; data?: string } | undefined,
 	): () => void {
-		const unsubscribe = this.ui.addInputListener(handler);
-		this.extensionTerminalInputUnsubscribers.add(unsubscribe);
+		const subscription = { handler, unsubscribe: this.ui.addInputListener(handler) };
+		this.extensionTerminalInputSubscriptions.add(subscription);
 		return () => {
-			unsubscribe();
-			this.extensionTerminalInputUnsubscribers.delete(unsubscribe);
+			subscription.unsubscribe();
+			this.extensionTerminalInputSubscriptions.delete(subscription);
 		};
 	}
 
-	private clearExtensionTerminalInputListeners(): void {
-		for (const unsubscribe of this.extensionTerminalInputUnsubscribers) {
-			unsubscribe();
+	private rebindExtensionTerminalInputListeners(): void {
+		for (const subscription of this.extensionTerminalInputSubscriptions) {
+			subscription.unsubscribe();
+			subscription.unsubscribe = this.ui.addInputListener(subscription.handler);
 		}
-		this.extensionTerminalInputUnsubscribers.clear();
+	}
+
+	private clearExtensionTerminalInputListeners(): void {
+		for (const subscription of this.extensionTerminalInputSubscriptions) subscription.unsubscribe();
+		this.extensionTerminalInputSubscriptions.clear();
 	}
 
 	/**
@@ -2830,6 +3009,7 @@ export class InteractiveMode {
 			};
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
+			this.extensionSelectorRestore = { view: this.activeView, focus: this.ui.getFocusedComponent() };
 			this.extensionSelector = new ExtensionSelectorComponent(
 				title,
 				options,
@@ -2846,10 +3026,7 @@ export class InteractiveMode {
 				{ tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() },
 			);
 
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionSelector);
-			this.ui.setFocus(this.extensionSelector);
-			this.ui.requestRender();
+			this.activateView(this.createDedicatedView(this.extensionSelector), this.extensionSelector);
 		});
 	}
 
@@ -2861,8 +3038,13 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.extensionSelector = undefined;
-		this.ui.setFocus(this.editor);
-		this.ui.requestRender();
+		const restore = this.extensionSelectorRestore;
+		this.extensionSelectorRestore = undefined;
+		if (restore) this.activateView(restore.view, restore.focus ?? this.editor);
+		else {
+			this.ui.setFocus(this.editor);
+			this.ui.requestRender();
+		}
 	}
 
 	/**
@@ -2914,6 +3096,7 @@ export class InteractiveMode {
 			};
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
+			this.extensionInputRestore = { view: this.activeView, focus: this.ui.getFocusedComponent() };
 			this.extensionInput = new ExtensionInputComponent(
 				title,
 				placeholder,
@@ -2930,10 +3113,7 @@ export class InteractiveMode {
 				{ tui: this.ui, timeout: opts?.timeout },
 			);
 
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionInput);
-			this.ui.setFocus(this.extensionInput);
-			this.ui.requestRender();
+			this.activateView(this.createDedicatedView(this.extensionInput), this.extensionInput);
 		});
 	}
 
@@ -2945,8 +3125,13 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.extensionInput = undefined;
-		this.ui.setFocus(this.editor);
-		this.ui.requestRender();
+		const restore = this.extensionInputRestore;
+		this.extensionInputRestore = undefined;
+		if (restore) this.activateView(restore.view, restore.focus ?? this.editor);
+		else {
+			this.ui.setFocus(this.editor);
+			this.ui.requestRender();
+		}
 	}
 
 	/**
@@ -2954,6 +3139,7 @@ export class InteractiveMode {
 	 */
 	private showExtensionEditor(title: string, prefill?: string): Promise<string | undefined> {
 		return new Promise((resolve) => {
+			this.extensionEditorRestore = { view: this.activeView, focus: this.ui.getFocusedComponent() };
 			this.extensionEditor = new ExtensionEditorComponent(
 				this.ui,
 				this.keybindings,
@@ -2969,10 +3155,7 @@ export class InteractiveMode {
 				},
 			);
 
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionEditor);
-			this.ui.setFocus(this.extensionEditor);
-			this.ui.requestRender();
+			this.activateView(this.createDedicatedView(this.extensionEditor), this.extensionEditor);
 		});
 	}
 
@@ -2983,8 +3166,13 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.extensionEditor = undefined;
-		this.ui.setFocus(this.editor);
-		this.ui.requestRender();
+		const restore = this.extensionEditorRestore;
+		this.extensionEditorRestore = undefined;
+		if (restore) this.activateView(restore.view, restore.focus ?? this.editor);
+		else {
+			this.ui.setFocus(this.editor);
+			this.ui.requestRender();
+		}
 	}
 
 	/**
@@ -3094,13 +3282,14 @@ export class InteractiveMode {
 	): Promise<T> {
 		const savedText = this.editor.getText();
 		const isOverlay = options?.overlay ?? false;
+		const previousView = this.activeView;
+		const previousFocus = this.ui.getFocusedComponent();
 
-		const restoreEditor = () => {
+		const restoreView = () => {
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.editor);
 			this.editor.setText(savedText);
-			this.ui.setFocus(this.editor);
-			this.ui.requestRender();
+			this.activateView(previousView, previousFocus ?? this.editor, false);
 		};
 
 		return new Promise((resolve, reject) => {
@@ -3111,8 +3300,7 @@ export class InteractiveMode {
 				if (closed) return;
 				closed = true;
 				if (isOverlay) this.ui.hideOverlay();
-				else restoreEditor();
-				// Note: both branches above already call requestRender
+				else restoreView();
 				resolve(result);
 				try {
 					component?.dispose?.();
@@ -3129,29 +3317,24 @@ export class InteractiveMode {
 						// Resolve overlay options - can be static or dynamic function
 						const resolveOptions = (): OverlayOptions | undefined => {
 							if (options?.overlayOptions) {
-								const opts =
-									typeof options.overlayOptions === "function"
-										? options.overlayOptions()
-										: options.overlayOptions;
-								return opts;
+								return typeof options.overlayOptions === "function"
+									? options.overlayOptions()
+									: options.overlayOptions;
 							}
 							// Fallback: use component's width property if available
-							const w = (component as { width?: number }).width;
-							return w ? { width: w } : undefined;
+							const width = (component as { width?: number }).width;
+							return width ? { width } : undefined;
 						};
 						const handle = this.ui.showOverlay(component, resolveOptions());
 						// Expose handle to caller for visibility control
 						options?.onHandle?.(handle);
 					} else {
-						this.editorContainer.clear();
-						this.editorContainer.addChild(component);
-						this.ui.setFocus(component);
-						this.ui.requestRender();
+						this.activateView(this.createDedicatedView(component), component);
 					}
 				})
 				.catch((err) => {
 					if (closed) return;
-					if (!isOverlay) restoreEditor();
+					if (!isOverlay) restoreView();
 					reject(err);
 				});
 		});
@@ -3322,9 +3505,16 @@ export class InteractiveMode {
 		this.planPaneInputUnsubscribe = this.ui.addInputListener((data) => {
 			if (
 				isKeyRelease(data) ||
-				!this.mainViewVisible ||
-				this.ui.isOverlayFocused() ||
+				this.activeView !== this.conversationView ||
 				!this.keybindings.matches(data, "app.plan.togglePane")
+			) {
+				return undefined;
+			}
+			const focused = this.ui.getFocusedComponent();
+			if (
+				focused !== this.planInspector &&
+				focused !== this.planDetails &&
+				(focused === null || !this.editorContainer.children.includes(focused))
 			) {
 				return undefined;
 			}
@@ -3360,6 +3550,20 @@ export class InteractiveMode {
 				}),
 			runReviewLifecycleAction: (action, args) => this.runInteractiveReviewLifecycleAction(action, args),
 		};
+	}
+
+	private async handleRightClickPaste(): Promise<void> {
+		const target = this.renderer.getFocusedComponent();
+		const handleInput = target?.handleInput;
+		if (!target || !handleInput) return;
+		try {
+			const text = await readClipboardText();
+			if (!text || this.renderer.getFocusedComponent() !== target) return;
+			handleInput.call(target, `\x1b[200~${text}\x1b[201~`);
+			this.ui.requestRender();
+		} catch {
+			// Clipboard paste is best-effort.
+		}
 	}
 
 	private async handleClipboardImagePaste(): Promise<void> {
@@ -3698,8 +3902,8 @@ export class InteractiveMode {
 		};
 	}
 
-	private subscribeToAgent(): void {
-		this.unsubscribe = this.session.subscribe(async (event) => {
+	private subscribeToAgent(session: AgentSession): void {
+		this.unsubscribe = session.subscribe(async (event) => {
 			await this.handleEvent(event);
 		});
 	}
@@ -4386,6 +4590,26 @@ export class InteractiveMode {
 	 */
 	private isShuttingDown = false;
 
+	private async flushStdout(): Promise<void> {
+		await new Promise<void>((resolve) => {
+			let settled = false;
+			const timeout = setTimeout(settle, STDOUT_FLUSH_TIMEOUT_MS);
+			function settle() {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timeout);
+				process.stdout.off("error", settle);
+				resolve();
+			}
+			process.stdout.once("error", settle);
+			try {
+				process.stdout.write("", settle);
+			} catch {
+				settle();
+			}
+		});
+	}
+
 	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
 		if (this.isShuttingDown) return;
 		this.isShuttingDown = true;
@@ -4415,6 +4639,7 @@ export class InteractiveMode {
 			await rememberActiveProfile();
 			await this.ui.terminal.drainInput(1000);
 			this.stop();
+			await this.flushStdout();
 			process.exit(0);
 		}
 
@@ -4437,6 +4662,7 @@ export class InteractiveMode {
 			process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
 		}
 
+		await this.flushStdout();
 		process.exit(0);
 	}
 
@@ -4563,8 +4789,8 @@ export class InteractiveMode {
 		});
 
 		try {
-			// Stop the TUI (restore terminal to normal mode)
-			this.ui.stop();
+			// Stop the TUI (restore terminal to normal mode without printing a fullscreen transcript).
+			this.ui.stop({ preserveScreen: this.ui.mode === "fullscreen" });
 
 			// Send SIGTSTP to process group (pid=0 means all processes in group)
 			process.kill(0, "SIGTSTP");
@@ -4673,18 +4899,16 @@ export class InteractiveMode {
 		} else if (this.planDetails && !plan) {
 			this.closePlanDetails();
 		}
-		if (!split && this.planInspector.focused) {
-			this.focusConversation();
-		}
+		if (!split && this.planInspector.focused) this.focusConversation();
 		this.updateEditorBorderColor();
 		if (plan?.phase === "ready") {
 			const readyKey = `${plan.id}:${plan.revision}`;
 			if (split) {
-				if (this.readyPlanFocusKey !== readyKey) this.focusPlanInspector();
-			} else if (!this.planDetails) {
+				if (this.readyPlanFocusKey !== readyKey && this.focusPlanInspector()) this.readyPlanFocusKey = readyKey;
+			} else if (!this.planDetails && this.activeView === this.conversationView) {
 				this.showPlanDetails();
+				this.readyPlanFocusKey = readyKey;
 			}
-			this.readyPlanFocusKey = readyKey;
 		} else {
 			this.readyPlanFocusKey = undefined;
 		}
@@ -4705,6 +4929,7 @@ export class InteractiveMode {
 		this.planDetails = new PlanDetailsComponent({
 			plan,
 			getTerminalRows: () => this.ui.terminal.rows,
+			fullscreenScrollbar: this.settingsManager.getFullscreenScrollbar(),
 			onAction: (action) => {
 				void this.handlePlanDetailsAction(action);
 			},
@@ -4712,45 +4937,68 @@ export class InteractiveMode {
 			requestRender: () => this.ui.requestRender(),
 		});
 		this.planDetailsContainer.addChild(this.planDetails);
+		this.fullscreenFlexibleSlot.clear();
+		this.fullscreenFlexibleSlot.addChild(this.planDetails.getFullscreenLayout(), {
+			grow: 1,
+			shrink: 1,
+			minSize: 0,
+		});
+		this.planDetails.setFullscreenActive(this.ui.mode === "fullscreen");
+		this.fullscreenTranscript.setPrimary(false);
 		this.ui.setFocus(this.planDetails);
 		this.ui.requestRender();
 	}
 
 	private closePlanDetails(options: { focusConversation?: boolean } = {}): void {
+		const closingDetails = this.planDetails;
 		this.planDetailsContainer.clear();
 		this.planDetails = undefined;
-		if (options.focusConversation !== false) this.focusConversation();
-		this.ui.requestRender();
+		this.fullscreenFlexibleSlot.clear();
+		this.fullscreenFlexibleSlot.addChild(this.fullscreenTranscript, { grow: 1, shrink: 1, minSize: 0 });
+		if (options.focusConversation !== false && this.activeView === this.conversationView) {
+			this.focusConversation();
+		} else {
+			if (closingDetails && this.ui.getFocusedComponent() === closingDetails) {
+				this.fullscreenTranscript.setPrimary(true);
+				this.ui.setFocus(this.getConversationFocusTarget());
+			}
+			this.ui.requestRender();
+		}
 	}
 
 	private getConversationFocusTarget(): Component {
 		const saved = this.planPaneReturnFocus;
 		if (saved && this.editorContainer.children.includes(saved)) return saved;
-		return (
-			this.extensionSelector ??
-			this.extensionInput ??
-			this.extensionEditor ??
-			this.editorContainer.children[0] ??
-			(this.editor as Component)
-		);
+		return this.editorContainer.children[0] ?? (this.editor as Component);
 	}
 
-	private focusPlanInspector(): void {
+	private focusPlanInspector(): boolean {
 		if (
-			!this.mainViewVisible ||
-			this.ui.isOverlayFocused() ||
+			this.activeView !== this.conversationView ||
 			!this.mainView.isSplit(this.ui.terminal.columns, this.ui.terminal.rows)
 		) {
-			return;
+			return false;
+		}
+		const focused = this.ui.getFocusedComponent();
+		if (
+			focused !== this.planInspector &&
+			focused !== this.planDetails &&
+			(focused === null || !this.editorContainer.children.includes(focused))
+		) {
+			return false;
 		}
 		if (!this.planInspector.focused) {
 			this.planPaneReturnFocus = this.getConversationFocusTarget();
+			this.fullscreenTranscript.setPrimary(false);
+			this.planInspector.setFullscreenActive(this.ui.mode === "fullscreen");
 			this.ui.setFocus(this.planInspector);
 		}
 		this.ui.requestRender();
+		return true;
 	}
 
 	private focusConversation(): void {
+		this.fullscreenTranscript.setPrimary(true);
 		this.ui.setFocus(this.getConversationFocusTarget());
 		this.planPaneReturnFocus = undefined;
 		this.ui.requestRender();
@@ -4762,23 +5010,30 @@ export class InteractiveMode {
 			else this.focusPlanInspector();
 			return;
 		}
-		if (this.planDetails) {
-			this.closePlanDetails();
-		} else if (this.session.planningState.plan) {
-			this.showPlanDetails();
-		}
+		if (this.planDetails) this.closePlanDetails();
+		else if (this.session.planningState.plan) this.showPlanDetails();
 	}
 
 	private handlePlanSplitChange(split: boolean, preserveScrollback: boolean): void {
-		if (preserveScrollback) this.ui.resetViewportOnNextRender();
+		if (preserveScrollback && this.renderer instanceof TuiMainScreen) {
+			this.renderer.resetViewportOnNextRender();
+		}
+		this.planInspector.setFullscreenActive(split && this.ui.mode === "fullscreen");
 		if (split) {
 			const hadPlanDetails = this.planDetails !== undefined;
 			if (hadPlanDetails) this.closePlanDetails({ focusConversation: false });
 			if (hadPlanDetails || this.session.planningState.plan?.phase === "ready") this.focusPlanInspector();
 			return;
 		}
+		this.fullscreenTranscript.setPrimary(true);
 		if (this.planInspector.focused) this.focusConversation();
-		if (this.session.planningState.plan?.phase === "ready" && !this.planDetails) this.showPlanDetails();
+		if (
+			this.session.planningState.plan?.phase === "ready" &&
+			!this.planDetails &&
+			this.activeView === this.conversationView
+		) {
+			this.showPlanDetails();
+		}
 	}
 
 	private async handlePlanDetailsAction(action: PlanDetailsAction): Promise<void> {
@@ -4903,8 +5158,8 @@ export class InteractiveMode {
 			// Write current content to temp file
 			writePrivateNewFileSync(tmpFile, currentText);
 
-			// Stop TUI to release terminal
-			this.ui.stop();
+			// Stop TUI to release terminal without printing a fullscreen transcript.
+			this.ui.stop({ preserveScreen: this.ui.mode === "fullscreen" });
 			tuiStopped = true;
 
 			// Split by space to support editor arguments (e.g., "code --wait")
@@ -5098,7 +5353,9 @@ export class InteractiveMode {
 			throw error;
 		} finally {
 			if (options?.abortSource) {
-				this.agent.abort(options.abortSource);
+				void this.session.abort(options.abortSource).catch((error: unknown) => {
+					this.showError(`Failed to abort the active run: ${String(error)}`);
+				});
 			}
 		}
 		return this.putQueuedTextInEditor([...queues.steering, ...queues.followUp], options?.currentText);
@@ -5235,6 +5492,104 @@ export class InteractiveMode {
 	}
 
 	// =========================================================================
+	// Renderer-aware view composition
+	// =========================================================================
+
+	private createDedicatedView(component: Component): ActiveViewDescriptor {
+		return {
+			regularComponents: [component],
+			fullscreenRoot: new VStack([{ component, grow: 1, shrink: 1, minSize: 0 }]),
+		};
+	}
+
+	private stopInteractiveTui(fullscreenExitOutput: "transcript" | "resume-hint"): void {
+		if (this.renderer.mode === "fullscreen" && fullscreenExitOutput === "transcript") {
+			while (this.renderer.hasOverlayEntries) this.renderer.hideOverlay();
+			this.switchTuiMode("regular", false, false);
+			this.activateView(this.conversationView, null, false);
+			const suspension = this.sessionRenderSuspension;
+			this.sessionRenderSuspension = undefined;
+			suspension?.release();
+			this.renderer.renderNow();
+		}
+		this.ui.stop({ preserveScreen: this.renderer.mode === "fullscreen" });
+	}
+
+	private switchTuiMode(mode: TuiMode, restoreProgress = true, startRenderer = true): boolean {
+		const previousUi = this.renderer;
+		if (mode === previousUi.mode) return true;
+		if (previousUi.hasOverlayEntries) return false;
+
+		const focus = previousUi.getFocusedComponent();
+		const terminal = previousUi.terminal;
+		const showHardwareCursor = previousUi.getShowHardwareCursor();
+		const clearOnShrink = previousUi.getClearOnShrink();
+		const onDebug = previousUi.onDebug;
+		if (previousUi instanceof TuiMainScreen) {
+			this.mainScreenRenderState = previousUi.captureRenderState();
+		}
+
+		const previousSuspension = this.sessionRenderSuspension;
+		previousUi.stop({ preserveScreen: true });
+		previousUi.setFocus(null);
+		previousUi.clear();
+		if (isViewportTUI(previousUi)) previousUi.setLayoutRoot(undefined);
+
+		const nextUi = createInteractiveTui({
+			tuiMode: mode,
+			showHardwareCursor,
+			logDirectory: getAgentDir(),
+			terminal,
+			onRightClickPaste: this.onRightClickPaste,
+		});
+		nextUi.setClearOnShrink(clearOnShrink);
+		nextUi.onDebug = onDebug;
+		if (nextUi instanceof TuiMainScreen && this.mainScreenRenderState) {
+			nextUi.restoreRenderState(this.mainScreenRenderState);
+		}
+		const nextSuspension = previousSuspension ? nextUi.suspendRendering() : undefined;
+
+		this.renderer = nextUi;
+		this.options.tuiMode = mode;
+		this.activateView(this.activeView, focus, false);
+		nextUi.invalidate();
+		if (startRenderer) nextUi.start();
+		this.setupPlanPaneInputRouting();
+		this.rebindExtensionTerminalInputListeners();
+		if (
+			startRenderer &&
+			restoreProgress &&
+			this.settingsManager.getShowTerminalProgress() &&
+			(this.session.isStreaming || this.session.isCompacting)
+		) {
+			terminal.setProgress(true);
+		}
+
+		if (previousSuspension) {
+			this.sessionRenderSuspension = nextSuspension;
+			previousSuspension.release();
+		}
+		return true;
+	}
+
+	private activateView(view: ActiveViewDescriptor, focus: Component | null, forceRender = true): void {
+		this.ui.clear();
+		for (const component of view.regularComponents) this.ui.addChild(component);
+		if (isViewportTUI(this.ui)) this.ui.setLayoutRoot(view.fullscreenRoot);
+		this.activeView = view;
+		const split =
+			view === this.conversationView &&
+			this.mainView?.isSplit(this.ui.terminal.columns, this.ui.terminal.rows) === true;
+		this.planInspector?.setFullscreenActive(split && this.ui.mode === "fullscreen");
+		this.planDetails?.setFullscreenActive(view === this.conversationView && !split && this.ui.mode === "fullscreen");
+		if (view === this.conversationView && this.fullscreenTranscript) {
+			this.fullscreenTranscript.setPrimary(focus !== this.planInspector && this.planDetails === undefined);
+		}
+		this.ui.setFocus(focus);
+		this.ui.requestRender(forceRender);
+	}
+
+	// =========================================================================
 	// Selectors
 	// =========================================================================
 
@@ -5247,7 +5602,8 @@ export class InteractiveMode {
 		create: (done: () => void) => { component: Component; focus: Component; dispose?: () => void },
 	): void {
 		this.dismissSubagentInspector?.();
-		const mainComponents = this.getMainViewComponents();
+		const previousView = this.activeView;
+		const previousFocus = this.ui.getFocusedComponent();
 		let component: Component | undefined;
 		let dispose: (() => void) | undefined;
 		let closed = false;
@@ -5256,13 +5612,9 @@ export class InteractiveMode {
 			closed = true;
 			dispose?.();
 			if (!component) return;
-			this.ui.removeChild(component);
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.editor);
-			for (const mainComponent of mainComponents) this.ui.addChild(mainComponent);
-			this.mainViewVisible = true;
-			this.ui.setFocus(this.editor);
-			this.ui.requestRender(true);
+			this.activateView(previousView, previousFocus ?? this.editor);
 		};
 		const created = create(done);
 		component = created.component;
@@ -5271,15 +5623,7 @@ export class InteractiveMode {
 			dispose?.();
 			return;
 		}
-		this.mainViewVisible = false;
-		for (const mainComponent of mainComponents) this.ui.removeChild(mainComponent);
-		this.ui.addChild(component);
-		this.ui.setFocus(created.focus);
-		this.ui.requestRender(true);
-	}
-
-	private getMainViewComponents(): Component[] {
-		return [this.mainView];
+		this.activateView(this.createDedicatedView(component), created.focus);
 	}
 
 	private showSubagentInspector(): void {
@@ -5289,18 +5633,16 @@ export class InteractiveMode {
 			return;
 		}
 
+		const previousView = this.activeView;
+		const previousFocus = this.ui.getFocusedComponent();
 		let closed = false;
 		let view: SubagentInspectorComponent;
 		const close = () => {
 			if (closed) return;
 			closed = true;
 			view.dispose();
-			this.ui.removeChild(view);
-			for (const component of this.getMainViewComponents()) this.ui.addChild(component);
-			this.mainViewVisible = true;
-			this.ui.setFocus(this.editor);
+			this.activateView(previousView, previousFocus ?? this.editor);
 			if (this.dismissSubagentInspector === close) this.dismissSubagentInspector = undefined;
-			this.ui.requestRender(true);
 		};
 		view = new SubagentInspectorComponent(
 			{
@@ -5311,12 +5653,8 @@ export class InteractiveMode {
 			close,
 		);
 
-		this.mainViewVisible = false;
-		for (const component of this.getMainViewComponents()) this.ui.removeChild(component);
-		this.ui.addChild(view);
-		this.ui.setFocus(view);
+		this.activateView(this.createDedicatedView(view), view);
 		this.dismissSubagentInspector = close;
-		this.ui.requestRender(true);
 	}
 
 	private showRemoteControlCenter(): void {
@@ -5371,6 +5709,9 @@ export class InteractiveMode {
 					clearOnShrink: this.settingsManager.getClearOnShrink(),
 					showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
 					turnDoneAlert: this.settingsManager.getTurnDoneAlert(),
+					tuiMode: this.ui.mode,
+					fullscreenExitOutput: this.settingsManager.getFullscreenExitOutput(),
+					fullscreenScrollbar: this.settingsManager.getFullscreenScrollbar(),
 					warnings: this.settingsManager.getWarnings(),
 				},
 				{
@@ -5416,7 +5757,7 @@ export class InteractiveMode {
 					},
 					onTransportChange: (transport) => {
 						this.settingsManager.setTransport(transport);
-						this.session.agent.transport = transport;
+						this.session.setTransport(transport);
 					},
 					onHttpIdleTimeoutMsChange: (timeoutMs) => {
 						this.settingsManager.setHttpIdleTimeoutMs(timeoutMs);
@@ -5504,6 +5845,22 @@ export class InteractiveMode {
 					},
 					onTurnDoneAlertChange: (mode) => {
 						this.settingsManager.setTurnDoneAlert(mode);
+					},
+					onTuiModeChange: (mode) => {
+						if (!this.switchTuiMode(mode)) {
+							selector.getSettingsList().updateValue("tui-mode", this.ui.mode);
+							this.showStatus("Close active overlays before changing TUI mode");
+							return;
+						}
+						this.settingsManager.setTuiMode(mode);
+						this.showStatus(`TUI mode: ${mode}`);
+					},
+					onFullscreenExitOutputChange: (output) => {
+						this.settingsManager.setFullscreenExitOutput(output);
+					},
+					onFullscreenScrollbarChange: (mode) => {
+						this.settingsManager.setFullscreenScrollbar(mode);
+						this.applyFullscreenScrollbarSetting(mode);
 					},
 					onWarningsChange: (warnings) => {
 						this.settingsManager.setWarnings(warnings);
@@ -6136,14 +6493,14 @@ export class InteractiveMode {
 		}
 	}
 
-	private applyProfileDefaultThinkingLevel(thinkingLevelOverride?: ThinkingLevel): boolean {
+	private async applyProfileDefaultThinkingLevel(thinkingLevelOverride?: ThinkingLevel): Promise<boolean> {
 		const defaultThinkingLevel = thinkingLevelOverride ?? this.settingsManager.getDefaultThinkingLevel();
 		if (defaultThinkingLevel === undefined) {
 			return false;
 		}
 
 		const previousThinkingLevel = this.session.thinkingLevel;
-		this.session.setThinkingLevel(defaultThinkingLevel, { persistDefault: false });
+		await this.session.setThinkingLevel(defaultThinkingLevel, { persistDefault: false });
 		return this.session.thinkingLevel !== previousThinkingLevel;
 	}
 
@@ -6164,7 +6521,7 @@ export class InteractiveMode {
 				}
 				try {
 					await this.session.setModel(selectedScopedModel.model, { persistDefault: false });
-					this.applyProfileDefaultThinkingLevel(selectedScopedModel.thinkingLevel);
+					await this.applyProfileDefaultThinkingLevel(selectedScopedModel.thinkingLevel);
 					this.footer.invalidate();
 					this.updateEditorBorderColor();
 					void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedScopedModel.model);
@@ -6176,7 +6533,7 @@ export class InteractiveMode {
 				}
 				return;
 			}
-			if (this.applyProfileDefaultThinkingLevel(selectedScopedModel?.thinkingLevel)) {
+			if (await this.applyProfileDefaultThinkingLevel(selectedScopedModel?.thinkingLevel)) {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 			}
@@ -6201,7 +6558,7 @@ export class InteractiveMode {
 		const selectedThinkingLevel = selectedScopedModel?.thinkingLevel;
 
 		if (modelsAreEqual(this.session.model, selectedModel)) {
-			if (this.applyProfileDefaultThinkingLevel(selectedThinkingLevel)) {
+			if (await this.applyProfileDefaultThinkingLevel(selectedThinkingLevel)) {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 			}
@@ -6216,7 +6573,7 @@ export class InteractiveMode {
 
 		try {
 			await this.session.setModel(selectedModel, { persistDefault: false });
-			this.applyProfileDefaultThinkingLevel(selectedThinkingLevel);
+			await this.applyProfileDefaultThinkingLevel(selectedThinkingLevel);
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
 			void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel);
@@ -7126,12 +7483,9 @@ export class InteractiveMode {
 	}
 
 	private showBedrockSetupDialog(providerId: string, providerName: string): void {
-		const restoreEditor = () => {
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.ui.setFocus(this.editor);
-			this.ui.requestRender();
-		};
+		const previousView = this.activeView;
+		const previousFocus = this.ui.getFocusedComponent();
+		const restoreEditor = () => this.activateView(previousView, previousFocus ?? this.editor);
 
 		const dialog = new LoginDialogComponent(
 			this.ui,
@@ -7147,14 +7501,13 @@ export class InteractiveMode {
 			theme.fg("accent", `  ${path.join(getDocsPath(), "providers.md")}`),
 		]);
 
-		this.editorContainer.clear();
-		this.editorContainer.addChild(dialog);
-		this.ui.setFocus(dialog);
-		this.ui.requestRender();
+		this.activateView(this.createDedicatedView(dialog), dialog);
 	}
 
 	private async showApiKeyLoginDialog(providerId: string, providerName: string): Promise<void> {
 		const previousModel = this.session.model;
+		const previousView = this.activeView;
+		const previousFocus = this.ui.getFocusedComponent();
 
 		const dialog = new LoginDialogComponent(
 			this.ui,
@@ -7165,17 +7518,9 @@ export class InteractiveMode {
 			providerName,
 		);
 
-		this.editorContainer.clear();
-		this.editorContainer.addChild(dialog);
-		this.ui.setFocus(dialog);
-		this.ui.requestRender();
+		this.activateView(this.createDedicatedView(dialog), dialog);
 
-		const restoreEditor = () => {
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.ui.setFocus(this.editor);
-			this.ui.requestRender();
-		};
+		const restoreEditor = () => this.activateView(previousView, previousFocus ?? this.editor);
 
 		try {
 			const apiKey = (await dialog.showPrompt("Enter API key:")).trim();
@@ -7198,12 +7543,9 @@ export class InteractiveMode {
 
 	private showOAuthLoginSelect(dialog: LoginDialogComponent, prompt: OAuthSelectPrompt): Promise<string | undefined> {
 		return new Promise((resolve) => {
-			const restoreDialog = () => {
-				this.editorContainer.clear();
-				this.editorContainer.addChild(dialog);
-				this.ui.setFocus(dialog);
-				this.ui.requestRender();
-			};
+			const previousView = this.activeView;
+			const previousFocus = this.ui.getFocusedComponent();
+			const restoreDialog = () => this.activateView(previousView, previousFocus ?? dialog);
 			const labels = prompt.options.map((option) => option.label);
 			const selector = new ExtensionSelectorComponent(
 				prompt.message,
@@ -7217,14 +7559,13 @@ export class InteractiveMode {
 					resolve(undefined);
 				},
 			);
-			this.editorContainer.clear();
-			this.editorContainer.addChild(selector);
-			this.ui.setFocus(selector);
-			this.ui.requestRender();
+			this.activateView(this.createDedicatedView(selector), selector);
 		});
 	}
 
 	private async showLoginDialog(providerId: string, providerName: string): Promise<void> {
+		const previousView = this.activeView;
+		const previousFocus = this.ui.getFocusedComponent();
 		const providerInfo = this.session.modelRegistry.authStorage
 			.getOAuthProviders()
 			.find((provider) => provider.id === providerId);
@@ -7243,11 +7584,7 @@ export class InteractiveMode {
 			providerName,
 		);
 
-		// Show dialog in editor container
-		this.editorContainer.clear();
-		this.editorContainer.addChild(dialog);
-		this.ui.setFocus(dialog);
-		this.ui.requestRender();
+		this.activateView(this.createDedicatedView(dialog), dialog);
 
 		// Promise for manual code input (racing with callback server)
 		let manualCodeResolve: ((code: string) => void) | undefined;
@@ -7257,13 +7594,8 @@ export class InteractiveMode {
 			manualCodeReject = reject;
 		});
 
-		// Restore editor helper
-		const restoreEditor = () => {
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.ui.setFocus(this.editor);
-			this.ui.requestRender();
-		};
+		// Restore the view that opened the login flow.
+		const restoreEditor = () => this.activateView(previousView, previousFocus ?? this.editor);
 
 		try {
 			await this.session.modelRegistry.authStorage.login(providerId as OAuthProviderId, {
@@ -7377,7 +7709,7 @@ export class InteractiveMode {
 		try {
 			await this.session.reload();
 			configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
-			this.session.agent.transport = this.settingsManager.getTransport();
+			this.session.setTransport(this.settingsManager.getTransport());
 			this.keybindings.reload();
 			const activeHeader = this.customHeader ?? this.builtInHeader;
 			if (isExpandable(activeHeader)) {
@@ -7401,6 +7733,7 @@ export class InteractiveMode {
 			}
 			this.ui.setShowHardwareCursor(this.settingsManager.getShowHardwareCursor());
 			this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
+			this.applyFullscreenScrollbarSetting();
 			this.setupAutocompleteProvider();
 			const runner = this.session.extensionRunner;
 			this.setupExtensionShortcuts(runner);
@@ -8228,7 +8561,12 @@ export class InteractiveMode {
 		const uncommittedLabel = "Uncommitted changes";
 		const prLabel = "GitHub pull request";
 		const commitLabel = "Specific commit";
+		const currentPullRequest = await probeCurrentBranchPullRequest(this.sessionManager.getCwd());
+		const currentPullRequestLabel = currentPullRequest
+			? `Current PR #${currentPullRequest.number} — ${currentPullRequest.title}`
+			: undefined;
 		const choice = await this.showExtensionSelector("Review what?", [
+			...(currentPullRequestLabel ? [currentPullRequestLabel] : []),
 			branchLabel,
 			uncommittedLabel,
 			prLabel,
@@ -8236,6 +8574,9 @@ export class InteractiveMode {
 		]);
 		if (choice === undefined) {
 			return undefined;
+		}
+		if (choice === currentPullRequestLabel && currentPullRequest) {
+			return { kind: "pr", number: String(currentPullRequest.number) };
 		}
 		if (choice === branchLabel) {
 			const base = await this.promptForReviewBaseBranch();
@@ -8322,29 +8663,23 @@ export class InteractiveMode {
 
 	private async showReviewToolsSelector(options: ReviewToolSelectorOption[]): Promise<string[] | undefined> {
 		return new Promise((resolve) => {
-			const restoreEditor = () => {
-				this.editorContainer.clear();
-				this.editorContainer.addChild(this.editor);
-				this.ui.setFocus(this.editor);
-				this.ui.requestRender();
-			};
+			const previousView = this.activeView;
+			const previousFocus = this.ui.getFocusedComponent();
+			const restoreView = () => this.activateView(previousView, previousFocus ?? this.editor);
 
 			const selector = new ReviewToolsSelectorComponent(
 				options,
 				(toolNames) => {
-					restoreEditor();
+					restoreView();
 					resolve(toolNames);
 				},
 				() => {
-					restoreEditor();
+					restoreView();
 					resolve(undefined);
 				},
 			);
 
-			this.editorContainer.clear();
-			this.editorContainer.addChild(selector);
-			this.ui.setFocus(selector);
-			this.ui.requestRender();
+			this.activateView(this.createDedicatedView(selector), selector);
 		});
 	}
 
@@ -8451,6 +8786,7 @@ export class InteractiveMode {
 		};
 
 		const cleanup = () => {
+			this.footer.setTransientUsage(undefined);
 			reviewRenderer.dispose();
 			loader.dispose();
 			this.editorContainer.clear();
@@ -8466,6 +8802,10 @@ export class InteractiveMode {
 				this.ui.requestRender();
 			},
 			onSessionEvent: reviewRenderer.onSessionEvent,
+			onUsage: (usage) => {
+				this.footer.setTransientUsage(usage);
+				this.ui.requestRender();
+			},
 			cleanup,
 		};
 	}
@@ -8837,7 +9177,7 @@ export class InteractiveMode {
 		}
 	}
 
-	stop(): void {
+	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
 		this.clearTurnDoneAlertTimer();
 		this.stopWorkingElapsedTicker();
 		this.streamingRenderCoalescer?.dispose();
@@ -8859,7 +9199,7 @@ export class InteractiveMode {
 			this.unsubscribe();
 		}
 		if (this.isInitialized) {
-			this.ui.stop();
+			this.stopInteractiveTui(fullscreenExitOutput);
 			this.isInitialized = false;
 		}
 		this.session.closeLspTraceSync();

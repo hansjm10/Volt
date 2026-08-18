@@ -6,6 +6,14 @@ Extensions and custom tools can render custom TUI components for interactive use
 
 **Source:** [`@hansjm10/volt-tui`](../../tui)
 
+## Renderer and Layout Context
+
+Volt uses the main terminal buffer by default. This `regular` mode preserves terminal-owned native scrollback. Optional `fullscreen` mode uses the alternate terminal buffer, keeps the editor/status/footer dock fixed, and gives the transcript an application-owned scroll viewport. Extensions use the same `Component` and renderer-neutral `TUI` interfaces in both modes.
+
+`VStack`, `HStack`, and `ScrollView` expose constrained layout semantics only when mounted as the layout root of `TuiAltScreen`. In regular mode, components render as an ordinary unbounded document. In fullscreen mode, mouse-wheel input targets the deepest `ScrollView` under the pointer and can chain unused movement outward; keyboard viewport actions always target the `ScrollView` marked `primary`, independent of component keyboard focus. Multi-pane interfaces can call `scrollView.setPrimary(true)` as focus moves between panes.
+
+Library consumers must construct a concrete renderer: use `new TuiMainScreen(...)` for native scrollback or `new TuiAltScreen(...)` for an alternate-screen viewport. `TUI` is an interface and is not constructible. See the [`@hansjm10/volt-tui` README](../../tui/README.md) for renderer and constrained-layout examples.
+
 ## Component Interface
 
 All components implement:
@@ -257,7 +265,7 @@ md.setText("Updated markdown");
 
 ### Image
 
-Renders images in supported terminals (Kitty, iTerm2, Ghostty, WezTerm).
+Renders images through Kitty (Kitty, Ghostty, WezTerm), iTerm2, or negotiated Sixel in Windows Terminal 1.22+. Windows Terminal must report Sixel support through DA1; unsupported sessions render a text placeholder.
 
 ```typescript
 const image = new Image(
@@ -267,6 +275,8 @@ const image = new Image(
   { maxWidthCells: 80, maxHeightCells: 24 }
 );
 ```
+
+Sixel rendering requires PNG input and uses a deterministic adaptive palette of up to 256 colors without dithering. Volt's tool-result renderer converts supported JPEG, GIF, and BMP results to PNG before creating the component. In fullscreen mode, Kitty and Sixel images support vertical viewport cropping. Sixel does not have placement deletion, so changing or moving a Sixel image clears and repaints the viewport; text-only updates remain differential. iTerm2 images use placeholders in fullscreen but continue to render in regular mode. Sixel is disabled under tmux and GNU screen.
 
 ## Keyboard Input
 
@@ -416,7 +426,7 @@ renderResult(result, options, theme, context) {
 
 | Category | Colors |
 |----------|--------|
-| General | `text`, `accent`, `muted`, `dim` |
+| General | `text`, `accent`, `muted`, `dim`, `searchMatchText` |
 | Status | `success`, `error`, `warning` |
 | Borders | `border`, `borderAccent`, `borderMuted` |
 | Messages | `userMessageText`, `customMessageText`, `customMessageLabel` |
@@ -429,7 +439,7 @@ renderResult(result, options, theme, context) {
 
 **Background colors** (`theme.bg(color, text)`):
 
-`selectedBg`, `userMessageBg`, `customMessageBg`, `toolPendingBg`, `toolSuccessBg`, `toolErrorBg`
+`selectedBg`, `searchMatchBg`, `scrollbarThumb`, `userMessageBg`, `customMessageBg`, `toolPendingBg`, `toolSuccessBg`, `toolErrorBg`
 
 **For Markdown**, use `getMarkdownTheme()`:
 

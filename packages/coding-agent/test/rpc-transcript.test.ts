@@ -480,9 +480,11 @@ describe("RPC transcript projection", () => {
 	});
 
 	test("projects displayed review seed messages so remote clients can continue from findings", () => {
+		const privateMarker = "private-github-discussion-marker";
 		const session = SessionManager.inMemory("/workspace");
 		session.appendCustomMessageEntry("review", "Automated review result\n\nFindings:\n1. Fix the bug", true, {
 			findings: [{ title: "Fix the bug" }],
+			privateAnalysis: privateMarker,
 		});
 		session.appendCustomMessageEntry("review", "Hidden review context", false);
 		session.appendCustomMessageEntry("extension.note", "Displayed extension note", true);
@@ -495,6 +497,7 @@ describe("RPC transcript projection", () => {
 				text: "Automated review result\n\nFindings:\n1. Fix the bug",
 			}),
 		]);
+		expect(JSON.stringify(transcript)).not.toContain(privateMarker);
 		expect(JSON.stringify(transcript)).not.toContain("Hidden review context");
 		expect(JSON.stringify(transcript)).not.toContain("Displayed extension note");
 	});

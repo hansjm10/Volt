@@ -1,9 +1,27 @@
 import { constants as bufferConstants } from "buffer";
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "fs";
+import {
+	appendFileSync,
+	closeSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+	writeSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { findMostRecentSession, loadEntriesFromFile, SessionManager } from "../../src/core/session-manager.ts";
+
+async function commitPlanningState(manager: SessionManager, mode: "build" | "plan"): Promise<void> {
+	const projection = manager.issueCanonicalProjection();
+	await manager.commitCanonicalCommand({
+		guard: { kind: "exact", token: projection.token },
+		mutations: [{ kind: "append", entry: { type: "planning_state_change", planning: { mode, plan: null } } }],
+	});
+}
 
 describe("loadEntriesFromFile", () => {
 	let tempDir: string;
@@ -125,12 +143,7 @@ describe("loadEntriesFromFile", () => {
 		appendFileSync(sessionFile, "not-json\n");
 		const exactPreimage = readFileSync(sessionFile);
 
-		await expect(
-			manager.appendAtomically(
-				() => manager.appendPlanningState({ mode: "build", plan: null }),
-				() => {},
-			),
-		).rejects.toMatchObject({
+		await expect(commitPlanningState(manager, "build")).rejects.toMatchObject({
 			effect: "not_started",
 			authority: "reconciliation_required",
 			message: expect.stringContaining("malformed at committed line"),
@@ -155,12 +168,7 @@ describe("loadEntriesFromFile", () => {
 		const manager = SessionManager.open(sessionFile, tempDir);
 		const exactPreimage = readFileSync(sessionFile);
 
-		await expect(
-			manager.appendAtomically(
-				() => manager.appendPlanningState({ mode: "build", plan: null }),
-				() => {},
-			),
-		).rejects.toMatchObject({
+		await expect(commitPlanningState(manager, "build")).rejects.toMatchObject({
 			effect: "not_started",
 			authority: "available",
 			message: "Atomic append requires the current session schema",
@@ -176,10 +184,7 @@ describe("loadEntriesFromFile", () => {
 			'{"type":"session","version":5,"id":"atomic-complete","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}',
 		);
 		const complete = SessionManager.open(completeFile, tempDir);
-		await complete.appendAtomically(
-			() => complete.appendPlanningState({ mode: "build", plan: null }),
-			() => {},
-		);
+		await commitPlanningState(complete, "build");
 		expect(SessionManager.open(completeFile, tempDir).buildSessionContext().planning).toEqual({
 			mode: "build",
 			plan: null,
@@ -192,15 +197,83 @@ describe("loadEntriesFromFile", () => {
 				'{"type":"client_input_sta',
 		);
 		const torn = SessionManager.open(tornFile, tempDir);
-		await torn.appendAtomically(
-			() => torn.appendPlanningState({ mode: "build", plan: null }),
-			() => {},
-		);
+		await commitPlanningState(torn, "build");
 		expect(readFileSync(tornFile, "utf8")).not.toContain("client_input_sta");
 		expect(SessionManager.open(tornFile, tempDir).buildSessionContext().planning).toEqual({
 			mode: "build",
 			plan: null,
 		});
+	});
+
+	it("commits delivery receipts, messages, and planning as one verifiable transaction", async () => {
+		const manager = SessionManager.inMemory(tempDir);
+		manager.reserveClientInput("delivery-1", "prompt", { message: "hello" });
+		const planning = {
+			mode: "plan" as const,
+			plan: {
+				id: "plan-1",
+				revision: 1,
+				phase: "draft" as const,
+				steps: [{ id: "step-1", text: "Inspect", status: "pending" as const }],
+			},
+		};
+		const message = {
+			role: "user" as const,
+			content: "hello",
+			clientMessageId: "delivery-1",
+			timestamp: 1,
+		};
+
+		const identity = { deliveryId: "delivery", epoch: 2, attemptId: "attempt-1" };
+		const receipt = await manager.commitDelivery({ ...identity, messages: [message], planning });
+		const verified = manager.verifyDeliveryReceipt(receipt);
+
+		expect(manager.getClientInput("delivery-1")).toMatchObject({ state: "completed" });
+		expect(manager.buildSessionContext()).toMatchObject({ messages: [message], planning });
+		expect(verified).toMatchObject({
+			outcome: "committed",
+			...identity,
+			sessionId: manager.getSessionId(),
+			beforeLeafId: null,
+			afterLeafId: expect.any(String),
+			messages: [message],
+			clientMessageIds: ["delivery-1"],
+			planning,
+		});
+		if (verified?.outcome !== "committed") throw new Error("Expected committed delivery receipt");
+		expect(verified.entryIds).toHaveLength(3);
+		expect(manager.verifyDeliveryReceipt({ receiptId: receipt.receiptId })).toBeUndefined();
+
+		const noEffectReceipt = await manager.attestDeliveryNoEffect({
+			deliveryId: "delivery",
+			epoch: 2,
+			attemptId: "attempt-2",
+		});
+		expect(manager.verifyDeliveryReceipt(noEffectReceipt)).toMatchObject({
+			outcome: "no_effect",
+			deliveryId: "delivery",
+			epoch: 2,
+			attemptId: "attempt-2",
+			beforeLeafId: verified?.afterLeafId,
+			afterLeafId: verified?.afterLeafId,
+		});
+	});
+
+	it("attests a no-effect delivery without replacing the session file", async () => {
+		const manager = SessionManager.create(tempDir, tempDir);
+		manager.appendPlanningState({ mode: "build", plan: null });
+		await manager.flush();
+		const sessionFile = manager.getSessionFile()!;
+		const before = statSync(sessionFile);
+
+		const receipt = await manager.attestDeliveryNoEffect({
+			deliveryId: "no-effect",
+			epoch: 1,
+			attemptId: "attempt-1",
+		});
+
+		expect(manager.verifyDeliveryReceipt(receipt)?.outcome).toBe("no_effect");
+		expect(statSync(sessionFile).ino).toBe(before.ino);
 	});
 
 	it("durably normalizes complete and torn unterminated tails before appending", async () => {
@@ -474,5 +547,39 @@ describe("SessionManager.setSessionFile with invalid files", () => {
 			"Current session JSONL is malformed at committed line 1",
 		);
 		expect(readFileSync(corruptedFile, "utf8")).toBe(original);
+	});
+});
+
+describe("SessionManager durable leaf markers", () => {
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `session-leaf-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("restores non-summary navigation to an earlier entry and root", async () => {
+		const manager = SessionManager.create(tempDir, tempDir);
+		const firstId = manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
+		manager.appendMessage({ role: "user", content: "second", timestamp: 2 });
+		await manager.flush();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session path");
+
+		manager.branch(firstId);
+		await manager.flush();
+		let reopened = SessionManager.open(sessionFile, tempDir);
+		expect(reopened.getLeafId()).toBe(firstId);
+		expect(reopened.getEntries().map((entry) => entry.type)).toEqual(["message", "message"]);
+
+		reopened.resetLeaf();
+		await reopened.flush();
+		reopened = SessionManager.open(sessionFile, tempDir);
+		expect(reopened.getLeafId()).toBeNull();
+		expect(reopened.getBranch()).toEqual([]);
 	});
 });

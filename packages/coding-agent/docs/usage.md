@@ -99,7 +99,7 @@ See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 
 ## Code Review
 
-`/review` captures the selected change as an exact Git snapshot, then runs candidate discovery and independent verification in separate isolated contexts. Host-owned paged tools read only that snapshot. Optional auxiliary tools selected with `/review tools` run in a disposable checkout; mutable workspace `read`/`grep`/`find`/`ls`/edit tools are never used by a review.
+`/review` captures the selected change as an exact Git snapshot, then runs candidate discovery and independent verification in separate isolated contexts. Host-owned paged tools read only that snapshot. For PR runs with newly accepted findings, a third context-blind pass uses the verifier model to render code-derived finding prose from host-validated anchors; it receives immutable repository tools but no GitHub context or private discovery/verifier prose. Zero-new-finding and prior-only incremental runs skip that pass. Optional auxiliary tools selected with `/review tools` run in a disposable checkout for analysis only; mutable workspace `read`/`grep`/`find`/`ls`/edit tools are never used by a review. When `/review` opens the local target selector, Volt also makes a short best-effort GitHub lookup and puts `Current PR #N — title` first when the current branch has one unambiguous pull request; lookup failures silently leave the normal selector unchanged. Explicit review targets and RPC actions never perform or inherit this selector lookup.
 
 ```
 /review                                      # open a target selector
@@ -113,11 +113,13 @@ See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 /review uncommitted --include-optional       # opt in to P3 suggestions
 ```
 
-P0-P2 findings must have a changed-side anchor, concrete trigger and impact, and an independent verifier decision. P3 findings are disabled by default. Results are marked `incomplete` and have no correctness verdict when verification or in-scope hunk coverage is incomplete.
+For PR targets, Volt uses the host's `gh` credentials and network to capture the authoritative closing/manual-linked issues, PR issue comments, submitted review summaries, inline review threads and replies, and linked-issue comments. It does not infer links from arbitrary text or follow relationships recursively. GitHub text is capped at 32 KiB per field, capture is capped at 20 linked issues and 200 total discussion entries, and the rendered context is capped at 256 KiB. Truncation, limits, malformed responses, and ancillary API failures are recorded as capture limitations. PR identity or fetch failures are fatal before inference, and Volt rechecks the exact head OID after context capture; if it moved, retry the review.
 
-Review policy comes from user `REVIEW.md` in the Volt agent directory and hierarchical project `REVIEW.md`/`AGENTS.md` files read from the trusted base snapshot. Candidate changes cannot alter the active review policy.
+Both context-aware analysis passes must page the same host-captured context to completion. GitHub-authored text is untrusted evidence: it can establish intent or prior discussion, but cannot change review policy, direct tools, or support a retained finding without independently verified changed-code evidence. P0-P2 findings must have a changed-side anchor, concrete trigger and impact, and an independent verifier decision. P3 findings are disabled by default. Results are marked `incomplete` and have no correctness verdict when GitHub context capture or either analysis pass's context inspection is incomplete, or when verification or in-scope hunk coverage is incomplete. The presentation pass must inspect every accepted hunk but cannot change finding identity, anchor, severity, or status.
 
-Completed, incomplete, failed, and cancelled runs plus explicit finding outcomes are stored as bounded host-only records on the current session branch. Opening a fix session copies the durable run and can select findings by ID; it does not consume the original result. Publishing is explicit, PR-only, and refused if the PR head moved.
+Review policy comes from user `REVIEW.md` in the Volt agent directory and hierarchical project `REVIEW.md`/`AGENTS.md` files read from the trusted base snapshot. Candidate changes and GitHub discussion cannot alter the active review policy.
+
+Completed, incomplete, failed, and cancelled runs plus explicit finding outcomes are stored as bounded host-only records on the current session branch. Existing bounded PR identity includes its title and body, but newly captured linked-issue and discussion text and all free-form prose from context-aware model passes remain ephemeral. Volt declassifies only host-validated finding existence, anchors/evidence, identity, priority/status, and confidence rounded to one percent; durable finding prose comes from the context-blind pass, while summaries, incomplete copy, model-limitation counts, command-attempt counts, and persisted PR failures use host-generated text. Durable and RPC records retain only bounded capture counts/status/limitation codes and a content fingerprint for the captured context. A changed fingerprint forces a full incremental PR rerun. Opening a fix session copies the same public durable result and can select findings by ID; it does not consume the original result. Publishing uses that result, is explicit and PR-only, and is refused if the PR head moved.
 
 Set `reviewModel` to choose the discovery model. Set `reviewVerifierModel` to choose a separate verifier; it defaults to `reviewModel`, which defaults to the active session model. Example: `"anthropic/claude-opus-4-5"`.
 
@@ -443,11 +445,18 @@ volt --no-extensions -e ./my-extension.ts
 |--------|-------------|
 | `--system-prompt <text>` | Replace default prompt; context files and skills are still appended |
 | `--append-system-prompt <text>` | Append to system prompt |
+| `--tui-mode <mode>` | Interactive TUI mode: `regular` (default) or `fullscreen` |
 | `--verbose` | Force verbose startup |
 | `-a`, `--approve` | Trust project-local files for this run |
 | `-na`, `--no-approve` | Ignore project-local files for this run |
 | `-h`, `--help` | Show help |
 | `-v`, `--version` | Show version |
+
+In `regular` mode, Volt renders in the main terminal buffer and leaves scrolling to native terminal scrollback. In `fullscreen` mode, the transcript scrolls inside the terminal viewport while queued messages, working status, extension widgets, Plan status, editor, and footer remain fixed at the bottom. Mouse and trackpad input scroll the region under the pointer; keyboard viewport actions target the transcript.
+
+Inline images work in fullscreen terminals that support Kitty, including Kitty and Ghostty, and in Windows Terminal 1.22+ through negotiated Sixel. Volt enables Sixel only when Windows Terminal reports support, converts supported non-PNG tool images before rendering, and re-encodes visible image regions while scrolling. Because Sixel cannot delete individual placements, image changes and movement repaint the full viewport; text-only updates remain differential. Sixel is disabled under tmux and GNU screen. In iTerm2, fullscreen images render as text placeholders because its protocol cannot delete or crop placements during application-owned scrolling; regular mode continues to render them normally. See [Terminal setup](terminal-setup.md) for terminal-specific behavior.
+
+Set **TUI mode** in `/settings` to switch immediately and choose the default for future sessions. `--tui-mode` overrides that setting only for the current run. **Fullscreen scrollbar** controls transcript scrollbar visibility. **Fullscreen exit output** controls shutdown while fullscreen: `transcript` prints the final transcript before Volt's normal resume hint, while `resume-hint` restores the previous main-buffer screen without printing the transcript and leaves only the normal resume hint when one is available.
 
 ### File Arguments
 
@@ -507,6 +516,7 @@ volt --exclude-tools ask_question
 | `VOLT_SHARE_VIEWER_URL` | Base URL for `/share` command viewer links |
 | `VOLT_TELEMETRY` | Override install/update telemetry and provider attribution headers: `1`/`true`/`yes` or `0`/`false`/`no`. This does not disable update checks |
 | `VOLT_CACHE_RETENTION` | Set to `long` for extended prompt cache where supported |
+| `VOLT_TUI_ESC_TIMEOUT` | Milliseconds to wait for bytes following a lone Escape key; defaults to 10 locally and 100 over SSH |
 | `VISUAL`, `EDITOR` | External editor for Ctrl+G |
 
 ## Design Principles

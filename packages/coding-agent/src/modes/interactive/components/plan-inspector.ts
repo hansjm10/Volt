@@ -1,4 +1,13 @@
-import { type Component, type Focusable, getKeybindings, truncateToWidth, visibleWidth } from "@hansjm10/volt-tui";
+import {
+	type Component,
+	type Focusable,
+	getKeybindings,
+	ScrollView,
+	type ScrollViewScrollbar,
+	truncateToWidth,
+	VStack,
+	visibleWidth,
+} from "@hansjm10/volt-tui";
 import type { PlanningState, PlanStepStatus } from "../../../core/planning.ts";
 import { theme } from "../../../core/theme/runtime.ts";
 import { keyHint, keyText, rawKeyHint } from "./keybinding-hints.ts";
@@ -31,23 +40,41 @@ function fitSides(left: string, right: string, width: number): string {
 	return truncateToWidth(`${fittedLeft}${gap}${right}`, width, "");
 }
 
+class PlanInspectorSection implements Component {
+	private readonly renderSection: (width: number) => string[];
+
+	constructor(renderSection: (width: number) => string[]) {
+		this.renderSection = renderSection;
+	}
+
+	invalidate(): void {
+		// Theme styling is resolved during render.
+	}
+
+	render(width: number): string[] {
+		return this.renderSection(width);
+	}
+}
+
 /** Persistent, focusable rendering of canonical branch-local planning state. */
 export class PlanInspectorComponent implements Component, Focusable {
-	focused = false;
 	private planning: PlanningState;
 	private readonly onAction: (action: PlanDetailsAction) => void;
 	private readonly onReturnFocus: () => void;
 	private readonly onToggleFocus: () => void;
 	private readonly requestRender: () => void;
+	private readonly bodyScroll: ScrollView;
+	private readonly fullscreenLayout: VStack;
+	private _focused = false;
 	private actionIndex = 0;
-	private scrollOffset = 0;
-	private viewportRows = 1;
-	private lastPageSize = 1;
-	private lastMaxScroll = 0;
+	private regularViewportRows = 1;
+	private regularPageSize = 1;
 	private selectedActionVisible = false;
+	private fullscreenActive = false;
 
 	constructor(options: {
 		planning: PlanningState;
+		fullscreenScrollbar?: ScrollViewScrollbar;
 		onAction: (action: PlanDetailsAction) => void;
 		onReturnFocus: () => void;
 		onToggleFocus: () => void;
@@ -58,11 +85,35 @@ export class PlanInspectorComponent implements Component, Focusable {
 		this.onReturnFocus = options.onReturnFocus;
 		this.onToggleFocus = options.onToggleFocus;
 		this.requestRender = options.requestRender;
+
+		this.bodyScroll = new ScrollView(new PlanInspectorSection((width) => this.renderBody(width)), {
+			overscroll: "contain",
+			scrollbar: options.fullscreenScrollbar ?? "auto",
+			scrollbarStyle: (text) => theme.bg("scrollbarThumb", text),
+		});
+		this.fullscreenLayout = new VStack([
+			{ component: new PlanInspectorSection((width) => this.renderFullscreenHeader(width)), shrink: 1, minSize: 0 },
+			{ component: this.bodyScroll, basis: 0, grow: 1, shrink: 1, minSize: 0 },
+			{
+				component: new PlanInspectorSection((width) => this.renderFooter(width)),
+				shrink: 1,
+				minSize: 0,
+			},
+		]);
+	}
+
+	get focused(): boolean {
+		return this._focused;
+	}
+
+	set focused(focused: boolean) {
+		this._focused = focused;
+		this.bodyScroll.setPrimary(this.fullscreenActive && focused);
 	}
 
 	setPlanning(planning: PlanningState): void {
 		if (planning.plan?.id !== this.planning.plan?.id) {
-			this.scrollOffset = 0;
+			this.bodyScroll.scrollToStart();
 			this.actionIndex = 0;
 		}
 		this.planning = planning;
@@ -71,49 +122,48 @@ export class PlanInspectorComponent implements Component, Focusable {
 
 	setViewportRows(rows: number): void {
 		const nextRows = Math.max(0, rows);
-		if (nextRows !== this.viewportRows) this.selectedActionVisible = false;
-		this.viewportRows = nextRows;
+		if (nextRows !== this.regularViewportRows) this.selectedActionVisible = false;
+		this.regularViewportRows = nextRows;
+	}
+
+	setFullscreenActive(active: boolean): void {
+		this.fullscreenActive = active;
+		this.bodyScroll.setPrimary(active && this.focused);
+	}
+
+	setFullscreenScrollbar(scrollbar: ScrollViewScrollbar): void {
+		this.bodyScroll.setScrollbar(scrollbar);
+	}
+
+	getFullscreenLayout(): Component {
+		return this.fullscreenLayout;
 	}
 
 	invalidate(): void {
-		// Theme styling is resolved during render.
+		this.fullscreenLayout.invalidate();
 	}
 
 	render(width: number): string[] {
-		if (width <= 0 || this.viewportRows <= 0) {
+		if (width <= 0 || this.regularViewportRows <= 0) {
 			this.selectedActionVisible = false;
 			return [];
 		}
 
 		const body = this.renderBody(width);
 		const footer = this.renderFooter(width);
-		const headerRows = Math.min(2, this.viewportRows);
-		const footerRows = Math.min(footer.length, Math.max(0, this.viewportRows - headerRows - 1));
-		const pageSize = Math.max(1, this.viewportRows - headerRows - footerRows);
-		const maxScroll = Math.max(0, body.length - pageSize);
-		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScroll));
-		this.lastPageSize = pageSize;
-		this.lastMaxScroll = maxScroll;
-		const end = Math.min(body.length, this.scrollOffset + pageSize);
-		const page = body.slice(this.scrollOffset, end);
-		const plan = this.planning.plan;
-		const phase = plan ? planPhaseLabel(plan) : "DRAFT";
-		const marker = usesAsciiPlanMarkers() ? "PLAN" : "◆ PLAN";
-		const focus = this.focused
-			? theme.bold(theme.fg("accent", "FOCUSED"))
-			: theme.fg("dim", `${keyText("app.plan.togglePane")} focus`);
-		const header = [
-			fitSides(
-				theme.bold(theme.fg(plan?.phase === "ready" ? "warning" : "accent", `${marker} · ${phase}`)),
-				focus,
-				width,
-			),
-			this.renderMetadata(width, body.length, end),
-		].slice(0, headerRows);
+		const headerRows = Math.min(2, this.regularViewportRows);
+		const footerRows = Math.min(footer.length, Math.max(0, this.regularViewportRows - headerRows - 1));
+		const pageSize = Math.max(1, this.regularViewportRows - headerRows - footerRows);
+		this.regularPageSize = pageSize;
+		this.bodyScroll.updateLayout(body.length, pageSize, this.requestRender);
+		const end = Math.min(body.length, this.bodyScroll.scrollTop + pageSize);
+		const header = this.renderHeader(width, body.length, end).slice(0, headerRows);
+		const page = body.slice(this.bodyScroll.scrollTop, end);
 		const visibleFooter = this.selectVisibleFooter(footer, footerRows);
-		this.selectedActionVisible = plan?.phase === "ready" && visibleFooter.includes(footer[this.actionIndex] ?? "");
+		this.selectedActionVisible =
+			this.planning.plan?.phase === "ready" && visibleFooter.includes(footer[this.actionIndex] ?? "");
 		const padding = Array.from(
-			{ length: Math.max(0, this.viewportRows - header.length - page.length - visibleFooter.length) },
+			{ length: Math.max(0, this.regularViewportRows - header.length - page.length - visibleFooter.length) },
 			() => "",
 		);
 		return [...header, ...page, ...padding, ...visibleFooter].map((line) => truncateToWidth(line, width, ""));
@@ -143,25 +193,55 @@ export class PlanInspectorComponent implements Component, Focusable {
 				return;
 			}
 			if (kb.matches(data, "tui.select.confirm")) {
-				if (this.selectedActionVisible) this.onAction(READY_ACTIONS[this.actionIndex]!.action);
+				if (this.fullscreenActive || this.selectedActionVisible) {
+					this.onAction(READY_ACTIONS[this.actionIndex]!.action);
+				}
 				return;
 			}
 		}
 		if (kb.matches(data, "tui.select.up")) {
-			this.scrollBy(-1);
+			this.bodyScroll.scrollBy(-1);
 		} else if (kb.matches(data, "tui.select.down")) {
-			this.scrollBy(1);
+			this.bodyScroll.scrollBy(1);
 		} else if (kb.matches(data, "tui.editor.pageUp")) {
-			this.scrollBy(-this.lastPageSize);
+			this.bodyScroll.scrollBy(-this.getPageSize());
 		} else if (kb.matches(data, "tui.editor.pageDown")) {
-			this.scrollBy(this.lastPageSize);
+			this.bodyScroll.scrollBy(this.getPageSize());
 		}
+	}
+
+	private getPageSize(): number {
+		return Math.max(1, this.fullscreenActive ? this.bodyScroll.viewportHeight : this.regularPageSize);
+	}
+
+	private renderFullscreenHeader(width: number): string[] {
+		const bodyLength = this.renderBody(this.bodyScroll.getContentWidth(width)).length;
+		const end = Math.min(bodyLength, this.bodyScroll.scrollTop + this.bodyScroll.viewportHeight);
+		return this.renderHeader(width, bodyLength, end);
+	}
+
+	private renderHeader(width: number, bodyRows: number, end: number): string[] {
+		const plan = this.planning.plan;
+		const phase = plan ? planPhaseLabel(plan) : "DRAFT";
+		const marker = usesAsciiPlanMarkers() ? "PLAN" : "◆ PLAN";
+		const focus = this.focused
+			? theme.bold(theme.fg("accent", "FOCUSED"))
+			: theme.fg("dim", `${keyText("app.plan.togglePane")} focus`);
+		return [
+			fitSides(
+				theme.bold(theme.fg(plan?.phase === "ready" ? "warning" : "accent", `${marker} · ${phase}`)),
+				focus,
+				width,
+			),
+			this.renderMetadata(width, bodyRows, end),
+		];
 	}
 
 	private renderMetadata(width: number, bodyRows: number, end: number): string {
 		const plan = this.planning.plan;
 		const mode = this.planning.mode === "plan" ? "Plan mode" : "Build mode";
-		const position = bodyRows > this.lastPageSize ? ` · rows ${this.scrollOffset + 1}–${end}/${bodyRows}` : "";
+		const pageSize = this.getPageSize();
+		const position = bodyRows > pageSize ? ` · rows ${this.bodyScroll.scrollTop + 1}–${end}/${bodyRows}` : "";
 		if (!plan) return truncateToWidth(theme.fg("dim", ` ${mode}${position}`), width, "");
 		const progress = getPlanProgress(plan);
 		return truncateToWidth(
@@ -265,10 +345,5 @@ export class PlanInspectorComponent implements Component, Focusable {
 			),
 		);
 		return lines;
-	}
-
-	private scrollBy(delta: number): void {
-		this.scrollOffset = Math.max(0, Math.min(this.lastMaxScroll, this.scrollOffset + delta));
-		this.requestRender();
 	}
 }

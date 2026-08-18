@@ -2,7 +2,7 @@
  * TUI session selector for --resume flag
  */
 
-import { ProcessTerminal, setKeybindings, TUI } from "@hansjm10/volt-tui";
+import { ProcessTerminal, setKeybindings, TuiMainScreen } from "@hansjm10/volt-tui";
 import { KeybindingsManager } from "../core/keybindings.ts";
 import type { SessionInfo, SessionListProgress } from "../core/session-manager.ts";
 import { SessionSelectorComponent } from "../modes/interactive/components/session-selector.ts";
@@ -15,7 +15,7 @@ export async function selectSession(
 	allSessionsLoader: SessionsLoader,
 ): Promise<string | null> {
 	return new Promise((resolve) => {
-		const ui = new TUI(new ProcessTerminal());
+		const ui = new TuiMainScreen(new ProcessTerminal());
 		const keybindings = KeybindingsManager.create();
 		setKeybindings(keybindings);
 		let resolved = false;

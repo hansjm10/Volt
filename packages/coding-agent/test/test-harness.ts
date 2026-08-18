@@ -11,7 +11,6 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
-import { Agent } from "@hansjm10/volt-agent-core";
 import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
@@ -35,6 +34,7 @@ import type { Settings } from "../src/core/settings-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import type { SubagentToolManager } from "../src/core/tools/index.ts";
 import type { ExtensionFactory, ResourceLoader } from "../src/index.ts";
+import { createAgentSessionTestControl } from "./agent-session-test-control.ts";
 import {
 	type CreateTestExtensionsResultInput,
 	createTestExtensionsResult,
@@ -342,7 +342,7 @@ export interface HarnessOptions {
 
 export interface Harness {
 	session: AgentSession;
-	agent: Agent;
+	control: ReturnType<typeof createAgentSessionTestControl>;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
 	/** Faux stream function state (call count, captured contexts). */
@@ -373,20 +373,6 @@ function createHarnessWithResourceLoader(
 
 	const { streamFn, state: fauxState } = createFauxStreamFn(options.responses ?? ["ok"]);
 
-	const agent = new Agent({
-		getApiKey: () => "faux-key",
-		initialState: {
-			model,
-			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
-			tools: options.tools ?? [],
-		},
-		// Mirror production (sdk.ts): custom/bash messages convert to user
-		// messages for the provider instead of agent-core's default filtering,
-		// so faux contexts see what real models see.
-		convertToLlm,
-		streamFn,
-	});
-
 	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
 
@@ -399,13 +385,18 @@ function createHarnessWithResourceLoader(
 	const modelRegistry = ModelRegistry.create(authStorage, tempDir);
 
 	const session = new AgentSession({
-		agent,
 		sessionManager,
+		model,
+		thinkingLevel: "off",
+		streamFn,
+		convertToLlm,
 		settingsManager,
 		cwd: tempDir,
 		modelRegistry,
 		resourceLoader,
-		baseToolsOverride: options.baseToolsOverride,
+		baseToolsOverride:
+			options.baseToolsOverride ??
+			(options.tools === undefined ? undefined : Object.fromEntries(options.tools.map((tool) => [tool.name, tool]))),
 		subagentToolManager: options.subagentToolManager,
 	});
 
@@ -423,7 +414,7 @@ function createHarnessWithResourceLoader(
 
 	return {
 		session,
-		agent,
+		control: createAgentSessionTestControl(session),
 		sessionManager,
 		settingsManager,
 		faux: fauxState,
@@ -442,12 +433,20 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	}
 
 	const tempDir = createTempDir();
-	return createHarnessWithResourceLoader(options, options.resourceLoader ?? createTestResourceLoader(), tempDir);
+	const resourceLoader =
+		options.resourceLoader ??
+		createTestResourceLoader({ systemPrompt: options.systemPrompt ?? "You are a test assistant." });
+	return createHarnessWithResourceLoader(options, resourceLoader, tempDir);
 }
 
 export async function createHarnessWithExtensions(options: HarnessOptions = {}): Promise<Harness> {
 	const tempDir = createTempDir();
 	const extensionsResult = await createTestExtensionsResult(options.extensionFactories ?? [], tempDir);
-	const resourceLoader = options.resourceLoader ?? createTestResourceLoader({ extensionsResult });
+	const resourceLoader =
+		options.resourceLoader ??
+		createTestResourceLoader({
+			extensionsResult,
+			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
+		});
 	return createHarnessWithResourceLoader(options, resourceLoader, tempDir);
 }

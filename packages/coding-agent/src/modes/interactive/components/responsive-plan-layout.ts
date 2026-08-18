@@ -1,4 +1,4 @@
-import { type Component, Container, truncateToWidth, visibleWidth } from "@hansjm10/volt-tui";
+import { type Component, Container, HStack, truncateToWidth, VStack, visibleWidth } from "@hansjm10/volt-tui";
 import type { PlanningState } from "../../../core/planning.ts";
 import { theme } from "../../../core/theme/runtime.ts";
 import { usesAsciiPlanMarkers } from "./plan-content.ts";
@@ -11,6 +11,7 @@ export const PLAN_PANE_MAX_COLUMNS = 72;
 export const PLAN_PANE_MAX_RATIO = 0.4;
 export const CONVERSATION_PANE_MIN_COLUMNS = 80;
 export const PLAN_PANE_DIVIDER_COLUMNS = 1;
+const CONVERSATION_PANE_BASIS_COLUMNS = 108;
 const PANE_SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
 
 export interface ResponsivePlanDimensions {
@@ -56,6 +57,13 @@ function getImageBlocks(lines: readonly string[]): ImageBlock[] {
 			blocks.push({ start: index, end: Math.min(lines.length - 1, index + safeRows - 1) });
 			continue;
 		}
+		const sixelRows = /\x1b_pi:s=\d+,c=\d+,r=(\d+),/.exec(line)?.[1];
+		if (sixelRows !== undefined) {
+			const rows = Number(sixelRows);
+			const safeRows = Number.isSafeInteger(rows) && rows > 0 ? rows : 1;
+			blocks.push({ start: index, end: Math.min(lines.length - 1, index + safeRows - 1) });
+			continue;
+		}
 		if (line.includes("\x1b]1337;File=")) {
 			const prefix = line.slice(0, line.indexOf("\x1b]1337;File="));
 			const cursorUpMatches = [...prefix.matchAll(/\x1b\[(\d+)A/g)];
@@ -78,9 +86,7 @@ function protectedImageRows(lines: readonly string[]): Set<number> {
 function safeTailStart(lines: readonly string[], maximumRows: number, minimumStart = 0): number {
 	let start = Math.min(lines.length, Math.max(minimumStart, lines.length - Math.max(0, maximumRows)));
 	for (const block of getImageBlocks(lines)) {
-		if (start > block.start && start <= block.end) {
-			start = block.end + 1;
-		}
+		if (start > block.start && start <= block.end) start = block.end + 1;
 	}
 	return start;
 }
@@ -94,14 +100,31 @@ function fitLine(line: string, width: number): string {
 	return `${fitted}${" ".repeat(Math.max(0, width - visibleWidth(fitted)))}`;
 }
 
+class PlanPaneDivider implements Component {
+	private readonly getTerminalRows: () => number;
+
+	constructor(getTerminalRows: () => number) {
+		this.getTerminalRows = getTerminalRows;
+	}
+
+	invalidate(): void {
+		// Theme styling is resolved during render.
+	}
+
+	render(width: number): string[] {
+		if (width <= 0) return [];
+		const divider = theme.fg("border", usesAsciiPlanMarkers() ? "|" : "│");
+		return Array.from({ length: Math.max(1, this.getTerminalRows()) }, () => divider);
+	}
+}
+
 /**
- * Main interactive viewport. Compact terminals retain the legacy vertical flow;
- * wide terminals keep conversation controls and the canonical plan inspector in
- * the active viewport while leaving older conversation rows in scrollback.
+ * Renderer-aware interactive plan layout. Main-screen mode preserves native
+ * terminal scrollback; fullscreen mode uses constrained stacks and scroll views.
  */
 export class ResponsivePlanLayoutComponent extends Container {
 	private planning: PlanningState;
-	private footer: Component;
+	private readonly footer: Component;
 	private readonly transcriptComponents: readonly Component[];
 	private readonly controlComponents: readonly Component[];
 	private readonly compactComponents: readonly Component[];
@@ -109,6 +132,7 @@ export class ResponsivePlanLayoutComponent extends Container {
 	private readonly getTerminalRows: () => number;
 	private readonly requestViewportReset: () => void;
 	private readonly onSplitChange: (split: boolean, preserveScrollback: boolean) => void;
+	private readonly fullscreenRoot: VStack;
 	private lastSplit: boolean | undefined;
 	private lastWidth: number | undefined;
 	private lastRows: number | undefined;
@@ -121,6 +145,7 @@ export class ResponsivePlanLayoutComponent extends Container {
 		transcriptComponents: readonly Component[];
 		controlComponents: readonly Component[];
 		compactComponents: readonly Component[];
+		fullscreenConversation: Component;
 		inspector: PlanInspectorComponent;
 		footer: Component;
 		getTerminalRows: () => number;
@@ -137,20 +162,67 @@ export class ResponsivePlanLayoutComponent extends Container {
 		this.getTerminalRows = options.getTerminalRows;
 		this.requestViewportReset = options.requestViewportReset;
 		this.onSplitChange = options.onSplitChange;
-		this.rebuildChildren();
+
+		const fullscreenSplit = new HStack([
+			{
+				component: options.fullscreenConversation,
+				basis: CONVERSATION_PANE_BASIS_COLUMNS,
+				grow: 1,
+				shrink: 1,
+				minSize: CONVERSATION_PANE_MIN_COLUMNS,
+			},
+			{
+				component: new PlanPaneDivider(options.getTerminalRows),
+				basis: PLAN_PANE_DIVIDER_COLUMNS,
+				grow: 0,
+				shrink: 0,
+				minSize: PLAN_PANE_DIVIDER_COLUMNS,
+				maxSize: PLAN_PANE_DIVIDER_COLUMNS,
+			},
+			{
+				component: this.inspector.getFullscreenLayout(),
+				basis: PLAN_PANE_MAX_COLUMNS,
+				grow: 0,
+				shrink: 1,
+				minSize: PLAN_PANE_MIN_COLUMNS,
+				maxSize: PLAN_PANE_MAX_COLUMNS,
+			},
+		]);
+		const fullscreenBody = new VStack([
+			{
+				component: options.fullscreenConversation,
+				basis: 0,
+				grow: 1,
+				shrink: 1,
+				minSize: 0,
+				visible: (viewport) => !this.resolveFullscreenSplit(viewport.width, viewport.height),
+			},
+			{
+				component: fullscreenSplit,
+				basis: 0,
+				grow: 1,
+				shrink: 1,
+				minSize: 0,
+				visible: (viewport) => this.resolveFullscreenSplit(viewport.width, viewport.height),
+			},
+		]);
+		this.fullscreenRoot = new VStack([
+			{ component: fullscreenBody, basis: 0, grow: 1, shrink: 1, minSize: 0 },
+			{ component: this.footer, shrink: 1, minSize: 0 },
+		]);
+		this.children = [...new Set([...this.compactComponents, this.inspector, this.footer])];
 	}
 
 	setPlanning(planning: PlanningState): void {
 		this.planning = planning;
 	}
 
-	setFooter(footer: Component): void {
-		this.footer = footer;
-		this.rebuildChildren();
-	}
-
 	isSplit(width: number, rows = this.getTerminalRows()): boolean {
 		return getResponsivePlanDimensions(width, rows, this.planning) !== undefined;
+	}
+
+	getFullscreenLayout(): Component {
+		return this.fullscreenRoot;
 	}
 
 	override render(width: number): string[] {
@@ -159,10 +231,7 @@ export class ResponsivePlanLayoutComponent extends Container {
 		const dimensions = getResponsivePlanDimensions(width, rows, this.planning);
 		const split = dimensions !== undefined;
 		const resetCommittedTranscript = this.lastSplit !== true || this.lastWidth !== width || this.lastRows !== rows;
-		if (this.lastSplit !== undefined && this.lastSplit !== split) {
-			this.onSplitChange(split, this.lastWidth === width);
-		}
-		this.lastSplit = split;
+		this.syncSplit(split, this.lastWidth === width);
 		this.lastWidth = width;
 		this.lastRows = rows;
 		const footerLines = this.footer.render(width);
@@ -217,16 +286,23 @@ export class ResponsivePlanLayoutComponent extends Container {
 			const right = inspectorLines[inspectorIndex++] ?? "";
 			return `${fitLine(line, dimensions.conversationColumns)}${PANE_SEGMENT_RESET}${divider}${fitLine(right, dimensions.planColumns)}`;
 		});
-		// Rows scrolled out of the active viewport become immutable terminal scrollback. The plan
-		// pane only ever exists in the viewport, so decorating them with a divider would strand a
-		// dangling column beside empty space forever. Emit them as plain conversation text instead.
 		const historicalLines = historicalTranscript.map((line, index) =>
 			protectedHistoricalRows.has(index) ? line : truncateToWidth(line, dimensions.conversationColumns, ""),
 		);
 		return [...historicalLines, ...visibleLines, ...footerLines];
 	}
 
-	private rebuildChildren(): void {
-		this.children = [...new Set([...this.compactComponents, this.inspector, this.footer])];
+	private resolveFullscreenSplit(width: number, rows: number): boolean {
+		const split = this.isSplit(width, rows);
+		this.syncSplit(split, false);
+		this.lastWidth = width;
+		this.lastRows = rows;
+		return split;
+	}
+
+	private syncSplit(split: boolean, preserveScrollback: boolean): void {
+		const previous = this.lastSplit;
+		this.lastSplit = split;
+		if (previous !== undefined && previous !== split) this.onSplitChange(split, preserveScrollback);
 	}
 }

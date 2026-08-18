@@ -1,17 +1,15 @@
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@hansjm10/volt-agent-core";
 import { fauxAssistantMessage, registerFauxProvider } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentSession } from "../../../src/core/agent-session.ts";
 import { AuthStorage } from "../../../src/core/auth-storage.ts";
-import { convertToLlm } from "../../../src/core/messages.ts";
 import { ModelRegistry } from "../../../src/core/model-registry.ts";
 import { SessionManager } from "../../../src/core/session-manager.ts";
 import { SettingsManager } from "../../../src/core/settings-manager.ts";
 import { initTheme } from "../../../src/core/theme/runtime.ts";
-import { createTestResourceLoader } from "../../utilities.ts";
+import { createTestAgentSessionRuntimeConfig, createTestResourceLoader } from "../../utilities.ts";
 
 describe("regression #5596: missing configured theme export", () => {
 	const cleanups: Array<() => void> = [];
@@ -53,17 +51,8 @@ describe("regression #5596: missing configured theme export", () => {
 
 		const settingsManager = SettingsManager.inMemory({ theme: "missing-theme" });
 		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
-		const agent = new Agent({
-			getApiKey: () => "faux-key",
-			initialState: {
-				model,
-				systemPrompt: "You are a test assistant.",
-				tools: [],
-			},
-			convertToLlm,
-		});
 		const session = new AgentSession({
-			agent,
+			...createTestAgentSessionRuntimeConfig({ model, apiKey: "faux-key" }),
 			sessionManager,
 			settingsManager,
 			cwd: tempDir,

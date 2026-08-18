@@ -1,5 +1,6 @@
 import { fauxAssistantMessage } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import type { BashOperations } from "../../../src/core/tools/bash.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -8,10 +9,6 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
 		resolve = promiseResolve;
 	});
 	return { promise, resolve };
-}
-
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
 }
 
 function persistedMessageRoles(harness: Harness): string[] {
@@ -24,127 +21,105 @@ describe("regression #214: reentrant session disposal", () => {
 	afterEach(async () => {
 		while (harnesses.length > 0) {
 			const harness = harnesses.pop()!;
-			await harness.session.dispose();
+			harness.session.dispose();
+			await harness.session.waitForClosed();
 			harness.cleanup();
 		}
 	});
 
-	it("fails fast when participant code joins disposal after an async hop, then permits an external join", async () => {
-		let harness!: Harness;
-		let capturedReceipt: Promise<void> | undefined;
-		const participantErrors: string[] = [];
-		let finallyCalls = 0;
-		harness = await createHarness({
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				participant: {
-					settle: async () => {
-						await Promise.resolve();
-						const receipt = harness.session.dispose("disposal");
-						capturedReceipt = receipt;
-						try {
-							await receipt;
-						} catch (error) {
-							participantErrors.push(errorMessage(error));
-						}
-						await receipt.catch((error) => {
-							participantErrors.push(errorMessage(error));
-						});
-						await receipt
-							.finally(() => {
-								finallyCalls++;
-							})
-							.catch((error) => {
-								participantErrors.push(errorMessage(error));
-							});
-						return { outcome: "committed" };
-					},
-				},
-			}),
-		});
+	it("installs a synchronous fence and exposes a stable external close join", async () => {
+		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("must remain unused")]);
 
-		await harness.session.prompt("dispose after an async participant hop");
-		const receipt = capturedReceipt;
-		if (!receipt) throw new Error("Participant did not capture the disposal receipt");
-		await receipt;
-
-		expect(participantErrors).toHaveLength(3);
-		for (const message of participantErrors) {
-			expect(message).toContain('context.requestAbort("disposal")');
-			expect(message).toContain("return the participant outcome");
-			expect(message).toContain("await disposal after the Agent run settles");
-		}
-		expect(finallyCalls).toBe(1);
+		expect(harness.session.dispose()).toBeUndefined();
+		const closed = harness.session.waitForClosed();
+		harness.session.dispose();
+		expect(harness.session.waitForClosed()).toBe(closed);
+		await closed;
+		await expect(harness.session.prompt("too late")).rejects.toThrow("disposed");
 	});
 
-	it("allows ignored reentrant disposal while preserving committed-message-before-abort ordering", async () => {
-		let harness!: Harness;
-		harness = await createHarness({
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				participant: {
-					settle: () => {
-						void harness.session.dispose("disposal");
-						return { outcome: "committed" };
-					},
-				},
-			}),
-		});
+	it("allows a provider callback to request close without joining its own run", async () => {
+		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("must remain unused")]);
+		let closed: Promise<void> | undefined;
+		harness.setResponses([
+			() => {
+				harness.session.dispose("disposal");
+				closed = harness.session.waitForClosed();
+				return fauxAssistantMessage("must remain unused");
+			},
+		]);
 
-		await harness.session.prompt("commit before ignored disposal", {
-			clientMessageId: "issue-214-ignored-disposal",
+		await harness.session.prompt("commit before callback disposal", {
+			clientMessageId: "issue-214-fence-only-disposal",
 		});
-		await harness.session.dispose();
+		if (!closed) throw new Error("Provider callback did not request close");
+		await closed;
 
 		expect(persistedMessageRoles(harness)).toEqual(["user", "assistant"]);
 		expect(harness.sessionManager.buildSessionContext().messages[0]).toMatchObject({
 			role: "user",
-			clientMessageId: "issue-214-ignored-disposal",
-		});
-		expect(harness.sessionManager.buildSessionContext().messages[1]).toMatchObject({
-			role: "assistant",
-			stopReason: "aborted",
-			diagnostics: [expect.objectContaining({ type: "runtime_abort", details: { source: "disposal" } })],
+			clientMessageId: "issue-214-fence-only-disposal",
 		});
 	});
 
-	it("keeps external disposal pending until active participant settlement completes", async () => {
-		const settlementStarted = deferred();
-		const releaseSettlement = deferred();
-		const harness = await createHarness({
-			prepareDelivery: (delivery) => ({
-				messages: [...delivery.messages],
-				participant: {
-					settle: async () => {
-						settlementStarted.resolve();
-						await releaseSettlement.promise;
-						return { outcome: "committed" };
-					},
-				},
-			}),
-		});
+	it("keeps the external close join pending until an active provider request settles", async () => {
+		const responseStarted = deferred();
+		const releaseResponse = deferred();
+		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("must remain unused")]);
+		harness.setResponses([
+			async () => {
+				responseStarted.resolve();
+				await releaseResponse.promise;
+				return fauxAssistantMessage("late response");
+			},
+		]);
 
-		const prompt = harness.session.prompt("external disposal waits for settlement");
-		await settlementStarted.promise;
+		const prompt = harness.session.prompt("external disposal waits for provider settlement");
+		await responseStarted.promise;
+		harness.session.dispose("disposal");
 		let disposalSettled = false;
-		const disposal = harness.session.dispose("disposal").then(() => {
+		const closed = harness.session.waitForClosed().then(() => {
 			disposalSettled = true;
 		});
 		await Promise.resolve();
 
 		expect(disposalSettled).toBe(false);
-		expect(persistedMessageRoles(harness)).toEqual([]);
+		expect(persistedMessageRoles(harness)).toEqual(["user"]);
 
-		releaseSettlement.resolve();
-		await Promise.all([prompt, disposal]);
-
+		releaseResponse.resolve();
+		await Promise.all([prompt, closed]);
 		expect(disposalSettled).toBe(true);
 		expect(persistedMessageRoles(harness)).toEqual(["user", "assistant"]);
+	});
+
+	it("keeps the external close join pending until abort-ignoring bash work settles", async () => {
+		const bashStarted = deferred();
+		const releaseBash = deferred();
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const operations: BashOperations = {
+			exec: async () => {
+				bashStarted.resolve();
+				await releaseBash.promise;
+				return { exitCode: 0 };
+			},
+		};
+
+		const bash = harness.session.executeBash("ignored abort", undefined, { operations }).catch(() => undefined);
+		await bashStarted.promise;
+		harness.session.dispose();
+		let closed = false;
+		const close = harness.session.waitForClosed().then(() => {
+			closed = true;
+		});
+		await Promise.resolve();
+		expect(closed).toBe(false);
+
+		releaseBash.resolve();
+		await Promise.all([bash, close]);
+		expect(closed).toBe(true);
 	});
 });

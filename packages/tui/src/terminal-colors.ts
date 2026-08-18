@@ -4,6 +4,8 @@ export interface RgbColor {
 	b: number;
 }
 
+export type TerminalColorScheme = "dark" | "light";
+
 function hexToRgb(hex: string): RgbColor {
 	const normalized = hex.startsWith("#") ? hex.slice(1) : hex;
 	const r = parseInt(normalized.slice(0, 2), 16);
@@ -24,6 +26,7 @@ function parseOscHexChannel(channel: string): number | undefined {
 }
 
 const OSC11_BACKGROUND_COLOR_RESPONSE_PATTERN = /^\x1b\]11;([^\x07\x1b]*)(?:\x07|\x1b\\)$/i;
+const COLOR_SCHEME_REPORT_PATTERN = /^(?:\x1b\[\?997;(1|2)n)+$/;
 
 export function isOsc11BackgroundColorResponse(data: string): boolean {
 	return OSC11_BACKGROUND_COLOR_RESPONSE_PATTERN.test(data);
@@ -35,15 +38,12 @@ export function parseOsc11BackgroundColor(data: string): RgbColor | undefined {
 		return undefined;
 	}
 
-	const value = match[1];
-	if (value === undefined) {
-		return undefined;
-	}
-	const normalizedValue = value.trim();
-	if (normalizedValue.startsWith("#")) {
-		const hex = normalizedValue.slice(1);
+	const value = match[1]?.trim();
+	if (value === undefined) return undefined;
+	if (value.startsWith("#")) {
+		const hex = value.slice(1);
 		if (/^[0-9a-f]{6}$/i.test(hex)) {
-			return hexToRgb(normalizedValue);
+			return hexToRgb(value);
 		}
 		if (/^[0-9a-f]{12}$/i.test(hex)) {
 			const r = parseOscHexChannel(hex.slice(0, 4));
@@ -54,7 +54,7 @@ export function parseOsc11BackgroundColor(data: string): RgbColor | undefined {
 		return undefined;
 	}
 
-	const rgbValue = normalizedValue.replace(/^rgba?:/i, "");
+	const rgbValue = value.replace(/^rgba?:/i, "");
 	const [red, green, blue] = rgbValue.split("/");
 	if (red === undefined || green === undefined || blue === undefined) {
 		return undefined;
@@ -63,4 +63,12 @@ export function parseOsc11BackgroundColor(data: string): RgbColor | undefined {
 	const g = parseOscHexChannel(green);
 	const b = parseOscHexChannel(blue);
 	return r !== undefined && g !== undefined && b !== undefined ? { r, g, b } : undefined;
+}
+
+export function parseTerminalColorSchemeReport(data: string): TerminalColorScheme | undefined {
+	const match = data.match(COLOR_SCHEME_REPORT_PATTERN);
+	if (!match) {
+		return undefined;
+	}
+	return match[1] === "2" ? "light" : "dark";
 }

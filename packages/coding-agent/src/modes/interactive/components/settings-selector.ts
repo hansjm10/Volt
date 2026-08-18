@@ -3,6 +3,7 @@ import type { Transport } from "@hansjm10/volt-ai";
 import {
 	Container,
 	getCapabilities,
+	type ScrollViewScrollbar,
 	type SelectItem,
 	SelectList,
 	type SelectListLayoutOptions,
@@ -13,7 +14,13 @@ import {
 } from "@hansjm10/volt-tui";
 import { formatHttpIdleTimeoutMs, HTTP_IDLE_TIMEOUT_CHOICES } from "../../../core/http-dispatcher.ts";
 import type { Personality } from "../../../core/personality.ts";
-import type { DefaultProjectTrust, TurnDoneAlert, WarningSettings } from "../../../core/settings-manager.ts";
+import type {
+	DefaultProjectTrust,
+	FullscreenExitOutput,
+	TuiMode,
+	TurnDoneAlert,
+	WarningSettings,
+} from "../../../core/settings-manager.ts";
 import { getSelectListTheme, getSettingsListTheme, theme } from "../../../core/theme/runtime.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyDisplayText } from "./keybinding-hints.ts";
@@ -44,6 +51,19 @@ const DEFAULT_PROJECT_TRUST_BY_LABEL = new Map(
 );
 
 const SESSION_MODEL_LABEL = "session model";
+const CONTEXT_WARNING_TOKEN_PRESETS = [0, 250_000, 350_000, 500_000, 750_000] as const;
+
+function formatContextWarningTokens(tokens: number): string {
+	if (tokens === 0) return "off";
+	if (tokens % 1000 === 0) return `${tokens / 1000}k`;
+	return String(tokens);
+}
+
+function parseContextWarningTokens(value: string): number {
+	if (value === "off") return 0;
+	if (value.endsWith("k")) return Math.floor(Number(value.slice(0, -1)) * 1000);
+	return Math.floor(Number(value));
+}
 
 export interface SettingsConfig {
 	autoCompact: boolean;
@@ -77,6 +97,9 @@ export interface SettingsConfig {
 	clearOnShrink: boolean;
 	showTerminalProgress: boolean;
 	turnDoneAlert?: TurnDoneAlert;
+	tuiMode: TuiMode;
+	fullscreenExitOutput: FullscreenExitOutput;
+	fullscreenScrollbar: ScrollViewScrollbar;
 	warnings: WarningSettings;
 }
 
@@ -109,6 +132,9 @@ export interface SettingsCallbacks {
 	onClearOnShrinkChange: (enabled: boolean) => void;
 	onShowTerminalProgressChange: (enabled: boolean) => void;
 	onTurnDoneAlertChange?: (mode: TurnDoneAlert) => void;
+	onTuiModeChange: (mode: TuiMode) => void;
+	onFullscreenExitOutputChange: (output: FullscreenExitOutput) => void;
+	onFullscreenScrollbarChange: (mode: ScrollViewScrollbar) => void;
 	onWarningsChange: (warnings: WarningSettings) => void;
 	onCancel: () => void;
 }
@@ -124,6 +150,10 @@ class WarningSettingsSubmenu extends Container {
 		super();
 
 		this.state = { ...warnings };
+		const contextWarningTokens = this.state.contextTokens ?? 350_000;
+		const contextWarningChoices = [...new Set([...CONTEXT_WARNING_TOKEN_PRESETS, contextWarningTokens])]
+			.sort((a, b) => a - b)
+			.map(formatContextWarningTokens);
 
 		const items: SettingItem[] = [
 			{
@@ -132,6 +162,13 @@ class WarningSettingsSubmenu extends Container {
 				description: "Warn when Anthropic subscription auth may use paid extra usage",
 				currentValue: (this.state.anthropicExtraUsage ?? true) ? "true" : "false",
 				values: ["true", "false"],
+			},
+			{
+				id: "context-tokens",
+				label: "Context usage",
+				description: "Warn in the footer at this context token count. The default is 350k.",
+				currentValue: formatContextWarningTokens(contextWarningTokens),
+				values: contextWarningChoices,
 			},
 		];
 
@@ -143,6 +180,10 @@ class WarningSettingsSubmenu extends Container {
 				switch (id) {
 					case "anthropic-extra-usage":
 						this.state = { ...this.state, anthropicExtraUsage: newValue === "true" };
+						onChange({ ...this.state });
+						break;
+					case "context-tokens":
+						this.state = { ...this.state, contextTokens: parseContextWarningTokens(newValue) };
 						onChange({ ...this.state });
 						break;
 				}
@@ -395,6 +436,27 @@ export class SettingsSelectorComponent extends Container {
 					),
 			},
 			{
+				id: "tui-mode",
+				label: "TUI mode",
+				description: "Interface layout; regular uses native scrollback and fullscreen uses a fixed viewport",
+				currentValue: config.tuiMode,
+				values: ["regular", "fullscreen"],
+			},
+			{
+				id: "fullscreen-exit-output",
+				label: "Fullscreen exit output",
+				description: "Print the transcript or only a session resume hint when exiting fullscreen mode",
+				currentValue: config.fullscreenExitOutput,
+				values: ["transcript", "resume-hint"],
+			},
+			{
+				id: "fullscreen-scrollbar",
+				label: "Fullscreen scrollbar",
+				description: "Scrollbar behavior in fullscreen mode; has no effect in regular mode",
+				currentValue: config.fullscreenScrollbar,
+				values: ["auto", "always", "hidden"],
+			},
+			{
 				id: "theme",
 				label: "Theme",
 				description: "Color theme for the interface",
@@ -547,6 +609,9 @@ export class SettingsSelectorComponent extends Container {
 			transport: "Messages",
 			"http-idle-timeout": "Messages",
 			theme: "Interface",
+			"tui-mode": "Interface",
+			"fullscreen-exit-output": "Interface",
+			"fullscreen-scrollbar": "Interface",
 			"collapse-changelog": "Interface",
 			"quiet-startup": "Interface",
 			"double-escape-action": "Interface",
@@ -666,6 +731,15 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "turn-done-alert":
 						callbacks.onTurnDoneAlertChange?.(newValue as TurnDoneAlert);
+						break;
+					case "tui-mode":
+						callbacks.onTuiModeChange(newValue as TuiMode);
+						break;
+					case "fullscreen-exit-output":
+						callbacks.onFullscreenExitOutputChange(newValue as FullscreenExitOutput);
+						break;
+					case "fullscreen-scrollbar":
+						callbacks.onFullscreenScrollbarChange(newValue as ScrollViewScrollbar);
 						break;
 				}
 			},

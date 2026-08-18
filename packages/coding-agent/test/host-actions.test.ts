@@ -377,7 +377,7 @@ describe("HostActionRegistry", () => {
 		expect(descriptors.find((descriptor) => descriptor.id === REVIEW_PR_ACTION_ID)).toEqual(
 			expect.objectContaining({
 				label: "Review pull request",
-				description: expect.stringContaining("GitHub credentials and network"),
+				description: expect.stringMatching(/GitHub credentials and network.*linked issues.*inline review threads/),
 				category: "review",
 				presentation: expect.objectContaining({ kind: "card", group: "Review", priority: 80 }),
 				requiresConfirmation: true,
@@ -573,6 +573,14 @@ function createCompletedReviewResult(
 			diffCommand: "git diff HEAD",
 			readFile: async () => undefined,
 			listFiles: async () => [],
+			search: async () => ({
+				matches: [],
+				filesScanned: 0,
+				skippedPaths: [],
+				nextFileIndex: 0,
+				nextLineIndex: 0,
+				complete: true,
+			}),
 			materializeHead: async () => "/tmp/review",
 			dispose: async () => {},
 		},

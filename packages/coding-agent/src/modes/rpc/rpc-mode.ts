@@ -1090,7 +1090,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 					output(frame);
 				}
 			});
-			unsubscribeBackpressure = session.agent.subscribe(async () => {
+			unsubscribeBackpressure = session.subscribeRuntimeEvents(async () => {
 				try {
 					await waitForTransportBackpressure();
 				} catch (transportError: unknown) {

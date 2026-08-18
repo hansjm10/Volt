@@ -225,8 +225,13 @@ return traceOperation(
   "volt.agent.session.append_entry",
   { entryType: entry.type },
   async () => {
-    await this.unwrap(this.storage.appendEntry(entry));
-    return entry.id;
+    const snapshot = await this.storage.getBranchSnapshot();
+    const result = await this.storage.commitBatch({
+      guard: { kind: "descendant", cursor: snapshot.cursor },
+      mutations: [{ kind: "append", entry }],
+    });
+    if (result.outcome !== "committed") throw result.error;
+    return result.record.appendedEntryIds[0];
   },
 );
 ```

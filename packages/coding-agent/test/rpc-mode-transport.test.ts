@@ -34,9 +34,7 @@ function createRuntimeHost(): { runtimeHost: AgentSessionRuntime; dispose: Retur
 			bindExtensions: vi.fn(async () => {}),
 			sessionManager: { getClientInput: vi.fn(() => undefined) },
 			subscribe: vi.fn(() => () => {}),
-			agent: {
-				subscribe: vi.fn(() => () => {}),
-			},
+			subscribeRuntimeEvents: vi.fn(() => () => {}),
 		},
 		newSession: vi.fn(async () => ({ cancelled: true })),
 		switchSession: vi.fn(async () => ({ cancelled: true })),
@@ -57,12 +55,8 @@ interface RpcModeHarness {
 
 function createStateSession(sessionId: string, gitContext: RpcGitContext | null = null) {
 	return {
-		agent: {
-			state: {
-				pendingToolExecutions: new Map(),
-			},
-			subscribe: vi.fn(() => () => {}),
-		},
+		activeToolExecutions: new Map(),
+		subscribeRuntimeEvents: vi.fn(() => () => {}),
 		activeCompaction: undefined,
 		autoCompactionEnabled: true,
 		bindExtensions: vi.fn(async () => {}),
@@ -87,9 +81,7 @@ function createStateSession(sessionId: string, gitContext: RpcGitContext | null 
 
 function createPayloadValidationSession() {
 	return {
-		agent: {
-			subscribe: vi.fn(() => () => {}),
-		},
+		subscribeRuntimeEvents: vi.fn(() => () => {}),
 		bindExtensions: vi.fn(async () => {}),
 		executeBash: vi.fn(async () => ({ cancelled: false, exitCode: 0, output: "" })),
 		followUp: vi.fn(async () => {}),
@@ -198,9 +190,7 @@ describe("RPC mode caller-provided transports", () => {
 		const makeSession = (sessionId: string) => ({
 			bindExtensions: vi.fn(async () => {}),
 			subscribe: vi.fn(() => detachSession),
-			agent: {
-				subscribe: vi.fn(() => detachBackpressure),
-			},
+			subscribeRuntimeEvents: vi.fn(() => detachBackpressure),
 			sessionFile: `/sessions/${sessionId}.jsonl`,
 			sessionId,
 		});
@@ -662,9 +652,7 @@ describe("RPC mode caller-provided transports", () => {
 		const currentSession = {
 			bindExtensions: vi.fn(async () => {}),
 			subscribe: vi.fn(() => detachSession),
-			agent: {
-				subscribe: vi.fn(() => detachBackpressure),
-			},
+			subscribeRuntimeEvents: vi.fn(() => detachBackpressure),
 			sessionId: "session-1",
 			sessionFile: "/sessions/session-1.jsonl",
 			setHostInteraction: vi.fn((interaction: HostInteraction) => {
@@ -798,9 +786,7 @@ describe("RPC mode caller-provided transports", () => {
 		const currentSession = {
 			bindExtensions: vi.fn(async () => {}),
 			subscribe: vi.fn(() => detachSession),
-			agent: {
-				subscribe: vi.fn(() => detachBackpressure),
-			},
+			subscribeRuntimeEvents: vi.fn(() => detachBackpressure),
 			sessionId: "session-1",
 			sessionFile: "/sessions/session-1.jsonl",
 			setHostInteraction: vi.fn((interaction: HostInteraction) => {
@@ -977,9 +963,7 @@ describe("RPC mode caller-provided transports", () => {
 		const currentSession = {
 			bindExtensions: vi.fn(async () => {}),
 			subscribe: vi.fn(() => () => {}),
-			agent: {
-				subscribe: vi.fn(() => () => {}),
-			},
+			subscribeRuntimeEvents: vi.fn(() => () => {}),
 			sessionId: "session-1",
 			setHostInteraction: vi.fn((interaction: HostInteraction) => {
 				hostInteraction = interaction;
@@ -1108,9 +1092,7 @@ describe("RPC mode caller-provided transports", () => {
 			session: {
 				bindExtensions: vi.fn(async () => {}),
 				subscribe: vi.fn(() => () => {}),
-				agent: {
-					subscribe: vi.fn(() => () => {}),
-				},
+				subscribeRuntimeEvents: vi.fn(() => () => {}),
 				sessionId: "session-1",
 				setHostInteraction: vi.fn((interaction: HostInteraction) => {
 					hostInteraction = interaction;
@@ -1302,9 +1284,7 @@ describe("RPC mode caller-provided transports", () => {
 		const currentSession = {
 			bindExtensions: vi.fn(async () => {}),
 			subscribe: vi.fn(() => detachSession),
-			agent: {
-				subscribe: vi.fn(() => detachBackpressure),
-			},
+			subscribeRuntimeEvents: vi.fn(() => detachBackpressure),
 			sessionId: sessionManager.getSessionId(),
 			sessionManager,
 		};
@@ -1382,9 +1362,7 @@ describe("RPC mode caller-provided transports", () => {
 		const makeSession = (sessionId: string) => ({
 			bindExtensions: vi.fn(async () => {}),
 			subscribe: vi.fn(() => detachSession),
-			agent: {
-				subscribe: vi.fn(() => detachBackpressure),
-			},
+			subscribeRuntimeEvents: vi.fn(() => detachBackpressure),
 			sessionFile: `/sessions/${sessionId}.jsonl`,
 			sessionId,
 		});
@@ -1517,7 +1495,7 @@ describe("RPC mode caller-provided transports", () => {
 		expect(transportClose).toHaveBeenCalledOnce();
 	});
 
-	test("agent backpressure subscriber handles write failures by shutting down", async () => {
+	test("runtime-event backpressure subscriber handles write failures by shutting down", async () => {
 		let sessionEventHandler: ((event: object) => void) | undefined;
 		let backpressureHandler: (() => Promise<void> | void) | undefined;
 		const detachInput = vi.fn();
@@ -1542,12 +1520,10 @@ describe("RPC mode caller-provided transports", () => {
 					sessionEventHandler = handler;
 					return detachSession;
 				}),
-				agent: {
-					subscribe: vi.fn((handler: () => Promise<void> | void) => {
-						backpressureHandler = handler;
-						return detachBackpressure;
-					}),
-				},
+				subscribeRuntimeEvents: vi.fn((handler: () => Promise<void> | void) => {
+					backpressureHandler = handler;
+					return detachBackpressure;
+				}),
 			},
 			newSession: vi.fn(async () => ({ cancelled: true })),
 			switchSession: vi.fn(async () => ({ cancelled: true })),
@@ -1590,7 +1566,7 @@ describe("RPC mode caller-provided transports", () => {
 			close: transportClose,
 		};
 		const subscribe = vi.fn(() => () => {});
-		const agentSubscribe = vi.fn(() => () => {});
+		const runtimeEventSubscribe = vi.fn(() => () => {});
 		const dispose = vi.fn(async () => {});
 		const runtimeHost = {
 			session: {
@@ -1601,9 +1577,7 @@ describe("RPC mode caller-provided transports", () => {
 						}),
 				),
 				subscribe,
-				agent: {
-					subscribe: agentSubscribe,
-				},
+				subscribeRuntimeEvents: runtimeEventSubscribe,
 			},
 			newSession: vi.fn(async () => ({ cancelled: true })),
 			switchSession: vi.fn(async () => ({ cancelled: true })),
@@ -1625,7 +1599,7 @@ describe("RPC mode caller-provided transports", () => {
 
 		await expect(modePromise).rejects.toThrow("RPC transport closed during startup");
 		expect(subscribe).not.toHaveBeenCalled();
-		expect(agentSubscribe).not.toHaveBeenCalled();
+		expect(runtimeEventSubscribe).not.toHaveBeenCalled();
 		expect(detachInput).toHaveBeenCalledOnce();
 		expect(detachClose).toHaveBeenCalledOnce();
 		expect(transportClose).toHaveBeenCalledOnce();
@@ -1659,9 +1633,7 @@ describe("RPC mode caller-provided transports", () => {
 					throw startupError;
 				}),
 				subscribe: vi.fn(() => () => {}),
-				agent: {
-					subscribe: vi.fn(() => () => {}),
-				},
+				subscribeRuntimeEvents: vi.fn(() => () => {}),
 			},
 			newSession: vi.fn(async () => ({ cancelled: true })),
 			switchSession: vi.fn(async () => ({ cancelled: true })),
@@ -1698,9 +1670,7 @@ describe("RPC mode caller-provided transports", () => {
 			session: {
 				bindExtensions: vi.fn(async () => {}),
 				subscribe: vi.fn(() => detachSession),
-				agent: {
-					subscribe: vi.fn(() => detachBackpressure),
-				},
+				subscribeRuntimeEvents: vi.fn(() => detachBackpressure),
 			},
 			newSession: vi.fn(async () => ({ cancelled: true })),
 			switchSession: vi.fn(async () => ({ cancelled: true })),

@@ -1,4 +1,4 @@
-import { ProcessTerminal, setKeybindings, TUI } from "@hansjm10/volt-tui";
+import { ProcessTerminal, setKeybindings, type TUI, TuiMainScreen } from "@hansjm10/volt-tui";
 import { existsSync } from "fs";
 import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, getSettingsPath, PACKAGE_NAME } from "../config.ts";
 import { areExperimentalFeaturesEnabled } from "../core/experimental.ts";
@@ -33,7 +33,7 @@ function isOfficialDistribution({ packageName, appName, configDirName }: Distrib
 function createStartupTui(settingsManager: SettingsManager): TUI {
 	initTheme(settingsManager.getTheme());
 	setKeybindings(KeybindingsManager.create());
-	const ui = new TUI(new ProcessTerminal(), settingsManager.getShowHardwareCursor());
+	const ui = new TuiMainScreen(new ProcessTerminal(), settingsManager.getShowHardwareCursor());
 	ui.setClearOnShrink(settingsManager.getClearOnShrink());
 	return ui;
 }

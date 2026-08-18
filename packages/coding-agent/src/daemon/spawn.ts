@@ -10,6 +10,7 @@ import { type InvalidVoltdStateFile, inspectVoltdStateFiles } from "./state.ts";
 
 const SPAWN_HEALTH_TIMEOUT_MS = process.platform === "win32" ? 15_000 : 5_000;
 const SPAWN_HEALTH_POLL_MS = 100;
+const DAEMON_NODE_ARGS = ["--optimize-for-size"] as const;
 export const DAEMON_SHUTDOWN_TIMEOUT_MS = 75_000;
 const DAEMON_EXIT_POLL_MS = 200;
 
@@ -102,9 +103,9 @@ export function resolveDaemonCliInvocation(): { nodeArgs: string[]; entry: strin
 	const packageDir = getPackageDir();
 	const sourceEntry = join(packageDir, "src", "cli.ts");
 	if (existsSync(sourceEntry)) {
-		return { nodeArgs: ["--conditions", "volt-source"], entry: sourceEntry };
+		return { nodeArgs: [...DAEMON_NODE_ARGS, "--conditions", "volt-source"], entry: sourceEntry };
 	}
-	return { nodeArgs: [], entry: join(packageDir, "dist", "cli.js") };
+	return { nodeArgs: [...DAEMON_NODE_ARGS], entry: join(packageDir, "dist", "cli.js") };
 }
 
 export interface SpawnDaemonResult {

@@ -1,6 +1,6 @@
-import type { AssistantMessage, ImageContent, JsonValue, Model, TextContent, Usage } from "@hansjm10/volt-ai";
-import { completeSimple } from "@hansjm10/volt-ai";
-import type { AgentMessage, ThinkingLevel } from "../../types.ts";
+import type { AssistantMessage, ImageContent, JsonValue, Model, TextContent, Tool, Usage } from "@hansjm10/volt-ai";
+import { estimateToolDefinitionTokens, streamSimple } from "@hansjm10/volt-ai";
+import type { AgentMessage, StreamFn, ThinkingLevel } from "../../types.ts";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -163,12 +163,25 @@ function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; in
 	return undefined;
 }
 
-/** Estimate context tokens for messages using provider usage when available. */
-export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+/** Sum per-message token estimates, ignoring any stale provider usage. */
+export function estimateMessagesTokens(messages: AgentMessage[]): number {
+	let tokens = 0;
+	for (const message of messages) {
+		tokens += estimateTokens(message);
+	}
+	return tokens;
+}
+
+/**
+ * Estimate context tokens using provider usage when available. Provider usage
+ * already includes the request's tool definitions, so active tools are added
+ * only when no valid provider usage exists.
+ */
+export function estimateContextTokens(messages: AgentMessage[], tools?: readonly Tool[]): ContextUsageEstimate {
 	const usageInfo = getLastAssistantUsageInfo(messages);
 
 	if (!usageInfo) {
-		let estimated = 0;
+		let estimated = estimateToolDefinitionTokens(tools);
 		for (const message of messages) {
 			estimated += estimateTokens(message);
 		}
@@ -330,7 +343,7 @@ export interface CutPointResult {
 	isSplitTurn: boolean;
 }
 
-/** Find the compaction cut point that keeps approximately the requested recent-token budget. */
+/** Find the compaction cut point that keeps at most the requested recent-token budget. */
 export function findCutPoint(
 	entries: SessionTreeEntry[],
 	startIndex: number,
@@ -347,23 +360,25 @@ export function findCutPoint(
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry?.type !== "message") continue;
-		const messageTokens = estimateTokens(entry.message as AgentMessage);
-		accumulatedTokens += messageTokens;
-		if (accumulatedTokens >= keepRecentTokens) {
-			// Tool results are not valid cut points. If the budget lands in a trailing
-			// result batch, retain the assistant that issued it so compaction still
-			// advances while keeping the call and all of its results together.
-			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints.at(-1) ?? startIndex;
+		if (!entry) continue;
+		const message = getMessageFromEntryForCompaction(entry);
+		if (!message) continue;
+		const messageTokens = estimateTokens(message);
+		if (accumulatedTokens + messageTokens > keepRecentTokens) {
+			// Exclude the crossing message by cutting at the next valid boundary. If
+			// there is no later boundary, retain the newest valid suffix so compaction
+			// still advances without separating tool results from their assistant call.
+			cutIndex = cutPoints.find((candidate) => candidate > i) ?? cutPoints.at(-1) ?? startIndex;
 			break;
 		}
+		accumulatedTokens += messageTokens;
 	}
 	while (cutIndex > startIndex) {
 		const prevEntry = entries[cutIndex - 1];
 		if (!prevEntry || prevEntry.type === "compaction") {
 			break;
 		}
-		if (prevEntry.type === "message") {
+		if (getMessageFromEntryForCompaction(prevEntry)) {
 			break;
 		}
 		cutIndex--;
@@ -463,12 +478,13 @@ export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
 	reserveTokens: number,
-	apiKey: string,
+	apiKey?: string,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	customInstructions?: string,
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
+	streamFn: StreamFn = streamSimple,
 ): Promise<Result<string, CompactionError>> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
@@ -496,17 +512,18 @@ export async function generateSummary(
 
 	const completionOptions = {
 		maxTokens,
-		apiKey,
+		...(apiKey === undefined ? {} : { apiKey }),
 		...(signal === undefined ? {} : { signal }),
 		...(headers === undefined ? {} : { headers }),
 		...(model.reasoning && thinkingLevel && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
 	};
 
-	const response = await completeSimple(
+	const stream = await streamFn(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		completionOptions,
 	);
+	const response = await stream.result();
 	if (response.stopReason === "aborted") {
 		return err(new CompactionError("aborted", response.errorMessage || "Summarization aborted"));
 	}
@@ -525,6 +542,12 @@ export async function generateSummary(
 		.join("\n");
 
 	return ok(textContent);
+}
+
+/** Live request state used to keep retained context within the selected model's budget. */
+export interface CompactionContextBudget {
+	tools?: readonly Tool[];
+	contextWindow?: number;
 }
 
 /** Prepared inputs for a compaction run. */
@@ -551,6 +574,7 @@ export interface CompactionPreparation {
 export function prepareCompaction(
 	pathEntries: SessionTreeEntry[],
 	settings: CompactionSettings,
+	context: CompactionContextBudget = {},
 ): Result<CompactionPreparation | undefined, CompactionError> {
 	if (pathEntries.length === 0 || pathEntries.at(-1)?.type === "compaction") {
 		return ok(undefined);
@@ -573,10 +597,14 @@ export function prepareCompaction(
 		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
 	}
 	const boundaryEnd = pathEntries.length;
+	const toolTokens = estimateToolDefinitionTokens(context.tools);
+	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages, context.tools).tokens;
+	const retainedMessageTokens =
+		context.contextWindow !== undefined && context.contextWindow > 0
+			? Math.min(settings.keepRecentTokens, Math.max(0, context.contextWindow - settings.reserveTokens - toolTokens))
+			: settings.keepRecentTokens;
 
-	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
-
-	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, retainedMessageTokens);
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
 	if (!firstKeptEntry?.id) {
 		return err(new CompactionError("invalid_session", "First kept entry has no UUID - session may need migration"));
@@ -640,11 +668,12 @@ export { serializeConversation } from "./utils.ts";
 export async function compact(
 	preparation: CompactionPreparation,
 	model: Model<any>,
-	apiKey: string,
+	apiKey?: string,
 	headers?: Record<string, string>,
 	customInstructions?: string,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	streamFn: StreamFn = streamSimple,
 ): Promise<Result<CompactionResult<CompactionDetails> & { details: CompactionDetails }, CompactionError>> {
 	const {
 		firstKeptEntryId,
@@ -676,6 +705,7 @@ export async function compact(
 						customInstructions,
 						previousSummary,
 						thinkingLevel,
+						streamFn,
 					)
 				: Promise.resolve(ok<string, CompactionError>("No prior history.")),
 			generateTurnPrefixSummary(
@@ -686,6 +716,7 @@ export async function compact(
 				headers,
 				signal,
 				thinkingLevel,
+				streamFn,
 			),
 		]);
 		if (!historyResult.ok) return err(historyResult.error);
@@ -702,6 +733,7 @@ export async function compact(
 			customInstructions,
 			previousSummary,
 			thinkingLevel,
+			streamFn,
 		);
 		if (!summaryResult.ok) return err(summaryResult.error);
 		summary = summaryResult.value;
@@ -721,10 +753,11 @@ async function generateTurnPrefixSummary(
 	messages: AgentMessage[],
 	model: Model<any>,
 	reserveTokens: number,
-	apiKey: string,
-	headers?: Record<string, string>,
-	signal?: AbortSignal,
-	thinkingLevel?: ThinkingLevel,
+	apiKey: string | undefined,
+	headers: Record<string, string> | undefined,
+	signal: AbortSignal | undefined,
+	thinkingLevel: ThinkingLevel | undefined,
+	streamFn: StreamFn,
 ): Promise<Result<string, CompactionError>> {
 	const maxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
@@ -741,17 +774,18 @@ async function generateTurnPrefixSummary(
 		},
 	];
 
-	const response = await completeSimple(
+	const stream = await streamFn(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		{
 			maxTokens,
-			apiKey,
+			...(apiKey === undefined ? {} : { apiKey }),
 			...(signal === undefined ? {} : { signal }),
 			...(headers === undefined ? {} : { headers }),
 			...(model.reasoning && thinkingLevel && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
 		},
 	);
+	const response = await stream.result();
 	if (response.stopReason === "aborted") {
 		return err(new CompactionError("aborted", response.errorMessage || "Turn prefix summarization aborted"));
 	}

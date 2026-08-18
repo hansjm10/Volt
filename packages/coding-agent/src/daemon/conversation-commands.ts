@@ -32,8 +32,18 @@ import {
 } from "../core/rpc/conversation-projection-limits.ts";
 import { getRpcErrorResponseTarget } from "../core/rpc/correlation.ts";
 import { getRemoteVisibleCustomMessageRole } from "../core/rpc/custom-message-projection.ts";
+import { projectSessionTreePage } from "../core/rpc/session-tree.ts";
+import {
+	type ResolvedSessionToolCall,
+	resolveSessionToolCallsByResultEntryId,
+} from "../core/rpc/tool-call-resolution.ts";
 import { extractMessageImages, projectMessageImages } from "../core/rpc/transcript.ts";
-import type { RpcConversationAssistantPart, RpcKeepAwakeStatus } from "../core/rpc/types.ts";
+import type {
+	RpcConversationAssistantPart,
+	RpcConversationTranscriptItem,
+	RpcKeepAwakeStatus,
+	RpcSessionTreePage,
+} from "../core/rpc/types.ts";
 import { REMOTE_TRANSCRIPT_DEFAULT_MAX_SERIALIZED_BYTES } from "../core/rpc/wire-limits.ts";
 import { getDefaultSessionDir, type SessionEntry, SessionManager } from "../core/session-manager.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "../core/subagents/tool-names.ts";
@@ -136,7 +146,8 @@ export interface RemoteSessionListCursorEntry {
 export interface ConversationCommandRuntime {
 	session: {
 		sessionId: string;
-		sessionManager: Pick<SessionManager, "getBranch" | "getBranchWindow" | "getLeafEntry">;
+		sessionManager: Pick<SessionManager, "getBranch" | "getBranchWindow" | "getLeafEntry"> &
+			Partial<Pick<SessionManager, "getEntries">>;
 	};
 	listSessions(): Promise<
 		Array<{
@@ -569,16 +580,10 @@ function getRemoteStopReason(value: unknown): RemoteTranscriptItem["stopReason"]
 		: undefined;
 }
 
-interface RemoteToolCallRecord {
-	id: string;
-	name: string;
-	arguments: Record<string, unknown>;
-}
-
 export function projectRemoteTranscriptEntry(
 	entry: SessionEntry,
 	authorization: IrohRemoteClientAuthorizationSuccess,
-	toolCallsById: Map<string, RemoteToolCallRecord>,
+	toolCall: ResolvedSessionToolCall | undefined,
 	finalAssistantEntry = false,
 ): RemoteTranscriptItem | undefined {
 	if (!entry || typeof entry !== "object") {
@@ -657,7 +662,6 @@ export function projectRemoteTranscriptEntry(
 		const status = message.isError ? "failed" : "completed";
 		const toolName =
 			typeof message.toolName === "string" && message.toolName.trim() ? message.toolName.trim() : "tool";
-		const toolCall = typeof message.toolCallId === "string" ? toolCallsById.get(message.toolCallId) : undefined;
 		const args = isRemoteRecord(toolCall?.arguments) ? toolCall.arguments : undefined;
 		const path = getRemoteToolPath(toolName, args, authorization);
 		const summary = summarizeRemoteToolResult(toolName, status, args, path, authorization);
@@ -726,11 +730,16 @@ export function projectRemoteTranscriptItems(
 	});
 	if (!window) return [];
 	const boundedBranch = [...window.lookback, ...window.entries];
-	const toolCallsById = collectRemoteToolCalls(boundedBranch);
+	const toolCallsByResultEntryId = resolveSessionToolCallsByResultEntryId(boundedBranch);
 	const fullContentEntryId = findLatestAssistantMessageEntryId(window.entries);
 	return window.entries
 		.map((entry) =>
-			projectRemoteTranscriptEntry(entry, authorization, toolCallsById, entry.id === fullContentEntryId),
+			projectRemoteTranscriptEntry(
+				entry,
+				authorization,
+				toolCallsByResultEntryId.get(entry.id),
+				entry.id === fullContentEntryId,
+			),
 		)
 		.filter((item): item is RemoteTranscriptItem => item !== undefined);
 }
@@ -819,14 +828,14 @@ export function createRemoteConversationTranscriptEntry(
 		lookbackEntries: REMOTE_TRANSCRIPT_TOOL_CALL_LOOKBACK_ENTRIES,
 	});
 	const isCurrentCommit = window?.entries.at(-1)?.id === entry.id;
-	const toolCallsById = isCurrentCommit
-		? collectRemoteToolCalls([...(window?.lookback ?? []), ...(window?.entries ?? [])])
-		: new Map<string, RemoteToolCallRecord>();
+	const toolCall = isCurrentCommit
+		? resolveSessionToolCallsByResultEntryId([...(window?.lookback ?? []), ...(window?.entries ?? [])]).get(entry.id)
+		: undefined;
 	const finalAssistantEntry =
 		isCurrentCommit &&
 		entry.type === "message" &&
 		(entry.message as unknown as Record<string, unknown>)?.role === "assistant";
-	return projectRemoteTranscriptEntry(entry, authorization, toolCallsById, finalAssistantEntry);
+	return projectRemoteTranscriptEntry(entry, authorization, toolCall, finalAssistantEntry);
 }
 
 function projectRemoteTranscriptWindow(
@@ -836,10 +845,8 @@ function projectRemoteTranscriptWindow(
 	authorization: IrohRemoteClientAuthorizationSuccess,
 	fullContentEntryId?: string,
 ): RemoteTranscriptItem[] {
-	const toolCallsById = collectRemoteToolCalls(
-		entries,
-		Math.max(0, startIndex - REMOTE_TRANSCRIPT_TOOL_CALL_LOOKBACK_ENTRIES),
-		endIndex,
+	const toolCallsByResultEntryId = resolveSessionToolCallsByResultEntryId(
+		entries.slice(Math.max(0, startIndex - REMOTE_TRANSCRIPT_TOOL_CALL_LOOKBACK_ENTRIES), endIndex),
 	);
 	const items: RemoteTranscriptItem[] = [];
 	for (let index = startIndex; index < endIndex; index++) {
@@ -850,7 +857,7 @@ function projectRemoteTranscriptWindow(
 		const item = projectRemoteTranscriptEntry(
 			entry,
 			authorization,
-			toolCallsById,
+			toolCallsByResultEntryId.get(entry.id),
 			fullContentEntryId !== undefined && entry.id === fullContentEntryId,
 		);
 		if (item) {
@@ -858,43 +865,6 @@ function projectRemoteTranscriptWindow(
 		}
 	}
 	return items;
-}
-
-function collectRemoteToolCalls(
-	entries: SessionEntry[],
-	startIndex = 0,
-	endIndex = entries.length,
-): Map<string, RemoteToolCallRecord> {
-	const toolCallsById = new Map<string, RemoteToolCallRecord>();
-	for (let index = startIndex; index < endIndex; index++) {
-		const entry = entries[index];
-		if (!entry) {
-			continue;
-		}
-		if (entry.type !== "message") {
-			continue;
-		}
-		const message = entry.message as unknown as Record<string, unknown>;
-		if (message?.role !== "assistant" || !Array.isArray(message.content)) {
-			continue;
-		}
-		for (const block of message.content) {
-			if (
-				isRemoteRecord(block) &&
-				block.type === "toolCall" &&
-				typeof block.id === "string" &&
-				typeof block.name === "string" &&
-				isRemoteRecord(block.arguments)
-			) {
-				toolCallsById.set(block.id, {
-					id: block.id,
-					name: block.name,
-					arguments: block.arguments,
-				});
-			}
-		}
-	}
-	return toolCallsById;
 }
 
 function projectRemoteToolArgs(
@@ -1437,6 +1407,58 @@ export function createRemoteGetTranscriptRpcResponse(
 	return createRpcSuccessResponse(id, "get_transcript", page);
 }
 
+export function createRemoteGetSessionTreeRpcResponse(
+	command: RemoteRpcCommand,
+	authorization: IrohRemoteClientAuthorizationSuccess,
+	runtime: ConversationCommandRuntime,
+): object {
+	const id = getRpcResponseId(command);
+	if (
+		command.limit !== undefined &&
+		(typeof command.limit !== "number" || !Number.isSafeInteger(command.limit) || command.limit <= 0)
+	) {
+		return createIrohRemoteRpcErrorResponse(id, "get_session_tree", "invalid_limit");
+	}
+	if (
+		command.afterOrdinal !== undefined &&
+		(typeof command.afterOrdinal !== "number" ||
+			!Number.isSafeInteger(command.afterOrdinal) ||
+			command.afterOrdinal < 0)
+	) {
+		return createIrohRemoteRpcErrorResponse(id, "get_session_tree", "invalid_cursor");
+	}
+	const entries = runtime.session.sessionManager.getEntries?.();
+	if (!entries) {
+		return createIrohRemoteRpcErrorResponse(id, "get_session_tree", "unsupported_remote_command");
+	}
+	const activeBranch = runtime.session.sessionManager.getBranch();
+	const finalAssistantEntryId = findLatestAssistantMessageEntryId(activeBranch);
+	let page: RpcSessionTreePage;
+	try {
+		const toolCallsByResultEntryId = resolveSessionToolCallsByResultEntryId(entries);
+		page = projectSessionTreePage(entries, activeBranch, {
+			workspaceName: authorization.workspace.name,
+			sessionId: runtime.session.sessionId,
+			limit: command.limit as number | undefined,
+			afterOrdinal: command.afterOrdinal as number | undefined,
+			projectTranscriptEntry: (entry): RpcConversationTranscriptItem | undefined =>
+				projectRemoteTranscriptEntry(
+					entry,
+					authorization,
+					toolCallsByResultEntryId.get(entry.id),
+					entry.id === finalAssistantEntryId,
+				),
+		});
+	} catch {
+		return createIrohRemoteRpcErrorResponse(id, "get_session_tree", "session_tree_unavailable");
+	}
+	return createRpcSuccessResponse(id, "get_session_tree", page);
+}
+
+function getRemoteRecoverableEntries(runtime: ConversationCommandRuntime): SessionEntry[] {
+	return runtime.session.sessionManager.getEntries?.() ?? runtime.session.sessionManager.getBranch();
+}
+
 /**
  * The unbounded sanitized long-form text lane of one transcript entry — the
  * same composition the transcript projection truncates. Assistant entries
@@ -1512,7 +1534,7 @@ export function createRemoteGetTranscriptEntryTextRpcResponse(
 		}
 		offset = command.offset;
 	}
-	const entry = runtime.session.sessionManager.getBranch().find((candidate) => candidate.id === command.entryId);
+	const entry = getRemoteRecoverableEntries(runtime).find((candidate) => candidate.id === command.entryId);
 	const canonicalText = entry === undefined ? undefined : getRemoteTranscriptEntryCanonicalText(entry, authorization);
 	if (canonicalText === undefined) {
 		return createIrohRemoteRpcErrorResponse(id, "get_transcript_entry_text", "unknown_entry");
@@ -1555,7 +1577,7 @@ export function createRemoteGetMessageImagesRpcResponse(
 		}
 		startImageIndex = command.startImageIndex;
 	}
-	const result = projectMessageImages(runtime.session.sessionManager.getBranch(), command.entryId, startImageIndex);
+	const result = projectMessageImages(getRemoteRecoverableEntries(runtime), command.entryId, startImageIndex);
 	if (!result.ok) {
 		return createIrohRemoteRpcErrorResponse(id, "get_message_images", result.error);
 	}
@@ -2128,6 +2150,9 @@ export async function handleIntegratedConversationRpcCommand(
 			context.isConversationTranscriptCursorValid,
 			context.registerConversationTranscriptCursor,
 		);
+	}
+	if (command.type === "get_session_tree") {
+		return createRemoteGetSessionTreeRpcResponse(command, authorization, runtime);
 	}
 	if (command.type === "get_message_images") {
 		return createRemoteGetMessageImagesRpcResponse(command, authorization, runtime);

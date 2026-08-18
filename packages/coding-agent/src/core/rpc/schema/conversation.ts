@@ -105,6 +105,37 @@ export const RpcConversationTranscriptPageSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
+/** One sanitized, append-ordered node in a session's branch tree. */
+export const RpcSessionTreeNodeSchema = Type.Object(
+	{
+		entryId: Type.String(),
+		parentEntryId: Type.Union([Type.String(), Type.Null()]),
+		ordinal: Type.Integer(),
+		createdAt: Type.String(),
+		activeBranch: Type.Boolean(),
+		/** Null for structural entries that are not part of transcript projection. */
+		transcript: Type.Union([RpcConversationTranscriptItemSchema, Type.Null()]),
+	},
+	{ additionalProperties: false },
+);
+
+/** Bounded append-order page of the current session's complete branch tree. */
+export const RpcSessionTreePageSchema = Type.Object(
+	{
+		workspaceName: Type.Optional(Type.String()),
+		sessionId: Type.String(),
+		nodes: Type.Array(RpcSessionTreeNodeSchema),
+		hasMore: Type.Boolean(),
+		nextAfterOrdinal: Type.Union([Type.Integer(), Type.Null()]),
+		projectionVersion: Type.Number(),
+		head: Type.Union([
+			Type.Object({ entryId: Type.String(), ordinal: Type.Integer() }, { additionalProperties: false }),
+			Type.Null(),
+		]),
+	},
+	{ additionalProperties: false },
+);
+
 export const RpcConversationWorkflowSnapshotSchema = Type.Object(
 	{
 		/** Stable identity retained even when workflow details are projected away. */

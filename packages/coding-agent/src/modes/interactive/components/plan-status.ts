@@ -1,4 +1,12 @@
-import { type Component, getKeybindings, truncateToWidth, visibleWidth } from "@hansjm10/volt-tui";
+import {
+	type Component,
+	getKeybindings,
+	ScrollView,
+	type ScrollViewScrollbar,
+	truncateToWidth,
+	VStack,
+	visibleWidth,
+} from "@hansjm10/volt-tui";
 import type { PlanningState, PlanState } from "../../../core/planning.ts";
 import { theme } from "../../../core/theme/runtime.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
@@ -66,9 +74,26 @@ export class PlanStatusComponent implements Component {
 
 export type PlanDetailsAction = "retain_context" | "new_session" | "change";
 
+class PlanDetailsSection implements Component {
+	private readonly renderSection: (width: number) => string[];
+
+	constructor(renderSection: (width: number) => string[]) {
+		this.renderSection = renderSection;
+	}
+
+	invalidate(): void {
+		// Theme styling is resolved during render.
+	}
+
+	render(width: number): string[] {
+		return this.renderSection(width);
+	}
+}
+
 /**
- * Scrollable plan viewer. It lives above the normal editor, so even the compact
- * ready-state selector never displaces draft feedback input.
+ * Scrollable plan viewer. Regular mode keeps its bounded native-scrollback
+ * rendering; fullscreen mode uses a fixed header/actions layout around one
+ * body ScrollView while sharing the same plan, action, and scroll state.
  */
 export class PlanDetailsComponent implements Component {
 	private static readonly RESERVED_OUTSIDE_ROWS = 7;
@@ -77,14 +102,16 @@ export class PlanDetailsComponent implements Component {
 	private readonly onAction: (action: PlanDetailsAction) => void;
 	private readonly onClose: () => void;
 	private readonly requestRender: () => void;
+	private readonly bodyScroll: ScrollView;
+	private readonly fullscreenLayout: VStack;
 	private actionIndex = 0;
-	private scrollOffset = 0;
-	private lastPageSize = 1;
-	private lastMaxScroll = 0;
+	private regularPageSize = 1;
+	private fullscreenActive = false;
 
 	constructor(options: {
 		plan: PlanState;
 		getTerminalRows: () => number;
+		fullscreenScrollbar?: ScrollViewScrollbar;
 		onAction: (action: PlanDetailsAction) => void;
 		onClose: () => void;
 		requestRender: () => void;
@@ -94,24 +121,50 @@ export class PlanDetailsComponent implements Component {
 		this.onAction = options.onAction;
 		this.onClose = options.onClose;
 		this.requestRender = options.requestRender;
+
+		const body = new PlanDetailsSection((width) => renderPlanContentLines(this.plan, width, theme));
+		this.bodyScroll = new ScrollView(body, {
+			overscroll: "contain",
+			scrollbar: options.fullscreenScrollbar ?? "auto",
+			scrollbarStyle: (text) => theme.bg("scrollbarThumb", text),
+		});
+		const header = new PlanDetailsSection((width) => this.renderFullscreenHeader(width));
+		const actions = new PlanDetailsSection((width) =>
+			this.renderFooter(width, width < 100, this.renderBorder(width)),
+		);
+		this.fullscreenLayout = new VStack([
+			{ component: header, shrink: 1, minSize: 0 },
+			{ component: this.bodyScroll, basis: 0, grow: 1, shrink: 1, minSize: 0 },
+			{ component: actions, shrink: 1, minSize: 0 },
+		]);
 	}
 
 	setPlan(plan: PlanState): void {
-		if (plan.id !== this.plan.id) this.scrollOffset = 0;
+		if (plan.id !== this.plan.id) this.bodyScroll.scrollToStart();
 		this.plan = plan;
 	}
 
+	setFullscreenActive(active: boolean): void {
+		this.fullscreenActive = active;
+	}
+
+	setFullscreenScrollbar(scrollbar: ScrollViewScrollbar): void {
+		this.bodyScroll.setScrollbar(scrollbar);
+	}
+
+	getFullscreenLayout(): Component {
+		return this.fullscreenLayout;
+	}
+
 	invalidate(): void {
-		// Theme styling is resolved during render.
+		this.fullscreenLayout.invalidate();
 	}
 
 	render(width: number): string[] {
 		if (width <= 0) return [];
 		const compact = width < 100;
-		const border = new DynamicBorder().render(width)[0]!;
-		const titleLines: string[] = [];
-		appendWrappedPlanLine(titleLines, " ", theme.bold(theme.fg("accent", this.plan.title ?? "Plan Details")), width);
-
+		const border = this.renderBorder(width);
+		const titleLines = this.renderTitle(width);
 		const bodyContent = renderPlanContentLines(this.plan, width, theme);
 		const footer = this.renderFooter(width, compact, border);
 		const headerRows = 2 + titleLines.length;
@@ -120,21 +173,17 @@ export class PlanDetailsComponent implements Component {
 			this.getTerminalRows() - PlanDetailsComponent.RESERVED_OUTSIDE_ROWS,
 		);
 		const pageSize = Math.max(2, targetRows - headerRows - footer.length);
-		const maxScroll = Math.max(0, bodyContent.length - pageSize);
-		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScroll));
-		this.lastPageSize = pageSize;
-		this.lastMaxScroll = maxScroll;
-		const end = Math.min(bodyContent.length, this.scrollOffset + pageSize);
+		this.regularPageSize = pageSize;
+		this.bodyScroll.updateLayout(bodyContent.length, pageSize, this.requestRender);
+		const end = Math.min(bodyContent.length, this.bodyScroll.scrollTop + pageSize);
 
-		const progress = getPlanProgress(this.plan);
-		const position = maxScroll > 0 ? ` · rows ${this.scrollOffset + 1}–${end}/${bodyContent.length}` : "";
-		const metadata = truncateToWidth(
-			` ${theme.fg("dim", `${progress.completed}/${progress.total} complete${position}`)}`,
-			width,
-			"",
-		);
-
-		return [border, ...titleLines, metadata, ...bodyContent.slice(this.scrollOffset, end), ...footer];
+		return [
+			border,
+			...titleLines,
+			this.renderMetadata(width, bodyContent.length, end),
+			...bodyContent.slice(this.bodyScroll.scrollTop, end),
+			...footer,
+		];
 	}
 
 	handleInput(data: string): void {
@@ -159,18 +208,46 @@ export class PlanDetailsComponent implements Component {
 				return;
 			}
 		} else if (kb.matches(data, "tui.select.up")) {
-			this.scrollBy(-1);
+			this.bodyScroll.scrollBy(-1);
 			return;
 		} else if (kb.matches(data, "tui.select.down")) {
-			this.scrollBy(1);
+			this.bodyScroll.scrollBy(1);
 			return;
 		}
 
+		const pageSize = Math.max(1, this.fullscreenActive ? this.bodyScroll.viewportHeight : this.regularPageSize);
 		if (kb.matches(data, "tui.editor.pageUp")) {
-			this.scrollBy(-this.lastPageSize);
+			this.bodyScroll.scrollBy(-pageSize);
 		} else if (kb.matches(data, "tui.editor.pageDown")) {
-			this.scrollBy(this.lastPageSize);
+			this.bodyScroll.scrollBy(pageSize);
 		}
+	}
+
+	private renderBorder(width: number): string {
+		return new DynamicBorder().render(width)[0] ?? "";
+	}
+
+	private renderTitle(width: number): string[] {
+		const lines: string[] = [];
+		appendWrappedPlanLine(lines, " ", theme.bold(theme.fg("accent", this.plan.title ?? "Plan Details")), width);
+		return lines;
+	}
+
+	private renderFullscreenHeader(width: number): string[] {
+		const bodyLength = renderPlanContentLines(this.plan, width, theme).length;
+		const end = Math.min(bodyLength, this.bodyScroll.scrollTop + this.bodyScroll.viewportHeight);
+		return [this.renderBorder(width), ...this.renderTitle(width), this.renderMetadata(width, bodyLength, end)];
+	}
+
+	private renderMetadata(width: number, bodyLength: number, end: number): string {
+		const progress = getPlanProgress(this.plan);
+		const maxScroll = Math.max(0, bodyLength - Math.max(1, this.bodyScroll.viewportHeight));
+		const position = maxScroll > 0 ? ` · rows ${this.bodyScroll.scrollTop + 1}–${end}/${bodyLength}` : "";
+		return truncateToWidth(
+			` ${theme.fg("dim", `${progress.completed}/${progress.total} complete${position}`)}`,
+			width,
+			"",
+		);
 	}
 
 	private renderFooter(width: number, compact: boolean, border: string): string[] {
@@ -211,10 +288,5 @@ export class PlanDetailsComponent implements Component {
 		lines.push(truncateToWidth(` ${actionHints}${pageHint}  ${keyHint("tui.select.cancel", "close")}`, width, ""));
 		lines.push(border);
 		return lines;
-	}
-
-	private scrollBy(delta: number): void {
-		this.scrollOffset = Math.max(0, Math.min(this.lastMaxScroll, this.scrollOffset + delta));
-		this.requestRender();
 	}
 }

@@ -96,7 +96,6 @@ describe("AgentSession model and extension characterization", () => {
 		expect(harness.session.getAllTools().map((tool) => tool.name)).toContain("image_gen");
 		expect(harness.session.getActiveToolNames()).toContain("image_gen");
 		expect(harness.session.getToolDefinition("image_gen")).toBeDefined();
-		expect(harness.session.systemPrompt).toContain("- image_gen: Generate or edit images with GPT Image 2");
 
 		await harness.session.setModel(fauxModel, { persistDefault: false });
 		expect(harness.session.getActiveToolNames()).not.toContain("image_gen");
@@ -132,14 +131,15 @@ describe("AgentSession model and extension characterization", () => {
 			isError: false,
 			timestamp: Date.now(),
 		};
-		harness.session.agent.state.messages.push(priorGeneratedResult);
-		harness.session.agent.state.messages.push({
+		harness.sessionManager.appendMessage(priorGeneratedResult);
+		harness.sessionManager.appendMessage({
 			role: "custom",
 			customType: "reference_image",
 			content: [{ type: "image", mimeType: "image/png", data: customImageData }],
 			display: false,
 			timestamp: Date.now(),
 		});
+		await harness.sessionManager.flush();
 		await harness.session.prompt("Edit these attached references", {
 			images: [{ type: "image", mimeType: "image/png", data: rpcImageData }],
 			clientMessageId: "rpc-image-edit",
@@ -184,7 +184,7 @@ describe("AgentSession model and extension characterization", () => {
 		});
 		vi.stubGlobal("fetch", fetcher);
 
-		const imageGen = harness.session.agent.state.tools.find((tool) => tool.name === "image_gen");
+		const imageGen = harness.session.state.tools.find((tool) => tool.name === "image_gen");
 		expect(imageGen).toBeDefined();
 		const result = await imageGen!.execute("call/rpc edit", {
 			prompt: "Combine the references",
@@ -219,7 +219,7 @@ describe("AgentSession model and extension characterization", () => {
 			model: Model<string>;
 			thinkingLevel?: ThinkingLevel;
 		}>);
-		harness.session.setThinkingLevel("high");
+		await harness.session.setThinkingLevel("high");
 
 		await harness.session.cycleModel();
 		expect(harness.session.model?.id).toBe("faux-2");
@@ -234,7 +234,7 @@ describe("AgentSession model and extension characterization", () => {
 		const harness = await createHarness({ models: [{ id: "faux-1", reasoning: false }] });
 		harnesses.push(harness);
 
-		harness.session.setThinkingLevel("high");
+		await harness.session.setThinkingLevel("high");
 		expect(harness.session.thinkingLevel).toBe("off");
 		expect(harness.session.cycleThinkingLevel()).toBeUndefined();
 	});
@@ -244,7 +244,7 @@ describe("AgentSession model and extension characterization", () => {
 		harnesses.push(harness);
 
 		expect(harness.session.getAvailableThinkingLevels()).toEqual(["off", "minimal", "low", "medium", "high"]);
-		harness.session.setThinkingLevel("xhigh");
+		await harness.session.setThinkingLevel("xhigh");
 		expect(harness.session.thinkingLevel).toBe("high");
 		expect(harness.eventsOfType("thinking_level_changed").map((event) => event.level)).toEqual(["high"]);
 	});
@@ -276,9 +276,9 @@ describe("AgentSession model and extension characterization", () => {
 		const modelOne = harness.getModel("faux-1")!;
 		const modelTwo = harness.getModel("faux-2")!;
 
-		harness.session.setThinkingLevel("high", { persistDefault: false });
+		await harness.session.setThinkingLevel("high", { persistDefault: false });
 		harness.session.setFastModeEnabled(true);
-		harness.session.setThinkingLevel("low", { persistDefault: false });
+		await harness.session.setThinkingLevel("low", { persistDefault: false });
 		expect(harness.session.fastModeEnabled).toBe(true);
 		expect(harness.session.thinkingLevel).toBe("low");
 
@@ -286,7 +286,7 @@ describe("AgentSession model and extension characterization", () => {
 		expect(harness.session.fastModeEnabled).toBe(true);
 		expect(harness.session.thinkingLevel).toBe("low");
 
-		harness.session.setThinkingLevel("high", { persistDefault: false });
+		await harness.session.setThinkingLevel("high", { persistDefault: false });
 		harness.session.setScopedModels([{ model: modelOne }]);
 		expect(harness.session.fastModeEnabled).toBe(true);
 		expect(harness.session.thinkingLevel).toBe("high");
@@ -365,12 +365,14 @@ describe("AgentSession model and extension characterization", () => {
 		await harness.session.setAgentMode("plan");
 		const args = { action: "diagnostics" };
 
-		const decision = await harness.session.agent.beforeToolCall?.({
-			toolCall: { type: "toolCall", id: "mutated-lsp", name: "lsp", arguments: args },
-			args,
-		} as never);
+		const decision = await harness.control.evaluateToolCall({
+			type: "tool_call",
+			toolCallId: "mutated-lsp",
+			toolName: "lsp",
+			input: args,
+		});
 
-		expect(args.action).toBe("fix");
+		expect(args.action).toBe("diagnostics");
 		expect(decision).toMatchObject({
 			block: true,
 			reason: expect.stringContaining("workspace.write"),

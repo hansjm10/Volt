@@ -1684,11 +1684,23 @@ describe("Iroh remote notification requests", () => {
 			setRebindSession: vi.fn(),
 		} as unknown as AgentSessionRuntime;
 		const { modePromise, recv, send } = await startIrohRpcMode(runtimeHost, session);
+		const privateContextResult = completedReview(2);
+		if (privateContextResult.status !== "completed") throw new Error("Expected a completed review fixture");
+		privateContextResult.parsed.summary = "PRIVATE_LINKED_ISSUE_AND_REVIEW_TEXT";
+		privateContextResult.parsed.coverage.context = {
+			captureStatus: "complete",
+			linkedIssueCount: 2,
+			discussionEntryCount: 5,
+			limitationCodes: [],
+			fingerprint: "e".repeat(64),
+			discoveryInspectionComplete: true,
+			verificationInspectionComplete: true,
+		};
 		startTestReview(
 			reviewWorkflows,
 			"review:malicious",
 			`${"PR #123".repeat(100)}\n/Users/private/project\ngit diff HEAD`,
-		).finish(completedReview(2));
+		).finish(privateContextResult);
 		await vi.waitFor(() => expect(getNotifications(send)).toHaveLength(1));
 		expect(getNotifications(send)[0]).toMatchObject({
 			body: "Review completed with 2 findings.",
@@ -1696,6 +1708,7 @@ describe("Iroh remote notification requests", () => {
 		});
 		expect(JSON.stringify(getNotifications(send))).not.toContain("Users/private");
 		expect(JSON.stringify(getNotifications(send))).not.toContain("git diff");
+		expect(JSON.stringify(getNotifications(send))).not.toContain("PRIVATE_LINKED_ISSUE_AND_REVIEW_TEXT");
 
 		startTestReview(reviewWorkflows, "review:cancelled").finish({ status: "cancelled" });
 		await reviewWorkflows.waitForIdle();

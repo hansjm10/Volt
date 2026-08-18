@@ -230,7 +230,8 @@ function makeSession(sessionId: string, sessionManager = SessionManager.inMemory
 	return {
 		bindExtensions: vi.fn(async () => {}),
 		subscribe: vi.fn(() => vi.fn()),
-		agent: { subscribe: vi.fn(() => vi.fn()), state: { pendingToolExecutions: new Map() } },
+		activeToolExecutions: new Map(),
+		subscribeRuntimeEvents: vi.fn(() => vi.fn()),
 		isStreaming: false,
 		isCompacting: false,
 		thinkingLevel: "off",
@@ -388,10 +389,30 @@ describe("RPC durable review actions", () => {
 		await closeMode(collecting, modePromise);
 	});
 
-	test("hydrates durable paginated results and exposes the breaking structured contract", async () => {
+	test("hydrates durable paginated results and exposes structured context coverage without raw GitHub text", async () => {
 		const manager = SessionManager.inMemory("/workspace");
 		appendReviewRun(manager, durableRecord("review:older"));
-		appendReviewRun(manager, { ...durableRecord("review:newer"), endedAt: 3 });
+		const newer = { ...durableRecord("review:newer"), endedAt: 3 };
+		newer.target.context = {
+			captureStatus: "complete",
+			linkedIssueCount: 2,
+			discussionEntryCount: 5,
+			renderedLinkedIssueCount: 2,
+			renderedDiscussionEntryCount: 5,
+			renderedBytes: 1_024,
+			limitationCodes: [],
+			fingerprint: "c".repeat(64),
+		};
+		newer.result!.coverage.context = {
+			captureStatus: "complete",
+			linkedIssueCount: 2,
+			discussionEntryCount: 5,
+			limitationCodes: [],
+			fingerprint: "c".repeat(64),
+			discoveryInspectionComplete: true,
+			verificationInspectionComplete: true,
+		};
+		appendReviewRun(manager, newer);
 		const runtimeHost = makeRuntimeHost({ manager });
 		const collecting = createCollectingTransport();
 		const modePromise = await startMode(runtimeHost, collecting.transport);
@@ -421,10 +442,18 @@ describe("RPC durable review actions", () => {
 			runId: "review:newer",
 			completionStatus: "complete",
 			overallCorrectness: "incorrect",
+			target: { context: { linkedIssueCount: 2, discussionEntryCount: 5, fingerprint: "c".repeat(64) } },
+			coverage: {
+				context: {
+					discoveryInspectionComplete: true,
+					verificationInspectionComplete: true,
+				},
+			},
 		});
 		expect(JSON.stringify(getData)).toContain("changeLocation");
 		expect(JSON.stringify(getData)).not.toContain('"file"');
 		expect(JSON.stringify(getData)).not.toContain("filesReviewed");
+		expect(JSON.stringify(getData)).not.toContain("PRIVATE_LINKED_ISSUE_AND_REVIEW_TEXT");
 		await closeMode(collecting, modePromise);
 	});
 
@@ -470,6 +499,7 @@ describe("RPC durable review actions", () => {
 		);
 		expect(JSON.stringify(seedMessages)).toContain("finding-2");
 		expect(JSON.stringify(seedMessages)).not.toContain("finding-1");
+		expect(JSON.stringify(seedMessages)).not.toContain("PRIVATE_LINKED_ISSUE_AND_REVIEW_TEXT");
 		expect(
 			replacementManagers[0]
 				?.getBranch()

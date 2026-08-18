@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AgentLoopNextActionContext } from "@hansjm10/volt-agent-core";
 import {
 	type FauxModelDefinition,
 	type FauxResponseStep,
@@ -40,6 +41,11 @@ import { createTestResourceLoader } from "./utilities.ts";
 interface TestManagerContext {
 	manager: SubagentManager;
 	getDisposedSessionCount(): number;
+}
+
+interface ProactiveCompactionSessionInternals {
+	_proactiveCompactionState: "idle" | "scheduled" | "compacting";
+	_shouldStopForProactiveCompaction(context: AgentLoopNextActionContext): boolean;
 }
 
 interface CreateTestManagerOptions {
@@ -1452,6 +1458,80 @@ describe("SubagentManager", () => {
 		]);
 	});
 
+	it("does not auto-continue after the turn budget overrides proactive compaction with a final report", async () => {
+		let proactiveCompactionStops = 0;
+		let providerTurns = 0;
+		let postRunCompactionRequests = 0;
+		let finalReportPromptSeen = false;
+		const turnStartCompactionStates: ProactiveCompactionSessionInternals["_proactiveCompactionState"][] = [];
+		const resourceLoader = createSubagentResourceLoader([createDefinition({ name: "researcher" })]);
+		const { manager } = await createTestManager({
+			resourceLoader,
+			noTools: false,
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 1_000 }],
+			turnLimits: { maxTurns: 1 },
+			settings: { compaction: { enabled: true, reserveTokens: 8_000, keepRecentTokens: 1 } },
+			onRuntimeCreated: (event) => {
+				const session = event.runtime.session as unknown as ProactiveCompactionSessionInternals;
+				event.runtime.session.subscribe((event) => {
+					if (event.type === "turn_start") {
+						turnStartCompactionStates.push(session._proactiveCompactionState);
+					}
+				});
+				const shouldStopForProactiveCompaction = session._shouldStopForProactiveCompaction;
+				session._shouldStopForProactiveCompaction = (context) => {
+					const shouldStop = shouldStopForProactiveCompaction.call(session, context);
+					if (shouldStop) proactiveCompactionStops += 1;
+					return shouldStop;
+				};
+			},
+			responses: [
+				() => {
+					providerTurns += 1;
+					return fauxAssistantMessage(
+						[
+							{ type: "text", text: "large working context ".repeat(600) },
+							fauxToolCall("subagent_registry", { list: true }),
+						],
+						{ stopReason: "toolUse" },
+					);
+				},
+				(context) => {
+					providerTurns += 1;
+					finalReportPromptSeen = JSON.stringify(context.messages).includes(
+						"Do not call any more tools. Return your best final report now",
+					);
+					return fauxAssistantMessage("Final report at the turn budget");
+				},
+				() => {
+					providerTurns += 1;
+					return fauxAssistantMessage("unexpected continuation after the final report");
+				},
+			],
+			simpleResponses: [
+				() => {
+					postRunCompactionRequests += 1;
+					return fauxAssistantMessage("ordinary post-run compaction");
+				},
+			],
+		});
+
+		const handle = await manager.startByName("researcher");
+		const completion = handle.waitForEnd();
+		await handle.prompt("Reach the turn budget with enough context to trigger compaction");
+		const result = await completion;
+
+		expect(proactiveCompactionStops).toBe(1);
+		expect(turnStartCompactionStates).toEqual(["idle", "idle"]);
+		expect(finalReportPromptSeen).toBe(true);
+		expect(providerTurns).toBe(2);
+		expect(postRunCompactionRequests).toBe(1);
+		expect(result.event.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "Final report at the turn budget" }],
+		});
+	});
+
 	it("uses terminal plan finalization as the budget report turn without queuing a redundant report", async () => {
 		let childSession: SubagentRuntimeCreatedEvent["runtime"]["session"] | undefined;
 		let activePlan: { id: string; revision: number; steps: Array<{ id: string; status: string }> } | undefined;
@@ -1752,24 +1832,17 @@ describe("SubagentManager", () => {
 		expect(abortSpy).toHaveBeenCalled();
 	});
 
-	it("preserves an externally chained hook wrapper installed after spawn", async () => {
-		let childSession: SubagentRuntimeCreatedEvent["runtime"]["session"] | undefined;
-		let externalBeforeToolCall: unknown;
-		let externalNextAction: unknown;
+	it("composes an independently scoped turn policy with the budget policy", async () => {
+		let externalNextActionCalls = 0;
+		let unregisterExternalPolicy: (() => void) | undefined;
 		const { manager } = await createTestManager({
 			onRuntimeCreated: (event) => {
-				const agent = event.runtime.session.agent;
-				const innerBeforeToolCall = agent.beforeToolCall;
-				const innerNextAction = agent.nextAction;
-				const wrappedBeforeToolCall: typeof innerBeforeToolCall = async (context, signal) =>
-					innerBeforeToolCall?.(context, signal);
-				const wrappedNextAction: NonNullable<typeof innerNextAction> = async (context, signal) =>
-					innerNextAction ? await innerNextAction(context, signal) : context.defaultAction;
-				agent.beforeToolCall = wrappedBeforeToolCall;
-				agent.nextAction = wrappedNextAction;
-				externalBeforeToolCall = wrappedBeforeToolCall;
-				externalNextAction = wrappedNextAction;
-				childSession = event.runtime.session;
+				unregisterExternalPolicy = event.runtime.session.registerTurnPolicy({
+					nextAction: (context) => {
+						externalNextActionCalls++;
+						return context.defaultAction;
+					},
+				});
 			},
 		});
 
@@ -1777,13 +1850,10 @@ describe("SubagentManager", () => {
 		const completion = handle.waitForEnd();
 		await handle.prompt("finish quickly");
 		await completion;
+		expect(externalNextActionCalls).toBeGreaterThan(0);
+		unregisterExternalPolicy?.();
+		unregisterExternalPolicy?.();
 		await handle.dispose();
-
-		if (!childSession) throw new Error("expected the child session");
-		// Teardown must not clobber the externally chained wrappers: the budget
-		// wrappers are no longer the installed hooks, so restore is skipped.
-		expect(childSession.agent.beforeToolCall).toBe(externalBeforeToolCall);
-		expect(childSession.agent.nextAction).toBe(externalNextAction);
 	});
 
 	it("applies finite manager aggregate consumption overrides with field-specific abort errors", async () => {

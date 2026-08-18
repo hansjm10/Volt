@@ -1,6 +1,6 @@
 import { complete, createAssistantMessageEventStream, getModel, getProviders, Type } from "@hansjm10/volt-ai";
 import {
-	Agent,
+	AgentHarness,
 	bashExecutionToText,
 	convertToLlm,
 	createCustomMessage,
@@ -23,8 +23,6 @@ const model = getModel("google", "gemini-2.5-flash");
 const schema = Type.Object({ prompt: Type.String() });
 const stream = createAssistantMessageEventStream();
 
-const agent = new Agent({ initialState: { model } });
-agent.steer({ role: "user", content: [{ type: "text", text: "queued" }], timestamp: 0 });
 const repo = new InMemorySessionRepo();
 const result = getOrThrow(ok({ value: 1 }));
 const customMessage = createCustomMessage("note", "hello", true, undefined, "2026-01-01T00:00:00.000Z");
@@ -37,7 +35,7 @@ console.log(
 	typeof complete,
 	schema.type,
 	typeof stream.push,
-	agent.hasQueuedMessages(),
+	typeof AgentHarness,
 	typeof repo.create,
 	result.value,
 	llmMessages.length,

@@ -1,6 +1,5 @@
-import { setKeybindings, visibleWidth } from "@hansjm10/volt-tui";
+import { type Component, setKeybindings, TuiAltScreen, TuiMainScreen, visibleWidth } from "@hansjm10/volt-tui";
 import { beforeAll, describe, expect, it } from "vitest";
-import { type Component, TUI } from "../../tui/src/tui.ts";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { PlanningState, PlanState } from "../src/core/planning.ts";
@@ -105,6 +104,7 @@ function createLayout(options: {
 	transcript?: LinesComponent;
 	controls?: LinesComponent[];
 	compact?: LinesComponent[];
+	fullscreenConversation?: Component;
 	footer?: Component;
 	actions?: PlanDetailsAction[];
 	requestViewportReset?: () => void;
@@ -129,6 +129,7 @@ function createLayout(options: {
 		transcriptComponents: [transcript],
 		controlComponents: controls,
 		compactComponents: compact,
+		fullscreenConversation: options.fullscreenConversation ?? new LinesComponent(["FULLSCREEN_CONVERSATION"]),
 		inspector,
 		footer: options.footer ?? new FullWidthFooter(),
 		getTerminalRows: () => rows,
@@ -224,6 +225,55 @@ describe("ResponsivePlanLayoutComponent", () => {
 		for (const line of rendered) expect(visibleWidth(line)).toBeLessThanOrEqual(160);
 	});
 
+	it("uses native fullscreen layout, plan scrolling, and compact resize fallback", async () => {
+		const readyPlan = plan("ready");
+		readyPlan.steps = Array.from({ length: 40 }, (_, index) => ({
+			id: `step-${index + 1}`,
+			text: `Fullscreen plan step ${index + 1}`,
+			status: index < 4 ? ("completed" as const) : index === 4 ? ("in_progress" as const) : ("pending" as const),
+		}));
+		const planning: PlanningState = { mode: "plan", plan: readyPlan };
+		const terminal = new VirtualTerminal(160, 30);
+		const { layout, inspector, splitChanges } = createLayout({
+			columns: 160,
+			rows: 30,
+			planning,
+			fullscreenConversation: new LinesComponent(["FULLSCREEN_CONVERSATION"]),
+		});
+		const tui = new TuiAltScreen(terminal, false, "/tmp", { mouse: false });
+		tui.addChild(layout);
+		tui.setLayoutRoot(layout.getFullscreenLayout());
+		inspector.setFullscreenActive(true);
+		tui.setFocus(inspector);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			const before = terminal.getViewport().map(stripAnsi).join("\n");
+			expect(before).toContain("FULLSCREEN_CONVERSATION");
+			expect(before).toContain("Responsive Plan");
+			expect(before).toContain("rows 1–");
+			expect(before).toContain("Execute Plan");
+			expect(before).toContain(usesAsciiPlanMarkers() ? "|" : "│");
+			expect(terminal.getViewport().at(-1)).toBe("F".repeat(160));
+
+			terminal.sendInput("\x1b[6~");
+			await terminal.waitForRender();
+			const scrolled = terminal.getViewport().map(stripAnsi).join("\n");
+			expect(scrolled).not.toContain("rows 1–");
+			expect(scrolled).toContain("Fullscreen plan step 35");
+
+			terminal.resize(128, 30);
+			await terminal.waitForRender();
+			const compact = terminal.getViewport().map(stripAnsi).join("\n");
+			expect(compact).toContain("FULLSCREEN_CONVERSATION");
+			expect(compact).not.toContain("Responsive Plan");
+			expect(terminal.getViewport().at(-1)).toBe("F".repeat(128));
+			expect(splitChanges).toEqual([false]);
+		} finally {
+			tui.stop({ preserveScreen: true });
+		}
+	});
+
 	it("leaves rows scrolled out of the viewport undecorated so scrollback stays readable", () => {
 		const transcript = new LinesComponent(Array.from({ length: 40 }, (_, index) => `message-${index + 1}`));
 		const editor = new LinesComponent(["EDITOR_TOP", "EDITOR_BOTTOM"]);
@@ -284,7 +334,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 		const committedHistory = initialLines.slice(0, historicalRows);
 		const terminal = new LoggingVirtualTerminal(columns, rows);
 		terminal.write("SHELL_SENTINEL\r\n");
-		const tui = new TUI(terminal);
+		const tui = new TuiMainScreen(terminal);
 		tui.addChild(layout);
 		tui.start();
 		try {
@@ -318,7 +368,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 		const committedHistory = initialLines.slice(0, historicalRows);
 		const terminal = new LoggingVirtualTerminal(columns, rows);
 		terminal.write("SHELL_SENTINEL\r\n");
-		const tui = new TUI(terminal);
+		const tui = new TuiMainScreen(terminal);
 		tui.addChild(layout);
 		tui.start();
 		try {
@@ -348,7 +398,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 		const editor = new LinesComponent(["EDITOR"]);
 		const terminal = new LoggingVirtualTerminal(columns, rows);
 		terminal.write("SHELL_SENTINEL\r\n");
-		const tui = new TUI(terminal);
+		const tui = new TuiMainScreen(terminal);
 		let viewportResets = 0;
 		const { layout } = createLayout({
 			columns,
@@ -388,7 +438,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 		const transcript = new LinesComponent([`assistant chunk${endMarker}`]);
 		const controls = [new LinesComponent(Array.from({ length: rows - 1 }, (_, index) => `CONTROL_${index + 1}`))];
 		const terminal = new LoggingVirtualTerminal(columns, rows);
-		const tui = new TUI(terminal);
+		const tui = new TuiMainScreen(terminal);
 		let viewportResets = 0;
 		const { layout } = createLayout({
 			columns,
@@ -424,7 +474,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 		const editor = new LinesComponent(["EDITOR"]);
 		const terminal = new LoggingVirtualTerminal(columns, rows);
 		terminal.write("SHELL_SENTINEL\r\n");
-		const tui = new TUI(terminal);
+		const tui = new TuiMainScreen(terminal);
 		const { layout } = createLayout({
 			columns,
 			rows,
@@ -472,6 +522,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 			transcriptComponents: [header],
 			controlComponents: [widget, editor],
 			compactComponents: [header, widget, editor],
+			fullscreenConversation: new LinesComponent(["FULLSCREEN_CONVERSATION"]),
 			inspector,
 			footer,
 			getTerminalRows: () => 24,
@@ -567,7 +618,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 			const editor = new LinesComponent(["EDITOR"]);
 			const terminal = new LoggingVirtualTerminal(columns, 24);
 			terminal.write("SHELL_SENTINEL\r\n");
-			const tui = new TUI(terminal);
+			const tui = new TuiMainScreen(terminal);
 			const { layout, setRows } = createLayout({
 				columns,
 				rows: 24,

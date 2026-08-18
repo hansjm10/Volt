@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync as nodeRealpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -18,6 +18,8 @@ import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manage
 import { getDefaultSessionDir, SessionManager } from "../src/core/session-manager.ts";
 import { createConversationOpenError, IntegratedRuntimeRegistry } from "../src/daemon/integrated-runtimes.ts";
 import { createTestSession } from "./iroh-stream-doubles.ts";
+
+const realpathSync = nodeRealpathSync.native;
 
 type CreateRuntimeOptions = Parameters<
 	NonNullable<ConstructorParameters<typeof IntegratedRuntimeRegistry>[0]["createRuntime"]>

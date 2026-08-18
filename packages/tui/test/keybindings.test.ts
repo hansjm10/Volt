@@ -35,4 +35,18 @@ describe("KeybindingsManager", () => {
 		]);
 		assert.deepStrictEqual(keybindings.getKeys("tui.editor.cursorLeft"), ["left", "ctrl+b"]);
 	});
+
+	it("configures alternate-screen navigation without removing Ctrl-modified editor navigation", () => {
+		const keybindings = new KeybindingsManager(TUI_KEYBINDINGS, {
+			"tui.altScreen.pageUp": "alt+u",
+			"tui.altScreen.halfPageDown": "ctrl+d",
+			"tui.altScreen.search": "ctrl+f",
+		});
+
+		assert.deepStrictEqual(keybindings.getKeys("tui.altScreen.pageUp"), ["alt+u"]);
+		assert.deepStrictEqual(keybindings.getKeys("tui.altScreen.halfPageDown"), ["ctrl+d"]);
+		assert.deepStrictEqual(keybindings.getKeys("tui.altScreen.search"), ["ctrl+f"]);
+		assert.deepStrictEqual(keybindings.getKeys("tui.editor.pageUp"), ["pageUp", "ctrl+pageUp"]);
+		assert.deepStrictEqual(keybindings.getKeys("tui.editor.pageDown"), ["pageDown", "ctrl+pageDown"]);
+	});
 });

@@ -4,9 +4,7 @@ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 describe("InteractiveMode extension settlement", () => {
 	test("binds extension waitForIdle to the session settlement boundary", async () => {
 		const sessionWaitForIdle = vi.fn(async () => undefined);
-		const agentWaitForIdle = vi.fn(async () => undefined);
 		const session = {
-			agent: { waitForIdle: agentWaitForIdle },
 			isBusy: true,
 			bindExtensions: vi.fn(
 				async (_options: { commandContextActions: { waitForIdle(): Promise<void> } }) => undefined,
@@ -27,9 +25,10 @@ describe("InteractiveMode extension settlement", () => {
 		};
 		const bindCurrentSessionExtensions = Reflect.get(InteractiveMode.prototype, "bindCurrentSessionExtensions") as (
 			this: typeof fakeThis,
+			currentSession: typeof session,
 		) => Promise<void>;
 
-		await bindCurrentSessionExtensions.call(fakeThis);
+		await bindCurrentSessionExtensions.call(fakeThis, session);
 		const options = session.bindExtensions.mock.calls[0]?.[0] as {
 			commandContextActions: { waitForIdle(): Promise<void> };
 			shutdownHandler(): void;
@@ -37,7 +36,6 @@ describe("InteractiveMode extension settlement", () => {
 		await options.commandContextActions.waitForIdle();
 
 		expect(sessionWaitForIdle).toHaveBeenCalledOnce();
-		expect(agentWaitForIdle).not.toHaveBeenCalled();
 
 		options.shutdownHandler();
 		expect(fakeThis.shutdownRequested).toBe(true);

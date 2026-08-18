@@ -23,7 +23,6 @@ export { keyHint, keyText, rawKeyHint } from "./keybinding-hints.ts";
 export { LoginDialogComponent } from "./login-dialog.ts";
 export { ModelSelectorComponent } from "./model-selector.ts";
 export { OAuthSelectorComponent } from "./oauth-selector.ts";
-export { PlanInspectorComponent } from "./plan-inspector.ts";
 export {
 	type PlanDetailsAction,
 	PlanDetailsComponent,
@@ -37,18 +36,6 @@ export {
 	type RemoteControlSnapshot,
 	type RemotePairingHandle,
 } from "./remote-control-center.ts";
-export {
-	CONVERSATION_PANE_MIN_COLUMNS,
-	getResponsivePlanDimensions,
-	PLAN_PANE_DIVIDER_COLUMNS,
-	PLAN_PANE_MAX_COLUMNS,
-	PLAN_PANE_MAX_RATIO,
-	PLAN_PANE_MIN_COLUMNS,
-	PLAN_SPLIT_MIN_COLUMNS,
-	PLAN_SPLIT_MIN_ROWS,
-	type ResponsivePlanDimensions,
-	ResponsivePlanLayoutComponent,
-} from "./responsive-plan-layout.ts";
 export { type ModelsCallbacks, type ModelsConfig, ScopedModelsSelectorComponent } from "./scoped-models-selector.ts";
 export { SessionSelectorComponent } from "./session-selector.ts";
 export { type SettingsCallbacks, type SettingsConfig, SettingsSelectorComponent } from "./settings-selector.ts";

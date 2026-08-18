@@ -4,8 +4,26 @@ import { describe, expect, it } from "vitest";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import { JsonlSessionStorage, loadJsonlSessionMetadata } from "../../src/harness/session/jsonl-storage.ts";
 import { InMemorySessionStorage } from "../../src/harness/session/memory-storage.ts";
-import { type MessageEntry, ok, type SessionMetadata } from "../../src/harness/types.ts";
+import {
+	err,
+	FileError,
+	type MessageEntry,
+	ok,
+	type SessionMetadata,
+	type SessionMutation,
+	type SessionStorage,
+} from "../../src/harness/types.ts";
 import { createAssistantMessage, createTempDir, createUserMessage } from "./session-test-utils.ts";
+
+async function commitMutations(
+	storage: Pick<SessionStorage, "commitBatch" | "getBranchSnapshot">,
+	mutations: readonly SessionMutation[],
+): Promise<readonly string[]> {
+	const snapshot = await storage.getBranchSnapshot();
+	const result = await storage.commitBatch({ guard: { kind: "exact", cursor: snapshot.cursor }, mutations });
+	if (result.outcome !== "committed") throw result.error;
+	return result.record.appendedEntryIds;
+}
 
 describe("InMemorySessionStorage", () => {
 	it("returns configured session metadata", async () => {
@@ -27,14 +45,16 @@ describe("InMemorySessionStorage", () => {
 		initialEntries.push({ ...entry, id: "entry-2" });
 		expect((await storage.getEntries()).map((storedEntry) => storedEntry.id)).toEqual(["entry-1"]);
 		expect(await storage.getLeafId()).toBe("entry-1");
-		await storage.setLeafId(null);
+		await commitMutations(storage, [{ kind: "move", leafId: null }]);
 		expect(await storage.getLeafId()).toBeNull();
 		expect((await storage.getEntries()).at(-1)).toMatchObject({ type: "leaf", targetId: null });
 	});
 
 	it("rejects invalid leaf ids", async () => {
 		const storage = new InMemorySessionStorage();
-		await expect(storage.setLeafId("missing")).rejects.toThrow("Entry missing not found");
+		await expect(commitMutations(storage, [{ kind: "move", leafId: "missing" }])).rejects.toThrow(
+			"Entry missing not found",
+		);
 	});
 
 	it("finds entries by type", async () => {
@@ -60,22 +80,11 @@ describe("InMemorySessionStorage", () => {
 		};
 		const storage = new InMemorySessionStorage({ entries: [entry] });
 		expect(await storage.getLabel("entry-1")).toBeUndefined();
-		await storage.appendEntry({
-			type: "label",
-			id: "label-1",
-			parentId: "entry-1",
-			timestamp: "2026-01-01T00:00:01.000Z",
-			targetId: "entry-1",
-			label: "checkpoint",
-		});
+		await commitMutations(storage, [
+			{ kind: "append", entry: { type: "label", targetId: "entry-1", label: "checkpoint" } },
+		]);
 		expect(await storage.getLabel("entry-1")).toBe("checkpoint");
-		await storage.appendEntry({
-			type: "label",
-			id: "label-2",
-			parentId: "label-1",
-			timestamp: "2026-01-01T00:00:02.000Z",
-			targetId: "entry-1",
-		});
+		await commitMutations(storage, [{ kind: "append", entry: { type: "label", targetId: "entry-1" } }]);
 		expect(await storage.getLabel("entry-1")).toBeUndefined();
 	});
 
@@ -100,6 +109,39 @@ describe("InMemorySessionStorage", () => {
 });
 
 describe("JsonlSessionStorage", () => {
+	it("retires canonical authority after an ambiguous batch append failure", async () => {
+		let content = "";
+		let failAppend = false;
+		const fs = {
+			readTextFile: async () => ok<string, FileError>(content),
+			readTextLines: async () => ok<string[], FileError>(content.split("\n")),
+			writeFile: async (_path: string, value: string | Uint8Array) => {
+				content = typeof value === "string" ? value : new TextDecoder().decode(value);
+				return ok<void, FileError>(undefined);
+			},
+			appendFile: async (_path: string, value: string | Uint8Array) => {
+				content += typeof value === "string" ? value : new TextDecoder().decode(value);
+				return failAppend
+					? err<void, FileError>(new FileError("unknown", "append completion was ambiguous"))
+					: ok<void, FileError>(undefined);
+			},
+		};
+		const storage = await JsonlSessionStorage.create(fs, "/session.jsonl", {
+			cwd: "/workspace",
+			sessionId: "session-1",
+		});
+		const snapshot = await storage.getBranchSnapshot();
+		failAppend = true;
+		const result = await storage.commitBatch({
+			guard: { kind: "exact", cursor: snapshot.cursor },
+			mutations: [{ kind: "append", entry: { type: "message", message: createUserMessage("one") } }],
+		});
+		expect(result).toMatchObject({ outcome: "uncertain", error: { code: "authority_retired" } });
+		expect(await storage.getEntries()).toEqual([]);
+		expect(content.trim().split("\n")).toHaveLength(2);
+		await expect(storage.getBranchSnapshot()).rejects.toMatchObject({ code: "authority_retired" });
+	});
+
 	it("throws for missing files when opening", async () => {
 		const dir = createTempDir();
 		const env = new NodeExecutionEnv({ cwd: dir });
@@ -116,16 +158,12 @@ describe("JsonlSessionStorage", () => {
 		expect(readFileSync(filePath, "utf8").trim().split("\n")).toHaveLength(1);
 		expect(await storage.getLeafId()).toBeNull();
 		expect(await storage.getEntries()).toEqual([]);
-		await storage.appendEntry({
-			type: "message",
-			id: "user-1",
-			parentId: null,
-			timestamp: "2026-01-01T00:00:00.000Z",
-			message: createUserMessage("one"),
-		});
+		await commitMutations(storage, [
+			{ kind: "append", entry: { type: "message", message: createUserMessage("one") } },
+		]);
 		const lines = readFileSync(filePath, "utf8").trim().split("\n");
 		expect(JSON.parse(lines[0]!).type).toBe("session");
-		expect(JSON.parse(lines[1]!).id).toBe("user-1");
+		expect(JSON.parse(lines[1]!).type).toBe("message");
 		expect(lines).toHaveLength(2);
 	});
 
@@ -175,13 +213,9 @@ describe("JsonlSessionStorage", () => {
 			path: filePath,
 			parentSessionPath: "/tmp/parent.jsonl",
 		});
-		await storage.appendEntry({
-			type: "message",
-			id: "user-1",
-			parentId: null,
-			timestamp: "2026-01-01T00:00:00.000Z",
-			message: createUserMessage("one"),
-		});
+		await commitMutations(storage, [
+			{ kind: "append", entry: { type: "message", message: createUserMessage("one") } },
+		]);
 		expect(await loadJsonlSessionMetadata(env, filePath)).toEqual(metadata);
 	});
 
@@ -203,12 +237,12 @@ describe("JsonlSessionStorage", () => {
 			parentId: "root",
 			message: createAssistantMessage("child"),
 		};
-		await storage.appendEntry(root);
-		await storage.appendEntry(child);
+		await storage.appendImportedEntry(root);
+		await storage.appendImportedEntry(child);
 		const loaded = await JsonlSessionStorage.open(env, filePath);
 		expect(await loaded.getLeafId()).toBe("child");
 		expect((await loaded.getEntries()).map((entry) => entry.id)).toEqual(["root", "child"]);
-		await loaded.setLeafId("root");
+		await commitMutations(loaded, [{ kind: "move", leafId: "root" }]);
 		const reloaded = await JsonlSessionStorage.open(env, filePath);
 		expect(await reloaded.getLeafId()).toBe("root");
 		expect((await reloaded.getEntries()).at(-1)).toMatchObject({ type: "leaf", targetId: "root" });
@@ -220,14 +254,10 @@ describe("JsonlSessionStorage", () => {
 		const env = new NodeExecutionEnv({ cwd: dir });
 		const filePath = join(dir, "session.jsonl");
 		const storage = await JsonlSessionStorage.create(env, filePath, { cwd: dir, sessionId: "session-1" });
-		await storage.appendEntry({
-			type: "message",
-			id: "entry-1",
-			parentId: null,
-			timestamp: "2026-01-01T00:00:00.000Z",
-			message: createUserMessage("one"),
-		});
-		expect((await storage.findEntries("message")).map((found) => found.id)).toEqual(["entry-1"]);
+		const [entryId] = await commitMutations(storage, [
+			{ kind: "append", entry: { type: "message", message: createUserMessage("one") } },
+		]);
+		expect((await storage.findEntries("message")).map((found) => found.id)).toEqual([entryId]);
 		expect(await storage.findEntries("session_info")).toEqual([]);
 	});
 
@@ -236,33 +266,19 @@ describe("JsonlSessionStorage", () => {
 		const env = new NodeExecutionEnv({ cwd: dir });
 		const filePath = join(dir, "session.jsonl");
 		const storage = await JsonlSessionStorage.create(env, filePath, { cwd: dir, sessionId: "session-1" });
-		await storage.appendEntry({
-			type: "message",
-			id: "entry-1",
-			parentId: null,
-			timestamp: "2026-01-01T00:00:00.000Z",
-			message: createUserMessage("one"),
-		});
-		expect(await storage.getLabel("entry-1")).toBeUndefined();
-		await storage.appendEntry({
-			type: "label",
-			id: "label-1",
-			parentId: "entry-1",
-			timestamp: "2026-01-01T00:00:01.000Z",
-			targetId: "entry-1",
-			label: "checkpoint",
-		});
-		expect(await storage.getLabel("entry-1")).toBe("checkpoint");
-		await storage.appendEntry({
-			type: "label",
-			id: "label-2",
-			parentId: "label-1",
-			timestamp: "2026-01-01T00:00:02.000Z",
-			targetId: "entry-1",
-		});
-		expect(await storage.getLabel("entry-1")).toBeUndefined();
+		const [entryId] = await commitMutations(storage, [
+			{ kind: "append", entry: { type: "message", message: createUserMessage("one") } },
+		]);
+		if (!entryId) throw new Error("Expected committed message identity");
+		expect(await storage.getLabel(entryId)).toBeUndefined();
+		await commitMutations(storage, [
+			{ kind: "append", entry: { type: "label", targetId: entryId, label: "checkpoint" } },
+		]);
+		expect(await storage.getLabel(entryId)).toBe("checkpoint");
+		await commitMutations(storage, [{ kind: "append", entry: { type: "label", targetId: entryId } }]);
+		expect(await storage.getLabel(entryId)).toBeUndefined();
 		const loaded = await JsonlSessionStorage.open(env, filePath);
-		expect(await loaded.getLabel("entry-1")).toBeUndefined();
+		expect(await loaded.getLabel(entryId)).toBeUndefined();
 	});
 
 	it("reads session metadata through the line-reading filesystem operation", async () => {

@@ -10,7 +10,6 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@hansjm10/volt-agent-core";
 import { getModel } from "@hansjm10/volt-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession, type AgentSessionEvent } from "../src/core/agent-session.ts";
@@ -19,7 +18,7 @@ import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createCodingTools } from "../src/index.ts";
-import { API_KEY, createTestResourceLoader } from "./utilities.ts";
+import { API_KEY, createTestAgentSessionRuntimeConfig, createTestResourceLoader } from "./utilities.ts";
 
 describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 	let session: AgentSession;
@@ -47,14 +46,6 @@ describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 
 	function createSession(inMemory = false) {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
-		const agent = new Agent({
-			getApiKey: () => API_KEY,
-			initialState: {
-				model,
-				systemPrompt: "You are a helpful assistant. Be concise.",
-				tools: createCodingTools(process.cwd()),
-			},
-		});
 
 		sessionManager = inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir);
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
@@ -64,8 +55,12 @@ describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 		const modelRegistry = ModelRegistry.create(authStorage);
 
 		session = new AgentSession({
-			agent,
 			sessionManager,
+			...createTestAgentSessionRuntimeConfig({
+				model,
+				...(API_KEY === undefined ? {} : { apiKey: API_KEY }),
+				tools: createCodingTools(process.cwd()),
+			}),
 			settingsManager,
 			cwd: tempDir,
 			modelRegistry,
@@ -85,10 +80,10 @@ describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 
 		// Send a few prompts to build up history
 		await session.prompt("What is 2+2? Reply with just the number.");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		await session.prompt("What is 3+3? Reply with just the number.");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Manually compact
 		const result = await session.compact();
@@ -111,17 +106,17 @@ describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 
 		// Build up history
 		await session.prompt("What is the capital of France? One word answer.");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		await session.prompt("What is the capital of Germany? One word answer.");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Compact
 		await session.compact();
 
 		// Session should still be usable
 		await session.prompt("What is the capital of Italy? One word answer.");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Should have messages after compaction
 		expect(session.messages.length).toBeGreaterThan(0);
@@ -135,10 +130,10 @@ describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 		createSession();
 
 		await session.prompt("Say hello");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		await session.prompt("Say goodbye");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Compact
 		await session.compact();
@@ -164,10 +159,10 @@ describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 
 		// Send prompts
 		await session.prompt("What is 2+2? Reply with just the number.");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		await session.prompt("What is 3+3? Reply with just the number.");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Compact should work even without file persistence
 		const result = await session.compact();
@@ -186,7 +181,7 @@ describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 
 		// Build some history
 		await session.prompt("Say hello");
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 
 		// Manually trigger compaction and check events
 		await session.compact();

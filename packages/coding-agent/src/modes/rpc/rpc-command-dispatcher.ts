@@ -25,7 +25,13 @@ import {
 } from "../../core/review-state.ts";
 import { getRpcErrorResponseTarget, isUsableRpcConversationIdentifier } from "../../core/rpc/correlation.ts";
 import { buildRpcSessionState } from "../../core/rpc/session-state.ts";
-import { projectMessageImages, projectSessionTranscript } from "../../core/rpc/transcript.ts";
+import { projectSessionTreePage } from "../../core/rpc/session-tree.ts";
+import { resolveSessionToolCallsByResultEntryId } from "../../core/rpc/tool-call-resolution.ts";
+import {
+	projectConversationTranscriptEntry,
+	projectMessageImages,
+	projectSessionTranscript,
+} from "../../core/rpc/transcript.ts";
 import {
 	createUiActionInvocationPlan,
 	getUiActionCompletions,
@@ -45,6 +51,7 @@ import type {
 	RpcResponse,
 	RpcSessionListItem,
 	RpcSessionState,
+	RpcSessionTreePage,
 	RpcSlashCommand,
 	RpcSubagentStartResponse,
 	RpcTranscriptResponse,
@@ -183,6 +190,7 @@ function projectReviewRun(record: ReviewRunRecord, includeResult: boolean): Reco
 			description: record.target.description,
 			diffCommand: record.target.diffCommand,
 			identity: record.target.identity,
+			...(record.target.context ? { context: record.target.context } : {}),
 		},
 		options: record.options,
 		...(record.parentRunId ? { parentRunId: record.parentRunId } : {}),
@@ -793,9 +801,22 @@ export async function handleRpcCommand(
 			return createRpcSuccessResponse(id, "get_transcript", transcript);
 		}
 
+		case "get_session_tree": {
+			const entries = session.sessionManager.getEntries();
+			const toolCallsByResultEntryId = resolveSessionToolCallsByResultEntryId(entries);
+			const tree: RpcSessionTreePage = projectSessionTreePage(entries, session.sessionManager.getBranch(), {
+				sessionId: session.sessionManager.getSessionId(),
+				limit: command.limit,
+				afterOrdinal: command.afterOrdinal,
+				projectTranscriptEntry: (entry) =>
+					projectConversationTranscriptEntry(entry, toolCallsByResultEntryId.get(entry.id)),
+			});
+			return createRpcSuccessResponse(id, "get_session_tree", tree);
+		}
+
 		case "get_message_images": {
 			const result = projectMessageImages(
-				session.sessionManager.getBranch(),
+				session.sessionManager.getEntries(),
 				command.entryId,
 				command.startImageIndex,
 			);
