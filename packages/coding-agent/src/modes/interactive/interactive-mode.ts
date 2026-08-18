@@ -120,6 +120,7 @@ import {
 	listBaseBranches,
 	listRecentCommits,
 	parseReviewCommandArgs,
+	probeCurrentBranchPullRequest,
 	REMOTE_REVIEW_TOOL_NAMES,
 	REVIEW_USAGE,
 	type ResolvedReview,
@@ -8388,7 +8389,12 @@ export class InteractiveMode {
 		const uncommittedLabel = "Uncommitted changes";
 		const prLabel = "GitHub pull request";
 		const commitLabel = "Specific commit";
+		const currentPullRequest = await probeCurrentBranchPullRequest(this.sessionManager.getCwd());
+		const currentPullRequestLabel = currentPullRequest
+			? `Current PR #${currentPullRequest.number} — ${currentPullRequest.title}`
+			: undefined;
 		const choice = await this.showExtensionSelector("Review what?", [
+			...(currentPullRequestLabel ? [currentPullRequestLabel] : []),
 			branchLabel,
 			uncommittedLabel,
 			prLabel,
@@ -8396,6 +8402,9 @@ export class InteractiveMode {
 		]);
 		if (choice === undefined) {
 			return undefined;
+		}
+		if (choice === currentPullRequestLabel && currentPullRequest) {
+			return { kind: "pr", number: String(currentPullRequest.number) };
 		}
 		if (choice === branchLabel) {
 			const base = await this.promptForReviewBaseBranch();

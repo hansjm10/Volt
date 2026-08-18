@@ -22,7 +22,10 @@ describe("review snapshot tools", () => {
 		for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 	});
 
-	async function setup(limits?: { maxBlobBytes: number }): Promise<{
+	async function setup(
+		limits?: { maxBlobBytes: number },
+		withContext = false,
+	): Promise<{
 		snapshot: ReviewSnapshot;
 		tracker: ReviewCoverageTracker;
 		tools: ToolDefinition[];
@@ -47,6 +50,24 @@ describe("review snapshot tools", () => {
 			...(limits ? { limits } : {}),
 		});
 		if ("error" in resolved) throw new Error(resolved.error);
+		if (withContext) {
+			resolved.githubContext = {
+				manifest: {
+					status: "complete",
+					capturedAt: "2026-01-01T00:00:00Z",
+					linkedIssueCount: 1,
+					discussionEntryCount: 1,
+					renderedLinkedIssueCount: 1,
+					renderedDiscussionEntryCount: 1,
+					renderedBytes: 256,
+					limitations: [],
+					fingerprint: "f".repeat(64),
+				},
+				linkedIssues: [],
+				discussionEntries: [],
+				rendered: `GitHub context\n${"discussion ".repeat(100)}`,
+			};
+		}
 		snapshots.push(resolved);
 		const tracker = new ReviewCoverageTracker();
 		return { snapshot: resolved, tracker, tools: createReviewSnapshotTools(resolved, tracker) };
@@ -65,6 +86,40 @@ describe("review snapshot tools", () => {
 	function resultText(result: Awaited<ReturnType<ToolDefinition["execute"]>>): string {
 		return result.content.map((entry) => (entry.type === "text" ? entry.text : "")).join("\n");
 	}
+
+	it("pages PR context with operation-bound opaque cursors and records complete inspection", async () => {
+		const { tracker, tools } = await setup(undefined, true);
+		const context = tool(tools, "review_context");
+		let cursor: string | undefined;
+		let pages = 0;
+		do {
+			const page = await execute(context, { ...(cursor ? { cursor } : {}), maxBytes: 64 });
+			const details = page.details as { fingerprint: string; nextCursor?: string };
+			expect(details.fingerprint).toBe("f".repeat(64));
+			cursor = details.nextCursor;
+			pages++;
+		} while (cursor);
+		expect(tracker.snapshot()).toMatchObject({
+			contextInspectionComplete: true,
+			contextPagesRead: pages,
+		});
+
+		const first = await execute(context, { maxBytes: 64 });
+		const contextCursor = (first.details as { nextCursor?: string }).nextCursor;
+		if (!contextCursor) throw new Error("Expected a context cursor");
+		await expect(execute(tool(tools, "review_changed_files"), { cursor: contextCursor })).rejects.toThrow(
+			/another operation/,
+		);
+	});
+
+	it("can omit protected PR context from a context-blind tool set", async () => {
+		const { snapshot } = await setup(undefined, true);
+		const tools = createReviewSnapshotTools(snapshot, new ReviewCoverageTracker(), { includeContext: false });
+		expect(tools.map((entry) => entry.name)).not.toContain("review_context");
+		expect(tools.map((entry) => entry.name)).toEqual(
+			expect.arrayContaining(["review_changed_files", "review_diff", "review_file", "review_search", "review_tree"]),
+		);
+	});
 
 	it("pages changed files and requires full per-file diff coverage", async () => {
 		const { snapshot, tracker, tools } = await setup();

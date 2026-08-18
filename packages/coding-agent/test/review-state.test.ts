@@ -154,6 +154,59 @@ function snapshot(headOid: string, hunkId = "hunk-1"): ReviewSnapshot {
 	};
 }
 
+function prSnapshot(
+	headOid: string,
+	fingerprint: string,
+	rawMarker: string,
+	pullRequestHeadOid = "b".repeat(40),
+): ReviewSnapshot {
+	const value = snapshot(headOid);
+	value.description = "PR #7 (Context)";
+	value.diffCommand = "gh pr diff 7";
+	value.identity = {
+		...value.identity,
+		kind: "pr",
+		pullRequest: {
+			number: 7,
+			title: "Context",
+			body: "Bounded identity body",
+			url: "https://example.test/pr/7",
+			baseRefName: "main",
+			headRefName: "feature",
+			baseRefOid: "a".repeat(40),
+			headRefOid: pullRequestHeadOid,
+		},
+	};
+	value.githubContext = {
+		manifest: {
+			status: "complete",
+			capturedAt: "2026-01-01T00:00:00Z",
+			linkedIssueCount: 1,
+			discussionEntryCount: 1,
+			renderedLinkedIssueCount: 1,
+			renderedDiscussionEntryCount: 1,
+			renderedBytes: 100,
+			limitations: [],
+			fingerprint,
+		},
+		linkedIssues: [
+			{
+				id: "issue-1",
+				repository: "volt/example",
+				number: 1,
+				title: rawMarker,
+				body: rawMarker,
+				url: "https://example.test/issues/1",
+				state: "OPEN",
+				relationship: "closing",
+			},
+		],
+		discussionEntries: [{ id: "comment-1", kind: "pr-comment", body: rawMarker }],
+		rendered: rawMarker,
+	};
+	return value;
+}
+
 describe("durable review state", () => {
 	const directories: string[] = [];
 
@@ -280,6 +333,53 @@ describe("durable review state", () => {
 				scopeMode: "incremental",
 			}),
 		).toMatchObject({ mode: "full", fallbackReason: expect.stringContaining("inventory exceeded") });
+	});
+
+	it("persists only PR context metadata and preserves incremental continuity until that context changes", () => {
+		const manager = SessionManager.inMemory("/tmp/review-state");
+		const rawMarker = "PRIVATE_LINKED_ISSUE_AND_REVIEW_TEXT";
+		const firstSnapshot = prSnapshot("blob-context", "1".repeat(64), rawMarker);
+		const controls = {
+			scope: [],
+			effort: "standard" as const,
+			includeOptional: false,
+			scopeMode: "incremental" as const,
+		};
+		const firstRecord = createReviewRunRecord({
+			workflowId: "review:pr-context",
+			workflowAction: "review.pr",
+			startedAt: 1,
+			snapshot: firstSnapshot,
+			controls,
+			status: "completed",
+			result: result(),
+		});
+		expect(firstRecord.target.context).toEqual({
+			captureStatus: "complete",
+			linkedIssueCount: 1,
+			discussionEntryCount: 1,
+			renderedLinkedIssueCount: 1,
+			renderedDiscussionEntryCount: 1,
+			renderedBytes: 100,
+			limitationCodes: [],
+			fingerprint: "1".repeat(64),
+		});
+		expect(JSON.stringify(firstRecord)).not.toContain(rawMarker);
+		appendReviewRun(manager, firstRecord);
+
+		expect(
+			planIncrementalReview(manager, prSnapshot("blob-context", "1".repeat(64), "other", "c".repeat(40)), controls),
+		).toMatchObject({
+			mode: "incremental",
+			changedPaths: [],
+			priorOpenFindings: [{ id: "finding-1" }],
+		});
+		expect(
+			planIncrementalReview(manager, prSnapshot("blob-context", "2".repeat(64), "changed"), controls),
+		).toMatchObject({
+			mode: "full",
+			fallbackReason: "The pull request GitHub context changed since the prior review.",
+		});
 	});
 
 	it("honors an explicitly requested incremental parent instead of the newest run", () => {

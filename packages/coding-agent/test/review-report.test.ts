@@ -6,10 +6,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	buildParsedReview,
 	createReviewCandidateReportCollector,
+	createReviewPresentationReportCollector,
 	createReviewVerificationReportCollector,
+	declassifyReviewFindings,
 	type ReviewCandidateReport,
+	type ReviewPresentationReport,
 	type ReviewVerificationReport,
 	validateReviewCandidates,
+	validateReviewPresentations,
 	validateReviewVerification,
 } from "../src/core/review-report.ts";
 import { type ReviewSnapshot, resolveReviewSnapshot } from "../src/core/review-snapshot.ts";
@@ -121,6 +125,139 @@ describe("structured review reports", () => {
 		expect(verification.getReport()).toEqual(verificationReport);
 	});
 
+	it("declassifies PR analysis before building the public presentation", async () => {
+		const privateMarker = "private-github-discussion-marker";
+		const snapshot = await setup();
+		const privateReport = report({
+			title: privateMarker,
+			body: privateMarker,
+			trigger: privateMarker,
+			impact: privateMarker,
+			category: privateMarker,
+			rootCauseKey: privateMarker,
+			confidence: 0.956,
+		});
+		privateReport.summary = privateMarker;
+		privateReport.limitations = [privateMarker];
+		const validation = await validateReviewCandidates(snapshot, privateReport, validationOptions(snapshot));
+		expect(validation.errors).toEqual([]);
+		const verification: ReviewVerificationReport = {
+			summary: privateMarker,
+			assessment: "complete",
+			decisions: [
+				{
+					candidateId: "candidate-1",
+					outcome: "accept",
+					method: privateMarker,
+					rationale: privateMarker,
+					confidence: 0.987,
+				},
+			],
+			priorFindingDecisions: [],
+			limitations: [privateMarker],
+		};
+		const declassified = declassifyReviewFindings(validation.candidates, verification);
+		expect(declassified).toHaveLength(1);
+		expect(declassified[0]?.confidence).toBe(0.96);
+		expect(JSON.stringify(declassified)).not.toContain(privateMarker);
+		const presentation: ReviewPresentationReport = {
+			findings: [
+				{
+					presentationId: declassified[0]!.presentationId,
+					title: "Zero divisor returns the numerator",
+					body: "The new guard returns the numerator instead of a division result.",
+					trigger: "Call divide with a zero divisor.",
+					impact: "Callers receive a plausible but incorrect value.",
+					category: "correctness",
+					rootCauseKey: "zero-divisor-returns-input",
+					rationale: "The changed branch directly returns amount.",
+				},
+			],
+		};
+		const collector = createReviewPresentationReportCollector();
+		await collector.tool.execute("call", presentation, undefined, undefined, {} as never);
+		expect(collector.getReport()).toEqual(presentation);
+		expect(validateReviewPresentations(declassified, presentation)).toEqual([]);
+		expect(
+			validateReviewPresentations(declassified, presentation, {
+				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
+				filesRead: [],
+				hunksInspected: [],
+				searchesRun: 0,
+				treePagesRead: 0,
+				diffFilesFullyRead: [],
+			}).join(" "),
+		).toContain("did not inspect changed hunk");
+
+		snapshot.githubContext = {
+			manifest: {
+				status: "complete",
+				capturedAt: "2026-01-01T00:00:00Z",
+				linkedIssueCount: 0,
+				discussionEntryCount: 1,
+				renderedLinkedIssueCount: 0,
+				renderedDiscussionEntryCount: 1,
+				renderedBytes: 100,
+				limitations: [],
+				fingerprint: "d".repeat(64),
+			},
+			linkedIssues: [],
+			discussionEntries: [{ id: "comment-1", kind: "pr-comment", body: privateMarker }],
+			rendered: privateMarker,
+		};
+		const hunkIds = snapshot.changedFiles.flatMap((file) => file.hunks.map((hunk) => hunk.id));
+		const observed = {
+			changedFileInventoryComplete: true,
+			contextInspectionComplete: true,
+			contextPagesRead: 1,
+			filesRead: [],
+			hunksInspected: hunkIds,
+			searchesRun: 0,
+			treePagesRead: 0,
+			diffFilesFullyRead: ["src/divide.ts"],
+		};
+		const parsed = buildParsedReview({
+			snapshot,
+			candidateReport: privateReport,
+			validatedCandidates: validation.candidates,
+			verificationReport: verification,
+			declassifiedFindings: declassified,
+			presentationReport: presentation,
+			discoveryCoverage: observed,
+			verificationCoverage: observed,
+			commandsRun: [privateMarker],
+			failedVerificationAttempts: [privateMarker],
+			excludedPaths: [],
+		});
+		expect(JSON.stringify(parsed)).not.toContain(privateMarker);
+		expect(parsed).toMatchObject({
+			summary: "Review completed with 1 verified finding.",
+			findings: [
+				{
+					title: "Zero divisor returns the numerator",
+					confidence: 0.96,
+					verification: {
+						outcome: "accepted",
+						method:
+							"Independent verification accepted this finding; a separate context-blind pass rendered the code-based rationale.",
+						rationale: "The changed branch directly returns amount.",
+						confidence: 0.96,
+					},
+				},
+			],
+			coverage: {
+				commandsRun: ["1 bash command(s) completed during review."],
+				failedVerificationAttempts: ["1 verification tool attempt(s) failed."],
+				modelReportedLimitations: [
+					"Discovery reported 1 model limitation(s).",
+					"Verification reported 1 model limitation(s).",
+				],
+			},
+		});
+	});
+
 	it("validates changed-side anchors and computes stable host fingerprints", async () => {
 		const snapshot = await setup();
 		const first = await validateReviewCandidates(snapshot, report(), validationOptions(snapshot));
@@ -209,8 +346,20 @@ describe("structured review reports", () => {
 			candidateReport: report(),
 			validatedCandidates: validated.candidates,
 			verificationReport: verification,
+			discoveryCoverage: {
+				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
+				filesRead: [],
+				hunksInspected: hunkIds,
+				searchesRun: 0,
+				treePagesRead: 0,
+				diffFilesFullyRead: ["src/divide.ts"],
+			},
 			verificationCoverage: {
 				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
 				filesRead: [],
 				hunksInspected: hunkIds,
 				searchesRun: 1,
@@ -227,6 +376,15 @@ describe("structured review reports", () => {
 			commandsRun: ["npm run focused-check"],
 			failedVerificationAttempts: ["bash: npm run missing"],
 		});
+		expect(complete.findings[0]).toMatchObject({
+			confidence: 0.95,
+			verification: {
+				outcome: "accepted",
+				method: "Compared exact blobs.",
+				rationale: "The trigger is present.",
+				confidence: 0.98,
+			},
+		});
 		expect(complete.findings[0]).not.toHaveProperty("file");
 
 		const incomplete = buildParsedReview({
@@ -240,8 +398,20 @@ describe("structured review reports", () => {
 				priorFindingDecisions: [],
 				limitations: [],
 			},
+			discoveryCoverage: {
+				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
+				filesRead: [],
+				hunksInspected: [],
+				searchesRun: 0,
+				treePagesRead: 0,
+				diffFilesFullyRead: [],
+			},
 			verificationCoverage: {
 				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
 				filesRead: [],
 				hunksInspected: [],
 				searchesRun: 0,
@@ -255,6 +425,70 @@ describe("structured review reports", () => {
 		expect(incomplete.completionStatus).toBe("incomplete");
 		expect(incomplete.overallCorrectness).toBeUndefined();
 		expect(incomplete.coverage.uncheckedAreas).toHaveLength(1);
+	});
+
+	it("withholds correctness when PR context capture or either pass inspection is incomplete", async () => {
+		const snapshot = await setup();
+		snapshot.githubContext = {
+			manifest: {
+				status: "incomplete",
+				capturedAt: "2026-01-01T00:00:00Z",
+				linkedIssueCount: 1,
+				discussionEntryCount: 2,
+				renderedLinkedIssueCount: 1,
+				renderedDiscussionEntryCount: 2,
+				renderedBytes: 100,
+				limitations: [{ code: "api-error", source: "review-threads", count: 1 }],
+				fingerprint: "c".repeat(64),
+			},
+			linkedIssues: [],
+			discussionEntries: [],
+			rendered: "untrusted GitHub context",
+		};
+		const hunkIds = snapshot.changedFiles.flatMap((file) => file.hunks.map((hunk) => hunk.id));
+		const candidateReport: ReviewCandidateReport = { summary: "No findings.", candidates: [], limitations: [] };
+		const verificationReport: ReviewVerificationReport = {
+			summary: "No omission found.",
+			assessment: "complete",
+			decisions: [],
+			priorFindingDecisions: [],
+			limitations: [],
+		};
+		const observed = (contextInspectionComplete: boolean) => ({
+			changedFileInventoryComplete: true,
+			contextInspectionComplete,
+			contextPagesRead: contextInspectionComplete ? 1 : 0,
+			filesRead: [],
+			hunksInspected: hunkIds,
+			searchesRun: 0,
+			treePagesRead: 0,
+			diffFilesFullyRead: ["src/divide.ts"],
+		});
+		const parsed = buildParsedReview({
+			snapshot,
+			candidateReport,
+			validatedCandidates: [],
+			verificationReport,
+			discoveryCoverage: observed(false),
+			verificationCoverage: observed(true),
+			commandsRun: [],
+			failedVerificationAttempts: [],
+			excludedPaths: [],
+		});
+		expect(parsed.completionStatus).toBe("incomplete");
+		expect(parsed.overallCorrectness).toBeUndefined();
+		expect(parsed.coverage.context).toMatchObject({
+			captureStatus: "incomplete",
+			discoveryInspectionComplete: false,
+			verificationInspectionComplete: true,
+			limitationCodes: ["api-error"],
+		});
+		expect(parsed.coverage.uncheckedAreas).toEqual(
+			expect.arrayContaining([
+				"GitHub pull request context capture was incomplete.",
+				"Discovery did not page GitHub pull request context to completion.",
+			]),
+		);
 	});
 
 	it("marks unsupported in-scope changes incomplete unless they are excluded", async () => {
@@ -292,8 +526,20 @@ describe("structured review reports", () => {
 			candidateReport,
 			validatedCandidates: [],
 			verificationReport,
+			discoveryCoverage: {
+				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
+				filesRead: [],
+				hunksInspected: [],
+				searchesRun: 0,
+				treePagesRead: 1,
+				diffFilesFullyRead: [],
+			},
 			verificationCoverage: {
 				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
 				filesRead: [],
 				hunksInspected: [],
 				searchesRun: 0,
