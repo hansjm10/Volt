@@ -171,7 +171,8 @@ function cloneControls(controls: ReviewRunControls): ReviewRunControls {
 	};
 }
 
-function boundParsedReview(result: ParsedReview, includeEvidence: boolean): ParsedReview {
+/** Bounds an already-declassified public result; private analysis reports must never reach persistence. */
+function boundPublicReviewResult(result: ParsedReview, includeEvidence: boolean): ParsedReview {
 	const maximumCoverageItems = includeEvidence ? MAX_PERSISTED_COVERAGE_ITEMS : MAX_COMPACT_COVERAGE_ITEMS;
 	const coverageWasCompacted = [
 		result.coverage.filesInspected.length,
@@ -481,7 +482,7 @@ export function createReviewRunRecord(options: {
 			files: snapshotFileIdentities(options.snapshot),
 		},
 		options: cloneControls(options.controls),
-		...(options.result ? { result: boundParsedReview(options.result, includeEvidence) } : {}),
+		...(options.result ? { result: boundPublicReviewResult(options.result, includeEvidence) } : {}),
 		...(options.errorMessage ? { errorMessage: truncateUtf8(options.errorMessage, 4_000) } : {}),
 		...(options.incrementalPlan?.previousRun ? { parentRunId: options.incrementalPlan.previousRun.runId } : {}),
 		...(options.incrementalPlan?.fallbackReason

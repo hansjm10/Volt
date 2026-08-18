@@ -68,6 +68,33 @@ export interface ReviewVerificationReport {
 	limitations: string[];
 }
 
+export interface ReviewFindingPresentation {
+	presentationId: string;
+	title: string;
+	body: string;
+	trigger: string;
+	impact: string;
+	category: string;
+	rootCauseKey: string;
+	rationale: string;
+}
+
+export interface ReviewPresentationReport {
+	findings: ReviewFindingPresentation[];
+}
+
+export interface DeclassifiedReviewFinding {
+	presentationId: string;
+	id: string;
+	fingerprint: string;
+	status: ReviewFindingStatus;
+	priority: ReviewPriority;
+	confidence: number;
+	changeLocation: ReviewLocation;
+	evidenceLocations: ReviewLocation[];
+	hunkIds: string[];
+}
+
 export interface ReviewFindingVerification {
 	outcome: "accepted";
 	method: string;
@@ -152,6 +179,8 @@ export interface BuildParsedReviewOptions {
 	candidateReport: ReviewCandidateReport;
 	validatedCandidates: ValidatedReviewCandidate[];
 	verificationReport: ReviewVerificationReport;
+	declassifiedFindings?: DeclassifiedReviewFinding[];
+	presentationReport?: ReviewPresentationReport;
 	discoveryCoverage: ReviewObservedCoverage;
 	verificationCoverage: ReviewObservedCoverage;
 	commandsRun: string[];
@@ -229,6 +258,25 @@ export const ReviewVerificationReportSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
+const FindingPresentationSchema = Type.Object(
+	{
+		presentationId: Type.String({ minLength: 1, maxLength: 120 }),
+		title: Type.String({ minLength: 1, maxLength: 200 }),
+		body: Type.String({ minLength: 1, maxLength: 4_000 }),
+		trigger: Type.String({ minLength: 1, maxLength: 1_000 }),
+		impact: Type.String({ minLength: 1, maxLength: 1_000 }),
+		category: Type.String({ minLength: 1, maxLength: 80, pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$" }),
+		rootCauseKey: Type.String({ minLength: 1, maxLength: 160, pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$" }),
+		rationale: Type.String({ minLength: 1, maxLength: 2_000 }),
+	},
+	{ additionalProperties: false },
+);
+
+export const ReviewPresentationReportSchema = Type.Object(
+	{ findings: Type.Array(FindingPresentationSchema, { maxItems: 50 }) },
+	{ additionalProperties: false },
+);
+
 export function createReviewCandidateReportCollector(): ReviewReportCollector<ReviewCandidateReport> {
 	let report: ReviewCandidateReport | undefined;
 	const tool = defineTool({
@@ -275,6 +323,37 @@ export function createReviewVerificationReportCollector(): ReviewReportCollector
 					{
 						type: "text",
 						text: `Verification report accepted (${params.decisions.length} decision${params.decisions.length === 1 ? "" : "s"}).`,
+					},
+				],
+				details: params,
+				disposition: "stop",
+			};
+		},
+	});
+	return {
+		tool,
+		getReport: () => report,
+		clear: () => {
+			report = undefined;
+		},
+	};
+}
+
+export function createReviewPresentationReportCollector(): ReviewReportCollector<ReviewPresentationReport> {
+	let report: ReviewPresentationReport | undefined;
+	const tool = defineTool({
+		name: "report_review_presentations",
+		label: "report_review_presentations",
+		description:
+			"Submit code-derived prose for every supplied presentation id. This terminates the context-blind presentation pass.",
+		parameters: ReviewPresentationReportSchema,
+		async execute(_toolCallId, params) {
+			report = structuredClone(params);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Presentation report accepted (${params.findings.length} finding${params.findings.length === 1 ? "" : "s"}).`,
 					},
 				],
 				details: params,
@@ -476,6 +555,91 @@ export function validateReviewVerification(
 	return errors;
 }
 
+export function declassifyReviewFindings(
+	candidates: readonly ValidatedReviewCandidate[],
+	report: ReviewVerificationReport,
+): DeclassifiedReviewFinding[] {
+	const decisions = new Map(report.decisions.map((decision) => [decision.candidateId, decision]));
+	return candidates.flatMap((candidate) => {
+		const decision = decisions.get(candidate.candidateId);
+		if (!decision || decision.outcome !== "accept") return [];
+		return [
+			{
+				presentationId: randomUUID(),
+				id: randomUUID(),
+				fingerprint: candidate.fingerprint,
+				status: "open" as const,
+				priority: candidate.priority,
+				confidence: Math.round(Math.min(candidate.confidence, decision.confidence) * 100) / 100,
+				changeLocation: structuredClone(candidate.changeLocation),
+				evidenceLocations: structuredClone(candidate.evidenceLocations),
+				hunkIds: [...candidate.hunkIds],
+			},
+		];
+	});
+}
+
+export function validateReviewPresentations(
+	findings: readonly DeclassifiedReviewFinding[],
+	report: ReviewPresentationReport,
+	coverage?: ReviewObservedCoverage,
+): string[] {
+	const errors: string[] = [];
+	const expectedIds = new Set(findings.map((finding) => finding.presentationId));
+	const seen = new Set<string>();
+	for (const [index, presentation] of report.findings.entries()) {
+		if (!expectedIds.has(presentation.presentationId)) {
+			errors.push(`findings[${index}] references unknown presentation ${presentation.presentationId}`);
+		}
+		if (seen.has(presentation.presentationId)) {
+			errors.push(`findings[${index}] duplicates presentation ${presentation.presentationId}`);
+		}
+		seen.add(presentation.presentationId);
+	}
+	for (const presentationId of expectedIds) {
+		if (!seen.has(presentationId)) errors.push(`Missing presentation for ${presentationId}`);
+	}
+	if (coverage) {
+		const inspectedHunks = new Set(coverage.hunksInspected);
+		for (const finding of findings) {
+			for (const hunkId of finding.hunkIds) {
+				if (!inspectedHunks.has(hunkId)) {
+					errors.push(`Presentation ${finding.presentationId} did not inspect changed hunk ${hunkId}`);
+				}
+			}
+		}
+	}
+	return errors;
+}
+
+function presentationFromPrivateAnalysis(
+	findings: readonly DeclassifiedReviewFinding[],
+	candidates: readonly ValidatedReviewCandidate[],
+	report: ReviewVerificationReport,
+): ReviewPresentationReport {
+	const candidatesByFingerprint = new Map(candidates.map((candidate) => [candidate.fingerprint, candidate]));
+	const decisions = new Map(report.decisions.map((decision) => [decision.candidateId, decision]));
+	return {
+		findings: findings.map((finding) => {
+			const candidate = candidatesByFingerprint.get(finding.fingerprint);
+			const decision = candidate ? decisions.get(candidate.candidateId) : undefined;
+			if (!candidate || !decision || decision.outcome !== "accept") {
+				throw new Error(`Missing private analysis for presentation ${finding.presentationId}`);
+			}
+			return {
+				presentationId: finding.presentationId,
+				title: candidate.title,
+				body: candidate.body,
+				trigger: candidate.trigger,
+				impact: candidate.impact,
+				category: candidate.category,
+				rootCauseKey: candidate.rootCauseKey,
+				rationale: decision.rationale,
+			};
+		}),
+	};
+}
+
 function expectedReviewableHunkIds(snapshot: ReviewSnapshot, excludedPaths: ReadonlySet<string>): string[] {
 	return snapshot.changedFiles
 		.filter((file) => file.reviewable && !excludedPaths.has(file.path))
@@ -483,34 +647,59 @@ function expectedReviewableHunkIds(snapshot: ReviewSnapshot, excludedPaths: Read
 		.sort();
 }
 
+const REVIEW_PRESENTATION_VERIFICATION_METHOD =
+	"Independent verification accepted this finding; a separate context-blind pass rendered the code-based rationale.";
+
+export function hostReviewSummary(completionStatus: ReviewCompletionStatus, findingCount: number): string {
+	const findings = `${findingCount} verified finding${findingCount === 1 ? "" : "s"}`;
+	return completionStatus === "complete"
+		? `Review completed with ${findings}.`
+		: `Review incomplete with ${findings}.`;
+}
+
 export function buildParsedReview(options: BuildParsedReviewOptions): ParsedReview {
-	const decisions = new Map(options.verificationReport.decisions.map((decision) => [decision.candidateId, decision]));
-	const findings: ReviewFinding[] = options.validatedCandidates.flatMap((candidate) => {
-		const decision = decisions.get(candidate.candidateId);
-		if (!decision || decision.outcome !== "accept") return [];
-		return [
-			{
-				id: randomUUID(),
-				fingerprint: candidate.fingerprint,
-				status: "open" as const,
-				title: candidate.title,
-				body: candidate.body,
-				trigger: candidate.trigger,
-				impact: candidate.impact,
-				category: candidate.category,
-				rootCauseKey: candidate.rootCauseKey,
-				priority: candidate.priority,
-				confidence: Math.min(candidate.confidence, decision.confidence),
-				changeLocation: candidate.changeLocation,
-				evidenceLocations: candidate.evidenceLocations,
-				verification: {
-					outcome: "accepted" as const,
-					method: decision.method,
-					rationale: decision.rationale,
-					confidence: decision.confidence,
-				},
+	const declassifiedFindings =
+		options.declassifiedFindings ?? declassifyReviewFindings(options.validatedCandidates, options.verificationReport);
+	const presentationReport =
+		options.presentationReport ??
+		(options.snapshot.githubContext && declassifiedFindings.length > 0
+			? undefined
+			: presentationFromPrivateAnalysis(
+					declassifiedFindings,
+					options.validatedCandidates,
+					options.verificationReport,
+				));
+	if (!presentationReport) throw new Error("PR findings require a context-blind presentation report.");
+	const presentationErrors = validateReviewPresentations(declassifiedFindings, presentationReport);
+	if (presentationErrors.length > 0)
+		throw new Error(`Review presentation is invalid: ${presentationErrors.join("; ")}`);
+	const presentations = new Map(
+		presentationReport.findings.map((presentation) => [presentation.presentationId, presentation]),
+	);
+	const findings: ReviewFinding[] = declassifiedFindings.map((finding) => {
+		const presentation = presentations.get(finding.presentationId);
+		if (!presentation) throw new Error(`Missing presentation for ${finding.presentationId}`);
+		return {
+			id: finding.id,
+			fingerprint: finding.fingerprint,
+			status: finding.status,
+			title: presentation.title,
+			body: presentation.body,
+			trigger: presentation.trigger,
+			impact: presentation.impact,
+			category: presentation.category,
+			rootCauseKey: presentation.rootCauseKey,
+			priority: finding.priority,
+			confidence: finding.confidence,
+			changeLocation: structuredClone(finding.changeLocation),
+			evidenceLocations: structuredClone(finding.evidenceLocations),
+			verification: {
+				outcome: "accepted",
+				method: REVIEW_PRESENTATION_VERIFICATION_METHOD,
+				rationale: presentation.rationale,
+				confidence: finding.confidence,
 			},
-		];
+		};
 	});
 	const excluded = new Set(options.excludedPaths.map((entry) => entry.path));
 	const expectedHunks = expectedReviewableHunkIds(options.snapshot, excluded);
@@ -558,14 +747,38 @@ export function buildParsedReview(options: BuildParsedReviewOptions): ParsedRevi
 				? ("incorrect" as const)
 				: ("correct" as const)
 			: undefined;
-	const residualRisk = [
-		...uncheckedAreas,
-		...(options.verificationReport.challenge ? [`Verifier challenge: ${options.verificationReport.challenge}`] : []),
-	];
-	const summary = [options.candidateReport.summary, options.verificationReport.summary].filter(Boolean).join(" ");
+	const protectedContext = contextCoverage !== undefined;
+	const challenge = options.verificationReport.challenge
+		? protectedContext
+			? "Independent verification reported a completeness challenge."
+			: options.verificationReport.challenge
+		: undefined;
+	const residualRisk = [...uncheckedAreas, ...(challenge ? [`Verifier challenge: ${challenge}`] : [])];
+	const modelReportedLimitations = protectedContext
+		? [
+				...(options.candidateReport.limitations.length > 0
+					? [`Discovery reported ${options.candidateReport.limitations.length} model limitation(s).`]
+					: []),
+				...(options.verificationReport.limitations.length > 0
+					? [`Verification reported ${options.verificationReport.limitations.length} model limitation(s).`]
+					: []),
+			]
+		: [...options.candidateReport.limitations, ...options.verificationReport.limitations];
+	const commandsRun = protectedContext
+		? options.commandsRun.length > 0
+			? [`${options.commandsRun.length} bash command(s) completed during review.`]
+			: []
+		: [...options.commandsRun];
+	const failedVerificationAttempts = protectedContext
+		? options.failedVerificationAttempts.length > 0
+			? [`${options.failedVerificationAttempts.length} verification tool attempt(s) failed.`]
+			: []
+		: [...options.failedVerificationAttempts];
 	return {
 		completionStatus,
-		summary,
+		summary: protectedContext
+			? hostReviewSummary(completionStatus, findings.length)
+			: [options.candidateReport.summary, options.verificationReport.summary].filter(Boolean).join(" "),
 		findings,
 		coverage: {
 			changedFileInventoryComplete: options.verificationCoverage.changedFileInventoryComplete,
@@ -574,12 +787,12 @@ export function buildParsedReview(options: BuildParsedReviewOptions): ParsedRevi
 				...new Set([...options.verificationCoverage.filesRead, ...options.verificationCoverage.diffFilesFullyRead]),
 			].sort(),
 			hunksInspected: options.verificationCoverage.hunksInspected,
-			commandsRun: [...options.commandsRun],
-			failedVerificationAttempts: [...options.failedVerificationAttempts],
+			commandsRun,
+			failedVerificationAttempts,
 			exclusions: options.excludedPaths,
 			uncheckedAreas,
 			residualRisk,
-			modelReportedLimitations: [...options.candidateReport.limitations, ...options.verificationReport.limitations],
+			modelReportedLimitations,
 		},
 		...(overallCorrectness ? { overallCorrectness } : {}),
 		overallExplanation:
@@ -588,6 +801,6 @@ export function buildParsedReview(options: BuildParsedReviewOptions): ParsedRevi
 				: overallCorrectness === "incorrect"
 					? `${blockingFindings.length} verified P0-P2 finding${blockingFindings.length === 1 ? " remains" : "s remain"}.`
 					: "No verified P0-P2 findings remain.",
-		...(options.verificationReport.challenge ? { verificationChallenge: options.verificationReport.challenge } : {}),
+		...(challenge ? { verificationChallenge: challenge } : {}),
 	};
 }

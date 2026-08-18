@@ -765,6 +765,72 @@ describe("review snapshots", () => {
 		);
 	});
 
+	it("fails closed when manifest byte convergence crosses the aggregate boundary", async () => {
+		const repository = createRepository();
+		const oid = "c".repeat(40);
+		const view = {
+			id: "PR_boundary",
+			number: 274,
+			title: "Boundary",
+			body: "Body",
+			baseRefName: "main",
+			headRefName: "feature",
+			url: "https://example.test/pr/274",
+			baseRefOid: oid,
+			headRefOid: oid,
+		};
+		const configPath = join(repository, "bin", "gh-config.json");
+		const configFor = (finalBodyBytes: number): GitHubShimConfig => ({
+			view,
+			graphql: {
+				[graphqlKey("VoltReviewPullRequestComments", "PR_boundary", null)]: graphqlConnection("comments", [
+					...Array.from({ length: 7 }, (_, index) => ({
+						id: `comment-${index}`,
+						body: "x".repeat(32 * 1024),
+					})),
+					{ id: "comment-final", body: "y".repeat(finalBodyBytes) },
+				]),
+			},
+		});
+		installGitHubShim(repository, configFor(31_637));
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+		const capture = async () => {
+			const captured = await captureReviewGitHubContext({
+				cwd: repository,
+				number: "274",
+				maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
+			});
+			expect(captured.ok).toBe(true);
+			if (!captured.ok) throw new Error(captured.error);
+			expect(captured.context.manifest.renderedBytes).toBe(Buffer.byteLength(captured.context.rendered, "utf8"));
+			if (captured.context.manifest.status === "complete") {
+				expect(captured.context.manifest.renderedLinkedIssueCount).toBe(captured.context.manifest.linkedIssueCount);
+				expect(captured.context.manifest.renderedDiscussionEntryCount).toBe(
+					captured.context.manifest.discussionEntryCount,
+				);
+			}
+			return captured.context;
+		};
+
+		const atLimit = await capture();
+		expect(atLimit.manifest).toMatchObject({
+			status: "complete",
+			discussionEntryCount: 8,
+			renderedDiscussionEntryCount: 8,
+			renderedBytes: 256 * 1024,
+			limitations: [],
+		});
+
+		writeFileSync(configPath, JSON.stringify(configFor(31_638)));
+		const overLimit = await capture();
+		expect(overLimit.manifest).toMatchObject({
+			status: "incomplete",
+			discussionEntryCount: 8,
+			renderedDiscussionEntryCount: 7,
+		});
+		expect(overLimit.manifest.limitations.map((limitation) => limitation.code)).toContain("aggregate-limit");
+	});
+
 	it("classifies submodule entries as unsupported", async () => {
 		const dependency = createRepository();
 		const repository = createRepository();

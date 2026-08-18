@@ -112,6 +112,15 @@ describe("review snapshot tools", () => {
 		);
 	});
 
+	it("can omit protected PR context from a context-blind tool set", async () => {
+		const { snapshot } = await setup(undefined, true);
+		const tools = createReviewSnapshotTools(snapshot, new ReviewCoverageTracker(), { includeContext: false });
+		expect(tools.map((entry) => entry.name)).not.toContain("review_context");
+		expect(tools.map((entry) => entry.name)).toEqual(
+			expect.arrayContaining(["review_changed_files", "review_diff", "review_file", "review_search", "review_tree"]),
+		);
+	});
+
 	it("pages changed files and requires full per-file diff coverage", async () => {
 		const { snapshot, tracker, tools } = await setup();
 		const changed = tool(tools, "review_changed_files");

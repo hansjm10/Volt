@@ -6,6 +6,7 @@ import { join, relative, resolve, sep } from "node:path";
 import type { ThinkingLevel } from "@hansjm10/volt-agent-core";
 import type { Api, Model } from "@hansjm10/volt-ai";
 import { minimatch } from "minimatch";
+import { spawnProcess } from "../utils/child-process.ts";
 import type { AgentSession, AgentSessionEvent } from "./agent-session.ts";
 import type { AgentSessionRuntime } from "./agent-session-runtime.ts";
 import type { AuthStorage } from "./auth-storage.ts";
@@ -18,14 +19,20 @@ import type { ResourceLoader } from "./resource-loader.ts";
 import {
 	buildParsedReview,
 	createReviewCandidateReportCollector,
+	createReviewPresentationReportCollector,
 	createReviewVerificationReportCollector,
+	type DeclassifiedReviewFinding,
+	declassifyReviewFindings,
+	hostReviewSummary,
 	type ParsedReview,
 	type ReviewCandidateReport,
 	type ReviewCoverage,
 	type ReviewFinding,
+	type ReviewPresentationReport,
 	type ReviewReportCollector,
 	type ValidatedReviewCandidate,
 	validateReviewCandidates,
+	validateReviewPresentations,
 	validateReviewVerification,
 } from "./review-report.ts";
 import {
@@ -89,7 +96,11 @@ const CURRENT_PR_PROBE_TIMEOUT_MS = 1_500;
 const CURRENT_PR_PROBE_MAX_BYTES = 32 * 1024;
 const CURRENT_PR_TITLE_MAX_BYTES = 160;
 const MUTABLE_WORKSPACE_REVIEW_TOOLS = new Set(["read", "grep", "find", "ls", "edit", "write"]);
-const REVIEW_REPORT_TOOL_NAMES = new Set(["report_review_candidates", "report_review_verification"]);
+const REVIEW_REPORT_TOOL_NAMES = new Set([
+	"report_review_candidates",
+	"report_review_verification",
+	"report_review_presentations",
+]);
 
 interface CommandResult {
 	ok: boolean;
@@ -296,7 +307,7 @@ export async function probeCurrentBranchPullRequest(cwd: string): Promise<Curren
 	timer.unref?.();
 	try {
 		return await new Promise((resolveResult) => {
-			const proc = spawn("gh", ["pr", "view", "--json", "number,title"], {
+			const proc = spawnProcess("gh", ["pr", "view", "--json", "number,title"], {
 				cwd,
 				stdio: ["ignore", "pipe", "pipe"],
 				env: process.env,
@@ -428,6 +439,18 @@ export const REVIEW_VERIFIER_SYSTEM_PROMPT = `<review_verifier_prompt>
 </rules>
 </review_verifier_prompt>`;
 
+export const REVIEW_PRESENTATION_SYSTEM_PROMPT = `<review_presentation_prompt>
+<role>You are a context-blind presentation pass. You receive host-declassified finding anchors and immutable repository tools, but no GitHub discussion or private analysis prose.</role>
+<goal>Render useful code-derived prose for every supplied presentation id without changing finding identity, scope, severity, or anchors.</goal>
+<rules>
+- Inspect the complete diff for every supplied finding path before reporting.
+- Derive title, body, trigger, impact, category, root-cause key, and rationale only from immutable code evidence and trusted review policy.
+- Return exactly one entry for every supplied presentation id and no others.
+- Do not infer or request GitHub context, prior discussion, candidate prose, verifier prose, or model configuration.
+- Call report_review_presentations exactly once. Do not serialize JSON/XML in prose.
+</rules>
+</review_presentation_prompt>`;
+
 function escapeXml(value: string): string {
 	return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -544,6 +567,27 @@ function buildVerificationPrompt(
 	].join("\n");
 }
 
+function buildPresentationPrompt(findings: readonly DeclassifiedReviewFinding[]): string {
+	const declassified = findings.map((finding) => ({
+		presentationId: finding.presentationId,
+		priority: finding.priority,
+		changeLocation: finding.changeLocation,
+		evidenceLocations: finding.evidenceLocations,
+		hunkIds: finding.hunkIds,
+	}));
+	return [
+		"<review_presentation_request>",
+		`<declassified_findings>${escapeXml(JSON.stringify(declassified))}</declassified_findings>`,
+		"<available_tool_guidance>",
+		"<instruction>Use review_diff to page the complete immutable diff for every supplied finding path.</instruction>",
+		"<instruction>Use review_file, review_search, and review_tree only for code context needed to render the supplied findings.</instruction>",
+		"<instruction>No GitHub context tool or command-capable tool is available in this pass.</instruction>",
+		"</available_tool_guidance>",
+		"<task>Inspect every supplied finding hunk, render code-derived prose for each presentation id, and terminate with report_review_presentations.</task>",
+		"</review_presentation_request>",
+	].join("\n");
+}
+
 export function stripReviewEnvelopeForDisplay(text: string): string {
 	return text.trim();
 }
@@ -553,7 +597,7 @@ export function formatReviewForNewSession(
 	parsed: ParsedReview,
 ): string {
 	const lines = [
-		`An automated code review of ${resolved.description} was completed in separate discovery and verification sessions.`,
+		`An automated code review of ${resolved.description} was completed in separate discovery and verification sessions, with context-blind presentation for newly accepted PR findings.`,
 		"",
 		`Status: ${parsed.completionStatus}`,
 		`Summary: ${parsed.summary}`,
@@ -700,7 +744,7 @@ function collectParentExtensionTools(parentResourceLoader: ResourceLoader | unde
 	return Array.from(toolsByName.values());
 }
 
-export type ReviewPass = "discovery" | "verification";
+export type ReviewPass = "discovery" | "verification" | "presentation";
 
 export interface ReviewUsageSnapshot extends SessionUsageProjection {
 	pass: ReviewPass;
@@ -913,7 +957,7 @@ export function createReviewConfirmationMessage(resolution: ResolvedReview): str
 		"",
 		"Volt will capture an exact immutable Git snapshot, run separate discovery and verification model passes, may use selected auxiliary tools in a disposable checkout, consume model tokens, and create a fresh session seeded with verified findings.",
 		resolution.githubContext
-			? "Both model passes will receive host-captured GitHub pull request text, including linked issues, comments, submitted review summaries, and inline review threads/replies."
+			? "Discovery and verification will receive host-captured GitHub pull request text, including linked issues, comments, submitted review summaries, and inline review threads/replies. Retained findings use an additional context-blind presentation pass that sees only validated code anchors and immutable repository content."
 			: undefined,
 		`Snapshot: ${resolution.identity.baseTree}..${resolution.identity.headTree}`,
 	]
@@ -1383,11 +1427,50 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 			onUsage: options.onUsage,
 		});
 		const verificationReport = verificationPass.report;
+		const suppressedFingerprints = new Set(options.incrementalPlan?.suppressedDismissedFingerprints ?? []);
+		const declassifiedFindings = declassifyReviewFindings(validatedCandidates, verificationReport).filter(
+			(finding) => !suppressedFingerprints.has(finding.fingerprint),
+		);
+		let presentationReport: ReviewPresentationReport | undefined;
+		if (snapshot.githubContext && declassifiedFindings.length > 0) {
+			const presentationTracker = new ReviewCoverageTracker();
+			const presentationSnapshotTools = createReviewSnapshotTools(snapshot, presentationTracker, {
+				includeContext: false,
+			});
+			const presentationCollector = createReviewPresentationReportCollector();
+			const presentationPass = await runReviewPass({
+				name: "presentation",
+				cwd: reviewCwd,
+				agentDir: options.agentDir,
+				model: options.verifierModel ?? options.model,
+				thinkingLevel: effortThinkingLevel(options.thinkingLevel, controls.effort),
+				fastModeEnabled: options.fastModeEnabled,
+				authStorage: options.authStorage,
+				modelRegistry: options.modelRegistry,
+				settingsManager: options.settingsManager,
+				resourceLoader: createReviewResourceLoader(REVIEW_PRESENTATION_SYSTEM_PROMPT, contextFiles),
+				customTools: [...presentationSnapshotTools, presentationCollector.tool],
+				activeTools: [...presentationSnapshotTools.map((tool) => tool.name), presentationCollector.tool.name],
+				collector: presentationCollector,
+				prompt: buildPresentationPrompt(declassifiedFindings),
+				repair: (report) =>
+					report
+						? validateReviewPresentations(declassifiedFindings, report, presentationTracker.snapshot())
+						: ["report_review_presentations was not called with a valid payload"],
+				priorUsage: verificationPass.usage,
+				signal: options.signal,
+				onEvent: onSessionEvent,
+				onUsage: options.onUsage,
+			});
+			presentationReport = presentationPass.report;
+		}
 		const parsed = buildParsedReview({
 			snapshot,
 			candidateReport,
 			validatedCandidates,
 			verificationReport,
+			declassifiedFindings,
+			...(presentationReport ? { presentationReport } : {}),
 			discoveryCoverage: discoveryTracker.snapshot(),
 			verificationCoverage: verificationTracker.snapshot(),
 			commandsRun: commandRuns,
@@ -1404,12 +1487,6 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 			const finding = currentByFingerprint.get(prior.fingerprint) ?? structuredClone(prior);
 			finding.id = prior.id;
 			finding.status = decision.outcome;
-			finding.verification = {
-				outcome: "accepted",
-				method: decision.method,
-				rationale: decision.rationale,
-				confidence: decision.confidence,
-			};
 			if (!currentByFingerprint.has(prior.fingerprint)) parsed.findings.push(finding);
 		}
 		if (parsed.findings.some((finding) => finding.status === "uncertain")) {
@@ -1428,6 +1505,7 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 					? "The host retained at least one independently verified P0-P2 finding."
 					: "Independent verification completed with no retained P0-P2 findings.";
 		}
+		if (snapshot.githubContext) parsed.summary = hostReviewSummary(parsed.completionStatus, parsed.findings.length);
 		return { aborted: false, raw: parsed.summary, parsed };
 	} catch (error) {
 		if (options.signal?.aborted || (error instanceof Error && error.message === "Review aborted"))
@@ -1488,9 +1566,10 @@ export async function executeReviewWorkflow(
 		return { status: "cancelled", record };
 	}
 	if (result.errorMessage || !result.parsed) {
-		const errorMessage = options.sanitizeRemoteErrors
-			? REMOTE_REVIEW_FAILURE_MESSAGE
-			: (result.errorMessage ?? "Review produced no validated report");
+		const diagnostic = result.errorMessage ?? "Review produced no validated report";
+		const errorMessage = options.sanitizeRemoteErrors ? REMOTE_REVIEW_FAILURE_MESSAGE : diagnostic;
+		const persistedErrorMessage =
+			options.sanitizeRemoteErrors || prepared.resolution.githubContext ? REMOTE_REVIEW_FAILURE_MESSAGE : diagnostic;
 		const record = createReviewRunRecord({
 			workflowId: prepared.workflowId,
 			workflowAction: prepared.action,
@@ -1498,7 +1577,7 @@ export async function executeReviewWorkflow(
 			snapshot: prepared.resolution,
 			controls: prepared.controls,
 			status: "failed",
-			errorMessage,
+			errorMessage: persistedErrorMessage,
 			incrementalPlan: prepared.incrementalPlan,
 		});
 		if (options.sessionManager) await appendReviewRunDurably(options.sessionManager, record);
@@ -1600,7 +1679,11 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 			snapshot: resolution,
 			controls: prepared.controls,
 			status: "failed",
-			errorMessage: error instanceof Error ? error.message : String(error),
+			errorMessage: resolution.githubContext
+				? REMOTE_REVIEW_FAILURE_MESSAGE
+				: error instanceof Error
+					? error.message
+					: String(error),
 			incrementalPlan: prepared.incrementalPlan,
 		});
 		if (options.session.sessionManager) await appendReviewRunDurably(options.session.sessionManager, record);

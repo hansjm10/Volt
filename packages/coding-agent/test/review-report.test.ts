@@ -6,10 +6,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	buildParsedReview,
 	createReviewCandidateReportCollector,
+	createReviewPresentationReportCollector,
 	createReviewVerificationReportCollector,
+	declassifyReviewFindings,
 	type ReviewCandidateReport,
+	type ReviewPresentationReport,
 	type ReviewVerificationReport,
 	validateReviewCandidates,
+	validateReviewPresentations,
 	validateReviewVerification,
 } from "../src/core/review-report.ts";
 import { type ReviewSnapshot, resolveReviewSnapshot } from "../src/core/review-snapshot.ts";
@@ -119,6 +123,127 @@ describe("structured review reports", () => {
 		);
 		expect(verificationResult.disposition).toBe("stop");
 		expect(verification.getReport()).toEqual(verificationReport);
+	});
+
+	it("declassifies PR analysis before building the public presentation", async () => {
+		const privateMarker = "private-github-discussion-marker";
+		const snapshot = await setup();
+		const privateReport = report({
+			title: privateMarker,
+			body: privateMarker,
+			trigger: privateMarker,
+			impact: privateMarker,
+			category: privateMarker,
+			rootCauseKey: privateMarker,
+			confidence: 0.956,
+		});
+		privateReport.summary = privateMarker;
+		privateReport.limitations = [privateMarker];
+		const validation = await validateReviewCandidates(snapshot, privateReport, validationOptions(snapshot));
+		expect(validation.errors).toEqual([]);
+		const verification: ReviewVerificationReport = {
+			summary: privateMarker,
+			assessment: "complete",
+			decisions: [
+				{
+					candidateId: "candidate-1",
+					outcome: "accept",
+					method: privateMarker,
+					rationale: privateMarker,
+					confidence: 0.987,
+				},
+			],
+			priorFindingDecisions: [],
+			limitations: [privateMarker],
+		};
+		const declassified = declassifyReviewFindings(validation.candidates, verification);
+		expect(declassified).toHaveLength(1);
+		expect(declassified[0]?.confidence).toBe(0.96);
+		expect(JSON.stringify(declassified)).not.toContain(privateMarker);
+		const presentation: ReviewPresentationReport = {
+			findings: [
+				{
+					presentationId: declassified[0]!.presentationId,
+					title: "Zero divisor returns the numerator",
+					body: "The new guard returns the numerator instead of a division result.",
+					trigger: "Call divide with a zero divisor.",
+					impact: "Callers receive a plausible but incorrect value.",
+					category: "correctness",
+					rootCauseKey: "zero-divisor-returns-input",
+					rationale: "The changed branch directly returns amount.",
+				},
+			],
+		};
+		const collector = createReviewPresentationReportCollector();
+		await collector.tool.execute("call", presentation, undefined, undefined, {} as never);
+		expect(collector.getReport()).toEqual(presentation);
+		expect(validateReviewPresentations(declassified, presentation)).toEqual([]);
+		expect(
+			validateReviewPresentations(declassified, presentation, {
+				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
+				filesRead: [],
+				hunksInspected: [],
+				searchesRun: 0,
+				treePagesRead: 0,
+				diffFilesFullyRead: [],
+			}).join(" "),
+		).toContain("did not inspect changed hunk");
+
+		snapshot.githubContext = {
+			manifest: {
+				status: "complete",
+				capturedAt: "2026-01-01T00:00:00Z",
+				linkedIssueCount: 0,
+				discussionEntryCount: 1,
+				renderedLinkedIssueCount: 0,
+				renderedDiscussionEntryCount: 1,
+				renderedBytes: 100,
+				limitations: [],
+				fingerprint: "d".repeat(64),
+			},
+			linkedIssues: [],
+			discussionEntries: [{ id: "comment-1", kind: "pr-comment", body: privateMarker }],
+			rendered: privateMarker,
+		};
+		const hunkIds = snapshot.changedFiles.flatMap((file) => file.hunks.map((hunk) => hunk.id));
+		const observed = {
+			changedFileInventoryComplete: true,
+			contextInspectionComplete: true,
+			contextPagesRead: 1,
+			filesRead: [],
+			hunksInspected: hunkIds,
+			searchesRun: 0,
+			treePagesRead: 0,
+			diffFilesFullyRead: ["src/divide.ts"],
+		};
+		const parsed = buildParsedReview({
+			snapshot,
+			candidateReport: privateReport,
+			validatedCandidates: validation.candidates,
+			verificationReport: verification,
+			declassifiedFindings: declassified,
+			presentationReport: presentation,
+			discoveryCoverage: observed,
+			verificationCoverage: observed,
+			commandsRun: [privateMarker],
+			failedVerificationAttempts: [privateMarker],
+			excludedPaths: [],
+		});
+		expect(JSON.stringify(parsed)).not.toContain(privateMarker);
+		expect(parsed).toMatchObject({
+			summary: "Review completed with 1 verified finding.",
+			findings: [{ title: "Zero divisor returns the numerator", confidence: 0.96 }],
+			coverage: {
+				commandsRun: ["1 bash command(s) completed during review."],
+				failedVerificationAttempts: ["1 verification tool attempt(s) failed."],
+				modelReportedLimitations: [
+					"Discovery reported 1 model limitation(s).",
+					"Verification reported 1 model limitation(s).",
+				],
+			},
+		});
 	});
 
 	it("validates changed-side anchors and computes stable host fingerprints", async () => {

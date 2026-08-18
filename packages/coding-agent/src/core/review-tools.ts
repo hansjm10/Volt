@@ -306,9 +306,13 @@ function treeEntryText(entry: ReviewSnapshotTreeEntry): string {
 	return `${entry.mode} ${entry.type} ${entry.oid}${entry.size === undefined ? "" : ` ${entry.size}`}\t${entry.path}`;
 }
 
-export function createReviewSnapshotTools(snapshot: ReviewSnapshot, tracker: ReviewCoverageTracker): ToolDefinition[] {
+export function createReviewSnapshotTools(
+	snapshot: ReviewSnapshot,
+	tracker: ReviewCoverageTracker,
+	options: { includeContext?: boolean } = {},
+): ToolDefinition[] {
 	const cursors = new ReviewCursorCodec(snapshot);
-	const githubContext = snapshot.githubContext;
+	const githubContext = options.includeContext === false ? undefined : snapshot.githubContext;
 	const contextTool = githubContext
 		? defineTool({
 				name: "review_context",

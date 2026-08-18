@@ -499,6 +499,7 @@ describe("RPC durable review actions", () => {
 		);
 		expect(JSON.stringify(seedMessages)).toContain("finding-2");
 		expect(JSON.stringify(seedMessages)).not.toContain("finding-1");
+		expect(JSON.stringify(seedMessages)).not.toContain("PRIVATE_LINKED_ISSUE_AND_REVIEW_TEXT");
 		expect(
 			replacementManagers[0]
 				?.getBranch()

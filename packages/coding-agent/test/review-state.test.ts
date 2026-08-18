@@ -184,8 +184,19 @@ function prSnapshot(headOid: string, fingerprint: string, rawMarker: string): Re
 			limitations: [],
 			fingerprint,
 		},
-		linkedIssues: [],
-		discussionEntries: [],
+		linkedIssues: [
+			{
+				id: "issue-1",
+				repository: "volt/example",
+				number: 1,
+				title: rawMarker,
+				body: rawMarker,
+				url: "https://example.test/issues/1",
+				state: "OPEN",
+				relationship: "closing",
+			},
+		],
+		discussionEntries: [{ id: "comment-1", kind: "pr-comment", body: rawMarker }],
 		rendered: rawMarker,
 	};
 	return value;

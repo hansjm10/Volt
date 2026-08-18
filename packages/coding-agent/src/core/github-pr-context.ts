@@ -847,6 +847,7 @@ function renderContext(
 	linkedIssues: ReviewGitHubLinkedIssue[],
 	discussionEntries: ReviewGitHubDiscussionEntry[],
 	manifest: ReviewGitHubContextManifest,
+	maximumBlockCount = linkedIssues.length + discussionEntries.length,
 ): { text: string; linkedIssueCount: number; discussionEntryCount: number } {
 	const header = [
 		"# GitHub pull request context",
@@ -872,7 +873,7 @@ function renderContext(
 	let text = header;
 	let linkedIssueCount = 0;
 	let discussionEntryCount = 0;
-	for (const block of blocks) {
+	for (const block of blocks.slice(0, maximumBlockCount)) {
 		const candidate = `${text}\n\n${block.text}`;
 		if (Buffer.byteLength(candidate, "utf8") > REVIEW_GITHUB_RENDERED_MAX_BYTES) break;
 		text = candidate;
@@ -1013,36 +1014,43 @@ export async function captureReviewGitHubContext(options: {
 		limitations: state.limitations.map((limitation) => ({ ...limitation })),
 		fingerprint: contextFingerprint(identity, linkedIssues, state.discussionEntries, state.limitations),
 	});
+	const capturedBlockCount = linkedIssues.length + state.discussionEntries.length;
+	let maximumBlockCount = capturedBlockCount;
 	let manifest = createManifest(linkedIssues.length, state.discussionEntries.length, 0);
-	let rendered = renderContext(identity, linkedIssues, state.discussionEntries, manifest);
-	if (
-		rendered.linkedIssueCount !== linkedIssues.length ||
-		rendered.discussionEntryCount !== state.discussionEntries.length
-	) {
-		addLimitation(state.limitations, "aggregate-limit", "rendered-context");
-		manifest = createManifest(rendered.linkedIssueCount, rendered.discussionEntryCount, 0);
-	}
-	for (let attempt = 0; attempt < 8; attempt++) {
-		rendered = renderContext(identity, linkedIssues, state.discussionEntries, manifest);
-		const renderedBytes = Buffer.byteLength(rendered.text, "utf8");
+	for (let attempt = 0; attempt < capturedBlockCount + 16; attempt++) {
+		const rendered = renderContext(identity, linkedIssues, state.discussionEntries, manifest, maximumBlockCount);
+		const renderedBlockCount = rendered.linkedIssueCount + rendered.discussionEntryCount;
 		if (
-			manifest.renderedLinkedIssueCount === rendered.linkedIssueCount &&
-			manifest.renderedDiscussionEntryCount === rendered.discussionEntryCount &&
-			manifest.renderedBytes === renderedBytes
+			renderedBlockCount < capturedBlockCount &&
+			!state.limitations.some((limitation) => limitation.code === "aggregate-limit")
 		) {
-			break;
+			addLimitation(state.limitations, "aggregate-limit", "rendered-context");
 		}
-		manifest = createManifest(rendered.linkedIssueCount, rendered.discussionEntryCount, renderedBytes);
+		const nextManifest = createManifest(
+			rendered.linkedIssueCount,
+			rendered.discussionEntryCount,
+			Buffer.byteLength(rendered.text, "utf8"),
+		);
+		const converged =
+			maximumBlockCount === renderedBlockCount && JSON.stringify(manifest) === JSON.stringify(nextManifest);
+		manifest = nextManifest;
+		maximumBlockCount = renderedBlockCount;
+		if (converged) {
+			return {
+				ok: true,
+				pullRequest: identity,
+				context: {
+					manifest,
+					linkedIssues,
+					discussionEntries: state.discussionEntries,
+					rendered: rendered.text,
+				},
+			};
+		}
 	}
-	rendered = renderContext(identity, linkedIssues, state.discussionEntries, manifest);
 	return {
-		ok: true,
-		pullRequest: identity,
-		context: {
-			manifest,
-			linkedIssues,
-			discussionEntries: state.discussionEntries,
-			rendered: rendered.text,
-		},
+		ok: false,
+		error: "Could not converge the bounded GitHub context manifest.",
+		remoteError: "Could not finalize bounded pull request context. Retry the review.",
 	};
 }
