@@ -685,6 +685,59 @@ describe("TUI differential rendering", () => {
 		tui.stop();
 	});
 
+	for (const protocol of ["kitty", "sixel", "iterm2"] as const) {
+		it(`aligns viewport-only redraws past partial ${protocol} image blocks`, async () => {
+			setCapabilities({ images: protocol, trueColor: true, hyperlinks: true });
+			setCellDimensions({ widthPx: 1, heightPx: 1 });
+			let image: Image | undefined;
+			try {
+				const terminal = new LoggingVirtualTerminal(20, 5);
+				const tui = new TuiMainScreen(terminal);
+				const before = new TestComponent();
+				before.lines = ["before"];
+				image = new Image(
+					solidPngBase64(2, 3),
+					"image/png",
+					{ fallbackColor: (value) => value },
+					{ maxWidthCells: 2, maxHeightCells: 3 },
+					{ widthPx: 2, heightPx: 3 },
+				);
+				const imageLines = image.render(20);
+				assert.strictEqual(imageLines.length, 3, "test image should reserve three rows");
+				const after = new TestComponent();
+				after.lines = ["after 0", "after 1", "after 2"];
+				tui.addChild(before);
+				tui.addChild(image);
+				tui.addChild(after);
+				tui.start();
+				await terminal.waitForRender();
+				terminal.clearWrites();
+
+				tui.resetViewportOnNextRender();
+				tui.requestRender();
+				await terminal.waitForRender();
+
+				const writes = terminal.getWrites();
+				const clearSequence = "\x1b[2J\x1b[H";
+				const clearIndex = writes.indexOf(clearSequence);
+				assert.ok(clearIndex >= 0, "viewport-only redraw should clear the active screen");
+				const tailIndex = writes.indexOf("after 0", clearIndex);
+				assert.ok(tailIndex >= 0, "viewport-only redraw should emit the safe transcript tail");
+				assert.strictEqual(
+					writes.slice(clearIndex + clearSequence.length, tailIndex),
+					"\r\n\r\n",
+					"redraw should skip the clipped image block without emitting its rows or anchor",
+				);
+
+				tui.stop();
+			} finally {
+				image?.dispose();
+				resetCapabilitiesCache();
+				setCellDimensions({ widthPx: 9, heightPx: 18 });
+			}
+		});
+	}
+
 	it("reports logical render work separately from terminal output", async () => {
 		const terminal = new LoggingVirtualTerminal(40, 10);
 		const tui = new TuiMainScreen(terminal);

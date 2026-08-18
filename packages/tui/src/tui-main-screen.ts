@@ -147,6 +147,19 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		return reservedRows;
 	}
 
+	private getSafeTailStart(lineCount: number, maximumRows: number, images: readonly ImagePlacement[]): number {
+		let start = Math.max(0, lineCount - Math.max(0, maximumRows));
+		while (true) {
+			let nextStart = start;
+			for (const image of images) {
+				const imageEnd = Math.min(lineCount, image.top + image.rows);
+				if (image.top < start && start < imageEnd) nextStart = Math.max(nextStart, imageEnd);
+			}
+			if (nextStart === start) return start;
+			start = nextStart;
+		}
+	}
+
 	private expandChangedRangeForImages(
 		firstChanged: number,
 		lastChanged: number,
@@ -222,7 +235,14 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				if (!preserveScrollback) buffer += this.deleteKittyImages(this.previousKittyImageIds);
 				buffer += preserveScrollback ? "\x1b[2J\x1b[H" : "\x1b[2J\x1b[H\x1b[3J";
 			}
-			const renderStart = preserveScrollback ? Math.max(0, newLines.length - height) : 0;
+			const viewportStart = preserveScrollback ? Math.max(0, newLines.length - height) : 0;
+			const renderStart = preserveScrollback
+				? this.getSafeTailStart(newLines.length, height, newImages)
+				: viewportStart;
+			if (renderStart > viewportStart) {
+				const skippedRows = Math.min(renderStart - viewportStart, Math.max(0, height - 1));
+				buffer += "\r\n".repeat(skippedRows);
+			}
 			for (let i = renderStart; i < newLines.length; i++) {
 				if (i > renderStart) buffer += "\r\n";
 				const line = newLines[i];
