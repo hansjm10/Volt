@@ -473,6 +473,21 @@ async function loadConnection(options: {
 	return connection;
 }
 
+function nextPageCursor(
+	connection: GraphqlConnection,
+	seenCursors: Set<string>,
+	limitations: ReviewGitHubContextLimitation[],
+	source: string,
+): string | undefined {
+	const cursor = connection.endCursor;
+	if (!cursor || seenCursors.has(cursor)) {
+		addLimitation(limitations, "invalid-api-response", source);
+		return undefined;
+	}
+	seenCursors.add(cursor);
+	return cursor;
+}
+
 function parseLinkedIssue(
 	value: unknown,
 	limitations: ReviewGitHubContextLimitation[],
@@ -514,6 +529,7 @@ async function captureLinkedIssueSet(
 	limitations: ReviewGitHubContextLimitation[],
 ): Promise<{ issues: Array<Omit<ReviewGitHubLinkedIssue, "relationship">>; complete: boolean }> {
 	const issues: Array<Omit<ReviewGitHubLinkedIssue, "relationship">> = [];
+	const seenCursors = new Set<string>();
 	let cursor: string | undefined;
 	while (issues.length < REVIEW_GITHUB_LINKED_ISSUE_LIMIT) {
 		const connection = await loadConnection({
@@ -539,7 +555,10 @@ async function captureLinkedIssueSet(
 			addLimitation(limitations, "linked-issue-limit", manualOnly ? "manual-linked-issues" : "linked-issues");
 			return { issues, complete: false };
 		}
-		cursor = connection.endCursor;
+		const source = manualOnly ? "manual-linked-issues" : "linked-issues";
+		const nextCursor = nextPageCursor(connection, seenCursors, limitations, source);
+		if (!nextCursor) return { issues, complete: false };
+		cursor = nextCursor;
 	}
 	return { issues, complete: true };
 }
@@ -671,6 +690,7 @@ async function captureSimpleDiscussionConnection(options: {
 	state: CaptureState;
 	parse: (value: unknown, limitations: ReviewGitHubContextLimitation[]) => ReviewGitHubDiscussionEntry | undefined;
 }): Promise<boolean> {
+	const seenCursors = new Set<string>();
 	let cursor: string | undefined;
 	while (true) {
 		const connection = await loadConnection({
@@ -688,7 +708,9 @@ async function captureSimpleDiscussionConnection(options: {
 			if (!appendDiscussion(options.state, entry, options.source)) return false;
 		}
 		if (!connection.hasNextPage) return true;
-		cursor = connection.endCursor;
+		const nextCursor = nextPageCursor(connection, seenCursors, options.state.limitations, options.source);
+		if (!nextCursor) return true;
+		cursor = nextCursor;
 	}
 }
 
@@ -721,6 +743,7 @@ async function captureThreadCommentPages(
 	initialConnection: GraphqlConnection,
 	state: CaptureState,
 ): Promise<boolean> {
+	const seenCursors = new Set<string>();
 	let connection: GraphqlConnection | undefined = initialConnection;
 	while (connection) {
 		for (const node of connection.nodes) {
@@ -729,10 +752,12 @@ async function captureThreadCommentPages(
 			if (!appendDiscussion(state, entry, "review-thread-comments")) return false;
 		}
 		if (!connection.hasNextPage) return true;
+		const cursor = nextPageCursor(connection, seenCursors, state.limitations, "review-thread-comments");
+		if (!cursor) return true;
 		connection = await loadConnection({
 			cwd,
 			query: REVIEW_THREAD_COMMENTS_QUERY,
-			variables: { id: thread.id, cursor: connection.endCursor ?? null },
+			variables: { id: thread.id, cursor },
 			path: ["data", "node", "comments"],
 			source: "review-thread-comments",
 			limitations: state.limitations,
@@ -742,6 +767,7 @@ async function captureThreadCommentPages(
 }
 
 async function captureReviewThreads(cwd: string, pullRequestId: string, state: CaptureState): Promise<boolean> {
+	const seenCursors = new Set<string>();
 	let cursor: string | undefined;
 	while (true) {
 		const connection = await loadConnection({
@@ -763,7 +789,9 @@ async function captureReviewThreads(cwd: string, pullRequestId: string, state: C
 			if (!(await captureThreadCommentPages(cwd, thread, comments, state))) return false;
 		}
 		if (!connection.hasNextPage) return true;
-		cursor = connection.endCursor;
+		const nextCursor = nextPageCursor(connection, seenCursors, state.limitations, "review-threads");
+		if (!nextCursor) return true;
+		cursor = nextCursor;
 	}
 }
 
@@ -773,6 +801,7 @@ async function captureIssueComments(
 	state: CaptureState,
 ): Promise<void> {
 	for (const issue of issues) {
+		const seenCursors = new Set<string>();
 		let cursor: string | undefined;
 		while (true) {
 			const connection = await loadConnection({
@@ -790,7 +819,9 @@ async function captureIssueComments(
 				}
 			}
 			if (!connection.hasNextPage) break;
-			cursor = connection.endCursor;
+			const nextCursor = nextPageCursor(connection, seenCursors, state.limitations, "linked-issue-comments");
+			if (!nextCursor) break;
+			cursor = nextCursor;
 		}
 	}
 }

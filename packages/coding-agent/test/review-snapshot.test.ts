@@ -38,6 +38,7 @@ interface GitHubShimConfig {
 	view: Record<string, unknown>;
 	finalHeadOid?: string;
 	graphql?: Record<string, unknown>;
+	maximumGraphqlRequests?: number;
 }
 
 function graphqlKey(operation: string, id: string, cursor: string | null, manualOnly: boolean | null = null): string {
@@ -80,19 +81,25 @@ if (args[0] === "pr" && args[1] === "view") {
   const variables = request.variables ?? {};
   const key = JSON.stringify([operation, variables.id, variables.cursor ?? null, variables.manualOnly ?? null]);
   appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ operation, variables }) + "\\n");
-  const configured = config.graphql?.[key];
-  if (configured) process.stdout.write(JSON.stringify(configured));
-  else {
-    const fields = {
-      VoltReviewLinkedIssues: "closingIssuesReferences",
-      VoltReviewPullRequestComments: "comments",
-      VoltReviewPullRequestReviews: "reviews",
-      VoltReviewThreads: "reviewThreads",
-      VoltReviewThreadComments: "comments",
-      VoltReviewIssueComments: "comments"
-    };
-    const field = fields[operation];
-    process.stdout.write(JSON.stringify({ data: { node: { [field]: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } }));
+  const requestCount = readFileSync(${JSON.stringify(logPath)}, "utf8").trim().split("\\n").length;
+  if (config.maximumGraphqlRequests !== undefined && requestCount > config.maximumGraphqlRequests) {
+    process.stderr.write("GraphQL request limit exceeded");
+    process.exitCode = 1;
+  } else {
+    const configured = config.graphql?.[key];
+    if (configured) process.stdout.write(JSON.stringify(configured));
+    else {
+      const fields = {
+        VoltReviewLinkedIssues: "closingIssuesReferences",
+        VoltReviewPullRequestComments: "comments",
+        VoltReviewPullRequestReviews: "reviews",
+        VoltReviewThreads: "reviewThreads",
+        VoltReviewThreadComments: "comments",
+        VoltReviewIssueComments: "comments"
+      };
+      const field = fields[operation];
+      process.stdout.write(JSON.stringify({ data: { node: { [field]: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } }));
+    }
   }
 } else process.exitCode = 1;
 `,
@@ -759,6 +766,152 @@ describe("review snapshots", () => {
 		expect(requests).toContain('"cursor":"issues-page-2"');
 		expect(requests).toContain('"cursor":"pr-comments-page-2"');
 		expect(requests).toContain('"cursor":"thread-replies"');
+	});
+
+	it("stops GitHub pagination when a connection repeats its cursor", async () => {
+		const repository = createRepository();
+		const oid = "e".repeat(40);
+		const view = {
+			id: "PR_cursor_cycle",
+			number: 10,
+			title: "Cursor cycle",
+			body: "Body",
+			baseRefName: "main",
+			headRefName: "feature",
+			url: "https://example.test/pr/10",
+			baseRefOid: oid,
+			headRefOid: oid,
+		};
+		const linkedIssue = {
+			id: "issue-cycle",
+			number: 1,
+			title: "Linked issue",
+			body: "Issue body",
+			url: "https://example.test/issues/1",
+			state: "OPEN",
+			stateReason: null,
+			repository: { nameWithOwner: "volt/example" },
+		};
+		const comment = (id: string, body: string) => ({
+			id,
+			body,
+			url: `https://example.test/comments/${id}`,
+		});
+		const threadComment = {
+			...comment("thread-comment-cycle", "Thread comment"),
+			state: "SUBMITTED",
+			diffHunk: "@@ -1 +1 @@",
+			replyTo: null,
+		};
+		const thread = (paginateComments: boolean) => ({
+			id: "thread-cycle",
+			isResolved: false,
+			isOutdated: false,
+			path: "src/value.ts",
+			line: 1,
+			comments: {
+				nodes: [threadComment],
+				pageInfo: {
+					hasNextPage: paginateComments,
+					endCursor: paginateComments ? "thread-comments-repeat" : null,
+				},
+			},
+		});
+		const graphql: Record<string, unknown> = {
+			[graphqlKey("VoltReviewLinkedIssues", view.id, null, false)]: graphqlConnection(
+				"closingIssuesReferences",
+				[linkedIssue],
+				true,
+				"linked-issues-repeat",
+			),
+			[graphqlKey("VoltReviewLinkedIssues", view.id, "linked-issues-repeat", false)]: graphqlConnection(
+				"closingIssuesReferences",
+				[linkedIssue],
+				true,
+				"linked-issues-repeat",
+			),
+			[graphqlKey("VoltReviewPullRequestComments", view.id, null)]: graphqlConnection(
+				"comments",
+				[comment("pr-comment-cycle", "PR comment")],
+				true,
+				"pr-comments-repeat",
+			),
+			[graphqlKey("VoltReviewPullRequestComments", view.id, "pr-comments-repeat")]: graphqlConnection(
+				"comments",
+				[comment("pr-comment-cycle", "PR comment")],
+				true,
+				"pr-comments-repeat",
+			),
+			[graphqlKey("VoltReviewThreads", view.id, null)]: graphqlConnection(
+				"reviewThreads",
+				[thread(true)],
+				true,
+				"review-threads-repeat",
+			),
+			[graphqlKey("VoltReviewThreadComments", "thread-cycle", "thread-comments-repeat")]: graphqlConnection(
+				"comments",
+				[threadComment],
+				true,
+				"thread-comments-repeat",
+			),
+			[graphqlKey("VoltReviewThreads", view.id, "review-threads-repeat")]: graphqlConnection(
+				"reviewThreads",
+				[thread(false)],
+				true,
+				"review-threads-repeat",
+			),
+			[graphqlKey("VoltReviewIssueComments", linkedIssue.id, null)]: graphqlConnection(
+				"comments",
+				[comment("issue-comment-cycle", "Issue comment")],
+				true,
+				"issue-comments-repeat",
+			),
+			[graphqlKey("VoltReviewIssueComments", linkedIssue.id, "issue-comments-repeat")]: graphqlConnection(
+				"comments",
+				[comment("issue-comment-cycle", "Issue comment")],
+				true,
+				"issue-comments-repeat",
+			),
+		};
+		const logPath = installGitHubShim(repository, { view, graphql, maximumGraphqlRequests: 16 });
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+
+		const captured = await captureReviewGitHubContext({
+			cwd: repository,
+			number: "10",
+			maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
+		});
+		expect(captured.ok).toBe(true);
+		if (!captured.ok) throw new Error(captured.error);
+		expect(captured.context.manifest).toMatchObject({
+			status: "incomplete",
+			linkedIssueCount: 1,
+			discussionEntryCount: 3,
+		});
+		expect(captured.context.manifest.limitations).toEqual([
+			{ code: "invalid-api-response", source: "linked-issues", count: 1 },
+			{ code: "invalid-api-response", source: "pr-comments", count: 1 },
+			{ code: "invalid-api-response", source: "review-thread-comments", count: 1 },
+			{ code: "invalid-api-response", source: "review-threads", count: 1 },
+			{ code: "invalid-api-response", source: "linked-issue-comments", count: 1 },
+		]);
+		const requests = readFileSync(logPath, "utf8")
+			.trim()
+			.split("\n")
+			.map(
+				(line) =>
+					JSON.parse(line) as {
+						operation?: unknown;
+						variables?: { cursor?: unknown };
+					},
+			);
+		const requestCount = (operation: string, cursor: string): number =>
+			requests.filter((request) => request.operation === operation && request.variables?.cursor === cursor).length;
+		expect(requestCount("VoltReviewLinkedIssues", "linked-issues-repeat")).toBe(1);
+		expect(requestCount("VoltReviewPullRequestComments", "pr-comments-repeat")).toBe(1);
+		expect(requestCount("VoltReviewThreadComments", "thread-comments-repeat")).toBe(1);
+		expect(requestCount("VoltReviewThreads", "review-threads-repeat")).toBe(1);
+		expect(requestCount("VoltReviewIssueComments", "issue-comments-repeat")).toBe(1);
 	});
 
 	it("enforces GitHub context text, issue, discussion, and aggregate limits", async () => {
