@@ -97,6 +97,16 @@ describe("Bedrock prompt-cache metadata", () => {
 		expect(payload.messages.at(-1)?.content?.at(-1)?.cachePoint).toBeUndefined();
 	});
 
+	it("omits explicit cache points for implicit-only models", async () => {
+		const model: Model<"bedrock-converse-stream"> = {
+			...getModel("amazon-bedrock", "us.anthropic.claude-opus-4-5-20251101-v1:0"),
+			promptCache: { modes: ["implicit"], retention: { short: {}, long: {} } },
+		};
+		const payload = await capturePayload(model, "long");
+		expect(lastSystemCachePoint(payload)).toBeUndefined();
+		expect(payload.messages.at(-1)?.content?.at(-1)?.cachePoint).toBeUndefined();
+	});
+
 	it("keeps AWS_BEDROCK_FORCE_CACHE short-only", async () => {
 		const baseModel = getModel("amazon-bedrock", "us.anthropic.claude-opus-5");
 		const model = {

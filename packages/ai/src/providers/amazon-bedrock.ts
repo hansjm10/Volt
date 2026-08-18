@@ -49,7 +49,7 @@ import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
-import { resolvePromptCacheRetention } from "./prompt-cache.ts";
+import { resolvePromptCacheRetention, supportsPromptCacheMode } from "./prompt-cache.ts";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -215,9 +215,13 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 			if (options.headers && Object.keys(options.headers).length > 0) {
 				addCustomHeadersMiddleware(client, options.headers);
 			}
-			const cacheRetention = resolvePromptCacheRetention(model, options.cacheRetention, options.env, {
-				forceShort: getProviderEnvValue("AWS_BEDROCK_FORCE_CACHE", options.env) === "1",
-			});
+			const forcePromptCache = getProviderEnvValue("AWS_BEDROCK_FORCE_CACHE", options.env) === "1";
+			const cacheRetention =
+				forcePromptCache || supportsPromptCacheMode(model, "explicit")
+					? resolvePromptCacheRetention(model, options.cacheRetention, options.env, {
+							forceShort: forcePromptCache,
+						})
+					: "none";
 			const inferenceMaxTokens = options.maxTokens ?? (isAnthropicClaudeModel(model) ? model.maxTokens : undefined);
 			let commandInput = {
 				modelId: model.id,

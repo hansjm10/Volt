@@ -239,14 +239,15 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 
 			const accountId = extractAccountId(apiKey);
 			const cacheRetention = resolvePromptCacheRetention(model, options?.cacheRetention, options?.env);
-			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
-			const effectiveOptions = options ? { ...options, sessionId: cacheSessionId } : undefined;
-			let body = buildRequestBody(model, context, effectiveOptions);
+			const transportSessionId = options?.sessionId;
+			const cacheSessionId = cacheRetention === "none" ? undefined : transportSessionId;
+			const promptCacheOptions = options ? { ...options, sessionId: cacheSessionId } : undefined;
+			let body = buildRequestBody(model, context, promptCacheOptions);
 			const nextBody = await options?.onPayload?.(body, model);
 			if (nextBody !== undefined) {
 				body = nextBody as RequestBody;
 			}
-			const websocketRequestId = cacheSessionId || createCodexRequestId();
+			const websocketRequestId = transportSessionId || createCodexRequestId();
 			const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, cacheSessionId);
 			const websocketHeaders = buildWebSocketHeaders(
 				model.headers,
@@ -259,9 +260,9 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			const idleTimeoutMs = normalizeTimeoutMs(options?.timeoutMs);
 			const websocketConnectTimeoutMs = normalizeTimeoutMs(options?.websocketConnectTimeoutMs);
 			const transport = options?.transport || "auto";
-			const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(cacheSessionId);
+			const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(transportSessionId);
 			if (websocketDisabledForSession) {
-				recordWebSocketSseFallback(cacheSessionId);
+				recordWebSocketSseFallback(transportSessionId);
 			}
 
 			if (transport !== "sse" && !websocketDisabledForSession) {
@@ -279,7 +280,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						},
 						idleTimeoutMs,
 						websocketConnectTimeoutMs,
-						effectiveOptions,
+						options,
 					);
 
 					if (options?.signal?.aborted) {
@@ -304,11 +305,11 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 							requestBytes: new TextEncoder().encode(bodyJson).byteLength,
 						}),
 					);
-					recordWebSocketFailure(cacheSessionId, error);
+					recordWebSocketFailure(transportSessionId, error);
 					if (websocketStarted) {
 						throw error;
 					}
-					recordWebSocketSseFallback(cacheSessionId);
+					recordWebSocketSseFallback(transportSessionId);
 				}
 			}
 

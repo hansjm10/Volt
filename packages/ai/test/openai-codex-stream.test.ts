@@ -1158,7 +1158,7 @@ describe("openai-codex streaming", () => {
 		});
 	});
 
-	it("falls back to SSE when websocket connect does not open before the connect timeout", async () => {
+	it("remembers websocket fallback by transport session when cache retention is none", async () => {
 		vi.useFakeTimers();
 		const token = mockToken();
 		const encoder = new TextEncoder();
@@ -1182,8 +1182,13 @@ describe("openai-codex streaming", () => {
 		});
 		vi.stubGlobal("fetch", fetchMock);
 
+		let websocketConnections = 0;
 		class MockWebSocket {
 			private listeners = new Map<string, Set<(event: unknown) => void>>();
+
+			constructor() {
+				websocketConnections++;
+			}
 
 			addEventListener(type: string, listener: (event: unknown) => void): void {
 				let listeners = this.listeners.get(type);
@@ -1228,6 +1233,7 @@ describe("openai-codex streaming", () => {
 		const resultPromise = streamOpenAICodexResponses(model, context, {
 			apiKey: token,
 			sessionId: "ws-connect-timeout",
+			cacheRetention: "none",
 			transport: "auto",
 			timeoutMs: 300_000,
 			websocketConnectTimeoutMs: 50,
@@ -1243,6 +1249,24 @@ describe("openai-codex streaming", () => {
 			sseFallbacks: 1,
 			websocketFallbackActive: true,
 			lastWebSocketError: "WebSocket connect timeout after 50ms",
+		});
+
+		const secondResult = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			sessionId: "ws-connect-timeout",
+			cacheRetention: "none",
+			transport: "auto",
+			timeoutMs: 300_000,
+			websocketConnectTimeoutMs: 50,
+		}).result();
+
+		expect(secondResult.content.find((content) => content.type === "text")?.text).toBe("Hello");
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(websocketConnections).toBe(1);
+		expect(getOpenAICodexWebSocketDebugStats("ws-connect-timeout")).toMatchObject({
+			websocketFailures: 1,
+			sseFallbacks: 2,
+			websocketFallbackActive: true,
 		});
 	});
 
