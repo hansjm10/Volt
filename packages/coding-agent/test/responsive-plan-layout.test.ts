@@ -1,4 +1,4 @@
-import { type Component, setKeybindings, TuiAltScreen, TuiMainScreen, visibleWidth } from "@hansjm10/volt-tui";
+import { type Component, setKeybindings, TuiAltScreen, TuiMainScreen, VStack, visibleWidth } from "@hansjm10/volt-tui";
 import { beforeAll, describe, expect, it } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
@@ -132,6 +132,7 @@ function createLayout(options: {
 		fullscreenConversation: options.fullscreenConversation ?? new LinesComponent(["FULLSCREEN_CONVERSATION"]),
 		inspector,
 		footer: options.footer ?? new FullWidthFooter(),
+		getTerminalColumns: () => options.columns,
 		getTerminalRows: () => rows,
 		requestViewportReset: options.requestViewportReset ?? (() => undefined),
 		onSplitChange: (split, preserveScrollback) => {
@@ -269,6 +270,52 @@ describe("ResponsivePlanLayoutComponent", () => {
 			expect(compact).not.toContain("Responsive Plan");
 			expect(terminal.getViewport().at(-1)).toBe("F".repeat(128));
 			expect(splitChanges).toEqual([false]);
+		} finally {
+			tui.stop({ preserveScreen: true });
+		}
+	});
+
+	it("keeps the fullscreen conversation dock aligned with the inspector footer", async () => {
+		const columns = 191;
+		const rows = 40;
+		const planning: PlanningState = { mode: "plan", plan: plan("draft") };
+		const compactStatus = new LinesComponent(["COMPACT_STATUS_TOP", "COMPACT_STATUS_BOTTOM"]);
+		const editor = new LinesComponent(["EDITOR_TOP", "EDITOR_BOTTOM"]);
+		const conversationBody = new LinesComponent(["FULLSCREEN_CONVERSATION"]);
+		const terminal = new VirtualTerminal(columns, rows);
+		let layout: ResponsivePlanLayoutComponent;
+		const conversationDock = new VStack([
+			{
+				component: compactStatus,
+				shrink: 2,
+				minSize: 0,
+				visible: () => !layout.isTerminalSplit(),
+			},
+			{ component: editor, shrink: 1, minSize: 1 },
+		]);
+		const fullscreenConversation = new VStack([
+			{ component: conversationBody, basis: 0, grow: 1, shrink: 1, minSize: 0 },
+			{ component: conversationDock, shrink: 1, minSize: 0 },
+		]);
+		({ layout } = createLayout({
+			columns,
+			rows,
+			planning,
+			fullscreenConversation,
+		}));
+		const tui = new TuiAltScreen(terminal, false, "/tmp", { mouse: false });
+		tui.addChild(layout);
+		tui.setLayoutRoot(layout.getFullscreenLayout());
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			const viewport = terminal.getViewport().map(stripAnsi);
+			const editorBottomRow = viewport.findIndex((line) => line.includes("EDITOR_BOTTOM"));
+			const inspectorFooterRow = viewport.findIndex((line) => line.includes("scroll") && line.includes("page"));
+			const appFooterRow = viewport.findIndex((line) => line === "F".repeat(columns));
+			expect(viewport.join("\n")).not.toContain("COMPACT_STATUS");
+			expect(editorBottomRow).toBe(inspectorFooterRow);
+			expect(inspectorFooterRow).toBe(appFooterRow - 1);
 		} finally {
 			tui.stop({ preserveScreen: true });
 		}
@@ -525,6 +572,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 			fullscreenConversation: new LinesComponent(["FULLSCREEN_CONVERSATION"]),
 			inspector,
 			footer,
+			getTerminalColumns: () => 129,
 			getTerminalRows: () => 24,
 			requestViewportReset: () => undefined,
 			onSplitChange: () => undefined,

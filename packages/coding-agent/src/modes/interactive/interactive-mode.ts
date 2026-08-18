@@ -759,7 +759,7 @@ export class InteractiveMode {
 				component: this.planStatusContainer,
 				shrink: 2,
 				minSize: 0,
-				visible: (viewport) => !this.mainView.isSplit(viewport.width, viewport.height),
+				visible: () => !this.mainView.isTerminalSplit(),
 			},
 			{ component: this.editorContainer, shrink: 1, minSize: 1 },
 			{ component: this.widgetContainerBelow, shrink: 3, minSize: 0 },
@@ -792,6 +792,7 @@ export class InteractiveMode {
 			fullscreenConversation: this.fullscreenConversationRoot,
 			inspector: this.planInspector,
 			footer: this.footerContainer,
+			getTerminalColumns: () => this.ui.terminal.columns,
 			getTerminalRows: () => this.ui.terminal.rows,
 			requestViewportReset: () => {
 				if (this.renderer instanceof TuiMainScreen) this.renderer.resetViewportOnNextRender();
@@ -4891,7 +4892,7 @@ export class InteractiveMode {
 		this.planInspector.setPlanning(planning);
 		this.mainView.setPlanning(planning);
 		const plan = planning.plan;
-		const split = this.mainView.isSplit(this.ui.terminal.columns, this.ui.terminal.rows);
+		const split = this.mainView.isTerminalSplit();
 		if (split && this.planDetails) {
 			this.closePlanDetails({ focusConversation: false });
 		} else if (this.planDetails && plan) {
@@ -4916,7 +4917,7 @@ export class InteractiveMode {
 	}
 
 	private showPlanDetails(): void {
-		if (this.mainView.isSplit(this.ui.terminal.columns, this.ui.terminal.rows)) {
+		if (this.mainView.isTerminalSplit()) {
 			this.focusPlanInspector();
 			return;
 		}
@@ -4973,10 +4974,7 @@ export class InteractiveMode {
 	}
 
 	private focusPlanInspector(): boolean {
-		if (
-			this.activeView !== this.conversationView ||
-			!this.mainView.isSplit(this.ui.terminal.columns, this.ui.terminal.rows)
-		) {
+		if (this.activeView !== this.conversationView || !this.mainView.isTerminalSplit()) {
 			return false;
 		}
 		const focused = this.ui.getFocusedComponent();
@@ -5005,7 +5003,7 @@ export class InteractiveMode {
 	}
 
 	private togglePlanPaneFocus(): void {
-		if (this.mainView.isSplit(this.ui.terminal.columns, this.ui.terminal.rows)) {
+		if (this.mainView.isTerminalSplit()) {
 			if (this.planInspector.focused) this.focusConversation();
 			else this.focusPlanInspector();
 			return;
@@ -5577,9 +5575,7 @@ export class InteractiveMode {
 		for (const component of view.regularComponents) this.ui.addChild(component);
 		if (isViewportTUI(this.ui)) this.ui.setLayoutRoot(view.fullscreenRoot);
 		this.activeView = view;
-		const split =
-			view === this.conversationView &&
-			this.mainView?.isSplit(this.ui.terminal.columns, this.ui.terminal.rows) === true;
+		const split = view === this.conversationView && this.mainView?.isTerminalSplit() === true;
 		this.planInspector?.setFullscreenActive(split && this.ui.mode === "fullscreen");
 		this.planDetails?.setFullscreenActive(view === this.conversationView && !split && this.ui.mode === "fullscreen");
 		if (view === this.conversationView && this.fullscreenTranscript) {

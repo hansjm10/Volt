@@ -129,6 +129,7 @@ export class ResponsivePlanLayoutComponent extends Container {
 	private readonly controlComponents: readonly Component[];
 	private readonly compactComponents: readonly Component[];
 	private readonly inspector: PlanInspectorComponent;
+	private readonly getTerminalColumns: () => number;
 	private readonly getTerminalRows: () => number;
 	private readonly requestViewportReset: () => void;
 	private readonly onSplitChange: (split: boolean, preserveScrollback: boolean) => void;
@@ -148,6 +149,7 @@ export class ResponsivePlanLayoutComponent extends Container {
 		fullscreenConversation: Component;
 		inspector: PlanInspectorComponent;
 		footer: Component;
+		getTerminalColumns: () => number;
 		getTerminalRows: () => number;
 		requestViewportReset: () => void;
 		onSplitChange: (split: boolean, preserveScrollback: boolean) => void;
@@ -159,6 +161,7 @@ export class ResponsivePlanLayoutComponent extends Container {
 		this.compactComponents = options.compactComponents;
 		this.inspector = options.inspector;
 		this.footer = options.footer;
+		this.getTerminalColumns = options.getTerminalColumns;
 		this.getTerminalRows = options.getTerminalRows;
 		this.requestViewportReset = options.requestViewportReset;
 		this.onSplitChange = options.onSplitChange;
@@ -219,6 +222,10 @@ export class ResponsivePlanLayoutComponent extends Container {
 
 	isSplit(width: number, rows = this.getTerminalRows()): boolean {
 		return getResponsivePlanDimensions(width, rows, this.planning) !== undefined;
+	}
+
+	isTerminalSplit(): boolean {
+		return this.isSplit(this.getTerminalColumns(), this.getTerminalRows());
 	}
 
 	getFullscreenLayout(): Component {

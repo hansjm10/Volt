@@ -189,7 +189,7 @@ const fullscreenConversation = new VStack([
 		component: statusContainer,
 		shrink: 2,
 		minSize: 0,
-		visible: (viewport) => !layout.isSplit(viewport.width, viewport.height),
+		visible: () => !layout.isTerminalSplit(),
 	},
 	{ component: editorContainer, shrink: 1, minSize: 1 },
 ]);
@@ -201,6 +201,7 @@ layout = new ResponsivePlanLayoutComponent({
 	fullscreenConversation,
 	inspector,
 	footer,
+	getTerminalColumns: () => tui.terminal.columns,
 	getTerminalRows: () => tui.terminal.rows,
 	requestViewportReset: () => {
 		if (tui instanceof TuiMainScreen) tui.resetViewportOnNextRender();
