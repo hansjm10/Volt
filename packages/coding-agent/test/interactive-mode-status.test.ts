@@ -638,7 +638,7 @@ describe("InteractiveMode plan pane integration", () => {
 			planDetails: undefined,
 			planPaneInputUnsubscribe: undefined,
 			togglePlanPaneFocus,
-			mainView: { isSplit: () => true },
+			mainView: { isTerminalSplit: () => true },
 			planInspector: inspector,
 			planPaneReturnFocus: undefined,
 			getConversationFocusTarget: () => editor,
@@ -692,7 +692,7 @@ describe("InteractiveMode plan pane integration", () => {
 			editor,
 			editorContainer,
 			fullscreenTranscript: { setPrimary: vi.fn() },
-			mainView: { isSplit: () => true },
+			mainView: { isTerminalSplit: () => true },
 			planDetails: undefined,
 			planInspector: inspector,
 			planPaneReturnFocus: undefined,
@@ -804,7 +804,7 @@ describe("InteractiveMode plan pane integration", () => {
 	test("focuses the persistent inspector for /plan-details in wide layout", () => {
 		const focusPlanInspector = vi.fn();
 		const fakeThis = {
-			mainView: { isSplit: () => true },
+			mainView: { isTerminalSplit: () => true },
 			ui: { terminal: { columns: 160, rows: 30 } },
 			focusPlanInspector,
 		};
@@ -834,7 +834,7 @@ describe("InteractiveMode plan pane integration", () => {
 			editor,
 			editorContainer,
 			fullscreenTranscript: { setPrimary: vi.fn() },
-			mainView: { isSplit: () => false },
+			mainView: { isTerminalSplit: () => false },
 			planDetails: undefined,
 			planInspector: new TestFocusableComponent("PLAN_INSPECTOR"),
 			ui,
