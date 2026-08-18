@@ -1,13 +1,12 @@
 import * as fs from "node:fs";
-import { createRequire } from "node:module";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { setKittyProtocolActive } from "./keys.ts";
+import { loadNativeAddon } from "./native-loader.ts";
 import { isNativeModifierPressed } from "./native-modifiers.ts";
 import { StdinBuffer } from "./stdin-buffer.ts";
 
 const moduleUrl: string | undefined = import.meta.url;
-const cjsRequire = createRequire(moduleUrl || pathToFileURL(process.execPath).href);
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
@@ -519,15 +518,14 @@ export class ProcessTerminal implements Terminal {
 				path.join(moduleDir, nativePath),
 				path.join(path.dirname(process.execPath), nativePath),
 			];
-			for (const modulePath of candidates) {
-				try {
-					const helper = cjsRequire(modulePath) as { enableVirtualTerminalInput?: () => boolean };
-					helper.enableVirtualTerminalInput?.();
-					return;
-				} catch {
-					// Try the next possible packaging location.
-				}
-			}
+			const helper = loadNativeAddon(
+				candidates,
+				(value): value is { enableVirtualTerminalInput: () => boolean } =>
+					typeof value === "object" &&
+					value !== null &&
+					typeof (value as { enableVirtualTerminalInput?: unknown }).enableVirtualTerminalInput === "function",
+			);
+			helper?.enableVirtualTerminalInput();
 		} catch {
 			// Native helper not available — Shift+Tab won't be distinguishable from Tab.
 		}

@@ -1,9 +1,8 @@
-import { createRequire } from "node:module";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import { loadNativeAddon } from "./native-loader.ts";
 
 const moduleUrl: string | undefined = import.meta.url;
-const cjsRequire = createRequire(moduleUrl || pathToFileURL(process.execPath).href);
 
 export type ModifierKey = "shift" | "command" | "control" | "option";
 
@@ -41,19 +40,10 @@ function loadNativeModifiersHelper(): NativeModifiersHelper | undefined {
 		path.join(path.dirname(process.execPath), nativePath),
 	];
 
-	for (const modulePath of candidates) {
-		try {
-			const helper = cjsRequire(modulePath) as unknown;
-			if (isNativeModifiersHelper(helper)) {
-				nativeModifiersHelper = helper;
-				return helper;
-			}
-		} catch {
-			// Try the next possible packaging location.
-		}
-	}
-
-	return undefined;
+	const helper = loadNativeAddon(candidates, isNativeModifiersHelper);
+	if (!helper) return undefined;
+	nativeModifiersHelper = helper;
+	return helper;
 }
 
 export function hasNativeModifierSupport(): boolean {
