@@ -2,6 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getModel } from "../src/models.ts";
 import {
 	getOpenAICodexWebSocketDebugStats,
 	resetOpenAICodexWebSocketDebugStats,
@@ -583,6 +584,7 @@ describe("openai-codex streaming", () => {
 			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
 		};
 
+		model.promptCache = { modes: ["implicit"], retention: { short: {} } };
 		const streamResult = streamOpenAICodexResponses(model, context, { apiKey: token, sessionId, transport: "sse" });
 		await streamResult.result();
 	});
@@ -625,6 +627,7 @@ describe("openai-codex streaming", () => {
 			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
 		};
 
+		model.promptCache = { modes: ["implicit"], retention: { short: {} } };
 		await streamOpenAICodexResponses(model, context, {
 			apiKey: token,
 			transport: "sse",
@@ -635,6 +638,49 @@ describe("openai-codex streaming", () => {
 		}).result();
 
 		expect(capturedPayload?.prompt_cache_key).toBe("x".repeat(64));
+	});
+
+	it("omits Codex cache affinity when retention is none", async () => {
+		const token = mockToken();
+		let capturedPayload: { prompt_cache_key?: string } | undefined;
+		let capturedHeaders: Headers | undefined;
+		const encoder = new TextEncoder();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (_input: string | URL, init?: RequestInit) => {
+				capturedHeaders = init?.headers instanceof Headers ? init.headers : undefined;
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(encoder.encode(buildSSEPayload({ status: "completed" })));
+							controller.close();
+						},
+					}),
+					{ status: 200, headers: { "content-type": "text/event-stream" } },
+				);
+			}),
+		);
+
+		await streamOpenAICodexResponses(
+			getModel("openai-codex", "gpt-5.4"),
+			{
+				systemPrompt: "You are a helpful assistant.",
+				messages: [{ role: "user", content: "Say hello", timestamp: 1 }],
+			},
+			{
+				apiKey: token,
+				transport: "sse",
+				sessionId: "one-shot",
+				cacheRetention: "none",
+				onPayload: (payload) => {
+					capturedPayload = payload as { prompt_cache_key?: string };
+				},
+			},
+		).result();
+
+		expect(capturedPayload?.prompt_cache_key).toBeUndefined();
+		expect(capturedHeaders?.has("session-id")).toBe(false);
+		expect(capturedHeaders?.has("x-client-request-id")).toBe(false);
 	});
 
 	it.each(["xhigh", "max"] as const)(
@@ -1094,6 +1140,7 @@ describe("openai-codex streaming", () => {
 			messages: [{ role: "user", content: "Say hello", timestamp: 1 }],
 		};
 
+		model.promptCache = { modes: ["implicit"], retention: { short: {} } };
 		await streamSimpleOpenAICodexResponses(model, context, {
 			apiKey: token,
 			sessionId: "session-auto",
@@ -1177,6 +1224,7 @@ describe("openai-codex streaming", () => {
 			messages: [{ role: "user", content: "Say hello", timestamp: 1 }],
 		};
 
+		model.promptCache = { modes: ["implicit"], retention: { short: {} } };
 		const resultPromise = streamOpenAICodexResponses(model, context, {
 			apiKey: token,
 			sessionId: "ws-connect-timeout",
@@ -1279,6 +1327,7 @@ describe("openai-codex streaming", () => {
 			messages: [{ role: "user", content: "Say hello", timestamp: 1 }],
 		};
 
+		model.promptCache = { modes: ["implicit"], retention: { short: {} } };
 		const resultPromise = streamOpenAICodexResponses(model, context, {
 			apiKey: token,
 			sessionId: "ws-idle-before-start",
@@ -1489,6 +1538,7 @@ describe("openai-codex streaming", () => {
 			contextWindow: 400000,
 			maxTokens: 128000,
 		};
+		model.promptCache = { modes: ["implicit"], retention: { short: {} } };
 		const firstContext: Context = {
 			systemPrompt: "You are a helpful assistant.",
 			messages: [{ role: "user", content: "Say hello", timestamp: 1 }],

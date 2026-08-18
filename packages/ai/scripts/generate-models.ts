@@ -9,7 +9,14 @@ import {
 	CLOUDFLARE_AI_GATEWAY_OPENAI_BASE_URL,
 	CLOUDFLARE_WORKERS_AI_BASE_URL,
 } from "../src/providers/cloudflare.ts";
-import type { AnthropicMessagesCompat, Api, KnownProvider, Model, OpenAICompletionsCompat } from "../src/types.ts";
+import type {
+	AnthropicMessagesCompat,
+	Api,
+	KnownProvider,
+	Model,
+	OpenAICompletionsCompat,
+	PromptCacheMetadata,
+} from "../src/types.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -96,7 +103,6 @@ const TOGETHER_BASE_COMPAT: OpenAICompletionsCompat = {
 	supportsReasoningEffort: false,
 	maxTokensField: "max_tokens",
 	supportsStrictMode: false,
-	supportsLongCacheRetention: false,
 };
 const TOGETHER_TOGGLE_REASONING_COMPAT: OpenAICompletionsCompat = {
 	...TOGETHER_BASE_COMPAT,
@@ -153,7 +159,6 @@ const NVIDIA_OPENAI_COMPAT: OpenAICompletionsCompat = {
 	supportsReasoningEffort: false,
 	maxTokensField: "max_tokens",
 	supportsStrictMode: false,
-	supportsLongCacheRetention: false,
 };
 const NVIDIA_NIM_UNSUPPORTED_MODELS = new Set([
 	"abacusai/dracarys-llama-3.1-70b-instruct",
@@ -217,14 +222,250 @@ const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
 	...GPT_5_6_MODEL_IDS,
 ]);
 
-const OPENCODE_OPENAI_COMPLETIONS_LONG_CACHE_RETENTION_UNSUPPORTED_MODELS = new Set([
-	"opencode:deepseek-v4-flash",
-	"opencode:deepseek-v4-pro",
-	"opencode:kimi-k2.5",
-	"opencode:kimi-k2.6",
-	"opencode:minimax-m2.7",
-	"opencode-go:kimi-k2.6",
+const OPENAI_PROMPT_CACHE_MODEL_IDS = new Set([
+	"gpt-4.1",
+	"gpt-4.1-mini",
+	"gpt-4.1-nano",
+	"gpt-4o",
+	"gpt-4o-2024-05-13",
+	"gpt-4o-2024-08-06",
+	"gpt-4o-2024-11-20",
+	"gpt-4o-mini",
+	"gpt-5",
+	"gpt-5-chat-latest",
+	"gpt-5-mini",
+	"gpt-5-nano",
+	"gpt-5-pro",
+	"gpt-5.1",
+	"gpt-5.1-codex",
+	"gpt-5.1-codex-max",
+	"gpt-5.2",
+	"gpt-5.2-chat-latest",
+	"gpt-5.2-pro",
+	"gpt-5.3-chat-latest",
+	"gpt-5.3-codex",
+	"gpt-5.3-codex-spark",
+	"gpt-5.4",
+	"gpt-5.4-mini",
+	"gpt-5.4-nano",
+	"gpt-5.4-pro",
+	"gpt-5.5",
+	"gpt-5.5-pro",
+	...GPT_5_6_MODEL_IDS,
+	"o1",
+	"o1-pro",
+	"o3",
+	"o3-mini",
+	"o3-pro",
+	"o4-mini",
 ]);
+
+const OPENAI_EXTENDED_PROMPT_CACHE_MODEL_IDS = new Set([
+	"gpt-4.1",
+	"gpt-5",
+	"gpt-5-codex",
+	"gpt-5.1",
+	"gpt-5.1-chat-latest",
+	"gpt-5.1-codex",
+	"gpt-5.1-codex-max",
+	"gpt-5.1-codex-mini",
+	"gpt-5.2",
+	"gpt-5.4",
+	"gpt-5.5",
+	"gpt-5.5-pro",
+]);
+
+const AZURE_EXTENDED_PROMPT_CACHE_MODEL_IDS = new Set([
+	"gpt-4.1",
+	"gpt-5",
+	"gpt-5-codex",
+	"gpt-5.1",
+	"gpt-5.1-codex",
+	"gpt-5.1-codex-max",
+	"gpt-5.1-codex-mini",
+	"gpt-5.2",
+	"gpt-5.3-codex",
+	"gpt-5.4",
+	"gpt-5.5",
+]);
+
+const BEDROCK_SHORT_PROMPT_CACHE_MODEL_IDS = new Set([
+	"anthropic.claude-opus-4-1-20250805-v1:0",
+	"anthropic.claude-opus-4-6-v1",
+	"anthropic.claude-sonnet-4-6",
+]);
+
+const BEDROCK_LONG_PROMPT_CACHE_MODEL_IDS = new Set([
+	"anthropic.claude-fable-5",
+	"anthropic.claude-haiku-4-5-20251001-v1:0",
+	"anthropic.claude-opus-4-5-20251101-v1:0",
+	"anthropic.claude-opus-4-7",
+	"anthropic.claude-opus-4-8",
+	"anthropic.claude-sonnet-4-5-20250929-v1:0",
+	"anthropic.claude-sonnet-5",
+]);
+
+const IMPLICIT_SHORT_PROMPT_CACHE = {
+	modes: ["implicit"],
+	retention: { short: {} },
+} as const satisfies PromptCacheMetadata;
+
+const IMPLICIT_EXTENDED_PROMPT_CACHE = {
+	modes: ["implicit"],
+	retention: { short: {}, long: { ttlSeconds: 86_400 } },
+	refreshesOnHit: true,
+} as const satisfies PromptCacheMetadata;
+
+const OPENAI_GPT_5_6_PROMPT_CACHE = {
+	modes: ["implicit", "explicit"],
+	retention: { short: { ttlSeconds: 1_800 } },
+	refreshesOnHit: true,
+} as const satisfies PromptCacheMetadata;
+
+const ANTHROPIC_PROMPT_CACHE = {
+	modes: ["explicit"],
+	retention: { short: { ttlSeconds: 300 }, long: { ttlSeconds: 3_600 } },
+	refreshesOnHit: true,
+} as const satisfies PromptCacheMetadata;
+
+const BEDROCK_SHORT_PROMPT_CACHE = {
+	modes: ["explicit"],
+	retention: { short: { ttlSeconds: 300 } },
+	refreshesOnHit: true,
+} as const satisfies PromptCacheMetadata;
+
+const BEDROCK_LONG_PROMPT_CACHE = {
+	modes: ["explicit"],
+	retention: { short: { ttlSeconds: 300 }, long: { ttlSeconds: 3_600 } },
+	refreshesOnHit: true,
+} as const satisfies PromptCacheMetadata;
+
+interface PromptCachePolicyRecord {
+	name: string;
+	sourceUrl: string;
+	verifiedAt: string;
+	matches: (model: Model<Api>) => boolean;
+	metadata: PromptCacheMetadata;
+}
+
+function canonicalBedrockModelId(modelId: string): string {
+	return modelId.replace(/^(?:apac|au|eu|global|jp|us)\./, "");
+}
+
+const PROMPT_CACHE_POLICIES: readonly PromptCachePolicyRecord[] = [
+	{
+		name: "OpenAI GPT-5.6",
+		sourceUrl: "https://developers.openai.com/api/docs/guides/prompt-caching",
+		verifiedAt: "2026-08-18",
+		matches: (model) =>
+			model.provider === "openai" && model.api === "openai-responses" && GPT_5_6_MODEL_IDS.has(model.id),
+		metadata: OPENAI_GPT_5_6_PROMPT_CACHE,
+	},
+	{
+		name: "OpenAI extended retention",
+		sourceUrl: "https://developers.openai.com/api/docs/guides/prompt-caching",
+		verifiedAt: "2026-08-18",
+		matches: (model) =>
+			model.provider === "openai" &&
+			model.api === "openai-responses" &&
+			OPENAI_EXTENDED_PROMPT_CACHE_MODEL_IDS.has(model.id),
+		metadata: IMPLICIT_EXTENDED_PROMPT_CACHE,
+	},
+	{
+		name: "OpenAI automatic retention",
+		sourceUrl: "https://developers.openai.com/api/docs/guides/prompt-caching",
+		verifiedAt: "2026-08-18",
+		matches: (model) =>
+			model.provider === "openai" &&
+			model.api === "openai-responses" &&
+			OPENAI_PROMPT_CACHE_MODEL_IDS.has(model.id),
+		metadata: IMPLICIT_SHORT_PROMPT_CACHE,
+	},
+	{
+		name: "Azure OpenAI GPT-5.6",
+		sourceUrl: "https://learn.microsoft.com/azure/foundry/openai/how-to/prompt-caching",
+		verifiedAt: "2026-08-18",
+		matches: (model) => model.provider === "azure-openai-responses" && GPT_5_6_MODEL_IDS.has(model.id),
+		metadata: OPENAI_GPT_5_6_PROMPT_CACHE,
+	},
+	{
+		name: "Azure OpenAI extended retention",
+		sourceUrl: "https://learn.microsoft.com/azure/foundry/openai/how-to/prompt-caching",
+		verifiedAt: "2026-08-18",
+		matches: (model) =>
+			model.provider === "azure-openai-responses" && AZURE_EXTENDED_PROMPT_CACHE_MODEL_IDS.has(model.id),
+		metadata: IMPLICIT_EXTENDED_PROMPT_CACHE,
+	},
+	{
+		name: "Azure OpenAI automatic retention",
+		sourceUrl: "https://learn.microsoft.com/azure/foundry/openai/how-to/prompt-caching",
+		verifiedAt: "2026-08-18",
+		matches: (model) => model.provider === "azure-openai-responses" && OPENAI_PROMPT_CACHE_MODEL_IDS.has(model.id),
+		metadata: IMPLICIT_SHORT_PROMPT_CACHE,
+	},
+	{
+		name: "Anthropic prompt caching",
+		sourceUrl: "https://docs.anthropic.com/en/docs/about-claude/pricing",
+		verifiedAt: "2026-08-18",
+		matches: (model) => model.provider === "anthropic" && model.api === "anthropic-messages",
+		metadata: ANTHROPIC_PROMPT_CACHE,
+	},
+	{
+		name: "Amazon Bedrock extended Claude retention",
+		sourceUrl: "https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html",
+		verifiedAt: "2026-08-18",
+		matches: (model) =>
+			model.provider === "amazon-bedrock" &&
+			BEDROCK_LONG_PROMPT_CACHE_MODEL_IDS.has(canonicalBedrockModelId(model.id)),
+		metadata: BEDROCK_LONG_PROMPT_CACHE,
+	},
+	{
+		name: "Amazon Bedrock short Claude retention",
+		sourceUrl: "https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html",
+		verifiedAt: "2026-08-18",
+		matches: (model) =>
+			model.provider === "amazon-bedrock" &&
+			BEDROCK_SHORT_PROMPT_CACHE_MODEL_IDS.has(canonicalBedrockModelId(model.id)),
+		metadata: BEDROCK_SHORT_PROMPT_CACHE,
+	},
+	{
+		name: "Mistral prompt caching",
+		sourceUrl: "https://docs.mistral.ai/studio/conversations/advanced/prompt-caching",
+		verifiedAt: "2026-08-18",
+		matches: (model) => model.provider === "mistral" && model.api === "mistral-conversations",
+		metadata: IMPLICIT_SHORT_PROMPT_CACHE,
+	},
+	{
+		name: "Fireworks prompt caching",
+		sourceUrl: "https://docs.fireworks.ai/guides/prompt-caching",
+		verifiedAt: "2026-08-18",
+		matches: (model) => model.provider === "fireworks",
+		metadata: IMPLICIT_SHORT_PROMPT_CACHE,
+	},
+	{
+		name: "Cloudflare Workers AI prompt caching",
+		sourceUrl: "https://developers.cloudflare.com/workers-ai/features/prompt-caching/",
+		verifiedAt: "2026-08-18",
+		matches: (model) =>
+			model.provider === "cloudflare-workers-ai" ||
+			(model.provider === "cloudflare-ai-gateway" && model.api === "openai-completions"),
+		metadata: IMPLICIT_SHORT_PROMPT_CACHE,
+	},
+	{
+		name: "OpenAI Codex session caching",
+		sourceUrl: "https://github.com/earendil-works/pi/pull/6618",
+		verifiedAt: "2026-08-18",
+		matches: (model) => model.provider === "openai-codex" && model.api === "openai-codex-responses",
+		metadata: IMPLICIT_SHORT_PROMPT_CACHE,
+	},
+];
+
+function applyPromptCacheMetadata(model: Model<Api>): void {
+	const policy = PROMPT_CACHE_POLICIES.find((candidate) => candidate.matches(model));
+	if (policy) {
+		model.promptCache = policy.metadata;
+	}
+}
 
 // Checked manually against the authenticated GitHub Copilot /models endpoint on 2026-06-15.
 // Keep this to narrow corrections over models.dev metadata instead of snapshotting Copilot's catalog.
@@ -1044,7 +1285,6 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 						sendSessionAffinityHeaders: true,
 						supportsEagerToolInputStreaming: false,
 						supportsCacheControlOnTools: false,
-						supportsLongCacheRetention: false,
 					},
 				});
 			}
@@ -1160,7 +1400,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl = `${variant.basePath}/v1`;
 				}
 
-				if (variant.provider === "opencode" && modelId === "grok-build-0.1") {
+				if (api === "openai-completions" && variant.provider === "opencode" && modelId === "grok-build-0.1") {
 					compat = { ...(compat ?? {}), supportsReasoningEffort: false };
 				}
 
@@ -1192,13 +1432,6 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 
 				if (api === "openai-completions") {
 					compat = { ...(compat ?? {}), maxTokensField: "max_tokens" };
-					if (
-						OPENCODE_OPENAI_COMPLETIONS_LONG_CACHE_RETENTION_UNSUPPORTED_MODELS.has(
-							`${variant.provider}:${modelId}`,
-						)
-					) {
-						compat = { ...compat, supportsLongCacheRetention: false };
-					}
 				}
 
 				models.push({
@@ -1849,7 +2082,6 @@ async function generateModels() {
 		supportsDeveloperRole: false,
 		supportsReasoningEffort: false,
 		maxTokensField: "max_tokens",
-		supportsLongCacheRetention: false,
 	};
 	const antLingModels: Model<"openai-completions">[] = [
 		{
@@ -2108,6 +2340,7 @@ async function generateModels() {
 
 	for (const model of allModels) {
 		applyThinkingLevelMetadata(model);
+		applyPromptCacheMetadata(model);
 	}
 
 	// Group by provider and deduplicate by model ID
@@ -2161,6 +2394,9 @@ export const MODELS = {
 				output += `\t\t\tthinkingLevelMap: ${JSON.stringify(model.thinkingLevelMap)},\n`;
 			}
 			output += `\t\t\tinput: [${model.input.map(i => `"${i}"`).join(", ")}],\n`;
+			if (model.promptCache) {
+				output += `\t\t\tpromptCache: ${JSON.stringify(model.promptCache)},\n`;
+			}
 			output += `\t\t\tcost: {\n`;
 			output += `\t\t\t\tinput: ${model.cost.input},\n`;
 			output += `\t\t\t\toutput: ${model.cost.output},\n`;

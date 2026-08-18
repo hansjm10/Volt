@@ -49,6 +49,7 @@ import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { resolvePromptCacheRetention } from "./prompt-cache.ts";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -214,12 +215,14 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 			if (options.headers && Object.keys(options.headers).length > 0) {
 				addCustomHeadersMiddleware(client, options.headers);
 			}
-			const cacheRetention = resolveCacheRetention(options.cacheRetention, options.env);
+			const cacheRetention = resolvePromptCacheRetention(model, options.cacheRetention, options.env, {
+				forceShort: getProviderEnvValue("AWS_BEDROCK_FORCE_CACHE", options.env) === "1",
+			});
 			const inferenceMaxTokens = options.maxTokens ?? (isAnthropicClaudeModel(model) ? model.maxTokens : undefined);
 			let commandInput = {
 				modelId: model.id,
-				messages: convertMessages(context, model, cacheRetention, options.env),
-				system: buildSystemPrompt(context.systemPrompt, model, cacheRetention, options.env),
+				messages: convertMessages(context, model, cacheRetention),
+				system: buildSystemPrompt(context.systemPrompt, cacheRetention),
 				inferenceConfig: {
 					...(inferenceMaxTokens !== undefined && { maxTokens: inferenceMaxTokens }),
 					...(options.temperature !== undefined && { temperature: options.temperature }),
@@ -590,20 +593,6 @@ function mapThinkingLevelToEffort(
 }
 
 /**
- * Resolve cache retention preference.
- * Defaults to "short" and uses VOLT_CACHE_RETENTION for backward compatibility.
- */
-function resolveCacheRetention(cacheRetention?: CacheRetention, env?: ProviderEnv): CacheRetention {
-	if (cacheRetention) {
-		return cacheRetention;
-	}
-	if (getProviderEnvValue("VOLT_CACHE_RETENTION", env) === "long") {
-		return "long";
-	}
-	return "short";
-}
-
-/**
  * Check if the model is an Anthropic Claude model on Bedrock.
  * Checks both model ID and model name to support application inference profiles
  * whose ARNs don't contain the model name.
@@ -621,37 +610,6 @@ function isAnthropicClaudeModel(model: Model<"bedrock-converse-stream">): boolea
 }
 
 /**
- * Check if the model supports prompt caching.
- * Supported: Claude 3.5 Haiku, Claude 3.7 Sonnet, Claude 4.x models
- *
- * For base models and system-defined inference profiles the model ID / ARN
- * contains the model name, so we can decide locally.
- *
- * For application inference profiles (whose ARNs don't contain the model name),
- * also checks model.name which is user-controlled via models.json or registerProvider.
- * As a last resort, set AWS_BEDROCK_FORCE_CACHE=1 to enable cache points.
- * Amazon Nova models have automatic caching and don't need explicit cache points.
- */
-function supportsPromptCaching(model: Model<"bedrock-converse-stream">, env?: ProviderEnv): boolean {
-	const candidates = getModelMatchCandidates(model.id, model.name);
-
-	const hasClaudeRef = candidates.some((s) => s.includes("claude"));
-	if (!hasClaudeRef) {
-		// Application inference profiles don't contain the model name in the ARN.
-		// Allow users to force cache points via environment variable.
-		if (getProviderEnvValue("AWS_BEDROCK_FORCE_CACHE", env) === "1") return true;
-		return false;
-	}
-	// Claude 4.x models (opus-4, sonnet-4, haiku-4)
-	if (candidates.some((s) => s.includes("-4-"))) return true;
-	// Claude 3.7 Sonnet
-	if (candidates.some((s) => s.includes("claude-3-7-sonnet"))) return true;
-	// Claude 3.5 Haiku
-	if (candidates.some((s) => s.includes("claude-3-5-haiku"))) return true;
-	return false;
-}
-
-/**
  * Check if the model supports thinking signatures in reasoningContent.
  * Only Anthropic Claude models support the signature field.
  * Other models (OpenAI, Qwen, Minimax, Moonshot, etc.) reject it with:
@@ -665,16 +623,13 @@ function supportsThinkingSignature(model: Model<"bedrock-converse-stream">): boo
 
 function buildSystemPrompt(
 	systemPrompt: string | undefined,
-	model: Model<"bedrock-converse-stream">,
 	cacheRetention: CacheRetention,
-	env?: ProviderEnv,
 ): SystemContentBlock[] | undefined {
 	if (!systemPrompt) return undefined;
 
 	const blocks: SystemContentBlock[] = [{ text: sanitizeSurrogates(systemPrompt) }];
 
-	// Add cache point for supported Claude models when caching is enabled
-	if (cacheRetention !== "none" && supportsPromptCaching(model, env)) {
+	if (cacheRetention !== "none") {
 		blocks.push({
 			cachePoint: { type: CachePointType.DEFAULT, ...(cacheRetention === "long" ? { ttl: CacheTTL.ONE_HOUR } : {}) },
 		});
@@ -715,7 +670,6 @@ function convertMessages(
 	context: Context,
 	model: Model<"bedrock-converse-stream">,
 	cacheRetention: CacheRetention,
-	env?: ProviderEnv,
 ): Message[] {
 	const result: Message[] = [];
 	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
@@ -860,8 +814,7 @@ function convertMessages(
 		}
 	}
 
-	// Add cache point to the last user message for supported Claude models when caching is enabled
-	if (cacheRetention !== "none" && supportsPromptCaching(model, env) && result.length > 0) {
+	if (cacheRetention !== "none" && result.length > 0) {
 		const lastMessage = result[result.length - 1];
 		if (lastMessage.role === ConversationRole.USER && lastMessage.content) {
 			(lastMessage.content as ContentBlock[]).push({

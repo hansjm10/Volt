@@ -62,7 +62,7 @@ describe("Fireworks models", () => {
 		expect(model.compat?.sendSessionAffinityHeaders).toBe(true);
 		expect(model.compat?.supportsEagerToolInputStreaming).toBe(false);
 		expect(model.compat?.supportsCacheControlOnTools).toBe(false);
-		expect(model.compat?.supportsLongCacheRetention).toBe(false);
+		expect(model.promptCache).toEqual({ modes: ["implicit"], retention: { short: {} } });
 	});
 });
 
@@ -88,6 +88,7 @@ function createFireworksModel(compat?: Model<"anthropic-messages">["compat"]): M
 		baseUrl: "http://127.0.0.1:0", // overridden by captureAnthropicRequest
 		reasoning: true,
 		input: ["text", "image"],
+		promptCache: { modes: ["implicit"], retention: { short: {} } },
 		cost: { input: 0.95, output: 4, cacheRead: 0.16, cacheWrite: 0 },
 		contextWindow: 262000,
 		maxTokens: 262000,
@@ -104,6 +105,7 @@ function createAnthropicModel(): Model<"anthropic-messages"> {
 		baseUrl: "http://127.0.0.1:0", // overridden by captureAnthropicRequest
 		reasoning: true,
 		input: ["text"],
+		promptCache: { modes: ["explicit"], retention: { short: { ttlSeconds: 300 } } },
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 200000,
 		maxTokens: 32000,

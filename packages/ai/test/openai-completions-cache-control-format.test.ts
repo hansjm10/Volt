@@ -126,7 +126,7 @@ describe("openai-completions cacheControlFormat", () => {
 		mockState.lastParams = undefined;
 	});
 
-	it("applies Anthropic-style cache markers when model compat enables them", async () => {
+	it("applies Anthropic-style cache markers when model metadata enables them", async () => {
 		const model: Model<"openai-completions"> = {
 			id: "custom-qwen",
 			name: "Custom Qwen",
@@ -135,6 +135,7 @@ describe("openai-completions cacheControlFormat", () => {
 			baseUrl: "https://example.com/v1",
 			reasoning: true,
 			input: ["text"],
+			promptCache: { modes: ["explicit"], retention: { short: {} } },
 			cost: {
 				input: 0,
 				output: 0,
@@ -152,10 +153,14 @@ describe("openai-completions cacheControlFormat", () => {
 		expectAnthropicCacheMarkers(params);
 	});
 
-	it("preserves Anthropic-style cache markers for OpenRouter Anthropic models", async () => {
+	it("omits cache markers for routed models without cache metadata", async () => {
 		const model = getModel("openrouter", "anthropic/claude-sonnet-4");
 		const params = await capturePayload(model);
-		expectAnthropicCacheMarkers(params);
+		const instructionMessage = getInstructionMessage(params);
+
+		expect(Array.isArray(instructionMessage?.content)).toBe(false);
+		expect(params.tools?.[0]?.cache_control).toBeUndefined();
+		expect(typeof params.messages[params.messages.length - 1]?.content).toBe("string");
 	});
 
 	it("omits Anthropic-style cache markers when cacheRetention is none", async () => {
@@ -167,6 +172,7 @@ describe("openai-completions cacheControlFormat", () => {
 			baseUrl: "https://example.com/v1",
 			reasoning: true,
 			input: ["text"],
+			promptCache: { modes: ["explicit"], retention: { short: {} } },
 			cost: {
 				input: 0,
 				output: 0,

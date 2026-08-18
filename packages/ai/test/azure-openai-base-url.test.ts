@@ -13,6 +13,8 @@ interface CapturedAzureClientOptions {
 
 interface CapturedAzureResponsesPayload {
 	prompt_cache_key?: string;
+	prompt_cache_retention?: string;
+	prompt_cache_options?: { mode: "explicit" };
 	store?: boolean;
 }
 
@@ -143,6 +145,46 @@ describe("azure-openai-responses base URL normalization", () => {
 		}).result();
 
 		expect(azureMock.lastParams?.prompt_cache_key).toBe("x".repeat(64));
+	});
+
+	it("uses 24h retention only for Azure models with a long tier", async () => {
+		const model = getModel("azure-openai-responses", "gpt-4.1");
+		await streamAzureOpenAIResponses(model, context, {
+			apiKey: "test-api-key",
+			azureBaseUrl: "https://my-resource.openai.azure.com",
+			cacheRetention: "long",
+			sessionId: "azure-session",
+		}).result();
+
+		expect(azureMock.lastParams?.prompt_cache_key).toBe("azure-session");
+		expect(azureMock.lastParams?.prompt_cache_retention).toBe("24h");
+	});
+
+	it("disables GPT-5.6 implicit caching when retention is none", async () => {
+		const model = getModel("azure-openai-responses", "gpt-5.6-sol");
+		await streamAzureOpenAIResponses(model, context, {
+			apiKey: "test-api-key",
+			azureBaseUrl: "https://my-resource.openai.azure.com",
+			cacheRetention: "none",
+			sessionId: "azure-session",
+		}).result();
+
+		expect(azureMock.lastParams?.prompt_cache_key).toBeUndefined();
+		expect(azureMock.lastParams?.prompt_cache_retention).toBeUndefined();
+		expect(azureMock.lastParams?.prompt_cache_options).toEqual({ mode: "explicit" });
+	});
+
+	it("does not send 24h retention to Azure GPT-5.6", async () => {
+		const model = getModel("azure-openai-responses", "gpt-5.6-sol");
+		await streamAzureOpenAIResponses(model, context, {
+			apiKey: "test-api-key",
+			azureBaseUrl: "https://my-resource.openai.azure.com",
+			cacheRetention: "long",
+			sessionId: "azure-session",
+		}).result();
+
+		expect(azureMock.lastParams?.prompt_cache_key).toBe("azure-session");
+		expect(azureMock.lastParams?.prompt_cache_retention).toBeUndefined();
 	});
 
 	it("disables server-side response storage", async () => {

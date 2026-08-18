@@ -24,6 +24,7 @@ import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import type { JsonObject } from "../utils/json-value.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { resolvePromptCacheRetention } from "./prompt-cache.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -212,7 +213,8 @@ function buildRequestOptions(model: Model<"mistral-conversations">, options?: Mi
 
 	// Mistral infrastructure uses `x-affinity` for KV-cache reuse (prefix caching).
 	// Respect explicit caller-provided header values.
-	if (options?.sessionId && !headers["x-affinity"]) {
+	const cacheRetention = resolvePromptCacheRetention(model, options?.cacheRetention, options?.env);
+	if (cacheRetention !== "none" && options?.sessionId && !headers["x-affinity"]) {
 		headers["x-affinity"] = options.sessionId;
 	}
 

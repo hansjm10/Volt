@@ -80,6 +80,24 @@ export interface ThinkingBudgets {
 // Base options all providers share
 export type CacheRetention = "none" | "short" | "long";
 
+export type PromptCacheMode = "implicit" | "explicit";
+
+export interface PromptCacheRetentionTier {
+	/** Documented retention window in seconds. Omitted when the provider does not publish a stable TTL. */
+	ttlSeconds?: number;
+}
+
+export interface PromptCacheMetadata {
+	/** Prompt-cache modes supported by Volt for this provider/API/model tuple. */
+	modes: readonly PromptCacheMode[];
+	retention: {
+		short: PromptCacheRetentionTier;
+		long?: PromptCacheRetentionTier;
+	};
+	/** Whether a successful cache hit renews the documented retention window. */
+	refreshesOnHit?: boolean;
+}
+
 export type Transport = "sse" | "websocket" | "websocket-cached" | "auto";
 
 /** Provider-scoped environment overrides. Values take precedence over process.env. */
@@ -525,8 +543,6 @@ export interface OpenAICompletionsCompat {
 	cacheControlFormat?: "anthropic";
 	/** Whether to send known session-affinity headers (`session_id`, `x-client-request-id`, `x-session-affinity`) from `options.sessionId` when caching is enabled. Default: false. */
 	sendSessionAffinityHeaders?: boolean;
-	/** Whether the provider supports long prompt cache retention (`prompt_cache_retention: "24h"` or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true. */
-	supportsLongCacheRetention?: boolean;
 }
 
 /** Compatibility settings for OpenAI Responses APIs. */
@@ -535,8 +551,6 @@ export interface OpenAIResponsesCompat {
 	supportsDeveloperRole?: boolean;
 	/** Whether to send the OpenAI `session_id` cache-affinity header from `options.sessionId` when caching is enabled. Default: true. */
 	sendSessionIdHeader?: boolean;
-	/** Whether the provider supports `prompt_cache_retention: "24h"`. Default: true. */
-	supportsLongCacheRetention?: boolean;
 }
 
 /** Compatibility settings for Anthropic Messages-compatible APIs. */
@@ -549,8 +563,6 @@ export interface AnthropicMessagesCompat {
 	 * Default: true.
 	 */
 	supportsEagerToolInputStreaming?: boolean;
-	/** Whether the provider supports Anthropic long cache retention (`cache_control.ttl: "1h"`). Default: true. */
-	supportsLongCacheRetention?: boolean;
 	/**
 	 * Whether to send the `x-session-affinity` header from `options.sessionId`
 	 * when caching is enabled. Required for providers like Fireworks that use
@@ -688,6 +700,8 @@ export interface Model<TApi extends Api> {
 	 */
 	thinkingLevelMap?: ThinkingLevelMap;
 	input: ("text" | "image")[];
+	/** Prompt-cache capabilities and documented retention for this exact provider/API/model tuple. */
+	promptCache?: PromptCacheMetadata;
 	cost: {
 		input: number; // $/million tokens
 		output: number; // $/million tokens
@@ -708,7 +722,10 @@ export interface Model<TApi extends Api> {
 }
 
 export interface ImagesModel<TApi extends ImagesApi>
-	extends Omit<Model<Api>, "api" | "provider" | "reasoning" | "contextWindow" | "maxTokens" | "compat"> {
+	extends Omit<
+		Model<Api>,
+		"api" | "provider" | "reasoning" | "contextWindow" | "maxTokens" | "promptCache" | "compat"
+	> {
 	api: TApi;
 	provider: ImagesProvider;
 	output: ("text" | "image")[];
