@@ -554,6 +554,47 @@ describe("review snapshots", () => {
 		});
 	});
 
+	it("keeps the GitHub context fingerprint stable across pull request code revisions", async () => {
+		const repository = createRepository();
+		const view = {
+			id: "PR_fingerprint",
+			number: 7,
+			title: "Stable context",
+			body: "Stable body",
+			baseRefName: "main",
+			headRefName: "feature",
+			url: "https://example.test/pr/7",
+			baseRefOid: "a".repeat(40),
+			headRefOid: "b".repeat(40),
+		};
+		const configPath = join(repository, "bin", "gh-config.json");
+		installGitHubShim(repository, { view });
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+		const captureFingerprint = async (): Promise<string> => {
+			const captured = await captureReviewGitHubContext({
+				cwd: repository,
+				number: "7",
+				maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
+			});
+			expect(captured.ok).toBe(true);
+			if (!captured.ok) throw new Error(captured.error);
+			return captured.context.manifest.fingerprint;
+		};
+
+		const initialFingerprint = await captureFingerprint();
+		view.headRefOid = "c".repeat(40);
+		writeFileSync(configPath, JSON.stringify({ view }));
+		expect(await captureFingerprint()).toBe(initialFingerprint);
+
+		view.baseRefOid = "d".repeat(40);
+		writeFileSync(configPath, JSON.stringify({ view }));
+		expect(await captureFingerprint()).toBe(initialFingerprint);
+
+		view.title = "Changed context";
+		writeFileSync(configPath, JSON.stringify({ view }));
+		expect(await captureFingerprint()).not.toBe(initialFingerprint);
+	});
+
 	it("captures paged linked issues, PR discussion, reviews, threads, replies, and issue comments", async () => {
 		const repository = createRepository();
 		const oid = "a".repeat(40);

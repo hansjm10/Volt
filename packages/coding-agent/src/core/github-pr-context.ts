@@ -886,7 +886,21 @@ function contextFingerprint(
 	limitations: ReviewGitHubContextLimitation[],
 ): string {
 	return createHash("sha256")
-		.update(JSON.stringify({ pullRequest, linkedIssues, discussionEntries, limitations }))
+		.update(
+			JSON.stringify({
+				pullRequest: {
+					number: pullRequest.number,
+					title: pullRequest.title,
+					body: pullRequest.body,
+					url: pullRequest.url,
+					baseRefName: pullRequest.baseRefName,
+					headRefName: pullRequest.headRefName,
+				},
+				linkedIssues,
+				discussionEntries,
+				limitations,
+			}),
+		)
 		.digest("hex");
 }
 
