@@ -3,4 +3,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(compaction): Serialized split-turn summaries and exposed compaction cause to extensions. ([#239](https://github.com/volt-hq/Volt/issues/239))
+fix(compaction): Serialized split-turn summaries, resumed empty length-limited turns after compaction, and exposed compaction cause and continuation state to extensions. ([#239](https://github.com/volt-hq/Volt/issues/239))
