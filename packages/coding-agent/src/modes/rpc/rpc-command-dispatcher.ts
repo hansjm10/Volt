@@ -190,6 +190,7 @@ function projectReviewRun(record: ReviewRunRecord, includeResult: boolean): Reco
 			description: record.target.description,
 			diffCommand: record.target.diffCommand,
 			identity: record.target.identity,
+			...(record.target.context ? { context: record.target.context } : {}),
 		},
 		options: record.options,
 		...(record.parentRunId ? { parentRunId: record.parentRunId } : {}),

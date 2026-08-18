@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { type Component, parseOsc11BackgroundColor, type Terminal, TuiMainScreen } from "../src/index.ts";
+import { createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 
 class TestTerminal implements Terminal {
 	private inputHandler: ((data: string) => void) | undefined;
@@ -77,8 +78,8 @@ class TestTerminal implements Terminal {
 class InputRecorder implements Component {
 	readonly inputs: string[] = [];
 
-	render(_width: number): string[] {
-		return [];
+	render(_width: number): RenderFrame {
+		return createRenderFrame([]);
 	}
 
 	handleInput(data: string): void {

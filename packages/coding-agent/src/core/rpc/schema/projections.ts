@@ -171,6 +171,20 @@ export const RpcReviewFindingSchema = Type.Object(
 export const RpcReviewCoverageSchema = Type.Object(
 	{
 		changedFileInventoryComplete: Type.Boolean(),
+		context: Type.Optional(
+			Type.Object(
+				{
+					captureStatus: stringEnum(["complete", "incomplete"]),
+					linkedIssueCount: Type.Integer({ minimum: 0 }),
+					discussionEntryCount: Type.Integer({ minimum: 0 }),
+					limitationCodes: Type.Array(Type.String()),
+					fingerprint: Type.String(),
+					discoveryInspectionComplete: Type.Boolean(),
+					verificationInspectionComplete: Type.Boolean(),
+				},
+				{ additionalProperties: false },
+			),
+		),
 		filesInspected: Type.Array(Type.String()),
 		hunksInspected: Type.Array(Type.String()),
 		commandsRun: Type.Array(Type.String()),
@@ -234,6 +248,21 @@ const reviewRunProperties = {
 			description: Type.String(),
 			diffCommand: Type.String(),
 			identity: RpcReviewTargetIdentitySchema,
+			context: Type.Optional(
+				Type.Object(
+					{
+						captureStatus: stringEnum(["complete", "incomplete"]),
+						linkedIssueCount: Type.Integer({ minimum: 0 }),
+						discussionEntryCount: Type.Integer({ minimum: 0 }),
+						renderedLinkedIssueCount: Type.Integer({ minimum: 0 }),
+						renderedDiscussionEntryCount: Type.Integer({ minimum: 0 }),
+						renderedBytes: Type.Integer({ minimum: 0 }),
+						limitationCodes: Type.Array(Type.String()),
+						fingerprint: Type.String(),
+					},
+					{ additionalProperties: false },
+				),
+			),
 		},
 		{ additionalProperties: false },
 	),

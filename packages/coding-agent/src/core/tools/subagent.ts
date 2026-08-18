@@ -2,7 +2,15 @@ import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@hansjm10/volt-agent-core";
 import type { AssistantMessage, TextContent } from "@hansjm10/volt-ai";
-import { type Component, Markdown, Text, truncateToWidth, visibleWidth } from "@hansjm10/volt-tui";
+import {
+	type Component,
+	createRenderFrame,
+	Markdown,
+	type RenderFrame,
+	Text,
+	truncateToWidth,
+	visibleWidth,
+} from "@hansjm10/volt-tui";
 import { type Static, Type } from "typebox";
 import type { SessionStats } from "../agent-session.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
@@ -1897,7 +1905,7 @@ function appendIndentedMarkdown(
 	const prefix = currentTheme.fg("muted", branchPrefix);
 	const rendered = new Markdown(text, 3, 0, getMarkdownTheme(), {
 		color: (value) => currentTheme.fg("toolOutput", value),
-	}).render(Math.max(1, width - visibleWidth(prefix)));
+	}).render(Math.max(1, width - visibleWidth(prefix))).lines;
 	for (const line of rendered) {
 		lines.push(truncateToWidth(`${prefix}${line.replace(/ +$/, "")}`, width, currentTheme.fg("dim", "…")));
 	}
@@ -2107,14 +2115,14 @@ class SubagentConversationSummaryComponent implements Component {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		if (this.cachedLines && this.cachedWidth === width) {
-			return this.cachedLines;
+			return createRenderFrame(this.cachedLines);
 		}
 		const lines = this.renderLines(width);
 		this.cachedWidth = width;
 		this.cachedLines = lines;
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	private renderLines(width: number): string[] {

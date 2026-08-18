@@ -21,7 +21,7 @@ describe("StartupHeaderComponent", () => {
 	});
 
 	it("keeps normal terminals focused on the compact startup lockup", () => {
-		const lines = createHeader(36).render(120);
+		const lines = createHeader(36).render(120).lines;
 		const text = lines.map(stripAnsi).join("\n");
 
 		expect(text).toContain("VOLT v1.2.3");
@@ -30,14 +30,14 @@ describe("StartupHeaderComponent", () => {
 	});
 
 	it("does not orphan a compact shortcut action at narrow widths", () => {
-		const lines = createHeader(24).render(80).map(stripAnsi);
+		const lines = createHeader(24).render(80).lines.map(stripAnsi);
 
 		expect(lines.some((line) => line.trim() === "more")).toBe(false);
 		expect(lines.join("\n")).toContain("ctrl+o more");
 	});
 
 	it("uses the full wordmark only when both width and height are spacious", () => {
-		const lines = createHeader(45).render(160);
+		const lines = createHeader(45).render(160).lines;
 		const text = lines.map(stripAnsi).join("\n");
 
 		expect(text).toContain("______");

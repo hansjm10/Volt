@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { type Component, type TUI, TuiMainScreen } from "../src/index.ts";
 import { matchesKey } from "../src/keys.ts";
+import { createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 import { ProcessTerminal } from "../src/terminal.ts";
 import { truncateToWidth } from "../src/utils.ts";
 
@@ -65,7 +66,7 @@ class KeyLogger implements Component {
 		return truncateToWidth(line, width).padEnd(width);
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const lines: string[] = [];
 
 		// Title
@@ -96,7 +97,7 @@ class KeyLogger implements Component {
 		lines.push(this.fit("  - Regular Backspace", width));
 		lines.push("=".repeat(width));
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 }
 

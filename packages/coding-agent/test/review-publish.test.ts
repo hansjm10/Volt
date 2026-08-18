@@ -168,8 +168,12 @@ switch (args.slice(0, 2).join(" ")) {
 	}
 
 	it("rechecks the head and submits one atomic review with unsafe anchors in the summary", async () => {
+		const privateMarker = "private-github-discussion-marker";
 		const fixture = installGh();
-		const published = await publishReviewRun(fixture.cwd, reviewRun());
+		const run = reviewRun();
+		if (!run.target.identity.pullRequest) throw new Error("Expected a PR review fixture");
+		run.target.identity.pullRequest.body = privateMarker;
+		const published = await publishReviewRun(fixture.cwd, run);
 		expect(published).toEqual({
 			reviewId: 99,
 			url: "https://example.test/review/99",
@@ -184,6 +188,7 @@ switch (args.slice(0, 2).join(" ")) {
 		expect(payload.commit_id).toBe("head-oid");
 		expect(payload.comments).toEqual([expect.objectContaining({ path: "src/value.ts" })]);
 		expect(payload.body).toContain("finding-summary");
+		expect(JSON.stringify(payload)).not.toContain(privateMarker);
 		expect(
 			readFileSync(fixture.callsPath, "utf8")
 				.split("\n")

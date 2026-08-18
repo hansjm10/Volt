@@ -6,7 +6,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { isKeyRelease, matchesKey } from "./keys.ts";
-import { getImagePlacements, type ImagePlacement, renderComponentFrame, setImagePlacements } from "./render-frame.ts";
+import {
+	concatRenderFrames,
+	createRenderFrame,
+	mapRenderFrameLines,
+	type RenderFrame,
+	sliceRenderFrame,
+} from "./render-frame.ts";
 import type { Terminal } from "./terminal.ts";
 import {
 	isOsc11BackgroundColorResponse,
@@ -31,9 +37,9 @@ export interface Component {
 	/**
 	 * Render the component to lines for the given viewport width
 	 * @param width - Current viewport width
-	 * @returns Array of strings, each representing a line
+	 * @returns Rendered lines and explicit terminal-image placements
 	 */
-	render(width: number): string[];
+	render(width: number): RenderFrame;
 
 	/**
 	 * Optional handler for keyboard input when component has focus
@@ -252,16 +258,8 @@ export class Container implements Component {
 		}
 	}
 
-	render(width: number): string[] {
-		const lines: string[] = [];
-		const images: ImagePlacement[] = [];
-		for (const child of this.children) {
-			const frame = renderComponentFrame(child, width);
-			const top = lines.length;
-			lines.push(...frame.lines);
-			for (const image of frame.images) images.push({ ...image, top: image.top + top, anchor: image.anchor + top });
-		}
-		return setImagePlacements(lines, images);
+	render(width: number): RenderFrame {
+		return concatRenderFrames(this.children.map((child) => child.render(width)));
 	}
 }
 
@@ -324,6 +322,8 @@ export interface TUI extends Component {
 	setClearOnShrink(enabled: boolean): void;
 	getFocusedComponent(): Component | null;
 	setFocus(component: Component | null): void;
+	/** Replace current focus or an active overlay's eventual restore target. */
+	retargetFocus(from: Component, to: Component | null): boolean;
 	showOverlay(component: Component, options?: OverlayOptions): OverlayHandle;
 	hideOverlay(): void;
 	hasOverlay(): boolean;
@@ -489,6 +489,44 @@ export abstract class TuiBase extends Container implements TUI {
 
 	setFocus(component: Component | null): void {
 		this.setFocusInternal({ component, overlayFocusRestore: "clear" });
+	}
+
+	/**
+	 * Replace focus without interrupting a capturing overlay. Returns true when
+	 * the current focus or its active overlay restore chain referenced `from`.
+	 */
+	retargetFocus(from: Component, to: Component | null): boolean {
+		if (this.focusedComponent === from) {
+			this.setFocus(to);
+			return true;
+		}
+
+		const retargetOverlayChain = (start: Component | null): boolean => {
+			const visited = new Set<Component>();
+			let current = start;
+			while (current && !visited.has(current)) {
+				visited.add(current);
+				const overlay = this.overlayStack.find((entry) => entry.component === current);
+				if (!overlay) return false;
+				if (overlay.preFocus === from) {
+					overlay.preFocus = to;
+					return true;
+				}
+				current = overlay.preFocus;
+			}
+			return false;
+		};
+
+		if (retargetOverlayChain(this.focusedComponent)) return true;
+		const restoreState = this.getVisibleOverlayFocusRestore();
+		if (restoreState.status === "inactive") return false;
+		if (restoreState.status === "blocked" && restoreState.resume.status === "focus-target") {
+			if (restoreState.resume.target === from) {
+				restoreState.resume.target = to;
+				return true;
+			}
+		}
+		return retargetOverlayChain(restoreState.overlay.component);
 	}
 
 	private setFocusInternal({
@@ -1234,23 +1272,22 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 	}
 
-	/** Composite all overlays into content lines (sorted by focusOrder, higher = on top). */
-	protected compositeOverlays(lines: string[], termWidth: number, termHeight: number): string[] {
-		if (this.overlayStack.length === 0) return lines;
-		const result = [...lines];
-		const images = getImagePlacements(lines).map((image) => ({ ...image }));
+	/** Composite all overlays into a frame (sorted by focusOrder, higher = on top). */
+	protected compositeOverlays(frame: RenderFrame, termWidth: number, termHeight: number): RenderFrame {
+		if (this.overlayStack.length === 0) return frame;
+		const result = [...frame.lines];
+		const images = frame.images.map((image) => ({ ...image }));
 
 		// Pre-render all visible overlays and calculate positions
 		const rendered: {
-			overlayLines: string[];
-			overlayImages: ImagePlacement[];
+			overlayFrame: RenderFrame;
 			row: number;
 			col: number;
 			w: number;
 		}[] = [];
 		let minLinesNeeded = result.length;
 
-		const visibleEntries = this.overlayStack.filter((e) => this.isOverlayVisible(e));
+		const visibleEntries = this.overlayStack.filter((entry) => this.isOverlayVisible(entry));
 		visibleEntries.sort((a, b) => a.focusOrder - b.focusOrder);
 		for (const entry of visibleEntries) {
 			const { component, options } = entry;
@@ -1259,50 +1296,35 @@ export abstract class TuiBase extends Container implements TUI {
 			// (width and maxHeight don't depend on overlay height)
 			const { width, maxHeight } = this.resolveOverlayLayout(options, 0, termWidth, termHeight);
 
-			// Render component at calculated width
-			const overlayFrame = renderComponentFrame(component, width);
-			let overlayLines = overlayFrame.lines;
-			let overlayImages = overlayFrame.images;
-
-			// Apply maxHeight if specified
-			if (maxHeight !== undefined && overlayLines.length > maxHeight) {
-				overlayLines = overlayLines.slice(0, maxHeight);
-				overlayImages = overlayImages.filter((image) => image.anchor < maxHeight && image.top < maxHeight);
+			let overlayFrame = component.render(width);
+			if (maxHeight !== undefined && overlayFrame.lines.length > maxHeight) {
+				overlayFrame = sliceRenderFrame(overlayFrame, 0, maxHeight);
 			}
 
 			// Get final row/col with actual overlay height
-			const { row, col } = this.resolveOverlayLayout(options, overlayLines.length, termWidth, termHeight);
+			const { row, col } = this.resolveOverlayLayout(options, overlayFrame.lines.length, termWidth, termHeight);
 
-			rendered.push({ overlayLines, overlayImages, row, col, w: width });
-			minLinesNeeded = Math.max(minLinesNeeded, row + overlayLines.length);
+			rendered.push({ overlayFrame, row, col, w: width });
+			minLinesNeeded = Math.max(minLinesNeeded, row + overlayFrame.lines.length);
 		}
 
 		// Pad to at least terminal height so overlays have screen-relative positions.
 		// Excludes maxLinesRendered: the historical high-water mark caused self-reinforcing
 		// inflation that pushed content into scrollback on terminal widen.
 		const workingHeight = Math.max(result.length, termHeight, minLinesNeeded);
-
-		// Extend result with empty lines if content is too short for overlay placement or working area
-		while (result.length < workingHeight) {
-			result.push("");
-		}
+		while (result.length < workingHeight) result.push("");
 
 		const viewportStart = Math.max(0, workingHeight - termHeight);
-
-		// Composite each overlay
-		for (const { overlayLines, overlayImages, row, col, w } of rendered) {
-			for (const [i, overlayLine] of overlayLines.entries()) {
-				const idx = viewportStart + row + i;
-				const baseLine = result[idx];
-				if (baseLine !== undefined) {
-					// Defensive: truncate overlay line to declared width before compositing
-					// (components should already respect width, but this ensures it)
-					const truncatedOverlayLine =
-						visibleWidth(overlayLine) > w ? sliceByColumn(overlayLine, 0, w, true) : overlayLine;
-					result[idx] = this.compositeLineAt(baseLine, truncatedOverlayLine, col, w, termWidth);
-				}
+		for (const { overlayFrame, row, col, w } of rendered) {
+			for (const [index, overlayLine] of overlayFrame.lines.entries()) {
+				const targetRow = viewportStart + row + index;
+				const baseLine = result[targetRow];
+				if (baseLine === undefined) continue;
+				const truncatedOverlayLine =
+					visibleWidth(overlayLine) > w ? sliceByColumn(overlayLine, 0, w, true) : overlayLine;
+				result[targetRow] = this.compositeLineAt(baseLine, truncatedOverlayLine, col, w, termWidth);
 			}
-			for (const image of overlayImages) {
+			for (const image of overlayFrame.images) {
 				images.push({
 					...image,
 					top: image.top + viewportStart + row,
@@ -1312,15 +1334,12 @@ export abstract class TuiBase extends Container implements TUI {
 			}
 		}
 
-		return setImagePlacements(result, images);
+		return createRenderFrame(result, images);
 	}
 
-	protected applyLineResets(lines: string[]): string[] {
+	protected applyLineResets(frame: RenderFrame): RenderFrame {
 		const reset = SEGMENT_RESET;
-		for (const [i, line] of lines.entries()) {
-			if (!isImageLine(line)) lines[i] = normalizeTerminalOutput(line) + reset;
-		}
-		return lines;
+		return mapRenderFrameLines(frame, (line) => (isImageLine(line) ? line : normalizeTerminalOutput(line) + reset));
 	}
 
 	private compositeLineAt(

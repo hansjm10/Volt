@@ -11,7 +11,7 @@ describe("UserMessageComponent", () => {
 		initTheme("dark");
 
 		const component = new UserMessageComponent("hello");
-		const lines = component.render(20);
+		const lines = component.render(20).lines;
 
 		expect(lines).toHaveLength(2);
 		expect(lines[0]).toContain(OSC133_ZONE_START);

@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "../render-frame.ts";
 import type { Component } from "../tui.ts";
 import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 
@@ -42,10 +43,10 @@ export class Text implements Component {
 		this.cachedLines = undefined;
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		// Check cache
 		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
-			return this.cachedLines;
+			return createRenderFrame(this.cachedLines);
 		}
 
 		// Don't render anything if there's no actual text
@@ -54,7 +55,7 @@ export class Text implements Component {
 			this.cachedText = this.text;
 			this.cachedWidth = width;
 			this.cachedLines = result;
-			return result;
+			return createRenderFrame(result);
 		}
 
 		// Replace tabs with 3 spaces
@@ -101,6 +102,6 @@ export class Text implements Component {
 		this.cachedWidth = width;
 		this.cachedLines = result;
 
-		return result.length > 0 ? result : [""];
+		return createRenderFrame(result.length > 0 ? result : [""]);
 	}
 }

@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Todo Extension - Demonstrates state management via session entries
  *
@@ -56,9 +57,9 @@ class TodoListComponent {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		if (this.cachedLines && this.cachedWidth === width) {
-			return this.cachedLines;
+			return createRenderFrame(this.cachedLines);
 		}
 
 		const lines: string[] = [];
@@ -93,7 +94,7 @@ class TodoListComponent {
 
 		this.cachedWidth = width;
 		this.cachedLines = lines;
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	invalidate(): void {

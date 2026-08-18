@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 /**
  * TUI viewport overwrite repro
  *
@@ -34,11 +35,13 @@ class Lines implements Component {
 		this.lines.push(...lines);
 	}
 
-	render(width: number): string[] {
-		return this.lines.map((line) => {
-			if (line.length > width) return line.slice(0, width);
-			return line.padEnd(width, " ");
-		});
+	render(width: number): RenderFrame {
+		return createRenderFrame(
+			this.lines.map((line) => {
+				if (line.length > width) return line.slice(0, width);
+				return line.padEnd(width, " ");
+			}),
+		);
 	}
 
 	invalidate(): void {}

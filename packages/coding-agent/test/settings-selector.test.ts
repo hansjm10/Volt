@@ -133,7 +133,7 @@ describe("SettingsSelectorComponent", () => {
 			for (const character of "personality") {
 				settingsList.handleInput(character);
 			}
-			const initialRender = stripAnsi(settingsList.render(100).join("\n"));
+			const initialRender = stripAnsi(settingsList.render(100).lines.join("\n"));
 			expect(initialRender).toContain("Personality");
 			expect(initialRender).toContain("default");
 
@@ -142,7 +142,7 @@ describe("SettingsSelectorComponent", () => {
 			expect(onPersonalityChange).toHaveBeenCalledWith("pragmatic");
 			expect(session.settingsManager.getPersonality()).toBe("pragmatic");
 			expect(session.settingsManager.getGlobalSettings().profiles?.delivery?.personality).toBe("pragmatic");
-			expect(stripAnsi(settingsList.render(100).join("\n"))).toContain("pragmatic");
+			expect(stripAnsi(settingsList.render(100).lines.join("\n"))).toContain("pragmatic");
 		} finally {
 			cleanup();
 		}
@@ -160,8 +160,8 @@ describe("SettingsSelectorComponent", () => {
 			settingsList.handleInput(character);
 		}
 		settingsList.handleInput("\n");
-		expect(stripAnsi(settingsList.render(100).join("\n"))).toContain("Context usage");
-		expect(stripAnsi(settingsList.render(100).join("\n"))).toContain("350k");
+		expect(stripAnsi(settingsList.render(100).lines.join("\n"))).toContain("Context usage");
+		expect(stripAnsi(settingsList.render(100).lines.join("\n"))).toContain("350k");
 
 		settingsList.handleInput("\x1b[B");
 		settingsList.handleInput("\n");

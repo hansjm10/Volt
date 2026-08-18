@@ -1,11 +1,18 @@
+import {
+	concatRenderFrames,
+	createRenderFrame,
+	mapRenderFrameLines,
+	prefixRenderFrame,
+	type RenderFrame,
+} from "../render-frame.ts";
 import type { Component } from "../tui.ts";
 import { applyBackgroundToLine, visibleWidth } from "../utils.ts";
 
 type RenderCache = {
-	childLines: string[];
+	childFrame: RenderFrame;
 	width: number;
 	bgSample: string | undefined;
-	lines: string[];
+	frame: RenderFrame;
 };
 
 /**
@@ -53,14 +60,30 @@ export class Box implements Component {
 		this.cache = undefined;
 	}
 
-	private matchCache(width: number, childLines: string[], bgSample: string | undefined): boolean {
+	private matchCache(width: number, childFrame: RenderFrame, bgSample: string | undefined): boolean {
 		const cache = this.cache;
 		return (
 			!!cache &&
 			cache.width === width &&
 			cache.bgSample === bgSample &&
-			cache.childLines.length === childLines.length &&
-			cache.childLines.every((line, i) => line === childLines[i])
+			cache.childFrame.lines.length === childFrame.lines.length &&
+			cache.childFrame.lines.every((line, index) => line === childFrame.lines[index]) &&
+			cache.childFrame.images.length === childFrame.images.length &&
+			cache.childFrame.images.every((image, index) => {
+				const next = childFrame.images[index];
+				return (
+					next !== undefined &&
+					image.top === next.top &&
+					image.anchor === next.anchor &&
+					image.left === next.left &&
+					image.columns === next.columns &&
+					image.rows === next.rows &&
+					image.protocol === next.protocol &&
+					image.imageId === next.imageId &&
+					image.sequence === next.sequence &&
+					image.exactSequence === next.exactSequence
+				);
+			})
 		);
 	}
 
@@ -71,57 +94,37 @@ export class Box implements Component {
 		}
 	}
 
-	render(width: number): string[] {
-		if (this.children.length === 0) {
-			return [];
-		}
+	render(width: number): RenderFrame {
+		if (this.children.length === 0) return createRenderFrame([]);
 
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
 		const leftPad = " ".repeat(this.paddingX);
+		const childFrame = prefixRenderFrame(
+			concatRenderFrames(this.children.map((child) => child.render(contentWidth))),
+			leftPad,
+		);
+		if (childFrame.lines.length === 0) return createRenderFrame([]);
 
-		// Render all children
-		const childLines: string[] = [];
-		for (const child of this.children) {
-			const lines = child.render(contentWidth);
-			for (const line of lines) {
-				childLines.push(leftPad + line);
-			}
-		}
-
-		if (childLines.length === 0) {
-			return [];
-		}
-
-		// Check if bgFn output changed by sampling
 		const bgSample = this.bgFn ? this.bgFn("test") : undefined;
+		if (this.matchCache(width, childFrame, bgSample)) return this.cache!.frame;
 
-		// Check cache validity
-		if (this.matchCache(width, childLines, bgSample)) {
-			return this.cache!.lines;
-		}
-
-		// Apply background and padding
-		const result: string[] = [];
-
-		// Top padding
-		for (let i = 0; i < this.paddingY; i++) {
-			result.push(this.applyBg("", width));
-		}
-
-		// Content
-		for (const line of childLines) {
-			result.push(this.applyBg(line, width));
-		}
-
-		// Bottom padding
-		for (let i = 0; i < this.paddingY; i++) {
-			result.push(this.applyBg("", width));
-		}
-
-		// Update cache
-		this.cache = { childLines, width, bgSample, lines: result };
-
-		return result;
+		const contentFrame = mapRenderFrameLines(childFrame, (line) => this.applyBg(line, width));
+		const paddingLines = Array.from({ length: this.paddingY }, () => this.applyBg("", width));
+		const frame = concatRenderFrames([
+			createRenderFrame(paddingLines),
+			contentFrame,
+			createRenderFrame(paddingLines),
+		]);
+		this.cache = {
+			childFrame: createRenderFrame(
+				[...childFrame.lines],
+				childFrame.images.map((image) => ({ ...image })),
+			),
+			width,
+			bgSample,
+			frame,
+		};
+		return frame;
 	}
 
 	private applyBg(line: string, width: number): string {

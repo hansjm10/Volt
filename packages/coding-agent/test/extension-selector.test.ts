@@ -27,7 +27,7 @@ describe("ExtensionSelectorComponent", () => {
 			() => {},
 		);
 
-		const rendered = stripAnsi(selector.render(80).join("\n"));
+		const rendered = stripAnsi(selector.render(80).lines.join("\n"));
 		const shown = options.filter((option) => rendered.includes(option));
 
 		// Only a bounded window is rendered, not the entire 40-item list.
@@ -45,7 +45,7 @@ describe("ExtensionSelectorComponent", () => {
 			() => {},
 		);
 
-		const rendered = stripAnsi(selector.render(80).join("\n"));
+		const rendered = stripAnsi(selector.render(80).lines.join("\n"));
 
 		for (const option of options) {
 			expect(rendered).toContain(option);
@@ -62,14 +62,14 @@ describe("ExtensionSelectorComponent", () => {
 			() => {},
 		);
 
-		expect(stripAnsi(selector.render(80).join("\n"))).toContain("branch-00");
+		expect(stripAnsi(selector.render(80).lines.join("\n"))).toContain("branch-00");
 
 		// Move the selection to the last item.
 		for (let i = 0; i < options.length - 1; i++) {
 			selector.handleInput("j");
 		}
 
-		const scrolled = stripAnsi(selector.render(80).join("\n"));
+		const scrolled = stripAnsi(selector.render(80).lines.join("\n"));
 		expect(scrolled).toContain("branch-39");
 		expect(scrolled).not.toContain("branch-00");
 		expect(scrolled).toContain("(40/40)");

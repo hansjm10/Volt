@@ -1,5 +1,6 @@
 import { fuzzyFilter } from "../fuzzy.ts";
 import { getKeybindings } from "../keybindings.ts";
+import { createRenderFrame, type RenderFrame } from "../render-frame.ts";
 import type { Component } from "../tui.ts";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 import { Input } from "./input.ts";
@@ -81,20 +82,20 @@ export class SettingsList implements Component {
 		this.submenuComponent?.invalidate?.();
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		// If submenu is active, render it instead
 		if (this.submenuComponent) {
 			return this.submenuComponent.render(width);
 		}
 
-		return this.renderMainList(width);
+		return createRenderFrame(this.renderMainList(width));
 	}
 
 	private renderMainList(width: number): string[] {
 		const lines: string[] = [];
 
 		if (this.searchEnabled && this.searchInput) {
-			lines.push(...this.searchInput.render(width));
+			lines.push(...this.searchInput.render(width).lines);
 			lines.push("");
 		}
 

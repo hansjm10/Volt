@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Snake game extension - play snake with /snake command
  */
@@ -204,9 +205,9 @@ class SnakeComponent {
 		this.cachedWidth = 0;
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		if (width === this.cachedWidth && this.cachedVersion === this.version) {
-			return this.cachedLines;
+			return createRenderFrame(this.cachedLines);
 		}
 
 		const lines: string[] = [];
@@ -286,7 +287,7 @@ class SnakeComponent {
 		this.cachedWidth = width;
 		this.cachedVersion = this.version;
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	private padLine(line: string, width: number): string {

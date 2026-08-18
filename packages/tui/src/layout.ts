@@ -2,13 +2,7 @@ import type { ScrollView } from "./components/scroll-view.ts";
 import { allocateStackSizes, visibleStackEntries } from "./components/stack.ts";
 import { getLayoutNode } from "./layout-node.ts";
 import { compositeLayoutLine } from "./line-compositor.ts";
-import {
-	getImagePlacements,
-	type ImagePlacement,
-	type RenderFrame,
-	renderComponentFrame,
-	setImagePlacements,
-} from "./render-frame.ts";
+import type { ImagePlacement, RenderFrame } from "./render-frame.ts";
 import { cropImageLine, getImageMetadata, isImageLine } from "./terminal-image.ts";
 import { type Component, CURSOR_MARKER } from "./tui.ts";
 import { extractAnsiCode, getGraphemeCellRange, sliceByColumn, visibleWidth } from "./utils.ts";
@@ -81,7 +75,7 @@ function renderCached(context: LayoutContext, component: Component, width: numbe
 	}
 	let frame = widths.get(safeWidth);
 	if (!frame) {
-		frame = renderComponentFrame(component, safeWidth);
+		frame = component.render(safeWidth);
 		widths.set(safeWidth, frame);
 	}
 	return frame;
@@ -461,16 +455,6 @@ export function renderLayoutFrame(
 		const lines = Array.from({ length: safeHeight }, () => "");
 		const images: ImagePlacement[] = [];
 		paintBox(rootBox, lines, safeWidth, images);
-		for (const inferred of getImagePlacements(lines)) {
-			const represented = images.some(
-				(image) =>
-					image.protocol === inferred.protocol &&
-					image.imageId === inferred.imageId &&
-					image.anchor === inferred.anchor,
-			);
-			if (!represented) images.push(inferred);
-		}
-		setImagePlacements(lines, images);
 		return {
 			root: rootBox,
 			width: safeWidth,

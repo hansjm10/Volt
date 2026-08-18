@@ -48,7 +48,7 @@ describe("BashExecutionComponent width handling (#2569)", () => {
 		component.setComplete(0, false);
 
 		// Render at the narrow width (simulating a resize or split pane)
-		const lines = component.render(narrowWidth);
+		const lines = component.render(narrowWidth).lines;
 
 		// Every rendered line must fit within the narrow width
 		for (let i = 0; i < lines.length; i++) {
@@ -61,12 +61,12 @@ describe("BashExecutionComponent width handling (#2569)", () => {
 		const { stub } = createTuiStub(120);
 		const component = new BashExecutionComponent(`cd src && python -c 'print("hello")'`, stub);
 		component.setComplete(0, false);
-		const rendered = component.render(120).join("\n");
+		const rendered = component.render(120).lines.join("\n");
 
 		expect(rendered).toContain(theme.fg("syntaxFunction", "cd"));
 		expect(rendered).toContain(theme.fg("syntaxFunction", "python"));
 		expect(stripAnsi(rendered)).toContain(`$ cd src && python -c 'print("hello")' [success]`);
-		for (const line of component.render(32)) {
+		for (const line of component.render(32).lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(32);
 		}
 	});
@@ -76,14 +76,14 @@ describe("BashExecutionComponent width handling (#2569)", () => {
 		const success = new BashExecutionComponent("npm run check", stub);
 		success.appendOutput("No errors found");
 		success.setComplete(0, false);
-		const successLines = success.render(120).map(stripAnsi);
+		const successLines = success.render(120).lines.map(stripAnsi);
 		expect(successLines.join("\n")).toContain("$ npm run check [success]");
 		expect(successLines.filter((line) => line.trim()).every((line) => line.startsWith("│ "))).toBe(true);
 
 		const failure = new BashExecutionComponent("npm run check", stub);
 		failure.appendOutput("Type error");
 		failure.setComplete(1, false);
-		const failed = failure.render(120).map(stripAnsi).join("\n");
+		const failed = failure.render(120).lines.map(stripAnsi).join("\n");
 		expect(failed).toContain("$ npm run check [failure]");
 		expect(failed).toContain("Exit code: 1");
 	});
@@ -97,13 +97,13 @@ describe("BashExecutionComponent width handling (#2569)", () => {
 		component.setComplete(0, false);
 
 		// First render at width 200
-		const lines200 = component.render(200);
+		const lines200 = component.render(200).lines;
 		for (const line of lines200) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(200);
 		}
 
 		// Second render at width 60 (split pane scenario)
-		const lines60 = component.render(60);
+		const lines60 = component.render(60).lines;
 		for (let i = 0; i < lines60.length; i++) {
 			const w = visibleWidth(lines60[i]);
 			expect(w, `Line ${i} visibleWidth=${w} > 60`).toBeLessThanOrEqual(60);

@@ -16,6 +16,7 @@ export interface AppKeybindings {
 	"app.exit": true;
 	"app.suspend": true;
 	"app.mode.toggle": true;
+	"app.plan.togglePane": true;
 	"app.thinking.cycle": true;
 	"app.model.cycleForward": true;
 	"app.model.cycleBackward": true;
@@ -81,6 +82,10 @@ export const KEYBINDINGS = {
 	"app.mode.toggle": {
 		defaultKeys: "shift+tab",
 		description: "Toggle Build and Plan mode",
+	},
+	"app.plan.togglePane": {
+		defaultKeys: "alt+p",
+		description: "Switch focus between conversation and plan pane",
 	},
 	"app.model.cycleForward": {
 		defaultKeys: "ctrl+p",

@@ -91,7 +91,7 @@ describe("issue #3217 scoped model ordering", () => {
 
 		await waitForAsyncRender();
 
-		const renderedLines = stripAnsi(selector.render(120).join("\n"))
+		const renderedLines = stripAnsi(selector.render(120).lines.join("\n"))
 			.split("\n")
 			.filter((line) => line.includes(`[${modelOne.provider}]`));
 		const orderedIds = renderedLines.slice(0, 3).map((line) => {

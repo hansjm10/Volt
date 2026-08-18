@@ -1,4 +1,5 @@
 import { Input } from "./components/input.ts";
+import { concatRenderFrames, createRenderFrame, type RenderFrame } from "./render-frame.ts";
 import type { Component, Focusable } from "./tui.ts";
 import { getGraphemeSegmenter, stripTerminalSequences, truncateToWidth, visibleWidth } from "./utils.ts";
 
@@ -138,7 +139,7 @@ export class AltScreenSearchComponent implements Component, Focusable {
 		this.input.invalidate();
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const safeWidth = Math.max(1, width);
 		const label = " Find transcript";
 		const query = this.input.getValue();
@@ -152,6 +153,9 @@ export class AltScreenSearchComponent implements Component, Focusable {
 		const gap = " ".repeat(Math.max(1, safeWidth - labelWidth - statusWidth));
 		const title = truncateToWidth(`${label}${gap}${status}`, safeWidth, "");
 		const padding = " ".repeat(Math.max(0, safeWidth - visibleWidth(title)));
-		return [`\x1b[7m${title}${padding}\x1b[27m`, ...this.input.render(safeWidth)];
+		return concatRenderFrames([
+			createRenderFrame([`\x1b[7m${title}${padding}\x1b[27m`]),
+			this.input.render(safeWidth),
+		]);
 	}
 }

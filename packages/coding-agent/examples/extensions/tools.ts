@@ -1,3 +1,4 @@
+import { createRenderFrame } from "@hansjm10/volt-tui";
 /**
  * Tools Extension
  *
@@ -88,7 +89,7 @@ export default function toolsExtension(volt: ExtensionAPI) {
 				container.addChild(
 					new (class {
 						render(_width: number) {
-							return [theme.fg("accent", theme.bold("Tool Configuration")), ""];
+							return createRenderFrame([theme.fg("accent", theme.bold("Tool Configuration")), ""]);
 						}
 						invalidate() {}
 					})(),

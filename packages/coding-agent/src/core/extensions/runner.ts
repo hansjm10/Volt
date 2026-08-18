@@ -64,12 +64,13 @@ import type {
 } from "./types.ts";
 
 // Extension shortcuts compete with canonical keybinding ids from keybindings.json.
-// Only editor-global shortcuts are reserved here. Picker-specific bindings are not.
+// Only main-view global shortcuts are reserved here. Picker-specific bindings are not.
 const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS = [
 	"app.interrupt",
 	"app.clear",
 	"app.exit",
 	"app.suspend",
+	"app.plan.togglePane",
 	"app.thinking.cycle",
 	"app.model.cycleForward",
 	"app.model.cycleBackward",

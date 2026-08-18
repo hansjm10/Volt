@@ -33,7 +33,7 @@ describe("AssistantMessageComponent", () => {
 		initTheme("dark");
 
 		const component = new AssistantMessageComponent(createAssistantMessage([{ type: "text", text: "hello" }]));
-		const lines = component.render(40);
+		const lines = component.render(40).lines;
 
 		expect(lines).not.toHaveLength(0);
 		expect(lines[0]).toContain(OSC133_ZONE_START);
@@ -44,11 +44,11 @@ describe("AssistantMessageComponent", () => {
 		initTheme("dark");
 		const message = createAssistantMessage([{ type: "thinking", thinking: "Check the render hierarchy" }]);
 
-		const visible = new AssistantMessageComponent(message).render(60).join("\n");
+		const visible = new AssistantMessageComponent(message).render(60).lines.join("\n");
 		expect(visible).toContain(theme.italic(theme.fg("accent", "[thinking]")));
 		expect(visible).toContain("Check the render hierarchy");
 
-		const hidden = stripAnsi(new AssistantMessageComponent(message, true).render(60).join("\n"));
+		const hidden = stripAnsi(new AssistantMessageComponent(message, true).render(60).lines.join("\n"));
 		expect(hidden).toContain("[thinking] Thinking...");
 		expect(hidden).not.toContain("Check the render hierarchy");
 	});
@@ -61,7 +61,7 @@ describe("AssistantMessageComponent", () => {
 		component.updateContent(createAssistantMessage([{ type: "text", text: "stale second draft" }]));
 		component.updateContent(createAssistantMessage([{ type: "text", text: "latest response" }]));
 
-		const rendered = stripAnsi(component.render(60).join("\n"));
+		const rendered = stripAnsi(component.render(60).lines.join("\n"));
 		expect(rendered).toContain("latest response");
 		expect(rendered).not.toContain("stale first draft");
 		expect(rendered).not.toContain("stale second draft");
@@ -73,7 +73,7 @@ describe("AssistantMessageComponent", () => {
 		const message = createAssistantMessage([{ type: "text", text: "Partial response" }]);
 		message.stopReason = "error";
 		message.errorMessage = "Provider disconnected";
-		const rendered = new AssistantMessageComponent(message).render(60).join("\n");
+		const rendered = new AssistantMessageComponent(message).render(60).lines.join("\n");
 
 		expect(rendered).toContain("[failure] Provider disconnected");
 	});
@@ -87,7 +87,7 @@ describe("AssistantMessageComponent", () => {
 				{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "file.txt" } },
 			]),
 		);
-		const rendered = component.render(60).join("\n");
+		const rendered = component.render(60).lines.join("\n");
 
 		expect(rendered.includes(OSC133_ZONE_START)).toBe(false);
 		expect(rendered.includes(OSC133_ZONE_END)).toBe(false);
