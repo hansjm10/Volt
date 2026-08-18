@@ -92,8 +92,19 @@ export interface ReviewFinding {
 	verification: ReviewFindingVerification;
 }
 
+export interface ReviewContextCoverage {
+	captureStatus: "complete" | "incomplete";
+	linkedIssueCount: number;
+	discussionEntryCount: number;
+	limitationCodes: string[];
+	fingerprint: string;
+	discoveryInspectionComplete: boolean;
+	verificationInspectionComplete: boolean;
+}
+
 export interface ReviewCoverage {
 	changedFileInventoryComplete: boolean;
+	context?: ReviewContextCoverage;
 	filesInspected: string[];
 	hunksInspected: string[];
 	commandsRun: string[];
@@ -141,6 +152,7 @@ export interface BuildParsedReviewOptions {
 	candidateReport: ReviewCandidateReport;
 	validatedCandidates: ValidatedReviewCandidate[];
 	verificationReport: ReviewVerificationReport;
+	discoveryCoverage: ReviewObservedCoverage;
 	verificationCoverage: ReviewObservedCoverage;
 	commandsRun: string[];
 	failedVerificationAttempts: string[];
@@ -504,6 +516,19 @@ export function buildParsedReview(options: BuildParsedReviewOptions): ParsedRevi
 	const expectedHunks = expectedReviewableHunkIds(options.snapshot, excluded);
 	const inspected = new Set(options.verificationCoverage.hunksInspected);
 	const uninspectedHunks = expectedHunks.filter((hunkId) => !inspected.has(hunkId));
+	const contextCoverage = options.snapshot.githubContext
+		? {
+				captureStatus: options.snapshot.githubContext.manifest.status,
+				linkedIssueCount: options.snapshot.githubContext.manifest.linkedIssueCount,
+				discussionEntryCount: options.snapshot.githubContext.manifest.discussionEntryCount,
+				limitationCodes: [
+					...new Set(options.snapshot.githubContext.manifest.limitations.map((limitation) => limitation.code)),
+				].sort(),
+				fingerprint: options.snapshot.githubContext.manifest.fingerprint,
+				discoveryInspectionComplete: options.discoveryCoverage.contextInspectionComplete,
+				verificationInspectionComplete: options.verificationCoverage.contextInspectionComplete,
+			}
+		: undefined;
 	const uncheckedAreas = [
 		...options.snapshot.changedFiles.flatMap((file) =>
 			file.reviewable || excluded.has(file.path)
@@ -513,6 +538,15 @@ export function buildParsedReview(options: BuildParsedReviewOptions): ParsedRevi
 		...(options.verificationCoverage.changedFileInventoryComplete
 			? []
 			: ["Changed-file inventory was not paged to completion."]),
+		...(contextCoverage?.captureStatus === "incomplete"
+			? ["GitHub pull request context capture was incomplete."]
+			: []),
+		...(contextCoverage && !contextCoverage.discoveryInspectionComplete
+			? ["Discovery did not page GitHub pull request context to completion."]
+			: []),
+		...(contextCoverage && !contextCoverage.verificationInspectionComplete
+			? ["Verification did not page GitHub pull request context to completion."]
+			: []),
 		...uninspectedHunks.map((hunkId) => `Changed hunk was not fully inspected: ${hunkId}`),
 	];
 	const completionStatus: ReviewCompletionStatus =
@@ -535,6 +569,7 @@ export function buildParsedReview(options: BuildParsedReviewOptions): ParsedRevi
 		findings,
 		coverage: {
 			changedFileInventoryComplete: options.verificationCoverage.changedFileInventoryComplete,
+			...(contextCoverage ? { context: contextCoverage } : {}),
 			filesInspected: [
 				...new Set([...options.verificationCoverage.filesRead, ...options.verificationCoverage.diffFilesFullyRead]),
 			].sort(),

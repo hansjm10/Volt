@@ -5,6 +5,13 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnProcess } from "../utils/child-process.ts";
+import {
+	captureReviewGitHubContext,
+	type ReviewGitHubContext,
+	type ReviewPullRequestIdentity,
+} from "./github-pr-context.ts";
+
+export type { ReviewPullRequestIdentity } from "./github-pr-context.ts";
 
 export type ReviewTarget =
 	| { kind: "uncommitted" }
@@ -52,17 +59,6 @@ export interface ReviewChangedFile {
 	binary: boolean;
 	reviewable: boolean;
 	unsupportedReason?: string;
-}
-
-export interface ReviewPullRequestIdentity {
-	number: number;
-	title: string;
-	body: string;
-	url: string;
-	baseRefName: string;
-	headRefName: string;
-	baseRefOid: string;
-	headRefOid: string;
 }
 
 export interface ReviewSnapshotIdentity {
@@ -135,6 +131,7 @@ export interface ReviewSnapshot {
 	workflowDescription?: string;
 	diffCommand: string;
 	extraContext?: string;
+	githubContext?: ReviewGitHubContext;
 	identity: ReviewSnapshotIdentity;
 	changedFiles: ReviewChangedFile[];
 	root: string;
@@ -190,22 +187,12 @@ interface SnapshotInit {
 	workflowDescription?: string;
 	diffCommand: string;
 	extraContext?: string;
+	githubContext?: ReviewGitHubContext;
 	identity: ReviewSnapshotIdentity;
 	root: string;
 	source: GitSource;
 	temporaryDirectories: string[];
 	limits: ReviewSnapshotLimits;
-}
-
-interface PullRequestView {
-	number: number;
-	title: string;
-	body: string;
-	baseRefName: string;
-	headRefName: string;
-	url: string;
-	baseRefOid: string;
-	headRefOid: string;
 }
 
 const CANONICAL_GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -489,44 +476,6 @@ async function resolveBaseRef(base: string, cwd: string, limits: ReviewSnapshotL
 	return undefined;
 }
 
-function parsePullRequestView(stdout: string, maximum: number): PullRequestView | undefined {
-	let value: unknown;
-	try {
-		value = JSON.parse(stdout) as unknown;
-	} catch {
-		return undefined;
-	}
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const record = value as Record<string, unknown>;
-	if (
-		typeof record.number !== "number" ||
-		!Number.isInteger(record.number) ||
-		record.number < 1 ||
-		record.number > maximum ||
-		typeof record.title !== "string" ||
-		typeof record.body !== "string" ||
-		typeof record.baseRefName !== "string" ||
-		typeof record.headRefName !== "string" ||
-		typeof record.url !== "string" ||
-		typeof record.baseRefOid !== "string" ||
-		typeof record.headRefOid !== "string" ||
-		!CANONICAL_GIT_OBJECT_ID_PATTERN.test(record.baseRefOid) ||
-		!CANONICAL_GIT_OBJECT_ID_PATTERN.test(record.headRefOid)
-	) {
-		return undefined;
-	}
-	return {
-		number: record.number,
-		title: record.title,
-		body: record.body,
-		baseRefName: record.baseRefName,
-		headRefName: record.headRefName,
-		url: record.url,
-		baseRefOid: record.baseRefOid,
-		headRefOid: record.headRefOid,
-	};
-}
-
 function normalizePullRequestNumber(value: string | undefined, maximum: number): string | undefined {
 	const number = value?.trim();
 	if (!number) return undefined;
@@ -667,7 +616,7 @@ async function captureWorktreeTree(
 
 async function createPullRequestSource(
 	root: string,
-	pullRequest: PullRequestView,
+	pullRequest: ReviewPullRequestIdentity,
 	limits: ReviewSnapshotLimits,
 ): Promise<{ source?: GitSource; temporaryDirectory?: string; error?: ReviewSnapshotResolutionError }> {
 	const originResult = await runCommand("git", ["remote", "get-url", "origin"], root, commandOptions(limits));
@@ -1604,6 +1553,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	readonly workflowDescription?: string;
 	readonly diffCommand: string;
 	readonly extraContext?: string;
+	readonly githubContext?: ReviewGitHubContext;
 	readonly identity: ReviewSnapshotIdentity;
 	readonly root: string;
 	readonly changedFiles: ReviewChangedFile[];
@@ -1631,6 +1581,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		this.workflowDescription = init.workflowDescription;
 		this.diffCommand = init.diffCommand;
 		this.extraContext = init.extraContext;
+		this.githubContext = init.githubContext;
 		this.identity = init.identity;
 		this.root = init.root;
 		this.source = init.source;
@@ -2310,31 +2261,13 @@ export async function resolveReviewSnapshot(
 						error: `PR number must be a canonical positive decimal no greater than ${options.maxPullRequestNumber}.`,
 					};
 				}
-				const numberArgs = normalized ? [normalized] : [];
-				const viewResult = await runCommand(
-					"gh",
-					[
-						"pr",
-						"view",
-						...numberArgs,
-						"--json",
-						"number,title,body,baseRefName,headRefName,url,baseRefOid,headRefOid",
-					],
-					root,
-					commandOptions(limits),
-				);
-				if (!viewResult.ok) {
-					const stderr = commandError(viewResult);
-					if (/ENOENT|not found|not recognized/i.test(stderr)) {
-						return { error: "GitHub CLI (gh) is not installed. Install it from https://cli.github.com/" };
-					}
-					return {
-						error: `gh pr view failed: ${stderr}`,
-						remoteError: "Could not load pull request metadata with GitHub CLI.",
-					};
-				}
-				const pullRequest = parsePullRequestView(text(viewResult), options.maxPullRequestNumber);
-				if (!pullRequest) return { error: "Could not parse gh pr view output." };
+				const captured = await captureReviewGitHubContext({
+					cwd: root,
+					...(normalized ? { number: normalized } : {}),
+					maxPullRequestNumber: options.maxPullRequestNumber,
+				});
+				if (!captured.ok) return captured;
+				const { pullRequest } = captured;
 				const fetched = await createPullRequestSource(root, pullRequest, limits);
 				if (!fetched.source || !fetched.temporaryDirectory)
 					return fetched.error ?? { error: "Could not fetch pull request snapshot." };
@@ -2358,20 +2291,11 @@ export async function resolveReviewSnapshot(
 					await rm(fetched.temporaryDirectory, { recursive: true, force: true });
 					return { error: `PR #${pullRequest.number} has an empty diff.` };
 				}
-				const bodyText = pullRequest.body.trim();
 				init = {
 					description: `PR #${pullRequest.number} (${pullRequest.title})`,
 					workflowDescription: `PR #${pullRequest.number}`,
 					diffCommand: `gh pr diff ${pullRequest.number}`,
-					extraContext: [
-						`PR #${pullRequest.number}: ${pullRequest.title}`,
-						`Base branch: ${pullRequest.baseRefName}`,
-						`Head branch: ${pullRequest.headRefName}`,
-						`URL: ${pullRequest.url}`,
-						bodyText ? `Description:\n${bodyText}` : undefined,
-					]
-						.filter((line): line is string => line !== undefined)
-						.join("\n"),
+					githubContext: captured.context,
 					identity: {
 						kind: target.kind,
 						baseCommit: pullRequest.baseRefOid,

@@ -40,6 +40,17 @@ export interface ReviewRunFileIdentity {
 	reviewable: boolean;
 }
 
+export interface ReviewRunContextMetadata {
+	captureStatus: "complete" | "incomplete";
+	linkedIssueCount: number;
+	discussionEntryCount: number;
+	renderedLinkedIssueCount: number;
+	renderedDiscussionEntryCount: number;
+	renderedBytes: number;
+	limitationCodes: string[];
+	fingerprint: string;
+}
+
 export interface ReviewRunRecord {
 	schemaVersion: 1;
 	runId: string;
@@ -51,6 +62,7 @@ export interface ReviewRunRecord {
 		description: string;
 		diffCommand: string;
 		identity: ReviewSnapshotIdentity;
+		context?: ReviewRunContextMetadata;
 		files: ReviewRunFileIdentity[];
 	};
 	options: ReviewRunControls;
@@ -193,6 +205,15 @@ function boundParsedReview(result: ParsedReview, includeEvidence: boolean): Pars
 		})),
 		coverage: {
 			changedFileInventoryComplete: result.coverage.changedFileInventoryComplete,
+			...(result.coverage.context
+				? {
+						context: {
+							...result.coverage.context,
+							limitationCodes: boundedStrings(result.coverage.context.limitationCodes, 100, 20),
+							fingerprint: truncateUtf8(result.coverage.context.fingerprint, 128),
+						},
+					}
+				: {}),
 			filesInspected: boundedStrings(result.coverage.filesInspected, 1_000, maximumCoverageItems),
 			hunksInspected: boundedStrings(result.coverage.hunksInspected, 500, maximumCoverageItems),
 			commandsRun: boundedStrings(result.coverage.commandsRun, 1_000, maximumCoverageItems),
@@ -417,6 +438,21 @@ export function snapshotFileIdentities(snapshot: ReviewSnapshot): ReviewRunFileI
 	return serializedBytes(files) <= MAX_REVIEW_INVENTORY_BYTES ? files : [];
 }
 
+function snapshotContextMetadata(snapshot: ReviewSnapshot): ReviewRunContextMetadata | undefined {
+	const manifest = snapshot.githubContext?.manifest;
+	if (!manifest) return undefined;
+	return {
+		captureStatus: manifest.status,
+		linkedIssueCount: manifest.linkedIssueCount,
+		discussionEntryCount: manifest.discussionEntryCount,
+		renderedLinkedIssueCount: manifest.renderedLinkedIssueCount,
+		renderedDiscussionEntryCount: manifest.renderedDiscussionEntryCount,
+		renderedBytes: manifest.renderedBytes,
+		limitationCodes: [...new Set(manifest.limitations.map((limitation) => limitation.code))].sort(),
+		fingerprint: manifest.fingerprint,
+	};
+}
+
 export function createReviewRunRecord(options: {
 	workflowId: string;
 	workflowAction: string;
@@ -441,6 +477,7 @@ export function createReviewRunRecord(options: {
 			description: truncateUtf8(options.snapshot.description, 4_000),
 			diffCommand: truncateUtf8(options.snapshot.diffCommand, 4_000),
 			identity: boundSnapshotIdentity(options.snapshot.identity),
+			...(snapshotContextMetadata(options.snapshot) ? { context: snapshotContextMetadata(options.snapshot) } : {}),
 			files: snapshotFileIdentities(options.snapshot),
 		},
 		options: cloneControls(options.controls),
@@ -536,6 +573,11 @@ export function planIncrementalReview(
 		previousRun.target.identity.baseTree !== snapshot.identity.baseTree
 	) {
 		return fullReviewPlan(snapshot, "The prior review target or base tree is incompatible.");
+	}
+	const previousContextFingerprint = previousRun.target.context?.fingerprint;
+	const currentContextFingerprint = snapshot.githubContext?.manifest.fingerprint;
+	if (previousContextFingerprint !== currentContextFingerprint) {
+		return fullReviewPlan(snapshot, "The pull request GitHub context changed since the prior review.");
 	}
 	if (!controlsCompatible(previousRun.options, controls)) {
 		return fullReviewPlan(snapshot, "The prior review controls are incompatible with this run.");

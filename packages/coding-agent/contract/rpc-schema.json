@@ -9540,6 +9540,47 @@
 				"changedFileInventoryComplete": {
 					"type": "boolean"
 				},
+				"context": {
+					"type": "object",
+					"required": [
+						"captureStatus",
+						"linkedIssueCount",
+						"discussionEntryCount",
+						"limitationCodes",
+						"fingerprint",
+						"discoveryInspectionComplete",
+						"verificationInspectionComplete"
+					],
+					"properties": {
+						"captureStatus": {
+							"$ref": "#/$defs/RpcReviewCompletionStatus"
+						},
+						"linkedIssueCount": {
+							"type": "integer",
+							"minimum": 0
+						},
+						"discussionEntryCount": {
+							"type": "integer",
+							"minimum": 0
+						},
+						"limitationCodes": {
+							"type": "array",
+							"items": {
+								"type": "string"
+							}
+						},
+						"fingerprint": {
+							"type": "string"
+						},
+						"discoveryInspectionComplete": {
+							"type": "boolean"
+						},
+						"verificationInspectionComplete": {
+							"type": "boolean"
+						}
+					},
+					"additionalProperties": false
+				},
 				"filesInspected": {
 					"type": "array",
 					"items": {
@@ -9836,6 +9877,54 @@
 						},
 						"identity": {
 							"$ref": "#/$defs/RpcReviewTargetIdentity"
+						},
+						"context": {
+							"type": "object",
+							"required": [
+								"captureStatus",
+								"linkedIssueCount",
+								"discussionEntryCount",
+								"renderedLinkedIssueCount",
+								"renderedDiscussionEntryCount",
+								"renderedBytes",
+								"limitationCodes",
+								"fingerprint"
+							],
+							"properties": {
+								"captureStatus": {
+									"$ref": "#/$defs/RpcReviewCompletionStatus"
+								},
+								"linkedIssueCount": {
+									"type": "integer",
+									"minimum": 0
+								},
+								"discussionEntryCount": {
+									"type": "integer",
+									"minimum": 0
+								},
+								"renderedLinkedIssueCount": {
+									"type": "integer",
+									"minimum": 0
+								},
+								"renderedDiscussionEntryCount": {
+									"type": "integer",
+									"minimum": 0
+								},
+								"renderedBytes": {
+									"type": "integer",
+									"minimum": 0
+								},
+								"limitationCodes": {
+									"type": "array",
+									"items": {
+										"type": "string"
+									}
+								},
+								"fingerprint": {
+									"type": "string"
+								}
+							},
+							"additionalProperties": false
 						}
 					},
 					"additionalProperties": false
@@ -10073,6 +10162,54 @@
 						},
 						"identity": {
 							"$ref": "#/$defs/RpcReviewTargetIdentity"
+						},
+						"context": {
+							"type": "object",
+							"required": [
+								"captureStatus",
+								"linkedIssueCount",
+								"discussionEntryCount",
+								"renderedLinkedIssueCount",
+								"renderedDiscussionEntryCount",
+								"renderedBytes",
+								"limitationCodes",
+								"fingerprint"
+							],
+							"properties": {
+								"captureStatus": {
+									"$ref": "#/$defs/RpcReviewCompletionStatus"
+								},
+								"linkedIssueCount": {
+									"type": "integer",
+									"minimum": 0
+								},
+								"discussionEntryCount": {
+									"type": "integer",
+									"minimum": 0
+								},
+								"renderedLinkedIssueCount": {
+									"type": "integer",
+									"minimum": 0
+								},
+								"renderedDiscussionEntryCount": {
+									"type": "integer",
+									"minimum": 0
+								},
+								"renderedBytes": {
+									"type": "integer",
+									"minimum": 0
+								},
+								"limitationCodes": {
+									"type": "array",
+									"items": {
+										"type": "string"
+									}
+								},
+								"fingerprint": {
+									"type": "string"
+								}
+							},
+							"additionalProperties": false
 						}
 					},
 					"additionalProperties": false

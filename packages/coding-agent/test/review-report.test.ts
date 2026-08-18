@@ -209,8 +209,20 @@ describe("structured review reports", () => {
 			candidateReport: report(),
 			validatedCandidates: validated.candidates,
 			verificationReport: verification,
+			discoveryCoverage: {
+				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
+				filesRead: [],
+				hunksInspected: hunkIds,
+				searchesRun: 0,
+				treePagesRead: 0,
+				diffFilesFullyRead: ["src/divide.ts"],
+			},
 			verificationCoverage: {
 				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
 				filesRead: [],
 				hunksInspected: hunkIds,
 				searchesRun: 1,
@@ -240,8 +252,20 @@ describe("structured review reports", () => {
 				priorFindingDecisions: [],
 				limitations: [],
 			},
+			discoveryCoverage: {
+				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
+				filesRead: [],
+				hunksInspected: [],
+				searchesRun: 0,
+				treePagesRead: 0,
+				diffFilesFullyRead: [],
+			},
 			verificationCoverage: {
 				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
 				filesRead: [],
 				hunksInspected: [],
 				searchesRun: 0,
@@ -255,6 +279,70 @@ describe("structured review reports", () => {
 		expect(incomplete.completionStatus).toBe("incomplete");
 		expect(incomplete.overallCorrectness).toBeUndefined();
 		expect(incomplete.coverage.uncheckedAreas).toHaveLength(1);
+	});
+
+	it("withholds correctness when PR context capture or either pass inspection is incomplete", async () => {
+		const snapshot = await setup();
+		snapshot.githubContext = {
+			manifest: {
+				status: "incomplete",
+				capturedAt: "2026-01-01T00:00:00Z",
+				linkedIssueCount: 1,
+				discussionEntryCount: 2,
+				renderedLinkedIssueCount: 1,
+				renderedDiscussionEntryCount: 2,
+				renderedBytes: 100,
+				limitations: [{ code: "api-error", source: "review-threads", count: 1 }],
+				fingerprint: "c".repeat(64),
+			},
+			linkedIssues: [],
+			discussionEntries: [],
+			rendered: "untrusted GitHub context",
+		};
+		const hunkIds = snapshot.changedFiles.flatMap((file) => file.hunks.map((hunk) => hunk.id));
+		const candidateReport: ReviewCandidateReport = { summary: "No findings.", candidates: [], limitations: [] };
+		const verificationReport: ReviewVerificationReport = {
+			summary: "No omission found.",
+			assessment: "complete",
+			decisions: [],
+			priorFindingDecisions: [],
+			limitations: [],
+		};
+		const observed = (contextInspectionComplete: boolean) => ({
+			changedFileInventoryComplete: true,
+			contextInspectionComplete,
+			contextPagesRead: contextInspectionComplete ? 1 : 0,
+			filesRead: [],
+			hunksInspected: hunkIds,
+			searchesRun: 0,
+			treePagesRead: 0,
+			diffFilesFullyRead: ["src/divide.ts"],
+		});
+		const parsed = buildParsedReview({
+			snapshot,
+			candidateReport,
+			validatedCandidates: [],
+			verificationReport,
+			discoveryCoverage: observed(false),
+			verificationCoverage: observed(true),
+			commandsRun: [],
+			failedVerificationAttempts: [],
+			excludedPaths: [],
+		});
+		expect(parsed.completionStatus).toBe("incomplete");
+		expect(parsed.overallCorrectness).toBeUndefined();
+		expect(parsed.coverage.context).toMatchObject({
+			captureStatus: "incomplete",
+			discoveryInspectionComplete: false,
+			verificationInspectionComplete: true,
+			limitationCodes: ["api-error"],
+		});
+		expect(parsed.coverage.uncheckedAreas).toEqual(
+			expect.arrayContaining([
+				"GitHub pull request context capture was incomplete.",
+				"Discovery did not page GitHub pull request context to completion.",
+			]),
+		);
 	});
 
 	it("marks unsupported in-scope changes incomplete unless they are excluded", async () => {
@@ -292,8 +380,20 @@ describe("structured review reports", () => {
 			candidateReport,
 			validatedCandidates: [],
 			verificationReport,
+			discoveryCoverage: {
+				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
+				filesRead: [],
+				hunksInspected: [],
+				searchesRun: 0,
+				treePagesRead: 1,
+				diffFilesFullyRead: [],
+			},
 			verificationCoverage: {
 				changedFileInventoryComplete: true,
+				contextInspectionComplete: false,
+				contextPagesRead: 0,
 				filesRead: [],
 				hunksInspected: [],
 				searchesRun: 0,

@@ -99,7 +99,7 @@ See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 
 ## Code Review
 
-`/review` captures the selected change as an exact Git snapshot, then runs candidate discovery and independent verification in separate isolated contexts. Host-owned paged tools read only that snapshot. Optional auxiliary tools selected with `/review tools` run in a disposable checkout; mutable workspace `read`/`grep`/`find`/`ls`/edit tools are never used by a review.
+`/review` captures the selected change as an exact Git snapshot, then runs candidate discovery and independent verification in separate isolated contexts. Host-owned paged tools read only that snapshot. Optional auxiliary tools selected with `/review tools` run in a disposable checkout; mutable workspace `read`/`grep`/`find`/`ls`/edit tools are never used by a review. When `/review` opens the local target selector, Volt also makes a short best-effort GitHub lookup and puts `Current PR #N — title` first when the current branch has one unambiguous pull request; lookup failures silently leave the normal selector unchanged. Explicit review targets and RPC actions never perform or inherit this selector lookup.
 
 ```
 /review                                      # open a target selector
@@ -113,11 +113,13 @@ See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 /review uncommitted --include-optional       # opt in to P3 suggestions
 ```
 
-P0-P2 findings must have a changed-side anchor, concrete trigger and impact, and an independent verifier decision. P3 findings are disabled by default. Results are marked `incomplete` and have no correctness verdict when verification or in-scope hunk coverage is incomplete.
+For PR targets, Volt uses the host's `gh` credentials and network to capture the authoritative closing/manual-linked issues, PR issue comments, submitted review summaries, inline review threads and replies, and linked-issue comments. It does not infer links from arbitrary text or follow relationships recursively. GitHub text is capped at 32 KiB per field, capture is capped at 20 linked issues and 200 total discussion entries, and the rendered context is capped at 256 KiB. Truncation, limits, malformed responses, and ancillary API failures are recorded as capture limitations. PR identity or fetch failures are fatal before inference, and Volt rechecks the exact head OID after context capture; if it moved, retry the review.
 
-Review policy comes from user `REVIEW.md` in the Volt agent directory and hierarchical project `REVIEW.md`/`AGENTS.md` files read from the trusted base snapshot. Candidate changes cannot alter the active review policy.
+Both isolated passes must page the same host-captured context to completion. GitHub-authored text is untrusted evidence: it can establish intent or prior discussion, but cannot change review policy, direct tools, or support a retained finding without independently verified changed-code evidence. P0-P2 findings must have a changed-side anchor, concrete trigger and impact, and an independent verifier decision. P3 findings are disabled by default. Results are marked `incomplete` and have no correctness verdict when GitHub context capture or either pass's context inspection is incomplete, or when verification or in-scope hunk coverage is incomplete.
 
-Completed, incomplete, failed, and cancelled runs plus explicit finding outcomes are stored as bounded host-only records on the current session branch. Opening a fix session copies the durable run and can select findings by ID; it does not consume the original result. Publishing is explicit, PR-only, and refused if the PR head moved.
+Review policy comes from user `REVIEW.md` in the Volt agent directory and hierarchical project `REVIEW.md`/`AGENTS.md` files read from the trusted base snapshot. Candidate changes and GitHub discussion cannot alter the active review policy.
+
+Completed, incomplete, failed, and cancelled runs plus explicit finding outcomes are stored as bounded host-only records on the current session branch. Existing bounded PR identity includes its title and body, but newly captured linked-issue and discussion text is never persisted; only bounded capture counts/status/limitation codes and a content fingerprint are retained. A changed fingerprint forces a full incremental PR rerun. Opening a fix session copies the durable run and can select findings by ID; it does not consume the original result. Publishing is explicit, PR-only, and refused if the PR head moved.
 
 Set `reviewModel` to choose the discovery model. Set `reviewVerifierModel` to choose a separate verifier; it defaults to `reviewModel`, which defaults to the active session model. Example: `"anthropic/claude-opus-4-5"`.
 

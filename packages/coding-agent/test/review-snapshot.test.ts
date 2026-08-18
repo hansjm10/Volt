@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, wr
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { captureReviewGitHubContext } from "../src/core/github-pr-context.ts";
 import { normalizeReviewPath, type ReviewSnapshot, resolveReviewSnapshot } from "../src/core/review-snapshot.ts";
 
 const OPTIONS = { maxCommitRefBytes: 1_024, maxPullRequestNumber: 2_147_483_647 };
@@ -31,6 +32,72 @@ function installNodeCommandShim(directory: string, command: string, source: stri
 	const executable = join(directory, command);
 	writeFileSync(executable, `#!/bin/sh\nexec "${process.execPath}" "${fixture}" "$@"\n`);
 	chmodSync(executable, 0o755);
+}
+
+interface GitHubShimConfig {
+	view: Record<string, unknown>;
+	finalHeadOid?: string;
+	graphql?: Record<string, unknown>;
+}
+
+function graphqlKey(operation: string, id: string, cursor: string | null, manualOnly: boolean | null = null): string {
+	return JSON.stringify([operation, id, cursor, manualOnly]);
+}
+
+function graphqlConnection(field: string, nodes: unknown[], hasNextPage = false, endCursor?: string): object {
+	return {
+		data: {
+			node: {
+				[field]: {
+					nodes,
+					pageInfo: { hasNextPage, endCursor: endCursor ?? null },
+				},
+			},
+		},
+	};
+}
+
+function installGitHubShim(directory: string, config: GitHubShimConfig): string {
+	const bin = join(directory, "bin");
+	mkdirSync(bin, { recursive: true });
+	const configPath = join(bin, "gh-config.json");
+	const logPath = join(bin, "gh-requests.jsonl");
+	writeFileSync(configPath, JSON.stringify(config));
+	installNodeCommandShim(
+		bin,
+		"gh",
+		`import { appendFileSync, readFileSync } from "node:fs";
+const config = JSON.parse(readFileSync(${JSON.stringify(configPath)}, "utf8"));
+const args = process.argv.slice(2);
+if (args[0] === "pr" && args[1] === "view") {
+  const fields = args[args.indexOf("--json") + 1];
+  process.stdout.write(JSON.stringify(fields === "headRefOid" ? { headRefOid: config.finalHeadOid ?? config.view.headRefOid } : config.view));
+} else if (args[0] === "api" && args[1] === "graphql") {
+  let input = "";
+  for await (const chunk of process.stdin) input += chunk;
+  const request = JSON.parse(input);
+  const operation = /query\\s+(Volt\\w+)/.exec(request.query)?.[1];
+  const variables = request.variables ?? {};
+  const key = JSON.stringify([operation, variables.id, variables.cursor ?? null, variables.manualOnly ?? null]);
+  appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ operation, variables }) + "\\n");
+  const configured = config.graphql?.[key];
+  if (configured) process.stdout.write(JSON.stringify(configured));
+  else {
+    const fields = {
+      VoltReviewLinkedIssues: "closingIssuesReferences",
+      VoltReviewPullRequestComments: "comments",
+      VoltReviewPullRequestReviews: "reviews",
+      VoltReviewThreads: "reviewThreads",
+      VoltReviewThreadComments: "comments",
+      VoltReviewIssueComments: "comments"
+    };
+    const field = fields[operation];
+    process.stdout.write(JSON.stringify({ data: { node: { [field]: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } }));
+  }
+} else process.exitCode = 1;
+`,
+	);
+	return logPath;
 }
 
 function createSymlinkFixture(repository: string, path: string, target: string): void {
@@ -453,22 +520,25 @@ describe("review snapshots", () => {
 		const baseOid = git(repository, "rev-parse", "main");
 		const headOid = git(repository, "rev-parse", "HEAD");
 
-		const bin = join(repository, "bin");
-		mkdirSync(bin);
-		const ghOutput = join(bin, "gh-output.json");
-		writeFileSync(
-			ghOutput,
-			`${JSON.stringify({ number: 7, title: "Snapshot", body: "Body", baseRefName: "main", headRefName: "feature", url: "https://example.test/pr/7", baseRefOid: baseOid, headRefOid: headOid })}\n`,
-		);
-		installNodeCommandShim(
-			bin,
-			"gh",
-			`import { readFileSync } from "node:fs";\nprocess.stdout.write(readFileSync(${JSON.stringify(ghOutput)}, "utf8"));\n`,
-		);
-		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
+		const config: GitHubShimConfig = {
+			view: {
+				id: "PR_node_7",
+				number: 7,
+				title: "Snapshot",
+				body: "Body",
+				baseRefName: "main",
+				headRefName: "feature",
+				url: "https://example.test/pr/7",
+				baseRefOid: baseOid,
+				headRefOid: headOid,
+			},
+		};
+		installGitHubShim(repository, config);
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 
 		const snapshot = await resolve({ kind: "pr", number: "7" }, repository);
 		expect(snapshot.identity.pullRequest).toMatchObject({ number: 7, baseRefOid: baseOid, headRefOid: headOid });
+		expect(snapshot.githubContext?.manifest).toMatchObject({ status: "complete", fingerprint: expect.any(String) });
 		expect(
 			snapshot.changedFiles
 				.flatMap((file) => file.hunks)
@@ -476,9 +546,223 @@ describe("review snapshots", () => {
 				.join("\n"),
 		).toContain("+pull request");
 
-		writeFileSync(ghOutput, readFileSync(ghOutput, "utf8").replace(headOid, baseOid));
+		config.finalHeadOid = baseOid;
+		writeFileSync(join(repository, "bin", "gh-config.json"), JSON.stringify(config));
 		const moved = await resolveReviewSnapshot({ kind: "pr", number: "7" }, repository, OPTIONS);
-		expect(moved).toMatchObject({ error: "The pull request moved while Volt captured it. Retry the review." });
+		expect(moved).toMatchObject({
+			error: "The pull request moved while Volt captured its GitHub context. Retry the review.",
+		});
+	});
+
+	it("captures paged linked issues, PR discussion, reviews, threads, replies, and issue comments", async () => {
+		const repository = createRepository();
+		const oid = "a".repeat(40);
+		const issue = (id: string, number: number, title: string) => ({
+			id,
+			number,
+			title,
+			body: `Issue ${number} body`,
+			url: `https://example.test/issues/${number}`,
+			state: number === 1 ? "OPEN" : "CLOSED",
+			stateReason: number === 1 ? null : "COMPLETED",
+			createdAt: "2026-01-01T00:00:00Z",
+			updatedAt: "2026-01-02T00:00:00Z",
+			author: { __typename: "User", login: `issue-author-${number}` },
+			repository: { nameWithOwner: "volt/example" },
+		});
+		const comment = (id: string, body: string) => ({
+			id,
+			body,
+			url: `https://example.test/comments/${id}`,
+			createdAt: "2026-01-03T00:00:00Z",
+			updatedAt: "2026-01-03T00:00:00Z",
+			authorAssociation: "CONTRIBUTOR",
+			isMinimized: false,
+			minimizedReason: null,
+			author: { __typename: "User", login: "reviewer" },
+		});
+		const graphql: Record<string, unknown> = {
+			[graphqlKey("VoltReviewLinkedIssues", "PR_node_7", null, false)]: graphqlConnection(
+				"closingIssuesReferences",
+				[issue("issue-1", 1, "First linked issue")],
+				true,
+				"issues-page-2",
+			),
+			[graphqlKey("VoltReviewLinkedIssues", "PR_node_7", "issues-page-2", false)]: graphqlConnection(
+				"closingIssuesReferences",
+				[issue("issue-2", 2, "Manual linked issue")],
+			),
+			[graphqlKey("VoltReviewLinkedIssues", "PR_node_7", null, true)]: graphqlConnection("closingIssuesReferences", [
+				issue("issue-2", 2, "Manual linked issue"),
+			]),
+			[graphqlKey("VoltReviewPullRequestComments", "PR_node_7", null)]: graphqlConnection(
+				"comments",
+				[comment("pr-comment-1", "First PR comment")],
+				true,
+				"pr-comments-page-2",
+			),
+			[graphqlKey("VoltReviewPullRequestComments", "PR_node_7", "pr-comments-page-2")]: graphqlConnection(
+				"comments",
+				[comment("pr-comment-2", "Second PR comment")],
+			),
+			[graphqlKey("VoltReviewPullRequestReviews", "PR_node_7", null)]: graphqlConnection("reviews", [
+				{
+					...comment("review-1", "Submitted review summary"),
+					state: "APPROVED",
+					submittedAt: "2026-01-04T00:00:00Z",
+					commit: { oid },
+				},
+			]),
+			[graphqlKey("VoltReviewThreads", "PR_node_7", null)]: graphqlConnection("reviewThreads", [
+				{
+					id: "thread-1",
+					isResolved: true,
+					isOutdated: false,
+					path: "src/value.ts",
+					line: 4,
+					startLine: 4,
+					originalLine: 3,
+					originalStartLine: 3,
+					diffSide: "RIGHT",
+					comments: {
+						nodes: [{ ...comment("thread-comment-1", "Inline root"), diffHunk: "@@ -1 +1 @@", replyTo: null }],
+						pageInfo: { hasNextPage: true, endCursor: "thread-replies" },
+					},
+				},
+			]),
+			[graphqlKey("VoltReviewThreadComments", "thread-1", "thread-replies")]: graphqlConnection("comments", [
+				{
+					...comment("thread-comment-2", "Inline reply"),
+					diffHunk: "@@ -1 +1 @@",
+					replyTo: { id: "thread-comment-1" },
+				},
+			]),
+			[graphqlKey("VoltReviewIssueComments", "issue-1", null)]: graphqlConnection("comments", [
+				comment("issue-comment-1", "Linked issue discussion"),
+			]),
+		};
+		const logPath = installGitHubShim(repository, {
+			view: {
+				id: "PR_node_7",
+				number: 7,
+				title: "Context PR",
+				body: "PR body",
+				baseRefName: "main",
+				headRefName: "feature",
+				url: "https://example.test/pr/7",
+				baseRefOid: oid,
+				headRefOid: oid,
+			},
+			graphql,
+		});
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+
+		const captured = await captureReviewGitHubContext({
+			cwd: repository,
+			number: "7",
+			maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
+		});
+		expect(captured.ok).toBe(true);
+		if (!captured.ok) throw new Error(captured.error);
+		expect(captured.context.manifest).toMatchObject({
+			status: "complete",
+			linkedIssueCount: 2,
+			discussionEntryCount: 6,
+			fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+		});
+		expect(captured.context.linkedIssues).toMatchObject([
+			{ number: 1, relationship: "closing", state: "OPEN" },
+			{ number: 2, relationship: "manual", state: "CLOSED" },
+		]);
+		expect(captured.context.discussionEntries.map((entry) => entry.kind)).toEqual([
+			"pr-comment",
+			"pr-comment",
+			"review-summary",
+			"review-thread-comment",
+			"review-thread-comment",
+			"linked-issue-comment",
+		]);
+		expect(captured.context.rendered).toContain("Manual linked issue");
+		expect(captured.context.rendered).toContain("Inline reply");
+		expect(captured.context.rendered).toContain("Linked issue discussion");
+		const requests = readFileSync(logPath, "utf8");
+		expect(requests).toContain('"cursor":"issues-page-2"');
+		expect(requests).toContain('"cursor":"pr-comments-page-2"');
+		expect(requests).toContain('"cursor":"thread-replies"');
+	});
+
+	it("enforces GitHub context text, issue, discussion, and aggregate limits", async () => {
+		const repository = createRepository();
+		const oid = "b".repeat(40);
+		const linkedIssues = Array.from({ length: 20 }, (_, index) => ({
+			id: `issue-${index + 1}`,
+			number: index + 1,
+			title: `Issue ${index + 1}`,
+			body: "body",
+			url: `https://example.test/issues/${index + 1}`,
+			state: "OPEN",
+			stateReason: null,
+			repository: { nameWithOwner: "volt/example" },
+		}));
+		const graphql: Record<string, unknown> = {
+			[graphqlKey("VoltReviewLinkedIssues", "PR_node_limits", null, false)]: graphqlConnection(
+				"closingIssuesReferences",
+				linkedIssues,
+				true,
+				"issue-overflow",
+			),
+		};
+		for (let page = 0; page < 10; page++) {
+			const cursor = page === 0 ? null : `discussion-${page}`;
+			const nextCursor = `discussion-${page + 1}`;
+			graphql[graphqlKey("VoltReviewPullRequestComments", "PR_node_limits", cursor)] = graphqlConnection(
+				"comments",
+				Array.from({ length: 20 }, (_, index) => ({
+					id: `comment-${page * 20 + index}`,
+					body: page === 0 && index === 0 ? "x".repeat(33 * 1024) : "z".repeat(1_300),
+					url: `https://example.test/comments/${page * 20 + index}`,
+					authorAssociation: "NONE",
+					author: { __typename: "User", login: "commenter" },
+				})),
+				true,
+				nextCursor,
+			);
+		}
+		installGitHubShim(repository, {
+			view: {
+				id: "PR_node_limits",
+				number: 8,
+				title: "Limits",
+				body: "Body",
+				baseRefName: "main",
+				headRefName: "feature",
+				url: "https://example.test/pr/8",
+				baseRefOid: oid,
+				headRefOid: oid,
+			},
+			graphql,
+		});
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+
+		const captured = await captureReviewGitHubContext({
+			cwd: repository,
+			number: "8",
+			maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
+		});
+		expect(captured.ok).toBe(true);
+		if (!captured.ok) throw new Error(captured.error);
+		expect(captured.context.manifest).toMatchObject({
+			status: "incomplete",
+			linkedIssueCount: 20,
+			discussionEntryCount: 200,
+		});
+		expect(captured.context.manifest.limitations.map((limitation) => limitation.code)).toEqual(
+			expect.arrayContaining(["linked-issue-limit", "discussion-limit", "text-limit", "aggregate-limit"]),
+		);
+		expect(Buffer.byteLength(captured.context.rendered, "utf8")).toBeLessThanOrEqual(256 * 1024);
+		expect(Buffer.byteLength(captured.context.discussionEntries[0]?.body ?? "", "utf8")).toBeLessThanOrEqual(
+			32 * 1024,
+		);
 	});
 
 	it("classifies submodule entries as unsupported", async () => {
