@@ -168,13 +168,13 @@ describe("WorkspaceEdit applier", () => {
 		expect(await readFile(outsideFile, "utf-8")).toBe("secret");
 	});
 
-	it("edits file symlinks whose targets remain inside the workspace", async () => {
+	it("replaces relative in-root text-edit symlinks without changing their referents", async () => {
 		const root = await createTempDir();
 		const target = join(root, "target.foo");
 		const alias = join(root, "alias.foo");
 		await writeFile(target, "old", "utf-8");
 		try {
-			await symlink(target, alias, "file");
+			await symlink("target.foo", alias, "file");
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "EPERM") return;
 			throw error;
@@ -187,25 +187,77 @@ describe("WorkspaceEdit applier", () => {
 		});
 
 		expect(result.applied).toBe(true);
-		expect(await readFile(target, "utf-8")).toBe("new");
+		expect((await lstat(alias)).isSymbolicLink()).toBe(false);
+		expect(await readFile(alias, "utf-8")).toBe("new");
+		expect(await readFile(target, "utf-8")).toBe("old");
 	});
 
-	it("rejects dangling symlink traversal", async () => {
+	it("rejects absolute and dangling final symlink dereferences", async () => {
 		const root = await createTempDir();
+		const target = join(root, "target.foo");
+		const absoluteAlias = join(root, "absolute-alias.foo");
 		const dangling = join(root, "dangling.foo");
+		await writeFile(target, "old", "utf-8");
 		try {
-			await symlink(join(root, "missing-target.foo"), dangling, "file");
+			await symlink(target, absoluteAlias, "file");
+			await symlink("missing-target.foo", dangling, "file");
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "EPERM") return;
 			throw error;
 		}
-		const result = await applyWorkspaceEdit({
+
+		const absoluteResult = await applyWorkspaceEdit({
 			rootDir: root,
-			edit: { documentChanges: [{ kind: "create", uri: uri(dangling), options: { overwrite: true } }] },
+			edit: replaceFirst(uri(absoluteAlias), "old", "new"),
 			snapshots: [],
 		});
-		expect(result).toMatchObject({ applied: false, failedChange: 0 });
-		expect(result.failureReason).toContain("dangling symlink");
+		expect(absoluteResult).toMatchObject({ applied: false, failedChange: 0 });
+		expect(await readFile(target, "utf-8")).toBe("old");
+
+		const danglingResult = await applyWorkspaceEdit({
+			rootDir: root,
+			edit: replaceFirst(uri(dangling), "", "new"),
+			snapshots: [],
+		});
+		expect(danglingResult).toMatchObject({ applied: false, failedChange: 0 });
+		expect((await lstat(dangling)).isSymbolicLink()).toBe(true);
+	});
+
+	it("rejects a multi-operation component swap before it can reach an outside file", async () => {
+		const root = await createTempDir();
+		const outside = await createTempDir("volt-lsp-component-swap-outside-");
+		const outsideFile = join(outside, "outside.foo");
+		const gate = join(root, "gate");
+		const parked = join(root, "parked");
+		const source = join(root, "source");
+		await mkdir(join(gate, "child"), { recursive: true });
+		await mkdir(source);
+		await writeFile(join(gate, "child", "outside.foo"), "inside", "utf-8");
+		await writeFile(outsideFile, "secret", "utf-8");
+		try {
+			await symlink(outside, join(source, "child"), directorySymlinkType());
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EPERM") return;
+			throw error;
+		}
+
+		const result = await applyWorkspaceEdit({
+			rootDir: root,
+			edit: {
+				documentChanges: [
+					{ kind: "rename", oldUri: uri(gate), newUri: uri(parked) },
+					{ kind: "rename", oldUri: uri(source), newUri: uri(gate) },
+					...replaceFirst(uri(join(gate, "child", "outside.foo")), "secret", "pwned").documentChanges!,
+				],
+			},
+			snapshots: [],
+		});
+
+		expect(result).toMatchObject({ applied: false, failedChange: 2, changes: [] });
+		expect(await readFile(outsideFile, "utf-8")).toBe("secret");
+		expect(await readFile(join(gate, "child", "outside.foo"), "utf-8")).toBe("inside");
+		expect(await pathExists(source)).toBe(true);
+		expect(await pathExists(parked)).toBe(false);
 	});
 
 	it("fails closed for version mismatches and stale request snapshots", async () => {
@@ -381,6 +433,106 @@ describe("WorkspaceEdit applier", () => {
 		expect(result.changes.map((change) => change.kind)).toEqual(["create", "edit", "rename", "delete"]);
 		expect(await pathExists(created)).toBe(false);
 		expect(await pathExists(renamed)).toBe(false);
+	});
+
+	it("uses old backing state for descendant edits and creates after a directory rename", async () => {
+		const root = await createTempDir();
+		const source = join(root, "source");
+		const destination = join(root, "destination");
+		const child = join(destination, "child.foo");
+		const created = join(destination, "created.foo");
+		await mkdir(source);
+		await writeFile(join(source, "child.foo"), "old", "utf-8");
+
+		const result = await applyWorkspaceEdit({
+			rootDir: root,
+			edit: {
+				documentChanges: [
+					{ kind: "rename", oldUri: uri(source), newUri: uri(destination) },
+					...replaceFirst(uri(child), "old", "new").documentChanges!,
+					{ kind: "create", uri: uri(created) },
+				],
+			},
+			snapshots: [],
+		});
+
+		expect(result.applied).toBe(true);
+		expect(await pathExists(source)).toBe(false);
+		expect(await readFile(child, "utf-8")).toBe("new");
+		expect(await readFile(created, "utf-8")).toBe("");
+	});
+
+	it("rejects stale access through an old directory subtree before mutation", async () => {
+		const root = await createTempDir();
+		const source = join(root, "source");
+		const destination = join(root, "destination");
+		const child = join(source, "child.foo");
+		await mkdir(source);
+		await writeFile(child, "old", "utf-8");
+
+		const result = await applyWorkspaceEdit({
+			rootDir: root,
+			edit: {
+				documentChanges: [
+					{ kind: "rename", oldUri: uri(source), newUri: uri(destination) },
+					...replaceFirst(uri(child), "old", "new").documentChanges!,
+				],
+			},
+			snapshots: [],
+		});
+
+		expect(result).toMatchObject({ applied: false, failedChange: 1, changes: [] });
+		expect(await readFile(child, "utf-8")).toBe("old");
+		expect(await pathExists(destination)).toBe(false);
+	});
+
+	it("applies directory deletion tombstones to already loaded descendants", async () => {
+		const root = await createTempDir();
+		const directory = join(root, "directory");
+		const child = join(directory, "child.foo");
+		await mkdir(directory);
+		await writeFile(child, "old", "utf-8");
+
+		const result = await applyWorkspaceEdit({
+			rootDir: root,
+			edit: {
+				documentChanges: [
+					...replaceFirst(uri(child), "old", "loaded").documentChanges!,
+					{ kind: "delete", uri: uri(directory), options: { recursive: true } },
+					...replaceFirst(uri(child), "loaded", "new").documentChanges!,
+				],
+			},
+			snapshots: [],
+		});
+
+		expect(result).toMatchObject({ applied: false, failedChange: 2, changes: [] });
+		expect(await readFile(child, "utf-8")).toBe("old");
+	});
+
+	it("preserves source snapshot provenance through directory rename chains", async () => {
+		const root = await createTempDir();
+		const source = join(root, "source");
+		const middle = join(root, "middle");
+		const destination = join(root, "destination");
+		const sourceFile = join(source, "child.foo");
+		const destinationFile = join(destination, "child.foo");
+		await mkdir(source);
+		await writeFile(sourceFile, "old", "utf-8");
+
+		const result = await applyWorkspaceEdit({
+			rootDir: root,
+			edit: {
+				documentChanges: [
+					{ kind: "rename", oldUri: uri(source), newUri: uri(middle) },
+					{ kind: "rename", oldUri: uri(middle), newUri: uri(destination) },
+					...replaceFirst(uri(destinationFile), "old", "new", 7).documentChanges!,
+				],
+			},
+			snapshots: [{ uri: uri(sourceFile), absolutePath: sourceFile, version: 7, content: "old" }],
+		});
+
+		expect(result.applied).toBe(true);
+		expect(await readFile(destinationFile, "utf-8")).toBe("new");
 	});
 
 	it("honors create overwrite and ignoreIfExists options", async () => {

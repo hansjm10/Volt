@@ -1,7 +1,13 @@
 import { realpath } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-const fileMutationQueues = new Map<string, Promise<void>>();
+interface PendingMutation {
+	keys: readonly string[];
+	completion: Promise<void>;
+	release: () => void;
+}
+
+const pendingMutations = new Set<PendingMutation>();
 let registrationQueue = Promise.resolve();
 
 function isMissingPathError(error: unknown): boolean {
@@ -34,50 +40,69 @@ async function getMutationQueueKey(filePath: string): Promise<string> {
 	}
 }
 
+function isSameOrDescendant(path: string, parent: string): boolean {
+	const suffix = relative(parent, path);
+	return suffix === "" || (suffix !== ".." && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix));
+}
+
+function pathsOverlap(first: string, second: string): boolean {
+	return isSameOrDescendant(first, second) || isSameOrDescendant(second, first);
+}
+
+function collapseHierarchicalKeys(keys: readonly string[]): string[] {
+	const collapsed: string[] = [];
+	for (const key of new Set(keys)) {
+		if (collapsed.some((existing) => isSameOrDescendant(key, existing))) continue;
+		for (let index = collapsed.length - 1; index >= 0; index--) {
+			if (isSameOrDescendant(collapsed[index], key)) collapsed.splice(index, 1);
+		}
+		collapsed.push(key);
+	}
+	return collapsed.sort();
+}
+
+function keySetsOverlap(first: readonly string[], second: readonly string[]): boolean {
+	return first.some((firstKey) => second.some((secondKey) => pathsOverlap(firstKey, secondKey)));
+}
+
 /**
- * Serialize mutation operations that touch any overlapping path. The complete
- * sorted key set is registered atomically so callers cannot deadlock by
- * requesting the same paths in different orders.
+ * Serialize mutation operations whose canonical paths are equal or have an
+ * ancestor/descendant relationship. Each collapsed key set is registered as
+ * one record before it waits, preserving registration order without coupling
+ * disjoint sibling paths.
  */
 export async function withFileMutationQueues<T>(filePaths: readonly string[], fn: () => Promise<T>): Promise<T> {
 	const registration = registrationQueue.then(async () => {
-		const keys = [...new Set(await Promise.all(filePaths.map(getMutationQueueKey)))].sort();
-		const currentQueues = keys.map((key) => fileMutationQueues.get(key) ?? Promise.resolve());
-		const currentQueue = Promise.all(currentQueues).then(() => undefined);
-
-		let releaseNext!: () => void;
-		const nextQueue = new Promise<void>((resolveQueue) => {
-			releaseNext = resolveQueue;
+		const keys = collapseHierarchicalKeys(await Promise.all(filePaths.map(getMutationQueueKey)));
+		const predecessors = [...pendingMutations]
+			.filter((pending) => keySetsOverlap(keys, pending.keys))
+			.map((pending) => pending.completion);
+		let release!: () => void;
+		const completion = new Promise<void>((resolveCompletion) => {
+			release = resolveCompletion;
 		});
-		const chainedQueue = currentQueue.then(() => nextQueue);
-		for (const key of keys) {
-			fileMutationQueues.set(key, chainedQueue);
-		}
-
-		return { keys, currentQueue, chainedQueue, releaseNext };
+		const record: PendingMutation = { keys, completion, release };
+		pendingMutations.add(record);
+		return { predecessors, record };
 	});
 	registrationQueue = registration.then(
 		() => undefined,
 		() => undefined,
 	);
 
-	const { keys, currentQueue, chainedQueue, releaseNext } = await registration;
-	await currentQueue;
+	const { predecessors, record } = await registration;
+	await Promise.all(predecessors);
 	try {
 		return await fn();
 	} finally {
-		releaseNext();
-		for (const key of keys) {
-			if (fileMutationQueues.get(key) === chainedQueue) {
-				fileMutationQueues.delete(key);
-			}
-		}
+		record.release();
+		pendingMutations.delete(record);
 	}
 }
 
 /**
- * Serialize file mutation operations targeting the same file.
- * Operations for different files still run in parallel.
+ * Serialize file mutation operations targeting the same path hierarchy.
+ * Operations for disjoint paths still run in parallel.
  */
 export function withFileMutationQueue<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
 	return withFileMutationQueues([filePath], fn);

@@ -133,6 +133,86 @@ describe("withFileMutationQueue", () => {
 		await first;
 	});
 
+	it("makes a descendant write wait for an earlier parent-directory mutation", async () => {
+		const dir = await createTempDir();
+		const parent = join(dir, "workspace-directory");
+		const descendant = join(parent, "nested", "file.txt");
+		const parentStarted = createDeferred();
+		const releaseParent = createDeferred();
+		const writeStarted = createDeferred();
+		const writeTool = createWriteTool(dir, {
+			operations: {
+				mkdir: async () => {},
+				writeFile: async () => {
+					writeStarted.resolve();
+				},
+			},
+		});
+		const parentMutation = withFileMutationQueue(parent, async () => {
+			parentStarted.resolve();
+			await releaseParent.promise;
+		});
+		await parentStarted.promise;
+
+		const descendantWrite = writeTool.execute("write", { path: descendant, content: "content" });
+		expect(await resolvesWithin(writeStarted.promise, 20)).toBe(false);
+		releaseParent.resolve();
+		await Promise.all([parentMutation, descendantWrite]);
+		expect(await resolvesWithin(writeStarted.promise, 20)).toBe(true);
+	});
+
+	it("makes a parent-directory mutation wait for an earlier descendant edit", async () => {
+		const dir = await createTempDir();
+		const descendant = join(dir, "file.txt");
+		await writeFile(descendant, "old", "utf8");
+		const editStarted = createDeferred();
+		const releaseEdit = createDeferred();
+		const parentStarted = createDeferred();
+		const editTool = createEditTool(dir, {
+			operations: {
+				access,
+				readFile,
+				writeFile: async (path, content) => {
+					editStarted.resolve();
+					await releaseEdit.promise;
+					await writeFile(path, content, "utf8");
+				},
+			},
+		});
+		const descendantEdit = editTool.execute("edit", {
+			path: descendant,
+			edits: [{ oldText: "old", newText: "new" }],
+		});
+		await editStarted.promise;
+
+		const parentMutation = withFileMutationQueue(dir, async () => {
+			parentStarted.resolve();
+		});
+		expect(await resolvesWithin(parentStarted.promise, 20)).toBe(false);
+		releaseEdit.resolve();
+		await Promise.all([descendantEdit, parentMutation]);
+		expect(await resolvesWithin(parentStarted.promise, 20)).toBe(true);
+	});
+
+	it("collapses redundant ancestor keys without locking a disjoint sibling", async () => {
+		const dir = await createTempDir();
+		const parent = join(dir, "workspace-directory");
+		const firstSibling = join(parent, "first");
+		const secondSibling = join(parent, "second");
+		const firstStarted = createDeferred();
+		const releaseFirst = createDeferred();
+		const first = withFileMutationQueues([firstSibling, join(firstSibling, "nested.txt")], async () => {
+			firstStarted.resolve();
+			await releaseFirst.promise;
+		});
+		await firstStarted.promise;
+
+		const sibling = withFileMutationQueue(secondSibling, async () => "done");
+		expect(await resolvesWithin(sibling, 50)).toBe(true);
+		releaseFirst.resolve();
+		await first;
+	});
+
 	it("releases every canonical alias key after a multi-path operation", async () => {
 		const dir = await createTempDir();
 		const targetPath = join(dir, "release-target.txt");
