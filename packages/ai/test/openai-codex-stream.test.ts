@@ -1158,6 +1158,158 @@ describe("openai-codex streaming", () => {
 		});
 	});
 
+	it("does not reuse websocket affinity or continuation state when cache retention is none", async () => {
+		const token = mockToken();
+		const sentBodies: Record<string, unknown>[] = [];
+		const websocketSessionIds: string[] = [];
+		let websocketConnections = 0;
+		let websocketCloses = 0;
+
+		const fetchMock = vi.fn(async () => new Response("unexpected fetch", { status: 500 }));
+		vi.stubGlobal("fetch", fetchMock);
+
+		class MockWebSocket {
+			static OPEN = 1;
+			readyState = MockWebSocket.OPEN;
+			private listeners = new Map<string, Set<(event: unknown) => void>>();
+
+			constructor(_url: string, protocols?: string | string[] | { headers?: Record<string, string> }) {
+				websocketConnections++;
+				if (protocols && typeof protocols === "object" && !Array.isArray(protocols)) {
+					const sessionId = protocols.headers?.["session-id"];
+					if (sessionId) websocketSessionIds.push(sessionId);
+				}
+				queueMicrotask(() => this.dispatch("open", {}));
+			}
+
+			addEventListener(type: string, listener: (event: unknown) => void): void {
+				let listeners = this.listeners.get(type);
+				if (!listeners) {
+					listeners = new Set();
+					this.listeners.set(type, listeners);
+				}
+				listeners.add(listener);
+			}
+
+			removeEventListener(type: string, listener: (event: unknown) => void): void {
+				this.listeners.get(type)?.delete(listener);
+			}
+
+			send(data: string): void {
+				const body = JSON.parse(data) as Record<string, unknown>;
+				sentBodies.push(body);
+				const requestNumber = sentBodies.length;
+				const responseId = `resp_${requestNumber}`;
+				const messageId = `msg_${requestNumber}`;
+				const text = requestNumber === 1 ? "Hello" : "Done";
+				const events = [
+					{ type: "response.created", response: { id: responseId } },
+					{
+						type: "response.output_item.added",
+						item: { type: "message", id: messageId, role: "assistant", status: "in_progress", content: [] },
+					},
+					{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+					{ type: "response.output_text.delta", delta: text },
+					{
+						type: "response.output_item.done",
+						item: {
+							type: "message",
+							id: messageId,
+							role: "assistant",
+							status: "completed",
+							content: [{ type: "output_text", text }],
+						},
+					},
+					{
+						type: "response.completed",
+						response: {
+							id: responseId,
+							status: "completed",
+							usage: {
+								input_tokens: 5,
+								output_tokens: 3,
+								total_tokens: 8,
+								input_tokens_details: { cached_tokens: 0 },
+							},
+						},
+					},
+				];
+				queueMicrotask(() => {
+					for (const event of events) {
+						this.dispatch("message", { data: JSON.stringify(event) });
+					}
+				});
+			}
+
+			close(): void {
+				this.readyState = 3;
+				websocketCloses++;
+			}
+
+			private dispatch(type: string, event: unknown): void {
+				for (const listener of this.listeners.get(type) ?? []) {
+					listener(event);
+				}
+			}
+		}
+
+		vi.stubGlobal("WebSocket", MockWebSocket);
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+			promptCache: { modes: ["implicit"], retention: { short: {} } },
+		};
+		const firstContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: 1 }],
+		};
+		const options = {
+			apiKey: token,
+			sessionId: "session-no-cache",
+			cacheRetention: "none" as const,
+			transport: "websocket-cached" as const,
+		};
+
+		const first = await streamOpenAICodexResponses(model, firstContext, options).result();
+		const secondContext: Context = {
+			systemPrompt: firstContext.systemPrompt,
+			messages: [...firstContext.messages, first, { role: "user", content: "Now finish", timestamp: 2 }],
+		};
+		await streamOpenAICodexResponses(model, secondContext, options).result();
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(websocketConnections).toBe(2);
+		expect(websocketCloses).toBe(2);
+		expect(websocketSessionIds).toHaveLength(2);
+		expect(websocketSessionIds[0]).not.toBe(options.sessionId);
+		expect(websocketSessionIds[1]).not.toBe(options.sessionId);
+		expect(websocketSessionIds[1]).not.toBe(websocketSessionIds[0]);
+		expect(sentBodies).toHaveLength(2);
+		expect(sentBodies[0].previous_response_id).toBeUndefined();
+		expect(sentBodies[1].previous_response_id).toBeUndefined();
+		expect(sentBodies[0].input).toHaveLength(1);
+		expect(sentBodies[1].input).toHaveLength(3);
+		expect(JSON.stringify(sentBodies[1].input)).toContain("Say hello");
+		expect(JSON.stringify(sentBodies[1].input)).toContain("Now finish");
+		expect(getOpenAICodexWebSocketDebugStats(options.sessionId)).toMatchObject({
+			requests: 2,
+			connectionsCreated: 2,
+			connectionsReused: 0,
+			cachedContextRequests: 0,
+			fullContextRequests: 2,
+			deltaRequests: 0,
+		});
+	});
+
 	it("remembers websocket fallback by transport session when cache retention is none", async () => {
 		vi.useFakeTimers();
 		const token = mockToken();

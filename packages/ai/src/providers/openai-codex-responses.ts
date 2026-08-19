@@ -247,7 +247,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			if (nextBody !== undefined) {
 				body = nextBody as RequestBody;
 			}
-			const websocketRequestId = transportSessionId || createCodexRequestId();
+			const websocketRequestId = cacheSessionId || createCodexRequestId();
 			const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, cacheSessionId);
 			const websocketHeaders = buildWebSocketHeaders(
 				model.headers,
@@ -280,6 +280,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						},
 						idleTimeoutMs,
 						websocketConnectTimeoutMs,
+						cacheSessionId,
 						options,
 					);
 
@@ -1319,18 +1320,20 @@ async function processWebSocketStream(
 	onStart: () => void,
 	idleTimeoutMs: number | undefined,
 	websocketConnectTimeoutMs: number | undefined,
+	cacheSessionId: string | undefined,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<ProcessResponsesStreamResult> {
 	const { socket, entry, reused, release } = await acquireWebSocket(
 		url,
 		headers,
-		options?.sessionId,
+		cacheSessionId,
 		options?.signal,
 		websocketConnectTimeoutMs,
 		options?.env,
 	);
 	let keepConnection = true;
-	const useCachedContext = options?.transport === "websocket-cached" || options?.transport === "auto";
+	const useCachedContext =
+		cacheSessionId !== undefined && (options?.transport === "websocket-cached" || options?.transport === "auto");
 	// ChatGPT Codex Responses rejects `store: true` ("Store must be set to false").
 	// WebSocket continuation still works via connection-scoped previous_response_id state.
 	const fullBody = body;
