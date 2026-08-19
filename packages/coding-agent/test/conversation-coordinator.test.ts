@@ -463,5 +463,10 @@ describe("ConversationCoordinator", () => {
 		expect(coordinator.tuiLeaseConnectionId).toBe("tui");
 		expect(coordinator.releaseTuiLease("tui")).toBe(true);
 		expect(registry.size).toBe(0);
+		expect(registry.get("workspace", "session-a")).toBeUndefined();
+		expect(registry.get("workspace", "session-b")).toBeUndefined();
+		const replacement = registry.getOrCreate("workspace", "session-a");
+		expect(replacement).not.toBe(coordinator);
+		expect(replacement.sessionId).toBe("session-a");
 	});
 });

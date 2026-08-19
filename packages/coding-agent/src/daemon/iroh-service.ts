@@ -2255,12 +2255,17 @@ class IrohDaemonService {
 		handshake: Extract<IrohRemoteHostHandshakeResult, { ok: true }>,
 		connectionId: string,
 		streamId: string,
-		targetSessionId: string,
+		target: { requestedSessionId: string; sessionId: string },
 		tuiConnectionId: string,
 		admission: IrohDaemonAdmissionLease,
 	): Promise<void> {
 		const authorization = handshake.authorization;
 		const workspaceName = authorization.workspace.name;
+		const targetSessionId = target.sessionId;
+		const isExplicitSessionAlias =
+			handshake.hello.mode === "conversation" &&
+			handshake.hello.conversation.target === "session" &&
+			target.requestedSessionId !== targetSessionId;
 		if (!admission.isCurrent()) {
 			return;
 		}
@@ -2301,9 +2306,9 @@ class IrohDaemonService {
 		}
 
 		// Resolve the concrete session target for the preamble (§3.7).
-		const target: IrohRemoteSessionTarget =
+		const sessionTarget: IrohRemoteSessionTarget =
 			handshake.hello.mode === "conversation" && handshake.hello.conversation.target === "session"
-				? { kind: "session", sessionId: handshake.hello.conversation.sessionId }
+				? { kind: "session", sessionId: targetSessionId }
 				: { kind: "last", resumeSessionId: targetSessionId };
 		// A worktree-bound session must resolve against the worktree cwd (the
 		// parent-keyed session dir plus a non-matching cwd makes SessionManager.list
@@ -2345,7 +2350,7 @@ class IrohDaemonService {
 		let resolvedTarget: Awaited<ReturnType<typeof resolveIrohRemoteSessionTarget>>;
 		try {
 			resolvedTarget = await resolveIrohRemoteSessionTarget(
-				target,
+				sessionTarget,
 				{ name: workspaceName, path: authorization.workspace.path },
 				createSessionManagerTargetStore(
 					boundWorktree?.path ?? authorization.workspace.path,
@@ -2481,10 +2486,12 @@ class IrohDaemonService {
 					...(resolvedTarget.sessionFilePath === undefined
 						? {}
 						: { sessionFilePath: resolvedTarget.sessionFilePath }),
-					selection: resolvedTarget.selection,
-					...(resolvedTarget.requestedSessionId === undefined
-						? {}
-						: { requestedSessionId: resolvedTarget.requestedSessionId }),
+					selection: isExplicitSessionAlias ? "session_rekeyed" : resolvedTarget.selection,
+					...(isExplicitSessionAlias
+						? { requestedSessionId: target.requestedSessionId }
+						: resolvedTarget.requestedSessionId === undefined
+							? {}
+							: { requestedSessionId: resolvedTarget.requestedSessionId }),
 					workspaceName: resolvedTarget.workspaceName,
 					workspacePath: resolvedTarget.workspacePath,
 					...(boundWorktree === undefined ? {} : { worktreeId: boundWorktree.id }),
@@ -2580,6 +2587,7 @@ class IrohDaemonService {
 				relayId: relay.relayId,
 				workspaceName,
 				sessionId: targetSessionId,
+				...(isExplicitSessionAlias ? { requestedSessionId: target.requestedSessionId } : {}),
 				connectionId,
 				streamId,
 			},
@@ -2638,7 +2646,12 @@ class IrohDaemonService {
 		admission: IrohDaemonAdmissionLease,
 	): Promise<void> {
 		const authorization = handshake.authorization;
-		const targetSessionId = getResolvedTargetSessionId(handshake.hello, authorization);
+		const requestedTargetSessionId = getResolvedTargetSessionId(handshake.hello, authorization);
+		const targetCoordinator =
+			requestedTargetSessionId === undefined
+				? undefined
+				: this.conversationCoordinators.get(authorization.workspace.name, requestedTargetSessionId);
+		const targetSessionId = targetCoordinator?.sessionId ?? requestedTargetSessionId;
 		if (!admission.isCurrent()) {
 			return;
 		}
@@ -2657,7 +2670,7 @@ class IrohDaemonService {
 				handshake,
 				connectionId,
 				streamId,
-				targetSessionId,
+				{ requestedSessionId: requestedTargetSessionId ?? targetSessionId, sessionId: targetSessionId },
 				daemonAttach.tuiConnectionId,
 				admission,
 			);
@@ -2698,7 +2711,10 @@ class IrohDaemonService {
 				error: error instanceof Error ? error.message : String(error),
 				details: {
 					runtime: "integrated-volt",
-					...(targetSessionId === undefined ? {} : { targetSessionId }),
+					...(requestedTargetSessionId === undefined ? {} : { targetSessionId: requestedTargetSessionId }),
+					...(requestedTargetSessionId === undefined || requestedTargetSessionId === targetSessionId
+						? {}
+						: { canonicalSessionId: targetSessionId }),
 					...(handshake.hello.mode === "conversation" ? { target: handshake.hello.conversation.target } : {}),
 				},
 			});
@@ -2823,7 +2839,10 @@ class IrohDaemonService {
 						handshake,
 						connectionId,
 						streamId,
-						committedSessionId,
+						{
+							requestedSessionId: requestedTargetSessionId ?? committedSessionId,
+							sessionId: committedSessionId,
+						},
 						brokerCommit.tuiConnectionId,
 						admission,
 					);
