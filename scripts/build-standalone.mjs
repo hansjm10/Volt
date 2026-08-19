@@ -261,6 +261,7 @@ function copyWorkspaceFsAssets(stageDirectory, target) {
 	const destinationAddon = join(destinationPrebuilds, ...artifact.path.split("/"));
 	mkdirSync(dirname(destinationAddon), { recursive: true, mode: 0o755 });
 	copyFileSync(sourceAddon, destinationAddon);
+	chmodSync(destinationAddon, 0o644);
 	writeFileSync(
 		join(destinationPrebuilds, "manifest.json"),
 		`${JSON.stringify({ ...manifest, artifacts: [artifact] }, null, 2)}\n`,

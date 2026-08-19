@@ -3,6 +3,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+	chmodSync,
 	copyFileSync,
 	existsSync,
 	mkdirSync,
@@ -124,6 +125,7 @@ function build(target) {
 	const destination = artifactPath(target);
 	mkdirSync(dirname(destination), { recursive: true });
 	copyFileSync(built, destination);
+	chmodSync(destination, 0o644);
 	console.log(`Built ${relative(root, destination)}`);
 }
 
