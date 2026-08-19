@@ -225,6 +225,15 @@ describe("RPC contract emission conformance", () => {
 		const voidSuccess = createRpcSuccessResponse(undefined, "abort");
 		expect(Compile(RPC_RESPONSE_SCHEMAS.abort).Errors(voidSuccess)).toEqual([]);
 
+		expect(
+			Compile(RPC_COMMAND_SCHEMAS.acknowledge_review).Errors({ type: "acknowledge_review", runId: "review:1" }),
+		).toEqual([]);
+		const acknowledgment = createRpcSuccessResponse("ack-1", "acknowledge_review", {
+			runId: "review:1",
+			acknowledgedAt: 123,
+		});
+		expect(Compile(RPC_RESPONSE_SCHEMAS.acknowledge_review).Errors(acknowledgment)).toEqual([]);
+
 		const failure = createRpcErrorResponse("id-2", "prompt", 'Invalid RPC command payload: "message" is required');
 		expect(Compile(RpcErrorResponseSchema).Errors(failure)).toEqual([]);
 

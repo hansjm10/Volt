@@ -905,6 +905,7 @@ export {
 	type RpcRegisterPushTargetArgs,
 	type RpcRegisterPushTargetResponse,
 	type RpcResponse,
+	type RpcReviewAcknowledgmentResponse,
 	type RpcReviewWorkflowDescriptor,
 	type RpcReviewWorkflowLifecycleStatus,
 	type RpcReviewWorkflowListResponse,

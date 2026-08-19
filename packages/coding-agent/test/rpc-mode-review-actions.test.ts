@@ -3,7 +3,12 @@ import type { AgentSession } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { restoreStdout } from "../src/core/output-guard.ts";
 import type { ParsedReview } from "../src/core/review-report.ts";
-import { appendReviewRun, type ReviewRunRecord } from "../src/core/review-state.ts";
+import {
+	appendReviewRun,
+	getReviewRun,
+	REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE,
+	type ReviewRunRecord,
+} from "../src/core/review-state.ts";
 import { ReviewWorkflowManager } from "../src/core/review-workflows.ts";
 import type { RpcCloseHandler, RpcLineHandler, RpcTransport } from "../src/core/rpc/transport.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -505,6 +510,15 @@ describe("RPC durable review actions", () => {
 				?.getBranch()
 				.some((entry) => entry.type === "custom" && entry.customType === "volt.review.run"),
 		).toBe(true);
+		expect(getReviewRun(manager, "review:test")?.acknowledgedAt).toBeUndefined();
+		expect(getReviewRun(replacementManagers[0]!, "review:test")?.acknowledgedAt).toEqual(expect.any(Number));
+		line(JSON.stringify({ id: "get-opened", type: "get_review_result", runId: "review:test" }));
+		await vi.waitFor(() => expect(response(collecting.writes, "get-opened")).toBeDefined());
+		expect(response(collecting.writes, "get-opened")?.data).toMatchObject({
+			runId: "review:test",
+			acknowledgedAt: expect.any(Number),
+			findings: expect.any(Array),
+		});
 
 		seedMessages.length = 0;
 		line(
@@ -523,6 +537,94 @@ describe("RPC durable review actions", () => {
 		);
 		expect(JSON.stringify(seedMessages)).toContain("finding-1");
 		expect(JSON.stringify(seedMessages)).toContain("finding-2");
+		await closeMode(collecting, modePromise);
+	});
+
+	test("acknowledges full opens in source and target while retaining durable results", async () => {
+		const manager = SessionManager.inMemory("/workspace");
+		appendReviewRun(manager, durableRecord());
+		const replacementManagers: SessionManager[] = [];
+		const runtimeHost = makeRuntimeHost({ manager, replacementManagers });
+		const collecting = createCollectingTransport();
+		const modePromise = await startMode(runtimeHost, collecting.transport);
+		const line = collecting.getLineHandler();
+
+		line(JSON.stringify({ id: "open-all", type: "open_review_session", runId: "review:test" }));
+		await vi.waitFor(() =>
+			expect(response(collecting.writes, "open-all")).toMatchObject({
+				success: true,
+				data: { cancelled: false },
+			}),
+		);
+		const source = getReviewRun(manager, "review:test");
+		const target = getReviewRun(replacementManagers[0]!, "review:test");
+		expect(source?.acknowledgedAt).toEqual(expect.any(Number));
+		expect(target?.acknowledgedAt).toBe(source?.acknowledgedAt);
+		expect(source?.result?.findings).toHaveLength(1);
+		expect(target?.result?.findings).toHaveLength(1);
+
+		line(JSON.stringify({ id: "list-opened", type: "list_review_workflows" }));
+		line(JSON.stringify({ id: "get-opened", type: "get_review_result", runId: "review:test" }));
+		await vi.waitFor(() => {
+			expect(response(collecting.writes, "list-opened")).toBeDefined();
+			expect(response(collecting.writes, "get-opened")).toBeDefined();
+		});
+		expect(response(collecting.writes, "list-opened")?.data).toMatchObject({
+			runs: [{ runId: "review:test", acknowledgedAt: source?.acknowledgedAt }],
+		});
+		expect(response(collecting.writes, "get-opened")?.data).toMatchObject({
+			runId: "review:test",
+			acknowledgedAt: source?.acknowledgedAt,
+			findings: expect.any(Array),
+		});
+		await closeMode(collecting, modePromise);
+	});
+
+	test("explicit acknowledgment is idempotent and unsuccessful opens preserve the source", async () => {
+		const manager = SessionManager.inMemory("/workspace");
+		appendReviewRun(manager, durableRecord());
+		const runtimeHost = makeRuntimeHost({ manager });
+		const collecting = createCollectingTransport();
+		const modePromise = await startMode(runtimeHost, collecting.transport);
+		const line = collecting.getLineHandler();
+
+		line(JSON.stringify({ id: "ack-1", type: "acknowledge_review", runId: "review:test" }));
+		await vi.waitFor(() => expect(response(collecting.writes, "ack-1")).toBeDefined());
+		const acknowledgedAt = (response(collecting.writes, "ack-1")?.data as { acknowledgedAt: number }).acknowledgedAt;
+		line(JSON.stringify({ id: "ack-2", type: "acknowledge_review", runId: "review:test" }));
+		await vi.waitFor(() => expect(response(collecting.writes, "ack-2")).toBeDefined());
+		expect(response(collecting.writes, "ack-2")?.data).toEqual({ runId: "review:test", acknowledgedAt });
+		expect(
+			manager
+				.getBranch()
+				.filter((entry) => entry.type === "custom" && entry.customType === REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE),
+		).toHaveLength(1);
+
+		const unacknowledged = durableRecord("review:unacknowledged");
+		appendReviewRun(manager, unacknowledged);
+		vi.mocked(runtimeHost.newSession).mockResolvedValueOnce({ cancelled: true, seeded: false });
+		line(JSON.stringify({ id: "open-cancelled", type: "open_review_session", runId: unacknowledged.runId }));
+		await vi.waitFor(() => expect(response(collecting.writes, "open-cancelled")).toBeDefined());
+		expect(response(collecting.writes, "open-cancelled")).toMatchObject({
+			success: true,
+			data: { cancelled: true },
+		});
+		expect(getReviewRun(manager, unacknowledged.runId)?.acknowledgedAt).toBeUndefined();
+
+		vi.mocked(runtimeHost.newSession).mockResolvedValueOnce({ cancelled: false, seeded: false });
+		line(JSON.stringify({ id: "open-skipped", type: "open_review_session", runId: unacknowledged.runId }));
+		await vi.waitFor(() => expect(response(collecting.writes, "open-skipped")).toBeDefined());
+		expect(response(collecting.writes, "open-skipped")).toMatchObject({
+			success: false,
+			error: expect.stringContaining("remains available"),
+		});
+		expect(getReviewRun(manager, unacknowledged.runId)?.acknowledgedAt).toBeUndefined();
+
+		vi.mocked(runtimeHost.newSession).mockRejectedValueOnce(new Error("seed failed"));
+		line(JSON.stringify({ id: "open-failed", type: "open_review_session", runId: unacknowledged.runId }));
+		await vi.waitFor(() => expect(response(collecting.writes, "open-failed")).toBeDefined());
+		expect(response(collecting.writes, "open-failed")).toMatchObject({ success: false, error: "seed failed" });
+		expect(getReviewRun(manager, unacknowledged.runId)?.acknowledgedAt).toBeUndefined();
 		await closeMode(collecting, modePromise);
 	});
 

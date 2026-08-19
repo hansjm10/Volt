@@ -171,6 +171,9 @@ export const RPC_COMMAND_SCHEMAS = {
 		runId: RpcConversationIdentifierSchema,
 		findingIds: Type.Optional(Type.Array(RpcConversationIdentifierSchema, { maxItems: 50 })),
 	}),
+	acknowledge_review: commandSchema("acknowledge_review", {
+		runId: RpcConversationIdentifierSchema,
+	}),
 	record_review_finding_outcome: commandSchema("record_review_finding_outcome", {
 		runId: RpcConversationIdentifierSchema,
 		findingId: RpcConversationIdentifierSchema,

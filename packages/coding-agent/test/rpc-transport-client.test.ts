@@ -212,6 +212,33 @@ describe("RpcTransportClient", () => {
 		}
 	});
 
+	test("sends typed durable review acknowledgment commands", async () => {
+		const pair = createLoopbackRpcTransportPair();
+		const client = new RpcTransportClient({ transport: pair.client });
+		let command: Record<string, unknown> | undefined;
+		pair.server.onLine((line) => {
+			command = JSON.parse(line) as Record<string, unknown>;
+			pair.server.write({
+				id: command.id,
+				type: "response",
+				command: command.type,
+				success: true,
+				data: { runId: "review:test", acknowledgedAt: 123 },
+			});
+		});
+
+		await client.start();
+		try {
+			await expect(client.acknowledgeReview("review:test")).resolves.toEqual({
+				runId: "review:test",
+				acknowledgedAt: 123,
+			});
+			expect(command).toMatchObject({ type: "acknowledge_review", runId: "review:test" });
+		} finally {
+			await client.stop();
+		}
+	});
+
 	test("rejects unsuccessful responses for void commands", async () => {
 		const pair = createLoopbackRpcTransportPair();
 		const client = new RpcTransportClient({ transport: pair.client });

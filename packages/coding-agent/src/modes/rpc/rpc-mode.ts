@@ -221,6 +221,7 @@ const RPC_CONVERSATION_AUTHORITY_MUTATION_TYPES: ReadonlySet<RpcCommand["type"]>
 	"set_thinking_level",
 	"invoke_ui_action",
 	"open_review_session",
+	"acknowledge_review",
 ]);
 
 class StaleConversationAuthorityError extends Error {

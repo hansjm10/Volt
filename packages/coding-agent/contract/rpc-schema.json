@@ -651,6 +651,9 @@
 					"$ref": "#/$defs/RpcCommand.open_review_session"
 				},
 				{
+					"$ref": "#/$defs/RpcCommand.acknowledge_review"
+				},
+				{
 					"$ref": "#/$defs/RpcCommand.record_review_finding_outcome"
 				},
 				{
@@ -927,6 +930,9 @@
 					"$ref": "#/$defs/RpcCommand.open_review_session"
 				},
 				{
+					"$ref": "#/$defs/RpcCommand.acknowledge_review"
+				},
+				{
 					"$ref": "#/$defs/RpcCommand.record_review_finding_outcome"
 				},
 				{
@@ -1182,6 +1188,29 @@
 				},
 				"conversationAuthority": {
 					"$ref": "#/$defs/RpcConversationAuthority"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcCommand.acknowledge_review": {
+			"type": "object",
+			"required": [
+				"type",
+				"runId"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "acknowledge_review"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"runId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
 				}
 			},
 			"additionalProperties": false
@@ -6351,6 +6380,9 @@
 					"$ref": "#/$defs/RpcResponse.open_review_session"
 				},
 				{
+					"$ref": "#/$defs/RpcResponse.acknowledge_review"
+				},
+				{
 					"$ref": "#/$defs/RpcResponse.record_review_finding_outcome"
 				},
 				{
@@ -6630,6 +6662,36 @@
 				"success": {
 					"type": "boolean",
 					"const": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.acknowledge_review": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "acknowledge_review"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"$ref": "#/$defs/RpcReviewAcknowledgmentResponse"
 				}
 			},
 			"additionalProperties": false
@@ -9509,6 +9571,22 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcReviewAcknowledgmentResponse": {
+			"type": "object",
+			"required": [
+				"runId",
+				"acknowledgedAt"
+			],
+			"properties": {
+				"runId": {
+					"type": "string"
+				},
+				"acknowledgedAt": {
+					"type": "number"
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcReviewCompletionStatus": {
 			"type": "string",
 			"enum": [
@@ -9861,6 +9939,9 @@
 				"endedAt": {
 					"type": "number"
 				},
+				"acknowledgedAt": {
+					"type": "number"
+				},
 				"target": {
 					"type": "object",
 					"required": [
@@ -10144,6 +10225,9 @@
 					"type": "number"
 				},
 				"endedAt": {
+					"type": "number"
+				},
+				"acknowledgedAt": {
 					"type": "number"
 				},
 				"target": {
