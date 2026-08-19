@@ -14,6 +14,7 @@ import {
 	type OAuthProviderInterface,
 	type OpenAICompletionsCompat,
 	type OpenAIResponsesCompat,
+	type PromptCacheMetadata,
 	registerApiProvider,
 	resetApiProviders,
 	type SimpleStreamOptions,
@@ -97,6 +98,24 @@ const ThinkingLevelMapSchema = Type.Object({
 	max: Type.Optional(ThinkingLevelMapValueSchema),
 });
 
+const PromptCacheRetentionTierSchema = Type.Object({
+	ttlSeconds: Type.Optional(Type.Integer({ minimum: 1 })),
+});
+
+const PromptCacheMetadataSchema = Type.Object({
+	modes: Type.Array(Type.Union([Type.Literal("implicit"), Type.Literal("explicit")]), {
+		minItems: 1,
+		uniqueItems: true,
+	}),
+	retention: Type.Object({
+		short: PromptCacheRetentionTierSchema,
+		long: Type.Optional(PromptCacheRetentionTierSchema),
+	}),
+	refreshesOnHit: Type.Optional(Type.Boolean()),
+});
+
+const PromptCacheOverrideSchema = Type.Union([PromptCacheMetadataSchema, Type.Null()]);
+
 const OpenAICompletionsCompatSchema = Type.Object({
 	supportsStore: Type.Optional(Type.Boolean()),
 	supportsDeveloperRole: Type.Optional(Type.Boolean()),
@@ -122,18 +141,15 @@ const OpenAICompletionsCompatSchema = Type.Object({
 	openRouterRouting: Type.Optional(OpenRouterRoutingSchema),
 	vercelGatewayRouting: Type.Optional(VercelGatewayRoutingSchema),
 	supportsStrictMode: Type.Optional(Type.Boolean()),
-	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
 });
 
 const OpenAIResponsesCompatSchema = Type.Object({
 	supportsDeveloperRole: Type.Optional(Type.Boolean()),
 	sendSessionIdHeader: Type.Optional(Type.Boolean()),
-	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
 });
 
 const AnthropicMessagesCompatSchema = Type.Object({
 	supportsEagerToolInputStreaming: Type.Optional(Type.Boolean()),
-	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
 	sendSessionAffinityHeaders: Type.Optional(Type.Boolean()),
 	supportsCacheControlOnTools: Type.Optional(Type.Boolean()),
 	forceAdaptiveThinking: Type.Optional(Type.Boolean()),
@@ -155,6 +171,7 @@ const ModelDefinitionSchema = Type.Object({
 	reasoning: Type.Optional(Type.Boolean()),
 	thinkingLevelMap: Type.Optional(ThinkingLevelMapSchema),
 	input: Type.Optional(Type.Array(Type.Union([Type.Literal("text"), Type.Literal("image")]))),
+	promptCache: Type.Optional(PromptCacheMetadataSchema),
 	cost: Type.Optional(
 		Type.Object({
 			input: Type.Number(),
@@ -175,6 +192,7 @@ const ModelOverrideSchema = Type.Object({
 	reasoning: Type.Optional(Type.Boolean()),
 	thinkingLevelMap: Type.Optional(ThinkingLevelMapSchema),
 	input: Type.Optional(Type.Array(Type.Union([Type.Literal("text"), Type.Literal("image")]))),
+	promptCache: Type.Optional(PromptCacheOverrideSchema),
 	cost: Type.Optional(
 		Type.Object({
 			input: Type.Optional(Type.Number()),
@@ -198,6 +216,7 @@ const ProviderConfigSchema = Type.Object({
 	api: Type.Optional(Type.String({ minLength: 1 })),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
+	promptCache: Type.Optional(PromptCacheOverrideSchema),
 	authHeader: Type.Optional(Type.Boolean()),
 	models: Type.Optional(Type.Array(ModelDefinitionSchema)),
 	modelOverrides: Type.Optional(Type.Record(Type.String(), ModelOverrideSchema)),
@@ -228,6 +247,7 @@ function formatValidationPath(error: TLocalizedValidationError): string {
 interface ProviderOverride {
 	baseUrl?: string;
 	compat?: Model<Api>["compat"];
+	promptCache?: PromptCacheMetadata | null;
 }
 
 interface ProviderRequestConfig {
@@ -307,6 +327,7 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 		result.thinkingLevelMap = { ...model.thinkingLevelMap, ...override.thinkingLevelMap };
 	}
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
+	if (override.promptCache !== undefined) result.promptCache = override.promptCache ?? undefined;
 	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
 
@@ -433,12 +454,16 @@ export class ModelRegistry {
 			return models.map((m) => {
 				let model = m;
 
-				// Apply provider-level baseUrl/headers/compat override
+				// Apply provider-level baseUrl/headers/compat/cache override
 				if (providerOverride) {
 					model = {
 						...model,
 						baseUrl: providerOverride.baseUrl ?? model.baseUrl,
 						compat: mergeCompat(model.compat, providerOverride.compat),
+						promptCache:
+							providerOverride.promptCache === undefined
+								? model.promptCache
+								: (providerOverride.promptCache ?? undefined),
 					};
 				}
 
@@ -494,10 +519,11 @@ export class ModelRegistry {
 			const modelOverrides = new Map<string, Map<string, ModelOverride>>();
 
 			for (const [providerName, providerConfig] of Object.entries(config.providers)) {
-				if (providerConfig.baseUrl || providerConfig.compat) {
+				if (providerConfig.baseUrl || providerConfig.compat || providerConfig.promptCache !== undefined) {
 					overrides.set(providerName, {
 						baseUrl: providerConfig.baseUrl,
 						compat: providerConfig.compat,
+						promptCache: providerConfig.promptCache,
 					});
 				}
 
@@ -534,9 +560,15 @@ export class ModelRegistry {
 
 			if (models.length === 0) {
 				// Override-only config: needs baseUrl, headers, compat, modelOverrides, or some combination.
-				if (!providerConfig.baseUrl && !providerConfig.headers && !providerConfig.compat && !hasModelOverrides) {
+				if (
+					!providerConfig.baseUrl &&
+					!providerConfig.headers &&
+					!providerConfig.compat &&
+					providerConfig.promptCache === undefined &&
+					!hasModelOverrides
+				) {
 					throw new Error(
-						`Provider ${providerName}: must specify "baseUrl", "headers", "compat", "modelOverrides", or "models".`,
+						`Provider ${providerName}: must specify "baseUrl", "headers", "compat", "promptCache", "modelOverrides", or "models".`,
 					);
 				}
 			} else if (!isBuiltIn) {
@@ -613,6 +645,7 @@ export class ModelRegistry {
 					reasoning: modelDef.reasoning ?? false,
 					thinkingLevelMap: modelDef.thinkingLevelMap,
 					input: (modelDef.input ?? ["text"]) as ("text" | "image")[],
+					promptCache: modelDef.promptCache ?? providerConfig.promptCache ?? undefined,
 					cost: modelDef.cost ?? defaultCost,
 					contextWindow: modelDef.contextWindow ?? 128000,
 					maxTokens: modelDef.maxTokens ?? 16384,
@@ -936,6 +969,7 @@ export class ModelRegistry {
 					reasoning: modelDef.reasoning,
 					thinkingLevelMap: modelDef.thinkingLevelMap,
 					input: modelDef.input as ("text" | "image")[],
+					promptCache: modelDef.promptCache ?? config.promptCache ?? undefined,
 					cost: modelDef.cost,
 					contextWindow: modelDef.contextWindow,
 					maxTokens: modelDef.maxTokens,
@@ -951,13 +985,14 @@ export class ModelRegistry {
 					this.models = config.oauth.modifyModels(this.models, cred);
 				}
 			}
-		} else if (config.baseUrl || config.headers) {
-			// Override-only: update baseUrl for existing models. Request headers are resolved per request.
+		} else if (config.baseUrl || config.headers || config.promptCache !== undefined) {
+			// Override-only: update provider defaults. Request headers are resolved per request.
 			this.models = this.models.map((m) => {
 				if (m.provider !== providerName) return m;
 				return {
 					...m,
 					baseUrl: config.baseUrl ?? m.baseUrl,
+					promptCache: config.promptCache === undefined ? m.promptCache : (config.promptCache ?? undefined),
 				};
 			});
 		}
@@ -975,6 +1010,7 @@ export interface ProviderConfigInput {
 	streamSimple?: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream;
 	headers?: Record<string, string>;
 	authHeader?: boolean;
+	promptCache?: PromptCacheMetadata | null;
 	/** OAuth provider for /login support */
 	oauth?: Omit<OAuthProviderInterface, "id">;
 	models?: Array<{
@@ -985,6 +1021,7 @@ export interface ProviderConfigInput {
 		reasoning: boolean;
 		thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
 		input: ("text" | "image")[];
+		promptCache?: PromptCacheMetadata;
 		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 		contextWindow: number;
 		maxTokens: number;

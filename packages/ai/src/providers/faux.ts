@@ -15,6 +15,7 @@ import type {
 	ToolResultMessage,
 	Usage,
 } from "../types.ts";
+import { resolvePromptCacheRetention } from "./prompt-cache.ts";
 
 const DEFAULT_API = "faux";
 const DEFAULT_PROVIDER = "faux";
@@ -217,6 +218,7 @@ function commonPrefixLength(a: string, b: string): number {
 function withUsageEstimate(
 	message: AssistantMessage,
 	context: Context,
+	model: Model<string>,
 	options: StreamOptions | undefined,
 	promptCache: Map<string, string>,
 ): AssistantMessage {
@@ -227,8 +229,9 @@ function withUsageEstimate(
 	let cacheRead = 0;
 	let cacheWrite = 0;
 	const sessionId = options?.sessionId;
+	const cacheRetention = resolvePromptCacheRetention(model, options?.cacheRetention, options?.env);
 
-	if (sessionId && options?.cacheRetention !== "none") {
+	if (sessionId && cacheRetention !== "none") {
 		const previousPrompt = promptCache.get(sessionId);
 		if (previousPrompt) {
 			const cachedChars = commonPrefixLength(previousPrompt, promptText);
@@ -467,7 +470,7 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 					maxTokens: 16384,
 				},
 			];
-	const models = modelDefinitions.map((definition) => ({
+	const mappedModels: Model<string>[] = modelDefinitions.map((definition) => ({
 		id: definition.id,
 		name: definition.name ?? definition.id,
 		api,
@@ -475,10 +478,14 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 		baseUrl: DEFAULT_BASE_URL,
 		reasoning: definition.reasoning ?? false,
 		input: definition.input ?? ["text", "image"],
+		promptCache: { modes: ["implicit"], retention: { short: {} } },
 		cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: definition.contextWindow ?? 128000,
 		maxTokens: definition.maxTokens ?? 16384,
-	})) as [Model<string>, ...Model<string>[]];
+	}));
+	const firstModel = mappedModels[0];
+	if (!firstModel) throw new Error("Faux provider requires at least one model");
+	const models: [Model<string>, ...Model<string>[]] = [firstModel, ...mappedModels.slice(1)];
 
 	const createQueueStream =
 		(takeStep: () => FauxResponseStep | undefined, recordCall: () => void): StreamFunction<string, StreamOptions> =>
@@ -497,7 +504,7 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 							provider,
 							requestModel.id,
 						);
-						message = withUsageEstimate(message, context, streamOptions, promptCache);
+						message = withUsageEstimate(message, context, requestModel, streamOptions, promptCache);
 						await streamWithDeltas(
 							normalizer,
 							message,
@@ -512,7 +519,7 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 					const resolved =
 						typeof step === "function" ? await step(context, streamOptions, state, requestModel) : step;
 					let message = cloneMessage(resolved, api, provider, requestModel.id);
-					message = withUsageEstimate(message, context, streamOptions, promptCache);
+					message = withUsageEstimate(message, context, requestModel, streamOptions, promptCache);
 					await streamWithDeltas(
 						normalizer,
 						message,

@@ -952,6 +952,25 @@ const ollamaReasoningModel: Model<'openai-completions'> = {
 };
 ```
 
+### Prompt Cache Metadata
+
+Prompt-cache support belongs to the exact provider/API/model tuple, not the underlying model name. Built-in models expose verified capabilities through `promptCache`; custom models can declare the same metadata:
+
+```typescript
+promptCache: {
+  modes: ['explicit'],
+  retention: {
+    short: { ttlSeconds: 300 },
+    long: { ttlSeconds: 3600 }
+  },
+  refreshesOnHit: true
+}
+```
+
+`modes` contains the cache modes Volt can control for that model. `retention.short` is required when metadata is present; `retention.long` enables the `long` request preference. Omit `ttlSeconds` when caching is supported but the provider does not publish a stable TTL. The duration describes the provider's retention policy, not a guaranteed cache hit.
+
+When `cacheRetention` is `long` but the model has no long tier, Volt safely uses short retention. When `promptCache` is absent, Volt omits controllable cache keys, affinity headers, cache markers, and retention fields. A provider may still perform unavoidable automatic caching. On OpenAI and Azure GPT-5.6+, `cacheRetention: 'none'` selects explicit mode with no breakpoints to suppress implicit cache writes.
+
 ### OpenAI Compatibility Settings
 
 The `openai-completions` API is implemented by many providers with minor differences. By default, the library auto-detects compatibility settings based on `baseUrl` for a small set of known OpenAI-compatible providers (Cerebras, xAI, Chutes, DeepSeek, NVIDIA NIM, Together AI, zAi, OpenCode, Cloudflare Workers AI, etc.). For custom proxies or unknown endpoints, you can override these settings via the `compat` field. For `openai-responses` models, the compat field supports Responses-specific flags.
@@ -978,7 +997,6 @@ interface OpenAICompletionsCompat {
 interface OpenAIResponsesCompat {
   supportsDeveloperRole?: boolean;   // Whether provider supports `developer` role vs `system` (default: true)
   sendSessionIdHeader?: boolean;     // Whether to send `session_id` from `sessionId` when caching is enabled (default: true)
-  supportsLongCacheRetention?: boolean; // Whether provider supports `prompt_cache_retention: "24h"` (default: true)
 }
 ```
 

@@ -56,6 +56,7 @@ import {
 } from "../../core/review.ts";
 import { publishReviewRun } from "../../core/review-publish.ts";
 import {
+	acknowledgeReviewRun,
 	appendReviewFindingTransition,
 	appendReviewPublication,
 	appendReviewRun,
@@ -65,6 +66,7 @@ import {
 } from "../../core/review-state.ts";
 import { type ProjectionDiagnostic, StreamProjector } from "../../core/rpc/stream-projection.ts";
 import type { RpcTransport } from "../../core/rpc/transport.ts";
+import { SessionManager } from "../../core/session-manager.ts";
 import type { SubagentDefinition, SubagentHandle } from "../../core/subagents/index.ts";
 import {
 	getAvailableThemesWithPaths,
@@ -221,6 +223,7 @@ const RPC_CONVERSATION_AUTHORITY_MUTATION_TYPES: ReadonlySet<RpcCommand["type"]>
 	"set_thinking_level",
 	"invoke_ui_action",
 	"open_review_session",
+	"acknowledge_review",
 ]);
 
 class StaleConversationAuthorityError extends Error {
@@ -1268,13 +1271,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				throw new Error(`Unknown durable review run: ${runId ?? "missing"}`);
 			if (action === REVIEW_FIX_ACTION_ID) {
 				if (!record?.result) throw new Error(`Review run has no findings result: ${runId}`);
-				const requestedIds =
+				const requestedFindingIds =
 					typeof args.findingIds === "string" && args.findingIds.trim().length > 0
 						? args.findingIds
 								.split(",")
 								.map((value) => value.trim())
 								.filter(Boolean)
-						: record.result.findings.map((finding) => finding.id);
+						: undefined;
+				const requestedIds = requestedFindingIds ?? record.result.findings.map((finding) => finding.id);
 				const selectedIds = new Set(requestedIds);
 				const unknown = requestedIds.filter(
 					(findingId) => !record.result?.findings.some((finding) => finding.id === findingId),
@@ -1284,12 +1288,38 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 					...record.result,
 					findings: record.result.findings.filter((finding) => selectedIds.has(finding.id)),
 				};
+				const sourceSessionManager = commandSession.sessionManager;
+				const seedMessage = createReviewSeedMessage(record.target, { parsed: selectedResult });
+				let targetSessionManager: SessionManager | undefined;
+				let acknowledgedAt: number | undefined;
 				const opened = await runtimeHost.newSession({
 					assertConversationGenerationCurrent,
-					setup: async (sessionManager) => appendReviewRun(sessionManager, record),
-					withSession: async (sessionContext) =>
-						sessionContext.sendMessage(createReviewSeedMessage(record.target, { parsed: selectedResult })),
+					setup: async (sessionManager) => {
+						targetSessionManager = sessionManager;
+						appendReviewRun(sessionManager, record);
+					},
+					withSession: async (sessionContext) => {
+						await sessionContext.sendMessage(seedMessage);
+						if (!targetSessionManager) throw new Error("Review session was not initialized");
+						acknowledgedAt = acknowledgeReviewRun(
+							targetSessionManager,
+							record.runId,
+							record.acknowledgedAt ?? Date.now(),
+						).acknowledgedAt;
+					},
 				});
+				if (!opened.cancelled && !opened.seeded)
+					throw new Error("The review session opened without the selected findings.");
+				if (opened.seeded && requestedFindingIds === undefined) {
+					if (acknowledgedAt === undefined) throw new Error("Review session was seeded without acknowledgment");
+					const sourceSessionFile = sourceSessionManager.getSessionFile();
+					const acknowledgmentManager = sourceSessionFile
+						? SessionManager.open(sourceSessionFile, sourceSessionManager.getSessionDir())
+						: sourceSessionManager;
+					acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
+					await acknowledgmentManager.flush();
+					if (sourceSessionFile) sourceSessionManager.setSessionFile(sourceSessionFile);
+				}
 				return {
 					action,
 					status: opened.cancelled ? "cancelled" : "completed",

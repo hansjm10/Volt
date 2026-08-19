@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "packages": {
+    "napi@3.12.1": {
+      "source": "https://github.com/napi-rs/napi-rs/blob/napi-v3.12.1/LICENSE",
+      "files": [
+        {
+          "path": "compliance/rust-license-overrides/napi-rs-napi-v3.12.1/LICENSE",
+          "sha256": "3f1ce66533302df3a32edbfdfc0b78f0dd34659e4c1f5817162e5ea3c2297215"
+        }
+      ]
+    },
+    "napi-build@2.4.1": {
+      "source": "https://github.com/napi-rs/napi-rs/blob/napi-v3.12.1/LICENSE",
+      "files": [
+        {
+          "path": "compliance/rust-license-overrides/napi-rs-napi-v3.12.1/LICENSE",
+          "sha256": "3f1ce66533302df3a32edbfdfc0b78f0dd34659e4c1f5817162e5ea3c2297215"
+        }
+      ]
+    },
+    "napi-derive@3.6.3": {
+      "source": "https://github.com/napi-rs/napi-rs/blob/napi-v3.12.1/LICENSE",
+      "files": [
+        {
+          "path": "compliance/rust-license-overrides/napi-rs-napi-v3.12.1/LICENSE",
+          "sha256": "3f1ce66533302df3a32edbfdfc0b78f0dd34659e4c1f5817162e5ea3c2297215"
+        }
+      ]
+    },
+    "napi-derive-backend@6.1.2": {
+      "source": "https://github.com/napi-rs/napi-rs/blob/napi-v3.12.1/LICENSE",
+      "files": [
+        {
+          "path": "compliance/rust-license-overrides/napi-rs-napi-v3.12.1/LICENSE",
+          "sha256": "3f1ce66533302df3a32edbfdfc0b78f0dd34659e4c1f5817162e5ea3c2297215"
+        }
+      ]
+    },
+    "napi-sys@3.3.0": {
+      "source": "https://github.com/napi-rs/napi-rs/blob/napi-v3.12.1/LICENSE",
+      "files": [
+        {
+          "path": "compliance/rust-license-overrides/napi-rs-napi-v3.12.1/LICENSE",
+          "sha256": "3f1ce66533302df3a32edbfdfc0b78f0dd34659e4c1f5817162e5ea3c2297215"
+        }
+      ]
+    },
+    "r-efi@6.0.0": {
+      "source": "https://github.com/r-efi/r-efi/blob/v6.0.0/AUTHORS",
+      "selectedLicense": "MIT",
+      "files": [
+        {
+          "path": "compliance/rust-license-overrides/r-efi-v6.0.0/AUTHORS",
+          "sha256": "d027e91dbc9cdbb2f1190068e498bd6b61cff022b6a032b191021ba658d96111"
+        }
+      ]
+    }
+  }
+}

@@ -7,6 +7,7 @@ dist/
 packages/*/dist/
 packages/*/dist-chrome/
 packages/*/dist-firefox/
+packages/coding-agent/native/workspace-fs/target/
 *.cpuprofile
 .venv-swebench/
 swebench-output/

@@ -32,11 +32,11 @@ import type {
 	Usage,
 } from "../types.ts";
 import { headersToRecord } from "../utils/headers.ts";
-import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
+import { resolvePromptCacheRetention, supportsPromptCacheMode } from "./prompt-cache.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -103,16 +103,6 @@ type ChatCompletionToolWithCacheControl = OpenAI.Chat.Completions.ChatCompletion
 	cache_control?: OpenAICompatCacheControl;
 };
 
-function resolveCacheRetention(cacheRetention?: CacheRetention, env?: ProviderEnv): CacheRetention {
-	if (cacheRetention) {
-		return cacheRetention;
-	}
-	if (getProviderEnvValue("VOLT_CACHE_RETENTION", env) === "long") {
-		return "long";
-	}
-	return "short";
-}
-
 export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenAICompletionsOptions> = (
 	model: Model<"openai-completions">,
 	context: Context,
@@ -142,7 +132,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				throw new Error(`No API key for provider: ${model.provider}`);
 			}
 			const compat = getCompat(model);
-			const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
+			const cacheRetention = resolvePromptCacheRetention(model, options?.cacheRetention, options?.env);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
 			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId, compat, options?.env);
 			let params = buildParams(model, context, options, compat, cacheRetention);
@@ -490,21 +480,22 @@ function buildParams(
 	context: Context,
 	options?: OpenAICompletionsOptions,
 	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
-	cacheRetention: CacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env),
+	cacheRetention: CacheRetention = resolvePromptCacheRetention(model, options?.cacheRetention, options?.env),
 ) {
 	const messages = convertMessages(model, context, compat);
-	const cacheControl = getCompatCacheControl(compat, cacheRetention);
+	const cacheControl = getCompatCacheControl(model, compat, cacheRetention);
+	const usesAnthropicCacheControl = compat.cacheControlFormat === "anthropic";
 
 	const params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
 		model: model.id,
 		messages,
 		stream: true,
 		prompt_cache_key:
-			(model.baseUrl.includes("api.openai.com") && cacheRetention !== "none") ||
-			(cacheRetention === "long" && compat.supportsLongCacheRetention)
+			!usesAnthropicCacheControl &&
+			((model.baseUrl.includes("api.openai.com") && cacheRetention !== "none") || cacheRetention === "long")
 				? clampOpenAIPromptCacheKey(options?.sessionId)
 				: undefined,
-		prompt_cache_retention: cacheRetention === "long" && compat.supportsLongCacheRetention ? "24h" : undefined,
+		prompt_cache_retention: !usesAnthropicCacheControl && cacheRetention === "long" ? "24h" : undefined,
 	};
 
 	if (compat.supportsUsageInStreaming !== false) {
@@ -636,14 +627,19 @@ function buildParams(
 }
 
 function getCompatCacheControl(
+	model: Model<"openai-completions">,
 	compat: ResolvedOpenAICompletionsCompat,
 	cacheRetention: CacheRetention,
 ): OpenAICompatCacheControl | undefined {
-	if (compat.cacheControlFormat !== "anthropic" || cacheRetention === "none") {
+	if (
+		compat.cacheControlFormat !== "anthropic" ||
+		cacheRetention === "none" ||
+		!supportsPromptCacheMode(model, "explicit")
+	) {
 		return undefined;
 	}
 
-	const ttl = cacheRetention === "long" && compat.supportsLongCacheRetention ? "1h" : undefined;
+	const ttl = cacheRetention === "long" ? "1h" : undefined;
 	return { type: "ephemeral", ...(ttl ? { ttl } : {}) };
 }
 
@@ -1151,13 +1147,6 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		supportsStrictMode: !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia,
 		cacheControlFormat,
 		sendSessionAffinityHeaders: false,
-		supportsLongCacheRetention: !(
-			isTogether ||
-			isCloudflareWorkersAI ||
-			isCloudflareAiGateway ||
-			isNvidia ||
-			isAntLing
-		),
 	};
 }
 
@@ -1189,6 +1178,5 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		supportsStrictMode: model.compat.supportsStrictMode ?? detected.supportsStrictMode,
 		cacheControlFormat: model.compat.cacheControlFormat ?? detected.cacheControlFormat,
 		sendSessionAffinityHeaders: model.compat.sendSessionAffinityHeaders ?? detected.sendSessionAffinityHeaders,
-		supportsLongCacheRetention: model.compat.supportsLongCacheRetention ?? detected.supportsLongCacheRetention,
 	};
 }

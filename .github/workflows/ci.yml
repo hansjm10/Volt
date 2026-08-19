@@ -88,3 +88,106 @@ jobs:
           TMP: ${{ runner.temp }}
           VITEST_MAX_FORKS: '2'
         run: ./test.sh
+
+  workspace-fs-native:
+    name: Workspace fs native (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            rust-target: aarch64-apple-darwin
+            runner: macos-15
+          - target: darwin-x64
+            rust-target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: linux-arm64-gnu
+            rust-target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: linux-x64-gnu
+            rust-target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: win32-arm64-msvc
+            rust-target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+          - target: win32-x64-msvc
+            rust-target: x86_64-pc-windows-msvc
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js 22.19
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22.19.0'
+          package-manager-cache: false
+
+      - name: Setup pinned Rust toolchain
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust-target }}
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+          rustup target add --toolchain 1.97.1 "${RUST_TARGET}"
+
+      - name: Format, lint, and test Rust crate
+        shell: bash
+        run: |
+          cd packages/coding-agent/native/workspace-fs
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --locked
+
+      - name: Build and load target-native addon
+        shell: bash
+        env:
+          WORKSPACE_FS_TARGET: ${{ matrix.target }}
+        run: |
+          test "$(node --version)" = "v22.19.0"
+          node scripts/workspace-fs-native.mjs build "${WORKSPACE_FS_TARGET}"
+          node scripts/workspace-fs-native.mjs manifest
+          node scripts/workspace-fs-native.mjs verify
+
+      - name: Check Rust advisories and licenses
+        if: matrix.target == 'linux-x64-gnu'
+        shell: bash
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cd packages/coding-agent/native/workspace-fs
+          cargo deny check advisories licenses bans sources
+
+  workspace-fs-musl-load:
+    name: Workspace fs musl load (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: x64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Load committed musl addon with Node.js 22.19 on Alpine
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "${PWD}:/workspace:ro" \
+            --workdir /workspace \
+            node:22.19.0-alpine@sha256:d2166de198f26e17e5a442f537754dd616ab069c47cc57b889310a717e0abbf9 \
+            sh -c 'test "$(node --version)" = "v22.19.0" && node scripts/workspace-fs-native.mjs verify'

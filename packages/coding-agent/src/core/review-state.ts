@@ -11,6 +11,7 @@ import type {
 import type { CustomEntry, SessionEntry, SessionManager } from "./session-manager.ts";
 
 export const REVIEW_RUN_CUSTOM_ENTRY_TYPE = "volt.review.run";
+export const REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE = "volt.review.acknowledgment";
 export const REVIEW_FINDING_TRANSITION_CUSTOM_ENTRY_TYPE = "volt.review.finding-transition";
 export const REVIEW_PUBLICATION_CUSTOM_ENTRY_TYPE = "volt.review.publication";
 export const REVIEW_STATE_SCHEMA_VERSION = 1;
@@ -72,6 +73,16 @@ export interface ReviewRunRecord {
 	incrementalFallbackReason?: string;
 }
 
+export interface HydratedReviewRunRecord extends ReviewRunRecord {
+	acknowledgedAt?: number;
+}
+
+export interface ReviewAcknowledgmentRecord {
+	schemaVersion: 1;
+	runId: string;
+	acknowledgedAt: number;
+}
+
 export interface ReviewFindingTransitionRecord {
 	schemaVersion: 1;
 	runId: string;
@@ -93,7 +104,7 @@ export interface ReviewPublicationRecord {
 }
 
 export interface ReviewRunPage {
-	runs: ReviewRunRecord[];
+	runs: HydratedReviewRunRecord[];
 	nextCursor?: string;
 }
 
@@ -276,6 +287,12 @@ function parseRun(value: unknown): ReviewRunRecord | undefined {
 	return structuredClone(value) as unknown as ReviewRunRecord;
 }
 
+function parseAcknowledgment(value: unknown): ReviewAcknowledgmentRecord | undefined {
+	if (!isObject(value) || value.schemaVersion !== REVIEW_STATE_SCHEMA_VERSION) return undefined;
+	if (typeof value.runId !== "string" || !Number.isFinite(value.acknowledgedAt)) return undefined;
+	return structuredClone(value) as unknown as ReviewAcknowledgmentRecord;
+}
+
 function parseTransition(value: unknown): ReviewFindingTransitionRecord | undefined {
 	if (!isObject(value) || value.schemaVersion !== REVIEW_STATE_SCHEMA_VERSION) return undefined;
 	if (typeof value.runId !== "string" || typeof value.findingId !== "string" || !Number.isFinite(value.createdAt))
@@ -295,6 +312,16 @@ function branchCustomEntries(sessionManager: SessionManager): CustomEntry[] {
 	return sessionManager.getBranch().filter((entry: SessionEntry): entry is CustomEntry => entry.type === "custom");
 }
 
+function acknowledgmentMap(entries: readonly CustomEntry[]): Map<string, ReviewAcknowledgmentRecord> {
+	const acknowledgments = new Map<string, ReviewAcknowledgmentRecord>();
+	for (const entry of entries) {
+		if (entry.customType !== REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE) continue;
+		const acknowledgment = parseAcknowledgment(entry.data);
+		if (acknowledgment) acknowledgments.set(acknowledgment.runId, acknowledgment);
+	}
+	return acknowledgments;
+}
+
 function transitionMap(entries: readonly CustomEntry[]): Map<string, ReviewFindingTransitionRecord> {
 	const transitions = new Map<string, ReviewFindingTransitionRecord>();
 	for (const entry of entries) {
@@ -305,12 +332,14 @@ function transitionMap(entries: readonly CustomEntry[]): Map<string, ReviewFindi
 	return transitions;
 }
 
-function applyTransitions(
+function applyReviewState(
 	run: ReviewRunRecord,
+	acknowledgments: ReadonlyMap<string, ReviewAcknowledgmentRecord>,
 	transitions: ReadonlyMap<string, ReviewFindingTransitionRecord>,
-): ReviewRunRecord {
-	if (!run.result) return run;
-	const result = structuredClone(run);
+): HydratedReviewRunRecord {
+	const result: HydratedReviewRunRecord = structuredClone(run);
+	const acknowledgment = acknowledgments.get(run.runId);
+	if (acknowledgment) result.acknowledgedAt = acknowledgment.acknowledgedAt;
 	for (const finding of result.result?.findings ?? []) {
 		const transition = transitions.get(`${run.runId}\0${finding.id}`);
 		if (transition) finding.status = transition.status;
@@ -344,6 +373,7 @@ export function listReviewRuns(
 	if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50)
 		throw new Error("Review result limit must be between 1 and 50.");
 	const entries = branchCustomEntries(sessionManager);
+	const acknowledgments = acknowledgmentMap(entries);
 	const transitions = transitionMap(entries);
 	const byRunId = new Map<string, ReviewRunRecord>();
 	for (const entry of entries) {
@@ -358,7 +388,7 @@ export function listReviewRuns(
 		if (index < 0) throw new Error("Review result cursor no longer identifies a retained run.");
 		runs = runs.slice(index + 1);
 	}
-	const selected = runs.slice(0, limit).map((run) => applyTransitions(run, transitions));
+	const selected = runs.slice(0, limit).map((run) => applyReviewState(run, acknowledgments, transitions));
 	const finalRun = selected.at(-1);
 	return {
 		runs: selected,
@@ -368,7 +398,7 @@ export function listReviewRuns(
 	};
 }
 
-export function getReviewRun(sessionManager: SessionManager, runId: string): ReviewRunRecord | undefined {
+export function getReviewRun(sessionManager: SessionManager, runId: string): HydratedReviewRunRecord | undefined {
 	let cursor: string | undefined;
 	do {
 		const page = listReviewRuns(sessionManager, { cursor, limit: 50 });
@@ -380,13 +410,36 @@ export function getReviewRun(sessionManager: SessionManager, runId: string): Rev
 }
 
 export function appendReviewRun(sessionManager: SessionManager, record: ReviewRunRecord): void {
-	assertRecordSize(record);
-	sessionManager.appendCustomEntry(REVIEW_RUN_CUSTOM_ENTRY_TYPE, record);
+	const persistedRecord = structuredClone(record) as HydratedReviewRunRecord;
+	delete persistedRecord.acknowledgedAt;
+	assertRecordSize(persistedRecord);
+	sessionManager.appendCustomEntry(REVIEW_RUN_CUSTOM_ENTRY_TYPE, persistedRecord);
 }
 
 export async function appendReviewRunDurably(sessionManager: SessionManager, record: ReviewRunRecord): Promise<void> {
 	appendReviewRun(sessionManager, record);
 	await sessionManager.materialize();
+}
+
+export function acknowledgeReviewRun(
+	sessionManager: SessionManager,
+	runId: string,
+	acknowledgedAt = Date.now(),
+): ReviewAcknowledgmentRecord {
+	const run = getReviewRun(sessionManager, runId);
+	if (!run) throw new Error(`Unknown durable review run: ${runId}`);
+	if (!Number.isFinite(acknowledgedAt)) throw new Error("Review acknowledgment timestamp must be finite.");
+	if (run.acknowledgedAt !== undefined) {
+		return { schemaVersion: REVIEW_STATE_SCHEMA_VERSION, runId, acknowledgedAt: run.acknowledgedAt };
+	}
+	const record: ReviewAcknowledgmentRecord = {
+		schemaVersion: REVIEW_STATE_SCHEMA_VERSION,
+		runId,
+		acknowledgedAt,
+	};
+	assertRecordSize(record);
+	sessionManager.appendCustomEntry(REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE, record);
+	return record;
 }
 
 export function appendReviewFindingTransition(

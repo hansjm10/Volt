@@ -463,33 +463,83 @@ describe("ModelRegistry", () => {
 			expect(compat?.supportsEagerToolInputStreaming).toBe(false);
 		});
 
-		test("compat schema accepts long cache retention flag", () => {
+		test("provider promptCache applies to custom models", () => {
 			writeRawModelsJson({
 				demo: {
 					baseUrl: "https://example.com",
 					apiKey: "DEMO_KEY",
 					api: "anthropic-messages",
-					compat: {
-						supportsLongCacheRetention: false,
+					promptCache: {
+						modes: ["explicit"],
+						retention: { short: { ttlSeconds: 300 }, long: { ttlSeconds: 3600 } },
+						refreshesOnHit: true,
+					},
+					models: [{ id: "demo-model", reasoning: true, input: ["text"] }],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+			expect(registry.find("demo", "demo-model")?.promptCache).toEqual({
+				modes: ["explicit"],
+				retention: { short: { ttlSeconds: 300 }, long: { ttlSeconds: 3600 } },
+				refreshesOnHit: true,
+			});
+		});
+
+		test("model promptCache overrides the provider default", () => {
+			writeRawModelsJson({
+				demo: {
+					baseUrl: "https://example.com",
+					apiKey: "DEMO_KEY",
+					api: "anthropic-messages",
+					promptCache: {
+						modes: ["explicit"],
+						retention: { short: { ttlSeconds: 300 }, long: { ttlSeconds: 3600 } },
 					},
 					models: [
 						{
 							id: "demo-model",
 							reasoning: true,
 							input: ["text"],
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-							contextWindow: 1000,
-							maxTokens: 100,
+							promptCache: { modes: ["implicit"], retention: { short: {} } },
 						},
 					],
 				},
 			});
 
 			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
-			const compat = registry.find("demo", "demo-model")?.compat as AnthropicMessagesCompat | undefined;
-
 			expect(registry.getError()).toBeUndefined();
-			expect(compat?.supportsLongCacheRetention).toBe(false);
+			expect(registry.find("demo", "demo-model")?.promptCache).toEqual({
+				modes: ["implicit"],
+				retention: { short: {} },
+			});
+		});
+
+		test("provider and model overrides can clear inherited promptCache metadata", () => {
+			writeRawModelsJson({
+				anthropic: {
+					promptCache: null,
+					modelOverrides: {
+						"claude-haiku-4-5": {
+							promptCache: {
+								modes: ["explicit"],
+								retention: { short: { ttlSeconds: 300 } },
+							},
+						},
+						"claude-opus-4-5": { promptCache: null },
+					},
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+			expect(registry.find("anthropic", "claude-haiku-4-5")?.promptCache).toEqual({
+				modes: ["explicit"],
+				retention: { short: { ttlSeconds: 300 } },
+			});
+			expect(registry.find("anthropic", "claude-opus-4-5")?.promptCache).toBeUndefined();
+			expect(registry.find("anthropic", "claude-sonnet-4-5")?.promptCache).toBeUndefined();
 		});
 
 		test("model-level baseUrl overrides provider-level baseUrl for custom models", () => {
@@ -1100,6 +1150,17 @@ describe("ModelRegistry", () => {
 				const anthropicModels = getModelsForProvider(registry, "anthropic");
 				expect(anthropicModels.length).toBeGreaterThan(1);
 				expect(anthropicModels.every((m) => m.baseUrl === "https://proxy.test/anthropic")).toBe(true);
+			});
+
+			test("promptCache override clears built-in metadata after refresh", () => {
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+
+				registry.registerProvider("anthropic", { promptCache: null });
+				registry.refresh();
+
+				expect(getModelsForProvider(registry, "anthropic").every((model) => model.promptCache === undefined)).toBe(
+					true,
+				);
 			});
 
 			test("models-only override replaces built-in provider models after refresh", () => {

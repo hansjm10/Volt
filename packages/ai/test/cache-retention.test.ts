@@ -19,6 +19,10 @@ interface OpenAICompletionsCachePayload {
 	prompt_cache_retention?: string;
 }
 
+interface OpenAIResponsesCachePayload extends OpenAICompletionsCachePayload {
+	prompt_cache_options?: { mode: "explicit" };
+}
+
 function stopAfterPayload<TPayload>(capture: (payload: TPayload) => void): (payload: unknown) => never {
 	return (payload: unknown): never => {
 		capture(payload as TPayload);
@@ -132,12 +136,12 @@ describe("Cache Retention (VOLT_CACHE_RETENTION)", () => {
 			expect(capturedPayload.system[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
 		});
 
-		it("should omit ttl when supportsLongCacheRetention is false", async () => {
+		it("should fall back to short when long retention metadata is absent", async () => {
 			const baseModel = getModel("anthropic", "claude-haiku-4-5");
 			const proxyModel = {
 				...baseModel,
 				baseUrl: "https://my-proxy.example.com/v1",
-				compat: { supportsLongCacheRetention: false },
+				promptCache: { modes: ["explicit"], retention: { short: { ttlSeconds: 300 } } } as const,
 			};
 			let capturedPayload: any = null;
 
@@ -237,166 +241,62 @@ describe("Cache Retention (VOLT_CACHE_RETENTION)", () => {
 	});
 
 	describe("OpenAI Responses Provider", () => {
-		it.skipIf(!process.env.OPENAI_API_KEY)(
-			"should not set prompt_cache_retention when VOLT_CACHE_RETENTION is not set",
-			async () => {
-				const model = getModel("openai", "gpt-4o-mini");
-				let capturedPayload: any = null;
-
-				const s = stream(model, context, {
-					onPayload: stopAfterPayload((payload) => {
-						capturedPayload = payload;
-					}),
-				});
-
-				// Consume the stream to trigger the request
-				for await (const _ of s) {
-					// Just consume
-				}
-
-				expect(capturedPayload).not.toBeNull();
-				expect(capturedPayload.prompt_cache_retention).toBeUndefined();
-			},
-		);
-
-		it.skipIf(!process.env.OPENAI_API_KEY)(
-			"should set prompt_cache_retention to 24h when VOLT_CACHE_RETENTION=long",
-			async () => {
-				process.env.VOLT_CACHE_RETENTION = "long";
-				const model = getModel("openai", "gpt-4o-mini");
-				let capturedPayload: any = null;
-
-				const s = stream(model, context, {
-					onPayload: stopAfterPayload((payload) => {
-						capturedPayload = payload;
-					}),
-				});
-
-				// Consume the stream to trigger the request
-				for await (const _ of s) {
-					// Just consume
-				}
-
-				expect(capturedPayload).not.toBeNull();
-				expect(capturedPayload.prompt_cache_retention).toBe("24h");
-			},
-		);
-
-		it("should set prompt_cache_retention for non-api.openai.com baseUrl by default", async () => {
-			process.env.VOLT_CACHE_RETENTION = "long";
-
-			// Create a model with a different baseUrl (simulating a proxy)
-			const baseModel = getModel("openai", "gpt-4o-mini");
-			const proxyModel = {
-				...baseModel,
-				baseUrl: "https://my-proxy.example.com/v1",
-			};
-
-			let capturedPayload: any = null;
-
-			try {
-				const s = streamOpenAIResponses(proxyModel, context, {
-					apiKey: "fake-key",
-					onPayload: stopAfterPayload((payload) => {
-						capturedPayload = payload;
-					}),
-				});
-
-				// This will fail since we're using a fake key and fake proxy, but the payload should be captured
-				for await (const event of s) {
-					if (event.type === "error") break;
-				}
-			} catch {
-				// Expected to fail
+		async function capturePayload(
+			model: Model<"openai-responses">,
+			cacheRetention: "none" | "short" | "long",
+		): Promise<OpenAIResponsesCachePayload> {
+			let capturedPayload: OpenAIResponsesCachePayload | undefined;
+			const s = streamOpenAIResponses(model, context, {
+				apiKey: "fake-key",
+				cacheRetention,
+				sessionId: "session-1",
+				onPayload: stopAfterPayload<OpenAIResponsesCachePayload>((payload) => {
+					capturedPayload = payload;
+				}),
+			});
+			for await (const event of s) {
+				if (event.type === "error") break;
 			}
+			if (!capturedPayload) throw new Error("Expected payload capture");
+			return capturedPayload;
+		}
 
-			expect(capturedPayload).not.toBeNull();
-			expect(capturedPayload.prompt_cache_retention).toBe("24h");
+		it("uses 24h only for models with a long retention tier", async () => {
+			const payload = await capturePayload(getModel("openai", "gpt-4.1"), "long");
+			expect(payload.prompt_cache_key).toBe("session-1");
+			expect(payload.prompt_cache_retention).toBe("24h");
 		});
 
-		it("should omit prompt_cache_retention when supportsLongCacheRetention is false", async () => {
-			const model = {
-				...getModel("openai", "gpt-4o-mini"),
-				compat: { supportsLongCacheRetention: false },
-			};
-			let capturedPayload: any = null;
-
-			try {
-				const s = streamOpenAIResponses(model, context, {
-					apiKey: "fake-key",
-					cacheRetention: "long",
-					sessionId: "session-compat-false",
-					onPayload: stopAfterPayload((payload) => {
-						capturedPayload = payload;
-					}),
-				});
-
-				for await (const event of s) {
-					if (event.type === "error") break;
-				}
-			} catch {
-				// Expected to fail
-			}
-
-			expect(capturedPayload).not.toBeNull();
-			expect(capturedPayload.prompt_cache_retention).toBeUndefined();
+		it("falls back to short retention when long is unavailable", async () => {
+			const payload = await capturePayload(getModel("openai", "gpt-4o-mini"), "long");
+			expect(payload.prompt_cache_key).toBe("session-1");
+			expect(payload.prompt_cache_retention).toBeUndefined();
 		});
 
-		it("should omit prompt_cache_key when cacheRetention is none", async () => {
-			const model = getModel("openai", "gpt-4o-mini");
-			let capturedPayload: any = null;
-
-			try {
-				const s = streamOpenAIResponses(model, context, {
-					apiKey: "fake-key",
-					cacheRetention: "none",
-					sessionId: "session-1",
-					onPayload: stopAfterPayload((payload) => {
-						capturedPayload = payload;
-					}),
-				});
-
-				for await (const event of s) {
-					if (event.type === "error") break;
-				}
-			} catch {
-				// Expected to fail
-			}
-
-			expect(capturedPayload).not.toBeNull();
-			expect(capturedPayload.prompt_cache_key).toBeUndefined();
-			expect(capturedPayload.prompt_cache_retention).toBeUndefined();
+		it("omits controllable cache hints for unknown metadata", async () => {
+			const model = { ...getModel("openai", "gpt-4.1"), promptCache: undefined };
+			const payload = await capturePayload(model, "long");
+			expect(payload.prompt_cache_key).toBeUndefined();
+			expect(payload.prompt_cache_retention).toBeUndefined();
 		});
 
-		it("should set prompt_cache_retention when cacheRetention is long", async () => {
-			const model = getModel("openai", "gpt-4o-mini");
-			let capturedPayload: any = null;
+		it("does not send 24h retention to GPT-5.6", async () => {
+			const payload = await capturePayload(getModel("openai", "gpt-5.6-sol"), "long");
+			expect(payload.prompt_cache_key).toBe("session-1");
+			expect(payload.prompt_cache_retention).toBeUndefined();
+		});
 
-			try {
-				const s = streamOpenAIResponses(model, context, {
-					apiKey: "fake-key",
-					cacheRetention: "long",
-					sessionId: "session-2",
-					onPayload: stopAfterPayload((payload) => {
-						capturedPayload = payload;
-					}),
-				});
-
-				for await (const event of s) {
-					if (event.type === "error") break;
-				}
-			} catch {
-				// Expected to fail
-			}
-
-			expect(capturedPayload).not.toBeNull();
-			expect(capturedPayload.prompt_cache_key).toBe("session-2");
-			expect(capturedPayload.prompt_cache_retention).toBe("24h");
+		it("disables GPT-5.6 implicit cache writes when retention is none", async () => {
+			const payload = await capturePayload(getModel("openai", "gpt-5.6-sol"), "none");
+			expect(payload.prompt_cache_key).toBeUndefined();
+			expect(payload.prompt_cache_options).toEqual({ mode: "explicit" });
 		});
 	});
 
 	describe("OpenAI Completions Provider", () => {
-		function createCompletionsModel(compat?: Model<"openai-completions">["compat"]): Model<"openai-completions"> {
+		function createCompletionsModel(
+			overrides: Partial<Model<"openai-completions">> = {},
+		): Model<"openai-completions"> {
 			return {
 				id: "test-model",
 				name: "Test Model",
@@ -405,10 +305,14 @@ describe("Cache Retention (VOLT_CACHE_RETENTION)", () => {
 				baseUrl: "https://my-proxy.example.com/v1",
 				reasoning: false,
 				input: ["text"],
+				promptCache: {
+					modes: ["implicit"],
+					retention: { short: {}, long: { ttlSeconds: 86_400 } },
+				},
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 128000,
 				maxTokens: 4096,
-				compat,
+				...overrides,
 			};
 		}
 
@@ -437,18 +341,22 @@ describe("Cache Retention (VOLT_CACHE_RETENTION)", () => {
 			expect(capturedPayload.prompt_cache_retention).toBe("24h");
 		});
 
-		it("should omit prompt_cache_retention when supportsLongCacheRetention is false", async () => {
+		it("should omit prompt_cache_retention when long metadata is absent", async () => {
 			let capturedPayload: any = null;
 
 			try {
-				const s = streamOpenAICompletions(createCompletionsModel({ supportsLongCacheRetention: false }), context, {
-					apiKey: "fake-key",
-					cacheRetention: "long",
-					sessionId: "session-completions-false",
-					onPayload: stopAfterPayload((payload) => {
-						capturedPayload = payload;
-					}),
-				});
+				const s = streamOpenAICompletions(
+					createCompletionsModel({ promptCache: { modes: ["implicit"], retention: { short: {} } } }),
+					context,
+					{
+						apiKey: "fake-key",
+						cacheRetention: "long",
+						sessionId: "session-completions-false",
+						onPayload: stopAfterPayload((payload) => {
+							capturedPayload = payload;
+						}),
+					},
+				);
 
 				for await (const event of s) {
 					if (event.type === "error") break;
@@ -490,7 +398,7 @@ describe("Cache Retention (VOLT_CACHE_RETENTION)", () => {
 				// Expected to fail
 			}
 
-			expect(model.compat?.supportsLongCacheRetention).toBe(false);
+			expect(model.promptCache).toBeUndefined();
 			expect(capturedPayload).toBeDefined();
 			expect(capturedPayload?.prompt_cache_key).toBeUndefined();
 			expect(capturedPayload?.prompt_cache_retention).toBeUndefined();

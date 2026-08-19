@@ -243,6 +243,7 @@ const reviewRunProperties = {
 	status: RpcReviewRunStatusSchema,
 	startedAt: Type.Number(),
 	endedAt: Type.Number(),
+	acknowledgedAt: Type.Optional(Type.Number()),
 	target: Type.Object(
 		{
 			description: Type.String(),
@@ -300,6 +301,14 @@ export const RpcReviewWorkflowListResponseSchema = Type.Object(
 		runs: Type.Array(RpcReviewRunDescriptorSchema),
 		activeWorkflows: Type.Array(RpcReviewWorkflowDescriptorSchema),
 		nextCursor: Type.Optional(Type.String()),
+	},
+	{ additionalProperties: false },
+);
+
+export const RpcReviewAcknowledgmentResponseSchema = Type.Object(
+	{
+		runId: Type.String(),
+		acknowledgedAt: Type.Number(),
 	},
 	{ additionalProperties: false },
 );

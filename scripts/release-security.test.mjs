@@ -814,6 +814,16 @@ test("shipped packages and standalone archives contain no development workflow t
 		"packages/coding-agent": [
 			"contract",
 			"dist",
+			"native/workspace-fs/prebuilds/manifest.json",
+			"native/workspace-fs/prebuilds/darwin-arm64/workspace-fs.node",
+			"native/workspace-fs/prebuilds/darwin-x64/workspace-fs.node",
+			"native/workspace-fs/prebuilds/linux-arm64-gnu/workspace-fs.node",
+			"native/workspace-fs/prebuilds/linux-arm64-musl/workspace-fs.node",
+			"native/workspace-fs/prebuilds/linux-x64-gnu/workspace-fs.node",
+			"native/workspace-fs/prebuilds/linux-x64-musl/workspace-fs.node",
+			"native/workspace-fs/prebuilds/win32-arm64-msvc/workspace-fs.node",
+			"native/workspace-fs/prebuilds/win32-x64-msvc/workspace-fs.node",
+			"native/workspace-fs/licenses",
 			"docs",
 			"!docs/development.md",
 			"!docs/*-design.md",
@@ -1723,14 +1733,94 @@ test("published packages and binary build include the repository license and not
 			),
 			false,
 		);
+		const packedPaths = new Set(packResult[0].files.map(({ path }) => path));
+		const nativeRoot = "packages/coding-agent/native/workspace-fs";
+		const manifest = JSON.parse(readFileSync(`${nativeRoot}/prebuilds/manifest.json`, "utf8"));
+		const expectedTargets = [
+			"darwin-arm64",
+			"darwin-x64",
+			"linux-arm64-gnu",
+			"linux-arm64-musl",
+			"linux-x64-gnu",
+			"linux-x64-musl",
+			"win32-arm64-msvc",
+			"win32-x64-msvc",
+		];
+		assert.equal(manifest.schemaVersion, 1);
+		assert.equal(manifest.apiVersion, "volt-workspace-fs-v1");
+		assert.match(manifest.sourceFingerprint, /^[0-9a-f]{64}$/);
+		assert.deepEqual(
+			manifest.artifacts.map(({ target }) => target),
+			expectedTargets,
+		);
+		const expectedPackedNativeFiles = ["native/workspace-fs/prebuilds/manifest.json"];
+		for (const artifact of manifest.artifacts) {
+			assert.equal(artifact.path, `${artifact.target}/workspace-fs.node`);
+			const bytes = readFileSync(`${nativeRoot}/prebuilds/${artifact.path}`);
+			assert.equal(artifact.sha256, `sha256:${createHash("sha256").update(bytes).digest("hex")}`);
+			expectedPackedNativeFiles.push(`native/workspace-fs/prebuilds/${artifact.path}`);
+		}
+		const collectLicenseFiles = (directory, prefix = "") => {
+			const files = [];
+			for (const entry of readdirSync(directory, { withFileTypes: true })) {
+				const entryPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
+				if (entry.isDirectory()) files.push(...collectLicenseFiles(join(directory, entry.name), entryPrefix));
+				else if (entry.isFile()) files.push(entryPrefix);
+				else assert.fail(`native license entry is not a regular file: ${entryPrefix}`);
+			}
+			return files;
+		};
+		const licenseFiles = collectLicenseFiles(`${nativeRoot}/licenses`).sort();
+		expectedPackedNativeFiles.push(...licenseFiles.map((path) => `native/workspace-fs/licenses/${path}`));
+		const packedNativeFiles = [...packedPaths].filter((path) => path.startsWith("native/workspace-fs/")).sort();
+		assert.deepEqual(packedNativeFiles, expectedPackedNativeFiles.sort());
+		assert.equal(
+			[...packedPaths].some(
+				(path) =>
+					path.startsWith("native/workspace-fs/src/") ||
+					["Cargo.toml", "Cargo.lock", "build.rs", "deny.toml", "rust-toolchain.toml"].some(
+						(name) => path === `native/workspace-fs/${name}`,
+					),
+			),
+			false,
+		);
 	} finally {
 		rmSync(packCache, { force: true, recursive: true });
+	}
+	execFileSync(process.execPath, ["scripts/workspace-fs-native.mjs", "verify-licenses"], { stdio: "pipe" });
+	const nativeLicenseInventory = JSON.parse(
+		readFileSync("packages/coding-agent/native/workspace-fs/licenses/inventory.json", "utf8"),
+	);
+	assert.equal(nativeLicenseInventory.schemaVersion, 1);
+	assert.match(nativeLicenseInventory.cargoLockSha256, /^[0-9a-f]{64}$/);
+	const nativeLicenseManifest = JSON.parse(
+		readFileSync("packages/coding-agent/native/workspace-fs/prebuilds/manifest.json", "utf8"),
+	);
+	assert.equal(nativeLicenseInventory.sourceFingerprint, nativeLicenseManifest.sourceFingerprint);
+	assert.equal(nativeLicenseInventory.packages.length > 0, true);
+	const rustLicenseOverrides = JSON.parse(readFileSync("compliance/rust-license-overrides.json", "utf8"));
+	assert.equal(rustLicenseOverrides.schemaVersion, 1);
+	for (const override of Object.values(rustLicenseOverrides.packages)) {
+		assert.match(override.source, /^https:\/\/github\.com\//);
+		for (const file of override.files) {
+			assert.equal(
+				createHash("sha256").update(readFileSync(file.path)).digest("hex"),
+				file.sha256,
+			);
+		}
 	}
 	assert.match(standaloneBuild, /remote\/firebase-push-relay\/functions\/node_modules/);
 	assert.match(standaloneBuild, /extensions\/doom-overlay/);
 	assert.match(standaloneBuild, /Doom overlay must not be present in standalone release staging/);
 	assert.match(standaloneBuild, /Standalone staging contains unexpected WASM files/);
 	assert.match(standaloneBuild, /Standalone staging contains unexpected binary files/);
+	assert.match(standaloneBuild, /copyWorkspaceFsAssets/);
+	assert.match(standaloneBuild, /assertStagedWorkspaceFsAddon/);
+	assert.match(standaloneBuild, /workspace-fs-rust/);
+	assert.match(standaloneBuild, /native\/workspace-fs\/prebuilds/);
+	assert.match(standaloneBuild, /Workspace filesystem addon checksum mismatch/);
+	assert.match(standaloneBuild, /Workspace filesystem Rust license tree does not exactly match inventory\.json/);
+	assert.match(standaloneBuild, /Standalone workspace filesystem addon fingerprint does not match its manifest/);
 	assert.match(standaloneBuild, /git.*ls-files/);
 	assert.match(standaloneBuild, /images\/doom-extension\.png/);
 	assert.match(standaloneBuild, /binary-metafile\.json/);

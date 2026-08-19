@@ -35,7 +35,16 @@ const publishDelayMs = delayIndex !== -1 ? Number.parseInt(process.argv[delayInd
 let pullRequests = 0;
 const documents = new Map();
 const versions = new Map();
-const state = { opens: [], changes: [], closes: [], watched: [], configChanges: [], configResponses: undefined };
+const state = {
+	opens: [],
+	changes: [],
+	closes: [],
+	watched: [],
+	configChanges: [],
+	configResponses: undefined,
+	initializeCapabilities: undefined,
+	applyEditResponses: [],
+};
 
 process.stderr.write("fake-lsp-server ready\n");
 let buffer = Buffer.alloc(0);
@@ -133,6 +142,7 @@ function handle(message) {
 		return;
 	}
 	if (method === "initialize") {
+		state.initializeCapabilities = params.capabilities;
 		if (initErrorMode) {
 			// Respond with a JSON-RPC error but keep the process running, like a
 			// server that fails its handshake without exiting.
@@ -318,6 +328,13 @@ function handle(message) {
 	}
 	if (method === "fake/state") {
 		send({ jsonrpc: "2.0", id, result: state });
+		return;
+	}
+	if (method === "fake/applyEdit") {
+		serverRequest("workspace/applyEdit", { edit: params.edit }, (response) => {
+			state.applyEditResponses.push(response.result);
+			send({ jsonrpc: "2.0", id, result: response.result });
+		});
 		return;
 	}
 	if (method === "textDocument/definition") {
@@ -537,7 +554,19 @@ function handle(message) {
 				},
 			});
 		}
-		if (text.includes("CMDFIX")) {
+		if (text.includes("SEQUENTIAL_CMDFIX")) {
+			actions.push({
+				title: "Fix via sequential command edits",
+				kind: "quickfix",
+				command: { title: "Fix via sequential command edits", command: "fake.sequentialFix", arguments: [uri] },
+			});
+		} else if (text.includes("DELAYED_CMDFIX")) {
+			actions.push({
+				title: "Fix via delayed command",
+				kind: "quickfix",
+				command: { title: "Fix via delayed command", command: "fake.delayedFix", arguments: [uri] },
+			});
+		} else if (text.includes("CMDFIX")) {
 			actions.push({
 				title: "Fix via command",
 				kind: "quickfix",
@@ -561,6 +590,31 @@ function handle(message) {
 			serverRequest("workspace/applyEdit", { edit }, () => {
 				send({ jsonrpc: "2.0", id, result: null });
 			});
+			return;
+		}
+		if (params.command === "fake.sequentialFix") {
+			const uri = params.arguments[0];
+			const firstEdit = buildReplaceEdit(uri, documents.get(uri) ?? "", "SEQUENTIAL_CMDFIX", "SECOND_CMDFIX");
+			serverRequest("workspace/applyEdit", { edit: firstEdit }, (firstResponse) => {
+				if (!firstResponse.result?.applied) {
+					send({ jsonrpc: "2.0", id, result: null });
+					return;
+				}
+				const secondEdit = buildReplaceEdit(uri, documents.get(uri) ?? "", "SECOND_CMDFIX", "FIXED");
+				serverRequest("workspace/applyEdit", { edit: secondEdit }, () => {
+					send({ jsonrpc: "2.0", id, result: null });
+				});
+			});
+			return;
+		}
+		if (params.command === "fake.delayedFix") {
+			const uri = params.arguments[0];
+			const edit = buildReplaceEdit(uri, documents.get(uri) ?? "", "DELAYED_CMDFIX", "FIXED");
+			setTimeout(() => {
+				serverRequest("workspace/applyEdit", { edit }, () => {
+					send({ jsonrpc: "2.0", id, result: null });
+				});
+			}, 150);
 			return;
 		}
 		send({ jsonrpc: "2.0", id, result: null });
