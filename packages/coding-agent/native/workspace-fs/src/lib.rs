@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const API_VERSION: &str = "volt-workspace-fs-v1";
 
@@ -179,21 +179,21 @@ pub struct NativeMetadata {
     pub mode: Option<u32>,
 }
 
-fn metadata_output(metadata: Metadata) -> NativeMetadata {
-    let modified_ms = metadata
-        .modified()
-        .map(|time| time.into_std())
-        .unwrap_or(UNIX_EPOCH)
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
-        * 1000.0;
-    NativeMetadata {
+fn epoch_milliseconds(time: SystemTime) -> f64 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs_f64() * 1000.0,
+        Err(error) => -error.duration().as_secs_f64() * 1000.0,
+    }
+}
+
+fn metadata_output(metadata: Metadata) -> io::Result<NativeMetadata> {
+    let modified_ms = epoch_milliseconds(metadata.modified()?.into_std());
+    Ok(NativeMetadata {
         file_type: metadata_type(&metadata).to_owned(),
         size: metadata.len() as f64,
         modified_ms,
         mode: metadata_mode(&metadata),
-    }
+    })
 }
 
 #[napi(object, object_from_js = false)]
@@ -263,7 +263,7 @@ impl Task for MetadataTask {
                 parent.symlink_metadata(&name)
             }
         };
-        result.map(metadata_output).map_err(|error| {
+        result.and_then(metadata_output).map_err(|error| {
             napi_io_error(
                 if self.follow { "metadata" } else { "lstat" },
                 &self.path,
@@ -400,6 +400,30 @@ fn temporary_name() -> String {
     format!(".v{token:08x}")
 }
 
+#[cfg(unix)]
+fn default_creation_permissions(parent: &Dir) -> io::Result<Permissions> {
+    use cap_std::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    loop {
+        let probe = temporary_name();
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o666);
+        let file = match parent.open_with(&probe, &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let permissions = file
+            .metadata()
+            .map(|metadata| Permissions::from_mode(metadata.mode() & 0o777));
+        drop(file);
+        let cleanup = parent.remove_file(&probe);
+        let permissions = permissions?;
+        cleanup?;
+        return Ok(permissions);
+    }
+}
+
 fn replace_file(root: &Dir, path: &str, data: &[u8]) -> Result<()> {
     let (parent, destination) = open_parent(root, "replaceFile", path)?;
     operation_hook("replaceFile");
@@ -416,6 +440,16 @@ fn replace_file(root: &Dir, path: &str, data: &[u8]) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(napi_io_error("replaceFile", path, error)),
     };
+    #[cfg(unix)]
+    let publish_permissions = match existing_permissions {
+        Some(permissions) => Some(permissions),
+        None => Some(
+            default_creation_permissions(&parent)
+                .map_err(|error| napi_io_error("replaceFile", path, error))?,
+        ),
+    };
+    #[cfg(windows)]
+    let publish_permissions = existing_permissions;
 
     let (temporary, mut file) = loop {
         let temporary = temporary_name();
@@ -435,7 +469,7 @@ fn replace_file(root: &Dir, path: &str, data: &[u8]) -> Result<()> {
 
     let publish = (|| -> io::Result<()> {
         file.write_all(data)?;
-        if let Some(permissions) = existing_permissions {
+        if let Some(permissions) = publish_permissions {
             file.set_permissions(permissions)?;
         }
         file.sync_all()?;

@@ -1,47 +1,47 @@
 {
   "schemaVersion": 1,
   "apiVersion": "volt-workspace-fs-v1",
-  "sourceFingerprint": "1b319df8df6471c0cf53e53ce5c6bc8260bf138c5961b03d8518ebb2fb65f1c1",
+  "sourceFingerprint": "acb34379b274e951f94c4c734216b2c7d679d07d4fad67d7318d3b91f81abff2",
   "artifacts": [
     {
       "target": "darwin-arm64",
       "path": "darwin-arm64/workspace-fs.node",
-      "sha256": "sha256:cacd9743f5892ba72873016d27918a7640f59b15132e9aa4c6890d8139ac2d0d"
+      "sha256": "sha256:f5b67c78ecfd5cad2f8b472fde30f1625829043ea1b0b046470885d853c8540f"
     },
     {
       "target": "darwin-x64",
       "path": "darwin-x64/workspace-fs.node",
-      "sha256": "sha256:8571adf1cf933660d2c0a896cb78d1b281fb6eee66fe5432172cdf1eed366fc5"
+      "sha256": "sha256:b62f5d6bb07d15ce02204abba9824b0ff5442408f0b0a0975a9d8e54ec81e483"
     },
     {
       "target": "linux-arm64-gnu",
       "path": "linux-arm64-gnu/workspace-fs.node",
-      "sha256": "sha256:e793b2f0d4a1156605df319a233d39fb5197c4f5c10a098868cff98513e95fde"
+      "sha256": "sha256:abf483cea999328e2291c80cb1f7d734ec0b5f824fb3757f4d2fcbec4753cfbd"
     },
     {
       "target": "linux-arm64-musl",
       "path": "linux-arm64-musl/workspace-fs.node",
-      "sha256": "sha256:2e74a39f7d6fb1d7f11f3934c8f6698b7e920e43150bac2c0ba6b99408edef40"
+      "sha256": "sha256:ea88296759a4d156cbc2320a5eebf0ffffa627ebab318a1de8eed30dcb68c9f3"
     },
     {
       "target": "linux-x64-gnu",
       "path": "linux-x64-gnu/workspace-fs.node",
-      "sha256": "sha256:fa874683e3b71569bddbd880fd116dea65f3a3e53f59de9343048d7d94acb4e1"
+      "sha256": "sha256:f3b64e0e2830fbd62effea104eb4fd804123430acd2a686bfec8b6edb92826c8"
     },
     {
       "target": "linux-x64-musl",
       "path": "linux-x64-musl/workspace-fs.node",
-      "sha256": "sha256:09806096ec3cd80e5252862be338946a6d8786256c431ee4ccf176166e1e85e9"
+      "sha256": "sha256:fd030fb7e2abdee50eaa53324e093020849b69ab91aec140ded707ffa30d9b56"
     },
     {
       "target": "win32-arm64-msvc",
       "path": "win32-arm64-msvc/workspace-fs.node",
-      "sha256": "sha256:8948ab217614f6e93959ed3750312eaa793f181f1f09ef55dfa8cde916f7306f"
+      "sha256": "sha256:e79e6ea04ef0d7710679e46088dcd05e05d60bc2f7b0c8d1b7cc26751c1d9286"
     },
     {
       "target": "win32-x64-msvc",
       "path": "win32-x64-msvc/workspace-fs.node",
-      "sha256": "sha256:d6634d2d83ba79744a77ecf7fb05e310deb2ae8d28b91bfeeebfea2e054a6fcd"
+      "sha256": "sha256:cdeaf34b7ab36bd6ac1cba22d4f97e2261083b7f3cf3ab13b33342be1f5975bd"
     }
   ]
 }

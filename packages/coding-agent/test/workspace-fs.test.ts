@@ -151,6 +151,40 @@ describe("workspace filesystem", () => {
 		},
 	);
 
+	it.runIf(process.platform !== "win32")(
+		"uses normal create-mode and umask permissions when replacing a missing file",
+		() => {
+			const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+			const directory = temporaryDirectory("volt-workspace-fs-replace-missing-");
+			const script = join(directory, "replace.ts");
+			writeFileSync(
+				script,
+				[
+					`import { WorkspaceRoot } from ${JSON.stringify(pathToFileURL(join(repositoryRoot, "packages", "coding-agent", "src", "core", "workspace-fs", "index.ts")).href)};`,
+					"process.umask(0o027);",
+					"const root = new WorkspaceRoot(process.argv[2]);",
+					'try { await root.replaceFile("created", Buffer.from("content")); } finally { root.close(); }',
+				].join("\n"),
+			);
+
+			const result = spawnSync(process.execPath, ["--experimental-strip-types", script, directory], {
+				encoding: "utf8",
+			});
+			expect(result.status, result.stderr).toBe(0);
+			expect(statSync(join(directory, "created")).mode & 0o777).toBe(0o640);
+		},
+	);
+
+	it("returns signed milliseconds for modification times before the Unix epoch", async () => {
+		const directory = temporaryDirectory("volt-workspace-fs-pre-epoch-");
+		const target = join(directory, "target");
+		writeFileSync(target, "content");
+		utimesSync(target, new Date("1960-01-01T00:00:00.000Z"), new Date("1960-01-01T00:00:00.000Z"));
+		const root = openWorkspace(directory);
+
+		expect((await root.metadata("target")).modifiedMs).toBeLessThan(0);
+	});
+
 	it("documents replacement metadata by replacing timestamps rather than preserving them", async () => {
 		const directory = temporaryDirectory("volt-workspace-fs-metadata-");
 		const target = join(directory, "target");
