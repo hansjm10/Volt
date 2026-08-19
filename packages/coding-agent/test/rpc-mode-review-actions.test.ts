@@ -511,7 +511,8 @@ describe("RPC durable review actions", () => {
 				.some((entry) => entry.type === "custom" && entry.customType === "volt.review.run"),
 		).toBe(true);
 		expect(getReviewRun(manager, "review:test")?.acknowledgedAt).toBeUndefined();
-		expect(getReviewRun(replacementManagers[0]!, "review:test")?.acknowledgedAt).toEqual(expect.any(Number));
+		const openedAcknowledgedAt = getReviewRun(replacementManagers[0]!, "review:test")?.acknowledgedAt;
+		expect(openedAcknowledgedAt).toEqual(expect.any(Number));
 		line(JSON.stringify({ id: "get-opened", type: "get_review_result", runId: "review:test" }));
 		await vi.waitFor(() => expect(response(collecting.writes, "get-opened")).toBeDefined());
 		expect(response(collecting.writes, "get-opened")?.data).toMatchObject({
@@ -537,6 +538,7 @@ describe("RPC durable review actions", () => {
 		);
 		expect(JSON.stringify(seedMessages)).toContain("finding-1");
 		expect(JSON.stringify(seedMessages)).toContain("finding-2");
+		expect(getReviewRun(replacementManagers[1]!, "review:test")?.acknowledgedAt).toBe(openedAcknowledgedAt);
 		await closeMode(collecting, modePromise);
 	});
 
@@ -624,6 +626,51 @@ describe("RPC durable review actions", () => {
 		line(JSON.stringify({ id: "open-failed", type: "open_review_session", runId: unacknowledged.runId }));
 		await vi.waitFor(() => expect(response(collecting.writes, "open-failed")).toBeDefined());
 		expect(response(collecting.writes, "open-failed")).toMatchObject({ success: false, error: "seed failed" });
+		expect(getReviewRun(manager, unacknowledged.runId)?.acknowledgedAt).toBeUndefined();
+
+		vi.mocked(runtimeHost.newSession).mockResolvedValueOnce({ cancelled: true, seeded: false });
+		line(
+			JSON.stringify({
+				id: "fix-cancelled",
+				type: "invoke_ui_action",
+				action: "review.fix",
+				args: { runId: unacknowledged.runId, findingIds: "" },
+			}),
+		);
+		await vi.waitFor(() => expect(response(collecting.writes, "fix-cancelled")).toBeDefined());
+		expect(response(collecting.writes, "fix-cancelled")).toMatchObject({
+			success: true,
+			data: { status: "cancelled" },
+		});
+		expect(getReviewRun(manager, unacknowledged.runId)?.acknowledgedAt).toBeUndefined();
+
+		vi.mocked(runtimeHost.newSession).mockResolvedValueOnce({ cancelled: false, seeded: false });
+		line(
+			JSON.stringify({
+				id: "fix-skipped",
+				type: "invoke_ui_action",
+				action: "review.fix",
+				args: { runId: unacknowledged.runId, findingIds: "" },
+			}),
+		);
+		await vi.waitFor(() => expect(response(collecting.writes, "fix-skipped")).toBeDefined());
+		expect(response(collecting.writes, "fix-skipped")).toMatchObject({
+			success: false,
+			error: expect.stringContaining("opened without the selected findings"),
+		});
+		expect(getReviewRun(manager, unacknowledged.runId)?.acknowledgedAt).toBeUndefined();
+
+		vi.mocked(runtimeHost.newSession).mockRejectedValueOnce(new Error("fix seed failed"));
+		line(
+			JSON.stringify({
+				id: "fix-failed",
+				type: "invoke_ui_action",
+				action: "review.fix",
+				args: { runId: unacknowledged.runId, findingIds: "" },
+			}),
+		);
+		await vi.waitFor(() => expect(response(collecting.writes, "fix-failed")).toBeDefined());
+		expect(response(collecting.writes, "fix-failed")).toMatchObject({ success: false, error: "fix seed failed" });
 		expect(getReviewRun(manager, unacknowledged.runId)?.acknowledgedAt).toBeUndefined();
 		await closeMode(collecting, modePromise);
 	});
