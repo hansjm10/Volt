@@ -47,12 +47,20 @@ describe("ExtensionRunner", () => {
 		baseUrl: "https://provider.test/v1",
 		apiKey: "provider-test-key",
 		api: "openai-completions",
+		promptCache: {
+			modes: ["explicit"],
+			retention: { short: { ttlSeconds: 300 } },
+		},
 		models: [
 			{
 				id: "instant-model",
 				name: "Instant Model",
 				reasoning: false,
 				input: ["text"],
+				promptCache: {
+					modes: ["implicit"],
+					retention: { short: {} },
+				},
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 128000,
 				maxTokens: 4096,
@@ -930,7 +938,13 @@ describe("ExtensionRunner", () => {
 
 			runtime.registerProvider("instant-provider", providerModelConfig);
 			expect(runtime.pendingProviderRegistrations).toHaveLength(0);
-			expect(modelRegistry.find("instant-provider", "instant-model")).toBeDefined();
+			expect(modelRegistry.find("instant-provider", "instant-model")?.promptCache).toEqual({
+				modes: ["implicit"],
+				retention: { short: {} },
+			});
+
+			runtime.registerProvider("anthropic", { promptCache: null });
+			expect(modelRegistry.find("anthropic", "claude-sonnet-4-5")?.promptCache).toBeUndefined();
 
 			runtime.unregisterProvider("instant-provider");
 			expect(modelRegistry.find("instant-provider", "instant-model")).toBeUndefined();

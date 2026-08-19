@@ -45,6 +45,7 @@ import {
 	type ProcessResponsesStreamResult,
 	processResponsesStream,
 } from "./openai-responses-shared.ts";
+import { resolvePromptCacheRetention } from "./prompt-cache.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 // ============================================================================
@@ -237,13 +238,17 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			}
 
 			const accountId = extractAccountId(apiKey);
-			let body = buildRequestBody(model, context, options);
+			const cacheRetention = resolvePromptCacheRetention(model, options?.cacheRetention, options?.env);
+			const transportSessionId = options?.sessionId;
+			const cacheSessionId = cacheRetention === "none" ? undefined : transportSessionId;
+			const promptCacheOptions = options ? { ...options, sessionId: cacheSessionId } : undefined;
+			let body = buildRequestBody(model, context, promptCacheOptions);
 			const nextBody = await options?.onPayload?.(body, model);
 			if (nextBody !== undefined) {
 				body = nextBody as RequestBody;
 			}
-			const websocketRequestId = options?.sessionId || createCodexRequestId();
-			const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, options?.sessionId);
+			const websocketRequestId = cacheSessionId || createCodexRequestId();
+			const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, cacheSessionId);
 			const websocketHeaders = buildWebSocketHeaders(
 				model.headers,
 				options?.headers,
@@ -255,9 +260,9 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			const idleTimeoutMs = normalizeTimeoutMs(options?.timeoutMs);
 			const websocketConnectTimeoutMs = normalizeTimeoutMs(options?.websocketConnectTimeoutMs);
 			const transport = options?.transport || "auto";
-			const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(options?.sessionId);
+			const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(transportSessionId);
 			if (websocketDisabledForSession) {
-				recordWebSocketSseFallback(options?.sessionId);
+				recordWebSocketSseFallback(transportSessionId);
 			}
 
 			if (transport !== "sse" && !websocketDisabledForSession) {
@@ -275,6 +280,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						},
 						idleTimeoutMs,
 						websocketConnectTimeoutMs,
+						cacheSessionId,
 						options,
 					);
 
@@ -300,11 +306,11 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 							requestBytes: new TextEncoder().encode(bodyJson).byteLength,
 						}),
 					);
-					recordWebSocketFailure(options?.sessionId, error);
+					recordWebSocketFailure(transportSessionId, error);
 					if (websocketStarted) {
 						throw error;
 					}
-					recordWebSocketSseFallback(options?.sessionId);
+					recordWebSocketSseFallback(transportSessionId);
 				}
 			}
 
@@ -1314,18 +1320,20 @@ async function processWebSocketStream(
 	onStart: () => void,
 	idleTimeoutMs: number | undefined,
 	websocketConnectTimeoutMs: number | undefined,
+	cacheSessionId: string | undefined,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<ProcessResponsesStreamResult> {
 	const { socket, entry, reused, release } = await acquireWebSocket(
 		url,
 		headers,
-		options?.sessionId,
+		cacheSessionId,
 		options?.signal,
 		websocketConnectTimeoutMs,
 		options?.env,
 	);
 	let keepConnection = true;
-	const useCachedContext = options?.transport === "websocket-cached" || options?.transport === "auto";
+	const useCachedContext =
+		cacheSessionId !== undefined && (options?.transport === "websocket-cached" || options?.transport === "auto");
 	// ChatGPT Codex Responses rejects `store: true` ("Store must be set to false").
 	// WebSocket continuation still works via connection-scoped previous_response_id state.
 	const fullBody = body;

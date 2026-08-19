@@ -156,8 +156,11 @@ describe("openai-completions tool_choice", () => {
 		expect("strict" in (tool ?? {})).toBe(false);
 	});
 
-	it("maps groq qwen3 reasoning levels to default reasoning_effort", async () => {
-		const model = getModel("groq", "qwen/qwen3-32b")!;
+	it("maps model-specific Groq reasoning levels to default reasoning_effort", async () => {
+		const model = {
+			...getModel("groq", "qwen/qwen3.6-27b"),
+			thinkingLevelMap: { medium: "default" },
+		};
 		let payload: unknown;
 
 		await streamSimple(
@@ -213,7 +216,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("enables tool_stream for supported z.ai models with tools", async () => {
-		const model = getModel("zai", "glm-5.1")!;
+		const model = getModel("zai", "glm-5.3")!;
 		const tools: Tool[] = [
 			{
 				name: "ping",
@@ -249,12 +252,10 @@ describe("openai-completions tool_choice", () => {
 		expect(params.tool_stream).toBe(true);
 	});
 
-	it("stores z.ai tool_stream support in model compat metadata", () => {
-		expect(getModel("zai", "glm-5.1")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-4.7")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-4.7")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-5-turbo")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-4.5-air")?.compat?.zaiToolStream).toBeUndefined();
+	it("stores z.ai tool_stream support in current model metadata", () => {
+		for (const modelId of ["glm-4.7", "glm-5-turbo", "glm-5.2", "glm-5.2-highspeed", "glm-5.3"] as const) {
+			expect(getModel("zai", modelId)?.compat?.zaiToolStream).toBe(true);
+		}
 	});
 
 	it("stores z.ai GLM-5.2 effort metadata", () => {
@@ -337,8 +338,9 @@ describe("openai-completions tool_choice", () => {
 		expect(params.reasoning_effort).toBeUndefined();
 	});
 
-	it("omits tool_stream for unsupported z.ai models", async () => {
-		const model = getModel("zai", "glm-4.5-air")!;
+	it("omits tool_stream when z.ai metadata disables it", async () => {
+		const baseModel = getModel("zai", "glm-5.3")!;
+		const model = { ...baseModel, compat: { ...baseModel.compat, zaiToolStream: false } };
 		const tools: Tool[] = [
 			{
 				name: "ping",
@@ -375,7 +377,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("respects explicit z.ai tool_stream compat override", async () => {
-		const baseModel = getModel("zai", "glm-4.5-air")!;
+		const baseModel = getModel("zai", "glm-5.3")!;
 		const model = {
 			...baseModel,
 			compat: {
@@ -419,7 +421,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("omits tool_stream when no tools are provided", async () => {
-		const model = getModel("zai", "glm-5.1")!;
+		const model = getModel("zai", "glm-5.3")!;
 		let payload: unknown;
 
 		await streamSimple(
@@ -461,7 +463,7 @@ describe("openai-completions tool_choice", () => {
 			},
 		];
 
-		const model = getModel("zai", "glm-5.1")!;
+		const model = getModel("zai", "glm-5.3")!;
 		const response = await streamSimple(
 			model,
 			{
@@ -1145,7 +1147,6 @@ describe("openai-completions tool_choice", () => {
 				zaiToolStream: false,
 				supportsStrictMode: true,
 				sendSessionAffinityHeaders: false,
-				supportsLongCacheRetention: true,
 			},
 		);
 
@@ -1247,7 +1248,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("sends max_tokens for OpenCode completions models", async () => {
-		const cases = [getModel("opencode-go", "kimi-k2.6")!, getModel("opencode", "grok-build-0.1")!] as const;
+		const cases = [getModel("opencode-go", "kimi-k2.6")!, getModel("opencode", "glm-5.1")!] as const;
 
 		for (const model of cases) {
 			let payload: unknown;
@@ -1459,8 +1460,8 @@ describe("openai-completions tool_choice", () => {
 			supportsReasoningEffort: false,
 			maxTokensField: "max_tokens",
 			thinkingFormat: "ant-ling",
-			supportsLongCacheRetention: false,
 		});
+		expect(model.promptCache).toBeUndefined();
 		expect(model.compat?.supportsStrictMode).toBeUndefined();
 		expect(model.compat?.requiresReasoningContentOnAssistantMessages).toBeUndefined();
 

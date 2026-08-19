@@ -31,6 +31,7 @@ describe("Together models", () => {
 			cacheRead: 0.2,
 			cacheWrite: 0,
 		});
+		expect(model.promptCache).toBeUndefined();
 		expect(model.compat).toEqual({
 			supportsStore: false,
 			supportsDeveloperRole: false,
@@ -38,7 +39,6 @@ describe("Together models", () => {
 			maxTokensField: "max_tokens",
 			thinkingFormat: "together",
 			supportsStrictMode: false,
-			supportsLongCacheRetention: false,
 		});
 	});
 

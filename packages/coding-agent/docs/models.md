@@ -315,7 +315,7 @@ Use `modelOverrides` to customize specific built-in models without replacing the
 }
 ```
 
-`modelOverrides` supports these fields per model: `name`, `reasoning`, `input`, `cost` (partial), `contextWindow`, `maxTokens`, `headers`, `compat`.
+`modelOverrides` supports these fields per model: `name`, `reasoning`, `input`, `promptCache`, `cost` (partial), `contextWindow`, `maxTokens`, `headers`, `compat`.
 
 Behavior notes:
 - `modelOverrides` are applied to built-in provider models.
@@ -323,6 +323,25 @@ Behavior notes:
 - You can combine provider-level `baseUrl`/`headers` with `modelOverrides`.
 - Overriding `name` changes model matching and secondary detail text only; the footer and primary model lists continue to show the model `id`.
 - If `models` is also defined for a provider, custom models are merged after built-in overrides. A custom model with the same `id` replaces the overridden built-in model entry.
+
+## Prompt Cache Metadata
+
+Use `promptCache` at the provider or model level to describe cache behavior for that exact route. Model definitions and `modelOverrides` take precedence over the provider default. Set `promptCache` to `null` in a provider or model override to clear inherited built-in metadata when a proxy does not provide the same cache contract.
+
+```json
+{
+  "promptCache": {
+    "modes": ["explicit"],
+    "retention": {
+      "short": { "ttlSeconds": 300 },
+      "long": { "ttlSeconds": 3600 }
+    },
+    "refreshesOnHit": true
+  }
+}
+```
+
+`retention.short` is required. `retention.long` declares support for the `long` request preference; without it, `long` falls back to short. Omit `ttlSeconds` when caching is supported but the TTL is not stable or documented. Missing metadata causes Volt to omit controllable cache hints, though providers can still perform automatic caching internally.
 
 ## Anthropic Messages Compatibility
 
@@ -341,9 +360,16 @@ Some Anthropic-compatible providers emit thinking blocks with empty signatures a
       "baseUrl": "https://proxy.example.com",
       "api": "anthropic-messages",
       "apiKey": "$ANTHROPIC_PROXY_KEY",
+      "promptCache": {
+        "modes": ["explicit"],
+        "retention": {
+          "short": { "ttlSeconds": 300 },
+          "long": { "ttlSeconds": 3600 }
+        },
+        "refreshesOnHit": true
+      },
       "compat": {
         "supportsEagerToolInputStreaming": false,
-        "supportsLongCacheRetention": true,
         "forceAdaptiveThinking": true,
         "allowEmptySignature": true
       },
@@ -362,7 +388,6 @@ Some Anthropic-compatible providers emit thinking blocks with empty signatures a
 | Field | Description |
 |-------|-------------|
 | `supportsEagerToolInputStreaming` | Whether the provider accepts per-tool `eager_input_streaming`. Default: `true`. Set to `false` to omit that field and use the legacy fine-grained tool streaming beta header on tool-enabled requests. |
-| `supportsLongCacheRetention` | Whether the provider accepts Anthropic long cache retention (`cache_control.ttl: "1h"`) when cache retention is `long`. Default: `true`. |
 | `sendSessionAffinityHeaders` | Whether to send `x-session-affinity` from the session id when caching is enabled. Default: auto-detected for known providers. |
 | `supportsCacheControlOnTools` | Whether the provider accepts Anthropic-style `cache_control` markers on tool definitions. Default: `true`. |
 | `forceAdaptiveThinking` | Whether to send adaptive thinking (`thinking.type: "adaptive"` plus `output_config.effort`) for this model. Built-in adaptive models set this automatically. Default: `false`. |
@@ -405,7 +430,6 @@ For providers with partial OpenAI compatibility, use the `compat` field.
 | `thinkingFormat` | Use `reasoning_effort`, `openrouter`, `deepseek`, `together`, `zai`, `qwen`, or `qwen-chat-template` thinking parameters |
 | `cacheControlFormat` | Use Anthropic-style `cache_control` markers on the system prompt, last tool definition, and last user/assistant text content. Currently only `anthropic` is supported. |
 | `supportsStrictMode` | Include the `strict` field in tool definitions |
-| `supportsLongCacheRetention` | Whether the provider accepts long cache retention when cache retention is `long`: `prompt_cache_retention: "24h"` for OpenAI prompt caching, or `cache_control.ttl: "1h"` when `cacheControlFormat` is `anthropic`. Default: `true`. |
 | `openRouterRouting` | OpenRouter provider routing preferences. This object is sent as-is in the `provider` field of the [OpenRouter API request](https://openrouter.ai/docs/guides/routing/provider-selection). |
 | `vercelGatewayRouting` | Vercel AI Gateway routing config for provider selection (`only`, `order`) |
 

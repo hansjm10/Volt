@@ -27,6 +27,7 @@ import type {
 	Model,
 	OAuthCredentials,
 	OAuthLoginCallbacks,
+	PromptCacheMetadata,
 	SimpleStreamOptions,
 	TextContent,
 	ToolResultMessage,
@@ -1426,6 +1427,8 @@ export interface ProviderConfig {
 	headers?: Record<string, string>;
 	/** If true, adds Authorization: Bearer header with the resolved API key. */
 	authHeader?: boolean;
+	/** Prompt-cache behavior inherited by registered models. Set to null to clear inherited metadata. */
+	promptCache?: PromptCacheMetadata | null;
 	/** Models to register. If provided, replaces all existing models for this provider. */
 	models?: ProviderModelConfig[];
 	/** OAuth provider for /login support. The `id` is set automatically from the provider name. */
@@ -1459,6 +1462,8 @@ export interface ProviderModelConfig {
 	thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
 	/** Supported input types. */
 	input: ("text" | "image")[];
+	/** Prompt-cache behavior for this model. Overrides the provider default. */
+	promptCache?: PromptCacheMetadata;
 	/** Cost per token (for tracking, can be 0). */
 	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	/** Maximum context window size in tokens. */
