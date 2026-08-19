@@ -932,6 +932,7 @@ describe("Iroh remote core helpers", () => {
 			"get_review_result",
 			"list_review_workflows",
 			"open_review_session",
+			"acknowledge_review",
 			"record_review_finding_outcome",
 			"rerun_review",
 			"publish_review",

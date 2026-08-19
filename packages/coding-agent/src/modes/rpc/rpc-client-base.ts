@@ -17,6 +17,7 @@ import type {
 	RpcHostActionUpdate,
 	RpcListSubagentsResponse,
 	RpcResponse,
+	RpcReviewAcknowledgmentResponse,
 	RpcReviewWorkflowListResponse,
 	RpcReviewWorkflowResultResponse,
 	RpcSessionListItem,
@@ -235,6 +236,12 @@ export abstract class RpcClientBase {
 	/** Open a fresh session seeded with all or selected findings from a durable review run. */
 	async openReviewSession(runId: string, findingIds?: string[]): Promise<{ cancelled: boolean }> {
 		const response = await this.send({ type: "open_review_session", runId, findingIds });
+		return this.getData(response);
+	}
+
+	/** Durably acknowledge a review so clients no longer advertise it as requiring action. */
+	async acknowledgeReview(runId: string): Promise<RpcReviewAcknowledgmentResponse> {
+		const response = await this.send({ type: "acknowledge_review", runId });
 		return this.getData(response);
 	}
 

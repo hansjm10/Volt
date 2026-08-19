@@ -77,6 +77,7 @@ import type {
 } from "./schema/primitives.ts";
 import type {
 	RpcProjectionCollectionTruncationSchema,
+	RpcReviewAcknowledgmentResponseSchema,
 	RpcReviewCompletionStatusSchema,
 	RpcReviewCorrectnessSchema,
 	RpcReviewFindingStatusSchema,
@@ -248,6 +249,7 @@ export type RpcWorkflowToolEvent = Static<typeof RpcWorkflowToolEventSchema>;
 // ============================================================================
 
 export type RpcReviewWorkflowLifecycleStatus = Static<typeof RpcReviewWorkflowLifecycleStatusSchema>;
+export type RpcReviewAcknowledgmentResponse = Static<typeof RpcReviewAcknowledgmentResponseSchema>;
 export type RpcReviewRunStatus = Static<typeof RpcReviewRunStatusSchema>;
 export type RpcReviewCompletionStatus = Static<typeof RpcReviewCompletionStatusSchema>;
 export type RpcReviewCorrectness = Static<typeof RpcReviewCorrectnessSchema>;

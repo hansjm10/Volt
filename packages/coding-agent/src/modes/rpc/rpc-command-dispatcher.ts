@@ -15,13 +15,14 @@ import { toIrohRemoteAgentOptionsCatalogModel } from "../../core/remote/iroh/age
 import { createReviewSeedMessage } from "../../core/review.ts";
 import { publishReviewRun } from "../../core/review-publish.ts";
 import {
+	acknowledgeReviewRun,
 	appendReviewFindingTransition,
 	appendReviewPublication,
 	appendReviewRun,
 	exportReviewFeedback,
 	getReviewRun,
+	type HydratedReviewRunRecord,
 	listReviewRuns,
-	type ReviewRunRecord,
 } from "../../core/review-state.ts";
 import { getRpcErrorResponseTarget, isUsableRpcConversationIdentifier } from "../../core/rpc/correlation.ts";
 import { buildRpcSessionState } from "../../core/rpc/session-state.ts";
@@ -38,6 +39,7 @@ import {
 	getUiActionDescriptors,
 } from "../../core/rpc/ui-actions.ts";
 import { RPC_STABLE_ERROR_CODES } from "../../core/rpc/wire-limits.ts";
+import { SessionManager } from "../../core/session-manager.ts";
 import type {
 	RpcCatalogModel,
 	RpcClientCapabilityFeature,
@@ -178,7 +180,7 @@ export function createRpcErrorResponse(
 
 export { getRpcErrorResponseTarget };
 
-function projectReviewRun(record: ReviewRunRecord, includeResult: boolean): Record<string, unknown> {
+function projectReviewRun(record: HydratedReviewRunRecord, includeResult: boolean): Record<string, unknown> {
 	const result = record.result;
 	return {
 		runId: record.runId,
@@ -186,6 +188,7 @@ function projectReviewRun(record: ReviewRunRecord, includeResult: boolean): Reco
 		status: record.status,
 		startedAt: record.startedAt,
 		endedAt: record.endedAt,
+		...(record.acknowledgedAt === undefined ? {} : { acknowledgedAt: record.acknowledgedAt }),
 		target: {
 			description: record.target.description,
 			diffCommand: record.target.diffCommand,
@@ -483,7 +486,8 @@ export async function handleRpcCommand(
 		}
 
 		case "open_review_session": {
-			const record = getReviewRun(session.sessionManager, command.runId);
+			const sourceSessionManager = session.sessionManager;
+			const record = getReviewRun(sourceSessionManager, command.runId);
 			if (!record?.result)
 				return createRpcErrorResponse(
 					id,
@@ -501,12 +505,21 @@ export async function handleRpcCommand(
 				findings: record.result.findings.filter((finding) => selectedIds.has(finding.id)),
 			};
 			const seedMessage = createReviewSeedMessage(record.target, { parsed: selectedResult });
+			let targetSessionManager: SessionManager | undefined;
+			let acknowledgedAt: number | undefined;
 			const result = await runSessionNewHostAction(context.createHostActionContext(), {
 				setup: async (sessionManager) => {
+					targetSessionManager = sessionManager;
 					appendReviewRun(sessionManager, record);
 				},
 				withSession: async (sessionContext) => {
 					await sessionContext.sendMessage(seedMessage);
+					if (!targetSessionManager) throw new Error("Review session was not initialized");
+					acknowledgedAt = acknowledgeReviewRun(
+						targetSessionManager,
+						record.runId,
+						record.acknowledgedAt ?? Date.now(),
+					).acknowledgedAt;
 				},
 			});
 			if (!result.cancelled && !result.seeded) {
@@ -516,7 +529,26 @@ export async function handleRpcCommand(
 					`Review session was opened without findings; the durable run remains available: ${command.runId}`,
 				);
 			}
+			if (result.seeded && command.findingIds === undefined) {
+				if (acknowledgedAt === undefined) throw new Error("Review session was seeded without acknowledgment");
+				const sourceSessionFile = sourceSessionManager.getSessionFile();
+				const acknowledgmentManager = sourceSessionFile
+					? SessionManager.open(sourceSessionFile, sourceSessionManager.getSessionDir())
+					: sourceSessionManager;
+				acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
+				await acknowledgmentManager.flush();
+				if (sourceSessionFile) sourceSessionManager.setSessionFile(sourceSessionFile);
+			}
 			return createRpcSuccessResponse(id, "open_review_session", { cancelled: result.cancelled });
+		}
+
+		case "acknowledge_review": {
+			const acknowledgment = acknowledgeReviewRun(session.sessionManager, command.runId);
+			await session.sessionManager.flush();
+			return createRpcSuccessResponse(id, "acknowledge_review", {
+				runId: acknowledgment.runId,
+				acknowledgedAt: acknowledgment.acknowledgedAt,
+			});
 		}
 
 		case "record_review_finding_outcome": {

@@ -5,15 +5,18 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ParsedReview, ReviewFinding } from "../src/core/review-report.ts";
 import type { ReviewSnapshot } from "../src/core/review-snapshot.ts";
 import {
+	acknowledgeReviewRun,
 	appendReviewFindingTransition,
 	appendReviewPublication,
 	appendReviewRun,
 	appendReviewRunDurably,
 	createReviewRunRecord,
 	exportReviewFeedback,
+	getReviewRun,
 	listReviewRuns,
 	MAX_REVIEW_STATE_RECORD_BYTES,
 	planIncrementalReview,
+	REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE,
 	type ReviewRunRecord,
 	reconcileFindingIdentities,
 } from "../src/core/review-state.ts";
@@ -256,6 +259,56 @@ describe("durable review state", () => {
 		if (!file) throw new Error("Expected a persisted session file");
 		const reopened = SessionManager.open(file);
 		expect(listReviewRuns(reopened).runs).toMatchObject([{ runId: "run-before-prompt", status: "completed" }]);
+	});
+
+	it("persists branch-local review acknowledgment idempotently and ignores malformed entries", async () => {
+		const root = join(tmpdir(), `volt-review-ack-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(root, { recursive: true });
+		directories.push(root);
+		const manager = SessionManager.create(root, join(root, "sessions"));
+		await appendReviewRunDurably(manager, record("run-acknowledged", 1));
+		const branchPoint = manager.appendCustomEntry("test.branch-point", { value: true });
+		manager.appendCustomEntry(REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE, {
+			schemaVersion: 1,
+			runId: "run-acknowledged",
+			acknowledgedAt: "not-a-number",
+		});
+		expect(getReviewRun(manager, "run-acknowledged")?.acknowledgedAt).toBeUndefined();
+
+		expect(acknowledgeReviewRun(manager, "run-acknowledged", 123)).toEqual({
+			schemaVersion: 1,
+			runId: "run-acknowledged",
+			acknowledgedAt: 123,
+		});
+		expect(acknowledgeReviewRun(manager, "run-acknowledged", 456).acknowledgedAt).toBe(123);
+		expect(
+			manager
+				.getBranch()
+				.filter(
+					(entry) =>
+						entry.type === "custom" &&
+						entry.customType === REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE &&
+						typeof (entry.data as { acknowledgedAt?: unknown } | undefined)?.acknowledgedAt === "number",
+				).length,
+		).toBe(1);
+		await manager.flush();
+
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Expected a persisted session file");
+		const reopened = SessionManager.open(file);
+		expect(getReviewRun(reopened, "run-acknowledged")).toMatchObject({
+			runId: "run-acknowledged",
+			acknowledgedAt: 123,
+			result: { findings: [{ id: "finding-1" }] },
+		});
+
+		const copied = SessionManager.inMemory("/tmp/review-ack-copy");
+		appendReviewRun(copied, getReviewRun(reopened, "run-acknowledged")!);
+		expect(getReviewRun(copied, "run-acknowledged")?.acknowledgedAt).toBeUndefined();
+
+		manager.branch(branchPoint);
+		expect(getReviewRun(manager, "run-acknowledged")?.acknowledgedAt).toBeUndefined();
+		expect(() => acknowledgeReviewRun(manager, "missing", 789)).toThrow("Unknown durable review run");
 	});
 
 	it("survives session-manager restart and paginates with opaque cursors", async () => {

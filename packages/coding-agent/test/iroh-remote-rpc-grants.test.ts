@@ -121,7 +121,7 @@ describe("Iroh remote RPC grants", () => {
 	it("admits review lifecycle commands as conversation controls while keeping feedback export local-only", () => {
 		const controlGrant = createIrohRemotePresetAccess("coding").rpcGrant;
 		const observeOnlyGrant = createIrohRemoteExplicitAccess([], ["conversation.observe.v1"]).rpcGrant;
-		for (const type of ["record_review_finding_outcome", "rerun_review", "publish_review"]) {
+		for (const type of ["acknowledge_review", "record_review_finding_outcome", "rerun_review", "publish_review"]) {
 			expect(IROH_REMOTE_RPC_PASSTHROUGH_TYPES.has(type)).toBe(true);
 			expect(getIrohRemoteRpcCommandCapabilities({ type })).toEqual(["conversation.control.v1"]);
 			expect(getIrohRemoteRpcFilterResult(JSON.stringify({ id: `${type}-allowed`, type }), controlGrant)).toEqual({
