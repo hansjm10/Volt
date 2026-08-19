@@ -116,7 +116,7 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn install_test_operation_hook(hook: impl FnOnce(&str) + 'static) {
     TEST_OPERATION_HOOK.with(|slot| {
         assert!(slot.replace(Some(Box::new(hook))).is_none());

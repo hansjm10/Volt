@@ -14,6 +14,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -172,7 +173,7 @@ function verifyAddon(addonPath, manifest) {
 	if (addon.workspaceFsSourceFingerprint() !== manifest.sourceFingerprint) {
 		fail(`Source fingerprint mismatch for ${addonPath}`);
 	}
-	const fixture = join(crate, "target", `smoke-${process.pid}-${Date.now()}`);
+	const fixture = join(tmpdir(), `volt-workspace-fs-smoke-${process.pid}-${Date.now()}`);
 	mkdirSync(fixture, { recursive: true });
 	try {
 		const workspace = new addon.WorkspaceRoot(resolve(fixture));
