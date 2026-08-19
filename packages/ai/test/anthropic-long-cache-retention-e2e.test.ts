@@ -72,9 +72,10 @@ const probeCases = selectOneCasePerProvider(anthropicMessagesCases);
 function withLongCacheRetention(model: Model<"anthropic-messages">): Model<"anthropic-messages"> {
 	return {
 		...model,
-		compat: {
-			...model.compat,
-			supportsLongCacheRetention: true,
+		promptCache: {
+			modes: ["explicit"],
+			retention: { short: { ttlSeconds: 300 }, long: { ttlSeconds: 3_600 } },
+			refreshesOnHit: true,
 		},
 	};
 }

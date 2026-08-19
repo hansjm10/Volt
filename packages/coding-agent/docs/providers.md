@@ -190,12 +190,16 @@ Also supports ECS task roles (`AWS_CONTAINER_CREDENTIALS_*`) and IRSA (`AWS_WEB_
 volt --provider amazon-bedrock --model us.anthropic.claude-sonnet-4-20250514-v1:0
 ```
 
-Prompt caching is enabled automatically for Claude models whose ID contains a recognizable model name (base models and system-defined inference profiles). For application inference profiles (whose ARNs don't contain the model name), set `AWS_BEDROCK_FORCE_CACHE=1` to enable cache points:
+Prompt caching follows the generated policy for each Bedrock model ID, including regional inference-profile IDs. Volt sends the 1-hour TTL only for models whose AWS model card documents it; other cache-capable models use the 5-minute tier.
+
+For application inference profiles whose ARN cannot be matched to generated metadata, set `AWS_BEDROCK_FORCE_CACHE=1` to force short cache points:
 
 ```bash
 export AWS_BEDROCK_FORCE_CACHE=1
 volt --provider amazon-bedrock --model arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123
 ```
+
+The force flag never authorizes the 1-hour TTL. To declare verified long retention for a custom inference profile, add model-level `promptCache.retention.long` metadata in `models.json`.
 
 If you are connecting to a Bedrock API proxy, the following environment variables can be used:
 

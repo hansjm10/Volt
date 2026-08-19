@@ -725,6 +725,16 @@ interface ProviderModelConfig {
   /** Maximum output tokens. */
   maxTokens: number;
 
+  /** Prompt-cache capabilities for this exact provider/API/model route. */
+  promptCache?: {
+    modes: ("implicit" | "explicit")[];
+    retention: {
+      short: { ttlSeconds?: number };
+      long?: { ttlSeconds?: number };
+    };
+    refreshesOnHit?: boolean;
+  };
+
   /** Custom headers for this specific model. */
   headers?: Record<string, string>;
 
@@ -745,7 +755,6 @@ interface ProviderModelConfig {
 
     // anthropic-messages
     supportsEagerToolInputStreaming?: boolean;
-    supportsLongCacheRetention?: boolean;
     sendSessionAffinityHeaders?: boolean;
     supportsCacheControlOnTools?: boolean;
     forceAdaptiveThinking?: boolean;
@@ -756,3 +765,5 @@ interface ProviderModelConfig {
 
 `openrouter` sends `reasoning: { effort }`. `deepseek` sends `thinking: { type: "enabled" | "disabled" }` and `reasoning_effort` when enabled. `together` sends `reasoning: { enabled }` and also `reasoning_effort` when `supportsReasoningEffort` is enabled. `qwen` is for DashScope-style top-level `enable_thinking`. Use `qwen-chat-template` for local Qwen-compatible servers that read `chat_template_kwargs.enable_thinking`.
 `cacheControlFormat: "anthropic"` applies Anthropic-style `cache_control` markers to the system prompt, last tool definition, and last user/assistant text content.
+
+`promptCache` can also be set as a provider default. Model metadata overrides that default; provider and model overrides may use `promptCache: null` to clear inherited built-in cache behavior for an incompatible proxy. The `long` request preference is available only when `retention.long` exists, otherwise Volt falls back to short retention. Missing metadata suppresses controllable cache hints.

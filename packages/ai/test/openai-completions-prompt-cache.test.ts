@@ -80,7 +80,7 @@ describe("openai-completions prompt caching", () => {
 	});
 
 	function createModel(overrides: Partial<Model<"openai-completions">> = {}): Model<"openai-completions"> {
-		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini");
+		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4.1");
 		return {
 			...(baseModel as Omit<Model<"openai-completions">, "api">),
 			api: "openai-completions",
@@ -142,7 +142,7 @@ describe("openai-completions prompt caching", () => {
 	it("omits prompt cache fields for non-OpenAI base URLs without compatible long retention", async () => {
 		const model = createModel({
 			baseUrl: "https://proxy.example.com/v1",
-			compat: { supportsLongCacheRetention: false },
+			promptCache: undefined,
 		});
 		const { payload } = await captureRequest({ cacheRetention: "long", sessionId: "session-proxy" }, model);
 
