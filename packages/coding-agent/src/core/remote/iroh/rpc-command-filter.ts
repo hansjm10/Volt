@@ -54,6 +54,7 @@ export const IROH_REMOTE_RPC_PASSTHROUGH_TYPES = new Set([
 	"get_review_result",
 	"list_review_workflows",
 	"open_review_session",
+	"acknowledge_review",
 	"record_review_finding_outcome",
 	"rerun_review",
 	"publish_review",

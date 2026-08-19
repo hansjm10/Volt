@@ -116,6 +116,7 @@ describe("conversation mutation authority", () => {
 			{ id: "missing-model", type: "set_model", provider: "anthropic", modelId: "model" },
 			{ id: "missing-thinking", type: "set_thinking_level", level: "low" },
 			{ id: "missing-action", type: "invoke_ui_action", action: "session.new" },
+			{ id: "missing-review-ack", type: "acknowledge_review", runId: "review:test" },
 		];
 		for (const command of missingAuthorityCommands) {
 			recv.pushLine(JSON.stringify(command));

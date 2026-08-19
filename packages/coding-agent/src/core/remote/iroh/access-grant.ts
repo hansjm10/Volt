@@ -176,6 +176,7 @@ const CONTROL_COMMANDS = new Set([
 	"invoke_ui_action",
 	"cancel_workflow",
 	"open_review_session",
+	"acknowledge_review",
 	"record_review_finding_outcome",
 	"rerun_review",
 	"publish_review",

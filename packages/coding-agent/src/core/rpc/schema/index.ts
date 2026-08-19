@@ -177,6 +177,7 @@ import {
 import {
 	RpcProjectionCollectionTruncationSchema,
 	RpcProjectionTruncationSchema,
+	RpcReviewAcknowledgmentResponseSchema,
 	RpcReviewCompletionStatusSchema,
 	RpcReviewCorrectnessSchema,
 	RpcReviewCoverageSchema,
@@ -400,6 +401,7 @@ const SHARED_SCHEMAS: Record<string, TSchema> = {
 	RpcProjectionCollectionTruncation: RpcProjectionCollectionTruncationSchema,
 	RpcWorkflowEvent: RpcWorkflowEventSchema,
 	RpcWorkflowToolEvent: RpcWorkflowToolEventSchema,
+	RpcReviewAcknowledgmentResponse: RpcReviewAcknowledgmentResponseSchema,
 	RpcReviewWorkflowLifecycleStatus: RpcReviewWorkflowLifecycleStatusSchema,
 	RpcReviewRunStatus: RpcReviewRunStatusSchema,
 	RpcReviewCompletionStatus: RpcReviewCompletionStatusSchema,

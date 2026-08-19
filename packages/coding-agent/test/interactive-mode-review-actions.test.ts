@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import { REVIEW_FIX_ACTION_ID } from "../src/core/host-actions.ts";
 import type { ParsedReview } from "../src/core/review-report.ts";
-import { appendReviewRun, type ReviewRunRecord } from "../src/core/review-state.ts";
+import { acknowledgeReviewRun, appendReviewRun, getReviewRun, type ReviewRunRecord } from "../src/core/review-state.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 
@@ -79,9 +79,15 @@ function durableRecord(): ReviewRunRecord {
 }
 
 describe("InteractiveMode durable review actions", () => {
-	test.each(["", " \t "])("seeds all durable findings for blank findingIds %j", async (findingIds) => {
+	test.each([
+		{ findingIds: "", acknowledgedAt: undefined },
+		{ findingIds: " \t ", acknowledgedAt: 123 },
+	])("seeds all durable findings and preserves acknowledgment for blank findingIds $findingIds", async (testCase) => {
 		const manager = SessionManager.inMemory("/workspace");
 		appendReviewRun(manager, durableRecord());
+		if (testCase.acknowledgedAt !== undefined) {
+			acknowledgeReviewRun(manager, "review:test", testCase.acknowledgedAt);
+		}
 		const replacementManager = SessionManager.inMemory("/workspace");
 		const seedMessages: object[] = [];
 		const fakeThis = {
@@ -112,12 +118,16 @@ describe("InteractiveMode durable review actions", () => {
 		await expect(
 			runInteractiveReviewLifecycleAction.call(fakeThis, REVIEW_FIX_ACTION_ID, {
 				runId: "review:test",
-				findingIds,
+				findingIds: testCase.findingIds,
 			}),
 		).resolves.toMatchObject({ status: "completed" });
 		expect(seedMessages).toHaveLength(1);
 		const seedMessage = seedMessages[0] as { details?: { findings?: Array<{ id: string }> } };
 		expect(seedMessage.details?.findings?.map((finding) => finding.id)).toEqual(["finding-1", "finding-2"]);
+		const sourceAcknowledgedAt = getReviewRun(manager, "review:test")?.acknowledgedAt;
+		expect(sourceAcknowledgedAt).toEqual(expect.any(Number));
+		if (testCase.acknowledgedAt !== undefined) expect(sourceAcknowledgedAt).toBe(testCase.acknowledgedAt);
+		expect(getReviewRun(replacementManager, "review:test")?.acknowledgedAt).toBe(sourceAcknowledgedAt);
 		expect(fakeThis.renderCurrentSessionState).toHaveBeenCalledOnce();
 	});
 });

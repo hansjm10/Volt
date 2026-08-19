@@ -161,6 +161,11 @@ const invalidPayloadCases: Array<{ name: string; payload: unknown; error: string
 		error: 'Invalid RPC command payload: "findingIds[0]" exceeds the 256-byte UTF-8 limit',
 	},
 	{
+		name: "rejects acknowledgment review ids beyond the identifier byte bound",
+		payload: { type: "acknowledge_review", runId: "r".repeat(300) },
+		error: 'Invalid RPC command payload: "runId" exceeds the 256-byte UTF-8 limit',
+	},
+	{
 		name: "rejects review finding ids beyond the identifier byte bound",
 		payload: {
 			type: "record_review_finding_outcome",
@@ -323,6 +328,7 @@ describe("RPC command payload validation", () => {
 		expect(
 			validateRpcCommandPayload({ type: "open_review_session", runId: "review:one", findingIds: ["finding:one"] }),
 		).toBeUndefined();
+		expect(validateRpcCommandPayload({ type: "acknowledge_review", runId: "review:one" })).toBeUndefined();
 		expect(
 			validateRpcCommandPayload({
 				type: "record_review_finding_outcome",

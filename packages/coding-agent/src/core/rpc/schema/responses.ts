@@ -27,7 +27,11 @@ import {
 } from "./mcp.ts";
 import { RpcPlanExecutionResultSchema, RpcPlanningStateSchema } from "./planning.ts";
 import { RpcConversationIdentifierSchema, RpcThinkingLevelSchema } from "./primitives.ts";
-import { RpcReviewWorkflowListResponseSchema, RpcReviewWorkflowResultResponseSchema } from "./projections.ts";
+import {
+	RpcReviewAcknowledgmentResponseSchema,
+	RpcReviewWorkflowListResponseSchema,
+	RpcReviewWorkflowResultResponseSchema,
+} from "./projections.ts";
 import {
 	RpcCatalogModelSchema,
 	RpcKeepAwakeStatusSchema,
@@ -320,6 +324,7 @@ export const RPC_RESPONSE_SCHEMAS = {
 	get_review_result: dataResponse("get_review_result", RpcReviewWorkflowResultResponseSchema),
 	list_review_workflows: dataResponse("list_review_workflows", RpcReviewWorkflowListResponseSchema),
 	open_review_session: dataResponse("open_review_session", cancelledDataSchema),
+	acknowledge_review: dataResponse("acknowledge_review", RpcReviewAcknowledgmentResponseSchema),
 	record_review_finding_outcome: dataResponse(
 		"record_review_finding_outcome",
 		Type.Object(
