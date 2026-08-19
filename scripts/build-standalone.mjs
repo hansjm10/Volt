@@ -17,7 +17,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { get } from "node:https";
-import { isBuiltin } from "node:module";
+import { createRequire, isBuiltin } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -30,9 +30,11 @@ const ALLOWED_EXTERNAL_PACKAGES = new Set(["bufferutil", "supports-color", "utf-
 const OUTPUT_SENTINEL = ".volt-release-output-v1";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const codingAgentRoot = join(repoRoot, "packages", "coding-agent");
+const workspaceFsRoot = join(codingAgentRoot, "native", "workspace-fs");
 const defaultOutputDirectory = join(codingAgentRoot, "binaries");
 const runtimeConfigPath = join(repoRoot, "compliance", "standalone-runtime.json");
 const pythonCommand = process.env.VOLT_PYTHON || (process.platform === "win32" ? "python" : "python3");
+const cjsRequire = createRequire(import.meta.url);
 
 function usage() {
 	console.log(`Usage: node scripts/build-standalone.mjs [options]
@@ -44,6 +46,7 @@ Options:
   --out <directory>            Release output directory
   --node-archive <file>        Use a local official Node archive instead of downloading it
   --source-date-epoch <epoch>  Archive timestamp (defaults to SOURCE_DATE_EPOCH or HEAD)
+  --stage-assets-only          Stage and smoke-test release assets without building an archive
   --help                       Show this help`);
 }
 
@@ -53,6 +56,10 @@ function parseArgs(argv) {
 		const argument = argv[index];
 		if (argument === "--help") {
 			options.help = true;
+			continue;
+		}
+		if (argument === "--stage-assets-only") {
+			options.stage_assets_only = true;
 			continue;
 		}
 		if (!["--target", "--out", "--node-archive", "--source-date-epoch"].includes(argument)) {
@@ -198,6 +205,133 @@ function copyTrackedTree(sourceRoot, destinationRoot, excludedPaths = []) {
 	}
 }
 
+function workspaceFsTarget(target) {
+	if (target.startsWith("darwin-")) return target;
+	if (target.startsWith("linux-")) return `${target}-gnu`;
+	if (target.startsWith("windows-")) return `win32-${target.slice("windows-".length)}-msvc`;
+	throw new Error(`Unsupported standalone workspace-fs target: ${target}`);
+}
+
+function collectRegularFiles(directory) {
+	const files = [];
+	const visit = (current) => {
+		for (const entry of readdirSync(current, { withFileTypes: true })) {
+			const path = join(current, entry.name);
+			const metadata = lstatSync(path);
+			if (metadata.isSymbolicLink()) throw new Error(`Native release assets must not contain symlinks: ${path}`);
+			if (entry.isDirectory()) visit(path);
+			else if (entry.isFile()) files.push(relative(directory, path).replaceAll("\\", "/"));
+			else throw new Error(`Native release asset is not a regular file: ${path}`);
+		}
+	};
+	visit(directory);
+	return files.sort();
+}
+
+function copyWorkspaceFsAssets(stageDirectory, target) {
+	const nativeTarget = workspaceFsTarget(target);
+	const sourcePrebuilds = join(workspaceFsRoot, "prebuilds");
+	const sourceManifest = join(sourcePrebuilds, "manifest.json");
+	assertRequiredFile(sourceManifest);
+	const manifest = JSON.parse(readFileSync(sourceManifest, "utf8"));
+	if (
+		manifest.schemaVersion !== 1 ||
+		typeof manifest.apiVersion !== "string" ||
+		!/^[0-9a-f]{64}$/.test(manifest.sourceFingerprint) ||
+		!Array.isArray(manifest.artifacts)
+	) {
+		throw new Error("Workspace filesystem native manifest is malformed");
+	}
+	const matches = manifest.artifacts.filter((artifact) => artifact.target === nativeTarget);
+	if (matches.length !== 1) throw new Error(`Workspace filesystem manifest must contain exactly one ${nativeTarget} artifact`);
+	const artifact = matches[0];
+	if (
+		artifact.path !== `${nativeTarget}/workspace-fs.node` ||
+		!/^sha256:[0-9a-f]{64}$/.test(artifact.sha256)
+	) {
+		throw new Error(`Workspace filesystem artifact record is malformed for ${nativeTarget}`);
+	}
+	const sourceAddon = join(sourcePrebuilds, ...artifact.path.split("/"));
+	assertRequiredFile(sourceAddon);
+	const sourceBytes = readFileSync(sourceAddon);
+	const digest = `sha256:${createHash("sha256").update(sourceBytes).digest("hex")}`;
+	if (digest !== artifact.sha256) throw new Error(`Workspace filesystem addon checksum mismatch for ${nativeTarget}`);
+
+	const destinationPrebuilds = join(stageDirectory, "native", "workspace-fs", "prebuilds");
+	const destinationAddon = join(destinationPrebuilds, ...artifact.path.split("/"));
+	mkdirSync(dirname(destinationAddon), { recursive: true, mode: 0o755 });
+	copyFileSync(sourceAddon, destinationAddon);
+	chmodSync(destinationAddon, 0o644);
+	writeFileSync(
+		join(destinationPrebuilds, "manifest.json"),
+		`${JSON.stringify({ ...manifest, artifacts: [artifact] }, null, 2)}\n`,
+		{ mode: 0o644 },
+	);
+
+	const sourceLicenses = join(workspaceFsRoot, "licenses");
+	const inventoryPath = join(sourceLicenses, "inventory.json");
+	assertRequiredFile(inventoryPath);
+	const inventory = JSON.parse(readFileSync(inventoryPath, "utf8"));
+	if (
+		inventory.schemaVersion !== 1 ||
+		inventory.sourceFingerprint !== manifest.sourceFingerprint ||
+		!Array.isArray(inventory.packages)
+	) {
+		throw new Error("Workspace filesystem Rust license inventory is malformed or stale");
+	}
+	const expectedLicenseFiles = new Set(["inventory.json"]);
+	for (const dependency of inventory.packages) {
+		if (!Array.isArray(dependency.licenseFiles) || dependency.licenseFiles.length === 0) {
+			throw new Error(`Workspace filesystem Rust license record has no texts: ${dependency.name}@${dependency.version}`);
+		}
+		for (const license of dependency.licenseFiles) {
+			if (typeof license.path !== "string" || !/^[0-9a-f]{64}$/.test(license.sha256)) {
+				throw new Error(`Workspace filesystem Rust license record is malformed: ${dependency.name}@${dependency.version}`);
+			}
+			const source = join(sourceLicenses, ...license.path.split("/"));
+			const licenseBytes = readFileSync(source);
+			if (createHash("sha256").update(licenseBytes).digest("hex") !== license.sha256) {
+				throw new Error(`Workspace filesystem Rust license checksum mismatch: ${license.path}`);
+			}
+			expectedLicenseFiles.add(license.path);
+		}
+	}
+	const actualLicenseFiles = collectRegularFiles(sourceLicenses);
+	if (JSON.stringify(actualLicenseFiles) !== JSON.stringify([...expectedLicenseFiles].sort())) {
+		throw new Error("Workspace filesystem Rust license tree does not exactly match inventory.json");
+	}
+	const destinationLicenses = join(stageDirectory, "LICENSES", "workspace-fs-rust");
+	for (const licensePath of actualLicenseFiles) {
+		const destination = join(destinationLicenses, ...licensePath.split("/"));
+		mkdirSync(dirname(destination), { recursive: true, mode: 0o755 });
+		copyFileSync(join(sourceLicenses, ...licensePath.split("/")), destination);
+	}
+}
+
+function assertStagedWorkspaceFsAddon(stageDirectory, target) {
+	const nativeTarget = workspaceFsTarget(target);
+	const prebuilds = join(stageDirectory, "native", "workspace-fs", "prebuilds");
+	const manifest = JSON.parse(readFileSync(join(prebuilds, "manifest.json"), "utf8"));
+	if (manifest.artifacts.length !== 1 || manifest.artifacts[0].target !== nativeTarget) {
+		throw new Error(`Standalone workspace filesystem manifest does not contain only ${nativeTarget}`);
+	}
+	const addonPath = join(prebuilds, ...manifest.artifacts[0].path.split("/"));
+	const addon = cjsRequire(addonPath);
+	const exports = Object.keys(addon).sort();
+	const expectedExports = ["WorkspaceRoot", "workspaceFsApiVersion", "workspaceFsSourceFingerprint"];
+	if (JSON.stringify(exports) !== JSON.stringify(expectedExports)) {
+		throw new Error(`Standalone workspace filesystem addon exports are invalid: ${exports.join(", ")}`);
+	}
+	if (
+		addon.workspaceFsApiVersion() !== manifest.apiVersion ||
+		addon.workspaceFsSourceFingerprint() !== manifest.sourceFingerprint
+	) {
+		throw new Error("Standalone workspace filesystem addon fingerprint does not match its manifest");
+	}
+	const root = new addon.WorkspaceRoot(stageDirectory);
+	root.close();
+}
+
 function copyReleaseAssets(stageDirectory, target) {
 	for (const name of [
 		"package.json",
@@ -282,6 +416,7 @@ function copyReleaseAssets(stageDirectory, target) {
 		mkdirSync(destination, { recursive: true, mode: 0o755 });
 		copyFileSync(helper, join(destination, "win32-console-mode.node"));
 	}
+	copyWorkspaceFsAssets(stageDirectory, target);
 }
 
 function assertNoSymlinks(directory) {
@@ -323,11 +458,16 @@ function assertExternalImports(metafile) {
 }
 
 function assertStagedBinarySidecars(stageDirectory, target) {
-	const expectedNativeSidecar = target.startsWith("darwin-")
-		? `native/darwin/prebuilds/${target}/darwin-modifiers.node`
-		: target.startsWith("windows-")
-			? `native/win32/prebuilds/${target === "windows-arm64" ? "win32-arm64" : "win32-x64"}/win32-console-mode.node`
-			: undefined;
+	const expectedNativeSidecars = [
+		`native/workspace-fs/prebuilds/${workspaceFsTarget(target)}/workspace-fs.node`,
+	];
+	if (target.startsWith("darwin-")) {
+		expectedNativeSidecars.push(`native/darwin/prebuilds/${target}/darwin-modifiers.node`);
+	} else if (target.startsWith("windows-")) {
+		expectedNativeSidecars.push(
+			`native/win32/prebuilds/${target === "windows-arm64" ? "win32-arm64" : "win32-x64"}/win32-console-mode.node`,
+		);
+	}
 	const nativeSidecars = [];
 	const wasmFiles = [];
 	const unexpectedBinaryFiles = [];
@@ -351,10 +491,10 @@ function assertStagedBinarySidecars(stageDirectory, target) {
 	if (unexpectedBinaryFiles.length > 0) {
 		throw new Error(`Standalone staging contains unexpected binary files:\n${unexpectedBinaryFiles.sort().join("\n")}`);
 	}
-	const expected = expectedNativeSidecar ? [expectedNativeSidecar] : [];
+	const expected = expectedNativeSidecars.sort();
 	if (JSON.stringify(nativeSidecars.sort()) !== JSON.stringify(expected)) {
 		throw new Error(
-			`Standalone native sidecars do not match the target allowlist. Expected ${expected.join(", ") || "none"}; found ${nativeSidecars.join(", ") || "none"}`,
+			`Standalone native sidecars do not match the target allowlist. Expected ${expected.join(", ")}; found ${nativeSidecars.join(", ") || "none"}`,
 		);
 	}
 }
@@ -529,6 +669,14 @@ async function build() {
 
 	try {
 		copyReleaseAssets(stageDirectory, target);
+		assertStagedWorkspaceFsAddon(stageDirectory, target);
+		if (options.stage_assets_only) {
+			assertNoSymlinks(stageDirectory);
+			assertStagedBinarySidecars(stageDirectory, target);
+			writeStagedFileManifest(stageDirectory);
+			console.log(`Staged and smoke-tested ${stageDirectory}`);
+			return;
+		}
 		const { bundlePath, metafilePath } = await bundleStandalone(scratchDirectory, stageDirectory);
 		const { executable: nodeExecutable, archiveSha256 } = await extractNodeRuntime(
 			runtime,

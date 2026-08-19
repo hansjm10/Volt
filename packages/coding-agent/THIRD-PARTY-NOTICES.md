@@ -35,6 +35,15 @@ license file. The small number of packages whose npm tarballs omit their
 repository-level license use checksum-pinned, version- or commit-specific
 authoritative copies declared in `compliance/npm-license-overrides.json`.
 
+The workspace filesystem foundation includes a Rust Node-API addon. Its
+checksum-pinned artifact manifest is `native/workspace-fs/prebuilds/manifest.json`.
+The generated `native/workspace-fs/licenses/inventory.json` records the exact
+Cargo dependency versions, declared licenses, selected licenses, source/Cargo
+fingerprint, and checksums of every redistributed Rust license text. The npm
+package carries all eight supported prebuilds and this complete license tree;
+each standalone archive carries only its matching addon plus the same native
+license inventory and texts under `LICENSES/workspace-fs-rust/`.
+
 The standalone archive also carries Volt's MIT license and this notice. The
 optional native `@number0/iroh` adapter is intentionally not bundled, so a
 standalone executable cannot host `volt daemon` or provide remote/iOS access.
