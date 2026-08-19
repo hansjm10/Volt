@@ -168,6 +168,28 @@ describe("WorkspaceEdit applier", () => {
 		expect(await readFile(outsideFile, "utf-8")).toBe("secret");
 	});
 
+	it("edits file symlinks whose targets remain inside the workspace", async () => {
+		const root = await createTempDir();
+		const target = join(root, "target.foo");
+		const alias = join(root, "alias.foo");
+		await writeFile(target, "old", "utf-8");
+		try {
+			await symlink(target, alias, "file");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EPERM") return;
+			throw error;
+		}
+
+		const result = await applyWorkspaceEdit({
+			rootDir: root,
+			edit: replaceFirst(uri(alias), "old", "new"),
+			snapshots: [],
+		});
+
+		expect(result.applied).toBe(true);
+		expect(await readFile(target, "utf-8")).toBe("new");
+	});
+
 	it("rejects dangling symlink traversal", async () => {
 		const root = await createTempDir();
 		const dangling = join(root, "dangling.foo");
@@ -419,6 +441,30 @@ describe("WorkspaceEdit applier", () => {
 		expect(await readFile(destination, "utf-8")).toBe("source");
 	});
 
+	it("restores an overwrite destination when the source rename fails", async () => {
+		const root = await createTempDir();
+		const destination = join(root, "destination");
+		const source = join(destination, "source.foo");
+		const existing = join(destination, "existing.foo");
+		await mkdir(destination);
+		await writeFile(source, "source", "utf-8");
+		await writeFile(existing, "destination", "utf-8");
+
+		const result = await applyWorkspaceEdit({
+			rootDir: root,
+			edit: {
+				documentChanges: [
+					{ kind: "rename", oldUri: uri(source), newUri: uri(destination), options: { overwrite: true } },
+				],
+			},
+			snapshots: [],
+		});
+
+		expect(result).toMatchObject({ applied: false, failedChange: 0, changes: [] });
+		expect(await readFile(source, "utf-8")).toBe("source");
+		expect(await readFile(existing, "utf-8")).toBe("destination");
+	});
+
 	it("honors delete recursive and ignoreIfNotExists options", async () => {
 		const root = await createTempDir();
 		const missing = join(root, "missing");
@@ -529,7 +575,7 @@ describe("LSP WorkspaceEdit integration", () => {
 		}
 	});
 
-	it("rejects a delayed stale command edit and isolates concurrent command summaries", async () => {
+	it("advances sequential command edits, rejects stale ones, and isolates concurrent summaries", async () => {
 		const root = await createTempDir();
 		const manager = new LspManager({
 			cwd: root,
@@ -554,6 +600,13 @@ describe("LSP WorkspaceEdit integration", () => {
 			const delayedResult = await delayedFix;
 			expect(delayedResult).toContain("no workspace edits reported");
 			expect(await readFile(delayedPath, "utf-8")).toBe("changed by write tool");
+
+			const sequentialPath = join(root, "sequential.foo");
+			await writeFile(sequentialPath, "SEQUENTIAL_CMDFIX", "utf-8");
+			const sequentialResult = await manager.codeFix(sequentialPath, { line: 1 });
+			expect(sequentialResult).toContain('Applied "Fix via sequential command edits"');
+			expect(sequentialResult.match(/sequential\.foo \(1 edit\)/g)).toHaveLength(2);
+			expect(await readFile(sequentialPath, "utf-8")).toBe("FIXED");
 
 			const firstPath = join(root, "first.foo");
 			const secondPath = join(root, "second.foo");

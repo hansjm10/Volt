@@ -1,4 +1,4 @@
-import { lstat, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { withFileMutationQueues } from "../tools/file-mutation-queue.ts";
@@ -145,7 +145,7 @@ async function loadEntry(path: string): Promise<VirtualEntry> {
 }
 
 async function readEntryContent(entry: VirtualEntry, operationIndex: number, path: string): Promise<string> {
-	if (!entry.exists || entry.kind !== "file") {
+	if (!entry.exists) {
 		throw new WorkspaceEditValidationError(operationIndex, `Cannot edit missing or non-file document: ${path}`);
 	}
 	if (entry.content !== undefined) {
@@ -153,6 +153,20 @@ async function readEntryContent(entry: VirtualEntry, operationIndex: number, pat
 	}
 	if (!entry.diskPath) {
 		throw new WorkspaceEditValidationError(operationIndex, `Cannot edit missing or non-file document: ${path}`);
+	}
+	if (entry.kind !== "file") {
+		let targetIsFile: boolean;
+		try {
+			targetIsFile = (await stat(entry.diskPath)).isFile();
+		} catch (error) {
+			throw new WorkspaceEditValidationError(
+				operationIndex,
+				`Could not inspect LSP workspace edit input ${path}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		if (!targetIsFile) {
+			throw new WorkspaceEditValidationError(operationIndex, `Cannot edit missing or non-file document: ${path}`);
+		}
 	}
 	try {
 		entry.content = await readFile(entry.diskPath, "utf-8");
@@ -318,9 +332,49 @@ function summarize(operation: NormalizedWorkspaceOperation, paths: readonly stri
 	return `deleted ${paths[0]}${suffix}`;
 }
 
+async function renameWithOverwrite(sourcePath: string, destinationPath: string, rootDir: string): Promise<void> {
+	try {
+		await rename(sourcePath, destinationPath);
+		return;
+	} catch (initialError) {
+		const backupParent = dirname(destinationPath);
+		if (!isPathInside(resolve(rootDir), resolve(backupParent))) {
+			throw initialError;
+		}
+		const backupDirectory = await mkdtemp(join(backupParent, ".volt-lsp-rename-"));
+		const backupPath = join(backupDirectory, "destination");
+		try {
+			await rename(destinationPath, backupPath);
+		} catch {
+			await rm(backupDirectory, { recursive: true, force: true }).catch(() => {});
+			throw initialError;
+		}
+
+		try {
+			await rename(sourcePath, destinationPath);
+		} catch (moveError) {
+			try {
+				await rename(backupPath, destinationPath);
+			} catch (restoreError) {
+				throw new AggregateError(
+					[moveError, restoreError],
+					`Failed to rename ${sourcePath} to ${destinationPath}; destination backup remains at ${backupPath}`,
+				);
+			}
+			await rm(backupDirectory, { recursive: true, force: true }).catch(() => {});
+			throw moveError;
+		}
+
+		// The replacement is complete. Cleanup must not turn it into an unreported
+		// failed mutation; if removal fails, retain the old destination as a backup.
+		await rm(backupDirectory, { recursive: true, force: true }).catch(() => {});
+	}
+}
+
 async function executeOperation(
 	operation: NormalizedWorkspaceOperation,
 	paths: readonly string[],
+	rootDir: string,
 ): Promise<{ change?: AppliedWorkspaceChange; ignored: boolean }> {
 	if (operation.kind === "edit") {
 		const content = await readFile(paths[0], "utf-8");
@@ -360,9 +414,10 @@ async function executeOperation(
 			return { ignored: true };
 		}
 		if (destinationExists && operation.options?.overwrite) {
-			await rm(paths[1], { recursive: true, force: true });
+			await renameWithOverwrite(paths[0], paths[1], rootDir);
+		} else {
+			await rename(paths[0], paths[1]);
 		}
-		await rename(paths[0], paths[1]);
 		let content: string | undefined;
 		try {
 			content = await readFile(paths[1], "utf-8");
@@ -439,7 +494,7 @@ export async function applyWorkspaceEdit(options: ApplyWorkspaceEditOptions): Pr
 		const changes: AppliedWorkspaceChange[] = [];
 		for (let index = 0; index < operations.length; index++) {
 			try {
-				const result = await executeOperation(operations[index], pathsByOperation[index]);
+				const result = await executeOperation(operations[index], pathsByOperation[index], options.rootDir);
 				lines.push(summarize(operations[index], pathsByOperation[index], result.ignored));
 				if (result.change) {
 					changes.push(result.change);

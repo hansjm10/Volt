@@ -554,7 +554,13 @@ function handle(message) {
 				},
 			});
 		}
-		if (text.includes("DELAYED_CMDFIX")) {
+		if (text.includes("SEQUENTIAL_CMDFIX")) {
+			actions.push({
+				title: "Fix via sequential command edits",
+				kind: "quickfix",
+				command: { title: "Fix via sequential command edits", command: "fake.sequentialFix", arguments: [uri] },
+			});
+		} else if (text.includes("DELAYED_CMDFIX")) {
 			actions.push({
 				title: "Fix via delayed command",
 				kind: "quickfix",
@@ -583,6 +589,21 @@ function handle(message) {
 			const edit = buildReplaceEdit(uri, documents.get(uri) ?? "", "CMDFIX", "FIXED");
 			serverRequest("workspace/applyEdit", { edit }, () => {
 				send({ jsonrpc: "2.0", id, result: null });
+			});
+			return;
+		}
+		if (params.command === "fake.sequentialFix") {
+			const uri = params.arguments[0];
+			const firstEdit = buildReplaceEdit(uri, documents.get(uri) ?? "", "SEQUENTIAL_CMDFIX", "SECOND_CMDFIX");
+			serverRequest("workspace/applyEdit", { edit: firstEdit }, (firstResponse) => {
+				if (!firstResponse.result?.applied) {
+					send({ jsonrpc: "2.0", id, result: null });
+					return;
+				}
+				const secondEdit = buildReplaceEdit(uri, documents.get(uri) ?? "", "SECOND_CMDFIX", "FIXED");
+				serverRequest("workspace/applyEdit", { edit: secondEdit }, () => {
+					send({ jsonrpc: "2.0", id, result: null });
+				});
 			});
 			return;
 		}

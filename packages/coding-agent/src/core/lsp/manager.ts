@@ -1180,6 +1180,9 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 				const context = this.commandApplyContexts.get(clientRef);
 				const snapshots = context?.snapshots ?? clientRef.captureWorkspaceEditSnapshots();
 				const result = await this.applyWorkspaceEdit(clientRef, edit as LspWorkspaceEdit, snapshots);
+				if (context && result.applied) {
+					context.snapshots = clientRef.captureWorkspaceEditSnapshots();
+				}
 				if (context && result.summary) {
 					context.summaries.push(result.summary);
 				}
