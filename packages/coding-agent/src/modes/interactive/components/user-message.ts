@@ -1,4 +1,13 @@
-import { type Component, Container, Markdown, type MarkdownTheme, Spacer } from "@hansjm10/volt-tui";
+import {
+	type Component,
+	Container,
+	Markdown,
+	type MarkdownTheme,
+	mapRenderFrameLines,
+	prefixRenderFrame,
+	type RenderFrame,
+	Spacer,
+} from "@hansjm10/volt-tui";
 import { getMarkdownTheme, theme } from "../../../core/theme/runtime.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -12,10 +21,9 @@ class UserMessageRail implements Component {
 		this.content = content;
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		if (width <= 2) return this.content.render(width);
-		const prefix = `${theme.fg("borderAccent", "│")} `;
-		return this.content.render(width - 2).map((line) => prefix + line);
+		return prefixRenderFrame(this.content.render(width - 2), `${theme.fg("borderAccent", "│")} `);
 	}
 
 	invalidate(): void {
@@ -46,14 +54,13 @@ export class UserMessageComponent extends Container {
 		);
 	}
 
-	override render(width: number): string[] {
-		const lines = super.render(width);
-		if (lines.length === 0) {
-			return lines;
-		}
-
-		lines[0] = OSC133_ZONE_START + lines[0];
-		lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
-		return lines;
+	override render(width: number): RenderFrame {
+		const frame = super.render(width);
+		if (frame.lines.length === 0) return frame;
+		return mapRenderFrameLines(frame, (line, row) => {
+			if (row === 0) return OSC133_ZONE_START + line;
+			if (row === frame.lines.length - 1) return OSC133_ZONE_END + OSC133_ZONE_FINAL + line;
+			return line;
+		});
 	}
 }

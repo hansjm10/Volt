@@ -107,7 +107,7 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		expect(stripAnsi(component.render(120).join("\n"))).toContain("custom call");
+		expect(stripAnsi(component.render(120).lines.join("\n"))).toContain("custom call");
 
 		component.updateResult(
 			{
@@ -118,7 +118,7 @@ describe("ToolExecutionComponent parity", () => {
 			false,
 		);
 
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("custom call");
 		expect(rendered).toContain("custom result");
 	});
@@ -152,10 +152,10 @@ describe("ToolExecutionComponent parity", () => {
 				},
 				false,
 			);
-			expect(component.render(120).join("\n")).not.toContain("\x1bP0;1;0q");
+			expect(component.render(120).lines.join("\n")).not.toContain("\x1bP0;1;0q");
 
 			await vi.waitFor(() => expect(renderRequests).toBeGreaterThan(0));
-			const rendered = component.render(120).join("\n");
+			const rendered = component.render(120).lines.join("\n");
 			expect(rendered).toContain("\x1bP0;1;0q");
 			expect(rendered).not.toContain("[image/gif]");
 		} finally {
@@ -193,14 +193,14 @@ describe("ToolExecutionComponent parity", () => {
 				},
 				false,
 			);
-			expect(component.render(120).join("\n")).not.toContain("\x1bP0;1;0q");
+			expect(component.render(120).lines.join("\n")).not.toContain("\x1bP0;1;0q");
 			expect(renderRequests).toBe(0);
 
 			setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
 			component.invalidate();
 
 			await vi.waitFor(() => expect(renderRequests).toBeGreaterThan(0));
-			const rendered = component.render(120).join("\n");
+			const rendered = component.render(120).lines.join("\n");
 			expect(rendered).toContain("\x1bP0;1;0q");
 			expect(rendered).not.toContain("[image/gif]");
 		} finally {
@@ -237,12 +237,12 @@ describe("ToolExecutionComponent parity", () => {
 			newConversion.resolve({ data: "new-png", mimeType: "image/png" });
 			await newConversion.promise;
 			await Promise.resolve();
-			expect(component.render(80).join("\n")).toContain("new-png");
+			expect(component.render(80).lines.join("\n")).toContain("new-png");
 
 			oldConversion.resolve({ data: "old-png", mimeType: "image/png" });
 			await oldConversion.promise;
 			await Promise.resolve();
-			const rendered = component.render(80).join("\n");
+			const rendered = component.render(80).lines.join("\n");
 			expect(rendered).toContain("new-png");
 			expect(rendered).not.toContain("old-png");
 		} finally {
@@ -281,7 +281,7 @@ describe("ToolExecutionComponent parity", () => {
 			expect(
 				component
 					.render(80)
-					.join("\n")
+					.lines.join("\n")
 					.match(/dedup-png/g),
 			).toHaveLength(2);
 		} finally {
@@ -313,7 +313,7 @@ describe("ToolExecutionComponent parity", () => {
 			await conversion.promise;
 			await Promise.resolve();
 			expect(renderRequests).toBe(0);
-			expect(component.render(80).join("\n")).not.toContain("disposed-png");
+			expect(component.render(80).lines.join("\n")).not.toContain("disposed-png");
 		} finally {
 			resetCapabilitiesCache();
 		}
@@ -365,7 +365,7 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		expect(component.render(120)).toEqual([]);
+		expect(component.render(120).lines).toEqual([]);
 
 		component.updateResult(
 			{
@@ -376,7 +376,7 @@ describe("ToolExecutionComponent parity", () => {
 			false,
 		);
 
-		expect(component.render(120)).toEqual([]);
+		expect(component.render(120).lines).toEqual([]);
 	});
 
 	test("collapses fallback output for tools without result renderers and shows expand hint", () => {
@@ -394,14 +394,14 @@ describe("ToolExecutionComponent parity", () => {
 		);
 		component.updateResult({ content: [{ type: "text", text: output }], details: {}, isError: false }, false);
 
-		const collapsed = stripAnsi(component.render(120).join("\n"));
+		const collapsed = stripAnsi(component.render(120).lines.join("\n"));
 		expect(collapsed).toContain("line-10");
 		expect(collapsed).not.toContain("line-11");
 		expect(collapsed).toContain("20 more lines");
 		expect(collapsed).toContain("to expand");
 
 		component.setExpanded(true);
-		const expanded = stripAnsi(component.render(120).join("\n"));
+		const expanded = stripAnsi(component.render(120).lines.join("\n"));
 		expect(expanded).toContain("line-11");
 		expect(expanded).toContain("line-30");
 		expect(expanded).not.toContain("more lines");
@@ -422,7 +422,7 @@ describe("ToolExecutionComponent parity", () => {
 		);
 		component.updateResult({ content: [{ type: "text", text: output }], details: {}, isError: false }, false);
 
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("short-5");
 		expect(rendered).not.toContain("more lines");
 	});
@@ -442,7 +442,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 		component.updateResult({ content: [], details: { diff: "+1 after", firstChangedLine: 1 }, isError: false });
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("edit");
 		expect(rendered).toContain("README.md");
 		expect(rendered).not.toContain(":1");
@@ -458,7 +458,7 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("read");
 		expect(rendered).toContain("README.md");
 	});
@@ -512,7 +512,7 @@ describe("ToolExecutionComponent parity", () => {
 		component.setExpanded(true);
 		component.updateResult({ ...result, isError: false }, false);
 
-		const rendered = stripAnsi(component.render(200).join("\n"));
+		const rendered = stripAnsi(component.render(200).lines.join("\n"));
 		expect(rendered.match(/Full output:/g)?.length ?? 0).toBe(1);
 		expect(rendered).toMatch(/line-4000[^\n]*\n[^\S\n]*\n \[Full output:/);
 		expect(rendered).not.toMatch(/line-4000[^\n]*\n[^\S\n]*\n[^\S\n]*\n \[Full output:/);
@@ -531,7 +531,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 		component.updateResult({ content: [{ type: "text", text: "hello" }], isError: false }, false);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered.match(/\bread\b/g)?.length ?? 0).toBe(1);
 	});
 
@@ -552,7 +552,7 @@ describe("ToolExecutionComponent parity", () => {
 		);
 		component.updateResult({ content: [{ type: "text", text: "hello" }], isError: false }, false);
 		component.setExpanded(true);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("override call");
 		expect(rendered).toContain("hello");
 	});
@@ -573,7 +573,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 		component.updateResult({ content: [{ type: "text", text: "hello" }], isError: false }, false);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("read");
 		expect(rendered).toContain("README.md");
 		expect(rendered).toContain("override result");
@@ -595,7 +595,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 		component.updateResult({ content: [{ type: "text", text: "hello" }], isError: false }, false);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("override call");
 		expect(rendered).toContain("override result");
 		expect(rendered).not.toContain("read README.md");
@@ -618,7 +618,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 		component.updateResult({ content: [{ type: "text", text: "hello" }], isError: false }, false);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("wrapped override call");
 		expect(rendered).toContain("wrapped override result");
 	});
@@ -646,7 +646,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 		component.updateResult({ content: [{ type: "text", text: "done" }], details: {}, isError: false }, false);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("custom call shared-token");
 		expect(rendered).toContain("custom result shared-token");
 	});
@@ -669,7 +669,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 		component.updateResult({ content: [{ type: "text", text: "done" }], details: {}, isError: false }, false);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("arg:bar");
 	});
 
@@ -701,7 +701,7 @@ describe("ToolExecutionComponent parity", () => {
 			false,
 		);
 
-		const collapsed = stripAnsi(component.render(120).join("\n"));
+		const collapsed = stripAnsi(component.render(120).lines.join("\n"));
 		expect(collapsed).toContain("Subagent  1 done");
 		expect(collapsed).toContain("scout · Inspect the auth flow");
 		expect(collapsed).toContain("done · 0 tool calls · 32.1s · 30 tokens");
@@ -710,7 +710,7 @@ describe("ToolExecutionComponent parity", () => {
 		expect(collapsed).toContain("outputs");
 
 		component.setExpanded(true);
-		const expanded = stripAnsi(component.render(120).join("\n"));
+		const expanded = stripAnsi(component.render(120).lines.join("\n"));
 		expect(expanded).toContain("final answer");
 		expect(expanded).toContain("collapse outputs");
 	});
@@ -726,7 +726,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 		component.markExecutionStarted();
-		expect(component.render(120)).toEqual([]);
+		expect(component.render(120).lines).toEqual([]);
 
 		component.updateResult(
 			{
@@ -741,7 +741,7 @@ describe("ToolExecutionComponent parity", () => {
 			false,
 		);
 
-		expect(component.render(120)).toEqual([]);
+		expect(component.render(120).lines).toEqual([]);
 	});
 
 	test("presents explicit registry list and follow calls without a created child", () => {
@@ -755,7 +755,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 		listComponent.markExecutionStarted();
-		expect(stripAnsi(listComponent.render(120).join("\n"))).toContain("Subagent registry");
+		expect(stripAnsi(listComponent.render(120).lines.join("\n"))).toContain("Subagent registry");
 		listComponent.updateResult(
 			{
 				content: [{ type: "text", text: "2 subagent runs recorded in this session" }],
@@ -768,7 +768,7 @@ describe("ToolExecutionComponent parity", () => {
 			},
 			false,
 		);
-		expect(stripAnsi(listComponent.render(120).join("\n"))).toContain("Subagent registry");
+		expect(stripAnsi(listComponent.render(120).lines.join("\n"))).toContain("Subagent registry");
 
 		const followComponent = new ToolExecutionComponent(
 			"subagent",
@@ -780,7 +780,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 		followComponent.markExecutionStarted();
-		expect(followComponent.render(120)).not.toEqual([]);
+		expect(followComponent.render(120).lines).not.toEqual([]);
 		followComponent.updateResult(
 			{
 				content: [{ type: "text", text: "shared result" }],
@@ -794,7 +794,7 @@ describe("ToolExecutionComponent parity", () => {
 			},
 			false,
 		);
-		expect(stripAnsi(followComponent.render(120).join("\n"))).toContain("researcher");
+		expect(stripAnsi(followComponent.render(120).lines.join("\n"))).toContain("researcher");
 	});
 
 	test("presents terminal errors that occur before any child is created", () => {
@@ -808,7 +808,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 		component.markExecutionStarted();
-		expect(component.render(120)).toEqual([]);
+		expect(component.render(120).lines).toEqual([]);
 
 		component.updateResult(
 			{
@@ -819,7 +819,7 @@ describe("ToolExecutionComponent parity", () => {
 			},
 			false,
 		);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("scout");
 		expect(rendered).toContain("failed");
 	});
@@ -898,7 +898,7 @@ describe("ToolExecutionComponent parity", () => {
 			false,
 		);
 
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("Subagent  1 failed");
 		expect(rendered).toContain("✗ missing · Inspect the auth flow");
 		expect(rendered).toContain("failed · Unknown subagent: missing");
@@ -953,7 +953,7 @@ describe("ToolExecutionComponent parity", () => {
 			false,
 		);
 
-		const collapsed = stripAnsi(component.render(140).join("\n"));
+		const collapsed = stripAnsi(component.render(140).lines.join("\n"));
 		expect(collapsed).toContain("Subagents · parallel  1 done · 1 failed");
 		expect(collapsed.indexOf("alpha · First task")).toBeLessThan(collapsed.indexOf("beta · Second task"));
 		expect(collapsed).toContain("done");
@@ -962,10 +962,10 @@ describe("ToolExecutionComponent parity", () => {
 		expect(collapsed).toContain("Second task");
 		expect(collapsed).not.toContain("alpha output");
 		expect(collapsed.match(/beta failed/g)?.length).toBe(1);
-		for (const line of component.render(32)) expect(visibleWidth(line)).toBeLessThanOrEqual(32);
+		for (const line of component.render(32).lines) expect(visibleWidth(line)).toBeLessThanOrEqual(32);
 
 		component.setExpanded(true);
-		const expanded = stripAnsi(component.render(140).join("\n"));
+		const expanded = stripAnsi(component.render(140).lines.join("\n"));
 		expect(expanded).toContain("alpha output");
 		expect(expanded).toContain("beta failed");
 	});
@@ -1016,7 +1016,7 @@ describe("ToolExecutionComponent parity", () => {
 			true,
 		);
 
-		const collapsed = stripAnsi(component.render(140).join("\n"));
+		const collapsed = stripAnsi(component.render(140).lines.join("\n"));
 		expect(collapsed).toContain("Subagents · parallel  2 running");
 		expect(collapsed).toContain("├─ … alpha · First task");
 		expect(collapsed).toMatch(/│ {3}running · 6[45]\.\ds/);
@@ -1069,7 +1069,7 @@ describe("ToolExecutionComponent parity", () => {
 			true,
 		);
 
-		const rendered = stripAnsi(component.render(140).join("\n"));
+		const rendered = stripAnsi(component.render(140).lines.join("\n"));
 		expect(rendered).toContain("…and 24 more agents");
 		for (let index = 30; index < 40; index++) {
 			expect(rendered).toContain(`agent-${index}`);
@@ -1117,7 +1117,7 @@ describe("ToolExecutionComponent parity", () => {
 			true,
 		);
 
-		const lines = component.render(140);
+		const lines = component.render(140).lines;
 		const rendered = stripAnsi(lines.join("\n"));
 		// 16 children x 16 grandchildren would be hundreds of lines without a budget.
 		expect(lines.length).toBeLessThan(45);
@@ -1146,8 +1146,8 @@ describe("ToolExecutionComponent parity", () => {
 			true,
 		);
 
-		const first = component.render(140);
-		expect(component.render(140)).toEqual(first);
+		const first = component.render(140).lines;
+		expect(component.render(140).lines).toEqual(first);
 
 		component.updateResult(
 			{
@@ -1157,7 +1157,7 @@ describe("ToolExecutionComponent parity", () => {
 			},
 			false,
 		);
-		const completed = stripAnsi(component.render(140).join("\n"));
+		const completed = stripAnsi(component.render(140).lines.join("\n"));
 		expect(completed).toContain("done");
 		expect(completed).not.toContain("running");
 	});
@@ -1211,7 +1211,7 @@ describe("ToolExecutionComponent parity", () => {
 			false,
 		);
 
-		const expanded = stripAnsi(component.render(140).join("\n"));
+		const expanded = stripAnsi(component.render(140).lines.join("\n"));
 		expect(expanded).toContain("Subagents · chain  2 done");
 		expect(expanded).toContain("first · Collect facts");
 		expect(expanded).toContain("Collect facts");
@@ -1236,15 +1236,15 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 
-		expect(stripAnsi(component.render(120).join("\n"))).toContain("inspect target.ts [pending]");
+		expect(stripAnsi(component.render(120).lines.join("\n"))).toContain("inspect target.ts [pending]");
 		component.markExecutionStarted();
-		expect(stripAnsi(component.render(120).join("\n"))).toContain("inspect target.ts [running]");
+		expect(stripAnsi(component.render(120).lines.join("\n"))).toContain("inspect target.ts [running]");
 		component.updateResult({ content: [{ type: "text", text: "working" }], isError: false }, true);
-		expect(stripAnsi(component.render(120).join("\n"))).toContain("inspect target.ts [partial]");
+		expect(stripAnsi(component.render(120).lines.join("\n"))).toContain("inspect target.ts [partial]");
 		component.updateResult({ content: [{ type: "text", text: "done" }], isError: false }, false);
-		expect(stripAnsi(component.render(120).join("\n"))).toContain("inspect target.ts [success]");
+		expect(stripAnsi(component.render(120).lines.join("\n"))).toContain("inspect target.ts [success]");
 		component.updateResult({ content: [{ type: "text", text: "broken" }], isError: true }, false);
-		expect(stripAnsi(component.render(120).join("\n"))).toContain("inspect target.ts [failure]");
+		expect(stripAnsi(component.render(120).lines.join("\n"))).toContain("inspect target.ts [failure]");
 	});
 
 	test("renders lifecycle colors without state background bands", () => {
@@ -1263,7 +1263,7 @@ describe("ToolExecutionComponent parity", () => {
 		);
 		component.updateResult({ content: [{ type: "text", text: "done" }], isError: false }, false);
 
-		const rendered = component.render(120).join("\n");
+		const rendered = component.render(120).lines.join("\n");
 		expect(stripAnsi(rendered)).toContain("[success]");
 		expect(rendered).not.toContain("\x1b[48;");
 	});
@@ -1284,7 +1284,7 @@ describe("ToolExecutionComponent parity", () => {
 		);
 		component.updateResult({ content: [{ type: "text", text: "done" }], isError: false }, false);
 
-		const lines = component.render(32).map(stripAnsi);
+		const lines = component.render(32).lines.map(stripAnsi);
 		expect(lines.some((line) => line.includes("[success]"))).toBe(true);
 	});
 
@@ -1311,17 +1311,17 @@ describe("ToolExecutionComponent parity", () => {
 
 		now.mockReturnValue(3_000);
 		component.updateResult({ content: [{ type: "text", text: "working" }], details: {}, isError: false }, true);
-		expect(stripAnsi(component.render(120).join("\n"))).not.toContain("(2.0s)");
+		expect(stripAnsi(component.render(120).lines.join("\n"))).not.toContain("(2.0s)");
 
 		now.mockReturnValue(5_200);
 		component.updateResult({ content: [{ type: "text", text: "done" }], details: {}, isError: false }, false);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("custom call [success] (4.2s)");
 
 		// Duration is frozen at completion; later renders keep the same value
 		now.mockReturnValue(99_000);
 		component.invalidate();
-		expect(stripAnsi(component.render(120).join("\n"))).toContain("custom call [success] (4.2s)");
+		expect(stripAnsi(component.render(120).lines.join("\n"))).toContain("custom call [success] (4.2s)");
 	});
 
 	test("hides sub-second durations", () => {
@@ -1346,7 +1346,7 @@ describe("ToolExecutionComponent parity", () => {
 		now.mockReturnValue(1_400);
 		component.updateResult({ content: [{ type: "text", text: "done" }], details: {}, isError: false }, false);
 
-		expect(stripAnsi(component.render(120).join("\n"))).not.toContain("(0.4s)");
+		expect(stripAnsi(component.render(120).lines.join("\n"))).not.toContain("(0.4s)");
 	});
 
 	test("shows durations for tools without renderers and for restored history only when execution was observed", () => {
@@ -1366,7 +1366,7 @@ describe("ToolExecutionComponent parity", () => {
 		fallbackComponent.markExecutionStarted();
 		now.mockReturnValue(4_500);
 		fallbackComponent.updateResult({ content: [{ type: "text", text: "done" }], isError: false }, false);
-		expect(stripAnsi(fallbackComponent.render(120).join("\n"))).toContain("mystery_tool [success] (3.5s)");
+		expect(stripAnsi(fallbackComponent.render(120).lines.join("\n"))).toContain("mystery_tool [success] (3.5s)");
 
 		// Restored history never calls markExecutionStarted -> no duration
 		const restoredComponent = new ToolExecutionComponent(
@@ -1380,7 +1380,7 @@ describe("ToolExecutionComponent parity", () => {
 		);
 		now.mockReturnValue(9_000);
 		restoredComponent.updateResult({ content: [{ type: "text", text: "done" }], isError: false }, false);
-		expect(stripAnsi(restoredComponent.render(120).join("\n"))).not.toContain("s)");
+		expect(stripAnsi(restoredComponent.render(120).lines.join("\n"))).not.toContain("s)");
 	});
 
 	test("highlights built-in bash tool commands", () => {
@@ -1395,7 +1395,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 
-		const rendered = component.render(120).join("\n");
+		const rendered = component.render(120).lines.join("\n");
 		expect(rendered).toContain(theme.fg("syntaxFunction", "cd"));
 		expect(rendered).toContain(theme.fg("syntaxFunction", "python"));
 		expect(stripAnsi(rendered)).toContain(`$ cd src && python -c 'print("hello")' [pending]`);
@@ -1419,7 +1419,7 @@ describe("ToolExecutionComponent parity", () => {
 		now.mockReturnValue(6_000);
 		component.updateResult({ content: [{ type: "text", text: "done" }], details: {}, isError: false }, false);
 
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("Took 5.0s");
 		expect(rendered.match(/5\.0s/g)?.length ?? 0).toBe(1);
 		expect(rendered).not.toContain("(5.0s)");
@@ -1450,10 +1450,10 @@ describe("ToolExecutionComponent parity", () => {
 
 		// Box padding leaves the narrow header without room for metadata, so
 		// state and duration move to the next line rather than disappearing.
-		const narrow = stripAnsi(component.render(64).join("\n"));
+		const narrow = stripAnsi(component.render(64).lines.join("\n"));
 		expect(narrow).toContain(longHeader);
 		expect(narrow).toContain("[success] (2.5s)");
-		expect(stripAnsi(component.render(120).join("\n"))).toContain(`${longHeader} [success] (2.5s)`);
+		expect(stripAnsi(component.render(120).lines.join("\n"))).toContain(`${longHeader} [success] (2.5s)`);
 	});
 
 	test("falls back when custom renderers are absent", () => {
@@ -1471,7 +1471,7 @@ describe("ToolExecutionComponent parity", () => {
 			process.cwd(),
 		);
 		component.updateResult({ content: [{ type: "text", text: "done" }], details: {}, isError: false }, false);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("custom_tool");
 		expect(rendered).toContain("done");
 	});
@@ -1486,7 +1486,7 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("one");
 		expect(rendered).toContain("two");
 		expect(rendered).not.toContain("two\n\n");
@@ -1504,7 +1504,7 @@ describe("ToolExecutionComponent parity", () => {
 		);
 		component.updateResult({ content: [{ type: "text", text: "one\ntwo\n" }], isError: false }, false);
 		component.setExpanded(true);
-		const rendered = stripAnsi(component.render(120).join("\n"));
+		const rendered = stripAnsi(component.render(120).lines.join("\n"));
 		expect(rendered).toContain("one");
 		expect(rendered).toContain("two");
 		expect(rendered).not.toContain("two\n\n");
@@ -1522,13 +1522,13 @@ describe("ToolExecutionComponent parity", () => {
 		);
 		component.updateResult({ content: [{ type: "text", text: "hidden content" }], isError: false }, false);
 
-		const collapsed = stripAnsi(component.render(120).join("\n"));
+		const collapsed = stripAnsi(component.render(120).lines.join("\n"));
 		expect(collapsed).toContain("read");
 		expect(collapsed).toContain("notes.txt");
 		expect(collapsed).not.toContain("hidden content");
 
 		component.setExpanded(true);
-		const expanded = stripAnsi(component.render(120).join("\n"));
+		const expanded = stripAnsi(component.render(120).lines.join("\n"));
 		expect(expanded).toContain("hidden content");
 	});
 
@@ -1579,7 +1579,7 @@ describe("ToolExecutionComponent parity", () => {
 			);
 			component.updateResult({ content: [{ type: "text", text: scenario.content }], isError: false }, false);
 
-			const collapsed = stripAnsi(component.render(120).join("\n"));
+			const collapsed = stripAnsi(component.render(120).lines.join("\n"));
 			expect(collapsed).toContain(scenario.compact);
 			expect(collapsed).not.toContain(scenario.hidden);
 			if (scenario.absent) {
@@ -1587,7 +1587,7 @@ describe("ToolExecutionComponent parity", () => {
 			}
 
 			component.setExpanded(true);
-			const expanded = stripAnsi(component.render(120).join("\n"));
+			const expanded = stripAnsi(component.render(120).lines.join("\n"));
 			expect(expanded).toContain(scenario.hidden);
 		});
 	}
@@ -1607,7 +1607,7 @@ describe("ToolExecutionComponent parity", () => {
 				process.cwd(),
 			);
 
-			const collapsed = stripAnsi(component.render(120).join("\n"));
+			const collapsed = stripAnsi(component.render(120).lines.join("\n"));
 			expect(collapsed).toContain(scenario.compact);
 			expect(collapsed.indexOf(":120-329")).toBeLessThan(collapsed.indexOf("to expand"));
 		});

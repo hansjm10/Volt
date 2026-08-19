@@ -37,6 +37,7 @@ import {
 	type Component,
 	Container,
 	fuzzyFilter,
+	isKeyRelease,
 	isViewportTUI,
 	Loader,
 	type LoaderIndicatorOptions,
@@ -222,8 +223,10 @@ import { ExtensionInputComponent } from "./components/extension-input.ts";
 import { ExtensionSelectorComponent } from "./components/extension-selector.ts";
 import { FooterComponent } from "./components/footer.ts";
 import { type HotkeySection, HotkeysComponent } from "./components/hotkeys.ts";
+import { PlanInspectorComponent } from "./components/plan-inspector.ts";
 import { type PlanDetailsAction, PlanDetailsComponent, PlanStatusComponent } from "./components/plan-status.ts";
 import { createRemoteControlBackend, RemoteControlCenterComponent } from "./components/remote-control-center.ts";
+import { ResponsivePlanLayoutComponent } from "./components/responsive-plan-layout.ts";
 import { isCoalescableAssistantUpdate, StreamingRenderCoalescer } from "./components/streaming-render-coalescer.ts";
 import { VoltAnnouncementComponent } from "./components/volt-announcement.ts";
 import {
@@ -518,6 +521,11 @@ export class InteractiveMode {
 	private activeView: ActiveViewDescriptor;
 	private planStatus: PlanStatusComponent;
 	private planDetails: PlanDetailsComponent | undefined;
+	private planInspector: PlanInspectorComponent;
+	private mainView: ResponsivePlanLayoutComponent;
+	private planPaneReturnFocus: Component | undefined;
+	private planPaneInputUnsubscribe: (() => void) | undefined;
+	private readyPlanFocusKey: string | undefined;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
 	private editorComponentFactory: EditorFactory | undefined;
@@ -720,6 +728,16 @@ export class InteractiveMode {
 		this.editorContainer.addChild(this.editor as Component);
 		this.planStatus = new PlanStatusComponent(this.session.planningState);
 		this.planStatusContainer.addChild(this.planStatus);
+		this.planInspector = new PlanInspectorComponent({
+			planning: this.session.planningState,
+			fullscreenScrollbar: this.settingsManager.getFullscreenScrollbar(),
+			onAction: (action) => {
+				void this.handlePlanDetailsAction(action);
+			},
+			onReturnFocus: () => this.focusConversation(),
+			onToggleFocus: () => this.togglePlanPaneFocus(),
+			requestRender: () => this.ui.requestRender(),
+		});
 		this.footerDataProvider = new FooterDataProvider(this.session.gitContextProvider);
 		this.footer = new FooterComponent(this.session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
@@ -737,18 +755,53 @@ export class InteractiveMode {
 			{ component: this.pendingMessagesContainer, shrink: 4, minSize: 0 },
 			{ component: this.statusContainer, shrink: 4, minSize: 0 },
 			{ component: this.widgetContainerAbove, shrink: 3, minSize: 0 },
-			{ component: this.planStatusContainer, shrink: 2, minSize: 0 },
+			{
+				component: this.planStatusContainer,
+				shrink: 2,
+				minSize: 0,
+				visible: () => !this.mainView.isTerminalSplit(),
+			},
 			{ component: this.editorContainer, shrink: 1, minSize: 1 },
 			{ component: this.widgetContainerBelow, shrink: 3, minSize: 0 },
-			{ component: this.footerContainer, shrink: 4, minSize: 0 },
 		]);
 		this.fullscreenConversationRoot = new VStack([
 			{ component: this.fullscreenFlexibleSlot, basis: 0, grow: 1, shrink: 1, minSize: 0 },
 			{ component: fullscreenDock, shrink: 1, minSize: 0 },
 		]);
+		this.mainView = new ResponsivePlanLayoutComponent({
+			planning: this.session.planningState,
+			transcriptComponents: [this.headerContainer, this.chatContainer],
+			controlComponents: [
+				this.pendingMessagesContainer,
+				this.statusContainer,
+				this.widgetContainerAbove,
+				this.editorContainer,
+				this.widgetContainerBelow,
+			],
+			compactComponents: [
+				this.headerContainer,
+				this.chatContainer,
+				this.pendingMessagesContainer,
+				this.statusContainer,
+				this.widgetContainerAbove,
+				this.planStatusContainer,
+				this.planDetailsContainer,
+				this.editorContainer,
+				this.widgetContainerBelow,
+			],
+			fullscreenConversation: this.fullscreenConversationRoot,
+			inspector: this.planInspector,
+			footer: this.footerContainer,
+			getTerminalColumns: () => this.ui.terminal.columns,
+			getTerminalRows: () => this.ui.terminal.rows,
+			requestViewportReset: () => {
+				if (this.renderer instanceof TuiMainScreen) this.renderer.resetViewportOnNextRender();
+			},
+			onSplitChange: (split, preserveScrollback) => this.handlePlanSplitChange(split, preserveScrollback),
+		});
 		this.conversationView = {
-			regularComponents: this.getMainViewComponents(),
-			fullscreenRoot: this.fullscreenConversationRoot,
+			regularComponents: [this.mainView],
+			fullscreenRoot: this.mainView.getFullscreenLayout(),
 		};
 		this.activeView = this.conversationView;
 
@@ -1015,7 +1068,9 @@ export class InteractiveMode {
 		this.activateView(this.conversationView, this.editor, false);
 
 		this.setupKeyHandlers();
+		this.setupPlanPaneInputRouting();
 		this.setupEditorSubmitHandler();
+		this.refreshPlanningUi();
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
@@ -1035,6 +1090,7 @@ export class InteractiveMode {
 				hint("app.exit", "to exit (empty)"),
 				hint("app.suspend", "to suspend"),
 				keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
+				hint("app.plan.togglePane", "to focus the plan pane"),
 				hint("app.thinking.cycle", "to cycle thinking level"),
 				rawKeyHint(`${keyText("app.model.cycleForward")}/${keyText("app.model.cycleBackward")}`, "to cycle models"),
 				hint("app.model.select", "to select model"),
@@ -2290,6 +2346,7 @@ export class InteractiveMode {
 
 	private applyFullscreenScrollbarSetting(mode = this.settingsManager.getFullscreenScrollbar()): void {
 		this.fullscreenTranscript.setScrollbar(mode);
+		this.planInspector.setFullscreenScrollbar(mode);
 		this.planDetails?.setFullscreenScrollbar(mode);
 	}
 
@@ -3442,6 +3499,29 @@ export class InteractiveMode {
 		this.defaultEditor.onPasteImage = () => {
 			this.handleClipboardImagePaste();
 		};
+	}
+
+	private setupPlanPaneInputRouting(): void {
+		this.planPaneInputUnsubscribe?.();
+		this.planPaneInputUnsubscribe = this.ui.addInputListener((data) => {
+			if (
+				isKeyRelease(data) ||
+				this.activeView !== this.conversationView ||
+				!this.keybindings.matches(data, "app.plan.togglePane")
+			) {
+				return undefined;
+			}
+			const focused = this.ui.getFocusedComponent();
+			if (
+				focused !== this.planInspector &&
+				focused !== this.planDetails &&
+				(focused === null || !this.editorContainer.children.includes(focused))
+			) {
+				return undefined;
+			}
+			this.togglePlanPaneFocus();
+			return { consume: true };
+		});
 	}
 
 	private createHostActionContext(): HostActionInvocationContext {
@@ -4809,20 +4889,39 @@ export class InteractiveMode {
 
 	private refreshPlanningUi(planning = this.session.planningState): void {
 		this.planStatus.setPlanning(planning);
+		this.planInspector.setPlanning(planning);
+		this.mainView.setPlanning(planning);
 		const plan = planning.plan;
-		if (this.planDetails && plan) {
+		const split = this.mainView.isTerminalSplit();
+		if (split && this.planDetails) {
+			this.focusPlanInspector();
+			this.closePlanDetails({ focusConversation: false });
+		} else if (this.planDetails && plan) {
 			this.planDetails.setPlan(plan);
 		} else if (this.planDetails && !plan) {
 			this.closePlanDetails();
 		}
+		if (!split) this.focusConversation(true);
 		this.updateEditorBorderColor();
-		if (plan?.phase === "ready" && !this.planDetails) {
-			this.showPlanDetails();
+		if (plan?.phase === "ready") {
+			const readyKey = `${plan.id}:${plan.revision}`;
+			if (split) {
+				if (this.readyPlanFocusKey !== readyKey && this.focusPlanInspector()) this.readyPlanFocusKey = readyKey;
+			} else if (!this.planDetails && this.activeView === this.conversationView) {
+				this.showPlanDetails();
+				this.readyPlanFocusKey = readyKey;
+			}
+		} else {
+			this.readyPlanFocusKey = undefined;
 		}
 		this.ui.requestRender();
 	}
 
 	private showPlanDetails(): void {
+		if (this.mainView.isTerminalSplit()) {
+			this.focusPlanInspector();
+			return;
+		}
 		const plan = this.session.planningState.plan;
 		if (!plan) {
 			this.showStatus("No structured plan yet");
@@ -4847,17 +4946,117 @@ export class InteractiveMode {
 			minSize: 0,
 		});
 		this.planDetails.setFullscreenActive(this.ui.mode === "fullscreen");
-		this.ui.setFocus(this.planDetails);
+		this.fullscreenTranscript.setPrimary(false);
+		if (!this.ui.retargetFocus(this.getConversationFocusTarget(), this.planDetails)) {
+			this.ui.setFocus(this.planDetails);
+		}
 		this.ui.requestRender();
 	}
 
-	private closePlanDetails(): void {
+	private closePlanDetails(options: { focusConversation?: boolean } = {}): void {
+		const closingDetails = this.planDetails;
 		this.planDetailsContainer.clear();
 		this.planDetails = undefined;
 		this.fullscreenFlexibleSlot.clear();
 		this.fullscreenFlexibleSlot.addChild(this.fullscreenTranscript, { grow: 1, shrink: 1, minSize: 0 });
-		this.ui.setFocus(this.editor);
+		if (options.focusConversation !== false && this.activeView === this.conversationView) {
+			this.focusConversation();
+		} else {
+			if (closingDetails && this.ui.getFocusedComponent() === closingDetails) {
+				this.fullscreenTranscript.setPrimary(true);
+				this.ui.setFocus(this.getConversationFocusTarget());
+			}
+			this.ui.requestRender();
+		}
+	}
+
+	private getConversationFocusTarget(): Component {
+		const saved = this.planPaneReturnFocus;
+		if (saved && this.editorContainer.children.includes(saved)) return saved;
+		return this.editorContainer.children[0] ?? (this.editor as Component);
+	}
+
+	private focusPlanInspector(): boolean {
+		if (this.activeView !== this.conversationView || !this.mainView.isTerminalSplit()) {
+			return false;
+		}
+		const focused = this.ui.getFocusedComponent();
+		let focusSource: Component | undefined;
+		let retargeted = false;
+		if (focused !== this.planInspector) {
+			if (focused === this.planDetails || (focused !== null && this.editorContainer.children.includes(focused))) {
+				focusSource = focused;
+			} else {
+				const focusSources: Component[] = [...this.editorContainer.children];
+				if (this.planDetails) focusSources.unshift(this.planDetails);
+				for (const source of focusSources) {
+					if (!this.ui.retargetFocus(source, this.planInspector)) continue;
+					focusSource = source;
+					retargeted = true;
+					break;
+				}
+				if (!retargeted) return false;
+			}
+		}
+		if (!this.planInspector.focused) {
+			this.planPaneReturnFocus =
+				focusSource && this.editorContainer.children.includes(focusSource)
+					? focusSource
+					: this.getConversationFocusTarget();
+			this.fullscreenTranscript.setPrimary(false);
+			this.planInspector.setFullscreenActive(this.ui.mode === "fullscreen");
+			this.planInspector.setSelected(true);
+			if (!retargeted) this.ui.setFocus(this.planInspector);
+		}
 		this.ui.requestRender();
+		return true;
+	}
+
+	private focusConversation(onlyFromPlanInspector = false): boolean {
+		const target = this.getConversationFocusTarget();
+		const wasInspectorFocused = this.planInspector.focused;
+		const retargeted = this.ui.retargetFocus(this.planInspector, target);
+		if (!retargeted) {
+			if (onlyFromPlanInspector && !wasInspectorFocused) return false;
+			this.ui.setFocus(target);
+		}
+		this.planInspector.setSelected(false);
+		this.fullscreenTranscript.setPrimary(true);
+		this.planPaneReturnFocus = undefined;
+		this.ui.requestRender();
+		return true;
+	}
+
+	private togglePlanPaneFocus(): void {
+		if (this.mainView.isTerminalSplit()) {
+			if (this.planInspector.focused) this.focusConversation();
+			else this.focusPlanInspector();
+			return;
+		}
+		if (this.planDetails) this.closePlanDetails();
+		else if (this.session.planningState.plan) this.showPlanDetails();
+	}
+
+	private handlePlanSplitChange(split: boolean, preserveScrollback: boolean): void {
+		if (preserveScrollback && this.renderer instanceof TuiMainScreen) {
+			this.renderer.resetViewportOnNextRender();
+		}
+		this.planInspector.setFullscreenActive(split && this.ui.mode === "fullscreen");
+		if (split) {
+			const hadPlanDetails = this.planDetails !== undefined;
+			if (hadPlanDetails || this.session.planningState.plan?.phase === "ready") this.focusPlanInspector();
+			if (hadPlanDetails) this.closePlanDetails({ focusConversation: false });
+			return;
+		}
+		this.fullscreenTranscript.setPrimary(true);
+		this.focusConversation(true);
+		if (
+			this.session.planningState.plan?.phase === "ready" &&
+			!this.planDetails &&
+			this.activeView === this.conversationView
+		) {
+			this.showPlanDetails();
+		}
 	}
 
 	private async handlePlanDetailsAction(action: PlanDetailsAction): Promise<void> {
@@ -5378,6 +5577,7 @@ export class InteractiveMode {
 		this.activateView(this.activeView, focus, false);
 		nextUi.invalidate();
 		if (startRenderer) nextUi.start();
+		this.setupPlanPaneInputRouting();
 		this.rebindExtensionTerminalInputListeners();
 		if (
 			startRenderer &&
@@ -5400,7 +5600,12 @@ export class InteractiveMode {
 		for (const component of view.regularComponents) this.ui.addChild(component);
 		if (isViewportTUI(this.ui)) this.ui.setLayoutRoot(view.fullscreenRoot);
 		this.activeView = view;
-		this.planDetails?.setFullscreenActive(view === this.conversationView && this.ui.mode === "fullscreen");
+		const split = view === this.conversationView && this.mainView?.isTerminalSplit() === true;
+		this.planInspector?.setFullscreenActive(split && this.ui.mode === "fullscreen");
+		this.planDetails?.setFullscreenActive(view === this.conversationView && !split && this.ui.mode === "fullscreen");
+		if (view === this.conversationView && this.fullscreenTranscript) {
+			this.fullscreenTranscript.setPrimary(focus !== this.planInspector && this.planDetails === undefined);
+		}
 		this.ui.setFocus(focus);
 		this.ui.requestRender(forceRender);
 	}
@@ -5440,21 +5645,6 @@ export class InteractiveMode {
 			return;
 		}
 		this.activateView(this.createDedicatedView(component), created.focus);
-	}
-
-	private getMainViewComponents(): Component[] {
-		return [
-			this.headerContainer,
-			this.chatContainer,
-			this.pendingMessagesContainer,
-			this.statusContainer,
-			this.widgetContainerAbove,
-			this.planStatusContainer,
-			this.planDetailsContainer,
-			this.editorContainer,
-			this.widgetContainerBelow,
-			this.footerContainer,
-		];
 	}
 
 	private showSubagentInspector(): void {
@@ -8095,6 +8285,7 @@ export class InteractiveMode {
 		const exit = this.getAppKeyDisplay("app.exit");
 		const suspend = this.getAppKeyDisplay("app.suspend");
 		const toggleAgentMode = this.getAppKeyDisplay("app.mode.toggle");
+		const togglePlanPane = this.getAppKeyDisplay("app.plan.togglePane");
 		const cycleThinkingLevel = this.getAppKeyDisplay("app.thinking.cycle");
 		const cycleModelForward = this.getAppKeyDisplay("app.model.cycleForward");
 		const selectModel = this.getAppKeyDisplay("app.model.select");
@@ -8118,6 +8309,7 @@ export class InteractiveMode {
 					{ key: expandTools, action: "Toggle tool output expansion" },
 					{ key: selectModel, action: "Open model selector" },
 					{ key: toggleAgentMode, action: "Toggle Build / Plan mode" },
+					{ key: togglePlanPane, action: "Switch conversation / plan pane focus" },
 					{ key: cycleThinkingLevel, action: "Cycle thinking level" },
 					{ key: openSubagents, action: "Switch to subagent conversations" },
 				],
@@ -8162,6 +8354,7 @@ export class InteractiveMode {
 					{ key: exit, action: "Exit when editor is empty" },
 					{ key: suspend, action: "Suspend to background" },
 					{ key: toggleAgentMode, action: "Toggle Build / Plan mode" },
+					{ key: togglePlanPane, action: "Switch conversation / plan pane focus" },
 					{ key: cycleThinkingLevel, action: "Cycle thinking level" },
 					{ key: `${cycleModelForward} / ${cycleModelBackward}`, action: "Cycle models" },
 					{ key: selectModel, action: "Open model selector" },
@@ -8235,7 +8428,7 @@ export class InteractiveMode {
 	private handleDebugCommand(): void {
 		const width = this.ui.terminal.columns;
 		const height = this.ui.terminal.rows;
-		const allLines = this.ui.render(width);
+		const allLines = this.ui.render(width).lines;
 
 		const debugLogPath = getDebugLogPath();
 		const debugData = [
@@ -9018,6 +9211,8 @@ export class InteractiveMode {
 			this.loadingAnimation = undefined;
 		}
 		this.clearExtensionTerminalInputListeners();
+		this.planPaneInputUnsubscribe?.();
+		this.planPaneInputUnsubscribe = undefined;
 		this.dismissSubagentInspector?.();
 		this.footer.dispose();
 		this.footerDataProvider.dispose();

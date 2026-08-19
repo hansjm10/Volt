@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { type Component, TuiMainScreen } from "../src/index.ts";
+import { createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class Lines implements Component {
@@ -10,8 +11,8 @@ class Lines implements Component {
 		this.lines = lines;
 	}
 
-	render(): string[] {
-		return this.lines;
+	render(): RenderFrame {
+		return createRenderFrame(this.lines);
 	}
 
 	invalidate(): void {}

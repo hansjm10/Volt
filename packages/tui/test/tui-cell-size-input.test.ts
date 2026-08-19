@@ -1,14 +1,15 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { type Component, TuiMainScreen } from "../src/index.ts";
+import { createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 import { getCellDimensions, resetCapabilitiesCache, setCellDimensions } from "../src/terminal-image.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class InputRecorder implements Component {
 	readonly inputs: string[] = [];
 
-	render(): string[] {
-		return [""];
+	render(): RenderFrame {
+		return createRenderFrame([""]);
 	}
 
 	handleInput(data: string): void {

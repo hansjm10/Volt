@@ -1,6 +1,8 @@
 import {
 	type Component,
+	createRenderFrame,
 	getKeybindings,
+	type RenderFrame,
 	ScrollView,
 	type ScrollViewScrollbar,
 	truncateToWidth,
@@ -36,19 +38,19 @@ export class PlanStatusComponent implements Component {
 		// Theme styling is resolved during render.
 	}
 
-	render(width: number): string[] {
-		if (width <= 0) return [];
+	render(width: number): RenderFrame {
+		if (width <= 0) return createRenderFrame([]);
 		const plan = this.planning.plan;
-		if (!plan && this.planning.mode === "build") return [];
+		if (!plan && this.planning.mode === "build") return createRenderFrame([]);
 
 		const mark = usesAsciiPlanMarkers() ? "PLAN" : "◆ PLAN";
 		if (!plan) {
-			return [
+			return createRenderFrame([
 				truncateToWidth(
 					`${theme.bold(theme.fg("accent", mark))}${theme.fg("dim", " · DRAFT · Agent tools are read-only")}`,
 					width,
 				),
-			];
+			]);
 		}
 
 		const { completed, total, percent } = getPlanProgress(plan);
@@ -58,7 +60,7 @@ export class PlanStatusComponent implements Component {
 		const right = theme.fg("dim", `${completed}/${total} · ${percent}%`);
 		const gap = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
 		const lines = [truncateToWidth(`${left}${gap}${right}`, width)];
-		if (width < 100) return lines;
+		if (width < 100) return createRenderFrame(lines);
 
 		const step = getCurrentPlanStep(plan);
 		if (plan.phase === "handed_off" && plan.execution) {
@@ -68,7 +70,7 @@ export class PlanStatusComponent implements Component {
 		} else if (plan.phase === "ready") {
 			lines.push(truncateToWidth(theme.fg("muted", " Choose how to execute or return to editing"), width));
 		}
-		return lines;
+		return createRenderFrame(lines);
 	}
 }
 
@@ -85,8 +87,8 @@ class PlanDetailsSection implements Component {
 		// Theme styling is resolved during render.
 	}
 
-	render(width: number): string[] {
-		return this.renderSection(width);
+	render(width: number): RenderFrame {
+		return createRenderFrame(this.renderSection(width));
 	}
 }
 
@@ -160,8 +162,8 @@ export class PlanDetailsComponent implements Component {
 		this.fullscreenLayout.invalidate();
 	}
 
-	render(width: number): string[] {
-		if (width <= 0) return [];
+	render(width: number): RenderFrame {
+		if (width <= 0) return createRenderFrame([]);
 		const compact = width < 100;
 		const border = this.renderBorder(width);
 		const titleLines = this.renderTitle(width);
@@ -177,13 +179,13 @@ export class PlanDetailsComponent implements Component {
 		this.bodyScroll.updateLayout(bodyContent.length, pageSize, this.requestRender);
 		const end = Math.min(bodyContent.length, this.bodyScroll.scrollTop + pageSize);
 
-		return [
+		return createRenderFrame([
 			border,
 			...titleLines,
 			this.renderMetadata(width, bodyContent.length, end),
 			...bodyContent.slice(this.bodyScroll.scrollTop, end),
 			...footer,
-		];
+		]);
 	}
 
 	handleInput(data: string): void {
@@ -224,7 +226,7 @@ export class PlanDetailsComponent implements Component {
 	}
 
 	private renderBorder(width: number): string {
-		return new DynamicBorder().render(width)[0] ?? "";
+		return new DynamicBorder().render(width).lines[0] ?? "";
 	}
 
 	private renderTitle(width: number): string[] {

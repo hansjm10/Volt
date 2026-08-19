@@ -2,7 +2,17 @@
  * Component for displaying bash command execution with streaming output.
  */
 
-import { type Component, Container, Loader, Spacer, Text, type TUI } from "@hansjm10/volt-tui";
+import {
+	type Component,
+	Container,
+	createRenderFrame,
+	Loader,
+	prefixRenderFrame,
+	type RenderFrame,
+	Spacer,
+	Text,
+	type TUI,
+} from "@hansjm10/volt-tui";
 import { highlightShellCommand, theme } from "../../../core/theme/runtime.ts";
 import { formatDuration } from "../../../core/tools/render-utils.ts";
 import {
@@ -27,10 +37,9 @@ class BashOutputRail implements Component {
 		this.colorKey = colorKey;
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		if (width <= 2) return this.component.render(width);
-		const prefix = `${theme.fg(this.colorKey, "│")} `;
-		return this.component.render(width - 2).map((line) => prefix + line);
+		return prefixRenderFrame(this.component.render(width - 2), `${theme.fg(this.colorKey, "│")} `);
 	}
 
 	invalidate(): void {
@@ -85,7 +94,7 @@ export class BashExecutionComponent extends Container {
 		this.displayDirty = true;
 	}
 
-	override render(width: number): string[] {
+	override render(width: number): RenderFrame {
 		if (this.displayDirty) {
 			this.updateDisplay();
 		}
@@ -191,7 +200,7 @@ export class BashExecutionComponent extends Container {
 							cachedLines = result.visualLines;
 							cachedWidth = width;
 						}
-						return cachedLines ?? [];
+						return createRenderFrame(cachedLines ?? []);
 					},
 					invalidate: () => {
 						cachedWidth = undefined;

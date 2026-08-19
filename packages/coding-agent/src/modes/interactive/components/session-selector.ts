@@ -5,9 +5,11 @@ import * as os from "node:os";
 import {
 	type Component,
 	Container,
+	createRenderFrame,
 	type Focusable,
 	getKeybindings,
 	Input,
+	type RenderFrame,
 	Spacer,
 	Text,
 	truncateToWidth,
@@ -127,7 +129,7 @@ class SessionSelectorHeader implements Component {
 
 	invalidate(): void {}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const title = this.scope === "current" ? "Resume Session (Current Folder)" : "Resume Session (All)";
 		const leftText = theme.bold(title);
 
@@ -182,7 +184,7 @@ class SessionSelectorHeader implements Component {
 			hintLine2 = truncateToWidth(hint2, width, "…");
 		}
 
-		return [`${left}${" ".repeat(spacing)}${rightText}`, hintLine1, hintLine2];
+		return createRenderFrame([`${left}${" ".repeat(spacing)}${rightText}`, hintLine1, hintLine2]);
 	}
 }
 
@@ -397,11 +399,11 @@ class SessionList implements Component, Focusable {
 
 	invalidate(): void {}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const lines: string[] = [];
 
 		// Render search input
-		lines.push(...this.searchInput.render(width));
+		lines.push(...this.searchInput.render(width).lines);
 		lines.push(""); // Blank line after search
 
 		if (this.filteredSessions.length === 0) {
@@ -421,7 +423,7 @@ class SessionList implements Component, Focusable {
 				emptyMessage = "  No sessions in current folder. Press Tab to view all.";
 			}
 			lines.push(theme.fg("muted", truncateToWidth(emptyMessage, width, "…")));
-			return lines;
+			return createRenderFrame(lines);
 		}
 
 		// Calculate visible range with scrolling
@@ -502,7 +504,7 @@ class SessionList implements Component, Focusable {
 			lines.push(scrollInfo);
 		}
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	private buildTreePrefix(node: FlatSessionNode): string {

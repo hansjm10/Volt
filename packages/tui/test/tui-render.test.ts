@@ -6,6 +6,7 @@ import { HStack } from "../src/components/h-stack.ts";
 import { Image } from "../src/components/image.ts";
 import { Text } from "../src/components/text.ts";
 import { type Component, TuiMainScreen } from "../src/index.ts";
+import { concatRenderFrames, createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 import {
 	deleteKittyImage,
 	encodeKitty,
@@ -17,10 +18,39 @@ import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class TestComponent implements Component {
 	lines: string[] = [];
-	render(_width: number): string[] {
-		return this.lines;
+	private images: RenderFrame["images"] = [];
+
+	setFrame(frame: RenderFrame): void {
+		this.lines = [...frame.lines];
+		this.images = frame.images.map((image) => ({ ...image }));
 	}
+
+	render(_width: number): RenderFrame {
+		return createRenderFrame(this.lines, this.images);
+	}
+
 	invalidate(): void {}
+}
+
+function kittyFrame(lines: readonly string[], anchor: number, rows: number, imageId: number): RenderFrame {
+	const sequence = lines[anchor] ?? "";
+	return createRenderFrame(lines, [
+		{
+			top: anchor,
+			anchor,
+			left: 0,
+			columns: 2,
+			rows,
+			protocol: "kitty",
+			imageId,
+			sequence,
+			exactSequence: true,
+		},
+	]);
+}
+
+function deleteKittyPlacements(imageId: number): string {
+	return `\x1b_Ga=d,d=i,i=${imageId},q=2\x1b\\`;
 }
 
 class LoggingVirtualTerminal extends VirtualTerminal {
@@ -46,7 +76,7 @@ function solidPngBase64(width: number, height: number): string {
 	return Buffer.from(encode({ width, height, channels: 4, depth: 8, data })).toString("base64");
 }
 
-function lineAt(lines: string[], index: number): string {
+function lineAt(lines: readonly string[], index: number): string {
 	const line = lines[index];
 	assert.notStrictEqual(line, undefined, `Expected rendered line at index ${index}`);
 	return line ?? "";
@@ -94,6 +124,15 @@ function getBufferPosition(terminal: VirtualTerminal): { baseY: number; viewport
 	};
 }
 
+function getBufferText(terminal: VirtualTerminal): string {
+	const xterm = (terminal as unknown as { xterm: XtermTerminalType }).xterm;
+	const buffer = xterm.buffer.active;
+	return Array.from(
+		{ length: buffer.length },
+		(_, index) => buffer.getLine(index)?.translateToString(true) ?? "",
+	).join("\n");
+}
+
 function scrollToLine(terminal: VirtualTerminal, line: number): void {
 	const xterm = (terminal as unknown as { xterm: XtermTerminalType }).xterm;
 	xterm.scrollToLine(line);
@@ -126,9 +165,12 @@ describe("TUI Kitty image cleanup", () => {
 				{ maxWidthCells: 2 },
 				{ widthPx: 20, heightPx: 20 },
 			);
-			const imageLines = image.render(40);
+			const imageFrame = image.render(40);
+			const imageLines = imageFrame.lines;
 			const imageSequence = lineAt(imageLines, 0);
-			component.lines = ["before", ...imageLines, "after"];
+			component.setFrame(
+				concatRenderFrames([createRenderFrame(["before"]), imageFrame, createRenderFrame(["after"])]),
+			);
 			tui.requestRender();
 			await terminal.waitForRender();
 
@@ -171,7 +213,9 @@ describe("TUI Kitty image cleanup", () => {
 				{ maxWidthCells: 3 },
 				{ widthPx: 30, heightPx: 30 },
 			);
-			component.lines = ["before", ...image.render(40), "after"];
+			component.setFrame(
+				concatRenderFrames([createRenderFrame(["before"]), image.render(40), createRenderFrame(["after"])]),
+			);
 			tui.requestRender();
 			await terminal.waitForRender();
 
@@ -207,9 +251,16 @@ describe("TUI Kitty image cleanup", () => {
 				{ maxWidthCells: 3 },
 				{ widthPx: 30, heightPx: 30 },
 			);
-			const imageLines = image.render(40);
+			const imageFrame = image.render(40);
+			const imageLines = imageFrame.lines;
 			const imageSequence = lineAt(imageLines, 0);
-			component.lines = ["l0", "l1", "l2", "l3", "l4", ...imageLines, "after"];
+			component.setFrame(
+				concatRenderFrames([
+					createRenderFrame(["l0", "l1", "l2", "l3", "l4"]),
+					imageFrame,
+					createRenderFrame(["after"]),
+				]),
+			);
 			tui.requestRender();
 			await terminal.waitForRender();
 
@@ -252,11 +303,14 @@ describe("TUI Kitty image cleanup", () => {
 				{ maxWidthCells: 6 },
 				{ widthPx: 60, heightPx: 60 },
 			);
-			const imageLines = image.render(40);
+			const imageFrame = image.render(40);
+			const imageLines = imageFrame.lines;
 			const imageSequence = lineAt(imageLines, 0);
 			assert.ok(imageLines.length > terminal.rows, "test image should exceed the viewport height");
 
-			component.lines = ["before", ...imageLines, "after"];
+			component.setFrame(
+				concatRenderFrames([createRenderFrame(["before"]), imageFrame, createRenderFrame(["after"])]),
+			);
 			tui.requestRender(true);
 			await terminal.waitForRender();
 
@@ -281,13 +335,13 @@ describe("TUI Kitty image cleanup", () => {
 		tui.addChild(component);
 
 		const oldImage = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 42, moveCursor: false });
-		component.lines = ["top", oldImage];
+		component.setFrame(kittyFrame(["top", oldImage], 1, 2, 42));
 		tui.start();
 		await terminal.waitForRender();
 		terminal.clearWrites();
 
 		const newImage = encodeKitty("BBBB", { columns: 2, rows: 1, imageId: 42, moveCursor: false });
-		component.lines = [newImage, ""];
+		component.setFrame(kittyFrame([newImage, ""], 0, 1, 42));
 		tui.requestRender();
 		await terminal.waitForRender();
 
@@ -308,12 +362,12 @@ describe("TUI Kitty image cleanup", () => {
 		tui.addChild(component);
 
 		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 88, moveCursor: false });
-		component.lines = ["", image];
+		component.setFrame(kittyFrame(["", image], 1, 2, 88));
 		tui.start();
 		await terminal.waitForRender();
 		terminal.clearWrites();
 
-		component.lines = ["covered", image];
+		component.setFrame(kittyFrame(["covered", image], 1, 2, 88));
 		tui.requestRender();
 		await terminal.waitForRender();
 
@@ -374,12 +428,13 @@ describe("TUI Kitty image cleanup", () => {
 		const component = new TestComponent();
 		tui.addChild(component);
 
-		component.lines = [encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 77, moveCursor: false })];
+		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 77, moveCursor: false });
+		component.setFrame(kittyFrame([image], 0, 2, 77));
 		tui.start();
 		await terminal.waitForRender();
 		terminal.clearWrites();
 
-		component.lines = ["plain text"];
+		component.setFrame(createRenderFrame(["plain text"]));
 		tui.requestRender(true);
 		await terminal.waitForRender();
 
@@ -389,6 +444,121 @@ describe("TUI Kitty image cleanup", () => {
 		assert.ok(deleteIndex >= 0, "previous image should be deleted during full redraw");
 		assert.ok(clearIndex >= 0, "full redraw should clear the screen");
 		assert.ok(deleteIndex < clearIndex, "old image should be deleted before the screen is cleared");
+
+		tui.stop();
+	});
+
+	it("replaces retained visible Kitty placements during viewport-only redraws", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 5);
+		terminal.write("SHELL_SENTINEL\r\n");
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 101, moveCursor: false });
+		component.setFrame(
+			kittyFrame(["line 0", "line 1", "line 2", "line 3", image, "", "line 6", "line 7"], 4, 2, 101),
+		);
+		tui.addChild(component);
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		tui.resetViewportOnNextRender();
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		const placementDeleteIndex = writes.indexOf(deleteKittyPlacements(101));
+		const clearIndex = writes.indexOf("\x1b[2J\x1b[H");
+		const drawIndex = writes.indexOf(image, clearIndex);
+		assert.ok(placementDeleteIndex >= 0, "visible placement should be removed before repainting");
+		assert.ok(clearIndex > placementDeleteIndex, "placement deletion should precede the viewport clear");
+		assert.ok(drawIndex > clearIndex, "retained image should be redrawn after the viewport clear");
+		assert.ok(!writes.includes(deleteKittyImage(101)), "retained image data should not be freed");
+		assert.ok(!writes.includes("\x1b[3J"), "viewport redraw must preserve scrollback");
+		assert.ok(getBufferText(terminal).includes("SHELL_SENTINEL"), "existing scrollback should remain available");
+
+		tui.stop();
+	});
+
+	it("frees removed Kitty images during viewport-only redraws", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 5);
+		terminal.write("SHELL_SENTINEL\r\n");
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 102, moveCursor: false });
+		component.setFrame(
+			kittyFrame(["line 0", "line 1", "line 2", "line 3", image, "", "line 6", "line 7"], 4, 2, 102),
+		);
+		tui.addChild(component);
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		component.setFrame(createRenderFrame(Array.from({ length: 8 }, (_, index) => `replacement ${index}`)));
+		tui.resetViewportOnNextRender();
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		const imageDeleteIndex = writes.indexOf(deleteKittyImage(102));
+		const clearIndex = writes.indexOf("\x1b[2J\x1b[H");
+		assert.ok(imageDeleteIndex >= 0, "removed image data should be freed");
+		assert.ok(clearIndex > imageDeleteIndex, "image deletion should precede the viewport clear");
+		assert.ok(!writes.includes(image), "removed image should not be redrawn");
+		assert.ok(!writes.includes("\x1b[3J"), "viewport redraw must preserve scrollback");
+		assert.ok(getBufferText(terminal).includes("SHELL_SENTINEL"), "existing scrollback should remain available");
+
+		tui.stop();
+	});
+
+	it("leaves retained offscreen Kitty placements intact during viewport-only redraws", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 5);
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		const historicalImage = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 103, moveCursor: false });
+		const visibleImage = encodeKitty("BBBB", { columns: 2, rows: 2, imageId: 104, moveCursor: false });
+		const lines = ["line 0", historicalImage, "", "line 3", "line 4", "line 5", visibleImage, "", "line 8", "line 9"];
+		component.setFrame(
+			createRenderFrame(lines, [
+				{
+					top: 1,
+					anchor: 1,
+					left: 0,
+					columns: 2,
+					rows: 2,
+					protocol: "kitty",
+					imageId: 103,
+					sequence: historicalImage,
+					exactSequence: true,
+				},
+				{
+					top: 6,
+					anchor: 6,
+					left: 0,
+					columns: 2,
+					rows: 2,
+					protocol: "kitty",
+					imageId: 104,
+					sequence: visibleImage,
+					exactSequence: true,
+				},
+			]),
+		);
+		tui.addChild(component);
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		tui.resetViewportOnNextRender();
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		assert.ok(!writes.includes(deleteKittyPlacements(103)), "historical placement should remain in scrollback");
+		assert.ok(!writes.includes(deleteKittyImage(103)), "historical image data should remain retained");
+		assert.ok(writes.includes(deleteKittyPlacements(104)), "visible placement should be removed before repainting");
+		assert.ok(writes.includes(visibleImage), "visible placement should be redrawn");
+		assert.ok(!writes.includes(historicalImage), "historical image should not be replayed into the viewport");
 
 		tui.stop();
 	});
@@ -637,6 +807,98 @@ describe("TUI content shrinkage", () => {
 });
 
 describe("TUI differential rendering", () => {
+	it("resets the active viewport without clearing existing scrollback", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		terminal.write("SHELL_SENTINEL\r\n");
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		component.lines = Array.from({ length: 30 }, (_, index) => `Old line ${index}`);
+		tui.addChild(component);
+		tui.start();
+		await terminal.waitForRender();
+		assert.ok(getBufferText(terminal).includes("SHELL_SENTINEL"));
+		terminal.clearWrites();
+
+		component.lines = Array.from({ length: 45 }, (_, index) => `New line ${index}`);
+		tui.resetViewportOnNextRender();
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		assert.ok(terminal.getWrites().includes("\x1b[2J\x1b[H"), "viewport reset should clear the active screen");
+		assert.ok(!terminal.getWrites().includes("\x1b[3J"), "viewport reset must not clear scrollback");
+		assert.ok(getBufferText(terminal).includes("SHELL_SENTINEL"), "preexisting scrollback should remain available");
+		assert.deepStrictEqual(
+			terminal.getViewport(),
+			Array.from({ length: 10 }, (_, index) => `New line ${index + 35}`),
+		);
+
+		component.lines[44] = "Updated new line 44";
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport().at(-1), "Updated new line 44");
+
+		component.lines.push("New line 45");
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport().at(-1), "New line 45");
+		assert.ok(getBufferText(terminal).includes("SHELL_SENTINEL"));
+
+		tui.stop();
+	});
+
+	for (const protocol of ["kitty", "sixel", "iterm2"] as const) {
+		it(`aligns viewport-only redraws past partial ${protocol} image blocks`, async () => {
+			setCapabilities({ images: protocol, trueColor: true, hyperlinks: true });
+			setCellDimensions({ widthPx: 1, heightPx: 1 });
+			let image: Image | undefined;
+			try {
+				const terminal = new LoggingVirtualTerminal(20, 5);
+				const tui = new TuiMainScreen(terminal);
+				const before = new TestComponent();
+				before.lines = ["before"];
+				image = new Image(
+					solidPngBase64(2, 3),
+					"image/png",
+					{ fallbackColor: (value) => value },
+					{ maxWidthCells: 2, maxHeightCells: 3 },
+					{ widthPx: 2, heightPx: 3 },
+				);
+				const imageLines = image.render(20).lines;
+				assert.strictEqual(imageLines.length, 3, "test image should reserve three rows");
+				const after = new TestComponent();
+				after.lines = ["after 0", "after 1", "after 2"];
+				tui.addChild(before);
+				tui.addChild(image);
+				tui.addChild(after);
+				tui.start();
+				await terminal.waitForRender();
+				terminal.clearWrites();
+
+				tui.resetViewportOnNextRender();
+				tui.requestRender();
+				await terminal.waitForRender();
+
+				const writes = terminal.getWrites();
+				const clearSequence = "\x1b[2J\x1b[H";
+				const clearIndex = writes.indexOf(clearSequence);
+				assert.ok(clearIndex >= 0, "viewport-only redraw should clear the active screen");
+				const tailIndex = writes.indexOf("after 0", clearIndex);
+				assert.ok(tailIndex >= 0, "viewport-only redraw should emit the safe transcript tail");
+				assert.strictEqual(
+					writes.slice(clearIndex + clearSequence.length, tailIndex),
+					"\r\n\r\n",
+					"redraw should skip the clipped image block without emitting its rows or anchor",
+				);
+
+				tui.stop();
+			} finally {
+				image?.dispose();
+				resetCapabilitiesCache();
+				setCellDimensions({ widthPx: 9, heightPx: 18 });
+			}
+		});
+	}
+
 	it("reports logical render work separately from terminal output", async () => {
 		const terminal = new LoggingVirtualTerminal(40, 10);
 		const tui = new TuiMainScreen(terminal);

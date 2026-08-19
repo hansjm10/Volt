@@ -1,5 +1,13 @@
 import type { AssistantMessage } from "@hansjm10/volt-ai";
-import { Container, Markdown, type MarkdownTheme, Spacer, Text } from "@hansjm10/volt-tui";
+import {
+	Container,
+	Markdown,
+	type MarkdownTheme,
+	mapRenderFrameLines,
+	type RenderFrame,
+	Spacer,
+	Text,
+} from "@hansjm10/volt-tui";
 import { getMarkdownTheme, theme } from "../../../core/theme/runtime.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -56,18 +64,17 @@ export class AssistantMessageComponent extends Container {
 		this.contentDirty = true;
 	}
 
-	override render(width: number): string[] {
+	override render(width: number): RenderFrame {
 		if (this.contentDirty) {
 			this.rebuildContent();
 		}
-		const lines = super.render(width);
-		if (this.hasToolCalls || lines.length === 0) {
-			return lines;
-		}
-
-		lines[0] = OSC133_ZONE_START + lines[0];
-		lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
-		return lines;
+		const frame = super.render(width);
+		if (this.hasToolCalls || frame.lines.length === 0) return frame;
+		return mapRenderFrameLines(frame, (line, row) => {
+			if (row === 0) return OSC133_ZONE_START + line;
+			if (row === frame.lines.length - 1) return OSC133_ZONE_END + OSC133_ZONE_FINAL + line;
+			return line;
+		});
 	}
 
 	updateContent(message: AssistantMessage): void {

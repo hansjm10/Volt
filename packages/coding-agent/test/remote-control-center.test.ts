@@ -245,7 +245,7 @@ describe("RemoteControlCenterComponent", () => {
 		const backend = new FakeBackend({ kind: "online", status: status() });
 		const { component } = createComponent(backend, 45);
 		await component.start();
-		const text = component.render(120).map(stripAnsi).join("\n");
+		const text = component.render(120).lines.map(stripAnsi).join("\n");
 
 		expect(text).toContain("Remote Access");
 		expect(text).toContain("1 attached phone · 1 paired device");
@@ -282,7 +282,7 @@ describe("RemoteControlCenterComponent", () => {
 		});
 		const { component } = createComponent(backend, 45);
 		await component.start();
-		const text = component.render(200).map(stripAnsi).join("\n");
+		const text = component.render(200).lines.map(stripAnsi).join("\n");
 
 		expect(text).toContain(`Tools: ${DEFAULT_IROH_REMOTE_ALLOW_TOOLS.split(",").join(", ")} (default)`);
 		expect(text).toContain("Tools: none");
@@ -304,7 +304,7 @@ describe("RemoteControlCenterComponent", () => {
 		const backend = new FakeBackend({ kind: "online", status: legacyStatus });
 		const { component } = createComponent(backend, 45);
 		await component.start();
-		const text = component.render(100).map(stripAnsi).join("\n");
+		const text = component.render(100).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("Detached runtime retention: not reported");
 		expect(text).toContain("Tools: not reported");
 		expect(text).toContain("Restart voltd to pair with explicit access grants");
@@ -320,7 +320,7 @@ describe("RemoteControlCenterComponent", () => {
 			const backend = new FakeBackend({ kind: "online", status: status() });
 			const { component } = createComponent(backend, rows);
 			await component.start();
-			const lines = component.render(width);
+			const lines = component.render(width).lines;
 			expect(lines).toHaveLength(rows);
 			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
@@ -337,9 +337,9 @@ describe("RemoteControlCenterComponent", () => {
 		const backend = new FakeBackend({ kind: "online", status: status({ clients }) });
 		const { component } = createComponent(backend, 24);
 		await component.start();
-		component.render(80);
+		component.render(80).lines;
 		for (let index = 0; index < 4; index++) component.handleInput("\x1b[6~");
-		const text = component.render(80).map(stripAnsi).join("\n");
+		const text = component.render(80).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("LEASES");
 		expect(text).toContain("Current · volt/session-current");
 	});
@@ -348,13 +348,13 @@ describe("RemoteControlCenterComponent", () => {
 		const backend = new FakeBackend({ kind: "offline", state: "not-running" });
 		const { component } = createComponent(backend);
 		await component.start();
-		expect(component.render(80).map(stripAnsi).join("\n")).toContain("Start daemon");
+		expect(component.render(80).lines.map(stripAnsi).join("\n")).toContain("Start daemon");
 
 		backend.nextSnapshot = { kind: "online", status: status() };
 		component.handleInput("\n");
 		await settle();
 		expect(backend.startCalls).toBe(1);
-		expect(component.render(80).map(stripAnsi).join("\n")).toContain("Daemon started");
+		expect(component.render(80).lines.map(stripAnsi).join("\n")).toContain("Daemon started");
 	});
 
 	it("requires confirmation before backing up and regenerating invalid daemon state", async () => {
@@ -370,13 +370,13 @@ describe("RemoteControlCenterComponent", () => {
 		const backend = new FakeBackend(invalidSnapshot);
 		const { component } = createComponent(backend);
 		await component.start();
-		let text = component.render(100).map(stripAnsi).join("\n");
+		let text = component.render(100).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("Regenerate daemon state…");
 		expect(text).toContain("preserves validated settings/identity when possible");
 
 		component.handleInput("\n");
 		expect(backend.regenerateCalls).toBe(0);
-		text = component.render(100).map(stripAnsi).join("\n");
+		text = component.render(100).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("Confirm regenerate state");
 		expect(text).toContain("timestamped backup");
 
@@ -385,7 +385,7 @@ describe("RemoteControlCenterComponent", () => {
 		await settle();
 		expect(backend.regenerateCalls).toBe(1);
 		expect(backend.startCalls).toBe(1);
-		text = component.render(100).map(stripAnsi).join("\n");
+		text = component.render(100).lines.map(stripAnsi).join("\n");
 		expect(text).toContain(
 			"Daemon state regenerated; backup saved to /tmp/state.json.invalid-1 · Iroh identity preserved",
 		);
@@ -395,15 +395,15 @@ describe("RemoteControlCenterComponent", () => {
 		const backend = new FakeBackend({ kind: "online", status: status({ workspaces: [] }) });
 		const { component } = createComponent(backend, 36);
 		await component.start();
-		component.render(100);
-		expect(component.render(100).map(stripAnsi).join("\n")).toContain("Register current directory");
+		component.render(100).lines;
+		expect(component.render(100).lines.map(stripAnsi).join("\n")).toContain("Register current directory");
 
 		component.handleInput("\x1b[B");
 		component.handleInput("\n");
 		await settle();
 
 		expect(backend.registerCalls).toEqual(["/tmp/volt"]);
-		const text = component.render(100).map(stripAnsi).join("\n");
+		const text = component.render(100).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("Workspace volt is available");
 		expect(text).toContain("Current · volt · /tmp/volt");
 		expect(text).toContain("Pair a phone");
@@ -413,11 +413,11 @@ describe("RemoteControlCenterComponent", () => {
 		const backend = new FakeBackend({ kind: "online", status: status() });
 		const { component, copied } = createComponent(backend, 24);
 		await component.start();
-		component.render(40);
+		component.render(40).lines;
 		component.handleInput("\x1b[B");
 		component.handleInput("\x1b[B");
 		component.handleInput("\n");
-		let text = component.render(80).map(stripAnsi).join("\n");
+		let text = component.render(80).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("Choose what this phone may do");
 		expect(text).toContain("Everything: API keys, log upload, host control, worktrees, and workspaces");
 		component.handleInput("\x1b[B");
@@ -435,7 +435,7 @@ describe("RemoteControlCenterComponent", () => {
 			ticket: "volt+iroh://v1/test-pairing-ticket",
 		});
 		backend.pairingProgress?.({ type: "pairing_progress", requestId: "pair-1", phase: "waiting" });
-		text = component.render(40).map(stripAnsi).join("\n");
+		text = component.render(40).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("PAIR PHONE · volt · Full access");
 		expect(text).toContain("Scan with Volt, then compare");
 		expect(text).toContain("Enlarge the terminal");
@@ -444,19 +444,19 @@ describe("RemoteControlCenterComponent", () => {
 		component.handleInput("\n");
 		await settle();
 		expect(copied).toEqual(["volt+iroh://v1/test-pairing-ticket"]);
-		text = component.render(40).map(stripAnsi).join("\n");
+		text = component.render(40).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("Pairing ticket copied");
 
 		component.handleInput("\x1b");
 		expect(backend.pairDisposeCalls).toBe(1);
-		expect(component.render(40).map(stripAnsi).join("\n")).toContain("HEADLESS POLICY");
+		expect(component.render(40).lines.map(stripAnsi).join("\n")).toContain("HEADLESS POLICY");
 	});
 
 	it("shows full safe pairing verification details at the narrow review size", async () => {
 		const backend = new FakeBackend({ kind: "online", status: status() });
 		const { component } = createComponent(backend, 24);
 		await component.start();
-		component.render(80);
+		component.render(80).lines;
 		component.handleInput("\x1b[B");
 		component.handleInput("\x1b[B");
 		component.handleInput("\n");
@@ -470,7 +470,7 @@ describe("RemoteControlCenterComponent", () => {
 		});
 		backend.pairingProgress?.({ type: "pairing_progress", requestId: "pair-1", phase: "waiting" });
 
-		const lines = component.render(80);
+		const lines = component.render(80).lines;
 		const text = lines.map(stripAnsi).join("\n");
 		expect(lines).toHaveLength(24);
 		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
@@ -499,20 +499,20 @@ describe("RemoteControlCenterComponent", () => {
 		});
 		const { component } = createComponent(backend, 24);
 		await component.start();
-		component.render(80);
+		component.render(80).lines;
 		component.handleInput("\x1b[B");
 		component.handleInput("\x1b[B");
 		component.handleInput("\n");
-		component.render(80);
+		component.render(80).lines;
 		component.handleInput("\x1b[B");
 		component.handleInput("\n");
 
-		let text = component.render(80).map(stripAnsi).join("\n");
+		let text = component.render(80).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("PAIR A PHONE · Review");
 		expect(text).toContain("Choose the phone's initial workspace");
 
 		component.handleInput("\x1b");
-		text = component.render(80).map(stripAnsi).join("\n");
+		text = component.render(80).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("PAIR A PHONE · ACCESS");
 
 		component.handleInput("\n");
@@ -526,27 +526,27 @@ describe("RemoteControlCenterComponent", () => {
 		const backend = new EndpointUnavailableBackend({ kind: "online", status: status() });
 		const { component } = createComponent(backend, 36);
 		await component.start();
-		component.render(100);
+		component.render(100).lines;
 		component.handleInput("\x1b[B");
 		component.handleInput("\x1b[B");
 		component.handleInput("\n");
 		component.handleInput("\n");
 		await settle();
 
-		let text = component.render(100).map(stripAnsi).join("\n");
+		let text = component.render(100).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("Iroh endpoint did not become ready within 15s");
 		expect(text).toContain("Recover previous daemon state…");
 
 		component.handleInput("\n");
 		expect(backend.recoverCalls).toEqual([]);
-		text = component.render(100).map(stripAnsi).join("\n");
+		text = component.render(100).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("Confirm recover and restart");
 		expect(text).toContain("Legacy access records are dropped");
 
 		component.handleInput("\n");
 		await settle();
 		expect(backend.recoverCalls).toEqual(["/tmp/state.json.corrupt-1"]);
-		text = component.render(100).map(stripAnsi).join("\n");
+		text = component.render(100).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("Recovered daemon state and preserved the Iroh identity");
 	});
 
@@ -554,13 +554,13 @@ describe("RemoteControlCenterComponent", () => {
 		const backend = new DeferredPairBackend({ kind: "online", status: status() });
 		const { component } = createComponent(backend, 36);
 		await component.start();
-		component.render(100);
+		component.render(100).lines;
 		component.handleInput("\x1b[B");
 		component.handleInput("\x1b[B");
 		component.handleInput("\n");
 		component.handleInput("\n");
 		component.handleInput("\x1b");
-		component.render(100);
+		component.render(100).lines;
 		component.handleInput("\n");
 		component.handleInput("\n");
 		expect(backend.pairResolvers).toHaveLength(2);
@@ -573,7 +573,7 @@ describe("RemoteControlCenterComponent", () => {
 			phase: "failed",
 			error: "stale failure",
 		});
-		expect(component.render(100).map(stripAnsi).join("\n")).not.toContain("stale failure");
+		expect(component.render(100).lines.map(stripAnsi).join("\n")).not.toContain("stale failure");
 
 		backend.resolvePair(1);
 		await settle();
@@ -582,14 +582,14 @@ describe("RemoteControlCenterComponent", () => {
 			requestId: "pair-1",
 			phase: "waiting",
 		});
-		expect(component.render(100).map(stripAnsi).join("\n")).toContain("Scan with Volt, then compare");
+		expect(component.render(100).lines.map(stripAnsi).join("\n")).toContain("Scan with Volt, then compare");
 	});
 
 	it("renders a complete QR only when the viewport can contain it", async () => {
 		const backend = new FakeBackend({ kind: "online", status: status() });
 		const { component } = createComponent(backend, 50);
 		await component.start();
-		component.render(160);
+		component.render(160).lines;
 		component.handleInput("\x1b[B");
 		component.handleInput("\x1b[B");
 		component.handleInput("\n");
@@ -601,12 +601,12 @@ describe("RemoteControlCenterComponent", () => {
 			phase: "ticket",
 			ticket: verificationTicket(),
 		});
-		let lines = component.render(160);
+		let lines = component.render(160).lines;
 		expect(lines.map(stripAnsi).join("\n")).toContain("Show pairing QR");
 		component.handleInput("\x1b[A");
 		component.handleInput("\x1b[A");
 		component.handleInput("\n");
-		lines = component.render(160);
+		lines = component.render(160).lines;
 		const text = lines.map(stripAnsi).join("\n");
 		expect(text).not.toContain("Enlarge the terminal");
 		expect(text).toMatch(/[▀▄█]/);
@@ -618,7 +618,7 @@ describe("RemoteControlCenterComponent", () => {
 			phase: "completed",
 			clientNodeId: "paired-phone",
 		});
-		const completed = component.render(160).map(stripAnsi).join("\n");
+		const completed = component.render(160).lines.map(stripAnsi).join("\n");
 		expect(completed).toContain("Pairing complete");
 		expect(completed).toContain("Paired paired-phone");
 		expect(completed).not.toMatch(/[▀▄█]/);
@@ -628,13 +628,13 @@ describe("RemoteControlCenterComponent", () => {
 		const backend = new FakeBackend({ kind: "online", status: status() });
 		const { component } = createComponent(backend, 36);
 		await component.start();
-		component.render(100);
+		component.render(100).lines;
 		component.handleInput("\x1b[B");
 		component.handleInput("\x1b[B");
 		component.handleInput("\x1b[B");
 		component.handleInput("\n");
 		expect(backend.revokeCalls).toEqual([]);
-		expect(component.render(100).map(stripAnsi).join("\n")).toContain("Confirm revoke");
+		expect(component.render(100).lines.map(stripAnsi).join("\n")).toContain("Confirm revoke");
 
 		component.handleInput("\n");
 		await settle();
@@ -660,19 +660,19 @@ describe("RemoteControlCenterComponent", () => {
 		});
 		const { component } = createComponent(backend, 36);
 		await component.start();
-		component.render(100);
+		component.render(100).lines;
 		component.handleInput("\x1b[B");
 		component.handleInput("\x1b[B");
 		component.handleInput("\x1b[B");
 		component.handleInput("\n");
 
 		expect(backend.repairApprovalCalls).toEqual([]);
-		expect(component.render(100).map(stripAnsi).join("\n")).toContain("Confirm allow re-pair");
+		expect(component.render(100).lines.map(stripAnsi).join("\n")).toContain("Confirm allow re-pair");
 
 		component.handleInput("\n");
 		await settle();
 		expect(backend.repairApprovalCalls).toEqual([revokedNodeId]);
-		const text = component.render(100).map(stripAnsi).join("\n");
+		const text = component.render(100).lines.map(stripAnsi).join("\n");
 		expect(text).toContain("Re-pair approved. Choose Pair a phone and scan a fresh QR.");
 		expect(text).toContain("Re-pair approved · scan a fresh QR");
 	});
@@ -692,7 +692,7 @@ describe("RemoteControlCenterComponent", () => {
 		const backend = new FakeBackend({ kind: "online", status: unsafe });
 		const { component } = createComponent(backend, 45);
 		await component.start();
-		const rendered = component.render(100).join("\n");
+		const rendered = component.render(100).lines.join("\n");
 		expect(rendered).not.toContain("example.invalid");
 		expect(stripAnsi(rendered)).toContain("spoofed");
 	});

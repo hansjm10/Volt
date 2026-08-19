@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Question Tool - Single question with options
  * Full custom UI: options list + inline editor for "Type something..."
@@ -135,8 +136,8 @@ export default function question(volt: ExtensionAPI) {
 						}
 					}
 
-					function render(width: number): string[] {
-						if (cachedLines) return cachedLines;
+					function render(width: number): RenderFrame {
+						if (cachedLines) return createRenderFrame(cachedLines);
 
 						const lines: string[] = [];
 						const renderWidth = Math.max(1, width);
@@ -181,7 +182,7 @@ export default function question(volt: ExtensionAPI) {
 						if (editMode) {
 							lines.push("");
 							addWrappedWithPrefix(" ", theme.fg("muted", "Your answer:"));
-							for (const line of editor.render(Math.max(1, renderWidth - 2))) {
+							for (const line of editor.render(Math.max(1, renderWidth - 2)).lines) {
 								lines.push(` ${line}`);
 							}
 						}
@@ -195,7 +196,7 @@ export default function question(volt: ExtensionAPI) {
 						lines.push(theme.fg("accent", "─".repeat(renderWidth)));
 
 						cachedLines = lines;
-						return lines;
+						return createRenderFrame(lines);
 					}
 
 					return {

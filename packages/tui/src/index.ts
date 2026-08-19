@@ -71,6 +71,19 @@ export {
 	parseKey,
 	setKittyProtocolActive,
 } from "./keys.ts";
+// Explicit component render frames and composition helpers
+export {
+	concatRenderFrames,
+	createRenderFrame,
+	type ImagePlacement,
+	mapRenderFrameLines,
+	padRenderFrameRows,
+	prefixRenderFrame,
+	type RenderFrame,
+	sliceRenderFrame,
+	spliceRenderFrameRows,
+	translateRenderFrame,
+} from "./render-frame.ts";
 // Input buffering for batch splitting
 export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.ts";
 // Terminal interface and implementations

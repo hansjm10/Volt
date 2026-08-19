@@ -119,7 +119,7 @@ describe("drain viewer (§6.3)", () => {
 		);
 		expect(wireUpdate).not.toHaveProperty("message");
 		sendProjected(viewer, projector, { type: "message_end", message: updatedMessage });
-		const rendered = stripAnsi(viewer.render(80).join("\n"));
+		const rendered = stripAnsi(viewer.render(80).lines.join("\n"));
 		expect(rendered).toContain("remote says hi from the phone");
 		expect(rendered).toContain("finishing remote turn");
 
@@ -189,7 +189,7 @@ describe("drain viewer (§6.3)", () => {
 		);
 		send({ type: "message_end", message: finalMessage });
 
-		const rendered = stripAnsi(viewer.render(100).join("\n"));
+		const rendered = stripAnsi(viewer.render(100).lines.join("\n"));
 		expect(rendered).toContain("mid-stream");
 		expect(rendered).toContain("plan");
 		expect(rendered).toContain("notes.md");
@@ -236,7 +236,7 @@ describe("drain viewer (§6.3)", () => {
 		);
 		expect(delta).not.toHaveProperty("message");
 
-		const rendered = stripAnsi(viewer.render(100).join("\n"));
+		const rendered = stripAnsi(viewer.render(100).lines.join("\n"));
 		expect(rendered).toContain("notes.md");
 		grant.reject(new Error("test over"));
 	});
@@ -256,7 +256,7 @@ describe("drain viewer (§6.3)", () => {
 			message: fauxAssistantMessage("authoritative final reply", { timestamp: 0 }),
 		});
 
-		const rendered = stripAnsi(viewer.render(80).join("\n"));
+		const rendered = stripAnsi(viewer.render(80).lines.join("\n"));
 		expect(rendered).toContain("authoritative final reply");
 		grant.reject(new Error("test over"));
 	});
@@ -277,7 +277,7 @@ describe("drain viewer (§6.3)", () => {
 			stream: { epoch: 2, seq: 0 },
 			message: fauxAssistantMessage("ignored after truncation", { timestamp: 0 }),
 		});
-		const rendered = stripAnsi(viewer.render(80).join("\n"));
+		const rendered = stripAnsi(viewer.render(80).lines.join("\n"));
 		expect(rendered).not.toContain("will be dropped");
 		expect(rendered).not.toContain("ignored after truncation");
 		expect(rendered).toContain("finishing remote turn");

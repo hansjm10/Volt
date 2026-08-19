@@ -1,7 +1,16 @@
 import type { Component, RenderSuspensionLease, Terminal, TUI, TuiMode } from "@hansjm10/volt-tui";
-import { Container, Image, isViewportTUI, resetCapabilitiesCache, setCapabilities, VStack } from "@hansjm10/volt-tui";
+import {
+	Container,
+	createRenderFrame,
+	Image,
+	isViewportTUI,
+	resetCapabilitiesCache,
+	setCapabilities,
+	VStack,
+} from "@hansjm10/volt-tui";
 import { describe, expect, it, vi } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
+import { KeybindingsManager } from "../src/core/keybindings.ts";
 import {
 	createInteractiveTui,
 	createInteractiveTuiReference,
@@ -72,7 +81,7 @@ describe("createInteractiveTui", () => {
 		const invalidatedModes: TuiMode[] = [];
 		const component: Component & { focused: boolean } = {
 			focused: false,
-			render: () => ["content"],
+			render: () => createRenderFrame(["content"]),
 			invalidate: () => invalidatedModes.push(stableUi.mode),
 		};
 		const view = { regularComponents: [component], fullscreenRoot: component };
@@ -84,6 +93,7 @@ describe("createInteractiveTui", () => {
 			ui: undefined as unknown as TUI,
 			activeView: view,
 			conversationView: view,
+			keybindings: new KeybindingsManager(),
 			planDetails: undefined,
 			mainScreenRenderState: undefined,
 			sessionRenderSuspension: undefined as RenderSuspensionLease | undefined,
@@ -149,7 +159,7 @@ describe("createInteractiveTui", () => {
 			{ maxWidthCells: 2 },
 			{ widthPx: 20, heightPx: 20 },
 		);
-		const temporary = { render: () => ["settings"], invalidate: () => {} } satisfies Component;
+		const temporary = { render: () => createRenderFrame(["settings"]), invalidate: () => {} } satisfies Component;
 		const conversationView: { regularComponents: Component[]; fullscreenRoot: Component } = {
 			regularComponents: [image],
 			fullscreenRoot: image,
@@ -254,8 +264,8 @@ describe("createInteractiveTui", () => {
 			logDirectory: "/tmp",
 			terminal,
 		});
-		const component = { render: () => ["content"], invalidate: () => {} } satisfies Component;
-		const overlay = { render: () => ["overlay"], invalidate: () => {} } satisfies Component;
+		const component = { render: () => createRenderFrame(["content"]), invalidate: () => {} } satisfies Component;
+		const overlay = { render: () => createRenderFrame(["overlay"]), invalidate: () => {} } satisfies Component;
 		const view = { regularComponents: [component], fullscreenRoot: component };
 		previousRenderer.addChild(component);
 
@@ -307,8 +317,14 @@ describe("createInteractiveTui", () => {
 			logDirectory: "/tmp",
 			terminal,
 		});
-		const transcript = { render: () => ["FINAL TRANSCRIPT"], invalidate: () => {} } satisfies Component;
-		const temporary = { render: () => ["TEMP SETTINGS"], invalidate: () => {} } satisfies Component;
+		const transcript = {
+			render: () => createRenderFrame(["FINAL TRANSCRIPT"]),
+			invalidate: () => {},
+		} satisfies Component;
+		const temporary = {
+			render: () => createRenderFrame(["TEMP SETTINGS"]),
+			invalidate: () => {},
+		} satisfies Component;
 		const conversationView = { regularComponents: [transcript], fullscreenRoot: transcript };
 		const temporaryView = { regularComponents: [temporary], fullscreenRoot: temporary };
 		const context = Object.assign(Object.create(InteractiveMode.prototype), {
@@ -354,10 +370,10 @@ describe("InteractiveMode active views", () => {
 			logDirectory: "/tmp",
 			terminal,
 		});
-		const main = { render: () => ["MAIN"], invalidate: () => {} } satisfies Component;
+		const main = { render: () => createRenderFrame(["MAIN"]), invalidate: () => {} } satisfies Component;
 		const editor = {
 			focused: false,
-			render: () => ["EDITOR"],
+			render: () => createRenderFrame(["EDITOR"]),
 			invalidate: () => {},
 		} satisfies Component & { focused: boolean };
 		const editorContainer = new Container();
@@ -389,7 +405,7 @@ describe("InteractiveMode active views", () => {
 			let close: () => void = () => undefined;
 			const selector = {
 				focused: false,
-				render: () => ["SELECTOR"],
+				render: () => createRenderFrame(["SELECTOR"]),
 				invalidate: () => {},
 			} satisfies Component & { focused: boolean };
 			prototype.showSelector.call(context, (done) => {
@@ -433,7 +449,7 @@ describe("InteractiveMode right-click paste", () => {
 		const clipboard = await import("../src/utils/clipboard.ts");
 		const readClipboardText = vi.spyOn(clipboard, "readClipboardText").mockResolvedValue("clipboard text");
 		const handleInput = vi.fn<(data: string) => void>();
-		const target = { render: () => [], invalidate: () => {}, handleInput } satisfies Component;
+		const target = { render: () => createRenderFrame([]), invalidate: () => {}, handleInput } satisfies Component;
 		const requestRender = vi.fn();
 		const context = {
 			renderer: { getFocusedComponent: () => target },

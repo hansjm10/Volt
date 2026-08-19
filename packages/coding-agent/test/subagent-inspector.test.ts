@@ -124,7 +124,7 @@ describe("SubagentInspectorComponent", () => {
 		const close = vi.fn();
 		const inspector = new SubagentInspectorComponent(source, tui, close);
 
-		const running = stripAnsi(inspector.render(100).join("\n"));
+		const running = stripAnsi(inspector.render(100).lines.join("\n"));
 		expect(running).toContain("Subagents  1 running · 1 done");
 		expect(running).toContain("Subagent B · reviewer");
 		expect(running).toContain("● running");
@@ -135,7 +135,7 @@ describe("SubagentInspectorComponent", () => {
 		expect(running).not.toContain("session_reviewer");
 
 		inspector.handleInput("\x1b[D");
-		const completed = stripAnsi(inspector.render(100).join("\n"));
+		const completed = stripAnsi(inspector.render(100).lines.join("\n"));
 		expect(completed).toContain("Subagent A · scout");
 		expect(completed).toContain("I will inspect the relevant files.");
 		expect(completed).toContain("read  src/auth.ts");
@@ -170,7 +170,7 @@ describe("SubagentInspectorComponent", () => {
 		source.emit();
 
 		expect(requestRender).toHaveBeenCalled();
-		const rendered = stripAnsi(inspector.render(80).join("\n"));
+		const rendered = stripAnsi(inspector.render(80).lines.join("\n"));
 		expect(rendered).toContain("Subagents  1 done");
 		expect(rendered).toContain("✓ done");
 		expect(rendered).toContain("Live result arrived");
@@ -184,7 +184,7 @@ describe("SubagentInspectorComponent", () => {
 		]);
 		const { tui } = createFakeTui(12);
 		const inspector = new SubagentInspectorComponent(source, tui, () => {});
-		const lines = inspector.render(24);
+		const lines = inspector.render(24).lines;
 
 		expect(lines).toHaveLength(12);
 		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(24);

@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * Tic-Tac-Toe extension - demonstrates executionMode: "sequential" on tools.
  *
@@ -435,9 +436,9 @@ class TicTacToeComponent implements Component {
 		this.cachedWidth = 0;
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		if (width === this.cachedWidth && this.cachedVersion === this.version) {
-			return this.cachedLines;
+			return createRenderFrame(this.cachedLines);
 		}
 
 		const ESC = "\x1b[";
@@ -501,7 +502,7 @@ class TicTacToeComponent implements Component {
 		this.cachedLines = lines;
 		this.cachedWidth = width;
 		this.cachedVersion = this.version;
-		return lines;
+		return createRenderFrame(lines);
 	}
 }
 
@@ -525,7 +526,7 @@ class BannerMessageComponent implements Component {
 
 	invalidate(): void {}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const dim = (s: string) => this.theme.fg("dim", s);
 		const lines: string[] = [];
 		const titleLen = visibleWidth(this.title);
@@ -539,7 +540,7 @@ class BannerMessageComponent implements Component {
 			lines.push(...renderBoardSnapshot(this.details.board, width));
 		}
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 }
 
@@ -558,7 +559,7 @@ class GameOverMessageComponent implements Component {
 
 	invalidate(): void {}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const dim = (s: string) => this.theme.fg("dim", s);
 		const bold = (s: string) => this.theme.bold(s);
 
@@ -600,7 +601,7 @@ class GameOverMessageComponent implements Component {
 		}
 		lines.push(hr);
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 }
 

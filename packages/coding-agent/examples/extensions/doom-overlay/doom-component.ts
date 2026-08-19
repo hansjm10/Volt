@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * DOOM Component for overlay mode
  *
@@ -101,7 +102,7 @@ export class DoomOverlayComponent implements Component {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		// DOOM renders at 640x400 (1.6:1 ratio)
 		// With half-block characters, each terminal row = 2 pixels
 		// So effective ratio is 640:200 = 3.2:1 (width:height in terminal cells)
@@ -118,7 +119,7 @@ export class DoomOverlayComponent implements Component {
 		const truncatedFooter = footer.length > width ? footer.slice(0, width) : footer;
 		lines.push(`\x1b[2m${truncatedFooter}\x1b[0m`);
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	invalidate(): void {}

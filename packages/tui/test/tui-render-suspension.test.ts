@@ -1,14 +1,15 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { type Component, TuiMainScreen } from "../src/index.ts";
+import { createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class CountingComponent implements Component {
 	renderCount = 0;
 
-	render(_width: number): string[] {
+	render(_width: number): RenderFrame {
 		this.renderCount += 1;
-		return ["frame"];
+		return createRenderFrame(["frame"]);
 	}
 
 	invalidate(): void {}

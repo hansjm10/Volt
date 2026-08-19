@@ -1,5 +1,5 @@
 import { LAYOUT_NODE, type ScrollLayoutNode } from "../layout-node.ts";
-import { renderComponentFrame, setImagePlacements } from "../render-frame.ts";
+import { mapRenderFrameLines, type RenderFrame } from "../render-frame.ts";
 import { type Component, Container } from "../tui.ts";
 
 export type ScrollViewScrollbar = "hidden" | "auto" | "always";
@@ -22,7 +22,7 @@ export interface ScrollViewScrollToOptions {
 export class ScrollView extends Container {
 	private readonly child: Component;
 	private readonly followEnd: boolean;
-	readonly primary: boolean;
+	private currentPrimary: boolean;
 	readonly overscroll: "chain" | "contain";
 	readonly scrollbarStyle: (text: string) => string;
 	private currentScrollbar: ScrollViewScrollbar;
@@ -46,7 +46,7 @@ export class ScrollView extends Container {
 		this.children.push(component);
 		this.followEnd = (options.follow ?? "none") === "end";
 		this.followingEnd = this.followEnd;
-		this.primary = options.primary ?? false;
+		this.currentPrimary = options.primary ?? false;
 		this.overscroll = options.overscroll ?? "chain";
 		this.currentScrollbar = options.scrollbar ?? "hidden";
 		this.scrollbarStyle = options.scrollbarStyle ?? ((text) => `\x1b[100m${text}\x1b[49m`);
@@ -55,6 +55,16 @@ export class ScrollView extends Container {
 
 	get scrollTop(): number {
 		return this.currentScrollTop;
+	}
+
+	get primary(): boolean {
+		return this.currentPrimary;
+	}
+
+	setPrimary(primary: boolean): void {
+		if (primary === this.currentPrimary) return;
+		this.currentPrimary = primary;
+		this.requestRenderCallback?.();
 	}
 
 	get isFollowingEnd(): boolean {
@@ -215,14 +225,10 @@ export class ScrollView extends Container {
 		throw new Error("ScrollView child cannot be cleared");
 	}
 
-	override render(width: number): string[] {
+	override render(width: number): RenderFrame {
 		const contentWidth = this.getContentWidth(width);
-		const frame = renderComponentFrame(this.child, contentWidth);
-		if (contentWidth === width) return setImagePlacements(frame.lines, frame.images);
-		return setImagePlacements(
-			frame.lines.map((line) => `${line} `),
-			frame.images,
-		);
+		const frame = this.child.render(contentWidth);
+		return contentWidth === width ? frame : mapRenderFrameLines(frame, (line) => `${line} `);
 	}
 
 	[LAYOUT_NODE](): ScrollLayoutNode {

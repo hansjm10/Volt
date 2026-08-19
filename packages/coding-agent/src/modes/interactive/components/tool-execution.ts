@@ -2,9 +2,14 @@ import {
 	Box,
 	type Component,
 	Container,
+	concatRenderFrames,
+	createRenderFrame,
 	getCapabilities,
 	Image,
+	mapRenderFrameLines,
+	type RenderFrame,
 	Spacer,
+	spliceRenderFrameRows,
 	Text,
 	type TUI,
 	visibleWidth,
@@ -58,22 +63,28 @@ class ToolHeaderMetadata implements Component {
 		this.getMetadata = getMetadata;
 	}
 
-	render(width: number): string[] {
-		const lines = this.component.render(width);
-		if (lines.length === 0) return lines;
+	render(width: number): RenderFrame {
+		const frame = this.component.render(width);
+		if (frame.lines.length === 0) return frame;
 		// Components like Text pad lines to full width with trailing spaces;
 		// strip that padding before measuring (the parent Box re-pads).
-		const index = lines.findIndex((line) => visibleWidth(line.replace(/ +$/, "")) > 0);
-		if (index === -1) return lines;
-		const line = lines[index]!.replace(/ +$/, "");
+		const index = frame.lines.findIndex((line) => visibleWidth(line.replace(/ +$/, "")) > 0);
+		if (index === -1) return frame;
+		const line = frame.lines[index]!.replace(/ +$/, "");
 		const metadata = this.getMetadata();
-		const result = lines.slice();
-		if (visibleWidth(line) + visibleWidth(metadata) + 1 <= width) {
-			result[index] = `${line} ${metadata}`;
-		} else {
-			result.splice(index + 1, 0, metadata);
+		const image = frame.images.find((placement) => index >= placement.top && index < placement.top + placement.rows);
+		if (image) {
+			return spliceRenderFrameRows(
+				frame,
+				Math.min(frame.lines.length, image.top + image.rows),
+				0,
+				createRenderFrame([metadata]),
+			);
 		}
-		return result;
+		if (visibleWidth(line) + visibleWidth(metadata) + 1 <= width) {
+			return mapRenderFrameLines(frame, (value, row) => (row === index ? `${line} ${metadata}` : value));
+		}
+		return spliceRenderFrameRows(frame, index + 1, 0, createRenderFrame([metadata]));
 	}
 
 	invalidate(): void {
@@ -380,33 +391,24 @@ export class ToolExecutionComponent extends Container {
 		this.maybeConvertImagesForTerminal();
 	}
 
-	override render(width: number): string[] {
+	override render(width: number): RenderFrame {
 		if (this.hideComponent) {
-			return [];
+			return createRenderFrame([]);
 		}
 
 		if (this.hasRendererDefinition() && this.getRenderShell() === "self") {
-			const contentLines = this.selfRenderContainer.render(width);
-			if (contentLines.length === 0 && this.imageComponents.length === 0) {
-				return [];
-			}
+			const contentFrame = this.selfRenderContainer.render(width);
+			if (contentFrame.lines.length === 0 && this.imageComponents.length === 0) return createRenderFrame([]);
 
-			const lines: string[] = [];
-			if (contentLines.length > 0) {
-				lines.push("");
-				lines.push(...contentLines);
-			}
+			const frames: RenderFrame[] = [];
+			if (contentFrame.lines.length > 0) frames.push(createRenderFrame([""]), contentFrame);
 			for (let i = 0; i < this.imageComponents.length; i++) {
 				const spacer = this.imageSpacers[i];
-				if (spacer) {
-					lines.push(...spacer.render(width));
-				}
+				if (spacer) frames.push(spacer.render(width));
 				const imageComponent = this.imageComponents[i];
-				if (imageComponent) {
-					lines.push(...imageComponent.render(width));
-				}
+				if (imageComponent) frames.push(imageComponent.render(width));
 			}
-			return lines;
+			return concatRenderFrames(frames);
 		}
 
 		return super.render(width);

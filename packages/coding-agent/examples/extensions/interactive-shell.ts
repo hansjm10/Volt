@@ -1,3 +1,4 @@
+import { createRenderFrame } from "@hansjm10/volt-tui";
 /**
  * Interactive Shell Commands Extension
  *
@@ -175,7 +176,7 @@ export default function (volt: ExtensionAPI) {
 			done(result.status);
 
 			// Return empty component (immediately disposed since done() was called)
-			return { render: () => [], invalidate: () => {} };
+			return { render: () => createRenderFrame([]), invalidate: () => {} };
 		});
 
 		// Return result to prevent default bash handling

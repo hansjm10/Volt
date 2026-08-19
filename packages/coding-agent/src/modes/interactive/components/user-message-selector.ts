@@ -1,4 +1,13 @@
-import { type Component, Container, getKeybindings, Spacer, Text, truncateToWidth } from "@hansjm10/volt-tui";
+import {
+	type Component,
+	Container,
+	createRenderFrame,
+	getKeybindings,
+	type RenderFrame,
+	Spacer,
+	Text,
+	truncateToWidth,
+} from "@hansjm10/volt-tui";
 import { theme } from "../../../core/theme/runtime.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 
@@ -30,12 +39,12 @@ class UserMessageList implements Component {
 		// No cached state to invalidate currently
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const lines: string[] = [];
 
 		if (this.messages.length === 0) {
 			lines.push(theme.fg("muted", "  No user messages found"));
-			return lines;
+			return createRenderFrame(lines);
 		}
 
 		// Calculate visible range with scrolling
@@ -75,7 +84,7 @@ class UserMessageList implements Component {
 			lines.push(scrollInfo);
 		}
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	handleInput(keyData: string): void {

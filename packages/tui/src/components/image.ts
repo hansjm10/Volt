@@ -1,4 +1,4 @@
-import { type ImagePlacement, setImagePlacements } from "../render-frame.ts";
+import { createRenderFrame, type ImagePlacement, type RenderFrame } from "../render-frame.ts";
 import {
 	allocateImageId,
 	getCapabilities,
@@ -32,7 +32,7 @@ export class Image implements Component {
 	private options: ImageOptions;
 	private imageId: number | undefined;
 
-	private cachedLines: string[] | undefined;
+	private cachedFrame: RenderFrame | undefined;
 	private cachedWidth: number | undefined;
 	private cachedGeneration: number | undefined;
 
@@ -57,7 +57,7 @@ export class Image implements Component {
 	}
 
 	invalidate(): void {
-		this.cachedLines = undefined;
+		this.cachedFrame = undefined;
 		this.cachedWidth = undefined;
 		this.cachedGeneration = undefined;
 	}
@@ -65,15 +65,15 @@ export class Image implements Component {
 	/** Release terminal-side preparation retained for this image. Safe to call repeatedly. */
 	dispose(): void {
 		if (this.imageId !== undefined) releaseSixelImage(this.imageId);
-		this.cachedLines = undefined;
+		this.cachedFrame = undefined;
 		this.cachedWidth = undefined;
 		this.cachedGeneration = undefined;
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const generation = getImageRenderGeneration();
-		if (this.cachedLines && this.cachedWidth === width && this.cachedGeneration === generation) {
-			return this.cachedLines;
+		if (this.cachedFrame && this.cachedWidth === width && this.cachedGeneration === generation) {
+			return this.cachedFrame;
 		}
 
 		const maxWidth = Math.max(1, Math.min(width - 2, this.options.maxWidthCells ?? 60));
@@ -154,11 +154,11 @@ export class Image implements Component {
 			lines = [this.theme.fallbackColor(fallback)];
 		}
 
-		setImagePlacements(lines, imagePlacement ? [imagePlacement] : []);
-		this.cachedLines = lines;
+		const frame = createRenderFrame(lines, imagePlacement ? [imagePlacement] : []);
+		this.cachedFrame = frame;
 		this.cachedWidth = width;
 		this.cachedGeneration = generation;
 
-		return lines;
+		return frame;
 	}
 }

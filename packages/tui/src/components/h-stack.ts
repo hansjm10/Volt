@@ -1,5 +1,5 @@
 import { compositeLayoutLine } from "../line-compositor.ts";
-import { type ImagePlacement, renderComponentFrame, setImagePlacements } from "../render-frame.ts";
+import { createRenderFrame, type ImagePlacement, type RenderFrame } from "../render-frame.ts";
 import { visibleWidth } from "../utils.ts";
 import { allocateStackSizes, Stack, type StackChild, type StackOptions, visibleStackEntries } from "./stack.ts";
 
@@ -10,19 +10,19 @@ export class HStack extends Stack {
 		super(children, options);
 	}
 
-	override render(width: number): string[] {
+	override render(width: number): RenderFrame {
 		const safeWidth = Math.max(1, width);
 		const viewport = { width: safeWidth, height: Number.MAX_SAFE_INTEGER };
 		const entries = visibleStackEntries(this.entries, viewport);
-		if (entries.length === 0) return [];
+		if (entries.length === 0) return createRenderFrame([]);
 
 		const intrinsicWidths = entries.map((entry) => {
-			const frame = renderComponentFrame(entry.component, safeWidth);
+			const frame = entry.component.render(safeWidth);
 			return frame.lines.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
 		});
 		const widths = allocateStackSizes(entries, intrinsicWidths, safeWidth, this.gap);
 		const rendered = entries.map((entry, index) =>
-			widths[index] === 0 ? { lines: [], images: [] } : renderComponentFrame(entry.component, widths[index]!),
+			widths[index] === 0 ? createRenderFrame([]) : entry.component.render(widths[index]!),
 		);
 		const height = rendered.reduce((max, frame) => Math.max(max, frame.lines.length), 0);
 		const result = Array.from({ length: height }, () => "");
@@ -49,6 +49,6 @@ export class HStack extends Stack {
 			}
 			x += childWidth + this.gap;
 		}
-		return setImagePlacements(result, images);
+		return createRenderFrame(result, images);
 	}
 }

@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { type Component, TuiMainScreen } from "../src/index.ts";
+import { createRenderFrame, type RenderFrame } from "../src/render-frame.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class SimpleContent implements Component {
@@ -10,15 +11,15 @@ class SimpleContent implements Component {
 		this.lines = lines;
 	}
 
-	render(): string[] {
-		return this.lines;
+	render(): RenderFrame {
+		return createRenderFrame(this.lines);
 	}
 	invalidate() {}
 }
 
 class SimpleOverlay implements Component {
-	render(): string[] {
-		return ["OVERLAY_TOP", "OVERLAY_MID", "OVERLAY_BOT"];
+	render(): RenderFrame {
+		return createRenderFrame(["OVERLAY_TOP", "OVERLAY_MID", "OVERLAY_BOT"]);
 	}
 	invalidate() {}
 }

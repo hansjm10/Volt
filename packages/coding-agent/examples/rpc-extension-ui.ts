@@ -1,3 +1,4 @@
+import { concatRenderFrames, createRenderFrame, type RenderFrame } from "@hansjm10/volt-tui";
 /**
  * RPC Extension UI Example (TUI)
  *
@@ -95,10 +96,10 @@ class OutputLog implements Component {
 
 	invalidate(): void {}
 
-	render(width: number): string[] {
-		if (this.lines.length === 0) return [""];
+	render(width: number): RenderFrame {
+		if (this.lines.length === 0) return createRenderFrame([""]);
 		const n = this.visibleLines > 0 ? this.visibleLines : this.lines.length;
-		return this.lines.slice(-n).map((l) => l.slice(0, width));
+		return createRenderFrame(this.lines.slice(-n).map((l) => l.slice(0, width)));
 	}
 }
 
@@ -129,8 +130,8 @@ class LoadingIndicator implements Component {
 
 	invalidate(): void {}
 
-	render(_width: number): string[] {
-		return [`${BLUE}${BOLD}Agent:${RESET} ${DIM}Working${".".repeat(this.dots)}${RESET}`];
+	render(_width: number): RenderFrame {
+		return createRenderFrame([`${BLUE}${BOLD}Agent:${RESET} ${DIM}Working${".".repeat(this.dots)}${RESET}`]);
 	}
 }
 
@@ -158,8 +159,8 @@ class PromptInput implements Component {
 		this.input.invalidate();
 	}
 
-	render(width: number): string[] {
-		return [`${GREEN}${BOLD}You:${RESET}`, ...this.input.render(width)];
+	render(width: number): RenderFrame {
+		return concatRenderFrames([createRenderFrame([`${GREEN}${BOLD}You:${RESET}`]), this.input.render(width)]);
 	}
 }
 
@@ -195,12 +196,12 @@ class SelectDialog implements Component {
 		this.list.invalidate();
 	}
 
-	render(width: number): string[] {
-		return [
-			`${MAGENTA}${BOLD}${this.title}${RESET}`,
-			...this.list.render(width),
-			`${DIM}Up/Down, Enter to select, Esc to cancel${RESET}`,
-		];
+	render(width: number): RenderFrame {
+		return concatRenderFrames([
+			createRenderFrame([`${MAGENTA}${BOLD}${this.title}${RESET}`]),
+			this.list.render(width),
+			createRenderFrame([`${DIM}Up/Down, Enter to select, Esc to cancel${RESET}`]),
+		]);
 	}
 }
 
@@ -239,12 +240,12 @@ class InputDialog implements Component {
 		this.dialogInput.invalidate();
 	}
 
-	render(width: number): string[] {
-		return [
-			`${MAGENTA}${BOLD}${this.title}${RESET}`,
-			...this.dialogInput.render(width),
-			`${DIM}Enter to submit, Esc to cancel${RESET}`,
-		];
+	render(width: number): RenderFrame {
+		return concatRenderFrames([
+			createRenderFrame([`${MAGENTA}${BOLD}${this.title}${RESET}`]),
+			this.dialogInput.render(width),
+			createRenderFrame([`${DIM}Enter to submit, Esc to cancel${RESET}`]),
+		]);
 	}
 }
 

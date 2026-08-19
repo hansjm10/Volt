@@ -10,7 +10,7 @@ const chalk = new Chalk({ level: 3 });
 describe("TruncatedText component", () => {
 	it("pads output lines to exactly match width", () => {
 		const text = new TruncatedText("Hello world", 1, 0);
-		const lines = text.render(50);
+		const lines = text.render(50).lines;
 
 		// Should have exactly one content line (no vertical padding)
 		assert.strictEqual(lines.length, 1);
@@ -24,7 +24,7 @@ describe("TruncatedText component", () => {
 
 	it("pads output with vertical padding lines to width", () => {
 		const text = new TruncatedText("Hello", 0, 2);
-		const lines = text.render(40);
+		const lines = text.render(40).lines;
 
 		// Should have 2 padding lines + 1 content line + 2 padding lines = 5 total
 		assert.strictEqual(lines.length, 5);
@@ -38,7 +38,7 @@ describe("TruncatedText component", () => {
 	it("truncates long text and pads to width", () => {
 		const longText = "This is a very long piece of text that will definitely exceed the available width";
 		const text = new TruncatedText(longText, 1, 0);
-		const lines = text.render(30);
+		const lines = text.render(30).lines;
 
 		assert.strictEqual(lines.length, 1);
 
@@ -56,7 +56,7 @@ describe("TruncatedText component", () => {
 	it("preserves ANSI codes in output and pads correctly", () => {
 		const styledText = `${chalk.red("Hello")} ${chalk.blue("world")}`;
 		const text = new TruncatedText(styledText, 1, 0);
-		const lines = text.render(40);
+		const lines = text.render(40).lines;
 
 		assert.strictEqual(lines.length, 1);
 
@@ -73,7 +73,7 @@ describe("TruncatedText component", () => {
 	it("truncates styled text and adds reset code before ellipsis", () => {
 		const longStyledText = chalk.red("This is a very long red text that will be truncated");
 		const text = new TruncatedText(longStyledText, 1, 0);
-		const lines = text.render(20);
+		const lines = text.render(20).lines;
 
 		assert.strictEqual(lines.length, 1);
 
@@ -91,7 +91,7 @@ describe("TruncatedText component", () => {
 		// With paddingX=1, available width is 30-2=28
 		// "Hello world" is 11 chars, fits comfortably
 		const text = new TruncatedText("Hello world", 1, 0);
-		const lines = text.render(30);
+		const lines = text.render(30).lines;
 
 		assert.strictEqual(lines.length, 1);
 		const line = lines[0];
@@ -105,7 +105,7 @@ describe("TruncatedText component", () => {
 
 	it("handles empty text", () => {
 		const text = new TruncatedText("", 1, 0);
-		const lines = text.render(30);
+		const lines = text.render(30).lines;
 
 		assert.strictEqual(lines.length, 1);
 		const line = lines[0];
@@ -116,7 +116,7 @@ describe("TruncatedText component", () => {
 	it("stops at newline and only shows first line", () => {
 		const multilineText = "First line\nSecond line\nThird line";
 		const text = new TruncatedText(multilineText, 1, 0);
-		const lines = text.render(40);
+		const lines = text.render(40).lines;
 
 		assert.strictEqual(lines.length, 1);
 		const line = lines[0];
@@ -133,7 +133,7 @@ describe("TruncatedText component", () => {
 	it("truncates first line even with newlines in text", () => {
 		const longMultilineText = "This is a very long first line that needs truncation\nSecond line";
 		const text = new TruncatedText(longMultilineText, 1, 0);
-		const lines = text.render(25);
+		const lines = text.render(25).lines;
 
 		assert.strictEqual(lines.length, 1);
 		const line = lines[0];

@@ -1,7 +1,9 @@
 import {
 	type Component,
+	createRenderFrame,
 	getKeybindings,
 	Markdown,
+	type RenderFrame,
 	type TUI,
 	truncateToWidth,
 	visibleWidth,
@@ -331,7 +333,7 @@ export class SubagentInspectorComponent implements Component {
 		this.unsubscribe();
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const safeWidth = Math.max(1, width);
 		const rows = this.terminalRows();
 		const header = this.renderHeader(safeWidth);
@@ -349,7 +351,7 @@ export class SubagentInspectorComponent implements Component {
 		this.detailScroll = Math.max(0, Math.min(this.detailScroll, maxScroll));
 		const body = content.slice(this.detailScroll, this.detailScroll + pageSize);
 		while (body.length < pageSize) body.push("");
-		return [...header, ...body, ...footer];
+		return createRenderFrame([...header, ...body, ...footer]);
 	}
 
 	handleInput(data: string): void {
@@ -448,7 +450,7 @@ export class SubagentInspectorComponent implements Component {
 
 	private buildConversationLines(activity: SubagentActivity, width: number): string[] {
 		const lines: string[] = [];
-		if (activity.task) lines.push(...new UserMessageComponent(activity.task, getMarkdownTheme()).render(width));
+		if (activity.task) lines.push(...new UserMessageComponent(activity.task, getMarkdownTheme()).render(width).lines);
 
 		let timeline = buildTimelineFromEvents(activity.events);
 		if (timeline.length === 0 && activity.transcript.length > 0)
@@ -461,7 +463,7 @@ export class SubagentInspectorComponent implements Component {
 			if (item.kind === "message") {
 				if (!item.text || item.role === "user") continue;
 				lines.push("");
-				lines.push(...new Markdown(item.text, 1, 0, getMarkdownTheme()).render(width));
+				lines.push(...new Markdown(item.text, 1, 0, getMarkdownTheme()).render(width).lines);
 				continue;
 			}
 			if (item.kind === "notice") {

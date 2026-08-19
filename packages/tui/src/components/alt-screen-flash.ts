@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "../render-frame.ts";
 import type { Component } from "../tui.ts";
 import { truncateToWidth } from "../utils.ts";
 
@@ -42,10 +43,12 @@ export class AltScreenFlashContainer implements Component {
 
 	invalidate(): void {}
 
-	render(width: number): string[] {
-		return this.entries.map((entry) => {
-			const message = truncateToWidth(` ${entry.message} `, width, "");
-			return `\x1b[7m${message}\x1b[27m`;
-		});
+	render(width: number): RenderFrame {
+		return createRenderFrame(
+			this.entries.map((entry) => {
+				const message = truncateToWidth(` ${entry.message} `, width, "");
+				return `\x1b[7m${message}\x1b[27m`;
+			}),
+		);
 	}
 }

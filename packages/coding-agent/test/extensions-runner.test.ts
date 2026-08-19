@@ -161,6 +161,51 @@ describe("ExtensionRunner", () => {
 			warnSpy.mockRestore();
 		});
 
+		it.each([
+			{
+				name: "default binding",
+				shortcut: "alt+p" as KeyId,
+				keybindings: defaultKeybindings,
+			},
+			{
+				name: "remapped binding",
+				shortcut: "ctrl+shift+x" as KeyId,
+				keybindings: {
+					...defaultKeybindings,
+					"app.plan.togglePane": "ctrl+shift+x" as KeyId,
+				},
+			},
+		])("blocks extension conflicts with the plan-pane action using the $name", async ({ shortcut, keybindings }) => {
+			const extensionPath = path.join(extensionsDir, "plan-pane-conflict.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`export default function(volt) {
+	volt.registerShortcut("${shortcut}", {
+		description: "Conflicts with global plan-pane toggle",
+		handler: async () => {},
+	});
+}`,
+			);
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const shortcuts = runner.getShortcuts(keybindings);
+			const message = `Extension shortcut '${shortcut}' from ${extensionPath} conflicts with built-in shortcut. Skipping.`;
+
+			expect(shortcuts.has(shortcut)).toBe(false);
+			expect(runner.getShortcutDiagnostics()).toEqual([
+				{
+					type: "warning",
+					message,
+					path: extensionPath,
+				},
+			]);
+			expect(warnSpy).toHaveBeenCalledWith(message);
+
+			warnSpy.mockRestore();
+		});
+
 		it("allows a shortcut when the reserved set no longer contains the default key", async () => {
 			const extCode = `
 				export default function(volt) {

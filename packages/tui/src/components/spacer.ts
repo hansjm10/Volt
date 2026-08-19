@@ -1,3 +1,4 @@
+import { createRenderFrame, type RenderFrame } from "../render-frame.ts";
 import type { Component } from "../tui.ts";
 
 /**
@@ -18,11 +19,11 @@ export class Spacer implements Component {
 		// No cached state to invalidate currently
 	}
 
-	render(_width: number): string[] {
+	render(_width: number): RenderFrame {
 		const result: string[] = [];
 		for (let i = 0; i < this.lines; i++) {
 			result.push("");
 		}
-		return result;
+		return createRenderFrame(result);
 	}
 }

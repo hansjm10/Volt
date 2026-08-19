@@ -1,10 +1,12 @@
 import {
 	type Component,
 	Container,
+	createRenderFrame,
 	type Focusable,
 	getKeybindings,
 	Input,
 	type Keybinding,
+	type RenderFrame,
 	Spacer,
 	sliceByColumn,
 	Text,
@@ -659,13 +661,13 @@ class TreeList implements Component {
 		return labels;
 	}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const lines: string[] = [];
 
 		if (this.filteredNodes.length === 0) {
 			lines.push(truncateToWidth(theme.fg("muted", "  No entries found"), width));
 			lines.push(truncateToWidth(theme.fg("muted", `  (0/0)${this.getStatusLabels()}`), width));
-			return lines;
+			return createRenderFrame(lines);
 		}
 
 		const startIndex = Math.max(
@@ -760,7 +762,7 @@ class TreeList implements Component {
 			),
 		);
 
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	private getEntryDisplayText(node: SessionTreeNode, isSelected: boolean): string {
@@ -1132,12 +1134,14 @@ class SearchLine implements Component {
 
 	invalidate(): void {}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const query = this.treeList.getSearchQuery();
 		if (query) {
-			return [truncateToWidth(`  ${theme.fg("muted", "Type to search:")} ${theme.fg("accent", query)}`, width)];
+			return createRenderFrame([
+				truncateToWidth(`  ${theme.fg("muted", "Type to search:")} ${theme.fg("accent", query)}`, width),
+			]);
 		}
-		return [truncateToWidth(`  ${theme.fg("muted", "Type to search:")}`, width)];
+		return createRenderFrame([truncateToWidth(`  ${theme.fg("muted", "Type to search:")}`, width)]);
 	}
 
 	handleInput(_keyData: string): void {}
@@ -1147,7 +1151,7 @@ class SearchLine implements Component {
 class TreeHelp implements Component {
 	invalidate(): void {}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const items = TREE_HELP_ITEMS.map(({ keys, label, labelFirst }) => {
 			const text = formatHelpKeys(keys);
 			if (!text) return label;
@@ -1179,7 +1183,7 @@ class TreeHelp implements Component {
 			lines.push(...wrapTextWithAnsi(currentLine.trimEnd(), availableWidth));
 		}
 
-		return lines.map((line) => theme.fg("muted", line));
+		return createRenderFrame(lines.map((line) => theme.fg("muted", line)));
 	}
 }
 
@@ -1262,19 +1266,19 @@ class LabelInput implements Component, Focusable {
 
 	invalidate(): void {}
 
-	render(width: number): string[] {
+	render(width: number): RenderFrame {
 		const lines: string[] = [];
 		const indent = "  ";
 		const availableWidth = width - indent.length;
 		lines.push(truncateToWidth(`${indent}${theme.fg("muted", "Label (empty to remove):")}`, width));
-		lines.push(...this.input.render(availableWidth).map((line) => truncateToWidth(`${indent}${line}`, width)));
+		lines.push(...this.input.render(availableWidth).lines.map((line) => truncateToWidth(`${indent}${line}`, width)));
 		lines.push(
 			truncateToWidth(
 				`${indent}${keyHint("tui.select.confirm", "save")}  ${keyHint("tui.select.cancel", "cancel")}`,
 				width,
 			),
 		);
-		return lines;
+		return createRenderFrame(lines);
 	}
 
 	handleInput(keyData: string): void {

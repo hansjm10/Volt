@@ -26,7 +26,7 @@ describe("HotkeysComponent", () => {
 			() => {},
 		);
 
-		const lines = component.render(80);
+		const lines = component.render(80).lines;
 		const text = lines.map(stripAnsi).join("\n");
 		expect(text).toContain("Keyboard Shortcuts");
 		expect(text).toContain("1–12/13");

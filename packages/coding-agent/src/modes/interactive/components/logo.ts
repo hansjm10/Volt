@@ -1,4 +1,11 @@
-import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@hansjm10/volt-tui";
+import {
+	type Component,
+	createRenderFrame,
+	type RenderFrame,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@hansjm10/volt-tui";
 import { APP_NAME } from "../../../config.ts";
 import { theme } from "../../../core/theme/runtime.ts";
 
@@ -53,8 +60,8 @@ export class StartupHeaderComponent implements Component {
 		// Styling is resolved during render so theme changes apply immediately.
 	}
 
-	render(width: number): string[] {
-		if (width <= 0) return [];
+	render(width: number): RenderFrame {
+		if (width <= 0) return createRenderFrame([]);
 		const contentWidth = Math.max(1, width - 2);
 		const lines: string[] = [];
 		const addLine = (line: string) => {
@@ -94,7 +101,7 @@ export class StartupHeaderComponent implements Component {
 			}
 			lines.push("");
 			addWrapped(this.options.onboarding);
-			return lines;
+			return createRenderFrame(lines);
 		}
 
 		addWrapped(this.options.compactInstructions, true);
@@ -103,6 +110,6 @@ export class StartupHeaderComponent implements Component {
 			lines.push("");
 			addWrapped(this.options.onboarding);
 		}
-		return lines;
+		return createRenderFrame(lines);
 	}
 }
