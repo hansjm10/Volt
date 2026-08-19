@@ -536,7 +536,7 @@ fn rename_no_replace(
     new_parent: &Dir,
     new_name: &OsStr,
 ) -> io::Result<()> {
-    use std::mem::{align_of, size_of};
+    use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use std::ptr::{copy_nonoverlapping, null_mut};
@@ -565,6 +565,14 @@ fn rename_no_replace(
     struct IoStatusBlock {
         status: usize,
         information: usize,
+    }
+
+    #[repr(C)]
+    struct FileRenameInfo {
+        flags: u32,
+        root_directory: Handle,
+        file_name_length: u32,
+        file_name: [u16; 1],
     }
 
     #[link(name = "ntdll")]
@@ -655,10 +663,12 @@ fn rename_no_replace(
                 "destination entry name is too long",
             )
         })?;
-    let root_offset = 4usize.next_multiple_of(align_of::<Handle>());
-    let length_offset = root_offset + size_of::<Handle>();
-    let name_offset = length_offset + size_of::<u32>();
-    let total_size = name_offset
+    let root_offset = std::mem::offset_of!(FileRenameInfo, root_directory);
+    let length_offset = std::mem::offset_of!(FileRenameInfo, file_name_length);
+    let name_offset = std::mem::offset_of!(FileRenameInfo, file_name);
+    // Windows requires sizeof(FILE_RENAME_INFO) plus the complete file-name
+    // byte length, even though the fixed structure already contains WCHAR[1].
+    let total_size = size_of::<FileRenameInfo>()
         .checked_add(name_bytes)
         .and_then(|length| u32::try_from(length).ok())
         .ok_or_else(|| {
@@ -977,6 +987,24 @@ mod tests {
                 0o640
             );
         }
+    }
+
+    #[test]
+    fn no_replace_rename_uses_the_destination_parent_capability() {
+        let fixture = tempdir().expect("tempdir");
+        fs::create_dir(fixture.path().join("from-directory")).expect("create source directory");
+        fs::create_dir(fixture.path().join("to-directory")).expect("create destination directory");
+        fs::write(fixture.path().join("from-directory/item"), b"content").expect("write source");
+        let root = open_fixture(fixture.path());
+
+        rename_entry(&root, "from-directory/item", "to-directory/renamed", false)
+            .expect("rename into destination parent");
+
+        assert!(!fixture.path().join("from-directory/item").exists());
+        assert_eq!(
+            fs::read(fixture.path().join("to-directory/renamed")).expect("read destination"),
+            b"content"
+        );
     }
 
     #[test]
