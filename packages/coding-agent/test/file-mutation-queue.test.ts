@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEditTool } from "../src/core/tools/edit.ts";
-import { withFileMutationQueue } from "../src/core/tools/file-mutation-queue.ts";
+import { withFileMutationQueue, withFileMutationQueues } from "../src/core/tools/file-mutation-queue.ts";
 import { createWriteTool } from "../src/core/tools/write.ts";
 import { tryCreateFileSymlink } from "./symlink-utils.ts";
 
@@ -97,6 +97,52 @@ describe("withFileMutationQueue", () => {
 		]);
 
 		expect(order).toEqual(["target:start", "target:end", "alias:start", "alias:end"]);
+	});
+
+	it("serializes overlapping multi-path sets requested in reverse order", async () => {
+		const order: string[] = [];
+		const firstStarted = createDeferred();
+		const releaseFirst = createDeferred();
+		const first = withFileMutationQueues(["/tmp/queue-a", "/tmp/queue-b"], async () => {
+			order.push("first:start");
+			firstStarted.resolve();
+			await releaseFirst.promise;
+			order.push("first:end");
+		});
+		await firstStarted.promise;
+		const second = withFileMutationQueues(["/tmp/queue-b", "/tmp/queue-a"], async () => {
+			order.push("second:start");
+		});
+		expect(await resolvesWithin(second, 20)).toBe(false);
+		releaseFirst.resolve();
+		await Promise.all([first, second]);
+		expect(order).toEqual(["first:start", "first:end", "second:start"]);
+	});
+
+	it("keeps disjoint multi-path sets parallel", async () => {
+		const firstStarted = createDeferred();
+		const releaseFirst = createDeferred();
+		const first = withFileMutationQueues(["/tmp/queue-c", "/tmp/queue-d"], async () => {
+			firstStarted.resolve();
+			await releaseFirst.promise;
+		});
+		await firstStarted.promise;
+		const disjoint = withFileMutationQueues(["/tmp/queue-e", "/tmp/queue-f"], async () => "done");
+		expect(await resolvesWithin(disjoint, 50)).toBe(true);
+		releaseFirst.resolve();
+		await first;
+	});
+
+	it("releases every canonical alias key after a multi-path operation", async () => {
+		const dir = await createTempDir();
+		const targetPath = join(dir, "release-target.txt");
+		const aliasPath = join(dir, "release-alias.txt");
+		await writeFile(targetPath, "x", "utf8");
+		if (!(await tryCreateFileSymlink(targetPath, aliasPath))) return;
+
+		await withFileMutationQueues([targetPath, aliasPath, targetPath], async () => {});
+		const result = await withFileMutationQueue(aliasPath, async () => "released");
+		expect(result).toBe("released");
 	});
 });
 

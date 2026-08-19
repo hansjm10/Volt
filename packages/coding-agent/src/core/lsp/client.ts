@@ -10,10 +10,11 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { basename, extname, isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { languageIdForExtension } from "./config.ts";
 import type { LspTracer } from "./trace.ts";
+import type { AppliedWorkspaceChange, WorkspaceEditDocumentSnapshot } from "./workspace-edit-applier.ts";
 
 export interface LspPosition {
 	line: number;
@@ -45,13 +46,16 @@ export interface LspClientOptions {
 	settings?: unknown;
 	/** Timeout for individual LSP requests (including initialize). Default: 30000 */
 	requestTimeoutMs?: number;
-	/**
-	 * Handler for server-initiated workspace/applyEdit requests (used by
-	 * command-based code actions). Returns whether the edit was applied.
-	 */
-	onApplyEdit?: (edit: unknown) => Promise<boolean>;
+	/** Handler for server-initiated workspace/applyEdit requests. */
+	onApplyEdit?: (edit: unknown) => Promise<boolean | LspApplyEditResult>;
 	/** Protocol tracer. Can also be set later via setTracer(). */
 	tracer?: LspTracer;
+}
+
+export interface LspApplyEditResult {
+	applied: boolean;
+	failureReason?: string;
+	failedChange?: number;
 }
 
 interface PendingRequest {
@@ -85,6 +89,7 @@ interface TrackedDocument {
 }
 
 /** LSP FileChangeType values for workspace/didChangeWatchedFiles */
+const FILE_CHANGE_TYPE_CREATED = 1;
 const FILE_CHANGE_TYPE_CHANGED = 2;
 const FILE_CHANGE_TYPE_DELETED = 3;
 
@@ -191,6 +196,11 @@ function normalizeUri(uri: string): string {
 		// Keep the raw URI when decoding fails.
 	}
 	return process.platform === "win32" ? decoded.toLowerCase() : decoded;
+}
+
+function isPathAtOrInside(parentPath: string, candidatePath: string): boolean {
+	const rel = relative(parentPath, candidatePath);
+	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
 export class LspClient {
@@ -333,6 +343,7 @@ export class LspClient {
 						workspaceEdit: {
 							documentChanges: true,
 							resourceOperations: ["create", "rename", "delete"],
+							failureHandling: "abort",
 						},
 					},
 					window: { workDoneProgress: false },
@@ -532,17 +543,109 @@ export class LspClient {
 		return this.published.get(normalizeUri(pathToFileURL(absolutePath).toString()))?.diagnostics ?? [];
 	}
 
-	/** Notify the server that files changed on disk (e.g. after applying a WorkspaceEdit). */
-	notifyFilesChanged(absolutePaths: string[]): void {
-		if (absolutePaths.length === 0) {
-			return;
+	/** @internal Capture the exact tracked-document state at the start of an LSP request. */
+	captureWorkspaceEditSnapshots(): WorkspaceEditDocumentSnapshot[] {
+		return [...this.documents.values()].map((document) => ({
+			uri: document.uri,
+			absolutePath: document.absolutePath,
+			version: document.version,
+			content: document.content,
+		}));
+	}
+
+	/** @internal Reconcile successful on-disk WorkspaceEdit operations with server state. */
+	async applyWorkspaceChanges(changes: readonly AppliedWorkspaceChange[]): Promise<void> {
+		for (const change of changes) {
+			if (change.kind === "edit" || change.kind === "create") {
+				const uri = pathToFileURL(change.path).toString();
+				const key = normalizeUri(uri);
+				const document = this.documents.get(key);
+				if (document) {
+					document.content = change.content;
+					document.version++;
+					await this.updateTrackedStat(document);
+					this.notify("textDocument/didChange", {
+						textDocument: { uri: document.uri, version: document.version },
+						contentChanges: [{ text: change.content }],
+					});
+				} else {
+					this.notifyWatchedFile(
+						uri,
+						change.kind === "create" && !change.overwritten ? FILE_CHANGE_TYPE_CREATED : FILE_CHANGE_TYPE_CHANGED,
+					);
+				}
+				continue;
+			}
+
+			if (change.kind === "rename") {
+				const destinationDocuments = [...this.documents.entries()].filter(([, document]) =>
+					isPathAtOrInside(change.newPath, document.absolutePath),
+				);
+				for (const [key, document] of destinationDocuments) {
+					this.documents.delete(key);
+					this.published.delete(key);
+					this.notify("textDocument/didClose", { textDocument: { uri: document.uri } });
+				}
+
+				const sourceDocuments = [...this.documents.entries()].filter(([, document]) =>
+					isPathAtOrInside(change.oldPath, document.absolutePath),
+				);
+				if (sourceDocuments.length === 0) {
+					this.notifyWatchedFile(pathToFileURL(change.oldPath).toString(), FILE_CHANGE_TYPE_DELETED);
+					this.notifyWatchedFile(pathToFileURL(change.newPath).toString(), FILE_CHANGE_TYPE_CREATED);
+					continue;
+				}
+				for (const [key, document] of sourceDocuments) {
+					this.documents.delete(key);
+					this.published.delete(key);
+					this.notify("textDocument/didClose", { textDocument: { uri: document.uri } });
+					const suffix = relative(change.oldPath, document.absolutePath);
+					const absolutePath = suffix ? join(change.newPath, suffix) : change.newPath;
+					const uri = pathToFileURL(absolutePath).toString();
+					const content = suffix || change.content === undefined ? document.content : change.content;
+					const moved: TrackedDocument = { uri, absolutePath, version: 1, content };
+					await this.updateTrackedStat(moved);
+					this.documents.set(normalizeUri(uri), moved);
+					this.notify("textDocument/didOpen", {
+						textDocument: {
+							uri,
+							languageId: languageIdForExtension(extname(absolutePath)),
+							version: 1,
+							text: content,
+						},
+					});
+				}
+				continue;
+			}
+
+			const deletedDocuments = [...this.documents.entries()].filter(([, document]) =>
+				isPathAtOrInside(change.path, document.absolutePath),
+			);
+			if (deletedDocuments.length === 0) {
+				this.notifyWatchedFile(pathToFileURL(change.path).toString(), FILE_CHANGE_TYPE_DELETED);
+				continue;
+			}
+			for (const [key, document] of deletedDocuments) {
+				this.documents.delete(key);
+				this.published.delete(key);
+				this.notify("textDocument/didClose", { textDocument: { uri: document.uri } });
+			}
 		}
-		this.notify("workspace/didChangeWatchedFiles", {
-			changes: absolutePaths.map((path) => ({
-				uri: pathToFileURL(path).toString(),
-				type: FILE_CHANGE_TYPE_CHANGED,
-			})),
-		});
+	}
+
+	private async updateTrackedStat(document: TrackedDocument): Promise<void> {
+		try {
+			const metadata = await stat(document.absolutePath);
+			document.mtimeMs = metadata.mtimeMs;
+			document.size = metadata.size;
+		} catch {
+			document.mtimeMs = undefined;
+			document.size = undefined;
+		}
+	}
+
+	private notifyWatchedFile(uri: string, type: number): void {
+		this.notify("workspace/didChangeWatchedFiles", { changes: [{ uri, type }] });
 	}
 
 	dispose(): void {
@@ -807,10 +910,19 @@ export class LspClient {
 			const edit = (params as { edit?: unknown } | undefined)?.edit;
 			void this.options
 				.onApplyEdit(edit)
-				.catch(() => false)
-				.then((applied) => {
+				.catch(
+					(error: unknown): LspApplyEditResult => ({
+						applied: false,
+						failureReason: error instanceof Error ? error.message : String(error),
+					}),
+				)
+				.then((result) => {
 					try {
-						this.sendMessage({ jsonrpc: "2.0", id, result: { applied } });
+						this.sendMessage({
+							jsonrpc: "2.0",
+							id,
+							result: typeof result === "boolean" ? { applied: result } : result,
+						});
 					} catch {
 						// Server may have exited.
 					}
