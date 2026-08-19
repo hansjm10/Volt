@@ -333,6 +333,16 @@ describe("control protocol framing", () => {
 			},
 		};
 		expect(isRelayPreamble(roundTrip(preamble))).toBe(true);
+		const rekeyedPreamble: RelayPreamble = {
+			...preamble,
+			resolvedTarget: {
+				...preamble.resolvedTarget,
+				sessionId: "s-def",
+				selection: "session_rekeyed",
+				requestedSessionId: "s-abc",
+			},
+		};
+		expect(isRelayPreamble(roundTrip(rekeyedPreamble))).toBe(true);
 		expect(
 			isRelayPreamble({
 				...preamble,

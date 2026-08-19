@@ -1,14 +1,23 @@
 import { Buffer } from "node:buffer";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerFauxProvider } from "@hansjm10/volt-ai";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { IrohRemoteClientAuthorizationSuccess } from "../src/core/remote/iroh/authorization.ts";
+import {
+	type IrohRemoteHandshakeSuccess,
+	type IrohRemoteHello,
+	parseIrohRemoteHandshakeResponse,
+} from "../src/core/remote/iroh/handshake.ts";
 import { IROH_REMOTE_ALPN } from "../src/core/remote/iroh/protocol.ts";
 import { decodeIrohRemoteTicketPayload } from "../src/core/remote/iroh/ticket.ts";
 import type { IrohBiStreamLike } from "../src/core/rpc/iroh-transport.ts";
+import { getDefaultSessionDir, SessionManager } from "../src/core/session-manager.ts";
 import { createDaemonClient, type DaemonClient } from "../src/daemon/control-client.ts";
-import type { ControlEvent } from "../src/daemon/control-protocol.ts";
+import { CONTROL_RPC_GRANTS_CAPABILITY, type ControlEvent } from "../src/daemon/control-protocol.ts";
+import { createIntegratedConversationHandshakeResponse } from "../src/daemon/handshake-responses.ts";
 import {
 	formatIrohLoadError,
 	type IrohConnectionLike,
@@ -467,6 +476,300 @@ describe("iroh daemon lifecycle ownership", () => {
 			"replacement_attach_released",
 		]);
 	});
+});
+
+describe.skipIf(!nativeAvailable)("TUI rekey alias relay admission (#259)", () => {
+	it("reconnects an explicit old session alias through the canonical TUI lease", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-rekey-alias-"));
+		const unresolvedWorkspaceDir = join(agentDir, "ws");
+		mkdirSync(unresolvedWorkspaceDir, { recursive: true });
+		const workspaceDir = realpathSync(unresolvedWorkspaceDir);
+		const sourceSessionId = randomUUID();
+		const replacementSessionId = randomUUID();
+		const sessionDir = getDefaultSessionDir(workspaceDir, agentDir);
+		const sourceSession = SessionManager.create(workspaceDir, sessionDir, { id: sourceSessionId });
+		const replacementSession = SessionManager.create(workspaceDir, sessionDir, { id: replacementSessionId });
+		await Promise.all([sourceSession.materialize(), replacementSession.materialize()]);
+
+		const faux = registerFauxProvider();
+		const model = faux.getModel();
+		writeFileSync(
+			join(agentDir, "models.json"),
+			`${JSON.stringify(
+				{
+					providers: {
+						[model.provider]: {
+							api: model.api,
+							apiKey: "faux-key",
+							baseUrl: model.baseUrl,
+							models: [{ id: model.id }],
+						},
+					},
+				},
+				null,
+				2,
+			)}\n`,
+		);
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			`${JSON.stringify({ defaultProvider: model.provider, defaultModel: model.id }, null, 2)}\n`,
+		);
+
+		let daemonStopped = false;
+		let control: DaemonClient | undefined;
+		let tui: DaemonClient | undefined;
+		let phone: PhoneEndpoint | undefined;
+		const phoneConnections: PhoneConnection[] = [];
+		const relaySockets: Array<{ destroy(): void }> = [];
+		const controlEvents: ControlEvent[] = [];
+		const tuiEvents: ControlEvent[] = [];
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			createIrohDaemonService({ relayMode: "disabled" }),
+		]);
+
+		try {
+			let status: DaemonProbeResult = await probeDaemon(agentDir);
+			for (let attempt = 0; !status.healthy && attempt < 100; attempt++) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				status = await probeDaemon(agentDir);
+			}
+			expect(status.healthy).toBe(true);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+				onEvent: (event) => controlEvents.push(event),
+			});
+			expect(await control.request({ type: "workspace_register", name: "ws", path: workspaceDir })).toMatchObject({
+				type: "ok",
+			});
+
+			const pairStarted = await control.request({ type: "pair_request", workspaceName: "ws" });
+			expect(pairStarted).toMatchObject({ type: "pair_started" });
+			let ticket: string | undefined;
+			await expect
+				.poll(() => {
+					const event = controlEvents.find(
+						(candidate) => candidate.type === "pairing_progress" && candidate.phase === "ticket",
+					);
+					ticket = event?.type === "pairing_progress" ? event.ticket : undefined;
+					return ticket;
+				})
+				.toBeTypeOf("string");
+			const payload = decodeIrohRemoteTicketPayload(ticket as string);
+			const iroh = native.iroh;
+			if (!iroh) throw new Error("native iroh unavailable");
+			const endpointTicket = (
+				iroh.EndpointTicket as unknown as { fromString(value: string): { endpointAddr(): unknown } }
+			).fromString(payload.irohTicket);
+			phone = await createPhoneEndpoint();
+			const pairingConnection = await phone.connect(endpointTicket.endpointAddr(), ALPN);
+			phoneConnections.push(pairingConnection);
+			const pairingStream = await pairingConnection.openBi();
+			await writeJsonLine(pairingStream, {
+				type: "volt_iroh_hello",
+				protocol: IROH_REMOTE_ALPN,
+				workspace: "ws",
+				secret: payload.secret,
+				clientLabel: "vitest-rekey-phone",
+				workspaceDiscovery: { purpose: "list_sessions" },
+			});
+			expect((await readJsonLine(pairingStream)).value.success).toBe(true);
+			pairingConnection.close(0n, Array.from(Buffer.from("done", "utf8")));
+			await pairingConnection.closed();
+
+			const clients = await control.request({ type: "clients_list" });
+			expect(clients.type).toBe("clients_result");
+			if (clients.type !== "clients_result" || !clients.clients[0]) {
+				throw new Error("paired client missing");
+			}
+			const pairedClient = clients.clients[0];
+			tui = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "tui",
+				version: "test",
+				authToken: status.authToken,
+				capabilities: [CONTROL_RPC_GRANTS_CAPABILITY],
+				reconnect: false,
+				onEvent: (event) => tuiEvents.push(event),
+			});
+			expect(
+				await tui.request({ type: "lease_acquire", workspaceName: "ws", sessionId: sourceSessionId }),
+			).toMatchObject({ type: "lease_granted" });
+
+			const initialConnection = await phone.connect(endpointTicket.endpointAddr(), ALPN);
+			phoneConnections.push(initialConnection);
+			const initialStream = await initialConnection.openBi();
+			await writeJsonLine(initialStream, {
+				type: "volt_iroh_hello",
+				protocol: IROH_REMOTE_ALPN,
+				workspace: "ws",
+				conversation: { target: "session", sessionId: sourceSessionId },
+			});
+			const initialResponse = readJsonLine(initialStream).then((response) => {
+				throw new Error(`initial relay failed before offer: ${JSON.stringify(response.value)}`);
+			});
+			await Promise.race([
+				expect
+					.poll(() => tuiEvents.filter((event) => event.type === "relay_offer").length, { timeout: 5_000 })
+					.toBe(1),
+				initialResponse,
+			]);
+			const initialOffer = tuiEvents.find((event) => event.type === "relay_offer");
+			if (initialOffer?.type !== "relay_offer") throw new Error("initial relay offer missing");
+			const initialRelay = await tui.openRelay(initialOffer);
+			relaySockets.push(initialRelay.stream);
+			expect(initialRelay.preamble.resolvedTarget).toMatchObject({
+				sessionId: sourceSessionId,
+				selection: "resumed",
+			});
+
+			const prepared = await tui.request({
+				type: "lease_rekey_prepare",
+				workspaceName: "ws",
+				oldSessionId: sourceSessionId,
+				newSessionId: replacementSessionId,
+			});
+			expect(prepared.type).toBe("lease_rekey_prepared");
+			if (prepared.type !== "lease_rekey_prepared") throw new Error("TUI rekey was not prepared");
+			expect(await tui.request({ type: "lease_rekey_commit", transactionId: prepared.transactionId })).toMatchObject(
+				{
+					type: "ok",
+				},
+			);
+			await expect
+				.poll(() =>
+					tuiEvents.some((event) => event.type === "relay_closed" && event.reason === "session_rekeyed_reconnect"),
+				)
+				.toBe(true);
+
+			const aliasConnection = await phone.connect(endpointTicket.endpointAddr(), ALPN);
+			phoneConnections.push(aliasConnection);
+			const aliasStream = await aliasConnection.openBi();
+			await writeJsonLine(aliasStream, {
+				type: "volt_iroh_hello",
+				protocol: IROH_REMOTE_ALPN,
+				workspace: "ws",
+				conversation: { target: "session", sessionId: sourceSessionId },
+			});
+			await expect
+				.poll(() => tuiEvents.filter((event) => event.type === "relay_offer").length, { timeout: 5_000 })
+				.toBe(2);
+			const aliasOffer = tuiEvents.filter((event) => event.type === "relay_offer")[1];
+			if (aliasOffer?.type !== "relay_offer") throw new Error("alias relay offer missing");
+			expect(aliasOffer.sessionId).toBe(replacementSessionId);
+			const aliasRelay = await tui.openRelay(aliasOffer);
+			relaySockets.push(aliasRelay.stream);
+			expect(aliasRelay.preamble.resolvedTarget).toMatchObject({
+				sessionId: replacementSessionId,
+				selection: "session_rekeyed",
+				requestedSessionId: sourceSessionId,
+			});
+			expect(aliasRelay.preamble.handshake).toMatchObject({
+				hello: { conversation: { target: "session", sessionId: sourceSessionId } },
+			});
+
+			const relayHandshake = aliasRelay.preamble.handshake as {
+				hello: IrohRemoteHello;
+				response: IrohRemoteHandshakeSuccess;
+			};
+			const authorizationSubset = aliasRelay.preamble.authorization;
+			const authorization = {
+				ok: true as const,
+				allowTools: authorizationSubset.allowedTools,
+				client: {
+					nodeId: pairedClient.clientNodeId,
+					label: pairedClient.label ?? pairedClient.clientNodeId,
+					allowedWorkspaces: ["ws"],
+					allowedTools: authorizationSubset.allowedTools,
+					rpcGrant: authorizationSubset.rpcGrant,
+					pairedAt: pairedClient.pairedAtMs,
+					lastSeenAt: pairedClient.lastSeenAtMs ?? pairedClient.pairedAtMs,
+				},
+				paired: true,
+				pairingSecretConsumed: false,
+				workspace: { name: "ws", path: workspaceDir },
+				workspaceNames: ["ws"],
+				workspaces: [{ name: "ws", status: "available" as const }],
+			} satisfies IrohRemoteClientAuthorizationSuccess;
+			const handshakeResponse = createIntegratedConversationHandshakeResponse(
+				relayHandshake,
+				authorization,
+				replacementSessionId,
+				{ kind: "session_rekeyed", requestedSessionId: sourceSessionId, sessionId: replacementSessionId },
+				{
+					hostNodeId: aliasRelay.preamble.hostNodeId,
+					relayMode: aliasRelay.preamble.relayMode,
+					relayUrls: aliasRelay.preamble.relayUrls,
+				},
+			);
+			aliasRelay.stream.write(`${JSON.stringify(handshakeResponse)}\n`);
+			const phoneHandshake = parseIrohRemoteHandshakeResponse((await readJsonLine(aliasStream)).value);
+			expect(phoneHandshake).toMatchObject({
+				success: true,
+				sessionId: replacementSessionId,
+				conversation: {
+					target: "session",
+					sessionId: replacementSessionId,
+					selection: "session_rekeyed",
+					requestedSessionId: sourceSessionId,
+				},
+			});
+
+			const directConnection = await phone.connect(endpointTicket.endpointAddr(), ALPN);
+			phoneConnections.push(directConnection);
+			const directStream = await directConnection.openBi();
+			await writeJsonLine(directStream, {
+				type: "volt_iroh_hello",
+				protocol: IROH_REMOTE_ALPN,
+				workspace: "ws",
+				conversation: { target: "session", sessionId: replacementSessionId },
+			});
+			await expect
+				.poll(() => tuiEvents.filter((event) => event.type === "relay_offer").length, { timeout: 5_000 })
+				.toBe(3);
+			const directOffer = tuiEvents.filter((event) => event.type === "relay_offer")[2];
+			if (directOffer?.type !== "relay_offer") throw new Error("canonical relay offer missing");
+			expect(directOffer.sessionId).toBe(replacementSessionId);
+			const directRelay = await tui.openRelay(directOffer);
+			relaySockets.push(directRelay.stream);
+			expect(directRelay.preamble.resolvedTarget).toMatchObject({
+				sessionId: replacementSessionId,
+				selection: "resumed",
+				requestedSessionId: replacementSessionId,
+			});
+
+			const currentStatus = await control.request({ type: "status" });
+			expect(currentStatus).toMatchObject({
+				type: "status_result",
+				leases: [
+					{
+						workspaceName: "ws",
+						sessionId: replacementSessionId,
+						state: "tui-owned",
+					},
+				],
+			});
+			expect(readFileSync(getDaemonPaths(agentDir).auditPath, "utf8")).not.toContain('"type":"runtime_failure"');
+		} finally {
+			for (const socket of relaySockets) socket.destroy();
+			for (const connection of phoneConnections) {
+				connection.close(0n, Array.from(Buffer.from("done", "utf8")));
+			}
+			await phone?.close().catch(() => {});
+			if (!daemonStopped) {
+				await control?.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+				daemonStopped = true;
+			}
+			await tui?.close();
+			await control?.close();
+			faux.unregister();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
 });
 
 describe.skipIf(!nativeAvailable)("voltd iroh service (loopback)", () => {

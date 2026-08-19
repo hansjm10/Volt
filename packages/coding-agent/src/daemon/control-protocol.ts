@@ -441,7 +441,7 @@ export interface RelayPreamble {
 	resolvedTarget: {
 		sessionId: string;
 		sessionFilePath?: string;
-		selection: "created" | "created_after_missing" | "resumed";
+		selection: "created" | "created_after_missing" | "resumed" | "session_rekeyed";
 		requestedSessionId?: string;
 		workspaceName: string;
 		workspacePath: string;
