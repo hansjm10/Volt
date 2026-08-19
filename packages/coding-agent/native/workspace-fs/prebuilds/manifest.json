@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": "volt-workspace-fs-v1",
+  "sourceFingerprint": "b10f9e55dfd784f11e4af8cefec358245d722725b965ef6b1b872252b17f30fa",
+  "artifacts": [
+    {
+      "target": "darwin-arm64",
+      "path": "darwin-arm64/workspace-fs.node",
+      "sha256": "sha256:b72998e7ab9a4a70649df64e2a9f1bf60e88fba9764fcdbea7c3053faa317c39"
+    },
+    {
+      "target": "darwin-x64",
+      "path": "darwin-x64/workspace-fs.node",
+      "sha256": "sha256:3ea0b423df536512b011fa52367a209fdc179658929f1259bf89d2a049e29b29"
+    },
+    {
+      "target": "linux-arm64-gnu",
+      "path": "linux-arm64-gnu/workspace-fs.node",
+      "sha256": "sha256:464d0014d093a7ddb3940d57fac9e79a0b3edec1c073381eea75ffdc088b0c30"
+    },
+    {
+      "target": "linux-arm64-musl",
+      "path": "linux-arm64-musl/workspace-fs.node",
+      "sha256": "sha256:31e548a21e9492e2eabc947d55b49df9c3cc0678121717570c7c287b2263d64b"
+    },
+    {
+      "target": "linux-x64-gnu",
+      "path": "linux-x64-gnu/workspace-fs.node",
+      "sha256": "sha256:a309fbf527d2ce79f1fb82b6557b1f1bdaff8d32b32144c6d9c1e72131c890e8"
+    },
+    {
+      "target": "linux-x64-musl",
+      "path": "linux-x64-musl/workspace-fs.node",
+      "sha256": "sha256:a94aa56524ef0eec73be87285b2542299e7d8ea909afd153729bac282e2bc945"
+    },
+    {
+      "target": "win32-arm64-msvc",
+      "path": "win32-arm64-msvc/workspace-fs.node",
+      "sha256": "sha256:38f02d6d544fb8c5668fd3702f363d5e172b540d9d64a412b33efe7428274217"
+    },
+    {
+      "target": "win32-x64-msvc",
+      "path": "win32-x64-msvc/workspace-fs.node",
+      "sha256": "sha256:85b5d050fa3e7298742b042ce588a652928fd5dafbb6d0466cba59a07a291755"
+    }
+  ]
+}
