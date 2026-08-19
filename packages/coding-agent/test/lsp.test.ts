@@ -908,20 +908,21 @@ describe("workspace edits", () => {
 			{
 				kind: "edit",
 				uri: "file:///a",
+				version: null,
 				edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, newText: "x" }],
 			},
 		]);
 		expect(
 			normalizeWorkspaceEdit({
 				documentChanges: [
-					{ textDocument: { uri: "file:///a" }, edits: [] },
+					{ textDocument: { uri: "file:///a", version: null }, edits: [] },
 					{ kind: "create", uri: "file:///b" },
 					{ kind: "rename", oldUri: "file:///b", newUri: "file:///c" },
 					{ kind: "delete", uri: "file:///c" },
 				],
 			}),
 		).toEqual([
-			{ kind: "edit", uri: "file:///a", edits: [] },
+			{ kind: "edit", uri: "file:///a", version: null, edits: [] },
 			{ kind: "create", uri: "file:///b" },
 			{ kind: "rename", oldUri: "file:///b", newUri: "file:///c" },
 			{ kind: "delete", uri: "file:///c" },
