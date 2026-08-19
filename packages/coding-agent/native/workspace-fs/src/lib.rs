@@ -585,17 +585,18 @@ fn rename_no_replace(
             share_access: u32,
             open_options: u32,
         ) -> NtStatus;
+        fn NtSetInformationFile(
+            file_handle: Handle,
+            io_status_block: *mut IoStatusBlock,
+            file_information: *const std::ffi::c_void,
+            length: u32,
+            file_information_class: i32,
+        ) -> NtStatus;
         fn RtlNtStatusToDosError(status: NtStatus) -> u32;
     }
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn SetFileInformationByHandle(
-            file: Handle,
-            information_class: i32,
-            information: *const std::ffi::c_void,
-            size: u32,
-        ) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
     }
 
@@ -606,7 +607,7 @@ fn rename_no_replace(
     const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
     const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
-    const FILE_RENAME_INFO_CLASS: i32 = 3;
+    const FILE_RENAME_INFORMATION_CLASS: i32 = 10;
 
     let mut old_wide = old_name.encode_wide().collect::<Vec<_>>();
     let old_bytes = old_wide
@@ -696,18 +697,27 @@ fn rename_no_replace(
             name_bytes,
         );
     }
-    // SAFETY: source_handle is valid after successful NtOpenFile and the
-    // information buffer follows FILE_RENAME_INFO's ABI layout.
-    let renamed = unsafe {
-        SetFileInformationByHandle(
+    let mut rename_status_block = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    // SAFETY: source_handle is valid after successful NtOpenFile, the
+    // information buffer follows FILE_RENAME_INFORMATION's ABI layout, and
+    // the destination directory capability remains borrowed for the call.
+    let status = unsafe {
+        NtSetInformationFile(
             source_handle,
-            FILE_RENAME_INFO_CLASS,
+            &mut rename_status_block,
             information.as_ptr().cast(),
             total_size,
+            FILE_RENAME_INFORMATION_CLASS,
         )
     };
-    let error = if renamed == 0 {
-        Some(io::Error::last_os_error())
+    let error = if status < 0 {
+        // SAFETY: RtlNtStatusToDosError accepts any NTSTATUS value.
+        Some(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ))
     } else {
         None
     };
