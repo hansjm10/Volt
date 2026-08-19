@@ -390,14 +390,14 @@ impl Task for CreateFileTask {
     }
 }
 
-static TEMPORARY_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEMPORARY_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-fn temporary_name(destination: &str) -> String {
+fn temporary_name() -> String {
     let counter = TEMPORARY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!(
-        ".{destination}.volt-workspace-fs-{}-{counter}.tmp",
-        std::process::id()
-    )
+    let token = std::process::id()
+        .wrapping_mul(0x9e37_79b9)
+        .wrapping_add(counter);
+    format!(".v{token:08x}")
 }
 
 fn replace_file(root: &Dir, path: &str, data: &[u8]) -> Result<()> {
@@ -418,7 +418,7 @@ fn replace_file(root: &Dir, path: &str, data: &[u8]) -> Result<()> {
     };
 
     let (temporary, mut file) = loop {
-        let temporary = temporary_name(&destination);
+        let temporary = temporary_name();
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -931,6 +931,24 @@ mod tests {
         assert!(validate_relative_path("test", ".", true).is_ok());
         assert!(validate_relative_path("test", ".", false).is_err());
         assert!(validate_relative_path("test", "a/b", false).is_ok());
+    }
+
+    #[test]
+    fn replacement_supports_near_limit_destination_names() {
+        let fixture = tempdir().expect("tempdir");
+        let name = "a".repeat(240);
+        let root = open_fixture(fixture.path());
+        root.write(&name, b"before").expect("write fixture");
+
+        replace_file(&root, &name, b"after").expect("replace file");
+
+        assert_eq!(root.read(&name).expect("read replacement"), b"after");
+        let entries = root
+            .entries()
+            .expect("read fixture entries")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [std::ffi::OsString::from(name)]);
     }
 
     #[test]

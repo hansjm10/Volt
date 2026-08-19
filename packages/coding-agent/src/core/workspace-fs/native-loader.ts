@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
@@ -11,7 +11,7 @@ const WORKSPACE_FS_API_VERSION = "volt-workspace-fs-v1";
 const moduleUrl: string | undefined = import.meta.url;
 const cjsRequire = createRequire(moduleUrl || pathToFileURL(process.execPath).href);
 const isStandaloneBinary = typeof __VOLT_STANDALONE__ !== "undefined" && __VOLT_STANDALONE__ === true;
-let windowsNativeCacheDirectory: string | undefined;
+const WINDOWS_NATIVE_CACHE_DIRECTORY = path.join(os.tmpdir(), "volt-workspace-fs-native");
 
 export type NativeMetadata = {
 	fileType: "file" | "directory" | "symlink" | "other";
@@ -169,17 +169,48 @@ function sha256(bytes: Buffer): string {
 	return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
-function stageWindowsAddon(source: Buffer, digest: string): string {
-	windowsNativeCacheDirectory ??= fs.mkdtempSync(path.join(os.tmpdir(), "volt-workspace-fs-native-"));
-	const destination = path.join(windowsNativeCacheDirectory, `workspace-fs-${digest.slice("sha256:".length)}.node`);
-	fs.writeFileSync(destination, source, { flag: "wx", mode: 0o600 });
-	if (!source.equals(fs.readFileSync(destination))) {
-		throw new WorkspaceFsNativeUnavailableError(
-			"WORKSPACE_FS_NATIVE_UNAVAILABLE",
-			"Workspace filesystem staged Windows addon failed post-write verification",
-		);
+export function stageWindowsAddon(
+	source: Buffer,
+	digest: string,
+	cacheDirectory = WINDOWS_NATIVE_CACHE_DIRECTORY,
+): string {
+	const destination = path.join(cacheDirectory, `workspace-fs-${digest.slice("sha256:".length)}.node`);
+	fs.mkdirSync(cacheDirectory, { recursive: true, mode: 0o700 });
+	try {
+		if (source.equals(fs.readFileSync(destination))) return destination;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
-	return destination;
+
+	const temporary = path.join(cacheDirectory, `.stage-${process.pid}-${randomUUID()}.node`);
+	try {
+		fs.writeFileSync(temporary, source, { flag: "wx", mode: 0o600 });
+		if (!source.equals(fs.readFileSync(temporary))) {
+			throw new WorkspaceFsNativeUnavailableError(
+				"WORKSPACE_FS_NATIVE_UNAVAILABLE",
+				"Workspace filesystem staged Windows addon failed post-write verification",
+			);
+		}
+		try {
+			fs.renameSync(temporary, destination);
+		} catch (error) {
+			try {
+				if (source.equals(fs.readFileSync(destination))) return destination;
+			} catch {
+				// Report the atomic publication error below.
+			}
+			throw error;
+		}
+		if (!source.equals(fs.readFileSync(destination))) {
+			throw new WorkspaceFsNativeUnavailableError(
+				"WORKSPACE_FS_NATIVE_UNAVAILABLE",
+				"Workspace filesystem cached Windows addon failed post-publish verification",
+			);
+		}
+		return destination;
+	} finally {
+		fs.rmSync(temporary, { force: true });
+	}
 }
 
 function isNativeAddon(value: unknown): value is NativeWorkspaceFsAddon {

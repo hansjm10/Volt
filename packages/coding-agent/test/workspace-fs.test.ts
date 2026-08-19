@@ -19,7 +19,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { validateWorkspaceRelativePath, WorkspaceFsError, WorkspaceRoot } from "../src/core/workspace-fs/index.ts";
 
@@ -290,6 +290,34 @@ describe("workspace filesystem", () => {
 		},
 		20_000,
 	);
+
+	it("reuses one content-addressed Windows staging copy across processes", () => {
+		const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+		const fixture = temporaryDirectory("volt-workspace-fs-staging-");
+		const cacheDirectory = join(fixture, "cache");
+		const script = join(fixture, "stage.ts");
+		const digest = `sha256:${"1".repeat(64)}`;
+		const source = "workspace-fs-addon";
+		writeFileSync(
+			script,
+			[
+				`import { stageWindowsAddon } from ${JSON.stringify(pathToFileURL(join(repositoryRoot, "packages", "coding-agent", "src", "core", "workspace-fs", "native-loader.ts")).href)};`,
+				`stageWindowsAddon(Buffer.from(${JSON.stringify(source)}), ${JSON.stringify(digest)}, process.argv[2]);`,
+			].join("\n"),
+		);
+
+		for (let processIndex = 0; processIndex < 2; processIndex += 1) {
+			const result = spawnSync(process.execPath, ["--experimental-strip-types", script, cacheDirectory], {
+				encoding: "utf8",
+			});
+			expect(result.status, result.stderr).toBe(0);
+		}
+
+		expect(readdirSync(cacheDirectory)).toEqual([`workspace-fs-${digest.slice("sha256:".length)}.node`]);
+		expect(readFileSync(join(cacheDirectory, `workspace-fs-${digest.slice("sha256:".length)}.node`), "utf8")).toBe(
+			source,
+		);
+	});
 
 	it("fails closed for missing, malformed, stale, or checksum-mismatched native manifests", () => {
 		const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
