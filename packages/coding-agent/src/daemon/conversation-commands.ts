@@ -52,18 +52,18 @@ import type { LeaseState } from "./lease-broker.ts";
 import { getRegisteredWorkingDirectoryForWorktree } from "./worktree-manager.ts";
 
 export const INTEGRATED_CONVERSATION_UNSUPPORTED_RPC_TYPES: ReadonlySet<string> = new Set([
-	"new_session",
 	"switch_session_by_id",
 	"get_messages",
 ]);
 
 /**
- * Commands that start or extend a turn. While a lease is draining to a TUI,
- * these are rejected with `lease_draining` so the drain converges; read-only
- * commands and abort pass through.
+ * Commands that start or replace conversation work. While a lease is draining
+ * to a TUI, these are rejected with `lease_draining` so the drain converges;
+ * read-only commands and abort pass through.
  */
 export const TURN_INITIATING_RPC_TYPES: ReadonlySet<string> = new Set([
 	"prompt",
+	"new_session",
 	"plan_execute",
 	"invoke_ui_action",
 	"steer",
