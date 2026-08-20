@@ -41,7 +41,7 @@
 				"@number0/iroh": "1.0.0"
 			},
 			"bin": {
-				"volt": "dist/cli.js"
+				"volt": "dist/core/npm/cli.js"
 			},
 			"engines": {
 				"node": ">=22.19.0"

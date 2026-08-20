@@ -13,7 +13,14 @@ const moduleUrl: string | undefined = import.meta.url;
 const __filename = moduleUrl ? fileURLToPath(moduleUrl) : process.execPath;
 const __dirname = dirname(__filename);
 
+declare const __VOLT_BUNDLED_CLI__: boolean | undefined;
 declare const __VOLT_STANDALONE__: boolean | undefined;
+
+/**
+ * Detect the bundled npm CLI entrypoint. The npm bundler replaces this
+ * compile-time constant; modular SDK and source execution leave it undefined.
+ */
+export const isBundledCli = typeof __VOLT_BUNDLED_CLI__ !== "undefined" && __VOLT_BUNDLED_CLI__ === true;
 
 /**
  * Detect a release standalone executable. The SEA bundler replaces this
