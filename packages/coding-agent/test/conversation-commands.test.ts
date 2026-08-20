@@ -150,6 +150,16 @@ describe("handleIntegratedConversationRpcCommand", () => {
 		}
 	});
 
+	it("does not intercept new-session commands — the rpc runtime owns the session rekey", async () => {
+		const response = await handleIntegratedConversationRpcCommand(
+			{ id: "1", type: "new_session" },
+			createAuthorization(),
+			createContext(),
+			createRuntime(),
+		);
+		expect(response).toBeUndefined();
+	});
+
 	it("does not intercept abort — the rpc mode stops the turn with the stream open", async () => {
 		const response = await handleIntegratedConversationRpcCommand(
 			{ id: "1", type: "abort" },
