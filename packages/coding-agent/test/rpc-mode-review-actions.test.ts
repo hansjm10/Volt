@@ -4,6 +4,7 @@ import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { restoreStdout } from "../src/core/output-guard.ts";
 import type { ParsedReview } from "../src/core/review-report.ts";
 import {
+	acknowledgeReviewRun,
 	appendReviewRun,
 	getReviewRun,
 	REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE,
@@ -672,6 +673,60 @@ describe("RPC durable review actions", () => {
 		await vi.waitFor(() => expect(response(collecting.writes, "fix-failed")).toBeDefined());
 		expect(response(collecting.writes, "fix-failed")).toMatchObject({ success: false, error: "fix seed failed" });
 		expect(getReviewRun(manager, unacknowledged.runId)?.acknowledgedAt).toBeUndefined();
+		await closeMode(collecting, modePromise);
+	});
+
+	test("preserves a durable review when starting a clear discussion session", async () => {
+		const manager = SessionManager.inMemory("/workspace");
+		appendReviewRun(manager, durableRecord());
+		const acknowledgedAt = acknowledgeReviewRun(manager, "review:test").acknowledgedAt;
+		const replacementManagers: SessionManager[] = [];
+		const runtimeHost = makeRuntimeHost({ manager, replacementManagers });
+		const collecting = createCollectingTransport();
+		const modePromise = await startMode(runtimeHost, collecting.transport);
+		const line = collecting.getLineHandler();
+
+		line(
+			JSON.stringify({
+				id: "new-discussion",
+				type: "new_session",
+				preserveReviewRunId: "review:test",
+			}),
+		);
+		await vi.waitFor(() =>
+			expect(response(collecting.writes, "new-discussion")).toMatchObject({
+				success: true,
+				data: { cancelled: false },
+			}),
+		);
+		expect(getReviewRun(replacementManagers[0]!, "review:test")).toMatchObject({
+			runId: "review:test",
+			acknowledgedAt,
+			result: { completionStatus: "complete" },
+		});
+
+		line(JSON.stringify({ id: "rerun-preserved", type: "rerun_review", runId: "review:test" }));
+		await vi.waitFor(() =>
+			expect(response(collecting.writes, "rerun-preserved")).toMatchObject({
+				success: true,
+				data: { status: "accepted" },
+			}),
+		);
+
+		line(
+			JSON.stringify({
+				id: "new-missing",
+				type: "new_session",
+				preserveReviewRunId: "review:missing",
+			}),
+		);
+		await vi.waitFor(() =>
+			expect(response(collecting.writes, "new-missing")).toMatchObject({
+				success: false,
+				error: "Unknown review run: review:missing",
+			}),
+		);
+		expect(replacementManagers).toHaveLength(1);
 		await closeMode(collecting, modePromise);
 	});
 
