@@ -2343,6 +2343,9 @@
 				},
 				"parentSession": {
 					"type": "string"
+				},
+				"preserveReviewRunId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
 				}
 			},
 			"additionalProperties": false

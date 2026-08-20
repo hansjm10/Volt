@@ -98,6 +98,7 @@ export const RPC_COMMAND_SCHEMAS = {
 	abort: commandSchema("abort", {}),
 	new_session: commandSchema("new_session", {
 		parentSession: Type.Optional(Type.String()),
+		preserveReviewRunId: Type.Optional(RpcConversationIdentifierSchema),
 	}),
 	set_agent_mode: commandSchema("set_agent_mode", {
 		mode: RpcAgentModeSchema,
