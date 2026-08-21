@@ -14,6 +14,7 @@ import {
 } from "../core/remote/iroh/state.ts";
 import { DEFAULT_INTEGRATED_DETACHED_RUNTIME_TTL_MS } from "../remote/integrated-runtime-retention.ts";
 import { writeDurableAtomicFile } from "../utils/durable-atomic-write.ts";
+import { type IrohManagedRelayCredential, parseIrohManagedRelayCredential } from "./relay-credential.ts";
 
 /**
  * Persistent daemon state. The pairing/client sections reuse the remote host
@@ -43,12 +44,12 @@ export interface VoltdStateFileV1 {
 		themeTokenPush?: boolean;
 		/** Hold a keep-awake (prevent system sleep) assertion while the daemon runs; OFF by default. */
 		keepAwakeEnabled?: boolean;
-		/**
-		 * Bearer token presented to relay servers (access.shared_token). Seeded
-		 * from VOLT_IROH_RELAY_AUTH_TOKEN and persisted so bare restarts keep
-		 * authenticating; pairing tickets carry it to phones.
-		 */
+		/** Static bearer token for self-managed relays using access.shared_token. */
 		relayAuthToken?: string;
+		/** Refreshable node-bound credential for Volt-managed JWT relays. */
+		relayCredential?: IrohManagedRelayCredential;
+		/** Durable, non-usable credential retained only to finish broker revocation. */
+		relayCredentialRevocation?: IrohManagedRelayCredential;
 		/** Worktree cleanup policies (design §5.3); all opt-in except pruneOnStart. */
 		worktreeCleanup?: WorktreeCleanupSettings;
 	};
@@ -187,6 +188,14 @@ export function parseVoltdState(value: unknown): VoltdStateFileV1 {
 		typeof settingsRecord.relayAuthToken === "string" && settingsRecord.relayAuthToken.length > 0
 			? settingsRecord.relayAuthToken
 			: undefined;
+	const relayCredential =
+		settingsRecord.relayCredential === undefined
+			? undefined
+			: parseIrohManagedRelayCredential(settingsRecord.relayCredential);
+	const relayCredentialRevocation =
+		settingsRecord.relayCredentialRevocation === undefined
+			? undefined
+			: parseIrohManagedRelayCredential(settingsRecord.relayCredentialRevocation);
 	const worktreeCleanup = parseWorktreeCleanupSettings(settingsRecord.worktreeCleanup);
 	return hostStateToVoltdState(hostState, {
 		detachedRuntimeTtlMs,
@@ -195,6 +204,8 @@ export function parseVoltdState(value: unknown): VoltdStateFileV1 {
 		...(themeTokenPush ? { themeTokenPush } : {}),
 		...(keepAwakeEnabled ? { keepAwakeEnabled } : {}),
 		...(relayAuthToken === undefined ? {} : { relayAuthToken }),
+		...(relayCredential === undefined ? {} : { relayCredential }),
+		...(relayCredentialRevocation === undefined ? {} : { relayCredentialRevocation }),
 		...(worktreeCleanup === undefined ? {} : { worktreeCleanup }),
 	});
 }

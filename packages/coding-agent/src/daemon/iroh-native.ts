@@ -20,6 +20,8 @@ export interface IrohEndpointLike {
 	addr(): unknown;
 	online(): Promise<void>;
 	close(): Promise<void>;
+	insertRelay?(config: IrohRelayConfigLike): Promise<void>;
+	removeRelay?(url: string): Promise<boolean>;
 	acceptNext(): Promise<IrohIncomingLike | null | undefined>;
 	secretKey(): IrohSecretKeyLike;
 }

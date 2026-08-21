@@ -166,6 +166,32 @@ describe("voltd state migration", () => {
 		expect(parsed.settings).toEqual({ detachedRuntimeTtlMs: 60_000, allowTools: ["read", "grep"] });
 	});
 
+	it("round-trips a managed relay credential and rejects malformed persisted credentials", async () => {
+		const managedCredential = {
+			schemaVersion: 1 as const,
+			serviceUrl: "http://127.0.0.1:18085",
+			relayUrls: ["https://iroh-relay-us-central-canary.volt-cli.dev"],
+			endpointNodeId: "a".repeat(64),
+			grantId: "abcdefghijklmnopqrstuvwx",
+			accessToken: "aaaaaa.bbbbbb.cccccc",
+			accessTokenExpiresAt: Date.now() + 15 * 60_000,
+			refreshToken: `vrr_${"d".repeat(43)}`,
+			refreshTokenExpiresAt: Date.now() + 30 * 24 * 60 * 60_000,
+		};
+		const state = createEmptyVoltdState();
+		state.settings.relayCredential = managedCredential;
+		expect(parseVoltdState(JSON.parse(JSON.stringify(state))).settings.relayCredential).toEqual(managedCredential);
+		state.settings.relayCredential = undefined;
+		state.settings.relayCredentialRevocation = managedCredential;
+		expect(parseVoltdState(JSON.parse(JSON.stringify(state))).settings.relayCredentialRevocation).toEqual(
+			managedCredential,
+		);
+
+		state.settings.relayCredentialRevocation = undefined;
+		state.settings.relayCredential = { ...managedCredential, serviceUrl: "http://attacker.example" };
+		expect(() => parseVoltdState(JSON.parse(JSON.stringify(state)))).toThrow(/HTTPS origin or the local canary/);
+	});
+
 	it("setHostState updates the persisted host portion", async () => {
 		const store = new VoltdStateStore({ agentDir, statePath, debounceMs: 1 });
 		await store.load();

@@ -1,0 +1,935 @@
+diff --git a/iroh-relay/src/jwt_access.rs b/iroh-relay/src/jwt_access.rs
+new file mode 100644
+index 0000000..a8897ba
+--- /dev/null
++++ b/iroh-relay/src/jwt_access.rs
+@@ -0,0 +1,654 @@
++use std::{
++    collections::HashMap,
++    sync::Mutex,
++    time::{SystemTime, UNIX_EPOCH},
++};
++
++use data_encoding::BASE64URL_NOPAD;
++use http::header::AUTHORIZATION;
++use iroh_base::{EndpointId, PublicKey, Signature};
++use iroh_relay::server::{Access, AccessControl, ClientRequest, ConnectionId};
++use serde::{Deserialize, Serialize};
++use tokio::sync::Semaphore;
++use tracing::{debug, warn};
++
++const MAX_JWT_BYTES: usize = 8 * 1024;
++const MAX_KEY_ID_BYTES: usize = 128;
++const MAX_AUTHORITY_BYTES: usize = 512;
++const MAX_IDENTIFIER_BYTES: usize = 128;
++const MIN_IDENTIFIER_BYTES: usize = 16;
++const HARD_MAX_TOKEN_LIFETIME_SECONDS: u64 = 60 * 60;
++const HARD_MAX_CLOCK_SKEW_SECONDS: u64 = 5 * 60;
++const HARD_MAX_GLOBAL_CONNECTIONS: usize = 100_000;
++const HARD_MAX_NODE_CONNECTIONS: usize = 64;
++const HARD_MAX_GRANT_CONNECTIONS: usize = 128;
++const HARD_MAX_CONCURRENT_VERIFICATIONS: usize = 256;
++
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(deny_unknown_fields)]
++pub(crate) struct JwtAccessConfig {
++    /// Ed25519 public key as unpadded base64url (the JWKS `x` value).
++    pub(crate) public_key: String,
++    /// Exact JWT `kid` accepted by this relay process.
++    pub(crate) key_id: String,
++    /// Exact JWT issuer.
++    pub(crate) issuer: String,
++    /// Exact JWT audience.
++    pub(crate) audience: String,
++    /// Maximum accepted `exp - iat`, independently capped at one hour.
++    #[serde(default = "default_max_token_lifetime_seconds")]
++    pub(crate) max_token_lifetime_seconds: u64,
++    /// Clock skew accepted for `iat` and `exp`, capped at five minutes.
++    #[serde(default = "default_clock_skew_seconds")]
++    pub(crate) clock_skew_seconds: u64,
++    /// Maximum concurrent admitted relay connections.
++    #[serde(default = "default_max_global_connections")]
++    pub(crate) max_global_connections: usize,
++    /// Maximum concurrent connections for one proven Iroh endpoint ID.
++    #[serde(default = "default_max_node_connections")]
++    pub(crate) max_node_connections: usize,
++    /// Maximum concurrent connections sharing one anonymous pairing grant.
++    #[serde(default = "default_max_grant_connections")]
++    pub(crate) max_grant_connections: usize,
++    /// Maximum simultaneous JWT signature verifications.
++    #[serde(default = "default_max_concurrent_verifications")]
++    pub(crate) max_concurrent_verifications: usize,
++}
++
++const fn default_max_token_lifetime_seconds() -> u64 {
++    HARD_MAX_TOKEN_LIFETIME_SECONDS
++}
++
++const fn default_clock_skew_seconds() -> u64 {
++    30
++}
++
++const fn default_max_global_connections() -> usize {
++    4096
++}
++
++const fn default_max_node_connections() -> usize {
++    8
++}
++
++const fn default_max_grant_connections() -> usize {
++    32
++}
++
++const fn default_max_concurrent_verifications() -> usize {
++    32
++}
++
++#[derive(Debug)]
++pub(crate) struct JwtAccess {
++    verifier: JwtVerifier,
++    limits: ConnectionLimits,
++    verification_semaphore: Semaphore,
++    state: Mutex<ConnectionState>,
++}
++
++#[derive(Debug)]
++struct JwtVerifier {
++    public_key: PublicKey,
++    key_id: String,
++    issuer: String,
++    audience: String,
++    max_token_lifetime_seconds: i64,
++    clock_skew_seconds: i64,
++}
++
++#[derive(Debug)]
++struct ConnectionLimits {
++    global: usize,
++    per_node: usize,
++    per_grant: usize,
++}
++
++#[derive(Debug, Default)]
++struct ConnectionState {
++    connections: HashMap<ConnectionId, ConnectionAuthority>,
++    by_node: HashMap<EndpointId, usize>,
++    by_grant: HashMap<String, usize>,
++}
++
++#[derive(Debug)]
++struct ConnectionAuthority {
++    endpoint_id: EndpointId,
++    grant_id: String,
++}
++
++#[derive(Debug)]
++struct VerifiedAuthority {
++    grant_id: String,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct JwtHeader {
++    alg: String,
++    kid: String,
++    typ: String,
++}
++
++#[derive(Debug, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct JwtClaims {
++    iss: String,
++    aud: String,
++    sub: String,
++    exp: i64,
++    iat: i64,
++    jti: String,
++    scope: String,
++    endpoint_kind: String,
++    grant_id: String,
++}
++
++impl JwtAccess {
++    pub(crate) fn new(config: JwtAccessConfig) -> Result<Self, &'static str> {
++        if config.key_id.is_empty()
++            || config.key_id.len() > MAX_KEY_ID_BYTES
++            || config
++                .key_id
++                .bytes()
++                .any(|byte| byte.is_ascii_whitespace() || byte == b',')
++        {
++            return Err("access.jwt.key_id is invalid");
++        }
++        if !valid_authority(&config.issuer) || !valid_authority(&config.audience) {
++            return Err("access.jwt issuer or audience is invalid");
++        }
++        if config.max_token_lifetime_seconds == 0
++            || config.max_token_lifetime_seconds > HARD_MAX_TOKEN_LIFETIME_SECONDS
++        {
++            return Err("access.jwt.max_token_lifetime_seconds must be between 1 and 3600");
++        }
++        if config.clock_skew_seconds > HARD_MAX_CLOCK_SKEW_SECONDS {
++            return Err("access.jwt.clock_skew_seconds must not exceed 300");
++        }
++        if config.max_global_connections == 0
++            || config.max_global_connections > HARD_MAX_GLOBAL_CONNECTIONS
++            || config.max_node_connections == 0
++            || config.max_node_connections > HARD_MAX_NODE_CONNECTIONS
++            || config.max_grant_connections == 0
++            || config.max_grant_connections > HARD_MAX_GRANT_CONNECTIONS
++            || config.max_concurrent_verifications == 0
++            || config.max_concurrent_verifications > HARD_MAX_CONCURRENT_VERIFICATIONS
++            || config.max_node_connections > config.max_global_connections
++            || config.max_grant_connections > config.max_global_connections
++        {
++            return Err("access.jwt connection limits are invalid");
++        }
++
++        let public_key_bytes = decode_array::<32>(&config.public_key).map_err(
++            |_| "access.jwt.public_key must be a canonical 32-byte unpadded base64url value",
++        )?;
++        let public_key = PublicKey::from_bytes(&public_key_bytes)
++            .map_err(|_| "access.jwt.public_key is not a valid Ed25519 key")?;
++
++        Ok(Self {
++            verifier: JwtVerifier {
++                public_key,
++                key_id: config.key_id,
++                issuer: config.issuer,
++                audience: config.audience,
++                max_token_lifetime_seconds: config.max_token_lifetime_seconds as i64,
++                clock_skew_seconds: config.clock_skew_seconds as i64,
++            },
++            limits: ConnectionLimits {
++                global: config.max_global_connections,
++                per_node: config.max_node_connections,
++                per_grant: config.max_grant_connections,
++            },
++            verification_semaphore: Semaphore::new(config.max_concurrent_verifications),
++            state: Mutex::new(ConnectionState::default()),
++        })
++    }
++
++    fn admit(
++        &self,
++        request: &ClientRequest,
++        authority: VerifiedAuthority,
++    ) -> Result<(), &'static str> {
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| "connection state lock poisoned")?;
++        if state.connections.len() >= self.limits.global {
++            return Err("global connection limit reached");
++        }
++        if state
++            .by_node
++            .get(&request.endpoint_id())
++            .copied()
++            .unwrap_or_default()
++            >= self.limits.per_node
++        {
++            return Err("endpoint connection limit reached");
++        }
++        if state
++            .by_grant
++            .get(&authority.grant_id)
++            .copied()
++            .unwrap_or_default()
++            >= self.limits.per_grant
++        {
++            return Err("grant connection limit reached");
++        }
++        if state.connections.contains_key(&request.connection_id()) {
++            return Err("duplicate connection ID");
++        }
++
++        *state.by_node.entry(request.endpoint_id()).or_default() += 1;
++        *state
++            .by_grant
++            .entry(authority.grant_id.clone())
++            .or_default() += 1;
++        state.connections.insert(
++            request.connection_id(),
++            ConnectionAuthority {
++                endpoint_id: request.endpoint_id(),
++                grant_id: authority.grant_id,
++            },
++        );
++        Ok(())
++    }
++}
++
++impl AccessControl for JwtAccess {
++    async fn on_connect(&self, request: &ClientRequest) -> Access {
++        let result = match self.verification_semaphore.try_acquire() {
++            Ok(_permit) => self
++                .verifier
++                .verify(request)
++                .and_then(|authority| self.admit(request, authority)),
++            Err(_) => Err("JWT verification concurrency limit reached"),
++        };
++        match result {
++            Ok(()) => Access::Allow,
++            Err(reason) => {
++                debug!(
++                    endpoint_id = %request.endpoint_id().fmt_short(),
++                    connection_id = %request.connection_id(),
++                    reason,
++                    "denied relay JWT access"
++                );
++                Access::Deny { reason: None }
++            }
++        }
++    }
++
++    fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId) {
++        let Ok(mut state) = self.state.lock() else {
++            warn!(%connection_id, "relay JWT connection state lock poisoned during disconnect");
++            return;
++        };
++        let Some(authority) = state.connections.remove(&connection_id) else {
++            return;
++        };
++        if authority.endpoint_id != endpoint_id {
++            warn!(
++                %connection_id,
++                expected_endpoint_id = %authority.endpoint_id.fmt_short(),
++                observed_endpoint_id = %endpoint_id.fmt_short(),
++                "relay JWT disconnect endpoint did not match admitted authority"
++            );
++        }
++        decrement_count(&mut state.by_node, &authority.endpoint_id);
++        decrement_count(&mut state.by_grant, &authority.grant_id);
++    }
++}
++
++impl JwtVerifier {
++    fn verify(&self, request: &ClientRequest) -> Result<VerifiedAuthority, &'static str> {
++        let now = i64::try_from(
++            SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .map_err(|_| "system clock is before Unix epoch")?
++                .as_secs(),
++        )
++        .map_err(|_| "system clock is out of range")?;
++        self.verify_at(request, now)
++    }
++
++    fn verify_at(
++        &self,
++        request: &ClientRequest,
++        now: i64,
++    ) -> Result<VerifiedAuthority, &'static str> {
++        if request.query_pairs().any(|(name, _)| name == "token") {
++            return Err("query token is forbidden");
++        }
++        let mut authorization_values = request.headers().get_all(AUTHORIZATION).iter();
++        let authorization = authorization_values
++            .next()
++            .ok_or("authorization header missing")?;
++        if authorization_values.next().is_some() {
++            return Err("duplicate authorization header");
++        }
++        let authorization = authorization
++            .to_str()
++            .map_err(|_| "authorization header is not UTF-8")?;
++        if authorization.trim() != authorization || authorization.contains(',') {
++            return Err("authorization header is ambiguous");
++        }
++        let (scheme, token) = authorization
++            .split_once(' ')
++            .ok_or("authorization scheme missing")?;
++        if !scheme.eq_ignore_ascii_case("Bearer")
++            || token.is_empty()
++            || token.len() > MAX_JWT_BYTES
++            || token
++                .bytes()
++                .any(|byte| byte.is_ascii_whitespace() || byte == b',')
++        {
++            return Err("bearer token is invalid");
++        }
++
++        let mut parts = token.split('.');
++        let encoded_header = parts.next().ok_or("JWT header missing")?;
++        let encoded_claims = parts.next().ok_or("JWT claims missing")?;
++        let encoded_signature = parts.next().ok_or("JWT signature missing")?;
++        if parts.next().is_some()
++            || encoded_header.is_empty()
++            || encoded_claims.is_empty()
++            || encoded_signature.is_empty()
++        {
++            return Err("JWT shape is invalid");
++        }
++
++        let header_bytes = BASE64URL_NOPAD
++            .decode(encoded_header.as_bytes())
++            .map_err(|_| "JWT header is not canonical base64url")?;
++        let header: JwtHeader =
++            serde_json::from_slice(&header_bytes).map_err(|_| "JWT header JSON is invalid")?;
++        if header.alg != "EdDSA" || header.typ != "JWT" || header.kid != self.key_id {
++            return Err("JWT header authority is invalid");
++        }
++
++        let signature_bytes = decode_array::<64>(encoded_signature)
++            .map_err(|_| "JWT signature encoding is invalid")?;
++        let signature = Signature::from_bytes(&signature_bytes);
++        let signing_input = format!("{encoded_header}.{encoded_claims}");
++        self.public_key
++            .verify(signing_input.as_bytes(), &signature)
++            .map_err(|_| "JWT signature is invalid")?;
++
++        let claims_bytes = BASE64URL_NOPAD
++            .decode(encoded_claims.as_bytes())
++            .map_err(|_| "JWT claims are not canonical base64url")?;
++        let claims: JwtClaims =
++            serde_json::from_slice(&claims_bytes).map_err(|_| "JWT claims JSON is invalid")?;
++
++        if claims.iss != self.issuer
++            || claims.aud != self.audience
++            || claims.scope != "relay:connect"
++            || (claims.endpoint_kind != "app" && claims.endpoint_kind != "host")
++        {
++            return Err("JWT claim authority is invalid");
++        }
++        if claims.sub != request.endpoint_id().to_string() {
++            return Err("JWT subject does not match proven endpoint ID");
++        }
++        if claims.iat > now.saturating_add(self.clock_skew_seconds) {
++            return Err("JWT issued in the future");
++        }
++        if claims.exp <= now.saturating_sub(self.clock_skew_seconds) {
++            return Err("JWT expired");
++        }
++        let lifetime = claims
++            .exp
++            .checked_sub(claims.iat)
++            .ok_or("JWT lifetime overflow")?;
++        if lifetime <= 0 || lifetime > self.max_token_lifetime_seconds {
++            return Err("JWT lifetime exceeds relay policy");
++        }
++        if !valid_identifier(&claims.jti) || !valid_identifier(&claims.grant_id) {
++            return Err("JWT identifier is invalid");
++        }
++
++        Ok(VerifiedAuthority {
++            grant_id: claims.grant_id,
++        })
++    }
++}
++
++fn valid_authority(value: &str) -> bool {
++    !value.is_empty()
++        && value.len() <= MAX_AUTHORITY_BYTES
++        && value.trim() == value
++        && !value.bytes().any(|byte| byte.is_ascii_control())
++}
++
++fn valid_identifier(value: &str) -> bool {
++    (MIN_IDENTIFIER_BYTES..=MAX_IDENTIFIER_BYTES).contains(&value.len())
++        && value
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
++}
++
++fn decode_array<const N: usize>(value: &str) -> Result<[u8; N], ()> {
++    let decoded = BASE64URL_NOPAD.decode(value.as_bytes()).map_err(|_| ())?;
++    let bytes: [u8; N] = decoded.try_into().map_err(|_| ())?;
++    if BASE64URL_NOPAD.encode(&bytes) != value {
++        return Err(());
++    }
++    Ok(bytes)
++}
++
++fn decrement_count<K>(counts: &mut HashMap<K, usize>, key: &K)
++where
++    K: std::hash::Hash + Eq,
++{
++    if let Some(count) = counts.get_mut(key) {
++        *count -= 1;
++        if *count == 0 {
++            counts.remove(key);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use http::{Request, header::HeaderValue};
++    use iroh_base::SecretKey;
++    use iroh_relay::http::ProtocolVersion;
++    use serde_json::json;
++
++    use super::*;
++
++    const KEY_ID: &str = "credential-key-one";
++    const ISSUER: &str = "https://credentials.volt.test";
++    const AUDIENCE: &str = "volt-iroh-relay-canary";
++
++    fn signing_key() -> SecretKey {
++        SecretKey::from_bytes(&[7; 32])
++    }
++
++    fn endpoint_key() -> SecretKey {
++        SecretKey::from_bytes(&[9; 32])
++    }
++
++    fn config() -> JwtAccessConfig {
++        JwtAccessConfig {
++            public_key: BASE64URL_NOPAD.encode(signing_key().public().as_bytes()),
++            key_id: KEY_ID.to_string(),
++            issuer: ISSUER.to_string(),
++            audience: AUDIENCE.to_string(),
++            max_token_lifetime_seconds: 3600,
++            clock_skew_seconds: 30,
++            max_global_connections: 4,
++            max_node_connections: 1,
++            max_grant_connections: 2,
++            max_concurrent_verifications: 2,
++        }
++    }
++
++    fn token(endpoint_id: EndpointId, overrides: serde_json::Value) -> String {
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_secs() as i64;
++        let header = json!({"alg":"EdDSA","kid":KEY_ID,"typ":"JWT"});
++        let mut claims = json!({
++            "iss": ISSUER,
++            "aud": AUDIENCE,
++            "sub": endpoint_id.to_string(),
++            "exp": now + 900,
++            "iat": now,
++            "jti": "jwt_identifier_one",
++            "scope": "relay:connect",
++            "endpoint_kind": "host",
++            "grant_id": "grant_identifier_one"
++        });
++        let claims_object = claims.as_object_mut().unwrap();
++        for (key, value) in overrides.as_object().unwrap() {
++            claims_object.insert(key.clone(), value.clone());
++        }
++        let encoded_header = BASE64URL_NOPAD.encode(&serde_json::to_vec(&header).unwrap());
++        let encoded_claims = BASE64URL_NOPAD.encode(&serde_json::to_vec(&claims).unwrap());
++        let signing_input = format!("{encoded_header}.{encoded_claims}");
++        let signature = signing_key().sign(signing_input.as_bytes());
++        format!(
++            "{signing_input}.{}",
++            BASE64URL_NOPAD.encode(&signature.to_bytes())
++        )
++    }
++
++    fn request(endpoint_id: EndpointId, token: &str) -> ClientRequest {
++        let request = Request::builder()
++            .uri("/relay")
++            .header(AUTHORIZATION, format!("Bearer {token}"))
++            .body(())
++            .unwrap();
++        let (parts, _) = request.into_parts();
++        ClientRequest::new(endpoint_id, ProtocolVersion::default(), parts)
++    }
++
++    #[tokio::test]
++    async fn accepts_node_bound_jwt_and_releases_connection_limit() {
++        let access = JwtAccess::new(config()).unwrap();
++        let endpoint_id = endpoint_key().public();
++        let first = request(endpoint_id, &token(endpoint_id, json!({})));
++        assert_eq!(access.on_connect(&first).await, Access::Allow);
++
++        let second = request(endpoint_id, &token(endpoint_id, json!({})));
++        assert_eq!(
++            access.on_connect(&second).await,
++            Access::Deny { reason: None }
++        );
++
++        access.on_disconnect(endpoint_id, first.connection_id());
++        let third = request(endpoint_id, &token(endpoint_id, json!({})));
++        assert_eq!(access.on_connect(&third).await, Access::Allow);
++    }
++
++    #[tokio::test]
++    async fn rejects_wrong_subject_expiry_and_excess_lifetime() {
++        let endpoint_id = endpoint_key().public();
++        let access = JwtAccess::new(config()).unwrap();
++        let other_id = SecretKey::from_bytes(&[11; 32]).public();
++        let wrong_subject = request(endpoint_id, &token(other_id, json!({})));
++        assert_eq!(
++            access.on_connect(&wrong_subject).await,
++            Access::Deny { reason: None }
++        );
++
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_secs() as i64;
++        let expired = request(
++            endpoint_id,
++            &token(endpoint_id, json!({"iat": now - 120, "exp": now - 60})),
++        );
++        assert_eq!(
++            access.on_connect(&expired).await,
++            Access::Deny { reason: None }
++        );
++        let excessive = request(
++            endpoint_id,
++            &token(endpoint_id, json!({"iat": now, "exp": now + 3601})),
++        );
++        assert_eq!(
++            access.on_connect(&excessive).await,
++            Access::Deny { reason: None }
++        );
++    }
++
++    #[tokio::test]
++    async fn rejects_duplicate_headers_and_query_tokens() {
++        let endpoint_id = endpoint_key().public();
++        let access = JwtAccess::new(config()).unwrap();
++        let jwt = token(endpoint_id, json!({}));
++
++        let mut duplicate_request = Request::builder()
++            .uri("/relay")
++            .header(AUTHORIZATION, format!("Bearer {jwt}"))
++            .body(())
++            .unwrap();
++        duplicate_request
++            .headers_mut()
++            .append(AUTHORIZATION, HeaderValue::from_static("Bearer duplicate"));
++        let (parts, _) = duplicate_request.into_parts();
++        let duplicate = ClientRequest::new(endpoint_id, ProtocolVersion::default(), parts);
++        assert_eq!(
++            access.on_connect(&duplicate).await,
++            Access::Deny { reason: None }
++        );
++
++        let query_request = Request::builder()
++            .uri(format!("/relay?token={jwt}"))
++            .header(AUTHORIZATION, format!("Bearer {jwt}"))
++            .body(())
++            .unwrap();
++        let (parts, _) = query_request.into_parts();
++        let query_request = ClientRequest::new(endpoint_id, ProtocolVersion::default(), parts);
++        assert_eq!(
++            access.on_connect(&query_request).await,
++            Access::Deny { reason: None }
++        );
++    }
++
++    #[test]
++    fn accepts_go_issuer_interop_vector() {
++        const NODE_ID: &str = "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618";
++        const TOKEN: &str = "eyJhbGciOiJFZERTQSIsImtpZCI6Il9vRXNFdk9yVE9hc1hiYWEiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2NyZWRlbnRpYWxzLnZvbHQudGVzdCIsImF1ZCI6InZvbHQtaXJvaC1yZWxheS1jYW5hcnkiLCJzdWIiOiJmZDE3MjQzODVhYTBjNzViNjRmYjc4Y2Q2MDJmYTFkOTkxZmRlYmY3NmIxM2M1OGVkNzAyZWFjODM1ZTlmNjE4IiwiZXhwIjoxNzg3MzE0NTAwLCJpYXQiOjE3ODczMTM2MDAsImp0aSI6Imp3dF9pZGVudGlmaWVyX29uZSIsInNjb3BlIjoicmVsYXk6Y29ubmVjdCIsImVuZHBvaW50X2tpbmQiOiJob3N0IiwiZ3JhbnRfaWQiOiJncmFudF9pZGVudGlmaWVyX29uZSJ9.S0Eq4fPo1jq1ZUvASpZiE_6Grdx2Mb_iCkbtMLXxQktkJKSvriAc1CCISYwzd6ynPJKbNdcmnokG71jWpGvwCA";
++        let endpoint_id: EndpointId = NODE_ID.parse().unwrap();
++        let access = JwtAccess::new(JwtAccessConfig {
++            public_key: "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw".to_string(),
++            key_id: "_oEsEvOrTOasXbaa".to_string(),
++            issuer: ISSUER.to_string(),
++            audience: AUDIENCE.to_string(),
++            max_token_lifetime_seconds: 3600,
++            clock_skew_seconds: 30,
++            max_global_connections: 4,
++            max_node_connections: 1,
++            max_grant_connections: 2,
++            max_concurrent_verifications: 2,
++        })
++        .unwrap();
++        let request = request(endpoint_id, TOKEN);
++        let authority = access.verifier.verify_at(&request, 1_787_313_600).unwrap();
++        assert_eq!(authority.grant_id, "grant_identifier_one");
++    }
++
++    #[test]
++    fn rejects_unsafe_configuration() {
++        let mut unsafe_config = config();
++        unsafe_config.max_token_lifetime_seconds = 3601;
++        assert!(JwtAccess::new(unsafe_config).is_err());
++
++        let mut unsafe_config = config();
++        unsafe_config.max_node_connections = 0;
++        assert!(JwtAccess::new(unsafe_config).is_err());
++
++        let mut unsafe_config = config();
++        unsafe_config.public_key = "not-base64url".to_string();
++        assert!(JwtAccess::new(unsafe_config).is_err());
++
++        let mut unsafe_config = config();
++        unsafe_config.max_concurrent_verifications = 0;
++        assert!(JwtAccess::new(unsafe_config).is_err());
++    }
++}
+diff --git a/iroh-relay/src/main.rs b/iroh-relay/src/main.rs
+index 2ca043d..116c235 100644
+--- a/iroh-relay/src/main.rs
++++ b/iroh-relay/src/main.rs
+@@ -3,6 +3,8 @@
+ //! This handles only the CLI and config file loading, the server implementation lives in
+ //! [`iroh::relay::server`].
+
++mod jwt_access;
++
+ use std::{
+     net::{Ipv6Addr, SocketAddr},
+     num::NonZeroU32,
+@@ -30,6 +32,8 @@ use tracing_subscriber::{EnvFilter, prelude::*};
+ use url::Url;
+ use webpki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
++use crate::jwt_access::{JwtAccess, JwtAccessConfig};
++
+ /// The default `http_bind_port` when using `--dev`.
+ const DEV_MODE_HTTP_PORT: u16 = 3340;
+ /// The header name for setting the endpoint id in HTTP auth requests.
+@@ -89,6 +93,7 @@ fn load_secret_key(
+ ///
+ /// This is (de)serialised to/from a TOML config file.
+ #[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
+ struct Config {
+     /// Whether to enable the Relay server.
+     ///
+@@ -151,7 +156,6 @@ struct Config {
+     /// Access control for relaying connections.
+     ///
+     /// This controls which endpoints are allowed to relay connections, other endpoints are not controlled by this.
+-    #[serde(default)]
+     access: AccessConfig,
+ }
+
+@@ -173,6 +177,8 @@ enum AccessConfig {
+     /// To grant access, the HTTP endpoint must return a `200` response with `true` as the response text.
+     /// In all other cases, the endpoint will be denied access.
+     Http(HttpAccessConfig),
++    /// Validates short-lived Ed25519 JWTs bound to the proven Iroh endpoint ID.
++    Jwt(JwtAccessConfig),
+     #[serde(rename = "shared_token")]
+     /// Allows only clients that present one of the configured bearer tokens.
+     ///
+@@ -228,6 +234,10 @@ impl TryFrom<AccessConfig> for Arc<dyn iroh_relay::server::DynAccessControl> {
+                 }
+                 Ok(Arc::new(HttpAccess { client, config }))
+             }
++            AccessConfig::Jwt(config) => match JwtAccess::new(config) {
++                Ok(access) => Ok(Arc::new(access)),
++                Err(message) => bail_any!("{message}"),
++            },
+             AccessConfig::SharedToken(mut tokens) => {
+                 // A single env var token replaces the entire list. A comma-separated list
+                 // is intentionally not supported to avoid restricting the token character set.
+@@ -537,15 +547,16 @@ impl Config {
+     async fn load(opts: &Cli) -> Result<Self> {
+         let config_path = if let Some(config_path) = &opts.config_path {
+             config_path
+-        } else {
++        } else if opts.dev {
+             return Ok(Config::default());
++        } else {
++            bail_any!("--config-path is required outside --dev mode");
+         };
+
+-        if config_path.exists() {
+-            Self::read_from_file(&config_path).await
+-        } else {
+-            Ok(Config::default())
++        if !config_path.exists() {
++            bail_any!("config-path does not exist: {}", config_path.display());
+         }
++        Self::read_from_file(config_path).await
+     }
+
+     fn from_str(config: &str) -> Result<Self> {
+@@ -582,6 +593,7 @@ async fn main() -> Result<()> {
+
+     let cli = Cli::parse();
+     let mut cfg = Config::load(&cli).await?;
++    validate_access_mode(&cli, &cfg)?;
+     if cfg.enable_quic_addr_discovery && cfg.tls.is_none() {
+         bail_any!("TLS must be configured in order to spawn a QUIC endpoint");
+     }
+@@ -612,6 +624,13 @@ async fn main() -> Result<()> {
+     Ok(())
+ }
+
++fn validate_access_mode(cli: &Cli, cfg: &Config) -> Result<()> {
++    if !cli.dev && matches!(cfg.access, AccessConfig::Everyone) {
++        bail_any!("access = \"everyone\" is allowed only in --dev mode");
++    }
++    Ok(())
++}
++
+ async fn load_cert_config(tls: &TlsConfig) -> Result<relay::CertConfig> {
+     let server_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+         rustls::crypto::ring::default_provider(),
+@@ -794,6 +813,7 @@ mod tests {
+     #[tokio::test]
+     async fn test_rate_limit_config() -> Result {
+         let config = "
++            access = \"everyone\"
+             [limits.client.rx]
+             bytes_per_second = 400
+             max_burst_bytes = 800
+@@ -816,7 +836,7 @@ mod tests {
+
+     #[tokio::test]
+     async fn test_rate_limit_default() -> Result {
+-        let config = Config::from_str("")?;
++        let config = Config::from_str("access = \"everyone\"")?;
+         let relay_config = build_relay_config(config).await?;
+
+         let relay = relay_config.relay.expect("no relay config");
+@@ -898,6 +918,37 @@ mod tests {
+             })
+         );
+
++        let config = r#"
++            [access.jwt]
++            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++            key_id = "credential-key-one"
++            issuer = "https://credentials.volt.test"
++            audience = "volt-iroh-relay-canary"
++            max_global_connections = 100
++            max_node_connections = 4
++            max_grant_connections = 8
++        "#
++        .to_string();
++        let config = Config::from_str(dbg!(&config))?;
++        assert!(matches!(config.access, AccessConfig::Jwt(_)));
++
++        let misspelled_jwt_policy = r#"
++            [access.jwt]
++            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++            key_id = "credential-key-one"
++            issuer = "https://credentials.volt.test"
++            audience = "volt-iroh-relay-canary"
++            max_node_connectons = 4
++        "#;
++        assert!(
++            Config::from_str(misspelled_jwt_policy).is_err(),
++            "unknown JWT policy fields must fail closed"
++        );
++        assert!(
++            Config::from_str("acces = \"everyone\"").is_err(),
++            "unknown root fields must fail closed"
++        );
++
+         let config = r#"
+             access.shared_token = ["token-a", "token-b"]
+         "#
+@@ -937,6 +988,7 @@ mod tests {
+     async fn test_enable_relay_config() -> Result {
+         let config = "
+             enable_relay = false
++            access = \"everyone\"
+         ";
+         let config = Config::from_str(config)?;
+         let relay_config = build_relay_config(config).await?;
+@@ -944,16 +996,37 @@ mod tests {
+
+         let config = "
+             enable_relay = true
++            access = \"everyone\"
+         ";
+         let config = Config::from_str(config)?;
+         let relay_config = build_relay_config(config).await?;
+         assert!(relay_config.relay.is_some());
+
+-        let config = "";
+-        let config = Config::from_str(config)?;
+-        let relay_config = build_relay_config(config).await?;
+-        assert!(relay_config.relay.is_some());
++        assert!(Config::from_str("").is_err(), "access must be explicit");
+
+         Ok(())
+     }
++
++    #[tokio::test]
++    async fn test_production_config_fails_closed() {
++        let no_config = Cli {
++            dev: false,
++            config_path: None,
++        };
++        assert!(Config::load(&no_config).await.is_err());
++
++        let missing_config = Cli {
++            dev: false,
++            config_path: Some(std::env::temp_dir().join("missing-iroh-relay-config.toml")),
++        };
++        assert!(Config::load(&missing_config).await.is_err());
++
++        let open_config = Config::from_str("access = \"everyone\"").unwrap();
++        assert!(validate_access_mode(&no_config, &open_config).is_err());
++        let dev = Cli {
++            dev: true,
++            config_path: None,
++        };
++        assert!(validate_access_mode(&dev, &open_config).is_ok());
++    }
+ }
+diff --git a/iroh-relay/src/server/http_server.rs b/iroh-relay/src/server/http_server.rs
+index 22384eb..374a311 100644
+--- a/iroh-relay/src/server/http_server.rs
++++ b/iroh-relay/src/server/http_server.rs
+@@ -25,7 +25,7 @@ use n0_error::{e, ensure, stack_error};
+ use n0_future::MaybeFuture;
+ use tokio::{
+     net::{TcpListener, TcpStream},
+-    sync::{Notify, watch},
++    sync::{Notify, Semaphore, watch},
+ };
+ use tokio_rustls_acme::AcmeAcceptor;
+ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
+@@ -73,7 +73,14 @@ const SEC_WEBSOCKET_ACCEPT_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+ ///
+ /// The connection is aborted if the connection does not complete the TLS handshake
+ /// and establishes relay protocol WebSocket stream within this timeout.
+-const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
++const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
++/// Maximum TCP connections concurrently completing TLS, HTTP upgrade, endpoint authentication,
++/// and access authorization. Established relay clients are governed separately by AccessControl.
++const MAX_PENDING_CONNECTIONS: usize = 64;
++/// Hard cap on HTTP headers accepted before a relay WebSocket upgrade.
++const MAX_HTTP_HEADERS: usize = 32;
++/// Hard cap on Hyper's HTTP/1 read buffer during relay establishment.
++const MAX_HTTP_BUFFER_BYTES: usize = 32 * 1024;
+
+ /// Derives the accept key for WebSocket handshake according to RFC 6455.
+ /// Takes the client's Sec-WebSocket-Key value and returns the calculated accept key.
+@@ -468,6 +475,7 @@ impl ServerBuilder {
+
+         let cancel = cancel_token.clone();
+         let loop_service = service.clone();
++        let pending_connections = Arc::new(Semaphore::new(MAX_PENDING_CONNECTIONS));
+         let task = tokio::task::spawn(
+             async move {
+                 let service = loop_service;
+@@ -488,11 +496,17 @@ impl ServerBuilder {
+                         }
+                         res = listener.accept() => match res {
+                             Ok((stream, peer_addr)) => {
++                                let Ok(pending_permit) = pending_connections.clone().try_acquire_owned() else {
++                                    debug!(%peer_addr, "dropping connection because pending establishment capacity is full");
++                                    drop(stream);
++                                    continue;
++                                };
+                                 debug!("connection opened from {peer_addr}");
+                                 let tls_config = tls_config.clone();
+                                 let service = service.clone();
+                                 // spawn a task to handle the connection
+                                 set.spawn(async move {
++                                    let _pending_permit = pending_permit;
+                                     service
+                                         .handle_connection(stream, tls_config, self.establish_timeout)
+                                         .await
+@@ -1117,7 +1131,11 @@ impl RelayServiceWithNotify {
+
+     /// Wrapper for the actual http connection (with upgrades)
+     async fn serve_connection(self, io: MaybeTlsStream) -> Result<(), ServeConnectionError> {
+-        hyper::server::conn::http1::Builder::new()
++        let mut builder = hyper::server::conn::http1::Builder::new();
++        builder
++            .max_headers(MAX_HTTP_HEADERS)
++            .max_buf_size(MAX_HTTP_BUFFER_BYTES);
++        builder
+             .serve_connection(hyper_util::rt::TokioIo::new(io), self)
+             .with_upgrades()
+             .await
