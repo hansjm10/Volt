@@ -76,6 +76,25 @@ describe("SubscriptionUsageService", () => {
 		});
 	});
 
+	it("omits usage-capable providers without stored OAuth credentials", async () => {
+		const configuredId = `configured-${Date.now()}`;
+		const unconfiguredId = `unconfigured-${Date.now()}`;
+		const configuredFetch = vi.fn(async () => successfulResult(configuredId));
+		const unconfiguredFetch = vi.fn(async () => successfulResult(unconfiguredId));
+		registerUsageProvider(configuredId, configuredFetch);
+		registerUsageProvider(unconfiguredId, unconfiguredFetch);
+		const authStorage = AuthStorage.inMemory({ [configuredId]: oauthCredential() });
+
+		const report = await new SubscriptionUsageService().fetch(authStorage, unconfiguredId);
+
+		expect(report).toMatchObject({
+			status: "providers",
+			providers: [{ providerId: configuredId }],
+		});
+		expect(configuredFetch).toHaveBeenCalledOnce();
+		expect(unconfiguredFetch).not.toHaveBeenCalled();
+	});
+
 	it("orders the active provider first and preserves partial successes", async () => {
 		const alphaId = `alpha-${Date.now()}`;
 		const zetaId = `zeta-${Date.now()}`;
