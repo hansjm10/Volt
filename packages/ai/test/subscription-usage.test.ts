@@ -147,6 +147,38 @@ describe.sequential("subscription usage adapters", () => {
 		expect(serialized).not.toContain("spend_control");
 	});
 
+	it("marks only the exhausted Codex window as limit reached", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				jsonResponse({
+					rate_limit: {
+						limit_reached: true,
+						primary_window: { used_percent: 100 },
+						secondary_window: { used_percent: 50 },
+					},
+				}),
+			),
+		);
+
+		const snapshot = requireSuccess(await fetchOpenAICodexSubscriptionUsage(credentials));
+
+		expect(snapshot.limits).toEqual([
+			{
+				id: "primary",
+				label: "Primary window",
+				usedPercent: 100,
+				limitReached: true,
+			},
+			{
+				id: "secondary",
+				label: "Secondary window",
+				usedPercent: 50,
+				limitReached: false,
+			},
+		]);
+	});
+
 	it.each([
 		{ status: 401, code: "unauthorized" },
 		{ status: 429, code: "rate_limited" },

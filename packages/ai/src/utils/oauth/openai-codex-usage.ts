@@ -58,7 +58,7 @@ function parseWindow(
 	value: unknown,
 	kind: WindowKind,
 	fetchedAt: number,
-	options: { idPrefix?: string; labelPrefix?: string; limitReached?: boolean } = {},
+	options: { idPrefix?: string; labelPrefix?: string } = {},
 ): SubscriptionUsageLimit | undefined {
 	if (!isRecord(value)) return undefined;
 	const usedPercent = normalizeUsedPercent(value.used_percent);
@@ -81,7 +81,7 @@ function parseWindow(
 		usedPercent,
 		...(resetsAt === undefined ? {} : { resetsAt }),
 		...(durationSeconds === undefined ? {} : { windowDurationMs: durationSeconds * 1000 }),
-		...(options.limitReached === undefined ? {} : { limitReached: options.limitReached }),
+		limitReached: usedPercent >= 100,
 	};
 }
 
@@ -91,10 +91,9 @@ function parseRateLimitWindows(
 	options: { idPrefix?: string; labelPrefix?: string } = {},
 ): SubscriptionUsageLimit[] {
 	if (!isRecord(value)) return [];
-	const limitReached = typeof value.limit_reached === "boolean" ? value.limit_reached : undefined;
 	const limits: SubscriptionUsageLimit[] = [];
-	const primary = parseWindow(value.primary_window, "primary", fetchedAt, { ...options, limitReached });
-	const secondary = parseWindow(value.secondary_window, "secondary", fetchedAt, { ...options, limitReached });
+	const primary = parseWindow(value.primary_window, "primary", fetchedAt, options);
+	const secondary = parseWindow(value.secondary_window, "secondary", fetchedAt, options);
 	if (primary) limits.push(primary);
 	if (secondary) limits.push(secondary);
 	return limits;
