@@ -2169,9 +2169,13 @@ export class InteractiveMode {
 		} satisfies IrohRemoteClientAuthorizationSuccess;
 
 		// The daemon's identity from the preamble: the phone verifies the saved
-		// host node id in the handshake response we write over the relay.
+		// host node id in the handshake response and every notification destination.
+		const hostNodeId = preamble.hostNodeId;
+		if (hostNodeId === undefined) {
+			throw new Error("Relay preamble omitted the daemon host node ID");
+		}
 		const responseContext = {
-			hostNodeId: preamble.hostNodeId,
+			hostNodeId,
 			relayMode: preamble.relayMode,
 			relayUrls: preamble.relayUrls,
 		};
@@ -2212,6 +2216,7 @@ export class InteractiveMode {
 				);
 				await runIrohRemoteRpcMode(this.runtimeHost, {
 					rpcGrant,
+					hostNodeId,
 					isRpcIngressOpen: workspaceUnregisterRetirement.isIngressOpen,
 					clientNodeId: authorizationSubset.clientNodeId,
 					stream: relayedStream,

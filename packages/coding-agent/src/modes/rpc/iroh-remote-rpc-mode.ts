@@ -43,6 +43,8 @@ import type { RpcRegisterPushTargetResponse } from "./rpc-types.ts";
 
 export interface IrohRemoteRpcModeOptions extends IrohRpcTransportOptions {
 	rpcGrant: IrohRemoteRpcGrant;
+	/** Authoritative Iroh host identity bound into every notification destination. */
+	hostNodeId: string;
 	/** Stable paired-client identity for notification reconciliation across stream reattachment. */
 	clientNodeId?: string;
 	/** Stop terminally fenced ingress while preserving already-admitted ordered output. */
@@ -97,6 +99,7 @@ export type IrohRemoteNotificationKind =
 export interface IrohRemoteNotificationRequest {
 	type: "notification_request";
 	eventId: string;
+	hostNodeId: string;
 	kind: IrohRemoteNotificationKind;
 	title: string;
 	body: string;
@@ -241,7 +244,11 @@ export function runIrohRemoteRpcMode(
 		preparedTransport: preparedOutboundTransport,
 		getCompletionState: () => getIrohRemoteCompletionState(runtimeHost),
 		onCommandCompleted: async (completion) => {
-			const notification = createIrohRemoteCompletionNotification(completion, options.workspaceName);
+			const notification = createIrohRemoteCompletionNotification(
+				completion,
+				options.hostNodeId,
+				options.workspaceName,
+			);
 			if (notification) {
 				await notificationDelivery?.deliver(notification);
 			}
@@ -373,6 +380,7 @@ export function runIrohRemoteRpcMode(
 	notificationDelivery = attachIrohRemoteNotificationDelivery(runtimeHost, {
 		clientNodeId: options.clientNodeId,
 		delivery: options.notificationDelivery,
+		hostNodeId: options.hostNodeId,
 		workspaceName: options.workspaceName,
 		writeJsonl: enqueueOrderedControl,
 	});
@@ -450,6 +458,7 @@ interface IrohRemoteNotificationDeliveryAttachment {
 interface IrohRemoteNotificationDeliveryAttachmentOptions {
 	clientNodeId?: string;
 	delivery?: IrohRemotePushNotificationDelivery;
+	hostNodeId: string;
 	workspaceName?: string;
 	writeJsonl(notification: IrohRemoteNotificationRequest): Promise<void>;
 }
@@ -468,13 +477,15 @@ class IrohRemoteNotificationDeliveryReconciler {
 	private readonly deliveredEventIds = new Set<string>();
 	private readonly pendingNotifications = new Map<string, IrohRemoteNotificationRequest>();
 	private readonly runtimeHost: AgentSessionRuntime;
+	private readonly hostNodeId: string;
 	private currentAttachment: IrohRemoteActiveNotificationAttachment | undefined;
 	private deliveryQueue: Promise<void> = Promise.resolve();
 	private pushDelivery: IrohRemotePushNotificationDelivery | undefined;
 	private workspaceName: string | undefined;
 
-	constructor(runtimeHost: AgentSessionRuntime) {
+	constructor(runtimeHost: AgentSessionRuntime, hostNodeId: string) {
 		this.runtimeHost = runtimeHost;
+		this.hostNodeId = hostNodeId;
 		runtimeHost.reviewWorkflows?.attachSink((event) => {
 			if (event.type !== "workflow_end" || event.kind !== "review" || event.status !== "completed") {
 				return;
@@ -486,6 +497,7 @@ class IrohRemoteNotificationDeliveryReconciler {
 			const notification = createIrohRemoteReviewCompletionNotification(
 				record,
 				runtimeHost.session.sessionId,
+				this.hostNodeId,
 				this.workspaceName,
 			);
 			if (notification) {
@@ -495,6 +507,9 @@ class IrohRemoteNotificationDeliveryReconciler {
 	}
 
 	attach(options: IrohRemoteNotificationDeliveryAttachmentOptions): IrohRemoteNotificationDeliveryAttachment {
+		if (options.hostNodeId !== this.hostNodeId) {
+			throw new Error("Notification host identity changed for a retained runtime");
+		}
 		const token = {};
 		this.currentAttachment = { token, writeJsonl: options.writeJsonl };
 		this.workspaceName = options.workspaceName;
@@ -510,6 +525,7 @@ class IrohRemoteNotificationDeliveryReconciler {
 			const notification = createIrohRemoteReviewCompletionNotification(
 				record,
 				this.runtimeHost.session.sessionId,
+				this.hostNodeId,
 				this.workspaceName,
 			);
 			if (notification) {
@@ -611,7 +627,7 @@ function attachIrohRemoteNotificationDelivery(
 	const key = options.clientNodeId ?? anonymousNotificationClient;
 	let reconciler = reconcilers.get(key);
 	if (!reconciler) {
-		reconciler = new IrohRemoteNotificationDeliveryReconciler(runtimeHost);
+		reconciler = new IrohRemoteNotificationDeliveryReconciler(runtimeHost, options.hostNodeId);
 		reconcilers.set(key, reconciler);
 	}
 	return reconciler.attach(options);
@@ -620,6 +636,7 @@ function attachIrohRemoteNotificationDelivery(
 function createIrohRemoteReviewCompletionNotification(
 	record: ReviewWorkflowResultRecord,
 	sessionId: string,
+	hostNodeId: string,
 	workspaceName: string | undefined,
 ): IrohRemoteNotificationRequest | undefined {
 	const workflowId = sanitizeIrohRemoteNotificationMetadata(record.workflowId);
@@ -643,6 +660,7 @@ function createIrohRemoteReviewCompletionNotification(
 					: `${target} completed with ${findingsCount} finding${findingsCount === 1 ? "" : "s"}.`;
 	return createBoundedIrohRemoteNotificationRequest({
 		eventId: `${workflowId}:completed`,
+		hostNodeId,
 		kind: "review_completed",
 		title: "Your review is ready",
 		body,
@@ -1147,6 +1165,7 @@ function getIrohRemoteCompletionState(runtimeHost: AgentSessionRuntime): IrohRem
 
 function createIrohRemoteCompletionNotification(
 	completion: IrohRemoteCompletedCommand,
+	hostNodeId: string,
 	workspaceName: string | undefined,
 ): IrohRemoteNotificationRequest | undefined {
 	const finalState = getChangedFinalCompletionState(completion);
@@ -1162,6 +1181,7 @@ function createIrohRemoteCompletionNotification(
 		case "failed":
 			return createBoundedIrohRemoteNotificationRequest({
 				eventId: `conversation:${finalState.sessionId}:${finalState.runId}:failed`,
+				hostNodeId,
 				kind: "host_notice",
 				title:
 					workspaceNameMetadata === undefined
@@ -1180,6 +1200,7 @@ function createIrohRemoteCompletionNotification(
 				}
 				return createBoundedIrohRemoteNotificationRequest({
 					eventId: `plan:${finalState.sessionId}:${finalState.runId}:ready`,
+					hostNodeId,
 					kind: "plan_ready",
 					title: "Your plan is ready",
 					body: "Open Volt to review and approve it.",
@@ -1190,6 +1211,7 @@ function createIrohRemoteCompletionNotification(
 			}
 			return createBoundedIrohRemoteNotificationRequest({
 				eventId: `conversation:${finalState.sessionId}:${finalState.runId}:completed`,
+				hostNodeId,
 				kind: "conversation_completed",
 				title: workspaceNameMetadata === undefined ? "Volt finished" : `Volt finished in ${workspaceNameMetadata}`,
 				body: "Your conversation is ready.",

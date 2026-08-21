@@ -96,6 +96,7 @@ describe("control protocol framing", () => {
 				sessionId: "s-1",
 				notification: {
 					eventId: "plan:s-1:run-1:ready",
+					hostNodeId: "a".repeat(64),
 					kind: "plan_ready",
 					title: "Your plan is ready",
 					body: "Open Volt to review and approve it.",

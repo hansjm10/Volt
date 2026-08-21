@@ -20,6 +20,8 @@ const {
 	revokePushTargetTransaction,
 } = require("./core.js");
 
+const HOST_NODE_ID = "a".repeat(64);
+
 function expectRequestError(operation, status, message) {
 	assert.throws(operation, (error) => {
 		assert.ok(error instanceof RequestError);
@@ -148,10 +150,11 @@ test("registration and notification schemas reject unknown and oversized values"
 				pushTargetId: "fcm_12345678901234567890",
 				pushTargetAuthToken: "a".repeat(32),
 				eventId: "event-1",
+				hostNodeId: HOST_NODE_ID,
 				kind: "conversation_completed",
 				title: "Volt",
 				body: "x".repeat(1025),
-				data: { eventId: "event-1", kind: "conversation_completed" },
+				data: { eventId: "event-1", hostNodeId: HOST_NODE_ID, kind: "conversation_completed" },
 			}),
 		400,
 		"body_has_invalid_notification_text",
@@ -163,6 +166,7 @@ test("notification input preserves bounded Plan and review navigation metadata f
 		pushTargetId: "fcm_12345678901234567890",
 		pushTargetAuthToken: "a".repeat(32),
 		eventId: "plan:session-one:run-one:ready",
+		hostNodeId: HOST_NODE_ID,
 		kind: "plan_ready",
 		title: "Your plan is ready",
 		body: "Open Volt to review and approve it.",
@@ -170,6 +174,7 @@ test("notification input preserves bounded Plan and review navigation metadata f
 		planId: "plan-one",
 		data: {
 			eventId: "plan:session-one:run-one:ready",
+			hostNodeId: HOST_NODE_ID,
 			kind: "plan_ready",
 			sessionId: "session-one",
 			workspaceName: "volt-app",
@@ -178,28 +183,33 @@ test("notification input preserves bounded Plan and review navigation metadata f
 	});
 	assert.deepEqual(plan.data, {
 		eventId: "plan:session-one:run-one:ready",
+		hostNodeId: HOST_NODE_ID,
 		kind: "plan_ready",
 		sessionId: "session-one",
 		workspaceName: "volt-app",
 		planId: "plan-one",
 	});
+	assert.equal(plan.hostNodeId, HOST_NODE_ID);
 	assert.equal(plan.planId, "plan-one");
 
 	const review = parseNotification({
 		pushTargetId: "fcm_12345678901234567890",
 		pushTargetAuthToken: "a".repeat(32),
 		eventId: "review:one:completed",
+		hostNodeId: HOST_NODE_ID,
 		kind: "review_completed",
 		title: "Your review is ready",
 		body: "PR #151 completed with 4 findings.",
 		workflowId: "review:one",
 		data: {
 			eventId: "review:one:completed",
+			hostNodeId: HOST_NODE_ID,
 			kind: "review_completed",
 			sessionId: "session-one",
 			workflowId: "review:one",
 		},
 	});
+	assert.equal(review.hostNodeId, HOST_NODE_ID);
 	assert.equal(review.workflowId, "review:one");
 	assert.equal(review.data.workflowId, "review:one");
 });
@@ -209,16 +219,26 @@ test("notification input rejects control characters, host paths, overlong copy, 
 		pushTargetId: "fcm_12345678901234567890",
 		pushTargetAuthToken: "a".repeat(32),
 		eventId: "review:one:completed",
+		hostNodeId: HOST_NODE_ID,
 		kind: "review_completed",
 		title: "Your review is ready",
 		body: "Review completed with 1 finding.",
 		workflowId: "review:one",
 		data: {
 			eventId: "review:one:completed",
+			hostNodeId: HOST_NODE_ID,
 			kind: "review_completed",
 			workflowId: "review:one",
 		},
 	};
+	for (const [hostNodeId, message] of [
+		[undefined, "hostNodeId_has_invalid_notification_metadata"],
+		["A".repeat(64), "hostNodeId_has_invalid_notification_host_identity"],
+		["a".repeat(63), "hostNodeId_has_invalid_notification_host_identity"],
+		[`${"a".repeat(63)}/`, "hostNodeId_has_invalid_notification_metadata"],
+	]) {
+		expectRequestError(() => parseNotification({ ...base, hostNodeId }), 400, message);
+	}
 	for (const [field, value, message] of [
 		["title", "Review\nready", "title_has_invalid_notification_text"],
 		["body", "Open /Users/private/review.diff", "body_has_invalid_notification_text"],

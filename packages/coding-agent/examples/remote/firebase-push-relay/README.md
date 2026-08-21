@@ -9,7 +9,7 @@ This deploys Volt's managed FCM notification relay contract to Firebase Cloud Fu
 - Target credentials are stored only as SHA-256 hashes. FCM tokens remain raw because Firebase Messaging needs them, so Firestore access is denied to clients and project IAM must stay least-privilege.
 - Targets expire after 30 days by default. Every delivery rejects an expired target immediately; the deployed Firestore TTL policy deletes expired documents asynchronously.
 - The app validates a cached target through the credential-authenticated status route before reuse. A host-side revoke therefore causes fresh App Check registration instead of leaving the phone stuck on a dead credential.
-- Registration, notification, and revocation bodies have a 16 KiB total cap plus explicit field, UTF-8 string, object-depth, key-count, and array-count bounds. Notification copy and metadata reject controls and path separators. FCM data is restricted to event, kind, workspace/session authority, and one navigation ID, so commands, diffs, and host paths cannot be forwarded.
+- Registration, notification, and revocation bodies have a 16 KiB total cap plus explicit field, UTF-8 string, object-depth, key-count, and array-count bounds. Notification copy and metadata reject controls and path separators. FCM data is restricted to event, authoritative host identity, kind, workspace/session authority, and one navigation ID, so commands, diffs, and host paths cannot be forwarded.
 - Each target reserves a delivery quota slot in a Firestore transaction before FCM is called. Failures consume the slot, preventing a failing send from creating a hot retry loop.
 - Registration also has a per-instance burst cap. Bounded concurrency, instance count, memory, and request time are defense in depth, not substitutes for a project-level budget and edge rate limit.
 - `relayUrl` is returned only from the validated `PUSH_RELAY_URL` setting (or the compiled production URL); request `Host` and forwarding headers are never reflected.
@@ -22,13 +22,14 @@ The function remains publicly invokable because an unattached iOS app must reach
 - `POST /v1/push-targets`: mobile app registration with `X-Firebase-AppCheck`; body `{ provider:"fcm", platform:"ios", token, enabled }`; returns `{ pushTargetId, pushTargetAuthToken, relayUrl, tokenHash, expiresAtEpochSeconds }`.
 - `POST /v1/push-targets/revoke`: app or host cleanup with `{ pushTargetId, pushTargetAuthToken }`; returns `revoked` or idempotent `already_revoked`.
 - `POST /v1/push-targets/status`: credential-authenticated cache validation; returns `{ status:"active", expiresAtEpochSeconds }`, or `401`/`404`/`410` when the cached credential must be replaced.
-- `POST /v1/notifications`: desktop delivery with `{ pushTargetId, pushTargetAuthToken, eventId, kind, title, body, workspaceName?, planId?, workflowId?, data }`.
+- `POST /v1/notifications`: desktop delivery with `{ pushTargetId, pushTargetAuthToken, eventId, hostNodeId, kind, title, body, workspaceName?, planId?, workflowId?, data }`.
 
 Notification delivery accepts `conversation_completed`, `plan_ready`, `review_completed`, `action_completed`, and `host_notice`. `plan_ready` requires `planId`; `review_completed` requires `workflowId`; the navigation fields are mutually exclusive and forbidden on other kinds. Top-level and `data` values must agree. The bounded FCM data shape is forwarded unchanged:
 
 ```json
 {
   "eventId": "plan:session-one:run-one:ready",
+  "hostNodeId": "<authoritative-host-node-id>",
   "kind": "plan_ready",
   "sessionId": "session-one",
   "workspaceName": "volt-app",
@@ -36,7 +37,7 @@ Notification delivery accepts `conversation_completed`, `plan_ready`, `review_co
 }
 ```
 
-`workflowId` replaces `planId` for review completion. Notification titles are limited to 128 UTF-8 bytes, bodies to 512, workspace/session/navigation values to 128, event IDs to 512, and kinds to 64. Unknown fields, mismatched metadata, unsafe characters, whitespace in identifiers, and path separators are rejected.
+`hostNodeId` is required at both the top level and in FCM `data`, must be the canonical lowercase 64-hex Iroh host identity, and must match exactly. `workflowId` replaces `planId` for review completion. Notification titles are limited to 128 UTF-8 bytes, bodies to 512, workspace/session/navigation values to 128, event IDs to 512, and kinds to 64. Unknown fields, mismatched metadata, unsafe characters, whitespace in identifiers, and path separators are rejected.
 
 Volt host state stores only the opaque relay target id, target-scoped credential, and optional FCM token hash.
 

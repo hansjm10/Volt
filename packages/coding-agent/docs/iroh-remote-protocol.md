@@ -305,7 +305,7 @@ The successful response is:
 {"id":"push-1","type":"response","command":"register_push_target","success":true,"data":{"status":"registered","pushTargetId":"<relay-target-id>"}}
 ```
 
-Completion notifications use one canonical intent for managed push delivery and JSONL fallback. The JSONL shape is `notification_request`; the relay receives the same `eventId`, `kind`, title, body, `workspaceName`/`sessionId` authority, and `planId` or `workflowId`, and forwards those exact metadata fields in FCM `data`.
+Completion notifications use one canonical intent for managed push delivery and JSONL fallback. The JSONL shape is `notification_request`; the relay receives the same `eventId`, authoritative `hostNodeId`, `kind`, title, body, `workspaceName`/`sessionId` authority, and `planId` or `workflowId`, and forwards those exact metadata fields in FCM `data`.
 
 | Outcome | `kind` | Title | Body | Navigation |
 | --- | --- | --- | --- | --- |
@@ -319,16 +319,16 @@ Completion notifications use one canonical intent for managed push delivery and 
 A ready Plan emits `plan_ready` instead of `conversation_completed` for that prompt. Failed prompts retain the `host_notice` error copy, aborted prompts emit no completion notification, and cancelled or failed reviews do not emit `review_completed`.
 
 ```json
-{"type":"notification_request","eventId":"plan:session-one:run-one:ready","kind":"plan_ready","title":"Your plan is ready","body":"Open Volt to review and approve it.","sessionId":"session-one","workspaceName":"volt-app","planId":"plan-one"}
+{"type":"notification_request","eventId":"plan:session-one:run-one:ready","hostNodeId":"<authoritative-host-node-id>","kind":"plan_ready","title":"Your plan is ready","body":"Open Volt to review and approve it.","sessionId":"session-one","workspaceName":"volt-app","planId":"plan-one"}
 ```
 
 ```json
-{"type":"notification_request","eventId":"review:one:completed","kind":"review_completed","title":"Your review is ready","body":"PR #151 completed with 4 findings.","sessionId":"session-one","workspaceName":"volt-app","workflowId":"review:one"}
+{"type":"notification_request","eventId":"review:one:completed","hostNodeId":"<authoritative-host-node-id>","kind":"review_completed","title":"Your review is ready","body":"PR #151 completed with 4 findings.","sessionId":"session-one","workspaceName":"volt-app","workflowId":"review:one"}
 ```
 
 Review targets come only from the host's bounded workflow target record: `PR #N`, `uncommitted changes`, a canonical commit, or a path-free branch comparison. Unsafe or unavailable targets fall back to `Review`; commands, diffs, pull request titles/bodies, linked-issue/discussion text, and host paths are never copied into a notification. Notification titles are limited to 128 UTF-8 bytes, bodies to 512, review targets to 256, workspace and navigation/session identifiers to 128, event IDs to 512, and kinds to 64. Host construction removes unsafe copy before delivery, and strict control/relay boundaries reject path separators plus control, format, or surrogate characters; metadata also rejects whitespace.
 
-`workspaceName` is the sole notification workspace key, contains a registered workspace name only, and never carries a host-local path; the former `workspace` key is rejected. `sessionId` remains the stream/runtime authority. `planId` and `workflowId` are mutually exclusive stable navigation identifiers and appear only on their matching kind. A retained runtime reconciles completed review records per paired client: a completion that lands while detached remains pending, is retried through push when available or delivered over JSONL after reattachment, and a stable `eventId` is surfaced at most once for that runtime/client.
+`hostNodeId` is required on every notification and must be the same canonical 64-hex Iroh identity used by the stream handshake; clients reject a notification whose host identity differs from the saved pairing. `workspaceName` is the sole notification workspace key, contains a registered workspace name only, and never carries a host-local path; the former `workspace` key is rejected. `sessionId` remains the stream/runtime authority. `planId` and `workflowId` are mutually exclusive stable navigation identifiers and appear only on their matching kind. A retained runtime reconciles completed review records per paired client: a completion that lands while detached remains pending, is retried through push when available or delivered over JSONL after reattachment, and a stable `eventId` is surfaced at most once for that runtime/client.
 
 `unregister_workspace` on a workspace management stream removes a registered workspace name from the host state file without deleting files:
 
