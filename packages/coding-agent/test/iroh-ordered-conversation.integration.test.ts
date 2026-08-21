@@ -233,6 +233,7 @@ async function createFixture(
 	const send = options.send ?? new ManualIrohSendStream();
 	const modePromise = runIrohRemoteRpcMode(runtimeHost, {
 		rpcGrant: createIrohRemotePresetAccess("full").rpcGrant,
+		hostNodeId: "a".repeat(64),
 		disposeRuntimeOnClose: false,
 		stream: { recv, send },
 		workspacePath,
@@ -582,6 +583,7 @@ describe("Iroh ordered conversation integration", () => {
 		const replacementSend = new ManualIrohSendStream();
 		const replacementMode = runIrohRemoteRpcMode(fixture.runtimeHost, {
 			rpcGrant: createIrohRemotePresetAccess("full").rpcGrant,
+			hostNodeId: "a".repeat(64),
 			disposeRuntimeOnClose: false,
 			stream: { recv: replacementRecv, send: replacementSend },
 			workspacePath: fixture.manager.getCwd(),

@@ -385,6 +385,7 @@ describe("createDaemonAttach + control server integration", () => {
 		await expect(
 			attach.relayNotificationDelivery.deliverNotification("n-1", "s-relay", {
 				eventId: "conversation:s-relay:run-1:completed",
+				hostNodeId: "a".repeat(64),
 				kind: "conversation_completed",
 				title: "Volt finished",
 				body: "Your conversation is ready.",

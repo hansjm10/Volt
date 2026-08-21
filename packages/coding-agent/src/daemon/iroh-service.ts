@@ -3025,8 +3025,12 @@ class IrohDaemonService {
 			}
 			const pushDispatcher = this.createPushNotificationDispatcher(authorization);
 			const responseContext = this.getResponseContext();
+			if (responseContext.hostNodeId === undefined) {
+				throw new Error("Iroh service host node ID is unavailable");
+			}
 			await runIrohRemoteRpcMode(entry.runtime, {
 				rpcGrant: authorization.client.rpcGrant,
+				hostNodeId: responseContext.hostNodeId,
 				clientNodeId: authorization.client.nodeId,
 				isRpcIngressOpen: () => !workspaceUnregistered,
 				isRpcGrantCurrent: () => this.isAuthorizationCurrent(authorization),
