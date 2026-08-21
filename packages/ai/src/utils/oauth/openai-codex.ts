@@ -20,6 +20,7 @@ if (typeof process !== "undefined" && (process.versions?.node || process.version
 import { getProviderEnvValue } from "../provider-env.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 import { oauthErrorHtml, oauthSuccessHtml } from "./oauth-page.ts";
+import { fetchOpenAICodexSubscriptionUsage } from "./openai-codex-usage.ts";
 import { generatePKCE } from "./pkce.ts";
 import type {
 	OAuthCredentials,
@@ -604,4 +605,6 @@ export const openaiCodexOAuthProvider: OAuthProviderInterface = {
 	getApiKey(credentials: OAuthCredentials): string {
 		return credentials.access;
 	},
+
+	fetchSubscriptionUsage: fetchOpenAICodexSubscriptionUsage,
 };

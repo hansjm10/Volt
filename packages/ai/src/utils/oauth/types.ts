@@ -9,6 +9,42 @@ export type OAuthCredentials = {
 
 export type OAuthProviderId = string;
 
+export interface SubscriptionUsageLimit {
+	id: string;
+	label: string;
+	usedPercent: number;
+	resetsAt?: number;
+	windowDurationMs?: number;
+	limitReached?: boolean;
+}
+
+export interface SubscriptionUsageSnapshot {
+	providerId: OAuthProviderId;
+	fetchedAt: number;
+	plan?: string;
+	limits: SubscriptionUsageLimit[];
+}
+
+export type SubscriptionUsageErrorCode =
+	| "unauthorized"
+	| "rate_limited"
+	| "timeout"
+	| "unavailable"
+	| "malformed_response";
+
+export interface SubscriptionUsageError {
+	code: SubscriptionUsageErrorCode;
+	message: string;
+}
+
+export type SubscriptionUsageResult =
+	| { status: "success"; snapshot: SubscriptionUsageSnapshot }
+	| { status: "error"; error: SubscriptionUsageError };
+
+export interface SubscriptionUsageFetchOptions {
+	signal?: AbortSignal;
+}
+
 /** @deprecated Use OAuthProviderId instead */
 export type OAuthProvider = OAuthProviderId;
 
@@ -66,6 +102,12 @@ export interface OAuthProviderInterface {
 
 	/** Convert credentials to API key string for the provider */
 	getApiKey(credentials: OAuthCredentials): string;
+
+	/** Fetch provider-neutral subscription quota usage for stored OAuth credentials. */
+	fetchSubscriptionUsage?(
+		credentials: OAuthCredentials,
+		options?: SubscriptionUsageFetchOptions,
+	): Promise<SubscriptionUsageResult>;
 
 	/** Optional: modify models for this provider (e.g., update baseUrl) */
 	modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];

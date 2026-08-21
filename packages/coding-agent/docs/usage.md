@@ -45,6 +45,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/clear` | Start a new session |
 | `/name <name>` | Set session display name |
 | `/session` | Show session file, ID, messages, tokens, and cost |
+| `/usage` | Show remaining subscription quota and local reset times |
 | `/tree` | Jump to any point in the session and continue from there |
 | `/fork` | Create a new session from a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
@@ -58,6 +59,8 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/remote` | Manage daemon status, pairing, devices, workspaces, leases, and headless policy |
 | `/changelog` | Display version history |
 | `/quit` | Quit volt |
+
+`/usage` fetches quota status on demand for stored Anthropic Claude and OpenAI ChatGPT/Codex subscription logins. API keys are not queried. The active eligible provider is shown first, provider failures are reported independently, and results are cached briefly without background polling.
 
 Fast mode requests premium low-latency inference capacity on supported OpenAI and OpenAI Codex models. Enabling it may cost more. It is session-scoped and independent of the thinking level; the footer shows `fast` while it is active. Review workflows inherit the current Fast setting for review inference and carry it into the fresh findings session.
 
