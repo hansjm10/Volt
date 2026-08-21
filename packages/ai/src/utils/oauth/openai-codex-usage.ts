@@ -6,6 +6,7 @@ import type {
 } from "./types.ts";
 
 const OPENAI_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
 
 type WindowKind = "primary" | "secondary";
 
@@ -17,8 +18,14 @@ function normalizeUsedPercent(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : undefined;
 }
 
-function finiteNonNegativeNumber(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+function secondsToSafeMilliseconds(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+	const milliseconds = value * 1000;
+	return Number.isSafeInteger(milliseconds) ? milliseconds : undefined;
+}
+
+function safeDateTimestamp(value: number): number | undefined {
+	return Number.isSafeInteger(value) && value >= 0 && value <= MAX_DATE_TIMESTAMP_MS ? value : undefined;
 }
 
 function slugify(value: string): string {
@@ -64,23 +71,20 @@ function parseWindow(
 	const usedPercent = normalizeUsedPercent(value.used_percent);
 	if (usedPercent === undefined) return undefined;
 
-	const durationSeconds = finiteNonNegativeNumber(value.limit_window_seconds);
-	const resetAtSeconds = finiteNonNegativeNumber(value.reset_at);
-	const resetAfterSeconds = finiteNonNegativeNumber(value.reset_after_seconds);
-	const resetsAt =
-		resetAtSeconds !== undefined
-			? resetAtSeconds * 1000
-			: resetAfterSeconds !== undefined
-				? fetchedAt + resetAfterSeconds * 1000
-				: undefined;
-	const windowLabel = formatWindowLabel(durationSeconds, kind);
+	const windowDurationMs = secondsToSafeMilliseconds(value.limit_window_seconds);
+	const resetAtMs = secondsToSafeMilliseconds(value.reset_at);
+	const resetAfterMs = secondsToSafeMilliseconds(value.reset_after_seconds);
+	const absoluteResetsAt = resetAtMs === undefined ? undefined : safeDateTimestamp(resetAtMs);
+	const relativeResetsAt = resetAfterMs === undefined ? undefined : safeDateTimestamp(fetchedAt + resetAfterMs);
+	const resetsAt = absoluteResetsAt ?? relativeResetsAt;
+	const windowLabel = formatWindowLabel(windowDurationMs === undefined ? undefined : windowDurationMs / 1000, kind);
 
 	return {
 		id: options.idPrefix ? `${options.idPrefix}:${kind}` : kind,
 		label: options.labelPrefix ? `${windowLabel} · ${options.labelPrefix}` : windowLabel,
 		usedPercent,
 		...(resetsAt === undefined ? {} : { resetsAt }),
-		...(durationSeconds === undefined ? {} : { windowDurationMs: durationSeconds * 1000 }),
+		...(windowDurationMs === undefined ? {} : { windowDurationMs }),
 		limitReached: usedPercent >= 100,
 	};
 }

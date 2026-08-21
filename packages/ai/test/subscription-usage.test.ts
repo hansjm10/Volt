@@ -147,6 +147,68 @@ describe.sequential("subscription usage adapters", () => {
 		expect(serialized).not.toContain("spend_control");
 	});
 
+	it.each([
+		{ name: "fractional", seconds: 0.0005, expectedDurationMs: undefined },
+		{ name: "overflowing", seconds: Number.MAX_VALUE, expectedDurationMs: undefined },
+		{
+			name: "out-of-range",
+			seconds: 9_006_000_000_000,
+			expectedDurationMs: 9_006_000_000_000_000,
+		},
+	])("omits $name Codex reset times and unsafe durations", async ({ seconds, expectedDurationMs }) => {
+		vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				jsonResponse({
+					rate_limit: {
+						primary_window: {
+							used_percent: 25,
+							reset_at: seconds,
+							reset_after_seconds: seconds,
+							limit_window_seconds: seconds,
+						},
+					},
+				}),
+			),
+		);
+
+		const snapshot = requireSuccess(await fetchOpenAICodexSubscriptionUsage(credentials));
+		const limit = snapshot.limits[0];
+
+		expect(limit?.resetsAt).toBeUndefined();
+		expect(limit?.windowDurationMs).toBe(expectedDurationMs);
+		if (limit?.windowDurationMs !== undefined) {
+			expect(Number.isSafeInteger(limit.windowDurationMs)).toBe(true);
+		}
+	});
+
+	it("falls back to a valid relative Codex reset time when the absolute time is invalid", async () => {
+		vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				jsonResponse({
+					rate_limit: {
+						primary_window: {
+							used_percent: 25,
+							reset_at: Number.MAX_VALUE,
+							reset_after_seconds: 0.001,
+							limit_window_seconds: 1.5,
+						},
+					},
+				}),
+			),
+		);
+
+		const snapshot = requireSuccess(await fetchOpenAICodexSubscriptionUsage(credentials));
+
+		expect(snapshot.limits[0]).toMatchObject({
+			resetsAt: 1_800_000_000_001,
+			windowDurationMs: 1_500,
+		});
+	});
+
 	it("marks only the exhausted Codex window as limit reached", async () => {
 		vi.stubGlobal(
 			"fetch",
