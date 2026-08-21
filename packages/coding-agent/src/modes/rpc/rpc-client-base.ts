@@ -24,6 +24,7 @@ import type {
 	RpcSessionState,
 	RpcSlashCommand,
 	RpcSubagentStartResponse,
+	RpcSubscriptionUsageReport,
 	RpcTranscriptResponse,
 	RpcWorkflowEvent,
 	RpcWorkflowToolEvent,
@@ -378,6 +379,12 @@ export abstract class RpcClientBase {
 	/** Get session statistics. */
 	async getSessionStats(): Promise<SessionStats> {
 		const response = await this.send({ type: "get_session_stats" });
+		return this.getData(response);
+	}
+
+	/** Get normalized subscription quota usage for stored OAuth logins. */
+	async getSubscriptionUsage(): Promise<RpcSubscriptionUsageReport> {
+		const response = await this.send({ type: "get_subscription_usage" });
 		return this.getData(response);
 	}
 

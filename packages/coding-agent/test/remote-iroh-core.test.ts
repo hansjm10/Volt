@@ -907,6 +907,7 @@ describe("Iroh remote core helpers", () => {
 			"host_action_response",
 			"get_state",
 			"get_transcript",
+			"get_subscription_usage",
 			"get_message_images",
 			"get_transcript_entry_text",
 			"get_mcp_capabilities",

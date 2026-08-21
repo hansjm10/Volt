@@ -44,6 +44,7 @@ import {
 	RpcTranscriptResponseSchema,
 	RpcWebSearchStatusSchema,
 } from "./session.ts";
+import { RpcSubscriptionUsageReportSchema } from "./subscription-usage.ts";
 import {
 	UiActionCapabilitiesSchema,
 	UiActionCompletionListResponseSchema,
@@ -489,6 +490,7 @@ export const RPC_RESPONSE_SCHEMAS = {
 
 	// Session
 	get_session_stats: dataResponse("get_session_stats", RpcSessionStatsSchema),
+	get_subscription_usage: dataResponse("get_subscription_usage", RpcSubscriptionUsageReportSchema),
 	list_sessions: dataResponse(
 		"list_sessions",
 		Type.Object({ sessions: Type.Array(RpcSessionListItemSchema) }, { additionalProperties: false }),

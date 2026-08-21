@@ -40,6 +40,7 @@ import {
 } from "../../core/rpc/ui-actions.ts";
 import { RPC_STABLE_ERROR_CODES } from "../../core/rpc/wire-limits.ts";
 import { SessionManager } from "../../core/session-manager.ts";
+import type { SubscriptionUsageReport, SubscriptionUsageService } from "../../core/subscription-usage.ts";
 import type {
 	RpcCatalogModel,
 	RpcClientCapabilityFeature,
@@ -56,6 +57,7 @@ import type {
 	RpcSessionTreePage,
 	RpcSlashCommand,
 	RpcSubagentStartResponse,
+	RpcSubscriptionUsageReport,
 	RpcTranscriptResponse,
 	UiActionCapabilities,
 } from "./rpc-types.ts";
@@ -97,6 +99,7 @@ export interface RpcCommandDispatcherContext {
 	cancelPendingHostActionRequests(message?: string): void;
 	/** Revalidate the mutation lease after an awaited dispatcher/session preflight boundary. */
 	assertConversationGenerationCurrent(): void;
+	subscriptionUsageService: SubscriptionUsageService;
 	/**
 	 * Claim the deferred launch of a review workflow registered by this
 	 * invocation. The dispatcher launches it only after the accepted response is
@@ -126,6 +129,49 @@ function getUiActionCapabilities(invocationEnabled: boolean): UiActionCapabiliti
 
 function toCatalogModel(model: RpcModel): RpcCatalogModel {
 	return toIrohRemoteAgentOptionsCatalogModel(model);
+}
+
+function projectSubscriptionUsageReport(report: SubscriptionUsageReport): RpcSubscriptionUsageReport {
+	if (report.status !== "providers") {
+		return { status: report.status };
+	}
+	return {
+		status: "providers",
+		providers: report.providers.map((provider) => {
+			if (provider.result.status === "error") {
+				return {
+					providerId: provider.providerId,
+					result: {
+						status: "error",
+						error: {
+							code: provider.result.error.code,
+							message: provider.result.error.message,
+						},
+					},
+				};
+			}
+			const snapshot = provider.result.snapshot;
+			return {
+				providerId: provider.providerId,
+				result: {
+					status: "success",
+					snapshot: {
+						providerId: provider.providerId,
+						fetchedAt: snapshot.fetchedAt,
+						...(snapshot.plan === undefined ? {} : { plan: snapshot.plan }),
+						limits: snapshot.limits.map((limit) => ({
+							id: limit.id,
+							label: limit.label,
+							usedPercent: limit.usedPercent,
+							...(limit.resetsAt === undefined ? {} : { resetsAt: limit.resetsAt }),
+							...(limit.windowDurationMs === undefined ? {} : { windowDurationMs: limit.windowDurationMs }),
+							...(limit.limitReached === undefined ? {} : { limitReached: limit.limitReached }),
+						})),
+					},
+				},
+			};
+		}),
+	};
 }
 
 function getPromptExtensionCommandName(message: string): string | undefined {
@@ -1050,6 +1096,14 @@ export async function handleRpcCommand(
 		case "get_session_stats": {
 			const stats = session.getSessionStats();
 			return createRpcSuccessResponse(id, "get_session_stats", stats);
+		}
+
+		case "get_subscription_usage": {
+			const report = await context.subscriptionUsageService.fetch(
+				session.modelRegistry.authStorage,
+				session.model?.provider,
+			);
+			return createRpcSuccessResponse(id, "get_subscription_usage", projectSubscriptionUsageReport(report));
 		}
 
 		case "list_sessions": {

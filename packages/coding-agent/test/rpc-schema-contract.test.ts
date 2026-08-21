@@ -23,6 +23,7 @@ import { RpcGitContextSchema } from "../src/core/rpc/schema/git-context.ts";
 import { RpcPlanningStateChangedEventSchema } from "../src/core/rpc/schema/planning.ts";
 import { RpcWorkflowEventSchema } from "../src/core/rpc/schema/projections.ts";
 import { RPC_RESPONSE_SCHEMAS, RpcErrorResponseSchema } from "../src/core/rpc/schema/responses.ts";
+import { RpcSubscriptionUsageReportSchema } from "../src/core/rpc/schema/subscription-usage.ts";
 import { UiActionCapabilityFeatureSchema, UiActionDescriptorSchema } from "../src/core/rpc/schema/ui-actions.ts";
 import { projectRpcQueueUpdate } from "../src/core/rpc/session-state.ts";
 import { StreamProjector } from "../src/core/rpc/stream-projection.ts";
@@ -90,6 +91,67 @@ describe("RPC contract schema integrity", () => {
 			expect(check(schema, "some-novel-value.v9")).toBe(true);
 			expect(check(schema, 7)).toBe(false);
 		}
+	});
+
+	test("defines strict normalized subscription usage reports", () => {
+		const report = {
+			status: "providers",
+			providers: [
+				{
+					providerId: "openai-codex",
+					result: {
+						status: "success",
+						snapshot: {
+							providerId: "openai-codex",
+							fetchedAt: 1_800_000_000_000,
+							plan: "plus",
+							limits: [
+								{
+									id: "weekly",
+									label: "Weekly",
+									usedPercent: 25.5,
+									resetsAt: 1_800_086_400_000,
+									windowDurationMs: 604_800_000,
+									limitReached: false,
+								},
+							],
+						},
+					},
+				},
+			],
+		};
+		expect(check(RpcSubscriptionUsageReportSchema, report)).toBe(true);
+		expect(check(RpcSubscriptionUsageReportSchema, { status: "no_subscription" })).toBe(true);
+		expect(check(RpcSubscriptionUsageReportSchema, { status: "unsupported" })).toBe(true);
+		expect(check(RpcSubscriptionUsageReportSchema, { ...report, rawPayload: {} })).toBe(false);
+		expect(
+			check(RpcSubscriptionUsageReportSchema, {
+				...report,
+				providers: [
+					{
+						...report.providers[0],
+						result: {
+							...report.providers[0].result,
+							snapshot: { ...report.providers[0].result.snapshot, accountEmail: "private@example.com" },
+						},
+					},
+				],
+			}),
+		).toBe(false);
+		expect(
+			check(RpcSubscriptionUsageReportSchema, {
+				status: "providers",
+				providers: [
+					{
+						providerId: "anthropic",
+						result: {
+							status: "error",
+							error: { code: "rate_limited", message: "Try again later." },
+						},
+					},
+				],
+			}),
+		).toBe(true);
 	});
 
 	test("requires usable correlation for every invoke_ui_action response", () => {

@@ -243,6 +243,14 @@ import {
 	RpcWebSearchStatusSchema,
 } from "./session.ts";
 import {
+	RpcSubscriptionUsageErrorCodeSchema,
+	RpcSubscriptionUsageLimitSchema,
+	RpcSubscriptionUsageProviderReportSchema,
+	RpcSubscriptionUsageReportSchema,
+	RpcSubscriptionUsageResultSchema,
+	RpcSubscriptionUsageSnapshotSchema,
+} from "./subscription-usage.ts";
+import {
 	UiActionArgumentDescriptorSchema,
 	UiActionArgumentTypeSchema,
 	UiActionCapabilitiesSchema,
@@ -472,6 +480,14 @@ const SHARED_SCHEMAS: Record<string, TSchema> = {
 	RpcKeepAwakeStatus: RpcKeepAwakeStatusSchema,
 	RpcWebSearchStatus: RpcWebSearchStatusSchema,
 	RpcPromptResponse: RpcPromptResponseSchema,
+
+	// Subscription usage
+	RpcSubscriptionUsageErrorCode: RpcSubscriptionUsageErrorCodeSchema,
+	RpcSubscriptionUsageLimit: RpcSubscriptionUsageLimitSchema,
+	RpcSubscriptionUsageSnapshot: RpcSubscriptionUsageSnapshotSchema,
+	RpcSubscriptionUsageResult: RpcSubscriptionUsageResultSchema,
+	RpcSubscriptionUsageProviderReport: RpcSubscriptionUsageProviderReportSchema,
+	RpcSubscriptionUsageReport: RpcSubscriptionUsageReportSchema,
 
 	// Ordered conversation + stream frames
 	RpcConversationDeliveryPosition: RpcConversationDeliveryPositionSchema,

@@ -68,6 +68,7 @@ import { type ProjectionDiagnostic, StreamProjector } from "../../core/rpc/strea
 import type { RpcTransport } from "../../core/rpc/transport.ts";
 import { SessionManager } from "../../core/session-manager.ts";
 import type { SubagentDefinition, SubagentHandle } from "../../core/subagents/index.ts";
+import { SubscriptionUsageService } from "../../core/subscription-usage.ts";
 import {
 	getAvailableThemesWithPaths,
 	getThemeByName,
@@ -125,6 +126,7 @@ export type {
 	RpcSubagentDefinitionSource,
 	RpcSubagentSourceInfo,
 	RpcSubagentStartResponse,
+	RpcSubscriptionUsageReport,
 	RpcWorkflowEvent,
 	RpcWorkflowKind,
 	RpcWorkflowStatus,
@@ -663,6 +665,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		}
 	};
 	const createStreamProjector = options.createStreamProjector ?? (() => new StreamProjector());
+	const subscriptionUsageService = new SubscriptionUsageService();
 	const reportProjectionDiagnostics = (source: string, diagnostics: readonly ProjectionDiagnostic[]): void => {
 		for (const diagnostic of diagnostics) {
 			console.error(`[stream-projection:${source}] ${diagnostic.code}: ${diagnostic.message}`, diagnostic);
@@ -1463,6 +1466,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			getPendingHostActionRequests: () => hostActionBridge.getPendingRequests(),
 			cancelPendingHostActionRequests,
 			assertConversationGenerationCurrent,
+			subscriptionUsageService,
 			takePendingReviewWorkflow: (workflowId: string) => {
 				const pending = pendingReviewWorkflows.get(workflowId);
 				pendingReviewWorkflows.delete(workflowId);

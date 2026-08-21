@@ -135,6 +135,7 @@ export {
 	type RpcSubagentDefinitionSource,
 	type RpcSubagentSourceInfo,
 	type RpcSubagentStartResponse,
+	type RpcSubscriptionUsageReport,
 	type RpcTransport,
 	serializeJsonLine,
 } from "./rpc/index.ts";

@@ -45,6 +45,7 @@ import type {
 } from "../../mcp/types.ts";
 import type { ReviewCoverage, ReviewFinding } from "../../review.ts";
 import type { SourceInfo } from "../../source-info.ts";
+import type { SubscriptionUsageReport } from "../../subscription-usage.ts";
 import type {
 	ProjectedMessageEndFrame,
 	ProjectedMessageStartFrame,
@@ -86,6 +87,7 @@ import type {
 import type { RpcImageContentSchema, RpcThinkingLevelSchema } from "./primitives.ts";
 import type { RpcReviewCoverageSchema, RpcReviewFindingSchema } from "./projections.ts";
 import type { RpcBashResultSchema, RpcCompactionResultSchema, RpcSessionStatsSchema } from "./responses.ts";
+import type { RpcSubscriptionUsageReportSchema } from "./subscription-usage.ts";
 
 // volt-ai content and message shapes
 type _imageContent = Assert<MutualExtends<Static<typeof RpcImageContentSchema>, ImageContent>>;
@@ -114,6 +116,9 @@ type _messageEndFrame = Assert<MutualExtends<Static<typeof RpcMessageEndFrameSch
 
 // Host modules that own response-body shapes
 type _sessionStats = Assert<MutualExtends<Static<typeof RpcSessionStatsSchema>, JsonWireShape<SessionStats>>>;
+type _subscriptionUsage = Assert<
+	MutualExtends<Static<typeof RpcSubscriptionUsageReportSchema>, JsonWireShape<SubscriptionUsageReport>>
+>;
 type _bashResult = Assert<MutualExtends<Static<typeof RpcBashResultSchema>, JsonWireShape<BashResult>>>;
 type _compactionResult = Assert<MutualExtends<Static<typeof RpcCompactionResultSchema>, CompactionResult>>;
 type _hostActionRequest = Assert<
