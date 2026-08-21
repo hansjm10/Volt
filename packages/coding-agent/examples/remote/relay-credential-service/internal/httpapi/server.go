@@ -68,13 +68,23 @@ type Server struct {
 	handler           http.Handler
 }
 
-type createClaimRequest struct {
-	HostNodeID string `json:"hostNodeId"`
+type createBootstrapClaimRequest struct {
+	HostNodeID           string `json:"hostNodeId"`
+	ClaimSecretHash      string `json:"claimSecretHash"`
+	HostRefreshTokenHash string `json:"hostRefreshTokenHash"`
+}
+
+type createExistingClaimRequest struct {
+	ClaimSecretHash string `json:"claimSecretHash"`
 }
 
 type approveClaimRequest struct {
-	AppNodeID      string `json:"appNodeId"`
-	DeliverySecret string `json:"deliverySecret"`
+	AppNodeID           string `json:"appNodeId"`
+	AppRefreshTokenHash string `json:"appRefreshTokenHash"`
+}
+
+type revokeAppEndpointRequest struct {
+	EndpointID string `json:"endpointId"`
 }
 
 type pendingResponse struct {
@@ -114,6 +124,8 @@ func NewServer(brokerService *broker.Broker, signer *credential.Signer, appCheck
 	mux.HandleFunc("POST /v1/pairing-claims/{claimID}/exchange", server.handleExchangeClaim)
 	mux.HandleFunc("POST /v1/tokens/refresh", server.handleRefresh)
 	mux.HandleFunc("POST /v1/tokens/revoke", server.handleRevoke)
+	mux.HandleFunc("POST /v1/grant/endpoints/revoke", server.handleRevokeAppEndpoint)
+	mux.HandleFunc("POST /v1/grant/revoke", server.handleRevokeGrant)
 	server.handler = server.securityHeaders(server.limitConcurrency(mux))
 	return server, nil
 }
@@ -132,39 +144,72 @@ func (s *Server) handleJWKS(writer http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleCreateClaim(writer http.ResponseWriter, request *http.Request) {
-	var body createClaimRequest
+	authorizationValues := request.Header.Values("Authorization")
+	if len(authorizationValues) == 0 {
+		var body createBootstrapClaimRequest
+		if err := decodeJSON(writer, request, &body); err != nil {
+			writeError(writer, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		claimSecretHash, err := broker.ParseSecretHash(body.ClaimSecretHash)
+		if err != nil {
+			writeError(writer, http.StatusBadRequest, "invalid_claim_secret_hash")
+			return
+		}
+		hostRefreshHash, err := broker.ParseSecretHash(body.HostRefreshTokenHash)
+		if err != nil {
+			writeError(writer, http.StatusBadRequest, "invalid_host_refresh_token_hash")
+			return
+		}
+		claim, err := s.broker.CreateBootstrapPairingClaim(body.HostNodeID, claimSecretHash, hostRefreshHash)
+		if err != nil {
+			s.writeClaimCreationError(writer, err)
+			return
+		}
+		writeJSON(writer, http.StatusCreated, claim)
+		return
+	}
+
+	hostRefreshToken, ok := bearerToken(request)
+	if !ok {
+		writeError(writer, http.StatusUnauthorized, "host_refresh_token_required")
+		return
+	}
+	var body createExistingClaimRequest
 	if err := decodeJSON(writer, request, &body); err != nil {
 		writeError(writer, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	claim, err := s.broker.CreatePairingClaim(body.HostNodeID)
+	claimSecretHash, err := broker.ParseSecretHash(body.ClaimSecretHash)
 	if err != nil {
-		if errors.Is(err, broker.ErrClaimCapacity) {
-			writeError(writer, http.StatusTooManyRequests, "claim_capacity_reached")
-			return
-		}
-		if errors.Is(err, broker.ErrInvalidHostNodeID) {
-			writeError(writer, http.StatusBadRequest, "invalid_host_node_id")
-			return
-		}
-		s.internalError(writer, "create pairing claim", err)
+		writeError(writer, http.StatusBadRequest, "invalid_claim_secret_hash")
+		return
+	}
+	claim, err := s.broker.CreatePairingClaimForGrant(hostRefreshToken, claimSecretHash)
+	if err != nil {
+		s.writeAuthenticatedError(writer, err)
 		return
 	}
 	writeJSON(writer, http.StatusCreated, claim)
 }
 
 func (s *Server) handleApproveClaim(writer http.ResponseWriter, request *http.Request) {
-	appID, err := s.appCheck.Verify(request)
-	if err != nil {
-		writeError(writer, http.StatusUnauthorized, "app_check_invalid")
-		return
-	}
 	var body approveClaimRequest
 	if err := decodeJSON(writer, request, &body); err != nil {
 		writeError(writer, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	approval, err := s.broker.ApprovePairingClaim(request.PathValue("claimID"), appID, body.AppNodeID, body.DeliverySecret)
+	appID, err := s.appCheck.Verify(request)
+	if err != nil {
+		writeError(writer, http.StatusUnauthorized, "app_check_invalid")
+		return
+	}
+	appRefreshHash, err := broker.ParseSecretHash(body.AppRefreshTokenHash)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_app_refresh_token_hash")
+		return
+	}
+	approval, err := s.broker.ApprovePairingClaim(request.PathValue("claimID"), appID, body.AppNodeID, appRefreshHash)
 	if err != nil {
 		s.writeBrokerError(writer, err, "invalid_app_node_id")
 		return
@@ -203,20 +248,12 @@ func (s *Server) handleRefresh(writer http.ResponseWriter, request *http.Request
 	}
 	accessToken, err := s.broker.RefreshAccessToken(refreshToken)
 	if err != nil {
-		if errors.Is(err, broker.ErrRefreshExpired) {
-			writeError(writer, http.StatusGone, "refresh_token_expired")
-			return
-		}
-		if errors.Is(err, broker.ErrRefreshInvalid) {
-			writeError(writer, http.StatusUnauthorized, "refresh_token_invalid")
-			return
-		}
 		if errors.Is(err, broker.ErrRefreshThrottled) {
 			writer.Header().Set("Retry-After", s.refreshRetryAfter)
 			writeError(writer, http.StatusTooManyRequests, "refresh_rate_limited")
 			return
 		}
-		s.internalError(writer, "refresh access token", err)
+		s.writeAuthenticatedError(writer, err)
 		return
 	}
 	writeJSON(writer, http.StatusOK, accessToken)
@@ -233,18 +270,58 @@ func (s *Server) handleRevoke(writer http.ResponseWriter, request *http.Request)
 		return
 	}
 	if err := s.broker.RevokeRefreshToken(refreshToken); err != nil {
-		if errors.Is(err, broker.ErrRefreshExpired) {
-			writeError(writer, http.StatusGone, "refresh_token_expired")
-			return
-		}
-		if errors.Is(err, broker.ErrRefreshInvalid) {
-			writeError(writer, http.StatusUnauthorized, "refresh_token_invalid")
-			return
-		}
-		s.internalError(writer, "revoke refresh token", err)
+		s.writeAuthenticatedError(writer, err)
 		return
 	}
 	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleRevokeAppEndpoint(writer http.ResponseWriter, request *http.Request) {
+	hostRefreshToken, ok := bearerToken(request)
+	if !ok {
+		writeError(writer, http.StatusUnauthorized, "host_refresh_token_required")
+		return
+	}
+	var body revokeAppEndpointRequest
+	if err := decodeJSON(writer, request, &body); err != nil || strings.TrimSpace(body.EndpointID) == "" {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if err := s.broker.RevokeAppEndpoint(hostRefreshToken, body.EndpointID); err != nil {
+		s.writeAuthenticatedError(writer, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleRevokeGrant(writer http.ResponseWriter, request *http.Request) {
+	if err := requireEmptyBody(request); err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	hostRefreshToken, ok := bearerToken(request)
+	if !ok {
+		writeError(writer, http.StatusUnauthorized, "host_refresh_token_required")
+		return
+	}
+	if err := s.broker.RevokeGrant(hostRefreshToken); err != nil {
+		s.writeAuthenticatedError(writer, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) writeClaimCreationError(writer http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, broker.ErrClaimCapacity):
+		writeError(writer, http.StatusTooManyRequests, "claim_capacity_reached")
+	case errors.Is(err, broker.ErrInvalidHostNodeID):
+		writeError(writer, http.StatusBadRequest, "invalid_host_node_id")
+	case errors.Is(err, broker.ErrClaimConflict):
+		writeError(writer, http.StatusConflict, "claim_conflict")
+	default:
+		s.internalError(writer, "create pairing claim", err)
+	}
 }
 
 func (s *Server) writeBrokerError(writer http.ResponseWriter, err error, invalidCode string) {
@@ -255,18 +332,39 @@ func (s *Server) writeBrokerError(writer http.ResponseWriter, err error, invalid
 		writeError(writer, http.StatusGone, "claim_expired")
 	case errors.Is(err, broker.ErrClaimUnauthorized):
 		writeError(writer, http.StatusUnauthorized, "claim_secret_invalid")
-	case errors.Is(err, broker.ErrClaimConflict):
-		writeError(writer, http.StatusConflict, "claim_already_approved")
-	case errors.Is(err, broker.ErrCredentialCapacity):
-		writeError(writer, http.StatusTooManyRequests, "credential_capacity_reached")
+	case errors.Is(err, broker.ErrClaimConflict), errors.Is(err, broker.ErrRefreshHashConflict):
+		writeError(writer, http.StatusConflict, "claim_conflict")
+	case errors.Is(err, broker.ErrEndpointCapacity):
+		writeError(writer, http.StatusTooManyRequests, "endpoint_capacity_reached")
+	case errors.Is(err, broker.ErrAppEndpointCapacity):
+		writeError(writer, http.StatusTooManyRequests, "grant_endpoint_capacity_reached")
 	case errors.Is(err, broker.ErrInvalidAppNodeID):
 		writeError(writer, http.StatusBadRequest, invalidCode)
-	case errors.Is(err, broker.ErrInvalidDeliverySecret):
-		writeError(writer, http.StatusBadRequest, "invalid_delivery_secret")
-	case errors.Is(err, broker.ErrDeliveryUnauthorized):
-		writeError(writer, http.StatusUnauthorized, "delivery_secret_invalid")
+	case errors.Is(err, broker.ErrRefreshExpired):
+		writeError(writer, http.StatusGone, "credential_expired")
+	case errors.Is(err, broker.ErrGrantRevoked), errors.Is(err, broker.ErrRefreshInvalid):
+		writeError(writer, http.StatusUnauthorized, "credential_invalid")
 	default:
 		s.internalError(writer, "pairing claim operation", err)
+	}
+}
+
+func (s *Server) writeAuthenticatedError(writer http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, broker.ErrRefreshExpired):
+		writeError(writer, http.StatusGone, "refresh_token_expired")
+	case errors.Is(err, broker.ErrRefreshInvalid), errors.Is(err, broker.ErrGrantRevoked):
+		writeError(writer, http.StatusUnauthorized, "refresh_token_invalid")
+	case errors.Is(err, broker.ErrEndpointNotFound):
+		writeError(writer, http.StatusNotFound, "endpoint_not_found")
+	case errors.Is(err, broker.ErrEndpointForbidden):
+		writeError(writer, http.StatusForbidden, "endpoint_forbidden")
+	case errors.Is(err, broker.ErrClaimCapacity):
+		writeError(writer, http.StatusTooManyRequests, "claim_capacity_reached")
+	case errors.Is(err, broker.ErrClaimConflict):
+		writeError(writer, http.StatusConflict, "claim_conflict")
+	default:
+		s.internalError(writer, "authenticated credential operation", err)
 	}
 }
 

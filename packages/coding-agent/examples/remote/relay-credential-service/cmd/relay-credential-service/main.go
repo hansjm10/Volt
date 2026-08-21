@@ -26,21 +26,22 @@ const (
 )
 
 type config struct {
-	ListenAddress         string
-	Issuer                string
-	Audience              string
-	SigningKeyPath        string
-	AppCheckMode          string
-	DevAppCheck           string
-	FirebaseProjectNumber string
-	AllowedFirebaseAppIDs []string
-	ClaimTTL              time.Duration
-	AccessTTL             time.Duration
-	RefreshTTL            time.Duration
-	RefreshMinInterval    time.Duration
-	MaxClaims             int
-	MaxCredentials        int
-	MaxConcurrentRequests int
+	ListenAddress           string
+	Issuer                  string
+	Audience                string
+	SigningKeyPath          string
+	AppCheckMode            string
+	DevAppCheck             string
+	FirebaseProjectNumber   string
+	AllowedFirebaseAppIDs   []string
+	ClaimTTL                time.Duration
+	AccessTTL               time.Duration
+	RefreshInactivityTTL    time.Duration
+	RefreshMinInterval      time.Duration
+	MaxClaims               int
+	MaxEndpoints            int
+	MaxAppEndpointsPerGrant int
+	MaxConcurrentRequests   int
 }
 
 func main() {
@@ -81,12 +82,13 @@ func main() {
 		os.Exit(2)
 	}
 	brokerService, err := broker.New(signer, broker.Config{
-		ClaimTTL:           configuration.ClaimTTL,
-		AccessTokenTTL:     configuration.AccessTTL,
-		RefreshTokenTTL:    configuration.RefreshTTL,
-		RefreshMinInterval: configuration.RefreshMinInterval,
-		MaxClaims:          configuration.MaxClaims,
-		MaxCredentials:     configuration.MaxCredentials,
+		ClaimTTL:                configuration.ClaimTTL,
+		AccessTokenTTL:          configuration.AccessTTL,
+		RefreshInactivityTTL:    configuration.RefreshInactivityTTL,
+		RefreshMinInterval:      configuration.RefreshMinInterval,
+		MaxClaims:               configuration.MaxClaims,
+		MaxEndpoints:            configuration.MaxEndpoints,
+		MaxAppEndpointsPerGrant: configuration.MaxAppEndpointsPerGrant,
 	}, time.Now)
 	if err != nil {
 		logger.Error("configure credential broker", "error", err)
@@ -152,7 +154,7 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	refreshTTL, err := durationEnv("VOLT_CREDENTIAL_REFRESH_TTL", 30*24*time.Hour)
+	refreshInactivityTTL, err := durationEnv("VOLT_CREDENTIAL_REFRESH_INACTIVITY_TTL", 90*24*time.Hour)
 	if err != nil {
 		return config{}, err
 	}
@@ -164,7 +166,11 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	maxCredentials, err := positiveIntEnv("VOLT_CREDENTIAL_MAX_CREDENTIALS", 100_000)
+	maxEndpoints, err := positiveIntEnv("VOLT_CREDENTIAL_MAX_ENDPOINTS", 100_000)
+	if err != nil {
+		return config{}, err
+	}
+	maxAppEndpointsPerGrant, err := positiveIntEnv("VOLT_CREDENTIAL_MAX_APP_ENDPOINTS_PER_GRANT", 8)
 	if err != nil {
 		return config{}, err
 	}
@@ -188,21 +194,22 @@ func loadConfig() (config, error) {
 	}
 
 	return config{
-		ListenAddress:         stringEnv("VOLT_CREDENTIAL_LISTEN", defaultListenAddress),
-		Issuer:                stringEnv("VOLT_CREDENTIAL_ISSUER", defaultIssuer),
-		Audience:              stringEnv("VOLT_CREDENTIAL_AUDIENCE", defaultAudience),
-		SigningKeyPath:        stringEnv("VOLT_CREDENTIAL_SIGNING_KEY_FILE", defaultSigningKey),
-		AppCheckMode:          appCheckMode,
-		DevAppCheck:           devAppCheck,
-		FirebaseProjectNumber: firebaseProjectNumber,
-		AllowedFirebaseAppIDs: allowedFirebaseAppIDs,
-		ClaimTTL:              claimTTL,
-		AccessTTL:             accessTTL,
-		RefreshTTL:            refreshTTL,
-		RefreshMinInterval:    refreshMinInterval,
-		MaxClaims:             maxClaims,
-		MaxCredentials:        maxCredentials,
-		MaxConcurrentRequests: maxConcurrentRequests,
+		ListenAddress:           stringEnv("VOLT_CREDENTIAL_LISTEN", defaultListenAddress),
+		Issuer:                  stringEnv("VOLT_CREDENTIAL_ISSUER", defaultIssuer),
+		Audience:                stringEnv("VOLT_CREDENTIAL_AUDIENCE", defaultAudience),
+		SigningKeyPath:          stringEnv("VOLT_CREDENTIAL_SIGNING_KEY_FILE", defaultSigningKey),
+		AppCheckMode:            appCheckMode,
+		DevAppCheck:             devAppCheck,
+		FirebaseProjectNumber:   firebaseProjectNumber,
+		AllowedFirebaseAppIDs:   allowedFirebaseAppIDs,
+		ClaimTTL:                claimTTL,
+		AccessTTL:               accessTTL,
+		RefreshInactivityTTL:    refreshInactivityTTL,
+		RefreshMinInterval:      refreshMinInterval,
+		MaxClaims:               maxClaims,
+		MaxEndpoints:            maxEndpoints,
+		MaxAppEndpointsPerGrant: maxAppEndpointsPerGrant,
+		MaxConcurrentRequests:   maxConcurrentRequests,
 	}, nil
 }
 

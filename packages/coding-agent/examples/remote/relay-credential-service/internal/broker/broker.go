@@ -16,98 +16,102 @@ import (
 )
 
 var (
-	ErrClaimCapacity         = errors.New("pairing claim capacity reached")
-	ErrCredentialCapacity    = errors.New("refresh credential capacity reached")
-	ErrInvalidHostNodeID     = errors.New("invalid host node ID")
-	ErrInvalidAppNodeID      = errors.New("invalid app node ID")
-	ErrInvalidDeliverySecret = errors.New("invalid app delivery secret")
-	ErrDeliveryUnauthorized  = errors.New("app delivery secret unauthorized")
-	ErrClaimNotFound         = errors.New("pairing claim not found")
-	ErrClaimExpired          = errors.New("pairing claim expired")
-	ErrClaimPending          = errors.New("pairing claim pending")
-	ErrClaimUnauthorized     = errors.New("pairing claim unauthorized")
-	ErrClaimConflict         = errors.New("pairing claim already approved for another app endpoint")
-	ErrRefreshInvalid        = errors.New("refresh credential invalid")
-	ErrRefreshExpired        = errors.New("refresh credential expired")
-	ErrRefreshThrottled      = errors.New("refresh credential used too frequently")
+	ErrClaimCapacity       = errors.New("pairing claim capacity reached")
+	ErrEndpointCapacity    = errors.New("endpoint credential capacity reached")
+	ErrAppEndpointCapacity = errors.New("app endpoint capacity reached for grant")
+	ErrInvalidHostNodeID   = errors.New("invalid host node ID")
+	ErrInvalidAppNodeID    = errors.New("invalid app node ID")
+	ErrInvalidSecretHash   = errors.New("invalid secret hash")
+	ErrClaimNotFound       = errors.New("pairing claim not found")
+	ErrClaimExpired        = errors.New("pairing claim expired")
+	ErrClaimPending        = errors.New("pairing claim pending")
+	ErrClaimUnauthorized   = errors.New("pairing claim unauthorized")
+	ErrClaimConflict       = errors.New("pairing claim conflicts with existing approval")
+	ErrRefreshHashConflict = errors.New("refresh credential hash already exists")
+	ErrRefreshInvalid      = errors.New("refresh credential invalid")
+	ErrRefreshExpired      = errors.New("refresh credential expired")
+	ErrRefreshThrottled    = errors.New("refresh credential used too frequently")
+	ErrGrantRevoked        = errors.New("daemon identity grant revoked")
+	ErrEndpointNotFound    = errors.New("endpoint credential not found")
+	ErrEndpointForbidden   = errors.New("endpoint credential is outside host grant")
 )
 
 var nodeIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 const (
-	claimSecretPrefix  = "vpc_"
-	refreshPrefix      = "vrr_"
-	MaxClaimTTL        = 30 * time.Minute
-	MaxAccessTokenTTL  = time.Hour
-	MaxRefreshTokenTTL = 90 * 24 * time.Hour
+	claimSecretPrefix          = "vpc_"
+	refreshPrefix              = "vrr_"
+	secretByteCount            = 32
+	MaxClaimTTL                = 30 * time.Minute
+	MaxAccessTokenTTL          = time.Hour
+	MaxRefreshInactivityTTL    = 90 * 24 * time.Hour
+	endpointTombstoneRetention = 30 * 24 * time.Hour
 )
 
+type SecretHash [sha256.Size]byte
+
 type Config struct {
-	ClaimTTL           time.Duration
-	AccessTokenTTL     time.Duration
-	RefreshTokenTTL    time.Duration
-	RefreshMinInterval time.Duration
-	MaxClaims          int
-	MaxCredentials     int
+	ClaimTTL                time.Duration
+	AccessTokenTTL          time.Duration
+	RefreshInactivityTTL    time.Duration
+	RefreshMinInterval      time.Duration
+	MaxClaims               int
+	MaxEndpoints            int
+	MaxAppEndpointsPerGrant int
 }
 
 type Broker struct {
-	mu      sync.Mutex
-	signer  *credential.Signer
-	config  Config
-	now     func() time.Time
-	claims  map[string]*pairingClaim
-	refresh map[[sha256.Size]byte]*refreshRecord
+	mu             sync.Mutex
+	signer         *credential.Signer
+	config         Config
+	now            func() time.Time
+	claims         map[string]*pairingClaim
+	claimSecrets   map[SecretHash]string
+	grants         map[string]*grantRecord
+	endpoints      map[string]*endpointRecord
+	grantEndpoints map[string]map[string]*endpointRecord
+	refresh        map[SecretHash]*endpointRecord
 }
 
 type pairingClaim struct {
-	ID                    string
-	SecretHash            [sha256.Size]byte
-	HostNodeID            string
-	ExpiresAt             time.Time
-	ApprovedAppID         string
-	ApprovedAppNodeID     string
-	AppDeliverySecretHash [sha256.Size]byte
-	GrantID               string
-	AppRefreshHash        [sha256.Size]byte
-	HasAppRefreshHash     bool
-	HostRefreshHash       [sha256.Size]byte
-	HasHostRefreshHash    bool
+	ID                       string
+	SecretHash               SecretHash
+	HostNodeID               string
+	ExpiresAt                time.Time
+	GrantID                  string
+	BootstrapHostRefreshHash SecretHash
+	HasBootstrapHostRefresh  bool
+	ApprovedAppID            string
+	ApprovedAppNodeID        string
+	ApprovedAppRefreshHash   SecretHash
+	ApprovedAppEndpointID    string
+	ApprovedAt               time.Time
+	ExchangedAt              time.Time
 }
 
-type refreshRecord struct {
-	Subject      string
-	EndpointKind string
-	GrantID      string
-	ExpiresAt    time.Time
-	LastRefresh  time.Time
-	Revoked      bool
+type grantRecord struct {
+	ID             string
+	HostNodeID     string
+	HostEndpointID string
+	CreatedAt      time.Time
+	RevokedAt      time.Time
+}
+
+type endpointRecord struct {
+	ID                       string
+	Subject                  string
+	EndpointKind             string
+	GrantID                  string
+	RefreshHash              SecretHash
+	RefreshInactiveExpiresAt time.Time
+	LastRefresh              time.Time
+	CreatedAt                time.Time
+	RevokedAt                time.Time
 }
 
 type PairingClaim struct {
-	ClaimID     string    `json:"claimId"`
-	ClaimSecret string    `json:"claimSecret"`
-	ExpiresAt   time.Time `json:"expiresAt"`
-}
-
-type EndpointCredential struct {
-	AccessToken           string    `json:"accessToken"`
-	AccessTokenExpiresAt  time.Time `json:"accessTokenExpiresAt"`
-	RefreshToken          string    `json:"refreshToken"`
-	RefreshTokenExpiresAt time.Time `json:"refreshTokenExpiresAt"`
-	TokenType             string    `json:"tokenType"`
-}
-
-type Approval struct {
-	GrantID    string             `json:"grantId"`
-	AppNodeID  string             `json:"appNodeId"`
-	Credential EndpointCredential `json:"credential"`
-}
-
-type Exchange struct {
-	GrantID    string             `json:"grantId"`
-	HostNodeID string             `json:"hostNodeId"`
-	Credential EndpointCredential `json:"credential"`
+	ClaimID   string    `json:"claimId"`
+	ExpiresAt time.Time `json:"expiresAt"`
 }
 
 type AccessToken struct {
@@ -116,31 +120,55 @@ type AccessToken struct {
 	TokenType            string    `json:"tokenType"`
 }
 
+type Approval struct {
+	GrantID    string      `json:"grantId"`
+	EndpointID string      `json:"endpointId"`
+	HostNodeID string      `json:"hostNodeId"`
+	AppNodeID  string      `json:"appNodeId"`
+	Credential AccessToken `json:"credential"`
+}
+
+type Exchange struct {
+	GrantID       string      `json:"grantId"`
+	EndpointID    string      `json:"endpointId"`
+	HostNodeID    string      `json:"hostNodeId"`
+	AppEndpointID string      `json:"appEndpointId"`
+	AppNodeID     string      `json:"appNodeId"`
+	Credential    AccessToken `json:"credential"`
+}
+
 func New(signer *credential.Signer, config Config, now func() time.Time) (*Broker, error) {
 	if signer == nil {
 		return nil, errors.New("signer is required")
 	}
-	if config.ClaimTTL <= 0 || config.AccessTokenTTL < time.Second || config.RefreshTokenTTL <= 0 || config.RefreshMinInterval <= 0 {
+	if config.ClaimTTL <= 0 || config.AccessTokenTTL < time.Second || config.RefreshInactivityTTL <= 0 || config.RefreshMinInterval <= 0 {
 		return nil, errors.New("credential TTLs and refresh interval are invalid")
 	}
-	if config.ClaimTTL > MaxClaimTTL || config.AccessTokenTTL > MaxAccessTokenTTL || config.RefreshTokenTTL > MaxRefreshTokenTTL {
+	if config.ClaimTTL > MaxClaimTTL || config.AccessTokenTTL > MaxAccessTokenTTL || config.RefreshInactivityTTL > MaxRefreshInactivityTTL {
 		return nil, errors.New("credential TTL exceeds its hard safety maximum")
 	}
 	if config.RefreshMinInterval >= config.AccessTokenTTL {
 		return nil, errors.New("refresh interval must be shorter than the access token TTL")
 	}
-	if config.MaxClaims <= 0 || config.MaxCredentials <= 0 {
-		return nil, errors.New("claim and credential capacities must be positive")
+	if config.RefreshInactivityTTL < config.ClaimTTL || config.RefreshInactivityTTL < config.AccessTokenTTL {
+		return nil, errors.New("refresh inactivity TTL must cover the claim and access token TTLs")
+	}
+	if config.MaxClaims <= 0 || config.MaxEndpoints <= 0 || config.MaxAppEndpointsPerGrant <= 0 {
+		return nil, errors.New("claim and endpoint capacities must be positive")
 	}
 	if now == nil {
 		now = time.Now
 	}
 	return &Broker{
-		signer:  signer,
-		config:  config,
-		now:     now,
-		claims:  make(map[string]*pairingClaim),
-		refresh: make(map[[sha256.Size]byte]*refreshRecord),
+		signer:         signer,
+		config:         config,
+		now:            now,
+		claims:         make(map[string]*pairingClaim),
+		claimSecrets:   make(map[SecretHash]string),
+		grants:         make(map[string]*grantRecord),
+		endpoints:      make(map[string]*endpointRecord),
+		grantEndpoints: make(map[string]map[string]*endpointRecord),
+		refresh:        make(map[SecretHash]*endpointRecord),
 	}, nil
 }
 
@@ -148,51 +176,94 @@ func ValidNodeID(nodeID string) bool {
 	return nodeIDPattern.MatchString(nodeID)
 }
 
-func (b *Broker) CreatePairingClaim(hostNodeID string) (PairingClaim, error) {
+func ParseSecretHash(value string) (SecretHash, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil || len(decoded) != sha256.Size || base64.RawURLEncoding.EncodeToString(decoded) != value {
+		return SecretHash{}, ErrInvalidSecretHash
+	}
+	var result SecretHash
+	copy(result[:], decoded)
+	return result, nil
+}
+
+func (b *Broker) CreateBootstrapPairingClaim(hostNodeID string, claimSecretHash, hostRefreshHash SecretHash) (PairingClaim, error) {
 	if !ValidNodeID(hostNodeID) {
 		return PairingClaim{}, ErrInvalidHostNodeID
+	}
+	if subtle.ConstantTimeCompare(claimSecretHash[:], hostRefreshHash[:]) == 1 {
+		return PairingClaim{}, ErrClaimConflict
 	}
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.createPairingClaimLocked(hostNodeID, "", claimSecretHash, hostRefreshHash, true)
+}
+
+func (b *Broker) CreatePairingClaimForGrant(hostRefreshToken string, claimSecretHash SecretHash) (PairingClaim, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now().UTC()
+	host, err := b.activeEndpointLocked(hostRefreshToken, now)
+	if err != nil {
+		return PairingClaim{}, err
+	}
+	if host.EndpointKind != "host" {
+		return PairingClaim{}, ErrEndpointForbidden
+	}
+	if subtle.ConstantTimeCompare(claimSecretHash[:], host.RefreshHash[:]) == 1 {
+		return PairingClaim{}, ErrClaimConflict
+	}
+	return b.createPairingClaimLocked(host.Subject, host.GrantID, claimSecretHash, SecretHash{}, false)
+}
+
+func (b *Broker) createPairingClaimLocked(
+	hostNodeID string,
+	grantID string,
+	claimSecretHash SecretHash,
+	hostRefreshHash SecretHash,
+	bootstrap bool,
+) (PairingClaim, error) {
 	now := b.now().UTC()
 	if len(b.claims) >= b.config.MaxClaims {
-		b.cleanupLocked(now)
+		b.cleanupClaimsLocked(now)
 		if len(b.claims) >= b.config.MaxClaims {
 			return PairingClaim{}, ErrClaimCapacity
 		}
 	}
-
-	claimID, err := randomToken("", 18)
-	if err != nil {
-		return PairingClaim{}, err
+	if existingID, exists := b.claimSecrets[claimSecretHash]; exists {
+		existing := b.claims[existingID]
+		if existing != nil && now.Before(existing.ExpiresAt) {
+			return PairingClaim{}, ErrClaimConflict
+		}
+		delete(b.claims, existingID)
+		delete(b.claimSecrets, claimSecretHash)
 	}
-	claimSecret, err := randomToken(claimSecretPrefix, 32)
+
+	claimID, err := randomIdentifier()
 	if err != nil {
 		return PairingClaim{}, err
 	}
 	expiresAt := now.Add(b.config.ClaimTTL)
 	b.claims[claimID] = &pairingClaim{
-		ID:         claimID,
-		SecretHash: sha256.Sum256([]byte(claimSecret)),
-		HostNodeID: hostNodeID,
-		ExpiresAt:  expiresAt,
+		ID:                       claimID,
+		SecretHash:               claimSecretHash,
+		HostNodeID:               hostNodeID,
+		ExpiresAt:                expiresAt,
+		GrantID:                  grantID,
+		BootstrapHostRefreshHash: hostRefreshHash,
+		HasBootstrapHostRefresh:  bootstrap,
 	}
-	return PairingClaim{ClaimID: claimID, ClaimSecret: claimSecret, ExpiresAt: expiresAt}, nil
+	b.claimSecrets[claimSecretHash] = claimID
+	return PairingClaim{ClaimID: claimID, ExpiresAt: expiresAt}, nil
 }
 
-func (b *Broker) ApprovePairingClaim(claimID, appID, appNodeID, deliverySecret string) (Approval, error) {
+func (b *Broker) ApprovePairingClaim(claimID, appID, appNodeID string, appRefreshHash SecretHash) (Approval, error) {
 	if strings.TrimSpace(appID) == "" {
 		return Approval{}, errors.New("verified app ID is required")
 	}
 	if !ValidNodeID(appNodeID) {
 		return Approval{}, ErrInvalidAppNodeID
 	}
-	decodedDeliverySecret, err := base64.RawURLEncoding.DecodeString(deliverySecret)
-	if err != nil || len(decodedDeliverySecret) != 32 || base64.RawURLEncoding.EncodeToString(decodedDeliverySecret) != deliverySecret {
-		return Approval{}, ErrInvalidDeliverySecret
-	}
-	deliverySecretHash := sha256.Sum256([]byte(deliverySecret))
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -201,43 +272,121 @@ func (b *Broker) ApprovePairingClaim(claimID, appID, appNodeID, deliverySecret s
 	if err != nil {
 		return Approval{}, err
 	}
-	grantID := claim.GrantID
-	if claim.ApprovedAppNodeID != "" {
-		if claim.ApprovedAppNodeID != appNodeID || claim.ApprovedAppID != appID {
+	if claim.ApprovedAppEndpointID != "" {
+		if claim.ApprovedAppNodeID != appNodeID || claim.ApprovedAppID != appID || subtle.ConstantTimeCompare(claim.ApprovedAppRefreshHash[:], appRefreshHash[:]) != 1 {
 			return Approval{}, ErrClaimConflict
 		}
-		if subtle.ConstantTimeCompare(deliverySecretHash[:], claim.AppDeliverySecretHash[:]) != 1 {
-			return Approval{}, ErrDeliveryUnauthorized
+		app := b.endpoints[claim.ApprovedAppEndpointID]
+		if app == nil || !app.RevokedAt.IsZero() || !now.Before(app.RefreshInactiveExpiresAt) {
+			return Approval{}, ErrRefreshInvalid
 		}
-		if claim.HasAppRefreshHash {
-			delete(b.refresh, claim.AppRefreshHash)
-			claim.HasAppRefreshHash = false
+		access, err := b.issueAccessToken(app, now)
+		if err != nil {
+			return Approval{}, err
 		}
+		return approvalFor(claim, app, access), nil
+	}
+	if _, exists := b.refresh[appRefreshHash]; exists {
+		return Approval{}, ErrRefreshHashConflict
+	}
+	if claim.HasBootstrapHostRefresh && subtle.ConstantTimeCompare(appRefreshHash[:], claim.BootstrapHostRefreshHash[:]) == 1 {
+		return Approval{}, ErrRefreshHashConflict
+	}
+
+	grantID := claim.GrantID
+	neededEndpoints := 1
+	if claim.HasBootstrapHostRefresh {
+		neededEndpoints = 2
 	} else {
-		var err error
-		grantID, err = randomToken("", 18)
+		grant := b.grants[grantID]
+		if grant == nil || !grant.RevokedAt.IsZero() {
+			return Approval{}, ErrGrantRevoked
+		}
+		host := b.endpoints[grant.HostEndpointID]
+		if host == nil || !host.RevokedAt.IsZero() {
+			return Approval{}, ErrRefreshInvalid
+		}
+		if !now.Before(host.RefreshInactiveExpiresAt) {
+			b.revokeGrantLocked(grantID, now)
+			return Approval{}, ErrRefreshExpired
+		}
+		if b.endpointForGrantNodeLocked(grantID, "app", appNodeID) != nil {
+			return Approval{}, ErrClaimConflict
+		}
+		if b.activeAppEndpointCountLocked(grantID, now) >= b.config.MaxAppEndpointsPerGrant {
+			return Approval{}, ErrAppEndpointCapacity
+		}
+	}
+	if !b.ensureEndpointCapacityLocked(neededEndpoints, now) {
+		return Approval{}, ErrEndpointCapacity
+	}
+
+	if claim.HasBootstrapHostRefresh {
+		if _, exists := b.refresh[claim.BootstrapHostRefreshHash]; exists {
+			return Approval{}, ErrRefreshHashConflict
+		}
+		grantID, err = randomIdentifier()
 		if err != nil {
 			return Approval{}, err
 		}
 	}
-	if !b.ensureCredentialCapacityLocked(1, now) {
-		return Approval{}, ErrCredentialCapacity
+	appEndpointID, err := randomIdentifier()
+	if err != nil {
+		return Approval{}, err
 	}
-	appCredential, appRefreshHash, err := b.issueEndpointCredentialLocked(appNodeID, "app", grantID, now)
+	var hostEndpointID string
+	if claim.HasBootstrapHostRefresh {
+		hostEndpointID, err = randomIdentifier()
+		if err != nil {
+			return Approval{}, err
+		}
+	}
+	app := &endpointRecord{
+		ID:                       appEndpointID,
+		Subject:                  appNodeID,
+		EndpointKind:             "app",
+		GrantID:                  grantID,
+		RefreshHash:              appRefreshHash,
+		RefreshInactiveExpiresAt: now.Add(b.config.RefreshInactivityTTL),
+		CreatedAt:                now,
+	}
+	access, err := b.issueAccessToken(app, now)
 	if err != nil {
 		return Approval{}, err
 	}
 
+	if claim.HasBootstrapHostRefresh {
+		host := &endpointRecord{
+			ID:                       hostEndpointID,
+			Subject:                  claim.HostNodeID,
+			EndpointKind:             "host",
+			GrantID:                  grantID,
+			RefreshHash:              claim.BootstrapHostRefreshHash,
+			RefreshInactiveExpiresAt: now.Add(b.config.RefreshInactivityTTL),
+			CreatedAt:                now,
+		}
+		b.grants[grantID] = &grantRecord{
+			ID:             grantID,
+			HostNodeID:     claim.HostNodeID,
+			HostEndpointID: hostEndpointID,
+			CreatedAt:      now,
+		}
+		b.registerEndpointLocked(host)
+	}
+	b.registerEndpointLocked(app)
+	claim.GrantID = grantID
 	claim.ApprovedAppID = appID
 	claim.ApprovedAppNodeID = appNodeID
-	claim.AppDeliverySecretHash = deliverySecretHash
-	claim.GrantID = grantID
-	claim.AppRefreshHash = appRefreshHash
-	claim.HasAppRefreshHash = true
-	return Approval{GrantID: grantID, AppNodeID: appNodeID, Credential: appCredential}, nil
+	claim.ApprovedAppRefreshHash = appRefreshHash
+	claim.ApprovedAppEndpointID = app.ID
+	claim.ApprovedAt = now
+	return approvalFor(claim, app, access), nil
 }
 
 func (b *Broker) ExchangePairingClaim(claimID, claimSecret string) (Exchange, error) {
+	if !validSecret(claimSecret, claimSecretPrefix) {
+		return Exchange{}, ErrClaimUnauthorized
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.now().UTC()
@@ -245,30 +394,37 @@ func (b *Broker) ExchangePairingClaim(claimID, claimSecret string) (Exchange, er
 	if err != nil {
 		return Exchange{}, err
 	}
-	providedHash := sha256.Sum256([]byte(claimSecret))
+	providedHash := SecretHash(sha256.Sum256([]byte(claimSecret)))
 	if subtle.ConstantTimeCompare(providedHash[:], claim.SecretHash[:]) != 1 {
 		return Exchange{}, ErrClaimUnauthorized
 	}
-	if claim.ApprovedAppNodeID == "" {
+	if claim.ApprovedAppEndpointID == "" {
 		return Exchange{}, ErrClaimPending
 	}
-	if claim.HasHostRefreshHash {
-		delete(b.refresh, claim.HostRefreshHash)
-		claim.HasHostRefreshHash = false
+	grant := b.grants[claim.GrantID]
+	if grant == nil || !grant.RevokedAt.IsZero() {
+		return Exchange{}, ErrGrantRevoked
 	}
-	if !b.ensureCredentialCapacityLocked(1, now) {
-		return Exchange{}, ErrCredentialCapacity
+	host := b.endpoints[grant.HostEndpointID]
+	if host == nil || !host.RevokedAt.IsZero() {
+		return Exchange{}, ErrRefreshInvalid
 	}
-	hostCredential, hostRefreshHash, err := b.issueEndpointCredentialLocked(claim.HostNodeID, "host", claim.GrantID, now)
+	if !now.Before(host.RefreshInactiveExpiresAt) {
+		b.revokeGrantLocked(grant.ID, now)
+		return Exchange{}, ErrRefreshExpired
+	}
+	access, err := b.issueAccessToken(host, now)
 	if err != nil {
 		return Exchange{}, err
 	}
-	claim.HostRefreshHash = hostRefreshHash
-	claim.HasHostRefreshHash = true
+	claim.ExchangedAt = now
 	return Exchange{
-		GrantID:    claim.GrantID,
-		HostNodeID: claim.HostNodeID,
-		Credential: hostCredential,
+		GrantID:       grant.ID,
+		EndpointID:    host.ID,
+		HostNodeID:    host.Subject,
+		AppEndpointID: claim.ApprovedAppEndpointID,
+		AppNodeID:     claim.ApprovedAppNodeID,
+		Credential:    access,
 	}, nil
 }
 
@@ -276,69 +432,109 @@ func (b *Broker) RefreshAccessToken(refreshToken string) (AccessToken, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.now().UTC()
-	record, err := b.activeRefreshLocked(refreshToken, now)
+	endpoint, err := b.activeEndpointLocked(refreshToken, now)
 	if err != nil {
 		return AccessToken{}, err
 	}
-	if !record.LastRefresh.IsZero() && now.Sub(record.LastRefresh) < b.config.RefreshMinInterval {
+	if !endpoint.LastRefresh.IsZero() && now.Sub(endpoint.LastRefresh) < b.config.RefreshMinInterval {
 		return AccessToken{}, ErrRefreshThrottled
 	}
-	previousRefresh := record.LastRefresh
-	record.LastRefresh = now
-	accessToken, expiresAt, err := b.issueAccessToken(record.Subject, record.EndpointKind, record.GrantID, now)
+	previousRefresh := endpoint.LastRefresh
+	previousExpiry := endpoint.RefreshInactiveExpiresAt
+	endpoint.LastRefresh = now
+	endpoint.RefreshInactiveExpiresAt = now.Add(b.config.RefreshInactivityTTL)
+	access, err := b.issueAccessToken(endpoint, now)
 	if err != nil {
-		record.LastRefresh = previousRefresh
+		endpoint.LastRefresh = previousRefresh
+		endpoint.RefreshInactiveExpiresAt = previousExpiry
 		return AccessToken{}, err
 	}
-	return AccessToken{AccessToken: accessToken, AccessTokenExpiresAt: expiresAt, TokenType: "Bearer"}, nil
+	return access, nil
 }
 
 func (b *Broker) RevokeRefreshToken(refreshToken string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.now().UTC()
-	record, err := b.activeRefreshLocked(refreshToken, now)
+	endpoint, err := b.endpointForRefreshTokenLocked(refreshToken)
 	if err != nil {
 		return err
 	}
-	record.Revoked = true
+	if endpoint.EndpointKind == "host" {
+		b.revokeGrantLocked(endpoint.GrantID, now)
+		return nil
+	}
+	if endpoint.RevokedAt.IsZero() {
+		endpoint.RevokedAt = now
+	}
 	return nil
 }
 
-func (b *Broker) issueEndpointCredentialLocked(subject, endpointKind, grantID string, now time.Time) (EndpointCredential, [sha256.Size]byte, error) {
-	refreshToken, err := randomToken(refreshPrefix, 32)
+func (b *Broker) RevokeAppEndpoint(hostRefreshToken, appEndpointID string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now().UTC()
+	host, err := b.activeEndpointLocked(hostRefreshToken, now)
 	if err != nil {
-		return EndpointCredential{}, [sha256.Size]byte{}, err
+		return err
 	}
-	refreshExpiresAt := now.Add(b.config.RefreshTokenTTL)
-	refreshHash := sha256.Sum256([]byte(refreshToken))
-	b.refresh[refreshHash] = &refreshRecord{
-		Subject:      subject,
-		EndpointKind: endpointKind,
-		GrantID:      grantID,
-		ExpiresAt:    refreshExpiresAt,
+	if host.EndpointKind != "host" {
+		return ErrEndpointForbidden
 	}
-
-	accessToken, accessExpiresAt, err := b.issueAccessToken(subject, endpointKind, grantID, now)
-	if err != nil {
-		delete(b.refresh, refreshHash)
-		return EndpointCredential{}, [sha256.Size]byte{}, err
+	app := b.endpoints[appEndpointID]
+	if app == nil {
+		return ErrEndpointNotFound
 	}
-	return EndpointCredential{
-		AccessToken:           accessToken,
-		AccessTokenExpiresAt:  accessExpiresAt,
-		RefreshToken:          refreshToken,
-		RefreshTokenExpiresAt: refreshExpiresAt,
-		TokenType:             "Bearer",
-	}, refreshHash, nil
+	if app.EndpointKind != "app" || app.GrantID != host.GrantID {
+		return ErrEndpointForbidden
+	}
+	if app.RevokedAt.IsZero() {
+		app.RevokedAt = now
+	}
+	return nil
 }
 
-func (b *Broker) issueAccessToken(subject, endpointKind, grantID string, now time.Time) (string, time.Time, error) {
-	jwtID, err := randomToken("", 18)
+func (b *Broker) RevokeGrant(hostRefreshToken string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	endpoint, err := b.endpointForRefreshTokenLocked(hostRefreshToken)
 	if err != nil {
-		return "", time.Time{}, err
+		return err
 	}
-	return b.signer.Issue(subject, endpointKind, grantID, jwtID, now, b.config.AccessTokenTTL)
+	if endpoint.EndpointKind != "host" {
+		return ErrEndpointForbidden
+	}
+	b.revokeGrantLocked(endpoint.GrantID, b.now().UTC())
+	return nil
+}
+
+func approvalFor(claim *pairingClaim, app *endpointRecord, access AccessToken) Approval {
+	return Approval{
+		GrantID:    claim.GrantID,
+		EndpointID: app.ID,
+		HostNodeID: claim.HostNodeID,
+		AppNodeID:  app.Subject,
+		Credential: access,
+	}
+}
+
+func (b *Broker) issueAccessToken(endpoint *endpointRecord, now time.Time) (AccessToken, error) {
+	jwtID, err := randomIdentifier()
+	if err != nil {
+		return AccessToken{}, err
+	}
+	accessToken, expiresAt, err := b.signer.Issue(
+		endpoint.Subject,
+		endpoint.EndpointKind,
+		endpoint.GrantID,
+		jwtID,
+		now,
+		b.config.AccessTokenTTL,
+	)
+	if err != nil {
+		return AccessToken{}, err
+	}
+	return AccessToken{AccessToken: accessToken, AccessTokenExpiresAt: expiresAt, TokenType: "Bearer"}, nil
 }
 
 func (b *Broker) activeClaimLocked(claimID string, now time.Time) (*pairingClaim, error) {
@@ -347,53 +543,155 @@ func (b *Broker) activeClaimLocked(claimID string, now time.Time) (*pairingClaim
 		return nil, ErrClaimNotFound
 	}
 	if !now.Before(claim.ExpiresAt) {
-		delete(b.claims, claimID)
+		b.deleteClaimLocked(claimID, claim)
 		return nil, ErrClaimExpired
 	}
 	return claim, nil
 }
 
-func (b *Broker) activeRefreshLocked(refreshToken string, now time.Time) (*refreshRecord, error) {
-	if !strings.HasPrefix(refreshToken, refreshPrefix) || len(refreshToken) > 256 {
+func (b *Broker) activeEndpointLocked(refreshToken string, now time.Time) (*endpointRecord, error) {
+	endpoint, err := b.endpointForRefreshTokenLocked(refreshToken)
+	if err != nil {
+		return nil, err
+	}
+	grant := b.grants[endpoint.GrantID]
+	if grant == nil || !grant.RevokedAt.IsZero() || !endpoint.RevokedAt.IsZero() {
 		return nil, ErrRefreshInvalid
 	}
-	hash := sha256.Sum256([]byte(refreshToken))
-	record, ok := b.refresh[hash]
-	if !ok || record.Revoked {
-		return nil, ErrRefreshInvalid
-	}
-	if !now.Before(record.ExpiresAt) {
-		delete(b.refresh, hash)
+	if !now.Before(endpoint.RefreshInactiveExpiresAt) {
+		if endpoint.EndpointKind == "host" {
+			b.revokeGrantLocked(endpoint.GrantID, now)
+		} else {
+			endpoint.RevokedAt = now
+		}
 		return nil, ErrRefreshExpired
 	}
-	return record, nil
+	return endpoint, nil
 }
 
-func (b *Broker) ensureCredentialCapacityLocked(needed int, now time.Time) bool {
-	if len(b.refresh)+needed <= b.config.MaxCredentials {
+func (b *Broker) endpointForRefreshTokenLocked(refreshToken string) (*endpointRecord, error) {
+	if !validSecret(refreshToken, refreshPrefix) {
+		return nil, ErrRefreshInvalid
+	}
+	hash := SecretHash(sha256.Sum256([]byte(refreshToken)))
+	endpoint := b.refresh[hash]
+	if endpoint == nil {
+		return nil, ErrRefreshInvalid
+	}
+	return endpoint, nil
+}
+
+func (b *Broker) endpointForGrantNodeLocked(grantID, endpointKind, nodeID string) *endpointRecord {
+	for _, endpoint := range b.grantEndpoints[grantID] {
+		if endpoint.EndpointKind == endpointKind && endpoint.Subject == nodeID {
+			return endpoint
+		}
+	}
+	return nil
+}
+
+func (b *Broker) activeAppEndpointCountLocked(grantID string, now time.Time) int {
+	count := 0
+	for _, endpoint := range b.grantEndpoints[grantID] {
+		if endpoint.EndpointKind == "app" && endpoint.RevokedAt.IsZero() && now.Before(endpoint.RefreshInactiveExpiresAt) {
+			count++
+		}
+	}
+	return count
+}
+
+func (b *Broker) registerEndpointLocked(endpoint *endpointRecord) {
+	b.endpoints[endpoint.ID] = endpoint
+	b.refresh[endpoint.RefreshHash] = endpoint
+	grantEndpoints := b.grantEndpoints[endpoint.GrantID]
+	if grantEndpoints == nil {
+		grantEndpoints = make(map[string]*endpointRecord)
+		b.grantEndpoints[endpoint.GrantID] = grantEndpoints
+	}
+	grantEndpoints[endpoint.ID] = endpoint
+}
+
+func (b *Broker) ensureEndpointCapacityLocked(needed int, now time.Time) bool {
+	if len(b.endpoints)+needed <= b.config.MaxEndpoints {
 		return true
 	}
-	b.cleanupLocked(now)
-	return len(b.refresh)+needed <= b.config.MaxCredentials
+	b.cleanupEndpointsLocked(now)
+	return len(b.endpoints)+needed <= b.config.MaxEndpoints
 }
 
-func (b *Broker) cleanupLocked(now time.Time) {
+func (b *Broker) revokeGrantLocked(grantID string, now time.Time) {
+	grant := b.grants[grantID]
+	if grant == nil || !grant.RevokedAt.IsZero() {
+		return
+	}
+	grant.RevokedAt = now
+	for _, endpoint := range b.grantEndpoints[grantID] {
+		if endpoint.RevokedAt.IsZero() {
+			endpoint.RevokedAt = now
+		}
+	}
+}
+
+func (b *Broker) deleteClaimLocked(claimID string, claim *pairingClaim) {
+	delete(b.claims, claimID)
+	if b.claimSecrets[claim.SecretHash] == claimID {
+		delete(b.claimSecrets, claim.SecretHash)
+	}
+}
+
+func (b *Broker) cleanupClaimsLocked(now time.Time) {
 	for claimID, claim := range b.claims {
 		if !now.Before(claim.ExpiresAt) {
-			delete(b.claims, claimID)
-		}
-	}
-	for hash, record := range b.refresh {
-		if record.Revoked || !now.Before(record.ExpiresAt) {
-			delete(b.refresh, hash)
+			b.deleteClaimLocked(claimID, claim)
 		}
 	}
 }
 
-func randomToken(prefix string, byteCount int) (string, error) {
-	value := make([]byte, byteCount)
-	if _, err := rand.Read(value); err != nil {
-		return "", fmt.Errorf("generate random token: %w", err)
+func (b *Broker) cleanupEndpointsLocked(now time.Time) {
+	expiredGrants := make(map[string]struct{})
+	for _, endpoint := range b.endpoints {
+		if !endpoint.RevokedAt.IsZero() || now.Before(endpoint.RefreshInactiveExpiresAt) {
+			continue
+		}
+		if endpoint.EndpointKind == "host" {
+			expiredGrants[endpoint.GrantID] = struct{}{}
+		} else {
+			endpoint.RevokedAt = now
+		}
 	}
-	return prefix + base64.RawURLEncoding.EncodeToString(value), nil
+	for grantID := range expiredGrants {
+		b.revokeGrantLocked(grantID, now)
+	}
+	for endpointID, endpoint := range b.endpoints {
+		if endpoint.RevokedAt.IsZero() || now.Before(endpoint.RevokedAt.Add(endpointTombstoneRetention)) {
+			continue
+		}
+		delete(b.endpoints, endpointID)
+		delete(b.refresh, endpoint.RefreshHash)
+		grantEndpoints := b.grantEndpoints[endpoint.GrantID]
+		delete(grantEndpoints, endpointID)
+		if len(grantEndpoints) == 0 {
+			delete(b.grantEndpoints, endpoint.GrantID)
+			if grant := b.grants[endpoint.GrantID]; grant != nil && !grant.RevokedAt.IsZero() {
+				delete(b.grants, endpoint.GrantID)
+			}
+		}
+	}
+}
+
+func validSecret(value, prefix string) bool {
+	if !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	encoded := strings.TrimPrefix(value, prefix)
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	return err == nil && len(decoded) == secretByteCount && base64.RawURLEncoding.EncodeToString(decoded) == encoded
+}
+
+func randomIdentifier() (string, error) {
+	value := make([]byte, 18)
+	if _, err := rand.Read(value); err != nil {
+		return "", fmt.Errorf("generate random identifier: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(value), nil
 }

@@ -1,47 +1,69 @@
 # Relay Credential Service POC
 
-This Go service proves the account-free credential flow for the Volt-operated iroh relay fleet. It is a credential broker, not a user account service.
+This Go service proves the account-free credential flow for the Volt-operated Iroh relay fleet. It is a credential broker, not a user account service.
 
-The POC:
+The POC now implements the accepted protocol in [Managed relay credentials production design](../../../docs/managed-relay-credentials-design.md):
 
-- creates short-lived pairing claims for daemon Iroh node IDs;
-- requires an app-attestation check before a phone can approve a claim;
-- gives the app and daemon separate credentials;
-- issues short-lived Ed25519 JWT access tokens bound to each endpoint's Iroh node ID;
-- stores opaque refresh credentials only as SHA-256 hashes after claim delivery;
-- supports refresh and endpoint-local revocation;
-- publishes the relay verification key as JWKS;
-- includes a pinned `iroh-relay 1.0.3` JWT `AccessControl` patch and reproducible canary build script; and
-- uses only the Go standard library in the credential-service runtime.
+- one daemon identity grant with one host endpoint and multiple app endpoints;
+- client-generated pairing and refresh secrets, with only SHA-256 hashes sent during enrollment;
+- separate node-bound host and app access JWTs;
+- stable refresh secrets with a sliding inactivity expiry;
+- endpoint-local, host-authorized app, and grant-wide revocation;
+- short-lived Ed25519 JWTs bound to each endpoint's Iroh node ID;
+- a public JWKS endpoint; and
+- a pinned `iroh-relay 1.0.3` JWT `AccessControl` patch and reproducible canary build script.
 
 ## Status and production blockers
 
-This is intentionally not production-ready:
+This remains an in-memory protocol POC, not a production service:
 
-- Firebase mode verifies limited-use App Check tokens against Firebase's cached RS256 JWKS, exact project authority, and an explicit app-ID allowlist, then consumes each `jti` once. The replay store is in memory and therefore is neither durable nor shared across service instances; production must make limited-use-token consumption atomic across the deployment.
-- Pairing approval quotas need a pseudonymous, scarce app-install or device abuse principal; a Firebase app ID alone is not sufficient. This is abuse control, not a user account.
-- Pairing claims and refresh records are in memory. A restart invalidates refresh credentials. Production storage must be durable, transactional across service instances, and continue storing refresh secrets only as hashes.
-- Refresh credentials rotate when a claim response is redelivered, but ordinary refresh does not rotate. Production refresh should rotate on every use and reject reuse.
-- The service needs edge rate limits, request budgets, audit events, and grant-wide administrative revocation. Its in-process concurrency and per-refresh limits are only defense in depth.
-- The app and daemon must refresh before expiry and atomically update the relay bearer credential on their live Iroh endpoint, or rebind while preserving the endpoint identity. This capability must be verified in both current Iroh bindings before short-lived tokens can replace the static token.
-- Signing-key custody and rotation need KMS/HSM-backed storage, overlapping current and previous keys in JWKS, and a documented compromise-recovery path.
-- The stock `iroh-relay` binary cannot use these JWTs through `access.shared_token`. The canary patch adds a custom `AccessControl`, but production still needs reviewed key rotation, metrics, rollout, and artifact publication.
+- Pairing claims, grants, endpoints, and refresh hashes are process-local. A restart invalidates them. Production replaces the maps with Cloud SQL PostgreSQL transactions.
+- Firebase mode verifies limited-use App Check tokens and consumes each `jti` once, but its replay store is process-local. Production consumes a `jti` atomically in the same PostgreSQL transaction as approval.
+- Production should use the Firebase Admin Go verifier instead of maintaining the custom RS256/JWKS verifier.
+- The service still needs managed HTTPS deployment, edge rate limits, request budgets, secret-free monitoring, readiness checks, migrations, backup/restore verification, and administrative procedures.
+- Signing still uses one mode-`0600` local Ed25519 seed. Production uses Cloud KMS and an overlapping active/retiring relay key set.
+- The relay canary accepts the JWT shape, but production relays still need multi-key configuration, metrics, rollout, and artifact publication.
+- Normal daemon claim creation/exchange and normal confirmed iOS approval are the next implementation step. The existing credential-file and Debug canary bootstrap clients speak the prior POC protocol and are intentionally not compatible with this revised service.
 
 Do not expose this POC to the public internet or use its development App Check token in an app build.
 
+## Grant model
+
+A grant follows one persistent daemon Iroh identity:
+
+```text
+daemon identity grant
+  host endpoint
+  app endpoint A
+  app endpoint B
+```
+
+Daemon restart, Volt upgrade, workspace changes, and pairing another phone retain the grant. Deleting the daemon identity/credential state creates a new grant.
+
+Initial approval creates the grant, host endpoint, and first app endpoint atomically. Later claims authenticate with the existing host refresh secret and add only another app endpoint. The host endpoint remains unchanged.
+
+Each app can revoke itself. The host can revoke one app endpoint or the complete grant. Revoking the host refresh secret also revokes the complete grant.
+
 ## Account-free flow
 
-1. The daemon creates a claim for its persistent Iroh node ID. It retains `claimSecret`; the QR contains `claimId`, not `claimSecret`.
-2. The app scans the QR, generates and retains a 32-byte `deliverySecret`, then approves `claimId` with that secret, a limited-use App Check token, and its persistent Iroh node ID.
-3. The app receives an app-bound access/refresh credential pair.
-4. The daemon polls the claim exchange endpoint using `claimSecret` and receives a different host-bound access/refresh pair.
-5. Each endpoint presents its access JWT to the relay as the existing relay bearer token.
-6. The relay validates the JWT and requires JWT `sub` to equal the cryptographically proven Iroh endpoint ID.
-7. App and daemon refresh their own access JWTs over HTTPS without user interaction.
+### Initial enrollment
 
-Repeating approval or exchange rotates that endpoint's previously delivered refresh credential instead of replaying the same plaintext secret. App redelivery requires the original client-generated `deliverySecret`; host redelivery requires `claimSecret`. A prior access JWT remains usable by its same bound node until its short expiry. Production delivery should additionally use a client-bound encrypted envelope so reliable retries never depend on returning plaintext from durable state.
+1. The daemon generates and durably stores a `vpc_` claim secret and `vrr_` host refresh secret.
+2. The daemon creates a bootstrap claim with its node ID and the SHA-256 hashes of those secrets. The broker returns only `claimId` and `expiresAt`.
+3. The reviewed app-facing pairing payload carries `claimId`, never either plaintext daemon secret.
+4. The app generates and stores its own `vrr_` refresh secret, obtains a limited-use App Check token, and approves the claim with its endpoint node ID and refresh-secret hash.
+5. Approval creates one grant plus separate host/app endpoint records and returns only an app access JWT.
+6. The daemon polls exchange with its claim secret and receives only a host access JWT. Its pre-persisted host refresh secret is now active.
+7. Each endpoint presents its access JWT to the relay. The relay requires JWT `sub` to equal the Iroh-handshake-proven endpoint ID.
 
-Possession of a JWT or refresh credential for one endpoint does not authorize another endpoint because the relay enforces the node-ID binding.
+### Later phone pairing
+
+1. The daemon creates a claim authenticated by its existing host refresh secret.
+2. The app approves with a new app endpoint node ID and app refresh-secret hash.
+3. The broker adds the app endpoint to the existing grant.
+4. Exchange returns the same host endpoint/grant IDs and identifies the newly approved app endpoint.
+
+Refresh never returns or changes the refresh secret. It issues a new access JWT and extends the endpoint's inactivity expiry. Exact approval/exchange retries preserve endpoint and grant identity while issuing a fresh access JWT.
 
 ## Run locally
 
@@ -56,47 +78,54 @@ go run ./cmd/relay-credential-service
 
 The default listener and issuer are local-only: `127.0.0.1:8085` and `http://127.0.0.1:8085`. The service creates `./data/relay-credential-signing-key` with mode `0600`.
 
-Run the test suite:
+Run validation:
 
 ```sh
 go test ./...
 go vet ./...
 ```
 
-## Exercise the flow
+## Exercise initial enrollment
 
-This example uses placeholder canonical node IDs. Keep the development App Check token in the shell that started the service.
+The following commands print credentials and are only for an isolated local POC.
 
 ```sh
 HOST_NODE_ID="$(printf 'a%.0s' $(seq 1 64))"
 APP_NODE_ID="$(printf 'b%.0s' $(seq 1 64))"
-APP_DELIVERY_SECRET="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+CLAIM_SECRET="vpc_$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+HOST_REFRESH_TOKEN="vrr_$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+APP_REFRESH_TOKEN="vrr_$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
 BASE_URL="http://127.0.0.1:8085"
 
-CLAIM="$({ curl -sS -X POST "$BASE_URL/v1/pairing-claims" \
+hash_secret() {
+  printf '%s' "$1" | openssl dgst -sha256 -binary \
+    | openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+CLAIM="$(curl -sS -X POST "$BASE_URL/v1/pairing-claims" \
   -H 'Content-Type: application/json' \
-  -d "{\"hostNodeId\":\"$HOST_NODE_ID\"}"; })"
+  -d "{\"hostNodeId\":\"$HOST_NODE_ID\",\"claimSecretHash\":\"$(hash_secret "$CLAIM_SECRET")\",\"hostRefreshTokenHash\":\"$(hash_secret "$HOST_REFRESH_TOKEN")\"}")"
 CLAIM_ID="$(printf '%s' "$CLAIM" | jq -r .claimId)"
-CLAIM_SECRET="$(printf '%s' "$CLAIM" | jq -r .claimSecret)"
 
 # Returns 202 until an attested app approves the claim.
 curl -i -X POST "$BASE_URL/v1/pairing-claims/$CLAIM_ID/exchange" \
   -H "Authorization: Bearer $CLAIM_SECRET"
 
-APP_CREDENTIALS="$({ curl -sS -X POST "$BASE_URL/v1/pairing-claims/$CLAIM_ID/approve" \
+APP_CREDENTIAL="$(curl -sS -X POST "$BASE_URL/v1/pairing-claims/$CLAIM_ID/approve" \
   -H 'Content-Type: application/json' \
   -H "X-Firebase-AppCheck: $VOLT_DEVELOPMENT_APP_CHECK_TOKEN" \
-  -d "{\"appNodeId\":\"$APP_NODE_ID\",\"deliverySecret\":\"$APP_DELIVERY_SECRET\"}"; })"
+  -d "{\"appNodeId\":\"$APP_NODE_ID\",\"appRefreshTokenHash\":\"$(hash_secret "$APP_REFRESH_TOKEN")\"}")"
 
-HOST_CREDENTIALS="$({ curl -sS -X POST "$BASE_URL/v1/pairing-claims/$CLAIM_ID/exchange" \
-  -H "Authorization: Bearer $CLAIM_SECRET"; })"
+HOST_CREDENTIAL="$(curl -sS -X POST "$BASE_URL/v1/pairing-claims/$CLAIM_ID/exchange" \
+  -H "Authorization: Bearer $CLAIM_SECRET")"
 
-printf '%s\n' "$APP_CREDENTIALS" | jq
-printf '%s\n' "$HOST_CREDENTIALS" | jq
+printf '%s\n' "$APP_CREDENTIAL" | jq
+printf '%s\n' "$HOST_CREDENTIAL" | jq
+
+curl -sS -X POST "$BASE_URL/v1/tokens/refresh" \
+  -H "Authorization: Bearer $HOST_REFRESH_TOKEN" | jq
 curl -sS "$BASE_URL/.well-known/jwks.json" | jq
 ```
-
-Do not print credentials in production logs. The commands above are only for an isolated local POC.
 
 For Firebase-backed verification, omit the development token and configure the exact Firebase authority and allowlist:
 
@@ -107,39 +136,22 @@ export VOLT_ALLOWED_FIREBASE_APP_IDS=1:546623825529:ios:9f5a707e3f4ef89154d6a8
 go run ./cmd/relay-credential-service
 ```
 
-Firebase mode requires limited-use tokens with a `jti`, caches bounded JWKS responses, throttles attacker-triggered unknown-key refreshes, and rejects replayed `jti` values. The production service still requires HTTPS and a durable shared replay store.
-
-## App-facing pairing tickets
-
-A daemon credential is node-bound and must not be transferred to the app, including through process launch arguments. Pipe a locally generated pairing ticket through the stdin-only sanitizer before rendering a QR or launching the Debug simulator:
-
-```sh
-APP_TICKET="$(printf '%s' "$HOST_TICKET" | go run ./cmd/sanitize-pairing-ticket)"
-```
-
-The sanitizer preserves the one-time pairing secret and all non-credential fields but removes `relayAuthToken`. Managed-credential daemons now omit their host JWT from generated pairing tickets directly; the sanitizer remains a fail-closed boundary for older/manual ticket sources. The app obtains its own node-bound JWT before binding Iroh. Do not pass an unsanitized ticket as a command argument because process inspection can expose it.
-
-To start a daemon with the complete host exchange response, keep the response in a mode-`0600` file and configure both values together:
-
-```sh
-export VOLT_IROH_RELAY_CREDENTIAL_FILE="$HOME/.volt/canary-poc/host-credential.json"
-export VOLT_IROH_RELAY_CREDENTIAL_SERVICE=http://127.0.0.1:18085
-unset VOLT_IROH_RELAY_AUTH_TOKEN
-```
-
-The daemon verifies that the credential's node ID matches its persistent Iroh identity, refreshes before access-token expiry, replaces each live relay configuration with `Endpoint.insertRelay`, and persists the refreshed credential in its mode-`0600` state. Revoke it explicitly with `volt remote credential revoke`; normal daemon shutdown intentionally preserves it for restart.
+Firebase mode requires limited-use tokens with a `jti`, caches bounded JWKS responses, throttles attacker-triggered unknown-key refreshes, and rejects replayed `jti` values. The replay barrier remains process-local until the PostgreSQL step.
 
 ## HTTP contract
 
 | Route | Authorization | Result |
 | --- | --- | --- |
-| `POST /v1/pairing-claims` | Public, edge-rate-limited in production | Creates `{claimId, claimSecret, expiresAt}` for `{hostNodeId}`. |
-| `POST /v1/pairing-claims/{id}/approve` | Exactly one `X-Firebase-AppCheck` header | Approves with `{appNodeId,deliverySecret}` and returns app credentials. A retry requires the same delivery secret and rotates the prior app refresh credential. |
-| `POST /v1/pairing-claims/{id}/exchange` | Exactly one bearer `claimSecret` header | Returns `202` while pending, then host credentials. A retry rotates the prior host refresh credential. |
-| `POST /v1/tokens/refresh` | Exactly one bearer refresh-credential header | Returns a new access JWT, subject to a per-credential minimum interval. Body must be empty. |
-| `POST /v1/tokens/revoke` | Exactly one bearer refresh-credential header | Revokes that endpoint's future refreshes. Body must be empty. |
+| `POST /v1/pairing-claims` | None for bootstrap | Creates a claim from `{hostNodeId,claimSecretHash,hostRefreshTokenHash}`. |
+| `POST /v1/pairing-claims` | Host refresh bearer | Creates a later-pairing claim from `{claimSecretHash}` under the existing grant. |
+| `POST /v1/pairing-claims/{id}/approve` | Exactly one App Check header | Approves with `{appNodeId,appRefreshTokenHash}` and returns app endpoint metadata plus an access JWT. |
+| `POST /v1/pairing-claims/{id}/exchange` | Claim-secret bearer | Returns `202` while pending, then host/app endpoint metadata plus a host access JWT. |
+| `POST /v1/tokens/refresh` | Endpoint refresh bearer | Extends inactivity and returns a new access JWT. Body must be empty. |
+| `POST /v1/tokens/revoke` | Endpoint refresh bearer | Idempotently revokes that app endpoint; a host endpoint revokes the complete grant. |
+| `POST /v1/grant/endpoints/revoke` | Host refresh bearer | Idempotently revokes one app `{endpointId}` in the host's grant. |
+| `POST /v1/grant/revoke` | Host refresh bearer | Idempotently revokes the complete daemon identity grant. Body must be empty. |
 | `GET /.well-known/jwks.json` | Public | Returns the Ed25519 public verification key. |
-| `GET /healthz` | Public | Liveness response. |
+| `GET /healthz` | Public | Returns liveness only. |
 
 Access JWT claims:
 
@@ -153,22 +165,34 @@ Access JWT claims:
   "jti": "<random-id>",
   "scope": "relay:connect",
   "endpoint_kind": "app",
-  "grant_id": "<anonymous-pairing-grant-id>"
+  "grant_id": "<daemon-identity-grant-id>"
 }
 ```
 
 The JWT contains no user identity.
 
+## Pairing-ticket boundary
+
+A host credential is node-bound and must not be transferred to the app. Pipe any manually generated ticket through the stdin-only sanitizer before rendering or passing it to simulator tooling:
+
+```sh
+APP_TICKET="$(printf '%s' "$HOST_TICKET" | go run ./cmd/sanitize-pairing-ticket)"
+```
+
+The sanitizer preserves the existing one-time pairing secret and non-credential fields but removes `relayAuthToken`. The final daemon flow will add `claimId` directly to the reviewed pairing payload and will never serialize the host access or refresh credential.
+
+Do not pass unsanitized tickets or credentials as process arguments.
+
 ## Canary relay integration
 
-The current canary is:
+The current relay canary is:
 
 ```text
 https://iroh-relay-us-central-canary.volt-cli.dev
 172.234.196.84
 ```
 
-The canary now runs the JWT-only custom binary built from upstream commit `f2eb930dda3779c6d852b72f3712aacd6e573ab1` (`v1.0.3`) plus `relay-patch/iroh-relay-1.0.3-jwt-access.patch`. Its configured audience is `volt-iroh-relay-canary`; production remains unchanged.
+It runs the JWT-only custom binary built from upstream commit `f2eb930dda3779c6d852b72f3712aacd6e573ab1` (`v1.0.3`) plus `relay-patch/iroh-relay-1.0.3-jwt-access.patch`. Its configured audience is `volt-iroh-relay-canary`; production remains unchanged.
 
 Build and validate the patch with pinned Rust, Zig, cargo-zigbuild, and LLVM versions:
 
@@ -177,59 +201,29 @@ Build and validate the patch with pinned Rust, Zig, cargo-zigbuild, and LLVM ver
 ./relay-patch/build.sh linux-x86_64 /tmp/iroh-relay-1.0.3-volt-jwt
 ```
 
-The Linux build writes a sidecar manifest containing the source commit, patch/tool versions, and hashes, and atomically publishes a stripped glibc-2.28-compatible binary. The current canary binary SHA-256 is `7917f468dd81dee9c412eaf99de9cd35df75e5efd04d4e06091c695af234fc11`.
+The Linux build writes a sidecar manifest containing source, patch/tool versions, and hashes. The current canary binary SHA-256 is `7917f468dd81dee9c412eaf99de9cd35df75e5efd04d4e06091c695af234fc11`.
 
-The canary patch also fails closed on missing, misspelled, unknown, or explicitly open non-development access configuration. It caps pending TLS/upgrade/authentication work at 64 connections with a 10-second deadline, caps HTTP establishment headers/buffering, and independently caps concurrent JWT verification plus admitted global/node/grant connections.
+The relay access check requires one bearer JWT, selects the configured Ed25519 key by `kid`, validates issuer/audience/scope/time bounds, requires canonical `sub` equal to the proven endpoint ID, and enforces node/grant/global connection limits. It fails closed on malformed tokens or invalid access configuration. Production key rotation requires a configured set of active and retiring keys rather than the canary's single key.
 
-Recent `iroh-relay` exposes `iroh_relay::server::AccessControl`. Its `ClientRequest` provides raw request headers plus the Iroh-handshake-proven `endpoint_id()`. The relay fork's access check:
-
-1. Inspect raw headers and require exactly one `Authorization: Bearer <JWT>` header. Reject duplicate/comma-combined authorization fields and every `token` query parameter; do not use the permissive `auth_token()` fallback.
-2. Select an allowlisted Ed25519 key by `kid`; reject unknown algorithms and keys.
-3. Verify the signature locally using a bounded, cached JWKS key set with last-known-good rotation behavior.
-4. Require the configured `iss`, `aud`, `scope == "relay:connect"`, mandatory `iat`/`exp`, bounded clock skew, and `exp - iat <= 1 hour` even when a correctly signed token claims a longer lifetime.
-5. Require canonical JWT `sub == request.endpoint_id().to_string()`.
-6. Require `endpoint_kind` to be `app` or `host`.
-7. Enforce mandatory per-node, per-grant, and global concurrent-connection limits, keyed by the relay `ConnectionId`, and decrement them in `on_disconnect`.
-8. Denies closed on malformed tokens, stale verification configuration, or exhausted limits.
-
-The configured canary access table is:
-
-```toml
-[access.jwt]
-public_key = "<JWKS x>"
-key_id = "<JWKS kid>"
-issuer = "https://iroh-credentials-canary.volt-cli.dev"
-audience = "volt-iroh-relay-canary"
-max_token_lifetime_seconds = 3600
-clock_skew_seconds = 30
-max_global_connections = 1024
-max_node_connections = 8
-max_grant_connections = 16
-max_concurrent_verifications = 32
-```
-
-Live canary probes verify that a fresh Go-issued token is admitted only for its bound Iroh endpoint ID; missing credentials and reuse from a different proven endpoint ID are denied. A Debug-only iOS simulator bootstrap has also obtained a real limited-use Firebase App Check token, had it verified by the local Firebase-mode service, received an app-node-bound JWT plus refresh credential, bound to the canary relay, and reconnected from saved-host state while preserving its endpoint identity. Both clients refresh through bounded no-redirect requests and replace live relay configuration without changing endpoint keys; explicit daemon revocation and app Forget revoke the refresh credential. Release/TestFlight and physical-device use still require an HTTPS credential-service deployment.
-
-The relay verifies locally rather than calling the credential service for every connection. Short access-token lifetimes bound revocation delay and keep the credential service out of the relay data path.
-
-See the upstream [`AccessControl` API](https://docs.rs/iroh-relay/latest/iroh_relay/server/trait.AccessControl.html) and [`ClientRequest`](https://docs.rs/iroh-relay/latest/iroh_relay/server/struct.ClientRequest.html).
+Relays verify locally instead of calling the credential service for each connection. Short access-token lifetimes bound revocation delay and keep the broker out of the relay data path.
 
 ## Configuration
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
-| `VOLT_CREDENTIAL_LISTEN` | `127.0.0.1:8085` | HTTP listen address. Put TLS at a trusted reverse proxy for the POC. |
+| `VOLT_CREDENTIAL_LISTEN` | `127.0.0.1:8085` | HTTP listen address. |
 | `VOLT_CREDENTIAL_ISSUER` | `http://127.0.0.1:8085` | Exact JWT issuer expected by the relay. |
 | `VOLT_CREDENTIAL_AUDIENCE` | `volt-iroh-relay` | Exact JWT audience expected by the relay. |
 | `VOLT_CREDENTIAL_SIGNING_KEY_FILE` | `./data/relay-credential-signing-key` | Persistent mode-`0600` Ed25519 seed file. |
-| `VOLT_APP_CHECK_MODE` | `development` | `development` for a constant-time local token or `firebase` for limited-use Firebase App Check JWTs. |
-| `VOLT_DEVELOPMENT_APP_CHECK_TOKEN` | required in development mode | Development-only app approval token, minimum 32 characters. |
-| `VOLT_FIREBASE_PROJECT_NUMBER` | required in Firebase mode | Decimal Firebase project number used for exact issuer and audience checks. |
-| `VOLT_ALLOWED_FIREBASE_APP_IDS` | required in Firebase mode | Comma-separated exact Firebase app IDs allowed to approve claims. |
-| `VOLT_CREDENTIAL_CLAIM_TTL` | `10m` | Pairing claim lifetime; hard maximum `30m`. |
-| `VOLT_CREDENTIAL_ACCESS_TTL` | `15m` | Relay access JWT lifetime; hard maximum `1h`. |
-| `VOLT_CREDENTIAL_REFRESH_TTL` | `720h` | Refresh credential lifetime; hard maximum `2160h` (90 days). |
-| `VOLT_CREDENTIAL_REFRESH_MIN_INTERVAL` | `5s` | Minimum interval between access-token refreshes for one credential. |
-| `VOLT_CREDENTIAL_MAX_CLAIMS` | `10000` | In-memory pending/retained claim cap. |
-| `VOLT_CREDENTIAL_MAX_CREDENTIALS` | `100000` | In-memory refresh-record cap. |
-| `VOLT_CREDENTIAL_MAX_CONCURRENT_REQUESTS` | `64` | In-process HTTP concurrency cap; not a substitute for edge controls. |
+| `VOLT_APP_CHECK_MODE` | `development` | `development` or `firebase`. |
+| `VOLT_DEVELOPMENT_APP_CHECK_TOKEN` | required in development | Constant-time local approval token, minimum 32 characters. |
+| `VOLT_FIREBASE_PROJECT_NUMBER` | required in Firebase mode | Exact Firebase project authority. |
+| `VOLT_ALLOWED_FIREBASE_APP_IDS` | required in Firebase mode | Comma-separated exact app-ID allowlist. |
+| `VOLT_CREDENTIAL_CLAIM_TTL` | `10m` | Claim lifetime; hard maximum `30m`. |
+| `VOLT_CREDENTIAL_ACCESS_TTL` | `15m` | Access JWT lifetime; hard maximum `1h`. |
+| `VOLT_CREDENTIAL_REFRESH_INACTIVITY_TTL` | `2160h` | Sliding refresh inactivity lifetime; hard maximum 90 days. |
+| `VOLT_CREDENTIAL_REFRESH_MIN_INTERVAL` | `5s` | Minimum access refresh interval per endpoint. |
+| `VOLT_CREDENTIAL_MAX_CLAIMS` | `10000` | In-memory active/retained claim cap. |
+| `VOLT_CREDENTIAL_MAX_ENDPOINTS` | `100000` | In-memory endpoint/tombstone cap. |
+| `VOLT_CREDENTIAL_MAX_APP_ENDPOINTS_PER_GRANT` | `8` | Active phone endpoint cap per daemon identity grant. |
+| `VOLT_CREDENTIAL_MAX_CONCURRENT_REQUESTS` | `64` | In-process HTTP concurrency cap; not an edge-control substitute. |
