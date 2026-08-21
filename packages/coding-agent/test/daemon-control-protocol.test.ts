@@ -225,6 +225,7 @@ describe("control protocol framing", () => {
 			sessionId: "s-1",
 			notification: {
 				eventId: "review:one:completed",
+				hostNodeId: "a".repeat(64),
 				kind: "review_completed",
 				title: "Your review is ready",
 				body: "PR #151 completed with 4 findings.",
@@ -245,6 +246,7 @@ describe("control protocol framing", () => {
 			{ ...reviewNotificationRequest.notification, body: "Open /Users/private/review.diff" },
 			{ ...reviewNotificationRequest.notification, workspaceName: "private/path" },
 			{ ...reviewNotificationRequest.notification, workflowId: "w".repeat(129) },
+			{ ...reviewNotificationRequest.notification, hostNodeId: "A".repeat(64) },
 		]) {
 			expect(isControlRequest({ ...reviewNotificationRequest, notification })).toBe(false);
 		}
