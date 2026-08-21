@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { registerOAuthProvider } from "@hansjm10/volt-ai/oauth";
+import { registerOAuthProvider, unregisterOAuthProvider } from "@hansjm10/volt-ai/oauth";
 import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
@@ -457,6 +457,102 @@ describe("AuthStorage", () => {
 					}
 				}
 			});
+		});
+	});
+
+	describe("subscription usage", () => {
+		test("ignores API keys, runtime overrides, and fallback credentials", async () => {
+			const providerId = `usage-api-key-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			const fetchSubscriptionUsage = vi.fn(async () => ({
+				status: "error" as const,
+				error: { code: "unavailable" as const, message: "should not run" },
+			}));
+			registerOAuthProvider({
+				id: providerId,
+				name: "Usage API Key Provider",
+				async login() {
+					throw new Error("Not used in this test");
+				},
+				async refreshToken(credentials) {
+					return credentials;
+				},
+				getApiKey(credentials) {
+					return credentials.access;
+				},
+				fetchSubscriptionUsage,
+			});
+
+			try {
+				authStorage = AuthStorage.inMemory({
+					[providerId]: { type: "api_key", key: "stored-api-key" },
+				});
+				authStorage.setRuntimeApiKey(providerId, "runtime-api-key");
+				authStorage.setFallbackResolver(() => "fallback-api-key");
+
+				expect(await authStorage.fetchSubscriptionUsage(providerId)).toBeUndefined();
+				expect(fetchSubscriptionUsage).not.toHaveBeenCalled();
+			} finally {
+				unregisterOAuthProvider(providerId);
+			}
+		});
+
+		test("refreshes expired OAuth credentials under lock and persists them before fetching usage", async () => {
+			const providerId = `usage-oauth-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			const refreshToken = vi.fn(async (credentials) => ({
+				...credentials,
+				access: "refreshed-access-token",
+				expires: Date.now() + 60_000,
+			}));
+			const fetchSubscriptionUsage = vi.fn(async (_credentials) => ({
+				status: "success" as const,
+				snapshot: {
+					providerId,
+					fetchedAt: Date.now(),
+					limits: [{ id: "session", label: "Session", usedPercent: 25 }],
+				},
+			}));
+			registerOAuthProvider({
+				id: providerId,
+				name: "Usage OAuth Provider",
+				async login() {
+					throw new Error("Not used in this test");
+				},
+				refreshToken,
+				getApiKey(credentials) {
+					return credentials.access;
+				},
+				fetchSubscriptionUsage,
+			});
+			writeAuthJson({
+				[providerId]: {
+					type: "oauth",
+					refresh: "refresh-token",
+					access: "expired-access-token",
+					expires: Date.now() - 10_000,
+				},
+			});
+
+			try {
+				authStorage = AuthStorage.create(authJsonPath);
+				const result = await authStorage.fetchSubscriptionUsage(providerId);
+
+				expect(result).toMatchObject({ status: "success", snapshot: { providerId } });
+				expect(refreshToken).toHaveBeenCalledOnce();
+				expect(fetchSubscriptionUsage).toHaveBeenCalledWith(
+					expect.objectContaining({ access: "refreshed-access-token" }),
+					{},
+				);
+				const persisted = JSON.parse(readFileSync(authJsonPath, "utf-8")) as Record<
+					string,
+					{ access: string; type: string }
+				>;
+				expect(persisted[providerId]).toMatchObject({
+					type: "oauth",
+					access: "refreshed-access-token",
+				});
+			} finally {
+				unregisterOAuthProvider(providerId);
+			}
 		});
 	});
 

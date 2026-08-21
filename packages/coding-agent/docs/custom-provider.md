@@ -314,6 +314,11 @@ volt.registerProvider("corporate-ai", {
       return credentials.access;
     },
 
+    // Optional: expose normalized quota windows through /usage
+    async fetchSubscriptionUsage(credentials, options) {
+      return fetchCorporateUsage(credentials.access, options?.signal);
+    },
+
     // Optional: modify models based on user's subscription
     modifyModels(models, credentials) {
       const region = decodeRegionFromToken(credentials.access);
@@ -326,7 +331,7 @@ volt.registerProvider("corporate-ai", {
 });
 ```
 
-After registration, users can authenticate via `/login corporate-ai`.
+After registration, users can authenticate via `/login corporate-ai`. If `fetchSubscriptionUsage` is provided, stored OAuth credentials for the provider also appear in `/usage`. The callback must return `SubscriptionUsageResult`: either a provider-neutral snapshot or a safe categorized error. Snapshot percentages are used percentages clamped to 0–100, timestamps are epoch milliseconds, and raw provider payloads or identity fields must not be returned.
 
 ### OAuthLoginCallbacks
 
@@ -681,6 +686,10 @@ interface ProviderConfig {
     login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
     refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials>;
     getApiKey(credentials: OAuthCredentials): string;
+    fetchSubscriptionUsage?(
+      credentials: OAuthCredentials,
+      options?: SubscriptionUsageFetchOptions
+    ): Promise<SubscriptionUsageResult>;
     modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
   };
 }

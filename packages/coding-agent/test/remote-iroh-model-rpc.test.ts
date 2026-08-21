@@ -1,7 +1,9 @@
 import type { ThinkingLevel } from "@hansjm10/volt-agent-core";
-import type { Api, Model } from "@hansjm10/volt-ai";
+import type { Api, Model, SubscriptionUsageResult } from "@hansjm10/volt-ai";
+import { registerOAuthProvider, unregisterOAuthProvider } from "@hansjm10/volt-ai/oauth";
 import { describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+import { AuthStorage } from "../src/core/auth-storage.ts";
 import {
 	createTestModel,
 	createTestSession,
@@ -254,5 +256,118 @@ describe("Iroh remote model RPC", () => {
 
 		recv.end();
 		await expect(modePromise).resolves.toBeUndefined();
+	});
+
+	test("returns normalized subscription quota usage to authorized remote clients", async () => {
+		const providerId = `remote-usage-${Date.now()}`;
+		const fetchedAt = 1_800_000_000_000;
+		const providerResult: SubscriptionUsageResult = {
+			status: "success",
+			snapshot: {
+				providerId,
+				fetchedAt,
+				plan: "team_plan",
+				limits: [
+					{
+						id: "weekly",
+						label: "Weekly",
+						usedPercent: 25,
+						resetsAt: fetchedAt + 60_000,
+					},
+				],
+			},
+		};
+		Object.assign(providerResult, { rawPayload: { accountId: "private-account" } });
+		Object.assign(providerResult.snapshot, { accountEmail: "private@example.com" });
+		Object.assign(providerResult.snapshot.limits[0], { rawProviderWindow: { secret: true } });
+		const fetchSubscriptionUsage = vi.fn(async () => providerResult);
+		registerOAuthProvider({
+			id: providerId,
+			name: "Remote Usage",
+			async login() {
+				throw new Error("Not used in this test");
+			},
+			async refreshToken(credentials) {
+				return credentials;
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+			fetchSubscriptionUsage,
+		});
+
+		const authStorage = AuthStorage.inMemory({
+			[providerId]: {
+				type: "oauth",
+				access: "access-token",
+				refresh: "refresh-token",
+				expires: 1_900_000_000_000,
+			},
+		});
+		const session = {
+			...createTestSession("session-usage", null),
+			model: createTestModel("usage-model", { provider: providerId }),
+			modelRegistry: { authStorage },
+		};
+		const runtimeHost = {
+			...createStableSessionRunner(() => session),
+			session,
+			dispose: vi.fn(async () => {}),
+			setRebindSession: vi.fn(),
+		} as unknown as AgentSessionRuntime;
+		const { modePromise, recv, send } = await startIrohRpcMode(runtimeHost, session);
+
+		try {
+			recv.pushLine(JSON.stringify({ id: "usage-1", type: "get_subscription_usage" }));
+			recv.pushLine(JSON.stringify({ id: "usage-2", type: "get_subscription_usage" }));
+			await vi.waitFor(() => {
+				const responses = parseWrittenObjects(send).filter(
+					(record) => record.type === "response" && record.command === "get_subscription_usage",
+				);
+				expect(responses).toHaveLength(2);
+			});
+
+			const responses = parseWrittenObjects(send).filter(
+				(record) => record.type === "response" && record.command === "get_subscription_usage",
+			);
+			expect(responses[0]).toEqual({
+				id: "usage-1",
+				type: "response",
+				command: "get_subscription_usage",
+				success: true,
+				data: {
+					status: "providers",
+					providers: [
+						{
+							providerId,
+							result: {
+								status: "success",
+								snapshot: {
+									providerId,
+									fetchedAt,
+									plan: "team_plan",
+									limits: [
+										{
+											id: "weekly",
+											label: "Weekly",
+											usedPercent: 25,
+											resetsAt: fetchedAt + 60_000,
+										},
+									],
+								},
+							},
+						},
+					],
+				},
+			});
+			expect(JSON.stringify(responses)).not.toContain("private@example.com");
+			expect(JSON.stringify(responses)).not.toContain("private-account");
+			expect(JSON.stringify(responses)).not.toContain("rawProviderWindow");
+			expect(fetchSubscriptionUsage).toHaveBeenCalledOnce();
+		} finally {
+			recv.end();
+			await modePromise;
+			unregisterOAuthProvider(providerId);
+		}
 	});
 });

@@ -51,6 +51,12 @@ export type {
 	OAuthProviderInterface,
 	OAuthSelectOption,
 	OAuthSelectPrompt,
+	SubscriptionUsageError,
+	SubscriptionUsageErrorCode,
+	SubscriptionUsageFetchOptions,
+	SubscriptionUsageLimit,
+	SubscriptionUsageResult,
+	SubscriptionUsageSnapshot,
 } from "./utils/oauth/types.ts";
 export * from "./utils/overflow.ts";
 export * from "./utils/tool-tokens.ts";

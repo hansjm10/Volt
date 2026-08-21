@@ -7,6 +7,7 @@
 
 import type { Server } from "node:http";
 import { getProviderEnvValue } from "../provider-env.ts";
+import { fetchAnthropicSubscriptionUsage } from "./anthropic-usage.ts";
 import { oauthErrorHtml, oauthSuccessHtml } from "./oauth-page.ts";
 import { generatePKCE } from "./pkce.ts";
 import type { OAuthCredentials, OAuthLoginCallbacks, OAuthPrompt, OAuthProviderInterface } from "./types.ts";
@@ -400,4 +401,6 @@ export const anthropicOAuthProvider: OAuthProviderInterface = {
 	getApiKey(credentials: OAuthCredentials): string {
 		return credentials.access;
 	},
+
+	fetchSubscriptionUsage: fetchAnthropicSubscriptionUsage,
 };

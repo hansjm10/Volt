@@ -1695,6 +1695,9 @@ volt.registerProvider("corporate-ai", {
     },
     getApiKey(credentials) {
       return credentials.access;
+    },
+    async fetchSubscriptionUsage(credentials, options) {
+      return fetchCorporateUsage(credentials.access, options?.signal);
     }
   }
 });
@@ -1708,7 +1711,7 @@ volt.registerProvider("corporate-ai", {
 - `headers` - Custom headers to include in requests.
 - `authHeader` - If true, adds `Authorization: Bearer` header automatically.
 - `models` - Array of model definitions. If provided, replaces all existing models for this provider. Model definitions can set `baseUrl` to override the provider endpoint for that model.
-- `oauth` - OAuth provider config for `/login` support. When provided, the provider appears in the login menu.
+- `oauth` - OAuth provider config for `/login` support. When provided, the provider appears in the login menu. Add `fetchSubscriptionUsage(credentials, options)` to expose normalized quota windows through `/usage`; return `SubscriptionUsageResult` and omit raw payloads and identity fields.
 - `streamSimple` - Custom streaming implementation for non-standard APIs.
 
 See [custom-provider.md](custom-provider.md) for advanced topics: custom streaming APIs, OAuth details, model definition reference.

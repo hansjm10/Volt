@@ -133,6 +133,7 @@ import type {
 	RpcTranscriptToolStatusSchema,
 	RpcWebSearchStatusSchema,
 } from "./schema/session.ts";
+import type { RpcSubscriptionUsageReportSchema } from "./schema/subscription-usage.ts";
 import type {
 	UiActionArgumentDescriptorSchema,
 	UiActionArgumentTypeSchema,
@@ -309,6 +310,7 @@ export type RpcSlashCommand = Static<typeof RpcSlashCommandSchema>;
 // ============================================================================
 
 export type RpcSessionListItem = Static<typeof RpcSessionListItemSchema>;
+export type RpcSubscriptionUsageReport = Static<typeof RpcSubscriptionUsageReportSchema>;
 /** Path-free host-observed metadata for one active session worktree. */
 export type RpcGitContext = Static<typeof RpcGitContextSchema>;
 export type RpcActiveToolExecution = Static<typeof RpcActiveToolExecutionSchema>;

@@ -54,6 +54,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "copy", description: "Copy last agent message to clipboard" },
 	SESSION_RENAME_SLASH_COMMAND,
 	{ name: "session", description: "Show session info and stats" },
+	{ name: "usage", description: "Show remaining subscription quota and reset times" },
 	{ name: "lsp", description: "Show LSP server status (/lsp restart, /lsp trace [path|off])" },
 	{ name: "mcp", description: "Show MCP server status (/mcp connect|disconnect|refresh <server>)" },
 	{ name: "changelog", description: "Show changelog entries" },
