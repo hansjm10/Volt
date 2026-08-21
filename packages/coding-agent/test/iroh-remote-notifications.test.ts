@@ -81,6 +81,8 @@ vi.mock("../src/core/review.ts", async (importOriginal) => {
 
 import { runIrohRemoteRpcMode } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
 
+const TEST_HOST_NODE_ID = "a".repeat(64);
+
 function createStableSessionRunner<TSession>(getSession: () => TSession) {
 	return {
 		async runWithStableSession<TResult>(
@@ -317,10 +319,11 @@ describe("Iroh remote notification requests", () => {
 				pushTargetId: "relay-target-1",
 				pushTargetAuthToken: "relay-target-auth-token",
 				eventId: "event-1",
+				hostNodeId: TEST_HOST_NODE_ID,
 				kind: "conversation_completed",
 				title: "Volt finished",
 				body: "Your conversation is ready.",
-				data: { eventId: "event-1", kind: "conversation_completed" },
+				data: { eventId: "event-1", hostNodeId: TEST_HOST_NODE_ID, kind: "conversation_completed" },
 			}),
 		).resolves.toEqual({ status: "sent" });
 
@@ -340,6 +343,7 @@ describe("Iroh remote notification requests", () => {
 			pushTargetId: "relay-target-1",
 			pushTargetAuthToken: "relay-target-auth-token",
 			eventId: "event-1",
+			hostNodeId: TEST_HOST_NODE_ID,
 		});
 	});
 
@@ -356,10 +360,11 @@ describe("Iroh remote notification requests", () => {
 				pushTargetId: "relay-target-1",
 				pushTargetAuthToken: "relay-target-auth-token",
 				eventId: "event-1",
+				hostNodeId: TEST_HOST_NODE_ID,
 				kind: "conversation_completed",
 				title: "Volt finished",
 				body: "Your conversation is ready.",
-				data: { eventId: "event-1", kind: "conversation_completed" },
+				data: { eventId: "event-1", hostNodeId: TEST_HOST_NODE_ID, kind: "conversation_completed" },
 			}),
 		).rejects.toThrow("Push relay request failed with HTTP 502 (fcm_send_failed: messaging/invalid-argument)");
 	});
@@ -378,10 +383,11 @@ describe("Iroh remote notification requests", () => {
 			pushTargetId: "relay-target-1",
 			pushTargetAuthToken: "relay-target-auth-token",
 			eventId: "event-1",
+			hostNodeId: TEST_HOST_NODE_ID,
 			kind: "conversation_completed",
 			title: "Volt finished",
 			body: "Your conversation is ready.",
-			data: { eventId: "event-1", kind: "conversation_completed" },
+			data: { eventId: "event-1", hostNodeId: TEST_HOST_NODE_ID, kind: "conversation_completed" },
 		});
 
 		const init = fetcher.mock.calls[0]?.[1];
@@ -409,10 +415,11 @@ describe("Iroh remote notification requests", () => {
 			pushTargetAuthToken: "relay-target-auth-token",
 			relayUrl: "https://attacker.example.test/steal",
 			eventId: "event-1",
+			hostNodeId: TEST_HOST_NODE_ID,
 			kind: "conversation_completed",
 			title: "Volt finished",
 			body: "Your conversation is ready.",
-			data: { eventId: "event-1", kind: "conversation_completed" },
+			data: { eventId: "event-1", hostNodeId: TEST_HOST_NODE_ID, kind: "conversation_completed" },
 		};
 
 		await client.sendNotification(requestWithClientRelayUrl);
@@ -590,12 +597,14 @@ describe("Iroh remote notification requests", () => {
 			pushTargetId: "relay-target-1",
 			pushTargetAuthToken: "relay-target-auth-token",
 			eventId: "conversation:session-one:conversation-run:completed",
+			hostNodeId: TEST_HOST_NODE_ID,
 			kind: "conversation_completed",
 			title: "Volt finished in volt-app",
 			body: "Your conversation is ready.",
 			workspaceName: "volt-app",
 			data: {
 				eventId: "conversation:session-one:conversation-run:completed",
+				hostNodeId: TEST_HOST_NODE_ID,
 				kind: "conversation_completed",
 				sessionId: "session-one",
 				workspaceName: "volt-app",
@@ -660,6 +669,7 @@ describe("Iroh remote notification requests", () => {
 
 		const expectedIntent = {
 			eventId: "plan:session-one:plan-run:ready",
+			hostNodeId: TEST_HOST_NODE_ID,
 			kind: "plan_ready",
 			title: "Your plan is ready",
 			body: "Open Volt to review and approve it.",
@@ -687,6 +697,7 @@ describe("Iroh remote notification requests", () => {
 			pushTargetId: "relay-target-1",
 			pushTargetAuthToken: "relay-target-auth-token",
 			eventId: expectedIntent.eventId,
+			hostNodeId: TEST_HOST_NODE_ID,
 			kind: expectedIntent.kind,
 			title: expectedIntent.title,
 			body: expectedIntent.body,
@@ -694,6 +705,7 @@ describe("Iroh remote notification requests", () => {
 			planId: expectedIntent.planId,
 			data: {
 				eventId: expectedIntent.eventId,
+				hostNodeId: TEST_HOST_NODE_ID,
 				kind: expectedIntent.kind,
 				sessionId: expectedIntent.sessionId,
 				workspaceName: expectedIntent.workspaceName,
@@ -758,6 +770,7 @@ describe("Iroh remote notification requests", () => {
 			expect(relayClient.sendNotification).toHaveBeenCalledWith(
 				expect.objectContaining({
 					eventId: "conversation:session-one:conversation-run:failed",
+					hostNodeId: TEST_HOST_NODE_ID,
 					kind: "host_notice",
 					title: "Volt needs attention in volt-app",
 					body: "Open Volt to view the error.",
@@ -878,7 +891,10 @@ describe("Iroh remote notification requests", () => {
 
 		await vi.waitFor(() =>
 			expect(relayClient.sendNotification).toHaveBeenCalledWith(
-				expect.objectContaining({ eventId: "conversation:session-one:conversation-run:completed" }),
+				expect.objectContaining({
+					eventId: "conversation:session-one:conversation-run:completed",
+					hostNodeId: TEST_HOST_NODE_ID,
+				}),
 			),
 		);
 		await expect(modePromise).rejects.toThrow("send closed");
@@ -1437,6 +1453,7 @@ describe("Iroh remote notification requests", () => {
 				{
 					type: "notification_request",
 					eventId: "conversation:session-one:conversation-run:completed",
+					hostNodeId: TEST_HOST_NODE_ID,
 					kind: "conversation_completed",
 					title: "Volt finished in volt-app",
 					body: "Your conversation is ready.",
@@ -1568,6 +1585,7 @@ describe("Iroh remote notification requests", () => {
 				{
 					type: "notification_request",
 					eventId: "conversation:session-one:conversation-run:completed",
+					hostNodeId: TEST_HOST_NODE_ID,
 					kind: "conversation_completed",
 					title: "Volt finished",
 					body: "Your conversation is ready.",
@@ -1618,6 +1636,7 @@ describe("Iroh remote notification requests", () => {
 				{
 					type: "notification_request",
 					eventId: "conversation:session-one:conversation-run:completed",
+					hostNodeId: TEST_HOST_NODE_ID,
 					kind: "conversation_completed",
 					title: "Volt finished",
 					body: "Your conversation is ready.",
@@ -1746,6 +1765,7 @@ describe("Iroh remote notification requests", () => {
 				{
 					type: "notification_request",
 					eventId: "review:reconnect:completed",
+					hostNodeId: TEST_HOST_NODE_ID,
 					kind: "review_completed",
 					title: "Your review is ready",
 					body: "PR #151 completed with no issues found.",
@@ -1799,6 +1819,7 @@ describe("Iroh remote notification requests", () => {
 				{
 					type: "notification_request",
 					eventId: "review:test:completed",
+					hostNodeId: TEST_HOST_NODE_ID,
 					kind: "review_completed",
 					title: "Your review is ready",
 					body: "uncommitted changes completed with 1 finding.",

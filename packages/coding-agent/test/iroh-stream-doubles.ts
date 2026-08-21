@@ -197,7 +197,7 @@ export function createTestSession(sessionId: string, leafId: string | null) {
 
 type TestIrohConversationOptions = Pick<
 	Parameters<typeof runIrohRemoteRpcMode>[1],
-	"buildConversationSnapshot" | "projectConversationExternal"
+	"buildConversationSnapshot" | "hostNodeId" | "projectConversationExternal"
 >;
 
 interface TestConversationRuntimeHost {
@@ -229,6 +229,7 @@ export function createTestIrohConversationOptions(runtimeHost: AgentSessionRunti
 	}
 
 	return {
+		hostNodeId: "a".repeat(64),
 		buildConversationSnapshot: ({ activeAssistant, branchEpoch }) => {
 			const session = testHost.session;
 			return {
@@ -282,6 +283,7 @@ export async function startIrohRpcMode(
 	const modePromise = runIrohRemoteRpcMode(runtimeHost, {
 		...options,
 		buildConversationSnapshot: options.buildConversationSnapshot ?? conversationOptions.buildConversationSnapshot,
+		hostNodeId: options.hostNodeId ?? conversationOptions.hostNodeId,
 		projectConversationExternal:
 			options.projectConversationExternal ?? conversationOptions.projectConversationExternal,
 		rpcGrant: options.rpcGrant ?? createIrohRemotePresetAccess("full").rpcGrant,
