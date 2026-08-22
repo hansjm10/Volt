@@ -19,6 +19,8 @@ export interface IrohWatchHandleLike {
 	stop(): Promise<void>;
 }
 
+export type IrohAddrWatchCallback = (errorOrAddr: unknown, addr?: IrohEndpointAddrLike) => void;
+
 export interface IrohSecretKeyLike {
 	toBytes(): number[];
 }
@@ -30,7 +32,7 @@ export interface IrohEndpointLike {
 	close(): Promise<void>;
 	insertRelay?(config: IrohRelayConfigLike): Promise<void>;
 	removeRelay?(url: string): Promise<boolean>;
-	watchAddr?(callback: (addr: IrohEndpointAddrLike) => void): IrohWatchHandleLike;
+	watchAddr?(callback: IrohAddrWatchCallback): IrohWatchHandleLike;
 	acceptNext(): Promise<IrohIncomingLike | null | undefined>;
 	secretKey(): IrohSecretKeyLike;
 }

@@ -1,14 +1,18 @@
-import type { IrohEndpointAddrLike, IrohWatchHandleLike } from "./iroh-native.ts";
+import type { IrohAddrWatchCallback, IrohEndpointAddrLike, IrohWatchHandleLike } from "./iroh-native.ts";
 
 export const IROH_RELAY_RECOVERY_DELAY_MS = 15_000;
 export const IROH_RELAY_RECOVERY_RETRY_MS = 30_000;
 
 export interface IrohRelayRecoveryMonitorOptions {
-	watchAddr(callback: (addr: IrohEndpointAddrLike) => void): IrohWatchHandleLike;
+	watchAddr(callback: IrohAddrWatchCallback): IrohWatchHandleLike;
 	recover(): Promise<void>;
 	log(level: "info" | "warn", message: string, details?: Record<string, unknown>): void;
 	recoveryDelayMs?: number;
 	retryDelayMs?: number;
+}
+
+function isIrohEndpointAddrLike(value: unknown): value is IrohEndpointAddrLike {
+	return typeof value === "object" && value !== null && "relayUrl" in value && typeof value.relayUrl === "function";
 }
 
 /** Recycles live relay configuration after a previously-online endpoint loses every advertised home relay. */
@@ -31,7 +35,14 @@ export class IrohRelayRecoveryMonitor {
 
 	start(): void {
 		if (this.watchHandle !== undefined || this.stopped) return;
-		this.watchHandle = this.options.watchAddr((addr) => this.observeRelayAddress(addr));
+		this.watchHandle = this.options.watchAddr((errorOrAddr, addr) => {
+			const normalized = addr ?? (isIrohEndpointAddrLike(errorOrAddr) ? errorOrAddr : undefined);
+			if (normalized === undefined) {
+				this.options.log("warn", "Iroh relay registration watcher emitted an invalid update");
+				return;
+			}
+			this.observeRelayAddress(normalized);
+		});
 	}
 
 	async stop(): Promise<void> {

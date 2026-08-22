@@ -20,8 +20,8 @@ import { CONTROL_RPC_GRANTS_CAPABILITY, type ControlEvent } from "../src/daemon/
 import { createIntegratedConversationHandshakeResponse } from "../src/daemon/handshake-responses.ts";
 import {
 	formatIrohLoadError,
+	type IrohAddrWatchCallback,
 	type IrohConnectionLike,
-	type IrohEndpointAddrLike,
 	type IrohEndpointLike,
 	type IrohIncomingLike,
 	type IrohRelayConfigLike,
@@ -361,15 +361,15 @@ describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
 					relayRecoveryDelayMs: 20,
 					relayRecoveryRetryMs: 20,
 					decorateEndpoint: (endpoint) => {
-						let watcher: ((addr: IrohEndpointAddrLike) => void) | undefined;
-						emitRelayUrl = (url) => watcher?.({ relayUrl: () => url });
+						let watcher: IrohAddrWatchCallback | undefined;
+						emitRelayUrl = (url) => watcher?.(null, { relayUrl: () => url });
 						return {
 							id: () => endpoint.id(),
 							addr: () => endpoint.addr(),
 							online: () => Promise.resolve(),
 							insertRelay: async (config) => {
 								relayInsertions.push(config);
-								watcher?.({ relayUrl: () => config.url });
+								watcher?.(null, { relayUrl: () => config.url });
 							},
 							removeRelay: async (url) => {
 								relayRemovals.push(url);
