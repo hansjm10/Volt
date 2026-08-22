@@ -19,44 +19,38 @@ import (
 )
 
 const (
-	firebaseAppCheckJWKSURL       = "https://firebaseappcheck.googleapis.com/v1/jwks"
-	maxAppCheckTokenBytes         = 8 * 1024
-	maxAppCheckJWKSBytes          = 64 * 1024
-	maxAppCheckKeys               = 16
-	maxAppCheckKeyCacheTTL        = 6 * time.Hour
-	defaultAppCheckKeyCacheTTL    = time.Hour
-	maxAppCheckTokenLifetime      = 7 * 24 * time.Hour
-	maxAppCheckClockSkew          = 30 * time.Second
-	minForcedJWKSRefreshInterval  = 30 * time.Second
-	defaultConsumedAppCheckJTICap = 10_000
+	firebaseAppCheckJWKSURL      = "https://firebaseappcheck.googleapis.com/v1/jwks"
+	maxAppCheckTokenBytes        = 8 * 1024
+	maxAppCheckJWKSBytes         = 64 * 1024
+	maxAppCheckKeys              = 16
+	maxAppCheckKeyCacheTTL       = 6 * time.Hour
+	defaultAppCheckKeyCacheTTL   = time.Hour
+	maxAppCheckTokenLifetime     = 7 * 24 * time.Hour
+	maxAppCheckClockSkew         = 30 * time.Second
+	minForcedJWKSRefreshInterval = 30 * time.Second
 )
 
 type FirebaseAppCheckConfig struct {
-	ProjectNumber  string
-	AllowedAppIDs  []string
-	JWKSURL        string
-	HTTPClient     *http.Client
-	Now            func() time.Time
-	MaxConsumedJTI int
+	ProjectNumber string
+	AllowedAppIDs []string
+	JWKSURL       string
+	HTTPClient    *http.Client
+	Now           func() time.Time
 }
 
 type FirebaseAppCheckVerifier struct {
-	projectNumber  string
-	issuer         string
-	audience       string
-	allowedAppIDs  map[string]struct{}
-	jwksURL        string
-	httpClient     *http.Client
-	now            func() time.Time
-	maxConsumedJTI int
+	projectNumber string
+	issuer        string
+	audience      string
+	allowedAppIDs map[string]struct{}
+	jwksURL       string
+	httpClient    *http.Client
+	now           func() time.Time
 
 	keysMu            sync.Mutex
 	keys              map[string]*rsa.PublicKey
 	keysExpiresAt     time.Time
 	nextForcedRefresh time.Time
-
-	consumedMu sync.Mutex
-	consumed   map[string]time.Time
 }
 
 type appCheckJWTHeader struct {
@@ -120,47 +114,38 @@ func NewFirebaseAppCheckVerifier(config FirebaseAppCheckConfig) (*FirebaseAppChe
 	if now == nil {
 		now = time.Now
 	}
-	maxConsumedJTI := config.MaxConsumedJTI
-	if maxConsumedJTI == 0 {
-		maxConsumedJTI = defaultConsumedAppCheckJTICap
-	}
-	if maxConsumedJTI < 1 || maxConsumedJTI > 100_000 {
-		return nil, errors.New("consumed App Check JTI capacity is invalid")
-	}
 	return &FirebaseAppCheckVerifier{
-		projectNumber:  projectNumber,
-		issuer:         "https://firebaseappcheck.googleapis.com/" + projectNumber,
-		audience:       "projects/" + projectNumber,
-		allowedAppIDs:  allowedAppIDs,
-		jwksURL:        jwksURL,
-		httpClient:     httpClient,
-		now:            now,
-		maxConsumedJTI: maxConsumedJTI,
-		keys:           make(map[string]*rsa.PublicKey),
-		consumed:       make(map[string]time.Time),
+		projectNumber: projectNumber,
+		issuer:        "https://firebaseappcheck.googleapis.com/" + projectNumber,
+		audience:      "projects/" + projectNumber,
+		allowedAppIDs: allowedAppIDs,
+		jwksURL:       jwksURL,
+		httpClient:    httpClient,
+		now:           now,
+		keys:          make(map[string]*rsa.PublicKey),
 	}, nil
 }
 
-func (v *FirebaseAppCheckVerifier) Verify(request *http.Request) (string, error) {
+func (v *FirebaseAppCheckVerifier) Verify(request *http.Request) (VerifiedAppCheck, error) {
 	token, ok := singleHeaderValue(request.Header, "X-Firebase-AppCheck")
 	if !ok || token == "" || len(token) > maxAppCheckTokenBytes {
-		return "", errors.New("exactly one Firebase App Check token is required")
+		return VerifiedAppCheck{}, errors.New("exactly one Firebase App Check token is required")
 	}
 	return v.verifyToken(request.Context(), token)
 }
 
-func (v *FirebaseAppCheckVerifier) verifyToken(ctx context.Context, token string) (string, error) {
+func (v *FirebaseAppCheckVerifier) verifyToken(ctx context.Context, token string) (VerifiedAppCheck, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return "", errors.New("Firebase App Check token shape is invalid")
+		return VerifiedAppCheck{}, errors.New("Firebase App Check token shape is invalid")
 	}
 	headerBytes, err := decodeCanonicalBase64URL(parts[0])
 	if err != nil {
-		return "", errors.New("Firebase App Check header encoding is invalid")
+		return VerifiedAppCheck{}, errors.New("Firebase App Check header encoding is invalid")
 	}
 	var header appCheckJWTHeader
 	if err := decodeOneJSON(headerBytes, &header); err != nil || header.Algorithm != "RS256" || header.Type != "JWT" || !validJWTIdentifier(header.KeyID, 1, 256) {
-		return "", errors.New("Firebase App Check header is invalid")
+		return VerifiedAppCheck{}, errors.New("Firebase App Check header is invalid")
 	}
 
 	key, err := v.keyFor(ctx, header.KeyID, false)
@@ -168,47 +153,50 @@ func (v *FirebaseAppCheckVerifier) verifyToken(ctx context.Context, token string
 		key, err = v.keyFor(ctx, header.KeyID, true)
 	}
 	if err != nil {
-		return "", err
+		return VerifiedAppCheck{}, err
 	}
 	signature, err := decodeCanonicalBase64URL(parts[2])
 	if err != nil || len(signature) == 0 || len(signature) > 512 {
-		return "", errors.New("Firebase App Check signature encoding is invalid")
+		return VerifiedAppCheck{}, errors.New("Firebase App Check signature encoding is invalid")
 	}
 	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
 	if err := rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], signature); err != nil {
-		return "", errors.New("Firebase App Check signature is invalid")
+		return VerifiedAppCheck{}, errors.New("Firebase App Check signature is invalid")
 	}
 
 	claimsBytes, err := decodeCanonicalBase64URL(parts[1])
 	if err != nil {
-		return "", errors.New("Firebase App Check claims encoding is invalid")
+		return VerifiedAppCheck{}, errors.New("Firebase App Check claims encoding is invalid")
 	}
 	var claims appCheckJWTClaims
 	if err := decodeOneJSON(claimsBytes, &claims); err != nil {
-		return "", errors.New("Firebase App Check claims are invalid")
+		return VerifiedAppCheck{}, errors.New("Firebase App Check claims are invalid")
 	}
 	now := v.now().UTC()
 	nowSeconds := now.Unix()
 	if claims.Issuer != v.issuer || !claims.Audience.contains(v.audience) {
-		return "", errors.New("Firebase App Check authority is invalid")
+		return VerifiedAppCheck{}, errors.New("Firebase App Check authority is invalid")
 	}
 	if _, ok := v.allowedAppIDs[claims.Subject]; !ok {
-		return "", errors.New("Firebase App Check app is not allowed")
+		return VerifiedAppCheck{}, errors.New("Firebase App Check app is not allowed")
 	}
 	if claims.IssuedAt > now.Add(maxAppCheckClockSkew).Unix() || claims.ExpiresAt <= nowSeconds {
-		return "", errors.New("Firebase App Check token is outside its validity window")
+		return VerifiedAppCheck{}, errors.New("Firebase App Check token is outside its validity window")
 	}
 	lifetime := claims.ExpiresAt - claims.IssuedAt
 	if lifetime <= 0 || lifetime > int64(maxAppCheckTokenLifetime/time.Second) {
-		return "", errors.New("Firebase App Check token lifetime is invalid")
+		return VerifiedAppCheck{}, errors.New("Firebase App Check token lifetime is invalid")
 	}
 	if !validJWTIdentifier(claims.JWTID, 16, 512) {
-		return "", errors.New("limited-use Firebase App Check token jti is required")
+		return VerifiedAppCheck{}, errors.New("limited-use Firebase App Check token jti is required")
 	}
-	if err := v.consumeJTI(claims.JWTID, time.Unix(claims.ExpiresAt, 0).UTC(), now); err != nil {
-		return "", err
-	}
-	return claims.Subject, nil
+	jtiHash := sha256.Sum256([]byte(claims.JWTID))
+	return VerifiedAppCheck{
+		AppID:           claims.Subject,
+		JTIHash:         jtiHash,
+		ExpiresAt:       time.Unix(claims.ExpiresAt, 0).UTC(),
+		ReplayProtected: true,
+	}, nil
 }
 
 var errAppCheckKeyNotFound = errors.New("Firebase App Check signing key not found")
@@ -278,26 +266,6 @@ func (v *FirebaseAppCheckVerifier) fetchKeys(ctx context.Context, now time.Time)
 		return nil, time.Time{}, errors.New("Firebase App Check JWKS has no usable keys")
 	}
 	return keys, now.Add(cacheTTL(response.Header.Get("Cache-Control"))), nil
-}
-
-func (v *FirebaseAppCheckVerifier) consumeJTI(jti string, expiresAt, now time.Time) error {
-	v.consumedMu.Lock()
-	defer v.consumedMu.Unlock()
-	if previousExpiry, exists := v.consumed[jti]; exists && now.Before(previousExpiry) {
-		return errors.New("Firebase App Check token was already consumed")
-	}
-	if len(v.consumed) >= v.maxConsumedJTI {
-		for value, expiry := range v.consumed {
-			if !now.Before(expiry) {
-				delete(v.consumed, value)
-			}
-		}
-		if len(v.consumed) >= v.maxConsumedJTI {
-			return errors.New("Firebase App Check replay store capacity reached")
-		}
-	}
-	v.consumed[jti] = expiresAt
-	return nil
 }
 
 func (a *appCheckAudience) UnmarshalJSON(data []byte) error {

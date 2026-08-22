@@ -1,8 +1,8 @@
-# Relay Credential Service POC
+# Relay Credential Broker
 
-This Go service proves the account-free credential flow for the Volt-operated Iroh relay fleet. It is a credential broker, not a user account service.
+This Go service implements the account-free credential flow for the Volt-operated Iroh relay fleet. It is a credential broker, not a user account service.
 
-The POC now implements the accepted protocol in [Managed relay credentials production design](../../../docs/managed-relay-credentials-design.md):
+The broker implements the accepted protocol in [Managed relay credentials production design](../../packages/coding-agent/docs/managed-relay-credentials-design.md):
 
 - one daemon identity grant with one host endpoint and multiple app endpoints;
 - client-generated pairing and refresh secrets, with only SHA-256 hashes sent during enrollment;
@@ -13,19 +13,18 @@ The POC now implements the accepted protocol in [Managed relay credentials produ
 - a public JWKS endpoint; and
 - a pinned `iroh-relay 1.0.3` JWT `AccessControl` patch and reproducible canary build script.
 
-## Status and production blockers
+## Persistence and production blockers
 
-This remains an in-memory protocol POC, not a production service:
+PostgreSQL is the broker's only state store. Embedded, checksummed migrations create `grants`, `endpoints`, `pairing_claims`, `consumed_app_check_tokens`, and `schema_migrations`. Approval consumes the verified App Check `jti`, creates or validates the grant and endpoints, and approves the claim in one transaction. Exchange, refresh throttling, expiry, and revocation use row locks, so replicas share one durable authority and restarts retain state.
 
-- Pairing claims, grants, endpoints, and refresh hashes are process-local. A restart invalidates them. Production replaces the maps with Cloud SQL PostgreSQL transactions.
-- Firebase mode verifies limited-use App Check tokens and consumes each `jti` once, but its replay store is process-local. Production consumes a `jti` atomically in the same PostgreSQL transaction as approval.
+Remaining production blockers:
+
 - Production should use the Firebase Admin Go verifier instead of maintaining the custom RS256/JWKS verifier.
-- The service still needs managed HTTPS deployment, edge rate limits, request budgets, secret-free monitoring, readiness checks, migrations, backup/restore verification, and administrative procedures.
+- The service still needs managed HTTPS deployment, edge rate limits, request budgets, secret-free monitoring, readiness checks, backup/restore verification, and administrative procedures.
 - Signing still uses one mode-`0600` local Ed25519 seed. Production uses Cloud KMS and an overlapping active/retiring relay key set.
 - The relay canary accepts the JWT shape, but production relays still need multi-key configuration, metrics, rollout, and artifact publication.
-- Normal daemon claim creation/exchange and confirmed iOS approval now implement this protocol. Production deployment, PostgreSQL, KMS, and relay key-set rollout remain blockers.
 
-Do not expose this POC to the public internet or use its development App Check token in an app build.
+Do not expose the development App Check mode to the public internet or use its token in an app build.
 
 ## Grant model
 
@@ -70,13 +69,14 @@ Refresh never returns or changes the refresh secret. It issues a new access JWT 
 Go 1.23 or newer is required.
 
 ```sh
-cd packages/coding-agent/examples/remote/relay-credential-service
+cd services/relay-credential-broker
+export VOLT_CREDENTIAL_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/volt_credentials?sslmode=disable'
 export VOLT_APP_CHECK_MODE=development
 export VOLT_DEVELOPMENT_APP_CHECK_TOKEN="$(openssl rand -base64 32)"
 go run ./cmd/relay-credential-service
 ```
 
-The default listener and issuer are local-only: `127.0.0.1:8085` and `http://127.0.0.1:8085`. The service creates `./data/relay-credential-signing-key` with mode `0600`.
+The database user must be able to create tables and use PostgreSQL advisory locks. Migrations run automatically before the listener starts. The default listener and issuer are local-only: `127.0.0.1:8085` and `http://127.0.0.1:8085`. The service creates `./data/relay-credential-signing-key` with mode `0600`.
 
 For a normal daemon-generated canary pairing, start the broker with the canary signing key and Firebase configuration, then start a disposable daemon state directory against the canary relay:
 
@@ -92,12 +92,15 @@ VOLT_CODING_AGENT_DIR=/tmp/volt-relay-canary \
 
 The daemon recognizes the exact canary relay set, pre-persists its claim and host refresh secrets, creates the broker claim, and emits a normal reviewed ticket. Confirming that ticket in iOS obtains App Check, pre-persists the app refresh secret, approves the claim, and connects with the app access JWT. The daemon exchanges the same claim and installs its separate host JWT. No credential file or credential-specific launch argument is used.
 
-Run validation:
+Run unit validation, then PostgreSQL integration tests against a disposable database whose schemas may be created and dropped:
 
 ```sh
 go test ./...
 go vet ./...
+VOLT_TEST_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable' go test ./...
 ```
+
+Database-backed tests isolate each case in a random schema and cover migration idempotency, concurrent approval and refresh, App Check replay rollback, restart persistence, expiry, and refresh/revoke races.
 
 ## Exercise initial enrollment
 
@@ -150,7 +153,7 @@ export VOLT_ALLOWED_FIREBASE_APP_IDS=1:546623825529:ios:9f5a707e3f4ef89154d6a8
 go run ./cmd/relay-credential-service
 ```
 
-Firebase mode requires limited-use tokens with a `jti`, caches bounded JWKS responses, throttles attacker-triggered unknown-key refreshes, and rejects replayed `jti` values. The replay barrier remains process-local until the PostgreSQL step.
+Firebase mode requires limited-use tokens with a `jti`, caches bounded JWKS responses, and throttles attacker-triggered unknown-key refreshes. The verifier returns only a SHA-256 `jti` digest to the broker; PostgreSQL consumes that digest in the approval transaction and provides the global replay barrier.
 
 ## HTTP contract
 
@@ -229,6 +232,7 @@ Relays verify locally instead of calling the credential service for each connect
 | `VOLT_CREDENTIAL_ISSUER` | `http://127.0.0.1:8085` | Exact JWT issuer expected by the relay. |
 | `VOLT_CREDENTIAL_AUDIENCE` | `volt-iroh-relay` | Exact JWT audience expected by the relay. |
 | `VOLT_CREDENTIAL_SIGNING_KEY_FILE` | `./data/relay-credential-signing-key` | Persistent mode-`0600` Ed25519 seed file. |
+| `VOLT_CREDENTIAL_DATABASE_URL` | required | PostgreSQL connection URL. |
 | `VOLT_APP_CHECK_MODE` | `development` | `development` or `firebase`. |
 | `VOLT_DEVELOPMENT_APP_CHECK_TOKEN` | required in development | Constant-time local approval token, minimum 32 characters. |
 | `VOLT_FIREBASE_PROJECT_NUMBER` | required in Firebase mode | Exact Firebase project authority. |
@@ -237,7 +241,7 @@ Relays verify locally instead of calling the credential service for each connect
 | `VOLT_CREDENTIAL_ACCESS_TTL` | `15m` | Access JWT lifetime; hard maximum `1h`. |
 | `VOLT_CREDENTIAL_REFRESH_INACTIVITY_TTL` | `2160h` | Sliding refresh inactivity lifetime; hard maximum 90 days. |
 | `VOLT_CREDENTIAL_REFRESH_MIN_INTERVAL` | `5s` | Minimum access refresh interval per endpoint. |
-| `VOLT_CREDENTIAL_MAX_CLAIMS` | `10000` | In-memory active/retained claim cap. |
-| `VOLT_CREDENTIAL_MAX_ENDPOINTS` | `100000` | In-memory endpoint/tombstone cap. |
+| `VOLT_CREDENTIAL_MAX_CLAIMS` | `10000` | Database-wide active claim cap. |
+| `VOLT_CREDENTIAL_MAX_ENDPOINTS` | `100000` | Database-wide endpoint/tombstone cap. |
 | `VOLT_CREDENTIAL_MAX_APP_ENDPOINTS_PER_GRANT` | `8` | Active phone endpoint cap per daemon identity grant. |
 | `VOLT_CREDENTIAL_MAX_CONCURRENT_REQUESTS` | `64` | In-process HTTP concurrency cap; not an edge-control substitute. |

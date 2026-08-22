@@ -15,14 +15,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/volt-hq/Volt/packages/coding-agent/examples/remote/relay-credential-service/internal/broker"
-	"github.com/volt-hq/Volt/packages/coding-agent/examples/remote/relay-credential-service/internal/credential"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/broker"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/credential"
 )
 
 const maxRequestBodyBytes = 4 * 1024
 
+type VerifiedAppCheck struct {
+	AppID           string
+	JTIHash         broker.SecretHash
+	ExpiresAt       time.Time
+	ReplayProtected bool
+}
+
 type AppCheckVerifier interface {
-	Verify(request *http.Request) (appID string, err error)
+	Verify(request *http.Request) (VerifiedAppCheck, error)
 }
 
 type DevelopmentAppCheckVerifier struct {
@@ -41,16 +48,16 @@ func NewDevelopmentAppCheckVerifier(token string) (*DevelopmentAppCheckVerifier,
 	}, nil
 }
 
-func (v *DevelopmentAppCheckVerifier) Verify(request *http.Request) (string, error) {
+func (v *DevelopmentAppCheckVerifier) Verify(request *http.Request) (VerifiedAppCheck, error) {
 	token, ok := singleHeaderValue(request.Header, "X-Firebase-AppCheck")
 	if !ok || token == "" || len(token) > 8192 {
-		return "", errors.New("exactly one App Check token is required")
+		return VerifiedAppCheck{}, errors.New("exactly one App Check token is required")
 	}
 	digest := sha256.Sum256([]byte(token))
 	if subtle.ConstantTimeCompare(digest[:], v.tokenHash[:]) != 1 {
-		return "", errors.New("App Check token invalid")
+		return VerifiedAppCheck{}, errors.New("App Check token invalid")
 	}
-	return v.appID, nil
+	return VerifiedAppCheck{AppID: v.appID}, nil
 }
 
 type Config struct {
@@ -161,7 +168,7 @@ func (s *Server) handleCreateClaim(writer http.ResponseWriter, request *http.Req
 			writeError(writer, http.StatusBadRequest, "invalid_host_refresh_token_hash")
 			return
 		}
-		claim, err := s.broker.CreateBootstrapPairingClaim(body.HostNodeID, claimSecretHash, hostRefreshHash)
+		claim, err := s.broker.CreateBootstrapPairingClaim(request.Context(), body.HostNodeID, claimSecretHash, hostRefreshHash)
 		if err != nil {
 			s.writeClaimCreationError(writer, err)
 			return
@@ -185,7 +192,7 @@ func (s *Server) handleCreateClaim(writer http.ResponseWriter, request *http.Req
 		writeError(writer, http.StatusBadRequest, "invalid_claim_secret_hash")
 		return
 	}
-	claim, err := s.broker.CreatePairingClaimForGrant(hostRefreshToken, claimSecretHash)
+	claim, err := s.broker.CreatePairingClaimForGrant(request.Context(), hostRefreshToken, claimSecretHash)
 	if err != nil {
 		s.writeAuthenticatedError(writer, err)
 		return
@@ -199,7 +206,7 @@ func (s *Server) handleApproveClaim(writer http.ResponseWriter, request *http.Re
 		writeError(writer, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	appID, err := s.appCheck.Verify(request)
+	verifiedAppCheck, err := s.appCheck.Verify(request)
 	if err != nil {
 		writeError(writer, http.StatusUnauthorized, "app_check_invalid")
 		return
@@ -209,7 +216,12 @@ func (s *Server) handleApproveClaim(writer http.ResponseWriter, request *http.Re
 		writeError(writer, http.StatusBadRequest, "invalid_app_refresh_token_hash")
 		return
 	}
-	approval, err := s.broker.ApprovePairingClaim(request.PathValue("claimID"), appID, body.AppNodeID, appRefreshHash)
+	approval, err := s.broker.ApprovePairingClaim(request.Context(), request.PathValue("claimID"), broker.AppCheckProof{
+		AppID:           verifiedAppCheck.AppID,
+		JTIHash:         verifiedAppCheck.JTIHash,
+		ExpiresAt:       verifiedAppCheck.ExpiresAt,
+		ReplayProtected: verifiedAppCheck.ReplayProtected,
+	}, body.AppNodeID, appRefreshHash)
 	if err != nil {
 		s.writeBrokerError(writer, err, "invalid_app_node_id")
 		return
@@ -223,7 +235,7 @@ func (s *Server) handleExchangeClaim(writer http.ResponseWriter, request *http.R
 		writeError(writer, http.StatusUnauthorized, "claim_secret_required")
 		return
 	}
-	exchange, err := s.broker.ExchangePairingClaim(request.PathValue("claimID"), claimSecret)
+	exchange, err := s.broker.ExchangePairingClaim(request.Context(), request.PathValue("claimID"), claimSecret)
 	if errors.Is(err, broker.ErrClaimPending) {
 		writer.Header().Set("Retry-After", "1")
 		writeJSON(writer, http.StatusAccepted, pendingResponse{Status: "pending", RetryAfterSeconds: 1})
@@ -246,7 +258,7 @@ func (s *Server) handleRefresh(writer http.ResponseWriter, request *http.Request
 		writeError(writer, http.StatusUnauthorized, "refresh_token_required")
 		return
 	}
-	accessToken, err := s.broker.RefreshAccessToken(refreshToken)
+	accessToken, err := s.broker.RefreshAccessToken(request.Context(), refreshToken)
 	if err != nil {
 		if errors.Is(err, broker.ErrRefreshThrottled) {
 			writer.Header().Set("Retry-After", s.refreshRetryAfter)
@@ -269,7 +281,7 @@ func (s *Server) handleRevoke(writer http.ResponseWriter, request *http.Request)
 		writeError(writer, http.StatusUnauthorized, "refresh_token_required")
 		return
 	}
-	if err := s.broker.RevokeRefreshToken(refreshToken); err != nil {
+	if err := s.broker.RevokeRefreshToken(request.Context(), refreshToken); err != nil {
 		s.writeAuthenticatedError(writer, err)
 		return
 	}
@@ -287,7 +299,7 @@ func (s *Server) handleRevokeAppEndpoint(writer http.ResponseWriter, request *ht
 		writeError(writer, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	if err := s.broker.RevokeAppEndpoint(hostRefreshToken, body.EndpointID); err != nil {
+	if err := s.broker.RevokeAppEndpoint(request.Context(), hostRefreshToken, body.EndpointID); err != nil {
 		s.writeAuthenticatedError(writer, err)
 		return
 	}
@@ -304,7 +316,7 @@ func (s *Server) handleRevokeGrant(writer http.ResponseWriter, request *http.Req
 		writeError(writer, http.StatusUnauthorized, "host_refresh_token_required")
 		return
 	}
-	if err := s.broker.RevokeGrant(hostRefreshToken); err != nil {
+	if err := s.broker.RevokeGrant(request.Context(), hostRefreshToken); err != nil {
 		s.writeAuthenticatedError(writer, err)
 		return
 	}
@@ -326,6 +338,8 @@ func (s *Server) writeClaimCreationError(writer http.ResponseWriter, err error) 
 
 func (s *Server) writeBrokerError(writer http.ResponseWriter, err error, invalidCode string) {
 	switch {
+	case errors.Is(err, broker.ErrAppCheckInvalid), errors.Is(err, broker.ErrAppCheckReplay):
+		writeError(writer, http.StatusUnauthorized, "app_check_invalid")
 	case errors.Is(err, broker.ErrClaimNotFound):
 		writeError(writer, http.StatusNotFound, "claim_not_found")
 	case errors.Is(err, broker.ErrClaimExpired):

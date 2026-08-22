@@ -15,8 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/volt-hq/Volt/packages/coding-agent/examples/remote/relay-credential-service/internal/broker"
-	"github.com/volt-hq/Volt/packages/coding-agent/examples/remote/relay-credential-service/internal/credential"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/broker"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/credential"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/testdatabase"
 )
 
 const developmentAppCheckToken = "development-app-check-token-at-least-32-bytes"
@@ -41,7 +42,8 @@ func newTestService(t *testing.T) *testService {
 		signer: signer,
 		now:    time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC),
 	}
-	brokerService, err := broker.New(signer, broker.Config{
+	pool := testdatabase.Open(t)
+	brokerService, err := broker.New(pool, signer, broker.Config{
 		ClaimTTL:                10 * time.Minute,
 		AccessTokenTTL:          15 * time.Minute,
 		RefreshInactivityTTL:    30 * 24 * time.Hour,

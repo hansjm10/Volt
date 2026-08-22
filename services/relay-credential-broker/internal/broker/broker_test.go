@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/volt-hq/Volt/packages/coding-agent/examples/remote/relay-credential-service/internal/credential"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/credential"
 )
 
 func TestBrokerRejectsUnsafeCredentialLifetimes(t *testing.T) {
@@ -49,7 +49,7 @@ func TestBrokerRejectsUnsafeCredentialLifetimes(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			configuration := valid
 			test.mutate(&configuration)
-			if _, err := New(signer, configuration, time.Now); err == nil {
+			if _, err := New(nil, signer, configuration, time.Now); err == nil {
 				t.Fatal("unsafe configuration was accepted")
 			}
 		})

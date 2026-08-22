@@ -20,7 +20,7 @@ const (
 	testFirebaseAppID         = "1:546623825529:ios:9f5a707e3f4ef89154d6a8"
 )
 
-func TestFirebaseAppCheckVerifierAcceptsOnceAndCachesKeys(t *testing.T) {
+func TestFirebaseAppCheckVerifierReturnsReplayMetadataAndCachesKeys(t *testing.T) {
 	key := generateRSAKey(t)
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
@@ -45,15 +45,19 @@ func TestFirebaseAppCheckVerifierAcceptsOnceAndCachesKeys(t *testing.T) {
 
 	request := httptest.NewRequest(http.MethodPost, "/approve", nil)
 	request.Header.Set("X-Firebase-AppCheck", token)
-	appID, err := verifier.Verify(request)
+	verified, err := verifier.Verify(request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if appID != testFirebaseAppID {
-		t.Fatalf("app ID = %q, want %q", appID, testFirebaseAppID)
+	if verified.AppID != testFirebaseAppID || !verified.ReplayProtected || verified.ExpiresAt != now.Add(time.Hour) {
+		t.Fatalf("unexpected verified App Check metadata: %+v", verified)
 	}
-	if _, err := verifier.Verify(request); err == nil {
-		t.Fatal("replayed limited-use token was accepted")
+	expectedJTIHash := sha256.Sum256([]byte("limited-use-token-identifier-one"))
+	if verified.JTIHash != expectedJTIHash {
+		t.Fatalf("jti hash = %x, want %x", verified.JTIHash, expectedJTIHash)
+	}
+	if _, err := verifier.Verify(request); err != nil {
+		t.Fatalf("stateless verification rejected a valid token: %v", err)
 	}
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("JWKS request count = %d, want 1", got)
@@ -191,12 +195,11 @@ func newFirebaseVerifier(
 ) *FirebaseAppCheckVerifier {
 	t.Helper()
 	verifier, err := NewFirebaseAppCheckVerifier(FirebaseAppCheckConfig{
-		ProjectNumber:  testFirebaseProjectNumber,
-		AllowedAppIDs:  []string{testFirebaseAppID},
-		JWKSURL:        server.URL,
-		HTTPClient:     server.Client(),
-		Now:            func() time.Time { return now },
-		MaxConsumedJTI: 100,
+		ProjectNumber: testFirebaseProjectNumber,
+		AllowedAppIDs: []string{testFirebaseAppID},
+		JWKSURL:       server.URL,
+		HTTPClient:    server.Client(),
+		Now:           func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatal(err)

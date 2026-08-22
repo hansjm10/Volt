@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/volt-hq/Volt/packages/coding-agent/examples/remote/relay-credential-service/internal/pairingticket"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/pairingticket"
 )
 
 func main() {

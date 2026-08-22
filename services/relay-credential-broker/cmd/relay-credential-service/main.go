@@ -13,9 +13,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/volt-hq/Volt/packages/coding-agent/examples/remote/relay-credential-service/internal/broker"
-	"github.com/volt-hq/Volt/packages/coding-agent/examples/remote/relay-credential-service/internal/credential"
-	"github.com/volt-hq/Volt/packages/coding-agent/examples/remote/relay-credential-service/internal/httpapi"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/broker"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/credential"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/database"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/httpapi"
 )
 
 const (
@@ -30,6 +32,7 @@ type config struct {
 	Issuer                  string
 	Audience                string
 	SigningKeyPath          string
+	DatabaseURL             string
 	AppCheckMode            string
 	DevAppCheck             string
 	FirebaseProjectNumber   string
@@ -81,7 +84,29 @@ func main() {
 		logger.Error("configure App Check verifier", "error", err)
 		os.Exit(2)
 	}
-	brokerService, err := broker.New(signer, broker.Config{
+	databaseConfig, err := pgxpool.ParseConfig(configuration.DatabaseURL)
+	if err != nil {
+		logger.Error("invalid PostgreSQL configuration")
+		os.Exit(2)
+	}
+	startupContext, cancelStartup := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelStartup()
+	pool, err := pgxpool.NewWithConfig(startupContext, databaseConfig)
+	if err != nil {
+		logger.Error("open PostgreSQL", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+	if err := pool.Ping(startupContext); err != nil {
+		logger.Error("connect to PostgreSQL", "error", err)
+		os.Exit(1)
+	}
+	if err := database.Migrate(startupContext, pool); err != nil {
+		logger.Error("migrate PostgreSQL", "error", err)
+		os.Exit(1)
+	}
+
+	brokerService, err := broker.New(pool, signer, broker.Config{
 		ClaimTTL:                configuration.ClaimTTL,
 		AccessTokenTTL:          configuration.AccessTTL,
 		RefreshInactivityTTL:    configuration.RefreshInactivityTTL,
@@ -178,6 +203,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	databaseURL := strings.TrimSpace(os.Getenv("VOLT_CREDENTIAL_DATABASE_URL"))
+	if databaseURL == "" {
+		return config{}, errors.New("VOLT_CREDENTIAL_DATABASE_URL is required")
+	}
 	appCheckMode := stringEnv("VOLT_APP_CHECK_MODE", "development")
 	devAppCheck := os.Getenv("VOLT_DEVELOPMENT_APP_CHECK_TOKEN")
 	firebaseProjectNumber := strings.TrimSpace(
@@ -198,6 +227,7 @@ func loadConfig() (config, error) {
 		Issuer:                  stringEnv("VOLT_CREDENTIAL_ISSUER", defaultIssuer),
 		Audience:                stringEnv("VOLT_CREDENTIAL_AUDIENCE", defaultAudience),
 		SigningKeyPath:          stringEnv("VOLT_CREDENTIAL_SIGNING_KEY_FILE", defaultSigningKey),
+		DatabaseURL:             databaseURL,
 		AppCheckMode:            appCheckMode,
 		DevAppCheck:             devAppCheck,
 		FirebaseProjectNumber:   firebaseProjectNumber,

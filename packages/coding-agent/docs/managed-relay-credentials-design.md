@@ -1,8 +1,8 @@
 # Managed relay credentials production design
 
-- Status: Accepted; protocol POC and normal daemon/iOS clients implemented
+- Status: Accepted; PostgreSQL broker and normal daemon/iOS clients implemented
 - Workspaces: `Volt` broker/daemon/relay integration and `volt-app` iOS client
-- Current proof of concept: `packages/coding-agent/examples/remote/relay-credential-service`
+- Broker: `services/relay-credential-broker`
 
 ## Decision
 
@@ -322,7 +322,7 @@ Alert only on sustained 5xx responses, database/KMS unavailability, unexpected s
 
 1. **Completed:** accept this contract and update the POC protocol/tests to client-generated stable refresh secrets and daemon-identity grants, including host-authorized app revocation.
 2. **Completed:** wire durable daemon claim creation/exchange and normal confirmed iOS approval; remove file/Debug bootstrap paths.
-3. Replace in-memory broker state with PostgreSQL transactions and migrations.
+3. **Completed:** replace in-memory broker state with PostgreSQL transactions and migrations.
 4. Replace custom Firebase signature verification with the Firebase Admin Go verifier while retaining PostgreSQL `jti` consumption.
 5. Add KMS signing and multi-key relay configuration.
 6. Deploy the canary to Cloud Run and single-zone Cloud SQL, then run crash, replay, rotation, revocation, and log-redaction tests.
